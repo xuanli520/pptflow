@@ -1,0 +1,29 @@
+scan_path: "./projects-qa"
+db_path: "./projects-qa/.qa-control/index.db"
+
+pipeline:
+  static_only: false
+  stage_timeouts:
+    A: 60
+    B: 120
+    C: 300
+    D: 300
+    E: 600
+    F: 60
+
+docker:
+  managed_label: "managed_by=p2rqa"
+  compose_project_prefix: "p2rqa"
+  keep_failed_containers_minutes: 60
+  health_check_timeout_seconds: 60
+
+codex:
+  sandbox_image: "codex:latest"
+  prompt_profiles_dir: "./projects-qa/.qa-control/prompt_profiles"
+  network: "none"
+  max_output_bytes: 1048576
+  writable_tmp: true
+
+tui:
+  refresh_interval_ms: 100
+  log_max_lines: 10000

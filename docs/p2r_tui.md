@@ -40,7 +40,7 @@
 - Release checks：`go test ./...`、`go vet ./...`、`go build ./...`、`goreleaser check`（若本机安装）。
 
 ## Assumptions
-- 不新增设计文档外的核心依赖；Cobra、Bubble Tea、Lip Gloss、Bubbles、go-sqlite3、goreleaser 视为已由设计批准。
+- 不新增设计文档外的核心依赖；Cobra、Bubble Tea、Lip Gloss、Bubbles、modernc.org/sqlite、goreleaser 视为已由设计批准。SQLite driver 使用纯 Go 实现以保证 Windows 默认单二进制构建可运行。
 - `p2r` 不自动勾选 `PASS/REWORK/FAIL`，只预填前三条 `short_comment.txt` 文案。
 - ReportPanel、PromptPanel、批量并行执行不进入 MVP。
 - 若真实 Docker、Codex 或 gstack 环境不可用，测试用 fake executor 保证逻辑覆盖，真实集成项在最终报告中标为 Not-tested。

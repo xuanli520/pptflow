@@ -1,1 +1,6 @@
 .omx
+.go-cache
+.gomodcache
+/projects-qa/
+/p2r-smoke.exe
+testdata/**/qa/

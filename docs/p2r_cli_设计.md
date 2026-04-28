@@ -55,7 +55,7 @@
 | TUI | [Bubble Tea](https://github.com/charmbracelet/bubbletea) | Elm 架构，适合面板式 TUI |
 | 样式 | [Lip Gloss](https://github.com/charmbracelet/lipgloss) | 声明式终端样式 |
 | 组件 | [Bubbles](https://github.com/charmbracelet/bubbles) | 内建 table/viewport/spinner/textinput |
-| 存储 | [mattn/go-sqlite3](https://github.com/mattn/go-sqlite3) | 轻量、无需服务端、适合本地索引 |
+| 存储 | [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) | 纯 Go SQLite driver；保留 `database/sql` 与 SQLite schema，同时避免 Windows 默认构建依赖 CGO/GCC |
 | CLI 进度 | [log/slog](https://pkg.go.dev/log/slog) | 标准库结构化日志，CI 友好 |
 
 ### 2.2 选型关键
@@ -342,7 +342,7 @@ C 阶段只说明测试命令的实际执行结果，不替代 D 阶段对测试
 | 依赖 | 项目文件可读 |
 | 分析方式 | 纯静态，不启动服务，不运行 Docker，不运行测试 |
 | 模板 | `prompt_profiles/tests_coverage_report.md` |
-| Codex 动作 | `codex exec --prompt @prompt_profiles/tests_coverage_report.md` |
+| Codex 动作 | `codex exec <rendered static prompt>`，其中 prompt 内容由内置 `prompt_profiles/tests_coverage_report.md` 渲染 |
 | 模板输出 | `./.tmp/tests_coverage_report.md` |
 | CLI 收集输出 | `tests_coverage_report.md`、兼容文件 `4_测试有效性报告_api端点真实性.md` |
 | 超时 | 300s |
@@ -360,7 +360,7 @@ D 阶段必须按项目类型处理：
 | 依赖 | 项目文件可读 |
 | 分析方式 | 纯静态，不启动服务，不运行 Docker，不运行测试，不修改代码 |
 | 模板 | `prompt_profiles/static_acceptance_audit.md` |
-| Codex 动作 | `codex exec --prompt @prompt_profiles/static_acceptance_audit.md` |
+| Codex 动作 | `codex exec <rendered static prompt>`，其中 prompt 内容由内置 `prompt_profiles/static_acceptance_audit.md` 渲染 |
 | 模板输出 | `./.tmp/static_acceptance_audit_report.md` |
 | CLI 收集输出 | `static_acceptance_audit_report.md`、兼容文件 `1_质检AI测试报告.md` |
 | 超时 | 600s |
