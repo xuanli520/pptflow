@@ -66,7 +66,7 @@ func Default() Config {
 			PromptProfilesDir: "./projects-qa/.qa-control/prompt_profiles",
 			Network:           "none",
 			MaxOutputBytes:    1048576,
-			WritableTmp:       true,
+			WritableTmp:       false,
 		},
 		TUI: TUIConfig{
 			RefreshIntervalMS: 100,

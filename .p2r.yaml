@@ -22,7 +22,7 @@ codex:
   prompt_profiles_dir: "./projects-qa/.qa-control/prompt_profiles"
   network: "none"
   max_output_bytes: 1048576
-  writable_tmp: true
+  writable_tmp: false
 
 tui:
   refresh_interval_ms: 100

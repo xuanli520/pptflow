@@ -386,20 +386,21 @@ func (r Runner) runStageAScripts(project scanner.Project, logPath string) map[st
 	if promptLooksEnglish(filepath.Join(project.Path, "metadata.json")) {
 		scripts = append(scripts, "check_english_only.py")
 	}
-	python := "python"
-	if path, err := r.exec.LookPath("python"); err == nil {
-		python = path
-	} else if path, err := r.exec.LookPath("python3"); err == nil {
-		python = path
-	}
+	python, prefix, pythonErr := r.pythonInvocation(project.Path)
+	env := append(os.Environ(), "UV_CACHE_DIR="+filepath.Join(r.cfg.ScanPath, ".qa-control", ".uv-cache"))
 	var log strings.Builder
 	for _, script := range scripts {
 		scriptPath := filepath.Join(r.cfg.ScanPath, ".qa-control", "scripts", script)
+		if pythonErr != "" {
+			results[script] = fmt.Sprintf(`{"error":%q,"script":%q}`+"\n", pythonErr, scriptPath)
+			continue
+		}
 		if !fileExists(scriptPath) {
 			results[script] = fmt.Sprintf(`{"error":"script not found","script":%q}`+"\n", scriptPath)
 			continue
 		}
-		result := r.exec.Run(context.Background(), time.Duration(r.cfg.Pipeline.StageTimeouts["A"])*time.Second, project.Path, nil, python, scriptPath, project.Path)
+		args := append(append([]string{}, prefix...), scriptPath, project.Path)
+		result := r.exec.Run(context.Background(), time.Duration(r.cfg.Pipeline.StageTimeouts["A"])*time.Second, project.Path, env, python, args...)
 		output := strings.TrimSpace(result.Stdout)
 		if output == "" {
 			output = strings.TrimSpace(result.Stderr)
@@ -409,6 +410,23 @@ func (r Runner) runStageAScripts(project scanner.Project, logPath string) map[st
 	}
 	_ = writeText(logPath, log.String())
 	return results
+}
+
+func (r Runner) pythonInvocation(workDir string) (string, []string, string) {
+	for _, name := range []string{"python", "python3"} {
+		path, err := r.exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		result := r.exec.Run(context.Background(), 5*time.Second, workDir, nil, path, "--version")
+		if result.Err == nil && (strings.Contains(result.Stdout, "Python") || strings.Contains(result.Stderr, "Python")) {
+			return path, nil, ""
+		}
+	}
+	if path, err := r.exec.LookPath("uv"); err == nil {
+		return path, []string{"run", "python"}, ""
+	}
+	return "", nil, "python interpreter not found"
 }
 
 func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner.Project) model.StageRecord {
@@ -436,11 +454,15 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	workDir := repoPath
 	upArgs := []string{"compose", "-f", compose, "-p", projectName, "up", "-d", "--build"}
 	psArgs := []string{"compose", "-f", compose, "-p", projectName, "ps", "--format", "json"}
+	psQArgs := []string{"compose", "-f", compose, "-p", projectName, "ps", "-q"}
+	servicesArgs := []string{"compose", "-f", compose, "-p", projectName, "config", "--services"}
 	if compose != "" {
 		workDir = filepath.Dir(compose)
 	} else {
 		upArgs = composeArgsWithProject(readmeCommand, projectName)
 		psArgs = composePSArgs(readmeCommand, projectName)
+		psQArgs = composePSQArgs(readmeCommand, projectName)
+		servicesArgs = composeServicesArgs(readmeCommand, projectName)
 	}
 	up := r.exec.Run(ctx, timeout, workDir, nil, "docker", upArgs...)
 	log := up.Command + "\n\nSTDOUT:\n" + up.Stdout + "\nSTDERR:\n" + up.Stderr
@@ -453,8 +475,16 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	}
 	ps := r.exec.Run(ctx, 30*time.Second, workDir, nil, "docker", psArgs...)
 	log += "\n\n" + ps.Command + "\n\nSTDOUT:\n" + ps.Stdout + "\nSTDERR:\n" + ps.Stderr
-	_ = writeText(logPath, log)
 	mappings, services := parseComposePS(ps.Stdout)
+	if ps.Err != nil || len(mappings) == 0 {
+		fallbackMappings, fallbackServices, fallbackLog := r.dockerPortFallback(ctx, workDir, psQArgs, servicesArgs)
+		log += fallbackLog
+		if len(fallbackMappings) > 0 {
+			mappings = fallbackMappings
+			services = fallbackServices
+		}
+	}
+	_ = writeText(logPath, log)
 	probes := probeMappings(mappings, time.Duration(r.cfg.Docker.HealthCheckTimeoutSeconds)*time.Second)
 	_ = writeJSON(portMapPath, map[string]any{
 		"run_id":          run.RunID,
@@ -467,7 +497,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		"probes":          probes,
 	})
 	_ = writePlaceholderPNG(screenshotPath)
-	if ps.Err != nil {
+	if ps.Err != nil && len(mappings) == 0 {
 		record.Findings = []model.Finding{{
 			Stage:      "B",
 			Severity:   "High",
@@ -486,7 +516,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			Severity:   "High",
 			Title:      "Docker port mappings were empty",
 			Rule:       "Stage B must record real Docker/Compose port mappings.",
-			Evidence:   "docker compose ps returned no published ports.",
+			Evidence:   "docker compose ps and docker port fallback returned no published ports.",
 			Impact:     "External browser/runtime evidence cannot be collected from mapped host ports.",
 			MinimumFix: "Expose the service ports in docker-compose.yml and rerun B.",
 		}}
@@ -494,6 +524,29 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		return finishStage(record, model.StageFailed, start)
 	}
 	return finishStage(record, model.StageDone, start)
+}
+
+func (r Runner) dockerPortFallback(ctx context.Context, workDir string, psQArgs, servicesArgs []string) (map[string][]portMapping, []string, string) {
+	var log strings.Builder
+	servicesResult := r.exec.Run(ctx, 30*time.Second, workDir, nil, "docker", servicesArgs...)
+	log.WriteString("\n\n" + servicesResult.Command + "\nSTDOUT:\n" + servicesResult.Stdout + "\nSTDERR:\n" + servicesResult.Stderr)
+	serviceNames := splitNonEmptyLines(servicesResult.Stdout)
+	psQ := r.exec.Run(ctx, 30*time.Second, workDir, nil, "docker", psQArgs...)
+	log.WriteString("\n\n" + psQ.Command + "\nSTDOUT:\n" + psQ.Stdout + "\nSTDERR:\n" + psQ.Stderr)
+	containers := splitNonEmptyLines(psQ.Stdout)
+	mappings := map[string][]portMapping{}
+	var services []string
+	for index, container := range containers {
+		service := container
+		if index < len(serviceNames) {
+			service = serviceNames[index]
+		}
+		services = append(services, service)
+		port := r.exec.Run(ctx, 30*time.Second, workDir, nil, "docker", "port", container)
+		log.WriteString("\n\n" + port.Command + "\nSTDOUT:\n" + port.Stdout + "\nSTDERR:\n" + port.Stderr)
+		mappings[service] = append(mappings[service], parseDockerPort(service, port.Stdout)...)
+	}
+	return mappings, services, log.String()
 }
 
 func (r Runner) failB(record model.StageRecord, start time.Time, logPath, portMapPath, screenshotPath, evidence, fix string) model.StageRecord {
@@ -637,6 +690,40 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		record.ErrorSummary = "prompt profile unavailable"
 		return finishStage(record, model.StageFailed, start)
 	}
+	if r.cfg.Codex.Network != "none" {
+		report := staticUnavailableReport(stage, profile, project.Path, "configured Codex network mode is unsupported by the current safe sandbox: "+r.cfg.Codex.Network)
+		_ = writeText(outputPath, report)
+		_ = writeText(compatPath, report)
+		_ = writeText(logPath, report)
+		record.Findings = []model.Finding{{
+			Stage:      stage,
+			Severity:   "High",
+			Title:      stageName(stage) + " network policy unsupported",
+			Rule:       "D/E must execute under an enforceable no-network static sandbox for MVP.",
+			Evidence:   "codex.network=" + r.cfg.Codex.Network,
+			Impact:     "Static review evidence is incomplete because requested network behavior cannot be safely enforced.",
+			MinimumFix: "Set codex.network to none or implement a dedicated network-controlled sandbox runner.",
+		}}
+		record.ErrorSummary = "codex network policy unsupported"
+		return finishStage(record, model.StageFailed, start)
+	}
+	if r.cfg.Codex.WritableTmp {
+		report := staticUnavailableReport(stage, profile, project.Path, "configured writable_tmp=true is unsupported without widening write access in the current Codex CLI sandbox")
+		_ = writeText(outputPath, report)
+		_ = writeText(compatPath, report)
+		_ = writeText(logPath, report)
+		record.Findings = []model.Finding{{
+			Stage:      stage,
+			Severity:   "High",
+			Title:      stageName(stage) + " writable tmp policy unsupported",
+			Rule:       "D/E must not gain project write access during static review.",
+			Evidence:   "codex.writable_tmp=true",
+			Impact:     "Static review evidence is incomplete because artifact-only writes cannot be safely enforced.",
+			MinimumFix: "Set codex.writable_tmp to false or implement artifact-only writable sandbox mounting.",
+		}}
+		record.ErrorSummary = "codex writable tmp policy unsupported"
+		return finishStage(record, model.StageFailed, start)
+	}
 	if _, err := r.exec.LookPath("codex"); err != nil {
 		report := staticUnavailableReport(stage, profile, project.Path, "codex executable not found on PATH")
 		_ = writeText(outputPath, report)
@@ -671,7 +758,8 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	env := sandbox.Env(os.Environ())
 	timeout := time.Duration(r.cfg.Pipeline.StageTimeouts[stage]) * time.Second
 	prompt := codexPrompt(stage, profile, project.Path, run.ArtifactRoot, string(profileContent))
-	result := r.exec.Run(ctx, timeout, project.Path, env, "codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", prompt)
+	sandboxMode := "read-only"
+	result := r.exec.Run(ctx, timeout, project.Path, env, "codex", "exec", "--skip-git-repo-check", "--sandbox", sandboxMode, prompt)
 	report := strings.TrimSpace(result.Stdout)
 	if report == "" {
 		report = staticUnavailableReport(stage, profile, project.Path, strings.TrimSpace(result.Stderr))
@@ -1245,6 +1333,9 @@ func readmeComposeCommand(repoPath string) []string {
 			if len(clean) >= 3 && clean[0] == "docker" && clean[1] == "compose" {
 				return clean
 			}
+			if len(clean) >= 2 && clean[0] == "docker-compose" {
+				return append([]string{"docker", "compose"}, clean[1:]...)
+			}
 		}
 	}
 	return nil
@@ -1282,6 +1373,29 @@ func composePSArgs(fields []string, projectName string) []string {
 	return append(globals, "ps", "--format", "json")
 }
 
+func composePSQArgs(fields []string, projectName string) []string {
+	globals := composeGlobals(fields, projectName)
+	return append(globals, "ps", "-q")
+}
+
+func composeServicesArgs(fields []string, projectName string) []string {
+	globals := composeGlobals(fields, projectName)
+	return append(globals, "config", "--services")
+}
+
+func composeGlobals(fields []string, projectName string) []string {
+	args := append([]string{}, fields[1:]...)
+	commandIndex := composeCommandIndex(args)
+	if commandIndex < 0 {
+		commandIndex = len(args)
+	}
+	globals := append([]string{}, args[:commandIndex]...)
+	if !hasFlag(globals, "-p", "--project-name") {
+		globals = append(globals, "-p", projectName)
+	}
+	return globals
+}
+
 func composeCommandIndex(args []string) int {
 	for i, arg := range args {
 		switch arg {
@@ -1290,6 +1404,17 @@ func composeCommandIndex(args []string) int {
 		}
 	}
 	return -1
+}
+
+func splitNonEmptyLines(value string) []string {
+	var lines []string
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 func hasFlag(args []string, names ...string) bool {
@@ -1388,6 +1513,42 @@ func probeMappings(mappings map[string][]portMapping, timeout time.Duration) []p
 		}
 	}
 	return results
+}
+
+func parseDockerPort(service, raw string) []portMapping {
+	var mappings []portMapping
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, "->") {
+			continue
+		}
+		parts := strings.SplitN(line, "->", 2)
+		left := strings.TrimSpace(parts[0])
+		right := strings.TrimSpace(parts[1])
+		containerPort := 0
+		protocol := ""
+		if portParts := strings.SplitN(left, "/", 2); len(portParts) == 2 {
+			containerPort, _ = strconv.Atoi(portParts[0])
+			protocol = portParts[1]
+		}
+		lastColon := strings.LastIndex(right, ":")
+		if lastColon < 0 {
+			continue
+		}
+		hostText := right[lastColon+1:]
+		hostPort, _ := strconv.Atoi(hostText)
+		if hostPort == 0 {
+			continue
+		}
+		mappings = append(mappings, portMapping{
+			Service:   service,
+			URL:       strings.TrimSuffix(right[:lastColon], ":"),
+			Host:      hostPort,
+			Container: containerPort,
+			Protocol:  protocol,
+		})
+	}
+	return mappings
 }
 
 type runtimeEvidence struct {

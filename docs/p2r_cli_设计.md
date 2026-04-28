@@ -409,7 +409,7 @@ Codex 阶段处理的是不可信交付包内容，沙箱必须满足：
 - 不挂载 Docker socket
 - 不挂载宿主机凭证目录、浏览器 cookie、SSH key、token 文件
 - `HOME` 指向临时目录
-- 只允许写入当前项目的 `.tmp/` 和本次 run 的 artifact 目录
+- MVP 通过 stdout 收集 D/E 报告，默认 `writable_tmp: false` 并使用 Codex `read-only` sandbox；如后续改为模板直接写 `.tmp/`，必须先实现不扩大项目写权限的 artifact-only 写入策略
 - 默认禁用网络；如确需网络，必须在配置中显式开启并记录到 `run_manifest.json`
 - D/E 复用同一沙箱容器顺序执行（先 D 后 E），两阶段之间清理 workdir/cache 并重置 HOME 指向的临时目录。复用原因记录到 `run_manifest.json`
 - 限制 stdout/stderr 最大字节数，超限时截断并保留尾部
@@ -749,7 +749,7 @@ codex:
   prompt_profiles_dir: "./projects-qa/.qa-control/prompt_profiles"
   network: "none"
   max_output_bytes: 1048576
-  writable_tmp: true
+  writable_tmp: false
 
 tui:
   refresh_interval_ms: 100
