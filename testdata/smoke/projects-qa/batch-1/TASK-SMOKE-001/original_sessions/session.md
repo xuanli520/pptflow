@@ -1,3 +1,0 @@
-# Session
-
-Original session fixture.
