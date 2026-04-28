@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+const (
+	EnvConfig   = "P2R_CONFIG"
+	EnvScanPath = "P2R_SCAN_PATH"
+	EnvDBPath   = "P2R_DB_PATH"
+)
+
 type Config struct {
 	ScanPath string
 	DBPath   string
@@ -48,6 +54,18 @@ type Overrides struct {
 	DBPath   string
 }
 
+type pathBases struct {
+	ScanPath          string
+	DBPath            string
+	PromptProfilesDir string
+}
+
+type fileSettings struct {
+	ScanPath          bool
+	DBPath            bool
+	PromptProfilesDir bool
+}
+
 func Default() Config {
 	return Config{
 		ScanPath: "./projects-qa",
@@ -77,24 +95,93 @@ func Default() Config {
 
 func Load(cwd string, overrides Overrides) (Config, error) {
 	cfg := Default()
-	path := filepath.Join(cwd, ".p2r.yaml")
-	if _, err := os.Stat(path); err == nil {
-		if err := applyFile(&cfg, path); err != nil {
+	cwd = filepath.Clean(cwd)
+	bases := pathBases{
+		ScanPath:          cwd,
+		DBPath:            cwd,
+		PromptProfilesDir: cwd,
+	}
+
+	path, err := discoverConfig(cwd)
+	if err != nil {
+		return cfg, err
+	}
+	if path != "" {
+		settings, err := applyFile(&cfg, path)
+		if err != nil {
 			return cfg, err
 		}
-	} else if !os.IsNotExist(err) {
-		return cfg, err
+		base := filepath.Dir(path)
+		if settings.ScanPath {
+			bases.ScanPath = base
+		}
+		if settings.DBPath {
+			bases.DBPath = base
+		}
+		if settings.PromptProfilesDir {
+			bases.PromptProfilesDir = base
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv(EnvScanPath)); value != "" {
+		cfg.ScanPath = value
+		bases.ScanPath = cwd
+	}
+	if value := strings.TrimSpace(os.Getenv(EnvDBPath)); value != "" {
+		cfg.DBPath = value
+		bases.DBPath = cwd
 	}
 	if overrides.ScanPath != "" {
 		cfg.ScanPath = overrides.ScanPath
+		bases.ScanPath = cwd
 	}
 	if overrides.DBPath != "" {
 		cfg.DBPath = overrides.DBPath
+		bases.DBPath = cwd
 	}
-	cfg.ScanPath = absFrom(cwd, cfg.ScanPath)
-	cfg.DBPath = absFrom(cwd, cfg.DBPath)
-	cfg.Codex.PromptProfilesDir = absFrom(cwd, cfg.Codex.PromptProfilesDir)
+	cfg.ScanPath = absFrom(bases.ScanPath, cfg.ScanPath)
+	cfg.DBPath = absFrom(bases.DBPath, cfg.DBPath)
+	cfg.Codex.PromptProfilesDir = absFrom(bases.PromptProfilesDir, cfg.Codex.PromptProfilesDir)
 	return cfg, nil
+}
+
+func discoverConfig(cwd string) (string, error) {
+	if explicit := strings.TrimSpace(os.Getenv(EnvConfig)); explicit != "" {
+		path := absFrom(cwd, explicit)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				return "", fmt.Errorf("%s points to missing config %s", EnvConfig, path)
+			}
+			return "", err
+		}
+		return path, nil
+	}
+
+	localPath := filepath.Join(cwd, ".p2r.yaml")
+	if _, err := os.Stat(localPath); err == nil {
+		return localPath, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	for _, path := range userConfigCandidates() {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+func userConfigCandidates() []string {
+	var candidates []string
+	if configDir, err := os.UserConfigDir(); err == nil && configDir != "" {
+		candidates = append(candidates, filepath.Join(configDir, "p2r", "config.yaml"))
+	}
+	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
+		candidates = append(candidates, filepath.Join(homeDir, ".p2r.yaml"))
+	}
+	return candidates
 }
 
 func absFrom(cwd, path string) string {
@@ -104,10 +191,11 @@ func absFrom(cwd, path string) string {
 	return filepath.Clean(filepath.Join(cwd, path))
 }
 
-func applyFile(cfg *Config, path string) error {
+func applyFile(cfg *Config, path string) (fileSettings, error) {
+	var settings fileSettings
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return settings, err
 	}
 	defer file.Close()
 
@@ -139,8 +227,10 @@ func applyFile(cfg *Config, path string) error {
 		switch {
 		case section == "" && key == "scan_path":
 			cfg.ScanPath = value
+			settings.ScanPath = true
 		case section == "" && key == "db_path":
 			cfg.DBPath = value
+			settings.DBPath = true
 		case section == "pipeline" && key == "static_only":
 			cfg.Pipeline.StaticOnly = parseBool(value)
 		case section == "pipeline" && subSection == "stage_timeouts":
@@ -157,6 +247,7 @@ func applyFile(cfg *Config, path string) error {
 			cfg.Codex.SandboxImage = value
 		case section == "codex" && key == "prompt_profiles_dir":
 			cfg.Codex.PromptProfilesDir = value
+			settings.PromptProfilesDir = true
 		case section == "codex" && key == "network":
 			cfg.Codex.Network = value
 		case section == "codex" && key == "max_output_bytes":
@@ -170,9 +261,9 @@ func applyFile(cfg *Config, path string) error {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return settings, fmt.Errorf("read config: %w", err)
 	}
-	return nil
+	return settings, nil
 }
 
 func stripComment(line string) string {

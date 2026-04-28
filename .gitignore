@@ -3,4 +3,5 @@
 .gomodcache
 /projects-qa/
 /p2r-smoke.exe
+/dist/
 testdata/**/qa/

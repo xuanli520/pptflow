@@ -4,10 +4,12 @@ project_name: p2r
 
 builds:
   - id: p2r
-    main: .
+    main: ./cmd/p2r
     binary: p2r
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/xuanli520/p2r_tui/cmd.version={{.Version}} -X github.com/xuanli520/p2r_tui/cmd.commit={{.ShortCommit}} -X github.com/xuanli520/p2r_tui/cmd.buildDate={{.Date}}
     goos:
       - linux
       - darwin
@@ -20,7 +22,8 @@ builds:
         goarch: arm64
 
 archives:
-  - formats: [tar.gz]
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
         formats: [zip]

@@ -1,9 +1,11 @@
-package scanner
+package scanner_test
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
 func TestScanFindsValidPackages(t *testing.T) {
@@ -20,7 +22,7 @@ func TestScanFindsValidPackages(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "batch-1", "not-a-task", "docs"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Scan(root)
+	result, err := scanner.Scan(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +49,7 @@ func TestScanIndexesMissingPrompt(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(valid, "metadata.json"), []byte(`{"task_id":"TASK-002"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Scan(root)
+	result, err := scanner.Scan(root)
 	if err != nil {
 		t.Fatal(err)
 	}

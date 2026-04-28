@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -205,10 +206,13 @@ func (m app) execution() string {
 	findings, _ := m.store.Findings(context.Background(), run.RunID)
 	var builder strings.Builder
 	builder.WriteString(fmt.Sprintf("Task: %s  Run: %s  %s\n\n", taskID, run.RunID, run.Status))
+	builder.WriteString(fmt.Sprintf("Artifacts: %s\n\n", run.ArtifactRoot))
+	var selectedLog string
 	for index, stage := range stages {
 		prefix := "  "
 		if index == m.selectedStage {
 			prefix = "> "
+			selectedLog = stage.LogPath
 		}
 		builder.WriteString(fmt.Sprintf("%s[%s] %-34s %-10s %6dms", prefix, stage.Stage, stage.Name, stage.Status, stage.DurationMS))
 		if stage.ErrorSummary != "" {
@@ -233,6 +237,9 @@ func (m app) execution() string {
 			break
 		}
 		builder.WriteString(fmt.Sprintf("[%s] %s: %s\n", finding.Stage, finding.Severity, finding.Title))
+	}
+	if selectedLog != "" {
+		builder.WriteString("\n" + stageLogPreview(selectedLog, m.cfg.TUI.LogMaxLines))
 	}
 	m.logs.SetContent(builder.String())
 	return m.logs.View()
@@ -323,6 +330,22 @@ func empty(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func stageLogPreview(path string, maxLines int) string {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "Log: " + path + "\n" + err.Error() + "\n"
+	}
+	text := strings.TrimRight(string(content), "\r\n")
+	lines := strings.Split(text, "\n")
+	if maxLines <= 0 {
+		maxLines = 200
+	}
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return "Log: " + path + "\n" + strings.Join(lines, "\n")
 }
 
 func max(a, b int) int {

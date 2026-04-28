@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -302,13 +303,92 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 	record := startStage("A")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "A_validate.log")
 	record.LogPath = logPath
-	scriptResults := r.runStageAScripts(project, logPath)
+
+	scriptRoot := project.Path
+	snapshotPath := filepath.Join(run.ArtifactRoot, "script_input_snapshot")
+	snapshotErr := copyPackageSnapshot(project.Path, snapshotPath)
+	if snapshotErr == nil {
+		scriptRoot = snapshotPath
+	}
+
 	required := map[string]bool{
 		"docs":              dirExists(filepath.Join(project.Path, "docs")),
 		"repo":              dirExists(filepath.Join(project.Path, "repo")),
 		"original_sessions": dirExists(filepath.Join(project.Path, "original_sessions")),
 		"metadata.json":     fileExists(filepath.Join(project.Path, "metadata.json")),
 	}
+	findings := structuralFindings(project, required)
+	if snapshotErr != nil {
+		findings = append(findings, model.Finding{
+			Stage:      "A",
+			Severity:   "High",
+			Title:      "Script input snapshot could not be created",
+			Rule:       "Stage A scripts should inspect the delivery package without prior p2r QA artifacts.",
+			Evidence:   snapshotErr.Error(),
+			Impact:     "Checks may include previous qa/ artifacts and produce noisy findings.",
+			MinimumFix: "Ensure the run artifact directory is writable and rerun Stage A.",
+		})
+	}
+
+	acceptancePath := filepath.Join(run.ArtifactRoot, "acceptance.json")
+	reportPath := filepath.Join(run.ArtifactRoot, "validation_report.md")
+	requiredPath := filepath.Join(run.ArtifactRoot, "required_artifacts.json")
+	readmeAlignmentPath := filepath.Join(run.ArtifactRoot, "readme_alignment.json")
+	localDependencyPath := filepath.Join(run.ArtifactRoot, "local_dependency.json")
+	fakeImplPath := filepath.Join(run.ArtifactRoot, "fake_impl.json")
+	testsInspectionPath := filepath.Join(run.ArtifactRoot, "tests_inspection.json")
+	englishOnlyPath := filepath.Join(run.ArtifactRoot, "english_only.json")
+
+	scriptResults := r.runStageAScripts(project, scriptRoot, logPath, map[string]string{
+		"acceptance":       acceptancePath,
+		"validation":       reportPath,
+		"required":         requiredPath,
+		"readme_alignment": readmeAlignmentPath,
+		"local_dependency": localDependencyPath,
+		"fake_impl":        fakeImplPath,
+		"tests_inspection": testsInspectionPath,
+		"english_only":     englishOnlyPath,
+	})
+
+	if !fileExists(acceptancePath) {
+		_ = writeJSON(acceptancePath, scriptResults["run_acceptance.py"])
+	}
+	if !fileExists(reportPath) {
+		_ = writeText(reportPath, validationMarkdown(project, required, findings))
+	}
+	if result, ok := scriptResults["run_acceptance.py"]; ok && !result.OK {
+		findings = append(findings, model.Finding{
+			Stage:      "A",
+			Severity:   "High",
+			Title:      "run_acceptance.py did not complete cleanly",
+			Rule:       "Stage A must collect primary acceptance evidence from the bundled script.",
+			Evidence:   result.summary(),
+			Impact:     "Primary acceptance evidence may be incomplete.",
+			MinimumFix: "Ensure Python/uv can run the embedded scripts and rerun Stage A.",
+			SourcePath: acceptancePath,
+		})
+	}
+	findings = append(findings, acceptanceFindings(acceptancePath)...)
+
+	artifactPaths := []string{acceptancePath, reportPath, requiredPath, readmeAlignmentPath, localDependencyPath}
+	for _, path := range []string{fakeImplPath, testsInspectionPath, englishOnlyPath} {
+		if fileExists(path) {
+			artifactPaths = append(artifactPaths, path)
+		}
+	}
+	record.ArtifactPaths = artifactPaths
+	record.Findings = findings
+	_ = appendText(logPath, "\n\n"+validationMarkdown(project, required, findings))
+
+	status := model.StageDone
+	if hasHardStageAFailure(record.Findings, scriptResults["run_acceptance.py"]) {
+		status = model.StageFailed
+		record.ErrorSummary = fmt.Sprintf("%d acceptance finding(s)", len(record.Findings))
+	}
+	return finishStage(record, status, start)
+}
+
+func structuralFindings(project scanner.Project, required map[string]bool) []model.Finding {
 	findings := []model.Finding{}
 	for name, ok := range required {
 		if !ok {
@@ -334,82 +414,122 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 			MinimumFix: "Populate metadata.json.prompt with the source prompt.",
 		})
 	}
-
-	acceptance := map[string]any{"task_id": project.TaskID, "required": required, "metadata_prompt_missing": project.MetadataPromptMissing, "ok": len(findings) == 0}
-	requiredPath := filepath.Join(run.ArtifactRoot, "required_artifacts.json")
-	acceptancePath := filepath.Join(run.ArtifactRoot, "acceptance.json")
-	reportPath := filepath.Join(run.ArtifactRoot, "validation_report.md")
-	readmeAlignmentPath := filepath.Join(run.ArtifactRoot, "readme_alignment.json")
-	localDependencyPath := filepath.Join(run.ArtifactRoot, "local_dependency.json")
-	if content := scriptResults["check_required_artifacts.py"]; content != "" {
-		_ = writeText(requiredPath, content)
-	} else {
-		_ = writeJSON(requiredPath, required)
-	}
-	if content := scriptResults["run_acceptance.py"]; content != "" {
-		_ = writeText(acceptancePath, content)
-	} else {
-		_ = writeJSON(acceptancePath, acceptance)
-	}
-	if content := scriptResults["check_readme_alignment.py"]; content != "" {
-		_ = writeText(readmeAlignmentPath, content)
-	} else {
-		_ = writeJSON(readmeAlignmentPath, map[string]any{"manual_review_required": true, "readme_files": readmes(filepath.Join(project.Path, "repo"))})
-	}
-	if content := scriptResults["check_local_dependency.py"]; content != "" {
-		_ = writeText(localDependencyPath, content)
-	} else {
-		_ = writeJSON(localDependencyPath, map[string]any{"local_dependency_paths": localDependencyPaths(project.Path)})
-	}
-	_ = writeText(reportPath, validationMarkdown(project, required, findings))
-	_ = appendText(logPath, "\n\n"+validationMarkdown(project, required, findings))
-	record.ArtifactPaths = append(record.ArtifactPaths, acceptancePath, reportPath, requiredPath, readmeAlignmentPath, localDependencyPath)
-	record.Findings = append(findings, scriptFindings(scriptResults)...)
-	status := model.StageDone
-	if len(record.Findings) > 0 {
-		status = model.StageFailed
-		record.ErrorSummary = fmt.Sprintf("%d structural/script finding(s)", len(record.Findings))
-	}
-	return finishStage(record, status, start)
+	return findings
 }
 
-func (r Runner) runStageAScripts(project scanner.Project, logPath string) map[string]string {
-	results := map[string]string{}
-	scripts := []string{
-		"run_acceptance.py",
-		"run_validate.py",
-		"check_required_artifacts.py",
-		"check_readme_alignment.py",
-		"check_local_dependency.py",
-		"check_fake_impl.py",
+func (r Runner) runStageAScripts(project scanner.Project, scriptRoot, logPath string, outputs map[string]string) map[string]scriptExecution {
+	results := map[string]scriptExecution{}
+	projectTypeArgs := projectTypeArgs(scriptRoot)
+	results["run_acceptance.py"] = r.runStageAScript(project.Path, scriptRoot, "run_acceptance.py", acceptanceScriptArgs(outputs, projectTypeArgs))
+
+	checks := []struct {
+		script string
+		output string
+		args   []string
+	}{
+		{"check_required_artifacts.py", outputs["required"], projectTypeArgs},
+		{"check_readme_alignment.py", outputs["readme_alignment"], projectTypeArgs},
+		{"check_local_dependency.py", outputs["local_dependency"], nil},
+		{"check_fake_impl.py", outputs["fake_impl"], nil},
+		{"inspect_tests.py", outputs["tests_inspection"], projectTypeArgs},
 	}
 	if promptLooksEnglish(filepath.Join(project.Path, "metadata.json")) {
-		scripts = append(scripts, "check_english_only.py")
+		checks = append(checks, struct {
+			script string
+			output string
+			args   []string
+		}{"check_english_only.py", outputs["english_only"], nil})
 	}
-	python, prefix, pythonErr := r.pythonInvocation(project.Path)
-	env := append(os.Environ(), "UV_CACHE_DIR="+filepath.Join(r.cfg.ScanPath, ".qa-control", ".uv-cache"))
 	var log strings.Builder
-	for _, script := range scripts {
-		scriptPath := filepath.Join(r.cfg.ScanPath, ".qa-control", "scripts", script)
-		if pythonErr != "" {
-			results[script] = fmt.Sprintf(`{"error":%q,"script":%q}`+"\n", pythonErr, scriptPath)
-			continue
-		}
-		if !fileExists(scriptPath) {
-			results[script] = fmt.Sprintf(`{"error":"script not found","script":%q}`+"\n", scriptPath)
-			continue
-		}
-		args := append(append([]string{}, prefix...), scriptPath, project.Path)
-		result := r.exec.Run(context.Background(), time.Duration(r.cfg.Pipeline.StageTimeouts["A"])*time.Second, project.Path, env, python, args...)
-		output := strings.TrimSpace(result.Stdout)
-		if output == "" {
-			output = strings.TrimSpace(result.Stderr)
-		}
-		results[script] = output + "\n"
-		log.WriteString(result.Command + "\nSTDOUT:\n" + result.Stdout + "\nSTDERR:\n" + result.Stderr + "\n\n")
+	log.WriteString(results["run_acceptance.py"].logBlock())
+	for _, check := range checks {
+		result := r.runStageAScript(project.Path, scriptRoot, check.script, check.args)
+		results[check.script] = result
+		_ = writeJSON(check.output, result)
+		log.WriteString(result.logBlock())
 	}
 	_ = writeText(logPath, log.String())
 	return results
+}
+
+func acceptanceScriptArgs(outputs map[string]string, projectTypeArgs []string) []string {
+	args := []string{
+		"--output-json", outputs["acceptance"],
+		"--output-md", outputs["validation"],
+	}
+	return append(args, projectTypeArgs...)
+}
+
+type scriptExecution struct {
+	Script    string `json:"script"`
+	Command   string `json:"command,omitempty"`
+	InputRoot string `json:"input_root,omitempty"`
+	OK        bool   `json:"ok"`
+	ExitCode  int    `json:"exit_code"`
+	Timeout   bool   `json:"timeout,omitempty"`
+	Stdout    string `json:"stdout,omitempty"`
+	Stderr    string `json:"stderr,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func (r Runner) runStageAScript(workDir, inputRoot, script string, extraArgs []string) scriptExecution {
+	scriptPath := filepath.Join(r.cfg.ScanPath, ".qa-control", "scripts", script)
+	result := scriptExecution{Script: script, InputRoot: inputRoot}
+	python, prefix, pythonErr := r.pythonInvocation(workDir)
+	if pythonErr != "" {
+		result.Error = pythonErr
+		return result
+	}
+	if !fileExists(scriptPath) {
+		result.Error = "script not found: " + scriptPath
+		return result
+	}
+	args := append(append([]string{}, prefix...), scriptPath, inputRoot)
+	args = append(args, extraArgs...)
+	env := append(os.Environ(), "UV_CACHE_DIR="+filepath.Join(r.cfg.ScanPath, ".qa-control", ".uv-cache"))
+	timeout := time.Duration(r.cfg.Pipeline.StageTimeouts["A"]) * time.Second
+	execResult := r.exec.Run(context.Background(), timeout, inputRoot, env, python, args...)
+	result.Command = execResult.Command
+	result.Stdout = execResult.Stdout
+	result.Stderr = execResult.Stderr
+	result.ExitCode = execResult.ExitCode
+	result.Timeout = execResult.Timeout
+	result.OK = execResult.Err == nil
+	if execResult.Err != nil {
+		result.Error = execResult.Err.Error()
+	}
+	return result
+}
+
+func (s scriptExecution) logBlock() string {
+	var builder strings.Builder
+	builder.WriteString(s.Command)
+	if s.Command == "" {
+		builder.WriteString(s.Script)
+	}
+	builder.WriteString("\nINPUT_ROOT:\n" + s.InputRoot + "\nSTDOUT:\n" + s.Stdout + "\nSTDERR:\n" + s.Stderr)
+	if s.Error != "" {
+		builder.WriteString("\nERROR:\n" + s.Error)
+	}
+	builder.WriteString("\n\n")
+	return builder.String()
+}
+
+func (s scriptExecution) summary() string {
+	parts := []string{}
+	if s.Error != "" {
+		parts = append(parts, s.Error)
+	}
+	if text := strings.TrimSpace(s.Stderr); text != "" {
+		parts = append(parts, text)
+	}
+	if text := strings.TrimSpace(s.Stdout); text != "" {
+		parts = append(parts, text)
+	}
+	if len(parts) == 0 {
+		return "script produced no output"
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (r Runner) pythonInvocation(workDir string) (string, []string, string) {
@@ -879,6 +999,196 @@ func runStatus(stages []model.StageRecord) string {
 	return model.RunCompletedClean
 }
 
+func copyPackageSnapshot(source, dest string) error {
+	if err := os.RemoveAll(dest); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return err
+	}
+	skipTopLevel := map[string]bool{
+		".git":        true,
+		".qa-control": true,
+		"qa":          true,
+	}
+	skipDirNames := map[string]bool{
+		".next":         true,
+		".pytest_cache": true,
+		".venv":         true,
+		"__pycache__":   true,
+		"build":         true,
+		"coverage":      true,
+		"dist":          true,
+		"node_modules":  true,
+		"venv":          true,
+	}
+	return filepath.WalkDir(source, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) > 0 && skipTopLevel[parts[0]] {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() && skipDirNames[d.Name()] {
+			return filepath.SkipDir
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		target := filepath.Join(dest, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return copyFile(path, target, info.Mode())
+	})
+}
+
+func copyFile(source, dest string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+func projectTypeArgs(root string) []string {
+	content, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+	if err != nil {
+		return nil
+	}
+	var data map[string]any
+	if json.Unmarshal(content, &data) != nil {
+		return nil
+	}
+	value := strings.ToLower(strings.TrimSpace(fmt.Sprint(data["project_type"])))
+	switch value {
+	case "pure_frontend", "pure_backend", "fullstack":
+		return []string{"--project-type", value}
+	case "web", "android", "ios", "desktop":
+		return []string{"--project-type", "pure_frontend"}
+	case "server":
+		return []string{"--project-type", "pure_backend"}
+	default:
+		return nil
+	}
+}
+
+func acceptanceFindings(path string) []model.Finding {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(content, &payload); err != nil {
+		return []model.Finding{{
+			Stage:      "A",
+			Severity:   "High",
+			Title:      "acceptance.json was not valid JSON",
+			Rule:       "run_acceptance.py must emit machine-readable JSON.",
+			Evidence:   err.Error(),
+			Impact:     "Acceptance findings could not be extracted.",
+			MinimumFix: "Inspect Stage A logs and rerun after fixing script execution.",
+			SourcePath: path,
+		}}
+	}
+	var findings []model.Finding
+	findings = append(findings, issueFindings("blocking_issues", payload["blocking_issues"], path)...)
+	findings = append(findings, issueFindings("non_blocking_issues", payload["non_blocking_issues"], path)...)
+	return findings
+}
+
+func issueFindings(section string, raw any, sourcePath string) []model.Finding {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	findings := make([]model.Finding, 0, len(items))
+	for _, item := range items {
+		issue, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		issueID := issueString(issue, "issue_id", "acceptance issue")
+		if section == "non_blocking_issues" && issueID == "runtime-verification-missing" {
+			continue
+		}
+		findings = append(findings, model.Finding{
+			Stage:      "A",
+			Severity:   acceptanceSeverity(section, issue["severity"]),
+			Title:      issueID,
+			Rule:       issueString(issue, "rule", ""),
+			Evidence:   issueString(issue, "evidence", ""),
+			Impact:     issueString(issue, "done_criteria", ""),
+			MinimumFix: issueString(issue, "repair_action", ""),
+			SourcePath: sourcePath,
+		})
+	}
+	return findings
+}
+
+func issueString(issue map[string]any, key, fallback string) string {
+	value, ok := issue[key]
+	if !ok || value == nil {
+		return fallback
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" {
+		return fallback
+	}
+	return text
+}
+
+func acceptanceSeverity(section string, raw any) string {
+	value := strings.ToLower(strings.TrimSpace(fmt.Sprint(raw)))
+	if section == "blocking_issues" || value == "blocking" || value == "blocker" || value == "critical" {
+		return "Blocker"
+	}
+	switch value {
+	case "major", "high":
+		return "High"
+	case "minor", "medium":
+		return "Medium"
+	case "low":
+		return "Low"
+	default:
+		return "High"
+	}
+}
+
+func hasHardStageAFailure(findings []model.Finding, primary scriptExecution) bool {
+	if !primary.OK {
+		return true
+	}
+	for _, finding := range findings {
+		if finding.Severity == "Blocker" {
+			return true
+		}
+	}
+	return false
+}
+
 func assignFindingIDs(stage string, findings []model.Finding) []model.Finding {
 	counts := map[string]int{}
 	for i := range findings {
@@ -962,122 +1272,6 @@ func promptLooksEnglish(metadataPath string) bool {
 		}
 	}
 	return float64(ascii)/float64(len([]rune(prompt))) > 0.9
-}
-
-func scriptFindings(results map[string]string) []model.Finding {
-	var findings []model.Finding
-	for script, content := range results {
-		if strings.TrimSpace(content) == "" {
-			continue
-		}
-		var data map[string]any
-		if err := json.Unmarshal([]byte(content), &data); err != nil {
-			continue
-		}
-		if errText, ok := data["error"].(string); ok && errText != "" {
-			findings = append(findings, model.Finding{
-				Stage:      "A",
-				Severity:   "High",
-				Title:      script + " did not run",
-				Rule:       "Stage A must execute bundled acceptance scripts.",
-				Evidence:   errText,
-				Impact:     "Acceptance evidence is incomplete.",
-				MinimumFix: "Ensure embedded scripts are released and Python is available.",
-			})
-			continue
-		}
-		switch script {
-		case "run_acceptance.py":
-			if missing := stringSlice(data["missing"]); len(missing) > 0 {
-				findings = append(findings, model.Finding{
-					Stage:      "A",
-					Severity:   "Blocker",
-					Title:      "Missing required p2r package roots: " + strings.Join(missing, ", "),
-					Rule:       "p2r package requires docs/, repo/, original_sessions/, and metadata.json.",
-					Evidence:   content,
-					Impact:     "The delivery package cannot be accepted as structurally complete.",
-					MinimumFix: "Add the missing package roots and rerun A.",
-				})
-			}
-		case "run_validate.py":
-			if readable, _ := data["metadata_readable"].(bool); !readable {
-				findings = append(findings, model.Finding{
-					Stage:      "A",
-					Severity:   "Blocker",
-					Title:      "metadata.json is not readable",
-					Rule:       "metadata.json must be readable for validation.",
-					Evidence:   content,
-					Impact:     "Prompt and package metadata cannot be validated.",
-					MinimumFix: "Fix metadata.json and rerun A.",
-				})
-			}
-		case "check_required_artifacts.py":
-			for key, value := range data {
-				if ok, isBool := value.(bool); isBool && !ok {
-					findings = append(findings, model.Finding{
-						Stage:      "A",
-						Severity:   "High",
-						Title:      "Missing expected artifact: " + key,
-						Rule:       "prompt2repo delivery should include required docs and test artifacts.",
-						Evidence:   content,
-						Impact:     "QA evidence may be incomplete.",
-						MinimumFix: "Add the missing artifact or document why it is not applicable.",
-					})
-				}
-			}
-		case "check_local_dependency.py":
-			if paths := stringSlice(data["local_dependency_paths"]); len(paths) > 0 {
-				findings = append(findings, model.Finding{
-					Stage:      "A",
-					Severity:   "High",
-					Title:      "Local dependency/cache artifacts are present",
-					Rule:       "Delivery packages should not include local dependency or cache directories.",
-					Evidence:   strings.Join(paths, ", "),
-					Impact:     "The package may be non-reproducible or unnecessarily large.",
-					MinimumFix: "Remove local dependencies/caches and rely on declared package managers.",
-				})
-			}
-		case "check_fake_impl.py":
-			if matches, ok := data["matches"].([]any); ok && len(matches) > 0 {
-				findings = append(findings, model.Finding{
-					Stage:      "A",
-					Severity:   "Medium",
-					Title:      "Possible fake/mock implementation markers found",
-					Rule:       "Implementation should not hide mock/stub/fake behavior unless explicitly intended.",
-					Evidence:   content,
-					Impact:     "Static acceptance should inspect these markers closely.",
-					MinimumFix: "Remove fake paths or document legitimate test-only usage.",
-				})
-			}
-		case "check_english_only.py":
-			if files := stringSlice(data["non_ascii_files"]); len(files) > 0 {
-				findings = append(findings, model.Finding{
-					Stage:      "A",
-					Severity:   "Medium",
-					Title:      "English-prompt delivery contains non-ASCII text",
-					Rule:       "English prompt deliverables should keep repository artifacts in English unless required.",
-					Evidence:   strings.Join(files, ", "),
-					Impact:     "The package may violate language policy.",
-					MinimumFix: "Translate user-facing repository artifacts or justify exceptions.",
-				})
-			}
-		}
-	}
-	return findings
-}
-
-func stringSlice(value any) []string {
-	items, ok := value.([]any)
-	if !ok {
-		return nil
-	}
-	result := make([]string, 0, len(items))
-	for _, item := range items {
-		if text, ok := item.(string); ok {
-			result = append(result, text)
-		}
-	}
-	return result
 }
 
 func validationMarkdown(project scanner.Project, required map[string]bool, findings []model.Finding) string {
@@ -1249,23 +1443,6 @@ func fileExists(path string) bool {
 
 func readmes(repoPath string) []string {
 	matches, _ := filepath.Glob(filepath.Join(repoPath, "README*"))
-	return matches
-}
-
-func localDependencyPaths(root string) []string {
-	bad := map[string]bool{".venv": true, "venv": true, "node_modules": true, ".pytest_cache": true, "__pycache__": true}
-	var matches []string
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err == nil && bad[d.Name()] {
-			if rel, relErr := filepath.Rel(root, path); relErr == nil {
-				matches = append(matches, rel)
-			}
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-		}
-		return nil
-	})
 	return matches
 }
 
