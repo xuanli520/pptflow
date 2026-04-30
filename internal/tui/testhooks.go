@@ -32,6 +32,12 @@ type TestExecutionProbe struct {
 	RefRunIDs          []string
 }
 
+type TestStagePlan struct {
+	RunStages     []string
+	DisplayStages []string
+	BlockedReason string
+}
+
 func NewTestHarness(cfg config.Config) TestHarness {
 	m := newApp(nil, cfg)
 	m.width = 120
@@ -239,6 +245,20 @@ func ExecutionLayoutModeForTest(width, height int) string {
 
 func TruncateDisplayForTest(value string, width int) string {
 	return truncateDisplay(value, width)
+}
+
+func StagePlanForTest(mode, stage string, staticOnly bool) TestStagePlan {
+	plan := stagePlanForMode(mode, stage, staticOnly)
+	result := TestStagePlan{
+		BlockedReason: plan.blockedReason,
+	}
+	if plan.runStages != nil {
+		result.RunStages = append([]string{}, plan.runStages...)
+	}
+	if plan.displayStages != nil {
+		result.DisplayStages = append([]string{}, plan.displayStages...)
+	}
+	return result
 }
 
 func FooterForTest(focus string, confirm bool) string {

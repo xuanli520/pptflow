@@ -8,6 +8,7 @@ import (
 	"testing"
 	_ "unsafe"
 
+	"github.com/xuanli520/p2r_tui/internal/codex"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
@@ -44,6 +45,9 @@ func terminalScreenshotLines(text string) []string
 
 //go:linkname safeCodexExtraArgs github.com/xuanli520/p2r_tui/internal/pipeline.safeCodexExtraArgs
 func safeCodexExtraArgs(args []string) ([]string, error)
+
+//go:linkname capabilitySummary github.com/xuanli520/p2r_tui/internal/pipeline.capabilitySummary
+func capabilitySummary(capability codex.Capability) string
 
 type portMapping struct {
 	Service   string
@@ -168,8 +172,20 @@ func TestSafeCodexExtraArgsRejectsBoundaryFlags(t *testing.T) {
 	if _, err := safeCodexExtraArgs([]string{"--model", "gpt-5.4"}); err != nil {
 		t.Fatalf("safe args rejected: %v", err)
 	}
-	if _, err := safeCodexExtraArgs([]string{"--sandbox", "workspace-write"}); err == nil {
-		t.Fatal("expected --sandbox to be rejected")
+	for _, flag := range []string{"--sandbox", "--full-auto", "--search", "--dangerously-bypass-approvals-and-sandbox"} {
+		if _, err := safeCodexExtraArgs([]string{flag}); err == nil {
+			t.Fatalf("expected %s to be rejected", flag)
+		}
+	}
+	if _, err := safeCodexExtraArgs([]string{"--full-auto=true"}); err == nil {
+		t.Fatal("expected --full-auto=... to be rejected")
+	}
+}
+
+func TestCapabilitySummaryIncludesFullAutoDiagnostic(t *testing.T) {
+	summary := capabilitySummary(codex.Capability{Path: "codex", HasFullAuto: true})
+	if !strings.Contains(summary, "full_auto=true") {
+		t.Fatalf("summary missing full_auto diagnostic: %s", summary)
 	}
 }
 

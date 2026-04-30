@@ -25,6 +25,7 @@ type Capability struct {
 	HasEphemeral           bool   `json:"has_ephemeral"`
 	HasSkipGitRepoCheck    bool   `json:"has_skip_git_repo_check"`
 	HasIgnoreUserConfig    bool   `json:"has_ignore_user_config"`
+	HasFullAuto            bool   `json:"has_full_auto"`
 	NodePath               string `json:"node_path,omitempty"`
 	PathPrependedForNode   bool   `json:"path_prepended_for_node"`
 	ExecHelpAvailable      bool   `json:"exec_help_available"`
@@ -74,6 +75,7 @@ func ApplyExecHelp(cap *Capability, help string) {
 	cap.HasEphemeral = hasHelpToken(help, "--ephemeral")
 	cap.HasSkipGitRepoCheck = hasHelpToken(help, "--skip-git-repo-check")
 	cap.HasIgnoreUserConfig = hasHelpToken(help, "--ignore-user-config")
+	cap.HasFullAuto = hasHelpToken(help, "--full-auto")
 }
 
 func BuildExecArgs(cap Capability, projectPath string, extraArgs []string) ([]string, error) {

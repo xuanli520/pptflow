@@ -147,7 +147,9 @@ func validateExtraArgs(args []string) string {
 		"--cd":               true,
 		"-C":                 true,
 		"--dangerously-bypass-approvals-and-sandbox": true,
-		"--add-dir": true,
+		"--full-auto": true,
+		"--search":    true,
+		"--add-dir":   true,
 	}
 	for _, arg := range args {
 		key := arg

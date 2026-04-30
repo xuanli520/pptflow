@@ -17,13 +17,14 @@ func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
 		HasCDLong:           true,
 		HasEphemeral:        true,
 		HasSkipGitRepoCheck: true,
+		HasFullAuto:         true,
 	}
 	args, err := codex.BuildExecArgs(capability, "/repo", []string{"--model", "gpt-5.4"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := joinArgs(args)
-	for _, absent := range []string{"--ask-for-approval"} {
+	for _, absent := range []string{"--ask-for-approval", "--full-auto"} {
 		if containsArg(args, absent) {
 			t.Fatalf("args should not contain unavailable optional flag %s: %#v", absent, args)
 		}
@@ -32,6 +33,34 @@ func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
 		if !containsArg(args, want) {
 			t.Fatalf("args missing %s in %s", want, joined)
 		}
+	}
+}
+
+func TestApplyExecHelpDetectsFullAutoForDiagnosticsOnly(t *testing.T) {
+	var capability codex.Capability
+	codex.ApplyExecHelp(&capability, `
+Usage: codex exec [OPTIONS] [PROMPT]
+  --sandbox <MODE>
+  --ask-for-approval <POLICY>
+  -c, --config <KEY=VALUE>
+  --cd <DIR>
+  --full-auto
+`)
+	if !capability.HasFullAuto {
+		t.Fatal("expected --full-auto to be detected")
+	}
+	args, err := codex.BuildExecArgs(codex.Capability{
+		Path:              "codex",
+		HasSandbox:        true,
+		HasAskForApproval: true,
+		HasCDLong:         true,
+		HasFullAuto:       true,
+	}, "/repo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsArg(args, "--full-auto") {
+		t.Fatalf("BuildExecArgs must not use --full-auto: %#v", args)
 	}
 }
 

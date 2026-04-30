@@ -384,7 +384,9 @@ func safeCodexExtraArgs(args []string) ([]string, error) {
 		"--cd":               true,
 		"-C":                 true,
 		"--dangerously-bypass-approvals-and-sandbox": true,
-		"--add-dir": true,
+		"--full-auto": true,
+		"--search":    true,
+		"--add-dir":   true,
 	}
 	for _, arg := range args {
 		key := arg
@@ -425,6 +427,7 @@ func capabilitySummary(capability codex.Capability) string {
 		fmt.Sprintf("ephemeral=%t", capability.HasEphemeral),
 		fmt.Sprintf("skip_git_repo_check=%t", capability.HasSkipGitRepoCheck),
 		fmt.Sprintf("ignore_user_config=%t", capability.HasIgnoreUserConfig),
+		fmt.Sprintf("full_auto=%t", capability.HasFullAuto),
 		"node=" + capability.NodePath,
 		fmt.Sprintf("path_prepended_for_node=%t", capability.PathPrependedForNode),
 	}

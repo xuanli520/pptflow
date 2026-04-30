@@ -222,16 +222,13 @@ func (m app) tick() tea.Cmd {
 
 func (m app) runSelected() tea.Cmd {
 	taskID := m.selectedTaskID()
-	stage := m.selectedStageKey
-	if stage == "" {
-		stage = stageLetter(m.stageIndex)
-	}
 	refRun := m.selectedRefRun()
 	mode := m.qaMode
+	plan := m.rerunStagePlan()
 	return func() tea.Msg {
 		runner := pipeline.NewRunner(m.store, m.cfg)
 		result, err := runner.Run(context.Background(), taskID, pipeline.RunOptions{
-			Stages: affectedStages(stage),
+			Stages: plan.runStages,
 			Mode:   mode,
 			RefRun: refRun,
 		})

@@ -250,6 +250,10 @@ func (m *app) openRerunConfirm() {
 		return
 	}
 	m.syncRefSelection()
+	if plan := m.rerunStagePlan(); plan.blockedReason != "" {
+		m.message = plan.blockedReason
+		return
+	}
 	if m.qaMode == "recheck" && m.selectedRefRun() == "" {
 		m.message = "打回重检模式需要选择一个参考运行"
 		if m.tab == panelExecution {

@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"strings"
 	"testing"
 	_ "unsafe"
 
@@ -110,6 +111,68 @@ func TestExecutionRenderDoesNotExceedViewportWidth(t *testing.T) {
 		if got := lipgloss.Width(view); got > width {
 			t.Fatalf("render width at %d columns = %d, want <= %d\n%s", width, got, width, view)
 		}
+	}
+	for _, size := range []struct {
+		width  int
+		height int
+	}{
+		{120, 12},
+		{100, 12},
+		{90, 12},
+	} {
+		view := tuiapp.NewTestHarness(config.Default()).
+			SeedExecutionDetail("TASK-1").
+			SetSize(size.width, size.height).
+			View()
+		if got := lipgloss.Width(view); got > size.width {
+			t.Fatalf("render width at %dx%d = %d, want <= %d\n%s", size.width, size.height, got, size.width, view)
+		}
+		if got := lipgloss.Height(view); got > size.height {
+			t.Fatalf("render height at %dx%d = %d, want <= %d\n%s", size.width, size.height, got, size.height, view)
+		}
+	}
+}
+
+func TestExecutionLeftKeepsSelectedStageVisibleOnSmallHeight(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionDetail("TASK-1").
+		SeedStages([]model.StageRecord{
+			{Stage: "A", Status: model.StageDone},
+			{Stage: "B", Status: model.StageDone},
+			{Stage: "C", Status: model.StageDone},
+			{Stage: "D", Status: model.StageDone},
+			{Stage: "E", Status: model.StageDone},
+			{Stage: "F", Status: model.StageFailed},
+		}, "F").
+		SetSize(120, 12)
+	view := h.View()
+	if got := lipgloss.Height(view); got > 12 {
+		t.Fatalf("render height = %d, want <= 12\n%s", got, view)
+	}
+	if !strings.Contains(view, "↑") || !strings.Contains(view, "F") {
+		t.Fatalf("small left panel should show scroll marker and selected Stage F:\n%s", view)
+	}
+}
+
+func TestExecutionLeftCropsRefRunsAndKeepsSelectionVisible(t *testing.T) {
+	runIDs := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		runIDs = append(runIDs, "run-"+string(rune('A'+i)))
+	}
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionDetail("TASK-1").
+		SeedRefRuns(runIDs...).
+		SetFocus("ref-run-list").
+		SetSize(120, 12)
+	for i := 0; i < 18; i++ {
+		h, _ = h.Press("down")
+	}
+	view := h.View()
+	if got := lipgloss.Height(view); got > 12 {
+		t.Fatalf("render height = %d, want <= 12\n%s", got, view)
+	}
+	if !strings.Contains(view, "run-S") {
+		t.Fatalf("selected ref run should remain visible:\n%s", view)
 	}
 }
 

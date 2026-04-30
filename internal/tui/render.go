@@ -52,7 +52,8 @@ func renderExecution(m app) string {
 	}
 	layout := layoutFor(m.width, m.height, true)
 	if layout.mode == layoutWide || layout.mode == layoutMedium {
-		left := renderPanel(layout.leftWidth, layout.contentHeight, renderExecutionLeft(m, max(8, layout.leftWidth-panelStyle.GetHorizontalFrameSize())))
+		leftContentHeight := max(1, layout.contentHeight-panelStyle.GetVerticalFrameSize())
+		left := renderPanel(layout.leftWidth, layout.contentHeight, renderExecutionLeft(m, max(8, layout.leftWidth-panelStyle.GetHorizontalFrameSize()), leftContentHeight))
 		rightWidth := max(8, layout.rightWidth-panelStyle.GetHorizontalFrameSize())
 		right := renderPanel(layout.rightWidth, layout.contentHeight, renderDetailContext(m, rightWidth)+"\n"+m.detail.View())
 		return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
@@ -69,29 +70,94 @@ func renderPanel(width, height int, content string) string {
 	return panelStyle.Width(contentWidth).Height(contentHeight).Render(content)
 }
 
-func renderExecutionLeft(m app, width int) string {
-	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("任务: %s\n", truncateMiddleDisplay(m.detailVM.TaskID, max(8, width-4))))
+func renderExecutionLeft(m app, width int, maxHeight int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
+	width = max(1, width)
+	info := []string{
+		fmt.Sprintf("任务: %s", truncateMiddleDisplay(m.detailVM.TaskID, max(8, width-4))),
+	}
+	info = append(info, "模式: "+localizeMode(m.qaMode))
+	if m.qaMode == "recheck" {
+		info = append(info, "参考运行: "+empty(m.selectedRefRun(), "-"))
+	}
 	if m.detailVM.HasRun {
-		builder.WriteString(fmt.Sprintf("运行: %s\n", truncateMiddleDisplay(m.detailVM.Run.RunID, max(8, width-4))))
-		builder.WriteString(fmt.Sprintf("状态: %s\n", localizeRunStatus(m.detailVM.Run.Status)))
+		info = append(info,
+			fmt.Sprintf("运行: %s", truncateMiddleDisplay(m.detailVM.Run.RunID, max(8, width-4))),
+			fmt.Sprintf("状态: %s", localizeRunStatus(m.detailVM.Run.Status)),
+		)
 	} else {
-		builder.WriteString("运行: 未生成\n")
+		info = append(info, "运行: 未生成")
 	}
-	builder.WriteString("模式: " + localizeMode(m.qaMode) + "\n")
-	if m.qaMode == "recheck" {
-		builder.WriteString("参考运行: " + empty(m.selectedRefRun(), "-") + "\n")
-	}
-	builder.WriteString("\n阶段:\n")
-	for index, stage := range m.detailVM.Stages {
-		builder.WriteString(renderStageLine(stage, index == m.stageIndex, width))
-		builder.WriteString("\n")
-	}
-	if m.qaMode == "recheck" {
-		builder.WriteString("\n参考运行列表:\n")
-		if len(m.detailVM.RefRuns) == 0 {
-			builder.WriteString("  无可用参考运行\n")
+
+	listBudget := 0
+	if len(m.detailVM.Stages) > 0 || m.qaMode == "recheck" {
+		listBudget = 1
+		if maxHeight >= 4 {
+			listBudget = max(2, maxHeight/2)
 		}
+	}
+	infoBudget := maxHeight
+	if listBudget > 0 {
+		infoBudget = max(1, maxHeight-listBudget)
+	}
+	lines := append([]string{}, info[:min(len(info), infoBudget)]...)
+	remaining := maxHeight - len(lines)
+	if remaining <= 0 {
+		return joinLimitedLines(lines, maxHeight)
+	}
+	if m.qaMode != "recheck" {
+		lines = append(lines, renderStageSection(m, width, remaining)...)
+		return joinLimitedLines(lines, maxHeight)
+	}
+
+	if m.focus == focusRefRunList {
+		if remaining >= 9 {
+			stageCap := min(len(m.detailVM.Stages)+2, remaining/2)
+			lines = append(lines, renderStageSection(m, width, stageCap)...)
+			remaining = maxHeight - len(lines)
+		}
+		lines = append(lines, renderRefRunSection(m, width, remaining)...)
+		return joinLimitedLines(lines, maxHeight)
+	}
+
+	stageCap := remaining
+	if len(m.detailVM.RefRuns) > 0 && remaining >= 10 {
+		stageCap = min(len(m.detailVM.Stages)+2, remaining/2)
+	}
+	lines = append(lines, renderStageSection(m, width, stageCap)...)
+	remaining = maxHeight - len(lines)
+	if remaining > 0 && len(m.detailVM.RefRuns) > 0 {
+		lines = append(lines, renderRefRunSection(m, width, remaining)...)
+	}
+	return joinLimitedLines(lines, maxHeight)
+}
+
+func renderStageSection(m app, width int, maxLines int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	var items []string
+	for index, stage := range m.detailVM.Stages {
+		items = append(items, renderStageLine(stage, index == m.stageIndex, width))
+	}
+	if len(items) == 0 {
+		items = []string{"阶段: 未生成"}
+	}
+	if maxLines >= 3 {
+		return append([]string{"阶段:"}, visibleWindowLines(items, m.stageIndex, maxLines-1)...)
+	}
+	return visibleWindowLines(items, m.stageIndex, maxLines)
+}
+
+func renderRefRunSection(m app, width int, maxLines int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	items := []string{"  无可用参考运行"}
+	if len(m.detailVM.RefRuns) > 0 {
+		items = nil
 		for index, run := range m.detailVM.RefRuns {
 			prefix := "  "
 			line := fmt.Sprintf("%s %s", run.RunID, localizeRunStatus(run.Status))
@@ -99,14 +165,63 @@ func renderExecutionLeft(m app, width int) string {
 				prefix = "> "
 				if m.focus == focusRefRunList {
 					line = selectedStyle.Render(truncateDisplay(line, max(8, width-2)))
-					builder.WriteString(prefix + line + "\n")
+					items = append(items, prefix+line)
 					continue
 				}
 			}
-			builder.WriteString(prefix + truncateDisplay(line, max(8, width-2)) + "\n")
+			items = append(items, prefix+truncateDisplay(line, max(8, width-2)))
 		}
 	}
-	return builder.String()
+	if maxLines >= 3 {
+		return append([]string{"参考运行列表:"}, visibleWindowLines(items, m.refIndex, maxLines-1)...)
+	}
+	return visibleWindowLines(items, m.refIndex, maxLines)
+}
+
+func visibleWindowLines(items []string, selected int, maxLines int) []string {
+	if maxLines <= 0 || len(items) == 0 {
+		return nil
+	}
+	selected = clamp(selected, 0, len(items)-1)
+	if len(items) <= maxLines {
+		return append([]string{}, items...)
+	}
+	if maxLines == 1 {
+		return []string{items[selected]}
+	}
+	itemSlots := maxLines - 1
+	if selected < len(items)-1 && selected > 0 && maxLines >= 3 {
+		itemSlots = maxLines - 2
+	}
+	itemSlots = max(1, itemSlots)
+	start := clamp(selected-itemSlots+1, 0, max(0, len(items)-itemSlots))
+	end := min(len(items), start+itemSlots)
+	above := start > 0
+	below := end < len(items)
+	lines := make([]string, 0, maxLines)
+	if above {
+		lines = append(lines, mutedStyle.Render("↑"))
+	}
+	lines = append(lines, items[start:end]...)
+	if below && len(lines) < maxLines {
+		lines = append(lines, mutedStyle.Render("↓"))
+	}
+	return lines
+}
+
+func joinLimitedLines(lines []string, maxLines int) string {
+	if maxLines <= 0 {
+		return ""
+	}
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	rendered := strings.Join(lines, "\n")
+	parts := strings.Split(rendered, "\n")
+	if len(parts) > maxLines {
+		parts = parts[:maxLines]
+	}
+	return strings.Join(parts, "\n")
 }
 
 func renderStageSummary(m app, width int) string {
@@ -159,15 +274,8 @@ func renderStageLine(stage stageView, selected bool, width int) string {
 }
 
 func renderConfirm(m app) string {
-	stage := m.selectedStage()
-	stageKey := stage.Stage
-	if stageKey == "" {
-		stageKey = m.selectedStageKey
-	}
-	if stageKey == "" {
-		stageKey = "A"
-	}
-	stages := affectedStages(stageKey)
+	plan := m.rerunStagePlan()
+	stages := plan.displayStages
 	docs := m.detailVM.DocsSummary
 	var updates []string
 	for _, affected := range stages {
