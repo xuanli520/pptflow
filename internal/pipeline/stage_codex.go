@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
@@ -162,10 +163,10 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	args := execArgs[:len(execArgs)-1]
 	args = append(args, extraArgs...)
 	args = append(args, "-")
-	result := r.exec.RunWithInput(ctx, timeout, project.Path, env, strings.NewReader(prompt), capability.Path, args...)
+	result := r.runCodexWithLog(ctx, timeout, project.Path, logPath, env, prompt, capability, args)
 	report := strings.TrimSpace(result.Stdout)
 	if report == "" {
-		report = staticUnavailableReport(stage, profile, project.Path, codexFailureReason(result.Stderr))
+		report = staticUnavailableReport(stage, profile, project.Path, codexFailureReason(firstNonEmpty(result.Stderr, result.Stdout)))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
 	_ = writeText(outputPath, report+"\n")
@@ -173,14 +174,13 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	for _, path := range extraOutputPaths {
 		_ = writeText(path, report+"\n")
 	}
-	_ = writeText(logPath, result.Command+"\n\nPrompt: supplied via stdin; sha256="+sha256Text(prompt)+"\nCodex capability: "+capabilitySummary(capability)+"\nCodex env keys: "+strings.Join(configuredEnvKeys(r.cfg.Codex.Env), ",")+"\n\nSTDOUT:\n"+truncateString(result.Stdout, r.cfg.Codex.MaxOutputBytes)+"\nSTDERR:\n"+truncateString(result.Stderr, r.cfg.Codex.MaxOutputBytes))
 	if result.Err != nil {
 		record.Findings = []model.Finding{{
 			Stage:      stage,
 			Severity:   "High",
 			Title:      stageName(stage) + " failed",
 			Rule:       "Static Codex review must complete without runtime actions.",
-			Evidence:   codexFailureReason(result.Stderr),
+			Evidence:   codexFailureReason(firstNonEmpty(result.Stderr, result.Stdout)),
 			Impact:     "Static review report may be incomplete.",
 			MinimumFix: "Inspect the static review log and rerun the stage.",
 		}}
@@ -189,6 +189,27 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	}
 	record.Findings = extractFindingsFromReport(stage, report, outputPath)
 	return finishStage(record, model.StageDone, start)
+}
+
+func (r Runner) runCodexWithLog(ctx context.Context, timeout time.Duration, projectPath, logPath string, env []string, prompt string, capability codex.Capability, args []string) executor.Result {
+	commandText := strings.Join(append([]string{capability.Path}, args...), " ")
+	preamble := commandText +
+		"\n\nPrompt: supplied via stdin; sha256=" + sha256Text(prompt) +
+		"\nCodex capability: " + capabilitySummary(capability) +
+		"\nCodex env keys: " + strings.Join(configuredEnvKeys(r.cfg.Codex.Env), ",") +
+		"\nTimeout: " + timeout.String() +
+		"\nStarted: " + time.Now().UTC().Format(time.RFC3339) +
+		"\n\n=== codex stream start ===\n"
+	_ = writeText(logPath, preamble)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return r.exec.RunWithInput(ctx, timeout, projectPath, env, strings.NewReader(prompt), capability.Path, args...)
+	}
+	defer logFile.Close()
+	result := r.exec.RunWithInputStreaming(ctx, timeout, projectPath, env, strings.NewReader(prompt), logFile, capability.Path, args...)
+	fmt.Fprintf(logFile, "\n=== codex stream end: exit=%d timeout=%t err=%v ===\n", result.ExitCode, result.Timeout, result.Err)
+	fmt.Fprintf(logFile, "\n=== captured stdout/stderr tail ===\nSTDOUT:\n%s\nSTDERR:\n%s\n", truncateString(result.Stdout, r.cfg.Codex.MaxOutputBytes), truncateString(result.Stderr, r.cfg.Codex.MaxOutputBytes))
+	return result
 }
 
 func codexPrompt(stage, profile, projectPath, artifactRoot, profileContent, contextText string) string {

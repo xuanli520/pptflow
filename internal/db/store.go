@@ -100,14 +100,14 @@ func (s *Store) ListProjects(ctx context.Context) ([]ProjectSummary, error) {
 		if err := rows.Scan(&project.TaskID, &project.Batch, &project.Path, &project.RunCount, &project.LastRunID, &project.LastRunAt); err != nil {
 			return nil, err
 		}
-		if project.LastRunID != "" {
-			run, err := s.GetRun(ctx, project.LastRunID)
-			if err == nil {
-				project.RunStatus = run.Status
-				project.ManualVerdict = run.ManualVerdict
-				project.FailedStage = firstFailedStage(ctx, s, project.LastRunID)
-				project.Blocking, project.High = findingCounts(ctx, s, project.LastRunID)
-			}
+		run, err := s.LatestRunForTask(ctx, project.TaskID)
+		if err == nil {
+			project.LastRunID = run.RunID
+			project.LastRunAt = firstNonEmptyString(run.FinishedAt, run.StartedAt, project.LastRunAt)
+			project.RunStatus = run.Status
+			project.ManualVerdict = run.ManualVerdict
+			project.FailedStage = firstFailedStage(ctx, s, run.RunID)
+			project.Blocking, project.High = findingCounts(ctx, s, run.RunID)
 		}
 		projects = append(projects, project)
 	}
@@ -119,10 +119,22 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 	if run.StaticOnly {
 		staticOnly = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, artifact_root, tool_versions, prompt_versions)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, artifact_root, tool_versions, prompt_versions)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.RunID, run.TaskID, run.StartedAt, run.Status, run.ManualVerdict, staticOnly, run.ArtifactRoot, run.ToolVersions, run.PromptVersions)
-	return err
+	if err != nil {
+		return err
+	}
+	startedAt := firstNonEmptyString(run.StartedAt, time.Now().UTC().Format(time.RFC3339))
+	if _, err := tx.ExecContext(ctx, `UPDATE projects SET last_run_id = ?, last_run_at = ? WHERE task_id = ?`, run.RunID, startedAt, run.TaskID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, duration time.Duration) error {
@@ -156,12 +168,9 @@ func (s *Store) GetRun(ctx context.Context, runID string) (model.RunRecord, erro
 
 func (s *Store) LatestRunForTask(ctx context.Context, taskID string) (model.RunRecord, error) {
 	var runID string
-	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(last_run_id, '') FROM projects WHERE task_id = ?`, taskID)
+	row := s.db.QueryRowContext(ctx, `SELECT run_id FROM runs WHERE task_id = ? ORDER BY COALESCE(started_at, '') DESC, run_id DESC LIMIT 1`, taskID)
 	if err := row.Scan(&runID); err != nil {
 		return model.RunRecord{}, err
-	}
-	if runID == "" {
-		return model.RunRecord{}, sql.ErrNoRows
 	}
 	return s.GetRun(ctx, runID)
 }
@@ -281,6 +290,15 @@ func metadataPromptMissing(projectPath string) bool {
 	}
 	prompt, ok := data["prompt"].(string)
 	return !ok || prompt == ""
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func FormatNotFound(kind, id string) error {

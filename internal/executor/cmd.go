@@ -41,6 +41,10 @@ func (Runner) RunWithInput(ctx context.Context, timeout time.Duration, dir strin
 	return runCommand(ctx, timeout, dir, env, input, nil, name, args...)
 }
 
+func (Runner) RunWithInputStreaming(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, writer io.Writer, name string, args ...string) Result {
+	return runCommand(ctx, timeout, dir, env, input, writer, name, args...)
+}
+
 func runCommand(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, writer io.Writer, name string, args ...string) Result {
 	if timeout > 0 {
 		var cancel context.CancelFunc

@@ -62,21 +62,20 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	args := execArgs[:len(execArgs)-1]
 	args = append(args, extraArgs...)
 	args = append(args, "-")
-	result := r.exec.RunWithInput(ctx, r.stageTimeout("F", 300), project.Path, env, strings.NewReader(prompt), capability.Path, args...)
+	result := r.runCodexWithLog(ctx, r.stageTimeout("F", 300), project.Path, logPath, env, prompt, capability, args)
 	report := strings.TrimSpace(result.Stdout)
 	if report == "" {
-		report = staticUnavailableReport("F", profile, project.Path, codexFailureReason(result.Stderr))
+		report = staticUnavailableReport("F", profile, project.Path, codexFailureReason(firstNonEmpty(result.Stderr, result.Stdout)))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
 	_ = writeText(reportPath, report+"\n")
-	_ = writeText(logPath, result.Command+"\n\nPrompt: supplied via stdin; sha256="+sha256Text(prompt)+"\nCodex capability: "+capabilitySummary(capability)+"\n\nSTDOUT:\n"+truncateString(result.Stdout, r.cfg.Codex.MaxOutputBytes)+"\nSTDERR:\n"+truncateString(result.Stderr, r.cfg.Codex.MaxOutputBytes))
 	if result.Err != nil {
 		record.Findings = []model.Finding{{
 			Stage:      "F",
 			Severity:   "High",
 			Title:      "annotator repair static review failed",
 			Rule:       "Stage F must complete a Codex static review or produce an unavailable-review artifact.",
-			Evidence:   codexFailureReason(result.Stderr),
+			Evidence:   codexFailureReason(firstNonEmpty(result.Stderr, result.Stdout)),
 			Impact:     "The annotator repair report may be incomplete and requires manual review.",
 			MinimumFix: "Inspect the Stage F log and rerun after fixing Codex availability.",
 			SourcePath: reportPath,

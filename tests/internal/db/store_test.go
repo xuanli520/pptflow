@@ -56,6 +56,43 @@ func TestFindingsAreScopedByRun(t *testing.T) {
 	}
 }
 
+func TestCreateRunMakesRunningRunLatest(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: t.TempDir()}}); err != nil {
+		t.Fatal(err)
+	}
+	old := model.RunRecord{RunID: "run-old", TaskID: "TASK-1", StartedAt: "2026-04-30T00:00:00Z", Status: model.RunCompletedClean, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}
+	if err := store.CreateRun(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, old.RunID, old.TaskID, model.RunCompletedClean, 0); err != nil {
+		t.Fatal(err)
+	}
+	running := model.RunRecord{RunID: "run-running", TaskID: "TASK-1", StartedAt: "2026-04-30T00:01:00Z", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}
+	if err := store.CreateRun(ctx, running); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := store.LatestRunForTask(ctx, "TASK-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.RunID != running.RunID || latest.Status != model.RunRunning {
+		t.Fatalf("latest run = %#v, want running run", latest)
+	}
+	projects, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 || projects[0].LastRunID != running.RunID || projects[0].RunStatus != model.RunRunning {
+		t.Fatalf("project summary did not surface running run: %#v", projects)
+	}
+}
+
 func TestMigratesLegacyGlobalFindingPrimaryKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	handle, err := sql.Open("sqlite", path)

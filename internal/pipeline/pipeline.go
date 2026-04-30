@@ -163,6 +163,9 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 	if err := r.writeStageStatus(runID, artifactRoot, stages); err != nil {
 		return Result{}, err
 	}
+	for _, stage := range stages {
+		_ = r.store.PutStage(ctx, runID, stage)
+	}
 	preflightResult := preflight.Run(ctx, r.exec, r.cfg)
 	preflightPath := filepath.Join(artifactRoot, "preflight.json")
 	_ = writeJSON(preflightPath, preflightResult)
@@ -184,6 +187,11 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 			_ = r.writeStageStatus(runID, artifactRoot, stages)
 			continue
 		}
+		running := runningStage(run, stage)
+		stages[index] = running
+		results[stage] = running
+		_ = r.store.PutStage(ctx, runID, running)
+		_ = r.writeStageStatus(runID, artifactRoot, stages)
 		record := r.executeStage(ctx, run, project, stage, results, opts, preflightResult)
 		record.Findings = assignMissingFindingIDs(stage, record.Findings)
 		stages[index] = record
@@ -333,6 +341,31 @@ func startStage(stage string) model.StageRecord {
 		Status:        model.StageRunning,
 		StartedAt:     time.Now().UTC().Format(time.RFC3339),
 		ArtifactPaths: []string{},
+	}
+}
+
+func runningStage(run model.RunRecord, stage string) model.StageRecord {
+	record := startStage(stage)
+	record.LogPath = stageLogPath(run.ArtifactRoot, stage)
+	return record
+}
+
+func stageLogPath(artifactRoot, stage string) string {
+	switch stage {
+	case "A":
+		return filepath.Join(artifactRoot, "logs", "A_validate.log")
+	case "B":
+		return filepath.Join(artifactRoot, "logs", "B_docker.log")
+	case "C":
+		return filepath.Join(artifactRoot, "logs", "C_tests.log")
+	case "D":
+		return filepath.Join(artifactRoot, "logs", "D_tests_coverage_static.log")
+	case "E":
+		return filepath.Join(artifactRoot, "logs", "E_static_audit.log")
+	case "F":
+		return filepath.Join(artifactRoot, "logs", "F_repair.log")
+	default:
+		return filepath.Join(artifactRoot, "logs", stage+"_stage.log")
 	}
 }
 

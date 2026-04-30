@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -47,6 +48,8 @@ type runMsg struct {
 	err    error
 }
 
+type tickMsg time.Time
+
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 	activeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
@@ -86,7 +89,7 @@ func newApp(store *db.Store, cfg config.Config) app {
 }
 
 func (m app) Init() tea.Cmd {
-	return m.reload()
+	return tea.Batch(m.reload(), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -112,6 +115,8 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.message = fmt.Sprintf("completed %s (%s)", value.result.Run.RunID, value.result.Run.Status)
 		}
 		cmds = append(cmds, m.reload())
+	case tickMsg:
+		cmds = append(cmds, m.reload(), m.tick())
 	case tea.KeyMsg:
 		key := value.String()
 		if m.confirm {
@@ -354,6 +359,16 @@ func (m app) reload() tea.Cmd {
 		}
 		return projectsMsg(projects)
 	}
+}
+
+func (m app) tick() tea.Cmd {
+	interval := time.Duration(m.cfg.TUI.RefreshIntervalMS) * time.Millisecond
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 func (m app) runSelected() tea.Cmd {
