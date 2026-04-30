@@ -1,0 +1,140 @@
+package pipeline
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scanner"
+)
+
+func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner.Project) model.StageRecord {
+	start := time.Now()
+	record := startStage("C")
+	logPath := filepath.Join(run.ArtifactRoot, "logs", "C_tests.log")
+	screenshotPath := filepath.Join(run.ArtifactRoot, "6_run_tests.sh运行截图.png")
+	summaryPath := filepath.Join(run.ArtifactRoot, "test_runtime_summary.json")
+	record.LogPath = logPath
+	record.ArtifactPaths = append(record.ArtifactPaths, logPath, screenshotPath, summaryPath)
+	repoPath := filepath.Join(project.Path, "repo")
+	script := filepath.Join(repoPath, "run_tests.sh")
+	if !fileExists(script) {
+		evidence := "Package spec violation: repo/run_tests.sh was not found. Stage C uses the host run_tests.sh entrypoint only."
+		_ = writeText(logPath, evidence)
+		pages, _ := renderLogFile(logPath, screenshotPath)
+		record.ArtifactPaths = append([]string{logPath}, pages...)
+		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
+		_ = writeJSON(summaryPath, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		record.Findings = []model.Finding{{
+			Stage:      "C",
+			Severity:   "High",
+			Title:      "Unified test entrypoint is missing",
+			Rule:       "Stage C requires repo/run_tests.sh.",
+			Evidence:   evidence,
+			Impact:     "Runtime test evidence cannot be collected.",
+			MinimumFix: "Add a runnable repo/run_tests.sh entrypoint.",
+		}}
+		record.ErrorSummary = evidence
+		return finishStage(record, model.StageFailed, start)
+	}
+	runtime, runtimeErr := readRuntimeEvidence(filepath.Join(run.ArtifactRoot, "port_map.json"))
+	if runtimeErr != nil || len(runtime.Mappings) == 0 {
+		evidence := "Stage B runtime evidence is missing port mappings. Run Stage B successfully before Stage C."
+		if runtimeErr != nil {
+			evidence = runtimeErr.Error()
+		}
+		_ = writeText(logPath, evidence)
+		pages, _ := renderLogFile(logPath, screenshotPath)
+		record.ArtifactPaths = append([]string{logPath}, pages...)
+		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
+		_ = writeJSON(summaryPath, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		record.Findings = []model.Finding{{
+			Stage:      "C",
+			Severity:   "High",
+			Title:      "Stage B runtime evidence is missing",
+			Rule:       "Stage C requires Stage B port_map.json mappings.",
+			Evidence:   evidence,
+			Impact:     "Runtime test evidence cannot be collected from host service URLs.",
+			MinimumFix: "Rerun B successfully and ensure published ports are recorded.",
+		}}
+		record.ErrorSummary = evidence
+		return finishStage(record, model.StageFailed, start)
+	}
+	bash := findHostBash(r.exec)
+	if bash == "" {
+		evidence := "bash executable not found on PATH. Stage C requires host bash to run repo/run_tests.sh."
+		_ = writeText(logPath, evidence)
+		pages, _ := renderLogFile(logPath, screenshotPath)
+		record.ArtifactPaths = append([]string{logPath}, pages...)
+		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
+		_ = writeJSON(summaryPath, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		record.Findings = []model.Finding{{
+			Stage:      "C",
+			Severity:   "High",
+			Title:      "bash unavailable for host runtime tests",
+			Rule:       "Stage C must execute repo/run_tests.sh on the host.",
+			Evidence:   evidence,
+			Impact:     "Runtime test evidence cannot be collected.",
+			MinimumFix: "Install bash, such as Git Bash on Windows, and rerun C.",
+		}}
+		record.ErrorSummary = evidence
+		return finishStage(record, model.StageFailed, start)
+	}
+	serviceURLs := serviceURLEnvironment(runtime)
+	env := append(os.Environ(), serviceURLs.Env...)
+	timeout := r.stageTimeout("C", 300)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		record.ErrorSummary = err.Error()
+		return finishStage(record, model.StageFailed, start)
+	}
+	fmt.Fprintln(logFile, "=== C host run_tests.sh start ===")
+	result := r.exec.RunStreaming(ctx, timeout, repoPath, env, logFile, bash, "run_tests.sh")
+	fmt.Fprintf(logFile, "\n=== C host run_tests.sh end: exit=%d timeout=%t err=%v ===\n", result.ExitCode, result.Timeout, result.Err)
+	_ = logFile.Close()
+	log := result.Command + "\n\nSTDOUT:\n" + result.Stdout + "\nSTDERR:\n" + result.Stderr
+	if strings.TrimSpace(result.Stdout+result.Stderr) == "" {
+		_ = appendText(logPath, log)
+	}
+	pages, _ := renderLogFile(logPath, screenshotPath)
+	record.ArtifactPaths = append([]string{logPath}, pages...)
+	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
+	_ = writeJSON(summaryPath, map[string]any{"ok": result.Err == nil, "exit_code": result.ExitCode, "timeout": result.Timeout, "mode": "host", "script": "repo/run_tests.sh", "command": "bash run_tests.sh", "env_keys": serviceURLs.Keys, "service_urls": serviceURLs.Mapping, "compose_project": runtime.ComposeProject})
+	if result.Err != nil {
+		record.Findings = []model.Finding{{
+			Stage:      "C",
+			Severity:   "High",
+			Title:      "run_tests runtime evidence failed",
+			Rule:       "Stage C must execute the unified test entrypoint successfully.",
+			Evidence:   strings.TrimSpace(result.Stderr),
+			Impact:     "The delivery package does not currently have passing runtime test evidence.",
+			MinimumFix: "Fix the test entrypoint or application runtime and rerun C.",
+		}}
+		record.ErrorSummary = "run_tests failed"
+		return finishStage(record, model.StageFailed, start)
+	}
+	return finishStage(record, model.StageDone, start)
+}
+
+func findHostBash(exec executor.Runner) string {
+	if path, err := exec.LookPath("bash"); err == nil {
+		return path
+	}
+	for _, candidate := range []string{
+		`C:\Program Files\Git\bin\bash.exe`,
+		`C:\Program Files\Git\usr\bin\bash.exe`,
+		`C:\msys64\usr\bin\bash.exe`,
+		"/usr/bin/bash",
+		"/bin/bash",
+	} {
+		if fileExists(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}

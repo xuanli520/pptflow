@@ -113,3 +113,11 @@ func asciiForBasicFont(text string) string {
 	}
 	return builder.String()
 }
+
+func renderLogFile(logPath, screenshotPath string) ([]string, error) {
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		return renderTerminalLog(err.Error(), screenshotPath)
+	}
+	return renderTerminalLog(string(content), screenshotPath)
+}
