@@ -57,61 +57,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	statements := []string{
-		`CREATE TABLE IF NOT EXISTS projects (
-			task_id TEXT PRIMARY KEY,
-			batch TEXT NOT NULL,
-			path TEXT NOT NULL,
-			run_count INTEGER DEFAULT 0,
-			last_run_id TEXT,
-			last_run_at TEXT,
-			created_at TEXT DEFAULT (datetime('now'))
-		);`,
-		`CREATE TABLE IF NOT EXISTS runs (
-			run_id TEXT PRIMARY KEY,
-			task_id TEXT NOT NULL REFERENCES projects(task_id),
-			started_at TEXT,
-			finished_at TEXT,
-			status TEXT DEFAULT 'running',
-			manual_verdict TEXT DEFAULT 'unset',
-			static_only INTEGER DEFAULT 0,
-			duration_ms INTEGER DEFAULT 0,
-			artifact_root TEXT NOT NULL,
-			tool_versions TEXT,
-			prompt_versions TEXT
-		);`,
-		`CREATE TABLE IF NOT EXISTS run_stages (
-			run_id TEXT NOT NULL REFERENCES runs(run_id),
-			stage TEXT NOT NULL,
-			status TEXT NOT NULL,
-			started_at TEXT,
-			finished_at TEXT,
-			duration_ms INTEGER DEFAULT 0,
-			blocked_by TEXT,
-			log_path TEXT,
-			artifact_json TEXT,
-			error_summary TEXT,
-			PRIMARY KEY (run_id, stage)
-		);`,
-		`CREATE TABLE IF NOT EXISTS findings (
-			id TEXT PRIMARY KEY,
-			run_id TEXT NOT NULL REFERENCES runs(run_id),
-			stage TEXT,
-			severity TEXT NOT NULL,
-			title TEXT NOT NULL,
-			rule TEXT,
-			evidence TEXT,
-			impact TEXT,
-			minimum_fix TEXT,
-			source_path TEXT
-		);`,
-	}
-	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return err
-		}
-	}
-	return nil
+	return migrate(ctx, s.db)
 }
 
 func (s *Store) UpsertProjects(ctx context.Context, projects []scanner.Project) error {
@@ -220,6 +166,25 @@ func (s *Store) LatestRunForTask(ctx context.Context, taskID string) (model.RunR
 	return s.GetRun(ctx, runID)
 }
 
+func (s *Store) ListRunsForTask(ctx context.Context, taskID string) ([]model.RunRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,'') FROM runs WHERE task_id = ? ORDER BY started_at DESC, run_id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var runs []model.RunRecord
+	for rows.Next() {
+		var run model.RunRecord
+		var staticOnly int
+		if err := rows.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions); err != nil {
+			return nil, err
+		}
+		run.StaticOnly = staticOnly == 1
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
 func (s *Store) PutStage(ctx context.Context, runID string, stage model.StageRecord) error {
 	blockedBy, _ := json.Marshal(stage.BlockedBy)
 	artifacts, _ := json.Marshal(stage.ArtifactPaths)
@@ -232,9 +197,10 @@ func (s *Store) PutStage(ctx context.Context, runID string, stage model.StageRec
 
 func (s *Store) InsertFindings(ctx context.Context, runID string, findings []model.Finding) error {
 	for _, finding := range findings {
-		_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO findings(id, run_id, stage, severity, title, rule, evidence, impact, minimum_fix, source_path)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			finding.ID, runID, finding.Stage, finding.Severity, finding.Title, finding.Rule, finding.Evidence, finding.Impact, finding.MinimumFix, finding.SourcePath)
+		_, err := s.db.ExecContext(ctx, `INSERT INTO findings(id, run_id, stage, severity, title, rule, evidence, impact, done_criteria, minimum_fix, source_path)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(run_id, id) DO UPDATE SET stage=excluded.stage, severity=excluded.severity, title=excluded.title, rule=excluded.rule, evidence=excluded.evidence, impact=excluded.impact, done_criteria=excluded.done_criteria, minimum_fix=excluded.minimum_fix, source_path=excluded.source_path`,
+			finding.ID, runID, finding.Stage, finding.Severity, finding.Title, finding.Rule, finding.Evidence, finding.Impact, finding.DoneCriteria, finding.MinimumFix, finding.SourcePath)
 		if err != nil {
 			return err
 		}
@@ -264,7 +230,7 @@ func (s *Store) Stages(ctx context.Context, runID string) ([]model.StageRecord, 
 }
 
 func (s *Store) Findings(ctx context.Context, runID string) ([]model.Finding, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, stage, severity, title, COALESCE(rule,''), COALESCE(evidence,''), COALESCE(impact,''), COALESCE(minimum_fix,''), COALESCE(source_path,'') FROM findings WHERE run_id = ? ORDER BY severity, id`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, stage, severity, title, COALESCE(rule,''), COALESCE(evidence,''), COALESCE(impact,''), COALESCE(done_criteria,''), COALESCE(minimum_fix,''), COALESCE(source_path,'') FROM findings WHERE run_id = ? ORDER BY severity, id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +238,7 @@ func (s *Store) Findings(ctx context.Context, runID string) ([]model.Finding, er
 	var findings []model.Finding
 	for rows.Next() {
 		var finding model.Finding
-		if err := rows.Scan(&finding.ID, &finding.Stage, &finding.Severity, &finding.Title, &finding.Rule, &finding.Evidence, &finding.Impact, &finding.MinimumFix, &finding.SourcePath); err != nil {
+		if err := rows.Scan(&finding.ID, &finding.Stage, &finding.Severity, &finding.Title, &finding.Rule, &finding.Evidence, &finding.Impact, &finding.DoneCriteria, &finding.MinimumFix, &finding.SourcePath); err != nil {
 			return nil, err
 		}
 		findings = append(findings, finding)

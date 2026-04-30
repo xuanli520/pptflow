@@ -49,15 +49,16 @@ type StageRecord struct {
 }
 
 type Finding struct {
-	ID         string `json:"id"`
-	Stage      string `json:"stage"`
-	Severity   string `json:"severity"`
-	Title      string `json:"title"`
-	Rule       string `json:"rule,omitempty"`
-	Evidence   string `json:"evidence,omitempty"`
-	Impact     string `json:"impact,omitempty"`
-	MinimumFix string `json:"minimum_fix,omitempty"`
-	SourcePath string `json:"source_path,omitempty"`
+	ID           string `json:"id"`
+	Stage        string `json:"stage"`
+	Severity     string `json:"severity"`
+	Title        string `json:"title"`
+	Rule         string `json:"rule,omitempty"`
+	Evidence     string `json:"evidence,omitempty"`
+	Impact       string `json:"impact,omitempty"`
+	DoneCriteria string `json:"done_criteria,omitempty"`
+	MinimumFix   string `json:"minimum_fix,omitempty"`
+	SourcePath   string `json:"source_path,omitempty"`
 }
 
 type StageStatusFile struct {

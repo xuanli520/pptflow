@@ -3,9 +3,15 @@ db_path: "./projects-qa/.qa-control/index.db"
 
 pipeline:
   static_only: false
+  self_test_report_path: "repo/self_test_report.md"
   stage_timeouts:
     A: 60
-    B: 120
+    B: 900
+    B_pull: 300
+    B_build: 600
+    B_up: 300
+    B_health: 60
+    B_port: 30
     C: 300
     D: 300
     E: 600

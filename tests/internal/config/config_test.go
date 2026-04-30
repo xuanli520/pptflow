@@ -134,3 +134,52 @@ func TestLoadReturnsErrorForMissingExplicitConfig(t *testing.T) {
 		t.Fatal("expected error for missing explicit config")
 	}
 }
+
+func TestLoadParsesCodexEnvExtraArgsAndSelfTestPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OPENAI_API_KEY", "secret")
+	content := []byte(`pipeline:
+  self_test_report_path: "repo/custom_self_test.md"
+  stage_timeouts:
+    b_pull: 12
+codex:
+  env:
+    OPENAI_API_KEY: "${OPENAI_API_KEY}"
+  extra_args:
+    - "--model"
+    - "gpt-5.4"
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.SelfTestReportPath != "repo/custom_self_test.md" {
+		t.Fatalf("unexpected self test path: %s", cfg.Pipeline.SelfTestReportPath)
+	}
+	if cfg.Pipeline.StageTimeouts["B_PULL"] != 12 {
+		t.Fatalf("B_PULL timeout not normalized: %#v", cfg.Pipeline.StageTimeouts)
+	}
+	if cfg.Codex.Env["OPENAI_API_KEY"] != "secret" {
+		t.Fatalf("env expansion failed: %#v", cfg.Codex.Env)
+	}
+	if len(cfg.Codex.ExtraArgs) != 2 || cfg.Codex.ExtraArgs[1] != "gpt-5.4" {
+		t.Fatalf("extra args not parsed: %#v", cfg.Codex.ExtraArgs)
+	}
+}
+
+func TestLoadErrorsForMissingEnvReference(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`codex:
+  env:
+    OPENAI_API_KEY: "${MISSING_P2R_TEST_ENV}"
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(dir, config.Overrides{}); err == nil {
+		t.Fatal("expected missing env reference error")
+	}
+}

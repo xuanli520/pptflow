@@ -25,8 +25,9 @@ type Config struct {
 }
 
 type PipelineConfig struct {
-	StaticOnly    bool
-	StageTimeouts map[string]int
+	StaticOnly         bool
+	StageTimeouts      map[string]int
+	SelfTestReportPath string
 }
 
 type DockerConfig struct {
@@ -42,6 +43,8 @@ type CodexConfig struct {
 	Network           string
 	MaxOutputBytes    int
 	WritableTmp       bool
+	Env               map[string]string
+	ExtraArgs         []string
 }
 
 type TUIConfig struct {
@@ -71,7 +74,8 @@ func Default() Config {
 		ScanPath: "./projects-qa",
 		DBPath:   "./projects-qa/.qa-control/index.db",
 		Pipeline: PipelineConfig{
-			StageTimeouts: map[string]int{"A": 60, "B": 120, "C": 300, "D": 300, "E": 600, "F": 60},
+			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 300, "E": 600, "F": 60},
+			SelfTestReportPath: "repo/self_test_report.md",
 		},
 		Docker: DockerConfig{
 			ManagedLabel:                "managed_by=p2rqa",
@@ -85,6 +89,7 @@ func Default() Config {
 			Network:           "none",
 			MaxOutputBytes:    1048576,
 			WritableTmp:       false,
+			Env:               map[string]string{},
 		},
 		TUI: TUIConfig{
 			RefreshIntervalMS: 100,
@@ -209,6 +214,14 @@ func applyFile(cfg *Config, path string) (fileSettings, error) {
 			continue
 		}
 		indent := len(raw) - len(strings.TrimLeft(raw, " "))
+		if strings.HasPrefix(line, "-") {
+			item := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "-")), `"'`)
+			switch {
+			case section == "codex" && subSection == "extra_args":
+				cfg.Codex.ExtraArgs = append(cfg.Codex.ExtraArgs, item)
+			}
+			continue
+		}
 		if strings.HasSuffix(line, ":") {
 			key := strings.TrimSuffix(line, ":")
 			if indent == 0 {
@@ -234,7 +247,10 @@ func applyFile(cfg *Config, path string) (fileSettings, error) {
 		case section == "pipeline" && key == "static_only":
 			cfg.Pipeline.StaticOnly = parseBool(value)
 		case section == "pipeline" && subSection == "stage_timeouts":
-			cfg.Pipeline.StageTimeouts[strings.ToUpper(key)] = parseInt(value, cfg.Pipeline.StageTimeouts[strings.ToUpper(key)])
+			normalized := normalizeStageTimeoutKey(key)
+			cfg.Pipeline.StageTimeouts[normalized] = parseInt(value, cfg.Pipeline.StageTimeouts[normalized])
+		case section == "pipeline" && key == "self_test_report_path":
+			cfg.Pipeline.SelfTestReportPath = value
 		case section == "docker" && key == "managed_label":
 			cfg.Docker.ManagedLabel = value
 		case section == "docker" && key == "compose_project_prefix":
@@ -254,6 +270,15 @@ func applyFile(cfg *Config, path string) (fileSettings, error) {
 			cfg.Codex.MaxOutputBytes = parseInt(value, cfg.Codex.MaxOutputBytes)
 		case section == "codex" && key == "writable_tmp":
 			cfg.Codex.WritableTmp = parseBool(value)
+		case section == "codex" && subSection == "env":
+			expanded, err := expandEnvRefs(value)
+			if err != nil {
+				return settings, err
+			}
+			if cfg.Codex.Env == nil {
+				cfg.Codex.Env = map[string]string{}
+			}
+			cfg.Codex.Env[key] = expanded
 		case section == "tui" && key == "refresh_interval_ms":
 			cfg.TUI.RefreshIntervalMS = parseInt(value, cfg.TUI.RefreshIntervalMS)
 		case section == "tui" && key == "log_max_lines":
@@ -287,5 +312,36 @@ func parseBool(value string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func normalizeStageTimeoutKey(key string) string {
+	key = strings.TrimSpace(key)
+	key = strings.ReplaceAll(key, "-", "_")
+	return strings.ToUpper(key)
+}
+
+func expandEnvRefs(value string) (string, error) {
+	var builder strings.Builder
+	for {
+		start := strings.Index(value, "${")
+		if start < 0 {
+			builder.WriteString(value)
+			return builder.String(), nil
+		}
+		builder.WriteString(value[:start])
+		rest := value[start+2:]
+		end := strings.Index(rest, "}")
+		if end < 0 {
+			builder.WriteString(value[start:])
+			return builder.String(), nil
+		}
+		name := rest[:end]
+		envValue, ok := os.LookupEnv(name)
+		if !ok {
+			return "", fmt.Errorf("environment variable %s referenced by config is not set", name)
+		}
+		builder.WriteString(envValue)
+		value = rest[end+1:]
 	}
 }

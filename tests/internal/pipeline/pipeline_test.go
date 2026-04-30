@@ -1,6 +1,7 @@
 package pipeline_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,12 @@ func acceptanceScriptArgs(outputs map[string]string, projectTypeArgs []string) [
 
 //go:linkname copyPackageSnapshot github.com/xuanli520/p2r_tui/internal/pipeline.copyPackageSnapshot
 func copyPackageSnapshot(source, dest string) error
+
+//go:linkname terminalScreenshotLines github.com/xuanli520/p2r_tui/internal/pipeline.terminalScreenshotLines
+func terminalScreenshotLines(text string) []string
+
+//go:linkname safeCodexExtraArgs github.com/xuanli520/p2r_tui/internal/pipeline.safeCodexExtraArgs
+func safeCodexExtraArgs(args []string) ([]string, error)
 
 type portMapping struct {
 	Service   string
@@ -122,6 +129,47 @@ func TestShortCommentKeepsManualVerdictUnchecked(t *testing.T) {
 	text := shortComment(map[string]string{"B": "skipped", "C": "skipped"}, nil)
 	if want := "<[ ] PASS  [ ] REWORK  [ ] FAIL>"; !strings.Contains(text, want) {
 		t.Fatalf("short comment missing manual verdict line: %s", text)
+	}
+}
+
+func TestShortCommentDoesNotExposeDoneCriteriaAsRisk(t *testing.T) {
+	text := shortComment(map[string]string{"B": "done", "C": "done"}, []model.Finding{{
+		ID:           "P2R-A-BLK-001",
+		Severity:     "Blocker",
+		Title:        "missing auth",
+		Rule:         "rule-1",
+		DoneCriteria: "acceptance passes after adding auth",
+	}})
+	if strings.Contains(text, "acceptance passes") {
+		t.Fatalf("short comment exposed done criteria: %s", text)
+	}
+	if !strings.Contains(text, "rule-1") {
+		t.Fatalf("short comment should include risk rule/evidence context: %s", text)
+	}
+}
+
+func TestTerminalScreenshotUsesTailSinglePageInput(t *testing.T) {
+	var builder strings.Builder
+	for i := 1; i <= 90; i++ {
+		builder.WriteString("line ")
+		builder.WriteString(fmt.Sprint(i))
+		builder.WriteString("\n")
+	}
+	lines := terminalScreenshotLines("\x1b[31m" + builder.String())
+	if len(lines) != 80 {
+		t.Fatalf("expected 80 tail lines, got %d", len(lines))
+	}
+	if lines[0] != "line 11" || lines[len(lines)-1] != "line 90" {
+		t.Fatalf("unexpected tail lines: first=%q last=%q", lines[0], lines[len(lines)-1])
+	}
+}
+
+func TestSafeCodexExtraArgsRejectsBoundaryFlags(t *testing.T) {
+	if _, err := safeCodexExtraArgs([]string{"--model", "gpt-5.4"}); err != nil {
+		t.Fatalf("safe args rejected: %v", err)
+	}
+	if _, err := safeCodexExtraArgs([]string{"--sandbox", "workspace-write"}); err == nil {
+		t.Fatal("expected --sandbox to be rejected")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -29,6 +30,18 @@ func (Runner) LookPath(name string) (string, error) {
 }
 
 func (Runner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) Result {
+	return runCommand(ctx, timeout, dir, env, nil, nil, name, args...)
+}
+
+func (Runner) RunStreaming(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, name string, args ...string) Result {
+	return runCommand(ctx, timeout, dir, env, nil, writer, name, args...)
+}
+
+func (Runner) RunWithInput(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, name string, args ...string) Result {
+	return runCommand(ctx, timeout, dir, env, input, nil, name, args...)
+}
+
+func runCommand(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, writer io.Writer, name string, args ...string) Result {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -39,10 +52,18 @@ func (Runner) Run(ctx context.Context, timeout time.Duration, dir string, env []
 	if len(env) > 0 {
 		cmd.Env = env
 	}
+	if input != nil {
+		cmd.Stdin = input
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	if writer != nil {
+		cmd.Stdout = io.MultiWriter(&stdout, writer)
+		cmd.Stderr = io.MultiWriter(&stderr, writer)
+	} else {
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+	}
 	err := cmd.Run()
 	result := Result{
 		Command: strings.Join(append([]string{name}, args...), " "),

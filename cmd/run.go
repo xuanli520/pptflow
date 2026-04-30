@@ -14,6 +14,9 @@ func newRunCommand() *cobra.Command {
 	var stage string
 	var from string
 	var staticOnly bool
+	var mode string
+	var refRun string
+	var extraDocs []string
 	command := &cobra.Command{
 		Use:   "run <task-id>",
 		Short: "Run the p2r QA pipeline",
@@ -40,7 +43,7 @@ func newRunCommand() *cobra.Command {
 			}
 			defer store.Close()
 			runner := pipeline.NewRunner(store, cfg)
-			result, err := runner.Run(context.Background(), args[0], pipeline.RunOptions{Stage: stage, From: from, StaticOnly: staticOnly})
+			result, err := runner.Run(context.Background(), args[0], pipeline.RunOptions{Stage: stage, From: from, StaticOnly: staticOnly, Mode: mode, RefRun: refRun, ExtraDocs: extraDocs})
 			if err != nil {
 				return err
 			}
@@ -59,6 +62,9 @@ func newRunCommand() *cobra.Command {
 	command.Flags().StringVar(&stage, "stage", "", "run only one stage (A..F)")
 	command.Flags().StringVar(&from, "from", "", "run from one stage through F (A..F)")
 	command.Flags().BoolVar(&staticOnly, "static-only", false, "run only A, D, E, and F")
+	command.Flags().StringVar(&mode, "mode", "initial", "QA mode: initial or recheck")
+	command.Flags().StringVar(&refRun, "ref-run", "", "reference run id for --mode recheck")
+	command.Flags().StringSliceVar(&extraDocs, "extra-docs", nil, "comma-separated extra document paths for --mode recheck")
 	return command
 }
 

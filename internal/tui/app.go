@@ -15,6 +15,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
 type app struct {
@@ -31,6 +32,9 @@ type app struct {
 	confirm       bool
 	message       string
 	running       bool
+	qaMode        string
+	refRuns       []model.RunRecord
+	refIndex      int
 }
 
 type projectsMsg []db.ProjectSummary
@@ -73,7 +77,7 @@ func newApp(store *db.Store, cfg config.Config) app {
 	styles := table.DefaultStyles()
 	styles.Selected = styles.Selected.Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57")).Bold(false)
 	t.SetStyles(styles)
-	return app{store: store, cfg: cfg, table: t, search: search, logs: viewport.New(80, 10)}
+	return app{store: store, cfg: cfg, table: t, search: search, logs: viewport.New(80, 10), qaMode: "initial"}
 }
 
 func (m app) Init() tea.Cmd {
@@ -92,6 +96,7 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case projectsMsg:
 		m.projects = []db.ProjectSummary(value)
 		m.refreshRows()
+		m.refreshRefRuns()
 	case runMsg:
 		m.running = false
 		if value.err != nil {
@@ -120,13 +125,16 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "tab":
 			m.tab = (m.tab + 1) % 2
+			m.refreshRefRuns()
 		case "shift+tab":
 			m.tab = (m.tab + 1) % 2
+			m.refreshRefRuns()
 		case "esc":
 			m.tab = 0
 		case "enter":
 			if m.tab == 0 {
 				m.tab = 1
+				m.refreshRefRuns()
 			}
 		case "left":
 			if m.tab == 1 && m.selectedStage > 0 {
@@ -136,8 +144,30 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.tab == 1 && m.selectedStage < 5 {
 				m.selectedStage++
 			}
+		case "m":
+			if m.qaMode == "recheck" {
+				m.qaMode = "initial"
+			} else {
+				m.qaMode = "recheck"
+				m.refreshRefRuns()
+			}
+		case "up":
+			m.refreshRefRuns()
+			if m.tab == 1 && m.qaMode == "recheck" && m.refIndex > 0 {
+				m.refIndex--
+			}
+		case "down":
+			m.refreshRefRuns()
+			if m.tab == 1 && m.qaMode == "recheck" && m.refIndex < len(m.refRuns)-1 {
+				m.refIndex++
+			}
 		case "r":
+			m.refreshRefRuns()
 			if m.selectedTaskID() != "" && !m.running {
+				if m.qaMode == "recheck" && m.selectedRefRun() == "" {
+					m.message = "recheck mode requires selecting a ref run"
+					break
+				}
 				m.confirm = true
 			}
 		default:
@@ -167,14 +197,20 @@ func (m app) View() string {
 		builder.WriteString(m.messageStyle().Render(m.message) + "\n\n")
 	}
 	if m.confirm {
-		builder.WriteString(errorStyle.Render("Rerun "+m.selectedTaskID()+" from stage "+stageLetter(m.selectedStage)+"? Affected: "+strings.Join(affectedStages(stageLetter(m.selectedStage)), ", ")+"  y/n") + "\n\n")
+		ref := m.selectedRefRun()
+		confirm := fmt.Sprintf("Rerun %s?\nMode: %s\n", m.selectedTaskID(), m.qaMode)
+		if m.qaMode == "recheck" {
+			confirm += "Ref run: " + ref + "\n"
+		}
+		confirm += "Stages: " + strings.Join(affectedStages(stageLetter(m.selectedStage)), ", ") + "\ny/n"
+		builder.WriteString(errorStyle.Render(confirm) + "\n\n")
 	}
 	if m.tab == 0 {
 		builder.WriteString(m.overview())
 	} else {
 		builder.WriteString(m.execution())
 	}
-	builder.WriteString("\n" + mutedStyle.Render("Tab: switch panel  Enter: view execution  r: rerun  q: quit"))
+	builder.WriteString("\n" + mutedStyle.Render("Tab: switch panel  Enter: view execution  m: mode  ↑/↓: ref run  r: rerun  q: quit"))
 	return panelStyle.Render(builder.String())
 }
 
@@ -199,13 +235,38 @@ func (m app) execution() string {
 		return mutedStyle.Render("No indexed project selected. Run `p2r scan --path <projects-qa>` first.")
 	}
 	run, err := m.store.LatestRunForTask(context.Background(), taskID)
+	refRuns := m.refRuns
+	if len(refRuns) == 0 {
+		refRuns, _ = m.store.ListRunsForTask(context.Background(), taskID)
+	}
+	selfTestPath := pipeline.SelfTestReportPath(filepathFromProject(m.projects, taskID), m.cfg)
+	selfTestStatus := "✗ 未找到，请放置到 " + selfTestPath
+	if fileExists(selfTestPath) {
+		selfTestStatus = "✓ 已就绪"
+	}
 	if err != nil {
-		return fmt.Sprintf("Task: %s\n\nNo run yet. Press r to start a pipeline run.", taskID)
+		return fmt.Sprintf("Task: %s\nMode: %s\n自测报告: %s\n\nNo run yet. Press r to start a pipeline run.", taskID, m.qaMode, selfTestStatus)
 	}
 	stages, _ := m.store.Stages(context.Background(), run.RunID)
 	findings, _ := m.store.Findings(context.Background(), run.RunID)
 	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("Task: %s  Run: %s  %s\n\n", taskID, run.RunID, run.Status))
+	builder.WriteString(fmt.Sprintf("Task: %s  Run: %s  %s\n", taskID, run.RunID, run.Status))
+	builder.WriteString(fmt.Sprintf("Mode: %s", m.qaMode))
+	if m.qaMode == "recheck" {
+		builder.WriteString(fmt.Sprintf("  Ref run: %s", empty(m.selectedRefRun(), "-")))
+	}
+	builder.WriteString("\n自测报告: " + selfTestStatus + "\n\n")
+	if m.qaMode == "recheck" {
+		builder.WriteString("Ref runs:\n")
+		for i, item := range refRuns {
+			prefix := "  "
+			if i == m.refIndex {
+				prefix = "> "
+			}
+			builder.WriteString(fmt.Sprintf("%s%s %s %s\n", prefix, item.RunID, item.Status, item.StartedAt))
+		}
+		builder.WriteString("\n")
+	}
 	builder.WriteString(fmt.Sprintf("Artifacts: %s\n\n", run.ArtifactRoot))
 	var selectedLog string
 	for index, stage := range stages {
@@ -260,7 +321,7 @@ func (m app) runSelected() tea.Cmd {
 	stage := stageLetter(m.selectedStage)
 	return func() tea.Msg {
 		runner := pipeline.NewRunner(m.store, m.cfg)
-		result, err := runner.Run(context.Background(), taskID, pipeline.RunOptions{Stages: affectedStages(stage)})
+		result, err := runner.Run(context.Background(), taskID, pipeline.RunOptions{Stages: affectedStages(stage), Mode: m.qaMode, RefRun: m.selectedRefRun()})
 		return runMsg{result: result, err: err}
 	}
 }
@@ -287,12 +348,59 @@ func (m *app) refreshRows() {
 	m.table.SetRows(rows)
 }
 
+func (m *app) refreshRefRuns() {
+	taskID := m.selectedTaskID()
+	if taskID == "" || m.store == nil {
+		m.refRuns = nil
+		m.refIndex = 0
+		return
+	}
+	runs, err := m.store.ListRunsForTask(context.Background(), taskID)
+	if err != nil {
+		m.refRuns = nil
+		m.refIndex = 0
+		return
+	}
+	filtered := runs[:0]
+	for _, run := range runs {
+		if run.Status == model.RunRunning {
+			continue
+		}
+		filtered = append(filtered, run)
+	}
+	m.refRuns = filtered
+	if m.refIndex >= len(m.refRuns) {
+		m.refIndex = max(0, len(m.refRuns)-1)
+	}
+}
+
 func (m app) selectedTaskID() string {
 	row := m.table.SelectedRow()
 	if len(row) == 0 {
 		return ""
 	}
 	return row[0]
+}
+
+func (m app) selectedRefRun() string {
+	if m.qaMode != "recheck" || len(m.refRuns) == 0 || m.refIndex < 0 || m.refIndex >= len(m.refRuns) {
+		return ""
+	}
+	return m.refRuns[m.refIndex].RunID
+}
+
+func filepathFromProject(projects []db.ProjectSummary, taskID string) string {
+	for _, project := range projects {
+		if project.TaskID == taskID {
+			return project.Path
+		}
+	}
+	return ""
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func (m app) messageStyle() lipgloss.Style {
