@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -164,6 +165,53 @@ func localizePreflightStatus(status string) string {
 	default:
 		return status
 	}
+}
+
+func localizeSummary(summary string) string {
+	trimmed := strings.TrimSpace(summary)
+	switch trimmed {
+	case "":
+		return ""
+	case "Not selected for this run.":
+		return "本次未选择"
+	case "--static-only skips Docker and run_tests evidence.":
+		return "静态模式跳过运行时证据"
+	case "codex exec failed":
+		return "Codex 执行失败"
+	case "codex unavailable":
+		return "Codex 不可用"
+	case "audit input unavailable":
+		return "审查输入不可用"
+	case "prompt profile unavailable":
+		return "提示词模板不可用"
+	case "codex network policy unsupported":
+		return "Codex 网络策略不受支持"
+	case "codex writable tmp policy unsupported":
+		return "Codex 临时写入策略不受支持"
+	}
+	var count int
+	if _, err := fmt.Sscanf(trimmed, "%d acceptance finding(s)", &count); err == nil {
+		return fmt.Sprintf("%d 个验收发现", count)
+	}
+	return localizePreflightMessage(trimmed)
+}
+
+func localizePreflightMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	replacements := map[string]string{
+		"optional flags unavailable": "可选参数不可用",
+		"node found near Codex CLI":  "已找到 Codex CLI 附近的 Node.js",
+		"node found on PATH":         "已在 PATH 中找到 Node.js",
+		"Codex CLI is required for static review stages. Searched PATH and known install locations.": "静态审查阶段需要 Codex CLI，已检查 PATH 和常见安装位置。",
+		"Codex CLI is missing required exec flags":                                                   "Codex CLI 缺少必需执行参数",
+	}
+	for from, to := range replacements {
+		message = strings.ReplaceAll(message, from, to)
+	}
+	return message
 }
 
 func stageStatusIcon(status string) (string, lipgloss.Color) {

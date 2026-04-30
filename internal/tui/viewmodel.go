@@ -245,7 +245,7 @@ func buildDetailContent(vm executionViewModel, selectedStage string, width int) 
 	}
 	if stage.ErrorSummary != "" {
 		builder.WriteString("原因:\n")
-		for _, line := range wrapDisplay(stage.ErrorSummary, max(20, width-4)) {
+		for _, line := range wrapDisplay(localizeSummary(stage.ErrorSummary), max(20, width-4)) {
 			builder.WriteString("  " + line + "\n")
 		}
 	}
@@ -261,36 +261,37 @@ func buildDetailContent(vm executionViewModel, selectedStage string, width int) 
 				if strings.TrimSpace(detail) == "" {
 					continue
 				}
-				for _, line := range wrapDisplay(detail, max(20, width-6)) {
+				for _, line := range wrapDisplay(compactDetailText(detail, vm), max(20, width-6)) {
 					builder.WriteString("    " + line + "\n")
 				}
 			}
 		}
 	}
 	builder.WriteString("\n证据入口:\n")
-	builder.WriteString("  产物: " + empty(vm.ArtifactRoot, "未生成") + "\n")
+	builder.WriteString("  运行目录: " + compactPath(empty(vm.ArtifactRoot, "未生成"), vm) + "\n")
 	if stage.LogPath != "" {
-		builder.WriteString("  日志: " + stage.LogPath + "\n")
+		builder.WriteString("  日志: " + compactPath(stage.LogPath, vm) + "\n")
 	}
 	if len(stage.ArtifactPaths) == 0 {
 		builder.WriteString("  阶段产物: 未生成\n")
 	} else {
+		builder.WriteString("  阶段产物:\n")
 		for _, path := range stage.ArtifactPaths {
-			builder.WriteString("  阶段产物: " + path + "\n")
+			builder.WriteString("    - " + compactPath(path, vm) + "\n")
 		}
 	}
 	builder.WriteString("\n文档:\n")
-	builder.WriteString("  " + docsSummaryLine(vm.DocsSummary) + "\n")
+	builder.WriteString("  " + docsSummaryLineCompact(vm.DocsSummary, vm) + "\n")
 	for _, line := range docsDetailLines(vm.DocsSummary) {
 		builder.WriteString("  " + line + "\n")
 	}
 	builder.WriteString("\n预检:\n")
-	builder.WriteString("  路径: " + empty(vm.PreflightPath, "未生成") + "\n")
+	builder.WriteString("  路径: " + compactPath(empty(vm.PreflightPath, "未生成"), vm) + "\n")
 	for _, line := range strings.Split(empty(vm.PreflightText, "未生成"), "\n") {
 		builder.WriteString("  " + line + "\n")
 	}
 	builder.WriteString("\n清理:\n")
-	builder.WriteString("  路径: " + empty(vm.CleanupPath, "未生成") + "\n")
+	builder.WriteString("  路径: " + compactPath(empty(vm.CleanupPath, "未生成"), vm) + "\n")
 	builder.WriteString("  状态: " + localizeCleanupStatus(vm.CleanupStatus) + "\n")
 	for _, line := range strings.Split(empty(vm.CleanupText, "未生成"), "\n") {
 		builder.WriteString("  " + line + "\n")
@@ -382,6 +383,17 @@ func docsSummaryLine(summary docsSummary) string {
 	return fmt.Sprintf("%d 个，文档清单: %s（%s）", summary.Count, summary.ManifestPath, status)
 }
 
+func docsSummaryLineCompact(summary docsSummary, vm executionViewModel) string {
+	status := "未生成"
+	if summary.ManifestExists {
+		status = "已生成"
+	}
+	if summary.Error != "" {
+		status = "读取失败: " + summary.Error
+	}
+	return fmt.Sprintf("%d 个，文档清单: %s（%s）", summary.Count, compactPath(summary.ManifestPath, vm), status)
+}
+
 func docsDetailLines(summary docsSummary) []string {
 	if len(summary.Docs) == 0 {
 		return []string{"无补充文档"}
@@ -435,7 +447,7 @@ func readPreflightSummary(path string) string {
 			line += " [" + strings.Join(check.Stages, ",") + "]"
 		}
 		if check.Message != "" {
-			line += " - " + check.Message
+			line += " - " + localizePreflightMessage(check.Message)
 		}
 		lines = append(lines, line)
 	}
@@ -552,6 +564,48 @@ func readLogTail(path string, maxLines int) string {
 		lines = lines[len(lines)-maxLines:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func compactDetailText(text string, vm executionViewModel) string {
+	if strings.TrimSpace(vm.ArtifactRoot) != "" {
+		text = strings.ReplaceAll(text, filepath.Clean(vm.ArtifactRoot), "$RUN")
+	}
+	if strings.TrimSpace(vm.ProjectPath) != "" {
+		text = strings.ReplaceAll(text, filepath.Clean(vm.ProjectPath), "$PROJECT")
+	}
+	return text
+}
+
+func compactPath(path string, vm executionViewModel) string {
+	path = strings.TrimSpace(path)
+	if path == "" || path == "未生成" {
+		return empty(path, "未生成")
+	}
+	cleaned := filepath.Clean(path)
+	for _, base := range []struct {
+		path  string
+		label string
+	}{
+		{vm.ArtifactRoot, "$RUN"},
+		{vm.ProjectPath, "$PROJECT"},
+	} {
+		if strings.TrimSpace(base.path) == "" {
+			continue
+		}
+		rel, err := filepath.Rel(filepath.Clean(base.path), cleaned)
+		if err == nil && rel != "." && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) {
+			return base.label + "/" + filepath.ToSlash(rel)
+		}
+		if err == nil && rel == "." {
+			return base.label
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if rel, err := filepath.Rel(home, cleaned); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+			return "~/" + filepath.ToSlash(rel)
+		}
+	}
+	return truncateMiddleDisplay(cleaned, 96)
 }
 
 func stageLogPreview(path string, maxLines int) string {

@@ -28,6 +28,9 @@ func localizeStageName(stage, name string) string
 //go:linkname localizeCleanupStatus github.com/xuanli520/p2r_tui/internal/tui.localizeCleanupStatus
 func localizeCleanupStatus(status string) string
 
+//go:linkname localizeSummary github.com/xuanli520/p2r_tui/internal/tui.localizeSummary
+func localizeSummary(summary string) string
+
 func TestExecutionLayoutBreakpoints(t *testing.T) {
 	cases := map[int]string{120: "wide", 100: "medium", 80: "stacked", 70: "minimal"}
 	for width, want := range cases {
@@ -77,6 +80,8 @@ func TestLocalizationCoversCoreValues(t *testing.T) {
 		localizeSeverity("Blocker"):                       "阻断",
 		localizeStageName("F", ""):                        "标注员修复静态审查",
 		localizeCleanupStatus("none"):                     "未生成",
+		localizeSummary("Not selected for this run."):     "本次未选择",
+		localizeSummary("3 acceptance finding(s)"):        "3 个验收发现",
 	}
 	for got, want := range cases {
 		if got != want {

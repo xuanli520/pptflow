@@ -52,6 +52,11 @@ func runCommand(ctx context.Context, timeout time.Duration, dir string, env []st
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
+	prepareCommand(cmd)
+	cmd.Cancel = func() error {
+		return terminateCommand(cmd)
+	}
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = dir
 	if len(env) > 0 {
 		cmd.Env = env

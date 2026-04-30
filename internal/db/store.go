@@ -194,6 +194,25 @@ func (s *Store) ListRunsForTask(ctx context.Context, taskID string) ([]model.Run
 	return runs, rows.Err()
 }
 
+func (s *Store) RunningRuns(ctx context.Context) ([]model.RunRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,'') FROM runs WHERE status = ? ORDER BY started_at DESC, run_id DESC`, model.RunRunning)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var runs []model.RunRecord
+	for rows.Next() {
+		var run model.RunRecord
+		var staticOnly int
+		if err := rows.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions); err != nil {
+			return nil, err
+		}
+		run.StaticOnly = staticOnly == 1
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
 func (s *Store) PutStage(ctx context.Context, runID string, stage model.StageRecord) error {
 	blockedBy, _ := json.Marshal(stage.BlockedBy)
 	artifacts, _ := json.Marshal(stage.ArtifactPaths)

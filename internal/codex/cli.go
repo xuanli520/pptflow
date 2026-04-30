@@ -19,6 +19,7 @@ type Capability struct {
 	Version                string `json:"version,omitempty"`
 	HasSandbox             bool   `json:"has_sandbox"`
 	HasAskForApproval      bool   `json:"has_ask_for_approval"`
+	HasConfig              bool   `json:"has_config"`
 	HasCDLong              bool   `json:"has_cd_long"`
 	HasCDShort             bool   `json:"has_cd_short"`
 	HasEphemeral           bool   `json:"has_ephemeral"`
@@ -67,6 +68,7 @@ func DetectCLI(ctx context.Context, exec executor.Runner, preferredPath string) 
 func ApplyExecHelp(cap *Capability, help string) {
 	cap.HasSandbox = hasHelpToken(help, "--sandbox")
 	cap.HasAskForApproval = hasHelpToken(help, "--ask-for-approval")
+	cap.HasConfig = hasHelpToken(help, "--config") || hasHelpToken(help, "-c,")
 	cap.HasCDLong = hasHelpToken(help, "--cd")
 	cap.HasCDShort = hasHelpToken(help, "-C")
 	cap.HasEphemeral = hasHelpToken(help, "--ephemeral")
@@ -91,6 +93,10 @@ func BuildExecArgs(cap Capability, projectPath string, extraArgs []string) ([]st
 	args = append(args, "--sandbox", "read-only")
 	if cap.HasAskForApproval {
 		args = append(args, "--ask-for-approval", "never")
+	} else if cap.HasConfig {
+		args = append(args, "-c", `approval_policy="never"`)
+	} else {
+		return nil, fmt.Errorf("codex exec exposes neither --ask-for-approval nor -c/--config; cannot force approval_policy=never")
 	}
 	switch {
 	case cap.HasCDLong:
@@ -137,7 +143,7 @@ func WithNodeOnPATH(env []string, nodePath string) []string {
 
 func optionalMissingMessage(cap Capability) string {
 	var missing []string
-	if !cap.HasAskForApproval {
+	if !cap.HasAskForApproval && !cap.HasConfig {
 		missing = append(missing, "--ask-for-approval")
 	}
 	if !cap.HasEphemeral {

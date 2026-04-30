@@ -13,6 +13,7 @@ func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
 	capability := codex.Capability{
 		Path:                "codex",
 		HasSandbox:          true,
+		HasConfig:           true,
 		HasCDLong:           true,
 		HasEphemeral:        true,
 		HasSkipGitRepoCheck: true,
@@ -22,12 +23,12 @@ func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := joinArgs(args)
-	for _, absent := range []string{"--ask-for-approval", "never"} {
+	for _, absent := range []string{"--ask-for-approval"} {
 		if containsArg(args, absent) {
 			t.Fatalf("args should not contain unavailable optional flag %s: %#v", absent, args)
 		}
 	}
-	for _, want := range []string{"exec", "--skip-git-repo-check", "--sandbox", "read-only", "--cd", "/repo", "--ephemeral", "--model", "gpt-5.4", "-"} {
+	for _, want := range []string{"exec", "--skip-git-repo-check", "--sandbox", "read-only", "-c", `approval_policy="never"`, "--cd", "/repo", "--ephemeral", "--model", "gpt-5.4", "-"} {
 		if !containsArg(args, want) {
 			t.Fatalf("args missing %s in %s", want, joined)
 		}
@@ -35,7 +36,7 @@ func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
 }
 
 func TestBuildExecArgsSupportsShortCD(t *testing.T) {
-	args, err := codex.BuildExecArgs(codex.Capability{Path: "codex", HasSandbox: true, HasCDShort: true}, "/repo", nil)
+	args, err := codex.BuildExecArgs(codex.Capability{Path: "codex", HasSandbox: true, HasConfig: true, HasCDShort: true}, "/repo", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +48,12 @@ func TestBuildExecArgsSupportsShortCD(t *testing.T) {
 func TestBuildExecArgsRejectsMissingSandbox(t *testing.T) {
 	if _, err := codex.BuildExecArgs(codex.Capability{Path: "codex", HasCDLong: true}, "/repo", nil); err == nil {
 		t.Fatal("expected missing sandbox to be rejected")
+	}
+}
+
+func TestBuildExecArgsRejectsWhenApprovalPolicyCannotBeForced(t *testing.T) {
+	if _, err := codex.BuildExecArgs(codex.Capability{Path: "codex", HasSandbox: true, HasCDLong: true}, "/repo", nil); err == nil {
+		t.Fatal("expected missing approval-policy controls to be rejected")
 	}
 }
 

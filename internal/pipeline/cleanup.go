@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
@@ -25,10 +27,14 @@ func (r Runner) acquireTaskRunLock(taskID string) (taskRunLock, error) {
 	name := safeLockName(taskID) + ".lock"
 	path := filepath.Join(lockDir, name)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil && os.IsExist(err) && staleTaskRunLock(path) {
+		_ = os.Remove(path)
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	}
 	if err != nil {
 		return taskRunLock{}, fmt.Errorf("task %s is already locked for a p2r run or lock cannot be created: %w", taskID, err)
 	}
-	_, _ = fmt.Fprintf(file, "task_id=%s\n", taskID)
+	_, _ = fmt.Fprintf(file, "task_id=%s\npid=%d\ncreated_at=%s\n", taskID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	return taskRunLock{path: path, file: file}, nil
 }
 
@@ -141,6 +147,25 @@ func safeLockName(taskID string) string {
 		name = name[:48]
 	}
 	return strings.Trim(name, "._-") + "-" + sum[:8]
+}
+
+func staleTaskRunLock(path string) bool {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(string(content), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	pid, err := strconv.Atoi(values["pid"])
+	if err != nil || pid <= 0 {
+		return false
+	}
+	return !processAlive(pid)
 }
 
 func mergeCleanupIntoManifest(path string, key string, value any) {

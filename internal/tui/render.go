@@ -53,11 +53,13 @@ func renderExecution(m app) string {
 	layout := layoutFor(m.width, m.height, true)
 	if layout.mode == layoutWide || layout.mode == layoutMedium {
 		left := renderPanel(layout.leftWidth, layout.contentHeight, renderExecutionLeft(m, max(8, layout.leftWidth-panelStyle.GetHorizontalFrameSize())))
-		right := renderPanel(layout.rightWidth, layout.contentHeight, m.detail.View())
+		rightWidth := max(8, layout.rightWidth-panelStyle.GetHorizontalFrameSize())
+		right := renderPanel(layout.rightWidth, layout.contentHeight, renderDetailContext(m, rightWidth)+"\n"+m.detail.View())
 		return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 	}
 	stageSummary := renderPanel(layout.contentWidth, layout.stageHeight, renderStageSummary(m, max(8, layout.contentWidth-panelStyle.GetHorizontalFrameSize())))
-	detail := renderPanel(layout.contentWidth, max(6, layout.contentHeight-layout.stageHeight), m.detail.View())
+	detailWidth := max(8, layout.contentWidth-panelStyle.GetHorizontalFrameSize())
+	detail := renderPanel(layout.contentWidth, max(6, layout.contentHeight-layout.stageHeight), renderDetailContext(m, detailWidth)+"\n"+m.detail.View())
 	return lipgloss.JoinVertical(lipgloss.Left, stageSummary, detail)
 }
 
@@ -127,10 +129,20 @@ func renderStageSummary(m app, width int) string {
 	return truncateDisplay(line, width)
 }
 
+func renderDetailContext(m app, width int) string {
+	stage := m.selectedStage()
+	if stage.Stage == "" {
+		return mutedStyle.Render(truncateDisplay("当前: 未选择阶段", width))
+	}
+	icon, _ := stageStatusIcon(stage.Status)
+	line := fmt.Sprintf("当前: %s %s  状态: %s %s  运行: %s", stage.Stage, stage.DisplayName, icon, localizeStageStatus(stage.Status), empty(m.detailVM.Run.RunID, "未生成"))
+	return mutedStyle.Render(truncateDisplay(line, width))
+}
+
 func renderStageLine(stage stageView, selected bool, width int) string {
 	icon, color := stageStatusIcon(stage.Status)
 	status := lipgloss.NewStyle().Foreground(color).Render(icon)
-	reason := stage.ErrorSummary
+	reason := localizeSummary(stage.ErrorSummary)
 	if reason != "" {
 		reason = " " + reason
 	}

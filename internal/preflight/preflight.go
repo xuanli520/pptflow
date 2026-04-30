@@ -124,10 +124,10 @@ func checkCodex(ctx context.Context, exec executor.Runner, cfg config.Config) Ch
 		check.Message = err.Error()
 		return check
 	}
-	if capability.OptionalMissingMessage != "" || capability.PathPrependedForNode {
+	if capability.OptionalMissingMessage != "" {
 		check.Status = "degraded"
 		var messages []string
-		for _, message := range []string{capability.OptionalMissingMessage, capability.NodeDetectionMessage} {
+		for _, message := range []string{capability.OptionalMissingMessage} {
 			if strings.TrimSpace(message) != "" {
 				messages = append(messages, message)
 			}
@@ -142,6 +142,8 @@ func validateExtraArgs(args []string) string {
 		"--sandbox":          true,
 		"--ask-for-approval": true,
 		"-a":                 true,
+		"-c":                 true,
+		"--config":           true,
 		"--cd":               true,
 		"-C":                 true,
 		"--dangerously-bypass-approvals-and-sandbox": true,

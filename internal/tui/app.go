@@ -189,6 +189,7 @@ func (m app) reload() tea.Cmd {
 	}
 	return func() tea.Msg {
 		ctx := context.Background()
+		_ = pipeline.RecoverStaleRuns(ctx, m.store, m.cfg)
 		projects, err := m.store.ListProjects(ctx)
 		if err != nil {
 			return projectsMsg{err: err}
@@ -245,6 +246,9 @@ func (m *app) applyLayout() {
 	m.table.SetHeight(layout.overviewTableHeight)
 	m.detail.Width = layout.detailWidth
 	m.detail.Height = layout.detailHeight
+	if m.tab == panelExecution {
+		m.detail.Height = max(3, layout.detailHeight-1)
+	}
 	m.refreshRows()
 	m.updateDetailContent(false)
 }

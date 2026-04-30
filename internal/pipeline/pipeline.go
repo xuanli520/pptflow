@@ -111,7 +111,7 @@ func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project
 	return opts, nil
 }
 
-func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result, error) {
+func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result Result, err error) {
 	project, err := r.store.GetProject(ctx, taskID)
 	if err != nil {
 		return Result{}, db.FormatNotFound("task", taskID)
@@ -156,6 +156,19 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 	if err := r.store.CreateRun(ctx, run); err != nil {
 		return Result{}, err
 	}
+	runCreated := true
+	runFinished := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if runCreated && !runFinished {
+				r.markRunCrashed(context.Background(), run, start, fmt.Sprintf("panic: %v", recovered))
+			}
+			panic(recovered)
+		}
+		if err != nil && runCreated && !runFinished {
+			r.markRunCrashed(context.Background(), run, start, err.Error())
+		}
+	}()
 	stages := initialStages(selectedStages(opts, staticOnly), staticOnly)
 	if err := r.writeRunManifest(run, project, opts, released, releaseErr, importedDocs, docsManifest, firstErrorString(docsImportErr, docsManifestErr)); err != nil {
 		return Result{}, err
@@ -225,10 +238,26 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 	if err := r.store.FinishRun(ctx, runID, taskID, status, time.Since(start)); err != nil {
 		return Result{}, err
 	}
+	runFinished = true
 	run.Status = status
 	run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	run.DurationMS = time.Since(start).Milliseconds()
 	return Result{Run: run, Stages: stages}, nil
+}
+
+func (r Runner) markRunCrashed(ctx context.Context, run model.RunRecord, start time.Time, reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "pipeline exited before finishing the run"
+	}
+	_ = writeJSON(filepath.Join(run.ArtifactRoot, "crash_summary.json"), map[string]any{
+		"run_id":      run.RunID,
+		"task_id":     run.TaskID,
+		"status":      model.RunCrashed,
+		"reason":      reason,
+		"recorded_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	_ = r.store.FinishRun(ctx, run.RunID, run.TaskID, model.RunCrashed, time.Since(start))
 }
 
 func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project scanner.Project, stage string, prior map[string]model.StageRecord, opts RunOptions, preflightResult preflight.CheckResult) model.StageRecord {
