@@ -19,6 +19,28 @@ func assignFindingIDs(stage string, findings []model.Finding) []model.Finding {
 	return findings
 }
 
+func assignMissingFindingIDs(stage string, findings []model.Finding) []model.Finding {
+	counts := map[string]int{}
+	for _, finding := range findings {
+		if finding.Stage == stage && finding.ID != "" {
+			short := severityShort(finding.Severity)
+			counts[short]++
+		}
+	}
+	for i := range findings {
+		if findings[i].Stage == "" {
+			findings[i].Stage = stage
+		}
+		if findings[i].ID != "" {
+			continue
+		}
+		short := severityShort(findings[i].Severity)
+		counts[short]++
+		findings[i].ID = fmt.Sprintf("P2R-%s-%s-%03d", findings[i].Stage, short, counts[short])
+	}
+	return findings
+}
+
 func severityShort(severity string) string {
 	switch strings.ToLower(severity) {
 	case "blocker":

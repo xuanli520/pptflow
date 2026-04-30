@@ -16,16 +16,18 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/preflight"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
+	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
 type RunOptions struct {
-	Stage      string
-	From       string
-	StaticOnly bool
-	Stages     []string
-	Mode       string
-	RefRun     string
-	ExtraDocs  []string
+	Stage       string
+	From        string
+	StaticOnly  bool
+	Stages      []string
+	Mode        string
+	RefRun      string
+	ExtraDocs   []string
+	KeepRuntime bool
 }
 
 type Result struct {
@@ -44,14 +46,35 @@ func NewRunner(store *db.Store, cfg config.Config) Runner {
 }
 
 func SelfTestReportPath(projectPath string, cfg config.Config) string {
-	path := strings.TrimSpace(cfg.Pipeline.SelfTestReportPath)
-	if path == "" {
-		path = "repo/self_test_report.md"
+	candidates := SelfTestReportCandidates(projectPath, cfg)
+	if len(candidates) == 0 {
+		return filepath.Clean(filepath.Join(projectPath, "repo", "self_test_report.md"))
 	}
-	if filepath.IsAbs(path) {
-		return filepath.Clean(path)
+	return candidates[0]
+}
+
+func SelfTestReportCandidates(projectPath string, cfg config.Config) []string {
+	var candidates []string
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(projectPath, path)
+		}
+		path = filepath.Clean(path)
+		for _, existing := range candidates {
+			if existing == path {
+				return
+			}
+		}
+		candidates = append(candidates, path)
 	}
-	return filepath.Clean(filepath.Join(projectPath, path))
+	add(cfg.Pipeline.SelfTestReportPath)
+	add("repo/self_test_report.md")
+	add("docs/self-test-report.md")
+	return candidates
 }
 
 func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project, opts RunOptions) (RunOptions, error) {
@@ -97,6 +120,12 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 	if err != nil {
 		return Result{}, err
 	}
+	lock, err := r.acquireTaskRunLock(taskID)
+	if err != nil {
+		return Result{}, err
+	}
+	defer lock.Release()
+	previousRuns, _ := r.store.ListRunsForTask(ctx, taskID)
 	start := time.Now().UTC()
 	runID := fmt.Sprintf("run-%s-%d", start.Format("20060102-150405"), start.UnixNano()%1000000)
 	artifactRoot := filepath.Join(project.Path, "qa", "runs", runID)
@@ -109,7 +138,10 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 	if releaseErr != nil {
 		toolVersions, _ = json.Marshal(map[string]any{"assets_error": releaseErr.Error()})
 	}
+	importedDocs, docsImportErr := taskdocs.ImportDropbox(r.cfg.ScanPath, taskID, r.cfg.Docs, "p2r-run")
+	docsManifest, docsManifestErr := taskdocs.ReadManifest(r.cfg.ScanPath, taskID)
 	staticOnly := opts.StaticOnly || r.cfg.Pipeline.StaticOnly
+	keepRuntime := opts.KeepRuntime || r.cfg.Docker.KeepRuntime
 	run := model.RunRecord{
 		RunID:          runID,
 		TaskID:         taskID,
@@ -125,7 +157,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 		return Result{}, err
 	}
 	stages := initialStages(selectedStages(opts, staticOnly), staticOnly)
-	if err := r.writeRunManifest(run, project, opts, released, releaseErr); err != nil {
+	if err := r.writeRunManifest(run, project, opts, released, releaseErr, importedDocs, docsManifest, firstErrorString(docsImportErr, docsManifestErr)); err != nil {
 		return Result{}, err
 	}
 	if err := r.writeStageStatus(runID, artifactRoot, stages); err != nil {
@@ -134,8 +166,14 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 	preflightResult := preflight.Run(ctx, r.exec, r.cfg)
 	preflightPath := filepath.Join(artifactRoot, "preflight.json")
 	_ = writeJSON(preflightPath, preflightResult)
+	preCleanup := r.cleanupStaleRuns(ctx, previousRuns, runID, artifactRoot)
+	if len(preCleanup) > 0 {
+		mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "pre_run_cleanup", preCleanup)
+	}
 
 	results := map[string]model.StageRecord{}
+	runtimeCleanupDone := false
+	cleanupFailed := false
 	for index := range stages {
 		stage := stages[index].Stage
 		if stages[index].Status == model.StageSkipped {
@@ -147,17 +185,35 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 			continue
 		}
 		record := r.executeStage(ctx, run, project, stage, results, opts, preflightResult)
-		if stage != "F" {
-			record.Findings = assignFindingIDs(stage, record.Findings)
-		}
+		record.Findings = assignMissingFindingIDs(stage, record.Findings)
 		stages[index] = record
 		results[stage] = record
 		_ = r.store.PutStage(ctx, runID, record)
 		_ = r.store.InsertFindings(ctx, runID, record.Findings)
 		_ = r.writeStageStatus(runID, artifactRoot, stages)
+		if !runtimeCleanupDone && runtimeCleanupPoint(stage, stages) {
+			cleanupSummary := r.cleanupCurrentRuntime(ctx, run, keepRuntime)
+			mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
+			if cleanupSummary.Status == "failed" {
+				cleanupFailed = true
+				_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
+			}
+			runtimeCleanupDone = true
+		}
+	}
+	if !runtimeCleanupDone && runtimeStageWasSelected(stages) {
+		cleanupSummary := r.cleanupCurrentRuntime(ctx, run, keepRuntime)
+		mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
+		if cleanupSummary.Status == "failed" {
+			cleanupFailed = true
+			_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
+		}
 	}
 
 	status := runStatus(stages)
+	if cleanupFailed {
+		status = model.RunCompletedWithFindings
+	}
 	if err := r.store.FinishRun(ctx, runID, taskID, status, time.Since(start)); err != nil {
 		return Result{}, err
 	}
@@ -169,27 +225,32 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (Result
 
 func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project scanner.Project, stage string, prior map[string]model.StageRecord, opts RunOptions, preflightResult preflight.CheckResult) model.StageRecord {
 	if check, ok := preflightResult.BlockingCheck(stage); ok {
-		return r.materializeSkippedStage(run, blockedStage(stage, stageName(stage), nil, check.Message))
+		if stage == "D" || stage == "E" || stage == "F" {
+			// Static stages materialize their own unavailable-review reports so
+			// the external QA artifact contract stays intact.
+		} else {
+			return r.materializeSkippedStage(run, blockedStage(stage, stageName(stage), nil, check.Message))
+		}
 	}
 	switch stage {
 	case "A":
 		return r.stageA(run, project)
 	case "B":
-		if prior["A"].Status == model.StageFailed {
-			return r.materializeSkippedStage(run, blockedStage("B", stageName("B"), []string{"A"}, "Stage A failed; runtime evidence is blocked."))
-		}
 		return r.stageB(ctx, run, project)
 	case "C":
-		if prior["B"].Status != model.StageDone {
-			return r.materializeSkippedStage(run, blockedStage("C", stageName("C"), []string{"B"}, "Stage C requires successful Docker/runtime evidence from B."))
-		}
 		return r.stageC(ctx, run, project)
 	case "D":
+		if opts.Mode == "recheck" {
+			return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "自测报告确认修复报告.md")
+		}
 		return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性.md")
 	case "E":
+		if opts.Mode == "recheck" {
+			return r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "1_质检AI测试报告_确认修复报告.md", "static_acceptance_audit_report.md")
+		}
 		return r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "static_acceptance_audit_report.md", "1_质检AI测试报告.md")
 	case "F":
-		return r.stageF(run, prior)
+		return r.stageF(ctx, run, project, opts, prior)
 	default:
 		return skippedStage(stage, "Unknown stage.")
 	}
@@ -253,22 +314,7 @@ func initialStages(selected map[string]bool, staticOnly bool) []model.StageRecor
 }
 
 func stageName(stage string) string {
-	switch stage {
-	case "A":
-		return "structure and rules check"
-	case "B":
-		return "Docker runtime evidence"
-	case "C":
-		return "run_tests runtime evidence"
-	case "D":
-		return "tests effectiveness static review"
-	case "E":
-		return "static acceptance audit"
-	case "F":
-		return "repair summary and short_comment"
-	default:
-		return "unknown"
-	}
+	return model.StageDisplayName(stage)
 }
 
 func (r Runner) stageTimeout(key string, fallback int) time.Duration {
@@ -360,19 +406,29 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 	return record
 }
 
-func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, opts RunOptions, released []assets.ReleasedFile, releaseErr error) error {
+func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, opts RunOptions, released []assets.ReleasedFile, releaseErr error, importedDocs []taskdocs.Document, docsManifest taskdocs.Manifest, docsErr string) error {
 	manifest := map[string]any{
-		"run_id":           run.RunID,
-		"task_id":          run.TaskID,
-		"started_at":       run.StartedAt,
-		"project_path":     project.Path,
-		"static_only":      run.StaticOnly,
-		"stage":            opts.Stage,
-		"from":             opts.From,
-		"stages":           opts.Stages,
-		"qa_mode":          opts.Mode,
-		"ref_run":          opts.RefRun,
-		"extra_docs":       opts.ExtraDocs,
+		"run_id":       run.RunID,
+		"task_id":      run.TaskID,
+		"started_at":   run.StartedAt,
+		"project_path": project.Path,
+		"static_only":  run.StaticOnly,
+		"stage":        opts.Stage,
+		"from":         opts.From,
+		"stages":       opts.Stages,
+		"qa_mode":      opts.Mode,
+		"ref_run":      opts.RefRun,
+		"extra_docs":   opts.ExtraDocs,
+		"supplemental_docs": map[string]any{
+			"manifest":         taskdocs.ManifestPath(r.cfg.ScanPath, run.TaskID),
+			"managed_store":    taskdocs.StoreDir(r.cfg.ScanPath, run.TaskID),
+			"count":            len(docsManifest.Docs),
+			"imported_count":   len(importedDocs),
+			"docs":             docsManifest.Docs,
+			"inline_limit":     r.cfg.Docs.InlineTextLimitBytes,
+			"stage_text_limit": r.cfg.Docs.StageInlineMaxBytes,
+		},
+		"keep_runtime":     opts.KeepRuntime || r.cfg.Docker.KeepRuntime,
 		"self_test_report": r.cfg.Pipeline.SelfTestReportPath,
 		"preflight":        "preflight.json",
 		"stage_timeouts":   r.cfg.Pipeline.StageTimeouts,
@@ -390,11 +446,31 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 			"extra_args":          r.cfg.Codex.ExtraArgs,
 			"docker_socket":       "not mounted",
 		},
+		"docker_cleanup_policy": map[string]any{
+			"cleanup_policy":          r.cfg.Docker.CleanupPolicy,
+			"cleanup_images":          r.cfg.Docker.CleanupImages,
+			"cleanup_volumes":         r.cfg.Docker.CleanupVolumes,
+			"cleanup_build_cache":     r.cfg.Docker.CleanupBuildCache,
+			"build_cache_prune_until": r.cfg.Docker.BuildCachePruneUntil,
+			"keep_runtime":            opts.KeepRuntime || r.cfg.Docker.KeepRuntime,
+		},
 	}
 	if releaseErr != nil {
 		manifest["asset_release_error"] = releaseErr.Error()
 	}
+	if docsErr != "" {
+		manifest["docs_error"] = docsErr
+	}
 	return writeJSON(filepath.Join(run.ArtifactRoot, "run_manifest.json"), manifest)
+}
+
+func firstErrorString(errors ...error) string {
+	for _, err := range errors {
+		if err != nil {
+			return err.Error()
+		}
+	}
+	return ""
 }
 
 func (r Runner) writeStageStatus(runID, artifactRoot string, stages []model.StageRecord) error {

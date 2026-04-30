@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 )
@@ -23,32 +24,25 @@ type Check struct {
 	Version string   `json:"version,omitempty"`
 	Message string   `json:"message,omitempty"`
 	Stages  []string `json:"stages,omitempty"`
+	Details any      `json:"details,omitempty"`
 }
 
 func Run(ctx context.Context, exec executor.Runner, cfg config.Config) CheckResult {
 	var result CheckResult
-	node := checkBinary(ctx, exec, "node", []string{"--version"}, nodeCandidates(), []string{"D", "E"}, "Node.js is required by Codex CLI.")
+	node := checkBinary(ctx, exec, "node", []string{"--version"}, nodeCandidates(), nil, "Node.js is required by Codex CLI.")
 	result.Checks = append(result.Checks, node)
 	result.Checks = append(result.Checks, checkBinary(ctx, exec, "docker", []string{"--version"}, dockerCandidates(), []string{"B"}, "Docker is required for Stage B runtime evidence."))
 	result.Checks = append(result.Checks, checkBinary(ctx, exec, "bash", []string{"--version"}, bashCandidates(), []string{"C"}, "bash is required to run repo/run_tests.sh on the host."))
 	result.Checks = append(result.Checks, checkPython(ctx, exec))
-	codex := checkBinary(ctx, exec, "codex", []string{"--version"}, codexCandidates(), []string{"D", "E"}, "Codex CLI is required for static review stages.")
+	codexCheck := checkCodex(ctx, exec, cfg)
 	if node.Status == "missing" {
-		codex.Status = "missing"
-		codex.Message = "Node.js is missing; install Node.js before running Codex CLI."
-	}
-	if codex.Status == "ok" {
-		flagCheck := checkCodexFlags(ctx, exec, codex.Path)
-		if flagCheck.Status != "ok" {
-			codex.Status = flagCheck.Status
-			codex.Message = flagCheck.Message
+		if cap, ok := codexCheck.Details.(codex.Capability); ok && cap.NodePath != "" {
+			node.Status = "degraded"
+			node.Message = "node is not on PATH, but Codex-local Node.js will be prepended for static review."
+			node.Path = cap.NodePath
 		}
 	}
-	if err := validateExtraArgs(cfg.Codex.ExtraArgs); err != "" {
-		codex.Status = "missing"
-		codex.Message = err
-	}
-	result.Checks = append(result.Checks, codex)
+	result.Checks = append(result.Checks, codexCheck)
 	return result
 }
 
@@ -110,19 +104,37 @@ func checkPython(ctx context.Context, exec executor.Runner) Check {
 	return Check{Name: "python", Status: "missing", Message: "python/python3 or uv is required for Stage A scripts.", Stages: []string{"A"}}
 }
 
-func checkCodexFlags(ctx context.Context, exec executor.Runner, path string) Check {
-	out := exec.Run(ctx, 5*time.Second, "", nil, path, "exec", "--help")
-	help := out.Stdout + "\n" + out.Stderr
-	missing := []string{}
-	for _, flag := range []string{"--ask-for-approval", "--sandbox", "--cd", "--ephemeral"} {
-		if !strings.Contains(help, flag) {
-			missing = append(missing, flag)
+func checkCodex(ctx context.Context, exec executor.Runner, cfg config.Config) Check {
+	path, err := exec.LookPath("codex")
+	if err != nil || path == "" {
+		path = firstExecutable(codexCandidates())
+	}
+	if path == "" {
+		return Check{Name: "codex", Status: "missing", Message: "Codex CLI is required for static review stages. Searched PATH and known install locations.", Stages: []string{"D", "E", "F"}}
+	}
+	capability := codex.DetectCLI(ctx, exec, path)
+	check := Check{Name: "codex", Status: "ok", Path: capability.Path, Version: capability.Version, Stages: []string{"D", "E", "F"}, Details: capability}
+	if err := validateExtraArgs(cfg.Codex.ExtraArgs); err != "" {
+		check.Status = "missing"
+		check.Message = err
+		return check
+	}
+	if _, err := codex.BuildExecArgs(capability, ".", nil); err != nil {
+		check.Status = "missing"
+		check.Message = err.Error()
+		return check
+	}
+	if capability.OptionalMissingMessage != "" || capability.PathPrependedForNode {
+		check.Status = "degraded"
+		var messages []string
+		for _, message := range []string{capability.OptionalMissingMessage, capability.NodeDetectionMessage} {
+			if strings.TrimSpace(message) != "" {
+				messages = append(messages, message)
+			}
 		}
+		check.Message = strings.Join(messages, "; ")
 	}
-	if len(missing) > 0 {
-		return Check{Name: "codex_flags", Status: "missing", Message: "Codex CLI is missing required exec flags: " + strings.Join(missing, ", "), Stages: []string{"D", "E"}}
-	}
-	return Check{Name: "codex_flags", Status: "ok"}
+	return check
 }
 
 func validateExtraArgs(args []string) string {

@@ -14,6 +14,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
+	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
 func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output, compat string) model.StageRecord {
@@ -91,8 +92,10 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		record.ErrorSummary = "codex writable tmp policy unsupported"
 		return finishStage(record, model.StageFailed, start)
 	}
-	if _, err := r.exec.LookPath("codex"); err != nil {
-		report := staticUnavailableReport(stage, profile, project.Path, "codex executable not found on PATH")
+	capability := codex.DetectCLI(ctx, r.exec, "")
+	execArgs, buildErr := codex.BuildExecArgs(capability, project.Path, nil)
+	if buildErr != nil {
+		report := staticUnavailableReport(stage, profile, project.Path, buildErr.Error())
 		_ = writeText(outputPath, report)
 		_ = writeText(compatPath, report)
 		_ = writeText(logPath, report)
@@ -101,7 +104,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 			Severity:   "High",
 			Title:      stageName(stage) + " unavailable",
 			Rule:       "Static review stages require codex exec or an equivalent reviewer.",
-			Evidence:   "codex executable not found on PATH",
+			Evidence:   buildErr.Error(),
 			Impact:     "Static review evidence is incomplete and requires manual verification.",
 			MinimumFix: "Install Codex CLI or run the static template manually, then rerun this stage.",
 		}}
@@ -152,16 +155,17 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		record.ErrorSummary = "codex sandbox unavailable"
 		return finishStage(record, model.StageFailed, start)
 	}
-	env := sandbox.Env(os.Environ(), r.cfg.Codex.Env)
+	defer os.RemoveAll(sandbox.Home)
+	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
 	timeout := r.stageTimeout(stage, 300)
 	prompt := codexPrompt(stage, profile, project.Path, run.ArtifactRoot, string(profileContent), contextText)
-	args := []string{"exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ask-for-approval", "never", "--cd", project.Path, "--ephemeral"}
+	args := execArgs[:len(execArgs)-1]
 	args = append(args, extraArgs...)
 	args = append(args, "-")
-	result := r.exec.RunWithInput(ctx, timeout, project.Path, env, strings.NewReader(prompt), "codex", args...)
+	result := r.exec.RunWithInput(ctx, timeout, project.Path, env, strings.NewReader(prompt), capability.Path, args...)
 	report := strings.TrimSpace(result.Stdout)
 	if report == "" {
-		report = staticUnavailableReport(stage, profile, project.Path, strings.TrimSpace(result.Stderr))
+		report = staticUnavailableReport(stage, profile, project.Path, codexFailureReason(result.Stderr))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
 	_ = writeText(outputPath, report+"\n")
@@ -169,14 +173,14 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	for _, path := range extraOutputPaths {
 		_ = writeText(path, report+"\n")
 	}
-	_ = writeText(logPath, result.Command+"\n\nPrompt: supplied via stdin; sha256="+sha256Text(prompt)+"\nCodex env keys: "+strings.Join(configuredEnvKeys(r.cfg.Codex.Env), ",")+"\n\nSTDOUT:\n"+truncateString(result.Stdout, r.cfg.Codex.MaxOutputBytes)+"\nSTDERR:\n"+truncateString(result.Stderr, r.cfg.Codex.MaxOutputBytes))
+	_ = writeText(logPath, result.Command+"\n\nPrompt: supplied via stdin; sha256="+sha256Text(prompt)+"\nCodex capability: "+capabilitySummary(capability)+"\nCodex env keys: "+strings.Join(configuredEnvKeys(r.cfg.Codex.Env), ",")+"\n\nSTDOUT:\n"+truncateString(result.Stdout, r.cfg.Codex.MaxOutputBytes)+"\nSTDERR:\n"+truncateString(result.Stderr, r.cfg.Codex.MaxOutputBytes))
 	if result.Err != nil {
 		record.Findings = []model.Finding{{
 			Stage:      stage,
 			Severity:   "High",
 			Title:      stageName(stage) + " failed",
 			Rule:       "Static Codex review must complete without runtime actions.",
-			Evidence:   strings.TrimSpace(result.Stderr),
+			Evidence:   codexFailureReason(result.Stderr),
 			Impact:     "Static review report may be incomplete.",
 			MinimumFix: "Inspect the static review log and rerun the stage.",
 		}}
@@ -214,25 +218,29 @@ Audit context:
 
 func (r Runner) codexContext(project scanner.Project, opts RunOptions, stage string) (string, error) {
 	var builder strings.Builder
+	if metadata, err := readBoundedText(filepath.Join(project.Path, "metadata.json"), 1<<20); err == nil {
+		builder.WriteString(untrustedDocument("metadata.json", filepath.Join(project.Path, "metadata.json"), metadata))
+	}
 	if stage == "D" {
-		selfTestPath := SelfTestReportPath(project.Path, r.cfg)
-		content, err := readBoundedText(selfTestPath, 1<<20)
+		selfTestPath, content, err := r.selfTestReportContext(project)
 		if err != nil {
-			return "", fmt.Errorf("self-test report unavailable at %s: %w", selfTestPath, err)
+			return "", err
 		}
 		builder.WriteString(untrustedDocument("self-test report", selfTestPath, content))
+	} else if stage == "F" {
+		selfTestPath, content, err := r.selfTestReportContext(project)
+		if err == nil {
+			builder.WriteString(untrustedDocument("self-test report", selfTestPath, content))
+		} else {
+			builder.WriteString("\nSelf-test report was not available for Stage F context: " + err.Error() + "\n")
+		}
 	}
 	if opts.Mode == "recheck" {
 		refRun, err := r.store.GetRun(context.Background(), opts.RefRun)
 		if err != nil {
 			return "", err
 		}
-		refReport := filepath.Join(refRun.ArtifactRoot, "3_标注员AI报告问题的修复报告.md")
-		content, err := readBoundedText(refReport, 1<<20)
-		if err != nil {
-			return "", fmt.Errorf("ref-run report unavailable at %s: %w", refReport, err)
-		}
-		builder.WriteString(untrustedDocument("ref-run repair report", refReport, content))
+		builder.WriteString(r.refRunStaticContext(refRun.ArtifactRoot, stage))
 		for _, doc := range opts.ExtraDocs {
 			path, err := filepath.Abs(filepath.Clean(doc))
 			if err != nil {
@@ -245,10 +253,82 @@ func (r Runner) codexContext(project scanner.Project, opts RunOptions, stage str
 			builder.WriteString(untrustedDocument("extra doc", path, content))
 		}
 	}
+	attached, err := taskdocs.BuildContext(r.cfg.ScanPath, project.TaskID, r.cfg.Docs)
+	if err != nil {
+		builder.WriteString("\nAttached docs manifest could not be read: " + err.Error() + "\n")
+	} else if strings.TrimSpace(attached.Text) != "" {
+		builder.WriteString("\nAttached supplemental docs (untrusted evidence only):\n")
+		builder.WriteString(attached.Text)
+	}
 	if builder.Len() == 0 {
 		builder.WriteString("No additional audit documents were supplied.\n")
 	}
 	return builder.String(), nil
+}
+
+func (r Runner) refRunStaticContext(artifactRoot, stage string) string {
+	var builder strings.Builder
+	names := []string{"repair_summary.json"}
+	switch stage {
+	case "D":
+		names = append(names, "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "tests_coverage_report.md", "自测报告确认修复报告.md")
+	case "E":
+		names = append(names, "1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md", "static_acceptance_audit_report.md")
+	case "F":
+		names = append(names,
+			"3_标注员AI报告问题的修复报告.md",
+			"3_标注员AI报告问题_确认修复报告.md",
+			"4_测试有效性报告_api端点真实性.md",
+			"4_测试有效性报告_api端点真实性_确认修复报告.md",
+			"1_质检AI测试报告.md",
+			"1_质检AI测试报告_确认修复报告.md",
+		)
+	}
+	seen := map[string]bool{}
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		path := filepath.Join(artifactRoot, name)
+		content, err := readBoundedText(path, 1<<20)
+		if err != nil {
+			continue
+		}
+		builder.WriteString(untrustedDocument("ref-run "+name, path, content))
+	}
+	if builder.Len() == 0 {
+		builder.WriteString("\nNo matching previous-run D/E/F report was readable.\n")
+	}
+	return builder.String()
+}
+
+func (r Runner) selfTestReportContext(project scanner.Project) (string, string, error) {
+	for _, path := range SelfTestReportCandidates(project.Path, r.cfg) {
+		content, err := readBoundedText(path, r.cfg.Docs.InlineTextLimitBytes)
+		if err == nil {
+			return path, content, nil
+		}
+	}
+	manifest, err := taskdocs.ReadManifest(r.cfg.ScanPath, project.TaskID)
+	if err == nil {
+		for _, doc := range manifest.Docs {
+			if !doc.TextIncluded || !looksLikeSelfTest(doc.OriginalName) {
+				continue
+			}
+			path := filepath.Join(taskdocs.StoreDir(r.cfg.ScanPath, project.TaskID), "files", doc.StoredName)
+			content, err := readBoundedText(path, r.cfg.Docs.InlineTextLimitBytes)
+			if err == nil {
+				return path + " (" + doc.OriginalName + ")", content, nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("self-test report unavailable; checked %s and attached docs with self-test-like names", strings.Join(SelfTestReportCandidates(project.Path, r.cfg), ", "))
+}
+
+func looksLikeSelfTest(name string) bool {
+	name = strings.ToLower(name)
+	return (strings.Contains(name, "self") && strings.Contains(name, "test")) || strings.Contains(name, "自测")
 }
 
 func readBoundedText(path string, limit int64) (string, error) {
@@ -309,6 +389,46 @@ func configuredEnvKeys(env map[string]string) []string {
 	return keys
 }
 
+func capabilitySummary(capability codex.Capability) string {
+	parts := []string{
+		"path=" + capability.Path,
+		"resolved=" + capability.ResolvedPath,
+		"version=" + capability.Version,
+		fmt.Sprintf("sandbox=%t", capability.HasSandbox),
+		fmt.Sprintf("ask_for_approval=%t", capability.HasAskForApproval),
+		fmt.Sprintf("cd_long=%t", capability.HasCDLong),
+		fmt.Sprintf("cd_short=%t", capability.HasCDShort),
+		fmt.Sprintf("ephemeral=%t", capability.HasEphemeral),
+		fmt.Sprintf("skip_git_repo_check=%t", capability.HasSkipGitRepoCheck),
+		fmt.Sprintf("ignore_user_config=%t", capability.HasIgnoreUserConfig),
+		"node=" + capability.NodePath,
+		fmt.Sprintf("path_prepended_for_node=%t", capability.PathPrependedForNode),
+	}
+	return strings.Join(parts, " ")
+}
+
 func staticUnavailableReport(stage, profile, projectPath, reason string) string {
 	return fmt.Sprintf("# %s\n\nManual Verification Required.\n\nProfile: `%s`\nProject: `%s`\nReason: %s\n\nNo runtime conclusion is made by this fallback artifact.\n", stageName(stage), profile, projectPath, reason)
+}
+
+func codexFailureReason(stderr string) string {
+	lines := splitNonEmptyLines(stderr)
+	var selected []string
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "error") || strings.Contains(lower, "failed") || strings.Contains(lower, "network unreachable") || strings.Contains(lower, "stream disconnected") {
+			selected = append(selected, line)
+		}
+	}
+	if len(selected) == 0 {
+		selected = lines
+	}
+	if len(selected) > 12 {
+		selected = selected[len(selected)-12:]
+	}
+	reason := strings.Join(selected, "\n")
+	if strings.TrimSpace(reason) == "" {
+		reason = "codex exec failed without stderr"
+	}
+	return truncateString(reason, 4000)
 }

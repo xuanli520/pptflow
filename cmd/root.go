@@ -22,6 +22,8 @@ func NewRootCommand() *cobra.Command {
 	}
 	root.AddCommand(newScanCommand())
 	root.AddCommand(newRunCommand())
+	root.AddCommand(newAttachCommand())
+	root.AddCommand(newDocsCommand())
 	root.AddCommand(newStatusCommand())
 	root.AddCommand(newTUICommand())
 	root.AddCommand(newVersionCommand())

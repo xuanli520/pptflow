@@ -2,8 +2,10 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -16,6 +18,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
 type app struct {
@@ -68,9 +71,11 @@ func newApp(store *db.Store, cfg config.Config) app {
 		{Title: "batch", Width: 14},
 		{Title: "last_run", Width: 16},
 		{Title: "run_status", Width: 18},
-		{Title: "bad", Width: 4},
-		{Title: "blk", Width: 4},
-		{Title: "hi", Width: 4},
+		{Title: "failed", Width: 6},
+		{Title: "blocker", Width: 7},
+		{Title: "high", Width: 5},
+		{Title: "docs", Width: 5},
+		{Title: "cleanup", Width: 10},
 		{Title: "manual", Width: 8},
 	}
 	t := table.New(table.WithColumns(columns), table.WithFocused(true), table.WithHeight(12))
@@ -90,6 +95,8 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = value.Width
 		m.height = value.Height
+		m.applyTableColumns()
+		m.refreshRows()
 		m.table.SetHeight(max(6, value.Height-10))
 		m.logs.Width = max(20, value.Width-4)
 		m.logs.Height = max(6, value.Height-12)
@@ -141,8 +148,24 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedStage--
 			}
 		case "right":
-			if m.tab == 1 && m.selectedStage < 5 {
+			if m.tab == 1 && m.selectedStage < m.latestStageCount()-1 {
 				m.selectedStage++
+			}
+		case "a":
+			if taskID := m.selectedTaskID(); taskID != "" {
+				m.message = fmt.Sprintf("attach docs with: p2r attach %s --file <path>", taskID)
+			}
+		case "d":
+			if taskID := m.selectedTaskID(); taskID != "" {
+				m.message = fmt.Sprintf("docs manifest: %s", taskdocs.ManifestPath(m.cfg.ScanPath, taskID))
+			}
+		case "p":
+			if run, ok := m.latestRun(); ok {
+				m.message = fmt.Sprintf("preflight: %s", filepath.Join(run.ArtifactRoot, "preflight.json"))
+			}
+		case "c":
+			if run, ok := m.latestRun(); ok {
+				m.message = fmt.Sprintf("cleanup: %s", filepath.Join(run.ArtifactRoot, "cleanup_summary.json"))
 			}
 		case "m":
 			if m.qaMode == "recheck" {
@@ -210,7 +233,7 @@ func (m app) View() string {
 	} else {
 		builder.WriteString(m.execution())
 	}
-	builder.WriteString("\n" + mutedStyle.Render("Tab: switch panel  Enter: view execution  m: mode  ↑/↓: ref run  r: rerun  q: quit"))
+	builder.WriteString("\n" + mutedStyle.Render("Tab: switch panel  Enter: view execution  a: attach hint  d/p/c: docs/preflight/cleanup  m: mode  ↑/↓: ref run  r: rerun  q: quit"))
 	return panelStyle.Render(builder.String())
 }
 
@@ -239,15 +262,23 @@ func (m app) execution() string {
 	if len(refRuns) == 0 {
 		refRuns, _ = m.store.ListRunsForTask(context.Background(), taskID)
 	}
-	selfTestPath := pipeline.SelfTestReportPath(filepathFromProject(m.projects, taskID), m.cfg)
-	selfTestStatus := "✗ 未找到，请放置到 " + selfTestPath
-	if fileExists(selfTestPath) {
-		selfTestStatus = "✓ 已就绪"
+	projectPath := filepathFromProject(m.projects, taskID)
+	selfTestPath := pipeline.SelfTestReportPath(projectPath, m.cfg)
+	selfTestStatus := "x 未找到，请放置到 " + selfTestPath
+	for _, candidate := range pipeline.SelfTestReportCandidates(projectPath, m.cfg) {
+		if fileExists(candidate) {
+			selfTestStatus = "ok " + candidate
+			break
+		}
 	}
 	if err != nil {
 		return fmt.Sprintf("Task: %s\nMode: %s\n自测报告: %s\n\nNo run yet. Press r to start a pipeline run.", taskID, m.qaMode, selfTestStatus)
 	}
 	stages, _ := m.store.Stages(context.Background(), run.RunID)
+	stages = normalizeStages(stages)
+	if m.selectedStage >= len(stages) {
+		m.selectedStage = max(0, len(stages)-1)
+	}
 	findings, _ := m.store.Findings(context.Background(), run.RunID)
 	var builder strings.Builder
 	builder.WriteString(fmt.Sprintf("Task: %s  Run: %s  %s\n", taskID, run.RunID, run.Status))
@@ -267,13 +298,20 @@ func (m app) execution() string {
 		}
 		builder.WriteString("\n")
 	}
-	builder.WriteString(fmt.Sprintf("Artifacts: %s\n\n", run.ArtifactRoot))
+	builder.WriteString(fmt.Sprintf("Artifacts: %s\n", run.ArtifactRoot))
+	builder.WriteString(fmt.Sprintf("Docs: %d  Manifest: %s\n", taskdocs.Count(m.cfg.ScanPath, taskID), taskdocs.ManifestPath(m.cfg.ScanPath, taskID)))
+	builder.WriteString(fmt.Sprintf("Preflight: %s\nCleanup: %s\n\n", filepath.Join(run.ArtifactRoot, "preflight.json"), cleanupStatus(run.ArtifactRoot)))
 	var selectedLog string
+	var selected model.StageRecord
 	for index, stage := range stages {
+		if stage.Name == "" {
+			stage.Name = model.StageDisplayName(stage.Stage)
+		}
 		prefix := "  "
 		if index == m.selectedStage {
 			prefix = "> "
 			selectedLog = stage.LogPath
+			selected = stage
 		}
 		builder.WriteString(fmt.Sprintf("%s[%s] %-34s %-10s %6dms", prefix, stage.Stage, stage.Name, stage.Status, stage.DurationMS))
 		if stage.ErrorSummary != "" {
@@ -293,6 +331,8 @@ func (m app) execution() string {
 		}
 	}
 	builder.WriteString(fmt.Sprintf("\nFindings: Blocker %d | High %d | Medium %d\n\n", blocker, high, medium))
+	builder.WriteString(stageDetail(selected, findings))
+	builder.WriteString("\n")
 	for i, finding := range findings {
 		if i >= 8 {
 			break
@@ -334,16 +374,30 @@ func (m *app) refreshRows() {
 		if filter != "" && !strings.Contains(needle, filter) {
 			continue
 		}
-		rows = append(rows, table.Row{
-			project.TaskID,
-			project.Batch,
-			project.LastRunAt,
-			empty(project.RunStatus, "-"),
-			empty(project.FailedStage, "-"),
-			fmt.Sprint(project.Blocking),
-			fmt.Sprint(project.High),
-			empty(project.ManualVerdict, "unset"),
-		})
+		if m.width > 0 && m.width < 110 {
+			rows = append(rows, table.Row{
+				project.TaskID,
+				empty(project.RunStatus, "-"),
+				empty(project.FailedStage, "-"),
+				fmt.Sprint(project.Blocking),
+				fmt.Sprint(project.High),
+				fmt.Sprint(taskdocs.Count(m.cfg.ScanPath, project.TaskID)),
+				latestCleanupStatus(m.store, project.TaskID),
+			})
+		} else {
+			rows = append(rows, table.Row{
+				project.TaskID,
+				project.Batch,
+				project.LastRunAt,
+				empty(project.RunStatus, "-"),
+				empty(project.FailedStage, "-"),
+				fmt.Sprint(project.Blocking),
+				fmt.Sprint(project.High),
+				fmt.Sprint(taskdocs.Count(m.cfg.ScanPath, project.TaskID)),
+				latestCleanupStatus(m.store, project.TaskID),
+				empty(project.ManualVerdict, "unset"),
+			})
+		}
 	}
 	m.table.SetRows(rows)
 }
@@ -389,6 +443,139 @@ func (m app) selectedRefRun() string {
 	return m.refRuns[m.refIndex].RunID
 }
 
+func (m app) latestRun() (model.RunRecord, bool) {
+	taskID := m.selectedTaskID()
+	if taskID == "" || m.store == nil {
+		return model.RunRecord{}, false
+	}
+	run, err := m.store.LatestRunForTask(context.Background(), taskID)
+	return run, err == nil
+}
+
+func (m app) latestStageCount() int {
+	run, ok := m.latestRun()
+	if !ok {
+		return 6
+	}
+	stages, err := m.store.Stages(context.Background(), run.RunID)
+	if err != nil || len(stages) == 0 {
+		return 6
+	}
+	return len(normalizeStages(stages))
+}
+
+func (m *app) applyTableColumns() {
+	columns := []table.Column{
+		{Title: "task_id", Width: 20},
+		{Title: "batch", Width: 12},
+		{Title: "last_run", Width: 16},
+		{Title: "run_status", Width: 18},
+		{Title: "failed", Width: 6},
+		{Title: "blocker", Width: 7},
+		{Title: "high", Width: 5},
+		{Title: "docs", Width: 5},
+		{Title: "cleanup", Width: 10},
+		{Title: "manual", Width: 8},
+	}
+	if m.width > 0 && m.width < 110 {
+		columns = []table.Column{
+			{Title: "task_id", Width: 20},
+			{Title: "status", Width: 18},
+			{Title: "failed", Width: 6},
+			{Title: "blk", Width: 4},
+			{Title: "hi", Width: 4},
+			{Title: "docs", Width: 5},
+			{Title: "cleanup", Width: 10},
+		}
+	}
+	m.table.SetColumns(columns)
+}
+
+func normalizeStages(stages []model.StageRecord) []model.StageRecord {
+	byStage := map[string]model.StageRecord{}
+	for _, stage := range stages {
+		if stage.Name == "" {
+			stage.Name = model.StageDisplayName(stage.Stage)
+		}
+		byStage[stage.Stage] = stage
+	}
+	result := make([]model.StageRecord, 0, 6)
+	for _, letter := range []string{"A", "B", "C", "D", "E", "F"} {
+		if stage, ok := byStage[letter]; ok {
+			result = append(result, stage)
+			continue
+		}
+		result = append(result, model.StageRecord{Stage: letter, Name: model.StageDisplayName(letter), Status: model.StageSkipped, ErrorSummary: "No row stored for this run."})
+	}
+	return result
+}
+
+func stageDetail(stage model.StageRecord, findings []model.Finding) string {
+	if stage.Stage == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("Selected stage %s: %s\n", stage.Stage, stage.Name))
+	builder.WriteString(fmt.Sprintf("Status: %s  Duration: %dms\n", stage.Status, stage.DurationMS))
+	if stage.ErrorSummary != "" {
+		builder.WriteString("Reason: " + stage.ErrorSummary + "\n")
+	}
+	if stage.LogPath != "" {
+		builder.WriteString("Log: " + stage.LogPath + "\n")
+	}
+	if len(stage.ArtifactPaths) > 0 {
+		builder.WriteString("Artifacts:\n")
+		for _, path := range stage.ArtifactPaths {
+			builder.WriteString("  " + path + "\n")
+		}
+	}
+	count := 0
+	for _, finding := range findings {
+		if finding.Stage != stage.Stage {
+			continue
+		}
+		if count == 0 {
+			builder.WriteString("Stage findings:\n")
+		}
+		builder.WriteString(fmt.Sprintf("  [%s] %s\n", finding.Severity, finding.Title))
+		if finding.SourcePath != "" {
+			builder.WriteString("    " + finding.SourcePath + "\n")
+		}
+		count++
+		if count >= 5 {
+			break
+		}
+	}
+	return builder.String()
+}
+
+func latestCleanupStatus(store *db.Store, taskID string) string {
+	if store == nil {
+		return "-"
+	}
+	run, err := store.LatestRunForTask(context.Background(), taskID)
+	if err != nil {
+		return "-"
+	}
+	return cleanupStatus(run.ArtifactRoot)
+}
+
+func cleanupStatus(artifactRoot string) string {
+	path := filepath.Join(artifactRoot, "cleanup_summary.json")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "none"
+	}
+	var data map[string]any
+	if json.Unmarshal(content, &data) != nil {
+		return "unknown"
+	}
+	if status, ok := data["status"].(string); ok && status != "" {
+		return status
+	}
+	return "unknown"
+}
+
 func filepathFromProject(projects []db.ProjectSummary, taskID string) string {
 	for _, project := range projects {
 		if project.TaskID == taskID {
@@ -421,7 +608,7 @@ func stageLetter(index int) string {
 func affectedStages(stage string) []string {
 	switch stage {
 	case "A":
-		return []string{"A", "B", "C", "F"}
+		return []string{"A", "F"}
 	case "B":
 		return []string{"B", "C", "F"}
 	case "C":

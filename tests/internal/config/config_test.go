@@ -18,6 +18,11 @@ pipeline:
     B: 9
 tui:
   refresh_interval_ms: 250
+docker:
+  cleanup_build_cache: true
+  build_cache_prune_until: "12h"
+docs:
+  inline_text_limit_bytes: 2048
 `)
 	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
 		t.Fatal(err)
@@ -37,6 +42,12 @@ tui:
 	}
 	if cfg.TUI.RefreshIntervalMS != 250 {
 		t.Fatalf("expected TUI refresh 250, got %d", cfg.TUI.RefreshIntervalMS)
+	}
+	if !cfg.Docker.CleanupBuildCache || cfg.Docker.BuildCachePruneUntil != "12h" {
+		t.Fatalf("docker cleanup config not parsed: %#v", cfg.Docker)
+	}
+	if cfg.Docs.InlineTextLimitBytes != 2048 {
+		t.Fatalf("docs inline limit not parsed: %#v", cfg.Docs)
 	}
 }
 

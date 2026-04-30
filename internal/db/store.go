@@ -188,10 +188,14 @@ func (s *Store) ListRunsForTask(ctx context.Context, taskID string) ([]model.Run
 func (s *Store) PutStage(ctx context.Context, runID string, stage model.StageRecord) error {
 	blockedBy, _ := json.Marshal(stage.BlockedBy)
 	artifacts, _ := json.Marshal(stage.ArtifactPaths)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO run_stages(run_id, stage, status, started_at, finished_at, duration_ms, blocked_by, log_path, artifact_json, error_summary)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(run_id, stage) DO UPDATE SET status=excluded.status, started_at=excluded.started_at, finished_at=excluded.finished_at, duration_ms=excluded.duration_ms, blocked_by=excluded.blocked_by, log_path=excluded.log_path, artifact_json=excluded.artifact_json, error_summary=excluded.error_summary`,
-		runID, stage.Stage, stage.Status, stage.StartedAt, stage.FinishedAt, stage.DurationMS, string(blockedBy), stage.LogPath, string(artifacts), stage.ErrorSummary)
+	name := stage.Name
+	if name == "" {
+		name = model.StageDisplayName(stage.Stage)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO run_stages(run_id, stage, name, status, started_at, finished_at, duration_ms, blocked_by, log_path, artifact_json, error_summary)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_id, stage) DO UPDATE SET name=excluded.name, status=excluded.status, started_at=excluded.started_at, finished_at=excluded.finished_at, duration_ms=excluded.duration_ms, blocked_by=excluded.blocked_by, log_path=excluded.log_path, artifact_json=excluded.artifact_json, error_summary=excluded.error_summary`,
+		runID, stage.Stage, name, stage.Status, stage.StartedAt, stage.FinishedAt, stage.DurationMS, string(blockedBy), stage.LogPath, string(artifacts), stage.ErrorSummary)
 	return err
 }
 
@@ -209,7 +213,7 @@ func (s *Store) InsertFindings(ctx context.Context, runID string, findings []mod
 }
 
 func (s *Store) Stages(ctx context.Context, runID string) ([]model.StageRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT stage, status, COALESCE(started_at,''), COALESCE(finished_at,''), duration_ms, COALESCE(blocked_by,'[]'), COALESCE(log_path,''), COALESCE(artifact_json,'[]'), COALESCE(error_summary,'') FROM run_stages WHERE run_id = ? ORDER BY stage`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT stage, COALESCE(name,''), status, COALESCE(started_at,''), COALESCE(finished_at,''), duration_ms, COALESCE(blocked_by,'[]'), COALESCE(log_path,''), COALESCE(artifact_json,'[]'), COALESCE(error_summary,'') FROM run_stages WHERE run_id = ? ORDER BY CASE stage WHEN 'A' THEN 1 WHEN 'B' THEN 2 WHEN 'C' THEN 3 WHEN 'D' THEN 4 WHEN 'E' THEN 5 WHEN 'F' THEN 6 ELSE 99 END, stage`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -219,8 +223,11 @@ func (s *Store) Stages(ctx context.Context, runID string) ([]model.StageRecord, 
 		var stage model.StageRecord
 		var blockedBy string
 		var artifacts string
-		if err := rows.Scan(&stage.Stage, &stage.Status, &stage.StartedAt, &stage.FinishedAt, &stage.DurationMS, &blockedBy, &stage.LogPath, &artifacts, &stage.ErrorSummary); err != nil {
+		if err := rows.Scan(&stage.Stage, &stage.Name, &stage.Status, &stage.StartedAt, &stage.FinishedAt, &stage.DurationMS, &blockedBy, &stage.LogPath, &artifacts, &stage.ErrorSummary); err != nil {
 			return nil, err
+		}
+		if stage.Name == "" {
+			stage.Name = model.StageDisplayName(stage.Stage)
 		}
 		_ = json.Unmarshal([]byte(blockedBy), &stage.BlockedBy)
 		_ = json.Unmarshal([]byte(artifacts), &stage.ArtifactPaths)

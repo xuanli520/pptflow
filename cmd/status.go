@@ -63,7 +63,7 @@ func newStatusCommand() *cobra.Command {
 			fmt.Fprintf(out, "task: %s\nrun: %s\nstatus: %s\nmanual_verdict: %s\nartifact_root: %s\n", run.TaskID, run.RunID, run.Status, run.ManualVerdict, run.ArtifactRoot)
 			fmt.Fprintf(out, "findings: Blocker=%d High=%d Total=%d\n", blocker, high, len(findings))
 			for _, stage := range stages {
-				fmt.Fprintf(out, "[%s] %s", stage.Stage, stage.Status)
+				fmt.Fprintf(out, "[%s] %-34s %s", stage.Stage, stage.Name, stage.Status)
 				if stage.ErrorSummary != "" {
 					fmt.Fprintf(out, " - %s", stage.ErrorSummary)
 				}

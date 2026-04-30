@@ -20,6 +20,7 @@ type Config struct {
 	DBPath   string
 	Pipeline PipelineConfig
 	Docker   DockerConfig
+	Docs     DocsConfig
 	Codex    CodexConfig
 	TUI      TUIConfig
 }
@@ -35,6 +36,18 @@ type DockerConfig struct {
 	ComposeProjectPrefix        string
 	KeepFailedContainersMinutes int
 	HealthCheckTimeoutSeconds   int
+	CleanupPolicy               string
+	CleanupImages               bool
+	CleanupVolumes              bool
+	CleanupBuildCache           bool
+	BuildCachePruneUntil        string
+	KeepRuntime                 bool
+}
+
+type DocsConfig struct {
+	MaxAttachmentBytes   int64
+	InlineTextLimitBytes int64
+	StageInlineMaxBytes  int64
 }
 
 type CodexConfig struct {
@@ -74,7 +87,7 @@ func Default() Config {
 		ScanPath: "./projects-qa",
 		DBPath:   "./projects-qa/.qa-control/index.db",
 		Pipeline: PipelineConfig{
-			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 300, "E": 600, "F": 60},
+			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 300, "E": 600, "F": 300},
 			SelfTestReportPath: "repo/self_test_report.md",
 		},
 		Docker: DockerConfig{
@@ -82,6 +95,17 @@ func Default() Config {
 			ComposeProjectPrefix:        "p2rqa",
 			KeepFailedContainersMinutes: 60,
 			HealthCheckTimeoutSeconds:   60,
+			CleanupPolicy:               "always",
+			CleanupImages:               true,
+			CleanupVolumes:              true,
+			CleanupBuildCache:           false,
+			BuildCachePruneUntil:        "24h",
+			KeepRuntime:                 false,
+		},
+		Docs: DocsConfig{
+			MaxAttachmentBytes:   64 << 20,
+			InlineTextLimitBytes: 1 << 20,
+			StageInlineMaxBytes:  4 << 20,
 		},
 		Codex: CodexConfig{
 			SandboxImage:      "codex:latest",
@@ -259,6 +283,24 @@ func applyFile(cfg *Config, path string) (fileSettings, error) {
 			cfg.Docker.KeepFailedContainersMinutes = parseInt(value, cfg.Docker.KeepFailedContainersMinutes)
 		case section == "docker" && key == "health_check_timeout_seconds":
 			cfg.Docker.HealthCheckTimeoutSeconds = parseInt(value, cfg.Docker.HealthCheckTimeoutSeconds)
+		case section == "docker" && key == "cleanup_policy":
+			cfg.Docker.CleanupPolicy = value
+		case section == "docker" && key == "cleanup_images":
+			cfg.Docker.CleanupImages = parseBool(value)
+		case section == "docker" && key == "cleanup_volumes":
+			cfg.Docker.CleanupVolumes = parseBool(value)
+		case section == "docker" && key == "cleanup_build_cache":
+			cfg.Docker.CleanupBuildCache = parseBool(value)
+		case section == "docker" && key == "build_cache_prune_until":
+			cfg.Docker.BuildCachePruneUntil = value
+		case section == "docker" && key == "keep_runtime":
+			cfg.Docker.KeepRuntime = parseBool(value)
+		case section == "docs" && key == "max_attachment_bytes":
+			cfg.Docs.MaxAttachmentBytes = int64(parseInt(value, int(cfg.Docs.MaxAttachmentBytes)))
+		case section == "docs" && key == "inline_text_limit_bytes":
+			cfg.Docs.InlineTextLimitBytes = int64(parseInt(value, int(cfg.Docs.InlineTextLimitBytes)))
+		case section == "docs" && key == "stage_inline_max_bytes":
+			cfg.Docs.StageInlineMaxBytes = int64(parseInt(value, int(cfg.Docs.StageInlineMaxBytes)))
 		case section == "codex" && key == "sandbox_image":
 			cfg.Codex.SandboxImage = value
 		case section == "codex" && key == "prompt_profiles_dir":

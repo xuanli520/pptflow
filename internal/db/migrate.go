@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 func migrate(ctx context.Context, handle *sql.DB) error {
 	tx, err := handle.BeginTx(ctx, nil)
@@ -53,6 +53,11 @@ func migrate(ctx context.Context, handle *sql.DB) error {
 				return err
 			}
 			version = 3
+		case 3:
+			if err := migrateV3ToV4(ctx, tx); err != nil {
+				return err
+			}
+			version = 4
 		default:
 			return fmt.Errorf("unsupported schema version %d", version)
 		}
@@ -122,6 +127,7 @@ func ensureCoreTables(ctx context.Context, tx *sql.Tx) error {
 		`CREATE TABLE IF NOT EXISTS run_stages (
 			run_id TEXT NOT NULL REFERENCES runs(run_id),
 			stage TEXT NOT NULL,
+			name TEXT,
 			status TEXT NOT NULL,
 			started_at TEXT,
 			finished_at TEXT,
@@ -162,6 +168,13 @@ func inferLegacyVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 		if _, err := tx.ExecContext(ctx, currentFindingsDDL); err != nil {
 			return 0, err
 		}
+		stageColumns, stageErr := tableColumns(ctx, tx, "run_stages")
+		if stageErr != nil {
+			return 0, stageErr
+		}
+		if _, hasName := stageColumns["name"]; !hasName {
+			return 3, nil
+		}
 		return currentSchemaVersion, nil
 	}
 	columns, err := findingColumns(ctx, tx)
@@ -169,7 +182,14 @@ func inferLegacyVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 		return 0, err
 	}
 	if columns["run_id"] > 0 && columns["id"] > 0 {
+		stageColumns, stageErr := tableColumns(ctx, tx, "run_stages")
+		if stageErr != nil {
+			return 0, stageErr
+		}
 		if _, ok := columns["done_criteria"]; ok {
+			if _, hasName := stageColumns["name"]; hasName {
+				return 4, nil
+			}
 			return 3, nil
 		}
 		return 2, nil
@@ -223,6 +243,18 @@ func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
 	return err
 }
 
+func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumns(ctx, tx, "run_stages")
+	if err != nil {
+		return err
+	}
+	if _, ok := columns["name"]; ok {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `ALTER TABLE run_stages ADD COLUMN name TEXT;`)
+	return err
+}
+
 func ensureSchemaVersion(ctx context.Context, tx *sql.Tx, version int) error {
 	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (
 		id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -249,7 +281,11 @@ func tableExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
 }
 
 func findingColumns(ctx context.Context, tx *sql.Tx) (map[string]int, error) {
-	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(findings)`)
+	return tableColumns(ctx, tx, "findings")
+}
+
+func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]int, error) {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		return nil, err
 	}

@@ -29,10 +29,10 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		readmeCommand = readmeComposeCommand(repoPath)
 	}
 	if compose == "" && len(readmeCommand) == 0 {
-		return r.failB(record, start, logPath, portMapPath, screenshotPath, "No docker-compose.yml or README-declared docker compose startup command found in repo/.", "Add repo/docker-compose.yml, document a docker compose startup command, or run --static-only.")
+		return r.failB(record, start, logPath, portMapPath, screenshotPath, nil, "No docker-compose.yml or README-declared docker compose startup command found in repo/.", "Add repo/docker-compose.yml, document a docker compose startup command, or run --static-only.")
 	}
 	if _, err := r.exec.LookPath("docker"); err != nil {
-		return r.failB(record, start, logPath, portMapPath, screenshotPath, "docker executable not found on PATH.", "Install Docker or run --static-only.")
+		return r.failB(record, start, logPath, portMapPath, screenshotPath, nil, "docker executable not found on PATH.", "Install Docker or run --static-only.")
 	}
 	projectName := dockermgr.ComposeProjectName(r.cfg.Docker.ComposeProjectPrefix, project.TaskID, run.RunID)
 	workDir := repoPath
@@ -51,6 +51,17 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		psArgs = composePSArgs(readmeCommand, projectName)
 		psQArgs = composePSQArgs(readmeCommand, projectName)
 		servicesArgs = composeServicesArgs(readmeCommand, projectName)
+	}
+	cleanupMeta := map[string]any{
+		"run_id":          run.RunID,
+		"compose_project": projectName,
+		"compose_file":    compose,
+		"work_dir":        workDir,
+		"labels": map[string]string{
+			"managed_by":  "p2rqa",
+			"p2r.task_id": project.TaskID,
+			"p2r.run_id":  run.RunID,
+		},
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -87,7 +98,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			if pull.Timeout {
 				reason = "B1 docker compose pull timed out"
 			}
-			return r.failB(record, start, logPath, portMapPath, screenshotPath, reason+": "+strings.TrimSpace(firstNonEmpty(pull.Stderr, pull.Stdout)), "Fix Docker image pull or compose image declarations and rerun stage B.")
+			return r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(pull.Stderr, pull.Stdout)), "Fix Docker image pull or compose image declarations and rerun stage B.")
 		}
 	}
 	if buildArgs != nil {
@@ -97,7 +108,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			if build.Timeout {
 				reason = "B2 docker compose build timed out"
 			}
-			return r.failB(record, start, logPath, portMapPath, screenshotPath, reason+": "+strings.TrimSpace(firstNonEmpty(build.Stderr, build.Stdout)), "Fix Docker build failures and rerun stage B.")
+			return r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(build.Stderr, build.Stdout)), "Fix Docker build failures and rerun stage B.")
 		}
 	}
 	up := runDockerStep("B3 docker compose up", r.stageTimeout("B_UP", 300), upArgs, true)
@@ -106,7 +117,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		if up.Timeout {
 			reason = "B3 docker compose up timed out"
 		}
-		return r.failB(record, start, logPath, portMapPath, screenshotPath, reason+": "+strings.TrimSpace(firstNonEmpty(up.Stderr, up.Stdout)), "Fix Docker startup and rerun stage B.")
+		return r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(up.Stderr, up.Stdout)), "Fix Docker startup and rerun stage B.")
 	}
 	ps := runDockerStep("B5 docker compose port collection", r.stageTimeout("B_PORT", 30), psArgs, false)
 	mappings, services := parseComposePS(ps.Stdout)
@@ -133,6 +144,12 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		"raw_compose_ps":  ps.Stdout,
 		"mappings":        mappings,
 		"probes":          probes,
+		"labels": map[string]string{
+			"managed_by":  "p2rqa",
+			"p2r.task_id": project.TaskID,
+			"p2r.run_id":  run.RunID,
+		},
+		"cleanup_command": dockerCleanupCommandText(compose, projectName),
 		"stage_timeouts": map[string]int{
 			"B_PULL":   int(r.stageTimeout("B_PULL", 300).Seconds()),
 			"B_BUILD":  int(r.stageTimeout("B_BUILD", 600).Seconds()),
@@ -196,13 +213,17 @@ func (r Runner) dockerPortFallback(ctx context.Context, workDir string, psQArgs,
 	return mappings, services, log.String()
 }
 
-func (r Runner) failB(record model.StageRecord, start time.Time, logPath, portMapPath, screenshotPath, evidence, fix string) model.StageRecord {
+func (r Runner) failB(record model.StageRecord, start time.Time, logPath, portMapPath, screenshotPath string, meta map[string]any, evidence, fix string) model.StageRecord {
 	if fileExists(logPath) {
 		_ = appendText(logPath, "\nERROR SUMMARY:\n"+evidence+"\n")
 	} else {
 		_ = writeText(logPath, evidence)
 	}
-	_ = writeJSON(portMapPath, map[string]any{"mappings": map[string]any{}, "reason": evidence})
+	payload := map[string]any{"mappings": map[string]any{}, "reason": evidence}
+	for key, value := range meta {
+		payload[key] = value
+	}
+	_ = writeJSON(portMapPath, payload)
 	pages, _ := renderLogFile(logPath, screenshotPath)
 	record.ArtifactPaths = []string{portMapPath}
 	record.ArtifactPaths = append(record.ArtifactPaths, pages...)
@@ -227,4 +248,13 @@ func minDuration(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+func dockerCleanupCommandText(composeFile, projectName string) string {
+	args := []string{"docker", "compose"}
+	if strings.TrimSpace(composeFile) != "" {
+		args = append(args, "-f", composeFile)
+	}
+	args = append(args, "-p", projectName, "down", "-v", "--remove-orphans", "--rmi", "local")
+	return strings.Join(args, " ")
 }

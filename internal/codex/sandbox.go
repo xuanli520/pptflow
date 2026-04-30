@@ -51,6 +51,10 @@ func validateHome(root, home string) error {
 }
 
 func (s Sandbox) Env(base []string, configured map[string]string) []string {
+	return s.EnvWithNode(base, configured, "")
+}
+
+func (s Sandbox) EnvWithNode(base []string, configured map[string]string, nodePath string) []string {
 	values := map[string]string{}
 	casing := map[string]string{}
 	for _, item := range base {
@@ -81,7 +85,7 @@ func (s Sandbox) Env(base []string, configured map[string]string) []string {
 		key := casing[canonical]
 		env = append(env, key+"="+value)
 	}
-	return env
+	return WithNodeOnPATH(env, nodePath)
 }
 
 func canonicalEnvKey(key string) string {

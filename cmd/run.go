@@ -17,6 +17,7 @@ func newRunCommand() *cobra.Command {
 	var mode string
 	var refRun string
 	var extraDocs []string
+	var keepRuntime bool
 	command := &cobra.Command{
 		Use:   "run <task-id>",
 		Short: "Run the p2r QA pipeline",
@@ -43,7 +44,7 @@ func newRunCommand() *cobra.Command {
 			}
 			defer store.Close()
 			runner := pipeline.NewRunner(store, cfg)
-			result, err := runner.Run(context.Background(), args[0], pipeline.RunOptions{Stage: stage, From: from, StaticOnly: staticOnly, Mode: mode, RefRun: refRun, ExtraDocs: extraDocs})
+			result, err := runner.Run(context.Background(), args[0], pipeline.RunOptions{Stage: stage, From: from, StaticOnly: staticOnly, Mode: mode, RefRun: refRun, ExtraDocs: extraDocs, KeepRuntime: keepRuntime})
 			if err != nil {
 				return err
 			}
@@ -65,6 +66,7 @@ func newRunCommand() *cobra.Command {
 	command.Flags().StringVar(&mode, "mode", "initial", "QA mode: initial or recheck")
 	command.Flags().StringVar(&refRun, "ref-run", "", "reference run id for --mode recheck")
 	command.Flags().StringSliceVar(&extraDocs, "extra-docs", nil, "comma-separated extra document paths for --mode recheck")
+	command.Flags().BoolVar(&keepRuntime, "keep-runtime", false, "keep the current Docker runtime after B/C for debugging")
 	return command
 }
 

@@ -5,17 +5,28 @@ pipeline:
   static_only: false
   stage_timeouts:
     A: 60
-    B: 120
-    C: 300
-    D: 300
-    E: 600
-    F: 60
+  B: 120
+  C: 300
+  D: 300
+  E: 600
+  F: 300
 
 docker:
   managed_label: "managed_by=p2rqa"
   compose_project_prefix: "p2rqa"
   keep_failed_containers_minutes: 60
   health_check_timeout_seconds: 60
+  cleanup_policy: "always"
+  cleanup_images: true
+  cleanup_volumes: true
+  cleanup_build_cache: false
+  build_cache_prune_until: "24h"
+  keep_runtime: false
+
+docs:
+  max_attachment_bytes: 67108864
+  inline_text_limit_bytes: 1048576
+  stage_inline_max_bytes: 4194304
 
 codex:
   sandbox_image: "codex:latest"
