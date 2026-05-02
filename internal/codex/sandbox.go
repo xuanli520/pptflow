@@ -85,7 +85,47 @@ func (s Sandbox) EnvWithNode(base []string, configured map[string]string, nodePa
 		key := casing[canonical]
 		env = append(env, key+"="+value)
 	}
-	return WithNodeOnPATH(env, nodePath)
+	env = WithNodeOnPATH(env, nodePath)
+	return withSystemBinOnPATH(env)
+}
+
+var systemBinPaths = []string{"/usr/bin", "/usr/local/bin", "/bin"}
+
+func withSystemBinOnPATH(env []string) []string {
+	if runtime.GOOS == "windows" {
+		return env
+	}
+	for _, dir := range systemBinPaths {
+		env = withDirOnPATH(env, dir)
+	}
+	return env
+}
+
+func withDirOnPATH(env []string, dir string) []string {
+	dir = filepath.Clean(dir)
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		if canonicalEnvKey(key) == canonicalEnvKey("PATH") {
+			if pathListContains(value, dir) {
+				return env
+			}
+		}
+	}
+	// Not on PATH – append.
+	for i, item := range env {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		if canonicalEnvKey(key) == canonicalEnvKey("PATH") {
+			env[i] = key + "=" + env[i][len(key)+1:] + string(os.PathListSeparator) + dir
+			return env
+		}
+	}
+	return append(env, "PATH="+dir)
 }
 
 func canonicalEnvKey(key string) string {
