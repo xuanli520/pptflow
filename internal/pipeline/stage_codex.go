@@ -148,7 +148,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 			Stage:      stage,
 			Severity:   "High",
 			Title:      stageName(stage) + " sandbox setup failed",
-			Rule:       "Static review stages require an isolated writable HOME.",
+			Rule:       "Static review stages require a writable stage scratch directory.",
 			Evidence:   sandboxErr.Error(),
 			Impact:     "Static review evidence is incomplete and requires manual verification.",
 			MinimumFix: "Ensure the run artifact directory is writable and rerun this stage.",

@@ -71,15 +71,6 @@ func (s Sandbox) EnvWithNode(base []string, configured map[string]string, nodePa
 		values[canonical] = value
 		casing[canonical] = key
 	}
-	for key, value := range map[string]string{
-		"HOME":        s.Home,
-		"USERPROFILE": s.Home,
-		"CODEX_HOME":  s.Home,
-	} {
-		canonical := canonicalEnvKey(key)
-		values[canonical] = value
-		casing[canonical] = key
-	}
 	env := make([]string, 0, len(values))
 	for canonical, value := range values {
 		key := casing[canonical]

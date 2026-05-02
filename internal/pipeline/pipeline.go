@@ -503,7 +503,7 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 			"writable_tmp":        r.cfg.Codex.WritableTmp,
 			"sandbox_mode":        "read-only",
 			"approval":            "never",
-			"home_reuse_strategy": "per-stage .codex-home-D/.codex-home-E paths, removed and recreated before each stage",
+			"home_reuse_strategy": "user HOME/CODEX_HOME preserved so Codex uses normal user config; stage scratch directories are removed and recreated before each stage",
 			"env_keys":            configuredEnvKeys(r.cfg.Codex.Env),
 			"extra_args":          r.cfg.Codex.ExtraArgs,
 			"docker_socket":       "not mounted",
