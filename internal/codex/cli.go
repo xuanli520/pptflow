@@ -26,6 +26,7 @@ type Capability struct {
 	HasSkipGitRepoCheck    bool   `json:"has_skip_git_repo_check"`
 	HasIgnoreUserConfig    bool   `json:"has_ignore_user_config"`
 	HasFullAuto            bool   `json:"has_full_auto"`
+	HasOutputLastMessage   bool   `json:"has_output_last_message"`
 	NodePath               string `json:"node_path,omitempty"`
 	PathPrependedForNode   bool   `json:"path_prepended_for_node"`
 	ExecHelpAvailable      bool   `json:"exec_help_available"`
@@ -76,6 +77,7 @@ func ApplyExecHelp(cap *Capability, help string) {
 	cap.HasSkipGitRepoCheck = hasHelpToken(help, "--skip-git-repo-check")
 	cap.HasIgnoreUserConfig = hasHelpToken(help, "--ignore-user-config")
 	cap.HasFullAuto = hasHelpToken(help, "--full-auto")
+	cap.HasOutputLastMessage = hasHelpToken(help, "--output-last-message")
 }
 
 func BuildExecArgs(cap Capability, projectPath string, extraArgs []string) ([]string, error) {
@@ -88,9 +90,6 @@ func BuildExecArgs(cap Capability, projectPath string, extraArgs []string) ([]st
 	args := []string{"exec"}
 	if cap.HasSkipGitRepoCheck {
 		args = append(args, "--skip-git-repo-check")
-	}
-	if cap.HasIgnoreUserConfig {
-		args = append(args, "--ignore-user-config")
 	}
 	args = append(args, "--sandbox", "read-only")
 	if cap.HasAskForApproval {
@@ -153,9 +152,6 @@ func optionalMissingMessage(cap Capability) string {
 	}
 	if !cap.HasSkipGitRepoCheck {
 		missing = append(missing, "--skip-git-repo-check")
-	}
-	if !cap.HasIgnoreUserConfig {
-		missing = append(missing, "--ignore-user-config")
 	}
 	if len(missing) == 0 {
 		return ""

@@ -59,23 +59,22 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	defer os.RemoveAll(sandbox.Home)
 	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
 	prompt := codexPrompt("F", profile, project.Path, run.ArtifactRoot, string(profileContent), contextText)
-	args := execArgs[:len(execArgs)-1]
-	args = append(args, extraArgs...)
-	args = append(args, "-")
+	lastMessagePath := codexLastMessagePath(run.ArtifactRoot, "F")
+	args, usingLastMessage := codexExecArgsWithReportCapture(execArgs, extraArgs, capability, lastMessagePath)
 	result := r.runCodexWithLog(ctx, r.stageTimeout("F", 300), project.Path, logPath, env, prompt, capability, args)
-	report := strings.TrimSpace(result.Stdout)
-	if report == "" {
-		report = staticUnavailableReport("F", profile, project.Path, codexFailureReason(firstNonEmpty(result.Stderr, result.Stdout)))
+	report, reportErr := capturedCodexReport(result, lastMessagePath, usingLastMessage, r.cfg.Codex.MaxOutputBytes)
+	if reportErr != nil {
+		report = staticUnavailableReport("F", profile, project.Path, codexFailureEvidence(result, reportErr))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
 	_ = writeText(reportPath, report+"\n")
-	if result.Err != nil {
+	if result.Err != nil || reportErr != nil {
 		record.Findings = []model.Finding{{
 			Stage:      "F",
 			Severity:   "High",
 			Title:      "annotator repair static review failed",
 			Rule:       "Stage F must complete a Codex static review or produce an unavailable-review artifact.",
-			Evidence:   codexFailureReason(firstNonEmpty(result.Stderr, result.Stdout)),
+			Evidence:   codexFailureEvidence(result, reportErr),
 			Impact:     "The annotator repair report may be incomplete and requires manual review.",
 			MinimumFix: "Inspect the Stage F log and rerun after fixing Codex availability.",
 			SourcePath: reportPath,

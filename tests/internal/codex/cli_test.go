@@ -24,7 +24,7 @@ func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := joinArgs(args)
-	for _, absent := range []string{"--ask-for-approval", "--full-auto"} {
+	for _, absent := range []string{"--ask-for-approval", "--full-auto", "--ignore-user-config"} {
 		if containsArg(args, absent) {
 			t.Fatalf("args should not contain unavailable optional flag %s: %#v", absent, args)
 		}
@@ -33,6 +33,22 @@ func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
 		if !containsArg(args, want) {
 			t.Fatalf("args missing %s in %s", want, joined)
 		}
+	}
+}
+
+func TestBuildExecArgsUsesUserConfigByDefault(t *testing.T) {
+	args, err := codex.BuildExecArgs(codex.Capability{
+		Path:                "codex",
+		HasSandbox:          true,
+		HasAskForApproval:   true,
+		HasCDLong:           true,
+		HasIgnoreUserConfig: true,
+	}, "/repo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsArg(args, "--ignore-user-config") {
+		t.Fatalf("user config should be enabled by default: %#v", args)
 	}
 }
 
@@ -45,9 +61,13 @@ Usage: codex exec [OPTIONS] [PROMPT]
   -c, --config <KEY=VALUE>
   --cd <DIR>
   --full-auto
+  -o, --output-last-message <FILE>
 `)
 	if !capability.HasFullAuto {
 		t.Fatal("expected --full-auto to be detected")
+	}
+	if !capability.HasOutputLastMessage {
+		t.Fatal("expected --output-last-message to be detected")
 	}
 	args, err := codex.BuildExecArgs(codex.Capability{
 		Path:              "codex",

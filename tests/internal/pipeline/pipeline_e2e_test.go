@@ -105,6 +105,119 @@ echo "v25.0.0"
 	}
 }
 
+func TestRunCapturesCodexOutputLastMessageWhenStdoutIsEmpty(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "batch-1", "task-file-output")
+	for _, dir := range []string{"docs", "repo", "original_sessions"} {
+		if err := os.MkdirAll(filepath.Join(projectDir, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "metadata.json"), []byte(`{"task_id":"TASK-FILE","prompt":"build a small app"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "repo", "self_test_report.md"), []byte("self test passed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  echo "codex-cli 0.999.0"
+  exit 0
+fi
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
+  echo "--sandbox --ask-for-approval --cd -C --ephemeral --skip-git-repo-check --ignore-user-config --output-last-message"
+  exit 0
+fi
+if [ "${1:-}" = "exec" ]; then
+  output=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -o|--output-last-message)
+        output="${2:-}"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$output" ]; then
+    echo "missing --output-last-message" >&2
+    exit 3
+  fi
+  printf '# File Only Report\n- High: file-only finding from fake codex\n' > "$output"
+  exit 0
+fi
+echo "unexpected fake codex args: $*" >&2
+exit 2
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "node"), `#!/usr/bin/env bash
+echo "v25.0.0"
+`)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(root, ".qa-control", "index.db")
+	cfg.Codex.PromptProfilesDir = filepath.Join(root, ".qa-control", "prompt_profiles")
+	cfg.Pipeline.StageTimeouts["D"] = 10
+	cfg.Pipeline.StageTimeouts["F"] = 10
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scan, err := scanner.Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertProjects(context.Background(), scan.Projects); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipelinepkg.NewRunner(store, cfg).Run(context.Background(), "TASK-FILE", pipelinepkg.RunOptions{Stage: "D"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageD := stageByName(result.Stages, "D")
+	if stageD.Status != model.StageDone {
+		t.Fatalf("stage D status = %s, want done; error=%s", stageD.Status, stageD.ErrorSummary)
+	}
+	reportPath := filepath.Join(result.Run.ArtifactRoot, "tests_coverage_report.md")
+	content, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "# File Only Report") {
+		t.Fatalf("report did not come from --output-last-message:\n%s", content)
+	}
+	if strings.Contains(string(content), "Manual Verification Required") {
+		t.Fatalf("report fell back to unavailable artifact:\n%s", content)
+	}
+	logContent, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "logs", "D_tests_coverage_static.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logContent), "--output-last-message") {
+		t.Fatalf("log should show output-last-message capture command:\n%s", logContent)
+	}
+}
+
+func stageByName(stages []model.StageRecord, name string) model.StageRecord {
+	for _, stage := range stages {
+		if stage.Stage == name {
+			return stage
+		}
+	}
+	return model.StageRecord{}
+}
+
 func writeExecutable(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {

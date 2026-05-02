@@ -23,5 +23,4 @@ Output constraints:
 - If no issue is found for a check, mark it briefly as "No significant issue found".
 - Keep the overall report as short as possible while still preserving key conclusions and evidence.
 
-Generate the report at:
-./.tmp/tests_coverage_report.md
+Return the complete report as the final Codex response. Do not write files or create `.tmp` reports; p2r persists the response to the required artifact paths.

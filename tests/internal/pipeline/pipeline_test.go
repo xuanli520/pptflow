@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	_ "unsafe"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
@@ -48,6 +50,12 @@ func safeCodexExtraArgs(args []string) ([]string, error)
 
 //go:linkname capabilitySummary github.com/xuanli520/p2r_tui/internal/pipeline.capabilitySummary
 func capabilitySummary(capability codex.Capability) string
+
+//go:linkname codexExecArgsWithReportCapture github.com/xuanli520/p2r_tui/internal/pipeline.codexExecArgsWithReportCapture
+func codexExecArgsWithReportCapture(execArgs, extraArgs []string, capability codex.Capability, lastMessagePath string) ([]string, bool)
+
+//go:linkname capturedCodexReport github.com/xuanli520/p2r_tui/internal/pipeline.capturedCodexReport
+func capturedCodexReport(result executor.Result, lastMessagePath string, usingLastMessage bool, maxOutputBytes int) (string, error)
 
 type portMapping struct {
 	Service   string
@@ -172,7 +180,7 @@ func TestSafeCodexExtraArgsRejectsBoundaryFlags(t *testing.T) {
 	if _, err := safeCodexExtraArgs([]string{"--model", "gpt-5.4"}); err != nil {
 		t.Fatalf("safe args rejected: %v", err)
 	}
-	for _, flag := range []string{"--sandbox", "--full-auto", "--search", "--dangerously-bypass-approvals-and-sandbox"} {
+	for _, flag := range []string{"--sandbox", "--full-auto", "--search", "--output-last-message", "-o", "--dangerously-bypass-approvals-and-sandbox"} {
 		if _, err := safeCodexExtraArgs([]string{flag}); err == nil {
 			t.Fatalf("expected %s to be rejected", flag)
 		}
@@ -180,12 +188,70 @@ func TestSafeCodexExtraArgsRejectsBoundaryFlags(t *testing.T) {
 	if _, err := safeCodexExtraArgs([]string{"--full-auto=true"}); err == nil {
 		t.Fatal("expected --full-auto=... to be rejected")
 	}
+	if _, err := safeCodexExtraArgs([]string{"--output-last-message=/tmp/out.md"}); err == nil {
+		t.Fatal("expected --output-last-message=... to be rejected")
+	}
 }
 
 func TestCapabilitySummaryIncludesFullAutoDiagnostic(t *testing.T) {
 	summary := capabilitySummary(codex.Capability{Path: "codex", HasFullAuto: true})
 	if !strings.Contains(summary, "full_auto=true") {
 		t.Fatalf("summary missing full_auto diagnostic: %s", summary)
+	}
+}
+
+func TestCapabilitySummaryIncludesOutputLastMessageDiagnostic(t *testing.T) {
+	summary := capabilitySummary(codex.Capability{Path: "codex", HasOutputLastMessage: true})
+	if !strings.Contains(summary, "output_last_message=true") {
+		t.Fatalf("summary missing output-last-message diagnostic: %s", summary)
+	}
+}
+
+func TestCodexExecArgsAddOutputLastMessageBeforePrompt(t *testing.T) {
+	args, using := codexExecArgsWithReportCapture(
+		[]string{"exec", "--sandbox", "read-only", "-"},
+		[]string{"--model", "gpt-5.4"},
+		codex.Capability{HasOutputLastMessage: true},
+		"/tmp/report.md",
+	)
+	if !using {
+		t.Fatal("expected output-last-message capture to be enabled")
+	}
+	joined := strings.Join(args, "\x00")
+	for _, want := range []string{"--model\x00gpt-5.4", "--output-last-message\x00/tmp/report.md"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("args missing %q: %#v", want, args)
+		}
+	}
+	if args[len(args)-1] != "-" {
+		t.Fatalf("prompt marker should remain last, got %#v", args)
+	}
+}
+
+func TestCapturedCodexReportRejectsEmptySuccessfulRun(t *testing.T) {
+	if _, err := capturedCodexReport(executor.Result{}, "", false, 1024); err == nil {
+		t.Fatal("expected empty successful Codex run to be treated as missing report")
+	}
+}
+
+func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "../../.."))
+	for _, name := range []string{"tests_coverage_report.md", "static_acceptance_audit.md", "annotator_fix.md"} {
+		content, err := os.ReadFile(filepath.Join(repoRoot, "assets", "prompt_profiles", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(content)
+		if strings.Contains(text, "./.tmp") {
+			t.Fatalf("%s still asks Codex to write a .tmp report", name)
+		}
+		if !strings.Contains(text, "final Codex response") || !strings.Contains(text, "Do not write files") {
+			t.Fatalf("%s does not state the p2r final-response contract", name)
+		}
 	}
 }
 

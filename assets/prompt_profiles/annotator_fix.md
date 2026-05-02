@@ -49,3 +49,4 @@ Recheck mode:
 - Name unresolved previous issues clearly and cite current evidence.
 
 Keep the report concise, evidence-based, and useful for a human PASS / REWORK / FAIL decision.
+Return the complete report as the final Codex response. Do not write files; p2r persists the response to the required artifact paths.

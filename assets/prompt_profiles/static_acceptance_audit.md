@@ -200,7 +200,7 @@ Hard Rules (must follow)
 ====================
 Output Requirements
 
-Produce the final audit in a concise but complete report and write the consolidated report to `./.tmp/**.md`.
+Produce the final audit in a concise but complete report. Return the complete report as the final Codex response. Do not write files or create `.tmp` reports; p2r persists the response to the required artifact paths.
 
 The final report must be organized by the six major acceptance sections in order, even if your scan order was different.
 
