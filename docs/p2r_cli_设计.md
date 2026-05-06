@@ -281,7 +281,7 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 
 | 规则 / 风险点 | 负责阶段 | 工具或模板 | 主要输出 |
 |---------------|----------|------------|----------|
-| 根结构：`docs/`、`repo/`、`original_sessions/`、`metadata.json` | A | `run_acceptance.py`、`run_validate.py` | `validation_report.md`、`acceptance.json` |
+| 根结构：`docs/`、`repo/`、`original_sessions/`、`metadata.json` | A | `run_acceptance.py`、`run_validate.py` | `acceptance.json`、`acceptance_report.md`、`validation_report.md` |
 | 必需文档和测试目录 | A | `check_required_artifacts.py` | `required_artifacts.json` |
 | README 与实际结构/命令静态一致性 | A/E | `check_readme_alignment.py`、`static_acceptance_audit.md` | finding |
 | 脏依赖、缓存、数据库文件 | A | `check_local_dependency.py` | finding |
@@ -304,7 +304,7 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 | 输入 | `<task-path>/` |
 | 依赖 | 无 |
 | 动作 | 运行 `run_acceptance.py`、`run_validate.py`、`check_required_artifacts.py`、`check_readme_alignment.py`、`check_local_dependency.py`，英文题追加 `check_english_only.py` |
-| 输出 | `acceptance.json`、`validation_report.md`、`required_artifacts.json`、`readme_alignment.json`、`local_dependency.json` |
+| 输出 | `acceptance.json`、`acceptance_report.md`、`validation_report.md`、`required_artifacts.json`、`readme_alignment.json`、`local_dependency.json` |
 | 超时 | 60s |
 | 失败影响 | A 失败时 B/C 标记 `blocked`；D/E 仍可静态审查已存在文件；F 必跑 |
 
@@ -435,6 +435,7 @@ P2R-{stage}-{severity_short}-{seq:03d}
 | `run_manifest.json` | run 初始化 | 记录配置、工具版本、模板版本、启动参数 |
 | `stage_status.json` | 全阶段 | 阶段状态权威记录 |
 | `acceptance.json` | A | 基础规则脚本结果 |
+| `acceptance_report.md` | A | acceptance 脚本的人类可读报告 |
 | `validation_report.md` | A | 结构校验报告 |
 | `port_map.json` | B | B skipped/blocked 时仍生成空结构并说明原因 |
 | `5_Docker启动截图.png` | B | B 成功时生成；失败时记录缺失原因 |
@@ -475,6 +476,7 @@ TASK-xxxxxx/qa/runs/<run_id>/
 │   ├── E_static_audit.log
 │   └── F_repair.log
 ├── acceptance.json
+├── acceptance_report.md
 ├── validation_report.md
 ├── 5_Docker启动截图.png
 ├── 6_run_tests.sh运行截图.png

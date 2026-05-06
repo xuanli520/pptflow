@@ -41,12 +41,31 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	handle.SetMaxOpenConns(1)
+	handle.SetMaxIdleConns(1)
+	if err := configureSQLite(handle); err != nil {
+		_ = handle.Close()
+		return nil, err
+	}
 	store := &Store{db: handle}
 	if err := store.Migrate(context.Background()); err != nil {
 		_ = handle.Close()
 		return nil, err
 	}
 	return store, nil
+}
+
+func configureSQLite(handle *sql.DB) error {
+	for _, statement := range []string{
+		`PRAGMA busy_timeout = 5000;`,
+		`PRAGMA journal_mode = WAL;`,
+		`PRAGMA synchronous = NORMAL;`,
+	} {
+		if _, err := handle.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -93,13 +112,24 @@ func (s *Store) ListProjects(ctx context.Context) ([]ProjectSummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var projects []ProjectSummary
 	for rows.Next() {
 		var project ProjectSummary
 		if err := rows.Scan(&project.TaskID, &project.Batch, &project.Path, &project.RunCount, &project.LastRunID, &project.LastRunAt); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
+		projects = append(projects, project)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range projects {
+		project := &projects[i]
 		run, err := s.LatestRunForTask(ctx, project.TaskID)
 		if err == nil {
 			project.LastRunID = run.RunID
@@ -109,9 +139,8 @@ func (s *Store) ListProjects(ctx context.Context) ([]ProjectSummary, error) {
 			project.FailedStage = firstFailedStage(ctx, s, run.RunID)
 			project.Blocking, project.High = findingCounts(ctx, s, run.RunID)
 		}
-		projects = append(projects, project)
 	}
-	return projects, rows.Err()
+	return projects, nil
 }
 
 func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {

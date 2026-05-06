@@ -18,7 +18,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
-func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output, compat string) model.StageRecord {
+func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output string, compat ...string) model.StageRecord {
 	start := time.Now()
 	record := startStage(stage)
 	logPath := filepath.Join(run.ArtifactRoot, "logs", fmt.Sprintf("%s_static.log", stage))
@@ -29,23 +29,44 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		logPath = filepath.Join(run.ArtifactRoot, "logs", "E_static_audit.log")
 	}
 	outputPath := filepath.Join(run.ArtifactRoot, output)
-	compatPath := filepath.Join(run.ArtifactRoot, compat)
 	record.LogPath = logPath
-	record.ArtifactPaths = append(record.ArtifactPaths, outputPath, compatPath)
+	record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, outputPath)
+	compatPaths := []string{}
+	for _, name := range compat {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		path := filepath.Join(run.ArtifactRoot, name)
+		if path == outputPath || containsPath(compatPaths, path) {
+			continue
+		}
+		compatPaths = append(compatPaths, path)
+		record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, path)
+	}
 	extraOutputPaths := []string{}
 	if stage == "D" {
-		extraOutputPaths = append(extraOutputPaths, filepath.Join(run.ArtifactRoot, "自测报告确认修复报告.md"))
 		if opts.Mode == "recheck" {
 			extraOutputPaths = append(extraOutputPaths, filepath.Join(run.ArtifactRoot, "打回问题修复确认报告.md"))
 		}
-		record.ArtifactPaths = append(record.ArtifactPaths, extraOutputPaths...)
+		for _, path := range extraOutputPaths {
+			record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, path)
+		}
+	}
+	writeReports := func(content string) {
+		_ = writeText(outputPath, content)
+		for _, path := range compatPaths {
+			_ = writeText(path, content)
+		}
+		for _, path := range extraOutputPaths {
+			_ = writeText(path, content)
+		}
 	}
 	profilePath := filepath.Join(r.cfg.Codex.PromptProfilesDir, profile)
 	profileContent, readErr := os.ReadFile(profilePath)
 	if readErr != nil {
 		report := staticUnavailableReport(stage, profile, project.Path, "prompt profile not readable: "+readErr.Error())
-		_ = writeText(outputPath, report)
-		_ = writeText(compatPath, report)
+		writeReports(report)
 		_ = writeText(logPath, report)
 		record.Findings = []model.Finding{{
 			Stage:      stage,
@@ -61,8 +82,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	}
 	if r.cfg.Codex.Network != "none" {
 		report := staticUnavailableReport(stage, profile, project.Path, "configured Codex network mode is unsupported by the current safe sandbox: "+r.cfg.Codex.Network)
-		_ = writeText(outputPath, report)
-		_ = writeText(compatPath, report)
+		writeReports(report)
 		_ = writeText(logPath, report)
 		record.Findings = []model.Finding{{
 			Stage:      stage,
@@ -78,8 +98,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	}
 	if r.cfg.Codex.WritableTmp {
 		report := staticUnavailableReport(stage, profile, project.Path, "configured writable_tmp=true is unsupported without widening write access in the current Codex CLI sandbox")
-		_ = writeText(outputPath, report)
-		_ = writeText(compatPath, report)
+		writeReports(report)
 		_ = writeText(logPath, report)
 		record.Findings = []model.Finding{{
 			Stage:      stage,
@@ -93,12 +112,12 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		record.ErrorSummary = "codex writable tmp policy unsupported"
 		return finishStage(record, model.StageFailed, start)
 	}
+	reviewPath := codexReviewPath(run, project.Path)
 	capability := codex.DetectCLI(ctx, r.exec, "")
-	execArgs, buildErr := codex.BuildExecArgs(capability, project.Path, nil)
+	execArgs, buildErr := codex.BuildExecArgs(capability, reviewPath, nil)
 	if buildErr != nil {
 		report := staticUnavailableReport(stage, profile, project.Path, buildErr.Error())
-		_ = writeText(outputPath, report)
-		_ = writeText(compatPath, report)
+		writeReports(report)
 		_ = writeText(logPath, report)
 		record.Findings = []model.Finding{{
 			Stage:      stage,
@@ -115,11 +134,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	contextText, contextErr := r.codexContext(project, opts, stage)
 	if contextErr != nil {
 		report := staticUnavailableReport(stage, profile, project.Path, contextErr.Error())
-		_ = writeText(outputPath, report)
-		_ = writeText(compatPath, report)
-		for _, path := range extraOutputPaths {
-			_ = writeText(path, report)
-		}
+		writeReports(report)
 		_ = writeText(logPath, report)
 		record.Findings = []model.Finding{{
 			Stage:      stage,
@@ -136,13 +151,12 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	extraArgs, extraErr := safeCodexExtraArgs(r.cfg.Codex.ExtraArgs)
 	if extraErr != nil {
 		report := staticUnavailableReport(stage, profile, project.Path, extraErr.Error())
-		_ = writeText(outputPath, report)
-		_ = writeText(compatPath, report)
+		writeReports(report)
 		_ = writeText(logPath, report)
 		record.ErrorSummary = "unsafe codex extra_args"
 		return finishStage(record, model.StageFailed, start)
 	}
-	sandbox, sandboxErr := codex.NewSandbox(project.Path, run.ArtifactRoot, stage)
+	sandbox, sandboxErr := codex.NewSandbox(reviewPath, run.ArtifactRoot, stage)
 	if sandboxErr != nil {
 		record.Findings = []model.Finding{{
 			Stage:      stage,
@@ -159,21 +173,17 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	defer os.RemoveAll(sandbox.Home)
 	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
 	timeout := r.stageTimeout(stage, 300)
-	prompt := codexPrompt(stage, profile, project.Path, run.ArtifactRoot, string(profileContent), contextText)
+	prompt := codexPrompt(stage, profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	lastMessagePath := codexLastMessagePath(run.ArtifactRoot, stage)
 	args, usingLastMessage := codexExecArgsWithReportCapture(execArgs, extraArgs, capability, lastMessagePath)
-	result := r.runCodexWithLog(ctx, timeout, project.Path, logPath, env, prompt, capability, args)
+	result := r.runCodexWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args)
 	report, reportErr := capturedCodexReport(result, lastMessagePath, usingLastMessage, r.cfg.Codex.MaxOutputBytes)
 	if reportErr != nil {
 		report = staticUnavailableReport(stage, profile, project.Path, codexFailureEvidence(result, reportErr))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
-	_ = writeText(outputPath, report+"\n")
-	_ = writeText(compatPath, report+"\n")
-	for _, path := range extraOutputPaths {
-		_ = writeText(path, report+"\n")
-	}
 	if result.Err != nil || reportErr != nil {
+		writeReports(report + "\n")
 		record.Findings = []model.Finding{{
 			Stage:      stage,
 			Severity:   "High",
@@ -186,8 +196,42 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		record.ErrorSummary = "codex exec failed"
 		return finishStage(record, model.StageFailed, start)
 	}
-	record.Findings = extractFindingsFromReport(stage, report, outputPath)
+	findings, schemaErr := staticReviewFindingsFromReport(stage, report, outputPath)
+	if schemaErr != nil {
+		report = staticUnavailableReport(stage, profile, project.Path, "static review report schema invalid: "+schemaErr.Error())
+		writeReports(report + "\n")
+		record.Findings = []model.Finding{staticReviewSchemaFailureFinding(stage, outputPath, schemaErr)}
+		record.ErrorSummary = "static review schema invalid"
+		return finishStage(record, model.StageFailed, start)
+	}
+	writeReports(report + "\n")
+	record.Findings = findings
 	return finishStage(record, model.StageDone, start)
+}
+
+func codexReviewPath(run model.RunRecord, projectPath string) string {
+	snapshot := filepath.Join(run.ArtifactRoot, "script_input_snapshot")
+	if dirExists(snapshot) {
+		return snapshot
+	}
+	return projectPath
+}
+
+func appendUniqueArtifactPath(paths []string, path string) []string {
+	if containsPath(paths, path) {
+		return paths
+	}
+	return append(paths, path)
+}
+
+func containsPath(paths []string, path string) bool {
+	path = filepath.Clean(path)
+	for _, existing := range paths {
+		if filepath.Clean(existing) == path {
+			return true
+		}
+	}
+	return false
 }
 
 func (r Runner) runCodexWithLog(ctx context.Context, timeout time.Duration, projectPath, logPath string, env []string, prompt string, capability codex.Capability, args []string) executor.Result {
@@ -211,10 +255,11 @@ func (r Runner) runCodexWithLog(ctx context.Context, timeout time.Duration, proj
 	return result
 }
 
-func codexPrompt(stage, profile, projectPath, artifactRoot, profileContent, contextText string) string {
+func codexPrompt(stage, profile, reviewPath, projectPath, artifactRoot, profileContent, contextText string) string {
 	return fmt.Sprintf(`Run p2r stage %s as a pure static review.
 
 Project path: %s
+Original package path: %s
 Artifact root: %s
 Prompt profile: %s
 
@@ -230,12 +275,40 @@ Hard boundaries:
 - Return the complete report as the final Codex response. p2r will write that response to artifact files.
 - Do not create .tmp reports or write artifact files yourself, even if a profile mentions a file path.
 
+Machine-readable review contract:
+- The final response must include exactly one static-review JSON contract block between the markers below.
+- The JSON must be a single object with schema_version "%s", stage "%s", and findings array.
+- Each finding must include severity, title, rule, evidence, impact, and minimum_fix. evidence may be a string or a string array. done_criteria is optional.
+- severity must be exactly one of Blocker, High, Medium, Low. Use findings: [] when there are no material findings.
+- Do not encode negative statements such as "No High findings" as findings.
+
+%s
+{
+  "schema_version": "%s",
+  "stage": "%s",
+  "findings": []
+}
+%s
+
 Profile:
 %s
 
 Audit context:
 %s
-`, stage, projectPath, artifactRoot, profile, profileContent, contextText)
+`, stage, reviewPath, projectPath, artifactRoot, profile, staticReviewSchemaVersion, stage, staticReviewJSONStart, staticReviewSchemaVersion, stage, staticReviewJSONEnd, profileContent, contextText)
+}
+
+func staticReviewSchemaFailureFinding(stage, reportPath string, schemaErr error) model.Finding {
+	return model.Finding{
+		Stage:      stage,
+		Severity:   "High",
+		Title:      stageName(stage) + " report schema invalid",
+		Rule:       "Static Codex review reports must include a valid p2r.static_review.v1 JSON contract.",
+		Evidence:   schemaErr.Error(),
+		Impact:     "p2r cannot reliably classify findings from an unstructured static review report.",
+		MinimumFix: "Rerun the stage with a Codex response that includes the required static-review JSON contract.",
+		SourcePath: reportPath,
+	}
 }
 
 func (r Runner) codexContext(project scanner.Project, opts RunOptions, stage string) (string, error) {
@@ -293,7 +366,7 @@ func (r Runner) refRunStaticContext(artifactRoot, stage string) string {
 	names := []string{"repair_summary.json"}
 	switch stage {
 	case "D":
-		names = append(names, "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "tests_coverage_report.md", "自测报告确认修复报告.md")
+		names = append(names, "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "tests_coverage_report.md")
 	case "E":
 		names = append(names, "1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md", "static_acceptance_audit_report.md")
 	case "F":

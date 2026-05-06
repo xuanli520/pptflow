@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,9 +25,16 @@ type Result struct {
 
 func Scan(root string) (Result, error) {
 	result := Result{Root: filepath.Clean(root)}
-	err := filepath.WalkDir(result.Root, func(path string, d os.DirEntry, err error) error {
+	info, err := os.Stat(result.Root)
+	if err != nil {
+		return result, fmt.Errorf("scan root unavailable: %w", err)
+	}
+	if !info.IsDir() {
+		return result, fmt.Errorf("scan root is not a directory: %s", result.Root)
+	}
+	err = filepath.WalkDir(result.Root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return fmt.Errorf("scan traversal failed at %s: %w", path, err)
 		}
 		if !d.IsDir() {
 			return nil

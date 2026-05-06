@@ -45,10 +45,35 @@ if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
   exit 0
 fi
 if [ "${1:-}" = "exec" ]; then
+  prompt="$(cat)"
+  stage="D"
+  if printf '%s' "$prompt" | grep -q 'Run p2r stage F'; then
+    stage="F"
+  elif printf '%s' "$prompt" | grep -q 'Run p2r stage E'; then
+    stage="E"
+  fi
   echo "fake-codex-start" >&2
   sleep "${FAKE_CODEX_SLEEP:-2}"
   echo "# Fake Report"
   echo "- High: simulated finding from fake codex"
+  cat <<JSON
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "$stage",
+  "findings": [
+    {
+      "severity": "High",
+      "title": "simulated finding from fake codex",
+      "rule": "Fake Codex test rule",
+      "evidence": "repo/fake.go:1",
+      "impact": "The fake reviewer reported a controlled issue.",
+      "minimum_fix": "Keep the fake output contract valid."
+    }
+  ]
+}
+<!-- p2r:static-review-json:end -->
+JSON
   exit 0
 fi
 echo "unexpected fake codex args: $*" >&2
@@ -135,6 +160,13 @@ if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
   exit 0
 fi
 if [ "${1:-}" = "exec" ]; then
+  prompt="$(cat)"
+  stage="D"
+  if printf '%s' "$prompt" | grep -q 'Run p2r stage F'; then
+    stage="F"
+  elif printf '%s' "$prompt" | grep -q 'Run p2r stage E'; then
+    stage="E"
+  fi
   output=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -151,7 +183,27 @@ if [ "${1:-}" = "exec" ]; then
     echo "missing --output-last-message" >&2
     exit 3
   fi
-  printf '# File Only Report\n- High: file-only finding from fake codex\n' > "$output"
+  cat > "$output" <<JSON
+# File Only Report
+- High: file-only finding from fake codex
+
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "$stage",
+  "findings": [
+    {
+      "severity": "High",
+      "title": "file-only finding from fake codex",
+      "rule": "Fake Codex output-last-message rule",
+      "evidence": "repo/fake.go:2",
+      "impact": "The fake reviewer wrote the report via output-last-message.",
+      "minimum_fix": "Keep output-last-message capture working."
+    }
+  ]
+}
+<!-- p2r:static-review-json:end -->
+JSON
   exit 0
 fi
 echo "unexpected fake codex args: $*" >&2
@@ -206,6 +258,85 @@ echo "v25.0.0"
 	}
 	if !strings.Contains(string(logContent), "--output-last-message") {
 		t.Fatalf("log should show output-last-message capture command:\n%s", logContent)
+	}
+}
+
+func TestRunMarksStaticReviewUnavailableWhenReportSchemaInvalid(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "batch-1", "task-invalid-schema")
+	for _, dir := range []string{"docs", "repo", "original_sessions"} {
+		if err := os.MkdirAll(filepath.Join(projectDir, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "metadata.json"), []byte(`{"task_id":"TASK-SCHEMA","prompt":"build a small app"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "repo", "self_test_report.md"), []byte("self test passed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  echo "codex-cli 0.999.0"
+  exit 0
+fi
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
+  echo "--sandbox --ask-for-approval --cd -C --ephemeral --skip-git-repo-check --ignore-user-config"
+  exit 0
+fi
+if [ "${1:-}" = "exec" ]; then
+  cat >/dev/null
+  echo "# Legacy Report"
+  echo "- High: plain text finding without JSON contract"
+  exit 0
+fi
+exit 2
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "node"), `#!/usr/bin/env bash
+echo "v25.0.0"
+`)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(root, ".qa-control", "index.db")
+	cfg.Codex.PromptProfilesDir = filepath.Join(root, ".qa-control", "prompt_profiles")
+	cfg.Pipeline.StageTimeouts["D"] = 10
+	cfg.Pipeline.StageTimeouts["F"] = 10
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scan, err := scanner.Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertProjects(context.Background(), scan.Projects); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipelinepkg.NewRunner(store, cfg).Run(context.Background(), "TASK-SCHEMA", pipelinepkg.RunOptions{Stage: "D"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageD := stageByName(result.Stages, "D")
+	if stageD.Status != model.StageFailed || stageD.ErrorSummary != "static review schema invalid" {
+		t.Fatalf("stage D = %#v, want schema failure", stageD)
+	}
+	reportPath := filepath.Join(result.Run.ArtifactRoot, "tests_coverage_report.md")
+	content, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "Manual Verification Required") {
+		t.Fatalf("schema-invalid report should be replaced with unavailable artifact:\n%s", content)
 	}
 }
 

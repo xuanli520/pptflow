@@ -40,6 +40,52 @@ type serviceURL struct {
 	URL    string `json:"url"`
 }
 
+type stageCCommandEnv struct {
+	Env     []string
+	Keys    []string
+	Values  map[string]string
+	Service serviceURLEnv
+}
+
+func stageCEnvironment(evidence runtimeEvidence) stageCCommandEnv {
+	service := serviceURLEnvironment(evidence)
+	result := stageCCommandEnv{
+		Env:     append([]string{}, service.Env...),
+		Keys:    append([]string{}, service.Keys...),
+		Values:  envValueMap(service.Env),
+		Service: service,
+	}
+	result.add("COMPOSE_PROJECT_NAME", evidence.ComposeProject)
+	result.add("COMPOSE_FILE", evidence.ComposeFile)
+	return result
+}
+
+func (e *stageCCommandEnv) add(key, value string) {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" {
+		return
+	}
+	e.Env = append(e.Env, key+"="+value)
+	e.Keys = append(e.Keys, key)
+	if e.Values == nil {
+		e.Values = map[string]string{}
+	}
+	e.Values[key] = value
+}
+
+func envValueMap(env []string) map[string]string {
+	values := map[string]string{}
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || key == "" {
+			continue
+		}
+		values[key] = value
+	}
+	return values
+}
+
 func serviceURLEnvironment(evidence runtimeEvidence) serviceURLEnv {
 	names := make([]string, 0, len(evidence.Mappings))
 	for service := range evidence.Mappings {

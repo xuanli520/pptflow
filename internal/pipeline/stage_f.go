@@ -42,8 +42,9 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	if extraErr != nil {
 		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, extraErr.Error())
 	}
+	reviewPath := codexReviewPath(run, project.Path)
 	capability := codex.DetectCLI(ctx, r.exec, "")
-	execArgs, buildErr := codex.BuildExecArgs(capability, project.Path, nil)
+	execArgs, buildErr := codex.BuildExecArgs(capability, reviewPath, nil)
 	if buildErr != nil {
 		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, buildErr.Error())
 	}
@@ -52,23 +53,23 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, contextErr.Error())
 	}
 	contextText += "\n" + stageFPreviousFindingsContext(stageStatuses, priorFindings)
-	sandbox, sandboxErr := codex.NewSandbox(project.Path, run.ArtifactRoot, "F")
+	sandbox, sandboxErr := codex.NewSandbox(reviewPath, run.ArtifactRoot, "F")
 	if sandboxErr != nil {
 		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, sandboxErr.Error())
 	}
 	defer os.RemoveAll(sandbox.Home)
 	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
-	prompt := codexPrompt("F", profile, project.Path, run.ArtifactRoot, string(profileContent), contextText)
+	prompt := codexPrompt("F", profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	lastMessagePath := codexLastMessagePath(run.ArtifactRoot, "F")
 	args, usingLastMessage := codexExecArgsWithReportCapture(execArgs, extraArgs, capability, lastMessagePath)
-	result := r.runCodexWithLog(ctx, r.stageTimeout("F", 300), project.Path, logPath, env, prompt, capability, args)
+	result := r.runCodexWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args)
 	report, reportErr := capturedCodexReport(result, lastMessagePath, usingLastMessage, r.cfg.Codex.MaxOutputBytes)
 	if reportErr != nil {
 		report = staticUnavailableReport("F", profile, project.Path, codexFailureEvidence(result, reportErr))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
-	_ = writeText(reportPath, report+"\n")
 	if result.Err != nil || reportErr != nil {
+		_ = writeText(reportPath, report+"\n")
 		record.Findings = []model.Finding{{
 			Stage:      "F",
 			Severity:   "High",
@@ -82,7 +83,16 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 		record.ErrorSummary = "codex exec failed"
 		return finishStage(record, model.StageFailed, start)
 	}
-	record.Findings = extractFindingsFromReport("F", report, reportPath)
+	findings, schemaErr := staticReviewFindingsFromReport("F", report, reportPath)
+	if schemaErr != nil {
+		report = staticUnavailableReport("F", profile, project.Path, "static review report schema invalid: "+schemaErr.Error())
+		_ = writeText(reportPath, report+"\n")
+		record.Findings = []model.Finding{staticReviewSchemaFailureFinding("F", reportPath, schemaErr)}
+		record.ErrorSummary = "static review schema invalid"
+		return finishStage(record, model.StageFailed, start)
+	}
+	_ = writeText(reportPath, report+"\n")
+	record.Findings = findings
 	return finishStage(record, model.StageDone, start)
 }
 

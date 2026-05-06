@@ -110,6 +110,19 @@ db_path: "./from-file/index.db"
 	}
 }
 
+func TestDefaultStaticCodexTimeoutsAllowFullReviews(t *testing.T) {
+	cfg := config.Default()
+	if cfg.Pipeline.StageTimeouts["D"] < 900 {
+		t.Fatalf("D timeout too short for static Codex review: %d", cfg.Pipeline.StageTimeouts["D"])
+	}
+	if cfg.Pipeline.StageTimeouts["E"] < 1200 {
+		t.Fatalf("E timeout too short for static Codex review: %d", cfg.Pipeline.StageTimeouts["E"])
+	}
+	if cfg.Pipeline.StageTimeouts["F"] < 900 {
+		t.Fatalf("F timeout too short for static Codex review: %d", cfg.Pipeline.StageTimeouts["F"])
+	}
+}
+
 func TestLoadUsesUserConfigWhenNoLocalConfigExists(t *testing.T) {
 	cwd := t.TempDir()
 	configRoot := t.TempDir()

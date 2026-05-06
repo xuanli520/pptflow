@@ -85,8 +85,8 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		record.ErrorSummary = evidence
 		return finishStage(record, model.StageFailed, start)
 	}
-	serviceURLs := serviceURLEnvironment(runtime)
-	env := append(os.Environ(), serviceURLs.Env...)
+	stageEnv := stageCEnvironment(runtime)
+	env := append(os.Environ(), stageEnv.Env...)
 	timeout := r.stageTimeout("C", 300)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -94,6 +94,11 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		return finishStage(record, model.StageFailed, start)
 	}
 	fmt.Fprintln(logFile, "=== C host run_tests.sh start ===")
+	fmt.Fprintln(logFile, "Stage C injected runtime env:")
+	for _, key := range stageEnv.Keys {
+		fmt.Fprintf(logFile, "%s=%s\n", key, stageEnv.Values[key])
+	}
+	fmt.Fprintln(logFile)
 	result := r.exec.RunStreaming(ctx, timeout, repoPath, env, logFile, bash, "run_tests.sh")
 	fmt.Fprintf(logFile, "\n=== C host run_tests.sh end: exit=%d timeout=%t err=%v ===\n", result.ExitCode, result.Timeout, result.Err)
 	_ = logFile.Close()
@@ -104,7 +109,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	pages, _ := renderLogFile(logPath, screenshotPath)
 	record.ArtifactPaths = append([]string{logPath}, pages...)
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-	_ = writeJSON(summaryPath, map[string]any{"ok": result.Err == nil, "exit_code": result.ExitCode, "timeout": result.Timeout, "mode": "host", "script": "repo/run_tests.sh", "command": "bash run_tests.sh", "env_keys": serviceURLs.Keys, "service_urls": serviceURLs.Mapping, "compose_project": runtime.ComposeProject})
+	_ = writeJSON(summaryPath, map[string]any{"ok": result.Err == nil, "exit_code": result.ExitCode, "timeout": result.Timeout, "mode": "host", "script": "repo/run_tests.sh", "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "compose_project": runtime.ComposeProject})
 	if result.Err != nil {
 		record.Findings = []model.Finding{{
 			Stage:      "C",

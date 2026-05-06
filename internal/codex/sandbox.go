@@ -62,6 +62,9 @@ func (s Sandbox) EnvWithNode(base []string, configured map[string]string, nodePa
 		if !ok {
 			continue
 		}
+		if !allowedBaseEnvKey(key) {
+			continue
+		}
 		canonical := canonicalEnvKey(key)
 		values[canonical] = value
 		casing[canonical] = key
@@ -78,6 +81,16 @@ func (s Sandbox) EnvWithNode(base []string, configured map[string]string, nodePa
 	}
 	env = WithNodeOnPATH(env, nodePath)
 	return withSystemBinOnPATH(env)
+}
+
+func allowedBaseEnvKey(key string) bool {
+	upper := strings.ToUpper(key)
+	switch upper {
+	case "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENAI_ORGANIZATION", "OPENAI_PROJECT", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "TZ", "TERM", "COLORTERM", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY":
+		return true
+	default:
+		return strings.HasPrefix(upper, "LC_")
+	}
 }
 
 var systemBinPaths = []string{"/usr/bin", "/usr/local/bin", "/bin"}

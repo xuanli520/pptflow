@@ -13,6 +13,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
 // Linknames keep mirrored tests out of source directories while preserving
@@ -33,11 +34,20 @@ func readmeComposeCommand(repoPath string) []string
 //go:linkname extractFindingsFromReport github.com/xuanli520/p2r_tui/internal/pipeline.extractFindingsFromReport
 func extractFindingsFromReport(stage, report, sourcePath string) []model.Finding
 
+//go:linkname staticReviewFindingsFromReport github.com/xuanli520/p2r_tui/internal/pipeline.staticReviewFindingsFromReport
+func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.Finding, error)
+
 //go:linkname acceptanceFindings github.com/xuanli520/p2r_tui/internal/pipeline.acceptanceFindings
 func acceptanceFindings(path string) []model.Finding
 
 //go:linkname acceptanceScriptArgs github.com/xuanli520/p2r_tui/internal/pipeline.acceptanceScriptArgs
 func acceptanceScriptArgs(outputs map[string]string, projectTypeArgs []string) []string
+
+//go:linkname validationScriptArgs github.com/xuanli520/p2r_tui/internal/pipeline.validationScriptArgs
+func validationScriptArgs(outputs map[string]string, projectTypeArgs []string) []string
+
+//go:linkname runArtifactRoot github.com/xuanli520/p2r_tui/internal/pipeline.runArtifactRoot
+func runArtifactRoot(scanPath string, project scanner.Project, runID string) string
 
 //go:linkname copyPackageSnapshot github.com/xuanli520/p2r_tui/internal/pipeline.copyPackageSnapshot
 func copyPackageSnapshot(source, dest string) error
@@ -292,13 +302,56 @@ func TestParseDockerPortFallback(t *testing.T) {
 }
 
 func TestExtractFindingsFromReport(t *testing.T) {
-	report := "# Verdict\n\n- Blocker: missing auth guard\n- High: run_tests does not hit API\nNo blocker in unrelated sentence\n"
+	report := `# Verdict
+
+- Blocker: missing auth guard
+- High: run_tests does not hit API
+
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "E",
+  "findings": [
+    {
+      "severity": "Blocker",
+      "title": "missing auth guard",
+      "rule": "Acceptance requires protected routes to enforce auth.",
+      "evidence": ["repo/server.js:42 lacks auth middleware", "repo/routes.js:12 is reachable without a guard"],
+      "impact": "Unauthorized users can reach protected behavior.",
+      "minimum_fix": "Add auth middleware and tests around protected routes."
+    },
+    {
+      "severity": "High",
+      "title": "run_tests does not hit API",
+      "rule": "Self tests must exercise the delivered API.",
+      "evidence": "repo/run_tests.sh:7 only checks process startup",
+      "impact": "Endpoint regressions can pass self-test.",
+      "minimum_fix": "Add API assertions to run_tests.sh."
+    }
+  ]
+}
+<!-- p2r:static-review-json:end -->
+`
 	findings := extractFindingsFromReport("E", report, "report.md")
 	if len(findings) != 2 {
 		t.Fatalf("expected 2 findings, got %d: %#v", len(findings), findings)
 	}
 	if findings[0].Severity != "Blocker" || findings[1].Severity != "High" {
 		t.Fatalf("unexpected severities: %#v", findings)
+	}
+	if findings[0].Rule == "" || findings[0].Evidence == "" || findings[0].MinimumFix == "" {
+		t.Fatalf("structured finding details were not preserved: %#v", findings[0])
+	}
+}
+
+func TestStaticReviewFindingsRequireContract(t *testing.T) {
+	report := "# Verdict\n\n- High: this old text format should not be parsed\n"
+	findings, err := staticReviewFindingsFromReport("E", report, "report.md")
+	if err == nil {
+		t.Fatalf("expected missing contract to fail, got findings %#v", findings)
+	}
+	if len(extractFindingsFromReport("E", report, "report.md")) != 0 {
+		t.Fatal("legacy keyword extraction should not produce findings")
 	}
 }
 
@@ -329,13 +382,47 @@ func TestAcceptanceFindingsMapRealScriptPayload(t *testing.T) {
 
 func TestAcceptanceScriptArgsMatchRealScriptContract(t *testing.T) {
 	outputs := map[string]string{
-		"acceptance": "acceptance.json",
-		"validation": "validation_report.md",
+		"acceptance":    "acceptance.json",
+		"acceptance_md": "acceptance_report.md",
 	}
 	got := acceptanceScriptArgs(outputs, []string{"--project-type", "fullstack"})
-	want := []string{"--output-json", "acceptance.json", "--output-md", "validation_report.md", "--project-type", "fullstack"}
+	want := []string{"--output-json", "acceptance.json", "--output-md", "acceptance_report.md", "--project-type", "fullstack"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestValidationScriptArgsOwnValidationReport(t *testing.T) {
+	outputs := map[string]string{
+		"validation_md": "validation_report.md",
+	}
+	got := validationScriptArgs(outputs, []string{"--project-type", "fullstack"})
+	want := []string{"--output-md", "validation_report.md"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestRunArtifactRootUsesTaskQAOutsideOriginalPackage(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	got := runArtifactRoot(root, scanner.Project{TaskID: "TASK-1", Path: projectPath}, "run-1")
+	want := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
+	if got != want {
+		t.Fatalf("artifact root = %q, want %q", got, want)
+	}
+	if strings.HasPrefix(got, projectPath+string(filepath.Separator)) {
+		t.Fatalf("artifact root should not be under original package: %s", got)
+	}
+}
+
+func TestRunArtifactRootFallsBackWhenTaskFolderIsOriginalPackage(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "TASK-1")
+	got := runArtifactRoot(root, scanner.Project{TaskID: "TASK-1", Path: projectPath}, "run-1")
+	want := filepath.Join(root, ".qa-control", "runs", "TASK-1", "qa", "runs", "run-1")
+	if got != want {
+		t.Fatalf("artifact root = %q, want %q", got, want)
 	}
 }
 

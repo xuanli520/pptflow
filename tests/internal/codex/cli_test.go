@@ -48,7 +48,7 @@ func TestBuildExecArgsUsesUserConfigByDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	if containsArg(args, "--ignore-user-config") {
-		t.Fatalf("user config should be enabled by default: %#v", args)
+		t.Fatalf("user config should remain available for Codex auth: %#v", args)
 	}
 }
 

@@ -1,12 +1,58 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
+
+const (
+	staticReviewSchemaVersion = "p2r.static_review.v1"
+	staticReviewJSONStart     = "<!-- p2r:static-review-json:start -->"
+	staticReviewJSONEnd       = "<!-- p2r:static-review-json:end -->"
+)
+
+type staticReviewReportSchema struct {
+	SchemaVersion string                      `json:"schema_version"`
+	Stage         string                      `json:"stage"`
+	Findings      []staticReviewFindingSchema `json:"findings"`
+}
+
+type staticReviewFindingSchema struct {
+	Severity     string     `json:"severity"`
+	Title        string     `json:"title"`
+	Rule         string     `json:"rule"`
+	Evidence     reviewText `json:"evidence"`
+	Impact       string     `json:"impact"`
+	DoneCriteria string     `json:"done_criteria,omitempty"`
+	MinimumFix   string     `json:"minimum_fix"`
+}
+
+type reviewText string
+
+func (v *reviewText) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err == nil {
+		*v = reviewText(strings.TrimSpace(value))
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal(data, &values); err != nil {
+		return fmt.Errorf("must be a string or string array")
+	}
+	var cleaned []string
+	for _, item := range values {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			cleaned = append(cleaned, item)
+		}
+	}
+	*v = reviewText(strings.Join(cleaned, "\n"))
+	return nil
+}
 
 func assignFindingIDs(stage string, findings []model.Finding) []model.Finding {
 	counts := map[string]int{}
@@ -55,48 +101,133 @@ func severityShort(severity string) string {
 }
 
 func extractFindingsFromReport(stage, report, sourcePath string) []model.Finding {
+	findings, err := staticReviewFindingsFromReport(stage, report, sourcePath)
+	if err != nil {
+		return nil
+	}
+	return findings
+}
+
+func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.Finding, error) {
+	payload, err := extractStaticReviewJSON(report)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		return nil, fmt.Errorf("invalid static review JSON: %w", err)
+	}
+	for _, key := range []string{"schema_version", "stage", "findings"} {
+		if _, ok := raw[key]; !ok {
+			return nil, fmt.Errorf("static review JSON missing required field %q", key)
+		}
+	}
+	var rawFindings []json.RawMessage
+	if err := json.Unmarshal(raw["findings"], &rawFindings); err != nil {
+		return nil, fmt.Errorf("static review JSON field findings must be an array: %w", err)
+	}
+	var schema staticReviewReportSchema
+	if err := json.Unmarshal([]byte(payload), &schema); err != nil {
+		return nil, fmt.Errorf("static review JSON does not match schema: %w", err)
+	}
+	if strings.TrimSpace(schema.SchemaVersion) != staticReviewSchemaVersion {
+		return nil, fmt.Errorf("static review JSON schema_version = %q, want %q", schema.SchemaVersion, staticReviewSchemaVersion)
+	}
+	if strings.ToUpper(strings.TrimSpace(schema.Stage)) != strings.ToUpper(strings.TrimSpace(stage)) {
+		return nil, fmt.Errorf("static review JSON stage = %q, want %q", schema.Stage, stage)
+	}
 	var findings []model.Finding
 	seen := map[string]bool{}
-	for index, line := range strings.Split(report, "\n") {
-		title := strings.TrimSpace(strings.TrimLeft(line, "#-*0123456789.> \t"))
+	for index, item := range schema.Findings {
+		severity, err := normalizeReviewSeverity(item.Severity)
+		if err != nil {
+			return nil, fmt.Errorf("finding %d: %w", index+1, err)
+		}
+		title := strings.TrimSpace(item.Title)
 		if title == "" {
-			continue
+			return nil, fmt.Errorf("finding %d: title is required", index+1)
 		}
-		lower := strings.ToLower(title)
-		if strings.Contains(lower, "no blocker") || strings.Contains(lower, "no high") || strings.Contains(lower, "no issue") {
-			continue
+		rule := strings.TrimSpace(item.Rule)
+		evidence := strings.TrimSpace(string(item.Evidence))
+		impact := strings.TrimSpace(item.Impact)
+		minimumFix := strings.TrimSpace(item.MinimumFix)
+		for field, value := range map[string]string{
+			"rule":        rule,
+			"evidence":    evidence,
+			"impact":      impact,
+			"minimum_fix": minimumFix,
+		} {
+			if value == "" {
+				return nil, fmt.Errorf("finding %d: %s is required", index+1, field)
+			}
 		}
-		severity := ""
-		switch {
-		case strings.Contains(lower, "blocker") || strings.Contains(lower, "critical"):
-			severity = "Blocker"
-		case strings.Contains(lower, "high"):
-			severity = "High"
-		case strings.Contains(lower, "medium"):
-			severity = "Medium"
-		case strings.Contains(lower, "low"):
-			severity = "Low"
-		}
-		if severity == "" {
-			continue
-		}
-		key := severity + title
+		key := strings.Join([]string{severity, title, rule, evidence}, "\x00")
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		findings = append(findings, model.Finding{
-			Stage:      stage,
-			Severity:   severity,
-			Title:      title,
-			Rule:       "Static review report finding",
-			Evidence:   fmt.Sprintf("%s:%d", sourcePath, index+1),
-			Impact:     "See the static review report for full context.",
-			MinimumFix: "Review the cited report item and repair the delivery package.",
-			SourcePath: sourcePath,
+			Stage:        stage,
+			Severity:     severity,
+			Title:        title,
+			Rule:         rule,
+			Evidence:     evidence,
+			Impact:       impact,
+			DoneCriteria: strings.TrimSpace(item.DoneCriteria),
+			MinimumFix:   minimumFix,
+			SourcePath:   sourcePath,
 		})
 	}
-	return findings
+	return findings, nil
+}
+
+func extractStaticReviewJSON(report string) (string, error) {
+	start := strings.Index(report, staticReviewJSONStart)
+	if start < 0 {
+		return "", fmt.Errorf("static review report missing %s marker", staticReviewJSONStart)
+	}
+	afterStart := start + len(staticReviewJSONStart)
+	endOffset := strings.Index(report[afterStart:], staticReviewJSONEnd)
+	if endOffset < 0 {
+		return "", fmt.Errorf("static review report missing %s marker", staticReviewJSONEnd)
+	}
+	end := afterStart + endOffset
+	if strings.Contains(report[end+len(staticReviewJSONEnd):], staticReviewJSONStart) {
+		return "", fmt.Errorf("static review report contains multiple JSON contract blocks")
+	}
+	payload := trimMarkdownFence(strings.TrimSpace(report[afterStart:end]))
+	if payload == "" {
+		return "", fmt.Errorf("static review JSON contract is empty")
+	}
+	return payload, nil
+}
+
+func trimMarkdownFence(value string) string {
+	lines := strings.Split(strings.TrimSpace(value), "\n")
+	if len(lines) < 3 {
+		return value
+	}
+	first := strings.TrimSpace(lines[0])
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if !strings.HasPrefix(first, "```") || !strings.HasPrefix(last, "```") {
+		return value
+	}
+	return strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n"))
+}
+
+func normalizeReviewSeverity(severity string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "blocker":
+		return "Blocker", nil
+	case "high":
+		return "High", nil
+	case "medium":
+		return "Medium", nil
+	case "low":
+		return "Low", nil
+	default:
+		return "", fmt.Errorf("severity must be one of Blocker, High, Medium, Low")
+	}
 }
 
 func countSeverity(findings []model.Finding, severity string) int {

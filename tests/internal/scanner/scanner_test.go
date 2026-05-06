@@ -60,3 +60,22 @@ func TestScanIndexesMissingPrompt(t *testing.T) {
 		t.Fatal("missing prompt should be recorded without blocking indexing")
 	}
 }
+
+func TestScanMissingRootReturnsError(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing")
+	result, err := scanner.Scan(root)
+	if err == nil {
+		t.Fatalf("expected missing root to fail, got result %#v", result)
+	}
+}
+
+func TestScanFileRootReturnsError(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-dir")
+	if err := os.WriteFile(root, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := scanner.Scan(root)
+	if err == nil {
+		t.Fatalf("expected file root to fail, got result %#v", result)
+	}
+}

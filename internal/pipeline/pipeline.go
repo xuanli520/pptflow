@@ -77,6 +77,56 @@ func SelfTestReportCandidates(projectPath string, cfg config.Config) []string {
 	return candidates
 }
 
+func runArtifactRoot(scanPath string, project scanner.Project, runID string) string {
+	taskDir := safeTaskArtifactDir(project.TaskID)
+	primary := filepath.Join(filepath.Clean(scanPath), taskDir, "qa", "runs", runID)
+	if pathWithin(primary, project.Path) {
+		return filepath.Join(filepath.Clean(scanPath), ".qa-control", "runs", taskDir, "qa", "runs", runID)
+	}
+	return primary
+}
+
+func safeTaskArtifactDir(taskID string) string {
+	var builder strings.Builder
+	for _, r := range strings.TrimSpace(taskID) {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			builder.WriteRune(r)
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '_' || r == '-' || r == '.':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	name := strings.Trim(builder.String(), "._-")
+	if name == "" {
+		return "TASK-UNKNOWN"
+	}
+	return name
+}
+
+func pathWithin(path, parent string) bool {
+	path = absClean(path)
+	parent = absClean(parent)
+	rel, err := filepath.Rel(parent, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func absClean(path string) string {
+	cleaned := filepath.Clean(path)
+	if abs, err := filepath.Abs(cleaned); err == nil {
+		return abs
+	}
+	return cleaned
+}
+
 func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project, opts RunOptions) (RunOptions, error) {
 	opts.Mode = strings.ToLower(strings.TrimSpace(opts.Mode))
 	if opts.Mode == "" {
@@ -128,7 +178,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	previousRuns, _ := r.store.ListRunsForTask(ctx, taskID)
 	start := time.Now().UTC()
 	runID := fmt.Sprintf("run-%s-%d", start.Format("20060102-150405"), start.UnixNano()%1000000)
-	artifactRoot := filepath.Join(project.Path, "qa", "runs", runID)
+	artifactRoot := runArtifactRoot(r.cfg.ScanPath, project, runID)
 	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
 		return Result{}, err
 	}
@@ -278,7 +328,7 @@ func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project s
 		return r.stageC(ctx, run, project)
 	case "D":
 		if opts.Mode == "recheck" {
-			return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "自测报告确认修复报告.md")
+			return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性_确认修复报告.md")
 		}
 		return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性.md")
 	case "E":
@@ -503,7 +553,7 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 			"writable_tmp":        r.cfg.Codex.WritableTmp,
 			"sandbox_mode":        "read-only",
 			"approval":            "never",
-			"home_reuse_strategy": "user HOME/CODEX_HOME preserved so Codex uses normal user config; stage scratch directories are removed and recreated before each stage",
+			"home_reuse_strategy": "user HOME/CODEX_HOME/XDG config paths are preserved so Codex can read the configured auth/API key; unrelated shell environment is not inherited",
 			"env_keys":            configuredEnvKeys(r.cfg.Codex.Env),
 			"extra_args":          r.cfg.Codex.ExtraArgs,
 			"docker_socket":       "not mounted",

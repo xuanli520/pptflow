@@ -19,6 +19,8 @@ import (
 const (
 	panelOverview = iota
 	panelExecution
+
+	staleRunRecoveryInterval = 30 * time.Second
 )
 
 type app struct {
@@ -50,8 +52,9 @@ type app struct {
 	running bool
 	qaMode  string
 
-	detailVM      executionViewModel
-	detailContent string
+	detailVM       executionViewModel
+	detailContent  string
+	lastRecoveryAt time.Time
 }
 
 type projectsMsg struct {
@@ -69,6 +72,10 @@ type detailMsg struct {
 type runMsg struct {
 	result pipeline.Result
 	err    error
+}
+
+type recoveryMsg struct {
+	err error
 }
 
 type tickMsg time.Time
@@ -93,22 +100,23 @@ func newApp(store *db.Store, cfg config.Config) app {
 	t.SetStyles(tableStyles())
 
 	m := app{
-		store:   store,
-		cfg:     cfg,
-		table:   t,
-		search:  search,
-		detail:  viewport.New(80, 10),
-		tab:     panelOverview,
-		focus:   focusSearch,
-		qaMode:  "initial",
-		message: "",
+		store:          store,
+		cfg:            cfg,
+		table:          t,
+		search:         search,
+		detail:         viewport.New(80, 10),
+		tab:            panelOverview,
+		focus:          focusSearch,
+		qaMode:         "initial",
+		message:        "",
+		lastRecoveryAt: time.Now(),
 	}
 	m.setFocus(focusSearch)
 	return m
 }
 
 func (m app) Init() tea.Cmd {
-	return tea.Batch(m.reload(), m.tick())
+	return tea.Batch(m.recoverStaleRuns(), m.reload(), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -150,7 +158,15 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.message = fmt.Sprintf("流水线完成 %s（%s）", value.result.Run.RunID, localizeRunStatus(value.result.Run.Status))
 		}
 		cmds = append(cmds, m.reload())
+	case recoveryMsg:
+		if value.err != nil {
+			m.message = value.err.Error()
+		}
 	case tickMsg:
+		if time.Since(m.lastRecoveryAt) >= staleRunRecoveryInterval {
+			m.lastRecoveryAt = time.Time(value)
+			cmds = append(cmds, m.recoverStaleRuns())
+		}
 		cmds = append(cmds, m.reload(), m.tick())
 	case tea.KeyMsg:
 		next, keyCmds := m.handleKey(value)
@@ -189,13 +205,21 @@ func (m app) reload() tea.Cmd {
 	}
 	return func() tea.Msg {
 		ctx := context.Background()
-		_ = pipeline.RecoverStaleRuns(ctx, m.store, m.cfg)
 		projects, err := m.store.ListProjects(ctx)
 		if err != nil {
 			return projectsMsg{err: err}
 		}
 		items := buildOverviewItems(ctx, m.store, m.cfg, projects)
 		return projectsMsg{projects: projects, items: items}
+	}
+}
+
+func (m app) recoverStaleRuns() tea.Cmd {
+	if m.store == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		return recoveryMsg{err: pipeline.RecoverStaleRuns(context.Background(), m.store, m.cfg)}
 	}
 }
 

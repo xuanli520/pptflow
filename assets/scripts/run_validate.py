@@ -12,6 +12,9 @@ Usage is identical to validate_package.py:
   python run_validate.py /path/to/TASK-001
   python run_validate.py TASK-001 --repair
   python run_validate.py TASK-001 --convert-legacy
+
+p2r adds one wrapper-only option:
+  --output-md PATH   Write a markdown report for the validation invocation
 """
 
 import hashlib
@@ -125,6 +128,52 @@ def sync_if_needed():
     print(f"[AutoUpdate] Updated: {LOCAL_FILE}")
 
 
+def split_wrapper_args(argv):
+    forwarded = []
+    output_md = None
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--output-md":
+            if index + 1 >= len(argv):
+                raise ValueError("--output-md requires a path")
+            output_md = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--output-md="):
+            output_md = arg.split("=", 1)[1]
+            index += 1
+            continue
+        forwarded.append(arg)
+        index += 1
+    return forwarded, output_md
+
+
+def write_markdown_report(output_md, command, result):
+    output_path = Path(output_md)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sections = [
+        "# Validation Report",
+        "",
+        f"- Command: `{' '.join(command)}`",
+        f"- Exit code: {result.returncode}",
+        "",
+        "## stdout",
+        "",
+        "```text",
+        result.stdout.rstrip(),
+        "```",
+        "",
+        "## stderr",
+        "",
+        "```text",
+        result.stderr.rstrip(),
+        "```",
+        "",
+    ]
+    output_path.write_text("\n".join(sections), encoding="utf-8")
+
+
 def main():
     try:
         sync_if_needed()
@@ -133,13 +182,27 @@ def main():
 
     print()
 
+    try:
+        forwarded_args, output_md = split_wrapper_args(sys.argv[1:])
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
     if not LOCAL_FILE.is_file():
         print(f"Error: {LOCAL_FILE} does not exist and could not be fetched from remote")
         return 1
 
-    result = subprocess.run(
-        [sys.executable, str(LOCAL_FILE)] + sys.argv[1:],
-    )
+    command = [sys.executable, str(LOCAL_FILE)] + forwarded_args
+    if output_md:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        write_markdown_report(output_md, command, result)
+        return result.returncode
+
+    result = subprocess.run(command)
     return result.returncode
 
 

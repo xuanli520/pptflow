@@ -5,11 +5,16 @@ pipeline:
   static_only: false
   stage_timeouts:
     A: 60
-  B: 120
-  C: 300
-  D: 300
-  E: 600
-  F: 300
+    B: 900
+    B_pull: 300
+    B_build: 600
+    B_up: 300
+    B_health: 60
+    B_port: 30
+    C: 300
+    D: 900
+    E: 1200
+    F: 900
 
 docker:
   managed_label: "managed_by=p2rqa"

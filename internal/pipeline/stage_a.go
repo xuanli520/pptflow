@@ -47,7 +47,8 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 	}
 
 	acceptancePath := filepath.Join(run.ArtifactRoot, "acceptance.json")
-	reportPath := filepath.Join(run.ArtifactRoot, "validation_report.md")
+	acceptanceReportPath := filepath.Join(run.ArtifactRoot, "acceptance_report.md")
+	validationReportPath := filepath.Join(run.ArtifactRoot, "validation_report.md")
 	requiredPath := filepath.Join(run.ArtifactRoot, "required_artifacts.json")
 	readmeAlignmentPath := filepath.Join(run.ArtifactRoot, "readme_alignment.json")
 	localDependencyPath := filepath.Join(run.ArtifactRoot, "local_dependency.json")
@@ -57,7 +58,8 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 
 	scriptResults := r.runStageAScripts(project, scriptRoot, logPath, map[string]string{
 		"acceptance":       acceptancePath,
-		"validation":       reportPath,
+		"acceptance_md":    acceptanceReportPath,
+		"validation_md":    validationReportPath,
 		"required":         requiredPath,
 		"readme_alignment": readmeAlignmentPath,
 		"local_dependency": localDependencyPath,
@@ -68,9 +70,6 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 
 	if !fileExists(acceptancePath) {
 		_ = writeJSON(acceptancePath, scriptResults["run_acceptance.py"])
-	}
-	if !fileExists(reportPath) {
-		_ = writeText(reportPath, validationMarkdown(project, required, findings))
 	}
 	if result, ok := scriptResults["run_acceptance.py"]; ok && !result.OK {
 		findings = append(findings, model.Finding{
@@ -84,9 +83,24 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 			SourcePath: acceptancePath,
 		})
 	}
+	if result, ok := scriptResults["run_validate.py"]; ok && !result.OK {
+		findings = append(findings, model.Finding{
+			Stage:      "A",
+			Severity:   "High",
+			Title:      "run_validate.py did not complete cleanly",
+			Rule:       "Stage A must collect validation_report.md from the bundled validation wrapper.",
+			Evidence:   result.summary(),
+			Impact:     "The validation markdown report may be incomplete or generated from fallback structural checks.",
+			MinimumFix: "Ensure Python/uv can run assets/scripts/run_validate.py and rerun Stage A.",
+			SourcePath: validationReportPath,
+		})
+	}
 	findings = append(findings, acceptanceFindings(acceptancePath)...)
+	if !fileExists(validationReportPath) {
+		_ = writeText(validationReportPath, validationMarkdown(project, required, findings))
+	}
 
-	artifactPaths := []string{acceptancePath, reportPath, requiredPath, readmeAlignmentPath, localDependencyPath}
+	artifactPaths := []string{acceptancePath, acceptanceReportPath, validationReportPath, requiredPath, readmeAlignmentPath, localDependencyPath}
 	for _, path := range []string{fakeImplPath, testsInspectionPath, englishOnlyPath} {
 		if fileExists(path) {
 			artifactPaths = append(artifactPaths, path)
@@ -137,6 +151,7 @@ func (r Runner) runStageAScripts(project scanner.Project, scriptRoot, logPath st
 	results := map[string]scriptExecution{}
 	projectTypeArgs := projectTypeArgs(scriptRoot)
 	results["run_acceptance.py"] = r.runStageAScript(project.Path, scriptRoot, "run_acceptance.py", acceptanceScriptArgs(outputs, projectTypeArgs))
+	results["run_validate.py"] = r.runStageAScript(project.Path, scriptRoot, "run_validate.py", validationScriptArgs(outputs, projectTypeArgs))
 
 	checks := []struct {
 		script string
@@ -158,6 +173,7 @@ func (r Runner) runStageAScripts(project scanner.Project, scriptRoot, logPath st
 	}
 	var log strings.Builder
 	log.WriteString(results["run_acceptance.py"].logBlock())
+	log.WriteString(results["run_validate.py"].logBlock())
 	for _, check := range checks {
 		result := r.runStageAScript(project.Path, scriptRoot, check.script, check.args)
 		results[check.script] = result
@@ -171,9 +187,15 @@ func (r Runner) runStageAScripts(project scanner.Project, scriptRoot, logPath st
 func acceptanceScriptArgs(outputs map[string]string, projectTypeArgs []string) []string {
 	args := []string{
 		"--output-json", outputs["acceptance"],
-		"--output-md", outputs["validation"],
+		"--output-md", outputs["acceptance_md"],
 	}
 	return append(args, projectTypeArgs...)
+}
+
+func validationScriptArgs(outputs map[string]string, _ []string) []string {
+	return []string{
+		"--output-md", outputs["validation_md"],
+	}
 }
 
 type scriptExecution struct {

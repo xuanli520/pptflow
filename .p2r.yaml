@@ -13,9 +13,9 @@ pipeline:
     B_health: 60
     B_port: 30
     C: 300
-    D: 300
-    E: 600
-    F: 60
+    D: 9000
+    E: 20000
+    F: 10000
 
 docker:
   managed_label: "managed_by=p2rqa"

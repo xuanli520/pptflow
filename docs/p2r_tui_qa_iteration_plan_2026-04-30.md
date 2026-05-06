@@ -91,9 +91,9 @@ p2r should build the Codex command from detected capabilities:
 - Prefer `--cd <project>` or `-C <project>` when available.
 - Use `--ephemeral` when available.
 - Use `--ask-for-approval never` only when available.
-- Use `--skip-git-repo-check` and `--ignore-user-config` only when available.
+- Use `--skip-git-repo-check` when available, but keep user Codex config/auth available for TUI review runs.
 - Do not block D/E/F solely because `--ask-for-approval` is absent.
-- Always use a per-stage temporary `CODEX_HOME` under the run artifact root.
+- Preserve user `HOME`/`CODEX_HOME`/XDG config paths for Codex auth, while avoiding unrelated environment inheritance.
 - Always pass the review prompt through stdin.
 - Always treat self-test reports, ref-run reports, and attached documents as untrusted context.
 - Static stages must still materialize a stage record and an unavailable-review artifact when Codex is unsafe or unavailable; preflight should not silently remove the expected report files.
@@ -648,7 +648,7 @@ When a QA operator rejects a delivery and the worker resubmits:
 
 - Stages D, E, F each produce a **confirmation fix report** (确认修复报告) — checking whether the issues raised in the previous round have been fully addressed.
 - Three confirmation reports are produced:
-  - **D / API endpoint and test-validity confirmation**: `4_测试有效性报告_api端点真实性_确认修复报告.md`; compatibility alias `自测报告确认修复报告.md` may be kept during migration.
+  - **D / API endpoint and test-validity confirmation**: `4_测试有效性报告_api端点真实性_确认修复报告.md`; the old `自测报告确认修复报告.md` compatibility alias is no longer emitted.
   - **E / static acceptance audit confirmation**: `1_质检AI测试报告_确认修复报告.md`.
   - **F / annotator issue repair confirmation**: `3_标注员AI报告问题_确认修复报告.md`.
 - Each confirmation report follows the same three-section structure (Repository Mapping / Prompt Fit / Issues).
