@@ -18,6 +18,7 @@ func TestSandboxEnvPreservesUserCodexHome(t *testing.T) {
 		"HOME=/home/user",
 		"USERPROFILE=/home/user",
 		"CODEX_HOME=/home/user/.codex",
+		"CODEX_API_KEY=secret",
 		"PATH=/usr/bin",
 		"P2R_SECRET=should-not-leak",
 	}, nil, filepath.Join(t.TempDir(), "node"))
@@ -25,6 +26,7 @@ func TestSandboxEnvPreservesUserCodexHome(t *testing.T) {
 	assertEnvValue(t, env, "HOME", "/home/user")
 	assertEnvValue(t, env, "USERPROFILE", "/home/user")
 	assertEnvValue(t, env, "CODEX_HOME", "/home/user/.codex")
+	assertEnvValue(t, env, "CODEX_API_KEY", "secret")
 	assertEnvMissing(t, env, "P2R_SECRET")
 }
 
