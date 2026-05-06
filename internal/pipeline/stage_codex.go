@@ -140,10 +140,10 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 			Stage:      stage,
 			Severity:   "High",
 			Title:      stageName(stage) + " audit input unavailable",
-			Rule:       "D/E audit documents must exist and stay within size limits.",
+			Rule:       "Static review inputs supplied for recheck or extra-doc workflows must be readable and stay within size limits.",
 			Evidence:   contextErr.Error(),
 			Impact:     "Static review evidence is incomplete.",
-			MinimumFix: "Provide the required self-test/ref-run/extra-docs inputs and rerun.",
+			MinimumFix: "Fix unavailable recheck or extra-doc inputs and rerun.",
 		}}
 		record.ErrorSummary = "audit input unavailable"
 		return finishStage(record, model.StageFailed, start)
@@ -316,13 +316,7 @@ func (r Runner) codexContext(project scanner.Project, opts RunOptions, stage str
 	if metadata, err := readBoundedText(filepath.Join(project.Path, "metadata.json"), 1<<20); err == nil {
 		builder.WriteString(untrustedDocument("metadata.json", filepath.Join(project.Path, "metadata.json"), metadata))
 	}
-	if stage == "D" {
-		selfTestPath, content, err := r.selfTestReportContext(project)
-		if err != nil {
-			return "", err
-		}
-		builder.WriteString(untrustedDocument("self-test report", selfTestPath, content))
-	} else if stage == "F" {
+	if stage == "F" {
 		selfTestPath, content, err := r.selfTestReportContext(project)
 		if err == nil {
 			builder.WriteString(untrustedDocument("self-test report", selfTestPath, content))

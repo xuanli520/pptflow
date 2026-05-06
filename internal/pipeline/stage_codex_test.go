@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
@@ -34,6 +35,33 @@ func TestCodexReviewPathFallsBackToProjectPath(t *testing.T) {
 	got := codexReviewPath(model.RunRecord{ArtifactRoot: artifactRoot}, projectPath)
 	if got != projectPath {
 		t.Fatalf("review path = %q, want project path %q", got, projectPath)
+	}
+}
+
+func TestStageDCodexContextDoesNotRequireSelfTestReport(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), []byte(`{"task_id":"TASK-1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := Runner{cfg: config.Default()}
+	contextText, err := runner.codexContext(
+		scanner.Project{TaskID: "TASK-1", Path: projectPath},
+		RunOptions{},
+		"D",
+	)
+	if err != nil {
+		t.Fatalf("D context should not require self-test report: %v", err)
+	}
+	if strings.Contains(contextText, "self-test report unavailable") {
+		t.Fatalf("D context should not mention missing self-test report: %s", contextText)
+	}
+	if !strings.Contains(contextText, "metadata.json") {
+		t.Fatalf("D context should still include available metadata: %s", contextText)
 	}
 }
 
