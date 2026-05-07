@@ -39,6 +39,12 @@ type TestStagePlan struct {
 	BlockedReason string
 }
 
+type TestOverviewColumn struct {
+	Key   string
+	Title string
+	Width int
+}
+
 func NewTestHarness(cfg config.Config) TestHarness {
 	m := newApp(nil, cfg)
 	m.width = 120
@@ -257,6 +263,32 @@ func OverviewColumnTitlesForTest(width int) []string {
 		titles = append(titles, column.Title)
 	}
 	return titles
+}
+
+func OverviewColumnsForTest(width int) []TestOverviewColumn {
+	specs := overviewColumnSpecs(width)
+	columns := make([]TestOverviewColumn, 0, len(specs))
+	for _, spec := range specs {
+		columns = append(columns, TestOverviewColumn{Key: spec.Key, Title: spec.Title, Width: spec.Width})
+	}
+	return columns
+}
+
+func OverviewRowForTest(lastRun string, width int) []string {
+	specs := overviewColumnSpecs(width)
+	row := overviewDisplayRow(overviewItem{
+		TaskID:        "TASK-1",
+		Batch:         "batch-1",
+		RunStatus:     model.RunCompletedClean,
+		ManualVerdict: model.ManualUnset,
+		LastRun:       lastRun,
+		Mode:          "initial",
+	}, specs)
+	return []string(row)
+}
+
+func ShortTimeForTest(value string) string {
+	return shortTime(value)
 }
 
 func ExecutionLayoutModeForTest(width, height int) string {

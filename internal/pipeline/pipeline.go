@@ -12,9 +12,11 @@ import (
 	"github.com/xuanli520/p2r_tui/assets"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	"github.com/xuanli520/p2r_tui/internal/displaytime"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/preflight"
+	"github.com/xuanli520/p2r_tui/internal/projectlayout"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
@@ -91,35 +93,14 @@ func SelfTestReportCandidates(projectPath string, cfg config.Config) []string {
 }
 
 func runArtifactRoot(scanPath string, project scanner.Project, runID string) string {
-	taskDir := safeTaskArtifactDir(project.TaskID)
-	primary := filepath.Join(filepath.Clean(scanPath), taskDir, "qa", "runs", runID)
+	batchDir := projectlayout.SafePathSegment(project.Batch, "unbatched")
+	taskDir := projectlayout.SafePathSegment(project.TaskID, "TASK-UNKNOWN")
+	runDir := projectlayout.SafePathSegment(runID, "run-unknown")
+	primary := filepath.Join(filepath.Clean(scanPath), "result", batchDir, taskDir, runDir)
 	if pathWithin(primary, project.Path) {
-		return filepath.Join(filepath.Clean(scanPath), ".qa-control", "runs", taskDir, "qa", "runs", runID)
+		return filepath.Join(filepath.Clean(scanPath), ".qa-control", "runs", batchDir, taskDir, runDir)
 	}
 	return primary
-}
-
-func safeTaskArtifactDir(taskID string) string {
-	var builder strings.Builder
-	for _, r := range strings.TrimSpace(taskID) {
-		switch {
-		case r >= 'A' && r <= 'Z':
-			builder.WriteRune(r)
-		case r >= 'a' && r <= 'z':
-			builder.WriteRune(r)
-		case r >= '0' && r <= '9':
-			builder.WriteRune(r)
-		case r == '_' || r == '-' || r == '.':
-			builder.WriteRune(r)
-		default:
-			builder.WriteByte('_')
-		}
-	}
-	name := strings.Trim(builder.String(), "._-")
-	if name == "" {
-		return "TASK-UNKNOWN"
-	}
-	return name
 }
 
 func pathWithin(path, parent string) bool {
@@ -209,7 +190,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	defer lock.Release()
 	previousRuns, _ := r.store.ListRunsForTask(ctx, taskID)
 	start := time.Now().UTC()
-	runID := fmt.Sprintf("run-%s-%d", start.Format("20060102-150405"), start.UnixNano()%1000000)
+	runID := displaytime.RunID(start)
 	artifactRoot := runArtifactRoot(r.cfg.ScanPath, project, runID)
 	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
 		progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
@@ -564,17 +545,22 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 
 func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, opts RunOptions, released []assets.ReleasedFile, releaseErr error, importedDocs []taskdocs.Document, docsManifest taskdocs.Manifest, docsErr string) error {
 	manifest := map[string]any{
-		"run_id":       run.RunID,
-		"task_id":      run.TaskID,
-		"started_at":   run.StartedAt,
-		"project_path": project.Path,
-		"static_only":  run.StaticOnly,
-		"stage":        opts.Stage,
-		"from":         opts.From,
-		"stages":       opts.Stages,
-		"qa_mode":      opts.Mode,
-		"ref_run":      opts.RefRun,
-		"extra_docs":   opts.ExtraDocs,
+		"run_id":           run.RunID,
+		"task_id":          run.TaskID,
+		"batch":            project.Batch,
+		"started_at":       run.StartedAt,
+		"started_at_utc":   run.StartedAt,
+		"started_at_local": displaytime.LocalRFC3339(run.StartedAt),
+		"timezone":         displaytime.Timezone,
+		"project_path":     project.Path,
+		"artifact_root":    run.ArtifactRoot,
+		"static_only":      run.StaticOnly,
+		"stage":            opts.Stage,
+		"from":             opts.From,
+		"stages":           opts.Stages,
+		"qa_mode":          opts.Mode,
+		"ref_run":          opts.RefRun,
+		"extra_docs":       opts.ExtraDocs,
 		"supplemental_docs": map[string]any{
 			"manifest":         taskdocs.ManifestPath(r.cfg.ScanPath, run.TaskID),
 			"managed_store":    taskdocs.StoreDir(r.cfg.ScanPath, run.TaskID),

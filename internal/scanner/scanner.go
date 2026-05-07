@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
+
+	"github.com/xuanli520/p2r_tui/internal/projectlayout"
 )
 
 type Project struct {
@@ -32,67 +33,76 @@ func Scan(root string) (Result, error) {
 	if !info.IsDir() {
 		return result, fmt.Errorf("scan root is not a directory: %s", result.Root)
 	}
-	err = filepath.WalkDir(result.Root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return fmt.Errorf("scan traversal failed at %s: %w", path, err)
-		}
-		if !d.IsDir() {
-			return nil
+	batches, err := os.ReadDir(result.Root)
+	if err != nil {
+		return result, fmt.Errorf("scan root unavailable: %w", err)
+	}
+	for _, batchEntry := range batches {
+		if !batchEntry.IsDir() || excludedTopLevel(batchEntry.Name()) || !projectlayout.IsBatchDir(batchEntry.Name()) {
+			continue
 		}
 		result.VisitedDirs++
-		if isProject(path) {
-			project := Project{
-				TaskID:                taskID(path),
-				Batch:                 batch(path, result.Root),
-				Path:                  filepath.Clean(path),
-				MetadataPromptMissing: promptMissing(filepath.Join(path, "metadata.json")),
-			}
-			result.Projects = append(result.Projects, project)
-			return filepath.SkipDir
+		batchName := batchEntry.Name()
+		batchPath := filepath.Join(result.Root, batchName)
+		tasks, err := os.ReadDir(batchPath)
+		if err != nil {
+			return result, fmt.Errorf("scan batch failed at %s: %w", batchPath, err)
 		}
-		return nil
-	})
+		for _, taskEntry := range tasks {
+			if !taskEntry.IsDir() || excludedComponent(taskEntry.Name()) {
+				continue
+			}
+			result.VisitedDirs++
+			if !projectlayout.IsTaskID(taskEntry.Name()) {
+				continue
+			}
+			taskID := taskEntry.Name()
+			projectPath := projectlayout.ExpectedProjectPath(result.Root, batchName, taskID)
+			if !isValidProject(projectPath) {
+				continue
+			}
+			result.Projects = append(result.Projects, Project{
+				TaskID:                taskID,
+				Batch:                 batchName,
+				Path:                  filepath.Clean(projectPath),
+				MetadataPromptMissing: promptMissing(filepath.Join(projectPath, "metadata.json")),
+			})
+		}
+	}
 	result.Skipped = result.VisitedDirs - len(result.Projects)
-	return result, err
+	return result, nil
 }
 
-func isProject(path string) bool {
-	for _, item := range []string{"docs", "repo", "original_sessions"} {
+func isValidProject(path string) bool {
+	for _, item := range []string{"docs", "repo"} {
 		info, err := os.Stat(filepath.Join(path, item))
 		if err != nil || !info.IsDir() {
 			return false
 		}
 	}
+	if ok, _ := projectlayout.HasOriginalSessionMarker(path); !ok {
+		return false
+	}
 	info, err := os.Stat(filepath.Join(path, "metadata.json"))
 	return err == nil && !info.IsDir()
 }
 
-func taskID(path string) string {
-	metadata := filepath.Join(path, "metadata.json")
-	content, err := os.ReadFile(metadata)
-	if err == nil {
-		var data map[string]any
-		if json.Unmarshal(content, &data) == nil {
-			for _, key := range []string{"task_id", "taskId", "id"} {
-				if value, ok := data[key].(string); ok && strings.TrimSpace(value) != "" {
-					return sanitizeID(value)
-				}
-			}
-		}
+func excludedTopLevel(name string) bool {
+	switch name {
+	case "result", ".qa-control", "task-docs":
+		return true
+	default:
+		return excludedComponent(name)
 	}
-	return sanitizeID(filepath.Base(path))
 }
 
-func batch(path, root string) string {
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == "." {
-		return filepath.Base(path)
+func excludedComponent(name string) bool {
+	switch name {
+	case "qa", "runs", "script_input_snapshot":
+		return true
+	default:
+		return false
 	}
-	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) > 1 {
-		return parts[0]
-	}
-	return filepath.Base(filepath.Dir(path))
 }
 
 func promptMissing(path string) bool {
@@ -106,16 +116,4 @@ func promptMissing(path string) bool {
 	}
 	value, ok := data["prompt"].(string)
 	return !ok || strings.TrimSpace(value) == ""
-}
-
-var invalidID = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
-
-func sanitizeID(value string) string {
-	value = strings.TrimSpace(value)
-	value = invalidID.ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-")
-	if value == "" {
-		return "TASK-UNKNOWN"
-	}
-	return value
 }

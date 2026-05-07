@@ -125,7 +125,7 @@ func overviewColumnSpecs(width int) []overviewColumnSpec {
 		{"docs", "文档", [4]int{6, 5, 4, 0}},
 		{"cleanup", "清理", [4]int{10, 8, 0, 0}},
 		{"batch", "批次", [4]int{12, 8, 0, 0}},
-		{"last_run", "最后运行", [4]int{16, 12, 0, 0}},
+		{"last_run", "最后运行", [4]int{16, 0, 0, 0}},
 		{"mode", "模式", [4]int{10, 0, 0, 0}},
 	}
 	specs := make([]overviewColumnSpec, 0, len(defs))

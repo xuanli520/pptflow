@@ -19,7 +19,8 @@ METADATA_PROJECT_TYPE_MAP = {
     "desktop": "pure_frontend",
 }
 ROOT_REQUIRED = ("metadata.json", "docs/design.md", "docs/questions.md")
-ROOT_REQUIRED_DIRS = ("repo", "original_sessions")
+ROOT_REQUIRED_DIRS = ("repo",)
+ORIGINAL_SESSION_MARKERS = ("original_sessions", "docs/original-session", "docs/original_sessions")
 REPO_REQUIRED = ("README.md", "unit_tests", "API_tests")
 RUN_TESTS_CANDIDATES = ("run_tests.sh", "run_tests.ps1", "run_tests.py")
 
@@ -91,6 +92,8 @@ def main() -> int:
     for rel_path in ROOT_REQUIRED_DIRS:
         if not (root / rel_path).is_dir():
             missing.append(rel_path + "/")
+    if not any((root / rel_path).is_dir() for rel_path in ORIGINAL_SESSION_MARKERS):
+        missing.append("original_sessions/|docs/original-session/|docs/original_sessions/")
 
     repo_root = root / "repo"
     for name in REPO_REQUIRED:

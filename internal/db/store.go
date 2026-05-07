@@ -37,6 +37,18 @@ type ProjectSummary struct {
 	High          int
 }
 
+type ArtifactPruneItem struct {
+	TaskID string
+	Batch  string
+	Path   string
+	Runs   int
+}
+
+type ArtifactPruneResult struct {
+	Removed []ArtifactPruneItem
+	Skipped []ArtifactPruneItem
+}
+
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -144,6 +156,50 @@ func (s *Store) UpsertProjects(ctx context.Context, projects []scanner.Project) 
 		}
 		return nil
 	})
+}
+
+func (s *Store) PruneArtifactProjects(ctx context.Context, scanRoot string) (ArtifactPruneResult, error) {
+	var result ArtifactPruneResult
+	scanRoot = filepath.Clean(scanRoot)
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT task_id, batch, path FROM projects ORDER BY task_id`)
+		if err != nil {
+			return err
+		}
+		var candidates []ArtifactPruneItem
+		for rows.Next() {
+			var item ArtifactPruneItem
+			if err := rows.Scan(&item.TaskID, &item.Batch, &item.Path); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if artifactProjectPath(scanRoot, item.Path) {
+				candidates = append(candidates, item)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, item := range candidates {
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE task_id = ?`, item.TaskID).Scan(&item.Runs); err != nil {
+				return err
+			}
+			if item.Runs > 0 {
+				result.Skipped = append(result.Skipped, item)
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE task_id = ?`, item.TaskID); err != nil {
+				return err
+			}
+			result.Removed = append(result.Removed, item)
+		}
+		return nil
+	})
+	return result, err
 }
 
 func (s *Store) GetProject(ctx context.Context, taskID string) (scanner.Project, error) {
@@ -398,4 +454,57 @@ func firstNonEmptyString(values ...string) string {
 
 func FormatNotFound(kind, id string) error {
 	return fmt.Errorf("%s not found: %s", kind, id)
+}
+
+func artifactProjectPath(scanRoot, projectPath string) bool {
+	rel, ok := relUnderRoot(scanRoot, projectPath)
+	if !ok || rel == "." {
+		return false
+	}
+	parts := splitPathParts(rel)
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case "result", ".qa-control":
+		return true
+	}
+	for index, part := range parts {
+		if part == "script_input_snapshot" {
+			return true
+		}
+		if part == "qa" && index+1 < len(parts) && parts[index+1] == "runs" {
+			return true
+		}
+	}
+	return false
+}
+
+func relUnderRoot(root, path string) (string, bool) {
+	root = absClean(root)
+	path = absClean(path)
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.Clean(rel), true
+}
+
+func splitPathParts(path string) []string {
+	path = filepath.Clean(path)
+	if path == "." {
+		return nil
+	}
+	return strings.Split(path, string(filepath.Separator))
+}
+
+func absClean(path string) string {
+	cleaned := filepath.Clean(path)
+	if abs, err := filepath.Abs(cleaned); err == nil {
+		return abs
+	}
+	return cleaned
 }

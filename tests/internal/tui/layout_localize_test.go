@@ -65,6 +65,57 @@ func TestOverviewColumnsHideModeBeforeCoreAtMediumWidth(t *testing.T) {
 	}
 }
 
+func TestOverviewColumnsHideLastRunWhenWidthInsufficient(t *testing.T) {
+	titles := titleSet(tuiapp.OverviewColumnTitlesForTest(100))
+	if titles["最后运行"] {
+		t.Fatalf("medium columns should hide last_run instead of truncating it: %#v", titles)
+	}
+}
+
+func TestOverviewMediumDoesNotShowTwelveColumnLastRun(t *testing.T) {
+	for _, column := range tuiapp.OverviewColumnsForTest(100) {
+		if column.Key == "last_run" && column.Width == 12 {
+			t.Fatalf("last_run should never be shown at 12 columns: %#v", column)
+		}
+	}
+}
+
+func TestOverviewLastRunColumnIsNeverTruncatedWhenVisible(t *testing.T) {
+	columns := tuiapp.OverviewColumnsForTest(120)
+	lastRunIndex := -1
+	lastRunWidth := 0
+	for index, column := range columns {
+		if column.Key == "last_run" {
+			lastRunIndex = index
+			lastRunWidth = column.Width
+		}
+	}
+	if lastRunIndex < 0 || lastRunWidth != 16 {
+		t.Fatalf("wide layout should show last_run at width 16: %#v", columns)
+	}
+	row := tuiapp.OverviewRowForTest("2026-05-07T05:36:18Z", 120)
+	value := row[lastRunIndex]
+	if strings.Contains(value, "…") {
+		t.Fatalf("last_run should not be truncated: %q", value)
+	}
+	if got := lipgloss.Width(value); got > lastRunWidth {
+		t.Fatalf("last_run width = %d, want <= %d for %q", got, lastRunWidth, value)
+	}
+}
+
+func TestShortTimeConvertsUTCToShanghai(t *testing.T) {
+	if got := tuiapp.ShortTimeForTest("2026-05-07T05:36:18Z"); got != "2026-05-07 13:36" {
+		t.Fatalf("shortTime = %q", got)
+	}
+}
+
+func TestShortTimeInvalidInputIsWidthSafe(t *testing.T) {
+	got := tuiapp.ShortTimeForTest("not-a-valid-rfc3339-value")
+	if lipgloss.Width(got) > 16 {
+		t.Fatalf("shortTime fallback width = %d for %q", lipgloss.Width(got), got)
+	}
+}
+
 func TestTruncateDisplayRespectsChineseWidth(t *testing.T) {
 	got := tuiapp.TruncateDisplayForTest("阶段 B - Docker运行时证据", 10)
 	if width := lipgloss.Width(got); width > 10 {

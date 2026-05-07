@@ -223,7 +223,7 @@ def main() -> int:
                 "blocking",
                 "3.2.1",
                 artifact_result.stdout or artifact_result.stderr,
-                "Add the missing package artifacts and keep docs/, repo/, original_sessions/, and metadata.json in the expected locations.",
+                "Add the missing package artifacts and keep docs/, repo/, metadata.json, and one original session marker in the expected locations.",
                 "Artifact checks pass and the package tree includes all required files and directories.",
             )
         )

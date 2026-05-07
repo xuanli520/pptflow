@@ -142,7 +142,7 @@ func TestRunReportsProgressWhenArtifactRootCannotBeCreated(t *testing.T) {
 	if err := os.MkdirAll(projectPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(scanPath, "TASK-1"), []byte("blocks artifact directory"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(scanPath, "result"), []byte("blocks artifact directory"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -487,11 +487,11 @@ func TestValidationScriptArgsOwnValidationReport(t *testing.T) {
 	}
 }
 
-func TestRunArtifactRootUsesTaskQAOutsideOriginalPackage(t *testing.T) {
+func TestRunArtifactRootUsesResultBatchTask(t *testing.T) {
 	root := t.TempDir()
-	projectPath := filepath.Join(root, "batch", "TASK-1")
-	got := runArtifactRoot(root, scanner.Project{TaskID: "TASK-1", Path: projectPath}, "run-1")
-	want := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
+	projectPath := filepath.Join(root, "batch-1", "TASK-1", "TASK-1")
+	got := runArtifactRoot(root, scanner.Project{TaskID: "TASK-1", Batch: "batch-1", Path: projectPath}, "run-1")
+	want := filepath.Join(root, "result", "batch-1", "TASK-1", "run-1")
 	if got != want {
 		t.Fatalf("artifact root = %q, want %q", got, want)
 	}
@@ -502,11 +502,34 @@ func TestRunArtifactRootUsesTaskQAOutsideOriginalPackage(t *testing.T) {
 
 func TestRunArtifactRootFallsBackWhenTaskFolderIsOriginalPackage(t *testing.T) {
 	root := t.TempDir()
-	projectPath := filepath.Join(root, "TASK-1")
-	got := runArtifactRoot(root, scanner.Project{TaskID: "TASK-1", Path: projectPath}, "run-1")
-	want := filepath.Join(root, ".qa-control", "runs", "TASK-1", "qa", "runs", "run-1")
+	projectPath := root
+	got := runArtifactRoot(root, scanner.Project{TaskID: "TASK-1", Batch: "batch-1", Path: projectPath}, "run-1")
+	want := filepath.Join(root, ".qa-control", "runs", "batch-1", "TASK-1", "run-1")
 	if got != want {
 		t.Fatalf("artifact root = %q, want %q", got, want)
+	}
+}
+
+func TestRunArtifactRootFallsBackToUnbatchedForLegacyProject(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "legacy", "TASK-1")
+	got := runArtifactRoot(root, scanner.Project{TaskID: "TASK-1", Path: projectPath}, "run-1")
+	want := filepath.Join(root, "result", "unbatched", "TASK-1", "run-1")
+	if got != want {
+		t.Fatalf("artifact root = %q, want %q", got, want)
+	}
+}
+
+func TestRunArtifactRootCleansUnsafeSegments(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch-1", "TASK-1", "TASK-1")
+	got := runArtifactRoot(root, scanner.Project{TaskID: "../TASK-1", Batch: "batch/1", Path: projectPath}, "../run-1")
+	want := filepath.Join(root, "result", "unbatched", "TASK-UNKNOWN", "run-unknown")
+	if got != want {
+		t.Fatalf("artifact root = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "..") {
+		t.Fatalf("artifact root contains parent traversal: %s", got)
 	}
 }
 
@@ -532,5 +555,46 @@ func TestCopyPackageSnapshotExcludesPriorQAArtifacts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "qa")); !os.IsNotExist(err) {
 		t.Fatalf("qa artifacts should be excluded, stat err: %v", err)
+	}
+}
+
+func TestCopyPackageSnapshotExcludesResultArtifacts(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"docs", "repo", "original_sessions", filepath.Join("result", "batch-1", "TASK-1", "run-1")} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte(`{"prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "result", "batch-1", "TASK-1", "run-1", "run_manifest.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "snapshot")
+	if err := copyPackageSnapshot(root, dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "result")); !os.IsNotExist(err) {
+		t.Fatalf("result artifacts should be excluded, stat err: %v", err)
+	}
+}
+
+func TestCopyPackageSnapshotExcludesTaskDocsControlDir(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"docs", "repo", "original_sessions", filepath.Join("task-docs", "TASK-1")} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte(`{"prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "snapshot")
+	if err := copyPackageSnapshot(root, dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "task-docs")); !os.IsNotExist(err) {
+		t.Fatalf("task-docs control dir should be excluded, stat err: %v", err)
 	}
 }

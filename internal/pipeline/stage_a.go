@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/projectlayout"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
@@ -27,11 +28,12 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 		scriptRoot = snapshotPath
 	}
 
+	hasOriginalMarker, _ := projectlayout.HasOriginalSessionMarker(project.Path)
 	required := map[string]bool{
-		"docs":              dirExists(filepath.Join(project.Path, "docs")),
-		"repo":              dirExists(filepath.Join(project.Path, "repo")),
-		"original_sessions": dirExists(filepath.Join(project.Path, "original_sessions")),
-		"metadata.json":     fileExists(filepath.Join(project.Path, "metadata.json")),
+		"docs":                    dirExists(filepath.Join(project.Path, "docs")),
+		"repo":                    dirExists(filepath.Join(project.Path, "repo")),
+		"original_session_marker": hasOriginalMarker,
+		"metadata.json":           fileExists(filepath.Join(project.Path, "metadata.json")),
 	}
 	findings := structuralFindings(project, required)
 	if snapshotErr != nil {
@@ -122,16 +124,35 @@ func structuralFindings(project scanner.Project, required map[string]bool) []mod
 	findings := []model.Finding{}
 	for name, ok := range required {
 		if !ok {
+			rule := "A package must contain docs/, repo/, an original session marker, and metadata.json."
+			evidence := filepath.Join(project.Path, name)
+			minimumFix := "Add the missing required artifact and rerun p2r scan/run."
+			if name == "original_session_marker" {
+				evidence = project.Path
+				minimumFix = "Add one of: " + strings.Join(projectlayout.OriginalSessionMarkers(), ", ") + "."
+			}
 			findings = append(findings, model.Finding{
 				Stage:      "A",
 				Severity:   "Blocker",
 				Title:      "Missing required delivery artifact: " + name,
-				Rule:       "A package must contain docs/, repo/, original_sessions/, and metadata.json.",
-				Evidence:   filepath.Join(project.Path, name),
+				Rule:       rule,
+				Evidence:   evidence,
 				Impact:     "The package cannot be validated as a prompt2repo delivery.",
-				MinimumFix: "Add the missing required artifact and rerun p2r scan/run.",
+				MinimumFix: minimumFix,
 			})
 		}
+	}
+	if metadataTaskID := projectlayout.MetadataTaskID(project.Path); metadataTaskID != "" && metadataTaskID != project.TaskID {
+		findings = append(findings, model.Finding{
+			Stage:      "A",
+			Severity:   "Blocker",
+			Title:      "metadata.json task_id does not match directory task ID",
+			Rule:       "The canonical task ID is the <batch>/<task-id>/<task-id> directory name; metadata.json.task_id must match it.",
+			Evidence:   fmt.Sprintf("directory task_id=%s metadata task_id=%s", project.TaskID, metadataTaskID),
+			Impact:     "Historical snapshots or copied metadata can otherwise pollute the QA index.",
+			MinimumFix: "Update metadata.json.task_id to match the directory task ID, or move the package under the intended TASK-* directory.",
+			SourcePath: filepath.Join(project.Path, "metadata.json"),
+		})
 	}
 	if project.MetadataPromptMissing {
 		findings = append(findings, model.Finding{

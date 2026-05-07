@@ -30,7 +30,7 @@ func TestVersionCommand(t *testing.T) {
 
 func TestStatusEmptyRunIsFriendly(t *testing.T) {
 	root := t.TempDir()
-	project := filepath.Join(root, "TASK-001")
+	project := filepath.Join(root, "batch-1", "TASK-001", "TASK-001")
 	for _, dir := range []string{"docs", "repo", "original_sessions"} {
 		if err := os.MkdirAll(filepath.Join(project, dir), 0o755); err != nil {
 			t.Fatal(err)

@@ -19,6 +19,8 @@ func copyPackageSnapshot(source, dest string) error {
 		".git":        true,
 		".qa-control": true,
 		"qa":          true,
+		"result":      true,
+		"task-docs":   true,
 	}
 	skipDirNames := map[string]bool{
 		".next":         true,

@@ -158,6 +158,121 @@ func TestCreateRunMakesRunningRunLatest(t *testing.T) {
 	}
 }
 
+func TestScanPruneArtifactsRemovesSnapshotProjectWithoutRuns(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	root := t.TempDir()
+	snapshotPath := filepath.Join(root, "result", "batch-1", "TASK-1", "run-1", "script_input_snapshot")
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-SNAPSHOT", Batch: "batch-1", Path: snapshotPath}}); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := store.PruneArtifactProjects(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned.Removed) != 1 || pruned.Removed[0].TaskID != "TASK-SNAPSHOT" {
+		t.Fatalf("unexpected prune result: %#v", pruned)
+	}
+	projects, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 0 {
+		t.Fatalf("artifact project should be removed: %#v", projects)
+	}
+}
+
+func TestScanPruneArtifactsSkipsProjectWithRuns(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	root := t.TempDir()
+	snapshotPath := filepath.Join(root, "TASK-OLD", "qa", "runs", "run-1", "script_input_snapshot")
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-SNAPSHOT", Batch: "batch-1", Path: snapshotPath}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{RunID: "run-1", TaskID: "TASK-SNAPSHOT", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := store.PruneArtifactProjects(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned.Removed) != 0 || len(pruned.Skipped) != 1 || pruned.Skipped[0].Runs != 1 {
+		t.Fatalf("unexpected prune result: %#v", pruned)
+	}
+	projects, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("project with runs should remain: %#v", projects)
+	}
+}
+
+func TestScanPruneArtifactsDoesNotRemoveNormalProject(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch-1", "TASK-1", "TASK-1")
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := store.PruneArtifactProjects(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned.Removed) != 0 || len(pruned.Skipped) != 0 {
+		t.Fatalf("normal project should not be pruned: %#v", pruned)
+	}
+	projects, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("normal project should remain: %#v", projects)
+	}
+}
+
+func TestScanPruneArtifactsRequiresPathUnderScanRoot(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	root := t.TempDir()
+	outsidePath := filepath.Join(t.TempDir(), "result", "batch-1", "TASK-1", "run-1", "script_input_snapshot")
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-OUTSIDE", Batch: "batch-1", Path: outsidePath}}); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := store.PruneArtifactProjects(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned.Removed) != 0 || len(pruned.Skipped) != 0 {
+		t.Fatalf("outside artifact-looking path should not be pruned: %#v", pruned)
+	}
+	projects, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("outside project should remain: %#v", projects)
+	}
+}
+
 func TestMigratesLegacyGlobalFindingPrimaryKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	handle, err := sql.Open("sqlite", path)

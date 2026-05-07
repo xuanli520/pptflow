@@ -14,6 +14,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	"github.com/xuanli520/p2r_tui/internal/displaytime"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
@@ -126,7 +127,7 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 		case "batch":
 			row = append(row, truncateDisplay(item.Batch, width))
 		case "last_run":
-			row = append(row, truncateDisplay(shortTime(item.LastRun), width))
+			row = append(row, shortTime(item.LastRun))
 		case "mode":
 			row = append(row, truncateDisplay(localizeMode(item.Mode), width))
 		}
@@ -649,10 +650,7 @@ func stageLetter(index int) string {
 }
 
 func shortTime(value string) string {
-	if len(value) > 19 {
-		return strings.ReplaceAll(value[:19], "T", " ")
-	}
-	return value
+	return displaytime.FormatMinute(value)
 }
 
 func fileExists(path string) bool {

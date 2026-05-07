@@ -2,6 +2,7 @@ package pipeline_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,7 +18,7 @@ import (
 
 func TestRunPersistsRunningStageAndStreamsCodexLog(t *testing.T) {
 	root := t.TempDir()
-	projectDir := filepath.Join(root, "batch-1", "task-hang")
+	projectDir := filepath.Join(root, "batch-1", "TASK-HANG", "TASK-HANG")
 	for _, dir := range []string{"docs", "repo", "original_sessions"} {
 		if err := os.MkdirAll(filepath.Join(projectDir, dir), 0o755); err != nil {
 			t.Fatal(err)
@@ -132,7 +133,7 @@ echo "v25.0.0"
 
 func TestRunCapturesCodexOutputLastMessageWhenStdoutIsEmpty(t *testing.T) {
 	root := t.TempDir()
-	projectDir := filepath.Join(root, "batch-1", "task-file-output")
+	projectDir := filepath.Join(root, "batch-1", "TASK-FILE", "TASK-FILE")
 	for _, dir := range []string{"docs", "repo", "original_sessions"} {
 		if err := os.MkdirAll(filepath.Join(projectDir, dir), 0o755); err != nil {
 			t.Fatal(err)
@@ -237,6 +238,30 @@ echo "v25.0.0"
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(result.Run.ArtifactRoot, filepath.Join("result", "batch-1", "TASK-FILE")) {
+		t.Fatalf("artifact root should use result/batch/task layout: %s", result.Run.ArtifactRoot)
+	}
+	manifestContent, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "run_manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(manifestContent, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"batch":          "batch-1",
+		"artifact_root":  result.Run.ArtifactRoot,
+		"started_at_utc": result.Run.StartedAt,
+		"timezone":       "Asia/Shanghai",
+	} {
+		if got, _ := manifest[key].(string); got != want {
+			t.Fatalf("manifest[%s] = %q, want %q", key, got, want)
+		}
+	}
+	if local, _ := manifest["started_at_local"].(string); !strings.Contains(local, "+08:00") {
+		t.Fatalf("manifest started_at_local should be Shanghai offset: %#v", manifest)
+	}
 	stageD := stageByName(result.Stages, "D")
 	if stageD.Status != model.StageDone {
 		t.Fatalf("stage D status = %s, want done; error=%s", stageD.Status, stageD.ErrorSummary)
@@ -263,7 +288,7 @@ echo "v25.0.0"
 
 func TestRunMarksStaticReviewUnavailableWhenReportSchemaInvalid(t *testing.T) {
 	root := t.TempDir()
-	projectDir := filepath.Join(root, "batch-1", "task-invalid-schema")
+	projectDir := filepath.Join(root, "batch-1", "TASK-SCHEMA", "TASK-SCHEMA")
 	for _, dir := range []string{"docs", "repo", "original_sessions"} {
 		if err := os.MkdirAll(filepath.Join(projectDir, dir), 0o755); err != nil {
 			t.Fatal(err)
