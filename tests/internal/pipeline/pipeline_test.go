@@ -1,6 +1,7 @@
 package pipeline_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	_ "unsafe"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
+	"github.com/xuanli520/p2r_tui/internal/config"
+	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
@@ -130,6 +133,47 @@ func TestSelectedStagesExplicitDependencyChain(t *testing.T) {
 	}
 	if selected["D"] || selected["E"] {
 		t.Fatalf("D/E should not be selected for A dependency rerun")
+	}
+}
+
+func TestRunReportsProgressWhenArtifactRootCannotBeCreated(t *testing.T) {
+	scanPath := t.TempDir()
+	projectPath := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scanPath, "TASK-1"), []byte("blocks artifact directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.ScanPath = scanPath
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var updates []pipelinepkg.RunProgress
+	_, err = pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-1", pipelinepkg.RunOptions{
+		Progress: func(update pipelinepkg.RunProgress) {
+			updates = append(updates, update)
+		},
+	})
+	if err == nil {
+		t.Fatal("expected artifact directory creation to fail")
+	}
+	if len(updates) == 0 {
+		t.Fatal("expected progress update for early run failure")
+	}
+	last := updates[len(updates)-1]
+	if last.Event != "run_crashed" || !last.Done || last.Err == nil || last.RunID == "" {
+		t.Fatalf("last progress = %#v, want run_crashed done with run id and error", last)
 	}
 }
 

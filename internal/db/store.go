@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,7 +19,8 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	writeMu sync.Mutex
 }
 
 type ProjectSummary struct {
@@ -37,12 +41,12 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	handle, err := sql.Open("sqlite", path)
+	handle, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, err
 	}
-	handle.SetMaxOpenConns(1)
-	handle.SetMaxIdleConns(1)
+	handle.SetMaxOpenConns(8)
+	handle.SetMaxIdleConns(3)
 	if err := configureSQLite(handle); err != nil {
 		_ = handle.Close()
 		return nil, err
@@ -53,6 +57,30 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+func sqliteDSN(path string) string {
+	if path == ":memory:" {
+		return path
+	}
+	if strings.HasPrefix(path, "file:") {
+		u, err := url.Parse(path)
+		if err != nil {
+			return path
+		}
+		return withSQLitePragmas(*u)
+	}
+	u := url.URL{Scheme: "file", Path: filepath.Clean(path)}
+	return withSQLitePragmas(u)
+}
+
+func withSQLitePragmas(u url.URL) string {
+	q := u.Query()
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func configureSQLite(handle *sql.DB) error {
@@ -79,22 +107,43 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return migrate(ctx, s.db)
 }
 
-func (s *Store) UpsertProjects(ctx context.Context, projects []scanner.Project) error {
+func (s *Store) withWriteTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	for _, project := range projects {
-		_, err := tx.ExecContext(ctx, `INSERT INTO projects(task_id, batch, path)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) UpsertProjects(ctx context.Context, projects []scanner.Project) error {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		for _, project := range projects {
+			_, err := tx.ExecContext(ctx, `INSERT INTO projects(task_id, batch, path)
 			VALUES(?, ?, ?)
 			ON CONFLICT(task_id) DO UPDATE SET batch=excluded.batch, path=excluded.path`,
-			project.TaskID, project.Batch, project.Path)
-		if err != nil {
-			return err
+				project.TaskID, project.Batch, project.Path)
+			if err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 func (s *Store) GetProject(ctx context.Context, taskID string) (scanner.Project, error) {
@@ -148,42 +197,36 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 	if run.StaticOnly {
 		staticOnly = 1
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, artifact_root, tool_versions, prompt_versions)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, artifact_root, tool_versions, prompt_versions)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		run.RunID, run.TaskID, run.StartedAt, run.Status, run.ManualVerdict, staticOnly, run.ArtifactRoot, run.ToolVersions, run.PromptVersions)
-	if err != nil {
-		return err
-	}
-	startedAt := firstNonEmptyString(run.StartedAt, time.Now().UTC().Format(time.RFC3339))
-	if _, err := tx.ExecContext(ctx, `UPDATE projects SET last_run_id = ?, last_run_at = ? WHERE task_id = ?`, run.RunID, startedAt, run.TaskID); err != nil {
-		return err
-	}
-	return tx.Commit()
+			run.RunID, run.TaskID, run.StartedAt, run.Status, run.ManualVerdict, staticOnly, run.ArtifactRoot, run.ToolVersions, run.PromptVersions)
+		if err != nil {
+			return err
+		}
+		startedAt := firstNonEmptyString(run.StartedAt, time.Now().UTC().Format(time.RFC3339))
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET last_run_id = ?, last_run_at = ? WHERE task_id = ?`, run.RunID, startedAt, run.TaskID); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, duration time.Duration) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `UPDATE runs SET finished_at = ?, status = ?, duration_ms = ? WHERE run_id = ?`,
-		now, status, duration.Milliseconds(), runID)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `UPDATE projects SET run_count = run_count + 1, last_run_id = ?, last_run_at = ? WHERE task_id = ?`,
-		runID, now, taskID)
-	if err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE runs SET finished_at = ?, status = ?, duration_ms = ? WHERE run_id = ?`,
+			now, status, duration.Milliseconds(), runID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE projects SET run_count = run_count + 1, last_run_id = ?, last_run_at = ? WHERE task_id = ?`,
+			runID, now, taskID)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) GetRun(ctx context.Context, runID string) (model.RunRecord, error) {
@@ -249,6 +292,8 @@ func (s *Store) PutStage(ctx context.Context, runID string, stage model.StageRec
 	if name == "" {
 		name = model.StageDisplayName(stage.Stage)
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.ExecContext(ctx, `INSERT INTO run_stages(run_id, stage, name, status, started_at, finished_at, duration_ms, blocked_by, log_path, artifact_json, error_summary)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_id, stage) DO UPDATE SET name=excluded.name, status=excluded.status, started_at=excluded.started_at, finished_at=excluded.finished_at, duration_ms=excluded.duration_ms, blocked_by=excluded.blocked_by, log_path=excluded.log_path, artifact_json=excluded.artifact_json, error_summary=excluded.error_summary`,
@@ -257,16 +302,18 @@ func (s *Store) PutStage(ctx context.Context, runID string, stage model.StageRec
 }
 
 func (s *Store) InsertFindings(ctx context.Context, runID string, findings []model.Finding) error {
-	for _, finding := range findings {
-		_, err := s.db.ExecContext(ctx, `INSERT INTO findings(id, run_id, stage, severity, title, rule, evidence, impact, done_criteria, minimum_fix, source_path)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		for _, finding := range findings {
+			_, err := tx.ExecContext(ctx, `INSERT INTO findings(id, run_id, stage, severity, title, rule, evidence, impact, done_criteria, minimum_fix, source_path)
 			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(run_id, id) DO UPDATE SET stage=excluded.stage, severity=excluded.severity, title=excluded.title, rule=excluded.rule, evidence=excluded.evidence, impact=excluded.impact, done_criteria=excluded.done_criteria, minimum_fix=excluded.minimum_fix, source_path=excluded.source_path`,
-			finding.ID, runID, finding.Stage, finding.Severity, finding.Title, finding.Rule, finding.Evidence, finding.Impact, finding.DoneCriteria, finding.MinimumFix, finding.SourcePath)
-		if err != nil {
-			return err
+				finding.ID, runID, finding.Stage, finding.Severity, finding.Title, finding.Rule, finding.Evidence, finding.Impact, finding.DoneCriteria, finding.MinimumFix, finding.SourcePath)
+			if err != nil {
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (s *Store) Stages(ctx context.Context, runID string) ([]model.StageRecord, error) {

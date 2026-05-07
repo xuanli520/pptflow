@@ -28,7 +28,20 @@ type RunOptions struct {
 	RefRun      string
 	ExtraDocs   []string
 	KeepRuntime bool
+	Progress    ProgressReporter
 }
+
+type RunProgress struct {
+	RunID       string
+	TaskID      string
+	Stage       string
+	Event       string
+	StageRecord model.StageRecord
+	Done        bool
+	Err         error
+}
+
+type ProgressReporter func(RunProgress)
 
 type Result struct {
 	Run    model.RunRecord
@@ -162,16 +175,28 @@ func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project
 }
 
 func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result Result, err error) {
+	progress := func(update RunProgress) {
+		if opts.Progress == nil {
+			return
+		}
+		if update.TaskID == "" {
+			update.TaskID = taskID
+		}
+		opts.Progress(update)
+	}
 	project, err := r.store.GetProject(ctx, taskID)
 	if err != nil {
+		progress(RunProgress{Event: "run_crashed", Done: true, Err: db.FormatNotFound("task", taskID)})
 		return Result{}, db.FormatNotFound("task", taskID)
 	}
 	opts, err = r.normalizeRunOptions(ctx, project, opts)
 	if err != nil {
+		progress(RunProgress{Event: "run_crashed", Done: true, Err: err})
 		return Result{}, err
 	}
 	lock, err := r.acquireTaskRunLock(taskID)
 	if err != nil {
+		progress(RunProgress{Event: "run_crashed", Done: true, Err: err})
 		return Result{}, err
 	}
 	defer lock.Release()
@@ -180,6 +205,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	runID := fmt.Sprintf("run-%s-%d", start.Format("20060102-150405"), start.UnixNano()%1000000)
 	artifactRoot := runArtifactRoot(r.cfg.ScanPath, project, runID)
 	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
+		progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
 		return Result{}, err
 	}
 	controlDir := filepath.Join(r.cfg.ScanPath, ".qa-control")
@@ -204,8 +230,10 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 		PromptVersions: string(toolVersions),
 	}
 	if err := r.store.CreateRun(ctx, run); err != nil {
+		progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
 		return Result{}, err
 	}
+	progress(RunProgress{RunID: runID, Event: "run_created"})
 	runCreated := true
 	runFinished := false
 	defer func() {
@@ -213,10 +241,12 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 			if runCreated && !runFinished {
 				r.markRunCrashed(context.Background(), run, start, fmt.Sprintf("panic: %v", recovered))
 			}
+			progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: fmt.Errorf("panic: %v", recovered)})
 			panic(recovered)
 		}
 		if err != nil && runCreated && !runFinished {
 			r.markRunCrashed(context.Background(), run, start, err.Error())
+			progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
 		}
 	}()
 	stages := initialStages(selectedStages(opts, staticOnly), staticOnly)
@@ -228,6 +258,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	}
 	for _, stage := range stages {
 		_ = r.store.PutStage(ctx, runID, stage)
+		progress(RunProgress{RunID: runID, Stage: stage.Stage, Event: "stage_pending", StageRecord: stage})
 	}
 	preflightResult := preflight.Run(ctx, r.exec, r.cfg)
 	preflightPath := filepath.Join(artifactRoot, "preflight.json")
@@ -248,6 +279,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 			results[stage] = record
 			_ = r.store.PutStage(ctx, runID, record)
 			_ = r.writeStageStatus(runID, artifactRoot, stages)
+			progress(RunProgress{RunID: runID, Stage: record.Stage, Event: "stage_done", StageRecord: record})
 			continue
 		}
 		running := runningStage(run, stage)
@@ -255,6 +287,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 		results[stage] = running
 		_ = r.store.PutStage(ctx, runID, running)
 		_ = r.writeStageStatus(runID, artifactRoot, stages)
+		progress(RunProgress{RunID: runID, Stage: stage, Event: "stage_running", StageRecord: running})
 		record := r.executeStage(ctx, run, project, stage, results, opts, preflightResult)
 		record.Findings = assignMissingFindingIDs(stage, record.Findings)
 		stages[index] = record
@@ -262,6 +295,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 		_ = r.store.PutStage(ctx, runID, record)
 		_ = r.store.InsertFindings(ctx, runID, record.Findings)
 		_ = r.writeStageStatus(runID, artifactRoot, stages)
+		progress(RunProgress{RunID: runID, Stage: record.Stage, Event: "stage_done", StageRecord: record})
 		if !runtimeCleanupDone && runtimeCleanupPoint(stage, stages) {
 			cleanupSummary := r.cleanupCurrentRuntime(ctx, run, keepRuntime)
 			mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
@@ -270,6 +304,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 				_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
 			}
 			runtimeCleanupDone = true
+			progress(RunProgress{RunID: runID, Event: "cleanup"})
 		}
 	}
 	if !runtimeCleanupDone && runtimeStageWasSelected(stages) {
@@ -279,6 +314,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 			cleanupFailed = true
 			_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
 		}
+		progress(RunProgress{RunID: runID, Event: "cleanup"})
 	}
 
 	status := runStatus(stages)
@@ -292,6 +328,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	run.Status = status
 	run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	run.DurationMS = time.Since(start).Milliseconds()
+	progress(RunProgress{RunID: runID, Event: "run_done", Done: true})
 	return Result{Run: run, Stages: stages}, nil
 }
 
@@ -352,9 +389,6 @@ func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 		}
 		return selected
 	}
-	if staticOnly {
-		return map[string]bool{"A": true, "D": true, "E": true, "F": true}
-	}
 	if opts.Stage != "" {
 		stage := strings.ToUpper(opts.Stage)
 		selected := map[string]bool{stage: true}
@@ -375,6 +409,9 @@ func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 			}
 		}
 		return selected
+	}
+	if staticOnly {
+		return map[string]bool{"A": true, "D": true, "E": true, "F": true}
 	}
 	return selected
 }

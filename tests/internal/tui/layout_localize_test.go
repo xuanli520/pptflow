@@ -97,7 +97,7 @@ func TestFooterChangesWithFocus(t *testing.T) {
 	if search == "" || search == detail {
 		t.Fatalf("footer should be focus-specific, search=%q detail=%q", search, detail)
 	}
-	if got := tuiapp.FooterForTest("search", true); got != "Enter/y 确认  Esc/n 取消" {
+	if got := tuiapp.FooterForTest("search", true); got != "Tab 切换  Space 选择  Enter 确认  Esc 取消" {
 		t.Fatalf("confirm footer = %q", got)
 	}
 }
@@ -130,6 +130,23 @@ func TestExecutionRenderDoesNotExceedViewportWidth(t *testing.T) {
 		if got := lipgloss.Height(view); got > size.height {
 			t.Fatalf("render height at %dx%d = %d, want <= %d\n%s", size.width, size.height, got, size.height, view)
 		}
+	}
+}
+
+func TestRunConfigDialogFitsNarrowShortViewport(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionDetail("TASK-1").
+		SetSize(70, 12)
+	h, _ = h.Press("ctrl+r")
+	view := h.View()
+	if got := lipgloss.Width(view); got > 70 {
+		t.Fatalf("run config width = %d, want <= 70\n%s", got, view)
+	}
+	if got := lipgloss.Height(view); got > 12 {
+		t.Fatalf("run config height = %d, want <= 12\n%s", got, view)
+	}
+	if !strings.Contains(view, "运行配置") {
+		t.Fatalf("run config dialog should remain visible:\n%s", view)
 	}
 }
 

@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -53,6 +55,69 @@ func TestFindingsAreScopedByRun(t *testing.T) {
 	}
 	if len(run2) != 1 || run2[0].Title != "second" {
 		t.Fatalf("unexpected run2 findings: %#v", run2)
+	}
+}
+
+func TestConcurrentWritesAreSerialized(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	projectPath := t.TempDir()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 3)
+	artifactRoots := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	for i := 0; i < 3; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runID := "run-concurrent-" + string(rune('A'+i))
+			run := model.RunRecord{
+				RunID:         runID,
+				TaskID:        "TASK-1",
+				StartedAt:     time.Now().UTC().Format(time.RFC3339),
+				Status:        model.RunRunning,
+				ManualVerdict: model.ManualUnset,
+				ArtifactRoot:  artifactRoots[i],
+			}
+			if err := store.CreateRun(ctx, run); err != nil {
+				errCh <- err
+				return
+			}
+			if err := store.PutStage(ctx, runID, model.StageRecord{Stage: "A", Status: model.StageDone}); err != nil {
+				errCh <- err
+				return
+			}
+			if err := store.InsertFindings(ctx, runID, []model.Finding{{ID: "F-1", Stage: "A", Severity: "High", Title: "finding"}}); err != nil {
+				errCh <- err
+				return
+			}
+			if err := store.FinishRun(ctx, runID, "TASK-1", model.RunCompletedWithFindings, time.Second); err != nil {
+				errCh <- err
+				return
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	runs, err := store.ListRunsForTask(ctx, "TASK-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 3 {
+		t.Fatalf("run count = %d, want 3", len(runs))
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
 
 const (
@@ -24,8 +25,9 @@ const (
 )
 
 type app struct {
-	store *db.Store
-	cfg   config.Config
+	store     *db.Store
+	cfg       config.Config
+	scheduler *scheduler.Scheduler
 
 	projects      []db.ProjectSummary
 	overviewItems []overviewItem
@@ -47,10 +49,10 @@ type app struct {
 	width  int
 	height int
 
-	confirm bool
-	message string
-	running bool
-	qaMode  string
+	message    string
+	qaMode     string
+	runConfig  runConfig
+	activeJobs []scheduler.JobSnapshot
 
 	detailVM       executionViewModel
 	detailContent  string
@@ -74,6 +76,17 @@ type runMsg struct {
 	err    error
 }
 
+type runSubmitMsg struct {
+	jobID string
+	err   error
+}
+
+type schedulerJobsMsg struct {
+	jobs []scheduler.JobSnapshot
+}
+
+type schedulerNotifyMsg struct{}
+
 type recoveryMsg struct {
 	err error
 }
@@ -81,7 +94,16 @@ type recoveryMsg struct {
 type tickMsg time.Time
 
 func Start(store *db.Store, cfg config.Config) error {
-	program := tea.NewProgram(newApp(store, cfg), tea.WithAltScreen())
+	m := newApp(store, cfg)
+	defer func() {
+		if m.scheduler == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = m.scheduler.Shutdown(ctx)
+	}()
+	program := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := program.Run()
 	return err
 }
@@ -111,12 +133,15 @@ func newApp(store *db.Store, cfg config.Config) app {
 		message:        "",
 		lastRecoveryAt: time.Now(),
 	}
+	if store != nil {
+		m.scheduler = scheduler.New(store, cfg)
+	}
 	m.setFocus(focusSearch)
 	return m
 }
 
 func (m app) Init() tea.Cmd {
-	return tea.Batch(m.recoverStaleRuns(), m.reload(), m.tick())
+	return tea.Batch(m.recoverStaleRuns(), m.reload(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -151,13 +176,25 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncRefSelection()
 		m.updateDetailContent(false)
 	case runMsg:
-		m.running = false
 		if value.err != nil {
 			m.message = value.err.Error()
 		} else {
 			m.message = fmt.Sprintf("流水线完成 %s（%s）", value.result.Run.RunID, localizeRunStatus(value.result.Run.Status))
 		}
 		cmds = append(cmds, m.reload())
+	case runSubmitMsg:
+		if value.err != nil {
+			m.message = value.err.Error()
+		} else {
+			m.message = fmt.Sprintf("已提交 job %s", value.jobID)
+			m.runConfig = runConfig{}
+		}
+		cmds = append(cmds, m.reloadSchedulerJobs())
+	case schedulerJobsMsg:
+		m.activeJobs = value.jobs
+		m.applyLayout()
+	case schedulerNotifyMsg:
+		cmds = append(cmds, m.reloadSchedulerJobs(), m.reload(), m.reloadDetail(), m.waitSchedulerNotify())
 	case recoveryMsg:
 		if value.err != nil {
 			m.message = value.err.Error()
@@ -167,7 +204,7 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastRecoveryAt = time.Time(value)
 			cmds = append(cmds, m.recoverStaleRuns())
 		}
-		cmds = append(cmds, m.reload(), m.tick())
+		cmds = append(cmds, m.reload(), m.reloadSchedulerJobs(), m.tick())
 	case tea.KeyMsg:
 		next, keyCmds := m.handleKey(value)
 		m = next
@@ -185,11 +222,11 @@ func (m app) View() string {
 		builder.WriteString(messageStyle(m.message).Render(m.message))
 		builder.WriteString("\n")
 	}
-	if m.confirm {
-		builder.WriteString(renderConfirm(m))
-		builder.WriteString("\n")
-	}
-	if m.tab == panelOverview {
+	builder.WriteString(renderPipelineBar(m))
+	builder.WriteString("\n")
+	if m.runConfig.active {
+		builder.WriteString(renderRunConfig(m))
+	} else if m.tab == panelOverview {
 		builder.WriteString(renderOverview(m))
 	} else {
 		builder.WriteString(renderExecution(m))
@@ -244,24 +281,50 @@ func (m app) tick() tea.Cmd {
 	})
 }
 
-func (m app) runSelected() tea.Cmd {
-	taskID := m.selectedTaskID()
-	refRun := m.selectedRefRun()
-	mode := m.qaMode
-	plan := m.rerunStagePlan()
+func (m app) submitRun(taskID string, opts pipeline.RunOptions) tea.Cmd {
 	return func() tea.Msg {
-		runner := pipeline.NewRunner(m.store, m.cfg)
-		result, err := runner.Run(context.Background(), taskID, pipeline.RunOptions{
-			Stages: plan.runStages,
-			Mode:   mode,
-			RefRun: refRun,
-		})
-		return runMsg{result: result, err: err}
+		if m.scheduler == nil {
+			return runSubmitMsg{err: fmt.Errorf("scheduler unavailable")}
+		}
+		jobID, err := m.scheduler.Submit(taskID, opts)
+		return runSubmitMsg{jobID: jobID, err: err}
+	}
+}
+
+func (m app) reloadSchedulerJobs() tea.Cmd {
+	if m.scheduler == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		return schedulerJobsMsg{jobs: m.scheduler.Snapshot()}
+	}
+}
+
+func (m app) waitSchedulerNotify() tea.Cmd {
+	if m.scheduler == nil || m.scheduler.NotifyCh() == nil {
+		return nil
+	}
+	ch := m.scheduler.NotifyCh()
+	return func() tea.Msg {
+		<-ch
+		return schedulerNotifyMsg{}
+	}
+}
+
+func (m app) shutdownScheduler() tea.Cmd {
+	if m.scheduler == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = m.scheduler.Shutdown(ctx)
+		return nil
 	}
 }
 
 func (m *app) applyLayout() {
-	layout := layoutFor(m.width, m.height, m.tab == panelExecution)
+	layout := layoutFor(m.width, max(8, m.height-pipelineBarHeight(*m)), m.tab == panelExecution)
 	m.search.Width = max(12, layout.contentWidth-8)
 	m.table.SetWidth(layout.contentWidth)
 	m.table.SetHeight(layout.overviewTableHeight)
@@ -347,11 +410,19 @@ func (m app) selectedRefRun() string {
 	if m.qaMode != "recheck" {
 		return ""
 	}
-	if m.selectedRefRunID != "" {
-		return m.selectedRefRunID
-	}
+	return m.selectedRefRunCandidate()
+}
+
+func (m app) selectedRefRunCandidate() string {
 	if len(m.detailVM.RefRuns) == 0 {
 		return ""
+	}
+	if m.selectedRefRunID != "" {
+		for _, run := range m.detailVM.RefRuns {
+			if run.RunID == m.selectedRefRunID {
+				return m.selectedRefRunID
+			}
+		}
 	}
 	index := clamp(m.refIndex, 0, len(m.detailVM.RefRuns)-1)
 	return m.detailVM.RefRuns[index].RunID

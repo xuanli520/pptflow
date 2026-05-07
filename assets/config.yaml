@@ -3,6 +3,7 @@ db_path: "./projects-qa/.qa-control/index.db"
 
 pipeline:
   static_only: false
+  max_concurrent: 3
   stage_timeouts:
     A: 60
     B: 900

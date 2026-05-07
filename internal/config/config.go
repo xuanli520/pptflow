@@ -29,6 +29,7 @@ type PipelineConfig struct {
 	StaticOnly         bool
 	StageTimeouts      map[string]int
 	SelfTestReportPath string
+	MaxConcurrent      int
 }
 
 type DockerConfig struct {
@@ -89,6 +90,7 @@ func Default() Config {
 		Pipeline: PipelineConfig{
 			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 900, "E": 1200, "F": 900},
 			SelfTestReportPath: "repo/self_test_report.md",
+			MaxConcurrent:      3,
 		},
 		Docker: DockerConfig{
 			ManagedLabel:                "managed_by=p2rqa",
@@ -170,6 +172,7 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 	cfg.ScanPath = absFrom(bases.ScanPath, cfg.ScanPath)
 	cfg.DBPath = absFrom(bases.DBPath, cfg.DBPath)
 	cfg.Codex.PromptProfilesDir = absFrom(bases.PromptProfilesDir, cfg.Codex.PromptProfilesDir)
+	normalize(&cfg)
 	return cfg, nil
 }
 
@@ -275,6 +278,8 @@ func applyFile(cfg *Config, path string) (fileSettings, error) {
 			cfg.Pipeline.StageTimeouts[normalized] = parseInt(value, cfg.Pipeline.StageTimeouts[normalized])
 		case section == "pipeline" && key == "self_test_report_path":
 			cfg.Pipeline.SelfTestReportPath = value
+		case section == "pipeline" && key == "max_concurrent":
+			cfg.Pipeline.MaxConcurrent = parseInt(value, cfg.Pipeline.MaxConcurrent)
 		case section == "docker" && key == "managed_label":
 			cfg.Docker.ManagedLabel = value
 		case section == "docker" && key == "compose_project_prefix":
@@ -331,6 +336,15 @@ func applyFile(cfg *Config, path string) (fileSettings, error) {
 		return settings, fmt.Errorf("read config: %w", err)
 	}
 	return settings, nil
+}
+
+func normalize(cfg *Config) {
+	if cfg.Pipeline.MaxConcurrent <= 0 {
+		cfg.Pipeline.MaxConcurrent = 3
+	}
+	if cfg.Pipeline.MaxConcurrent > 8 {
+		cfg.Pipeline.MaxConcurrent = 8
+	}
 }
 
 func stripComment(line string) string {

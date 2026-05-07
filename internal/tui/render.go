@@ -50,7 +50,7 @@ func renderExecution(m app) string {
 	if taskID == "" {
 		return mutedStyle.Render("未选择已索引的项目\n请先执行 `p2r scan --path <projects-qa>`")
 	}
-	layout := layoutFor(m.width, m.height, true)
+	layout := layoutFor(m.width, max(8, m.height-pipelineBarHeight(m)), true)
 	if layout.mode == layoutWide || layout.mode == layoutMedium {
 		leftContentHeight := max(1, layout.contentHeight-panelStyle.GetVerticalFrameSize())
 		left := renderPanel(layout.leftWidth, layout.contentHeight, renderExecutionLeft(m, max(8, layout.leftWidth-panelStyle.GetHorizontalFrameSize()), leftContentHeight))
@@ -298,6 +298,131 @@ func renderConfirm(m app) string {
 		lines = append(lines[:2], lines[3:]...)
 	}
 	return errorStyle.Render(strings.Join(lines, "\n"))
+}
+
+func renderRunConfig(m app) string {
+	c := m.runConfig
+	plan := m.rerunStagePlan()
+	width := clamp(m.width-4, 48, 88)
+	if width <= 0 {
+		width = 72
+	}
+	var lines []string
+	focusIndex := 1
+	lines = append(lines, titleStyle.Render("运行配置: "+truncateMiddleDisplay(c.taskID, max(12, width-16))))
+	lines = append(lines, focusLine(c.focus == runConfigFocusMode, "模式: "+localizeMode(c.mode)))
+	if c.mode == "recheck" {
+		lines = append(lines, "  参考运行: "+empty(c.refRun, "-"))
+	}
+	lines = append(lines, "")
+	stageHeaderIndex := len(lines)
+	lines = append(lines, focusLine(c.focus == runConfigFocusStages, "阶段:"))
+	for i, stage := range []string{"A", "B", "C", "D", "E", "F"} {
+		checked := runConfigStageChecked(c, stage, plan)
+		mark := "[ ]"
+		if checked {
+			mark = "[✓]"
+		}
+		text := fmt.Sprintf("  %s %s - %s", mark, stage, localizeStageName(stage, ""))
+		if stage == "F" {
+			text += " (始终选中)"
+		}
+		if c.focus == runConfigFocusStages && c.stageIndex == i {
+			focusIndex = len(lines)
+			text = selectedStyle.Render(truncateDisplay("> "+text, width-4))
+		}
+		lines = append(lines, text)
+	}
+	if c.focus == runConfigFocusStages && focusIndex == 1 {
+		focusIndex = stageHeaderIndex
+	}
+	if c.fromStage != "" {
+		lines = append(lines, mutedStyle.Render("使用起始阶段时不能多选阶段"))
+	}
+	if len(c.stages) > 0 {
+		lines = append(lines, mutedStyle.Render("多选阶段时不能使用起始阶段"))
+	}
+	if c.focus == runConfigFocusFrom {
+		focusIndex = len(lines)
+	}
+	lines = append(lines, focusLine(c.focus == runConfigFocusFrom, "起始阶段: "+empty(c.fromStage, "未设置")))
+	if c.focus == runConfigFocusKeepRuntime {
+		focusIndex = len(lines)
+	}
+	lines = append(lines, focusLine(c.focus == runConfigFocusKeepRuntime, "保留运行时: "+yesNo(c.keepRuntime)))
+	lines = append(lines, fmt.Sprintf("  补充文档: 已托管附件 %d 个", c.attachedCount))
+	input := c.input.View()
+	if c.focus == runConfigFocusExtraDocs {
+		focusIndex = len(lines)
+		input = selectedStyle.Render(truncateDisplay(input, width-4))
+	}
+	lines = append(lines, input)
+	if c.err != "" {
+		lines = append(lines, errorStyle.Render(truncateDisplay(c.err, width-4)))
+	}
+	if plan.blockedReason != "" && c.err == "" {
+		lines = append(lines, errorStyle.Render(truncateDisplay(plan.blockedReason, width-4)))
+	}
+	stageText := strings.Join(plan.displayStages, ", ")
+	if stageText == "" {
+		stageText = "-"
+	}
+	lines = append(lines, mutedStyle.Render("将运行阶段: "+stageText))
+	lines = append(lines, "")
+	if c.focus == runConfigFocusSubmit {
+		focusIndex = len(lines)
+	}
+	submit := focusLine(c.focus == runConfigFocusSubmit, "[Enter] 确认")
+	if c.focus == runConfigFocusCancel {
+		focusIndex = len(lines)
+	}
+	cancel := focusLine(c.focus == runConfigFocusCancel, "[Esc] 取消")
+	lines = append(lines, submit+"  "+cancel+"  "+mutedStyle.Render("[Tab] 切换"))
+
+	panelHeight := len(lines) + panelStyle.GetVerticalFrameSize()
+	if m.height > 0 {
+		reserved := 4
+		if m.message != "" {
+			reserved++
+		}
+		panelHeight = min(panelHeight, max(3, m.height-reserved))
+	}
+	contentHeight := max(1, panelHeight-panelStyle.GetVerticalFrameSize())
+	lines = visibleRunConfigLines(lines, focusIndex, contentHeight)
+	return renderPanel(width, panelHeight, strings.Join(lines, "\n"))
+}
+
+func visibleRunConfigLines(lines []string, focusIndex int, maxLines int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	if len(lines) <= maxLines {
+		return append([]string{}, lines...)
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	body := visibleWindowLines(lines[1:], max(0, focusIndex-1), max(1, maxLines-1))
+	return append([]string{lines[0]}, body...)
+}
+
+func focusLine(focused bool, line string) string {
+	if focused {
+		return selectedStyle.Render("> " + line)
+	}
+	return "  " + line
+}
+
+func runConfigStageChecked(c runConfig, stage string, plan stagePlan) bool {
+	if len(c.stages) > 0 {
+		return c.stages[stage] || stage == "F"
+	}
+	for _, selected := range plan.displayStages {
+		if selected == stage {
+			return true
+		}
+	}
+	return false
 }
 
 func messageStyle(message string) lipgloss.Style {

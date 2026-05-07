@@ -1,6 +1,8 @@
 package tui_test
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -50,6 +52,29 @@ func TestStagePlanBlocksRuntimeStagesInStaticOnlyRecheck(t *testing.T) {
 	}
 }
 
+func TestStagePlanFromAndExplicitStagesAreMutuallyExclusive(t *testing.T) {
+	plan := tuiapp.StagePlanWithOptionsForTest("initial", "A", false, []string{"D"}, "C")
+	if !strings.Contains(plan.BlockedReason, "不能同时使用") {
+		t.Fatalf("expected mutual exclusion error, got %#v", plan)
+	}
+}
+
+func TestStagePlanFromStageRunsThroughF(t *testing.T) {
+	plan := tuiapp.StagePlanWithOptionsForTest("initial", "A", false, nil, "C")
+	want := []string{"C", "D", "E", "F"}
+	if !slices.Equal(plan.DisplayStages, want) || plan.RunStages != nil {
+		t.Fatalf("plan = run %#v display %#v, want display %v and nil run stages", plan.RunStages, plan.DisplayStages, want)
+	}
+}
+
+func TestStagePlanExplicitStagesAppendF(t *testing.T) {
+	plan := tuiapp.StagePlanWithOptionsForTest("initial", "A", false, []string{"D"}, "")
+	want := []string{"D", "F"}
+	if !slices.Equal(plan.RunStages, want) || !slices.Equal(plan.DisplayStages, want) {
+		t.Fatalf("plan = run %#v display %#v, want %v", plan.RunStages, plan.DisplayStages, want)
+	}
+}
+
 func TestRenderConfirmUsesInitialStagePlan(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedOverview("TASK-1").
@@ -64,6 +89,57 @@ func TestRenderConfirmUsesInitialStagePlan(t *testing.T) {
 	}
 	if strings.Contains(view, "阶段: A, F") {
 		t.Fatalf("confirm appears to use affectedStages for initial mode:\n%s", view)
+	}
+}
+
+func TestRunConfigModeTogglePreservesFromStageWithoutConflict(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverview("TASK-1").
+		SetExecutionPanel().
+		SetFocus("stage-list")
+
+	h, _ = h.Press("ctrl+r")
+	h, _ = h.Press("tab")
+	h, _ = h.Press("tab")
+	h, _ = h.Press(" ")
+	h, _ = h.Press("shift+tab")
+	h, _ = h.Press("shift+tab")
+	h, _ = h.Press(" ")
+
+	view := h.View()
+	if strings.Contains(view, "起始阶段和阶段多选不能同时使用") {
+		t.Fatalf("mode toggle should not create a stage-source conflict:\n%s", view)
+	}
+	if !strings.Contains(view, "起始阶段: A") {
+		t.Fatalf("from stage should be preserved after mode toggle:\n%s", view)
+	}
+}
+
+func TestRunConfigAttachedDocCountUsesManagedManifest(t *testing.T) {
+	root := t.TempDir()
+	docPath := filepath.Join(root, "extra.md")
+	if err := os.WriteFile(docPath, []byte("extra context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ScanPath = root
+	h := tuiapp.NewTestHarness(cfg).
+		SeedOverview("TASK-1").
+		SetExecutionPanel().
+		SetFocus("stage-list")
+
+	h, _ = h.Press("ctrl+r")
+	for i := 0; i < 4; i++ {
+		h, _ = h.Press("tab")
+	}
+	h, _ = h.Press(docPath)
+	h, _ = h.Press("enter")
+	h, _ = h.Press(docPath)
+	h, _ = h.Press("enter")
+
+	view := h.View()
+	if !strings.Contains(view, "补充文档: 已托管附件 1 个") {
+		t.Fatalf("attached count should come from managed manifest, got:\n%s", view)
 	}
 }
 

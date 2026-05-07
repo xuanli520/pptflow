@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
 
 func localizeRunStatus(status string) string {
@@ -147,6 +148,21 @@ func localizeMode(mode string) string {
 		return "首次质检"
 	default:
 		return mode
+	}
+}
+
+func localizeJobState(state scheduler.JobState) string {
+	switch state {
+	case scheduler.JobQueued:
+		return "排队中"
+	case scheduler.JobRunning:
+		return "运行中"
+	case scheduler.JobDone:
+		return "已完成"
+	case scheduler.JobFailed:
+		return "失败"
+	default:
+		return "未知"
 	}
 }
 

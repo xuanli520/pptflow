@@ -40,6 +40,9 @@ docs:
 	if cfg.Pipeline.StageTimeouts["B"] != 9 {
 		t.Fatalf("expected B timeout 9, got %d", cfg.Pipeline.StageTimeouts["B"])
 	}
+	if cfg.Pipeline.MaxConcurrent != 3 {
+		t.Fatalf("expected default max concurrent 3, got %d", cfg.Pipeline.MaxConcurrent)
+	}
 	if cfg.TUI.RefreshIntervalMS != 250 {
 		t.Fatalf("expected TUI refresh 250, got %d", cfg.TUI.RefreshIntervalMS)
 	}
@@ -48,6 +51,33 @@ docs:
 	}
 	if cfg.Docs.InlineTextLimitBytes != 2048 {
 		t.Fatalf("docs inline limit not parsed: %#v", cfg.Docs)
+	}
+}
+
+func TestLoadParsesAndNormalizesMaxConcurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"file value", "5", 5},
+		{"zero fallback", "0", 3},
+		{"cap large", "99", 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			content := []byte("pipeline:\n  max_concurrent: " + tc.raw + "\n")
+			if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(dir, config.Overrides{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Pipeline.MaxConcurrent != tc.want {
+				t.Fatalf("max concurrent = %d, want %d", cfg.Pipeline.MaxConcurrent, tc.want)
+			}
+		})
 	}
 }
 

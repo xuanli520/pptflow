@@ -255,7 +255,7 @@ func buildDetailContent(vm executionViewModel, selectedStage string, width int) 
 		builder.WriteString("  无阻断/严重发现\n")
 	} else {
 		for _, finding := range stageFindings {
-			label := "[" + localizeSeverity(finding.Severity) + "]"
+			label := severityStyle(finding.Severity).Render("[" + localizeSeverity(finding.Severity) + "]")
 			builder.WriteString(fmt.Sprintf("  %s %s\n", label, finding.Title))
 			for _, detail := range []string{finding.Rule, finding.Evidence, finding.SourcePath} {
 				if strings.TrimSpace(detail) == "" {

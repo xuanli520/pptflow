@@ -80,6 +80,20 @@ func TestRecheckRequiresRefRunBeforeConfirm(t *testing.T) {
 	}
 }
 
+func TestRunConfigModeToggleToRecheckSubmitsWithAvailableRefRun(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionDetail("TASK-1").
+		SeedRefRunsForCurrentMode("run-ref-1").
+		SetFocus("stage-list")
+
+	h, _ = h.Press("ctrl+r")
+	h, _ = h.Press(" ")
+	next, result := h.Press("enter")
+	if next.Confirm() || !next.Running() || result.CmdCount == 0 {
+		t.Fatalf("recheck mode toggle should submit with available ref run, confirm=%v running=%v cmds=%d message=%q", next.Confirm(), next.Running(), result.CmdCount, next.Message())
+	}
+}
+
 func TestOverviewTableMovesSelection(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1", "TASK-2").SetFocus("overview-table")
 

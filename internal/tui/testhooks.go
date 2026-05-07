@@ -113,6 +113,10 @@ func (h TestHarness) SeedStages(stages []model.StageRecord, selected string) Tes
 
 func (h TestHarness) SeedRefRuns(runIDs ...string) TestHarness {
 	h.model.qaMode = "recheck"
+	return h.SeedRefRunsForCurrentMode(runIDs...)
+}
+
+func (h TestHarness) SeedRefRunsForCurrentMode(runIDs ...string) TestHarness {
 	h.model.detailVM.RefRuns = nil
 	for _, runID := range runIDs {
 		h.model.detailVM.RefRuns = append(h.model.detailVM.RefRuns, model.RunRecord{RunID: runID})
@@ -165,11 +169,19 @@ func (h TestHarness) Mode() string {
 }
 
 func (h TestHarness) Confirm() bool {
-	return h.model.confirm
+	return h.model.runConfig.active
 }
 
 func (h TestHarness) Running() bool {
-	return h.model.running
+	if h.model.message == "正在提交流水线 job..." {
+		return true
+	}
+	for _, job := range activeJobSnapshots(h.model.activeJobs) {
+		if job.State.String() == "running" || job.State.String() == "queued" {
+			return true
+		}
+	}
+	return false
 }
 
 func (h TestHarness) Message() string {
@@ -248,7 +260,28 @@ func TruncateDisplayForTest(value string, width int) string {
 }
 
 func StagePlanForTest(mode, stage string, staticOnly bool) TestStagePlan {
-	plan := stagePlanForMode(mode, stage, staticOnly)
+	plan := stagePlanForMode(mode, stage, staticOnly, nil, "")
+	result := TestStagePlan{
+		BlockedReason: plan.blockedReason,
+	}
+	if plan.runStages != nil {
+		result.RunStages = append([]string{}, plan.runStages...)
+	}
+	if plan.displayStages != nil {
+		result.DisplayStages = append([]string{}, plan.displayStages...)
+	}
+	return result
+}
+
+func StagePlanWithOptionsForTest(mode, stage string, staticOnly bool, selected []string, fromStage string) TestStagePlan {
+	var selectedMap map[string]bool
+	if len(selected) > 0 {
+		selectedMap = map[string]bool{}
+		for _, stage := range selected {
+			selectedMap[stage] = true
+		}
+	}
+	plan := stagePlanForMode(mode, stage, staticOnly, selectedMap, fromStage)
 	result := TestStagePlan{
 		BlockedReason: plan.blockedReason,
 	}
@@ -263,7 +296,9 @@ func StagePlanForTest(mode, stage string, staticOnly bool) TestStagePlan {
 
 func FooterForTest(focus string, confirm bool) string {
 	m := newApp(nil, config.Default())
-	m.confirm = confirm
+	if confirm {
+		m.runConfig = newRunConfig("TASK-1", "initial", "", "A", false, 0)
+	}
 	m.setFocus(testFocusArea(focus))
 	return footerFor(m)
 }

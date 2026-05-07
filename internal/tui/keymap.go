@@ -51,25 +51,15 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	var cmds []tea.Cmd
 	key := msg.String()
 
-	if m.confirm {
-		switch key {
-		case "y", "Y", "enter":
-			m.confirm = false
-			m.running = true
-			m.message = "流水线运行中..."
-			cmds = append(cmds, m.runSelected())
-		case "n", "N", "esc":
-			m.confirm = false
-			m.message = "已取消重跑"
-		}
-		return m, cmds
+	if m.runConfig.active {
+		return m.handleRunConfigKey(msg)
 	}
 
 	switch key {
 	case "ctrl+c", "ctrl+q":
-		return m, []tea.Cmd{tea.Quit}
+		return m, []tea.Cmd{tea.Batch(m.shutdownScheduler(), tea.Quit)}
 	case "ctrl+r":
-		m.openRerunConfirm()
+		m.openRunConfig()
 		return m, cmds
 	case "ctrl+a":
 		m.showAttachHint()
@@ -212,6 +202,9 @@ func (m *app) enterExecution() {
 
 func (m *app) handleEscape() {
 	switch {
+	case m.runConfig.active:
+		m.runConfig = runConfig{}
+		m.message = "已取消重跑"
 	case m.focus == focusSearch:
 		m.setFocus(focusOverviewTable)
 	case m.tab == panelExecution && m.focus != focusStageList:
@@ -245,8 +238,8 @@ func (m *app) showAttachHint() {
 	}
 }
 
-func (m *app) openRerunConfirm() {
-	if m.selectedTaskID() == "" || m.running {
+func (m *app) openRunConfig() {
+	if m.selectedTaskID() == "" {
 		return
 	}
 	m.syncRefSelection()
@@ -261,12 +254,12 @@ func (m *app) openRerunConfirm() {
 		}
 		return
 	}
-	m.confirm = true
+	m.runConfig = newRunConfig(m.selectedTaskID(), m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, m.detailVM.DocsSummary.Count)
 }
 
 func footerFor(m app) string {
-	if m.confirm {
-		return "Enter/y 确认  Esc/n 取消"
+	if m.runConfig.active {
+		return "Tab 切换  Space 选择  Enter 确认  Esc 取消"
 	}
 	switch m.focus {
 	case focusSearch:
