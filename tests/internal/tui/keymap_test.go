@@ -1,10 +1,12 @@
 package tui_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
 
@@ -91,6 +93,38 @@ func TestRunConfigModeToggleToRecheckSubmitsWithAvailableRefRun(t *testing.T) {
 	next, result := h.Press("enter")
 	if next.Confirm() || !next.Running() || result.CmdCount == 0 {
 		t.Fatalf("recheck mode toggle should submit with available ref run, confirm=%v running=%v cmds=%d message=%q", next.Confirm(), next.Running(), result.CmdCount, next.Message())
+	}
+}
+
+func TestSubmittedJobFailureUpdatesMessage(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).ApplyRunSubmitForTest("job-1")
+
+	h = h.ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+		JobID: "job-1",
+		State: scheduler.JobFailed,
+		Err:   "ref run run-old artifact root is missing",
+	}})
+	if !strings.Contains(h.Message(), "启动失败") || !strings.Contains(h.Message(), "artifact root is missing") {
+		t.Fatalf("message should surface scheduler failure, got %q", h.Message())
+	}
+}
+
+func TestPipelineBarShowsEachConfiguredRunningSlot(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SetSize(120, 20).
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{
+			{JobID: "job-1", TaskID: "TASK-A", State: scheduler.JobRunning, CurrentStage: "A"},
+			{JobID: "job-2", TaskID: "TASK-B", State: scheduler.JobRunning, CurrentStage: "B"},
+			{JobID: "job-3", TaskID: "TASK-C", State: scheduler.JobRunning, CurrentStage: "C"},
+		})
+	view := h.View()
+	for _, want := range []string{"TASK-A", "TASK-B", "TASK-C"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("pipeline bar should show %s when max_concurrent has a visible slot:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "另有 1 个 job") {
+		t.Fatalf("pipeline bar should not fold the third running slot:\n%s", view)
 	}
 }
 

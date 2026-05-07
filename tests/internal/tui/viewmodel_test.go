@@ -66,16 +66,22 @@ func TestExecutionViewModelReportsInvalidCleanupJSON(t *testing.T) {
 	}
 }
 
-func TestExecutionViewModelExcludesRunningRefRuns(t *testing.T) {
+func TestExecutionViewModelOnlyIncludesUsableCompletedRefRuns(t *testing.T) {
 	store, cfg, _, artifactRoot := tuiStore(t)
 	ctx := context.Background()
-	completed := model.RunRecord{RunID: "run-completed", TaskID: "TASK-1", StartedAt: "2026-04-30T00:00:00Z", Status: model.RunCompletedClean, ManualVerdict: model.ManualUnset, ArtifactRoot: artifactRoot}
+	completed := model.RunRecord{RunID: "run-completed", TaskID: "TASK-1", StartedAt: "2026-04-30T00:03:00Z", Status: model.RunCompletedClean, ManualVerdict: model.ManualUnset, ArtifactRoot: artifactRoot}
 	runningRoot := filepath.Join(filepath.Dir(artifactRoot), "run-running")
 	if err := os.MkdirAll(runningRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	crashedRoot := filepath.Join(filepath.Dir(artifactRoot), "run-crashed")
+	if err := os.MkdirAll(crashedRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	running := model.RunRecord{RunID: "run-running", TaskID: "TASK-1", StartedAt: "2026-04-30T00:01:00Z", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: runningRoot}
-	for _, run := range []model.RunRecord{completed, running} {
+	crashed := model.RunRecord{RunID: "run-crashed", TaskID: "TASK-1", StartedAt: "2026-04-30T00:02:00Z", Status: model.RunCrashed, ManualVerdict: model.ManualUnset, ArtifactRoot: crashedRoot}
+	missing := model.RunRecord{RunID: "run-missing-artifacts", TaskID: "TASK-1", StartedAt: "2026-04-30T00:00:00Z", Status: model.RunCompletedWithFindings, ManualVerdict: model.ManualUnset, ArtifactRoot: filepath.Join(filepath.Dir(artifactRoot), "missing")}
+	for _, run := range []model.RunRecord{completed, running, crashed, missing} {
 		if err := store.CreateRun(ctx, run); err != nil {
 			t.Fatal(err)
 		}
@@ -86,7 +92,7 @@ func TestExecutionViewModelExcludesRunningRefRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Join(probe.RefRunIDs, ",") != "run-completed" {
-		t.Fatalf("ref runs should exclude running runs, got %#v", probe.RefRunIDs)
+		t.Fatalf("ref runs should exclude unusable runs, got %#v", probe.RefRunIDs)
 	}
 }
 

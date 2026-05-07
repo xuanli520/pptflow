@@ -165,6 +165,9 @@ func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project
 		if ref.TaskID != project.TaskID {
 			return opts, fmt.Errorf("ref run %s belongs to task %s, not %s", opts.RefRun, ref.TaskID, project.TaskID)
 		}
+		if !completedRefRunStatus(ref.Status) {
+			return opts, fmt.Errorf("ref run %s status is %s; --mode recheck requires a completed reference run", opts.RefRun, ref.Status)
+		}
 		if !dirExists(ref.ArtifactRoot) {
 			return opts, fmt.Errorf("ref run %s artifact root is missing: %s", opts.RefRun, ref.ArtifactRoot)
 		}
@@ -172,6 +175,10 @@ func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project
 		return opts, fmt.Errorf("invalid --mode %q; expected initial or recheck", opts.Mode)
 	}
 	return opts, nil
+}
+
+func completedRefRunStatus(status string) bool {
+	return status == model.RunCompletedClean || status == model.RunCompletedWithFindings
 }
 
 func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result Result, err error) {

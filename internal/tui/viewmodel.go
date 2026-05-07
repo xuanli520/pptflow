@@ -170,7 +170,7 @@ func buildExecutionViewModel(ctx context.Context, store *db.Store, cfg config.Co
 	vm.Findings = prioritizeFindings(findings)
 	runs, _ := store.ListRunsForTask(ctx, taskID)
 	for _, candidate := range runs {
-		if candidate.Status == model.RunRunning {
+		if !eligibleRefRun(candidate) {
 			continue
 		}
 		vm.RefRuns = append(vm.RefRuns, candidate)
@@ -182,6 +182,15 @@ func buildExecutionViewModel(ctx context.Context, store *db.Store, cfg config.Co
 		vm.LogTailByStage[stage.Stage] = readLogTail(stage.LogPath, cfg.TUI.LogMaxLines)
 	}
 	return vm, nil
+}
+
+func eligibleRefRun(run model.RunRecord) bool {
+	switch run.Status {
+	case model.RunCompletedClean, model.RunCompletedWithFindings:
+	default:
+		return false
+	}
+	return dirExists(run.ArtifactRoot)
 }
 
 func normalizeStageViews(stages []model.StageRecord) []stageView {
@@ -649,6 +658,11 @@ func shortTime(value string) string {
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func empty(value, fallback string) string {

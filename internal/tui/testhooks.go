@@ -8,6 +8,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
 
 // TestHarness exposes narrow state-machine probes for the external tests under
@@ -73,6 +74,24 @@ func (h TestHarness) ApplyProjectReloadForTest() (TestHarness, bool) {
 		return h, cmd != nil
 	}
 	return TestHarness{model: model}, cmd != nil
+}
+
+func (h TestHarness) ApplyRunSubmitForTest(jobID string) TestHarness {
+	next, _ := h.model.Update(runSubmitMsg{jobID: jobID})
+	model, ok := next.(app)
+	if !ok {
+		return h
+	}
+	return TestHarness{model: model}
+}
+
+func (h TestHarness) ApplySchedulerJobsForTest(jobs []scheduler.JobSnapshot) TestHarness {
+	next, _ := h.model.Update(schedulerJobsMsg{jobs: jobs})
+	model, ok := next.(app)
+	if !ok {
+		return h
+	}
+	return TestHarness{model: model}
 }
 
 func (h TestHarness) SetFocus(name string) TestHarness {

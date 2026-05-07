@@ -50,6 +50,7 @@ type app struct {
 	height int
 
 	message    string
+	pendingJob string
 	qaMode     string
 	runConfig  runConfig
 	activeJobs []scheduler.JobSnapshot
@@ -187,11 +188,13 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.message = value.err.Error()
 		} else {
 			m.message = fmt.Sprintf("已提交 job %s", value.jobID)
+			m.pendingJob = value.jobID
 			m.runConfig = runConfig{}
 		}
 		cmds = append(cmds, m.reloadSchedulerJobs())
 	case schedulerJobsMsg:
 		m.activeJobs = value.jobs
+		m.updatePendingJobMessage(value.jobs)
 		m.applyLayout()
 	case schedulerNotifyMsg:
 		cmds = append(cmds, m.reloadSchedulerJobs(), m.reload(), m.reloadDetail(), m.waitSchedulerNotify())
@@ -212,6 +215,47 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *app) updatePendingJobMessage(jobs []scheduler.JobSnapshot) {
+	if m.pendingJob == "" {
+		return
+	}
+	job, ok := findJobSnapshot(jobs, m.pendingJob)
+	if !ok {
+		return
+	}
+	switch job.State {
+	case scheduler.JobRunning:
+		if m.message == fmt.Sprintf("已提交 job %s", job.JobID) {
+			m.message = fmt.Sprintf("job %s 已开始运行", job.JobID)
+		}
+	case scheduler.JobFailed:
+		reason := strings.TrimSpace(job.Err)
+		if reason == "" {
+			reason = "未知错误"
+		}
+		label := "失败"
+		if job.RunID == "" {
+			label = "启动失败"
+		}
+		m.message = fmt.Sprintf("job %s %s: %s", job.JobID, label, reason)
+		m.pendingJob = ""
+	case scheduler.JobDone:
+		if m.message == fmt.Sprintf("已提交 job %s", job.JobID) || m.message == fmt.Sprintf("job %s 已开始运行", job.JobID) {
+			m.message = fmt.Sprintf("job %s 已完成", job.JobID)
+		}
+		m.pendingJob = ""
+	}
+}
+
+func findJobSnapshot(jobs []scheduler.JobSnapshot, jobID string) (scheduler.JobSnapshot, bool) {
+	for _, job := range jobs {
+		if job.JobID == jobID {
+			return job, true
+		}
+	}
+	return scheduler.JobSnapshot{}, false
 }
 
 func (m app) View() string {

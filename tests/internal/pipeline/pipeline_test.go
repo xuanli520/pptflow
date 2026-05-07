@@ -177,6 +177,46 @@ func TestRunReportsProgressWhenArtifactRootCannotBeCreated(t *testing.T) {
 	}
 }
 
+func TestRecheckRejectsCrashedReferenceRun(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	refRoot := filepath.Join(root, "refs", "run-crashed")
+	if err := os.MkdirAll(refRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:         "run-crashed",
+		TaskID:        "TASK-1",
+		StartedAt:     "2026-04-30T00:00:00Z",
+		Status:        model.RunCrashed,
+		ManualVerdict: model.ManualUnset,
+		ArtifactRoot:  refRoot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-1", pipelinepkg.RunOptions{Mode: "recheck", RefRun: "run-crashed", Stage: "F"})
+	if err == nil || !strings.Contains(err.Error(), "requires a completed reference run") {
+		t.Fatalf("expected completed ref-run validation error, got %v", err)
+	}
+}
+
 func TestAssignFindingIDs(t *testing.T) {
 	findings := assignFindingIDs("E", []model.Finding{
 		{Severity: "Blocker", Title: "one"},

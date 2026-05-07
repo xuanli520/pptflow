@@ -31,7 +31,7 @@ func renderPipelineBar(m app) string {
 	if len(active) == 0 || m.width < 72 {
 		return mutedStyle.Render(line)
 	}
-	limit := min(2, len(active))
+	limit := pipelineJobLineLimit(m)
 	lines := []string{mutedStyle.Render(line)}
 	for _, job := range active[:limit] {
 		label := localizeJobState(job.State)
@@ -51,7 +51,20 @@ func pipelineBarHeight(m app) int {
 	if len(active) == 0 || m.width < 72 {
 		return 1
 	}
-	return 1 + min(2, len(active))
+	limit := pipelineJobLineLimit(m)
+	height := 1 + limit
+	if len(active) > limit {
+		height++
+	}
+	return height
+}
+
+func pipelineJobLineLimit(m app) int {
+	active := activeJobSnapshots(m.activeJobs)
+	if len(active) == 0 || m.width < 72 {
+		return 0
+	}
+	return min(normalizedMaxParallel(m.cfg.Pipeline.MaxConcurrent), len(active))
 }
 
 func activeJobSnapshots(jobs []scheduler.JobSnapshot) []scheduler.JobSnapshot {
