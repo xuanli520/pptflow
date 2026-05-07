@@ -23,6 +23,9 @@ func TestAttachPreservesArbitraryNameAndBuildsContext(t *testing.T) {
 	if doc.OriginalName != "自测 report 01.md" || !doc.TextIncluded {
 		t.Fatalf("unexpected doc: %#v", doc)
 	}
+	if len(doc.IncludedInStages) != 1 || doc.IncludedInStages[0] != "F" {
+		t.Fatalf("attached docs should be marked for Stage F only: %#v", doc.IncludedInStages)
+	}
 	if _, err := os.Stat(filepath.Join(taskdocs.StoreDir(root, "TASK-1"), "files", doc.StoredName)); err != nil {
 		t.Fatal(err)
 	}

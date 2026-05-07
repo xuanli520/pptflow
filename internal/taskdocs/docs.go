@@ -242,7 +242,7 @@ func classify(doc *Document, limits config.DocsConfig) {
 		return
 	}
 	doc.TextIncluded = true
-	doc.IncludedInStages = []string{"D", "E", "F"}
+	doc.IncludedInStages = []string{"F"}
 }
 
 func isTextLike(ext string) bool {

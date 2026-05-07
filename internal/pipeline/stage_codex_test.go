@@ -10,6 +10,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
+	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
 func TestCodexReviewPathPrefersScriptInputSnapshot(t *testing.T) {
@@ -62,6 +63,60 @@ func TestStageDCodexContextDoesNotRequireSelfTestReport(t *testing.T) {
 	}
 	if !strings.Contains(contextText, "metadata.json") {
 		t.Fatalf("D context should still include available metadata: %s", contextText)
+	}
+}
+
+func TestCodexContextOnlyExposesUploadedDocsToStageF(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), []byte(`{"task_id":"TASK-1","prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	selfTest := filepath.Join(t.TempDir(), "标注员自测报告.md")
+	if err := os.WriteFile(selfTest, []byte("SELF TEST CLAIM: checkout flow passes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notes := filepath.Join(t.TempDir(), "补充说明.md")
+	if err := os.WriteFile(notes, []byte("SUPPLEMENTAL CLAIM: admin flow exists"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.Docs.StageInlineMaxBytes = 10
+	if _, err := taskdocs.Attach(root, "TASK-1", selfTest, "self-test", "test", cfg.Docs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := taskdocs.Attach(root, "TASK-1", notes, "notes", "test", cfg.Docs); err != nil {
+		t.Fatal(err)
+	}
+	runner := Runner{cfg: cfg}
+	project := scanner.Project{TaskID: "TASK-1", Path: projectPath}
+
+	stageD, err := runner.codexContext(project, RunOptions{}, "D")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stageD, "SELF TEST CLAIM") || strings.Contains(stageD, "SUPPLEMENTAL CLAIM") || strings.Contains(stageD, "Uploaded/attached docs") {
+		t.Fatalf("Stage D should not see uploaded docs:\n%s", stageD)
+	}
+
+	stageF, err := runner.codexContext(project, RunOptions{}, "F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Stage F uploaded-document requirement",
+		"Uploaded/attached docs available to Stage F: 2",
+		"SELF TEST CLAIM",
+		"SUPPLEMENTAL CLAIM",
+	} {
+		if !strings.Contains(stageF, want) {
+			t.Fatalf("Stage F context missing %q:\n%s", want, stageF)
+		}
 	}
 }
 
