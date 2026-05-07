@@ -68,6 +68,9 @@ func migrate(ctx context.Context, handle *sql.DB) error {
 	if version != currentSchemaVersion {
 		return fmt.Errorf("database schema version %d is newer than supported version %d", version, currentSchemaVersion)
 	}
+	if err := ensureReadIndexes(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -97,7 +100,10 @@ func createCurrentSchema(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx, currentFindingsDDL); err != nil {
 		return err
 	}
-	return ensureSchemaVersion(ctx, tx, currentSchemaVersion)
+	if err := ensureSchemaVersion(ctx, tx, currentSchemaVersion); err != nil {
+		return err
+	}
+	return ensureReadIndexes(ctx, tx)
 }
 
 func ensureCoreTables(ctx context.Context, tx *sql.Tx) error {
@@ -253,6 +259,22 @@ func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error {
 	}
 	_, err = tx.ExecContext(ctx, `ALTER TABLE run_stages ADD COLUMN name TEXT;`)
 	return err
+}
+
+func ensureReadIndexes(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE INDEX IF NOT EXISTS idx_runs_task_started ON runs(task_id, started_at DESC, run_id DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);`,
+		`CREATE INDEX IF NOT EXISTS idx_run_stages_run_status_stage ON run_stages(run_id, status, stage);`,
+		`CREATE INDEX IF NOT EXISTS idx_findings_run_severity ON findings(run_id, severity);`,
+		`CREATE INDEX IF NOT EXISTS idx_projects_batch ON projects(batch);`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ensureSchemaVersion(ctx context.Context, tx *sql.Tx, version int) error {

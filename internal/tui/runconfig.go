@@ -170,12 +170,7 @@ func (m *app) toggleRunConfigFocused() {
 			m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly)
 		}
 		stage := m.runConfig.selectedStage()
-		if stage == "F" {
-			m.runConfig.stages["F"] = true
-			return
-		}
 		m.runConfig.stages[stage] = !m.runConfig.stages[stage]
-		m.runConfig.stages["F"] = true
 	case runConfigFocusFrom:
 		if len(m.runConfig.stages) > 0 {
 			m.runConfig.err = "多选阶段时不能使用起始阶段"
@@ -241,7 +236,6 @@ func stageSet(stages []string) map[string]bool {
 			result[stage] = true
 		}
 	}
-	result["F"] = true
 	return result
 }
 

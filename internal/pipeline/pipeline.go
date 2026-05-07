@@ -371,7 +371,7 @@ func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project s
 func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 	selected := map[string]bool{"A": true, "B": true, "C": true, "D": true, "E": true, "F": true}
 	if len(opts.Stages) > 0 {
-		selected = map[string]bool{"F": true}
+		selected = map[string]bool{}
 		for _, stage := range opts.Stages {
 			selected[strings.ToUpper(stage)] = true
 		}

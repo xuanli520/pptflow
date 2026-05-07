@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/table"
-	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -29,22 +27,16 @@ type app struct {
 	cfg       config.Config
 	scheduler *scheduler.Scheduler
 
-	projects      []db.ProjectSummary
-	overviewItems []overviewItem
-	visibleRows   []overviewItem
-
-	table  table.Model
-	search textinput.Model
-	detail viewport.Model
+	overview OverviewModel
+	detail   viewport.Model
 
 	tab   int
 	focus focusArea
 
-	selectedTaskIDValue string
-	selectedStageKey    string
-	selectedRefRunID    string
-	stageIndex          int
-	refIndex            int
+	selectedStageKey string
+	selectedRefRunID string
+	stageIndex       int
+	refIndex         int
 
 	width  int
 	height int
@@ -58,12 +50,6 @@ type app struct {
 	detailVM       executionViewModel
 	detailContent  string
 	lastRecoveryAt time.Time
-}
-
-type projectsMsg struct {
-	projects []db.ProjectSummary
-	items    []overviewItem
-	err      error
 }
 
 type detailMsg struct {
@@ -110,23 +96,10 @@ func Start(store *db.Store, cfg config.Config) error {
 }
 
 func newApp(store *db.Store, cfg config.Config) app {
-	search := textinput.New()
-	search.Placeholder = "搜索任务ID、批次、状态或阶段..."
-	search.Prompt = "搜索: "
-	search.Focus()
-
-	t := table.New(
-		table.WithColumns(buildOverviewColumns(120)),
-		table.WithFocused(false),
-		table.WithHeight(12),
-	)
-	t.SetStyles(tableStyles())
-
 	m := app{
 		store:          store,
 		cfg:            cfg,
-		table:          t,
-		search:         search,
+		overview:       newOverviewModel(),
 		detail:         viewport.New(80, 10),
 		tab:            panelOverview,
 		focus:          focusSearch,
@@ -142,7 +115,7 @@ func newApp(store *db.Store, cfg config.Config) app {
 }
 
 func (m app) Init() tea.Cmd {
-	return tea.Batch(m.recoverStaleRuns(), m.reload(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), m.tick())
+	return tea.Batch(m.recoverStaleRuns(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -152,16 +125,42 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = value.Width
 		m.height = value.Height
-		m.applyLayout()
-	case projectsMsg:
+		m.overview.page.autoSize = true
+		if cmd := m.applyLayout(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case overviewRefreshMsg:
+		var cmd tea.Cmd
+		m.overview, cmd = m.overview.Update(value)
+		cmds = append(cmds, cmd)
+	case overviewSearchDebounceMsg:
+		var cmd tea.Cmd
+		m.overview, cmd = m.overview.Update(value)
+		cmds = append(cmds, cmd)
+	case overviewLoadRequestMsg:
+		cmds = append(cmds, m.handleOverviewLoad(value))
+	case overviewLoadResultMsg:
+		if value.seq != m.overview.seq {
+			break
+		}
+		beforeID := m.selectedTaskID()
+		beforeKey := m.selectedOverviewDetailKey()
+		var cmd tea.Cmd
+		m.overview, cmd = m.overview.Update(value)
+		cmds = append(cmds, cmd)
 		if value.err != nil {
 			m.message = value.err.Error()
 			break
 		}
-		m.projects = value.projects
-		m.overviewItems = value.items
-		m.refreshRows()
-		if m.selectedTaskID() != "" {
+		afterID := m.selectedTaskID()
+		afterKey := m.selectedOverviewDetailKey()
+		if afterID == "" {
+			m.detailVM = executionViewModel{}
+			m.detailContent = ""
+			m.detail.SetContent("")
+			break
+		}
+		if afterID != beforeID || afterKey != beforeKey || value.refreshDetail {
 			cmds = append(cmds, m.reloadDetail())
 		}
 	case detailMsg:
@@ -195,9 +194,11 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case schedulerJobsMsg:
 		m.activeJobs = value.jobs
 		m.updatePendingJobMessage(value.jobs)
-		m.applyLayout()
+		if cmd := m.applyLayout(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case schedulerNotifyMsg:
-		cmds = append(cmds, m.reloadSchedulerJobs(), m.reload(), m.reloadDetail(), m.waitSchedulerNotify())
+		cmds = append(cmds, m.reloadSchedulerJobs(), m.reload(), m.waitSchedulerNotify())
 	case recoveryMsg:
 		if value.err != nil {
 			m.message = value.err.Error()
@@ -281,17 +282,41 @@ func (m app) View() string {
 }
 
 func (m app) reload() tea.Cmd {
-	if m.store == nil {
-		return nil
-	}
+	return overviewRefreshCmd(true, true)
+}
+
+func (m app) handleOverviewLoad(req overviewLoadRequestMsg) tea.Cmd {
 	return func() tea.Msg {
-		ctx := context.Background()
-		projects, err := m.store.ListProjects(ctx)
-		if err != nil {
-			return projectsMsg{err: err}
+		if m.store == nil {
+			return overviewLoadResultMsg{
+				seq:           req.seq,
+				query:         req.query,
+				cursorIntent:  req.cursorIntent,
+				total:         0,
+				refreshDetail: req.refreshDetail,
+			}
 		}
-		items := buildOverviewItems(ctx, m.store, m.cfg, projects)
-		return projectsMsg{projects: projects, items: items}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		projects, total, err := m.store.ListProjectsPaginated(ctx, req.query)
+		if err != nil {
+			return overviewLoadResultMsg{
+				seq:           req.seq,
+				query:         req.query,
+				cursorIntent:  req.cursorIntent,
+				refreshDetail: req.refreshDetail,
+				err:           err,
+			}
+		}
+		items := buildOverviewItems(m.cfg, projects)
+		return overviewLoadResultMsg{
+			seq:           req.seq,
+			query:         req.query,
+			cursorIntent:  req.cursorIntent,
+			items:         items,
+			total:         total,
+			refreshDetail: req.refreshDetail,
+		}
 	}
 }
 
@@ -367,79 +392,23 @@ func (m app) shutdownScheduler() tea.Cmd {
 	}
 }
 
-func (m *app) applyLayout() {
+func (m *app) applyLayout() tea.Cmd {
 	layout := layoutFor(m.width, max(8, m.height-pipelineBarHeight(*m)), m.tab == panelExecution)
-	m.search.Width = max(12, layout.contentWidth-8)
-	m.table.SetWidth(layout.contentWidth)
-	m.table.SetHeight(layout.overviewTableHeight)
+	pageSizeChanged := m.overview.SetSize(layout.contentWidth, layout.overviewTableHeight)
 	m.detail.Width = layout.detailWidth
 	m.detail.Height = layout.detailHeight
 	if m.tab == panelExecution {
 		m.detail.Height = max(3, layout.detailHeight-1)
 	}
-	m.refreshRows()
 	m.updateDetailContent(false)
-}
-
-func (m *app) refreshRows() {
-	specs := overviewColumnSpecs(m.width)
-	columns := make([]table.Column, 0, len(specs))
-	for _, spec := range specs {
-		columns = append(columns, table.Column{Title: spec.Title, Width: spec.Width})
+	if pageSizeChanged {
+		return overviewRefreshCmd(true, false)
 	}
-	m.table.SetRows(nil)
-	m.table.SetColumns(columns)
-
-	filter := strings.ToLower(strings.TrimSpace(m.search.Value()))
-	rows := make([]table.Row, 0, len(m.overviewItems))
-	visible := make([]overviewItem, 0, len(m.overviewItems))
-	for _, item := range m.overviewItems {
-		if filter != "" && !strings.Contains(strings.ToLower(item.SearchText), filter) {
-			continue
-		}
-		rows = append(rows, overviewDisplayRow(item, specs))
-		visible = append(visible, item)
-	}
-
-	previous := m.selectedTaskIDValue
-	m.visibleRows = visible
-	m.table.SetRows(rows)
-	switch {
-	case len(visible) == 0:
-		m.selectedTaskIDValue = ""
-		m.detailVM = executionViewModel{}
-	case previous != "":
-		if index := overviewIndex(visible, previous); index >= 0 {
-			m.table.SetCursor(index)
-			m.selectedTaskIDValue = previous
-		} else {
-			m.table.SetCursor(0)
-			m.selectedTaskIDValue = visible[0].TaskID
-			if filter != "" {
-				m.message = "当前选择已被过滤，已切换到第一条结果"
-			}
-		}
-	default:
-		m.table.SetCursor(0)
-		m.selectedTaskIDValue = visible[0].TaskID
-	}
-}
-
-func (m *app) syncSelectedTaskFromCursor() bool {
-	if len(m.visibleRows) == 0 {
-		changed := m.selectedTaskIDValue != ""
-		m.selectedTaskIDValue = ""
-		return changed
-	}
-	index := clamp(m.table.Cursor(), 0, len(m.visibleRows)-1)
-	next := m.visibleRows[index].TaskID
-	changed := next != m.selectedTaskIDValue
-	m.selectedTaskIDValue = next
-	return changed
+	return nil
 }
 
 func (m app) selectedTaskID() string {
-	return m.selectedTaskIDValue
+	return m.overview.SelectedTaskID()
 }
 
 func (m app) selectedStage() stageView {
@@ -541,11 +510,28 @@ func (m *app) updateDetailContent(resetScroll bool) {
 	}
 }
 
-func overviewIndex(rows []overviewItem, taskID string) int {
-	for index, row := range rows {
-		if row.TaskID == taskID {
-			return index
-		}
+type overviewDetailKey struct {
+	TaskID        string
+	LastRunID     string
+	RunStatus     string
+	ManualVerdict string
+	FailedStage   string
+	Blocking      int
+	High          int
+}
+
+func (m app) selectedOverviewDetailKey() overviewDetailKey {
+	item, ok := m.overview.SelectedItem()
+	if !ok {
+		return overviewDetailKey{}
 	}
-	return -1
+	return overviewDetailKey{
+		TaskID:        item.TaskID,
+		LastRunID:     item.LastRunID,
+		RunStatus:     item.RunStatus,
+		ManualVerdict: item.ManualVerdict,
+		FailedStage:   item.FailedStage,
+		Blocking:      item.Blocking,
+		High:          item.High,
+	}
 }

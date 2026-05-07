@@ -230,7 +230,7 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 - B 是运行证据采集，依赖 A 的基础结构存在
 - C 依赖 B 成功提供可执行容器或服务
 - D/E 是纯静态 Codex 审查，不依赖 B/C 成功
-- F 永远执行，汇总 `done / failed / blocked / skipped` 输入
+- F 在完整运行和默认运行配置中默认执行；显式阶段选择时尊重用户勾选
 - Codex 阶段必须遵守静态报告模板的边界：不启动项目、不运行 Docker、不运行测试、不改代码
 
 ### 5.2 阶段状态模型
@@ -306,7 +306,7 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 | 动作 | 运行 `run_acceptance.py`、`run_validate.py`、`check_required_artifacts.py`、`check_readme_alignment.py`、`check_local_dependency.py`，英文题追加 `check_english_only.py` |
 | 输出 | `acceptance.json`、`acceptance_report.md`、`validation_report.md`、`required_artifacts.json`、`readme_alignment.json`、`local_dependency.json` |
 | 超时 | 60s |
-| 失败影响 | A 失败时 B/C 标记 `blocked`；D/E 仍可静态审查已存在文件；F 必跑 |
+| 失败影响 | A 失败时 B/C 标记 `blocked`；D/E 仍可静态审查已存在文件；F 在默认配置中继续参与汇总 |
 
 #### 阶段 B — Docker 运行证据采集
 

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -71,9 +72,14 @@ func (h TestHarness) Press(key string) (TestHarness, TestKeyResult) {
 }
 
 func (h TestHarness) ApplyProjectReloadForTest() (TestHarness, bool) {
-	next, cmd := h.model.Update(projectsMsg{
-		projects: h.model.projects,
-		items:    h.model.overviewItems,
+	h.model.overview.seq++
+	next, cmd := h.model.Update(overviewLoadResultMsg{
+		seq:           h.model.overview.seq,
+		query:         h.model.overview.projectQuery(),
+		cursorIntent:  cursorKeep,
+		items:         h.model.overview.items,
+		total:         h.model.overview.page.total,
+		refreshDetail: true,
 	})
 	model, ok := next.(app)
 	if !ok {
@@ -119,13 +125,15 @@ func (h TestHarness) SetSize(width, height int) TestHarness {
 }
 
 func (h TestHarness) SeedOverview(taskIDs ...string) TestHarness {
-	h.model.overviewItems = nil
+	h.model.overview.items = nil
 	for _, taskID := range taskIDs {
 		item := overviewItem{TaskID: taskID, RunStatus: model.RunCompletedClean}
 		item.SearchText = overviewSearchText(item)
-		h.model.overviewItems = append(h.model.overviewItems, item)
+		h.model.overview.items = append(h.model.overview.items, item)
 	}
-	h.model.refreshRows()
+	h.model.overview.page.total = len(h.model.overview.items)
+	h.model.overview.page.current = 1
+	h.model.overview.refreshTable(cursorKeep)
 	return h
 }
 
@@ -182,11 +190,99 @@ func (h TestHarness) View() string {
 }
 
 func (h TestHarness) SearchValue() string {
-	return h.model.search.Value()
+	return h.model.overview.search.Value()
 }
 
 func (h TestHarness) VisibleCount() int {
-	return len(h.model.visibleRows)
+	return len(h.model.overview.items)
+}
+
+func (h TestHarness) OverviewSeq() uint64 {
+	return h.model.overview.seq
+}
+
+func (h TestHarness) SearchSeq() uint64 {
+	return h.model.overview.searchSeq
+}
+
+func (h TestHarness) PageCurrent() int {
+	return h.model.overview.page.current
+}
+
+func (h TestHarness) PageSize() int {
+	return normalizePageSize(h.model.overview.page.size)
+}
+
+func (h TestHarness) SortName() string {
+	switch h.model.overview.sortMode {
+	case sortByStatus:
+		return "status"
+	case sortBySeverity:
+		return "severity"
+	case sortByLastRun:
+		return "last_run"
+	case sortByVerdict:
+		return "verdict"
+	default:
+		return "task_id"
+	}
+}
+
+func (h TestHarness) SortAsc() bool {
+	return h.model.overview.sortAsc
+}
+
+func (h TestHarness) SetOverviewPage(current, size, total int) TestHarness {
+	h.model.overview.page.current = current
+	h.model.overview.page.size = size
+	h.model.overview.page.total = total
+	h.model.overview.refreshTable(cursorKeep)
+	return h
+}
+
+func (h TestHarness) SetOverviewCursor(index int) TestHarness {
+	h.model.overview.table.SetCursor(index)
+	h.model.overview.syncSelectedFromCursor()
+	return h
+}
+
+func (h TestHarness) ApplySearchDebounceForTest(searchSeq uint64, text string) (TestHarness, bool) {
+	next, cmd := h.model.Update(overviewSearchDebounceMsg{searchSeq: searchSeq, text: text})
+	model, ok := next.(app)
+	if !ok {
+		return h, cmd != nil
+	}
+	return TestHarness{model: model}, cmd != nil
+}
+
+func (h TestHarness) ApplyOverviewRefreshForTest() (TestHarness, bool) {
+	next, cmd := h.model.Update(overviewRefreshMsg{silent: true})
+	model, ok := next.(app)
+	if !ok {
+		return h, cmd != nil
+	}
+	return TestHarness{model: model}, cmd != nil
+}
+
+func (h TestHarness) ApplyOverviewResultForTest(seq uint64, total int, taskIDs ...string) (TestHarness, bool) {
+	items := make([]overviewItem, 0, len(taskIDs))
+	for _, taskID := range taskIDs {
+		item := overviewItem{TaskID: taskID, RunStatus: model.RunCompletedClean}
+		item.SearchText = overviewSearchText(item)
+		items = append(items, item)
+	}
+	next, cmd := h.model.Update(overviewLoadResultMsg{
+		seq:          seq,
+		query:        h.model.overview.projectQuery(),
+		cursorIntent: cursorKeep,
+		items:        items,
+		total:        total,
+	})
+	model, ok := next.(app)
+	if !ok {
+		return h, cmd != nil
+	}
+	return TestHarness{model: model}, cmd != nil
 }
 
 func (h TestHarness) Mode() string {
@@ -241,32 +337,33 @@ func (h TestHarness) FocusName() string {
 }
 
 func (h TestHarness) SetSelectedTaskForRefresh(taskID string) TestHarness {
-	h.model.selectedTaskIDValue = taskID
+	h.model.overview.selectedID = taskID
 	return h
 }
 
 func (h TestHarness) ReplaceOverviewForRefresh(taskIDs ...string) TestHarness {
-	h.model.overviewItems = nil
+	h.model.overview.items = nil
 	for _, taskID := range taskIDs {
 		item := overviewItem{TaskID: taskID, RunStatus: model.RunCompletedClean}
 		item.SearchText = overviewSearchText(item)
-		h.model.overviewItems = append(h.model.overviewItems, item)
+		h.model.overview.items = append(h.model.overview.items, item)
 	}
-	h.model.refreshRows()
+	h.model.overview.page.total = len(h.model.overview.items)
+	h.model.overview.refreshTable(cursorKeep)
 	return h
 }
 
 func OverviewColumnTitlesForTest(width int) []string {
-	columns := buildOverviewColumns(width)
+	columns := buildOverviewColumns(width, sortByTaskID, true)
 	titles := make([]string, 0, len(columns))
 	for _, column := range columns {
-		titles = append(titles, column.Title)
+		titles = append(titles, strings.TrimRight(column.Title, "↑↓"))
 	}
 	return titles
 }
 
 func OverviewColumnsForTest(width int) []TestOverviewColumn {
-	specs := overviewColumnSpecs(width)
+	specs := overviewColumnSpecs(width, sortByTaskID, true)
 	columns := make([]TestOverviewColumn, 0, len(specs))
 	for _, spec := range specs {
 		columns = append(columns, TestOverviewColumn{Key: spec.Key, Title: spec.Title, Width: spec.Width})
@@ -275,7 +372,7 @@ func OverviewColumnsForTest(width int) []TestOverviewColumn {
 }
 
 func OverviewRowForTest(lastRun string, width int) []string {
-	specs := overviewColumnSpecs(width)
+	specs := overviewColumnSpecs(width, sortByTaskID, true)
 	row := overviewDisplayRow(overviewItem{
 		TaskID:        "TASK-1",
 		Batch:         "batch-1",
@@ -383,10 +480,6 @@ func testKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlQ}
 	case "ctrl+r":
 		return tea.KeyMsg{Type: tea.KeyCtrlR}
-	case "ctrl+a":
-		return tea.KeyMsg{Type: tea.KeyCtrlA}
-	case "ctrl+m":
-		return tea.KeyMsg{Type: tea.KeyCtrlM}
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "esc":

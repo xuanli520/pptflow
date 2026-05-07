@@ -126,13 +126,13 @@ func TestSelectedStagesSingleStageStillRunsSummary(t *testing.T) {
 
 func TestSelectedStagesExplicitDependencyChain(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{Stages: []string{"A", "B", "C"}}, false)
-	for _, stage := range []string{"A", "B", "C", "F"} {
+	for _, stage := range []string{"A", "B", "C"} {
 		if !selected[stage] {
 			t.Fatalf("expected %s selected", stage)
 		}
 	}
-	if selected["D"] || selected["E"] {
-		t.Fatalf("D/E should not be selected for A dependency rerun")
+	if selected["D"] || selected["E"] || selected["F"] {
+		t.Fatalf("D/E/F should not be selected unless explicitly requested")
 	}
 }
 

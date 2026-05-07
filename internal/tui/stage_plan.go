@@ -30,6 +30,9 @@ func stagePlanForMode(mode, stage string, staticOnly bool, explicitStages map[st
 	}
 	if len(explicitStages) > 0 {
 		stages := selectedStageList(explicitStages)
+		if len(stages) == 0 {
+			return stagePlan{blockedReason: "至少选择一个阶段"}
+		}
 		if staticOnly && hasRuntimeStage(stages) {
 			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段 B/C"}
 		}
@@ -70,7 +73,7 @@ func (m app) rerunStageKey() string {
 func selectedStageList(selected map[string]bool) []string {
 	var stages []string
 	for _, stage := range []string{"A", "B", "C", "D", "E", "F"} {
-		if selected[stage] || stage == "F" {
+		if selected[stage] {
 			stages = append(stages, stage)
 		}
 	}

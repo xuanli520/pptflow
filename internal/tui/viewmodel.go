@@ -25,6 +25,7 @@ type overviewItem struct {
 	TaskID        string
 	Batch         string
 	Path          string
+	LastRunID     string
 	LastRun       string
 	RunStatus     string
 	ManualVerdict string
@@ -76,13 +77,14 @@ type executionViewModel struct {
 	LogTailByStage map[string]string
 }
 
-func buildOverviewItems(ctx context.Context, store *db.Store, cfg config.Config, projects []db.ProjectSummary) []overviewItem {
+func buildOverviewItems(cfg config.Config, projects []db.ProjectSummary) []overviewItem {
 	items := make([]overviewItem, 0, len(projects))
 	for _, project := range projects {
 		item := overviewItem{
 			TaskID:        project.TaskID,
 			Batch:         project.Batch,
 			Path:          project.Path,
+			LastRunID:     project.LastRunID,
 			LastRun:       project.LastRunAt,
 			RunStatus:     project.RunStatus,
 			ManualVerdict: project.ManualVerdict,
@@ -93,9 +95,10 @@ func buildOverviewItems(ctx context.Context, store *db.Store, cfg config.Config,
 			CleanupStatus: "none",
 			Mode:          "initial",
 		}
-		if run, err := store.LatestRunForTask(ctx, project.TaskID); err == nil {
+		if project.LatestArtifactRoot != "" {
+			run := model.RunRecord{StaticOnly: project.LatestStaticOnly, ArtifactRoot: project.LatestArtifactRoot}
 			item.Mode = runMode(run)
-			item.CleanupStatus = cleanupStatus(run.ArtifactRoot)
+			item.CleanupStatus = cleanupStatus(project.LatestArtifactRoot)
 		}
 		item.SearchText = overviewSearchText(item)
 		items = append(items, item)

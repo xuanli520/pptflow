@@ -90,16 +90,11 @@ func layoutFor(width, height int, execution bool) appLayout {
 	return layout
 }
 
-func buildOverviewColumns(width int) []table.Column {
-	specs := overviewColumnSpecs(width)
-	columns := make([]table.Column, 0, len(specs))
-	for _, spec := range specs {
-		columns = append(columns, table.Column{Title: spec.Title, Width: spec.Width})
-	}
-	return columns
+func buildOverviewColumns(width int, sort overviewSortMode, asc bool) []table.Column {
+	return columnsFromSpecs(overviewColumnSpecs(width, sort, asc))
 }
 
-func overviewColumnSpecs(width int) []overviewColumnSpec {
+func overviewColumnSpecs(width int, sort overviewSortMode, asc bool) []overviewColumnSpec {
 	breakpoint := 0
 	switch {
 	case width >= 120:
@@ -131,10 +126,33 @@ func overviewColumnSpecs(width int) []overviewColumnSpec {
 	specs := make([]overviewColumnSpec, 0, len(defs))
 	for _, def := range defs {
 		if width := def.widths[breakpoint]; width > 0 {
-			specs = append(specs, overviewColumnSpec{Key: def.key, Title: def.title, Width: width})
+			title := def.title
+			if overviewSortKey(sort) == def.key {
+				if asc {
+					title += "↑"
+				} else {
+					title += "↓"
+				}
+			}
+			specs = append(specs, overviewColumnSpec{Key: def.key, Title: title, Width: width})
 		}
 	}
 	return specs
+}
+
+func overviewSortKey(sort overviewSortMode) string {
+	switch sort {
+	case sortByStatus:
+		return "run_status"
+	case sortBySeverity:
+		return "blocker"
+	case sortByLastRun:
+		return "last_run"
+	case sortByVerdict:
+		return "manual_verdict"
+	default:
+		return "task_id"
+	}
 }
 
 func truncateDisplay(value string, width int) string {

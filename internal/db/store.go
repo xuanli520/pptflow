@@ -35,6 +35,38 @@ type ProjectSummary struct {
 	FailedStage   string
 	Blocking      int
 	High          int
+
+	LatestArtifactRoot string
+	LatestStaticOnly   bool
+}
+
+type ProjectSort string
+
+const (
+	ProjectSortTaskID   ProjectSort = "task_id"
+	ProjectSortStatus   ProjectSort = "status"
+	ProjectSortSeverity ProjectSort = "severity"
+	ProjectSortLastRun  ProjectSort = "last_run"
+	ProjectSortVerdict  ProjectSort = "verdict"
+)
+
+type ProjectSearch struct {
+	Terms []ProjectSearchTerm
+}
+
+type ProjectSearchTerm struct {
+	Text         string
+	Statuses     []string
+	Verdicts     []string
+	FailedStages []string
+}
+
+type ProjectQuery struct {
+	Sort   ProjectSort
+	Asc    bool
+	Search ProjectSearch
+	Limit  int
+	Offset int
 }
 
 type ArtifactPruneItem struct {
@@ -213,39 +245,388 @@ func (s *Store) GetProject(ctx context.Context, taskID string) (scanner.Project,
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]ProjectSummary, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT task_id, batch, path, run_count, COALESCE(last_run_id, ''), COALESCE(last_run_at, '') FROM projects ORDER BY task_id`)
+	projects, _, err := s.listProjectSummaries(ctx, ProjectQuery{
+		Sort: ProjectSortTaskID,
+		Asc:  true,
+	}, false)
+	return projects, err
+}
+
+func (s *Store) ListProjectsPaginated(ctx context.Context, q ProjectQuery) ([]ProjectSummary, int, error) {
+	return s.listProjectSummaries(ctx, q, true)
+}
+
+func (s *Store) listProjectSummaries(ctx context.Context, q ProjectQuery, paginated bool) ([]ProjectSummary, int, error) {
+	q = normalizeProjectQuery(q, paginated)
+	where, searchArgs := projectSearchPredicate(q.Search)
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	total := 0
+	if paginated {
+		countSQL := baseProjectRowsSQL(where) + `SELECT COUNT(*) FROM project_rows`
+		if err := tx.QueryRowContext(ctx, countSQL, searchArgs...).Scan(&total); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	selectSQL := baseProjectRowsSQL(where) + `SELECT task_id,
+       batch,
+       path,
+       run_count,
+       last_run_id,
+       last_run_at,
+       run_status,
+       manual_verdict,
+       failed_stage,
+       blocking,
+       high,
+       latest_artifact_root,
+       latest_static_only
+FROM project_rows
+` + projectOrderClause(q)
+	args := append([]any{}, searchArgs...)
+	if paginated {
+		selectSQL += `
+LIMIT ? OFFSET ?`
+		args = append(args, q.Limit, q.Offset)
+	}
+
+	rows, err := tx.QueryContext(ctx, selectSQL, args...)
+	if err != nil {
+		return nil, 0, err
 	}
 	var projects []ProjectSummary
 	for rows.Next() {
 		var project ProjectSummary
-		if err := rows.Scan(&project.TaskID, &project.Batch, &project.Path, &project.RunCount, &project.LastRunID, &project.LastRunAt); err != nil {
+		var staticOnly int
+		if err := rows.Scan(
+			&project.TaskID,
+			&project.Batch,
+			&project.Path,
+			&project.RunCount,
+			&project.LastRunID,
+			&project.LastRunAt,
+			&project.RunStatus,
+			&project.ManualVerdict,
+			&project.FailedStage,
+			&project.Blocking,
+			&project.High,
+			&project.LatestArtifactRoot,
+			&staticOnly,
+		); err != nil {
 			_ = rows.Close()
-			return nil, err
+			return nil, 0, err
 		}
+		project.LatestStaticOnly = staticOnly == 1
 		projects = append(projects, project)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return nil, err
+		return nil, 0, err
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	for i := range projects {
-		project := &projects[i]
-		run, err := s.LatestRunForTask(ctx, project.TaskID)
-		if err == nil {
-			project.LastRunID = run.RunID
-			project.LastRunAt = firstNonEmptyString(run.FinishedAt, run.StartedAt, project.LastRunAt)
-			project.RunStatus = run.Status
-			project.ManualVerdict = run.ManualVerdict
-			project.FailedStage = firstFailedStage(ctx, s, run.RunID)
-			project.Blocking, project.High = findingCounts(ctx, s, run.RunID)
+	if !paginated {
+		total = len(projects)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+	committed = true
+	return projects, total, nil
+}
+
+func baseProjectRowsSQL(where string) string {
+	return fmt.Sprintf(`WITH latest_run AS (
+    SELECT *
+    FROM (
+        SELECT r.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY r.task_id
+                   ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+               ) AS rn
+        FROM runs r
+    ) ranked_runs
+    WHERE rn = 1
+),
+failed_stage AS (
+    SELECT run_id, stage
+    FROM (
+        SELECT s.run_id,
+               s.stage,
+               ROW_NUMBER() OVER (
+                   PARTITION BY s.run_id
+                   ORDER BY CASE s.stage
+                       WHEN 'A' THEN 1 WHEN 'B' THEN 2 WHEN 'C' THEN 3
+                       WHEN 'D' THEN 4 WHEN 'E' THEN 5 WHEN 'F' THEN 6
+                       ELSE 99 END, s.stage
+               ) AS rn
+        FROM run_stages s
+        WHERE s.status IN ('failed', 'blocked')
+    ) ranked_stages
+    WHERE rn = 1
+),
+finding_counts AS (
+    SELECT run_id,
+           SUM(CASE WHEN severity = 'Blocker' THEN 1 ELSE 0 END) AS blocking,
+           SUM(CASE WHEN severity = 'High' THEN 1 ELSE 0 END) AS high
+    FROM findings
+    GROUP BY run_id
+),
+project_rows AS (
+    SELECT p.task_id,
+           p.batch,
+           p.path,
+           p.run_count,
+           COALESCE(lr.run_id, '') AS last_run_id,
+           COALESCE(NULLIF(lr.finished_at, ''), NULLIF(lr.started_at, ''), NULLIF(p.last_run_at, ''), '') AS last_run_at,
+           COALESCE(lr.status, '') AS run_status,
+           COALESCE(NULLIF(lr.manual_verdict, ''), 'unset') AS manual_verdict,
+           CASE COALESCE(lr.status, '')
+               WHEN 'running' THEN 50
+               WHEN 'crashed' THEN 40
+               WHEN 'completed_with_findings' THEN 30
+               WHEN 'aborted' THEN 20
+               WHEN 'completed_clean' THEN 10
+               ELSE 0
+           END AS status_rank,
+           CASE COALESCE(NULLIF(lr.manual_verdict, ''), 'unset')
+               WHEN 'fail' THEN 40
+               WHEN 'rework' THEN 30
+               WHEN 'unset' THEN 20
+               WHEN 'pass' THEN 10
+               ELSE 0
+           END AS verdict_rank,
+           COALESCE(fs.stage, '') AS failed_stage,
+           COALESCE(fc.blocking, 0) AS blocking,
+           COALESCE(fc.high, 0) AS high,
+           COALESCE(lr.artifact_root, '') AS latest_artifact_root,
+           COALESCE(lr.static_only, 0) AS latest_static_only
+    FROM projects p
+    LEFT JOIN latest_run lr ON lr.task_id = p.task_id
+    LEFT JOIN failed_stage fs ON fs.run_id = lr.run_id
+    LEFT JOIN finding_counts fc ON fc.run_id = lr.run_id
+    WHERE %s
+)
+`, where)
+}
+
+func normalizeProjectQuery(q ProjectQuery, paginated bool) ProjectQuery {
+	if !validProjectSort(q.Sort) {
+		q.Sort = ProjectSortTaskID
+		q.Asc = true
+	}
+	if paginated {
+		q.Limit = normalizeProjectLimit(q.Limit)
+	}
+	if q.Offset < 0 {
+		q.Offset = 0
+	}
+	q.Search = normalizeProjectSearch(q.Search)
+	return q
+}
+
+func validProjectSort(sort ProjectSort) bool {
+	switch sort {
+	case ProjectSortTaskID, ProjectSortStatus, ProjectSortSeverity, ProjectSortLastRun, ProjectSortVerdict:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeProjectLimit(limit int) int {
+	switch limit {
+	case 10, 20, 40, 50:
+		return limit
+	default:
+		return 20
+	}
+}
+
+func normalizeProjectSearch(search ProjectSearch) ProjectSearch {
+	capacity := len(search.Terms)
+	if capacity > 8 {
+		capacity = 8
+	}
+	terms := make([]ProjectSearchTerm, 0, capacity)
+	for _, term := range search.Terms {
+		if len(terms) >= 8 {
+			break
+		}
+		normalized := ProjectSearchTerm{
+			Text:         limitSearchText(strings.TrimSpace(term.Text), 64),
+			Statuses:     filterUnique(term.Statuses, validRunStatuses()),
+			Verdicts:     filterUnique(term.Verdicts, validManualVerdicts()),
+			FailedStages: filterUnique(term.FailedStages, validFailedStages()),
+		}
+		if normalized.Text == "" && len(normalized.Statuses) == 0 && len(normalized.Verdicts) == 0 && len(normalized.FailedStages) == 0 {
+			continue
+		}
+		terms = append(terms, normalized)
+	}
+	return ProjectSearch{Terms: terms}
+}
+
+func limitSearchText(value string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes])
+}
+
+func filterUnique(values []string, allowed map[string]bool) []string {
+	var result []string
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || !allowed[value] || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func validRunStatuses() map[string]bool {
+	return map[string]bool{
+		model.RunRunning:               true,
+		model.RunCrashed:               true,
+		model.RunCompletedWithFindings: true,
+		model.RunAborted:               true,
+		model.RunCompletedClean:        true,
+	}
+}
+
+func validManualVerdicts() map[string]bool {
+	return map[string]bool{
+		model.ManualUnset:  true,
+		model.ManualPass:   true,
+		model.ManualRework: true,
+		model.ManualFail:   true,
+	}
+}
+
+func validFailedStages() map[string]bool {
+	return map[string]bool{"A": true, "B": true, "C": true, "D": true, "E": true, "F": true}
+}
+
+func projectSearchPredicate(search ProjectSearch) (string, []any) {
+	if len(search.Terms) == 0 {
+		return "1=1", nil
+	}
+	var termPredicates []string
+	var args []any
+	for _, term := range search.Terms {
+		predicate, predicateArgs := projectSearchTermPredicate(term)
+		if predicate == "" {
+			continue
+		}
+		termPredicates = append(termPredicates, predicate)
+		args = append(args, predicateArgs...)
+	}
+	if len(termPredicates) == 0 {
+		return "1=1", nil
+	}
+	return strings.Join(termPredicates, " AND "), args
+}
+
+func projectSearchTermPredicate(term ProjectSearchTerm) (string, []any) {
+	var clauses []string
+	var args []any
+	if term.Text != "" {
+		pattern := likePattern(term.Text)
+		for _, expression := range []string{
+			"p.task_id",
+			"p.batch",
+			"p.path",
+			"COALESCE(lr.status, '')",
+			"COALESCE(NULLIF(lr.manual_verdict, ''), 'unset')",
+			"COALESCE(fs.stage, '')",
+		} {
+			clauses = append(clauses, expression+` LIKE ? ESCAPE '\'`)
+			args = append(args, pattern)
 		}
 	}
-	return projects, nil
+	if len(term.Statuses) > 0 {
+		clauses = append(clauses, "COALESCE(lr.status, '') IN ("+placeholders(len(term.Statuses))+")")
+		for _, status := range term.Statuses {
+			args = append(args, status)
+		}
+	}
+	if len(term.Verdicts) > 0 {
+		clauses = append(clauses, "COALESCE(NULLIF(lr.manual_verdict, ''), 'unset') IN ("+placeholders(len(term.Verdicts))+")")
+		for _, verdict := range term.Verdicts {
+			args = append(args, verdict)
+		}
+	}
+	if len(term.FailedStages) > 0 {
+		clauses = append(clauses, "COALESCE(fs.stage, '') IN ("+placeholders(len(term.FailedStages))+")")
+		for _, stage := range term.FailedStages {
+			args = append(args, stage)
+		}
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return "(" + strings.Join(clauses, " OR ") + ")", args
+}
+
+func likePattern(value string) string {
+	var builder strings.Builder
+	builder.WriteByte('%')
+	for _, r := range value {
+		switch r {
+		case '%', '_', '\\':
+			builder.WriteByte('\\')
+		}
+		builder.WriteRune(r)
+	}
+	builder.WriteByte('%')
+	return builder.String()
+}
+
+func placeholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
+}
+
+func projectOrderClause(q ProjectQuery) string {
+	dir := "ASC"
+	if !q.Asc {
+		dir = "DESC"
+	}
+
+	switch q.Sort {
+	case ProjectSortStatus:
+		return fmt.Sprintf("ORDER BY status_rank %s, task_id ASC", dir)
+	case ProjectSortSeverity:
+		return fmt.Sprintf("ORDER BY blocking %s, high %s, task_id ASC", dir, dir)
+	case ProjectSortLastRun:
+		return fmt.Sprintf("ORDER BY last_run_at %s, task_id ASC", dir)
+	case ProjectSortVerdict:
+		return fmt.Sprintf("ORDER BY verdict_rank %s, task_id ASC", dir)
+	default:
+		return fmt.Sprintf("ORDER BY task_id %s", dir)
+	}
 }
 
 func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {

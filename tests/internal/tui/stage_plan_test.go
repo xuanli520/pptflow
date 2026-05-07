@@ -67,11 +67,33 @@ func TestStagePlanFromStageRunsThroughF(t *testing.T) {
 	}
 }
 
-func TestStagePlanExplicitStagesAppendF(t *testing.T) {
+func TestStagePlanExplicitStagesDoNotForceF(t *testing.T) {
 	plan := tuiapp.StagePlanWithOptionsForTest("initial", "A", false, []string{"D"}, "")
-	want := []string{"D", "F"}
+	want := []string{"D"}
 	if !slices.Equal(plan.RunStages, want) || !slices.Equal(plan.DisplayStages, want) {
 		t.Fatalf("plan = run %#v display %#v, want %v", plan.RunStages, plan.DisplayStages, want)
+	}
+}
+
+func TestRunConfigFCanBeUnchecked(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverview("TASK-1").
+		SetExecutionPanel().
+		SetFocus("stage-list")
+
+	h, _ = h.Press("ctrl+r")
+	h, _ = h.Press("tab")
+	for i := 0; i < 5; i++ {
+		h, _ = h.Press("down")
+	}
+	h, _ = h.Press(" ")
+
+	view := h.View()
+	if !strings.Contains(view, "将运行阶段: A, B, C, D, E") {
+		t.Fatalf("run config should keep non-F defaults after F is unchecked:\n%s", view)
+	}
+	if strings.Contains(view, "将运行阶段: A, B, C, D, E, F") || strings.Contains(view, "始终选中") {
+		t.Fatalf("F should not be forced or labeled always-selected:\n%s", view)
 	}
 }
 

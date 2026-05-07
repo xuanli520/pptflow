@@ -1,10 +1,6 @@
 package tui
 
-import (
-	"fmt"
-
-	tea "github.com/charmbracelet/bubbletea"
-)
+import tea "github.com/charmbracelet/bubbletea"
 
 type focusArea int
 
@@ -35,16 +31,7 @@ func (f focusArea) String() string {
 
 func (m *app) setFocus(area focusArea) {
 	m.focus = area
-	if area == focusSearch {
-		m.search.Focus()
-	} else {
-		m.search.Blur()
-	}
-	if area == focusOverviewTable {
-		m.table.Focus()
-	} else {
-		m.table.Blur()
-	}
+	m.overview.SetFocus(area)
 }
 
 func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
@@ -61,12 +48,6 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	case "ctrl+r":
 		m.openRunConfig()
 		return m, cmds
-	case "ctrl+a":
-		m.showAttachHint()
-		return m, cmds
-	case "ctrl+m":
-		m.toggleMode()
-		return m, cmds
 	case "tab":
 		m.switchPanel(1)
 		return m, append(cmds, m.reloadDetail())
@@ -80,18 +61,15 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 
 	switch m.focus {
 	case focusSearch:
-		before := m.selectedTaskID()
 		switch key {
 		case "enter", "down":
 			m.setFocus(focusOverviewTable)
 		default:
 			var cmd tea.Cmd
-			m.search, cmd = m.search.Update(msg)
-			cmds = append(cmds, cmd)
-			m.refreshRows()
-		}
-		if m.selectedTaskID() != before {
-			cmds = append(cmds, m.reloadDetail())
+			m.overview, cmd = m.overview.Update(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 	case focusOverviewTable:
 		switch key {
@@ -104,12 +82,17 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			m.toggleMode()
 		case "q":
 			m.setFocus(focusSearch)
-		case "up", "down", "pgup", "pgdown", "home", "end":
+		case "up", "down", "pgup", "pgdown", "home", "end", "s", "S", "z":
 			before := m.selectedTaskID()
+			beforeKey := m.selectedOverviewDetailKey()
 			var cmd tea.Cmd
-			m.table, cmd = m.table.Update(msg)
-			cmds = append(cmds, cmd)
-			if m.syncSelectedTaskFromCursor() || m.selectedTaskID() != before {
+			m.overview, cmd = m.overview.Update(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			after := m.selectedTaskID()
+			afterKey := m.selectedOverviewDetailKey()
+			if after != "" && (after != before || afterKey != beforeKey) {
 				cmds = append(cmds, m.reloadDetail())
 			}
 		}
@@ -232,12 +215,6 @@ func (m *app) toggleMode() {
 	}
 }
 
-func (m *app) showAttachHint() {
-	if taskID := m.selectedTaskID(); taskID != "" {
-		m.message = fmt.Sprintf("附加文档命令: p2r attach %s --file <path>", taskID)
-	}
-}
-
 func (m *app) openRunConfig() {
 	if m.selectedTaskID() == "" {
 		return
@@ -265,13 +242,13 @@ func footerFor(m app) string {
 	case focusSearch:
 		return "Ctrl+C 退出  Tab 执行详情  ↓ 表格  Ctrl+R 重跑"
 	case focusOverviewTable:
-		return "↑↓ 选择  Enter 执行详情  / 搜索  Ctrl+R 重跑  m 模式  Ctrl+C 退出"
+		return "↑↓选择 Enter详情 /搜索 s排序 S反向 PgUp/PgDn翻页 z条数 Ctrl+R重跑 m模式"
 	case focusStageList:
-		return "↑↓ 阶段  Enter 详情  Ctrl+R 重跑  Ctrl+A 文档  m 模式"
+		return "↑↓ 阶段  Enter 详情  Ctrl+R 重跑  m 模式"
 	case focusRefRunList:
 		return "↑↓ 参考运行  Enter 选择  Esc 返回阶段  Ctrl+R 重跑"
 	case focusDetailViewport:
-		return "↑↓ 滚动  PgUp/PgDn 翻页  Esc 返回阶段  Ctrl+A 文档"
+		return "↑↓ 滚动  PgUp/PgDn 翻页  Esc 返回阶段"
 	default:
 		return "Ctrl+C 退出"
 	}

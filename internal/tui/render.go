@@ -39,10 +39,7 @@ func renderHeader(m app) string {
 }
 
 func renderOverview(m app) string {
-	if len(m.overviewItems) == 0 {
-		return m.search.View() + "\n\n" + mutedStyle.Render("未选择已索引的项目\n请先执行 `p2r scan --path <projects-qa>`")
-	}
-	return m.search.View() + "\n\n" + m.table.View()
+	return m.overview.View()
 }
 
 func renderExecution(m app) string {
@@ -324,9 +321,6 @@ func renderRunConfig(m app) string {
 			mark = "[✓]"
 		}
 		text := fmt.Sprintf("  %s %s - %s", mark, stage, localizeStageName(stage, ""))
-		if stage == "F" {
-			text += " (始终选中)"
-		}
 		if c.focus == runConfigFocusStages && c.stageIndex == i {
 			focusIndex = len(lines)
 			text = selectedStyle.Render(truncateDisplay("> "+text, width-4))
@@ -415,7 +409,7 @@ func focusLine(focused bool, line string) string {
 
 func runConfigStageChecked(c runConfig, stage string, plan stagePlan) bool {
 	if len(c.stages) > 0 {
-		return c.stages[stage] || stage == "F"
+		return c.stages[stage]
 	}
 	for _, selected := range plan.displayStages {
 		if selected == stage {
