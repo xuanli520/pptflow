@@ -3,6 +3,7 @@ db_path: "./projects-qa/.qa-control/index.db"
 
 pipeline:
   static_only: false
+  max_concurrent: 5
   self_test_report_path: "repo/self_test_report.md"
   stage_timeouts:
     A: 60
