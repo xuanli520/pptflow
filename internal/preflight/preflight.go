@@ -138,21 +138,8 @@ func checkCodex(ctx context.Context, exec executor.Runner, cfg config.Config) Ch
 }
 
 func validateExtraArgs(args []string) string {
-	for i := 0; i < len(args); i++ {
-		arg := strings.TrimSpace(args[i])
-		switch {
-		case arg == "--model" || arg == "-m":
-			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
-				return "codex.extra_args " + arg + " requires a model value"
-			}
-			i++
-		case strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "-m="):
-			if _, value, _ := strings.Cut(arg, "="); strings.TrimSpace(value) == "" {
-				return "codex.extra_args " + arg + " requires a model value"
-			}
-		default:
-			return "codex.extra_args contains unsupported app-server argument: " + arg
-		}
+	if _, err := codex.ValidateAppServerExtraArgs(args); err != nil {
+		return err.Error()
 	}
 	return ""
 }

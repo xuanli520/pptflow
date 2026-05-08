@@ -442,23 +442,7 @@ func untrustedDocument(label, path, content string) string {
 }
 
 func safeCodexExtraArgs(args []string) ([]string, error) {
-	for i := 0; i < len(args); i++ {
-		arg := strings.TrimSpace(args[i])
-		switch {
-		case arg == "--model" || arg == "-m":
-			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
-				return nil, fmt.Errorf("codex.extra_args %s requires a model value", arg)
-			}
-			i++
-		case strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "-m="):
-			if _, value, _ := strings.Cut(arg, "="); strings.TrimSpace(value) == "" {
-				return nil, fmt.Errorf("codex.extra_args %s requires a model value", arg)
-			}
-		default:
-			return nil, fmt.Errorf("codex.extra_args contains unsupported app-server argument: %s", arg)
-		}
-	}
-	return append([]string{}, args...), nil
+	return codex.ValidateAppServerExtraArgs(args)
 }
 
 func configuredEnvKeys(env map[string]string) []string {

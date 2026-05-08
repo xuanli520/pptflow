@@ -77,6 +77,63 @@ func ValidateAppServerCapability(cap Capability) error {
 	return nil
 }
 
+func ValidateAppServerExtraArgs(args []string) ([]string, error) {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "--model" || arg == "-m":
+			if i+1 >= len(args) {
+				return nil, missingAppServerModelValueError(arg)
+			}
+			if err := validateAppServerModelValue(arg, args[i+1]); err != nil {
+				return nil, err
+			}
+			i++
+		case strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "-m="):
+			flag, value, _ := strings.Cut(arg, "=")
+			if err := validateAppServerModelValue(flag, value); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("codex.extra_args contains unsupported app-server argument: %s", arg)
+		}
+	}
+	return append([]string{}, args...), nil
+}
+
+func validateAppServerModelValue(flag, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return missingAppServerModelValueError(flag)
+	}
+	if strings.HasPrefix(value, "-") {
+		return fmt.Errorf("codex.extra_args %s requires a model value, got option-like value %q", flag, value)
+	}
+	return nil
+}
+
+func missingAppServerModelValueError(flag string) error {
+	return fmt.Errorf("codex.extra_args %s requires a model value", flag)
+}
+
+func AppServerModelFromArgs(args []string) string {
+	for i, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "--model" || arg == "-m" {
+			if i+1 < len(args) {
+				return strings.TrimSpace(args[i+1])
+			}
+			return ""
+		}
+		for _, prefix := range []string{"--model=", "-m="} {
+			if strings.HasPrefix(arg, prefix) {
+				return strings.TrimSpace(strings.TrimPrefix(arg, prefix))
+			}
+		}
+	}
+	return ""
+}
+
 func WithNodeOnPATH(env []string, nodePath string) []string {
 	nodePath = strings.TrimSpace(nodePath)
 	if nodePath == "" {

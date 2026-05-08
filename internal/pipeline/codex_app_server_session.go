@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 )
 
@@ -151,7 +152,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 		"approvalPolicy": "never",
 		"cwd":            request.ProjectPath,
 		"ephemeral":      true,
-		"model":          codexModelFromArgs(request.Args),
+		"model":          appServerModelParam(request.Args),
 		"sandbox":        "read-only",
 	})
 	if err != nil {
@@ -174,7 +175,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 			"type": "text",
 			"text": request.Prompt,
 		}},
-		"model": codexModelFromArgs(request.Args),
+		"model": appServerModelParam(request.Args),
 		"sandboxPolicy": map[string]any{
 			"type":          "readOnly",
 			"networkAccess": false,
@@ -332,7 +333,7 @@ func (s *appServerCodexReviewSession) unregisterResponse(id int) {
 
 func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), appServerMaxLineBytes(s.maxOutputBytes()))
 	for scanner.Scan() {
 		line := scanner.Text()
 		s.appendLog(line + "\n")
@@ -354,21 +355,82 @@ func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
 			s.handleNotification(message)
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		s.completeStreamError("stdout", err)
+	}
 }
 
 func (s *appServerCodexReviewSession) readStderr(stderr io.Reader) {
 	scanner := bufio.NewScanner(stderr)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), appServerMaxLineBytes(s.maxOutputBytes()))
 	for scanner.Scan() {
 		line := scanner.Text()
 		s.appendLog("STDERR: " + line + "\n")
-		s.mu.Lock()
-		if s.stderr.Len() < s.req.MaxOutputBytes {
-			s.stderr.WriteString(line)
-			s.stderr.WriteByte('\n')
-		}
-		s.mu.Unlock()
+		s.recordStderrLine(line)
 	}
+	if err := scanner.Err(); err != nil {
+		s.completeStreamError("stderr", err)
+	}
+}
+
+func appServerMaxLineBytes(maxOutputBytes int) int {
+	const (
+		defaultLimit = 4 * 1024 * 1024
+		noLimitCap   = 64 * 1024 * 1024
+	)
+	if maxOutputBytes <= 0 {
+		return noLimitCap
+	}
+	limit := maxOutputBytes + 1024*1024
+	if limit < defaultLimit {
+		return defaultLimit
+	}
+	return limit
+}
+
+func (s *appServerCodexReviewSession) maxOutputBytes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.req.MaxOutputBytes
+}
+
+func (s *appServerCodexReviewSession) recordStderrLine(line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit := s.req.MaxOutputBytes
+	if limit <= 0 {
+		s.stderr.WriteString(line)
+		s.stderr.WriteByte('\n')
+		return
+	}
+	remaining := limit - s.stderr.Len()
+	if remaining <= 0 {
+		return
+	}
+	if len(line) >= remaining {
+		s.stderr.WriteString(line[:remaining])
+		return
+	}
+	s.stderr.WriteString(line)
+	if s.stderr.Len() < limit {
+		s.stderr.WriteByte('\n')
+	}
+}
+
+func (s *appServerCodexReviewSession) completeStreamError(stream string, err error) {
+	if err == nil {
+		return
+	}
+	streamErr := fmt.Errorf("codex app-server %s stream error: %w", stream, err)
+	s.appendLog("Codex app-server " + stream + " stream error: " + err.Error() + "\n")
+	s.mu.Lock()
+	command := ""
+	if s.cmd != nil {
+		command = commandString(s.cmd.Path, s.cmd.Args[1:])
+	}
+	stderr := s.stderr.String()
+	s.mu.Unlock()
+	s.complete(executor.Result{Command: command, Stderr: stderr, Err: streamErr}, streamErr)
 }
 
 func (s *appServerCodexReviewSession) dispatchResponse(id int, message appServerRPCMessage) {
@@ -506,10 +568,22 @@ func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnEr
 	s.mu.Unlock()
 	result := executor.Result{Command: command, Stdout: report, Stderr: stderr}
 	var err error
-	if strings.EqualFold(status, "failed") {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed":
+	case "failed":
 		message := "codex app-server turn failed"
 		if turnErr != nil && strings.TrimSpace(turnErr.Message) != "" {
 			message = turnErr.Message
+		}
+		err = fmt.Errorf("%s", message)
+		result.Err = err
+	case "":
+		err = fmt.Errorf("codex app-server turn completed without a status")
+		result.Err = err
+	default:
+		message := fmt.Sprintf("codex app-server turn ended with status %q", status)
+		if turnErr != nil && strings.TrimSpace(turnErr.Message) != "" {
+			message += ": " + strings.TrimSpace(turnErr.Message)
 		}
 		err = fmt.Errorf("%s", message)
 		result.Err = err
@@ -636,19 +710,9 @@ func stringAtPath(raw json.RawMessage, path ...string) string {
 	return strings.TrimSpace(text)
 }
 
-func codexModelFromArgs(args []string) any {
-	for i, arg := range args {
-		if arg == "--model" || arg == "-m" {
-			if i+1 < len(args) && strings.TrimSpace(args[i+1]) != "" {
-				return strings.TrimSpace(args[i+1])
-			}
-			return nil
-		}
-		for _, prefix := range []string{"--model=", "-m="} {
-			if strings.HasPrefix(arg, prefix) && strings.TrimSpace(strings.TrimPrefix(arg, prefix)) != "" {
-				return strings.TrimSpace(strings.TrimPrefix(arg, prefix))
-			}
-		}
+func appServerModelParam(args []string) any {
+	if model := codex.AppServerModelFromArgs(args); model != "" {
+		return model
 	}
 	return nil
 }

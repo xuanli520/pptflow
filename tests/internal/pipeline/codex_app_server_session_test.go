@@ -56,6 +56,34 @@ func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 	}
 }
 
+func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
+	dir := t.TempDir()
+	codexPath := filepath.Join(dir, "codex")
+	if err := os.WriteFile(codexPath, []byte(fakeAppServerWithTurnStatus("interrupted")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session := newAppServerCodexReviewSession(nil)
+	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{
+		Timeout:        5 * time.Second,
+		ProjectPath:    dir,
+		LogPath:        filepath.Join(dir, "codex.log"),
+		Env:            []string{"PATH=" + os.Getenv("PATH")},
+		Prompt:         "Run p2r stage E as a pure static review.",
+		Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
+		MaxOutputBytes: 1 << 20,
+	}, nil)
+	if err == nil {
+		t.Fatalf("expected interrupted turn to fail, result=%#v", result.Result)
+	}
+	if !strings.Contains(err.Error(), "interrupted") || result.Result.Err == nil {
+		t.Fatalf("unexpected interrupted result: err=%v result=%#v", err, result.Result)
+	}
+}
+
+func fakeAppServerWithTurnStatus(status string) string {
+	return strings.Replace(fakeSteerableAppServer(), `"status": "completed"`, `"status": "`+status+`"`, 1)
+}
+
 func fakeSteerableAppServer() string {
 	return `#!/usr/bin/env python3
 import json

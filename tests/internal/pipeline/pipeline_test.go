@@ -423,6 +423,25 @@ func TestCodexGuidanceDoesNotSendAfterFinalResult(t *testing.T) {
 	}
 }
 
+func TestCodexGuidanceStopsPromptlyWhenContextCancelled(t *testing.T) {
+	session := &fakeCodexSession{waitDelay: time.Hour}
+	deadlines := []pipelinepkg.CodexGuidanceDeadline{{Label: "late", After: time.Hour, Message: "late"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	result, err := runCodexReviewSessionWithGuidance(ctx, session, pipelinepkg.CodexReviewRequest{}, deadlines)
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("expected context deadline error, got err=%v result=%#v", err, result)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("guidance runner did not stop promptly after context cancellation: %s", elapsed)
+	}
+	if got := session.guidanceMessages(); len(got) != 0 {
+		t.Fatalf("guidance should not be sent after context cancellation, got %#v", got)
+	}
+}
+
 func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {

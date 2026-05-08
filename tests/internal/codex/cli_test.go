@@ -36,6 +36,44 @@ func TestValidateAppServerCapabilityRejectsMissingConfigOverride(t *testing.T) {
 	}
 }
 
+func TestValidateAppServerExtraArgsOnlyAllowsModelSelection(t *testing.T) {
+	got, err := codex.ValidateAppServerExtraArgs([]string{"--model", "gpt-5.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1] != "gpt-5.4" {
+		t.Fatalf("validated args were not preserved: %#v", got)
+	}
+	for _, args := range [][]string{
+		{"--sandbox", "read-only"},
+		{"--search"},
+		{"--dangerously-bypass-approvals-and-sandbox"},
+		{"--model", ""},
+		{"--model", "--search"},
+		{"--model=--search"},
+	} {
+		if _, err := codex.ValidateAppServerExtraArgs(args); err == nil {
+			t.Fatalf("expected args to be rejected: %#v", args)
+		}
+	}
+}
+
+func TestAppServerModelFromArgs(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--model", "gpt-5.4"}, "gpt-5.4"},
+		{[]string{"-m=gpt-5.5"}, "gpt-5.5"},
+		{[]string{"--model="}, ""},
+		{nil, ""},
+	} {
+		if got := codex.AppServerModelFromArgs(tc.args); got != tc.want {
+			t.Fatalf("AppServerModelFromArgs(%#v) = %q, want %q", tc.args, got, tc.want)
+		}
+	}
+}
+
 func TestWithNodeOnPATHPrependsNodeDirectory(t *testing.T) {
 	node := filepath.Join(t.TempDir(), "node")
 	env := []string{"PATH=/usr/bin"}

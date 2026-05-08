@@ -120,6 +120,20 @@ func runCodexReviewSessionWithGuidance(ctx context.Context, session CodexReviewS
 
 	start := time.Now()
 	var events []CodexGuidanceEvent
+	finish := func(outcome waitResult) (CodexReviewResult, error) {
+		outcome.result.GuidanceEvents = append(outcome.result.GuidanceEvents, events...)
+		return outcome.result, outcome.err
+	}
+	finishAfterCancel := func() (CodexReviewResult, error) {
+		outcome := <-waitCh
+		if outcome.err == nil {
+			outcome.err = ctx.Err()
+		}
+		if outcome.result.Result.Err == nil {
+			outcome.result.Result.Err = ctx.Err()
+		}
+		return finish(outcome)
+	}
 	for _, deadline := range deadlines {
 		wait := time.Until(start.Add(deadline.After))
 		if wait < 0 {
@@ -129,8 +143,10 @@ func runCodexReviewSessionWithGuidance(ctx context.Context, session CodexReviewS
 		select {
 		case outcome := <-waitCh:
 			timer.Stop()
-			outcome.result.GuidanceEvents = append(outcome.result.GuidanceEvents, events...)
-			return outcome.result, outcome.err
+			return finish(outcome)
+		case <-ctx.Done():
+			timer.Stop()
+			return finishAfterCancel()
 		case <-timer.C:
 			if ctx.Err() != nil {
 				continue
@@ -147,9 +163,12 @@ func runCodexReviewSessionWithGuidance(ctx context.Context, session CodexReviewS
 			events = append(events, event)
 		}
 	}
-	outcome := <-waitCh
-	outcome.result.GuidanceEvents = append(outcome.result.GuidanceEvents, events...)
-	return outcome.result, outcome.err
+	select {
+	case outcome := <-waitCh:
+		return finish(outcome)
+	case <-ctx.Done():
+		return finishAfterCancel()
+	}
 }
 
 func codexGuidanceSchedule(timeout time.Duration, stage string) []CodexGuidanceDeadline {
