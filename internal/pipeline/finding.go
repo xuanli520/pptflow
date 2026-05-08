@@ -181,25 +181,99 @@ func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.F
 	return findings, nil
 }
 
+func normalizeStaticReviewReport(report string) (string, error) {
+	report = strings.TrimSpace(report)
+	if report == "" {
+		return "", fmt.Errorf("static review report is empty")
+	}
+	start, blockEnd, _, err := staticReviewJSONBlock(report)
+	if err != nil {
+		return "", err
+	}
+	contract := strings.TrimSpace(report[start:blockEnd])
+	body := strings.TrimSpace(strings.Join([]string{
+		strings.TrimSpace(report[:start]),
+		strings.TrimSpace(report[blockEnd:]),
+	}, "\n\n"))
+	body, err = trimStaticReviewReportPreamble(body)
+	if err != nil {
+		return "", err
+	}
+	return body + "\n\n" + contract, nil
+}
+
 func extractStaticReviewJSON(report string) (string, error) {
+	_, _, payload, err := staticReviewJSONBlock(report)
+	return payload, err
+}
+
+func staticReviewJSONBlock(report string) (int, int, string, error) {
 	start := strings.Index(report, staticReviewJSONStart)
 	if start < 0 {
-		return "", fmt.Errorf("static review report missing %s marker", staticReviewJSONStart)
+		return 0, 0, "", fmt.Errorf("static review report missing %s marker", staticReviewJSONStart)
 	}
 	afterStart := start + len(staticReviewJSONStart)
 	endOffset := strings.Index(report[afterStart:], staticReviewJSONEnd)
 	if endOffset < 0 {
-		return "", fmt.Errorf("static review report missing %s marker", staticReviewJSONEnd)
+		return 0, 0, "", fmt.Errorf("static review report missing %s marker", staticReviewJSONEnd)
 	}
 	end := afterStart + endOffset
-	if strings.Contains(report[end+len(staticReviewJSONEnd):], staticReviewJSONStart) {
-		return "", fmt.Errorf("static review report contains multiple JSON contract blocks")
+	blockEnd := end + len(staticReviewJSONEnd)
+	if strings.Contains(report[blockEnd:], staticReviewJSONStart) {
+		return 0, 0, "", fmt.Errorf("static review report contains multiple JSON contract blocks")
 	}
 	payload := trimMarkdownFence(strings.TrimSpace(report[afterStart:end]))
 	if payload == "" {
-		return "", fmt.Errorf("static review JSON contract is empty")
+		return 0, 0, "", fmt.Errorf("static review JSON contract is empty")
 	}
-	return payload, nil
+	return start, blockEnd, payload, nil
+}
+
+func trimStaticReviewReportPreamble(body string) (string, error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", fmt.Errorf("static review report body is empty")
+	}
+	start := staticReviewReportStartIndex(body)
+	if start < 0 {
+		return "", fmt.Errorf("static review report must begin with a markdown heading or numbered section before the JSON contract")
+	}
+	return strings.TrimSpace(body[start:]), nil
+}
+
+func staticReviewReportStartIndex(body string) int {
+	offset := 0
+	for offset <= len(body) {
+		next := strings.IndexByte(body[offset:], '\n')
+		lineEnd := len(body)
+		if next >= 0 {
+			lineEnd = offset + next
+		}
+		line := body[offset:lineEnd]
+		trimmed := strings.TrimSpace(line)
+		if isStaticReviewReportStartLine(trimmed) {
+			return offset + len(line) - len(strings.TrimLeft(line, " \t\r"))
+		}
+		if next < 0 {
+			break
+		}
+		offset = lineEnd + 1
+	}
+	return -1
+}
+
+func isStaticReviewReportStartLine(line string) bool {
+	if strings.HasPrefix(line, "1. ") {
+		return true
+	}
+	if !strings.HasPrefix(line, "#") {
+		return false
+	}
+	hashes := 0
+	for hashes < len(line) && line[hashes] == '#' {
+		hashes++
+	}
+	return hashes >= 1 && hashes <= 6 && hashes < len(line) && (line[hashes] == ' ' || line[hashes] == '\t')
 }
 
 func trimMarkdownFence(value string) string {

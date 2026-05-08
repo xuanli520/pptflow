@@ -68,8 +68,8 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 		reportErr = fmt.Errorf("codex app-server produced no final agent message")
 		report = staticUnavailableReport("F", profile, project.Path, codexFailureEvidence(result, reportErr))
 	}
-	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
 	if result.Err != nil || reportErr != nil {
+		report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
 		_ = writeText(reportPath, report+"\n")
 		record.Findings = []model.Finding{{
 			Stage:      "F",
@@ -84,6 +84,15 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 		record.ErrorSummary = "codex app-server failed"
 		return finishStage(record, model.StageFailed, start)
 	}
+	normalizedReport, layoutErr := normalizeStaticReviewReport(report)
+	if layoutErr != nil {
+		report = staticUnavailableReport("F", profile, project.Path, "static review report layout invalid: "+layoutErr.Error())
+		_ = writeText(reportPath, report+"\n")
+		record.Findings = []model.Finding{staticReviewSchemaFailureFinding("F", reportPath, layoutErr)}
+		record.ErrorSummary = "static review schema invalid"
+		return finishStage(record, model.StageFailed, start)
+	}
+	report = truncateString(normalizedReport, r.cfg.Codex.MaxOutputBytes)
 	findings, schemaErr := staticReviewFindingsFromReport("F", report, reportPath)
 	if schemaErr != nil {
 		report = staticUnavailableReport("F", profile, project.Path, "static review report schema invalid: "+schemaErr.Error())

@@ -51,4 +51,7 @@ Recheck mode:
 - Name unresolved previous issues clearly and cite current evidence.
 
 Keep the report concise, evidence-based, and useful for a human PASS / REWORK / FAIL decision.
-Return the complete report as the final Codex response. Do not write files; p2r persists the response to the required artifact paths.
+Begin the final response immediately with `1. Repository / Requirement Mapping Summary`.
+Do not include progress updates, tool-use notes, setup narration, environment commentary, or any preamble before the report.
+If p2r supplies a machine-readable JSON contract block, place that block only at the very end of the final response, after all human-readable report sections, and do not write any text after the JSON end marker.
+Return only the complete report as the final Codex response. Do not write files; p2r persists the response to the required artifact paths.

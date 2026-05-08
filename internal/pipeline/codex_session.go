@@ -189,7 +189,7 @@ func codexGuidanceMessageWithContract(message, stage string) string {
 	}
 	return fmt.Sprintf(`%s
 
-Final response format is still mandatory. Return a complete Markdown review report and include exactly one static-review JSON contract block:
+Final response format is still mandatory. Return only the complete Markdown review report, with no progress preamble or tool-use narration. Begin immediately with the report's first heading or numbered section. Append exactly one static-review JSON contract block as the final block of the response:
 %s
 {
   "schema_version": "%s",
@@ -198,7 +198,7 @@ Final response format is still mandatory. Return a complete Markdown review repo
 }
 %s
 
-Replace findings with confirmed findings when present; use findings: [] only when none are confirmed. Do not return a prose-only summary.`, strings.TrimSpace(message), staticReviewJSONStart, staticReviewSchemaVersion, stage, staticReviewJSONEnd)
+Replace findings with confirmed findings when present; use findings: [] only when none are confirmed. Do not return a prose-only summary. Do not put any text after the JSON end marker.`, strings.TrimSpace(message), staticReviewJSONStart, staticReviewSchemaVersion, stage, staticReviewJSONEnd)
 }
 
 func appendCodexGuidanceEvents(logPath string, events []CodexGuidanceEvent) {

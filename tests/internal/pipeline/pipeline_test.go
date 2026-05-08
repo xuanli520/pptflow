@@ -42,6 +42,9 @@ func extractFindingsFromReport(stage, report, sourcePath string) []model.Finding
 //go:linkname staticReviewFindingsFromReport github.com/xuanli520/p2r_tui/internal/pipeline.staticReviewFindingsFromReport
 func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.Finding, error)
 
+//go:linkname normalizeStaticReviewReport github.com/xuanli520/p2r_tui/internal/pipeline.normalizeStaticReviewReport
+func normalizeStaticReviewReport(report string) (string, error)
+
 //go:linkname staticUnavailableReport github.com/xuanli520/p2r_tui/internal/pipeline.staticUnavailableReport
 func staticUnavailableReport(stage, profile, projectPath, reason string) string
 
@@ -363,7 +366,9 @@ func TestCodexGuidanceMessagesRestateStaticReviewContract(t *testing.T) {
 			`"schema_version": "p2r.static_review.v1"`,
 			`"stage": "E"`,
 			`"findings": []`,
+			"Begin immediately with the report's first heading",
 			"Do not return a prose-only summary.",
+			"Do not put any text after the JSON end marker.",
 		} {
 			if !strings.Contains(deadline.Message, want) {
 				t.Fatalf("%s guidance missing %q:\n%s", deadline.Label, want, deadline.Message)
@@ -383,6 +388,47 @@ func TestStaticUnavailableReportIncludesMachineReadableContract(t *testing.T) {
 	}
 	if len(findings) != 1 || findings[0].Severity != "High" || !strings.Contains(findings[0].Evidence, "missing marker") {
 		t.Fatalf("unexpected unavailable findings: %#v", findings)
+	}
+}
+
+func TestNormalizeStaticReviewReportRemovesPreambleAndMovesContractToEnd(t *testing.T) {
+	report := `I will keep this strictly static and inspect files only.
+
+Tool note: rg is unavailable, so I am using find.
+
+1. **Verdict**
+
+Overall conclusion: **Partial Pass**
+
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "E",
+  "findings": []
+}
+<!-- p2r:static-review-json:end -->
+
+2. **Scope and Static Verification Boundary**
+
+Reviewed repository files only.
+`
+	normalized, err := normalizeStaticReviewReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(normalized, "I will keep this strictly static") || strings.Contains(normalized, "Tool note") {
+		t.Fatalf("preamble should be removed:\n%s", normalized)
+	}
+	if !strings.HasPrefix(normalized, "1. **Verdict**") {
+		t.Fatalf("normalized report should start with first report section:\n%s", normalized)
+	}
+	jsonStart := strings.Index(normalized, "<!-- p2r:static-review-json:start -->")
+	scope := strings.Index(normalized, "2. **Scope and Static Verification Boundary**")
+	if jsonStart < 0 || scope < 0 || jsonStart < scope {
+		t.Fatalf("JSON contract should be moved after the report body:\n%s", normalized)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(normalized), "<!-- p2r:static-review-json:end -->") {
+		t.Fatalf("JSON contract should be the final block:\n%s", normalized)
 	}
 }
 
@@ -459,6 +505,9 @@ func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 		}
 		if !strings.Contains(text, "final Codex response") || !strings.Contains(text, "Do not write files") {
 			t.Fatalf("%s does not state the p2r final-response contract", name)
+		}
+		if !strings.Contains(text, "Do not include progress updates") || !strings.Contains(text, "JSON end marker") {
+			t.Fatalf("%s does not forbid preamble text and require final JSON placement", name)
 		}
 	}
 }

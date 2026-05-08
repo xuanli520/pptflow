@@ -200,9 +200,13 @@ Hard Rules (must follow)
 ====================
 Output Requirements
 
-Produce the final audit in a concise but complete report. Return the complete report as the final Codex response. Do not write files or create `.tmp` reports; p2r persists the response to the required artifact paths.
+Produce the final audit in a concise but complete report. Return only the complete report as the final Codex response. Do not write files or create `.tmp` reports; p2r persists the response to the required artifact paths.
+
+The final response must begin immediately with `1. Verdict`. Do not include progress updates, tool-use notes, setup narration, environment commentary, or any preamble before the report.
 
 The final report must be organized by the six major acceptance sections in order, even if your scan order was different.
+
+If p2r supplies a machine-readable JSON contract block, place that block only at the very end of the final response, after all human-readable report sections, and do not write any text after the JSON end marker.
 
 Use this structure:
 

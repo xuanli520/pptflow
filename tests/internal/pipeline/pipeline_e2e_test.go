@@ -390,9 +390,10 @@ if len(sys.argv) > 1 and sys.argv[1] == "app-server":
     def report_for(stage):
         if os.environ.get("FAKE_CODEX_REPORT") == "invalid":
             return "# Legacy Report\n- High: plain text finding without JSON contract\n"
-        return f"""# App Server Report
+        body = """# App Server Report
 - High: simulated finding from fake codex
-
+"""
+        contract = f"""
 <!-- p2r:static-review-json:start -->
 {{
   "schema_version": "p2r.static_review.v1",
@@ -410,6 +411,12 @@ if len(sys.argv) > 1 and sys.argv[1] == "app-server":
 }}
 <!-- p2r:static-review-json:end -->
 """
+        report = body + contract
+        if os.environ.get("FAKE_CODEX_SUFFIX_AFTER_CONTRACT") == "1":
+            report = body + contract + "\n2. **Scope**\n\nBody text after the contract.\n"
+        if os.environ.get("FAKE_CODEX_PREAMBLE") == "1":
+            report = "I will keep this strictly static before writing the report.\n\nTool note: rg is unavailable.\n\n" + report
+        return report
 
     for line in sys.stdin:
         if not line.strip():

@@ -217,3 +217,75 @@ func TestStageCodexUnsafeExtraArgsProducesFindingAndContract(t *testing.T) {
 		}
 	}
 }
+
+func TestStageCodexNormalizesFinalReportLayout(t *testing.T) {
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profiles := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profiles, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profiles, "static_acceptance_audit.md"), []byte("profile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
+	cfg := config.Default()
+	cfg.Codex.PromptProfilesDir = profiles
+	cfg.Codex.Env["FAKE_CODEX_PREAMBLE"] = "1"
+	cfg.Codex.Env["FAKE_CODEX_SUFFIX_AFTER_CONTRACT"] = "1"
+	record := runnerStageCodex(
+		pipelinepkg.NewRunner(nil, cfg),
+		context.Background(),
+		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: projectPath},
+		pipelinepkg.RunOptions{},
+		"E",
+		"static_acceptance_audit.md",
+		"1_质检AI测试报告.md",
+		"static_acceptance_audit_report.md",
+	)
+	if record.Status != model.StageDone {
+		t.Fatalf("stage record = %#v, want done", record)
+	}
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "1_质检AI测试报告.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	if strings.Contains(text, "I will keep this strictly static") || strings.Contains(text, "Tool note") {
+		t.Fatalf("preamble should not be persisted:\n%s", text)
+	}
+	if !strings.HasPrefix(text, "# App Server Report") {
+		t.Fatalf("report should start with the first report heading:\n%s", text)
+	}
+	startMarker := "<!-- p2r:static-review-json:start -->"
+	endMarker := "<!-- p2r:static-review-json:end -->"
+	jsonStart := strings.Index(text, startMarker)
+	if jsonStart < 0 || strings.LastIndex(text, startMarker) != jsonStart {
+		t.Fatalf("expected exactly one JSON contract block:\n%s", text)
+	}
+	if scope := strings.Index(text, "2. **Scope**"); scope < 0 || jsonStart < scope {
+		t.Fatalf("JSON contract should be after the human-readable report body:\n%s", text)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(text), endMarker) {
+		t.Fatalf("JSON contract should be the final block:\n%s", text)
+	}
+	compat, err := os.ReadFile(filepath.Join(artifactRoot, "static_acceptance_audit_report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(compat) != text {
+		t.Fatal("compatibility report should receive the same normalized content")
+	}
+}
