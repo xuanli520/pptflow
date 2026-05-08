@@ -131,7 +131,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		record.ErrorSummary = "codex unavailable"
 		return finishStage(record, model.StageFailed, start)
 	}
-	contextText, contextErr := r.codexContext(project, opts, stage)
+	contextText, contextErr := r.codexContext(ctx, project, opts, stage)
 	if contextErr != nil {
 		report := staticUnavailableReport(stage, profile, project.Path, contextErr.Error())
 		writeReports(report)
@@ -311,7 +311,7 @@ func staticReviewSchemaFailureFinding(stage, reportPath string, schemaErr error)
 	}
 }
 
-func (r Runner) codexContext(project scanner.Project, opts RunOptions, stage string) (string, error) {
+func (r Runner) codexContext(ctx context.Context, project scanner.Project, opts RunOptions, stage string) (string, error) {
 	var builder strings.Builder
 	if metadata, err := readBoundedText(filepath.Join(project.Path, "metadata.json"), 1<<20); err == nil {
 		builder.WriteString(untrustedDocument("metadata.json", filepath.Join(project.Path, "metadata.json"), metadata))
@@ -330,7 +330,7 @@ func (r Runner) codexContext(project scanner.Project, opts RunOptions, stage str
 		builder.WriteString(r.attachedDocsContext(project.TaskID))
 	}
 	if opts.Mode == "recheck" {
-		refRun, err := r.store.GetRun(context.Background(), opts.RefRun)
+		refRun, err := r.store.GetRun(ctx, opts.RefRun)
 		if err != nil {
 			return "", err
 		}

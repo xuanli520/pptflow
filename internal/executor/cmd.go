@@ -80,9 +80,9 @@ func runCommand(ctx context.Context, timeout time.Duration, dir string, env []st
 		Stderr:  stderr.String(),
 		Err:     err,
 	}
-	if ctx.Err() != nil {
-		result.Timeout = true
-		result.Err = ctx.Err()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result.Timeout = errors.Is(ctxErr, context.DeadlineExceeded)
+		result.Err = ctxErr
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {

@@ -47,6 +47,10 @@ type app struct {
 	runConfig  runConfig
 	activeJobs []scheduler.JobSnapshot
 
+	confirmCancelTaskID string
+	confirmCancelJobID  string
+	pendingCancelJobID  string
+
 	detailVM       executionViewModel
 	detailContent  string
 	lastRecoveryAt time.Time
@@ -66,6 +70,12 @@ type runMsg struct {
 type runSubmitMsg struct {
 	jobID string
 	err   error
+}
+
+type taskCancelRequestMsg struct {
+	taskID string
+	jobID  string
+	err    error
 }
 
 type schedulerJobsMsg struct {
@@ -191,8 +201,20 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.runConfig = runConfig{}
 		}
 		cmds = append(cmds, m.reloadSchedulerJobs())
+	case taskCancelRequestMsg:
+		if value.err != nil {
+			m.message = fmt.Sprintf("终止失败 %s: %s", value.taskID, value.err)
+		} else {
+			m.pendingCancelJobID = value.jobID
+			if m.pendingJob == value.jobID {
+				m.pendingJob = ""
+			}
+			m.message = "已发送终止请求 " + value.taskID
+		}
+		cmds = append(cmds, m.reloadSchedulerJobs(), m.reload())
 	case schedulerJobsMsg:
 		m.activeJobs = value.jobs
+		m.updatePendingCancelMessage(value.jobs)
 		m.updatePendingJobMessage(value.jobs)
 		if cmd := m.applyLayout(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -220,6 +242,9 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *app) updatePendingJobMessage(jobs []scheduler.JobSnapshot) {
 	if m.pendingJob == "" {
+		return
+	}
+	if m.pendingJob == m.pendingCancelJobID {
 		return
 	}
 	job, ok := findJobSnapshot(jobs, m.pendingJob)
@@ -250,6 +275,36 @@ func (m *app) updatePendingJobMessage(jobs []scheduler.JobSnapshot) {
 	}
 }
 
+func (m *app) updatePendingCancelMessage(jobs []scheduler.JobSnapshot) {
+	if m.pendingCancelJobID == "" {
+		return
+	}
+	job, ok := findJobSnapshot(jobs, m.pendingCancelJobID)
+	if !ok {
+		return
+	}
+	switch job.State {
+	case scheduler.JobQueued, scheduler.JobRunning:
+		if job.CancelRequested {
+			m.message = "正在终止 " + job.TaskID + " 的运行"
+		}
+	case scheduler.JobFailed:
+		if job.CancelRequested {
+			m.message = "已终止 " + job.TaskID + " 的运行"
+		} else {
+			reason := strings.TrimSpace(job.Err)
+			if reason == "" {
+				reason = "未知错误"
+			}
+			m.message = "终止后 job 失败: " + reason
+		}
+		m.pendingCancelJobID = ""
+	case scheduler.JobDone:
+		m.message = "终止请求已发送，但 job 已完成"
+		m.pendingCancelJobID = ""
+	}
+}
+
 func findJobSnapshot(jobs []scheduler.JobSnapshot, jobID string) (scheduler.JobSnapshot, bool) {
 	for _, job := range jobs {
 		if job.JobID == jobID {
@@ -265,6 +320,11 @@ func (m app) View() string {
 	builder.WriteString("\n")
 	if m.message != "" {
 		builder.WriteString(messageStyle(m.message).Render(m.message))
+		builder.WriteString("\n")
+	}
+	if m.confirmCancelTaskID != "" {
+		prompt := fmt.Sprintf("确认终止 %s 的 %s？(y/n)", m.confirmCancelTaskID, m.confirmCancelJobID)
+		builder.WriteString(errorStyle.Render(truncateDisplay(prompt, max(8, m.width-2))))
 		builder.WriteString("\n")
 	}
 	builder.WriteString(renderPipelineBar(m))
@@ -360,6 +420,16 @@ func (m app) submitRun(taskID string, opts pipeline.RunOptions) tea.Cmd {
 	}
 }
 
+func cancelTaskCmd(s *scheduler.Scheduler, taskID, jobID string) tea.Cmd {
+	return func() tea.Msg {
+		if s == nil {
+			return taskCancelRequestMsg{taskID: taskID, jobID: jobID, err: fmt.Errorf("scheduler unavailable")}
+		}
+		err := s.CancelTask(taskID)
+		return taskCancelRequestMsg{taskID: taskID, jobID: jobID, err: err}
+	}
+}
+
 func (m app) reloadSchedulerJobs() tea.Cmd {
 	if m.scheduler == nil {
 		return nil
@@ -393,7 +463,7 @@ func (m app) shutdownScheduler() tea.Cmd {
 }
 
 func (m *app) applyLayout() tea.Cmd {
-	layout := layoutFor(m.width, max(8, m.height-pipelineBarHeight(*m)), m.tab == panelExecution)
+	layout := layoutFor(m.width, max(8, m.height-verticalChromeHeight(*m)), m.tab == panelExecution)
 	pageSizeChanged := m.overview.SetSize(layout.contentWidth, layout.overviewTableHeight)
 	m.detail.Width = layout.detailWidth
 	m.detail.Height = layout.detailHeight
@@ -409,6 +479,18 @@ func (m *app) applyLayout() tea.Cmd {
 
 func (m app) selectedTaskID() string {
 	return m.overview.SelectedTaskID()
+}
+
+func (m app) activeJobForTask(taskID string) (scheduler.JobSnapshot, bool) {
+	for _, job := range m.activeJobs {
+		if job.TaskID != taskID {
+			continue
+		}
+		if job.State == scheduler.JobQueued || job.State == scheduler.JobRunning {
+			return job, true
+		}
+	}
+	return scheduler.JobSnapshot{}, false
 }
 
 func (m app) selectedStage() stageView {

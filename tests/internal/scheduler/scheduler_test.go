@@ -2,6 +2,7 @@ package scheduler_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,6 +86,76 @@ func TestSnapshotTracksRunProgressAndStageCompletion(t *testing.T) {
 	defer cancel()
 	if err := s.Shutdown(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCancelQueuedJobDoesNotReleaseRunningSlot(t *testing.T) {
+	s := newTestScheduler(t, 800*time.Millisecond, "TASK-1", "TASK-2", "TASK-3")
+
+	if _, err := s.Submit("TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-1" && snapshot.State == scheduler.JobRunning
+	})
+	if _, err := s.Submit("TASK-2", pipeline.RunOptions{Stage: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	queued := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-2" && snapshot.State == scheduler.JobQueued
+	})
+	if err := s.CancelTask("TASK-2"); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.JobID == queued.JobID && snapshot.State == scheduler.JobFailed && snapshot.CancelRequested
+	})
+	if cancelled.Err != scheduler.ErrJobCancelledByUser.Error() {
+		t.Fatalf("cancelled queued err = %q", cancelled.Err)
+	}
+	if _, err := s.Submit("TASK-3", pipeline.RunOptions{Stage: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	third := waitForSnapshot(t, s, 150*time.Millisecond, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-3" && snapshot.State == scheduler.JobQueued
+	})
+	if third.State != scheduler.JobQueued {
+		t.Fatalf("third job should remain queued while first holds slot: %#v", third)
+	}
+	waitForSnapshot(t, s, 4*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-3" && snapshot.State == scheduler.JobDone
+	})
+}
+
+func TestCancelRunningJobMarksUserCancelledAndKeepsPartialRun(t *testing.T) {
+	s := newTestScheduler(t, 3*time.Second, "TASK-1")
+
+	if _, err := s.Submit("TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	running := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-1" && snapshot.State == scheduler.JobRunning && snapshot.RunID != ""
+	})
+	if err := s.CancelTask("TASK-1"); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := waitForSnapshot(t, s, 6*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.JobID == running.JobID && snapshot.State == scheduler.JobFailed && snapshot.CancelRequested
+	})
+	if cancelled.Err != scheduler.ErrJobCancelledByUser.Error() {
+		t.Fatalf("cancelled running err = %q", cancelled.Err)
+	}
+	if cancelled.RunID == "" || cancelled.Result == nil || cancelled.Result.Run.Status != model.RunAborted {
+		t.Fatalf("cancelled job should keep aborted partial result: %#v", cancelled)
+	}
+	if len(cancelled.Stages) == 0 {
+		t.Fatalf("cancelled job should retain stage snapshots: %#v", cancelled)
+	}
+	if err := s.CancelTask("TASK-1"); err == nil || !strings.Contains(err.Error(), "no active job") {
+		t.Fatalf("completed cancelled job should no longer be active, got %v", err)
+	}
+	if !errors.Is(fmt.Errorf("wrapped: %w", scheduler.ErrJobCancelledByUser), scheduler.ErrJobCancelledByUser) {
+		t.Fatal("sentinel error should be stable")
 	}
 }
 

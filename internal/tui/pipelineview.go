@@ -35,7 +35,9 @@ func renderPipelineBar(m app) string {
 	lines := []string{mutedStyle.Render(line)}
 	for _, job := range active[:limit] {
 		label := localizeJobState(job.State)
-		if job.CurrentStage != "" {
+		if job.CancelRequested {
+			label = "终止中"
+		} else if job.CurrentStage != "" {
 			label = "阶段" + job.CurrentStage + " " + localizeStageName(job.CurrentStage, "")
 		}
 		lines = append(lines, fmt.Sprintf("  %s %s  %s  %s", jobStateIcon(job.State), truncateMiddleDisplay(job.TaskID, 24), label, shortDuration(job)))

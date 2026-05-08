@@ -238,15 +238,38 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 		}
 	}()
 	stages := initialStages(selectedStages(opts, staticOnly), staticOnly)
+	results := map[string]model.StageRecord{}
+	runtimeCleanupDone := false
+	cleanupFailed := false
+	abortIfCancelled := func() (Result, error, bool) {
+		if abortErr := ctx.Err(); abortErr != nil {
+			result, err := r.finishAbortedRun(abortErr, &run, start, stages, keepRuntime, &runtimeCleanupDone, &runFinished, progress)
+			stages = result.Stages
+			return result, err, true
+		}
+		return Result{}, nil, false
+	}
+	if result, err, aborted := abortIfCancelled(); aborted {
+		return result, err
+	}
 	if err := r.writeRunManifest(run, project, opts, released, releaseErr, importedDocs, docsManifest, firstErrorString(docsImportErr, docsManifestErr)); err != nil {
 		return Result{}, err
 	}
 	if err := r.writeStageStatus(runID, artifactRoot, stages); err != nil {
 		return Result{}, err
 	}
+	if result, err, aborted := abortIfCancelled(); aborted {
+		return result, err
+	}
 	for _, stage := range stages {
+		if result, err, aborted := abortIfCancelled(); aborted {
+			return result, err
+		}
 		_ = r.store.PutStage(ctx, runID, stage)
 		progress(RunProgress{RunID: runID, Stage: stage.Stage, Event: "stage_pending", StageRecord: stage})
+	}
+	if result, err, aborted := abortIfCancelled(); aborted {
+		return result, err
 	}
 	preflightResult := preflight.Run(ctx, r.exec, r.cfg)
 	preflightPath := filepath.Join(artifactRoot, "preflight.json")
@@ -255,24 +278,35 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	if len(preCleanup) > 0 {
 		mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "pre_run_cleanup", preCleanup)
 	}
-
-	results := map[string]model.StageRecord{}
-	runtimeCleanupDone := false
-	cleanupFailed := false
+	if result, err, aborted := abortIfCancelled(); aborted {
+		return result, err
+	}
 	for index := range stages {
 		stage := stages[index].Stage
+		if result, err, aborted := abortIfCancelled(); aborted {
+			return result, err
+		}
 		if stages[index].Status == model.StageSkipped {
 			record := r.materializeSkippedStage(run, stages[index])
 			stages[index] = record
 			results[stage] = record
+			if result, err, aborted := abortIfCancelled(); aborted {
+				return result, err
+			}
 			_ = r.store.PutStage(ctx, runID, record)
 			_ = r.writeStageStatus(runID, artifactRoot, stages)
 			progress(RunProgress{RunID: runID, Stage: record.Stage, Event: "stage_done", StageRecord: record})
+			if result, err, aborted := abortIfCancelled(); aborted {
+				return result, err
+			}
 			continue
 		}
 		running := runningStage(run, stage)
 		stages[index] = running
 		results[stage] = running
+		if result, err, aborted := abortIfCancelled(); aborted {
+			return result, err
+		}
 		_ = r.store.PutStage(ctx, runID, running)
 		_ = r.writeStageStatus(runID, artifactRoot, stages)
 		progress(RunProgress{RunID: runID, Stage: stage, Event: "stage_running", StageRecord: running})
@@ -280,10 +314,16 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 		record.Findings = assignMissingFindingIDs(stage, record.Findings)
 		stages[index] = record
 		results[stage] = record
+		if result, err, aborted := abortIfCancelled(); aborted {
+			return result, err
+		}
 		_ = r.store.PutStage(ctx, runID, record)
 		_ = r.store.InsertFindings(ctx, runID, record.Findings)
 		_ = r.writeStageStatus(runID, artifactRoot, stages)
 		progress(RunProgress{RunID: runID, Stage: record.Stage, Event: "stage_done", StageRecord: record})
+		if result, err, aborted := abortIfCancelled(); aborted {
+			return result, err
+		}
 		if !runtimeCleanupDone && runtimeCleanupPoint(stage, stages) {
 			cleanupSummary := r.cleanupCurrentRuntime(ctx, run, keepRuntime)
 			mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
@@ -291,23 +331,36 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 				cleanupFailed = true
 				_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
 			}
-			runtimeCleanupDone = true
+			runtimeCleanupDone = cleanupSummary.Status != "failed" || ctx.Err() == nil
 			progress(RunProgress{RunID: runID, Event: "cleanup"})
+			if result, err, aborted := abortIfCancelled(); aborted {
+				return result, err
+			}
 		}
 	}
 	if !runtimeCleanupDone && runtimeStageWasSelected(stages) {
+		if result, err, aborted := abortIfCancelled(); aborted {
+			return result, err
+		}
 		cleanupSummary := r.cleanupCurrentRuntime(ctx, run, keepRuntime)
 		mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
 		if cleanupSummary.Status == "failed" {
 			cleanupFailed = true
 			_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
 		}
+		runtimeCleanupDone = cleanupSummary.Status != "failed" || ctx.Err() == nil
 		progress(RunProgress{RunID: runID, Event: "cleanup"})
+		if result, err, aborted := abortIfCancelled(); aborted {
+			return result, err
+		}
 	}
 
 	status := runStatus(stages)
 	if cleanupFailed {
 		status = model.RunCompletedWithFindings
+	}
+	if result, err, aborted := abortIfCancelled(); aborted {
+		return result, err
 	}
 	if err := r.store.FinishRun(ctx, runID, taskID, status, time.Since(start)); err != nil {
 		return Result{}, err
@@ -335,6 +388,97 @@ func (r Runner) markRunCrashed(ctx context.Context, run model.RunRecord, start t
 	_ = r.store.FinishRun(ctx, run.RunID, run.TaskID, model.RunCrashed, time.Since(start))
 }
 
+func (r Runner) finishAbortedRun(abortErr error, run *model.RunRecord, start time.Time, stages []model.StageRecord, keepRuntime bool, runtimeCleanupDone *bool, runFinished *bool, progress func(RunProgress)) (Result, error) {
+	if abortErr == nil {
+		abortErr = context.Canceled
+	}
+	*runFinished = true
+	stages = markInFlightStageAborted(stages, abortErr)
+	saveErrors := []string{}
+
+	saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	for index := range stages {
+		stages[index].Findings = assignMissingFindingIDs(stages[index].Stage, stages[index].Findings)
+		if err := r.store.PutStage(saveCtx, run.RunID, stages[index]); err != nil {
+			saveErrors = append(saveErrors, fmt.Sprintf("put stage %s: %s", stages[index].Stage, err))
+		}
+		if len(stages[index].Findings) > 0 {
+			if err := r.store.InsertFindings(saveCtx, run.RunID, stages[index].Findings); err != nil {
+				saveErrors = append(saveErrors, fmt.Sprintf("insert findings %s: %s", stages[index].Stage, err))
+			}
+		}
+	}
+	saveCancel()
+	if err := r.writeStageStatus(run.RunID, run.ArtifactRoot, stages); err != nil {
+		saveErrors = append(saveErrors, "write stage_status.json: "+err.Error())
+	}
+
+	cleanupStatus := "not_applicable"
+	if runtimeCleanupDone != nil && *runtimeCleanupDone {
+		cleanupStatus = "already_done"
+	} else if runtimeStageWasSelected(stages) {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanupSummary := r.cleanupCurrentRuntime(cleanupCtx, *run, keepRuntime)
+		cleanupCancel()
+		cleanupStatus = cleanupSummary.Status
+		mergeCleanupIntoManifest(filepath.Join(run.ArtifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
+		if cleanupSummary.Status == "failed" {
+			findingCtx, findingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := r.store.InsertFindings(findingCtx, run.RunID, []model.Finding{cleanupFinding(cleanupSummary)}); err != nil {
+				saveErrors = append(saveErrors, "insert cleanup finding: "+err.Error())
+			}
+			findingCancel()
+		}
+		if runtimeCleanupDone != nil {
+			*runtimeCleanupDone = cleanupSummary.Status != "failed"
+		}
+	}
+
+	finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := r.store.FinishRun(finishCtx, run.RunID, run.TaskID, model.RunAborted, time.Since(start)); err != nil {
+		saveErrors = append(saveErrors, "finish aborted run: "+err.Error())
+	}
+	finishCancel()
+
+	run.Status = model.RunAborted
+	run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	run.DurationMS = time.Since(start).Milliseconds()
+	_ = writeJSON(filepath.Join(run.ArtifactRoot, "abort_summary.json"), map[string]any{
+		"run_id":         run.RunID,
+		"task_id":        run.TaskID,
+		"status":         model.RunAborted,
+		"reason":         abortErr.Error(),
+		"save_errors":    saveErrors,
+		"cleanup_status": cleanupStatus,
+		"recorded_at":    time.Now().UTC().Format(time.RFC3339),
+	})
+	progress(RunProgress{RunID: run.RunID, Event: "run_done", Done: true, Err: abortErr})
+	return Result{Run: *run, Stages: stages}, abortErr
+}
+
+func markInFlightStageAborted(stages []model.StageRecord, abortErr error) []model.StageRecord {
+	now := time.Now().UTC()
+	reason := "pipeline aborted"
+	if abortErr != nil && strings.TrimSpace(abortErr.Error()) != "" {
+		reason += ": " + abortErr.Error()
+	}
+	for index := range stages {
+		if stages[index].Status != model.StageRunning {
+			continue
+		}
+		stages[index].Status = model.StageFailed
+		stages[index].FinishedAt = now.Format(time.RFC3339)
+		if started, err := time.Parse(time.RFC3339, stages[index].StartedAt); err == nil {
+			stages[index].DurationMS = now.Sub(started).Milliseconds()
+		}
+		if stages[index].ArtifactPaths == nil {
+			stages[index].ArtifactPaths = []string{}
+		}
+		stages[index].ErrorSummary = reason
+	}
+	return stages
+}
+
 func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project scanner.Project, stage string, prior map[string]model.StageRecord, opts RunOptions, preflightResult preflight.CheckResult) model.StageRecord {
 	if check, ok := preflightResult.BlockingCheck(stage); ok {
 		if stage == "D" || stage == "E" || stage == "F" {
@@ -346,7 +490,7 @@ func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project s
 	}
 	switch stage {
 	case "A":
-		return r.stageA(run, project)
+		return r.stageA(ctx, run, project)
 	case "B":
 		return r.stageB(ctx, run, project)
 	case "C":

@@ -16,6 +16,8 @@ import (
 
 type JobState int
 
+var ErrJobCancelledByUser = errors.New("cancelled by user")
+
 const (
 	JobQueued JobState = iota
 	JobRunning
@@ -51,9 +53,10 @@ type Job struct {
 	StartedAt    time.Time
 	FinishedAt   time.Time
 
-	opts   pipeline.RunOptions
-	cancel context.CancelFunc
-	mu     sync.RWMutex
+	opts            pipeline.RunOptions
+	cancel          context.CancelFunc
+	cancelRequested bool
+	mu              sync.RWMutex
 }
 
 type JobSnapshot struct {
@@ -68,6 +71,8 @@ type JobSnapshot struct {
 	SubmittedAt  time.Time
 	StartedAt    time.Time
 	FinishedAt   time.Time
+
+	CancelRequested bool
 }
 
 type Scheduler struct {
@@ -155,6 +160,58 @@ func (s *Scheduler) Submit(taskID string, opts pipeline.RunOptions) (string, err
 	return jobID, nil
 }
 
+func (s *Scheduler) CancelTask(taskID string) error {
+	if s == nil {
+		return errors.New("scheduler is nil")
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return errors.New("task id is required")
+	}
+
+	var cancel context.CancelFunc
+	notify := false
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	job := s.activeByTask[taskID]
+	if job == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("task %s has no active job", taskID)
+	}
+
+	job.mu.Lock()
+	switch job.State {
+	case JobQueued:
+		job.cancelRequested = true
+		finishCancelledJobLocked(job, now)
+		s.deleteActiveJobLocked(job)
+		s.removeFromQueueLocked(job.JobID)
+		notify = true
+	case JobRunning:
+		if !job.cancelRequested {
+			job.cancelRequested = true
+			cancel = job.cancel
+		}
+		notify = true
+	default:
+		err := fmt.Errorf("job %s is in state %s, cannot cancel", job.JobID, job.State)
+		job.mu.Unlock()
+		s.mu.Unlock()
+		return err
+	}
+	job.mu.Unlock()
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if notify {
+		s.notify()
+	}
+	return nil
+}
+
 func (s *Scheduler) Snapshot() []JobSnapshot {
 	if s == nil {
 		return nil
@@ -167,16 +224,17 @@ func (s *Scheduler) Snapshot() []JobSnapshot {
 	for _, job := range jobs {
 		job.mu.RLock()
 		snapshot := JobSnapshot{
-			JobID:        job.JobID,
-			RunID:        job.RunID,
-			TaskID:       job.TaskID,
-			State:        job.State,
-			CurrentStage: job.CurrentStage,
-			Stages:       append([]model.StageRecord(nil), job.Stages...),
-			Result:       cloneResult(job.Result),
-			SubmittedAt:  job.SubmittedAt,
-			StartedAt:    job.StartedAt,
-			FinishedAt:   job.FinishedAt,
+			JobID:           job.JobID,
+			RunID:           job.RunID,
+			TaskID:          job.TaskID,
+			State:           job.State,
+			CurrentStage:    job.CurrentStage,
+			Stages:          append([]model.StageRecord(nil), job.Stages...),
+			Result:          cloneResult(job.Result),
+			SubmittedAt:     job.SubmittedAt,
+			StartedAt:       job.StartedAt,
+			FinishedAt:      job.FinishedAt,
+			CancelRequested: job.cancelRequested,
 		}
 		if job.Err != nil {
 			snapshot.Err = job.Err.Error()
@@ -244,21 +302,34 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 func (s *Scheduler) startJob(job *Job) {
 	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now().UTC()
+	var next *Job
 
 	s.mu.Lock()
 	job.mu.Lock()
-	if s.closed || job.State != JobQueued {
+	if s.closed || job.State != JobQueued || job.cancelRequested {
 		if job.State == JobQueued {
-			job.State = JobFailed
-			job.Err = context.Canceled
-			job.FinishedAt = now
-			delete(s.activeByTask, job.TaskID)
+			if job.cancelRequested {
+				finishCancelledJobLocked(job, now)
+			} else {
+				job.State = JobFailed
+				job.Err = context.Canceled
+				job.FinishedAt = now
+			}
+			s.deleteActiveJobLocked(job)
+		}
+		if !s.closed {
+			next = s.popQueuedJobLocked()
+		}
+		if next == nil {
+			s.releaseSlotLocked()
 		}
 		job.mu.Unlock()
-		s.releaseSlotLocked()
 		s.mu.Unlock()
 		cancel()
 		s.notify()
+		if next != nil {
+			s.startJob(next)
+		}
 		return
 	}
 	job.State = JobRunning
@@ -291,18 +362,22 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 	}
 	result, err := pipeline.NewRunner(s.store, s.cfg).Run(ctx, job.TaskID, opts)
 	job.mu.Lock()
-	if err != nil {
+	if job.cancelRequested {
+		if result.Run.RunID != "" {
+			applyResultLocked(job, result)
+		}
+		finishCancelledJobLocked(job, time.Now().UTC())
+	} else if err != nil {
+		if result.Run.RunID != "" {
+			applyResultLocked(job, result)
+		}
 		job.State = JobFailed
 		job.Err = err
 		job.FinishedAt = time.Now().UTC()
 	} else {
-		resultCopy := result
-		resultCopy.Stages = append([]model.StageRecord(nil), result.Stages...)
-		job.Result = &resultCopy
+		applyResultLocked(job, result)
 		job.State = JobDone
 		job.Err = nil
-		job.RunID = result.Run.RunID
-		job.Stages = append([]model.StageRecord(nil), result.Stages...)
 		job.CurrentStage = ""
 		job.FinishedAt = time.Now().UTC()
 	}
@@ -317,6 +392,22 @@ func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {
 	}
 	if update.StageRecord.Stage != "" {
 		job.Stages = upsertStage(job.Stages, update.StageRecord)
+	}
+	if job.cancelRequested {
+		switch update.Event {
+		case "stage_running":
+			job.CurrentStage = update.Stage
+		case "stage_done", "run_done", "run_crashed":
+			if job.CurrentStage == update.Stage || update.Event != "stage_done" {
+				job.CurrentStage = ""
+			}
+		}
+		if update.Done && job.FinishedAt.IsZero() {
+			job.FinishedAt = time.Now().UTC()
+		}
+		job.mu.Unlock()
+		s.notify()
+		return
 	}
 	switch update.Event {
 	case "stage_running":
@@ -355,11 +446,11 @@ func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {
 func (s *Scheduler) finishJob(job *Job) {
 	var next *Job
 	s.mu.Lock()
-	delete(s.activeByTask, job.TaskID)
-	if !s.closed && len(s.queue) > 0 {
-		next = s.queue[0]
-		s.queue = s.queue[1:]
-	} else {
+	s.deleteActiveJobLocked(job)
+	if !s.closed {
+		next = s.popQueuedJobLocked()
+	}
+	if next == nil {
 		s.releaseSlotLocked()
 	}
 	s.mu.Unlock()
@@ -367,6 +458,64 @@ func (s *Scheduler) finishJob(job *Job) {
 		s.startJob(next)
 	}
 	s.notify()
+}
+
+func (s *Scheduler) removeFromQueueLocked(jobID string) {
+	if jobID == "" || len(s.queue) == 0 {
+		return
+	}
+	filtered := s.queue[:0]
+	for _, job := range s.queue {
+		if job.JobID == jobID {
+			continue
+		}
+		filtered = append(filtered, job)
+	}
+	s.queue = filtered
+}
+
+func (s *Scheduler) deleteActiveJobLocked(job *Job) {
+	if job == nil {
+		return
+	}
+	if s.activeByTask[job.TaskID] == job {
+		delete(s.activeByTask, job.TaskID)
+	}
+}
+
+func (s *Scheduler) popQueuedJobLocked() *Job {
+	for len(s.queue) > 0 {
+		job := s.queue[0]
+		s.queue = s.queue[1:]
+		job.mu.Lock()
+		active := s.activeByTask[job.TaskID] == job
+		startable := active && job.State == JobQueued && !job.cancelRequested
+		if startable {
+			job.mu.Unlock()
+			return job
+		}
+		if active && (job.State != JobQueued || job.cancelRequested) {
+			s.deleteActiveJobLocked(job)
+		}
+		job.mu.Unlock()
+	}
+	return nil
+}
+
+func applyResultLocked(job *Job, result pipeline.Result) {
+	resultCopy := result
+	resultCopy.Stages = append([]model.StageRecord(nil), result.Stages...)
+	job.Result = &resultCopy
+	job.RunID = result.Run.RunID
+	job.Stages = append([]model.StageRecord(nil), result.Stages...)
+	job.CurrentStage = ""
+}
+
+func finishCancelledJobLocked(job *Job, now time.Time) {
+	job.State = JobFailed
+	job.Err = ErrJobCancelledByUser
+	job.FinishedAt = now
+	job.CurrentStage = ""
 }
 
 func (s *Scheduler) releaseSlotLocked() {

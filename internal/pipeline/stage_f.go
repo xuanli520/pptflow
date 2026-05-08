@@ -48,7 +48,7 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	if buildErr != nil {
 		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, buildErr.Error())
 	}
-	contextText, contextErr := r.codexContext(project, opts, "F")
+	contextText, contextErr := r.codexContext(ctx, project, opts, "F")
 	if contextErr != nil {
 		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, contextErr.Error())
 	}

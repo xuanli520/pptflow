@@ -97,6 +97,15 @@ func (h TestHarness) ApplyRunSubmitForTest(jobID string) TestHarness {
 	return TestHarness{model: model}
 }
 
+func (h TestHarness) ApplyCancelRequestForTest(taskID, jobID string, err error) TestHarness {
+	next, _ := h.model.Update(taskCancelRequestMsg{taskID: taskID, jobID: jobID, err: err})
+	model, ok := next.(app)
+	if !ok {
+		return h
+	}
+	return TestHarness{model: model}
+}
+
 func (h TestHarness) ApplySchedulerJobsForTest(jobs []scheduler.JobSnapshot) TestHarness {
 	next, _ := h.model.Update(schedulerJobsMsg{jobs: jobs})
 	model, ok := next.(app)
@@ -293,6 +302,10 @@ func (h TestHarness) Confirm() bool {
 	return h.model.runConfig.active
 }
 
+func (h TestHarness) CancelConfirm() bool {
+	return h.model.confirmCancelTaskID != ""
+}
+
 func (h TestHarness) Running() bool {
 	if h.model.message == "正在提交流水线 job..." {
 		return true
@@ -451,6 +464,13 @@ func FooterForTest(focus string, confirm bool) string {
 	return footerFor(m)
 }
 
+func CancelFooterForTest() string {
+	m := newApp(nil, config.Default())
+	m.confirmCancelTaskID = "TASK-1"
+	m.confirmCancelJobID = "job-1"
+	return footerFor(m)
+}
+
 func BuildExecutionProbeForTest(ctx context.Context, store *db.Store, cfg config.Config, taskID, selectedStage string, width int) (TestExecutionProbe, error) {
 	vm, err := buildExecutionViewModel(ctx, store, cfg, taskID)
 	if err != nil {
@@ -480,6 +500,8 @@ func testKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlQ}
 	case "ctrl+r":
 		return tea.KeyMsg{Type: tea.KeyCtrlR}
+	case "ctrl+x":
+		return tea.KeyMsg{Type: tea.KeyCtrlX}
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "esc":

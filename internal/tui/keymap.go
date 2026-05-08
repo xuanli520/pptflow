@@ -39,12 +39,37 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	key := msg.String()
 
 	if m.runConfig.active {
+		if key == "ctrl+x" {
+			m.message = "请先关闭运行配置再终止作业"
+			return m, cmds
+		}
 		return m.handleRunConfigKey(msg)
+	}
+	if m.confirmCancelTaskID != "" {
+		switch key {
+		case "y", "Y", "enter":
+			taskID := m.confirmCancelTaskID
+			jobID := m.confirmCancelJobID
+			m.confirmCancelTaskID = ""
+			m.confirmCancelJobID = ""
+			m.message = "正在发送终止请求 " + taskID
+			return m, append(cmds, cancelTaskCmd(m.scheduler, taskID, jobID))
+		case "n", "N", "esc":
+			m.confirmCancelTaskID = ""
+			m.confirmCancelJobID = ""
+			m.message = "已取消终止请求"
+			return m, cmds
+		default:
+			return m, cmds
+		}
 	}
 
 	switch key {
 	case "ctrl+c", "ctrl+q":
 		return m, []tea.Cmd{tea.Batch(m.shutdownScheduler(), tea.Quit)}
+	case "ctrl+x":
+		m.openCancelConfirm()
+		return m, cmds
 	case "ctrl+r":
 		m.openRunConfig()
 		return m, cmds
@@ -234,21 +259,39 @@ func (m *app) openRunConfig() {
 	m.runConfig = newRunConfig(m.selectedTaskID(), m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, m.detailVM.DocsSummary.Count)
 }
 
+func (m *app) openCancelConfirm() {
+	taskID := m.selectedTaskID()
+	if taskID == "" {
+		m.message = "没有选中的任务"
+		return
+	}
+	job, ok := m.activeJobForTask(taskID)
+	if !ok {
+		m.message = "该任务没有排队或运行中的作业"
+		return
+	}
+	m.confirmCancelTaskID = taskID
+	m.confirmCancelJobID = job.JobID
+}
+
 func footerFor(m app) string {
 	if m.runConfig.active {
 		return "Tab 切换  Space 选择  Enter 确认  Esc 取消"
 	}
+	if m.confirmCancelTaskID != "" {
+		return "y/Enter 确认终止  n/Esc 取消"
+	}
 	switch m.focus {
 	case focusSearch:
-		return "Ctrl+C 退出  Tab 执行详情  ↓ 表格  Ctrl+R 重跑"
+		return "Ctrl+C 退出  Tab 执行详情  ↓ 表格  Ctrl+R 重跑  Ctrl+X 终止"
 	case focusOverviewTable:
-		return "↑↓选择 Enter详情 /搜索 s排序 S反向 PgUp/PgDn翻页 z条数 Ctrl+R重跑 m模式"
+		return "↑↓选择 Enter详情 /搜索 s排序 S反向 PgUp/PgDn翻页 z条数 Ctrl+R重跑 Ctrl+X终止 m模式"
 	case focusStageList:
-		return "↑↓ 阶段  Enter 详情  Ctrl+R 重跑  m 模式"
+		return "↑↓ 阶段  Enter 详情  Ctrl+R 重跑  Ctrl+X 终止  m 模式"
 	case focusRefRunList:
-		return "↑↓ 参考运行  Enter 选择  Esc 返回阶段  Ctrl+R 重跑"
+		return "↑↓ 参考运行  Enter 选择  Esc 返回阶段  Ctrl+R 重跑  Ctrl+X 终止"
 	case focusDetailViewport:
-		return "↑↓ 滚动  PgUp/PgDn 翻页  Esc 返回阶段"
+		return "↑↓ 滚动  PgUp/PgDn 翻页  Esc 返回阶段  Ctrl+X 终止"
 	default:
 		return "Ctrl+C 退出"
 	}

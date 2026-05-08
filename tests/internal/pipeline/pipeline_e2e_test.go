@@ -3,8 +3,10 @@ package pipeline_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +130,121 @@ echo "v25.0.0"
 	}
 	if finalRun.Status == model.RunRunning {
 		t.Fatalf("run stayed running after completion: %#v", finalRun)
+	}
+}
+
+func TestRunStageACancelPersistsAbortedRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake PATH python shim is Unix-specific")
+	}
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "batch-1", "TASK-CANCEL", "TASK-CANCEL")
+	for _, dir := range []string{"docs", "repo", "original_sessions"} {
+		if err := os.MkdirAll(filepath.Join(projectDir, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "metadata.json"), []byte(`{"task_id":"TASK-CANCEL","prompt":"build a small app"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "python-invocations.txt")
+	writeExecutable(t, filepath.Join(fakeBin, "python"), `#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  echo "Python 3.11.0"
+  exit 0
+fi
+printf '%s\n' "${1:-}" >> "$FAKE_PYTHON_MARKER"
+sleep 10
+exit 0
+`)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_PYTHON_MARKER", marker)
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(root, ".qa-control", "index.db")
+	cfg.Codex.PromptProfilesDir = filepath.Join(root, ".qa-control", "prompt_profiles")
+	cfg.Pipeline.StageTimeouts["A"] = 20
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scan, err := scanner.Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertProjects(context.Background(), scan.Projects); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan struct {
+		result pipelinepkg.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-CANCEL", pipelinepkg.RunOptions{Stage: "A"})
+		resultCh <- struct {
+			result pipelinepkg.Result
+			err    error
+		}{result: result, err: err}
+	}()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	for {
+		if content, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(content)) != "" {
+			cancel()
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("timed out waiting for fake Stage A script to start: %v", waitCtx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+
+	var outcome struct {
+		result pipelinepkg.Result
+		err    error
+	}
+	select {
+	case outcome = <-resultCh:
+	case <-time.After(8 * time.Second):
+		t.Fatal("pipeline did not return after cancellation")
+	}
+	if !errors.Is(outcome.err, context.Canceled) {
+		t.Fatalf("Run err = %v, want context.Canceled", outcome.err)
+	}
+	if outcome.result.Run.Status != model.RunAborted {
+		t.Fatalf("result status = %s, want aborted", outcome.result.Run.Status)
+	}
+	finalRun, err := store.GetRun(context.Background(), outcome.result.Run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalRun.Status != model.RunAborted {
+		t.Fatalf("stored run status = %s, want aborted", finalRun.Status)
+	}
+	if _, err := os.Stat(filepath.Join(outcome.result.Run.ArtifactRoot, "abort_summary.json")); err != nil {
+		t.Fatalf("abort summary should be written: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outcome.result.Run.ArtifactRoot, "crash_summary.json")); !os.IsNotExist(err) {
+		t.Fatalf("cancelled run should not be marked crashed, stat err: %v", err)
+	}
+	content, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.Fields(string(content))); got != 1 {
+		t.Fatalf("Stage A should stop launching helper scripts after cancellation, got %d invocations:\n%s", got, content)
 	}
 }
 

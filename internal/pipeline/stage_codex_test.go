@@ -51,6 +51,7 @@ func TestStageDCodexContextDoesNotRequireSelfTestReport(t *testing.T) {
 
 	runner := Runner{cfg: config.Default()}
 	contextText, err := runner.codexContext(
+		context.Background(),
 		scanner.Project{TaskID: "TASK-1", Path: projectPath},
 		RunOptions{},
 		"D",
@@ -96,7 +97,7 @@ func TestCodexContextOnlyExposesUploadedDocsToStageF(t *testing.T) {
 	runner := Runner{cfg: cfg}
 	project := scanner.Project{TaskID: "TASK-1", Path: projectPath}
 
-	stageD, err := runner.codexContext(project, RunOptions{}, "D")
+	stageD, err := runner.codexContext(context.Background(), project, RunOptions{}, "D")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +105,7 @@ func TestCodexContextOnlyExposesUploadedDocsToStageF(t *testing.T) {
 		t.Fatalf("Stage D should not see uploaded docs:\n%s", stageD)
 	}
 
-	stageF, err := runner.codexContext(project, RunOptions{}, "F")
+	stageF, err := runner.codexContext(context.Background(), project, RunOptions{}, "F")
 	if err != nil {
 		t.Fatal(err)
 	}

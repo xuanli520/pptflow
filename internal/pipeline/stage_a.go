@@ -15,7 +15,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.StageRecord {
+func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner.Project) model.StageRecord {
 	start := time.Now()
 	record := startStage("A")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "A_validate.log")
@@ -58,7 +58,7 @@ func (r Runner) stageA(run model.RunRecord, project scanner.Project) model.Stage
 	testsInspectionPath := filepath.Join(run.ArtifactRoot, "tests_inspection.json")
 	englishOnlyPath := filepath.Join(run.ArtifactRoot, "english_only.json")
 
-	scriptResults := r.runStageAScripts(project, scriptRoot, logPath, map[string]string{
+	scriptResults := r.runStageAScripts(ctx, project, scriptRoot, logPath, map[string]string{
 		"acceptance":       acceptancePath,
 		"acceptance_md":    acceptanceReportPath,
 		"validation_md":    validationReportPath,
@@ -168,11 +168,17 @@ func structuralFindings(project scanner.Project, required map[string]bool) []mod
 	return findings
 }
 
-func (r Runner) runStageAScripts(project scanner.Project, scriptRoot, logPath string, outputs map[string]string) map[string]scriptExecution {
+func (r Runner) runStageAScripts(ctx context.Context, project scanner.Project, scriptRoot, logPath string, outputs map[string]string) map[string]scriptExecution {
 	results := map[string]scriptExecution{}
 	projectTypeArgs := projectTypeArgs(scriptRoot)
-	results["run_acceptance.py"] = r.runStageAScript(project.Path, scriptRoot, "run_acceptance.py", acceptanceScriptArgs(outputs, projectTypeArgs))
-	results["run_validate.py"] = r.runStageAScript(project.Path, scriptRoot, "run_validate.py", validationScriptArgs(outputs, projectTypeArgs))
+	run := func(script string, args []string) scriptExecution {
+		if err := ctx.Err(); err != nil {
+			return cancelledScriptExecution(script, scriptRoot, err)
+		}
+		return r.runStageAScript(ctx, project.Path, scriptRoot, script, args)
+	}
+	results["run_acceptance.py"] = run("run_acceptance.py", acceptanceScriptArgs(outputs, projectTypeArgs))
+	results["run_validate.py"] = run("run_validate.py", validationScriptArgs(outputs, projectTypeArgs))
 
 	checks := []struct {
 		script string
@@ -196,7 +202,7 @@ func (r Runner) runStageAScripts(project scanner.Project, scriptRoot, logPath st
 	log.WriteString(results["run_acceptance.py"].logBlock())
 	log.WriteString(results["run_validate.py"].logBlock())
 	for _, check := range checks {
-		result := r.runStageAScript(project.Path, scriptRoot, check.script, check.args)
+		result := run(check.script, check.args)
 		results[check.script] = result
 		_ = writeJSON(check.output, result)
 		log.WriteString(result.logBlock())
@@ -231,10 +237,13 @@ type scriptExecution struct {
 	Error     string `json:"error,omitempty"`
 }
 
-func (r Runner) runStageAScript(workDir, inputRoot, script string, extraArgs []string) scriptExecution {
+func (r Runner) runStageAScript(ctx context.Context, workDir, inputRoot, script string, extraArgs []string) scriptExecution {
 	scriptPath := filepath.Join(r.cfg.ScanPath, ".qa-control", "scripts", script)
 	result := scriptExecution{Script: script, InputRoot: inputRoot}
-	python, prefix, pythonErr := r.pythonInvocation(workDir)
+	if err := ctx.Err(); err != nil {
+		return cancelledScriptExecution(script, inputRoot, err)
+	}
+	python, prefix, pythonErr := r.pythonInvocation(ctx, workDir)
 	if pythonErr != "" {
 		result.Error = pythonErr
 		return result
@@ -247,7 +256,7 @@ func (r Runner) runStageAScript(workDir, inputRoot, script string, extraArgs []s
 	args = append(args, extraArgs...)
 	env := append(os.Environ(), "UV_CACHE_DIR="+filepath.Join(r.cfg.ScanPath, ".qa-control", ".uv-cache"))
 	timeout := time.Duration(r.cfg.Pipeline.StageTimeouts["A"]) * time.Second
-	execResult := r.exec.Run(context.Background(), timeout, inputRoot, env, python, args...)
+	execResult := r.exec.Run(ctx, timeout, inputRoot, env, python, args...)
 	result.Command = execResult.Command
 	result.Stdout = execResult.Stdout
 	result.Stderr = execResult.Stderr
@@ -258,6 +267,15 @@ func (r Runner) runStageAScript(workDir, inputRoot, script string, extraArgs []s
 		result.Error = execResult.Err.Error()
 	}
 	return result
+}
+
+func cancelledScriptExecution(script, inputRoot string, err error) scriptExecution {
+	return scriptExecution{
+		Script:    script,
+		InputRoot: inputRoot,
+		OK:        false,
+		Error:     err.Error(),
+	}
 }
 
 func (s scriptExecution) logBlock() string {
@@ -291,16 +309,22 @@ func (s scriptExecution) summary() string {
 	return strings.Join(parts, "\n")
 }
 
-func (r Runner) pythonInvocation(workDir string) (string, []string, string) {
+func (r Runner) pythonInvocation(ctx context.Context, workDir string) (string, []string, string) {
 	for _, name := range []string{"python", "python3"} {
+		if err := ctx.Err(); err != nil {
+			return "", nil, err.Error()
+		}
 		path, err := r.exec.LookPath(name)
 		if err != nil {
 			continue
 		}
-		result := r.exec.Run(context.Background(), 5*time.Second, workDir, nil, path, "--version")
+		result := r.exec.Run(ctx, 5*time.Second, workDir, nil, path, "--version")
 		if result.Err == nil && (strings.Contains(result.Stdout, "Python") || strings.Contains(result.Stderr, "Python")) {
 			return path, nil, ""
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", nil, err.Error()
 	}
 	if path, err := r.exec.LookPath("uv"); err == nil {
 		return path, []string{"run", "python"}, ""

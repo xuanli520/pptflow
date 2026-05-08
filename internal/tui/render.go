@@ -47,7 +47,7 @@ func renderExecution(m app) string {
 	if taskID == "" {
 		return mutedStyle.Render("未选择已索引的项目\n请先执行 `p2r scan --path <projects-qa>`")
 	}
-	layout := layoutFor(m.width, max(8, m.height-pipelineBarHeight(m)), true)
+	layout := layoutFor(m.width, max(8, m.height-verticalChromeHeight(m)), true)
 	if layout.mode == layoutWide || layout.mode == layoutMedium {
 		leftContentHeight := max(1, layout.contentHeight-panelStyle.GetVerticalFrameSize())
 		left := renderPanel(layout.leftWidth, layout.contentHeight, renderExecutionLeft(m, max(8, layout.leftWidth-panelStyle.GetHorizontalFrameSize()), leftContentHeight))
@@ -375,10 +375,7 @@ func renderRunConfig(m app) string {
 
 	panelHeight := len(lines) + panelStyle.GetVerticalFrameSize()
 	if m.height > 0 {
-		reserved := 4
-		if m.message != "" {
-			reserved++
-		}
+		reserved := verticalChromeHeight(m)
 		panelHeight = min(panelHeight, max(3, m.height-reserved))
 	}
 	contentHeight := max(1, panelHeight-panelStyle.GetVerticalFrameSize())

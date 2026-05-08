@@ -109,6 +109,61 @@ func TestSubmittedJobFailureUpdatesMessage(t *testing.T) {
 	}
 }
 
+func TestCtrlXCancelQueuedJobUsesSeparateConfirmation(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverview("TASK-1").
+		SetFocus("overview-table").
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-1",
+			TaskID: "TASK-1",
+			State:  scheduler.JobQueued,
+		}})
+
+	next, _ := h.Press("ctrl+x")
+	if !next.CancelConfirm() || next.Confirm() {
+		t.Fatalf("ctrl+x should open cancel confirmation only, cancel=%v run=%v", next.CancelConfirm(), next.Confirm())
+	}
+	if !strings.Contains(next.View(), "确认终止 TASK-1 的 job-1") {
+		t.Fatalf("cancel prompt missing from view:\n%s", next.View())
+	}
+	next, result := next.Press("enter")
+	if next.CancelConfirm() || result.CmdCount == 0 || !strings.Contains(next.Message(), "正在发送终止请求") {
+		t.Fatalf("enter should submit cancel request, cancel=%v cmds=%d message=%q", next.CancelConfirm(), result.CmdCount, next.Message())
+	}
+}
+
+func TestCancelMessageTakesPriorityOverPendingJobFailure(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverview("TASK-1").
+		ApplyRunSubmitForTest("job-1").
+		ApplyCancelRequestForTest("TASK-1", "job-1", nil)
+
+	h = h.ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+		JobID:           "job-1",
+		TaskID:          "TASK-1",
+		State:           scheduler.JobFailed,
+		Err:             scheduler.ErrJobCancelledByUser.Error(),
+		CancelRequested: true,
+	}})
+	if got := h.Message(); got != "已终止 TASK-1 的运行" {
+		t.Fatalf("cancel message should win over generic job failure, got %q", got)
+	}
+}
+
+func TestCtrlXWithoutActiveJobAndRunConfigPriority(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+	next, _ := h.Press("ctrl+x")
+	if next.CancelConfirm() || next.Message() != "该任务没有排队或运行中的作业" {
+		t.Fatalf("ctrl+x without active job message = %q cancel=%v", next.Message(), next.CancelConfirm())
+	}
+
+	h, _ = h.Press("ctrl+r")
+	next, result := h.Press("ctrl+x")
+	if !next.Confirm() || result.CmdCount != 0 || next.Message() != "请先关闭运行配置再终止作业" {
+		t.Fatalf("ctrl+x should not pass through run config, confirm=%v cmds=%d message=%q", next.Confirm(), result.CmdCount, next.Message())
+	}
+}
+
 func TestPipelineBarShowsEachConfiguredRunningSlot(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SetSize(120, 20).

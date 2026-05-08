@@ -151,6 +151,9 @@ func TestFooterChangesWithFocus(t *testing.T) {
 	if got := tuiapp.FooterForTest("search", true); got != "Tab 切换  Space 选择  Enter 确认  Esc 取消" {
 		t.Fatalf("confirm footer = %q", got)
 	}
+	if got := tuiapp.CancelFooterForTest(); got != "y/Enter 确认终止  n/Esc 取消" {
+		t.Fatalf("cancel footer = %q", got)
+	}
 }
 
 func TestExecutionRenderDoesNotExceedViewportWidth(t *testing.T) {

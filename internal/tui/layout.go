@@ -90,6 +90,19 @@ func layoutFor(width, height int, execution bool) appLayout {
 	return layout
 }
 
+func verticalChromeHeight(m app) int {
+	height := 1
+	if m.message != "" {
+		height++
+	}
+	if m.confirmCancelTaskID != "" {
+		height++
+	}
+	height += pipelineBarHeight(m)
+	height++
+	return height
+}
+
 func buildOverviewColumns(width int, sort overviewSortMode, asc bool) []table.Column {
 	return columnsFromSpecs(overviewColumnSpecs(width, sort, asc))
 }
