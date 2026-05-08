@@ -222,11 +222,44 @@ func staticReviewJSONBlock(report string) (int, int, string, error) {
 	if strings.Contains(report[blockEnd:], staticReviewJSONStart) {
 		return 0, 0, "", fmt.Errorf("static review report contains multiple JSON contract blocks")
 	}
+	if strings.Contains(report[blockEnd:], staticReviewJSONEnd) {
+		return 0, 0, "", fmt.Errorf("static review report contains extra JSON contract end markers")
+	}
 	payload := trimMarkdownFence(strings.TrimSpace(report[afterStart:end]))
 	if payload == "" {
 		return 0, 0, "", fmt.Errorf("static review JSON contract is empty")
 	}
 	return start, blockEnd, payload, nil
+}
+
+func truncateStaticReviewReport(report string, limit int) string {
+	if limit <= 0 || len(report) <= limit {
+		return report
+	}
+	start, blockEnd, _, err := staticReviewJSONBlock(report)
+	if err != nil {
+		return truncateString(report, limit)
+	}
+	contract := strings.TrimSpace(report[start:blockEnd])
+	body := strings.TrimSpace(strings.Join([]string{
+		strings.TrimSpace(report[:start]),
+		strings.TrimSpace(report[blockEnd:]),
+	}, "\n\n"))
+	if body == "" {
+		return contract
+	}
+	const (
+		truncationMarker = "\n\n[truncated]"
+		reportSeparator  = "\n\n"
+	)
+	bodyLimit := limit - len(contract) - len(truncationMarker) - len(reportSeparator)
+	if bodyLimit <= 0 {
+		return contract
+	}
+	if len(body) > bodyLimit {
+		body = strings.TrimSpace(truncateStringPrefix(body, bodyLimit)) + truncationMarker
+	}
+	return strings.TrimSpace(body) + reportSeparator + contract
 }
 
 func trimStaticReviewReportPreamble(body string) (string, error) {

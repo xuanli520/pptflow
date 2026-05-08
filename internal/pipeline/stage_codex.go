@@ -188,47 +188,13 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	prompt := codexPrompt(stage, profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	args := append([]string{}, extraArgs...)
 	review := r.runCodexReviewWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args)
-	result := review.Result
-	report := strings.TrimSpace(result.Stdout)
-	var reportErr error
-	if report == "" {
-		reportErr = fmt.Errorf("codex app-server produced no final agent message")
-		report = staticUnavailableReport(stage, profile, project.Path, codexFailureEvidence(result, reportErr))
-	}
-	if result.Err != nil || reportErr != nil {
-		report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
-		writeReports(report + "\n")
-		record.Findings = []model.Finding{{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " failed",
-			Rule:       "Static Codex review must complete without runtime actions.",
-			Evidence:   codexFailureEvidence(result, reportErr),
-			Impact:     "Static review report may be incomplete.",
-			MinimumFix: "Inspect the static review log and rerun the stage.",
-		}}
-		record.ErrorSummary = "codex app-server failed"
+	outcome := finalizeStaticReviewReport(stage, profile, project.Path, outputPath, review.Result, r.cfg.Codex.MaxOutputBytes)
+	writeReports(outcome.Report + "\n")
+	record.Findings = outcome.Findings
+	if outcome.ErrorSummary != "" {
+		record.ErrorSummary = outcome.ErrorSummary
 		return finishStage(record, model.StageFailed, start)
 	}
-	normalizedReport, layoutErr := normalizeStaticReviewReport(report)
-	if layoutErr != nil {
-		report = staticUnavailableReport(stage, profile, project.Path, "static review report layout invalid: "+layoutErr.Error())
-		writeReports(report + "\n")
-		record.Findings = []model.Finding{staticReviewSchemaFailureFinding(stage, outputPath, layoutErr)}
-		record.ErrorSummary = "static review schema invalid"
-		return finishStage(record, model.StageFailed, start)
-	}
-	report = truncateString(normalizedReport, r.cfg.Codex.MaxOutputBytes)
-	findings, schemaErr := staticReviewFindingsFromReport(stage, report, outputPath)
-	if schemaErr != nil {
-		report = staticUnavailableReport(stage, profile, project.Path, "static review report schema invalid: "+schemaErr.Error())
-		writeReports(report + "\n")
-		record.Findings = []model.Finding{staticReviewSchemaFailureFinding(stage, outputPath, schemaErr)}
-		record.ErrorSummary = "static review schema invalid"
-		return finishStage(record, model.StageFailed, start)
-	}
-	writeReports(report + "\n")
-	record.Findings = findings
 	return finishStage(record, model.StageDone, start)
 }
 
@@ -314,6 +280,61 @@ func staticReviewSchemaFailureFinding(stage, reportPath string, schemaErr error)
 		Impact:     "p2r cannot reliably classify findings from an unstructured static review report.",
 		MinimumFix: "Rerun the stage with a Codex response that includes the required static-review JSON contract.",
 		SourcePath: reportPath,
+	}
+}
+
+type staticReviewReportOutcome struct {
+	Report       string
+	Findings     []model.Finding
+	ErrorSummary string
+}
+
+func finalizeStaticReviewReport(stage, profile, projectPath, sourcePath string, result executor.Result, maxOutputBytes int) staticReviewReportOutcome {
+	report := strings.TrimSpace(result.Stdout)
+	var reportErr error
+	if report == "" {
+		reportErr = fmt.Errorf("codex app-server produced no final agent message")
+		report = staticUnavailableReport(stage, profile, projectPath, codexFailureEvidence(result, reportErr))
+	}
+	if result.Err != nil || reportErr != nil {
+		return staticReviewReportOutcome{
+			Report:       truncateStaticReviewReport(report, maxOutputBytes),
+			Findings:     []model.Finding{staticReviewExecutionFailureFinding(stage, sourcePath, codexFailureEvidence(result, reportErr))},
+			ErrorSummary: "codex app-server failed",
+		}
+	}
+	normalizedReport, layoutErr := normalizeStaticReviewReport(report)
+	if layoutErr != nil {
+		return staticReviewSchemaInvalidOutcome(stage, profile, projectPath, sourcePath, "static review report layout invalid: "+layoutErr.Error(), layoutErr)
+	}
+	findings, schemaErr := staticReviewFindingsFromReport(stage, normalizedReport, sourcePath)
+	if schemaErr != nil {
+		return staticReviewSchemaInvalidOutcome(stage, profile, projectPath, sourcePath, "static review report schema invalid: "+schemaErr.Error(), schemaErr)
+	}
+	return staticReviewReportOutcome{
+		Report:   truncateStaticReviewReport(normalizedReport, maxOutputBytes),
+		Findings: findings,
+	}
+}
+
+func staticReviewExecutionFailureFinding(stage, sourcePath, evidence string) model.Finding {
+	return model.Finding{
+		Stage:      stage,
+		Severity:   "High",
+		Title:      stageName(stage) + " failed",
+		Rule:       "Static Codex review must complete without runtime actions.",
+		Evidence:   evidence,
+		Impact:     "Static review report may be incomplete.",
+		MinimumFix: "Inspect the static review log and rerun the stage.",
+		SourcePath: sourcePath,
+	}
+}
+
+func staticReviewSchemaInvalidOutcome(stage, profile, projectPath, sourcePath, reason string, err error) staticReviewReportOutcome {
+	return staticReviewReportOutcome{
+		Report:       staticUnavailableReport(stage, profile, projectPath, reason),
+		Findings:     []model.Finding{staticReviewSchemaFailureFinding(stage, sourcePath, err)},
+		ErrorSummary: "static review schema invalid",
 	}
 }
 

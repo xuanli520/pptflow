@@ -2,6 +2,7 @@ package pipeline_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,6 +45,9 @@ func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.F
 
 //go:linkname normalizeStaticReviewReport github.com/xuanli520/p2r_tui/internal/pipeline.normalizeStaticReviewReport
 func normalizeStaticReviewReport(report string) (string, error)
+
+//go:linkname truncateStaticReviewReport github.com/xuanli520/p2r_tui/internal/pipeline.truncateStaticReviewReport
+func truncateStaticReviewReport(report string, limit int) string
 
 //go:linkname staticUnavailableReport github.com/xuanli520/p2r_tui/internal/pipeline.staticUnavailableReport
 func staticUnavailableReport(stage, profile, projectPath, reason string) string
@@ -432,6 +436,46 @@ Reviewed repository files only.
 	}
 }
 
+func TestTruncateStaticReviewReportPreservesContract(t *testing.T) {
+	var body strings.Builder
+	body.WriteString("# Static Review\n\n")
+	for i := 0; i < 200; i++ {
+		body.WriteString("Long evidence line that can be shortened without losing the JSON contract.\n")
+	}
+	report := body.String() + `
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "E",
+  "findings": [
+    {
+      "severity": "High",
+      "title": "kept finding",
+      "rule": "contract must survive truncation",
+      "evidence": "repo/file.go:12",
+      "impact": "findings remain classifiable after truncation",
+      "minimum_fix": "preserve the contract block when shortening report bodies"
+    }
+  ]
+}
+<!-- p2r:static-review-json:end -->
+`
+	truncated := truncateStaticReviewReport(report, 900)
+	if !strings.Contains(truncated, "[truncated]") {
+		t.Fatalf("expected truncation marker:\n%s", truncated)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(truncated), "<!-- p2r:static-review-json:end -->") {
+		t.Fatalf("contract should remain the final block:\n%s", truncated)
+	}
+	findings, err := staticReviewFindingsFromReport("E", truncated, "/tmp/report.md")
+	if err != nil {
+		t.Fatalf("truncated report should still satisfy schema: %v\n%s", err, truncated)
+	}
+	if len(findings) != 1 || findings[0].Title != "kept finding" {
+		t.Fatalf("unexpected findings after truncation: %#v", findings)
+	}
+}
+
 func TestCodexGuidanceSendsDeadlinesUntilFinalResult(t *testing.T) {
 	session := &fakeCodexSession{waitDelay: 35 * time.Millisecond}
 	deadlines := []pipelinepkg.CodexGuidanceDeadline{
@@ -488,6 +532,25 @@ func TestCodexGuidanceStopsPromptlyWhenContextCancelled(t *testing.T) {
 	}
 }
 
+func TestCodexStartFailurePreservesSessionDiagnostics(t *testing.T) {
+	startErr := errors.New("initialize failed")
+	session := &startFailureCodexSession{
+		startErr: startErr,
+		result: pipelinepkg.CodexReviewResult{Result: executor.Result{
+			Command: "codex app-server --listen stdio://",
+			Stderr:  "not authenticated",
+			Err:     startErr,
+		}},
+	}
+	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{}, nil)
+	if !errors.Is(err, startErr) {
+		t.Fatalf("start error = %v, want %v", err, startErr)
+	}
+	if result.Result.Command == "" || !strings.Contains(result.Result.Stderr, "not authenticated") {
+		t.Fatalf("session diagnostics were not preserved: %#v", result.Result)
+	}
+}
+
 func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
@@ -510,6 +573,23 @@ func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 			t.Fatalf("%s does not forbid preamble text and require final JSON placement", name)
 		}
 	}
+}
+
+type startFailureCodexSession struct {
+	startErr error
+	result   pipelinepkg.CodexReviewResult
+}
+
+func (s *startFailureCodexSession) Start(ctx context.Context, request pipelinepkg.CodexReviewRequest) error {
+	return s.startErr
+}
+
+func (s *startFailureCodexSession) SendGuidance(ctx context.Context, message string) error {
+	return nil
+}
+
+func (s *startFailureCodexSession) Wait(ctx context.Context) (pipelinepkg.CodexReviewResult, error) {
+	return s.result, s.startErr
 }
 
 type fakeCodexSession struct {

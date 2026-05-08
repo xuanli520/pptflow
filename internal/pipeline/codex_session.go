@@ -106,7 +106,7 @@ func codexStageFromPrompt(prompt string) string {
 
 func runCodexReviewSessionWithGuidance(ctx context.Context, session CodexReviewSession, request CodexReviewRequest, deadlines []CodexGuidanceDeadline) (CodexReviewResult, error) {
 	if err := session.Start(ctx, request); err != nil {
-		return CodexReviewResult{}, err
+		return codexReviewStartFailureResult(session, err)
 	}
 	type waitResult struct {
 		result CodexReviewResult
@@ -168,6 +168,20 @@ func runCodexReviewSessionWithGuidance(ctx context.Context, session CodexReviewS
 	case <-ctx.Done():
 		return finishAfterCancel()
 	}
+}
+
+func codexReviewStartFailureResult(session CodexReviewSession, startErr error) (CodexReviewResult, error) {
+	waitCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	result, waitErr := session.Wait(waitCtx)
+	if waitErr == nil || hasCodexReviewResult(result.Result) {
+		return result, startErr
+	}
+	return CodexReviewResult{}, startErr
+}
+
+func hasCodexReviewResult(result executor.Result) bool {
+	return result.Command != "" || result.Stdout != "" || result.Stderr != "" || result.Err != nil || result.ExitCode != 0 || result.Timeout
 }
 
 func codexGuidanceSchedule(timeout time.Duration, stage string) []CodexGuidanceDeadline {
