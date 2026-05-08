@@ -74,17 +74,7 @@ func Scan(root string) (Result, error) {
 }
 
 func isValidProject(path string) bool {
-	for _, item := range []string{"docs", "repo"} {
-		info, err := os.Stat(filepath.Join(path, item))
-		if err != nil || !info.IsDir() {
-			return false
-		}
-	}
-	if ok, _ := projectlayout.HasOriginalSessionMarker(path); !ok {
-		return false
-	}
-	info, err := os.Stat(filepath.Join(path, "metadata.json"))
-	return err == nil && !info.IsDir()
+	return projectlayout.ValidatePackageRoot(path).Valid
 }
 
 func excludedTopLevel(name string) bool {

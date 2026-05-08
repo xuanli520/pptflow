@@ -62,7 +62,8 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	prompt := codexPrompt("F", profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	lastMessagePath := codexLastMessagePath(run.ArtifactRoot, "F")
 	args, usingLastMessage := codexExecArgsWithReportCapture(execArgs, extraArgs, capability, lastMessagePath)
-	result := r.runCodexWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args)
+	review := r.runCodexReviewWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args)
+	result := review.Result
 	report, reportErr := capturedCodexReport(result, lastMessagePath, usingLastMessage, r.cfg.Codex.MaxOutputBytes)
 	if reportErr != nil {
 		report = staticUnavailableReport("F", profile, project.Path, codexFailureEvidence(result, reportErr))

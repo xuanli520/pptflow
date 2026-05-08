@@ -178,7 +178,7 @@ func newTestScheduler(t *testing.T, firstScriptDelay time.Duration, taskIDs ...s
 	}
 	projects := make([]scanner.Project, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
-		projectPath := filepath.Join(t.TempDir(), taskID)
+		projectPath := filepath.Join(scanPath, "batch-1", taskID, taskID)
 		for _, dir := range []string{"docs", "repo", "original_sessions"} {
 			if err := os.MkdirAll(filepath.Join(projectPath, dir), 0o755); err != nil {
 				t.Fatal(err)
@@ -188,7 +188,7 @@ func newTestScheduler(t *testing.T, firstScriptDelay time.Duration, taskIDs ...s
 		if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), metadata, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		projects = append(projects, scanner.Project{TaskID: taskID, Batch: "batch", Path: projectPath})
+		projects = append(projects, scanner.Project{TaskID: taskID, Batch: "batch-1", Path: projectPath})
 	}
 	if err := store.UpsertProjects(context.Background(), projects); err != nil {
 		t.Fatal(err)

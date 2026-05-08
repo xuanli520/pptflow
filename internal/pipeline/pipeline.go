@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,6 +42,12 @@ type RunProgress struct {
 	StageRecord model.StageRecord
 	Done        bool
 	Err         error
+}
+
+type ProjectPathWarning struct {
+	Type          string `json:"type"`
+	DBPath        string `json:"db_path"`
+	CanonicalPath string `json:"canonical_path"`
 }
 
 type ProgressReporter func(RunProgress)
@@ -162,6 +169,47 @@ func completedRefRunStatus(status string) bool {
 	return status == model.RunCompletedClean || status == model.RunCompletedWithFindings
 }
 
+func (r Runner) canonicalizeProjectForRun(project scanner.Project) (scanner.Project, []ProjectPathWarning, error) {
+	dbPath := filepath.Clean(project.Path)
+	expected := projectlayout.ExpectedProjectPath(r.cfg.ScanPath, project.Batch, project.TaskID)
+	validation := projectlayout.ValidatePackageRoot(expected)
+	if !validation.Valid {
+		return project, nil, invalidIndexedProjectPathError(r.cfg.ScanPath, expected)
+	}
+
+	project.Path = filepath.Clean(expected)
+	project.MetadataPromptMissing = projectlayout.MetadataPromptMissing(project.Path)
+	if dbPath != project.Path {
+		return project, []ProjectPathWarning{{
+			Type:          "stale_project_path",
+			DBPath:        dbPath,
+			CanonicalPath: project.Path,
+		}}, nil
+	}
+	return project, nil, nil
+}
+
+func invalidIndexedProjectPathError(scanRoot, expected string) error {
+	return fmt.Errorf("indexed project path is invalid or stale:\nexpected package root %s\nbut it does not contain metadata.json, docs/, repo/, and an original session marker.\nPlease rerun p2r scan --path %s; if old artifact rows remain, run p2r scan --path %s --prune-artifacts.", expected, filepath.Clean(scanRoot), filepath.Clean(scanRoot))
+}
+
+func (warning ProjectPathWarning) Message() string {
+	if warning.Type == "stale_project_path" {
+		return fmt.Sprintf("DB project path was stale; runtime used canonical package root.\ndb_path=%s\ncanonical_path=%s", warning.DBPath, warning.CanonicalPath)
+	}
+	return fmt.Sprintf("project path warning: %s db_path=%s canonical_path=%s", warning.Type, warning.DBPath, warning.CanonicalPath)
+}
+
+func formatProjectPathWarnings(warnings []ProjectPathWarning) string {
+	var builder strings.Builder
+	builder.WriteString("=== project path warnings ===\n")
+	for _, warning := range warnings {
+		builder.WriteString(warning.Message())
+		builder.WriteString("\n")
+	}
+	return builder.String()
+}
+
 func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result Result, err error) {
 	progress := func(update RunProgress) {
 		if opts.Progress == nil {
@@ -176,6 +224,11 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	if err != nil {
 		progress(RunProgress{Event: "run_crashed", Done: true, Err: db.FormatNotFound("task", taskID)})
 		return Result{}, db.FormatNotFound("task", taskID)
+	}
+	project, pathWarnings, err := r.canonicalizeProjectForRun(project)
+	if err != nil {
+		progress(RunProgress{Event: "run_crashed", Done: true, Err: err})
+		return Result{}, err
 	}
 	opts, err = r.normalizeRunOptions(ctx, project, opts)
 	if err != nil {
@@ -195,6 +248,12 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
 		progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
 		return Result{}, err
+	}
+	if len(pathWarnings) > 0 {
+		_ = writeText(filepath.Join(artifactRoot, "logs", "path_warnings.log"), formatProjectPathWarnings(pathWarnings))
+		for _, warning := range pathWarnings {
+			progress(RunProgress{RunID: runID, Event: "path_warning", Err: errors.New(warning.Message())})
+		}
 	}
 	controlDir := filepath.Join(r.cfg.ScanPath, ".qa-control")
 	released, releaseErr := assets.Release(controlDir)
@@ -252,7 +311,7 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	if result, err, aborted := abortIfCancelled(); aborted {
 		return result, err
 	}
-	if err := r.writeRunManifest(run, project, opts, released, releaseErr, importedDocs, docsManifest, firstErrorString(docsImportErr, docsManifestErr)); err != nil {
+	if err := r.writeRunManifest(run, project, opts, released, releaseErr, importedDocs, docsManifest, firstErrorString(docsImportErr, docsManifestErr), pathWarnings); err != nil {
 		return Result{}, err
 	}
 	if err := r.writeStageStatus(runID, artifactRoot, stages); err != nil {
@@ -687,7 +746,7 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 	return record
 }
 
-func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, opts RunOptions, released []assets.ReleasedFile, releaseErr error, importedDocs []taskdocs.Document, docsManifest taskdocs.Manifest, docsErr string) error {
+func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, opts RunOptions, released []assets.ReleasedFile, releaseErr error, importedDocs []taskdocs.Document, docsManifest taskdocs.Manifest, docsErr string, pathWarnings []ProjectPathWarning) error {
 	manifest := map[string]any{
 		"run_id":           run.RunID,
 		"task_id":          run.TaskID,
@@ -746,6 +805,9 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 	}
 	if docsErr != "" {
 		manifest["docs_error"] = docsErr
+	}
+	if len(pathWarnings) > 0 {
+		manifest["path_warnings"] = pathWarnings
 	}
 	return writeJSON(filepath.Join(run.ArtifactRoot, "run_manifest.json"), manifest)
 }

@@ -2,8 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -176,7 +174,8 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	prompt := codexPrompt(stage, profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	lastMessagePath := codexLastMessagePath(run.ArtifactRoot, stage)
 	args, usingLastMessage := codexExecArgsWithReportCapture(execArgs, extraArgs, capability, lastMessagePath)
-	result := r.runCodexWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args)
+	review := r.runCodexReviewWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args)
+	result := review.Result
 	report, reportErr := capturedCodexReport(result, lastMessagePath, usingLastMessage, r.cfg.Codex.MaxOutputBytes)
 	if reportErr != nil {
 		report = staticUnavailableReport(stage, profile, project.Path, codexFailureEvidence(result, reportErr))
@@ -235,24 +234,7 @@ func containsPath(paths []string, path string) bool {
 }
 
 func (r Runner) runCodexWithLog(ctx context.Context, timeout time.Duration, projectPath, logPath string, env []string, prompt string, capability codex.Capability, args []string) executor.Result {
-	commandText := strings.Join(append([]string{capability.Path}, args...), " ")
-	preamble := commandText +
-		"\n\nPrompt: supplied via stdin; sha256=" + sha256Text(prompt) +
-		"\nCodex capability: " + capabilitySummary(capability) +
-		"\nCodex env keys: " + strings.Join(configuredEnvKeys(r.cfg.Codex.Env), ",") +
-		"\nTimeout: " + timeout.String() +
-		"\nStarted: " + time.Now().UTC().Format(time.RFC3339) +
-		"\n\n=== codex stream start ===\n"
-	_ = writeText(logPath, preamble)
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return r.exec.RunWithInput(ctx, timeout, projectPath, env, strings.NewReader(prompt), capability.Path, args...)
-	}
-	defer logFile.Close()
-	result := r.exec.RunWithInputStreaming(ctx, timeout, projectPath, env, strings.NewReader(prompt), logFile, capability.Path, args...)
-	fmt.Fprintf(logFile, "\n=== codex stream end: exit=%d timeout=%t err=%v ===\n", result.ExitCode, result.Timeout, result.Err)
-	fmt.Fprintf(logFile, "\n=== captured stdout/stderr tail ===\nSTDOUT:\n%s\nSTDERR:\n%s\n", truncateString(result.Stdout, r.cfg.Codex.MaxOutputBytes), truncateString(result.Stderr, r.cfg.Codex.MaxOutputBytes))
-	return result
+	return r.runCodexReviewWithLog(ctx, timeout, projectPath, logPath, env, prompt, capability, args).Result
 }
 
 func codexPrompt(stage, profile, reviewPath, projectPath, artifactRoot, profileContent, contextText string) string {
@@ -502,6 +484,9 @@ func codexExecArgsWithReportCapture(execArgs, extraArgs []string, capability cod
 	args = append(args, extraArgs...)
 	usingLastMessage := capability.HasOutputLastMessage && strings.TrimSpace(lastMessagePath) != ""
 	if usingLastMessage {
+		if capability.HasJSON {
+			args = append(args, "--json")
+		}
 		args = append(args, "--output-last-message", lastMessagePath)
 	}
 	args = append(args, "-")
@@ -509,25 +494,20 @@ func codexExecArgsWithReportCapture(execArgs, extraArgs []string, capability cod
 }
 
 func capturedCodexReport(result executor.Result, lastMessagePath string, usingLastMessage bool, maxOutputBytes int) (string, error) {
-	if report := strings.TrimSpace(result.Stdout); report != "" {
-		return report, nil
-	}
 	if !usingLastMessage {
+		if report := strings.TrimSpace(result.Stdout); report != "" {
+			return report, nil
+		}
 		return "", fmt.Errorf("codex produced no report on stdout")
 	}
 	content, err := readBoundedText(lastMessagePath, int64(maxOutputBytes))
 	if err != nil {
-		return "", fmt.Errorf("codex produced no stdout and last-message capture is unavailable at %s: %w", lastMessagePath, err)
+		return "", fmt.Errorf("codex last-message capture is unavailable at %s: %w", lastMessagePath, err)
 	}
 	if report := strings.TrimSpace(content); report != "" {
 		return report, nil
 	}
 	return "", fmt.Errorf("codex produced an empty report at %s", lastMessagePath)
-}
-
-func sha256Text(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
 }
 
 func configuredEnvKeys(env map[string]string) []string {
@@ -554,6 +534,8 @@ func capabilitySummary(capability codex.Capability) string {
 		fmt.Sprintf("ignore_user_config=%t", capability.HasIgnoreUserConfig),
 		fmt.Sprintf("full_auto=%t", capability.HasFullAuto),
 		fmt.Sprintf("output_last_message=%t", capability.HasOutputLastMessage),
+		fmt.Sprintf("resume=%t", capability.HasResume),
+		fmt.Sprintf("json=%t", capability.HasJSON),
 		"node=" + capability.NodePath,
 		fmt.Sprintf("path_prepended_for_node=%t", capability.PathPrependedForNode),
 	}

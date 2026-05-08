@@ -27,6 +27,8 @@ type Capability struct {
 	HasIgnoreUserConfig    bool   `json:"has_ignore_user_config"`
 	HasFullAuto            bool   `json:"has_full_auto"`
 	HasOutputLastMessage   bool   `json:"has_output_last_message"`
+	HasResume              bool   `json:"has_resume"`
+	HasJSON                bool   `json:"has_json"`
 	NodePath               string `json:"node_path,omitempty"`
 	PathPrependedForNode   bool   `json:"path_prepended_for_node"`
 	ExecHelpAvailable      bool   `json:"exec_help_available"`
@@ -78,6 +80,8 @@ func ApplyExecHelp(cap *Capability, help string) {
 	cap.HasIgnoreUserConfig = hasHelpToken(help, "--ignore-user-config")
 	cap.HasFullAuto = hasHelpToken(help, "--full-auto")
 	cap.HasOutputLastMessage = hasHelpToken(help, "--output-last-message")
+	cap.HasResume = hasHelpToken(help, "resume")
+	cap.HasJSON = hasHelpToken(help, "--json")
 }
 
 func BuildExecArgs(cap Capability, projectPath string, extraArgs []string) ([]string, error) {

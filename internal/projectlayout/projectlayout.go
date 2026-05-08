@@ -20,6 +20,12 @@ var originalSessionMarkers = []string{
 	filepath.Join("docs", "original_sessions"),
 }
 
+type PackageRootValidation struct {
+	Valid                 bool
+	Missing               []string
+	OriginalSessionMarker string
+}
+
 func IsBatchDir(name string) bool {
 	return batchDirPattern.MatchString(strings.TrimSpace(name))
 }
@@ -30,6 +36,27 @@ func IsTaskID(name string) bool {
 
 func ExpectedProjectPath(root, batch, taskID string) string {
 	return filepath.Clean(filepath.Join(root, batch, taskID, taskID))
+}
+
+func ValidatePackageRoot(path string) PackageRootValidation {
+	var result PackageRootValidation
+	path = filepath.Clean(path)
+	if !fileExists(filepath.Join(path, "metadata.json")) {
+		result.Missing = append(result.Missing, "metadata.json")
+	}
+	if !dirExists(filepath.Join(path, "docs")) {
+		result.Missing = append(result.Missing, "docs/")
+	}
+	if !dirExists(filepath.Join(path, "repo")) {
+		result.Missing = append(result.Missing, "repo/")
+	}
+	if ok, marker := HasOriginalSessionMarker(path); ok {
+		result.OriginalSessionMarker = marker
+	} else {
+		result.Missing = append(result.Missing, "original session marker")
+	}
+	result.Valid = len(result.Missing) == 0
+	return result
 }
 
 func HasOriginalSessionMarker(projectPath string) (bool, string) {
@@ -68,6 +95,23 @@ func MetadataTaskID(path string) string {
 		}
 	}
 	return ""
+}
+
+func MetadataPromptMissing(path string) bool {
+	metadataPath := path
+	if filepath.Base(metadataPath) != "metadata.json" {
+		metadataPath = filepath.Join(path, "metadata.json")
+	}
+	content, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return true
+	}
+	var data map[string]any
+	if json.Unmarshal(content, &data) != nil {
+		return true
+	}
+	value, ok := data["prompt"].(string)
+	return !ok || strings.TrimSpace(value) == ""
 }
 
 func SafePathSegment(value, fallback string) string {
@@ -109,4 +153,14 @@ func safePathSegment(value string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }

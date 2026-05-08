@@ -40,6 +40,32 @@ func TestHasOriginalSessionMarkerAcceptsEquivalentLocations(t *testing.T) {
 	}
 }
 
+func TestValidatePackageRootReportsSharedRequiredMarkers(t *testing.T) {
+	root := t.TempDir()
+	validation := projectlayout.ValidatePackageRoot(root)
+	if validation.Valid {
+		t.Fatal("empty package root should be invalid")
+	}
+	for _, want := range []string{"metadata.json", "docs/", "repo/", "original session marker"} {
+		if !contains(validation.Missing, want) {
+			t.Fatalf("missing list %#v does not include %q", validation.Missing, want)
+		}
+	}
+
+	for _, dir := range []string{"docs", "repo", filepath.Join("docs", "original-session")} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte(`{"prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	validation = projectlayout.ValidatePackageRoot(root)
+	if !validation.Valid || validation.OriginalSessionMarker != filepath.Join("docs", "original-session") || len(validation.Missing) != 0 {
+		t.Fatalf("valid package root validation = %#v", validation)
+	}
+}
+
 func TestMetadataTaskIDReadsMetadataWithoutCanonicalizing(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte(`{"task_id":"TASK-METADATA"}`), 0o644); err != nil {
@@ -48,6 +74,15 @@ func TestMetadataTaskIDReadsMetadataWithoutCanonicalizing(t *testing.T) {
 	if got := projectlayout.MetadataTaskID(root); got != "TASK-METADATA" {
 		t.Fatalf("metadata task id = %q", got)
 	}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSafePathSegmentFallsBackForUnsafeValues(t *testing.T) {

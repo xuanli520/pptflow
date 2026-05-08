@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 	_ "unsafe"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
@@ -69,6 +71,9 @@ func codexExecArgsWithReportCapture(execArgs, extraArgs []string, capability cod
 
 //go:linkname capturedCodexReport github.com/xuanli520/p2r_tui/internal/pipeline.capturedCodexReport
 func capturedCodexReport(result executor.Result, lastMessagePath string, usingLastMessage bool, maxOutputBytes int) (string, error)
+
+//go:linkname runCodexReviewSessionWithGuidance github.com/xuanli520/p2r_tui/internal/pipeline.runCodexReviewSessionWithGuidance
+func runCodexReviewSessionWithGuidance(ctx context.Context, session pipelinepkg.CodexReviewSession, request pipelinepkg.CodexReviewRequest, deadlines []pipelinepkg.CodexGuidanceDeadline) (pipelinepkg.CodexReviewResult, error)
 
 type portMapping struct {
 	Service   string
@@ -138,10 +143,7 @@ func TestSelectedStagesExplicitDependencyChain(t *testing.T) {
 
 func TestRunReportsProgressWhenArtifactRootCannotBeCreated(t *testing.T) {
 	scanPath := t.TempDir()
-	projectPath := filepath.Join(t.TempDir(), "project")
-	if err := os.MkdirAll(projectPath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	projectPath := writePipelinePackage(t, scanPath, "batch-1", "TASK-1")
 	if err := os.WriteFile(filepath.Join(scanPath, "result"), []byte("blocks artifact directory"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +157,7 @@ func TestRunReportsProgressWhenArtifactRootCannotBeCreated(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: projectPath}}); err != nil {
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "batch-1", Path: projectPath}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -177,12 +179,71 @@ func TestRunReportsProgressWhenArtifactRootCannotBeCreated(t *testing.T) {
 	}
 }
 
-func TestRecheckRejectsCrashedReferenceRun(t *testing.T) {
+func TestRunCanonicalizesStaleDBProjectPath(t *testing.T) {
 	root := t.TempDir()
-	projectPath := filepath.Join(root, "batch", "TASK-1")
-	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+	canonical := writePipelinePackage(t, root, "batch-1", "TASK-STALE")
+	outer := filepath.Dir(canonical)
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer store.Close()
+	if err := store.UpsertProjects(context.Background(), []scanner.Project{{TaskID: "TASK-STALE", Batch: "batch-1", Path: outer}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pipelinepkg.NewRunner(store, cfg).Run(context.Background(), "TASK-STALE", pipelinepkg.RunOptions{Stages: []string{"Z"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.LatestRunForTask(context.Background(), "TASK-STALE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(run.ArtifactRoot, "run_manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), `"project_path": "`+canonical+`"`) || !strings.Contains(string(content), `"type": "stale_project_path"`) {
+		t.Fatalf("manifest should contain canonical path and stale warning:\n%s", content)
+	}
+	if _, err := os.Stat(filepath.Join(run.ArtifactRoot, "logs", "path_warnings.log")); err != nil {
+		t.Fatalf("path warning log should be written: %v", err)
+	}
+}
+
+func TestRunFailsWhenCanonicalPackageRootInvalid(t *testing.T) {
+	root := t.TempDir()
+	outer := filepath.Join(root, "batch-1", "TASK-BAD")
+	if err := os.MkdirAll(outer, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.UpsertProjects(context.Background(), []scanner.Project{{TaskID: "TASK-BAD", Batch: "batch-1", Path: outer}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pipelinepkg.NewRunner(store, cfg).Run(context.Background(), "TASK-BAD", pipelinepkg.RunOptions{Stages: []string{"Z"}})
+	if err == nil || !strings.Contains(err.Error(), "indexed project path is invalid or stale") || strings.Contains(err.Error(), ".git") {
+		t.Fatalf("expected explicit canonical package root failure without generic repo fallback, got %v", err)
+	}
+}
+
+func TestRecheckRejectsCrashedReferenceRun(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-1")
 	refRoot := filepath.Join(root, "refs", "run-crashed")
 	if err := os.MkdirAll(refRoot, 0o755); err != nil {
 		t.Fatal(err)
@@ -197,7 +258,7 @@ func TestRecheckRejectsCrashedReferenceRun(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: projectPath}}); err != nil {
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "batch-1", Path: projectPath}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateRun(ctx, model.RunRecord{
@@ -322,9 +383,81 @@ func TestCodexExecArgsAddOutputLastMessageBeforePrompt(t *testing.T) {
 	}
 }
 
+func TestCodexExecArgsAddsJSONStreamOnlyWithLastMessageCapture(t *testing.T) {
+	args, using := codexExecArgsWithReportCapture(
+		[]string{"exec", "--sandbox", "read-only", "-"},
+		nil,
+		codex.Capability{HasOutputLastMessage: true, HasJSON: true},
+		"/tmp/report.md",
+	)
+	if !using || !containsArg(args, "--json") {
+		t.Fatalf("expected json event stream with last-message capture, using=%t args=%#v", using, args)
+	}
+	args, using = codexExecArgsWithReportCapture(
+		[]string{"exec", "--sandbox", "read-only", "-"},
+		nil,
+		codex.Capability{HasJSON: true},
+		"",
+	)
+	if using || containsArg(args, "--json") {
+		t.Fatalf("json stream should not be enabled without last-message capture, using=%t args=%#v", using, args)
+	}
+}
+
 func TestCapturedCodexReportRejectsEmptySuccessfulRun(t *testing.T) {
 	if _, err := capturedCodexReport(executor.Result{}, "", false, 1024); err == nil {
 		t.Fatal("expected empty successful Codex run to be treated as missing report")
+	}
+}
+
+func TestCapturedCodexReportPrefersLastMessageOverStdoutStream(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "last-message.md")
+	if err := os.WriteFile(path, []byte("# Final Codex Response\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := capturedCodexReport(executor.Result{Stdout: "raw event stream"}, path, true, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report != "# Final Codex Response" {
+		t.Fatalf("report = %q, want last-message content", report)
+	}
+}
+
+func TestCodexGuidanceSendsDeadlinesUntilFinalResult(t *testing.T) {
+	session := &fakeCodexSession{waitDelay: 35 * time.Millisecond}
+	deadlines := []pipelinepkg.CodexGuidanceDeadline{
+		{Label: "first", After: 10 * time.Millisecond, Message: "soft"},
+		{Label: "second", After: 20 * time.Millisecond, Message: "deadline"},
+		{Label: "third", After: 80 * time.Millisecond, Message: "too late"},
+	}
+	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{}, deadlines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result.Stdout != "final" {
+		t.Fatalf("result stdout = %q", result.Result.Stdout)
+	}
+	if got := strings.Join(session.guidanceMessages(), ","); got != "soft,deadline" {
+		t.Fatalf("guidance messages = %q", got)
+	}
+	if len(result.GuidanceEvents) != 2 || result.GuidanceEvents[0].Label != "first" || result.GuidanceEvents[1].Label != "second" {
+		t.Fatalf("guidance events = %#v", result.GuidanceEvents)
+	}
+}
+
+func TestCodexGuidanceDoesNotSendAfterFinalResult(t *testing.T) {
+	session := &fakeCodexSession{waitDelay: 5 * time.Millisecond}
+	deadlines := []pipelinepkg.CodexGuidanceDeadline{{Label: "first", After: 40 * time.Millisecond, Message: "late"}}
+	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{}, deadlines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result.Stdout != "final" {
+		t.Fatalf("result stdout = %q", result.Result.Stdout)
+	}
+	if got := session.guidanceMessages(); len(got) != 0 {
+		t.Fatalf("guidance should not be sent after final result, got %#v", got)
 	}
 }
 
@@ -347,6 +480,49 @@ func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 			t.Fatalf("%s does not state the p2r final-response contract", name)
 		}
 	}
+}
+
+type fakeCodexSession struct {
+	waitDelay time.Duration
+	done      chan struct{}
+	mu        sync.Mutex
+	guidance  []string
+}
+
+func (s *fakeCodexSession) Start(ctx context.Context, request pipelinepkg.CodexReviewRequest) error {
+	s.done = make(chan struct{})
+	go func() {
+		timer := time.NewTimer(s.waitDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		close(s.done)
+	}()
+	return nil
+}
+
+func (s *fakeCodexSession) SendGuidance(ctx context.Context, message string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.guidance = append(s.guidance, message)
+	return nil
+}
+
+func (s *fakeCodexSession) Wait(ctx context.Context) (pipelinepkg.CodexReviewResult, error) {
+	select {
+	case <-ctx.Done():
+		return pipelinepkg.CodexReviewResult{Result: executor.Result{Err: ctx.Err()}}, ctx.Err()
+	case <-s.done:
+		return pipelinepkg.CodexReviewResult{Result: executor.Result{Stdout: "final"}}, nil
+	}
+}
+
+func (s *fakeCodexSession) guidanceMessages() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string{}, s.guidance...)
 }
 
 func TestParseComposePSExtractsMappings(t *testing.T) {
@@ -597,4 +773,27 @@ func TestCopyPackageSnapshotExcludesTaskDocsControlDir(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dest, "task-docs")); !os.IsNotExist(err) {
 		t.Fatalf("task-docs control dir should be excluded, stat err: %v", err)
 	}
+}
+
+func writePipelinePackage(t *testing.T, root, batch, taskID string) string {
+	t.Helper()
+	projectPath := filepath.Join(root, batch, taskID, taskID)
+	for _, dir := range []string{"docs", "repo", "original_sessions"} {
+		if err := os.MkdirAll(filepath.Join(projectPath, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), []byte(`{"task_id":"`+taskID+`","prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return projectPath
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }

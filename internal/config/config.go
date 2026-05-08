@@ -88,7 +88,7 @@ func Default() Config {
 		ScanPath: "./projects-qa",
 		DBPath:   "./projects-qa/.qa-control/index.db",
 		Pipeline: PipelineConfig{
-			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 900, "E": 1200, "F": 900},
+			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 2700, "E": 2700, "F": 2700},
 			SelfTestReportPath: "repo/self_test_report.md",
 			MaxConcurrent:      3,
 		},

@@ -61,13 +61,19 @@ Usage: codex exec [OPTIONS] [PROMPT]
   -c, --config <KEY=VALUE>
   --cd <DIR>
   --full-auto
+  --json
   -o, --output-last-message <FILE>
+Commands:
+  resume  Resume a previous session
 `)
 	if !capability.HasFullAuto {
 		t.Fatal("expected --full-auto to be detected")
 	}
 	if !capability.HasOutputLastMessage {
 		t.Fatal("expected --output-last-message to be detected")
+	}
+	if !capability.HasJSON || !capability.HasResume {
+		t.Fatalf("expected json/resume to be detected: %#v", capability)
 	}
 	args, err := codex.BuildExecArgs(codex.Capability{
 		Path:              "codex",

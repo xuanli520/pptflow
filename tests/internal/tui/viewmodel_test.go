@@ -66,6 +66,48 @@ func TestExecutionViewModelReportsInvalidCleanupJSON(t *testing.T) {
 	}
 }
 
+func TestExecutionViewModelPrioritizesCodexFinalReportWarningsAndGuidance(t *testing.T) {
+	store, cfg, projectPath, artifactRoot := tuiStore(t)
+	ctx := context.Background()
+	run := model.RunRecord{RunID: "run-1", TaskID: "TASK-1", StartedAt: "2026-04-30T00:00:00Z", Status: model.RunCompletedClean, ManualVerdict: model.ManualUnset, ArtifactRoot: artifactRoot}
+	if err := store.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	reportPath := filepath.Join(artifactRoot, "tests_coverage_report.md")
+	if err := os.WriteFile(reportPath, []byte("# Final Codex Response\n\nConfirmed findings.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(artifactRoot, "logs", "D_tests_coverage_static.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("=== codex guidance events ===\n20m guidance sent at 2026-05-08T00:20:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{
+  "project_path": "` + filepath.ToSlash(projectPath) + `",
+  "path_warnings": [
+    {"type":"stale_project_path","db_path":"` + filepath.ToSlash(filepath.Dir(projectPath)) + `","canonical_path":"` + filepath.ToSlash(projectPath) + `"}
+  ]
+}`
+	if err := os.WriteFile(filepath.Join(artifactRoot, "run_manifest.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStage(ctx, run.RunID, model.StageRecord{Stage: "D", Status: model.StageDone, LogPath: logPath, ArtifactPaths: []string{reportPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	probe, err := tuiapp.BuildExecutionProbeForTest(ctx, store, cfg, "TASK-1", "D", 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"最终报告", "Final Codex Response", "路径警告", "20m guidance sent"} {
+		if !strings.Contains(probe.DetailContent, want) {
+			t.Fatalf("detail content missing %q:\n%s", want, probe.DetailContent)
+		}
+	}
+}
+
 func TestExecutionViewModelOnlyIncludesUsableCompletedRefRuns(t *testing.T) {
 	store, cfg, _, artifactRoot := tuiStore(t)
 	ctx := context.Background()

@@ -59,22 +59,25 @@ type stageView struct {
 }
 
 type executionViewModel struct {
-	TaskID         string
-	ProjectPath    string
-	HasRun         bool
-	Run            model.RunRecord
-	Stages         []stageView
-	Findings       []model.Finding
-	RefRuns        []model.RunRecord
-	DocsSummary    docsSummary
-	PreflightPath  string
-	PreflightText  string
-	CleanupPath    string
-	CleanupStatus  string
-	CleanupText    string
-	ArtifactRoot   string
-	SelfTestState  string
-	LogTailByStage map[string]string
+	TaskID                string
+	ProjectPath           string
+	HasRun                bool
+	Run                   model.RunRecord
+	Stages                []stageView
+	Findings              []model.Finding
+	RefRuns               []model.RunRecord
+	DocsSummary           docsSummary
+	RunManifestPath       string
+	PathWarnings          []pipeline.ProjectPathWarning
+	PreflightPath         string
+	PreflightText         string
+	CleanupPath           string
+	CleanupStatus         string
+	CleanupText           string
+	ArtifactRoot          string
+	SelfTestState         string
+	LogTailByStage        map[string]string
+	GuidanceEventsByStage map[string][]string
 }
 
 func buildOverviewItems(cfg config.Config, projects []db.ProjectSummary) []overviewItem {
@@ -144,11 +147,12 @@ func buildExecutionViewModel(ctx context.Context, store *db.Store, cfg config.Co
 		return executionViewModel{}, err
 	}
 	vm := executionViewModel{
-		TaskID:         taskID,
-		ProjectPath:    project.Path,
-		DocsSummary:    readDocsSummary(cfg, taskID),
-		SelfTestState:  selfTestState(project, cfg),
-		LogTailByStage: map[string]string{},
+		TaskID:                taskID,
+		ProjectPath:           project.Path,
+		DocsSummary:           readDocsSummary(cfg, taskID),
+		SelfTestState:         selfTestState(project, cfg),
+		LogTailByStage:        map[string]string{},
+		GuidanceEventsByStage: map[string][]string{},
 	}
 	run, err := store.LatestRunForTask(ctx, taskID)
 	if err != nil {
@@ -161,6 +165,14 @@ func buildExecutionViewModel(ctx context.Context, store *db.Store, cfg config.Co
 	vm.HasRun = true
 	vm.Run = run
 	vm.ArtifactRoot = run.ArtifactRoot
+	vm.RunManifestPath = filepath.Join(run.ArtifactRoot, "run_manifest.json")
+	manifest := readRunManifestView(vm.RunManifestPath)
+	if manifest.ProjectPath != "" {
+		vm.ProjectPath = manifest.ProjectPath
+		project.Path = manifest.ProjectPath
+		vm.SelfTestState = selfTestState(project, cfg)
+	}
+	vm.PathWarnings = manifest.PathWarnings
 	vm.PreflightPath = filepath.Join(run.ArtifactRoot, "preflight.json")
 	vm.PreflightText = readPreflightSummary(vm.PreflightPath)
 	cleanup := readCleanupSummary(run.ArtifactRoot)
@@ -184,6 +196,7 @@ func buildExecutionViewModel(ctx context.Context, store *db.Store, cfg config.Co
 			continue
 		}
 		vm.LogTailByStage[stage.Stage] = readLogTail(stage.LogPath, cfg.TUI.LogMaxLines)
+		vm.GuidanceEventsByStage[stage.Stage] = readGuidanceEvents(stage.LogPath)
 	}
 	return vm, nil
 }
@@ -260,6 +273,30 @@ func buildDetailContent(vm executionViewModel, selectedStage string, width int) 
 		builder.WriteString("原因:\n")
 		for _, line := range wrapDisplay(localizeSummary(stage.ErrorSummary), max(20, width-4)) {
 			builder.WriteString("  " + line + "\n")
+		}
+	}
+	if len(vm.PathWarnings) > 0 {
+		builder.WriteString("\n路径警告:\n")
+		for _, warning := range vm.PathWarnings {
+			builder.WriteString("  " + compactPath(warning.DBPath, vm) + " -> " + compactPath(warning.CanonicalPath, vm) + "\n")
+		}
+	}
+	if codexStage(stage.Stage) {
+		reportPath := primaryCodexReportPath(stage)
+		if reportPath != "" {
+			builder.WriteString("\n最终报告:\n")
+			builder.WriteString("  路径: " + compactPath(reportPath, vm) + "\n")
+			if summary := reportSummary(reportPath); summary != "" {
+				for _, line := range wrapDisplay(summary, max(20, width-6)) {
+					builder.WriteString("  摘要: " + line + "\n")
+				}
+			}
+		}
+		if events := vm.GuidanceEventsByStage[stage.Stage]; len(events) > 0 {
+			builder.WriteString("\nCodex deadline guidance:\n")
+			for _, event := range events {
+				builder.WriteString("  " + event + "\n")
+			}
 		}
 	}
 	builder.WriteString("\n本阶段发现:\n")
@@ -383,6 +420,26 @@ func readDocsSummary(cfg config.Config, taskID string) docsSummary {
 		summary.Error = err.Error()
 	}
 	return summary
+}
+
+type runManifestView struct {
+	ProjectPath  string
+	PathWarnings []pipeline.ProjectPathWarning
+}
+
+func readRunManifestView(path string) runManifestView {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return runManifestView{}
+	}
+	var payload struct {
+		ProjectPath  string                        `json:"project_path"`
+		PathWarnings []pipeline.ProjectPathWarning `json:"path_warnings"`
+	}
+	if json.Unmarshal(content, &payload) != nil {
+		return runManifestView{}
+	}
+	return runManifestView{ProjectPath: payload.ProjectPath, PathWarnings: payload.PathWarnings}
 }
 
 func docsSummaryLine(summary docsSummary) string {
@@ -577,6 +634,85 @@ func readLogTail(path string, maxLines int) string {
 		lines = lines[len(lines)-maxLines:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func readGuidanceEvents(path string) []string {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var events []string
+	inSection := false
+	for _, line := range strings.Split(string(content), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "=== codex guidance events ===" {
+			inSection = true
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "===") {
+			inSection = false
+			continue
+		}
+		if strings.Contains(trimmed, "guidance sent") {
+			events = append(events, trimmed)
+		}
+	}
+	return events
+}
+
+func codexStage(stage string) bool {
+	switch strings.TrimSpace(stage) {
+	case "D", "E", "F":
+		return true
+	default:
+		return false
+	}
+}
+
+func primaryCodexReportPath(stage stageView) string {
+	if !codexStage(stage.Stage) {
+		return ""
+	}
+	known := map[string][]string{
+		"D": {"tests_coverage_report.md", "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md"},
+		"E": {"static_acceptance_audit_report.md", "1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md"},
+		"F": {"3_标注员AI报告问题的修复报告.md", "3_标注员AI报告问题_确认修复报告.md"},
+	}
+	for _, name := range known[stage.Stage] {
+		for _, path := range stage.ArtifactPaths {
+			if filepath.Base(path) == name {
+				return path
+			}
+		}
+	}
+	for _, path := range stage.ArtifactPaths {
+		if strings.EqualFold(filepath.Ext(path), ".md") && filepath.Base(path) != "short_comment.txt" {
+			return path
+		}
+	}
+	return ""
+}
+
+func reportSummary(path string) string {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "读取失败: " + err.Error()
+	}
+	var lines []string
+	for _, line := range strings.Split(string(content), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "<!-- p2r:static-review-json:") {
+			continue
+		}
+		lines = append(lines, trimmed)
+		if len(lines) >= 3 {
+			break
+		}
+	}
+	return strings.Join(lines, " ")
 }
 
 func compactDetailText(text string, vm executionViewModel) string {

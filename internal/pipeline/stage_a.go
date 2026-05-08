@@ -28,12 +28,12 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 		scriptRoot = snapshotPath
 	}
 
-	hasOriginalMarker, _ := projectlayout.HasOriginalSessionMarker(project.Path)
+	validation := projectlayout.ValidatePackageRoot(project.Path)
 	required := map[string]bool{
-		"docs":                    dirExists(filepath.Join(project.Path, "docs")),
-		"repo":                    dirExists(filepath.Join(project.Path, "repo")),
-		"original_session_marker": hasOriginalMarker,
-		"metadata.json":           fileExists(filepath.Join(project.Path, "metadata.json")),
+		"docs":                    !containsString(validation.Missing, "docs/"),
+		"repo":                    !containsString(validation.Missing, "repo/"),
+		"original_session_marker": validation.OriginalSessionMarker != "",
+		"metadata.json":           !containsString(validation.Missing, "metadata.json"),
 	}
 	findings := structuralFindings(project, required)
 	if snapshotErr != nil {
@@ -166,6 +166,15 @@ func structuralFindings(project scanner.Project, required map[string]bool) []mod
 		})
 	}
 	return findings
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (r Runner) runStageAScripts(ctx context.Context, project scanner.Project, scriptRoot, logPath string, outputs map[string]string) map[string]scriptExecution {
