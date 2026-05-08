@@ -1,29 +1,27 @@
-Review the effectiveness of the project tests.
+Review the effectiveness of the project tests, with an absolute **hard requirement on API endpoint test coverage**.
 
-Rule by project type:
-1. If the project includes backend/API services:
-   - Verify that API tests truly call the actual project API endpoints.
-   - Reject tests that only validate mocks, stubs, patched internals, or bypassed code paths without exercising real API flows.
-   - Check whether API tests cover more than 90% of implemented endpoints.
-   - Explicitly list untested or weakly tested endpoints.
+**Rule by project type**
 
-2. If the project is a pure frontend project with no backend service and no real API interfaces:
-   - Exempt the project from API-test existence and API-endpoint coverage requirements.
-   - Do not mark the project deficient solely because it has no API tests.
-   - Instead, inspect whether frontend tests meaningfully cover core UI behavior, routing, state changes, local storage/session storage behavior, form validation, and key user flows.
-   - Mock/local data usage is acceptable in this case unless it hides missing required frontend functionality.
+1. **If the project includes backend/API services:**
+   - **CRITICAL: API endpoint test coverage MUST be greater than 90%.**  
+     If coverage is ≤ 90%, the project **automatically fails** this review, regardless of any other quality metrics.
+   - Verify that API tests truly call the actual project API endpoints (no mocks, stubs, or patched internals that bypass real flows).
+   - Explicitly list every implemented endpoint, indicate whether it is covered, and calculate the exact coverage percentage.
+   - List all untested or weakly tested endpoints that cause the coverage to fall at or below 90%.
+   - If coverage > 90% but some endpoints are still untested, note them but the hard fail threshold is 90%.
 
-Output constraints:
-- Begin the final response immediately with the report's first heading or numbered section.
-- Do not include progress updates, tool-use notes, setup narration, environment commentary, or any preamble before the report.
-- Keep the report concise and focused.
-- Briefly state each issue only; do not provide long narrative explanations.
-- For each finding, use at most 3 short bullets: issue, evidence, impact.
-- Prefer short sentences and direct conclusions.
-- Do not repeat the task description or evaluation criteria in the report.
-- Do not include lengthy background analysis, speculation, or generic testing theory.
-- If no issue is found for a check, mark it briefly as "No significant issue found".
-- Keep the overall report as short as possible while still preserving key conclusions and evidence.
-- If p2r supplies a machine-readable JSON contract block, place that block only at the very end of the final response, after all human-readable report sections, and do not write any text after the JSON end marker.
+2. **If the project is a pure frontend project with no backend service and no real API interfaces:**
+   - Exempt from the API‑test existence and coverage requirement. Do **not** mark it deficient for lacking API tests.
+   - Instead, inspect whether frontend tests meaningfully cover core UI behaviour, routing, state changes, local/session storage behaviour, form validation, and key user flows.
+   - Mock/local data is acceptable unless it hides missing required frontend functionality.
 
-Return only the complete report as the final Codex response. Do not write files or create `.tmp` reports; p2r persists the response to the required artifact paths.
+**Output constraints**
+- Begin the final response immediately with the analysis heading.
+- No preamble, progress updates, or narration.
+- For each finding use at most 3 short bullets: issue, evidence, impact.
+- If the API endpoint coverage hard fail is triggered, clearly state **FAIL** and give the exact percentage with the list of uncovered endpoints.
+- Do not speculate; base all conclusions on static evidence from the repository.
+- If no issue is found and coverage > 90%, state “Pass” and briefly summarise the coverage level.
+- Keep the report as short as possible while preserving key conclusions.
+
+Return only the complete report. Do not write files; p2r persists the response.
