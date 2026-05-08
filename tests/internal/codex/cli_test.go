@@ -9,106 +9,30 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/codex"
 )
 
-func TestBuildExecArgsAllowsMissingOptionalApproval(t *testing.T) {
-	capability := codex.Capability{
-		Path:                "codex",
-		HasSandbox:          true,
-		HasConfig:           true,
-		HasCDLong:           true,
-		HasEphemeral:        true,
-		HasSkipGitRepoCheck: true,
-		HasFullAuto:         true,
-	}
-	args, err := codex.BuildExecArgs(capability, "/repo", []string{"--model", "gpt-5.4"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	joined := joinArgs(args)
-	for _, absent := range []string{"--ask-for-approval", "--full-auto", "--ignore-user-config"} {
-		if containsArg(args, absent) {
-			t.Fatalf("args should not contain unavailable optional flag %s: %#v", absent, args)
-		}
-	}
-	for _, want := range []string{"exec", "--skip-git-repo-check", "--sandbox", "read-only", "-c", `approval_policy="never"`, "--cd", "/repo", "--ephemeral", "--model", "gpt-5.4", "-"} {
-		if !containsArg(args, want) {
-			t.Fatalf("args missing %s in %s", want, joined)
-		}
-	}
-}
-
-func TestBuildExecArgsUsesUserConfigByDefault(t *testing.T) {
-	args, err := codex.BuildExecArgs(codex.Capability{
-		Path:                "codex",
-		HasSandbox:          true,
-		HasAskForApproval:   true,
-		HasCDLong:           true,
-		HasIgnoreUserConfig: true,
-	}, "/repo", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if containsArg(args, "--ignore-user-config") {
-		t.Fatalf("user config should remain available for Codex auth: %#v", args)
-	}
-}
-
-func TestApplyExecHelpDetectsFullAutoForDiagnosticsOnly(t *testing.T) {
+func TestApplyAppServerHelpDetectsRequiredControls(t *testing.T) {
 	var capability codex.Capability
-	codex.ApplyExecHelp(&capability, `
-Usage: codex exec [OPTIONS] [PROMPT]
-  --sandbox <MODE>
-  --ask-for-approval <POLICY>
+	codex.ApplyAppServerHelp(&capability, `
+Usage: codex app-server [OPTIONS] [COMMAND]
   -c, --config <KEY=VALUE>
-  --cd <DIR>
-  --full-auto
-  --json
-  -o, --output-last-message <FILE>
-Commands:
-  resume  Resume a previous session
+  --listen <URL>
 `)
-	if !capability.HasFullAuto {
-		t.Fatal("expected --full-auto to be detected")
+	if !capability.HasAppServer || !capability.HasConfig {
+		t.Fatalf("expected app-server/config controls to be detected: %#v", capability)
 	}
-	if !capability.HasOutputLastMessage {
-		t.Fatal("expected --output-last-message to be detected")
-	}
-	if !capability.HasJSON || !capability.HasResume {
-		t.Fatalf("expected json/resume to be detected: %#v", capability)
-	}
-	args, err := codex.BuildExecArgs(codex.Capability{
-		Path:              "codex",
-		HasSandbox:        true,
-		HasAskForApproval: true,
-		HasCDLong:         true,
-		HasFullAuto:       true,
-	}, "/repo", nil)
-	if err != nil {
+	if err := codex.ValidateAppServerCapability(codex.Capability{Path: "codex", HasAppServer: true, HasConfig: true}); err != nil {
 		t.Fatal(err)
 	}
-	if containsArg(args, "--full-auto") {
-		t.Fatalf("BuildExecArgs must not use --full-auto: %#v", args)
+}
+
+func TestValidateAppServerCapabilityRejectsMissingAppServer(t *testing.T) {
+	if err := codex.ValidateAppServerCapability(codex.Capability{Path: "codex", HasConfig: true}); err == nil {
+		t.Fatal("expected missing app-server support to be rejected")
 	}
 }
 
-func TestBuildExecArgsSupportsShortCD(t *testing.T) {
-	args, err := codex.BuildExecArgs(codex.Capability{Path: "codex", HasSandbox: true, HasConfig: true, HasCDShort: true}, "/repo", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !containsArg(args, "-C") || containsArg(args, "--cd") {
-		t.Fatalf("expected short cd only, got %#v", args)
-	}
-}
-
-func TestBuildExecArgsRejectsMissingSandbox(t *testing.T) {
-	if _, err := codex.BuildExecArgs(codex.Capability{Path: "codex", HasCDLong: true}, "/repo", nil); err == nil {
-		t.Fatal("expected missing sandbox to be rejected")
-	}
-}
-
-func TestBuildExecArgsRejectsWhenApprovalPolicyCannotBeForced(t *testing.T) {
-	if _, err := codex.BuildExecArgs(codex.Capability{Path: "codex", HasSandbox: true, HasCDLong: true}, "/repo", nil); err == nil {
-		t.Fatal("expected missing approval-policy controls to be rejected")
+func TestValidateAppServerCapabilityRejectsMissingConfigOverride(t *testing.T) {
+	if err := codex.ValidateAppServerCapability(codex.Capability{Path: "codex", HasAppServer: true}); err == nil {
+		t.Fatal("expected missing -c/--config support to be rejected")
 	}
 }
 
@@ -123,21 +47,4 @@ func TestWithNodeOnPATHPrependsNodeDirectory(t *testing.T) {
 	if got[0][:len("PATH=")+len(wantPrefix)] != "PATH="+wantPrefix {
 		t.Fatalf("node dir not prepended: %#v", got)
 	}
-}
-
-func joinArgs(args []string) string {
-	out := ""
-	for _, arg := range args {
-		out += arg + " "
-	}
-	return out
-}
-
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
 }

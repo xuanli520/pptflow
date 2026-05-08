@@ -37,61 +37,17 @@ func TestRunPersistsRunningStageAndStreamsCodexLog(t *testing.T) {
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(fakeBin, "codex"), `#!/usr/bin/env bash
-set -euo pipefail
-if [ "${1:-}" = "--version" ]; then
-  echo "codex-cli 0.999.0"
-  exit 0
-fi
-if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
-  echo "--sandbox --ask-for-approval --cd -C --ephemeral --skip-git-repo-check --ignore-user-config"
-  exit 0
-fi
-if [ "${1:-}" = "exec" ]; then
-  prompt="$(cat)"
-  stage="D"
-  if printf '%s' "$prompt" | grep -q 'Run p2r stage F'; then
-    stage="F"
-  elif printf '%s' "$prompt" | grep -q 'Run p2r stage E'; then
-    stage="E"
-  fi
-  echo "fake-codex-start" >&2
-  sleep "${FAKE_CODEX_SLEEP:-2}"
-  echo "# Fake Report"
-  echo "- High: simulated finding from fake codex"
-  cat <<JSON
-<!-- p2r:static-review-json:start -->
-{
-  "schema_version": "p2r.static_review.v1",
-  "stage": "$stage",
-  "findings": [
-    {
-      "severity": "High",
-      "title": "simulated finding from fake codex",
-      "rule": "Fake Codex test rule",
-      "evidence": "repo/fake.go:1",
-      "impact": "The fake reviewer reported a controlled issue.",
-      "minimum_fix": "Keep the fake output contract valid."
-    }
-  ]
-}
-<!-- p2r:static-review-json:end -->
-JSON
-  exit 0
-fi
-echo "unexpected fake codex args: $*" >&2
-exit 2
-`)
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
 	writeExecutable(t, filepath.Join(fakeBin, "node"), `#!/usr/bin/env bash
 echo "v25.0.0"
 `)
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("FAKE_CODEX_SLEEP", "2")
 
 	cfg := config.Default()
 	cfg.ScanPath = root
 	cfg.DBPath = filepath.Join(root, ".qa-control", "index.db")
 	cfg.Codex.PromptProfilesDir = filepath.Join(root, ".qa-control", "prompt_profiles")
+	cfg.Codex.Env["FAKE_CODEX_SLEEP"] = "2"
 	cfg.Pipeline.StageTimeouts["D"] = 10
 	cfg.Pipeline.StageTimeouts["F"] = 10
 	store, err := db.Open(cfg.DBPath)
@@ -248,7 +204,7 @@ exit 0
 	}
 }
 
-func TestRunCapturesCodexOutputLastMessageWhenStdoutIsEmpty(t *testing.T) {
+func TestRunCapturesCodexAppServerFinalMessage(t *testing.T) {
 	root := t.TempDir()
 	projectDir := filepath.Join(root, "batch-1", "TASK-FILE", "TASK-FILE")
 	for _, dir := range []string{"docs", "repo", "original_sessions"} {
@@ -267,66 +223,7 @@ func TestRunCapturesCodexOutputLastMessageWhenStdoutIsEmpty(t *testing.T) {
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(fakeBin, "codex"), `#!/usr/bin/env bash
-set -euo pipefail
-if [ "${1:-}" = "--version" ]; then
-  echo "codex-cli 0.999.0"
-  exit 0
-fi
-if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
-  echo "--sandbox --ask-for-approval --cd -C --ephemeral --skip-git-repo-check --ignore-user-config --output-last-message"
-  exit 0
-fi
-if [ "${1:-}" = "exec" ]; then
-  prompt="$(cat)"
-  stage="D"
-  if printf '%s' "$prompt" | grep -q 'Run p2r stage F'; then
-    stage="F"
-  elif printf '%s' "$prompt" | grep -q 'Run p2r stage E'; then
-    stage="E"
-  fi
-  output=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -o|--output-last-message)
-        output="${2:-}"
-        shift 2
-        ;;
-      *)
-        shift
-        ;;
-    esac
-  done
-  if [ -z "$output" ]; then
-    echo "missing --output-last-message" >&2
-    exit 3
-  fi
-  cat > "$output" <<JSON
-# File Only Report
-- High: file-only finding from fake codex
-
-<!-- p2r:static-review-json:start -->
-{
-  "schema_version": "p2r.static_review.v1",
-  "stage": "$stage",
-  "findings": [
-    {
-      "severity": "High",
-      "title": "file-only finding from fake codex",
-      "rule": "Fake Codex output-last-message rule",
-      "evidence": "repo/fake.go:2",
-      "impact": "The fake reviewer wrote the report via output-last-message.",
-      "minimum_fix": "Keep output-last-message capture working."
-    }
-  ]
-}
-<!-- p2r:static-review-json:end -->
-JSON
-  exit 0
-fi
-echo "unexpected fake codex args: $*" >&2
-exit 2
-`)
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
 	writeExecutable(t, filepath.Join(fakeBin, "node"), `#!/usr/bin/env bash
 echo "v25.0.0"
 `)
@@ -388,8 +285,8 @@ echo "v25.0.0"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(content), "# File Only Report") {
-		t.Fatalf("report did not come from --output-last-message:\n%s", content)
+	if !strings.Contains(string(content), "# App Server Report") {
+		t.Fatalf("report did not come from app-server final message:\n%s", content)
 	}
 	if strings.Contains(string(content), "Manual Verification Required") {
 		t.Fatalf("report fell back to unavailable artifact:\n%s", content)
@@ -398,8 +295,8 @@ echo "v25.0.0"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(logContent), "--output-last-message") {
-		t.Fatalf("log should show output-last-message capture command:\n%s", logContent)
+	if !strings.Contains(string(logContent), "app-server") {
+		t.Fatalf("log should show app-server command:\n%s", logContent)
 	}
 }
 
@@ -422,24 +319,7 @@ func TestRunMarksStaticReviewUnavailableWhenReportSchemaInvalid(t *testing.T) {
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(fakeBin, "codex"), `#!/usr/bin/env bash
-set -euo pipefail
-if [ "${1:-}" = "--version" ]; then
-  echo "codex-cli 0.999.0"
-  exit 0
-fi
-if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
-  echo "--sandbox --ask-for-approval --cd -C --ephemeral --skip-git-repo-check --ignore-user-config"
-  exit 0
-fi
-if [ "${1:-}" = "exec" ]; then
-  cat >/dev/null
-  echo "# Legacy Report"
-  echo "- High: plain text finding without JSON contract"
-  exit 0
-fi
-exit 2
-`)
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
 	writeExecutable(t, filepath.Join(fakeBin, "node"), `#!/usr/bin/env bash
 echo "v25.0.0"
 `)
@@ -449,6 +329,7 @@ echo "v25.0.0"
 	cfg.ScanPath = root
 	cfg.DBPath = filepath.Join(root, ".qa-control", "index.db")
 	cfg.Codex.PromptProfilesDir = filepath.Join(root, ".qa-control", "prompt_profiles")
+	cfg.Codex.Env["FAKE_CODEX_REPORT"] = "invalid"
 	cfg.Pipeline.StageTimeouts["D"] = 10
 	cfg.Pipeline.StageTimeouts["F"] = 10
 	store, err := db.Open(cfg.DBPath)
@@ -480,6 +361,91 @@ echo "v25.0.0"
 	if !strings.Contains(string(content), "Manual Verification Required") {
 		t.Fatalf("schema-invalid report should be replaced with unavailable artifact:\n%s", content)
 	}
+}
+
+func fakeCodexAppServerScript() string {
+	return `#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("codex-cli 0.999.0")
+    sys.exit(0)
+
+if len(sys.argv) > 1 and sys.argv[1] == "app-server" and "--help" in sys.argv:
+    print("Usage: codex app-server [OPTIONS] [COMMAND]")
+    print("  -c, --config <KEY=VALUE>")
+    print("      --listen <URL>")
+    sys.exit(0)
+
+if len(sys.argv) > 1 and sys.argv[1] == "app-server":
+    thread_id = "thread-1"
+    turn_id = "turn-1"
+
+    def send(payload):
+        print(json.dumps(payload), flush=True)
+
+    def report_for(stage):
+        if os.environ.get("FAKE_CODEX_REPORT") == "invalid":
+            return "# Legacy Report\n- High: plain text finding without JSON contract\n"
+        return f"""# App Server Report
+- High: simulated finding from fake codex
+
+<!-- p2r:static-review-json:start -->
+{{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "{stage}",
+  "findings": [
+    {{
+      "severity": "High",
+      "title": "simulated finding from fake codex",
+      "rule": "Fake Codex app-server test rule",
+      "evidence": "repo/fake.go:1",
+      "impact": "The fake app-server reviewer reported a controlled issue.",
+      "minimum_fix": "Keep app-server final-message capture working."
+    }}
+  ]
+}}
+<!-- p2r:static-review-json:end -->
+"""
+
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        request = json.loads(line)
+        request_id = request.get("id")
+        method = request.get("method")
+        if method == "initialize":
+            send({"id": request_id, "result": {"userAgent": "fake-codex", "codexHome": "/tmp/fake-codex", "platformFamily": "unix", "platformOs": "linux"}})
+        elif method == "thread/start":
+            send({"id": request_id, "result": {"thread": {"id": thread_id}}})
+        elif method == "turn/start":
+            text = "\n".join(item.get("text", "") for item in request.get("params", {}).get("input", []) if item.get("type") == "text")
+            stage = "D"
+            if "Run p2r stage F" in text:
+                stage = "F"
+            elif "Run p2r stage E" in text:
+                stage = "E"
+            send({"id": request_id, "result": {"turn": {"id": turn_id, "items": [], "status": "running"}}})
+            print("fake-codex-start", file=sys.stderr, flush=True)
+            delay = float(os.environ.get("FAKE_CODEX_SLEEP", "0") or "0")
+            if delay:
+                time.sleep(delay)
+            report = report_for(stage)
+            send({"method": "item/agentMessage/delta", "params": {"threadId": thread_id, "turnId": turn_id, "itemId": "item-1", "delta": report}})
+            send({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"id": "item-1", "type": "agentMessage", "text": report}}})
+            send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "items": [], "status": "completed"}}})
+        elif method == "turn/steer":
+            send({"id": request_id, "result": {"turnId": turn_id}})
+        else:
+            send({"id": request_id, "error": {"code": -32601, "message": "unknown method"}})
+    sys.exit(0)
+
+print("unexpected fake codex args: " + " ".join(sys.argv[1:]), file=sys.stderr)
+sys.exit(2)
+`
 }
 
 func stageByName(stages []model.StageRecord, name string) model.StageRecord {

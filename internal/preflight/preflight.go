@@ -119,7 +119,7 @@ func checkCodex(ctx context.Context, exec executor.Runner, cfg config.Config) Ch
 		check.Message = err
 		return check
 	}
-	if _, err := codex.BuildExecArgs(capability, ".", nil); err != nil {
+	if err := codex.ValidateAppServerCapability(capability); err != nil {
 		check.Status = "missing"
 		check.Message = err.Error()
 		return check
@@ -138,28 +138,20 @@ func checkCodex(ctx context.Context, exec executor.Runner, cfg config.Config) Ch
 }
 
 func validateExtraArgs(args []string) string {
-	dangerous := map[string]bool{
-		"--sandbox":          true,
-		"--ask-for-approval": true,
-		"-a":                 true,
-		"-c":                 true,
-		"--config":           true,
-		"--cd":               true,
-		"-C":                 true,
-		"--dangerously-bypass-approvals-and-sandbox": true,
-		"--full-auto":           true,
-		"--search":              true,
-		"--add-dir":             true,
-		"--output-last-message": true,
-		"-o":                    true,
-	}
-	for _, arg := range args {
-		key := arg
-		if before, _, ok := strings.Cut(arg, "="); ok {
-			key = before
-		}
-		if dangerous[key] {
-			return "codex.extra_args contains unsafe boundary-changing argument: " + key
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "--model" || arg == "-m":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "codex.extra_args " + arg + " requires a model value"
+			}
+			i++
+		case strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "-m="):
+			if _, value, _ := strings.Cut(arg, "="); strings.TrimSpace(value) == "" {
+				return "codex.extra_args " + arg + " requires a model value"
+			}
+		default:
+			return "codex.extra_args contains unsupported app-server argument: " + arg
 		}
 	}
 	return ""

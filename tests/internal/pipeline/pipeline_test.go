@@ -42,6 +42,9 @@ func extractFindingsFromReport(stage, report, sourcePath string) []model.Finding
 //go:linkname staticReviewFindingsFromReport github.com/xuanli520/p2r_tui/internal/pipeline.staticReviewFindingsFromReport
 func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.Finding, error)
 
+//go:linkname staticUnavailableReport github.com/xuanli520/p2r_tui/internal/pipeline.staticUnavailableReport
+func staticUnavailableReport(stage, profile, projectPath, reason string) string
+
 //go:linkname acceptanceFindings github.com/xuanli520/p2r_tui/internal/pipeline.acceptanceFindings
 func acceptanceFindings(path string) []model.Finding
 
@@ -66,14 +69,11 @@ func safeCodexExtraArgs(args []string) ([]string, error)
 //go:linkname capabilitySummary github.com/xuanli520/p2r_tui/internal/pipeline.capabilitySummary
 func capabilitySummary(capability codex.Capability) string
 
-//go:linkname codexExecArgsWithReportCapture github.com/xuanli520/p2r_tui/internal/pipeline.codexExecArgsWithReportCapture
-func codexExecArgsWithReportCapture(execArgs, extraArgs []string, capability codex.Capability, lastMessagePath string) ([]string, bool)
-
-//go:linkname capturedCodexReport github.com/xuanli520/p2r_tui/internal/pipeline.capturedCodexReport
-func capturedCodexReport(result executor.Result, lastMessagePath string, usingLastMessage bool, maxOutputBytes int) (string, error)
-
 //go:linkname runCodexReviewSessionWithGuidance github.com/xuanli520/p2r_tui/internal/pipeline.runCodexReviewSessionWithGuidance
 func runCodexReviewSessionWithGuidance(ctx context.Context, session pipelinepkg.CodexReviewSession, request pipelinepkg.CodexReviewRequest, deadlines []pipelinepkg.CodexGuidanceDeadline) (pipelinepkg.CodexReviewResult, error)
+
+//go:linkname codexGuidanceSchedule github.com/xuanli520/p2r_tui/internal/pipeline.codexGuidanceSchedule
+func codexGuidanceSchedule(timeout time.Duration, stage string) []pipelinepkg.CodexGuidanceDeadline
 
 type portMapping struct {
 	Service   string
@@ -335,7 +335,7 @@ func TestSafeCodexExtraArgsRejectsBoundaryFlags(t *testing.T) {
 	if _, err := safeCodexExtraArgs([]string{"--model", "gpt-5.4"}); err != nil {
 		t.Fatalf("safe args rejected: %v", err)
 	}
-	for _, flag := range []string{"--sandbox", "--full-auto", "--search", "--output-last-message", "-o", "--dangerously-bypass-approvals-and-sandbox"} {
+	for _, flag := range []string{"--sandbox", "--full-auto", "--search", "--dangerously-bypass-approvals-and-sandbox"} {
 		if _, err := safeCodexExtraArgs([]string{flag}); err == nil {
 			t.Fatalf("expected %s to be rejected", flag)
 		}
@@ -343,84 +343,46 @@ func TestSafeCodexExtraArgsRejectsBoundaryFlags(t *testing.T) {
 	if _, err := safeCodexExtraArgs([]string{"--full-auto=true"}); err == nil {
 		t.Fatal("expected --full-auto=... to be rejected")
 	}
-	if _, err := safeCodexExtraArgs([]string{"--output-last-message=/tmp/out.md"}); err == nil {
-		t.Fatal("expected --output-last-message=... to be rejected")
+}
+
+func TestCapabilitySummaryIncludesAppServerDiagnostic(t *testing.T) {
+	summary := capabilitySummary(codex.Capability{Path: "codex", HasAppServer: true})
+	if !strings.Contains(summary, "app_server=true") {
+		t.Fatalf("summary missing app-server diagnostic: %s", summary)
 	}
 }
 
-func TestCapabilitySummaryIncludesFullAutoDiagnostic(t *testing.T) {
-	summary := capabilitySummary(codex.Capability{Path: "codex", HasFullAuto: true})
-	if !strings.Contains(summary, "full_auto=true") {
-		t.Fatalf("summary missing full_auto diagnostic: %s", summary)
+func TestCodexGuidanceMessagesRestateStaticReviewContract(t *testing.T) {
+	deadlines := codexGuidanceSchedule(45*time.Minute, "E")
+	if len(deadlines) != 3 {
+		t.Fatalf("guidance deadlines = %d, want 3", len(deadlines))
 	}
-}
-
-func TestCapabilitySummaryIncludesOutputLastMessageDiagnostic(t *testing.T) {
-	summary := capabilitySummary(codex.Capability{Path: "codex", HasOutputLastMessage: true})
-	if !strings.Contains(summary, "output_last_message=true") {
-		t.Fatalf("summary missing output-last-message diagnostic: %s", summary)
-	}
-}
-
-func TestCodexExecArgsAddOutputLastMessageBeforePrompt(t *testing.T) {
-	args, using := codexExecArgsWithReportCapture(
-		[]string{"exec", "--sandbox", "read-only", "-"},
-		[]string{"--model", "gpt-5.4"},
-		codex.Capability{HasOutputLastMessage: true},
-		"/tmp/report.md",
-	)
-	if !using {
-		t.Fatal("expected output-last-message capture to be enabled")
-	}
-	joined := strings.Join(args, "\x00")
-	for _, want := range []string{"--model\x00gpt-5.4", "--output-last-message\x00/tmp/report.md"} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("args missing %q: %#v", want, args)
+	for _, deadline := range deadlines {
+		for _, want := range []string{
+			"<!-- p2r:static-review-json:start -->",
+			`"schema_version": "p2r.static_review.v1"`,
+			`"stage": "E"`,
+			`"findings": []`,
+			"Do not return a prose-only summary.",
+		} {
+			if !strings.Contains(deadline.Message, want) {
+				t.Fatalf("%s guidance missing %q:\n%s", deadline.Label, want, deadline.Message)
+			}
 		}
 	}
-	if args[len(args)-1] != "-" {
-		t.Fatalf("prompt marker should remain last, got %#v", args)
-	}
 }
 
-func TestCodexExecArgsAddsJSONStreamOnlyWithLastMessageCapture(t *testing.T) {
-	args, using := codexExecArgsWithReportCapture(
-		[]string{"exec", "--sandbox", "read-only", "-"},
-		nil,
-		codex.Capability{HasOutputLastMessage: true, HasJSON: true},
-		"/tmp/report.md",
-	)
-	if !using || !containsArg(args, "--json") {
-		t.Fatalf("expected json event stream with last-message capture, using=%t args=%#v", using, args)
+func TestStaticUnavailableReportIncludesMachineReadableContract(t *testing.T) {
+	report := staticUnavailableReport("E", "static_acceptance_audit.md", "/tmp/project", "static review report schema invalid: missing marker")
+	if !strings.Contains(report, "Manual Verification Required") {
+		t.Fatalf("unavailable report missing manual-verification text:\n%s", report)
 	}
-	args, using = codexExecArgsWithReportCapture(
-		[]string{"exec", "--sandbox", "read-only", "-"},
-		nil,
-		codex.Capability{HasJSON: true},
-		"",
-	)
-	if using || containsArg(args, "--json") {
-		t.Fatalf("json stream should not be enabled without last-message capture, using=%t args=%#v", using, args)
-	}
-}
-
-func TestCapturedCodexReportRejectsEmptySuccessfulRun(t *testing.T) {
-	if _, err := capturedCodexReport(executor.Result{}, "", false, 1024); err == nil {
-		t.Fatal("expected empty successful Codex run to be treated as missing report")
-	}
-}
-
-func TestCapturedCodexReportPrefersLastMessageOverStdoutStream(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "last-message.md")
-	if err := os.WriteFile(path, []byte("# Final Codex Response\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	report, err := capturedCodexReport(executor.Result{Stdout: "raw event stream"}, path, true, 1024)
+	findings, err := staticReviewFindingsFromReport("E", report, "/tmp/report.md")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unavailable report should satisfy static review schema: %v\n%s", err, report)
 	}
-	if report != "# Final Codex Response" {
-		t.Fatalf("report = %q, want last-message content", report)
+	if len(findings) != 1 || findings[0].Severity != "High" || !strings.Contains(findings[0].Evidence, "missing marker") {
+		t.Fatalf("unexpected unavailable findings: %#v", findings)
 	}
 }
 
@@ -787,13 +749,4 @@ func writePipelinePackage(t *testing.T, root, batch, taskID string) string {
 		t.Fatal(err)
 	}
 	return projectPath
-}
-
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
 }

@@ -44,9 +44,8 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	}
 	reviewPath := codexReviewPath(run, project.Path)
 	capability := codex.DetectCLI(ctx, r.exec, "")
-	execArgs, buildErr := codex.BuildExecArgs(capability, reviewPath, nil)
-	if buildErr != nil {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, buildErr.Error())
+	if capabilityErr := codex.ValidateAppServerCapability(capability); capabilityErr != nil {
+		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, capabilityErr.Error())
 	}
 	contextText, contextErr := r.codexContext(ctx, project, opts, "F")
 	if contextErr != nil {
@@ -60,12 +59,13 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	defer os.RemoveAll(sandbox.Home)
 	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
 	prompt := codexPrompt("F", profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
-	lastMessagePath := codexLastMessagePath(run.ArtifactRoot, "F")
-	args, usingLastMessage := codexExecArgsWithReportCapture(execArgs, extraArgs, capability, lastMessagePath)
+	args := append([]string{}, extraArgs...)
 	review := r.runCodexReviewWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args)
 	result := review.Result
-	report, reportErr := capturedCodexReport(result, lastMessagePath, usingLastMessage, r.cfg.Codex.MaxOutputBytes)
-	if reportErr != nil {
+	report := strings.TrimSpace(result.Stdout)
+	var reportErr error
+	if report == "" {
+		reportErr = fmt.Errorf("codex app-server produced no final agent message")
 		report = staticUnavailableReport("F", profile, project.Path, codexFailureEvidence(result, reportErr))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
@@ -81,7 +81,7 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 			MinimumFix: "Inspect the Stage F log and rerun after fixing Codex availability.",
 			SourcePath: reportPath,
 		}}
-		record.ErrorSummary = "codex exec failed"
+		record.ErrorSummary = "codex app-server failed"
 		return finishStage(record, model.StageFailed, start)
 	}
 	findings, schemaErr := staticReviewFindingsFromReport("F", report, reportPath)

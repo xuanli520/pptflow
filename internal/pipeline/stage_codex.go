@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -112,19 +113,18 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	}
 	reviewPath := codexReviewPath(run, project.Path)
 	capability := codex.DetectCLI(ctx, r.exec, "")
-	execArgs, buildErr := codex.BuildExecArgs(capability, reviewPath, nil)
-	if buildErr != nil {
-		report := staticUnavailableReport(stage, profile, project.Path, buildErr.Error())
+	if capabilityErr := codex.ValidateAppServerCapability(capability); capabilityErr != nil {
+		report := staticUnavailableReport(stage, profile, project.Path, capabilityErr.Error())
 		writeReports(report)
 		_ = writeText(logPath, report)
 		record.Findings = []model.Finding{{
 			Stage:      stage,
 			Severity:   "High",
 			Title:      stageName(stage) + " unavailable",
-			Rule:       "Static review stages require codex exec or an equivalent reviewer.",
-			Evidence:   buildErr.Error(),
+			Rule:       "Static review stages require Codex app-server active-turn steering support.",
+			Evidence:   capabilityErr.Error(),
 			Impact:     "Static review evidence is incomplete and requires manual verification.",
-			MinimumFix: "Install Codex CLI or run the static template manually, then rerun this stage.",
+			MinimumFix: "Install a Codex CLI version with app-server support and rerun this stage.",
 		}}
 		record.ErrorSummary = "codex unavailable"
 		return finishStage(record, model.StageFailed, start)
@@ -172,12 +172,13 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
 	timeout := r.stageTimeout(stage, 300)
 	prompt := codexPrompt(stage, profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
-	lastMessagePath := codexLastMessagePath(run.ArtifactRoot, stage)
-	args, usingLastMessage := codexExecArgsWithReportCapture(execArgs, extraArgs, capability, lastMessagePath)
+	args := append([]string{}, extraArgs...)
 	review := r.runCodexReviewWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args)
 	result := review.Result
-	report, reportErr := capturedCodexReport(result, lastMessagePath, usingLastMessage, r.cfg.Codex.MaxOutputBytes)
-	if reportErr != nil {
+	report := strings.TrimSpace(result.Stdout)
+	var reportErr error
+	if report == "" {
+		reportErr = fmt.Errorf("codex app-server produced no final agent message")
 		report = staticUnavailableReport(stage, profile, project.Path, codexFailureEvidence(result, reportErr))
 	}
 	report = truncateString(report, r.cfg.Codex.MaxOutputBytes)
@@ -192,7 +193,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 			Impact:     "Static review report may be incomplete.",
 			MinimumFix: "Inspect the static review log and rerun the stage.",
 		}}
-		record.ErrorSummary = "codex exec failed"
+		record.ErrorSummary = "codex app-server failed"
 		return finishStage(record, model.StageFailed, start)
 	}
 	findings, schemaErr := staticReviewFindingsFromReport(stage, report, outputPath)
@@ -231,10 +232,6 @@ func containsPath(paths []string, path string) bool {
 		}
 	}
 	return false
-}
-
-func (r Runner) runCodexWithLog(ctx context.Context, timeout time.Duration, projectPath, logPath string, env []string, prompt string, capability codex.Capability, args []string) executor.Result {
-	return r.runCodexReviewWithLog(ctx, timeout, projectPath, logPath, env, prompt, capability, args).Result
 }
 
 func codexPrompt(stage, profile, reviewPath, projectPath, artifactRoot, profileContent, contextText string) string {
@@ -445,69 +442,23 @@ func untrustedDocument(label, path, content string) string {
 }
 
 func safeCodexExtraArgs(args []string) ([]string, error) {
-	dangerous := map[string]bool{
-		"--sandbox":          true,
-		"--ask-for-approval": true,
-		"-a":                 true,
-		"-c":                 true,
-		"--config":           true,
-		"--cd":               true,
-		"-C":                 true,
-		"--dangerously-bypass-approvals-and-sandbox": true,
-		"--full-auto":           true,
-		"--search":              true,
-		"--add-dir":             true,
-		"--output-last-message": true,
-		"-o":                    true,
-	}
-	for _, arg := range args {
-		key := arg
-		if before, _, ok := strings.Cut(arg, "="); ok {
-			key = before
-		}
-		if dangerous[key] {
-			return nil, fmt.Errorf("codex.extra_args contains unsafe boundary-changing argument: %s", key)
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "--model" || arg == "-m":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return nil, fmt.Errorf("codex.extra_args %s requires a model value", arg)
+			}
+			i++
+		case strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "-m="):
+			if _, value, _ := strings.Cut(arg, "="); strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("codex.extra_args %s requires a model value", arg)
+			}
+		default:
+			return nil, fmt.Errorf("codex.extra_args contains unsupported app-server argument: %s", arg)
 		}
 	}
 	return append([]string{}, args...), nil
-}
-
-func codexLastMessagePath(artifactRoot, stage string) string {
-	return filepath.Join(artifactRoot, "logs", fmt.Sprintf("%s_codex_last_message.md", stage))
-}
-
-func codexExecArgsWithReportCapture(execArgs, extraArgs []string, capability codex.Capability, lastMessagePath string) ([]string, bool) {
-	args := append([]string{}, execArgs...)
-	if len(args) > 0 && args[len(args)-1] == "-" {
-		args = args[:len(args)-1]
-	}
-	args = append(args, extraArgs...)
-	usingLastMessage := capability.HasOutputLastMessage && strings.TrimSpace(lastMessagePath) != ""
-	if usingLastMessage {
-		if capability.HasJSON {
-			args = append(args, "--json")
-		}
-		args = append(args, "--output-last-message", lastMessagePath)
-	}
-	args = append(args, "-")
-	return args, usingLastMessage
-}
-
-func capturedCodexReport(result executor.Result, lastMessagePath string, usingLastMessage bool, maxOutputBytes int) (string, error) {
-	if !usingLastMessage {
-		if report := strings.TrimSpace(result.Stdout); report != "" {
-			return report, nil
-		}
-		return "", fmt.Errorf("codex produced no report on stdout")
-	}
-	content, err := readBoundedText(lastMessagePath, int64(maxOutputBytes))
-	if err != nil {
-		return "", fmt.Errorf("codex last-message capture is unavailable at %s: %w", lastMessagePath, err)
-	}
-	if report := strings.TrimSpace(content); report != "" {
-		return report, nil
-	}
-	return "", fmt.Errorf("codex produced an empty report at %s", lastMessagePath)
 }
 
 func configuredEnvKeys(env map[string]string) []string {
@@ -524,18 +475,8 @@ func capabilitySummary(capability codex.Capability) string {
 		"path=" + capability.Path,
 		"resolved=" + capability.ResolvedPath,
 		"version=" + capability.Version,
-		fmt.Sprintf("sandbox=%t", capability.HasSandbox),
-		fmt.Sprintf("ask_for_approval=%t", capability.HasAskForApproval),
 		fmt.Sprintf("config=%t", capability.HasConfig),
-		fmt.Sprintf("cd_long=%t", capability.HasCDLong),
-		fmt.Sprintf("cd_short=%t", capability.HasCDShort),
-		fmt.Sprintf("ephemeral=%t", capability.HasEphemeral),
-		fmt.Sprintf("skip_git_repo_check=%t", capability.HasSkipGitRepoCheck),
-		fmt.Sprintf("ignore_user_config=%t", capability.HasIgnoreUserConfig),
-		fmt.Sprintf("full_auto=%t", capability.HasFullAuto),
-		fmt.Sprintf("output_last_message=%t", capability.HasOutputLastMessage),
-		fmt.Sprintf("resume=%t", capability.HasResume),
-		fmt.Sprintf("json=%t", capability.HasJSON),
+		fmt.Sprintf("app_server=%t", capability.HasAppServer),
 		"node=" + capability.NodePath,
 		fmt.Sprintf("path_prepended_for_node=%t", capability.PathPrependedForNode),
 	}
@@ -543,7 +484,28 @@ func capabilitySummary(capability codex.Capability) string {
 }
 
 func staticUnavailableReport(stage, profile, projectPath, reason string) string {
-	return fmt.Sprintf("# %s\n\nManual Verification Required.\n\nProfile: `%s`\nProject: `%s`\nReason: %s\n\nNo runtime conclusion is made by this fallback artifact.\n", stageName(stage), profile, projectPath, reason)
+	stage = strings.ToUpper(strings.TrimSpace(stage))
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "codex app-server static reviewer unavailable for an unknown reason"
+	}
+	payload := staticReviewReportSchema{
+		SchemaVersion: staticReviewSchemaVersion,
+		Stage:         stage,
+		Findings: []staticReviewFindingSchema{{
+			Severity:   "High",
+			Title:      stageName(stage) + " unavailable",
+			Rule:       "Static review stages must produce a valid p2r.static_review.v1 final response or an explicit unavailable-review artifact.",
+			Evidence:   reviewText(reason),
+			Impact:     "Manual verification is required before relying on this stage's review conclusion.",
+			MinimumFix: "Inspect the static review log, fix the Codex app-server review failure, and rerun the stage.",
+		}},
+	}
+	contract, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		contract = []byte(`{"schema_version":"p2r.static_review.v1","stage":"` + stage + `","findings":[]}`)
+	}
+	return fmt.Sprintf("# %s\n\nManual Verification Required.\n\nProfile: `%s`\nProject: `%s`\nReason: %s\n\nNo runtime conclusion is made by this unavailable-review artifact.\n\n%s\n%s\n%s\n", stageName(stage), profile, projectPath, reason, staticReviewJSONStart, string(contract), staticReviewJSONEnd)
 }
 
 func codexFailureReason(stderr string) string {
@@ -563,7 +525,7 @@ func codexFailureReason(stderr string) string {
 	}
 	reason := strings.Join(selected, "\n")
 	if strings.TrimSpace(reason) == "" {
-		reason = "codex exec failed without stderr"
+		reason = "codex app-server failed without stderr"
 	}
 	return truncateString(reason, 4000)
 }
@@ -573,7 +535,7 @@ func codexFailureEvidence(result executor.Result, reportErr error) string {
 	if reportErr == nil {
 		return reason
 	}
-	if strings.TrimSpace(reason) == "" || reason == "codex exec failed without stderr" {
+	if strings.TrimSpace(reason) == "" || reason == "codex app-server failed without stderr" {
 		return reportErr.Error()
 	}
 	return reportErr.Error() + "\n" + reason

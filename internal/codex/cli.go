@@ -17,21 +17,11 @@ type Capability struct {
 	Path                   string `json:"path"`
 	ResolvedPath           string `json:"resolved_path,omitempty"`
 	Version                string `json:"version,omitempty"`
-	HasSandbox             bool   `json:"has_sandbox"`
-	HasAskForApproval      bool   `json:"has_ask_for_approval"`
 	HasConfig              bool   `json:"has_config"`
-	HasCDLong              bool   `json:"has_cd_long"`
-	HasCDShort             bool   `json:"has_cd_short"`
-	HasEphemeral           bool   `json:"has_ephemeral"`
-	HasSkipGitRepoCheck    bool   `json:"has_skip_git_repo_check"`
-	HasIgnoreUserConfig    bool   `json:"has_ignore_user_config"`
-	HasFullAuto            bool   `json:"has_full_auto"`
-	HasOutputLastMessage   bool   `json:"has_output_last_message"`
-	HasResume              bool   `json:"has_resume"`
-	HasJSON                bool   `json:"has_json"`
+	HasAppServer           bool   `json:"has_app_server"`
 	NodePath               string `json:"node_path,omitempty"`
 	PathPrependedForNode   bool   `json:"path_prepended_for_node"`
-	ExecHelpAvailable      bool   `json:"exec_help_available"`
+	AppServerHelpAvailable bool   `json:"app_server_help_available"`
 	DetectionError         string `json:"detection_error,omitempty"`
 	NodeDetectionMessage   string `json:"node_detection_message,omitempty"`
 	OptionalMissingMessage string `json:"optional_missing_message,omitempty"`
@@ -55,12 +45,12 @@ func DetectCLI(ctx context.Context, exec executor.Runner, preferredPath string) 
 	if version.Err != nil && cap.DetectionError == "" {
 		cap.DetectionError = version.Err.Error()
 	}
-	help := exec.Run(ctx, 5*time.Second, "", nil, path, "exec", "--help")
+	help := exec.Run(ctx, 5*time.Second, "", nil, path, "app-server", "--help")
 	helpText := help.Stdout + "\n" + help.Stderr
 	if strings.TrimSpace(helpText) != "" && help.Err == nil {
-		cap.ExecHelpAvailable = true
+		cap.AppServerHelpAvailable = true
 	}
-	ApplyExecHelp(&cap, helpText)
+	ApplyAppServerHelp(&cap, helpText)
 	cap.NodePath, cap.PathPrependedForNode, cap.NodeDetectionMessage = detectNodeForCodex(cap.Path, cap.ResolvedPath, os.Getenv("PATH"))
 	cap.OptionalMissingMessage = optionalMissingMessage(cap)
 	if help.Err != nil && cap.DetectionError == "" {
@@ -69,54 +59,22 @@ func DetectCLI(ctx context.Context, exec executor.Runner, preferredPath string) 
 	return cap
 }
 
-func ApplyExecHelp(cap *Capability, help string) {
-	cap.HasSandbox = hasHelpToken(help, "--sandbox")
-	cap.HasAskForApproval = hasHelpToken(help, "--ask-for-approval")
+func ApplyAppServerHelp(cap *Capability, help string) {
+	cap.HasAppServer = hasHelpToken(help, "app-server") && hasHelpToken(help, "--listen")
 	cap.HasConfig = hasHelpToken(help, "--config") || hasHelpToken(help, "-c,")
-	cap.HasCDLong = hasHelpToken(help, "--cd")
-	cap.HasCDShort = hasHelpToken(help, "-C")
-	cap.HasEphemeral = hasHelpToken(help, "--ephemeral")
-	cap.HasSkipGitRepoCheck = hasHelpToken(help, "--skip-git-repo-check")
-	cap.HasIgnoreUserConfig = hasHelpToken(help, "--ignore-user-config")
-	cap.HasFullAuto = hasHelpToken(help, "--full-auto")
-	cap.HasOutputLastMessage = hasHelpToken(help, "--output-last-message")
-	cap.HasResume = hasHelpToken(help, "resume")
-	cap.HasJSON = hasHelpToken(help, "--json")
 }
 
-func BuildExecArgs(cap Capability, projectPath string, extraArgs []string) ([]string, error) {
+func ValidateAppServerCapability(cap Capability) error {
 	if strings.TrimSpace(cap.Path) == "" {
-		return nil, fmt.Errorf("codex executable not found")
+		return fmt.Errorf("codex executable not found")
 	}
-	if !cap.HasSandbox {
-		return nil, fmt.Errorf("codex exec does not expose --sandbox; static review cannot enforce read-only mode")
+	if !cap.HasAppServer {
+		return fmt.Errorf("codex CLI does not expose app-server; static review requires codex app-server turn/steer")
 	}
-	args := []string{"exec"}
-	if cap.HasSkipGitRepoCheck {
-		args = append(args, "--skip-git-repo-check")
+	if !cap.HasConfig {
+		return fmt.Errorf("codex app-server does not expose -c/--config; cannot force approval_policy=never and sandbox_mode=read-only")
 	}
-	args = append(args, "--sandbox", "read-only")
-	if cap.HasAskForApproval {
-		args = append(args, "--ask-for-approval", "never")
-	} else if cap.HasConfig {
-		args = append(args, "-c", `approval_policy="never"`)
-	} else {
-		return nil, fmt.Errorf("codex exec exposes neither --ask-for-approval nor -c/--config; cannot force approval_policy=never")
-	}
-	switch {
-	case cap.HasCDLong:
-		args = append(args, "--cd", projectPath)
-	case cap.HasCDShort:
-		args = append(args, "-C", projectPath)
-	default:
-		return nil, fmt.Errorf("codex exec exposes neither --cd nor -C; refusing to rely on untested working-directory behavior")
-	}
-	if cap.HasEphemeral {
-		args = append(args, "--ephemeral")
-	}
-	args = append(args, extraArgs...)
-	args = append(args, "-")
-	return args, nil
+	return nil
 }
 
 func WithNodeOnPATH(env []string, nodePath string) []string {
@@ -148,14 +106,11 @@ func WithNodeOnPATH(env []string, nodePath string) []string {
 
 func optionalMissingMessage(cap Capability) string {
 	var missing []string
-	if !cap.HasAskForApproval && !cap.HasConfig {
-		missing = append(missing, "--ask-for-approval")
+	if !cap.HasConfig {
+		missing = append(missing, "-c/--config")
 	}
-	if !cap.HasEphemeral {
-		missing = append(missing, "--ephemeral")
-	}
-	if !cap.HasSkipGitRepoCheck {
-		missing = append(missing, "--skip-git-repo-check")
+	if !cap.HasAppServer {
+		missing = append(missing, "app-server")
 	}
 	if len(missing) == 0 {
 		return ""

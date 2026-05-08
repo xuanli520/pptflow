@@ -192,7 +192,7 @@ func localizeSummary(summary string) string {
 		return "本次未选择"
 	case "--static-only skips Docker and run_tests evidence.":
 		return "静态模式跳过运行时证据"
-	case "codex exec failed":
+	case "codex app-server failed":
 		return "Codex 执行失败"
 	case "codex unavailable":
 		return "Codex 不可用"

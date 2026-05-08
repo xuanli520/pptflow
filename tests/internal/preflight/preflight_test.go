@@ -15,7 +15,7 @@ func TestValidateExtraArgsRejectsBoundaryFlags(t *testing.T) {
 	if err := validateExtraArgs([]string{"--model", "gpt-5.4"}); err != "" {
 		t.Fatalf("safe args rejected: %s", err)
 	}
-	for _, flag := range []string{"--full-auto", "--search", "--output-last-message", "-o", "--dangerously-bypass-approvals-and-sandbox"} {
+	for _, flag := range []string{"--full-auto", "--search", "--dangerously-bypass-approvals-and-sandbox"} {
 		err := validateExtraArgs([]string{flag})
 		if !strings.Contains(err, flag) {
 			t.Fatalf("expected %s to be rejected, got %q", flag, err)
@@ -23,8 +23,5 @@ func TestValidateExtraArgsRejectsBoundaryFlags(t *testing.T) {
 	}
 	if err := validateExtraArgs([]string{"--search=true"}); !strings.Contains(err, "--search") {
 		t.Fatalf("expected --search=... to be rejected, got %q", err)
-	}
-	if err := validateExtraArgs([]string{"--output-last-message=/tmp/out.md"}); !strings.Contains(err, "--output-last-message") {
-		t.Fatalf("expected --output-last-message=... to be rejected, got %q", err)
 	}
 }

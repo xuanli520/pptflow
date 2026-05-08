@@ -161,11 +161,13 @@ debug     = raw stream, tool calls, stdout/stderr, command line, capability diag
 
 Implementation rules:
 
-- Continue using `--output-last-message` when supported.
-- Fall back to stdout only when last-message capture is unavailable.
+- Run Codex static reviews through `codex app-server --listen stdio://` and JSON-RPC.
+- Start the review with `thread/start` plus `turn/start`.
+- Capture the final report from app-server agent-message notifications for the active turn.
+- Do not use `codex exec`, `codex exec resume`, or `--output-last-message` for D/E/F static reviews.
 - D/E/F report artifacts should contain only the final Codex response plus a trailing newline.
 - `staticReviewFindingsFromReport` must parse findings only from the final response artifact content.
-- Raw Codex streams and tool-call traces remain in `logs/*_static.log`.
+- Raw app-server JSON-RPC streams, tool calls, stdout/stderr, and capability diagnostics remain in `logs/*_static.log`.
 - TUI and later QA context should default to the final report, not the raw execution stream.
 
 This preserves debuggability while aligning reviewer attention with the actual Codex conclusion.
@@ -204,14 +206,15 @@ You have been running for 40 minutes. Stop starting new exploration, summarize t
 
 Guidance rules:
 
-- Use Codex's guidance conversation ability to append messages to the running review.
+- Use Codex app-server JSON-RPC `turn/steer` to append messages to the active running turn.
+- `codex exec resume` is not a valid non-interrupting guidance channel and must not be used.
 - Do not kill, restart, or interrupt Codex merely to send guidance.
 - Send each guidance message at most once.
 - Trigger based on absence of a final result, not absence of stream output.
 - Record each guidance event in the stage log.
 - Surface each guidance event in TUI stage status/details.
 
-The current code mostly uses one-shot `codex exec` with stdin. Supporting true guidance requires a runner/session abstraction around Codex execution.
+The runner must be session-based around Codex app-server, because active-turn guidance requires the current `threadId` and `turnId`.
 
 Recommended abstraction:
 
@@ -223,9 +226,9 @@ type CodexReviewSession interface {
 }
 ```
 
-The first implementation can wrap the existing exec path where possible, but the deadline guidance feature should be designed around session semantics rather than scattered timers inside stage functions.
+The implementation must not retain a production downgrade path to `codex exec`; if app-server support is unavailable, the stage fails clearly with an unavailable-review artifact.
 
-Fallback behavior:
+Unavailable-review behavior:
 
 - If the 40-minute guidance is sent and Codex still does not produce a final response after a short grace window, p2r may generate an incomplete-review artifact.
 - That artifact must clearly state that Codex did not produce a final response in time.
@@ -301,9 +304,9 @@ Stage A:
 
 Codex final response:
 
-- When `--output-last-message` is available, report artifacts come from that file even if stdout is empty.
-- When last-message capture is unavailable, stdout is used.
-- Raw logs can contain stream/tool-call details, but report artifact contains final response content.
+- App-server `thread/start` and `turn/start` are used to run D/E/F static reviews.
+- Report artifacts come from app-server agent-message notifications for the active turn.
+- Raw JSON-RPC logs can contain stream/tool-call details, but report artifact contains final response content.
 - Findings are parsed from final response content only.
 
 Codex guidance:
