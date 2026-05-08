@@ -151,11 +151,24 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		report := staticUnavailableReport(stage, profile, project.Path, extraErr.Error())
 		writeReports(report)
 		_ = writeText(logPath, report)
+		record.Findings = []model.Finding{{
+			Stage:      stage,
+			Severity:   "High",
+			Title:      stageName(stage) + " extra_args invalid",
+			Rule:       "codex.extra_args for app-server static review may only select the model; boundary-changing or protocol-level arguments are rejected.",
+			Evidence:   extraErr.Error(),
+			Impact:     "Static review cannot start because the configured Codex arguments would make the app-server contract ambiguous or unsafe.",
+			MinimumFix: "Remove unsupported codex.extra_args, or keep only --model/-m with a non-empty model name.",
+			SourcePath: outputPath,
+		}}
 		record.ErrorSummary = "unsafe codex extra_args"
 		return finishStage(record, model.StageFailed, start)
 	}
 	sandbox, sandboxErr := codex.NewSandbox(reviewPath, run.ArtifactRoot, stage)
 	if sandboxErr != nil {
+		report := staticUnavailableReport(stage, profile, project.Path, sandboxErr.Error())
+		writeReports(report)
+		_ = writeText(logPath, report)
 		record.Findings = []model.Finding{{
 			Stage:      stage,
 			Severity:   "High",
@@ -164,6 +177,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 			Evidence:   sandboxErr.Error(),
 			Impact:     "Static review evidence is incomplete and requires manual verification.",
 			MinimumFix: "Ensure the run artifact directory is writable and rerun this stage.",
+			SourcePath: outputPath,
 		}}
 		record.ErrorSummary = "codex sandbox unavailable"
 		return finishStage(record, model.StageFailed, start)

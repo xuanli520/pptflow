@@ -1,12 +1,14 @@
 package codex_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 )
 
 func TestApplyAppServerHelpDetectsRequiredControls(t *testing.T) {
@@ -51,10 +53,48 @@ func TestValidateAppServerExtraArgsOnlyAllowsModelSelection(t *testing.T) {
 		{"--model", ""},
 		{"--model", "--search"},
 		{"--model=--search"},
+		{"--model", "gpt-5.4", "--model", "gpt-5.5"},
 	} {
 		if _, err := codex.ValidateAppServerExtraArgs(args); err == nil {
 			t.Fatalf("expected args to be rejected: %#v", args)
 		}
+	}
+}
+
+func TestDetectCLIUsesCodexLocalNodeForVersionAndHelp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based local node fixture is unix-only")
+	}
+	dir := t.TempDir()
+	codexPath := filepath.Join(dir, "codex")
+	nodePath := filepath.Join(dir, "node")
+	if err := os.WriteFile(codexPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nodePath, []byte(`#!/bin/sh
+shift
+if [ "$1" = "--version" ]; then
+  echo "codex-cli local-node"
+  exit 0
+fi
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then
+  echo "Usage: codex app-server [OPTIONS]"
+  echo "  -c, --config <KEY=VALUE>"
+  echo "      --listen <URL>"
+  exit 0
+fi
+exit 3
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "")
+
+	capability := codex.DetectCLI(context.Background(), executor.New(), codexPath)
+	if capability.Version != "codex-cli local-node" || !capability.HasAppServer || !capability.HasConfig {
+		t.Fatalf("expected local node to power Codex capability detection: %#v", capability)
+	}
+	if capability.NodePath != nodePath || !capability.PathPrependedForNode {
+		t.Fatalf("expected Codex-local node to be detected and prepended: %#v", capability)
 	}
 }
 

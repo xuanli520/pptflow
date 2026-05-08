@@ -59,7 +59,7 @@ func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
 	dir := t.TempDir()
 	codexPath := filepath.Join(dir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeAppServerWithTurnStatus("interrupted")), 0o755); err != nil {
+	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	session := newAppServerCodexReviewSession(nil)
@@ -67,7 +67,7 @@ func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
 		Timeout:        5 * time.Second,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
-		Env:            []string{"PATH=" + os.Getenv("PATH")},
+		Env:            []string{"PATH=" + os.Getenv("PATH"), "TURN_STATUS=interrupted"},
 		Prompt:         "Run p2r stage E as a pure static review.",
 		Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
 		MaxOutputBytes: 1 << 20,
@@ -80,8 +80,62 @@ func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
 	}
 }
 
-func fakeAppServerWithTurnStatus(status string) string {
-	return strings.Replace(fakeSteerableAppServer(), `"status": "completed"`, `"status": "`+status+`"`, 1)
+func TestAppServerSessionCapturesTurnCompletedItems(t *testing.T) {
+	dir := t.TempDir()
+	codexPath := filepath.Join(dir, "codex")
+	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session := newAppServerCodexReviewSession(nil)
+	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{
+		Timeout:        5 * time.Second,
+		ProjectPath:    dir,
+		LogPath:        filepath.Join(dir, "codex.log"),
+		Env:            []string{"PATH=" + os.Getenv("PATH"), "TURN_ITEMS_ONLY=1"},
+		Prompt:         "Run p2r stage E as a pure static review.",
+		Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
+		MaxOutputBytes: 1 << 20,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Result.Stdout, "# Steered Report") {
+		t.Fatalf("missing report from turn/completed items: %#v", result.Result)
+	}
+}
+
+func TestAppServerSessionOmitsUnsetModelAndSendsConfiguredModel(t *testing.T) {
+	dir := t.TempDir()
+	codexPath := filepath.Join(dir, "codex")
+	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		env  []string
+		args []string
+	}{
+		{name: "unset", env: []string{"REJECT_NULL_MODEL=1"}},
+		{name: "configured", env: []string{"REQUIRE_MODEL=gpt-5.4"}, args: []string{"--model", "gpt-5.4"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := newAppServerCodexReviewSession(nil)
+			env := append([]string{"PATH=" + os.Getenv("PATH")}, tc.env...)
+			result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{
+				Timeout:        5 * time.Second,
+				ProjectPath:    dir,
+				LogPath:        filepath.Join(dir, "codex-"+tc.name+".log"),
+				Env:            env,
+				Prompt:         "Run p2r stage E as a pure static review.",
+				Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
+				Args:           tc.args,
+				MaxOutputBytes: 1 << 20,
+			}, nil)
+			if err != nil {
+				t.Fatalf("app-server session failed: %v result=%#v", err, result.Result)
+			}
+		})
+	}
 }
 
 func fakeSteerableAppServer() string {
@@ -124,6 +178,15 @@ if len(sys.argv) > 1 and sys.argv[1] == "app-server":
         request = json.loads(line)
         request_id = request.get("id")
         method = request.get("method")
+        params = request.get("params") or {}
+        if method in ("thread/start", "turn/start"):
+            if os.environ.get("REJECT_NULL_MODEL") == "1" and "model" in params and params.get("model") is None:
+                send({"id": request_id, "error": {"code": -32602, "message": "model must be omitted when unset"}})
+                continue
+            required_model = os.environ.get("REQUIRE_MODEL")
+            if required_model and params.get("model") != required_model:
+                send({"id": request_id, "error": {"code": -32602, "message": "missing required model"}})
+                continue
         if method == "initialize":
             send({"id": request_id, "result": {"userAgent": "fake-codex", "codexHome": "/tmp/fake", "platformFamily": "unix", "platformOs": "linux"}})
         elif method == "initialized":
@@ -137,8 +200,12 @@ if len(sys.argv) > 1 and sys.argv[1] == "app-server":
             send({"id": request_id, "result": {"turn": {"id": turn_id, "items": [], "status": "running"}}})
             def complete():
                 time.sleep(0.2)
+                status = os.environ.get("TURN_STATUS", "completed")
+                if os.environ.get("TURN_ITEMS_ONLY") == "1":
+                    send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "items": [{"id": "item-1", "type": "agentMessage", "text": report}], "status": status}}})
+                    return
                 send({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"id": "item-1", "type": "agentMessage", "text": report}}})
-                send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "items": [], "status": "completed"}}})
+                send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "items": [], "status": status}}})
             threading.Thread(target=complete, daemon=True).start()
         elif method == "turn/steer":
             if steer_log:

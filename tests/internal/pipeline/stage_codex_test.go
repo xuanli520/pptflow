@@ -164,3 +164,56 @@ func TestStageCodexRecheckDoesNotEmitSelfTestCompatibilityAlias(t *testing.T) {
 		t.Fatalf("canonical recheck report missing: %v", err)
 	}
 }
+
+func TestStageCodexUnsafeExtraArgsProducesFindingAndContract(t *testing.T) {
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profiles := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profiles, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profiles, "tests_coverage_report.md"), []byte("profile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
+	cfg := config.Default()
+	cfg.Codex.PromptProfilesDir = profiles
+	cfg.Codex.ExtraArgs = []string{"--search"}
+	record := runnerStageCodex(
+		pipelinepkg.NewRunner(nil, cfg),
+		context.Background(),
+		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: projectPath},
+		pipelinepkg.RunOptions{},
+		"D",
+		"tests_coverage_report.md",
+		"tests_coverage_report.md",
+	)
+
+	if record.Status != model.StageFailed || record.ErrorSummary != "unsafe codex extra_args" {
+		t.Fatalf("stage record = %#v, want unsafe extra_args failure", record)
+	}
+	if len(record.Findings) != 1 || !strings.Contains(record.Findings[0].Evidence, "--search") {
+		t.Fatalf("expected structured extra_args finding, got %#v", record.Findings)
+	}
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "tests_coverage_report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Manual Verification Required", "<!-- p2r:static-review-json:start -->", `"stage": "D"`} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("unavailable report missing %q:\n%s", want, content)
+		}
+	}
+}

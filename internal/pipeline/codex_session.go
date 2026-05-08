@@ -125,14 +125,13 @@ func runCodexReviewSessionWithGuidance(ctx context.Context, session CodexReviewS
 		return outcome.result, outcome.err
 	}
 	finishAfterCancel := func() (CodexReviewResult, error) {
-		outcome := <-waitCh
-		if outcome.err == nil {
-			outcome.err = ctx.Err()
+		select {
+		case outcome := <-waitCh:
+			return finish(outcome)
+		default:
 		}
-		if outcome.result.Result.Err == nil {
-			outcome.result.Result.Err = ctx.Err()
-		}
-		return finish(outcome)
+		cancelErr := ctx.Err()
+		return finish(waitResult{result: CodexReviewResult{Result: executor.Result{Err: cancelErr}}, err: cancelErr})
 	}
 	for _, deadline := range deadlines {
 		wait := time.Until(start.Add(deadline.After))

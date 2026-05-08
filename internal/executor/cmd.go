@@ -45,6 +45,17 @@ func (Runner) RunWithInputStreaming(ctx context.Context, timeout time.Duration, 
 	return runCommand(ctx, timeout, dir, env, input, writer, name, args...)
 }
 
+func ConfigureCommand(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	prepareCommand(cmd)
+	cmd.Cancel = func() error {
+		return terminateCommand(cmd)
+	}
+	cmd.WaitDelay = 5 * time.Second
+}
+
 func runCommand(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, writer io.Writer, name string, args ...string) Result {
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -52,11 +63,7 @@ func runCommand(ctx context.Context, timeout time.Duration, dir string, env []st
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	prepareCommand(cmd)
-	cmd.Cancel = func() error {
-		return terminateCommand(cmd)
-	}
-	cmd.WaitDelay = 5 * time.Second
+	ConfigureCommand(cmd)
 	cmd.Dir = dir
 	if len(env) > 0 {
 		cmd.Env = env

@@ -54,6 +54,12 @@ type appServerRPCError struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
+type appServerItem struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
 func (e *appServerRPCError) Error() string {
 	if e == nil {
 		return ""
@@ -83,17 +89,18 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 		return err
 	}
 	runCtx := ctx
+	var cancel context.CancelFunc
 	if request.Timeout > 0 {
-		var cancel context.CancelFunc
 		runCtx, cancel = context.WithTimeout(ctx, request.Timeout)
-		s.cancel = cancel
 	} else {
-		var cancel context.CancelFunc
 		runCtx, cancel = context.WithCancel(ctx)
-		s.cancel = cancel
 	}
+	s.mu.Lock()
+	s.cancel = cancel
+	s.mu.Unlock()
 	args := []string{"app-server", "-c", `approval_policy="never"`, "-c", `sandbox_mode="read-only"`, "--listen", "stdio://"}
 	cmd := exec.CommandContext(runCtx, request.Capability.Path, args...)
+	executor.ConfigureCommand(cmd)
 	cmd.Dir = request.ProjectPath
 	if len(request.Env) > 0 {
 		cmd.Env = request.Env
@@ -148,13 +155,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 		s.failStart(commandString(request.Capability.Path, args), err)
 		return err
 	}
-	threadResult, err := s.sendRequest(initCtx, "thread/start", map[string]any{
-		"approvalPolicy": "never",
-		"cwd":            request.ProjectPath,
-		"ephemeral":      true,
-		"model":          appServerModelParam(request.Args),
-		"sandbox":        "read-only",
-	})
+	threadResult, err := s.sendRequest(initCtx, "thread/start", appServerThreadStartParams(request))
 	if err != nil {
 		s.failStart(commandString(request.Capability.Path, args), err)
 		return err
@@ -168,20 +169,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 	s.mu.Lock()
 	s.threadID = threadID
 	s.mu.Unlock()
-	turnResult, err := s.sendRequest(initCtx, "turn/start", map[string]any{
-		"approvalPolicy": "never",
-		"cwd":            request.ProjectPath,
-		"input": []map[string]any{{
-			"type": "text",
-			"text": request.Prompt,
-		}},
-		"model": appServerModelParam(request.Args),
-		"sandboxPolicy": map[string]any{
-			"type":          "readOnly",
-			"networkAccess": false,
-		},
-		"threadId": threadID,
-	})
+	turnResult, err := s.sendRequest(initCtx, "turn/start", appServerTurnStartParams(request, threadID))
 	if err != nil {
 		s.failStart(commandString(request.Capability.Path, args), err)
 		return err
@@ -493,13 +481,9 @@ func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMes
 		}
 	case "item/completed":
 		var params struct {
-			ThreadID string `json:"threadId"`
-			TurnID   string `json:"turnId"`
-			Item     struct {
-				ID   string `json:"id"`
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"item"`
+			ThreadID string        `json:"threadId"`
+			TurnID   string        `json:"turnId"`
+			Item     appServerItem `json:"item"`
 		}
 		if json.Unmarshal(message.Params, &params) == nil && params.Item.Type == "agentMessage" {
 			s.recordCompletedItem(params.TurnID, params.Item.ID, params.Item.Text)
@@ -508,14 +492,20 @@ func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMes
 		var params struct {
 			ThreadID string `json:"threadId"`
 			Turn     struct {
-				ID     string `json:"id"`
-				Status string `json:"status"`
+				ID     string          `json:"id"`
+				Items  []appServerItem `json:"items"`
+				Status string          `json:"status"`
 				Error  *struct {
 					Message string `json:"message"`
 				} `json:"error"`
 			} `json:"turn"`
 		}
 		if json.Unmarshal(message.Params, &params) == nil {
+			for _, item := range params.Turn.Items {
+				if item.Type == "agentMessage" {
+					s.recordCompletedItem(params.Turn.ID, item.ID, item.Text)
+				}
+			}
 			s.completeTurn(params.Turn.ID, params.Turn.Status, params.Turn.Error)
 		}
 	}
@@ -710,9 +700,37 @@ func stringAtPath(raw json.RawMessage, path ...string) string {
 	return strings.TrimSpace(text)
 }
 
-func appServerModelParam(args []string) any {
-	if model := codex.AppServerModelFromArgs(args); model != "" {
-		return model
+func appServerThreadStartParams(request CodexReviewRequest) map[string]any {
+	params := map[string]any{
+		"approvalPolicy": "never",
+		"cwd":            request.ProjectPath,
+		"ephemeral":      true,
+		"sandbox":        "read-only",
 	}
-	return nil
+	setAppServerModelParam(params, request.Args)
+	return params
+}
+
+func appServerTurnStartParams(request CodexReviewRequest, threadID string) map[string]any {
+	params := map[string]any{
+		"approvalPolicy": "never",
+		"cwd":            request.ProjectPath,
+		"input": []map[string]any{{
+			"type": "text",
+			"text": request.Prompt,
+		}},
+		"sandboxPolicy": map[string]any{
+			"type":          "readOnly",
+			"networkAccess": false,
+		},
+		"threadId": threadID,
+	}
+	setAppServerModelParam(params, request.Args)
+	return params
+}
+
+func setAppServerModelParam(params map[string]any, args []string) {
+	if model := codex.AppServerModelFromArgs(args); model != "" {
+		params["model"] = model
+	}
 }

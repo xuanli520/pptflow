@@ -40,18 +40,22 @@ func DetectCLI(ctx context.Context, exec executor.Runner, preferredPath string) 
 	}
 	cap.Path = path
 	cap.ResolvedPath = resolvePath(path)
-	version := exec.Run(ctx, 5*time.Second, "", nil, path, "--version")
+	cap.NodePath, cap.PathPrependedForNode, cap.NodeDetectionMessage = detectNodeForCodex(cap.Path, cap.ResolvedPath, os.Getenv("PATH"))
+	env := os.Environ()
+	if cap.NodePath != "" {
+		env = WithNodeOnPATH(env, cap.NodePath)
+	}
+	version := exec.Run(ctx, 5*time.Second, "", env, path, "--version")
 	cap.Version = firstLine(firstNonEmpty(version.Stdout, version.Stderr))
 	if version.Err != nil && cap.DetectionError == "" {
 		cap.DetectionError = version.Err.Error()
 	}
-	help := exec.Run(ctx, 5*time.Second, "", nil, path, "app-server", "--help")
+	help := exec.Run(ctx, 5*time.Second, "", env, path, "app-server", "--help")
 	helpText := help.Stdout + "\n" + help.Stderr
 	if strings.TrimSpace(helpText) != "" && help.Err == nil {
 		cap.AppServerHelpAvailable = true
 	}
 	ApplyAppServerHelp(&cap, helpText)
-	cap.NodePath, cap.PathPrependedForNode, cap.NodeDetectionMessage = detectNodeForCodex(cap.Path, cap.ResolvedPath, os.Getenv("PATH"))
 	cap.OptionalMissingMessage = optionalMissingMessage(cap)
 	if help.Err != nil && cap.DetectionError == "" {
 		cap.DetectionError = help.Err.Error()
@@ -60,7 +64,7 @@ func DetectCLI(ctx context.Context, exec executor.Runner, preferredPath string) 
 }
 
 func ApplyAppServerHelp(cap *Capability, help string) {
-	cap.HasAppServer = hasHelpToken(help, "app-server") && hasHelpToken(help, "--listen")
+	cap.HasAppServer = hasHelpToken(help, "--listen")
 	cap.HasConfig = hasHelpToken(help, "--config") || hasHelpToken(help, "-c,")
 }
 
@@ -78,22 +82,31 @@ func ValidateAppServerCapability(cap Capability) error {
 }
 
 func ValidateAppServerExtraArgs(args []string) ([]string, error) {
+	modelSeen := false
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
 		switch {
 		case arg == "--model" || arg == "-m":
+			if modelSeen {
+				return nil, fmt.Errorf("codex.extra_args contains duplicate model selection")
+			}
 			if i+1 >= len(args) {
 				return nil, missingAppServerModelValueError(arg)
 			}
 			if err := validateAppServerModelValue(arg, args[i+1]); err != nil {
 				return nil, err
 			}
+			modelSeen = true
 			i++
 		case strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "-m="):
+			if modelSeen {
+				return nil, fmt.Errorf("codex.extra_args contains duplicate model selection")
+			}
 			flag, value, _ := strings.Cut(arg, "=")
 			if err := validateAppServerModelValue(flag, value); err != nil {
 				return nil, err
 			}
+			modelSeen = true
 		default:
 			return nil, fmt.Errorf("codex.extra_args contains unsupported app-server argument: %s", arg)
 		}
