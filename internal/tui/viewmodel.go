@@ -677,9 +677,9 @@ func primaryCodexReportPath(stage stageView) string {
 		return ""
 	}
 	known := map[string][]string{
-		"D": {"tests_coverage_report.md", "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md"},
-		"E": {"static_acceptance_audit_report.md", "1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md"},
-		"F": {"3_标注员AI报告问题的修复报告.md", "3_标注员AI报告问题_确认修复报告.md"},
+		"D": qaArtifactCandidates("tests_coverage_report.md", "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md"),
+		"E": qaArtifactCandidates("static_acceptance_audit_report.md", "1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md"),
+		"F": qaArtifactCandidates("3_标注员AI报告问题的修复报告.md", "3_标注员AI报告问题_确认修复报告.md"),
 	}
 	for _, name := range known[stage.Stage] {
 		for _, path := range stage.ArtifactPaths {
@@ -689,11 +689,37 @@ func primaryCodexReportPath(stage stageView) string {
 		}
 	}
 	for _, path := range stage.ArtifactPaths {
-		if strings.EqualFold(filepath.Ext(path), ".md") && filepath.Base(path) != "short_comment.txt" {
+		if strings.EqualFold(filepath.Ext(path), ".md") && !isShortCommentArtifact(filepath.Base(path)) {
 			return path
 		}
 	}
 	return ""
+}
+
+func qaArtifactCandidates(names ...string) []string {
+	seen := map[string]bool{}
+	var result []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		add("QA_" + strings.TrimPrefix(name, "QA_"))
+		add(name)
+	}
+	return result
+}
+
+func isShortCommentArtifact(base string) bool {
+	return base == "short_comment.txt" || base == "QA_short_comment.txt"
 }
 
 func reportSummary(path string) string {

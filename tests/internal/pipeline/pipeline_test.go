@@ -267,7 +267,7 @@ func TestRunPersistsStageArtifactWarnings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	compatWarningPath := "4_测试有效性报告_api端点真实性.md"
+	compatWarningPath := "QA_4_测试有效性报告_api端点真实性.md"
 	result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-WARN", pipelinepkg.RunOptions{
 		Stages: []string{"D"},
 		Progress: func(update pipelinepkg.RunProgress) {

@@ -678,7 +678,7 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 	case "B":
 		logPath := filepath.Join(run.ArtifactRoot, "logs", "B_docker.log")
 		portMapPath := filepath.Join(run.ArtifactRoot, "port_map.json")
-		screenshotPath := filepath.Join(run.ArtifactRoot, "5_Docker启动截图.png")
+		screenshotPath := qaArtifactPath(run.ArtifactRoot, "5_Docker启动截图.png")
 		reason := record.ErrorSummary
 		if reason == "" {
 			reason = "Stage B was not executed."
@@ -694,7 +694,7 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 		record.ArtifactPaths = append([]string{portMapPath}, pages...)
 	case "C":
 		logPath := filepath.Join(run.ArtifactRoot, "logs", "C_tests.log")
-		screenshotPath := filepath.Join(run.ArtifactRoot, "6_run_tests.sh运行截图.png")
+		screenshotPath := qaArtifactPath(run.ArtifactRoot, "6_run_tests.sh运行截图.png")
 		summaryPath := filepath.Join(run.ArtifactRoot, "test_runtime_summary.json")
 		reason := record.ErrorSummary
 		if reason == "" {

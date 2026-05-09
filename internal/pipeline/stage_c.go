@@ -16,7 +16,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	start := time.Now()
 	record := startStage("C")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "C_tests.log")
-	screenshotPath := filepath.Join(run.ArtifactRoot, "6_run_tests.sh运行截图.png")
+	screenshotPath := qaArtifactPath(run.ArtifactRoot, "6_run_tests.sh运行截图.png")
 	summaryPath := filepath.Join(run.ArtifactRoot, "test_runtime_summary.json")
 	record.LogPath = logPath
 	record.ArtifactPaths = append(record.ArtifactPaths, logPath, screenshotPath, summaryPath)

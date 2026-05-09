@@ -37,8 +37,8 @@
 
 | 模板 | 用途 | 运行边界 | 模板要求输出 |
 |------|------|----------|--------------|
-| `static_acceptance_audit.md` | Delivery Acceptance and Project Architecture Audit | 纯静态；不启动项目、不运行 Docker、不运行测试、不改代码 | `./.tmp/static_acceptance_audit_report.md` |
-| `tests_coverage_report.md` | Review the effectiveness of project tests | 纯静态；按项目类型检查 API/前端测试有效性 | `./.tmp/tests_coverage_report.md` |
+| `static_acceptance_audit.md` | Delivery Acceptance and Project Architecture Audit | 纯静态；不启动项目、不运行 Docker、不运行测试、不改代码 | `./.tmp/QA_static_acceptance_audit_report.md` |
+| `tests_coverage_report.md` | Review the effectiveness of project tests | 纯静态；按项目类型检查 API/前端测试有效性 | `./.tmp/QA_tests_coverage_report.md` |
 
 阶段 D/E 可以读取源码、文档、测试文件和既有证据文件，但不得在 Codex 审查过程中启动项目、运行 Docker、运行测试或修改代码。任何依赖真实运行结果的结论必须标注 `Cannot Confirm Statistically` 或 `Manual Verification Required`，除非只是引用 B/C 阶段已经采集到的外部运行证据。
 
@@ -98,7 +98,7 @@ p2r/
 │   │   ├── stage_c.go           # run_tests.* 运行证据采集
 │   │   ├── stage_d.go           # 测试有效性静态审查
 │   │   ├── stage_e.go           # 质检员静态审计报告
-│   │   └── stage_f.go           # 汇总报告 + short_comment
+│   │   └── stage_f.go           # 汇总报告 + QA_short_comment
 │   ├── docker/
 │   │   └── manager.go           # Compose/容器/端口/GC
 │   ├── codex/
@@ -191,7 +191,7 @@ CI 输出示例：
 [C] run_tests.* 运行证据 ................. blocked (B failed)
 [D] 测试有效性静态审查 .................. done (18.4s)
 [E] 质检员静态审计报告 .................. done (25.2s)
-[F] 汇总报告 + short_comment ............. done (1.8s)
+[F] 汇总报告 + QA_short_comment .......... done (1.8s)
 [run] completed_with_findings, 输出: TASK-.../qa/runs/run-20260428-001/
 ```
 
@@ -281,19 +281,19 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 
 | 规则 / 风险点 | 负责阶段 | 工具或模板 | 主要输出 |
 |---------------|----------|------------|----------|
-| 根结构：`docs/`、`repo/`、`original_sessions/`、`metadata.json` | A | `run_acceptance.py`、`run_validate.py` | `acceptance.json`、`acceptance_report.md`、`validation_report.md` |
+| 根结构：`docs/`、`repo/`、`original_sessions/`、`metadata.json` | A | `run_acceptance.py`、`run_validate.py` | `acceptance.json`、`QA_acceptance_report.md`、`QA_validation_report.md` |
 | 必需文档和测试目录 | A | `check_required_artifacts.py` | `required_artifacts.json` |
 | README 与实际结构/命令静态一致性 | A/E | `check_readme_alignment.py`、`static_acceptance_audit.md` | finding |
 | 脏依赖、缓存、数据库文件 | A | `check_local_dependency.py` | finding |
 | 英文题交付语言 | A/E | `check_english_only.py`、静态审计模板 | finding |
 | Docker 能否启动并暴露服务 | B | `docker compose` + probes | `port_map.json`、logs、截图 |
 | `run_tests.*` 是否可运行 | C | 容器内执行统一测试入口 | test logs、截图 |
-| API 测试是否真调实际端点、覆盖率是否超过 90% | D | `tests_coverage_report.md` | `tests_coverage_report.md` |
-| 纯前端是否正确豁免 API 测试要求 | D | `tests_coverage_report.md` | `tests_coverage_report.md` |
-| Prompt 到代码的业务一致性 | E | `static_acceptance_audit.md` | `static_acceptance_audit_report.md` |
+| API 测试是否真调实际端点、覆盖率是否超过 90% | D | `tests_coverage_report.md` | `QA_tests_coverage_report.md` |
+| 纯前端是否正确豁免 API 测试要求 | D | `tests_coverage_report.md` | `QA_tests_coverage_report.md` |
+| Prompt 到代码的业务一致性 | E | `static_acceptance_audit.md` | `QA_static_acceptance_audit_report.md` |
 | 安全边界、鉴权、授权、数据隔离 | E | `static_acceptance_audit.md` | Security Review Summary |
 | mock/stub/fake 风险 | E | `static_acceptance_audit.md`、`check_fake_impl.py` | finding |
-| 最终人工可读修复建议和 short_comment | F | `annotator_fix.md` | repair report、`short_comment.txt` |
+| 最终人工可读修复建议和 QA_short_comment | F | `annotator_fix.md` | repair report、`QA_short_comment.txt` |
 
 ### 5.4 阶段详细定义
 
@@ -304,7 +304,7 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 | 输入 | `<task-path>/` |
 | 依赖 | 无 |
 | 动作 | 运行 `run_acceptance.py`、`run_validate.py`、`check_required_artifacts.py`、`check_readme_alignment.py`、`check_local_dependency.py`，英文题追加 `check_english_only.py` |
-| 输出 | `acceptance.json`、`acceptance_report.md`、`validation_report.md`、`required_artifacts.json`、`readme_alignment.json`、`local_dependency.json` |
+| 输出 | `acceptance.json`、`QA_acceptance_report.md`、`QA_validation_report.md`、`required_artifacts.json`、`readme_alignment.json`、`local_dependency.json` |
 | 超时 | 60s |
 | 失败影响 | A 失败时 B/C 标记 `blocked`；D/E 仍可静态审查已存在文件；F 在默认配置中继续参与汇总 |
 
@@ -315,7 +315,7 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 | 输入 | `repo/docker-compose.yml` 或 README 声明的容器启动方式 |
 | 依赖 | A 未出现结构阻断 |
 | 动作 | 启动服务、读取实际端口映射、执行基础 probe、采集 docker logs 首屏和健康检查输出 |
-| 输出 | `port_map.json`、`5_Docker启动截图.png`、`logs/B_docker.log` |
+| 输出 | `port_map.json`、`QA_5_Docker启动截图.png`、`logs/B_docker.log` |
 | 超时 | 120s |
 | 失败影响 | C 标记 `blocked`；D/E/F 继续 |
 
@@ -328,7 +328,7 @@ B 阶段不得把 README 当作唯一事实来源。README 是被审查对象，
 | 输入 | `repo/run_tests.sh`、`repo/run_tests.ps1` 或 `repo/run_tests.py` |
 | 依赖 | B 成功提供可执行服务或测试容器 |
 | 动作 | 在容器或 Compose 网络内执行统一测试入口 |
-| 输出 | `6_run_tests.sh运行截图.png`、`logs/C_tests.log`、`test_runtime_summary.json` |
+| 输出 | `QA_6_run_tests.sh运行截图.png`、`logs/C_tests.log`、`test_runtime_summary.json` |
 | 超时 | 300s |
 | 失败影响 | 不阻塞 D/E/F；F 必须把失败作为运行证据缺口 |
 
@@ -343,8 +343,8 @@ C 阶段只说明测试命令的实际执行结果，不替代 D 阶段对测试
 | 分析方式 | 纯静态，不启动服务，不运行 Docker，不运行测试 |
 | 模板 | `prompt_profiles/tests_coverage_report.md` |
 | Codex 动作 | `codex exec <rendered static prompt>`，其中 prompt 内容由内置 `prompt_profiles/tests_coverage_report.md` 渲染 |
-| 模板输出 | `./.tmp/tests_coverage_report.md` |
-| CLI 收集输出 | `tests_coverage_report.md`、兼容文件 `4_测试有效性报告_api端点真实性.md` |
+| 模板输出 | `./.tmp/QA_tests_coverage_report.md` |
+| CLI 收集输出 | `QA_tests_coverage_report.md`、兼容文件 `QA_4_测试有效性报告_api端点真实性.md` |
 | 超时 | 300s |
 
 D 阶段必须按项目类型处理：
@@ -361,8 +361,8 @@ D 阶段必须按项目类型处理：
 | 分析方式 | 纯静态，不启动服务，不运行 Docker，不运行测试，不修改代码 |
 | 模板 | `prompt_profiles/static_acceptance_audit.md` |
 | Codex 动作 | `codex exec <rendered static prompt>`，其中 prompt 内容由内置 `prompt_profiles/static_acceptance_audit.md` 渲染 |
-| 模板输出 | `./.tmp/static_acceptance_audit_report.md` |
-| CLI 收集输出 | `static_acceptance_audit_report.md`、兼容文件 `1_质检AI测试报告.md` |
+| 模板输出 | `./.tmp/QA_static_acceptance_audit_report.md` |
+| CLI 收集输出 | `QA_static_acceptance_audit_report.md`、兼容文件 `QA_1_质检AI测试报告.md` |
 | 超时 | 600s |
 
 E 阶段报告必须按模板要求组织：
@@ -379,19 +379,19 @@ E 阶段报告必须按模板要求组织：
 
 所有强结论必须有 `file:line` 证据。任何运行时相关结论必须标注 `Cannot Confirm Statistically` 或 `Manual Verification Required`，除非只是引用 B/C 已采集 artifact。
 
-#### 阶段 F — 汇总报告 + `short_comment.txt`
+#### 阶段 F — 汇总报告 + `QA_short_comment.txt`
 
 | 项 | 内容 |
 |----|------|
 | 输入 | A/B/C/D/E 全部输出 |
 | 依赖 | 无，永远执行 |
-| 动作 | 汇总阶段状态、提取 Blocker/High findings、生成修复建议、预填 `short_comment.txt` |
-| 输出 | `3_标注员AI报告问题的修复报告.md`、`repair_summary.json`、`short_comment.txt` |
+| 动作 | 汇总阶段状态、提取 Blocker/High findings、生成修复建议、预填 `QA_short_comment.txt` |
+| 输出 | `QA_3_标注员AI报告问题的修复报告.md`、`repair_summary.json`、`QA_short_comment.txt` |
 | 超时 | 60s |
 
 F 阶段不得改写 E/D 的审查结论，只能聚合、去重、压缩和标注来源。
 
-`short_comment.txt` 的三项 AI 预填由 Go 侧模板拼接生成，不额外调用 Codex：
+`QA_short_comment.txt` 的三项 AI 预填由 Go 侧模板拼接生成，不额外调用 Codex：
 
 | 字段 | 拼接来源 |
 |------|----------|
@@ -435,20 +435,20 @@ P2R-{stage}-{severity_short}-{seq:03d}
 | `run_manifest.json` | run 初始化 | 记录配置、工具版本、模板版本、启动参数 |
 | `stage_status.json` | 全阶段 | 阶段状态权威记录 |
 | `acceptance.json` | A | 基础规则脚本结果 |
-| `acceptance_report.md` | A | acceptance 脚本的人类可读报告 |
-| `validation_report.md` | A | 结构校验报告 |
+| `QA_acceptance_report.md` | A | acceptance 脚本的人类可读报告 |
+| `QA_validation_report.md` | A | 结构校验报告 |
 | `port_map.json` | B | B skipped/blocked 时仍生成空结构并说明原因 |
-| `5_Docker启动截图.png` | B | B 成功时生成；失败时记录缺失原因 |
-| `6_run_tests.sh运行截图.png` | C | C 成功执行时生成；blocked/skipped 时记录原因 |
-| `tests_coverage_report.md` | D | 测试有效性静态报告 |
-| `4_测试有效性报告_api端点真实性.md` | D | 兼容旧命名，内容来自 D |
-| `static_acceptance_audit_report.md` | E | 质检员静态审计报告 |
-| `1_质检AI测试报告.md` | E | 兼容旧命名，内容来自 E |
-| `3_标注员AI报告问题的修复报告.md` | F | 修复建议汇总 |
+| `QA_5_Docker启动截图.png` | B | B 成功时生成；失败时记录缺失原因 |
+| `QA_6_run_tests.sh运行截图.png` | C | C 成功执行时生成；blocked/skipped 时记录原因 |
+| `QA_tests_coverage_report.md` | D | 测试有效性静态报告 |
+| `QA_4_测试有效性报告_api端点真实性.md` | D | 兼容旧命名，内容来自 D |
+| `QA_static_acceptance_audit_report.md` | E | 质检员静态审计报告 |
+| `QA_1_质检AI测试报告.md` | E | 兼容旧命名，内容来自 E |
+| `QA_3_标注员AI报告问题的修复报告.md` | F | 修复建议汇总 |
 | `repair_summary.json` | F | 机器可读修复摘要 |
-| `short_comment.txt` | F | 人工勾选入口 |
+| `QA_short_comment.txt` | F | 人工勾选入口 |
 
-### 5.8 `short_comment.txt` 格式
+### 5.8 `QA_short_comment.txt` 格式
 
 ```text
 1.<可运行性结论: [AI预填，注明来自 B/C 或缺失原因]>
@@ -466,7 +466,7 @@ TASK-xxxxxx/qa/runs/<run_id>/
 ├── run_manifest.json
 ├── stage_status.json
 ├── port_map.json
-├── short_comment.txt
+├── QA_short_comment.txt
 ├── repair_summary.json
 ├── logs/
 │   ├── A_validate.log
@@ -476,15 +476,15 @@ TASK-xxxxxx/qa/runs/<run_id>/
 │   ├── E_static_audit.log
 │   └── F_repair.log
 ├── acceptance.json
-├── acceptance_report.md
-├── validation_report.md
-├── 5_Docker启动截图.png
-├── 6_run_tests.sh运行截图.png
-├── tests_coverage_report.md
-├── 4_测试有效性报告_api端点真实性.md
-├── static_acceptance_audit_report.md
-├── 1_质检AI测试报告.md
-└── 3_标注员AI报告问题的修复报告.md
+├── QA_acceptance_report.md
+├── QA_validation_report.md
+├── QA_5_Docker启动截图.png
+├── QA_6_run_tests.sh运行截图.png
+├── QA_tests_coverage_report.md
+├── QA_4_测试有效性报告_api端点真实性.md
+├── QA_static_acceptance_audit_report.md
+├── QA_1_质检AI测试报告.md
+└── QA_3_标注员AI报告问题的修复报告.md
 ```
 
 ---
@@ -525,7 +525,7 @@ Report/Prompt 面板后续版本再加入 TabBar，MVP 不展示不可用入口�
 | 执行选中项目 | `Enter` |
 | 重跑当前阶段 | `r` |
 | 打开当前 run 目录 | `o` |
-| 打开 `short_comment.txt` 路径提示 | `s` |
+| 打开 `QA_short_comment.txt` 路径提示 | `s` |
 | 返回 | `Esc` |
 | 退出 TUI | `q` / `Ctrl+C` |
 | 过滤 | SearchBox 直接输入 |
@@ -845,7 +845,7 @@ projects-qa/.qa-control/prompt_profiles/
 - `p2r-qa` skill 提供 QA 规则、脚本和参考文档
 - `p2r` CLI 负责发现项目、执行阶段、采集证据、落盘报告、索引 findings
 - 质检员静态审计报告由既有模板生成，不由 CLI 临时拼接
-- 质检员最终判定仍在 CLI 之外完成，CLI 只预填 `short_comment.txt`
+- 质检员最终判定仍在 CLI 之外完成，CLI 只预填 `QA_short_comment.txt`
 
 ## 附录 B: p2r CLI 命令速查
 

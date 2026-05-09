@@ -162,7 +162,7 @@ func TestStageCodexRecheckDoesNotEmitSelfTestCompatibilityAlias(t *testing.T) {
 			t.Fatalf("deprecated self-test compatibility alias should not be recorded: %#v", record.ArtifactPaths)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(artifactRoot, "4_测试有效性报告_api端点真实性_确认修复报告.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(artifactRoot, "QA_4_测试有效性报告_api端点真实性_确认修复报告.md")); err != nil {
 		t.Fatalf("canonical recheck report missing: %v", err)
 	}
 }
@@ -209,7 +209,7 @@ func TestStageCodexUnsafeExtraArgsProducesFindingAndContract(t *testing.T) {
 	if len(record.Findings) != 1 || !strings.Contains(record.Findings[0].Evidence, "--search") {
 		t.Fatalf("expected structured extra_args finding, got %#v", record.Findings)
 	}
-	content, err := os.ReadFile(filepath.Join(artifactRoot, "tests_coverage_report.md"))
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "QA_tests_coverage_report.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestStageCodexUnsafeExtraArgsProducesFindingAndContract(t *testing.T) {
 func TestStageCodexRequiredReportWriteFailureAddsInfraFinding(t *testing.T) {
 	root := t.TempDir()
 	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
-	outputPath := filepath.Join(artifactRoot, "tests_coverage_report.md")
+	outputPath := filepath.Join(artifactRoot, "QA_tests_coverage_report.md")
 	if err := os.MkdirAll(outputPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestStageCodexCompatWriteFailureRecordsWarningOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
-	if err := os.MkdirAll(filepath.Join(artifactRoot, "compat.md"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "QA_compat.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -294,13 +294,13 @@ func TestStageCodexCompatWriteFailureRecordsWarningOnly(t *testing.T) {
 	if record.Status != model.StageDone {
 		t.Fatalf("stage status = %s, want done; record=%#v", record.Status, record)
 	}
-	if _, err := os.Stat(filepath.Join(artifactRoot, "tests_coverage_report.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(artifactRoot, "QA_tests_coverage_report.md")); err != nil {
 		t.Fatalf("required report should be written: %v", err)
 	}
 	if len(record.ArtifactWarnings) != 1 {
 		t.Fatalf("expected one best-effort artifact warning, got %#v", record.ArtifactWarnings)
 	}
-	if record.ArtifactWarnings[0].Required || record.ArtifactWarnings[0].Path != "compat.md" {
+	if record.ArtifactWarnings[0].Required || record.ArtifactWarnings[0].Path != "QA_compat.md" {
 		t.Fatalf("unexpected artifact warning: %#v", record.ArtifactWarnings[0])
 	}
 	if hasFinding(record.Findings, "INFRA", "Required p2r artifact could not be written") {
@@ -348,7 +348,7 @@ func TestStageCodexNormalizesFinalReportLayout(t *testing.T) {
 	if record.Status != model.StageDone {
 		t.Fatalf("stage record = %#v, want done", record)
 	}
-	content, err := os.ReadFile(filepath.Join(artifactRoot, "1_质检AI测试报告.md"))
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "QA_1_质检AI测试报告.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func TestStageCodexNormalizesFinalReportLayout(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimSpace(text), endMarker) {
 		t.Fatalf("JSON contract should be the final block:\n%s", text)
 	}
-	compat, err := os.ReadFile(filepath.Join(artifactRoot, "static_acceptance_audit_report.md"))
+	compat, err := os.ReadFile(filepath.Join(artifactRoot, "QA_static_acceptance_audit_report.md"))
 	if err != nil {
 		t.Fatal(err)
 	}

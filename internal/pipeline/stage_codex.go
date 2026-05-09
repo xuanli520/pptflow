@@ -27,7 +27,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	if stage == "E" {
 		logPath = filepath.Join(run.ArtifactRoot, "logs", "E_static_audit.log")
 	}
-	outputPath := filepath.Join(run.ArtifactRoot, output)
+	outputPath := qaArtifactPath(run.ArtifactRoot, output)
 	record.LogPath = logPath
 	record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, outputPath)
 	writer := NewArtifactWriter(run.ArtifactRoot)
@@ -37,7 +37,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		if name == "" {
 			continue
 		}
-		path := filepath.Join(run.ArtifactRoot, name)
+		path := qaArtifactPath(run.ArtifactRoot, name)
 		if path == outputPath || containsPath(compatPaths, path) {
 			continue
 		}
@@ -47,7 +47,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	extraOutputPaths := []string{}
 	if stage == "D" {
 		if opts.Mode == "recheck" {
-			extraOutputPaths = append(extraOutputPaths, filepath.Join(run.ArtifactRoot, "打回问题修复确认报告.md"))
+			extraOutputPaths = append(extraOutputPaths, qaArtifactPath(run.ArtifactRoot, "打回问题修复确认报告.md"))
 		}
 		for _, path := range extraOutputPaths {
 			record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, path)
@@ -426,18 +426,18 @@ func (r Runner) refRunStaticContext(artifactRoot, stage string) string {
 	names := []string{"repair_summary.json"}
 	switch stage {
 	case "D":
-		names = append(names, "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "tests_coverage_report.md")
+		names = append(names, qaArtifactCandidates("4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "tests_coverage_report.md")...)
 	case "E":
-		names = append(names, "1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md", "static_acceptance_audit_report.md")
+		names = append(names, qaArtifactCandidates("1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md", "static_acceptance_audit_report.md")...)
 	case "F":
-		names = append(names,
+		names = append(names, qaArtifactCandidates(
 			"3_标注员AI报告问题的修复报告.md",
 			"3_标注员AI报告问题_确认修复报告.md",
 			"4_测试有效性报告_api端点真实性.md",
 			"4_测试有效性报告_api端点真实性_确认修复报告.md",
 			"1_质检AI测试报告.md",
 			"1_质检AI测试报告_确认修复报告.md",
-		)
+		)...)
 	}
 	seen := map[string]bool{}
 	for _, name := range names {

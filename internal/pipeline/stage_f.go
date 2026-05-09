@@ -19,7 +19,7 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "F_repair.log")
 	summaryPath := filepath.Join(run.ArtifactRoot, "repair_summary.json")
 	reportPath := stageFReportPath(run.ArtifactRoot, opts)
-	shortPath := filepath.Join(run.ArtifactRoot, "short_comment.txt")
+	shortPath := qaArtifactPath(run.ArtifactRoot, "short_comment.txt")
 	record.LogPath = logPath
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath, reportPath, shortPath)
 	writer := NewArtifactWriter(run.ArtifactRoot)
@@ -122,9 +122,9 @@ func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, ru
 
 func stageFReportPath(artifactRoot string, opts RunOptions) string {
 	if opts.Mode == "recheck" {
-		return filepath.Join(artifactRoot, "3_标注员AI报告问题_确认修复报告.md")
+		return qaArtifactPath(artifactRoot, "3_标注员AI报告问题_确认修复报告.md")
 	}
-	return filepath.Join(artifactRoot, "3_标注员AI报告问题的修复报告.md")
+	return qaArtifactPath(artifactRoot, "3_标注员AI报告问题的修复报告.md")
 }
 
 func stageFPreviousFindingsContext(stageStatuses map[string]string, findings []model.Finding) string {

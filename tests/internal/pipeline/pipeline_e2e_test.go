@@ -280,7 +280,7 @@ echo "v25.0.0"
 	if stageD.Status != model.StageDone {
 		t.Fatalf("stage D status = %s, want done; error=%s", stageD.Status, stageD.ErrorSummary)
 	}
-	reportPath := filepath.Join(result.Run.ArtifactRoot, "tests_coverage_report.md")
+	reportPath := filepath.Join(result.Run.ArtifactRoot, "QA_tests_coverage_report.md")
 	content, err := os.ReadFile(reportPath)
 	if err != nil {
 		t.Fatal(err)
@@ -353,7 +353,7 @@ echo "v25.0.0"
 	if stageD.Status != model.StageFailed || stageD.ErrorSummary != "static review schema invalid" {
 		t.Fatalf("stage D = %#v, want schema failure", stageD)
 	}
-	reportPath := filepath.Join(result.Run.ArtifactRoot, "tests_coverage_report.md")
+	reportPath := filepath.Join(result.Run.ArtifactRoot, "QA_tests_coverage_report.md")
 	content, err := os.ReadFile(reportPath)
 	if err != nil {
 		t.Fatal(err)

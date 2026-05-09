@@ -73,7 +73,7 @@ func TestExecutionViewModelPrioritizesCodexFinalReportWarningsAndGuidance(t *tes
 	if err := store.CreateRun(ctx, run); err != nil {
 		t.Fatal(err)
 	}
-	reportPath := filepath.Join(artifactRoot, "tests_coverage_report.md")
+	reportPath := filepath.Join(artifactRoot, "QA_tests_coverage_report.md")
 	if err := os.WriteFile(reportPath, []byte("# Final Codex Response\n\nConfirmed findings.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

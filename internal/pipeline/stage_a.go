@@ -50,8 +50,8 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	}
 
 	acceptancePath := filepath.Join(run.ArtifactRoot, "acceptance.json")
-	acceptanceReportPath := filepath.Join(run.ArtifactRoot, "acceptance_report.md")
-	validationReportPath := filepath.Join(run.ArtifactRoot, "validation_report.md")
+	acceptanceReportPath := qaArtifactPath(run.ArtifactRoot, "acceptance_report.md")
+	validationReportPath := qaArtifactPath(run.ArtifactRoot, "validation_report.md")
 	requiredPath := filepath.Join(run.ArtifactRoot, "required_artifacts.json")
 	readmeAlignmentPath := filepath.Join(run.ArtifactRoot, "readme_alignment.json")
 	localDependencyPath := filepath.Join(run.ArtifactRoot, "local_dependency.json")
@@ -91,7 +91,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 			Stage:      "A",
 			Severity:   "High",
 			Title:      "run_validate.py did not complete cleanly",
-			Rule:       "Stage A must collect validation_report.md from the bundled validation wrapper.",
+			Rule:       "Stage A must collect " + filepath.Base(validationReportPath) + " from the bundled validation wrapper.",
 			Evidence:   result.summary(),
 			Impact:     "The validation markdown report may be incomplete or generated from fallback structural checks.",
 			MinimumFix: "Ensure Python/uv can run assets/scripts/run_validate.py and rerun Stage A.",

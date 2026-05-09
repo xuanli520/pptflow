@@ -22,7 +22,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	record.LogPath = logPath
 	writer := NewArtifactWriter(run.ArtifactRoot)
 	portMapPath := filepath.Join(run.ArtifactRoot, "port_map.json")
-	screenshotPath := filepath.Join(run.ArtifactRoot, "5_Docker启动截图.png")
+	screenshotPath := qaArtifactPath(run.ArtifactRoot, "5_Docker启动截图.png")
 	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, screenshotPath)
 	repoPath := filepath.Join(project.Path, "repo")
 	compose := findCompose(repoPath)
