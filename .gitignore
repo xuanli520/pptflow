@@ -6,5 +6,5 @@
 /dist/
 testdata/**/qa/
 testdata
-
+p2r
 .claude
