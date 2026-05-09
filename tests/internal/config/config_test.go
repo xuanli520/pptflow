@@ -237,3 +237,104 @@ func TestLoadErrorsForMissingEnvReference(t *testing.T) {
 		t.Fatal("expected missing env reference error")
 	}
 }
+
+func TestLoadRejectsInvalidScalarTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "invalid bool",
+			content: `pipeline:
+  static_only: maybe
+`,
+		},
+		{
+			name: "invalid int",
+			content: `pipeline:
+  max_concurrent: lots
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := config.Load(dir, config.Overrides{}); err == nil {
+				t.Fatal("expected config parse error")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnknownFieldsAndStageTimeoutKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "unknown top level",
+			content: `surprise: true
+`,
+		},
+		{
+			name: "unknown nested field",
+			content: `codex:
+  unsafe_extra_args: true
+`,
+		},
+		{
+			name: "unknown stage timeout",
+			content: `pipeline:
+  stage_timeouts:
+    Z: 10
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := config.Load(dir, config.Overrides{}); err == nil {
+				t.Fatal("expected config validation error")
+			}
+		})
+	}
+}
+
+func TestLoadPreservesQuotedHashInScalar(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`scan_path: "./with#hash"
+codex:
+  env:
+    TOKEN: "abc#123"
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ScanPath != filepath.Join(dir, "with#hash") {
+		t.Fatalf("quoted hash in scan path was not preserved: %s", cfg.ScanPath)
+	}
+	if cfg.Codex.Env["TOKEN"] != "abc#123" {
+		t.Fatalf("quoted hash in env value was not preserved: %#v", cfg.Codex.Env)
+	}
+}
+
+func TestLoadRejectsNonPositiveLimits(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`docs:
+  max_attachment_bytes: 0
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(dir, config.Overrides{}); err == nil {
+		t.Fatal("expected non-positive docs limit to be rejected")
+	}
+}

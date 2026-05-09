@@ -141,7 +141,7 @@ func TestCancelMessageTakesPriorityOverPendingJobFailure(t *testing.T) {
 	h = h.ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
 		JobID:           "job-1",
 		TaskID:          "TASK-1",
-		State:           scheduler.JobFailed,
+		State:           scheduler.JobCancelled,
 		Err:             scheduler.ErrJobCancelledByUser.Error(),
 		CancelRequested: true,
 	}})

@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -30,12 +29,13 @@ func newScanCommand() *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			if err := store.UpsertProjects(context.Background(), result.Projects); err != nil {
+			ctx := cmd.Context()
+			if err := store.UpsertProjects(ctx, result.Projects); err != nil {
 				return err
 			}
 			var pruneResult db.ArtifactPruneResult
 			if pruneArtifacts {
-				pruned, err := store.PruneArtifactProjects(context.Background(), cfg.ScanPath)
+				pruned, err := store.PruneArtifactProjects(ctx, cfg.ScanPath)
 				if err != nil {
 					return err
 				}

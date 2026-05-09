@@ -159,6 +159,8 @@ func localizeJobState(state scheduler.JobState) string {
 		return "运行中"
 	case scheduler.JobDone:
 		return "已完成"
+	case scheduler.JobCancelled:
+		return "已终止"
 	case scheduler.JobFailed:
 		return "失败"
 	default:

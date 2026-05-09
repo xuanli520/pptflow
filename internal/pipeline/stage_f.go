@@ -22,9 +22,10 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	shortPath := filepath.Join(run.ArtifactRoot, "short_comment.txt")
 	record.LogPath = logPath
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath, reportPath, shortPath)
+	writer := NewArtifactWriter(run.ArtifactRoot)
 
 	stageStatuses, priorFindings := priorStageSnapshot(prior)
-	writeRepairSupplements(run, stageStatuses, priorFindings, summaryPath, shortPath)
+	writeRepairSupplements(&record, writer, run, stageStatuses, priorFindings, summaryPath, shortPath)
 
 	profile := "annotator_fix.md"
 	profilePath := filepath.Join(r.cfg.Codex.PromptProfilesDir, profile)
@@ -61,21 +62,25 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	prompt := codexPrompt("F", profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	args := append([]string{}, extraArgs...)
 	review := r.runCodexReviewWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args)
+	recordArtifactWarnings(&record, writer, review.ArtifactWarnings)
 	outcome := finalizeStaticReviewReport("F", profile, project.Path, reportPath, review.Result, r.cfg.Codex.MaxOutputBytes)
-	_ = writeText(reportPath, outcome.Report+"\n")
-	record.Findings = outcome.Findings
+	record.Findings = append(record.Findings, outcome.Findings...)
+	record = requiredStageText(record, writer, writer.RelativePath(reportPath), outcome.Report+"\n")
 	if outcome.ErrorSummary != "" {
-		record.ErrorSummary = outcome.ErrorSummary
+		if record.ErrorSummary == "" {
+			record.ErrorSummary = outcome.ErrorSummary
+		}
 		return finishStage(record, model.StageFailed, start)
 	}
 	return finishStage(record, model.StageDone, start)
 }
 
 func (r Runner) finishUnavailableF(record model.StageRecord, start time.Time, reportPath, logPath, profile, projectPath, reason string) model.StageRecord {
+	writer := NewArtifactWriter(filepath.Dir(reportPath))
 	report := staticUnavailableReport("F", profile, projectPath, reason)
-	_ = writeText(reportPath, report)
-	_ = writeText(logPath, report)
-	record.Findings = []model.Finding{{
+	record = requiredStageText(record, writer, writer.RelativePath(reportPath), report)
+	bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
+	record.Findings = append(record.Findings, model.Finding{
 		Stage:      "F",
 		Severity:   "High",
 		Title:      "annotator repair static reviewer unavailable",
@@ -84,8 +89,10 @@ func (r Runner) finishUnavailableF(record model.StageRecord, start time.Time, re
 		Impact:     "Human manual review is required before relying on the repair report.",
 		MinimumFix: "Restore Codex static review capability or manually complete the Stage F report.",
 		SourcePath: reportPath,
-	}}
-	record.ErrorSummary = "codex unavailable"
+	})
+	if record.ErrorSummary == "" {
+		record.ErrorSummary = "codex unavailable"
+	}
 	return finishStage(record, model.StageFailed, start)
 }
 
@@ -102,15 +109,15 @@ func priorStageSnapshot(prior map[string]model.StageRecord) (map[string]string, 
 	return stageStatuses, findings
 }
 
-func writeRepairSupplements(run model.RunRecord, stageStatuses map[string]string, findings []model.Finding, summaryPath, shortPath string) {
+func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, run model.RunRecord, stageStatuses map[string]string, findings []model.Finding, summaryPath, shortPath string) {
 	summary := map[string]any{
 		"run_id":         run.RunID,
 		"stage_statuses": stageStatuses,
 		"findings":       findings,
 		"highest_risk":   highestRisk(findings),
 	}
-	_ = writeJSON(summaryPath, summary)
-	_ = writeText(shortPath, shortComment(stageStatuses, findings))
+	bestEffortStageJSON(record, writer, writer.RelativePath(summaryPath), summary)
+	bestEffortStageText(record, writer, writer.RelativePath(shortPath), shortComment(stageStatuses, findings))
 }
 
 func stageFReportPath(artifactRoot string, opts RunOptions) string {

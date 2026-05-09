@@ -563,30 +563,25 @@ func stageMatchesForSearch(term string) []string {
 	lower := strings.ToLower(trimmed)
 	var stages []string
 	if strings.Contains(trimmed, "结构") {
-		stages = append(stages, "A")
+		stages = append(stages, string(model.StageA))
 	}
 	if strings.Contains(lower, "docker") {
-		stages = append(stages, "B")
+		stages = append(stages, string(model.StageB))
 	}
 	if strings.Contains(trimmed, "测试") {
-		stages = append(stages, "C", "D")
+		stages = append(stages, string(model.StageC), string(model.StageD))
 	}
 	if strings.Contains(trimmed, "验收") {
-		stages = append(stages, "E")
+		stages = append(stages, string(model.StageE))
 	}
 	if strings.Contains(trimmed, "修复") || strings.Contains(trimmed, "标注") {
-		stages = append(stages, "F")
+		stages = append(stages, string(model.StageF))
 	}
 	return uniqueStrings(stages)
 }
 
 func isStageLetter(value string) bool {
-	switch value {
-	case "A", "B", "C", "D", "E", "F":
-		return true
-	default:
-		return false
-	}
+	return model.IsStageID(value)
 }
 
 func uniqueStrings(values []string) []string {

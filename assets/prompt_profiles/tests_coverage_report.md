@@ -16,12 +16,14 @@ Review the effectiveness of the project tests, with an absolute **hard requireme
    - Mock/local data is acceptable unless it hides missing required frontend functionality.
 
 **Output constraints**
+- Return the report as the final Codex response. Do not write files; p2r persists the response to the required artifact path.
 - Begin the final response immediately with the analysis heading.
-- No preamble, progress updates, or narration.
+- Do not include progress updates, preamble text, or narration.
 - For each finding use at most 3 short bullets: issue, evidence, impact.
 - If the API endpoint coverage hard fail is triggered, clearly state **FAIL** and give the exact percentage with the list of uncovered endpoints.
 - Do not speculate; base all conclusions on static evidence from the repository.
 - If no issue is found and coverage > 90%, state “Pass” and briefly summarise the coverage level.
+- If p2r supplies a machine-readable JSON contract block, place that block only at the very end, ending at the JSON end marker with no text after it.
 - Keep the report as short as possible while preserving key conclusions.
 
 Return only the complete report. Do not write files; p2r persists the response.

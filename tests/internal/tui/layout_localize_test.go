@@ -3,34 +3,12 @@ package tui_test
 import (
 	"strings"
 	"testing"
-	_ "unsafe"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
-
-//go:linkname localizeRunStatus github.com/xuanli520/p2r_tui/internal/tui.localizeRunStatus
-func localizeRunStatus(status string) string
-
-//go:linkname localizeStageStatus github.com/xuanli520/p2r_tui/internal/tui.localizeStageStatus
-func localizeStageStatus(status string) string
-
-//go:linkname localizeManualVerdict github.com/xuanli520/p2r_tui/internal/tui.localizeManualVerdict
-func localizeManualVerdict(verdict string) string
-
-//go:linkname localizeSeverity github.com/xuanli520/p2r_tui/internal/tui.localizeSeverity
-func localizeSeverity(severity string) string
-
-//go:linkname localizeStageName github.com/xuanli520/p2r_tui/internal/tui.localizeStageName
-func localizeStageName(stage, name string) string
-
-//go:linkname localizeCleanupStatus github.com/xuanli520/p2r_tui/internal/tui.localizeCleanupStatus
-func localizeCleanupStatus(status string) string
-
-//go:linkname localizeSummary github.com/xuanli520/p2r_tui/internal/tui.localizeSummary
-func localizeSummary(summary string) string
 
 func TestExecutionLayoutBreakpoints(t *testing.T) {
 	cases := map[int]string{120: "wide", 100: "medium", 80: "stacked", 70: "minimal"}
@@ -125,15 +103,15 @@ func TestTruncateDisplayRespectsChineseWidth(t *testing.T) {
 
 func TestLocalizationCoversCoreValues(t *testing.T) {
 	cases := map[string]string{
-		localizeRunStatus(model.RunCompletedClean):        "通过",
-		localizeRunStatus(model.RunCompletedWithFindings): "有发现",
-		localizeStageStatus(model.StageBlocked):           "已阻塞",
-		localizeManualVerdict(model.ManualRework):         "返工",
-		localizeSeverity("Blocker"):                       "阻断",
-		localizeStageName("F", ""):                        "标注员修复静态审查",
-		localizeCleanupStatus("none"):                     "未生成",
-		localizeSummary("Not selected for this run."):     "本次未选择",
-		localizeSummary("3 acceptance finding(s)"):        "3 个验收发现",
+		tuiapp.LocalizeRunStatusForTest(model.RunCompletedClean):        "通过",
+		tuiapp.LocalizeRunStatusForTest(model.RunCompletedWithFindings): "有发现",
+		tuiapp.LocalizeStageStatusForTest(model.StageBlocked):           "已阻塞",
+		tuiapp.LocalizeManualVerdictForTest(model.ManualRework):         "返工",
+		tuiapp.LocalizeSeverityForTest("Blocker"):                       "阻断",
+		tuiapp.LocalizeStageNameForTest("F", ""):                        "标注员修复静态审查",
+		tuiapp.LocalizeCleanupStatusForTest("none"):                     "未生成",
+		tuiapp.LocalizeSummaryForTest("Not selected for this run."):     "本次未选择",
+		tuiapp.LocalizeSummaryForTest("3 acceptance finding(s)"):        "3 个验收发现",
 	}
 	for got, want := range cases {
 		if got != want {

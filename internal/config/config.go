@@ -1,12 +1,15 @@
 package config
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -81,6 +84,57 @@ type fileSettings struct {
 	ScanPath          bool
 	DBPath            bool
 	PromptProfilesDir bool
+}
+
+type rawConfig struct {
+	ScanPath *string            `yaml:"scan_path"`
+	DBPath   *string            `yaml:"db_path"`
+	Pipeline *rawPipelineConfig `yaml:"pipeline"`
+	Docker   *rawDockerConfig   `yaml:"docker"`
+	Docs     *rawDocsConfig     `yaml:"docs"`
+	Codex    *rawCodexConfig    `yaml:"codex"`
+	TUI      *rawTUIConfig      `yaml:"tui"`
+}
+
+type rawPipelineConfig struct {
+	StaticOnly         *bool          `yaml:"static_only"`
+	StageTimeouts      map[string]int `yaml:"stage_timeouts"`
+	SelfTestReportPath *string        `yaml:"self_test_report_path"`
+	MaxConcurrent      *int           `yaml:"max_concurrent"`
+}
+
+type rawDockerConfig struct {
+	ManagedLabel                *string `yaml:"managed_label"`
+	ComposeProjectPrefix        *string `yaml:"compose_project_prefix"`
+	KeepFailedContainersMinutes *int    `yaml:"keep_failed_containers_minutes"`
+	HealthCheckTimeoutSeconds   *int    `yaml:"health_check_timeout_seconds"`
+	CleanupPolicy               *string `yaml:"cleanup_policy"`
+	CleanupImages               *bool   `yaml:"cleanup_images"`
+	CleanupVolumes              *bool   `yaml:"cleanup_volumes"`
+	CleanupBuildCache           *bool   `yaml:"cleanup_build_cache"`
+	BuildCachePruneUntil        *string `yaml:"build_cache_prune_until"`
+	KeepRuntime                 *bool   `yaml:"keep_runtime"`
+}
+
+type rawDocsConfig struct {
+	MaxAttachmentBytes   *int64 `yaml:"max_attachment_bytes"`
+	InlineTextLimitBytes *int64 `yaml:"inline_text_limit_bytes"`
+	StageInlineMaxBytes  *int64 `yaml:"stage_inline_max_bytes"`
+}
+
+type rawCodexConfig struct {
+	SandboxImage      *string           `yaml:"sandbox_image"`
+	PromptProfilesDir *string           `yaml:"prompt_profiles_dir"`
+	Network           *string           `yaml:"network"`
+	MaxOutputBytes    *int              `yaml:"max_output_bytes"`
+	WritableTmp       *bool             `yaml:"writable_tmp"`
+	Env               map[string]string `yaml:"env"`
+	ExtraArgs         []string          `yaml:"extra_args"`
+}
+
+type rawTUIConfig struct {
+	RefreshIntervalMS *int `yaml:"refresh_interval_ms"`
+	LogMaxLines       *int `yaml:"log_max_lines"`
 }
 
 func Default() Config {
@@ -173,6 +227,9 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 	cfg.DBPath = absFrom(bases.DBPath, cfg.DBPath)
 	cfg.Codex.PromptProfilesDir = absFrom(bases.PromptProfilesDir, cfg.Codex.PromptProfilesDir)
 	normalize(&cfg)
+	if err := Validate(cfg); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
 }
 
@@ -225,117 +282,138 @@ func absFrom(cwd, path string) string {
 
 func applyFile(cfg *Config, path string) (fileSettings, error) {
 	var settings fileSettings
-	file, err := os.Open(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return settings, err
 	}
-	defer file.Close()
 
-	var section string
-	var subSection string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		raw := scanner.Text()
-		line := strings.TrimSpace(stripComment(raw))
-		if line == "" {
-			continue
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	decoder.KnownFields(true)
+	var raw rawConfig
+	if err := decoder.Decode(&raw); err != nil {
+		if err == io.EOF {
+			return settings, nil
 		}
-		indent := len(raw) - len(strings.TrimLeft(raw, " "))
-		if strings.HasPrefix(line, "-") {
-			item := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "-")), `"'`)
-			switch {
-			case section == "codex" && subSection == "extra_args":
-				cfg.Codex.ExtraArgs = append(cfg.Codex.ExtraArgs, item)
-			}
-			continue
+		return settings, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := applyRawConfig(cfg, raw, &settings); err != nil {
+		return settings, err
+	}
+	return settings, nil
+}
+
+func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
+	if raw.ScanPath != nil {
+		cfg.ScanPath = *raw.ScanPath
+		settings.ScanPath = true
+	}
+	if raw.DBPath != nil {
+		cfg.DBPath = *raw.DBPath
+		settings.DBPath = true
+	}
+	if raw.Pipeline != nil {
+		if raw.Pipeline.StaticOnly != nil {
+			cfg.Pipeline.StaticOnly = *raw.Pipeline.StaticOnly
 		}
-		if strings.HasSuffix(line, ":") {
-			key := strings.TrimSuffix(line, ":")
-			if indent == 0 {
-				section, subSection = key, ""
-			} else if indent == 2 {
-				subSection = key
-			}
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-		switch {
-		case section == "" && key == "scan_path":
-			cfg.ScanPath = value
-			settings.ScanPath = true
-		case section == "" && key == "db_path":
-			cfg.DBPath = value
-			settings.DBPath = true
-		case section == "pipeline" && key == "static_only":
-			cfg.Pipeline.StaticOnly = parseBool(value)
-		case section == "pipeline" && subSection == "stage_timeouts":
-			normalized := normalizeStageTimeoutKey(key)
-			cfg.Pipeline.StageTimeouts[normalized] = parseInt(value, cfg.Pipeline.StageTimeouts[normalized])
-		case section == "pipeline" && key == "self_test_report_path":
-			cfg.Pipeline.SelfTestReportPath = value
-		case section == "pipeline" && key == "max_concurrent":
-			cfg.Pipeline.MaxConcurrent = parseInt(value, cfg.Pipeline.MaxConcurrent)
-		case section == "docker" && key == "managed_label":
-			cfg.Docker.ManagedLabel = value
-		case section == "docker" && key == "compose_project_prefix":
-			cfg.Docker.ComposeProjectPrefix = value
-		case section == "docker" && key == "keep_failed_containers_minutes":
-			cfg.Docker.KeepFailedContainersMinutes = parseInt(value, cfg.Docker.KeepFailedContainersMinutes)
-		case section == "docker" && key == "health_check_timeout_seconds":
-			cfg.Docker.HealthCheckTimeoutSeconds = parseInt(value, cfg.Docker.HealthCheckTimeoutSeconds)
-		case section == "docker" && key == "cleanup_policy":
-			cfg.Docker.CleanupPolicy = value
-		case section == "docker" && key == "cleanup_images":
-			cfg.Docker.CleanupImages = parseBool(value)
-		case section == "docker" && key == "cleanup_volumes":
-			cfg.Docker.CleanupVolumes = parseBool(value)
-		case section == "docker" && key == "cleanup_build_cache":
-			cfg.Docker.CleanupBuildCache = parseBool(value)
-		case section == "docker" && key == "build_cache_prune_until":
-			cfg.Docker.BuildCachePruneUntil = value
-		case section == "docker" && key == "keep_runtime":
-			cfg.Docker.KeepRuntime = parseBool(value)
-		case section == "docs" && key == "max_attachment_bytes":
-			cfg.Docs.MaxAttachmentBytes = int64(parseInt(value, int(cfg.Docs.MaxAttachmentBytes)))
-		case section == "docs" && key == "inline_text_limit_bytes":
-			cfg.Docs.InlineTextLimitBytes = int64(parseInt(value, int(cfg.Docs.InlineTextLimitBytes)))
-		case section == "docs" && key == "stage_inline_max_bytes":
-			cfg.Docs.StageInlineMaxBytes = int64(parseInt(value, int(cfg.Docs.StageInlineMaxBytes)))
-		case section == "codex" && key == "sandbox_image":
-			cfg.Codex.SandboxImage = value
-		case section == "codex" && key == "prompt_profiles_dir":
-			cfg.Codex.PromptProfilesDir = value
-			settings.PromptProfilesDir = true
-		case section == "codex" && key == "network":
-			cfg.Codex.Network = value
-		case section == "codex" && key == "max_output_bytes":
-			cfg.Codex.MaxOutputBytes = parseInt(value, cfg.Codex.MaxOutputBytes)
-		case section == "codex" && key == "writable_tmp":
-			cfg.Codex.WritableTmp = parseBool(value)
-		case section == "codex" && subSection == "env":
-			expanded, err := expandEnvRefs(value)
+		for key, value := range raw.Pipeline.StageTimeouts {
+			normalized, err := validateStageTimeoutKey(key)
 			if err != nil {
-				return settings, err
+				return err
 			}
+			cfg.Pipeline.StageTimeouts[normalized] = value
+		}
+		if raw.Pipeline.SelfTestReportPath != nil {
+			cfg.Pipeline.SelfTestReportPath = *raw.Pipeline.SelfTestReportPath
+		}
+		if raw.Pipeline.MaxConcurrent != nil {
+			cfg.Pipeline.MaxConcurrent = *raw.Pipeline.MaxConcurrent
+		}
+	}
+	if raw.Docker != nil {
+		if raw.Docker.ManagedLabel != nil {
+			cfg.Docker.ManagedLabel = *raw.Docker.ManagedLabel
+		}
+		if raw.Docker.ComposeProjectPrefix != nil {
+			cfg.Docker.ComposeProjectPrefix = *raw.Docker.ComposeProjectPrefix
+		}
+		if raw.Docker.KeepFailedContainersMinutes != nil {
+			cfg.Docker.KeepFailedContainersMinutes = *raw.Docker.KeepFailedContainersMinutes
+		}
+		if raw.Docker.HealthCheckTimeoutSeconds != nil {
+			cfg.Docker.HealthCheckTimeoutSeconds = *raw.Docker.HealthCheckTimeoutSeconds
+		}
+		if raw.Docker.CleanupPolicy != nil {
+			cfg.Docker.CleanupPolicy = *raw.Docker.CleanupPolicy
+		}
+		if raw.Docker.CleanupImages != nil {
+			cfg.Docker.CleanupImages = *raw.Docker.CleanupImages
+		}
+		if raw.Docker.CleanupVolumes != nil {
+			cfg.Docker.CleanupVolumes = *raw.Docker.CleanupVolumes
+		}
+		if raw.Docker.CleanupBuildCache != nil {
+			cfg.Docker.CleanupBuildCache = *raw.Docker.CleanupBuildCache
+		}
+		if raw.Docker.BuildCachePruneUntil != nil {
+			cfg.Docker.BuildCachePruneUntil = *raw.Docker.BuildCachePruneUntil
+		}
+		if raw.Docker.KeepRuntime != nil {
+			cfg.Docker.KeepRuntime = *raw.Docker.KeepRuntime
+		}
+	}
+	if raw.Docs != nil {
+		if raw.Docs.MaxAttachmentBytes != nil {
+			cfg.Docs.MaxAttachmentBytes = *raw.Docs.MaxAttachmentBytes
+		}
+		if raw.Docs.InlineTextLimitBytes != nil {
+			cfg.Docs.InlineTextLimitBytes = *raw.Docs.InlineTextLimitBytes
+		}
+		if raw.Docs.StageInlineMaxBytes != nil {
+			cfg.Docs.StageInlineMaxBytes = *raw.Docs.StageInlineMaxBytes
+		}
+	}
+	if raw.Codex != nil {
+		if raw.Codex.SandboxImage != nil {
+			cfg.Codex.SandboxImage = *raw.Codex.SandboxImage
+		}
+		if raw.Codex.PromptProfilesDir != nil {
+			cfg.Codex.PromptProfilesDir = *raw.Codex.PromptProfilesDir
+			settings.PromptProfilesDir = true
+		}
+		if raw.Codex.Network != nil {
+			cfg.Codex.Network = *raw.Codex.Network
+		}
+		if raw.Codex.MaxOutputBytes != nil {
+			cfg.Codex.MaxOutputBytes = *raw.Codex.MaxOutputBytes
+		}
+		if raw.Codex.WritableTmp != nil {
+			cfg.Codex.WritableTmp = *raw.Codex.WritableTmp
+		}
+		if raw.Codex.Env != nil {
 			if cfg.Codex.Env == nil {
 				cfg.Codex.Env = map[string]string{}
 			}
-			cfg.Codex.Env[key] = expanded
-		case section == "tui" && key == "refresh_interval_ms":
-			cfg.TUI.RefreshIntervalMS = parseInt(value, cfg.TUI.RefreshIntervalMS)
-		case section == "tui" && key == "log_max_lines":
-			cfg.TUI.LogMaxLines = parseInt(value, cfg.TUI.LogMaxLines)
+			for key, value := range raw.Codex.Env {
+				expanded, err := expandEnvRefs(value)
+				if err != nil {
+					return err
+				}
+				cfg.Codex.Env[key] = expanded
+			}
+		}
+		if raw.Codex.ExtraArgs != nil {
+			cfg.Codex.ExtraArgs = append([]string(nil), raw.Codex.ExtraArgs...)
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return settings, fmt.Errorf("read config: %w", err)
+	if raw.TUI != nil {
+		if raw.TUI.RefreshIntervalMS != nil {
+			cfg.TUI.RefreshIntervalMS = *raw.TUI.RefreshIntervalMS
+		}
+		if raw.TUI.LogMaxLines != nil {
+			cfg.TUI.LogMaxLines = *raw.TUI.LogMaxLines
+		}
 	}
-	return settings, nil
+	return nil
 }
 
 func normalize(cfg *Config) {
@@ -347,34 +425,79 @@ func normalize(cfg *Config) {
 	}
 }
 
-func stripComment(line string) string {
-	if idx := strings.Index(line, "#"); idx >= 0 {
-		return line[:idx]
+func Validate(cfg Config) error {
+	for key, seconds := range cfg.Pipeline.StageTimeouts {
+		if _, err := validateStageTimeoutKey(key); err != nil {
+			return err
+		}
+		if seconds <= 0 {
+			return fmt.Errorf("pipeline.stage_timeouts.%s must be greater than 0", key)
+		}
 	}
-	return line
-}
-
-func parseInt(value string, fallback int) int {
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return fallback
+	if cfg.Pipeline.MaxConcurrent <= 0 {
+		return fmt.Errorf("pipeline.max_concurrent must be greater than 0")
 	}
-	return parsed
-}
-
-func parseBool(value string) bool {
-	switch strings.ToLower(value) {
-	case "true", "yes", "1", "on":
-		return true
-	default:
-		return false
+	if cfg.Docker.KeepFailedContainersMinutes < 0 {
+		return fmt.Errorf("docker.keep_failed_containers_minutes must be greater than or equal to 0")
 	}
+	if cfg.Docker.HealthCheckTimeoutSeconds <= 0 {
+		return fmt.Errorf("docker.health_check_timeout_seconds must be greater than 0")
+	}
+	if strings.TrimSpace(cfg.Docker.ManagedLabel) == "" {
+		return fmt.Errorf("docker.managed_label must not be empty")
+	}
+	if strings.TrimSpace(cfg.Docker.ComposeProjectPrefix) == "" {
+		return fmt.Errorf("docker.compose_project_prefix must not be empty")
+	}
+	if strings.TrimSpace(cfg.Docker.CleanupPolicy) == "" {
+		return fmt.Errorf("docker.cleanup_policy must not be empty")
+	}
+	if cfg.Docs.MaxAttachmentBytes <= 0 {
+		return fmt.Errorf("docs.max_attachment_bytes must be greater than 0")
+	}
+	if cfg.Docs.InlineTextLimitBytes <= 0 {
+		return fmt.Errorf("docs.inline_text_limit_bytes must be greater than 0")
+	}
+	if cfg.Docs.StageInlineMaxBytes <= 0 {
+		return fmt.Errorf("docs.stage_inline_max_bytes must be greater than 0")
+	}
+	if strings.TrimSpace(cfg.Codex.SandboxImage) == "" {
+		return fmt.Errorf("codex.sandbox_image must not be empty")
+	}
+	if strings.TrimSpace(cfg.Codex.Network) == "" {
+		return fmt.Errorf("codex.network must not be empty")
+	}
+	if cfg.Codex.MaxOutputBytes <= 0 {
+		return fmt.Errorf("codex.max_output_bytes must be greater than 0")
+	}
+	if cfg.TUI.RefreshIntervalMS <= 0 {
+		return fmt.Errorf("tui.refresh_interval_ms must be greater than 0")
+	}
+	if cfg.TUI.LogMaxLines <= 0 {
+		return fmt.Errorf("tui.log_max_lines must be greater than 0")
+	}
+	return nil
 }
 
 func normalizeStageTimeoutKey(key string) string {
 	key = strings.TrimSpace(key)
 	key = strings.ReplaceAll(key, "-", "_")
 	return strings.ToUpper(key)
+}
+
+func validateStageTimeoutKey(key string) (string, error) {
+	normalized := normalizeStageTimeoutKey(key)
+	if normalized == "" {
+		return "", fmt.Errorf("pipeline.stage_timeouts contains an empty key")
+	}
+	stage := normalized
+	if index := strings.Index(stage, "_"); index >= 0 {
+		stage = stage[:index]
+	}
+	if !model.IsStageID(stage) {
+		return "", fmt.Errorf("pipeline.stage_timeouts.%s uses unknown stage %q", key, stage)
+	}
+	return normalized, nil
 }
 
 func expandEnvRefs(value string) (string, error) {

@@ -11,6 +11,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
 type CheckResult struct {
@@ -27,12 +28,12 @@ type Check struct {
 	Details any      `json:"details,omitempty"`
 }
 
-func Run(ctx context.Context, exec executor.Runner, cfg config.Config) CheckResult {
+func Run(ctx context.Context, exec executor.CommandRunner, cfg config.Config) CheckResult {
 	var result CheckResult
 	node := checkBinary(ctx, exec, "node", []string{"--version"}, nodeCandidates(), nil, "Node.js is required by Codex CLI.")
 	result.Checks = append(result.Checks, node)
-	result.Checks = append(result.Checks, checkBinary(ctx, exec, "docker", []string{"--version"}, dockerCandidates(), []string{"B"}, "Docker is required for Stage B runtime evidence."))
-	result.Checks = append(result.Checks, checkBinary(ctx, exec, "bash", []string{"--version"}, bashCandidates(), []string{"C"}, "bash is required to run repo/run_tests.sh on the host."))
+	result.Checks = append(result.Checks, checkBinary(ctx, exec, "docker", []string{"--version"}, dockerCandidates(), []string{string(model.StageB)}, "Docker is required for Stage B runtime evidence."))
+	result.Checks = append(result.Checks, checkBinary(ctx, exec, "bash", []string{"--version"}, bashCandidates(), []string{string(model.StageC)}, "bash is required to run repo/run_tests.sh on the host."))
 	result.Checks = append(result.Checks, checkPython(ctx, exec))
 	codexCheck := checkCodex(ctx, exec, cfg)
 	if node.Status == "missing" {
@@ -60,7 +61,7 @@ func (r CheckResult) BlockingCheck(stage string) (Check, bool) {
 	return Check{}, false
 }
 
-func checkBinary(ctx context.Context, exec executor.Runner, name string, versionArgs []string, candidates []string, stages []string, missing string) Check {
+func checkBinary(ctx context.Context, exec executor.CommandRunner, name string, versionArgs []string, candidates []string, stages []string, missing string) Check {
 	path, err := exec.LookPath(name)
 	if err != nil || path == "" {
 		path = firstExecutable(candidates)
@@ -84,7 +85,7 @@ func checkBinary(ctx context.Context, exec executor.Runner, name string, version
 	return check
 }
 
-func checkPython(ctx context.Context, exec executor.Runner) Check {
+func checkPython(ctx context.Context, exec executor.CommandRunner) Check {
 	for _, name := range []string{"python", "python3", "uv"} {
 		path, err := exec.LookPath(name)
 		if err == nil && path != "" {
@@ -94,26 +95,26 @@ func checkPython(ctx context.Context, exec executor.Runner) Check {
 			}
 			out := exec.Run(ctx, 5*time.Second, "", nil, path, args...)
 			version := strings.TrimSpace(firstNonEmpty(out.Stdout, out.Stderr))
-			return Check{Name: "python", Status: "ok", Path: path, Version: firstLine(version), Stages: []string{"A"}}
+			return Check{Name: "python", Status: "ok", Path: path, Version: firstLine(version), Stages: []string{string(model.StageA)}}
 		}
 	}
 	path := firstExecutable(pythonCandidates())
 	if path != "" {
-		return Check{Name: "python", Status: "ok", Path: path, Stages: []string{"A"}}
+		return Check{Name: "python", Status: "ok", Path: path, Stages: []string{string(model.StageA)}}
 	}
-	return Check{Name: "python", Status: "missing", Message: "python/python3 or uv is required for Stage A scripts.", Stages: []string{"A"}}
+	return Check{Name: "python", Status: "missing", Message: "python/python3 or uv is required for Stage A scripts.", Stages: []string{string(model.StageA)}}
 }
 
-func checkCodex(ctx context.Context, exec executor.Runner, cfg config.Config) Check {
+func checkCodex(ctx context.Context, exec executor.CommandRunner, cfg config.Config) Check {
 	path, err := exec.LookPath("codex")
 	if err != nil || path == "" {
 		path = firstExecutable(codexCandidates())
 	}
 	if path == "" {
-		return Check{Name: "codex", Status: "missing", Message: "Codex CLI is required for static review stages. Searched PATH and known install locations.", Stages: []string{"D", "E", "F"}}
+		return Check{Name: "codex", Status: "missing", Message: "Codex CLI is required for static review stages. Searched PATH and known install locations.", Stages: staticReviewStages()}
 	}
 	capability := codex.DetectCLI(ctx, exec, path)
-	check := Check{Name: "codex", Status: "ok", Path: capability.Path, Version: capability.Version, Stages: []string{"D", "E", "F"}, Details: capability}
+	check := Check{Name: "codex", Status: "ok", Path: capability.Path, Version: capability.Version, Stages: staticReviewStages(), Details: capability}
 	if err := validateExtraArgs(cfg.Codex.ExtraArgs); err != "" {
 		check.Status = "missing"
 		check.Message = err
@@ -135,6 +136,16 @@ func checkCodex(ctx context.Context, exec executor.Runner, cfg config.Config) Ch
 		check.Message = strings.Join(messages, "; ")
 	}
 	return check
+}
+
+func staticReviewStages() []string {
+	var stages []string
+	for _, spec := range model.AllStageSpecs() {
+		if spec.Static && spec.ID != model.StageA {
+			stages = append(stages, string(spec.ID))
+		}
+	}
+	return stages
 }
 
 func validateExtraArgs(args []string) string {

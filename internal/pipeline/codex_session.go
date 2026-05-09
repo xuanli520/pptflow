@@ -24,8 +24,9 @@ type CodexReviewRequest struct {
 }
 
 type CodexReviewResult struct {
-	Result         executor.Result
-	GuidanceEvents []CodexGuidanceEvent
+	Result           executor.Result
+	GuidanceEvents   []CodexGuidanceEvent
+	ArtifactWarnings []ArtifactWarning
 }
 
 type CodexGuidanceEvent struct {
@@ -86,7 +87,7 @@ func (r Runner) runCodexReviewWithLog(ctx context.Context, timeout time.Duration
 			Err:     err,
 		}
 	}
-	appendCodexGuidanceEvents(logPath, result.GuidanceEvents)
+	recordArtifactWarningInResult(&result, appendCodexGuidanceEvents(logPath, result.GuidanceEvents))
 	return result
 }
 
@@ -215,9 +216,9 @@ Final response format is still mandatory. Return only the complete Markdown revi
 Replace findings with confirmed findings when present; use findings: [] only when none are confirmed. Do not return a prose-only summary. Do not put any text after the JSON end marker.`, strings.TrimSpace(message), staticReviewJSONStart, staticReviewSchemaVersion, stage, staticReviewJSONEnd)
 }
 
-func appendCodexGuidanceEvents(logPath string, events []CodexGuidanceEvent) {
+func appendCodexGuidanceEvents(logPath string, events []CodexGuidanceEvent) ArtifactWarning {
 	if len(events) == 0 {
-		return
+		return ArtifactWarning{}
 	}
 	var builder strings.Builder
 	builder.WriteString("\n=== codex guidance events ===\n")
@@ -233,7 +234,17 @@ func appendCodexGuidanceEvents(logPath string, events []CodexGuidanceEvent) {
 		}
 		builder.WriteString("\n")
 	}
-	_ = appendText(logPath, builder.String())
+	if err := appendText(logPath, builder.String()); err != nil {
+		return newArtifactWarning(logPath, "append_text", false, err)
+	}
+	return ArtifactWarning{}
+}
+
+func recordArtifactWarningInResult(result *CodexReviewResult, warning ArtifactWarning) {
+	if result == nil || warning.OK() {
+		return
+	}
+	result.ArtifactWarnings = append(result.ArtifactWarnings, warning)
 }
 
 func sha256Text(value string) string {

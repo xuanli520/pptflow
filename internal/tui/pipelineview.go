@@ -113,6 +113,8 @@ func jobStateIcon(state scheduler.JobState) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#4488FF")).Render("▶")
 	case scheduler.JobDone:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#00CC66")).Render("✓")
+	case scheduler.JobCancelled:
+		return mutedStyle.Render("×")
 	case scheduler.JobFailed:
 		return errorStyle.Render("✗")
 	default:

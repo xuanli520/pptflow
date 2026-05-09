@@ -12,6 +12,8 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scanner"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
 
@@ -23,9 +25,10 @@ const (
 )
 
 type app struct {
-	store     *db.Store
-	cfg       config.Config
-	scheduler *scheduler.Scheduler
+	store              appStore
+	cfg                config.Config
+	scheduler          schedulerClient
+	recoverStaleRunsFn func(context.Context) error
 
 	overview OverviewModel
 	detail   viewport.Model
@@ -90,6 +93,31 @@ type recoveryMsg struct {
 
 type tickMsg time.Time
 
+type overviewStore interface {
+	ListProjectsPaginated(context.Context, db.ProjectQuery) ([]db.ProjectSummary, int, error)
+}
+
+type executionStore interface {
+	GetProject(context.Context, string) (scanner.Project, error)
+	LatestRunForTask(context.Context, string) (model.RunRecord, error)
+	Stages(context.Context, string) ([]model.StageRecord, error)
+	Findings(context.Context, string) ([]model.Finding, error)
+	ListRunsForTask(context.Context, string) ([]model.RunRecord, error)
+}
+
+type appStore interface {
+	overviewStore
+	executionStore
+}
+
+type schedulerClient interface {
+	Submit(string, pipeline.RunOptions) (string, error)
+	CancelTask(string) error
+	Snapshot() []scheduler.JobSnapshot
+	NotifyCh() <-chan struct{}
+	Shutdown(context.Context) error
+}
+
 func Start(store *db.Store, cfg config.Config) error {
 	m := newApp(store, cfg)
 	defer func() {
@@ -118,49 +146,91 @@ func newApp(store *db.Store, cfg config.Config) app {
 		lastRecoveryAt: time.Now(),
 	}
 	if store != nil {
+		m.store = store
 		m.scheduler = scheduler.New(store, cfg)
+		m.recoverStaleRunsFn = func(ctx context.Context) error {
+			return pipeline.RecoverStaleRuns(ctx, store, cfg)
+		}
 	}
 	m.setFocus(focusSearch)
 	return m
 }
 
 func (m app) Init() tea.Cmd {
-	return tea.Batch(m.recoverStaleRuns(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), m.tick())
+	return tea.Batch(m.recoverStaleRunsCmd(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
+	if handled := m.handleWindowMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+	if handled := m.handleOverviewMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+	if handled := m.handleDetailMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+	if handled := m.handleSchedulerMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+	if handled := m.handleRecoveryMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+
+	switch value := msg.(type) {
+	case tea.KeyMsg:
+		next, keyCmds := m.handleKey(value)
+		m = next
+		cmds = append(cmds, keyCmds...)
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+func (m *app) handleWindowMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 	switch value := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = value.Width
 		m.height = value.Height
 		m.overview.page.autoSize = true
 		if cmd := m.applyLayout(); cmd != nil {
-			cmds = append(cmds, cmd)
+			*cmds = append(*cmds, cmd)
 		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *app) handleOverviewMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
+	switch value := msg.(type) {
 	case overviewRefreshMsg:
 		var cmd tea.Cmd
 		m.overview, cmd = m.overview.Update(value)
-		cmds = append(cmds, cmd)
+		*cmds = append(*cmds, cmd)
+		return true
 	case overviewSearchDebounceMsg:
 		var cmd tea.Cmd
 		m.overview, cmd = m.overview.Update(value)
-		cmds = append(cmds, cmd)
+		*cmds = append(*cmds, cmd)
+		return true
 	case overviewLoadRequestMsg:
-		cmds = append(cmds, m.handleOverviewLoad(value))
+		*cmds = append(*cmds, m.handleOverviewLoad(value))
+		return true
 	case overviewLoadResultMsg:
 		if value.seq != m.overview.seq {
-			break
+			return true
 		}
 		beforeID := m.selectedTaskID()
 		beforeKey := m.selectedOverviewDetailKey()
 		var cmd tea.Cmd
 		m.overview, cmd = m.overview.Update(value)
-		cmds = append(cmds, cmd)
+		*cmds = append(*cmds, cmd)
 		if value.err != nil {
 			m.message = value.err.Error()
-			break
+			return true
 		}
 		afterID := m.selectedTaskID()
 		afterKey := m.selectedOverviewDetailKey()
@@ -168,30 +238,47 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detailVM = executionViewModel{}
 			m.detailContent = ""
 			m.detail.SetContent("")
-			break
+			return true
 		}
 		if afterID != beforeID || afterKey != beforeKey || value.refreshDetail {
-			cmds = append(cmds, m.reloadDetail())
+			*cmds = append(*cmds, m.reloadDetail())
 		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *app) handleDetailMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
+	switch value := msg.(type) {
 	case detailMsg:
 		if value.taskID != m.selectedTaskID() {
-			break
+			return true
 		}
 		if value.err != nil {
 			m.message = value.err.Error()
-			break
+			return true
 		}
 		m.detailVM = value.vm
 		m.syncStageSelection()
 		m.syncRefSelection()
 		m.updateDetailContent(false)
+		return true
 	case runMsg:
 		if value.err != nil {
 			m.message = value.err.Error()
 		} else {
 			m.message = fmt.Sprintf("流水线完成 %s（%s）", value.result.Run.RunID, localizeRunStatus(value.result.Run.Status))
 		}
-		cmds = append(cmds, m.reload())
+		*cmds = append(*cmds, m.reload())
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *app) handleSchedulerMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
+	switch value := msg.(type) {
 	case runSubmitMsg:
 		if value.err != nil {
 			m.message = value.err.Error()
@@ -200,7 +287,8 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingJob = value.jobID
 			m.runConfig = runConfig{}
 		}
-		cmds = append(cmds, m.reloadSchedulerJobs())
+		*cmds = append(*cmds, m.reloadSchedulerJobs())
+		return true
 	case taskCancelRequestMsg:
 		if value.err != nil {
 			m.message = fmt.Sprintf("终止失败 %s: %s", value.taskID, value.err)
@@ -211,33 +299,41 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.message = "已发送终止请求 " + value.taskID
 		}
-		cmds = append(cmds, m.reloadSchedulerJobs(), m.reload())
+		*cmds = append(*cmds, m.reloadSchedulerJobs(), m.reload())
+		return true
 	case schedulerJobsMsg:
 		m.activeJobs = value.jobs
 		m.updatePendingCancelMessage(value.jobs)
 		m.updatePendingJobMessage(value.jobs)
 		if cmd := m.applyLayout(); cmd != nil {
-			cmds = append(cmds, cmd)
+			*cmds = append(*cmds, cmd)
 		}
+		return true
 	case schedulerNotifyMsg:
-		cmds = append(cmds, m.reloadSchedulerJobs(), m.reload(), m.waitSchedulerNotify())
+		*cmds = append(*cmds, m.reloadSchedulerJobs(), m.reload(), m.waitSchedulerNotify())
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *app) handleRecoveryMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
+	switch value := msg.(type) {
 	case recoveryMsg:
 		if value.err != nil {
 			m.message = value.err.Error()
 		}
+		return true
 	case tickMsg:
 		if time.Since(m.lastRecoveryAt) >= staleRunRecoveryInterval {
 			m.lastRecoveryAt = time.Time(value)
-			cmds = append(cmds, m.recoverStaleRuns())
+			*cmds = append(*cmds, m.recoverStaleRunsCmd())
 		}
-		cmds = append(cmds, m.reload(), m.reloadSchedulerJobs(), m.tick())
-	case tea.KeyMsg:
-		next, keyCmds := m.handleKey(value)
-		m = next
-		cmds = append(cmds, keyCmds...)
+		*cmds = append(*cmds, m.reload(), m.reloadSchedulerJobs(), m.tick())
+		return true
+	default:
+		return false
 	}
-
-	return m, tea.Batch(cmds...)
 }
 
 func (m *app) updatePendingJobMessage(jobs []scheduler.JobSnapshot) {
@@ -256,6 +352,9 @@ func (m *app) updatePendingJobMessage(jobs []scheduler.JobSnapshot) {
 		if m.message == fmt.Sprintf("已提交 job %s", job.JobID) {
 			m.message = fmt.Sprintf("job %s 已开始运行", job.JobID)
 		}
+	case scheduler.JobCancelled:
+		m.message = fmt.Sprintf("job %s 已终止", job.JobID)
+		m.pendingJob = ""
 	case scheduler.JobFailed:
 		reason := strings.TrimSpace(job.Err)
 		if reason == "" {
@@ -288,6 +387,9 @@ func (m *app) updatePendingCancelMessage(jobs []scheduler.JobSnapshot) {
 		if job.CancelRequested {
 			m.message = "正在终止 " + job.TaskID + " 的运行"
 		}
+	case scheduler.JobCancelled:
+		m.message = "已终止 " + job.TaskID + " 的运行"
+		m.pendingCancelJobID = ""
 	case scheduler.JobFailed:
 		if job.CancelRequested {
 			m.message = "已终止 " + job.TaskID + " 的运行"
@@ -380,12 +482,12 @@ func (m app) handleOverviewLoad(req overviewLoadRequestMsg) tea.Cmd {
 	}
 }
 
-func (m app) recoverStaleRuns() tea.Cmd {
-	if m.store == nil {
+func (m app) recoverStaleRunsCmd() tea.Cmd {
+	if m.recoverStaleRunsFn == nil {
 		return nil
 	}
 	return func() tea.Msg {
-		return recoveryMsg{err: pipeline.RecoverStaleRuns(context.Background(), m.store, m.cfg)}
+		return recoveryMsg{err: m.recoverStaleRunsFn(context.Background())}
 	}
 }
 
@@ -420,7 +522,7 @@ func (m app) submitRun(taskID string, opts pipeline.RunOptions) tea.Cmd {
 	}
 }
 
-func cancelTaskCmd(s *scheduler.Scheduler, taskID, jobID string) tea.Cmd {
+func cancelTaskCmd(s schedulerClient, taskID, jobID string) tea.Cmd {
 	return func() tea.Msg {
 		if s == nil {
 			return taskCancelRequestMsg{taskID: taskID, jobID: jobID, err: fmt.Errorf("scheduler unavailable")}

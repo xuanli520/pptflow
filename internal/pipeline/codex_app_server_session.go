@@ -37,6 +37,7 @@ type appServerCodexReviewSession struct {
 	stderr    bytes.Buffer
 	completed bool
 	envKeys   []string
+	warnings  []ArtifactWarning
 }
 
 type appServerRPCMessage struct {
@@ -127,7 +128,9 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 		"\nTimeout: " + request.Timeout.String() +
 		"\nStarted: " + time.Now().UTC().Format(time.RFC3339) +
 		"\n\n=== codex app-server JSON-RPC stream start ===\n"
-	_ = writeText(request.LogPath, preamble)
+	if err := writeText(request.LogPath, preamble); err != nil {
+		s.addArtifactWarning(newArtifactWarning(request.LogPath, "write_text", false, err))
+	}
 	if err := cmd.Start(); err != nil {
 		s.complete(executor.Result{Command: commandString(request.Capability.Path, args), Err: err, Stderr: err.Error()}, err)
 		return err
@@ -638,6 +641,7 @@ func (s *appServerCodexReviewSession) complete(result executor.Result, err error
 	}
 	s.completed = true
 	s.result.Result = result
+	s.result.ArtifactWarnings = append(s.result.ArtifactWarnings, s.warnings...)
 	s.err = err
 	cancel := s.cancel
 	s.responses = map[int]chan appServerRPCMessage{}
@@ -677,7 +681,18 @@ func (s *appServerCodexReviewSession) appendLog(content string) {
 	if strings.TrimSpace(path) == "" {
 		return
 	}
-	_ = appendText(path, content)
+	if err := appendText(path, content); err != nil {
+		s.addArtifactWarning(newArtifactWarning(path, "append_text", false, err))
+	}
+}
+
+func (s *appServerCodexReviewSession) addArtifactWarning(warning ArtifactWarning) {
+	if warning.OK() {
+		return
+	}
+	s.mu.Lock()
+	s.warnings = append(s.warnings, warning)
+	s.mu.Unlock()
 }
 
 func commandString(name string, args []string) string {

@@ -7,14 +7,14 @@ import (
 	"strings"
 	"testing"
 	"time"
-	_ "unsafe"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 )
 
-//go:linkname newAppServerCodexReviewSession github.com/xuanli520/p2r_tui/internal/pipeline.newAppServerCodexReviewSession
-func newAppServerCodexReviewSession(envKeys []string) pipelinepkg.CodexReviewSession
+func newAppServerCodexReviewSession(envKeys []string) pipelinepkg.CodexReviewSession {
+	return pipelinepkg.NewAppServerCodexReviewSessionForTest(envKeys)
+}
 
 func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 	dir := t.TempDir()

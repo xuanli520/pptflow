@@ -14,6 +14,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/xuanli520/p2r_tui/internal/pathutil"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
@@ -258,7 +259,7 @@ func (s *Store) ListProjectsPaginated(ctx context.Context, q ProjectQuery) ([]Pr
 
 func (s *Store) listProjectSummaries(ctx context.Context, q ProjectQuery, paginated bool) ([]ProjectSummary, int, error) {
 	q = normalizeProjectQuery(q, paginated)
-	where, searchArgs := projectSearchPredicate(q.Search)
+	where := projectSearchPredicate(q.Search)
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -274,7 +275,7 @@ func (s *Store) listProjectSummaries(ctx context.Context, q ProjectQuery, pagina
 	total := 0
 	if paginated {
 		countSQL := baseProjectRowsSQL(where) + `SELECT COUNT(*) FROM project_rows`
-		if err := tx.QueryRowContext(ctx, countSQL, searchArgs...).Scan(&total); err != nil {
+		if err := tx.QueryRowContext(ctx, countSQL, where.Args...).Scan(&total); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -294,7 +295,7 @@ func (s *Store) listProjectSummaries(ctx context.Context, q ProjectQuery, pagina
        latest_static_only
 FROM project_rows
 ` + projectOrderClause(q)
-	args := append([]any{}, searchArgs...)
+	args := append([]any{}, where.Args...)
 	if paginated {
 		selectSQL += `
 LIMIT ? OFFSET ?`
@@ -347,7 +348,23 @@ LIMIT ? OFFSET ?`
 	return projects, total, nil
 }
 
-func baseProjectRowsSQL(where string) string {
+type projectWhere struct {
+	SQL  string
+	Args []any
+}
+
+func allProjectRowsWhere() projectWhere {
+	return projectWhere{SQL: "1=1"}
+}
+
+func (w projectWhere) sqlOrDefault() string {
+	if strings.TrimSpace(w.SQL) == "" {
+		return "1=1"
+	}
+	return w.SQL
+}
+
+func baseProjectRowsSQL(where projectWhere) string {
 	return fmt.Sprintf(`WITH latest_run AS (
     SELECT *
     FROM (
@@ -367,10 +384,7 @@ failed_stage AS (
                s.stage,
                ROW_NUMBER() OVER (
                    PARTITION BY s.run_id
-                   ORDER BY CASE s.stage
-                       WHEN 'A' THEN 1 WHEN 'B' THEN 2 WHEN 'C' THEN 3
-                       WHEN 'D' THEN 4 WHEN 'E' THEN 5 WHEN 'F' THEN 6
-                       ELSE 99 END, s.stage
+                   ORDER BY %s, s.stage
                ) AS rn
         FROM run_stages s
         WHERE s.status IN ('failed', 'blocked')
@@ -419,7 +433,7 @@ project_rows AS (
     LEFT JOIN finding_counts fc ON fc.run_id = lr.run_id
     WHERE %s
 )
-`, where)
+`, stageOrderCaseSQL("s.stage"), where.sqlOrDefault())
 }
 
 func normalizeProjectQuery(q ProjectQuery, paginated bool) ProjectQuery {
@@ -524,30 +538,45 @@ func validManualVerdicts() map[string]bool {
 }
 
 func validFailedStages() map[string]bool {
-	return map[string]bool{"A": true, "B": true, "C": true, "D": true, "E": true, "F": true}
+	result := map[string]bool{}
+	for _, stage := range model.AllStages() {
+		result[stage] = true
+	}
+	return result
 }
 
-func projectSearchPredicate(search ProjectSearch) (string, []any) {
+func stageOrderCaseSQL(column string) string {
+	var builder strings.Builder
+	builder.WriteString("CASE ")
+	builder.WriteString(column)
+	for _, spec := range model.AllStageSpecs() {
+		builder.WriteString(fmt.Sprintf(" WHEN '%s' THEN %d", spec.ID, spec.Order))
+	}
+	builder.WriteString(" ELSE 99 END")
+	return builder.String()
+}
+
+func projectSearchPredicate(search ProjectSearch) projectWhere {
 	if len(search.Terms) == 0 {
-		return "1=1", nil
+		return allProjectRowsWhere()
 	}
 	var termPredicates []string
 	var args []any
 	for _, term := range search.Terms {
-		predicate, predicateArgs := projectSearchTermPredicate(term)
-		if predicate == "" {
+		predicate := projectSearchTermPredicate(term)
+		if predicate.SQL == "" {
 			continue
 		}
-		termPredicates = append(termPredicates, predicate)
-		args = append(args, predicateArgs...)
+		termPredicates = append(termPredicates, predicate.SQL)
+		args = append(args, predicate.Args...)
 	}
 	if len(termPredicates) == 0 {
-		return "1=1", nil
+		return allProjectRowsWhere()
 	}
-	return strings.Join(termPredicates, " AND "), args
+	return projectWhere{SQL: strings.Join(termPredicates, " AND "), Args: args}
 }
 
-func projectSearchTermPredicate(term ProjectSearchTerm) (string, []any) {
+func projectSearchTermPredicate(term ProjectSearchTerm) projectWhere {
 	var clauses []string
 	var args []any
 	if term.Text != "" {
@@ -583,9 +612,9 @@ func projectSearchTermPredicate(term ProjectSearchTerm) (string, []any) {
 		}
 	}
 	if len(clauses) == 0 {
-		return "", nil
+		return projectWhere{}
 	}
-	return "(" + strings.Join(clauses, " OR ") + ")", args
+	return projectWhere{SQL: "(" + strings.Join(clauses, " OR ") + ")", Args: args}
 }
 
 func likePattern(value string) string {
@@ -754,7 +783,8 @@ func (s *Store) InsertFindings(ctx context.Context, runID string, findings []mod
 }
 
 func (s *Store) Stages(ctx context.Context, runID string) ([]model.StageRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT stage, COALESCE(name,''), status, COALESCE(started_at,''), COALESCE(finished_at,''), duration_ms, COALESCE(blocked_by,'[]'), COALESCE(log_path,''), COALESCE(artifact_json,'[]'), COALESCE(error_summary,'') FROM run_stages WHERE run_id = ? ORDER BY CASE stage WHEN 'A' THEN 1 WHEN 'B' THEN 2 WHEN 'C' THEN 3 WHEN 'D' THEN 4 WHEN 'E' THEN 5 WHEN 'F' THEN 6 ELSE 99 END, stage`, runID)
+	query := fmt.Sprintf(`SELECT stage, COALESCE(name,''), status, COALESCE(started_at,''), COALESCE(finished_at,''), duration_ms, COALESCE(blocked_by,'[]'), COALESCE(log_path,''), COALESCE(artifact_json,'[]'), COALESCE(error_summary,'') FROM run_stages WHERE run_id = ? ORDER BY %s, stage`, stageOrderCaseSQL("stage"))
+	rows, err := s.db.QueryContext(ctx, query, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -795,7 +825,8 @@ func (s *Store) Findings(ctx context.Context, runID string) ([]model.Finding, er
 }
 
 func firstFailedStage(ctx context.Context, s *Store, runID string) string {
-	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(stage, '') FROM run_stages WHERE run_id = ? AND status IN ('failed', 'blocked') ORDER BY stage LIMIT 1`, runID)
+	query := fmt.Sprintf(`SELECT COALESCE(stage, '') FROM run_stages WHERE run_id = ? AND status IN ('failed', 'blocked') ORDER BY %s, stage LIMIT 1`, stageOrderCaseSQL("stage"))
+	row := s.db.QueryRowContext(ctx, query, runID)
 	var stage string
 	if err := row.Scan(&stage); err != nil {
 		return ""
@@ -838,7 +869,7 @@ func FormatNotFound(kind, id string) error {
 }
 
 func artifactProjectPath(scanRoot, projectPath string) bool {
-	rel, ok := relUnderRoot(scanRoot, projectPath)
+	rel, ok := pathutil.RelUnderRoot(scanRoot, projectPath)
 	if !ok || rel == "." {
 		return false
 	}
@@ -861,31 +892,10 @@ func artifactProjectPath(scanRoot, projectPath string) bool {
 	return false
 }
 
-func relUnderRoot(root, path string) (string, bool) {
-	root = absClean(root)
-	path = absClean(path)
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return "", false
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	return filepath.Clean(rel), true
-}
-
 func splitPathParts(path string) []string {
 	path = filepath.Clean(path)
 	if path == "." {
 		return nil
 	}
 	return strings.Split(path, string(filepath.Separator))
-}
-
-func absClean(path string) string {
-	cleaned := filepath.Clean(path)
-	if abs, err := filepath.Abs(cleaned); err == nil {
-		return abs
-	}
-	return cleaned
 }

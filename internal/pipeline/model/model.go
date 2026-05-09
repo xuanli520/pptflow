@@ -35,17 +35,18 @@ type RunRecord struct {
 }
 
 type StageRecord struct {
-	Stage         string    `json:"stage"`
-	Name          string    `json:"name"`
-	Status        string    `json:"status"`
-	BlockedBy     []string  `json:"blocked_by,omitempty"`
-	StartedAt     string    `json:"started_at,omitempty"`
-	FinishedAt    string    `json:"finished_at,omitempty"`
-	DurationMS    int64     `json:"duration_ms"`
-	LogPath       string    `json:"log_path,omitempty"`
-	ArtifactPaths []string  `json:"artifact_paths"`
-	ErrorSummary  string    `json:"error_summary,omitempty"`
-	Findings      []Finding `json:"findings,omitempty"`
+	Stage            string            `json:"stage"`
+	Name             string            `json:"name"`
+	Status           string            `json:"status"`
+	BlockedBy        []string          `json:"blocked_by,omitempty"`
+	StartedAt        string            `json:"started_at,omitempty"`
+	FinishedAt       string            `json:"finished_at,omitempty"`
+	DurationMS       int64             `json:"duration_ms"`
+	LogPath          string            `json:"log_path,omitempty"`
+	ArtifactPaths    []string          `json:"artifact_paths"`
+	ErrorSummary     string            `json:"error_summary,omitempty"`
+	Findings         []Finding         `json:"findings,omitempty"`
+	ArtifactWarnings []ArtifactWarning `json:"artifact_warnings,omitempty"`
 }
 
 type Finding struct {
@@ -64,4 +65,16 @@ type Finding struct {
 type StageStatusFile struct {
 	RunID  string        `json:"run_id"`
 	Stages []StageRecord `json:"stages"`
+}
+
+type ArtifactWarning struct {
+	Path       string `json:"path"`
+	Op         string `json:"op"`
+	Error      string `json:"error"`
+	Required   bool   `json:"required,omitempty"`
+	RecordedAt string `json:"recorded_at,omitempty"`
+}
+
+func (w ArtifactWarning) OK() bool {
+	return w.Error == ""
 }

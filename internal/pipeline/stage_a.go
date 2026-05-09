@@ -20,6 +20,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	record := startStage("A")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "A_validate.log")
 	record.LogPath = logPath
+	writer := NewArtifactWriter(run.ArtifactRoot)
 
 	scriptRoot := project.Path
 	snapshotPath := filepath.Join(run.ArtifactRoot, "script_input_snapshot")
@@ -58,7 +59,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	testsInspectionPath := filepath.Join(run.ArtifactRoot, "tests_inspection.json")
 	englishOnlyPath := filepath.Join(run.ArtifactRoot, "english_only.json")
 
-	scriptResults := r.runStageAScripts(ctx, project, scriptRoot, logPath, map[string]string{
+	scriptResults := r.runStageAScripts(ctx, project, scriptRoot, logPath, writer, &record, map[string]string{
 		"acceptance":       acceptancePath,
 		"acceptance_md":    acceptanceReportPath,
 		"validation_md":    validationReportPath,
@@ -71,7 +72,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	})
 
 	if !fileExists(acceptancePath) {
-		_ = writeJSON(acceptancePath, scriptResults["run_acceptance.py"])
+		record = requiredStageJSON(record, writer, writer.RelativePath(acceptancePath), scriptResults["run_acceptance.py"])
 	}
 	if result, ok := scriptResults["run_acceptance.py"]; ok && !result.OK {
 		findings = append(findings, model.Finding{
@@ -99,7 +100,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	}
 	findings = append(findings, acceptanceFindings(acceptancePath)...)
 	if !fileExists(validationReportPath) {
-		_ = writeText(validationReportPath, validationMarkdown(project, required, findings))
+		record = requiredStageText(record, writer, writer.RelativePath(validationReportPath), validationMarkdown(project, required, findings))
 	}
 
 	artifactPaths := []string{acceptancePath, acceptanceReportPath, validationReportPath, requiredPath, readmeAlignmentPath, localDependencyPath}
@@ -109,13 +110,15 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 		}
 	}
 	record.ArtifactPaths = artifactPaths
-	record.Findings = findings
-	_ = appendText(logPath, "\n\n"+validationMarkdown(project, required, findings))
+	record.Findings = append(record.Findings, findings...)
+	bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), "\n\n"+validationMarkdown(project, required, findings))
 
 	status := model.StageDone
 	if hasHardStageAFailure(record.Findings, scriptResults["run_acceptance.py"]) {
 		status = model.StageFailed
-		record.ErrorSummary = fmt.Sprintf("%d acceptance finding(s)", len(record.Findings))
+		if record.ErrorSummary == "" {
+			record.ErrorSummary = fmt.Sprintf("%d acceptance finding(s)", len(record.Findings))
+		}
 	}
 	return finishStage(record, status, start)
 }
@@ -177,7 +180,7 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func (r Runner) runStageAScripts(ctx context.Context, project scanner.Project, scriptRoot, logPath string, outputs map[string]string) map[string]scriptExecution {
+func (r Runner) runStageAScripts(ctx context.Context, project scanner.Project, scriptRoot, logPath string, writer ArtifactWriter, record *model.StageRecord, outputs map[string]string) map[string]scriptExecution {
 	results := map[string]scriptExecution{}
 	projectTypeArgs := projectTypeArgs(scriptRoot)
 	run := func(script string, args []string) scriptExecution {
@@ -213,10 +216,10 @@ func (r Runner) runStageAScripts(ctx context.Context, project scanner.Project, s
 	for _, check := range checks {
 		result := run(check.script, check.args)
 		results[check.script] = result
-		_ = writeJSON(check.output, result)
+		*record = requiredStageJSON(*record, writer, writer.RelativePath(check.output), result)
 		log.WriteString(result.logBlock())
 	}
-	_ = writeText(logPath, log.String())
+	bestEffortStageText(record, writer, writer.RelativePath(logPath), log.String())
 	return results
 }
 

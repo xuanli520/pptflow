@@ -6,6 +6,8 @@ import (
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
 var (
@@ -314,7 +316,7 @@ func renderRunConfig(m app) string {
 	lines = append(lines, "")
 	stageHeaderIndex := len(lines)
 	lines = append(lines, focusLine(c.focus == runConfigFocusStages, "阶段:"))
-	for i, stage := range []string{"A", "B", "C", "D", "E", "F"} {
+	for i, stage := range model.AllStages() {
 		checked := runConfigStageChecked(c, stage, plan)
 		mark := "[ ]"
 		if checked {

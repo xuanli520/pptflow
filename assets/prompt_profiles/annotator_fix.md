@@ -52,4 +52,5 @@ Recheck mode (applied globally):
 
 Keep the two reports concise, evidence‑based, and immediately useful for a human **PASS / REWORK / FAIL** decision regarding the repair state only.  
 Return the two markdown reports as the final Codex response. Do not write files; p2r persists the response to the required artifact paths.  
-Begin the final response immediately with the repair summary and then the two reports in sequence. Do not include any preamble, progress updates, or narration.
+Begin the final response immediately with the repair summary and then the two reports in sequence. Do not include progress updates, preamble text, or narration.
+If p2r supplies a machine-readable JSON contract block, place that block only at the very end, ending at the JSON end marker with no text after it.

@@ -3,25 +3,21 @@ package preflight_test
 import (
 	"strings"
 	"testing"
-	_ "unsafe"
 
-	_ "github.com/xuanli520/p2r_tui/internal/preflight"
+	"github.com/xuanli520/p2r_tui/internal/codex"
 )
 
-//go:linkname validateExtraArgs github.com/xuanli520/p2r_tui/internal/preflight.validateExtraArgs
-func validateExtraArgs(args []string) string
-
 func TestValidateExtraArgsRejectsBoundaryFlags(t *testing.T) {
-	if err := validateExtraArgs([]string{"--model", "gpt-5.4"}); err != "" {
+	if _, err := codex.ValidateAppServerExtraArgs([]string{"--model", "gpt-5.4"}); err != nil {
 		t.Fatalf("safe args rejected: %s", err)
 	}
 	for _, flag := range []string{"--full-auto", "--search", "--dangerously-bypass-approvals-and-sandbox"} {
-		err := validateExtraArgs([]string{flag})
-		if !strings.Contains(err, flag) {
-			t.Fatalf("expected %s to be rejected, got %q", flag, err)
+		_, err := codex.ValidateAppServerExtraArgs([]string{flag})
+		if err == nil || !strings.Contains(err.Error(), flag) {
+			t.Fatalf("expected %s to be rejected, got %v", flag, err)
 		}
 	}
-	if err := validateExtraArgs([]string{"--search=true"}); !strings.Contains(err, "--search") {
-		t.Fatalf("expected --search=... to be rejected, got %q", err)
+	if _, err := codex.ValidateAppServerExtraArgs([]string{"--search=true"}); err == nil || !strings.Contains(err.Error(), "--search") {
+		t.Fatalf("expected --search=... to be rejected, got %v", err)
 	}
 }

@@ -2,46 +2,19 @@ package pipeline_test
 
 import (
 	"testing"
-	_ "unsafe"
+
+	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 )
 
-type testRuntimeEvidence struct {
-	ComposeProject string                   `json:"compose_project"`
-	ComposeFile    string                   `json:"compose_file"`
-	WorkDir        string                   `json:"work_dir"`
-	Services       []string                 `json:"services"`
-	Mappings       map[string][]portMapping `json:"mappings"`
-	Probes         []testProbeResult        `json:"probes"`
-}
+type testRuntimeEvidence = pipelinepkg.TestRuntimeEvidence
+type testProbeResult = pipelinepkg.TestProbeResult
+type testStageCCommandEnv = pipelinepkg.TestStageCCommandEnv
+type testServiceURLEnv = pipelinepkg.TestServiceURLEnv
+type testServiceURL = pipelinepkg.TestServiceURL
 
-type testProbeResult struct {
-	Service string `json:"service"`
-	URL     string `json:"url"`
-	OK      bool   `json:"ok"`
-	Status  int    `json:"status,omitempty"`
-	Error   string `json:"error,omitempty"`
+func stageCEnvironment(evidence testRuntimeEvidence) testStageCCommandEnv {
+	return pipelinepkg.StageCEnvironmentForTest(evidence)
 }
-
-type testStageCCommandEnv struct {
-	Env     []string
-	Keys    []string
-	Values  map[string]string
-	Service testServiceURLEnv
-}
-
-type testServiceURLEnv struct {
-	Env     []string
-	Keys    []string
-	Mapping map[string]testServiceURL
-}
-
-type testServiceURL struct {
-	EnvKey string `json:"env_key"`
-	URL    string `json:"url"`
-}
-
-//go:linkname stageCEnvironment github.com/xuanli520/p2r_tui/internal/pipeline.stageCEnvironment
-func stageCEnvironment(evidence testRuntimeEvidence) testStageCCommandEnv
 
 func TestStageCEnvironmentPassesComposeProjectAndFile(t *testing.T) {
 	evidence := testRuntimeEvidence{

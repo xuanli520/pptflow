@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -26,7 +25,7 @@ func newStatusCommand() *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			ctx := context.Background()
+			ctx := cmd.Context()
 			run, err := store.LatestRunForTask(ctx, args[0])
 			if runID != "" {
 				run, err = store.GetRun(ctx, runID)

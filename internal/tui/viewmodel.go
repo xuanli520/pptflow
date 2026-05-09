@@ -141,7 +141,7 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 	return row
 }
 
-func buildExecutionViewModel(ctx context.Context, store *db.Store, cfg config.Config, taskID string) (executionViewModel, error) {
+func buildExecutionViewModel(ctx context.Context, store executionStore, cfg config.Config, taskID string) (executionViewModel, error) {
 	project, err := store.GetProject(ctx, taskID)
 	if err != nil {
 		return executionViewModel{}, err
@@ -219,7 +219,7 @@ func normalizeStageViews(stages []model.StageRecord) []stageView {
 		byStage[stage.Stage] = stage
 	}
 	result := make([]stageView, 0, 6)
-	for _, letter := range []string{"A", "B", "C", "D", "E", "F"} {
+	for _, letter := range model.AllStages() {
 		stage, ok := byStage[letter]
 		if !ok {
 			stage = model.StageRecord{
@@ -767,23 +767,23 @@ func stageLogPreview(path string, maxLines int) string {
 
 func affectedStages(stage string) []string {
 	switch stage {
-	case "A":
-		return []string{"A", "F"}
-	case "B":
-		return []string{"B", "C", "F"}
-	case "C":
-		return []string{"C", "F"}
-	case "D", "E":
-		return []string{stage, "F"}
+	case string(model.StageA):
+		return []string{string(model.StageA), string(model.StageF)}
+	case string(model.StageB):
+		return []string{string(model.StageB), string(model.StageC), string(model.StageF)}
+	case string(model.StageC):
+		return []string{string(model.StageC), string(model.StageF)}
+	case string(model.StageD), string(model.StageE):
+		return []string{stage, string(model.StageF)}
 	default:
 		return []string{stage}
 	}
 }
 
 func stageLetter(index int) string {
-	stages := []string{"A", "B", "C", "D", "E", "F"}
+	stages := model.AllStages()
 	if index < 0 || index >= len(stages) {
-		return "A"
+		return string(model.StageA)
 	}
 	return stages[index]
 }

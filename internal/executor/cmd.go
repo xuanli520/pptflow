@@ -19,6 +19,12 @@ type Result struct {
 	Timeout  bool
 }
 
+type CommandRunner interface {
+	LookPath(name string) (string, error)
+	Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) Result
+	RunStreaming(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, name string, args ...string) Result
+}
+
 type Runner struct{}
 
 func New() Runner {

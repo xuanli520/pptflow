@@ -108,7 +108,7 @@ func TestCancelQueuedJobDoesNotReleaseRunningSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancelled := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
-		return snapshot.JobID == queued.JobID && snapshot.State == scheduler.JobFailed && snapshot.CancelRequested
+		return snapshot.JobID == queued.JobID && snapshot.State == scheduler.JobCancelled && snapshot.CancelRequested
 	})
 	if cancelled.Err != scheduler.ErrJobCancelledByUser.Error() {
 		t.Fatalf("cancelled queued err = %q", cancelled.Err)
@@ -140,7 +140,7 @@ func TestCancelRunningJobMarksUserCancelledAndKeepsPartialRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancelled := waitForSnapshot(t, s, 6*time.Second, func(snapshot scheduler.JobSnapshot) bool {
-		return snapshot.JobID == running.JobID && snapshot.State == scheduler.JobFailed && snapshot.CancelRequested
+		return snapshot.JobID == running.JobID && snapshot.State == scheduler.JobCancelled && snapshot.CancelRequested
 	})
 	if cancelled.Err != scheduler.ErrJobCancelledByUser.Error() {
 		t.Fatalf("cancelled running err = %q", cancelled.Err)
@@ -157,6 +157,63 @@ func TestCancelRunningJobMarksUserCancelledAndKeepsPartialRun(t *testing.T) {
 	if !errors.Is(fmt.Errorf("wrapped: %w", scheduler.ErrJobCancelledByUser), scheduler.ErrJobCancelledByUser) {
 		t.Fatal("sentinel error should be stable")
 	}
+}
+
+func TestSchedulerUsesRunnerFactory(t *testing.T) {
+	cfg := config.Default()
+	cfg.Pipeline.MaxConcurrent = 1
+	called := make(chan string, 1)
+	factory := func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+		return fakePipelineRunner{
+			run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				opts.Progress(pipeline.RunProgress{
+					RunID:       "run-factory",
+					Stage:       "A",
+					Event:       pipeline.EventStageRunning,
+					StageRecord: model.StageRecord{Stage: "A", Status: model.StageRunning},
+				})
+				called <- taskID
+				return pipeline.Result{
+					Run: model.RunRecord{RunID: "run-factory", TaskID: taskID, Status: model.RunCompletedClean},
+					Stages: []model.StageRecord{
+						{Stage: "A", Status: model.StageDone},
+					},
+				}, nil
+			},
+		}
+	}
+	s := scheduler.New(nil, cfg, scheduler.WithRunnerFactory(factory))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+
+	if _, err := s.Submit("TASK-FACTORY", pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	done := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-FACTORY" && snapshot.State == scheduler.JobDone
+	})
+	if done.RunID != "run-factory" || stageStatus(done.Stages, "A") != model.StageDone {
+		t.Fatalf("factory runner result not reflected in snapshot: %#v", done)
+	}
+	select {
+	case got := <-called:
+		if got != "TASK-FACTORY" {
+			t.Fatalf("factory runner task = %s", got)
+		}
+	default:
+		t.Fatal("factory runner was not called")
+	}
+}
+
+type fakePipelineRunner struct {
+	run func(context.Context, string, pipeline.RunOptions) (pipeline.Result, error)
+}
+
+func (f fakePipelineRunner) Run(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+	return f.run(ctx, taskID, opts)
 }
 
 func newTestScheduler(t *testing.T, firstScriptDelay time.Duration, taskIDs ...string) *scheduler.Scheduler {

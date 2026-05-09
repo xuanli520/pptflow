@@ -2,19 +2,18 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/xuanli520/p2r_tui/assets"
 	"github.com/xuanli520/p2r_tui/internal/config"
-	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/displaytime"
 	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/p2r_tui/internal/pathutil"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/preflight"
 	"github.com/xuanli520/p2r_tui/internal/projectlayout"
@@ -38,11 +37,25 @@ type RunProgress struct {
 	RunID       string
 	TaskID      string
 	Stage       string
-	Event       string
+	Event       ProgressEvent
 	StageRecord model.StageRecord
 	Done        bool
 	Err         error
 }
+
+type ProgressEvent string
+
+const (
+	EventRunCreated   ProgressEvent = "run_created"
+	EventPathWarning  ProgressEvent = "path_warning"
+	EventStagePending ProgressEvent = "stage_pending"
+	EventStageRunning ProgressEvent = "stage_running"
+	EventStageDone    ProgressEvent = "stage_done"
+	EventCleanup      ProgressEvent = "cleanup"
+	EventRunDone      ProgressEvent = "run_done"
+	EventRunAborted   ProgressEvent = "run_aborted"
+	EventRunCrashed   ProgressEvent = "run_crashed"
+)
 
 type ProjectPathWarning struct {
 	Type          string `json:"type"`
@@ -57,14 +70,46 @@ type Result struct {
 	Stages []model.StageRecord
 }
 
-type Runner struct {
-	store *db.Store
-	cfg   config.Config
-	exec  executor.Runner
+type runStore interface {
+	GetProject(context.Context, string) (scanner.Project, error)
+	GetRun(context.Context, string) (model.RunRecord, error)
+	ListRunsForTask(context.Context, string) ([]model.RunRecord, error)
+	CreateRun(context.Context, model.RunRecord) error
+	PutStage(context.Context, string, model.StageRecord) error
+	InsertFindings(context.Context, string, []model.Finding) error
+	FinishRun(context.Context, string, string, string, time.Duration) error
 }
 
-func NewRunner(store *db.Store, cfg config.Config) Runner {
-	return Runner{store: store, cfg: cfg, exec: executor.New()}
+type CommandRunner interface {
+	LookPath(name string) (string, error)
+	Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result
+	RunStreaming(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, name string, args ...string) executor.Result
+}
+
+type RunnerOption func(*Runner)
+
+type Runner struct {
+	store runStore
+	cfg   config.Config
+	exec  CommandRunner
+}
+
+func WithCommandRunner(exec CommandRunner) RunnerOption {
+	return func(r *Runner) {
+		if exec != nil {
+			r.exec = exec
+		}
+	}
+}
+
+func NewRunner(store runStore, cfg config.Config, opts ...RunnerOption) Runner {
+	runner := Runner{store: store, cfg: cfg, exec: executor.New()}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&runner)
+		}
+	}
+	return runner
 }
 
 func SelfTestReportPath(projectPath string, cfg config.Config) string {
@@ -104,31 +149,17 @@ func runArtifactRoot(scanPath string, project scanner.Project, runID string) str
 	taskDir := projectlayout.SafePathSegment(project.TaskID, "TASK-UNKNOWN")
 	runDir := projectlayout.SafePathSegment(runID, "run-unknown")
 	primary := filepath.Join(filepath.Clean(scanPath), "result", batchDir, taskDir, runDir)
-	if pathWithin(primary, project.Path) {
+	if pathutil.PathWithin(primary, project.Path) {
 		return filepath.Join(filepath.Clean(scanPath), ".qa-control", "runs", batchDir, taskDir, runDir)
 	}
 	return primary
 }
 
-func pathWithin(path, parent string) bool {
-	path = absClean(path)
-	parent = absClean(parent)
-	rel, err := filepath.Rel(parent, path)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
-}
-
-func absClean(path string) string {
-	cleaned := filepath.Clean(path)
-	if abs, err := filepath.Abs(cleaned); err == nil {
-		return abs
-	}
-	return cleaned
-}
-
 func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project, opts RunOptions) (RunOptions, error) {
+	var err error
+	if opts, err = normalizeStageOptions(opts); err != nil {
+		return opts, err
+	}
 	opts.Mode = strings.ToLower(strings.TrimSpace(opts.Mode))
 	if opts.Mode == "" {
 		opts.Mode = "initial"
@@ -161,6 +192,40 @@ func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project
 		}
 	default:
 		return opts, fmt.Errorf("invalid --mode %q; expected initial or recheck", opts.Mode)
+	}
+	return opts, nil
+}
+
+func normalizeStageOptions(opts RunOptions) (RunOptions, error) {
+	if opts.Stage != "" {
+		stage, ok := model.NormalizeStage(opts.Stage)
+		if !ok {
+			return opts, fmt.Errorf("invalid stage %q; expected A..F", opts.Stage)
+		}
+		opts.Stage = stage
+	}
+	if opts.From != "" {
+		from, ok := model.NormalizeStage(opts.From)
+		if !ok {
+			return opts, fmt.Errorf("invalid from stage %q; expected A..F", opts.From)
+		}
+		opts.From = from
+	}
+	if len(opts.Stages) > 0 {
+		normalized := make([]string, 0, len(opts.Stages))
+		seen := map[string]bool{}
+		for _, raw := range opts.Stages {
+			stage, ok := model.NormalizeStage(raw)
+			if !ok {
+				return opts, fmt.Errorf("invalid stage %q in stage list; expected A..F", raw)
+			}
+			if seen[stage] {
+				continue
+			}
+			seen[stage] = true
+			normalized = append(normalized, stage)
+		}
+		opts.Stages = normalized
 	}
 	return opts, nil
 }
@@ -211,247 +276,121 @@ func formatProjectPathWarnings(warnings []ProjectPathWarning) string {
 }
 
 func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result Result, err error) {
-	progress := func(update RunProgress) {
-		if opts.Progress == nil {
-			return
-		}
-		if update.TaskID == "" {
-			update.TaskID = taskID
-		}
-		opts.Progress(update)
-	}
-	project, err := r.store.GetProject(ctx, taskID)
+	progress := makeRunProgress(taskID, opts.Progress)
+	project, pathWarnings, opts, err := r.loadAndValidateRunInputs(ctx, taskID, opts, progress)
 	if err != nil {
-		progress(RunProgress{Event: "run_crashed", Done: true, Err: db.FormatNotFound("task", taskID)})
-		return Result{}, db.FormatNotFound("task", taskID)
-	}
-	project, pathWarnings, err := r.canonicalizeProjectForRun(project)
-	if err != nil {
-		progress(RunProgress{Event: "run_crashed", Done: true, Err: err})
-		return Result{}, err
-	}
-	opts, err = r.normalizeRunOptions(ctx, project, opts)
-	if err != nil {
-		progress(RunProgress{Event: "run_crashed", Done: true, Err: err})
 		return Result{}, err
 	}
 	lock, err := r.acquireTaskRunLock(taskID)
 	if err != nil {
-		progress(RunProgress{Event: "run_crashed", Done: true, Err: err})
+		progress(RunProgress{Event: EventRunCrashed, Done: true, Err: err})
 		return Result{}, err
 	}
 	defer lock.Release()
-	previousRuns, _ := r.store.ListRunsForTask(ctx, taskID)
-	start := time.Now().UTC()
-	runID := displaytime.RunID(start)
-	artifactRoot := runArtifactRoot(r.cfg.ScanPath, project, runID)
-	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
-		progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
-		return Result{}, err
-	}
-	if len(pathWarnings) > 0 {
-		_ = writeText(filepath.Join(artifactRoot, "logs", "path_warnings.log"), formatProjectPathWarnings(pathWarnings))
-		for _, warning := range pathWarnings {
-			progress(RunProgress{RunID: runID, Event: "path_warning", Err: errors.New(warning.Message())})
-		}
-	}
-	controlDir := filepath.Join(r.cfg.ScanPath, ".qa-control")
-	released, releaseErr := assets.Release(controlDir)
-	toolVersions, _ := json.Marshal(map[string]any{"assets": released})
-	if releaseErr != nil {
-		toolVersions, _ = json.Marshal(map[string]any{"assets_error": releaseErr.Error()})
-	}
-	importedDocs, docsImportErr := taskdocs.ImportDropbox(r.cfg.ScanPath, taskID, r.cfg.Docs, "p2r-run")
-	docsManifest, docsManifestErr := taskdocs.ReadManifest(r.cfg.ScanPath, taskID)
-	staticOnly := opts.StaticOnly || r.cfg.Pipeline.StaticOnly
-	keepRuntime := opts.KeepRuntime || r.cfg.Docker.KeepRuntime
-	run := model.RunRecord{
-		RunID:          runID,
-		TaskID:         taskID,
-		StartedAt:      start.Format(time.RFC3339),
-		Status:         model.RunRunning,
-		ManualVerdict:  model.ManualUnset,
-		StaticOnly:     staticOnly,
-		ArtifactRoot:   artifactRoot,
-		ToolVersions:   string(toolVersions),
-		PromptVersions: string(toolVersions),
-	}
-	if err := r.store.CreateRun(ctx, run); err != nil {
-		progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
-		return Result{}, err
-	}
-	progress(RunProgress{RunID: runID, Event: "run_created"})
-	runCreated := true
-	runFinished := false
+
+	var state *runState
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			if runCreated && !runFinished {
-				r.markRunCrashed(context.Background(), run, start, fmt.Sprintf("panic: %v", recovered))
+			if state != nil && state.runCreated && !state.runFinished {
+				_ = r.crashRun(context.Background(), state.run, state.start, state.stages, state.keepRuntime, state.runtimeCleanupDone, fmt.Sprintf("panic: %v", recovered))
 			}
-			progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: fmt.Errorf("panic: %v", recovered)})
+			progress(RunProgress{RunID: runIDFromState(state), Event: EventRunCrashed, Done: true, Err: fmt.Errorf("panic: %v", recovered)})
 			panic(recovered)
 		}
-		if err != nil && runCreated && !runFinished {
-			r.markRunCrashed(context.Background(), run, start, err.Error())
-			progress(RunProgress{RunID: runID, Event: "run_crashed", Done: true, Err: err})
+		if err != nil && state != nil && state.runCreated && !state.runFinished {
+			if persistErr := r.crashRun(context.Background(), state.run, state.start, state.stages, state.keepRuntime, state.runtimeCleanupDone, err.Error()); persistErr != nil {
+				err = errors.Join(err, persistErr)
+			}
+			progress(RunProgress{RunID: state.runID, Event: EventRunCrashed, Done: true, Err: err})
 		}
 	}()
-	stages := initialStages(selectedStages(opts, staticOnly), staticOnly)
-	results := map[string]model.StageRecord{}
-	runtimeCleanupDone := false
-	cleanupFailed := false
-	abortIfCancelled := func() (Result, error, bool) {
-		if abortErr := ctx.Err(); abortErr != nil {
-			result, err := r.finishAbortedRun(abortErr, &run, start, stages, keepRuntime, &runtimeCleanupDone, &runFinished, progress)
-			stages = result.Stages
-			return result, err, true
-		}
-		return Result{}, nil, false
-	}
-	if result, err, aborted := abortIfCancelled(); aborted {
-		return result, err
-	}
-	if err := r.writeRunManifest(run, project, opts, released, releaseErr, importedDocs, docsManifest, firstErrorString(docsImportErr, docsManifestErr), pathWarnings); err != nil {
-		return Result{}, err
-	}
-	if err := r.writeStageStatus(runID, artifactRoot, stages); err != nil {
-		return Result{}, err
-	}
-	if result, err, aborted := abortIfCancelled(); aborted {
-		return result, err
-	}
-	for _, stage := range stages {
-		if result, err, aborted := abortIfCancelled(); aborted {
-			return result, err
-		}
-		_ = r.store.PutStage(ctx, runID, stage)
-		progress(RunProgress{RunID: runID, Stage: stage.Stage, Event: "stage_pending", StageRecord: stage})
-	}
-	if result, err, aborted := abortIfCancelled(); aborted {
-		return result, err
-	}
-	preflightResult := preflight.Run(ctx, r.exec, r.cfg)
-	preflightPath := filepath.Join(artifactRoot, "preflight.json")
-	_ = writeJSON(preflightPath, preflightResult)
-	preCleanup := r.cleanupStaleRuns(ctx, previousRuns, runID, artifactRoot)
-	if len(preCleanup) > 0 {
-		mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "pre_run_cleanup", preCleanup)
-	}
-	if result, err, aborted := abortIfCancelled(); aborted {
-		return result, err
-	}
-	for index := range stages {
-		stage := stages[index].Stage
-		if result, err, aborted := abortIfCancelled(); aborted {
-			return result, err
-		}
-		if stages[index].Status == model.StageSkipped {
-			record := r.materializeSkippedStage(run, stages[index])
-			stages[index] = record
-			results[stage] = record
-			if result, err, aborted := abortIfCancelled(); aborted {
-				return result, err
-			}
-			_ = r.store.PutStage(ctx, runID, record)
-			_ = r.writeStageStatus(runID, artifactRoot, stages)
-			progress(RunProgress{RunID: runID, Stage: record.Stage, Event: "stage_done", StageRecord: record})
-			if result, err, aborted := abortIfCancelled(); aborted {
-				return result, err
-			}
-			continue
-		}
-		running := runningStage(run, stage)
-		stages[index] = running
-		results[stage] = running
-		if result, err, aborted := abortIfCancelled(); aborted {
-			return result, err
-		}
-		_ = r.store.PutStage(ctx, runID, running)
-		_ = r.writeStageStatus(runID, artifactRoot, stages)
-		progress(RunProgress{RunID: runID, Stage: stage, Event: "stage_running", StageRecord: running})
-		record := r.executeStage(ctx, run, project, stage, results, opts, preflightResult)
-		record.Findings = assignMissingFindingIDs(stage, record.Findings)
-		stages[index] = record
-		results[stage] = record
-		if result, err, aborted := abortIfCancelled(); aborted {
-			return result, err
-		}
-		_ = r.store.PutStage(ctx, runID, record)
-		_ = r.store.InsertFindings(ctx, runID, record.Findings)
-		_ = r.writeStageStatus(runID, artifactRoot, stages)
-		progress(RunProgress{RunID: runID, Stage: record.Stage, Event: "stage_done", StageRecord: record})
-		if result, err, aborted := abortIfCancelled(); aborted {
-			return result, err
-		}
-		if !runtimeCleanupDone && runtimeCleanupPoint(stage, stages) {
-			cleanupSummary := r.cleanupCurrentRuntime(ctx, run, keepRuntime)
-			mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
-			if cleanupSummary.Status == "failed" {
-				cleanupFailed = true
-				_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
-			}
-			runtimeCleanupDone = cleanupSummary.Status != "failed" || ctx.Err() == nil
-			progress(RunProgress{RunID: runID, Event: "cleanup"})
-			if result, err, aborted := abortIfCancelled(); aborted {
-				return result, err
-			}
-		}
-	}
-	if !runtimeCleanupDone && runtimeStageWasSelected(stages) {
-		if result, err, aborted := abortIfCancelled(); aborted {
-			return result, err
-		}
-		cleanupSummary := r.cleanupCurrentRuntime(ctx, run, keepRuntime)
-		mergeCleanupIntoManifest(filepath.Join(artifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
-		if cleanupSummary.Status == "failed" {
-			cleanupFailed = true
-			_ = r.store.InsertFindings(ctx, runID, []model.Finding{cleanupFinding(cleanupSummary)})
-		}
-		runtimeCleanupDone = cleanupSummary.Status != "failed" || ctx.Err() == nil
-		progress(RunProgress{RunID: runID, Event: "cleanup"})
-		if result, err, aborted := abortIfCancelled(); aborted {
-			return result, err
-		}
-	}
 
-	status := runStatus(stages)
-	if cleanupFailed {
-		status = model.RunCompletedWithFindings
-	}
-	if result, err, aborted := abortIfCancelled(); aborted {
-		return result, err
-	}
-	if err := r.store.FinishRun(ctx, runID, taskID, status, time.Since(start)); err != nil {
+	state, err = r.prepareRun(ctx, taskID, project, pathWarnings, opts, progress)
+	if err != nil {
 		return Result{}, err
 	}
-	runFinished = true
-	run.Status = status
-	run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
-	run.DurationMS = time.Since(start).Milliseconds()
-	progress(RunProgress{RunID: runID, Event: "run_done", Done: true})
-	return Result{Run: run, Stages: stages}, nil
+	if result, err, aborted := state.abortIfCancelled(); aborted {
+		return result, err
+	}
+	if err := state.persistInitialArtifacts(); err != nil {
+		return Result{}, err
+	}
+	if result, err, aborted := state.abortIfCancelled(); aborted {
+		return result, err
+	}
+	if result, err, aborted := state.persistInitialStages(); aborted || err != nil {
+		return result, err
+	}
+	preflightResult, err := state.runPreflightAndCleanup()
+	if err != nil {
+		if result, err, aborted := state.abortOrError(err); aborted {
+			return result, err
+		}
+		return Result{}, err
+	}
+	if result, err, aborted := state.abortIfCancelled(); aborted {
+		return result, err
+	}
+	if result, err, aborted := state.executeStageLoop(preflightResult); aborted || err != nil {
+		return result, err
+	}
+	if result, err, aborted := state.finalizeRuntimeCleanup(); aborted || err != nil {
+		return result, err
+	}
+	result, err, _ = state.finishRun()
+	return result, err
 }
 
-func (r Runner) markRunCrashed(ctx context.Context, run model.RunRecord, start time.Time, reason string) {
+func runIDFromState(state *runState) string {
+	if state == nil {
+		return ""
+	}
+	return state.runID
+}
+
+func (r Runner) markRunCrashed(ctx context.Context, run model.RunRecord, start time.Time, reason string) error {
+	return r.crashRun(ctx, run, start, nil, false, true, reason)
+}
+
+func (r Runner) crashRun(ctx context.Context, run model.RunRecord, start time.Time, stages []model.StageRecord, keepRuntime bool, runtimeCleanupDone bool, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "pipeline exited before finishing the run"
 	}
-	_ = writeJSON(filepath.Join(run.ArtifactRoot, "crash_summary.json"), map[string]any{
-		"run_id":      run.RunID,
-		"task_id":     run.TaskID,
-		"status":      model.RunCrashed,
-		"reason":      reason,
-		"recorded_at": time.Now().UTC().Format(time.RFC3339),
-	})
-	_ = r.store.FinishRun(ctx, run.RunID, run.TaskID, model.RunCrashed, time.Since(start))
+	saveErrors := []error{}
+	cleanupStatus := "not_applicable"
+	if runtimeCleanupDone {
+		cleanupStatus = "already_done"
+	} else if runtimeStageWasSelected(stages) {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanup := r.finalizeRuntime(cleanupCtx, run, stages, keepRuntime, "crash")
+		cleanupCancel()
+		cleanupStatus = cleanup.Summary.Status
+		saveErrors = append(saveErrors, cleanup.PersistErrors...)
+	}
+	if err := NewArtifactWriter(run.ArtifactRoot).RequiredJSON("crash_summary.json", map[string]any{
+		"run_id":         run.RunID,
+		"task_id":        run.TaskID,
+		"status":         model.RunCrashed,
+		"reason":         reason,
+		"save_errors":    cleanupPersistErrorStrings(cleanupOutcome{PersistErrors: saveErrors}),
+		"cleanup_status": cleanupStatus,
+		"recorded_at":    time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		saveErrors = append(saveErrors, err)
+	}
+	saveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := r.store.FinishRun(saveCtx, run.RunID, run.TaskID, model.RunCrashed, time.Since(start)); err != nil {
+		saveErrors = append(saveErrors, fmt.Errorf("finish crashed run: %w", err))
+	}
+	return errors.Join(saveErrors...)
 }
 
 func (r Runner) finishAbortedRun(abortErr error, run *model.RunRecord, start time.Time, stages []model.StageRecord, keepRuntime bool, runtimeCleanupDone *bool, runFinished *bool, progress func(RunProgress)) (Result, error) {
 	if abortErr == nil {
 		abortErr = context.Canceled
 	}
-	*runFinished = true
 	stages = markInFlightStageAborted(stages, abortErr)
 	saveErrors := []string{}
 
@@ -477,32 +416,30 @@ func (r Runner) finishAbortedRun(abortErr error, run *model.RunRecord, start tim
 		cleanupStatus = "already_done"
 	} else if runtimeStageWasSelected(stages) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cleanupSummary := r.cleanupCurrentRuntime(cleanupCtx, *run, keepRuntime)
+		cleanup := r.finalizeRuntime(cleanupCtx, *run, stages, keepRuntime, "abort")
 		cleanupCancel()
-		cleanupStatus = cleanupSummary.Status
-		mergeCleanupIntoManifest(filepath.Join(run.ArtifactRoot, "run_manifest.json"), "cleanup", cleanupSummary)
-		if cleanupSummary.Status == "failed" {
-			findingCtx, findingCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := r.store.InsertFindings(findingCtx, run.RunID, []model.Finding{cleanupFinding(cleanupSummary)}); err != nil {
-				saveErrors = append(saveErrors, "insert cleanup finding: "+err.Error())
-			}
-			findingCancel()
-		}
+		cleanupStatus = cleanup.Summary.Status
+		saveErrors = append(saveErrors, cleanupPersistErrorStrings(cleanup)...)
 		if runtimeCleanupDone != nil {
-			*runtimeCleanupDone = cleanupSummary.Status != "failed"
+			*runtimeCleanupDone = cleanup.RuntimeCleanupDone
 		}
 	}
 
 	finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	terminalPersisted := true
 	if err := r.store.FinishRun(finishCtx, run.RunID, run.TaskID, model.RunAborted, time.Since(start)); err != nil {
+		terminalPersisted = false
 		saveErrors = append(saveErrors, "finish aborted run: "+err.Error())
 	}
 	finishCancel()
+	if terminalPersisted && runFinished != nil {
+		*runFinished = true
+	}
 
 	run.Status = model.RunAborted
 	run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	run.DurationMS = time.Since(start).Milliseconds()
-	_ = writeJSON(filepath.Join(run.ArtifactRoot, "abort_summary.json"), map[string]any{
+	if err := NewArtifactWriter(run.ArtifactRoot).RequiredJSON("abort_summary.json", map[string]any{
 		"run_id":         run.RunID,
 		"task_id":        run.TaskID,
 		"status":         model.RunAborted,
@@ -510,8 +447,13 @@ func (r Runner) finishAbortedRun(abortErr error, run *model.RunRecord, start tim
 		"save_errors":    saveErrors,
 		"cleanup_status": cleanupStatus,
 		"recorded_at":    time.Now().UTC().Format(time.RFC3339),
-	})
-	progress(RunProgress{RunID: run.RunID, Event: "run_done", Done: true, Err: abortErr})
+	}); err != nil {
+		saveErrors = append(saveErrors, "write abort_summary.json: "+err.Error())
+	}
+	if len(saveErrors) > 0 {
+		return Result{Run: *run, Stages: stages}, fmt.Errorf("%w; abort persistence errors: %s", abortErr, strings.Join(saveErrors, "; "))
+	}
+	progress(RunProgress{RunID: run.RunID, Event: EventRunAborted, Done: true, Err: abortErr})
 	return Result{Run: *run, Stages: stages}, abortErr
 }
 
@@ -572,27 +514,36 @@ func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project s
 }
 
 func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
-	selected := map[string]bool{"A": true, "B": true, "C": true, "D": true, "E": true, "F": true}
+	selected := stageSet(model.AllStages())
 	if len(opts.Stages) > 0 {
 		selected = map[string]bool{}
 		for _, stage := range opts.Stages {
-			selected[strings.ToUpper(stage)] = true
+			if normalized, ok := model.NormalizeStage(stage); ok {
+				selected[normalized] = true
+			}
 		}
 		return selected
 	}
 	if opts.Stage != "" {
-		stage := strings.ToUpper(opts.Stage)
+		stage, ok := model.NormalizeStage(opts.Stage)
+		if !ok {
+			return map[string]bool{}
+		}
 		selected := map[string]bool{stage: true}
-		if stage != "F" {
-			selected["F"] = true
+		if stage != string(model.StageF) {
+			selected[string(model.StageF)] = true
 		}
 		return selected
 	}
 	if opts.From != "" {
 		selected = map[string]bool{}
 		include := false
-		for _, stage := range []string{"A", "B", "C", "D", "E", "F"} {
-			if stage == strings.ToUpper(opts.From) {
+		from, ok := model.NormalizeStage(opts.From)
+		if !ok {
+			return selected
+		}
+		for _, stage := range model.AllStages() {
+			if stage == from {
 				include = true
 			}
 			if include {
@@ -602,14 +553,14 @@ func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 		return selected
 	}
 	if staticOnly {
-		return map[string]bool{"A": true, "D": true, "E": true, "F": true}
+		return staticStageSet()
 	}
 	return selected
 }
 
 func initialStages(selected map[string]bool, staticOnly bool) []model.StageRecord {
 	stages := make([]model.StageRecord, 0, 6)
-	for _, stage := range []string{"A", "B", "C", "D", "E", "F"} {
+	for _, stage := range model.AllStages() {
 		if selected[stage] {
 			stages = append(stages, model.StageRecord{
 				Stage:         stage,
@@ -620,12 +571,32 @@ func initialStages(selected map[string]bool, staticOnly bool) []model.StageRecor
 			continue
 		}
 		reason := "Not selected for this run."
-		if staticOnly && (stage == "B" || stage == "C") {
+		if staticOnly && model.IsRuntimeStage(stage) {
 			reason = "--static-only skips Docker and run_tests evidence."
 		}
 		stages = append(stages, skippedStage(stage, reason))
 	}
 	return stages
+}
+
+func stageSet(stages []string) map[string]bool {
+	selected := make(map[string]bool, len(stages))
+	for _, stage := range stages {
+		if normalized, ok := model.NormalizeStage(stage); ok {
+			selected[normalized] = true
+		}
+	}
+	return selected
+}
+
+func staticStageSet() map[string]bool {
+	selected := map[string]bool{}
+	for _, spec := range model.AllStageSpecs() {
+		if spec.Static {
+			selected[string(spec.ID)] = true
+		}
+	}
+	return selected
 }
 
 func stageName(stage string) string {
@@ -658,25 +629,13 @@ func runningStage(run model.RunRecord, stage string) model.StageRecord {
 }
 
 func stageLogPath(artifactRoot, stage string) string {
-	switch stage {
-	case "A":
-		return filepath.Join(artifactRoot, "logs", "A_validate.log")
-	case "B":
-		return filepath.Join(artifactRoot, "logs", "B_docker.log")
-	case "C":
-		return filepath.Join(artifactRoot, "logs", "C_tests.log")
-	case "D":
-		return filepath.Join(artifactRoot, "logs", "D_tests_coverage_static.log")
-	case "E":
-		return filepath.Join(artifactRoot, "logs", "E_static_audit.log")
-	case "F":
-		return filepath.Join(artifactRoot, "logs", "F_repair.log")
-	default:
-		return filepath.Join(artifactRoot, "logs", stage+"_stage.log")
-	}
+	return filepath.Join(artifactRoot, "logs", model.StageLogName(stage))
 }
 
 func finishStage(record model.StageRecord, status string, started time.Time) model.StageRecord {
+	if record.Status == model.StageFailed && status == model.StageDone {
+		status = model.StageFailed
+	}
 	record.Status = status
 	record.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	record.DurationMS = time.Since(started).Milliseconds()
@@ -714,6 +673,7 @@ func blockedStage(stage, name string, blockedBy []string, reason string) model.S
 }
 
 func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageRecord) model.StageRecord {
+	writer := NewArtifactWriter(run.ArtifactRoot)
 	switch record.Stage {
 	case "B":
 		logPath := filepath.Join(run.ArtifactRoot, "logs", "B_docker.log")
@@ -723,8 +683,12 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 		if reason == "" {
 			reason = "Stage B was not executed."
 		}
-		_ = writeText(logPath, reason)
-		_ = writeJSON(portMapPath, map[string]any{"run_id": run.RunID, "mappings": map[string]any{}, "reason": reason})
+		if err := writer.RequiredText("logs/B_docker.log", reason); err != nil {
+			record = recordArtifactWriteError(record, err, logPath)
+		}
+		if err := writer.RequiredJSON("port_map.json", map[string]any{"run_id": run.RunID, "mappings": map[string]any{}, "reason": reason}); err != nil {
+			record = recordArtifactWriteError(record, err, portMapPath)
+		}
 		pages, _ := renderTerminalLog(reason, screenshotPath)
 		record.LogPath = logPath
 		record.ArtifactPaths = append([]string{portMapPath}, pages...)
@@ -736,8 +700,12 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 		if reason == "" {
 			reason = "Stage C was not executed."
 		}
-		_ = writeText(logPath, reason)
-		_ = writeJSON(summaryPath, map[string]any{"ok": false, "reason": reason})
+		if err := writer.RequiredText("logs/C_tests.log", reason); err != nil {
+			record = recordArtifactWriteError(record, err, logPath)
+		}
+		if err := writer.RequiredJSON("test_runtime_summary.json", map[string]any{"ok": false, "reason": reason}); err != nil {
+			record = recordArtifactWriteError(record, err, summaryPath)
+		}
 		pages, _ := renderTerminalLog(reason, screenshotPath)
 		record.LogPath = logPath
 		record.ArtifactPaths = append([]string{logPath}, pages...)
@@ -746,7 +714,26 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 	return record
 }
 
-func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, opts RunOptions, released []assets.ReleasedFile, releaseErr error, importedDocs []taskdocs.Document, docsManifest taskdocs.Manifest, docsErr string, pathWarnings []ProjectPathWarning) error {
+func recordArtifactWriteError(record model.StageRecord, err error, sourcePath string) model.StageRecord {
+	if err == nil {
+		return record
+	}
+	record.Status = model.StageFailed
+	record.ErrorSummary = err.Error()
+	record.Findings = append(record.Findings, model.Finding{
+		Stage:      "INFRA",
+		Severity:   "High",
+		Title:      "Required p2r artifact could not be written",
+		Rule:       "p2r stages must persist required evidence artifacts.",
+		Evidence:   err.Error(),
+		Impact:     "The run evidence is incomplete even if the underlying stage work completed.",
+		MinimumFix: "Ensure the run artifact directory is writable and rerun the affected stage.",
+		SourcePath: sourcePath,
+	})
+	return record
+}
+
+func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, opts RunOptions, released []assets.ReleasedFile, releaseErr error, importedDocs []taskdocs.Document, docsManifest taskdocs.Manifest, docsErr string, pathWarnings []ProjectPathWarning, artifactWarnings []ArtifactWarning) error {
 	manifest := map[string]any{
 		"run_id":           run.RunID,
 		"task_id":          run.TaskID,
@@ -809,7 +796,10 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 	if len(pathWarnings) > 0 {
 		manifest["path_warnings"] = pathWarnings
 	}
-	return writeJSON(filepath.Join(run.ArtifactRoot, "run_manifest.json"), manifest)
+	if len(artifactWarnings) > 0 {
+		manifest["artifact_warnings"] = artifactWarnings
+	}
+	return NewArtifactWriter(run.ArtifactRoot).RequiredJSON("run_manifest.json", manifest)
 }
 
 func firstErrorString(errors ...error) string {
@@ -822,7 +812,7 @@ func firstErrorString(errors ...error) string {
 }
 
 func (r Runner) writeStageStatus(runID, artifactRoot string, stages []model.StageRecord) error {
-	return writeJSON(filepath.Join(artifactRoot, "stage_status.json"), model.StageStatusFile{RunID: runID, Stages: stages})
+	return NewArtifactWriter(artifactRoot).RequiredJSON("stage_status.json", model.StageStatusFile{RunID: runID, Stages: stages})
 }
 
 func runStatus(stages []model.StageRecord) string {

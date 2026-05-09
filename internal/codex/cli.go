@@ -27,7 +27,7 @@ type Capability struct {
 	OptionalMissingMessage string `json:"optional_missing_message,omitempty"`
 }
 
-func DetectCLI(ctx context.Context, exec executor.Runner, preferredPath string) Capability {
+func DetectCLI(ctx context.Context, exec executor.CommandRunner, preferredPath string) Capability {
 	cap := Capability{}
 	path := strings.TrimSpace(preferredPath)
 	if path == "" {

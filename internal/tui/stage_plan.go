@@ -1,6 +1,10 @@
 package tui
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+)
 
 type stagePlan struct {
 	runStages     []string
@@ -12,7 +16,7 @@ type stagePlan struct {
 func stagePlanForMode(mode, stage string, staticOnly bool, explicitStages map[string]bool, fromStage string) stagePlan {
 	stage = strings.ToUpper(strings.TrimSpace(stage))
 	if stage == "" {
-		stage = "A"
+		stage = string(model.StageA)
 	}
 	fromStage = strings.ToUpper(strings.TrimSpace(fromStage))
 	if len(explicitStages) > 0 && fromStage != "" {
@@ -39,16 +43,16 @@ func stagePlanForMode(mode, stage string, staticOnly bool, explicitStages map[st
 		return stagePlan{runStages: stages, displayStages: stages}
 	}
 	if mode == "recheck" {
-		if staticOnly && (stage == "B" || stage == "C") {
+		if staticOnly && model.IsRuntimeStage(stage) {
 			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段 B/C"}
 		}
 		stages := affectedStages(stage)
 		return stagePlan{runStages: stages, displayStages: stages}
 	}
 	if staticOnly {
-		return stagePlan{displayStages: []string{"A", "D", "E", "F"}}
+		return stagePlan{displayStages: staticDisplayStages()}
 	}
-	return stagePlan{displayStages: []string{"A", "B", "C", "D", "E", "F"}}
+	return stagePlan{displayStages: model.AllStages()}
 }
 
 func (m app) rerunStagePlan() stagePlan {
@@ -72,7 +76,7 @@ func (m app) rerunStageKey() string {
 
 func selectedStageList(selected map[string]bool) []string {
 	var stages []string
-	for _, stage := range []string{"A", "B", "C", "D", "E", "F"} {
+	for _, stage := range model.AllStages() {
 		if selected[stage] {
 			stages = append(stages, stage)
 		}
@@ -84,7 +88,7 @@ func stagesFrom(fromStage string) []string {
 	fromStage = strings.ToUpper(strings.TrimSpace(fromStage))
 	include := false
 	var stages []string
-	for _, stage := range []string{"A", "B", "C", "D", "E", "F"} {
+	for _, stage := range model.AllStages() {
 		if stage == fromStage {
 			include = true
 		}
@@ -97,9 +101,19 @@ func stagesFrom(fromStage string) []string {
 
 func hasRuntimeStage(stages []string) bool {
 	for _, stage := range stages {
-		if stage == "B" || stage == "C" {
+		if model.IsRuntimeStage(stage) {
 			return true
 		}
 	}
 	return false
+}
+
+func staticDisplayStages() []string {
+	var stages []string
+	for _, spec := range model.AllStageSpecs() {
+		if spec.Static {
+			stages = append(stages, string(spec.ID))
+		}
+	}
+	return stages
 }

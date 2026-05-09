@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	_ "unsafe"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
@@ -15,14 +14,17 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
-//go:linkname codexReviewPath github.com/xuanli520/p2r_tui/internal/pipeline.codexReviewPath
-func codexReviewPath(run model.RunRecord, projectPath string) string
+func codexReviewPath(run model.RunRecord, projectPath string) string {
+	return pipelinepkg.CodexReviewPathForTest(run, projectPath)
+}
 
-//go:linkname runnerCodexContext github.com/xuanli520/p2r_tui/internal/pipeline.Runner.codexContext
-func runnerCodexContext(r pipelinepkg.Runner, ctx context.Context, project scanner.Project, opts pipelinepkg.RunOptions, stage string) (string, error)
+func runnerCodexContext(r pipelinepkg.Runner, ctx context.Context, project scanner.Project, opts pipelinepkg.RunOptions, stage string) (string, error) {
+	return r.CodexContextForTest(ctx, project, opts, stage)
+}
 
-//go:linkname runnerStageCodex github.com/xuanli520/p2r_tui/internal/pipeline.Runner.stageCodex
-func runnerStageCodex(r pipelinepkg.Runner, ctx context.Context, run model.RunRecord, project scanner.Project, opts pipelinepkg.RunOptions, stage, profile, output string, compat ...string) model.StageRecord
+func runnerStageCodex(r pipelinepkg.Runner, ctx context.Context, run model.RunRecord, project scanner.Project, opts pipelinepkg.RunOptions, stage, profile, output string, compat ...string) model.StageRecord {
+	return r.StageCodexForTest(ctx, run, project, opts, stage, profile, output, compat...)
+}
 
 func TestCodexReviewPathPrefersScriptInputSnapshot(t *testing.T) {
 	root := t.TempDir()
@@ -218,6 +220,94 @@ func TestStageCodexUnsafeExtraArgsProducesFindingAndContract(t *testing.T) {
 	}
 }
 
+func TestStageCodexRequiredReportWriteFailureAddsInfraFinding(t *testing.T) {
+	root := t.TempDir()
+	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
+	outputPath := filepath.Join(artifactRoot, "tests_coverage_report.md")
+	if err := os.MkdirAll(outputPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Codex.PromptProfilesDir = filepath.Join(root, "missing-profiles")
+	record := runnerStageCodex(
+		pipelinepkg.NewRunner(nil, cfg),
+		context.Background(),
+		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: filepath.Join(root, "batch", "TASK-1")},
+		pipelinepkg.RunOptions{},
+		"D",
+		"tests_coverage_report.md",
+		"tests_coverage_report.md",
+	)
+
+	if record.Status != model.StageFailed {
+		t.Fatalf("stage status = %s, want failed", record.Status)
+	}
+	if !hasFinding(record.Findings, "INFRA", "Required p2r artifact could not be written") {
+		t.Fatalf("expected required artifact infra finding, got %#v", record.Findings)
+	}
+	if !strings.Contains(record.ErrorSummary, "write required artifact") {
+		t.Fatalf("error summary should preserve artifact write failure, got %q", record.ErrorSummary)
+	}
+}
+
+func TestStageCodexCompatWriteFailureRecordsWarningOnly(t *testing.T) {
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profiles := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profiles, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profiles, "tests_coverage_report.md"), []byte("profile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "compat.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Codex.PromptProfilesDir = profiles
+	record := runnerStageCodex(
+		pipelinepkg.NewRunner(nil, cfg),
+		context.Background(),
+		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: projectPath},
+		pipelinepkg.RunOptions{},
+		"D",
+		"tests_coverage_report.md",
+		"tests_coverage_report.md",
+		"compat.md",
+	)
+
+	if record.Status != model.StageDone {
+		t.Fatalf("stage status = %s, want done; record=%#v", record.Status, record)
+	}
+	if _, err := os.Stat(filepath.Join(artifactRoot, "tests_coverage_report.md")); err != nil {
+		t.Fatalf("required report should be written: %v", err)
+	}
+	if len(record.ArtifactWarnings) != 1 {
+		t.Fatalf("expected one best-effort artifact warning, got %#v", record.ArtifactWarnings)
+	}
+	if record.ArtifactWarnings[0].Required || record.ArtifactWarnings[0].Path != "compat.md" {
+		t.Fatalf("unexpected artifact warning: %#v", record.ArtifactWarnings[0])
+	}
+	if hasFinding(record.Findings, "INFRA", "Required p2r artifact could not be written") {
+		t.Fatalf("compat failure should not become required-artifact finding: %#v", record.Findings)
+	}
+}
+
 func TestStageCodexNormalizesFinalReportLayout(t *testing.T) {
 	root := t.TempDir()
 	fakeBin := filepath.Join(root, "bin")
@@ -288,4 +378,13 @@ func TestStageCodexNormalizesFinalReportLayout(t *testing.T) {
 	if string(compat) != text {
 		t.Fatal("compatibility report should receive the same normalized content")
 	}
+}
+
+func hasFinding(findings []model.Finding, stage, title string) bool {
+	for _, finding := range findings {
+		if finding.Stage == stage && finding.Title == title {
+			return true
+		}
+	}
+	return false
 }

@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
@@ -113,12 +114,12 @@ func (m app) handleRunConfigKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		return m, cmds
 	case "up":
 		if m.runConfig.focus == runConfigFocusStages {
-			m.runConfig.stageIndex = clamp(m.runConfig.stageIndex-1, 0, 5)
+			m.runConfig.stageIndex = clamp(m.runConfig.stageIndex-1, 0, len(model.AllStages())-1)
 		}
 		return m, cmds
 	case "down":
 		if m.runConfig.focus == runConfigFocusStages {
-			m.runConfig.stageIndex = clamp(m.runConfig.stageIndex+1, 0, 5)
+			m.runConfig.stageIndex = clamp(m.runConfig.stageIndex+1, 0, len(model.AllStages())-1)
 		}
 		return m, cmds
 	case " ":
@@ -242,18 +243,18 @@ func stageSet(stages []string) map[string]bool {
 func defaultStageSet(mode, selectedStage string, staticOnly bool) map[string]bool {
 	plan := stagePlanForMode(mode, selectedStage, staticOnly, nil, "")
 	if len(plan.displayStages) == 0 {
-		return map[string]bool{"F": true}
+		return map[string]bool{string(model.StageF): true}
 	}
 	return stageSet(plan.displayStages)
 }
 
 func nextFromStage(current string) string {
-	order := []string{"", "A", "B", "C", "D", "E", "F"}
+	order := append([]string{""}, model.AllStages()...)
 	current = strings.ToUpper(strings.TrimSpace(current))
 	for i, stage := range order {
 		if stage == current {
 			return order[(i+1)%len(order)]
 		}
 	}
-	return "A"
+	return string(model.StageA)
 }

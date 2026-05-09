@@ -11,7 +11,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	_ "unsafe"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/config"
@@ -22,79 +21,91 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-// Linknames keep mirrored tests out of source directories while preserving
-// coverage for package-private pipeline helpers.
-//
-//go:linkname selectedStages github.com/xuanli520/p2r_tui/internal/pipeline.selectedStages
-func selectedStages(opts pipelinepkg.RunOptions, staticOnly bool) map[string]bool
+type portMapping = pipelinepkg.TestPortMapping
 
-//go:linkname assignFindingIDs github.com/xuanli520/p2r_tui/internal/pipeline.assignFindingIDs
-func assignFindingIDs(stage string, findings []model.Finding) []model.Finding
-
-//go:linkname shortComment github.com/xuanli520/p2r_tui/internal/pipeline.shortComment
-func shortComment(stageStatuses map[string]string, findings []model.Finding) string
-
-//go:linkname readmeComposeCommand github.com/xuanli520/p2r_tui/internal/pipeline.readmeComposeCommand
-func readmeComposeCommand(repoPath string) []string
-
-//go:linkname extractFindingsFromReport github.com/xuanli520/p2r_tui/internal/pipeline.extractFindingsFromReport
-func extractFindingsFromReport(stage, report, sourcePath string) []model.Finding
-
-//go:linkname staticReviewFindingsFromReport github.com/xuanli520/p2r_tui/internal/pipeline.staticReviewFindingsFromReport
-func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.Finding, error)
-
-//go:linkname normalizeStaticReviewReport github.com/xuanli520/p2r_tui/internal/pipeline.normalizeStaticReviewReport
-func normalizeStaticReviewReport(report string) (string, error)
-
-//go:linkname truncateStaticReviewReport github.com/xuanli520/p2r_tui/internal/pipeline.truncateStaticReviewReport
-func truncateStaticReviewReport(report string, limit int) string
-
-//go:linkname staticUnavailableReport github.com/xuanli520/p2r_tui/internal/pipeline.staticUnavailableReport
-func staticUnavailableReport(stage, profile, projectPath, reason string) string
-
-//go:linkname acceptanceFindings github.com/xuanli520/p2r_tui/internal/pipeline.acceptanceFindings
-func acceptanceFindings(path string) []model.Finding
-
-//go:linkname acceptanceScriptArgs github.com/xuanli520/p2r_tui/internal/pipeline.acceptanceScriptArgs
-func acceptanceScriptArgs(outputs map[string]string, projectTypeArgs []string) []string
-
-//go:linkname validationScriptArgs github.com/xuanli520/p2r_tui/internal/pipeline.validationScriptArgs
-func validationScriptArgs(outputs map[string]string, projectTypeArgs []string) []string
-
-//go:linkname runArtifactRoot github.com/xuanli520/p2r_tui/internal/pipeline.runArtifactRoot
-func runArtifactRoot(scanPath string, project scanner.Project, runID string) string
-
-//go:linkname copyPackageSnapshot github.com/xuanli520/p2r_tui/internal/pipeline.copyPackageSnapshot
-func copyPackageSnapshot(source, dest string) error
-
-//go:linkname terminalScreenshotLines github.com/xuanli520/p2r_tui/internal/pipeline.terminalScreenshotLines
-func terminalScreenshotLines(text string) []string
-
-//go:linkname safeCodexExtraArgs github.com/xuanli520/p2r_tui/internal/pipeline.safeCodexExtraArgs
-func safeCodexExtraArgs(args []string) ([]string, error)
-
-//go:linkname capabilitySummary github.com/xuanli520/p2r_tui/internal/pipeline.capabilitySummary
-func capabilitySummary(capability codex.Capability) string
-
-//go:linkname runCodexReviewSessionWithGuidance github.com/xuanli520/p2r_tui/internal/pipeline.runCodexReviewSessionWithGuidance
-func runCodexReviewSessionWithGuidance(ctx context.Context, session pipelinepkg.CodexReviewSession, request pipelinepkg.CodexReviewRequest, deadlines []pipelinepkg.CodexGuidanceDeadline) (pipelinepkg.CodexReviewResult, error)
-
-//go:linkname codexGuidanceSchedule github.com/xuanli520/p2r_tui/internal/pipeline.codexGuidanceSchedule
-func codexGuidanceSchedule(timeout time.Duration, stage string) []pipelinepkg.CodexGuidanceDeadline
-
-type portMapping struct {
-	Service   string
-	URL       string
-	Host      int
-	Container int
-	Protocol  string
+func selectedStages(opts pipelinepkg.RunOptions, staticOnly bool) map[string]bool {
+	return pipelinepkg.SelectedStagesForTest(opts, staticOnly)
 }
 
-//go:linkname parseComposePS github.com/xuanli520/p2r_tui/internal/pipeline.parseComposePS
-func parseComposePS(raw string) (map[string][]portMapping, []string)
+func assignFindingIDs(stage string, findings []model.Finding) []model.Finding {
+	return pipelinepkg.AssignFindingIDsForTest(stage, findings)
+}
 
-//go:linkname parseDockerPort github.com/xuanli520/p2r_tui/internal/pipeline.parseDockerPort
-func parseDockerPort(service, raw string) []portMapping
+func shortComment(stageStatuses map[string]string, findings []model.Finding) string {
+	return pipelinepkg.ShortCommentForTest(stageStatuses, findings)
+}
+
+func readmeComposeCommand(repoPath string) []string {
+	return pipelinepkg.ReadmeComposeCommandForTest(repoPath)
+}
+
+func extractFindingsFromReport(stage, report, sourcePath string) []model.Finding {
+	return pipelinepkg.ExtractFindingsFromReportForTest(stage, report, sourcePath)
+}
+
+func staticReviewFindingsFromReport(stage, report, sourcePath string) ([]model.Finding, error) {
+	return pipelinepkg.StaticReviewFindingsFromReportForTest(stage, report, sourcePath)
+}
+
+func normalizeStaticReviewReport(report string) (string, error) {
+	return pipelinepkg.NormalizeStaticReviewReportForTest(report)
+}
+
+func truncateStaticReviewReport(report string, limit int) string {
+	return pipelinepkg.TruncateStaticReviewReportForTest(report, limit)
+}
+
+func staticUnavailableReport(stage, profile, projectPath, reason string) string {
+	return pipelinepkg.StaticUnavailableReportForTest(stage, profile, projectPath, reason)
+}
+
+func acceptanceFindings(path string) []model.Finding {
+	return pipelinepkg.AcceptanceFindingsForTest(path)
+}
+
+func acceptanceScriptArgs(outputs map[string]string, projectTypeArgs []string) []string {
+	return pipelinepkg.AcceptanceScriptArgsForTest(outputs, projectTypeArgs)
+}
+
+func validationScriptArgs(outputs map[string]string, projectTypeArgs []string) []string {
+	return pipelinepkg.ValidationScriptArgsForTest(outputs, projectTypeArgs)
+}
+
+func runArtifactRoot(scanPath string, project scanner.Project, runID string) string {
+	return pipelinepkg.RunArtifactRootForTest(scanPath, project, runID)
+}
+
+func copyPackageSnapshot(source, dest string) error {
+	return pipelinepkg.CopyPackageSnapshotForTest(source, dest)
+}
+
+func terminalScreenshotLines(text string) []string {
+	return pipelinepkg.TerminalScreenshotLinesForTest(text)
+}
+
+func safeCodexExtraArgs(args []string) ([]string, error) {
+	return pipelinepkg.SafeCodexExtraArgsForTest(args)
+}
+
+func capabilitySummary(capability codex.Capability) string {
+	return pipelinepkg.CapabilitySummaryForTest(capability)
+}
+
+func runCodexReviewSessionWithGuidance(ctx context.Context, session pipelinepkg.CodexReviewSession, request pipelinepkg.CodexReviewRequest, deadlines []pipelinepkg.CodexGuidanceDeadline) (pipelinepkg.CodexReviewResult, error) {
+	return pipelinepkg.RunCodexReviewSessionWithGuidanceForTest(ctx, session, request, deadlines)
+}
+
+func codexGuidanceSchedule(timeout time.Duration, stage string) []pipelinepkg.CodexGuidanceDeadline {
+	return pipelinepkg.CodexGuidanceScheduleForTest(timeout, stage)
+}
+
+func parseComposePS(raw string) (map[string][]portMapping, []string) {
+	return pipelinepkg.ParseComposePSForTest(raw)
+}
+
+func parseDockerPort(service, raw string) []portMapping {
+	return pipelinepkg.ParseDockerPortForTest(service, raw)
+}
 
 func TestSelectedStagesStaticOnly(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{StaticOnly: true}, true)
@@ -194,6 +205,7 @@ func TestRunCanonicalizesStaleDBProjectPath(t *testing.T) {
 	cfg := config.Default()
 	cfg.ScanPath = root
 	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	cfg.Codex.PromptProfilesDir = filepath.Join(t.TempDir(), "missing-prompt-profiles")
 	store, err := db.Open(cfg.DBPath)
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +215,7 @@ func TestRunCanonicalizesStaleDBProjectPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = pipelinepkg.NewRunner(store, cfg).Run(context.Background(), "TASK-STALE", pipelinepkg.RunOptions{Stages: []string{"Z"}})
+	_, err = pipelinepkg.NewRunner(store, cfg).Run(context.Background(), "TASK-STALE", pipelinepkg.RunOptions{Stages: []string{"D"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,6 +232,96 @@ func TestRunCanonicalizesStaleDBProjectPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(run.ArtifactRoot, "logs", "path_warnings.log")); err != nil {
 		t.Fatalf("path warning log should be written: %v", err)
+	}
+}
+
+func TestRunPersistsStageArtifactWarnings(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-WARN")
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profiles := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profiles, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profiles, "tests_coverage_report.md"), []byte("profile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	cfg.Codex.PromptProfilesDir = profiles
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-WARN", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	compatWarningPath := "4_测试有效性报告_api端点真实性.md"
+	result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-WARN", pipelinepkg.RunOptions{
+		Stages: []string{"D"},
+		Progress: func(update pipelinepkg.RunProgress) {
+			if update.Event != "run_created" || update.RunID == "" {
+				return
+			}
+			artifactRoot := runArtifactRoot(root, scanner.Project{TaskID: "TASK-WARN", Batch: "batch-1", Path: projectPath}, update.RunID)
+			if err := os.MkdirAll(filepath.Join(artifactRoot, compatWarningPath), 0o755); err != nil {
+				t.Errorf("block compat path: %v", err)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	warnings, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "artifact_warnings.json"))
+	if err != nil {
+		t.Fatalf("artifact_warnings.json should be written: %v", err)
+	}
+	if !strings.Contains(string(warnings), compatWarningPath) || !strings.Contains(string(warnings), "write_text") {
+		t.Fatalf("artifact warnings missing compat write warning:\n%s", warnings)
+	}
+	stageStatus, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "stage_status.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stageStatus), `"artifact_warnings"`) {
+		t.Fatalf("stage status should retain stage-local warnings:\n%s", stageStatus)
+	}
+}
+
+func TestRunRejectsUnknownStageBeforeCreatingRun(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-BAD-STAGE")
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-BAD-STAGE", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-BAD-STAGE", pipelinepkg.RunOptions{Stages: []string{"Z"}})
+	if err == nil || !strings.Contains(err.Error(), `invalid stage "Z"`) {
+		t.Fatalf("expected invalid stage error, got %v", err)
+	}
+	if _, err := store.LatestRunForTask(ctx, "TASK-BAD-STAGE"); err == nil {
+		t.Fatal("invalid stage should not create a run")
 	}
 }
 

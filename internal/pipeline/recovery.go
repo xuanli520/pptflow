@@ -61,7 +61,7 @@ func recoverStaleRun(ctx context.Context, store *db.Store, cfg config.Config, ru
 	if reason == "" {
 		reason = "历史 running 记录已失联"
 	}
-	runner := Runner{store: store, cfg: cfg}
+	runner := NewRunner(store, cfg)
 	stages, _ := store.Stages(ctx, run.RunID)
 	selected := selectedStagesForRecovery(run, manifest)
 	now := time.Now().UTC()
@@ -69,7 +69,7 @@ func recoverStaleRun(ctx context.Context, store *db.Store, cfg config.Config, ru
 	for _, stage := range stages {
 		byStage[stage.Stage] = stage
 	}
-	for _, letter := range []string{"A", "B", "C", "D", "E", "F"} {
+	for _, letter := range model.AllStages() {
 		if !selected[letter] {
 			continue
 		}
@@ -136,7 +136,7 @@ func selectedStagesForRecovery(run model.RunRecord, manifest recoveryManifest) m
 func expectedRunDuration(run model.RunRecord, manifest recoveryManifest, cfg config.Config) time.Duration {
 	selected := selectedStagesForRecovery(run, manifest)
 	var total time.Duration
-	for _, stage := range []string{"A", "B", "C", "D", "E", "F"} {
+	for _, stage := range model.AllStages() {
 		if !selected[stage] {
 			continue
 		}

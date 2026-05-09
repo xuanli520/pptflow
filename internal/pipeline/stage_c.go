@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
@@ -21,16 +20,23 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	summaryPath := filepath.Join(run.ArtifactRoot, "test_runtime_summary.json")
 	record.LogPath = logPath
 	record.ArtifactPaths = append(record.ArtifactPaths, logPath, screenshotPath, summaryPath)
+	writer := NewArtifactWriter(run.ArtifactRoot)
+	recordRequiredEvidence := func(evidence string, summary map[string]any) {
+		record = requiredStageText(record, writer, writer.RelativePath(logPath), evidence)
+		pages, err := renderLogFile(logPath, screenshotPath)
+		if err != nil {
+			record = recordArtifactWriteError(record, err, screenshotPath)
+		}
+		record.ArtifactPaths = append([]string{logPath}, pages...)
+		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
+		record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), summary)
+	}
 	repoPath := filepath.Join(project.Path, "repo")
 	script := filepath.Join(repoPath, "run_tests.sh")
 	if !fileExists(script) {
 		evidence := "Package spec violation: repo/run_tests.sh was not found. Stage C uses the host run_tests.sh entrypoint only."
-		_ = writeText(logPath, evidence)
-		pages, _ := renderLogFile(logPath, screenshotPath)
-		record.ArtifactPaths = append([]string{logPath}, pages...)
-		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-		_ = writeJSON(summaryPath, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
-		record.Findings = []model.Finding{{
+		recordRequiredEvidence(evidence, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
 			Title:      "Unified test entrypoint is missing",
@@ -38,8 +44,10 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 			Evidence:   evidence,
 			Impact:     "Runtime test evidence cannot be collected.",
 			MinimumFix: "Add a runnable repo/run_tests.sh entrypoint.",
-		}}
-		record.ErrorSummary = evidence
+		})
+		if record.ErrorSummary == "" {
+			record.ErrorSummary = evidence
+		}
 		return finishStage(record, model.StageFailed, start)
 	}
 	runtime, runtimeErr := readRuntimeEvidence(filepath.Join(run.ArtifactRoot, "port_map.json"))
@@ -48,12 +56,8 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		if runtimeErr != nil {
 			evidence = runtimeErr.Error()
 		}
-		_ = writeText(logPath, evidence)
-		pages, _ := renderLogFile(logPath, screenshotPath)
-		record.ArtifactPaths = append([]string{logPath}, pages...)
-		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-		_ = writeJSON(summaryPath, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
-		record.Findings = []model.Finding{{
+		recordRequiredEvidence(evidence, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
 			Title:      "Stage B runtime evidence is missing",
@@ -61,19 +65,17 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 			Evidence:   evidence,
 			Impact:     "Runtime test evidence cannot be collected from host service URLs.",
 			MinimumFix: "Rerun B successfully and ensure published ports are recorded.",
-		}}
-		record.ErrorSummary = evidence
+		})
+		if record.ErrorSummary == "" {
+			record.ErrorSummary = evidence
+		}
 		return finishStage(record, model.StageFailed, start)
 	}
 	bash := findHostBash(r.exec)
 	if bash == "" {
 		evidence := "bash executable not found on PATH. Stage C requires host bash to run repo/run_tests.sh."
-		_ = writeText(logPath, evidence)
-		pages, _ := renderLogFile(logPath, screenshotPath)
-		record.ArtifactPaths = append([]string{logPath}, pages...)
-		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-		_ = writeJSON(summaryPath, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
-		record.Findings = []model.Finding{{
+		recordRequiredEvidence(evidence, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
 			Title:      "bash unavailable for host runtime tests",
@@ -81,8 +83,10 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 			Evidence:   evidence,
 			Impact:     "Runtime test evidence cannot be collected.",
 			MinimumFix: "Install bash, such as Git Bash on Windows, and rerun C.",
-		}}
-		record.ErrorSummary = evidence
+		})
+		if record.ErrorSummary == "" {
+			record.ErrorSummary = evidence
+		}
 		return finishStage(record, model.StageFailed, start)
 	}
 	stageEnv := stageCEnvironment(runtime)
@@ -90,7 +94,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	timeout := r.stageTimeout("C", 300)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		record.ErrorSummary = err.Error()
+		record = recordArtifactWriteError(record, err, logPath)
 		return finishStage(record, model.StageFailed, start)
 	}
 	fmt.Fprintln(logFile, "=== C host run_tests.sh start ===")
@@ -104,14 +108,17 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	_ = logFile.Close()
 	log := result.Command + "\n\nSTDOUT:\n" + result.Stdout + "\nSTDERR:\n" + result.Stderr
 	if strings.TrimSpace(result.Stdout+result.Stderr) == "" {
-		_ = appendText(logPath, log)
+		bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), log)
 	}
-	pages, _ := renderLogFile(logPath, screenshotPath)
+	pages, renderErr := renderLogFile(logPath, screenshotPath)
+	if renderErr != nil {
+		record = recordArtifactWriteError(record, renderErr, screenshotPath)
+	}
 	record.ArtifactPaths = append([]string{logPath}, pages...)
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-	_ = writeJSON(summaryPath, map[string]any{"ok": result.Err == nil, "exit_code": result.ExitCode, "timeout": result.Timeout, "mode": "host", "script": "repo/run_tests.sh", "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "compose_project": runtime.ComposeProject})
+	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), map[string]any{"ok": result.Err == nil, "exit_code": result.ExitCode, "timeout": result.Timeout, "mode": "host", "script": "repo/run_tests.sh", "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "compose_project": runtime.ComposeProject})
 	if result.Err != nil {
-		record.Findings = []model.Finding{{
+		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
 			Title:      "run_tests runtime evidence failed",
@@ -119,14 +126,16 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 			Evidence:   strings.TrimSpace(result.Stderr),
 			Impact:     "The delivery package does not currently have passing runtime test evidence.",
 			MinimumFix: "Fix the test entrypoint or application runtime and rerun C.",
-		}}
-		record.ErrorSummary = "run_tests failed"
+		})
+		if record.ErrorSummary == "" {
+			record.ErrorSummary = "run_tests failed"
+		}
 		return finishStage(record, model.StageFailed, start)
 	}
 	return finishStage(record, model.StageDone, start)
 }
 
-func findHostBash(exec executor.Runner) string {
+func findHostBash(exec CommandRunner) string {
 	if path, err := exec.LookPath("bash"); err == nil {
 		return path
 	}

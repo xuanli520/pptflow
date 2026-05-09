@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	record := startStage("B")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "B_docker.log")
 	record.LogPath = logPath
+	writer := NewArtifactWriter(run.ArtifactRoot)
 	portMapPath := filepath.Join(run.ArtifactRoot, "port_map.json")
 	screenshotPath := filepath.Join(run.ArtifactRoot, "5_Docker启动截图.png")
 	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, screenshotPath)
@@ -65,27 +67,24 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		record.Findings = []model.Finding{{
-			Stage:      "B",
-			Severity:   "High",
-			Title:      "Docker runtime log could not be opened",
-			Rule:       "Stage B must persist Docker runtime logs.",
-			Evidence:   err.Error(),
-			Impact:     "Runtime evidence cannot be audited.",
-			MinimumFix: "Ensure the artifact directory is writable and rerun Stage B.",
-		}}
-		record.ErrorSummary = err.Error()
-		return finishStage(record, model.StageFailed, start)
+		recordArtifactWarning(&record, newArtifactWarning(writer.RelativePath(logPath), "write_text", false, err))
+		logFile = nil
 	}
-	defer logFile.Close()
+	if logFile != nil {
+		defer logFile.Close()
+	}
+	logWriter := io.Writer(io.Discard)
+	if logFile != nil {
+		logWriter = logFile
+	}
 	runDockerStep := func(name string, timeout time.Duration, args []string, required bool) executor.Result {
-		fmt.Fprintf(logFile, "=== %s start ===\n", name)
+		fmt.Fprintf(logWriter, "=== %s start ===\n", name)
 		if len(args) == 0 {
-			fmt.Fprintf(logFile, "%s skipped\n=== %s end: skipped ===\n\n", name, name)
+			fmt.Fprintf(logWriter, "%s skipped\n=== %s end: skipped ===\n\n", name, name)
 			return executor.Result{}
 		}
-		result := r.exec.RunStreaming(ctx, timeout, workDir, nil, logFile, "docker", args...)
-		fmt.Fprintf(logFile, "\n=== %s end: exit=%d timeout=%t err=%v ===\n\n", name, result.ExitCode, result.Timeout, result.Err)
+		result := r.exec.RunStreaming(ctx, timeout, workDir, nil, logWriter, "docker", args...)
+		fmt.Fprintf(logWriter, "\n=== %s end: exit=%d timeout=%t err=%v ===\n\n", name, result.ExitCode, result.Timeout, result.Err)
 		if result.Err != nil && required {
 			_, _ = renderLogFile(logPath, screenshotPath)
 		}
@@ -123,19 +122,19 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	mappings, services := parseComposePS(ps.Stdout)
 	if ps.Err != nil || len(mappings) == 0 {
 		fallbackMappings, fallbackServices, fallbackLog := r.dockerPortFallback(ctx, workDir, psQArgs, servicesArgs)
-		_, _ = logFile.WriteString(fallbackLog)
+		_, _ = logWriter.Write([]byte(fallbackLog))
 		if len(fallbackMappings) > 0 {
 			mappings = fallbackMappings
 			services = fallbackServices
 		}
 	}
-	fmt.Fprintln(logFile, "=== B4 health check probe start ===")
+	fmt.Fprintln(logWriter, "=== B4 health check probe start ===")
 	probes := probeMappings(mappings, minDuration(r.stageTimeout("B_HEALTH", 60), time.Duration(r.cfg.Docker.HealthCheckTimeoutSeconds)*time.Second))
 	for _, probe := range probes {
-		fmt.Fprintf(logFile, "%s %s ok=%t status=%d error=%s\n", probe.Service, probe.URL, probe.OK, probe.Status, probe.Error)
+		fmt.Fprintf(logWriter, "%s %s ok=%t status=%d error=%s\n", probe.Service, probe.URL, probe.OK, probe.Status, probe.Error)
 	}
-	fmt.Fprintln(logFile, "=== B4 health check probe end ===")
-	_ = writeJSON(portMapPath, map[string]any{
+	fmt.Fprintln(logWriter, "=== B4 health check probe end ===")
+	portMap := map[string]any{
 		"run_id":          run.RunID,
 		"compose_project": projectName,
 		"compose_file":    compose,
@@ -157,7 +156,11 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			"B_HEALTH": int(r.stageTimeout("B_HEALTH", 60).Seconds()),
 			"B_PORT":   int(r.stageTimeout("B_PORT", 30).Seconds()),
 		},
-	})
+	}
+	if err := writer.RequiredJSON("port_map.json", portMap); err != nil {
+		record = recordArtifactWriteError(record, err, portMapPath)
+		return finishStage(record, model.StageFailed, start)
+	}
 	pages, _ := renderLogFile(logPath, screenshotPath)
 	record.ArtifactPaths = []string{portMapPath}
 	record.ArtifactPaths = append(record.ArtifactPaths, pages...)
@@ -214,20 +217,23 @@ func (r Runner) dockerPortFallback(ctx context.Context, workDir string, psQArgs,
 }
 
 func (r Runner) failB(record model.StageRecord, start time.Time, logPath, portMapPath, screenshotPath string, meta map[string]any, evidence, fix string) model.StageRecord {
+	writer := NewArtifactWriter(filepath.Dir(portMapPath))
 	if fileExists(logPath) {
-		_ = appendText(logPath, "\nERROR SUMMARY:\n"+evidence+"\n")
+		bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), "\nERROR SUMMARY:\n"+evidence+"\n")
 	} else {
-		_ = writeText(logPath, evidence)
+		bestEffortStageText(&record, writer, writer.RelativePath(logPath), evidence)
 	}
 	payload := map[string]any{"mappings": map[string]any{}, "reason": evidence}
 	for key, value := range meta {
 		payload[key] = value
 	}
-	_ = writeJSON(portMapPath, payload)
+	if err := writer.RequiredJSON(filepath.Base(portMapPath), payload); err != nil {
+		record = recordArtifactWriteError(record, err, portMapPath)
+	}
 	pages, _ := renderLogFile(logPath, screenshotPath)
 	record.ArtifactPaths = []string{portMapPath}
 	record.ArtifactPaths = append(record.ArtifactPaths, pages...)
-	record.Findings = []model.Finding{{
+	record.Findings = append(record.Findings, model.Finding{
 		Stage:      "B",
 		Severity:   "High",
 		Title:      "Docker runtime evidence was not collected",
@@ -235,8 +241,10 @@ func (r Runner) failB(record model.StageRecord, start time.Time, logPath, portMa
 		Evidence:   evidence,
 		Impact:     "Stage C runtime tests cannot run from this evidence chain.",
 		MinimumFix: fix,
-	}}
-	record.ErrorSummary = evidence
+	})
+	if record.ErrorSummary == "" {
+		record.ErrorSummary = evidence
+	}
 	return finishStage(record, model.StageFailed, start)
 }
 

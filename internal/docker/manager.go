@@ -46,7 +46,7 @@ type CleanupSummary struct {
 	Warnings       []string `json:"warnings,omitempty"`
 }
 
-func CleanupComposeProject(ctx context.Context, exec executor.Runner, cfg config.DockerConfig, composeFile, projectName, workDir string) CleanupSummary {
+func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig, composeFile, projectName, workDir string) CleanupSummary {
 	summary := CleanupSummary{Status: "not_applicable", ComposeFile: composeFile, ComposeProject: projectName, WorkDir: workDir}
 	if strings.TrimSpace(projectName) == "" {
 		summary.Warnings = append(summary.Warnings, "compose project is empty")

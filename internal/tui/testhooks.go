@@ -401,6 +401,38 @@ func ShortTimeForTest(value string) string {
 	return shortTime(value)
 }
 
+func LocalizeRunStatusForTest(status string) string {
+	return localizeRunStatus(status)
+}
+
+func LocalizeStageStatusForTest(status string) string {
+	return localizeStageStatus(status)
+}
+
+func LocalizeManualVerdictForTest(verdict string) string {
+	return localizeManualVerdict(verdict)
+}
+
+func LocalizeSeverityForTest(severity string) string {
+	return localizeSeverity(severity)
+}
+
+func LocalizeStageNameForTest(stage, name string) string {
+	return localizeStageName(stage, name)
+}
+
+func LocalizeCleanupStatusForTest(status string) string {
+	return localizeCleanupStatus(status)
+}
+
+func LocalizeSummaryForTest(summary string) string {
+	return localizeSummary(summary)
+}
+
+func StageLogPreviewForTest(path string, maxLines int) string {
+	return stageLogPreview(path, maxLines)
+}
+
 func ExecutionLayoutModeForTest(width, height int) string {
 	switch layoutFor(width, height, true).mode {
 	case layoutWide:

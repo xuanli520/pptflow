@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,13 @@ import (
 type taskRunLock struct {
 	path string
 	file *os.File
+}
+
+type cleanupOutcome struct {
+	Summary            dockermgr.CleanupSummary
+	Finding            *model.Finding
+	PersistErrors      []error
+	RuntimeCleanupDone bool
 }
 
 func (r Runner) acquireTaskRunLock(taskID string) (taskRunLock, error) {
@@ -75,8 +83,7 @@ func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, 
 		if err != nil {
 			summary.Warnings = append(summary.Warnings, "runtime evidence unavailable: "+err.Error())
 		}
-		_ = writeJSON(filepath.Join(run.ArtifactRoot, "cleanup_summary.json"), summary)
-		return summary
+		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
 	if keepRuntime {
 		args := cleanupCommand(evidence.ComposeFile, evidence.ComposeProject)
@@ -87,23 +94,86 @@ func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, 
 			WorkDir:        evidence.WorkDir,
 			ManualCommand:  strings.Join(append([]string{"docker"}, args...), " "),
 		}
-		_ = writeJSON(filepath.Join(run.ArtifactRoot, "cleanup_summary.json"), summary)
-		return summary
+		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
 	summary := dockermgr.CleanupComposeProject(ctx, r.exec, r.cfg.Docker, evidence.ComposeFile, evidence.ComposeProject, evidence.WorkDir)
-	_ = writeJSON(filepath.Join(run.ArtifactRoot, "cleanup_summary.json"), summary)
+	return writeCleanupSummary(run.ArtifactRoot, summary)
+}
+
+func (r Runner) finalizeRuntime(ctx context.Context, run model.RunRecord, stages []model.StageRecord, keepRuntime bool, reason string) cleanupOutcome {
+	outcome := cleanupOutcome{
+		Summary:            dockermgr.CleanupSummary{Status: "not_applicable"},
+		RuntimeCleanupDone: true,
+	}
+	if !runtimeStageWasSelected(stages) {
+		return outcome
+	}
+	outcome.Summary = r.cleanupCurrentRuntime(ctx, run, keepRuntime)
+	if err := mergeCleanupIntoManifest(filepath.Join(run.ArtifactRoot, "run_manifest.json"), "cleanup", outcome.Summary); err != nil {
+		outcome.PersistErrors = append(outcome.PersistErrors, fmt.Errorf("merge cleanup into run_manifest.json: %w", err))
+	}
+	if outcome.Summary.Status == "failed" {
+		finding := cleanupFinding(outcome.Summary)
+		outcome.Finding = &finding
+		if r.store != nil {
+			if err := r.store.InsertFindings(ctx, run.RunID, []model.Finding{finding}); err != nil {
+				outcome.PersistErrors = append(outcome.PersistErrors, fmt.Errorf("insert cleanup finding: %w", err))
+			}
+		}
+	}
+	outcome.RuntimeCleanupDone = cleanupDoneForReason(ctx, outcome.Summary, reason)
+	return outcome
+}
+
+func cleanupDoneForReason(ctx context.Context, summary dockermgr.CleanupSummary, reason string) bool {
+	if summary.Status != "failed" {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(reason), "normal") && ctx.Err() == nil {
+		return true
+	}
+	return false
+}
+
+func cleanupPersistErrorStrings(outcome cleanupOutcome) []string {
+	result := make([]string, 0, len(outcome.PersistErrors))
+	for _, err := range outcome.PersistErrors {
+		if err != nil {
+			result = append(result, err.Error())
+		}
+	}
+	return result
+}
+
+func cleanupPersistError(outcome cleanupOutcome) error {
+	if len(outcome.PersistErrors) == 0 {
+		return nil
+	}
+	return errors.Join(outcome.PersistErrors...)
+}
+
+func writeCleanupSummary(artifactRoot string, summary dockermgr.CleanupSummary) dockermgr.CleanupSummary {
+	if err := NewArtifactWriter(artifactRoot).RequiredJSON("cleanup_summary.json", summary); err != nil {
+		if summary.Status != "failed" {
+			summary.Status = "failed"
+		}
+		if strings.TrimSpace(summary.Error) == "" {
+			summary.Error = err.Error()
+		}
+		summary.Warnings = append(summary.Warnings, "cleanup summary artifact write failed: "+err.Error())
+	}
 	return summary
 }
 
 func runtimeCleanupPoint(stage string, stages []model.StageRecord) bool {
-	if stage == "C" {
+	if stage == string(model.StageC) {
 		return true
 	}
-	if stage != "B" {
+	if stage != string(model.StageB) {
 		return false
 	}
 	for _, item := range stages {
-		if item.Stage == "C" && item.Status != model.StageSkipped {
+		if item.Stage == string(model.StageC) && item.Status != model.StageSkipped {
 			return false
 		}
 	}
@@ -112,7 +182,7 @@ func runtimeCleanupPoint(stage string, stages []model.StageRecord) bool {
 
 func runtimeStageWasSelected(stages []model.StageRecord) bool {
 	for _, item := range stages {
-		if (item.Stage == "B" || item.Stage == "C") && item.Status != model.StageSkipped {
+		if model.IsRuntimeStage(item.Stage) && item.Status != model.StageSkipped {
 			return true
 		}
 	}
@@ -168,17 +238,20 @@ func staleTaskRunLock(path string) bool {
 	return !processAlive(pid)
 }
 
-func mergeCleanupIntoManifest(path string, key string, value any) {
+func mergeCleanupIntoManifest(path string, key string, value any) error {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 	var data map[string]any
-	if json.Unmarshal(content, &data) != nil {
-		return
+	if err := json.Unmarshal(content, &data); err != nil {
+		return err
 	}
 	data[key] = value
-	_ = writeJSON(path, data)
+	return writeJSON(path, data)
 }
 
 func cleanupFinding(summary dockermgr.CleanupSummary) model.Finding {

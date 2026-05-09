@@ -22,6 +22,7 @@ const (
 	JobQueued JobState = iota
 	JobRunning
 	JobDone
+	JobCancelled
 	JobFailed
 )
 
@@ -33,6 +34,8 @@ func (s JobState) String() string {
 		return "running"
 	case JobDone:
 		return "done"
+	case JobCancelled:
+		return "cancelled"
 	case JobFailed:
 		return "failed"
 	default:
@@ -75,23 +78,40 @@ type JobSnapshot struct {
 	CancelRequested bool
 }
 
-type Scheduler struct {
-	store        *db.Store
-	cfg          config.Config
-	maxParallel  int
-	sem          chan struct{}
-	mu           sync.Mutex
-	jobs         []*Job
-	queue        []*Job
-	jobByID      map[string]*Job
-	activeByTask map[string]*Job
-	notifyCh     chan struct{}
-	closed       bool
-	nextID       int
-	wg           sync.WaitGroup
+type PipelineRunner interface {
+	Run(context.Context, string, pipeline.RunOptions) (pipeline.Result, error)
 }
 
-func New(store *db.Store, cfg config.Config) *Scheduler {
+type RunnerFactory func(*db.Store, config.Config) PipelineRunner
+
+type Option func(*Scheduler)
+
+type Scheduler struct {
+	store         *db.Store
+	cfg           config.Config
+	runnerFactory RunnerFactory
+	maxParallel   int
+	sem           chan struct{}
+	mu            sync.Mutex
+	jobs          []*Job
+	queue         []*Job
+	jobByID       map[string]*Job
+	activeByTask  map[string]*Job
+	notifyCh      chan struct{}
+	closed        bool
+	nextID        int
+	wg            sync.WaitGroup
+}
+
+func WithRunnerFactory(factory RunnerFactory) Option {
+	return func(s *Scheduler) {
+		if factory != nil {
+			s.runnerFactory = factory
+		}
+	}
+}
+
+func New(store *db.Store, cfg config.Config, opts ...Option) *Scheduler {
 	maxParallel := cfg.Pipeline.MaxConcurrent
 	if maxParallel <= 0 {
 		maxParallel = 3
@@ -99,15 +119,26 @@ func New(store *db.Store, cfg config.Config) *Scheduler {
 	if maxParallel > 8 {
 		maxParallel = 8
 	}
-	return &Scheduler{
-		store:        store,
-		cfg:          cfg,
-		maxParallel:  maxParallel,
-		sem:          make(chan struct{}, maxParallel),
-		jobByID:      map[string]*Job{},
-		activeByTask: map[string]*Job{},
-		notifyCh:     make(chan struct{}, 1),
+	s := &Scheduler{
+		store:         store,
+		cfg:           cfg,
+		runnerFactory: defaultRunnerFactory,
+		maxParallel:   maxParallel,
+		sem:           make(chan struct{}, maxParallel),
+		jobByID:       map[string]*Job{},
+		activeByTask:  map[string]*Job{},
+		notifyCh:      make(chan struct{}, 1),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
+}
+
+func defaultRunnerFactory(store *db.Store, cfg config.Config) PipelineRunner {
+	return pipeline.NewRunner(store, cfg)
 }
 
 func (s *Scheduler) Submit(taskID string, opts pipeline.RunOptions) (string, error) {
@@ -360,7 +391,7 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 	opts.Progress = func(update pipeline.RunProgress) {
 		s.applyProgress(job, update)
 	}
-	result, err := pipeline.NewRunner(s.store, s.cfg).Run(ctx, job.TaskID, opts)
+	result, err := s.runnerFactory(s.store, s.cfg).Run(ctx, job.TaskID, opts)
 	job.mu.Lock()
 	if job.cancelRequested {
 		if result.Run.RunID != "" {
@@ -395,10 +426,10 @@ func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {
 	}
 	if job.cancelRequested {
 		switch update.Event {
-		case "stage_running":
+		case pipeline.EventStageRunning:
 			job.CurrentStage = update.Stage
-		case "stage_done", "run_done", "run_crashed":
-			if job.CurrentStage == update.Stage || update.Event != "stage_done" {
+		case pipeline.EventStageDone, pipeline.EventRunDone, pipeline.EventRunAborted, pipeline.EventRunCrashed:
+			if job.CurrentStage == update.Stage || update.Event != pipeline.EventStageDone {
 				job.CurrentStage = ""
 			}
 		}
@@ -410,26 +441,34 @@ func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {
 		return
 	}
 	switch update.Event {
-	case "stage_running":
+	case pipeline.EventStageRunning:
 		job.State = JobRunning
 		job.CurrentStage = update.Stage
-	case "stage_done":
+	case pipeline.EventStageDone:
 		if job.CurrentStage == update.Stage {
 			job.CurrentStage = ""
 		}
-	case "run_done":
+	case pipeline.EventRunDone:
 		job.State = JobDone
 		job.Err = nil
 		job.CurrentStage = ""
 		job.FinishedAt = time.Now().UTC()
-	case "run_crashed":
+	case pipeline.EventRunAborted:
+		job.State = JobCancelled
+		job.Err = ErrJobCancelledByUser
+		job.CurrentStage = ""
+		job.FinishedAt = time.Now().UTC()
+	case pipeline.EventRunCrashed:
 		job.State = JobFailed
 		job.Err = firstErr(update.Err, errors.New("pipeline crashed"))
 		job.CurrentStage = ""
 		job.FinishedAt = time.Now().UTC()
 	}
 	if update.Done {
-		if update.Err != nil {
+		if update.Event == pipeline.EventRunAborted {
+			job.State = JobCancelled
+			job.Err = ErrJobCancelledByUser
+		} else if update.Err != nil {
 			job.State = JobFailed
 			job.Err = update.Err
 		} else if job.State != JobFailed {
@@ -512,7 +551,7 @@ func applyResultLocked(job *Job, result pipeline.Result) {
 }
 
 func finishCancelledJobLocked(job *Job, now time.Time) {
-	job.State = JobFailed
+	job.State = JobCancelled
 	job.Err = ErrJobCancelledByUser
 	job.FinishedAt = now
 	job.CurrentStage = ""

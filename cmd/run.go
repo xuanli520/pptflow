@@ -1,13 +1,13 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
 func newRunCommand() *cobra.Command {
@@ -44,7 +44,7 @@ func newRunCommand() *cobra.Command {
 			}
 			defer store.Close()
 			runner := pipeline.NewRunner(store, cfg)
-			result, err := runner.Run(context.Background(), args[0], pipeline.RunOptions{Stage: stage, From: from, StaticOnly: staticOnly, Mode: mode, RefRun: refRun, ExtraDocs: extraDocs, KeepRuntime: keepRuntime})
+			result, err := runner.Run(cmd.Context(), args[0], pipeline.RunOptions{Stage: stage, From: from, StaticOnly: staticOnly, Mode: mode, RefRun: refRun, ExtraDocs: extraDocs, KeepRuntime: keepRuntime})
 			if err != nil {
 				return err
 			}
@@ -71,10 +71,5 @@ func newRunCommand() *cobra.Command {
 }
 
 func validStage(stage string) bool {
-	switch stage {
-	case "A", "B", "C", "D", "E", "F":
-		return true
-	default:
-		return false
-	}
+	return model.IsStageID(stage)
 }

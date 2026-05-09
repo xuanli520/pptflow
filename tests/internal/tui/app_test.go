@@ -5,13 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	_ "unsafe"
 
-	_ "github.com/xuanli520/p2r_tui/internal/tui"
+	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
-
-//go:linkname stageLogPreview github.com/xuanli520/p2r_tui/internal/tui.stageLogPreview
-func stageLogPreview(path string, maxLines int) string
 
 func TestStageLogPreviewTailsConfiguredLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "A_validate.log")
@@ -19,7 +15,7 @@ func TestStageLogPreviewTailsConfiguredLines(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	preview := stageLogPreview(path, 2)
+	preview := tuiapp.StageLogPreviewForTest(path, 2)
 	if !strings.Contains(preview, "Log: "+path) {
 		t.Fatalf("preview missing log path: %s", preview)
 	}

@@ -5,15 +5,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	_ "unsafe"
 
+	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/projectlayout"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-//go:linkname structuralFindings github.com/xuanli520/p2r_tui/internal/pipeline.structuralFindings
-func structuralFindings(project scanner.Project, required map[string]bool) []model.Finding
+func structuralFindings(project scanner.Project, required map[string]bool) []model.Finding {
+	return pipelinepkg.StructuralFindingsForTest(project, required)
+}
 
 func TestStageAAcceptsAlternativeOriginalSessionMarkers(t *testing.T) {
 	for _, marker := range []string{filepath.Join("docs", "original-session"), filepath.Join("docs", "original_sessions")} {
