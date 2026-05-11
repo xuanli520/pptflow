@@ -8,6 +8,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
@@ -194,6 +195,27 @@ func (h TestHarness) SeedExecutionDetail(taskID string) TestHarness {
 	return h
 }
 
+func (h TestHarness) SeedExecutionRun(taskID, runID string, stages []model.StageRecord, selected string) TestHarness {
+	h = h.SeedOverview(taskID)
+	h.model.tab = panelExecution
+	h.model.detailVM = executionViewModel{
+		TaskID:                taskID,
+		HasRun:                true,
+		Run:                   model.RunRecord{RunID: runID, TaskID: taskID, Status: model.RunRunning},
+		ArtifactRoot:          "/tmp/artifacts",
+		Stages:                normalizeStageViews(stages),
+		DocsSummary:           docsSummary{ManifestPath: "/tmp/manifest.json"},
+		LogTailByStage:        map[string]string{},
+		GuidanceEventsByStage: map[string][]string{},
+		StreamByStage:         map[string]pipeline.StreamUpdate{},
+	}
+	h.model.selectedStageKey = selected
+	h.model.syncStageSelection()
+	h.model.updateDetailContent(true)
+	h.model.setFocus(focusStageList)
+	return h
+}
+
 func (h TestHarness) View() string {
 	return h.model.View()
 }
@@ -336,6 +358,10 @@ func (h TestHarness) SelectedRefRun() string {
 
 func (h TestHarness) DetailYOffset() int {
 	return h.model.detail.YOffset
+}
+
+func (h TestHarness) DetailFollowTail() bool {
+	return h.model.detailFollowTail
 }
 
 func (h TestHarness) TabName() string {
@@ -513,7 +539,7 @@ func BuildExecutionProbeForTest(ctx context.Context, store *db.Store, cfg config
 		DocsManifestExists: vm.DocsSummary.ManifestExists,
 		CleanupStatus:      vm.CleanupStatus,
 		CleanupText:        vm.CleanupText,
-		DetailContent:      buildDetailContent(vm, selectedStage, width),
+		DetailContent:      buildDetailContent(vm, selectedStage, width, 24),
 	}
 	for _, run := range vm.RefRuns {
 		probe.RefRunIDs = append(probe.RefRunIDs, run.RunID)

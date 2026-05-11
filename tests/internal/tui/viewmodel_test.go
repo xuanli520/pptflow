@@ -2,6 +2,7 @@ package tui_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,8 +10,10 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
 
@@ -156,6 +159,163 @@ func TestProjectReloadRequestsDetailRefreshForSameTask(t *testing.T) {
 	_, hasCmd := h.ApplyProjectReloadForTest()
 	if !hasCmd {
 		t.Fatal("project reload for selected task should request detail refresh")
+	}
+}
+
+func TestExecutionDetailMergesRunningCodexStream(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+			{Stage: "D", Status: model.StageRunning},
+		}, "D").
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-1",
+			RunID:  "run-1",
+			TaskID: "TASK-1",
+			State:  scheduler.JobRunning,
+			StreamByStage: map[string]pipeline.StreamUpdate{
+				"D": {Stage: "D", Mode: pipeline.StreamModeCumulative, ItemID: "item-1", Text: "正在生成 Codex 审查正文", Truncated: true},
+			},
+		}})
+
+	view := h.View()
+	for _, want := range []string{"正在生成 Codex 审查正文", "预览已截断", "运行证据"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("stream detail missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestExecutionDetailRendersAppendStreamAndClearsAfterReload(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+			{Stage: "B", Status: model.StageRunning},
+		}, "B").
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-1",
+			RunID:  "run-1",
+			TaskID: "TASK-1",
+			State:  scheduler.JobRunning,
+			StreamByStage: map[string]pipeline.StreamUpdate{
+				"B": {
+					Stage: "B",
+					Mode:  pipeline.StreamModeAppend,
+					Lines: []pipeline.StreamLine{
+						{Source: "stdout", Text: "container healthy"},
+						{Source: "stderr", Text: "warning from docker"},
+					},
+				},
+			},
+		}})
+	if view := h.View(); !strings.Contains(view, "container healthy") || !strings.Contains(view, "[stderr] warning from docker") {
+		t.Fatalf("append stream not rendered:\n%s", view)
+	}
+
+	h = h.SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+		{Stage: "B", Status: model.StageDone},
+	}, "B").ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+		JobID:  "job-1",
+		RunID:  "run-1",
+		TaskID: "TASK-1",
+		State:  scheduler.JobRunning,
+		StreamByStage: map[string]pipeline.StreamUpdate{
+			"B": {Stage: "B", Mode: pipeline.StreamModeAppend, Lines: []pipeline.StreamLine{{Source: "stdout", Text: "old output"}}},
+		},
+	}})
+	if view := h.View(); strings.Contains(view, "old output") {
+		t.Fatalf("stream should not render once DB state marks stage non-running:\n%s", view)
+	}
+}
+
+func TestExecutionDetailKeepsFinishedJobStreamUntilDBConfirmsStageDone(t *testing.T) {
+	finishedJob := scheduler.JobSnapshot{
+		JobID:  "job-1",
+		RunID:  "run-1",
+		TaskID: "TASK-1",
+		State:  scheduler.JobDone,
+		StreamByStage: map[string]pipeline.StreamUpdate{
+			"C": {
+				Stage: "C",
+				Mode:  pipeline.StreamModeAppend,
+				Done:  true,
+				Lines: []pipeline.StreamLine{
+					{Source: "stdout", Text: "last observed test output"},
+				},
+			},
+		},
+	}
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+			{Stage: "C", Status: model.StageRunning},
+		}, "C").
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{finishedJob})
+	if view := h.View(); !strings.Contains(view, "last observed test output") {
+		t.Fatalf("finished job stream should remain while DB still says running:\n%s", view)
+	}
+
+	h = h.SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+		{Stage: "C", Status: model.StageDone},
+	}, "C").ApplySchedulerJobsForTest([]scheduler.JobSnapshot{finishedJob})
+	if view := h.View(); strings.Contains(view, "last observed test output") {
+		t.Fatalf("stream should clear after DB confirms stage done:\n%s", view)
+	}
+}
+
+func TestDetailFollowTailStopsAfterPageUpAndResumesAtEnd(t *testing.T) {
+	lines := make([]pipeline.StreamLine, 0, 40)
+	for i := 0; i < 40; i++ {
+		lines = append(lines, pipeline.StreamLine{Source: "stdout", Text: fmt.Sprintf("line-%02d", i)})
+	}
+	h := tuiapp.NewTestHarness(config.Default()).
+		SetSize(100, 24).
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+			{Stage: "C", Status: model.StageRunning},
+		}, "C").
+		SetFocus("detail-viewport").
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-1",
+			RunID:  "run-1",
+			TaskID: "TASK-1",
+			State:  scheduler.JobRunning,
+			StreamByStage: map[string]pipeline.StreamUpdate{
+				"C": {Stage: "C", Mode: pipeline.StreamModeAppend, Lines: lines},
+			},
+		}})
+	if h.DetailYOffset() == 0 {
+		t.Fatal("running stream should follow the bottom by default")
+	}
+	h, _ = h.Press("pgup")
+	offsetAfterPageUp := h.DetailYOffset()
+	if h.DetailFollowTail() {
+		t.Fatal("PageUp should disable follow-tail")
+	}
+	h = h.ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+		JobID:  "job-1",
+		RunID:  "run-1",
+		TaskID: "TASK-1",
+		State:  scheduler.JobRunning,
+		StreamByStage: map[string]pipeline.StreamUpdate{
+			"C": {Stage: "C", Mode: pipeline.StreamModeAppend, Lines: append(lines, pipeline.StreamLine{Source: "stdout", Text: "new line"})},
+		},
+	}})
+	if h.DetailYOffset() != offsetAfterPageUp {
+		t.Fatalf("PageUp should disable follow-tail, offset %d -> %d", offsetAfterPageUp, h.DetailYOffset())
+	}
+	h, _ = h.Press("end")
+	bottom := h.DetailYOffset()
+	if !h.DetailFollowTail() {
+		t.Fatal("End should restore follow-tail")
+	}
+	h = h.ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+		JobID:  "job-1",
+		RunID:  "run-1",
+		TaskID: "TASK-1",
+		State:  scheduler.JobRunning,
+		StreamByStage: map[string]pipeline.StreamUpdate{
+			"C": {Stage: "C", Mode: pipeline.StreamModeAppend, Lines: append(lines, pipeline.StreamLine{Source: "stdout", Text: "another line"})},
+		},
+	}})
+	if h.DetailYOffset() < bottom {
+		t.Fatalf("End should restore follow-tail, offset %d -> %d", bottom, h.DetailYOffset())
 	}
 }
 

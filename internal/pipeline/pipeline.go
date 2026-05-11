@@ -39,17 +39,43 @@ type RunProgress struct {
 	Stage       string
 	Event       ProgressEvent
 	StageRecord model.StageRecord
+	Stream      *StreamUpdate
 	Done        bool
 	Err         error
 }
 
 type ProgressEvent string
 
+type StreamMode int
+
+const (
+	StreamModeCumulative StreamMode = iota
+	StreamModeAppend
+)
+
+type StreamLine struct {
+	Source string
+	Text   string
+}
+
+type StreamUpdate struct {
+	Stage     string
+	Mode      StreamMode
+	ItemID    string
+	Text      string
+	Delta     string
+	Source    string
+	Lines     []StreamLine
+	Done      bool
+	Truncated bool
+}
+
 const (
 	EventRunCreated   ProgressEvent = "run_created"
 	EventPathWarning  ProgressEvent = "path_warning"
 	EventStagePending ProgressEvent = "stage_pending"
 	EventStageRunning ProgressEvent = "stage_running"
+	EventStageStream  ProgressEvent = "stage_stream"
 	EventStageDone    ProgressEvent = "stage_done"
 	EventCleanup      ProgressEvent = "cleanup"
 	EventRunDone      ProgressEvent = "run_done"
@@ -83,7 +109,7 @@ type runStore interface {
 type CommandRunner interface {
 	LookPath(name string) (string, error)
 	Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result
-	RunStreaming(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, name string, args ...string) executor.Result
+	RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result
 }
 
 type RunnerOption func(*Runner)
@@ -480,7 +506,7 @@ func markInFlightStageAborted(stages []model.StageRecord, abortErr error) []mode
 	return stages
 }
 
-func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project scanner.Project, stage string, prior map[string]model.StageRecord, opts RunOptions, preflightResult preflight.CheckResult) model.StageRecord {
+func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project scanner.Project, stage string, prior map[string]model.StageRecord, opts RunOptions, preflightResult preflight.CheckResult, progress func(RunProgress)) model.StageRecord {
 	if check, ok := preflightResult.BlockingCheck(stage); ok {
 		if stage == "D" || stage == "E" || stage == "F" {
 			// Static stages materialize their own unavailable-review reports so
@@ -491,23 +517,23 @@ func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project s
 	}
 	switch stage {
 	case "A":
-		return r.stageA(ctx, run, project)
+		return r.stageA(ctx, run, project, progress)
 	case "B":
-		return r.stageB(ctx, run, project)
+		return r.stageB(ctx, run, project, progress)
 	case "C":
-		return r.stageC(ctx, run, project)
+		return r.stageC(ctx, run, project, progress)
 	case "D":
 		if opts.Mode == "recheck" {
-			return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性_确认修复报告.md")
+			return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", progress)
 		}
-		return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "tests_coverage_report.md", "4_测试有效性报告_api端点真实性.md")
+		return r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "tests_coverage_report.md", progress, "4_测试有效性报告_api端点真实性.md")
 	case "E":
 		if opts.Mode == "recheck" {
-			return r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "1_质检AI测试报告_确认修复报告.md", "static_acceptance_audit_report.md")
+			return r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "1_质检AI测试报告_确认修复报告.md", progress, "static_acceptance_audit_report.md")
 		}
-		return r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "static_acceptance_audit_report.md", "1_质检AI测试报告.md")
+		return r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "static_acceptance_audit_report.md", progress, "1_质检AI测试报告.md")
 	case "F":
-		return r.stageF(ctx, run, project, opts, prior)
+		return r.stageF(ctx, run, project, opts, prior, progress)
 	default:
 		return skippedStage(stage, "Unknown stage.")
 	}

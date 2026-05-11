@@ -13,7 +13,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, prior map[string]model.StageRecord) model.StageRecord {
+func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, prior map[string]model.StageRecord, progress func(RunProgress)) model.StageRecord {
 	start := time.Now()
 	record := startStage("F")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "F_repair.log")
@@ -61,7 +61,7 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
 	prompt := codexPrompt("F", profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	args := append([]string{}, extraArgs...)
-	review := r.runCodexReviewWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args)
+	review := r.runCodexReviewWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args, codexDeltaProgress(run.RunID, "F", progress))
 	recordArtifactWarnings(&record, writer, review.ArtifactWarnings)
 	outcome := finalizeStaticReviewReport("F", profile, project.Path, reportPath, review.Result, r.cfg.Codex.MaxOutputBytes)
 	record.Findings = append(record.Findings, outcome.Findings...)

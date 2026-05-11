@@ -208,6 +208,117 @@ func TestSchedulerUsesRunnerFactory(t *testing.T) {
 	}
 }
 
+func TestSchedulerBuffersAppendStreamInSnapshot(t *testing.T) {
+	cfg := config.Default()
+	cfg.Pipeline.MaxConcurrent = 1
+	release := make(chan struct{})
+	factory := func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+		return fakePipelineRunner{
+			run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				opts.Progress(pipeline.RunProgress{
+					RunID:       "run-stream",
+					Stage:       "B",
+					Event:       pipeline.EventStageRunning,
+					StageRecord: model.StageRecord{Stage: "B", Status: model.StageRunning},
+				})
+				for i := 0; i < 205; i++ {
+					opts.Progress(pipeline.RunProgress{
+						RunID: "run-stream",
+						Stage: "B",
+						Event: pipeline.EventStageStream,
+						Stream: &pipeline.StreamUpdate{
+							Stage:  "B",
+							Mode:   pipeline.StreamModeAppend,
+							Delta:  fmt.Sprintf("line-%03d\n", i),
+							Source: "stdout",
+						},
+					})
+				}
+				<-release
+				return pipeline.Result{
+					Run:    model.RunRecord{RunID: "run-stream", TaskID: taskID, Status: model.RunCompletedClean},
+					Stages: []model.StageRecord{{Stage: "B", Status: model.StageDone}},
+				}, nil
+			},
+		}
+	}
+	s := scheduler.New(nil, cfg, scheduler.WithRunnerFactory(factory))
+	t.Cleanup(func() {
+		close(release)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+
+	if _, err := s.Submit("TASK-STREAM", pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		stream := snapshot.StreamByStage["B"]
+		return snapshot.TaskID == "TASK-STREAM" && snapshot.State == scheduler.JobRunning && len(stream.Lines) == 200 && stream.Truncated
+	})
+	stream := snapshot.StreamByStage["B"]
+	if stream.Text == "" || stream.Lines[0].Text != "line-005" || stream.Lines[len(stream.Lines)-1].Text != "line-204" {
+		t.Fatalf("append stream buffer not retained as tail window: %#v", stream)
+	}
+
+	stream.Lines[0].Text = "mutated"
+	again := snapshotByTask(t, s, "TASK-STREAM")
+	if again.StreamByStage["B"].Lines[0].Text == "mutated" {
+		t.Fatalf("snapshot stream lines should be deep copied")
+	}
+}
+
+func TestSchedulerCumulativeStreamDoesNotChangeStageState(t *testing.T) {
+	cfg := config.Default()
+	release := make(chan struct{})
+	factory := func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+		return fakePipelineRunner{
+			run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				opts.Progress(pipeline.RunProgress{
+					RunID:       "run-codex",
+					Stage:       "D",
+					Event:       pipeline.EventStageRunning,
+					StageRecord: model.StageRecord{Stage: "D", Status: model.StageRunning},
+				})
+				opts.Progress(pipeline.RunProgress{
+					RunID: "run-codex",
+					Stage: "D",
+					Event: pipeline.EventStageStream,
+					Stream: &pipeline.StreamUpdate{
+						Stage:  "D",
+						Mode:   pipeline.StreamModeCumulative,
+						ItemID: "item-1",
+						Text:   "streaming review text",
+					},
+				})
+				<-release
+				return pipeline.Result{
+					Run:    model.RunRecord{RunID: "run-codex", TaskID: taskID, Status: model.RunCompletedClean},
+					Stages: []model.StageRecord{{Stage: "D", Status: model.StageDone}},
+				}, nil
+			},
+		}
+	}
+	s := scheduler.New(nil, cfg, scheduler.WithRunnerFactory(factory))
+	t.Cleanup(func() {
+		close(release)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+
+	if _, err := s.Submit("TASK-CODEX", pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-CODEX" && snapshot.StreamByStage["D"].Text == "streaming review text"
+	})
+	if snapshot.CurrentStage != "D" || stageStatus(snapshot.Stages, "D") != model.StageRunning {
+		t.Fatalf("stream event should not mutate stage state: %#v", snapshot)
+	}
+}
+
 type fakePipelineRunner struct {
 	run func(context.Context, string, pipeline.RunOptions) (pipeline.Result, error)
 }

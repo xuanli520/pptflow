@@ -12,7 +12,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner.Project) model.StageRecord {
+func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner.Project, progress func(RunProgress)) model.StageRecord {
 	start := time.Now()
 	record := startStage("C")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "C_tests.log")
@@ -98,13 +98,22 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		return finishStage(record, model.StageFailed, start)
 	}
 	fmt.Fprintln(logFile, "=== C host run_tests.sh start ===")
+	appendStreamProgress(run.RunID, "C", "=== C host run_tests.sh start ===", "p2r", false, progress)
 	fmt.Fprintln(logFile, "Stage C injected runtime env:")
+	appendStreamProgress(run.RunID, "C", "Stage C injected runtime env:", "p2r", false, progress)
 	for _, key := range stageEnv.Keys {
-		fmt.Fprintf(logFile, "%s=%s\n", key, stageEnv.Values[key])
+		line := fmt.Sprintf("%s=%s", key, stageEnv.Values[key])
+		fmt.Fprintln(logFile, line)
+		appendStreamProgress(run.RunID, "C", line, "p2r", false, progress)
 	}
 	fmt.Fprintln(logFile)
-	result := r.exec.RunStreaming(ctx, timeout, repoPath, env, logFile, bash, "run_tests.sh")
-	fmt.Fprintf(logFile, "\n=== C host run_tests.sh end: exit=%d timeout=%t err=%v ===\n", result.ExitCode, result.Timeout, result.Err)
+	onOutput := func(line string, source string) {
+		appendStreamProgress(run.RunID, "C", line, source, false, progress)
+	}
+	result := r.exec.RunStreamingWithOutput(ctx, timeout, repoPath, env, logFile, onOutput, bash, "run_tests.sh")
+	endLine := fmt.Sprintf("=== C host run_tests.sh end: exit=%d timeout=%t err=%v ===", result.ExitCode, result.Timeout, result.Err)
+	fmt.Fprintf(logFile, "\n%s\n", endLine)
+	appendStreamProgress(run.RunID, "C", endLine, "p2r", true, progress)
 	_ = logFile.Close()
 	log := result.Command + "\n\nSTDOUT:\n" + result.Stdout + "\nSTDERR:\n" + result.Stderr
 	if strings.TrimSpace(result.Stdout+result.Stderr) == "" {

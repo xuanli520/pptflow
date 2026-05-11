@@ -54,9 +54,10 @@ type app struct {
 	confirmCancelJobID  string
 	pendingCancelJobID  string
 
-	detailVM       executionViewModel
-	detailContent  string
-	lastRecoveryAt time.Time
+	detailVM         executionViewModel
+	detailContent    string
+	detailFollowTail bool
+	lastRecoveryAt   time.Time
 }
 
 type detailMsg struct {
@@ -135,15 +136,16 @@ func Start(store *db.Store, cfg config.Config) error {
 
 func newApp(store *db.Store, cfg config.Config) app {
 	m := app{
-		store:          store,
-		cfg:            cfg,
-		overview:       newOverviewModel(),
-		detail:         viewport.New(80, 10),
-		tab:            panelOverview,
-		focus:          focusSearch,
-		qaMode:         "initial",
-		message:        "",
-		lastRecoveryAt: time.Now(),
+		store:            store,
+		cfg:              cfg,
+		overview:         newOverviewModel(),
+		detail:           viewport.New(80, 10),
+		tab:              panelOverview,
+		focus:            focusSearch,
+		qaMode:           "initial",
+		message:          "",
+		detailFollowTail: true,
+		lastRecoveryAt:   time.Now(),
 	}
 	if store != nil {
 		m.store = store
@@ -262,6 +264,7 @@ func (m *app) handleDetailMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.detailVM = value.vm
 		m.syncStageSelection()
 		m.syncRefSelection()
+		m.mergeActiveStreamPreview()
 		m.updateDetailContent(false)
 		return true
 	case runMsg:
@@ -305,6 +308,7 @@ func (m *app) handleSchedulerMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.activeJobs = value.jobs
 		m.updatePendingCancelMessage(value.jobs)
 		m.updatePendingJobMessage(value.jobs)
+		m.mergeActiveStreamPreview()
 		if cmd := m.applyLayout(); cmd != nil {
 			*cmds = append(*cmds, cmd)
 		}
@@ -595,6 +599,54 @@ func (m app) activeJobForTask(taskID string) (scheduler.JobSnapshot, bool) {
 	return scheduler.JobSnapshot{}, false
 }
 
+func (m app) streamJobForTask(taskID string) (scheduler.JobSnapshot, bool) {
+	currentRunID := strings.TrimSpace(m.detailVM.Run.RunID)
+	matchesCurrentRun := func(job scheduler.JobSnapshot) bool {
+		return currentRunID == "" || job.RunID == "" || job.RunID == currentRunID
+	}
+	if job, ok := m.activeJobForTask(taskID); ok && matchesCurrentRun(job) {
+		return job, true
+	}
+	for index := len(m.activeJobs) - 1; index >= 0; index-- {
+		job := m.activeJobs[index]
+		if job.TaskID == taskID && len(job.StreamByStage) > 0 && matchesCurrentRun(job) {
+			return job, true
+		}
+	}
+	return scheduler.JobSnapshot{}, false
+}
+
+func (m *app) mergeActiveStreamPreview() {
+	if m.detailVM.StreamByStage == nil {
+		m.detailVM.StreamByStage = map[string]pipeline.StreamUpdate{}
+	}
+	changed := false
+	for stage := range m.detailVM.StreamByStage {
+		sv := stageForKey(m.detailVM.Stages, stage)
+		if sv.Status != model.StageRunning {
+			delete(m.detailVM.StreamByStage, stage)
+			changed = true
+		}
+	}
+	job, ok := m.streamJobForTask(m.selectedTaskID())
+	if ok && len(job.StreamByStage) > 0 {
+		for stage, update := range job.StreamByStage {
+			sv := stageForKey(m.detailVM.Stages, stage)
+			if sv.Status != model.StageRunning {
+				continue
+			}
+			if _, exists := m.detailVM.StreamByStage[stage]; !exists && stage == m.selectedStageKey {
+				m.detailFollowTail = true
+			}
+			m.detailVM.StreamByStage[stage] = update
+			changed = true
+		}
+	}
+	if changed {
+		m.updateDetailContent(false)
+	}
+}
+
 func (m app) selectedStage() stageView {
 	if len(m.detailVM.Stages) == 0 {
 		return stageView{}
@@ -667,6 +719,7 @@ func (m *app) moveStage(delta int) {
 	}
 	m.stageIndex = clamp(m.stageIndex+delta, 0, len(m.detailVM.Stages)-1)
 	m.selectedStageKey = m.detailVM.Stages[m.stageIndex].Stage
+	m.detailFollowTail = true
 	m.updateDetailContent(true)
 }
 
@@ -683,8 +736,14 @@ func (m *app) updateDetailContent(resetScroll bool) {
 	if width <= 0 {
 		width = max(40, m.width/2)
 	}
-	content := buildDetailContent(m.detailVM, m.selectedStageKey, width)
+	content := buildDetailContent(m.detailVM, m.selectedStageKey, width, m.detail.Height)
 	if content == m.detailContent {
+		if resetScroll {
+			m.detail.GotoTop()
+		}
+		if m.detailFollowTail && m.currentStageHasRunningStream() {
+			m.detail.GotoBottom()
+		}
 		return
 	}
 	m.detailContent = content
@@ -692,6 +751,18 @@ func (m *app) updateDetailContent(resetScroll bool) {
 	if resetScroll {
 		m.detail.GotoTop()
 	}
+	if m.detailFollowTail && m.currentStageHasRunningStream() {
+		m.detail.GotoBottom()
+	}
+}
+
+func (m app) currentStageHasRunningStream() bool {
+	stage := m.selectedStage()
+	if stage.Status != model.StageRunning {
+		return false
+	}
+	stream, ok := m.detailVM.StreamByStage[stage.Stage]
+	return ok && stream.Stage != ""
 }
 
 type overviewDetailKey struct {

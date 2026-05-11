@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
@@ -249,8 +250,29 @@ func renderDetailContext(m app, width int) string {
 		return mutedStyle.Render(truncateDisplay("当前: 未选择阶段", width))
 	}
 	icon, _ := stageStatusIcon(stage.Status)
-	line := fmt.Sprintf("当前: %s %s  状态: %s %s  运行: %s", stage.Stage, stage.DisplayName, icon, localizeStageStatus(stage.Status), empty(m.detailVM.Run.RunID, "未生成"))
+	jobID := "-"
+	mode := "-"
+	if job, ok := m.streamJobForTask(m.selectedTaskID()); ok {
+		jobID = truncateMiddleDisplay(job.JobID, 18)
+		if stream, ok := m.detailVM.StreamByStage[stage.Stage]; ok {
+			mode = streamModeLabel(stream.Mode)
+		} else if stream, ok := job.StreamByStage[stage.Stage]; ok {
+			mode = streamModeLabel(stream.Mode)
+		}
+	}
+	line := fmt.Sprintf("当前: %s %s  %s %s  耗时: %dms  run: %s  job: %s  模式: %s", stage.Stage, stage.DisplayName, icon, localizeStageStatus(stage.Status), stage.DurationMS, empty(m.detailVM.Run.RunID, "未生成"), jobID, mode)
 	return mutedStyle.Render(truncateDisplay(line, width))
+}
+
+func streamModeLabel(mode pipeline.StreamMode) string {
+	switch mode {
+	case pipeline.StreamModeCumulative:
+		return "Codex"
+	case pipeline.StreamModeAppend:
+		return "进程输出"
+	default:
+		return "-"
+	}
 }
 
 func renderStageLine(stage stageView, selected bool, width int) string {

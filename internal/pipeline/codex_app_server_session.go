@@ -14,33 +14,38 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 )
 
 type appServerCodexReviewSession struct {
-	mu         sync.Mutex
-	writeMu    sync.Mutex
-	req        CodexReviewRequest
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	processCtx context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
-	result     CodexReviewResult
-	err        error
-	nextID     int
-	responses  map[int]chan appServerRPCMessage
-	threadID   string
-	turnID     string
-	items      map[string]string
-	deltas     map[string]string
-	itemOrder  []string
-	stderr     bytes.Buffer
-	completed  bool
-	envKeys    []string
-	warnings   []ArtifactWarning
+	mu                    sync.Mutex
+	writeMu               sync.Mutex
+	req                   CodexReviewRequest
+	cmd                   *exec.Cmd
+	stdin                 io.WriteCloser
+	processCtx            context.Context
+	cancel                context.CancelFunc
+	done                  chan struct{}
+	result                CodexReviewResult
+	err                   error
+	nextID                int
+	responses             map[int]chan appServerRPCMessage
+	threadID              string
+	turnID                string
+	items                 map[string]string
+	deltas                map[string]string
+	deltaLogged           map[string]bool
+	deltaPreview          map[string]string
+	deltaPreviewTruncated map[string]bool
+	itemDone              map[string]bool
+	itemOrder             []string
+	stderr                bytes.Buffer
+	completed             bool
+	envKeys               []string
+	warnings              []ArtifactWarning
 }
 
 type appServerRPCMessage struct {
@@ -85,6 +90,10 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 	s.responses = map[int]chan appServerRPCMessage{}
 	s.items = map[string]string{}
 	s.deltas = map[string]string{}
+	s.deltaLogged = map[string]bool{}
+	s.deltaPreview = map[string]string{}
+	s.deltaPreviewTruncated = map[string]bool{}
+	s.itemDone = map[string]bool{}
 	s.mu.Unlock()
 
 	if !request.Capability.HasAppServer {
@@ -336,7 +345,10 @@ func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
 			s.appendLog("STDOUT: " + truncateAppServerLogValue(line) + "\n")
 			continue
 		}
-		s.appendLog(formatAppServerRPCLogLine(message))
+		isDeltaNotification := len(message.ID) == 0 && message.Method == "item/agentMessage/delta"
+		if !isDeltaNotification {
+			s.appendLog(formatAppServerRPCLogLine(message))
+		}
 		if len(message.ID) > 0 && message.Method == "" {
 			if id, ok := rpcIDInt(message.ID); ok {
 				s.dispatchResponse(id, message)
@@ -641,6 +653,128 @@ func shortAppServerLogHash(value string) string {
 	return sum[:length]
 }
 
+func prefixRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	for index := range value {
+		if limit == 0 {
+			return value[:index]
+		}
+		limit--
+	}
+	return value
+}
+
+type aggregatedDeltaLog struct {
+	turnID string
+	itemID string
+	text   string
+}
+
+func formatAggregatedDeltaLogLine(log aggregatedDeltaLog) string {
+	starts, ends := staticReviewMarkerCounts(log.text)
+	return fmt.Sprintf(
+		"JSON-RPC notification item/agentMessage/delta aggregated turn=%s item=%s total_bytes=%d delta_sha256=%s contract_starts=%d contract_ends=%d text_prefix=%q\n",
+		compactAppServerLogID(log.turnID),
+		compactAppServerLogID(log.itemID),
+		len(log.text),
+		shortAppServerLogHash(log.text),
+		starts,
+		ends,
+		truncateAppServerLogValue(prefixRunes(log.text, 10)),
+	)
+}
+
+func (s *appServerCodexReviewSession) aggregatedDeltaLogForItem(itemID string) (aggregatedDeltaLog, bool) {
+	itemID = strings.TrimSpace(itemID)
+	if itemID == "" {
+		return aggregatedDeltaLog{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	text := s.deltas[itemID]
+	if text == "" {
+		return aggregatedDeltaLog{}, false
+	}
+	if s.deltaLogged == nil {
+		s.deltaLogged = map[string]bool{}
+	}
+	if s.deltaLogged[itemID] {
+		return aggregatedDeltaLog{}, false
+	}
+	s.deltaLogged[itemID] = true
+	return aggregatedDeltaLog{turnID: s.turnID, itemID: itemID, text: text}, true
+}
+
+func (s *appServerCodexReviewSession) logAggregatedDelta(itemID string) {
+	log, ok := s.aggregatedDeltaLogForItem(itemID)
+	if !ok {
+		return
+	}
+	s.appendLog(formatAggregatedDeltaLogLine(log))
+}
+
+func (s *appServerCodexReviewSession) remainingAggregatedDeltaLogs() []aggregatedDeltaLog {
+	s.mu.Lock()
+	if s.deltaLogged == nil {
+		s.deltaLogged = map[string]bool{}
+	}
+	logs := make([]aggregatedDeltaLog, 0, len(s.deltas))
+	for itemID, text := range s.deltas {
+		if text == "" || s.deltaLogged[itemID] {
+			continue
+		}
+		s.deltaLogged[itemID] = true
+		logs = append(logs, aggregatedDeltaLog{turnID: s.turnID, itemID: itemID, text: text})
+	}
+	s.mu.Unlock()
+	sort.Slice(logs, func(i, j int) bool {
+		return logs[i].itemID < logs[j].itemID
+	})
+	return logs
+}
+
+func (s *appServerCodexReviewSession) logRemainingAggregatedDeltas() {
+	for _, log := range s.remainingAggregatedDeltaLogs() {
+		s.appendLog(formatAggregatedDeltaLogLine(log))
+	}
+}
+
+const appServerDeltaPreviewMaxBytes = 64 * 1024
+
+func appendDeltaPreview(current, delta string, truncated bool) (string, bool) {
+	return deltaPreviewText(current+delta, truncated)
+}
+
+func deltaPreviewText(text string, truncated bool) (string, bool) {
+	if len(text) <= appServerDeltaPreviewMaxBytes {
+		return strings.ToValidUTF8(text, ""), truncated
+	}
+	return utf8SafeSuffix(text, appServerDeltaPreviewMaxBytes), true
+}
+
+func utf8SafeSuffix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return strings.ToValidUTF8(value, "")
+	}
+	start := len(value) - limit
+	for start < len(value) && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	return strings.ToValidUTF8(value[start:], "")
+}
+
+func (s *appServerCodexReviewSession) emitDeltaUpdate(update CodexDeltaUpdate, ok bool) {
+	if !ok || s.req.OnDelta == nil {
+		return
+	}
+	s.req.OnDelta(update)
+}
+
 func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMessage) {
 	switch message.Method {
 	case "item/agentMessage/delta":
@@ -661,6 +795,7 @@ func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMes
 		}
 		if json.Unmarshal(message.Params, &params) == nil && params.Item.Type == "agentMessage" {
 			s.recordCompletedItem(params.TurnID, params.Item.ID, params.Item.Text)
+			s.logAggregatedDelta(params.Item.ID)
 		}
 	case "turn/completed":
 		var params struct {
@@ -680,6 +815,7 @@ func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMes
 					s.recordCompletedItem(params.Turn.ID, item.ID, item.Text)
 				}
 			}
+			s.logRemainingAggregatedDeltas()
 			s.completeTurn(params.Turn.ID, params.Turn.Status, params.Turn.Error)
 		}
 	}
@@ -690,14 +826,44 @@ func (s *appServerCodexReviewSession) recordDelta(turnID, itemID, delta string) 
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.turnID != "" && turnID != s.turnID {
+	if s.completed || (s.turnID != "" && turnID != s.turnID) {
+		s.mu.Unlock()
 		return
 	}
+	if s.deltas == nil {
+		s.deltas = map[string]string{}
+	}
+	if s.deltaPreview == nil {
+		s.deltaPreview = map[string]string{}
+	}
+	if s.deltaPreviewTruncated == nil {
+		s.deltaPreviewTruncated = map[string]bool{}
+	}
+	if s.itemDone == nil {
+		s.itemDone = map[string]bool{}
+	}
 	if _, ok := s.deltas[itemID]; !ok {
-		s.itemOrder = append(s.itemOrder, itemID)
+		if _, hasItem := s.items[itemID]; !hasItem {
+			s.itemOrder = append(s.itemOrder, itemID)
+		}
 	}
 	s.deltas[itemID] += delta
+	if s.itemDone[itemID] {
+		s.mu.Unlock()
+		return
+	}
+	preview, truncated := appendDeltaPreview(s.deltaPreview[itemID], delta, s.deltaPreviewTruncated[itemID])
+	s.deltaPreview[itemID] = preview
+	s.deltaPreviewTruncated[itemID] = truncated
+	update := CodexDeltaUpdate{
+		TurnID:    firstNonEmpty(turnID, s.turnID),
+		ItemID:    itemID,
+		Delta:     delta,
+		Text:      preview,
+		Truncated: truncated,
+	}
+	s.mu.Unlock()
+	s.emitDeltaUpdate(update, true)
 }
 
 func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text string) {
@@ -705,14 +871,45 @@ func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text s
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.turnID != "" && turnID != s.turnID {
+	if s.completed || (s.turnID != "" && turnID != s.turnID) {
+		s.mu.Unlock()
 		return
+	}
+	if s.items == nil {
+		s.items = map[string]string{}
+	}
+	if s.deltas == nil {
+		s.deltas = map[string]string{}
+	}
+	if s.deltaPreview == nil {
+		s.deltaPreview = map[string]string{}
+	}
+	if s.deltaPreviewTruncated == nil {
+		s.deltaPreviewTruncated = map[string]bool{}
+	}
+	if s.itemDone == nil {
+		s.itemDone = map[string]bool{}
 	}
 	if _, ok := s.items[itemID]; !ok && s.deltas[itemID] == "" {
 		s.itemOrder = append(s.itemOrder, itemID)
 	}
 	s.items[itemID] = text
+	hadPreview := s.deltaPreview[itemID] != "" || s.deltas[itemID] != ""
+	s.itemDone[itemID] = true
+	preview := s.deltaPreview[itemID]
+	truncated := s.deltaPreviewTruncated[itemID]
+	if text != "" {
+		preview, truncated = deltaPreviewText(text, false)
+	}
+	update := CodexDeltaUpdate{
+		TurnID:    firstNonEmpty(turnID, s.turnID),
+		ItemID:    itemID,
+		Text:      preview,
+		Done:      true,
+		Truncated: truncated,
+	}
+	s.mu.Unlock()
+	s.emitDeltaUpdate(update, hadPreview)
 }
 
 func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnErr *struct {
@@ -811,9 +1008,6 @@ func (s *appServerCodexReviewSession) complete(result executor.Result, err error
 		return
 	}
 	s.completed = true
-	s.result.Result = result
-	s.result.ArtifactWarnings = append(s.result.ArtifactWarnings, s.warnings...)
-	s.err = err
 	cancel := s.cancel
 	s.responses = map[int]chan appServerRPCMessage{}
 	done := s.done
@@ -821,6 +1015,12 @@ func (s *appServerCodexReviewSession) complete(result executor.Result, err error
 	if cancel != nil {
 		cancel()
 	}
+	s.logRemainingAggregatedDeltas()
+	s.mu.Lock()
+	s.result.Result = result
+	s.result.ArtifactWarnings = append(s.result.ArtifactWarnings, s.warnings...)
+	s.err = err
+	s.mu.Unlock()
 	if done != nil {
 		close(done)
 	}

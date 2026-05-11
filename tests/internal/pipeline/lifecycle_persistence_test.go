@@ -172,7 +172,7 @@ func (lifecycleCommandRunner) Run(_ context.Context, _ time.Duration, _ string, 
 	return executor.Result{Command: strings.Join(append([]string{name}, args...), " ")}
 }
 
-func (r lifecycleCommandRunner) RunStreaming(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, name string, args ...string) executor.Result {
+func (r lifecycleCommandRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, _ executor.OutputCallback, name string, args ...string) executor.Result {
 	return r.Run(ctx, timeout, dir, env, name, args...)
 }
 

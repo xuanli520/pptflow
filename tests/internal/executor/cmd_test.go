@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,44 @@ wait
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("timeout command took too long to return: %s", elapsed)
+	}
+}
+
+func TestRunStreamingWithOutputCapturesStdoutAndStderrLines(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell streaming test is Unix-specific")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "stream.sh")
+	if err := os.WriteFile(script, []byte(`#!/usr/bin/env bash
+set -euo pipefail
+echo out-one
+echo err-one >&2
+echo out-two
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var writer strings.Builder
+	var events []string
+	result := executor.New().RunStreamingWithOutput(context.Background(), time.Second, dir, nil, &writer, func(line string, source string) {
+		events = append(events, source+":"+strings.TrimSpace(line))
+	}, script)
+
+	if result.Err != nil {
+		t.Fatalf("streaming command failed: %#v", result)
+	}
+	if !strings.Contains(result.Stdout, "out-one") || !strings.Contains(result.Stdout, "out-two") || !strings.Contains(result.Stderr, "err-one") {
+		t.Fatalf("stdout/stderr not captured: %#v", result)
+	}
+	if !strings.Contains(writer.String(), "out-one") || !strings.Contains(writer.String(), "err-one") {
+		t.Fatalf("writer did not receive both streams:\n%s", writer.String())
+	}
+	got := strings.Join(events, ",")
+	for _, want := range []string{"stdout:out-one", "stdout:out-two", "stderr:err-one"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing output callback %q in %q", want, got)
+		}
 	}
 }
 

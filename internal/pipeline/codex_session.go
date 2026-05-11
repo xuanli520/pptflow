@@ -21,12 +21,22 @@ type CodexReviewRequest struct {
 	Capability     codex.Capability
 	Args           []string
 	MaxOutputBytes int
+	OnDelta        func(update CodexDeltaUpdate)
 }
 
 type CodexReviewResult struct {
 	Result           executor.Result
 	GuidanceEvents   []CodexGuidanceEvent
 	ArtifactWarnings []ArtifactWarning
+}
+
+type CodexDeltaUpdate struct {
+	TurnID    string
+	ItemID    string
+	Delta     string
+	Text      string
+	Done      bool
+	Truncated bool
 }
 
 type CodexGuidanceEvent struct {
@@ -66,7 +76,7 @@ var defaultCodexGuidanceDeadlines = []CodexGuidanceDeadline{
 	},
 }
 
-func (r Runner) runCodexReviewWithLog(ctx context.Context, timeout time.Duration, projectPath, logPath string, env []string, prompt string, capability codex.Capability, args []string) CodexReviewResult {
+func (r Runner) runCodexReviewWithLog(ctx context.Context, timeout time.Duration, projectPath, logPath string, env []string, prompt string, capability codex.Capability, args []string, onDelta func(CodexDeltaUpdate)) CodexReviewResult {
 	schedule := codexGuidanceSchedule(timeout, codexStageFromPrompt(prompt))
 	request := CodexReviewRequest{
 		Timeout:        timeout,
@@ -77,6 +87,7 @@ func (r Runner) runCodexReviewWithLog(ctx context.Context, timeout time.Duration
 		Capability:     capability,
 		Args:           args,
 		MaxOutputBytes: r.cfg.Codex.MaxOutputBytes,
+		OnDelta:        onDelta,
 	}
 	session := newAppServerCodexReviewSession(configuredEnvKeys(r.cfg.Codex.Env))
 	result, err := runCodexReviewSessionWithGuidance(ctx, session, request, schedule)

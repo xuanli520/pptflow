@@ -15,7 +15,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner.Project) model.StageRecord {
+func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner.Project, progress func(RunProgress)) model.StageRecord {
 	start := time.Now()
 	record := startStage("A")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "A_validate.log")

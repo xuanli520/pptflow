@@ -2,9 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
@@ -50,6 +52,10 @@ type TestServiceURLEnv struct {
 type TestServiceURL struct {
 	EnvKey string `json:"env_key"`
 	URL    string `json:"url"`
+}
+
+type TestAppServerSessionProbe struct {
+	session *appServerCodexReviewSession
 }
 
 func SelectedStagesForTest(opts RunOptions, staticOnly bool) map[string]bool {
@@ -132,6 +138,139 @@ func NewAppServerCodexReviewSessionForTest(envKeys []string) CodexReviewSession 
 	return newAppServerCodexReviewSession(envKeys)
 }
 
+func NewAppServerSessionProbeForTest(logPath, turnID string, maxOutputBytes int, onDelta func(CodexDeltaUpdate)) *TestAppServerSessionProbe {
+	return newAppServerSessionProbeForTest(CodexReviewRequest{
+		LogPath:        logPath,
+		MaxOutputBytes: maxOutputBytes,
+		OnDelta:        onDelta,
+	}, turnID, nil)
+}
+
+func NewAppServerSessionProbeWithProcessContextForTest(logPath string, processCtx context.Context) *TestAppServerSessionProbe {
+	return newAppServerSessionProbeForTest(CodexReviewRequest{LogPath: logPath}, "", processCtx)
+}
+
+func FormatAggregatedDeltaLogLineForTest(turnID, itemID, text string) string {
+	return formatAggregatedDeltaLogLine(aggregatedDeltaLog{turnID: turnID, itemID: itemID, text: text})
+}
+
+func newAppServerSessionProbeForTest(req CodexReviewRequest, turnID string, processCtx context.Context) *TestAppServerSessionProbe {
+	return &TestAppServerSessionProbe{session: &appServerCodexReviewSession{
+		req:                   req,
+		processCtx:            processCtx,
+		done:                  make(chan struct{}),
+		responses:             map[int]chan appServerRPCMessage{},
+		turnID:                turnID,
+		items:                 map[string]string{},
+		deltas:                map[string]string{},
+		deltaLogged:           map[string]bool{},
+		deltaPreview:          map[string]string{},
+		deltaPreviewTruncated: map[string]bool{},
+		itemDone:              map[string]bool{},
+	}}
+}
+
+func (p *TestAppServerSessionProbe) Complete(command string, err error) {
+	if p == nil || p.session == nil {
+		return
+	}
+	p.session.complete(executor.Result{Command: command, Err: err}, err)
+}
+
+func (p *TestAppServerSessionProbe) CompleteStreamError(stream string, err error) {
+	if p == nil || p.session == nil {
+		return
+	}
+	p.session.completeStreamError(stream, err)
+}
+
+func (p *TestAppServerSessionProbe) ReadStdout(stream string) {
+	if p == nil || p.session == nil {
+		return
+	}
+	p.session.readStdout(strings.NewReader(stream))
+}
+
+func (p *TestAppServerSessionProbe) RecordDelta(turnID, itemID, delta string) {
+	if p == nil || p.session == nil {
+		return
+	}
+	p.session.recordDelta(turnID, itemID, delta)
+}
+
+func (p *TestAppServerSessionProbe) RecordCompletedItem(turnID, itemID, text string) {
+	if p == nil || p.session == nil {
+		return
+	}
+	p.session.recordCompletedItem(turnID, itemID, text)
+}
+
+func (p *TestAppServerSessionProbe) ResultStdout() string {
+	if p == nil || p.session == nil {
+		return ""
+	}
+	p.session.mu.Lock()
+	defer p.session.mu.Unlock()
+	return p.session.result.Result.Stdout
+}
+
+func (p *TestAppServerSessionProbe) Err() error {
+	if p == nil || p.session == nil {
+		return nil
+	}
+	p.session.mu.Lock()
+	defer p.session.mu.Unlock()
+	return p.session.err
+}
+
+func (p *TestAppServerSessionProbe) Completed() bool {
+	if p == nil || p.session == nil {
+		return false
+	}
+	p.session.mu.Lock()
+	defer p.session.mu.Unlock()
+	return p.session.completed
+}
+
+func (p *TestAppServerSessionProbe) DoneClosed() bool {
+	if p == nil || p.session == nil || p.session.done == nil {
+		return false
+	}
+	select {
+	case <-p.session.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *TestAppServerSessionProbe) FinalReport() string {
+	if p == nil || p.session == nil {
+		return ""
+	}
+	p.session.mu.Lock()
+	defer p.session.mu.Unlock()
+	return p.session.finalReportLocked()
+}
+
+func (p *TestAppServerSessionProbe) DeltaForItem(itemID string) string {
+	if p == nil || p.session == nil {
+		return ""
+	}
+	p.session.mu.Lock()
+	defer p.session.mu.Unlock()
+	return p.session.deltas[itemID]
+}
+
+func (p *TestAppServerSessionProbe) ItemOrderLen() int {
+	if p == nil || p.session == nil {
+		return 0
+	}
+	p.session.mu.Lock()
+	defer p.session.mu.Unlock()
+	return len(p.session.itemOrder)
+}
+
 func CodexReviewPathForTest(run model.RunRecord, projectPath string) string {
 	return codexReviewPath(run, projectPath)
 }
@@ -141,7 +280,7 @@ func (r Runner) CodexContextForTest(ctx context.Context, project scanner.Project
 }
 
 func (r Runner) StageCodexForTest(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output string, compat ...string) model.StageRecord {
-	return r.stageCodex(ctx, run, project, opts, stage, profile, output, compat...)
+	return r.stageCodex(ctx, run, project, opts, stage, profile, output, nil, compat...)
 }
 
 func StructuralFindingsForTest(project scanner.Project, required map[string]bool) []model.Finding {

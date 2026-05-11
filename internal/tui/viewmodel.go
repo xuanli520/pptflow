@@ -78,6 +78,7 @@ type executionViewModel struct {
 	SelfTestState         string
 	LogTailByStage        map[string]string
 	GuidanceEventsByStage map[string][]string
+	StreamByStage         map[string]pipeline.StreamUpdate
 }
 
 func buildOverviewItems(cfg config.Config, projects []db.ProjectSummary) []overviewItem {
@@ -153,6 +154,7 @@ func buildExecutionViewModel(ctx context.Context, store executionStore, cfg conf
 		SelfTestState:         selfTestState(project, cfg),
 		LogTailByStage:        map[string]string{},
 		GuidanceEventsByStage: map[string][]string{},
+		StreamByStage:         map[string]pipeline.StreamUpdate{},
 	}
 	run, err := store.LatestRunForTask(ctx, taskID)
 	if err != nil {
@@ -246,7 +248,7 @@ func preferredStageIndex(stages []stageView) int {
 	return 0
 }
 
-func buildDetailContent(vm executionViewModel, selectedStage string, width int) string {
+func buildDetailContent(vm executionViewModel, selectedStage string, width, height int) string {
 	if vm.TaskID == "" {
 		return "未选择已索引的项目\n请先执行 `p2r scan --path <projects-qa>`"
 	}
@@ -262,47 +264,119 @@ func buildDetailContent(vm executionViewModel, selectedStage string, width int) 
 	}
 
 	stage := stageForKey(vm.Stages, selectedStage)
-	var builder strings.Builder
-	icon, _ := stageStatusIcon(stage.Status)
-	builder.WriteString(fmt.Sprintf("阶段 %s - %s\n", stage.Stage, stage.DisplayName))
-	builder.WriteString(fmt.Sprintf("状态: %s %s  耗时: %dms\n", icon, localizeStageStatus(stage.Status), stage.DurationMS))
-	if len(stage.BlockedBy) > 0 {
-		builder.WriteString("阻塞来源: " + strings.Join(stage.BlockedBy, ", ") + "\n")
+	stream := vm.StreamByStage[stage.Stage]
+	primaryBudget := primaryContentBudget(stage, stream, height)
+	primary := renderPrimaryContent(vm, stage, width, primaryBudget)
+	evidence := renderEvidenceSection(vm, stage, width)
+	return joinNonEmptySections([]string{primary, evidence})
+}
+
+func primaryContentBudget(stage stageView, stream pipeline.StreamUpdate, height int) int {
+	if height <= 0 {
+		height = 20
 	}
-	if stage.ErrorSummary != "" {
-		builder.WriteString("原因:\n")
+	if stage.Status == model.StageRunning && stream.Stage != "" {
+		return clamp(height/2, 8, max(8, height-4))
+	}
+	return min(14, max(8, height/2))
+}
+
+func renderPrimaryContent(vm executionViewModel, stage stageView, width, budget int) string {
+	switch stage.Status {
+	case model.StageRunning:
+		if stream, ok := vm.StreamByStage[stage.Stage]; ok && stream.Stage != "" {
+			return renderStreamContent(stream, width, budget)
+		}
+		return "等待阶段输出..."
+	case model.StageDone, model.StageFailed:
+		return renderStageResultContent(vm, stage, width)
+	case model.StageSkipped, model.StageBlocked:
+		return renderBlockedStageContent(stage, width)
+	default:
+		return renderStageResultContent(vm, stage, width)
+	}
+}
+
+func renderStreamContent(stream pipeline.StreamUpdate, width, budget int) string {
+	if stream.Mode == pipeline.StreamModeAppend {
+		return renderAppendStreamContent(stream, width, budget)
+	}
+	return renderCumulativeStreamContent(stream, width, budget)
+}
+
+func renderCumulativeStreamContent(stream pipeline.StreamUpdate, width, budget int) string {
+	var builder strings.Builder
+	if stream.Truncated {
+		builder.WriteString("...（预览已截断，仅显示尾部 64 KiB）\n")
+	}
+	text := strings.TrimRight(stream.Text, "\n")
+	if strings.TrimSpace(text) == "" {
+		text = "等待阶段输出..."
+	}
+	var lines []string
+	for _, raw := range strings.Split(text, "\n") {
+		wrapped := wrapDisplay(raw, max(20, width-2))
+		if len(wrapped) == 0 {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, wrapped...)
+	}
+	lines = tailLines(lines, budget)
+	for _, line := range lines {
+		builder.WriteString(line + "\n")
+	}
+	if stream.Done {
+		builder.WriteString(mutedStyle.Render("生成已完成，等待阶段确认...") + "\n")
+	}
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+func renderAppendStreamContent(stream pipeline.StreamUpdate, width, budget int) string {
+	lines := append([]pipeline.StreamLine(nil), stream.Lines...)
+	if len(lines) == 0 && strings.TrimSpace(stream.Text) != "" {
+		for _, line := range strings.Split(stream.Text, "\n") {
+			lines = append(lines, pipeline.StreamLine{Source: "stdout", Text: line})
+		}
+	}
+	if len(lines) == 0 {
+		return "等待阶段输出..."
+	}
+	lines = tailStreamLines(lines, budget)
+	var rendered []string
+	if stream.Truncated {
+		rendered = append(rendered, mutedStyle.Render("...（实时输出已截断，仅显示最近 200 行）"))
+	}
+	for _, line := range lines {
+		text := truncateDisplay(line.Text, max(8, width-2))
+		switch strings.ToLower(strings.TrimSpace(line.Source)) {
+		case "stderr":
+			rendered = append(rendered, errorStyle.Render("[stderr] "+text))
+		case "p2r":
+			rendered = append(rendered, mutedStyle.Render(text))
+		default:
+			rendered = append(rendered, mutedStyle.Render(text))
+		}
+	}
+	if stream.Done {
+		rendered = append(rendered, mutedStyle.Render("进程已退出，等待阶段确认..."))
+	}
+	return strings.Join(rendered, "\n")
+}
+
+func renderStageResultContent(vm executionViewModel, stage stageView, width int) string {
+	var builder strings.Builder
+	if stage.Status == model.StageFailed && strings.TrimSpace(stage.ErrorSummary) != "" {
+		builder.WriteString("失败原因:\n")
 		for _, line := range wrapDisplay(localizeSummary(stage.ErrorSummary), max(20, width-4)) {
 			builder.WriteString("  " + line + "\n")
 		}
+		builder.WriteString("\n")
 	}
-	if len(vm.PathWarnings) > 0 {
-		builder.WriteString("\n路径警告:\n")
-		for _, warning := range vm.PathWarnings {
-			builder.WriteString("  " + compactPath(warning.DBPath, vm) + " -> " + compactPath(warning.CanonicalPath, vm) + "\n")
-		}
-	}
-	if codexStage(stage.Stage) {
-		reportPath := primaryCodexReportPath(stage)
-		if reportPath != "" {
-			builder.WriteString("\n最终报告:\n")
-			builder.WriteString("  路径: " + compactPath(reportPath, vm) + "\n")
-			if summary := reportSummary(reportPath); summary != "" {
-				for _, line := range wrapDisplay(summary, max(20, width-6)) {
-					builder.WriteString("  摘要: " + line + "\n")
-				}
-			}
-		}
-		if events := vm.GuidanceEventsByStage[stage.Stage]; len(events) > 0 {
-			builder.WriteString("\nCodex deadline guidance:\n")
-			for _, event := range events {
-				builder.WriteString("  " + event + "\n")
-			}
-		}
-	}
-	builder.WriteString("\n本阶段发现:\n")
+	builder.WriteString("本阶段发现:\n")
 	stageFindings := findingsForStage(vm.Findings, stage.Stage)
 	if len(stageFindings) == 0 {
-		builder.WriteString("  无阻断/严重发现\n")
+		builder.WriteString("  本阶段无阻断/严重发现\n")
 	} else {
 		for _, finding := range stageFindings {
 			label := severityStyle(finding.Severity).Render("[" + localizeSeverity(finding.Severity) + "]")
@@ -317,43 +391,130 @@ func buildDetailContent(vm executionViewModel, selectedStage string, width int) 
 			}
 		}
 	}
-	builder.WriteString("\n证据入口:\n")
-	builder.WriteString("  运行目录: " + compactPath(empty(vm.ArtifactRoot, "未生成"), vm) + "\n")
-	if stage.LogPath != "" {
-		builder.WriteString("  日志: " + compactPath(stage.LogPath, vm) + "\n")
-	}
-	if len(stage.ArtifactPaths) == 0 {
-		builder.WriteString("  阶段产物: 未生成\n")
-	} else {
-		builder.WriteString("  阶段产物:\n")
-		for _, path := range stage.ArtifactPaths {
-			builder.WriteString("    - " + compactPath(path, vm) + "\n")
+	if codexStage(stage.Stage) {
+		reportPath := primaryCodexReportPath(stage)
+		if reportPath != "" {
+			builder.WriteString("\n最终报告:\n")
+			builder.WriteString("  路径: " + compactPath(reportPath, vm) + "\n")
+			if summary := reportSummary(reportPath); summary != "" {
+				for _, line := range wrapDisplay(summary, max(20, width-6)) {
+					builder.WriteString("  摘要: " + line + "\n")
+				}
+			}
 		}
 	}
-	builder.WriteString("\n文档:\n")
-	builder.WriteString("  " + docsSummaryLineCompact(vm.DocsSummary, vm) + "\n")
-	for _, line := range docsDetailLines(vm.DocsSummary) {
-		builder.WriteString("  " + line + "\n")
-	}
-	builder.WriteString("\n预检:\n")
-	builder.WriteString("  路径: " + compactPath(empty(vm.PreflightPath, "未生成"), vm) + "\n")
-	for _, line := range strings.Split(empty(vm.PreflightText, "未生成"), "\n") {
-		builder.WriteString("  " + line + "\n")
-	}
-	builder.WriteString("\n清理:\n")
-	builder.WriteString("  路径: " + compactPath(empty(vm.CleanupPath, "未生成"), vm) + "\n")
-	builder.WriteString("  状态: " + localizeCleanupStatus(vm.CleanupStatus) + "\n")
-	for _, line := range strings.Split(empty(vm.CleanupText, "未生成"), "\n") {
-		builder.WriteString("  " + line + "\n")
-	}
-	builder.WriteString("\n日志尾部:\n")
-	if tail := strings.TrimSpace(vm.LogTailByStage[stage.Stage]); tail != "" {
-		builder.WriteString(tail)
-		builder.WriteString("\n")
+	if len(stage.ArtifactPaths) == 0 {
+		builder.WriteString("\n产物: 未生成\n")
 	} else {
-		builder.WriteString("  未生成\n")
+		builder.WriteString("\n产物:\n")
+		for _, path := range stage.ArtifactPaths {
+			builder.WriteString("  - " + compactPath(path, vm) + "\n")
+		}
 	}
-	return builder.String()
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+func renderBlockedStageContent(stage stageView, width int) string {
+	var builder strings.Builder
+	if len(stage.BlockedBy) > 0 {
+		builder.WriteString("阻塞来源: " + strings.Join(stage.BlockedBy, ", ") + "\n")
+	}
+	reason := localizeSummary(stage.ErrorSummary)
+	if reason == "" {
+		reason = "阶段未运行"
+	}
+	for _, line := range wrapDisplay(reason, max(20, width-2)) {
+		builder.WriteString(line + "\n")
+	}
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+func renderEvidenceSection(vm executionViewModel, stage stageView, width int) string {
+	var sections []string
+
+	var docs strings.Builder
+	docs.WriteString("文档: " + docsSummaryLineCompact(vm.DocsSummary, vm))
+	for _, line := range docsDetailLines(vm.DocsSummary) {
+		docs.WriteString("\n  " + line)
+	}
+	sections = append(sections, docs.String())
+
+	var preflight strings.Builder
+	preflight.WriteString("预检: " + compactPath(empty(vm.PreflightPath, "未生成"), vm))
+	for _, line := range strings.Split(empty(vm.PreflightText, "未生成"), "\n") {
+		preflight.WriteString("\n  " + line)
+	}
+	sections = append(sections, preflight.String())
+
+	var cleanup strings.Builder
+	cleanup.WriteString("清理: " + localizeCleanupStatus(vm.CleanupStatus) + "  " + compactPath(empty(vm.CleanupPath, "未生成"), vm))
+	for _, line := range strings.Split(empty(vm.CleanupText, "未生成"), "\n") {
+		cleanup.WriteString("\n  " + line)
+	}
+	sections = append(sections, cleanup.String())
+
+	if events := vm.GuidanceEventsByStage[stage.Stage]; len(events) > 0 {
+		var guidance strings.Builder
+		guidance.WriteString("Codex deadline guidance:")
+		for _, event := range events {
+			guidance.WriteString("\n  " + event)
+		}
+		sections = append(sections, guidance.String())
+	}
+	if len(stage.ArtifactWarnings) > 0 {
+		var warnings strings.Builder
+		warnings.WriteString("产物警告:")
+		for _, warning := range stage.ArtifactWarnings {
+			warnings.WriteString("\n  " + compactPath(warning.Path, vm) + " " + warning.Op + ": " + warning.Error)
+		}
+		sections = append(sections, warnings.String())
+	}
+	if len(vm.PathWarnings) > 0 {
+		var paths strings.Builder
+		paths.WriteString("路径警告:")
+		for _, warning := range vm.PathWarnings {
+			paths.WriteString("\n  " + compactPath(warning.DBPath, vm) + " -> " + compactPath(warning.CanonicalPath, vm))
+		}
+		sections = append(sections, paths.String())
+	}
+
+	var logTail strings.Builder
+	logTail.WriteString("日志尾部:")
+	if tail := strings.TrimSpace(vm.LogTailByStage[stage.Stage]); tail != "" {
+		for _, line := range strings.Split(tail, "\n") {
+			logTail.WriteString("\n  " + truncateDisplay(line, max(8, width-4)))
+		}
+	} else {
+		logTail.WriteString("\n  未生成")
+	}
+	sections = append(sections, logTail.String())
+
+	return "── 运行证据 ──\n" + joinNonEmptySections(sections)
+}
+
+func joinNonEmptySections(sections []string) string {
+	var kept []string
+	for _, section := range sections {
+		section = strings.TrimSpace(section)
+		if section != "" {
+			kept = append(kept, section)
+		}
+	}
+	return strings.Join(kept, "\n\n")
+}
+
+func tailLines(lines []string, limit int) []string {
+	if limit <= 0 || len(lines) <= limit {
+		return lines
+	}
+	return lines[len(lines)-limit:]
+}
+
+func tailStreamLines(lines []pipeline.StreamLine, limit int) []pipeline.StreamLine {
+	if limit <= 0 || len(lines) <= limit {
+		return lines
+	}
+	return lines[len(lines)-limit:]
 }
 
 func stageForKey(stages []stageView, key string) stageView {

@@ -64,6 +64,46 @@ func makeRunProgress(taskID string, reporter ProgressReporter) func(RunProgress)
 	}
 }
 
+func codexDeltaProgress(runID, stage string, progress func(RunProgress)) func(CodexDeltaUpdate) {
+	if progress == nil {
+		return nil
+	}
+	return func(update CodexDeltaUpdate) {
+		progress(RunProgress{
+			RunID: runID,
+			Stage: stage,
+			Event: EventStageStream,
+			Stream: &StreamUpdate{
+				Stage:     stage,
+				Mode:      StreamModeCumulative,
+				ItemID:    update.ItemID,
+				Text:      update.Text,
+				Delta:     update.Delta,
+				Done:      update.Done,
+				Truncated: update.Truncated,
+			},
+		})
+	}
+}
+
+func appendStreamProgress(runID, stage, line, source string, done bool, progress func(RunProgress)) {
+	if progress == nil {
+		return
+	}
+	progress(RunProgress{
+		RunID: runID,
+		Stage: stage,
+		Event: EventStageStream,
+		Stream: &StreamUpdate{
+			Stage:  stage,
+			Mode:   StreamModeAppend,
+			Delta:  line,
+			Source: source,
+			Done:   done,
+		},
+	})
+}
+
 func (r Runner) loadAndValidateRunInputs(ctx context.Context, taskID string, opts RunOptions, progress func(RunProgress)) (scanner.Project, []ProjectPathWarning, RunOptions, error) {
 	project, err := r.store.GetProject(ctx, taskID)
 	if err != nil {
@@ -225,7 +265,7 @@ func (s *runState) executeStageLoop(preflightResult preflight.CheckResult) (Resu
 			return result, err, aborted
 		}
 
-		record := s.runner.executeStage(s.ctx, s.run, s.project, stage, s.results, s.opts, preflightResult)
+		record := s.runner.executeStage(s.ctx, s.run, s.project, stage, s.results, s.opts, preflightResult, s.progress)
 		record.Findings = assignMissingFindingIDs(stage, record.Findings)
 		s.stages[index] = record
 		s.results[stage] = record

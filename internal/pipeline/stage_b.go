@@ -15,7 +15,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner.Project) model.StageRecord {
+func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner.Project, progress func(RunProgress)) model.StageRecord {
 	start := time.Now()
 	record := startStage("B")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "B_docker.log")
@@ -78,13 +78,24 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		logWriter = logFile
 	}
 	runDockerStep := func(name string, timeout time.Duration, args []string, required bool) executor.Result {
-		fmt.Fprintf(logWriter, "=== %s start ===\n", name)
+		startLine := fmt.Sprintf("=== %s start ===", name)
+		fmt.Fprintln(logWriter, startLine)
+		appendStreamProgress(run.RunID, "B", startLine, "p2r", false, progress)
 		if len(args) == 0 {
-			fmt.Fprintf(logWriter, "%s skipped\n=== %s end: skipped ===\n\n", name, name)
+			skippedLine := name + " skipped"
+			endLine := fmt.Sprintf("=== %s end: skipped ===", name)
+			fmt.Fprintf(logWriter, "%s\n%s\n\n", skippedLine, endLine)
+			appendStreamProgress(run.RunID, "B", skippedLine, "p2r", false, progress)
+			appendStreamProgress(run.RunID, "B", endLine, "p2r", true, progress)
 			return executor.Result{}
 		}
-		result := r.exec.RunStreaming(ctx, timeout, workDir, nil, logWriter, "docker", args...)
-		fmt.Fprintf(logWriter, "\n=== %s end: exit=%d timeout=%t err=%v ===\n\n", name, result.ExitCode, result.Timeout, result.Err)
+		onOutput := func(line string, source string) {
+			appendStreamProgress(run.RunID, "B", line, source, false, progress)
+		}
+		result := r.exec.RunStreamingWithOutput(ctx, timeout, workDir, nil, logWriter, onOutput, "docker", args...)
+		endLine := fmt.Sprintf("=== %s end: exit=%d timeout=%t err=%v ===", name, result.ExitCode, result.Timeout, result.Err)
+		fmt.Fprintf(logWriter, "\n%s\n\n", endLine)
+		appendStreamProgress(run.RunID, "B", endLine, "p2r", true, progress)
 		if result.Err != nil && required {
 			_, _ = renderLogFile(logPath, screenshotPath)
 		}
@@ -129,11 +140,15 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		}
 	}
 	fmt.Fprintln(logWriter, "=== B4 health check probe start ===")
+	appendStreamProgress(run.RunID, "B", "=== B4 health check probe start ===", "p2r", false, progress)
 	probes := probeMappings(mappings, minDuration(r.stageTimeout("B_HEALTH", 60), time.Duration(r.cfg.Docker.HealthCheckTimeoutSeconds)*time.Second))
 	for _, probe := range probes {
-		fmt.Fprintf(logWriter, "%s %s ok=%t status=%d error=%s\n", probe.Service, probe.URL, probe.OK, probe.Status, probe.Error)
+		line := fmt.Sprintf("%s %s ok=%t status=%d error=%s", probe.Service, probe.URL, probe.OK, probe.Status, probe.Error)
+		fmt.Fprintln(logWriter, line)
+		appendStreamProgress(run.RunID, "B", line, "p2r", false, progress)
 	}
 	fmt.Fprintln(logWriter, "=== B4 health check probe end ===")
+	appendStreamProgress(run.RunID, "B", "=== B4 health check probe end ===", "p2r", false, progress)
 	portMap := map[string]any{
 		"run_id":          run.RunID,
 		"compose_project": projectName,

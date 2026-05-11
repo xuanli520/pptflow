@@ -44,36 +44,39 @@ func (s JobState) String() string {
 }
 
 type Job struct {
-	JobID        string
-	RunID        string
-	TaskID       string
-	State        JobState
-	CurrentStage string
-	Stages       []model.StageRecord
-	Result       *pipeline.Result
-	Err          error
-	SubmittedAt  time.Time
-	StartedAt    time.Time
-	FinishedAt   time.Time
+	JobID         string
+	RunID         string
+	TaskID        string
+	State         JobState
+	CurrentStage  string
+	Stages        []model.StageRecord
+	Result        *pipeline.Result
+	Err           error
+	SubmittedAt   time.Time
+	StartedAt     time.Time
+	FinishedAt    time.Time
+	StreamByStage map[string]pipeline.StreamUpdate
 
-	opts            pipeline.RunOptions
-	cancel          context.CancelFunc
-	cancelRequested bool
-	mu              sync.RWMutex
+	opts               pipeline.RunOptions
+	cancel             context.CancelFunc
+	cancelRequested    bool
+	streamLinesByStage map[string][]pipeline.StreamLine
+	mu                 sync.RWMutex
 }
 
 type JobSnapshot struct {
-	JobID        string
-	RunID        string
-	TaskID       string
-	State        JobState
-	CurrentStage string
-	Stages       []model.StageRecord
-	Result       *pipeline.Result
-	Err          string
-	SubmittedAt  time.Time
-	StartedAt    time.Time
-	FinishedAt   time.Time
+	JobID         string
+	RunID         string
+	TaskID        string
+	State         JobState
+	CurrentStage  string
+	Stages        []model.StageRecord
+	Result        *pipeline.Result
+	Err           string
+	SubmittedAt   time.Time
+	StartedAt     time.Time
+	FinishedAt    time.Time
+	StreamByStage map[string]pipeline.StreamUpdate
 
 	CancelRequested bool
 }
@@ -265,6 +268,7 @@ func (s *Scheduler) Snapshot() []JobSnapshot {
 			SubmittedAt:     job.SubmittedAt,
 			StartedAt:       job.StartedAt,
 			FinishedAt:      job.FinishedAt,
+			StreamByStage:   cloneStreamByStage(job.StreamByStage),
 			CancelRequested: job.cancelRequested,
 		}
 		if job.Err != nil {
@@ -421,6 +425,12 @@ func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {
 	if update.RunID != "" {
 		job.RunID = update.RunID
 	}
+	if update.Event == pipeline.EventStageStream && update.Stream != nil {
+		applyStreamUpdateLocked(job, update)
+		job.mu.Unlock()
+		s.notify()
+		return
+	}
 	if update.StageRecord.Stage != "" {
 		job.Stages = upsertStage(job.Stages, update.StageRecord)
 	}
@@ -550,6 +560,61 @@ func applyResultLocked(job *Job, result pipeline.Result) {
 	job.CurrentStage = ""
 }
 
+const maxStreamLines = 200
+
+func applyStreamUpdateLocked(job *Job, update pipeline.RunProgress) {
+	if job.StreamByStage == nil {
+		job.StreamByStage = map[string]pipeline.StreamUpdate{}
+	}
+	stage := strings.TrimSpace(update.Stream.Stage)
+	if stage == "" {
+		stage = strings.TrimSpace(update.Stage)
+	}
+	if stage == "" {
+		return
+	}
+
+	stream := *update.Stream
+	stream.Stage = stage
+	if stream.Mode == pipeline.StreamModeAppend {
+		if job.streamLinesByStage == nil {
+			job.streamLinesByStage = map[string][]pipeline.StreamLine{}
+		}
+		previous := job.StreamByStage[stage]
+		stream.Truncated = stream.Truncated || previous.Truncated
+		lineText := strings.TrimRight(stream.Delta, "\r\n")
+		if stream.Source != "" || stream.Delta != "" {
+			source := strings.TrimSpace(stream.Source)
+			if source == "" {
+				source = "stdout"
+			}
+			job.streamLinesByStage[stage] = append(job.streamLinesByStage[stage], pipeline.StreamLine{
+				Source: source,
+				Text:   lineText,
+			})
+		}
+		if len(job.streamLinesByStage[stage]) > maxStreamLines {
+			drop := len(job.streamLinesByStage[stage]) - maxStreamLines
+			job.streamLinesByStage[stage] = append([]pipeline.StreamLine(nil), job.streamLinesByStage[stage][drop:]...)
+			stream.Truncated = true
+		}
+		stream.Lines = append([]pipeline.StreamLine(nil), job.streamLinesByStage[stage]...)
+		stream.Text = streamLinesText(stream.Lines)
+	}
+	job.StreamByStage[stage] = stream
+}
+
+func streamLinesText(lines []pipeline.StreamLine) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	values := make([]string, 0, len(lines))
+	for _, line := range lines {
+		values = append(values, line.Text)
+	}
+	return strings.Join(values, "\n")
+}
+
 func finishCancelledJobLocked(job *Job, now time.Time) {
 	job.State = JobCancelled
 	job.Err = ErrJobCancelledByUser
@@ -588,6 +653,18 @@ func cloneResult(result *pipeline.Result) *pipeline.Result {
 	cloned := *result
 	cloned.Stages = append([]model.StageRecord(nil), result.Stages...)
 	return &cloned
+}
+
+func cloneStreamByStage(input map[string]pipeline.StreamUpdate) map[string]pipeline.StreamUpdate {
+	if len(input) == 0 {
+		return nil
+	}
+	output := make(map[string]pipeline.StreamUpdate, len(input))
+	for stage, update := range input {
+		update.Lines = append([]pipeline.StreamLine(nil), update.Lines...)
+		output[stage] = update
+	}
+	return output
 }
 
 func firstErr(err error, fallback error) error {

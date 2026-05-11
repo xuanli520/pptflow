@@ -17,7 +17,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
-func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output string, compat ...string) model.StageRecord {
+func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output string, progress func(RunProgress), compat ...string) model.StageRecord {
 	start := time.Now()
 	record := startStage(stage)
 	logPath := filepath.Join(run.ArtifactRoot, "logs", fmt.Sprintf("%s_static.log", stage))
@@ -203,7 +203,7 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 	timeout := r.stageTimeout(stage, 300)
 	prompt := codexPrompt(stage, profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
 	args := append([]string{}, extraArgs...)
-	review := r.runCodexReviewWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args)
+	review := r.runCodexReviewWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args, codexDeltaProgress(run.RunID, stage, progress))
 	recordArtifactWarnings(&record, writer, review.ArtifactWarnings)
 	outcome := finalizeStaticReviewReport(stage, profile, project.Path, outputPath, review.Result, r.cfg.Codex.MaxOutputBytes)
 	record.Findings = append(record.Findings, outcome.Findings...)

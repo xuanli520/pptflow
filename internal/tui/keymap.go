@@ -75,9 +75,11 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		return m, cmds
 	case "tab":
 		m.switchPanel(1)
+		m.detailFollowTail = true
 		return m, append(cmds, m.reloadDetail())
 	case "shift+tab":
 		m.switchPanel(-1)
+		m.detailFollowTail = true
 		return m, append(cmds, m.reloadDetail())
 	case "esc":
 		m.handleEscape()
@@ -164,16 +166,26 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		switch key {
 		case "up":
 			m.detail.LineUp(1)
+			m.detailFollowTail = false
 		case "down":
 			m.detail.LineDown(1)
+			if m.detail.AtBottom() {
+				m.detailFollowTail = true
+			}
 		case "pgup":
 			m.detail.PageUp()
+			m.detailFollowTail = false
 		case "pgdown":
 			m.detail.PageDown()
+			if m.detail.AtBottom() {
+				m.detailFollowTail = true
+			}
 		case "home":
 			m.detail.GotoTop()
+			m.detailFollowTail = false
 		case "end":
 			m.detail.GotoBottom()
+			m.detailFollowTail = true
 		case "left", "esc":
 			m.setFocus(focusStageList)
 		case "m":
@@ -201,6 +213,7 @@ func (m *app) switchPanel(delta int) {
 
 func (m *app) enterExecution() {
 	m.tab = panelExecution
+	m.detailFollowTail = true
 	if m.qaMode == "recheck" && len(m.detailVM.RefRuns) > 0 {
 		m.setFocus(focusRefRunList)
 		return
