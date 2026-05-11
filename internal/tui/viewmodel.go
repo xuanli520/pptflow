@@ -348,14 +348,14 @@ func renderAppendStreamContent(stream pipeline.StreamUpdate, width, budget int) 
 		rendered = append(rendered, mutedStyle.Render("...（实时输出已截断，仅显示最近 200 行）"))
 	}
 	for _, line := range lines {
-		text := truncateDisplay(line.Text, max(8, width-2))
+		lineWidth := max(8, width-2)
 		switch strings.ToLower(strings.TrimSpace(line.Source)) {
 		case "stderr":
-			rendered = append(rendered, errorStyle.Render("[stderr] "+text))
+			rendered = append(rendered, errorStyle.Render(truncateDisplay("[stderr] "+line.Text, lineWidth)))
 		case "p2r":
-			rendered = append(rendered, mutedStyle.Render(text))
+			rendered = append(rendered, mutedStyle.Render(truncateDisplay(line.Text, lineWidth)))
 		default:
-			rendered = append(rendered, mutedStyle.Render(text))
+			rendered = append(rendered, mutedStyle.Render(truncateDisplay(line.Text, lineWidth)))
 		}
 	}
 	if stream.Done {

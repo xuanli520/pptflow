@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -175,6 +174,79 @@ func (d *outputDispatcher) run() {
 	}
 }
 
+type commandStreamWriter struct {
+	source     string
+	output     *bytes.Buffer
+	writer     io.Writer
+	writerMu   *sync.Mutex
+	dispatcher *outputDispatcher
+
+	mu      sync.Mutex
+	pending []byte
+}
+
+func newCommandStreamWriter(source string, output *bytes.Buffer, writer io.Writer, writerMu *sync.Mutex, dispatcher *outputDispatcher) *commandStreamWriter {
+	return &commandStreamWriter{
+		source:     source,
+		output:     output,
+		writer:     writer,
+		writerMu:   writerMu,
+		dispatcher: dispatcher,
+	}
+}
+
+func (w *commandStreamWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.output != nil {
+		_, _ = w.output.Write(p)
+	}
+	w.emitLinesLocked(p)
+
+	if w.writer == nil {
+		return len(p), nil
+	}
+	w.writerMu.Lock()
+	n, err := w.writer.Write(p)
+	w.writerMu.Unlock()
+	if err != nil {
+		return n, err
+	}
+	if n != len(p) {
+		return n, io.ErrShortWrite
+	}
+	return len(p), nil
+}
+
+func (w *commandStreamWriter) emitLinesLocked(p []byte) {
+	w.pending = append(w.pending, p...)
+	for {
+		index := bytes.IndexByte(w.pending, '\n')
+		if index < 0 {
+			return
+		}
+		line := string(w.pending[:index+1])
+		rest := append([]byte(nil), w.pending[index+1:]...)
+		w.pending = rest
+		w.dispatcher.emit(outputEvent{line: line, source: w.source})
+	}
+}
+
+func (w *commandStreamWriter) flushPending() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) == 0 {
+		return
+	}
+	line := string(w.pending)
+	w.pending = nil
+	w.dispatcher.emit(outputEvent{line: line, source: w.source})
+}
+
 func runCommandStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput OutputCallback, name string, args ...string) Result {
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -188,56 +260,21 @@ func runCommandStreamingWithOutput(ctx context.Context, timeout time.Duration, d
 	if len(env) > 0 {
 		cmd.Env = env
 	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return Result{Command: command, Err: err, Stderr: err.Error()}
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return Result{Command: command, Err: err, Stderr: err.Error()}
-	}
-	if err := cmd.Start(); err != nil {
-		return Result{Command: command, Err: err, Stderr: err.Error()}
-	}
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	var writerMu sync.Mutex
-	var readMu sync.Mutex
-	var readErr error
-	setReadErr := func(err error) {
-		if err == nil {
-			return
-		}
-		readMu.Lock()
-		if readErr == nil {
-			readErr = err
-		}
-		readMu.Unlock()
-	}
-
-	var readWG sync.WaitGroup
-	readWG.Add(2)
 	dispatcher := newOutputDispatcher(onOutput)
-	go func() {
-		defer readWG.Done()
-		setReadErr(copyCommandStream(stdoutPipe, "stdout", &stdout, writer, &writerMu, dispatcher))
-	}()
-	go func() {
-		defer readWG.Done()
-		setReadErr(copyCommandStream(stderrPipe, "stderr", &stderr, writer, &writerMu, dispatcher))
-	}()
+	stdoutWriter := newCommandStreamWriter("stdout", &stdout, writer, &writerMu, dispatcher)
+	stderrWriter := newCommandStreamWriter("stderr", &stderr, writer, &writerMu, dispatcher)
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 
-	err = cmd.Wait()
+	err := cmd.Run()
 	waitCtxErr := ctx.Err()
-	readWG.Wait()
+	stdoutWriter.flushPending()
+	stderrWriter.flushPending()
 	dispatcher.closeAndWait()
-
-	readMu.Lock()
-	if err == nil {
-		err = readErr
-	}
-	readMu.Unlock()
 
 	result := Result{
 		Command: command,
@@ -254,26 +291,4 @@ func runCommandStreamingWithOutput(ctx context.Context, timeout time.Duration, d
 		result.ExitCode = exitErr.ExitCode()
 	}
 	return result
-}
-
-func copyCommandStream(reader io.Reader, source string, output *bytes.Buffer, writer io.Writer, writerMu *sync.Mutex, dispatcher *outputDispatcher) error {
-	buf := bufio.NewReader(reader)
-	for {
-		line, err := buf.ReadString('\n')
-		if len(line) > 0 {
-			output.WriteString(line)
-			if writer != nil {
-				writerMu.Lock()
-				_, _ = writer.Write([]byte(line))
-				writerMu.Unlock()
-			}
-			dispatcher.emit(outputEvent{line: line, source: source})
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
 }

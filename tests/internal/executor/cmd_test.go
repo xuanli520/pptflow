@@ -48,6 +48,7 @@ set -euo pipefail
 echo out-one
 echo err-one >&2
 echo out-two
+printf tail-without-newline
 `), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -61,17 +62,40 @@ echo out-two
 	if result.Err != nil {
 		t.Fatalf("streaming command failed: %#v", result)
 	}
-	if !strings.Contains(result.Stdout, "out-one") || !strings.Contains(result.Stdout, "out-two") || !strings.Contains(result.Stderr, "err-one") {
+	if !strings.Contains(result.Stdout, "out-one") || !strings.Contains(result.Stdout, "out-two") || !strings.Contains(result.Stdout, "tail-without-newline") || !strings.Contains(result.Stderr, "err-one") {
 		t.Fatalf("stdout/stderr not captured: %#v", result)
 	}
 	if !strings.Contains(writer.String(), "out-one") || !strings.Contains(writer.String(), "err-one") {
 		t.Fatalf("writer did not receive both streams:\n%s", writer.String())
 	}
 	got := strings.Join(events, ",")
-	for _, want := range []string{"stdout:out-one", "stdout:out-two", "stderr:err-one"} {
+	for _, want := range []string{"stdout:out-one", "stdout:out-two", "stdout:tail-without-newline", "stderr:err-one"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing output callback %q in %q", want, got)
 		}
+	}
+}
+
+func TestRunStreamingWithOutputReportsWriterErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell streaming test is Unix-specific")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "stream.sh")
+	if err := os.WriteFile(script, []byte(`#!/usr/bin/env bash
+set -euo pipefail
+echo out-one
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := executor.New().RunStreamingWithOutput(context.Background(), time.Second, dir, nil, failingWriter{}, nil, script)
+
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "write boom") {
+		t.Fatalf("writer error should be returned, got %#v", result)
+	}
+	if !strings.Contains(result.Stdout, "out-one") {
+		t.Fatalf("stdout should still capture bytes before writer failure: %#v", result)
 	}
 }
 
@@ -103,4 +127,10 @@ sleep 5
 	if result.Timeout {
 		t.Fatalf("parent cancellation should not be reported as timeout: %#v", result)
 	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write boom")
 }
