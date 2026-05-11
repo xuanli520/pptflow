@@ -157,6 +157,70 @@ func TestAppServerSessionCompactsCompletedItemLogs(t *testing.T) {
 	}
 }
 
+func TestAppServerSessionEmitsActivityPreviewWithoutAgentDelta(t *testing.T) {
+	var updates []pipelinepkg.CodexDeltaUpdate
+	session := pipelinepkg.NewAppServerSessionProbeForTest("", "turn-test", 0, func(update pipelinepkg.CodexDeltaUpdate) {
+		updates = append(updates, update)
+	})
+	stream := strings.Join([]string{
+		mustRPCLine(t, map[string]any{
+			"method": "item/started",
+			"params": map[string]any{
+				"threadId": "thread-test",
+				"turnId":   "turn-test",
+				"item": map[string]any{
+					"id":      "call-1",
+					"type":    "commandExecution",
+					"command": "rg TODO",
+				},
+			},
+		}),
+		mustRPCLine(t, map[string]any{
+			"method": "item/completed",
+			"params": map[string]any{
+				"threadId": "thread-test",
+				"turnId":   "turn-test",
+				"item": map[string]any{
+					"id":      "call-1",
+					"type":    "commandExecution",
+					"command": "rg TODO",
+				},
+			},
+		}),
+	}, "\n") + "\n"
+
+	session.ReadStdout(stream)
+
+	if len(updates) != 2 {
+		t.Fatalf("activity updates = %#v, want start and completion", updates)
+	}
+	if !strings.Contains(updates[0].Text, "Codex 正在执行命令: rg TODO") {
+		t.Fatalf("activity preview missing command start: %#v", updates)
+	}
+	if updates[0].Done || updates[1].Done {
+		t.Fatalf("activity updates should not mark agent response done: %#v", updates)
+	}
+	if report := session.FinalReport(); report != "" {
+		t.Fatalf("activity preview should not affect final report, got %q", report)
+	}
+}
+
+func TestAppServerSessionCompletedOnlyAgentMessageEmitsPreview(t *testing.T) {
+	var updates []pipelinepkg.CodexDeltaUpdate
+	session := pipelinepkg.NewAppServerSessionProbeForTest("", "turn-test", 0, func(update pipelinepkg.CodexDeltaUpdate) {
+		updates = append(updates, update)
+	})
+
+	session.RecordCompletedItem("turn-test", "item-1", "completed-only final text")
+
+	if len(updates) != 1 {
+		t.Fatalf("completed-only agent updates = %#v, want one", updates)
+	}
+	if !updates[0].Done || updates[0].Text != "completed-only final text" {
+		t.Fatalf("completed-only update = %#v, want done final text", updates[0])
+	}
+}
+
 func TestAppServerSessionAggregatesDeltaOnceAfterItemCompleted(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "codex.log")
 	session := pipelinepkg.NewAppServerSessionProbeForTest(logPath, "turn-test", 1<<20, nil)

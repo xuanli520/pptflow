@@ -742,7 +742,7 @@ func (m *app) updateDetailContent(resetScroll bool) {
 			m.detail.GotoTop()
 		}
 		if m.detailFollowTail && m.currentStageHasRunningStream() {
-			m.detail.GotoBottom()
+			m.detail.GotoTop()
 		}
 		return
 	}
@@ -752,7 +752,7 @@ func (m *app) updateDetailContent(resetScroll bool) {
 		m.detail.GotoTop()
 	}
 	if m.detailFollowTail && m.currentStageHasRunningStream() {
-		m.detail.GotoBottom()
+		m.detail.GotoTop()
 	}
 }
 

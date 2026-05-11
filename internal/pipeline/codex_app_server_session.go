@@ -40,6 +40,9 @@ type appServerCodexReviewSession struct {
 	deltaLogged           map[string]bool
 	deltaPreview          map[string]string
 	deltaPreviewTruncated map[string]bool
+	activityPreview       string
+	activityTruncated     bool
+	agentPreviewStarted   bool
 	itemDone              map[string]bool
 	itemOrder             []string
 	stderr                bytes.Buffer
@@ -777,6 +780,16 @@ func (s *appServerCodexReviewSession) emitDeltaUpdate(update CodexDeltaUpdate, o
 
 func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMessage) {
 	switch message.Method {
+	case "item/started":
+		var params struct {
+			ThreadID string          `json:"threadId"`
+			TurnID   string          `json:"turnId"`
+			Item     json.RawMessage `json:"item"`
+		}
+		if json.Unmarshal(message.Params, &params) == nil {
+			item := appServerItemFromRaw(params.Item)
+			s.recordItemActivity(params.TurnID, item.ID, item.Type, params.Item, false)
+		}
 	case "item/agentMessage/delta":
 		var params struct {
 			ThreadID string `json:"threadId"`
@@ -796,6 +809,8 @@ func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMes
 		if json.Unmarshal(message.Params, &params) == nil && params.Item.Type == "agentMessage" {
 			s.recordCompletedItem(params.TurnID, params.Item.ID, params.Item.Text)
 			s.logAggregatedDelta(params.Item.ID)
+		} else if json.Unmarshal(message.Params, &params) == nil {
+			s.recordItemActivity(params.TurnID, params.Item.ID, params.Item.Type, message.Params, true)
 		}
 	case "turn/completed":
 		var params struct {
@@ -818,6 +833,122 @@ func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMes
 			s.logRemainingAggregatedDeltas()
 			s.completeTurn(params.Turn.ID, params.Turn.Status, params.Turn.Error)
 		}
+	}
+}
+
+func appServerItemFromRaw(raw json.RawMessage) appServerItem {
+	var item appServerItem
+	_ = json.Unmarshal(raw, &item)
+	return item
+}
+
+func (s *appServerCodexReviewSession) recordItemActivity(turnID, itemID, itemType string, raw json.RawMessage, done bool) {
+	itemType = strings.TrimSpace(itemType)
+	if itemType == "" || itemType == "userMessage" {
+		return
+	}
+	s.mu.Lock()
+	if s.completed || (s.turnID != "" && turnID != s.turnID) || s.agentPreviewStarted {
+		s.mu.Unlock()
+		return
+	}
+	line := codexActivityLine(itemType, raw, done)
+	if line == "" {
+		s.mu.Unlock()
+		return
+	}
+	if itemID == "" {
+		itemID = "__codex_activity__"
+	}
+	preview, truncated := deltaPreviewText(s.activityPreview+line+"\n", s.activityTruncated)
+	s.activityPreview = preview
+	s.activityTruncated = truncated
+	update := CodexDeltaUpdate{
+		TurnID:    firstNonEmpty(turnID, s.turnID),
+		ItemID:    itemID,
+		Delta:     line + "\n",
+		Text:      preview,
+		Truncated: truncated,
+	}
+	s.mu.Unlock()
+	s.emitDeltaUpdate(update, true)
+}
+
+func codexActivityLine(itemType string, raw json.RawMessage, done bool) string {
+	detail := appServerActivityDetail(raw)
+	switch itemType {
+	case "agentMessage":
+		if done {
+			return "Codex 已完成回复。"
+		}
+		return "Codex 正在生成回复..."
+	case "reasoning":
+		if done {
+			return "Codex 完成一段分析。"
+		}
+		return "Codex 正在分析..."
+	case "commandExecution":
+		if done {
+			if detail != "" {
+				return "Codex 完成命令: " + detail
+			}
+			return "Codex 完成命令执行。"
+		}
+		if detail != "" {
+			return "Codex 正在执行命令: " + detail
+		}
+		return "Codex 正在执行命令..."
+	default:
+		if done {
+			return "Codex 完成事件: " + truncateAppServerLogValue(itemType)
+		}
+		return "Codex 事件: " + truncateAppServerLogValue(itemType)
+	}
+}
+
+func appServerActivityDetail(raw json.RawMessage) string {
+	for _, path := range [][]string{
+		{"item", "command"},
+		{"item", "cmd"},
+		{"item", "name"},
+		{"item", "title"},
+		{"command"},
+		{"cmd"},
+		{"name"},
+		{"title"},
+	} {
+		if value := appServerStringAtPath(raw, path...); value != "" {
+			return truncateAppServerLogValue(value)
+		}
+	}
+	return ""
+}
+
+func appServerStringAtPath(raw json.RawMessage, path ...string) string {
+	var value any
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	for _, key := range path {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return ""
+		}
+		value = object[key]
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+				parts = append(parts, strings.TrimSpace(text))
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
 	}
 }
 
@@ -848,6 +979,7 @@ func (s *appServerCodexReviewSession) recordDelta(turnID, itemID, delta string) 
 		}
 	}
 	s.deltas[itemID] += delta
+	s.agentPreviewStarted = true
 	if s.itemDone[itemID] {
 		s.mu.Unlock()
 		return
@@ -896,6 +1028,9 @@ func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text s
 	s.items[itemID] = text
 	hadPreview := s.deltaPreview[itemID] != "" || s.deltas[itemID] != ""
 	s.itemDone[itemID] = true
+	if text != "" {
+		s.agentPreviewStarted = true
+	}
 	preview := s.deltaPreview[itemID]
 	truncated := s.deltaPreviewTruncated[itemID]
 	if text != "" {
@@ -909,7 +1044,7 @@ func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text s
 		Truncated: truncated,
 	}
 	s.mu.Unlock()
-	s.emitDeltaUpdate(update, hadPreview)
+	s.emitDeltaUpdate(update, hadPreview || text != "")
 }
 
 func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnErr *struct {

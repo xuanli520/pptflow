@@ -260,7 +260,7 @@ func TestExecutionDetailKeepsFinishedJobStreamUntilDBConfirmsStageDone(t *testin
 	}
 }
 
-func TestDetailFollowTailStopsAfterPageUpAndResumesAtEnd(t *testing.T) {
+func TestRunningStreamStaysPinnedToPrimaryContent(t *testing.T) {
 	lines := make([]pipeline.StreamLine, 0, 40)
 	for i := 0; i < 40; i++ {
 		lines = append(lines, pipeline.StreamLine{Source: "stdout", Text: fmt.Sprintf("line-%02d", i)})
@@ -280,8 +280,12 @@ func TestDetailFollowTailStopsAfterPageUpAndResumesAtEnd(t *testing.T) {
 				"C": {Stage: "C", Mode: pipeline.StreamModeAppend, Lines: lines},
 			},
 		}})
-	if h.DetailYOffset() == 0 {
-		t.Fatal("running stream should follow the bottom by default")
+	if h.DetailYOffset() != 0 {
+		t.Fatalf("running stream should stay pinned to primary content, offset=%d", h.DetailYOffset())
+	}
+	view := h.View()
+	if !strings.Contains(view, "line-39") || !strings.Contains(view, "运行证据") {
+		t.Fatalf("running stream should show recent stream and evidence header, got:\n%s", view)
 	}
 	h, _ = h.Press("pgup")
 	offsetAfterPageUp := h.DetailYOffset()
@@ -300,8 +304,11 @@ func TestDetailFollowTailStopsAfterPageUpAndResumesAtEnd(t *testing.T) {
 	if h.DetailYOffset() != offsetAfterPageUp {
 		t.Fatalf("PageUp should disable follow-tail, offset %d -> %d", offsetAfterPageUp, h.DetailYOffset())
 	}
+	h, _ = h.Press("home")
+	if h.DetailFollowTail() {
+		t.Fatal("Home should keep follow-tail disabled")
+	}
 	h, _ = h.Press("end")
-	bottom := h.DetailYOffset()
 	if !h.DetailFollowTail() {
 		t.Fatal("End should restore follow-tail")
 	}
@@ -314,8 +321,8 @@ func TestDetailFollowTailStopsAfterPageUpAndResumesAtEnd(t *testing.T) {
 			"C": {Stage: "C", Mode: pipeline.StreamModeAppend, Lines: append(lines, pipeline.StreamLine{Source: "stdout", Text: "another line"})},
 		},
 	}})
-	if h.DetailYOffset() < bottom {
-		t.Fatalf("End should restore follow-tail, offset %d -> %d", bottom, h.DetailYOffset())
+	if h.DetailYOffset() != 0 {
+		t.Fatalf("restored follow-tail should return to primary content, offset=%d", h.DetailYOffset())
 	}
 }
 
