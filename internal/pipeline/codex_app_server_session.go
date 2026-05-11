@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -18,26 +20,27 @@ import (
 )
 
 type appServerCodexReviewSession struct {
-	mu        sync.Mutex
-	writeMu   sync.Mutex
-	req       CodexReviewRequest
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	cancel    context.CancelFunc
-	done      chan struct{}
-	result    CodexReviewResult
-	err       error
-	nextID    int
-	responses map[int]chan appServerRPCMessage
-	threadID  string
-	turnID    string
-	items     map[string]string
-	deltas    map[string]string
-	itemOrder []string
-	stderr    bytes.Buffer
-	completed bool
-	envKeys   []string
-	warnings  []ArtifactWarning
+	mu         sync.Mutex
+	writeMu    sync.Mutex
+	req        CodexReviewRequest
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	processCtx context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	result     CodexReviewResult
+	err        error
+	nextID     int
+	responses  map[int]chan appServerRPCMessage
+	threadID   string
+	turnID     string
+	items      map[string]string
+	deltas     map[string]string
+	itemOrder  []string
+	stderr     bytes.Buffer
+	completed  bool
+	envKeys    []string
+	warnings   []ArtifactWarning
 }
 
 type appServerRPCMessage struct {
@@ -97,6 +100,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 		runCtx, cancel = context.WithCancel(ctx)
 	}
 	s.mu.Lock()
+	s.processCtx = runCtx
 	s.cancel = cancel
 	s.mu.Unlock()
 	args := []string{"app-server", "-c", `approval_policy="never"`, "-c", `sandbox_mode="read-only"`, "--listen", "stdio://"}
@@ -127,7 +131,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 		"\nCodex env keys: " + strings.Join(s.envKeys, ",") +
 		"\nTimeout: " + request.Timeout.String() +
 		"\nStarted: " + time.Now().UTC().Format(time.RFC3339) +
-		"\n\n=== codex app-server JSON-RPC stream start ===\n"
+		"\n\n=== codex app-server JSON-RPC compact event log start ===\n"
 	if err := writeText(request.LogPath, preamble); err != nil {
 		s.addArtifactWarning(newArtifactWarning(request.LogPath, "write_text", false, err))
 	}
@@ -327,11 +331,12 @@ func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
 	scanner.Buffer(make([]byte, 0, 64*1024), appServerMaxLineBytes(s.maxOutputBytes()))
 	for scanner.Scan() {
 		line := scanner.Text()
-		s.appendLog(line + "\n")
 		var message appServerRPCMessage
 		if err := json.Unmarshal([]byte(line), &message); err != nil {
+			s.appendLog("STDOUT: " + truncateAppServerLogValue(line) + "\n")
 			continue
 		}
+		s.appendLog(formatAppServerRPCLogLine(message))
 		if len(message.ID) > 0 && message.Method == "" {
 			if id, ok := rpcIDInt(message.ID); ok {
 				s.dispatchResponse(id, message)
@@ -412,6 +417,9 @@ func (s *appServerCodexReviewSession) completeStreamError(stream string, err err
 	if err == nil {
 		return
 	}
+	if s.ignoreStreamError(err) {
+		return
+	}
 	streamErr := fmt.Errorf("codex app-server %s stream error: %w", stream, err)
 	s.appendLog("Codex app-server " + stream + " stream error: " + err.Error() + "\n")
 	s.mu.Lock()
@@ -422,6 +430,28 @@ func (s *appServerCodexReviewSession) completeStreamError(stream string, err err
 	stderr := s.stderr.String()
 	s.mu.Unlock()
 	s.complete(executor.Result{Command: command, Stderr: stderr, Err: streamErr}, streamErr)
+}
+
+func (s *appServerCodexReviewSession) ignoreStreamError(err error) bool {
+	s.mu.Lock()
+	completed := s.completed
+	processCtx := s.processCtx
+	s.mu.Unlock()
+	if completed {
+		return true
+	}
+	return processCtx != nil && processCtx.Err() != nil && isClosedPipeReadError(err)
+}
+
+func isClosedPipeReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrClosed) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "file already closed") || strings.Contains(text, "use of closed file")
 }
 
 func (s *appServerCodexReviewSession) dispatchResponse(id int, message appServerRPCMessage) {
@@ -468,6 +498,141 @@ func rpcIDInt(raw json.RawMessage) (int, bool) {
 		return id, true
 	}
 	return 0, false
+}
+
+func formatAppServerRPCLogLine(message appServerRPCMessage) string {
+	id := appServerRPCIDLog(message.ID)
+	if len(message.ID) > 0 && message.Method == "" {
+		if message.Error != nil {
+			return fmt.Sprintf("JSON-RPC response id=%s error code=%d message=%q\n", id, message.Error.Code, truncateAppServerLogValue(message.Error.Message))
+		}
+		return fmt.Sprintf("JSON-RPC response id=%s result_%s\n", id, appServerJSONSummary(message.Result))
+	}
+	if len(message.ID) > 0 && message.Method != "" {
+		return fmt.Sprintf("JSON-RPC server request id=%s method=%s params_%s\n", id, message.Method, appServerJSONSummary(message.Params))
+	}
+	if message.Method == "" {
+		return fmt.Sprintf("JSON-RPC message params_%s\n", appServerJSONSummary(message.Params))
+	}
+	switch message.Method {
+	case "item/agentMessage/delta":
+		var params struct {
+			TurnID string `json:"turnId"`
+			ItemID string `json:"itemId"`
+			Delta  string `json:"delta"`
+		}
+		if json.Unmarshal(message.Params, &params) == nil {
+			return fmt.Sprintf(
+				"JSON-RPC notification item/agentMessage/delta turn=%s item=%s delta_bytes=%d delta_sha256=%s\n",
+				compactAppServerLogID(params.TurnID),
+				compactAppServerLogID(params.ItemID),
+				len(params.Delta),
+				shortAppServerLogHash(params.Delta),
+			)
+		}
+	case "item/completed":
+		var params struct {
+			TurnID string        `json:"turnId"`
+			Item   appServerItem `json:"item"`
+		}
+		if json.Unmarshal(message.Params, &params) == nil {
+			return fmt.Sprintf(
+				"JSON-RPC notification item/completed turn=%s item=%s type=%s text_bytes=%d text_sha256=%s\n",
+				compactAppServerLogID(params.TurnID),
+				compactAppServerLogID(params.Item.ID),
+				truncateAppServerLogValue(params.Item.Type),
+				len(params.Item.Text),
+				shortAppServerLogHash(params.Item.Text),
+			)
+		}
+	case "turn/completed":
+		var params struct {
+			Turn struct {
+				ID     string          `json:"id"`
+				Items  []appServerItem `json:"items"`
+				Status string          `json:"status"`
+				Error  *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"turn"`
+		}
+		if json.Unmarshal(message.Params, &params) == nil {
+			if params.Turn.Error != nil && strings.TrimSpace(params.Turn.Error.Message) != "" {
+				return fmt.Sprintf(
+					"JSON-RPC notification turn/completed turn=%s status=%s items=%d error=%q\n",
+					compactAppServerLogID(params.Turn.ID),
+					truncateAppServerLogValue(params.Turn.Status),
+					len(params.Turn.Items),
+					truncateAppServerLogValue(params.Turn.Error.Message),
+				)
+			}
+			return fmt.Sprintf(
+				"JSON-RPC notification turn/completed turn=%s status=%s items=%d\n",
+				compactAppServerLogID(params.Turn.ID),
+				truncateAppServerLogValue(params.Turn.Status),
+				len(params.Turn.Items),
+			)
+		}
+	}
+	return fmt.Sprintf("JSON-RPC notification %s params_%s\n", message.Method, appServerJSONSummary(message.Params))
+}
+
+func appServerRPCIDLog(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "-"
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return compactAppServerLogID(text)
+	}
+	return truncateAppServerLogValue(string(raw))
+}
+
+func appServerJSONSummary(raw json.RawMessage) string {
+	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "" || strings.TrimSpace(string(raw)) == "null" {
+		return "empty"
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		keys := make([]string, 0, len(object))
+		for key := range object {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		if len(keys) > 8 {
+			keys = append(keys[:8], fmt.Sprintf("+%d", len(keys)-8))
+		}
+		return fmt.Sprintf("keys=%s bytes=%d sha256=%s", strings.Join(keys, ","), len(raw), shortAppServerLogHash(string(raw)))
+	}
+	return fmt.Sprintf("bytes=%d sha256=%s", len(raw), shortAppServerLogHash(string(raw)))
+}
+
+func compactAppServerLogID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	if len(value) <= 32 {
+		return value
+	}
+	return value[:18] + "..." + value[len(value)-10:]
+}
+
+func truncateAppServerLogValue(value string) string {
+	const limit = 512
+	value = strings.ReplaceAll(value, "\r", "\\r")
+	value = strings.ReplaceAll(value, "\n", "\\n")
+	value = strings.ReplaceAll(value, "\t", "\\t")
+	return truncateStringPrefix(value, limit)
+}
+
+func shortAppServerLogHash(value string) string {
+	const length = 12
+	sum := sha256Text(value)
+	if len(sum) <= length {
+		return sum
+	}
+	return sum[:length]
 }
 
 func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMessage) {
