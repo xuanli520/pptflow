@@ -186,15 +186,12 @@ func normalizeStaticReviewReport(report string) (string, error) {
 	if report == "" {
 		return "", fmt.Errorf("static review report is empty")
 	}
-	start, blockEnd, _, err := staticReviewJSONBlock(report)
+	blocks, err := staticReviewJSONBlocks(report)
 	if err != nil {
 		return "", err
 	}
-	contract := strings.TrimSpace(report[start:blockEnd])
-	body := strings.TrimSpace(strings.Join([]string{
-		strings.TrimSpace(report[:start]),
-		strings.TrimSpace(report[blockEnd:]),
-	}, "\n\n"))
+	contract := staticReviewContractForBlocks(report, blocks)
+	body := staticReviewReportWithoutBlocks(report, blocks)
 	body, err = trimStaticReviewReportPreamble(body)
 	if err != nil {
 		return "", err
@@ -208,28 +205,125 @@ func extractStaticReviewJSON(report string) (string, error) {
 }
 
 func staticReviewJSONBlock(report string) (int, int, string, error) {
-	start := strings.Index(report, staticReviewJSONStart)
-	if start < 0 {
-		return 0, 0, "", fmt.Errorf("static review report missing %s marker", staticReviewJSONStart)
+	blocks, err := staticReviewJSONBlocks(report)
+	if err != nil {
+		return 0, 0, "", err
 	}
-	afterStart := start + len(staticReviewJSONStart)
-	endOffset := strings.Index(report[afterStart:], staticReviewJSONEnd)
-	if endOffset < 0 {
-		return 0, 0, "", fmt.Errorf("static review report missing %s marker", staticReviewJSONEnd)
-	}
-	end := afterStart + endOffset
-	blockEnd := end + len(staticReviewJSONEnd)
-	if strings.Contains(report[blockEnd:], staticReviewJSONStart) {
+	if len(blocks) > 1 {
 		return 0, 0, "", fmt.Errorf("static review report contains multiple JSON contract blocks")
 	}
-	if strings.Contains(report[blockEnd:], staticReviewJSONEnd) {
-		return 0, 0, "", fmt.Errorf("static review report contains extra JSON contract end markers")
+	block := blocks[0]
+	return block.start, block.blockEnd, block.payload, nil
+}
+
+type staticReviewJSONBlockRange struct {
+	start    int
+	blockEnd int
+	payload  string
+}
+
+func staticReviewJSONBlocks(report string) ([]staticReviewJSONBlockRange, error) {
+	var blocks []staticReviewJSONBlockRange
+	offset := 0
+	for {
+		startOffset := strings.Index(report[offset:], staticReviewJSONStart)
+		if startOffset < 0 {
+			break
+		}
+		start := offset + startOffset
+		afterStart := start + len(staticReviewJSONStart)
+		endOffset := strings.Index(report[afterStart:], staticReviewJSONEnd)
+		if endOffset < 0 {
+			return nil, fmt.Errorf("static review report missing %s marker", staticReviewJSONEnd)
+		}
+		end := afterStart + endOffset
+		blockEnd := end + len(staticReviewJSONEnd)
+		payload := trimMarkdownFence(strings.TrimSpace(report[afterStart:end]))
+		if payload == "" {
+			return nil, fmt.Errorf("static review JSON contract is empty")
+		}
+		blocks = append(blocks, staticReviewJSONBlockRange{start: start, blockEnd: blockEnd, payload: payload})
+		offset = blockEnd
 	}
-	payload := trimMarkdownFence(strings.TrimSpace(report[afterStart:end]))
-	if payload == "" {
-		return 0, 0, "", fmt.Errorf("static review JSON contract is empty")
+	if len(blocks) == 0 {
+		if strings.Contains(report, staticReviewJSONEnd) {
+			return nil, fmt.Errorf("static review report missing %s marker", staticReviewJSONStart)
+		}
+		return nil, fmt.Errorf("static review report missing %s marker", staticReviewJSONStart)
 	}
-	return start, blockEnd, payload, nil
+	if strings.Count(report, staticReviewJSONEnd) > len(blocks) {
+		return nil, fmt.Errorf("static review report contains extra JSON contract end markers")
+	}
+	return blocks, nil
+}
+
+func staticReviewReportWithoutBlocks(report string, blocks []staticReviewJSONBlockRange) string {
+	var builder strings.Builder
+	cursor := 0
+	for _, block := range blocks {
+		builder.WriteString(strings.TrimSpace(report[cursor:block.start]))
+		builder.WriteString("\n\n")
+		cursor = block.blockEnd
+	}
+	builder.WriteString(strings.TrimSpace(report[cursor:]))
+	return strings.TrimSpace(builder.String())
+}
+
+func staticReviewContractForBlocks(report string, blocks []staticReviewJSONBlockRange) string {
+	if len(blocks) > 1 {
+		if contract, ok := combinedStaticReviewContract(blocks); ok {
+			return contract
+		}
+	}
+	contractBlock := blocks[len(blocks)-1]
+	return strings.TrimSpace(report[contractBlock.start:contractBlock.blockEnd])
+}
+
+func combinedStaticReviewContract(blocks []staticReviewJSONBlockRange) (string, bool) {
+	var combined staticReviewReportSchema
+	combined.SchemaVersion = staticReviewSchemaVersion
+	combined.Findings = []staticReviewFindingSchema{}
+	seen := map[string]bool{}
+	for _, block := range blocks {
+		var schema staticReviewReportSchema
+		if err := json.Unmarshal([]byte(block.payload), &schema); err != nil {
+			return "", false
+		}
+		if strings.TrimSpace(schema.SchemaVersion) != staticReviewSchemaVersion {
+			return "", false
+		}
+		if strings.TrimSpace(schema.Stage) == "" {
+			return "", false
+		}
+		if combined.Stage == "" {
+			combined.Stage = strings.TrimSpace(schema.Stage)
+		}
+		if !strings.EqualFold(strings.TrimSpace(schema.Stage), combined.Stage) {
+			return "", false
+		}
+		for _, finding := range schema.Findings {
+			key := strings.Join([]string{
+				strings.TrimSpace(finding.Severity),
+				strings.TrimSpace(finding.Title),
+				strings.TrimSpace(finding.Rule),
+				strings.TrimSpace(string(finding.Evidence)),
+			}, "\x00")
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			combined.Findings = append(combined.Findings, finding)
+		}
+	}
+	content, err := json.MarshalIndent(combined, "", "  ")
+	if err != nil {
+		return "", false
+	}
+	return staticReviewJSONStart + "\n" + string(content) + "\n" + staticReviewJSONEnd, true
+}
+
+func staticReviewMarkerCounts(value string) (int, int) {
+	return strings.Count(value, staticReviewJSONStart), strings.Count(value, staticReviewJSONEnd)
 }
 
 func truncateStaticReviewReport(report string, limit int) string {

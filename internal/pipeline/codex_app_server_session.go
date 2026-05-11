@@ -522,12 +522,15 @@ func formatAppServerRPCLogLine(message appServerRPCMessage) string {
 			Delta  string `json:"delta"`
 		}
 		if json.Unmarshal(message.Params, &params) == nil {
+			starts, ends := staticReviewMarkerCounts(params.Delta)
 			return fmt.Sprintf(
-				"JSON-RPC notification item/agentMessage/delta turn=%s item=%s delta_bytes=%d delta_sha256=%s\n",
+				"JSON-RPC notification item/agentMessage/delta turn=%s item=%s delta_bytes=%d delta_sha256=%s contract_starts=%d contract_ends=%d\n",
 				compactAppServerLogID(params.TurnID),
 				compactAppServerLogID(params.ItemID),
 				len(params.Delta),
 				shortAppServerLogHash(params.Delta),
+				starts,
+				ends,
 			)
 		}
 	case "item/completed":
@@ -536,13 +539,16 @@ func formatAppServerRPCLogLine(message appServerRPCMessage) string {
 			Item   appServerItem `json:"item"`
 		}
 		if json.Unmarshal(message.Params, &params) == nil {
+			starts, ends := staticReviewMarkerCounts(params.Item.Text)
 			return fmt.Sprintf(
-				"JSON-RPC notification item/completed turn=%s item=%s type=%s text_bytes=%d text_sha256=%s\n",
+				"JSON-RPC notification item/completed turn=%s item=%s type=%s text_bytes=%d text_sha256=%s contract_starts=%d contract_ends=%d\n",
 				compactAppServerLogID(params.TurnID),
 				compactAppServerLogID(params.Item.ID),
 				truncateAppServerLogValue(params.Item.Type),
 				len(params.Item.Text),
 				shortAppServerLogHash(params.Item.Text),
+				starts,
+				ends,
 			)
 		}
 	case "turn/completed":

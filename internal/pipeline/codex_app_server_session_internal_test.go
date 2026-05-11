@@ -141,7 +141,7 @@ func TestAppServerSessionCompactsDeltaLogsAndKeepsDeltaReport(t *testing.T) {
 			t.Fatalf("log should contain compact event summaries, not raw delta JSON/content %q:\n%s", forbidden, logText)
 		}
 	}
-	for _, want := range []string{"item/agentMessage/delta", "delta_bytes=6", "delta_bytes=5", "turn/completed"} {
+	for _, want := range []string{"item/agentMessage/delta", "delta_bytes=6", "delta_bytes=5", "contract_starts=0", "contract_ends=0", "turn/completed"} {
 		if !strings.Contains(logText, want) {
 			t.Fatalf("compact log missing %q:\n%s", want, logText)
 		}
@@ -194,7 +194,7 @@ func TestAppServerSessionCompactsCompletedItemLogs(t *testing.T) {
 	if strings.Contains(logText, report) || strings.Contains(logText, `"text"`) {
 		t.Fatalf("completed item log should not include raw report text or JSON envelope:\n%s", logText)
 	}
-	if !strings.Contains(logText, "item/completed") || !strings.Contains(logText, "text_bytes=") {
+	if !strings.Contains(logText, "item/completed") || !strings.Contains(logText, "text_bytes=") || !strings.Contains(logText, "contract_starts=0") || !strings.Contains(logText, "contract_ends=0") {
 		t.Fatalf("completed item compact log missing summary:\n%s", logText)
 	}
 }

@@ -538,6 +538,70 @@ Reviewed repository files only.
 	}
 }
 
+func TestNormalizeStaticReviewReportCollapsesMultipleContractBlocks(t *testing.T) {
+	report := `# Repair Verification
+
+Report 1 body.
+
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "F",
+  "findings": [
+    {
+      "severity": "Low",
+      "title": "earlier block",
+      "rule": "earlier duplicate block should not remain authoritative",
+      "evidence": "repo/old.py:1",
+      "impact": "duplicate blocks make report layout invalid",
+      "minimum_fix": "keep one final contract block"
+    }
+  ]
+}
+<!-- p2r:static-review-json:end -->
+
+## Report 2
+
+Report 2 body.
+
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "F",
+  "findings": [
+    {
+      "severity": "High",
+      "title": "final block",
+      "rule": "the final contract block is the authoritative machine-readable result",
+      "evidence": "repo/new.py:2",
+      "impact": "p2r can parse the final reviewer conclusion",
+      "minimum_fix": "collapse duplicate blocks before schema parsing"
+    }
+  ]
+}
+<!-- p2r:static-review-json:end -->
+`
+	normalized, err := normalizeStaticReviewReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startMarker := "<!-- p2r:static-review-json:start -->"
+	endMarker := "<!-- p2r:static-review-json:end -->"
+	if strings.Count(normalized, startMarker) != 1 || strings.Count(normalized, endMarker) != 1 {
+		t.Fatalf("normalized report should contain exactly one contract block:\n%s", normalized)
+	}
+	if !strings.Contains(normalized, "Report 1 body.") || !strings.Contains(normalized, "Report 2 body.") {
+		t.Fatalf("normalized report should preserve human-readable report bodies:\n%s", normalized)
+	}
+	findings, err := staticReviewFindingsFromReport("F", normalized, "/tmp/report.md")
+	if err != nil {
+		t.Fatalf("collapsed report should satisfy schema: %v\n%s", err, normalized)
+	}
+	if len(findings) != 2 || findings[0].Title != "earlier block" || findings[1].Title != "final block" {
+		t.Fatalf("expected final contract findings to be authoritative, got %#v", findings)
+	}
+}
+
 func TestTruncateStaticReviewReportPreservesContract(t *testing.T) {
 	var body strings.Builder
 	body.WriteString("# Static Review\n\n")

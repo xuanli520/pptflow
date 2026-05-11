@@ -416,7 +416,7 @@ func (r Runner) attachedDocsContext(taskID string) string {
 	}
 	builder.WriteString("Stage F must consider every listed document. Embedded text follows where available.\n")
 	if strings.TrimSpace(attached.Text) != "" {
-		builder.WriteString(attached.Text)
+		builder.WriteString(redactStaticReviewMarkers(attached.Text))
 	}
 	return builder.String()
 }
@@ -505,7 +505,14 @@ func readBoundedText(path string, limit int64) (string, error) {
 }
 
 func untrustedDocument(label, path, content string) string {
+	content = redactStaticReviewMarkers(content)
 	return fmt.Sprintf("\n--- BEGIN UNTRUSTED %s: %s ---\n%s\n--- END UNTRUSTED %s ---\n", label, path, content, label)
+}
+
+func redactStaticReviewMarkers(content string) string {
+	content = strings.ReplaceAll(content, staticReviewJSONStart, "[p2r static-review JSON start marker redacted from untrusted input]")
+	content = strings.ReplaceAll(content, staticReviewJSONEnd, "[p2r static-review JSON end marker redacted from untrusted input]")
+	return content
 }
 
 func safeCodexExtraArgs(args []string) ([]string, error) {
