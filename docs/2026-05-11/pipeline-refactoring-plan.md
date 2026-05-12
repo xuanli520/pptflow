@@ -392,7 +392,7 @@ type Warning struct {
 | 7 | `QA_run_tests_screenshot.png` | C |
 | 8 | `QA_trajectory_archive.png` | A |
 
-pipeline 负责在 run 末尾将上述文件从 `artifactRoot/` 复制（或硬链接）到 submit 目录。
+pipeline 负责在 run 末尾先清空 `result/{batch}/{task}/submit/`，再将上述文件从 `artifactRoot/` 复制到 submit 目录。
 
 ### 3.5 CodexReviewStage 共享实现
 
@@ -450,7 +450,7 @@ RecheckOutput: “prompt_requirements_verification.md”     // → QA_prompt_re
    - Stage E 初始输出 `QA_codex_report.md`，recheck 输出 `QA_codex_report_verification.md`，无兼容副本。
    - Stage F 初始输出 `QA_operator_prompt_requirements_verification.md` + `QA_operator_codex_report_issues_verification.md`。
    - Stage F recheck 输出 `QA_prompt_requirements_verification.md` + `QA_codex_report_issues_verification.md`。
-   - 提交聚合：run 末尾 `result/{batch}/{task}/submit/` 包含完整 8 份文件。
+   - 提交聚合：run 末尾清空并重建 `result/{batch}/{task}/submit/`，目录只包含本次 run 复制出的提交文件。
    - app-server delta compact log、completed item、closed pipe、guidance steer。
    - cancel/abort/crash 会持久化 stage status 和 cleanup summary。
 
@@ -638,7 +638,7 @@ go test ./...
 | Stage E recheck | `QA_codex_report_verification.md` |
 | Stage F initial | `QA_operator_prompt_requirements_verification.md`、`QA_operator_codex_report_issues_verification.md` |
 | Stage F recheck | `QA_prompt_requirements_verification.md`、`QA_codex_report_issues_verification.md` |
-| 提交聚合 | run 末尾将 8 份提交文件从 `artifactRoot/` 复制到 `result/{batch}/{task}/submit/`，清单见 3.4 节 |
+| 提交聚合 | run 末尾清空 `result/{batch}/{task}/submit/`，再将 8 份提交文件从 `artifactRoot/` 复制进去，清单见 3.4 节 |
 | Codex policy | app-server、approval never、read-only sandbox、no network |
 | 静态报告合约 | exactly one `p2r.static_review.v1` JSON block，marker 不变 |
 | `refRunStaticContext` | 读取 ref-run 产物时仅查找新名称（不再尝试兼容旧名） |

@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -27,12 +28,20 @@ type submitArtifactSpec struct {
 
 func (s *runState) aggregateSubmitArtifacts(r Runner) {
 	submitDir := submitRoot(r.cfg.ScanPath, s.prepare.project)
-	copies := aggregateSubmitArtifacts(
+	copies, resetErr := aggregateSubmitArtifacts(
 		s.identity.artifactRoot,
 		submitDir,
 		submitArtifactSpecs(s.prepare.opts.Mode),
 		selectedSubmitStages(s.execution.stages),
 	)
+	if resetErr != nil {
+		s.addArtifactWarning(ArtifactWarning{
+			Path:       submitDir,
+			Op:         "submit_reset",
+			Error:      resetErr.Error(),
+			RecordedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 	for _, item := range copies {
 		if item.OK || item.NotSelected {
 			continue
@@ -45,14 +54,19 @@ func (s *runState) aggregateSubmitArtifacts(r Runner) {
 		})
 	}
 	s.persistArtifactWarnings()
+	reset := map[string]any{"ok": resetErr == nil}
+	if resetErr != nil {
+		reset["error"] = resetErr.Error()
+	}
 	_ = s.identity.writer.BestEffortJSON("submit_manifest.json", map[string]any{
 		"submit_dir": submitDir,
+		"reset":      reset,
 		"files":      copies,
 	})
 }
 
-func aggregateSubmitArtifacts(artifactRoot, submitDir string, specs []submitArtifactSpec, selected map[string]bool) []submitArtifactCopy {
-	_ = os.MkdirAll(submitDir, 0o755)
+func aggregateSubmitArtifacts(artifactRoot, submitDir string, specs []submitArtifactSpec, selected map[string]bool) ([]submitArtifactCopy, error) {
+	resetErr := resetSubmitDir(submitDir)
 	copies := make([]submitArtifactCopy, 0, len(specs))
 	for _, spec := range specs {
 		source := filepath.Join(artifactRoot, spec.Name)
@@ -60,6 +74,11 @@ func aggregateSubmitArtifacts(artifactRoot, submitDir string, specs []submitArti
 		item := submitArtifactCopy{Name: spec.Name, Stage: spec.Stage, Source: source, Target: target}
 		if !selected[spec.Stage] {
 			item.NotSelected = true
+			copies = append(copies, item)
+			continue
+		}
+		if resetErr != nil {
+			item.Error = "reset submit directory: " + resetErr.Error()
 			copies = append(copies, item)
 			continue
 		}
@@ -82,7 +101,18 @@ func aggregateSubmitArtifacts(artifactRoot, submitDir string, specs []submitArti
 		item.OK = true
 		copies = append(copies, item)
 	}
-	return copies
+	return copies, resetErr
+}
+
+func resetSubmitDir(submitDir string) error {
+	submitDir = filepath.Clean(submitDir)
+	if filepath.Base(submitDir) != "submit" {
+		return fmt.Errorf("refusing to reset non-submit directory %q", submitDir)
+	}
+	if err := os.RemoveAll(submitDir); err != nil {
+		return err
+	}
+	return os.MkdirAll(submitDir, 0o755)
 }
 
 func submitRoot(scanPath string, project scanner.Project) string {

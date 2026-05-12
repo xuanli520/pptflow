@@ -266,10 +266,27 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-WARN", Batch: "batch-1", Path: projectPath}}); err != nil {
 		t.Fatal(err)
 	}
+	submitDir := filepath.Join(root, "result", "batch-1", "TASK-WARN", "submit")
+	if err := os.MkdirAll(filepath.Join(submitDir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, stale := range []string{"QA_validate_report.md", "unexpected.txt", filepath.Join("nested", "old.txt")} {
+		if err := os.WriteFile(filepath.Join(submitDir, stale), []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-WARN", pipelinepkg.RunOptions{Stages: []string{"D"}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, stale := range []string{"QA_validate_report.md", "unexpected.txt", filepath.Join("nested", "old.txt")} {
+		if _, err := os.Stat(filepath.Join(submitDir, stale)); !os.IsNotExist(err) {
+			t.Fatalf("submit reset should remove stale %s, stat err: %v", stale, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(submitDir, "QA_test_effectiveness_report.md")); err != nil {
+		t.Fatalf("submit reset should still copy current selected artifact: %v", err)
 	}
 	warnings, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "artifact_warnings.json"))
 	if err == nil && strings.Contains(string(warnings), "submit_copy") {
