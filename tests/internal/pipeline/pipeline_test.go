@@ -35,6 +35,10 @@ func shortComment(stageStatuses map[string]string, findings []model.Finding) str
 	return pipelinepkg.ShortCommentForTest(stageStatuses, findings)
 }
 
+func splitStageFCodexReport(report string) (string, string) {
+	return pipelinepkg.SplitStageFCodexReportForTest(report)
+}
+
 func readmeComposeCommand(repoPath string) []string {
 	return pipelinepkg.ReadmeComposeCommandForTest(repoPath)
 }
@@ -118,6 +122,23 @@ func TestSelectedStagesStaticOnly(t *testing.T) {
 		if selected[stage] {
 			t.Fatalf("expected %s skipped", stage)
 		}
+	}
+}
+
+func TestSplitStageFCodexReportUsesAnyReport2Line(t *testing.T) {
+	report1, report2 := splitStageFCodexReport(`# Repair Summary
+
+Report 1 body.
+
+This line contains Report 2: repair verification issues
+
+Report 2 body.
+`)
+	if !strings.Contains(report1, "Report 1 body.") || strings.Contains(report1, "Report 2 body.") {
+		t.Fatalf("unexpected report 1 split:\n%s", report1)
+	}
+	if !strings.Contains(report2, "This line contains Report 2") || !strings.Contains(report2, "Report 2 body.") {
+		t.Fatalf("unexpected report 2 split:\n%s", report2)
 	}
 }
 

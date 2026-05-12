@@ -243,6 +243,57 @@ func TestStageFUsesPromptAndIssueVerificationArtifactNames(t *testing.T) {
 	}
 }
 
+func TestStageFRequiredIssueReportWriteFailureFailsStage(t *testing.T) {
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profiles := filepath.Join(root, "profiles")
+	if err := os.MkdirAll(profiles, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profiles, "annotator_fix.md"), []byte("profile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), []byte(`{"task_id":"TASK-1","prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	artifactRoot := filepath.Join(root, "runs", "issue-write-failure")
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "QA_operator_codex_report_issues_verification.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.Codex.PromptProfilesDir = profiles
+	record := runnerStageF(
+		pipelinepkg.NewRunner(nil, cfg),
+		context.Background(),
+		model.RunRecord{RunID: "run-issue-write-failure", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: projectPath},
+		pipelinepkg.RunOptions{},
+		nil,
+	)
+
+	if record.Status != model.StageFailed {
+		t.Fatalf("stage F status = %s, want failed; record=%#v", record.Status, record)
+	}
+	if !hasFinding(record.Findings, "INFRA", "Required p2r artifact could not be written") {
+		t.Fatalf("expected required artifact infra finding, got %#v", record.Findings)
+	}
+	if !strings.Contains(record.ErrorSummary, "write required artifact") {
+		t.Fatalf("error summary should preserve artifact write failure, got %q", record.ErrorSummary)
+	}
+}
+
 func TestStageCodexRecheckDoesNotEmitSelfTestCompatibilityAlias(t *testing.T) {
 	root := t.TempDir()
 	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")

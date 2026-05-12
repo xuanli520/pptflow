@@ -174,6 +174,35 @@ def write_markdown_report(output_md, command, result):
     output_path.write_text("\n".join(sections), encoding="utf-8")
 
 
+def tmp_report_candidates(forwarded_args, output_md):
+    if not forwarded_args:
+        return []
+    input_root = Path(forwarded_args[0])
+    output_name = Path(output_md).name
+    names = []
+
+    def add_name(name):
+        if name and name not in names:
+            names.append(name)
+
+    add_name(output_name)
+    if output_name.startswith("QA_"):
+        add_name(output_name[len("QA_"):])
+    add_name("validation_report.md")
+    return [input_root / ".tmp" / name for name in names]
+
+
+def copy_tmp_markdown_report(forwarded_args, output_md):
+    output_path = Path(output_md)
+    for source in tmp_report_candidates(forwarded_args, output_md):
+        if not source.is_file():
+            continue
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(source.read_bytes())
+        return source
+    return None
+
+
 def main():
     try:
         sync_if_needed()
@@ -199,7 +228,8 @@ def main():
             print(result.stdout, end="")
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr)
-        write_markdown_report(output_md, command, result)
+        if copy_tmp_markdown_report(forwarded_args, output_md) is None:
+            write_markdown_report(output_md, command, result)
         return result.returncode
 
     result = subprocess.run(command)

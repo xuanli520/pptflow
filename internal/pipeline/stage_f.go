@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
@@ -35,7 +36,7 @@ func priorStageSnapshot(prior map[string]model.StageRecord) (map[string]string, 
 	return stageStatuses, findings
 }
 
-func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, run model.RunRecord, stageStatuses map[string]string, findings []model.Finding, summaryPath, issueReportPath string) {
+func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, run model.RunRecord, stageStatuses map[string]string, findings []model.Finding, summaryPath string) {
 	summary := map[string]any{
 		"run_id":         run.RunID,
 		"stage_statuses": stageStatuses,
@@ -43,7 +44,6 @@ func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, ru
 		"highest_risk":   highestRisk(findings),
 	}
 	bestEffortStageJSON(record, writer, writer.RelativePath(summaryPath), summary)
-	*record = requiredStageText(*record, writer, writer.RelativePath(issueReportPath), repairMarkdown(stageStatuses, findings))
 }
 
 func stageFReportPath(artifactRoot string, opts RunOptions) string {
@@ -79,37 +79,14 @@ func stageFPreviousFindingsContext(stageStatuses map[string]string, findings []m
 	return builder.String()
 }
 
-func repairMarkdown(stageStatuses map[string]string, findings []model.Finding) string {
-	var builder strings.Builder
-	builder.WriteString("# Repair Summary\n\n")
-	builder.WriteString("## Stage Statuses\n\n")
-	for _, stage := range []string{"A", "B", "C", "D", "E"} {
-		builder.WriteString(fmt.Sprintf("- %s: %s\n", stage, stageStatuses[stage]))
+var stageFReport2Boundary = regexp.MustCompile(`(?im)^.*Report\s+2\b.*$`)
+
+func splitStageFCodexReport(report string) (string, string) {
+	loc := stageFReport2Boundary.FindStringIndex(report)
+	if loc == nil {
+		return report, ""
 	}
-	builder.WriteString("\n## Priority Findings\n\n")
-	if len(findings) == 0 {
-		builder.WriteString("No Blocker/High findings were recorded.\n")
-		return builder.String()
-	}
-	for _, finding := range findings {
-		builder.WriteString(fmt.Sprintf("- %s %s: %s\n", finding.Severity, finding.ID, finding.Title))
-		if finding.Rule != "" {
-			builder.WriteString("  Rule: " + finding.Rule + "\n")
-		}
-		if finding.Evidence != "" {
-			builder.WriteString("  Evidence: " + finding.Evidence + "\n")
-		}
-		if finding.Impact != "" {
-			builder.WriteString("  Impact: " + finding.Impact + "\n")
-		}
-		if finding.DoneCriteria != "" {
-			builder.WriteString("  Done criteria: " + finding.DoneCriteria + "\n")
-		}
-		if finding.MinimumFix != "" {
-			builder.WriteString("  Minimum fix: " + finding.MinimumFix + "\n")
-		}
-	}
-	return builder.String()
+	return strings.TrimSpace(report[:loc[0]]), strings.TrimSpace(report[loc[0]:])
 }
 
 func shortComment(stageStatuses map[string]string, findings []model.Finding) string {

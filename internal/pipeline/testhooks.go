@@ -66,6 +66,10 @@ func ShortCommentForTest(stageStatuses map[string]string, findings []model.Findi
 	return shortComment(stageStatuses, findings)
 }
 
+func SplitStageFCodexReportForTest(report string) (string, string) {
+	return splitStageFCodexReport(report)
+}
+
 func ReadmeComposeCommandForTest(repoPath string) []string {
 	return readmeComposeCommand(repoPath)
 }

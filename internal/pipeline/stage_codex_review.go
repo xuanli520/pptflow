@@ -25,6 +25,7 @@ type CodexReviewStageSpec struct {
 	RecheckCompatOutputs   []string
 	ArtifactPaths          func(StageContext, CodexReviewPaths) []string
 	BeforeReview           func(*model.StageRecord, ArtifactWriter, StageContext, CodexReviewPaths)
+	AfterReview            func(report string, record *model.StageRecord, writer ArtifactWriter, sc StageContext) string
 	BuildContext           func(context.Context, Runner, StageContext) (string, error)
 	UnavailableFinding     func(CodexReviewUnavailable) model.Finding
 	ErrorSummary           func(codexReviewFailureKind) string
@@ -87,41 +88,41 @@ func (s CodexReviewStage) execute(ctx context.Context, sc StageContext) model.St
 	profilePath := filepath.Join(s.runner.cfg.Codex.PromptProfilesDir, spec.Profile)
 	profileContent, readErr := os.ReadFile(profilePath)
 	if readErr != nil {
-		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewProfileFailure, "prompt profile not readable: "+readErr.Error())
+		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewProfileFailure, "prompt profile not readable: "+readErr.Error(), sc)
 	}
 	if s.runner.cfg.Codex.Network != "none" {
-		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewNetworkFailure, "configured Codex network mode is unsupported by the current safe sandbox: "+s.runner.cfg.Codex.Network)
+		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewNetworkFailure, "configured Codex network mode is unsupported by the current safe sandbox: "+s.runner.cfg.Codex.Network, sc)
 	}
 	if s.runner.cfg.Codex.WritableTmp {
-		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewWritableTmpFailure, "configured writable_tmp=true is unsupported without widening write access in the current Codex CLI sandbox")
+		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewWritableTmpFailure, "configured writable_tmp=true is unsupported without widening write access in the current Codex CLI sandbox", sc)
 	}
 	var extraArgs []string
 	if spec.ValidateExtraArgsEarly {
 		var extraErr error
 		extraArgs, extraErr = safeCodexExtraArgs(s.runner.cfg.Codex.ExtraArgs)
 		if extraErr != nil {
-			return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewExtraArgsFailure, extraErr.Error())
+			return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewExtraArgsFailure, extraErr.Error(), sc)
 		}
 	}
 	reviewPath := codexReviewPath(sc.Run, sc.Project.Path)
 	capability := codex.DetectCLI(ctx, s.runner.exec, "")
 	if capabilityErr := codex.ValidateAppServerCapability(capability); capabilityErr != nil {
-		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewCapabilityFailure, capabilityErr.Error())
+		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewCapabilityFailure, capabilityErr.Error(), sc)
 	}
 	contextText, contextErr := spec.buildContext(ctx, s.runner, sc)
 	if contextErr != nil {
-		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewContextFailure, contextErr.Error())
+		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewContextFailure, contextErr.Error(), sc)
 	}
 	if !spec.ValidateExtraArgsEarly {
 		var extraErr error
 		extraArgs, extraErr = safeCodexExtraArgs(s.runner.cfg.Codex.ExtraArgs)
 		if extraErr != nil {
-			return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewExtraArgsFailure, extraErr.Error())
+			return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewExtraArgsFailure, extraErr.Error(), sc)
 		}
 	}
 	sandbox, sandboxErr := codex.NewSandbox(reviewPath, sc.Run.ArtifactRoot, stage)
 	if sandboxErr != nil {
-		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewSandboxFailure, sandboxErr.Error())
+		return s.finishUnavailable(record, writer, paths, start, spec, sc.Project.Path, codexReviewSandboxFailure, sandboxErr.Error(), sc)
 	}
 	defer os.RemoveAll(sandbox.Home)
 
@@ -133,7 +134,11 @@ func (s CodexReviewStage) execute(ctx context.Context, sc StageContext) model.St
 	recordArtifactWarnings(&record, writer, review.ArtifactWarnings)
 	outcome := finalizeStaticReviewReport(stage, spec.Profile, sc.Project.Path, paths.OutputPath, review.Result, s.runner.cfg.Codex.MaxOutputBytes)
 	record.Findings = append(record.Findings, outcome.Findings...)
-	record = s.writeReports(record, writer, paths, outcome.Report+"\n")
+	report := outcome.Report + "\n"
+	if spec.AfterReview != nil {
+		report = spec.AfterReview(report, &record, writer, sc)
+	}
+	record = s.writeReports(record, writer, paths, report)
 	if outcome.ErrorSummary != "" {
 		if record.ErrorSummary == "" {
 			record.ErrorSummary = outcome.ErrorSummary
@@ -143,8 +148,11 @@ func (s CodexReviewStage) execute(ctx context.Context, sc StageContext) model.St
 	return finishStage(record, model.StageDone, start)
 }
 
-func (s CodexReviewStage) finishUnavailable(record model.StageRecord, writer ArtifactWriter, paths CodexReviewPaths, start time.Time, spec CodexReviewStageSpec, projectPath string, kind codexReviewFailureKind, reason string) model.StageRecord {
+func (s CodexReviewStage) finishUnavailable(record model.StageRecord, writer ArtifactWriter, paths CodexReviewPaths, start time.Time, spec CodexReviewStageSpec, projectPath string, kind codexReviewFailureKind, reason string, sc StageContext) model.StageRecord {
 	report := staticUnavailableReport(spec.ID, spec.Profile, projectPath, reason)
+	if spec.AfterReview != nil {
+		report = spec.AfterReview(report, &record, writer, sc)
+	}
 	record = s.writeReports(record, writer, paths, report)
 	bestEffortStageText(&record, writer, writer.RelativePath(paths.LogPath), report)
 	record.Findings = append(record.Findings, spec.unavailableFinding(CodexReviewUnavailable{
@@ -385,7 +393,16 @@ func stageFCodexReviewSpec() CodexReviewStageSpec {
 		},
 		BeforeReview: func(record *model.StageRecord, writer ArtifactWriter, sc StageContext, paths CodexReviewPaths) {
 			stageStatuses, priorFindings := priorStageSnapshot(sc.Prior)
-			writeRepairSupplements(record, writer, sc.Run, stageStatuses, priorFindings, filepath.Join(sc.Run.ArtifactRoot, "repair_summary.json"), stageFIssueReportPath(sc.Run.ArtifactRoot, sc.Options))
+			writeRepairSupplements(record, writer, sc.Run, stageStatuses, priorFindings, filepath.Join(sc.Run.ArtifactRoot, "repair_summary.json"))
+		},
+		AfterReview: func(report string, record *model.StageRecord, writer ArtifactWriter, sc StageContext) string {
+			report1, report2 := splitStageFCodexReport(report)
+			issuePath := stageFIssueReportPath(sc.Run.ArtifactRoot, sc.Options)
+			if strings.TrimSpace(report2) == "" {
+				report2 = report
+			}
+			*record = requiredStageText(*record, writer, writer.RelativePath(issuePath), report2)
+			return report1
 		},
 		BuildContext: func(ctx context.Context, runner Runner, sc StageContext) (string, error) {
 			stageStatuses, priorFindings := priorStageSnapshot(sc.Prior)
