@@ -357,7 +357,7 @@ type Warning struct {
 
 | Stage | 模式 | 产物（写入名，自动加 `QA_` 前缀） | 说明 |
 |---|---|---|---|
-| A | any | `validate_report.md` | 静态验证报告 |
+| A | any | `validation_report.md` | 静态验证报告 |
 | A | any | `acceptance_report.md` | acceptance 报告 |
 | A | any | `trajectory_archive.png` | 轨迹文件压缩包内部构造截图 |
 | A | any | `acceptance.json`, `required_artifacts.json`, `readme_alignment.json`, `local_dependency.json`, `fake_impl.json`, `tests_inspection.json`, `english_only.json` | 辅助 JSON（无 QA_ 前缀） |
@@ -384,7 +384,7 @@ type Warning struct {
 | 序号 | 实际文件名 | 来源 Stage |
 |---|---|---|
 | 1 | `QA_codex_report.md` | E |
-| 2 | `QA_validate_report.md` | A |
+| 2 | `QA_validation_report.md` | A |
 | 3 | `QA_operator_prompt_requirements_verification.md`（首次）/<br>`QA_prompt_requirements_verification.md`（二次） | F |
 | 4 | `QA_operator_codex_report_issues_verification.md`（首次）/<br>`QA_codex_report_issues_verification.md`（二次） | F |
 | 5 | `QA_test_effectiveness_report.md` | D |
@@ -629,7 +629,7 @@ go test ./...
 | `--stage X` | 单 stage 仍自动包含 F（除非现有行为未来另有产品决策） |
 | `--static-only` | 跳过 B/C，保留静态 stage |
 | 命名原则 | 每次运行只生成一份文档，不生成内容相同命名不同的兼容副本；`qaArtifactName()` 自动加 `QA_` 前缀的逻辑保留；打回重检文档使用 `_verification` 后缀 |
-| Stage A artifact | `QA_validate_report.md`、`QA_acceptance_report.md`、`QA_trajectory_archive.png`；辅助 JSON（`acceptance.json` 等）无 QA_ 前缀 |
+| Stage A artifact | `QA_validation_report.md`、`QA_acceptance_report.md`、`QA_trajectory_archive.png`；辅助 JSON（`acceptance.json` 等）无 QA_ 前缀 |
 | Stage B artifact | `port_map.json`（无 QA_ 前缀）、`logs/B_docker.log`、`QA_docker_startup.png` |
 | Stage C artifact | `test_runtime_summary.json`（无 QA_ 前缀）、`logs/C_tests.log`、`QA_run_tests_screenshot.png` |
 | Stage D initial | `QA_test_effectiveness_report.md` |

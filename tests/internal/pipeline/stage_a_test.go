@@ -1,6 +1,7 @@
 package pipeline_test
 
 import (
+	"archive/zip"
 	"context"
 	"os"
 	"path/filepath"
@@ -58,6 +59,11 @@ func TestStageAReportsMetadataTaskIDMismatch(t *testing.T) {
 
 func TestStageAWritesRenamedReportsAndTrajectoryArchive(t *testing.T) {
 	root := writeStageAPackage(t, "original_sessions", `{"task_id":"TASK-1","prompt":"build it"}`)
+	writeStageAZip(t, filepath.Join(root, "original_sessions", "-home-purplevoid88-projects-TASK-20260327-D3040D.zip"), map[string]string{
+		"docs/README.md":      "# docs",
+		"original/prompt.txt": "build it",
+		"repo/package.json":   "{}",
+	})
 	artifactRoot := filepath.Join(t.TempDir(), "run")
 	scanPath := t.TempDir()
 	writeStageAScript(t, scanPath, "run_acceptance.py", `import json, sys
@@ -70,20 +76,44 @@ open(md_path,"w").write("# Acceptance\n")
 	writeStageAScript(t, scanPath, "run_validate.py", `import sys
 args=sys.argv
 md_path=args[args.index("--output-md")+1]
-open(md_path,"w").write("# Validate\n")
+open(md_path,"w").write("# Validation\n")
 `)
 	record := pipelinepkg.NewRunner(nil, configWithScanPath(scanPath)).StageAForTest(
 		context.Background(),
 		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
 		scanner.Project{TaskID: "TASK-1", Path: root},
 	)
-	for _, name := range []string{"QA_validate_report.md", "QA_acceptance_report.md", "QA_trajectory_archive.png"} {
+	for _, name := range []string{"QA_validation_report.md", "QA_acceptance_report.md", "QA_trajectory_archive.png"} {
 		if _, err := os.Stat(filepath.Join(artifactRoot, name)); err != nil {
 			t.Fatalf("expected Stage A artifact %s: %v; record=%#v", name, err, record)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(artifactRoot, "QA_validation_report.md")); !os.IsNotExist(err) {
-		t.Fatalf("old validation report name should not be emitted, stat err: %v", err)
+}
+
+func TestStageATrajectoryArchiveSummarizesZipInternals(t *testing.T) {
+	root := writeStageAPackage(t, "original_sessions", `{"task_id":"TASK-1","prompt":"build it"}`)
+	writeStageAZip(t, filepath.Join(root, "original_sessions", "-home-purplevoid88-projects-TASK-20260327-D3040D.zip"), map[string]string{
+		"docs/original-prompt.md": "# Prompt",
+		"repo/package.json":       "{}",
+		"repo/src/main.go":        "package main",
+	})
+
+	summary := pipelinepkg.PackageTrajectorySummaryForTest(root, root, nil)
+	for _, want := range []string{
+		"Stage A trajectory archive internal structure",
+		"archive: original_sessions/-home-purplevoid88-projects-TASK-20260327-D3040D.zip",
+		"repo/",
+		"src/",
+		"main.go",
+		"docs/",
+		"original-prompt.md",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary missing %q:\n%s", want, summary)
+		}
+	}
+	if strings.Contains(summary, "Top-level delivery structure") {
+		t.Fatalf("summary should describe zip internals, not the package root:\n%s", summary)
 	}
 }
 
@@ -91,7 +121,7 @@ func TestSubmitArtifactNamesMatchInitialAndRecheckContracts(t *testing.T) {
 	initial := strings.Join(pipelinepkg.SubmitArtifactNamesForTest("initial"), "\n")
 	for _, want := range []string{
 		"QA_codex_report.md",
-		"QA_validate_report.md",
+		"QA_validation_report.md",
 		"QA_operator_prompt_requirements_verification.md",
 		"QA_operator_codex_report_issues_verification.md",
 		"QA_test_effectiveness_report.md",
@@ -106,6 +136,7 @@ func TestSubmitArtifactNamesMatchInitialAndRecheckContracts(t *testing.T) {
 	recheck := strings.Join(pipelinepkg.SubmitArtifactNamesForTest("recheck"), "\n")
 	for _, want := range []string{
 		"QA_codex_report_verification.md",
+		"QA_validation_report.md",
 		"QA_prompt_requirements_verification.md",
 		"QA_codex_report_issues_verification.md",
 		"QA_test_effectiveness_verification.md",
@@ -145,6 +176,30 @@ func writeStageAScript(t *testing.T, scanPath, name, content string) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func writeStageAZip(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	writer := zip.NewWriter(file)
+	defer writer.Close()
+	for name, content := range files {
+		entry, err := writer.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

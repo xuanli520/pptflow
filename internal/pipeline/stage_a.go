@@ -1,10 +1,13 @@
 package pipeline
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -51,7 +54,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 
 	acceptancePath := filepath.Join(run.ArtifactRoot, "acceptance.json")
 	acceptanceReportPath := qaArtifactPath(run.ArtifactRoot, "acceptance_report.md")
-	validationReportPath := qaArtifactPath(run.ArtifactRoot, "validate_report.md")
+	validationReportPath := qaArtifactPath(run.ArtifactRoot, "validation_report.md")
 	trajectoryPath := qaArtifactPath(run.ArtifactRoot, "trajectory_archive.png")
 	requiredPath := filepath.Join(run.ArtifactRoot, "required_artifacts.json")
 	readmeAlignmentPath := filepath.Join(run.ArtifactRoot, "readme_alignment.json")
@@ -130,29 +133,193 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 }
 
 func packageTrajectorySummary(projectPath, scriptRoot string, snapshotErr error) string {
-	var builder strings.Builder
-	builder.WriteString("Stage A package trajectory archive\n")
-	builder.WriteString("project_path: " + projectPath + "\n")
-	builder.WriteString("script_input_root: " + scriptRoot + "\n")
-	if snapshotErr != nil {
-		builder.WriteString("snapshot_error: " + snapshotErr.Error() + "\n")
-	} else {
-		builder.WriteString("snapshot_status: copied\n")
+	lines := make([]string, 0, terminalScreenshotMaxLines)
+	truncated := false
+	appendLine := func(line string) bool {
+		if len(lines) >= terminalScreenshotMaxLines {
+			truncated = true
+			return false
+		}
+		lines = append(lines, line)
+		return true
 	}
-	builder.WriteString("\nTop-level delivery structure:\n")
-	for _, name := range []string{"metadata.json", "docs", "repo", "original_sessions"} {
-		path := filepath.Join(projectPath, name)
-		if info, err := os.Stat(path); err == nil {
-			kind := "file"
-			if info.IsDir() {
-				kind = "dir"
+
+	appendLine("Stage A trajectory archive internal structure")
+	appendLine("source: zip archive contents under the original session marker")
+	appendLine("project_path: " + projectPath)
+	appendLine("script_input_root: " + scriptRoot)
+	if snapshotErr != nil {
+		appendLine("snapshot_error: " + snapshotErr.Error())
+	} else {
+		appendLine("snapshot_status: copied")
+	}
+
+	ok, marker := projectlayout.HasOriginalSessionMarker(projectPath)
+	if !ok {
+		appendLine("original_session_marker: missing")
+		return strings.Join(lines, "\n") + "\n"
+	}
+	markerPath := filepath.Join(projectPath, marker)
+	appendLine("original_session_marker: " + filepath.ToSlash(marker))
+	archives, err := trajectoryZipArchives(markerPath)
+	if err != nil {
+		appendLine("archive_scan_error: " + err.Error())
+		return strings.Join(lines, "\n") + "\n"
+	}
+	if len(archives) == 0 {
+		appendLine("archive_count: 0")
+		appendLine("archive: no .zip files found under " + filepath.ToSlash(marker))
+		return strings.Join(lines, "\n") + "\n"
+	}
+	appendLine(fmt.Sprintf("archive_count: %d", len(archives)))
+	for _, archivePath := range archives {
+		if !appendLine("") {
+			break
+		}
+		appendLine("archive: " + displayPathRelativeTo(projectPath, archivePath))
+		treeLines, err := zipArchiveTreeLines(archivePath)
+		if err != nil {
+			appendLine("archive_error: " + err.Error())
+			continue
+		}
+		for _, line := range treeLines {
+			if !appendLine(line) {
+				break
 			}
-			builder.WriteString(fmt.Sprintf("- %s (%s)\n", name, kind))
-		} else {
-			builder.WriteString(fmt.Sprintf("- %s (missing)\n", name))
+		}
+		if truncated {
+			break
 		}
 	}
-	return builder.String()
+	if truncated && len(lines) > 0 {
+		lines[len(lines)-1] = "... truncated"
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func trajectoryZipArchives(markerPath string) ([]string, error) {
+	var archives []string
+	err := filepath.WalkDir(markerPath, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(entry.Name()), ".zip") {
+			archives = append(archives, path)
+		}
+		return nil
+	})
+	sort.Strings(archives)
+	return archives, err
+}
+
+func zipArchiveTreeLines(archivePath string) ([]string, error) {
+	reader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	root := newArchiveTreeNode()
+	entryCount := 0
+	for _, file := range reader.File {
+		name := cleanZipEntryName(file.Name)
+		if name == "" {
+			continue
+		}
+		entryCount++
+		parts := strings.Split(name, "/")
+		node := root
+		for index, part := range parts {
+			node = node.child(part)
+			if index < len(parts)-1 {
+				node.dir = true
+				continue
+			}
+			if file.FileInfo().IsDir() || strings.HasSuffix(file.Name, "/") {
+				node.dir = true
+			} else {
+				node.file = true
+			}
+		}
+	}
+
+	lines := []string{fmt.Sprintf("entries: %d", entryCount), "/"}
+	appendArchiveTreeNode(&lines, root, "")
+	return lines, nil
+}
+
+type archiveTreeNode struct {
+	children map[string]*archiveTreeNode
+	dir      bool
+	file     bool
+}
+
+func newArchiveTreeNode() *archiveTreeNode {
+	return &archiveTreeNode{children: map[string]*archiveTreeNode{}}
+}
+
+func (node *archiveTreeNode) child(name string) *archiveTreeNode {
+	child, ok := node.children[name]
+	if !ok {
+		child = newArchiveTreeNode()
+		node.children[name] = child
+	}
+	return child
+}
+
+func appendArchiveTreeNode(lines *[]string, node *archiveTreeNode, prefix string) {
+	names := make([]string, 0, len(node.children))
+	for name := range node.children {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		left := node.children[names[i]]
+		right := node.children[names[j]]
+		if (left.dir || len(left.children) > 0) != (right.dir || len(right.children) > 0) {
+			return left.dir || len(left.children) > 0
+		}
+		return names[i] < names[j]
+	})
+
+	for index, name := range names {
+		child := node.children[name]
+		connector := "|-- "
+		nextPrefix := prefix + "|   "
+		if index == len(names)-1 {
+			connector = "`-- "
+			nextPrefix = prefix + "    "
+		}
+		displayName := name
+		if child.dir || len(child.children) > 0 {
+			displayName += "/"
+		}
+		*lines = append(*lines, prefix+connector+displayName)
+		appendArchiveTreeNode(lines, child, nextPrefix)
+	}
+}
+
+func cleanZipEntryName(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = strings.Trim(name, "/")
+	if name == "" {
+		return ""
+	}
+	name = pathpkg.Clean(name)
+	if name == "." {
+		return ""
+	}
+	return name
+}
+
+func displayPathRelativeTo(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return path
+	}
+	return filepath.ToSlash(rel)
 }
 
 func structuralFindings(project scanner.Project, required map[string]bool) []model.Finding {

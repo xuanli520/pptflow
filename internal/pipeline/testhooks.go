@@ -114,6 +114,10 @@ func TerminalScreenshotLinesForTest(text string) []string {
 	return terminalScreenshotLines(text)
 }
 
+func PackageTrajectorySummaryForTest(projectPath, scriptRoot string, snapshotErr error) string {
+	return packageTrajectorySummary(projectPath, scriptRoot, snapshotErr)
+}
+
 func SafeCodexExtraArgsForTest(args []string) ([]string, error) {
 	return safeCodexExtraArgs(args)
 }

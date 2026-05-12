@@ -1035,10 +1035,10 @@ func TestAcceptanceScriptArgsMatchRealScriptContract(t *testing.T) {
 
 func TestValidationScriptArgsOwnValidationReport(t *testing.T) {
 	outputs := map[string]string{
-		"validation_md": "validate_report.md",
+		"validation_md": "validation_report.md",
 	}
 	got := validationScriptArgs(outputs, []string{"--project-type", "fullstack"})
-	want := []string{"--output-md", "validate_report.md"}
+	want := []string{"--output-md", "validation_report.md"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}

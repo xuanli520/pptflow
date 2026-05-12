@@ -104,7 +104,7 @@ func submitArtifactSpecs(mode string) []submitArtifactSpec {
 	if mode == "recheck" {
 		return []submitArtifactSpec{
 			{Name: qaArtifactName("codex_report_verification.md"), Stage: "E"},
-			{Name: qaArtifactName("validate_report.md"), Stage: "A"},
+			{Name: qaArtifactName("validation_report.md"), Stage: "A"},
 			{Name: qaArtifactName("prompt_requirements_verification.md"), Stage: "F"},
 			{Name: qaArtifactName("codex_report_issues_verification.md"), Stage: "F"},
 			{Name: qaArtifactName("test_effectiveness_verification.md"), Stage: "D"},
@@ -115,7 +115,7 @@ func submitArtifactSpecs(mode string) []submitArtifactSpec {
 	}
 	return []submitArtifactSpec{
 		{Name: qaArtifactName("codex_report.md"), Stage: "E"},
-		{Name: qaArtifactName("validate_report.md"), Stage: "A"},
+		{Name: qaArtifactName("validation_report.md"), Stage: "A"},
 		{Name: qaArtifactName("operator_prompt_requirements_verification.md"), Stage: "F"},
 		{Name: qaArtifactName("operator_codex_report_issues_verification.md"), Stage: "F"},
 		{Name: qaArtifactName("test_effectiveness_report.md"), Stage: "D"},
