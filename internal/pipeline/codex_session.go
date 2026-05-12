@@ -2,27 +2,15 @@ package pipeline
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
+	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 )
-
-type CodexReviewRequest struct {
-	Timeout        time.Duration
-	ProjectPath    string
-	LogPath        string
-	Env            []string
-	Prompt         string
-	Capability     codex.Capability
-	Args           []string
-	MaxOutputBytes int
-	OnDelta        func(update CodexDeltaUpdate)
-}
 
 type CodexReviewResult struct {
 	Result           executor.Result
@@ -30,13 +18,14 @@ type CodexReviewResult struct {
 	ArtifactWarnings []ArtifactWarning
 }
 
-type CodexDeltaUpdate struct {
-	TurnID    string
-	ItemID    string
-	Delta     string
-	Text      string
-	Done      bool
-	Truncated bool
+type CodexReviewRequest = appserver.Request
+
+type CodexDeltaUpdate = appserver.Update
+
+type CodexReviewSession interface {
+	Start(ctx context.Context, request CodexReviewRequest) error
+	SendGuidance(ctx context.Context, message string) error
+	Wait(ctx context.Context) (CodexReviewResult, error)
 }
 
 type CodexGuidanceEvent struct {
@@ -50,12 +39,6 @@ type CodexGuidanceDeadline struct {
 	Label   string
 	After   time.Duration
 	Message string
-}
-
-type CodexReviewSession interface {
-	Start(ctx context.Context, request CodexReviewRequest) error
-	SendGuidance(ctx context.Context, message string) error
-	Wait(ctx context.Context) (CodexReviewResult, error)
 }
 
 var defaultCodexGuidanceDeadlines = []CodexGuidanceDeadline{
@@ -76,20 +59,43 @@ var defaultCodexGuidanceDeadlines = []CodexGuidanceDeadline{
 	},
 }
 
+type appServerSessionAdapter struct {
+	session appserver.Session
+}
+
+func (s appServerSessionAdapter) Start(ctx context.Context, request CodexReviewRequest) error {
+	return s.session.Start(ctx, request)
+}
+
+func (s appServerSessionAdapter) SendGuidance(ctx context.Context, message string) error {
+	return s.session.SendGuidance(ctx, message)
+}
+
+func (s appServerSessionAdapter) Wait(ctx context.Context) (CodexReviewResult, error) {
+	result, err := s.session.Wait(ctx)
+	return codexReviewResultFromAppServer(result), err
+}
+
+func newCodexAppServerSession(envKeys []string) CodexReviewSession {
+	return appServerSessionAdapter{session: appserver.New(envKeys)}
+}
+
 func (r Runner) runCodexReviewWithLog(ctx context.Context, timeout time.Duration, projectPath, logPath string, env []string, prompt string, capability codex.Capability, args []string, onDelta func(CodexDeltaUpdate)) CodexReviewResult {
 	schedule := codexGuidanceSchedule(timeout, codexStageFromPrompt(prompt))
-	request := CodexReviewRequest{
-		Timeout:        timeout,
-		ProjectPath:    projectPath,
-		LogPath:        logPath,
-		Env:            env,
-		Prompt:         prompt,
-		Capability:     capability,
-		Args:           args,
-		MaxOutputBytes: r.cfg.Codex.MaxOutputBytes,
-		OnDelta:        onDelta,
+	request := appserver.Request{
+		Timeout:           timeout,
+		ProjectPath:       projectPath,
+		LogPath:           logPath,
+		Env:               env,
+		Prompt:            prompt,
+		CommandPath:       capability.Path,
+		CapabilitySummary: capabilitySummary(capability),
+		HasAppServer:      capability.HasAppServer,
+		Model:             codex.AppServerModelFromArgs(args),
+		MaxOutputBytes:    r.cfg.Codex.MaxOutputBytes,
+		OnDelta:           onDelta,
 	}
-	session := newAppServerCodexReviewSession(configuredEnvKeys(r.cfg.Codex.Env))
+	session := newCodexAppServerSession(configuredEnvKeys(r.cfg.Codex.Env))
 	result, err := runCodexReviewSessionWithGuidance(ctx, session, request, schedule)
 	if err != nil && result.Result.Err == nil {
 		result.Result = executor.Result{
@@ -100,10 +106,6 @@ func (r Runner) runCodexReviewWithLog(ctx context.Context, timeout time.Duration
 	}
 	recordArtifactWarningInResult(&result, appendCodexGuidanceEvents(logPath, result.GuidanceEvents))
 	return result
-}
-
-func newAppServerCodexReviewSession(envKeys []string) CodexReviewSession {
-	return &appServerCodexReviewSession{envKeys: envKeys}
 }
 
 func codexStageFromPrompt(prompt string) string {
@@ -133,14 +135,22 @@ func runCodexReviewSessionWithGuidance(ctx context.Context, session CodexReviewS
 	start := time.Now()
 	var events []CodexGuidanceEvent
 	finish := func(outcome waitResult) (CodexReviewResult, error) {
-		outcome.result.GuidanceEvents = append(outcome.result.GuidanceEvents, events...)
-		return outcome.result, outcome.err
+		result := outcome.result
+		result.GuidanceEvents = append(result.GuidanceEvents, events...)
+		return result, outcome.err
 	}
 	finishAfterCancel := func() (CodexReviewResult, error) {
 		select {
 		case outcome := <-waitCh:
 			return finish(outcome)
 		default:
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case outcome := <-waitCh:
+			return finish(outcome)
+		case <-timer.C:
 		}
 		cancelErr := ctx.Err()
 		return finish(waitResult{result: CodexReviewResult{Result: executor.Result{Err: cancelErr}}, err: cancelErr})
@@ -190,6 +200,37 @@ func codexReviewStartFailureResult(session CodexReviewSession, startErr error) (
 		return result, startErr
 	}
 	return CodexReviewResult{}, startErr
+}
+
+func codexReviewResultFromAppServer(result appserver.Result) CodexReviewResult {
+	return CodexReviewResult{
+		Result:           result.Result,
+		ArtifactWarnings: appServerWarningsToArtifactWarnings(result.Warnings),
+	}
+}
+
+func appServerWarningsToArtifactWarnings(warnings []appserver.Warning) []ArtifactWarning {
+	if len(warnings) == 0 {
+		return nil
+	}
+	result := make([]ArtifactWarning, 0, len(warnings))
+	for _, warning := range warnings {
+		if warning.OK() {
+			continue
+		}
+		path := strings.TrimSpace(warning.Path)
+		if path != "" {
+			path = filepath.Clean(path)
+		}
+		result = append(result, ArtifactWarning{
+			Path:       path,
+			Op:         warning.Op,
+			Error:      warning.Error,
+			Required:   warning.Required,
+			RecordedAt: warning.RecordedAt,
+		})
+	}
+	return result
 }
 
 func hasCodexReviewResult(result executor.Result) bool {
@@ -256,9 +297,4 @@ func recordArtifactWarningInResult(result *CodexReviewResult, warning ArtifactWa
 		return
 	}
 	result.ArtifactWarnings = append(result.ArtifactWarnings, warning)
-}
-
-func sha256Text(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
 }

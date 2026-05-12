@@ -1,4 +1,4 @@
-package pipeline_test
+package appserver_test
 
 import (
 	"context"
@@ -8,12 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xuanli520/p2r_tui/internal/codex"
-	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
+	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
 )
 
-func newAppServerCodexReviewSession(envKeys []string) pipelinepkg.CodexReviewSession {
-	return pipelinepkg.NewAppServerCodexReviewSessionForTest(envKeys)
+func newAppServerCodexReviewSession(envKeys []string) appserver.Session {
+	return appserver.New(envKeys)
 }
 
 func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
@@ -24,26 +23,29 @@ func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 	}
 	steerLog := filepath.Join(dir, "steer.log")
 	session := newAppServerCodexReviewSession(nil)
-	deadline := codexGuidanceSchedule(45*time.Minute, "E")[0]
-	deadline.Label = "test guidance"
-	deadline.After = 20 * time.Millisecond
-	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{
+	ctx := context.Background()
+	if err := session.Start(ctx, appserver.Request{
 		Timeout:        5 * time.Second,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
 		Env:            []string{"PATH=" + os.Getenv("PATH"), "STEER_LOG=" + steerLog},
 		Prompt:         "Run p2r stage E as a pure static review.",
-		Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
+		CommandPath:    codexPath,
+		HasAppServer:   true,
 		MaxOutputBytes: 1 << 20,
-	}, []pipelinepkg.CodexGuidanceDeadline{deadline})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := session.SendGuidance(ctx, "20 minutes reminder\n<!-- p2r:static-review-json:start -->")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.Wait(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(result.Result.Stdout, "# Steered Report") {
 		t.Fatalf("missing app-server final report: %#v", result.Result)
-	}
-	if len(result.GuidanceEvents) != 1 || result.GuidanceEvents[0].Error != "" {
-		t.Fatalf("unexpected guidance events: %#v", result.GuidanceEvents)
 	}
 	content, err := os.ReadFile(steerLog)
 	if err != nil {
@@ -63,15 +65,16 @@ func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := newAppServerCodexReviewSession(nil)
-	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{
+	result, err := runAppServerSession(context.Background(), session, appserver.Request{
 		Timeout:        5 * time.Second,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
 		Env:            []string{"PATH=" + os.Getenv("PATH"), "TURN_STATUS=interrupted"},
 		Prompt:         "Run p2r stage E as a pure static review.",
-		Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
+		CommandPath:    codexPath,
+		HasAppServer:   true,
 		MaxOutputBytes: 1 << 20,
-	}, nil)
+	})
 	if err == nil {
 		t.Fatalf("expected interrupted turn to fail, result=%#v", result.Result)
 	}
@@ -87,15 +90,16 @@ func TestAppServerSessionCapturesTurnCompletedItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := newAppServerCodexReviewSession(nil)
-	result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{
+	result, err := runAppServerSession(context.Background(), session, appserver.Request{
 		Timeout:        5 * time.Second,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
 		Env:            []string{"PATH=" + os.Getenv("PATH"), "TURN_ITEMS_ONLY=1"},
 		Prompt:         "Run p2r stage E as a pure static review.",
-		Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
+		CommandPath:    codexPath,
+		HasAppServer:   true,
 		MaxOutputBytes: 1 << 20,
-	}, nil)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,31 +115,65 @@ func TestAppServerSessionOmitsUnsetModelAndSendsConfiguredModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name string
-		env  []string
-		args []string
+		name  string
+		env   []string
+		model string
 	}{
 		{name: "unset", env: []string{"REJECT_NULL_MODEL=1"}},
-		{name: "configured", env: []string{"REQUIRE_MODEL=gpt-5.4"}, args: []string{"--model", "gpt-5.4"}},
+		{name: "configured", env: []string{"REQUIRE_MODEL=gpt-5.4"}, model: "gpt-5.4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			session := newAppServerCodexReviewSession(nil)
 			env := append([]string{"PATH=" + os.Getenv("PATH")}, tc.env...)
-			result, err := runCodexReviewSessionWithGuidance(context.Background(), session, pipelinepkg.CodexReviewRequest{
+			result, err := runAppServerSession(context.Background(), session, appserver.Request{
 				Timeout:        5 * time.Second,
 				ProjectPath:    dir,
 				LogPath:        filepath.Join(dir, "codex-"+tc.name+".log"),
 				Env:            env,
 				Prompt:         "Run p2r stage E as a pure static review.",
-				Capability:     codex.Capability{Path: codexPath, HasAppServer: true, HasConfig: true},
-				Args:           tc.args,
+				CommandPath:    codexPath,
+				HasAppServer:   true,
+				Model:          tc.model,
 				MaxOutputBytes: 1 << 20,
-			}, nil)
+			})
 			if err != nil {
 				t.Fatalf("app-server session failed: %v result=%#v", err, result.Result)
 			}
 		})
 	}
+}
+
+func TestAppServerSessionPreservesStdoutDiagnosticsOnStartFailure(t *testing.T) {
+	dir := t.TempDir()
+	codexPath := filepath.Join(dir, "codex")
+	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session := newAppServerCodexReviewSession(nil)
+	result, err := runAppServerSession(context.Background(), session, appserver.Request{
+		Timeout:        5 * time.Second,
+		ProjectPath:    dir,
+		LogPath:        filepath.Join(dir, "codex.log"),
+		Env:            []string{"PATH=" + os.Getenv("PATH"), "STDOUT_DIAGNOSTIC_ON_INITIALIZE=auth failed on stdout"},
+		Prompt:         "Run p2r stage E as a pure static review.",
+		CommandPath:    codexPath,
+		HasAppServer:   true,
+		MaxOutputBytes: 1 << 20,
+	})
+	if err == nil {
+		t.Fatalf("expected start failure, result=%#v", result.Result)
+	}
+	if !strings.Contains(result.Result.Stdout, "auth failed on stdout") {
+		t.Fatalf("stdout diagnostic was not preserved: %#v", result.Result)
+	}
+}
+
+func runAppServerSession(ctx context.Context, session appserver.Session, request appserver.Request) (appserver.Result, error) {
+	if err := session.Start(ctx, request); err != nil {
+		result, _ := session.Wait(context.Background())
+		return result, err
+	}
+	return session.Wait(ctx)
 }
 
 func fakeSteerableAppServer() string {
@@ -188,6 +226,11 @@ if len(sys.argv) > 1 and sys.argv[1] == "app-server":
                 send({"id": request_id, "error": {"code": -32602, "message": "missing required model"}})
                 continue
         if method == "initialize":
+            diagnostic = os.environ.get("STDOUT_DIAGNOSTIC_ON_INITIALIZE")
+            if diagnostic:
+                print(diagnostic, flush=True)
+                send({"id": request_id, "error": {"code": -32001, "message": "diagnostic requested"}})
+                continue
             send({"id": request_id, "result": {"userAgent": "fake-codex", "codexHome": "/tmp/fake", "platformFamily": "unix", "platformOs": "linux"}})
         elif method == "initialized":
             initialized = True

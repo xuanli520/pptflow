@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xuanli520/p2r_tui/assets"
+	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
 	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/displaytime"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
@@ -45,6 +46,7 @@ type runState struct {
 	run                model.RunRecord
 	stages             []model.StageRecord
 	results            map[string]model.StageRecord
+	runtime            RuntimeState
 	runtimeCleanupDone bool
 	cleanupFailed      bool
 	runCreated         bool
@@ -64,11 +66,11 @@ func makeRunProgress(taskID string, reporter ProgressReporter) func(RunProgress)
 	}
 }
 
-func codexDeltaProgress(runID, stage string, progress func(RunProgress)) func(CodexDeltaUpdate) {
+func codexDeltaProgress(runID, stage string, progress func(RunProgress)) func(appserver.Update) {
 	if progress == nil {
 		return nil
 	}
-	return func(update CodexDeltaUpdate) {
+	return func(update appserver.Update) {
 		progress(RunProgress{
 			RunID: runID,
 			Stage: stage,
@@ -265,7 +267,11 @@ func (s *runState) executeStageLoop(preflightResult preflight.CheckResult) (Resu
 			return result, err, aborted
 		}
 
-		record := s.runner.executeStage(s.ctx, s.run, s.project, stage, s.results, s.opts, preflightResult, s.progress)
+		outcome := s.runner.executeStage(s.ctx, s.run, s.project, stage, s.results, s.opts, preflightResult, s.runtime, s.progress)
+		if outcome.Runtime != nil {
+			s.runtime = *outcome.Runtime
+		}
+		record := outcome.Record
 		record.Findings = assignMissingFindingIDs(stage, record.Findings)
 		s.stages[index] = record
 		s.results[stage] = record
@@ -292,7 +298,7 @@ func (s *runState) cleanupRuntime() (Result, error, bool) {
 	if result, err, aborted := s.abortIfCancelled(); aborted {
 		return result, err, true
 	}
-	outcome := s.runner.finalizeRuntime(s.ctx, s.run, s.stages, s.keepRuntime, "normal")
+	outcome := s.runner.finalizeRuntime(s.ctx, s.run, s.stages, s.runtime, s.keepRuntime, "normal")
 	if outcome.Summary.Status == "failed" {
 		s.cleanupFailed = true
 	}
@@ -352,7 +358,7 @@ func (s *runState) finishRun() (Result, error, bool) {
 
 func (s *runState) abortIfCancelled() (Result, error, bool) {
 	if abortErr := s.ctx.Err(); abortErr != nil {
-		result, err := s.runner.finishAbortedRun(abortErr, &s.run, s.start, s.stages, s.keepRuntime, &s.runtimeCleanupDone, &s.runFinished, s.progress)
+		result, err := s.runner.finishAbortedRun(abortErr, &s.run, s.start, s.stages, s.runtime, s.keepRuntime, &s.runtimeCleanupDone, &s.runFinished, s.progress)
 		s.stages = result.Stages
 		return result, err, true
 	}

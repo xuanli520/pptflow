@@ -838,9 +838,9 @@ func primaryCodexReportPath(stage stageView) string {
 		return ""
 	}
 	known := map[string][]string{
-		"D": qaArtifactCandidates("tests_coverage_report.md", "4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md"),
-		"E": qaArtifactCandidates("static_acceptance_audit_report.md", "1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md"),
-		"F": qaArtifactCandidates("3_标注员AI报告问题的修复报告.md", "3_标注员AI报告问题_确认修复报告.md"),
+		"D": qaArtifactCandidates("test_effectiveness_report.md", "test_effectiveness_verification.md"),
+		"E": qaArtifactCandidates("codex_report.md", "codex_report_verification.md"),
+		"F": qaArtifactCandidates("operator_prompt_requirements_verification.md", "prompt_requirements_verification.md"),
 	}
 	for _, name := range known[stage.Stage] {
 		for _, path := range stage.ArtifactPaths {

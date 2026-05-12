@@ -1,4 +1,4 @@
-package pipeline_test
+package appserver_test
 
 import (
 	"context"
@@ -10,12 +10,12 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
+	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
 )
 
 func TestAppServerSessionIgnoresClosedPipeErrorsAfterCompletion(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "codex.log")
-	session := pipelinepkg.NewAppServerSessionProbeForTest(logPath, "", 0, nil)
+	session := appserver.NewSessionProbeForTest(logPath, "", 0, nil)
 
 	session.Complete("codex app-server", nil)
 	session.CompleteStreamError("stdout", fmt.Errorf("read |0: %w", os.ErrClosed))
@@ -32,7 +32,7 @@ func TestAppServerSessionIgnoresClosedPipeErrorsAfterCompletion(t *testing.T) {
 
 func TestAppServerSessionKeepsPrematureClosedPipeErrors(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "codex.log")
-	session := pipelinepkg.NewAppServerSessionProbeForTest(logPath, "", 0, nil)
+	session := appserver.NewSessionProbeForTest(logPath, "", 0, nil)
 
 	session.CompleteStreamError("stdout", fmt.Errorf("read |0: %w", os.ErrClosed))
 
@@ -54,7 +54,7 @@ func TestAppServerSessionIgnoresClosedPipeErrorsAfterProcessContextCancelled(t *
 	processCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cancel()
-	session := pipelinepkg.NewAppServerSessionProbeWithProcessContextForTest(logPath, processCtx)
+	session := appserver.NewSessionProbeWithProcessContextForTest(logPath, processCtx)
 
 	session.CompleteStreamError("stdout", fmt.Errorf("read |0: %w", os.ErrClosed))
 
@@ -69,7 +69,7 @@ func TestAppServerSessionIgnoresClosedPipeErrorsAfterProcessContextCancelled(t *
 
 func TestAppServerSessionCompactsDeltaLogsAndKeepsDeltaReport(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "codex.log")
-	session := pipelinepkg.NewAppServerSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
+	session := appserver.NewSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
 
 	stream := strings.Join([]string{
 		mustRPCLine(t, map[string]any{
@@ -119,7 +119,7 @@ func TestAppServerSessionCompactsDeltaLogsAndKeepsDeltaReport(t *testing.T) {
 
 func TestAppServerSessionCompactsCompletedItemLogs(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "codex.log")
-	session := pipelinepkg.NewAppServerSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
+	session := appserver.NewSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
 	report := "# App Server Report\n\nDetailed final text."
 	stream := strings.Join([]string{
 		mustRPCLine(t, map[string]any{
@@ -158,8 +158,8 @@ func TestAppServerSessionCompactsCompletedItemLogs(t *testing.T) {
 }
 
 func TestAppServerSessionEmitsActivityPreviewWithoutAgentDelta(t *testing.T) {
-	var updates []pipelinepkg.CodexDeltaUpdate
-	session := pipelinepkg.NewAppServerSessionProbeForTest("", "turn-test", 0, func(update pipelinepkg.CodexDeltaUpdate) {
+	var updates []appserver.Update
+	session := appserver.NewSessionProbeForTest("", "turn-test", 0, func(update appserver.Update) {
 		updates = append(updates, update)
 	})
 	stream := strings.Join([]string{
@@ -206,8 +206,8 @@ func TestAppServerSessionEmitsActivityPreviewWithoutAgentDelta(t *testing.T) {
 }
 
 func TestAppServerSessionCompletedOnlyAgentMessageEmitsPreview(t *testing.T) {
-	var updates []pipelinepkg.CodexDeltaUpdate
-	session := pipelinepkg.NewAppServerSessionProbeForTest("", "turn-test", 0, func(update pipelinepkg.CodexDeltaUpdate) {
+	var updates []appserver.Update
+	session := appserver.NewSessionProbeForTest("", "turn-test", 0, func(update appserver.Update) {
 		updates = append(updates, update)
 	})
 
@@ -223,7 +223,7 @@ func TestAppServerSessionCompletedOnlyAgentMessageEmitsPreview(t *testing.T) {
 
 func TestAppServerSessionAggregatesDeltaOnceAfterItemCompleted(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "codex.log")
-	session := pipelinepkg.NewAppServerSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
+	session := appserver.NewSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
 	stream := strings.Join([]string{
 		mustRPCLine(t, map[string]any{
 			"method": "item/agentMessage/delta",
@@ -259,7 +259,7 @@ func TestAppServerSessionAggregatesDeltaOnceAfterItemCompleted(t *testing.T) {
 
 func TestAppServerSessionAggregatesDeltaOnCompleteFallback(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "codex.log")
-	session := pipelinepkg.NewAppServerSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
+	session := appserver.NewSessionProbeForTest(logPath, "turn-test", 1<<20, nil)
 	session.RecordDelta("turn-test", "item-1", "leftover")
 	session.Complete("codex app-server", fmt.Errorf("boom"))
 
@@ -278,9 +278,33 @@ func TestAppServerSessionAggregatesDeltaOnCompleteFallback(t *testing.T) {
 	}
 }
 
+func TestAppServerSessionBoundsAccumulatedDeltaReport(t *testing.T) {
+	session := appserver.NewSessionProbeForTest("", "turn-test", 10, nil)
+
+	session.RecordDelta("turn-test", "item-1", strings.Repeat("a", 8))
+	session.RecordDelta("turn-test", "item-1", strings.Repeat("b", 8))
+
+	if got := session.DeltaForItem("item-1"); got != "aaaaaaaabb" {
+		t.Fatalf("bounded delta = %q, want first 10 bytes", got)
+	}
+	if report := session.FinalReport(); len(report) > 10 {
+		t.Fatalf("final report exceeded max output bytes: len=%d report=%q", len(report), report)
+	}
+}
+
+func TestAppServerSessionBoundsCompletedItemReport(t *testing.T) {
+	session := appserver.NewSessionProbeForTest("", "turn-test", 10, nil)
+
+	session.RecordCompletedItem("turn-test", "item-1", strings.Repeat("x", 20))
+
+	if report := session.FinalReport(); report != strings.Repeat("x", 10) {
+		t.Fatalf("bounded completed report = %q, want 10 bytes", report)
+	}
+}
+
 func TestAppServerSessionAggregatedDeltaPrefixUsesRunes(t *testing.T) {
 	text := "一二三四五六七八九十十一🙂"
-	line := pipelinepkg.FormatAggregatedDeltaLogLineForTest("turn", "item", text)
+	line := appserver.FormatAggregatedDeltaLogLineForTest("turn", "item", text)
 	if !utf8.ValidString(line) {
 		t.Fatalf("aggregated log line is not valid UTF-8: %q", line)
 	}
@@ -293,8 +317,8 @@ func TestAppServerSessionAggregatedDeltaPrefixUsesRunes(t *testing.T) {
 }
 
 func TestAppServerSessionLateDeltaAfterItemDoneDoesNotReopenPreview(t *testing.T) {
-	var updates []pipelinepkg.CodexDeltaUpdate
-	session := pipelinepkg.NewAppServerSessionProbeForTest("", "turn-test", 0, func(update pipelinepkg.CodexDeltaUpdate) {
+	var updates []appserver.Update
+	session := appserver.NewSessionProbeForTest("", "turn-test", 0, func(update appserver.Update) {
 		updates = append(updates, update)
 	})
 	session.RecordDelta("turn-test", "item-1", "hello")
@@ -313,7 +337,7 @@ func TestAppServerSessionLateDeltaAfterItemDoneDoesNotReopenPreview(t *testing.T
 }
 
 func TestAppServerSessionLateDeltaAfterCompletedOnlyDoesNotDuplicateReport(t *testing.T) {
-	session := pipelinepkg.NewAppServerSessionProbeForTest("", "turn-test", 0, nil)
+	session := appserver.NewSessionProbeForTest("", "turn-test", 0, nil)
 	session.RecordCompletedItem("turn-test", "item-1", "completed")
 	session.RecordDelta("turn-test", "item-1", "late")
 

@@ -9,20 +9,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xuanli520/p2r_tui/internal/config"
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner.Project, progress func(RunProgress)) model.StageRecord {
+func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner.Project, progress func(RunProgress)) StageOutcome {
 	start := time.Now()
 	record := startStage("B")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "B_docker.log")
 	record.LogPath = logPath
 	writer := NewArtifactWriter(run.ArtifactRoot)
 	portMapPath := filepath.Join(run.ArtifactRoot, "port_map.json")
-	screenshotPath := qaArtifactPath(run.ArtifactRoot, "5_Docker启动截图.png")
+	screenshotPath := qaArtifactPath(run.ArtifactRoot, "docker_startup.png")
 	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, screenshotPath)
 	repoPath := filepath.Join(project.Path, "repo")
 	compose := findCompose(repoPath)
@@ -31,10 +32,10 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		readmeCommand = readmeComposeCommand(repoPath)
 	}
 	if compose == "" && len(readmeCommand) == 0 {
-		return r.failB(record, start, logPath, portMapPath, screenshotPath, nil, "No docker-compose.yml or README-declared docker compose startup command found in repo/.", "Add repo/docker-compose.yml, document a docker compose startup command, or run --static-only.")
+		return StageOutcome{Record: r.failB(record, start, logPath, portMapPath, screenshotPath, nil, "No docker-compose.yml or README-declared docker compose startup command found in repo/.", "Add repo/docker-compose.yml, document a docker compose startup command, or run --static-only.")}
 	}
 	if _, err := r.exec.LookPath("docker"); err != nil {
-		return r.failB(record, start, logPath, portMapPath, screenshotPath, nil, "docker executable not found on PATH.", "Install Docker or run --static-only.")
+		return StageOutcome{Record: r.failB(record, start, logPath, portMapPath, screenshotPath, nil, "docker executable not found on PATH.", "Install Docker or run --static-only.")}
 	}
 	projectName := dockermgr.ComposeProjectName(r.cfg.Docker.ComposeProjectPrefix, project.TaskID, run.RunID)
 	workDir := repoPath
@@ -77,6 +78,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	if logFile != nil {
 		logWriter = logFile
 	}
+	dockerEnv := dockerCommandEnv()
 	runDockerStep := func(name string, timeout time.Duration, args []string, required bool) executor.Result {
 		startLine := fmt.Sprintf("=== %s start ===", name)
 		fmt.Fprintln(logWriter, startLine)
@@ -92,7 +94,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		onOutput := func(line string, source string) {
 			appendStreamProgress(run.RunID, "B", line, source, false, progress)
 		}
-		result := r.exec.RunStreamingWithOutput(ctx, timeout, workDir, nil, logWriter, onOutput, "docker", args...)
+		result := r.exec.RunStreamingWithOutput(ctx, timeout, workDir, dockerEnv, logWriter, onOutput, "docker", args...)
 		endLine := fmt.Sprintf("=== %s end: exit=%d timeout=%t err=%v ===", name, result.ExitCode, result.Timeout, result.Err)
 		fmt.Fprintf(logWriter, "\n%s\n\n", endLine)
 		appendStreamProgress(run.RunID, "B", endLine, "p2r", true, progress)
@@ -108,7 +110,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			if pull.Timeout {
 				reason = "B1 docker compose pull timed out"
 			}
-			return r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(pull.Stderr, pull.Stdout)), "Fix Docker image pull or compose image declarations and rerun stage B.")
+			return stageBFailureOutcome(r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(pull.Stderr, pull.Stdout)), "Fix Docker image pull or compose image declarations and rerun stage B."), cleanupMeta)
 		}
 	}
 	if buildArgs != nil {
@@ -118,7 +120,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			if build.Timeout {
 				reason = "B2 docker compose build timed out"
 			}
-			return r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(build.Stderr, build.Stdout)), "Fix Docker build failures and rerun stage B.")
+			return stageBFailureOutcome(r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(build.Stderr, build.Stdout)), "Fix Docker build failures and rerun stage B."), cleanupMeta)
 		}
 	}
 	up := runDockerStep("B3 docker compose up", r.stageTimeout("B_UP", 300), upArgs, true)
@@ -127,12 +129,12 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		if up.Timeout {
 			reason = "B3 docker compose up timed out"
 		}
-		return r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(up.Stderr, up.Stdout)), "Fix Docker startup and rerun stage B.")
+		return stageBFailureOutcome(r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, reason+": "+strings.TrimSpace(firstNonEmpty(up.Stderr, up.Stdout)), "Fix Docker startup and rerun stage B."), cleanupMeta)
 	}
 	ps := runDockerStep("B5 docker compose port collection", r.stageTimeout("B_PORT", 30), psArgs, false)
 	mappings, services := parseComposePS(ps.Stdout)
 	if ps.Err != nil || len(mappings) == 0 {
-		fallbackMappings, fallbackServices, fallbackLog := r.dockerPortFallback(ctx, workDir, psQArgs, servicesArgs)
+		fallbackMappings, fallbackServices, fallbackLog := r.dockerPortFallback(ctx, workDir, dockerEnv, psQArgs, servicesArgs)
 		_, _ = logWriter.Write([]byte(fallbackLog))
 		if len(fallbackMappings) > 0 {
 			mappings = fallbackMappings
@@ -149,6 +151,14 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	}
 	fmt.Fprintln(logWriter, "=== B4 health check probe end ===")
 	appendStreamProgress(run.RunID, "B", "=== B4 health check probe end ===", "p2r", false, progress)
+	runtime := RuntimeState{
+		ComposeProject: projectName,
+		ComposeFile:    compose,
+		WorkDir:        workDir,
+		Services:       services,
+		Mappings:       mappings,
+		Probes:         probes,
+	}
 	portMap := map[string]any{
 		"run_id":          run.RunID,
 		"compose_project": projectName,
@@ -163,7 +173,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			"p2r.task_id": project.TaskID,
 			"p2r.run_id":  run.RunID,
 		},
-		"cleanup_command": dockerCleanupCommandText(compose, projectName),
+		"cleanup_command": dockerCleanupCommandText(r.cfg.Docker, compose, projectName),
 		"stage_timeouts": map[string]int{
 			"B_PULL":   int(r.stageTimeout("B_PULL", 300).Seconds()),
 			"B_BUILD":  int(r.stageTimeout("B_BUILD", 600).Seconds()),
@@ -174,7 +184,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	}
 	if err := writer.RequiredJSON("port_map.json", portMap); err != nil {
 		record = recordArtifactWriteError(record, err, portMapPath)
-		return finishStage(record, model.StageFailed, start)
+		return StageOutcome{Record: finishStage(record, model.StageFailed, start), Runtime: &runtime}
 	}
 	pages, _ := renderLogFile(logPath, screenshotPath)
 	record.ArtifactPaths = []string{portMapPath}
@@ -190,7 +200,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			MinimumFix: "Ensure docker compose ps --format json works for the project.",
 		}}
 		record.ErrorSummary = "port inspection failed"
-		return finishStage(record, model.StageFailed, start)
+		return StageOutcome{Record: finishStage(record, model.StageFailed, start), Runtime: &runtime}
 	}
 	if len(mappings) == 0 {
 		record.Findings = []model.Finding{{
@@ -203,17 +213,36 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			MinimumFix: "Expose the service ports in docker-compose.yml and rerun B.",
 		}}
 		record.ErrorSummary = "no published ports"
-		return finishStage(record, model.StageFailed, start)
+		return StageOutcome{Record: finishStage(record, model.StageFailed, start), Runtime: &runtime}
 	}
-	return finishStage(record, model.StageDone, start)
+	return StageOutcome{Record: finishStage(record, model.StageDone, start), Runtime: &runtime}
 }
 
-func (r Runner) dockerPortFallback(ctx context.Context, workDir string, psQArgs, servicesArgs []string) (map[string][]portMapping, []string, string) {
+func stageBFailureOutcome(record model.StageRecord, meta map[string]any) StageOutcome {
+	runtime := runtimeStateFromCleanupMeta(meta)
+	if !runtime.HasCleanupTarget() {
+		return StageOutcome{Record: record}
+	}
+	return StageOutcome{Record: record, Runtime: &runtime}
+}
+
+func runtimeStateFromCleanupMeta(meta map[string]any) RuntimeState {
+	if len(meta) == 0 {
+		return RuntimeState{}
+	}
+	return RuntimeState{
+		ComposeProject: strings.TrimSpace(fmt.Sprint(meta["compose_project"])),
+		ComposeFile:    strings.TrimSpace(fmt.Sprint(meta["compose_file"])),
+		WorkDir:        strings.TrimSpace(fmt.Sprint(meta["work_dir"])),
+	}
+}
+
+func (r Runner) dockerPortFallback(ctx context.Context, workDir string, env []string, psQArgs, servicesArgs []string) (map[string][]portMapping, []string, string) {
 	var log strings.Builder
-	servicesResult := r.exec.Run(ctx, 30*time.Second, workDir, nil, "docker", servicesArgs...)
+	servicesResult := r.exec.Run(ctx, 30*time.Second, workDir, env, "docker", servicesArgs...)
 	log.WriteString("\n\n" + servicesResult.Command + "\nSTDOUT:\n" + servicesResult.Stdout + "\nSTDERR:\n" + servicesResult.Stderr)
 	serviceNames := splitNonEmptyLines(servicesResult.Stdout)
-	psQ := r.exec.Run(ctx, 30*time.Second, workDir, nil, "docker", psQArgs...)
+	psQ := r.exec.Run(ctx, 30*time.Second, workDir, env, "docker", psQArgs...)
 	log.WriteString("\n\n" + psQ.Command + "\nSTDOUT:\n" + psQ.Stdout + "\nSTDERR:\n" + psQ.Stderr)
 	containers := splitNonEmptyLines(psQ.Stdout)
 	mappings := map[string][]portMapping{}
@@ -224,7 +253,7 @@ func (r Runner) dockerPortFallback(ctx context.Context, workDir string, psQArgs,
 			service = serviceNames[index]
 		}
 		services = append(services, service)
-		port := r.exec.Run(ctx, 30*time.Second, workDir, nil, "docker", "port", container)
+		port := r.exec.Run(ctx, 30*time.Second, workDir, env, "docker", "port", container)
 		log.WriteString("\n\n" + port.Command + "\nSTDOUT:\n" + port.Stdout + "\nSTDERR:\n" + port.Stderr)
 		mappings[service] = append(mappings[service], parseDockerPort(service, port.Stdout)...)
 	}
@@ -273,11 +302,6 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func dockerCleanupCommandText(composeFile, projectName string) string {
-	args := []string{"docker", "compose"}
-	if strings.TrimSpace(composeFile) != "" {
-		args = append(args, "-f", composeFile)
-	}
-	args = append(args, "-p", projectName, "down", "-v", "--remove-orphans", "--rmi", "local")
-	return strings.Join(args, " ")
+func dockerCleanupCommandText(cfg config.DockerConfig, composeFile, projectName string) string {
+	return dockermgr.CommandLine("docker", dockermgr.CleanupComposeArgs(cfg, composeFile, projectName))
 }

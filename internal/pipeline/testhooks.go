@@ -2,11 +2,11 @@ package pipeline
 
 import (
 	"context"
-	"strings"
+	"errors"
 	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
-	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
@@ -52,10 +52,6 @@ type TestServiceURLEnv struct {
 type TestServiceURL struct {
 	EnvKey string `json:"env_key"`
 	URL    string `json:"url"`
-}
-
-type TestAppServerSessionProbe struct {
-	session *appServerCodexReviewSession
 }
 
 func SelectedStagesForTest(opts RunOptions, staticOnly bool) map[string]bool {
@@ -126,149 +122,19 @@ func CapabilitySummaryForTest(capability codex.Capability) string {
 	return capabilitySummary(capability)
 }
 
-func RunCodexReviewSessionWithGuidanceForTest(ctx context.Context, session CodexReviewSession, request CodexReviewRequest, deadlines []CodexGuidanceDeadline) (CodexReviewResult, error) {
-	return runCodexReviewSessionWithGuidance(ctx, session, request, deadlines)
+func RunCodexReviewSessionWithGuidanceForTest(ctx context.Context, session any, request CodexReviewRequest, deadlines []CodexGuidanceDeadline) (CodexReviewResult, error) {
+	switch typed := session.(type) {
+	case CodexReviewSession:
+		return runCodexReviewSessionWithGuidance(ctx, typed, request, deadlines)
+	case appserver.Session:
+		return runCodexReviewSessionWithGuidance(ctx, appServerSessionAdapter{session: typed}, request, deadlines)
+	default:
+		return CodexReviewResult{}, errors.New("test codex review session does not implement a supported session interface")
+	}
 }
 
 func CodexGuidanceScheduleForTest(timeout time.Duration, stage string) []CodexGuidanceDeadline {
 	return codexGuidanceSchedule(timeout, stage)
-}
-
-func NewAppServerCodexReviewSessionForTest(envKeys []string) CodexReviewSession {
-	return newAppServerCodexReviewSession(envKeys)
-}
-
-func NewAppServerSessionProbeForTest(logPath, turnID string, maxOutputBytes int, onDelta func(CodexDeltaUpdate)) *TestAppServerSessionProbe {
-	return newAppServerSessionProbeForTest(CodexReviewRequest{
-		LogPath:        logPath,
-		MaxOutputBytes: maxOutputBytes,
-		OnDelta:        onDelta,
-	}, turnID, nil)
-}
-
-func NewAppServerSessionProbeWithProcessContextForTest(logPath string, processCtx context.Context) *TestAppServerSessionProbe {
-	return newAppServerSessionProbeForTest(CodexReviewRequest{LogPath: logPath}, "", processCtx)
-}
-
-func FormatAggregatedDeltaLogLineForTest(turnID, itemID, text string) string {
-	return formatAggregatedDeltaLogLine(aggregatedDeltaLog{turnID: turnID, itemID: itemID, text: text})
-}
-
-func newAppServerSessionProbeForTest(req CodexReviewRequest, turnID string, processCtx context.Context) *TestAppServerSessionProbe {
-	return &TestAppServerSessionProbe{session: &appServerCodexReviewSession{
-		req:                   req,
-		processCtx:            processCtx,
-		done:                  make(chan struct{}),
-		responses:             map[int]chan appServerRPCMessage{},
-		turnID:                turnID,
-		items:                 map[string]string{},
-		deltas:                map[string]string{},
-		deltaLogged:           map[string]bool{},
-		deltaPreview:          map[string]string{},
-		deltaPreviewTruncated: map[string]bool{},
-		itemDone:              map[string]bool{},
-	}}
-}
-
-func (p *TestAppServerSessionProbe) Complete(command string, err error) {
-	if p == nil || p.session == nil {
-		return
-	}
-	p.session.complete(executor.Result{Command: command, Err: err}, err)
-}
-
-func (p *TestAppServerSessionProbe) CompleteStreamError(stream string, err error) {
-	if p == nil || p.session == nil {
-		return
-	}
-	p.session.completeStreamError(stream, err)
-}
-
-func (p *TestAppServerSessionProbe) ReadStdout(stream string) {
-	if p == nil || p.session == nil {
-		return
-	}
-	p.session.readStdout(strings.NewReader(stream))
-}
-
-func (p *TestAppServerSessionProbe) RecordDelta(turnID, itemID, delta string) {
-	if p == nil || p.session == nil {
-		return
-	}
-	p.session.recordDelta(turnID, itemID, delta)
-}
-
-func (p *TestAppServerSessionProbe) RecordCompletedItem(turnID, itemID, text string) {
-	if p == nil || p.session == nil {
-		return
-	}
-	p.session.recordCompletedItem(turnID, itemID, text)
-}
-
-func (p *TestAppServerSessionProbe) ResultStdout() string {
-	if p == nil || p.session == nil {
-		return ""
-	}
-	p.session.mu.Lock()
-	defer p.session.mu.Unlock()
-	return p.session.result.Result.Stdout
-}
-
-func (p *TestAppServerSessionProbe) Err() error {
-	if p == nil || p.session == nil {
-		return nil
-	}
-	p.session.mu.Lock()
-	defer p.session.mu.Unlock()
-	return p.session.err
-}
-
-func (p *TestAppServerSessionProbe) Completed() bool {
-	if p == nil || p.session == nil {
-		return false
-	}
-	p.session.mu.Lock()
-	defer p.session.mu.Unlock()
-	return p.session.completed
-}
-
-func (p *TestAppServerSessionProbe) DoneClosed() bool {
-	if p == nil || p.session == nil || p.session.done == nil {
-		return false
-	}
-	select {
-	case <-p.session.done:
-		return true
-	default:
-		return false
-	}
-}
-
-func (p *TestAppServerSessionProbe) FinalReport() string {
-	if p == nil || p.session == nil {
-		return ""
-	}
-	p.session.mu.Lock()
-	defer p.session.mu.Unlock()
-	return p.session.finalReportLocked()
-}
-
-func (p *TestAppServerSessionProbe) DeltaForItem(itemID string) string {
-	if p == nil || p.session == nil {
-		return ""
-	}
-	p.session.mu.Lock()
-	defer p.session.mu.Unlock()
-	return p.session.deltas[itemID]
-}
-
-func (p *TestAppServerSessionProbe) ItemOrderLen() int {
-	if p == nil || p.session == nil {
-		return 0
-	}
-	p.session.mu.Lock()
-	defer p.session.mu.Unlock()
-	return len(p.session.itemOrder)
 }
 
 func CodexReviewPathForTest(run model.RunRecord, projectPath string) string {
@@ -281,6 +147,22 @@ func (r Runner) CodexContextForTest(ctx context.Context, project scanner.Project
 
 func (r Runner) StageCodexForTest(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output string, compat ...string) model.StageRecord {
 	return r.stageCodex(ctx, run, project, opts, stage, profile, output, nil, compat...)
+}
+
+func (r Runner) StageAForTest(ctx context.Context, run model.RunRecord, project scanner.Project) model.StageRecord {
+	return r.stageA(ctx, run, project, nil)
+}
+
+func (r Runner) StageBForTest(ctx context.Context, run model.RunRecord, project scanner.Project) StageOutcome {
+	return r.stageB(ctx, run, project, nil)
+}
+
+func (r Runner) StageFForTest(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, prior map[string]model.StageRecord) model.StageRecord {
+	return r.stageF(ctx, run, project, opts, prior, nil)
+}
+
+func SubmitArtifactNamesForTest(mode string) []string {
+	return submitArtifactNames(mode)
 }
 
 func StructuralFindingsForTest(project scanner.Project, required map[string]bool) []model.Finding {
@@ -315,6 +197,10 @@ func StageCEnvironmentForTest(evidence TestRuntimeEvidence) TestStageCCommandEnv
 			Mapping: testServiceURLMap(env.Service.Mapping),
 		},
 	}
+}
+
+func FilteredRuntimeEnvForTest(environ, extra []string, docker bool) []string {
+	return filteredRuntimeEnv(environ, extra, docker)
 }
 
 func testPortMappingMap(values map[string][]portMapping) map[string][]TestPortMapping {

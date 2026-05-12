@@ -1,33 +1,10 @@
 package pipeline
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 )
-
-type runtimeEvidence struct {
-	ComposeProject string                   `json:"compose_project"`
-	ComposeFile    string                   `json:"compose_file"`
-	WorkDir        string                   `json:"work_dir"`
-	Services       []string                 `json:"services"`
-	Mappings       map[string][]portMapping `json:"mappings"`
-	Probes         []probeResult            `json:"probes"`
-}
-
-func readRuntimeEvidence(path string) (runtimeEvidence, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return runtimeEvidence{}, err
-	}
-	var evidence runtimeEvidence
-	if err := json.Unmarshal(content, &evidence); err != nil {
-		return runtimeEvidence{}, err
-	}
-	return evidence, nil
-}
 
 type serviceURLEnv struct {
 	Env     []string              `json:"env"`

@@ -52,25 +52,14 @@ func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg
 		summary.Warnings = append(summary.Warnings, "compose project is empty")
 		return summary
 	}
-	args := []string{"compose"}
-	if strings.TrimSpace(composeFile) != "" {
-		args = append(args, "-f", composeFile)
-	}
-	args = append(args, "-p", projectName, "down")
-	if cfg.CleanupVolumes {
-		args = append(args, "-v")
-	}
-	args = append(args, "--remove-orphans")
-	if cfg.CleanupImages {
-		args = append(args, "--rmi", "local")
-	}
+	args := CleanupComposeArgs(cfg, composeFile, projectName)
 	result := exec.Run(ctx, 2*time.Minute, workDir, nil, "docker", args...)
 	summary.Status = "ok"
 	summary.Command = result.Command
 	summary.ExitCode = result.ExitCode
 	summary.Stdout = result.Stdout
 	summary.Stderr = result.Stderr
-	summary.ManualCommand = strings.Join(append([]string{"docker"}, args...), " ")
+	summary.ManualCommand = CommandLine("docker", args)
 	if result.Err != nil {
 		summary.Status = "failed"
 		summary.Error = result.Err.Error()
@@ -98,6 +87,46 @@ func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg
 		}
 	}
 	return summary
+}
+
+func CleanupComposeArgs(cfg config.DockerConfig, composeFile, projectName string) []string {
+	args := []string{"compose"}
+	if strings.TrimSpace(composeFile) != "" {
+		args = append(args, "-f", composeFile)
+	}
+	args = append(args, "-p", projectName, "down")
+	if cfg.CleanupVolumes {
+		args = append(args, "-v")
+	}
+	args = append(args, "--remove-orphans")
+	if cfg.CleanupImages {
+		args = append(args, "--rmi", "local")
+	}
+	return args
+}
+
+func CommandLine(name string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, shellQuote(name))
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if strings.IndexFunc(value, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '_' || r == '-' || r == '.' || r == '/' || r == ':' || r == '=')
+	}) < 0 {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func dockerToken(value string) string {

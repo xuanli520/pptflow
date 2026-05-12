@@ -44,21 +44,9 @@ func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project sca
 		compatPaths = append(compatPaths, path)
 		record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, path)
 	}
-	extraOutputPaths := []string{}
-	if stage == "D" {
-		if opts.Mode == "recheck" {
-			extraOutputPaths = append(extraOutputPaths, qaArtifactPath(run.ArtifactRoot, "打回问题修复确认报告.md"))
-		}
-		for _, path := range extraOutputPaths {
-			record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, path)
-		}
-	}
 	writeReports := func(record model.StageRecord, content string) model.StageRecord {
 		record = requiredStageText(record, writer, writer.RelativePath(outputPath), content)
 		for _, path := range compatPaths {
-			bestEffortStageText(&record, writer, writer.RelativePath(path), content)
-		}
-		for _, path := range extraOutputPaths {
 			bestEffortStageText(&record, writer, writer.RelativePath(path), content)
 		}
 		return record
@@ -426,18 +414,20 @@ func (r Runner) refRunStaticContext(artifactRoot, stage string) string {
 	names := []string{"repair_summary.json"}
 	switch stage {
 	case "D":
-		names = append(names, qaArtifactCandidates("4_测试有效性报告_api端点真实性.md", "4_测试有效性报告_api端点真实性_确认修复报告.md", "tests_coverage_report.md")...)
+		names = append(names, qaArtifactName("test_effectiveness_report.md"), qaArtifactName("test_effectiveness_verification.md"))
 	case "E":
-		names = append(names, qaArtifactCandidates("1_质检AI测试报告.md", "1_质检AI测试报告_确认修复报告.md", "static_acceptance_audit_report.md")...)
+		names = append(names, qaArtifactName("codex_report.md"), qaArtifactName("codex_report_verification.md"))
 	case "F":
-		names = append(names, qaArtifactCandidates(
-			"3_标注员AI报告问题的修复报告.md",
-			"3_标注员AI报告问题_确认修复报告.md",
-			"4_测试有效性报告_api端点真实性.md",
-			"4_测试有效性报告_api端点真实性_确认修复报告.md",
-			"1_质检AI测试报告.md",
-			"1_质检AI测试报告_确认修复报告.md",
-		)...)
+		names = append(names,
+			qaArtifactName("operator_prompt_requirements_verification.md"),
+			qaArtifactName("operator_codex_report_issues_verification.md"),
+			qaArtifactName("prompt_requirements_verification.md"),
+			qaArtifactName("codex_report_issues_verification.md"),
+			qaArtifactName("test_effectiveness_report.md"),
+			qaArtifactName("test_effectiveness_verification.md"),
+			qaArtifactName("codex_report.md"),
+			qaArtifactName("codex_report_verification.md"),
+		)
 	}
 	seen := map[string]bool{}
 	for _, name := range names {

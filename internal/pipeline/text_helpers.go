@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"unicode/utf8"
 )
@@ -29,4 +31,9 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func sha256Text(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }

@@ -51,7 +51,8 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 
 	acceptancePath := filepath.Join(run.ArtifactRoot, "acceptance.json")
 	acceptanceReportPath := qaArtifactPath(run.ArtifactRoot, "acceptance_report.md")
-	validationReportPath := qaArtifactPath(run.ArtifactRoot, "validation_report.md")
+	validationReportPath := qaArtifactPath(run.ArtifactRoot, "validate_report.md")
+	trajectoryPath := qaArtifactPath(run.ArtifactRoot, "trajectory_archive.png")
 	requiredPath := filepath.Join(run.ArtifactRoot, "required_artifacts.json")
 	readmeAlignmentPath := filepath.Join(run.ArtifactRoot, "readme_alignment.json")
 	localDependencyPath := filepath.Join(run.ArtifactRoot, "local_dependency.json")
@@ -102,8 +103,13 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	if !fileExists(validationReportPath) {
 		record = requiredStageText(record, writer, writer.RelativePath(validationReportPath), validationMarkdown(project, required, findings))
 	}
+	trajectoryPages, trajectoryErr := renderTerminalLog(packageTrajectorySummary(project.Path, scriptRoot, snapshotErr), trajectoryPath)
+	if trajectoryErr != nil {
+		record = recordArtifactWriteError(record, trajectoryErr, trajectoryPath)
+	}
 
 	artifactPaths := []string{acceptancePath, acceptanceReportPath, validationReportPath, requiredPath, readmeAlignmentPath, localDependencyPath}
+	artifactPaths = append(artifactPaths, trajectoryPages...)
 	for _, path := range []string{fakeImplPath, testsInspectionPath, englishOnlyPath} {
 		if fileExists(path) {
 			artifactPaths = append(artifactPaths, path)
@@ -121,6 +127,32 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 		}
 	}
 	return finishStage(record, status, start)
+}
+
+func packageTrajectorySummary(projectPath, scriptRoot string, snapshotErr error) string {
+	var builder strings.Builder
+	builder.WriteString("Stage A package trajectory archive\n")
+	builder.WriteString("project_path: " + projectPath + "\n")
+	builder.WriteString("script_input_root: " + scriptRoot + "\n")
+	if snapshotErr != nil {
+		builder.WriteString("snapshot_error: " + snapshotErr.Error() + "\n")
+	} else {
+		builder.WriteString("snapshot_status: copied\n")
+	}
+	builder.WriteString("\nTop-level delivery structure:\n")
+	for _, name := range []string{"metadata.json", "docs", "repo", "original_sessions"} {
+		path := filepath.Join(projectPath, name)
+		if info, err := os.Stat(path); err == nil {
+			kind := "file"
+			if info.IsDir() {
+				kind = "dir"
+			}
+			builder.WriteString(fmt.Sprintf("- %s (%s)\n", name, kind))
+		} else {
+			builder.WriteString(fmt.Sprintf("- %s (missing)\n", name))
+		}
+	}
+	return builder.String()
 }
 
 func structuralFindings(project scanner.Project, required map[string]bool) []model.Finding {

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,26 +20,47 @@ type recoveryManifest struct {
 	From          string         `json:"from"`
 	Stages        []string       `json:"stages"`
 	StaticOnly    bool           `json:"static_only"`
+	KeepRuntime   bool           `json:"keep_runtime"`
 	StageTimeouts map[string]int `json:"stage_timeouts"`
 }
 
+type RecoveryService struct {
+	store *db.Store
+	cfg   config.Config
+}
+
+func NewRecoveryService(store *db.Store, cfg config.Config) RecoveryService {
+	return RecoveryService{store: store, cfg: cfg}
+}
+
 func RecoverStaleRuns(ctx context.Context, store *db.Store, cfg config.Config) error {
-	if store == nil {
+	return NewRecoveryService(store, cfg).RecoverStaleRuns(ctx)
+}
+
+func (s RecoveryService) RecoverStaleRuns(ctx context.Context) error {
+	if s.store == nil {
 		return nil
 	}
-	runs, err := store.RunningRuns(ctx)
+	runs, err := s.store.RunningRuns(ctx)
 	if err != nil {
 		return err
 	}
+	var recoverErrors []error
 	for _, run := range runs {
+		if err := ctx.Err(); err != nil {
+			recoverErrors = append(recoverErrors, err)
+			break
+		}
 		manifest := readRecoveryManifest(run.ArtifactRoot)
-		stale, reason, started := staleRunReason(run, manifest, cfg)
+		stale, reason, started := staleRunReason(run, manifest, s.cfg)
 		if !stale {
 			continue
 		}
-		recoverStaleRun(ctx, store, cfg, run, manifest, started, reason)
+		if err := s.recoverStaleRun(ctx, run, manifest, started, reason); err != nil {
+			recoverErrors = append(recoverErrors, fmt.Errorf("recover stale run %s: %w", run.RunID, err))
+		}
 	}
-	return nil
+	return errors.Join(recoverErrors...)
 }
 
 func staleRunReason(run model.RunRecord, manifest recoveryManifest, cfg config.Config) (bool, string, time.Time) {
@@ -56,25 +78,31 @@ func staleRunReason(run model.RunRecord, manifest recoveryManifest, cfg config.C
 	return true, fmt.Sprintf("运行超过预期上限 %s 仍未完成，已按失联运行回收", expected.Round(time.Second)), started
 }
 
-func recoverStaleRun(ctx context.Context, store *db.Store, cfg config.Config, run model.RunRecord, manifest recoveryManifest, started time.Time, reason string) {
+func (s RecoveryService) recoverStaleRun(ctx context.Context, run model.RunRecord, manifest recoveryManifest, started time.Time, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "历史 running 记录已失联"
 	}
-	runner := NewRunner(store, cfg)
-	stages, _ := store.Stages(ctx, run.RunID)
+	var recoverErrors []error
+	runner := NewRunner(s.store, s.cfg)
+	stages, err := s.store.Stages(ctx, run.RunID)
+	if err != nil {
+		return err
+	}
 	selected := selectedStagesForRecovery(run, manifest)
 	now := time.Now().UTC()
 	byStage := map[string]model.StageRecord{}
 	for _, stage := range stages {
 		byStage[stage.Stage] = stage
 	}
+	recoveredStages := make([]model.StageRecord, 0, len(stages))
 	for _, letter := range model.AllStages() {
 		if !selected[letter] {
 			continue
 		}
 		stage, ok := byStage[letter]
 		if ok && terminalStageStatus(stage.Status) {
+			recoveredStages = append(recoveredStages, stage)
 			continue
 		}
 		if !ok {
@@ -96,10 +124,18 @@ func recoverStaleRun(ctx context.Context, store *db.Store, cfg config.Config, ru
 		} else {
 			stage.DurationMS = now.Sub(started).Milliseconds()
 		}
-		_ = appendText(stage.LogPath, "\n[p2r recovery] "+reason+"\n")
-		_ = store.PutStage(ctx, run.RunID, stage)
+		if err := appendText(stage.LogPath, "\n[p2r recovery] "+reason+"\n"); err != nil {
+			recoverErrors = append(recoverErrors, fmt.Errorf("append recovery log for stage %s: %w", letter, err))
+		}
+		if err := s.store.PutStage(ctx, run.RunID, stage); err != nil {
+			recoverErrors = append(recoverErrors, fmt.Errorf("put recovered stage %s: %w", letter, err))
+		}
+		recoveredStages = append(recoveredStages, stage)
 	}
-	_ = store.InsertFindings(ctx, run.RunID, []model.Finding{{
+	if err := runner.writeStageStatus(run.RunID, run.ArtifactRoot, recoveredStages); err != nil {
+		recoverErrors = append(recoverErrors, fmt.Errorf("write recovered stage_status.json: %w", err))
+	}
+	if err := s.store.InsertFindings(ctx, run.RunID, []model.Finding{{
 		ID:         "P2R-INFRA-HIGH-STALLED-RUN",
 		Stage:      "INFRA",
 		Severity:   "High",
@@ -109,9 +145,21 @@ func recoverStaleRun(ctx context.Context, store *db.Store, cfg config.Config, ru
 		Impact:     "The TUI status was misleading and the task lock could block reruns.",
 		MinimumFix: "Inspect crash_summary.json and rerun the affected stages.",
 		SourcePath: filepath.Join(run.ArtifactRoot, "crash_summary.json"),
-	}})
-	runner.markRunCrashed(ctx, run, started, reason)
-	removeTaskLock(cfg, run.TaskID)
+	}}); err != nil {
+		recoverErrors = append(recoverErrors, fmt.Errorf("insert stale-run finding: %w", err))
+	}
+	runtime := RuntimeState{}
+	if loaded, err := readRuntimeState(filepath.Join(run.ArtifactRoot, "port_map.json")); err == nil {
+		runtime = loaded
+	} else if !os.IsNotExist(err) {
+		recoverErrors = append(recoverErrors, fmt.Errorf("read recovery runtime state: %w", err))
+	}
+	if err := runner.crashRun(ctx, run, started, recoveredStages, runtime, manifest.KeepRuntime || s.cfg.Docker.KeepRuntime, false, reason); err != nil {
+		recoverErrors = append(recoverErrors, err)
+		return errors.Join(recoverErrors...)
+	}
+	removeTaskLock(s.cfg, run.TaskID)
+	return errors.Join(recoverErrors...)
 }
 
 func readRecoveryManifest(artifactRoot string) recoveryManifest {
@@ -172,6 +220,5 @@ func terminalStageStatus(status string) bool {
 }
 
 func removeTaskLock(cfg config.Config, taskID string) {
-	path := filepath.Join(cfg.ScanPath, ".qa-control", "locks", safeLockName(taskID)+".lock")
-	_ = os.Remove(path)
+	_ = os.Remove(taskRunLockPath(cfg.ScanPath, taskID))
 }

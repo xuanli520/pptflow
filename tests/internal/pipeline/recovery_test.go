@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +89,73 @@ func TestRecoverStaleRunsLeavesFreshRunningRunAlone(t *testing.T) {
 	}
 	if got.Status != model.RunRunning {
 		t.Fatalf("fresh run status = %s, want running", got.Status)
+	}
+}
+
+func TestRecoverStaleRunsCleansRuntimeFromPortMap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker shell script is POSIX-only")
+	}
+	store, cfg, artifactRoot := recoveryStore(t)
+	ctx := context.Background()
+	started := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	run := model.RunRecord{
+		RunID:         "run-runtime-stale",
+		TaskID:        "TASK-1",
+		StartedAt:     started,
+		Status:        model.RunRunning,
+		ManualVerdict: model.ManualUnset,
+		ArtifactRoot:  artifactRoot,
+	}
+	if err := store.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStage(ctx, run.RunID, model.StageRecord{Stage: "B", Status: model.StageRunning, StartedAt: started}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactRoot, "run_manifest.json"), []byte(`{"stages":["B","C"],"stage_timeouts":{"B":1,"C":1}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(artifactRoot, "port_map.json"), []byte(`{
+  "compose_project": "p2r_test",
+  "compose_file": "`+filepath.ToSlash(filepath.Join(workDir, "compose file.yml"))+`",
+  "work_dir": "`+filepath.ToSlash(workDir)+`",
+  "services": ["web"],
+  "mappings": {"web": [{"service":"web","url":"0.0.0.0","host":38080,"container":8080,"protocol":"tcp"}]}
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dockerLog := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("DOCKER_LOG", dockerLog)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(fakeBin, "docker"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pipelinepkg.RecoverStaleRuns(ctx, store, cfg); err != nil {
+		t.Fatal(err)
+	}
+	logContent, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("docker cleanup was not invoked: %v", err)
+	}
+	logText := string(logContent)
+	for _, want := range []string{"compose", "-p p2r_test", "down"} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("docker cleanup log missing %q:\n%s", want, logText)
+		}
+	}
+	summary, err := os.ReadFile(filepath.Join(artifactRoot, "cleanup_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(summary), `"status": "ok"`) {
+		t.Fatalf("cleanup summary should record successful recovery cleanup:\n%s", summary)
 	}
 }
 

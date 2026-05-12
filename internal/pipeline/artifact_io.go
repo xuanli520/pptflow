@@ -23,42 +23,66 @@ func NewArtifactWriter(root string) ArtifactWriter {
 }
 
 func (w ArtifactWriter) RequiredJSON(path string, value any) error {
-	if err := writeJSON(w.resolve(path), value); err != nil {
+	target, err := w.resolveForWrite(path)
+	if err != nil {
+		return fmt.Errorf("write required artifact %s: %w", w.displayPath(path), err)
+	}
+	if err := writeJSON(target, value); err != nil {
 		return fmt.Errorf("write required artifact %s: %w", w.displayPath(path), err)
 	}
 	return nil
 }
 
 func (w ArtifactWriter) RequiredText(path, content string) error {
-	if err := writeText(w.resolve(path), content); err != nil {
+	target, err := w.resolveForWrite(path)
+	if err != nil {
+		return fmt.Errorf("write required artifact %s: %w", w.displayPath(path), err)
+	}
+	if err := writeText(target, content); err != nil {
 		return fmt.Errorf("write required artifact %s: %w", w.displayPath(path), err)
 	}
 	return nil
 }
 
 func (w ArtifactWriter) BestEffortJSON(path string, value any) ArtifactWarning {
-	if err := writeJSON(w.resolve(path), value); err != nil {
+	target, err := w.resolveForWrite(path)
+	if err != nil {
+		return newArtifactWarning(path, "write_json", false, err)
+	}
+	if err := writeJSON(target, value); err != nil {
 		return newArtifactWarning(path, "write_json", false, err)
 	}
 	return ArtifactWarning{}
 }
 
 func (w ArtifactWriter) BestEffortText(path, content string) ArtifactWarning {
-	if err := writeText(w.resolve(path), content); err != nil {
+	target, err := w.resolveForWrite(path)
+	if err != nil {
+		return newArtifactWarning(path, "write_text", false, err)
+	}
+	if err := writeText(target, content); err != nil {
 		return newArtifactWarning(path, "write_text", false, err)
 	}
 	return ArtifactWarning{}
 }
 
 func (w ArtifactWriter) BestEffortAppend(path, content string) ArtifactWarning {
-	if err := appendText(w.resolve(path), content); err != nil {
+	target, err := w.resolveForWrite(path)
+	if err != nil {
+		return newArtifactWarning(path, "append_text", false, err)
+	}
+	if err := appendText(target, content); err != nil {
 		return newArtifactWarning(path, "append_text", false, err)
 	}
 	return ArtifactWarning{}
 }
 
 func (w ArtifactWriter) Path(path string) string {
-	return w.resolve(path)
+	target, err := w.resolveForWrite(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return target
 }
 
 func (w ArtifactWriter) RelativePath(path string) string {
@@ -79,6 +103,41 @@ func (w ArtifactWriter) resolve(path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Join(w.Root, path)
+}
+
+func (w ArtifactWriter) resolveForWrite(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("artifact path is empty")
+	}
+	root := filepath.Clean(w.Root)
+	if root == "" {
+		root = "."
+	}
+	if filepath.IsAbs(path) {
+		clean := filepath.Clean(path)
+		if !pathWithinRoot(clean, root) {
+			return "", fmt.Errorf("artifact path escapes root: %s", clean)
+		}
+		return clean, nil
+	}
+	clean := filepath.Clean(path)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("artifact path escapes root: %s", path)
+	}
+	target := filepath.Join(root, clean)
+	if !pathWithinRoot(target, root) {
+		return "", fmt.Errorf("artifact path escapes root: %s", path)
+	}
+	return target, nil
+}
+
+func pathWithinRoot(path, root string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func (w ArtifactWriter) displayPath(path string) string {

@@ -19,13 +19,13 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "F_repair.log")
 	summaryPath := filepath.Join(run.ArtifactRoot, "repair_summary.json")
 	reportPath := stageFReportPath(run.ArtifactRoot, opts)
-	shortPath := qaArtifactPath(run.ArtifactRoot, "short_comment.txt")
+	issueReportPath := stageFIssueReportPath(run.ArtifactRoot, opts)
 	record.LogPath = logPath
-	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath, reportPath, shortPath)
+	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath, reportPath, issueReportPath)
 	writer := NewArtifactWriter(run.ArtifactRoot)
 
 	stageStatuses, priorFindings := priorStageSnapshot(prior)
-	writeRepairSupplements(&record, writer, run, stageStatuses, priorFindings, summaryPath, shortPath)
+	writeRepairSupplements(&record, writer, run, stageStatuses, priorFindings, summaryPath, issueReportPath)
 
 	profile := "annotator_fix.md"
 	profilePath := filepath.Join(r.cfg.Codex.PromptProfilesDir, profile)
@@ -109,7 +109,7 @@ func priorStageSnapshot(prior map[string]model.StageRecord) (map[string]string, 
 	return stageStatuses, findings
 }
 
-func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, run model.RunRecord, stageStatuses map[string]string, findings []model.Finding, summaryPath, shortPath string) {
+func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, run model.RunRecord, stageStatuses map[string]string, findings []model.Finding, summaryPath, issueReportPath string) {
 	summary := map[string]any{
 		"run_id":         run.RunID,
 		"stage_statuses": stageStatuses,
@@ -117,14 +117,21 @@ func writeRepairSupplements(record *model.StageRecord, writer ArtifactWriter, ru
 		"highest_risk":   highestRisk(findings),
 	}
 	bestEffortStageJSON(record, writer, writer.RelativePath(summaryPath), summary)
-	bestEffortStageText(record, writer, writer.RelativePath(shortPath), shortComment(stageStatuses, findings))
+	*record = requiredStageText(*record, writer, writer.RelativePath(issueReportPath), repairMarkdown(stageStatuses, findings))
 }
 
 func stageFReportPath(artifactRoot string, opts RunOptions) string {
 	if opts.Mode == "recheck" {
-		return qaArtifactPath(artifactRoot, "3_标注员AI报告问题_确认修复报告.md")
+		return qaArtifactPath(artifactRoot, "prompt_requirements_verification.md")
 	}
-	return qaArtifactPath(artifactRoot, "3_标注员AI报告问题的修复报告.md")
+	return qaArtifactPath(artifactRoot, "operator_prompt_requirements_verification.md")
+}
+
+func stageFIssueReportPath(artifactRoot string, opts RunOptions) string {
+	if opts.Mode == "recheck" {
+		return qaArtifactPath(artifactRoot, "codex_report_issues_verification.md")
+	}
+	return qaArtifactPath(artifactRoot, "operator_codex_report_issues_verification.md")
 }
 
 func stageFPreviousFindingsContext(stageStatuses map[string]string, findings []model.Finding) string {

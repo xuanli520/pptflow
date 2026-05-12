@@ -32,8 +32,7 @@ func (r Runner) acquireTaskRunLock(taskID string) (taskRunLock, error) {
 	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		return taskRunLock{}, err
 	}
-	name := safeLockName(taskID) + ".lock"
-	path := filepath.Join(lockDir, name)
+	path := taskRunLockPath(r.cfg.ScanPath, taskID)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil && os.IsExist(err) && staleTaskRunLock(path) {
 		_ = os.Remove(path)
@@ -44,6 +43,10 @@ func (r Runner) acquireTaskRunLock(taskID string) (taskRunLock, error) {
 	}
 	_, _ = fmt.Fprintf(file, "task_id=%s\npid=%d\ncreated_at=%s\n", taskID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	return taskRunLock{path: path, file: file}, nil
+}
+
+func taskRunLockPath(scanPath, taskID string) string {
+	return filepath.Join(scanPath, ".qa-control", "locks", safeLockName(taskID)+".lock")
 }
 
 func (l taskRunLock) Release() {
@@ -75,10 +78,13 @@ func (r Runner) cleanupStaleRuns(ctx context.Context, runs []model.RunRecord, cu
 	return summaries
 }
 
-func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, keepRuntime bool) dockermgr.CleanupSummary {
-	path := filepath.Join(run.ArtifactRoot, "port_map.json")
-	evidence, err := readRuntimeEvidence(path)
-	if err != nil || evidence.ComposeProject == "" {
+func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, runtime RuntimeState, keepRuntime bool) dockermgr.CleanupSummary {
+	var err error
+	evidence := runtime
+	if !evidence.HasCleanupTarget() {
+		evidence, err = readRuntimeState(filepath.Join(run.ArtifactRoot, "port_map.json"))
+	}
+	if err != nil || !evidence.HasCleanupTarget() {
 		summary := dockermgr.CleanupSummary{Status: "not_applicable"}
 		if err != nil {
 			summary.Warnings = append(summary.Warnings, "runtime evidence unavailable: "+err.Error())
@@ -86,13 +92,13 @@ func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, 
 		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
 	if keepRuntime {
-		args := cleanupCommand(evidence.ComposeFile, evidence.ComposeProject)
+		args := dockermgr.CleanupComposeArgs(r.cfg.Docker, evidence.ComposeFile, evidence.ComposeProject)
 		summary := dockermgr.CleanupSummary{
 			Status:         "kept_by_operator_request",
 			ComposeFile:    evidence.ComposeFile,
 			ComposeProject: evidence.ComposeProject,
 			WorkDir:        evidence.WorkDir,
-			ManualCommand:  strings.Join(append([]string{"docker"}, args...), " "),
+			ManualCommand:  dockermgr.CommandLine("docker", args),
 		}
 		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
@@ -100,7 +106,7 @@ func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, 
 	return writeCleanupSummary(run.ArtifactRoot, summary)
 }
 
-func (r Runner) finalizeRuntime(ctx context.Context, run model.RunRecord, stages []model.StageRecord, keepRuntime bool, reason string) cleanupOutcome {
+func (r Runner) finalizeRuntime(ctx context.Context, run model.RunRecord, stages []model.StageRecord, runtime RuntimeState, keepRuntime bool, reason string) cleanupOutcome {
 	outcome := cleanupOutcome{
 		Summary:            dockermgr.CleanupSummary{Status: "not_applicable"},
 		RuntimeCleanupDone: true,
@@ -108,7 +114,7 @@ func (r Runner) finalizeRuntime(ctx context.Context, run model.RunRecord, stages
 	if !runtimeStageWasSelected(stages) {
 		return outcome
 	}
-	outcome.Summary = r.cleanupCurrentRuntime(ctx, run, keepRuntime)
+	outcome.Summary = r.cleanupCurrentRuntime(ctx, run, runtime, keepRuntime)
 	if err := mergeCleanupIntoManifest(filepath.Join(run.ArtifactRoot, "run_manifest.json"), "cleanup", outcome.Summary); err != nil {
 		outcome.PersistErrors = append(outcome.PersistErrors, fmt.Errorf("merge cleanup into run_manifest.json: %w", err))
 	}
@@ -187,15 +193,6 @@ func runtimeStageWasSelected(stages []model.StageRecord) bool {
 		}
 	}
 	return false
-}
-
-func cleanupCommand(composeFile, projectName string) []string {
-	args := []string{"compose"}
-	if strings.TrimSpace(composeFile) != "" {
-		args = append(args, "-f", composeFile)
-	}
-	args = append(args, "-p", projectName, "down", "-v", "--remove-orphans", "--rmi", "local")
-	return args
 }
 
 func safeLockName(taskID string) string {

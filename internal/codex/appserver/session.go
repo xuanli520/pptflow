@@ -1,35 +1,37 @@
-package pipeline
+package appserver
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 )
 
 type appServerCodexReviewSession struct {
 	mu                    sync.Mutex
 	writeMu               sync.Mutex
-	req                   CodexReviewRequest
+	req                   Request
 	cmd                   *exec.Cmd
 	stdin                 io.WriteCloser
 	processCtx            context.Context
 	cancel                context.CancelFunc
 	done                  chan struct{}
-	result                CodexReviewResult
+	result                Result
 	err                   error
 	nextID                int
 	responses             map[int]chan appServerRPCMessage
@@ -45,10 +47,11 @@ type appServerCodexReviewSession struct {
 	agentPreviewStarted   bool
 	itemDone              map[string]bool
 	itemOrder             []string
+	stdoutDiagnostics     bytes.Buffer
 	stderr                bytes.Buffer
 	completed             bool
 	envKeys               []string
-	warnings              []ArtifactWarning
+	warnings              []Warning
 }
 
 type appServerRPCMessage struct {
@@ -82,7 +85,7 @@ func (e *appServerRPCError) Error() string {
 	return fmt.Sprintf("codex app-server JSON-RPC error %d: %s", e.Code, e.Message)
 }
 
-func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexReviewRequest) error {
+func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request) error {
 	s.mu.Lock()
 	if s.done != nil {
 		s.mu.Unlock()
@@ -99,9 +102,9 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 	s.itemDone = map[string]bool{}
 	s.mu.Unlock()
 
-	if !request.Capability.HasAppServer {
+	if !request.HasAppServer {
 		err := fmt.Errorf("codex CLI does not expose app-server; active-turn guidance requires codex app-server turn/steer")
-		s.complete(executor.Result{Command: request.Capability.Path + " app-server --listen stdio://", Err: err, Stderr: err.Error()}, err)
+		s.complete(executor.Result{Command: request.CommandPath + " app-server --listen stdio://", Err: err, Stderr: err.Error()}, err)
 		return err
 	}
 	runCtx := ctx
@@ -116,7 +119,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 	s.cancel = cancel
 	s.mu.Unlock()
 	args := []string{"app-server", "-c", `approval_policy="never"`, "-c", `sandbox_mode="read-only"`, "--listen", "stdio://"}
-	cmd := exec.CommandContext(runCtx, request.Capability.Path, args...)
+	cmd := exec.CommandContext(runCtx, request.CommandPath, args...)
 	executor.ConfigureCommand(cmd)
 	cmd.Dir = request.ProjectPath
 	if len(request.Env) > 0 {
@@ -124,31 +127,31 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		s.complete(executor.Result{Command: commandString(request.Capability.Path, args), Err: err, Stderr: err.Error()}, err)
+		s.complete(executor.Result{Command: commandString(request.CommandPath, args), Err: err, Stderr: err.Error()}, err)
 		return err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		s.complete(executor.Result{Command: commandString(request.Capability.Path, args), Err: err, Stderr: err.Error()}, err)
+		s.complete(executor.Result{Command: commandString(request.CommandPath, args), Err: err, Stderr: err.Error()}, err)
 		return err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		s.complete(executor.Result{Command: commandString(request.Capability.Path, args), Err: err, Stderr: err.Error()}, err)
+		s.complete(executor.Result{Command: commandString(request.CommandPath, args), Err: err, Stderr: err.Error()}, err)
 		return err
 	}
-	preamble := commandString(request.Capability.Path, args) +
+	preamble := commandString(request.CommandPath, args) +
 		"\n\nPrompt: supplied via app-server turn/start; sha256=" + sha256Text(request.Prompt) +
-		"\nCodex capability: " + capabilitySummary(request.Capability) +
+		"\nCodex capability: " + request.CapabilitySummary +
 		"\nCodex env keys: " + strings.Join(s.envKeys, ",") +
 		"\nTimeout: " + request.Timeout.String() +
 		"\nStarted: " + time.Now().UTC().Format(time.RFC3339) +
 		"\n\n=== codex app-server JSON-RPC compact event log start ===\n"
 	if err := writeText(request.LogPath, preamble); err != nil {
-		s.addArtifactWarning(newArtifactWarning(request.LogPath, "write_text", false, err))
+		s.addWarning(newWarning(request.LogPath, "write_text", false, err))
 	}
 	if err := cmd.Start(); err != nil {
-		s.complete(executor.Result{Command: commandString(request.Capability.Path, args), Err: err, Stderr: err.Error()}, err)
+		s.complete(executor.Result{Command: commandString(request.CommandPath, args), Err: err, Stderr: err.Error()}, err)
 		return err
 	}
 	s.mu.Lock()
@@ -157,7 +160,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 	s.mu.Unlock()
 	go s.readStdout(stdout)
 	go s.readStderr(stderr)
-	go s.waitProcess(runCtx, commandString(request.Capability.Path, args))
+	go s.waitProcess(runCtx, commandString(request.CommandPath, args))
 
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -167,22 +170,22 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 			"experimentalApi": true,
 		},
 	}); err != nil {
-		s.failStart(commandString(request.Capability.Path, args), err)
+		s.failStart(commandString(request.CommandPath, args), err)
 		return err
 	}
 	if err := s.sendNotification(initCtx, "initialized", nil); err != nil {
-		s.failStart(commandString(request.Capability.Path, args), err)
+		s.failStart(commandString(request.CommandPath, args), err)
 		return err
 	}
 	threadResult, err := s.sendRequest(initCtx, "thread/start", appServerThreadStartParams(request))
 	if err != nil {
-		s.failStart(commandString(request.Capability.Path, args), err)
+		s.failStart(commandString(request.CommandPath, args), err)
 		return err
 	}
 	threadID := stringAtPath(threadResult, "thread", "id")
 	if threadID == "" {
 		err := fmt.Errorf("codex app-server thread/start response missing thread.id")
-		s.failStart(commandString(request.Capability.Path, args), err)
+		s.failStart(commandString(request.CommandPath, args), err)
 		return err
 	}
 	s.mu.Lock()
@@ -190,13 +193,13 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request CodexRe
 	s.mu.Unlock()
 	turnResult, err := s.sendRequest(initCtx, "turn/start", appServerTurnStartParams(request, threadID))
 	if err != nil {
-		s.failStart(commandString(request.Capability.Path, args), err)
+		s.failStart(commandString(request.CommandPath, args), err)
 		return err
 	}
 	turnID := stringAtPath(turnResult, "turn", "id")
 	if turnID == "" {
 		err := fmt.Errorf("codex app-server turn/start response missing turn.id")
-		s.failStart(commandString(request.Capability.Path, args), err)
+		s.failStart(commandString(request.CommandPath, args), err)
 		return err
 	}
 	s.mu.Lock()
@@ -242,12 +245,12 @@ func (s *appServerCodexReviewSession) SendGuidance(ctx context.Context, message 
 	return nil
 }
 
-func (s *appServerCodexReviewSession) Wait(ctx context.Context) (CodexReviewResult, error) {
+func (s *appServerCodexReviewSession) Wait(ctx context.Context) (Result, error) {
 	s.mu.Lock()
 	done := s.done
 	s.mu.Unlock()
 	if done == nil {
-		return CodexReviewResult{}, fmt.Errorf("codex app-server review session is not started")
+		return Result{}, fmt.Errorf("codex app-server review session is not started")
 	}
 	select {
 	case <-done:
@@ -346,6 +349,7 @@ func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
 		var message appServerRPCMessage
 		if err := json.Unmarshal([]byte(line), &message); err != nil {
 			s.appendLog("STDOUT: " + truncateAppServerLogValue(line) + "\n")
+			s.recordStdoutDiagnosticLine(line)
 			continue
 		}
 		isDeltaNotification := len(message.ID) == 0 && message.Method == "item/agentMessage/delta"
@@ -408,23 +412,35 @@ func (s *appServerCodexReviewSession) maxOutputBytes() int {
 func (s *appServerCodexReviewSession) recordStderrLine(line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	limit := s.req.MaxOutputBytes
-	if limit <= 0 {
-		s.stderr.WriteString(line)
-		s.stderr.WriteByte('\n')
+	appendBoundedLine(&s.stderr, line, s.req.MaxOutputBytes)
+}
+
+func (s *appServerCodexReviewSession) recordStdoutDiagnosticLine(line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	appendBoundedLine(&s.stdoutDiagnostics, line, s.req.MaxOutputBytes)
+}
+
+func appendBoundedLine(buffer *bytes.Buffer, line string, limit int) {
+	if buffer == nil {
 		return
 	}
-	remaining := limit - s.stderr.Len()
+	if limit <= 0 {
+		buffer.WriteString(line)
+		buffer.WriteByte('\n')
+		return
+	}
+	remaining := limit - buffer.Len()
 	if remaining <= 0 {
 		return
 	}
 	if len(line) >= remaining {
-		s.stderr.WriteString(line[:remaining])
+		buffer.WriteString(line[:remaining])
 		return
 	}
-	s.stderr.WriteString(line)
-	if s.stderr.Len() < limit {
-		s.stderr.WriteByte('\n')
+	buffer.WriteString(line)
+	if buffer.Len() < limit {
+		buffer.WriteByte('\n')
 	}
 }
 
@@ -442,9 +458,10 @@ func (s *appServerCodexReviewSession) completeStreamError(stream string, err err
 	if s.cmd != nil {
 		command = commandString(s.cmd.Path, s.cmd.Args[1:])
 	}
+	stdout := s.stdoutDiagnostics.String()
 	stderr := s.stderr.String()
 	s.mu.Unlock()
-	s.complete(executor.Result{Command: command, Stderr: stderr, Err: streamErr}, streamErr)
+	s.complete(executor.Result{Command: command, Stdout: stdout, Stderr: stderr, Err: streamErr}, streamErr)
 }
 
 func (s *appServerCodexReviewSession) ignoreStreamError(err error) bool {
@@ -771,7 +788,35 @@ func utf8SafeSuffix(value string, limit int) string {
 	return strings.ToValidUTF8(value[start:], "")
 }
 
-func (s *appServerCodexReviewSession) emitDeltaUpdate(update CodexDeltaUpdate, ok bool) {
+func utf8SafePrefix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return strings.ToValidUTF8(value, "")
+	}
+	return strings.ToValidUTF8(truncateStringPrefix(value, limit), "")
+}
+
+func appendOutputBounded(current, addition string, limit int) (string, string, bool) {
+	if addition == "" {
+		return current, "", false
+	}
+	if limit <= 0 {
+		return current + addition, addition, false
+	}
+	remaining := limit - len(current)
+	if remaining <= 0 {
+		return current, "", true
+	}
+	if len(addition) <= remaining {
+		return current + addition, addition, false
+	}
+	appended := utf8SafePrefix(addition, remaining)
+	return current + appended, appended, true
+}
+
+func (s *appServerCodexReviewSession) emitDeltaUpdate(update Update, ok bool) {
 	if !ok || s.req.OnDelta == nil {
 		return
 	}
@@ -863,7 +908,7 @@ func (s *appServerCodexReviewSession) recordItemActivity(turnID, itemID, itemTyp
 	preview, truncated := deltaPreviewText(s.activityPreview+line+"\n", s.activityTruncated)
 	s.activityPreview = preview
 	s.activityTruncated = truncated
-	update := CodexDeltaUpdate{
+	update := Update{
 		TurnID:    firstNonEmpty(turnID, s.turnID),
 		ItemID:    itemID,
 		Delta:     line + "\n",
@@ -978,24 +1023,30 @@ func (s *appServerCodexReviewSession) recordDelta(turnID, itemID, delta string) 
 			s.itemOrder = append(s.itemOrder, itemID)
 		}
 	}
-	s.deltas[itemID] += delta
+	limit := s.req.MaxOutputBytes
+	next, storedDelta, outputTruncated := appendOutputBounded(s.deltas[itemID], delta, limit)
+	s.deltas[itemID] = next
 	s.agentPreviewStarted = true
+	if outputTruncated {
+		s.deltaPreviewTruncated[itemID] = true
+	}
 	if s.itemDone[itemID] {
 		s.mu.Unlock()
 		return
 	}
-	preview, truncated := appendDeltaPreview(s.deltaPreview[itemID], delta, s.deltaPreviewTruncated[itemID])
+	preview, truncated := appendDeltaPreview(s.deltaPreview[itemID], storedDelta, s.deltaPreviewTruncated[itemID])
 	s.deltaPreview[itemID] = preview
 	s.deltaPreviewTruncated[itemID] = truncated
-	update := CodexDeltaUpdate{
+	update := Update{
 		TurnID:    firstNonEmpty(turnID, s.turnID),
 		ItemID:    itemID,
-		Delta:     delta,
+		Delta:     storedDelta,
 		Text:      preview,
 		Truncated: truncated,
 	}
+	emit := storedDelta != "" || outputTruncated
 	s.mu.Unlock()
-	s.emitDeltaUpdate(update, true)
+	s.emitDeltaUpdate(update, emit)
 }
 
 func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text string) {
@@ -1025,18 +1076,19 @@ func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text s
 	if _, ok := s.items[itemID]; !ok && s.deltas[itemID] == "" {
 		s.itemOrder = append(s.itemOrder, itemID)
 	}
-	s.items[itemID] = text
+	storedText, _, outputTruncated := appendOutputBounded("", text, s.req.MaxOutputBytes)
+	s.items[itemID] = storedText
 	hadPreview := s.deltaPreview[itemID] != "" || s.deltas[itemID] != ""
 	s.itemDone[itemID] = true
-	if text != "" {
+	if storedText != "" {
 		s.agentPreviewStarted = true
 	}
 	preview := s.deltaPreview[itemID]
-	truncated := s.deltaPreviewTruncated[itemID]
-	if text != "" {
-		preview, truncated = deltaPreviewText(text, false)
+	truncated := s.deltaPreviewTruncated[itemID] || outputTruncated
+	if storedText != "" {
+		preview, truncated = deltaPreviewText(storedText, truncated)
 	}
-	update := CodexDeltaUpdate{
+	update := Update{
 		TurnID:    firstNonEmpty(turnID, s.turnID),
 		ItemID:    itemID,
 		Text:      preview,
@@ -1044,7 +1096,7 @@ func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text s
 		Truncated: truncated,
 	}
 	s.mu.Unlock()
-	s.emitDeltaUpdate(update, hadPreview || text != "")
+	s.emitDeltaUpdate(update, hadPreview || storedText != "" || outputTruncated)
 }
 
 func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnErr *struct {
@@ -1100,6 +1152,8 @@ func (s *appServerCodexReviewSession) finalReportLocked() string {
 		sort.Strings(s.itemOrder)
 	}
 	var parts []string
+	var report string
+	limit := s.req.MaxOutputBytes
 	for _, id := range s.itemOrder {
 		if text := strings.TrimSpace(s.items[id]); text != "" {
 			parts = append(parts, text)
@@ -1109,19 +1163,34 @@ func (s *appServerCodexReviewSession) finalReportLocked() string {
 			parts = append(parts, text)
 		}
 	}
-	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		addition := part
+		if report != "" {
+			addition = "\n\n" + addition
+		}
+		next, _, truncated := appendOutputBounded(report, addition, limit)
+		report = next
+		if truncated {
+			break
+		}
+	}
+	return strings.TrimSpace(report)
 }
 
 func (s *appServerCodexReviewSession) waitProcess(ctx context.Context, command string) {
 	err := s.cmd.Wait()
 	s.mu.Lock()
 	completed := s.completed
+	stdout := s.stdoutDiagnostics.String()
 	stderr := s.stderr.String()
 	s.mu.Unlock()
 	if completed {
 		return
 	}
-	result := executor.Result{Command: command, Stderr: stderr, Err: err}
+	result := executor.Result{Command: command, Stdout: stdout, Stderr: stderr, Err: err}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		result.Timeout = ctxErr == context.DeadlineExceeded
 		result.Err = ctxErr
@@ -1153,7 +1222,7 @@ func (s *appServerCodexReviewSession) complete(result executor.Result, err error
 	s.logRemainingAggregatedDeltas()
 	s.mu.Lock()
 	s.result.Result = result
-	s.result.ArtifactWarnings = append(s.result.ArtifactWarnings, s.warnings...)
+	s.result.Warnings = append(s.result.Warnings, s.warnings...)
 	s.err = err
 	s.mu.Unlock()
 	if done != nil {
@@ -1172,12 +1241,13 @@ func (s *appServerCodexReviewSession) stop() {
 
 func (s *appServerCodexReviewSession) failStart(command string, err error) {
 	s.mu.Lock()
+	stdout := s.stdoutDiagnostics.String()
 	stderr := s.stderr.String()
 	s.mu.Unlock()
 	if strings.TrimSpace(stderr) == "" && err != nil {
 		stderr = err.Error()
 	}
-	s.complete(executor.Result{Command: command, Stderr: stderr, Err: err}, err)
+	s.complete(executor.Result{Command: command, Stdout: stdout, Stderr: stderr, Err: err}, err)
 }
 
 func (s *appServerCodexReviewSession) appendLog(content string) {
@@ -1188,11 +1258,11 @@ func (s *appServerCodexReviewSession) appendLog(content string) {
 		return
 	}
 	if err := appendText(path, content); err != nil {
-		s.addArtifactWarning(newArtifactWarning(path, "append_text", false, err))
+		s.addWarning(newWarning(path, "append_text", false, err))
 	}
 }
 
-func (s *appServerCodexReviewSession) addArtifactWarning(warning ArtifactWarning) {
+func (s *appServerCodexReviewSession) addWarning(warning Warning) {
 	if warning.OK() {
 		return
 	}
@@ -1221,18 +1291,18 @@ func stringAtPath(raw json.RawMessage, path ...string) string {
 	return strings.TrimSpace(text)
 }
 
-func appServerThreadStartParams(request CodexReviewRequest) map[string]any {
+func appServerThreadStartParams(request Request) map[string]any {
 	params := map[string]any{
 		"approvalPolicy": "never",
 		"cwd":            request.ProjectPath,
 		"ephemeral":      true,
 		"sandbox":        "read-only",
 	}
-	setAppServerModelParam(params, request.Args)
+	setAppServerModelParam(params, request.Model)
 	return params
 }
 
-func appServerTurnStartParams(request CodexReviewRequest, threadID string) map[string]any {
+func appServerTurnStartParams(request Request, threadID string) map[string]any {
 	params := map[string]any{
 		"approvalPolicy": "never",
 		"cwd":            request.ProjectPath,
@@ -1246,12 +1316,78 @@ func appServerTurnStartParams(request CodexReviewRequest, threadID string) map[s
 		},
 		"threadId": threadID,
 	}
-	setAppServerModelParam(params, request.Args)
+	setAppServerModelParam(params, request.Model)
 	return params
 }
 
-func setAppServerModelParam(params map[string]any, args []string) {
-	if model := codex.AppServerModelFromArgs(args); model != "" {
+func setAppServerModelParam(params map[string]any, model string) {
+	if strings.TrimSpace(model) != "" {
 		params["model"] = model
 	}
+}
+
+const (
+	staticReviewJSONStart = "<!-- p2r:static-review-json:start -->"
+	staticReviewJSONEnd   = "<!-- p2r:static-review-json:end -->"
+)
+
+func newWarning(path, op string, required bool, err error) Warning {
+	if err == nil {
+		return Warning{}
+	}
+	return Warning{
+		Path:       filepath.Clean(path),
+		Op:         op,
+		Error:      err.Error(),
+		Required:   required,
+		RecordedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func writeText(path, content string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func appendText(path, content string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.WriteString(content)
+	return err
+}
+
+func sha256Text(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func staticReviewMarkerCounts(value string) (int, int) {
+	return strings.Count(value, staticReviewJSONStart), strings.Count(value, staticReviewJSONEnd)
+}
+
+func truncateStringPrefix(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	for limit > 0 && !utf8.ValidString(value[:limit]) {
+		limit--
+	}
+	return value[:limit]
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

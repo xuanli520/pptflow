@@ -235,7 +235,7 @@ func TestRunCanonicalizesStaleDBProjectPath(t *testing.T) {
 	}
 }
 
-func TestRunPersistsStageArtifactWarnings(t *testing.T) {
+func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) {
 	root := t.TempDir()
 	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-WARN")
 	fakeBin := filepath.Join(root, "bin")
@@ -267,35 +267,23 @@ func TestRunPersistsStageArtifactWarnings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	compatWarningPath := "QA_4_测试有效性报告_api端点真实性.md"
-	result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-WARN", pipelinepkg.RunOptions{
-		Stages: []string{"D"},
-		Progress: func(update pipelinepkg.RunProgress) {
-			if update.Event != "run_created" || update.RunID == "" {
-				return
-			}
-			artifactRoot := runArtifactRoot(root, scanner.Project{TaskID: "TASK-WARN", Batch: "batch-1", Path: projectPath}, update.RunID)
-			if err := os.MkdirAll(filepath.Join(artifactRoot, compatWarningPath), 0o755); err != nil {
-				t.Errorf("block compat path: %v", err)
-			}
-		},
-	})
+	result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-WARN", pipelinepkg.RunOptions{Stages: []string{"D"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	warnings, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "artifact_warnings.json"))
-	if err != nil {
-		t.Fatalf("artifact_warnings.json should be written: %v", err)
+	if err == nil && strings.Contains(string(warnings), "submit_copy") {
+		t.Fatalf("unselected submit files should not become artifact warnings:\n%s", warnings)
 	}
-	if !strings.Contains(string(warnings), compatWarningPath) || !strings.Contains(string(warnings), "write_text") {
-		t.Fatalf("artifact warnings missing compat write warning:\n%s", warnings)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("unexpected artifact_warnings.json read error: %v", err)
 	}
-	stageStatus, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "stage_status.json"))
+	manifest, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "submit_manifest.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(stageStatus), `"artifact_warnings"`) {
-		t.Fatalf("stage status should retain stage-local warnings:\n%s", stageStatus)
+	if !strings.Contains(string(manifest), "QA_test_effectiveness_report.md") || !strings.Contains(string(manifest), `"not_selected": true`) {
+		t.Fatalf("submit manifest missing expected file records:\n%s", manifest)
 	}
 }
 
@@ -322,6 +310,28 @@ func TestRunRejectsUnknownStageBeforeCreatingRun(t *testing.T) {
 	}
 	if _, err := store.LatestRunForTask(ctx, "TASK-BAD-STAGE"); err == nil {
 		t.Fatal("invalid stage should not create a run")
+	}
+}
+
+func TestArtifactWriterRejectsPathsOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	writer := pipelinepkg.NewArtifactWriter(root)
+	if err := writer.RequiredText("logs/ok.txt", "ok"); err != nil {
+		t.Fatalf("relative artifact write failed: %v", err)
+	}
+	for _, path := range []string{"../escape.txt", filepath.Join(t.TempDir(), "escape.txt")} {
+		if err := writer.RequiredText(path, "nope"); err == nil {
+			t.Fatalf("artifact writer should reject path outside root: %s", path)
+		}
+	}
+}
+
+func TestArtifactWriterAllowsAbsolutePathWithinRoot(t *testing.T) {
+	root := t.TempDir()
+	writer := pipelinepkg.NewArtifactWriter(root)
+	inside := filepath.Join(root, "logs", "ok.txt")
+	if err := writer.RequiredText(inside, "ok"); err != nil {
+		t.Fatalf("absolute path within artifact root should be allowed: %v", err)
 	}
 }
 
@@ -698,6 +708,20 @@ func TestCodexGuidanceStopsPromptlyWhenContextCancelled(t *testing.T) {
 	}
 }
 
+func TestCodexGuidancePreservesDiagnosticsAfterContextCancelled(t *testing.T) {
+	session := &cancelDiagnosticCodexSession{}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	result, err := runCodexReviewSessionWithGuidance(ctx, session, pipelinepkg.CodexReviewRequest{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("expected context deadline error, got err=%v result=%#v", err, result)
+	}
+	if !strings.Contains(result.Result.Stderr, "codex stderr after cancel") {
+		t.Fatalf("cancel diagnostics were not preserved: %#v", result.Result)
+	}
+}
+
 func TestCodexStartFailurePreservesSessionDiagnostics(t *testing.T) {
 	startErr := errors.New("initialize failed")
 	session := &startFailureCodexSession{
@@ -739,6 +763,26 @@ func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 			t.Fatalf("%s does not forbid preamble text and require final JSON placement", name)
 		}
 	}
+}
+
+type cancelDiagnosticCodexSession struct{}
+
+func (s *cancelDiagnosticCodexSession) Start(ctx context.Context, request pipelinepkg.CodexReviewRequest) error {
+	return nil
+}
+
+func (s *cancelDiagnosticCodexSession) SendGuidance(ctx context.Context, message string) error {
+	return nil
+}
+
+func (s *cancelDiagnosticCodexSession) Wait(ctx context.Context) (pipelinepkg.CodexReviewResult, error) {
+	<-ctx.Done()
+	time.Sleep(25 * time.Millisecond)
+	return pipelinepkg.CodexReviewResult{Result: executor.Result{
+		Command: "codex app-server --listen stdio://",
+		Stderr:  "codex stderr after cancel",
+		Err:     ctx.Err(),
+	}}, ctx.Err()
 }
 
 type startFailureCodexSession struct {
@@ -930,10 +974,10 @@ func TestAcceptanceScriptArgsMatchRealScriptContract(t *testing.T) {
 
 func TestValidationScriptArgsOwnValidationReport(t *testing.T) {
 	outputs := map[string]string{
-		"validation_md": "validation_report.md",
+		"validation_md": "validate_report.md",
 	}
 	got := validationScriptArgs(outputs, []string{"--project-type", "fullstack"})
-	want := []string{"--output-md", "validation_report.md"}
+	want := []string{"--output-md", "validate_report.md"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}

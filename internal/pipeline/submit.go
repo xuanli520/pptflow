@@ -1,0 +1,131 @@
+package pipeline
+
+import (
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/projectlayout"
+	"github.com/xuanli520/p2r_tui/internal/scanner"
+)
+
+type submitArtifactCopy struct {
+	Name        string `json:"name"`
+	Stage       string `json:"stage,omitempty"`
+	Source      string `json:"source,omitempty"`
+	Target      string `json:"target,omitempty"`
+	OK          bool   `json:"ok"`
+	NotSelected bool   `json:"not_selected,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+type submitArtifactSpec struct {
+	Name  string
+	Stage string
+}
+
+func (s *runState) aggregateSubmitArtifacts() {
+	copies := aggregateSubmitArtifacts(s.run.ArtifactRoot, submitRoot(s.runner.cfg.ScanPath, s.project), submitArtifactSpecs(s.opts.Mode), selectedSubmitStages(s.stages))
+	for _, item := range copies {
+		if item.OK || item.NotSelected {
+			continue
+		}
+		s.addArtifactWarning(ArtifactWarning{
+			Path:       item.Name,
+			Op:         "submit_copy",
+			Error:      item.Error,
+			RecordedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	s.persistArtifactWarnings()
+	_ = s.writer.BestEffortJSON("submit_manifest.json", map[string]any{
+		"submit_dir": submitRoot(s.runner.cfg.ScanPath, s.project),
+		"files":      copies,
+	})
+}
+
+func aggregateSubmitArtifacts(artifactRoot, submitDir string, specs []submitArtifactSpec, selected map[string]bool) []submitArtifactCopy {
+	_ = os.MkdirAll(submitDir, 0o755)
+	copies := make([]submitArtifactCopy, 0, len(specs))
+	for _, spec := range specs {
+		source := filepath.Join(artifactRoot, spec.Name)
+		target := filepath.Join(submitDir, spec.Name)
+		item := submitArtifactCopy{Name: spec.Name, Stage: spec.Stage, Source: source, Target: target}
+		if !selected[spec.Stage] {
+			item.NotSelected = true
+			copies = append(copies, item)
+			continue
+		}
+		info, err := os.Stat(source)
+		if err != nil {
+			item.Error = err.Error()
+			copies = append(copies, item)
+			continue
+		}
+		if info.IsDir() {
+			item.Error = "source is a directory"
+			copies = append(copies, item)
+			continue
+		}
+		if err := copyFile(source, target, info.Mode()); err != nil {
+			item.Error = err.Error()
+			copies = append(copies, item)
+			continue
+		}
+		item.OK = true
+		copies = append(copies, item)
+	}
+	return copies
+}
+
+func submitRoot(scanPath string, project scanner.Project) string {
+	batchDir := projectlayout.SafePathSegment(project.Batch, "unbatched")
+	taskDir := projectlayout.SafePathSegment(project.TaskID, "TASK-UNKNOWN")
+	return filepath.Join(filepath.Clean(scanPath), "result", batchDir, taskDir, "submit")
+}
+
+func submitArtifactNames(mode string) []string {
+	specs := submitArtifactSpecs(mode)
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+	}
+	return names
+}
+
+func submitArtifactSpecs(mode string) []submitArtifactSpec {
+	if mode == "recheck" {
+		return []submitArtifactSpec{
+			{Name: qaArtifactName("codex_report_verification.md"), Stage: "E"},
+			{Name: qaArtifactName("validate_report.md"), Stage: "A"},
+			{Name: qaArtifactName("prompt_requirements_verification.md"), Stage: "F"},
+			{Name: qaArtifactName("codex_report_issues_verification.md"), Stage: "F"},
+			{Name: qaArtifactName("test_effectiveness_verification.md"), Stage: "D"},
+			{Name: qaArtifactName("docker_startup.png"), Stage: "B"},
+			{Name: qaArtifactName("run_tests_screenshot.png"), Stage: "C"},
+			{Name: qaArtifactName("trajectory_archive.png"), Stage: "A"},
+		}
+	}
+	return []submitArtifactSpec{
+		{Name: qaArtifactName("codex_report.md"), Stage: "E"},
+		{Name: qaArtifactName("validate_report.md"), Stage: "A"},
+		{Name: qaArtifactName("operator_prompt_requirements_verification.md"), Stage: "F"},
+		{Name: qaArtifactName("operator_codex_report_issues_verification.md"), Stage: "F"},
+		{Name: qaArtifactName("test_effectiveness_report.md"), Stage: "D"},
+		{Name: qaArtifactName("docker_startup.png"), Stage: "B"},
+		{Name: qaArtifactName("run_tests_screenshot.png"), Stage: "C"},
+		{Name: qaArtifactName("trajectory_archive.png"), Stage: "A"},
+	}
+}
+
+func selectedSubmitStages(stages []model.StageRecord) map[string]bool {
+	selected := map[string]bool{}
+	for _, stage := range stages {
+		if stage.Status == model.StageSkipped {
+			continue
+		}
+		selected[stage.Stage] = true
+	}
+	return selected
+}

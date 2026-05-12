@@ -12,11 +12,11 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner.Project, progress func(RunProgress)) model.StageRecord {
+func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner.Project, runtime RuntimeState, progress func(RunProgress)) model.StageRecord {
 	start := time.Now()
 	record := startStage("C")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "C_tests.log")
-	screenshotPath := qaArtifactPath(run.ArtifactRoot, "6_run_tests.sh运行截图.png")
+	screenshotPath := qaArtifactPath(run.ArtifactRoot, "run_tests_screenshot.png")
 	summaryPath := filepath.Join(run.ArtifactRoot, "test_runtime_summary.json")
 	record.LogPath = logPath
 	record.ArtifactPaths = append(record.ArtifactPaths, logPath, screenshotPath, summaryPath)
@@ -50,12 +50,8 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		}
 		return finishStage(record, model.StageFailed, start)
 	}
-	runtime, runtimeErr := readRuntimeEvidence(filepath.Join(run.ArtifactRoot, "port_map.json"))
-	if runtimeErr != nil || len(runtime.Mappings) == 0 {
+	if !runtime.HasServiceMappings() {
 		evidence := "Stage B runtime evidence is missing port mappings. Run Stage B successfully before Stage C."
-		if runtimeErr != nil {
-			evidence = runtimeErr.Error()
-		}
 		recordRequiredEvidence(evidence, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
@@ -90,7 +86,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		return finishStage(record, model.StageFailed, start)
 	}
 	stageEnv := stageCEnvironment(runtime)
-	env := append(os.Environ(), stageEnv.Env...)
+	env := runtimeCommandEnv(stageEnv.Env)
 	timeout := r.stageTimeout("C", 300)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
