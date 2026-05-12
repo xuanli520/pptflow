@@ -97,21 +97,24 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 			Title:      "run_validate.py did not complete cleanly",
 			Rule:       "Stage A must collect " + filepath.Base(validationReportPath) + " from the bundled validation wrapper.",
 			Evidence:   result.summary(),
-			Impact:     "The validation markdown report may be incomplete or generated from fallback structural checks.",
+			Impact:     "The validation markdown report may be incomplete or missing.",
 			MinimumFix: "Ensure Python/uv can run assets/scripts/run_validate.py and rerun Stage A.",
 			SourcePath: validationReportPath,
 		})
 	}
 	findings = append(findings, acceptanceFindings(acceptancePath)...)
 	if !fileExists(validationReportPath) {
-		record = requiredStageText(record, writer, writer.RelativePath(validationReportPath), validationMarkdown(project, required, findings))
+		findings = append(findings, missingValidationReportFinding(validationReportPath, scriptResults["run_validate.py"]))
 	}
 	trajectoryPages, trajectoryErr := renderTerminalLog(packageTrajectorySummary(project.Path, scriptRoot, snapshotErr), trajectoryPath)
 	if trajectoryErr != nil {
 		record = recordArtifactWriteError(record, trajectoryErr, trajectoryPath)
 	}
 
-	artifactPaths := []string{acceptancePath, acceptanceReportPath, validationReportPath, requiredPath, readmeAlignmentPath, localDependencyPath}
+	artifactPaths := []string{acceptancePath, acceptanceReportPath, requiredPath, readmeAlignmentPath, localDependencyPath}
+	if fileExists(validationReportPath) {
+		artifactPaths = append(artifactPaths, validationReportPath)
+	}
 	artifactPaths = append(artifactPaths, trajectoryPages...)
 	for _, path := range []string{fakeImplPath, testsInspectionPath, englishOnlyPath} {
 		if fileExists(path) {
@@ -389,7 +392,16 @@ func (r Runner) runStageAScripts(ctx context.Context, project scanner.Project, s
 		return r.runStageAScript(ctx, project.Path, scriptRoot, script, args)
 	}
 	results["run_acceptance.py"] = run("run_acceptance.py", acceptanceScriptArgs(outputs, projectTypeArgs))
-	results["run_validate.py"] = run("run_validate.py", validationScriptArgs(outputs, projectTypeArgs))
+	removeScriptOwnedFile(outputs["validation_md"])
+	if err := cleanValidationInputRoot(scriptRoot); err != nil {
+		results["run_validate.py"] = scriptExecution{
+			Script:    "run_validate.py",
+			InputRoot: scriptRoot,
+			Error:     "validation input root cleanup failed: " + err.Error(),
+		}
+	} else {
+		results["run_validate.py"] = run("run_validate.py", validationScriptArgs(outputs, projectTypeArgs))
+	}
 
 	checks := []struct {
 		script string
@@ -434,6 +446,64 @@ func validationScriptArgs(outputs map[string]string, _ []string) []string {
 	return []string{
 		"--output-md", outputs["validation_md"],
 	}
+}
+
+func removeScriptOwnedFile(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+func missingValidationReportFinding(path string, result scriptExecution) model.Finding {
+	evidence := "run_validate.py completed without writing " + filepath.Base(path)
+	if result.Script != "" && !result.OK {
+		evidence = result.summary()
+	}
+	return model.Finding{
+		Stage:      "A",
+		Severity:   "Blocker",
+		Title:      "run_validate.py did not emit QA_validation_report.md",
+		Rule:       "QA_validation_report.md must be produced by run_validate.py, not by run_acceptance.py or a pipeline fallback.",
+		Evidence:   evidence,
+		Impact:     "The submit package would otherwise contain validation evidence with the wrong provenance.",
+		MinimumFix: "Ensure assets/scripts/run_validate.py writes --output-md to " + filepath.Base(path) + " and rerun Stage A.",
+		SourcePath: path,
+	}
+}
+
+func cleanValidationInputRoot(root string) error {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return fmt.Errorf("empty validation input root")
+	}
+	root = filepath.Clean(root)
+	if filepath.Base(root) != "script_input_snapshot" {
+		return fmt.Errorf("refusing to clean non-snapshot root %q", root)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	allowed := map[string]bool{
+		"docs":              true,
+		"metadata.json":     true,
+		"original_sessions": true,
+		"repo":              true,
+	}
+	for _, entry := range entries {
+		if allowed[entry.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type scriptExecution struct {

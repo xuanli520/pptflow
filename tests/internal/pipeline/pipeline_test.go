@@ -270,7 +270,8 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 	if err := os.MkdirAll(filepath.Join(submitDir, "nested"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, stale := range []string{"QA_validate_report.md", "unexpected.txt", filepath.Join("nested", "old.txt")} {
+	oldValidationReportName := "QA_" + "validate" + "_report.md"
+	for _, stale := range []string{oldValidationReportName, "unexpected.txt", filepath.Join("nested", "old.txt")} {
 		if err := os.WriteFile(filepath.Join(submitDir, stale), []byte("stale"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +281,7 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, stale := range []string{"QA_validate_report.md", "unexpected.txt", filepath.Join("nested", "old.txt")} {
+	for _, stale := range []string{oldValidationReportName, "unexpected.txt", filepath.Join("nested", "old.txt")} {
 		if _, err := os.Stat(filepath.Join(submitDir, stale)); !os.IsNotExist(err) {
 			t.Fatalf("submit reset should remove stale %s, stat err: %v", stale, err)
 		}

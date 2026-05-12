@@ -281,7 +281,7 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 
 | 规则 / 风险点 | 负责阶段 | 工具或模板 | 主要输出 |
 |---------------|----------|------------|----------|
-| 根结构：`docs/`、`repo/`、`original_sessions/`、`metadata.json` | A | `run_acceptance.py`、`run_validate.py` | `acceptance.json`、`QA_acceptance_report.md`、`QA_validation_report.md` |
+| 根结构：`docs/`、`repo/`、`original_sessions/`、`metadata.json` | A | `run_acceptance.py` → `acceptance.json`/`QA_acceptance_report.md`；`run_validate.py` → `QA_validation_report.md` | `acceptance.json`、`QA_acceptance_report.md`、`QA_validation_report.md` |
 | 必需文档和测试目录 | A | `check_required_artifacts.py` | `required_artifacts.json` |
 | README 与实际结构/命令静态一致性 | A/E | `check_readme_alignment.py`、`static_acceptance_audit.md` | finding |
 | 脏依赖、缓存、数据库文件 | A | `check_local_dependency.py` | finding |
@@ -303,8 +303,8 @@ MVP 只展示项目总览和执行面板。Report/Prompt 完整面板后续版�
 |----|------|
 | 输入 | `<task-path>/` |
 | 依赖 | 无 |
-| 动作 | 运行 `run_acceptance.py`、`run_validate.py`、`check_required_artifacts.py`、`check_readme_alignment.py`、`check_local_dependency.py`，英文题追加 `check_english_only.py` |
-| 输出 | `acceptance.json`、`QA_acceptance_report.md`、`QA_validation_report.md`、`required_artifacts.json`、`readme_alignment.json`、`local_dependency.json` |
+| 动作 | 运行 `run_acceptance.py`；随后清理脚本输入副本的顶层目录，仅保留 `docs/`、`repo/`、`original_sessions/`、`metadata.json` 后运行 `run_validate.py`；再运行 `check_required_artifacts.py`、`check_readme_alignment.py`、`check_local_dependency.py`，英文题追加 `check_english_only.py` |
+| 输出 | `acceptance.json`、`QA_acceptance_report.md`（由 `run_acceptance.py` 生成）、`QA_validation_report.md`（由 `run_validate.py` 生成）、`required_artifacts.json`、`readme_alignment.json`、`local_dependency.json` |
 | 超时 | 60s |
 | 失败影响 | A 失败时 B/C 标记 `blocked`；D/E 仍可静态审查已存在文件；F 在默认配置中继续参与汇总 |
 

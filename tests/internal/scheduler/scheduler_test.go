@@ -389,8 +389,43 @@ fi
 if mkdir %q 2>/dev/null; then
 	sleep %q
 fi
+script="${1:-}"
+output_json=""
+output_md=""
+pending=""
+for arg in "$@"; do
+	if [ "$pending" = "--output-json" ]; then
+		output_json="$arg"
+		pending=""
+		continue
+	fi
+	if [ "$pending" = "--output-md" ]; then
+		output_md="$arg"
+		pending=""
+		continue
+	fi
+	if [ "$arg" = "--output-json" ] || [ "$arg" = "--output-md" ]; then
+		pending="$arg"
+	fi
+done
+if [[ "$script" == *run_acceptance.py ]]; then
+	if [ -n "$output_json" ]; then
+		mkdir -p "$(dirname "$output_json")"
+		printf '{"blocking_issues":[],"non_blocking_issues":[]}\n' > "$output_json"
+	fi
+	if [ -n "$output_md" ]; then
+		mkdir -p "$(dirname "$output_md")"
+		printf '# Acceptance\n' > "$output_md"
+	fi
+fi
+if [[ "$script" == *run_validate.py ]]; then
+	if [ -n "$output_md" ]; then
+		mkdir -p "$(dirname "$output_md")"
+		printf '# Validation\n' > "$output_md"
+	fi
+fi
 exit 0
-`, delayMarker, fmt.Sprintf("%.3f", firstScriptDelay.Seconds()))
+	`, delayMarker, fmt.Sprintf("%.3f", firstScriptDelay.Seconds()))
 	if err := os.WriteFile(pythonPath, []byte(content), 0o755); err != nil {
 		t.Fatal(err)
 	}

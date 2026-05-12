@@ -357,10 +357,12 @@ type Warning struct {
 
 | Stage | 模式 | 产物（写入名，自动加 `QA_` 前缀） | 说明 |
 |---|---|---|---|
-| A | any | `validation_report.md` | 静态验证报告 |
-| A | any | `acceptance_report.md` | acceptance 报告 |
+| A | any | `validation_report.md` | 静态验证报告；只能由 `run_validate.py --output-md` 生成 |
+| A | any | `acceptance_report.md` | acceptance 报告；由 `run_acceptance.py --output-md` 生成 |
 | A | any | `trajectory_archive.png` | 轨迹文件压缩包内部构造截图 |
 | A | any | `acceptance.json`, `required_artifacts.json`, `readme_alignment.json`, `local_dependency.json`, `fake_impl.json`, `tests_inspection.json`, `english_only.json` | 辅助 JSON（无 QA_ 前缀） |
+
+`run_validate.py` 前会清理 `script_input_snapshot/` 顶层，只保留 `docs/`、`repo/`、`original_sessions/`、`metadata.json`，保证验证根目录不混入历史 QA 或临时文件。
 | B | any | `port_map.json` | Docker 端口映射（无 QA_ 前缀） |
 | B | any | `docker_startup.png` | Docker 启动截图 |
 | C | any | `test_runtime_summary.json` | 测试运行摘要（无 QA_ 前缀） |

@@ -64,6 +64,12 @@ func TestStageAWritesRenamedReportsAndTrajectoryArchive(t *testing.T) {
 		"original/prompt.txt": "build it",
 		"repo/package.json":   "{}",
 	})
+	if err := os.MkdirAll(filepath.Join(root, "tmp-cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scratch.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	artifactRoot := filepath.Join(t.TempDir(), "run")
 	scanPath := t.TempDir()
 	writeStageAScript(t, scanPath, "run_acceptance.py", `import json, sys
@@ -73,9 +79,16 @@ md_path=args[args.index("--output-md")+1]
 open(json_path,"w").write(json.dumps({"blocking_issues":[],"non_blocking_issues":[]}))
 open(md_path,"w").write("# Acceptance\n")
 `)
-	writeStageAScript(t, scanPath, "run_validate.py", `import sys
+	writeStageAScript(t, scanPath, "run_validate.py", `import os, sys
 args=sys.argv
+root=args[1]
 md_path=args[args.index("--output-md")+1]
+for dirty in ("scratch.txt", "tmp-cache"):
+    if os.path.exists(os.path.join(root, dirty)):
+        raise SystemExit("validation root is dirty: " + dirty)
+for required in ("docs", "repo", "original_sessions", "metadata.json"):
+    if not os.path.exists(os.path.join(root, required)):
+        raise SystemExit("validation root missing required entry: " + required)
 open(md_path,"w").write("# Validation\n")
 `)
 	record := pipelinepkg.NewRunner(nil, configWithScanPath(scanPath)).StageAForTest(
@@ -87,6 +100,51 @@ open(md_path,"w").write("# Validation\n")
 		if _, err := os.Stat(filepath.Join(artifactRoot, name)); err != nil {
 			t.Fatalf("expected Stage A artifact %s: %v; record=%#v", name, err, record)
 		}
+	}
+	acceptanceReport := readStageAArtifact(t, artifactRoot, "QA_acceptance_report.md")
+	if strings.Contains(acceptanceReport, "Validation") || !strings.Contains(acceptanceReport, "Acceptance") {
+		t.Fatalf("acceptance report should be produced by run_acceptance.py:\n%s", acceptanceReport)
+	}
+	validationReport := readStageAArtifact(t, artifactRoot, "QA_validation_report.md")
+	if strings.Contains(validationReport, "Acceptance") || !strings.Contains(validationReport, "Validation") {
+		t.Fatalf("validation report should be produced by run_validate.py:\n%s", validationReport)
+	}
+	for _, original := range []string{"scratch.txt", "tmp-cache"} {
+		if _, err := os.Stat(filepath.Join(root, original)); err != nil {
+			t.Fatalf("validation cleanup should not mutate original package entry %s: %v", original, err)
+		}
+	}
+}
+
+func TestStageADoesNotUseAcceptanceOutputAsValidationReport(t *testing.T) {
+	root := writeStageAPackage(t, "original_sessions", `{"task_id":"TASK-1","prompt":"build it"}`)
+	writeStageAZip(t, filepath.Join(root, "original_sessions", "-home-purplevoid88-projects-TASK-20260327-D3040D.zip"), map[string]string{
+		"repo/package.json": "{}",
+	})
+	artifactRoot := filepath.Join(t.TempDir(), "run")
+	scanPath := t.TempDir()
+	writeStageAScript(t, scanPath, "run_acceptance.py", `import json, os, sys
+args=sys.argv
+json_path=args[args.index("--output-json")+1]
+md_path=args[args.index("--output-md")+1]
+open(json_path,"w").write(json.dumps({"blocking_issues":[],"non_blocking_issues":[]}))
+open(md_path,"w").write("# Acceptance\n")
+open(os.path.join(os.path.dirname(md_path), "QA_validation_report.md"),"w").write("# Acceptance masquerading as validation\n")
+`)
+	writeStageAScript(t, scanPath, "run_validate.py", `import sys
+sys.exit(1)
+`)
+
+	record := pipelinepkg.NewRunner(nil, configWithScanPath(scanPath)).StageAForTest(
+		context.Background(),
+		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: root},
+	)
+	if _, err := os.Stat(filepath.Join(artifactRoot, "QA_validation_report.md")); !os.IsNotExist(err) {
+		t.Fatalf("validation report must not be kept from run_acceptance.py; stat err: %v; record=%#v", err, record)
+	}
+	if !hasFindingTitle(record.Findings, "run_validate.py did not emit QA_validation_report.md") {
+		t.Fatalf("missing validation report finding not recorded: %#v", record.Findings)
 	}
 }
 
@@ -201,6 +259,15 @@ func writeStageAZip(t *testing.T, path string, files map[string]string) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func readStageAArtifact(t *testing.T, artifactRoot, name string) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(artifactRoot, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(content)
 }
 
 func pathIsDir(path string) bool {
