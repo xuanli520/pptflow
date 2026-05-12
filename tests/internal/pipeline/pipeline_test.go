@@ -287,6 +287,67 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 	}
 }
 
+func TestRunMaterializesStaticArtifactsWhenCodexPreflightBlocked(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-PREFLIGHT")
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fakeBin, "codex"), fakeCodexAppServerScript())
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	cfg.Codex.PromptProfilesDir = filepath.Join(root, ".qa-control", "prompt_profiles")
+	cfg.Codex.ExtraArgs = []string{"--search"}
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-PREFLIGHT", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-PREFLIGHT", pipelinepkg.RunOptions{Stages: []string{"D", "E", "F"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []string{"D", "E", "F"} {
+		record := stageByName(result.Stages, stage)
+		if record.Status != model.StageFailed {
+			t.Fatalf("stage %s status = %s, want failed unavailable materialization; record=%#v", stage, record.Status, record)
+		}
+		if record.ErrorSummary == "" {
+			t.Fatalf("stage %s should keep an unavailable error summary: %#v", stage, record)
+		}
+	}
+	for _, name := range []string{
+		"QA_test_effectiveness_report.md",
+		"QA_codex_report.md",
+		"QA_operator_prompt_requirements_verification.md",
+	} {
+		content, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, name))
+		if err != nil {
+			t.Fatalf("expected preflight-blocked static report %s: %v", name, err)
+		}
+		if !strings.Contains(string(content), "Manual Verification Required") {
+			t.Fatalf("artifact %s should be an unavailable-review report:\n%s", name, content)
+		}
+	}
+	for _, name := range []string{
+		"QA_operator_codex_report_issues_verification.md",
+		"repair_summary.json",
+	} {
+		if _, err := os.Stat(filepath.Join(result.Run.ArtifactRoot, name)); err != nil {
+			t.Fatalf("expected preflight-blocked static artifact %s: %v", name, err)
+		}
+	}
+}
+
 func TestRunRejectsUnknownStageBeforeCreatingRun(t *testing.T) {
 	root := t.TempDir()
 	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-BAD-STAGE")

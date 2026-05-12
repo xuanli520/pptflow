@@ -3,97 +3,23 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
 func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, prior map[string]model.StageRecord, progress func(RunProgress)) model.StageRecord {
-	start := time.Now()
-	record := startStage("F")
-	logPath := filepath.Join(run.ArtifactRoot, "logs", "F_repair.log")
-	summaryPath := filepath.Join(run.ArtifactRoot, "repair_summary.json")
-	reportPath := stageFReportPath(run.ArtifactRoot, opts)
-	issueReportPath := stageFIssueReportPath(run.ArtifactRoot, opts)
-	record.LogPath = logPath
-	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath, reportPath, issueReportPath)
-	writer := NewArtifactWriter(run.ArtifactRoot)
-
-	stageStatuses, priorFindings := priorStageSnapshot(prior)
-	writeRepairSupplements(&record, writer, run, stageStatuses, priorFindings, summaryPath, issueReportPath)
-
-	profile := "annotator_fix.md"
-	profilePath := filepath.Join(r.cfg.Codex.PromptProfilesDir, profile)
-	profileContent, readErr := os.ReadFile(profilePath)
-	if readErr != nil {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, "prompt profile not readable: "+readErr.Error())
+	sc := StageContext{
+		Run:      run,
+		Project:  project,
+		Options:  opts,
+		Prior:    prior,
+		Progress: progress,
+		Writer:   NewArtifactWriter(run.ArtifactRoot),
+		Timeout:  r.stageTimeout,
 	}
-	if r.cfg.Codex.Network != "none" {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, "configured Codex network mode is unsupported by the current safe sandbox: "+r.cfg.Codex.Network)
-	}
-	if r.cfg.Codex.WritableTmp {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, "configured writable_tmp=true is unsupported without widening write access in the current Codex CLI sandbox")
-	}
-	extraArgs, extraErr := safeCodexExtraArgs(r.cfg.Codex.ExtraArgs)
-	if extraErr != nil {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, extraErr.Error())
-	}
-	reviewPath := codexReviewPath(run, project.Path)
-	capability := codex.DetectCLI(ctx, r.exec, "")
-	if capabilityErr := codex.ValidateAppServerCapability(capability); capabilityErr != nil {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, capabilityErr.Error())
-	}
-	contextText, contextErr := r.codexContext(ctx, project, opts, "F")
-	if contextErr != nil {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, contextErr.Error())
-	}
-	contextText += "\n" + stageFPreviousFindingsContext(stageStatuses, priorFindings)
-	sandbox, sandboxErr := codex.NewSandbox(reviewPath, run.ArtifactRoot, "F")
-	if sandboxErr != nil {
-		return r.finishUnavailableF(record, start, reportPath, logPath, profile, project.Path, sandboxErr.Error())
-	}
-	defer os.RemoveAll(sandbox.Home)
-	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
-	prompt := codexPrompt("F", profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
-	args := append([]string{}, extraArgs...)
-	review := r.runCodexReviewWithLog(ctx, r.stageTimeout("F", 300), reviewPath, logPath, env, prompt, capability, args, codexDeltaProgress(run.RunID, "F", progress))
-	recordArtifactWarnings(&record, writer, review.ArtifactWarnings)
-	outcome := finalizeStaticReviewReport("F", profile, project.Path, reportPath, review.Result, r.cfg.Codex.MaxOutputBytes)
-	record.Findings = append(record.Findings, outcome.Findings...)
-	record = requiredStageText(record, writer, writer.RelativePath(reportPath), outcome.Report+"\n")
-	if outcome.ErrorSummary != "" {
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = outcome.ErrorSummary
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	return finishStage(record, model.StageDone, start)
-}
-
-func (r Runner) finishUnavailableF(record model.StageRecord, start time.Time, reportPath, logPath, profile, projectPath, reason string) model.StageRecord {
-	writer := NewArtifactWriter(filepath.Dir(reportPath))
-	report := staticUnavailableReport("F", profile, projectPath, reason)
-	record = requiredStageText(record, writer, writer.RelativePath(reportPath), report)
-	bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-	record.Findings = append(record.Findings, model.Finding{
-		Stage:      "F",
-		Severity:   "High",
-		Title:      "annotator repair static reviewer unavailable",
-		Rule:       "Stage F requires a safe Codex static reviewer or explicit manual replacement.",
-		Evidence:   reason,
-		Impact:     "Human manual review is required before relying on the repair report.",
-		MinimumFix: "Restore Codex static review capability or manually complete the Stage F report.",
-		SourcePath: reportPath,
-	})
-	if record.ErrorSummary == "" {
-		record.ErrorSummary = "codex unavailable"
-	}
-	return finishStage(record, model.StageFailed, start)
+	return CodexReviewStage{runner: r, spec: stageFCodexReviewSpec()}.Execute(ctx, sc).Record
 }
 
 func priorStageSnapshot(prior map[string]model.StageRecord) (map[string]string, []model.Finding) {

@@ -146,54 +146,61 @@ func (r Runner) Run(ctx context.Context, taskID string, opts RunOptions) (result
 	var state *runState
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			if state != nil && state.runCreated && !state.runFinished {
-				_ = r.crashRun(context.Background(), state.run, state.start, state.stages, state.runtime, state.keepRuntime, state.runtimeCleanupDone, fmt.Sprintf("panic: %v", recovered))
+			if state != nil && state.canPersistCrash() {
+				_ = state.persistCrash(r, fmt.Sprintf("panic: %v", recovered))
 			}
 			progress(RunProgress{RunID: runIDFromState(state), Event: EventRunCrashed, Done: true, Err: fmt.Errorf("panic: %v", recovered)})
 			panic(recovered)
 		}
-		if err != nil && state != nil && state.runCreated && !state.runFinished {
-			if persistErr := r.crashRun(context.Background(), state.run, state.start, state.stages, state.runtime, state.keepRuntime, state.runtimeCleanupDone, err.Error()); persistErr != nil {
+		if err != nil && state != nil && state.canPersistCrash() {
+			if persistErr := state.persistCrash(r, err.Error()); persistErr != nil {
 				err = errors.Join(err, persistErr)
 			}
-			progress(RunProgress{RunID: state.runID, Event: EventRunCrashed, Done: true, Err: err})
+			progress(RunProgress{RunID: runIDFromState(state), Event: EventRunCrashed, Done: true, Err: err})
 		}
 	}()
 
-	state, err = r.prepareRun(ctx, taskID, project, pathWarnings, opts, progress)
+	state, err = r.prepareRun(runPrepareInput{
+		ctx:          ctx,
+		taskID:       taskID,
+		opts:         opts,
+		progress:     progress,
+		project:      project,
+		pathWarnings: pathWarnings,
+	})
 	if err != nil {
 		return Result{}, err
 	}
-	if result, err, aborted := state.abortIfCancelled(); aborted {
+	if result, err, aborted := state.abortIfCancelled(r); aborted {
 		return result, err
 	}
-	if err := state.persistInitialArtifacts(); err != nil {
+	if err := state.persistInitialArtifacts(r); err != nil {
 		return Result{}, err
 	}
-	if result, err, aborted := state.abortIfCancelled(); aborted {
+	if result, err, aborted := state.abortIfCancelled(r); aborted {
 		return result, err
 	}
-	if result, err, aborted := state.persistInitialStages(); aborted || err != nil {
+	if result, err, aborted := state.persistInitialStages(r); aborted || err != nil {
 		return result, err
 	}
-	preflightResult, err := state.runPreflightAndCleanup()
+	preflightResult, err := state.runPreflightAndCleanup(r)
 	if err != nil {
-		if result, err, aborted := state.abortOrError(err); aborted {
+		if result, err, aborted := state.abortOrError(r, err); aborted {
 			return result, err
 		}
 		return Result{}, err
 	}
-	if result, err, aborted := state.abortIfCancelled(); aborted {
+	if result, err, aborted := state.abortIfCancelled(r); aborted {
 		return result, err
 	}
-	if result, err, aborted := state.executeStageLoop(preflightResult); aborted || err != nil {
+	if result, err, aborted := state.executeStageLoop(r, preflightResult); aborted || err != nil {
 		return result, err
 	}
-	if result, err, aborted := state.finalizeRuntimeCleanup(); aborted || err != nil {
+	if result, err, aborted := state.finalizeRuntimeCleanup(r); aborted || err != nil {
 		return result, err
 	}
-	state.aggregateSubmitArtifacts()
-	result, err, _ = state.finishRun()
+	state.aggregateSubmitArtifacts(r)
+	result, err, _ = state.finishRun(r)
 	return result, err
 }
 
@@ -201,5 +208,5 @@ func runIDFromState(state *runState) string {
 	if state == nil {
 		return ""
 	}
-	return state.runID
+	return state.identity.runID
 }

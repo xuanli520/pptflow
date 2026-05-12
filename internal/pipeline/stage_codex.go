@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/executor"
@@ -18,191 +17,21 @@ import (
 )
 
 func (r Runner) stageCodex(ctx context.Context, run model.RunRecord, project scanner.Project, opts RunOptions, stage, profile, output string, progress func(RunProgress), compat ...string) model.StageRecord {
-	start := time.Now()
-	record := startStage(stage)
-	logPath := filepath.Join(run.ArtifactRoot, "logs", fmt.Sprintf("%s_static.log", stage))
-	if stage == "D" {
-		logPath = filepath.Join(run.ArtifactRoot, "logs", "D_tests_coverage_static.log")
+	sc := StageContext{
+		Run:      run,
+		Project:  project,
+		Options:  opts,
+		Progress: progress,
+		Writer:   NewArtifactWriter(run.ArtifactRoot),
+		Timeout:  r.stageTimeout,
 	}
-	if stage == "E" {
-		logPath = filepath.Join(run.ArtifactRoot, "logs", "E_static_audit.log")
+	spec := CodexReviewStageSpec{
+		ID:            stage,
+		Profile:       profile,
+		Output:        output,
+		CompatOutputs: compat,
 	}
-	outputPath := qaArtifactPath(run.ArtifactRoot, output)
-	record.LogPath = logPath
-	record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, outputPath)
-	writer := NewArtifactWriter(run.ArtifactRoot)
-	compatPaths := []string{}
-	for _, name := range compat {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		path := qaArtifactPath(run.ArtifactRoot, name)
-		if path == outputPath || containsPath(compatPaths, path) {
-			continue
-		}
-		compatPaths = append(compatPaths, path)
-		record.ArtifactPaths = appendUniqueArtifactPath(record.ArtifactPaths, path)
-	}
-	writeReports := func(record model.StageRecord, content string) model.StageRecord {
-		record = requiredStageText(record, writer, writer.RelativePath(outputPath), content)
-		for _, path := range compatPaths {
-			bestEffortStageText(&record, writer, writer.RelativePath(path), content)
-		}
-		return record
-	}
-	profilePath := filepath.Join(r.cfg.Codex.PromptProfilesDir, profile)
-	profileContent, readErr := os.ReadFile(profilePath)
-	if readErr != nil {
-		report := staticUnavailableReport(stage, profile, project.Path, "prompt profile not readable: "+readErr.Error())
-		record = writeReports(record, report)
-		bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " profile missing",
-			Rule:       "Static review stages require an embedded prompt profile.",
-			Evidence:   readErr.Error(),
-			Impact:     "Static review evidence is incomplete and requires manual verification.",
-			MinimumFix: "Ensure assets were released to .qa-control and rerun this stage.",
-		})
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = "prompt profile unavailable"
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	if r.cfg.Codex.Network != "none" {
-		report := staticUnavailableReport(stage, profile, project.Path, "configured Codex network mode is unsupported by the current safe sandbox: "+r.cfg.Codex.Network)
-		record = writeReports(record, report)
-		bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " network policy unsupported",
-			Rule:       "D/E must execute under an enforceable no-network static sandbox for MVP.",
-			Evidence:   "codex.network=" + r.cfg.Codex.Network,
-			Impact:     "Static review evidence is incomplete because requested network behavior cannot be safely enforced.",
-			MinimumFix: "Set codex.network to none or implement a dedicated network-controlled sandbox runner.",
-		})
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = "codex network policy unsupported"
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	if r.cfg.Codex.WritableTmp {
-		report := staticUnavailableReport(stage, profile, project.Path, "configured writable_tmp=true is unsupported without widening write access in the current Codex CLI sandbox")
-		record = writeReports(record, report)
-		bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " writable tmp policy unsupported",
-			Rule:       "D/E must not gain project write access during static review.",
-			Evidence:   "codex.writable_tmp=true",
-			Impact:     "Static review evidence is incomplete because artifact-only writes cannot be safely enforced.",
-			MinimumFix: "Set codex.writable_tmp to false or implement artifact-only writable sandbox mounting.",
-		})
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = "codex writable tmp policy unsupported"
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	reviewPath := codexReviewPath(run, project.Path)
-	capability := codex.DetectCLI(ctx, r.exec, "")
-	if capabilityErr := codex.ValidateAppServerCapability(capability); capabilityErr != nil {
-		report := staticUnavailableReport(stage, profile, project.Path, capabilityErr.Error())
-		record = writeReports(record, report)
-		bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " unavailable",
-			Rule:       "Static review stages require Codex app-server active-turn steering support.",
-			Evidence:   capabilityErr.Error(),
-			Impact:     "Static review evidence is incomplete and requires manual verification.",
-			MinimumFix: "Install a Codex CLI version with app-server support and rerun this stage.",
-		})
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = "codex unavailable"
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	contextText, contextErr := r.codexContext(ctx, project, opts, stage)
-	if contextErr != nil {
-		report := staticUnavailableReport(stage, profile, project.Path, contextErr.Error())
-		record = writeReports(record, report)
-		bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " audit input unavailable",
-			Rule:       "Static review inputs supplied for recheck or extra-doc workflows must be readable and stay within size limits.",
-			Evidence:   contextErr.Error(),
-			Impact:     "Static review evidence is incomplete.",
-			MinimumFix: "Fix unavailable recheck or extra-doc inputs and rerun.",
-		})
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = "audit input unavailable"
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	extraArgs, extraErr := safeCodexExtraArgs(r.cfg.Codex.ExtraArgs)
-	if extraErr != nil {
-		report := staticUnavailableReport(stage, profile, project.Path, extraErr.Error())
-		record = writeReports(record, report)
-		bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " extra_args invalid",
-			Rule:       "codex.extra_args for app-server static review may only select the model; boundary-changing or protocol-level arguments are rejected.",
-			Evidence:   extraErr.Error(),
-			Impact:     "Static review cannot start because the configured Codex arguments would make the app-server contract ambiguous or unsafe.",
-			MinimumFix: "Remove unsupported codex.extra_args, or keep only --model/-m with a non-empty model name.",
-			SourcePath: outputPath,
-		})
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = "unsafe codex extra_args"
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	sandbox, sandboxErr := codex.NewSandbox(reviewPath, run.ArtifactRoot, stage)
-	if sandboxErr != nil {
-		report := staticUnavailableReport(stage, profile, project.Path, sandboxErr.Error())
-		record = writeReports(record, report)
-		bestEffortStageText(&record, writer, writer.RelativePath(logPath), report)
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      stage,
-			Severity:   "High",
-			Title:      stageName(stage) + " sandbox setup failed",
-			Rule:       "Static review stages require a writable stage scratch directory.",
-			Evidence:   sandboxErr.Error(),
-			Impact:     "Static review evidence is incomplete and requires manual verification.",
-			MinimumFix: "Ensure the run artifact directory is writable and rerun this stage.",
-			SourcePath: outputPath,
-		})
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = "codex sandbox unavailable"
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	defer os.RemoveAll(sandbox.Home)
-	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
-	timeout := r.stageTimeout(stage, 300)
-	prompt := codexPrompt(stage, profile, reviewPath, project.Path, run.ArtifactRoot, string(profileContent), contextText)
-	args := append([]string{}, extraArgs...)
-	review := r.runCodexReviewWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, args, codexDeltaProgress(run.RunID, stage, progress))
-	recordArtifactWarnings(&record, writer, review.ArtifactWarnings)
-	outcome := finalizeStaticReviewReport(stage, profile, project.Path, outputPath, review.Result, r.cfg.Codex.MaxOutputBytes)
-	record.Findings = append(record.Findings, outcome.Findings...)
-	record = writeReports(record, outcome.Report+"\n")
-	if outcome.ErrorSummary != "" {
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = outcome.ErrorSummary
-		}
-		return finishStage(record, model.StageFailed, start)
-	}
-	return finishStage(record, model.StageDone, start)
+	return CodexReviewStage{runner: r, spec: spec}.Execute(ctx, sc).Record
 }
 
 func codexReviewPath(run model.RunRecord, projectPath string) string {

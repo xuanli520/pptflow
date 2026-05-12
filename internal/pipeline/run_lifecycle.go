@@ -19,7 +19,14 @@ import (
 )
 
 type runState struct {
-	runner   Runner
+	prepare   runPrepareInput
+	history   runHistory
+	identity  runIdentity
+	released  runReleasedInputs
+	execution runExecutionState
+}
+
+type runPrepareInput struct {
 	ctx      context.Context
 	taskID   string
 	opts     RunOptions
@@ -27,20 +34,29 @@ type runState struct {
 
 	project      scanner.Project
 	pathWarnings []ProjectPathWarning
-	previousRuns []model.RunRecord
+}
 
+type runHistory struct {
+	previousRuns []model.RunRecord
+}
+
+type runIdentity struct {
 	start        time.Time
 	runID        string
 	artifactRoot string
 	writer       ArtifactWriter
+}
 
-	released        []assets.ReleasedFile
-	releaseErr      error
+type runReleasedInputs struct {
+	assets          []assets.ReleasedFile
+	assetsErr       error
 	importedDocs    []taskdocs.Document
 	docsManifest    taskdocs.Manifest
 	docsImportErr   error
 	docsManifestErr error
+}
 
+type runExecutionState struct {
 	keepRuntime bool
 
 	run                model.RunRecord
@@ -130,13 +146,13 @@ func dbNotFoundTask(taskID string) error {
 	return db.FormatNotFound("task", taskID)
 }
 
-func (r Runner) prepareRun(ctx context.Context, taskID string, project scanner.Project, pathWarnings []ProjectPathWarning, opts RunOptions, progress func(RunProgress)) (*runState, error) {
-	previousRuns, _ := r.store.ListRunsForTask(ctx, taskID)
+func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
+	previousRuns, _ := r.store.ListRunsForTask(input.ctx, input.taskID)
 	start := time.Now().UTC()
 	runID := displaytime.RunID(start)
-	artifactRoot := runArtifactRoot(r.cfg.ScanPath, project, runID)
+	artifactRoot := runArtifactRoot(r.cfg.ScanPath, input.project, runID)
 	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
-		progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
+		input.progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
 		return nil, err
 	}
 
@@ -146,13 +162,13 @@ func (r Runner) prepareRun(ctx context.Context, taskID string, project scanner.P
 	if releaseErr != nil {
 		toolVersions, _ = json.Marshal(map[string]any{"assets_error": releaseErr.Error()})
 	}
-	importedDocs, docsImportErr := taskdocs.ImportDropbox(r.cfg.ScanPath, taskID, r.cfg.Docs, "p2r-run")
-	docsManifest, docsManifestErr := taskdocs.ReadManifest(r.cfg.ScanPath, taskID)
-	staticOnly := opts.StaticOnly || r.cfg.Pipeline.StaticOnly
-	keepRuntime := opts.KeepRuntime || r.cfg.Docker.KeepRuntime
+	importedDocs, docsImportErr := taskdocs.ImportDropbox(r.cfg.ScanPath, input.taskID, r.cfg.Docs, "p2r-run")
+	docsManifest, docsManifestErr := taskdocs.ReadManifest(r.cfg.ScanPath, input.taskID)
+	staticOnly := input.opts.StaticOnly || r.cfg.Pipeline.StaticOnly
+	keepRuntime := input.opts.KeepRuntime || r.cfg.Docker.KeepRuntime
 	run := model.RunRecord{
 		RunID:          runID,
-		TaskID:         taskID,
+		TaskID:         input.taskID,
 		StartedAt:      start.Format(time.RFC3339),
 		Status:         model.RunRunning,
 		ManualVerdict:  model.ManualUnset,
@@ -161,125 +177,156 @@ func (r Runner) prepareRun(ctx context.Context, taskID string, project scanner.P
 		ToolVersions:   string(toolVersions),
 		PromptVersions: string(toolVersions),
 	}
-	if err := r.store.CreateRun(ctx, run); err != nil {
-		progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
+	if err := r.store.CreateRun(input.ctx, run); err != nil {
+		input.progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
 		return nil, err
 	}
 
 	state := &runState{
-		runner:          r,
-		ctx:             ctx,
-		taskID:          taskID,
-		opts:            opts,
-		progress:        progress,
-		project:         project,
-		pathWarnings:    pathWarnings,
-		previousRuns:    previousRuns,
-		start:           start,
-		runID:           runID,
-		artifactRoot:    artifactRoot,
-		writer:          NewArtifactWriter(artifactRoot),
-		released:        released,
-		releaseErr:      releaseErr,
-		importedDocs:    importedDocs,
-		docsManifest:    docsManifest,
-		docsImportErr:   docsImportErr,
-		docsManifestErr: docsManifestErr,
-		keepRuntime:     keepRuntime,
-		run:             run,
-		stages:          initialStages(selectedStages(opts, staticOnly), staticOnly),
-		results:         map[string]model.StageRecord{},
-		runCreated:      true,
+		prepare: input,
+		history: runHistory{
+			previousRuns: previousRuns,
+		},
+		identity: runIdentity{
+			start:        start,
+			runID:        runID,
+			artifactRoot: artifactRoot,
+			writer:       NewArtifactWriter(artifactRoot),
+		},
+		released: runReleasedInputs{
+			assets:          released,
+			assetsErr:       releaseErr,
+			importedDocs:    importedDocs,
+			docsManifest:    docsManifest,
+			docsImportErr:   docsImportErr,
+			docsManifestErr: docsManifestErr,
+		},
+		execution: runExecutionState{
+			keepRuntime: keepRuntime,
+			run:         run,
+			stages:      initialStages(selectedStages(input.opts, staticOnly), staticOnly),
+			results:     map[string]model.StageRecord{},
+			runCreated:  true,
+		},
 	}
 	state.recordPathWarnings()
-	progress(RunProgress{RunID: runID, Event: EventRunCreated})
+	input.progress(RunProgress{RunID: runID, Event: EventRunCreated})
 	return state, nil
 }
 
 func (s *runState) recordPathWarnings() {
-	if len(s.pathWarnings) == 0 {
+	warnings := s.prepare.pathWarnings
+	if len(warnings) == 0 {
 		return
 	}
-	s.addArtifactWarning(s.writer.BestEffortText("logs/path_warnings.log", formatProjectPathWarnings(s.pathWarnings)))
-	for _, warning := range s.pathWarnings {
-		s.progress(RunProgress{RunID: s.runID, Event: EventPathWarning, Err: errors.New(warning.Message())})
+	s.addArtifactWarning(s.identity.writer.BestEffortText("logs/path_warnings.log", formatProjectPathWarnings(warnings)))
+	for _, warning := range warnings {
+		s.prepare.progress(RunProgress{RunID: s.identity.runID, Event: EventPathWarning, Err: errors.New(warning.Message())})
 	}
 }
 
-func (s *runState) persistInitialArtifacts() error {
-	if err := s.runner.writeRunManifest(s.run, s.project, s.opts, s.released, s.releaseErr, s.importedDocs, s.docsManifest, firstErrorString(s.docsImportErr, s.docsManifestErr), s.pathWarnings, s.artifactWarnings); err != nil {
+func (s *runState) persistInitialArtifacts(r Runner) error {
+	released := s.released
+	docsErr := firstErrorString(released.docsImportErr, released.docsManifestErr)
+	if err := r.writeRunManifest(
+		s.execution.run,
+		s.prepare.project,
+		s.prepare.opts,
+		released.assets,
+		released.assetsErr,
+		released.importedDocs,
+		released.docsManifest,
+		docsErr,
+		s.prepare.pathWarnings,
+		s.execution.artifactWarnings,
+	); err != nil {
 		return err
 	}
-	if err := s.runner.writeStageStatus(s.runID, s.artifactRoot, s.stages); err != nil {
+	if err := r.writeStageStatus(s.identity.runID, s.identity.artifactRoot, s.execution.stages); err != nil {
 		return err
 	}
 	s.persistArtifactWarnings()
 	return nil
 }
 
-func (s *runState) persistInitialStages() (Result, error, bool) {
-	for _, stage := range s.stages {
-		if result, err, aborted := s.abortIfCancelled(); aborted {
+func (s *runState) persistInitialStages(r Runner) (Result, error, bool) {
+	for _, stage := range s.execution.stages {
+		if result, err, aborted := s.abortIfCancelled(r); aborted {
 			return result, err, true
 		}
-		if err := s.runner.store.PutStage(s.ctx, s.runID, stage); err != nil {
-			return s.abortOrError(err)
+		if err := r.store.PutStage(s.prepare.ctx, s.identity.runID, stage); err != nil {
+			return s.abortOrError(r, err)
 		}
-		s.progress(RunProgress{RunID: s.runID, Stage: stage.Stage, Event: EventStagePending, StageRecord: stage})
+		s.prepare.progress(RunProgress{RunID: s.identity.runID, Stage: stage.Stage, Event: EventStagePending, StageRecord: stage})
 	}
 	return Result{}, nil, false
 }
 
-func (s *runState) runPreflightAndCleanup() (preflight.CheckResult, error) {
-	preflightResult := preflight.Run(s.ctx, s.runner.exec, s.runner.cfg)
-	if err := s.writer.RequiredJSON("preflight.json", preflightResult); err != nil {
+func (s *runState) runPreflightAndCleanup(r Runner) (preflight.CheckResult, error) {
+	preflightResult := preflight.Run(s.prepare.ctx, r.exec, r.cfg)
+	if err := s.identity.writer.RequiredJSON("preflight.json", preflightResult); err != nil {
 		return preflight.CheckResult{}, err
 	}
-	preCleanup := s.runner.cleanupStaleRuns(s.ctx, s.previousRuns, s.runID, s.artifactRoot)
+	preCleanup := r.cleanupStaleRuns(
+		s.prepare.ctx,
+		s.history.previousRuns,
+		s.identity.runID,
+		s.identity.artifactRoot,
+	)
 	if len(preCleanup) > 0 {
-		if err := mergeCleanupIntoManifest(filepath.Join(s.artifactRoot, "run_manifest.json"), "pre_run_cleanup", preCleanup); err != nil {
+		if err := mergeCleanupIntoManifest(filepath.Join(s.identity.artifactRoot, "run_manifest.json"), "pre_run_cleanup", preCleanup); err != nil {
 			return preflightResult, err
 		}
 	}
 	return preflightResult, nil
 }
 
-func (s *runState) executeStageLoop(preflightResult preflight.CheckResult) (Result, error, bool) {
-	for index := range s.stages {
-		stage := s.stages[index].Stage
-		if result, err, aborted := s.abortIfCancelled(); aborted {
+func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckResult) (Result, error, bool) {
+	for index := range s.execution.stages {
+		stage := s.execution.stages[index].Stage
+		if result, err, aborted := s.abortIfCancelled(r); aborted {
 			return result, err, true
 		}
-		if s.stages[index].Status == model.StageSkipped {
-			record := s.runner.materializeSkippedStage(s.run, s.stages[index])
-			s.stages[index] = record
-			s.results[stage] = record
-			if result, err, aborted := s.persistStageUpdate(record, len(record.Findings) > 0, EventStageDone); aborted || err != nil {
+		if s.execution.stages[index].Status == model.StageSkipped {
+			record := r.materializeSkippedStage(s.execution.run, s.execution.stages[index])
+			s.execution.stages[index] = record
+			s.execution.results[stage] = record
+			if result, err, aborted := s.persistStageUpdate(r, record, len(record.Findings) > 0, EventStageDone); aborted || err != nil {
 				return result, err, aborted
 			}
 			continue
 		}
 
-		running := runningStage(s.run, stage)
-		s.stages[index] = running
-		s.results[stage] = running
-		if result, err, aborted := s.persistStageUpdate(running, false, EventStageRunning); aborted || err != nil {
+		running := runningStage(s.execution.run, stage)
+		s.execution.stages[index] = running
+		s.execution.results[stage] = running
+		if result, err, aborted := s.persistStageUpdate(r, running, false, EventStageRunning); aborted || err != nil {
 			return result, err, aborted
 		}
 
-		outcome := s.runner.executeStage(s.ctx, s.run, s.project, stage, s.results, s.opts, preflightResult, s.runtime, s.progress)
+		outcome := r.executeStage(
+			s.prepare.ctx,
+			s.execution.run,
+			s.prepare.project,
+			stage,
+			s.execution.results,
+			s.prepare.opts,
+			preflightResult,
+			s.execution.runtime,
+			s.prepare.progress,
+		)
 		if outcome.Runtime != nil {
-			s.runtime = *outcome.Runtime
+			s.execution.runtime = *outcome.Runtime
 		}
 		record := outcome.Record
 		record.Findings = assignMissingFindingIDs(stage, record.Findings)
-		s.stages[index] = record
-		s.results[stage] = record
-		if result, err, aborted := s.persistStageUpdate(record, true, EventStageDone); aborted || err != nil {
+		s.execution.stages[index] = record
+		s.execution.results[stage] = record
+		if result, err, aborted := s.persistStageUpdate(r, record, true, EventStageDone); aborted || err != nil {
 			return result, err, aborted
 		}
-		if !s.runtimeCleanupDone && runtimeCleanupPoint(stage, s.stages) {
-			if result, err, aborted := s.cleanupRuntime(); aborted || err != nil {
+		if !s.execution.runtimeCleanupDone && runtimeCleanupPoint(stage, s.execution.stages) {
+			if result, err, aborted := s.cleanupRuntime(r); aborted || err != nil {
 				return result, err, aborted
 			}
 		}
@@ -287,96 +334,130 @@ func (s *runState) executeStageLoop(preflightResult preflight.CheckResult) (Resu
 	return Result{}, nil, false
 }
 
-func (s *runState) finalizeRuntimeCleanup() (Result, error, bool) {
-	if s.runtimeCleanupDone || !runtimeStageWasSelected(s.stages) {
+func (s *runState) finalizeRuntimeCleanup(r Runner) (Result, error, bool) {
+	if s.execution.runtimeCleanupDone || !runtimeStageWasSelected(s.execution.stages) {
 		return Result{}, nil, false
 	}
-	return s.cleanupRuntime()
+	return s.cleanupRuntime(r)
 }
 
-func (s *runState) cleanupRuntime() (Result, error, bool) {
-	if result, err, aborted := s.abortIfCancelled(); aborted {
+func (s *runState) cleanupRuntime(r Runner) (Result, error, bool) {
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
 		return result, err, true
 	}
-	outcome := s.runner.finalizeRuntime(s.ctx, s.run, s.stages, s.runtime, s.keepRuntime, "normal")
+	outcome := r.finalizeRuntime(
+		s.prepare.ctx,
+		s.execution.run,
+		s.execution.stages,
+		s.execution.runtime,
+		s.execution.keepRuntime,
+		"normal",
+	)
 	if outcome.Summary.Status == "failed" {
-		s.cleanupFailed = true
+		s.execution.cleanupFailed = true
 	}
 	if err := cleanupPersistError(outcome); err != nil {
-		return s.abortOrError(err)
+		return s.abortOrError(r, err)
 	}
-	s.runtimeCleanupDone = outcome.RuntimeCleanupDone
-	s.progress(RunProgress{RunID: s.runID, Event: EventCleanup})
-	if result, err, aborted := s.abortIfCancelled(); aborted {
+	s.execution.runtimeCleanupDone = outcome.RuntimeCleanupDone
+	s.prepare.progress(RunProgress{RunID: s.identity.runID, Event: EventCleanup})
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
 		return result, err, true
 	}
 	return Result{}, nil, false
 }
 
-func (s *runState) persistStageUpdate(record model.StageRecord, includeFindings bool, event ProgressEvent) (Result, error, bool) {
-	if result, err, aborted := s.abortIfCancelled(); aborted {
+func (s *runState) persistStageUpdate(r Runner, record model.StageRecord, includeFindings bool, event ProgressEvent) (Result, error, bool) {
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
 		return result, err, true
 	}
-	if err := s.runner.store.PutStage(s.ctx, s.runID, record); err != nil {
-		return s.abortOrError(err)
+	if err := r.store.PutStage(s.prepare.ctx, s.identity.runID, record); err != nil {
+		return s.abortOrError(r, err)
 	}
 	if includeFindings && len(record.Findings) > 0 {
-		if err := s.runner.store.InsertFindings(s.ctx, s.runID, record.Findings); err != nil {
-			return s.abortOrError(err)
+		if err := r.store.InsertFindings(s.prepare.ctx, s.identity.runID, record.Findings); err != nil {
+			return s.abortOrError(r, err)
 		}
 	}
 	s.addArtifactWarnings(record.ArtifactWarnings...)
 	s.persistArtifactWarnings()
-	if err := s.runner.writeStageStatus(s.runID, s.artifactRoot, s.stages); err != nil {
+	if err := r.writeStageStatus(s.identity.runID, s.identity.artifactRoot, s.execution.stages); err != nil {
 		return Result{}, err, false
 	}
-	s.progress(RunProgress{RunID: s.runID, Stage: record.Stage, Event: event, StageRecord: record})
-	if result, err, aborted := s.abortIfCancelled(); aborted {
+	s.prepare.progress(RunProgress{RunID: s.identity.runID, Stage: record.Stage, Event: event, StageRecord: record})
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
 		return result, err, true
 	}
 	return Result{}, nil, false
 }
 
-func (s *runState) finishRun() (Result, error, bool) {
-	status := runStatus(s.stages)
-	if s.cleanupFailed {
+func (s *runState) finishRun(r Runner) (Result, error, bool) {
+	status := runStatus(s.execution.stages)
+	if s.execution.cleanupFailed {
 		status = model.RunCompletedWithFindings
 	}
-	if result, err, aborted := s.abortIfCancelled(); aborted {
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
 		return result, err, true
 	}
-	if err := s.runner.store.FinishRun(s.ctx, s.runID, s.taskID, status, time.Since(s.start)); err != nil {
-		return s.abortOrError(err)
+	if err := r.store.FinishRun(s.prepare.ctx, s.identity.runID, s.prepare.taskID, status, time.Since(s.identity.start)); err != nil {
+		return s.abortOrError(r, err)
 	}
-	s.runFinished = true
-	s.run.Status = status
-	s.run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
-	s.run.DurationMS = time.Since(s.start).Milliseconds()
-	s.progress(RunProgress{RunID: s.runID, Event: EventRunDone, Done: true})
-	return Result{Run: s.run, Stages: s.stages}, nil, false
+	s.execution.runFinished = true
+	s.execution.run.Status = status
+	s.execution.run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	s.execution.run.DurationMS = time.Since(s.identity.start).Milliseconds()
+	s.prepare.progress(RunProgress{RunID: s.identity.runID, Event: EventRunDone, Done: true})
+	return Result{Run: s.execution.run, Stages: s.execution.stages}, nil, false
 }
 
-func (s *runState) abortIfCancelled() (Result, error, bool) {
-	if abortErr := s.ctx.Err(); abortErr != nil {
-		result, err := s.runner.finishAbortedRun(abortErr, &s.run, s.start, s.stages, s.runtime, s.keepRuntime, &s.runtimeCleanupDone, &s.runFinished, s.progress)
-		s.stages = result.Stages
+func (s *runState) abortIfCancelled(r Runner) (Result, error, bool) {
+	if abortErr := s.prepare.ctx.Err(); abortErr != nil {
+		result, err := r.finishAbortedRun(
+			abortErr,
+			&s.execution.run,
+			s.identity.start,
+			s.execution.stages,
+			s.execution.runtime,
+			s.execution.keepRuntime,
+			&s.execution.runtimeCleanupDone,
+			&s.execution.runFinished,
+			s.prepare.progress,
+		)
+		s.execution.stages = result.Stages
 		return result, err, true
 	}
 	return Result{}, nil, false
 }
 
-func (s *runState) abortOrError(err error) (Result, error, bool) {
-	if result, abortErr, aborted := s.abortIfCancelled(); aborted {
+func (s *runState) abortOrError(r Runner, err error) (Result, error, bool) {
+	if result, abortErr, aborted := s.abortIfCancelled(r); aborted {
 		return result, abortErr, true
 	}
 	return Result{}, err, false
+}
+
+func (s *runState) canPersistCrash() bool {
+	return s.execution.runCreated && !s.execution.runFinished
+}
+
+func (s *runState) persistCrash(r Runner, reason string) error {
+	return r.crashRun(
+		context.Background(),
+		s.execution.run,
+		s.identity.start,
+		s.execution.stages,
+		s.execution.runtime,
+		s.execution.keepRuntime,
+		s.execution.runtimeCleanupDone,
+		reason,
+	)
 }
 
 func (s *runState) addArtifactWarning(warning ArtifactWarning) {
 	if warning.OK() {
 		return
 	}
-	s.artifactWarnings = append(s.artifactWarnings, warning)
+	s.execution.artifactWarnings = append(s.execution.artifactWarnings, warning)
 }
 
 func (s *runState) addArtifactWarnings(warnings ...ArtifactWarning) {
@@ -386,8 +467,8 @@ func (s *runState) addArtifactWarnings(warnings ...ArtifactWarning) {
 }
 
 func (s *runState) persistArtifactWarnings() {
-	if len(s.artifactWarnings) == 0 {
+	if len(s.execution.artifactWarnings) == 0 {
 		return
 	}
-	_ = s.writer.BestEffortJSON("artifact_warnings.json", s.artifactWarnings)
+	_ = s.identity.writer.BestEffortJSON("artifact_warnings.json", s.execution.artifactWarnings)
 }

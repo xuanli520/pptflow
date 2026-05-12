@@ -25,8 +25,14 @@ type submitArtifactSpec struct {
 	Stage string
 }
 
-func (s *runState) aggregateSubmitArtifacts() {
-	copies := aggregateSubmitArtifacts(s.run.ArtifactRoot, submitRoot(s.runner.cfg.ScanPath, s.project), submitArtifactSpecs(s.opts.Mode), selectedSubmitStages(s.stages))
+func (s *runState) aggregateSubmitArtifacts(r Runner) {
+	submitDir := submitRoot(r.cfg.ScanPath, s.prepare.project)
+	copies := aggregateSubmitArtifacts(
+		s.identity.artifactRoot,
+		submitDir,
+		submitArtifactSpecs(s.prepare.opts.Mode),
+		selectedSubmitStages(s.execution.stages),
+	)
 	for _, item := range copies {
 		if item.OK || item.NotSelected {
 			continue
@@ -39,8 +45,8 @@ func (s *runState) aggregateSubmitArtifacts() {
 		})
 	}
 	s.persistArtifactWarnings()
-	_ = s.writer.BestEffortJSON("submit_manifest.json", map[string]any{
-		"submit_dir": submitRoot(s.runner.cfg.ScanPath, s.project),
+	_ = s.identity.writer.BestEffortJSON("submit_manifest.json", map[string]any{
+		"submit_dir": submitDir,
 		"files":      copies,
 	})
 }

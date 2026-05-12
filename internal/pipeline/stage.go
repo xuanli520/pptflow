@@ -34,6 +34,10 @@ type StageOutcome struct {
 	Runtime *RuntimeState
 }
 
+type preflightMaterializingStage interface {
+	MaterializesBlockedPreflight() bool
+}
+
 type stageAAdapter struct {
 	runner Runner
 }
@@ -70,9 +74,23 @@ func (s stageCAdapter) Execute(ctx context.Context, sc StageContext) StageOutcom
 	return StageOutcome{Record: s.runner.stageC(ctx, sc.Run, sc.Project, sc.Runtime, sc.Progress)}
 }
 
+func (r Runner) stageRegistry() map[string]Stage {
+	stages := map[string]Stage{
+		string(model.StageA): stageAAdapter{runner: r},
+		string(model.StageB): stageBAdapter{runner: r},
+		string(model.StageC): stageCAdapter{runner: r},
+	}
+	for _, spec := range codexReviewStageSpecs() {
+		stages[spec.ID] = CodexReviewStage{runner: r, spec: spec}
+	}
+	return stages
+}
+
 func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project scanner.Project, stage string, prior map[string]model.StageRecord, opts RunOptions, preflightResult preflight.CheckResult, runtime RuntimeState, progress func(RunProgress)) StageOutcome {
+	registry := r.stageRegistry()
+	stageImpl, known := registry[stage]
 	if check, ok := preflightResult.BlockingCheck(stage); ok {
-		if stage == "D" || stage == "E" || stage == "F" {
+		if stageMaterializesBlockedPreflight(stageImpl) {
 			// Static stages materialize their own unavailable-review reports so
 			// the external QA artifact contract stays intact.
 		} else {
@@ -90,28 +108,15 @@ func (r Runner) executeStage(ctx context.Context, run model.RunRecord, project s
 		Writer:    NewArtifactWriter(run.ArtifactRoot),
 		Timeout:   r.stageTimeout,
 	}
-	switch stage {
-	case "A":
-		return stageAAdapter{runner: r}.Execute(ctx, sc)
-	case "B":
-		return stageBAdapter{runner: r}.Execute(ctx, sc)
-	case "C":
-		return stageCAdapter{runner: r}.Execute(ctx, sc)
-	case "D":
-		if opts.Mode == "recheck" {
-			return StageOutcome{Record: r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "test_effectiveness_verification.md", progress)}
-		}
-		return StageOutcome{Record: r.stageCodex(ctx, run, project, opts, "D", "tests_coverage_report.md", "test_effectiveness_report.md", progress)}
-	case "E":
-		if opts.Mode == "recheck" {
-			return StageOutcome{Record: r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "codex_report_verification.md", progress)}
-		}
-		return StageOutcome{Record: r.stageCodex(ctx, run, project, opts, "E", "static_acceptance_audit.md", "codex_report.md", progress)}
-	case "F":
-		return StageOutcome{Record: r.stageF(ctx, run, project, opts, prior, progress)}
-	default:
+	if !known {
 		return StageOutcome{Record: skippedStage(stage, "Unknown stage.")}
 	}
+	return stageImpl.Execute(ctx, sc)
+}
+
+func stageMaterializesBlockedPreflight(stage Stage) bool {
+	materializing, ok := stage.(preflightMaterializingStage)
+	return ok && materializing.MaterializesBlockedPreflight()
 }
 
 func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
