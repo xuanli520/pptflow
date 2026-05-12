@@ -104,6 +104,87 @@ func TestOverviewIgnoresStaleResultAndClampsOutOfRangePage(t *testing.T) {
 	}
 }
 
+func TestOverviewSilentRefreshDoesNotInvalidateInFlightUserLoad(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SetFocus("search")
+	h, _ = h.Press("T")
+	h, hasCmd := h.ApplySearchDebounceForTest(h.SearchSeq(), "T")
+	if !hasCmd {
+		t.Fatal("search debounce should issue a foreground load")
+	}
+	userSeq := h.OverviewSeq()
+
+	next, hasCmd := h.ApplyOverviewRefreshForTest()
+	if hasCmd || next.OverviewSeq() != userSeq {
+		t.Fatalf("silent refresh should not supersede an in-flight user load, cmd=%v seq=%d want=%d", hasCmd, next.OverviewSeq(), userSeq)
+	}
+
+	next, _ = next.ApplyOverviewResultForTest(userSeq, 1, "TASK-T")
+	if next.VisibleCount() != 1 || next.SelectedTaskID() != "TASK-T" {
+		t.Fatalf("user load result should still be accepted, count=%d selected=%s", next.VisibleCount(), next.SelectedTaskID())
+	}
+}
+
+func TestOverviewSilentRefreshesAreSerialized(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default())
+	next, hasCmd := h.ApplyOverviewRefreshForTest()
+	if !hasCmd || next.OverviewSeq() != h.OverviewSeq()+1 {
+		t.Fatalf("idle silent refresh should issue a load, cmd=%v seq=%d", hasCmd, next.OverviewSeq())
+	}
+	refreshSeq := next.OverviewSeq()
+
+	next, hasCmd = next.ApplyOverviewRefreshForTest()
+	if hasCmd || next.OverviewSeq() != refreshSeq {
+		t.Fatalf("second silent refresh should wait for the in-flight load, cmd=%v seq=%d want=%d", hasCmd, next.OverviewSeq(), refreshSeq)
+	}
+}
+
+func TestOverviewForegroundLoadSupersedesBackgroundRefresh(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SetFocus("search")
+	h, hasCmd := h.ApplyOverviewRefreshForTest()
+	if !hasCmd {
+		t.Fatal("background refresh should issue a load when idle")
+	}
+	backgroundSeq := h.OverviewSeq()
+
+	h, _ = h.Press("T")
+	h, hasCmd = h.ApplySearchDebounceForTest(h.SearchSeq(), "T")
+	if !hasCmd || h.OverviewSeq() != backgroundSeq+1 {
+		t.Fatalf("foreground search should supersede background refresh, cmd=%v seq=%d background=%d", hasCmd, h.OverviewSeq(), backgroundSeq)
+	}
+	userSeq := h.OverviewSeq()
+
+	next, _ := h.ApplyOverviewResultForTest(backgroundSeq, 1, "TASK-BACKGROUND")
+	if next.VisibleCount() != h.VisibleCount() {
+		t.Fatalf("stale background result should be ignored, count=%d want=%d", next.VisibleCount(), h.VisibleCount())
+	}
+	next, _ = next.ApplyOverviewResultForTest(userSeq, 1, "TASK-T")
+	if next.VisibleCount() != 1 || next.SelectedTaskID() != "TASK-T" {
+		t.Fatalf("foreground result should be accepted, count=%d selected=%s", next.VisibleCount(), next.SelectedTaskID())
+	}
+}
+
+func TestOverviewSearchEnterTriggersImmediateLoad(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SetFocus("search").
+		SetOverviewPage(3, 10, 25)
+	h, _ = h.Press("T")
+	pendingSearchSeq := h.SearchSeq()
+	beforeSeq := h.OverviewSeq()
+
+	next, result := h.Press("enter")
+	if result.CmdCount == 0 || next.OverviewSeq() != beforeSeq+1 || next.PageCurrent() != 1 {
+		t.Fatalf("enter should confirm search immediately, cmd=%d seq=%d page=%d", result.CmdCount, next.OverviewSeq(), next.PageCurrent())
+	}
+	if next.SearchSeq() == pendingSearchSeq {
+		t.Fatal("enter should invalidate the pending debounce message")
+	}
+
+	afterDebounce, hasCmd := next.ApplySearchDebounceForTest(pendingSearchSeq, "T")
+	if hasCmd || afterDebounce.OverviewSeq() != next.OverviewSeq() {
+		t.Fatalf("stale debounce after enter should be ignored, cmd=%v seq=%d want=%d", hasCmd, afterDebounce.OverviewSeq(), next.OverviewSeq())
+	}
+}
+
 func TestOverviewSearchFocusKeepsCommandRunesAsInput(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SetFocus("search")
 	for _, key := range []string{"s", "S", "z"} {

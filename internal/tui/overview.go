@@ -46,7 +46,8 @@ type OverviewModel struct {
 	err     error
 	seq     uint64
 
-	searchSeq uint64
+	searchSeq    uint64
+	loadInFlight bool
 
 	cursorIntent overviewCursorIntent
 	width        int
@@ -137,6 +138,7 @@ func (m OverviewModel) Update(msg tea.Msg) (OverviewModel, tea.Cmd) {
 		if value.seq != m.seq {
 			return m, nil
 		}
+		m.loadInFlight = false
 		m.loading = false
 		if value.err != nil {
 			m.err = value.err
@@ -226,6 +228,12 @@ func (m OverviewModel) updateKey(msg tea.KeyMsg) (OverviewModel, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *OverviewModel) confirmSearch() tea.Cmd {
+	m.searchSeq++
+	m.page.current = 1
+	return m.requestLoad(false, cursorFirst, false)
+}
+
 func (m *OverviewModel) SetFocus(area focusArea) {
 	if area == focusSearch {
 		m.search.Focus()
@@ -300,8 +308,12 @@ func (m OverviewModel) View() string {
 }
 
 func (m *OverviewModel) requestLoad(silent bool, intent overviewCursorIntent, refreshDetail bool) tea.Cmd {
+	if silent && m.loadInFlight {
+		return nil
+	}
 	m.seq++
 	m.loading = !silent
+	m.loadInFlight = true
 	m.cursorIntent = intent
 	req := overviewLoadRequestMsg{
 		seq:           m.seq,

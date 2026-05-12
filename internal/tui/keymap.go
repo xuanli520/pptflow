@@ -89,7 +89,12 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	switch m.focus {
 	case focusSearch:
 		switch key {
-		case "enter", "down":
+		case "enter":
+			m.setFocus(focusOverviewTable)
+			if cmd := m.overview.confirmSearch(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		case "down":
 			m.setFocus(focusOverviewTable)
 		default:
 			var cmd tea.Cmd
