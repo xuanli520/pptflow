@@ -21,7 +21,8 @@ const (
 	panelOverview = iota
 	panelExecution
 
-	staleRunRecoveryInterval = 30 * time.Second
+	staleRunRecoveryInterval      = 30 * time.Second
+	persistedStateRefreshInterval = 2 * time.Second
 )
 
 type app struct {
@@ -54,10 +55,12 @@ type app struct {
 	confirmCancelJobID  string
 	pendingCancelJobID  string
 
-	detailVM         executionViewModel
-	detailContent    string
-	detailFollowTail bool
-	lastRecoveryAt   time.Time
+	detailVM                 executionViewModel
+	detailContent            string
+	detailFollowTail         bool
+	lastRecoveryAt           time.Time
+	lastPersistedRefreshAt   time.Time
+	lastTerminalRefreshJobID string
 }
 
 type detailMsg struct {
@@ -114,7 +117,7 @@ type appStore interface {
 type schedulerClient interface {
 	Submit(string, pipeline.RunOptions) (string, error)
 	CancelTask(string) error
-	Snapshot() []scheduler.JobSnapshot
+	ActiveSnapshot() []scheduler.JobSnapshot
 	NotifyCh() <-chan struct{}
 	Shutdown(context.Context) error
 }
@@ -135,17 +138,19 @@ func Start(store *db.Store, cfg config.Config) error {
 }
 
 func newApp(store *db.Store, cfg config.Config) app {
+	now := time.Now()
 	m := app{
-		store:            store,
-		cfg:              cfg,
-		overview:         newOverviewModel(),
-		detail:           viewport.New(80, 10),
-		tab:              panelOverview,
-		focus:            focusSearch,
-		qaMode:           "initial",
-		message:          "",
-		detailFollowTail: true,
-		lastRecoveryAt:   time.Now(),
+		store:                  store,
+		cfg:                    cfg,
+		overview:               newOverviewModel(),
+		detail:                 viewport.New(80, 10),
+		tab:                    panelOverview,
+		focus:                  focusSearch,
+		qaMode:                 "initial",
+		message:                "",
+		detailFollowTail:       true,
+		lastRecoveryAt:         now,
+		lastPersistedRefreshAt: now,
 	}
 	if store != nil {
 		m.store = store
@@ -305,16 +310,24 @@ func (m *app) handleSchedulerMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		*cmds = append(*cmds, m.reloadSchedulerJobs(), m.reload())
 		return true
 	case schedulerJobsMsg:
+		beforeChrome := verticalChromeHeight(*m)
 		m.activeJobs = value.jobs
 		m.updatePendingCancelMessage(value.jobs)
 		m.updatePendingJobMessage(value.jobs)
-		m.mergeActiveStreamPreview()
-		if cmd := m.applyLayout(); cmd != nil {
-			*cmds = append(*cmds, cmd)
+		if m.selectedJobIsTerminal(value.jobs) {
+			*cmds = append(*cmds, m.reload())
+		}
+		streamChanged := m.mergeActiveStreamPreview()
+		if verticalChromeHeight(*m) != beforeChrome {
+			if cmd := m.applyLayout(); cmd != nil {
+				*cmds = append(*cmds, cmd)
+			}
+		} else if streamChanged {
+			m.updateDetailContent(false)
 		}
 		return true
 	case schedulerNotifyMsg:
-		*cmds = append(*cmds, m.reloadSchedulerJobs(), m.reload(), m.waitSchedulerNotify())
+		*cmds = append(*cmds, m.reloadSchedulerJobs(), m.waitSchedulerNotify())
 		return true
 	default:
 		return false
@@ -329,11 +342,16 @@ func (m *app) handleRecoveryMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		}
 		return true
 	case tickMsg:
-		if time.Since(m.lastRecoveryAt) >= staleRunRecoveryInterval {
-			m.lastRecoveryAt = time.Time(value)
+		now := time.Time(value)
+		if now.Sub(m.lastRecoveryAt) >= staleRunRecoveryInterval {
+			m.lastRecoveryAt = now
 			*cmds = append(*cmds, m.recoverStaleRunsCmd())
 		}
-		*cmds = append(*cmds, m.reload(), m.reloadSchedulerJobs(), m.tick())
+		if now.Sub(m.lastPersistedRefreshAt) >= persistedStateRefreshInterval {
+			m.lastPersistedRefreshAt = now
+			*cmds = append(*cmds, m.reloadOverview())
+		}
+		*cmds = append(*cmds, m.reloadSchedulerJobs(), m.tick())
 		return true
 	default:
 		return false
@@ -420,6 +438,32 @@ func findJobSnapshot(jobs []scheduler.JobSnapshot, jobID string) (scheduler.JobS
 	return scheduler.JobSnapshot{}, false
 }
 
+func (m *app) selectedJobIsTerminal(jobs []scheduler.JobSnapshot) bool {
+	taskID := m.selectedTaskID()
+	if taskID == "" {
+		return false
+	}
+	for _, job := range jobs {
+		if job.TaskID == taskID && (job.State == scheduler.JobQueued || job.State == scheduler.JobRunning) {
+			return false
+		}
+	}
+	for _, job := range jobs {
+		if job.TaskID != taskID || job.JobID == "" {
+			continue
+		}
+		switch job.State {
+		case scheduler.JobDone, scheduler.JobCancelled, scheduler.JobFailed:
+			if m.lastTerminalRefreshJobID == job.JobID {
+				return false
+			}
+			m.lastTerminalRefreshJobID = job.JobID
+			return true
+		}
+	}
+	return false
+}
+
 func (m app) View() string {
 	var builder strings.Builder
 	builder.WriteString(renderHeader(m))
@@ -449,6 +493,10 @@ func (m app) View() string {
 
 func (m app) reload() tea.Cmd {
 	return overviewRefreshCmd(true, true)
+}
+
+func (m app) reloadOverview() tea.Cmd {
+	return overviewRefreshCmd(true, false)
 }
 
 func (m app) handleOverviewLoad(req overviewLoadRequestMsg) tea.Cmd {
@@ -541,7 +589,7 @@ func (m app) reloadSchedulerJobs() tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		return schedulerJobsMsg{jobs: m.scheduler.Snapshot()}
+		return schedulerJobsMsg{jobs: m.scheduler.ActiveSnapshot()}
 	}
 }
 
@@ -604,6 +652,13 @@ func (m app) streamJobForTask(taskID string) (scheduler.JobSnapshot, bool) {
 	matchesCurrentRun := func(job scheduler.JobSnapshot) bool {
 		return currentRunID == "" || job.RunID == "" || job.RunID == currentRunID
 	}
+	if m.pendingJob != "" {
+		for _, job := range m.activeJobs {
+			if job.JobID == m.pendingJob && job.TaskID == taskID {
+				return job, true
+			}
+		}
+	}
 	if job, ok := m.activeJobForTask(taskID); ok && matchesCurrentRun(job) {
 		return job, true
 	}
@@ -616,11 +671,17 @@ func (m app) streamJobForTask(taskID string) (scheduler.JobSnapshot, bool) {
 	return scheduler.JobSnapshot{}, false
 }
 
-func (m *app) mergeActiveStreamPreview() {
+func (m *app) mergeActiveStreamPreview() bool {
 	if m.detailVM.StreamByStage == nil {
 		m.detailVM.StreamByStage = map[string]pipeline.StreamUpdate{}
 	}
 	changed := false
+	job, ok := m.streamJobForTask(m.selectedTaskID())
+	if ok {
+		if m.mergeActiveStagePreview(job.Stages) {
+			changed = true
+		}
+	}
 	for stage := range m.detailVM.StreamByStage {
 		sv := stageForKey(m.detailVM.Stages, stage)
 		if sv.Status != model.StageRunning {
@@ -628,7 +689,6 @@ func (m *app) mergeActiveStreamPreview() {
 			changed = true
 		}
 	}
-	job, ok := m.streamJobForTask(m.selectedTaskID())
 	if ok && len(job.StreamByStage) > 0 {
 		for stage, update := range job.StreamByStage {
 			sv := stageForKey(m.detailVM.Stages, stage)
@@ -638,13 +698,110 @@ func (m *app) mergeActiveStreamPreview() {
 			if _, exists := m.detailVM.StreamByStage[stage]; !exists && stage == m.selectedStageKey {
 				m.detailFollowTail = true
 			}
-			m.detailVM.StreamByStage[stage] = update
-			changed = true
+			if !streamUpdateEqual(m.detailVM.StreamByStage[stage], update) {
+				m.detailVM.StreamByStage[stage] = update
+				changed = true
+			}
 		}
 	}
-	if changed {
-		m.updateDetailContent(false)
+	return changed
+}
+
+func (m *app) mergeActiveStagePreview(stages []model.StageRecord) bool {
+	if len(stages) == 0 {
+		return false
 	}
+	changed := false
+	if len(m.detailVM.Stages) == 0 {
+		m.detailVM.Stages = normalizeStageViews(stages)
+		m.syncStageSelection()
+		return true
+	}
+	byStage := map[string]model.StageRecord{}
+	for _, stage := range stages {
+		if stage.Stage != "" {
+			byStage[stage.Stage] = stage
+		}
+	}
+	for index := range m.detailVM.Stages {
+		next, ok := byStage[m.detailVM.Stages[index].Stage]
+		if !ok {
+			continue
+		}
+		if next.Name == "" {
+			next.Name = m.detailVM.Stages[index].Name
+		}
+		if stageRecordEqual(m.detailVM.Stages[index].StageRecord, next) {
+			continue
+		}
+		m.detailVM.Stages[index] = stageView{
+			StageRecord: next,
+			DisplayName: localizeStageName(next.Stage, next.Name),
+		}
+		changed = true
+	}
+	if changed {
+		m.syncStageSelection()
+	}
+	return changed
+}
+
+func stageRecordEqual(left, right model.StageRecord) bool {
+	return left.Stage == right.Stage &&
+		left.Name == right.Name &&
+		left.Status == right.Status &&
+		left.StartedAt == right.StartedAt &&
+		left.FinishedAt == right.FinishedAt &&
+		left.DurationMS == right.DurationMS &&
+		left.LogPath == right.LogPath &&
+		left.ErrorSummary == right.ErrorSummary &&
+		stringSlicesEqual(left.BlockedBy, right.BlockedBy) &&
+		stringSlicesEqual(left.ArtifactPaths, right.ArtifactPaths) &&
+		artifactWarningsEqual(left.ArtifactWarnings, right.ArtifactWarnings)
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func artifactWarningsEqual(left, right []model.ArtifactWarning) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func streamUpdateEqual(left, right pipeline.StreamUpdate) bool {
+	if left.Stage != right.Stage ||
+		left.Mode != right.Mode ||
+		left.ItemID != right.ItemID ||
+		left.Text != right.Text ||
+		left.Delta != right.Delta ||
+		left.Source != right.Source ||
+		left.Done != right.Done ||
+		left.Truncated != right.Truncated ||
+		len(left.Lines) != len(right.Lines) {
+		return false
+	}
+	for index := range left.Lines {
+		if left.Lines[index] != right.Lines[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (m app) selectedStage() stageView {

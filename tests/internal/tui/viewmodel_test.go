@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
@@ -182,6 +183,117 @@ func TestExecutionDetailMergesRunningCodexStream(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("stream detail missing %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestExecutionDetailUsesSchedulerStageStateForLiveStream(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+			{Stage: "D", Status: model.StagePending},
+		}, "D").
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-1",
+			RunID:  "run-1",
+			TaskID: "TASK-1",
+			State:  scheduler.JobRunning,
+			Stages: []model.StageRecord{
+				{Stage: "D", Status: model.StageRunning},
+			},
+			StreamByStage: map[string]pipeline.StreamUpdate{
+				"D": {Stage: "D", Mode: pipeline.StreamModeCumulative, ItemID: "item-1", Text: "live codex output"},
+			},
+		}})
+
+	if view := h.View(); !strings.Contains(view, "live codex output") {
+		t.Fatalf("live stream should render from scheduler state before persisted reload:\n%s", view)
+	}
+}
+
+func TestSubmittedRerunFollowsNewRunStreamBeforePersistedReload(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionRun("TASK-1", "run-old", []model.StageRecord{
+			{Stage: "D", Status: model.StageDone},
+		}, "D").
+		ApplyRunSubmitForTest("job-new").
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-new",
+			RunID:  "run-new",
+			TaskID: "TASK-1",
+			State:  scheduler.JobRunning,
+			Stages: []model.StageRecord{
+				{Stage: "D", Status: model.StageRunning},
+			},
+			StreamByStage: map[string]pipeline.StreamUpdate{
+				"D": {Stage: "D", Mode: pipeline.StreamModeCumulative, ItemID: "item-new", Text: "new run live output"},
+			},
+		}})
+
+	if view := h.View(); !strings.Contains(view, "new run live output") {
+		t.Fatalf("submitted rerun should follow new job stream before persisted reload:\n%s", view)
+	}
+}
+
+func TestCumulativeStreamRenderTextBoundsLongPreview(t *testing.T) {
+	var builder strings.Builder
+	for i := 0; i < 5000; i++ {
+		builder.WriteString(fmt.Sprintf("line-%04d\n", i))
+	}
+
+	text, truncated := tuiapp.CumulativeStreamRenderTextForTest(strings.TrimRight(builder.String(), "\n"), 80, 10)
+	if !truncated {
+		t.Fatal("long cumulative stream should be truncated before wrapping")
+	}
+	if strings.Contains(text, "line-0000") {
+		t.Fatal("render tail should drop old stream content")
+	}
+	if !strings.Contains(text, "line-4999") {
+		t.Fatal("render tail should keep latest stream content")
+	}
+}
+
+func TestSchedulerNotifyDoesNotRequestPersistedReload(t *testing.T) {
+	_, cmdCount := tuiapp.NewTestHarness(config.Default()).ApplySchedulerNotifyForTest()
+	if cmdCount != 2 {
+		t.Fatalf("scheduler notify should request scheduler snapshot and next wait only, got %d commands", cmdCount)
+	}
+}
+
+func TestTickThrottlesPersistedReload(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default())
+	_, cmdCount := h.ApplyTickForTest(500 * time.Millisecond)
+	if cmdCount != 2 {
+		t.Fatalf("short tick should only refresh scheduler snapshot and timer, got %d commands", cmdCount)
+	}
+	_, cmdCount = h.ApplyTickForTest(2500 * time.Millisecond)
+	if cmdCount != 3 {
+		t.Fatalf("cold tick should include persisted reload, got %d commands", cmdCount)
+	}
+	hasRefresh, refreshDetail := h.ColdTickRefreshDetailForTest(2500 * time.Millisecond)
+	if !hasRefresh || refreshDetail {
+		t.Fatalf("cold tick should refresh overview without detail reload, has=%v detail=%v", hasRefresh, refreshDetail)
+	}
+}
+
+func TestTerminalSchedulerSnapshotTriggersSingleReload(t *testing.T) {
+	job := scheduler.JobSnapshot{
+		JobID:  "job-1",
+		RunID:  "run-1",
+		TaskID: "TASK-1",
+		State:  scheduler.JobDone,
+	}
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverview("TASK-1").
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{
+			{Stage: "C", Status: model.StageRunning},
+		}, "C")
+
+	next, cmdCount := h.ApplySchedulerJobsCommandCountForTest([]scheduler.JobSnapshot{job})
+	if cmdCount != 1 {
+		t.Fatalf("first terminal snapshot should request one persisted reload, got %d commands", cmdCount)
+	}
+	_, cmdCount = next.ApplySchedulerJobsCommandCountForTest([]scheduler.JobSnapshot{job})
+	if cmdCount != 0 {
+		t.Fatalf("repeated terminal snapshot should not request another persisted reload, got %d commands", cmdCount)
 	}
 }
 

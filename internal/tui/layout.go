@@ -179,15 +179,7 @@ func truncateDisplay(value string, width int) string {
 	if width == 1 {
 		return "…"
 	}
-	var builder strings.Builder
-	for _, r := range value {
-		next := builder.String() + string(r)
-		if lipgloss.Width(next)+1 > width {
-			break
-		}
-		builder.WriteRune(r)
-	}
-	return builder.String() + "…"
+	return displayPrefix(value, width-1) + "…"
 }
 
 func truncateMiddleDisplay(value string, width int) string {
@@ -219,13 +211,16 @@ func wrapDisplay(value string, width int) []string {
 			continue
 		}
 		var builder strings.Builder
+		currentWidth := 0
 		for _, r := range line {
-			next := builder.String() + string(r)
-			if lipgloss.Width(next) > width && builder.Len() > 0 {
+			runeWidth := lipgloss.Width(string(r))
+			if currentWidth+runeWidth > width && builder.Len() > 0 {
 				result = append(result, builder.String())
 				builder.Reset()
+				currentWidth = 0
 			}
 			builder.WriteRune(r)
+			currentWidth += runeWidth
 		}
 		if builder.Len() > 0 {
 			result = append(result, builder.String())
@@ -236,27 +231,31 @@ func wrapDisplay(value string, width int) []string {
 
 func displayPrefix(value string, width int) string {
 	var builder strings.Builder
+	currentWidth := 0
 	for _, r := range value {
-		next := builder.String() + string(r)
-		if lipgloss.Width(next) > width {
+		runeWidth := lipgloss.Width(string(r))
+		if currentWidth+runeWidth > width {
 			break
 		}
 		builder.WriteRune(r)
+		currentWidth += runeWidth
 	}
 	return builder.String()
 }
 
 func displaySuffix(value string, width int) string {
 	runes := []rune(value)
-	var parts []string
-	for i := len(runes) - 1; i >= 0; i-- {
-		candidate := string(runes[i]) + strings.Join(parts, "")
-		if lipgloss.Width(candidate) > width {
+	currentWidth := 0
+	start := len(runes)
+	for start > 0 {
+		runeWidth := lipgloss.Width(string(runes[start-1]))
+		if currentWidth+runeWidth > width {
 			break
 		}
-		parts = append([]string{string(runes[i])}, parts...)
+		currentWidth += runeWidth
+		start--
 	}
-	return strings.Join(parts, "")
+	return string(runes[start:])
 }
 
 func clamp(value, low, high int) int {

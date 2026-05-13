@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/table"
 
@@ -20,6 +21,8 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
+
+const cumulativeStreamRenderMaxBytes = 16 * 1024
 
 type overviewItem struct {
 	TaskID        string
@@ -306,10 +309,11 @@ func renderStreamContent(stream pipeline.StreamUpdate, width, budget int) string
 
 func renderCumulativeStreamContent(stream pipeline.StreamUpdate, width, budget int) string {
 	var builder strings.Builder
-	if stream.Truncated {
-		builder.WriteString("...（预览已截断，仅显示尾部 64 KiB）\n")
-	}
 	text := strings.TrimRight(stream.Text, "\n")
+	text, renderTruncated := cumulativeStreamRenderText(text, width, budget)
+	if stream.Truncated || renderTruncated {
+		builder.WriteString("...（预览已截断，仅显示尾部）\n")
+	}
 	if strings.TrimSpace(text) == "" {
 		text = "等待阶段输出..."
 	}
@@ -330,6 +334,18 @@ func renderCumulativeStreamContent(stream pipeline.StreamUpdate, width, budget i
 		builder.WriteString(mutedStyle.Render("生成已完成，等待阶段确认...") + "\n")
 	}
 	return strings.TrimRight(builder.String(), "\n")
+}
+
+func cumulativeStreamRenderText(text string, width, budget int) (string, bool) {
+	limit := max(cumulativeStreamRenderMaxBytes, max(20, width-2)*max(1, budget)*8)
+	if len(text) <= limit {
+		return text, false
+	}
+	start := len(text) - limit
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	return text[start:], true
 }
 
 func renderAppendStreamContent(stream pipeline.StreamUpdate, width, budget int) string {

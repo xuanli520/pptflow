@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -108,24 +109,21 @@ func sqliteDSN(path string) string {
 	if path == ":memory:" {
 		return path
 	}
+	dsn := filepath.Clean(path)
 	if strings.HasPrefix(path, "file:") {
-		u, err := url.Parse(path)
-		if err != nil {
-			return path
-		}
-		return withSQLitePragmas(*u)
+		dsn = path
+	} else if runtime.GOOS != "windows" {
+		dsn = (&url.URL{Scheme: "file", Path: dsn}).String()
 	}
-	u := url.URL{Scheme: "file", Path: filepath.Clean(path)}
-	return withSQLitePragmas(u)
-}
-
-func withSQLitePragmas(u url.URL) string {
-	q := u.Query()
-	q.Add("_pragma", "busy_timeout(5000)")
-	q.Add("_pragma", "journal_mode(WAL)")
-	q.Add("_pragma", "synchronous(NORMAL)")
-	u.RawQuery = q.Encode()
-	return u.String()
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout=5000")
+	query.Add("_pragma", "journal_mode=WAL")
+	query.Add("_pragma", "synchronous=NORMAL")
+	return dsn + sep + query.Encode()
 }
 
 func configureSQLite(handle *sql.DB) error {

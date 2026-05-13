@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -114,6 +115,54 @@ func (h TestHarness) ApplySchedulerJobsForTest(jobs []scheduler.JobSnapshot) Tes
 		return h
 	}
 	return TestHarness{model: model}
+}
+
+func (h TestHarness) ApplySchedulerJobsCommandCountForTest(jobs []scheduler.JobSnapshot) (TestHarness, int) {
+	next, cmd := h.model.Update(schedulerJobsMsg{jobs: jobs})
+	model, ok := next.(app)
+	if !ok {
+		count := 0
+		if cmd != nil {
+			count = 1
+		}
+		return h, count
+	}
+	count := 0
+	if cmd != nil {
+		if batch, ok := cmd().(tea.BatchMsg); ok {
+			count = len(batch)
+		} else {
+			count = 1
+		}
+	}
+	return TestHarness{model: model}, count
+}
+
+func (h TestHarness) ApplySchedulerNotifyForTest() (TestHarness, int) {
+	var cmds []tea.Cmd
+	h.model.handleSchedulerMsg(schedulerNotifyMsg{}, &cmds)
+	return h, len(cmds)
+}
+
+func (h TestHarness) ApplyTickForTest(elapsed time.Duration) (TestHarness, int) {
+	var cmds []tea.Cmd
+	h.model.handleRecoveryMsg(tickMsg(h.model.lastPersistedRefreshAt.Add(elapsed)), &cmds)
+	return h, len(cmds)
+}
+
+func (h TestHarness) ColdTickRefreshDetailForTest(elapsed time.Duration) (bool, bool) {
+	var cmds []tea.Cmd
+	h.model.handleRecoveryMsg(tickMsg(h.model.lastPersistedRefreshAt.Add(elapsed)), &cmds)
+	for _, cmd := range cmds {
+		if cmd == nil {
+			continue
+		}
+		if msg, ok := cmd().(overviewRefreshMsg); ok {
+			return true, msg.refreshDetail
+		}
+		return false, false
+	}
+	return false, false
 }
 
 func (h TestHarness) SetFocus(name string) TestHarness {
@@ -457,6 +506,10 @@ func LocalizeSummaryForTest(summary string) string {
 
 func StageLogPreviewForTest(path string, maxLines int) string {
 	return stageLogPreview(path, maxLines)
+}
+
+func CumulativeStreamRenderTextForTest(text string, width, budget int) (string, bool) {
+	return cumulativeStreamRenderText(text, width, budget)
 }
 
 func ExecutionLayoutModeForTest(width, height int) string {

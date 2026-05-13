@@ -319,6 +319,109 @@ func TestSchedulerCumulativeStreamDoesNotChangeStageState(t *testing.T) {
 	}
 }
 
+func TestSchedulerStreamProgressDoesNotNotifyPerDelta(t *testing.T) {
+	cfg := config.Default()
+	ready := make(chan struct{})
+	stream := make(chan struct{})
+	streamed := make(chan struct{})
+	release := make(chan struct{})
+	factory := func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+		return fakePipelineRunner{
+			run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				opts.Progress(pipeline.RunProgress{
+					RunID:       "run-stream-notify",
+					Stage:       "D",
+					Event:       pipeline.EventStageRunning,
+					StageRecord: model.StageRecord{Stage: "D", Status: model.StageRunning},
+				})
+				close(ready)
+				select {
+				case <-stream:
+				case <-ctx.Done():
+					return pipeline.Result{}, ctx.Err()
+				}
+				opts.Progress(pipeline.RunProgress{
+					RunID: "run-stream-notify",
+					Stage: "D",
+					Event: pipeline.EventStageStream,
+					Stream: &pipeline.StreamUpdate{
+						Stage:  "D",
+						Mode:   pipeline.StreamModeCumulative,
+						ItemID: "item-1",
+						Text:   "delta",
+					},
+				})
+				close(streamed)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return pipeline.Result{}, ctx.Err()
+				}
+				return pipeline.Result{
+					Run:    model.RunRecord{RunID: "run-stream-notify", TaskID: taskID, Status: model.RunCompletedClean},
+					Stages: []model.StageRecord{{Stage: "D", Status: model.StageDone}},
+				}, nil
+			},
+		}
+	}
+	s := scheduler.New(nil, cfg, scheduler.WithRunnerFactory(factory))
+	t.Cleanup(func() {
+		close(release)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+
+	if _, err := s.Submit("TASK-NOTIFY", pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	<-ready
+	drainNotify(s.NotifyCh())
+	close(stream)
+	<-streamed
+	select {
+	case <-s.NotifyCh():
+		t.Fatal("stream progress should not emit scheduler notifications")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestActiveSnapshotDoesNotGrowWithHistoricalJobs(t *testing.T) {
+	cfg := config.Default()
+	cfg.Pipeline.MaxConcurrent = 8
+	factory := func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+		return fakePipelineRunner{
+			run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				return pipeline.Result{
+					Run:    model.RunRecord{RunID: "run-" + taskID, TaskID: taskID, Status: model.RunCompletedClean},
+					Stages: []model.StageRecord{{Stage: "A", Status: model.StageDone}},
+				}, nil
+			},
+		}
+	}
+	s := scheduler.New(nil, cfg, scheduler.WithRunnerFactory(factory))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+
+	for i := 0; i < 50; i++ {
+		if _, err := s.Submit(fmt.Sprintf("TASK-%02d", i), pipeline.RunOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForAllSnapshots(t, s, 2*time.Second, 50, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.State == scheduler.JobDone
+	})
+	if all := s.Snapshot(); len(all) < 50 {
+		t.Fatalf("full snapshot should retain history, got %d", len(all))
+	}
+	if active := s.ActiveSnapshot(); len(active) > 32 {
+		t.Fatalf("active snapshot should be bounded to active/recent jobs, got %d", len(active))
+	}
+}
+
 type fakePipelineRunner struct {
 	run func(context.Context, string, pipeline.RunOptions) (pipeline.Result, error)
 }
@@ -447,6 +550,36 @@ func waitForSnapshot(t *testing.T, s *scheduler.Scheduler, timeout time.Duration
 	}
 	t.Fatalf("timed out waiting for scheduler snapshot; last = %#v", last)
 	return scheduler.JobSnapshot{}
+}
+
+func waitForAllSnapshots(t *testing.T, s *scheduler.Scheduler, timeout time.Duration, count int, match func(scheduler.JobSnapshot) bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last []scheduler.JobSnapshot
+	for time.Now().Before(deadline) {
+		last = s.Snapshot()
+		matched := 0
+		for _, snapshot := range last {
+			if match(snapshot) {
+				matched++
+			}
+		}
+		if matched >= count {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d matching scheduler snapshots; last = %#v", count, last)
+}
+
+func drainNotify(ch <-chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
 
 func snapshotByTask(t *testing.T, s *scheduler.Scheduler, taskID string) scheduler.JobSnapshot {

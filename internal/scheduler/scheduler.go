@@ -90,20 +90,22 @@ type RunnerFactory func(*db.Store, config.Config) PipelineRunner
 type Option func(*Scheduler)
 
 type Scheduler struct {
-	store         *db.Store
-	cfg           config.Config
-	runnerFactory RunnerFactory
-	maxParallel   int
-	sem           chan struct{}
-	mu            sync.Mutex
-	jobs          []*Job
-	queue         []*Job
-	jobByID       map[string]*Job
-	activeByTask  map[string]*Job
-	notifyCh      chan struct{}
-	closed        bool
-	nextID        int
-	wg            sync.WaitGroup
+	store              *db.Store
+	cfg                config.Config
+	runnerFactory      RunnerFactory
+	maxParallel        int
+	sem                chan struct{}
+	mu                 sync.Mutex
+	jobs               []*Job
+	queue              []*Job
+	jobByID            map[string]*Job
+	activeByTask       map[string]*Job
+	recentTerminal     []*Job
+	recentTerminalByID map[string]bool
+	notifyCh           chan struct{}
+	closed             bool
+	nextID             int
+	wg                 sync.WaitGroup
 }
 
 func WithRunnerFactory(factory RunnerFactory) Option {
@@ -123,14 +125,15 @@ func New(store *db.Store, cfg config.Config, opts ...Option) *Scheduler {
 		maxParallel = 8
 	}
 	s := &Scheduler{
-		store:         store,
-		cfg:           cfg,
-		runnerFactory: defaultRunnerFactory,
-		maxParallel:   maxParallel,
-		sem:           make(chan struct{}, maxParallel),
-		jobByID:       map[string]*Job{},
-		activeByTask:  map[string]*Job{},
-		notifyCh:      make(chan struct{}, 1),
+		store:              store,
+		cfg:                cfg,
+		runnerFactory:      defaultRunnerFactory,
+		maxParallel:        maxParallel,
+		sem:                make(chan struct{}, maxParallel),
+		jobByID:            map[string]*Job{},
+		activeByTask:       map[string]*Job{},
+		recentTerminalByID: map[string]bool{},
+		notifyCh:           make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -219,6 +222,7 @@ func (s *Scheduler) CancelTask(taskID string) error {
 	case JobQueued:
 		job.cancelRequested = true
 		finishCancelledJobLocked(job, now)
+		s.addRecentTerminalLocked(job)
 		s.deleteActiveJobLocked(job)
 		s.removeFromQueueLocked(job.JobID)
 		notify = true
@@ -253,7 +257,46 @@ func (s *Scheduler) Snapshot() []JobSnapshot {
 	s.mu.Lock()
 	jobs := append([]*Job(nil), s.jobs...)
 	s.mu.Unlock()
+	return snapshotJobs(jobs)
+}
 
+func (s *Scheduler) ActiveSnapshot() []JobSnapshot {
+	if s == nil {
+		return nil
+	}
+	now := time.Now()
+	s.mu.Lock()
+	jobs := make([]*Job, 0, len(s.activeByTask)+len(s.recentTerminal))
+	seen := map[string]bool{}
+	for _, job := range s.activeByTask {
+		if job == nil || seen[job.JobID] {
+			continue
+		}
+		seen[job.JobID] = true
+		jobs = append(jobs, job)
+	}
+	pruned := s.recentTerminal[:0]
+	for _, job := range s.recentTerminal {
+		job.mu.RLock()
+		terminal := job.State != JobQueued && job.State != JobRunning
+		recent := !job.FinishedAt.IsZero() && now.Sub(job.FinishedAt) <= terminalSnapshotGrace
+		job.mu.RUnlock()
+		if terminal && recent {
+			pruned = append(pruned, job)
+		} else {
+			delete(s.recentTerminalByID, job.JobID)
+		}
+		if terminal && recent && !seen[job.JobID] {
+			seen[job.JobID] = true
+			jobs = append(jobs, job)
+		}
+	}
+	s.recentTerminal = pruned
+	s.mu.Unlock()
+	return snapshotJobs(jobs)
+}
+
+func snapshotJobs(jobs []*Job) []JobSnapshot {
 	snapshots := make([]JobSnapshot, 0, len(jobs))
 	for _, job := range jobs {
 		job.mu.RLock()
@@ -350,6 +393,7 @@ func (s *Scheduler) startJob(job *Job) {
 				job.Err = context.Canceled
 				job.FinishedAt = now
 			}
+			s.addRecentTerminalLocked(job)
 			s.deleteActiveJobLocked(job)
 		}
 		if !s.closed {
@@ -428,7 +472,6 @@ func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {
 	if update.Event == pipeline.EventStageStream && update.Stream != nil {
 		applyStreamUpdateLocked(job, update)
 		job.mu.Unlock()
-		s.notify()
 		return
 	}
 	if update.StageRecord.Stage != "" {
@@ -495,6 +538,7 @@ func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {
 func (s *Scheduler) finishJob(job *Job) {
 	var next *Job
 	s.mu.Lock()
+	s.addRecentTerminalLocked(job)
 	s.deleteActiveJobLocked(job)
 	if !s.closed {
 		next = s.popQueuedJobLocked()
@@ -507,6 +551,24 @@ func (s *Scheduler) finishJob(job *Job) {
 		s.startJob(next)
 	}
 	s.notify()
+}
+
+func (s *Scheduler) addRecentTerminalLocked(job *Job) {
+	if job == nil || job.JobID == "" || s.recentTerminalByID[job.JobID] {
+		return
+	}
+	if s.recentTerminalByID == nil {
+		s.recentTerminalByID = map[string]bool{}
+	}
+	s.recentTerminal = append(s.recentTerminal, job)
+	s.recentTerminalByID[job.JobID] = true
+	for len(s.recentTerminal) > maxRecentTerminalJobs {
+		drop := s.recentTerminal[0]
+		s.recentTerminal = s.recentTerminal[1:]
+		if drop != nil {
+			delete(s.recentTerminalByID, drop.JobID)
+		}
+	}
 }
 
 func (s *Scheduler) removeFromQueueLocked(jobID string) {
@@ -560,7 +622,11 @@ func applyResultLocked(job *Job, result pipeline.Result) {
 	job.CurrentStage = ""
 }
 
-const maxStreamLines = 200
+const (
+	maxStreamLines        = 200
+	maxRecentTerminalJobs = 32
+	terminalSnapshotGrace = 5 * time.Second
+)
 
 func applyStreamUpdateLocked(job *Job, update pipeline.RunProgress) {
 	if job.StreamByStage == nil {
