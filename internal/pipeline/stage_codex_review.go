@@ -396,13 +396,14 @@ func stageFCodexReviewSpec() CodexReviewStageSpec {
 			writeRepairSupplements(record, writer, sc.Run, stageStatuses, priorFindings, filepath.Join(sc.Run.ArtifactRoot, "repair_summary.json"))
 		},
 		AfterReview: func(report string, record *model.StageRecord, writer ArtifactWriter, sc StageContext) string {
-			report1, report2 := splitStageFCodexReport(report)
+			split := splitStageFCodexReport(report)
 			issuePath := stageFIssueReportPath(sc.Run.ArtifactRoot, sc.Options)
-			if strings.TrimSpace(report2) == "" {
-				report2 = report
+			if split.kind == stageFSplitNone || strings.TrimSpace(split.report2) == "" {
+				split.report2 = report
 			}
-			*record = requiredStageText(*record, writer, writer.RelativePath(issuePath), report2)
-			return report1
+			record.Findings = append(record.Findings, validateStageFSplit(split, report)...)
+			*record = requiredStageText(*record, writer, writer.RelativePath(issuePath), split.report2)
+			return split.report1
 		},
 		BuildContext: func(ctx context.Context, runner Runner, sc StageContext) (string, error) {
 			stageStatuses, priorFindings := priorStageSnapshot(sc.Prior)

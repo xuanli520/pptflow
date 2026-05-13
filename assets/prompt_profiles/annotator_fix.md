@@ -23,34 +23,50 @@ Severity definitions (for reference when reading incoming issues):
 - Medium: maintainability, coverage, edge-case, or UX issue that should be fixed but does not invalidate the whole delivery.
 - Low: minor clarity, polish, or follow-up improvement.
 
-Required output structure – **two independent Markdown reports**:
+Required output format — **two independent Markdown reports, separated by an exact split marker**:
 
-**Report 1: `repair_verification_requirements_and_fit.md`**  
-This report combines the original “1. Repository / Requirement Mapping Summary” and “2. Prompt Understanding and Requirement Fit” into a single repair-verification document.  
-It shall contain:
+You must produce exactly two reports in this order. Use the exact heading formats and the split marker shown below. p2r uses these to separate the two artifacts automatically.
+
+**Report 1 — Heading must be exactly: `## Report 1: Repair Verification Requirements and Fit`**
+
+This report combines the original “1. Repository / Requirement Mapping Summary” and “2. Prompt Understanding and Requirement Fit” into a single repair-verification document. It shall contain:
 - Confirmation of whether core requirements (extracted from `metadata.json`) are still correctly mapped after the repairs.
 - Verification that uploaded/attached documents (annotator self-test, prior p2r findings, etc.) were considered, and any changes described in those documents are reflected in the code.
 - A mapping update for each requirement, stating whether the repair fully satisfies it. Use only: **Confirmed Repaired / Partial / Not Repaired / Cannot Confirm**.
 - Prompt understanding assessment: check whether the implementation aligns with the business goal, and note any deviations or misunderstandings that remain after the fixes.
 - Cite `file:line` evidence for every conclusion.
+- Do not reference “Report 2” or any content from Report 2 within this section — each report must be self-contained.
 
-**Report 2: `repair_verification_issues.md`**  
-This report corresponds to the original “3. Issues / Suggestions (Severity-Rated)” section but is **strictly a repair-verification log, not a new audit finding log**.  
-It must list every issue from the provided issue report(s) with its original severity, and for each:
+After Report 1, insert the split marker on its own line:
+```
+<!-- p2r:report-split -->
+```
+
+**Report 2 — Heading must be exactly: `## Report 2: Repair Verification Issues`**
+
+This report is **strictly a repair-verification log, not a new audit finding log**. It must list every issue from the provided issue report(s) with its original severity, and for each:
 - State whether it is **Resolved**, **Partially Resolved**, or **Unresolved**.
 - Provide `file:line` evidence that proves the current status.
 - If unresolved, note the impact and current code evidence; do **not** propose a new fix.
 - Do not invent or add new issues. If some original issue was ambiguous, mark it as Cannot Confirm and explain why.
 - If all issues are resolved, explicitly state that no unresolved Blocker/High remains, but note any residual manual‑verification risk.
 
-Overall repair summary (included at the beginning of each report or as a short combined header) must answer the question: **“Have the reported problems been systematically repaired?”** State “Yes, systematically repaired”, “Partially repaired (list count)”, or “No, major problems persist”.
+**Overall repair summary** (include as a short section at the very beginning, before Report 1) must answer: **”Have the reported problems been systematically repaired?”** State “Yes, systematically repaired”, “Partially repaired (list count)”, or “No, major problems persist”.
 
 Recheck mode (applied globally):
 - All previous‑run findings must be re‑examined against the current code.
 - Do not trust a previous report’s conclusion without fresh verification.
 - Clearly name any still‑unresolved previous issue with current evidence.
 
-Keep the two reports concise, evidence‑based, and immediately useful for a human **PASS / REWORK / FAIL** decision regarding the repair state only.  
-Return the two markdown reports as the final Codex response. Do not write files; p2r persists the response to the required artifact paths.  
-Begin the final response immediately with the repair summary and then the two reports in sequence. Do not include progress updates, preamble text, or narration.
-If p2r supplies a machine-readable JSON contract block, place that block only at the very end, ending at the JSON end marker with no text after it.
+Keep the two reports concise, evidence‑based, and immediately useful for a human **PASS / REWORK / FAIL** decision regarding the repair state only.
+
+Output structure (mandatory — follow this exact order, use the exact heading text shown):
+1. `# Repair Summary` — a short H1 section answering "Have the reported problems been systematically repaired?" with one of: "Yes, systematically repaired", "Partially repaired (list count)", or "No, major problems persist".
+2. `## Report 1: Repair Verification Requirements and Fit` (heading + content)
+3. `<!-- p2r:report-split -->` (on its own line, no surrounding text)
+4. `## Report 2: Repair Verification Issues` (heading + content)
+5. The static-review JSON contract block (at the very end)
+
+Do not write files; p2r persists the response to the required artifact paths.
+Do not include progress updates, preamble text, or narration before the repair summary.
+If p2r supplies a machine-readable JSON contract block, place that block only at the very end, after Report 2, ending at the JSON end marker with no text after it.

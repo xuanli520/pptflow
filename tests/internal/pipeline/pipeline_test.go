@@ -142,6 +142,117 @@ Report 2 body.
 	}
 }
 
+func TestSplitStageFCodexReportMarkerPreferred(t *testing.T) {
+	result := pipelinepkg.SplitStageFCodexReportFullForTest(`# Repair Summary
+
+## Report 1: Repair Verification Requirements and Fit
+Requirement mapping content here.
+
+<!-- p2r:report-split -->
+
+## Report 2: Repair Verification Issues
+Issue list content here.
+`)
+	if result.Kind != "marker" {
+		t.Fatalf("expected marker split, got %s", result.Kind)
+	}
+	if !strings.Contains(result.Report1, "Requirement mapping content") || strings.Contains(result.Report1, "Issue list content") {
+		t.Fatalf("marker split report1 incorrect:\n%s", result.Report1)
+	}
+	if !strings.Contains(result.Report2, "## Report 2: Repair Verification Issues") || !strings.Contains(result.Report2, "Issue list content") {
+		t.Fatalf("marker split report2 incorrect:\n%s", result.Report2)
+	}
+}
+
+func TestSplitStageFCodexReportHeadingPreferredOverLine(t *testing.T) {
+	result := pipelinepkg.SplitStageFCodexReportFullForTest(`# Repair Summary
+
+## Report 1 content here.
+Some body text that mentions Report 2 in passing.
+
+## Report 2: Repair Verification Issues
+Issue list content here.
+`)
+	if result.Kind != "heading" {
+		t.Fatalf("expected heading split, got %s", result.Kind)
+	}
+	if !strings.Contains(result.Report1, "mentions Report 2 in passing") || strings.Contains(result.Report1, "Issue list content") {
+		t.Fatalf("heading split report1 incorrect:\n%s", result.Report1)
+	}
+	if !strings.Contains(result.Report2, "## Report 2: Repair Verification Issues") {
+		t.Fatalf("heading split report2 should start at heading:\n%s", result.Report2)
+	}
+}
+
+func TestSplitStageFCodexReportNoMatch(t *testing.T) {
+	result := pipelinepkg.SplitStageFCodexReportFullForTest(`# Repair Summary
+
+Some content here.
+
+More content about repairs.
+
+Final conclusion.
+`)
+	if result.Kind != "none" {
+		t.Fatalf("expected none split, got %s", result.Kind)
+	}
+	if result.Report1 == "" {
+		t.Fatalf("report1 should contain full content when no split found")
+	}
+	if result.Report2 != "" {
+		t.Fatalf("report2 should be empty when no split found, got:\n%s", result.Report2)
+	}
+}
+
+func TestValidateStageFSplitNoMatchEmitsFinding(t *testing.T) {
+	result := pipelinepkg.SplitStageFCodexReportFullForTest("# Report\nContent only.\n")
+	findings := pipelinepkg.ValidateStageFSplitForTest(result, "# Report\nContent only.\n")
+	if len(findings) == 0 {
+		t.Fatalf("expected at least one finding for no-match split")
+	}
+	if findings[0].Severity != "Medium" {
+		t.Fatalf("expected Medium severity for no-match split, got %s", findings[0].Severity)
+	}
+}
+
+func TestValidateStageFSplitOverlappingContentEmitsFinding(t *testing.T) {
+	shared := strings.Repeat("This is a shared report with substantial overlapping content across both segments. ", 10)
+	split := pipelinepkg.StageFSplitResultForTest{
+		Report1: shared,
+		Report2: shared + "\nResolved: issue fixed.",
+		Kind:    "marker",
+	}
+	report := shared + "\n<!-- p2r:report-split -->\n" + shared + "\nResolved: issue fixed."
+	findings := pipelinepkg.ValidateStageFSplitForTest(split, report)
+	hasOverlap := false
+	for _, f := range findings {
+		if strings.Contains(f.Title, "overlapping") {
+			hasOverlap = true
+		}
+	}
+	if !hasOverlap {
+		t.Fatalf("expected overlapping content finding, got: %#v", findings)
+	}
+}
+
+func TestValidateStageFSplitLineKindEmitsLowFinding(t *testing.T) {
+	split := pipelinepkg.StageFSplitResultForTest{
+		Report1: "Report 1 distinct content with unique patterns abcdef.",
+		Report2: "Report 2 distinct content with different patterns xyz123.",
+		Kind:    "line",
+	}
+	findings := pipelinepkg.ValidateStageFSplitForTest(split, "Report 1 distinct content with unique patterns abcdef.\nThis line mentions Report 2 boundary here.\nReport 2 distinct content with different patterns xyz123.")
+	hasLow := false
+	for _, f := range findings {
+		if f.Severity == "Low" && strings.Contains(f.Title, "weak boundary") {
+			hasLow = true
+		}
+	}
+	if !hasLow {
+		t.Fatalf("expected Low severity finding for line split, got: %#v", findings)
+	}
+}
+
 func TestSelectedStagesFrom(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{From: "C"}, false)
 	for _, stage := range []string{"A", "B"} {
@@ -847,7 +958,7 @@ func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 		t.Fatal("runtime.Caller failed")
 	}
 	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "../../.."))
-	for _, name := range []string{"tests_coverage_report.md", "static_acceptance_audit.md", "annotator_fix.md"} {
+	for _, name := range []string{"tests_coverage_report.md", "static_acceptance_audit.md"} {
 		content, err := os.ReadFile(filepath.Join(repoRoot, "assets", "prompt_profiles", name))
 		if err != nil {
 			t.Fatal(err)
@@ -861,6 +972,28 @@ func TestPromptProfilesUseFinalResponseContract(t *testing.T) {
 		}
 		if !strings.Contains(text, "Do not include progress updates") || !strings.Contains(text, "JSON end marker") {
 			t.Fatalf("%s does not forbid preamble text and require final JSON placement", name)
+		}
+	}
+	content, err := os.ReadFile(filepath.Join(repoRoot, "assets", "prompt_profiles", "annotator_fix.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	if strings.Contains(text, "./.tmp") {
+		t.Fatal("annotator_fix.md still asks Codex to write a .tmp report")
+	}
+	for _, want := range []string{
+		"two independent Markdown reports, separated by an exact split marker",
+		"# Repair Summary",
+		"## Report 1: Repair Verification Requirements and Fit",
+		"<!-- p2r:report-split -->",
+		"## Report 2: Repair Verification Issues",
+		"Do not write files",
+		"Do not include progress updates",
+		"JSON end marker",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("annotator_fix.md missing %q", want)
 		}
 	}
 }

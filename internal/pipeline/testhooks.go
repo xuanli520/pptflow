@@ -67,7 +67,31 @@ func ShortCommentForTest(stageStatuses map[string]string, findings []model.Findi
 }
 
 func SplitStageFCodexReportForTest(report string) (string, string) {
-	return splitStageFCodexReport(report)
+	result := splitStageFCodexReport(report)
+	return result.report1, result.report2
+}
+
+type StageFSplitResultForTest struct {
+	Report1 string
+	Report2 string
+	Kind    string
+}
+
+func SplitStageFCodexReportFullForTest(report string) StageFSplitResultForTest {
+	result := splitStageFCodexReport(report)
+	return StageFSplitResultForTest{
+		Report1: result.report1,
+		Report2: result.report2,
+		Kind:    string(result.kind),
+	}
+}
+
+func ValidateStageFSplitForTest(splitResult StageFSplitResultForTest, report string) []model.Finding {
+	return validateStageFSplit(stageFSplitResult{
+		report1: splitResult.Report1,
+		report2: splitResult.Report2,
+		kind:    stageFSplitKind(splitResult.Kind),
+	}, report)
 }
 
 func ReadmeComposeCommandForTest(repoPath string) []string {
