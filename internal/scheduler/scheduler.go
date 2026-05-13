@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -257,6 +258,12 @@ func (s *Scheduler) Snapshot() []JobSnapshot {
 	s.mu.Lock()
 	jobs := append([]*Job(nil), s.jobs...)
 	s.mu.Unlock()
+	sort.SliceStable(jobs, func(i, j int) bool {
+		if !jobs[i].SubmittedAt.Equal(jobs[j].SubmittedAt) {
+			return jobs[i].SubmittedAt.Before(jobs[j].SubmittedAt)
+		}
+		return jobs[i].JobID < jobs[j].JobID
+	})
 	return snapshotJobs(jobs)
 }
 
@@ -293,6 +300,12 @@ func (s *Scheduler) ActiveSnapshot() []JobSnapshot {
 	}
 	s.recentTerminal = pruned
 	s.mu.Unlock()
+	sort.SliceStable(jobs, func(i, j int) bool {
+		if !jobs[i].SubmittedAt.Equal(jobs[j].SubmittedAt) {
+			return jobs[i].SubmittedAt.Before(jobs[j].SubmittedAt)
+		}
+		return jobs[i].JobID < jobs[j].JobID
+	})
 	return snapshotJobs(jobs)
 }
 
