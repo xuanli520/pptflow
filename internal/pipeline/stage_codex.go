@@ -197,7 +197,9 @@ func (r Runner) codexContext(ctx context.Context, project scanner.Project, opts 
 		if err != nil {
 			return "", err
 		}
-		builder.WriteString(r.refRunStaticContext(refRun.ArtifactRoot, stage))
+		if r.cfg.Codex.IncludePriorFindings {
+			builder.WriteString(r.refRunStaticContext(refRun.ArtifactRoot, stage))
+		}
 		if stage == "F" {
 			for _, doc := range opts.ExtraDocs {
 				path, err := filepath.Abs(filepath.Clean(doc))

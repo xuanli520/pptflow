@@ -405,12 +405,15 @@ func stageFCodexReviewSpec() CodexReviewStageSpec {
 			return report1
 		},
 		BuildContext: func(ctx context.Context, runner Runner, sc StageContext) (string, error) {
-			stageStatuses, priorFindings := priorStageSnapshot(sc.Prior)
 			contextText, err := runner.codexContext(ctx, sc.Project, sc.Options, "F")
 			if err != nil {
 				return "", err
 			}
-			return contextText + "\n" + stageFPreviousFindingsContext(stageStatuses, priorFindings), nil
+			if runner.cfg.Codex.IncludePriorFindings {
+				stageStatuses, priorFindings := priorStageSnapshot(sc.Prior)
+				contextText += "\n" + stageFPreviousFindingsContext(stageStatuses, priorFindings)
+			}
+			return contextText, nil
 		},
 		UnavailableFinding: stageFUnavailableFinding,
 		ErrorSummary: func(codexReviewFailureKind) string {
