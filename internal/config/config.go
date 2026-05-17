@@ -55,13 +55,14 @@ type DocsConfig struct {
 }
 
 type CodexConfig struct {
-	SandboxImage      string
-	PromptProfilesDir string
-	Network           string
-	MaxOutputBytes    int
-	WritableTmp       bool
-	Env               map[string]string
-	ExtraArgs         []string
+	SandboxImage         string
+	PromptProfilesDir    string
+	Network              string
+	MaxOutputBytes       int
+	WritableTmp          bool
+	IncludePriorFindings bool
+	Env                  map[string]string
+	ExtraArgs            []string
 }
 
 type TUIConfig struct {
@@ -123,13 +124,14 @@ type rawDocsConfig struct {
 }
 
 type rawCodexConfig struct {
-	SandboxImage      *string           `yaml:"sandbox_image"`
-	PromptProfilesDir *string           `yaml:"prompt_profiles_dir"`
-	Network           *string           `yaml:"network"`
-	MaxOutputBytes    *int              `yaml:"max_output_bytes"`
-	WritableTmp       *bool             `yaml:"writable_tmp"`
-	Env               map[string]string `yaml:"env"`
-	ExtraArgs         []string          `yaml:"extra_args"`
+	SandboxImage         *string           `yaml:"sandbox_image"`
+	PromptProfilesDir    *string           `yaml:"prompt_profiles_dir"`
+	Network              *string           `yaml:"network"`
+	MaxOutputBytes       *int              `yaml:"max_output_bytes"`
+	WritableTmp          *bool             `yaml:"writable_tmp"`
+	IncludePriorFindings *bool             `yaml:"include_prior_findings"`
+	Env                  map[string]string `yaml:"env"`
+	ExtraArgs            []string          `yaml:"extra_args"`
 }
 
 type rawTUIConfig struct {
@@ -164,12 +166,13 @@ func Default() Config {
 			StageInlineMaxBytes:  4 << 20,
 		},
 		Codex: CodexConfig{
-			SandboxImage:      "codex:latest",
-			PromptProfilesDir: "./projects-qa/.qa-control/prompt_profiles",
-			Network:           "none",
-			MaxOutputBytes:    1048576,
-			WritableTmp:       false,
-			Env:               map[string]string{},
+			SandboxImage:         "codex:latest",
+			PromptProfilesDir:    "./projects-qa/.qa-control/prompt_profiles",
+			Network:              "none",
+			MaxOutputBytes:       1048576,
+			WritableTmp:          false,
+			IncludePriorFindings: false,
+			Env:                  map[string]string{},
 		},
 		TUI: TUIConfig{
 			RefreshIntervalMS: 100,
@@ -388,6 +391,9 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 		}
 		if raw.Codex.WritableTmp != nil {
 			cfg.Codex.WritableTmp = *raw.Codex.WritableTmp
+		}
+		if raw.Codex.IncludePriorFindings != nil {
+			cfg.Codex.IncludePriorFindings = *raw.Codex.IncludePriorFindings
 		}
 		if raw.Codex.Env != nil {
 			if cfg.Codex.Env == nil {
