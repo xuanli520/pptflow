@@ -16,14 +16,16 @@ type submitArtifactCopy struct {
 	Stage       string `json:"stage,omitempty"`
 	Source      string `json:"source,omitempty"`
 	Target      string `json:"target,omitempty"`
+	Optional    bool   `json:"optional,omitempty"`
 	OK          bool   `json:"ok"`
 	NotSelected bool   `json:"not_selected,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
 
 type submitArtifactSpec struct {
-	Name  string
-	Stage string
+	Name     string
+	Stage    string
+	Optional bool
 }
 
 func (s *runState) aggregateSubmitArtifacts(r Runner) {
@@ -43,7 +45,7 @@ func (s *runState) aggregateSubmitArtifacts(r Runner) {
 		})
 	}
 	for _, item := range copies {
-		if item.OK || item.NotSelected {
+		if item.OK || item.NotSelected || item.Error == "" {
 			continue
 		}
 		s.addArtifactWarning(ArtifactWarning{
@@ -71,7 +73,7 @@ func aggregateSubmitArtifacts(artifactRoot, submitDir string, specs []submitArti
 	for _, spec := range specs {
 		source := filepath.Join(artifactRoot, spec.Name)
 		target := filepath.Join(submitDir, spec.Name)
-		item := submitArtifactCopy{Name: spec.Name, Stage: spec.Stage, Source: source, Target: target}
+		item := submitArtifactCopy{Name: spec.Name, Stage: spec.Stage, Source: source, Target: target, Optional: spec.Optional}
 		if !selected[spec.Stage] {
 			item.NotSelected = true
 			copies = append(copies, item)
@@ -84,7 +86,9 @@ func aggregateSubmitArtifacts(artifactRoot, submitDir string, specs []submitArti
 		}
 		info, err := os.Stat(source)
 		if err != nil {
-			item.Error = err.Error()
+			if !spec.Optional {
+				item.Error = err.Error()
+			}
 			copies = append(copies, item)
 			continue
 		}
@@ -144,7 +148,7 @@ func submitArtifactSpecs(mode string) []submitArtifactSpec {
 		}
 	}
 	return []submitArtifactSpec{
-		{Name: qaArtifactName("codex_report.md"), Stage: "E"},
+		{Name: qaArtifactName("codex_report.md"), Stage: "E", Optional: true},
 		{Name: qaArtifactName("validation_report.md"), Stage: "A"},
 		{Name: qaArtifactName("operator_prompt_requirements_verification.md"), Stage: "F"},
 		{Name: qaArtifactName("operator_codex_report_issues_verification.md"), Stage: "F"},

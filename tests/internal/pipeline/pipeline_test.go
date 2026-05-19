@@ -113,15 +113,27 @@ func parseDockerPort(service, raw string) []portMapping {
 
 func TestSelectedStagesStaticOnly(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{StaticOnly: true}, true)
-	for _, stage := range []string{"A", "D", "E", "F"} {
+	for _, stage := range []string{"A", "D", "F"} {
 		if !selected[stage] {
 			t.Fatalf("expected %s selected", stage)
 		}
 	}
-	for _, stage := range []string{"B", "C"} {
+	for _, stage := range []string{"B", "C", "E"} {
 		if selected[stage] {
 			t.Fatalf("expected %s skipped", stage)
 		}
+	}
+}
+
+func TestSelectedStagesDefaultSkipsStageE(t *testing.T) {
+	selected := selectedStages(pipelinepkg.RunOptions{}, false)
+	for _, stage := range []string{"A", "B", "C", "D", "F"} {
+		if !selected[stage] {
+			t.Fatalf("expected %s selected", stage)
+		}
+	}
+	if selected["E"] {
+		t.Fatal("Stage E should not be selected by default")
 	}
 }
 
@@ -402,7 +414,7 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 	if err := os.MkdirAll(filepath.Join(submitDir, "nested"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	oldValidationReportName := "QA_" + "validate" + "_report.md"
+	oldValidationReportName := "stale_validation_report.md"
 	for _, stale := range []string{oldValidationReportName, "unexpected.txt", filepath.Join("nested", "old.txt")} {
 		if err := os.WriteFile(filepath.Join(submitDir, stale), []byte("stale"), 0o644); err != nil {
 			t.Fatal(err)
@@ -418,7 +430,7 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 			t.Fatalf("submit reset should remove stale %s, stat err: %v", stale, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(submitDir, "QA_test_effectiveness_report.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(submitDir, "test_effectiveness_report.md")); err != nil {
 		t.Fatalf("submit reset should still copy current selected artifact: %v", err)
 	}
 	warnings, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "artifact_warnings.json"))
@@ -432,8 +444,32 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(manifest), "QA_test_effectiveness_report.md") || !strings.Contains(string(manifest), `"not_selected": true`) {
+	if !strings.Contains(string(manifest), "test_effectiveness_report.md") || !strings.Contains(string(manifest), `"not_selected": true`) {
 		t.Fatalf("submit manifest missing expected file records:\n%s", manifest)
+	}
+}
+
+func TestAggregateSubmitArtifactsAllowsMissingOptionalCodexReport(t *testing.T) {
+	root := t.TempDir()
+	artifactRoot := filepath.Join(root, "run")
+	submitDir := filepath.Join(root, "submit")
+	if err := os.MkdirAll(artifactRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	copies, err := pipelinepkg.AggregateSubmitArtifactsForTest(artifactRoot, submitDir, "initial", map[string]bool{"E": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var codexReport pipelinepkg.TestSubmitArtifactCopy
+	for _, copy := range copies {
+		if copy.Name == "codex_report.md" {
+			codexReport = copy
+			break
+		}
+	}
+	if !codexReport.Optional || codexReport.OK || codexReport.NotSelected || codexReport.Error != "" {
+		t.Fatalf("missing optional codex_report should be recorded without copy error: %#v", codexReport)
 	}
 }
 
@@ -476,9 +512,9 @@ func TestRunMaterializesStaticArtifactsWhenCodexPreflightBlocked(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"QA_test_effectiveness_report.md",
-		"QA_codex_report.md",
-		"QA_operator_prompt_requirements_verification.md",
+		"test_effectiveness_report.md",
+		"codex_report.md",
+		"operator_prompt_requirements_verification.md",
 	} {
 		content, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, name))
 		if err != nil {
@@ -489,7 +525,7 @@ func TestRunMaterializesStaticArtifactsWhenCodexPreflightBlocked(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"QA_operator_codex_report_issues_verification.md",
+		"operator_codex_report_issues_verification.md",
 		"repair_summary.json",
 	} {
 		if _, err := os.Stat(filepath.Join(result.Run.ArtifactRoot, name)); err != nil {

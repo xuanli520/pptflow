@@ -46,13 +46,13 @@ func stagePlanForMode(mode, stage string, staticOnly bool, explicitStages map[st
 		if staticOnly && model.IsRuntimeStage(stage) {
 			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段 B/C"}
 		}
-		stages := affectedStages(stage)
+		stages := withoutStageE(affectedStages(stage))
 		return stagePlan{runStages: stages, displayStages: stages}
 	}
 	if staticOnly {
 		return stagePlan{displayStages: staticDisplayStages()}
 	}
-	return stagePlan{displayStages: model.AllStages()}
+	return stagePlan{displayStages: withoutStageE(model.AllStages())}
 }
 
 func (m app) rerunStagePlan() stagePlan {
@@ -115,5 +115,16 @@ func staticDisplayStages() []string {
 			stages = append(stages, string(spec.ID))
 		}
 	}
-	return stages
+	return withoutStageE(stages)
+}
+
+func withoutStageE(stages []string) []string {
+	filtered := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		if strings.ToUpper(strings.TrimSpace(stage)) == string(model.StageE) {
+			continue
+		}
+		filtered = append(filtered, stage)
+	}
+	return filtered
 }

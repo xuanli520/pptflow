@@ -131,7 +131,6 @@ func TestCodexContextOnlyExposesUploadedDocsToStageF(t *testing.T) {
 	for _, want := range []string{
 		"Stage F uploaded-document requirement",
 		"Uploaded/attached docs available to Stage F: 2",
-		"SELF TEST CLAIM",
 		"SUPPLEMENTAL CLAIM",
 		"[p2r static-review JSON start marker redacted from untrusted input]",
 	} {
@@ -141,6 +140,74 @@ func TestCodexContextOnlyExposesUploadedDocsToStageF(t *testing.T) {
 	}
 	if strings.Contains(stageF, "<!-- p2r:static-review-json:start -->") || strings.Contains(stageF, "<!-- p2r:static-review-json:end -->") {
 		t.Fatalf("Stage F context should redact exact static-review JSON markers from untrusted docs:\n%s", stageF)
+	}
+	if strings.Contains(stageF, "SELF TEST CLAIM") || strings.Contains(stageF, "Self-test report was not available") {
+		t.Fatalf("Stage F context should not include self-test report input:\n%s", stageF)
+	}
+}
+
+func TestStageFRefRunContextExcludesStageEAndIssueReports(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), []byte(`{"task_id":"TASK-1","prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refRoot := filepath.Join(root, "runs", "ref")
+	if err := os.MkdirAll(refRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"codex_report.md":                              "STAGE E REPORT",
+		"codex_report_verification.md":                 "STAGE E VERIFICATION",
+		"operator_codex_report_issues_verification.md": "INITIAL ISSUE REPORT",
+		"codex_report_issues_verification.md":          "RECHECK ISSUE REPORT",
+		"test_effectiveness_report.md":                 "STAGE D REPORT",
+		"prompt_requirements_verification.md":          "STAGE F PROMPT REPORT",
+		"operator_prompt_requirements_verification.md": "STAGE F INITIAL PROMPT REPORT",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(refRoot, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CreateRun(context.Background(), model.RunRecord{
+		RunID:        "ref-1",
+		TaskID:       "TASK-1",
+		Status:       model.RunCompletedClean,
+		ArtifactRoot: refRoot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.Codex.IncludePriorFindings = true
+	contextText, err := runnerCodexContext(
+		pipelinepkg.NewRunner(store, cfg),
+		context.Background(),
+		scanner.Project{TaskID: "TASK-1", Path: projectPath},
+		pipelinepkg.RunOptions{Mode: "recheck", RefRun: "ref-1"},
+		"F",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"STAGE D REPORT", "STAGE F PROMPT REPORT", "STAGE F INITIAL PROMPT REPORT"} {
+		if !strings.Contains(contextText, want) {
+			t.Fatalf("Stage F ref-run context missing %q:\n%s", want, contextText)
+		}
+	}
+	for _, excluded := range []string{"STAGE E REPORT", "STAGE E VERIFICATION", "INITIAL ISSUE REPORT", "RECHECK ISSUE REPORT"} {
+		if strings.Contains(contextText, excluded) {
+			t.Fatalf("Stage F ref-run context should exclude %q:\n%s", excluded, contextText)
+		}
 	}
 }
 
@@ -178,16 +245,16 @@ func TestStageFUsesPromptAndIssueVerificationArtifactNames(t *testing.T) {
 		{
 			name:       "initial",
 			mode:       "initial",
-			wantReport: "QA_operator_prompt_requirements_verification.md",
-			wantIssue:  "QA_operator_codex_report_issues_verification.md",
-			oldReport:  "QA_3_标注员AI报告问题的修复报告.md",
+			wantReport: "operator_prompt_requirements_verification.md",
+			wantIssue:  "operator_codex_report_issues_verification.md",
+			oldReport:  "3_标注员AI报告问题的修复报告.md",
 		},
 		{
 			name:       "recheck",
 			mode:       "recheck",
-			wantReport: "QA_prompt_requirements_verification.md",
-			wantIssue:  "QA_codex_report_issues_verification.md",
-			oldReport:  "QA_3_标注员AI报告问题_确认修复报告.md",
+			wantReport: "prompt_requirements_verification.md",
+			wantIssue:  "codex_report_issues_verification.md",
+			oldReport:  "3_标注员AI报告问题_确认修复报告.md",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -226,6 +293,7 @@ func TestStageFUsesPromptAndIssueVerificationArtifactNames(t *testing.T) {
 				opts,
 				map[string]model.StageRecord{
 					"D": {Stage: "D", Status: model.StageDone, Findings: []model.Finding{{Stage: "D", Severity: "High", Title: "prior issue"}}},
+					"E": {Stage: "E", Status: model.StageDone, Findings: []model.Finding{{Stage: "E", Severity: "High", Title: "stage e issue"}}},
 				},
 			)
 			if record.Status != model.StageDone {
@@ -238,6 +306,13 @@ func TestStageFUsesPromptAndIssueVerificationArtifactNames(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(artifactRoot, tc.oldReport)); !os.IsNotExist(err) {
 				t.Fatalf("old Stage F report name should not be emitted, stat err: %v", err)
+			}
+			summary, err := os.ReadFile(filepath.Join(artifactRoot, "repair_summary.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(summary), "stage e issue") || strings.Contains(string(summary), `"E":`) {
+				t.Fatalf("repair summary should not include Stage E status or findings:\n%s", summary)
 			}
 		})
 	}
@@ -268,7 +343,7 @@ func TestStageFRequiredIssueReportWriteFailureFailsStage(t *testing.T) {
 	}
 
 	artifactRoot := filepath.Join(root, "runs", "issue-write-failure")
-	if err := os.MkdirAll(filepath.Join(artifactRoot, "QA_operator_codex_report_issues_verification.md"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "operator_codex_report_issues_verification.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
@@ -321,7 +396,7 @@ func TestStageCodexRecheckDoesNotEmitSelfTestCompatibilityAlias(t *testing.T) {
 			t.Fatalf("deprecated self-test compatibility alias should not be recorded: %#v", record.ArtifactPaths)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(artifactRoot, "QA_test_effectiveness_verification.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(artifactRoot, "test_effectiveness_verification.md")); err != nil {
 		t.Fatalf("canonical recheck report missing: %v", err)
 	}
 }
@@ -368,7 +443,7 @@ func TestStageCodexUnsafeExtraArgsProducesFindingAndContract(t *testing.T) {
 	if len(record.Findings) != 1 || !strings.Contains(record.Findings[0].Evidence, "--search") {
 		t.Fatalf("expected structured extra_args finding, got %#v", record.Findings)
 	}
-	content, err := os.ReadFile(filepath.Join(artifactRoot, "QA_test_effectiveness_report.md"))
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "test_effectiveness_report.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +457,7 @@ func TestStageCodexUnsafeExtraArgsProducesFindingAndContract(t *testing.T) {
 func TestStageCodexRequiredReportWriteFailureAddsInfraFinding(t *testing.T) {
 	root := t.TempDir()
 	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
-	outputPath := filepath.Join(artifactRoot, "QA_test_effectiveness_report.md")
+	outputPath := filepath.Join(artifactRoot, "test_effectiveness_report.md")
 	if err := os.MkdirAll(outputPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +507,7 @@ func TestStageCodexCompatWriteFailureRecordsWarningOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	artifactRoot := filepath.Join(root, "TASK-1", "qa", "runs", "run-1")
-	if err := os.MkdirAll(filepath.Join(artifactRoot, "QA_compat.md"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "compat.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -453,13 +528,13 @@ func TestStageCodexCompatWriteFailureRecordsWarningOnly(t *testing.T) {
 	if record.Status != model.StageDone {
 		t.Fatalf("stage status = %s, want done; record=%#v", record.Status, record)
 	}
-	if _, err := os.Stat(filepath.Join(artifactRoot, "QA_test_effectiveness_report.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(artifactRoot, "test_effectiveness_report.md")); err != nil {
 		t.Fatalf("required report should be written: %v", err)
 	}
 	if len(record.ArtifactWarnings) != 1 {
 		t.Fatalf("expected one best-effort artifact warning, got %#v", record.ArtifactWarnings)
 	}
-	if record.ArtifactWarnings[0].Required || record.ArtifactWarnings[0].Path != "QA_compat.md" {
+	if record.ArtifactWarnings[0].Required || record.ArtifactWarnings[0].Path != "compat.md" {
 		t.Fatalf("unexpected artifact warning: %#v", record.ArtifactWarnings[0])
 	}
 	if hasFinding(record.Findings, "INFRA", "Required p2r artifact could not be written") {
@@ -507,7 +582,7 @@ func TestStageCodexNormalizesFinalReportLayout(t *testing.T) {
 	if record.Status != model.StageDone {
 		t.Fatalf("stage record = %#v, want done", record)
 	}
-	content, err := os.ReadFile(filepath.Join(artifactRoot, "QA_codex_report.md"))
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "codex_report.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +605,7 @@ func TestStageCodexNormalizesFinalReportLayout(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimSpace(text), endMarker) {
 		t.Fatalf("JSON contract should be the final block:\n%s", text)
 	}
-	compat, err := os.ReadFile(filepath.Join(artifactRoot, "QA_codex_report.md"))
+	compat, err := os.ReadFile(filepath.Join(artifactRoot, "codex_report.md"))
 	if err != nil {
 		t.Fatal(err)
 	}

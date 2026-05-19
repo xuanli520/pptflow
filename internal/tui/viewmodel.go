@@ -874,29 +874,18 @@ func primaryCodexReportPath(stage stageView) string {
 }
 
 func qaArtifactCandidates(names ...string) []string {
-	seen := map[string]bool{}
 	var result []string
-	add := func(name string) {
-		name = strings.TrimSpace(name)
-		if name == "" || seen[name] {
-			return
-		}
-		seen[name] = true
-		result = append(result, name)
-	}
 	for _, name := range names {
 		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
+		if name != "" {
+			result = append(result, name)
 		}
-		add("QA_" + strings.TrimPrefix(name, "QA_"))
-		add(name)
 	}
 	return result
 }
 
 func isShortCommentArtifact(base string) bool {
-	return base == "short_comment.txt" || base == "QA_short_comment.txt"
+	return base == "short_comment.txt"
 }
 
 func reportSummary(path string) string {

@@ -17,7 +17,7 @@ func TestStagePlanInitialRuntimeDefaults(t *testing.T) {
 	if plan.RunStages != nil {
 		t.Fatalf("initial run stages = %#v, want nil", plan.RunStages)
 	}
-	if !slices.Equal(plan.DisplayStages, []string{"A", "B", "C", "D", "E", "F"}) {
+	if !slices.Equal(plan.DisplayStages, []string{"A", "B", "C", "D", "F"}) {
 		t.Fatalf("display stages = %#v", plan.DisplayStages)
 	}
 }
@@ -27,7 +27,7 @@ func TestStagePlanInitialStaticOnlyDefaults(t *testing.T) {
 	if plan.RunStages != nil {
 		t.Fatalf("initial static-only run stages = %#v, want nil", plan.RunStages)
 	}
-	if !slices.Equal(plan.DisplayStages, []string{"A", "D", "E", "F"}) {
+	if !slices.Equal(plan.DisplayStages, []string{"A", "D", "F"}) {
 		t.Fatalf("display stages = %#v", plan.DisplayStages)
 	}
 }
@@ -35,6 +35,14 @@ func TestStagePlanInitialStaticOnlyDefaults(t *testing.T) {
 func TestStagePlanRecheckUsesAffectedStages(t *testing.T) {
 	plan := tuiapp.StagePlanForTest("recheck", "A", false)
 	want := []string{"A", "F"}
+	if !slices.Equal(plan.RunStages, want) || !slices.Equal(plan.DisplayStages, want) {
+		t.Fatalf("plan = run %#v display %#v, want %v", plan.RunStages, plan.DisplayStages, want)
+	}
+}
+
+func TestStagePlanRecheckSkipsStageEByDefault(t *testing.T) {
+	plan := tuiapp.StagePlanForTest("recheck", "E", false)
+	want := []string{"F"}
 	if !slices.Equal(plan.RunStages, want) || !slices.Equal(plan.DisplayStages, want) {
 		t.Fatalf("plan = run %#v display %#v, want %v", plan.RunStages, plan.DisplayStages, want)
 	}
@@ -89,10 +97,10 @@ func TestRunConfigFCanBeUnchecked(t *testing.T) {
 	h, _ = h.Press(" ")
 
 	view := h.View()
-	if !strings.Contains(view, "将运行阶段: A, B, C, D, E") {
+	if !strings.Contains(view, "将运行阶段: A, B, C, D") {
 		t.Fatalf("run config should keep non-F defaults after F is unchecked:\n%s", view)
 	}
-	if strings.Contains(view, "将运行阶段: A, B, C, D, E, F") || strings.Contains(view, "始终选中") {
+	if strings.Contains(view, "将运行阶段: A, B, C, D, F") || strings.Contains(view, "始终选中") {
 		t.Fatalf("F should not be forced or labeled always-selected:\n%s", view)
 	}
 }
@@ -106,7 +114,7 @@ func TestRenderConfirmUsesInitialStagePlan(t *testing.T) {
 
 	h, _ = h.Press("ctrl+r")
 	view := h.View()
-	if !strings.Contains(view, "阶段: A, B, C, D, E, F") {
+	if !strings.Contains(view, "阶段: A, B, C, D, F") {
 		t.Fatalf("confirm should show initial full plan, got:\n%s", view)
 	}
 	if strings.Contains(view, "阶段: A, F") {

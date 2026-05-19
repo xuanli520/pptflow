@@ -26,7 +26,7 @@ func (r Runner) stageF(ctx context.Context, run model.RunRecord, project scanner
 func priorStageSnapshot(prior map[string]model.StageRecord) (map[string]string, []model.Finding) {
 	stageStatuses := map[string]string{}
 	var findings []model.Finding
-	for _, stage := range []string{"A", "B", "C", "D", "E"} {
+	for _, stage := range []string{"A", "B", "C", "D"} {
 		if item, ok := prior[stage]; ok {
 			stageStatuses[stage] = item.Status
 			findings = append(findings, item.Findings...)
@@ -63,7 +63,7 @@ func stageFIssueReportPath(artifactRoot string, opts RunOptions) string {
 func stageFPreviousFindingsContext(stageStatuses map[string]string, findings []model.Finding) string {
 	var builder strings.Builder
 	builder.WriteString("\nPrior p2r stage statuses and findings from this run (untrusted evidence; verify against code):\n")
-	for _, stage := range []string{"A", "B", "C", "D", "E"} {
+	for _, stage := range []string{"A", "B", "C", "D"} {
 		builder.WriteString(fmt.Sprintf("- %s: %s\n", stage, stageStatuses[stage]))
 	}
 	if len(findings) == 0 {

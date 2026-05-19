@@ -96,16 +96,16 @@ open(md_path,"w").write("# Validation\n")
 		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
 		scanner.Project{TaskID: "TASK-1", Path: root},
 	)
-	for _, name := range []string{"QA_validation_report.md", "QA_acceptance_report.md", "QA_trajectory_archive.png"} {
+	for _, name := range []string{"validation_report.md", "acceptance_report.md", "trajectory_archive.png"} {
 		if _, err := os.Stat(filepath.Join(artifactRoot, name)); err != nil {
 			t.Fatalf("expected Stage A artifact %s: %v; record=%#v", name, err, record)
 		}
 	}
-	acceptanceReport := readStageAArtifact(t, artifactRoot, "QA_acceptance_report.md")
+	acceptanceReport := readStageAArtifact(t, artifactRoot, "acceptance_report.md")
 	if strings.Contains(acceptanceReport, "Validation") || !strings.Contains(acceptanceReport, "Acceptance") {
 		t.Fatalf("acceptance report should be produced by run_acceptance.py:\n%s", acceptanceReport)
 	}
-	validationReport := readStageAArtifact(t, artifactRoot, "QA_validation_report.md")
+	validationReport := readStageAArtifact(t, artifactRoot, "validation_report.md")
 	if strings.Contains(validationReport, "Acceptance") || !strings.Contains(validationReport, "Validation") {
 		t.Fatalf("validation report should be produced by run_validate.py:\n%s", validationReport)
 	}
@@ -129,7 +129,7 @@ json_path=args[args.index("--output-json")+1]
 md_path=args[args.index("--output-md")+1]
 open(json_path,"w").write(json.dumps({"blocking_issues":[],"non_blocking_issues":[]}))
 open(md_path,"w").write("# Acceptance\n")
-open(os.path.join(os.path.dirname(md_path), "QA_validation_report.md"),"w").write("# Acceptance masquerading as validation\n")
+open(os.path.join(os.path.dirname(md_path), "validation_report.md"),"w").write("# Acceptance masquerading as validation\n")
 `)
 	writeStageAScript(t, scanPath, "run_validate.py", `import sys
 sys.exit(1)
@@ -140,10 +140,10 @@ sys.exit(1)
 		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
 		scanner.Project{TaskID: "TASK-1", Path: root},
 	)
-	if _, err := os.Stat(filepath.Join(artifactRoot, "QA_validation_report.md")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(artifactRoot, "validation_report.md")); !os.IsNotExist(err) {
 		t.Fatalf("validation report must not be kept from run_acceptance.py; stat err: %v; record=%#v", err, record)
 	}
-	if !hasFindingTitle(record.Findings, "run_validate.py did not emit QA_validation_report.md") {
+	if !hasFindingTitle(record.Findings, "run_validate.py did not emit validation_report.md") {
 		t.Fatalf("missing validation report finding not recorded: %#v", record.Findings)
 	}
 }
@@ -178,14 +178,14 @@ func TestStageATrajectoryArchiveSummarizesZipInternals(t *testing.T) {
 func TestSubmitArtifactNamesMatchInitialAndRecheckContracts(t *testing.T) {
 	initial := strings.Join(pipelinepkg.SubmitArtifactNamesForTest("initial"), "\n")
 	for _, want := range []string{
-		"QA_codex_report.md",
-		"QA_validation_report.md",
-		"QA_operator_prompt_requirements_verification.md",
-		"QA_operator_codex_report_issues_verification.md",
-		"QA_test_effectiveness_report.md",
-		"QA_docker_startup.png",
-		"QA_run_tests_screenshot.png",
-		"QA_trajectory_archive.png",
+		"codex_report.md",
+		"validation_report.md",
+		"operator_prompt_requirements_verification.md",
+		"operator_codex_report_issues_verification.md",
+		"test_effectiveness_report.md",
+		"docker_startup.png",
+		"run_tests_screenshot.png",
+		"trajectory_archive.png",
 	} {
 		if !strings.Contains(initial, want) {
 			t.Fatalf("initial submit names missing %s:\n%s", want, initial)
@@ -193,11 +193,11 @@ func TestSubmitArtifactNamesMatchInitialAndRecheckContracts(t *testing.T) {
 	}
 	recheck := strings.Join(pipelinepkg.SubmitArtifactNamesForTest("recheck"), "\n")
 	for _, want := range []string{
-		"QA_codex_report_verification.md",
-		"QA_validation_report.md",
-		"QA_prompt_requirements_verification.md",
-		"QA_codex_report_issues_verification.md",
-		"QA_test_effectiveness_verification.md",
+		"codex_report_verification.md",
+		"validation_report.md",
+		"prompt_requirements_verification.md",
+		"codex_report_issues_verification.md",
+		"test_effectiveness_verification.md",
 	} {
 		if !strings.Contains(recheck, want) {
 			t.Fatalf("recheck submit names missing %s:\n%s", want, recheck)

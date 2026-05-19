@@ -120,7 +120,7 @@ func stageMaterializesBlockedPreflight(stage Stage) bool {
 }
 
 func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
-	selected := stageSet(model.AllStages())
+	selected := stageSet(defaultRunStages())
 	if len(opts.Stages) > 0 {
 		selected = map[string]bool{}
 		for _, stage := range opts.Stages {
@@ -198,11 +198,22 @@ func stageSet(stages []string) map[string]bool {
 func staticStageSet() map[string]bool {
 	selected := map[string]bool{}
 	for _, spec := range model.AllStageSpecs() {
-		if spec.Static {
+		if spec.Static && spec.ID != model.StageE {
 			selected[string(spec.ID)] = true
 		}
 	}
 	return selected
+}
+
+func defaultRunStages() []string {
+	stages := make([]string, 0, len(model.AllStages()))
+	for _, stage := range model.AllStages() {
+		if stage == string(model.StageE) {
+			continue
+		}
+		stages = append(stages, stage)
+	}
+	return stages
 }
 
 func stageName(stage string) string {

@@ -43,6 +43,17 @@ type TestStageCCommandEnv struct {
 	Service TestServiceURLEnv
 }
 
+type TestSubmitArtifactCopy struct {
+	Name        string
+	Stage       string
+	Source      string
+	Target      string
+	Optional    bool
+	OK          bool
+	NotSelected bool
+	Error       string
+}
+
 type TestServiceURLEnv struct {
 	Env     []string
 	Keys    []string
@@ -195,6 +206,24 @@ func (r Runner) StageFForTest(ctx context.Context, run model.RunRecord, project 
 
 func SubmitArtifactNamesForTest(mode string) []string {
 	return submitArtifactNames(mode)
+}
+
+func AggregateSubmitArtifactsForTest(artifactRoot, submitDir, mode string, selected map[string]bool) ([]TestSubmitArtifactCopy, error) {
+	copies, err := aggregateSubmitArtifacts(artifactRoot, submitDir, submitArtifactSpecs(mode), selected)
+	result := make([]TestSubmitArtifactCopy, 0, len(copies))
+	for _, copy := range copies {
+		result = append(result, TestSubmitArtifactCopy{
+			Name:        copy.Name,
+			Stage:       copy.Stage,
+			Source:      copy.Source,
+			Target:      copy.Target,
+			Optional:    copy.Optional,
+			OK:          copy.OK,
+			NotSelected: copy.NotSelected,
+			Error:       copy.Error,
+		})
+	}
+	return result, err
 }
 
 func StructuralFindingsForTest(project scanner.Project, required map[string]bool) []model.Finding {

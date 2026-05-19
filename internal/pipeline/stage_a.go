@@ -467,8 +467,8 @@ func missingValidationReportFinding(path string, result scriptExecution) model.F
 	return model.Finding{
 		Stage:      "A",
 		Severity:   "Blocker",
-		Title:      "run_validate.py did not emit QA_validation_report.md",
-		Rule:       "QA_validation_report.md must be produced by run_validate.py, not by run_acceptance.py or a pipeline fallback.",
+		Title:      "run_validate.py did not emit validation_report.md",
+		Rule:       "validation_report.md must be produced by run_validate.py, not by run_acceptance.py or a pipeline fallback.",
 		Evidence:   evidence,
 		Impact:     "The submit package would otherwise contain validation evidence with the wrong provenance.",
 		MinimumFix: "Ensure assets/scripts/run_validate.py writes --output-md to " + filepath.Base(path) + " and rerun Stage A.",
