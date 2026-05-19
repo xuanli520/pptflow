@@ -61,7 +61,7 @@ func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner
 		summary.Warnings = append(summary.Warnings, "compose project is empty")
 		return summary
 	}
-	args := CleanupComposeArgsFiles(cfg, composeFiles, projectName)
+	args := CleanupComposeArgsFilesWithProjectDir(cfg, composeFiles, projectName, workDir)
 	result := exec.Run(ctx, 2*time.Minute, workDir, nil, "docker", args...)
 	summary.Status = "ok"
 	summary.Command = result.Command
@@ -75,6 +75,9 @@ func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner
 		return summary
 	}
 	psArgs := []string{"compose"}
+	if strings.TrimSpace(workDir) != "" {
+		psArgs = append(psArgs, "--project-directory", workDir)
+	}
 	psArgs = append(psArgs, ComposeFileArgs(composeFiles)...)
 	psArgs = append(psArgs, "-p", projectName, "ps", "-q")
 	verify := exec.Run(ctx, 30*time.Second, workDir, nil, "docker", psArgs...)
@@ -101,7 +104,14 @@ func CleanupComposeArgs(cfg config.DockerConfig, composeFile, projectName string
 }
 
 func CleanupComposeArgsFiles(cfg config.DockerConfig, composeFiles []string, projectName string) []string {
+	return CleanupComposeArgsFilesWithProjectDir(cfg, composeFiles, projectName, "")
+}
+
+func CleanupComposeArgsFilesWithProjectDir(cfg config.DockerConfig, composeFiles []string, projectName, projectDir string) []string {
 	args := []string{"compose"}
+	if strings.TrimSpace(projectDir) != "" {
+		args = append(args, "--project-directory", projectDir)
+	}
 	args = append(args, ComposeFileArgs(normalizeComposeFiles(composeFiles))...)
 	args = append(args, "-p", projectName, "down")
 	if cfg.CleanupVolumes {

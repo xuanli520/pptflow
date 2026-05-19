@@ -13,6 +13,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/executor"
+	"gopkg.in/yaml.v3"
 )
 
 func TestStartRuntimePullPolicy(t *testing.T) {
@@ -118,6 +119,77 @@ func TestStartRuntimeBuildMirrorPatchWritesArtifactsWithoutModifyingRepo(t *test
 	}
 	if string(current) != original {
 		t.Fatalf("repo Dockerfile was modified:\n%s", current)
+	}
+}
+
+func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	compose := `services:
+  db:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+  api:
+    image: api
+    ports:
+      - target: 8000
+        published: "8000"
+        protocol: tcp
+`
+	composePath := filepath.Join(repo, "docker-compose.yml")
+	if err := os.WriteFile(composePath, []byte(compose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.RuntimeSummary.PortRewrite == nil || !result.RuntimeSummary.PortRewrite.Generated {
+		t.Fatalf("fixed ports should generate a runtime port rewrite: %#v", result.RuntimeSummary.PortRewrite)
+	}
+	if !containsCommand(runner.commands, " --project-directory "+repo+" ") || !containsCommand(runner.commands, result.RuntimeSummary.PortRewrite.ComposeFile+" ") {
+		t.Fatalf("docker commands should use rewritten compose with original project directory: %#v", runner.commands)
+	}
+	content, err := os.ReadFile(result.RuntimeSummary.PortRewrite.ComposeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "5432:5432") || strings.Contains(string(content), "published:") {
+		t.Fatalf("rewritten compose should not retain fixed published ports:\n%s", content)
+	}
+	var payload map[string]any
+	if err := yaml.Unmarshal(content, &payload); err != nil {
+		t.Fatal(err)
+	}
+	services := payload["services"].(map[string]any)
+	for service, wantPort := range map[string]string{"db": "5432", "api": "8000/tcp"} {
+		node := services[service].(map[string]any)
+		ports := node["ports"].([]any)
+		if len(ports) != 1 || ports[0] != wantPort {
+			t.Fatalf("%s ports = %#v, want %q", service, ports, wantPort)
+		}
+	}
+	original, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(original), "5432:5432") {
+		t.Fatalf("source compose should not be modified:\n%s", original)
 	}
 }
 

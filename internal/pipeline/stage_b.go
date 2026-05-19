@@ -102,7 +102,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		"probes":                result.Runtime.Probes,
 		"mirror":                result.Runtime.Mirror,
 		"labels":                runtimeLabels(r.cfg.Docker, project.TaskID, run.RunID),
-		"cleanup_command":       dockerCleanupCommandText(r.cfg.Docker, result.Runtime.ComposeFiles, result.Runtime.ComposeProject),
+		"cleanup_command":       dockerCleanupCommandText(r.cfg.Docker, result.Runtime.ComposeFiles, result.Runtime.ComposeProject, result.Runtime.WorkDir),
 		"runtime_summary":       "docker_runtime_summary.json",
 		"docker_mirror_summary": "docker_mirror_summary.json",
 		"stage_timeouts": map[string]int{
@@ -280,6 +280,6 @@ func metaComposeFiles(meta map[string]any) []string {
 	}
 }
 
-func dockerCleanupCommandText(cfg config.DockerConfig, composeFiles []string, projectName string) string {
-	return dockermgr.CommandLine("docker", dockermgr.CleanupComposeArgsFiles(cfg, composeFiles, projectName))
+func dockerCleanupCommandText(cfg config.DockerConfig, composeFiles []string, projectName, workDir string) string {
+	return dockermgr.CommandLine("docker", dockermgr.CleanupComposeArgsFilesWithProjectDir(cfg, composeFiles, projectName, workDir))
 }

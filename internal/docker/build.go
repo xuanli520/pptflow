@@ -39,22 +39,23 @@ type StartRuntimeResult struct {
 }
 
 type DockerRuntimeSummary struct {
-	OK                   bool             `json:"ok"`
-	RunID                string           `json:"run_id"`
-	TaskID               string           `json:"task_id"`
-	ComposeProject       string           `json:"compose_project"`
-	ComposeFile          string           `json:"compose_file,omitempty"`
-	ComposeFiles         []string         `json:"compose_files,omitempty"`
-	WorkDir              string           `json:"work_dir"`
-	PullPolicy           string           `json:"pull_policy"`
-	Pull                 StepSummary      `json:"pull"`
-	Build                BuildStepSummary `json:"build"`
-	Up                   StepSummary      `json:"up"`
-	PortCollection       StepSummary      `json:"port_collection"`
-	ReadmeCommandMode    bool             `json:"readme_command_mode,omitempty"`
-	EffectiveConfig      string           `json:"effective_config,omitempty"`
-	RuntimeErrorCategory string           `json:"runtime_error_category,omitempty"`
-	Warnings             []string         `json:"warnings,omitempty"`
+	OK                   bool                       `json:"ok"`
+	RunID                string                     `json:"run_id"`
+	TaskID               string                     `json:"task_id"`
+	ComposeProject       string                     `json:"compose_project"`
+	ComposeFile          string                     `json:"compose_file,omitempty"`
+	ComposeFiles         []string                   `json:"compose_files,omitempty"`
+	WorkDir              string                     `json:"work_dir"`
+	PullPolicy           string                     `json:"pull_policy"`
+	Pull                 StepSummary                `json:"pull"`
+	Build                BuildStepSummary           `json:"build"`
+	Up                   StepSummary                `json:"up"`
+	PortCollection       StepSummary                `json:"port_collection"`
+	ReadmeCommandMode    bool                       `json:"readme_command_mode,omitempty"`
+	EffectiveConfig      string                     `json:"effective_config,omitempty"`
+	PortRewrite          *RuntimePortRewriteSummary `json:"port_rewrite,omitempty"`
+	RuntimeErrorCategory string                     `json:"runtime_error_category,omitempty"`
+	Warnings             []string                   `json:"warnings,omitempty"`
 }
 
 type StepSummary struct {
@@ -151,11 +152,13 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	}
 	activeFiles := []string{}
 	originalFiles := []string{}
+	baseRuntimeFiles := []string{}
 	var effectiveConfig string
 	if composeFile != "" {
 		originalFiles = []string{composeFile}
-		activeFiles = append([]string{}, originalFiles...)
-		configResult := cmd.runStreaming(ctx, "B0 docker compose config", timeouts.Port, ComposeCommandArgs(originalFiles, projectName, "config"), true)
+		baseRuntimeFiles = append([]string{}, originalFiles...)
+		activeFiles = append([]string{}, baseRuntimeFiles...)
+		configResult := cmd.runStreaming(ctx, "B0 docker compose config", timeouts.Port, ComposeCommandArgsWithProjectDir(originalFiles, workDir, projectName, "config"), true)
 		effectiveConfig = configResult.Stdout
 		if configResult.Err != nil {
 			summary.RuntimeErrorCategory = "compose_config_failed"
@@ -163,21 +166,39 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 			result.MirrorSummary = mirrorSummary
 			return result, &StartRuntimeError{Category: "compose_config_failed", Message: "docker compose config failed: " + trimResultText(configResult), Fix: "Fix docker compose configuration and rerun stage B.", Result: configResult}
 		}
+		portRewrite := prepareRuntimePortRewrite(composeFile, req.ArtifactRoot)
+		if len(portRewrite.Summary.Warnings) > 0 {
+			summary.Warnings = append(summary.Warnings, portRewrite.Summary.Warnings...)
+		}
+		if portRewrite.Summary.Generated {
+			summary.PortRewrite = &portRewrite.Summary
+			candidateFiles := []string{portRewrite.Summary.ComposeFile}
+			verify := cmd.runStreaming(ctx, "B0 docker compose port rewrite config", timeouts.Port, ComposeCommandArgsWithProjectDir(candidateFiles, workDir, projectName, "config"), true)
+			if verify.Err == nil {
+				baseRuntimeFiles = candidateFiles
+				activeFiles = append([]string{}, baseRuntimeFiles...)
+				effectiveConfig = verify.Stdout
+			} else {
+				summary.Warnings = append(summary.Warnings, "runtime port rewrite config failed; falling back to original compose file: "+trimResultText(verify))
+				summary.PortRewrite.Warnings = append(summary.PortRewrite.Warnings, "config verification failed: "+trimResultText(verify))
+			}
+		}
 		prepared := prepareBuildMirror(repoPath, composeFile, req.ArtifactRoot, s.Config)
 		mirrorSummary = prepared.Summary
 		if len(prepared.ComposeFiles) > 1 {
-			verify := cmd.runStreaming(ctx, "B0 docker compose mirror config", timeouts.Port, ComposeCommandArgs(prepared.ComposeFiles, projectName, "config"), true)
+			candidateFiles := append(append([]string{}, baseRuntimeFiles...), prepared.ComposeFiles[1:]...)
+			verify := cmd.runStreaming(ctx, "B0 docker compose mirror config", timeouts.Port, ComposeCommandArgsWithProjectDir(candidateFiles, workDir, projectName, "config"), true)
 			if verify.Err == nil {
-				activeFiles = append([]string{}, prepared.ComposeFiles...)
+				activeFiles = append([]string{}, candidateFiles...)
 				effectiveConfig = verify.Stdout
 				mirrorSummary.OverrideVerified = true
 			} else {
 				mirrorSummary.FallbackUsed = true
 				mirrorSummary.FallbackReason = "mirror override config failed: " + trimResultText(verify)
-				mirrorSummary.FallbackFrom = append([]string{}, prepared.ComposeFiles...)
-				mirrorSummary.FallbackTo = append([]string{}, originalFiles...)
+				mirrorSummary.FallbackFrom = append([]string{}, candidateFiles...)
+				mirrorSummary.FallbackTo = append([]string{}, baseRuntimeFiles...)
 				mirrorSummary.Warnings = append(mirrorSummary.Warnings, mirrorSummary.FallbackReason)
-				cmd.logLine("mirror override config failed; falling back to original compose file set", "p2r", false)
+				cmd.logLine("mirror override config failed; falling back to base compose file set", "p2r", false)
 			}
 		}
 	} else {
@@ -198,7 +219,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 			summary.Pull = StepSummary{Status: "skipped", Required: false}
 		default:
 			required := pullPolicy == "required"
-			pull := cmd.runStreaming(ctx, "B1 docker compose pull", timeouts.Pull, ComposeCommandArgs(activeFiles, projectName, "pull", "--ignore-buildable"), required)
+			pull := cmd.runStreaming(ctx, "B1 docker compose pull", timeouts.Pull, ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "pull", "--ignore-buildable"), required)
 			summary.Pull = stepSummaryFromResult(pull, required, "ok")
 			if pull.Err != nil && required {
 				summary.Pull.Status = "failed"
@@ -212,19 +233,20 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 				summary.Warnings = append(summary.Warnings, "best-effort docker compose pull failed: "+trimResultText(pull))
 			}
 		}
-		build := cmd.runStreaming(ctx, "B2 docker compose build", timeouts.Build, ComposeCommandArgs(activeFiles, projectName, "build"), true)
-		summary.Build = buildSummaryFromResult(build, len(activeFiles) > len(originalFiles))
-		if build.Err != nil && len(activeFiles) > len(originalFiles) && s.Config.BuildMirrors.FallbackToOriginal {
+		usingMirrorOverride := len(activeFiles) > len(baseRuntimeFiles)
+		build := cmd.runStreaming(ctx, "B2 docker compose build", timeouts.Build, ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "build"), true)
+		summary.Build = buildSummaryFromResult(build, usingMirrorOverride)
+		if build.Err != nil && usingMirrorOverride && s.Config.BuildMirrors.FallbackToOriginal {
 			reason := "patched build failed: " + trimResultText(build)
 			cmd.logLine(reason, "p2r", false)
-			cmd.logLine("falling back to original compose file set for build/up", "p2r", false)
+			cmd.logLine("falling back to base compose file set for build/up", "p2r", false)
 			mirrorSummary.FallbackUsed = true
 			mirrorSummary.FallbackReason = reason
 			mirrorSummary.FallbackFrom = append([]string{}, activeFiles...)
-			mirrorSummary.FallbackTo = append([]string{}, originalFiles...)
+			mirrorSummary.FallbackTo = append([]string{}, baseRuntimeFiles...)
 			summary.Build.FallbackUsed = true
-			activeFiles = append([]string{}, originalFiles...)
-			fallbackBuild := cmd.runStreaming(ctx, "B2 docker compose build fallback", timeouts.Build, ComposeCommandArgs(activeFiles, projectName, "build"), true)
+			activeFiles = append([]string{}, baseRuntimeFiles...)
+			fallbackBuild := cmd.runStreaming(ctx, "B2 docker compose build fallback", timeouts.Build, ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "build"), true)
 			if fallbackBuild.Err != nil {
 				summary.Build.Status = "failed"
 				summary.Build.Error = "patched build and fallback build failed: " + trimResultText(fallbackBuild)
@@ -248,7 +270,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	}
 	var upArgs []string
 	if composeFile != "" {
-		upArgs = ComposeCommandArgs(activeFiles, projectName, "up", "-d")
+		upArgs = ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "up", "-d")
 	} else {
 		upArgs = ComposeArgsWithProject(readmeCommand, projectName)
 	}
@@ -261,9 +283,9 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		result.MirrorSummary = mirrorSummary
 		return result, &StartRuntimeError{Category: "up_failed", Message: "B3 docker compose up failed: " + trimResultText(up), Fix: "Fix Docker startup and rerun stage B.", Result: up}
 	}
-	psArgs := ComposeCommandArgs(activeFiles, projectName, "ps", "--format", "json")
-	psQArgs := ComposeCommandArgs(activeFiles, projectName, "ps", "-q")
-	servicesArgs := ComposeCommandArgs(activeFiles, projectName, "config", "--services")
+	psArgs := ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "ps", "--format", "json")
+	psQArgs := ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "ps", "-q")
+	servicesArgs := ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "config", "--services")
 	if composeFile == "" {
 		psArgs = ComposePSArgs(readmeCommand, projectName)
 		psQArgs = ComposePSQArgs(readmeCommand, projectName)

@@ -179,7 +179,14 @@ func ComposeFileArgs(files []string) []string {
 }
 
 func ComposeCommandArgs(files []string, projectName string, tail ...string) []string {
+	return ComposeCommandArgsWithProjectDir(files, "", projectName, tail...)
+}
+
+func ComposeCommandArgsWithProjectDir(files []string, projectDir, projectName string, tail ...string) []string {
 	args := []string{"compose"}
+	if strings.TrimSpace(projectDir) != "" {
+		args = append(args, "--project-directory", projectDir)
+	}
 	args = append(args, ComposeFileArgs(files)...)
 	args = append(args, "-p", projectName)
 	args = append(args, tail...)
