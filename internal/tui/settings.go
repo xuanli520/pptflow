@@ -26,10 +26,10 @@ func (m app) handleSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	switch key {
 	case "ctrl+c", "ctrl+q":
 		return m, []tea.Cmd{tea.Batch(m.shutdownScheduler(), tea.Quit)}
-	case "tab":
+	case "ctrl+right":
 		m.switchPanel(1)
 		return m, append(cmds, m.reloadDetail())
-	case "shift+tab":
+	case "ctrl+left":
 		m.switchPanel(-1)
 		return m, append(cmds, m.reloadDetail())
 	}
@@ -52,19 +52,19 @@ func renderSettings(m app) string {
 }
 
 func renderSettingsNav(m app) string {
-	prefix := "  "
+	item := "  Docker 镜像源"
 	if m.settings.selected == settingsItemDocker {
-		prefix = "> "
+		item = selectedStyle.Render("> Docker 镜像源")
 	}
 	return strings.Join([]string{
-		"设置",
-		prefix + "Docker",
+		titleStyle.Render("设置"),
+		item,
 	}, "\n")
 }
 
 func settingsFooter(m app) string {
 	if m.settings.selected == settingsItemDocker && m.dockerMirror.confirm != "" {
-		return "y/Enter 确认  n/Esc 取消"
+		return "y/回车 确认  n/Esc 取消"
 	}
-	return "Tab 顶层页  ↑↓ 设置项  Space 切换  r刷新  s保存  a应用  b恢复  Enter动作  Esc返回"
+	return "Tab/Shift+Tab 字段和按钮  空格切换  ↑↓ 选择备份  回车执行  Ctrl←/→ 顶层页  Esc返回"
 }

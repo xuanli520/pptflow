@@ -55,6 +55,8 @@ type DaemonMirrorSummary struct {
 	DesiredRegistryMirrors []string         `json:"desired_registry_mirrors,omitempty"`
 	Changed                bool             `json:"changed"`
 	Diff                   DaemonMirrorDiff `json:"diff"`
+	ManualApplyPath        string           `json:"manual_apply_path,omitempty"`
+	ManualApplyCommand     string           `json:"manual_apply_command,omitempty"`
 	RestartRequired        bool             `json:"restart_required"`
 	RestartCommand         string           `json:"restart_command"`
 	RecordedAt             string           `json:"recorded_at"`
@@ -69,6 +71,14 @@ type DaemonMirrorDiff struct {
 
 func DaemonMirrorSummaryPath(scanPath string) string {
 	return filepath.Join(scanPath, ".qa-control", "daemon_mirror_summary.json")
+}
+
+func DaemonMirrorManualApplyPath(scanPath string) string {
+	return filepath.Join(scanPath, ".qa-control", "docker-daemon", "daemon.json")
+}
+
+func DaemonMirrorManualRestorePath(scanPath string) string {
+	return filepath.Join(scanPath, ".qa-control", "docker-daemon", "daemon.restore.json")
 }
 
 func DockerGCSummaryPath(scanPath string) string {
@@ -92,6 +102,47 @@ func DaemonMirrorStatus(cfg config.Config) DaemonMirrorSummary {
 	return summary
 }
 
+func PlanDaemonMirrors(cfg config.Config) (DaemonMirrorSummary, error) {
+	summary := baseDaemonMirrorSummary("manual_apply", cfg.Docker.DaemonMirrors)
+	if !cfg.Docker.DaemonMirrors.Enabled {
+		summary.OK = true
+		summary.Warnings = append(summary.Warnings, "Docker daemon 镜像源未启用，未生成手动应用文件")
+		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+		return summary, nil
+	}
+	updated, current, beforeContent, afterContent, err := mergeDaemonMirrorsFile(cfg.Docker.DaemonMirrors.DaemonJSON, cfg.Docker.DaemonMirrors.RegistryMirrors)
+	if err != nil {
+		summary.OK = false
+		summary.Error = err.Error()
+		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+		return summary, err
+	}
+	summary.CurrentRegistryMirrors = current
+	summary.DesiredRegistryMirrors = append([]string(nil), cfg.Docker.DaemonMirrors.RegistryMirrors...)
+	summary.Diff = diffMirrors(current, summary.DesiredRegistryMirrors)
+	summary.Changed = string(beforeContent) != string(afterContent)
+	summary.BeforeSHA256 = sha256Hex(beforeContent)
+	summary.AfterSHA256 = sha256Hex(afterContent)
+	if summary.Changed {
+		path, err := writeManualDaemonJSON(DaemonMirrorManualApplyPath(cfg.ScanPath), updated)
+		if err != nil {
+			summary.OK = false
+			summary.Error = err.Error()
+			_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+			return summary, err
+		}
+		summary.ManualApplyPath = path
+		summary.ManualApplyCommand = manualInstallCommand(path, cfg.Docker.DaemonMirrors.DaemonJSON)
+		summary.RestartRequired = true
+		summary.Warnings = append(summary.Warnings, "已生成手动应用文件，未直接写入 Docker daemon.json")
+	}
+	summary.OK = true
+	if err := writeDaemonMirrorSummary(cfg.ScanPath, summary); err != nil {
+		return summary, err
+	}
+	return summary, nil
+}
+
 func ApplyDaemonMirrors(cfg config.Config, yes bool) (DaemonMirrorSummary, error) {
 	summary := baseDaemonMirrorSummary("apply", cfg.Docker.DaemonMirrors)
 	if cfg.Docker.DaemonMirrors.RequireManualApply && !yes {
@@ -100,6 +151,12 @@ func ApplyDaemonMirrors(cfg config.Config, yes bool) (DaemonMirrorSummary, error
 		summary.Error = err.Error()
 		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
 		return summary, err
+	}
+	if !cfg.Docker.DaemonMirrors.Enabled {
+		summary.OK = true
+		summary.Warnings = append(summary.Warnings, "Docker daemon 镜像源未启用，未写入 daemon.json")
+		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+		return summary, nil
 	}
 	updated, current, beforeContent, afterContent, err := mergeDaemonMirrorsFile(cfg.Docker.DaemonMirrors.DaemonJSON, cfg.Docker.DaemonMirrors.RegistryMirrors)
 	if err != nil {
@@ -190,6 +247,69 @@ func RestoreDaemonMirrors(cfg config.Config, backup string, yes bool) (DaemonMir
 	return summary, nil
 }
 
+func PlanRestoreDaemonMirrors(cfg config.Config, backup string) (DaemonMirrorSummary, error) {
+	summary := baseDaemonMirrorSummary("manual_restore", cfg.Docker.DaemonMirrors)
+	backup = strings.TrimSpace(backup)
+	if backup == "" {
+		err := fmt.Errorf("docker mirror restore requires --backup")
+		summary.OK = false
+		summary.Error = err.Error()
+		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+		return summary, err
+	}
+	before, err := os.ReadFile(cfg.Docker.DaemonMirrors.DaemonJSON)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			summary.Warnings = append(summary.Warnings, "无法读取当前 daemon.json: "+err.Error())
+		}
+		before = nil
+	}
+	restoreContent, err := os.ReadFile(backup)
+	if err != nil {
+		summary.OK = false
+		summary.Error = err.Error()
+		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+		return summary, err
+	}
+	data, err := decodeDaemonJSON(restoreContent)
+	if err != nil {
+		summary.OK = false
+		summary.Error = err.Error()
+		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+		return summary, err
+	}
+	path, err := writeManualDaemonJSON(DaemonMirrorManualRestorePath(cfg.ScanPath), restoreContent)
+	if err != nil {
+		summary.OK = false
+		summary.Error = err.Error()
+		_ = writeDaemonMirrorSummary(cfg.ScanPath, summary)
+		return summary, err
+	}
+	summary.OK = true
+	summary.BackupPath = backup
+	summary.ManualApplyPath = path
+	summary.ManualApplyCommand = manualInstallCommand(path, cfg.Docker.DaemonMirrors.DaemonJSON)
+	summary.BeforeSHA256 = sha256Hex(before)
+	summary.AfterSHA256 = sha256Hex(restoreContent)
+	if len(before) > 0 {
+		currentData, err := decodeDaemonJSON(before)
+		if err != nil {
+			summary.Warnings = append(summary.Warnings, "无法解析当前 daemon.json: "+err.Error())
+		} else {
+			summary.CurrentRegistryMirrors = stringSlice(currentData["registry-mirrors"])
+		}
+	}
+	summary.DesiredRegistryMirrors = stringSlice(data["registry-mirrors"])
+	summary.Diff = diffMirrors(summary.CurrentRegistryMirrors, summary.DesiredRegistryMirrors)
+	summary.Changed = string(before) != string(restoreContent)
+	summary.RestartRequired = summary.Changed
+	summary.Warnings = append(summary.Warnings, "已生成手动恢复文件，未直接写入 Docker daemon.json")
+	if err := writeDaemonMirrorSummary(cfg.ScanPath, summary); err != nil {
+		return summary, err
+	}
+	return summary, nil
+}
+
 func baseDaemonMirrorSummary(operation string, cfg config.DockerDaemonMirrorsConfig) DaemonMirrorSummary {
 	return DaemonMirrorSummary{
 		Operation:              operation,
@@ -268,6 +388,17 @@ func backupDaemonJSON(dir, daemonPath string, content []byte) (string, error) {
 	name := fmt.Sprintf("daemon-%s-%s.json", time.Now().UTC().Format("20060102T150405Z"), sha256Hex(content)[:8])
 	target := filepath.Join(dir, name)
 	return target, os.WriteFile(target, content, 0o644)
+}
+
+func writeManualDaemonJSON(path string, content []byte) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, content, 0o644)
+}
+
+func manualInstallCommand(source, target string) string {
+	return "sudo install -m 0644 " + shellQuote(source) + " " + shellQuote(target) + " && sudo systemctl restart docker"
 }
 
 func diffMirrors(current, desired []string) DaemonMirrorDiff {

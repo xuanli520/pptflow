@@ -134,6 +134,7 @@ func TestDaemonMirrorsApplyRestoreAndInvalidJSON(t *testing.T) {
 	cfg.Docker.DaemonMirrors.DaemonJSON = daemonPath
 	cfg.Docker.DaemonMirrors.BackupDir = backupDir
 	cfg.Docker.DaemonMirrors.RegistryMirrors = []string{"https://mirror.example"}
+	cfg.Docker.DaemonMirrors.Enabled = true
 	cfg.Docker.DaemonMirrors.RequireManualApply = true
 
 	if _, err := dockermgr.ApplyDaemonMirrors(cfg, false); err == nil {
@@ -176,6 +177,53 @@ func TestDaemonMirrorsApplyRestoreAndInvalidJSON(t *testing.T) {
 	}
 	if string(afterInvalid) != `{"registry-mirrors":` {
 		t.Fatalf("invalid daemon JSON should not be overwritten: %s", afterInvalid)
+	}
+}
+
+func TestDaemonMirrorsPlanWritesManualApplyFileWithoutDaemonWrite(t *testing.T) {
+	root := t.TempDir()
+	daemonPath := filepath.Join(root, "daemon.json")
+	backupDir := filepath.Join(root, "backups")
+	scanPath := filepath.Join(root, "scan")
+	original := `{"debug":true,"registry-mirrors":["https://old.example"]}`
+	if err := os.WriteFile(daemonPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ScanPath = scanPath
+	cfg.Docker.DaemonMirrors.DaemonJSON = daemonPath
+	cfg.Docker.DaemonMirrors.BackupDir = backupDir
+	cfg.Docker.DaemonMirrors.RegistryMirrors = []string{"https://mirror.example"}
+	cfg.Docker.DaemonMirrors.Enabled = true
+	cfg.Docker.DaemonMirrors.RequireManualApply = true
+
+	planned, err := dockermgr.PlanDaemonMirrors(cfg)
+	if err != nil {
+		t.Fatalf("plan failed: %v", err)
+	}
+	if !planned.OK || planned.ManualApplyPath == "" || planned.ManualApplyCommand == "" || !planned.RestartRequired {
+		t.Fatalf("unexpected manual apply summary: %#v", planned)
+	}
+	current, err := os.ReadFile(daemonPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current) != original {
+		t.Fatalf("manual plan should not write daemon.json:\n%s", current)
+	}
+	proposed, err := os.ReadFile(planned.ManualApplyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(proposed), "https://mirror.example") || !strings.Contains(string(proposed), `"debug": true`) {
+		t.Fatalf("manual apply file should preserve fields and include desired mirror:\n%s", proposed)
+	}
+	summary, err := os.ReadFile(dockermgr.DaemonMirrorSummaryPath(scanPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(summary), `"operation": "manual_apply"`) || !strings.Contains(string(summary), `"manual_apply_path"`) {
+		t.Fatalf("summary should record manual apply plan:\n%s", summary)
 	}
 }
 

@@ -27,7 +27,10 @@ const (
 	dockerMirrorFocusMirrors
 	dockerMirrorFocusManualApply
 	dockerMirrorFocusActions
+	dockerMirrorFocusCount
 )
+
+const dockerMirrorActionCount = 4
 
 type dockerMirrorPanel struct {
 	focus       dockerMirrorFocus
@@ -98,6 +101,30 @@ func (p *dockerMirrorPanel) saveInputToFocus() {
 	}
 }
 
+func (p *dockerMirrorPanel) moveFocus(delta int) {
+	p.saveInputToFocus()
+	if p.focus == dockerMirrorFocusActions {
+		nextAction := p.actionIndex + delta
+		if nextAction >= 0 && nextAction < dockerMirrorActionCount {
+			p.actionIndex = nextAction
+			return
+		}
+	}
+	next := (int(p.focus) + delta) % int(dockerMirrorFocusCount)
+	if next < 0 {
+		next += int(dockerMirrorFocusCount)
+	}
+	p.focus = dockerMirrorFocus(next)
+	if p.focus == dockerMirrorFocusActions {
+		if delta < 0 {
+			p.actionIndex = dockerMirrorActionCount - 1
+		} else if p.actionIndex >= dockerMirrorActionCount {
+			p.actionIndex = 0
+		}
+	}
+	p.syncInputFromFocus()
+}
+
 func (p *dockerMirrorPanel) refreshBackups() {
 	entries, err := os.ReadDir(strings.TrimSpace(p.values.BackupDir))
 	if err != nil {
@@ -129,6 +156,36 @@ func (p dockerMirrorPanel) selectedBackup() string {
 	return p.backups[max(0, min(p.backupIndex, len(p.backups)-1))]
 }
 
+func (m app) requestDockerMirrorApply(cmds []tea.Cmd) (app, []tea.Cmd) {
+	m.dockerMirror.saveInputToFocus()
+	if !m.dockerMirror.values.Enabled {
+		m.message = "请先启用 Docker 镜像源"
+		return m, cmds
+	}
+	if m.dockerMirror.values.RequireManualApply {
+		m.message = "正在生成 Docker 镜像源手动应用文件..."
+		return m, append(cmds, dockerMirrorApplyCmd(m.cfg, m.dockerMirror.values))
+	}
+	m.dockerMirror.confirm = "apply"
+	return m, cmds
+}
+
+func (m app) requestDockerMirrorRestore(cmds []tea.Cmd) (app, []tea.Cmd) {
+	m.dockerMirror.saveInputToFocus()
+	m.dockerMirror.refreshBackups()
+	m.dockerMirror.backup = m.dockerMirror.selectedBackup()
+	if m.dockerMirror.backup == "" {
+		m.message = "没有可恢复的 Docker 备份"
+		return m, cmds
+	}
+	if m.dockerMirror.values.RequireManualApply {
+		m.message = "正在生成 Docker 配置手动恢复文件..."
+		return m, append(cmds, dockerMirrorRestoreCmd(m.cfg, m.dockerMirror.values, m.dockerMirror.backup))
+	}
+	m.dockerMirror.confirm = "restore"
+	return m, cmds
+}
+
 func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	key := msg.String()
 	var cmds []tea.Cmd
@@ -138,22 +195,22 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			action := m.dockerMirror.confirm
 			m.dockerMirror.confirm = ""
 			if action == "apply" {
-				m.message = "正在写入 Docker daemon mirror 配置..."
+				m.message = "正在写入 Docker 守护进程镜像源配置..."
 				return m, append(cmds, dockerMirrorApplyCmd(m.cfg, m.dockerMirror.values))
 			}
 			if action == "restore" {
-				m.message = "正在恢复 Docker daemon 配置..."
+				m.message = "正在恢复 Docker 守护进程配置..."
 				return m, append(cmds, dockerMirrorRestoreCmd(m.cfg, m.dockerMirror.values, m.dockerMirror.selectedBackup()))
 			}
 		case "n", "N", "esc":
 			m.dockerMirror.confirm = ""
-			m.message = "已取消 Docker mirror 操作"
+			m.message = "已取消 Docker 镜像源操作"
 		}
 		return m, cmds
 	}
 	if m.dockerMirror.focus == dockerMirrorFocusDaemonJSON || m.dockerMirror.focus == dockerMirrorFocusBackupDir || m.dockerMirror.focus == dockerMirrorFocusMirrors {
 		switch key {
-		case "tab", "shift+tab", "enter", "esc", "ctrl+s":
+		case "tab", "shift+tab", "enter", "esc", "ctrl+s", "up", "down", "pgup", "pgdown":
 		default:
 			var cmd tea.Cmd
 			m.dockerMirror.input, cmd = m.dockerMirror.input.Update(msg)
@@ -162,13 +219,9 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	}
 	switch key {
 	case "tab":
-		m.dockerMirror.saveInputToFocus()
-		m.dockerMirror.focus = (m.dockerMirror.focus + 1) % 6
-		m.dockerMirror.syncInputFromFocus()
+		m.dockerMirror.moveFocus(1)
 	case "shift+tab":
-		m.dockerMirror.saveInputToFocus()
-		m.dockerMirror.focus = (m.dockerMirror.focus + 5) % 6
-		m.dockerMirror.syncInputFromFocus()
+		m.dockerMirror.moveFocus(-1)
 	case " ":
 		switch m.dockerMirror.focus {
 		case dockerMirrorFocusEnabled:
@@ -182,7 +235,7 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		}
 	case "right":
 		if m.dockerMirror.focus == dockerMirrorFocusActions {
-			m.dockerMirror.actionIndex = min(3, m.dockerMirror.actionIndex+1)
+			m.dockerMirror.actionIndex = min(dockerMirrorActionCount-1, m.dockerMirror.actionIndex+1)
 		}
 	case "up":
 		if m.dockerMirror.focus == dockerMirrorFocusActions && m.dockerMirror.actionIndex == 3 {
@@ -192,25 +245,29 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		if m.dockerMirror.focus == dockerMirrorFocusActions && m.dockerMirror.actionIndex == 3 && len(m.dockerMirror.backups) > 0 {
 			m.dockerMirror.backupIndex = min(len(m.dockerMirror.backups)-1, m.dockerMirror.backupIndex+1)
 		}
+	case "pgup":
+		if m.dockerMirror.focus == dockerMirrorFocusActions && m.dockerMirror.actionIndex == 3 {
+			m.dockerMirror.backupIndex = max(0, m.dockerMirror.backupIndex-1)
+		}
+	case "pgdown":
+		if m.dockerMirror.focus == dockerMirrorFocusActions && m.dockerMirror.actionIndex == 3 && len(m.dockerMirror.backups) > 0 {
+			m.dockerMirror.backupIndex = min(len(m.dockerMirror.backups)-1, m.dockerMirror.backupIndex+1)
+		}
 	case "ctrl+s", "s":
 		m.dockerMirror.saveInputToFocus()
 		if err := config.SaveProjectDaemonMirrors(m.cfg.ProjectConfigPath, m.dockerMirror.values); err != nil {
-			m.message = "保存 Docker mirror 配置失败: " + err.Error()
+			m.message = "保存 Docker 镜像源配置失败: " + err.Error()
 		} else {
-			m.message = "已保存 Docker mirror 配置到 " + m.cfg.ProjectConfigPath
+			m.message = "已保存 Docker 镜像源配置到 " + m.cfg.ProjectConfigPath
 			m.cfg.Docker.DaemonMirrors = m.dockerMirror.values
 		}
 	case "r":
 		m.dockerMirror.saveInputToFocus()
 		return m, append(cmds, dockerMirrorStatusCmd(m.cfg, m.dockerMirror.values))
 	case "a":
-		m.dockerMirror.saveInputToFocus()
-		m.dockerMirror.confirm = "apply"
+		return m.requestDockerMirrorApply(cmds)
 	case "b":
-		m.dockerMirror.saveInputToFocus()
-		m.dockerMirror.refreshBackups()
-		m.dockerMirror.backup = m.dockerMirror.selectedBackup()
-		m.dockerMirror.confirm = "restore"
+		return m.requestDockerMirrorRestore(cmds)
 	case "enter":
 		if m.dockerMirror.focus == dockerMirrorFocusActions {
 			switch m.dockerMirror.actionIndex {
@@ -218,17 +275,15 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 				return m, append(cmds, dockerMirrorStatusCmd(m.cfg, m.dockerMirror.values))
 			case 1:
 				if err := config.SaveProjectDaemonMirrors(m.cfg.ProjectConfigPath, m.dockerMirror.values); err != nil {
-					m.message = "保存 Docker mirror 配置失败: " + err.Error()
+					m.message = "保存 Docker 镜像源配置失败: " + err.Error()
 				} else {
-					m.message = "已保存 Docker mirror 配置到 " + m.cfg.ProjectConfigPath
+					m.message = "已保存 Docker 镜像源配置到 " + m.cfg.ProjectConfigPath
 					m.cfg.Docker.DaemonMirrors = m.dockerMirror.values
 				}
 			case 2:
-				m.dockerMirror.confirm = "apply"
+				return m.requestDockerMirrorApply(cmds)
 			case 3:
-				m.dockerMirror.refreshBackups()
-				m.dockerMirror.backup = m.dockerMirror.selectedBackup()
-				m.dockerMirror.confirm = "restore"
+				return m.requestDockerMirrorRestore(cmds)
 			}
 		}
 	case "esc":
@@ -247,16 +302,28 @@ func dockerMirrorStatusCmd(cfg config.Config, values config.DockerDaemonMirrorsC
 func dockerMirrorApplyCmd(cfg config.Config, values config.DockerDaemonMirrorsConfig) tea.Cmd {
 	cfg.Docker.DaemonMirrors = values
 	return func() tea.Msg {
-		summary, err := dockermgr.ApplyDaemonMirrors(cfg, true)
-		return dockerMirrorMsg{operation: "apply", summary: summary, err: err}
+		var summary dockermgr.DaemonMirrorSummary
+		var err error
+		if values.RequireManualApply {
+			summary, err = dockermgr.PlanDaemonMirrors(cfg)
+		} else {
+			summary, err = dockermgr.ApplyDaemonMirrors(cfg, true)
+		}
+		return dockerMirrorMsg{operation: summary.Operation, summary: summary, err: err}
 	}
 }
 
 func dockerMirrorRestoreCmd(cfg config.Config, values config.DockerDaemonMirrorsConfig, backup string) tea.Cmd {
 	cfg.Docker.DaemonMirrors = values
 	return func() tea.Msg {
-		summary, err := dockermgr.RestoreDaemonMirrors(cfg, backup, true)
-		return dockerMirrorMsg{operation: "restore", summary: summary, err: err}
+		var summary dockermgr.DaemonMirrorSummary
+		var err error
+		if values.RequireManualApply {
+			summary, err = dockermgr.PlanRestoreDaemonMirrors(cfg, backup)
+		} else {
+			summary, err = dockermgr.RestoreDaemonMirrors(cfg, backup, true)
+		}
+		return dockerMirrorMsg{operation: summary.Operation, summary: summary, err: err}
 	}
 }
 
@@ -271,82 +338,153 @@ func dockerStartupGCCmd(cfg config.Config, activeJobs int) tea.Cmd {
 
 func renderDockerSettings(m app) string {
 	p := m.dockerMirror
-	focusMark := func(f dockerMirrorFocus) string {
-		if p.focus == f {
-			return "> "
-		}
-		return "  "
-	}
-	checked := func(value bool) string {
-		if value {
-			return "[x]"
-		}
-		return "[ ]"
-	}
 	lines := []string{
-		"Docker",
+		titleStyle.Render("Docker 镜像源"),
 		"",
-		"Desired config",
-		focusMark(dockerMirrorFocusEnabled) + "Enabled: " + checked(p.values.Enabled),
-		focusMark(dockerMirrorFocusDaemonJSON) + "daemon.json: " + dockerMirrorField(p, dockerMirrorFocusDaemonJSON, p.values.DaemonJSON),
-		focusMark(dockerMirrorFocusBackupDir) + "backup dir: " + dockerMirrorField(p, dockerMirrorFocusBackupDir, p.values.BackupDir),
-		focusMark(dockerMirrorFocusMirrors) + "mirrors: " + dockerMirrorField(p, dockerMirrorFocusMirrors, strings.Join(p.values.RegistryMirrors, ", ")),
-		focusMark(dockerMirrorFocusManualApply) + "Require manual apply: " + checked(p.values.RequireManualApply),
-		"  backups: " + dockerMirrorBackupLine(p),
+		dockerMirrorSection("目标配置"),
+		dockerMirrorSettingRow(p, dockerMirrorFocusEnabled, "启用", dockerMirrorSwitchValue(p.values.Enabled)),
+		dockerMirrorSettingRow(p, dockerMirrorFocusDaemonJSON, "daemon.json 路径", dockerMirrorField(p, dockerMirrorFocusDaemonJSON, p.values.DaemonJSON)),
+		dockerMirrorSettingRow(p, dockerMirrorFocusBackupDir, "备份目录", dockerMirrorField(p, dockerMirrorFocusBackupDir, p.values.BackupDir)),
+		dockerMirrorSettingRow(p, dockerMirrorFocusMirrors, "镜像源", dockerMirrorField(p, dockerMirrorFocusMirrors, dockerMirrorListValue(p.values.RegistryMirrors))),
+		dockerMirrorSettingRow(p, dockerMirrorFocusManualApply, "需要手动应用", dockerMirrorSwitchValue(p.values.RequireManualApply)),
+		dockerMirrorReadonlyRow("备份", dockerMirrorBackupLine(p)),
 		"",
-		"Current daemon",
-		"  daemon.json: " + p.values.DaemonJSON,
-		"  status: " + dockerMirrorStatusLine(p.status),
-		"  current mirrors: " + strings.Join(p.status.CurrentRegistryMirrors, ", "),
-		"  desired mirrors: " + strings.Join(p.values.RegistryMirrors, ", "),
-		"",
-		"Actions",
-		"  " + renderDockerMirrorActions(p),
+		dockerMirrorReadonlySection("当前 Docker 守护进程（只读）"),
+		dockerMirrorReadonlyRow("daemon.json 路径", p.values.DaemonJSON),
+		dockerMirrorReadonlyRow("状态", dockerMirrorStatusLine(p.status)),
+		dockerMirrorReadonlyRow("当前镜像源", dockerMirrorListValue(p.status.CurrentRegistryMirrors)),
+		dockerMirrorReadonlyRow("目标镜像源", dockerMirrorListValue(p.values.RegistryMirrors)),
 	}
+	if p.status.ManualApplyPath != "" {
+		lines = append(lines, dockerMirrorReadonlyRow("手动应用文件", p.status.ManualApplyPath))
+	}
+	if p.status.ManualApplyCommand != "" {
+		lines = append(lines, dockerMirrorReadonlyRow("手动命令", p.status.ManualApplyCommand))
+	}
+	lines = append(lines,
+		"",
+		dockerMirrorSection("操作"),
+		renderDockerMirrorActions(p),
+	)
 	if p.confirm != "" {
-		lines = append(lines, "", "Confirm "+p.confirm+": daemon="+p.values.DaemonJSON+" backup="+p.selectedBackup(), "backup dir="+p.values.BackupDir, "Docker restart required after daemon changes. y/Enter confirm, n/Esc cancel")
+		lines = append(lines,
+			"",
+			activeStyle.Render("确认"+dockerMirrorOperationName(p.confirm)),
+			dockerMirrorReadonlyRow("daemon.json 路径", p.values.DaemonJSON),
+			dockerMirrorReadonlyRow("备份文件", p.selectedBackup()),
+			dockerMirrorReadonlyRow("备份目录", p.values.BackupDir),
+			"Docker 守护进程配置变更后需要重启。y/回车确认，n/Esc取消",
+		)
 	}
 	if p.status.Error != "" {
-		lines = append(lines, "", "Error: "+p.status.Error)
+		lines = append(lines, "", errorStyle.Render("错误: "+p.status.Error))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func dockerMirrorBackupLine(p dockerMirrorPanel) string {
 	if len(p.backups) == 0 {
-		return "none"
+		return "无可用备份"
 	}
-	return fmt.Sprintf("%d found, selected %s", len(p.backups), p.backups[max(0, min(p.backupIndex, len(p.backups)-1))])
+	return fmt.Sprintf("%d 个，可恢复 %s", len(p.backups), p.backups[max(0, min(p.backupIndex, len(p.backups)-1))])
 }
 
 func dockerMirrorField(p dockerMirrorPanel, focus dockerMirrorFocus, fallback string) string {
 	if p.focus == focus {
 		return p.input.View()
 	}
-	return fallback
+	return dockerMirrorEmpty(fallback)
+}
+
+func dockerMirrorSection(title string) string {
+	return activeStyle.Render(title)
+}
+
+func dockerMirrorReadonlySection(title string) string {
+	return mutedStyle.Render(title)
+}
+
+func dockerMirrorSettingRow(p dockerMirrorPanel, focus dockerMirrorFocus, label string, value string) string {
+	line := label + ": " + value
+	if p.focus == focus {
+		return selectedStyle.Render("> " + line)
+	}
+	return "  " + mutedStyle.Render(label+": ") + value
+}
+
+func dockerMirrorReadonlyRow(label string, value string) string {
+	return "  " + mutedStyle.Render(label+": ") + dockerMirrorEmpty(value)
+}
+
+func dockerMirrorSwitchValue(value bool) string {
+	if value {
+		return "[x] 是"
+	}
+	return "[ ] 否"
+}
+
+func dockerMirrorListValue(values []string) string {
+	if len(values) == 0 {
+		return "无"
+	}
+	return strings.Join(values, "，")
+}
+
+func dockerMirrorEmpty(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "未设置"
+	}
+	return value
 }
 
 func renderDockerMirrorActions(p dockerMirrorPanel) string {
-	actions := []string{"Refresh Status", "Save Config", "Apply to daemon", "Restore Backup"}
+	actions := dockerMirrorActionLabels(p)
 	for index, action := range actions {
+		action = "[" + action + "]"
 		if p.focus == dockerMirrorFocusActions && p.actionIndex == index {
-			actions[index] = selectedStyle.Render(action)
+			actions[index] = selectedStyle.Render("> " + action)
+			continue
 		}
+		actions[index] = "  " + action
 	}
 	return strings.Join(actions, "  ")
 }
 
+func dockerMirrorActionLabels(p dockerMirrorPanel) []string {
+	if p.values.RequireManualApply {
+		return []string{"刷新状态", "保存配置", "生成手动应用文件", "生成恢复文件"}
+	}
+	return []string{"刷新状态", "保存配置", "应用到守护进程", "恢复备份"}
+}
+
 func dockerMirrorStatusLine(summary dockermgr.DaemonMirrorSummary) string {
 	if summary.DaemonJSON == "" {
-		return "not loaded"
+		return "未加载"
 	}
 	if !summary.OK {
-		return "error"
+		return "错误"
 	}
 	if summary.Changed {
-		return "drift"
+		return "不一致"
 	}
-	return "consistent"
+	return "一致"
+}
+
+func dockerMirrorOperationName(operation string) string {
+	switch operation {
+	case "status":
+		return "刷新状态"
+	case "manual_apply":
+		return "生成手动应用文件"
+	case "apply":
+		return "应用"
+	case "manual_restore":
+		return "生成恢复文件"
+	case "restore":
+		return "恢复"
+	default:
+		return operation
+	}
 }
 
 func (m *app) handleDockerMirrorMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
@@ -354,16 +492,18 @@ func (m *app) handleDockerMirrorMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 	case dockerMirrorMsg:
 		m.dockerMirror.status = value.summary
 		if value.err != nil {
-			m.message = fmt.Sprintf("Docker mirror %s 失败: %s", value.operation, value.err)
+			m.message = fmt.Sprintf("Docker 镜像源%s失败: %s", dockerMirrorOperationName(value.operation), value.err)
+		} else if value.summary.ManualApplyPath != "" {
+			m.message = fmt.Sprintf("Docker 镜像源%s完成: %s", dockerMirrorOperationName(value.operation), value.summary.ManualApplyPath)
 		} else {
-			m.message = fmt.Sprintf("Docker mirror %s 完成", value.operation)
+			m.message = fmt.Sprintf("Docker 镜像源%s完成", dockerMirrorOperationName(value.operation))
 		}
 		return true
 	case dockerGCMsg:
 		if value.err != nil {
-			m.message = "Docker GC 失败: " + value.err.Error()
+			m.message = "Docker 清理失败: " + value.err.Error()
 		} else if value.summary.Skipped {
-			m.message = "Docker GC 已跳过: " + value.summary.SkipReason
+			m.message = "Docker 清理已跳过: " + value.summary.SkipReason
 		}
 		return true
 	default:

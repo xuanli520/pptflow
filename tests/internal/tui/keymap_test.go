@@ -64,7 +64,7 @@ func TestSettingsTabKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T)
 		t.Fatalf("expected settings top-level tab, got %s", h.TabName())
 	}
 	view := h.View()
-	if !strings.Contains(view, "设置") || !strings.Contains(view, "> Docker") || !strings.Contains(view, "Desired config") || !strings.Contains(view, "backups: 1 found") {
+	if !strings.Contains(view, "设置") || !strings.Contains(view, "> Docker 镜像源") || !strings.Contains(view, "目标配置") || !strings.Contains(view, "备份") || !strings.Contains(view, "1 个") {
 		t.Fatalf("settings view should keep Docker as settings item:\n%s", view)
 	}
 
@@ -75,6 +75,49 @@ func TestSettingsTabKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T)
 	}
 	if !strings.Contains(string(content), "daemon_mirrors") || !strings.Contains(h.Message(), cfg.ProjectConfigPath) {
 		t.Fatalf("save should write project .p2r.yaml and report target, message=%q content=\n%s", h.Message(), content)
+	}
+}
+
+func TestSettingsTabMovesDockerSettingFocus(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+	h, _ = h.Press("tab")
+	h, _ = h.Press("tab")
+
+	view := h.View()
+	if !strings.Contains(view, "> 启用") {
+		t.Fatalf("settings should start on enabled field:\n%s", view)
+	}
+
+	h, _ = h.Press("tab")
+	view = h.View()
+	if !strings.Contains(view, "> daemon.json 路径") {
+		t.Fatalf("tab should move focus to daemon.json field:\n%s", view)
+	}
+
+	h, _ = h.Press("tab")
+	view = h.View()
+	if !strings.Contains(view, "> 备份目录") {
+		t.Fatalf("second tab should move focus to backup dir field:\n%s", view)
+	}
+
+	h, _ = h.Press("shift+tab")
+	view = h.View()
+	if !strings.Contains(view, "> daemon.json 路径") {
+		t.Fatalf("shift+tab should move focus back to daemon.json field:\n%s", view)
+	}
+}
+
+func TestSettingsCtrlArrowsSwitchTopLevelPanel(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+	h, _ = h.Press("tab")
+	h, _ = h.Press("tab")
+	if h.TabName() != "settings" {
+		t.Fatalf("expected settings tab before pressing tab, got %s", h.TabName())
+	}
+
+	h, _ = h.Press("ctrl+right")
+	if h.TabName() != "overview" {
+		t.Fatalf("ctrl+right in settings should switch top-level panel, got %s", h.TabName())
 	}
 }
 
