@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
 
@@ -96,13 +97,7 @@ func slotBar(running, maxParallel int) string {
 }
 
 func normalizedMaxParallel(value int) int {
-	if value <= 0 {
-		return 3
-	}
-	if value > 8 {
-		return 8
-	}
-	return value
+	return config.NormalizeMaxConcurrent(value)
 }
 
 func jobStateIcon(state scheduler.JobState) string {

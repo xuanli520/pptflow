@@ -40,8 +40,8 @@ docs:
 	if cfg.Pipeline.StageTimeouts["B"] != 9 {
 		t.Fatalf("expected B timeout 9, got %d", cfg.Pipeline.StageTimeouts["B"])
 	}
-	if cfg.Pipeline.MaxConcurrent != 3 {
-		t.Fatalf("expected default max concurrent 3, got %d", cfg.Pipeline.MaxConcurrent)
+	if cfg.Pipeline.MaxConcurrent != 10 {
+		t.Fatalf("expected default max concurrent 10, got %d", cfg.Pipeline.MaxConcurrent)
 	}
 	if cfg.TUI.RefreshIntervalMS != 250 {
 		t.Fatalf("expected TUI refresh 250, got %d", cfg.TUI.RefreshIntervalMS)
@@ -61,8 +61,8 @@ func TestLoadParsesAndNormalizesMaxConcurrent(t *testing.T) {
 		want int
 	}{
 		{"file value", "5", 5},
-		{"zero fallback", "0", 3},
-		{"cap large", "99", 8},
+		{"zero fallback", "0", 10},
+		{"cap large", "99", 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

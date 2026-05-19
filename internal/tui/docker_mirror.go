@@ -218,10 +218,10 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		}
 	}
 	switch key {
-	case "tab":
-		m.dockerMirror.moveFocus(1)
-	case "shift+tab":
+	case "up":
 		m.dockerMirror.moveFocus(-1)
+	case "down":
+		m.dockerMirror.moveFocus(1)
 	case " ":
 		switch m.dockerMirror.focus {
 		case dockerMirrorFocusEnabled:
@@ -236,14 +236,6 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	case "right":
 		if m.dockerMirror.focus == dockerMirrorFocusActions {
 			m.dockerMirror.actionIndex = min(dockerMirrorActionCount-1, m.dockerMirror.actionIndex+1)
-		}
-	case "up":
-		if m.dockerMirror.focus == dockerMirrorFocusActions && m.dockerMirror.actionIndex == 3 {
-			m.dockerMirror.backupIndex = max(0, m.dockerMirror.backupIndex-1)
-		}
-	case "down":
-		if m.dockerMirror.focus == dockerMirrorFocusActions && m.dockerMirror.actionIndex == 3 && len(m.dockerMirror.backups) > 0 {
-			m.dockerMirror.backupIndex = min(len(m.dockerMirror.backups)-1, m.dockerMirror.backupIndex+1)
 		}
 	case "pgup":
 		if m.dockerMirror.focus == dockerMirrorFocusActions && m.dockerMirror.actionIndex == 3 {
@@ -287,6 +279,7 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			}
 		}
 	case "esc":
+		m.dockerMirror.saveInputToFocus()
 		m.switchPanel(-1)
 	}
 	return m, cmds
@@ -418,7 +411,7 @@ func dockerMirrorReadonlyRow(label string, value string) string {
 
 func dockerMirrorSwitchValue(value bool) string {
 	if value {
-		return "[x] 是"
+		return "[✓] 是"
 	}
 	return "[ ] 否"
 }
@@ -447,7 +440,7 @@ func renderDockerMirrorActions(p dockerMirrorPanel) string {
 		}
 		actions[index] = "  " + action
 	}
-	return strings.Join(actions, "  ")
+	return strings.Join(actions, "\n")
 }
 
 func dockerMirrorActionLabels(p dockerMirrorPanel) []string {

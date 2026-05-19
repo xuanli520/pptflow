@@ -26,10 +26,17 @@ func (m app) handleSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	switch key {
 	case "ctrl+c", "ctrl+q":
 		return m, []tea.Cmd{tea.Batch(m.shutdownScheduler(), tea.Quit)}
-	case "ctrl+right":
+	}
+	if m.settings.selected == settingsItemDocker && m.dockerMirror.confirm != "" {
+		return m.handleDockerSettingsKey(msg)
+	}
+	switch key {
+	case "tab", "ctrl+right":
+		m.saveSettingsInput()
 		m.switchPanel(1)
 		return m, append(cmds, m.reloadDetail())
-	case "ctrl+left":
+	case "shift+tab", "ctrl+left":
+		m.saveSettingsInput()
 		m.switchPanel(-1)
 		return m, append(cmds, m.reloadDetail())
 	}
@@ -38,6 +45,13 @@ func (m app) handleSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		return m.handleDockerSettingsKey(msg)
 	default:
 		return m, cmds
+	}
+}
+
+func (m *app) saveSettingsInput() {
+	switch m.settings.selected {
+	case settingsItemDocker:
+		m.dockerMirror.saveInputToFocus()
 	}
 }
 
@@ -66,5 +80,5 @@ func settingsFooter(m app) string {
 	if m.settings.selected == settingsItemDocker && m.dockerMirror.confirm != "" {
 		return "y/回车 确认  n/Esc 取消"
 	}
-	return "Tab/Shift+Tab 字段和按钮  空格切换  ↑↓ 选择备份  回车执行  Ctrl←/→ 顶层页  Esc返回"
+	return "Tab/Shift+Tab 顶层页  ↑↓ 字段和按钮  Space 开关  Enter 执行  PgUp/PgDn 备份  Esc 返回"
 }

@@ -17,6 +17,9 @@ const (
 	EnvConfig   = "P2R_CONFIG"
 	EnvScanPath = "P2R_SCAN_PATH"
 	EnvDBPath   = "P2R_DB_PATH"
+
+	DefaultMaxConcurrent = 10
+	MaxConcurrentLimit   = 10
 )
 
 type Config struct {
@@ -235,7 +238,7 @@ func Default() Config {
 		Pipeline: PipelineConfig{
 			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 2700, "E": 2700, "F": 2700},
 			SelfTestReportPath: "repo/self_test_report.md",
-			MaxConcurrent:      3,
+			MaxConcurrent:      DefaultMaxConcurrent,
 		},
 		Docker: DockerConfig{
 			ManagedLabel:                "managed_by=p2rqa",
@@ -662,12 +665,17 @@ func applyRawDockerGC(cfg *DockerGCConfig, raw *rawDockerGCConfig) {
 }
 
 func normalize(cfg *Config) {
-	if cfg.Pipeline.MaxConcurrent <= 0 {
-		cfg.Pipeline.MaxConcurrent = 3
+	cfg.Pipeline.MaxConcurrent = NormalizeMaxConcurrent(cfg.Pipeline.MaxConcurrent)
+}
+
+func NormalizeMaxConcurrent(value int) int {
+	if value <= 0 {
+		return DefaultMaxConcurrent
 	}
-	if cfg.Pipeline.MaxConcurrent > 8 {
-		cfg.Pipeline.MaxConcurrent = 8
+	if value > MaxConcurrentLimit {
+		return MaxConcurrentLimit
 	}
+	return value
 }
 
 func Validate(cfg Config) error {

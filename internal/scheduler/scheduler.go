@@ -118,13 +118,7 @@ func WithRunnerFactory(factory RunnerFactory) Option {
 }
 
 func New(store *db.Store, cfg config.Config, opts ...Option) *Scheduler {
-	maxParallel := cfg.Pipeline.MaxConcurrent
-	if maxParallel <= 0 {
-		maxParallel = 3
-	}
-	if maxParallel > 8 {
-		maxParallel = 8
-	}
+	maxParallel := config.NormalizeMaxConcurrent(cfg.Pipeline.MaxConcurrent)
 	s := &Scheduler{
 		store:              store,
 		cfg:                cfg,

@@ -78,7 +78,7 @@ func TestSettingsTabKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T)
 	}
 }
 
-func TestSettingsTabMovesDockerSettingFocus(t *testing.T) {
+func TestSettingsArrowKeysMoveDockerSettingFocus(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
 	h, _ = h.Press("tab")
 	h, _ = h.Press("tab")
@@ -88,22 +88,45 @@ func TestSettingsTabMovesDockerSettingFocus(t *testing.T) {
 		t.Fatalf("settings should start on enabled field:\n%s", view)
 	}
 
-	h, _ = h.Press("tab")
+	h, _ = h.Press("down")
 	view = h.View()
-	if !strings.Contains(view, "> daemon.json 路径") {
-		t.Fatalf("tab should move focus to daemon.json field:\n%s", view)
+	if !strings.Contains(view, "> daemon.json 路径") || strings.Contains(view, "[x]") {
+		t.Fatalf("down should move focus to daemon.json field and use checkmark switches:\n%s", view)
 	}
 
-	h, _ = h.Press("tab")
+	h, _ = h.Press("down")
 	view = h.View()
 	if !strings.Contains(view, "> 备份目录") {
-		t.Fatalf("second tab should move focus to backup dir field:\n%s", view)
+		t.Fatalf("second down should move focus to backup dir field:\n%s", view)
 	}
 
-	h, _ = h.Press("shift+tab")
+	h, _ = h.Press("up")
 	view = h.View()
 	if !strings.Contains(view, "> daemon.json 路径") {
-		t.Fatalf("shift+tab should move focus back to daemon.json field:\n%s", view)
+		t.Fatalf("up should move focus back to daemon.json field:\n%s", view)
+	}
+}
+
+func TestSettingsTabLeavesSettingsPanel(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+	h, _ = h.Press("tab")
+	h, _ = h.Press("tab")
+	if h.TabName() != "settings" {
+		t.Fatalf("expected settings tab before pressing tab, got %s", h.TabName())
+	}
+	view := h.View()
+	if !strings.Contains(view, "Tab/Shift+Tab 顶层页") || strings.Contains(view, "Ctrl←/→") {
+		t.Fatalf("settings footer should present tab as the top-level switch:\n%s", view)
+	}
+
+	next, _ := h.Press("tab")
+	if next.TabName() != "overview" || next.FocusName() != "overview-table" {
+		t.Fatalf("tab in settings should switch to overview, tab=%s focus=%s", next.TabName(), next.FocusName())
+	}
+
+	next, _ = h.Press("shift+tab")
+	if next.TabName() != "execution" || next.FocusName() != "stage-list" {
+		t.Fatalf("shift+tab in settings should switch to execution, tab=%s focus=%s", next.TabName(), next.FocusName())
 	}
 }
 
