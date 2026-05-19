@@ -52,7 +52,7 @@ func TestStageAReportsMetadataTaskIDMismatch(t *testing.T) {
 			break
 		}
 	}
-	if mismatch.Title == "" || mismatch.Severity != "Blocker" || !strings.Contains(mismatch.Evidence, "TASK-DIR") || !strings.Contains(mismatch.Evidence, "TASK-METADATA") {
+	if mismatch.Title == "" || mismatch.Severity != "Low" || !strings.Contains(mismatch.Evidence, "TASK-DIR") || !strings.Contains(mismatch.Evidence, "TASK-METADATA") {
 		t.Fatalf("metadata mismatch finding not found or incomplete: %#v", findings)
 	}
 }

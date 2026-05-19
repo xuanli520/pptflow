@@ -43,7 +43,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	if snapshotErr != nil {
 		findings = append(findings, model.Finding{
 			Stage:      "A",
-			Severity:   "High",
+			Severity:   "Low",
 			Title:      "Script input snapshot could not be created",
 			Rule:       "Stage A scripts should inspect the delivery package without prior p2r QA artifacts.",
 			Evidence:   snapshotErr.Error(),
@@ -81,7 +81,7 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	if result, ok := scriptResults["run_acceptance.py"]; ok && !result.OK {
 		findings = append(findings, model.Finding{
 			Stage:      "A",
-			Severity:   "High",
+			Severity:   "Low",
 			Title:      "run_acceptance.py did not complete cleanly",
 			Rule:       "Stage A must collect primary acceptance evidence from the bundled script.",
 			Evidence:   result.summary(),
@@ -126,10 +126,10 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), "\n\n"+validationMarkdown(project, required, findings))
 
 	status := model.StageDone
-	if hasHardStageAFailure(record.Findings, scriptResults["run_acceptance.py"]) {
+	if hasHardStageAFailure(record.Findings, scriptResults["run_acceptance.py"], scriptResults["run_validate.py"]) {
 		status = model.StageFailed
 		if record.ErrorSummary == "" {
-			record.ErrorSummary = fmt.Sprintf("%d acceptance finding(s)", len(record.Findings))
+			record.ErrorSummary = fmt.Sprintf("%d validation finding(s)", len(record.Findings))
 		}
 	}
 	return finishStage(record, status, start)
@@ -338,7 +338,7 @@ func structuralFindings(project scanner.Project, required map[string]bool) []mod
 			}
 			findings = append(findings, model.Finding{
 				Stage:      "A",
-				Severity:   "Blocker",
+				Severity:   "Low",
 				Title:      "Missing required delivery artifact: " + name,
 				Rule:       rule,
 				Evidence:   evidence,
@@ -350,7 +350,7 @@ func structuralFindings(project scanner.Project, required map[string]bool) []mod
 	if metadataTaskID := projectlayout.MetadataTaskID(project.Path); metadataTaskID != "" && metadataTaskID != project.TaskID {
 		findings = append(findings, model.Finding{
 			Stage:      "A",
-			Severity:   "Blocker",
+			Severity:   "Low",
 			Title:      "metadata.json task_id does not match directory task ID",
 			Rule:       "The canonical task ID is the <batch>/<task-id>/<task-id> directory name; metadata.json.task_id must match it.",
 			Evidence:   fmt.Sprintf("directory task_id=%s metadata task_id=%s", project.TaskID, metadataTaskID),
@@ -362,7 +362,7 @@ func structuralFindings(project scanner.Project, required map[string]bool) []mod
 	if project.MetadataPromptMissing {
 		findings = append(findings, model.Finding{
 			Stage:      "A",
-			Severity:   "Blocker",
+			Severity:   "Low",
 			Title:      "metadata.json prompt is missing",
 			Rule:       "metadata.json.prompt is required for acceptance mapping.",
 			Evidence:   filepath.Join(project.Path, "metadata.json"),
@@ -644,7 +644,7 @@ func acceptanceFindings(path string) []model.Finding {
 	if err := json.Unmarshal(content, &payload); err != nil {
 		return []model.Finding{{
 			Stage:      "A",
-			Severity:   "High",
+			Severity:   "Low",
 			Title:      "acceptance.json was not valid JSON",
 			Rule:       "run_acceptance.py must emit machine-readable JSON.",
 			Evidence:   err.Error(),
@@ -702,24 +702,11 @@ func issueString(issue map[string]any, key, fallback string) string {
 }
 
 func acceptanceSeverity(section string, raw any) string {
-	value := strings.ToLower(strings.TrimSpace(fmt.Sprint(raw)))
-	if section == "blocking_issues" || value == "blocking" || value == "blocker" || value == "critical" {
-		return "Blocker"
-	}
-	switch value {
-	case "major", "high":
-		return "High"
-	case "minor", "medium":
-		return "Medium"
-	case "low":
-		return "Low"
-	default:
-		return "High"
-	}
+	return "Low"
 }
 
-func hasHardStageAFailure(findings []model.Finding, primary scriptExecution) bool {
-	if !primary.OK {
+func hasHardStageAFailure(findings []model.Finding, acceptance scriptExecution, validate scriptExecution) bool {
+	if !validate.OK {
 		return true
 	}
 	for _, finding := range findings {

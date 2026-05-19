@@ -208,6 +208,9 @@ func localizeSummary(summary string) string {
 		return "Codex 临时写入策略不受支持"
 	}
 	var count int
+	if _, err := fmt.Sscanf(trimmed, "%d validation finding(s)", &count); err == nil {
+		return fmt.Sprintf("%d 个验证发现", count)
+	}
 	if _, err := fmt.Sscanf(trimmed, "%d acceptance finding(s)", &count); err == nil {
 		return fmt.Sprintf("%d 个验收发现", count)
 	}

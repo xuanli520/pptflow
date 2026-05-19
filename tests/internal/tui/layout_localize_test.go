@@ -111,6 +111,7 @@ func TestLocalizationCoversCoreValues(t *testing.T) {
 		tuiapp.LocalizeStageNameForTest("F", ""):                        "标注员修复静态审查",
 		tuiapp.LocalizeCleanupStatusForTest("none"):                     "未生成",
 		tuiapp.LocalizeSummaryForTest("Not selected for this run."):     "本次未选择",
+		tuiapp.LocalizeSummaryForTest("3 validation finding(s)"):      "3 个验证发现",
 		tuiapp.LocalizeSummaryForTest("3 acceptance finding(s)"):        "3 个验收发现",
 	}
 	for got, want := range cases {
