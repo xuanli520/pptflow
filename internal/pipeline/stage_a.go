@@ -125,12 +125,9 @@ func (r Runner) stageA(ctx context.Context, run model.RunRecord, project scanner
 	record.Findings = append(record.Findings, findings...)
 	bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), "\n\n"+validationMarkdown(project, required, findings))
 
-	status := model.StageDone
-	if hasHardStageAFailure(record.Findings, scriptResults["run_acceptance.py"], scriptResults["run_validate.py"]) {
-		status = model.StageFailed
-		if record.ErrorSummary == "" {
-			record.ErrorSummary = fmt.Sprintf("%d validation finding(s)", len(record.Findings))
-		}
+	status := stageAStatus(scriptResults["run_validate.py"])
+	if status == model.StageFailed && record.ErrorSummary == "" {
+		record.ErrorSummary = stageAValidationErrorSummary(scriptResults["run_validate.py"])
 	}
 	return finishStage(record, status, start)
 }
@@ -720,16 +717,32 @@ func acceptanceSeverity(section string, raw any) string {
 	return "Low"
 }
 
-func hasHardStageAFailure(findings []model.Finding, acceptance scriptExecution, validate scriptExecution) bool {
-	if !validate.OK {
-		return true
+func stageAStatus(validate scriptExecution) string {
+	if validate.OK {
+		return model.StageDone
 	}
-	for _, finding := range findings {
-		if finding.Severity == "Blocker" {
-			return true
-		}
+	return model.StageFailed
+}
+
+func stageAValidationErrorSummary(validate scriptExecution) string {
+	if validate.Script == "" {
+		return "run_validate.py did not run"
 	}
-	return false
+	if validate.Timeout {
+		return "run_validate.py timed out"
+	}
+	if validate.ExitCode != 0 {
+		return fmt.Sprintf("run_validate.py exited with code %d", validate.ExitCode)
+	}
+	if text := strings.TrimSpace(validate.Error); text != "" {
+		return "run_validate.py failed: " + firstSummaryLine(text)
+	}
+	return "run_validate.py did not complete cleanly"
+}
+
+func firstSummaryLine(text string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	return strings.TrimSpace(line)
 }
 
 func promptLooksEnglish(metadataPath string) bool {

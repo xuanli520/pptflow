@@ -140,11 +140,72 @@ sys.exit(1)
 		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
 		scanner.Project{TaskID: "TASK-1", Path: root},
 	)
+	if record.Status != model.StageFailed || !strings.Contains(record.ErrorSummary, "run_validate.py exited with code 1") {
+		t.Fatalf("run_validate.py exit code should own Stage A status, got status=%s summary=%q record=%#v", record.Status, record.ErrorSummary, record)
+	}
 	if _, err := os.Stat(filepath.Join(artifactRoot, "validation_report.md")); !os.IsNotExist(err) {
 		t.Fatalf("validation report must not be kept from run_acceptance.py; stat err: %v; record=%#v", err, record)
 	}
 	if !hasFindingTitle(record.Findings, "run_validate.py did not emit validation_report.md") {
 		t.Fatalf("missing validation report finding not recorded: %#v", record.Findings)
+	}
+}
+
+func TestStageAStatusIgnoresAcceptanceBlockerWhenValidateSucceeds(t *testing.T) {
+	root := writeStageAPackage(t, "original_sessions", `{"task_id":"TASK-1","prompt":"build it"}`)
+	artifactRoot := filepath.Join(t.TempDir(), "run")
+	scanPath := t.TempDir()
+	writeStageAScript(t, scanPath, "run_acceptance.py", `import json, sys
+args=sys.argv
+json_path=args[args.index("--output-json")+1]
+md_path=args[args.index("--output-md")+1]
+open(json_path,"w").write(json.dumps({"blocking_issues":[{"issue_id":"acceptance-blocker","severity":"blocking"}],"non_blocking_issues":[]}))
+open(md_path,"w").write("# Acceptance\n")
+`)
+	writeStageAScript(t, scanPath, "run_validate.py", `import sys
+args=sys.argv
+md_path=args[args.index("--output-md")+1]
+open(md_path,"w").write("# Validation\n")
+`)
+
+	record := pipelinepkg.NewRunner(nil, configWithScanPath(scanPath)).StageAForTest(
+		context.Background(),
+		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: root},
+	)
+	if record.Status != model.StageDone {
+		t.Fatalf("Stage A status must follow run_validate.py exit 0, got status=%s summary=%q findings=%#v", record.Status, record.ErrorSummary, record.Findings)
+	}
+	if !hasFindingTitle(record.Findings, "acceptance-blocker") {
+		t.Fatalf("acceptance blocker should remain evidence without failing Stage A: %#v", record.Findings)
+	}
+}
+
+func TestStageAStatusIgnoresMissingValidationReportWhenValidateSucceeds(t *testing.T) {
+	root := writeStageAPackage(t, "original_sessions", `{"task_id":"TASK-1","prompt":"build it"}`)
+	artifactRoot := filepath.Join(t.TempDir(), "run")
+	scanPath := t.TempDir()
+	writeStageAScript(t, scanPath, "run_acceptance.py", `import json, sys
+args=sys.argv
+json_path=args[args.index("--output-json")+1]
+md_path=args[args.index("--output-md")+1]
+open(json_path,"w").write(json.dumps({"blocking_issues":[],"non_blocking_issues":[]}))
+open(md_path,"w").write("# Acceptance\n")
+`)
+	writeStageAScript(t, scanPath, "run_validate.py", `import sys
+sys.exit(0)
+`)
+
+	record := pipelinepkg.NewRunner(nil, configWithScanPath(scanPath)).StageAForTest(
+		context.Background(),
+		model.RunRecord{RunID: "run-1", TaskID: "TASK-1", ArtifactRoot: artifactRoot},
+		scanner.Project{TaskID: "TASK-1", Path: root},
+	)
+	if record.Status != model.StageDone {
+		t.Fatalf("Stage A status must follow run_validate.py exit 0 even without report, got status=%s summary=%q findings=%#v", record.Status, record.ErrorSummary, record.Findings)
+	}
+	if !hasFindingTitle(record.Findings, "run_validate.py did not emit validation_report.md") {
+		t.Fatalf("missing validation report should remain evidence without failing Stage A: %#v", record.Findings)
 	}
 }
 
