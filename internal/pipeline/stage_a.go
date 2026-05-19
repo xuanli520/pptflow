@@ -702,6 +702,20 @@ func issueString(issue map[string]any, key, fallback string) string {
 }
 
 func acceptanceSeverity(section string, raw any) string {
+	value := strings.ToLower(strings.TrimSpace(fmt.Sprint(raw)))
+	switch value {
+	case "blocker", "blocking", "critical", "fatal":
+		return "Blocker"
+	case "high", "major", "error":
+		return "High"
+	case "medium", "moderate", "warning":
+		return "Medium"
+	case "low", "minor", "info", "informational":
+		return "Low"
+	}
+	if section == "blocking_issues" {
+		return "Blocker"
+	}
 	return "Low"
 }
 

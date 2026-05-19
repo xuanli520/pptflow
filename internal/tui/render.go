@@ -32,13 +32,16 @@ func tableStyles() table.Styles {
 func renderHeader(m app) string {
 	overview := "[项目总览]"
 	execution := "[执行详情]"
+	settings := "[设置]"
 	if m.tab == panelOverview {
 		overview = activeStyle.Render(overview)
+	} else if m.tab == panelSettings {
+		settings = activeStyle.Render(settings)
 	} else {
 		execution = activeStyle.Render(execution)
 	}
 	mode := "模式: " + localizeMode(m.qaMode)
-	return titleStyle.Render("p2r QA 工作台") + "  " + overview + "  " + execution + "  " + mutedStyle.Render(mode)
+	return titleStyle.Render("p2r QA 工作台") + "  " + overview + "  " + execution + "  " + settings + "  " + mutedStyle.Render(mode)
 }
 
 func renderOverview(m app) string {

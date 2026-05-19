@@ -225,7 +225,9 @@ func (r Runner) codexContext(ctx context.Context, project scanner.Project, opts 
 func (r Runner) attachedDocsContext(taskID string) string {
 	limits := r.cfg.Docs
 	limits.StageInlineMaxBytes = 0
-	attached, err := taskdocs.BuildContext(r.cfg.ScanPath, taskID, limits)
+	attached, err := taskdocs.BuildContextFiltered(r.cfg.ScanPath, taskID, limits, func(doc taskdocs.Document) bool {
+		return !looksLikeSelfTest(doc.OriginalName)
+	})
 	if err != nil {
 		return "\nUploaded/attached docs manifest could not be read: " + err.Error() + "\n"
 	}

@@ -181,6 +181,10 @@ func Count(scanPath, taskID string) int {
 }
 
 func BuildContext(scanPath, taskID string, limits config.DocsConfig) (ContextResult, error) {
+	return BuildContextFiltered(scanPath, taskID, limits, nil)
+}
+
+func BuildContextFiltered(scanPath, taskID string, limits config.DocsConfig, includeText func(Document) bool) (ContextResult, error) {
 	manifest, err := ReadManifest(scanPath, taskID)
 	if err != nil {
 		return ContextResult{}, err
@@ -190,6 +194,10 @@ func BuildContext(scanPath, taskID string, limits config.DocsConfig) (ContextRes
 	var total int64
 	for _, doc := range manifest.Docs {
 		used = append(used, doc)
+		if includeText != nil && !includeText(doc) {
+			builder.WriteString(fmt.Sprintf("\nAttached doc %s (%s) not embedded: excluded for this stage\n", doc.OriginalName, doc.StoredName))
+			continue
+		}
 		if !doc.TextIncluded {
 			builder.WriteString(fmt.Sprintf("\nAttached doc %s (%s) not embedded: %s\n", doc.OriginalName, doc.StoredName, doc.SkipReason))
 			continue

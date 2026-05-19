@@ -1,6 +1,8 @@
 package tui_test
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -40,6 +42,39 @@ func TestModeKeyDoesNotStealSearchInput(t *testing.T) {
 	next, _ = next.Press("m")
 	if next.Mode() != "recheck" {
 		t.Fatalf("m outside input should toggle mode, got %s", next.Mode())
+	}
+}
+
+func TestSettingsTabKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T) {
+	cfg := config.Default()
+	root := t.TempDir()
+	cfg.ProjectConfigPath = filepath.Join(root, ".p2r.yaml")
+	cfg.Docker.DaemonMirrors.BackupDir = filepath.Join(root, "backups")
+	if err := os.MkdirAll(cfg.Docker.DaemonMirrors.BackupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.Docker.DaemonMirrors.BackupDir, "daemon-20260519T120000Z-abcd1234.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := tuiapp.NewTestHarness(cfg).SeedOverview("TASK-1").SetFocus("overview-table")
+	h, _ = h.Press("tab")
+	h, _ = h.Press("tab")
+
+	if h.TabName() != "settings" {
+		t.Fatalf("expected settings top-level tab, got %s", h.TabName())
+	}
+	view := h.View()
+	if !strings.Contains(view, "设置") || !strings.Contains(view, "> Docker") || !strings.Contains(view, "Desired config") || !strings.Contains(view, "backups: 1 found") {
+		t.Fatalf("settings view should keep Docker as settings item:\n%s", view)
+	}
+
+	h, _ = h.Press("s")
+	content, err := os.ReadFile(cfg.ProjectConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "daemon_mirrors") || !strings.Contains(h.Message(), cfg.ProjectConfigPath) {
+		t.Fatalf("save should write project .p2r.yaml and report target, message=%q content=\n%s", h.Message(), content)
 	}
 }
 

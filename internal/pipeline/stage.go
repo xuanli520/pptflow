@@ -71,7 +71,7 @@ func (s stageCAdapter) ID() string {
 }
 
 func (s stageCAdapter) Execute(ctx context.Context, sc StageContext) StageOutcome {
-	return StageOutcome{Record: s.runner.stageC(ctx, sc.Run, sc.Project, sc.Runtime, sc.Progress)}
+	return StageOutcome{Record: s.runner.stageC(ctx, sc.Run, sc.Project, sc.Runtime, sc.Prior, sc.Progress)}
 }
 
 func (r Runner) stageRegistry() map[string]Stage {

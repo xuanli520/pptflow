@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 )
@@ -33,7 +34,11 @@ func stageCEnvironment(evidence runtimeEvidence) stageCCommandEnv {
 		Service: service,
 	}
 	result.add("COMPOSE_PROJECT_NAME", evidence.ComposeProject)
-	result.add("COMPOSE_FILE", evidence.ComposeFile)
+	composeFileValue := evidence.ComposeFile
+	if len(evidence.ComposeFiles) > 0 {
+		composeFileValue = strings.Join(evidence.ComposeFiles, string(os.PathListSeparator))
+	}
+	result.add("COMPOSE_FILE", composeFileValue)
 	return result
 }
 

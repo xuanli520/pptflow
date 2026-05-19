@@ -31,6 +31,7 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newDocsCommand())
 	root.AddCommand(newStatusCommand())
 	root.AddCommand(newTUICommand())
+	root.AddCommand(newAdminCommand())
 	root.AddCommand(newVersionCommand())
 	return root
 }

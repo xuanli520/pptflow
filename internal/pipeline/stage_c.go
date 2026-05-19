@@ -12,7 +12,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
-func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner.Project, runtime RuntimeState, progress func(RunProgress)) model.StageRecord {
+func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner.Project, runtime RuntimeState, prior map[string]model.StageRecord, progress func(RunProgress)) model.StageRecord {
 	start := time.Now()
 	record := startStage("C")
 	logPath := filepath.Join(run.ArtifactRoot, "logs", "C_tests.log")
@@ -35,7 +35,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	script := filepath.Join(repoPath, "run_tests.sh")
 	if !fileExists(script) {
 		evidence := "Package spec violation: repo/run_tests.sh was not found. Stage C uses the host run_tests.sh entrypoint only."
-		recordRequiredEvidence(evidence, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		recordRequiredEvidence(evidence, stageCRuntimeSummary(false, evidence, runtime, prior, nil))
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
@@ -52,7 +52,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	}
 	if !runtime.HasServiceMappings() {
 		evidence := "Stage B runtime evidence is missing port mappings. Run Stage B successfully before Stage C."
-		recordRequiredEvidence(evidence, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		recordRequiredEvidence(evidence, stageCRuntimeSummary(false, evidence, runtime, prior, nil))
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
@@ -70,7 +70,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	bash := findHostBash(r.exec)
 	if bash == "" {
 		evidence := "bash executable not found on PATH. Stage C requires host bash to run repo/run_tests.sh."
-		recordRequiredEvidence(evidence, map[string]any{"ok": false, "reason": evidence, "mode": "host", "script": "repo/run_tests.sh"})
+		recordRequiredEvidence(evidence, stageCRuntimeSummary(false, evidence, runtime, prior, nil))
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
@@ -121,7 +121,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	}
 	record.ArtifactPaths = append([]string{logPath}, pages...)
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), map[string]any{"ok": result.Err == nil, "exit_code": result.ExitCode, "timeout": result.Timeout, "mode": "host", "script": "repo/run_tests.sh", "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "compose_project": runtime.ComposeProject})
+	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, map[string]any{"exit_code": result.ExitCode, "timeout": result.Timeout, "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping}))
 	if result.Err != nil {
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
@@ -138,6 +138,42 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		return finishStage(record, model.StageFailed, start)
 	}
 	return finishStage(record, model.StageDone, start)
+}
+
+func stageCRuntimeSummary(ok bool, reason string, runtime RuntimeState, prior map[string]model.StageRecord, extra map[string]any) map[string]any {
+	classification := stageCRuntimeEvidenceClassification(runtime, prior)
+	summary := map[string]any{
+		"ok":                              ok,
+		"reason":                          reason,
+		"mode":                            "host",
+		"script":                          "repo/run_tests.sh",
+		"compose_project":                 runtime.ComposeProject,
+		"compose_files":                   runtime.ComposeFiles,
+		"build_mirror_enabled":            runtime.Mirror.BuildMirrorEnabled,
+		"build_mirror_mode":               runtime.Mirror.BuildMirrorMode,
+		"build_mirror_fallback_used":      runtime.Mirror.BuildMirrorFallbackUsed,
+		"runtime_evidence_classification": classification,
+	}
+	if len(runtime.ComposeFiles) == 0 && runtime.ComposeFile != "" {
+		summary["compose_files"] = []string{runtime.ComposeFile}
+	}
+	for key, value := range extra {
+		summary[key] = value
+	}
+	return summary
+}
+
+func stageCRuntimeEvidenceClassification(runtime RuntimeState, prior map[string]model.StageRecord) string {
+	if stageB, ok := prior[string(model.StageB)]; ok && stageB.Status == model.StageFailed {
+		return "stage_b_failed"
+	}
+	if !runtime.HasCleanupTarget() {
+		return "missing_runtime_evidence"
+	}
+	if !runtime.HasServiceMappings() {
+		return "missing_port_mapping"
+	}
+	return "ok"
 }
 
 func findHostBash(exec CommandRunner) string {

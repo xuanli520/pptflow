@@ -6,6 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/p2r_tui/internal/maintenance"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
@@ -37,6 +39,11 @@ func newRunCommand() *cobra.Command {
 			cfg, err := loadConfig("")
 			if err != nil {
 				return err
+			}
+			if cfg.Docker.GC.RunBeforeCLIRun {
+				if _, err := maintenance.TryRunBeforeCLIRun(cmd.Context(), cfg, executor.New()); err != nil {
+					return err
+				}
 			}
 			store, err := openStore(cfg)
 			if err != nil {

@@ -63,6 +63,9 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			return m, cmds
 		}
 	}
+	if m.tab == panelSettings {
+		return m.handleSettingsKey(msg)
+	}
 
 	switch key {
 	case "ctrl+c", "ctrl+q":
@@ -204,13 +207,16 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 }
 
 func (m *app) switchPanel(delta int) {
-	m.tab = (m.tab + delta + 2) % 2
+	m.tab = (m.tab + delta + 3) % 3
 	if m.tab == panelOverview {
 		if m.selectedTaskID() == "" {
 			m.setFocus(focusSearch)
 			return
 		}
 		m.setFocus(focusOverviewTable)
+		return
+	}
+	if m.tab == panelSettings {
 		return
 	}
 	m.enterExecution()
@@ -238,6 +244,9 @@ func (m *app) handleEscape() {
 	case m.tab == panelExecution:
 		m.tab = panelOverview
 		m.setFocus(focusOverviewTable)
+	case m.tab == panelSettings:
+		m.tab = panelExecution
+		m.setFocus(focusStageList)
 	default:
 		m.setFocus(focusSearch)
 	}
@@ -298,6 +307,9 @@ func footerFor(m app) string {
 	}
 	if m.confirmCancelTaskID != "" {
 		return "y/Enter 确认终止  n/Esc 取消"
+	}
+	if m.tab == panelSettings {
+		return settingsFooter(m)
 	}
 	switch m.focus {
 	case focusSearch:

@@ -7,6 +7,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
+	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
@@ -30,10 +31,19 @@ type TestProbeResult struct {
 type TestRuntimeEvidence struct {
 	ComposeProject string                       `json:"compose_project"`
 	ComposeFile    string                       `json:"compose_file"`
+	ComposeFiles   []string                     `json:"compose_files"`
 	WorkDir        string                       `json:"work_dir"`
 	Services       []string                     `json:"services"`
 	Mappings       map[string][]TestPortMapping `json:"mappings"`
 	Probes         []TestProbeResult            `json:"probes"`
+	Mirror         TestRuntimeMirrorState       `json:"mirror,omitempty"`
+}
+
+type TestRuntimeMirrorState struct {
+	BuildMirrorEnabled      bool   `json:"build_mirror_enabled,omitempty"`
+	BuildMirrorMode         string `json:"build_mirror_mode,omitempty"`
+	BuildMirrorFallbackUsed bool   `json:"build_mirror_fallback_used,omitempty"`
+	BuildMirrorSummary      string `json:"build_mirror_summary,omitempty"`
 }
 
 type TestStageCCommandEnv struct {
@@ -243,10 +253,17 @@ func StageCEnvironmentForTest(evidence TestRuntimeEvidence) TestStageCCommandEnv
 	env := stageCEnvironment(runtimeEvidence{
 		ComposeProject: evidence.ComposeProject,
 		ComposeFile:    evidence.ComposeFile,
+		ComposeFiles:   append([]string{}, evidence.ComposeFiles...),
 		WorkDir:        evidence.WorkDir,
 		Services:       append([]string{}, evidence.Services...),
 		Mappings:       runtimePortMappingMap(evidence.Mappings),
 		Probes:         runtimeProbeResults(evidence.Probes),
+		Mirror: dockermgr.RuntimeMirrorState{
+			BuildMirrorEnabled:      evidence.Mirror.BuildMirrorEnabled,
+			BuildMirrorMode:         evidence.Mirror.BuildMirrorMode,
+			BuildMirrorFallbackUsed: evidence.Mirror.BuildMirrorFallbackUsed,
+			BuildMirrorSummary:      evidence.Mirror.BuildMirrorSummary,
+		},
 	})
 	return TestStageCCommandEnv{
 		Env:    append([]string{}, env.Env...),

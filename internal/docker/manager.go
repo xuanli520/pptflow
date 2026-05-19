@@ -34,6 +34,7 @@ func ComposeProjectName(prefix, taskID, runID string) string {
 type CleanupSummary struct {
 	Status         string   `json:"status"`
 	ComposeFile    string   `json:"compose_file,omitempty"`
+	ComposeFiles   []string `json:"compose_files,omitempty"`
 	ComposeProject string   `json:"compose_project,omitempty"`
 	WorkDir        string   `json:"work_dir,omitempty"`
 	Command        string   `json:"command,omitempty"`
@@ -47,12 +48,20 @@ type CleanupSummary struct {
 }
 
 func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig, composeFile, projectName, workDir string) CleanupSummary {
-	summary := CleanupSummary{Status: "not_applicable", ComposeFile: composeFile, ComposeProject: projectName, WorkDir: workDir}
+	return CleanupComposeProjectFiles(ctx, exec, cfg, composeFilesFromLegacy(composeFile, nil), projectName, workDir)
+}
+
+func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig, composeFiles []string, projectName, workDir string) CleanupSummary {
+	composeFiles = normalizeComposeFiles(composeFiles)
+	summary := CleanupSummary{Status: "not_applicable", ComposeFiles: composeFiles, ComposeProject: projectName, WorkDir: workDir}
+	if len(composeFiles) > 0 {
+		summary.ComposeFile = composeFiles[0]
+	}
 	if strings.TrimSpace(projectName) == "" {
 		summary.Warnings = append(summary.Warnings, "compose project is empty")
 		return summary
 	}
-	args := CleanupComposeArgs(cfg, composeFile, projectName)
+	args := CleanupComposeArgsFiles(cfg, composeFiles, projectName)
 	result := exec.Run(ctx, 2*time.Minute, workDir, nil, "docker", args...)
 	summary.Status = "ok"
 	summary.Command = result.Command
@@ -66,9 +75,7 @@ func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg
 		return summary
 	}
 	psArgs := []string{"compose"}
-	if strings.TrimSpace(composeFile) != "" {
-		psArgs = append(psArgs, "-f", composeFile)
-	}
+	psArgs = append(psArgs, ComposeFileArgs(composeFiles)...)
 	psArgs = append(psArgs, "-p", projectName, "ps", "-q")
 	verify := exec.Run(ctx, 30*time.Second, workDir, nil, "docker", psArgs...)
 	summary.Verification = strings.TrimSpace(verify.Stdout + "\n" + verify.Stderr)
@@ -90,10 +97,12 @@ func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg
 }
 
 func CleanupComposeArgs(cfg config.DockerConfig, composeFile, projectName string) []string {
+	return CleanupComposeArgsFiles(cfg, composeFilesFromLegacy(composeFile, nil), projectName)
+}
+
+func CleanupComposeArgsFiles(cfg config.DockerConfig, composeFiles []string, projectName string) []string {
 	args := []string{"compose"}
-	if strings.TrimSpace(composeFile) != "" {
-		args = append(args, "-f", composeFile)
-	}
+	args = append(args, ComposeFileArgs(normalizeComposeFiles(composeFiles))...)
 	args = append(args, "-p", projectName, "down")
 	if cfg.CleanupVolumes {
 		args = append(args, "-v")
@@ -103,6 +112,28 @@ func CleanupComposeArgs(cfg config.DockerConfig, composeFile, projectName string
 		args = append(args, "--rmi", "local")
 	}
 	return args
+}
+
+func normalizeComposeFiles(files []string) []string {
+	result := make([]string, 0, len(files))
+	seen := map[string]bool{}
+	for _, file := range files {
+		file = strings.TrimSpace(file)
+		if file == "" || seen[file] {
+			continue
+		}
+		seen[file] = true
+		result = append(result, file)
+	}
+	return result
+}
+
+func composeFilesFromLegacy(composeFile string, composeFiles []string) []string {
+	composeFiles = normalizeComposeFiles(composeFiles)
+	if len(composeFiles) == 0 && strings.TrimSpace(composeFile) != "" {
+		composeFiles = []string{strings.TrimSpace(composeFile)}
+	}
+	return composeFiles
 }
 
 func CommandLine(name string, args []string) string {

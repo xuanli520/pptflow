@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"path/filepath"
+
 	"github.com/xuanli520/p2r_tui/assets"
 	"github.com/xuanli520/p2r_tui/internal/displaytime"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
@@ -60,6 +62,21 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 			"cleanup_build_cache":     r.cfg.Docker.CleanupBuildCache,
 			"build_cache_prune_until": r.cfg.Docker.BuildCachePruneUntil,
 			"keep_runtime":            opts.KeepRuntime || r.cfg.Docker.KeepRuntime,
+		},
+		"docker_runtime": map[string]any{
+			"summary":     "docker_runtime_summary.json",
+			"pull_policy": r.cfg.Docker.PullPolicy,
+		},
+		"docker_mirror": map[string]any{
+			"summary":              "docker_mirror_summary.json",
+			"mode":                 r.cfg.Docker.BuildMirrors.Mode,
+			"enabled":              r.cfg.Docker.BuildMirrors.Enabled,
+			"fallback_to_original": r.cfg.Docker.BuildMirrors.FallbackToOriginal,
+		},
+		"docker_gc": map[string]any{
+			"summary":  filepath.Join(r.cfg.ScanPath, ".qa-control", "docker_gc_summary.json"),
+			"enabled":  r.cfg.Docker.GC.Enabled,
+			"p2r_only": r.cfg.Docker.GC.P2ROnly,
 		},
 	}
 	if releaseErr != nil {

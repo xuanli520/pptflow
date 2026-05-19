@@ -20,6 +20,7 @@ import (
 const (
 	panelOverview = iota
 	panelExecution
+	panelSettings
 
 	staleRunRecoveryInterval      = 30 * time.Second
 	persistedStateRefreshInterval = 2 * time.Second
@@ -31,8 +32,10 @@ type app struct {
 	scheduler          schedulerClient
 	recoverStaleRunsFn func(context.Context) error
 
-	overview OverviewModel
-	detail   viewport.Model
+	overview     OverviewModel
+	detail       viewport.Model
+	dockerMirror dockerMirrorPanel
+	settings     settingsPanel
 
 	tab   int
 	focus focusArea
@@ -144,6 +147,8 @@ func newApp(store *db.Store, cfg config.Config) app {
 		cfg:                    cfg,
 		overview:               newOverviewModel(),
 		detail:                 viewport.New(80, 10),
+		dockerMirror:           newDockerMirrorPanel(cfg),
+		settings:               newSettingsPanel(),
 		tab:                    panelOverview,
 		focus:                  focusSearch,
 		qaMode:                 "initial",
@@ -164,7 +169,11 @@ func newApp(store *db.Store, cfg config.Config) app {
 }
 
 func (m app) Init() tea.Cmd {
-	return tea.Batch(m.recoverStaleRunsCmd(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), m.tick())
+	activeJobs := 0
+	if m.scheduler != nil {
+		activeJobs = len(m.scheduler.ActiveSnapshot())
+	}
+	return tea.Batch(m.recoverStaleRunsCmd(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), dockerStartupGCCmd(m.cfg, activeJobs), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -183,6 +192,9 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 	if handled := m.handleRecoveryMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+	if handled := m.handleDockerMirrorMsg(msg, &cmds); handled {
 		return m, tea.Batch(cmds...)
 	}
 
@@ -483,6 +495,8 @@ func (m app) View() string {
 		builder.WriteString(renderRunConfig(m))
 	} else if m.tab == panelOverview {
 		builder.WriteString(renderOverview(m))
+	} else if m.tab == panelSettings {
+		builder.WriteString(renderSettings(m))
 	} else {
 		builder.WriteString(renderExecution(m))
 	}

@@ -56,6 +56,14 @@ type cleanupSummary struct {
 	ManualCommand string
 }
 
+type dockerRuntimeBlock struct {
+	RuntimePath      string
+	MirrorPath       string
+	GCPath           string
+	DaemonMirrorPath string
+	Text             string
+}
+
 type stageView struct {
 	model.StageRecord
 	DisplayName string
@@ -77,6 +85,7 @@ type executionViewModel struct {
 	CleanupPath           string
 	CleanupStatus         string
 	CleanupText           string
+	DockerRuntime         dockerRuntimeBlock
 	ArtifactRoot          string
 	SelfTestState         string
 	LogTailByStage        map[string]string
@@ -184,6 +193,7 @@ func buildExecutionViewModel(ctx context.Context, store executionStore, cfg conf
 	vm.CleanupPath = cleanup.Path
 	vm.CleanupStatus = cleanup.Status
 	vm.CleanupText = cleanup.Text
+	vm.DockerRuntime = readDockerRuntimeBlock(cfg, run.ArtifactRoot)
 
 	stages, _ := store.Stages(ctx, run.RunID)
 	vm.Stages = normalizeStageViews(stages)
@@ -469,6 +479,10 @@ func renderEvidenceSection(vm executionViewModel, stage stageView, width int) st
 	}
 	sections = append(sections, cleanup.String())
 
+	if strings.TrimSpace(vm.DockerRuntime.Text) != "" {
+		sections = append(sections, "Docker runtime:\n"+vm.DockerRuntime.Text)
+	}
+
 	if events := vm.GuidanceEventsByStage[stage.Stage]; len(events) > 0 {
 		var guidance strings.Builder
 		guidance.WriteString("Codex deadline guidance:")
@@ -746,6 +760,73 @@ func readCleanupSummary(artifactRoot string) cleanupSummary {
 	}
 	summary.Text = strings.Join(lines, "\n")
 	return summary
+}
+
+func readDockerRuntimeBlock(cfg config.Config, artifactRoot string) dockerRuntimeBlock {
+	block := dockerRuntimeBlock{
+		RuntimePath:      filepath.Join(artifactRoot, "docker_runtime_summary.json"),
+		MirrorPath:       filepath.Join(artifactRoot, "docker_mirror_summary.json"),
+		GCPath:           filepath.Join(cfg.ScanPath, ".qa-control", "docker_gc_summary.json"),
+		DaemonMirrorPath: filepath.Join(cfg.ScanPath, ".qa-control", "daemon_mirror_summary.json"),
+	}
+	var lines []string
+	if runtime := readJSONMap(block.RuntimePath); len(runtime) > 0 {
+		lines = append(lines, "  Compose: "+stringValue(runtime["compose_project"])+" "+fmt.Sprintf("%d files", len(anySlice(runtime["compose_files"]))))
+		pull := mapValue(runtime["pull"])
+		lines = append(lines, "  Pull: "+stringValue(runtime["pull_policy"])+" "+stringValue(pull["status"]))
+	}
+	if mirror := readJSONMap(block.MirrorPath); len(mirror) > 0 {
+		lines = append(lines, "  Build mirror: "+fmt.Sprintf("%v", mirror["enabled"])+" "+stringValue(mirror["mode"])+" fallback="+fmt.Sprintf("%v", mirror["fallback_used"]))
+	}
+	if daemon := readJSONMap(block.DaemonMirrorPath); len(daemon) > 0 {
+		status := "consistent"
+		if changed, _ := daemon["changed"].(bool); changed {
+			status = "drift"
+		}
+		if ok, _ := daemon["ok"].(bool); !ok {
+			status = "error"
+		}
+		lines = append(lines, "  Daemon mirror: "+status)
+	}
+	if gc := readJSONMap(block.GCPath); len(gc) > 0 {
+		status := "ok"
+		if skipped, _ := gc["skipped"].(bool); skipped {
+			status = "skipped"
+		}
+		if ok, _ := gc["ok"].(bool); !ok {
+			status = "failed"
+		}
+		lines = append(lines, "  GC: "+status+" "+stringValue(gc["finished_at"]))
+	}
+	block.Text = strings.Join(lines, "\n")
+	return block
+}
+
+func readJSONMap(path string) map[string]any {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var data map[string]any
+	if json.Unmarshal(content, &data) != nil {
+		return nil
+	}
+	return data
+}
+
+func mapValue(value any) map[string]any {
+	data, _ := value.(map[string]any)
+	return data
+}
+
+func anySlice(value any) []any {
+	items, _ := value.([]any)
+	return items
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func cleanupStatus(artifactRoot string) string {

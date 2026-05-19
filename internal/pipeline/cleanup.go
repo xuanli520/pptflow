@@ -68,7 +68,7 @@ func (r Runner) cleanupStaleRuns(ctx context.Context, runs []model.RunRecord, cu
 		if err != nil || evidence.ComposeProject == "" {
 			continue
 		}
-		summary := dockermgr.CleanupComposeProject(ctx, r.exec, r.cfg.Docker, evidence.ComposeFile, evidence.ComposeProject, evidence.WorkDir)
+		summary := dockermgr.CleanupComposeProjectFiles(ctx, r.exec, r.cfg.Docker, evidence.ComposeFiles, evidence.ComposeProject, evidence.WorkDir)
 		summary.Status = "stale_" + summary.Status
 		summaries = append(summaries, summary)
 	}
@@ -92,17 +92,18 @@ func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, 
 		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
 	if keepRuntime {
-		args := dockermgr.CleanupComposeArgs(r.cfg.Docker, evidence.ComposeFile, evidence.ComposeProject)
+		args := dockermgr.CleanupComposeArgsFiles(r.cfg.Docker, evidence.ComposeFiles, evidence.ComposeProject)
 		summary := dockermgr.CleanupSummary{
 			Status:         "kept_by_operator_request",
 			ComposeFile:    evidence.ComposeFile,
+			ComposeFiles:   evidence.ComposeFiles,
 			ComposeProject: evidence.ComposeProject,
 			WorkDir:        evidence.WorkDir,
 			ManualCommand:  dockermgr.CommandLine("docker", args),
 		}
 		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
-	summary := dockermgr.CleanupComposeProject(ctx, r.exec, r.cfg.Docker, evidence.ComposeFile, evidence.ComposeProject, evidence.WorkDir)
+	summary := dockermgr.CleanupComposeProjectFiles(ctx, r.exec, r.cfg.Docker, evidence.ComposeFiles, evidence.ComposeProject, evidence.WorkDir)
 	return writeCleanupSummary(run.ArtifactRoot, summary)
 }
 

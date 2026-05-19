@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"gopkg.in/yaml.v3"
@@ -19,13 +20,14 @@ const (
 )
 
 type Config struct {
-	ScanPath string
-	DBPath   string
-	Pipeline PipelineConfig
-	Docker   DockerConfig
-	Docs     DocsConfig
-	Codex    CodexConfig
-	TUI      TUIConfig
+	ScanPath          string
+	DBPath            string
+	ProjectConfigPath string
+	Pipeline          PipelineConfig
+	Docker            DockerConfig
+	Docs              DocsConfig
+	Codex             CodexConfig
+	TUI               TUIConfig
 }
 
 type PipelineConfig struct {
@@ -40,12 +42,54 @@ type DockerConfig struct {
 	ComposeProjectPrefix        string
 	KeepFailedContainersMinutes int
 	HealthCheckTimeoutSeconds   int
+	PullPolicy                  string
+	DaemonMirrors               DockerDaemonMirrorsConfig
+	BuildMirrors                DockerBuildMirrorsConfig
 	CleanupPolicy               string
 	CleanupImages               bool
 	CleanupVolumes              bool
 	CleanupBuildCache           bool
 	BuildCachePruneUntil        string
 	KeepRuntime                 bool
+	GC                          DockerGCConfig
+}
+
+type DockerDaemonMirrorsConfig struct {
+	Enabled            bool
+	DaemonJSON         string
+	BackupDir          string
+	RegistryMirrors    []string
+	RequireManualApply bool
+}
+
+type DockerBuildMirrorsConfig struct {
+	Enabled            bool
+	Mode               string
+	FallbackToOriginal bool
+	VerifyOverride     bool
+	Profile            string
+	AptMirror          string
+	UbuntuMirror       string
+	ApkMirror          string
+	YumMirror          string
+	NPMRegistry        string
+	PipIndexURL        string
+	GoProxy            string
+	CargoRegistry      string
+}
+
+type DockerGCConfig struct {
+	Enabled               bool
+	RunOnTUIStart         bool
+	RunBeforeCLIRun       bool
+	Interval              string
+	P2ROnly               bool
+	PruneExitedContainers bool
+	PruneNetworks         bool
+	PruneVolumes          bool
+	PruneImages           bool
+	PruneBuilderCache     bool
+	BuilderCacheUntil     string
 }
 
 type DocsConfig struct {
@@ -76,15 +120,17 @@ type Overrides struct {
 }
 
 type pathBases struct {
-	ScanPath          string
-	DBPath            string
-	PromptProfilesDir string
+	ScanPath              string
+	DBPath                string
+	PromptProfilesDir     string
+	DaemonMirrorBackupDir string
 }
 
 type fileSettings struct {
-	ScanPath          bool
-	DBPath            bool
-	PromptProfilesDir bool
+	ScanPath              bool
+	DBPath                bool
+	PromptProfilesDir     bool
+	DaemonMirrorBackupDir bool
 }
 
 type rawConfig struct {
@@ -105,16 +151,58 @@ type rawPipelineConfig struct {
 }
 
 type rawDockerConfig struct {
-	ManagedLabel                *string `yaml:"managed_label"`
-	ComposeProjectPrefix        *string `yaml:"compose_project_prefix"`
-	KeepFailedContainersMinutes *int    `yaml:"keep_failed_containers_minutes"`
-	HealthCheckTimeoutSeconds   *int    `yaml:"health_check_timeout_seconds"`
-	CleanupPolicy               *string `yaml:"cleanup_policy"`
-	CleanupImages               *bool   `yaml:"cleanup_images"`
-	CleanupVolumes              *bool   `yaml:"cleanup_volumes"`
-	CleanupBuildCache           *bool   `yaml:"cleanup_build_cache"`
-	BuildCachePruneUntil        *string `yaml:"build_cache_prune_until"`
-	KeepRuntime                 *bool   `yaml:"keep_runtime"`
+	ManagedLabel                *string                       `yaml:"managed_label"`
+	ComposeProjectPrefix        *string                       `yaml:"compose_project_prefix"`
+	KeepFailedContainersMinutes *int                          `yaml:"keep_failed_containers_minutes"`
+	HealthCheckTimeoutSeconds   *int                          `yaml:"health_check_timeout_seconds"`
+	PullPolicy                  *string                       `yaml:"pull_policy"`
+	DaemonMirrors               *rawDockerDaemonMirrorsConfig `yaml:"daemon_mirrors"`
+	BuildMirrors                *rawDockerBuildMirrorsConfig  `yaml:"build_mirrors"`
+	CleanupPolicy               *string                       `yaml:"cleanup_policy"`
+	CleanupImages               *bool                         `yaml:"cleanup_images"`
+	CleanupVolumes              *bool                         `yaml:"cleanup_volumes"`
+	CleanupBuildCache           *bool                         `yaml:"cleanup_build_cache"`
+	BuildCachePruneUntil        *string                       `yaml:"build_cache_prune_until"`
+	KeepRuntime                 *bool                         `yaml:"keep_runtime"`
+	GC                          *rawDockerGCConfig            `yaml:"gc"`
+}
+
+type rawDockerDaemonMirrorsConfig struct {
+	Enabled            *bool    `yaml:"enabled"`
+	DaemonJSON         *string  `yaml:"daemon_json"`
+	BackupDir          *string  `yaml:"backup_dir"`
+	RegistryMirrors    []string `yaml:"registry_mirrors"`
+	RequireManualApply *bool    `yaml:"require_manual_apply"`
+}
+
+type rawDockerBuildMirrorsConfig struct {
+	Enabled            *bool   `yaml:"enabled"`
+	Mode               *string `yaml:"mode"`
+	FallbackToOriginal *bool   `yaml:"fallback_to_original"`
+	VerifyOverride     *bool   `yaml:"verify_override"`
+	Profile            *string `yaml:"profile"`
+	AptMirror          *string `yaml:"apt_mirror"`
+	UbuntuMirror       *string `yaml:"ubuntu_mirror"`
+	ApkMirror          *string `yaml:"apk_mirror"`
+	YumMirror          *string `yaml:"yum_mirror"`
+	NPMRegistry        *string `yaml:"npm_registry"`
+	PipIndexURL        *string `yaml:"pip_index_url"`
+	GoProxy            *string `yaml:"go_proxy"`
+	CargoRegistry      *string `yaml:"cargo_registry"`
+}
+
+type rawDockerGCConfig struct {
+	Enabled               *bool   `yaml:"enabled"`
+	RunOnTUIStart         *bool   `yaml:"run_on_tui_start"`
+	RunBeforeCLIRun       *bool   `yaml:"run_before_cli_run"`
+	Interval              *string `yaml:"interval"`
+	P2ROnly               *bool   `yaml:"p2r_only"`
+	PruneExitedContainers *bool   `yaml:"prune_exited_containers"`
+	PruneNetworks         *bool   `yaml:"prune_networks"`
+	PruneVolumes          *bool   `yaml:"prune_volumes"`
+	PruneImages           *bool   `yaml:"prune_images"`
+	PruneBuilderCache     *bool   `yaml:"prune_builder_cache"`
+	BuilderCacheUntil     *string `yaml:"builder_cache_until"`
 }
 
 type rawDocsConfig struct {
@@ -141,8 +229,9 @@ type rawTUIConfig struct {
 
 func Default() Config {
 	return Config{
-		ScanPath: "./projects-qa",
-		DBPath:   "./projects-qa/.qa-control/index.db",
+		ScanPath:          "./projects-qa",
+		DBPath:            "./projects-qa/.qa-control/index.db",
+		ProjectConfigPath: ".p2r.yaml",
 		Pipeline: PipelineConfig{
 			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 2700, "E": 2700, "F": 2700},
 			SelfTestReportPath: "repo/self_test_report.md",
@@ -153,12 +242,42 @@ func Default() Config {
 			ComposeProjectPrefix:        "p2rqa",
 			KeepFailedContainersMinutes: 60,
 			HealthCheckTimeoutSeconds:   60,
-			CleanupPolicy:               "always",
-			CleanupImages:               true,
-			CleanupVolumes:              true,
-			CleanupBuildCache:           false,
-			BuildCachePruneUntil:        "24h",
-			KeepRuntime:                 false,
+			PullPolicy:                  "best_effort",
+			DaemonMirrors: DockerDaemonMirrorsConfig{
+				Enabled:            false,
+				DaemonJSON:         "/etc/docker/daemon.json",
+				RegistryMirrors:    []string{},
+				RequireManualApply: true,
+			},
+			BuildMirrors: DockerBuildMirrorsConfig{
+				Enabled:            true,
+				Mode:               "patch_dockerfile",
+				FallbackToOriginal: true,
+				VerifyOverride:     true,
+				Profile:            "cn",
+				NPMRegistry:        "https://registry.npmmirror.com",
+				PipIndexURL:        "https://pypi.tuna.tsinghua.edu.cn/simple",
+				GoProxy:            "https://goproxy.cn,direct",
+			},
+			CleanupPolicy:        "always",
+			CleanupImages:        true,
+			CleanupVolumes:       true,
+			CleanupBuildCache:    false,
+			BuildCachePruneUntil: "24h",
+			KeepRuntime:          false,
+			GC: DockerGCConfig{
+				Enabled:               true,
+				RunOnTUIStart:         true,
+				RunBeforeCLIRun:       false,
+				Interval:              "24h",
+				P2ROnly:               true,
+				PruneExitedContainers: true,
+				PruneNetworks:         true,
+				PruneVolumes:          false,
+				PruneImages:           false,
+				PruneBuilderCache:     false,
+				BuilderCacheUntil:     "72h",
+			},
 		},
 		Docs: DocsConfig{
 			MaxAttachmentBytes:   64 << 20,
@@ -185,10 +304,12 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 	cfg := Default()
 	cwd = filepath.Clean(cwd)
 	bases := pathBases{
-		ScanPath:          cwd,
-		DBPath:            cwd,
-		PromptProfilesDir: cwd,
+		ScanPath:              cwd,
+		DBPath:                cwd,
+		PromptProfilesDir:     cwd,
+		DaemonMirrorBackupDir: cwd,
 	}
+	cfg.ProjectConfigPath = filepath.Join(cwd, ".p2r.yaml")
 
 	path, err := discoverConfig(cwd)
 	if err != nil {
@@ -208,6 +329,9 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 		}
 		if settings.PromptProfilesDir {
 			bases.PromptProfilesDir = base
+		}
+		if settings.DaemonMirrorBackupDir {
+			bases.DaemonMirrorBackupDir = base
 		}
 	}
 	if value := strings.TrimSpace(os.Getenv(EnvScanPath)); value != "" {
@@ -229,6 +353,12 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 	cfg.ScanPath = absFrom(bases.ScanPath, cfg.ScanPath)
 	cfg.DBPath = absFrom(bases.DBPath, cfg.DBPath)
 	cfg.Codex.PromptProfilesDir = absFrom(bases.PromptProfilesDir, cfg.Codex.PromptProfilesDir)
+	if strings.TrimSpace(cfg.Docker.DaemonMirrors.BackupDir) == "" {
+		cfg.Docker.DaemonMirrors.BackupDir = filepath.Join(cfg.ScanPath, ".qa-control", "docker-daemon-backups")
+	} else {
+		cfg.Docker.DaemonMirrors.BackupDir = absFrom(bases.DaemonMirrorBackupDir, cfg.Docker.DaemonMirrors.BackupDir)
+	}
+	cfg.ProjectConfigPath = absFrom(cwd, cfg.ProjectConfigPath)
 	normalize(&cfg)
 	if err := Validate(cfg); err != nil {
 		return cfg, err
@@ -345,6 +475,15 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 		if raw.Docker.HealthCheckTimeoutSeconds != nil {
 			cfg.Docker.HealthCheckTimeoutSeconds = *raw.Docker.HealthCheckTimeoutSeconds
 		}
+		if raw.Docker.PullPolicy != nil {
+			cfg.Docker.PullPolicy = *raw.Docker.PullPolicy
+		}
+		if raw.Docker.DaemonMirrors != nil {
+			applyRawDockerDaemonMirrors(&cfg.Docker.DaemonMirrors, raw.Docker.DaemonMirrors, settings)
+		}
+		if raw.Docker.BuildMirrors != nil {
+			applyRawDockerBuildMirrors(&cfg.Docker.BuildMirrors, raw.Docker.BuildMirrors)
+		}
 		if raw.Docker.CleanupPolicy != nil {
 			cfg.Docker.CleanupPolicy = *raw.Docker.CleanupPolicy
 		}
@@ -362,6 +501,9 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 		}
 		if raw.Docker.KeepRuntime != nil {
 			cfg.Docker.KeepRuntime = *raw.Docker.KeepRuntime
+		}
+		if raw.Docker.GC != nil {
+			applyRawDockerGC(&cfg.Docker.GC, raw.Docker.GC)
 		}
 	}
 	if raw.Docs != nil {
@@ -422,6 +564,103 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 	return nil
 }
 
+func applyRawDockerDaemonMirrors(cfg *DockerDaemonMirrorsConfig, raw *rawDockerDaemonMirrorsConfig, settings *fileSettings) {
+	if raw.Enabled != nil {
+		cfg.Enabled = *raw.Enabled
+	}
+	if raw.DaemonJSON != nil {
+		cfg.DaemonJSON = *raw.DaemonJSON
+	}
+	if raw.BackupDir != nil {
+		cfg.BackupDir = *raw.BackupDir
+		settings.DaemonMirrorBackupDir = true
+	}
+	if raw.RegistryMirrors != nil {
+		cfg.RegistryMirrors = append([]string(nil), raw.RegistryMirrors...)
+	}
+	if raw.RequireManualApply != nil {
+		cfg.RequireManualApply = *raw.RequireManualApply
+	}
+}
+
+func applyRawDockerBuildMirrors(cfg *DockerBuildMirrorsConfig, raw *rawDockerBuildMirrorsConfig) {
+	if raw.Enabled != nil {
+		cfg.Enabled = *raw.Enabled
+	}
+	if raw.Mode != nil {
+		cfg.Mode = *raw.Mode
+	}
+	if raw.FallbackToOriginal != nil {
+		cfg.FallbackToOriginal = *raw.FallbackToOriginal
+	}
+	if raw.VerifyOverride != nil {
+		cfg.VerifyOverride = *raw.VerifyOverride
+	}
+	if raw.Profile != nil {
+		cfg.Profile = *raw.Profile
+	}
+	if raw.AptMirror != nil {
+		cfg.AptMirror = *raw.AptMirror
+	}
+	if raw.UbuntuMirror != nil {
+		cfg.UbuntuMirror = *raw.UbuntuMirror
+	}
+	if raw.ApkMirror != nil {
+		cfg.ApkMirror = *raw.ApkMirror
+	}
+	if raw.YumMirror != nil {
+		cfg.YumMirror = *raw.YumMirror
+	}
+	if raw.NPMRegistry != nil {
+		cfg.NPMRegistry = *raw.NPMRegistry
+	}
+	if raw.PipIndexURL != nil {
+		cfg.PipIndexURL = *raw.PipIndexURL
+	}
+	if raw.GoProxy != nil {
+		cfg.GoProxy = *raw.GoProxy
+	}
+	if raw.CargoRegistry != nil {
+		cfg.CargoRegistry = *raw.CargoRegistry
+	}
+}
+
+func applyRawDockerGC(cfg *DockerGCConfig, raw *rawDockerGCConfig) {
+	if raw.Enabled != nil {
+		cfg.Enabled = *raw.Enabled
+	}
+	if raw.RunOnTUIStart != nil {
+		cfg.RunOnTUIStart = *raw.RunOnTUIStart
+	}
+	if raw.RunBeforeCLIRun != nil {
+		cfg.RunBeforeCLIRun = *raw.RunBeforeCLIRun
+	}
+	if raw.Interval != nil {
+		cfg.Interval = *raw.Interval
+	}
+	if raw.P2ROnly != nil {
+		cfg.P2ROnly = *raw.P2ROnly
+	}
+	if raw.PruneExitedContainers != nil {
+		cfg.PruneExitedContainers = *raw.PruneExitedContainers
+	}
+	if raw.PruneNetworks != nil {
+		cfg.PruneNetworks = *raw.PruneNetworks
+	}
+	if raw.PruneVolumes != nil {
+		cfg.PruneVolumes = *raw.PruneVolumes
+	}
+	if raw.PruneImages != nil {
+		cfg.PruneImages = *raw.PruneImages
+	}
+	if raw.PruneBuilderCache != nil {
+		cfg.PruneBuilderCache = *raw.PruneBuilderCache
+	}
+	if raw.BuilderCacheUntil != nil {
+		cfg.BuilderCacheUntil = *raw.BuilderCacheUntil
+	}
+}
+
 func normalize(cfg *Config) {
 	if cfg.Pipeline.MaxConcurrent <= 0 {
 		cfg.Pipeline.MaxConcurrent = 3
@@ -455,8 +694,29 @@ func Validate(cfg Config) error {
 	if strings.TrimSpace(cfg.Docker.ComposeProjectPrefix) == "" {
 		return fmt.Errorf("docker.compose_project_prefix must not be empty")
 	}
+	if err := validateOneOf("docker.pull_policy", cfg.Docker.PullPolicy, "required", "best_effort", "skip"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.Docker.DaemonMirrors.DaemonJSON) == "" {
+		return fmt.Errorf("docker.daemon_mirrors.daemon_json must not be empty")
+	}
+	if strings.TrimSpace(cfg.Docker.DaemonMirrors.BackupDir) == "" {
+		return fmt.Errorf("docker.daemon_mirrors.backup_dir must not be empty")
+	}
+	if err := validateOneOf("docker.build_mirrors.mode", cfg.Docker.BuildMirrors.Mode, "off", "env_only", "patch_dockerfile"); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.Docker.CleanupPolicy) == "" {
 		return fmt.Errorf("docker.cleanup_policy must not be empty")
+	}
+	if _, err := time.ParseDuration(cfg.Docker.BuildCachePruneUntil); err != nil {
+		return fmt.Errorf("docker.build_cache_prune_until must be a Go duration: %w", err)
+	}
+	if _, err := time.ParseDuration(cfg.Docker.GC.Interval); err != nil {
+		return fmt.Errorf("docker.gc.interval must be a Go duration: %w", err)
+	}
+	if _, err := time.ParseDuration(cfg.Docker.GC.BuilderCacheUntil); err != nil {
+		return fmt.Errorf("docker.gc.builder_cache_until must be a Go duration: %w", err)
 	}
 	if cfg.Docs.MaxAttachmentBytes <= 0 {
 		return fmt.Errorf("docs.max_attachment_bytes must be greater than 0")
@@ -483,6 +743,16 @@ func Validate(cfg Config) error {
 		return fmt.Errorf("tui.log_max_lines must be greater than 0")
 	}
 	return nil
+}
+
+func validateOneOf(name, value string, allowed ...string) error {
+	value = strings.TrimSpace(value)
+	for _, item := range allowed {
+		if value == item {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s must be one of %s", name, strings.Join(allowed, ", "))
 }
 
 func normalizeStageTimeoutKey(key string) string {

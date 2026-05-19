@@ -417,6 +417,9 @@ func (h TestHarness) TabName() string {
 	if h.model.tab == panelExecution {
 		return "execution"
 	}
+	if h.model.tab == panelSettings {
+		return "settings"
+	}
 	return "overview"
 }
 
