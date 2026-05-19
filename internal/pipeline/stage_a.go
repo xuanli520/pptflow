@@ -494,6 +494,7 @@ func cleanValidationInputRoot(root string) error {
 		"metadata.json":     true,
 		"original_sessions": true,
 		"repo":              true,
+		".gitignore":        true,
 	}
 	for _, entry := range entries {
 		if allowed[entry.Name()] {
