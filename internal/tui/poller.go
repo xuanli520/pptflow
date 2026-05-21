@@ -20,9 +20,12 @@ type dockerHealthStore interface {
 }
 
 type schedulerPoller struct {
-	store dockerHealthStore
-	cfg   config.Config
-	exec  executor.CommandRunner
+	store                  dockerHealthStore
+	cfg                    config.Config
+	exec                   executor.CommandRunner
+	lastRecoveryAt         time.Time
+	lastPersistedRefreshAt time.Time
+	lastDockerHealthAt     time.Time
 }
 
 type dockerHealthMsg struct {
@@ -32,11 +35,38 @@ type dockerHealthMsg struct {
 }
 
 func newSchedulerPoller(store dockerHealthStore, cfg config.Config) *schedulerPoller {
-	return &schedulerPoller{store: store, cfg: cfg, exec: executor.New()}
+	now := time.Now()
+	return &schedulerPoller{store: store, cfg: cfg, exec: executor.New(), lastRecoveryAt: now, lastPersistedRefreshAt: now, lastDockerHealthAt: now}
 }
 
-func (p *schedulerPoller) Tick(m app) tea.Cmd {
-	return m.tick()
+func (p *schedulerPoller) reset(now time.Time) {
+	if p == nil {
+		return
+	}
+	p.lastRecoveryAt = now
+	p.lastPersistedRefreshAt = now
+	p.lastDockerHealthAt = now
+}
+
+func (p *schedulerPoller) HandleTick(m app, now time.Time) []tea.Cmd {
+	if p == nil {
+		return []tea.Cmd{m.reloadSchedulerJobs(), m.tick()}
+	}
+	var cmds []tea.Cmd
+	if now.Sub(p.lastRecoveryAt) >= staleRunRecoveryInterval {
+		p.lastRecoveryAt = now
+		cmds = append(cmds, m.recoverStaleRunsCmd())
+	}
+	if now.Sub(p.lastPersistedRefreshAt) >= persistedStateRefreshInterval {
+		p.lastPersistedRefreshAt = now
+		cmds = append(cmds, m.reloadOverview(), m.taskBoard.Reload())
+	}
+	if now.Sub(p.lastDockerHealthAt) >= dockerHealthRefreshInterval {
+		p.lastDockerHealthAt = now
+		cmds = append(cmds, p.RefreshDockerHealthCmd())
+	}
+	cmds = append(cmds, m.reloadSchedulerJobs(), m.tick())
+	return cmds
 }
 
 func (p *schedulerPoller) RefreshDockerHealthCmd() tea.Cmd {

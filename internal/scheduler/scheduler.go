@@ -557,6 +557,9 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 			job.FinishedAt = time.Now().UTC()
 			job.mu.Unlock()
 			if err := s.enqueuePipelineAfterGit(job); err != nil {
+				if s.store != nil {
+					_ = s.store.RecordTaskGitError(ctx, job.TaskID, err)
+				}
 				job.mu.Lock()
 				job.State = JobFailed
 				job.Err = err

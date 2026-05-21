@@ -302,23 +302,8 @@ func (s *Store) ReopenTaskForInspection(ctx context.Context, taskID string) erro
 
 func (s *Store) RecordTaskRuntime(ctx context.Context, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	composeMeta, err := marshalComposeMeta(meta)
-	if err != nil {
-		return err
-	}
-	dockerFlag := 0
-	if dockerRunning {
-		dockerFlag = 1
-	}
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `UPDATE tasks
-			SET frontend_url = ?, docker_running = ?, compose_meta = ?, updated_at = ?
-			WHERE id = ?`,
-			frontendURL, dockerFlag, composeMeta, now, taskID)
-		if err != nil {
-			return err
-		}
-		return requireAffected(result, "task", taskID)
+		return recordTaskRuntimeTx(ctx, tx, taskID, frontendURL, dockerRunning, meta, now)
 	})
 }
 
@@ -960,7 +945,7 @@ func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, dur
 				model.TaskWaitingManual, now, now, taskID, runID)
 		case model.RunAborted, model.RunCrashed:
 			_, err = tx.ExecContext(ctx, `UPDATE tasks
-				SET current_run_id = NULL, updated_at = ?
+				SET current_run_id = NULL, docker_running = 0, frontend_url = '', compose_meta = '', updated_at = ?
 				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
 				now, taskID, runID)
 		}
@@ -1029,19 +1014,52 @@ func (s *Store) RunningRuns(ctx context.Context) ([]model.RunRecord, error) {
 }
 
 func (s *Store) PutStage(ctx context.Context, runID string, stage model.StageRecord) error {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return putStageTx(ctx, tx, runID, stage)
+	})
+}
+
+func (s *Store) PutStageAndRecordTaskRuntime(ctx context.Context, runID string, stage model.StageRecord, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := putStageTx(ctx, tx, runID, stage); err != nil {
+			return err
+		}
+		return recordTaskRuntimeTx(ctx, tx, taskID, frontendURL, dockerRunning, meta, now)
+	})
+}
+
+func putStageTx(ctx context.Context, tx *sql.Tx, runID string, stage model.StageRecord) error {
 	blockedBy, _ := json.Marshal(stage.BlockedBy)
 	artifacts, _ := json.Marshal(stage.ArtifactPaths)
 	name := stage.Name
 	if name == "" {
 		name = model.StageDisplayName(stage.Stage)
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO run_stages(run_id, stage, name, status, started_at, finished_at, duration_ms, blocked_by, log_path, artifact_json, error_summary)
+	_, err := tx.ExecContext(ctx, `INSERT INTO run_stages(run_id, stage, name, status, started_at, finished_at, duration_ms, blocked_by, log_path, artifact_json, error_summary)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_id, stage) DO UPDATE SET name=excluded.name, status=excluded.status, started_at=excluded.started_at, finished_at=excluded.finished_at, duration_ms=excluded.duration_ms, blocked_by=excluded.blocked_by, log_path=excluded.log_path, artifact_json=excluded.artifact_json, error_summary=excluded.error_summary`,
 		runID, stage.Stage, name, stage.Status, stage.StartedAt, stage.FinishedAt, stage.DurationMS, string(blockedBy), stage.LogPath, string(artifacts), stage.ErrorSummary)
 	return err
+}
+
+func recordTaskRuntimeTx(ctx context.Context, tx *sql.Tx, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string) error {
+	composeMeta, err := marshalComposeMeta(meta)
+	if err != nil {
+		return err
+	}
+	dockerFlag := 0
+	if dockerRunning {
+		dockerFlag = 1
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE tasks
+		SET frontend_url = ?, docker_running = ?, compose_meta = ?, updated_at = ?
+		WHERE id = ?`,
+		frontendURL, dockerFlag, composeMeta, now, taskID)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "task", taskID)
 }
 
 func (s *Store) InsertFindings(ctx context.Context, runID string, findings []model.Finding) error {

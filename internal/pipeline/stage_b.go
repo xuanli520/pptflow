@@ -90,7 +90,6 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 			category = runtimeErr.Category
 		}
 		record.ErrorSummary = category + ": " + evidence
-		r.recordTaskRuntimeBestEffort(ctx, project.TaskID, "", false, model.ComposeMeta{})
 		return stageBFailureOutcome(r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, evidence, fix), cleanupMeta)
 	}
 	portMap := map[string]any{
@@ -117,7 +116,6 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	}
 	if err := writer.RequiredJSON("port_map.json", portMap); err != nil {
 		record = recordArtifactWriteError(record, err, portMapPath)
-		r.recordTaskRuntimeBestEffort(ctx, project.TaskID, firstFrontendURL(result.Runtime), result.Runtime.HasCleanupTarget(), composeMetaFromRuntime(result.Runtime))
 		return StageOutcome{Record: finishStage(record, model.StageFailed, start), Runtime: &result.Runtime}
 	}
 	pages, _ := renderLogFile(logPath, screenshotPath)
@@ -127,7 +125,6 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	}
 	record.ArtifactPaths = append(record.ArtifactPaths, pages...)
 	if result.RuntimeSummary.PortCollection.Status == "failed" && !result.Runtime.HasServiceMappings() {
-		r.recordTaskRuntimeBestEffort(ctx, project.TaskID, "", result.Runtime.HasCleanupTarget(), composeMetaFromRuntime(result.Runtime))
 		record.Findings = []model.Finding{{
 			Stage:      "B",
 			Severity:   "High",
@@ -141,7 +138,6 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		return StageOutcome{Record: finishStage(record, model.StageFailed, start), Runtime: &result.Runtime}
 	}
 	if !result.Runtime.HasServiceMappings() {
-		r.recordTaskRuntimeBestEffort(ctx, project.TaskID, "", result.Runtime.HasCleanupTarget(), composeMetaFromRuntime(result.Runtime))
 		record.Findings = []model.Finding{{
 			Stage:      "B",
 			Severity:   "High",
@@ -154,20 +150,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		record.ErrorSummary = "no published ports"
 		return StageOutcome{Record: finishStage(record, model.StageFailed, start), Runtime: &result.Runtime}
 	}
-	r.recordTaskRuntimeBestEffort(ctx, project.TaskID, firstFrontendURL(result.Runtime), result.Runtime.HasCleanupTarget(), composeMetaFromRuntime(result.Runtime))
 	return StageOutcome{Record: finishStage(record, model.StageDone, start), Runtime: &result.Runtime}
-}
-
-type taskRuntimeRecorder interface {
-	RecordTaskRuntime(context.Context, string, string, bool, model.ComposeMeta) error
-}
-
-func (r Runner) recordTaskRuntimeBestEffort(ctx context.Context, taskID, frontendURL string, dockerRunning bool, meta model.ComposeMeta) {
-	recorder, ok := r.store.(taskRuntimeRecorder)
-	if !ok || recorder == nil {
-		return
-	}
-	_ = recorder.RecordTaskRuntime(ctx, taskID, frontendURL, dockerRunning, meta)
 }
 
 func composeMetaFromRuntime(runtime RuntimeState) model.ComposeMeta {

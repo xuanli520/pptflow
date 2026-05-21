@@ -70,6 +70,10 @@ type runExecutionState struct {
 	artifactWarnings   []ArtifactWarning
 }
 
+type taskRuntimeStageRecorder interface {
+	PutStageAndRecordTaskRuntime(context.Context, string, model.StageRecord, string, string, bool, model.ComposeMeta) error
+}
+
 func makeRunProgress(taskID string, reporter ProgressReporter) func(RunProgress) {
 	return func(update RunProgress) {
 		if reporter == nil {
@@ -322,8 +326,17 @@ func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckRes
 		record.Findings = assignMissingFindingIDs(stage, record.Findings)
 		s.execution.stages[index] = record
 		s.execution.results[stage] = record
-		if result, err, aborted := s.persistStageUpdate(r, record, true, EventStageDone); aborted || err != nil {
-			return result, err, aborted
+		persisted := false
+		if stage == string(model.StageB) {
+			persisted = true
+			if result, err, aborted := s.persistStageBUpdate(r, record, true, EventStageDone, outcome.Runtime); aborted || err != nil {
+				return result, err, aborted
+			}
+		}
+		if !persisted {
+			if result, err, aborted := s.persistStageUpdate(r, record, true, EventStageDone); aborted || err != nil {
+				return result, err, aborted
+			}
 		}
 		if outcome.SkipNextStage && index+1 < len(s.execution.stages) {
 			nextStage := s.execution.stages[index+1].Stage
@@ -341,6 +354,43 @@ func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckRes
 				return result, err, aborted
 			}
 		}
+	}
+	return Result{}, nil, false
+}
+
+func (s *runState) persistStageBUpdate(r Runner, record model.StageRecord, includeFindings bool, event ProgressEvent, runtime *RuntimeState) (Result, error, bool) {
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
+		return result, err, true
+	}
+	meta := model.ComposeMeta{}
+	frontendURL := ""
+	dockerRunning := false
+	if runtime != nil {
+		normalized := runtime.Normalized()
+		meta = composeMetaFromRuntime(normalized)
+		frontendURL = firstFrontendURL(normalized)
+		dockerRunning = normalized.HasCleanupTarget()
+	}
+	if recorder, ok := r.store.(taskRuntimeStageRecorder); ok && recorder != nil {
+		if err := recorder.PutStageAndRecordTaskRuntime(s.prepare.ctx, s.identity.runID, record, s.prepare.taskID, frontendURL, dockerRunning, meta); err != nil {
+			return s.abortOrError(r, err)
+		}
+	} else if err := r.store.PutStage(s.prepare.ctx, s.identity.runID, record); err != nil {
+		return s.abortOrError(r, err)
+	}
+	if includeFindings && len(record.Findings) > 0 {
+		if err := r.store.InsertFindings(s.prepare.ctx, s.identity.runID, record.Findings); err != nil {
+			return s.abortOrError(r, err)
+		}
+	}
+	s.addArtifactWarnings(record.ArtifactWarnings...)
+	s.persistArtifactWarnings()
+	if err := r.writeStageStatus(s.identity.runID, s.identity.artifactRoot, s.execution.stages); err != nil {
+		return Result{}, err, false
+	}
+	s.prepare.progress(RunProgress{RunID: s.identity.runID, Stage: record.Stage, Event: event, StageRecord: record})
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
+		return result, err, true
 	}
 	return Result{}, nil, false
 }

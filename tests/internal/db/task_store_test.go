@@ -155,6 +155,42 @@ func TestProjectQueryFiltersByTaskState(t *testing.T) {
 	}
 }
 
+func TestFinishRunAbortedClearsTaskDockerRuntime(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-DDDDDD", "https://gitlab.example/TASK-20260521-DDDDDD", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID := "run-aborted"
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        runID,
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordTaskRuntime(ctx, task.ID, "http://localhost:3000", true, model.ComposeMeta{Project: "p2r_abort", ComposeFiles: []string{"compose.yml"}, WorkDir: task.RepoPath}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, runID, task.ID, model.RunAborted, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.CurrentRunID != "" || task.DockerRunning || task.FrontendURL != "" || task.ComposeMeta.Project != "" {
+		t.Fatalf("aborted run should clear task runtime: %#v", task)
+	}
+}
+
 func finishTaskRun(t *testing.T, store *db.Store, taskID string) {
 	t.Helper()
 	ctx := context.Background()

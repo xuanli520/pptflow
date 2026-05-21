@@ -28,6 +28,10 @@ type taskBoardLoadMsg struct {
 	err        error
 }
 
+var _ Page = (*TaskBoardModel)(nil)
+
+var handledKeyCmd tea.Cmd = func() tea.Msg { return nil }
+
 func newTaskBoardModel(query TaskQueryService) TaskBoardModel {
 	return TaskBoardModel{
 		query: query,
@@ -67,7 +71,18 @@ func (m TaskBoardModel) Reload() tea.Cmd {
 	}
 }
 
-func (m TaskBoardModel) Update(msg tea.Msg) (TaskBoardModel, tea.Cmd) {
+func (m *TaskBoardModel) Update(msg tea.Msg) (bool, tea.Cmd) {
+	next, cmd, handled := m.apply(msg)
+	*m = next
+	return handled, cmd
+}
+
+func (m TaskBoardModel) Apply(msg tea.Msg) (TaskBoardModel, tea.Cmd) {
+	next, cmd, _ := m.apply(msg)
+	return next, cmd
+}
+
+func (m TaskBoardModel) apply(msg tea.Msg) (TaskBoardModel, tea.Cmd, bool) {
 	switch value := msg.(type) {
 	case taskBoardLoadMsg:
 		m.loading = false
@@ -77,32 +92,37 @@ func (m TaskBoardModel) Update(msg tea.Msg) (TaskBoardModel, tea.Cmd) {
 			m.cols[taskColumnWaiting].setItems(value.waiting)
 			m.cols[taskColumnCompleted].setItems(value.completed)
 		}
-		return m, nil
+		return m, nil, true
 	case tickMsg:
 		m.now = time.Time(value)
-		return m, nil
+		return m, nil, true
 	default:
-		return m, nil
+		return m, nil, false
 	}
 }
 
-func (m *TaskBoardModel) HandleKey(msg tea.KeyMsg) bool {
+func (m *TaskBoardModel) Focus() {}
+
+func (m *TaskBoardModel) Blur() {}
+
+func (m *TaskBoardModel) HandleKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
 	case "left":
 		m.focused = taskColumnID(clamp(int(m.focused)-1, 0, 2))
-		return true
 	case "right":
 		m.focused = taskColumnID(clamp(int(m.focused)+1, 0, 2))
-		return true
 	case "up":
 		m.cols[m.focused].move(-1)
-		return true
 	case "down":
 		m.cols[m.focused].move(1)
-		return true
 	default:
-		return false
+		return nil
 	}
+	return handledKeyCmd
+}
+
+func (m *TaskBoardModel) Destroy() tea.Cmd {
+	return nil
 }
 
 func (m TaskBoardModel) SelectedTask() (TaskProject, bool) {

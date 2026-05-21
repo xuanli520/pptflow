@@ -35,6 +35,14 @@ func TestForceExitCleanupReportsOnlyFailedTaskCleanup(t *testing.T) {
 	if count := strings.Count(text, "cleanup TASK-FAIL"); count != 1 {
 		t.Fatalf("failed task cleanup should be reported once, got %d in %q", count, text)
 	}
+
+	stopped, err := tuiapp.ForceExitCleanupStoppedForTest(context.Background(), cfg, &tuiCleanupRunner{failProject: "p2r_fail"}, tasks)
+	if err == nil {
+		t.Fatal("expected cleanup error with partial success")
+	}
+	if len(stopped) != 1 || stopped[0] != "TASK-OK" {
+		t.Fatalf("partial cleanup should report successfully stopped tasks, got %#v", stopped)
+	}
 }
 
 type tuiCleanupRunner struct {

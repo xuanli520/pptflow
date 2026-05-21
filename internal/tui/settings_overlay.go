@@ -7,7 +7,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-type SettingsOverlay struct{}
+type SettingsOverlay struct {
+	content string
+}
 
 func (SettingsOverlay) Init() tea.Cmd                  { return nil }
 func (SettingsOverlay) Update(tea.Msg) (bool, tea.Cmd) { return false, nil }
@@ -15,18 +17,22 @@ func (SettingsOverlay) ZIndex() int                    { return 100 }
 func (SettingsOverlay) InterceptsAllKeys() bool        { return true }
 func (SettingsOverlay) Destroy() tea.Cmd               { return nil }
 
-func (SettingsOverlay) View(width, height int) string {
-	return ""
+func (o SettingsOverlay) WithContent(content string) SettingsOverlay {
+	o.content = content
+	return o
 }
 
-func renderSettingsOverlay(m app) string {
-	content := renderSettings(m)
-	overlayWidth := clamp(m.width*35/100, 40, 60)
-	if m.width > 0 {
-		overlayWidth = min(overlayWidth, max(20, m.width-4))
+func (o SettingsOverlay) View(width, height int) string {
+	content := strings.TrimRight(o.content, "\n")
+	if content == "" {
+		return ""
+	}
+	overlayWidth := clamp(width*35/100, 40, 60)
+	if width > 0 {
+		overlayWidth = min(overlayWidth, max(20, width-4))
 	}
 	lines := strings.Split(content, "\n")
-	overlayHeight := min(len(lines)+panelStyle.GetVerticalFrameSize(), max(10, m.height*6/10))
+	overlayHeight := min(len(lines)+panelStyle.GetVerticalFrameSize(), max(10, height*6/10))
 	if overlayHeight <= 0 {
 		overlayHeight = min(len(lines)+panelStyle.GetVerticalFrameSize(), 20)
 	}
@@ -35,7 +41,11 @@ func renderSettingsOverlay(m app) string {
 		lines = lines[:bodyHeight]
 	}
 	panel := renderPanel(overlayWidth, overlayHeight, strings.Join(lines, "\n"))
-	leftPad := max(0, m.width-overlayWidth-2)
-	topPad := max(0, m.height-overlayHeight-3)
+	leftPad := max(0, width-overlayWidth-2)
+	topPad := max(0, height-overlayHeight-3)
 	return strings.Repeat("\n", topPad) + lipgloss.NewStyle().MarginLeft(leftPad).Render(panel)
+}
+
+func renderSettingsOverlay(m app) string {
+	return m.settingsUI.WithContent(renderSettings(m)).View(m.width, m.height)
 }

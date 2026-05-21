@@ -142,6 +142,15 @@ func (h TestHarness) ApplySchedulerNotifyForTest() (TestHarness, int) {
 	return h, len(cmds)
 }
 
+func (h TestHarness) ApplyStartupDockerCheckForTest(count int, err error) TestHarness {
+	next, _ := h.model.Update(startupDockerCheckMsg{count: count, err: err})
+	model, ok := next.(app)
+	if !ok {
+		return h
+	}
+	return TestHarness{model: model}
+}
+
 func RefreshDockerHealthForTest(ctx context.Context, store *db.Store, cfg config.Config, exec executor.CommandRunner) (int, []string, error) {
 	poller := newSchedulerPoller(store, cfg)
 	poller.exec = exec
@@ -154,6 +163,11 @@ func ConfirmCompleteForTest(ctx context.Context, store *db.Store, cfg config.Con
 }
 
 func ForceExitCleanupForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
+	_, err := forceExitCleanup(ctx, cfg, exec, tasks)
+	return err
+}
+
+func ForceExitCleanupStoppedForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) ([]string, error) {
 	return forceExitCleanup(ctx, cfg, exec, tasks)
 }
 
@@ -195,13 +209,15 @@ func (noopTaskQueryService) FindWithDockerRunning(context.Context) ([]TaskProjec
 
 func (h TestHarness) ApplyTickForTest(elapsed time.Duration) (TestHarness, int) {
 	var cmds []tea.Cmd
-	h.model.handleRecoveryMsg(tickMsg(h.model.lastPersistedRefreshAt.Add(elapsed)), &cmds)
+	base := h.model.poller.lastPersistedRefreshAt
+	h.model.handleRecoveryMsg(tickMsg(base.Add(elapsed)), &cmds)
 	return h, len(cmds)
 }
 
 func (h TestHarness) ColdTickRefreshDetailForTest(elapsed time.Duration) (bool, bool) {
 	var cmds []tea.Cmd
-	h.model.handleRecoveryMsg(tickMsg(h.model.lastPersistedRefreshAt.Add(elapsed)), &cmds)
+	base := h.model.poller.lastPersistedRefreshAt
+	h.model.handleRecoveryMsg(tickMsg(base.Add(elapsed)), &cmds)
 	for _, cmd := range cmds {
 		if cmd == nil {
 			continue
@@ -218,18 +234,18 @@ func (h TestHarness) SetFocus(name string) TestHarness {
 	area := testFocusArea(name)
 	switch area {
 	case focusSearch, focusOverviewTable:
-		h.model.tab = panelOverview
+		h.model.setTab(panelOverview)
 	case focusTaskBoard, focusTaskInput:
-		h.model.tab = panelTaskBoard
+		h.model.setTab(panelTaskBoard)
 	case focusStageList, focusRefRunList, focusDetailViewport:
-		h.model.tab = panelExecution
+		h.model.setTab(panelExecution)
 	}
 	h.model.setFocus(area)
 	return h
 }
 
 func (h TestHarness) SetExecutionPanel() TestHarness {
-	h.model.tab = panelExecution
+	h.model.setTab(panelExecution)
 	h.model.setFocus(focusStageList)
 	return h
 }
@@ -249,6 +265,20 @@ func (h TestHarness) SeedOverview(taskIDs ...string) TestHarness {
 		h.model.overview.items = append(h.model.overview.items, item)
 	}
 	h.model.overview.page.total = len(h.model.overview.items)
+	h.model.overview.page.current = 1
+	h.model.overview.refreshTable(cursorKeep)
+	return h
+}
+
+func (h TestHarness) SeedOverviewTask(taskID, state string) TestHarness {
+	h.model.overview.items = []overviewItem{{
+		TaskID:    taskID,
+		RunStatus: model.RunCompletedClean,
+		HasTask:   true,
+		TaskState: state,
+	}}
+	h.model.overview.items[0].SearchText = overviewSearchText(h.model.overview.items[0])
+	h.model.overview.page.total = 1
 	h.model.overview.page.current = 1
 	h.model.overview.refreshTable(cursorKeep)
 	return h
@@ -284,7 +314,7 @@ func (h TestHarness) SetDetailContent(width, height int, content string) TestHar
 
 func (h TestHarness) SeedExecutionDetail(taskID string) TestHarness {
 	h = h.SeedOverview(taskID)
-	h.model.tab = panelExecution
+	h.model.setTab(panelExecution)
 	h.model.detailVM = executionViewModel{
 		TaskID:       taskID,
 		HasRun:       true,
@@ -304,7 +334,7 @@ func (h TestHarness) SeedExecutionDetail(taskID string) TestHarness {
 
 func (h TestHarness) SeedExecutionRun(taskID, runID string, stages []model.StageRecord, selected string) TestHarness {
 	h = h.SeedOverview(taskID)
-	h.model.tab = panelExecution
+	h.model.setTab(panelExecution)
 	h.model.detailVM = executionViewModel{
 		TaskID:                taskID,
 		HasRun:                true,
@@ -435,6 +465,10 @@ func (h TestHarness) Confirm() bool {
 
 func (h TestHarness) CancelConfirm() bool {
 	return h.model.confirmCancelTaskID != ""
+}
+
+func (h TestHarness) StartupDockerCleanupConfirm() bool {
+	return h.model.confirmStartupDockerCleanup
 }
 
 func (h TestHarness) Running() bool {

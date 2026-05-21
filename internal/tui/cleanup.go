@@ -14,10 +14,15 @@ import (
 )
 
 func ForceExitCleanup(ctx context.Context, cfg config.Config, tasks []TaskProject) error {
+	_, err := forceExitCleanup(ctx, cfg, executor.New(), tasks)
+	return err
+}
+
+func ForceExitCleanupResult(ctx context.Context, cfg config.Config, tasks []TaskProject) ([]string, error) {
 	return forceExitCleanup(ctx, cfg, executor.New(), tasks)
 }
 
-func forceExitCleanup(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
+func forceExitCleanup(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) ([]string, error) {
 	if exec == nil {
 		exec = executor.New()
 	}
@@ -32,8 +37,17 @@ func forceExitCleanup(ctx context.Context, cfg config.Config, exec executor.Comm
 		taskIDs = append(taskIDs, task.ID)
 	}
 	summary, err := pipelinepkg.ForceExitCleanup(ctx, exec, cfg, metas)
+	var stopped []string
+	for i, cleanup := range summary.Runtime {
+		if cleanup.Status == "failed" {
+			continue
+		}
+		if i < len(taskIDs) && taskIDs[i] != "" {
+			stopped = append(stopped, taskIDs[i])
+		}
+	}
 	if err == nil {
-		return nil
+		return stopped, nil
 	}
 	var errs []error
 	for i, cleanup := range summary.Runtime {
@@ -52,7 +66,7 @@ func forceExitCleanup(ctx context.Context, cfg config.Config, exec executor.Comm
 	if len(errs) == 0 {
 		errs = append(errs, err)
 	}
-	return errors.Join(errs...)
+	return stopped, errors.Join(errs...)
 }
 
 func LightExitCleanup(ctx context.Context, cfg config.Config) error {

@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
@@ -336,5 +337,46 @@ func TestLoadRejectsNonPositiveLimits(t *testing.T) {
 	}
 	if _, err := config.Load(dir, config.Overrides{}); err == nil {
 		t.Fatal("expected non-positive docs limit to be rejected")
+	}
+}
+
+func TestLoadRejectsUnsafeGitBaseURL(t *testing.T) {
+	for _, raw := range []string{
+		"http://gitlab.example/fullstack/",
+		"ssh://gitlab.example/fullstack/",
+		"file:///tmp/repos/",
+		"https://user:pass@gitlab.example/fullstack/",
+		"https://gitlab.example/fullstack/?token=secret",
+		"https://gitlab.example/fullstack/#frag",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			dir := t.TempDir()
+			content := []byte("git:\n  base_url: " + strconv.Quote(raw) + "\n")
+			if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := config.Load(dir, config.Overrides{}); err == nil {
+				t.Fatal("expected unsafe git base url to be rejected")
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsGitBaseURLWhenHostIsAllowed(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`git:
+  base_url: "https://gitlab.example/fullstack/"
+  allowed_hosts:
+    - "gitlab.example"
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Git.BaseURL != "https://gitlab.example/fullstack/" || len(cfg.Git.AllowedHosts) != 1 || cfg.Git.AllowedHosts[0] != "gitlab.example" {
+		t.Fatalf("git config not loaded as expected: %#v", cfg.Git)
 	}
 }

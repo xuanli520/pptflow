@@ -27,6 +27,13 @@ func (m *focusManager) Push(target focusTarget) {
 	m.current = target
 }
 
+func (m *focusManager) SetCurrent(target focusTarget) {
+	if m == nil {
+		return
+	}
+	m.current = target
+}
+
 func (m *focusManager) Pop() focusTarget {
 	if m == nil {
 		return focusTargetPage

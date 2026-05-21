@@ -333,6 +333,49 @@ func dockerStartupGCCmd(cfg config.Config, activeJobs int) tea.Cmd {
 	}
 }
 
+func dockerStartupCheckCmd(cfg config.Config, activeJobs int) tea.Cmd {
+	return func() tea.Msg {
+		if activeJobs > 0 {
+			return startupDockerCheckMsg{}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		dockerCfg := cfg.Docker
+		dockerCfg.GC.Enabled = true
+		dockerCfg.GC.P2ROnly = true
+		dockerCfg.GC.PruneExitedContainers = true
+		dockerCfg.GC.PruneNetworks = true
+		dockerCfg.GC.PruneVolumes = false
+		dockerCfg.GC.PruneImages = false
+		dockerCfg.GC.PruneBuilderCache = false
+		summary, err := dockermgr.RunGC(ctx, dockermgr.GCRunRequest{
+			ScanPath:   cfg.ScanPath,
+			Config:     dockerCfg,
+			Exec:       executor.New(),
+			DryRun:     true,
+			Trigger:    "tui_start_legacy_check",
+			SkipReason: "",
+		})
+		return startupDockerCheckMsg{count: dockerGCCandidateCount(summary), err: err}
+	}
+}
+
+func startupDockerCleanupCmd(cfg config.Config) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		return dockerGCMsg{summary: dockermgr.GCSummary{OK: true, Trigger: "startup_confirmed_cleanup"}, err: LightExitCleanup(ctx, cfg)}
+	}
+}
+
+func dockerGCCandidateCount(summary dockermgr.GCSummary) int {
+	count := 0
+	for _, action := range summary.Actions {
+		count += len(action.Candidates)
+	}
+	return count
+}
+
 func renderDockerSettings(m app) string {
 	p := m.dockerMirror
 	lines := []string{
@@ -499,8 +542,20 @@ func (m *app) handleDockerMirrorMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 	case dockerGCMsg:
 		if value.err != nil {
 			m.message = "Docker 清理失败: " + value.err.Error()
+		} else if value.summary.Trigger == "startup_confirmed_cleanup" {
+			m.message = "Docker 遗留资源清理完成"
 		} else if value.summary.Skipped {
 			m.message = "Docker 清理已跳过: " + value.summary.SkipReason
+		}
+		return true
+	case startupDockerCheckMsg:
+		if value.err != nil {
+			m.message = "Docker 遗留资源检查失败: " + value.err.Error()
+			return true
+		}
+		if value.count > 0 {
+			m.confirmStartupDockerCleanup = true
+			m.startupDockerCleanupCount = value.count
 		}
 		return true
 	default:

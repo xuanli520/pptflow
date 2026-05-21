@@ -146,6 +146,17 @@ func TestSettingsOverlayInterceptsQuitShortcuts(t *testing.T) {
 	}
 }
 
+func TestStartupDockerCleanupPromptCanBeSkipped(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).ApplyStartupDockerCheckForTest(2, nil)
+	if !h.StartupDockerCleanupConfirm() || !strings.Contains(h.View(), "遗留 Docker 资源") {
+		t.Fatalf("startup docker check should open cleanup prompt:\n%s", h.View())
+	}
+	next, result := h.Press("n")
+	if result.CmdCount != 0 || next.StartupDockerCleanupConfirm() || !strings.Contains(next.Message(), "已跳过") {
+		t.Fatalf("n should skip startup cleanup, confirm=%v cmds=%d message=%q", next.StartupDockerCleanupConfirm(), result.CmdCount, next.Message())
+	}
+}
+
 func TestSearchMatchesLocalizedStatus(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("search")
 	next, _ := h.Press("通过")
@@ -170,6 +181,17 @@ func TestCtrlROpensConfirmAndConfirmKeys(t *testing.T) {
 	next, result := next.Press("enter")
 	if next.Confirm() || !next.Running() || result.CmdCount == 0 {
 		t.Fatalf("enter should confirm and start run, confirm=%v running=%v cmds=%d", next.Confirm(), next.Running(), result.CmdCount)
+	}
+}
+
+func TestCtrlROnOverviewTaskUsesReinspect(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverviewTask("TASK-20260521-ABCDEF", model.TaskCompleted).
+		SetFocus("overview-table")
+
+	next, result := h.Press("ctrl+r")
+	if next.Confirm() || result.CmdCount == 0 || !strings.Contains(next.Message(), "重新质检") {
+		t.Fatalf("overview task Ctrl+R should submit reinspection, confirm=%v cmds=%d message=%q", next.Confirm(), result.CmdCount, next.Message())
 	}
 }
 

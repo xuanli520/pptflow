@@ -223,28 +223,26 @@ func TestStageBEmptyPortMappingKeepsTaskDockerRunning(t *testing.T) {
 	if err := os.MkdirAll(repoPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(task.RepoPath, "docs", "original-session"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(task.RepoPath, "metadata.json"), []byte(`{"task_id":"`+task.ID+`","prompt":"build it"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(repoPath, "docker-compose.yml"), []byte("services:\n  web:\n    image: test\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	artifactRoot := filepath.Join(root, "run")
-	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	outcome := pipelinepkg.NewRunner(store, cfg, pipelinepkg.WithCommandRunner(stageBNoPortRunner{})).StageBForTest(
+	result, err := pipelinepkg.NewRunner(store, cfg, pipelinepkg.WithCommandRunner(stageBNoPortRunner{})).Run(
 		context.Background(),
-		model.RunRecord{RunID: "run-1", TaskID: task.ID, ArtifactRoot: artifactRoot},
-		scanner.Project{TaskID: task.ID, Path: task.RepoPath},
+		task.ID,
+		pipelinepkg.RunOptions{Stages: []string{"B"}, DeferRuntimeCleanup: true},
 	)
-
-	if outcome.SkipNextStage {
-		t.Fatalf("empty port mapping after docker up should not skip Stage C: %#v", outcome)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
 	}
-	if outcome.Runtime == nil || !outcome.Runtime.HasCleanupTarget() {
-		t.Fatalf("runtime cleanup target should be preserved: %#v", outcome.Runtime)
-	}
-	if outcome.Record.Status != model.StageFailed || !strings.Contains(outcome.Record.ErrorSummary, "no published ports") {
-		t.Fatalf("Stage B should fail with no published ports: %#v", outcome.Record)
+	stageB := stageRecordForTest(result.Stages, "B")
+	if stageB.Status != model.StageFailed || !strings.Contains(stageB.ErrorSummary, "no published ports") {
+		t.Fatalf("Stage B should fail with no published ports: %#v", stageB)
 	}
 	stored, err := store.GetTask(context.Background(), task.ID)
 	if err != nil {
@@ -253,6 +251,15 @@ func TestStageBEmptyPortMappingKeepsTaskDockerRunning(t *testing.T) {
 	if !stored.DockerRunning || stored.FrontendURL != "" || stored.ComposeMeta.Project == "" {
 		t.Fatalf("partial Docker startup should keep task docker_running with compose meta: %#v", stored)
 	}
+}
+
+func stageRecordForTest(stages []model.StageRecord, stage string) model.StageRecord {
+	for _, record := range stages {
+		if record.Stage == stage {
+			return record
+		}
+	}
+	return model.StageRecord{}
 }
 
 func assertKeyOrder(t *testing.T, got, want []string) {

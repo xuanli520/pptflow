@@ -259,9 +259,6 @@ func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string)
 				return fmt.Errorf("docker cleanup failed for %s: %s", taskID, cleanupErrorText(summary))
 			}
 		}
-		if err := s.store.MarkTaskDockerStopped(ctx, taskID); err != nil {
-			return err
-		}
 	}
 	_, err = s.store.CompleteTask(ctx, taskID)
 	return err

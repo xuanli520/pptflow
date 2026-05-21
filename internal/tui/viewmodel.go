@@ -31,6 +31,7 @@ type overviewItem struct {
 	LastRunID     string
 	LastRun       string
 	RunStatus     string
+	HasTask       bool
 	TaskState     string
 	ManualVerdict string
 	FailedStage   string
@@ -105,6 +106,7 @@ func buildOverviewItems(cfg config.Config, projects []db.ProjectSummary) []overv
 			LastRunID:     project.LastRunID,
 			LastRun:       project.LastRunAt,
 			RunStatus:     project.RunStatus,
+			HasTask:       project.HasTask,
 			TaskState:     project.TaskState,
 			ManualVerdict: project.ManualVerdict,
 			FailedStage:   project.FailedStage,

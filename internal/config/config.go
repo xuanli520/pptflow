@@ -47,6 +47,7 @@ type GitConfig struct {
 	CloneTimeout time.Duration
 	ShallowClone bool
 	LFSEnabled   bool
+	AllowedHosts []string
 }
 
 type DockerConfig struct {
@@ -164,10 +165,11 @@ type rawPipelineConfig struct {
 }
 
 type rawGitConfig struct {
-	BaseURL      *string `yaml:"base_url"`
-	CloneTimeout *string `yaml:"clone_timeout"`
-	ShallowClone *bool   `yaml:"shallow_clone"`
-	LFSEnabled   *bool   `yaml:"lfs_enabled"`
+	BaseURL      *string  `yaml:"base_url"`
+	CloneTimeout *string  `yaml:"clone_timeout"`
+	ShallowClone *bool    `yaml:"shallow_clone"`
+	LFSEnabled   *bool    `yaml:"lfs_enabled"`
+	AllowedHosts []string `yaml:"allowed_hosts"`
 }
 
 type rawDockerConfig struct {
@@ -262,6 +264,7 @@ func Default() Config {
 			CloneTimeout: 10 * time.Minute,
 			ShallowClone: true,
 			LFSEnabled:   false,
+			AllowedHosts: []string{"gitlab.mindflow.com.cn"},
 		},
 		Docker: DockerConfig{
 			ManagedLabel:                "managed_by=p2rqa",
@@ -505,6 +508,9 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 		if raw.Git.LFSEnabled != nil {
 			cfg.Git.LFSEnabled = *raw.Git.LFSEnabled
 		}
+		if raw.Git.AllowedHosts != nil {
+			cfg.Git.AllowedHosts = raw.Git.AllowedHosts
+		}
 	}
 	if raw.Docker != nil {
 		if raw.Docker.ManagedLabel != nil {
@@ -708,6 +714,7 @@ func applyRawDockerGC(cfg *DockerGCConfig, raw *rawDockerGCConfig) {
 func normalize(cfg *Config) {
 	cfg.Pipeline.MaxConcurrent = NormalizeMaxConcurrent(cfg.Pipeline.MaxConcurrent)
 	cfg.Git.BaseURL = strings.TrimSpace(cfg.Git.BaseURL)
+	cfg.Git.AllowedHosts = normalizeHosts(cfg.Git.AllowedHosts)
 	if cfg.Git.CloneTimeout <= 0 {
 		cfg.Git.CloneTimeout = 10 * time.Minute
 	}
@@ -739,7 +746,10 @@ func Validate(cfg Config) error {
 		return fmt.Errorf("git.base_url must not be empty")
 	}
 	if !validGitBaseURL(cfg.Git.BaseURL) {
-		return fmt.Errorf("git.base_url must be an absolute URL")
+		return fmt.Errorf("git.base_url must be an absolute HTTPS URL without credentials, query, or fragment")
+	}
+	if !gitBaseURLAllowed(cfg.Git.BaseURL, cfg.Git.AllowedHosts) {
+		return fmt.Errorf("git.base_url host must be listed in git.allowed_hosts")
 	}
 	if cfg.Git.CloneTimeout <= 0 {
 		return fmt.Errorf("git.clone_timeout must be greater than 0")
@@ -809,15 +819,47 @@ func Validate(cfg Config) error {
 
 func validGitBaseURL(value string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(value))
-	if err != nil || parsed.Scheme == "" {
+	if err != nil {
 		return false
 	}
-	switch parsed.Scheme {
-	case "http", "https", "ssh", "file":
-		return parsed.Host != "" || parsed.Scheme == "file"
-	default:
+	if parsed.Scheme != "https" || parsed.Hostname() == "" {
 		return false
 	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	return true
+}
+
+func gitBaseURLAllowed(value string, allowed []string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return false
+	}
+	for _, allowedHost := range allowed {
+		if host == allowedHost {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeHosts(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		host := strings.ToLower(strings.TrimSpace(value))
+		if host == "" || seen[host] {
+			continue
+		}
+		seen[host] = true
+		result = append(result, host)
+	}
+	return result
 }
 
 func validateOneOf(name, value string, allowed ...string) error {
