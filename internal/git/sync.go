@@ -70,7 +70,20 @@ func (s *Syncer) Sync(ctx context.Context, taskID, batchID, gitURL string, onPro
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("stat clone marker: %w", err)
 	}
+	if s.existingClone(clonePath, repoPath) {
+		return s.forcePull(ctx, clonePath, repoPath, markerPath, onProgress)
+	}
 	return s.clone(ctx, clonePath, repoPath, markerPath, gitURL, onProgress)
+}
+
+func (s *Syncer) existingClone(clonePath, repoPath string) bool {
+	if info, err := os.Stat(filepath.Join(clonePath, ".git")); err != nil || !info.IsDir() {
+		return false
+	}
+	if info, err := os.Stat(repoPath); err != nil || !info.IsDir() {
+		return false
+	}
+	return true
 }
 
 func (s *Syncer) clone(ctx context.Context, clonePath, repoPath, markerPath, gitURL string, onProgress SyncCallback) (*SyncResult, error) {

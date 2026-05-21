@@ -22,7 +22,7 @@ func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) s
 		if taskHasGitSyncStatus(task) {
 			lines = append(lines, inspectingTaskLines(task, bodyWidth)...)
 			if strings.TrimSpace(task.SyncError) != "" {
-				lines = append(lines, errorStyle.Render(truncateDisplay("Ctrl+G 重试", bodyWidth)))
+				lines = append(lines, errorStyle.Render(truncateDisplay("Ctrl+W 重试", bodyWidth)))
 			}
 		} else {
 			line := fmt.Sprintf("累计完成: %d 次", task.CompletionCount)
@@ -34,15 +34,27 @@ func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) s
 	default:
 		lines = append(lines, inspectingTaskLines(task, bodyWidth)...)
 		if strings.TrimSpace(task.SyncError) != "" {
-			lines = append(lines, errorStyle.Render(truncateDisplay("Ctrl+G 重试", bodyWidth)))
+			lines = append(lines, errorStyle.Render(truncateDisplay("Ctrl+W 重试", bodyWidth)))
 		}
 	}
 	lines = append(lines, mutedStyle.Render(strings.Repeat("─", min(bodyWidth, 28))))
 	rendered := strings.Join(lines, "\n")
 	if selected {
-		return selectedStyle.Render(rendered)
+		selectedLines := make([]string, 0, len(lines))
+		for _, line := range lines {
+			selectedLines = append(selectedLines, selectedStyle.Render(padDisplay(line, bodyWidth)))
+		}
+		return strings.Join(selectedLines, "\n")
 	}
 	return rendered
+}
+
+func padDisplay(value string, width int) string {
+	value = truncateDisplay(value, width)
+	if extra := width - lipgloss.Width(value); extra > 0 {
+		return value + strings.Repeat(" ", extra)
+	}
+	return value
 }
 
 func taskHasGitSyncStatus(task TaskProject) bool {

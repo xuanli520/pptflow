@@ -89,6 +89,34 @@ func TestSyncForcePullResetsAndCleansExistingClone(t *testing.T) {
 	}
 }
 
+func TestSyncForcePullsExistingCloneWithoutMarker(t *testing.T) {
+	requireGit(t)
+	taskID := "TASK-20260521-NOMARK"
+	batchID := "batch-1"
+	remotePath, workPath := createRemoteRepo(t, taskID, "v1")
+	basePath := filepath.Join(t.TempDir(), "projects-qa")
+	syncer := gitsync.NewSyncer(basePath, config.GitConfig{CloneTimeout: 10 * time.Second})
+
+	first, err := syncer.Sync(context.Background(), taskID, batchID, remotePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(basePath, batchID, taskID, ".qa-clone-done")); err != nil {
+		t.Fatal(err)
+	}
+	updateRemoteRepo(t, workPath, taskID, "v2")
+
+	second, err := syncer.Sync(context.Background(), taskID, batchID, remotePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Operation != "force-pull" || second.Commit == first.Commit {
+		t.Fatalf("unexpected sync result without marker: first=%#v second=%#v", first, second)
+	}
+	assertFileContains(t, filepath.Join(second.RepoPath, "metadata.json"), "v2")
+	assertFileContains(t, filepath.Join(basePath, batchID, taskID, ".qa-clone-done"), "commit="+second.Commit)
+}
+
 func TestSyncRejectsPathTraversal(t *testing.T) {
 	requireGit(t)
 	taskID := "TASK-20260521-SAFE"

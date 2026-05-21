@@ -244,18 +244,66 @@ func renderTaskColumn(col taskListModel, focused bool, width, height int, now ti
 	} else {
 		title = mutedStyle.Render(title)
 	}
-	bodyHeight := max(1, height-2)
-	col.lastSize = max(1, bodyHeight/4)
+	contentHeight := max(1, height-panelStyle.GetVerticalFrameSize())
+	bodyHeight := max(0, contentHeight-1)
+	col.lastSize = max(1, bodyHeight/3)
 	col.clamp()
-	var lines []string
-	lines = append(lines, title)
+	lines := []string{title}
+	if bodyHeight == 0 {
+		return renderPanel(width, height, strings.Join(lines, "\n"))
+	}
 	if len(col.items) == 0 {
 		lines = append(lines, mutedStyle.Render("暂无题目"))
 	} else {
-		end := min(len(col.items), col.scroll+col.lastSize)
-		for index := col.scroll; index < end; index++ {
-			lines = append(lines, renderTaskCard(col.items[index], focused && index == col.cursor, max(12, width-2), now))
-		}
+		lines = append(lines, visibleTaskCardLines(&col, focused, max(12, width-2), bodyHeight, now)...)
 	}
 	return renderPanel(width, height, strings.Join(lines, "\n"))
+}
+
+func visibleTaskCardLines(col *taskListModel, focused bool, width, budget int, now time.Time) []string {
+	if col == nil || len(col.items) == 0 || budget <= 0 {
+		return nil
+	}
+	start := clamp(col.scroll, 0, len(col.items)-1)
+	if col.cursor < start {
+		start = col.cursor
+	}
+	lines, count, includesCursor := taskCardWindowLines(col.items, start, col.cursor, focused, width, budget, now)
+	if !includesCursor {
+		start = col.cursor
+		lines, count, _ = taskCardWindowLines(col.items, start, col.cursor, focused, width, budget, now)
+	}
+	col.scroll = start
+	col.lastSize = max(1, count)
+	return lines
+}
+
+func taskCardWindowLines(items []TaskProject, start, cursor int, focused bool, width, budget int, now time.Time) ([]string, int, bool) {
+	var lines []string
+	count := 0
+	includesCursor := false
+	for index := start; index < len(items); index++ {
+		card := renderTaskCard(items[index], focused && index == cursor, width, now)
+		cardLines := strings.Split(card, "\n")
+		remaining := budget - len(lines)
+		if remaining <= 0 {
+			break
+		}
+		if len(cardLines) > remaining {
+			if count == 0 {
+				lines = append(lines, cardLines[:remaining]...)
+				count++
+				if index == cursor {
+					includesCursor = true
+				}
+			}
+			break
+		}
+		lines = append(lines, cardLines...)
+		count++
+		if index == cursor {
+			includesCursor = true
+		}
+	}
+	return lines, count, includesCursor
 }

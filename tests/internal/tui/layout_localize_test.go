@@ -50,7 +50,7 @@ func TestOverviewWideShowsCompletionCountColumn(t *testing.T) {
 	}
 }
 
-func TestOverviewLegacyRowsShowDashForTaskID(t *testing.T) {
+func TestOverviewLegacyRowsShowTaskID(t *testing.T) {
 	columns := tuiapp.OverviewColumnsForTest(120)
 	taskIDIndex := -1
 	for index, column := range columns {
@@ -63,8 +63,8 @@ func TestOverviewLegacyRowsShowDashForTaskID(t *testing.T) {
 		t.Fatalf("task_id column missing: %#v", columns)
 	}
 	row := tuiapp.OverviewLegacyRowForTest(120)
-	if row[taskIDIndex] != "-" {
-		t.Fatalf("legacy overview row task id = %q, want '-'; row=%#v", row[taskIDIndex], row)
+	if row[taskIDIndex] != "TASK-LEGACY" {
+		t.Fatalf("legacy overview row task id = %q, want TASK-LEGACY; row=%#v", row[taskIDIndex], row)
 	}
 }
 
@@ -207,6 +207,21 @@ func TestTaskBoardColumnsUseSeparatorsAndFixedTitles(t *testing.T) {
 	)
 	if !strings.Contains(view, "│") || !strings.Contains(view, "─── 开始质检 (1) ───") {
 		t.Fatalf("task board should show column separators and fixed titles:\n%s", view)
+	}
+	if got := lipgloss.Width(view); got > 120 {
+		t.Fatalf("task board width = %d, want <= 120\n%s", got, view)
+	}
+}
+
+func TestTaskBoardShortViewportDoesNotOverflow(t *testing.T) {
+	tasks := []tuiapp.TaskProject{
+		{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskInspecting, SyncError: "network timeout"},
+		{ID: "TASK-20260521-BBBBBB", TaskState: model.TaskInspecting, SyncPhase: "clone", SyncPercent: 45},
+		{ID: "TASK-20260521-CCCCCC", TaskState: model.TaskInspecting, RunStatus: model.RunRunning, CurrentStage: "E"},
+	}
+	view := tuiapp.TaskBoardViewForTest(120, 8, tasks, tasks, tasks)
+	if got := lipgloss.Height(view); got > 8 {
+		t.Fatalf("task board height = %d, want <= 8\n%s", got, view)
 	}
 	if got := lipgloss.Width(view); got > 120 {
 		t.Fatalf("task board width = %d, want <= 120\n%s", got, view)

@@ -241,6 +241,20 @@ func TestCtrlROnOverviewTaskUsesReinspect(t *testing.T) {
 	}
 }
 
+func TestCtrlWRetriesGitSync(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedTaskBoardForTest([]tuiapp.TaskProject{
+		{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskInspecting, SyncError: "auth failed"},
+	}).SetFocus("task-board")
+	view := h.View()
+	if !strings.Contains(view, "Ctrl+W 重试Git") {
+		t.Fatalf("task board footer should expose Ctrl+W retry, got:\n%s", view)
+	}
+	next, result := h.Press("ctrl+w")
+	if result.CmdCount == 0 || !strings.Contains(next.Message(), "正在重试 Git 同步") {
+		t.Fatalf("ctrl+w should submit retry, cmds=%d message=%q", result.CmdCount, next.Message())
+	}
+}
+
 func TestRecheckRequiresRefRunBeforeConfirm(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedOverview("TASK-1").
@@ -360,6 +374,22 @@ func TestOverviewTableMovesSelection(t *testing.T) {
 	next, _ := h.Press("down")
 	if got := next.SelectedTaskID(); got != "TASK-2" {
 		t.Fatalf("selected task = %s, want TASK-2", got)
+	}
+}
+
+func TestTaskBoardSelectionWraps(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedTaskBoardForTest([]tuiapp.TaskProject{
+		{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskInspecting},
+		{ID: "TASK-20260521-BBBBBB", TaskState: model.TaskInspecting},
+	}).SetFocus("task-board")
+
+	next, _ := h.Press("up")
+	if got := next.SelectedTaskID(); got != "TASK-20260521-BBBBBB" {
+		t.Fatalf("up should wrap to last task, got %s", got)
+	}
+	next, _ = next.Press("down")
+	if got := next.SelectedTaskID(); got != "TASK-20260521-AAAAAA" {
+		t.Fatalf("down should wrap to first task, got %s", got)
 	}
 }
 

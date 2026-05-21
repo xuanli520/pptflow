@@ -38,7 +38,11 @@ func (m *taskListModel) move(delta int) {
 		m.scroll = 0
 		return
 	}
-	m.cursor = clamp(m.cursor+delta, 0, len(m.items)-1)
+	next := (m.cursor + delta) % len(m.items)
+	if next < 0 {
+		next += len(m.items)
+	}
+	m.cursor = next
 	m.clamp()
 }
 

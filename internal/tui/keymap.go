@@ -204,7 +204,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			m.message = "请选择待处理题目"
 			return m, cmds
 		}
-	case "ctrl+g":
+	case "ctrl+w":
 		if m.tab == panelTaskBoard {
 			if task, ok := m.taskBoard.SelectedTask(); ok && canRetryGitSyncTask(task) {
 				m.message = "正在重试 Git 同步 " + task.ID
@@ -436,7 +436,7 @@ func globalKeyWhileInput(key string) bool {
 		return true
 	}
 	switch key {
-	case "ctrl+c", "ctrl+q", "ctrl+o", "ctrl+e", "ctrl+g", "ctrl+x", "ctrl+r", "q":
+	case "ctrl+c", "ctrl+q", "ctrl+o", "ctrl+e", "ctrl+w", "ctrl+x", "ctrl+r", "q":
 		return true
 	default:
 		return false
@@ -574,7 +574,7 @@ func footerFor(m app) string {
 	}
 	switch m.focus {
 	case focusTaskBoard:
-		return "/ 输入题目  Ctrl+E 确认  Ctrl+R 重检  Ctrl+G 重试Git  Ctrl+O 总览  Ctrl+/ 设置  Q 退出"
+		return "/ 输入题目  Ctrl+E 确认  Ctrl+R 重检  Ctrl+W 重试Git  Ctrl+O 总览  Ctrl+/ 设置  Q 退出"
 	case focusTaskInput:
 		return "Enter 开始质检  Esc 清空  ←→ 光标  Ctrl+E/Ctrl+R/Ctrl+O 全局  Ctrl+/ 设置  Q 退出"
 	case focusSearch:

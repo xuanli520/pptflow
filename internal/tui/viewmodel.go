@@ -165,7 +165,7 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 }
 
 func overviewTaskIDText(item overviewItem) string {
-	if !item.HasTask {
+	if strings.TrimSpace(item.TaskID) == "" {
 		return "-"
 	}
 	return item.TaskID

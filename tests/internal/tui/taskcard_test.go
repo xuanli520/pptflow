@@ -25,7 +25,7 @@ func TestTaskCardShowsGitProgressAndRetryFailure(t *testing.T) {
 		TaskState: model.TaskInspecting,
 		SyncError: "network timeout",
 	}, 34, time.Time{})
-	if !strings.Contains(failed, "[Git 同步失败]") || !strings.Contains(failed, "Ctrl+G 重试") {
+	if !strings.Contains(failed, "[Git 同步失败]") || !strings.Contains(failed, "Ctrl+W 重试") {
 		t.Fatalf("git failure card missing retry affordance:\n%s", failed)
 	}
 
@@ -44,7 +44,7 @@ func TestTaskCardShowsGitProgressAndRetryFailure(t *testing.T) {
 		TaskState: model.TaskCompleted,
 		SyncError: "auth failed",
 	}, 34, time.Time{})
-	if !strings.Contains(completedFailed, "[Git 同步失败]") || !strings.Contains(completedFailed, "Ctrl+G 重试") {
+	if !strings.Contains(completedFailed, "[Git 同步失败]") || !strings.Contains(completedFailed, "Ctrl+W 重试") {
 		t.Fatalf("completed reinspection git failure should be retryable:\n%s", completedFailed)
 	}
 }

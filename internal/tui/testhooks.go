@@ -344,6 +344,14 @@ func (h TestHarness) SeedOverviewTask(taskID, state string) TestHarness {
 	return h
 }
 
+func (h TestHarness) SeedTaskBoardForTest(inspecting []TaskProject) TestHarness {
+	if h.model.taskBoard != nil {
+		h.model.taskBoard.cols[taskColumnInspecting].setItems(inspecting)
+		h.model.taskBoard.focused = taskColumnInspecting
+	}
+	return h
+}
+
 func (h TestHarness) SeedStages(stages []model.StageRecord, selected string) TestHarness {
 	h.model.detailVM.Stages = normalizeStageViews(stages)
 	h.model.selectedStageKey = selected
@@ -787,6 +795,8 @@ func testKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlR}
 	case "ctrl+x":
 		return tea.KeyMsg{Type: tea.KeyCtrlX}
+	case "ctrl+w":
+		return tea.KeyMsg{Type: tea.KeyCtrlW}
 	case "ctrl+/":
 		return tea.KeyMsg{Type: tea.KeyCtrlUnderscore}
 	case "ctrl+left":
