@@ -13,9 +13,80 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
+
+func TestStartInspectionRecordsSyncErrorWhenSubmitFails(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scheduler := &failingInspectionScheduler{err: errors.New("scheduler down")}
+
+	err = tuiapp.StartInspectionForTest(ctx, store, cfg, scheduler, "TASK-20260521-ABCDEF")
+	if err == nil || !strings.Contains(err.Error(), "scheduler down") {
+		t.Fatalf("expected scheduler failure, got %v", err)
+	}
+	if scheduler.calls != 1 {
+		t.Fatalf("submit calls = %d, want 1", scheduler.calls)
+	}
+	task, err := store.GetTask(ctx, "TASK-20260521-ABCDEF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskInspecting || task.CurrentRunID != "" || !strings.Contains(task.SyncError, "scheduler down") {
+		t.Fatalf("failed submit should leave retryable inspecting task with sync error: %#v", task)
+	}
+}
+
+func TestFindStaleInspectingOnlyReturnsRetryableOrphans(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	stale, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-AAAAAA", "https://gitlab.example/TASK-20260521-AAAAAA", cfg.ScanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withError, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-BBBBBB", "https://gitlab.example/TASK-20260521-BBBBBB", cfg.ScanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordTaskGitError(ctx, withError.ID, errors.New("auth failed")); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-CCCCCC", "https://gitlab.example/TASK-20260521-CCCCCC", cfg.ScanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-active",
+		TaskID:       active.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := tuiapp.FindStaleInspectingForTest(ctx, store, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != stale.ID || tasks[0].GitURL == "" {
+		t.Fatalf("stale inspecting tasks = %#v", tasks)
+	}
+}
 
 func TestConfirmCompleteSkipsDockerCleanupWhenDaemonUnavailable(t *testing.T) {
 	store, cfg, taskID := waitingManualTask(t)
@@ -105,4 +176,14 @@ func (e *confirmCompleteExec) hasCommand(fragment string) bool {
 		}
 	}
 	return false
+}
+
+type failingInspectionScheduler struct {
+	err   error
+	calls int
+}
+
+func (s *failingInspectionScheduler) SubmitInspection(taskID, batchID, gitURL string, opts pipeline.RunOptions) (string, error) {
+	s.calls++
+	return "", s.err
 }

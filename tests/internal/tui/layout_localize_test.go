@@ -50,6 +50,24 @@ func TestOverviewWideShowsCompletionCountColumn(t *testing.T) {
 	}
 }
 
+func TestOverviewLegacyRowsShowDashForTaskID(t *testing.T) {
+	columns := tuiapp.OverviewColumnsForTest(120)
+	taskIDIndex := -1
+	for index, column := range columns {
+		if column.Key == "task_id" {
+			taskIDIndex = index
+			break
+		}
+	}
+	if taskIDIndex < 0 {
+		t.Fatalf("task_id column missing: %#v", columns)
+	}
+	row := tuiapp.OverviewLegacyRowForTest(120)
+	if row[taskIDIndex] != "-" {
+		t.Fatalf("legacy overview row task id = %q, want '-'; row=%#v", row[taskIDIndex], row)
+	}
+}
+
 func TestOverviewColumnsHideLastRunWhenWidthInsufficient(t *testing.T) {
 	titles := titleSet(tuiapp.OverviewColumnTitlesForTest(100))
 	if titles["最后运行"] {
@@ -133,6 +151,14 @@ func TestFooterChangesWithFocus(t *testing.T) {
 	detail := tuiapp.FooterForTest("detail-viewport", false)
 	if search == "" || search == detail {
 		t.Fatalf("footer should be focus-specific, search=%q detail=%q", search, detail)
+	}
+	taskBoard := tuiapp.FooterForTest("task-board", false)
+	if !strings.Contains(taskBoard, "Ctrl+E") || !strings.Contains(taskBoard, "Ctrl+/") || !strings.Contains(taskBoard, "Q 退出") {
+		t.Fatalf("task board footer should expose global workflow keys, got %q", taskBoard)
+	}
+	taskInput := tuiapp.FooterForTest("task-input", false)
+	if !strings.Contains(taskInput, "Enter 开始质检") || !strings.Contains(taskInput, "Ctrl+/") || !strings.Contains(taskInput, "Q 退出") {
+		t.Fatalf("task input footer should expose submit/global keys, got %q", taskInput)
 	}
 	if got := tuiapp.FooterForTest("search", true); got != "Tab 切换  Space 选择  Enter 确认  Esc 取消" {
 		t.Fatalf("confirm footer = %q", got)

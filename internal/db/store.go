@@ -937,17 +937,26 @@ func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, dur
 		if err != nil || !taskExists {
 			return err
 		}
+		var result sql.Result
 		switch status {
 		case model.RunCompletedClean, model.RunCompletedWithFindings:
-			_, err = tx.ExecContext(ctx, `UPDATE tasks
+			result, err = tx.ExecContext(ctx, `UPDATE tasks
 				SET state = ?, current_run_id = NULL, entered_waiting_at = CASE WHEN entered_waiting_at = '' THEN ? ELSE entered_waiting_at END, updated_at = ?
 				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
 				model.TaskWaitingManual, now, now, taskID, runID)
+			if err != nil {
+				return err
+			}
+			err = requireAffected(result, "active task", taskID)
 		case model.RunAborted, model.RunCrashed:
-			_, err = tx.ExecContext(ctx, `UPDATE tasks
+			result, err = tx.ExecContext(ctx, `UPDATE tasks
 				SET current_run_id = NULL, docker_running = 0, frontend_url = '', compose_meta = '', updated_at = ?
 				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
 				now, taskID, runID)
+			if err != nil {
+				return err
+			}
+			err = requireAffected(result, "active task", taskID)
 		}
 		return err
 	})

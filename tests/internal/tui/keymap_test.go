@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
@@ -28,6 +29,25 @@ func TestCtrlCStartsCleanupAwareQuit(t *testing.T) {
 	next, result := tuiapp.NewTestHarness(config.Default()).Press("ctrl+c")
 	if result.Quit || result.CmdCount == 0 || !strings.Contains(next.Message(), "Docker 运行状态") {
 		t.Fatalf("ctrl+c should start cleanup-aware quit, quit=%v cmds=%d message=%q", result.Quit, result.CmdCount, next.Message())
+	}
+}
+
+func TestTaskInputQStartsCleanupAwareQuit(t *testing.T) {
+	next, result := tuiapp.NewTestHarness(config.Default()).SetFocus("task-input").Press("q")
+	if result.Quit || result.CmdCount == 0 || !strings.Contains(next.Message(), "Docker 运行状态") {
+		t.Fatalf("q in task input should start cleanup-aware quit, quit=%v cmds=%d message=%q", result.Quit, result.CmdCount, next.Message())
+	}
+}
+
+func TestTaskInputEscapeRestoresPreviousFocus(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetExecutionPanel().SetFocus("detail-viewport")
+	h, _ = h.Press("/")
+	if h.FocusName() != "task-input" {
+		t.Fatalf("/ should focus task input, got %s", h.FocusName())
+	}
+	h, _ = h.Press("esc")
+	if h.FocusName() != "detail-viewport" || h.TabName() != "execution" {
+		t.Fatalf("esc should restore previous focus, tab=%s focus=%s", h.TabName(), h.FocusName())
 	}
 }
 
@@ -57,7 +77,7 @@ func TestSettingsOverlayKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testin
 		t.Fatal(err)
 	}
 	h := tuiapp.NewTestHarness(cfg).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("ctrl+?")
+	h, _ = h.Press("ctrl+/")
 
 	view := h.View()
 	if !strings.Contains(view, "设置") || !strings.Contains(view, "> Docker 镜像源") || !strings.Contains(view, "目标配置") || !strings.Contains(view, "备份") || !strings.Contains(view, "1 个") {
@@ -76,7 +96,7 @@ func TestSettingsOverlayKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testin
 
 func TestSettingsArrowKeysMoveDockerSettingFocus(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("ctrl+?")
+	h, _ = h.Press("ctrl+/")
 
 	view := h.View()
 	if !strings.Contains(view, "> 启用") {
@@ -104,7 +124,7 @@ func TestSettingsArrowKeysMoveDockerSettingFocus(t *testing.T) {
 
 func TestSettingsOverlayTabCyclesFieldsAndQCloses(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("ctrl+?")
+	h, _ = h.Press("ctrl+/")
 	view := h.View()
 	if !strings.Contains(view, "> 启用") {
 		t.Fatalf("settings overlay should start on enabled field:\n%s", view)
@@ -123,9 +143,22 @@ func TestSettingsOverlayTabCyclesFieldsAndQCloses(t *testing.T) {
 	}
 }
 
+func TestSettingsOverlayCtrlSlashToggles(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+	opened, _ := h.Press("ctrl+/")
+	if !strings.Contains(opened.View(), "目标配置") {
+		t.Fatalf("ctrl+/ should open settings overlay:\n%s", opened.View())
+	}
+
+	closed, result := opened.Press("ctrl+/")
+	if result.Quit || strings.Contains(closed.View(), "目标配置") {
+		t.Fatalf("ctrl+/ should close settings overlay without quitting, quit=%v view=\n%s", result.Quit, closed.View())
+	}
+}
+
 func TestSettingsOverlayInterceptsPageSwitchKeys(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("ctrl+?")
+	h, _ = h.Press("ctrl+/")
 
 	h, _ = h.Press("ctrl+right")
 	if h.TabName() != "overview" || !strings.Contains(h.View(), "目标配置") {
@@ -135,7 +168,7 @@ func TestSettingsOverlayInterceptsPageSwitchKeys(t *testing.T) {
 
 func TestSettingsOverlayInterceptsQuitShortcuts(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("ctrl+?")
+	h, _ = h.Press("ctrl+/")
 
 	next, result := h.Press("ctrl+c")
 	if result.Quit || result.CmdCount != 0 || next.TabName() != "overview" || !strings.Contains(next.View(), "目标配置") {
@@ -143,6 +176,19 @@ func TestSettingsOverlayInterceptsQuitShortcuts(t *testing.T) {
 	}
 	if !strings.Contains(next.Message(), "关闭设置") {
 		t.Fatalf("intercept message should explain close key, got %q", next.Message())
+	}
+}
+
+func TestSettingsOverlayDoesNotIncreaseViewportHeight(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table").SetSize(90, 12)
+	closedHeight := lipgloss.Height(h.View())
+	h, _ = h.Press("ctrl+/")
+	view := h.View()
+	if got := lipgloss.Height(view); got > closedHeight {
+		t.Fatalf("settings overlay should not add rows, height=%d closed=%d\n%s", got, closedHeight, view)
+	}
+	if got := lipgloss.Width(view); got > 90 {
+		t.Fatalf("settings overlay width=%d, want <=90\n%s", got, view)
 	}
 }
 

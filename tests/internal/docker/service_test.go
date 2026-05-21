@@ -233,6 +233,51 @@ func TestStartRuntimeAddsManagedLabelOverride(t *testing.T) {
 	}
 }
 
+func TestStartRuntimeReadmeCommandModeAddsManagedLabelOverride(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("`docker compose -f custom.yml up`\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "custom.yml"), []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := t.TempDir()
+	runner := &scriptedDockerRunner{configOutput: "services:\n  web:\n    image: nginx\n"}
+	cfg := config.Default().Docker
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: artifactRoot,
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Labels: map[string]string{
+			"managed_by": "p2rqa",
+		},
+		Timeouts: dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	overridePath := filepath.Join(artifactRoot, "runtime_labels.compose.yml")
+	content, err := os.ReadFile(overridePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "managed_by: p2rqa") {
+		t.Fatalf("readme label override missing managed label:\n%s", content)
+	}
+	if !result.RuntimeSummary.ReadmeCommandMode {
+		t.Fatalf("readme runtime summary should include label override: %#v", result.RuntimeSummary)
+	}
+	if !containsCommand(runner.commands, "custom.yml") || !containsCommand(runner.commands, overridePath+" up") {
+		t.Fatalf("readme compose commands should include custom and label override files: %#v", runner.commands)
+	}
+}
+
 func TestDaemonMirrorsApplyRestoreAndInvalidJSON(t *testing.T) {
 	root := t.TempDir()
 	daemonPath := filepath.Join(root, "daemon.json")

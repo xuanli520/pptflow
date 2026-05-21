@@ -72,6 +72,10 @@ func ReadmeComposeCommand(repoPath string) []string {
 }
 
 func ComposeArgsWithProject(fields []string, projectName string) []string {
+	return ComposeArgsWithProjectFiles(fields, projectName, nil)
+}
+
+func ComposeArgsWithProjectFiles(fields []string, projectName string, files []string) []string {
 	args := append([]string{}, fields[1:]...)
 	commandIndex := ComposeCommandIndex(args)
 	if commandIndex < 0 {
@@ -80,6 +84,11 @@ func ComposeArgsWithProject(fields []string, projectName string) []string {
 	if !HasFlag(args, "-p", "--project-name") {
 		args = append(args[:commandIndex], append([]string{"-p", projectName}, args[commandIndex:]...)...)
 		commandIndex += 2
+	}
+	if len(files) > 0 {
+		fileArgs := ComposeFileArgs(files)
+		args = append(args[:commandIndex], append(fileArgs, args[commandIndex:]...)...)
+		commandIndex += len(fileArgs)
 	}
 	if !HasFlag(args, "-d", "--detach") {
 		upIndex := IndexOf(args, "up")
@@ -91,20 +100,20 @@ func ComposeArgsWithProject(fields []string, projectName string) []string {
 }
 
 func ComposePSArgs(fields []string, projectName string) []string {
-	args := append([]string{}, fields[1:]...)
-	commandIndex := ComposeCommandIndex(args)
-	if commandIndex < 0 {
-		commandIndex = len(args)
-	}
-	globals := append([]string{}, args[:commandIndex]...)
-	if !HasFlag(globals, "-p", "--project-name") {
-		globals = append(globals, "-p", projectName)
-	}
-	return append(globals, "ps", "--format", "json")
+	return append(ComposeGlobals(fields, projectName), "ps", "--format", "json")
+}
+
+func ComposePSArgsWithFiles(fields []string, projectName string, files []string) []string {
+	return append(ComposeGlobalsWithFiles(fields, projectName, files), "ps", "--format", "json")
 }
 
 func ComposePSQArgs(fields []string, projectName string) []string {
 	globals := ComposeGlobals(fields, projectName)
+	return append(globals, "ps", "-q")
+}
+
+func ComposePSQArgsWithFiles(fields []string, projectName string, files []string) []string {
+	globals := ComposeGlobalsWithFiles(fields, projectName, files)
 	return append(globals, "ps", "-q")
 }
 
@@ -113,7 +122,16 @@ func ComposeServicesArgs(fields []string, projectName string) []string {
 	return append(globals, "config", "--services")
 }
 
+func ComposeServicesArgsWithFiles(fields []string, projectName string, files []string) []string {
+	globals := ComposeGlobalsWithFiles(fields, projectName, files)
+	return append(globals, "config", "--services")
+}
+
 func ComposeGlobals(fields []string, projectName string) []string {
+	return ComposeGlobalsWithFiles(fields, projectName, nil)
+}
+
+func ComposeGlobalsWithFiles(fields []string, projectName string, files []string) []string {
 	args := append([]string{}, fields[1:]...)
 	commandIndex := ComposeCommandIndex(args)
 	if commandIndex < 0 {
@@ -123,6 +141,7 @@ func ComposeGlobals(fields []string, projectName string) []string {
 	if !HasFlag(globals, "-p", "--project-name") {
 		globals = append(globals, "-p", projectName)
 	}
+	globals = append(globals, ComposeFileArgs(files)...)
 	return globals
 }
 

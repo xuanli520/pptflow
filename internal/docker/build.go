@@ -154,6 +154,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	activeFiles := []string{}
 	originalFiles := []string{}
 	baseRuntimeFiles := []string{}
+	readmeLabelFiles := []string{}
 	var effectiveConfig string
 	if composeFile != "" {
 		originalFiles = []string{composeFile}
@@ -288,12 +289,45 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		if mirrorSummary.ComposeFile == "" {
 			mirrorSummary.ComposeFile = firstComposeFile(activeFiles)
 		}
+	} else if len(req.Labels) > 0 {
+		configResult := cmd.runStreaming(ctx, "B0 docker compose README label config", timeouts.Port, append(ComposeGlobals(readmeCommand, projectName), "config"), true)
+		if configResult.Err != nil {
+			summary.RuntimeErrorCategory = "readme_label_config_failed"
+			result.RuntimeSummary = summary
+			result.MirrorSummary = mirrorSummary
+			return result, &StartRuntimeError{Category: "readme_label_config_failed", Message: "docker compose config failed before label injection: " + trimResultText(configResult), Fix: "Use a compose file that can be labelled or add a standard docker-compose.yml.", Result: configResult}
+		}
+		effectiveConfig = configResult.Stdout
+		labelOverride := prepareRuntimeLabelOverride(effectiveConfig, req.ArtifactRoot, req.Labels)
+		summary.Warnings = append(summary.Warnings, labelOverride.Warnings...)
+		if labelOverride.File == "" {
+			summary.RuntimeErrorCategory = "readme_label_override_unavailable"
+			result.RuntimeSummary = summary
+			result.MirrorSummary = mirrorSummary
+			return result, &StartRuntimeError{Category: "readme_label_override_unavailable", Message: "runtime label override could not be generated for README compose command mode", Fix: "Use a compose file with named services or disable README command mode.", Result: configResult}
+		}
+		candidateFiles := []string{labelOverride.File}
+		verify := cmd.runStreaming(ctx, "B0 docker compose README label override config", timeouts.Port, append(ComposeGlobalsWithFiles(readmeCommand, projectName, candidateFiles), "config"), true)
+		if verify.Err != nil {
+			summary.RuntimeErrorCategory = "readme_label_override_config_failed"
+			result.RuntimeSummary = summary
+			result.MirrorSummary = mirrorSummary
+			return result, &StartRuntimeError{Category: "readme_label_override_config_failed", Message: "runtime label override config failed: " + trimResultText(verify), Fix: "Fix README compose command or use a standard compose file.", Result: verify}
+		}
+		readmeLabelFiles = candidateFiles
+		effectiveConfig = verify.Stdout
+		summary.ComposeFiles = append([]string{}, readmeLabelFiles...)
+		summary.ComposeFile = firstComposeFile(readmeLabelFiles)
+		mirrorSummary.ComposeFiles = append([]string{}, readmeLabelFiles...)
+		if mirrorSummary.ComposeFile == "" {
+			mirrorSummary.ComposeFile = firstComposeFile(readmeLabelFiles)
+		}
 	}
 	var upArgs []string
 	if composeFile != "" {
 		upArgs = ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "up", "-d")
 	} else {
-		upArgs = ComposeArgsWithProject(readmeCommand, projectName)
+		upArgs = ComposeArgsWithProjectFiles(readmeCommand, projectName, readmeLabelFiles)
 	}
 	up := cmd.runStreaming(ctx, "B3 docker compose up", timeouts.Up, upArgs, true)
 	summary.Up = stepSummaryFromResult(up, true, "ok")
@@ -308,9 +342,9 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	psQArgs := ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "ps", "-q")
 	servicesArgs := ComposeCommandArgsWithProjectDir(activeFiles, workDir, projectName, "config", "--services")
 	if composeFile == "" {
-		psArgs = ComposePSArgs(readmeCommand, projectName)
-		psQArgs = ComposePSQArgs(readmeCommand, projectName)
-		servicesArgs = ComposeServicesArgs(readmeCommand, projectName)
+		psArgs = ComposePSArgsWithFiles(readmeCommand, projectName, readmeLabelFiles)
+		psQArgs = ComposePSQArgsWithFiles(readmeCommand, projectName, readmeLabelFiles)
+		servicesArgs = ComposeServicesArgsWithFiles(readmeCommand, projectName, readmeLabelFiles)
 	}
 	ps := cmd.runStreaming(ctx, "B5 docker compose port collection", timeouts.Port, psArgs, false)
 	mappings, services := ParseComposePS(ps.Stdout)

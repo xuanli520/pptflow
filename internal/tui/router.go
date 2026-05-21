@@ -122,7 +122,10 @@ func (r *pageRouter) Dispatch(msg tea.Msg) (bool, tea.Cmd) {
 	}
 	if overlay := r.TopOverlay(); overlay != nil {
 		handled, cmd := overlay.Update(msg)
-		if handled || overlay.InterceptsAllKeys() {
+		if handled {
+			return true, cmd
+		}
+		if _, ok := msg.(tea.KeyMsg); ok && overlay.InterceptsAllKeys() {
 			return true, cmd
 		}
 	}

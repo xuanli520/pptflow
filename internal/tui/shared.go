@@ -21,6 +21,7 @@ import (
 type TaskProject struct {
 	ID               string
 	BatchID          string
+	GitURL           string
 	TaskState        string
 	CompletionCount  int
 	FrontendURL      string
@@ -53,6 +54,7 @@ type TaskQueryService interface {
 	ListAll(context.Context, db.ProjectQuery) ([]TaskProject, int, error)
 	GetByID(context.Context, string) (*TaskProject, error)
 	FindWithDockerRunning(context.Context) ([]TaskProject, error)
+	FindStaleInspecting(context.Context) ([]TaskProject, error)
 }
 
 type TaskActionService interface {
@@ -120,6 +122,21 @@ func (s dbTaskQueryService) FindWithDockerRunning(ctx context.Context) ([]TaskPr
 	}
 	result := make([]TaskProject, 0, len(tasks))
 	for _, task := range tasks {
+		result = append(result, taskProjectFromTask(s.cfg, task))
+	}
+	return result, nil
+}
+
+func (s dbTaskQueryService) FindStaleInspecting(ctx context.Context) ([]TaskProject, error) {
+	tasks, err := s.store.ListTasksByState(ctx, model.TaskInspecting)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]TaskProject, 0, len(tasks))
+	for _, task := range tasks {
+		if strings.TrimSpace(task.CurrentRunID) != "" || strings.TrimSpace(task.SyncError) != "" {
+			continue
+		}
 		result = append(result, taskProjectFromTask(s.cfg, task))
 	}
 	return result, nil
@@ -195,7 +212,7 @@ func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string)
 	if err != nil {
 		return err
 	}
-	return s.submitInspection(task)
+	return s.submitInspection(ctx, task)
 }
 
 func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string) error {
@@ -213,7 +230,7 @@ func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string) error
 	if strings.TrimSpace(task.CurrentRunID) != "" {
 		return fmt.Errorf("task %s already has an active run", taskID)
 	}
-	return s.submitInspection(task)
+	return s.submitInspection(ctx, task)
 }
 
 func (s dbTaskActionService) RetryGitSync(ctx context.Context, taskID string) error {
@@ -236,7 +253,7 @@ func (s dbTaskActionService) RetryGitSync(ctx context.Context, taskID string) er
 	if strings.TrimSpace(task.SyncError) == "" {
 		return fmt.Errorf("task %s has no git sync error to retry", taskID)
 	}
-	return s.submitInspection(task)
+	return s.submitInspection(ctx, task)
 }
 
 func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string) error {
@@ -299,12 +316,19 @@ func cleanupCheckpointPath(scanPath string) string {
 	return filepath.Join(scanPath, ".qa-control", "cleanup_checkpoint.json")
 }
 
-func (s dbTaskActionService) submitInspection(task model.Task) error {
+func (s dbTaskActionService) submitInspection(ctx context.Context, task model.Task) error {
+	var err error
 	if s.scheduler == nil {
-		return fmt.Errorf("scheduler unavailable")
+		err = fmt.Errorf("scheduler unavailable")
+	} else {
+		opts := pipeline.RunOptions{DeferRuntimeCleanup: true}
+		_, err = s.scheduler.SubmitInspection(task.ID, task.BatchID, task.GitURL, opts)
 	}
-	opts := pipeline.RunOptions{DeferRuntimeCleanup: true}
-	_, err := s.scheduler.SubmitInspection(task.ID, task.BatchID, task.GitURL, opts)
+	if err != nil {
+		if recordErr := s.store.RecordTaskGitError(ctx, task.ID, err); recordErr != nil {
+			return fmt.Errorf("%w; additionally failed to record git sync error: %v", err, recordErr)
+		}
+	}
 	return err
 }
 
@@ -312,6 +336,7 @@ func taskProjectFromTask(cfg config.Config, task model.Task) TaskProject {
 	return TaskProject{
 		ID:               task.ID,
 		BatchID:          task.BatchID,
+		GitURL:           task.GitURL,
 		TaskState:        task.State,
 		CompletionCount:  task.CompletionCount,
 		FrontendURL:      task.FrontendURL,

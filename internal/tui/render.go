@@ -51,7 +51,7 @@ func renderHeader(m app) string {
 		overview = activeStyle.Render(overview)
 	}
 	mode := "模式: " + localizeMode(m.qaMode)
-	settings := "[设置 Ctrl+?]"
+	settings := "[设置 Ctrl+/]"
 	if m.settingsOpen {
 		settings = activeStyle.Render(settings)
 	} else {
@@ -66,7 +66,10 @@ func renderTaskBoard(m app) string {
 }
 
 func renderOverview(m app) string {
-	return m.overview.View()
+	if m.overview == nil {
+		return ""
+	}
+	return m.overview.Render()
 }
 
 func renderExecution(m app) string {

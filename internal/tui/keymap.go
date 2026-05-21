@@ -66,12 +66,16 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	key := msg.String()
 
 	if m.settingsOpen {
+		if handled, overlayCmd := m.settingsUI.Update(msg); handled {
+			m.closeSettingsOverlay()
+			if overlayCmd != nil {
+				cmds = append(cmds, overlayCmd)
+			}
+			return m, cmds
+		}
 		switch key {
 		case "ctrl+c", "ctrl+q":
-			m.message = "设置已打开，按 Esc 或 Q 关闭设置"
-			return m, cmds
-		case "esc", "ctrl+?", "q":
-			m.closeSettingsOverlay()
+			m.message = "设置已打开，按 Esc、Q 或 Ctrl+/ 关闭设置"
 			return m, cmds
 		default:
 			next, settingsCmds := m.handleDockerSettingsKey(msg)
@@ -80,7 +84,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		}
 	}
 	switch key {
-	case "ctrl+?":
+	case settingsShortcutKey, "ctrl+/":
 		m.settingsOpen = true
 		m.settingsFocusBeforeOpen = m.focus
 		m.settingsFocusCaptured = true
@@ -91,6 +95,8 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		return m, cmds
 	case "/":
 		if m.focus != focusTaskInput {
+			m.taskInputFocusBeforeOpen = m.focus
+			m.taskInputFocusCaptured = true
 			m.focusManager.Push(focusTargetInputBox)
 			m.setFocus(focusTaskInput)
 			return m, cmds
@@ -103,7 +109,12 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			}
 			if !m.taskInput.Focused() {
 				m.focusManager.Pop()
-				m.setFocus(m.defaultPageFocus())
+				if m.taskInputFocusCaptured {
+					m.taskInputFocusCaptured = false
+					m.setFocus(m.taskInputFocusBeforeOpen)
+				} else {
+					m.setFocus(m.defaultPageFocus())
+				}
 			}
 		}
 		return m, cmds
@@ -169,16 +180,13 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			return m, cmds
 		}
 	}
-	if m.tab == panelSettings {
-		return m.handleSettingsKey(msg)
-	}
 
 	switch key {
 	case "ctrl+c", "ctrl+q":
 		m.message = "正在检查 Docker 运行状态..."
 		return m, append(cmds, m.prepareQuitCmd())
 	case "q":
-		if m.focus == focusTaskInput || m.focus == focusSearch {
+		if m.focus == focusSearch {
 			break
 		}
 		m.message = "正在检查 Docker 运行状态..."
@@ -253,7 +261,17 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 				cmds = append(cmds, m.reloadDetail())
 			}
 		case "left", "right", "up", "down":
-			m.taskBoard.HandleKey(msg)
+			if m.router != nil && m.router.Active() == pageTaskBoard {
+				if page := m.router.ActivePage(); page != nil {
+					if cmd := page.HandleKey(msg); cmd != nil {
+						cmds = append(cmds, cmd)
+					}
+					break
+				}
+			}
+			if cmd := m.taskBoard.HandleKey(msg); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 	case focusSearch:
 		switch key {
@@ -266,7 +284,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			m.setFocus(focusOverviewTable)
 		default:
 			var cmd tea.Cmd
-			m.overview, cmd = m.overview.Update(msg)
+			_, cmd = m.overview.Update(msg)
 			if cmd != nil {
 				cmds = append(cmds, cmd)
 			}
@@ -286,7 +304,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			before := m.selectedTaskID()
 			beforeKey := m.selectedOverviewDetailKey()
 			var cmd tea.Cmd
-			m.overview, cmd = m.overview.Update(msg)
+			_, cmd = m.overview.Update(msg)
 			if cmd != nil {
 				cmds = append(cmds, cmd)
 			}
@@ -414,12 +432,21 @@ func (m *app) setTab(tab int) {
 }
 
 func globalKeyWhileInput(key string) bool {
+	if isSettingsShortcutKey(key) {
+		return true
+	}
 	switch key {
-	case "ctrl+c", "ctrl+q", "ctrl+?", "ctrl+o", "ctrl+e", "ctrl+g", "ctrl+x", "ctrl+r":
+	case "ctrl+c", "ctrl+q", "ctrl+o", "ctrl+e", "ctrl+g", "ctrl+x", "ctrl+r", "q":
 		return true
 	default:
 		return false
 	}
+}
+
+const settingsShortcutKey = "ctrl+_"
+
+func isSettingsShortcutKey(key string) bool {
+	return key == settingsShortcutKey || key == "ctrl+/"
 }
 
 func (m *app) closeSettingsOverlay() {
@@ -475,9 +502,6 @@ func (m *app) handleEscape() {
 	case m.tab == panelExecution:
 		m.setTab(panelOverview)
 		m.setFocus(focusOverviewTable)
-	case m.tab == panelSettings:
-		m.setTab(panelExecution)
-		m.setFocus(focusStageList)
 	default:
 		m.setFocus(focusSearch)
 	}
@@ -542,10 +566,17 @@ func footerFor(m app) string {
 	if m.confirmStartupDockerCleanup {
 		return "y/Enter 清理遗留 Docker 资源  n/Esc 跳过"
 	}
-	if m.tab == panelSettings {
-		return settingsFooter(m)
+	if m.settingsOpen {
+		if m.settings.selected == settingsItemDocker && m.dockerMirror.confirm != "" {
+			return "y/Enter 确认  n/Esc 取消  Ctrl+/ 关闭设置"
+		}
+		return "Esc/Q/Ctrl+/ 关闭设置  Tab/Shift+Tab 字段  ↑↓ 字段  Space 开关  Enter 执行"
 	}
 	switch m.focus {
+	case focusTaskBoard:
+		return "/ 输入题目  Ctrl+E 确认  Ctrl+R 重检  Ctrl+G 重试Git  Ctrl+O 总览  Ctrl+/ 设置  Q 退出"
+	case focusTaskInput:
+		return "Enter 开始质检  Esc 清空  ←→ 光标  Ctrl+E/Ctrl+R/Ctrl+O 全局  Ctrl+/ 设置  Q 退出"
 	case focusSearch:
 		return "Ctrl+C 退出  Tab 执行详情  ↓ 表格  Ctrl+R 重跑  Ctrl+X 终止"
 	case focusOverviewTable:

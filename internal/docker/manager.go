@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -45,6 +48,14 @@ type CleanupSummary struct {
 	ManualCommand  string   `json:"manual_command,omitempty"`
 	Verification   string   `json:"verification,omitempty"`
 	Warnings       []string `json:"warnings,omitempty"`
+}
+
+type ComposeProject struct {
+	Name         string            `json:"name"`
+	WorkDir      string            `json:"work_dir,omitempty"`
+	ComposeFiles []string          `json:"compose_files,omitempty"`
+	ContainerIDs []string          `json:"container_ids,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
 }
 
 func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig, composeFile, projectName, workDir string) CleanupSummary {
@@ -100,21 +111,80 @@ func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner
 }
 
 func ComposeProjectRunning(ctx context.Context, exec executor.CommandRunner, composeFiles []string, projectName, workDir string) (bool, error) {
+	return IsRunning(ctx, exec, composeFiles, projectName, workDir)
+}
+
+func IsRunning(ctx context.Context, exec executor.CommandRunner, composeFiles []string, projectName, workDir string) (bool, error) {
 	composeFiles = normalizeComposeFiles(composeFiles)
 	if strings.TrimSpace(projectName) == "" {
 		return false, nil
 	}
-	args := []string{"compose"}
-	if strings.TrimSpace(workDir) != "" {
-		args = append(args, "--project-directory", workDir)
-	}
-	args = append(args, ComposeFileArgs(composeFiles)...)
-	args = append(args, "-p", projectName, "ps", "-q")
+	args := ComposeCommandArgsWithProjectDir(composeFiles, workDir, projectName, "ps", "-q")
 	result := exec.Run(ctx, 10*time.Second, workDir, nil, "docker", args...)
 	if result.Err != nil {
 		return false, result.Err
 	}
 	return strings.TrimSpace(result.Stdout) != "", nil
+}
+
+func GetFrontendURL(ctx context.Context, exec executor.CommandRunner, composeFiles []string, projectName, workDir string) (string, error) {
+	composeFiles = normalizeComposeFiles(composeFiles)
+	if strings.TrimSpace(projectName) == "" {
+		return "", nil
+	}
+	args := ComposeCommandArgsWithProjectDir(composeFiles, workDir, projectName, "ps", "--format", "json")
+	result := exec.Run(ctx, 10*time.Second, workDir, nil, "docker", args...)
+	if result.Err != nil {
+		return "", result.Err
+	}
+	mappings, services := ParseComposePS(result.Stdout)
+	return firstFrontendURL(mappings, services), nil
+}
+
+func ListAllProjects(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig) ([]ComposeProject, error) {
+	projectsByName := map[string]*ComposeProject{}
+	seenContainers := map[string]map[string]bool{}
+	var errs []error
+	for _, query := range gcListQueries("container", cfg) {
+		result := exec.Run(ctx, time.Minute, "", nil, "docker", query.Args...)
+		if result.Err != nil {
+			errs = append(errs, result.Err)
+			continue
+		}
+		for _, candidate := range parseGCCandidates(result.Stdout) {
+			if query.Reason == "compose_project_prefix" && !composeProjectOwned(candidate, cfg.ComposeProjectPrefix) {
+				continue
+			}
+			name := composeProjectNameFromLabels(candidate.Labels)
+			if name == "" {
+				continue
+			}
+			project := projectsByName[name]
+			if project == nil {
+				project = &ComposeProject{Name: name, Labels: map[string]string{}}
+				projectsByName[name] = project
+				seenContainers[name] = map[string]bool{}
+			}
+			project.mergeCandidate(candidate)
+			container := candidate.ID
+			if container == "" {
+				container = candidate.Name
+			}
+			if container != "" && !seenContainers[name][container] {
+				seenContainers[name][container] = true
+				project.ContainerIDs = append(project.ContainerIDs, container)
+			}
+		}
+	}
+	projects := make([]ComposeProject, 0, len(projectsByName))
+	for _, project := range projectsByName {
+		sort.Strings(project.ContainerIDs)
+		projects = append(projects, *project)
+	}
+	sort.Slice(projects, func(i, j int) bool {
+		return projects[i].Name < projects[j].Name
+	})
+	return projects, errors.Join(errs...)
 }
 
 func CleanupComposeArgs(cfg config.DockerConfig, composeFile, projectName string) []string {
@@ -202,6 +272,91 @@ func dockerToken(value string) string {
 func shortHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:8]
+}
+
+func firstFrontendURL(mappings map[string][]PortMapping, services []string) string {
+	for _, service := range services {
+		if url := frontendURLForMappings(mappings[service]); url != "" {
+			return url
+		}
+	}
+	serviceNames := make([]string, 0, len(mappings))
+	for service := range mappings {
+		serviceNames = append(serviceNames, service)
+	}
+	sort.Strings(serviceNames)
+	for _, service := range serviceNames {
+		if url := frontendURLForMappings(mappings[service]); url != "" {
+			return url
+		}
+	}
+	return ""
+}
+
+func frontendURLForMappings(mappings []PortMapping) string {
+	for _, mapping := range mappings {
+		if mapping.Host == 0 {
+			continue
+		}
+		scheme := "http"
+		if mapping.Container == 443 || mapping.Host == 443 {
+			scheme = "https"
+		}
+		return fmt.Sprintf("%s://%s:%d", scheme, normalizePortHost(mapping.URL), mapping.Host)
+	}
+	return ""
+}
+
+func normalizePortHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "http://")
+	raw = strings.TrimPrefix(raw, "https://")
+	raw = strings.Trim(raw, "[]")
+	if raw == "" || raw == "0.0.0.0" || raw == "::" || raw == "127.0.0.1" {
+		return "localhost"
+	}
+	if strings.Contains(raw, ":") {
+		host, _, ok := strings.Cut(raw, ":")
+		if ok {
+			return normalizePortHost(host)
+		}
+	}
+	return raw
+}
+
+func composeProjectNameFromLabels(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(labels["com.docker.compose.project"])
+}
+
+func (p *ComposeProject) mergeCandidate(candidate GCCandidate) {
+	if p == nil {
+		return
+	}
+	for key, value := range candidate.Labels {
+		if _, ok := p.Labels[key]; !ok {
+			p.Labels[key] = value
+		}
+	}
+	if p.WorkDir == "" {
+		p.WorkDir = strings.TrimSpace(candidate.Labels["com.docker.compose.project.working_dir"])
+	}
+	if len(p.ComposeFiles) == 0 {
+		p.ComposeFiles = splitComposeConfigFiles(candidate.Labels["com.docker.compose.project.config_files"])
+	}
+}
+
+func splitComposeConfigFiles(raw string) []string {
+	var files []string
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			files = append(files, item)
+		}
+	}
+	return files
 }
 
 func min(a, b int) int {

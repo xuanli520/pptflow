@@ -25,7 +25,6 @@ const (
 	panelTaskBoard = iota
 	panelOverview
 	panelExecution
-	panelSettings
 
 	staleRunRecoveryInterval      = 30 * time.Second
 	persistedStateRefreshInterval = 2 * time.Second
@@ -41,26 +40,19 @@ type app struct {
 	taskActionSvc      TaskActionService
 	poller             *schedulerPoller
 
-	router                  *pageRouter
-	taskBoard               *TaskBoardModel
-	taskInput               *TaskInputModel
-	settingsUI              SettingsOverlay
-	overview                OverviewModel
-	detail                  viewport.Model
-	dockerMirror            dockerMirrorPanel
-	settings                settingsPanel
-	settingsOpen            bool
-	settingsFocusBeforeOpen focusArea
-	settingsFocusCaptured   bool
-	focusManager            focusManager
+	router                   *pageRouter
+	taskBoard                *TaskBoardModel
+	taskInput                *TaskInputModel
+	overview                 *OverviewModel
+	taskInputFocusBeforeOpen focusArea
+	taskInputFocusCaptured   bool
+	focusManager             focusManager
 
 	tab   int
 	focus focusArea
 
-	selectedStageKey string
-	selectedRefRunID string
-	stageIndex       int
-	refIndex         int
+	executionState
+	settingsState
 
 	width  int
 	height int
@@ -79,11 +71,27 @@ type app struct {
 	confirmQuitTasks            []TaskProject
 	confirmStartupDockerCleanup bool
 	startupDockerCleanupCount   int
+}
 
+type executionState struct {
+	detail                   viewport.Model
+	selectedStageKey         string
+	selectedRefRunID         string
+	stageIndex               int
+	refIndex                 int
 	detailVM                 executionViewModel
 	detailContent            string
 	detailFollowTail         bool
 	lastTerminalRefreshJobID string
+}
+
+type settingsState struct {
+	settingsUI              SettingsOverlay
+	dockerMirror            dockerMirrorPanel
+	settings                settingsPanel
+	settingsOpen            bool
+	settingsFocusBeforeOpen focusArea
+	settingsFocusCaptured   bool
 }
 
 type detailMsg struct {
@@ -163,6 +171,10 @@ type schedulerClient interface {
 	ActiveSnapshot() []scheduler.JobSnapshot
 	NotifyCh() <-chan struct{}
 	Shutdown(context.Context) error
+}
+
+type taskStateStore interface {
+	RecordTaskGitError(context.Context, string, error) error
 }
 
 func Start(store *db.Store, cfg config.Config) error {
@@ -246,22 +258,19 @@ func newApp(store *db.Store, cfg config.Config) app {
 		healthStore = store
 	}
 	m := app{
-		store:            appStoreValue,
-		cfg:              cfg,
-		router:           newPageRouter(),
-		taskInput:        ptrTaskInput(newTaskInputModel()),
-		poller:           newSchedulerPoller(healthStore, cfg),
-		settingsUI:       SettingsOverlay{},
-		overview:         newOverviewModel(),
-		detail:           viewport.New(80, 10),
-		dockerMirror:     newDockerMirrorPanel(cfg),
-		settings:         newSettingsPanel(),
-		tab:              panelTaskBoard,
-		focus:            focusTaskBoard,
-		focusManager:     newFocusManager(),
-		qaMode:           "initial",
-		message:          "",
-		detailFollowTail: true,
+		store:          appStoreValue,
+		cfg:            cfg,
+		router:         newPageRouter(),
+		taskInput:      ptrTaskInput(newTaskInputModel()),
+		poller:         newSchedulerPoller(healthStore, cfg),
+		overview:       ptrOverview(newOverviewModel()),
+		executionState: executionState{detail: viewport.New(80, 10), detailFollowTail: true},
+		settingsState:  settingsState{settingsUI: SettingsOverlay{}, dockerMirror: newDockerMirrorPanel(cfg), settings: newSettingsPanel()},
+		tab:            panelTaskBoard,
+		focus:          focusTaskBoard,
+		focusManager:   newFocusManager(),
+		qaMode:         "initial",
+		message:        "",
 	}
 	m.poller.reset(now)
 	if store != nil {
@@ -279,6 +288,7 @@ func newApp(store *db.Store, cfg config.Config) app {
 	taskBoard := newTaskBoardModel(m.taskQuerySvc)
 	m.taskBoard = &taskBoard
 	m.router.RegisterPage(pageTaskBoard, m.taskBoard)
+	m.router.RegisterPage(pageOverview, m.overview)
 	m.setFocus(focusTaskBoard)
 	return m
 }
@@ -287,12 +297,16 @@ func ptrTaskInput(input TaskInputModel) *TaskInputModel {
 	return &input
 }
 
+func ptrOverview(overview OverviewModel) *OverviewModel {
+	return &overview
+}
+
 func (m app) Init() tea.Cmd {
 	activeJobs := 0
 	if m.scheduler != nil {
 		activeJobs = len(m.scheduler.ActiveSnapshot())
 	}
-	return tea.Batch(m.recoverStaleRunsCmd(), m.refreshDockerHealthCmd(), m.taskBoard.Init(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), dockerStartupCheckCmd(m.cfg, activeJobs), m.tick())
+	return tea.Batch(m.recoverStaleRunsCmd(), m.recoverOrphanInspectionCmd(), m.refreshDockerHealthCmd(), m.taskBoard.Init(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), dockerStartupCheckCmd(m.cfg, activeJobs), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -411,12 +425,12 @@ func (m *app) handleOverviewMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 	switch value := msg.(type) {
 	case overviewRefreshMsg:
 		var cmd tea.Cmd
-		m.overview, cmd = m.overview.Update(value)
+		_, cmd = m.overview.Update(value)
 		*cmds = append(*cmds, cmd)
 		return true
 	case overviewSearchDebounceMsg:
 		var cmd tea.Cmd
-		m.overview, cmd = m.overview.Update(value)
+		_, cmd = m.overview.Update(value)
 		*cmds = append(*cmds, cmd)
 		return true
 	case overviewLoadRequestMsg:
@@ -429,7 +443,7 @@ func (m *app) handleOverviewMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		beforeID := m.selectedTaskID()
 		beforeKey := m.selectedOverviewDetailKey()
 		var cmd tea.Cmd
-		m.overview, cmd = m.overview.Update(value)
+		_, cmd = m.overview.Update(value)
 		*cmds = append(*cmds, cmd)
 		if value.err != nil {
 			m.message = value.err.Error()
@@ -685,8 +699,6 @@ func (m app) View() string {
 		builder.WriteString(renderTaskBoard(m))
 	} else if m.tab == panelOverview {
 		builder.WriteString(renderOverview(m))
-	} else if m.tab == panelSettings {
-		builder.WriteString(renderSettings(m))
 	} else {
 		builder.WriteString(renderExecution(m))
 	}
@@ -696,11 +708,11 @@ func (m app) View() string {
 		builder.WriteString("\n")
 	}
 	builder.WriteString(footerStyle.Render(footerFor(m)))
+	view := builder.String()
 	if m.settingsOpen {
-		builder.WriteString("\n")
-		builder.WriteString(renderSettingsOverlay(m))
+		view = renderOverlayBottomRight(view, renderSettingsOverlay(m), max(0, m.width-2), m.height)
 	}
-	return appStyle.Render(builder.String())
+	return appStyle.Render(view)
 }
 
 func (m app) reload() tea.Cmd {
@@ -752,6 +764,37 @@ func (m app) recoverStaleRunsCmd() tea.Cmd {
 	}
 	return func() tea.Msg {
 		return recoveryMsg{err: m.recoverStaleRunsFn(context.Background())}
+	}
+}
+
+func (m app) recoverOrphanInspectionCmd() tea.Cmd {
+	store, ok := m.store.(taskStateStore)
+	if !ok || store == nil || m.scheduler == nil || m.taskQuerySvc == nil {
+		return nil
+	}
+	submitter, ok := m.scheduler.(inspectionScheduler)
+	if !ok || submitter == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		tasks, err := m.taskQuerySvc.FindStaleInspecting(ctx)
+		if err != nil {
+			return recoveryMsg{err: err}
+		}
+		var failures []string
+		for _, task := range tasks {
+			_, err := submitter.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{DeferRuntimeCleanup: true})
+			if err != nil {
+				failures = append(failures, task.ID+": "+err.Error())
+				_ = store.RecordTaskGitError(ctx, task.ID, err)
+			}
+		}
+		if len(failures) > 0 {
+			return recoveryMsg{err: fmt.Errorf("恢复 Git 同步任务失败: %s", strings.Join(failures, "; "))}
+		}
+		return recoveryMsg{}
 	}
 }
 

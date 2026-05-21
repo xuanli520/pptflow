@@ -65,20 +65,54 @@ func NewTestHarnessWithStore(store *db.Store, cfg config.Config) TestHarness {
 	return TestHarness{model: m}
 }
 
+func cloneAppForTest(m app) app {
+	next := m
+	if m.taskBoard != nil {
+		taskBoard := *m.taskBoard
+		next.taskBoard = &taskBoard
+	}
+	if m.taskInput != nil {
+		taskInput := *m.taskInput
+		next.taskInput = &taskInput
+	}
+	if m.overview != nil {
+		overview := *m.overview
+		next.overview = &overview
+	}
+	if m.router != nil {
+		router := *m.router
+		router.pages = map[pageID]Page{}
+		for id, page := range m.router.pages {
+			router.pages[id] = page
+		}
+		if next.taskBoard != nil {
+			router.pages[pageTaskBoard] = next.taskBoard
+		}
+		if next.overview != nil {
+			router.pages[pageOverview] = next.overview
+		}
+		router.overlays = append([]Overlay(nil), m.router.overlays...)
+		next.router = &router
+	}
+	return next
+}
+
 func (h TestHarness) Press(key string) (TestHarness, TestKeyResult) {
-	next, cmds := h.model.handleKey(testKeyMsg(key))
+	model := cloneAppForTest(h.model)
+	next, cmds := model.handleKey(testKeyMsg(key))
 	result := TestKeyResult{CmdCount: len(cmds)}
 	return TestHarness{model: next}, result
 }
 
 func (h TestHarness) ApplyProjectReloadForTest() (TestHarness, bool) {
-	h.model.overview.seq++
-	next, cmd := h.model.Update(overviewLoadResultMsg{
-		seq:           h.model.overview.seq,
-		query:         h.model.overview.projectQuery(),
+	model := cloneAppForTest(h.model)
+	model.overview.seq++
+	next, cmd := model.Update(overviewLoadResultMsg{
+		seq:           model.overview.seq,
+		query:         model.overview.projectQuery(),
 		cursorIntent:  cursorKeep,
-		items:         h.model.overview.items,
-		total:         h.model.overview.page.total,
+		items:         model.overview.items,
+		total:         model.overview.page.total,
 		refreshDetail: true,
 	})
 	model, ok := next.(app)
@@ -89,7 +123,8 @@ func (h TestHarness) ApplyProjectReloadForTest() (TestHarness, bool) {
 }
 
 func (h TestHarness) ApplyRunSubmitForTest(jobID string) TestHarness {
-	next, _ := h.model.Update(runSubmitMsg{jobID: jobID})
+	model := cloneAppForTest(h.model)
+	next, _ := model.Update(runSubmitMsg{jobID: jobID})
 	model, ok := next.(app)
 	if !ok {
 		return h
@@ -98,7 +133,8 @@ func (h TestHarness) ApplyRunSubmitForTest(jobID string) TestHarness {
 }
 
 func (h TestHarness) ApplyCancelRequestForTest(taskID, jobID string, err error) TestHarness {
-	next, _ := h.model.Update(taskCancelRequestMsg{taskID: taskID, jobID: jobID, err: err})
+	model := cloneAppForTest(h.model)
+	next, _ := model.Update(taskCancelRequestMsg{taskID: taskID, jobID: jobID, err: err})
 	model, ok := next.(app)
 	if !ok {
 		return h
@@ -107,7 +143,8 @@ func (h TestHarness) ApplyCancelRequestForTest(taskID, jobID string, err error) 
 }
 
 func (h TestHarness) ApplySchedulerJobsForTest(jobs []scheduler.JobSnapshot) TestHarness {
-	next, _ := h.model.Update(schedulerJobsMsg{jobs: jobs})
+	model := cloneAppForTest(h.model)
+	next, _ := model.Update(schedulerJobsMsg{jobs: jobs})
 	model, ok := next.(app)
 	if !ok {
 		return h
@@ -116,7 +153,8 @@ func (h TestHarness) ApplySchedulerJobsForTest(jobs []scheduler.JobSnapshot) Tes
 }
 
 func (h TestHarness) ApplySchedulerJobsCommandCountForTest(jobs []scheduler.JobSnapshot) (TestHarness, int) {
-	next, cmd := h.model.Update(schedulerJobsMsg{jobs: jobs})
+	model := cloneAppForTest(h.model)
+	next, cmd := model.Update(schedulerJobsMsg{jobs: jobs})
 	model, ok := next.(app)
 	if !ok {
 		count := 0
@@ -143,7 +181,8 @@ func (h TestHarness) ApplySchedulerNotifyForTest() (TestHarness, int) {
 }
 
 func (h TestHarness) ApplyStartupDockerCheckForTest(count int, err error) TestHarness {
-	next, _ := h.model.Update(startupDockerCheckMsg{count: count, err: err})
+	model := cloneAppForTest(h.model)
+	next, _ := model.Update(startupDockerCheckMsg{count: count, err: err})
 	model, ok := next.(app)
 	if !ok {
 		return h
@@ -160,6 +199,23 @@ func RefreshDockerHealthForTest(ctx context.Context, store *db.Store, cfg config
 func ConfirmCompleteForTest(ctx context.Context, store *db.Store, cfg config.Config, exec executor.CommandRunner, taskID string) error {
 	service := dbTaskActionService{store: store, cfg: cfg, exec: exec}
 	return service.ConfirmComplete(ctx, taskID)
+}
+
+func FindStaleInspectingForTest(ctx context.Context, store *db.Store, cfg config.Config) ([]TaskProject, error) {
+	service := newTaskQueryService(store, cfg)
+	if service == nil {
+		return nil, nil
+	}
+	return service.FindStaleInspecting(ctx)
+}
+
+type InspectionSchedulerForTest interface {
+	SubmitInspection(string, string, string, pipeline.RunOptions) (string, error)
+}
+
+func StartInspectionForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID string) error {
+	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
+	return service.StartInspection(ctx, taskID)
 }
 
 func ForceExitCleanupForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
@@ -204,6 +260,10 @@ func (noopTaskQueryService) GetByID(context.Context, string) (*TaskProject, erro
 }
 
 func (noopTaskQueryService) FindWithDockerRunning(context.Context) ([]TaskProject, error) {
+	return nil, nil
+}
+
+func (noopTaskQueryService) FindStaleInspecting(context.Context) ([]TaskProject, error) {
 	return nil, nil
 }
 
@@ -417,7 +477,8 @@ func (h TestHarness) SetOverviewCursor(index int) TestHarness {
 }
 
 func (h TestHarness) ApplySearchDebounceForTest(searchSeq uint64, text string) (TestHarness, bool) {
-	next, cmd := h.model.Update(overviewSearchDebounceMsg{searchSeq: searchSeq, text: text})
+	model := cloneAppForTest(h.model)
+	next, cmd := model.Update(overviewSearchDebounceMsg{searchSeq: searchSeq, text: text})
 	model, ok := next.(app)
 	if !ok {
 		return h, cmd != nil
@@ -426,7 +487,8 @@ func (h TestHarness) ApplySearchDebounceForTest(searchSeq uint64, text string) (
 }
 
 func (h TestHarness) ApplyOverviewRefreshForTest() (TestHarness, bool) {
-	next, cmd := h.model.Update(overviewRefreshMsg{silent: true})
+	model := cloneAppForTest(h.model)
+	next, cmd := model.Update(overviewRefreshMsg{silent: true})
 	model, ok := next.(app)
 	if !ok {
 		return h, cmd != nil
@@ -435,15 +497,16 @@ func (h TestHarness) ApplyOverviewRefreshForTest() (TestHarness, bool) {
 }
 
 func (h TestHarness) ApplyOverviewResultForTest(seq uint64, total int, taskIDs ...string) (TestHarness, bool) {
+	appModel := cloneAppForTest(h.model)
 	items := make([]overviewItem, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
 		item := overviewItem{TaskID: taskID, RunStatus: model.RunCompletedClean}
 		item.SearchText = overviewSearchText(item)
 		items = append(items, item)
 	}
-	next, cmd := h.model.Update(overviewLoadResultMsg{
+	next, cmd := appModel.Update(overviewLoadResultMsg{
 		seq:          seq,
-		query:        h.model.overview.projectQuery(),
+		query:        appModel.overview.projectQuery(),
 		cursorIntent: cursorKeep,
 		items:        items,
 		total:        total,
@@ -514,9 +577,6 @@ func (h TestHarness) TabName() string {
 	if h.model.tab == panelExecution {
 		return "execution"
 	}
-	if h.model.tab == panelSettings {
-		return "settings"
-	}
 	return "overview"
 }
 
@@ -563,10 +623,24 @@ func OverviewRowForTest(lastRun string, width int) []string {
 	specs := overviewColumnSpecs(width, sortByTaskID, true)
 	row := overviewDisplayRow(overviewItem{
 		TaskID:        "TASK-1",
+		HasTask:       true,
 		Batch:         "batch-1",
 		RunStatus:     model.RunCompletedClean,
 		ManualVerdict: model.ManualUnset,
 		LastRun:       lastRun,
+		Mode:          "initial",
+	}, specs)
+	return []string(row)
+}
+
+func OverviewLegacyRowForTest(width int) []string {
+	specs := overviewColumnSpecs(width, sortByTaskID, true)
+	row := overviewDisplayRow(overviewItem{
+		TaskID:        "TASK-LEGACY",
+		HasTask:       false,
+		Batch:         "legacy",
+		RunStatus:     model.RunCompletedClean,
+		ManualVerdict: model.ManualUnset,
 		Mode:          "initial",
 	}, specs)
 	return []string(row)
@@ -713,6 +787,8 @@ func testKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlR}
 	case "ctrl+x":
 		return tea.KeyMsg{Type: tea.KeyCtrlX}
+	case "ctrl+/":
+		return tea.KeyMsg{Type: tea.KeyCtrlUnderscore}
 	case "ctrl+left":
 		return tea.KeyMsg{Type: tea.KeyCtrlLeft}
 	case "ctrl+right":
@@ -748,6 +824,10 @@ func testKeyMsg(key string) tea.KeyMsg {
 
 func testFocusArea(name string) focusArea {
 	switch name {
+	case "task-board":
+		return focusTaskBoard
+	case "task-input":
+		return focusTaskInput
 	case "search":
 		return focusSearch
 	case "overview-table":

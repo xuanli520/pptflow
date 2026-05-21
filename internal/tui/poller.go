@@ -55,7 +55,7 @@ func (p *schedulerPoller) HandleTick(m app, now time.Time) []tea.Cmd {
 	var cmds []tea.Cmd
 	if now.Sub(p.lastRecoveryAt) >= staleRunRecoveryInterval {
 		p.lastRecoveryAt = now
-		cmds = append(cmds, m.recoverStaleRunsCmd())
+		cmds = append(cmds, m.recoverStaleRunsCmd(), m.recoverOrphanInspectionCmd())
 	}
 	if now.Sub(p.lastPersistedRefreshAt) >= persistedStateRefreshInterval {
 		p.lastPersistedRefreshAt = now
@@ -89,7 +89,7 @@ func (p *schedulerPoller) refreshDockerHealth(ctx context.Context) (int, []strin
 	var stopped []string
 	var errs []error
 	for _, task := range tasks {
-		running, err := dockermgr.ComposeProjectRunning(ctx, p.exec, task.ComposeMeta.ComposeFiles, task.ComposeMeta.Project, task.ComposeMeta.WorkDir)
+		running, err := dockermgr.IsRunning(ctx, p.exec, task.ComposeMeta.ComposeFiles, task.ComposeMeta.Project, task.ComposeMeta.WorkDir)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", task.ID, err))
 			continue

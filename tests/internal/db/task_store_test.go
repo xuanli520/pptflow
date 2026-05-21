@@ -3,6 +3,7 @@ package db_test
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -191,6 +192,116 @@ func TestFinishRunAbortedClearsTaskDockerRuntime(t *testing.T) {
 	}
 }
 
+func TestFinishRunRejectsTaskRunMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-EEEEEE", "https://gitlab.example/TASK-20260521-EEEEEE", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-old",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, "run-old", task.ID, model.RunAborted, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-active",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.CurrentRunID != "run-active" {
+		t.Fatalf("active run was not attached to task: %#v", task)
+	}
+
+	if err := store.FinishRun(ctx, "run-old", task.ID, model.RunCompletedClean, time.Second); err == nil {
+		t.Fatal("expected finishing a non-current run to fail")
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.CurrentRunID != "run-active" || task.State != model.TaskInspecting {
+		t.Fatalf("mismatched finish should leave active task unchanged: %#v", task)
+	}
+	run, err := store.GetRun(ctx, "run-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != model.RunAborted {
+		t.Fatalf("mismatched finish should roll back run update, got %s", run.Status)
+	}
+}
+
+func TestTaskRunCASAndCompletionCountUnderConcurrency(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-FFFFFF", "https://gitlab.example/TASK-20260521-FFFFFF", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	createErrs := runConcurrently(2, func(index int) error {
+		return store.CreateRun(ctx, model.RunRecord{
+			RunID:        []string{"run-cas-1", "run-cas-2"}[index],
+			TaskID:       task.ID,
+			StartedAt:    time.Now().UTC().Format(time.RFC3339),
+			Status:       model.RunRunning,
+			ArtifactRoot: t.TempDir(),
+		})
+	})
+	if countNil(createErrs) != 1 || countErr(createErrs) != 1 {
+		t.Fatalf("concurrent CreateRun errors = %#v", createErrs)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.CurrentRunID == "" || task.State != model.TaskInspecting {
+		t.Fatalf("one run should be attached after CAS race: %#v", task)
+	}
+	if err := store.FinishRun(ctx, task.CurrentRunID, task.ID, model.RunCompletedClean, time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	completeErrs := runConcurrently(2, func(int) error {
+		_, err := store.CompleteTask(ctx, task.ID)
+		return err
+	})
+	if countNil(completeErrs) != 1 || countErr(completeErrs) != 1 {
+		t.Fatalf("concurrent CompleteTask errors = %#v", completeErrs)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskCompleted || task.CompletionCount != 1 {
+		t.Fatalf("completion count should increment once: %#v", task)
+	}
+}
+
 func finishTaskRun(t *testing.T, store *db.Store, taskID string) {
 	t.Helper()
 	ctx := context.Background()
@@ -213,4 +324,36 @@ type assertErr string
 
 func (e assertErr) Error() string {
 	return string(e)
+}
+
+func runConcurrently(n int, fn func(int) error) []error {
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		index := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[index] = fn(index)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	return errs
+}
+
+func countNil(errs []error) int {
+	count := 0
+	for _, err := range errs {
+		if err == nil {
+			count++
+		}
+	}
+	return count
+}
+
+func countErr(errs []error) int {
+	return len(errs) - countNil(errs)
 }

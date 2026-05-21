@@ -55,6 +55,8 @@ type OverviewModel struct {
 	height       int
 }
 
+var _ Page = (*OverviewModel)(nil)
+
 type overviewLoadRequestMsg struct {
 	seq           uint64
 	query         db.ProjectQuery
@@ -125,40 +127,55 @@ func (m OverviewModel) Init() tea.Cmd {
 	return overviewRefreshCmd(false, true)
 }
 
-func (m OverviewModel) Update(msg tea.Msg) (OverviewModel, tea.Cmd) {
+func (m OverviewModel) Apply(msg tea.Msg) (OverviewModel, tea.Cmd) {
+	next, cmd, _ := m.apply(msg)
+	return next, cmd
+}
+
+func (m *OverviewModel) Update(msg tea.Msg) (bool, tea.Cmd) {
+	if m == nil {
+		return false, nil
+	}
+	next, cmd, handled := m.apply(msg)
+	*m = next
+	return handled, cmd
+}
+
+func (m OverviewModel) apply(msg tea.Msg) (OverviewModel, tea.Cmd, bool) {
 	switch value := msg.(type) {
 	case overviewRefreshMsg:
-		return m, m.requestLoad(value.silent, cursorKeep, value.refreshDetail)
+		return m, m.requestLoad(value.silent, cursorKeep, value.refreshDetail), true
 	case overviewSearchDebounceMsg:
 		if value.searchSeq != m.searchSeq || value.text != m.search.Value() {
-			return m, nil
+			return m, nil, true
 		}
 		m.page.current = 1
-		return m, m.requestLoad(false, cursorFirst, false)
+		return m, m.requestLoad(false, cursorFirst, false), true
 	case overviewLoadResultMsg:
 		if value.seq != m.seq {
-			return m, nil
+			return m, nil, true
 		}
 		m.loadInFlight = false
 		m.loading = false
 		if value.err != nil {
 			m.err = value.err
-			return m, nil
+			return m, nil, true
 		}
 		m.err = nil
 		m.page.total = max(0, value.total)
 		m.page.current = max(1, m.page.current)
 		if m.page.current > m.page.totalPages() {
 			m.page.current = m.page.totalPages()
-			return m, m.requestLoad(true, cursorKeep, value.refreshDetail)
+			return m, m.requestLoad(true, cursorKeep, value.refreshDetail), true
 		}
 		m.items = append([]overviewItem{}, value.items...)
 		m.refreshTable(value.cursorIntent)
-		return m, nil
+		return m, nil, true
 	case tea.KeyMsg:
-		return m.updateKey(value)
+		next, cmd := m.updateKey(value)
+		return next, cmd, true
 	default:
-		return m, nil
+		return m, nil, false
 	}
 }
 
@@ -248,6 +265,33 @@ func (m *OverviewModel) SetFocus(area focusArea) {
 	}
 }
 
+func (m *OverviewModel) Focus() {
+	if m == nil {
+		return
+	}
+	m.SetFocus(focusOverviewTable)
+}
+
+func (m *OverviewModel) Blur() {
+	if m == nil {
+		return
+	}
+	m.search.Blur()
+	m.table.Blur()
+}
+
+func (m *OverviewModel) HandleKey(msg tea.KeyMsg) tea.Cmd {
+	if m == nil {
+		return nil
+	}
+	_, cmd := m.Update(msg)
+	return cmd
+}
+
+func (m *OverviewModel) Destroy() tea.Cmd {
+	return nil
+}
+
 func (m *OverviewModel) SetSize(width, height int) bool {
 	if width <= 0 {
 		width = 120
@@ -287,7 +331,17 @@ func (m OverviewModel) SelectedItem() (overviewItem, bool) {
 	return overviewItem{}, false
 }
 
-func (m OverviewModel) View() string {
+func (m *OverviewModel) View(width, height int) string {
+	if m == nil {
+		return ""
+	}
+	if width > 0 || height > 0 {
+		m.SetSize(width, height)
+	}
+	return m.Render()
+}
+
+func (m OverviewModel) Render() string {
 	var builder strings.Builder
 	builder.WriteString(m.search.View())
 	builder.WriteString("\n\n")

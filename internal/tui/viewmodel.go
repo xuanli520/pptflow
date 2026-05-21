@@ -134,7 +134,7 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 		width := spec.Width
 		switch spec.Key {
 		case "task_id":
-			row = append(row, truncateMiddleDisplay(item.TaskID, width))
+			row = append(row, truncateMiddleDisplay(overviewTaskIDText(item), width))
 		case "task_state":
 			row = append(row, taskStateStyle(item.TaskState).Render(truncateDisplay(localizeTaskState(item.TaskState), width)))
 		case "run_status":
@@ -162,6 +162,13 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 		}
 	}
 	return row
+}
+
+func overviewTaskIDText(item overviewItem) string {
+	if !item.HasTask {
+		return "-"
+	}
+	return item.TaskID
 }
 
 func buildExecutionViewModel(ctx context.Context, store executionStore, cfg config.Config, taskID string) (executionViewModel, error) {

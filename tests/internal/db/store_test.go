@@ -638,6 +638,7 @@ func TestMigratesReadIndexesForEmptyAndCurrentDatabases(t *testing.T) {
 		id INTEGER PRIMARY KEY CHECK(id = 1),
 		version INTEGER NOT NULL
 	);
+	INSERT INTO projects(task_id, batch, path) VALUES('TASK-OLD', 'legacy-batch', '/tmp/TASK-OLD');
 	INSERT INTO schema_version(id, version) VALUES(1, 4);`)
 	if err != nil {
 		t.Fatal(err)
@@ -649,6 +650,7 @@ func TestMigratesReadIndexesForEmptyAndCurrentDatabases(t *testing.T) {
 	}
 	_ = currentStore.Close()
 	assertReadIndexes(t, currentPath)
+	assertV5TaskSchema(t, currentPath)
 }
 
 func newStore(t *testing.T) (*db.Store, string) {
@@ -729,9 +731,14 @@ func assertReadIndexes(t *testing.T, path string) {
 	want := []string{
 		"idx_runs_task_started",
 		"idx_runs_task_status",
+		"idx_runs_task_completion_round",
 		"idx_run_stages_run_status_stage",
 		"idx_findings_run_severity",
 		"idx_projects_batch",
+		"idx_tasks_state",
+		"idx_tasks_batch",
+		"idx_tasks_batch_state",
+		"idx_tasks_state_docker",
 	}
 	for _, index := range want {
 		var name string
@@ -740,4 +747,65 @@ func assertReadIndexes(t *testing.T, path string) {
 			t.Fatalf("missing index %s: %v", index, err)
 		}
 	}
+}
+
+func assertV5TaskSchema(t *testing.T, path string) {
+	t.Helper()
+	handle, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	for table, columns := range map[string][]string{
+		"tasks":   {"id", "batch_id", "git_url", "repo_path", "state", "current_run_id", "completion_count", "frontend_url", "docker_running", "compose_meta", "entered_waiting_at", "last_completed_at", "sync_error", "created_at", "updated_at"},
+		"batches": {"id", "display_name", "task_count", "max_tasks", "created_at", "is_full"},
+		"runs":    {"completion_round"},
+	} {
+		got := tableColumnSet(t, handle, table)
+		for _, column := range columns {
+			if !got[column] {
+				t.Fatalf("table %s missing column %s; got %#v", table, column, got)
+			}
+		}
+	}
+	var batchID string
+	if err := handle.QueryRow(`SELECT id FROM batches WHERE id = 'legacy-batch'`).Scan(&batchID); err != nil {
+		t.Fatalf("legacy project batch should be backfilled: %v", err)
+	}
+	rows, err := handle.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("foreign_key_check reported migrated data conflicts")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tableColumnSet(t *testing.T, handle *sql.DB, table string) map[string]bool {
+	t.Helper()
+	rows, err := handle.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return columns
 }
