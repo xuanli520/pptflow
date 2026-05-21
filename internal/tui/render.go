@@ -29,19 +29,40 @@ func tableStyles() table.Styles {
 	return styles
 }
 
+func taskStateStyle(state string) lipgloss.Style {
+	switch strings.TrimSpace(state) {
+	case model.TaskInspecting:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#00DDDD"))
+	case model.TaskWaitingManual:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#DDAA00"))
+	case model.TaskCompleted:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#00CC66"))
+	default:
+		return mutedStyle
+	}
+}
+
 func renderHeader(m app) string {
-	overview := "[项目总览]"
-	execution := "[执行详情]"
-	settings := "[设置]"
-	if m.tab == panelOverview {
+	taskBoard := "[题目管理]"
+	overview := "[总览]"
+	if m.tab == panelTaskBoard {
+		taskBoard = activeStyle.Render(taskBoard)
+	} else if m.tab == panelOverview {
 		overview = activeStyle.Render(overview)
-	} else if m.tab == panelSettings {
-		settings = activeStyle.Render(settings)
-	} else {
-		execution = activeStyle.Render(execution)
 	}
 	mode := "模式: " + localizeMode(m.qaMode)
-	return titleStyle.Render("p2r QA 工作台") + "  " + overview + "  " + execution + "  " + settings + "  " + mutedStyle.Render(mode)
+	settings := "[设置 Ctrl+?]"
+	if m.settingsOpen {
+		settings = activeStyle.Render(settings)
+	} else {
+		settings = mutedStyle.Render(settings)
+	}
+	return titleStyle.Render("p2r QA 工作台") + "  " + taskBoard + "  " + overview + "  " + settings + "  " + mutedStyle.Render(mode)
+}
+
+func renderTaskBoard(m app) string {
+	layout := layoutFor(m.width, max(8, m.height-verticalChromeHeight(m)), false)
+	return m.taskBoard.WithJobs(m.activeJobs).View(layout.contentWidth, layout.contentHeight)
 }
 
 func renderOverview(m app) string {

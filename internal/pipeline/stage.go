@@ -30,8 +30,9 @@ type StageContext struct {
 }
 
 type StageOutcome struct {
-	Record  model.StageRecord
-	Runtime *RuntimeState
+	Record        model.StageRecord
+	Runtime       *RuntimeState
+	SkipNextStage bool
 }
 
 type preflightMaterializingStage interface {
@@ -198,7 +199,7 @@ func stageSet(stages []string) map[string]bool {
 func staticStageSet() map[string]bool {
 	selected := map[string]bool{}
 	for _, spec := range model.AllStageSpecs() {
-		if spec.Static && spec.ID != model.StageE {
+		if spec.Static {
 			selected[string(spec.ID)] = true
 		}
 	}
@@ -208,9 +209,6 @@ func staticStageSet() map[string]bool {
 func defaultRunStages() []string {
 	stages := make([]string, 0, len(model.AllStages()))
 	for _, stage := range model.AllStages() {
-		if stage == string(model.StageE) {
-			continue
-		}
 		stages = append(stages, stage)
 	}
 	return stages

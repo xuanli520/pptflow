@@ -53,6 +53,11 @@ type TestStageCCommandEnv struct {
 	Service TestServiceURLEnv
 }
 
+type TestStageCTestArtifactCleanup struct {
+	Removed  []string `json:"removed"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
 type TestSubmitArtifactCopy struct {
 	Name        string
 	Stage       string
@@ -275,6 +280,18 @@ func StageCEnvironmentForTest(evidence TestRuntimeEvidence) TestStageCCommandEnv
 			Mapping: testServiceURLMap(env.Service.Mapping),
 		},
 	}
+}
+
+func CleanupStageCTestArtifactsForTest(repoPath string) TestStageCTestArtifactCleanup {
+	cleanup := cleanupStageCTestArtifacts(repoPath)
+	return TestStageCTestArtifactCleanup{
+		Removed:  append([]string{}, cleanup.Removed...),
+		Warnings: append([]string{}, cleanup.Warnings...),
+	}
+}
+
+func RuntimeCleanupPointForTest(stage string, stages []model.StageRecord) bool {
+	return runtimeCleanupPoint(stage, stages)
 }
 
 func FilteredRuntimeEnvForTest(environ, extra []string, docker bool) []string {

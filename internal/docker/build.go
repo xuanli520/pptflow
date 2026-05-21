@@ -23,6 +23,7 @@ type StartRuntimeRequest struct {
 	ArtifactRoot string
 	TaskID       string
 	RunID        string
+	Labels       map[string]string
 	Env          []string
 	Log          io.Writer
 	Progress     func(ProgressEvent)
@@ -266,6 +267,26 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 			result.RuntimeSummary = summary
 			result.MirrorSummary = mirrorSummary
 			return result, &StartRuntimeError{Category: "build_failed", Message: "B2 docker compose build failed: " + trimResultText(build), Fix: "Fix Docker build failures and rerun stage B.", Result: build}
+		}
+	}
+	if composeFile != "" {
+		labelOverride := prepareRuntimeLabelOverride(effectiveConfig, req.ArtifactRoot, req.Labels)
+		summary.Warnings = append(summary.Warnings, labelOverride.Warnings...)
+		if labelOverride.File != "" {
+			candidateFiles := append(append([]string{}, activeFiles...), labelOverride.File)
+			verify := cmd.runStreaming(ctx, "B0 docker compose label override config", timeouts.Port, ComposeCommandArgsWithProjectDir(candidateFiles, workDir, projectName, "config"), true)
+			if verify.Err == nil {
+				activeFiles = candidateFiles
+				effectiveConfig = verify.Stdout
+			} else {
+				summary.Warnings = append(summary.Warnings, "runtime label override config failed; continuing without managed labels: "+trimResultText(verify))
+			}
+		}
+		summary.ComposeFiles = append([]string{}, activeFiles...)
+		summary.ComposeFile = firstComposeFile(activeFiles)
+		mirrorSummary.ComposeFiles = append([]string{}, activeFiles...)
+		if mirrorSummary.ComposeFile == "" {
+			mirrorSummary.ComposeFile = firstComposeFile(activeFiles)
 		}
 	}
 	var upArgs []string

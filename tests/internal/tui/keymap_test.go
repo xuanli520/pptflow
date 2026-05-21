@@ -24,10 +24,10 @@ func TestSearchQDoesNotQuit(t *testing.T) {
 	}
 }
 
-func TestCtrlCQuits(t *testing.T) {
-	_, result := tuiapp.NewTestHarness(config.Default()).Press("ctrl+c")
-	if !result.Quit {
-		t.Fatal("ctrl+c should quit")
+func TestCtrlCStartsCleanupAwareQuit(t *testing.T) {
+	next, result := tuiapp.NewTestHarness(config.Default()).Press("ctrl+c")
+	if result.Quit || result.CmdCount == 0 || !strings.Contains(next.Message(), "Docker 运行状态") {
+		t.Fatalf("ctrl+c should start cleanup-aware quit, quit=%v cmds=%d message=%q", result.Quit, result.CmdCount, next.Message())
 	}
 }
 
@@ -45,7 +45,7 @@ func TestModeKeyDoesNotStealSearchInput(t *testing.T) {
 	}
 }
 
-func TestSettingsTabKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T) {
+func TestSettingsOverlayKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T) {
 	cfg := config.Default()
 	root := t.TempDir()
 	cfg.ProjectConfigPath = filepath.Join(root, ".p2r.yaml")
@@ -57,15 +57,11 @@ func TestSettingsTabKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T)
 		t.Fatal(err)
 	}
 	h := tuiapp.NewTestHarness(cfg).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("tab")
-	h, _ = h.Press("tab")
+	h, _ = h.Press("ctrl+?")
 
-	if h.TabName() != "settings" {
-		t.Fatalf("expected settings top-level tab, got %s", h.TabName())
-	}
 	view := h.View()
 	if !strings.Contains(view, "设置") || !strings.Contains(view, "> Docker 镜像源") || !strings.Contains(view, "目标配置") || !strings.Contains(view, "备份") || !strings.Contains(view, "1 个") {
-		t.Fatalf("settings view should keep Docker as settings item:\n%s", view)
+		t.Fatalf("settings overlay should keep Docker as settings item:\n%s", view)
 	}
 
 	h, _ = h.Press("s")
@@ -80,8 +76,7 @@ func TestSettingsTabKeepsDockerAsSettingsItemAndSavesProjectConfig(t *testing.T)
 
 func TestSettingsArrowKeysMoveDockerSettingFocus(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("tab")
-	h, _ = h.Press("tab")
+	h, _ = h.Press("ctrl+?")
 
 	view := h.View()
 	if !strings.Contains(view, "> 启用") {
@@ -107,40 +102,47 @@ func TestSettingsArrowKeysMoveDockerSettingFocus(t *testing.T) {
 	}
 }
 
-func TestSettingsTabLeavesSettingsPanel(t *testing.T) {
+func TestSettingsOverlayTabCyclesFieldsAndQCloses(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("tab")
-	h, _ = h.Press("tab")
-	if h.TabName() != "settings" {
-		t.Fatalf("expected settings tab before pressing tab, got %s", h.TabName())
-	}
+	h, _ = h.Press("ctrl+?")
 	view := h.View()
-	if !strings.Contains(view, "Tab/Shift+Tab 顶层页") || strings.Contains(view, "Ctrl←/→") {
-		t.Fatalf("settings footer should present tab as the top-level switch:\n%s", view)
+	if !strings.Contains(view, "> 启用") {
+		t.Fatalf("settings overlay should start on enabled field:\n%s", view)
 	}
 
 	next, _ := h.Press("tab")
 	if next.TabName() != "overview" || next.FocusName() != "overview-table" {
-		t.Fatalf("tab in settings should switch to overview, tab=%s focus=%s", next.TabName(), next.FocusName())
+		t.Fatalf("tab in overlay should not switch page, tab=%s focus=%s", next.TabName(), next.FocusName())
 	}
-
-	next, _ = h.Press("shift+tab")
-	if next.TabName() != "execution" || next.FocusName() != "stage-list" {
-		t.Fatalf("shift+tab in settings should switch to execution, tab=%s focus=%s", next.TabName(), next.FocusName())
+	if !strings.Contains(next.View(), "> daemon.json 路径") {
+		t.Fatalf("tab should cycle settings fields:\n%s", next.View())
+	}
+	next, result := next.Press("q")
+	if result.Quit || strings.Contains(next.View(), "目标配置") {
+		t.Fatalf("q should close settings overlay without quitting, quit=%v view=\n%s", result.Quit, next.View())
 	}
 }
 
-func TestSettingsCtrlArrowsSwitchTopLevelPanel(t *testing.T) {
+func TestSettingsOverlayInterceptsPageSwitchKeys(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
-	h, _ = h.Press("tab")
-	h, _ = h.Press("tab")
-	if h.TabName() != "settings" {
-		t.Fatalf("expected settings tab before pressing tab, got %s", h.TabName())
-	}
+	h, _ = h.Press("ctrl+?")
 
 	h, _ = h.Press("ctrl+right")
-	if h.TabName() != "overview" {
-		t.Fatalf("ctrl+right in settings should switch top-level panel, got %s", h.TabName())
+	if h.TabName() != "overview" || !strings.Contains(h.View(), "目标配置") {
+		t.Fatalf("ctrl+right should be intercepted by settings overlay, tab=%s view=\n%s", h.TabName(), h.View())
+	}
+}
+
+func TestSettingsOverlayInterceptsQuitShortcuts(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+	h, _ = h.Press("ctrl+?")
+
+	next, result := h.Press("ctrl+c")
+	if result.Quit || result.CmdCount != 0 || next.TabName() != "overview" || !strings.Contains(next.View(), "目标配置") {
+		t.Fatalf("ctrl+c should be intercepted by settings overlay, quit=%v cmds=%d tab=%s view=\n%s", result.Quit, result.CmdCount, next.TabName(), next.View())
+	}
+	if !strings.Contains(next.Message(), "关闭设置") {
+		t.Fatalf("intercept message should explain close key, got %q", next.Message())
 	}
 }
 
@@ -303,8 +305,8 @@ func TestStageListMovesSelectedStage(t *testing.T) {
 		SetFocus("stage-list")
 
 	next, _ := h.Press("down")
-	if got := next.SelectedStageKey(); got != "B" {
-		t.Fatalf("selected stage = %s, want B", got)
+	if got := next.SelectedStageKey(); got != "D" {
+		t.Fatalf("selected stage = %s, want D", got)
 	}
 }
 

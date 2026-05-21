@@ -58,7 +58,7 @@ func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, 
 		input:         input,
 	}
 	if cfg.mode == "recheck" {
-		cfg.stages = stageSet(withoutStageE(affectedStages(selectedStage)))
+		cfg.stages = stageSet(affectedStages(selectedStage))
 	}
 	cfg.syncInputFocus()
 	return cfg
@@ -159,7 +159,7 @@ func (m *app) toggleRunConfigFocused() {
 			m.syncRefSelection()
 			m.runConfig.refRun = m.selectedRefRunCandidate()
 			if m.runConfig.fromStage == "" {
-				m.runConfig.stages = stageSet(withoutStageE(affectedStages(m.rerunStageKey())))
+				m.runConfig.stages = stageSet(affectedStages(m.rerunStageKey()))
 			}
 		}
 	case runConfigFocusStages:

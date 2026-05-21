@@ -282,7 +282,7 @@ func (s *runState) runPreflightAndCleanup(r Runner) (preflight.CheckResult, erro
 }
 
 func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckResult) (Result, error, bool) {
-	for index := range s.execution.stages {
+	for index := 0; index < len(s.execution.stages); index++ {
 		stage := s.execution.stages[index].Stage
 		if result, err, aborted := s.abortIfCancelled(r); aborted {
 			return result, err, true
@@ -325,7 +325,18 @@ func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckRes
 		if result, err, aborted := s.persistStageUpdate(r, record, true, EventStageDone); aborted || err != nil {
 			return result, err, aborted
 		}
-		if !s.execution.runtimeCleanupDone && runtimeCleanupPoint(stage, s.execution.stages) {
+		if outcome.SkipNextStage && index+1 < len(s.execution.stages) {
+			nextStage := s.execution.stages[index+1].Stage
+			skipped := skippedStage(nextStage, "Skipped because previous stage failed before required runtime was available.")
+			skipped = r.materializeSkippedStage(s.execution.run, skipped)
+			s.execution.stages[index+1] = skipped
+			s.execution.results[nextStage] = skipped
+			if result, err, aborted := s.persistStageUpdate(r, skipped, len(skipped.Findings) > 0, EventStageDone); aborted || err != nil {
+				return result, err, aborted
+			}
+			index++
+		}
+		if !s.prepare.opts.DeferRuntimeCleanup && !s.execution.runtimeCleanupDone && runtimeCleanupPoint(stage, s.execution.stages) {
 			if result, err, aborted := s.cleanupRuntime(r); aborted || err != nil {
 				return result, err, aborted
 			}
@@ -335,6 +346,9 @@ func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckRes
 }
 
 func (s *runState) finalizeRuntimeCleanup(r Runner) (Result, error, bool) {
+	if s.prepare.opts.DeferRuntimeCleanup {
+		return Result{}, nil, false
+	}
 	if s.execution.runtimeCleanupDone || !runtimeStageWasSelected(s.execution.stages) {
 		return Result{}, nil, false
 	}

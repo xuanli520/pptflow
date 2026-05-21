@@ -429,19 +429,43 @@ func TestMigratesLegacyGlobalFindingPrimaryKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = handle.Exec(`CREATE TABLE findings (
-		id TEXT PRIMARY KEY,
-		run_id TEXT NOT NULL,
-		stage TEXT,
-		severity TEXT NOT NULL,
+	_, err = handle.Exec(`CREATE TABLE projects (
+			task_id TEXT PRIMARY KEY,
+			batch TEXT NOT NULL,
+			path TEXT NOT NULL,
+			run_count INTEGER DEFAULT 0,
+			last_run_id TEXT,
+			last_run_at TEXT,
+			created_at TEXT DEFAULT (datetime('now'))
+		);
+		CREATE TABLE runs (
+			run_id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL REFERENCES projects(task_id),
+			started_at TEXT,
+			finished_at TEXT,
+			status TEXT DEFAULT 'running',
+			manual_verdict TEXT DEFAULT 'unset',
+			static_only INTEGER DEFAULT 0,
+			duration_ms INTEGER DEFAULT 0,
+			artifact_root TEXT NOT NULL,
+			tool_versions TEXT,
+			prompt_versions TEXT
+		);
+		CREATE TABLE findings (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			stage TEXT,
+			severity TEXT NOT NULL,
 		title TEXT NOT NULL,
 		rule TEXT,
 		evidence TEXT,
 		impact TEXT,
-		minimum_fix TEXT,
-		source_path TEXT
-	);
-	INSERT INTO findings(id, run_id, stage, severity, title) VALUES('P2R-A-BLK-001', 'run-legacy', 'A', 'Blocker', 'legacy');`)
+			minimum_fix TEXT,
+			source_path TEXT
+		);
+		INSERT INTO projects(task_id, batch, path) VALUES('TASK-LEGACY', 'batch', '/tmp/TASK-LEGACY');
+		INSERT INTO runs(run_id, task_id, artifact_root) VALUES('run-legacy', 'TASK-LEGACY', '/tmp/artifacts');
+		INSERT INTO findings(id, run_id, stage, severity, title) VALUES('P2R-A-BLK-001', 'run-legacy', 'A', 'Blocker', 'legacy');`)
 	if err != nil {
 		t.Fatal(err)
 	}

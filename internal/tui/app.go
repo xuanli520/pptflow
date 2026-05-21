@@ -3,7 +3,11 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -18,12 +22,14 @@ import (
 )
 
 const (
-	panelOverview = iota
+	panelTaskBoard = iota
+	panelOverview
 	panelExecution
 	panelSettings
 
 	staleRunRecoveryInterval      = 30 * time.Second
 	persistedStateRefreshInterval = 2 * time.Second
+	dockerHealthRefreshInterval   = 15 * time.Second
 )
 
 type app struct {
@@ -31,11 +37,22 @@ type app struct {
 	cfg                config.Config
 	scheduler          schedulerClient
 	recoverStaleRunsFn func(context.Context) error
+	taskQuerySvc       TaskQueryService
+	taskActionSvc      TaskActionService
+	poller             *schedulerPoller
 
-	overview     OverviewModel
-	detail       viewport.Model
-	dockerMirror dockerMirrorPanel
-	settings     settingsPanel
+	router                  *pageRouter
+	taskBoard               TaskBoardModel
+	taskInput               *TaskInputModel
+	settingsUI              SettingsOverlay
+	overview                OverviewModel
+	detail                  viewport.Model
+	dockerMirror            dockerMirrorPanel
+	settings                settingsPanel
+	settingsOpen            bool
+	settingsFocusBeforeOpen focusArea
+	settingsFocusCaptured   bool
+	focusManager            focusManager
 
 	tab   int
 	focus focusArea
@@ -57,12 +74,16 @@ type app struct {
 	confirmCancelTaskID string
 	confirmCancelJobID  string
 	pendingCancelJobID  string
+	confirmQuit         bool
+	confirmQuitDocker   bool
+	confirmQuitTasks    []TaskProject
 
 	detailVM                 executionViewModel
 	detailContent            string
 	detailFollowTail         bool
 	lastRecoveryAt           time.Time
 	lastPersistedRefreshAt   time.Time
+	lastDockerHealthAt       time.Time
 	lastTerminalRefreshJobID string
 }
 
@@ -95,6 +116,21 @@ type schedulerJobsMsg struct {
 type schedulerNotifyMsg struct{}
 
 type recoveryMsg struct {
+	err error
+}
+
+type taskActionMsg struct {
+	action string
+	taskID string
+	err    error
+}
+
+type quitCheckMsg struct {
+	tasks []TaskProject
+	err   error
+}
+
+type quitAfterCleanupMsg struct {
 	err error
 }
 
@@ -136,8 +172,64 @@ func Start(store *db.Store, cfg config.Config) error {
 		_ = m.scheduler.Shutdown(ctx)
 	}()
 	program := tea.NewProgram(m, tea.WithAltScreen())
+	stopSignalCleanup := registerSignalCleanup(store, cfg, m.scheduler)
+	defer stopSignalCleanup()
 	_, err := program.Run()
 	return err
+}
+
+func registerSignalCleanup(store *db.Store, cfg config.Config, scheduler schedulerClient) func() {
+	signals := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	var stopOnce sync.Once
+	go func() {
+		select {
+		case sig := <-signals:
+			signal.Stop(signals)
+			cleanupForSignal(store, cfg, scheduler)
+			os.Exit(signalExitCode(sig))
+		case <-done:
+		}
+	}()
+	return func() {
+		stopOnce.Do(func() {
+			signal.Stop(signals)
+			close(done)
+		})
+	}
+}
+
+func cleanupForSignal(store *db.Store, cfg config.Config, scheduler schedulerClient) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	var tasks []TaskProject
+	if store != nil {
+		dbTasks, err := store.ListTasksWithDockerRunning(ctx)
+		if err == nil {
+			tasks = make([]TaskProject, 0, len(dbTasks))
+			for _, task := range dbTasks {
+				tasks = append(tasks, taskProjectFromTask(cfg, task))
+			}
+		}
+	}
+	if err := ForceExitCleanup(ctx, cfg, tasks); err == nil && store != nil {
+		for _, task := range tasks {
+			_ = store.MarkTaskDockerStopped(ctx, task.ID)
+		}
+	}
+	if scheduler != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		_ = scheduler.Shutdown(shutdownCtx)
+	}
+}
+
+func signalExitCode(sig os.Signal) int {
+	if sig == os.Interrupt {
+		return 130
+	}
+	return 143
 }
 
 func newApp(store *db.Store, cfg config.Config) app {
@@ -145,27 +237,43 @@ func newApp(store *db.Store, cfg config.Config) app {
 	m := app{
 		store:                  store,
 		cfg:                    cfg,
+		router:                 newPageRouter(),
+		taskInput:              ptrTaskInput(newTaskInputModel()),
+		settingsUI:             SettingsOverlay{},
 		overview:               newOverviewModel(),
 		detail:                 viewport.New(80, 10),
 		dockerMirror:           newDockerMirrorPanel(cfg),
 		settings:               newSettingsPanel(),
-		tab:                    panelOverview,
-		focus:                  focusSearch,
+		tab:                    panelTaskBoard,
+		focus:                  focusTaskBoard,
+		focusManager:           newFocusManager(),
 		qaMode:                 "initial",
 		message:                "",
 		detailFollowTail:       true,
 		lastRecoveryAt:         now,
 		lastPersistedRefreshAt: now,
+		lastDockerHealthAt:     now,
 	}
 	if store != nil {
 		m.store = store
 		m.scheduler = scheduler.New(store, cfg)
 		m.recoverStaleRunsFn = func(ctx context.Context) error {
-			return pipeline.RecoverStaleRuns(ctx, store, cfg)
+			if err := pipeline.RecoverStaleRuns(ctx, store, cfg); err != nil {
+				return err
+			}
+			return store.RepairTaskStates(ctx)
 		}
+		m.taskQuerySvc = newTaskQueryService(store, cfg)
+		m.taskActionSvc = newTaskActionService(store, cfg, m.scheduler)
+		m.poller = newSchedulerPoller(store, cfg)
 	}
-	m.setFocus(focusSearch)
+	m.taskBoard = newTaskBoardModel(m.taskQuerySvc)
+	m.setFocus(focusTaskBoard)
 	return m
+}
+
+func ptrTaskInput(input TaskInputModel) *TaskInputModel {
+	return &input
 }
 
 func (m app) Init() tea.Cmd {
@@ -173,13 +281,16 @@ func (m app) Init() tea.Cmd {
 	if m.scheduler != nil {
 		activeJobs = len(m.scheduler.ActiveSnapshot())
 	}
-	return tea.Batch(m.recoverStaleRunsCmd(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), dockerStartupGCCmd(m.cfg, activeJobs), m.tick())
+	return tea.Batch(m.recoverStaleRunsCmd(), m.refreshDockerHealthCmd(), m.taskBoard.Init(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), dockerStartupGCCmd(m.cfg, activeJobs), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	if handled := m.handleWindowMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+	if handled := m.handleTaskMsg(msg, &cmds); handled {
 		return m, tea.Batch(cmds...)
 	}
 	if handled := m.handleOverviewMsg(msg, &cmds); handled {
@@ -216,6 +327,68 @@ func (m *app) handleWindowMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.overview.page.autoSize = true
 		if cmd := m.applyLayout(); cmd != nil {
 			*cmds = append(*cmds, cmd)
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
+	switch value := msg.(type) {
+	case taskBoardLoadMsg:
+		var cmd tea.Cmd
+		m.taskBoard, cmd = m.taskBoard.Update(value)
+		*cmds = append(*cmds, cmd)
+		return true
+	case TaskInputSubmitMsg:
+		m.message = "正在创建质检任务 " + value.TaskID
+		*cmds = append(*cmds, m.taskActionCmd("start", value.TaskID))
+		return true
+	case taskActionMsg:
+		if value.err != nil {
+			m.message = value.err.Error()
+		} else {
+			switch value.action {
+			case "complete":
+				m.message = "已确认完成 " + value.taskID
+			case "reinspect":
+				m.message = "已提交重新质检 " + value.taskID
+			case "retry-git":
+				m.message = "已重试 Git 同步 " + value.taskID
+			default:
+				m.message = "已提交质检 " + value.taskID
+			}
+		}
+		*cmds = append(*cmds, m.taskBoard.Reload(), m.reloadOverview(), m.reloadSchedulerJobs())
+		return true
+	case quitCheckMsg:
+		m.confirmQuit = true
+		m.confirmQuitTasks = append([]TaskProject(nil), value.tasks...)
+		m.confirmQuitDocker = len(value.tasks) > 0
+		if value.err != nil {
+			m.message = "检查 Docker 运行状态失败: " + value.err.Error()
+			m.confirmQuitDocker = false
+		}
+		return true
+	case quitAfterCleanupMsg:
+		if value.err != nil {
+			m.message = "退出清理失败: " + value.err.Error()
+		}
+		*cmds = append(*cmds, tea.Quit)
+		return true
+	case tickMsg:
+		var cmd tea.Cmd
+		m.taskBoard, cmd = m.taskBoard.Update(value)
+		*cmds = append(*cmds, cmd)
+		return false
+	case dockerHealthMsg:
+		if value.err != nil && len(value.stopped) == 0 {
+			m.message = "Docker 状态检查失败: " + value.err.Error()
+		}
+		if len(value.stopped) > 0 {
+			m.message = fmt.Sprintf("已标记 %d 个 Docker 环境为已停止", len(value.stopped))
+			*cmds = append(*cmds, m.taskBoard.Reload(), m.reloadOverview())
 		}
 		return true
 	default:
@@ -361,7 +534,11 @@ func (m *app) handleRecoveryMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		}
 		if now.Sub(m.lastPersistedRefreshAt) >= persistedStateRefreshInterval {
 			m.lastPersistedRefreshAt = now
-			*cmds = append(*cmds, m.reloadOverview())
+			*cmds = append(*cmds, m.reloadOverview(), m.taskBoard.Reload())
+		}
+		if now.Sub(m.lastDockerHealthAt) >= dockerHealthRefreshInterval {
+			m.lastDockerHealthAt = now
+			*cmds = append(*cmds, m.refreshDockerHealthCmd())
 		}
 		*cmds = append(*cmds, m.reloadSchedulerJobs(), m.tick())
 		return true
@@ -489,10 +666,20 @@ func (m app) View() string {
 		builder.WriteString(errorStyle.Render(truncateDisplay(prompt, max(8, m.width-2))))
 		builder.WriteString("\n")
 	}
+	if m.confirmQuit {
+		prompt := "退出 TUI？(y/n)"
+		if m.confirmQuitDocker {
+			prompt = fmt.Sprintf("存在 %d 个运行中的 Docker 环境，退出将清理。确认退出？(y/n)", len(m.confirmQuitTasks))
+		}
+		builder.WriteString(errorStyle.Render(truncateDisplay(prompt, max(8, m.width-2))))
+		builder.WriteString("\n")
+	}
 	builder.WriteString(renderPipelineBar(m))
 	builder.WriteString("\n")
 	if m.runConfig.active {
 		builder.WriteString(renderRunConfig(m))
+	} else if m.tab == panelTaskBoard {
+		builder.WriteString(renderTaskBoard(m))
 	} else if m.tab == panelOverview {
 		builder.WriteString(renderOverview(m))
 	} else if m.tab == panelSettings {
@@ -501,7 +688,15 @@ func (m app) View() string {
 		builder.WriteString(renderExecution(m))
 	}
 	builder.WriteString("\n")
+	if m.taskInput != nil {
+		builder.WriteString(m.taskInput.View(max(20, m.width-2)))
+		builder.WriteString("\n")
+	}
 	builder.WriteString(footerStyle.Render(footerFor(m)))
+	if m.settingsOpen {
+		builder.WriteString("\n")
+		builder.WriteString(renderSettingsOverlay(m))
+	}
 	return appStyle.Render(builder.String())
 }
 
@@ -557,6 +752,13 @@ func (m app) recoverStaleRunsCmd() tea.Cmd {
 	}
 }
 
+func (m app) refreshDockerHealthCmd() tea.Cmd {
+	if m.poller == nil {
+		return nil
+	}
+	return m.poller.RefreshDockerHealthCmd()
+}
+
 func (m app) reloadDetail() tea.Cmd {
 	taskID := m.selectedTaskID()
 	if m.store == nil || taskID == "" {
@@ -585,6 +787,69 @@ func (m app) submitRun(taskID string, opts pipeline.RunOptions) tea.Cmd {
 		}
 		jobID, err := m.scheduler.Submit(taskID, opts)
 		return runSubmitMsg{jobID: jobID, err: err}
+	}
+}
+
+func (m app) taskActionCmd(action, taskID string) tea.Cmd {
+	return func() tea.Msg {
+		if m.taskActionSvc == nil {
+			return taskActionMsg{action: action, taskID: taskID, err: fmt.Errorf("task service unavailable")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var err error
+		switch action {
+		case "complete":
+			err = m.taskActionSvc.ConfirmComplete(ctx, taskID)
+		case "reinspect":
+			err = m.taskActionSvc.ReInspect(ctx, taskID)
+		case "retry-git":
+			err = m.taskActionSvc.RetryGitSync(ctx, taskID)
+		default:
+			err = m.taskActionSvc.StartInspection(ctx, taskID)
+		}
+		return taskActionMsg{action: action, taskID: taskID, err: err}
+	}
+}
+
+func (m app) prepareQuitCmd() tea.Cmd {
+	return func() tea.Msg {
+		if m.taskQuerySvc == nil {
+			return quitCheckMsg{}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		tasks, err := m.taskQuerySvc.FindWithDockerRunning(ctx)
+		return quitCheckMsg{tasks: tasks, err: err}
+	}
+}
+
+func (m app) quitCleanupCmd(force bool, tasks []TaskProject) tea.Cmd {
+	cfg := m.cfg
+	scheduler := m.scheduler
+	stopStore, _ := m.store.(interface {
+		MarkTaskDockerStopped(context.Context, string) error
+	})
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		var err error
+		if force {
+			err = ForceExitCleanup(ctx, cfg, tasks)
+			if err == nil && stopStore != nil {
+				for _, task := range tasks {
+					_ = stopStore.MarkTaskDockerStopped(ctx, task.ID)
+				}
+			}
+		} else {
+			err = LightExitCleanup(ctx, cfg)
+		}
+		if scheduler != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = scheduler.Shutdown(shutdownCtx)
+			shutdownCancel()
+		}
+		return quitAfterCleanupMsg{err: err}
 	}
 }
 
@@ -633,6 +898,9 @@ func (m app) shutdownScheduler() tea.Cmd {
 func (m *app) applyLayout() tea.Cmd {
 	layout := layoutFor(m.width, max(8, m.height-verticalChromeHeight(*m)), m.tab == panelExecution)
 	pageSizeChanged := m.overview.SetSize(layout.contentWidth, layout.overviewTableHeight)
+	if m.taskInput != nil {
+		m.taskInput.SetWidth(max(18, layout.contentWidth-2))
+	}
 	m.detail.Width = layout.detailWidth
 	m.detail.Height = layout.detailHeight
 	if m.tab == panelExecution {
@@ -646,6 +914,11 @@ func (m *app) applyLayout() tea.Cmd {
 }
 
 func (m app) selectedTaskID() string {
+	if m.tab == panelTaskBoard {
+		if task, ok := m.taskBoard.SelectedTask(); ok {
+			return task.ID
+		}
+	}
 	return m.overview.SelectedTaskID()
 }
 

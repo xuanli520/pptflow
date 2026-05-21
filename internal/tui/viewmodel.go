@@ -31,10 +31,12 @@ type overviewItem struct {
 	LastRunID     string
 	LastRun       string
 	RunStatus     string
+	TaskState     string
 	ManualVerdict string
 	FailedStage   string
 	Blocking      int
 	High          int
+	Completion    int
 	DocsCount     int
 	CleanupStatus string
 	Mode          string
@@ -103,10 +105,12 @@ func buildOverviewItems(cfg config.Config, projects []db.ProjectSummary) []overv
 			LastRunID:     project.LastRunID,
 			LastRun:       project.LastRunAt,
 			RunStatus:     project.RunStatus,
+			TaskState:     project.TaskState,
 			ManualVerdict: project.ManualVerdict,
 			FailedStage:   project.FailedStage,
 			Blocking:      project.Blocking,
 			High:          project.High,
+			Completion:    project.CompletionCount,
 			DocsCount:     taskdocs.Count(cfg.ScanPath, project.TaskID),
 			CleanupStatus: "none",
 			Mode:          "initial",
@@ -129,6 +133,8 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 		switch spec.Key {
 		case "task_id":
 			row = append(row, truncateMiddleDisplay(item.TaskID, width))
+		case "task_state":
+			row = append(row, taskStateStyle(item.TaskState).Render(truncateDisplay(localizeTaskState(item.TaskState), width)))
 		case "run_status":
 			row = append(row, truncateDisplay(localizeRunStatus(empty(item.RunStatus, "unknown")), width))
 		case "failed_stage":
@@ -137,6 +143,8 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 			row = append(row, truncateDisplay(fmt.Sprint(item.Blocking), width))
 		case "high":
 			row = append(row, truncateDisplay(fmt.Sprint(item.High), width))
+		case "completion_count":
+			row = append(row, truncateDisplay(fmt.Sprint(item.Completion), width))
 		case "manual_verdict":
 			row = append(row, truncateDisplay(localizeManualVerdict(item.ManualVerdict), width))
 		case "docs":
@@ -855,6 +863,8 @@ func overviewSearchText(item overviewItem) string {
 		item.Batch,
 		item.RunStatus,
 		localizeRunStatus(item.RunStatus),
+		item.TaskState,
+		localizeTaskState(item.TaskState),
 		item.ManualVerdict,
 		localizeManualVerdict(item.ManualVerdict),
 		item.FailedStage,

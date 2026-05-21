@@ -265,7 +265,7 @@ func TestTickThrottlesPersistedReload(t *testing.T) {
 		t.Fatalf("short tick should only refresh scheduler snapshot and timer, got %d commands", cmdCount)
 	}
 	_, cmdCount = h.ApplyTickForTest(2500 * time.Millisecond)
-	if cmdCount != 3 {
+	if cmdCount != 4 {
 		t.Fatalf("cold tick should include persisted reload, got %d commands", cmdCount)
 	}
 	hasRefresh, refreshDetail := h.ColdTickRefreshDetailForTest(2500 * time.Millisecond)
@@ -396,7 +396,7 @@ func TestRunningStreamStaysPinnedToPrimaryContent(t *testing.T) {
 		t.Fatalf("running stream should stay pinned to primary content, offset=%d", h.DetailYOffset())
 	}
 	view := h.View()
-	if !strings.Contains(view, "line-39") || !strings.Contains(view, "运行证据") {
+	if !strings.Contains(view, "line-39") || !strings.Contains(view, "当前: C") {
 		t.Fatalf("running stream should show recent stream and evidence header, got:\n%s", view)
 	}
 	h, _ = h.Press("pgup")

@@ -99,6 +99,24 @@ func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner
 	return summary
 }
 
+func ComposeProjectRunning(ctx context.Context, exec executor.CommandRunner, composeFiles []string, projectName, workDir string) (bool, error) {
+	composeFiles = normalizeComposeFiles(composeFiles)
+	if strings.TrimSpace(projectName) == "" {
+		return false, nil
+	}
+	args := []string{"compose"}
+	if strings.TrimSpace(workDir) != "" {
+		args = append(args, "--project-directory", workDir)
+	}
+	args = append(args, ComposeFileArgs(composeFiles)...)
+	args = append(args, "-p", projectName, "ps", "-q")
+	result := exec.Run(ctx, 10*time.Second, workDir, nil, "docker", args...)
+	if result.Err != nil {
+		return false, result.Err
+	}
+	return strings.TrimSpace(result.Stdout) != "", nil
+}
+
 func CleanupComposeArgs(cfg config.DockerConfig, composeFile, projectName string) []string {
 	return CleanupComposeArgsFiles(cfg, composeFilesFromLegacy(composeFile, nil), projectName)
 }
@@ -114,6 +132,7 @@ func CleanupComposeArgsFilesWithProjectDir(cfg config.DockerConfig, composeFiles
 	}
 	args = append(args, ComposeFileArgs(normalizeComposeFiles(composeFiles))...)
 	args = append(args, "-p", projectName, "down")
+	args = append(args, "--timeout", "30")
 	if cfg.CleanupVolumes {
 		args = append(args, "-v")
 	}

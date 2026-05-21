@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/pathutil"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/projectlayout"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
@@ -40,16 +42,25 @@ type ProjectSummary struct {
 
 	LatestArtifactRoot string
 	LatestStaticOnly   bool
+	HasTask            bool
+	TaskState          string
+	CompletionCount    int
+	FrontendURL        string
+	DockerRunning      bool
+	EnteredWaitingAt   string
+	LastCompletedAt    string
+	SyncError          string
 }
 
 type ProjectSort string
 
 const (
-	ProjectSortTaskID   ProjectSort = "task_id"
-	ProjectSortStatus   ProjectSort = "status"
-	ProjectSortSeverity ProjectSort = "severity"
-	ProjectSortLastRun  ProjectSort = "last_run"
-	ProjectSortVerdict  ProjectSort = "verdict"
+	ProjectSortTaskID          ProjectSort = "task_id"
+	ProjectSortStatus          ProjectSort = "status"
+	ProjectSortSeverity        ProjectSort = "severity"
+	ProjectSortLastRun         ProjectSort = "last_run"
+	ProjectSortVerdict         ProjectSort = "verdict"
+	ProjectSortCompletionCount ProjectSort = "completion_count"
 )
 
 type ProjectSearch struct {
@@ -59,6 +70,7 @@ type ProjectSearch struct {
 type ProjectSearchTerm struct {
 	Text         string
 	Statuses     []string
+	TaskStates   []string
 	Verdicts     []string
 	FailedStages []string
 }
@@ -82,6 +94,8 @@ type ArtifactPruneResult struct {
 	Removed []ArtifactPruneItem
 	Skipped []ArtifactPruneItem
 }
+
+const defaultBatchMaxTasks = 20
 
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -121,6 +135,7 @@ func sqliteDSN(path string) string {
 	}
 	query := url.Values{}
 	query.Add("_pragma", "busy_timeout=5000")
+	query.Add("_pragma", "foreign_keys=ON")
 	query.Add("_pragma", "journal_mode=WAL")
 	query.Add("_pragma", "synchronous=NORMAL")
 	return dsn + sep + query.Encode()
@@ -129,6 +144,7 @@ func sqliteDSN(path string) string {
 func configureSQLite(handle *sql.DB) error {
 	for _, statement := range []string{
 		`PRAGMA busy_timeout = 5000;`,
+		`PRAGMA foreign_keys = ON;`,
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA synchronous = NORMAL;`,
 	} {
@@ -186,6 +202,179 @@ func (s *Store) UpsertProjects(ctx context.Context, projects []scanner.Project) 
 			}
 		}
 		return nil
+	})
+}
+
+func (s *Store) CreateTaskWithBatch(ctx context.Context, taskID, gitURL, scanPath string) (model.Task, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	var task model.Task
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		exists, err := taskExistsTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("task already exists: %s", taskID)
+		}
+		batch, err := selectWritableBatch(ctx, tx, now)
+		if err != nil {
+			return err
+		}
+		repoPath := projectlayout.ExpectedProjectPath(scanPath, batch.ID, taskID)
+		_, err = tx.ExecContext(ctx, `INSERT INTO tasks(id, batch_id, git_url, repo_path, state, completion_count, frontend_url, docker_running, compose_meta, entered_waiting_at, last_completed_at, sync_error, created_at, updated_at)
+			VALUES(?, ?, ?, ?, ?, 0, '', 0, '', '', '', '', ?, ?)
+			`,
+			taskID, batch.ID, gitURL, repoPath, model.TaskInspecting, now, now)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO projects(task_id, batch, path)
+			VALUES(?, ?, ?)
+			ON CONFLICT(task_id) DO UPDATE SET batch=excluded.batch, path=excluded.path`,
+			taskID, batch.ID, repoPath); err != nil {
+			return err
+		}
+		task, err = getTaskTx(ctx, tx, taskID)
+		return err
+	})
+	return task, err
+}
+
+func (s *Store) GetTask(ctx context.Context, taskID string) (model.Task, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return model.Task{}, err
+	}
+	defer tx.Rollback()
+	task, err := getTaskTx(ctx, tx, taskID)
+	if err != nil {
+		return model.Task{}, err
+	}
+	return task, tx.Commit()
+}
+
+func (s *Store) ListTasksByState(ctx context.Context, state string) ([]model.Task, error) {
+	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+` WHERE state = ? ORDER BY updated_at DESC, id ASC`, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTasks(rows)
+}
+
+func (s *Store) ListTasksWithDockerRunning(ctx context.Context) ([]model.Task, error) {
+	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+` WHERE docker_running = 1 ORDER BY updated_at DESC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTasks(rows)
+}
+
+func (s *Store) RecordTaskGitError(ctx context.Context, taskID string, syncErr error) error {
+	message := ""
+	if syncErr != nil {
+		message = syncErr.Error()
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE tasks SET sync_error = ?, updated_at = ? WHERE id = ?`, message, now, taskID)
+		if err != nil {
+			return err
+		}
+		return requireAffected(result, "task", taskID)
+	})
+}
+
+func (s *Store) ReopenTaskForInspection(ctx context.Context, taskID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET state = ?, current_run_id = NULL, frontend_url = '', docker_running = 0, compose_meta = '', entered_waiting_at = '', sync_error = '', updated_at = ?
+			WHERE id = ? AND state = ? AND current_run_id IS NULL`,
+			model.TaskInspecting, now, taskID, model.TaskCompleted)
+		if err != nil {
+			return err
+		}
+		return requireAffected(result, "completed task", taskID)
+	})
+}
+
+func (s *Store) RecordTaskRuntime(ctx context.Context, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	composeMeta, err := marshalComposeMeta(meta)
+	if err != nil {
+		return err
+	}
+	dockerFlag := 0
+	if dockerRunning {
+		dockerFlag = 1
+	}
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET frontend_url = ?, docker_running = ?, compose_meta = ?, updated_at = ?
+			WHERE id = ?`,
+			frontendURL, dockerFlag, composeMeta, now, taskID)
+		if err != nil {
+			return err
+		}
+		return requireAffected(result, "task", taskID)
+	})
+}
+
+func (s *Store) MarkTaskDockerStopped(ctx context.Context, taskID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE tasks SET docker_running = 0, updated_at = ? WHERE id = ?`, now, taskID)
+		if err != nil {
+			return err
+		}
+		return requireAffected(result, "task", taskID)
+	})
+}
+
+func (s *Store) CompleteTask(ctx context.Context, taskID string) (model.Task, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	var task model.Task
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET state = ?, current_run_id = NULL, docker_running = 0, completion_count = completion_count + 1,
+			    last_completed_at = ?, updated_at = ?
+			WHERE id = ? AND state = ?`,
+			model.TaskCompleted, now, now, taskID, model.TaskWaitingManual)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(result, "waiting task", taskID); err != nil {
+			return err
+		}
+		task, err = getTaskTx(ctx, tx, taskID)
+		return err
+	})
+	return task, err
+}
+
+func (s *Store) RepairTaskStates(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET state = ?, current_run_id = NULL, entered_waiting_at = CASE WHEN entered_waiting_at = '' THEN ? ELSE entered_waiting_at END, updated_at = ?
+			WHERE state = ? AND current_run_id IN (SELECT run_id FROM runs WHERE status IN (?, ?))`,
+			model.TaskWaitingManual, now, now, model.TaskInspecting, model.RunCompletedClean, model.RunCompletedWithFindings)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE tasks
+			SET current_run_id = NULL, updated_at = ?
+			WHERE state = ? AND current_run_id IN (SELECT run_id FROM runs WHERE status IN (?, ?))`,
+			now, model.TaskInspecting, model.RunAborted, model.RunCrashed)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE tasks
+			SET current_run_id = NULL, updated_at = ?
+			WHERE current_run_id IS NOT NULL AND current_run_id NOT IN (SELECT run_id FROM runs)`, now)
+		return err
 	})
 }
 
@@ -290,7 +479,15 @@ func (s *Store) listProjectSummaries(ctx context.Context, q ProjectQuery, pagina
        blocking,
        high,
        latest_artifact_root,
-       latest_static_only
+       latest_static_only,
+       has_task,
+       task_state,
+       completion_count,
+       frontend_url,
+       docker_running,
+       entered_waiting_at,
+       last_completed_at,
+       sync_error
 FROM project_rows
 ` + projectOrderClause(q)
 	args := append([]any{}, where.Args...)
@@ -308,6 +505,8 @@ LIMIT ? OFFSET ?`
 	for rows.Next() {
 		var project ProjectSummary
 		var staticOnly int
+		var hasTask int
+		var dockerRunning int
 		if err := rows.Scan(
 			&project.TaskID,
 			&project.Batch,
@@ -322,11 +521,21 @@ LIMIT ? OFFSET ?`
 			&project.High,
 			&project.LatestArtifactRoot,
 			&staticOnly,
+			&hasTask,
+			&project.TaskState,
+			&project.CompletionCount,
+			&project.FrontendURL,
+			&dockerRunning,
+			&project.EnteredWaitingAt,
+			&project.LastCompletedAt,
+			&project.SyncError,
 		); err != nil {
 			_ = rows.Close()
 			return nil, 0, err
 		}
 		project.LatestStaticOnly = staticOnly == 1
+		project.HasTask = hasTask == 1
+		project.DockerRunning = dockerRunning == 1
 		projects = append(projects, project)
 	}
 	if err := rows.Err(); err != nil {
@@ -424,8 +633,17 @@ project_rows AS (
            COALESCE(fc.blocking, 0) AS blocking,
            COALESCE(fc.high, 0) AS high,
            COALESCE(lr.artifact_root, '') AS latest_artifact_root,
-           COALESCE(lr.static_only, 0) AS latest_static_only
+           COALESCE(lr.static_only, 0) AS latest_static_only,
+           CASE WHEN t.id IS NULL THEN 0 ELSE 1 END AS has_task,
+           COALESCE(t.state, '') AS task_state,
+           COALESCE(t.completion_count, 0) AS completion_count,
+           COALESCE(t.frontend_url, '') AS frontend_url,
+           COALESCE(t.docker_running, 0) AS docker_running,
+           COALESCE(t.entered_waiting_at, '') AS entered_waiting_at,
+           COALESCE(t.last_completed_at, '') AS last_completed_at,
+           COALESCE(t.sync_error, '') AS sync_error
     FROM projects p
+    LEFT JOIN tasks t ON t.id = p.task_id
     LEFT JOIN latest_run lr ON lr.task_id = p.task_id
     LEFT JOIN failed_stage fs ON fs.run_id = lr.run_id
     LEFT JOIN finding_counts fc ON fc.run_id = lr.run_id
@@ -451,7 +669,7 @@ func normalizeProjectQuery(q ProjectQuery, paginated bool) ProjectQuery {
 
 func validProjectSort(sort ProjectSort) bool {
 	switch sort {
-	case ProjectSortTaskID, ProjectSortStatus, ProjectSortSeverity, ProjectSortLastRun, ProjectSortVerdict:
+	case ProjectSortTaskID, ProjectSortStatus, ProjectSortSeverity, ProjectSortLastRun, ProjectSortVerdict, ProjectSortCompletionCount:
 		return true
 	default:
 		return false
@@ -480,10 +698,11 @@ func normalizeProjectSearch(search ProjectSearch) ProjectSearch {
 		normalized := ProjectSearchTerm{
 			Text:         limitSearchText(strings.TrimSpace(term.Text), 64),
 			Statuses:     filterUnique(term.Statuses, validRunStatuses()),
+			TaskStates:   filterUnique(term.TaskStates, validTaskStates()),
 			Verdicts:     filterUnique(term.Verdicts, validManualVerdicts()),
 			FailedStages: filterUnique(term.FailedStages, validFailedStages()),
 		}
-		if normalized.Text == "" && len(normalized.Statuses) == 0 && len(normalized.Verdicts) == 0 && len(normalized.FailedStages) == 0 {
+		if normalized.Text == "" && len(normalized.Statuses) == 0 && len(normalized.TaskStates) == 0 && len(normalized.Verdicts) == 0 && len(normalized.FailedStages) == 0 {
 			continue
 		}
 		terms = append(terms, normalized)
@@ -523,6 +742,14 @@ func validRunStatuses() map[string]bool {
 		model.RunCompletedWithFindings: true,
 		model.RunAborted:               true,
 		model.RunCompletedClean:        true,
+	}
+}
+
+func validTaskStates() map[string]bool {
+	return map[string]bool{
+		model.TaskInspecting:    true,
+		model.TaskWaitingManual: true,
+		model.TaskCompleted:     true,
 	}
 }
 
@@ -584,6 +811,7 @@ func projectSearchTermPredicate(term ProjectSearchTerm) projectWhere {
 			"p.batch",
 			"p.path",
 			"COALESCE(lr.status, '')",
+			"COALESCE(t.state, '')",
 			"COALESCE(NULLIF(lr.manual_verdict, ''), 'unset')",
 			"COALESCE(fs.stage, '')",
 		} {
@@ -595,6 +823,12 @@ func projectSearchTermPredicate(term ProjectSearchTerm) projectWhere {
 		clauses = append(clauses, "COALESCE(lr.status, '') IN ("+placeholders(len(term.Statuses))+")")
 		for _, status := range term.Statuses {
 			args = append(args, status)
+		}
+	}
+	if len(term.TaskStates) > 0 {
+		clauses = append(clauses, "COALESCE(t.state, '') IN ("+placeholders(len(term.TaskStates))+")")
+		for _, state := range term.TaskStates {
+			args = append(args, state)
 		}
 	}
 	if len(term.Verdicts) > 0 {
@@ -651,6 +885,8 @@ func projectOrderClause(q ProjectQuery) string {
 		return fmt.Sprintf("ORDER BY last_run_at %s, task_id ASC", dir)
 	case ProjectSortVerdict:
 		return fmt.Sprintf("ORDER BY verdict_rank %s, task_id ASC", dir)
+	case ProjectSortCompletionCount:
+		return fmt.Sprintf("ORDER BY completion_count %s, task_id ASC", dir)
 	default:
 		return fmt.Sprintf("ORDER BY task_id %s", dir)
 	}
@@ -662,15 +898,38 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 		staticOnly = 1
 	}
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, artifact_root, tool_versions, prompt_versions)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			run.RunID, run.TaskID, run.StartedAt, run.Status, run.ManualVerdict, staticOnly, run.ArtifactRoot, run.ToolVersions, run.PromptVersions)
+		round := 1
+		taskExists, err := taskExistsTx(ctx, tx, run.TaskID)
+		if err != nil {
+			return err
+		}
+		if taskExists {
+			if err := tx.QueryRowContext(ctx, `SELECT completion_count + 1 FROM tasks WHERE id = ?`, run.TaskID).Scan(&round); err != nil {
+				return err
+			}
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, duration_ms, artifact_root, tool_versions, prompt_versions, completion_round)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			run.RunID, run.TaskID, run.StartedAt, run.Status, run.ManualVerdict, staticOnly, run.DurationMS, run.ArtifactRoot, run.ToolVersions, run.PromptVersions, round)
 		if err != nil {
 			return err
 		}
 		startedAt := firstNonEmptyString(run.StartedAt, time.Now().UTC().Format(time.RFC3339))
 		if _, err := tx.ExecContext(ctx, `UPDATE projects SET last_run_id = ?, last_run_at = ? WHERE task_id = ?`, run.RunID, startedAt, run.TaskID); err != nil {
 			return err
+		}
+		if taskExists {
+			now := time.Now().UTC().Format(time.RFC3339)
+			result, err := tx.ExecContext(ctx, `UPDATE tasks
+				SET current_run_id = ?, state = ?, sync_error = '', updated_at = ?
+				WHERE id = ? AND current_run_id IS NULL`,
+				run.RunID, model.TaskInspecting, now, run.TaskID)
+			if err != nil {
+				return err
+			}
+			if err := requireAffected(result, "idle task", run.TaskID); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -689,15 +948,35 @@ func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, dur
 		if err != nil {
 			return err
 		}
-		return nil
+		taskExists, err := taskExistsTx(ctx, tx, taskID)
+		if err != nil || !taskExists {
+			return err
+		}
+		switch status {
+		case model.RunCompletedClean, model.RunCompletedWithFindings:
+			_, err = tx.ExecContext(ctx, `UPDATE tasks
+				SET state = ?, current_run_id = NULL, entered_waiting_at = CASE WHEN entered_waiting_at = '' THEN ? ELSE entered_waiting_at END, updated_at = ?
+				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
+				model.TaskWaitingManual, now, now, taskID, runID)
+		case model.RunAborted, model.RunCrashed:
+			_, err = tx.ExecContext(ctx, `UPDATE tasks
+				SET current_run_id = NULL, updated_at = ?
+				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
+				now, taskID, runID)
+		}
+		return err
 	})
+}
+
+func (s *Store) FinishRunAndTransitionTask(ctx context.Context, runID, taskID, status string, duration time.Duration) error {
+	return s.FinishRun(ctx, runID, taskID, status, duration)
 }
 
 func (s *Store) GetRun(ctx context.Context, runID string) (model.RunRecord, error) {
 	var run model.RunRecord
 	var staticOnly int
-	row := s.db.QueryRowContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,'') FROM runs WHERE run_id = ?`, runID)
-	err := row.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions)
+	row := s.db.QueryRowContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,''), completion_round FROM runs WHERE run_id = ?`, runID)
+	err := row.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions, &run.CompletionRound)
 	run.StaticOnly = staticOnly == 1
 	return run, err
 }
@@ -712,7 +991,7 @@ func (s *Store) LatestRunForTask(ctx context.Context, taskID string) (model.RunR
 }
 
 func (s *Store) ListRunsForTask(ctx context.Context, taskID string) ([]model.RunRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,'') FROM runs WHERE task_id = ? ORDER BY started_at DESC, run_id DESC`, taskID)
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,''), completion_round FROM runs WHERE task_id = ? ORDER BY started_at DESC, run_id DESC`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -721,7 +1000,7 @@ func (s *Store) ListRunsForTask(ctx context.Context, taskID string) ([]model.Run
 	for rows.Next() {
 		var run model.RunRecord
 		var staticOnly int
-		if err := rows.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions); err != nil {
+		if err := rows.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions, &run.CompletionRound); err != nil {
 			return nil, err
 		}
 		run.StaticOnly = staticOnly == 1
@@ -731,7 +1010,7 @@ func (s *Store) ListRunsForTask(ctx context.Context, taskID string) ([]model.Run
 }
 
 func (s *Store) RunningRuns(ctx context.Context) ([]model.RunRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,'') FROM runs WHERE status = ? ORDER BY started_at DESC, run_id DESC`, model.RunRunning)
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, task_id, COALESCE(started_at,''), COALESCE(finished_at,''), status, manual_verdict, static_only, duration_ms, artifact_root, COALESCE(tool_versions,''), COALESCE(prompt_versions,''), completion_round FROM runs WHERE status = ? ORDER BY started_at DESC, run_id DESC`, model.RunRunning)
 	if err != nil {
 		return nil, err
 	}
@@ -740,7 +1019,7 @@ func (s *Store) RunningRuns(ctx context.Context) ([]model.RunRecord, error) {
 	for rows.Next() {
 		var run model.RunRecord
 		var staticOnly int
-		if err := rows.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions); err != nil {
+		if err := rows.Scan(&run.RunID, &run.TaskID, &run.StartedAt, &run.FinishedAt, &run.Status, &run.ManualVerdict, &staticOnly, &run.DurationMS, &run.ArtifactRoot, &run.ToolVersions, &run.PromptVersions, &run.CompletionRound); err != nil {
 			return nil, err
 		}
 		run.StaticOnly = staticOnly == 1
@@ -838,6 +1117,172 @@ func findingCounts(ctx context.Context, s *Store, runID string) (int, int) {
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM findings WHERE run_id = ? AND severity = 'Blocker'`, runID).Scan(&blocker)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM findings WHERE run_id = ? AND severity = 'High'`, runID).Scan(&high)
 	return blocker, high
+}
+
+func selectWritableBatch(ctx context.Context, tx *sql.Tx, now string) (model.Batch, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT b.id, b.display_name, COALESCE(NULLIF(b.max_tasks, 0), ?), b.created_at,
+	       COUNT(t.id) AS task_count
+	FROM batches b
+	LEFT JOIN tasks t ON t.batch_id = b.id
+	GROUP BY b.id, b.display_name, b.max_tasks, b.created_at
+	ORDER BY CAST(SUBSTR(b.id, 7) AS INTEGER), b.id`, defaultBatchMaxTasks)
+	if err != nil {
+		return model.Batch{}, err
+	}
+	var batches []model.Batch
+	for rows.Next() {
+		var batch model.Batch
+		if err := rows.Scan(&batch.ID, &batch.DisplayName, &batch.MaxTasks, &batch.CreatedAt, &batch.TaskCount); err != nil {
+			_ = rows.Close()
+			return model.Batch{}, err
+		}
+		batch.IsFull = batch.TaskCount >= batch.MaxTasks
+		batches = append(batches, batch)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return model.Batch{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return model.Batch{}, err
+	}
+	for _, batch := range batches {
+		if batch.TaskCount < batch.MaxTasks {
+			return batch, nil
+		}
+	}
+	next := nextBatchID(batches)
+	batch := model.Batch{
+		ID:          next,
+		DisplayName: next,
+		MaxTasks:    defaultBatchMaxTasks,
+		CreatedAt:   now,
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO batches(id, display_name, task_count, max_tasks, created_at, is_full)
+		VALUES(?, ?, 0, ?, ?, 0)`, batch.ID, batch.DisplayName, batch.MaxTasks, batch.CreatedAt); err != nil {
+		return model.Batch{}, err
+	}
+	return batch, nil
+}
+
+func nextBatchID(batches []model.Batch) string {
+	maxID := 0
+	for _, batch := range batches {
+		suffix := strings.TrimPrefix(strings.TrimSpace(batch.ID), "batch-")
+		number, err := strconv.Atoi(suffix)
+		if err == nil && number > maxID {
+			maxID = number
+		}
+	}
+	return fmt.Sprintf("batch-%03d", maxID+1)
+}
+
+func taskSelectSQL() string {
+	return `SELECT id, batch_id, git_url, repo_path, state, COALESCE(current_run_id, ''), completion_count,
+	       COALESCE(frontend_url, ''), docker_running, COALESCE(compose_meta, ''), COALESCE(entered_waiting_at, ''),
+	       COALESCE(last_completed_at, ''), COALESCE(sync_error, ''), created_at, updated_at
+	FROM tasks`
+}
+
+func getTaskTx(ctx context.Context, tx *sql.Tx, taskID string) (model.Task, error) {
+	row := tx.QueryRowContext(ctx, taskSelectSQL()+` WHERE id = ?`, taskID)
+	return scanTask(row)
+}
+
+type taskScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTask(row taskScanner) (model.Task, error) {
+	var task model.Task
+	var dockerRunning int
+	var composeMeta string
+	err := row.Scan(
+		&task.ID,
+		&task.BatchID,
+		&task.GitURL,
+		&task.RepoPath,
+		&task.State,
+		&task.CurrentRunID,
+		&task.CompletionCount,
+		&task.FrontendURL,
+		&dockerRunning,
+		&composeMeta,
+		&task.EnteredWaitingAt,
+		&task.LastCompletedAt,
+		&task.SyncError,
+		&task.CreatedAt,
+		&task.UpdatedAt,
+	)
+	if err != nil {
+		return model.Task{}, err
+	}
+	task.DockerRunning = dockerRunning == 1
+	if strings.TrimSpace(composeMeta) != "" {
+		_ = json.Unmarshal([]byte(composeMeta), &task.ComposeMeta)
+	}
+	return task, nil
+}
+
+func scanTasks(rows *sql.Rows) ([]model.Task, error) {
+	var tasks []model.Task
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
+}
+
+func taskExistsTx(ctx context.Context, tx *sql.Tx, taskID string) (bool, error) {
+	var found string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM tasks WHERE id = ?`, taskID).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func marshalComposeMeta(meta model.ComposeMeta) (string, error) {
+	if strings.TrimSpace(meta.Project) == "" && len(meta.ComposeFiles) == 0 && strings.TrimSpace(meta.WorkDir) == "" {
+		return "", nil
+	}
+	content, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
+func requireAffected(result sql.Result, kind, id string) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return FormatNotFound(kind, id)
+	}
+	return nil
+}
+
+func terminalRunStatusArgs() []any {
+	statuses := terminalRunStatuses()
+	args := make([]any, 0, len(statuses))
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	return args
+}
+
+func terminalRunStatuses() []string {
+	return []string{
+		model.RunCompletedClean,
+		model.RunCompletedWithFindings,
+		model.RunAborted,
+		model.RunCrashed,
+	}
 }
 
 func metadataPromptMissing(projectPath string) bool {

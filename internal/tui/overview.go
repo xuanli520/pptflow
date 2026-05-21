@@ -23,6 +23,7 @@ const (
 	sortBySeverity
 	sortByLastRun
 	sortByVerdict
+	sortByCompletionCount
 )
 
 type PageState struct {
@@ -345,13 +346,15 @@ func (m OverviewModel) dbSort() db.ProjectSort {
 		return db.ProjectSortLastRun
 	case sortByVerdict:
 		return db.ProjectSortVerdict
+	case sortByCompletionCount:
+		return db.ProjectSortCompletionCount
 	default:
 		return db.ProjectSortTaskID
 	}
 }
 
 func (m *OverviewModel) cycleSortMode() {
-	m.sortMode = (m.sortMode + 1) % 5
+	m.sortMode = (m.sortMode + 1) % 6
 	switch m.sortMode {
 	case sortByTaskID:
 		m.sortAsc = true
@@ -433,6 +436,8 @@ func (m OverviewModel) sortLabel() string {
 		label = "最近运行"
 	case sortByVerdict:
 		label = "判定"
+	case sortByCompletionCount:
+		label = "完成"
 	}
 	if m.sortAsc {
 		return label + "↑"
@@ -515,9 +520,11 @@ func overviewSearchFromText(value string) db.ProjectSearch {
 	for _, raw := range rawTerms {
 		term := db.ProjectSearchTerm{Text: raw}
 		term.Statuses = append(term.Statuses, statusMatchesForSearch(raw)...)
+		term.TaskStates = append(term.TaskStates, taskStateMatchesForSearch(raw)...)
 		term.Verdicts = append(term.Verdicts, verdictMatchesForSearch(raw)...)
 		term.FailedStages = append(term.FailedStages, stageMatchesForSearch(raw)...)
 		term.Statuses = uniqueStrings(term.Statuses)
+		term.TaskStates = uniqueStrings(term.TaskStates)
 		term.Verdicts = uniqueStrings(term.Verdicts)
 		term.FailedStages = uniqueStrings(term.FailedStages)
 		terms = append(terms, term)
@@ -539,6 +546,19 @@ func statusMatchesForSearch(term string) []string {
 		return nil
 	case strings.Contains(term, "通过"):
 		return []string{model.RunCompletedClean}
+	default:
+		return nil
+	}
+}
+
+func taskStateMatchesForSearch(term string) []string {
+	switch {
+	case strings.Contains(term, "开始质检") || strings.Contains(term, "质检中") || strings.Contains(term, "同步中"):
+		return []string{model.TaskInspecting}
+	case strings.Contains(term, "待处理") || strings.Contains(term, "等待人工") || strings.Contains(term, "等待手动"):
+		return []string{model.TaskWaitingManual}
+	case strings.Contains(term, "结束质检") || strings.Contains(term, "已完成"):
+		return []string{model.TaskCompleted}
 	default:
 		return nil
 	}

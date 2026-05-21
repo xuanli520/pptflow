@@ -24,11 +24,11 @@ type StageSpec struct {
 
 var stageSpecs = []StageSpec{
 	{ID: StageA, Order: 1, Name: "structure and rules check", Static: true, LogName: "A_validate.log"},
-	{ID: StageB, Order: 2, Name: "Docker runtime evidence", Runtime: true, LogName: "B_docker.log"},
-	{ID: StageC, Order: 3, Name: "run_tests runtime evidence", Runtime: true, LogName: "C_tests.log"},
-	{ID: StageD, Order: 4, Name: "tests effectiveness static review", Static: true, LogName: "D_tests_coverage_static.log"},
-	{ID: StageE, Order: 5, Name: "static acceptance audit", Static: true, LogName: "E_static_audit.log"},
-	{ID: StageF, Order: 6, Name: "annotator repair static review", Static: true, LogName: "F_repair.log"},
+	{ID: StageD, Order: 2, Name: "tests effectiveness static review", Static: true, LogName: "D_tests_coverage_static.log"},
+	{ID: StageE, Order: 3, Name: "static acceptance audit", Static: true, LogName: "E_static_audit.log"},
+	{ID: StageF, Order: 4, Name: "annotator repair static review", Static: true, LogName: "F_repair.log"},
+	{ID: StageB, Order: 5, Name: "Docker runtime evidence", Runtime: true, LogName: "B_docker.log"},
+	{ID: StageC, Order: 6, Name: "run_tests runtime evidence", Runtime: true, LogName: "C_tests.log"},
 }
 
 var stageSpecByID = func() map[StageID]StageSpec {

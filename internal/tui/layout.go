@@ -99,7 +99,7 @@ func verticalChromeHeight(m app) int {
 		height++
 	}
 	height += pipelineBarHeight(m)
-	height++
+	height += 2
 	return height
 }
 
@@ -124,17 +124,19 @@ func overviewColumnSpecs(width int, sort overviewSortMode, asc bool) []overviewC
 		title  string
 		widths [4]int
 	}{
-		{"task_id", "任务ID", [4]int{24, 22, 18, 14}},
-		{"run_status", "状态", [4]int{12, 10, 8, 6}},
+		{"task_id", "任务ID", [4]int{22, 22, 18, 14}},
+		{"task_state", "质检", [4]int{10, 10, 8, 0}},
+		{"run_status", "状态", [4]int{10, 10, 8, 6}},
 		{"failed_stage", "失败", [4]int{8, 6, 5, 4}},
 		{"blocker", "阻断", [4]int{6, 5, 4, 3}},
 		{"high", "严重", [4]int{6, 5, 4, 3}},
+		{"completion_count", "完成", [4]int{8, 6, 0, 0}},
 		{"manual_verdict", "判定", [4]int{8, 6, 0, 0}},
 		{"docs", "文档", [4]int{6, 5, 4, 0}},
-		{"cleanup", "清理", [4]int{10, 8, 0, 0}},
-		{"batch", "批次", [4]int{12, 8, 0, 0}},
+		{"cleanup", "清理", [4]int{8, 8, 0, 0}},
+		{"batch", "批次", [4]int{10, 8, 0, 0}},
 		{"last_run", "最后运行", [4]int{16, 0, 0, 0}},
-		{"mode", "模式", [4]int{10, 0, 0, 0}},
+		{"mode", "模式", [4]int{0, 0, 0, 0}},
 	}
 	specs := make([]overviewColumnSpec, 0, len(defs))
 	for _, def := range defs {
@@ -163,6 +165,8 @@ func overviewSortKey(sort overviewSortMode) string {
 		return "last_run"
 	case sortByVerdict:
 		return "manual_verdict"
+	case sortByCompletionCount:
+		return "completion_count"
 	default:
 		return "task_id"
 	}

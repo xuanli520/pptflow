@@ -178,6 +178,9 @@ func TestStageFRefRunContextExcludesStageEAndIssueReports(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if err := store.UpsertProjects(context.Background(), []scanner.Project{{TaskID: "TASK-1", Batch: "batch", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.CreateRun(context.Background(), model.RunRecord{
 		RunID:        "ref-1",
 		TaskID:       "TASK-1",
@@ -271,6 +274,9 @@ func TestStageFUsesPromptAndIssueVerificationArtifactNames(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer store.Close()
+				if err := store.UpsertProjects(context.Background(), []scanner.Project{{TaskID: "TASK-1", Batch: "batch", Path: projectPath}}); err != nil {
+					t.Fatal(err)
+				}
 				refRoot := filepath.Join(root, "runs", "ref")
 				if err := os.MkdirAll(refRoot, 0o755); err != nil {
 					t.Fatal(err)

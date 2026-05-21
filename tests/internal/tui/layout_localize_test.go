@@ -36,10 +36,17 @@ func TestOverviewColumnsHideModeBeforeCoreAtMediumWidth(t *testing.T) {
 	if titles["模式"] {
 		t.Fatalf("medium columns should hide mode: %#v", titles)
 	}
-	for _, title := range []string{"任务ID", "状态", "失败", "阻断", "严重", "文档", "清理"} {
+	for _, title := range []string{"任务ID", "质检", "状态", "失败", "阻断", "严重", "完成", "文档", "清理"} {
 		if !titles[title] {
 			t.Fatalf("medium columns missing %s: %#v", title, titles)
 		}
+	}
+}
+
+func TestOverviewWideShowsCompletionCountColumn(t *testing.T) {
+	titles := titleSet(tuiapp.OverviewColumnTitlesForTest(120))
+	if !titles["完成"] {
+		t.Fatalf("wide columns should show completion count: %#v", titles)
 	}
 }
 
@@ -111,7 +118,7 @@ func TestLocalizationCoversCoreValues(t *testing.T) {
 		tuiapp.LocalizeStageNameForTest("F", ""):                        "标注员修复静态审查",
 		tuiapp.LocalizeCleanupStatusForTest("none"):                     "未生成",
 		tuiapp.LocalizeSummaryForTest("Not selected for this run."):     "本次未选择",
-		tuiapp.LocalizeSummaryForTest("3 validation finding(s)"):      "3 个验证发现",
+		tuiapp.LocalizeSummaryForTest("3 validation finding(s)"):        "3 个验证发现",
 		tuiapp.LocalizeSummaryForTest("3 acceptance finding(s)"):        "3 个验收发现",
 	}
 	for got, want := range cases {
@@ -163,6 +170,20 @@ func TestExecutionRenderDoesNotExceedViewportWidth(t *testing.T) {
 		if got := lipgloss.Height(view); got > size.height {
 			t.Fatalf("render height at %dx%d = %d, want <= %d\n%s", size.width, size.height, got, size.height, view)
 		}
+	}
+}
+
+func TestTaskBoardColumnsUseSeparatorsAndFixedTitles(t *testing.T) {
+	view := tuiapp.TaskBoardViewForTest(120, 18,
+		[]tuiapp.TaskProject{{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskInspecting}},
+		[]tuiapp.TaskProject{{ID: "TASK-20260521-BBBBBB", TaskState: model.TaskWaitingManual}},
+		[]tuiapp.TaskProject{{ID: "TASK-20260521-CCCCCC", TaskState: model.TaskCompleted, CompletionCount: 1}},
+	)
+	if !strings.Contains(view, "│") || !strings.Contains(view, "─── 开始质检 (1) ───") {
+		t.Fatalf("task board should show column separators and fixed titles:\n%s", view)
+	}
+	if got := lipgloss.Width(view); got > 120 {
+		t.Fatalf("task board width = %d, want <= 120\n%s", got, view)
 	}
 }
 

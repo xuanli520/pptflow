@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,7 @@ type Config struct {
 	DBPath            string
 	ProjectConfigPath string
 	Pipeline          PipelineConfig
+	Git               GitConfig
 	Docker            DockerConfig
 	Docs              DocsConfig
 	Codex             CodexConfig
@@ -38,6 +40,13 @@ type PipelineConfig struct {
 	StageTimeouts      map[string]int
 	SelfTestReportPath string
 	MaxConcurrent      int
+}
+
+type GitConfig struct {
+	BaseURL      string
+	CloneTimeout time.Duration
+	ShallowClone bool
+	LFSEnabled   bool
 }
 
 type DockerConfig struct {
@@ -140,6 +149,7 @@ type rawConfig struct {
 	ScanPath *string            `yaml:"scan_path"`
 	DBPath   *string            `yaml:"db_path"`
 	Pipeline *rawPipelineConfig `yaml:"pipeline"`
+	Git      *rawGitConfig      `yaml:"git"`
 	Docker   *rawDockerConfig   `yaml:"docker"`
 	Docs     *rawDocsConfig     `yaml:"docs"`
 	Codex    *rawCodexConfig    `yaml:"codex"`
@@ -151,6 +161,13 @@ type rawPipelineConfig struct {
 	StageTimeouts      map[string]int `yaml:"stage_timeouts"`
 	SelfTestReportPath *string        `yaml:"self_test_report_path"`
 	MaxConcurrent      *int           `yaml:"max_concurrent"`
+}
+
+type rawGitConfig struct {
+	BaseURL      *string `yaml:"base_url"`
+	CloneTimeout *string `yaml:"clone_timeout"`
+	ShallowClone *bool   `yaml:"shallow_clone"`
+	LFSEnabled   *bool   `yaml:"lfs_enabled"`
 }
 
 type rawDockerConfig struct {
@@ -239,6 +256,12 @@ func Default() Config {
 			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 2700, "E": 2700, "F": 2700},
 			SelfTestReportPath: "repo/self_test_report.md",
 			MaxConcurrent:      DefaultMaxConcurrent,
+		},
+		Git: GitConfig{
+			BaseURL:      "https://gitlab.mindflow.com.cn/Prompt2Repo/fullstack/",
+			CloneTimeout: 10 * time.Minute,
+			ShallowClone: true,
+			LFSEnabled:   false,
 		},
 		Docker: DockerConfig{
 			ManagedLabel:                "managed_by=p2rqa",
@@ -465,6 +488,24 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 			cfg.Pipeline.MaxConcurrent = *raw.Pipeline.MaxConcurrent
 		}
 	}
+	if raw.Git != nil {
+		if raw.Git.BaseURL != nil {
+			cfg.Git.BaseURL = *raw.Git.BaseURL
+		}
+		if raw.Git.CloneTimeout != nil {
+			duration, err := time.ParseDuration(strings.TrimSpace(*raw.Git.CloneTimeout))
+			if err != nil {
+				return fmt.Errorf("git.clone_timeout must be a Go duration: %w", err)
+			}
+			cfg.Git.CloneTimeout = duration
+		}
+		if raw.Git.ShallowClone != nil {
+			cfg.Git.ShallowClone = *raw.Git.ShallowClone
+		}
+		if raw.Git.LFSEnabled != nil {
+			cfg.Git.LFSEnabled = *raw.Git.LFSEnabled
+		}
+	}
 	if raw.Docker != nil {
 		if raw.Docker.ManagedLabel != nil {
 			cfg.Docker.ManagedLabel = *raw.Docker.ManagedLabel
@@ -666,6 +707,10 @@ func applyRawDockerGC(cfg *DockerGCConfig, raw *rawDockerGCConfig) {
 
 func normalize(cfg *Config) {
 	cfg.Pipeline.MaxConcurrent = NormalizeMaxConcurrent(cfg.Pipeline.MaxConcurrent)
+	cfg.Git.BaseURL = strings.TrimSpace(cfg.Git.BaseURL)
+	if cfg.Git.CloneTimeout <= 0 {
+		cfg.Git.CloneTimeout = 10 * time.Minute
+	}
 }
 
 func NormalizeMaxConcurrent(value int) int {
@@ -689,6 +734,15 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Pipeline.MaxConcurrent <= 0 {
 		return fmt.Errorf("pipeline.max_concurrent must be greater than 0")
+	}
+	if strings.TrimSpace(cfg.Git.BaseURL) == "" {
+		return fmt.Errorf("git.base_url must not be empty")
+	}
+	if !validGitBaseURL(cfg.Git.BaseURL) {
+		return fmt.Errorf("git.base_url must be an absolute URL")
+	}
+	if cfg.Git.CloneTimeout <= 0 {
+		return fmt.Errorf("git.clone_timeout must be greater than 0")
 	}
 	if cfg.Docker.KeepFailedContainersMinutes < 0 {
 		return fmt.Errorf("docker.keep_failed_containers_minutes must be greater than or equal to 0")
@@ -751,6 +805,19 @@ func Validate(cfg Config) error {
 		return fmt.Errorf("tui.log_max_lines must be greater than 0")
 	}
 	return nil
+}
+
+func validGitBaseURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" {
+		return false
+	}
+	switch parsed.Scheme {
+	case "http", "https", "ssh", "file":
+		return parsed.Host != "" || parsed.Scheme == "file"
+	default:
+		return false
+	}
 }
 
 func validateOneOf(name, value string, allowed ...string) error {

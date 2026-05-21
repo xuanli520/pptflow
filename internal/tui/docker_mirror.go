@@ -218,6 +218,10 @@ func (m app) handleDockerSettingsKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		}
 	}
 	switch key {
+	case "tab":
+		m.dockerMirror.moveFocus(1)
+	case "shift+tab":
+		m.dockerMirror.moveFocus(-1)
 	case "up":
 		m.dockerMirror.moveFocus(-1)
 	case "down":

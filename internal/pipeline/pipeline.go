@@ -14,15 +14,16 @@ import (
 )
 
 type RunOptions struct {
-	Stage       string
-	From        string
-	StaticOnly  bool
-	Stages      []string
-	Mode        string
-	RefRun      string
-	ExtraDocs   []string
-	KeepRuntime bool
-	Progress    ProgressReporter
+	Stage               string
+	From                string
+	StaticOnly          bool
+	Stages              []string
+	Mode                string
+	RefRun              string
+	ExtraDocs           []string
+	KeepRuntime         bool
+	DeferRuntimeCleanup bool
+	Progress            ProgressReporter
 }
 
 type RunProgress struct {

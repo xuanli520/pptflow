@@ -9,6 +9,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
@@ -67,9 +68,6 @@ func NewTestHarnessWithStore(store *db.Store, cfg config.Config) TestHarness {
 func (h TestHarness) Press(key string) (TestHarness, TestKeyResult) {
 	next, cmds := h.model.handleKey(testKeyMsg(key))
 	result := TestKeyResult{CmdCount: len(cmds)}
-	if key == "ctrl+c" || key == "ctrl+q" {
-		result.Quit = len(cmds) > 0
-	}
 	return TestHarness{model: next}, result
 }
 
@@ -144,6 +142,57 @@ func (h TestHarness) ApplySchedulerNotifyForTest() (TestHarness, int) {
 	return h, len(cmds)
 }
 
+func RefreshDockerHealthForTest(ctx context.Context, store *db.Store, cfg config.Config, exec executor.CommandRunner) (int, []string, error) {
+	poller := newSchedulerPoller(store, cfg)
+	poller.exec = exec
+	return poller.refreshDockerHealth(ctx)
+}
+
+func ConfirmCompleteForTest(ctx context.Context, store *db.Store, cfg config.Config, exec executor.CommandRunner, taskID string) error {
+	service := dbTaskActionService{store: store, cfg: cfg, exec: exec}
+	return service.ConfirmComplete(ctx, taskID)
+}
+
+func ForceExitCleanupForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
+	return forceExitCleanup(ctx, cfg, exec, tasks)
+}
+
+func CleanupCheckpointPathForTest(scanPath string) string {
+	return cleanupCheckpointPath(scanPath)
+}
+
+func TaskCardForTest(task TaskProject, width int, now time.Time) string {
+	return renderTaskCard(task, false, width, now)
+}
+
+func TaskBoardViewForTest(width, height int, inspecting, waiting, completed []TaskProject) string {
+	board := newTaskBoardModel(nil)
+	board.query = noopTaskQueryService{}
+	board.cols[taskColumnInspecting].setItems(inspecting)
+	board.cols[taskColumnWaiting].setItems(waiting)
+	board.cols[taskColumnCompleted].setItems(completed)
+	board.now = time.Now()
+	return board.View(width, height)
+}
+
+type noopTaskQueryService struct{}
+
+func (noopTaskQueryService) ListByState(context.Context, string) ([]TaskProject, error) {
+	return nil, nil
+}
+
+func (noopTaskQueryService) ListAll(context.Context, db.ProjectQuery) ([]TaskProject, int, error) {
+	return nil, 0, nil
+}
+
+func (noopTaskQueryService) GetByID(context.Context, string) (*TaskProject, error) {
+	return nil, nil
+}
+
+func (noopTaskQueryService) FindWithDockerRunning(context.Context) ([]TaskProject, error) {
+	return nil, nil
+}
+
 func (h TestHarness) ApplyTickForTest(elapsed time.Duration) (TestHarness, int) {
 	var cmds []tea.Cmd
 	h.model.handleRecoveryMsg(tickMsg(h.model.lastPersistedRefreshAt.Add(elapsed)), &cmds)
@@ -166,7 +215,16 @@ func (h TestHarness) ColdTickRefreshDetailForTest(elapsed time.Duration) (bool, 
 }
 
 func (h TestHarness) SetFocus(name string) TestHarness {
-	h.model.setFocus(testFocusArea(name))
+	area := testFocusArea(name)
+	switch area {
+	case focusSearch, focusOverviewTable:
+		h.model.tab = panelOverview
+	case focusTaskBoard, focusTaskInput:
+		h.model.tab = panelTaskBoard
+	case focusStageList, focusRefRunList, focusDetailViewport:
+		h.model.tab = panelExecution
+	}
+	h.model.setFocus(area)
 	return h
 }
 
@@ -303,6 +361,8 @@ func (h TestHarness) SortName() string {
 		return "last_run"
 	case sortByVerdict:
 		return "verdict"
+	case sortByCompletionCount:
+		return "completion_count"
 	default:
 		return "task_id"
 	}
@@ -414,6 +474,9 @@ func (h TestHarness) DetailFollowTail() bool {
 }
 
 func (h TestHarness) TabName() string {
+	if h.model.tab == panelTaskBoard {
+		return "taskboard"
+	}
 	if h.model.tab == panelExecution {
 		return "execution"
 	}

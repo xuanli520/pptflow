@@ -50,17 +50,17 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		}
 		return finishStage(record, model.StageFailed, start)
 	}
-	if !runtime.HasServiceMappings() {
-		evidence := "Stage B runtime evidence is missing port mappings. Run Stage B successfully before Stage C."
+	if !runtime.HasCleanupTarget() {
+		evidence := "Stage B runtime evidence is missing. Run Stage B successfully before Stage C."
 		recordRequiredEvidence(evidence, stageCRuntimeSummary(false, evidence, runtime, prior, nil))
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
 			Title:      "Stage B runtime evidence is missing",
-			Rule:       "Stage C requires Stage B port_map.json mappings.",
+			Rule:       "Stage C requires Stage B Docker runtime metadata.",
 			Evidence:   evidence,
-			Impact:     "Runtime test evidence cannot be collected from host service URLs.",
-			MinimumFix: "Rerun B successfully and ensure published ports are recorded.",
+			Impact:     "Runtime test evidence cannot be collected.",
+			MinimumFix: "Rerun B successfully and ensure Docker starts.",
 		})
 		if record.ErrorSummary == "" {
 			record.ErrorSummary = evidence
@@ -107,6 +107,13 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		appendStreamProgress(run.RunID, "C", line, source, false, progress)
 	}
 	result := r.exec.RunStreamingWithOutput(ctx, timeout, repoPath, env, logFile, onOutput, bash, "run_tests.sh")
+	cleanup := cleanupStageCTestArtifacts(repoPath)
+	for _, removed := range cleanup.Removed {
+		fmt.Fprintln(logFile, "Stage C cleaned test artifact: "+removed)
+	}
+	for _, warning := range cleanup.Warnings {
+		fmt.Fprintln(logFile, "Stage C cleanup warning: "+warning)
+	}
 	endLine := fmt.Sprintf("=== C host run_tests.sh end: exit=%d timeout=%t err=%v ===", result.ExitCode, result.Timeout, result.Err)
 	fmt.Fprintf(logFile, "\n%s\n", endLine)
 	appendStreamProgress(run.RunID, "C", endLine, "p2r", true, progress)
@@ -121,7 +128,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	}
 	record.ArtifactPaths = append([]string{logPath}, pages...)
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, map[string]any{"exit_code": result.ExitCode, "timeout": result.Timeout, "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping}))
+	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, map[string]any{"exit_code": result.ExitCode, "timeout": result.Timeout, "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "cleanup": cleanup}))
 	if result.Err != nil {
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
@@ -138,6 +145,65 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		return finishStage(record, model.StageFailed, start)
 	}
 	return finishStage(record, model.StageDone, start)
+}
+
+type stageCTestArtifactCleanup struct {
+	Removed  []string `json:"removed"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+var stageCTestArtifactNames = map[string]bool{
+	".coverage":         true,
+	".nyc_output":       true,
+	".pytest_cache":     true,
+	"__pycache__":       true,
+	"playwright-report": true,
+	"test-results":      true,
+}
+
+var stageCTestArtifactTraversalSkips = map[string]bool{
+	".git":         true,
+	".venv":        true,
+	"node_modules": true,
+	"venv":         true,
+}
+
+func cleanupStageCTestArtifacts(repoPath string) stageCTestArtifactCleanup {
+	var cleanup stageCTestArtifactCleanup
+	repoPath = filepath.Clean(repoPath)
+	err := filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			cleanup.Warnings = append(cleanup.Warnings, err.Error())
+			return nil
+		}
+		if path == repoPath {
+			return nil
+		}
+		name := entry.Name()
+		if entry.IsDir() && stageCTestArtifactTraversalSkips[name] {
+			return filepath.SkipDir
+		}
+		if !stageCTestArtifactNames[name] {
+			return nil
+		}
+		rel, relErr := filepath.Rel(repoPath, path)
+		if relErr != nil {
+			rel = path
+		}
+		if removeErr := os.RemoveAll(path); removeErr != nil {
+			cleanup.Warnings = append(cleanup.Warnings, rel+": "+removeErr.Error())
+			return nil
+		}
+		cleanup.Removed = append(cleanup.Removed, filepath.ToSlash(rel))
+		if entry.IsDir() {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		cleanup.Warnings = append(cleanup.Warnings, err.Error())
+	}
+	return cleanup
 }
 
 func stageCRuntimeSummary(ok bool, reason string, runtime RuntimeState, prior map[string]model.StageRecord, extra map[string]any) map[string]any {

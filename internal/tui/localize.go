@@ -29,6 +29,21 @@ func localizeRunStatus(status string) string {
 	}
 }
 
+func localizeTaskState(state string) string {
+	switch strings.TrimSpace(state) {
+	case model.TaskInspecting:
+		return "开始质检"
+	case model.TaskWaitingManual:
+		return "待处理"
+	case model.TaskCompleted:
+		return "结束质检"
+	case "":
+		return "-"
+	default:
+		return state
+	}
+}
+
 func localizeStageStatus(status string) string {
 	switch strings.TrimSpace(status) {
 	case model.StageDone:

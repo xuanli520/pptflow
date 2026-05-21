@@ -18,20 +18,58 @@ const (
 	ManualPass   = "pass"
 	ManualRework = "rework"
 	ManualFail   = "fail"
+
+	TaskInspecting    = "inspecting"
+	TaskWaitingManual = "waiting_manual"
+	TaskCompleted     = "completed"
 )
 
 type RunRecord struct {
-	RunID          string `json:"run_id"`
-	TaskID         string `json:"task_id"`
-	StartedAt      string `json:"started_at"`
-	FinishedAt     string `json:"finished_at,omitempty"`
-	Status         string `json:"status"`
-	ManualVerdict  string `json:"manual_verdict"`
-	StaticOnly     bool   `json:"static_only"`
-	DurationMS     int64  `json:"duration_ms"`
-	ArtifactRoot   string `json:"artifact_root"`
-	ToolVersions   string `json:"tool_versions,omitempty"`
-	PromptVersions string `json:"prompt_versions,omitempty"`
+	RunID           string `json:"run_id"`
+	TaskID          string `json:"task_id"`
+	StartedAt       string `json:"started_at"`
+	FinishedAt      string `json:"finished_at,omitempty"`
+	Status          string `json:"status"`
+	ManualVerdict   string `json:"manual_verdict"`
+	StaticOnly      bool   `json:"static_only"`
+	DurationMS      int64  `json:"duration_ms"`
+	ArtifactRoot    string `json:"artifact_root"`
+	ToolVersions    string `json:"tool_versions,omitempty"`
+	PromptVersions  string `json:"prompt_versions,omitempty"`
+	CompletionRound int    `json:"completion_round,omitempty"`
+}
+
+type Task struct {
+	ID               string      `json:"id"`
+	BatchID          string      `json:"batch_id"`
+	GitURL           string      `json:"git_url"`
+	RepoPath         string      `json:"repo_path"`
+	State            string      `json:"state"`
+	CurrentRunID     string      `json:"current_run_id,omitempty"`
+	CompletionCount  int         `json:"completion_count"`
+	FrontendURL      string      `json:"frontend_url,omitempty"`
+	DockerRunning    bool        `json:"docker_running"`
+	ComposeMeta      ComposeMeta `json:"compose_meta,omitempty"`
+	EnteredWaitingAt string      `json:"entered_waiting_at,omitempty"`
+	LastCompletedAt  string      `json:"last_completed_at,omitempty"`
+	SyncError        string      `json:"sync_error,omitempty"`
+	CreatedAt        string      `json:"created_at"`
+	UpdatedAt        string      `json:"updated_at"`
+}
+
+type Batch struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	TaskCount   int    `json:"task_count"`
+	MaxTasks    int    `json:"max_tasks"`
+	CreatedAt   string `json:"created_at"`
+	IsFull      bool   `json:"is_full"`
+}
+
+type ComposeMeta struct {
+	Project      string   `json:"project"`
+	ComposeFiles []string `json:"compose_files,omitempty"`
+	WorkDir      string   `json:"work_dir,omitempty"`
 }
 
 type StageRecord struct {

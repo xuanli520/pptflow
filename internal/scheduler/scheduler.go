@@ -11,6 +11,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	gitsync "github.com/xuanli520/p2r_tui/internal/git"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
@@ -25,6 +26,14 @@ const (
 	JobDone
 	JobCancelled
 	JobFailed
+)
+
+type JobKind string
+
+const (
+	JobPipeline   JobKind = "pipeline"
+	JobGitSync    JobKind = "git_sync"
+	JobInspection JobKind = "inspection"
 )
 
 func (s JobState) String() string {
@@ -48,6 +57,7 @@ type Job struct {
 	JobID         string
 	RunID         string
 	TaskID        string
+	Kind          JobKind
 	State         JobState
 	CurrentStage  string
 	Stages        []model.StageRecord
@@ -57,8 +67,11 @@ type Job struct {
 	StartedAt     time.Time
 	FinishedAt    time.Time
 	StreamByStage map[string]pipeline.StreamUpdate
+	SyncProgress  gitsync.SyncProgress
 
 	opts               pipeline.RunOptions
+	batchID            string
+	gitURL             string
 	cancel             context.CancelFunc
 	cancelRequested    bool
 	streamLinesByStage map[string][]pipeline.StreamLine
@@ -69,6 +82,7 @@ type JobSnapshot struct {
 	JobID         string
 	RunID         string
 	TaskID        string
+	Kind          JobKind
 	State         JobState
 	CurrentStage  string
 	Stages        []model.StageRecord
@@ -78,12 +92,17 @@ type JobSnapshot struct {
 	StartedAt     time.Time
 	FinishedAt    time.Time
 	StreamByStage map[string]pipeline.StreamUpdate
+	SyncProgress  gitsync.SyncProgress
 
 	CancelRequested bool
 }
 
 type PipelineRunner interface {
 	Run(context.Context, string, pipeline.RunOptions) (pipeline.Result, error)
+}
+
+type GitSyncRunner interface {
+	Sync(context.Context, string, string, string, gitsync.SyncCallback) (*gitsync.SyncResult, error)
 }
 
 type RunnerFactory func(*db.Store, config.Config) PipelineRunner
@@ -94,6 +113,7 @@ type Scheduler struct {
 	store              *db.Store
 	cfg                config.Config
 	runnerFactory      RunnerFactory
+	gitSyncer          GitSyncRunner
 	maxParallel        int
 	sem                chan struct{}
 	mu                 sync.Mutex
@@ -117,12 +137,21 @@ func WithRunnerFactory(factory RunnerFactory) Option {
 	}
 }
 
+func WithGitSyncRunner(syncer GitSyncRunner) Option {
+	return func(s *Scheduler) {
+		if syncer != nil {
+			s.gitSyncer = syncer
+		}
+	}
+}
+
 func New(store *db.Store, cfg config.Config, opts ...Option) *Scheduler {
 	maxParallel := config.NormalizeMaxConcurrent(cfg.Pipeline.MaxConcurrent)
 	s := &Scheduler{
 		store:              store,
 		cfg:                cfg,
 		runnerFactory:      defaultRunnerFactory,
+		gitSyncer:          gitsync.NewSyncer(cfg.ScanPath, cfg.Git),
 		maxParallel:        maxParallel,
 		sem:                make(chan struct{}, maxParallel),
 		jobByID:            map[string]*Job{},
@@ -166,13 +195,74 @@ func (s *Scheduler) Submit(taskID string, opts pipeline.RunOptions) (string, err
 	job := &Job{
 		JobID:       jobID,
 		TaskID:      taskID,
+		Kind:        JobPipeline,
 		State:       JobQueued,
 		SubmittedAt: time.Now().UTC(),
 		opts:        opts,
 	}
+	startNow = s.enqueueJobLocked(job)
+	s.mu.Unlock()
+
+	if startNow {
+		s.startJob(job)
+	}
+	s.notify()
+	return jobID, nil
+}
+
+func (s *Scheduler) SubmitInspection(taskID, batchID, gitURL string, opts pipeline.RunOptions) (string, error) {
+	if s == nil {
+		return "", errors.New("scheduler is nil")
+	}
+	taskID = strings.TrimSpace(taskID)
+	batchID = strings.TrimSpace(batchID)
+	gitURL = strings.TrimSpace(gitURL)
+	if taskID == "" {
+		return "", errors.New("task id is required")
+	}
+	if batchID == "" {
+		return "", errors.New("batch id is required")
+	}
+	if gitURL == "" {
+		return "", errors.New("git url is required")
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return "", errors.New("scheduler is shut down")
+	}
+	if existing := s.activeByTask[taskID]; existing != nil {
+		s.mu.Unlock()
+		return "", fmt.Errorf("task %s already has an active job %s", taskID, existing.JobID)
+	}
+	s.nextID++
+	jobID := fmt.Sprintf("job-%s-%06d", time.Now().UTC().Format("20060102-150405"), s.nextID)
+	job := &Job{
+		JobID:       jobID,
+		TaskID:      taskID,
+		Kind:        JobGitSync,
+		State:       JobQueued,
+		SubmittedAt: time.Now().UTC(),
+		opts:        opts,
+		batchID:     batchID,
+		gitURL:      gitURL,
+	}
+	startNow := s.enqueueJobLocked(job)
+	s.mu.Unlock()
+
+	if startNow {
+		s.startJob(job)
+	}
+	s.notify()
+	return jobID, nil
+}
+
+func (s *Scheduler) enqueueJobLocked(job *Job) bool {
 	s.jobs = append(s.jobs, job)
-	s.jobByID[jobID] = job
-	s.activeByTask[taskID] = job
+	s.jobByID[job.JobID] = job
+	s.activeByTask[job.TaskID] = job
+	startNow := false
 	if len(s.queue) == 0 {
 		select {
 		case s.sem <- struct{}{}:
@@ -183,13 +273,7 @@ func (s *Scheduler) Submit(taskID string, opts pipeline.RunOptions) (string, err
 	if !startNow {
 		s.queue = append(s.queue, job)
 	}
-	s.mu.Unlock()
-
-	if startNow {
-		s.startJob(job)
-	}
-	s.notify()
-	return jobID, nil
+	return startNow
 }
 
 func (s *Scheduler) CancelTask(taskID string) error {
@@ -311,6 +395,7 @@ func snapshotJobs(jobs []*Job) []JobSnapshot {
 			JobID:           job.JobID,
 			RunID:           job.RunID,
 			TaskID:          job.TaskID,
+			Kind:            job.Kind,
 			State:           job.State,
 			CurrentStage:    job.CurrentStage,
 			Stages:          append([]model.StageRecord(nil), job.Stages...),
@@ -319,6 +404,7 @@ func snapshotJobs(jobs []*Job) []JobSnapshot {
 			StartedAt:       job.StartedAt,
 			FinishedAt:      job.FinishedAt,
 			StreamByStage:   cloneStreamByStage(job.StreamByStage),
+			SyncProgress:    job.SyncProgress,
 			CancelRequested: job.cancelRequested,
 		}
 		if job.Err != nil {
@@ -442,6 +528,46 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 		}
 	}()
 
+	if job.Kind == JobGitSync || job.Kind == JobInspection {
+		if err := s.runGitSync(ctx, job); err != nil {
+			job.mu.Lock()
+			if job.cancelRequested || errors.Is(err, context.Canceled) {
+				finishCancelledJobLocked(job, time.Now().UTC())
+			} else {
+				job.State = JobFailed
+				job.Err = err
+				job.CurrentStage = ""
+				job.FinishedAt = time.Now().UTC()
+			}
+			job.mu.Unlock()
+			s.notify()
+			return
+		}
+		if job.Kind == JobGitSync {
+			job.mu.Lock()
+			if job.cancelRequested {
+				finishCancelledJobLocked(job, time.Now().UTC())
+				job.mu.Unlock()
+				s.notify()
+				return
+			}
+			job.State = JobDone
+			job.Err = nil
+			job.CurrentStage = ""
+			job.FinishedAt = time.Now().UTC()
+			job.mu.Unlock()
+			if err := s.enqueuePipelineAfterGit(job); err != nil {
+				job.mu.Lock()
+				job.State = JobFailed
+				job.Err = err
+				job.FinishedAt = time.Now().UTC()
+				job.mu.Unlock()
+			}
+			s.notify()
+			return
+		}
+	}
+
 	opts := job.opts
 	opts.Progress = func(update pipeline.RunProgress) {
 		s.applyProgress(job, update)
@@ -469,6 +595,67 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 	}
 	job.mu.Unlock()
 	s.notify()
+}
+
+func (s *Scheduler) enqueuePipelineAfterGit(gitJob *Job) error {
+	if s == nil || gitJob == nil {
+		return errors.New("scheduler is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("scheduler is shut down")
+	}
+	s.nextID++
+	now := time.Now().UTC()
+	jobID := fmt.Sprintf("job-%s-%06d", now.Format("20060102-150405"), s.nextID)
+	job := &Job{
+		JobID:       jobID,
+		TaskID:      gitJob.TaskID,
+		Kind:        JobPipeline,
+		State:       JobQueued,
+		SubmittedAt: now,
+		opts:        gitJob.opts,
+	}
+	s.jobs = append(s.jobs, job)
+	s.jobByID[job.JobID] = job
+	s.activeByTask[job.TaskID] = job
+	s.queue = append(s.queue, job)
+	return nil
+}
+
+func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
+	if s.gitSyncer == nil {
+		return errors.New("git syncer unavailable")
+	}
+	if s.store != nil {
+		_ = s.store.RecordTaskGitError(ctx, job.TaskID, nil)
+	}
+	job.mu.Lock()
+	job.CurrentStage = "Git"
+	job.SyncProgress = gitsync.SyncProgress{Phase: "queued", Percent: 0, Message: "waiting for git sync"}
+	job.mu.Unlock()
+	s.notify()
+	_, err := s.gitSyncer.Sync(ctx, job.TaskID, job.batchID, job.gitURL, func(progress gitsync.SyncProgress) {
+		job.mu.Lock()
+		job.SyncProgress = progress
+		job.CurrentStage = "Git"
+		job.mu.Unlock()
+		s.notify()
+	})
+	if s.store != nil {
+		_ = s.store.RecordTaskGitError(ctx, job.TaskID, err)
+	}
+	job.mu.Lock()
+	if err == nil {
+		job.SyncProgress = gitsync.SyncProgress{Phase: "done", Percent: 100, Message: "git sync completed"}
+		job.CurrentStage = ""
+	} else {
+		job.SyncProgress = gitsync.SyncProgress{Phase: "failed", Percent: job.SyncProgress.Percent, Message: err.Error()}
+	}
+	job.mu.Unlock()
+	s.notify()
+	return err
 }
 
 func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {

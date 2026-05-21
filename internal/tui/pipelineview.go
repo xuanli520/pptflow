@@ -38,6 +38,11 @@ func renderPipelineBar(m app) string {
 		label := localizeJobState(job.State)
 		if job.CancelRequested {
 			label = "终止中"
+		} else if job.Kind == scheduler.JobGitSync {
+			label = "Git 同步"
+			if job.SyncProgress.Phase != "" {
+				label = "Git " + job.SyncProgress.Phase
+			}
 		} else if job.CurrentStage != "" {
 			label = "阶段" + job.CurrentStage + " " + localizeStageName(job.CurrentStage, "")
 		}

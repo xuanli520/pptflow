@@ -13,6 +13,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	gitsync "github.com/xuanli520/p2r_tui/internal/git"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
@@ -205,6 +206,154 @@ func TestSchedulerUsesRunnerFactory(t *testing.T) {
 		}
 	default:
 		t.Fatal("factory runner was not called")
+	}
+}
+
+func TestSubmitInspectionRecordsGitFailureWithoutRunningPipeline(t *testing.T) {
+	store, cfg, task := newInspectionStore(t)
+	pipelineCalled := make(chan struct{}, 1)
+	s := scheduler.New(store, cfg,
+		scheduler.WithGitSyncRunner(fakeGitSyncRunner{err: errors.New("auth failed")}),
+		scheduler.WithRunnerFactory(func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+			return fakePipelineRunner{run: func(context.Context, string, pipeline.RunOptions) (pipeline.Result, error) {
+				pipelineCalled <- struct{}{}
+				return pipeline.Result{}, nil
+			}}
+		}),
+	)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		_ = store.Close()
+	})
+
+	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == task.ID && snapshot.State == scheduler.JobFailed
+	})
+	if failed.Kind != scheduler.JobGitSync || failed.SyncProgress.Phase != "failed" || !strings.Contains(failed.Err, "auth failed") {
+		t.Fatalf("failed git sync snapshot = %#v", failed)
+	}
+	stored, err := store.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stored.SyncError, "auth failed") {
+		t.Fatalf("sync error not recorded: %#v", stored)
+	}
+	select {
+	case <-pipelineCalled:
+		t.Fatal("pipeline should not run after git sync failure")
+	default:
+	}
+	for _, snapshot := range s.Snapshot() {
+		if snapshot.Kind == scheduler.JobPipeline {
+			t.Fatalf("pipeline job should not be created after git failure: %#v", s.Snapshot())
+		}
+	}
+}
+
+func TestSubmitInspectionRunsPipelineAfterGitSuccess(t *testing.T) {
+	store, cfg, task := newInspectionStore(t)
+	pipelineCalled := make(chan string, 1)
+	s := scheduler.New(store, cfg,
+		scheduler.WithGitSyncRunner(fakeGitSyncRunner{}),
+		scheduler.WithRunnerFactory(func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+			return fakePipelineRunner{run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				pipelineCalled <- taskID
+				opts.Progress(pipeline.RunProgress{
+					RunID:       "run-inspection",
+					Stage:       "A",
+					Event:       pipeline.EventStageRunning,
+					StageRecord: model.StageRecord{Stage: "A", Status: model.StageRunning},
+				})
+				return pipeline.Result{
+					Run:    model.RunRecord{RunID: "run-inspection", TaskID: taskID, Status: model.RunCompletedClean},
+					Stages: []model.StageRecord{{Stage: "A", Status: model.StageDone}},
+				}, nil
+			}}
+		}),
+	)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		_ = store.Close()
+	})
+
+	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	gitDone := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == task.ID && snapshot.Kind == scheduler.JobGitSync && snapshot.State == scheduler.JobDone
+	})
+	if gitDone.SyncProgress.Phase != "done" || gitDone.RunID != "" {
+		t.Fatalf("done git sync snapshot = %#v", gitDone)
+	}
+	pipelineDone := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == task.ID && snapshot.Kind == scheduler.JobPipeline && snapshot.State == scheduler.JobDone
+	})
+	if pipelineDone.RunID != "run-inspection" || stageStatus(pipelineDone.Stages, "A") != model.StageDone {
+		t.Fatalf("done pipeline snapshot = %#v", pipelineDone)
+	}
+	select {
+	case got := <-pipelineCalled:
+		if got != task.ID {
+			t.Fatalf("pipeline task = %s, want %s", got, task.ID)
+		}
+	default:
+		t.Fatal("pipeline was not called")
+	}
+	stored, err := store.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.SyncError != "" {
+		t.Fatalf("sync error should be cleared: %#v", stored)
+	}
+}
+
+func TestSubmitInspectionKeepsTaskActiveBetweenGitAndPipeline(t *testing.T) {
+	store, cfg, task := newInspectionStore(t)
+	pipelineStarted := make(chan struct{})
+	release := make(chan struct{})
+	s := scheduler.New(store, cfg,
+		scheduler.WithGitSyncRunner(fakeGitSyncRunner{}),
+		scheduler.WithRunnerFactory(func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+			return fakePipelineRunner{run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				close(pipelineStarted)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return pipeline.Result{}, ctx.Err()
+				}
+				return pipeline.Result{
+					Run:    model.RunRecord{RunID: "run-after-git", TaskID: taskID, Status: model.RunCompletedClean},
+					Stages: []model.StageRecord{{Stage: "A", Status: model.StageDone}},
+				}, nil
+			}}
+		}),
+	)
+	t.Cleanup(func() {
+		close(release)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		_ = store.Close()
+	})
+
+	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == task.ID && snapshot.Kind == scheduler.JobGitSync && snapshot.State == scheduler.JobDone
+	})
+	<-pipelineStarted
+	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err == nil || !strings.Contains(err.Error(), "already has an active job") {
+		t.Fatalf("task should remain active while pipeline runs after git sync, got %v", err)
 	}
 }
 
@@ -428,6 +577,38 @@ type fakePipelineRunner struct {
 
 func (f fakePipelineRunner) Run(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
 	return f.run(ctx, taskID, opts)
+}
+
+type fakeGitSyncRunner struct {
+	err error
+}
+
+func (f fakeGitSyncRunner) Sync(ctx context.Context, taskID, batchID, gitURL string, onProgress gitsync.SyncCallback) (*gitsync.SyncResult, error) {
+	if onProgress != nil {
+		onProgress(gitsync.SyncProgress{Phase: "clone", Percent: 50, Message: "syncing"})
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &gitsync.SyncResult{Operation: "clone", Commit: "abc123", RepoPath: filepath.Join("projects-qa", batchID, taskID)}, nil
+}
+
+func newInspectionStore(t *testing.T) (*db.Store, config.Config, model.Task) {
+	t.Helper()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	cfg.Pipeline.MaxConcurrent = 1
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTaskWithBatch(context.Background(), "TASK-20260521-ABCDEF", "https://gitlab.example/TASK-20260521-ABCDEF", cfg.ScanPath)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	return store, cfg, task
 }
 
 func newTestScheduler(t *testing.T, firstScriptDelay time.Duration, taskIDs ...string) *scheduler.Scheduler {

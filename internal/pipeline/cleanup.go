@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xuanli520/p2r_tui/internal/config"
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
@@ -25,6 +27,77 @@ type cleanupOutcome struct {
 	Finding            *model.Finding
 	PersistErrors      []error
 	RuntimeCleanupDone bool
+}
+
+type ExitCleanupSummary struct {
+	Runtime []dockermgr.CleanupSummary `json:"runtime,omitempty"`
+	GC      dockermgr.GCSummary        `json:"gc"`
+}
+
+func StopDockerRuntime(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig, meta model.ComposeMeta) dockermgr.CleanupSummary {
+	if exec == nil {
+		exec = executor.New()
+	}
+	return dockermgr.CleanupComposeProjectFiles(ctx, exec, cfg, meta.ComposeFiles, meta.Project, meta.WorkDir)
+}
+
+func ForceExitCleanup(ctx context.Context, exec executor.CommandRunner, cfg config.Config, metas []model.ComposeMeta) (ExitCleanupSummary, error) {
+	if exec == nil {
+		exec = executor.New()
+	}
+	var summary ExitCleanupSummary
+	var errs []error
+	for _, meta := range metas {
+		cleanup := StopDockerRuntime(ctx, exec, cfg.Docker, meta)
+		summary.Runtime = append(summary.Runtime, cleanup)
+		if cleanup.Status == "failed" {
+			errs = append(errs, fmt.Errorf("cleanup %s: %s", meta.Project, cleanupErrorText(cleanup)))
+		}
+	}
+	gc, err := runExitLabelCleanup(ctx, exec, cfg, "force_exit")
+	summary.GC = gc
+	if err != nil {
+		errs = append(errs, err)
+	}
+	return summary, errors.Join(errs...)
+}
+
+func LightExitCleanup(ctx context.Context, exec executor.CommandRunner, cfg config.Config) (ExitCleanupSummary, error) {
+	if exec == nil {
+		exec = executor.New()
+	}
+	gc, err := runExitLabelCleanup(ctx, exec, cfg, "light_exit")
+	return ExitCleanupSummary{GC: gc}, err
+}
+
+func runExitLabelCleanup(ctx context.Context, exec executor.CommandRunner, cfg config.Config, trigger string) (dockermgr.GCSummary, error) {
+	dockerCfg := cfg.Docker
+	dockerCfg.GC.Enabled = true
+	dockerCfg.GC.P2ROnly = true
+	dockerCfg.GC.PruneExitedContainers = true
+	dockerCfg.GC.PruneNetworks = true
+	dockerCfg.GC.PruneVolumes = false
+	dockerCfg.GC.PruneImages = false
+	dockerCfg.GC.PruneBuilderCache = false
+	return dockermgr.RunGC(ctx, dockermgr.GCRunRequest{
+		ScanPath: cfg.ScanPath,
+		Config:   dockerCfg,
+		Exec:     exec,
+		Yes:      true,
+		Trigger:  trigger,
+	})
+}
+
+func cleanupErrorText(summary dockermgr.CleanupSummary) string {
+	for _, value := range []string{summary.Error, summary.Stderr, summary.Stdout} {
+		if text := strings.TrimSpace(value); text != "" {
+			return text
+		}
+	}
+	if len(summary.Warnings) > 0 {
+		return strings.Join(summary.Warnings, "; ")
+	}
+	return summary.Status
 }
 
 func (r Runner) acquireTaskRunLock(taskID string) (taskRunLock, error) {
@@ -173,18 +246,7 @@ func writeCleanupSummary(artifactRoot string, summary dockermgr.CleanupSummary) 
 }
 
 func runtimeCleanupPoint(stage string, stages []model.StageRecord) bool {
-	if stage == string(model.StageC) {
-		return true
-	}
-	if stage != string(model.StageB) {
-		return false
-	}
-	for _, item := range stages {
-		if item.Stage == string(model.StageC) && item.Status != model.StageSkipped {
-			return false
-		}
-	}
-	return true
+	return false
 }
 
 func runtimeStageWasSelected(stages []model.StageRecord) bool {

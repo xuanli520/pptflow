@@ -193,6 +193,46 @@ func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T)
 	}
 }
 
+func TestStartRuntimeAddsManagedLabelOverride(t *testing.T) {
+	repo := writeComposeProject(t, t.TempDir())
+	artifactRoot := t.TempDir()
+	runner := &scriptedDockerRunner{configOutput: "services:\n  api:\n    image: nginx\n  web:\n    image: nginx\n"}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: artifactRoot,
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Labels: map[string]string{
+			"managed_by":  "p2rqa",
+			"p2r.task_id": "TASK-1",
+		},
+		Timeouts: dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	overridePath := filepath.Join(artifactRoot, "runtime_labels.compose.yml")
+	content, err := os.ReadFile(overridePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"api:", "web:", "managed_by: p2rqa", "p2r.task_id: TASK-1"} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("label override missing %q:\n%s", want, content)
+		}
+	}
+	if !stringSliceContains(result.Runtime.ComposeFiles, overridePath) {
+		t.Fatalf("runtime compose files should include label override: %#v", result.Runtime.ComposeFiles)
+	}
+	if !containsCommand(runner.commands, overridePath+" -p") {
+		t.Fatalf("docker compose commands should include label override file: %#v", runner.commands)
+	}
+}
+
 func TestDaemonMirrorsApplyRestoreAndInvalidJSON(t *testing.T) {
 	root := t.TempDir()
 	daemonPath := filepath.Join(root, "daemon.json")
@@ -362,8 +402,9 @@ func TestRunGCGlobalScopeRequiresAllowGlobal(t *testing.T) {
 }
 
 type scriptedDockerRunner struct {
-	pullErr  bool
-	commands []string
+	pullErr      bool
+	configOutput string
+	commands     []string
 }
 
 func (r *scriptedDockerRunner) LookPath(name string) (string, error) {
@@ -393,6 +434,9 @@ func (r *scriptedDockerRunner) result(name string, args ...string) executor.Resu
 	r.commands = append(r.commands, command)
 	if strings.Contains(command, " pull ") && r.pullErr {
 		return executor.Result{Command: command, ExitCode: 1, Stderr: "pull failed", Err: errors.New("pull failed")}
+	}
+	if strings.Contains(command, " config") && strings.TrimSpace(r.configOutput) != "" {
+		return executor.Result{Command: command, Stdout: r.configOutput}
 	}
 	return executor.Result{Command: command, Stdout: command + " ok\n"}
 }
@@ -448,6 +492,15 @@ func writeComposeProject(t *testing.T, root string) string {
 func containsCommand(commands []string, needle string) bool {
 	for _, command := range commands {
 		if strings.Contains(command, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceContains(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
 			return true
 		}
 	}

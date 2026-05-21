@@ -113,27 +113,24 @@ func parseDockerPort(service, raw string) []portMapping {
 
 func TestSelectedStagesStaticOnly(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{StaticOnly: true}, true)
-	for _, stage := range []string{"A", "D", "F"} {
+	for _, stage := range []string{"A", "D", "E", "F"} {
 		if !selected[stage] {
 			t.Fatalf("expected %s selected", stage)
 		}
 	}
-	for _, stage := range []string{"B", "C", "E"} {
+	for _, stage := range []string{"B", "C"} {
 		if selected[stage] {
 			t.Fatalf("expected %s skipped", stage)
 		}
 	}
 }
 
-func TestSelectedStagesDefaultSkipsStageE(t *testing.T) {
+func TestSelectedStagesDefaultIncludesStageE(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{}, false)
-	for _, stage := range []string{"A", "B", "C", "D", "F"} {
+	for _, stage := range []string{"A", "D", "E", "F", "B", "C"} {
 		if !selected[stage] {
 			t.Fatalf("expected %s selected", stage)
 		}
-	}
-	if selected["E"] {
-		t.Fatal("Stage E should not be selected by default")
 	}
 }
 
@@ -267,12 +264,12 @@ func TestValidateStageFSplitLineKindEmitsLowFinding(t *testing.T) {
 
 func TestSelectedStagesFrom(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{From: "C"}, false)
-	for _, stage := range []string{"A", "B"} {
+	for _, stage := range []string{"A", "D", "E", "F", "B"} {
 		if selected[stage] {
 			t.Fatalf("expected %s not selected", stage)
 		}
 	}
-	for _, stage := range []string{"C", "D", "E", "F"} {
+	for _, stage := range []string{"C"} {
 		if !selected[stage] {
 			t.Fatalf("expected %s selected", stage)
 		}

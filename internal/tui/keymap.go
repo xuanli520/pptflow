@@ -1,12 +1,20 @@
 package tui
 
-import tea "github.com/charmbracelet/bubbletea"
+import (
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+)
 
 type focusArea int
 
 const (
 	focusSearch focusArea = iota
 	focusOverviewTable
+	focusTaskBoard
+	focusTaskInput
 	focusStageList
 	focusRefRunList
 	focusDetailViewport
@@ -18,6 +26,10 @@ func (f focusArea) String() string {
 		return "search"
 	case focusOverviewTable:
 		return "overview-table"
+	case focusTaskBoard:
+		return "task-board"
+	case focusTaskInput:
+		return "task-input"
 	case focusStageList:
 		return "stage-list"
 	case focusRefRunList:
@@ -32,12 +44,59 @@ func (f focusArea) String() string {
 func (m *app) setFocus(area focusArea) {
 	m.focus = area
 	m.overview.SetFocus(area)
+	if m.taskInput != nil {
+		if area == focusTaskInput {
+			m.taskInput.Focus()
+		} else {
+			m.taskInput.Blur()
+		}
+	}
 }
 
 func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	var cmds []tea.Cmd
 	key := msg.String()
 
+	if m.settingsOpen {
+		switch key {
+		case "ctrl+c", "ctrl+q":
+			m.message = "设置已打开，按 Esc 或 Q 关闭设置"
+			return m, cmds
+		case "esc", "ctrl+?", "q":
+			m.closeSettingsOverlay()
+			return m, cmds
+		default:
+			next, settingsCmds := m.handleDockerSettingsKey(msg)
+			next.settingsOpen = true
+			return next, append(cmds, settingsCmds...)
+		}
+	}
+	switch key {
+	case "ctrl+?":
+		m.settingsOpen = true
+		m.settingsFocusBeforeOpen = m.focus
+		m.settingsFocusCaptured = true
+		m.focusManager.Push(focusTargetOverlay)
+		return m, cmds
+	case "/":
+		if m.focus != focusTaskInput {
+			m.focusManager.Push(focusTargetInputBox)
+			m.setFocus(focusTaskInput)
+			return m, cmds
+		}
+	}
+	if m.focus == focusTaskInput && !globalKeyWhileInput(key) {
+		if m.taskInput != nil {
+			if cmd := m.taskInput.Update(msg); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			if !m.taskInput.Focused() {
+				m.focusManager.Pop()
+				m.setFocus(m.defaultPageFocus())
+			}
+		}
+		return m, cmds
+	}
 	if m.runConfig.active {
 		if key == "ctrl+x" {
 			m.message = "请先关闭运行配置再终止作业"
@@ -63,17 +122,74 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			return m, cmds
 		}
 	}
+	if m.confirmQuit {
+		switch key {
+		case "y", "Y", "enter":
+			force := m.confirmQuitDocker
+			tasks := append([]TaskProject(nil), m.confirmQuitTasks...)
+			m.confirmQuit = false
+			m.confirmQuitDocker = false
+			m.confirmQuitTasks = nil
+			m.message = "正在清理并退出..."
+			return m, append(cmds, m.quitCleanupCmd(force, tasks))
+		case "n", "N", "esc":
+			m.confirmQuit = false
+			m.confirmQuitDocker = false
+			m.confirmQuitTasks = nil
+			m.message = "已取消退出"
+			return m, cmds
+		default:
+			return m, cmds
+		}
+	}
 	if m.tab == panelSettings {
 		return m.handleSettingsKey(msg)
 	}
 
 	switch key {
 	case "ctrl+c", "ctrl+q":
-		return m, []tea.Cmd{tea.Batch(m.shutdownScheduler(), tea.Quit)}
+		m.message = "正在检查 Docker 运行状态..."
+		return m, append(cmds, m.prepareQuitCmd())
+	case "q":
+		if m.focus == focusTaskInput || m.focus == focusSearch {
+			break
+		}
+		m.message = "正在检查 Docker 运行状态..."
+		return m, append(cmds, m.prepareQuitCmd())
+	case "ctrl+o":
+		m.tab = panelOverview
+		m.setFocus(focusOverviewTable)
+		return m, append(cmds, m.reloadOverview())
+	case "ctrl+e":
+		if m.tab == panelTaskBoard {
+			if task, ok := m.taskBoard.SelectedTask(); ok && task.TaskState == "waiting_manual" {
+				m.message = "正在确认完成 " + task.ID
+				return m, append(cmds, m.taskActionCmd("complete", task.ID))
+			}
+			m.message = "请选择待处理题目"
+			return m, cmds
+		}
+	case "ctrl+g":
+		if m.tab == panelTaskBoard {
+			if task, ok := m.taskBoard.SelectedTask(); ok && canRetryGitSyncTask(task) {
+				m.message = "正在重试 Git 同步 " + task.ID
+				return m, append(cmds, m.taskActionCmd("retry-git", task.ID))
+			}
+			m.message = "请选择 Git 同步失败的题目"
+			return m, cmds
+		}
 	case "ctrl+x":
 		m.openCancelConfirm()
 		return m, cmds
 	case "ctrl+r":
+		if m.tab == panelTaskBoard {
+			if task, ok := m.taskBoard.SelectedTask(); ok && task.TaskState == "completed" {
+				m.message = "正在提交重新质检 " + task.ID
+				return m, append(cmds, m.taskActionCmd("reinspect", task.ID))
+			}
+			m.message = "请选择结束质检题目"
+			return m, cmds
+		}
 		m.openRunConfig()
 		return m, cmds
 	case "tab":
@@ -90,6 +206,18 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	}
 
 	switch m.focus {
+	case focusTaskBoard:
+		switch key {
+		case "enter":
+			if task, ok := m.taskBoard.SelectedTask(); ok {
+				m.tab = panelExecution
+				m.overview.selectedID = task.ID
+				m.setFocus(focusStageList)
+				cmds = append(cmds, m.reloadDetail())
+			}
+		case "left", "right", "up", "down":
+			m.taskBoard.HandleKey(msg)
+		}
 	case focusSearch:
 		switch key {
 		case "enter":
@@ -206,20 +334,68 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 	return m, cmds
 }
 
+func canRetryGitSyncTask(task TaskProject) bool {
+	if strings.TrimSpace(task.SyncError) == "" {
+		return false
+	}
+	return task.TaskState == model.TaskInspecting || task.TaskState == model.TaskCompleted
+}
+
 func (m *app) switchPanel(delta int) {
-	m.tab = (m.tab + delta + 3) % 3
-	if m.tab == panelOverview {
-		if m.selectedTaskID() == "" {
-			m.setFocus(focusSearch)
-			return
-		}
+	if m.tab == panelTaskBoard {
+		m.tab = panelOverview
 		m.setFocus(focusOverviewTable)
 		return
 	}
-	if m.tab == panelSettings {
+	if m.tab == panelOverview {
+		m.tab = panelTaskBoard
+		m.setFocus(focusTaskBoard)
 		return
 	}
-	m.enterExecution()
+	if delta < 0 {
+		m.tab = panelOverview
+		m.setFocus(focusOverviewTable)
+		return
+	}
+	m.tab = panelTaskBoard
+	m.setFocus(focusTaskBoard)
+}
+
+func globalKeyWhileInput(key string) bool {
+	switch key {
+	case "ctrl+c", "ctrl+q", "ctrl+?", "ctrl+o", "ctrl+e", "ctrl+g", "ctrl+x", "ctrl+r":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *app) closeSettingsOverlay() {
+	m.dockerMirror.saveInputToFocus()
+	m.settingsOpen = false
+	m.focusManager.Pop()
+	if m.settingsFocusCaptured {
+		m.settingsFocusCaptured = false
+		m.setFocus(m.settingsFocusBeforeOpen)
+		return
+	}
+	m.setFocus(m.defaultPageFocus())
+}
+
+func (m app) defaultPageFocus() focusArea {
+	switch m.tab {
+	case panelTaskBoard:
+		return focusTaskBoard
+	case panelExecution:
+		return focusStageList
+	case panelOverview:
+		if m.selectedTaskID() == "" {
+			return focusSearch
+		}
+		return focusOverviewTable
+	default:
+		return focusTaskBoard
+	}
 }
 
 func (m *app) enterExecution() {
