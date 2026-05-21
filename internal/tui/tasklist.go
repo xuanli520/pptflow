@@ -46,6 +46,11 @@ func (m *taskListModel) move(delta int) {
 	m.clamp()
 }
 
+func (m *taskListModel) setVisibleSize(size int) {
+	m.lastSize = max(1, size)
+	m.clamp()
+}
+
 func (m *taskListModel) selected() (TaskProject, bool) {
 	if len(m.items) == 0 {
 		return TaskProject{}, false
@@ -78,5 +83,5 @@ func (m *taskListModel) clamp() {
 	if m.cursor >= m.scroll+m.lastSize {
 		m.scroll = m.cursor - m.lastSize + 1
 	}
-	m.scroll = clamp(m.scroll, 0, max(0, len(m.items)-1))
+	m.scroll = clamp(m.scroll, 0, max(0, len(m.items)-m.lastSize))
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -646,6 +648,9 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 		job.mu.Unlock()
 		s.notify()
 	})
+	if err != nil {
+		err = s.writeGitSyncErrorLog(job, err)
+	}
 	if s.store != nil {
 		_ = s.store.RecordTaskGitError(ctx, job.TaskID, err)
 	}
@@ -659,6 +664,41 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 	job.mu.Unlock()
 	s.notify()
 	return err
+}
+
+func (s *Scheduler) writeGitSyncErrorLog(job *Job, err error) error {
+	if s == nil || job == nil || err == nil {
+		return err
+	}
+	logPath := filepath.Join(s.cfg.ScanPath, ".qa-control", "git-sync", job.TaskID+".log")
+	if writeErr := os.MkdirAll(filepath.Dir(logPath), 0o755); writeErr != nil {
+		return fmt.Errorf("%w; failed to write git sync log %s: %v", err, logPath, writeErr)
+	}
+	var commandErr *gitsync.CommandError
+	var builder strings.Builder
+	builder.WriteString("task_id: " + job.TaskID + "\n")
+	builder.WriteString("batch_id: " + job.batchID + "\n")
+	builder.WriteString("git_url: " + job.gitURL + "\n")
+	builder.WriteString("time: " + time.Now().UTC().Format(time.RFC3339) + "\n")
+	builder.WriteString("error: " + err.Error() + "\n")
+	if errors.As(err, &commandErr) {
+		builder.WriteString("dir: " + commandErr.Dir + "\n")
+		builder.WriteString("command: git " + strings.Join(commandErr.Args, " ") + "\n")
+		builder.WriteString("\n[stdout]\n")
+		builder.WriteString(commandErr.Stdout)
+		if !strings.HasSuffix(commandErr.Stdout, "\n") {
+			builder.WriteString("\n")
+		}
+		builder.WriteString("\n[stderr]\n")
+		builder.WriteString(commandErr.Stderr)
+		if !strings.HasSuffix(commandErr.Stderr, "\n") {
+			builder.WriteString("\n")
+		}
+	}
+	if writeErr := os.WriteFile(logPath, []byte(builder.String()), 0o644); writeErr != nil {
+		return fmt.Errorf("%w; failed to write git sync log %s: %v", err, logPath, writeErr)
+	}
+	return fmt.Errorf("%w; 日志: %s", err, logPath)
 }
 
 func (s *Scheduler) applyProgress(job *Job, update pipeline.RunProgress) {

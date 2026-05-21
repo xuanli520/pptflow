@@ -237,6 +237,24 @@ func (m TaskBoardModel) viewSingle(width, height int) string {
 	return strings.Join(tabs, " ") + "\n" + renderTaskColumn(col, true, width, max(4, height-3), m.now)
 }
 
+func (m *TaskBoardModel) prepareLayout(width, height int) {
+	if m == nil {
+		return
+	}
+	if width <= 110 {
+		m.cols[m.focused].setVisibleSize(taskColumnBodyHeight(width, max(4, height-3)) / taskCardLineCount)
+		return
+	}
+	for index := range m.cols {
+		m.cols[index].setVisibleSize(taskColumnBodyHeight(width, height) / taskCardLineCount)
+	}
+}
+
+func taskColumnBodyHeight(width, height int) int {
+	contentHeight := max(1, height-panelStyle.GetVerticalFrameSize())
+	return max(0, contentHeight-1)
+}
+
 func renderTaskColumn(col taskListModel, focused bool, width, height int, now time.Time) string {
 	title := truncateDisplay("─── "+col.title+" ("+itoa(len(col.items))+") ───", max(8, width-2))
 	if focused {
@@ -244,10 +262,7 @@ func renderTaskColumn(col taskListModel, focused bool, width, height int, now ti
 	} else {
 		title = mutedStyle.Render(title)
 	}
-	contentHeight := max(1, height-panelStyle.GetVerticalFrameSize())
-	bodyHeight := max(0, contentHeight-1)
-	col.lastSize = max(1, bodyHeight/3)
-	col.clamp()
+	bodyHeight := taskColumnBodyHeight(width, height)
 	lines := []string{title}
 	if bodyHeight == 0 {
 		return renderPanel(width, height, strings.Join(lines, "\n"))
@@ -264,6 +279,7 @@ func visibleTaskCardLines(col *taskListModel, focused bool, width, budget int, n
 	if col == nil || len(col.items) == 0 || budget <= 0 {
 		return nil
 	}
+	col.setVisibleSize(budget / taskCardLineCount)
 	start := clamp(col.scroll, 0, len(col.items)-1)
 	if col.cursor < start {
 		start = col.cursor

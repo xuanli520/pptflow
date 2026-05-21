@@ -62,6 +62,10 @@ func renderHeader(m app) string {
 
 func renderTaskBoard(m app) string {
 	layout := layoutFor(m.width, max(8, m.height-verticalChromeHeight(m)), false)
+	if m.taskBoard == nil {
+		return ""
+	}
+	m.taskBoard.prepareLayout(layout.contentWidth, layout.contentHeight)
 	return m.taskBoard.WithJobs(m.activeJobs).View(layout.contentWidth, layout.contentHeight)
 }
 

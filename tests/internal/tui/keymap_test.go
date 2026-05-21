@@ -393,6 +393,25 @@ func TestTaskBoardSelectionWraps(t *testing.T) {
 	}
 }
 
+func TestTaskBoardDownKeepsListWindowFilled(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedTaskBoardForTest([]tuiapp.TaskProject{
+		{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskInspecting, SyncError: "auth failed"},
+		{ID: "TASK-20260521-BBBBBB", TaskState: model.TaskInspecting, SyncError: "network timeout"},
+		{ID: "TASK-20260521-CCCCCC", TaskState: model.TaskInspecting, SyncError: "clone failed"},
+	}).SetFocus("task-board").SetSize(82, 30)
+
+	h, _ = h.Press("down")
+	view := h.View()
+	if got := h.SelectedTaskID(); got != "TASK-20260521-BBBBBB" {
+		t.Fatalf("selected task = %s, want TASK-20260521-BBBBBB", got)
+	}
+	for _, want := range []string{"TASK-20260521-AAAAAA", "TASK-20260521-BBBBBB", "TASK-20260521-CCCCCC"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("task board should keep surrounding rows visible after down, missing %s:\n%s", want, view)
+		}
+	}
+}
+
 func TestStageListMovesSelectedStage(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SetExecutionPanel().

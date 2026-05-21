@@ -2,6 +2,7 @@ package git_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -137,6 +138,27 @@ func TestSyncRejectsPathTraversal(t *testing.T) {
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		t.Fatalf("RepoPath escaped base path: %s", repoPath)
+	}
+}
+
+func TestSyncCommandErrorIncludesOutput(t *testing.T) {
+	requireGit(t)
+	basePath := filepath.Join(t.TempDir(), "projects-qa")
+	syncer := gitsync.NewSyncer(basePath, config.GitConfig{CloneTimeout: 10 * time.Second})
+
+	_, err := syncer.Sync(context.Background(), "TASK-20260521-BADURL", "batch-1", filepath.Join(t.TempDir(), "missing.git"), nil)
+	if err == nil {
+		t.Fatal("expected clone to fail")
+	}
+	var commandErr *gitsync.CommandError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("error type = %T, want CommandError: %v", err, err)
+	}
+	if strings.TrimSpace(commandErr.Stderr) == "" && strings.TrimSpace(commandErr.Stdout) == "" {
+		t.Fatalf("command error should capture git output: %#v", commandErr)
+	}
+	if !strings.Contains(err.Error(), "git clone") {
+		t.Fatalf("error should include command, got %v", err)
 	}
 }
 

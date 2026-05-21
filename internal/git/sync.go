@@ -250,14 +250,13 @@ func (s *Syncer) runGitOutput(ctx context.Context, dir string, args ...string) (
 		return stdout.String(), ctxErr
 	}
 	if err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = strings.TrimSpace(stdout.String())
+		return stdout.String(), &CommandError{
+			Dir:    dir,
+			Args:   append([]string(nil), args...),
+			Stdout: stdout.String(),
+			Stderr: stderr.String(),
+			Err:    err,
 		}
-		if message == "" {
-			message = err.Error()
-		}
-		return stdout.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, message)
 	}
 	return stdout.String(), nil
 }

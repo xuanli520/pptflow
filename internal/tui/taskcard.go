@@ -9,11 +9,19 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
+type taskCardLine struct {
+	text   string
+	style  lipgloss.Style
+	styled bool
+}
+
+const taskCardLineCount = 4
+
 func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) string {
 	width = max(12, width)
 	bodyWidth := max(8, width-2)
-	var lines []string
-	lines = append(lines, truncateMiddleDisplay(task.ID, bodyWidth))
+	var lines []taskCardLine
+	lines = append(lines, taskCardLine{text: truncateMiddleDisplay(task.ID, bodyWidth)})
 	switch task.TaskState {
 	case model.TaskWaitingManual:
 		lines = append(lines, waitingTaskLine(task, bodyWidth))
@@ -22,31 +30,40 @@ func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) s
 		if taskHasGitSyncStatus(task) {
 			lines = append(lines, inspectingTaskLines(task, bodyWidth)...)
 			if strings.TrimSpace(task.SyncError) != "" {
-				lines = append(lines, errorStyle.Render(truncateDisplay("Ctrl+W 重试", bodyWidth)))
+				lines = append(lines, taskCardLine{text: "Ctrl+W 重试", style: errorStyle, styled: true})
 			}
 		} else {
 			line := fmt.Sprintf("累计完成: %d 次", task.CompletionCount)
 			if task.LastCompletedAt != "" {
 				line += " · 最后: " + shortTime(task.LastCompletedAt)
 			}
-			lines = append(lines, truncateDisplay(line, bodyWidth))
+			lines = append(lines, taskCardLine{text: line})
 		}
 	default:
 		lines = append(lines, inspectingTaskLines(task, bodyWidth)...)
 		if strings.TrimSpace(task.SyncError) != "" {
-			lines = append(lines, errorStyle.Render(truncateDisplay("Ctrl+W 重试", bodyWidth)))
+			lines = append(lines, taskCardLine{text: "Ctrl+W 重试", style: errorStyle, styled: true})
 		}
 	}
-	lines = append(lines, mutedStyle.Render(strings.Repeat("─", min(bodyWidth, 28))))
-	rendered := strings.Join(lines, "\n")
+	if len(lines) < taskCardLineCount {
+		lines = append(lines, taskCardLine{text: strings.Repeat("─", min(bodyWidth, 28)), style: mutedStyle, styled: true})
+	}
 	if selected {
 		selectedLines := make([]string, 0, len(lines))
 		for _, line := range lines {
-			selectedLines = append(selectedLines, selectedStyle.Render(padDisplay(line, bodyWidth)))
+			selectedLines = append(selectedLines, selectedStyle.Render(padDisplay(line.text, bodyWidth)))
 		}
 		return strings.Join(selectedLines, "\n")
 	}
-	return rendered
+	rendered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		text := truncateDisplay(line.text, bodyWidth)
+		if line.styled {
+			text = line.style.Render(text)
+		}
+		rendered = append(rendered, text)
+	}
+	return strings.Join(rendered, "\n")
 }
 
 func padDisplay(value string, width int) string {
@@ -61,45 +78,62 @@ func taskHasGitSyncStatus(task TaskProject) bool {
 	return strings.TrimSpace(task.SyncError) != "" || (strings.TrimSpace(task.SyncPhase) != "" && task.SyncPhase != "done")
 }
 
-func inspectingTaskLines(task TaskProject, width int) []string {
+func inspectingTaskLines(task TaskProject, width int) []taskCardLine {
 	if strings.TrimSpace(task.SyncError) != "" {
-		return []string{errorStyle.Render(truncateDisplay("[Git 同步失败] "+task.SyncError, width))}
+		summary, logPath := splitSyncErrorLog(task.SyncError)
+		lines := []taskCardLine{{text: "[Git 同步失败] " + summary, style: errorStyle, styled: true}}
+		if logPath != "" {
+			lines = append(lines, taskCardLine{text: "日志: " + logPath, style: mutedStyle, styled: true})
+		}
+		return lines
 	}
 	if strings.TrimSpace(task.SyncPhase) != "" && task.SyncPhase != "done" {
 		phase := task.SyncPhase
 		if task.SyncPercent >= 0 {
 			phase = fmt.Sprintf("%s: %d%%", phase, task.SyncPercent)
 		}
-		return []string{truncateDisplay("[Git 同步中] "+phase, width)}
+		return []taskCardLine{{text: "[Git 同步中] " + phase}}
 	}
 	if task.CurrentStatus == model.StageFailed || task.CurrentStatus == model.StageBlocked || strings.TrimSpace(task.FailedStage) != "" {
 		stage := firstNonEmpty(task.FailedStage, task.CurrentStage)
-		lines := []string{truncateDisplay(compactStageLabel(stage), width)}
+		lines := []taskCardLine{{text: compactStageLabel(stage)}}
 		reason := localizeSummary(task.FailedSummary)
 		if reason == "" {
 			reason = "阶段失败"
 		}
-		lines = append(lines, errorStyle.Render(truncateDisplay("✗ 失败: "+reason, width)))
+		lines = append(lines, taskCardLine{text: "✗ 失败: " + reason, style: errorStyle, styled: true})
 		return lines
 	}
 	if task.RunStatus == model.RunRunning {
 		stage := firstNonEmpty(task.CurrentStage, "运行中")
-		return []string{
-			truncateDisplay(compactStageLabel(stage), width),
-			progressBar(stageProgressPercent(stage), width),
+		return []taskCardLine{
+			{text: compactStageLabel(stage)},
+			{text: progressBar(stageProgressPercent(stage), width)},
 		}
 	}
-	return []string{mutedStyle.Render(truncateDisplay("[Git 同步中]", width))}
+	return []taskCardLine{{text: "[Git 同步中]", style: mutedStyle, styled: true}}
 }
 
-func waitingTaskLine(task TaskProject, width int) string {
+func splitSyncErrorLog(value string) (string, string) {
+	value = strings.TrimSpace(value)
+	marker := "; 日志:"
+	index := strings.LastIndex(value, marker)
+	if index < 0 {
+		return value, ""
+	}
+	summary := strings.TrimSpace(value[:index])
+	logPath := strings.TrimSpace(value[index+len(marker):])
+	return summary, logPath
+}
+
+func waitingTaskLine(task TaskProject, width int) taskCardLine {
 	switch {
 	case task.DockerRunning && task.FrontendURL != "":
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#4488FF")).Render(truncateDisplay(task.FrontendURL, width))
+		return taskCardLine{text: task.FrontendURL, style: lipgloss.NewStyle().Foreground(lipgloss.Color("#4488FF")), styled: true}
 	case task.DockerRunning:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#DDAA00")).Render(truncateDisplay("! Docker 已启动，端口检测失败", width))
+		return taskCardLine{text: "! Docker 已启动，端口检测失败", style: lipgloss.NewStyle().Foreground(lipgloss.Color("#DDAA00")), styled: true}
 	default:
-		return errorStyle.Render(truncateDisplay("✗ Docker 启动失败", width))
+		return taskCardLine{text: "✗ Docker 启动失败", style: errorStyle, styled: true}
 	}
 }
 
@@ -136,14 +170,14 @@ func waitingDurationParts(value string, now time.Time) waitingDurationView {
 	return view
 }
 
-func waitingDurationLine(value string, now time.Time, width int) string {
+func waitingDurationLine(value string, now time.Time, width int) taskCardLine {
 	duration := waitingDurationParts(value, now)
 	line := "等待: " + duration.text
 	if duration.late {
 		line = "⏱ " + line
-		return errorStyle.Render(truncateDisplay(line, width))
+		return taskCardLine{text: line, style: errorStyle, styled: true}
 	}
-	return truncateDisplay(line, width)
+	return taskCardLine{text: line}
 }
 
 func compactStageLabel(stage string) string {

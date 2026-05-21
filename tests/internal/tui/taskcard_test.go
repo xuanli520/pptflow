@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
@@ -46,6 +48,37 @@ func TestTaskCardShowsGitProgressAndRetryFailure(t *testing.T) {
 	}, 34, time.Time{})
 	if !strings.Contains(completedFailed, "[Git 同步失败]") || !strings.Contains(completedFailed, "Ctrl+W 重试") {
 		t.Fatalf("completed reinspection git failure should be retryable:\n%s", completedFailed)
+	}
+}
+
+func TestTaskCardShowsGitErrorLogPathSeparately(t *testing.T) {
+	card := tuiapp.TaskCardForTest(tuiapp.TaskProject{
+		ID:        "TASK-20260521-ABCDEF",
+		TaskState: model.TaskInspecting,
+		SyncError: "git clone: exit status 128: fatal auth failed; 日志: /tmp/projects-qa/.qa-control/git-sync/TASK-20260521-ABCDEF.log",
+	}, 54, time.Time{})
+	if !strings.Contains(card, "[Git 同步失败]") || !strings.Contains(card, "日志:") {
+		t.Fatalf("git failure card should expose error summary and log path:\n%s", card)
+	}
+	if got := len(strings.Split(card, "\n")); got != 4 {
+		t.Fatalf("git failure card line count = %d, want 4:\n%s", got, card)
+	}
+}
+
+func TestSelectedTaskCardUsesFullWidthHighlight(t *testing.T) {
+	card := tuiapp.SelectedTaskCardForTest(tuiapp.TaskProject{
+		ID:        "TASK-20260521-ABCDEF",
+		TaskState: model.TaskInspecting,
+		SyncError: "clone target /home/purplevoid88/projects-qa/batch-1/TASK-20260521-ABCDEF exists without .qa-clone-done marker",
+	}, 34, time.Time{})
+	lines := strings.Split(card, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "\x1b[31m") || strings.Contains(line, "\x1b[90m") {
+			t.Fatalf("selected card should not nest inner ANSI colors:\n%q", card)
+		}
+		if got := lipgloss.Width(ansi.Strip(line)); got != 32 {
+			t.Fatalf("selected line width = %d, want 32 for %q\n%s", got, ansi.Strip(line), card)
+		}
 	}
 }
 

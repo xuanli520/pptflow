@@ -235,6 +235,10 @@ func TaskCardForTest(task TaskProject, width int, now time.Time) string {
 	return renderTaskCard(task, false, width, now)
 }
 
+func SelectedTaskCardForTest(task TaskProject, width int, now time.Time) string {
+	return renderTaskCard(task, true, width, now)
+}
+
 func TaskBoardViewForTest(width, height int, inspecting, waiting, completed []TaskProject) string {
 	board := newTaskBoardModel(nil)
 	board.query = noopTaskQueryService{}
@@ -242,6 +246,7 @@ func TaskBoardViewForTest(width, height int, inspecting, waiting, completed []Ta
 	board.cols[taskColumnWaiting].setItems(waiting)
 	board.cols[taskColumnCompleted].setItems(completed)
 	board.now = time.Now()
+	board.prepareLayout(width, height)
 	return board.View(width, height)
 }
 
@@ -346,6 +351,7 @@ func (h TestHarness) SeedOverviewTask(taskID, state string) TestHarness {
 
 func (h TestHarness) SeedTaskBoardForTest(inspecting []TaskProject) TestHarness {
 	if h.model.taskBoard != nil {
+		h.model.taskBoard.query = noopTaskQueryService{}
 		h.model.taskBoard.cols[taskColumnInspecting].setItems(inspecting)
 		h.model.taskBoard.focused = taskColumnInspecting
 	}
