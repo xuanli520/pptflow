@@ -215,7 +215,7 @@ type InspectionSchedulerForTest interface {
 
 func StartInspectionForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID string) error {
 	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
-	return service.StartInspection(ctx, taskID)
+	return service.StartInspection(ctx, taskID, pipeline.RunOptions{})
 }
 
 func ForceExitCleanupForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
@@ -233,6 +233,10 @@ func CleanupCheckpointPathForTest(scanPath string) string {
 
 func TaskCardForTest(task TaskProject, width int, now time.Time) string {
 	return renderTaskCard(task, width, now, false)
+}
+
+func SelectedTaskCardForTest(task TaskProject, width int, now time.Time) string {
+	return renderTaskCard(task, width, now, true)
 }
 
 func TaskBoardViewForTest(width, height int, inspecting, waiting, completed []TaskProject) string {
@@ -753,7 +757,7 @@ func StagePlanWithOptionsForTest(mode, stage string, staticOnly bool, selected [
 func FooterForTest(focus string, confirm bool) string {
 	m := newApp(nil, config.Default())
 	if confirm {
-		m.runConfig = newRunConfig("TASK-1", "initial", "", "A", false, 0)
+		m.runConfig = newRunConfig("TASK-1", "initial", "", "A", false, 0, runConfigActionPipeline)
 	}
 	m.setFocus(testFocusArea(focus))
 	return footerFor(m)

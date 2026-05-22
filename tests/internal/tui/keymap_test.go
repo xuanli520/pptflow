@@ -230,14 +230,35 @@ func TestCtrlROpensConfirmAndConfirmKeys(t *testing.T) {
 	}
 }
 
-func TestCtrlROnOverviewTaskUsesReinspect(t *testing.T) {
+func TestCtrlROnOverviewTaskOpensRunConfig(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedOverviewTask("TASK-20260521-ABCDEF", model.TaskCompleted).
 		SetFocus("overview-table")
 
 	next, result := h.Press("ctrl+r")
-	if next.Confirm() || result.CmdCount == 0 || !strings.Contains(next.Message(), "重新质检") {
-		t.Fatalf("overview task Ctrl+R should submit reinspection, confirm=%v cmds=%d message=%q", next.Confirm(), result.CmdCount, next.Message())
+	if !next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.View(), "运行配置: TASK-20260521-ABCDEF") {
+		t.Fatalf("overview task Ctrl+R should open run config, confirm=%v cmds=%d message=%q\n%s", next.Confirm(), result.CmdCount, next.Message(), next.View())
+	}
+}
+
+func TestCtrlROnOverviewWaitingTaskDoesNotOpenRunConfig(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverviewTask("TASK-20260521-ABCDEF", model.TaskWaitingManual).
+		SetFocus("overview-table")
+
+	next, result := h.Press("ctrl+r")
+	if next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.Message(), "请选择可重跑质检任务") {
+		t.Fatalf("waiting task Ctrl+R should be blocked, confirm=%v cmds=%d message=%q", next.Confirm(), result.CmdCount, next.Message())
+	}
+}
+
+func TestTaskInputCtrlROpensRunConfigForTypedTaskID(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SetFocus("task-input")
+	h, _ = h.Press("TASK-20260521-ABCDEF")
+
+	next, result := h.Press("ctrl+r")
+	if !next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.View(), "运行配置: TASK-20260521-ABCDEF") {
+		t.Fatalf("typed task Ctrl+R should open run config, confirm=%v cmds=%d message=%q\n%s", next.Confirm(), result.CmdCount, next.Message(), next.View())
 	}
 }
 

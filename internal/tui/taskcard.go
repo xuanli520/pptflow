@@ -220,8 +220,9 @@ func renderGradientBar(width int) string {
 		return ""
 	}
 	segCount := len(gradientColors)
-	segWidth := width / segCount
-	remainder := width % segCount
+	lineWidth := min(width, segCount*2)
+	segWidth := lineWidth / segCount
+	remainder := lineWidth % segCount
 	var bar strings.Builder
 	for i := 0; i < segCount; i++ {
 		w := segWidth
@@ -233,7 +234,7 @@ func renderGradientBar(width int) string {
 		}
 		bar.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color(gradientColors[i])).
-			Render(strings.Repeat("█", w)))
+			Render(strings.Repeat("─", w)))
 	}
 	return bar.String()
 }

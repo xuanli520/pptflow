@@ -350,9 +350,28 @@ func (s *Store) RepairTaskStates(ctx context.Context) error {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE tasks
-			SET current_run_id = NULL, updated_at = ?
+			SET state = ?, current_run_id = NULL, docker_running = 0, frontend_url = '', compose_meta = '', updated_at = ?
 			WHERE state = ? AND current_run_id IN (SELECT run_id FROM runs WHERE status IN (?, ?))`,
-			now, model.TaskInspecting, model.RunAborted, model.RunCrashed)
+			model.TaskCompleted, now, model.TaskInspecting, model.RunAborted, model.RunCrashed)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE tasks
+			SET state = ?, docker_running = 0, frontend_url = '', compose_meta = '', updated_at = ?
+			WHERE state = ? AND current_run_id IS NULL AND id IN (
+				SELECT task_id
+				FROM (
+					SELECT r.task_id,
+					       r.status,
+					       ROW_NUMBER() OVER (
+					           PARTITION BY r.task_id
+					           ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+					       ) AS rn
+					FROM runs r
+				) latest
+				WHERE rn = 1 AND status IN (?, ?)
+			)`,
+			model.TaskCompleted, now, model.TaskInspecting, model.RunAborted, model.RunCrashed)
 		if err != nil {
 			return err
 		}
@@ -950,9 +969,9 @@ func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, dur
 			err = requireAffected(result, "active task", taskID)
 		case model.RunAborted, model.RunCrashed:
 			result, err = tx.ExecContext(ctx, `UPDATE tasks
-				SET current_run_id = NULL, docker_running = 0, frontend_url = '', compose_meta = '', updated_at = ?
+				SET state = ?, current_run_id = NULL, docker_running = 0, frontend_url = '', compose_meta = '', updated_at = ?
 				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
-				now, taskID, runID)
+				model.TaskCompleted, now, taskID, runID)
 			if err != nil {
 				return err
 			}

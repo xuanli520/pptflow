@@ -78,6 +78,22 @@ func TestFindStaleInspectingOnlyReturnsRetryableOrphans(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	aborted, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-DDDDDD", "https://gitlab.example/TASK-20260521-DDDDDD", cfg.ScanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-aborted",
+		TaskID:       aborted.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, "run-aborted", aborted.ID, model.RunAborted, time.Second); err != nil {
+		t.Fatal(err)
+	}
 
 	tasks, err := tuiapp.FindStaleInspectingForTest(ctx, store, cfg)
 	if err != nil {

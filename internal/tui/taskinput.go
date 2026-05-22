@@ -55,6 +55,14 @@ func (m TaskInputModel) Focused() bool {
 	return m.input.Focused()
 }
 
+func (m TaskInputModel) Value() string {
+	return m.input.Value()
+}
+
+func (m *TaskInputModel) SetError(err string) {
+	m.err = err
+}
+
 func (m *TaskInputModel) Clear() {
 	m.input.SetValue("")
 	m.err = ""

@@ -24,8 +24,16 @@ const (
 	runConfigFocusCancel
 )
 
+type runConfigAction int
+
+const (
+	runConfigActionPipeline runConfigAction = iota
+	runConfigActionInspection
+)
+
 type runConfig struct {
 	active        bool
+	action        runConfigAction
 	focus         runConfigFocus
 	taskID        string
 	mode          string
@@ -40,7 +48,7 @@ type runConfig struct {
 	err           string
 }
 
-func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, attachedCount int) runConfig {
+func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, attachedCount int, action runConfigAction) runConfig {
 	input := textinput.New()
 	input.Placeholder = "/absolute/path/to/doc.md"
 	input.Prompt = "路径: "
@@ -49,6 +57,7 @@ func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, 
 
 	cfg := runConfig{
 		active:        true,
+		action:        action,
 		focus:         runConfigFocusMode,
 		taskID:        taskID,
 		mode:          empty(mode, "initial"),
@@ -56,23 +65,15 @@ func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, 
 		keepRuntime:   keepRuntime,
 		attachedCount: attachedCount,
 		input:         input,
-		stages:        stagesExcludingE(),
 	}
 	if mode == "recheck" {
 		recheckStages := stageSet(affectedStages(selectedStage))
-		delete(recheckStages, string(model.StageE))
 		if len(recheckStages) > 0 {
 			cfg.stages = recheckStages
 		}
 	}
 	cfg.syncInputFocus()
 	return cfg
-}
-
-func stagesExcludingE() map[string]bool {
-	stages := stageSet(model.AllStages())
-	delete(stages, string(model.StageE))
-	return stages
 }
 
 func (c *runConfig) syncInputFocus() {
@@ -164,14 +165,15 @@ func (m *app) toggleRunConfigFocused() {
 		if m.runConfig.mode == "recheck" {
 			m.runConfig.mode = "initial"
 			m.runConfig.refRun = ""
-			m.runConfig.stages = stagesExcludingE()
+			m.runConfig.stages = nil
 		} else {
 			m.runConfig.mode = "recheck"
 			m.syncRefSelection()
 			m.runConfig.refRun = m.selectedRefRunCandidate()
 			if m.runConfig.fromStage == "" {
-				m.runConfig.stages = stageSet(affectedStages(m.rerunStageKey()))
-				delete(m.runConfig.stages, string(model.StageE))
+				m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly)
+			} else {
+				m.runConfig.stages = nil
 			}
 		}
 	case runConfigFocusStages:
@@ -180,7 +182,7 @@ func (m *app) toggleRunConfigFocused() {
 			return
 		}
 		if m.runConfig.stages == nil {
-			m.runConfig.stages = stagesExcludingE()
+			m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly)
 		}
 		stage := m.runConfig.selectedStage()
 		m.runConfig.stages[stage] = !m.runConfig.stages[stage]
@@ -220,10 +222,6 @@ func (m *app) submitRunConfig() tea.Cmd {
 		m.runConfig.err = "未选择任务"
 		return nil
 	}
-	if m.runConfig.attachedCount == 0 {
-		m.runConfig.err = "必须附加至少1个参考文档"
-		return nil
-	}
 	if m.runConfig.mode == "recheck" && strings.TrimSpace(m.runConfig.refRun) == "" {
 		m.syncRefSelection()
 		m.runConfig.refRun = m.selectedRefRunCandidate()
@@ -239,7 +237,12 @@ func (m *app) submitRunConfig() tea.Cmd {
 	}
 	opts := m.runConfig.toRunOptions(plan)
 	taskID := m.runConfig.taskID
-	cmd := m.submitRun(taskID, opts)
+	var cmd tea.Cmd
+	if m.runConfig.action == runConfigActionInspection {
+		cmd = m.submitInspection(taskID, opts)
+	} else {
+		cmd = m.submitRun(taskID, opts)
+	}
 	m.runConfig = runConfig{}
 	m.message = "正在提交流水线 job..."
 	return cmd

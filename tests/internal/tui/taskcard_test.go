@@ -146,3 +146,17 @@ func TestTaskCardShowsWaitingDockerVariants(t *testing.T) {
 		t.Fatalf("late waiting card should include redundant timer marker:\n%s", late)
 	}
 }
+
+func TestSelectedTaskCardUsesGradientRule(t *testing.T) {
+	card := tuiapp.SelectedTaskCardForTest(tuiapp.TaskProject{
+		ID:              "TASK-20260521-ABCDEF",
+		TaskState:       model.TaskCompleted,
+		CompletionCount: 1,
+	}, 42, time.Time{})
+	if strings.Contains(card, "█") || !strings.Contains(card, "─") {
+		t.Fatalf("selected card should use a gradient rule, not a block bar:\n%s", card)
+	}
+	if count := strings.Count(card, "─"); count != 16 {
+		t.Fatalf("selected card gradient rule width = %d, want 16:\n%s", count, card)
+	}
+}

@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -187,8 +188,57 @@ func TestFinishRunAbortedClearsTaskDockerRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.CurrentRunID != "" || task.DockerRunning || task.FrontendURL != "" || task.ComposeMeta.Project != "" {
+	if task.State != model.TaskCompleted || task.CurrentRunID != "" || task.DockerRunning || task.FrontendURL != "" || task.ComposeMeta.Project != "" {
 		t.Fatalf("aborted run should clear task runtime: %#v", task)
+	}
+}
+
+func TestRepairTaskStatesCompletesLegacyAbortedInspectingTask(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-CCCCCC", "https://gitlab.example/TASK-20260521-CCCCCC", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID := "run-legacy-aborted"
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        runID,
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, runID, task.ID, model.RunAborted, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.Exec(`UPDATE tasks SET state = ?, current_run_id = NULL, docker_running = 1, frontend_url = 'http://localhost:3000', compose_meta = '{}' WHERE id = ?`, model.TaskInspecting, task.ID); err != nil {
+		_ = handle.Close()
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RepairTaskStates(ctx); err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskCompleted || task.CurrentRunID != "" || task.DockerRunning || task.FrontendURL != "" || task.ComposeMeta.Project != "" {
+		t.Fatalf("legacy aborted inspecting task should be completed and runtime-cleared: %#v", task)
 	}
 }
 

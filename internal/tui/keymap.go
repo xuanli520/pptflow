@@ -217,25 +217,28 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		m.openCancelConfirm()
 		return m, cmds
 	case "ctrl+r":
+		if m.focus == focusTaskInput && m.openRunConfigForTaskInput() {
+			return m, cmds
+		}
 		if m.tab == panelTaskBoard {
-			if task, ok := m.taskBoard.SelectedTask(); ok && task.TaskState == "completed" {
-				m.message = "正在提交重新质检 " + task.ID
-				return m, append(cmds, m.taskActionCmd("reinspect", task.ID))
+			if task, ok := m.taskBoard.SelectedTask(); ok && canOpenInspectionRunConfig(task.TaskState) {
+				m.openRunConfigForTask(task.ID, runConfigActionInspection)
+				return m, cmds
 			}
-			m.message = "请选择结束质检题目"
+			m.message = "请选择可重跑质检任务"
 			return m, cmds
 		}
 		if m.tab == panelOverview {
 			if item, ok := m.overview.SelectedItem(); ok && item.HasTask {
-				if item.TaskState == model.TaskCompleted {
-					m.message = "正在提交重新质检 " + item.TaskID
-					return m, append(cmds, m.taskActionCmd("reinspect", item.TaskID))
+				if canOpenInspectionRunConfig(item.TaskState) {
+					m.openRunConfigForTask(item.TaskID, runConfigActionInspection)
+					return m, cmds
 				}
-				m.message = "请选择结束质检题目"
+				m.message = "请选择可重跑质检任务"
 				return m, cmds
 			}
 		}
-		m.openRunConfig()
+		m.openRunConfigForSelected(runConfigActionPipeline)
 		return m, cmds
 	case "tab":
 		m.switchPanel(1)
@@ -396,6 +399,10 @@ func canRetryGitSyncTask(task TaskProject) bool {
 	return task.TaskState == model.TaskInspecting || task.TaskState == model.TaskCompleted
 }
 
+func canOpenInspectionRunConfig(state string) bool {
+	return state != model.TaskInspecting && state != model.TaskWaitingManual
+}
+
 func (m *app) switchPanel(delta int) {
 	if m.tab == panelTaskBoard {
 		m.setTab(panelOverview)
@@ -523,7 +530,16 @@ func (m *app) toggleMode() {
 }
 
 func (m *app) openRunConfig() {
-	if m.selectedTaskID() == "" {
+	m.openRunConfigForSelected(runConfigActionPipeline)
+}
+
+func (m *app) openRunConfigForSelected(action runConfigAction) {
+	m.openRunConfigForTask(m.selectedTaskID(), action)
+}
+
+func (m *app) openRunConfigForTask(taskID string, action runConfigAction) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
 		return
 	}
 	m.syncRefSelection()
@@ -538,7 +554,26 @@ func (m *app) openRunConfig() {
 		}
 		return
 	}
-	m.runConfig = newRunConfig(m.selectedTaskID(), m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, m.detailVM.DocsSummary.Count)
+	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, m.detailVM.DocsSummary.Count, action)
+}
+
+func (m *app) openRunConfigForTaskInput() bool {
+	if m.taskInput == nil {
+		return false
+	}
+	taskID, err := ValidateTaskID(m.taskInput.Value())
+	if err != nil {
+		m.taskInput.SetError(err.Error())
+		return true
+	}
+	m.overview.selectedID = taskID
+	m.taskInput.Clear()
+	m.taskInput.Blur()
+	m.focusManager.Pop()
+	m.taskInputFocusCaptured = false
+	m.setFocus(focusTaskBoard)
+	m.openRunConfigForTask(taskID, runConfigActionInspection)
+	return true
 }
 
 func (m *app) openCancelConfirm() {

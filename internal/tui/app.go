@@ -372,7 +372,7 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.taskInputFocusCaptured = false
 		m.taskInput.Blur()
 		m.setFocus(focusTaskBoard)
-		m.openRunConfig()
+		m.openRunConfigForTask(value.TaskID, runConfigActionInspection)
 		return true
 	case taskActionMsg:
 		if value.err != nil {
@@ -840,6 +840,18 @@ func (m app) submitRun(taskID string, opts pipeline.RunOptions) tea.Cmd {
 	}
 }
 
+func (m app) submitInspection(taskID string, opts pipeline.RunOptions) tea.Cmd {
+	return func() tea.Msg {
+		if m.taskActionSvc == nil {
+			return taskActionMsg{action: "inspect", taskID: taskID, err: fmt.Errorf("task service unavailable")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := m.taskActionSvc.SubmitInspection(ctx, taskID, opts)
+		return taskActionMsg{action: "inspect", taskID: taskID, err: err}
+	}
+}
+
 func (m app) taskActionCmd(action, taskID string) tea.Cmd {
 	return func() tea.Msg {
 		if m.taskActionSvc == nil {
@@ -852,11 +864,11 @@ func (m app) taskActionCmd(action, taskID string) tea.Cmd {
 		case "complete":
 			err = m.taskActionSvc.ConfirmComplete(ctx, taskID)
 		case "reinspect":
-			err = m.taskActionSvc.ReInspect(ctx, taskID)
+			err = m.taskActionSvc.ReInspect(ctx, taskID, pipeline.RunOptions{})
 		case "retry-git":
 			err = m.taskActionSvc.RetryGitSync(ctx, taskID)
 		default:
-			err = m.taskActionSvc.StartInspection(ctx, taskID)
+			err = m.taskActionSvc.StartInspection(ctx, taskID, pipeline.RunOptions{})
 		}
 		return taskActionMsg{action: action, taskID: taskID, err: err}
 	}

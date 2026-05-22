@@ -2,7 +2,9 @@ package tui
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -58,8 +60,9 @@ type TaskQueryService interface {
 }
 
 type TaskActionService interface {
-	StartInspection(context.Context, string) error
-	ReInspect(context.Context, string) error
+	StartInspection(context.Context, string, pipeline.RunOptions) error
+	SubmitInspection(context.Context, string, pipeline.RunOptions) error
+	ReInspect(context.Context, string, pipeline.RunOptions) error
 	ConfirmComplete(context.Context, string) error
 	RetryGitSync(context.Context, string) error
 }
@@ -137,6 +140,13 @@ func (s dbTaskQueryService) FindStaleInspecting(ctx context.Context) ([]TaskProj
 		if strings.TrimSpace(task.CurrentRunID) != "" || strings.TrimSpace(task.SyncError) != "" {
 			continue
 		}
+		runs, err := s.store.ListRunsForTask(ctx, task.ID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if len(runs) > 0 {
+			continue
+		}
 		result = append(result, taskProjectFromTask(s.cfg, task))
 	}
 	return result, nil
@@ -199,7 +209,7 @@ func newTaskActionService(store *db.Store, cfg config.Config, scheduler schedule
 	return action
 }
 
-func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string) error {
+func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
 	taskID, err := ValidateTaskID(taskID)
 	if err != nil {
 		return err
@@ -212,10 +222,31 @@ func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string)
 	if err != nil {
 		return err
 	}
-	return s.submitInspection(ctx, task)
+	return s.submitInspection(ctx, task, opts)
 }
 
-func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string) error {
+func (s dbTaskActionService) SubmitInspection(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
+	taskID, err := ValidateTaskID(taskID)
+	if err != nil {
+		return err
+	}
+	task, err := s.store.GetTask(ctx, taskID)
+	if err == nil {
+		if !canOpenInspectionRunConfig(task.State) {
+			return fmt.Errorf("task %s is not ready for reinspection", taskID)
+		}
+		if strings.TrimSpace(task.CurrentRunID) != "" {
+			return fmt.Errorf("task %s already has an active run", taskID)
+		}
+		return s.submitInspection(ctx, task, opts)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return s.StartInspection(ctx, taskID, opts)
+}
+
+func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
 	taskID, err := ValidateTaskID(taskID)
 	if err != nil {
 		return err
@@ -230,7 +261,7 @@ func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string) error
 	if strings.TrimSpace(task.CurrentRunID) != "" {
 		return fmt.Errorf("task %s already has an active run", taskID)
 	}
-	return s.submitInspection(ctx, task)
+	return s.submitInspection(ctx, task, opts)
 }
 
 func (s dbTaskActionService) RetryGitSync(ctx context.Context, taskID string) error {
@@ -253,7 +284,7 @@ func (s dbTaskActionService) RetryGitSync(ctx context.Context, taskID string) er
 	if strings.TrimSpace(task.SyncError) == "" {
 		return fmt.Errorf("task %s has no git sync error to retry", taskID)
 	}
-	return s.submitInspection(ctx, task)
+	return s.submitInspection(ctx, task, pipeline.RunOptions{})
 }
 
 func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string) error {
@@ -316,12 +347,12 @@ func cleanupCheckpointPath(scanPath string) string {
 	return filepath.Join(scanPath, ".qa-control", "cleanup_checkpoint.json")
 }
 
-func (s dbTaskActionService) submitInspection(ctx context.Context, task model.Task) error {
+func (s dbTaskActionService) submitInspection(ctx context.Context, task model.Task, opts pipeline.RunOptions) error {
 	var err error
+	opts.DeferRuntimeCleanup = true
 	if s.scheduler == nil {
 		err = fmt.Errorf("scheduler unavailable")
 	} else {
-		opts := pipeline.RunOptions{DeferRuntimeCleanup: true}
 		_, err = s.scheduler.SubmitInspection(task.ID, task.BatchID, task.GitURL, opts)
 	}
 	if err != nil {
