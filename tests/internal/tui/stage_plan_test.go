@@ -122,6 +122,30 @@ func TestRenderConfirmUsesInitialStagePlan(t *testing.T) {
 	}
 }
 
+func TestRunConfigUsesConfiguredDefaultStages(t *testing.T) {
+	cfg := config.Default()
+	cfg.Pipeline.DefaultStages = map[string][]string{
+		"initial": {"A", "D", "F"},
+		"recheck": {"F"},
+	}
+	h := tuiapp.NewTestHarness(cfg).
+		SeedOverview("TASK-1").
+		SetExecutionPanel().
+		SetFocus("stage-list")
+
+	h, _ = h.Press("ctrl+r")
+	view := h.View()
+	if !strings.Contains(view, "将运行阶段: A, D, F") || strings.Contains(view, "将运行阶段: A, D, E, F, B, C") {
+		t.Fatalf("run config should use configured initial stages:\n%s", view)
+	}
+
+	h, _ = h.Press(" ")
+	view = h.View()
+	if !strings.Contains(view, "将运行阶段: F") {
+		t.Fatalf("run config should use configured recheck stages after mode toggle:\n%s", view)
+	}
+}
+
 func TestRunConfigModeTogglePreservesFromStageWithoutConflict(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedOverview("TASK-1").

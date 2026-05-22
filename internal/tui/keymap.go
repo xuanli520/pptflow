@@ -554,7 +554,7 @@ func (m *app) openRunConfigForTask(taskID string, action runConfigAction) {
 		}
 		return
 	}
-	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, m.detailVM.DocsSummary.Count, action)
+	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, m.detailVM.DocsSummary.Count, action, m.cfg.Pipeline.DefaultStages)
 }
 
 func (m *app) openRunConfigForTaskInput() bool {

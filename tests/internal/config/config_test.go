@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
@@ -79,6 +80,28 @@ func TestLoadParsesAndNormalizesMaxConcurrent(t *testing.T) {
 				t.Fatalf("max concurrent = %d, want %d", cfg.Pipeline.MaxConcurrent, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadParsesDefaultStages(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`pipeline:
+  default_stages:
+    initial: [f, A, D, A]
+    recheck: [F]
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Pipeline.DefaultStages["initial"], ","); got != "A,D,F" {
+		t.Fatalf("initial default stages = %s, want A,D,F", got)
+	}
+	if got := strings.Join(cfg.Pipeline.DefaultStages["recheck"], ","); got != "F" {
+		t.Fatalf("recheck default stages = %s, want F", got)
 	}
 }
 
@@ -290,6 +313,27 @@ func TestLoadRejectsUnknownFieldsAndStageTimeoutKeys(t *testing.T) {
 			content: `pipeline:
   stage_timeouts:
     Z: 10
+`,
+		},
+		{
+			name: "unknown default stage mode",
+			content: `pipeline:
+  default_stages:
+    retry: [A]
+`,
+		},
+		{
+			name: "unknown default stage",
+			content: `pipeline:
+  default_stages:
+    initial: [Z]
+`,
+		},
+		{
+			name: "empty default stages",
+			content: `pipeline:
+  default_stages:
+    initial: []
 `,
 		},
 	} {

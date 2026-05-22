@@ -757,7 +757,7 @@ func StagePlanWithOptionsForTest(mode, stage string, staticOnly bool, selected [
 func FooterForTest(focus string, confirm bool) string {
 	m := newApp(nil, config.Default())
 	if confirm {
-		m.runConfig = newRunConfig("TASK-1", "initial", "", "A", false, 0, runConfigActionPipeline)
+		m.runConfig = newRunConfig("TASK-1", "initial", "", "A", false, 0, runConfigActionPipeline, nil)
 	}
 	m.setFocus(testFocusArea(focus))
 	return footerFor(m)

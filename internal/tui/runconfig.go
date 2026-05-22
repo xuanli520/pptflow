@@ -48,7 +48,7 @@ type runConfig struct {
 	err           string
 }
 
-func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, attachedCount int, action runConfigAction) runConfig {
+func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, attachedCount int, action runConfigAction, configuredStages map[string][]string) runConfig {
 	input := textinput.New()
 	input.Placeholder = "/absolute/path/to/doc.md"
 	input.Prompt = "路径: "
@@ -66,7 +66,9 @@ func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, 
 		attachedCount: attachedCount,
 		input:         input,
 	}
-	if mode == "recheck" {
+	if stages, ok := configuredStageSet(mode, configuredStages); ok {
+		cfg.stages = stages
+	} else if mode == "recheck" {
 		recheckStages := stageSet(affectedStages(selectedStage))
 		if len(recheckStages) > 0 {
 			cfg.stages = recheckStages
@@ -165,13 +167,19 @@ func (m *app) toggleRunConfigFocused() {
 		if m.runConfig.mode == "recheck" {
 			m.runConfig.mode = "initial"
 			m.runConfig.refRun = ""
-			m.runConfig.stages = nil
+			if stages, ok := configuredStageSet(m.runConfig.mode, m.cfg.Pipeline.DefaultStages); ok {
+				m.runConfig.stages = stages
+			} else {
+				m.runConfig.stages = nil
+			}
 		} else {
 			m.runConfig.mode = "recheck"
 			m.syncRefSelection()
 			m.runConfig.refRun = m.selectedRefRunCandidate()
-			if m.runConfig.fromStage == "" {
-				m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly)
+			if stages, ok := configuredStageSet(m.runConfig.mode, m.cfg.Pipeline.DefaultStages); ok {
+				m.runConfig.stages = stages
+			} else if m.runConfig.fromStage == "" {
+				m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly, nil)
 			} else {
 				m.runConfig.stages = nil
 			}
@@ -182,7 +190,7 @@ func (m *app) toggleRunConfigFocused() {
 			return
 		}
 		if m.runConfig.stages == nil {
-			m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly)
+			m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly, m.cfg.Pipeline.DefaultStages)
 		}
 		stage := m.runConfig.selectedStage()
 		m.runConfig.stages[stage] = !m.runConfig.stages[stage]
@@ -259,12 +267,23 @@ func stageSet(stages []string) map[string]bool {
 	return result
 }
 
-func defaultStageSet(mode, selectedStage string, staticOnly bool) map[string]bool {
+func defaultStageSet(mode, selectedStage string, staticOnly bool, configured map[string][]string) map[string]bool {
+	if stages, ok := configuredStageSet(mode, configured); ok {
+		return stages
+	}
 	plan := stagePlanForMode(mode, selectedStage, staticOnly, nil, "")
 	if len(plan.displayStages) == 0 {
 		return map[string]bool{string(model.StageF): true}
 	}
 	return stageSet(plan.displayStages)
+}
+
+func configuredStageSet(mode string, configured map[string][]string) (map[string]bool, bool) {
+	stages := configured[strings.ToLower(strings.TrimSpace(mode))]
+	if len(stages) == 0 {
+		return nil, false
+	}
+	return stageSet(stages), true
 }
 
 func nextFromStage(current string) string {

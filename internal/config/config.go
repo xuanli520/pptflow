@@ -40,6 +40,7 @@ type PipelineConfig struct {
 	StageTimeouts      map[string]int
 	SelfTestReportPath string
 	MaxConcurrent      int
+	DefaultStages      map[string][]string
 }
 
 type GitConfig struct {
@@ -158,10 +159,11 @@ type rawConfig struct {
 }
 
 type rawPipelineConfig struct {
-	StaticOnly         *bool          `yaml:"static_only"`
-	StageTimeouts      map[string]int `yaml:"stage_timeouts"`
-	SelfTestReportPath *string        `yaml:"self_test_report_path"`
-	MaxConcurrent      *int           `yaml:"max_concurrent"`
+	StaticOnly         *bool               `yaml:"static_only"`
+	StageTimeouts      map[string]int      `yaml:"stage_timeouts"`
+	SelfTestReportPath *string             `yaml:"self_test_report_path"`
+	MaxConcurrent      *int                `yaml:"max_concurrent"`
+	DefaultStages      map[string][]string `yaml:"default_stages"`
 }
 
 type rawGitConfig struct {
@@ -490,6 +492,13 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 		if raw.Pipeline.MaxConcurrent != nil {
 			cfg.Pipeline.MaxConcurrent = *raw.Pipeline.MaxConcurrent
 		}
+		if raw.Pipeline.DefaultStages != nil {
+			stages, err := normalizeDefaultStages(raw.Pipeline.DefaultStages)
+			if err != nil {
+				return err
+			}
+			cfg.Pipeline.DefaultStages = stages
+		}
 	}
 	if raw.Git != nil {
 		if raw.Git.BaseURL != nil {
@@ -720,6 +729,43 @@ func normalize(cfg *Config) {
 	}
 }
 
+func normalizeDefaultStages(raw map[string][]string) (map[string][]string, error) {
+	result := make(map[string][]string, len(raw))
+	for mode, stages := range raw {
+		normalizedMode, err := validateDefaultStageMode(mode)
+		if err != nil {
+			return nil, err
+		}
+		selected := map[string]bool{}
+		for _, stage := range stages {
+			normalizedStage, ok := model.NormalizeStage(stage)
+			if !ok {
+				return nil, fmt.Errorf("pipeline.default_stages.%s uses unknown stage %q", normalizedMode, stage)
+			}
+			selected[normalizedStage] = true
+		}
+		if len(selected) == 0 {
+			return nil, fmt.Errorf("pipeline.default_stages.%s must include at least one stage", normalizedMode)
+		}
+		for _, stage := range model.AllStages() {
+			if selected[stage] {
+				result[normalizedMode] = append(result[normalizedMode], stage)
+			}
+		}
+	}
+	return result, nil
+}
+
+func validateDefaultStageMode(mode string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(mode))
+	switch normalized {
+	case "initial", "recheck":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("pipeline.default_stages uses unknown mode %q", mode)
+	}
+}
+
 func NormalizeMaxConcurrent(value int) int {
 	if value <= 0 {
 		return DefaultMaxConcurrent
@@ -741,6 +787,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Pipeline.MaxConcurrent <= 0 {
 		return fmt.Errorf("pipeline.max_concurrent must be greater than 0")
+	}
+	if _, err := normalizeDefaultStages(cfg.Pipeline.DefaultStages); err != nil {
+		return err
 	}
 	if strings.TrimSpace(cfg.Git.BaseURL) == "" {
 		return fmt.Errorf("git.base_url must not be empty")
