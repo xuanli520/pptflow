@@ -398,7 +398,7 @@ func TestTaskBoardDownKeepsListWindowFilled(t *testing.T) {
 		{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskInspecting, SyncError: "auth failed"},
 		{ID: "TASK-20260521-BBBBBB", TaskState: model.TaskInspecting, SyncError: "network timeout"},
 		{ID: "TASK-20260521-CCCCCC", TaskState: model.TaskInspecting, SyncError: "clone failed"},
-	}).SetFocus("task-board").SetSize(82, 30)
+	}).SetFocus("task-board").SetSize(82, 35)
 
 	h, _ = h.Press("down")
 	view := h.View()

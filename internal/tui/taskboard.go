@@ -299,15 +299,28 @@ func taskCardWindowLines(items []TaskProject, start, cursor int, focused bool, w
 	count := 0
 	includesCursor := false
 	for index := start; index < len(items); index++ {
-		card := renderTaskCard(items[index], focused && index == cursor, width, now)
+		isSelected := focused && index == cursor
+		card := renderTaskCard(items[index], width, now)
 		cardLines := strings.Split(card, "\n")
+		needed := len(cardLines)
+		if isSelected {
+			needed += 3
+		}
 		remaining := budget - len(lines)
 		if remaining <= 0 {
 			break
 		}
-		if len(cardLines) > remaining {
+		if needed > remaining {
 			if count == 0 {
-				lines = append(lines, cardLines[:remaining]...)
+				remainingLines := remaining
+				if isSelected && remainingLines >= 2 {
+					lines = append(lines, "")
+					lines = append(lines, renderSelectedIndicator(width))
+					remainingLines -= 2
+				}
+				if remainingLines > 0 {
+					lines = append(lines, cardLines[:remainingLines]...)
+				}
 				count++
 				if index == cursor {
 					includesCursor = true
@@ -315,7 +328,14 @@ func taskCardWindowLines(items []TaskProject, start, cursor int, focused bool, w
 			}
 			break
 		}
+		if isSelected {
+			lines = append(lines, "")
+			lines = append(lines, renderSelectedIndicator(width))
+		}
 		lines = append(lines, cardLines...)
+		if isSelected {
+			lines = append(lines, "")
+		}
 		count++
 		if index == cursor {
 			includesCursor = true

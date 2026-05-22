@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
@@ -62,29 +60,6 @@ func TestTaskCardShowsGitErrorLogPathSeparately(t *testing.T) {
 	}
 	if got := len(strings.Split(card, "\n")); got != 4 {
 		t.Fatalf("git failure card line count = %d, want 4:\n%s", got, card)
-	}
-}
-
-func TestSelectedTaskCardUsesFullWidthHighlight(t *testing.T) {
-	card := tuiapp.SelectedTaskCardForTest(tuiapp.TaskProject{
-		ID:        "TASK-20260521-ABCDEF",
-		TaskState: model.TaskInspecting,
-		SyncError: "clone target /home/purplevoid88/projects-qa/batch-1/TASK-20260521-ABCDEF exists\nwithout .qa-clone-done marker",
-	}, 34, time.Unix(0, 0))
-	lines := strings.Split(card, "\n")
-	if len(lines) != 4 {
-		t.Fatalf("selected card line count = %d, want 4:\n%s", len(lines), card)
-	}
-	for _, line := range lines {
-		if strings.Contains(line, "\x1b[31m") || strings.Contains(line, "\x1b[90m") {
-			t.Fatalf("selected card should not nest inner ANSI colors:\n%q", card)
-		}
-		if got := lipgloss.Width(ansi.Strip(line)); got != 31 {
-			t.Fatalf("selected line width = %d, want 31 for %q\n%s", got, ansi.Strip(line), card)
-		}
-		if got := ansi.StringWidth(line); got != 31 {
-			t.Fatalf("selected ansi line width = %d, want 31 for %q\n%s", got, ansi.Strip(line), card)
-		}
 	}
 }
 

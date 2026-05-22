@@ -17,7 +17,7 @@ type taskCardLine struct {
 
 const taskCardLineCount = 4
 
-func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) string {
+func renderTaskCard(task TaskProject, width int, now time.Time) string {
 	width = max(12, width)
 	bodyWidth := max(8, width-2)
 	var lines []taskCardLine
@@ -54,16 +54,6 @@ func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) s
 	if len(lines) > taskCardLineCount {
 		lines = lines[:taskCardLineCount]
 	}
-	if selected {
-		selectedLines := make([]string, 0, len(lines))
-		lineWidth := selectedTaskCardLineWidth(bodyWidth)
-		for _, line := range lines {
-			text := taskCardLineText(line.text)
-			text = scrollDisplay(text, lineWidth, now)
-			selectedLines = append(selectedLines, selectedStyle.Render(padDisplay(text, lineWidth)))
-		}
-		return strings.Join(selectedLines, "\n")
-	}
 	rendered := make([]string, 0, len(lines))
 	for _, line := range lines {
 		text := truncateDisplay(taskCardLineText(line.text), bodyWidth)
@@ -75,65 +65,16 @@ func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) s
 	return strings.Join(rendered, "\n")
 }
 
-func selectedTaskCardLineWidth(width int) int {
-	return max(1, width-1)
-}
-
-func padDisplay(value string, width int) string {
-	value = truncateDisplay(value, width)
-	if extra := width - lipgloss.Width(value); extra > 0 {
-		return value + strings.Repeat(" ", extra)
-	}
-	return value
+func renderSelectedIndicator(width int) string {
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#4488FF")).
+		Width(width).
+		Align(lipgloss.Center).
+		Render("▼")
 }
 
 func taskCardLineText(value string) string {
 	return strings.Join(strings.Fields(value), " ")
-}
-
-func scrollDisplay(value string, width int, now time.Time) string {
-	if width <= 0 || lipgloss.Width(value) <= width {
-		return value
-	}
-	if now.IsZero() {
-		return truncateDisplay(value, width)
-	}
-	gap := "   "
-	cycle := value + gap
-	cycleWidth := lipgloss.Width(cycle)
-	if cycleWidth <= 0 {
-		return truncateDisplay(value, width)
-	}
-	offset := int(now.UnixNano()/int64(300*time.Millisecond)) % cycleWidth
-	return displayWindow(cycle+value, offset, width)
-}
-
-func displayWindow(value string, offset, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	runes := []rune(value)
-	current := 0
-	start := 0
-	for start < len(runes) {
-		runeWidth := lipgloss.Width(string(runes[start]))
-		if current+runeWidth > offset {
-			break
-		}
-		current += runeWidth
-		start++
-	}
-	var builder strings.Builder
-	current = 0
-	for _, r := range runes[start:] {
-		runeWidth := lipgloss.Width(string(r))
-		if current+runeWidth > width {
-			break
-		}
-		builder.WriteRune(r)
-		current += runeWidth
-	}
-	return builder.String()
 }
 
 func taskHasGitSyncStatus(task TaskProject) bool {
