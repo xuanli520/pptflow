@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
 
@@ -243,6 +244,33 @@ func TestTaskBoardLongSelectedGitErrorDoesNotOverflow(t *testing.T) {
 	}
 	if got := lipgloss.Height(view); got > 18 {
 		t.Fatalf("task board height = %d, want <= 18\n%s", got, view)
+	}
+}
+
+func TestTaskBoardActiveJobStageOverridesPersistedFailure(t *testing.T) {
+	view := tuiapp.NewTestHarness(config.Default()).
+		SeedTaskBoardForTest([]tuiapp.TaskProject{{
+			ID:            "TASK-20260508-F28578",
+			TaskState:     model.TaskInspecting,
+			FailedStage:   "A",
+			FailedSummary: "run_validate.py exited with code 1",
+			CurrentStatus: model.StageFailed,
+		}}).
+		SetFocus("task-board").
+		SetSize(82, 30).
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:        "job-1",
+			TaskID:       "TASK-20260508-F28578",
+			State:        scheduler.JobRunning,
+			CurrentStage: "D",
+			Stages: []model.StageRecord{
+				{Stage: "A", Status: model.StageFailed, ErrorSummary: "run_validate.py exited with code 1"},
+				{Stage: "D", Status: model.StageRunning},
+			},
+		}}).
+		View()
+	if !strings.Contains(view, "D: 测试有效性静态审查") || strings.Contains(view, "✗ 失败") {
+		t.Fatalf("active job stage should drive task board card:\n%s", view)
 	}
 }
 

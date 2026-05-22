@@ -79,8 +79,11 @@ func TestSelectedTaskCardUsesFullWidthHighlight(t *testing.T) {
 		if strings.Contains(line, "\x1b[31m") || strings.Contains(line, "\x1b[90m") {
 			t.Fatalf("selected card should not nest inner ANSI colors:\n%q", card)
 		}
-		if got := lipgloss.Width(ansi.Strip(line)); got != 32 {
-			t.Fatalf("selected line width = %d, want 32 for %q\n%s", got, ansi.Strip(line), card)
+		if got := lipgloss.Width(ansi.Strip(line)); got != 31 {
+			t.Fatalf("selected line width = %d, want 31 for %q\n%s", got, ansi.Strip(line), card)
+		}
+		if got := ansi.StringWidth(line); got != 31 {
+			t.Fatalf("selected ansi line width = %d, want 31 for %q\n%s", got, ansi.Strip(line), card)
 		}
 	}
 }
@@ -106,6 +109,21 @@ func TestTaskCardShowsRunningProgressAndFailedStage(t *testing.T) {
 	}, 38, time.Time{})
 	if !strings.Contains(failed, "D: 测试有效性静态审查") || !strings.Contains(failed, "✗ 失败: Codex 不可用") {
 		t.Fatalf("failed card missing stage detail:\n%s", failed)
+	}
+}
+
+func TestTaskCardCurrentStageOverridesPreviousFailure(t *testing.T) {
+	card := tuiapp.TaskCardForTest(tuiapp.TaskProject{
+		ID:            "TASK-20260521-ABCDEF",
+		TaskState:     model.TaskInspecting,
+		RunStatus:     model.RunRunning,
+		CurrentStage:  "D",
+		CurrentStatus: model.StageRunning,
+		FailedStage:   "A",
+		FailedSummary: "run_validate.py exited with code 1",
+	}, 38, time.Time{})
+	if !strings.Contains(card, "D: 测试有效性静态审查") || strings.Contains(card, "✗ 失败") {
+		t.Fatalf("running stage should override previous failure:\n%s", card)
 	}
 }
 

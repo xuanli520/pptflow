@@ -56,10 +56,11 @@ func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) s
 	}
 	if selected {
 		selectedLines := make([]string, 0, len(lines))
+		lineWidth := selectedTaskCardLineWidth(bodyWidth)
 		for _, line := range lines {
 			text := taskCardLineText(line.text)
-			text = scrollDisplay(text, bodyWidth, now)
-			selectedLines = append(selectedLines, selectedStyle.Render(padDisplay(text, bodyWidth)))
+			text = scrollDisplay(text, lineWidth, now)
+			selectedLines = append(selectedLines, selectedStyle.Render(padDisplay(text, lineWidth)))
 		}
 		return strings.Join(selectedLines, "\n")
 	}
@@ -72,6 +73,10 @@ func renderTaskCard(task TaskProject, selected bool, width int, now time.Time) s
 		rendered = append(rendered, text)
 	}
 	return strings.Join(rendered, "\n")
+}
+
+func selectedTaskCardLineWidth(width int) int {
+	return max(1, width-1)
 }
 
 func padDisplay(value string, width int) string {
@@ -151,6 +156,13 @@ func inspectingTaskLines(task TaskProject, width int) []taskCardLine {
 		}
 		return []taskCardLine{{text: "[Git 同步中] " + phase}}
 	}
+	if task.RunStatus == model.RunRunning && (task.CurrentStatus == model.StageRunning || strings.TrimSpace(task.CurrentStage) != "") {
+		stage := firstNonEmpty(task.CurrentStage, "运行中")
+		return []taskCardLine{
+			{text: compactStageLabel(stage)},
+			{text: progressBar(stageProgressPercent(stage), width)},
+		}
+	}
 	if task.CurrentStatus == model.StageFailed || task.CurrentStatus == model.StageBlocked || strings.TrimSpace(task.FailedStage) != "" {
 		stage := firstNonEmpty(task.FailedStage, task.CurrentStage)
 		lines := []taskCardLine{{text: compactStageLabel(stage)}}
@@ -162,10 +174,9 @@ func inspectingTaskLines(task TaskProject, width int) []taskCardLine {
 		return lines
 	}
 	if task.RunStatus == model.RunRunning {
-		stage := firstNonEmpty(task.CurrentStage, "运行中")
 		return []taskCardLine{
-			{text: compactStageLabel(stage)},
-			{text: progressBar(stageProgressPercent(stage), width)},
+			{text: "运行中"},
+			{text: progressBar(5, width)},
 		}
 	}
 	return []taskCardLine{{text: "[Git 同步中]", style: mutedStyle, styled: true}}
