@@ -232,7 +232,7 @@ func CleanupCheckpointPathForTest(scanPath string) string {
 }
 
 func TaskCardForTest(task TaskProject, width int, now time.Time) string {
-	return renderTaskCard(task, width, now)
+	return renderTaskCard(task, width, now, false)
 }
 
 func TaskBoardViewForTest(width, height int, inspecting, waiting, completed []TaskProject) string {

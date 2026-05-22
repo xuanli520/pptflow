@@ -300,7 +300,7 @@ func taskCardWindowLines(items []TaskProject, start, cursor int, focused bool, w
 	includesCursor := false
 	for index := start; index < len(items); index++ {
 		isSelected := focused && index == cursor
-		card := renderTaskCard(items[index], width, now)
+		card := renderTaskCard(items[index], width, now, isSelected)
 		cardLines := strings.Split(card, "\n")
 		needed := len(cardLines)
 		if isSelected {

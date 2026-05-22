@@ -367,8 +367,12 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		*cmds = append(*cmds, cmd)
 		return true
 	case TaskInputSubmitMsg:
-		m.message = "正在创建质检任务 " + value.TaskID
-		*cmds = append(*cmds, m.taskActionCmd("start", value.TaskID))
+		m.overview.selectedID = value.TaskID
+		m.focusManager.Pop()
+		m.taskInputFocusCaptured = false
+		m.taskInput.Blur()
+		m.setFocus(focusTaskBoard)
+		m.openRunConfig()
 		return true
 	case taskActionMsg:
 		if value.err != nil {

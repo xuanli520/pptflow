@@ -17,7 +17,7 @@ type taskCardLine struct {
 
 const taskCardLineCount = 4
 
-func renderTaskCard(task TaskProject, width int, now time.Time) string {
+func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool) string {
 	width = max(12, width)
 	bodyWidth := max(8, width-2)
 	var lines []taskCardLine
@@ -46,7 +46,11 @@ func renderTaskCard(task TaskProject, width int, now time.Time) string {
 		}
 	}
 	if len(lines) < taskCardLineCount {
-		lines = append(lines, taskCardLine{text: strings.Repeat("─", min(bodyWidth, 28)), style: mutedStyle, styled: true})
+		if isSelected {
+			lines = append(lines, taskCardLine{text: renderGradientBar(bodyWidth)})
+		} else {
+			lines = append(lines, taskCardLine{text: strings.Repeat("─", min(bodyWidth, 28)), style: mutedStyle, styled: true})
+		}
 	}
 	for len(lines) < taskCardLineCount {
 		lines = append(lines, taskCardLine{})
@@ -69,7 +73,7 @@ func renderSelectedIndicator(width int) string {
 	return lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#4488FF")).
 		Width(width).
-		Align(lipgloss.Center).
+		Align(lipgloss.Left).
 		Render("▼")
 }
 
@@ -204,6 +208,34 @@ func progressBar(percent int, width int) string {
 	filled := barWidth * percent / 100
 	bar := "[" + strings.Repeat("▓", filled) + strings.Repeat("░", barWidth-filled) + "]"
 	return truncateDisplay(bar+label, width)
+}
+
+var gradientColors = []string{
+	"#c1ff72", "#b1f186", "#a2e49a", "#92d6ae",
+	"#83c9c2", "#73bbd7", "#64aeeb", "#54a0ff",
+}
+
+func renderGradientBar(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	segCount := len(gradientColors)
+	segWidth := width / segCount
+	remainder := width % segCount
+	var bar strings.Builder
+	for i := 0; i < segCount; i++ {
+		w := segWidth
+		if i < remainder {
+			w++
+		}
+		if w <= 0 {
+			continue
+		}
+		bar.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color(gradientColors[i])).
+			Render(strings.Repeat("█", w)))
+	}
+	return bar.String()
 }
 
 func stageProgressPercent(stage string) int {

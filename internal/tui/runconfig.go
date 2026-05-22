@@ -56,12 +56,23 @@ func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, 
 		keepRuntime:   keepRuntime,
 		attachedCount: attachedCount,
 		input:         input,
+		stages:        stagesExcludingE(),
 	}
-	if cfg.mode == "recheck" {
-		cfg.stages = stageSet(affectedStages(selectedStage))
+	if mode == "recheck" {
+		recheckStages := stageSet(affectedStages(selectedStage))
+		delete(recheckStages, string(model.StageE))
+		if len(recheckStages) > 0 {
+			cfg.stages = recheckStages
+		}
 	}
 	cfg.syncInputFocus()
 	return cfg
+}
+
+func stagesExcludingE() map[string]bool {
+	stages := stageSet(model.AllStages())
+	delete(stages, string(model.StageE))
+	return stages
 }
 
 func (c *runConfig) syncInputFocus() {
@@ -153,13 +164,14 @@ func (m *app) toggleRunConfigFocused() {
 		if m.runConfig.mode == "recheck" {
 			m.runConfig.mode = "initial"
 			m.runConfig.refRun = ""
-			m.runConfig.stages = nil
+			m.runConfig.stages = stagesExcludingE()
 		} else {
 			m.runConfig.mode = "recheck"
 			m.syncRefSelection()
 			m.runConfig.refRun = m.selectedRefRunCandidate()
 			if m.runConfig.fromStage == "" {
 				m.runConfig.stages = stageSet(affectedStages(m.rerunStageKey()))
+				delete(m.runConfig.stages, string(model.StageE))
 			}
 		}
 	case runConfigFocusStages:
@@ -168,7 +180,7 @@ func (m *app) toggleRunConfigFocused() {
 			return
 		}
 		if m.runConfig.stages == nil {
-			m.runConfig.stages = defaultStageSet(m.runConfig.mode, m.rerunStageKey(), m.cfg.Pipeline.StaticOnly)
+			m.runConfig.stages = stagesExcludingE()
 		}
 		stage := m.runConfig.selectedStage()
 		m.runConfig.stages[stage] = !m.runConfig.stages[stage]
@@ -206,6 +218,10 @@ func (m *app) attachRunConfigDoc() {
 func (m *app) submitRunConfig() tea.Cmd {
 	if m.runConfig.taskID == "" {
 		m.runConfig.err = "未选择任务"
+		return nil
+	}
+	if m.runConfig.attachedCount == 0 {
+		m.runConfig.err = "必须附加至少1个参考文档"
 		return nil
 	}
 	if m.runConfig.mode == "recheck" && strings.TrimSpace(m.runConfig.refRun) == "" {
