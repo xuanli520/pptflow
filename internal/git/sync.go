@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
+	"github.com/xuanli520/p2r_tui/internal/projectlayout"
 )
 
 const cloneDoneMarker = ".qa-clone-done"
@@ -56,34 +57,81 @@ func (s *Syncer) Sync(ctx context.Context, taskID, batchID, gitURL string, onPro
 		defer cancel()
 	}
 
-	clonePath := filepath.Join(s.basePath(), batch, task)
-	repoPath := filepath.Join(clonePath, task)
-	for _, path := range []string{clonePath, repoPath} {
+	taskPath := filepath.Join(s.basePath(), batch, task)
+	repoPath := filepath.Join(taskPath, task)
+	for _, path := range []string{taskPath, repoPath} {
 		if err := s.ensureUnderBase(path); err != nil {
 			return nil, err
 		}
 	}
 
-	markerPath := filepath.Join(clonePath, cloneDoneMarker)
-	if _, err := os.Stat(markerPath); err == nil {
-		return s.forcePull(ctx, clonePath, repoPath, markerPath, onProgress)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	markerPath := filepath.Join(taskPath, cloneDoneMarker)
+	if _, err := os.Stat(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("stat clone marker: %w", err)
 	}
-	if s.existingClone(clonePath, repoPath) {
-		return s.forcePull(ctx, clonePath, repoPath, markerPath, onProgress)
+	if s.existingClone(repoPath) {
+		return s.forcePull(ctx, repoPath, repoPath, markerPath, onProgress)
 	}
-	return s.clone(ctx, clonePath, repoPath, markerPath, gitURL, onProgress)
+	if err := s.discardIncompleteClone(taskPath, onProgress); err != nil {
+		return nil, err
+	}
+	return s.clone(ctx, repoPath, repoPath, markerPath, gitURL, onProgress)
 }
 
-func (s *Syncer) existingClone(clonePath, repoPath string) bool {
-	if info, err := os.Stat(filepath.Join(clonePath, ".git")); err != nil || !info.IsDir() {
+func (s *Syncer) existingClone(repoPath string) bool {
+	if info, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil || !info.IsDir() {
 		return false
 	}
 	if info, err := os.Stat(repoPath); err != nil || !info.IsDir() {
 		return false
 	}
 	return true
+}
+
+func (s *Syncer) discardIncompleteClone(clonePath string, onProgress SyncCallback) error {
+	info, err := os.Stat(clonePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat incomplete clone target: %w", err)
+	}
+	if info.IsDir() {
+		empty, err := dirIsEmpty(clonePath)
+		if err != nil {
+			return err
+		}
+		if empty {
+			return nil
+		}
+	}
+	if err := s.ensureRemovableCloneTarget(clonePath); err != nil {
+		return err
+	}
+	emit(onProgress, "cleanup", -1, "removing incomplete clone")
+	if err := os.RemoveAll(clonePath); err != nil {
+		return fmt.Errorf("remove incomplete clone target: %w", err)
+	}
+	return nil
+}
+
+func (s *Syncer) ensureRemovableCloneTarget(path string) error {
+	if err := s.ensureUnderBase(path); err != nil {
+		return err
+	}
+	base := s.basePath()
+	target := absClean(path)
+	if target == base {
+		return fmt.Errorf("refuse to remove clone base path %s", base)
+	}
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return fmt.Errorf("validate removable clone target %s under %s: %w", target, base, err)
+	}
+	if len(strings.Split(rel, string(filepath.Separator))) < 2 {
+		return fmt.Errorf("refuse to remove clone target outside batch/task scope: %s", target)
+	}
+	return nil
 }
 
 func (s *Syncer) clone(ctx context.Context, clonePath, repoPath, markerPath, gitURL string, onProgress SyncCallback) (*SyncResult, error) {
@@ -111,10 +159,13 @@ func (s *Syncer) clone(ctx context.Context, clonePath, repoPath, markerPath, git
 	if err := s.runGit(ctx, "", args...); err != nil {
 		return nil, err
 	}
-	if err := s.verifyClone(clonePath, repoPath); err != nil {
+	if err := s.verifyGitRepo(clonePath); err != nil {
 		return nil, err
 	}
 	if err := s.afterSync(ctx, clonePath); err != nil {
+		return nil, err
+	}
+	if err := s.verifyDeliveryPackage(repoPath); err != nil {
 		return nil, err
 	}
 	commit, err := s.currentCommit(ctx, clonePath)
@@ -130,7 +181,7 @@ func (s *Syncer) clone(ctx context.Context, clonePath, repoPath, markerPath, git
 
 func (s *Syncer) forcePull(ctx context.Context, clonePath, repoPath, markerPath string, onProgress SyncCallback) (*SyncResult, error) {
 	emit(onProgress, "fetch", -1, "fetching updates")
-	if err := s.verifyClone(clonePath, repoPath); err != nil {
+	if err := s.verifyGitRepo(clonePath); err != nil {
 		return nil, err
 	}
 	stashMessage := "auto-stash-before-force-pull-" + time.Now().UTC().Format("20060102T150405Z")
@@ -154,10 +205,10 @@ func (s *Syncer) forcePull(ctx context.Context, clonePath, repoPath, markerPath 
 	if err := s.runGit(ctx, clonePath, "clean", "-fdx"); err != nil {
 		return nil, err
 	}
-	if err := s.verifyClone(clonePath, repoPath); err != nil {
+	if err := s.afterSync(ctx, clonePath); err != nil {
 		return nil, err
 	}
-	if err := s.afterSync(ctx, clonePath); err != nil {
+	if err := s.verifyClone(clonePath, repoPath); err != nil {
 		return nil, err
 	}
 	commit, err := s.currentCommit(ctx, clonePath)
@@ -186,17 +237,32 @@ func (s *Syncer) afterSync(ctx context.Context, clonePath string) error {
 }
 
 func (s *Syncer) verifyClone(clonePath, repoPath string) error {
+	if err := s.verifyGitRepo(clonePath); err != nil {
+		return err
+	}
+	return s.verifyDeliveryPackage(repoPath)
+}
+
+func (s *Syncer) verifyGitRepo(clonePath string) error {
 	if info, err := os.Stat(filepath.Join(clonePath, ".git")); err != nil || !info.IsDir() {
 		if err == nil {
 			err = errors.New(".git is not a directory")
 		}
 		return fmt.Errorf("verify clone: %w", err)
 	}
+	return nil
+}
+
+func (s *Syncer) verifyDeliveryPackage(repoPath string) error {
 	if info, err := os.Stat(repoPath); err != nil || !info.IsDir() {
 		if err == nil {
 			err = errors.New("delivery package is not a directory")
 		}
 		return fmt.Errorf("verify delivery package %s: %w", repoPath, err)
+	}
+	validation := projectlayout.ValidatePackageRoot(repoPath)
+	if !validation.Valid {
+		return fmt.Errorf("verify delivery package %s: missing %s", repoPath, strings.Join(validation.Missing, ", "))
 	}
 	return nil
 }

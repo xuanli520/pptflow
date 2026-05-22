@@ -90,7 +90,7 @@ func TestSyncForcePullResetsAndCleansExistingClone(t *testing.T) {
 	}
 }
 
-func TestSyncForcePullsExistingCloneWithoutMarker(t *testing.T) {
+func TestSyncRepairsCompletedCloneWithoutMarker(t *testing.T) {
 	requireGit(t)
 	taskID := "TASK-20260521-NOMARK"
 	batchID := "batch-1"
@@ -107,7 +107,10 @@ func TestSyncForcePullsExistingCloneWithoutMarker(t *testing.T) {
 	}
 	updateRemoteRepo(t, workPath, taskID, "v2")
 
-	second, err := syncer.Sync(context.Background(), taskID, batchID, remotePath, nil)
+	var events []gitsync.SyncProgress
+	second, err := syncer.Sync(context.Background(), taskID, batchID, remotePath, func(progress gitsync.SyncProgress) {
+		events = append(events, progress)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +119,70 @@ func TestSyncForcePullsExistingCloneWithoutMarker(t *testing.T) {
 	}
 	assertFileContains(t, filepath.Join(second.RepoPath, "metadata.json"), "v2")
 	assertFileContains(t, filepath.Join(basePath, batchID, taskID, ".qa-clone-done"), "commit="+second.Commit)
+	if !hasPhase(events, "force-pull") {
+		t.Fatalf("completed clone without marker should be repaired by force-pull, got %#v", events)
+	}
+}
+
+func TestSyncReplacesIncompleteCloneTargetWithoutMarker(t *testing.T) {
+	requireGit(t)
+	taskID := "TASK-20260521-PARTIAL"
+	batchID := "batch-1"
+	remotePath, _ := createRemoteRepo(t, taskID, "v1")
+	basePath := filepath.Join(t.TempDir(), "projects-qa")
+	clonePath := filepath.Join(basePath, batchID, taskID)
+	if err := os.MkdirAll(clonePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clonePath, "partial.tmp"), []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	syncer := gitsync.NewSyncer(basePath, config.GitConfig{CloneTimeout: 10 * time.Second})
+
+	var events []gitsync.SyncProgress
+	result, err := syncer.Sync(context.Background(), taskID, batchID, remotePath, func(progress gitsync.SyncProgress) {
+		events = append(events, progress)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Operation != "clone" {
+		t.Fatalf("operation = %s, want clone", result.Operation)
+	}
+	assertFileContains(t, filepath.Join(result.RepoPath, "metadata.json"), "v1")
+	if _, err := os.Stat(filepath.Join(clonePath, "partial.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("partial clone residue should be removed, stat err=%v", err)
+	}
+	if !hasPhase(events, "cleanup") || !hasPhase(events, "clone") {
+		t.Fatalf("expected cleanup and clone phases, got %#v", events)
+	}
+}
+
+func TestSyncReplacesLegacyOuterCloneTarget(t *testing.T) {
+	requireGit(t)
+	taskID := "TASK-20260521-LEGACY"
+	batchID := "batch-1"
+	remotePath, _ := createRemoteRepo(t, taskID, "v1")
+	basePath := filepath.Join(t.TempDir(), "projects-qa")
+	legacyPath := filepath.Join(basePath, batchID, taskID)
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, filepath.Dir(legacyPath), "clone", remotePath, legacyPath)
+	syncer := gitsync.NewSyncer(basePath, config.GitConfig{CloneTimeout: 10 * time.Second})
+
+	result, err := syncer.Sync(context.Background(), taskID, batchID, remotePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantRepoPath := filepath.Join(basePath, batchID, taskID, taskID)
+	if result.RepoPath != wantRepoPath || result.ClonePath != wantRepoPath {
+		t.Fatalf("legacy clone should be replaced by inner clone, got %#v want %s", result, wantRepoPath)
+	}
+	assertFileContains(t, filepath.Join(result.RepoPath, "metadata.json"), "v1")
+	assertFileContains(t, filepath.Join(basePath, batchID, taskID, ".qa-clone-done"), "commit="+result.Commit)
 }
 
 func TestSyncRejectsPathTraversal(t *testing.T) {
@@ -201,12 +268,23 @@ func updateRemoteRepo(t *testing.T, workPath, taskID, version string) {
 
 func writePackageVersion(t *testing.T, workPath, taskID, version string) {
 	t.Helper()
-	packagePath := filepath.Join(workPath, taskID)
-	if err := os.MkdirAll(packagePath, 0o755); err != nil {
+	for _, path := range []string{
+		filepath.Join("docs", "readme.txt"),
+		filepath.Join("repo", "app.txt"),
+		filepath.Join("docs", "original-session", "session.txt"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(workPath, path)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workPath, path), []byte(version+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(workPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	content := []byte(`{"version":"` + version + `"}` + "\n")
-	if err := os.WriteFile(filepath.Join(packagePath, "metadata.json"), content, 0o644); err != nil {
+	content := []byte(`{"task_id":"` + taskID + `","prompt":"build it","version":"` + version + `"}` + "\n")
+	if err := os.WriteFile(filepath.Join(workPath, "metadata.json"), content, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

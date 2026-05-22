@@ -228,6 +228,24 @@ func TestTaskBoardShortViewportDoesNotOverflow(t *testing.T) {
 	}
 }
 
+func TestTaskBoardLongSelectedGitErrorDoesNotOverflow(t *testing.T) {
+	view := tuiapp.TaskBoardViewForTest(120, 18,
+		[]tuiapp.TaskProject{{
+			ID:        "TASK-20260508-771E08",
+			TaskState: model.TaskInspecting,
+			SyncError: "verify delivery package /home/purplevoid88/projects-qa/batch-1/TASK-20260508-771E08/TASK-20260508-771E08: stat /home/purplevoid88/projects-qa/batch-1/TASK-20260508-771E08/TASK-20260508-771E08: no such file or directory",
+		}},
+		nil,
+		nil,
+	)
+	if got := lipgloss.Width(view); got > 120 {
+		t.Fatalf("task board width = %d, want <= 120\n%s", got, view)
+	}
+	if got := lipgloss.Height(view); got > 18 {
+		t.Fatalf("task board height = %d, want <= 18\n%s", got, view)
+	}
+}
+
 func TestRunConfigDialogFitsNarrowShortViewport(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedExecutionDetail("TASK-1").
