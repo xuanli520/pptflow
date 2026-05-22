@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -158,7 +159,51 @@ func composeMetaFromRuntime(runtime RuntimeState) model.ComposeMeta {
 		Project:      runtime.ComposeProject,
 		ComposeFiles: append([]string(nil), runtime.ComposeFiles...),
 		WorkDir:      runtime.WorkDir,
+		Ports:        servicePortsFromRuntime(runtime),
 	}
+}
+
+func servicePortsFromRuntime(runtime RuntimeState) []model.ServicePort {
+	names := append([]string(nil), runtime.Services...)
+	seen := map[string]bool{}
+	for _, name := range names {
+		seen[name] = true
+	}
+	var extra []string
+	for name := range runtime.Mappings {
+		if !seen[name] {
+			extra = append(extra, name)
+		}
+	}
+	sort.Strings(extra)
+	names = append(names, extra...)
+	var ports []model.ServicePort
+	for _, service := range names {
+		for _, mapping := range runtime.Mappings[service] {
+			if mapping.Host == 0 {
+				continue
+			}
+			ports = append(ports, model.ServicePort{
+				Service:   service,
+				URL:       servicePortURL(mapping),
+				Host:      mapping.Host,
+				Container: mapping.Container,
+				Protocol:  mapping.Protocol,
+			})
+		}
+	}
+	return ports
+}
+
+func servicePortURL(mapping portMapping) string {
+	if mapping.Host == 0 {
+		return ""
+	}
+	scheme := "http"
+	if mapping.Container == 443 || mapping.Host == 443 {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, normalizeHost(mapping.URL), mapping.Host)
 }
 
 func firstFrontendURL(runtime RuntimeState) string {

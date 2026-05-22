@@ -463,6 +463,14 @@ func (s *runState) finishRun(r Runner) (Result, error, bool) {
 	if result, err, aborted := s.abortIfCancelled(r); aborted {
 		return result, err, true
 	}
+	if status == model.RunCompletedClean || status == model.RunCompletedWithFindings {
+		if result, err, aborted := s.pauseWaitingRuntime(r); aborted || err != nil {
+			return result, err, aborted
+		}
+		if s.execution.cleanupFailed {
+			status = model.RunCompletedWithFindings
+		}
+	}
 	if err := r.store.FinishRun(s.prepare.ctx, s.identity.runID, s.prepare.taskID, status, time.Since(s.identity.start)); err != nil {
 		return s.abortOrError(r, err)
 	}
@@ -472,6 +480,43 @@ func (s *runState) finishRun(r Runner) (Result, error, bool) {
 	s.execution.run.DurationMS = time.Since(s.identity.start).Milliseconds()
 	s.prepare.progress(RunProgress{RunID: s.identity.runID, Event: EventRunDone, Done: true})
 	return Result{Run: s.execution.run, Stages: s.execution.stages}, nil, false
+}
+
+type taskDockerStopMarker interface {
+	MarkTaskDockerStopped(context.Context, string) error
+}
+
+func (s *runState) pauseWaitingRuntime(r Runner) (Result, error, bool) {
+	if s.execution.runtimeCleanupDone || !s.execution.runtime.HasCleanupTarget() {
+		return Result{}, nil, false
+	}
+	outcome := r.finalizeRuntime(
+		s.prepare.ctx,
+		s.execution.run,
+		s.execution.stages,
+		s.execution.runtime,
+		false,
+		"waiting_manual_pause",
+	)
+	if outcome.Summary.Status == "failed" {
+		s.execution.cleanupFailed = true
+	}
+	if err := cleanupPersistError(outcome); err != nil {
+		return s.abortOrError(r, err)
+	}
+	s.execution.runtimeCleanupDone = outcome.RuntimeCleanupDone
+	if outcome.Summary.Status != "failed" {
+		if marker, ok := r.store.(taskDockerStopMarker); ok && marker != nil {
+			if err := marker.MarkTaskDockerStopped(s.prepare.ctx, s.prepare.taskID); err != nil {
+				return s.abortOrError(r, err)
+			}
+		}
+	}
+	s.prepare.progress(RunProgress{RunID: s.identity.runID, Event: EventCleanup})
+	if result, err, aborted := s.abortIfCancelled(r); aborted {
+		return result, err, true
+	}
+	return Result{}, nil, false
 }
 
 func (s *runState) abortIfCancelled(r Runner) (Result, error, bool) {

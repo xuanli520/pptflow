@@ -16,7 +16,10 @@ docker:
     health_check_timeout_seconds: 60
     keep_failed_containers_minutes: 60
     managed_label: managed_by=p2rqa
-pipeline:
+pipeline:                                                                                                
+    default_stages:                                                                                                 
+        initial: [A, D, F]                                                                                            
+        recheck: [F]
     max_concurrent: 10
     self_test_report_path: repo/self_test_report.md
     stage_timeouts:

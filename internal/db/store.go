@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -95,7 +96,13 @@ type ArtifactPruneResult struct {
 	Skipped []ArtifactPruneItem
 }
 
-const defaultBatchMaxTasks = 20
+const (
+	defaultBatchMaxTasks    = 20
+	ActiveTaskStateLimit    = 10
+	CompletedTaskStateLimit = 10
+)
+
+var ErrInspectingTaskLimit = errors.New("开始质检已达到 10 道上限")
 
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -216,6 +223,9 @@ func (s *Store) CreateTaskWithBatch(ctx context.Context, taskID, gitURL, scanPat
 		if exists {
 			return fmt.Errorf("task already exists: %s", taskID)
 		}
+		if err := requireInspectingCapacityTx(ctx, tx); err != nil {
+			return err
+		}
 		batch, err := selectWritableBatch(ctx, tx, now)
 		if err != nil {
 			return err
@@ -254,12 +264,18 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (model.Task, error) 
 }
 
 func (s *Store) ListTasksByState(ctx context.Context, state string) ([]model.Task, error) {
-	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+` WHERE state = ? ORDER BY updated_at DESC, id ASC`, state)
+	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+` WHERE state = ? AND COALESCE(archived_at, '') = '' ORDER BY updated_at DESC, id ASC`, state)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanTasks(rows)
+}
+
+func (s *Store) CountTasksByState(ctx context.Context, state string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE state = ? AND COALESCE(archived_at, '') = ''`, state).Scan(&count)
+	return count, err
 }
 
 func (s *Store) ListTasksWithDockerRunning(ctx context.Context) ([]model.Task, error) {
@@ -289,8 +305,11 @@ func (s *Store) RecordTaskGitError(ctx context.Context, taskID string, syncErr e
 func (s *Store) ReopenTaskForInspection(ctx context.Context, taskID string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := requireInspectingCapacityTx(ctx, tx); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `UPDATE tasks
-			SET state = ?, current_run_id = NULL, frontend_url = '', docker_running = 0, compose_meta = '', entered_waiting_at = '', sync_error = '', updated_at = ?
+			SET state = ?, current_run_id = NULL, frontend_url = '', docker_running = 0, compose_meta = '', entered_waiting_at = '', archived_at = '', sync_error = '', updated_at = ?
 			WHERE id = ? AND state = ? AND current_run_id IS NULL`,
 			model.TaskInspecting, now, taskID, model.TaskCompleted)
 		if err != nil {
@@ -333,6 +352,9 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string) (model.Task, er
 		if err := requireAffected(result, "waiting task", taskID); err != nil {
 			return err
 		}
+		if err := archiveCompletedOverflowTx(ctx, tx, now); err != nil {
+			return err
+		}
 		task, err = getTaskTx(ctx, tx, taskID)
 		return err
 	})
@@ -373,6 +395,9 @@ func (s *Store) RepairTaskStates(ctx context.Context) error {
 			)`,
 			model.TaskCompleted, now, model.TaskInspecting, model.RunAborted, model.RunCrashed)
 		if err != nil {
+			return err
+		}
+		if err := archiveCompletedOverflowTx(ctx, tx, now); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE tasks
@@ -908,8 +933,14 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 			return err
 		}
 		if taskExists {
-			if err := tx.QueryRowContext(ctx, `SELECT completion_count + 1 FROM tasks WHERE id = ?`, run.TaskID).Scan(&round); err != nil {
+			var state string
+			if err := tx.QueryRowContext(ctx, `SELECT state, completion_count + 1 FROM tasks WHERE id = ?`, run.TaskID).Scan(&state, &round); err != nil {
 				return err
+			}
+			if state != model.TaskInspecting {
+				if err := requireInspectingCapacityTx(ctx, tx); err != nil {
+					return err
+				}
 			}
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, duration_ms, artifact_root, tool_versions, prompt_versions, completion_round)
@@ -925,7 +956,7 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 		if taskExists {
 			now := time.Now().UTC().Format(time.RFC3339)
 			result, err := tx.ExecContext(ctx, `UPDATE tasks
-				SET current_run_id = ?, state = ?, sync_error = '', updated_at = ?
+				SET current_run_id = ?, state = ?, archived_at = '', sync_error = '', updated_at = ?
 				WHERE id = ? AND current_run_id IS NULL`,
 				run.RunID, model.TaskInspecting, now, run.TaskID)
 			if err != nil {
@@ -976,6 +1007,12 @@ func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, dur
 				return err
 			}
 			err = requireAffected(result, "active task", taskID)
+		}
+		if err != nil {
+			return err
+		}
+		if status == model.RunAborted || status == model.RunCrashed {
+			return archiveCompletedOverflowTx(ctx, tx, now)
 		}
 		return err
 	})
@@ -1226,7 +1263,7 @@ func nextBatchID(batches []model.Batch) string {
 func taskSelectSQL() string {
 	return `SELECT id, batch_id, git_url, repo_path, state, COALESCE(current_run_id, ''), completion_count,
 	       COALESCE(frontend_url, ''), docker_running, COALESCE(compose_meta, ''), COALESCE(entered_waiting_at, ''),
-	       COALESCE(last_completed_at, ''), COALESCE(sync_error, ''), created_at, updated_at
+	       COALESCE(last_completed_at, ''), COALESCE(archived_at, ''), COALESCE(sync_error, ''), created_at, updated_at
 	FROM tasks`
 }
 
@@ -1256,6 +1293,7 @@ func scanTask(row taskScanner) (model.Task, error) {
 		&composeMeta,
 		&task.EnteredWaitingAt,
 		&task.LastCompletedAt,
+		&task.ArchivedAt,
 		&task.SyncError,
 		&task.CreatedAt,
 		&task.UpdatedAt,
@@ -1291,8 +1329,57 @@ func taskExistsTx(ctx context.Context, tx *sql.Tx, taskID string) (bool, error) 
 	return err == nil, err
 }
 
+func countTasksByStateTx(ctx context.Context, tx *sql.Tx, state string) (int, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE state = ? AND COALESCE(archived_at, '') = ''`, state).Scan(&count)
+	return count, err
+}
+
+func requireInspectingCapacityTx(ctx context.Context, tx *sql.Tx) error {
+	count, err := countTasksByStateTx(ctx, tx, model.TaskInspecting)
+	if err != nil {
+		return err
+	}
+	if count >= ActiveTaskStateLimit {
+		return ErrInspectingTaskLimit
+	}
+	return nil
+}
+
+func archiveCompletedOverflowTx(ctx context.Context, tx *sql.Tx, now string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM tasks
+		WHERE state = ? AND COALESCE(archived_at, '') = ''
+		ORDER BY COALESCE(NULLIF(last_completed_at, ''), updated_at, created_at) ASC, id ASC
+		LIMIT (
+			SELECT MAX(COUNT(*) - ?, 0)
+			FROM tasks
+			WHERE state = ? AND COALESCE(archived_at, '') = ''
+		)`, model.TaskCompleted, CompletedTaskStateLimit, model.TaskCompleted)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET archived_at = ?, updated_at = ? WHERE id = ?`, now, now, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func marshalComposeMeta(meta model.ComposeMeta) (string, error) {
-	if strings.TrimSpace(meta.Project) == "" && len(meta.ComposeFiles) == 0 && strings.TrimSpace(meta.WorkDir) == "" {
+	if strings.TrimSpace(meta.Project) == "" && len(meta.ComposeFiles) == 0 && strings.TrimSpace(meta.WorkDir) == "" && len(meta.Ports) == 0 {
 		return "", nil
 	}
 	content, err := json.Marshal(meta)

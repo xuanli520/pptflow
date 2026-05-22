@@ -367,6 +367,14 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		*cmds = append(*cmds, cmd)
 		return true
 	case TaskInputSubmitMsg:
+		if m.taskBoard != nil && m.taskBoard.StateCount(model.TaskInspecting) >= db.ActiveTaskStateLimit {
+			m.message = db.ErrInspectingTaskLimit.Error()
+			m.taskInput.SetValue(value.TaskID)
+			m.taskInput.SetError(db.ErrInspectingTaskLimit.Error())
+			m.taskInput.Focus()
+			m.setFocus(focusTaskInput)
+			return true
+		}
 		m.overview.selectedID = value.TaskID
 		m.focusManager.Pop()
 		m.taskInputFocusCaptured = false
@@ -385,6 +393,8 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 				m.message = "已提交重新质检 " + value.taskID
 			case "retry-git":
 				m.message = "已重试 Git 同步 " + value.taskID
+			case "start-docker":
+				m.message = "已启动待处理服务 " + value.taskID
 			default:
 				m.message = "已提交质检 " + value.taskID
 			}
@@ -857,7 +867,11 @@ func (m app) taskActionCmd(action, taskID string) tea.Cmd {
 		if m.taskActionSvc == nil {
 			return taskActionMsg{action: action, taskID: taskID, err: fmt.Errorf("task service unavailable")}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		timeout := 10 * time.Second
+		if action == "complete" || action == "start-docker" {
+			timeout = 5 * time.Minute
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		var err error
 		switch action {
@@ -867,6 +881,8 @@ func (m app) taskActionCmd(action, taskID string) tea.Cmd {
 			err = m.taskActionSvc.ReInspect(ctx, taskID, pipeline.RunOptions{})
 		case "retry-git":
 			err = m.taskActionSvc.RetryGitSync(ctx, taskID)
+		case "start-docker":
+			err = m.taskActionSvc.StartDocker(ctx, taskID)
 		default:
 			err = m.taskActionSvc.StartInspection(ctx, taskID, pipeline.RunOptions{})
 		}

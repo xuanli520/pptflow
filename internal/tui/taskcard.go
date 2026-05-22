@@ -15,7 +15,7 @@ type taskCardLine struct {
 	styled bool
 }
 
-const taskCardLineCount = 4
+const taskCardMinLineCount = 4
 
 func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool) string {
 	width = max(12, width)
@@ -24,7 +24,7 @@ func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool)
 	lines = append(lines, taskCardLine{text: truncateMiddleDisplay(task.ID, bodyWidth)})
 	switch task.TaskState {
 	case model.TaskWaitingManual:
-		lines = append(lines, waitingTaskLine(task, bodyWidth))
+		lines = append(lines, waitingTaskLines(task, bodyWidth)...)
 		lines = append(lines, waitingDurationLine(task.EnteredWaitingAt, now, bodyWidth))
 	case model.TaskCompleted:
 		if taskHasGitSyncStatus(task) {
@@ -45,18 +45,15 @@ func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool)
 			lines = append(lines, taskCardLine{text: "Ctrl+W 重试", style: errorStyle, styled: true})
 		}
 	}
-	if len(lines) < taskCardLineCount {
+	if len(lines) < taskCardMinLineCount {
 		if isSelected {
 			lines = append(lines, taskCardLine{text: renderGradientBar(bodyWidth)})
 		} else {
 			lines = append(lines, taskCardLine{text: strings.Repeat("─", min(bodyWidth, 28)), style: mutedStyle, styled: true})
 		}
 	}
-	for len(lines) < taskCardLineCount {
+	for len(lines) < taskCardMinLineCount {
 		lines = append(lines, taskCardLine{})
-	}
-	if len(lines) > taskCardLineCount {
-		lines = lines[:taskCardLineCount]
 	}
 	rendered := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -139,15 +136,87 @@ func splitSyncErrorLog(value string) (string, string) {
 	return summary, logPath
 }
 
-func waitingTaskLine(task TaskProject, width int) taskCardLine {
+func waitingTaskLines(task TaskProject, width int) []taskCardLine {
+	if task.DockerRunning {
+		ports := waitingServicePorts(task)
+		if len(ports) > 0 {
+			return styledTaskLines(wrapTaskCardText("端口: "+strings.Join(ports, "  "), width), lipgloss.NewStyle().Foreground(lipgloss.Color("#4488FF")))
+		}
+	}
 	switch {
 	case task.DockerRunning && task.FrontendURL != "":
-		return taskCardLine{text: task.FrontendURL, style: lipgloss.NewStyle().Foreground(lipgloss.Color("#4488FF")), styled: true}
+		return []taskCardLine{{text: task.FrontendURL, style: lipgloss.NewStyle().Foreground(lipgloss.Color("#4488FF")), styled: true}}
 	case task.DockerRunning:
-		return taskCardLine{text: "! Docker 已启动，端口检测失败", style: lipgloss.NewStyle().Foreground(lipgloss.Color("#DDAA00")), styled: true}
+		return []taskCardLine{{text: "! Docker 已启动，端口检测失败", style: lipgloss.NewStyle().Foreground(lipgloss.Color("#DDAA00")), styled: true}}
+	case strings.TrimSpace(task.ComposeMeta.Project) != "":
+		return []taskCardLine{{text: "Docker 已停止，Ctrl+S 启动服务", style: mutedStyle, styled: true}}
 	default:
-		return taskCardLine{text: "✗ Docker 启动失败", style: errorStyle, styled: true}
+		return []taskCardLine{{text: "✗ Docker 启动失败", style: errorStyle, styled: true}}
 	}
+}
+
+func waitingServicePorts(task TaskProject) []string {
+	var result []string
+	seen := map[string]bool{}
+	for _, port := range task.ComposeMeta.Ports {
+		label := servicePortLabel(port)
+		if label == "" || seen[label] {
+			continue
+		}
+		seen[label] = true
+		result = append(result, label)
+	}
+	if len(result) == 0 && strings.TrimSpace(task.FrontendURL) != "" {
+		result = append(result, strings.TrimSpace(task.FrontendURL))
+	}
+	return result
+}
+
+func servicePortLabel(port model.ServicePort) string {
+	url := strings.TrimSpace(port.URL)
+	if url == "" && port.Host > 0 {
+		scheme := "http"
+		if port.Container == 443 || port.Host == 443 {
+			scheme = "https"
+		}
+		url = fmt.Sprintf("%s://localhost:%d", scheme, port.Host)
+	}
+	if url == "" {
+		return ""
+	}
+	service := strings.TrimSpace(port.Service)
+	if service == "" {
+		return url
+	}
+	return service + " " + url
+}
+
+func styledTaskLines(values []string, style lipgloss.Style) []taskCardLine {
+	lines := make([]taskCardLine, 0, len(values))
+	for _, value := range values {
+		lines = append(lines, taskCardLine{text: value, style: style, styled: true})
+	}
+	return lines
+}
+
+func wrapTaskCardText(value string, width int) []string {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return nil
+	}
+	var lines []string
+	line := fields[0]
+	for _, field := range fields[1:] {
+		next := line + " " + field
+		if lipgloss.Width(next) <= width {
+			line = next
+			continue
+		}
+		lines = append(lines, line)
+		line = field
+	}
+	lines = append(lines, line)
+	return lines
 }
 
 func waitingDuration(value string, now time.Time) string {

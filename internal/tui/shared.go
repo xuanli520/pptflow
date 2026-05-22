@@ -9,11 +9,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
@@ -63,6 +65,7 @@ type TaskActionService interface {
 	StartInspection(context.Context, string, pipeline.RunOptions) error
 	SubmitInspection(context.Context, string, pipeline.RunOptions) error
 	ReInspect(context.Context, string, pipeline.RunOptions) error
+	StartDocker(context.Context, string) error
 	ConfirmComplete(context.Context, string) error
 	RetryGitSync(context.Context, string) error
 }
@@ -214,6 +217,9 @@ func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string,
 	if err != nil {
 		return err
 	}
+	if err := s.ensureInspectingCapacity(ctx); err != nil {
+		return err
+	}
 	gitURL, err := taskGitURL(s.cfg.Git.BaseURL, taskID)
 	if err != nil {
 		return err
@@ -238,6 +244,9 @@ func (s dbTaskActionService) SubmitInspection(ctx context.Context, taskID string
 		if strings.TrimSpace(task.CurrentRunID) != "" {
 			return fmt.Errorf("task %s already has an active run", taskID)
 		}
+		if err := s.ensureInspectingCapacity(ctx); err != nil {
+			return err
+		}
 		return s.submitInspection(ctx, task, opts)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -261,6 +270,9 @@ func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string, opts 
 	if strings.TrimSpace(task.CurrentRunID) != "" {
 		return fmt.Errorf("task %s already has an active run", taskID)
 	}
+	if err := s.ensureInspectingCapacity(ctx); err != nil {
+		return err
+	}
 	return s.submitInspection(ctx, task, opts)
 }
 
@@ -280,11 +292,25 @@ func (s dbTaskActionService) RetryGitSync(ctx context.Context, taskID string) er
 		if strings.TrimSpace(task.CurrentRunID) != "" {
 			return fmt.Errorf("task %s already has an active run", taskID)
 		}
+		if err := s.ensureInspectingCapacity(ctx); err != nil {
+			return err
+		}
 	}
 	if strings.TrimSpace(task.SyncError) == "" {
 		return fmt.Errorf("task %s has no git sync error to retry", taskID)
 	}
 	return s.submitInspection(ctx, task, pipeline.RunOptions{})
+}
+
+func (s dbTaskActionService) ensureInspectingCapacity(ctx context.Context) error {
+	count, err := s.store.CountTasksByState(ctx, model.TaskInspecting)
+	if err != nil {
+		return err
+	}
+	if count >= db.ActiveTaskStateLimit {
+		return db.ErrInspectingTaskLimit
+	}
+	return nil
 }
 
 func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string) error {
@@ -310,6 +336,140 @@ func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string)
 	}
 	_, err = s.store.CompleteTask(ctx, taskID)
 	return err
+}
+
+func (s dbTaskActionService) StartDocker(ctx context.Context, taskID string) error {
+	taskID, err := ValidateTaskID(taskID)
+	if err != nil {
+		return err
+	}
+	task, err := s.store.GetTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if task.State != model.TaskWaitingManual {
+		return fmt.Errorf("task %s is not waiting manual", taskID)
+	}
+	if task.DockerRunning {
+		return nil
+	}
+	if strings.TrimSpace(task.ComposeMeta.Project) == "" || len(task.ComposeMeta.ComposeFiles) == 0 {
+		return fmt.Errorf("task %s has no Docker runtime metadata", taskID)
+	}
+	if s.exec == nil {
+		s.exec = executor.New()
+	}
+	args := dockermgr.ComposeCommandArgsWithProjectDir(task.ComposeMeta.ComposeFiles, task.ComposeMeta.WorkDir, task.ComposeMeta.Project, "up", "-d")
+	result := s.exec.Run(ctx, 5*time.Minute, task.ComposeMeta.WorkDir, nil, "docker", args...)
+	if result.Err != nil {
+		return fmt.Errorf("docker start failed for %s: %s", taskID, taskActionResultText(result))
+	}
+	meta := task.ComposeMeta
+	if err := s.store.RecordTaskRuntime(ctx, taskID, task.FrontendURL, true, meta); err != nil {
+		return err
+	}
+	ports, frontendURL, err := inspectTaskRuntimePorts(ctx, s.exec, meta)
+	if err != nil {
+		return err
+	}
+	meta.Ports = ports
+	return s.store.RecordTaskRuntime(ctx, taskID, frontendURL, true, meta)
+}
+
+func inspectTaskRuntimePorts(ctx context.Context, exec executor.CommandRunner, meta model.ComposeMeta) ([]model.ServicePort, string, error) {
+	args := dockermgr.ComposeCommandArgsWithProjectDir(meta.ComposeFiles, meta.WorkDir, meta.Project, "ps", "--format", "json")
+	result := exec.Run(ctx, 30*time.Second, meta.WorkDir, nil, "docker", args...)
+	if result.Err != nil {
+		return nil, "", fmt.Errorf("docker port inspection failed: %s", taskActionResultText(result))
+	}
+	mappings, services := dockermgr.ParseComposePS(result.Stdout)
+	ports := servicePortsFromMappings(mappings, services)
+	frontendURL := ""
+	if len(ports) > 0 {
+		frontendURL = ports[0].URL
+	}
+	return ports, frontendURL, nil
+}
+
+func servicePortsFromMappings(mappings map[string][]dockermgr.PortMapping, services []string) []model.ServicePort {
+	names := append([]string(nil), services...)
+	seenServices := map[string]bool{}
+	for _, name := range names {
+		seenServices[name] = true
+	}
+	var extra []string
+	for name := range mappings {
+		if !seenServices[name] {
+			extra = append(extra, name)
+		}
+	}
+	sort.Strings(extra)
+	names = append(names, extra...)
+	seenPorts := map[string]bool{}
+	var ports []model.ServicePort
+	for _, service := range names {
+		for _, mapping := range mappings[service] {
+			port := servicePortFromMapping(mapping)
+			key := port.Service + "|" + port.URL
+			if port.URL == "" || seenPorts[key] {
+				continue
+			}
+			seenPorts[key] = true
+			ports = append(ports, port)
+		}
+	}
+	return ports
+}
+
+func servicePortFromMapping(mapping dockermgr.PortMapping) model.ServicePort {
+	return model.ServicePort{
+		Service:   mapping.Service,
+		URL:       servicePortURL(mapping.URL, mapping.Host, mapping.Container),
+		Host:      mapping.Host,
+		Container: mapping.Container,
+		Protocol:  mapping.Protocol,
+	}
+}
+
+func servicePortURL(rawHost string, hostPort, containerPort int) string {
+	if hostPort == 0 {
+		return ""
+	}
+	scheme := "http"
+	if containerPort == 443 || hostPort == 443 {
+		scheme = "https"
+	}
+	host := normalizeTaskPortHost(rawHost)
+	return fmt.Sprintf("%s://%s:%d", scheme, host, hostPort)
+}
+
+func normalizeTaskPortHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "http://")
+	raw = strings.TrimPrefix(raw, "https://")
+	raw = strings.Trim(raw, "[]")
+	if raw == "" || raw == "0.0.0.0" || raw == "::" || raw == "127.0.0.1" {
+		return "localhost"
+	}
+	if strings.Contains(raw, ":") {
+		host, _, ok := strings.Cut(raw, ":")
+		if ok {
+			return normalizeTaskPortHost(host)
+		}
+	}
+	return raw
+}
+
+func taskActionResultText(result executor.Result) string {
+	for _, value := range []string{result.Stderr, result.Stdout} {
+		if text := strings.TrimSpace(value); text != "" {
+			return text
+		}
+	}
+	if result.Err != nil {
+		return result.Err.Error()
+	}
+	return result.Command
 }
 
 func dockerDaemonAvailable(ctx context.Context, exec executor.CommandRunner) bool {

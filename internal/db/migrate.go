@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 func migrate(ctx context.Context, handle *sql.DB) error {
 	tx, err := handle.BeginTx(ctx, nil)
@@ -63,6 +63,11 @@ func migrate(ctx context.Context, handle *sql.DB) error {
 				return err
 			}
 			version = 5
+		case 5:
+			if err := migrateV5ToV6(ctx, tx); err != nil {
+				return err
+			}
+			version = 6
 		default:
 			return fmt.Errorf("unsupported schema version %d", version)
 		}
@@ -193,6 +198,9 @@ func inferLegacyVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 		if migrated, err := hasV5Tables(ctx, tx); err != nil || !migrated {
 			return 4, err
 		}
+		if migrated, err := hasV6Tables(ctx, tx); err != nil || !migrated {
+			return 5, err
+		}
 		return currentSchemaVersion, nil
 	}
 	columns, err := findingColumns(ctx, tx)
@@ -208,6 +216,9 @@ func inferLegacyVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 			if _, hasName := stageColumns["name"]; hasName {
 				if migrated, err := hasV5Tables(ctx, tx); err != nil || !migrated {
 					return 4, err
+				}
+				if migrated, err := hasV6Tables(ctx, tx); err != nil || !migrated {
+					return 5, err
 				}
 				return currentSchemaVersion, nil
 			}
@@ -297,6 +308,10 @@ func migrateV4ToV5(ctx context.Context, tx *sql.Tx) error {
 	return err
 }
 
+func migrateV5ToV6(ctx context.Context, tx *sql.Tx) error {
+	return ensureTaskArchiveColumn(ctx, tx)
+}
+
 func ensureTaskTables(ctx context.Context, tx *sql.Tx) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS batches (
@@ -320,6 +335,7 @@ func ensureTaskTables(ctx context.Context, tx *sql.Tx) error {
 			compose_meta TEXT DEFAULT '',
 			entered_waiting_at TEXT DEFAULT '',
 			last_completed_at TEXT DEFAULT '',
+			archived_at TEXT DEFAULT '',
 			sync_error TEXT DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
@@ -334,6 +350,18 @@ func ensureTaskTables(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func ensureTaskArchiveColumn(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumns(ctx, tx, "tasks")
+	if err != nil {
+		return err
+	}
+	if _, ok := columns["archived_at"]; ok {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `ALTER TABLE tasks ADD COLUMN archived_at TEXT DEFAULT '';`)
+	return err
+}
+
 func ensureReadIndexes(ctx context.Context, tx *sql.Tx) error {
 	statements := []string{
 		`CREATE INDEX IF NOT EXISTS idx_runs_task_started ON runs(task_id, started_at DESC, run_id DESC);`,
@@ -346,6 +374,7 @@ func ensureReadIndexes(ctx context.Context, tx *sql.Tx) error {
 		`CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks(batch_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_batch_state ON tasks(batch_id, state);`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_state_docker ON tasks(state, docker_running);`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_state_archive ON tasks(state, archived_at);`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -388,6 +417,19 @@ func hasV5Tables(ctx context.Context, tx *sql.Tx) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func hasV6Tables(ctx context.Context, tx *sql.Tx) (bool, error) {
+	ok, err := hasV5Tables(ctx, tx)
+	if err != nil || !ok {
+		return ok, err
+	}
+	taskColumns, err := tableColumns(ctx, tx, "tasks")
+	if err != nil {
+		return false, err
+	}
+	_, ok = taskColumns["archived_at"]
+	return ok, nil
 }
 
 func tableExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {

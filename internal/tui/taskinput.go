@@ -59,6 +59,10 @@ func (m TaskInputModel) Value() string {
 	return m.input.Value()
 }
 
+func (m *TaskInputModel) SetValue(value string) {
+	m.input.SetValue(value)
+}
+
 func (m *TaskInputModel) SetError(err string) {
 	m.err = err
 }

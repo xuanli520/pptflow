@@ -52,6 +52,7 @@ type Task struct {
 	ComposeMeta      ComposeMeta `json:"compose_meta,omitempty"`
 	EnteredWaitingAt string      `json:"entered_waiting_at,omitempty"`
 	LastCompletedAt  string      `json:"last_completed_at,omitempty"`
+	ArchivedAt       string      `json:"archived_at,omitempty"`
 	SyncError        string      `json:"sync_error,omitempty"`
 	CreatedAt        string      `json:"created_at"`
 	UpdatedAt        string      `json:"updated_at"`
@@ -67,9 +68,18 @@ type Batch struct {
 }
 
 type ComposeMeta struct {
-	Project      string   `json:"project"`
-	ComposeFiles []string `json:"compose_files,omitempty"`
-	WorkDir      string   `json:"work_dir,omitempty"`
+	Project      string        `json:"project"`
+	ComposeFiles []string      `json:"compose_files,omitempty"`
+	WorkDir      string        `json:"work_dir,omitempty"`
+	Ports        []ServicePort `json:"ports,omitempty"`
+}
+
+type ServicePort struct {
+	Service   string `json:"service,omitempty"`
+	URL       string `json:"url,omitempty"`
+	Host      int    `json:"host,omitempty"`
+	Container int    `json:"container,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
 }
 
 type StageRecord struct {

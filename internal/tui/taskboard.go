@@ -129,6 +129,15 @@ func (m TaskBoardModel) SelectedTask() (TaskProject, bool) {
 	return m.cols[m.focused].selected()
 }
 
+func (m TaskBoardModel) StateCount(state string) int {
+	for _, col := range m.cols {
+		if col.state == state {
+			return len(col.items)
+		}
+	}
+	return 0
+}
+
 func (m TaskBoardModel) WithJobs(jobs []scheduler.JobSnapshot) TaskBoardModel {
 	if len(jobs) == 0 {
 		return m
@@ -242,11 +251,11 @@ func (m *TaskBoardModel) prepareLayout(width, height int) {
 		return
 	}
 	if width <= 110 {
-		m.cols[m.focused].setVisibleSize(taskColumnBodyHeight(width, max(4, height-3)) / taskCardLineCount)
+		m.cols[m.focused].setVisibleSize(taskColumnBodyHeight(width, max(4, height-3)) / taskCardMinLineCount)
 		return
 	}
 	for index := range m.cols {
-		m.cols[index].setVisibleSize(taskColumnBodyHeight(width, height) / taskCardLineCount)
+		m.cols[index].setVisibleSize(taskColumnBodyHeight(width, height) / taskCardMinLineCount)
 	}
 }
 
@@ -256,7 +265,8 @@ func taskColumnBodyHeight(width, height int) int {
 }
 
 func renderTaskColumn(col taskListModel, focused bool, width, height int, now time.Time) string {
-	title := truncateDisplay("─── "+col.title+" ("+itoa(len(col.items))+") ───", max(8, width-2))
+	contentWidth := max(1, width-panelStyle.GetHorizontalFrameSize())
+	title := truncateDisplay("─── "+col.title+" ("+itoa(len(col.items))+") ───", max(8, contentWidth))
 	if focused {
 		title = activeStyle.Render(title)
 	} else {
@@ -270,7 +280,7 @@ func renderTaskColumn(col taskListModel, focused bool, width, height int, now ti
 	if len(col.items) == 0 {
 		lines = append(lines, mutedStyle.Render("暂无题目"))
 	} else {
-		lines = append(lines, visibleTaskCardLines(&col, focused, max(12, width-2), bodyHeight, now)...)
+		lines = append(lines, visibleTaskCardLines(&col, focused, max(12, contentWidth), bodyHeight, now)...)
 	}
 	return renderPanel(width, height, strings.Join(lines, "\n"))
 }
@@ -279,19 +289,70 @@ func visibleTaskCardLines(col *taskListModel, focused bool, width, budget int, n
 	if col == nil || len(col.items) == 0 || budget <= 0 {
 		return nil
 	}
-	col.setVisibleSize(budget / taskCardLineCount)
+	laneCount := taskColumnLaneCount(width)
+	col.setVisibleSize((budget / taskCardMinLineCount) * laneCount)
 	start := clamp(col.scroll, 0, len(col.items)-1)
 	if col.cursor < start {
 		start = col.cursor
 	}
 	lines, count, includesCursor := taskCardWindowLines(col.items, start, col.cursor, focused, width, budget, now)
+	if laneCount == 2 {
+		lines, count, includesCursor = taskCardGridLines(col.items, start, col.cursor, focused, width, budget, now)
+	}
 	if !includesCursor {
 		start = col.cursor
 		lines, count, _ = taskCardWindowLines(col.items, start, col.cursor, focused, width, budget, now)
+		if laneCount == 2 {
+			lines, count, _ = taskCardGridLines(col.items, start, col.cursor, focused, width, budget, now)
+		}
 	}
 	col.scroll = start
 	col.lastSize = max(1, count)
 	return lines
+}
+
+func taskColumnLaneCount(width int) int {
+	if width >= 36 {
+		return 2
+	}
+	return 1
+}
+
+func taskCardGridLines(items []TaskProject, start, cursor int, focused bool, width, budget int, now time.Time) ([]string, int, bool) {
+	gap := " "
+	laneWidth := max(12, (width-lipgloss.Width(gap))/2)
+	left, leftCount, leftCursor := taskCardWindowLines(items, start, cursor, focused, laneWidth, budget, now)
+	rightStart := start + leftCount
+	right, rightCount, rightCursor := taskCardWindowLines(items, rightStart, cursor, focused, laneWidth, budget, now)
+	return joinTaskCardLanes(left, right, laneWidth, gap, budget), leftCount + rightCount, leftCursor || rightCursor
+}
+
+func joinTaskCardLanes(left, right []string, laneWidth int, gap string, budget int) []string {
+	height := max(len(left), len(right))
+	height = min(height, budget)
+	lines := make([]string, 0, height)
+	for index := 0; index < height; index++ {
+		leftLine := ""
+		if index < len(left) {
+			leftLine = left[index]
+		}
+		rightLine := ""
+		if index < len(right) {
+			rightLine = right[index]
+		}
+		lines = append(lines, fitTaskLaneLine(leftLine, laneWidth)+gap+fitTaskLaneLine(rightLine, laneWidth))
+	}
+	return lines
+}
+
+func fitTaskLaneLine(line string, width int) string {
+	if lipgloss.Width(line) > width {
+		line = truncateDisplay(line, width)
+	}
+	if pad := width - lipgloss.Width(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
 }
 
 func taskCardWindowLines(items []TaskProject, start, cursor int, focused bool, width, budget int, now time.Time) ([]string, int, bool) {
