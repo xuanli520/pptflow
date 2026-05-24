@@ -13,6 +13,7 @@ type taskCardLine struct {
 	text   string
 	style  lipgloss.Style
 	styled bool
+	scroll bool
 }
 
 const taskCardMinLineCount = 4
@@ -37,7 +38,7 @@ func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool)
 			if task.LastCompletedAt != "" {
 				line += " · 最后: " + shortTime(task.LastCompletedAt)
 			}
-			lines = append(lines, taskCardLine{text: line})
+			lines = append(lines, taskCardLine{text: line, scroll: true})
 		}
 	default:
 		lines = append(lines, inspectingTaskLines(task, bodyWidth)...)
@@ -57,7 +58,12 @@ func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool)
 	}
 	rendered := make([]string, 0, len(lines))
 	for _, line := range lines {
-		text := truncateDisplay(taskCardLineText(line.text), bodyWidth)
+		text := taskCardLineText(line.text)
+		if line.scroll {
+			text = scrollingDisplay(text, bodyWidth, now)
+		} else {
+			text = truncateDisplay(text, bodyWidth)
+		}
 		if line.styled {
 			text = line.style.Render(text)
 		}
@@ -76,6 +82,60 @@ func renderSelectedIndicator(width int) string {
 
 func taskCardLineText(value string) string {
 	return strings.Join(strings.Fields(value), " ")
+}
+
+func scrollingDisplay(value string, width int, now time.Time) string {
+	value = strings.TrimSpace(value)
+	if width <= 0 || value == "" {
+		return ""
+	}
+	if lipgloss.Width(value) <= width {
+		return value
+	}
+	cycle := value + "   "
+	cycleWidth := lipgloss.Width(cycle)
+	offset := 0
+	if !now.IsZero() && cycleWidth > 0 {
+		offset = int(now.Unix()) % cycleWidth
+	}
+	return cyclicDisplayWindow(cycle, width, offset)
+}
+
+func cyclicDisplayWindow(value string, width int, offset int) string {
+	runes := []rune(value)
+	if len(runes) == 0 || width <= 0 {
+		return ""
+	}
+	total := lipgloss.Width(value)
+	if total <= 0 {
+		return ""
+	}
+	offset = ((offset % total) + total) % total
+	start := 0
+	columns := 0
+	for index, r := range runes {
+		runeWidth := lipgloss.Width(string(r))
+		if columns+runeWidth > offset {
+			start = index
+			break
+		}
+		columns += runeWidth
+	}
+	var builder strings.Builder
+	used := 0
+	for index := 0; used < width && index < len(runes)*2; index++ {
+		r := runes[(start+index)%len(runes)]
+		runeWidth := lipgloss.Width(string(r))
+		if used+runeWidth > width {
+			break
+		}
+		builder.WriteRune(r)
+		used += runeWidth
+	}
+	if used < width {
+		builder.WriteString(strings.Repeat(" ", width-used))
+	}
+	return builder.String()
 }
 
 func taskHasGitSyncStatus(task TaskProject) bool {

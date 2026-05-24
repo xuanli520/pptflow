@@ -323,8 +323,12 @@ func (m OverviewModel) SelectedTaskID() string {
 }
 
 func (m OverviewModel) SelectedItem() (overviewItem, bool) {
+	return m.ItemByTaskID(m.selectedID)
+}
+
+func (m OverviewModel) ItemByTaskID(taskID string) (overviewItem, bool) {
 	for _, item := range m.items {
-		if item.TaskID == m.selectedID {
+		if item.TaskID == taskID {
 			return item, true
 		}
 	}

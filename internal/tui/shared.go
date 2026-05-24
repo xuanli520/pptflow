@@ -66,7 +66,7 @@ type TaskActionService interface {
 	SubmitInspection(context.Context, string, pipeline.RunOptions) error
 	ReInspect(context.Context, string, pipeline.RunOptions) error
 	StartDocker(context.Context, string) error
-	ConfirmComplete(context.Context, string) error
+	ConfirmComplete(context.Context, string, string) error
 	RetryGitSync(context.Context, string) error
 }
 
@@ -169,6 +169,7 @@ func (s dbTaskQueryService) enrichTaskProject(ctx context.Context, project *Task
 		project.LastRun = run.StartedAt
 	}
 	project.RunStatus = run.Status
+	project.ManualVerdict = run.ManualVerdict
 	project.Mode = runMode(run)
 	stages, err := s.store.Stages(ctx, run.RunID)
 	if err != nil {
@@ -313,10 +314,14 @@ func (s dbTaskActionService) ensureInspectingCapacity(ctx context.Context) error
 	return nil
 }
 
-func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string) error {
+func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string, verdict string) error {
 	taskID, err := ValidateTaskID(taskID)
 	if err != nil {
 		return err
+	}
+	verdict = normalizeManualVerdict(verdict)
+	if verdict == "" || verdict == model.ManualUnset {
+		return fmt.Errorf("task %s requires manual verdict before completion", taskID)
 	}
 	task, err := s.store.GetTask(ctx, taskID)
 	if err != nil {
@@ -334,8 +339,24 @@ func (s dbTaskActionService) ConfirmComplete(ctx context.Context, taskID string)
 			}
 		}
 	}
+	if err := s.store.SetLatestRunManualVerdict(ctx, taskID, verdict); err != nil {
+		return err
+	}
 	_, err = s.store.CompleteTask(ctx, taskID)
 	return err
+}
+
+func normalizeManualVerdict(verdict string) string {
+	switch strings.TrimSpace(verdict) {
+	case model.ManualPass:
+		return model.ManualPass
+	case model.ManualRework:
+		return model.ManualRework
+	case model.ManualFail:
+		return model.ManualFail
+	default:
+		return ""
+	}
 }
 
 func (s dbTaskActionService) StartDocker(ctx context.Context, taskID string) error {

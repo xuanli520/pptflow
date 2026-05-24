@@ -338,6 +338,25 @@ func TestCtrlXCancelQueuedJobUsesSeparateConfirmation(t *testing.T) {
 	}
 }
 
+func TestCtrlERequiresManualVerdictBeforeCompletingTask(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedTaskBoardForTest([]tuiapp.TaskProject{
+			{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskWaitingManual},
+		}).
+		SetFocus("task-board")
+
+	next, result := h.Press("ctrl+e")
+	if result.CmdCount != 0 || !strings.Contains(next.View(), "结束质检前判定 TASK-20260521-AAAAAA") {
+		t.Fatalf("ctrl+e should open verdict prompt, cmd=%d view=\n%s", result.CmdCount, next.View())
+	}
+
+	next, _ = next.Press("3")
+	next, result = next.Press("enter")
+	if result.CmdCount == 0 || !strings.Contains(next.Message(), "判定: 不通过") {
+		t.Fatalf("enter should submit completion with selected verdict, cmd=%d message=%q", result.CmdCount, next.Message())
+	}
+}
+
 func TestCancelMessageTakesPriorityOverPendingJobFailure(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedOverview("TASK-1").
@@ -430,6 +449,25 @@ func TestTaskBoardDownKeepsListWindowFilled(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("task board should keep surrounding rows visible after down, missing %s:\n%s", want, view)
 		}
+	}
+}
+
+func TestTaskBoardEnterLocksExecutionTaskAcrossOverviewRefresh(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedTaskBoardForTest([]tuiapp.TaskProject{
+			{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskCompleted},
+		}).
+		SeedOverview("TASK-20260521-BBBBBB").
+		SetFocus("task-board")
+
+	next, result := h.Press("enter")
+	if result.CmdCount == 0 || next.TabName() != "execution" || next.SelectedTaskID() != "TASK-20260521-AAAAAA" {
+		t.Fatalf("enter should open selected task detail, cmd=%d tab=%s selected=%s", result.CmdCount, next.TabName(), next.SelectedTaskID())
+	}
+
+	next, _ = next.ApplyOverviewResultForTest(next.OverviewSeq(), 1, "TASK-20260521-BBBBBB")
+	if got := next.SelectedTaskID(); got != "TASK-20260521-AAAAAA" {
+		t.Fatalf("execution task should survive overview refresh, got %s", got)
 	}
 }
 

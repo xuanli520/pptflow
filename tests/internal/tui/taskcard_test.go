@@ -160,3 +160,28 @@ func TestSelectedTaskCardUsesGradientRule(t *testing.T) {
 		t.Fatalf("selected card gradient rule width = %d, want 16:\n%s", count, card)
 	}
 }
+
+func TestCompletedTaskCardScrollsSummaryWhenNarrow(t *testing.T) {
+	task := tuiapp.TaskProject{
+		ID:              "TASK-20260521-ABCDEF",
+		TaskState:       model.TaskCompleted,
+		CompletionCount: 3,
+		LastCompletedAt: "2026-05-24T12:58:00Z",
+	}
+	first := tuiapp.TaskCardForTest(task, 30, time.Unix(0, 0))
+	next := tuiapp.TaskCardForTest(task, 30, time.Unix(3, 0))
+	var frames string
+	for second := int64(0); second < 18; second += 3 {
+		frames += tuiapp.TaskCardForTest(task, 30, time.Unix(second, 0))
+	}
+
+	if strings.Contains(first, "…") || strings.Contains(next, "…") {
+		t.Fatalf("completed summary should scroll instead of truncating:\n%s\n---\n%s", first, next)
+	}
+	if first == next {
+		t.Fatalf("completed summary should advance with time:\n%s", first)
+	}
+	if !strings.Contains(frames, "累计完成: 3 次") || !strings.Contains(frames, "最后: 2026-05-24 20:58") {
+		t.Fatalf("scrolling summary should expose both parts:\n%s", frames)
+	}
+}

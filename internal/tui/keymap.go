@@ -180,6 +180,9 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			return m, cmds
 		}
 	}
+	if m.verdictPrompt.taskID != "" {
+		return m.handleVerdictPromptKey(key, cmds)
+	}
 
 	switch key {
 	case "ctrl+c", "ctrl+q":
@@ -197,9 +200,9 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		return m, append(cmds, m.reloadOverview())
 	case "ctrl+e":
 		if m.tab == panelTaskBoard {
-			if task, ok := m.taskBoard.SelectedTask(); ok && task.TaskState == "waiting_manual" {
-				m.message = "正在确认完成 " + task.ID
-				return m, append(cmds, m.taskActionCmd("complete", task.ID))
+			if task, ok := m.taskBoard.SelectedTask(); ok && task.TaskState == model.TaskWaitingManual {
+				m.openVerdictPrompt(task)
+				return m, cmds
 			}
 			m.message = "请选择待处理题目"
 			return m, cmds
@@ -272,7 +275,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		case "enter":
 			if task, ok := m.taskBoard.SelectedTask(); ok {
 				m.setTab(panelExecution)
-				m.overview.selectedID = task.ID
+				m.openExecutionForTask(task.ID)
 				m.setFocus(focusStageList)
 				cmds = append(cmds, m.reloadDetail())
 			}
@@ -501,6 +504,7 @@ func (m app) defaultPageFocus() focusArea {
 }
 
 func (m *app) enterExecution() {
+	m.openExecutionForTask(m.selectedTaskID())
 	m.setTab(panelExecution)
 	m.detailFollowTail = true
 	if m.qaMode == "recheck" && len(m.detailVM.RefRuns) > 0 {
@@ -508,6 +512,17 @@ func (m *app) enterExecution() {
 		return
 	}
 	m.setFocus(focusStageList)
+}
+
+func (m *app) openExecutionForTask(taskID string) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return
+	}
+	m.executionState.taskID = taskID
+	if m.overview != nil {
+		m.overview.selectedID = taskID
+	}
 }
 
 func (m *app) handleEscape() {
@@ -540,6 +555,63 @@ func (m *app) toggleMode() {
 	if m.tab == panelExecution && len(m.detailVM.RefRuns) > 0 {
 		m.setFocus(focusRefRunList)
 	}
+}
+
+func (m *app) openVerdictPrompt(task TaskProject) {
+	m.verdictPrompt = verdictPrompt{taskID: task.ID, index: verdictIndex(task.ManualVerdict)}
+	if m.verdictPrompt.index < 0 {
+		m.verdictPrompt.index = 0
+	}
+	m.message = "请选择判定 " + task.ID
+}
+
+func (m app) handleVerdictPromptKey(key string, cmds []tea.Cmd) (app, []tea.Cmd) {
+	switch key {
+	case "left", "up":
+		m.verdictPrompt.index = clamp(m.verdictPrompt.index-1, 0, len(manualVerdictOptions())-1)
+	case "right", "down", "tab":
+		m.verdictPrompt.index = clamp(m.verdictPrompt.index+1, 0, len(manualVerdictOptions())-1)
+	case "1":
+		m.verdictPrompt.index = 0
+	case "2":
+		m.verdictPrompt.index = 1
+	case "3":
+		m.verdictPrompt.index = 2
+	case "enter", " ":
+		taskID := m.verdictPrompt.taskID
+		verdict := manualVerdictOptions()[m.verdictPrompt.index].value
+		m.verdictPrompt = verdictPrompt{}
+		m.message = "正在结束质检 " + taskID + "，判定: " + localizeManualVerdict(verdict)
+		return m, append(cmds, m.taskActionCmdWithVerdict("complete", taskID, verdict))
+	case "esc", "q":
+		m.verdictPrompt = verdictPrompt{}
+		m.message = "已取消结束质检"
+	default:
+		return m, cmds
+	}
+	return m, cmds
+}
+
+type manualVerdictOption struct {
+	value string
+	label string
+}
+
+func manualVerdictOptions() []manualVerdictOption {
+	return []manualVerdictOption{
+		{value: model.ManualPass, label: "通过"},
+		{value: model.ManualRework, label: "返工"},
+		{value: model.ManualFail, label: "不通过"},
+	}
+}
+
+func verdictIndex(verdict string) int {
+	for index, option := range manualVerdictOptions() {
+		if option.value == strings.TrimSpace(verdict) {
+			return index
+		}
+	}
+	return -1
 }
 
 func (m *app) openRunConfig() {
@@ -614,6 +686,9 @@ func footerFor(m app) string {
 	if m.confirmStartupDockerCleanup {
 		return "y/Enter 清理遗留 Docker 资源  n/Esc 跳过"
 	}
+	if m.verdictPrompt.taskID != "" {
+		return "←→ 选择判定  1/2/3 快选  Enter 结束质检  Esc 取消"
+	}
 	if m.settingsOpen {
 		if m.settings.selected == settingsItemDocker && m.dockerMirror.confirm != "" {
 			return "y/Enter 确认  n/Esc 取消  Ctrl+/ 关闭设置"
@@ -622,7 +697,7 @@ func footerFor(m app) string {
 	}
 	switch m.focus {
 	case focusTaskBoard:
-		return "/ 输入题目  Ctrl+S 启动服务  Ctrl+E 确认  Ctrl+R 重检  Ctrl+W 重试Git  Ctrl+O 总览  Ctrl+/ 设置  Q 退出"
+		return "/ 输入题目  Ctrl+S 启动服务  Ctrl+E 判定完成  Ctrl+R 重检  Ctrl+W 重试Git  Ctrl+O 总览  Ctrl+/ 设置  Q 退出"
 	case focusTaskInput:
 		return "Enter 开始质检  Esc 清空  ←→ 光标  Ctrl+E/Ctrl+R/Ctrl+O 全局  Ctrl+/ 设置  Q 退出"
 	case focusSearch:

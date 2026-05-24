@@ -22,7 +22,7 @@ func TestExecutionLayoutBreakpoints(t *testing.T) {
 
 func TestOverviewColumnsKeepCoreSignalsOnNarrowWidth(t *testing.T) {
 	titles := titleSet(tuiapp.OverviewColumnTitlesForTest(70))
-	for _, title := range []string{"任务ID", "状态", "失败", "阻断", "严重"} {
+	for _, title := range []string{"任务ID", "结果", "失败", "阻断", "严重"} {
 		if !titles[title] {
 			t.Fatalf("narrow columns missing core title %s", title)
 		}
@@ -37,7 +37,7 @@ func TestOverviewColumnsHideModeBeforeCoreAtMediumWidth(t *testing.T) {
 	if titles["模式"] {
 		t.Fatalf("medium columns should hide mode: %#v", titles)
 	}
-	for _, title := range []string{"任务ID", "质检", "状态", "失败", "阻断", "严重", "完成", "文档", "清理"} {
+	for _, title := range []string{"任务ID", "流程", "结果", "失败", "阻断", "严重", "完成", "文档", "清理"} {
 		if !titles[title] {
 			t.Fatalf("medium columns missing %s: %#v", title, titles)
 		}

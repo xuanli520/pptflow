@@ -71,9 +71,11 @@ type app struct {
 	confirmQuitTasks            []TaskProject
 	confirmStartupDockerCleanup bool
 	startupDockerCleanupCount   int
+	verdictPrompt               verdictPrompt
 }
 
 type executionState struct {
+	taskID                   string
 	detail                   viewport.Model
 	selectedStageKey         string
 	selectedRefRunID         string
@@ -92,6 +94,11 @@ type settingsState struct {
 	settingsOpen            bool
 	settingsFocusBeforeOpen focusArea
 	settingsFocusCaptured   bool
+}
+
+type verdictPrompt struct {
+	taskID string
+	index  int
 }
 
 type detailMsg struct {
@@ -705,6 +712,10 @@ func (m app) View() string {
 		builder.WriteString(errorStyle.Render(truncateDisplay(prompt, max(8, m.width-2))))
 		builder.WriteString("\n")
 	}
+	if m.verdictPrompt.taskID != "" {
+		builder.WriteString(renderVerdictPrompt(m, max(8, m.width-2)))
+		builder.WriteString("\n")
+	}
 	builder.WriteString(renderPipelineBar(m))
 	builder.WriteString("\n")
 	if m.runConfig.active {
@@ -863,6 +874,10 @@ func (m app) submitInspection(taskID string, opts pipeline.RunOptions) tea.Cmd {
 }
 
 func (m app) taskActionCmd(action, taskID string) tea.Cmd {
+	return m.taskActionCmdWithVerdict(action, taskID, "")
+}
+
+func (m app) taskActionCmdWithVerdict(action, taskID, verdict string) tea.Cmd {
 	return func() tea.Msg {
 		if m.taskActionSvc == nil {
 			return taskActionMsg{action: action, taskID: taskID, err: fmt.Errorf("task service unavailable")}
@@ -876,7 +891,7 @@ func (m app) taskActionCmd(action, taskID string) tea.Cmd {
 		var err error
 		switch action {
 		case "complete":
-			err = m.taskActionSvc.ConfirmComplete(ctx, taskID)
+			err = m.taskActionSvc.ConfirmComplete(ctx, taskID, verdict)
 		case "reinspect":
 			err = m.taskActionSvc.ReInspect(ctx, taskID, pipeline.RunOptions{})
 		case "retry-git":
@@ -993,6 +1008,9 @@ func (m *app) applyLayout() tea.Cmd {
 }
 
 func (m app) selectedTaskID() string {
+	if m.tab == panelExecution && strings.TrimSpace(m.executionState.taskID) != "" {
+		return m.executionState.taskID
+	}
 	if m.tab == panelTaskBoard {
 		if task, ok := m.taskBoard.SelectedTask(); ok {
 			return task.ID
@@ -1299,9 +1317,10 @@ type overviewDetailKey struct {
 }
 
 func (m app) selectedOverviewDetailKey() overviewDetailKey {
-	item, ok := m.overview.SelectedItem()
+	taskID := m.selectedTaskID()
+	item, ok := m.overview.ItemByTaskID(taskID)
 	if !ok {
-		return overviewDetailKey{}
+		return overviewDetailKey{TaskID: taskID}
 	}
 	return overviewDetailKey{
 		TaskID:        item.TaskID,

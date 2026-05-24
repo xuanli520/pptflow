@@ -1022,6 +1022,28 @@ func (s *Store) FinishRunAndTransitionTask(ctx context.Context, runID, taskID, s
 	return s.FinishRun(ctx, runID, taskID, status, duration)
 }
 
+func (s *Store) SetLatestRunManualVerdict(ctx context.Context, taskID, verdict string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE runs
+			SET manual_verdict = ?
+			WHERE run_id = (
+				SELECT run_id FROM runs
+				WHERE task_id = ?
+				ORDER BY COALESCE(started_at, '') DESC, run_id DESC
+				LIMIT 1
+			)`, verdict, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(result, "latest run", taskID); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE id = ?`, now, taskID)
+		return err
+	})
+}
+
 func (s *Store) GetRun(ctx context.Context, runID string) (model.RunRecord, error) {
 	var run model.RunRecord
 	var staticOnly int

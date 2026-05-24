@@ -118,6 +118,13 @@ func TestConfirmCompleteSkipsDockerCleanupWhenDaemonUnavailable(t *testing.T) {
 	if task.State != model.TaskCompleted || task.CompletionCount != 1 || task.DockerRunning {
 		t.Fatalf("task should complete when daemon is unavailable: %#v", task)
 	}
+	run, err := store.LatestRunForTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.ManualVerdict != model.ManualPass {
+		t.Fatalf("manual verdict = %s, want %s", run.ManualVerdict, model.ManualPass)
+	}
 	if _, err := os.Stat(tuiapp.CleanupCheckpointPathForTest(cfg.ScanPath)); !os.IsNotExist(err) {
 		t.Fatalf("cleanup checkpoint should be removed, stat err=%v", err)
 	}

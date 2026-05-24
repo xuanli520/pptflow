@@ -198,7 +198,7 @@ func RefreshDockerHealthForTest(ctx context.Context, store *db.Store, cfg config
 
 func ConfirmCompleteForTest(ctx context.Context, store *db.Store, cfg config.Config, exec executor.CommandRunner, taskID string) error {
 	service := dbTaskActionService{store: store, cfg: cfg, exec: exec}
-	return service.ConfirmComplete(ctx, taskID)
+	return service.ConfirmComplete(ctx, taskID, model.ManualPass)
 }
 
 func FindStaleInspectingForTest(ctx context.Context, store *db.Store, cfg config.Config) ([]TaskProject, error) {

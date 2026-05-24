@@ -76,6 +76,30 @@ func renderOverview(m app) string {
 	return m.overview.Render()
 }
 
+func renderVerdictPrompt(m app, width int) string {
+	options := manualVerdictOptions()
+	prefix := "结束质检前判定 " + m.verdictPrompt.taskID + ":"
+	rawParts := []string{prefix}
+	for index, option := range options {
+		rawParts = append(rawParts, fmt.Sprintf("[%d %s]", index+1, option.label))
+	}
+	raw := strings.Join(rawParts, " ")
+	if lipgloss.Width(raw) > width {
+		return truncateDisplay(raw, width)
+	}
+	parts := []string{prefix}
+	for index, option := range options {
+		label := fmt.Sprintf("%d %s", index+1, option.label)
+		if index == m.verdictPrompt.index {
+			label = selectedStyle.Render("[" + label + "]")
+		} else {
+			label = mutedStyle.Render("[" + label + "]")
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, " ")
+}
+
 func renderExecution(m app) string {
 	taskID := m.selectedTaskID()
 	if taskID == "" {
