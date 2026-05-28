@@ -695,7 +695,11 @@ func stageCRunnerCommand() []string {
 		`  *) exec /bin/sh "$script" ;;`,
 		`esac`,
 	}, "\n")
-	return []string{"/bin/sh", "-lc", script}
+	return []string{"/bin/sh", "-lc", escapeComposeInterpolation(script)}
+}
+
+func escapeComposeInterpolation(value string) string {
+	return strings.ReplaceAll(value, "$", "$$")
 }
 
 func shellSingleQuote(value string) string {

@@ -251,9 +251,14 @@ func TestStageCProxyPlanUsesPortableRunTestsEntrypoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"/bin/sh", "-lc", "head -n 1", "exec /bin/sh \"$script\""} {
+	for _, want := range []string{"/bin/sh", "-lc", "head -n 1", "$$(head -n 1 \"$$script\"", "exec /bin/sh \"$$script\""} {
 		if !strings.Contains(plan.OverrideContent, want) {
 			t.Fatalf("runner command missing %q:\n%s", want, plan.OverrideContent)
+		}
+	}
+	for _, bad := range []string{"first=$(head", "\"$script\"", "\"$first\"", " set -- $interpreter", "interpreter=${first"} {
+		if strings.Contains(plan.OverrideContent, bad) {
+			t.Fatalf("runner command contains unescaped compose interpolation %q:\n%s", bad, plan.OverrideContent)
 		}
 	}
 	if strings.Contains(plan.OverrideContent, "\n    - bash\n") || strings.Contains(plan.OverrideContent, "\n    - run_tests.sh\n") {
