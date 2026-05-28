@@ -349,6 +349,9 @@ func TestStartRuntimeReadmeCommandModeAddsManagedLabelOverride(t *testing.T) {
 	if !result.RuntimeSummary.ReadmeCommandMode {
 		t.Fatalf("readme runtime summary should include label override: %#v", result.RuntimeSummary)
 	}
+	if !stringSliceContains(result.Runtime.ComposeFiles, "custom.yml") || !stringSliceContains(result.Runtime.ComposeFiles, overridePath) {
+		t.Fatalf("readme runtime should preserve original and label compose files: %#v", result.Runtime.ComposeFiles)
+	}
 	if !containsCommand(runner.commands, "custom.yml") || !containsCommand(runner.commands, overridePath+" up") {
 		t.Fatalf("readme compose commands should include custom and label override files: %#v", runner.commands)
 	}

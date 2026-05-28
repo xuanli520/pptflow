@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -104,7 +105,13 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 		}, nil)
 	}
 
-	plan, err := buildStageCProxyPlan(runtime, repoPath, run.ArtifactRoot, r.cfg.Pipeline.StageC)
+	plan, loadedPlan, err := loadStageCProxyPlan(run.ArtifactRoot)
+	if err != nil {
+		return fail(err.Error(), nil, nil)
+	}
+	if !loadedPlan {
+		plan, err = buildStageCProxyPlan(runtime, repoPath, run.ArtifactRoot, r.cfg.Pipeline.StageC)
+	}
 	if err != nil {
 		reason := "Stage C isolated proxy plan failed: " + err.Error()
 		return fail(reason, &model.Finding{
@@ -117,7 +124,10 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 			MinimumFix: "Fix compose ports or rerun Stage B.",
 		}, nil)
 	}
-	if err := writeStageCProxyPlanArtifacts(writer, plan); err != nil {
+	if !loadedPlan {
+		err = writeStageCProxyPlanArtifacts(writer, plan)
+	}
+	if err != nil {
 		return fail(err.Error(), nil, map[string]any{"proxy_plan": plan})
 	}
 	if unmapped := unmappedLocalhostPorts(filepath.Join(repoPath, "run_tests.sh"), plan.Mappings); len(unmapped) > 0 && r.cfg.Pipeline.StageC.FailOnUnmappedLocalhost {
@@ -172,7 +182,7 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 		}, map[string]any{"proxy_plan": plan, "cleanup": cleanup, "command": up.Command, "exit_code": up.ExitCode, "timeout": up.Timeout})
 	}
 
-	runArgs := dockermgr.ComposeCommandArgsWithProjectDir(composeFiles, runtime.WorkDir, runtime.ComposeProject, "--profile", stageCProfileName, "run", "--rm", "--no-deps", "--name", plan.RunnerName, stageCRunnerService)
+	runArgs := dockermgr.ComposeCommandArgsWithProjectDir(composeFiles, runtime.WorkDir, runtime.ComposeProject, "--profile", stageCProfileName, "run", "--rm", "-T", "--no-deps", "--name", plan.RunnerName, stageCRunnerService)
 	result := r.exec.RunStreamingWithOutput(ctx, timeout, runtime.WorkDir, dockerCommandEnv(), logFile, stageCOutput(run.RunID, progress), "docker", runArgs...)
 	cleanup := r.cleanupStageCIsolated(ctx, runtime, composeFiles, plan.RunnerName, logFile)
 	endLine := fmt.Sprintf("=== C isolated run_tests.sh end: exit=%d timeout=%t err=%v ===", result.ExitCode, result.Timeout, result.Err)
@@ -226,6 +236,11 @@ type stageCIsolatedCleanup struct {
 
 func (r Runner) cleanupStageCIsolated(ctx context.Context, runtime RuntimeState, composeFiles []string, runnerName string, logFile *os.File) stageCIsolatedCleanup {
 	var cleanup stageCIsolatedCleanup
+	if ctx == nil || ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+	}
 	rmRunner := r.exec.Run(ctx, 30*time.Second, runtime.WorkDir, dockerCommandEnv(), "docker", "rm", "-f", runnerName)
 	cleanup.Commands = append(cleanup.Commands, rmRunner.Command)
 	cleanup.RunnerRemoved = rmRunner.Err == nil
@@ -253,7 +268,15 @@ func buildStageCProxyPlan(runtime RuntimeState, repoPath, artifactRoot string, c
 	if composeFile == "" {
 		composeFile = runtime.ComposeFile
 	}
-	mappings, err := stageCProxyMappingsFromCompose(composeFile)
+	composeContent := ""
+	if content, err := os.ReadFile(filepath.Join(artifactRoot, "docker_compose_stage_c_proxy_config.yml")); err == nil {
+		composeContent = string(content)
+	}
+	return buildStageCProxyPlanWithComposeContent(runtime, repoPath, artifactRoot, cfg, composeFile, composeContent)
+}
+
+func buildStageCProxyPlanWithComposeContent(runtime RuntimeState, repoPath, artifactRoot string, cfg config.StageCConfig, composeFile, composeContent string) (stageCProxyPlan, error) {
+	mappings, err := stageCProxyMappings(composeFile, composeContent)
 	if err != nil {
 		return stageCProxyPlan{}, err
 	}
@@ -281,6 +304,28 @@ func buildStageCProxyPlan(runtime RuntimeState, repoPath, artifactRoot string, c
 	}
 	plan.OverrideContent = content
 	return plan, nil
+}
+
+func loadStageCProxyPlan(artifactRoot string) (stageCProxyPlan, bool, error) {
+	path := filepath.Join(artifactRoot, "p2r_stage_c_proxy.json")
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return stageCProxyPlan{}, false, nil
+	}
+	if err != nil {
+		return stageCProxyPlan{}, false, err
+	}
+	var plan stageCProxyPlan
+	if err := json.Unmarshal(content, &plan); err != nil {
+		return stageCProxyPlan{}, false, err
+	}
+	if strings.TrimSpace(plan.OverrideFile) == "" || strings.TrimSpace(plan.EnvFile) == "" {
+		return stageCProxyPlan{}, false, nil
+	}
+	if !fileExists(plan.OverrideFile) || !fileExists(plan.EnvFile) {
+		return stageCProxyPlan{}, false, nil
+	}
+	return plan, true, nil
 }
 
 func stageCTrimResult(result executor.Result) string {
@@ -319,24 +364,44 @@ func writeStageCProxyPlanArtifacts(writer ArtifactWriter, plan stageCProxyPlan) 
 	return nil
 }
 
-func bestEffortStageCProxyArtifacts(record *model.StageRecord, writer ArtifactWriter, runtime RuntimeState, repoPath, artifactRoot string, cfg config.StageCConfig) {
-	plan, err := buildStageCProxyPlan(runtime, repoPath, artifactRoot, cfg)
+func bestEffortStageCProxyArtifacts(record *model.StageRecord, writer ArtifactWriter, runtime RuntimeState, repoPath, artifactRoot string, cfg config.StageCConfig, composeContent string) {
+	composeFile := firstRuntimeComposeFile(runtime.ComposeFiles)
+	if composeFile == "" {
+		composeFile = runtime.ComposeFile
+	}
+	plan, err := buildStageCProxyPlanWithComposeContent(runtime, repoPath, artifactRoot, cfg, composeFile, composeContent)
 	if err != nil {
 		recordArtifactWarning(record, newArtifactWarning("p2r_stage_c_proxy.json", "write_json", false, err))
 		return
 	}
+	if strings.TrimSpace(composeContent) != "" {
+		bestEffortStageText(record, writer, "docker_compose_stage_c_proxy_config.yml", composeContent)
+	}
 	bestEffortStageText(record, writer, writer.RelativePath(plan.EnvFile), plan.EnvContent)
+	bestEffortStageText(record, writer, writer.RelativePath(plan.OverrideFile), plan.OverrideContent)
 	bestEffortStageJSON(record, writer, writer.RelativePath(plan.ProxyConfigFile), plan)
 }
 
 func stageCProxyMappingsFromCompose(composeFile string) ([]stageCProxyMapping, error) {
-	if strings.TrimSpace(composeFile) == "" {
+	return stageCProxyMappings(composeFile, "")
+}
+
+func stageCProxyMappings(composeFile, composeContent string) ([]stageCProxyMapping, error) {
+	if strings.TrimSpace(composeFile) == "" && strings.TrimSpace(composeContent) == "" {
 		return nil, nil
 	}
-	content, err := os.ReadFile(composeFile)
-	if err != nil {
-		return nil, err
+	content := []byte(composeContent)
+	if strings.TrimSpace(composeContent) == "" {
+		var err error
+		content, err = os.ReadFile(composeFile)
+		if err != nil {
+			return nil, err
+		}
 	}
+	return stageCProxyMappingsFromComposeContent(content)
+}
+
+func stageCProxyMappingsFromComposeContent(content []byte) ([]stageCProxyMapping, error) {
 	var payload map[string]any
 	if err := yaml.Unmarshal(content, &payload); err != nil {
 		return nil, err
@@ -353,20 +418,16 @@ func stageCProxyMappingsFromCompose(composeFile string) ([]stageCProxyMapping, e
 		service, _ := services[serviceName].(map[string]any)
 		ports, _ := service["ports"].([]any)
 		for _, raw := range ports {
-			listen, target, protocol, ok := parseStageCComposePort(raw)
-			if !ok || listen <= 0 || target <= 0 {
-				continue
+			for _, mapping := range parseStageCComposePort(serviceName, raw) {
+				if mapping.Listen <= 0 || mapping.Target <= 0 {
+					continue
+				}
+				if previous := seen[mapping.Listen]; previous != "" && previous != serviceName {
+					return nil, fmt.Errorf("multiple compose services publish localhost proxy port %d: %s and %s", mapping.Listen, previous, serviceName)
+				}
+				seen[mapping.Listen] = serviceName
+				mappings = append(mappings, mapping)
 			}
-			if previous := seen[listen]; previous != "" && previous != serviceName {
-				return nil, fmt.Errorf("multiple compose services publish localhost proxy port %d: %s and %s", listen, previous, serviceName)
-			}
-			seen[listen] = serviceName
-			mappings = append(mappings, stageCProxyMapping{
-				Listen:   listen,
-				Service:  serviceName,
-				Target:   target,
-				Protocol: protocol,
-			})
 		}
 	}
 	sort.SliceStable(mappings, func(i, j int) bool {
@@ -381,14 +442,12 @@ func stageCProxyMappingsFromCompose(composeFile string) ([]stageCProxyMapping, e
 	return mappings, nil
 }
 
-func parseStageCComposePort(raw any) (listen, target int, protocol string, ok bool) {
+func parseStageCComposePort(serviceName string, raw any) []stageCProxyMapping {
 	switch value := raw.(type) {
 	case string:
-		return parseStageCShortPort(value)
+		return parseStageCShortPort(serviceName, value)
 	case map[string]any:
-		target = intScalar(value["target"])
-		listen = intScalar(value["published"])
-		protocol = strings.ToLower(strings.TrimSpace(fmt.Sprint(value["protocol"])))
+		protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(value["protocol"])))
 		if protocol == "<nil>" {
 			protocol = ""
 		}
@@ -396,54 +455,119 @@ func parseStageCComposePort(raw any) (listen, target int, protocol string, ok bo
 			protocol = "tcp"
 		}
 		if protocol != "tcp" {
-			return 0, 0, protocol, false
+			return nil
 		}
-		return listen, target, protocol, listen > 0 && target > 0
+		return expandStageCPortMappings(serviceName, stageCScalarString(value["published"]), stageCScalarString(value["target"]), protocol)
 	default:
-		return 0, 0, "", false
+		return nil
 	}
 }
 
-func parseStageCShortPort(value string) (listen, target int, protocol string, ok bool) {
+func parseStageCShortPort(serviceName, value string) []stageCProxyMapping {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return 0, 0, "", false
+		return nil
 	}
-	protocol = "tcp"
+	protocol := "tcp"
 	if slash := strings.LastIndex(value, "/"); slash >= 0 {
 		protocol = strings.ToLower(strings.TrimSpace(value[slash+1:]))
 		value = strings.TrimSpace(value[:slash])
 	}
 	if protocol != "tcp" {
-		return 0, 0, protocol, false
+		return nil
 	}
 	colon := strings.LastIndex(value, ":")
 	if colon < 0 {
-		return 0, 0, protocol, false
+		return nil
 	}
-	target = atoiStrict(value[colon+1:])
+	target := strings.TrimSpace(value[colon+1:])
 	prefix := strings.TrimSpace(value[:colon])
 	if inner := strings.LastIndex(prefix, ":"); inner >= 0 {
 		prefix = strings.TrimSpace(prefix[inner+1:])
 	}
-	listen = atoiStrict(prefix)
-	return listen, target, protocol, listen > 0 && target > 0
+	return expandStageCPortMappings(serviceName, prefix, target, protocol)
 }
 
-func intScalar(value any) int {
+func expandStageCPortMappings(serviceName, listenText, targetText, protocol string) []stageCProxyMapping {
+	listens := stageCPortValues(listenText)
+	targets := stageCPortValues(targetText)
+	if len(listens) == 0 || len(targets) == 0 {
+		return nil
+	}
+	if len(listens) != len(targets) {
+		if len(listens) == 1 {
+			listens = repeatStageCPort(listens[0], len(targets))
+		} else if len(targets) == 1 {
+			targets = repeatStageCPort(targets[0], len(listens))
+		} else {
+			return nil
+		}
+	}
+	mappings := make([]stageCProxyMapping, 0, len(listens))
+	for index := range listens {
+		mappings = append(mappings, stageCProxyMapping{
+			Listen:   listens[index],
+			Service:  serviceName,
+			Target:   targets[index],
+			Protocol: protocol,
+		})
+	}
+	return mappings
+}
+
+func stageCPortValues(value string) []int {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0" {
+		return nil
+	}
+	parts := strings.Split(value, "-")
+	if len(parts) == 1 {
+		port := atoiStrict(parts[0])
+		if port <= 0 {
+			return nil
+		}
+		return []int{port}
+	}
+	if len(parts) != 2 {
+		return nil
+	}
+	start := atoiStrict(parts[0])
+	end := atoiStrict(parts[1])
+	if start <= 0 || end < start {
+		return nil
+	}
+	values := make([]int, 0, end-start+1)
+	for port := start; port <= end; port++ {
+		values = append(values, port)
+	}
+	return values
+}
+
+func repeatStageCPort(port, count int) []int {
+	values := make([]int, count)
+	for index := range values {
+		values[index] = port
+	}
+	return values
+}
+
+func stageCScalarString(value any) string {
 	switch typed := value.(type) {
 	case int:
-		return typed
+		return strconv.Itoa(typed)
 	case int64:
-		return int(typed)
+		return strconv.FormatInt(typed, 10)
 	case uint64:
-		return int(typed)
+		return strconv.FormatUint(typed, 10)
 	case float64:
-		return int(typed)
+		if typed == float64(int64(typed)) {
+			return strconv.FormatInt(int64(typed), 10)
+		}
+		return strings.TrimSpace(strconv.FormatFloat(typed, 'f', -1, 64))
 	case string:
-		return atoiStrict(typed)
+		return strings.TrimSpace(typed)
 	default:
-		return 0
+		return ""
 	}
 }
 
@@ -550,7 +674,7 @@ func stageCProxyOverride(plan stageCProxyPlan, repoPath, artifactRoot string) (s
 					filepath.Clean(artifactRoot) + ":/p2r-artifacts",
 				},
 				"environment": plan.Env,
-				"command":     []string{"bash", "run_tests.sh"},
+				"command":     stageCRunnerCommand(),
 			},
 		},
 	}
@@ -559,6 +683,19 @@ func stageCProxyOverride(plan stageCProxyPlan, repoPath, artifactRoot string) (s
 		return "", err
 	}
 	return string(content), nil
+}
+
+func stageCRunnerCommand() []string {
+	script := strings.Join([]string{
+		"set -eu",
+		"script=run_tests.sh",
+		`first=$(head -n 1 "$script" 2>/dev/null | tr -d '\r' || true)`,
+		`case "$first" in`,
+		`  '#!'*) interpreter=${first#\#!}; set -- $interpreter "$script"; exec "$@" ;;`,
+		`  *) exec /bin/sh "$script" ;;`,
+		`esac`,
+	}, "\n")
+	return []string{"/bin/sh", "-lc", script}
 }
 
 func shellSingleQuote(value string) string {

@@ -31,12 +31,13 @@ type StartRuntimeRequest struct {
 }
 
 type StartRuntimeResult struct {
-	Runtime                RuntimeState
-	MirrorSummary          BuildMirrorSummary
-	RuntimeSummary         DockerRuntimeSummary
-	EffectiveConfigContent string
-	LogHints               []string
-	Warnings               []string
+	Runtime                  RuntimeState
+	MirrorSummary            BuildMirrorSummary
+	RuntimeSummary           DockerRuntimeSummary
+	EffectiveConfigContent   string
+	StageCProxyConfigContent string
+	LogHints                 []string
+	Warnings                 []string
 }
 
 type DockerRuntimeSummary struct {
@@ -155,6 +156,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	originalFiles := []string{}
 	baseRuntimeFiles := []string{}
 	readmeLabelFiles := []string{}
+	readmeRuntimeFiles := []string{}
 	var effectiveConfig string
 	if composeFile != "" {
 		originalFiles = []string{composeFile}
@@ -162,6 +164,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		activeFiles = append([]string{}, baseRuntimeFiles...)
 		configResult := cmd.runStreaming(ctx, "B0 docker compose config", timeouts.Port, ComposeCommandArgsWithProjectDir(originalFiles, workDir, projectName, "config"), true)
 		effectiveConfig = configResult.Stdout
+		result.StageCProxyConfigContent = configResult.Stdout
 		if configResult.Err != nil {
 			summary.RuntimeErrorCategory = "compose_config_failed"
 			result.RuntimeSummary = summary
@@ -308,6 +311,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 			return result, &StartRuntimeError{Category: "readme_label_config_failed", Message: "docker compose config failed before label injection: " + trimResultText(configResult), Fix: "Use a compose file that can be labelled or add a standard docker-compose.yml.", Result: configResult}
 		}
 		effectiveConfig = configResult.Stdout
+		result.StageCProxyConfigContent = configResult.Stdout
 		labelOverride := prepareRuntimeLabelOverride(effectiveConfig, req.ArtifactRoot, req.Labels)
 		summary.Warnings = append(summary.Warnings, labelOverride.Warnings...)
 		if labelOverride.File == "" {
@@ -325,12 +329,13 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 			return result, &StartRuntimeError{Category: "readme_label_override_config_failed", Message: "runtime label override config failed: " + trimResultText(verify), Fix: "Fix README compose command or use a standard compose file.", Result: verify}
 		}
 		readmeLabelFiles = candidateFiles
+		readmeRuntimeFiles = append(readmeComposeFiles(readmeCommand), candidateFiles...)
 		effectiveConfig = verify.Stdout
-		summary.ComposeFiles = append([]string{}, readmeLabelFiles...)
-		summary.ComposeFile = firstComposeFile(readmeLabelFiles)
-		mirrorSummary.ComposeFiles = append([]string{}, readmeLabelFiles...)
+		summary.ComposeFiles = append([]string{}, readmeRuntimeFiles...)
+		summary.ComposeFile = firstComposeFile(readmeRuntimeFiles)
+		mirrorSummary.ComposeFiles = append([]string{}, readmeRuntimeFiles...)
 		if mirrorSummary.ComposeFile == "" {
-			mirrorSummary.ComposeFile = firstComposeFile(readmeLabelFiles)
+			mirrorSummary.ComposeFile = firstComposeFile(readmeRuntimeFiles)
 		}
 	}
 	var upArgs []string
@@ -383,10 +388,14 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		cmd.logLine(fmt.Sprintf("%s %s ok=%t status=%d error=%s", probe.Service, probe.URL, probe.OK, probe.Status, probe.Error), "p2r", false)
 	}
 	cmd.logLine("=== B4 health check probe end ===", "p2r", false)
+	runtimeComposeFiles := activeFiles
+	if composeFile == "" {
+		runtimeComposeFiles = readmeRuntimeFiles
+	}
 	runtime := RuntimeState{
 		ComposeProject: projectName,
-		ComposeFile:    firstComposeFile(activeFiles),
-		ComposeFiles:   append([]string{}, activeFiles...),
+		ComposeFile:    firstComposeFile(runtimeComposeFiles),
+		ComposeFiles:   append([]string{}, runtimeComposeFiles...),
 		WorkDir:        workDir,
 		Services:       services,
 		Mappings:       mappings,

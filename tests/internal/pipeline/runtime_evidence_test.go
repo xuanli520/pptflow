@@ -2,6 +2,7 @@ package pipeline_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -35,6 +36,10 @@ func cleanupStageCTestArtifacts(repoPath string) pipelinepkg.TestStageCTestArtif
 
 func stageCProxyPlan(runtime testRuntimeEvidence, repoPath, artifactRoot, runnerImage, proxyImage string) (pipelinepkg.TestStageCProxyPlan, error) {
 	return pipelinepkg.StageCProxyPlanForTest(runtime, repoPath, artifactRoot, runnerImage, proxyImage)
+}
+
+func stageCProxyPlanFromComposeContent(runtime testRuntimeEvidence, repoPath, artifactRoot, runnerImage, proxyImage, composeContent string) (pipelinepkg.TestStageCProxyPlan, error) {
+	return pipelinepkg.StageCProxyPlanFromComposeContentForTest(runtime, repoPath, artifactRoot, runnerImage, proxyImage, composeContent)
 }
 
 func TestStageCEnvironmentPassesComposeProjectAndFile(t *testing.T) {
@@ -173,6 +178,89 @@ func TestStageCProxyPlanMapsOriginalPublishedPortsToServices(t *testing.T) {
 	}
 }
 
+func TestStageCProxyPlanUsesComposeConfigContent(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(repoPath, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n    ports:\n      - \"${APP_PORT:-8080}:80\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := stageCProxyPlanFromComposeContent(testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    composePath,
+		ComposeFiles:   []string{composePath},
+		WorkDir:        repoPath,
+	}, repoPath, filepath.Join(root, "artifacts"), "alpine:3.20", "alpine/socat:latest", "services:\n  web:\n    image: nginx\n    ports:\n      - target: 80\n        published: \"8080\"\n        protocol: tcp\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Mappings) != 1 || plan.Mappings[0].Listen != 8080 || plan.Mappings[0].Target != 80 {
+		t.Fatalf("proxy mappings should come from resolved compose config: %#v", plan.Mappings)
+	}
+}
+
+func TestStageCProxyPlanExpandsPortRanges(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(repoPath, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n    ports:\n      - \"8080-8081:80-81\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := stageCProxyPlan(testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    composePath,
+		ComposeFiles:   []string{composePath},
+		WorkDir:        repoPath,
+	}, repoPath, filepath.Join(root, "artifacts"), "alpine:3.20", "alpine/socat:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Mappings) != 2 ||
+		plan.Mappings[0].Listen != 8080 || plan.Mappings[0].Target != 80 ||
+		plan.Mappings[1].Listen != 8081 || plan.Mappings[1].Target != 81 {
+		t.Fatalf("proxy mappings should expand matching ranges: %#v", plan.Mappings)
+	}
+}
+
+func TestStageCProxyPlanUsesPortableRunTestsEntrypoint(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(repoPath, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n    ports:\n      - \"8080:80\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env sh\nexit 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := stageCProxyPlan(testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    composePath,
+		ComposeFiles:   []string{composePath},
+		WorkDir:        repoPath,
+	}, repoPath, filepath.Join(root, "artifacts"), "alpine:3.20", "alpine/socat:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/bin/sh", "-lc", "head -n 1", "exec /bin/sh \"$script\""} {
+		if !strings.Contains(plan.OverrideContent, want) {
+			t.Fatalf("runner command missing %q:\n%s", want, plan.OverrideContent)
+		}
+	}
+	if strings.Contains(plan.OverrideContent, "\n    - bash\n") || strings.Contains(plan.OverrideContent, "\n    - run_tests.sh\n") {
+		t.Fatalf("runner command should not hardcode bash:\n%s", plan.OverrideContent)
+	}
+}
+
 func TestStageCIsolatedRejectsUnmappedHardcodedLocalhost(t *testing.T) {
 	root := t.TempDir()
 	projectPath := filepath.Join(root, "batch", "TASK-1")
@@ -259,12 +347,131 @@ func TestStageCIsolatedRunsDockerComposeAndCleansProxy(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--profile p2r-stage-c up -d p2r_stage_c_proxy",
-		"--profile p2r-stage-c run --rm --no-deps --name p2r_stage_c_p2rqa_task_run p2r_stage_c_runner",
+		"--profile p2r-stage-c run --rm -T --no-deps --name p2r_stage_c_p2rqa_task_run p2r_stage_c_runner",
 		"rm -f p2r_stage_c_p2rqa_task_run",
 		"--profile p2r-stage-c rm -sf p2r_stage_c_proxy",
 	} {
 		if !containsCommand(commandRunner.commands, want) {
 			t.Fatalf("missing command %q in %#v", want, commandRunner.commands)
+		}
+	}
+}
+
+func TestStageCIsolatedUsesPersistedProxyPlan(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\ncurl http://localhost:8080\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(repoPath, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "artifacts")
+	overridePath := filepath.Join(artifactRoot, "stage_c.runner.override.yml")
+	envPath := filepath.Join(artifactRoot, "p2r_ports.env")
+	if err := os.MkdirAll(artifactRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overridePath, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envPath, []byte("P2R_WEB_LOCALHOST_URL=http://localhost:8080\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plan := map[string]any{
+		"compose_project":   "p2rqa_task_run",
+		"compose_files":     []string{composePath},
+		"work_dir":          repoPath,
+		"runner_name":       "p2r_stage_c_p2rqa_task_run",
+		"runner_image":      "golang:1.25",
+		"proxy_image":       "alpine/socat:latest",
+		"override_file":     overridePath,
+		"env_file":          envPath,
+		"proxy_config_file": filepath.Join(artifactRoot, "p2r_stage_c_proxy.json"),
+		"mappings": []map[string]any{{
+			"listen":  8080,
+			"service": "web",
+			"target":  80,
+		}},
+		"env": []string{"P2R_WEB_LOCALHOST_URL=http://localhost:8080"},
+	}
+	content, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactRoot, "p2r_stage_c_proxy.json"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "isolated"
+	cfg.Pipeline.StageC.RunnerImage = "golang:1.25"
+	commandRunner := &stageCIsolatedRunner{}
+	runner := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(commandRunner))
+	record := runner.StageCForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    composePath,
+		ComposeFiles:   []string{composePath},
+		WorkDir:        repoPath,
+	}, nil)
+
+	if record.Status != model.StageDone {
+		t.Fatalf("isolated Stage C should use persisted proxy plan, got %#v", record)
+	}
+}
+
+func TestStageCIsolatedCleansRunnerAfterRunCancel(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(repoPath, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n    ports:\n      - \"8080:80\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "artifacts")
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "isolated"
+	cfg.Pipeline.StageC.RunnerImage = "alpine:3.20"
+	commandRunner := &cancelledStageCIsolatedRunner{}
+	runner := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(commandRunner))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	record := runner.StageCForTest(ctx, model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    composePath,
+		ComposeFiles:   []string{composePath},
+		WorkDir:        repoPath,
+	}, nil)
+
+	if record.Status != model.StageFailed {
+		t.Fatalf("cancelled run should fail Stage C, got %#v", record)
+	}
+	for _, want := range []string{
+		"rm -f p2r_stage_c_p2rqa_task_run",
+		"--profile p2r-stage-c rm -sf p2r_stage_c_proxy",
+	} {
+		if !containsCommand(commandRunner.commands, want) {
+			t.Fatalf("missing cleanup command %q in %#v", want, commandRunner.commands)
 		}
 	}
 }
@@ -554,6 +761,32 @@ func (r *stageCIsolatedRunner) RunStreamingWithOutput(ctx context.Context, timeo
 func (r *stageCIsolatedRunner) result(name string, args ...string) executor.Result {
 	command := strings.Join(append([]string{name}, args...), " ")
 	r.commands = append(r.commands, command)
+	return executor.Result{Command: command, Stdout: command + " ok\n"}
+}
+
+type cancelledStageCIsolatedRunner struct {
+	commands []string
+}
+
+func (r *cancelledStageCIsolatedRunner) LookPath(name string) (string, error) {
+	return name, nil
+}
+
+func (r *cancelledStageCIsolatedRunner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	command := strings.Join(append([]string{name}, args...), " ")
+	r.commands = append(r.commands, command)
+	if ctx.Err() != nil {
+		return executor.Result{Command: command, Err: ctx.Err()}
+	}
+	return executor.Result{Command: command, Stdout: command + " ok\n"}
+}
+
+func (r *cancelledStageCIsolatedRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
+	command := strings.Join(append([]string{name}, args...), " ")
+	r.commands = append(r.commands, command)
+	if strings.Contains(command, " run ") {
+		return executor.Result{Command: command, Err: context.Canceled}
+	}
 	return executor.Result{Command: command, Stdout: command + " ok\n"}
 }
 

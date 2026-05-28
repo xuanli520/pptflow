@@ -33,7 +33,9 @@ func Run(ctx context.Context, exec executor.CommandRunner, cfg config.Config) Ch
 	node := checkBinary(ctx, exec, "node", []string{"--version"}, nodeCandidates(), nil, "Node.js is required by Codex CLI.")
 	result.Checks = append(result.Checks, node)
 	result.Checks = append(result.Checks, checkBinary(ctx, exec, "docker", []string{"--version"}, dockerCandidates(), []string{string(model.StageB)}, "Docker is required for Stage B runtime evidence."))
-	result.Checks = append(result.Checks, checkBinary(ctx, exec, "bash", []string{"--version"}, bashCandidates(), []string{string(model.StageC)}, "bash is required to run repo/run_tests.sh on the host."))
+	if cfg.Pipeline.StageC.Execution != "isolated" {
+		result.Checks = append(result.Checks, checkBinary(ctx, exec, "bash", []string{"--version"}, bashCandidates(), []string{string(model.StageC)}, "bash is required to run repo/run_tests.sh on the host."))
+	}
 	result.Checks = append(result.Checks, checkPython(ctx, exec))
 	codexCheck := checkCodex(ctx, exec, cfg)
 	if node.Status == "missing" {

@@ -304,6 +304,17 @@ func StageCProxyPlanForTest(evidence TestRuntimeEvidence, repoPath, artifactRoot
 	return testStageCProxyPlan(plan), nil
 }
 
+func StageCProxyPlanFromComposeContentForTest(evidence TestRuntimeEvidence, repoPath, artifactRoot, runnerImage, proxyImage, composeContent string) (TestStageCProxyPlan, error) {
+	plan, err := buildStageCProxyPlanWithComposeContent(runtimeEvidenceFromTest(evidence), repoPath, artifactRoot, config.StageCConfig{
+		RunnerImage: runnerImage,
+		ProxyImage:  proxyImage,
+	}, evidence.ComposeFile, composeContent)
+	if err != nil {
+		return TestStageCProxyPlan{}, err
+	}
+	return testStageCProxyPlan(plan), nil
+}
+
 func (r Runner) StageCForTest(ctx context.Context, run model.RunRecord, project scanner.Project, runtime TestRuntimeEvidence, prior map[string]model.StageRecord) model.StageRecord {
 	return r.stageC(ctx, run, project, runtimeEvidenceFromTest(runtime), prior, nil)
 }

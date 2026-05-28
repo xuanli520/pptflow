@@ -26,10 +26,11 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	runtimeSummaryPath := filepath.Join(run.ArtifactRoot, "docker_runtime_summary.json")
 	mirrorSummaryPath := filepath.Join(run.ArtifactRoot, "docker_mirror_summary.json")
 	effectiveConfigPath := filepath.Join(run.ArtifactRoot, "docker_compose_effective_config.yml")
+	stageCProxyConfigPath := filepath.Join(run.ArtifactRoot, "docker_compose_stage_c_proxy_config.yml")
 	stageCProxyPath := filepath.Join(run.ArtifactRoot, "p2r_stage_c_proxy.json")
 	stageCPortsEnvPath := filepath.Join(run.ArtifactRoot, "p2r_ports.env")
 	screenshotPath := qaArtifactPath(run.ArtifactRoot, "docker_startup.png")
-	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, runtimeSummaryPath, mirrorSummaryPath, effectiveConfigPath, stageCProxyPath, stageCPortsEnvPath, screenshotPath)
+	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, runtimeSummaryPath, mirrorSummaryPath, effectiveConfigPath, stageCProxyConfigPath, stageCProxyPath, stageCPortsEnvPath, screenshotPath)
 	repoPath := filepath.Join(project.Path, "repo")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -121,11 +122,14 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		record = recordArtifactWriteError(record, err, portMapPath)
 		return StageOutcome{Record: finishStage(record, model.StageFailed, start), Runtime: &result.Runtime}
 	}
-	bestEffortStageCProxyArtifacts(&record, writer, result.Runtime, repoPath, run.ArtifactRoot, r.cfg.Pipeline.StageC)
+	bestEffortStageCProxyArtifacts(&record, writer, result.Runtime, repoPath, run.ArtifactRoot, r.cfg.Pipeline.StageC, result.StageCProxyConfigContent)
 	pages, _ := renderLogFile(logPath, screenshotPath)
 	record.ArtifactPaths = []string{portMapPath, runtimeSummaryPath, mirrorSummaryPath}
 	if strings.TrimSpace(result.EffectiveConfigContent) != "" {
 		record.ArtifactPaths = append(record.ArtifactPaths, effectiveConfigPath)
+	}
+	if strings.TrimSpace(result.StageCProxyConfigContent) != "" {
+		record.ArtifactPaths = append(record.ArtifactPaths, stageCProxyConfigPath)
 	}
 	record.ArtifactPaths = append(record.ArtifactPaths, stageCProxyPath, stageCPortsEnvPath)
 	record.ArtifactPaths = append(record.ArtifactPaths, pages...)

@@ -153,6 +153,34 @@ func ReadmeComposeCommand(repoPath string) []string {
 	return nil
 }
 
+func readmeComposeFiles(fields []string) []string {
+	var files []string
+	for index := 0; index < len(fields); index++ {
+		field := strings.TrimSpace(fields[index])
+		if field == "-f" || field == "--file" {
+			if index+1 < len(fields) {
+				if file := strings.TrimSpace(fields[index+1]); file != "" {
+					files = append(files, file)
+				}
+				index++
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "-f=") {
+			if file := strings.TrimSpace(strings.TrimPrefix(field, "-f=")); file != "" {
+				files = append(files, file)
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "--file=") {
+			if file := strings.TrimSpace(strings.TrimPrefix(field, "--file=")); file != "" {
+				files = append(files, file)
+			}
+		}
+	}
+	return files
+}
+
 func ComposeArgsWithProject(fields []string, projectName string) []string {
 	return ComposeArgsWithProjectFiles(fields, projectName, nil)
 }
