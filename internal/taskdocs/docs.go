@@ -15,6 +15,7 @@ import (
 )
 
 const ManifestVersion = 1
+const InitialInspectionDocsRequiredMessage = "至少需要一个补充文档才能开始质检"
 
 type Manifest struct {
 	ManifestVersion int        `json:"manifest_version"`
@@ -178,6 +179,47 @@ func Count(scanPath, taskID string) int {
 		return 0
 	}
 	return len(manifest.Docs)
+}
+
+func AvailableCount(scanPath, taskID string) int {
+	manifest, err := ReadManifest(scanPath, taskID)
+	if err != nil {
+		return 0
+	}
+	seen := map[string]bool{}
+	count := 0
+	for _, doc := range manifest.Docs {
+		if doc.SHA256 != "" {
+			if seen[doc.SHA256] {
+				continue
+			}
+			seen[doc.SHA256] = true
+		}
+		count++
+	}
+	dir := filepath.Join(filepath.Clean(scanPath), "task-docs", taskID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return count
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(content)
+		sha := hex.EncodeToString(sum[:])
+		if seen[sha] {
+			continue
+		}
+		seen[sha] = true
+		count++
+	}
+	return count
 }
 
 func BuildContext(scanPath, taskID string, limits config.DocsConfig) (ContextResult, error) {

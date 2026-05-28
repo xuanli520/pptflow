@@ -174,7 +174,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		}
 		if portRewrite.Summary.Generated {
 			summary.PortRewrite = &portRewrite.Summary
-			candidateFiles := []string{portRewrite.Summary.ComposeFile}
+			candidateFiles := append(append([]string{}, originalFiles...), portRewrite.Summary.ComposeFile)
 			verify := cmd.runStreaming(ctx, "B0 docker compose port rewrite config", timeouts.Port, ComposeCommandArgsWithProjectDir(candidateFiles, workDir, projectName, "config"), true)
 			if verify.Err == nil {
 				baseRuntimeFiles = candidateFiles
@@ -195,11 +195,16 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 				effectiveConfig = verify.Stdout
 				mirrorSummary.OverrideVerified = true
 			} else {
+				reason := "mirror override config failed: " + trimResultText(verify)
+				fallbackReason := reason
+				if dockerfilePathOutsideContextFailure(verify) {
+					fallbackReason = "dockerfile_path_outside_context"
+				}
 				mirrorSummary.FallbackUsed = true
-				mirrorSummary.FallbackReason = "mirror override config failed: " + trimResultText(verify)
+				mirrorSummary.FallbackReason = fallbackReason
 				mirrorSummary.FallbackFrom = append([]string{}, candidateFiles...)
 				mirrorSummary.FallbackTo = append([]string{}, baseRuntimeFiles...)
-				mirrorSummary.Warnings = append(mirrorSummary.Warnings, mirrorSummary.FallbackReason)
+				mirrorSummary.Warnings = append(mirrorSummary.Warnings, reason)
 				cmd.logLine("mirror override config failed; falling back to base compose file set", "p2r", false)
 			}
 		}
@@ -240,10 +245,15 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		summary.Build = buildSummaryFromResult(build, usingMirrorOverride)
 		if build.Err != nil && usingMirrorOverride && s.Config.BuildMirrors.FallbackToOriginal {
 			reason := "patched build failed: " + trimResultText(build)
+			fallbackReason := reason
+			if dockerfilePathOutsideContextFailure(build) {
+				fallbackReason = "dockerfile_path_outside_context"
+			}
 			cmd.logLine(reason, "p2r", false)
 			cmd.logLine("falling back to base compose file set for build/up", "p2r", false)
 			mirrorSummary.FallbackUsed = true
-			mirrorSummary.FallbackReason = reason
+			mirrorSummary.FallbackReason = fallbackReason
+			mirrorSummary.Warnings = append(mirrorSummary.Warnings, reason)
 			mirrorSummary.FallbackFrom = append([]string{}, activeFiles...)
 			mirrorSummary.FallbackTo = append([]string{}, baseRuntimeFiles...)
 			summary.Build.FallbackUsed = true
@@ -488,4 +498,12 @@ func resultErrorString(result executor.Result) string {
 		return ""
 	}
 	return result.Err.Error()
+}
+
+func dockerfilePathOutsideContextFailure(result executor.Result) bool {
+	text := strings.ToLower(strings.Join([]string{result.Stdout, result.Stderr, resultErrorString(result)}, "\n"))
+	return strings.Contains(text, "dockerfile") && (strings.Contains(text, "outside the build context") ||
+		strings.Contains(text, "outside build context") ||
+		strings.Contains(text, "forbidden path") ||
+		strings.Contains(text, "not within the build context"))
 }

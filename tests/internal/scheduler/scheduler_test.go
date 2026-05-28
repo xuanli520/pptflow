@@ -640,6 +640,7 @@ func newTestScheduler(t *testing.T, firstScriptDelay time.Duration, taskIDs ...s
 		if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), metadata, 0o644); err != nil {
 			t.Fatal(err)
 		}
+		writeSchedulerSupplementalDoc(t, scanPath, taskID)
 		projects = append(projects, scanner.Project{TaskID: taskID, Batch: "batch-1", Path: projectPath})
 	}
 	if err := store.UpsertProjects(context.Background(), projects); err != nil {
@@ -654,6 +655,17 @@ func newTestScheduler(t *testing.T, firstScriptDelay time.Duration, taskIDs ...s
 		_ = store.Close()
 	})
 	return s
+}
+
+func writeSchedulerSupplementalDoc(t *testing.T, scanPath, taskID string) {
+	t.Helper()
+	dir := filepath.Join(scanPath, "task-docs", taskID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("extra context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func installFakePython(t *testing.T, firstScriptDelay time.Duration) {

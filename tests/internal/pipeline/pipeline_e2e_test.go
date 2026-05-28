@@ -32,6 +32,7 @@ func TestRunPersistsRunningStageAndStreamsCodexLog(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectDir, "repo", "self_test_report.md"), []byte("self test passed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeSupplementalDoc(t, root, "TASK-HANG")
 
 	fakeBin := filepath.Join(t.TempDir(), "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
@@ -103,6 +104,7 @@ func TestRunStageACancelPersistsAbortedRun(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectDir, "metadata.json"), []byte(`{"task_id":"TASK-CANCEL","prompt":"build a small app"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeSupplementalDoc(t, root, "TASK-CANCEL")
 
 	fakeBin := filepath.Join(t.TempDir(), "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
@@ -218,6 +220,7 @@ func TestRunCapturesCodexAppServerFinalMessage(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectDir, "repo", "self_test_report.md"), []byte("self test passed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeSupplementalDoc(t, root, "TASK-FILE")
 
 	fakeBin := filepath.Join(t.TempDir(), "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
@@ -314,6 +317,7 @@ func TestRunMarksStaticReviewUnavailableWhenReportSchemaInvalid(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectDir, "repo", "self_test_report.md"), []byte("self test passed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeSupplementalDoc(t, root, "TASK-SCHEMA")
 
 	fakeBin := filepath.Join(t.TempDir(), "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {

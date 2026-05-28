@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,13 +28,94 @@ type composePSService struct {
 }
 
 func FindCompose(repoPath string) string {
-	for _, name := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
+	for _, name := range composeFilePriorityNames() {
 		path := filepath.Join(repoPath, name)
 		if fileExists(path) {
 			return path
 		}
 	}
+	candidates := recursiveComposeCandidates(repoPath, 5)
+	if len(candidates) > 0 {
+		return candidates[0].Path
+	}
 	return ""
+}
+
+type composeCandidate struct {
+	Path     string
+	Depth    int
+	Priority int
+}
+
+func recursiveComposeCandidates(repoPath string, maxDepth int) []composeCandidate {
+	repoPath = filepath.Clean(repoPath)
+	priority := map[string]int{}
+	for index, name := range composeFilePriorityNames() {
+		priority[name] = index
+	}
+	var candidates []composeCandidate
+	_ = filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if path == repoPath {
+			return nil
+		}
+		rel, err := filepath.Rel(repoPath, path)
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			if skipRecursiveComposeDir(entry.Name()) {
+				return filepath.SkipDir
+			}
+			if composeDirDepth(rel) >= maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		index, ok := priority[entry.Name()]
+		if !ok {
+			return nil
+		}
+		depth := composeDirDepth(filepath.Dir(rel))
+		if depth > maxDepth {
+			return nil
+		}
+		candidates = append(candidates, composeCandidate{Path: path, Depth: depth, Priority: index})
+		return nil
+	})
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Depth != candidates[j].Depth {
+			return candidates[i].Depth < candidates[j].Depth
+		}
+		if candidates[i].Priority != candidates[j].Priority {
+			return candidates[i].Priority < candidates[j].Priority
+		}
+		return filepath.ToSlash(candidates[i].Path) < filepath.ToSlash(candidates[j].Path)
+	})
+	return candidates
+}
+
+func composeFilePriorityNames() []string {
+	return []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+}
+
+func composeDirDepth(rel string) int {
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		return 0
+	}
+	return len(strings.Split(rel, string(filepath.Separator)))
+}
+
+func skipRecursiveComposeDir(name string) bool {
+	switch name {
+	case ".git", "node_modules", "vendor", ".venv", "venv", ".qa-control", "dist", "build":
+		return true
+	default:
+		return false
+	}
 }
 
 func ReadmeComposeCommand(repoPath string) []string {

@@ -52,3 +52,34 @@ func TestAttachListsBinaryWithoutEmbedding(t *testing.T) {
 		t.Fatalf("binary doc should be listed with skip reason: %#v", doc)
 	}
 }
+
+func TestAvailableCountIncludesDropboxAndDeduplicatesByContent(t *testing.T) {
+	root := t.TempDir()
+	managedSource := filepath.Join(t.TempDir(), "managed.md")
+	if err := os.WriteFile(managedSource, []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := taskdocs.Attach(root, "TASK-1", managedSource, "", "tester", config.Default().Docs); err != nil {
+		t.Fatal(err)
+	}
+	dropbox := filepath.Join(root, "task-docs", "TASK-1")
+	if err := os.MkdirAll(filepath.Join(dropbox, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropbox, "duplicate.md"), []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropbox, "new.md"), []byte("new context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropbox, "nested", "ignored.md"), []byte("ignored"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := taskdocs.AvailableCount(root, "TASK-1"); got != 2 {
+		t.Fatalf("available docs = %d, want managed + unique dropbox doc", got)
+	}
+	if got := taskdocs.Count(root, "TASK-1"); got != 1 {
+		t.Fatalf("managed docs count = %d, want unchanged managed-only count", got)
+	}
+}

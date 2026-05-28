@@ -197,6 +197,49 @@ func TestRunConfigAttachedDocCountUsesManagedManifest(t *testing.T) {
 	}
 }
 
+func TestRunConfigAttachedDocCountIncludesDropbox(t *testing.T) {
+	root := t.TempDir()
+	dropbox := filepath.Join(root, "task-docs", "TASK-1")
+	if err := os.MkdirAll(dropbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropbox, "notes.md"), []byte("extra context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ScanPath = root
+	h := tuiapp.NewTestHarness(cfg).
+		SeedOverview("TASK-1").
+		SetExecutionPanel().
+		SetFocus("stage-list")
+
+	h, _ = h.Press("ctrl+r")
+	view := h.View()
+	if !strings.Contains(view, "补充文档: 已托管附件 1 个") {
+		t.Fatalf("run config should count dropbox docs before import, got:\n%s", view)
+	}
+}
+
+func TestRunConfigInitialInspectionRequiresDocs(t *testing.T) {
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	h := tuiapp.NewTestHarness(cfg).
+		SeedTaskBoardForTest([]tuiapp.TaskProject{{ID: "TASK-20260521-ABCDEF", TaskState: model.TaskCompleted}}).
+		SetFocus("task-board")
+
+	h, result := h.Press("ctrl+r")
+	if !h.Confirm() || result.CmdCount != 0 {
+		t.Fatalf("ctrl+r should open inspection run config, confirm=%v cmds=%d", h.Confirm(), result.CmdCount)
+	}
+	h, result = h.Press("enter")
+	if !h.Confirm() || result.CmdCount != 0 {
+		t.Fatalf("missing docs should keep run config open without submitting, confirm=%v cmds=%d", h.Confirm(), result.CmdCount)
+	}
+	if !strings.Contains(h.View(), "至少需要一个补充文档才能开始质检") {
+		t.Fatalf("missing docs message not rendered:\n%s", h.View())
+	}
+}
+
 func TestStaticOnlyRecheckRuntimeStageDoesNotOpenConfirm(t *testing.T) {
 	cfg := config.Default()
 	cfg.Pipeline.StaticOnly = true

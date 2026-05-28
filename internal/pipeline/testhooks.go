@@ -7,6 +7,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
+	"github.com/xuanli520/p2r_tui/internal/config"
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
@@ -78,6 +79,30 @@ type TestServiceURLEnv struct {
 type TestServiceURL struct {
 	EnvKey string `json:"env_key"`
 	URL    string `json:"url"`
+}
+
+type TestStageCProxyPlan struct {
+	ComposeProject  string
+	ComposeFiles    []string
+	WorkDir         string
+	RunnerName      string
+	RunnerImage     string
+	ProxyImage      string
+	OverrideFile    string
+	EnvFile         string
+	ProxyConfigFile string
+	Mappings        []TestStageCProxyMapping
+	ServiceURLs     map[string]string
+	Env             []string
+	OverrideContent string
+	EnvContent      string
+}
+
+type TestStageCProxyMapping struct {
+	Listen   int
+	Service  string
+	Target   int
+	Protocol string
 }
 
 func SelectedStagesForTest(opts RunOptions, staticOnly bool) map[string]bool {
@@ -255,21 +280,7 @@ func ParseDockerPortForTest(service, raw string) []TestPortMapping {
 }
 
 func StageCEnvironmentForTest(evidence TestRuntimeEvidence) TestStageCCommandEnv {
-	env := stageCEnvironment(runtimeEvidence{
-		ComposeProject: evidence.ComposeProject,
-		ComposeFile:    evidence.ComposeFile,
-		ComposeFiles:   append([]string{}, evidence.ComposeFiles...),
-		WorkDir:        evidence.WorkDir,
-		Services:       append([]string{}, evidence.Services...),
-		Mappings:       runtimePortMappingMap(evidence.Mappings),
-		Probes:         runtimeProbeResults(evidence.Probes),
-		Mirror: dockermgr.RuntimeMirrorState{
-			BuildMirrorEnabled:      evidence.Mirror.BuildMirrorEnabled,
-			BuildMirrorMode:         evidence.Mirror.BuildMirrorMode,
-			BuildMirrorFallbackUsed: evidence.Mirror.BuildMirrorFallbackUsed,
-			BuildMirrorSummary:      evidence.Mirror.BuildMirrorSummary,
-		},
-	})
+	env := stageCEnvironment(runtimeEvidenceFromTest(evidence))
 	return TestStageCCommandEnv{
 		Env:    append([]string{}, env.Env...),
 		Keys:   append([]string{}, env.Keys...),
@@ -280,6 +291,21 @@ func StageCEnvironmentForTest(evidence TestRuntimeEvidence) TestStageCCommandEnv
 			Mapping: testServiceURLMap(env.Service.Mapping),
 		},
 	}
+}
+
+func StageCProxyPlanForTest(evidence TestRuntimeEvidence, repoPath, artifactRoot, runnerImage, proxyImage string) (TestStageCProxyPlan, error) {
+	plan, err := buildStageCProxyPlan(runtimeEvidenceFromTest(evidence), repoPath, artifactRoot, config.StageCConfig{
+		RunnerImage: runnerImage,
+		ProxyImage:  proxyImage,
+	})
+	if err != nil {
+		return TestStageCProxyPlan{}, err
+	}
+	return testStageCProxyPlan(plan), nil
+}
+
+func (r Runner) StageCForTest(ctx context.Context, run model.RunRecord, project scanner.Project, runtime TestRuntimeEvidence, prior map[string]model.StageRecord) model.StageRecord {
+	return r.stageC(ctx, run, project, runtimeEvidenceFromTest(runtime), prior, nil)
 }
 
 func CleanupStageCTestArtifactsForTest(repoPath string) TestStageCTestArtifactCleanup {
@@ -296,6 +322,47 @@ func RuntimeCleanupPointForTest(stage string, stages []model.StageRecord) bool {
 
 func FilteredRuntimeEnvForTest(environ, extra []string, docker bool) []string {
 	return filteredRuntimeEnv(environ, extra, docker)
+}
+
+func runtimeEvidenceFromTest(evidence TestRuntimeEvidence) runtimeEvidence {
+	return runtimeEvidence{
+		ComposeProject: evidence.ComposeProject,
+		ComposeFile:    evidence.ComposeFile,
+		ComposeFiles:   append([]string{}, evidence.ComposeFiles...),
+		WorkDir:        evidence.WorkDir,
+		Services:       append([]string{}, evidence.Services...),
+		Mappings:       runtimePortMappingMap(evidence.Mappings),
+		Probes:         runtimeProbeResults(evidence.Probes),
+		Mirror: dockermgr.RuntimeMirrorState{
+			BuildMirrorEnabled:      evidence.Mirror.BuildMirrorEnabled,
+			BuildMirrorMode:         evidence.Mirror.BuildMirrorMode,
+			BuildMirrorFallbackUsed: evidence.Mirror.BuildMirrorFallbackUsed,
+			BuildMirrorSummary:      evidence.Mirror.BuildMirrorSummary,
+		},
+	}
+}
+
+func testStageCProxyPlan(plan stageCProxyPlan) TestStageCProxyPlan {
+	mappings := make([]TestStageCProxyMapping, 0, len(plan.Mappings))
+	for _, mapping := range plan.Mappings {
+		mappings = append(mappings, TestStageCProxyMapping(mapping))
+	}
+	return TestStageCProxyPlan{
+		ComposeProject:  plan.ComposeProject,
+		ComposeFiles:    append([]string{}, plan.ComposeFiles...),
+		WorkDir:         plan.WorkDir,
+		RunnerName:      plan.RunnerName,
+		RunnerImage:     plan.RunnerImage,
+		ProxyImage:      plan.ProxyImage,
+		OverrideFile:    plan.OverrideFile,
+		EnvFile:         plan.EnvFile,
+		ProxyConfigFile: plan.ProxyConfigFile,
+		Mappings:        mappings,
+		ServiceURLs:     copyStringMap(plan.ServiceURLs),
+		Env:             append([]string{}, plan.Env...),
+		OverrideContent: plan.OverrideContent,
+		EnvContent:      plan.EnvContent,
+	}
 }
 
 func testPortMappingMap(values map[string][]portMapping) map[string][]TestPortMapping {

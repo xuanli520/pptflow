@@ -122,6 +122,76 @@ func TestStartRuntimeBuildMirrorPatchWritesArtifactsWithoutModifyingRepo(t *test
 	}
 }
 
+func TestStartRuntimeBuildMirrorFallsBackWhenPatchedDockerfileOutsideContext(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	web := filepath.Join(repo, "web")
+	if err := os.MkdirAll(web, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docker-compose.yml"), []byte("services:\n  web:\n    build: ./web\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(web, "Dockerfile"), []byte("FROM node:20\nRUN npm ci\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{rejectMirrorBuildOutsideContext: true}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("fallback build should keep runtime startup alive: %v", err)
+	}
+	if !result.MirrorSummary.FallbackUsed || result.MirrorSummary.FallbackReason != "dockerfile_path_outside_context" {
+		t.Fatalf("mirror fallback should record outside-context reason: %#v", result.MirrorSummary)
+	}
+	if len(result.Runtime.ComposeFiles) != 1 || strings.Contains(strings.Join(result.Runtime.ComposeFiles, " "), "compose.mirror.override.yml") {
+		t.Fatalf("runtime should fall back to base compose files: %#v", result.Runtime.ComposeFiles)
+	}
+}
+
+func TestFindComposeRecursesDeterministicallyAfterTopLevelPriority(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, "docker", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docker", "compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docker", "nested", "docker-compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := dockermgr.FindCompose(repo); got != filepath.Join(repo, "docker", "compose.yml") {
+		t.Fatalf("recursive compose = %q, want shallower deterministic candidate", got)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "compose.yaml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := dockermgr.FindCompose(repo); got != filepath.Join(repo, "compose.yaml") {
+		t.Fatalf("top-level compose = %q, want top-level priority", got)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "node_modules", "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "node_modules", "pkg", "docker-compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(repo, "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if got := dockermgr.FindCompose(repo); strings.Contains(got, "node_modules") {
+		t.Fatalf("recursive compose should skip dependency directories, got %q", got)
+	}
+}
+
 func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
@@ -162,8 +232,11 @@ func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T)
 	if result.RuntimeSummary.PortRewrite == nil || !result.RuntimeSummary.PortRewrite.Generated {
 		t.Fatalf("fixed ports should generate a runtime port rewrite: %#v", result.RuntimeSummary.PortRewrite)
 	}
-	if !containsCommand(runner.commands, " --project-directory "+repo+" ") || !containsCommand(runner.commands, result.RuntimeSummary.PortRewrite.ComposeFile+" ") {
-		t.Fatalf("docker commands should use rewritten compose with original project directory: %#v", runner.commands)
+	if !containsCommand(runner.commands, " --project-directory "+repo+" ") {
+		t.Fatalf("docker commands should use original project directory: %#v", runner.commands)
+	}
+	if !containsCommand(runner.commands, composePath+" -f "+result.RuntimeSummary.PortRewrite.ComposeFile+" ") {
+		t.Fatalf("docker commands should layer original compose plus ports override: %#v", runner.commands)
 	}
 	content, err := os.ReadFile(result.RuntimeSummary.PortRewrite.ComposeFile)
 	if err != nil {
@@ -179,6 +252,9 @@ func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T)
 	services := payload["services"].(map[string]any)
 	for service, wantPort := range map[string]string{"db": "5432", "api": "8000/tcp"} {
 		node := services[service].(map[string]any)
+		if len(node) != 1 {
+			t.Fatalf("%s override should contain only ports, got %#v", service, node)
+		}
 		ports := node["ports"].([]any)
 		if len(ports) != 1 || ports[0] != wantPort {
 			t.Fatalf("%s ports = %#v, want %q", service, ports, wantPort)
@@ -447,9 +523,10 @@ func TestRunGCGlobalScopeRequiresAllowGlobal(t *testing.T) {
 }
 
 type scriptedDockerRunner struct {
-	pullErr      bool
-	configOutput string
-	commands     []string
+	pullErr                         bool
+	configOutput                    string
+	rejectMirrorBuildOutsideContext bool
+	commands                        []string
 }
 
 func (r *scriptedDockerRunner) LookPath(name string) (string, error) {
@@ -479,6 +556,9 @@ func (r *scriptedDockerRunner) result(name string, args ...string) executor.Resu
 	r.commands = append(r.commands, command)
 	if strings.Contains(command, " pull ") && r.pullErr {
 		return executor.Result{Command: command, ExitCode: 1, Stderr: "pull failed", Err: errors.New("pull failed")}
+	}
+	if strings.Contains(command, " build") && strings.Contains(command, "compose.mirror.override.yml") && r.rejectMirrorBuildOutsideContext {
+		return executor.Result{Command: command, ExitCode: 1, Stderr: "failed to read dockerfile: forbidden path outside the build context", Err: errors.New("build failed")}
 	}
 	if strings.Contains(command, " config") && strings.TrimSpace(r.configOutput) != "" {
 		return executor.Result{Command: command, Stdout: r.configOutput}

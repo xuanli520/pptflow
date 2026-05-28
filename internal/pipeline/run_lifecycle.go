@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/xuanli520/p2r_tui/assets"
@@ -168,6 +169,11 @@ func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
 	}
 	importedDocs, docsImportErr := taskdocs.ImportDropbox(r.cfg.ScanPath, input.taskID, r.cfg.Docs, "p2r-run")
 	docsManifest, docsManifestErr := taskdocs.ReadManifest(r.cfg.ScanPath, input.taskID)
+	if isInitialRunMode(input.opts.Mode) && docsManifestErr == nil && len(docsManifest.Docs) < 1 {
+		err := errors.New(taskdocs.InitialInspectionDocsRequiredMessage)
+		input.progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
+		return nil, err
+	}
 	staticOnly := input.opts.StaticOnly || r.cfg.Pipeline.StaticOnly
 	keepRuntime := input.opts.KeepRuntime || r.cfg.Docker.KeepRuntime
 	run := model.RunRecord{
@@ -216,6 +222,10 @@ func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
 	state.recordPathWarnings()
 	input.progress(RunProgress{RunID: runID, Event: EventRunCreated})
 	return state, nil
+}
+
+func isInitialRunMode(mode string) bool {
+	return strings.TrimSpace(strings.ToLower(mode)) == "" || strings.TrimSpace(strings.ToLower(mode)) == "initial"
 }
 
 func (s *runState) recordPathWarnings() {

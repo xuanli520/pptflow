@@ -34,7 +34,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	repoPath := filepath.Join(project.Path, "repo")
 	script := filepath.Join(repoPath, "run_tests.sh")
 	if !fileExists(script) {
-		evidence := "Package spec violation: repo/run_tests.sh was not found. Stage C uses the host run_tests.sh entrypoint only."
+		evidence := "Package spec violation: repo/run_tests.sh was not found. Stage C requires the repo/run_tests.sh entrypoint."
 		recordRequiredEvidence(evidence, stageCRuntimeSummary(false, evidence, runtime, prior, nil))
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
@@ -66,6 +66,9 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 			record.ErrorSummary = evidence
 		}
 		return finishStage(record, model.StageFailed, start)
+	}
+	if strings.EqualFold(strings.TrimSpace(r.cfg.Pipeline.StageC.Execution), "isolated") {
+		return r.stageCIsolated(ctx, run, project, runtime, prior, progress)
 	}
 	bash := findHostBash(r.exec)
 	if bash == "" {

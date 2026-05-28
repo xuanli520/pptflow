@@ -150,7 +150,10 @@ func (m app) handleRunConfigKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			return m, cmds
 		}
 		cmd := m.submitRunConfig()
-		return m, append(cmds, cmd)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, cmds
 	}
 
 	if m.runConfig.focus == runConfigFocusExtraDocs {
@@ -220,7 +223,7 @@ func (m *app) attachRunConfigDoc() {
 		m.runConfig.err = err.Error()
 		return
 	}
-	m.runConfig.attachedCount = taskdocs.Count(m.cfg.ScanPath, m.runConfig.taskID)
+	m.runConfig.attachedCount = taskdocs.AvailableCount(m.cfg.ScanPath, m.runConfig.taskID)
 	m.runConfig.input.SetValue("")
 	m.message = fmt.Sprintf("已托管补充文档: %s", doc.OriginalName)
 }
@@ -241,6 +244,11 @@ func (m *app) submitRunConfig() tea.Cmd {
 	plan := m.rerunStagePlan()
 	if plan.blockedReason != "" {
 		m.runConfig.err = plan.blockedReason
+		return nil
+	}
+	m.runConfig.attachedCount = taskdocs.AvailableCount(m.cfg.ScanPath, m.runConfig.taskID)
+	if m.runConfig.action == runConfigActionInspection && strings.TrimSpace(strings.ToLower(m.runConfig.mode)) != "recheck" && m.runConfig.attachedCount < 1 {
+		m.runConfig.err = taskdocs.InitialInspectionDocsRequiredMessage
 		return nil
 	}
 	opts := m.runConfig.toRunOptions(plan)

@@ -6,6 +6,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
 type focusArea int
@@ -639,7 +640,8 @@ func (m *app) openRunConfigForTask(taskID string, action runConfigAction) {
 		}
 		return
 	}
-	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, m.detailVM.DocsSummary.Count, action, m.cfg.Pipeline.DefaultStages)
+	availableDocs := taskdocs.AvailableCount(m.cfg.ScanPath, taskID)
+	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, availableDocs, action, m.cfg.Pipeline.DefaultStages)
 }
 
 func (m *app) openRunConfigForTaskInput() bool {

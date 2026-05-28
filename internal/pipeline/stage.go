@@ -129,7 +129,7 @@ func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 				selected[normalized] = true
 			}
 		}
-		return selected
+		return filterRuntimeStages(selected, staticOnly)
 	}
 	if opts.Stage != "" {
 		stage, ok := model.NormalizeStage(opts.Stage)
@@ -140,7 +140,7 @@ func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 		if stage != string(model.StageF) {
 			selected[string(model.StageF)] = true
 		}
-		return selected
+		return filterRuntimeStages(selected, staticOnly)
 	}
 	if opts.From != "" {
 		selected = map[string]bool{}
@@ -157,12 +157,12 @@ func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 				selected[stage] = true
 			}
 		}
-		return selected
+		return filterRuntimeStages(selected, staticOnly)
 	}
 	if staticOnly {
 		return staticStageSet()
 	}
-	return selected
+	return filterRuntimeStages(selected, staticOnly)
 }
 
 func initialStages(selected map[string]bool, staticOnly bool) []model.StageRecord {
@@ -204,6 +204,19 @@ func staticStageSet() map[string]bool {
 		}
 	}
 	return selected
+}
+
+func filterRuntimeStages(selected map[string]bool, staticOnly bool) map[string]bool {
+	if !staticOnly {
+		return selected
+	}
+	filtered := map[string]bool{}
+	for stage, ok := range selected {
+		if ok && !model.IsRuntimeStage(stage) {
+			filtered[stage] = true
+		}
+	}
+	return filtered
 }
 
 func defaultRunStages() []string {

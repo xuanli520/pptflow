@@ -531,6 +531,9 @@ func cleanupCheckpointPath(scanPath string) string {
 func (s dbTaskActionService) submitInspection(ctx context.Context, task model.Task, opts pipeline.RunOptions) error {
 	var err error
 	opts.DeferRuntimeCleanup = true
+	if inspectionModeIsInitial(opts.Mode) && taskdocs.AvailableCount(s.cfg.ScanPath, task.ID) < 1 {
+		return errors.New(taskdocs.InitialInspectionDocsRequiredMessage)
+	}
 	if s.scheduler == nil {
 		err = fmt.Errorf("scheduler unavailable")
 	} else {
@@ -542,6 +545,11 @@ func (s dbTaskActionService) submitInspection(ctx context.Context, task model.Ta
 		}
 	}
 	return err
+}
+
+func inspectionModeIsInitial(mode string) bool {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	return mode == "" || mode == "initial"
 }
 
 func taskProjectFromTask(cfg config.Config, task model.Task) TaskProject {
@@ -558,7 +566,7 @@ func taskProjectFromTask(cfg config.Config, task model.Task) TaskProject {
 		EnteredWaitingAt: task.EnteredWaitingAt,
 		SyncError:        task.SyncError,
 		Path:             task.RepoPath,
-		DocsCount:        taskdocs.Count(cfg.ScanPath, task.ID),
+		DocsCount:        taskdocs.AvailableCount(cfg.ScanPath, task.ID),
 		Mode:             "initial",
 	}
 }
@@ -581,7 +589,7 @@ func taskProjectFromSummary(cfg config.Config, project db.ProjectSummary) TaskPr
 		FailedStage:      project.FailedStage,
 		Blocking:         project.Blocking,
 		High:             project.High,
-		DocsCount:        taskdocs.Count(cfg.ScanPath, project.TaskID),
+		DocsCount:        taskdocs.AvailableCount(cfg.ScanPath, project.TaskID),
 		Path:             project.Path,
 		Mode:             "initial",
 	}

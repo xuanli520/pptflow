@@ -50,6 +50,8 @@ func prepareRuntimePortRewrite(composeFile, artifactRoot string) portRewritePrep
 	if !ok {
 		return portRewritePreparation{Summary: summary}
 	}
+	override := map[string]any{"services": map[string]any{}}
+	overrideServices := override["services"].(map[string]any)
 	names := make([]string, 0, len(services))
 	for name := range services {
 		names = append(names, name)
@@ -69,7 +71,7 @@ func prepareRuntimePortRewrite(composeFile, artifactRoot string) portRewritePrep
 		if !changed {
 			continue
 		}
-		service["ports"] = rewritten
+		overrideServices[name] = map[string]any{"ports": rewritten}
 		summary.Services = append(summary.Services, RuntimePortRewriteService{
 			Service: name,
 			Ports:   stringPortEntries(rewritten),
@@ -78,7 +80,7 @@ func prepareRuntimePortRewrite(composeFile, artifactRoot string) portRewritePrep
 	if len(summary.Services) == 0 {
 		return portRewritePreparation{Summary: summary}
 	}
-	content, err = yaml.Marshal(payload)
+	content, err = yaml.Marshal(override)
 	if err != nil {
 		summary.Services = nil
 		summary.Warnings = append(summary.Warnings, "runtime port rewrite skipped: marshal compose: "+err.Error())

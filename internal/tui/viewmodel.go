@@ -622,7 +622,7 @@ func readDocsSummary(cfg config.Config, taskID string) docsSummary {
 		ManifestPath:   path,
 		ManifestExists: fileExists(path),
 		Docs:           manifest.Docs,
-		Count:          len(manifest.Docs),
+		Count:          taskdocs.AvailableCount(cfg.ScanPath, taskID),
 	}
 	if err != nil {
 		summary.Error = err.Error()

@@ -41,6 +41,14 @@ type PipelineConfig struct {
 	SelfTestReportPath string
 	MaxConcurrent      int
 	DefaultStages      map[string][]string
+	StageC             StageCConfig
+}
+
+type StageCConfig struct {
+	Execution               string
+	RunnerImage             string
+	ProxyImage              string
+	FailOnUnmappedLocalhost bool
 }
 
 type GitConfig struct {
@@ -164,6 +172,14 @@ type rawPipelineConfig struct {
 	SelfTestReportPath *string             `yaml:"self_test_report_path"`
 	MaxConcurrent      *int                `yaml:"max_concurrent"`
 	DefaultStages      map[string][]string `yaml:"default_stages"`
+	StageC             *rawStageCConfig    `yaml:"stage_c"`
+}
+
+type rawStageCConfig struct {
+	Execution               *string `yaml:"execution"`
+	RunnerImage             *string `yaml:"runner_image"`
+	ProxyImage              *string `yaml:"proxy_image"`
+	FailOnUnmappedLocalhost *bool   `yaml:"fail_on_unmapped_localhost"`
 }
 
 type rawGitConfig struct {
@@ -260,6 +276,11 @@ func Default() Config {
 			StageTimeouts:      map[string]int{"A": 60, "B": 900, "B_PULL": 300, "B_BUILD": 600, "B_UP": 300, "B_HEALTH": 60, "B_PORT": 30, "C": 300, "D": 2700, "E": 2700, "F": 2700},
 			SelfTestReportPath: "repo/self_test_report.md",
 			MaxConcurrent:      DefaultMaxConcurrent,
+			StageC: StageCConfig{
+				Execution:               "host",
+				ProxyImage:              "alpine/socat:latest",
+				FailOnUnmappedLocalhost: true,
+			},
 		},
 		Git: GitConfig{
 			BaseURL:      "https://gitlab.mindflow.com.cn/Prompt2Repo/fullstack/",
@@ -499,6 +520,9 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 			}
 			cfg.Pipeline.DefaultStages = stages
 		}
+		if raw.Pipeline.StageC != nil {
+			applyRawStageC(&cfg.Pipeline.StageC, raw.Pipeline.StageC)
+		}
 	}
 	if raw.Git != nil {
 		if raw.Git.BaseURL != nil {
@@ -642,6 +666,21 @@ func applyRawDockerDaemonMirrors(cfg *DockerDaemonMirrorsConfig, raw *rawDockerD
 	}
 }
 
+func applyRawStageC(cfg *StageCConfig, raw *rawStageCConfig) {
+	if raw.Execution != nil {
+		cfg.Execution = *raw.Execution
+	}
+	if raw.RunnerImage != nil {
+		cfg.RunnerImage = *raw.RunnerImage
+	}
+	if raw.ProxyImage != nil {
+		cfg.ProxyImage = *raw.ProxyImage
+	}
+	if raw.FailOnUnmappedLocalhost != nil {
+		cfg.FailOnUnmappedLocalhost = *raw.FailOnUnmappedLocalhost
+	}
+}
+
 func applyRawDockerBuildMirrors(cfg *DockerBuildMirrorsConfig, raw *rawDockerBuildMirrorsConfig) {
 	if raw.Enabled != nil {
 		cfg.Enabled = *raw.Enabled
@@ -722,6 +761,15 @@ func applyRawDockerGC(cfg *DockerGCConfig, raw *rawDockerGCConfig) {
 
 func normalize(cfg *Config) {
 	cfg.Pipeline.MaxConcurrent = NormalizeMaxConcurrent(cfg.Pipeline.MaxConcurrent)
+	cfg.Pipeline.StageC.Execution = strings.ToLower(strings.TrimSpace(cfg.Pipeline.StageC.Execution))
+	cfg.Pipeline.StageC.RunnerImage = strings.TrimSpace(cfg.Pipeline.StageC.RunnerImage)
+	cfg.Pipeline.StageC.ProxyImage = strings.TrimSpace(cfg.Pipeline.StageC.ProxyImage)
+	if cfg.Pipeline.StageC.Execution == "" {
+		cfg.Pipeline.StageC.Execution = "host"
+	}
+	if cfg.Pipeline.StageC.ProxyImage == "" {
+		cfg.Pipeline.StageC.ProxyImage = "alpine/socat:latest"
+	}
 	cfg.Git.BaseURL = strings.TrimSpace(cfg.Git.BaseURL)
 	cfg.Git.AllowedHosts = normalizeHosts(cfg.Git.AllowedHosts)
 	if cfg.Git.CloneTimeout <= 0 {
@@ -790,6 +838,12 @@ func Validate(cfg Config) error {
 	}
 	if _, err := normalizeDefaultStages(cfg.Pipeline.DefaultStages); err != nil {
 		return err
+	}
+	if err := validateOneOf("pipeline.stage_c.execution", cfg.Pipeline.StageC.Execution, "host", "isolated"); err != nil {
+		return err
+	}
+	if cfg.Pipeline.StageC.Execution == "isolated" && strings.TrimSpace(cfg.Pipeline.StageC.ProxyImage) == "" {
+		return fmt.Errorf("pipeline.stage_c.proxy_image must not be empty")
 	}
 	if strings.TrimSpace(cfg.Git.BaseURL) == "" {
 		return fmt.Errorf("git.base_url must not be empty")

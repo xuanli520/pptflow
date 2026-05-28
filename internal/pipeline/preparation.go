@@ -20,6 +20,16 @@ func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project
 	if opts.Mode == "" {
 		opts.Mode = "initial"
 	}
+	if opts.StaticOnly || r.cfg.Pipeline.StaticOnly {
+		if stage := explicitRuntimeStageSelection(opts); stage != "" {
+			return opts, fmt.Errorf("static-only mode cannot run runtime stage %s", stage)
+		}
+	}
+	if opts.Stage == "" && opts.From == "" && len(opts.Stages) == 0 {
+		if stages := r.cfg.Pipeline.DefaultStages[opts.Mode]; len(stages) > 0 {
+			opts.Stages = append([]string(nil), stages...)
+		}
+	}
 	switch opts.Mode {
 	case "initial":
 		if strings.TrimSpace(opts.RefRun) != "" {
@@ -50,6 +60,21 @@ func (r Runner) normalizeRunOptions(ctx context.Context, project scanner.Project
 		return opts, fmt.Errorf("invalid --mode %q; expected initial or recheck", opts.Mode)
 	}
 	return opts, nil
+}
+
+func explicitRuntimeStageSelection(opts RunOptions) string {
+	if opts.Stage != "" && model.IsRuntimeStage(opts.Stage) {
+		return opts.Stage
+	}
+	if opts.From != "" && model.IsRuntimeStage(opts.From) {
+		return opts.From
+	}
+	for _, stage := range opts.Stages {
+		if model.IsRuntimeStage(stage) {
+			return stage
+		}
+	}
+	return ""
 }
 
 func normalizeStageOptions(opts RunOptions) (RunOptions, error) {

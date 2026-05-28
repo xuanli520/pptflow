@@ -19,6 +19,7 @@ import (
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
+	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
 
 type portMapping = pipelinepkg.TestPortMapping
@@ -554,6 +555,147 @@ func TestRunRejectsUnknownStageBeforeCreatingRun(t *testing.T) {
 	}
 	if _, err := store.LatestRunForTask(ctx, "TASK-BAD-STAGE"); err == nil {
 		t.Fatal("invalid stage should not create a run")
+	}
+}
+
+func TestRunInitialRequiresSupplementalDocsBeforeCreatingRun(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-NODOCS")
+	removeSupplementalDocs(t, root, "TASK-NODOCS")
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-NODOCS", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pipelinepkg.NewRunner(store, cfg, pipelinepkg.WithCommandRunner(lifecycleCommandRunner{})).Run(ctx, "TASK-NODOCS", pipelinepkg.RunOptions{Stages: []string{"A"}})
+	if err == nil || !strings.Contains(err.Error(), "至少需要一个补充文档") {
+		t.Fatalf("expected initial docs gate error, got %v", err)
+	}
+	if _, err := store.LatestRunForTask(ctx, "TASK-NODOCS"); err == nil {
+		t.Fatal("docs gate should not create a run")
+	}
+}
+
+func TestRunInitialImportsDropboxBeforeDocsGate(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-DROPBOX")
+	removeSupplementalDocs(t, root, "TASK-DROPBOX")
+	dropbox := filepath.Join(root, "task-docs", "TASK-DROPBOX")
+	if err := os.MkdirAll(dropbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropbox, "notes.md"), []byte("extra context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-DROPBOX", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipelinepkg.NewRunner(store, cfg, pipelinepkg.WithCommandRunner(lifecycleCommandRunner{})).Run(ctx, "TASK-DROPBOX", pipelinepkg.RunOptions{Stages: []string{"A"}})
+	if err != nil {
+		t.Fatalf("dropbox docs should satisfy initial docs gate: %v", err)
+	}
+	if result.Run.RunID == "" {
+		t.Fatal("expected run to be created after importing dropbox docs")
+	}
+	manifest, err := taskdocs.ReadManifest(root, "TASK-DROPBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Docs) != 1 || manifest.Docs[0].OriginalName != "notes.md" {
+		t.Fatalf("dropbox doc should be imported before gate: %#v", manifest.Docs)
+	}
+}
+
+func TestRunInjectsConfiguredDefaultStages(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-DEFAULT")
+	doc := filepath.Join(t.TempDir(), "notes.md")
+	if err := os.WriteFile(doc, []byte("extra context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	cfg.Pipeline.DefaultStages = map[string][]string{"initial": {"A"}}
+	if _, err := taskdocs.Attach(root, "TASK-DEFAULT", doc, "", "tester", cfg.Docs); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-DEFAULT", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipelinepkg.NewRunner(store, cfg, pipelinepkg.WithCommandRunner(lifecycleCommandRunner{})).Run(ctx, "TASK-DEFAULT", pipelinepkg.RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stageByName(result.Stages, "A").Status == model.StageSkipped {
+		t.Fatalf("default stage A should run: %#v", result.Stages)
+	}
+	for _, stage := range []string{"D", "E", "F", "B", "C"} {
+		if got := stageByName(result.Stages, stage); got.Status != model.StageSkipped {
+			t.Fatalf("stage %s status = %s, want skipped after default_stages injection", stage, got.Status)
+		}
+	}
+	content, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "run_manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), `"stages": [
+    "A"
+  ]`) {
+		t.Fatalf("run manifest should record injected stages:\n%s", content)
+	}
+}
+
+func TestStaticOnlyExplicitRuntimeStageFailsBeforeCreatingRun(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-STATIC")
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	cfg.Pipeline.StaticOnly = true
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-STATIC", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-STATIC", pipelinepkg.RunOptions{Stages: []string{"B"}})
+	if err == nil || !strings.Contains(err.Error(), "static-only") || !strings.Contains(err.Error(), "B") {
+		t.Fatalf("expected explicit runtime stage static-only error, got %v", err)
+	}
+	if _, err := store.LatestRunForTask(ctx, "TASK-STATIC"); err == nil {
+		t.Fatal("static-only stage validation should not create a run")
 	}
 }
 
@@ -1372,5 +1514,24 @@ func writePipelinePackage(t *testing.T, root, batch, taskID string) string {
 	if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), []byte(`{"task_id":"`+taskID+`","prompt":"build it"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeSupplementalDoc(t, root, taskID)
 	return projectPath
+}
+
+func writeSupplementalDoc(t *testing.T, root, taskID string) {
+	t.Helper()
+	dropbox := filepath.Join(root, "task-docs", taskID)
+	if err := os.MkdirAll(dropbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropbox, "notes.md"), []byte("extra context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func removeSupplementalDocs(t *testing.T, root, taskID string) {
+	t.Helper()
+	if err := os.RemoveAll(filepath.Join(root, "task-docs", taskID)); err != nil {
+		t.Fatal(err)
+	}
 }

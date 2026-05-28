@@ -105,6 +105,30 @@ func TestLoadParsesDefaultStages(t *testing.T) {
 	}
 }
 
+func TestLoadParsesStageCExecutionConfig(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`pipeline:
+  stage_c:
+    execution: isolated
+    runner_image: golang:1.25
+    proxy_image: alpine/socat:latest
+    fail_on_unmapped_localhost: false
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.StageC.Execution != "isolated" ||
+		cfg.Pipeline.StageC.RunnerImage != "golang:1.25" ||
+		cfg.Pipeline.StageC.ProxyImage != "alpine/socat:latest" ||
+		cfg.Pipeline.StageC.FailOnUnmappedLocalhost {
+		t.Fatalf("stage C config not parsed: %#v", cfg.Pipeline.StageC)
+	}
+}
+
 func TestLoadUsesExplicitConfigRelativeToConfigDirectory(t *testing.T) {
 	cwd := t.TempDir()
 	configDir := t.TempDir()

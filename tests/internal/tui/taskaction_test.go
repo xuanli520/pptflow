@@ -22,6 +22,7 @@ func TestStartInspectionRecordsSyncErrorWhenSubmitFails(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()
 	cfg.ScanPath = t.TempDir()
+	writeTUIDropboxDoc(t, cfg.ScanPath, "TASK-20260521-ABCDEF")
 	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -42,6 +43,33 @@ func TestStartInspectionRecordsSyncErrorWhenSubmitFails(t *testing.T) {
 	}
 	if task.State != model.TaskInspecting || task.CurrentRunID != "" || !strings.Contains(task.SyncError, "scheduler down") {
 		t.Fatalf("failed submit should leave retryable inspecting task with sync error: %#v", task)
+	}
+}
+
+func TestStartInspectionDocsGateDoesNotSubmitOrRecordSyncError(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scheduler := &failingInspectionScheduler{err: errors.New("scheduler should not be called")}
+
+	err = tuiapp.StartInspectionForTest(ctx, store, cfg, scheduler, "TASK-20260521-ABC123")
+	if err == nil || !strings.Contains(err.Error(), "至少需要一个补充文档") {
+		t.Fatalf("expected docs gate error, got %v", err)
+	}
+	if scheduler.calls != 0 {
+		t.Fatalf("docs gate should not call scheduler, calls=%d", scheduler.calls)
+	}
+	task, err := store.GetTask(ctx, "TASK-20260521-ABC123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(task.SyncError) != "" {
+		t.Fatalf("docs gate should not be recorded as git sync error: %#v", task)
 	}
 }
 
@@ -173,6 +201,17 @@ func waitingManualTask(t *testing.T) (*db.Store, config.Config, string) {
 type confirmCompleteExec struct {
 	dockerInfoErr error
 	commands      []string
+}
+
+func writeTUIDropboxDoc(t *testing.T, scanPath, taskID string) {
+	t.Helper()
+	dropbox := filepath.Join(scanPath, "task-docs", taskID)
+	if err := os.MkdirAll(dropbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropbox, "notes.md"), []byte("extra context"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (confirmCompleteExec) LookPath(name string) (string, error) {
