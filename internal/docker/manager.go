@@ -38,6 +38,7 @@ type CleanupSummary struct {
 	Status         string   `json:"status"`
 	ComposeFile    string   `json:"compose_file,omitempty"`
 	ComposeFiles   []string `json:"compose_files,omitempty"`
+	EnvFiles       []string `json:"env_files,omitempty"`
 	ComposeProject string   `json:"compose_project,omitempty"`
 	WorkDir        string   `json:"work_dir,omitempty"`
 	Command        string   `json:"command,omitempty"`
@@ -63,8 +64,13 @@ func CleanupComposeProject(ctx context.Context, exec executor.CommandRunner, cfg
 }
 
 func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig, composeFiles []string, projectName, workDir string) CleanupSummary {
+	return CleanupComposeProjectFilesWithEnvFiles(ctx, exec, cfg, composeFiles, nil, projectName, workDir)
+}
+
+func CleanupComposeProjectFilesWithEnvFiles(ctx context.Context, exec executor.CommandRunner, cfg config.DockerConfig, composeFiles, envFiles []string, projectName, workDir string) CleanupSummary {
 	composeFiles = normalizeComposeFiles(composeFiles)
-	summary := CleanupSummary{Status: "not_applicable", ComposeFiles: composeFiles, ComposeProject: projectName, WorkDir: workDir}
+	envFiles = normalizeComposeFiles(envFiles)
+	summary := CleanupSummary{Status: "not_applicable", ComposeFiles: composeFiles, EnvFiles: envFiles, ComposeProject: projectName, WorkDir: workDir}
 	if len(composeFiles) > 0 {
 		summary.ComposeFile = composeFiles[0]
 	}
@@ -72,7 +78,7 @@ func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner
 		summary.Warnings = append(summary.Warnings, "compose project is empty")
 		return summary
 	}
-	args := CleanupComposeArgsFilesWithProjectDir(cfg, composeFiles, projectName, workDir)
+	args := CleanupComposeArgsFilesWithProjectDirAndEnvFiles(cfg, composeFiles, envFiles, projectName, workDir)
 	result := exec.Run(ctx, 2*time.Minute, workDir, nil, "docker", args...)
 	summary.Status = "ok"
 	summary.Command = result.Command
@@ -85,12 +91,7 @@ func CleanupComposeProjectFiles(ctx context.Context, exec executor.CommandRunner
 		summary.Error = result.Err.Error()
 		return summary
 	}
-	psArgs := []string{"compose"}
-	if strings.TrimSpace(workDir) != "" {
-		psArgs = append(psArgs, "--project-directory", workDir)
-	}
-	psArgs = append(psArgs, ComposeFileArgs(composeFiles)...)
-	psArgs = append(psArgs, "-p", projectName, "ps", "-q")
+	psArgs := ComposeCommandArgsWithProjectDirAndEnvFiles(composeFiles, workDir, projectName, envFiles, "ps", "-q")
 	verify := exec.Run(ctx, 30*time.Second, workDir, nil, "docker", psArgs...)
 	summary.Verification = strings.TrimSpace(verify.Stdout + "\n" + verify.Stderr)
 	if strings.TrimSpace(verify.Stdout) != "" {
@@ -115,11 +116,15 @@ func ComposeProjectRunning(ctx context.Context, exec executor.CommandRunner, com
 }
 
 func IsRunning(ctx context.Context, exec executor.CommandRunner, composeFiles []string, projectName, workDir string) (bool, error) {
+	return IsRunningWithEnvFiles(ctx, exec, composeFiles, nil, projectName, workDir)
+}
+
+func IsRunningWithEnvFiles(ctx context.Context, exec executor.CommandRunner, composeFiles, envFiles []string, projectName, workDir string) (bool, error) {
 	composeFiles = normalizeComposeFiles(composeFiles)
 	if strings.TrimSpace(projectName) == "" {
 		return false, nil
 	}
-	args := ComposeCommandArgsWithProjectDir(composeFiles, workDir, projectName, "ps", "-q")
+	args := ComposeCommandArgsWithProjectDirAndEnvFiles(composeFiles, workDir, projectName, envFiles, "ps", "-q")
 	result := exec.Run(ctx, 10*time.Second, workDir, nil, "docker", args...)
 	if result.Err != nil {
 		return false, result.Err
@@ -128,11 +133,15 @@ func IsRunning(ctx context.Context, exec executor.CommandRunner, composeFiles []
 }
 
 func GetFrontendURL(ctx context.Context, exec executor.CommandRunner, composeFiles []string, projectName, workDir string) (string, error) {
+	return GetFrontendURLWithEnvFiles(ctx, exec, composeFiles, nil, projectName, workDir)
+}
+
+func GetFrontendURLWithEnvFiles(ctx context.Context, exec executor.CommandRunner, composeFiles, envFiles []string, projectName, workDir string) (string, error) {
 	composeFiles = normalizeComposeFiles(composeFiles)
 	if strings.TrimSpace(projectName) == "" {
 		return "", nil
 	}
-	args := ComposeCommandArgsWithProjectDir(composeFiles, workDir, projectName, "ps", "--format", "json")
+	args := ComposeCommandArgsWithProjectDirAndEnvFiles(composeFiles, workDir, projectName, envFiles, "ps", "--format", "json")
 	result := exec.Run(ctx, 10*time.Second, workDir, nil, "docker", args...)
 	if result.Err != nil {
 		return "", result.Err
@@ -196,9 +205,18 @@ func CleanupComposeArgsFiles(cfg config.DockerConfig, composeFiles []string, pro
 }
 
 func CleanupComposeArgsFilesWithProjectDir(cfg config.DockerConfig, composeFiles []string, projectName, projectDir string) []string {
+	return CleanupComposeArgsFilesWithProjectDirAndEnvFiles(cfg, composeFiles, nil, projectName, projectDir)
+}
+
+func CleanupComposeArgsFilesWithProjectDirAndEnvFiles(cfg config.DockerConfig, composeFiles, envFiles []string, projectName, projectDir string) []string {
 	args := []string{"compose"}
 	if strings.TrimSpace(projectDir) != "" {
 		args = append(args, "--project-directory", projectDir)
+	}
+	for _, envFile := range envFiles {
+		if strings.TrimSpace(envFile) != "" {
+			args = append(args, "--env-file", envFile)
+		}
 	}
 	args = append(args, ComposeFileArgs(normalizeComposeFiles(composeFiles))...)
 	args = append(args, "-p", projectName, "down")

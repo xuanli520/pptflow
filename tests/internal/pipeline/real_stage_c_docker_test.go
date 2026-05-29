@@ -79,7 +79,7 @@ func runRealStageBC(t *testing.T, project scanner.Project) {
 	stageB := runner.StageBForTest(ctx, run, project)
 	if stageB.Runtime != nil {
 		defer func() {
-			_ = dockermgr.CleanupComposeProjectFiles(context.Background(), executor.New(), cfg.Docker, stageB.Runtime.ComposeFiles, stageB.Runtime.ComposeProject, stageB.Runtime.WorkDir)
+			_ = dockermgr.CleanupComposeProjectFilesWithEnvFiles(context.Background(), executor.New(), cfg.Docker, stageB.Runtime.ComposeFiles, stageB.Runtime.EnvFiles, stageB.Runtime.ComposeProject, stageB.Runtime.WorkDir)
 		}()
 	}
 	if stageB.Record.Status != model.StageDone {

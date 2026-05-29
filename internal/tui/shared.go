@@ -380,7 +380,7 @@ func (s dbTaskActionService) StartDocker(ctx context.Context, taskID string) err
 	if s.exec == nil {
 		s.exec = executor.New()
 	}
-	args := dockermgr.ComposeCommandArgsWithProjectDir(task.ComposeMeta.ComposeFiles, task.ComposeMeta.WorkDir, task.ComposeMeta.Project, "up", "-d")
+	args := dockermgr.ComposeCommandArgsWithProjectDirAndEnvFiles(task.ComposeMeta.ComposeFiles, task.ComposeMeta.WorkDir, task.ComposeMeta.Project, task.ComposeMeta.EnvFiles, "up", "-d")
 	result := s.exec.Run(ctx, 5*time.Minute, task.ComposeMeta.WorkDir, nil, "docker", args...)
 	if result.Err != nil {
 		return fmt.Errorf("docker start failed for %s: %s", taskID, taskActionResultText(result))
@@ -398,7 +398,7 @@ func (s dbTaskActionService) StartDocker(ctx context.Context, taskID string) err
 }
 
 func inspectTaskRuntimePorts(ctx context.Context, exec executor.CommandRunner, meta model.ComposeMeta) ([]model.ServicePort, string, error) {
-	args := dockermgr.ComposeCommandArgsWithProjectDir(meta.ComposeFiles, meta.WorkDir, meta.Project, "ps", "--format", "json")
+	args := dockermgr.ComposeCommandArgsWithProjectDirAndEnvFiles(meta.ComposeFiles, meta.WorkDir, meta.Project, meta.EnvFiles, "ps", "--format", "json")
 	result := exec.Run(ctx, 30*time.Second, meta.WorkDir, nil, "docker", args...)
 	if result.Err != nil {
 		return nil, "", fmt.Errorf("docker port inspection failed: %s", taskActionResultText(result))

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
@@ -88,8 +89,27 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		}
 		return finishStage(record, model.StageFailed, start)
 	}
+	composeUsage := inspectRunTestsCompose(repoPath)
+	runTestsOwnsCompose := composeUsage.StartsStack
 	stageEnv := stageCEnvironment(runtime)
-	env := runtimeCommandEnv(stageEnv.Env)
+	if runTestsOwnsCompose {
+		stageEnv = stageEnv.withoutComposeVars()
+		stageEnv.add("COMPOSE_PROJECT_NAME", stageCTestComposeProject(r.cfg.Docker.ComposeProjectPrefix, run.TaskID, run.RunID))
+		if composeFiles := runTestsHostComposeFiles(runtime); len(composeFiles) > 0 {
+			stageEnv.add("COMPOSE_FILE", strings.Join(composeFiles, string(os.PathListSeparator)))
+		}
+	}
+	envExtra := append([]string{}, stageEnv.Env...)
+	var envFileValues []string
+	var envFileWarnings []string
+	if composeUsage.Uses {
+		envFileValues, envFileWarnings = runtimeEnvFileValues(runtime.EnvFiles)
+		envExtra = append(envExtra, envFileValues...)
+	}
+	env := runtimeCommandEnv(envExtra)
+	if composeUsage.Uses {
+		env = dockerRuntimeCommandEnv(envExtra)
+	}
 	timeout := r.stageTimeout("C", 300)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -105,12 +125,21 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		fmt.Fprintln(logFile, line)
 		appendStreamProgress(run.RunID, "C", line, "p2r", false, progress)
 	}
+	for _, warning := range envFileWarnings {
+		fmt.Fprintln(logFile, "Stage C env warning: "+warning)
+	}
 	fmt.Fprintln(logFile)
 	onOutput := func(line string, source string) {
 		appendStreamProgress(run.RunID, "C", line, source, false, progress)
 	}
 	result := r.exec.RunStreamingWithOutput(ctx, timeout, repoPath, env, logFile, onOutput, bash, "run_tests.sh")
+	var composeCleanup *stageCTestComposeCleanup
+	if runTestsOwnsCompose {
+		cleanup := r.cleanupStageCTestCompose(ctx, repoPath, env, logFile, composeUsage)
+		composeCleanup = &cleanup
+	}
 	cleanup := cleanupStageCTestArtifacts(repoPath)
+	cleanup.Compose = composeCleanup
 	for _, removed := range cleanup.Removed {
 		fmt.Fprintln(logFile, "Stage C cleaned test artifact: "+removed)
 	}
@@ -131,14 +160,18 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	}
 	record.ArtifactPaths = append([]string{logPath}, pages...)
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, map[string]any{"exit_code": result.ExitCode, "timeout": result.Timeout, "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "cleanup": cleanup}))
+	summaryExtra := map[string]any{"exit_code": result.ExitCode, "timeout": result.Timeout, "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "cleanup": cleanup}
+	if len(envFileWarnings) > 0 {
+		summaryExtra["env_file_warnings"] = envFileWarnings
+	}
+	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, summaryExtra))
 	if result.Err != nil {
 		record.Findings = append(record.Findings, model.Finding{
 			Stage:      "C",
 			Severity:   "High",
 			Title:      "run_tests runtime evidence failed",
 			Rule:       "Stage C must execute the unified test entrypoint successfully.",
-			Evidence:   strings.TrimSpace(result.Stderr),
+			Evidence:   stageCTrimResult(result),
 			Impact:     "The delivery package does not currently have passing runtime test evidence.",
 			MinimumFix: "Fix the test entrypoint or application runtime and rerun C.",
 		})
@@ -151,8 +184,56 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 }
 
 type stageCTestArtifactCleanup struct {
-	Removed  []string `json:"removed"`
-	Warnings []string `json:"warnings,omitempty"`
+	Removed  []string                  `json:"removed"`
+	Warnings []string                  `json:"warnings,omitempty"`
+	Compose  *stageCTestComposeCleanup `json:"compose,omitempty"`
+}
+
+type stageCTestComposeCleanup struct {
+	Command       string `json:"command,omitempty"`
+	ExitCode      int    `json:"exit_code,omitempty"`
+	Stdout        string `json:"stdout,omitempty"`
+	Stderr        string `json:"stderr,omitempty"`
+	Error         string `json:"error,omitempty"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+}
+
+func (r Runner) cleanupStageCTestCompose(ctx context.Context, repoPath string, env []string, logFile *os.File, usage runTestsComposeUsage) stageCTestComposeCleanup {
+	if usage.ExplicitProject {
+		reason := "run_tests.sh uses an explicit Docker Compose project; relying on its own cleanup trap"
+		if logFile != nil {
+			fmt.Fprintln(logFile, "Stage C compose cleanup skipped: "+reason)
+		}
+		return stageCTestComposeCleanup{SkippedReason: reason}
+	}
+	if ctx == nil || ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+	}
+	result := r.exec.Run(ctx, 2*time.Minute, repoPath, env, "docker", "compose", "down", "--volumes", "--remove-orphans")
+	cleanup := stageCTestComposeCleanup{
+		Command:  result.Command,
+		ExitCode: result.ExitCode,
+		Stdout:   result.Stdout,
+		Stderr:   result.Stderr,
+	}
+	if result.Err != nil {
+		cleanup.Error = result.Err.Error()
+	}
+	if logFile != nil {
+		fmt.Fprintln(logFile, "Stage C compose cleanup: "+result.Command)
+		if strings.TrimSpace(result.Stdout) != "" {
+			fmt.Fprintln(logFile, result.Stdout)
+		}
+		if strings.TrimSpace(result.Stderr) != "" {
+			fmt.Fprintln(logFile, result.Stderr)
+		}
+		if result.Err != nil {
+			fmt.Fprintln(logFile, "Stage C compose cleanup warning: "+stageCTrimResult(result))
+		}
+	}
+	return cleanup
 }
 
 var stageCTestArtifactNames = map[string]bool{
@@ -208,6 +289,27 @@ func cleanupStageCTestArtifacts(repoPath string) stageCTestArtifactCleanup {
 		cleanup.Warnings = append(cleanup.Warnings, err.Error())
 	}
 	return cleanup
+}
+
+func runTestsHostComposeFiles(runtime RuntimeState) []string {
+	runtime.Normalize()
+	files := runtime.ComposeFiles
+	if len(files) == 0 && strings.TrimSpace(runtime.ComposeFile) != "" {
+		files = []string{runtime.ComposeFile}
+	}
+	result := make([]string, 0, len(files))
+	for _, file := range files {
+		switch filepath.Base(file) {
+		case "compose.env.yml", "compose.ports.yml", "runtime_labels.compose.yml", "stage_c.runner.override.yml":
+			continue
+		}
+		result = append(result, file)
+	}
+	return result
+}
+
+func stageCTestComposeProject(prefix, taskID, runID string) string {
+	return dockermgr.ComposeProjectName(prefix, taskID, runID+"-tests")
 }
 
 func stageCRuntimeSummary(ok bool, reason string, runtime RuntimeState, prior map[string]model.StageRecord, extra map[string]any) map[string]any {

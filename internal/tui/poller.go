@@ -89,7 +89,7 @@ func (p *schedulerPoller) refreshDockerHealth(ctx context.Context) (int, []strin
 	var stopped []string
 	var errs []error
 	for _, task := range tasks {
-		running, err := dockermgr.IsRunning(ctx, p.exec, task.ComposeMeta.ComposeFiles, task.ComposeMeta.Project, task.ComposeMeta.WorkDir)
+		running, err := dockermgr.IsRunningWithEnvFiles(ctx, p.exec, task.ComposeMeta.ComposeFiles, task.ComposeMeta.EnvFiles, task.ComposeMeta.Project, task.ComposeMeta.WorkDir)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", task.ID, err))
 			continue

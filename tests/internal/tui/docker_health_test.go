@@ -27,19 +27,20 @@ func TestDockerHealthPollerMarksMissingComposeProjectStopped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordTaskRuntime(ctx, lost.ID, "", true, model.ComposeMeta{Project: "lost", ComposeFiles: []string{"compose.yml"}, WorkDir: lost.RepoPath}); err != nil {
+	if err := store.RecordTaskRuntime(ctx, lost.ID, "", true, model.ComposeMeta{Project: "lost", ComposeFiles: []string{"compose.yml"}, EnvFiles: []string{"/tmp/lost/runtime.env"}, WorkDir: lost.RepoPath}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RecordTaskRuntime(ctx, running.ID, "", true, model.ComposeMeta{Project: "running", ComposeFiles: []string{"compose.yml"}, WorkDir: running.RepoPath}); err != nil {
 		t.Fatal(err)
 	}
-
-	checked, stopped, err := tuiapp.RefreshDockerHealthForTest(ctx, store, cfg, dockerHealthExec{
+	exec := &dockerHealthExec{
 		stdoutByProject: map[string]string{
 			"lost":    "",
 			"running": "container-id\n",
 		},
-	})
+	}
+
+	checked, stopped, err := tuiapp.RefreshDockerHealthForTest(ctx, store, cfg, exec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +57,11 @@ func TestDockerHealthPollerMarksMissingComposeProjectStopped(t *testing.T) {
 	}
 	if lostTask.DockerRunning || !runningTask.DockerRunning {
 		t.Fatalf("docker flags lost=%v running=%v", lostTask.DockerRunning, runningTask.DockerRunning)
+	}
+	if !slices.ContainsFunc(exec.commands, func(command string) bool {
+		return strings.Contains(command, "--env-file /tmp/lost/runtime.env")
+	}) {
+		t.Fatalf("docker health should pass runtime env files: %#v", exec.commands)
 	}
 }
 
@@ -74,13 +80,14 @@ func tuiDockerHealthStore(t *testing.T) (*db.Store, config.Config) {
 
 type dockerHealthExec struct {
 	stdoutByProject map[string]string
+	commands        []string
 }
 
 func (dockerHealthExec) LookPath(name string) (string, error) {
 	return name, nil
 }
 
-func (e dockerHealthExec) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+func (e *dockerHealthExec) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
 	project := ""
 	for index, arg := range args {
 		if arg == "-p" && index+1 < len(args) {
@@ -88,12 +95,14 @@ func (e dockerHealthExec) Run(ctx context.Context, timeout time.Duration, dir st
 			break
 		}
 	}
+	command := strings.Join(append([]string{name}, args...), " ")
+	e.commands = append(e.commands, command)
 	return executor.Result{
-		Command: strings.Join(append([]string{name}, args...), " "),
+		Command: command,
 		Stdout:  e.stdoutByProject[project],
 	}
 }
 
-func (e dockerHealthExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
+func (e *dockerHealthExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
 	return e.Run(ctx, timeout, dir, env, name, args...)
 }

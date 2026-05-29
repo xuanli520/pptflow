@@ -20,7 +20,7 @@ func TestForceExitCleanupKeepsGoingAfterProjectFailure(t *testing.T) {
 	runner := &exitCleanupRunner{failProject: "p2r_fail"}
 
 	summary, err := pipelinepkg.ForceExitCleanup(context.Background(), runner, cfg, []model.ComposeMeta{
-		{Project: "p2r_ok", ComposeFiles: []string{"compose.yml"}, WorkDir: "/tmp/ok"},
+		{Project: "p2r_ok", ComposeFiles: []string{"compose.yml"}, EnvFiles: []string{"/tmp/ok/runtime.env"}, WorkDir: "/tmp/ok"},
 		{Project: "p2r_fail", ComposeFiles: []string{"compose.yml"}, WorkDir: "/tmp/fail"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "p2r_fail") {
@@ -37,6 +37,9 @@ func TestForceExitCleanupKeepsGoingAfterProjectFailure(t *testing.T) {
 	}
 	if !containsExitCleanupCommand(runner.commands, " -p p2r_ok down ") || !containsExitCleanupCommand(runner.commands, " -p p2r_fail down ") {
 		t.Fatalf("expected both compose projects to be cleaned: %#v", runner.commands)
+	}
+	if !containsExitCleanupCommand(runner.commands, "--env-file /tmp/ok/runtime.env ") {
+		t.Fatalf("runtime env file should be passed to cleanup: %#v", runner.commands)
 	}
 }
 

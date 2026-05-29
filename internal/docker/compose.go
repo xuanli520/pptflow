@@ -312,9 +312,18 @@ func ComposeCommandArgs(files []string, projectName string, tail ...string) []st
 }
 
 func ComposeCommandArgsWithProjectDir(files []string, projectDir, projectName string, tail ...string) []string {
+	return ComposeCommandArgsWithProjectDirAndEnvFiles(files, projectDir, projectName, nil, tail...)
+}
+
+func ComposeCommandArgsWithProjectDirAndEnvFiles(files []string, projectDir, projectName string, envFiles []string, tail ...string) []string {
 	args := []string{"compose"}
 	if strings.TrimSpace(projectDir) != "" {
 		args = append(args, "--project-directory", projectDir)
+	}
+	for _, envFile := range envFiles {
+		if strings.TrimSpace(envFile) != "" {
+			args = append(args, "--env-file", envFile)
+		}
 	}
 	args = append(args, ComposeFileArgs(files)...)
 	args = append(args, "-p", projectName)

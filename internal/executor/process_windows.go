@@ -10,7 +10,7 @@ import (
 
 func prepareCommand(cmd *exec.Cmd) {}
 
-func terminateCommand(cmd *exec.Cmd) error {
+func terminateCommand(cmd *exec.Cmd, _ <-chan struct{}) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}

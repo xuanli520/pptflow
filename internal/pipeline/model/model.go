@@ -70,6 +70,7 @@ type Batch struct {
 type ComposeMeta struct {
 	Project      string        `json:"project"`
 	ComposeFiles []string      `json:"compose_files,omitempty"`
+	EnvFiles     []string      `json:"env_files,omitempty"`
 	WorkDir      string        `json:"work_dir,omitempty"`
 	Ports        []ServicePort `json:"ports,omitempty"`
 }

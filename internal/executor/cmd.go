@@ -60,9 +60,27 @@ func ConfigureCommand(cmd *exec.Cmd) {
 	}
 	prepareCommand(cmd)
 	cmd.Cancel = func() error {
-		return terminateCommand(cmd)
+		return terminateCommand(cmd, nil)
 	}
-	cmd.WaitDelay = 5 * time.Second
+	cmd.WaitDelay = 15 * time.Second
+}
+
+func configureCommandForRun(cmd *exec.Cmd) func() {
+	if cmd == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	prepareCommand(cmd)
+	cmd.Cancel = func() error {
+		return terminateCommand(cmd, done)
+	}
+	cmd.WaitDelay = 15 * time.Second
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+		})
+	}
 }
 
 func runCommand(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, writer io.Writer, name string, args ...string) Result {
@@ -72,7 +90,7 @@ func runCommand(ctx context.Context, timeout time.Duration, dir string, env []st
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	ConfigureCommand(cmd)
+	commandDone := configureCommandForRun(cmd)
 	cmd.Dir = dir
 	if len(env) > 0 {
 		cmd.Env = env
@@ -90,6 +108,7 @@ func runCommand(ctx context.Context, timeout time.Duration, dir string, env []st
 		cmd.Stderr = &stderr
 	}
 	err := cmd.Run()
+	commandDone()
 	result := Result{
 		Command: strings.Join(append([]string{name}, args...), " "),
 		Stdout:  stdout.String(),
@@ -255,7 +274,7 @@ func runCommandStreamingWithOutput(ctx context.Context, timeout time.Duration, d
 	}
 	command := strings.Join(append([]string{name}, args...), " ")
 	cmd := exec.CommandContext(ctx, name, args...)
-	ConfigureCommand(cmd)
+	commandDone := configureCommandForRun(cmd)
 	cmd.Dir = dir
 	if len(env) > 0 {
 		cmd.Env = env
@@ -271,6 +290,7 @@ func runCommandStreamingWithOutput(ctx context.Context, timeout time.Duration, d
 	cmd.Stderr = stderrWriter
 
 	err := cmd.Run()
+	commandDone()
 	waitCtxErr := ctx.Err()
 	stdoutWriter.flushPending()
 	stderrWriter.flushPending()

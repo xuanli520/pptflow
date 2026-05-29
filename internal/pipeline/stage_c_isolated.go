@@ -104,6 +104,18 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 			MinimumFix: "Configure pipeline.stage_c.runner_image with an image that can run repo/run_tests.sh.",
 		}, nil)
 	}
+	if runTestsUsesDockerCompose(repoPath) {
+		reason := "repo/run_tests.sh invokes Docker Compose, which isolated Stage C does not support without a Docker socket."
+		return fail(reason, &model.Finding{
+			Stage:      "C",
+			Severity:   "High",
+			Title:      "Unified test entrypoint requires host Docker Compose",
+			Rule:       "Isolated Stage C runs without a Docker socket and cannot execute repo/run_tests.sh that starts Docker Compose stacks.",
+			Evidence:   reason,
+			Impact:     "Runtime test evidence cannot be collected in isolated mode.",
+			MinimumFix: "Use host Stage C for this project or move Docker Compose startup out of run_tests.sh.",
+		}, nil)
+	}
 
 	plan, loadedPlan, err := loadStageCProxyPlan(run.ArtifactRoot)
 	if err != nil {
@@ -178,7 +190,7 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 
 	timeout := r.stageTimeout("C", 300)
 	composeFiles := append(append([]string{}, plan.ComposeFiles...), plan.OverrideFile)
-	upArgs := dockermgr.ComposeCommandArgsWithProjectDir(composeFiles, runtime.WorkDir, runtime.ComposeProject, "--profile", stageCProfileName, "up", "-d", stageCProxyService)
+	upArgs := dockermgr.ComposeCommandArgsWithProjectDirAndEnvFiles(composeFiles, runtime.WorkDir, runtime.ComposeProject, runtime.EnvFiles, "--profile", stageCProfileName, "up", "-d", stageCProxyService)
 	up := r.exec.RunStreamingWithOutput(ctx, timeout, runtime.WorkDir, dockerCommandEnv(), logFile, stageCOutput(run.RunID, progress), "docker", upArgs...)
 	if up.Err != nil {
 		cleanup := r.cleanupStageCIsolated(ctx, runtime, composeFiles, plan.RunnerName, logFile)
@@ -194,9 +206,16 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 		}, map[string]any{"proxy_plan": plan, "cleanup": cleanup, "command": up.Command, "exit_code": up.ExitCode, "timeout": up.Timeout})
 	}
 
-	runArgs := dockermgr.ComposeCommandArgsWithProjectDir(composeFiles, runtime.WorkDir, runtime.ComposeProject, "--profile", stageCProfileName, "run", "--rm", "-T", "--no-deps", "--name", plan.RunnerName, stageCRunnerService)
+	runArgs := dockermgr.ComposeCommandArgsWithProjectDirAndEnvFiles(composeFiles, runtime.WorkDir, runtime.ComposeProject, runtime.EnvFiles, "--profile", stageCProfileName, "run", "--rm", "-T", "--no-deps", "--name", plan.RunnerName, stageCRunnerService)
 	result := r.exec.RunStreamingWithOutput(ctx, timeout, runtime.WorkDir, dockerCommandEnv(), logFile, stageCOutput(run.RunID, progress), "docker", runArgs...)
 	cleanup := r.cleanupStageCIsolated(ctx, runtime, composeFiles, plan.RunnerName, logFile)
+	testArtifactCleanup := cleanupStageCTestArtifacts(repoPath)
+	for _, removed := range testArtifactCleanup.Removed {
+		fmt.Fprintln(logFile, "Stage C cleaned test artifact: "+removed)
+	}
+	for _, warning := range testArtifactCleanup.Warnings {
+		fmt.Fprintln(logFile, "Stage C cleanup warning: "+warning)
+	}
 	endLine := fmt.Sprintf("=== C isolated run_tests.sh end: exit=%d timeout=%t err=%v ===", result.ExitCode, result.Timeout, result.Err)
 	fmt.Fprintf(logFile, "\n%s\n", endLine)
 	appendStreamProgress(run.RunID, "C", endLine, "p2r", true, progress)
@@ -207,12 +226,13 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 	record.ArtifactPaths = append([]string{logPath}, pages...)
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath, proxyPath, envPath, overridePath)
 	extra := map[string]any{
-		"mode":       "isolated",
-		"exit_code":  result.ExitCode,
-		"timeout":    result.Timeout,
-		"command":    "docker compose run " + stageCRunnerService,
-		"proxy_plan": plan,
-		"cleanup":    cleanup,
+		"mode":                  "isolated",
+		"exit_code":             result.ExitCode,
+		"timeout":               result.Timeout,
+		"command":               "docker compose run " + stageCRunnerService,
+		"proxy_plan":            plan,
+		"cleanup":               cleanup,
+		"test_artifact_cleanup": testArtifactCleanup,
 	}
 	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, extra))
 	if result.Err != nil {
@@ -221,7 +241,7 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 			Severity:   "High",
 			Title:      "run_tests runtime evidence failed",
 			Rule:       "Stage C must execute the unified test entrypoint successfully.",
-			Evidence:   strings.TrimSpace(result.Stderr),
+			Evidence:   stageCTrimResult(result),
 			Impact:     "The delivery package does not currently have passing runtime test evidence.",
 			MinimumFix: "Fix the test entrypoint or application runtime and rerun C.",
 		})
@@ -259,7 +279,7 @@ func (r Runner) cleanupStageCIsolated(ctx context.Context, runtime RuntimeState,
 	if rmRunner.Err != nil {
 		cleanup.Warnings = append(cleanup.Warnings, "runner cleanup failed: "+stageCTrimResult(rmRunner))
 	}
-	rmProxyArgs := dockermgr.ComposeCommandArgsWithProjectDir(composeFiles, runtime.WorkDir, runtime.ComposeProject, "--profile", stageCProfileName, "rm", "-sf", stageCProxyService)
+	rmProxyArgs := dockermgr.ComposeCommandArgsWithProjectDirAndEnvFiles(composeFiles, runtime.WorkDir, runtime.ComposeProject, runtime.EnvFiles, "--profile", stageCProfileName, "rm", "-sf", stageCProxyService)
 	rmProxy := r.exec.Run(ctx, 30*time.Second, runtime.WorkDir, dockerCommandEnv(), "docker", rmProxyArgs...)
 	cleanup.Commands = append(cleanup.Commands, rmProxy.Command)
 	cleanup.ProxyRemoved = rmProxy.Err == nil

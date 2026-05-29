@@ -32,6 +32,7 @@ type RuntimeState struct {
 	ComposeProject string                   `json:"compose_project"`
 	ComposeFile    string                   `json:"compose_file,omitempty"`
 	ComposeFiles   []string                 `json:"compose_files,omitempty"`
+	EnvFiles       []string                 `json:"env_files,omitempty"`
 	WorkDir        string                   `json:"work_dir"`
 	Services       []string                 `json:"services"`
 	Mappings       map[string][]PortMapping `json:"mappings"`
@@ -67,6 +68,7 @@ func (s *RuntimeState) Normalize() {
 	if strings.TrimSpace(s.ComposeFile) == "" && len(s.ComposeFiles) > 0 {
 		s.ComposeFile = s.ComposeFiles[0]
 	}
+	s.EnvFiles = normalizeComposeFiles(s.EnvFiles)
 	if s.Mappings == nil {
 		s.Mappings = map[string][]PortMapping{}
 	}

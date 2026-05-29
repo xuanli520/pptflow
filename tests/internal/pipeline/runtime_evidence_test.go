@@ -318,6 +318,12 @@ func TestStageCIsolatedRunsDockerComposeAndCleansProxy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\ncurl http://localhost:8080\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(repoPath, ".pytest_cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, ".pytest_cache", "README.md"), []byte("cache"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	composePath := filepath.Join(repoPath, "compose.yml")
 	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n    ports:\n      - \"8080:80\"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -352,6 +358,9 @@ func TestStageCIsolatedRunsDockerComposeAndCleansProxy(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(artifactRoot, "p2r_ports.env")); err != nil {
 		t.Fatalf("ports env should be written: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoPath, ".pytest_cache")); !os.IsNotExist(err) {
+		t.Fatalf("isolated Stage C should clean test artifacts, stat err: %v", err)
 	}
 	for _, want := range []string{
 		"--profile p2r-stage-c up -d p2r_stage_c_proxy",
@@ -643,6 +652,255 @@ func TestStageBEmptyPortMappingKeepsTaskDockerRunning(t *testing.T) {
 	}
 }
 
+func TestStageBRewritesFixedPortsWhenRunTestsStartsDockerCompose(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\ndocker compose up -d --build db backend\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "docker-compose.yml"), []byte("services:\n  web:\n    image: test\n    ports:\n      - \"8080:80\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "run")
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "host"
+	cfg.Docker.HealthCheckTimeoutSeconds = 1
+	runner := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(stageBDockerRunner{}))
+	outcome := runner.StageBForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath})
+
+	if outcome.Record.Status != model.StageDone {
+		t.Fatalf("Stage B should still succeed, got %#v", outcome.Record)
+	}
+	if outcome.Runtime == nil {
+		t.Fatal("expected runtime state")
+	}
+	summaryPath := filepath.Join(artifactRoot, "docker_runtime_summary.json")
+	content, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), `"generated": true`) || !strings.Contains(string(content), "compose.ports.yml") {
+		t.Fatalf("runtime port rewrite should be generated for compose-owning run_tests:\n%s", content)
+	}
+}
+
+func TestStageBDoesNotRewriteFixedPortsForComposeExecOnlyRunTests(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\n/usr/bin/docker compose exec -T backend pytest\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "docker-compose.yml"), []byte("services:\n  web:\n    image: test\n    ports:\n      - \"8080:80\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "run")
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "host"
+	cfg.Docker.HealthCheckTimeoutSeconds = 1
+	outcome := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(stageBDockerRunner{})).StageBForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath})
+
+	if outcome.Record.Status != model.StageDone {
+		t.Fatalf("Stage B should succeed, got %#v", outcome.Record)
+	}
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "docker_runtime_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), `"generated": true`) || strings.Contains(string(content), "compose.ports.yml") {
+		t.Fatalf("exec-only run_tests should not force runtime port rewrite:\n%s", content)
+	}
+}
+
+func TestRunTestsComposeUsageDetectsPathAndVariableCommands(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := strings.Join([]string{
+		`#!/usr/bin/env bash`,
+		`COMPOSE_CMD="/usr/local/bin/docker compose"`,
+		`$COMPOSE_CMD exec -T backend pytest`,
+		`/usr/bin/docker-compose -p custom up -d backend`,
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	usage := pipelinepkg.RunTestsComposeUsageForTest(repoPath)
+	if !usage.Uses || !usage.StartsStack || !usage.ExplicitProject {
+		t.Fatalf("compose usage not classified correctly: %#v", usage)
+	}
+}
+
+func TestStageCIsolatedRejectsDockerComposeOwningRunTests(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\ndocker compose up -d --build db backend\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "docker-compose.yml"), []byte("services:\n  web:\n    image: nginx\n    ports:\n      - \"8080:80\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "artifacts")
+	if err := os.MkdirAll(artifactRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "isolated"
+	cfg.Pipeline.StageC.RunnerImage = "golang:1.25"
+	runner := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(&stageCIsolatedRunner{}))
+	record := runner.StageCForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    filepath.Join(repoPath, "docker-compose.yml"),
+		ComposeFiles:   []string{filepath.Join(repoPath, "docker-compose.yml")},
+		WorkDir:        repoPath,
+	}, nil)
+
+	if record.Status != model.StageFailed || !strings.Contains(record.ErrorSummary, "Docker Compose") {
+		t.Fatalf("isolated Stage C should reject compose-owning run_tests, got %#v", record)
+	}
+}
+
+func TestStageCHostComposeOwningRunTestsKeepsMirrorOverrideOnly(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///tmp/p2r-test-docker.sock")
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	artifactRoot := filepath.Join(root, "artifacts")
+	for _, dir := range []string{repoPath, filepath.Join(artifactRoot, "logs")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\ndocker compose up -d --build backend\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(repoPath, "docker-compose.yml")
+	portOverride := filepath.Join(artifactRoot, "docker_runtime", "compose.ports.yml")
+	envOverride := filepath.Join(artifactRoot, "docker_runtime", "compose.env.yml")
+	envFile := filepath.Join(artifactRoot, "docker_runtime", "runtime.env")
+	mirrorOverride := filepath.Join(artifactRoot, "docker_mirror", "compose.mirror.override.yml")
+	labelOverride := filepath.Join(artifactRoot, "runtime_labels.compose.yml")
+	if err := os.MkdirAll(filepath.Dir(envFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envFile, []byte("APP_ENV=stage-c\nSECRET_KEY=from-env-file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &stageCHostEnvRunner{}
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "host"
+	record := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(runner)).StageCForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    composePath,
+		ComposeFiles:   []string{composePath, envOverride, portOverride, mirrorOverride, labelOverride},
+		EnvFiles:       []string{envFile},
+		WorkDir:        repoPath,
+		Mappings: map[string][]portMapping{
+			"backend": {{Service: "backend", URL: "0.0.0.0", Host: 32777, Container: 8000, Protocol: "tcp"}},
+		},
+	}, map[string]model.StageRecord{string(model.StageB): {Stage: "B", Status: model.StageDone}})
+
+	if record.Status != model.StageDone {
+		t.Fatalf("Stage C should pass, got %#v", record)
+	}
+	values := envMap(runner.env)
+	if values["COMPOSE_PROJECT_NAME"] == "" || values["COMPOSE_PROJECT_NAME"] == "p2rqa_task_run" {
+		t.Fatalf("self-managed run_tests must receive an isolated test compose project: %#v", values)
+	}
+	if values["DOCKER_HOST"] != "unix:///tmp/p2r-test-docker.sock" {
+		t.Fatalf("compose run_tests should inherit Docker daemon settings: %#v", values)
+	}
+	if values["APP_ENV"] != "stage-c" || values["SECRET_KEY"] != "from-env-file" {
+		t.Fatalf("compose run_tests should receive generated runtime env-file values without logging them: %#v", values)
+	}
+	composeEnv := values["COMPOSE_FILE"]
+	if !strings.Contains(composeEnv, composePath) || !strings.Contains(composeEnv, mirrorOverride) {
+		t.Fatalf("COMPOSE_FILE should retain original plus mirror override, got %q", composeEnv)
+	}
+	if strings.Contains(composeEnv, envOverride) || strings.Contains(composeEnv, portOverride) || strings.Contains(composeEnv, labelOverride) {
+		t.Fatalf("COMPOSE_FILE should omit p2r runtime-only overrides, got %q", composeEnv)
+	}
+}
+
+func TestStageCHostSkipsGenericComposeCleanupForExplicitProject(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	artifactRoot := filepath.Join(root, "artifacts")
+	for _, dir := range []string{repoPath, filepath.Join(artifactRoot, "logs")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\ndocker compose -p custom-tests up -d backend\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &stageCHostEnvRunner{}
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "host"
+	record := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(runner)).StageCForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    filepath.Join(repoPath, "docker-compose.yml"),
+		ComposeFiles:   []string{filepath.Join(repoPath, "docker-compose.yml")},
+		WorkDir:        repoPath,
+		Mappings: map[string][]portMapping{
+			"backend": {{Service: "backend", URL: "0.0.0.0", Host: 32777, Container: 8000, Protocol: "tcp"}},
+		},
+	}, map[string]model.StageRecord{string(model.StageB): {Stage: "B", Status: model.StageDone}})
+
+	if record.Status != model.StageDone {
+		t.Fatalf("Stage C should pass, got %#v", record)
+	}
+	if slices.ContainsFunc(runner.commands, func(command string) bool {
+		return strings.Contains(command, " compose down ")
+	}) {
+		t.Fatalf("explicit -p script should not get unrelated generic cleanup: %#v", runner.commands)
+	}
+}
+
 func stageRecordForTest(stages []model.StageRecord, stage string) model.StageRecord {
 	for _, record := range stages {
 		if record.Stage == stage {
@@ -777,6 +1035,34 @@ func (r *stageCIsolatedRunner) result(name string, args ...string) executor.Resu
 	command := strings.Join(append([]string{name}, args...), " ")
 	r.commands = append(r.commands, command)
 	return executor.Result{Command: command, Stdout: command + " ok\n"}
+}
+
+type stageCHostEnvRunner struct {
+	env      []string
+	commands []string
+}
+
+func (r *stageCHostEnvRunner) LookPath(name string) (string, error) {
+	return name, nil
+}
+
+func (r *stageCHostEnvRunner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	command := strings.Join(append([]string{name}, args...), " ")
+	r.commands = append(r.commands, command)
+	return executor.Result{Command: command}
+}
+
+func (r *stageCHostEnvRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
+	r.env = append([]string{}, env...)
+	command := strings.Join(append([]string{name}, args...), " ")
+	r.commands = append(r.commands, command)
+	if writer != nil {
+		_, _ = writer.Write([]byte("ok\n"))
+	}
+	if onOutput != nil {
+		onOutput("ok", "stdout")
+	}
+	return executor.Result{Command: command, Stdout: "ok\n"}
 }
 
 type cancelledStageCIsolatedRunner struct {

@@ -37,6 +37,34 @@ wait
 	}
 }
 
+func TestRunTimeoutAllowsShellTrapBeforeKill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell trap timeout behavior is Unix-specific")
+	}
+	dir := t.TempDir()
+	trapFile := filepath.Join(dir, "trap-ran")
+	script := filepath.Join(dir, "trap.sh")
+	if err := os.WriteFile(script, []byte(`#!/usr/bin/env bash
+set -euo pipefail
+trap 'sleep 3; echo trap > trap-ran' EXIT
+sleep 10
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := executor.New().Run(context.Background(), 100*time.Millisecond, dir, nil, script)
+	if !result.Timeout {
+		t.Fatalf("expected timeout, got result: %#v", result)
+	}
+	content, err := os.ReadFile(trapFile)
+	if err != nil {
+		t.Fatalf("expected EXIT trap to run before hard kill: %v", err)
+	}
+	if strings.TrimSpace(string(content)) != "trap" {
+		t.Fatalf("unexpected trap file content: %q", content)
+	}
+}
+
 func TestRunStreamingWithOutputCapturesStdoutAndStderrLines(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell streaming test is Unix-specific")

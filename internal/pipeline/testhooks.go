@@ -33,6 +33,7 @@ type TestRuntimeEvidence struct {
 	ComposeProject string                       `json:"compose_project"`
 	ComposeFile    string                       `json:"compose_file"`
 	ComposeFiles   []string                     `json:"compose_files"`
+	EnvFiles       []string                     `json:"env_files"`
 	WorkDir        string                       `json:"work_dir"`
 	Services       []string                     `json:"services"`
 	Mappings       map[string][]TestPortMapping `json:"mappings"`
@@ -45,6 +46,12 @@ type TestRuntimeMirrorState struct {
 	BuildMirrorMode         string `json:"build_mirror_mode,omitempty"`
 	BuildMirrorFallbackUsed bool   `json:"build_mirror_fallback_used,omitempty"`
 	BuildMirrorSummary      string `json:"build_mirror_summary,omitempty"`
+}
+
+type TestRunTestsComposeUsage struct {
+	Uses            bool
+	StartsStack     bool
+	ExplicitProject bool
 }
 
 type TestStageCCommandEnv struct {
@@ -319,6 +326,15 @@ func (r Runner) StageCForTest(ctx context.Context, run model.RunRecord, project 
 	return r.stageC(ctx, run, project, runtimeEvidenceFromTest(runtime), prior, nil)
 }
 
+func RunTestsComposeUsageForTest(repoPath string) TestRunTestsComposeUsage {
+	usage := inspectRunTestsCompose(repoPath)
+	return TestRunTestsComposeUsage{
+		Uses:            usage.Uses,
+		StartsStack:     usage.StartsStack,
+		ExplicitProject: usage.ExplicitProject,
+	}
+}
+
 func CleanupStageCTestArtifactsForTest(repoPath string) TestStageCTestArtifactCleanup {
 	cleanup := cleanupStageCTestArtifacts(repoPath)
 	return TestStageCTestArtifactCleanup{
@@ -340,6 +356,7 @@ func runtimeEvidenceFromTest(evidence TestRuntimeEvidence) runtimeEvidence {
 		ComposeProject: evidence.ComposeProject,
 		ComposeFile:    evidence.ComposeFile,
 		ComposeFiles:   append([]string{}, evidence.ComposeFiles...),
+		EnvFiles:       append([]string{}, evidence.EnvFiles...),
 		WorkDir:        evidence.WorkDir,
 		Services:       append([]string{}, evidence.Services...),
 		Mappings:       runtimePortMappingMap(evidence.Mappings),

@@ -32,6 +32,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	screenshotPath := qaArtifactPath(run.ArtifactRoot, "docker_startup.png")
 	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, runtimeSummaryPath, mirrorSummaryPath, effectiveConfigPath, stageCProxyConfigPath, stageCProxyPath, stageCPortsEnvPath, screenshotPath)
 	repoPath := filepath.Join(project.Path, "repo")
+	rewriteFixedPorts := strings.EqualFold(strings.TrimSpace(r.cfg.Pipeline.StageC.Execution), "isolated") || runTestsStartsDockerComposeStack(repoPath)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		recordArtifactWarning(&record, newArtifactWarning(writer.RelativePath(logPath), "write_text", false, err))
@@ -54,7 +55,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		Labels:            runtimeLabels(r.cfg.Docker, project.TaskID, run.RunID),
 		Env:               dockerCommandEnv(),
 		Log:               logWriter,
-		RewriteFixedPorts: strings.EqualFold(strings.TrimSpace(r.cfg.Pipeline.StageC.Execution), "isolated"),
+		RewriteFixedPorts: rewriteFixedPorts,
 		Progress: func(event dockermgr.ProgressEvent) {
 			appendStreamProgress(run.RunID, "B", event.Line, event.Source, event.Done, progress)
 		},
@@ -102,13 +103,14 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		"compose_project":       result.Runtime.ComposeProject,
 		"compose_file":          result.Runtime.ComposeFile,
 		"compose_files":         result.Runtime.ComposeFiles,
+		"env_files":             result.Runtime.EnvFiles,
 		"work_dir":              result.Runtime.WorkDir,
 		"services":              result.Runtime.Services,
 		"mappings":              result.Runtime.Mappings,
 		"probes":                result.Runtime.Probes,
 		"mirror":                result.Runtime.Mirror,
 		"labels":                runtimeLabels(r.cfg.Docker, project.TaskID, run.RunID),
-		"cleanup_command":       dockerCleanupCommandText(r.cfg.Docker, result.Runtime.ComposeFiles, result.Runtime.ComposeProject, result.Runtime.WorkDir),
+		"cleanup_command":       dockerCleanupCommandText(r.cfg.Docker, result.Runtime.ComposeFiles, result.Runtime.EnvFiles, result.Runtime.ComposeProject, result.Runtime.WorkDir),
 		"runtime_summary":       "docker_runtime_summary.json",
 		"docker_mirror_summary": "docker_mirror_summary.json",
 		"stage_timeouts": map[string]int{
@@ -167,6 +169,7 @@ func composeMetaFromRuntime(runtime RuntimeState) model.ComposeMeta {
 	return model.ComposeMeta{
 		Project:      runtime.ComposeProject,
 		ComposeFiles: append([]string(nil), runtime.ComposeFiles...),
+		EnvFiles:     append([]string(nil), runtime.EnvFiles...),
 		WorkDir:      runtime.WorkDir,
 		Ports:        servicePortsFromRuntime(runtime),
 	}
@@ -245,6 +248,7 @@ func mergeDockerRuntimeIntoManifest(artifactRoot string, result dockermgr.StartR
 		"compose_project": result.RuntimeSummary.ComposeProject,
 		"compose_file":    result.RuntimeSummary.ComposeFile,
 		"compose_files":   result.RuntimeSummary.ComposeFiles,
+		"env_files":       result.Runtime.EnvFiles,
 		"pull_status":     result.RuntimeSummary.Pull.Status,
 		"build_status":    result.RuntimeSummary.Build.Status,
 		"fallback_used":   result.RuntimeSummary.Build.FallbackUsed,
@@ -267,7 +271,8 @@ func runtimeStateFromCleanupMeta(meta map[string]any) RuntimeState {
 	return RuntimeState{
 		ComposeProject: strings.TrimSpace(fmt.Sprint(meta["compose_project"])),
 		ComposeFile:    strings.TrimSpace(fmt.Sprint(meta["compose_file"])),
-		ComposeFiles:   metaComposeFiles(meta),
+		ComposeFiles:   metaStringSlice(meta, "compose_files"),
+		EnvFiles:       metaStringSlice(meta, "env_files"),
 		WorkDir:        strings.TrimSpace(fmt.Sprint(meta["work_dir"])),
 	}.Normalized()
 }
@@ -316,6 +321,7 @@ func cleanupMetaFromRuntime(runID, taskID string, runtime RuntimeState, cfg conf
 		"compose_project": runtime.ComposeProject,
 		"compose_file":    runtime.ComposeFile,
 		"compose_files":   runtime.ComposeFiles,
+		"env_files":       runtime.EnvFiles,
 		"work_dir":        runtime.WorkDir,
 		"labels":          runtimeLabels(cfg, taskID, runID),
 	}
@@ -336,8 +342,8 @@ func runtimeLabels(cfg config.DockerConfig, taskID, runID string) map[string]str
 	return labels
 }
 
-func metaComposeFiles(meta map[string]any) []string {
-	raw, ok := meta["compose_files"]
+func metaStringSlice(meta map[string]any, key string) []string {
+	raw, ok := meta[key]
 	if !ok {
 		return nil
 	}
@@ -357,6 +363,6 @@ func metaComposeFiles(meta map[string]any) []string {
 	}
 }
 
-func dockerCleanupCommandText(cfg config.DockerConfig, composeFiles []string, projectName, workDir string) string {
-	return dockermgr.CommandLine("docker", dockermgr.CleanupComposeArgsFilesWithProjectDir(cfg, composeFiles, projectName, workDir))
+func dockerCleanupCommandText(cfg config.DockerConfig, composeFiles, envFiles []string, projectName, workDir string) string {
+	return dockermgr.CommandLine("docker", dockermgr.CleanupComposeArgsFilesWithProjectDirAndEnvFiles(cfg, composeFiles, envFiles, projectName, workDir))
 }

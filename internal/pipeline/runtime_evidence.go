@@ -42,6 +42,37 @@ func stageCEnvironment(evidence runtimeEvidence) stageCCommandEnv {
 	return result
 }
 
+func (e stageCCommandEnv) withoutComposeVars() stageCCommandEnv {
+	if len(e.Env) == 0 && len(e.Keys) == 0 {
+		return e
+	}
+	result := stageCCommandEnv{
+		Env:     make([]string, 0, len(e.Env)),
+		Keys:    make([]string, 0, len(e.Keys)),
+		Values:  map[string]string{},
+		Service: e.Service,
+	}
+	for _, item := range e.Env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "COMPOSE_PROJECT_NAME", "COMPOSE_FILE":
+			continue
+		}
+		result.Env = append(result.Env, item)
+		result.Values[key] = value
+	}
+	for _, key := range e.Keys {
+		if key == "COMPOSE_PROJECT_NAME" || key == "COMPOSE_FILE" {
+			continue
+		}
+		result.Keys = append(result.Keys, key)
+	}
+	return result
+}
+
 func (e *stageCCommandEnv) add(key, value string) {
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)

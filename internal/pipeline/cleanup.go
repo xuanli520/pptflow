@@ -38,7 +38,7 @@ func StopDockerRuntime(ctx context.Context, exec executor.CommandRunner, cfg con
 	if exec == nil {
 		exec = executor.New()
 	}
-	return dockermgr.CleanupComposeProjectFiles(ctx, exec, cfg, meta.ComposeFiles, meta.Project, meta.WorkDir)
+	return dockermgr.CleanupComposeProjectFilesWithEnvFiles(ctx, exec, cfg, meta.ComposeFiles, meta.EnvFiles, meta.Project, meta.WorkDir)
 }
 
 func ForceExitCleanup(ctx context.Context, exec executor.CommandRunner, cfg config.Config, metas []model.ComposeMeta) (ExitCleanupSummary, error) {
@@ -141,7 +141,7 @@ func (r Runner) cleanupStaleRuns(ctx context.Context, runs []model.RunRecord, cu
 		if err != nil || evidence.ComposeProject == "" {
 			continue
 		}
-		summary := dockermgr.CleanupComposeProjectFiles(ctx, r.exec, r.cfg.Docker, evidence.ComposeFiles, evidence.ComposeProject, evidence.WorkDir)
+		summary := dockermgr.CleanupComposeProjectFilesWithEnvFiles(ctx, r.exec, r.cfg.Docker, evidence.ComposeFiles, evidence.EnvFiles, evidence.ComposeProject, evidence.WorkDir)
 		summary.Status = "stale_" + summary.Status
 		summaries = append(summaries, summary)
 	}
@@ -165,18 +165,19 @@ func (r Runner) cleanupCurrentRuntime(ctx context.Context, run model.RunRecord, 
 		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
 	if keepRuntime {
-		args := dockermgr.CleanupComposeArgsFiles(r.cfg.Docker, evidence.ComposeFiles, evidence.ComposeProject)
+		args := dockermgr.CleanupComposeArgsFilesWithProjectDirAndEnvFiles(r.cfg.Docker, evidence.ComposeFiles, evidence.EnvFiles, evidence.ComposeProject, evidence.WorkDir)
 		summary := dockermgr.CleanupSummary{
 			Status:         "kept_by_operator_request",
 			ComposeFile:    evidence.ComposeFile,
 			ComposeFiles:   evidence.ComposeFiles,
+			EnvFiles:       evidence.EnvFiles,
 			ComposeProject: evidence.ComposeProject,
 			WorkDir:        evidence.WorkDir,
 			ManualCommand:  dockermgr.CommandLine("docker", args),
 		}
 		return writeCleanupSummary(run.ArtifactRoot, summary)
 	}
-	summary := dockermgr.CleanupComposeProjectFiles(ctx, r.exec, r.cfg.Docker, evidence.ComposeFiles, evidence.ComposeProject, evidence.WorkDir)
+	summary := dockermgr.CleanupComposeProjectFilesWithEnvFiles(ctx, r.exec, r.cfg.Docker, evidence.ComposeFiles, evidence.EnvFiles, evidence.ComposeProject, evidence.WorkDir)
 	return writeCleanupSummary(run.ArtifactRoot, summary)
 }
 

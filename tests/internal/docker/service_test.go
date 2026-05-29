@@ -252,7 +252,12 @@ func TestStartRuntimeCopiesEnvExampleBeforeComposeConfig(t *testing.T) {
 	compose := `services:
   api:
     image: nginx
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
+        format: raw
+      - path: ./optional.env
+        required: false
     environment:
       APP_ENV: ${APP_ENV}
 `
@@ -278,18 +283,34 @@ func TestStartRuntimeCopiesEnvExampleBeforeComposeConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start runtime failed: %v", err)
 	}
-	content, err := os.ReadFile(filepath.Join(repo, ".env"))
+	if _, err := os.Stat(filepath.Join(repo, ".env")); !os.IsNotExist(err) {
+		t.Fatalf("runtime env preparation must not write repo .env, stat err: %v", err)
+	}
+	envPath := filepath.Join(root, "artifacts", "docker_runtime", "runtime.env")
+	content, err := os.ReadFile(envPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(content) != "APP_ENV=test\n" {
-		t.Fatalf(".env content = %q", content)
+		t.Fatalf("runtime env content = %q", content)
 	}
-	if len(result.RuntimeSummary.EnvFilesPrepared) != 1 || result.RuntimeSummary.EnvFilesPrepared[0] != filepath.Join(repo, ".env") {
+	if len(result.RuntimeSummary.EnvFilesPrepared) != 1 || result.RuntimeSummary.EnvFilesPrepared[0] != envPath {
 		t.Fatalf("env preparation not recorded: %#v", result.RuntimeSummary.EnvFilesPrepared)
 	}
-	if !containsCommand(runner.commands, " config") {
-		t.Fatalf("compose config should still run after env preparation: %#v", runner.commands)
+	if !stringSliceContains(result.Runtime.ComposeFiles, filepath.Join(root, "artifacts", "docker_runtime", "compose.env.yml")) || !stringSliceContains(result.Runtime.EnvFiles, envPath) {
+		t.Fatalf("runtime should use artifact env file and compose override: runtime=%#v", result.Runtime)
+	}
+	overrideContent, err := os.ReadFile(filepath.Join(root, "artifacts", "docker_runtime", "compose.env.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{envPath, "required: false", "format: raw", "optional.env"} {
+		if !strings.Contains(string(overrideContent), want) {
+			t.Fatalf("env override should preserve long syntax %q:\n%s", want, overrideContent)
+		}
+	}
+	if !containsCommand(runner.commands, "--env-file "+envPath+" ") || !containsCommand(runner.commands, "compose.env.yml") {
+		t.Fatalf("compose commands should use artifact env preparation: %#v", runner.commands)
 	}
 }
 

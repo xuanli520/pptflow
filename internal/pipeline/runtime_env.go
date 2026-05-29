@@ -13,6 +13,10 @@ func runtimeCommandEnv(extra []string) []string {
 	return filteredRuntimeEnv(os.Environ(), extra, false)
 }
 
+func dockerRuntimeCommandEnv(extra []string) []string {
+	return filteredRuntimeEnv(os.Environ(), extra, true)
+}
+
 func filteredRuntimeEnv(environ, extra []string, docker bool) []string {
 	values := map[string]string{}
 	var order []string
@@ -41,6 +45,64 @@ func filteredRuntimeEnv(environ, extra []string, docker bool) []string {
 		result = append(result, key+"="+values[key])
 	}
 	return result
+}
+
+func runtimeEnvFileValues(paths []string) ([]string, []string) {
+	var values []string
+	var warnings []string
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			warnings = append(warnings, "runtime env file skipped: "+err.Error())
+			continue
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			key, value, ok := parseRuntimeEnvFileLine(line)
+			if !ok || key == "COMPOSE_FILE" || key == "COMPOSE_PROJECT_NAME" {
+				continue
+			}
+			values = append(values, key+"="+value)
+		}
+	}
+	return values, warnings
+}
+
+func parseRuntimeEnvFileLine(line string) (string, string, bool) {
+	line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", false
+	}
+	line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+	key, value, ok := strings.Cut(line, "=")
+	key = strings.TrimSpace(key)
+	if !ok || !validRuntimeEnvName(key) {
+		return "", "", false
+	}
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		quote := value[0]
+		if (quote == '\'' || quote == '"') && value[len(value)-1] == quote {
+			value = value[1 : len(value)-1]
+		}
+	}
+	return key, value, true
+}
+
+func validRuntimeEnvName(key string) bool {
+	if key == "" {
+		return false
+	}
+	for index, char := range key {
+		if char == '_' || char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || index > 0 && char >= '0' && char <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func runtimeEnvAllowed(key string, docker bool) bool {

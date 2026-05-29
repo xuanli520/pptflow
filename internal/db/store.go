@@ -1401,7 +1401,7 @@ func archiveCompletedOverflowTx(ctx context.Context, tx *sql.Tx, now string) err
 }
 
 func marshalComposeMeta(meta model.ComposeMeta) (string, error) {
-	if strings.TrimSpace(meta.Project) == "" && len(meta.ComposeFiles) == 0 && strings.TrimSpace(meta.WorkDir) == "" && len(meta.Ports) == 0 {
+	if strings.TrimSpace(meta.Project) == "" && len(meta.ComposeFiles) == 0 && len(meta.EnvFiles) == 0 && strings.TrimSpace(meta.WorkDir) == "" && len(meta.Ports) == 0 {
 		return "", nil
 	}
 	content, err := json.Marshal(meta)
