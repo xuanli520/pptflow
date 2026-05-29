@@ -159,6 +159,7 @@ var stageCTestArtifactNames = map[string]bool{
 	".coverage":         true,
 	".nyc_output":       true,
 	".pytest_cache":     true,
+	".venv-tests":       true,
 	"__pycache__":       true,
 	"playwright-report": true,
 	"test-results":      true,

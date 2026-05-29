@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -247,6 +248,8 @@ func patchDockerfile(source, target string, mirrors config.DockerBuildMirrorsCon
 	insertions := map[int][]string{}
 	injectedSet := map[string]bool{}
 	var warnings []string
+	rewroteDockerfileLine := false
+	multiarchWarnings := map[string]bool{}
 	for _, stage := range stages {
 		if stage.Skip {
 			continue
@@ -284,7 +287,7 @@ func patchDockerfile(source, target string, mirrors config.DockerBuildMirrorsCon
 			insertions[insertLine] = append(insertions[insertLine], dockerfileInjectionLines(managers, mirrors)...)
 		}
 	}
-	if len(insertions) == 0 {
+	if len(insertions) == 0 && !dockerfileNeedsMultiarchRewrite(lines) {
 		return dockerfilePatchResult{Path: target, Warnings: warnings}, nil
 	}
 	var out []string
@@ -293,12 +296,83 @@ func patchDockerfile(source, target string, mirrors config.DockerBuildMirrorsCon
 		if block := insertions[lineNo]; len(block) > 0 {
 			out = append(out, block...)
 		}
+		normalized, changed, fromDir, toDir := normalizeDebianMultiarchCopyLine(line)
+		if changed {
+			line = normalized
+			rewroteDockerfileLine = true
+			key := fromDir + "->" + toDir
+			if !multiarchWarnings[key] {
+				warnings = append(warnings, fmt.Sprintf("normalized Debian multiarch COPY path from %s to %s", fromDir, toDir))
+				multiarchWarnings[key] = true
+			}
+		}
 		out = append(out, line)
 	}
 	if err := os.WriteFile(target, []byte(strings.Join(out, "\n")), 0o644); err != nil {
 		return dockerfilePatchResult{}, err
 	}
-	return dockerfilePatchResult{Path: target, Patched: true, Injected: sortedKeys(injectedSet), Warnings: warnings}, nil
+	return dockerfilePatchResult{Path: target, Patched: len(insertions) > 0 || rewroteDockerfileLine, Injected: sortedKeys(injectedSet), Warnings: warnings}, nil
+}
+
+func dockerfileNeedsMultiarchRewrite(lines []string) bool {
+	for _, line := range lines {
+		if _, changed, _, _ := normalizeDebianMultiarchCopyLine(line); changed {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeDebianMultiarchCopyLine(line string) (string, bool, string, string) {
+	targetDir := debianMultiarchLibDir(runtime.GOARCH)
+	if targetDir == "" {
+		return line, false, "", ""
+	}
+	trimmed := strings.TrimSpace(line)
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "COPY ") || !strings.Contains(trimmed, "--from=") {
+		return line, false, "", ""
+	}
+	for _, dir := range debianMultiarchLibDirs() {
+		if dir == targetDir {
+			continue
+		}
+		needle := "/usr/lib/" + dir + "/"
+		if strings.Contains(line, needle) {
+			return strings.ReplaceAll(line, needle, "/usr/lib/"+targetDir+"/"), true, dir, targetDir
+		}
+	}
+	return line, false, "", ""
+}
+
+func debianMultiarchLibDir(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return "x86_64-linux-gnu"
+	case "arm64":
+		return "aarch64-linux-gnu"
+	case "arm":
+		return "arm-linux-gnueabihf"
+	case "386":
+		return "i386-linux-gnu"
+	case "ppc64le":
+		return "powerpc64le-linux-gnu"
+	case "s390x":
+		return "s390x-linux-gnu"
+	default:
+		return ""
+	}
+}
+
+func debianMultiarchLibDirs() []string {
+	return []string{
+		"aarch64-linux-gnu",
+		"arm-linux-gnueabihf",
+		"i386-linux-gnu",
+		"powerpc64le-linux-gnu",
+		"s390x-linux-gnu",
+		"x86_64-linux-gnu",
+	}
 }
 
 type dockerfileStage struct {

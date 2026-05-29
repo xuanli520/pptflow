@@ -84,6 +84,7 @@ func TestCleanupStageCTestArtifactsRemovesGeneratedTestOutputs(t *testing.T) {
 	writeFile(filepath.Join(repoPath, ".coverage"))
 	writeFile(filepath.Join(repoPath, ".nyc_output", "coverage.json"))
 	writeFile(filepath.Join(repoPath, ".pytest_cache", "README.md"))
+	writeFile(filepath.Join(repoPath, ".venv-tests", "pyvenv.cfg"))
 	writeFile(filepath.Join(repoPath, "nested", "__pycache__", "module.pyc"))
 	writeFile(filepath.Join(repoPath, "playwright-report", "index.html"))
 	writeFile(filepath.Join(repoPath, "test-results", "result.json"))
@@ -100,6 +101,7 @@ func TestCleanupStageCTestArtifactsRemovesGeneratedTestOutputs(t *testing.T) {
 		".coverage",
 		".nyc_output",
 		".pytest_cache",
+		".venv-tests",
 		"nested/__pycache__",
 		"playwright-report",
 		"test-results",

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +14,6 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/executor"
-	"gopkg.in/yaml.v3"
 )
 
 func TestStartRuntimePullPolicy(t *testing.T) {
@@ -140,11 +140,12 @@ func TestStartRuntimeBuildMirrorFallsBackWhenPatchedDockerfileOutsideContext(t *
 	cfg.PullPolicy = "skip"
 
 	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
-		RepoPath:     repo,
-		ArtifactRoot: filepath.Join(root, "artifacts"),
-		TaskID:       "TASK-1",
-		RunID:        "run-1",
-		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+		RepoPath:          repo,
+		ArtifactRoot:      filepath.Join(root, "artifacts"),
+		TaskID:            "TASK-1",
+		RunID:             "run-1",
+		RewriteFixedPorts: true,
+		Timeouts:          dockermgr.RuntimeTimeouts{Health: time.Millisecond},
 	})
 	if err != nil {
 		t.Fatalf("fallback build should keep runtime startup alive: %v", err)
@@ -154,6 +155,56 @@ func TestStartRuntimeBuildMirrorFallsBackWhenPatchedDockerfileOutsideContext(t *
 	}
 	if len(result.Runtime.ComposeFiles) != 1 || strings.Contains(strings.Join(result.Runtime.ComposeFiles, " "), "compose.mirror.override.yml") {
 		t.Fatalf("runtime should fall back to base compose files: %#v", result.Runtime.ComposeFiles)
+	}
+}
+
+func TestStartRuntimeBuildMirrorNormalizesDebianMultiarchCopyPath(t *testing.T) {
+	targetDir := testDebianMultiarchLibDir()
+	if targetDir == "" {
+		t.Skip("unsupported test architecture")
+	}
+	sourceDir := "aarch64-linux-gnu"
+	if sourceDir == targetDir {
+		sourceDir = "x86_64-linux-gnu"
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	backend := filepath.Join(repo, "backend")
+	if err := os.MkdirAll(backend, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docker-compose.yml"), []byte("services:\n  backend:\n    build: ./backend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dockerfile := "FROM postgres:16 AS pg\nFROM python:3.11-slim\nCOPY --from=pg /usr/lib/" + sourceDir + "/libpq.so* /usr/lib/" + sourceDir + "/\nRUN apt-get update && apt-get install -y curl\n"
+	if err := os.WriteFile(filepath.Join(backend, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "artifacts")
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: artifactRoot,
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	patchedPath := filepath.Join(artifactRoot, "docker_mirror", "backend.Dockerfile.p2r")
+	patched, err := os.ReadFile(patchedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patched), "/usr/lib/"+targetDir+"/libpq.so*") || strings.Contains(string(patched), "/usr/lib/"+sourceDir+"/libpq.so*") {
+		t.Fatalf("patched Dockerfile did not normalize multiarch path:\n%s", patched)
+	}
+	if len(result.MirrorSummary.Services) != 1 || !containsString(result.MirrorSummary.Services[0].Warnings, "normalized Debian multiarch COPY path") {
+		t.Fatalf("multiarch normalization should be recorded: %#v", result.MirrorSummary.Services)
 	}
 }
 
@@ -192,6 +243,56 @@ func TestFindComposeRecursesDeterministicallyAfterTopLevelPriority(t *testing.T)
 	}
 }
 
+func TestStartRuntimeCopiesEnvExampleBeforeComposeConfig(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	compose := `services:
+  api:
+    image: nginx
+    env_file: .env
+    environment:
+      APP_ENV: ${APP_ENV}
+`
+	if err := os.WriteFile(filepath.Join(repo, "docker-compose.yml"), []byte(compose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".env.example"), []byte("APP_ENV=test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:          repo,
+		ArtifactRoot:      filepath.Join(root, "artifacts"),
+		TaskID:            "TASK-1",
+		RunID:             "run-1",
+		RewriteFixedPorts: true,
+		Timeouts:          dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(repo, ".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "APP_ENV=test\n" {
+		t.Fatalf(".env content = %q", content)
+	}
+	if len(result.RuntimeSummary.EnvFilesPrepared) != 1 || result.RuntimeSummary.EnvFilesPrepared[0] != filepath.Join(repo, ".env") {
+		t.Fatalf("env preparation not recorded: %#v", result.RuntimeSummary.EnvFilesPrepared)
+	}
+	if !containsCommand(runner.commands, " config") {
+		t.Fatalf("compose config should still run after env preparation: %#v", runner.commands)
+	}
+}
+
 func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
@@ -220,11 +321,12 @@ func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T)
 	cfg.BuildMirrors.Enabled = false
 
 	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
-		RepoPath:     repo,
-		ArtifactRoot: filepath.Join(root, "artifacts"),
-		TaskID:       "TASK-1",
-		RunID:        "run-1",
-		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+		RepoPath:          repo,
+		ArtifactRoot:      filepath.Join(root, "artifacts"),
+		TaskID:            "TASK-1",
+		RunID:             "run-1",
+		RewriteFixedPorts: true,
+		Timeouts:          dockermgr.RuntimeTimeouts{Health: time.Millisecond},
 	})
 	if err != nil {
 		t.Fatalf("start runtime failed: %v", err)
@@ -245,19 +347,9 @@ func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T)
 	if strings.Contains(string(content), "5432:5432") || strings.Contains(string(content), "published:") {
 		t.Fatalf("rewritten compose should not retain fixed published ports:\n%s", content)
 	}
-	var payload map[string]any
-	if err := yaml.Unmarshal(content, &payload); err != nil {
-		t.Fatal(err)
-	}
-	services := payload["services"].(map[string]any)
-	for service, wantPort := range map[string]string{"db": "5432", "api": "8000/tcp"} {
-		node := services[service].(map[string]any)
-		if len(node) != 1 {
-			t.Fatalf("%s override should contain only ports, got %#v", service, node)
-		}
-		ports := node["ports"].([]any)
-		if len(ports) != 1 || ports[0] != wantPort {
-			t.Fatalf("%s ports = %#v, want %q", service, ports, wantPort)
+	for _, want := range []string{"ports: !override", "- \"5432\"", "- 8000/tcp"} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("rewritten compose missing %q:\n%s", want, content)
 		}
 	}
 	original, err := os.ReadFile(composePath)
@@ -633,4 +725,32 @@ func stringSliceContains(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func testDebianMultiarchLibDir() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x86_64-linux-gnu"
+	case "arm64":
+		return "aarch64-linux-gnu"
+	case "arm":
+		return "arm-linux-gnueabihf"
+	case "386":
+		return "i386-linux-gnu"
+	case "ppc64le":
+		return "powerpc64le-linux-gnu"
+	case "s390x":
+		return "s390x-linux-gnu"
+	default:
+		return ""
+	}
 }

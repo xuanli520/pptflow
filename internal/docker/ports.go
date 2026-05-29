@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -50,8 +51,7 @@ func prepareRuntimePortRewrite(composeFile, artifactRoot string) portRewritePrep
 	if !ok {
 		return portRewritePreparation{Summary: summary}
 	}
-	override := map[string]any{"services": map[string]any{}}
-	overrideServices := override["services"].(map[string]any)
+	var overrides []runtimePortRewriteServiceOverride
 	names := make([]string, 0, len(services))
 	for name := range services {
 		names = append(names, name)
@@ -71,7 +71,10 @@ func prepareRuntimePortRewrite(composeFile, artifactRoot string) portRewritePrep
 		if !changed {
 			continue
 		}
-		overrideServices[name] = map[string]any{"ports": rewritten}
+		overrides = append(overrides, runtimePortRewriteServiceOverride{
+			Service: name,
+			Ports:   rewritten,
+		})
 		summary.Services = append(summary.Services, RuntimePortRewriteService{
 			Service: name,
 			Ports:   stringPortEntries(rewritten),
@@ -80,7 +83,7 @@ func prepareRuntimePortRewrite(composeFile, artifactRoot string) portRewritePrep
 	if len(summary.Services) == 0 {
 		return portRewritePreparation{Summary: summary}
 	}
-	content, err = yaml.Marshal(override)
+	content, err = marshalRuntimePortRewriteOverride(overrides)
 	if err != nil {
 		summary.Services = nil
 		summary.Warnings = append(summary.Warnings, "runtime port rewrite skipped: marshal compose: "+err.Error())
@@ -101,6 +104,41 @@ func prepareRuntimePortRewrite(composeFile, artifactRoot string) portRewritePrep
 	summary.Generated = true
 	summary.ComposeFile = path
 	return portRewritePreparation{Summary: summary}
+}
+
+type runtimePortRewriteServiceOverride struct {
+	Service string
+	Ports   []any
+}
+
+func marshalRuntimePortRewriteOverride(overrides []runtimePortRewriteServiceOverride) ([]byte, error) {
+	root := yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	services := yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	root.Content = append(root.Content, yamlScalar("services"), &services)
+	for _, override := range overrides {
+		service := yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		ports := yaml.Node{Kind: yaml.SequenceNode, Tag: "!override"}
+		for _, value := range override.Ports {
+			ports.Content = append(ports.Content, yamlScalar(scalarString(value)))
+		}
+		service.Content = append(service.Content, yamlScalar("ports"), &ports)
+		services.Content = append(services.Content, yamlScalar(override.Service), &service)
+	}
+	var buf bytes.Buffer
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&root); err != nil {
+		_ = encoder.Close()
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func yamlScalar(value string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
 }
 
 type composePortRewriteEntry struct {

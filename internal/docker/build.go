@@ -18,16 +18,17 @@ type Service struct {
 }
 
 type StartRuntimeRequest struct {
-	ProjectPath  string
-	RepoPath     string
-	ArtifactRoot string
-	TaskID       string
-	RunID        string
-	Labels       map[string]string
-	Env          []string
-	Log          io.Writer
-	Progress     func(ProgressEvent)
-	Timeouts     RuntimeTimeouts
+	ProjectPath       string
+	RepoPath          string
+	ArtifactRoot      string
+	TaskID            string
+	RunID             string
+	Labels            map[string]string
+	Env               []string
+	Log               io.Writer
+	Progress          func(ProgressEvent)
+	Timeouts          RuntimeTimeouts
+	RewriteFixedPorts bool
 }
 
 type StartRuntimeResult struct {
@@ -57,6 +58,7 @@ type DockerRuntimeSummary struct {
 	EffectiveConfig      string                     `json:"effective_config,omitempty"`
 	PortRewrite          *RuntimePortRewriteSummary `json:"port_rewrite,omitempty"`
 	RuntimeErrorCategory string                     `json:"runtime_error_category,omitempty"`
+	EnvFilesPrepared     []string                   `json:"env_files_prepared,omitempty"`
 	Warnings             []string                   `json:"warnings,omitempty"`
 }
 
@@ -159,6 +161,12 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	readmeRuntimeFiles := []string{}
 	var effectiveConfig string
 	if composeFile != "" {
+		envPrep := prepareRuntimeEnvFiles(workDir)
+		summary.EnvFilesPrepared = append(summary.EnvFilesPrepared, envPrep.Generated...)
+		summary.Warnings = append(summary.Warnings, envPrep.Warnings...)
+		for _, generated := range envPrep.Generated {
+			cmd.logLine("prepared runtime env file from example: "+generated, "p2r", false)
+		}
 		originalFiles = []string{composeFile}
 		baseRuntimeFiles = append([]string{}, originalFiles...)
 		activeFiles = append([]string{}, baseRuntimeFiles...)
@@ -171,21 +179,23 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 			result.MirrorSummary = mirrorSummary
 			return result, &StartRuntimeError{Category: "compose_config_failed", Message: "docker compose config failed: " + trimResultText(configResult), Fix: "Fix docker compose configuration and rerun stage B.", Result: configResult}
 		}
-		portRewrite := prepareRuntimePortRewrite(composeFile, req.ArtifactRoot)
-		if len(portRewrite.Summary.Warnings) > 0 {
-			summary.Warnings = append(summary.Warnings, portRewrite.Summary.Warnings...)
-		}
-		if portRewrite.Summary.Generated {
-			summary.PortRewrite = &portRewrite.Summary
-			candidateFiles := append(append([]string{}, originalFiles...), portRewrite.Summary.ComposeFile)
-			verify := cmd.runStreaming(ctx, "B0 docker compose port rewrite config", timeouts.Port, ComposeCommandArgsWithProjectDir(candidateFiles, workDir, projectName, "config"), true)
-			if verify.Err == nil {
-				baseRuntimeFiles = candidateFiles
-				activeFiles = append([]string{}, baseRuntimeFiles...)
-				effectiveConfig = verify.Stdout
-			} else {
-				summary.Warnings = append(summary.Warnings, "runtime port rewrite config failed; falling back to original compose file: "+trimResultText(verify))
-				summary.PortRewrite.Warnings = append(summary.PortRewrite.Warnings, "config verification failed: "+trimResultText(verify))
+		if req.RewriteFixedPorts {
+			portRewrite := prepareRuntimePortRewrite(composeFile, req.ArtifactRoot)
+			if len(portRewrite.Summary.Warnings) > 0 {
+				summary.Warnings = append(summary.Warnings, portRewrite.Summary.Warnings...)
+			}
+			if portRewrite.Summary.Generated {
+				summary.PortRewrite = &portRewrite.Summary
+				candidateFiles := append(append([]string{}, originalFiles...), portRewrite.Summary.ComposeFile)
+				verify := cmd.runStreaming(ctx, "B0 docker compose port rewrite config", timeouts.Port, ComposeCommandArgsWithProjectDir(candidateFiles, workDir, projectName, "config"), true)
+				if verify.Err == nil {
+					baseRuntimeFiles = candidateFiles
+					activeFiles = append([]string{}, baseRuntimeFiles...)
+					effectiveConfig = verify.Stdout
+				} else {
+					summary.Warnings = append(summary.Warnings, "runtime port rewrite config failed; falling back to original compose file: "+trimResultText(verify))
+					summary.PortRewrite.Warnings = append(summary.PortRewrite.Warnings, "config verification failed: "+trimResultText(verify))
+				}
 			}
 		}
 		prepared := prepareBuildMirror(repoPath, composeFile, req.ArtifactRoot, s.Config)

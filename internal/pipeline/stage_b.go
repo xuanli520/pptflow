@@ -46,14 +46,15 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	}
 	service := dockermgr.Service{Exec: r.exec, Config: r.cfg.Docker}
 	result, startErr := service.StartRuntime(ctx, dockermgr.StartRuntimeRequest{
-		ProjectPath:  project.Path,
-		RepoPath:     repoPath,
-		ArtifactRoot: run.ArtifactRoot,
-		TaskID:       project.TaskID,
-		RunID:        run.RunID,
-		Labels:       runtimeLabels(r.cfg.Docker, project.TaskID, run.RunID),
-		Env:          dockerCommandEnv(),
-		Log:          logWriter,
+		ProjectPath:       project.Path,
+		RepoPath:          repoPath,
+		ArtifactRoot:      run.ArtifactRoot,
+		TaskID:            project.TaskID,
+		RunID:             run.RunID,
+		Labels:            runtimeLabels(r.cfg.Docker, project.TaskID, run.RunID),
+		Env:               dockerCommandEnv(),
+		Log:               logWriter,
+		RewriteFixedPorts: strings.EqualFold(strings.TrimSpace(r.cfg.Pipeline.StageC.Execution), "isolated"),
 		Progress: func(event dockermgr.ProgressEvent) {
 			appendStreamProgress(run.RunID, "B", event.Line, event.Source, event.Done, progress)
 		},
