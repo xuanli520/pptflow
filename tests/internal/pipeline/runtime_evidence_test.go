@@ -172,6 +172,7 @@ func TestStageCProxyPlanMapsOriginalPublishedPortsToServices(t *testing.T) {
 	}
 	if !strings.Contains(plan.OverrideContent, "network_mode: service:p2r_stage_c_proxy") ||
 		strings.Contains(plan.OverrideContent, "ports:") ||
+		!strings.Contains(plan.OverrideContent, "entrypoint: []") ||
 		!strings.Contains(plan.OverrideContent, repoPath+":/workspace") ||
 		!strings.Contains(plan.OverrideContent, "golang:1.25") {
 		t.Fatalf("runner override should share proxy namespace without publishing ports:\n%s", plan.OverrideContent)
@@ -431,6 +432,13 @@ func TestStageCIsolatedUsesPersistedProxyPlan(t *testing.T) {
 
 	if record.Status != model.StageDone {
 		t.Fatalf("isolated Stage C should use persisted proxy plan, got %#v", record)
+	}
+	overrideContent, err := os.ReadFile(overridePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(overrideContent), "entrypoint: []") {
+		t.Fatalf("persisted override should be regenerated with proxy entrypoint override:\n%s", overrideContent)
 	}
 }
 

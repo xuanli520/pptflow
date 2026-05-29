@@ -124,9 +124,21 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 			MinimumFix: "Fix compose ports or rerun Stage B.",
 		}, nil)
 	}
-	if !loadedPlan {
-		err = writeStageCProxyPlanArtifacts(writer, plan)
+	if loadedPlan {
+		if strings.TrimSpace(plan.RunnerImage) == "" {
+			plan.RunnerImage = runnerImage
+		}
+		plan.OverrideContent, err = stageCProxyOverride(plan, repoPath, run.ArtifactRoot)
+		if err != nil {
+			return fail(err.Error(), nil, map[string]any{"proxy_plan": plan})
+		}
+		if len(plan.Env) == 0 {
+			plan.EnvContent, plan.Env = stageCProxyEnv(plan, runtime)
+		} else {
+			plan.EnvContent = stageCEnvContent(plan.Env)
+		}
 	}
+	err = writeStageCProxyPlanArtifacts(writer, plan)
 	if err != nil {
 		return fail(err.Error(), nil, map[string]any{"proxy_plan": plan})
 	}
@@ -644,7 +656,14 @@ func stageCProxyEnv(plan stageCProxyPlan, runtime RuntimeState) (string, []strin
 	for _, key := range keys {
 		env = append(env, key+"="+values[key])
 	}
-	return strings.Join(env, "\n") + "\n", env
+	return stageCEnvContent(env), env
+}
+
+func stageCEnvContent(env []string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	return strings.Join(env, "\n") + "\n"
 }
 
 func stageCProxyOverride(plan stageCProxyPlan, repoPath, artifactRoot string) (string, error) {
@@ -660,9 +679,10 @@ func stageCProxyOverride(plan stageCProxyPlan, repoPath, artifactRoot string) (s
 	override := map[string]any{
 		"services": map[string]any{
 			stageCProxyService: map[string]any{
-				"image":    plan.ProxyImage,
-				"profiles": []string{stageCProfileName},
-				"command":  []string{"/bin/sh", "-lc", proxyScript},
+				"image":      plan.ProxyImage,
+				"profiles":   []string{stageCProfileName},
+				"entrypoint": []string{},
+				"command":    []string{"/bin/sh", "-lc", proxyScript},
 			},
 			stageCRunnerService: map[string]any{
 				"image":        plan.RunnerImage,
