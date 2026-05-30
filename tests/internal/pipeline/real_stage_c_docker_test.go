@@ -28,11 +28,11 @@ func TestRealBatch1StageBCRunTests(t *testing.T) {
 	for _, project := range result.Projects {
 		projects[project.TaskID] = project
 	}
-	taskIDs := []string{
+	taskIDs := realDockerTaskIDs([]string{
 		"TASK-20260421-73955A",
 		"TASK-20260508-5388C5",
 		"TASK-20260508-6CCDE1",
-	}
+	})
 	for _, taskID := range taskIDs {
 		project, ok := projects[taskID]
 		if !ok {
@@ -140,4 +140,21 @@ func realDockerEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func realDockerTaskIDs(fallback []string) []string {
+	raw := strings.TrimSpace(os.Getenv("P2R_REAL_TASK_IDS"))
+	if raw == "" {
+		return fallback
+	}
+	var taskIDs []string
+	for _, item := range strings.Split(raw, ",") {
+		if taskID := strings.TrimSpace(item); taskID != "" {
+			taskIDs = append(taskIDs, taskID)
+		}
+	}
+	if len(taskIDs) == 0 {
+		return fallback
+	}
+	return taskIDs
 }

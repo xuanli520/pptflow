@@ -277,7 +277,7 @@ func Default() Config {
 			SelfTestReportPath: "repo/self_test_report.md",
 			MaxConcurrent:      DefaultMaxConcurrent,
 			StageC: StageCConfig{
-				Execution:               "host",
+				Execution:               "auto",
 				ProxyImage:              "alpine/socat:latest",
 				FailOnUnmappedLocalhost: true,
 			},
@@ -765,7 +765,7 @@ func normalize(cfg *Config) {
 	cfg.Pipeline.StageC.RunnerImage = strings.TrimSpace(cfg.Pipeline.StageC.RunnerImage)
 	cfg.Pipeline.StageC.ProxyImage = strings.TrimSpace(cfg.Pipeline.StageC.ProxyImage)
 	if cfg.Pipeline.StageC.Execution == "" {
-		cfg.Pipeline.StageC.Execution = "host"
+		cfg.Pipeline.StageC.Execution = "auto"
 	}
 	if cfg.Pipeline.StageC.ProxyImage == "" {
 		cfg.Pipeline.StageC.ProxyImage = "alpine/socat:latest"
@@ -839,7 +839,7 @@ func Validate(cfg Config) error {
 	if _, err := normalizeDefaultStages(cfg.Pipeline.DefaultStages); err != nil {
 		return err
 	}
-	if err := validateOneOf("pipeline.stage_c.execution", cfg.Pipeline.StageC.Execution, "host", "isolated"); err != nil {
+	if err := validateOneOf("pipeline.stage_c.execution", cfg.Pipeline.StageC.Execution, "auto", "host", "isolated"); err != nil {
 		return err
 	}
 	if cfg.Pipeline.StageC.Execution == "isolated" && strings.TrimSpace(cfg.Pipeline.StageC.ProxyImage) == "" {

@@ -16,6 +16,8 @@ pipeline:
     D: 900
     E: 1200
     F: 900
+  stage_c:
+    execution: "auto"
 
 docker:
   managed_label: "managed_by=p2rqa"

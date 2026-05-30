@@ -757,6 +757,114 @@ func TestRunTestsComposeUsageDetectsPathAndVariableCommands(t *testing.T) {
 	}
 }
 
+func TestStageCExecutionAutoSelectsHostForDockerComposeRunTests(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := strings.Join([]string{
+		`#!/usr/bin/env bash`,
+		`(cd "$ROOT_DIR" && docker compose up -d --build backend)`,
+		`docker compose exec -T backend npm test`,
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default().Pipeline.StageC
+	cfg.Execution = "auto"
+	cfg.RunnerImage = "p2r/stage-c-runner:test"
+
+	decision := pipelinepkg.StageCExecutionDecisionForTest(cfg, repoPath)
+	if decision.Selected != "host" || !decision.UsesDocker || !decision.StartsDockerComposeStack {
+		t.Fatalf("auto should select host for compose-owning run_tests: %#v", decision)
+	}
+}
+
+func TestStageCExecutionAutoSelectsIsolatedForRuntimeEndpointRunTests(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/usr/bin/env bash
+API_BASE_URL="${API_BASE_URL:-http://backend:8080/api/v1}"
+curl -fsS "$API_BASE_URL/auth/me"
+`
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default().Pipeline.StageC
+	cfg.Execution = "auto"
+	cfg.RunnerImage = "p2r/stage-c-runner:test"
+
+	decision := pipelinepkg.StageCExecutionDecisionForTest(cfg, repoPath)
+	if decision.Selected != "isolated" || !decision.ReferencesRuntimePorts || !slices.Contains(decision.RuntimeEndpointHints, "backend:8080") {
+		t.Fatalf("auto should select isolated for runtime endpoint run_tests: %#v", decision)
+	}
+}
+
+func TestStageCExecutionAutoFallsBackToHostWithoutRunnerImage(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("curl http://backend:8080/api/v1/health\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default().Pipeline.StageC
+	cfg.Execution = "auto"
+	cfg.RunnerImage = ""
+
+	decision := pipelinepkg.StageCExecutionDecisionForTest(cfg, repoPath)
+	if decision.Selected != "host" || !strings.Contains(decision.Reason, "runner_image") {
+		t.Fatalf("auto without runner image should fall back to host: %#v", decision)
+	}
+}
+
+func TestStageCHostInjectsScriptURLDefaultsFromRuntimePorts(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	artifactRoot := filepath.Join(root, "artifacts")
+	for _, dir := range []string{repoPath, filepath.Join(artifactRoot, "logs")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte(`#!/usr/bin/env bash
+API_BASE_URL="${API_BASE_URL:-http://backend:8080/api/v1}"
+echo "$API_BASE_URL"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &stageCHostEnvRunner{}
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "auto"
+	record := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(runner)).StageCForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    filepath.Join(repoPath, "docker-compose.yml"),
+		ComposeFiles:   []string{filepath.Join(repoPath, "docker-compose.yml")},
+		WorkDir:        repoPath,
+		Mappings: map[string][]portMapping{
+			"backend": {{Service: "backend", URL: "0.0.0.0", Host: 32777, Container: 8080, Protocol: "tcp"}},
+		},
+	}, map[string]model.StageRecord{string(model.StageB): {Stage: "B", Status: model.StageDone}})
+
+	if record.Status != model.StageDone {
+		t.Fatalf("Stage C should pass, got %#v", record)
+	}
+	values := envMap(runner.env)
+	if values["API_BASE_URL"] != "http://localhost:32777/api/v1" {
+		t.Fatalf("API_BASE_URL should be remapped from runtime ports, got %#v", values)
+	}
+}
+
 func TestStageCIsolatedRejectsDockerComposeOwningRunTests(t *testing.T) {
 	root := t.TempDir()
 	projectPath := filepath.Join(root, "batch", "TASK-1")

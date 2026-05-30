@@ -33,7 +33,7 @@ func Run(ctx context.Context, exec executor.CommandRunner, cfg config.Config) Ch
 	node := checkBinary(ctx, exec, "node", []string{"--version"}, nodeCandidates(), nil, "Node.js is required by Codex CLI.")
 	result.Checks = append(result.Checks, node)
 	result.Checks = append(result.Checks, checkBinary(ctx, exec, "docker", []string{"--version"}, dockerCandidates(), []string{string(model.StageB)}, "Docker is required for Stage B runtime evidence."))
-	if cfg.Pipeline.StageC.Execution != "isolated" {
+	if stageCPreflightRequiresHostBash(cfg.Pipeline.StageC) {
 		result.Checks = append(result.Checks, checkBinary(ctx, exec, "bash", []string{"--version"}, bashCandidates(), []string{string(model.StageC)}, "bash is required to run repo/run_tests.sh on the host."))
 	}
 	result.Checks = append(result.Checks, checkPython(ctx, exec))
@@ -47,6 +47,17 @@ func Run(ctx context.Context, exec executor.CommandRunner, cfg config.Config) Ch
 	}
 	result.Checks = append(result.Checks, codexCheck)
 	return result
+}
+
+func stageCPreflightRequiresHostBash(cfg config.StageCConfig) bool {
+	switch strings.ToLower(strings.TrimSpace(cfg.Execution)) {
+	case "isolated":
+		return false
+	case "auto":
+		return strings.TrimSpace(cfg.RunnerImage) == ""
+	default:
+		return true
+	}
 }
 
 func (r CheckResult) BlockingCheck(stage string) (Check, bool) {

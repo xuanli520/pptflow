@@ -45,13 +45,43 @@ func TestIsolatedStageCDoesNotRequireHostBash(t *testing.T) {
 }
 
 func TestHostStageCKeepsBashPreflight(t *testing.T) {
-	result := preflight.Run(context.Background(), preflightExec{}, config.Default())
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "host"
+
+	result := preflight.Run(context.Background(), preflightExec{}, cfg)
 	for _, check := range result.Checks {
 		if check.Name == "bash" {
 			return
 		}
 	}
 	t.Fatalf("host Stage C should keep bash preflight: %#v", result.Checks)
+}
+
+func TestAutoStageCWithRunnerDoesNotRequireHostBash(t *testing.T) {
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "auto"
+	cfg.Pipeline.StageC.RunnerImage = "p2r/stage-c-runner:test"
+
+	result := preflight.Run(context.Background(), preflightExec{}, cfg)
+	for _, check := range result.Checks {
+		if check.Name == "bash" {
+			t.Fatalf("auto Stage C with isolated runner should not run host bash preflight: %#v", result.Checks)
+		}
+	}
+}
+
+func TestAutoStageCWithoutRunnerKeepsBashPreflight(t *testing.T) {
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "auto"
+	cfg.Pipeline.StageC.RunnerImage = ""
+
+	result := preflight.Run(context.Background(), preflightExec{}, cfg)
+	for _, check := range result.Checks {
+		if check.Name == "bash" {
+			return
+		}
+	}
+	t.Fatalf("auto Stage C without runner should keep bash preflight: %#v", result.Checks)
 }
 
 type preflightExec struct{}

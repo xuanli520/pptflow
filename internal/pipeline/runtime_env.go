@@ -17,6 +17,30 @@ func dockerRuntimeCommandEnv(extra []string) []string {
 	return filteredRuntimeEnv(os.Environ(), extra, true)
 }
 
+func hostRuntimeToolEnv() []string {
+	keys := []string{
+		"HOME",
+		"USERPROFILE",
+		"XDG_CACHE_HOME",
+		"GOCACHE",
+		"GOMODCACHE",
+		"GOPATH",
+		"NPM_CONFIG_CACHE",
+		"PLAYWRIGHT_BROWSERS_PATH",
+		"CHROME_BIN",
+		"CI",
+	}
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value := strings.TrimSpace(os.Getenv(key))
+		if value == "" || runtimeEnvSensitive(key) {
+			continue
+		}
+		env = append(env, key+"="+value)
+	}
+	return env
+}
+
 func filteredRuntimeEnv(environ, extra []string, docker bool) []string {
 	values := map[string]string{}
 	var order []string

@@ -54,6 +54,19 @@ type TestRunTestsComposeUsage struct {
 	ExplicitProject bool
 }
 
+type TestStageCExecutionDecision struct {
+	Requested                string
+	Selected                 string
+	Reason                   string
+	UsesDocker               bool
+	StartsDockerRuntime      bool
+	UsesDockerCompose        bool
+	StartsDockerComposeStack bool
+	ExplicitComposeProject   bool
+	ReferencesRuntimePorts   bool
+	RuntimeEndpointHints     []string
+}
+
 type TestStageCCommandEnv struct {
 	Env     []string
 	Keys    []string
@@ -332,6 +345,22 @@ func RunTestsComposeUsageForTest(repoPath string) TestRunTestsComposeUsage {
 		Uses:            usage.Uses,
 		StartsStack:     usage.StartsStack,
 		ExplicitProject: usage.ExplicitProject,
+	}
+}
+
+func StageCExecutionDecisionForTest(cfg config.StageCConfig, repoPath string) TestStageCExecutionDecision {
+	decision := selectStageCExecution(cfg, repoPath)
+	return TestStageCExecutionDecision{
+		Requested:                decision.Requested,
+		Selected:                 decision.Selected,
+		Reason:                   decision.Reason,
+		UsesDocker:               decision.Usage.UsesDocker,
+		StartsDockerRuntime:      decision.Usage.StartsDockerRuntime,
+		UsesDockerCompose:        decision.Usage.Compose.Uses,
+		StartsDockerComposeStack: decision.Usage.Compose.StartsStack,
+		ExplicitComposeProject:   decision.Usage.Compose.ExplicitProject,
+		ReferencesRuntimePorts:   decision.Usage.ReferencesRuntimePorts,
+		RuntimeEndpointHints:     append([]string{}, decision.Usage.RuntimeEndpointHints...),
 	}
 }
 

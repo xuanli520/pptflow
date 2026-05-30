@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -12,6 +13,14 @@ type runTestsComposeUsage struct {
 	Uses            bool
 	StartsStack     bool
 	ExplicitProject bool
+}
+
+type runTestsRuntimeUsage struct {
+	UsesDocker             bool
+	StartsDockerRuntime    bool
+	ReferencesRuntimePorts bool
+	RuntimeEndpointHints   []string
+	Compose                runTestsComposeUsage
 }
 
 func runTestsUsesDockerCompose(repoPath string) bool {
@@ -23,31 +32,54 @@ func runTestsStartsDockerComposeStack(repoPath string) bool {
 }
 
 func inspectRunTestsCompose(repoPath string) runTestsComposeUsage {
+	return inspectRunTestsRuntime(repoPath).Compose
+}
+
+func inspectRunTestsRuntime(repoPath string) runTestsRuntimeUsage {
 	content, err := os.ReadFile(filepath.Join(repoPath, "run_tests.sh"))
 	if err != nil {
-		return runTestsComposeUsage{}
+		return runTestsRuntimeUsage{}
 	}
+	dockerVars := map[string]bool{}
 	composeVars := map[string]bool{}
-	var usage runTestsComposeUsage
+	var usage runTestsRuntimeUsage
+	endpointHints := map[string]bool{}
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		for _, hint := range runTestsRuntimeEndpointHints(line) {
+			endpointHints[hint] = true
+		}
 		words := shellWords(line)
 		for _, word := range words {
 			key, value, ok := shellAssignment(word)
-			if ok && composeCommandValue(value) {
+			if !ok {
+				continue
+			}
+			if dockerCommandValue(value) {
+				dockerVars[key] = true
+			}
+			if composeCommandValue(value) {
 				composeVars[key] = true
 			}
 		}
-		command := classifyComposeCommand(words, composeVars)
-		if !command.Uses {
-			continue
+		dockerCommand := classifyDockerCommand(words, dockerVars, composeVars)
+		if dockerCommand.Uses {
+			usage.UsesDocker = true
+			usage.StartsDockerRuntime = usage.StartsDockerRuntime || dockerCommand.StartsRuntime
 		}
-		usage.Uses = true
-		usage.StartsStack = usage.StartsStack || command.StartsStack
-		usage.ExplicitProject = usage.ExplicitProject || command.StartsStack && command.ExplicitProject
+		composeCommand := classifyComposeCommand(words, composeVars)
+		if composeCommand.Uses {
+			usage.Compose.Uses = true
+			usage.Compose.StartsStack = usage.Compose.StartsStack || composeCommand.StartsStack
+			usage.Compose.ExplicitProject = usage.Compose.ExplicitProject || composeCommand.StartsStack && composeCommand.ExplicitProject
+		}
+	}
+	if len(endpointHints) > 0 {
+		usage.ReferencesRuntimePorts = true
+		usage.RuntimeEndpointHints = sortedStringKeys(endpointHints)
 	}
 	return usage
 }
@@ -59,8 +91,21 @@ type runTestsComposeCommand struct {
 }
 
 func classifyComposeCommand(words []string, composeVars map[string]bool) runTestsComposeCommand {
-	index := shellCommandIndex(words)
-	if index < 0 {
+	var result runTestsComposeCommand
+	for _, index := range shellCommandStartIndexes(words) {
+		command := classifyComposeCommandAt(words, index, composeVars)
+		result.Uses = result.Uses || command.Uses
+		result.StartsStack = result.StartsStack || command.StartsStack
+		result.ExplicitProject = result.ExplicitProject || command.StartsStack && command.ExplicitProject
+	}
+	return result
+}
+
+func classifyComposeCommandAt(words []string, index int, composeVars map[string]bool) runTestsComposeCommand {
+	if index < 0 || index >= len(words) {
+		return runTestsComposeCommand{}
+	}
+	if _, _, ok := shellAssignment(words[index]); ok {
 		return runTestsComposeCommand{}
 	}
 	envProject := shellAssignmentsSetProject(words[:index])
@@ -84,6 +129,69 @@ func classifyComposeCommand(words []string, composeVars map[string]bool) runTest
 	default:
 		return runTestsComposeCommand{}
 	}
+}
+
+type runTestsDockerCommand struct {
+	Uses          bool
+	StartsRuntime bool
+}
+
+func classifyDockerCommand(words []string, dockerVars map[string]bool, composeVars map[string]bool) runTestsDockerCommand {
+	var result runTestsDockerCommand
+	for _, index := range shellCommandStartIndexes(words) {
+		command := classifyDockerCommandAt(words, index, dockerVars, composeVars)
+		result.Uses = result.Uses || command.Uses
+		result.StartsRuntime = result.StartsRuntime || command.StartsRuntime
+	}
+	return result
+}
+
+func shellCommandStartIndexes(words []string) []int {
+	seen := map[int]bool{}
+	var indexes []int
+	add := func(index int) {
+		if index < 0 || index >= len(words) || seen[index] {
+			return
+		}
+		seen[index] = true
+		indexes = append(indexes, index)
+	}
+	for index := range words {
+		if index > 0 && !shellCommandSeparator(words[index-1]) {
+			continue
+		}
+		if commandIndex := shellCommandIndex(words[index:]); commandIndex >= 0 {
+			add(index + commandIndex)
+		}
+	}
+	return indexes
+}
+
+func classifyDockerCommandAt(words []string, index int, dockerVars map[string]bool, composeVars map[string]bool) runTestsDockerCommand {
+	if index < 0 || index >= len(words) {
+		return runTestsDockerCommand{}
+	}
+	if _, _, ok := shellAssignment(words[index]); ok {
+		return runTestsDockerCommand{}
+	}
+	for index < len(words) && shellCommandWrapper(words[index]) {
+		index++
+	}
+	if index >= len(words) {
+		return runTestsDockerCommand{}
+	}
+	composeCommand := classifyComposeCommandAt(words, index, composeVars)
+	if composeCommand.Uses {
+		return runTestsDockerCommand{Uses: true, StartsRuntime: composeCommand.StartsStack}
+	}
+	if !dockerVars[shellVariableName(words[index])] && !dockerBinary(words[index]) {
+		return runTestsDockerCommand{}
+	}
+	subcommand := dockerSubcommandIndex(words, index+1)
+	if subcommand < 0 {
+		return runTestsDockerCommand{Uses: true}
+	}
+	return runTestsDockerCommand{Uses: true, StartsRuntime: dockerStartSubcommand(words[subcommand])}
 }
 
 func shellCommandIndex(words []string) int {
@@ -126,6 +234,24 @@ func dockerComposePluginIndex(words []string, index int) int {
 		}
 		if !strings.HasPrefix(word, "-") {
 			return -1
+		}
+		index += 1 + shellOptionValueCount(word)
+	}
+	return -1
+}
+
+func dockerSubcommandIndex(words []string, index int) int {
+	for index < len(words) {
+		word := words[index]
+		if _, _, ok := shellAssignment(word); ok {
+			index++
+			continue
+		}
+		if shellCommandSeparator(word) {
+			return -1
+		}
+		if !strings.HasPrefix(word, "-") {
+			return index
 		}
 		index += 1 + shellOptionValueCount(word)
 	}
@@ -183,6 +309,24 @@ func runTestsComposeStartSubcommand(word string) bool {
 	}
 }
 
+func dockerStartSubcommand(word string) bool {
+	switch strings.ToLower(strings.TrimSpace(word)) {
+	case "run", "create", "start":
+		return true
+	default:
+		return false
+	}
+}
+
+func dockerCommandValue(value string) bool {
+	words := shellWords(value)
+	if len(words) == 0 {
+		return false
+	}
+	command := classifyDockerCommand(words, nil, nil)
+	return command.Uses
+}
+
 func composeCommandValue(value string) bool {
 	words := shellWords(value)
 	if len(words) == 0 {
@@ -204,7 +348,7 @@ func dockerComposeBinary(word string) bool {
 
 func commandBase(word string) string {
 	word = strings.TrimSpace(word)
-	word = strings.Trim(word, `"'`)
+	word = strings.Trim(word, `"'()`)
 	word = strings.ReplaceAll(word, `\`, `/`)
 	if slash := strings.LastIndex(word, "/"); slash >= 0 {
 		word = word[slash+1:]
@@ -213,8 +357,17 @@ func commandBase(word string) string {
 }
 
 func shellCommandWrapper(word string) bool {
-	switch word {
-	case "!", "command", "exec", "if", "time", "until", "while":
+	switch strings.Trim(word, `"'()`) {
+	case "!", "command", "exec", "if", "elif", "then", "do", "sudo", "time", "until", "while":
+		return true
+	default:
+		return false
+	}
+}
+
+func shellCommandSeparator(word string) bool {
+	switch strings.TrimSpace(word) {
+	case ";", "&&", "||", "|":
 		return true
 	default:
 		return false
@@ -233,6 +386,7 @@ func shellAssignment(word string) (string, string, bool) {
 
 func shellVariableName(word string) string {
 	word = strings.TrimSpace(word)
+	word = strings.Trim(word, `"'()`)
 	if strings.HasPrefix(word, "${") && strings.HasSuffix(word, "}") {
 		return strings.TrimSuffix(strings.TrimPrefix(word, "${"), "}")
 	}
@@ -240,6 +394,49 @@ func shellVariableName(word string) string {
 		return strings.TrimPrefix(word, "$")
 	}
 	return ""
+}
+
+var runTestsURLPattern = regexp.MustCompile(`(?i)https?://([A-Za-z0-9_.-]+):([0-9]{2,5})(/[A-Za-z0-9_./?&=%:+-]*)?`)
+
+func runTestsRuntimeEndpointHints(line string) []string {
+	matches := runTestsURLPattern.FindAllStringSubmatch(line, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var hints []string
+	for _, match := range matches {
+		host := strings.ToLower(strings.TrimSpace(match[1]))
+		port := strings.TrimSpace(match[2])
+		if !runTestsRuntimeEndpointHost(host) {
+			continue
+		}
+		hint := host + ":" + port
+		if seen[hint] {
+			continue
+		}
+		seen[hint] = true
+		hints = append(hints, hint)
+	}
+	return hints
+}
+
+func runTestsRuntimeEndpointHost(host string) bool {
+	switch host {
+	case "", "0.0.0.0", "127.0.0.1", "localhost":
+		return true
+	default:
+		return !strings.Contains(host, ".")
+	}
+}
+
+func sortedStringKeys(values map[string]bool) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func shellWords(line string) []string {
@@ -289,6 +486,7 @@ func shellWords(line string) []string {
 			started = true
 		case char == ';':
 			flush()
+			words = append(words, ";")
 		case unicode.IsSpace(char):
 			flush()
 		default:

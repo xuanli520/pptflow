@@ -68,8 +68,9 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		}
 		return finishStage(record, model.StageFailed, start)
 	}
-	if strings.EqualFold(strings.TrimSpace(r.cfg.Pipeline.StageC.Execution), "isolated") {
-		return r.stageCIsolated(ctx, run, project, runtime, prior, progress)
+	execution := selectStageCExecution(r.cfg.Pipeline.StageC, repoPath)
+	if execution.Selected == stageCExecutionIsolated {
+		return r.stageCIsolated(ctx, run, project, runtime, prior, progress, execution)
 	}
 	bash := findHostBash(r.exec)
 	if bash == "" {
@@ -98,6 +99,13 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		if composeFiles := runTestsHostComposeFiles(runtime); len(composeFiles) > 0 {
 			stageEnv.add("COMPOSE_FILE", strings.Join(composeFiles, string(os.PathListSeparator)))
 		}
+	} else {
+		for _, item := range runTestsHostURLDefaultEnv(filepath.Join(repoPath, "run_tests.sh"), runtime) {
+			key, value, ok := strings.Cut(item, "=")
+			if ok {
+				stageEnv.add(key, value)
+			}
+		}
 	}
 	envExtra := append([]string{}, stageEnv.Env...)
 	var envFileValues []string
@@ -106,6 +114,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		envFileValues, envFileWarnings = runtimeEnvFileValues(runtime.EnvFiles)
 		envExtra = append(envExtra, envFileValues...)
 	}
+	envExtra = append(envExtra, hostRuntimeToolEnv()...)
 	env := runtimeCommandEnv(envExtra)
 	if composeUsage.Uses {
 		env = dockerRuntimeCommandEnv(envExtra)
@@ -118,6 +127,9 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	}
 	fmt.Fprintln(logFile, "=== C host run_tests.sh start ===")
 	appendStreamProgress(run.RunID, "C", "=== C host run_tests.sh start ===", "p2r", false, progress)
+	decisionLine := fmt.Sprintf("Stage C execution: %s (requested=%s) - %s", execution.Selected, execution.Requested, execution.Reason)
+	fmt.Fprintln(logFile, decisionLine)
+	appendStreamProgress(run.RunID, "C", decisionLine, "p2r", false, progress)
 	fmt.Fprintln(logFile, "Stage C injected runtime env:")
 	appendStreamProgress(run.RunID, "C", "Stage C injected runtime env:", "p2r", false, progress)
 	for _, key := range stageEnv.Keys {
@@ -160,7 +172,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	}
 	record.ArtifactPaths = append([]string{logPath}, pages...)
 	record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
-	summaryExtra := map[string]any{"exit_code": result.ExitCode, "timeout": result.Timeout, "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "cleanup": cleanup}
+	summaryExtra := map[string]any{"exit_code": result.ExitCode, "timeout": result.Timeout, "command": "bash run_tests.sh", "env_keys": stageEnv.Keys, "runtime_env": stageEnv.Values, "service_urls": stageEnv.Service.Mapping, "cleanup": cleanup, "execution": execution.Summary()}
 	if len(envFileWarnings) > 0 {
 		summaryExtra["env_file_warnings"] = envFileWarnings
 	}

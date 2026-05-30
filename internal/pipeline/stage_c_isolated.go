@@ -50,7 +50,7 @@ type stageCProxyPlan struct {
 	EnvContent      string               `json:"-"`
 }
 
-func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project scanner.Project, runtime RuntimeState, prior map[string]model.StageRecord, progress func(RunProgress)) model.StageRecord {
+func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project scanner.Project, runtime RuntimeState, prior map[string]model.StageRecord, progress func(RunProgress), execution stageCExecutionDecision) model.StageRecord {
 	runtime.Normalize()
 	start := time.Now()
 	record := startStage("C")
@@ -70,6 +70,7 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 			extra = map[string]any{}
 		}
 		extra["mode"] = "isolated"
+		extra["execution"] = execution.Summary()
 		if fileExists(logPath) {
 			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), "\nERROR SUMMARY:\n"+reason+"\n")
 		} else {
@@ -183,6 +184,9 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 	defer logFile.Close()
 	fmt.Fprintln(logFile, "=== C isolated run_tests.sh start ===")
 	appendStreamProgress(run.RunID, "C", "=== C isolated run_tests.sh start ===", "p2r", false, progress)
+	decisionLine := fmt.Sprintf("Stage C execution: %s (requested=%s) - %s", execution.Selected, execution.Requested, execution.Reason)
+	fmt.Fprintln(logFile, decisionLine)
+	appendStreamProgress(run.RunID, "C", decisionLine, "p2r", false, progress)
 	for _, item := range plan.Env {
 		fmt.Fprintln(logFile, item)
 		appendStreamProgress(run.RunID, "C", item, "p2r", false, progress)
@@ -233,6 +237,7 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 		"proxy_plan":            plan,
 		"cleanup":               cleanup,
 		"test_artifact_cleanup": testArtifactCleanup,
+		"execution":             execution.Summary(),
 	}
 	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, extra))
 	if result.Err != nil {

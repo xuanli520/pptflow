@@ -129,6 +129,31 @@ func TestLoadParsesStageCExecutionConfig(t *testing.T) {
 	}
 }
 
+func TestDefaultStageCExecutionIsAuto(t *testing.T) {
+	cfg := config.Default()
+	if cfg.Pipeline.StageC.Execution != "auto" {
+		t.Fatalf("default stage C execution = %q, want auto", cfg.Pipeline.StageC.Execution)
+	}
+}
+
+func TestLoadAcceptsStageCAutoExecutionConfig(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`pipeline:
+  stage_c:
+    execution: auto
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.StageC.Execution != "auto" {
+		t.Fatalf("stage C execution = %q, want auto", cfg.Pipeline.StageC.Execution)
+	}
+}
+
 func TestLoadUsesExplicitConfigRelativeToConfigDirectory(t *testing.T) {
 	cwd := t.TempDir()
 	configDir := t.TempDir()

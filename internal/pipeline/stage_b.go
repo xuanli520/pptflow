@@ -32,7 +32,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	screenshotPath := qaArtifactPath(run.ArtifactRoot, "docker_startup.png")
 	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, runtimeSummaryPath, mirrorSummaryPath, effectiveConfigPath, stageCProxyConfigPath, stageCProxyPath, stageCPortsEnvPath, screenshotPath)
 	repoPath := filepath.Join(project.Path, "repo")
-	rewriteFixedPorts := strings.EqualFold(strings.TrimSpace(r.cfg.Pipeline.StageC.Execution), "isolated") || runTestsStartsDockerComposeStack(repoPath)
+	rewriteFixedPorts := stageCNeedsRuntimePortRewrite(r.cfg.Pipeline.StageC, repoPath)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		recordArtifactWarning(&record, newArtifactWarning(writer.RelativePath(logPath), "write_text", false, err))
