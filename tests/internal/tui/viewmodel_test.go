@@ -50,6 +50,29 @@ func TestExecutionViewModelFillsPartialRunsAndMissingDocs(t *testing.T) {
 	}
 }
 
+func TestExecutionDetailShowsBatchWithoutRun(t *testing.T) {
+	store, cfg, _, _ := tuiStore(t)
+
+	probe, err := tuiapp.BuildExecutionProbeForTest(context.Background(), store, cfg, "TASK-1", "A", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(probe.DetailContent, "批次: batch") {
+		t.Fatalf("detail content should show batch:\n%s", probe.DetailContent)
+	}
+}
+
+func TestExecutionViewShowsBatch(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SetExecutionPanel().
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{{Stage: "A", Status: model.StageRunning}}, "A").
+		SetExecutionBatch("batch-042")
+
+	if view := h.View(); !strings.Contains(view, "批次: batch-042") {
+		t.Fatalf("execution view should show batch:\n%s", view)
+	}
+}
+
 func TestExecutionViewModelReportsInvalidCleanupJSON(t *testing.T) {
 	store, cfg, _, artifactRoot := tuiStore(t)
 	ctx := context.Background()

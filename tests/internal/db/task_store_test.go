@@ -3,7 +3,9 @@ package db_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -115,6 +117,40 @@ func TestTaskLifecycleTransitions(t *testing.T) {
 	}
 	if run.CompletionRound != 2 {
 		t.Fatalf("second completion round = %d, want 2", run.CompletionRound)
+	}
+}
+
+func TestTerminalGitErrorReleasesInspectingCapacity(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	scanPath := t.TempDir()
+
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-BADPKG", "https://gitlab.example/TASK-20260521-BADPKG", scanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordTaskTerminalGitError(ctx, task.ID, assertErr("missing repo/")); err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskCompleted || task.CurrentRunID != "" || !strings.Contains(task.SyncError, "missing repo/") {
+		t.Fatalf("terminal git failure should leave completed task with sync error: %#v", task)
+	}
+	if count, err := store.CountTasksByState(ctx, model.TaskInspecting); err != nil || count != 0 {
+		t.Fatalf("inspecting count = %d, err=%v", count, err)
+	}
+	for i := 0; i < db.ActiveTaskStateLimit; i++ {
+		taskID := fmt.Sprintf("TASK-20260521-CAP%02d", i)
+		if _, err := store.CreateTaskWithBatch(ctx, taskID, "https://gitlab.example/"+taskID, scanPath); err != nil {
+			t.Fatalf("terminal git failure should not consume capacity, create %s: %v", taskID, err)
+		}
 	}
 }
 

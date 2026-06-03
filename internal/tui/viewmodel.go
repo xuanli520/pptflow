@@ -74,6 +74,7 @@ type stageView struct {
 
 type executionViewModel struct {
 	TaskID                string
+	BatchID               string
 	ProjectPath           string
 	HasRun                bool
 	Run                   model.RunRecord
@@ -135,8 +136,6 @@ func overviewDisplayRow(item overviewItem, specs []overviewColumnSpec) table.Row
 		switch spec.Key {
 		case "task_id":
 			row = append(row, truncateMiddleDisplay(overviewTaskIDText(item), width))
-		case "task_state":
-			row = append(row, taskStateStyle(item.TaskState).Render(truncateDisplay(localizeTaskState(item.TaskState), width)))
 		case "run_status":
 			row = append(row, truncateDisplay(localizeRunStatus(empty(item.RunStatus, "unknown")), width))
 		case "failed_stage":
@@ -178,6 +177,7 @@ func buildExecutionViewModel(ctx context.Context, store executionStore, cfg conf
 	}
 	vm := executionViewModel{
 		TaskID:                taskID,
+		BatchID:               project.Batch,
 		ProjectPath:           project.Path,
 		DocsSummary:           readDocsSummary(cfg, taskID),
 		SelfTestState:         selfTestState(project, cfg),
@@ -283,14 +283,20 @@ func buildDetailContent(vm executionViewModel, selectedStage string, width, heig
 		return "未选择已索引的项目\n请先执行 `p2r scan --path <projects-qa>`"
 	}
 	if !vm.HasRun {
-		return strings.Join([]string{
+		lines := []string{
 			"任务: " + vm.TaskID,
-			"模式: " + localizeMode("initial"),
-			"自测报告: " + vm.SelfTestState,
-			"文档: " + docsSummaryLine(vm.DocsSummary),
+		}
+		if strings.TrimSpace(vm.BatchID) != "" {
+			lines = append(lines, "批次: "+vm.BatchID)
+		}
+		lines = append(lines,
+			"模式: "+localizeMode("initial"),
+			"自测报告: "+vm.SelfTestState,
+			"文档: "+docsSummaryLine(vm.DocsSummary),
 			"",
 			"暂无运行记录，按 Ctrl+R 启动流水线",
-		}, "\n")
+		)
+		return strings.Join(lines, "\n")
 	}
 
 	stage := stageForKey(vm.Stages, selectedStage)

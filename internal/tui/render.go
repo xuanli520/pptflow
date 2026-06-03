@@ -29,19 +29,6 @@ func tableStyles() table.Styles {
 	return styles
 }
 
-func taskStateStyle(state string) lipgloss.Style {
-	switch strings.TrimSpace(state) {
-	case model.TaskInspecting:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#00DDDD"))
-	case model.TaskWaitingManual:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#DDAA00"))
-	case model.TaskCompleted:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#00CC66"))
-	default:
-		return mutedStyle
-	}
-}
-
 func renderHeader(m app) string {
 	taskBoard := "[题目管理]"
 	overview := "[总览]"
@@ -132,6 +119,9 @@ func renderExecutionLeft(m app, width int, maxHeight int) string {
 	width = max(1, width)
 	info := []string{
 		fmt.Sprintf("任务: %s", truncateMiddleDisplay(m.detailVM.TaskID, max(8, width-4))),
+	}
+	if strings.TrimSpace(m.detailVM.BatchID) != "" {
+		info = append(info, "批次: "+truncateMiddleDisplay(m.detailVM.BatchID, max(8, width-4)))
 	}
 	info = append(info, "模式: "+localizeMode(m.qaMode))
 	if m.qaMode == "recheck" {

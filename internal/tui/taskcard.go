@@ -22,7 +22,7 @@ func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool)
 	width = max(12, width)
 	bodyWidth := max(8, width-2)
 	var lines []taskCardLine
-	lines = append(lines, taskCardLine{text: truncateMiddleDisplay(task.ID, bodyWidth)})
+	lines = append(lines, taskCardLine{text: truncateMiddleDisplay(taskCardTitle(task), bodyWidth)})
 	switch task.TaskState {
 	case model.TaskWaitingManual:
 		lines = append(lines, waitingTaskLines(task, bodyWidth)...)
@@ -70,6 +70,13 @@ func renderTaskCard(task TaskProject, width int, now time.Time, isSelected bool)
 		rendered = append(rendered, text)
 	}
 	return strings.Join(rendered, "\n")
+}
+
+func taskCardTitle(task TaskProject) string {
+	if strings.TrimSpace(task.BatchID) == "" {
+		return task.ID
+	}
+	return task.ID + " [" + task.BatchID + "]"
 }
 
 func renderSelectedIndicator(width int) string {

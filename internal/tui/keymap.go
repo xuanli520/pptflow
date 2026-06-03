@@ -96,6 +96,9 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		}
 		return m, cmds
 	case "/":
+		if m.tab == panelOverview && m.focus == focusOverviewTable {
+			break
+		}
 		if m.focus != focusTaskInput {
 			m.taskInputFocusBeforeOpen = m.focus
 			m.taskInputFocusCaptured = true
@@ -194,7 +197,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		m.message = "正在检查 Docker 运行状态..."
 		return m, append(cmds, m.prepareQuitCmd())
 	case "q":
-		if m.focus == focusSearch {
+		if m.focus == focusSearch || (m.tab == panelOverview && m.focus == focusOverviewTable) {
 			break
 		}
 		m.message = "正在检查 Docker 运行状态..."

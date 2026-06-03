@@ -652,7 +652,11 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 		err = s.writeGitSyncErrorLog(job, err)
 	}
 	if s.store != nil {
-		_ = s.store.RecordTaskGitError(ctx, job.TaskID, err)
+		if gitsync.IsTerminalSyncError(err) {
+			_ = s.store.RecordTaskTerminalGitError(ctx, job.TaskID, err)
+		} else {
+			_ = s.store.RecordTaskGitError(ctx, job.TaskID, err)
+		}
 	}
 	job.mu.Lock()
 	if err == nil {

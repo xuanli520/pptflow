@@ -447,6 +447,12 @@ func (h TestHarness) SeedExecutionRun(taskID, runID string, stages []model.Stage
 	return h
 }
 
+func (h TestHarness) SetExecutionBatch(batchID string) TestHarness {
+	h.model.detailVM.BatchID = batchID
+	h.model.updateDetailContent(true)
+	return h
+}
+
 func (h TestHarness) View() string {
 	return h.model.View()
 }
