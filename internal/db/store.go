@@ -302,6 +302,27 @@ func (s *Store) RecordTaskGitError(ctx context.Context, taskID string, syncErr e
 	})
 }
 
+func (s *Store) RecordTaskTerminalGitError(ctx context.Context, taskID string, syncErr error) error {
+	message := ""
+	if syncErr != nil {
+		message = syncErr.Error()
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET state = ?, current_run_id = NULL, frontend_url = '', docker_running = 0, compose_meta = '', entered_waiting_at = '', archived_at = '', sync_error = ?, updated_at = ?
+			WHERE id = ?`,
+			model.TaskCompleted, message, now, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(result, "task", taskID); err != nil {
+			return err
+		}
+		return archiveCompletedOverflowTx(ctx, tx, now)
+	})
+}
+
 func (s *Store) ReopenTaskForInspection(ctx context.Context, taskID string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {

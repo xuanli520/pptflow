@@ -258,11 +258,11 @@ func (s *Syncer) verifyDeliveryPackage(repoPath string) error {
 		if err == nil {
 			err = errors.New("delivery package is not a directory")
 		}
-		return fmt.Errorf("verify delivery package %s: %w", repoPath, err)
+		return &DeliveryPackageError{RepoPath: repoPath, Err: err}
 	}
 	validation := projectlayout.ValidatePackageRoot(repoPath)
 	if !validation.Valid {
-		return fmt.Errorf("verify delivery package %s: missing %s", repoPath, strings.Join(validation.Missing, ", "))
+		return &DeliveryPackageError{RepoPath: repoPath, Missing: validation.Missing}
 	}
 	return nil
 }

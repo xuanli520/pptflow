@@ -244,6 +244,9 @@ func TestSubmitInspectionRecordsGitFailureWithoutRunningPipeline(t *testing.T) {
 	if !strings.Contains(stored.SyncError, "auth failed") {
 		t.Fatalf("sync error not recorded: %#v", stored)
 	}
+	if stored.State != model.TaskInspecting {
+		t.Fatalf("retryable git failure should keep task inspecting: %#v", stored)
+	}
 	select {
 	case <-pipelineCalled:
 		t.Fatal("pipeline should not run after git sync failure")
@@ -253,6 +256,99 @@ func TestSubmitInspectionRecordsGitFailureWithoutRunningPipeline(t *testing.T) {
 		if snapshot.Kind == scheduler.JobPipeline {
 			t.Fatalf("pipeline job should not be created after git failure: %#v", s.Snapshot())
 		}
+	}
+}
+
+func TestSubmitInspectionReleasesTaskOnInvalidDeliveryPackage(t *testing.T) {
+	store, cfg, task := newInspectionStore(t)
+	pipelineCalled := make(chan struct{}, 1)
+	s := scheduler.New(store, cfg,
+		scheduler.WithGitSyncRunner(fakeGitSyncRunner{err: &gitsync.DeliveryPackageError{RepoPath: task.RepoPath, Missing: []string{"repo/"}}}),
+		scheduler.WithRunnerFactory(func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+			return fakePipelineRunner{run: func(context.Context, string, pipeline.RunOptions) (pipeline.Result, error) {
+				pipelineCalled <- struct{}{}
+				return pipeline.Result{}, nil
+			}}
+		}),
+	)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		_ = store.Close()
+	})
+
+	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == task.ID && snapshot.State == scheduler.JobFailed
+	})
+	if failed.Kind != scheduler.JobGitSync || failed.SyncProgress.Phase != "failed" || !strings.Contains(failed.Err, "missing repo/") {
+		t.Fatalf("failed delivery package snapshot = %#v", failed)
+	}
+	stored, err := store.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != model.TaskCompleted || !strings.Contains(stored.SyncError, "missing repo/") {
+		t.Fatalf("invalid delivery package should release inspecting task: %#v", stored)
+	}
+	if count, err := store.CountTasksByState(context.Background(), model.TaskInspecting); err != nil || count != 0 {
+		t.Fatalf("inspecting count = %d, err=%v", count, err)
+	}
+	select {
+	case <-pipelineCalled:
+		t.Fatal("pipeline should not run after invalid delivery package")
+	default:
+	}
+}
+
+func TestSubmitInspectionReleasesTaskWhenRemoteRepositoryMissing(t *testing.T) {
+	store, cfg, task := newInspectionStore(t)
+	pipelineCalled := make(chan struct{}, 1)
+	s := scheduler.New(store, cfg,
+		scheduler.WithGitSyncRunner(fakeGitSyncRunner{err: &gitsync.CommandError{
+			Args:   []string{"clone", task.GitURL, task.RepoPath},
+			Stderr: "Cloning into '" + task.RepoPath + "'...\nremote: The project you were looking for could not be found or you don't have permission to view it.\nfatal: repository '" + task.GitURL + ".git/' not found",
+		}}),
+		scheduler.WithRunnerFactory(func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+			return fakePipelineRunner{run: func(context.Context, string, pipeline.RunOptions) (pipeline.Result, error) {
+				pipelineCalled <- struct{}{}
+				return pipeline.Result{}, nil
+			}}
+		}),
+	)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		_ = store.Close()
+	})
+
+	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == task.ID && snapshot.State == scheduler.JobFailed
+	})
+	if failed.Kind != scheduler.JobGitSync || failed.SyncProgress.Phase != "failed" || !strings.Contains(failed.Err, "not found") {
+		t.Fatalf("failed missing remote snapshot = %#v", failed)
+	}
+	stored, err := store.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != model.TaskCompleted || !strings.Contains(stored.SyncError, "not found") {
+		t.Fatalf("missing remote repository should release inspecting task: %#v", stored)
+	}
+	if count, err := store.CountTasksByState(context.Background(), model.TaskInspecting); err != nil || count != 0 {
+		t.Fatalf("inspecting count = %d, err=%v", count, err)
+	}
+	select {
+	case <-pipelineCalled:
+		t.Fatal("pipeline should not run after missing remote repository")
+	default:
 	}
 }
 

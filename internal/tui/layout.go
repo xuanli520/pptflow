@@ -125,7 +125,6 @@ func overviewColumnSpecs(width int, sort overviewSortMode, asc bool) []overviewC
 		widths [4]int
 	}{
 		{"task_id", "任务ID", [4]int{22, 22, 18, 14}},
-		{"task_state", "流程", [4]int{10, 10, 8, 0}},
 		{"run_status", "结果", [4]int{10, 10, 8, 6}},
 		{"failed_stage", "失败", [4]int{8, 6, 5, 4}},
 		{"blocker", "阻断", [4]int{6, 5, 4, 3}},

@@ -51,6 +51,15 @@ func TestTaskInputEscapeRestoresPreviousFocus(t *testing.T) {
 	}
 }
 
+func TestOverviewSlashFocusesSearch(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+
+	next, result := h.Press("/")
+	if result.Quit || next.FocusName() != "search" {
+		t.Fatalf("/ on overview should focus search, quit=%v focus=%s", result.Quit, next.FocusName())
+	}
+}
+
 func TestModeKeyDoesNotStealSearchInput(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SetFocus("search")
 	next, _ := h.Press("m")

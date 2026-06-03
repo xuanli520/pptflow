@@ -9,6 +9,17 @@ import (
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
 
+func TestTaskCardShowsBatch(t *testing.T) {
+	card := tuiapp.TaskCardForTest(tuiapp.TaskProject{
+		ID:        "TASK-20260521-ABCDEF",
+		BatchID:   "batch-007",
+		TaskState: model.TaskInspecting,
+	}, 64, time.Time{})
+	if !strings.Contains(card, "TASK-20260521-ABCDEF [batch-007]") {
+		t.Fatalf("task card should show batch:\n%s", card)
+	}
+}
+
 func TestTaskCardShowsGitProgressAndRetryFailure(t *testing.T) {
 	progress := tuiapp.TaskCardForTest(tuiapp.TaskProject{
 		ID:          "TASK-20260521-ABCDEF",
