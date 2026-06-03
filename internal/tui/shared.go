@@ -63,7 +63,9 @@ type TaskQueryService interface {
 
 type TaskActionService interface {
 	StartInspection(context.Context, string, pipeline.RunOptions) error
+	StartInspectionForProjectType(context.Context, string, string, pipeline.RunOptions) error
 	SubmitInspection(context.Context, string, pipeline.RunOptions) error
+	SubmitInspectionForProjectType(context.Context, string, string, pipeline.RunOptions) error
 	ReInspect(context.Context, string, pipeline.RunOptions) error
 	StartDocker(context.Context, string) error
 	ConfirmComplete(context.Context, string, string) error
@@ -214,6 +216,10 @@ func newTaskActionService(store *db.Store, cfg config.Config, scheduler schedule
 }
 
 func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
+	return s.StartInspectionForProjectType(ctx, taskID, config.ProjectTypeFullstack, opts)
+}
+
+func (s dbTaskActionService) StartInspectionForProjectType(ctx context.Context, taskID string, projectType string, opts pipeline.RunOptions) error {
 	taskID, err := ValidateTaskID(taskID)
 	if err != nil {
 		return err
@@ -221,7 +227,7 @@ func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string,
 	if err := s.ensureInspectingCapacity(ctx); err != nil {
 		return err
 	}
-	gitURL, err := taskGitURL(s.cfg.Git.BaseURL, taskID)
+	gitURL, err := taskGitURLForProjectType(s.cfg.Git, projectType, taskID)
 	if err != nil {
 		return err
 	}
@@ -233,6 +239,10 @@ func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string,
 }
 
 func (s dbTaskActionService) SubmitInspection(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
+	return s.SubmitInspectionForProjectType(ctx, taskID, config.ProjectTypeFullstack, opts)
+}
+
+func (s dbTaskActionService) SubmitInspectionForProjectType(ctx context.Context, taskID string, projectType string, opts pipeline.RunOptions) error {
 	taskID, err := ValidateTaskID(taskID)
 	if err != nil {
 		return err
@@ -253,7 +263,7 @@ func (s dbTaskActionService) SubmitInspection(ctx context.Context, taskID string
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	return s.StartInspection(ctx, taskID, opts)
+	return s.StartInspectionForProjectType(ctx, taskID, projectType, opts)
 }
 
 func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
@@ -593,6 +603,14 @@ func taskProjectFromSummary(cfg config.Config, project db.ProjectSummary) TaskPr
 		Path:             project.Path,
 		Mode:             "initial",
 	}
+}
+
+func taskGitURLForProjectType(git config.GitConfig, projectType string, taskID string) (string, error) {
+	base, err := config.GitBaseURLForProjectType(git, projectType)
+	if err != nil {
+		return "", err
+	}
+	return taskGitURL(base, taskID)
 }
 
 func taskGitURL(base string, taskID string) (string, error) {

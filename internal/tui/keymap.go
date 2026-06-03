@@ -184,6 +184,9 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			return m, cmds
 		}
 	}
+	if m.taskTypePrompt.taskID != "" {
+		return m.handleTaskTypePromptKey(key, cmds)
+	}
 	if m.verdictPrompt.taskID != "" {
 		return m.handleVerdictPromptKey(key, cmds)
 	}
@@ -531,6 +534,9 @@ func (m *app) openExecutionForTask(taskID string) {
 
 func (m *app) handleEscape() {
 	switch {
+	case m.taskTypePrompt.taskID != "":
+		m.taskTypePrompt = taskTypePrompt{}
+		m.message = "已取消新题质检"
 	case m.runConfig.active:
 		m.runConfig = runConfig{}
 		m.message = "已取消重跑"
@@ -627,6 +633,10 @@ func (m *app) openRunConfigForSelected(action runConfigAction) {
 }
 
 func (m *app) openRunConfigForTask(taskID string, action runConfigAction) {
+	m.openRunConfigForTaskWithProjectType(taskID, action, "")
+}
+
+func (m *app) openRunConfigForTaskWithProjectType(taskID string, action runConfigAction, projectType string) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
 		return
@@ -645,6 +655,7 @@ func (m *app) openRunConfigForTask(taskID string, action runConfigAction) {
 	}
 	availableDocs := taskdocs.AvailableCount(m.cfg.ScanPath, taskID)
 	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, availableDocs, action, m.cfg.Pipeline.DefaultStages)
+	m.runConfig.projectType = projectType
 }
 
 func (m *app) openRunConfigForTaskInput() bool {
@@ -693,6 +704,9 @@ func footerFor(m app) string {
 	}
 	if m.verdictPrompt.taskID != "" {
 		return "←→ 选择判定  1/2/3 快选  Enter 结束质检  Esc 取消"
+	}
+	if m.taskTypePrompt.taskID != "" {
+		return "←→ 选择题型  1/2/3 快选  Enter 确认  Esc 取消"
 	}
 	if m.settingsOpen {
 		if m.settings.selected == settingsItemDocker && m.dockerMirror.confirm != "" {
