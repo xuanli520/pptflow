@@ -262,6 +262,19 @@ func TestTaskInputCtrlROpensRunConfigForTypedTaskID(t *testing.T) {
 	}
 }
 
+func TestTaskInputEnterOpensTaskTypePromptBeforeRunConfig(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).ApplyTaskInputSubmitForTest("TASK-20260521-ABCDEF")
+	if !h.TaskTypePrompt() || h.Confirm() || !strings.Contains(h.View(), "确认题型 TASK-20260521-ABCDEF") {
+		t.Fatalf("task input submit should open task type prompt before run config:\n%s", h.View())
+	}
+
+	h, _ = h.Press("2")
+	next, result := h.Press("enter")
+	if next.TaskTypePrompt() || !next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.View(), "题型: 纯后端") {
+		t.Fatalf("task type confirmation should open run config with selected type, prompt=%v confirm=%v cmds=%d\n%s", next.TaskTypePrompt(), next.Confirm(), result.CmdCount, next.View())
+	}
+}
+
 func TestCtrlWRetriesGitSync(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedTaskBoardForTest([]tuiapp.TaskProject{
 		{ID: "TASK-20260521-AAAAAA", TaskState: model.TaskInspecting, SyncError: "auth failed"},

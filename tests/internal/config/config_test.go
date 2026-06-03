@@ -297,6 +297,68 @@ codex:
 	}
 }
 
+func TestLoadDerivesGitProjectTypeBaseURLs(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`git:
+  base_url: "https://gitlab.example.com/Prompt2Repo/fullstack/"
+  allowed_hosts: ["gitlab.example.com"]
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		projectType string
+		want        string
+	}{
+		{projectType: config.ProjectTypeFullstack, want: "https://gitlab.example.com/Prompt2Repo/fullstack/"},
+		{projectType: config.ProjectTypePureBackend, want: "https://gitlab.example.com/Prompt2Repo/server/"},
+		{projectType: config.ProjectTypePureFrontend, want: "https://gitlab.example.com/Prompt2Repo/web/"},
+	} {
+		got, err := config.GitBaseURLForProjectType(cfg.Git, tc.projectType)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s base URL = %s, want %s", tc.projectType, got, tc.want)
+		}
+	}
+}
+
+func TestLoadParsesGitProjectTypeBaseURLOverrides(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`git:
+  base_url: "https://gitlab.example.com/Prompt2Repo/fullstack/"
+  project_type_base_urls:
+    pure_backend: "https://gitlab.example.com/custom/backend/"
+  allowed_hosts: ["gitlab.example.com"]
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := config.GitBaseURLForProjectType(cfg.Git, config.ProjectTypePureBackend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://gitlab.example.com/custom/backend/"; got != want {
+		t.Fatalf("backend base URL = %s, want %s", got, want)
+	}
+	frontend, err := config.GitBaseURLForProjectType(cfg.Git, config.ProjectTypePureFrontend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://gitlab.example.com/Prompt2Repo/web/"; frontend != want {
+		t.Fatalf("frontend base URL = %s, want %s", frontend, want)
+	}
+}
+
 func TestLoadErrorsForMissingEnvReference(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte(`codex:

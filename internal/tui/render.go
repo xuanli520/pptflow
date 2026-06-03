@@ -386,6 +386,14 @@ func renderRunConfig(m app) string {
 	var lines []string
 	focusIndex := 1
 	lines = append(lines, titleStyle.Render("运行配置: "+truncateMiddleDisplay(c.taskID, max(12, width-16))))
+	if c.action == runConfigActionInspection {
+		if label := taskTypeLabel(c.projectType); label != "" {
+			lines = append(lines, "  题型: "+label)
+		}
+	}
+	if c.focus == runConfigFocusMode {
+		focusIndex = len(lines)
+	}
 	lines = append(lines, focusLine(c.focus == runConfigFocusMode, "模式: "+localizeMode(c.mode)))
 	if c.mode == "recheck" {
 		lines = append(lines, "  参考运行: "+empty(c.refRun, "-"))

@@ -71,6 +71,7 @@ type app struct {
 	confirmQuitTasks            []TaskProject
 	confirmStartupDockerCleanup bool
 	startupDockerCleanupCount   int
+	taskTypePrompt              taskTypePrompt
 	verdictPrompt               verdictPrompt
 }
 
@@ -387,7 +388,7 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.taskInputFocusCaptured = false
 		m.taskInput.Blur()
 		m.setFocus(focusTaskBoard)
-		m.openRunConfigForTask(value.TaskID, runConfigActionInspection)
+		m.openTaskTypePrompt(value.TaskID)
 		return true
 	case taskActionMsg:
 		if value.err != nil {
@@ -712,6 +713,10 @@ func (m app) View() string {
 		builder.WriteString(errorStyle.Render(truncateDisplay(prompt, max(8, m.width-2))))
 		builder.WriteString("\n")
 	}
+	if m.taskTypePrompt.taskID != "" {
+		builder.WriteString(renderTaskTypePrompt(m, max(8, m.width-2)))
+		builder.WriteString("\n")
+	}
 	if m.verdictPrompt.taskID != "" {
 		builder.WriteString(renderVerdictPrompt(m, max(8, m.width-2)))
 		builder.WriteString("\n")
@@ -861,14 +866,14 @@ func (m app) submitRun(taskID string, opts pipeline.RunOptions) tea.Cmd {
 	}
 }
 
-func (m app) submitInspection(taskID string, opts pipeline.RunOptions) tea.Cmd {
+func (m app) submitInspection(taskID string, opts pipeline.RunOptions, projectType string) tea.Cmd {
 	return func() tea.Msg {
 		if m.taskActionSvc == nil {
 			return taskActionMsg{action: "inspect", taskID: taskID, err: fmt.Errorf("task service unavailable")}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		err := m.taskActionSvc.SubmitInspection(ctx, taskID, opts)
+		err := m.taskActionSvc.SubmitInspectionForProjectType(ctx, taskID, projectType, opts)
 		return taskActionMsg{action: "inspect", taskID: taskID, err: err}
 	}
 }

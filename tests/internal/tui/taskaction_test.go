@@ -46,6 +46,52 @@ func TestStartInspectionRecordsSyncErrorWhenSubmitFails(t *testing.T) {
 	}
 }
 
+func TestStartInspectionUsesSelectedProjectTypeGitURL(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	for _, tc := range []struct {
+		taskID      string
+		projectType string
+		wantURL     string
+	}{
+		{
+			taskID:      "TASK-20260521-ABCDEF",
+			projectType: config.ProjectTypePureBackend,
+			wantURL:     "https://gitlab.mindflow.com.cn/Prompt2Repo/server/TASK-20260521-ABCDEF",
+		},
+		{
+			taskID:      "TASK-20260521-FEDCBA",
+			projectType: config.ProjectTypePureFrontend,
+			wantURL:     "https://gitlab.mindflow.com.cn/Prompt2Repo/web/TASK-20260521-FEDCBA",
+		},
+	} {
+		t.Run(tc.projectType, func(t *testing.T) {
+			writeTUIDropboxDoc(t, cfg.ScanPath, tc.taskID)
+			scheduler := &failingInspectionScheduler{}
+			if err := tuiapp.StartInspectionForProjectTypeForTest(ctx, store, cfg, scheduler, tc.taskID, tc.projectType); err != nil {
+				t.Fatal(err)
+			}
+			if scheduler.gitURL != tc.wantURL {
+				t.Fatalf("scheduler git URL = %s, want %s", scheduler.gitURL, tc.wantURL)
+			}
+			task, err := store.GetTask(ctx, tc.taskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if task.GitURL != tc.wantURL {
+				t.Fatalf("stored git URL = %s, want %s", task.GitURL, tc.wantURL)
+			}
+		})
+	}
+}
+
 func TestStartInspectionDocsGateDoesNotSubmitOrRecordSyncError(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()
@@ -241,11 +287,13 @@ func (e *confirmCompleteExec) hasCommand(fragment string) bool {
 }
 
 type failingInspectionScheduler struct {
-	err   error
-	calls int
+	err    error
+	calls  int
+	gitURL string
 }
 
 func (s *failingInspectionScheduler) SubmitInspection(taskID, batchID, gitURL string, opts pipeline.RunOptions) (string, error) {
 	s.calls++
-	return "", s.err
+	s.gitURL = gitURL
+	return "job-test", s.err
 }

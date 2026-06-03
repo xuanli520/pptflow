@@ -36,6 +36,7 @@ type runConfig struct {
 	action        runConfigAction
 	focus         runConfigFocus
 	taskID        string
+	projectType   string
 	mode          string
 	refRun        string
 	fromStage     string
@@ -255,7 +256,7 @@ func (m *app) submitRunConfig() tea.Cmd {
 	taskID := m.runConfig.taskID
 	var cmd tea.Cmd
 	if m.runConfig.action == runConfigActionInspection {
-		cmd = m.submitInspection(taskID, opts)
+		cmd = m.submitInspection(taskID, opts, m.runConfig.projectType)
 	} else {
 		cmd = m.submitRun(taskID, opts)
 	}

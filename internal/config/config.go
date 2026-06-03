@@ -21,7 +21,17 @@ const (
 
 	DefaultMaxConcurrent = 10
 	MaxConcurrentLimit   = 10
+
+	ProjectTypeFullstack    = "fullstack"
+	ProjectTypePureBackend  = "pure_backend"
+	ProjectTypePureFrontend = "pure_frontend"
 )
+
+var projectTypes = []string{
+	ProjectTypeFullstack,
+	ProjectTypePureBackend,
+	ProjectTypePureFrontend,
+}
 
 type Config struct {
 	ScanPath          string
@@ -52,11 +62,12 @@ type StageCConfig struct {
 }
 
 type GitConfig struct {
-	BaseURL      string
-	CloneTimeout time.Duration
-	ShallowClone bool
-	LFSEnabled   bool
-	AllowedHosts []string
+	BaseURL             string
+	ProjectTypeBaseURLs map[string]string
+	CloneTimeout        time.Duration
+	ShallowClone        bool
+	LFSEnabled          bool
+	AllowedHosts        []string
 }
 
 type DockerConfig struct {
@@ -183,11 +194,12 @@ type rawStageCConfig struct {
 }
 
 type rawGitConfig struct {
-	BaseURL      *string  `yaml:"base_url"`
-	CloneTimeout *string  `yaml:"clone_timeout"`
-	ShallowClone *bool    `yaml:"shallow_clone"`
-	LFSEnabled   *bool    `yaml:"lfs_enabled"`
-	AllowedHosts []string `yaml:"allowed_hosts"`
+	BaseURL             *string           `yaml:"base_url"`
+	ProjectTypeBaseURLs map[string]string `yaml:"project_type_base_urls"`
+	CloneTimeout        *string           `yaml:"clone_timeout"`
+	ShallowClone        *bool             `yaml:"shallow_clone"`
+	LFSEnabled          *bool             `yaml:"lfs_enabled"`
+	AllowedHosts        []string          `yaml:"allowed_hosts"`
 }
 
 type rawDockerConfig struct {
@@ -268,6 +280,7 @@ type rawTUIConfig struct {
 }
 
 func Default() Config {
+	defaultGitBaseURL := "https://gitlab.mindflow.com.cn/Prompt2Repo/fullstack/"
 	return Config{
 		ScanPath:          "./projects-qa",
 		DBPath:            "./projects-qa/.qa-control/index.db",
@@ -283,11 +296,12 @@ func Default() Config {
 			},
 		},
 		Git: GitConfig{
-			BaseURL:      "https://gitlab.mindflow.com.cn/Prompt2Repo/fullstack/",
-			CloneTimeout: 10 * time.Minute,
-			ShallowClone: true,
-			LFSEnabled:   false,
-			AllowedHosts: []string{"gitlab.mindflow.com.cn"},
+			BaseURL:             defaultGitBaseURL,
+			ProjectTypeBaseURLs: defaultGitProjectTypeBaseURLs(defaultGitBaseURL),
+			CloneTimeout:        10 * time.Minute,
+			ShallowClone:        true,
+			LFSEnabled:          false,
+			AllowedHosts:        []string{"gitlab.mindflow.com.cn"},
 		},
 		Docker: DockerConfig{
 			ManagedLabel:                "managed_by=p2rqa",
@@ -527,6 +541,10 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 	if raw.Git != nil {
 		if raw.Git.BaseURL != nil {
 			cfg.Git.BaseURL = *raw.Git.BaseURL
+			cfg.Git.ProjectTypeBaseURLs = nil
+		}
+		if raw.Git.ProjectTypeBaseURLs != nil {
+			cfg.Git.ProjectTypeBaseURLs = copyStringMap(raw.Git.ProjectTypeBaseURLs)
 		}
 		if raw.Git.CloneTimeout != nil {
 			duration, err := time.ParseDuration(strings.TrimSpace(*raw.Git.CloneTimeout))
@@ -771,6 +789,7 @@ func normalize(cfg *Config) {
 		cfg.Pipeline.StageC.ProxyImage = "alpine/socat:latest"
 	}
 	cfg.Git.BaseURL = strings.TrimSpace(cfg.Git.BaseURL)
+	cfg.Git.ProjectTypeBaseURLs = normalizeGitProjectTypeBaseURLs(cfg.Git.BaseURL, cfg.Git.ProjectTypeBaseURLs)
 	cfg.Git.AllowedHosts = normalizeHosts(cfg.Git.AllowedHosts)
 	if cfg.Git.CloneTimeout <= 0 {
 		cfg.Git.CloneTimeout = 10 * time.Minute
@@ -824,6 +843,44 @@ func NormalizeMaxConcurrent(value int) int {
 	return value
 }
 
+func ProjectTypes() []string {
+	return append([]string(nil), projectTypes...)
+}
+
+func NormalizeProjectType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "-", "_")
+	switch value {
+	case ProjectTypeFullstack, "full_stack":
+		return ProjectTypeFullstack
+	case ProjectTypePureBackend, "backend", "server", "pure_server":
+		return ProjectTypePureBackend
+	case ProjectTypePureFrontend, "frontend", "web", "pure_web":
+		return ProjectTypePureFrontend
+	default:
+		return ""
+	}
+}
+
+func GitBaseURLForProjectType(cfg GitConfig, projectType string) (string, error) {
+	normalized := NormalizeProjectType(projectType)
+	if strings.TrimSpace(projectType) == "" {
+		normalized = ProjectTypeFullstack
+	}
+	if normalized == "" {
+		return "", fmt.Errorf("unknown project type %q", projectType)
+	}
+	baseURLs := normalizeGitProjectTypeBaseURLs(cfg.BaseURL, cfg.ProjectTypeBaseURLs)
+	baseURL := strings.TrimSpace(baseURLs[normalized])
+	if baseURL == "" && normalized == ProjectTypeFullstack {
+		baseURL = strings.TrimSpace(cfg.BaseURL)
+	}
+	if baseURL == "" {
+		return "", fmt.Errorf("git.project_type_base_urls.%s must not be empty", normalized)
+	}
+	return baseURL, nil
+}
+
 func Validate(cfg Config) error {
 	for key, seconds := range cfg.Pipeline.StageTimeouts {
 		if _, err := validateStageTimeoutKey(key); err != nil {
@@ -853,6 +910,10 @@ func Validate(cfg Config) error {
 	}
 	if !gitBaseURLAllowed(cfg.Git.BaseURL, cfg.Git.AllowedHosts) {
 		return fmt.Errorf("git.base_url host must be listed in git.allowed_hosts")
+	}
+	projectTypeBaseURLs := normalizeGitProjectTypeBaseURLs(cfg.Git.BaseURL, cfg.Git.ProjectTypeBaseURLs)
+	if err := validateGitProjectTypeBaseURLs(projectTypeBaseURLs, cfg.Git.AllowedHosts); err != nil {
+		return err
 	}
 	if cfg.Git.CloneTimeout <= 0 {
 		return fmt.Errorf("git.clone_timeout must be greater than 0")
@@ -934,6 +995,79 @@ func validGitBaseURL(value string) bool {
 	return true
 }
 
+func validateGitProjectTypeBaseURLs(values map[string]string, allowedHosts []string) error {
+	for key := range values {
+		if NormalizeProjectType(key) == "" {
+			return fmt.Errorf("git.project_type_base_urls uses unknown project type %q", key)
+		}
+	}
+	for _, projectType := range projectTypes {
+		value := strings.TrimSpace(values[projectType])
+		if value == "" {
+			return fmt.Errorf("git.project_type_base_urls.%s must not be empty", projectType)
+		}
+		if !validGitBaseURL(value) {
+			return fmt.Errorf("git.project_type_base_urls.%s must be an absolute HTTPS URL without credentials, query, or fragment", projectType)
+		}
+		if !gitBaseURLAllowed(value, allowedHosts) {
+			return fmt.Errorf("git.project_type_base_urls.%s host must be listed in git.allowed_hosts", projectType)
+		}
+	}
+	return nil
+}
+
+func normalizeGitProjectTypeBaseURLs(baseURL string, values map[string]string) map[string]string {
+	result := defaultGitProjectTypeBaseURLs(baseURL)
+	for key, value := range values {
+		normalized := NormalizeProjectType(key)
+		if normalized == "" {
+			result[strings.TrimSpace(key)] = strings.TrimSpace(value)
+			continue
+		}
+		result[normalized] = strings.TrimSpace(value)
+	}
+	return result
+}
+
+func defaultGitProjectTypeBaseURLs(baseURL string) map[string]string {
+	baseURL = strings.TrimSpace(baseURL)
+	return map[string]string{
+		ProjectTypeFullstack:    baseURL,
+		ProjectTypePureBackend:  siblingGitBaseURL(baseURL, "server"),
+		ProjectTypePureFrontend: siblingGitBaseURL(baseURL, "web"),
+	}
+}
+
+func siblingGitBaseURL(baseURL, group string) string {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.TrimSpace(baseURL)
+	}
+	trimmed := strings.Trim(parsed.Path, "/")
+	segments := []string{}
+	if trimmed != "" {
+		segments = strings.Split(trimmed, "/")
+	}
+	if len(segments) == 0 {
+		segments = append(segments, group)
+	} else if isKnownGitRepoGroup(segments[len(segments)-1]) {
+		segments[len(segments)-1] = group
+	} else {
+		segments = append(segments, group)
+	}
+	parsed.Path = "/" + strings.Join(segments, "/") + "/"
+	return parsed.String()
+}
+
+func isKnownGitRepoGroup(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "fullstack", "server", "web":
+		return true
+	default:
+		return false
+	}
+}
+
 func gitBaseURLAllowed(value string, allowed []string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil {
@@ -961,6 +1095,14 @@ func normalizeHosts(values []string) []string {
 		}
 		seen[host] = true
 		result = append(result, host)
+	}
+	return result
+}
+
+func copyStringMap(values map[string]string) map[string]string {
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
 	}
 	return result
 }

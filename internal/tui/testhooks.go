@@ -104,6 +104,16 @@ func (h TestHarness) Press(key string) (TestHarness, TestKeyResult) {
 	return TestHarness{model: next}, result
 }
 
+func (h TestHarness) ApplyTaskInputSubmitForTest(taskID string) TestHarness {
+	model := cloneAppForTest(h.model)
+	next, _ := model.Update(TaskInputSubmitMsg{TaskID: taskID})
+	model, ok := next.(app)
+	if !ok {
+		return h
+	}
+	return TestHarness{model: model}
+}
+
 func (h TestHarness) ApplyProjectReloadForTest() (TestHarness, bool) {
 	model := cloneAppForTest(h.model)
 	model.overview.seq++
@@ -216,6 +226,11 @@ type InspectionSchedulerForTest interface {
 func StartInspectionForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID string) error {
 	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
 	return service.StartInspection(ctx, taskID, pipeline.RunOptions{})
+}
+
+func StartInspectionForProjectTypeForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID, projectType string) error {
+	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
+	return service.StartInspectionForProjectType(ctx, taskID, projectType, pipeline.RunOptions{})
 }
 
 func ForceExitCleanupForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
@@ -538,6 +553,10 @@ func (h TestHarness) Mode() string {
 
 func (h TestHarness) Confirm() bool {
 	return h.model.runConfig.active
+}
+
+func (h TestHarness) TaskTypePrompt() bool {
+	return h.model.taskTypePrompt.taskID != ""
 }
 
 func (h TestHarness) CancelConfirm() bool {
