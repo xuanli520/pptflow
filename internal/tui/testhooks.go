@@ -233,6 +233,11 @@ func StartInspectionForProjectTypeForTest(ctx context.Context, store *db.Store, 
 	return service.StartInspectionForProjectType(ctx, taskID, projectType, pipeline.RunOptions{})
 }
 
+func SubmitInspectionForProjectTypeForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID, projectType string, opts pipeline.RunOptions) error {
+	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
+	return service.SubmitInspectionForProjectType(ctx, taskID, projectType, opts)
+}
+
 func ForceExitCleanupForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
 	_, err := forceExitCleanup(ctx, cfg, exec, tasks)
 	return err

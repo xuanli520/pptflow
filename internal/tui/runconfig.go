@@ -20,9 +20,12 @@ const (
 	runConfigFocusFrom
 	runConfigFocusKeepRuntime
 	runConfigFocusExtraDocs
+	runConfigFocusProjectType
 	runConfigFocusSubmit
 	runConfigFocusCancel
 )
+
+const runConfigFocusCount = int(runConfigFocusCancel) + 1
 
 type runConfigAction int
 
@@ -37,6 +40,8 @@ type runConfig struct {
 	focus         runConfigFocus
 	taskID        string
 	projectType   string
+	currentType   string
+	existingTask  bool
 	mode          string
 	refRun        string
 	fromStage     string
@@ -120,11 +125,11 @@ func (m app) handleRunConfigKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		m.message = "已取消重跑"
 		return m, cmds
 	case "tab":
-		m.runConfig.focus = (m.runConfig.focus + 1) % 7
+		m.runConfig.focus = runConfigFocus((int(m.runConfig.focus) + 1) % runConfigFocusCount)
 		m.runConfig.syncInputFocus()
 		return m, cmds
 	case "shift+tab":
-		m.runConfig.focus = (m.runConfig.focus + 6) % 7
+		m.runConfig.focus = runConfigFocus((int(m.runConfig.focus) + runConfigFocusCount - 1) % runConfigFocusCount)
 		m.runConfig.syncInputFocus()
 		return m, cmds
 	case "up":
@@ -206,12 +211,25 @@ func (m *app) toggleRunConfigFocused() {
 		m.runConfig.fromStage = nextFromStage(m.runConfig.fromStage)
 	case runConfigFocusKeepRuntime:
 		m.runConfig.keepRuntime = !m.runConfig.keepRuntime
+	case runConfigFocusProjectType:
+		m.toggleRunConfigProjectType()
 	case runConfigFocusSubmit:
 		// Enter submits; Space keeps focus stable.
 	case runConfigFocusCancel:
 		m.runConfig = runConfig{}
 		m.message = "已取消重跑"
 	}
+}
+
+func (m *app) toggleRunConfigProjectType() {
+	if m.runConfig.action != runConfigActionInspection {
+		return
+	}
+	if m.runConfig.existingTask {
+		m.runConfig.projectType = nextExistingTaskProjectTypeReset(m.runConfig.projectType)
+		return
+	}
+	m.runConfig.projectType = nextProjectType(m.runConfig.projectType)
 }
 
 func (m *app) attachRunConfigDoc() {

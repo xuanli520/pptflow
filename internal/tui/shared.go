@@ -76,6 +76,10 @@ type inspectionScheduler interface {
 	SubmitInspection(string, string, string, pipeline.RunOptions) (string, error)
 }
 
+func isTaskNotFound(err error) bool {
+	return errors.Is(err, sql.ErrNoRows)
+}
+
 type dbTaskQueryService struct {
 	store *db.Store
 	cfg   config.Config
@@ -216,7 +220,7 @@ func newTaskActionService(store *db.Store, cfg config.Config, scheduler schedule
 }
 
 func (s dbTaskActionService) StartInspection(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
-	return s.StartInspectionForProjectType(ctx, taskID, config.ProjectTypeFullstack, opts)
+	return s.StartInspectionForProjectType(ctx, taskID, "", opts)
 }
 
 func (s dbTaskActionService) StartInspectionForProjectType(ctx context.Context, taskID string, projectType string, opts pipeline.RunOptions) error {
@@ -239,7 +243,7 @@ func (s dbTaskActionService) StartInspectionForProjectType(ctx context.Context, 
 }
 
 func (s dbTaskActionService) SubmitInspection(ctx context.Context, taskID string, opts pipeline.RunOptions) error {
-	return s.SubmitInspectionForProjectType(ctx, taskID, config.ProjectTypeFullstack, opts)
+	return s.SubmitInspectionForProjectType(ctx, taskID, "", opts)
 }
 
 func (s dbTaskActionService) SubmitInspectionForProjectType(ctx context.Context, taskID string, projectType string, opts pipeline.RunOptions) error {
@@ -249,21 +253,48 @@ func (s dbTaskActionService) SubmitInspectionForProjectType(ctx context.Context,
 	}
 	task, err := s.store.GetTask(ctx, taskID)
 	if err == nil {
-		if !canOpenInspectionRunConfig(task.State) {
+		retryGitSync := canRetryGitSyncWithProjectType(task)
+		if !canOpenInspectionRunConfig(task.State) && !retryGitSync {
 			return fmt.Errorf("task %s is not ready for reinspection", taskID)
 		}
 		if strings.TrimSpace(task.CurrentRunID) != "" {
 			return fmt.Errorf("task %s already has an active run", taskID)
 		}
-		if err := s.ensureInspectingCapacity(ctx); err != nil {
+		if !retryGitSync {
+			if err := s.ensureInspectingCapacity(ctx); err != nil {
+				return err
+			}
+		}
+		task, err = s.applySelectedProjectType(ctx, task, projectType)
+		if err != nil {
 			return err
 		}
 		return s.submitInspection(ctx, task, opts)
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if !isTaskNotFound(err) {
 		return err
 	}
 	return s.StartInspectionForProjectType(ctx, taskID, projectType, opts)
+}
+
+func canRetryGitSyncWithProjectType(task model.Task) bool {
+	return task.State == model.TaskInspecting &&
+		strings.TrimSpace(task.CurrentRunID) == "" &&
+		strings.TrimSpace(task.SyncError) != ""
+}
+
+func (s dbTaskActionService) applySelectedProjectType(ctx context.Context, task model.Task, projectType string) (model.Task, error) {
+	if strings.TrimSpace(projectType) == "" {
+		return task, nil
+	}
+	gitURL, err := taskGitURLForProjectType(s.cfg.Git, projectType, task.ID)
+	if err != nil {
+		return model.Task{}, err
+	}
+	if strings.TrimSpace(task.GitURL) == gitURL {
+		return task, nil
+	}
+	return s.store.UpdateTaskGitURL(ctx, task.ID, gitURL)
 }
 
 func (s dbTaskActionService) ReInspect(ctx context.Context, taskID string, opts pipeline.RunOptions) error {

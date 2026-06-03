@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -35,6 +36,104 @@ func taskTypeLabel(value string) string {
 		}
 	}
 	return ""
+}
+
+func nextProjectType(current string) string {
+	options := taskTypeOptions()
+	normalized := config.NormalizeProjectType(current)
+	for index, option := range options {
+		if option.value == normalized {
+			return options[(index+1)%len(options)].value
+		}
+	}
+	return options[0].value
+}
+
+func nextExistingTaskProjectTypeReset(current string) string {
+	options := taskTypeOptions()
+	normalized := config.NormalizeProjectType(current)
+	if normalized == "" {
+		return options[0].value
+	}
+	for index, option := range options {
+		if option.value == normalized {
+			if index == len(options)-1 {
+				return ""
+			}
+			return options[index+1].value
+		}
+	}
+	return ""
+}
+
+func runConfigProjectTypeText(c runConfig) string {
+	if c.existingTask {
+		if c.projectType == "" {
+			if label := taskTypeLabel(c.currentType); label != "" {
+				return "重置题型: 保持当前 (" + label + ")"
+			}
+			return "重置题型: 保持当前"
+		}
+		return "重置题型: " + taskTypeLabel(c.projectType)
+	}
+	label := taskTypeLabel(c.projectType)
+	if label == "" {
+		label = taskTypeLabel(config.ProjectTypeFullstack)
+	}
+	return "题型: " + label
+}
+
+func taskTypeFromGitURL(git config.GitConfig, gitURL string) string {
+	target := normalizedGitURLPrefix(gitURL)
+	if target == "" {
+		return ""
+	}
+	for _, projectType := range config.ProjectTypes() {
+		base, err := config.GitBaseURLForProjectType(git, projectType)
+		if err != nil {
+			continue
+		}
+		base = normalizedGitURLPrefix(base)
+		if base != "" && (target == base || strings.HasPrefix(target, base+"/")) {
+			return projectType
+		}
+	}
+	return taskTypeFromGitURLPath(gitURL)
+}
+
+func normalizedGitURLPrefix(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimRight(value, "/")
+	value = strings.TrimSuffix(value, ".git")
+	value = strings.TrimRight(value, "/")
+	return value
+}
+
+func taskTypeFromGitURLPath(gitURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(gitURL))
+	if err != nil {
+		return ""
+	}
+	path := strings.Trim(parsed.Path, "/")
+	path = strings.TrimSuffix(path, ".git")
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return ""
+	}
+	segments := strings.Split(path, "/")
+	if len(segments) < 2 {
+		return ""
+	}
+	switch strings.ToLower(segments[len(segments)-2]) {
+	case "fullstack":
+		return config.ProjectTypeFullstack
+	case "server":
+		return config.ProjectTypePureBackend
+	case "web":
+		return config.ProjectTypePureFrontend
+	default:
+		return ""
+	}
 }
 
 func (m *app) openTaskTypePrompt(taskID string) {

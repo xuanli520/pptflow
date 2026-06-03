@@ -375,7 +375,16 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		*cmds = append(*cmds, cmd)
 		return true
 	case TaskInputSubmitMsg:
-		if m.taskBoard != nil && m.taskBoard.StateCount(model.TaskInspecting) >= db.ActiveTaskStateLimit {
+		existingTask, err := m.taskInputExistingTask(value.TaskID)
+		if err != nil {
+			m.message = err.Error()
+			m.taskInput.SetValue(value.TaskID)
+			m.taskInput.SetError(err.Error())
+			m.taskInput.Focus()
+			m.setFocus(focusTaskInput)
+			return true
+		}
+		if !existingTask && m.taskBoard != nil && m.taskBoard.StateCount(model.TaskInspecting) >= db.ActiveTaskStateLimit {
 			m.message = db.ErrInspectingTaskLimit.Error()
 			m.taskInput.SetValue(value.TaskID)
 			m.taskInput.SetError(db.ErrInspectingTaskLimit.Error())
@@ -388,7 +397,11 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.taskInputFocusCaptured = false
 		m.taskInput.Blur()
 		m.setFocus(focusTaskBoard)
-		m.openTaskTypePrompt(value.TaskID)
+		if existingTask {
+			m.openRunConfigForTask(value.TaskID, runConfigActionInspection)
+		} else {
+			m.openTaskTypePrompt(value.TaskID)
+		}
 		return true
 	case taskActionMsg:
 		if value.err != nil {
@@ -441,6 +454,30 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 	default:
 		return false
 	}
+}
+
+func (m app) taskInputExistingTask(taskID string) (bool, error) {
+	project, err := m.lookupTaskProject(taskID)
+	if err != nil {
+		return false, err
+	}
+	return project != nil, nil
+}
+
+func (m app) lookupTaskProject(taskID string) (*TaskProject, error) {
+	if m.taskQuerySvc == nil {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	project, err := m.taskQuerySvc.GetByID(ctx, strings.TrimSpace(taskID))
+	if err == nil {
+		return project, nil
+	}
+	if isTaskNotFound(err) {
+		return nil, nil
+	}
+	return nil, err
 }
 
 func (m *app) handleOverviewMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {

@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/xuanli520/p2r_tui/internal/config"
+	"github.com/xuanli520/p2r_tui/internal/db"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
@@ -272,6 +274,58 @@ func TestTaskInputEnterOpensTaskTypePromptBeforeRunConfig(t *testing.T) {
 	next, result := h.Press("enter")
 	if next.TaskTypePrompt() || !next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.View(), "题型: 纯后端") {
 		t.Fatalf("task type confirmation should open run config with selected type, prompt=%v confirm=%v cmds=%d\n%s", next.TaskTypePrompt(), next.Confirm(), result.CmdCount, next.View())
+	}
+}
+
+func TestTaskInputEnterForExistingTaskOpensRunConfigWithoutTypePrompt(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	taskID := "TASK-20260521-ABCDEF"
+	gitURL := "https://gitlab.mindflow.com.cn/Prompt2Repo/web/" + taskID
+	if _, err := store.CreateTaskWithBatch(ctx, taskID, gitURL, cfg.ScanPath); err != nil {
+		t.Fatal(err)
+	}
+
+	h := tuiapp.NewTestHarnessWithStore(store, cfg).ApplyTaskInputSubmitForTest(taskID)
+	view := h.View()
+	if h.TaskTypePrompt() || !h.Confirm() || !strings.Contains(view, "运行配置: "+taskID) {
+		t.Fatalf("existing task submit should open run config without task type prompt:\n%s", view)
+	}
+	if !strings.Contains(view, "重置题型: 保持当前 (纯前端)") {
+		t.Fatalf("run config should show current type reset option:\n%s", view)
+	}
+}
+
+func TestRunConfigProjectTypeResetCyclesAtBottom(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	taskID := "TASK-20260521-FEDCBA"
+	gitURL := "https://gitlab.mindflow.com.cn/Prompt2Repo/fullstack/" + taskID
+	if _, err := store.CreateTaskWithBatch(ctx, taskID, gitURL, cfg.ScanPath); err != nil {
+		t.Fatal(err)
+	}
+
+	h := tuiapp.NewTestHarnessWithStore(store, cfg).ApplyTaskInputSubmitForTest(taskID)
+	for i := 0; i < 5; i++ {
+		h, _ = h.Press("tab")
+	}
+	for i := 0; i < 3; i++ {
+		h, _ = h.Press(" ")
+	}
+	if !strings.Contains(h.View(), "重置题型: 纯前端") {
+		t.Fatalf("project type reset should cycle to pure frontend at the bottom:\n%s", h.View())
 	}
 }
 

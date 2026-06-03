@@ -386,11 +386,6 @@ func renderRunConfig(m app) string {
 	var lines []string
 	focusIndex := 1
 	lines = append(lines, titleStyle.Render("运行配置: "+truncateMiddleDisplay(c.taskID, max(12, width-16))))
-	if c.action == runConfigActionInspection {
-		if label := taskTypeLabel(c.projectType); label != "" {
-			lines = append(lines, "  题型: "+label)
-		}
-	}
 	if c.focus == runConfigFocusMode {
 		focusIndex = len(lines)
 	}
@@ -449,6 +444,12 @@ func renderRunConfig(m app) string {
 		stageText = "-"
 	}
 	lines = append(lines, mutedStyle.Render("将运行阶段: "+stageText))
+	if c.action == runConfigActionInspection {
+		if c.focus == runConfigFocusProjectType {
+			focusIndex = len(lines)
+		}
+		lines = append(lines, focusLine(c.focus == runConfigFocusProjectType, runConfigProjectTypeText(c)))
+	}
 	lines = append(lines, "")
 	if c.focus == runConfigFocusSubmit {
 		focusIndex = len(lines)

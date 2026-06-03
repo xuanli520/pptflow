@@ -302,6 +302,27 @@ func (s *Store) RecordTaskGitError(ctx context.Context, taskID string, syncErr e
 	})
 }
 
+func (s *Store) UpdateTaskGitURL(ctx context.Context, taskID string, gitURL string) (model.Task, error) {
+	gitURL = strings.TrimSpace(gitURL)
+	if gitURL == "" {
+		return model.Task{}, errors.New("git url is required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	var task model.Task
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE tasks SET git_url = ?, updated_at = ? WHERE id = ?`, gitURL, now, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(result, "task", taskID); err != nil {
+			return err
+		}
+		task, err = getTaskTx(ctx, tx, taskID)
+		return err
+	})
+	return task, err
+}
+
 func (s *Store) ReopenTaskForInspection(ctx context.Context, taskID string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {

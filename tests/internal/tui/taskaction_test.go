@@ -92,6 +92,96 @@ func TestStartInspectionUsesSelectedProjectTypeGitURL(t *testing.T) {
 	}
 }
 
+func TestSubmitInspectionUpdatesExistingTaskGitURLForSelectedProjectType(t *testing.T) {
+	store, cfg, taskID := waitingManualTask(t)
+	ctx := context.Background()
+	if _, err := store.CompleteTask(ctx, taskID); err != nil {
+		t.Fatal(err)
+	}
+	scheduler := &failingInspectionScheduler{}
+	wantURL := "https://gitlab.mindflow.com.cn/Prompt2Repo/web/" + taskID
+
+	err := tuiapp.SubmitInspectionForProjectTypeForTest(ctx, store, cfg, scheduler, taskID, config.ProjectTypePureFrontend, pipeline.RunOptions{Mode: "recheck"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.gitURL != wantURL {
+		t.Fatalf("scheduler git URL = %s, want %s", scheduler.gitURL, wantURL)
+	}
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.GitURL != wantURL {
+		t.Fatalf("stored git URL = %s, want %s", task.GitURL, wantURL)
+	}
+}
+
+func TestSubmitInspectionKeepsExistingTaskGitURLWithoutProjectTypeReset(t *testing.T) {
+	store, cfg, taskID := waitingManualTask(t)
+	ctx := context.Background()
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalURL := task.GitURL
+	if _, err := store.CompleteTask(ctx, taskID); err != nil {
+		t.Fatal(err)
+	}
+	scheduler := &failingInspectionScheduler{}
+
+	err = tuiapp.SubmitInspectionForProjectTypeForTest(ctx, store, cfg, scheduler, taskID, "", pipeline.RunOptions{Mode: "recheck"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.gitURL != originalURL {
+		t.Fatalf("scheduler git URL = %s, want existing %s", scheduler.gitURL, originalURL)
+	}
+	task, err = store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.GitURL != originalURL {
+		t.Fatalf("stored git URL = %s, want existing %s", task.GitURL, originalURL)
+	}
+}
+
+func TestSubmitInspectionUpdatesRetryableGitSyncTaskURLForSelectedProjectType(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	taskID := "TASK-20260521-BBBCCC"
+	task, err := store.CreateTaskWithBatch(ctx, taskID, "https://gitlab.mindflow.com.cn/Prompt2Repo/fullstack/"+taskID, cfg.ScanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordTaskGitError(ctx, task.ID, errors.New("repository not found")); err != nil {
+		t.Fatal(err)
+	}
+	scheduler := &failingInspectionScheduler{}
+	wantURL := "https://gitlab.mindflow.com.cn/Prompt2Repo/web/" + taskID
+
+	err = tuiapp.SubmitInspectionForProjectTypeForTest(ctx, store, cfg, scheduler, taskID, config.ProjectTypePureFrontend, pipeline.RunOptions{Mode: "recheck"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.gitURL != wantURL {
+		t.Fatalf("scheduler git URL = %s, want %s", scheduler.gitURL, wantURL)
+	}
+	task, err = store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.GitURL != wantURL {
+		t.Fatalf("stored git URL = %s, want %s", task.GitURL, wantURL)
+	}
+}
+
 func TestStartInspectionDocsGateDoesNotSubmitOrRecordSyncError(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()

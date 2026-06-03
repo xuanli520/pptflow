@@ -5,6 +5,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
@@ -652,7 +653,13 @@ func (m *app) openRunConfigForTaskWithProjectType(taskID string, action runConfi
 	}
 	availableDocs := taskdocs.AvailableCount(m.cfg.ScanPath, taskID)
 	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, availableDocs, action, m.cfg.Pipeline.DefaultStages)
-	m.runConfig.projectType = projectType
+	if action == runConfigActionInspection {
+		if project, err := m.lookupTaskProject(taskID); err == nil && project != nil {
+			m.runConfig.existingTask = true
+			m.runConfig.currentType = taskTypeFromGitURL(m.cfg.Git, project.GitURL)
+		}
+	}
+	m.runConfig.projectType = config.NormalizeProjectType(projectType)
 }
 
 func (m *app) openRunConfigForTaskInput() bool {
