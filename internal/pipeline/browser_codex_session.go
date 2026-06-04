@@ -75,6 +75,9 @@ type browserActionPromptData struct {
 	ProjectPath              string
 	ArtifactRoot             string
 	Round                    int
+	MinimumScreenshotCount   int
+	MaximumScreenshotCount   int
+	CurrentScreenshotCount   int
 	URLCandidatesJSON        string
 	PreviousObservationsJSON string
 	BlockedActionsJSON       string
@@ -90,6 +93,9 @@ func browserActionPromptDataForStage(sc StageContext, profile, contextText strin
 		ProjectPath:              sc.Project.Path,
 		ArtifactRoot:             sc.Run.ArtifactRoot,
 		Round:                    round,
+		MinimumScreenshotCount:   stageGMinBrowserScreenshots,
+		MaximumScreenshotCount:   stageGMaxBrowserScreenshots,
+		CurrentScreenshotCount:   stageGBrowserScreenshotCount(observations),
 		URLCandidatesJSON:        string(candidateJSON),
 		PreviousObservationsJSON: string(observationJSON),
 		BlockedActionsJSON:       string(blockedJSON),

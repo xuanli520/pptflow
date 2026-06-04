@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,8 +19,12 @@ import (
 
 const stageGMaxActions = 30
 const stageGMaxInvalidActions = 3
+const stageGMinBrowserScreenshots = 5
+const stageGMaxBrowserScreenshots = 10
 const stageGBrowserProfileName = "frontend_e2e_browser.md"
 const stageGBrowserActionPromptTemplateName = "frontend_e2e_browser_action_prompt.md"
+const stageGLegacyScreenshotName = "frontend_e2e_screenshot.png"
+const stageGKeyScreenshotDirName = "frontend_e2e_screenshots"
 
 func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 	start := time.Now()
@@ -28,7 +33,7 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 	logPath := stageLogPath(sc.Run.ArtifactRoot, string(model.StageG))
 	summaryPath := filepath.Join(sc.Run.ArtifactRoot, "frontend_e2e_summary.json")
 	reportPath := qaArtifactPath(sc.Run.ArtifactRoot, "frontend_e2e_report.md")
-	screenshotPath := qaArtifactPath(sc.Run.ArtifactRoot, "frontend_e2e_screenshot.png")
+	screenshotPath := qaArtifactPath(sc.Run.ArtifactRoot, stageGLegacyScreenshotName)
 	observationsPath := filepath.Join(sc.Run.ArtifactRoot, "frontend_e2e_observations.json")
 	record.LogPath = logPath
 	record.ArtifactPaths = []string{logPath, summaryPath, reportPath, screenshotPath, observationsPath}
@@ -145,11 +150,11 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 		}, nil)
 	}
 	contextText := stageGBrowserContext(sc.Project.Path)
-	runner := browserpkg.NewPlaywrightWrapper(r.exec, stageGNodePath(sc.Preflight), browserpkg.Policy{
+	nodePath := stageGNodePath(sc.Preflight)
+	browserPolicy := browserpkg.Policy{
 		AllowlistOrigins: browserAllowlistOrigins(candidates),
 		ArtifactRoot:     sc.Run.ArtifactRoot,
-		ScreenshotPath:   screenshotPath,
-	})
+	}
 	var observations []browserpkg.Observation
 	var blocked []BlockedBrowserAction
 	invalidCount := 0
@@ -199,6 +204,11 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 		}
 		invalidCount = 0
 		if validation.Action.Action == "finish" {
+			if reason := stageGFinishScreenshotBlockReason(observations); reason != "" {
+				blocked = append(blocked, BlockedBrowserAction{Action: validation.Action.Action, Reason: reason, Risk: string(validation.Risk), Raw: rawAction})
+				bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), fmt.Sprintf("blocked action round %d: %s\n", round, reason))
+				continue
+			}
 			summary, err := parseFrontendE2ESummary(validation.Action.Summary)
 			if err != nil {
 				record.Findings = append(record.Findings, frontendE2ESchemaFailureFinding(summaryPath, err))
@@ -248,6 +258,9 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 			continue
 		}
 		bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogPlannedAction(round, validation.Action))
+		actionPolicy := browserPolicy
+		actionPolicy.ScreenshotPath = stageGRuntimeScreenshotPath(sc.Run.ArtifactRoot, round, action.Name)
+		runner := browserpkg.NewPlaywrightWrapper(r.exec, nodePath, actionPolicy)
 		observation, err := runner.Run(stageCtx, action, 45*time.Second)
 		if err != nil {
 			record.Findings = append(record.Findings, model.Finding{
@@ -284,6 +297,197 @@ func cleanupStageGBrowserRuntime(artifactRoot string) {
 		return
 	}
 	_ = os.RemoveAll(filepath.Join(artifactRoot, "browser_runtime"))
+}
+
+func stageGRuntimeScreenshotPath(artifactRoot string, round int, action string) string {
+	name := fmt.Sprintf("round_%02d_%s.png", round, stageGScreenshotSafeName(action))
+	return filepath.Join(artifactRoot, "browser_runtime", "screenshots", name)
+}
+
+func stageGScreenshotSafeName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "action"
+	}
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	result := strings.Trim(builder.String(), "-")
+	if result == "" {
+		return "action"
+	}
+	if len(result) > 48 {
+		result = result[:48]
+		result = strings.TrimRight(result, "-")
+	}
+	return result
+}
+
+func stageGFinishScreenshotBlockReason(observations []browserpkg.Observation) string {
+	count := stageGBrowserScreenshotCount(observations)
+	if count >= stageGMinBrowserScreenshots {
+		return ""
+	}
+	return fmt.Sprintf("Stage G requires at least %d browser screenshots before finish; currently captured %d. Continue with snapshot, collect_network, or non-destructive navigation until key browser states are evidenced.", stageGMinBrowserScreenshots, count)
+}
+
+func stageGBrowserScreenshotCount(observations []browserpkg.Observation) int {
+	seen := map[string]bool{}
+	count := 0
+	for _, observation := range observations {
+		path := strings.TrimSpace(observation.ScreenshotPath)
+		if path == "" || seen[path] || !fileExists(path) {
+			continue
+		}
+		seen[path] = true
+		count++
+	}
+	return count
+}
+
+func stageGKeyScreenshotObservationIndexes(observations []browserpkg.Observation) []int {
+	var eligible []int
+	for index, observation := range observations {
+		if path := strings.TrimSpace(observation.ScreenshotPath); path != "" && fileExists(path) {
+			eligible = append(eligible, index)
+		}
+	}
+	if len(eligible) <= stageGMaxBrowserScreenshots {
+		return eligible
+	}
+	selected := map[int]bool{}
+	add := func(index int) {
+		if index >= 0 {
+			selected[index] = true
+		}
+	}
+	add(eligible[0])
+	add(eligible[len(eligible)-1])
+	for _, index := range eligible {
+		observation := observations[index]
+		if !observation.OK {
+			add(index)
+		}
+		if len(observation.PageErrors) > 0 || len(observation.ConsoleErrors) > 0 || len(observation.NetworkIssues) > 0 {
+			add(index)
+		}
+		if hasMutatingOrFailingNetworkEvent(observation.NetworkEvents) {
+			add(index)
+		}
+	}
+	if len(selected) > stageGMaxBrowserScreenshots {
+		return trimStageGScreenshotIndexes(sortedStageGIndexSet(selected))
+	}
+	lastURL := ""
+	for _, index := range eligible {
+		if len(selected) >= stageGMaxBrowserScreenshots {
+			break
+		}
+		observation := observations[index]
+		if observation.CurrentURL != "" && observation.CurrentURL != lastURL {
+			add(index)
+			lastURL = observation.CurrentURL
+		}
+	}
+	for len(selected) < stageGMaxBrowserScreenshots {
+		next := evenlySampledScreenshotIndex(eligible, selected)
+		if next < 0 {
+			break
+		}
+		selected[next] = true
+	}
+	return sortedStageGIndexSet(selected)
+}
+
+func hasMutatingOrFailingNetworkEvent(events []browserpkg.NetworkEvent) bool {
+	for _, event := range events {
+		method := strings.ToUpper(strings.TrimSpace(event.Method))
+		if event.Status >= 400 || event.Error != "" {
+			return true
+		}
+		switch method {
+		case "POST", "PUT", "PATCH", "DELETE":
+			return true
+		}
+	}
+	return false
+}
+
+func evenlySampledScreenshotIndex(eligible []int, selected map[int]bool) int {
+	if len(eligible) == 0 {
+		return -1
+	}
+	bestIndex := -1
+	bestDistance := -1
+	for _, candidate := range eligible {
+		if selected[candidate] {
+			continue
+		}
+		distance := nearestSelectedDistance(candidate, selected)
+		if distance > bestDistance {
+			bestDistance = distance
+			bestIndex = candidate
+		}
+	}
+	return bestIndex
+}
+
+func nearestSelectedDistance(candidate int, selected map[int]bool) int {
+	best := -1
+	for index := range selected {
+		distance := candidate - index
+		if distance < 0 {
+			distance = -distance
+		}
+		if best < 0 || distance < best {
+			best = distance
+		}
+	}
+	if best < 0 {
+		return candidate
+	}
+	return best
+}
+
+func trimStageGScreenshotIndexes(indexes []int) []int {
+	keep := map[int]bool{}
+	if len(indexes) == 0 {
+		return nil
+	}
+	keep[indexes[0]] = true
+	keep[indexes[len(indexes)-1]] = true
+	for len(keep) < stageGMaxBrowserScreenshots {
+		next := evenlySampledScreenshotIndex(indexes, keep)
+		if next < 0 {
+			break
+		}
+		keep[next] = true
+	}
+	result := make([]int, 0, len(keep))
+	for index := range keep {
+		result = append(result, index)
+	}
+	sort.Ints(result)
+	return result
+}
+
+func sortedStageGIndexSet(indexes map[int]bool) []int {
+	result := make([]int, 0, len(indexes))
+	for index := range indexes {
+		result = append(result, index)
+	}
+	sort.Ints(result)
+	return result
 }
 
 func stageGLogHeader(sc StageContext, candidates []BrowserURLCandidate) string {
@@ -335,6 +539,9 @@ func compactLogValue(value string, limit int) string {
 func stageGLogObservation(round int, observation browserpkg.Observation) string {
 	var builder strings.Builder
 	builder.WriteString(fmt.Sprintf("round %d action=%s ok=%t url=%s title=%s\n", round, observation.Action, observation.OK, observation.CurrentURL, observation.Title))
+	if strings.TrimSpace(observation.ScreenshotPath) != "" {
+		builder.WriteString("screenshot: " + strings.TrimSpace(observation.ScreenshotPath) + "\n")
+	}
 	if strings.TrimSpace(observation.Error) != "" {
 		builder.WriteString("error: " + strings.TrimSpace(observation.Error) + "\n")
 	}
@@ -427,26 +634,73 @@ func (r Runner) writeStageGArtifacts(record model.StageRecord, writer ArtifactWr
 	if observations == nil {
 		observations = []browserpkg.Observation{}
 	}
+	record, summary, observations = materializeStageGScreenshotArtifacts(record, writer, summary, observations)
 	record = requiredStageJSON(record, writer, "frontend_e2e_summary.json", summary)
 	record = requiredStageText(record, writer, "frontend_e2e_report.md", frontendE2EReport(summary, observations))
 	record = requiredStageJSON(record, writer, "frontend_e2e_observations.json", observations)
-	record = ensureStageGScreenshot(record, writer, summary, observations)
 	return record
 }
 
-func ensureStageGScreenshot(record model.StageRecord, writer ArtifactWriter, summary FrontendE2ESummary, observations []browserpkg.Observation) model.StageRecord {
-	screenshotPath := writer.Path("frontend_e2e_screenshot.png")
-	if fileExists(screenshotPath) {
-		return ensureArtifactPath(record, screenshotPath)
+func materializeStageGScreenshotArtifacts(record model.StageRecord, writer ArtifactWriter, summary FrontendE2ESummary, observations []browserpkg.Observation) (model.StageRecord, FrontendE2ESummary, []browserpkg.Observation) {
+	selected := stageGKeyScreenshotObservationIndexes(observations)
+	selectedSet := map[int]bool{}
+	for _, index := range selected {
+		selectedSet[index] = true
 	}
-	pages, err := renderTerminalLog(stageGScreenshotFallbackText(summary, observations), screenshotPath)
+	var screenshots []string
+	for selectedIndex, observationIndex := range selected {
+		source := strings.TrimSpace(observations[observationIndex].ScreenshotPath)
+		dest := stageGFinalScreenshotPath(writer, selectedIndex, len(selected), observations[observationIndex])
+		if err := copyStageGScreenshot(source, dest); err != nil {
+			record = recordArtifactWriteError(record, err, dest)
+			observations[observationIndex].ScreenshotPath = ""
+			continue
+		}
+		observations[observationIndex].ScreenshotPath = dest
+		screenshots = append(screenshots, dest)
+		record = ensureArtifactPath(record, dest)
+	}
+	for index := range observations {
+		if !selectedSet[index] {
+			observations[index].ScreenshotPath = ""
+		}
+	}
+	if len(screenshots) == 0 {
+		fallbackPath := writer.Path(stageGLegacyScreenshotName)
+		pages, err := renderTerminalLog(stageGScreenshotFallbackText(summary, observations), fallbackPath)
+		if err != nil {
+			record = recordArtifactWriteError(record, err, fallbackPath)
+		}
+		for _, page := range pages {
+			screenshots = append(screenshots, page)
+			record = ensureArtifactPath(record, page)
+		}
+	}
+	summary.Screenshots = screenshots
+	return record, summary, observations
+}
+
+func stageGFinalScreenshotPath(writer ArtifactWriter, selectedIndex, selectedCount int, observation browserpkg.Observation) string {
+	if selectedIndex == selectedCount-1 {
+		return writer.Path(stageGLegacyScreenshotName)
+	}
+	name := fmt.Sprintf("%02d_%s.png", selectedIndex+1, stageGScreenshotSafeName(observation.Action))
+	return writer.Path(filepath.Join(stageGKeyScreenshotDirName, name))
+}
+
+func copyStageGScreenshot(source, dest string) error {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return fmt.Errorf("source screenshot path is empty")
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	content, err := os.ReadFile(source)
 	if err != nil {
-		return recordArtifactWriteError(record, err, screenshotPath)
+		return err
 	}
-	for _, page := range pages {
-		record = ensureArtifactPath(record, page)
-	}
-	return record
+	return os.WriteFile(dest, content, 0o644)
 }
 
 func stageGScreenshotFallbackText(summary FrontendE2ESummary, observations []browserpkg.Observation) string {
@@ -672,10 +926,19 @@ func frontendE2EReport(summary FrontendE2ESummary, observations []browserpkg.Obs
 			builder.WriteString(fmt.Sprintf("- %s: %s\n", action.Action, action.Reason))
 		}
 	}
+	if len(summary.Screenshots) > 0 {
+		builder.WriteString("\n## Screenshots\n")
+		for index, screenshot := range summary.Screenshots {
+			builder.WriteString(fmt.Sprintf("- %02d %s\n", index+1, screenshot))
+		}
+	}
 	if len(observations) > 0 {
 		builder.WriteString("\n## Observations\n")
 		for _, observation := range observations {
 			builder.WriteString(fmt.Sprintf("- %s ok=%t url=%s title=%s\n", observation.Action, observation.OK, observation.CurrentURL, observation.Title))
+			if observation.ScreenshotPath != "" {
+				builder.WriteString(fmt.Sprintf("  screenshot: %s\n", observation.ScreenshotPath))
+			}
 			for _, err := range observation.PageErrors {
 				builder.WriteString(fmt.Sprintf("  page_error: %s\n", err))
 			}

@@ -58,12 +58,20 @@ func (w PlaywrightWrapper) Run(ctx context.Context, action Action, timeout time.
 	if policy.FormStatePath == "" {
 		policy.FormStatePath = filepath.Join(stateDir, "form_state.json")
 	}
-	if policy.ScreenshotPath == "" {
+	if policy.ScreenshotPath == "" && !policy.DisableScreenshot {
 		policy.ScreenshotPath = filepath.Join(root, "frontend_e2e_screenshot.png")
 	}
 	for _, path := range []string{policy.StorageStatePath, policy.LastURLPath, policy.FormStatePath, policy.ScreenshotPath} {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
 		if !pathWithinRoot(path, root) {
 			return Observation{}, fmt.Errorf("browser artifact path escapes root: %s", path)
+		}
+	}
+	if policy.ScreenshotPath != "" {
+		if err := os.MkdirAll(filepath.Dir(policy.ScreenshotPath), 0o755); err != nil {
+			return Observation{}, err
 		}
 	}
 	requestPath := filepath.Join(stateDir, "request.json")
@@ -308,7 +316,7 @@ async function collect(page, ok, error) {
   } catch (_) {}
   let screenshotPath = '';
   try {
-    if (policy.screenshot_path) {
+    if (policy.screenshot_path && !policy.disable_screenshot) {
       await page.screenshot({ path: policy.screenshot_path, fullPage: true });
       screenshotPath = policy.screenshot_path;
     }
@@ -341,6 +349,7 @@ async function collect(page, ok, error) {
 
 (async () => {
   let browser;
+  let page;
   try {
     browser = await chromium.launch({ headless: true });
     const contextOptions = {};
@@ -358,7 +367,7 @@ async function collect(page, ok, error) {
       blockedRequests.push({ url: raw, origin: parsed.origin });
       return route.abort('blockedbyclient');
     });
-    const page = await context.newPage();
+    page = await context.newPage();
     const formState = loadFormState();
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(trim(msg.text(), 1000));
@@ -434,6 +443,12 @@ async function collect(page, ok, error) {
     process.stdout.write(JSON.stringify(observation));
   } catch (err) {
     try {
+      if (page) {
+        const observation = await collect(page, false, err && err.message ? err.message : String(err));
+        if (browser) await browser.close();
+        process.stdout.write(JSON.stringify(observation));
+        return;
+      }
       if (browser) await browser.close();
     } catch (_) {}
     process.stdout.write(JSON.stringify({

@@ -461,6 +461,21 @@ func StageGLogObservationForTest(round int, observation TestBrowserObservation) 
 	return stageGLogObservation(round, observation)
 }
 
+func StageGFinishScreenshotBlockReasonForTest(observations []TestBrowserObservation) string {
+	return stageGFinishScreenshotBlockReason(observations)
+}
+
+func StageGKeyScreenshotObservationIndexesForTest(observations []TestBrowserObservation) []int {
+	return stageGKeyScreenshotObservationIndexes(observations)
+}
+
+func MaterializeStageGScreenshotArtifactsForTest(root string, summary TestFrontendE2ESummary, observations []TestBrowserObservation) (TestFrontendE2ESummary, []TestBrowserObservation, model.StageRecord) {
+	record := model.StageRecord{Stage: string(model.StageG)}
+	writer := NewArtifactWriter(root)
+	record, summary, observations = materializeStageGScreenshotArtifacts(record, writer, summary, observations)
+	return summary, observations, record
+}
+
 func IncludeStageGActionFailureFallbackForTest(summary TestFrontendE2ESummary, summaryFindings []model.Finding) bool {
 	return includeStageGActionFailureFallback(summary, summaryFindings)
 }

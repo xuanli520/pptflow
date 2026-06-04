@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -248,6 +249,7 @@ func TestBrowserActionPromptTemplateRendersFromPromptProfileAsset(t *testing.T) 
 	}
 	for _, want := range []string{
 		"Run p2r stage G as a browser E2E planner.",
+		"finish requires at least 5 browser screenshots",
 		"\"id\": \"url_1\"",
 		"README-derived browser test hints",
 		"rep1/rep123",
@@ -259,6 +261,111 @@ func TestBrowserActionPromptTemplateRendersFromPromptProfileAsset(t *testing.T) 
 	}
 	if strings.Contains(prompt, "{{.") {
 		t.Fatalf("rendered prompt still contains template placeholders:\n%s", prompt)
+	}
+}
+
+func TestStageGFinishRequiresMinimumBrowserScreenshots(t *testing.T) {
+	root := t.TempDir()
+	observations := make([]pipelinepkg.TestBrowserObservation, 0, 5)
+	for index := 0; index < 4; index++ {
+		observations = append(observations, pipelinepkg.TestBrowserObservation{
+			Action:         "snapshot",
+			OK:             true,
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "runtime", fmt.Sprintf("shot-%02d.png", index))),
+		})
+	}
+	reason := pipelinepkg.StageGFinishScreenshotBlockReasonForTest(observations)
+	if !strings.Contains(reason, "at least 5 browser screenshots") || !strings.Contains(reason, "currently captured 4") {
+		t.Fatalf("unexpected finish block reason: %q", reason)
+	}
+	observations = append(observations, pipelinepkg.TestBrowserObservation{
+		Action:         "snapshot",
+		OK:             true,
+		ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "runtime", "shot-04.png")),
+	})
+	if reason := pipelinepkg.StageGFinishScreenshotBlockReasonForTest(observations); reason != "" {
+		t.Fatalf("finish should be allowed after five screenshots, got %q", reason)
+	}
+}
+
+func TestStageGKeyScreenshotSelectionIsCappedAndRepresentative(t *testing.T) {
+	root := t.TempDir()
+	var observations []pipelinepkg.TestBrowserObservation
+	for index := 0; index < 12; index++ {
+		observation := pipelinepkg.TestBrowserObservation{
+			Action:         "snapshot",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "runtime", fmt.Sprintf("shot-%02d.png", index))),
+		}
+		if index == 3 {
+			observation.OK = false
+			observation.Error = "selector timed out"
+		}
+		if index == 8 {
+			observation.NetworkEvents = []browserpkg.NetworkEvent{{URL: "http://127.0.0.1:5173/api/auth/login", Method: "POST", Status: 200}}
+		}
+		observations = append(observations, observation)
+	}
+	indexes := pipelinepkg.StageGKeyScreenshotObservationIndexesForTest(observations)
+	if len(indexes) != 10 {
+		t.Fatalf("selected %d screenshots, want 10: %#v", len(indexes), indexes)
+	}
+	for _, want := range []int{0, 3, 8, 11} {
+		if !slices.Contains(indexes, want) {
+			t.Fatalf("selected screenshots should include key index %d: %#v", want, indexes)
+		}
+	}
+}
+
+func TestStageGMaterializesAtMostTenScreenshotArtifacts(t *testing.T) {
+	sourceRoot := t.TempDir()
+	artifactRoot := t.TempDir()
+	var observations []pipelinepkg.TestBrowserObservation
+	for index := 0; index < 12; index++ {
+		observations = append(observations, pipelinepkg.TestBrowserObservation{
+			Action:         "snapshot",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(sourceRoot, fmt.Sprintf("shot-%02d.png", index))),
+		})
+	}
+	summary := pipelinepkg.TestFrontendE2ESummary{
+		SchemaVersion: "p2r.frontend_e2e.v1",
+		Status:        "passed",
+	}
+	materialized, materializedObservations, record := pipelinepkg.MaterializeStageGScreenshotArtifactsForTest(artifactRoot, summary, observations)
+	if len(record.Findings) != 0 {
+		t.Fatalf("unexpected artifact findings: %#v", record.Findings)
+	}
+	if len(materialized.Screenshots) != 10 {
+		t.Fatalf("summary screenshots = %d, want 10: %#v", len(materialized.Screenshots), materialized.Screenshots)
+	}
+	legacy := filepath.Join(artifactRoot, "frontend_e2e_screenshot.png")
+	if materialized.Screenshots[len(materialized.Screenshots)-1] != legacy {
+		t.Fatalf("last screenshot should preserve legacy path: %#v", materialized.Screenshots)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("missing legacy screenshot: %v", err)
+	}
+	dirEntries, err := os.ReadDir(filepath.Join(artifactRoot, "frontend_e2e_screenshots"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirEntries) != 9 {
+		t.Fatalf("expected 9 supplemental screenshots, got %d", len(dirEntries))
+	}
+	nonEmpty := 0
+	for _, observation := range materializedObservations {
+		if observation.ScreenshotPath != "" {
+			nonEmpty++
+			if _, err := os.Stat(observation.ScreenshotPath); err != nil {
+				t.Fatalf("materialized observation screenshot missing: %v", err)
+			}
+		}
+	}
+	if nonEmpty != 10 {
+		t.Fatalf("materialized observation screenshots = %d, want 10", nonEmpty)
 	}
 }
 
@@ -412,6 +519,18 @@ func TestBrowserActionValidatorRejectsUnsafeActions(t *testing.T) {
 	if blocked := pipelinepkg.ValidateBrowserActionForTest(pipelinepkg.TestBrowserAction{Action: "open_candidate", URLID: "url_1", Reason: "open app"}, candidates); blocked != nil {
 		t.Fatalf("valid action blocked: %#v", blocked)
 	}
+}
+
+func writeTinyPNG(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 type runtimeBlockedRunner struct{}

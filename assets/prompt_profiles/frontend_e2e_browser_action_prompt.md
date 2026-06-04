@@ -3,6 +3,7 @@ Run p2r stage G as a browser E2E planner.
 Project path: {{.ProjectPath}}
 Artifact root: {{.ArtifactRoot}}
 Round: {{.Round}}
+Screenshot evidence: {{.CurrentScreenshotCount}} captured so far; finish requires at least {{.MinimumScreenshotCount}} browser screenshots and p2r will retain at most {{.MaximumScreenshotCount}} key screenshots.
 
 Hard boundaries:
 - Return exactly one JSON object and no prose.
@@ -13,6 +14,7 @@ Hard boundaries:
 - Allowed actions: open_candidate, wait, snapshot, collect_console, collect_network, click_navigation, click_button, fill_input, submit_local_form, go_back, finish.
 - Destructive actions are forbidden.
 - Use finish only when you can provide a valid p2r.frontend_e2e.v1 summary.
+- Do not use finish until at least {{.MinimumScreenshotCount}} browser screenshots have been captured in previous observations. If the workflow evidence is otherwise complete, use snapshot, collect_network, or other non-destructive read-only actions to capture missing key states.
 - Before concluding credentials are unavailable or login cannot be tested, use README-derived browser test hints from Project context. They may include local demo accounts, E2E check credentials, or README-referenced .env login passwords.
 - For login forms, prefer stable selectors such as input[type="text"], input[type="email"], input[type="password"], form input, and visible button text over generated element IDs.
 - For form submit buttons, prefer selectors such as button[type="submit"] or form button over broad text clicks, especially when the page title also contains words like "Sign in".

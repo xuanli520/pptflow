@@ -17,12 +17,13 @@ type Action struct {
 }
 
 type Policy struct {
-	AllowlistOrigins []string `json:"allowlist_origins"`
-	ArtifactRoot     string   `json:"artifact_root"`
-	ScreenshotPath   string   `json:"screenshot_path"`
-	StorageStatePath string   `json:"storage_state_path"`
-	LastURLPath      string   `json:"last_url_path"`
-	FormStatePath    string   `json:"form_state_path"`
+	AllowlistOrigins  []string `json:"allowlist_origins"`
+	ArtifactRoot      string   `json:"artifact_root"`
+	ScreenshotPath    string   `json:"screenshot_path"`
+	DisableScreenshot bool     `json:"disable_screenshot,omitempty"`
+	StorageStatePath  string   `json:"storage_state_path"`
+	LastURLPath       string   `json:"last_url_path"`
+	FormStatePath     string   `json:"form_state_path"`
 }
 
 type Observation struct {
