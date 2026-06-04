@@ -368,7 +368,9 @@ func Default() Config {
 
 func Load(cwd string, overrides Overrides) (Config, error) {
 	cfg := Default()
+	defaults := Default()
 	cwd = filepath.Clean(cwd)
+	var settings fileSettings
 	bases := pathBases{
 		ScanPath:              cwd,
 		DBPath:                cwd,
@@ -382,7 +384,7 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 		return cfg, err
 	}
 	if path != "" {
-		settings, err := applyFile(&cfg, path)
+		settings, err = applyFile(&cfg, path)
 		if err != nil {
 			return cfg, err
 		}
@@ -407,6 +409,7 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 	if value := strings.TrimSpace(os.Getenv(EnvDBPath)); value != "" {
 		cfg.DBPath = value
 		bases.DBPath = cwd
+		settings.DBPath = true
 	}
 	if overrides.ScanPath != "" {
 		cfg.ScanPath = overrides.ScanPath
@@ -415,10 +418,21 @@ func Load(cwd string, overrides Overrides) (Config, error) {
 	if overrides.DBPath != "" {
 		cfg.DBPath = overrides.DBPath
 		bases.DBPath = cwd
+		settings.DBPath = true
 	}
+	dbPathFollowsScan := isDefaultControlPath(cfg.DBPath, bases.DBPath, defaults.DBPath)
+	promptProfilesFollowScan := isDefaultControlPath(cfg.Codex.PromptProfilesDir, bases.PromptProfilesDir, defaults.Codex.PromptProfilesDir)
 	cfg.ScanPath = absFrom(bases.ScanPath, cfg.ScanPath)
-	cfg.DBPath = absFrom(bases.DBPath, cfg.DBPath)
-	cfg.Codex.PromptProfilesDir = absFrom(bases.PromptProfilesDir, cfg.Codex.PromptProfilesDir)
+	if !settings.DBPath || dbPathFollowsScan {
+		cfg.DBPath = filepath.Join(cfg.ScanPath, ".qa-control", "index.db")
+	} else {
+		cfg.DBPath = absFrom(bases.DBPath, cfg.DBPath)
+	}
+	if !settings.PromptProfilesDir || promptProfilesFollowScan {
+		cfg.Codex.PromptProfilesDir = filepath.Join(cfg.ScanPath, ".qa-control", "prompt_profiles")
+	} else {
+		cfg.Codex.PromptProfilesDir = absFrom(bases.PromptProfilesDir, cfg.Codex.PromptProfilesDir)
+	}
 	if strings.TrimSpace(cfg.Docker.DaemonMirrors.BackupDir) == "" {
 		cfg.Docker.DaemonMirrors.BackupDir = filepath.Join(cfg.ScanPath, ".qa-control", "docker-daemon-backups")
 	} else {
@@ -477,6 +491,18 @@ func absFrom(cwd, path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Clean(filepath.Join(cwd, path))
+}
+
+func isDefaultControlPath(pathValue, base, defaultValue string) bool {
+	pathValue = strings.TrimSpace(pathValue)
+	defaultValue = strings.TrimSpace(defaultValue)
+	if pathValue == "" || defaultValue == "" {
+		return false
+	}
+	if filepath.IsAbs(pathValue) {
+		return filepath.Clean(pathValue) == absFrom(base, defaultValue)
+	}
+	return filepath.Clean(pathValue) == filepath.Clean(defaultValue)
 }
 
 func applyFile(cfg *Config, path string) (fileSettings, error) {

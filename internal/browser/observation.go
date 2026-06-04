@@ -22,6 +22,7 @@ type Policy struct {
 	ScreenshotPath   string   `json:"screenshot_path"`
 	StorageStatePath string   `json:"storage_state_path"`
 	LastURLPath      string   `json:"last_url_path"`
+	FormStatePath    string   `json:"form_state_path"`
 }
 
 type Observation struct {
@@ -34,6 +35,7 @@ type Observation struct {
 	ConsoleErrors   []string          `json:"console_errors,omitempty"`
 	PageErrors      []string          `json:"page_errors,omitempty"`
 	NetworkIssues   []NetworkIssue    `json:"network_issues,omitempty"`
+	NetworkEvents   []NetworkEvent    `json:"network_events,omitempty"`
 	BlockedRequests []BlockedRequest  `json:"blocked_requests,omitempty"`
 	ScreenshotPath  string            `json:"screenshot_path,omitempty"`
 	Error           string            `json:"error,omitempty"`
@@ -47,12 +49,21 @@ type ControlSummary struct {
 	Name        string `json:"name,omitempty"`
 	Placeholder string `json:"placeholder,omitempty"`
 	Type        string `json:"type,omitempty"`
+	HasValue    bool   `json:"has_value,omitempty"`
 }
 
 type NetworkIssue struct {
 	URL    string `json:"url"`
 	Status int    `json:"status,omitempty"`
 	Error  string `json:"error,omitempty"`
+}
+
+type NetworkEvent struct {
+	URL          string `json:"url"`
+	Method       string `json:"method,omitempty"`
+	Status       int    `json:"status,omitempty"`
+	ResourceType string `json:"resource_type,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 type BlockedRequest struct {
@@ -85,6 +96,12 @@ func sanitizeObservation(observation Observation) Observation {
 	for index := range observation.NetworkIssues {
 		observation.NetworkIssues[index].URL = sanitizeURL(observation.NetworkIssues[index].URL)
 		observation.NetworkIssues[index].Error = redactText(observation.NetworkIssues[index].Error)
+	}
+	for index := range observation.NetworkEvents {
+		observation.NetworkEvents[index].URL = sanitizeURL(observation.NetworkEvents[index].URL)
+		observation.NetworkEvents[index].Method = redactText(observation.NetworkEvents[index].Method)
+		observation.NetworkEvents[index].ResourceType = redactText(observation.NetworkEvents[index].ResourceType)
+		observation.NetworkEvents[index].Error = redactText(observation.NetworkEvents[index].Error)
 	}
 	for index := range observation.BlockedRequests {
 		observation.BlockedRequests[index].URL = sanitizeURL(observation.BlockedRequests[index].URL)

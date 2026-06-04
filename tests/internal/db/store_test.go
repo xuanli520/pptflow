@@ -60,6 +60,55 @@ func TestFindingsAreScopedByRun(t *testing.T) {
 	}
 }
 
+func TestProjectOnlyRunCanPersistRuntimeStage(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	projectPath := t.TempDir()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-PROJECT", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+	run := model.RunRecord{
+		RunID:         "run-project-only",
+		TaskID:        "TASK-PROJECT",
+		StartedAt:     time.Now().UTC().Format(time.RFC3339),
+		Status:        model.RunRunning,
+		ManualVerdict: model.ManualUnset,
+		ArtifactRoot:  t.TempDir(),
+	}
+	if err := store.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	stage := model.StageRecord{Stage: "B", Name: "Docker runtime evidence", Status: model.StageDone}
+	meta := model.ComposeMeta{Project: "p2rqa_project", ComposeFiles: []string{"compose.yml"}, WorkDir: projectPath}
+	if err := store.PutStageAndRecordTaskRuntime(ctx, run.RunID, stage, run.TaskID, "http://127.0.0.1:32770", true, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkTaskDockerStopped(ctx, run.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, run.RunID, run.TaskID, model.RunCompletedClean, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	stages, err := store.Stages(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stages) != 1 || stages[0].Stage != "B" || stages[0].Status != model.StageDone {
+		t.Fatalf("stages = %#v", stages)
+	}
+	summaries, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].HasTask || summaries[0].RunCount != 1 || summaries[0].LastRunID != run.RunID {
+		t.Fatalf("project summary = %#v", summaries)
+	}
+}
+
 func TestConcurrentWritesAreSerialized(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
 	if err != nil {

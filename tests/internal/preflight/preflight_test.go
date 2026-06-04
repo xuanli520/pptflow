@@ -128,7 +128,7 @@ type missingDockerExec struct {
 }
 
 func (missingDockerExec) LookPath(name string) (string, error) {
-	if name == "docker" {
+	if strings.Contains(strings.ToLower(name), "docker") {
 		return "", errors.New("missing docker")
 	}
 	return preflightExec{}.LookPath(name)

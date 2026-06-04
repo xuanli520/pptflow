@@ -31,10 +31,10 @@ func newRunCommand() *cobra.Command {
 				return fmt.Errorf("--stage and --from are mutually exclusive")
 			}
 			if stage != "" && !validStage(stage) {
-				return fmt.Errorf("invalid --stage %q; expected A..G", stage)
+				return fmt.Errorf("invalid --stage %q; expected one of %s", stage, stageListForHelp())
 			}
 			if from != "" && !validStage(from) {
-				return fmt.Errorf("invalid --from %q; expected A..G", from)
+				return fmt.Errorf("invalid --from %q; expected one of %s", from, stageListForHelp())
 			}
 			cfg, err := loadConfig("")
 			if err != nil {
@@ -67,8 +67,8 @@ func newRunCommand() *cobra.Command {
 			return nil
 		},
 	}
-	command.Flags().StringVar(&stage, "stage", "", "run only one stage (A..G)")
-	command.Flags().StringVar(&from, "from", "", "run from one stage through G (A..G)")
+	command.Flags().StringVar(&stage, "stage", "", "run only one stage ("+stageListForHelp()+")")
+	command.Flags().StringVar(&from, "from", "", "run from one stage through the remaining selected order ("+stageListForHelp()+")")
 	command.Flags().BoolVar(&staticOnly, "static-only", false, "run only A, D, E, and F")
 	command.Flags().StringVar(&mode, "mode", "initial", "QA mode: initial or recheck")
 	command.Flags().StringVar(&refRun, "ref-run", "", "reference run id for --mode recheck")
@@ -79,4 +79,8 @@ func newRunCommand() *cobra.Command {
 
 func validStage(stage string) bool {
 	return model.IsStageID(stage)
+}
+
+func stageListForHelp() string {
+	return strings.Join(model.AllStages(), ",")
 }

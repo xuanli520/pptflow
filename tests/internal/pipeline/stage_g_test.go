@@ -2,6 +2,7 @@ package pipeline_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xuanli520/p2r_tui/assets"
+	browserpkg "github.com/xuanli520/p2r_tui/internal/browser"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
@@ -47,6 +50,56 @@ func TestBrowserURLCandidatesUseLocalhostAllowlist(t *testing.T) {
 	}
 }
 
+func TestBrowserURLCandidatesDoNotBorrowProbeAcrossPorts(t *testing.T) {
+	candidates := pipelinepkg.BrowserURLCandidatesForTest(pipelinepkg.TestRuntimeEvidence{
+		Services: []string{"web"},
+		Mappings: map[string][]pipelinepkg.TestPortMapping{
+			"web": {
+				{Service: "web", URL: "0.0.0.0", Host: 3000, Container: 3000, Protocol: "tcp"},
+				{Service: "web", URL: "0.0.0.0", Host: 3001, Container: 3001, Protocol: "tcp"},
+			},
+		},
+		Probes: []pipelinepkg.TestProbeResult{
+			{Service: "web", URL: "http://127.0.0.1:3000", OK: true, Status: 200},
+		},
+	})
+	if len(candidates) != 2 {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+	if candidates[0].Source != "probe" || !candidates[0].ProbeOK {
+		t.Fatalf("first candidate should carry exact successful probe evidence: %#v", candidates[0])
+	}
+	if candidates[1].Source != "mapping" || candidates[1].ProbeOK || candidates[1].ProbeStatus != 0 {
+		t.Fatalf("second candidate should not borrow first probe evidence: %#v", candidates[1])
+	}
+}
+
+func TestBrowserURLCandidatesDeduplicateEquivalentMappings(t *testing.T) {
+	candidates := pipelinepkg.BrowserURLCandidatesForTest(pipelinepkg.TestRuntimeEvidence{
+		Services: []string{"web"},
+		Mappings: map[string][]pipelinepkg.TestPortMapping{
+			"web": {
+				{Service: "web", URL: "0.0.0.0", Host: 38080, Container: 80, Protocol: "tcp"},
+				{Service: "web", URL: "0.0.0.0", Host: 38080, Container: 80, Protocol: "tcp"},
+				{Service: "web", URL: "0.0.0.0", Host: 39090, Container: 8080, Protocol: "tcp"},
+			},
+		},
+		Probes: []pipelinepkg.TestProbeResult{
+			{Service: "web", URL: "http://127.0.0.1:38080", OK: true, Status: 200},
+			{Service: "web", URL: "http://127.0.0.1:39090", OK: true, Status: 200},
+		},
+	})
+	if len(candidates) != 2 {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+	if candidates[0].ID != "url_1" || candidates[1].ID != "url_2" {
+		t.Fatalf("candidate IDs should remain contiguous after dedupe: %#v", candidates)
+	}
+	if candidates[0].URL != "http://127.0.0.1:38080" || candidates[1].URL != "http://127.0.0.1:39090" {
+		t.Fatalf("unexpected URLs after dedupe: %#v", candidates)
+	}
+}
+
 func TestStageBBlocksFrontendAndRuntimeDependents(t *testing.T) {
 	got := pipelinepkg.BlockedDependentsForTest("B")
 	want := []string{"G", "C"}
@@ -78,6 +131,269 @@ func TestRunBlocksGAndCWhenStageBPreflightBlocked(t *testing.T) {
 			t.Fatalf("expected blocked artifact %s: %v", name, err)
 		}
 	}
+	content, err := os.ReadFile(filepath.Join(result.Run.ArtifactRoot, "frontend_e2e_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary pipelinepkg.TestFrontendE2ESummary
+	if err := json.Unmarshal(content, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Findings) != 1 || summary.Findings[0].Title != "Stage G blocked" {
+		t.Fatalf("blocked summary findings = %#v", summary.Findings)
+	}
+}
+
+func TestBrowserCodexEnvDoesNotInheritSecretsOrUserHomes(t *testing.T) {
+	env := pipelinepkg.BrowserCodexEnvForTest([]string{
+		"PATH=/usr/bin",
+		"HOME=/home/user",
+		"USERPROFILE=/home/user",
+		"CODEX_HOME=/home/user/.codex",
+		"CODEX_API_KEY=secret",
+		"OPENAI_API_KEY=secret",
+		"HTTP_PROXY=http://user:pass@proxy.local:8080",
+		"TMPDIR=/tmp",
+		"LANG=C.UTF-8",
+	}, map[string]string{"P2R_EXPLICIT": "ok"}, "/opt/node/bin/node")
+	joined := "\n" + strings.Join(env, "\n") + "\n"
+	for _, key := range []string{"\nHOME=", "\nUSERPROFILE=", "\nCODEX_HOME=", "\nCODEX_API_KEY=", "\nOPENAI_API_KEY=", "\nHTTP_PROXY="} {
+		if strings.Contains(joined, key) {
+			t.Fatalf("browser Codex env leaked %s in %#v", strings.Trim(key, "\n="), env)
+		}
+	}
+	for _, key := range []string{"\nPATH=", "\nTMPDIR=", "\nLANG=", "\nP2R_EXPLICIT="} {
+		if !strings.Contains(joined, key) {
+			t.Fatalf("browser Codex env missing %s in %#v", strings.Trim(key, "\n="), env)
+		}
+	}
+}
+
+func TestStageGBrowserContextHighlightsReadmeCredentials(t *testing.T) {
+	projectPath := t.TempDir()
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	readme := `# FieldOrder Pro
+
+Demo credentials (also shown on the login screen):
+
+| Username | Password | Role |
+|----------|----------|------|
+| admin    | admin123 | admin |
+| rep1     | rep123   | rep |
+
+End-to-end UI check: sign in as rep1/rep123 and open the catalog.
+`
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte(readme), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	contextText := pipelinepkg.StageGBrowserContextForTest(projectPath)
+	for _, want := range []string{
+		"BEGIN P2R BROWSER TEST HINTS",
+		"Demo credentials",
+		"admin123",
+		"rep1/rep123",
+		"BEGIN UNTRUSTED repo/README.md",
+	} {
+		if !strings.Contains(contextText, want) {
+			t.Fatalf("context missing %q:\n%s", want, contextText)
+		}
+	}
+}
+
+func TestStageGBrowserContextResolvesReadmeReferencedEnvPassword(t *testing.T) {
+	projectPath := t.TempDir()
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	readme := `# TerraSync
+
+### Default Credentials
+
+On first startup the seed script consumes $ADMIN_BOOTSTRAP_PASSWORD from .env.
+Seeded accounts include admin, engineer, and viewer.
+`
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte(readme), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := `POSTGRES_PASSWORD=do_not_surface
+ADMIN_BOOTSTRAP_PASSWORD=ChangeMeOnFirstLogin!   # dev login password
+`
+	if err := os.WriteFile(filepath.Join(repoPath, ".env"), []byte(env), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	contextText := pipelinepkg.StageGBrowserContextForTest(projectPath)
+	if !strings.Contains(contextText, "ADMIN_BOOTSTRAP_PASSWORD=ChangeMeOnFirstLogin!") {
+		t.Fatalf("context should surface README-referenced login password:\n%s", contextText)
+	}
+	if strings.Contains(contextText, "POSTGRES_PASSWORD=do_not_surface") {
+		t.Fatalf("context should not surface unrelated database password:\n%s", contextText)
+	}
+}
+
+func TestBrowserActionPromptTemplateRendersFromPromptProfileAsset(t *testing.T) {
+	content, err := assets.FS.ReadFile("prompt_profiles/frontend_e2e_browser_action_prompt.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextText := "README-derived browser test hints: rep1/rep123"
+	prompt, err := pipelinepkg.BrowserActionPromptForTest(string(content), "profile text", contextText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Run p2r stage G as a browser E2E planner.",
+		"\"id\": \"url_1\"",
+		"README-derived browser test hints",
+		"rep1/rep123",
+		"profile text",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("rendered prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "{{.") {
+		t.Fatalf("rendered prompt still contains template placeholders:\n%s", prompt)
+	}
+}
+
+func TestExtractJSONObjectAcceptsWrappedPlannerOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "plain object",
+			raw:  `{"action":"wait","reason":"observe"}`,
+			want: `{"action":"wait","reason":"observe"}`,
+		},
+		{
+			name: "fenced object",
+			raw:  "```json\n{\"action\":\"wait\",\"reason\":\"observe\"}\n```",
+			want: `{"action":"wait","reason":"observe"}`,
+		},
+		{
+			name: "trailing prose",
+			raw:  "{\"action\":\"wait\",\"reason\":\"observe\"}\nDone.",
+			want: `{"action":"wait","reason":"observe"}`,
+		},
+		{
+			name: "first complete object",
+			raw:  "{\"action\":\"wait\",\"reason\":\"observe\"}\n{\"action\":\"finish\",\"reason\":\"done\"}",
+			want: `{"action":"wait","reason":"observe"}`,
+		},
+		{
+			name: "braces inside string",
+			raw:  "note {not-json}\n{\"action\":\"wait\",\"reason\":\"text with { brace }\"}",
+			want: `{"action":"wait","reason":"text with { brace }"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := pipelinepkg.ExtractJSONObjectForTest(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("object = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractJSONObjectRejectsMissingObject(t *testing.T) {
+	if _, err := pipelinepkg.ExtractJSONObjectForTest("[]"); err == nil {
+		t.Fatal("expected missing object error")
+	}
+}
+
+func TestFrontendE2EObservationFindingsCanSuppressActionFailureFallbacks(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{Action: "click_button", OK: false, Error: "selector timed out"},
+	}
+	if findings := pipelinepkg.FrontendE2EObservationFindingsForTest(observations, false); len(findings) != 0 {
+		t.Fatalf("expected action failure fallback to be suppressed, got %#v", findings)
+	}
+	findings := pipelinepkg.FrontendE2EObservationFindingsForTest(observations, true)
+	if len(findings) != 1 || findings[0].Title != "Browser action failed during frontend E2E" {
+		t.Fatalf("expected action failure fallback finding, got %#v", findings)
+	}
+}
+
+func TestStageGPassedSummarySuppressesRecoveredActionFailures(t *testing.T) {
+	passed := pipelinepkg.TestFrontendE2ESummary{Status: "passed"}
+	if pipelinepkg.IncludeStageGActionFailureFallbackForTest(passed, nil) {
+		t.Fatal("passed Stage G summary should not fail the stage for recovered intermediate action failures")
+	}
+	failed := pipelinepkg.TestFrontendE2ESummary{Status: "failed"}
+	if !pipelinepkg.IncludeStageGActionFailureFallbackForTest(failed, nil) {
+		t.Fatal("failed Stage G summary without own findings should include action failure fallback evidence")
+	}
+	withFindings := []model.Finding{{Title: "summary finding"}}
+	if pipelinepkg.IncludeStageGActionFailureFallbackForTest(failed, withFindings) {
+		t.Fatal("summary findings should suppress duplicate action failure fallback evidence")
+	}
+}
+
+func TestStageGLogObservationIncludesNetworkEvidence(t *testing.T) {
+	log := pipelinepkg.StageGLogObservationForTest(4, pipelinepkg.TestBrowserObservation{
+		Action:     "click_button",
+		OK:         true,
+		CurrentURL: "http://127.0.0.1:5173/login",
+		Title:      "FieldOrder Pro",
+		NetworkIssues: []browserpkg.NetworkIssue{
+			{URL: "http://127.0.0.1:5173/api/auth/login", Status: 401},
+		},
+		NetworkEvents: []browserpkg.NetworkEvent{
+			{URL: "http://127.0.0.1:5173/api/auth/login", Method: "POST", Status: 401, ResourceType: "xhr"},
+		},
+	})
+	for _, want := range []string{
+		"network_issues: 1",
+		"network_issue: http://127.0.0.1:5173/api/auth/login status=401",
+		"network_events: 1",
+		"network_event: POST http://127.0.0.1:5173/api/auth/login status=401 type=xhr",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("Stage G log missing %q:\n%s", want, log)
+		}
+	}
+}
+
+func TestStageGUnavailableWritesScreenshotArtifact(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch-1", "TASK-20260604-GSHOT")
+	if err := os.MkdirAll(filepath.Join(projectPath, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "metadata.json"), []byte(`{"project_type":"pure_backend"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "result", "run-g")
+	run := model.RunRecord{RunID: "run-g", TaskID: "TASK-20260604-GSHOT", ArtifactRoot: artifactRoot}
+	project := scanner.Project{TaskID: run.TaskID, Batch: "batch-1", Path: projectPath}
+	record := pipelinepkg.NewRunner(&runtimeBlockStore{project: project}, config.Default()).StageGForTest(context.Background(), run, project, pipelinepkg.TestRuntimeEvidence{
+		ComposeProject: "p2rqa-test",
+		Mappings:       map[string][]pipelinepkg.TestPortMapping{},
+	})
+	if record.Status != model.StageDone {
+		t.Fatalf("pure backend Stage G = %#v, want done", record)
+	}
+	if _, err := os.Stat(filepath.Join(artifactRoot, "frontend_e2e_screenshot.png")); err != nil {
+		t.Fatalf("expected fallback screenshot artifact: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "logs", "G_frontend_e2e.log"))
+	if err != nil {
+		t.Fatalf("expected Stage G log artifact: %v", err)
+	}
+	if !strings.Contains(string(content), "Stage G frontend browser E2E") || !strings.Contains(string(content), "No browser frontend URL is expected") {
+		t.Fatalf("unexpected Stage G log content: %s", string(content))
+	}
 }
 
 func TestBrowserActionValidatorRejectsUnsafeActions(t *testing.T) {
@@ -101,7 +417,7 @@ func TestBrowserActionValidatorRejectsUnsafeActions(t *testing.T) {
 type runtimeBlockedRunner struct{}
 
 func (runtimeBlockedRunner) LookPath(name string) (string, error) {
-	if name == "docker" {
+	if strings.Contains(strings.ToLower(name), "docker") {
 		return "", errors.New("docker missing")
 	}
 	return name, nil

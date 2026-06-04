@@ -211,6 +211,68 @@ db_path: "./from-file/index.db"
 	if cfg.DBPath != wantDBPath {
 		t.Fatalf("expected env db path %s, got %s", wantDBPath, cfg.DBPath)
 	}
+	wantProfilesPath := filepath.Join(dir, "from-flag", ".qa-control", "prompt_profiles")
+	if cfg.Codex.PromptProfilesDir != wantProfilesPath {
+		t.Fatalf("expected prompt profiles path %s, got %s", wantProfilesPath, cfg.Codex.PromptProfilesDir)
+	}
+}
+
+func TestLoadDerivesTemplateControlPathsFromEffectiveScanPath(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`scan_path: "./projects-qa"
+db_path: "./projects-qa/.qa-control/index.db"
+codex:
+  prompt_profiles_dir: "./projects-qa/.qa-control/prompt_profiles"
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvScanPath, "./from-env")
+
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantScanPath := filepath.Join(dir, "from-env")
+	if cfg.ScanPath != wantScanPath {
+		t.Fatalf("expected scan path %s, got %s", wantScanPath, cfg.ScanPath)
+	}
+	wantDBPath := filepath.Join(wantScanPath, ".qa-control", "index.db")
+	if cfg.DBPath != wantDBPath {
+		t.Fatalf("expected db path %s, got %s", wantDBPath, cfg.DBPath)
+	}
+	wantProfilesPath := filepath.Join(wantScanPath, ".qa-control", "prompt_profiles")
+	if cfg.Codex.PromptProfilesDir != wantProfilesPath {
+		t.Fatalf("expected prompt profiles path %s, got %s", wantProfilesPath, cfg.Codex.PromptProfilesDir)
+	}
+}
+
+func TestLoadPreservesCustomControlPathsWhenScanPathChanges(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`scan_path: "./projects-qa"
+db_path: "./state/index.db"
+codex:
+  prompt_profiles_dir: "./profiles"
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvScanPath, "./from-env")
+
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantDBPath := filepath.Join(dir, "state", "index.db")
+	if cfg.DBPath != wantDBPath {
+		t.Fatalf("expected custom db path %s, got %s", wantDBPath, cfg.DBPath)
+	}
+	wantProfilesPath := filepath.Join(dir, "profiles")
+	if cfg.Codex.PromptProfilesDir != wantProfilesPath {
+		t.Fatalf("expected custom prompt profiles path %s, got %s", wantProfilesPath, cfg.Codex.PromptProfilesDir)
+	}
 }
 
 func TestDefaultStaticCodexTimeoutsAllowFullReviews(t *testing.T) {

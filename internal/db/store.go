@@ -375,7 +375,7 @@ func (s *Store) MarkTaskDockerStopped(ctx context.Context, taskID string) error 
 		if err != nil {
 			return err
 		}
-		return requireAffected(result, "task", taskID)
+		return requireTaskOrProjectOnlyRunTx(ctx, tx, result, taskID)
 	})
 }
 
@@ -1154,7 +1154,7 @@ func (s *Store) PutStageAndRecordTaskRuntime(ctx context.Context, runID string, 
 		if err := putStageTx(ctx, tx, runID, stage); err != nil {
 			return err
 		}
-		return recordTaskRuntimeTx(ctx, tx, taskID, frontendURL, dockerRunning, meta, now)
+		return recordTaskRuntimeForProjectRunTx(ctx, tx, taskID, frontendURL, dockerRunning, meta, now)
 	})
 }
 
@@ -1173,6 +1173,14 @@ func putStageTx(ctx context.Context, tx *sql.Tx, runID string, stage model.Stage
 }
 
 func recordTaskRuntimeTx(ctx context.Context, tx *sql.Tx, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string) error {
+	return recordTaskRuntimeTxMode(ctx, tx, taskID, frontendURL, dockerRunning, meta, now, true)
+}
+
+func recordTaskRuntimeForProjectRunTx(ctx context.Context, tx *sql.Tx, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string) error {
+	return recordTaskRuntimeTxMode(ctx, tx, taskID, frontendURL, dockerRunning, meta, now, false)
+}
+
+func recordTaskRuntimeTxMode(ctx context.Context, tx *sql.Tx, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string, requireTask bool) error {
 	composeMeta, err := marshalComposeMeta(meta)
 	if err != nil {
 		return err
@@ -1188,7 +1196,28 @@ func recordTaskRuntimeTx(ctx context.Context, tx *sql.Tx, taskID string, fronten
 	if err != nil {
 		return err
 	}
+	if !requireTask {
+		return requireTaskOrProjectOnlyRunTx(ctx, tx, result, taskID)
+	}
 	return requireAffected(result, "task", taskID)
+}
+
+func requireTaskOrProjectOnlyRunTx(ctx context.Context, tx *sql.Tx, result sql.Result, taskID string) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 1 {
+		return nil
+	}
+	exists, err := projectExistsTx(ctx, tx, taskID)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return FormatNotFound("task", taskID)
 }
 
 func (s *Store) InsertFindings(ctx context.Context, runID string, findings []model.Finding) error {
@@ -1387,6 +1416,15 @@ func scanTasks(rows *sql.Rows) ([]model.Task, error) {
 func taskExistsTx(ctx context.Context, tx *sql.Tx, taskID string) (bool, error) {
 	var found string
 	err := tx.QueryRowContext(ctx, `SELECT id FROM tasks WHERE id = ?`, taskID).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func projectExistsTx(ctx context.Context, tx *sql.Tx, taskID string) (bool, error) {
+	var found string
+	err := tx.QueryRowContext(ctx, `SELECT task_id FROM projects WHERE task_id = ?`, taskID).Scan(&found)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}

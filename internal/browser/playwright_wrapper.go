@@ -55,10 +55,13 @@ func (w PlaywrightWrapper) Run(ctx context.Context, action Action, timeout time.
 	if policy.LastURLPath == "" {
 		policy.LastURLPath = filepath.Join(stateDir, "last_url.txt")
 	}
+	if policy.FormStatePath == "" {
+		policy.FormStatePath = filepath.Join(stateDir, "form_state.json")
+	}
 	if policy.ScreenshotPath == "" {
 		policy.ScreenshotPath = filepath.Join(root, "frontend_e2e_screenshot.png")
 	}
-	for _, path := range []string{policy.StorageStatePath, policy.LastURLPath, policy.ScreenshotPath} {
+	for _, path := range []string{policy.StorageStatePath, policy.LastURLPath, policy.FormStatePath, policy.ScreenshotPath} {
 		if !pathWithinRoot(path, root) {
 			return Observation{}, fmt.Errorf("browser artifact path escapes root: %s", path)
 		}
@@ -114,6 +117,7 @@ const allowed = new Set(policy.allowlist_origins || []);
 const consoleErrors = [];
 const pageErrors = [];
 const networkIssues = [];
+const networkEvents = [];
 const blockedRequests = [];
 
 function trim(value, limit) {
@@ -129,6 +133,15 @@ function safeRead(path) {
   try { return fs.readFileSync(path, 'utf8').trim(); } catch (_) { return ''; }
 }
 
+function safeJSONRead(path) {
+  try {
+    const raw = fs.readFileSync(path, 'utf8');
+    return JSON.parse(raw);
+  } catch (_) {
+    return {};
+  }
+}
+
 function safeURL(raw) {
   try {
     const value = new URL(raw);
@@ -138,6 +151,129 @@ function safeURL(raw) {
   } catch (_) {
     return '';
   }
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formStateKey(rawURL) {
+  return safeURL(rawURL);
+}
+
+function loadFormState() {
+  if (!policy.form_state_path) return {};
+  const value = safeJSONRead(policy.form_state_path);
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function writeFormState(state) {
+  if (!policy.form_state_path) return;
+  try {
+    fs.writeFileSync(policy.form_state_path, JSON.stringify(state));
+  } catch (_) {}
+}
+
+async function restoreFormState(page, state) {
+  const key = formStateKey(page.url());
+  const fields = Array.isArray(state[key]) ? state[key] : [];
+  if (fields.length === 0) return;
+  const controls = page.locator('input:not([type="hidden"]), textarea');
+  for (const field of fields) {
+    if (!Number.isInteger(field.index) || field.value === '') continue;
+    await controls.nth(field.index).fill(field.value || '', { timeout: 1200 }).catch(() => {});
+  }
+}
+
+async function saveFormState(page, state) {
+  const key = formStateKey(page.url());
+  if (!key) return;
+  const fields = await page.evaluate(() => {
+    const controls = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea, select'));
+    return controls.map((el, index) => {
+      const tag = el.tagName.toLowerCase();
+      const type = (el.getAttribute('type') || (tag === 'input' ? 'text' : '')).toLowerCase();
+      return {
+        index,
+        id: el.id || '',
+        name: el.getAttribute('name') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        type,
+        value: el.value || ''
+      };
+    }).filter((field) => {
+      if (['button', 'submit', 'reset', 'file'].includes(field.type)) return false;
+      return field.value !== '';
+    }).slice(0, 80);
+  });
+  if (fields.length > 0) state[key] = fields;
+  else delete state[key];
+  writeFormState(state);
+}
+
+function rememberNetworkEvent(event) {
+  networkEvents.push(event);
+  if (networkEvents.length > 160) networkEvents.shift();
+}
+
+function isUsefulNetworkEvent(event) {
+  const method = String(event.method || '').toUpperCase();
+  if (event.status >= 400 || event.error) return true;
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return true;
+  try {
+    const pathname = new URL(event.url).pathname;
+    return pathname.startsWith('/api/');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function firstAvailableLocator(candidates) {
+  for (const candidate of candidates) {
+    try {
+      if (await candidate.count() > 0) return candidate.first();
+    } catch (_) {}
+  }
+  if (candidates.length > 0) return candidates[candidates.length - 1].first();
+  throw new Error('no locator candidates available');
+}
+
+async function actionLocator(page) {
+  if (action.selector) return page.locator(action.selector).first();
+  const targetText = trim(action.text || '', 240);
+  const candidates = [];
+  if (action.name === 'fill_input') {
+    if (targetText) {
+      candidates.push(page.getByLabel(targetText, { exact: false }));
+      candidates.push(page.getByPlaceholder(targetText, { exact: false }));
+      candidates.push(page.locator('[aria-label*="' + targetText.replace(/"/g, '\\"') + '" i]'));
+    }
+    candidates.push(page.locator('input:not([type="hidden"]), textarea, [contenteditable="true"]'));
+    return firstAvailableLocator(candidates);
+  }
+  if (action.name === 'click_button') {
+    if (targetText) {
+      candidates.push(page.getByRole('button', { name: targetText, exact: false }));
+      candidates.push(page.locator('button, [role="button"]').filter({ hasText: new RegExp(escapeRegExp(targetText), 'i') }));
+      candidates.push(page.locator('input[type="submit"], input[type="button"]').filter({ hasText: new RegExp(escapeRegExp(targetText), 'i') }));
+    }
+    candidates.push(page.locator('button, [role="button"], input[type="submit"], input[type="button"]'));
+    return firstAvailableLocator(candidates);
+  }
+  if (action.name === 'click_navigation') {
+    if (targetText) {
+      candidates.push(page.getByRole('link', { name: targetText, exact: false }));
+      candidates.push(page.getByRole('button', { name: targetText, exact: false }));
+      candidates.push(page.locator('a, button, [role="link"], [role="button"]').filter({ hasText: new RegExp(escapeRegExp(targetText), 'i') }));
+    }
+    candidates.push(page.locator('a, button, [role="link"], [role="button"]'));
+    return firstAvailableLocator(candidates);
+  }
+  if (targetText) {
+    candidates.push(page.getByText(targetText, { exact: false }));
+  }
+  candidates.push(page.locator('body'));
+  return firstAvailableLocator(candidates);
 }
 
 async function collect(page, ok, error) {
@@ -157,7 +293,8 @@ async function collect(page, ok, error) {
           selector: el.id ? '#' + el.id : '',
           name: (el.getAttribute('name') || '').slice(0, 120),
           placeholder: (el.getAttribute('placeholder') || '').slice(0, 160),
-          type: (el.getAttribute('type') || '').slice(0, 80)
+          type: (el.getAttribute('type') || '').slice(0, 80),
+          has_value: !!el.value
         });
       };
       document.querySelectorAll('a,button,input,textarea,select').forEach((el) => {
@@ -195,6 +332,7 @@ async function collect(page, ok, error) {
     console_errors: consoleErrors.slice(0, 80),
     page_errors: pageErrors.slice(0, 80),
     network_issues: networkIssues.slice(0, 120),
+    network_events: networkEvents.filter(isUsefulNetworkEvent).slice(-120),
     blocked_requests: blockedRequests.slice(0, 120),
     screenshot_path: screenshotPath,
     error: error || ''
@@ -221,19 +359,34 @@ async function collect(page, ok, error) {
       return route.abort('blockedbyclient');
     });
     const page = await context.newPage();
+    const formState = loadFormState();
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(trim(msg.text(), 1000));
     });
     page.on('pageerror', (err) => pageErrors.push(trim(err.message, 1000)));
     page.on('response', (response) => {
       const status = response.status();
+      const request = response.request();
+      rememberNetworkEvent({
+        url: response.url(),
+        method: request.method(),
+        status,
+        resource_type: request.resourceType()
+      });
       if (status >= 400) networkIssues.push({ url: response.url(), status });
     });
     page.on('requestfailed', (request) => {
       const raw = request.url();
       if (blockedRequests.some((item) => item.url === raw)) return;
       const failure = request.failure();
-      networkIssues.push({ url: raw, error: failure ? failure.errorText : 'request failed' });
+      const error = failure ? failure.errorText : 'request failed';
+      rememberNetworkEvent({
+        url: raw,
+        method: request.method(),
+        resource_type: request.resourceType(),
+        error
+      });
+      networkIssues.push({ url: raw, error });
     });
 
     const lastURL = safeRead(policy.last_url_path);
@@ -242,24 +395,40 @@ async function collect(page, ok, error) {
     } else if (lastURL) {
       await page.goto(lastURL, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
     }
+    await restoreFormState(page, formState).catch(() => {});
 
-    const locator = () => action.selector ? page.locator(action.selector).first() : page.getByText(action.text, { exact: false }).first();
     if (action.name === 'wait') {
       await page.waitForTimeout(Math.max(100, Math.min(action.wait_ms || 1000, 5000)));
     } else if (action.name === 'click_navigation' || action.name === 'click_button') {
+      const locator = await actionLocator(page);
       await Promise.race([
-        locator().click({ timeout: 5000 }),
+        locator.click({ timeout: 5000 }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('click timeout')), 5500))
       ]);
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(750);
     } else if (action.name === 'fill_input') {
-      await locator().fill(action.value || '', { timeout: 5000 });
+      const locator = await actionLocator(page);
+      await locator.fill(action.value || '', { timeout: 5000 });
     } else if (action.name === 'submit_local_form') {
-      await locator().press('Enter', { timeout: 5000 });
+      const locator = await actionLocator(page);
+      const submitted = await locator.evaluate((el) => {
+        if (el && el.tagName && el.tagName.toLowerCase() === 'form') {
+          if (typeof el.requestSubmit === 'function') el.requestSubmit();
+          else el.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+          return true;
+        }
+        return false;
+      }).catch(() => false);
+      if (!submitted) {
+        await locator.press('Enter', { timeout: 5000 });
+      }
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(750);
     } else if (action.name === 'go_back') {
       await page.goBack({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
     }
+    await saveFormState(page, formState).catch(() => {});
     const observation = await collect(page, true, '');
     await browser.close();
     process.stdout.write(JSON.stringify(observation));
@@ -273,6 +442,7 @@ async function collect(page, ok, error) {
       console_errors: consoleErrors,
       page_errors: pageErrors,
       network_issues: networkIssues,
+      network_events: networkEvents.filter(isUsefulNetworkEvent).slice(-120),
       blocked_requests: blockedRequests,
       error: err && err.message ? err.message : String(err)
     }));

@@ -78,7 +78,7 @@ func (r CheckResult) BlockingCheck(stage string) (Check, bool) {
 func checkBinary(ctx context.Context, exec executor.CommandRunner, name string, versionArgs []string, candidates []string, stages []string, missing string) Check {
 	path, err := exec.LookPath(name)
 	if err != nil || path == "" {
-		path = firstExecutable(candidates)
+		path = firstExecutable(exec, candidates)
 	}
 	if path == "" {
 		return Check{Name: name, Status: "missing", Message: missing + " Searched PATH and known install locations.", Stages: stages}
@@ -112,7 +112,7 @@ func checkPython(ctx context.Context, exec executor.CommandRunner) Check {
 			return Check{Name: "python", Status: "ok", Path: path, Version: firstLine(version), Stages: []string{string(model.StageA)}}
 		}
 	}
-	path := firstExecutable(pythonCandidates())
+	path := firstExecutable(exec, pythonCandidates())
 	if path != "" {
 		return Check{Name: "python", Status: "ok", Path: path, Stages: []string{string(model.StageA)}}
 	}
@@ -122,7 +122,7 @@ func checkPython(ctx context.Context, exec executor.CommandRunner) Check {
 func checkCodex(ctx context.Context, exec executor.CommandRunner, cfg config.Config) Check {
 	path, err := exec.LookPath("codex")
 	if err != nil || path == "" {
-		path = firstExecutable(codexCandidates())
+		path = firstExecutable(exec, codexCandidates())
 	}
 	if path == "" {
 		return Check{Name: "codex", Status: "missing", Message: "Codex CLI is required for static review stages. Searched PATH and known install locations.", Stages: staticReviewStages()}
@@ -239,11 +239,11 @@ func pythonCandidates() []string {
 	return append(candidates, "/usr/bin/python3", "/usr/local/bin/python3")
 }
 
-func firstExecutable(candidates []string) string {
+func firstExecutable(exec executor.CommandRunner, candidates []string) string {
 	for _, candidate := range candidates {
-		info, err := os.Stat(candidate)
-		if err == nil && !info.IsDir() {
-			return candidate
+		path, err := exec.LookPath(candidate)
+		if err == nil && path != "" {
+			return path
 		}
 	}
 	return ""

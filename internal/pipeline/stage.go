@@ -368,7 +368,13 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 		if err := writer.RequiredText("logs/G_frontend_e2e.log", reason); err != nil {
 			record = recordArtifactWriteError(record, err, logPath)
 		}
-		if err := writer.RequiredJSON("frontend_e2e_summary.json", map[string]any{"schema_version": frontendE2ESchemaVersion, "status": "blocked", "reason": reason}); err != nil {
+		summary := FrontendE2ESummary{
+			SchemaVersion: frontendE2ESchemaVersion,
+			Status:        "blocked",
+			Reason:        reason,
+			Findings:      frontendE2EFindingsFromModel(record.Findings),
+		}
+		if err := writer.RequiredJSON("frontend_e2e_summary.json", summary); err != nil {
 			record = recordArtifactWriteError(record, err, summaryPath)
 		}
 		if err := writer.RequiredText("frontend_e2e_report.md", "# Browser Frontend E2E\n\n"+reason+"\n"); err != nil {

@@ -3,8 +3,10 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"os"
 	"time"
 
+	browserpkg "github.com/xuanli520/p2r_tui/internal/browser"
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
 	"github.com/xuanli520/p2r_tui/internal/config"
@@ -104,6 +106,7 @@ type TestServiceURL struct {
 type TestBrowserURLCandidate = BrowserURLCandidate
 type TestBrowserAction = BrowserAction
 type TestBlockedBrowserAction = BlockedBrowserAction
+type TestBrowserObservation = browserpkg.Observation
 type TestFrontendE2ESummary = FrontendE2ESummary
 
 type TestStageCProxyPlan struct {
@@ -269,6 +272,16 @@ func (r Runner) StageFForTest(ctx context.Context, run model.RunRecord, project 
 	return r.stageF(ctx, run, project, opts, prior, nil)
 }
 
+func (r Runner) StageGForTest(ctx context.Context, run model.RunRecord, project scanner.Project, runtime TestRuntimeEvidence) model.StageRecord {
+	return r.stageG(ctx, StageContext{
+		Run:     run,
+		Project: project,
+		Runtime: runtimeEvidenceFromTest(runtime),
+		Writer:  NewArtifactWriter(run.ArtifactRoot),
+		Timeout: r.stageTimeout,
+	})
+}
+
 func SubmitArtifactNamesForTest(mode string) []string {
 	return submitArtifactNames(mode)
 }
@@ -393,6 +406,40 @@ func BrowserAllowlistOriginsForTest(candidates []TestBrowserURLCandidate) []stri
 	return browserAllowlistOrigins(candidates)
 }
 
+func BrowserCodexEnvForTest(base []string, configured map[string]string, nodePath string) []string {
+	root, err := os.MkdirTemp("", "p2r-browser-codex-env-test-*")
+	if err != nil {
+		return nil
+	}
+	defer os.RemoveAll(root)
+	sandbox, _ := codex.NewSandbox("/repo", root, "G")
+	return browserCodexEnv(sandbox, base, configured, nodePath)
+}
+
+func ExtractJSONObjectForTest(raw string) (string, error) {
+	return extractJSONObject(raw)
+}
+
+func StageGBrowserContextForTest(projectPath string) string {
+	return stageGBrowserContext(projectPath)
+}
+
+func BrowserActionPromptForTest(templateText, profile, contextText string) (string, error) {
+	candidates := []BrowserURLCandidate{{
+		ID:      "url_1",
+		URL:     "http://127.0.0.1:3000",
+		Origin:  "http://127.0.0.1:3000",
+		Service: "frontend",
+		Source:  "probe",
+		ProbeOK: true,
+	}}
+	sc := StageContext{
+		Run:     model.RunRecord{RunID: "run-test", ArtifactRoot: "/tmp/p2r-run"},
+		Project: scanner.Project{TaskID: "TASK-TEST", Path: "/tmp/project"},
+	}
+	return browserActionPrompt(templateText, browserActionPromptDataForStage(sc, profile, contextText, candidates, nil, nil, 1))
+}
+
 func ValidateBrowserActionForTest(action TestBrowserAction, candidates []TestBrowserURLCandidate) *TestBlockedBrowserAction {
 	validation := validateBrowserAction(action, candidates, "")
 	if validation.Blocked == nil {
@@ -404,6 +451,18 @@ func ValidateBrowserActionForTest(action TestBrowserAction, candidates []TestBro
 
 func ParseFrontendE2ESummaryForTest(raw []byte) (TestFrontendE2ESummary, error) {
 	return parseFrontendE2ESummary(raw)
+}
+
+func FrontendE2EObservationFindingsForTest(observations []TestBrowserObservation, includeActionFailures bool) []model.Finding {
+	return frontendE2EObservationFindings(observations, "frontend_e2e_screenshot.png", includeActionFailures)
+}
+
+func StageGLogObservationForTest(round int, observation TestBrowserObservation) string {
+	return stageGLogObservation(round, observation)
+}
+
+func IncludeStageGActionFailureFallbackForTest(summary TestFrontendE2ESummary, summaryFindings []model.Finding) bool {
+	return includeStageGActionFailureFallback(summary, summaryFindings)
 }
 
 func SnapshotRepoForTest(repoPath string) (map[string]string, error) {

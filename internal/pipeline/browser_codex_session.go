@@ -1,12 +1,14 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"text/template"
 	"time"
 
 	browserpkg "github.com/xuanli520/p2r_tui/internal/browser"
@@ -14,7 +16,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
-func (r Runner) nextBrowserAction(ctx context.Context, sc StageContext, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int, timeout time.Duration) (string, []ArtifactWarning, error) {
+func (r Runner) nextBrowserAction(ctx context.Context, sc StageContext, promptTemplate, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int, timeout time.Duration) (string, []ArtifactWarning, error) {
 	capability := codex.DetectCLI(ctx, r.exec, "")
 	if err := codex.ValidateAppServerCapability(capability); err != nil {
 		return "", nil, err
@@ -25,13 +27,16 @@ func (r Runner) nextBrowserAction(ctx context.Context, sc StageContext, profile,
 		return "", nil, err
 	}
 	defer os.RemoveAll(sandbox.Home)
-	env := sandbox.EnvWithNode(os.Environ(), r.cfg.Codex.Env, capability.NodePath)
+	env := browserCodexEnv(sandbox, os.Environ(), r.cfg.Codex.Env, capability.NodePath)
 	extraArgs, err := safeCodexExtraArgs(r.cfg.Codex.ExtraArgs)
 	if err != nil {
 		return "", nil, err
 	}
 	logPath := filepath.Join(sc.Run.ArtifactRoot, "logs", fmt.Sprintf("G_frontend_e2e_codex_round_%02d.log", round))
-	prompt := browserActionPrompt(sc, profile, contextText, candidates, observations, blocked, round)
+	prompt, err := browserActionPrompt(promptTemplate, browserActionPromptDataForStage(sc, profile, contextText, candidates, observations, blocked, round))
+	if err != nil {
+		return "", nil, err
+	}
 	result := r.runCodexReviewWithLog(ctx, timeout, reviewPath, logPath, env, prompt, capability, extraArgs, codexDeltaProgress(sc.Run.RunID, string(model.StageG), sc.Progress))
 	if result.Result.Err != nil {
 		return "", result.ArtifactWarnings, result.Result.Err
@@ -40,66 +45,73 @@ func (r Runner) nextBrowserAction(ctx context.Context, sc StageContext, profile,
 	return actionJSON, result.ArtifactWarnings, err
 }
 
-func browserActionPrompt(sc StageContext, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int) string {
+func browserCodexEnv(sandbox codex.Sandbox, base []string, configured map[string]string, nodePath string) []string {
+	return sandbox.EnvWithNode(browserCodexBaseEnv(base), configured, nodePath)
+}
+
+func browserCodexBaseEnv(base []string) []string {
+	filtered := make([]string, 0, len(base))
+	for _, item := range base {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok || !browserCodexBaseEnvAllowed(key) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func browserCodexBaseEnvAllowed(key string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	switch upper {
+	case "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS":
+		return true
+	default:
+		return strings.HasPrefix(upper, "LC_")
+	}
+}
+
+type browserActionPromptData struct {
+	ProjectPath              string
+	ArtifactRoot             string
+	Round                    int
+	URLCandidatesJSON        string
+	PreviousObservationsJSON string
+	BlockedActionsJSON       string
+	Profile                  string
+	ProjectContext           string
+}
+
+func browserActionPromptDataForStage(sc StageContext, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int) browserActionPromptData {
 	candidateJSON, _ := json.MarshalIndent(candidates, "", "  ")
 	observationJSON, _ := json.MarshalIndent(observations, "", "  ")
 	blockedJSON, _ := json.MarshalIndent(blocked, "", "  ")
-	return fmt.Sprintf(`Run p2r stage G as a browser E2E planner.
-
-Project path: %s
-Artifact root: %s
-Round: %d
-
-Hard boundaries:
-- Return exactly one JSON object and no prose.
-- Do not ask to run shell commands.
-- Do not ask to call Playwright, browser tools, or external URLs directly.
-- Do not include arbitrary URLs. Use only url_id from the candidate list.
-- Do not include output paths.
-- Allowed actions: open_candidate, wait, snapshot, collect_console, collect_network, click_navigation, click_button, fill_input, submit_local_form, go_back, finish.
-- Destructive actions are forbidden.
-- Use finish only when you can provide a valid p2r.frontend_e2e.v1 summary.
-
-Action JSON examples:
-{"action":"open_candidate","url_id":"url_1","reason":"inspect the primary frontend candidate"}
-{"action":"click_button","selector":"button[type=submit]","reason":"submit a local form without destructive intent"}
-{"action":"finish","reason":"enough evidence collected","summary":{"schema_version":"p2r.frontend_e2e.v1","status":"passed","findings":[]}}
-
-Finish summary schema:
-{
-  "schema_version": "p2r.frontend_e2e.v1",
-  "status": "passed|failed|partial|blocked|not_applicable",
-  "reason": "short conclusion",
-  "visited_urls": [],
-  "screenshots": [],
-  "findings": [
-    {
-      "severity": "Blocker|High|Medium|Low",
-      "title": "confirmed issue",
-      "rule": "expected browser behavior",
-      "evidence": "specific observation",
-      "impact": "user-visible impact",
-      "minimum_fix": "smallest fix",
-      "screenshot": "optional artifact path"
-    }
-  ]
+	return browserActionPromptData{
+		ProjectPath:              sc.Project.Path,
+		ArtifactRoot:             sc.Run.ArtifactRoot,
+		Round:                    round,
+		URLCandidatesJSON:        string(candidateJSON),
+		PreviousObservationsJSON: string(observationJSON),
+		BlockedActionsJSON:       string(blockedJSON),
+		Profile:                  profile,
+		ProjectContext:           contextText,
+	}
 }
 
-URL candidates:
-%s
-
-Previous observations:
-%s
-
-Blocked actions:
-%s
-
-Profile:
-%s
-
-Project context:
-%s
-`, sc.Project.Path, sc.Run.ArtifactRoot, round, string(candidateJSON), string(observationJSON), string(blockedJSON), profile, contextText)
+func browserActionPrompt(templateText string, data browserActionPromptData) (string, error) {
+	parsed, err := template.New(stageGBrowserActionPromptTemplateName).Option("missingkey=error").Parse(templateText)
+	if err != nil {
+		return "", fmt.Errorf("parse Stage G browser prompt template: %w", err)
+	}
+	var output bytes.Buffer
+	if err := parsed.Execute(&output, data); err != nil {
+		return "", fmt.Errorf("render Stage G browser prompt template: %w", err)
+	}
+	prompt := strings.TrimSpace(output.String())
+	if prompt == "" {
+		return "", fmt.Errorf("Stage G browser prompt template rendered empty")
+	}
+	return prompt + "\n", nil
 }
 
 func extractJSONObject(raw string) (string, error) {
@@ -107,18 +119,35 @@ func extractJSONObject(raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("Codex returned empty action")
 	}
-	var value any
-	if json.Unmarshal([]byte(raw), &value) == nil {
-		return raw, nil
+	if object, ok := decodeJSONObjectPrefix(raw); ok && strings.TrimSpace(raw[len(object):]) == "" {
+		return object, nil
 	}
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start < 0 || end <= start {
-		return "", fmt.Errorf("Codex response did not contain a JSON object")
+	for start := strings.Index(raw, "{"); start >= 0; {
+		if object, ok := decodeJSONObjectPrefix(raw[start:]); ok {
+			return object, nil
+		}
+		next := strings.Index(raw[start+1:], "{")
+		if next < 0 {
+			break
+		}
+		start += next + 1
 	}
-	candidate := raw[start : end+1]
-	if json.Unmarshal([]byte(candidate), &value) != nil {
+	if strings.Contains(raw, "{") {
 		return "", fmt.Errorf("Codex response JSON object is invalid")
 	}
-	return candidate, nil
+	return "", fmt.Errorf("Codex response did not contain a JSON object")
+}
+
+func decodeJSONObjectPrefix(raw string) (string, bool) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var value map[string]any
+	if err := decoder.Decode(&value); err != nil {
+		return "", false
+	}
+	end := int(decoder.InputOffset())
+	if end <= 0 || end > len(raw) {
+		return "", false
+	}
+	return strings.TrimSpace(raw[:end]), true
 }

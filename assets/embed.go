@@ -35,14 +35,20 @@ func Release(controlDir string) ([]ReleasedFile, error) {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
+			if root == "prompt_profiles" {
+				existing, err := os.ReadFile(target)
+				if err == nil {
+					released = append(released, releasedFileForContent(target, existing))
+					return nil
+				}
+				if err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
 			if err := os.WriteFile(target, content, 0o644); err != nil {
 				return err
 			}
-			sum := sha256.Sum256(content)
-			released = append(released, ReleasedFile{
-				Path:   target,
-				SHA256: hex.EncodeToString(sum[:]),
-			})
+			released = append(released, releasedFileForContent(target, content))
 			return nil
 		})
 		if err != nil {
@@ -50,4 +56,12 @@ func Release(controlDir string) ([]ReleasedFile, error) {
 		}
 	}
 	return released, nil
+}
+
+func releasedFileForContent(path string, content []byte) ReleasedFile {
+	sum := sha256.Sum256(content)
+	return ReleasedFile{
+		Path:   path,
+		SHA256: hex.EncodeToString(sum[:]),
+	}
 }
