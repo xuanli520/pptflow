@@ -235,9 +235,9 @@ func firstFrontendURL(runtime RuntimeState) string {
 func stageBFailureOutcome(record model.StageRecord, meta map[string]any) StageOutcome {
 	runtime := runtimeStateFromCleanupMeta(meta)
 	if !runtime.HasCleanupTarget() {
-		return StageOutcome{Record: record, SkipNextStage: true}
+		return StageOutcome{Record: record, BlockedDependents: blockedDependents(string(model.StageB))}
 	}
-	return StageOutcome{Record: record, Runtime: &runtime}
+	return StageOutcome{Record: record, Runtime: &runtime, BlockedDependents: blockedDependents(string(model.StageB))}
 }
 
 func mergeDockerRuntimeIntoManifest(artifactRoot string, result dockermgr.StartRuntimeResult) {

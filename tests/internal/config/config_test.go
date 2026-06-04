@@ -224,6 +224,9 @@ func TestDefaultStaticCodexTimeoutsAllowFullReviews(t *testing.T) {
 	if cfg.Pipeline.StageTimeouts["F"] < 900 {
 		t.Fatalf("F timeout too short for static Codex review: %d", cfg.Pipeline.StageTimeouts["F"])
 	}
+	if cfg.Pipeline.StageTimeouts["G"] < 600 {
+		t.Fatalf("G timeout too short for browser E2E: %d", cfg.Pipeline.StageTimeouts["G"])
+	}
 }
 
 func TestLoadUsesUserConfigWhenNoLocalConfigExists(t *testing.T) {
@@ -269,6 +272,7 @@ func TestLoadParsesCodexEnvExtraArgsAndSelfTestPath(t *testing.T) {
   self_test_report_path: "repo/custom_self_test.md"
   stage_timeouts:
     b_pull: 12
+    g: 34
 codex:
   env:
     OPENAI_API_KEY: "${OPENAI_API_KEY}"
@@ -288,6 +292,9 @@ codex:
 	}
 	if cfg.Pipeline.StageTimeouts["B_PULL"] != 12 {
 		t.Fatalf("B_PULL timeout not normalized: %#v", cfg.Pipeline.StageTimeouts)
+	}
+	if cfg.Pipeline.StageTimeouts["G"] != 34 {
+		t.Fatalf("G timeout not normalized: %#v", cfg.Pipeline.StageTimeouts)
 	}
 	if cfg.Codex.Env["OPENAI_API_KEY"] != "secret" {
 		t.Fatalf("env expansion failed: %#v", cfg.Codex.Env)

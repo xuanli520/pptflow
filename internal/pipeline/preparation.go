@@ -81,14 +81,14 @@ func normalizeStageOptions(opts RunOptions) (RunOptions, error) {
 	if opts.Stage != "" {
 		stage, ok := model.NormalizeStage(opts.Stage)
 		if !ok {
-			return opts, fmt.Errorf("invalid stage %q; expected A..F", opts.Stage)
+			return opts, fmt.Errorf("invalid stage %q; expected A..G", opts.Stage)
 		}
 		opts.Stage = stage
 	}
 	if opts.From != "" {
 		from, ok := model.NormalizeStage(opts.From)
 		if !ok {
-			return opts, fmt.Errorf("invalid from stage %q; expected A..F", opts.From)
+			return opts, fmt.Errorf("invalid from stage %q; expected A..G", opts.From)
 		}
 		opts.From = from
 	}
@@ -98,7 +98,7 @@ func normalizeStageOptions(opts RunOptions) (RunOptions, error) {
 		for _, raw := range opts.Stages {
 			stage, ok := model.NormalizeStage(raw)
 			if !ok {
-				return opts, fmt.Errorf("invalid stage %q in stage list; expected A..F", raw)
+				return opts, fmt.Errorf("invalid stage %q in stage list; expected A..G", raw)
 			}
 			if seen[stage] {
 				continue

@@ -250,7 +250,7 @@ func normalizeStageViews(stages []model.StageRecord) []stageView {
 		}
 		byStage[stage.Stage] = stage
 	}
-	result := make([]stageView, 0, 6)
+	result := make([]stageView, 0, len(model.AllStages()))
 	for _, letter := range model.AllStages() {
 		stage, ok := byStage[letter]
 		if !ok {
@@ -1068,7 +1068,9 @@ func affectedStages(stage string) []string {
 	case string(model.StageA):
 		return []string{string(model.StageA), string(model.StageF)}
 	case string(model.StageB):
-		return []string{string(model.StageB), string(model.StageC), string(model.StageF)}
+		return []string{string(model.StageB), string(model.StageG), string(model.StageC), string(model.StageF)}
+	case string(model.StageG):
+		return []string{string(model.StageG), string(model.StageF)}
 	case string(model.StageC):
 		return []string{string(model.StageC), string(model.StageF)}
 	case string(model.StageD), string(model.StageE):

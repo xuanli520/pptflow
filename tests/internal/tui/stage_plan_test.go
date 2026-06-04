@@ -17,7 +17,7 @@ func TestStagePlanInitialRuntimeDefaults(t *testing.T) {
 	if plan.RunStages != nil {
 		t.Fatalf("initial run stages = %#v, want nil", plan.RunStages)
 	}
-	if !slices.Equal(plan.DisplayStages, []string{"A", "D", "E", "F", "B", "C"}) {
+	if !slices.Equal(plan.DisplayStages, model.AllStages()) {
 		t.Fatalf("display stages = %#v", plan.DisplayStages)
 	}
 }
@@ -49,7 +49,7 @@ func TestStagePlanRecheckCanRunStageE(t *testing.T) {
 }
 
 func TestStagePlanBlocksRuntimeStagesInStaticOnlyRecheck(t *testing.T) {
-	for _, stage := range []string{"B", "C"} {
+	for _, stage := range []string{"B", "G", "C"} {
 		plan := tuiapp.StagePlanForTest("recheck", stage, true)
 		if plan.BlockedReason == "" {
 			t.Fatalf("stage %s should be blocked", stage)
@@ -69,7 +69,7 @@ func TestStagePlanFromAndExplicitStagesAreMutuallyExclusive(t *testing.T) {
 
 func TestStagePlanFromStageUsesConfiguredOrder(t *testing.T) {
 	plan := tuiapp.StagePlanWithOptionsForTest("initial", "A", false, nil, "D")
-	want := []string{"D", "E", "F", "B", "C"}
+	want := []string{"D", "E", "F", "B", "G", "C"}
 	if !slices.Equal(plan.DisplayStages, want) || plan.RunStages != nil {
 		t.Fatalf("plan = run %#v display %#v, want display %v and nil run stages", plan.RunStages, plan.DisplayStages, want)
 	}
@@ -97,10 +97,10 @@ func TestRunConfigFCanBeUnchecked(t *testing.T) {
 	h, _ = h.Press(" ")
 
 	view := h.View()
-	if !strings.Contains(view, "将运行阶段: A, D, E, B, C") {
+	if !strings.Contains(view, "将运行阶段: A, D, E, B, G, C") {
 		t.Fatalf("run config should keep non-F defaults after F is unchecked:\n%s", view)
 	}
-	if strings.Contains(view, "将运行阶段: A, D, E, F, B, C") || strings.Contains(view, "始终选中") {
+	if strings.Contains(view, "将运行阶段: A, D, E, F, B, G, C") || strings.Contains(view, "始终选中") {
 		t.Fatalf("F should not be forced or labeled always-selected:\n%s", view)
 	}
 }
@@ -114,7 +114,7 @@ func TestRenderConfirmUsesInitialStagePlan(t *testing.T) {
 
 	h, _ = h.Press("ctrl+r")
 	view := h.View()
-	if !strings.Contains(view, "将运行阶段: A, D, E, F, B, C") {
+	if !strings.Contains(view, "将运行阶段: A, D, E, F, B, G, C") {
 		t.Fatalf("confirm should show initial full plan, got:\n%s", view)
 	}
 	if strings.Contains(view, "阶段: A, F") {
@@ -135,7 +135,7 @@ func TestRunConfigUsesConfiguredDefaultStages(t *testing.T) {
 
 	h, _ = h.Press("ctrl+r")
 	view := h.View()
-	if !strings.Contains(view, "将运行阶段: A, D, F") || strings.Contains(view, "将运行阶段: A, D, E, F, B, C") {
+	if !strings.Contains(view, "将运行阶段: A, D, F") || strings.Contains(view, "将运行阶段: A, D, E, F, B, G, C") {
 		t.Fatalf("run config should use configured initial stages:\n%s", view)
 	}
 
@@ -254,7 +254,7 @@ func TestStaticOnlyRecheckRuntimeStageDoesNotOpenConfirm(t *testing.T) {
 	if next.Confirm() {
 		t.Fatal("static-only runtime recheck should not open confirmation")
 	}
-	if !strings.Contains(next.Message(), "static-only 模式不能重跑 runtime 阶段 B/C") {
+	if !strings.Contains(next.Message(), "static-only 模式不能重跑 runtime 阶段") {
 		t.Fatalf("message = %q", next.Message())
 	}
 }

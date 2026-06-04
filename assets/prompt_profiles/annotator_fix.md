@@ -13,7 +13,7 @@ Hard boundaries:
 - Verify every material claim against repository files.
 - Review every uploaded/attached document included in the audit context. Use each document as evidence input, then verify material claims against the repository before accepting them.
 - Cite `file:line` evidence for all findings and status claims.
-- Mark runtime-only claims as Manual Verification Required unless existing B/C artifacts directly prove them.
+- Mark runtime-only claims as Manual Verification Required unless existing B/G/C artifacts directly prove them.
 - **Focus strictly on repair verification; do not search for or report new issues not already listed in the provided issue reports. If a previously reported issue is still unresolved, simply record it as Unresolved – do not provide a new suggested fix.**
 - Use the “oh my codex ralph” loop: iterate over every item in the given issue list, inspect the corresponding code locations, and document whether the problem has been systematically removed.
 

@@ -336,4 +336,4 @@ Your priority is:
 4. Preserve final completeness
 5. Avoid unnecessary repetition
 
-Every strong claim must cite file:line evidence. Runtime claims require `Cannot Confirm Statistically` or `Manual Verification Required` unless citing existing B/C artifacts.
+Every strong claim must cite file:line evidence. Runtime claims require `Cannot Confirm Statistically` or `Manual Verification Required` unless citing existing B/G/C artifacts.

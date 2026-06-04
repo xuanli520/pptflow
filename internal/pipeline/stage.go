@@ -30,9 +30,9 @@ type StageContext struct {
 }
 
 type StageOutcome struct {
-	Record        model.StageRecord
-	Runtime       *RuntimeState
-	SkipNextStage bool
+	Record            model.StageRecord
+	Runtime           *RuntimeState
+	BlockedDependents []string
 }
 
 type preflightMaterializingStage interface {
@@ -75,11 +75,24 @@ func (s stageCAdapter) Execute(ctx context.Context, sc StageContext) StageOutcom
 	return StageOutcome{Record: s.runner.stageC(ctx, sc.Run, sc.Project, sc.Runtime, sc.Prior, sc.Progress)}
 }
 
+type stageGAdapter struct {
+	runner Runner
+}
+
+func (s stageGAdapter) ID() string {
+	return string(model.StageG)
+}
+
+func (s stageGAdapter) Execute(ctx context.Context, sc StageContext) StageOutcome {
+	return StageOutcome{Record: s.runner.stageG(ctx, sc)}
+}
+
 func (r Runner) stageRegistry() map[string]Stage {
 	stages := map[string]Stage{
 		string(model.StageA): stageAAdapter{runner: r},
 		string(model.StageB): stageBAdapter{runner: r},
 		string(model.StageC): stageCAdapter{runner: r},
+		string(model.StageG): stageGAdapter{runner: r},
 	}
 	for _, spec := range codexReviewStageSpecs() {
 		stages[spec.ID] = CodexReviewStage{runner: r, spec: spec}
@@ -166,7 +179,7 @@ func selectedStages(opts RunOptions, staticOnly bool) map[string]bool {
 }
 
 func initialStages(selected map[string]bool, staticOnly bool) []model.StageRecord {
-	stages := make([]model.StageRecord, 0, 6)
+	stages := make([]model.StageRecord, 0, len(model.AllStages()))
 	for _, stage := range model.AllStages() {
 		if selected[stage] {
 			stages = append(stages, model.StageRecord{
@@ -179,7 +192,7 @@ func initialStages(selected map[string]bool, staticOnly bool) []model.StageRecor
 		}
 		reason := "Not selected for this run."
 		if staticOnly && model.IsRuntimeStage(stage) {
-			reason = "--static-only skips Docker and run_tests evidence."
+			reason = "--static-only skips runtime evidence stages."
 		}
 		stages = append(stages, skippedStage(stage, reason))
 	}
@@ -296,6 +309,15 @@ func blockedStage(stage, name string, blockedBy []string, reason string) model.S
 	}
 }
 
+func blockedDependents(stage string) []string {
+	switch strings.ToUpper(strings.TrimSpace(stage)) {
+	case string(model.StageB):
+		return []string{string(model.StageG), string(model.StageC)}
+	default:
+		return nil
+	}
+}
+
 func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageRecord) model.StageRecord {
 	writer := NewArtifactWriter(run.ArtifactRoot)
 	switch record.Stage {
@@ -334,6 +356,27 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 		record.LogPath = logPath
 		record.ArtifactPaths = append([]string{logPath}, pages...)
 		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
+	case "G":
+		logPath := filepath.Join(run.ArtifactRoot, "logs", "G_frontend_e2e.log")
+		screenshotPath := qaArtifactPath(run.ArtifactRoot, "frontend_e2e_screenshot.png")
+		summaryPath := filepath.Join(run.ArtifactRoot, "frontend_e2e_summary.json")
+		reportPath := qaArtifactPath(run.ArtifactRoot, "frontend_e2e_report.md")
+		reason := record.ErrorSummary
+		if reason == "" {
+			reason = "Stage G was not executed."
+		}
+		if err := writer.RequiredText("logs/G_frontend_e2e.log", reason); err != nil {
+			record = recordArtifactWriteError(record, err, logPath)
+		}
+		if err := writer.RequiredJSON("frontend_e2e_summary.json", map[string]any{"schema_version": frontendE2ESchemaVersion, "status": "blocked", "reason": reason}); err != nil {
+			record = recordArtifactWriteError(record, err, summaryPath)
+		}
+		if err := writer.RequiredText("frontend_e2e_report.md", "# Browser Frontend E2E\n\n"+reason+"\n"); err != nil {
+			record = recordArtifactWriteError(record, err, reportPath)
+		}
+		pages, _ := renderTerminalLog(reason, screenshotPath)
+		record.LogPath = logPath
+		record.ArtifactPaths = append([]string{logPath, summaryPath, reportPath}, pages...)
 	}
 	return record
 }

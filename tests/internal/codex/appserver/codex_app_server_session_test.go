@@ -1,9 +1,13 @@
 package appserver_test
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -11,16 +15,20 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/codex/appserver"
 )
 
+func TestMain(m *testing.M) {
+	if os.Getenv("P2R_FAKE_STEERABLE_APPSERVER") == "1" {
+		os.Exit(runFakeSteerableAppServer())
+	}
+	os.Exit(m.Run())
+}
+
 func newAppServerCodexReviewSession(envKeys []string) appserver.Session {
 	return appserver.New(envKeys)
 }
 
 func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 	dir := t.TempDir()
-	codexPath := filepath.Join(dir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	codexPath := writeFakeSteerableAppServer(t, dir)
 	steerLog := filepath.Join(dir, "steer.log")
 	session := newAppServerCodexReviewSession(nil)
 	ctx := context.Background()
@@ -60,10 +68,7 @@ func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 
 func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
 	dir := t.TempDir()
-	codexPath := filepath.Join(dir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	codexPath := writeFakeSteerableAppServer(t, dir)
 	session := newAppServerCodexReviewSession(nil)
 	result, err := runAppServerSession(context.Background(), session, appserver.Request{
 		Timeout:        5 * time.Second,
@@ -85,10 +90,7 @@ func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
 
 func TestAppServerSessionCapturesTurnCompletedItems(t *testing.T) {
 	dir := t.TempDir()
-	codexPath := filepath.Join(dir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	codexPath := writeFakeSteerableAppServer(t, dir)
 	session := newAppServerCodexReviewSession(nil)
 	result, err := runAppServerSession(context.Background(), session, appserver.Request{
 		Timeout:        5 * time.Second,
@@ -110,10 +112,7 @@ func TestAppServerSessionCapturesTurnCompletedItems(t *testing.T) {
 
 func TestAppServerSessionOmitsUnsetModelAndSendsConfiguredModel(t *testing.T) {
 	dir := t.TempDir()
-	codexPath := filepath.Join(dir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	codexPath := writeFakeSteerableAppServer(t, dir)
 	for _, tc := range []struct {
 		name  string
 		env   []string
@@ -145,10 +144,7 @@ func TestAppServerSessionOmitsUnsetModelAndSendsConfiguredModel(t *testing.T) {
 
 func TestAppServerSessionPreservesStdoutDiagnosticsOnStartFailure(t *testing.T) {
 	dir := t.TempDir()
-	codexPath := filepath.Join(dir, "codex")
-	if err := os.WriteFile(codexPath, []byte(fakeSteerableAppServer()), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	codexPath := writeFakeSteerableAppServer(t, dir)
 	session := newAppServerCodexReviewSession(nil)
 	result, err := runAppServerSession(context.Background(), session, appserver.Request{
 		Timeout:        5 * time.Second,
@@ -174,6 +170,140 @@ func runAppServerSession(ctx context.Context, session appserver.Session, request
 		return result, err
 	}
 	return session.Wait(ctx)
+}
+
+func writeFakeSteerableAppServer(t *testing.T, dir string) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		codexPath := filepath.Join(dir, "codex")
+		content := "#!/usr/bin/env sh\nP2R_FAKE_STEERABLE_APPSERVER=1 exec \"" + exe + "\" \"$@\"\n"
+		if err := os.WriteFile(codexPath, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return codexPath
+	}
+	codexPath := filepath.Join(dir, "codex.cmd")
+	wrapper := "@echo off\r\nset P2R_FAKE_STEERABLE_APPSERVER=1\r\n\"" + exe + "\" %*\r\n"
+	if err := os.WriteFile(codexPath, []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return codexPath
+}
+
+func runFakeSteerableAppServer() int {
+	if len(os.Args) > 1 && os.Args[1] == "app-server" && hasArg("--help") {
+		fmt.Println("Usage: codex app-server [OPTIONS] [COMMAND]")
+		fmt.Println("  -c, --config <KEY=VALUE>")
+		fmt.Println("      --listen <URL>")
+		return 0
+	}
+	if len(os.Args) <= 1 || os.Args[1] != "app-server" {
+		fmt.Fprintln(os.Stderr, "unexpected fake codex args: "+strings.Join(os.Args[1:], " "))
+		return 2
+	}
+	threadID := "thread-test"
+	turnID := "turn-test"
+	steerLog := os.Getenv("STEER_LOG")
+	initialized := false
+	send := func(payload map[string]any) {
+		_ = json.NewEncoder(os.Stdout).Encode(payload)
+	}
+	report := `# Steered Report
+
+<!-- p2r:static-review-json:start -->
+{
+  "schema_version": "p2r.static_review.v1",
+  "stage": "E",
+  "findings": []
+}
+<!-- p2r:static-review-json:end -->
+`
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 4096), 1<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var request map[string]any
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
+			continue
+		}
+		requestID := request["id"]
+		method, _ := request["method"].(string)
+		params, _ := request["params"].(map[string]any)
+		if method == "thread/start" || method == "turn/start" {
+			if os.Getenv("REJECT_NULL_MODEL") == "1" {
+				if value, ok := params["model"]; ok && value == nil {
+					send(map[string]any{"id": requestID, "error": map[string]any{"code": -32602, "message": "model must be omitted when unset"}})
+					continue
+				}
+			}
+			if required := os.Getenv("REQUIRE_MODEL"); required != "" && params["model"] != required {
+				send(map[string]any{"id": requestID, "error": map[string]any{"code": -32602, "message": "missing required model"}})
+				continue
+			}
+		}
+		switch method {
+		case "initialize":
+			if diagnostic := os.Getenv("STDOUT_DIAGNOSTIC_ON_INITIALIZE"); diagnostic != "" {
+				fmt.Println(diagnostic)
+				send(map[string]any{"id": requestID, "error": map[string]any{"code": -32001, "message": "diagnostic requested"}})
+				continue
+			}
+			send(map[string]any{"id": requestID, "result": map[string]any{"userAgent": "fake-codex", "codexHome": "/tmp/fake", "platformFamily": "unix", "platformOs": "linux"}})
+		case "initialized":
+			initialized = true
+		case "thread/start":
+			if !initialized {
+				send(map[string]any{"id": requestID, "error": map[string]any{"code": -32000, "message": "missing initialized notification"}})
+				continue
+			}
+			send(map[string]any{"id": requestID, "result": map[string]any{"thread": map[string]any{"id": threadID}}})
+		case "turn/start":
+			send(map[string]any{"id": requestID, "result": map[string]any{"turn": map[string]any{"id": turnID, "items": []any{}, "status": "running"}}})
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				status := os.Getenv("TURN_STATUS")
+				if status == "" {
+					status = "completed"
+				}
+				if os.Getenv("TURN_ITEMS_ONLY") == "1" {
+					send(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "items": []any{map[string]any{"id": "item-1", "type": "agentMessage", "text": report}}, "status": status}}})
+					return
+				}
+				send(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": threadID, "turnId": turnID, "item": map[string]any{"id": "item-1", "type": "agentMessage", "text": report}}})
+				send(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "items": []any{}, "status": status}}})
+			}()
+		case "turn/steer":
+			if steerLog != "" {
+				if input, ok := params["input"].([]any); ok && len(input) > 0 {
+					if item, ok := input[0].(map[string]any); ok {
+						if text, ok := item["text"].(string); ok {
+							_ = os.WriteFile(steerLog, []byte(text), 0o644)
+						}
+					}
+				}
+			}
+			send(map[string]any{"id": requestID, "result": map[string]any{"turnId": turnID}})
+		default:
+			send(map[string]any{"id": requestID, "error": map[string]any{"code": -32601, "message": "unknown"}})
+		}
+	}
+	return 0
+}
+
+func hasArg(target string) bool {
+	for _, arg := range os.Args[1:] {
+		if arg == target {
+			return true
+		}
+	}
+	return false
 }
 
 func fakeSteerableAppServer() string {

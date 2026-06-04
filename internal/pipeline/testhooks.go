@@ -101,6 +101,11 @@ type TestServiceURL struct {
 	URL    string `json:"url"`
 }
 
+type TestBrowserURLCandidate = BrowserURLCandidate
+type TestBrowserAction = BrowserAction
+type TestBlockedBrowserAction = BlockedBrowserAction
+type TestFrontendE2ESummary = FrontendE2ESummary
+
 type TestStageCProxyPlan struct {
 	ComposeProject  string
 	ComposeFiles    []string
@@ -374,6 +379,39 @@ func CleanupStageCTestArtifactsForTest(repoPath string) TestStageCTestArtifactCl
 
 func RuntimeCleanupPointForTest(stage string, stages []model.StageRecord) bool {
 	return runtimeCleanupPoint(stage, stages)
+}
+
+func BlockedDependentsForTest(stage string) []string {
+	return blockedDependents(stage)
+}
+
+func BrowserURLCandidatesForTest(evidence TestRuntimeEvidence) []TestBrowserURLCandidate {
+	return browserURLCandidates(runtimeEvidenceFromTest(evidence))
+}
+
+func BrowserAllowlistOriginsForTest(candidates []TestBrowserURLCandidate) []string {
+	return browserAllowlistOrigins(candidates)
+}
+
+func ValidateBrowserActionForTest(action TestBrowserAction, candidates []TestBrowserURLCandidate) *TestBlockedBrowserAction {
+	validation := validateBrowserAction(action, candidates, "")
+	if validation.Blocked == nil {
+		return nil
+	}
+	blocked := *validation.Blocked
+	return &blocked
+}
+
+func ParseFrontendE2ESummaryForTest(raw []byte) (TestFrontendE2ESummary, error) {
+	return parseFrontendE2ESummary(raw)
+}
+
+func SnapshotRepoForTest(repoPath string) (map[string]string, error) {
+	return snapshotRepo(repoPath)
+}
+
+func RepoSnapshotDiffForTest(before, after map[string]string) []string {
+	return repoSnapshotDiff(before, after)
 }
 
 func FilteredRuntimeEnvForTest(environ, extra []string, docker bool) []string {

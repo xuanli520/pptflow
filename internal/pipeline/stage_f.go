@@ -224,7 +224,7 @@ func checkDirection(sample, target string, step int) bool {
 }
 
 func shortComment(stageStatuses map[string]string, findings []model.Finding) string {
-	runtime := fmt.Sprintf("1.<Runtime conclusion: B=%s, C=%s. Runtime conclusions are based only on collected B/C artifacts or explicit missing evidence.>", stageStatuses["B"], stageStatuses["C"])
+	runtime := fmt.Sprintf("1.<Runtime conclusion: B=%s, G=%s, C=%s. Runtime conclusions are based only on collected B/G/C artifacts or explicit missing evidence.>", stageStatuses["B"], stageStatuses["G"], stageStatuses["C"])
 	blocker, high := countSeverity(findings, "Blocker"), countSeverity(findings, "High")
 	match := fmt.Sprintf("2.<Acceptance match conclusion: Static acceptance requires human review; recorded Blocker=%d, High=%d from pipeline findings.>", blocker, high)
 	risk := "3.<Highest risk: No Blocker/High finding recorded.>"

@@ -28,7 +28,7 @@ func stagePlanForMode(mode, stage string, staticOnly bool, explicitStages map[st
 			return stagePlan{blockedReason: "未知起始阶段: " + fromStage}
 		}
 		if staticOnly && hasRuntimeStage(stages) {
-			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段 B/C"}
+			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段"}
 		}
 		return stagePlan{displayStages: stages, fromStage: fromStage}
 	}
@@ -38,13 +38,13 @@ func stagePlanForMode(mode, stage string, staticOnly bool, explicitStages map[st
 			return stagePlan{blockedReason: "至少选择一个阶段"}
 		}
 		if staticOnly && hasRuntimeStage(stages) {
-			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段 B/C"}
+			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段"}
 		}
 		return stagePlan{runStages: stages, displayStages: stages}
 	}
 	if mode == "recheck" {
 		if staticOnly && model.IsRuntimeStage(stage) {
-			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段 B/C"}
+			return stagePlan{blockedReason: "static-only 模式不能重跑 runtime 阶段"}
 		}
 		stages := affectedStages(stage)
 		return stagePlan{runStages: stages, displayStages: stages}

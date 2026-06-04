@@ -12,6 +12,7 @@ pipeline:
     B_up: 300
     B_health: 60
     B_port: 30
+    G: 600
     C: 300
     D: 900
     E: 1200

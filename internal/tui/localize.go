@@ -111,6 +111,8 @@ func localizeStageName(stage, name string) string {
 		return "静态验收审计"
 	case "F":
 		return "标注员修复静态审查"
+	case "G":
+		return "浏览器前端 E2E"
 	}
 	switch strings.TrimSpace(name) {
 	case "", "unknown":
@@ -127,6 +129,8 @@ func localizeStageName(stage, name string) string {
 		return "静态验收审计"
 	case "annotator repair static review":
 		return "标注员修复静态审查"
+	case "frontend browser E2E":
+		return "浏览器前端 E2E"
 	default:
 		return name
 	}
@@ -207,7 +211,7 @@ func localizeSummary(summary string) string {
 		return ""
 	case "Not selected for this run.":
 		return "本次未选择"
-	case "--static-only skips Docker and run_tests evidence.":
+	case "--static-only skips Docker and run_tests evidence.", "--static-only skips runtime evidence stages.":
 		return "静态模式跳过运行时证据"
 	case "codex app-server failed":
 		return "Codex 执行失败"

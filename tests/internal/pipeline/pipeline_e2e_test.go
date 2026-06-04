@@ -470,6 +470,28 @@ func stageByName(stages []model.StageRecord, name string) model.StageRecord {
 
 func writeExecutable(t *testing.T, path, content string) {
 	t.Helper()
+	if runtime.GOOS == "windows" && filepath.Ext(path) == "" {
+		switch {
+		case strings.HasPrefix(content, "#!/usr/bin/env python"):
+			scriptPath := path + ".py"
+			if err := os.WriteFile(scriptPath, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+".cmd", []byte("@echo off\r\npython \""+scriptPath+"\" %*\r\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return
+		case strings.HasPrefix(content, "#!/usr/bin/env bash"):
+			scriptPath := path + ".sh"
+			if err := os.WriteFile(scriptPath, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+".cmd", []byte("@echo off\r\nbash \""+scriptPath+"\" %*\r\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+	}
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatal(err)
 	}

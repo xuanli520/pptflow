@@ -310,6 +310,10 @@ func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckRes
 			}
 			continue
 		}
+		if s.execution.stages[index].Status == model.StageBlocked {
+			s.execution.results[stage] = s.execution.stages[index]
+			continue
+		}
 
 		running := runningStage(s.execution.run, stage)
 		s.execution.stages[index] = running
@@ -348,16 +352,14 @@ func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckRes
 				return result, err, aborted
 			}
 		}
-		if outcome.SkipNextStage && index+1 < len(s.execution.stages) {
-			nextStage := s.execution.stages[index+1].Stage
-			skipped := skippedStage(nextStage, "Skipped because previous stage failed before required runtime was available.")
-			skipped = r.materializeSkippedStage(s.execution.run, skipped)
-			s.execution.stages[index+1] = skipped
-			s.execution.results[nextStage] = skipped
-			if result, err, aborted := s.persistStageUpdate(r, skipped, len(skipped.Findings) > 0, EventStageDone); aborted || err != nil {
+		dependents := outcome.BlockedDependents
+		if shouldBlockRuntimeDependents(stage, record, outcome.Runtime) {
+			dependents = append(dependents, blockedDependents(stage)...)
+		}
+		if len(dependents) > 0 {
+			if result, err, aborted := s.materializeBlockedDependents(r, stage, dependents); aborted || err != nil {
 				return result, err, aborted
 			}
-			index++
 		}
 		if !s.prepare.opts.DeferRuntimeCleanup && !s.execution.runtimeCleanupDone && runtimeCleanupPoint(stage, s.execution.stages) {
 			if result, err, aborted := s.cleanupRuntime(r); aborted || err != nil {
@@ -366,6 +368,48 @@ func (s *runState) executeStageLoop(r Runner, preflightResult preflight.CheckRes
 		}
 	}
 	return Result{}, nil, false
+}
+
+func shouldBlockRuntimeDependents(stage string, record model.StageRecord, runtime *RuntimeState) bool {
+	if stage != string(model.StageB) {
+		return false
+	}
+	if record.Status != model.StageDone {
+		return true
+	}
+	return runtime == nil || !runtime.HasCleanupTarget()
+}
+
+func (s *runState) materializeBlockedDependents(r Runner, upstream string, dependents []string) (Result, error, bool) {
+	seen := map[string]bool{}
+	for _, dependent := range dependents {
+		if seen[dependent] {
+			continue
+		}
+		seen[dependent] = true
+		index := s.stageIndex(dependent)
+		if index < 0 || s.execution.stages[index].Status == model.StageSkipped || s.execution.stages[index].Status == model.StageDone || s.execution.stages[index].Status == model.StageFailed {
+			continue
+		}
+		reason := "Skipped because Stage " + upstream + " failed before required runtime was available."
+		blocked := blockedStage(dependent, stageName(dependent), []string{upstream}, reason)
+		blocked = r.materializeSkippedStage(s.execution.run, blocked)
+		s.execution.stages[index] = blocked
+		s.execution.results[dependent] = blocked
+		if result, err, aborted := s.persistStageUpdate(r, blocked, len(blocked.Findings) > 0, EventStageDone); aborted || err != nil {
+			return result, err, aborted
+		}
+	}
+	return Result{}, nil, false
+}
+
+func (s *runState) stageIndex(stage string) int {
+	for index := range s.execution.stages {
+		if s.execution.stages[index].Stage == stage {
+			return index
+		}
+	}
+	return -1
 }
 
 func (s *runState) persistStageBUpdate(r Runner, record model.StageRecord, includeFindings bool, event ProgressEvent, runtime *RuntimeState) (Result, error, bool) {

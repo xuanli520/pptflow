@@ -36,8 +36,8 @@ func TestExecutionViewModelFillsPartialRunsAndMissingDocs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if probe.StageCount != 6 {
-		t.Fatalf("stages = %d, want 6", probe.StageCount)
+	if probe.StageCount != len(model.AllStages()) {
+		t.Fatalf("stages = %d, want %d", probe.StageCount, len(model.AllStages()))
 	}
 	if probe.FirstStageError != "本次运行未记录该阶段" {
 		t.Fatalf("missing stage summary = %q", probe.FirstStageError)

@@ -11,6 +11,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/preflight"
 )
 
@@ -84,6 +85,27 @@ func TestAutoStageCWithoutRunnerKeepsBashPreflight(t *testing.T) {
 	t.Fatalf("auto Stage C without runner should keep bash preflight: %#v", result.Checks)
 }
 
+func TestDockerMissingBlocksRuntimeChain(t *testing.T) {
+	result := preflight.Run(context.Background(), missingDockerExec{}, config.Default())
+	for _, stage := range []string{string(model.StageB), string(model.StageG), string(model.StageC)} {
+		if _, ok := result.BlockingCheck(stage); !ok {
+			t.Fatalf("docker missing should block %s: %#v", stage, result.Checks)
+		}
+	}
+}
+
+func TestPlaywrightMissingOnlyBlocksStageG(t *testing.T) {
+	result := preflight.Run(context.Background(), missingPlaywrightExec{}, config.Default())
+	if _, ok := result.BlockingCheck(string(model.StageG)); !ok {
+		t.Fatalf("playwright missing should block G: %#v", result.Checks)
+	}
+	for _, stage := range []string{string(model.StageB), string(model.StageC)} {
+		if check, ok := result.BlockingCheck(stage); ok && check.Name == "playwright" {
+			t.Fatalf("playwright should not block %s: %#v", stage, result.Checks)
+		}
+	}
+}
+
 type preflightExec struct{}
 
 func (preflightExec) LookPath(name string) (string, error) {
@@ -99,4 +121,27 @@ func (preflightExec) Run(ctx context.Context, timeout time.Duration, dir string,
 
 func (preflightExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
 	return executor.Result{Command: strings.Join(append([]string{name}, args...), " ")}
+}
+
+type missingDockerExec struct {
+	preflightExec
+}
+
+func (missingDockerExec) LookPath(name string) (string, error) {
+	if name == "docker" {
+		return "", errors.New("missing docker")
+	}
+	return preflightExec{}.LookPath(name)
+}
+
+type missingPlaywrightExec struct {
+	preflightExec
+}
+
+func (missingPlaywrightExec) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	command := strings.Join(append([]string{name}, args...), " ")
+	if name == "node" && len(args) > 0 && args[0] == "-e" {
+		return executor.Result{Command: command, Stderr: "Cannot find module 'playwright'", Err: errors.New("playwright missing")}
+	}
+	return preflightExec{}.Run(ctx, timeout, dir, env, name, args...)
 }

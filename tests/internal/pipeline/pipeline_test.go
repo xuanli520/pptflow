@@ -2,6 +2,7 @@ package pipeline_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -119,7 +120,7 @@ func TestSelectedStagesStaticOnly(t *testing.T) {
 			t.Fatalf("expected %s selected", stage)
 		}
 	}
-	for _, stage := range []string{"B", "C"} {
+	for _, stage := range []string{"B", "G", "C"} {
 		if selected[stage] {
 			t.Fatalf("expected %s skipped", stage)
 		}
@@ -128,7 +129,7 @@ func TestSelectedStagesStaticOnly(t *testing.T) {
 
 func TestSelectedStagesDefaultIncludesStageE(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{}, false)
-	for _, stage := range []string{"A", "D", "E", "F", "B", "C"} {
+	for _, stage := range model.AllStages() {
 		if !selected[stage] {
 			t.Fatalf("expected %s selected", stage)
 		}
@@ -265,7 +266,7 @@ func TestValidateStageFSplitLineKindEmitsLowFinding(t *testing.T) {
 
 func TestSelectedStagesFrom(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{From: "C"}, false)
-	for _, stage := range []string{"A", "D", "E", "F", "B"} {
+	for _, stage := range []string{"A", "D", "E", "F", "B", "G"} {
 		if selected[stage] {
 			t.Fatalf("expected %s not selected", stage)
 		}
@@ -277,12 +278,26 @@ func TestSelectedStagesFrom(t *testing.T) {
 	}
 }
 
+func TestSelectedStagesFromBIncludesRuntimeChain(t *testing.T) {
+	selected := selectedStages(pipelinepkg.RunOptions{From: "B"}, false)
+	for _, stage := range []string{"B", "G", "C"} {
+		if !selected[stage] {
+			t.Fatalf("expected %s selected", stage)
+		}
+	}
+	for _, stage := range []string{"A", "D", "E", "F"} {
+		if selected[stage] {
+			t.Fatalf("expected %s not selected", stage)
+		}
+	}
+}
+
 func TestSelectedStagesSingleStageStillRunsSummary(t *testing.T) {
 	selected := selectedStages(pipelinepkg.RunOptions{Stage: "D"}, false)
 	if !selected["D"] || !selected["F"] {
 		t.Fatalf("expected D and F selected, got %#v", selected)
 	}
-	for _, stage := range []string{"A", "B", "C", "E"} {
+	for _, stage := range []string{"A", "B", "G", "C", "E"} {
 		if selected[stage] {
 			t.Fatalf("expected %s not selected", stage)
 		}
@@ -290,8 +305,8 @@ func TestSelectedStagesSingleStageStillRunsSummary(t *testing.T) {
 }
 
 func TestSelectedStagesExplicitDependencyChain(t *testing.T) {
-	selected := selectedStages(pipelinepkg.RunOptions{Stages: []string{"A", "B", "C"}}, false)
-	for _, stage := range []string{"A", "B", "C"} {
+	selected := selectedStages(pipelinepkg.RunOptions{Stages: []string{"A", "B", "G", "C"}}, false)
+	for _, stage := range []string{"A", "B", "G", "C"} {
 		if !selected[stage] {
 			t.Fatalf("expected %s selected", stage)
 		}
@@ -369,8 +384,17 @@ func TestRunCanonicalizesStaleDBProjectPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(content), `"project_path": "`+canonical+`"`) || !strings.Contains(string(content), `"type": "stale_project_path"`) {
-		t.Fatalf("manifest should contain canonical path and stale warning:\n%s", content)
+	var manifest struct {
+		ProjectPath  string `json:"project_path"`
+		PathWarnings []struct {
+			Type string `json:"type"`
+		} `json:"path_warnings"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.ProjectPath != canonical || len(manifest.PathWarnings) != 1 || manifest.PathWarnings[0].Type != "stale_project_path" {
+		t.Fatalf("manifest should contain canonical path and stale warning: %#v", manifest)
 	}
 	if _, err := os.Stat(filepath.Join(run.ArtifactRoot, "logs", "path_warnings.log")); err != nil {
 		t.Fatalf("path warning log should be written: %v", err)
@@ -1350,7 +1374,7 @@ func TestAcceptanceFindingsMapRealScriptPayload(t *testing.T) {
   "blocking_issues": [{"issue_id":"required-artifacts-missing","severity":"blocking","rule":"3.2.1","evidence":"missing docs/design.md","repair_action":"add it","done_criteria":"check passes"}],
   "non_blocking_issues": [
     {"issue_id":"test-structure-gap","severity":"major","rule":"3.3.4","evidence":"weak tests","repair_action":"add tests","done_criteria":"tests pass"},
-    {"issue_id":"runtime-verification-missing","severity":"major","rule":"3.1.1","evidence":"run_acceptance.py was executed without --runtime-command","repair_action":"run B/C","done_criteria":"runtime evidence exists"}
+    {"issue_id":"runtime-verification-missing","severity":"major","rule":"3.1.1","evidence":"run_acceptance.py was executed without --runtime-command","repair_action":"run B/G/C","done_criteria":"runtime evidence exists"}
   ]
 }`
 	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {

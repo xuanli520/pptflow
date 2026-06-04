@@ -9,9 +9,19 @@ import (
 )
 
 func TestRequiredArtifactScriptsAcceptAlternativeOriginalSessionMarkers(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available")
+	python := ""
+	for _, name := range []string{"python3", "python"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		if err := exec.Command(path, "--version").Run(); err == nil {
+			python = path
+			break
+		}
+	}
+	if python == "" {
+		t.Skip("python not available")
 	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {

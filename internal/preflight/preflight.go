@@ -30,21 +30,22 @@ type Check struct {
 
 func Run(ctx context.Context, exec executor.CommandRunner, cfg config.Config) CheckResult {
 	var result CheckResult
-	node := checkBinary(ctx, exec, "node", []string{"--version"}, nodeCandidates(), nil, "Node.js is required by Codex CLI.")
-	result.Checks = append(result.Checks, node)
-	result.Checks = append(result.Checks, checkBinary(ctx, exec, "docker", []string{"--version"}, dockerCandidates(), []string{string(model.StageB)}, "Docker is required for Stage B runtime evidence."))
+	node := checkBinary(ctx, exec, "node", []string{"--version"}, nodeCandidates(), []string{string(model.StageG)}, "Node.js is required for Stage G browser E2E.")
+	result.Checks = append(result.Checks, checkBinary(ctx, exec, "docker", []string{"--version"}, dockerCandidates(), []string{string(model.StageB), string(model.StageG), string(model.StageC)}, "Docker is required for runtime evidence stages."))
 	if stageCPreflightRequiresHostBash(cfg.Pipeline.StageC) {
 		result.Checks = append(result.Checks, checkBinary(ctx, exec, "bash", []string{"--version"}, bashCandidates(), []string{string(model.StageC)}, "bash is required to run repo/run_tests.sh on the host."))
 	}
-	result.Checks = append(result.Checks, checkPython(ctx, exec))
 	codexCheck := checkCodex(ctx, exec, cfg)
 	if node.Status == "missing" {
 		if cap, ok := codexCheck.Details.(codex.Capability); ok && cap.NodePath != "" {
 			node.Status = "degraded"
-			node.Message = "node is not on PATH, but Codex-local Node.js will be prepended for static review."
+			node.Message = "node is not on PATH, but Codex-local Node.js will be used for Stage G browser wrapper."
 			node.Path = cap.NodePath
 		}
 	}
+	result.Checks = append([]Check{node}, result.Checks...)
+	result.Checks = append(result.Checks, checkPlaywright(ctx, exec, node))
+	result.Checks = append(result.Checks, checkPython(ctx, exec))
 	result.Checks = append(result.Checks, codexCheck)
 	return result
 }
@@ -148,6 +149,26 @@ func checkCodex(ctx context.Context, exec executor.CommandRunner, cfg config.Con
 		}
 		check.Message = strings.Join(messages, "; ")
 	}
+	return check
+}
+
+func checkPlaywright(ctx context.Context, exec executor.CommandRunner, node Check) Check {
+	check := Check{Name: "playwright", Status: "missing", Stages: []string{string(model.StageG)}, Message: "Playwright is required for Stage G browser E2E."}
+	if node.Status == "missing" || strings.TrimSpace(node.Path) == "" {
+		check.Message += " Node.js is unavailable."
+		return check
+	}
+	out := exec.Run(ctx, 5*time.Second, "", nil, node.Path, "-e", "const p=require('playwright/package.json'); console.log(p.version || 'ok')")
+	version := strings.TrimSpace(firstNonEmpty(out.Stdout, out.Stderr))
+	if out.Err != nil {
+		check.Message += " Install the playwright package and browser runtime."
+		check.Details = map[string]string{"error": out.Err.Error()}
+		return check
+	}
+	check.Status = "ok"
+	check.Path = node.Path
+	check.Version = firstLine(version)
+	check.Message = ""
 	return check
 }
 

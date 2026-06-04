@@ -11,6 +11,7 @@ const (
 	StageD StageID = "D"
 	StageE StageID = "E"
 	StageF StageID = "F"
+	StageG StageID = "G"
 )
 
 type StageSpec struct {
@@ -28,7 +29,8 @@ var stageSpecs = []StageSpec{
 	{ID: StageE, Order: 3, Name: "static acceptance audit", Static: true, LogName: "E_static_audit.log"},
 	{ID: StageF, Order: 4, Name: "annotator repair static review", Static: true, LogName: "F_repair.log"},
 	{ID: StageB, Order: 5, Name: "Docker runtime evidence", Runtime: true, LogName: "B_docker.log"},
-	{ID: StageC, Order: 6, Name: "run_tests runtime evidence", Runtime: true, LogName: "C_tests.log"},
+	{ID: StageG, Order: 6, Name: "frontend browser E2E", Runtime: true, LogName: "G_frontend_e2e.log"},
+	{ID: StageC, Order: 7, Name: "run_tests runtime evidence", Runtime: true, LogName: "C_tests.log"},
 }
 
 var stageSpecByID = func() map[StageID]StageSpec {

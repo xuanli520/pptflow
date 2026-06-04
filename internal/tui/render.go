@@ -516,6 +516,8 @@ func reportTypeForStage(stage string) string {
 		return "静态验收报告"
 	case "F":
 		return "标注员修复报告"
+	case "G":
+		return "浏览器前端 E2E"
 	default:
 		return stage
 	}
