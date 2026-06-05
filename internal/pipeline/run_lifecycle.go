@@ -169,7 +169,7 @@ func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
 	}
 	importedDocs, docsImportErr := taskdocs.ImportDropbox(r.cfg.ScanPath, input.taskID, r.cfg.Docs, "p2r-run")
 	docsManifest, docsManifestErr := taskdocs.ReadManifest(r.cfg.ScanPath, input.taskID)
-	if isInitialRunMode(input.opts.Mode) && docsManifestErr == nil && len(docsManifest.Docs) < 1 {
+	if initialRunRequiresSupplementalDocs(input.opts, input.opts.StaticOnly || r.cfg.Pipeline.StaticOnly) && docsManifestErr == nil && len(docsManifest.Docs) < 1 {
 		err := errors.New(taskdocs.InitialInspectionDocsRequiredMessage)
 		input.progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
 		return nil, err
@@ -226,6 +226,36 @@ func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
 
 func isInitialRunMode(mode string) bool {
 	return strings.TrimSpace(strings.ToLower(mode)) == "" || strings.TrimSpace(strings.ToLower(mode)) == "initial"
+}
+
+func initialRunRequiresSupplementalDocs(opts RunOptions, staticOnly bool) bool {
+	if !isInitialRunMode(opts.Mode) {
+		return false
+	}
+	if opts.StaticOnly || staticOnly {
+		return true
+	}
+	if strings.TrimSpace(opts.Stage) != "" {
+		return !model.IsRuntimeStage(opts.Stage)
+	}
+	if strings.TrimSpace(opts.From) != "" {
+		selected := selectedStages(opts, staticOnly)
+		for stage := range selected {
+			if !model.IsRuntimeStage(stage) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(opts.Stages) > 0 {
+		for _, stage := range opts.Stages {
+			if !model.IsRuntimeStage(stage) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func (s *runState) recordPathWarnings() {

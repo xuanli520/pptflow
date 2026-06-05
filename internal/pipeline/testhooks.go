@@ -465,6 +465,14 @@ func StageGFinishScreenshotBlockReasonForTest(observations []TestBrowserObservat
 	return stageGFinishScreenshotBlockReason(observations)
 }
 
+func StageGFinishScreenshotBlockReasonForSummaryForTest(summary TestFrontendE2ESummary, observations []TestBrowserObservation) string {
+	return stageGFinishScreenshotBlockReasonForSummary(summary, observations)
+}
+
+func StageGPartialProductBlockerFindingForTest(observations []TestBrowserObservation, reason string) (model.Finding, bool) {
+	return stageGPartialProductBlockerFinding(observations, reason)
+}
+
 func StageGKeyScreenshotObservationIndexesForTest(observations []TestBrowserObservation) []int {
 	return stageGKeyScreenshotObservationIndexes(observations)
 }

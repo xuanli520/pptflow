@@ -249,7 +249,10 @@ func TestBrowserActionPromptTemplateRendersFromPromptProfileAsset(t *testing.T) 
 	}
 	for _, want := range []string{
 		"Run p2r stage G as a browser E2E planner.",
-		"finish requires at least 5 browser screenshots",
+		"finish requires at least 5 key browser screenshots",
+		"Do not use fill_input retries",
+		"fill every visible username/email/account field and every password field before submitting",
+		"same login, CAPTCHA, or registration state remains",
 		"\"id\": \"url_1\"",
 		"README-derived browser test hints",
 		"rep1/rep123",
@@ -271,6 +274,8 @@ func TestStageGFinishRequiresMinimumBrowserScreenshots(t *testing.T) {
 		observations = append(observations, pipelinepkg.TestBrowserObservation{
 			Action:         "snapshot",
 			OK:             true,
+			CurrentURL:     fmt.Sprintf("http://127.0.0.1:5173/state-%02d", index),
+			VisibleText:    fmt.Sprintf("Business state %02d", index),
 			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "runtime", fmt.Sprintf("shot-%02d.png", index))),
 		})
 	}
@@ -281,10 +286,93 @@ func TestStageGFinishRequiresMinimumBrowserScreenshots(t *testing.T) {
 	observations = append(observations, pipelinepkg.TestBrowserObservation{
 		Action:         "snapshot",
 		OK:             true,
+		CurrentURL:     "http://127.0.0.1:5173/state-04",
+		VisibleText:    "Business state 04",
 		ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "runtime", "shot-04.png")),
 	})
 	if reason := pipelinepkg.StageGFinishScreenshotBlockReasonForTest(observations); reason != "" {
 		t.Fatalf("finish should be allowed after five screenshots, got %q", reason)
+	}
+}
+
+func TestStageGFinishAllowsLimitedScreenshotsForProductBlocker(t *testing.T) {
+	root := t.TempDir()
+	loginURL := "http://127.0.0.1:5173/api/auth/login"
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:         "open_candidate",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login CAPTCHA",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "open.png")),
+		},
+		{
+			Action:         "click_button",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Invalid or expired CAPTCHA Login CAPTCHA",
+			NetworkIssues:  []browserpkg.NetworkIssue{{URL: loginURL, Status: 400}},
+			NetworkEvents:  []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 400}},
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "captcha.png")),
+		},
+	}
+	passed := pipelinepkg.TestFrontendE2ESummary{Status: "passed"}
+	if reason := pipelinepkg.StageGFinishScreenshotBlockReasonForSummaryForTest(passed, observations); reason == "" {
+		t.Fatal("passed summary should still require five key screenshots")
+	}
+	failed := pipelinepkg.TestFrontendE2ESummary{
+		Status: "failed",
+		Findings: []pipelinepkg.FrontendE2EFinding{{
+			Severity: "High",
+			Title:    "CAPTCHA blocks README credentials",
+		}},
+	}
+	if reason := pipelinepkg.StageGFinishScreenshotBlockReasonForSummaryForTest(failed, observations); reason != "" {
+		t.Fatalf("failed product blocker should allow limited screenshot finish, got %q", reason)
+	}
+}
+
+func TestStageGPartialProductBlockerFindingDetectsAuthGate(t *testing.T) {
+	loginURL := "http://127.0.0.1:5173/api/auth/login"
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:      "open_candidate",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "Username Password CAPTCHA Sign In Register",
+		},
+		{
+			Action:        "click_button",
+			OK:            true,
+			CurrentURL:    "http://127.0.0.1:5173/login",
+			VisibleText:   "Invalid or expired CAPTCHA Username Password CAPTCHA Sign In Register",
+			NetworkIssues: []browserpkg.NetworkIssue{{URL: loginURL, Status: 400}},
+			NetworkEvents: []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 400}},
+		},
+		{
+			Action:      "fill_input",
+			OK:          false,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "Username Password CAPTCHA Sign In Register",
+			Error:       "locator.fill: Timeout 5000ms exceeded",
+		},
+	}
+	finding, ok := pipelinepkg.StageGPartialProductBlockerFindingForTest(observations, "Stage G timeout reached.")
+	if !ok {
+		t.Fatal("expected auth gate product blocker finding")
+	}
+	if finding.Title != "Authentication gate prevented browser workflow coverage" || !strings.Contains(finding.Evidence, "status=400") {
+		t.Fatalf("unexpected finding: %#v", finding)
+	}
+	observations = append(observations, pipelinepkg.TestBrowserObservation{
+		Action:        "click_button",
+		OK:            true,
+		CurrentURL:    "http://127.0.0.1:5173/dashboard",
+		VisibleText:   "Dashboard",
+		NetworkEvents: []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 200}},
+	})
+	if finding, ok := pipelinepkg.StageGPartialProductBlockerFindingForTest(observations, "timeout"); ok {
+		t.Fatalf("recovered auth failure should not be a blocker: %#v", finding)
 	}
 }
 
@@ -295,12 +383,13 @@ func TestStageGKeyScreenshotSelectionIsCappedAndRepresentative(t *testing.T) {
 		observation := pipelinepkg.TestBrowserObservation{
 			Action:         "snapshot",
 			OK:             true,
-			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			CurrentURL:     fmt.Sprintf("http://127.0.0.1:5173/business/%02d", index),
+			VisibleText:    fmt.Sprintf("Business screen %02d", index),
 			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "runtime", fmt.Sprintf("shot-%02d.png", index))),
 		}
 		if index == 3 {
 			observation.OK = false
-			observation.Error = "selector timed out"
+			observation.NetworkIssues = []browserpkg.NetworkIssue{{URL: "http://127.0.0.1:5173/api/business/03", Status: 500}}
 		}
 		if index == 8 {
 			observation.NetworkEvents = []browserpkg.NetworkEvent{{URL: "http://127.0.0.1:5173/api/auth/login", Method: "POST", Status: 200}}
@@ -326,7 +415,8 @@ func TestStageGMaterializesAtMostTenScreenshotArtifacts(t *testing.T) {
 		observations = append(observations, pipelinepkg.TestBrowserObservation{
 			Action:         "snapshot",
 			OK:             true,
-			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			CurrentURL:     fmt.Sprintf("http://127.0.0.1:5173/business/%02d", index),
+			VisibleText:    fmt.Sprintf("Business screen %02d", index),
 			ScreenshotPath: writeTinyPNG(t, filepath.Join(sourceRoot, fmt.Sprintf("shot-%02d.png", index))),
 		})
 	}
@@ -366,6 +456,234 @@ func TestStageGMaterializesAtMostTenScreenshotArtifacts(t *testing.T) {
 	}
 	if nonEmpty != 10 {
 		t.Fatalf("materialized observation screenshots = %d, want 10", nonEmpty)
+	}
+}
+
+func TestStageGMaterializesFindingEvidenceScreenshot(t *testing.T) {
+	sourceRoot := t.TempDir()
+	artifactRoot := t.TempDir()
+	var observations []pipelinepkg.TestBrowserObservation
+	for index := 0; index < 5; index++ {
+		observations = append(observations, pipelinepkg.TestBrowserObservation{
+			Action:         "snapshot",
+			OK:             true,
+			CurrentURL:     fmt.Sprintf("http://127.0.0.1:5173/business/%02d", index),
+			VisibleText:    fmt.Sprintf("Business screen %02d", index),
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(sourceRoot, fmt.Sprintf("shot-%02d.png", index))),
+		})
+	}
+	observations = append(observations, pipelinepkg.TestBrowserObservation{
+		Action:         "click_button",
+		OK:             true,
+		CurrentURL:     "http://127.0.0.1:5173/editor/1",
+		VisibleText:    "Editor No pages yet This page is empty",
+		ScreenshotPath: writeTinyPNG(t, filepath.Join(sourceRoot, "editor-stuck.png")),
+	})
+	summary := pipelinepkg.TestFrontendE2ESummary{
+		SchemaVersion: "p2r.frontend_e2e.v1",
+		Status:        "failed",
+	}
+	materialized, materializedObservations, _ := pipelinepkg.MaterializeStageGScreenshotArtifactsForTest(artifactRoot, summary, observations)
+	if len(materialized.Screenshots) != 6 {
+		t.Fatalf("summary screenshots = %d, want 6: %#v", len(materialized.Screenshots), materialized.Screenshots)
+	}
+	editor := materializedObservations[len(materializedObservations)-1]
+	if editor.ScreenshotPath == "" {
+		t.Fatalf("expected final finding evidence screenshot to be retained: %#v", materializedObservations)
+	}
+	if filepath.Base(editor.ScreenshotPath) != "frontend_e2e_screenshot.png" {
+		t.Fatalf("final finding screenshot should use legacy path, got %s", editor.ScreenshotPath)
+	}
+}
+
+func TestStageGMaterializesMinimumSupportScreenshotsForFailedBlocker(t *testing.T) {
+	sourceRoot := t.TempDir()
+	artifactRoot := t.TempDir()
+	loginURL := "http://127.0.0.1:5173/api/auth/login"
+	var observations []pipelinepkg.TestBrowserObservation
+	for index := 0; index < 5; index++ {
+		observation := pipelinepkg.TestBrowserObservation{
+			Action:         "snapshot",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login CAPTCHA",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(sourceRoot, fmt.Sprintf("captcha-%02d.png", index))),
+		}
+		if index == 2 {
+			observation.Action = "click_button"
+			observation.VisibleText = "Invalid or expired CAPTCHA Login CAPTCHA"
+			observation.NetworkIssues = []browserpkg.NetworkIssue{{URL: loginURL, Status: 400}}
+			observation.NetworkEvents = []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 400}}
+		}
+		observations = append(observations, observation)
+	}
+	summary := pipelinepkg.TestFrontendE2ESummary{
+		SchemaVersion: "p2r.frontend_e2e.v1",
+		Status:        "failed",
+		Findings: []pipelinepkg.FrontendE2EFinding{{
+			Severity: "High",
+			Title:    "CAPTCHA blocks login",
+		}},
+	}
+	materialized, materializedObservations, _ := pipelinepkg.MaterializeStageGScreenshotArtifactsForTest(artifactRoot, summary, observations)
+	if len(materialized.Screenshots) != 5 {
+		t.Fatalf("summary screenshots = %d, want 5: %#v", len(materialized.Screenshots), materialized.Screenshots)
+	}
+	nonEmpty := 0
+	for _, observation := range materializedObservations {
+		if observation.ScreenshotPath != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty != 5 {
+		t.Fatalf("materialized observation screenshots = %d, want 5", nonEmpty)
+	}
+}
+
+func TestStageGKeyScreenshotsSkipFillAndFailedRetries(t *testing.T) {
+	root := t.TempDir()
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:         "open_candidate",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login Username Password",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "open.png")),
+		},
+		{
+			Action:         "fill_input",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login Username Password",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "fill.png")),
+		},
+		{
+			Action:         "click_button",
+			OK:             false,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login Username Password",
+			Error:          "selector timed out",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "failed-click.png")),
+		},
+		{
+			Action:         "click_button",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			VisibleText:    "Dashboard Admin Users",
+			NetworkEvents:  []browserpkg.NetworkEvent{{URL: "http://127.0.0.1:5173/api/auth/login", Method: "POST", Status: 200}},
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "dashboard.png")),
+		},
+	}
+	indexes := pipelinepkg.StageGKeyScreenshotObservationIndexesForTest(observations)
+	if !slices.Equal(indexes, []int{0, 3}) {
+		t.Fatalf("key screenshot indexes = %#v, want [0 3]", indexes)
+	}
+}
+
+func TestStageGKeyScreenshotsSkipFailedFormRetries(t *testing.T) {
+	root := t.TempDir()
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:         "open_candidate",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login Username Password",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "open.png")),
+		},
+		{
+			Action:         "submit_local_form",
+			OK:             false,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login Username Password",
+			Error:          "locator.press: Timeout 5000ms exceeded",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "failed-form.png")),
+		},
+		{
+			Action:         "click_button",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login invalid credentials",
+			NetworkIssues:  []browserpkg.NetworkIssue{{URL: "http://127.0.0.1:5173/api/auth/login", Status: 401}},
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "auth-failure.png")),
+		},
+	}
+	indexes := pipelinepkg.StageGKeyScreenshotObservationIndexesForTest(observations)
+	if !slices.Equal(indexes, []int{0, 2}) {
+		t.Fatalf("key screenshot indexes = %#v, want [0 2]", indexes)
+	}
+}
+
+func TestStageGKeyScreenshotsSuppressRecoveredAuthFailure(t *testing.T) {
+	root := t.TempDir()
+	loginURL := "http://127.0.0.1:5173/api/auth/login"
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:         "open_candidate",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login Username Password",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "open.png")),
+		},
+		{
+			Action:         "click_button",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login invalid credentials",
+			ConsoleErrors:  []string{"Failed to load resource: the server responded with a status of 401 (Unauthorized)"},
+			NetworkIssues:  []browserpkg.NetworkIssue{{URL: loginURL, Status: 401}},
+			NetworkEvents:  []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 401}},
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "auth-failure.png")),
+		},
+		{
+			Action:         "fill_input",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "Login Username Password",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "password-fill.png")),
+		},
+		{
+			Action:         "click_button",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			VisibleText:    "Dashboard Projects",
+			NetworkEvents:  []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 200}},
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "dashboard.png")),
+		},
+	}
+	indexes := pipelinepkg.StageGKeyScreenshotObservationIndexesForTest(observations)
+	if !slices.Equal(indexes, []int{0, 3}) {
+		t.Fatalf("key screenshot indexes = %#v, want [0 3]", indexes)
+	}
+}
+
+func TestStageGKeyScreenshotsAllowReadOnlyChangedStates(t *testing.T) {
+	root := t.TempDir()
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:         "open_candidate",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			VisibleText:    "Dashboard Overview",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "open.png")),
+		},
+		{
+			Action:         "collect_network",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			VisibleText:    "Dashboard Overview",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "network-same.png")),
+		},
+		{
+			Action:         "wait",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/dashboard",
+			VisibleText:    "Dashboard Overview Async jobs loaded",
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "wait-changed.png")),
+		},
+	}
+	indexes := pipelinepkg.StageGKeyScreenshotObservationIndexesForTest(observations)
+	if !slices.Equal(indexes, []int{0, 2}) {
+		t.Fatalf("key screenshot indexes = %#v, want [0 2]", indexes)
 	}
 }
 
@@ -429,6 +747,32 @@ func TestFrontendE2EObservationFindingsCanSuppressActionFailureFallbacks(t *test
 	findings := pipelinepkg.FrontendE2EObservationFindingsForTest(observations, true)
 	if len(findings) != 1 || findings[0].Title != "Browser action failed during frontend E2E" {
 		t.Fatalf("expected action failure fallback finding, got %#v", findings)
+	}
+}
+
+func TestFrontendE2EObservationFindingsSuppressRecoveredAuthFailure(t *testing.T) {
+	loginURL := "http://127.0.0.1:5173/api/auth/login"
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:        "click_button",
+			OK:            true,
+			ConsoleErrors: []string{"Failed to load resource: the server responded with a status of 401 (Unauthorized)"},
+			NetworkIssues: []browserpkg.NetworkIssue{{URL: loginURL, Status: 401}},
+			NetworkEvents: []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 401}},
+		},
+		{
+			Action:        "click_button",
+			OK:            true,
+			NetworkEvents: []browserpkg.NetworkEvent{{URL: loginURL, Method: "POST", Status: 200}},
+		},
+	}
+	if findings := pipelinepkg.FrontendE2EObservationFindingsForTest(observations, false); len(findings) != 0 {
+		t.Fatalf("expected recovered auth failure to be suppressed, got %#v", findings)
+	}
+	observations = observations[:1]
+	findings := pipelinepkg.FrontendE2EObservationFindingsForTest(observations, false)
+	if len(findings) != 2 {
+		t.Fatalf("expected unrecovered auth failure findings, got %#v", findings)
 	}
 }
 

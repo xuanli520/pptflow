@@ -609,6 +609,33 @@ func TestRunInitialRequiresSupplementalDocsBeforeCreatingRun(t *testing.T) {
 	}
 }
 
+func TestRunInitialRuntimeFromBDoesNotRequireSupplementalDocs(t *testing.T) {
+	root := t.TempDir()
+	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-RUNTIME-NODOCS")
+	removeSupplementalDocs(t, root, "TASK-RUNTIME-NODOCS")
+
+	cfg := config.Default()
+	cfg.ScanPath = root
+	cfg.DBPath = filepath.Join(t.TempDir(), "index.db")
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-RUNTIME-NODOCS", Batch: "batch-1", Path: projectPath}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pipelinepkg.NewRunner(store, cfg, pipelinepkg.WithCommandRunner(lifecycleCommandRunner{})).Run(ctx, "TASK-RUNTIME-NODOCS", pipelinepkg.RunOptions{From: "B"})
+	if err != nil && strings.Contains(err.Error(), "至少需要一个补充文档") {
+		t.Fatalf("runtime-only initial run should not be blocked by docs gate: %v", err)
+	}
+	if _, err := store.LatestRunForTask(ctx, "TASK-RUNTIME-NODOCS"); err != nil {
+		t.Fatalf("runtime-only run should be created even without docs: %v", err)
+	}
+}
+
 func TestRunInitialImportsDropboxBeforeDocsGate(t *testing.T) {
 	root := t.TempDir()
 	projectPath := writePipelinePackage(t, root, "batch-1", "TASK-DROPBOX")

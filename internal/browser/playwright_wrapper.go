@@ -87,14 +87,22 @@ func (w PlaywrightWrapper) Run(ctx context.Context, action Action, timeout time.
 		return Observation{}, err
 	}
 	result := exec.Run(ctx, timeout, root, nil, node, scriptPath, requestPath)
+	observation, parseErr := parsePlaywrightObservation(result.Stdout)
+	if parseErr == nil {
+		return sanitizeObservation(observation), nil
+	}
 	if result.Err != nil {
 		return Observation{}, fmt.Errorf("playwright action failed: %s", strings.TrimSpace(firstNonEmpty(result.Stderr, result.Stdout, result.Err.Error())))
 	}
+	return Observation{}, parseErr
+}
+
+func parsePlaywrightObservation(raw string) (Observation, error) {
 	var observation Observation
-	if err := json.Unmarshal([]byte(result.Stdout), &observation); err != nil {
+	if err := json.Unmarshal([]byte(raw), &observation); err != nil {
 		return Observation{}, fmt.Errorf("playwright observation JSON invalid: %w", err)
 	}
-	return sanitizeObservation(observation), nil
+	return observation, nil
 }
 
 func pathWithinRoot(path, root string) bool {
