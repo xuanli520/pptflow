@@ -18,7 +18,7 @@ docker:
     managed_label: managed_by=p2rqa
 pipeline:                                                                                                
     default_stages:                                                                                                 
-        initial: [A, D, F]                                                                                            
+        initial: [A, D, F, B, G, C]                                                                                            
         recheck: [F]
     max_concurrent: 10
     self_test_report_path: repo/self_test_report.md
