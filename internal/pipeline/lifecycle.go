@@ -15,25 +15,90 @@ func (r Runner) markRunCrashed(ctx context.Context, run model.RunRecord, start t
 }
 
 func (r Runner) crashRun(ctx context.Context, run model.RunRecord, start time.Time, stages []model.StageRecord, runtime RuntimeState, keepRuntime bool, runtimeCleanupDone bool, reason string) error {
+	return r.finishTerminalRun(ctx, terminalRunRequest{
+		Run:                run,
+		Started:            start,
+		Stages:             stages,
+		Runtime:            runtime,
+		KeepRuntime:        keepRuntime,
+		RuntimeCleanupDone: runtimeCleanupDone,
+		Status:             model.RunCrashed,
+		SummaryFile:        "crash_summary.json",
+		CleanupReason:      "crash",
+		DefaultReason:      "pipeline exited before finishing the run",
+		Reason:             reason,
+	})
+}
+
+func (r Runner) abortRun(ctx context.Context, run model.RunRecord, start time.Time, stages []model.StageRecord, runtime RuntimeState, keepRuntime bool, runtimeCleanupDone bool, reason string) error {
+	return r.finishTerminalRun(ctx, terminalRunRequest{
+		Run:                run,
+		Started:            start,
+		Stages:             stages,
+		Runtime:            runtime,
+		KeepRuntime:        keepRuntime,
+		RuntimeCleanupDone: runtimeCleanupDone,
+		Status:             model.RunAborted,
+		SummaryFile:        "abort_summary.json",
+		CleanupReason:      "abort",
+		DefaultReason:      "pipeline aborted before finishing the run",
+		Reason:             reason,
+	})
+}
+
+type terminalRunRequest struct {
+	Run                model.RunRecord
+	Started            time.Time
+	Stages             []model.StageRecord
+	Runtime            RuntimeState
+	KeepRuntime        bool
+	RuntimeCleanupDone bool
+	Status             string
+	SummaryFile        string
+	CleanupReason      string
+	DefaultReason      string
+	Reason             string
+}
+
+func (r Runner) finishTerminalRun(ctx context.Context, request terminalRunRequest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reason := request.Reason
 	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = strings.TrimSpace(request.DefaultReason)
+	}
 	if reason == "" {
 		reason = "pipeline exited before finishing the run"
 	}
+	status := strings.TrimSpace(request.Status)
+	if status == "" {
+		status = model.RunCrashed
+	}
+	summaryFile := strings.TrimSpace(request.SummaryFile)
+	if summaryFile == "" {
+		summaryFile = "terminal_summary.json"
+	}
+	cleanupReason := strings.TrimSpace(request.CleanupReason)
+	if cleanupReason == "" {
+		cleanupReason = status
+	}
 	saveErrors := []error{}
 	cleanupStatus := "not_applicable"
-	if runtimeCleanupDone {
+	if request.RuntimeCleanupDone {
 		cleanupStatus = "already_done"
-	} else if runtimeStageWasSelected(stages) {
+	} else if runtimeStageWasSelected(request.Stages) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cleanup := r.finalizeRuntime(cleanupCtx, run, stages, runtime, keepRuntime, "crash")
+		cleanup := r.finalizeRuntime(cleanupCtx, request.Run, request.Stages, request.Runtime, request.KeepRuntime, cleanupReason)
 		cleanupCancel()
 		cleanupStatus = cleanup.Summary.Status
 		saveErrors = append(saveErrors, cleanup.PersistErrors...)
 	}
-	if err := NewArtifactWriter(run.ArtifactRoot).RequiredJSON("crash_summary.json", map[string]any{
-		"run_id":         run.RunID,
-		"task_id":        run.TaskID,
-		"status":         model.RunCrashed,
+	if err := NewArtifactWriter(request.Run.ArtifactRoot).RequiredJSON(summaryFile, map[string]any{
+		"run_id":         request.Run.RunID,
+		"task_id":        request.Run.TaskID,
+		"status":         status,
 		"reason":         reason,
 		"save_errors":    cleanupPersistErrorStrings(cleanupOutcome{PersistErrors: saveErrors}),
 		"cleanup_status": cleanupStatus,
@@ -41,10 +106,10 @@ func (r Runner) crashRun(ctx context.Context, run model.RunRecord, start time.Ti
 	}); err != nil {
 		saveErrors = append(saveErrors, err)
 	}
-	saveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := r.store.FinishRun(saveCtx, run.RunID, run.TaskID, model.RunCrashed, time.Since(start)); err != nil {
-		saveErrors = append(saveErrors, fmt.Errorf("finish crashed run: %w", err))
+	if err := r.store.FinishRun(saveCtx, request.Run.RunID, request.Run.TaskID, status, time.Since(request.Started)); err != nil {
+		saveErrors = append(saveErrors, fmt.Errorf("finish %s run: %w", status, err))
 	}
 	return errors.Join(saveErrors...)
 }

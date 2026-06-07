@@ -22,6 +22,15 @@ type taskRunLock struct {
 	file *os.File
 }
 
+type taskRunLockStatus struct {
+	Path    string
+	Exists  bool
+	PID     int
+	TaskID  string
+	Stale   bool
+	ReadErr error
+}
+
 type cleanupOutcome struct {
 	Summary            dockermgr.CleanupSummary
 	Finding            *model.Finding
@@ -281,10 +290,21 @@ func safeLockName(taskID string) string {
 }
 
 func staleTaskRunLock(path string) bool {
+	return readTaskRunLockStatus(path).Stale
+}
+
+func taskRunLockStatusForTask(scanPath, taskID string) taskRunLockStatus {
+	return readTaskRunLockStatus(taskRunLockPath(scanPath, taskID))
+}
+
+func readTaskRunLockStatus(path string) taskRunLockStatus {
+	status := taskRunLockStatus{Path: path}
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		status.ReadErr = err
+		return status
 	}
+	status.Exists = true
 	values := map[string]string{}
 	for _, line := range strings.Split(string(content), "\n") {
 		key, value, ok := strings.Cut(line, "=")
@@ -292,11 +312,14 @@ func staleTaskRunLock(path string) bool {
 			values[strings.TrimSpace(key)] = strings.TrimSpace(value)
 		}
 	}
+	status.TaskID = values["task_id"]
 	pid, err := strconv.Atoi(values["pid"])
 	if err != nil || pid <= 0 {
-		return false
+		return status
 	}
-	return !processAlive(pid)
+	status.PID = pid
+	status.Stale = !processAlive(pid)
+	return status
 }
 
 func mergeCleanupIntoManifest(path string, key string, value any) error {

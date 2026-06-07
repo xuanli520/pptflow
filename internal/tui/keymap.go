@@ -238,7 +238,9 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			return m, cmds
 		}
 	case "ctrl+x":
-		m.openCancelConfirm()
+		if cmd := m.openCancelConfirm(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		return m, cmds
 	case "ctrl+r":
 		if m.focus == focusTaskInput && m.openRunConfigForTaskInput() {
@@ -684,19 +686,43 @@ func (m *app) openRunConfigForTaskInput() bool {
 	return true
 }
 
-func (m *app) openCancelConfirm() {
+func (m *app) openCancelConfirm() tea.Cmd {
 	taskID := m.selectedTaskID()
 	if taskID == "" {
 		m.message = "没有选中的任务"
-		return
+		return nil
 	}
 	job, ok := m.activeJobForTask(taskID)
 	if !ok {
+		if m.selectedTaskHasPersistedRunningRun(taskID) && m.recoverOrphanRunFn != nil {
+			m.message = "正在检查失联运行 " + taskID
+			return m.recoverOrphanRunCmd(taskID)
+		}
 		m.message = "该任务没有排队或运行中的作业"
-		return
+		return nil
 	}
 	m.confirmCancelTaskID = taskID
 	m.confirmCancelJobID = job.JobID
+	return nil
+}
+
+func (m app) selectedTaskHasPersistedRunningRun(taskID string) bool {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return false
+	}
+	if m.detailVM.TaskID == taskID && m.detailVM.Run.Status == model.RunRunning {
+		return true
+	}
+	if item, ok := m.overview.ItemByTaskID(taskID); ok && item.RunStatus == model.RunRunning {
+		return true
+	}
+	if m.taskBoard != nil {
+		if task, ok := m.taskBoard.SelectedTask(); ok && task.ID == taskID {
+			return task.RunStatus == model.RunRunning || task.CurrentStatus == model.StageRunning
+		}
+	}
+	return false
 }
 
 func footerFor(m app) string {

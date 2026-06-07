@@ -190,6 +190,11 @@ func (h TestHarness) ApplySchedulerNotifyForTest() (TestHarness, int) {
 	return h, len(cmds)
 }
 
+func (h TestHarness) WithOrphanRunRecoveryForTest(fn func(context.Context, string) (pipeline.RecoveryResult, error)) TestHarness {
+	h.model.recoverOrphanRunFn = fn
+	return h
+}
+
 func (h TestHarness) ApplyStartupDockerCheckForTest(count int, err error) TestHarness {
 	model := cloneAppForTest(h.model)
 	next, _ := model.Update(startupDockerCheckMsg{count: count, err: err})

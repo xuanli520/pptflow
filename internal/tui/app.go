@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -29,6 +30,8 @@ const (
 	staleRunRecoveryInterval      = 30 * time.Second
 	persistedStateRefreshInterval = 2 * time.Second
 	dockerHealthRefreshInterval   = 15 * time.Second
+	schedulerExitShutdownTimeout  = 45 * time.Second
+	orphanRunRecoveryTimeout      = 30 * time.Second
 )
 
 type app struct {
@@ -36,6 +39,7 @@ type app struct {
 	cfg                config.Config
 	scheduler          schedulerClient
 	recoverStaleRunsFn func(context.Context) error
+	recoverOrphanRunFn func(context.Context, string) (pipeline.RecoveryResult, error)
 	taskQuerySvc       TaskQueryService
 	taskActionSvc      TaskActionService
 	poller             *schedulerPoller
@@ -134,6 +138,12 @@ type recoveryMsg struct {
 	err error
 }
 
+type orphanRunRecoveryMsg struct {
+	taskID string
+	result pipeline.RecoveryResult
+	err    error
+}
+
 type taskActionMsg struct {
 	action string
 	taskID string
@@ -191,9 +201,7 @@ func Start(store *db.Store, cfg config.Config) error {
 		if m.scheduler == nil {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = m.scheduler.Shutdown(ctx)
+		_ = shutdownSchedulerForExit(context.Background(), m.scheduler, store, cfg, "TUI exited before cancellation could be persisted")
 	}()
 	program := tea.NewProgram(m, tea.WithAltScreen())
 	stopSignalCleanup := registerSignalCleanup(store, cfg, m.scheduler)
@@ -243,11 +251,39 @@ func cleanupForSignal(store *db.Store, cfg config.Config, scheduler schedulerCli
 			_ = store.MarkTaskDockerStopped(ctx, taskID)
 		}
 	}
-	if scheduler != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shutdownCancel()
-		_ = scheduler.Shutdown(shutdownCtx)
+	_ = shutdownSchedulerForExit(ctx, scheduler, store, cfg, "TUI received interrupt before cancellation could be persisted")
+}
+
+func shutdownSchedulerForExit(ctx context.Context, scheduler schedulerClient, store *db.Store, cfg config.Config, reason string) error {
+	if scheduler == nil {
+		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refs := schedulerRunReferences(scheduler.ActiveSnapshot())
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, schedulerExitShutdownTimeout)
+	shutdownErr := scheduler.Shutdown(shutdownCtx)
+	shutdownCancel()
+	if shutdownErr == nil || store == nil || len(refs) == 0 {
+		return shutdownErr
+	}
+	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), orphanRunRecoveryTimeout)
+	defer recoverCancel()
+	_, recoverErr := pipeline.RecoverInterruptedRuns(recoverCtx, store, cfg, refs, reason)
+	repairErr := store.RepairTaskStates(recoverCtx)
+	return errors.Join(shutdownErr, recoverErr, repairErr)
+}
+
+func schedulerRunReferences(jobs []scheduler.JobSnapshot) []pipeline.RunReference {
+	refs := make([]pipeline.RunReference, 0, len(jobs))
+	for _, job := range jobs {
+		switch job.State {
+		case scheduler.JobQueued, scheduler.JobRunning:
+			refs = append(refs, pipeline.RunReference{RunID: job.RunID, TaskID: job.TaskID})
+		}
+	}
+	return refs
 }
 
 func signalExitCode(sig os.Signal) int {
@@ -285,10 +321,15 @@ func newApp(store *db.Store, cfg config.Config) app {
 		m.store = store
 		m.scheduler = scheduler.New(store, cfg)
 		m.recoverStaleRunsFn = func(ctx context.Context) error {
-			if err := pipeline.RecoverStaleRuns(ctx, store, cfg); err != nil {
-				return err
-			}
-			return store.RepairTaskStates(ctx)
+			_, orphanErr := pipeline.RecoverOrphanedRuns(ctx, store, cfg)
+			staleErr := pipeline.RecoverStaleRuns(ctx, store, cfg)
+			repairErr := store.RepairTaskStates(ctx)
+			return errors.Join(orphanErr, staleErr, repairErr)
+		}
+		m.recoverOrphanRunFn = func(ctx context.Context, taskID string) (pipeline.RecoveryResult, error) {
+			result, recoverErr := pipeline.RecoverOrphanedRunForTask(ctx, store, cfg, taskID)
+			repairErr := store.RepairTaskStates(ctx)
+			return result, errors.Join(recoverErr, repairErr)
 		}
 		m.taskQuerySvc = newTaskQueryService(store, cfg)
 		m.taskActionSvc = newTaskActionService(store, cfg, m.scheduler)
@@ -610,6 +651,16 @@ func (m *app) handleRecoveryMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 			m.message = value.err.Error()
 		}
 		return true
+	case orphanRunRecoveryMsg:
+		if value.err != nil {
+			m.message = "失联运行回收失败 " + value.taskID + ": " + value.err.Error()
+		} else if value.result.Count() == 0 {
+			m.message = "未发现可回收的失联运行 " + value.taskID
+		} else {
+			m.message = "已回收失联运行 " + value.taskID
+		}
+		*cmds = append(*cmds, m.reload(), m.reloadSchedulerJobs())
+		return true
 	case tickMsg:
 		*cmds = append(*cmds, m.poller.HandleTick(*m, time.Time(value))...)
 		return true
@@ -834,6 +885,19 @@ func (m app) recoverStaleRunsCmd() tea.Cmd {
 	}
 }
 
+func (m app) recoverOrphanRunCmd(taskID string) tea.Cmd {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" || m.recoverOrphanRunFn == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), orphanRunRecoveryTimeout)
+		defer cancel()
+		result, err := m.recoverOrphanRunFn(ctx, taskID)
+		return orphanRunRecoveryMsg{taskID: taskID, result: result, err: err}
+	}
+}
+
 func (m app) recoverOrphanInspectionCmd() tea.Cmd {
 	store, ok := m.store.(taskStateStore)
 	if !ok || store == nil || m.scheduler == nil || m.taskQuerySvc == nil {
@@ -962,6 +1026,7 @@ func (m app) prepareQuitCmd() tea.Cmd {
 func (m app) quitCleanupCmd(force bool, tasks []TaskProject) tea.Cmd {
 	cfg := m.cfg
 	scheduler := m.scheduler
+	recoveryStore, _ := m.store.(*db.Store)
 	stopStore, _ := m.store.(interface {
 		MarkTaskDockerStopped(context.Context, string) error
 	})
@@ -980,11 +1045,7 @@ func (m app) quitCleanupCmd(force bool, tasks []TaskProject) tea.Cmd {
 		} else {
 			err = LightExitCleanup(ctx, cfg)
 		}
-		if scheduler != nil {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = scheduler.Shutdown(shutdownCtx)
-			shutdownCancel()
-		}
+		err = errors.Join(err, shutdownSchedulerForExit(ctx, scheduler, recoveryStore, cfg, "TUI quit before cancellation could be persisted"))
 		return quitAfterCleanupMsg{err: err}
 	}
 }
@@ -1023,10 +1084,9 @@ func (m app) shutdownScheduler() tea.Cmd {
 	if m.scheduler == nil {
 		return nil
 	}
+	recoveryStore, _ := m.store.(*db.Store)
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = m.scheduler.Shutdown(ctx)
+		_ = shutdownSchedulerForExit(context.Background(), m.scheduler, recoveryStore, m.cfg, "TUI exited before cancellation could be persisted")
 		return nil
 	}
 }

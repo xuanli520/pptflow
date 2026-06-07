@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
@@ -462,6 +463,19 @@ func TestCtrlXWithoutActiveJobAndRunConfigPriority(t *testing.T) {
 	next, result := h.Press("ctrl+x")
 	if !next.Confirm() || result.CmdCount != 0 || next.Message() != "请先关闭运行配置再终止作业" {
 		t.Fatalf("ctrl+x should not pass through run config, confirm=%v cmds=%d message=%q", next.Confirm(), result.CmdCount, next.Message())
+	}
+}
+
+func TestCtrlXWithPersistedRunningRunStartsOrphanRecovery(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{{Stage: "C", Status: model.StageRunning}}, "C").
+		WithOrphanRunRecoveryForTest(func(context.Context, string) (pipeline.RecoveryResult, error) {
+			return pipeline.RecoveryResult{}, nil
+		})
+
+	next, result := h.Press("ctrl+x")
+	if next.CancelConfirm() || result.CmdCount != 1 || next.Message() != "正在检查失联运行 TASK-1" {
+		t.Fatalf("ctrl+x should start orphan recovery, cancel=%v cmds=%d message=%q", next.CancelConfirm(), result.CmdCount, next.Message())
 	}
 }
 

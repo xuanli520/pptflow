@@ -92,6 +92,104 @@ func TestRecoverStaleRunsLeavesFreshRunningRunAlone(t *testing.T) {
 	}
 }
 
+func TestRecoverOrphanedRunsMarksFreshLocklessRunCrashed(t *testing.T) {
+	store, cfg, artifactRoot := recoveryStore(t)
+	ctx := context.Background()
+	started := time.Now().UTC().Format(time.RFC3339)
+	run := model.RunRecord{
+		RunID:         "run-orphan",
+		TaskID:        "TASK-1",
+		StartedAt:     started,
+		Status:        model.RunRunning,
+		ManualVerdict: model.ManualUnset,
+		ArtifactRoot:  artifactRoot,
+	}
+	if err := store.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStage(ctx, run.RunID, model.StageRecord{Stage: "C", Status: model.StageRunning, StartedAt: started}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactRoot, "run_manifest.json"), []byte(`{"stages":["C"],"stage_timeouts":{"C":600}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipelinepkg.RecoverOrphanedRuns(ctx, store, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count() != 1 || result.RunIDs[0] != run.RunID {
+		t.Fatalf("recovery result = %#v, want recovered %s", result, run.RunID)
+	}
+	got, err := store.GetRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.RunCrashed || got.FinishedAt == "" {
+		t.Fatalf("run status = %s finished=%q, want crashed with finish time", got.Status, got.FinishedAt)
+	}
+	stages, err := store.Stages(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageC := findStage(stages, "C")
+	if stageC.Status != model.StageFailed || !strings.Contains(stageC.ErrorSummary, "运行锁不存在") {
+		t.Fatalf("stage C not recovered from missing lock: %#v", stageC)
+	}
+	if _, err := os.Stat(filepath.Join(artifactRoot, "crash_summary.json")); err != nil {
+		t.Fatalf("crash summary missing: %v", err)
+	}
+}
+
+func TestRecoverInterruptedRunsMarksActiveRunAborted(t *testing.T) {
+	store, cfg, artifactRoot := recoveryStore(t)
+	ctx := context.Background()
+	started := time.Now().UTC().Format(time.RFC3339)
+	run := model.RunRecord{
+		RunID:         "run-interrupted",
+		TaskID:        "TASK-1",
+		StartedAt:     started,
+		Status:        model.RunRunning,
+		ManualVerdict: model.ManualUnset,
+		ArtifactRoot:  artifactRoot,
+	}
+	if err := store.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutStage(ctx, run.RunID, model.StageRecord{Stage: "D", Status: model.StageRunning, StartedAt: started}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactRoot, "run_manifest.json"), []byte(`{"stages":["D"],"stage_timeouts":{"D":600}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipelinepkg.RecoverInterruptedRuns(ctx, store, cfg, []pipelinepkg.RunReference{{RunID: run.RunID, TaskID: run.TaskID}}, "operator interrupted the TUI")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count() != 1 || result.RunIDs[0] != run.RunID {
+		t.Fatalf("recovery result = %#v, want recovered %s", result, run.RunID)
+	}
+	got, err := store.GetRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.RunAborted || got.FinishedAt == "" {
+		t.Fatalf("run status = %s finished=%q, want aborted with finish time", got.Status, got.FinishedAt)
+	}
+	stages, err := store.Stages(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageD := findStage(stages, "D")
+	if stageD.Status != model.StageFailed || !strings.Contains(stageD.ErrorSummary, "operator interrupted") {
+		t.Fatalf("stage D not marked failed with interrupt reason: %#v", stageD)
+	}
+	if _, err := os.Stat(filepath.Join(artifactRoot, "abort_summary.json")); err != nil {
+		t.Fatalf("abort summary missing: %v", err)
+	}
+}
+
 func TestRecoverStaleRunsCleansRuntimeFromPortMap(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake docker shell script is POSIX-only")
