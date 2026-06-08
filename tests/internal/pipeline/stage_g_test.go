@@ -971,6 +971,26 @@ func TestStageGPassedSummarySuppressesRecoveredActionFailures(t *testing.T) {
 	}
 }
 
+func TestStageGValidFinishWithFindingsIsStageDone(t *testing.T) {
+	record := model.StageRecord{
+		Stage:  string(model.StageG),
+		Status: model.StageRunning,
+		Findings: []model.Finding{{
+			Stage:    string(model.StageG),
+			Severity: "High",
+			Title:    "login workflow failed",
+		}},
+	}
+	if status := pipelinepkg.StageGFinishedStatusForTest(record); status != model.StageDone {
+		t.Fatalf("valid Stage G finish with findings status = %s, want done", status)
+	}
+	record.Status = model.StageFailed
+	record.ErrorSummary = "write required artifact frontend_e2e_report.md: permission denied"
+	if status := pipelinepkg.StageGFinishedStatusForTest(record); status != model.StageFailed {
+		t.Fatalf("artifact write failure status = %s, want failed", status)
+	}
+}
+
 func TestStageGLogObservationIncludesNetworkEvidence(t *testing.T) {
 	log := pipelinepkg.StageGLogObservationForTest(4, pipelinepkg.TestBrowserObservation{
 		Action:     "click_button",

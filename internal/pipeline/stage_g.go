@@ -251,13 +251,7 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 				summary.Findings = append(summary.Findings, frontendE2EFindingFromModel(finding))
 			}
 			record = r.writeStageGArtifacts(record, writer, summary, observations)
-			status := model.StageDone
-			if summary.Status != "passed" && summary.Status != "not_applicable" || len(record.Findings) > 0 {
-				status = model.StageFailed
-				if record.ErrorSummary == "" {
-					record.ErrorSummary = "frontend E2E findings"
-				}
-			}
+			status := stageGFinishedStatus(record)
 			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogFinish(summary.Status, record.ErrorSummary, len(observations), len(record.Findings)))
 			return finishStage(record, status, start)
 		}
@@ -307,6 +301,13 @@ func stageGPlannerTimedOut(ctx context.Context, err error) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded")
+}
+
+func stageGFinishedStatus(record model.StageRecord) string {
+	if record.Status == model.StageFailed {
+		return model.StageFailed
+	}
+	return model.StageDone
 }
 
 func stageGNodePath(result preflight.CheckResult) string {

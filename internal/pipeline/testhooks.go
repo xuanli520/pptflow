@@ -461,6 +461,10 @@ func StageGLogObservationForTest(round int, observation TestBrowserObservation) 
 	return stageGLogObservation(round, observation)
 }
 
+func StageGFinishedStatusForTest(record model.StageRecord) string {
+	return stageGFinishedStatus(record)
+}
+
 func StageGFinishScreenshotBlockReasonForTest(observations []TestBrowserObservation) string {
 	return stageGFinishScreenshotBlockReason(observations)
 }
