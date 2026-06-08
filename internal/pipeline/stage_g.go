@@ -22,6 +22,8 @@ const stageGMaxActions = 30
 const stageGMaxInvalidActions = 3
 const stageGMinBrowserScreenshots = 5
 const stageGMaxBrowserScreenshots = 10
+const stageGAuthGateSubmitStallLimit = 2
+const stageGRepeatedStateStallLimit = 7
 const stageGBrowserProfileName = "frontend_e2e_browser.md"
 const stageGBrowserActionPromptTemplateName = "frontend_e2e_browser_action_prompt.md"
 const stageGLegacyScreenshotName = "frontend_e2e_screenshot.png"
@@ -290,6 +292,9 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 		bestEffortStageJSON(&record, writer, writer.RelativePath(observationsPath), observations)
 		bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogObservation(round, observation))
 		appendStreamProgress(sc.Run.RunID, string(model.StageG), fmt.Sprintf("G action %d: %s -> ok=%t", round, validation.Action.Action, observation.OK), "p2r", false, sc.Progress)
+		if reason := stageGObservationStopReason(observations); reason != "" {
+			return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, reason)
+		}
 	}
 	return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G reached the maximum browser action count.")
 }
@@ -405,6 +410,9 @@ func stageGSummaryCanFinishWithLimitedScreenshots(summary FrontendE2ESummary, ob
 	}
 	if len(summary.Findings) == 0 {
 		return false
+	}
+	if stageGAuthGateStallEvidence(observations) != "" {
+		return true
 	}
 	for index := range observations {
 		if stageGObservationHasProductFailureEvidenceAt(index, observations) {
@@ -997,6 +1005,18 @@ func stageGPartialProductBlockerFinding(observations []browserpkg.Observation, r
 			SourcePath: "frontend_e2e_observations.json",
 		}, true
 	}
+	if evidence := stageGAuthGateStallEvidence(observations); evidence != "" {
+		return model.Finding{
+			Stage:      string(model.StageG),
+			Severity:   "High",
+			Title:      "Authentication gate prevented browser workflow coverage",
+			Rule:       "README-provided local credentials or safe registration paths should allow Stage G to reach authenticated browser workflows, or the app should expose deterministic test authentication.",
+			Evidence:   evidence + " " + strings.TrimSpace(reason),
+			Impact:     "Stage G cannot verify the authenticated product workflow from the browser UI.",
+			MinimumFix: "Provide deterministic E2E credentials or a test-mode auth bypass, and ensure successful login redirects to the documented product workflow.",
+			SourcePath: "frontend_e2e_observations.json",
+		}, true
+	}
 	for index := range observations {
 		if stageGObservationHasProductFailureEvidenceAt(index, observations) {
 			observation := observations[index]
@@ -1013,6 +1033,16 @@ func stageGPartialProductBlockerFinding(observations []browserpkg.Observation, r
 		}
 	}
 	return model.Finding{}, false
+}
+
+func stageGObservationStopReason(observations []browserpkg.Observation) string {
+	if stageGAuthGateStallEvidence(observations) != "" {
+		return "Stage G stopped after repeated authentication-gate attempts did not reach a product workflow."
+	}
+	if evidence := stageGRepeatedStateStallEvidence(observations); evidence != "" {
+		return "Stage G stopped after repeated unchanged browser observations. " + evidence
+	}
+	return ""
 }
 
 func stageGAuthGateBlockerEvidence(observations []browserpkg.Observation) string {
@@ -1057,6 +1087,191 @@ func stageGAuthGateBlockerEvidence(observations []browserpkg.Observation) string
 		evidence += fmt.Sprintf(" Repeated auth/register selector attempts failed %d time(s).", registerSelectorFailures)
 	}
 	return evidence
+}
+
+func stageGAuthGateStallEvidence(observations []browserpkg.Observation) string {
+	if stageGObservedAuthSuccess(observations) || len(observations) == 0 {
+		return ""
+	}
+	last := observations[len(observations)-1]
+	if !stageGObservationLooksAuthGate(last) {
+		return ""
+	}
+	submits := 0
+	authGateObservations := 0
+	credentialEvidence := false
+	for _, observation := range observations {
+		if !stageGObservationLooksAuthGate(observation) {
+			continue
+		}
+		authGateObservations++
+		if stageGObservationHasCredentialEvidence(observation) {
+			credentialEvidence = true
+		}
+		if stageGObservationLooksInputAttempt(observation) {
+			credentialEvidence = true
+		}
+		if stageGObservationLooksSubmitAttempt(observation) {
+			submits++
+		}
+	}
+	if submits < stageGAuthGateSubmitStallLimit || !credentialEvidence {
+		return ""
+	}
+	target := strings.TrimSpace(last.CurrentURL)
+	if target == "" {
+		target = "the login/register UI"
+	}
+	return fmt.Sprintf("Browser remained on %s after %d credentialed submit attempt(s) across %d auth-gate observation(s), with no successful auth transition observed.", target, submits, authGateObservations)
+}
+
+func stageGRepeatedStateStallEvidence(observations []browserpkg.Observation) string {
+	if len(observations) < stageGRepeatedStateStallLimit {
+		return ""
+	}
+	last := observations[len(observations)-1]
+	lastKey := stageGObservationStateKey(last)
+	if lastKey == "" {
+		return ""
+	}
+	if stageGObservationLooksAuthGate(last) {
+		return ""
+	}
+	sameState := 0
+	activeActions := 0
+	for index := len(observations) - 1; index >= 0; index-- {
+		if stageGObservationStateKey(observations[index]) != lastKey {
+			break
+		}
+		sameState++
+		if stageGObservationCountsAsProgressAttempt(observations[index]) {
+			activeActions++
+		}
+	}
+	if sameState < stageGRepeatedStateStallLimit || activeActions < 2 {
+		return ""
+	}
+	target := strings.TrimSpace(last.CurrentURL)
+	if target == "" {
+		target = strings.TrimSpace(last.Title)
+	}
+	if target == "" {
+		target = "the same browser state"
+	}
+	return fmt.Sprintf("Browser stayed at %s with unchanged visible state for %d consecutive observation(s) after %d progress attempt(s).", target, sameState, activeActions)
+}
+
+func stageGObservedAuthSuccess(observations []browserpkg.Observation) bool {
+	for _, observation := range observations {
+		if stageGObservationLooksAuthenticated(observation) {
+			return true
+		}
+		for _, event := range observation.NetworkEvents {
+			if strings.ToUpper(strings.TrimSpace(event.Method)) == "POST" &&
+				event.Status >= 200 && event.Status < 400 &&
+				stageGNetworkURLLooksAuth(event.URL) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stageGObservationLooksAuthGate(observation browserpkg.Observation) bool {
+	urlValue := strings.ToLower(strings.TrimSpace(observation.CurrentURL))
+	for _, marker := range []string{"/login", "/signin", "/sign-in", "/register", "/signup", "/sign-up", "/auth"} {
+		if strings.Contains(urlValue, marker) {
+			return true
+		}
+	}
+	text := strings.ToLower(strings.TrimSpace(observation.VisibleText))
+	if text == "" {
+		return false
+	}
+	if strings.Contains(text, "captcha") {
+		return true
+	}
+	hasPassword := strings.Contains(text, "password") || stageGObservationHasPasswordControl(observation)
+	hasAuthLabel := strings.Contains(text, "login") ||
+		strings.Contains(text, "log in") ||
+		strings.Contains(text, "sign in") ||
+		strings.Contains(text, "signin") ||
+		strings.Contains(text, "register") ||
+		strings.Contains(text, "create account")
+	return hasPassword && hasAuthLabel && !stageGObservationLooksAuthenticated(observation)
+}
+
+func stageGObservationLooksAuthenticated(observation browserpkg.Observation) bool {
+	urlValue := strings.ToLower(strings.TrimSpace(observation.CurrentURL))
+	for _, marker := range []string{"/dashboard", "/app", "/studio", "/account", "/profile", "/orders", "/cart", "/analytics", "/catalog"} {
+		if strings.Contains(urlValue, marker) {
+			return true
+		}
+	}
+	text := strings.ToLower(strings.TrimSpace(observation.VisibleText))
+	if text == "" {
+		return false
+	}
+	for _, marker := range []string{"dashboard", "logout", "log out", "sign out", "user management"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGObservationHasCredentialEvidence(observation browserpkg.Observation) bool {
+	hasPasswordValue := false
+	hasAccountValue := false
+	for _, control := range observation.Controls {
+		if !control.HasValue {
+			continue
+		}
+		target := strings.ToLower(strings.Join([]string{control.Role, control.Text, control.Name, control.Placeholder, control.Type}, " "))
+		if strings.Contains(target, "password") || strings.Contains(target, "passwd") {
+			hasPasswordValue = true
+			continue
+		}
+		for _, marker := range []string{"email", "user", "username", "account", "login"} {
+			if strings.Contains(target, marker) {
+				hasAccountValue = true
+				break
+			}
+		}
+	}
+	return hasPasswordValue && hasAccountValue
+}
+
+func stageGObservationHasPasswordControl(observation browserpkg.Observation) bool {
+	for _, control := range observation.Controls {
+		target := strings.ToLower(strings.Join([]string{control.Role, control.Text, control.Name, control.Placeholder, control.Type}, " "))
+		if strings.Contains(target, "password") || strings.Contains(target, "passwd") {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGObservationLooksInputAttempt(observation browserpkg.Observation) bool {
+	return strings.TrimSpace(observation.Action) == "fill_input"
+}
+
+func stageGObservationLooksSubmitAttempt(observation browserpkg.Observation) bool {
+	switch strings.TrimSpace(observation.Action) {
+	case "click_button", "submit_local_form":
+		return true
+	default:
+		return false
+	}
+}
+
+func stageGObservationCountsAsProgressAttempt(observation browserpkg.Observation) bool {
+	switch strings.TrimSpace(observation.Action) {
+	case "open_candidate", "click_button", "submit_local_form", "click_navigation", "go_back":
+		return true
+	default:
+		return false
+	}
 }
 
 func stageGPartialFailureEvidence(index int, observation browserpkg.Observation, reason string) string {

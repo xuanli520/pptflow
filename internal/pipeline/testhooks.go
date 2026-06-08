@@ -473,6 +473,18 @@ func StageGPartialProductBlockerFindingForTest(observations []TestBrowserObserva
 	return stageGPartialProductBlockerFinding(observations, reason)
 }
 
+func StageGObservationStopReasonForTest(observations []TestBrowserObservation) string {
+	return stageGObservationStopReason(observations)
+}
+
+func StageGAuthGateStallEvidenceForTest(observations []TestBrowserObservation) string {
+	return stageGAuthGateStallEvidence(observations)
+}
+
+func StageGRepeatedStateStallEvidenceForTest(observations []TestBrowserObservation) string {
+	return stageGRepeatedStateStallEvidence(observations)
+}
+
 func StageGKeyScreenshotObservationIndexesForTest(observations []TestBrowserObservation) []int {
 	return stageGKeyScreenshotObservationIndexes(observations)
 }

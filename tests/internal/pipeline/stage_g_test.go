@@ -332,6 +332,68 @@ func TestStageGFinishAllowsLimitedScreenshotsForProductBlocker(t *testing.T) {
 	}
 }
 
+func TestStageGFinishAllowsLimitedScreenshotsForAuthGateStall(t *testing.T) {
+	root := t.TempDir()
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:         "open_candidate",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "AvatarForge Studio Sign In Email Password",
+			Controls:       loginControls(false, false),
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "open.png")),
+		},
+		{
+			Action:      "fill_input",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(true, false),
+		},
+		{
+			Action:      "fill_input",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(true, true),
+		},
+		{
+			Action:         "click_button",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "AvatarForge Studio Sign In Email Password",
+			Controls:       loginControls(true, true),
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "submit-1.png")),
+		},
+		{
+			Action:         "collect_network",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "AvatarForge Studio Sign In Email Password",
+			Controls:       loginControls(true, true),
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "network-1.png")),
+		},
+		{
+			Action:         "click_button",
+			OK:             true,
+			CurrentURL:     "http://127.0.0.1:5173/login",
+			VisibleText:    "AvatarForge Studio Sign In Email Password",
+			Controls:       loginControls(true, true),
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "submit-2.png")),
+		},
+	}
+	summary := pipelinepkg.TestFrontendE2ESummary{
+		Status: "failed",
+		Findings: []pipelinepkg.FrontendE2EFinding{{
+			Severity: "High",
+			Title:    "Login never reaches the dashboard",
+		}},
+	}
+	if reason := pipelinepkg.StageGFinishScreenshotBlockReasonForSummaryForTest(summary, observations); reason != "" {
+		t.Fatalf("auth-gate stall should allow limited screenshot finish, got %q", reason)
+	}
+}
+
 func TestStageGPartialProductBlockerFindingDetectsAuthGate(t *testing.T) {
 	loginURL := "http://127.0.0.1:5173/api/auth/login"
 	observations := []pipelinepkg.TestBrowserObservation{
@@ -373,6 +435,124 @@ func TestStageGPartialProductBlockerFindingDetectsAuthGate(t *testing.T) {
 	})
 	if finding, ok := pipelinepkg.StageGPartialProductBlockerFindingForTest(observations, "timeout"); ok {
 		t.Fatalf("recovered auth failure should not be a blocker: %#v", finding)
+	}
+}
+
+func TestStageGPartialProductBlockerFindingDetectsAuthGateStall(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:      "open_candidate",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(false, false),
+		},
+		{
+			Action:      "fill_input",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(true, false),
+		},
+		{
+			Action:      "fill_input",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(true, true),
+		},
+		{
+			Action:      "click_button",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(true, true),
+		},
+		{
+			Action:      "collect_network",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(true, true),
+		},
+		{
+			Action:      "click_button",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/login",
+			VisibleText: "AvatarForge Studio Sign In Email Password",
+			Controls:    loginControls(true, true),
+		},
+	}
+	finding, ok := pipelinepkg.StageGPartialProductBlockerFindingForTest(observations, "Stage G stopped after repeated authentication-gate attempts.")
+	if !ok {
+		t.Fatal("expected auth-gate stall product blocker finding")
+	}
+	if finding.Title != "Authentication gate prevented browser workflow coverage" || !strings.Contains(finding.Evidence, "2 credentialed submit attempt") {
+		t.Fatalf("unexpected finding: %#v", finding)
+	}
+	if reason := pipelinepkg.StageGObservationStopReasonForTest(observations); !strings.Contains(reason, "authentication-gate") {
+		t.Fatalf("expected auth-gate stop reason, got %q", reason)
+	}
+}
+
+func TestStageGRepeatedStateStallIgnoresAuthGateBeforeSubmitLimit(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{Action: "open_candidate", OK: true, Controls: loginControls(false, false)},
+		{Action: "fill_input", OK: true, Controls: loginControls(true, false)},
+		{Action: "fill_input", OK: true, Controls: loginControls(true, true)},
+		{Action: "fill_input", OK: true, Controls: loginControls(true, true)},
+		{Action: "fill_input", OK: true, Controls: loginControls(true, true)},
+		{Action: "click_button", OK: true, Controls: loginControls(true, true)},
+		{Action: "collect_network", OK: true, Controls: loginControls(true, true)},
+	}
+	for index := range observations {
+		observations[index].CurrentURL = "http://127.0.0.1:5173/login"
+		observations[index].VisibleText = "AvatarForge Studio Sign In Email Password"
+	}
+	if evidence := pipelinepkg.StageGRepeatedStateStallEvidenceForTest(observations); evidence != "" {
+		t.Fatalf("auth gate should wait for the dedicated submit stall rule, got %q", evidence)
+	}
+	if reason := pipelinepkg.StageGObservationStopReasonForTest(observations); reason != "" {
+		t.Fatalf("one submit should not stop auth exploration, got %q", reason)
+	}
+}
+
+func TestStageGRepeatedStateStallEvidenceDetectsNoProgressLoop(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{Action: "open_candidate", OK: true},
+		{Action: "fill_input", OK: true},
+		{Action: "click_button", OK: true},
+		{Action: "collect_network", OK: true},
+		{Action: "fill_input", OK: true},
+		{Action: "click_button", OK: true},
+		{Action: "collect_console", OK: true},
+	}
+	for index := range observations {
+		observations[index].CurrentURL = "http://127.0.0.1:5173/editor"
+		observations[index].VisibleText = "Editor Empty state"
+	}
+	evidence := pipelinepkg.StageGRepeatedStateStallEvidenceForTest(observations)
+	if !strings.Contains(evidence, "unchanged visible state") {
+		t.Fatalf("expected no-progress evidence, got %q", evidence)
+	}
+}
+
+func TestStageGRepeatedStateStallIgnoresLongFormInput(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{Action: "open_candidate", OK: true},
+		{Action: "fill_input", OK: true},
+		{Action: "fill_input", OK: true},
+		{Action: "fill_input", OK: true},
+		{Action: "fill_input", OK: true},
+		{Action: "fill_input", OK: true},
+		{Action: "fill_input", OK: true},
+	}
+	for index := range observations {
+		observations[index].CurrentURL = "http://127.0.0.1:5173/profile/edit"
+		observations[index].VisibleText = "Profile edit form Name Title Bio Location Website Phone Email"
+	}
+	if evidence := pipelinepkg.StageGRepeatedStateStallEvidenceForTest(observations); evidence != "" {
+		t.Fatalf("same-page form filling should not be treated as no-progress stall, got %q", evidence)
 	}
 }
 
@@ -875,6 +1055,14 @@ func writeTinyPNG(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func loginControls(emailValue, passwordValue bool) []browserpkg.ControlSummary {
+	return []browserpkg.ControlSummary{
+		{Role: "input", Name: "email", Type: "email", HasValue: emailValue},
+		{Role: "input", Name: "password", Type: "password", HasValue: passwordValue},
+		{Role: "button", Text: "Sign In", Type: "submit"},
+	}
 }
 
 type runtimeBlockedRunner struct{}
