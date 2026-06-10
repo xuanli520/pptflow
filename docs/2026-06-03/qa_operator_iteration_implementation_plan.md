@@ -1,469 +1,636 @@
-# p2r Stage G 与 p2ro 迭代开发实现计划
+# p2r Stage G 基线与 p2ro MVP 最终执行方案
 
 ## 目标
 
-把 `docs/2026-06-03/qa_operator_iteration_design.md` 修正后的设计落到可实现切片。
+本方案以当前源码为基线，收敛 `docs/2026-06-03` 中 p2r Stage G、p2ro producer、Claude runtime、self-test attachment 上传四条线的最终执行计划。
 
-第一轮实现重点是 p2r `Stage G`：
-
-```text
-A -> D -> E -> F -> B -> G -> C
-```
-
-G 第一版直接支持 Codex 自主浏览器测试，但 Codex 不直接执行 shell、不直接调用 Playwright CLI、不访问任意 URL。实现形态是：
+最终方向：
 
 ```text
-Codex action JSON -> p2r validator -> Playwright wrapper -> observation -> Codex next action
+p2r 继续作为质检端
+p2ro 作为独立 fork 作业端
+p2r 已落地的 B/G/C runtime 能力作为 p2ro 兼容契约
+p2ro 原生接管 quality-runner 当前承担的 self-test attachment 上传职责
 ```
 
-## 现有代码事实
+## 当前源码事实
 
-- 阶段定义由 `internal/pipeline/model/stages.go` 的 `stageSpecs` 驱动。
-- 执行入口由 `internal/pipeline/stage.go` 的 `stageRegistry()` 和 `executeStage()` 驱动。
-- B 的 runtime 会通过 `StageOutcome.Runtime` 写回 `run_lifecycle.go` 的内存态，再供 C 消费。
-- 当前 B 失败的 `SkipNextStage` 只跳过紧邻下一个阶段，插入 G 后需要改成显式 runtime dependency。
-- D/E/F 的 `CodexReviewStage` 不适合 G。它强制 read-only、no network，且属于静态审查。
-- app-server client 当前不支持工具分发通道，不应直接承载浏览器 action 执行。
-- `ArtifactWriter` 已有 artifact root 逃逸保护，G 的所有输出必须走同一套写入边界。
-- TUI 多数阶段列表来自 `model.AllStages()`，新增 G 后大多会自动展示，但本地化和测试断言需要补。
+Stage G 已经在 p2r 中落地，不再作为 p2ro MVP 的前置开发项。
 
-## 架构决策
-
-### ADR：Stage G 采用 Codex 自主规划 + p2r 受控执行
-
-Decision：
-
-第一版 Stage G 就引入 Codex 自主浏览器探索，不先做纯硬编码 smoke。
-
-Drivers：
-
-- runtime URL、入口页、SPA fallback、登录页和后端健康页误判太复杂。
-- p2r 不能靠固定程序穷举真实前端可用性。
-- 浏览器动作有权限风险，不能交给 Codex 任意执行。
-
-Alternatives considered：
-
-- 纯硬编码 browser smoke：实现简单，但会漏复杂入口和交互路径。
-- Codex 直接运行 Playwright CLI：能力强，但权限边界不可控。
-- Codex 规划 + p2r 执行：能力和边界平衡最好。
-
-Consequences：
-
-- 需要新增 action schema、validator、browser wrapper、observation loop。
-- 需要把 URL allowlist、artifact path、network route 都做成硬约束。
-- 第一版复杂度高于 smoke，但不会推迟最有价值的智能探索能力。
-
-## 实现切片
-
-### 1. Stage plumbing
-
-修改文件：
+已存在的关键文件：
 
 ```text
 internal/pipeline/model/stages.go
 internal/pipeline/stage.go
-internal/config/config.go
-assets/config.yaml
-cmd/run.go
-internal/tui/localize.go
-tests/internal/tui/stage_plan_test.go
-tests/internal/tui/viewmodel_test.go
-tests/internal/config/config_test.go
-```
-
-实现内容：
-
-- 新增 `StageG StageID = "G"`。
-- `stageSpecs` 顺序改为 `A,D,E,F,B,G,C`。
-- G 标记为 runtime stage。
-- G log name 为 `G_frontend_e2e.log`。
-- 默认 timeout 增加 `G`，建议 600 秒。
-- TUI 本地化增加 “浏览器前端 E2E”。
-- static-only 提示从 `B/C` 改成 runtime stages 泛化文案。
-- 所有写死 6 个 stage 的测试改为跟随 `model.AllStages()`。
-
-验收：
-
-- `p2r run --stage G` 是合法参数。
-- TUI 阶段列表显示 G。
-- static-only 模式跳过 G。
-- 从 B 起始运行时显示 `B, G, C`。
-
-### 2. Runtime dependency graph
-
-修改文件：
-
-```text
-internal/pipeline/run_lifecycle.go
-internal/pipeline/stage.go
-internal/pipeline/testhooks.go
-tests/internal/pipeline/lifecycle_persistence_test.go
-tests/internal/pipeline/runtime_evidence_test.go
-```
-
-实现内容：
-
-- 新增 runtime dependency helper：
-
-```text
-blockedDependents("B") = ["G", "C"]
-```
-
-- B 失败或 `StageOutcome.Runtime` 不可用时，materialize G/C 为 blocked。
-- 保留 C 缺失 runtime 的防御性失败，但正常链路不应靠 C 自己兜底。
-- `materializeSkippedStage` 增加 G 的 blocked artifact。
-
-验收：
-
-- B 无 runtime 时 G/C 都 skipped 或 blocked，不执行 C。
-- `stage_status.json` 中 G/C 状态一致。
-- blocked G 也有 summary/report，artifact 合同完整。
-
-### 3. URL candidates 和 allowlist
-
-新增文件：
-
-```text
-internal/pipeline/browser_url.go
-```
-
-实现内容：
-
-- 从 `RuntimeState.Probes` 和 `RuntimeState.Mappings` 生成 `BrowserURLCandidate`。
-- URL host 固定为 `127.0.0.1`。
-- 保留 service、source、probe status、container port、host port。
-- 对所有 candidates 生成 allowlist origin。
-- 不再只依赖 `firstFrontendURL(runtime)`。
-
-验收：
-
-- 多 service 时 summary 记录所有 candidates。
-- `0.0.0.0`、`localhost`、`[::]` 都归一到 `127.0.0.1`。
-- 非 Docker published port 不进入 allowlist。
-- pure_backend 且无前端 expectation 时 G 可 `not_applicable`。
-
-### 4. Browser action schema 和 validator
-
-新增文件：
-
-```text
+internal/pipeline/stage_g.go
 internal/pipeline/browser_action.go
 internal/pipeline/browser_policy.go
-```
-
-实现内容：
-
-- 定义 action schema：
-
-```text
-open_candidate
-wait
-snapshot
-collect_console
-collect_network
-click_navigation
-click_button
-fill_input
-submit_local_form
-go_back
-finish
-```
-
-- 定义 risk：
-
-```text
-read_only
-navigation
-local_stateful
-destructive
-```
-
-- 第一版允许 `read_only/navigation/local_stateful`。
-- 第一版禁止 `destructive`。
-- validator 校验 action 名称、target 类型、selector/text 长度、url_id、输出路径和 reason。
-
-验收：
-
-- 任意 shell action 被拒绝。
-- 任意 URL 被拒绝。
-- 任意绝对输出路径被拒绝。
-- destructive action 被记录到 `blocked_actions`。
-
-### 5. Playwright wrapper
-
-新增目录：
-
-```text
-internal/browser/
-```
-
-建议文件：
-
-```text
+internal/pipeline/browser_url.go
+internal/pipeline/browser_codex_session.go
+internal/pipeline/frontend_e2e_schema.go
+internal/pipeline/repo_snapshot.go
 internal/browser/runner.go
 internal/browser/playwright_wrapper.go
 internal/browser/observation.go
-internal/browser/network_policy.go
-```
-
-实现内容：
-
-- 封装 Playwright CLI 或 Node wrapper。
-- wrapper 只接收 validated action。
-- Playwright route 拦截所有非 allowlist origin。
-- 收集 DOM 摘要、可见文本摘要、控件摘要、console error、pageerror、network 4xx/5xx、screenshot、current URL。
-- 所有输出路径由 p2r 传入，不接受 Codex 指定路径。
-
-验收：
-
-- 打开 allowlist URL 成功截图。
-- 外网 request 被阻断并写入 observation。
-- console error 被采集。
-- pageerror 被采集。
-- wrapper 不读 workspace 外路径。
-
-### 6. Codex browser session
-
-新增文件：
-
-```text
-internal/pipeline/stage_g.go
-internal/pipeline/browser_codex_session.go
 assets/prompt_profiles/frontend_e2e_browser.md
+assets/prompt_profiles/frontend_e2e_browser_action_prompt.md
+tests/internal/pipeline/stage_g_test.go
 ```
 
-实现内容：
+已确认行为：
 
-- G stage 构建 Codex prompt：metadata、docs、README、url candidates、action schema、禁止动作、summary schema。
-- Codex 每轮输出一个 action JSON。
-- p2r 校验 action。
-- wrapper 执行 action。
-- observation 反馈给 Codex。
-- 达到 stop 条件后 Codex 输出 final summary。
+- `model.StageG` 已定义，默认顺序为 `A,D,E,F,B,G,C`。
+- G 是 runtime stage，日志名为 `G_frontend_e2e.log`。
+- B 失败或无 runtime 时，`blockedDependents("B")` 阻断 G/C。
+- G blocked 时会 materialize `frontend_e2e_summary.json`、`frontend_e2e_report.md`、`G_frontend_e2e.log`。
+- G 使用 URL candidates、browser action validator、Playwright wrapper、summary schema、finding 映射和 repo snapshot。
+- D/E/F 的 `CodexReviewStage` 仍是 read-only static reviewer，G 不复用该执行器。
 
-停止条件：
+当前还不存在 p2ro 产品层：
 
-- Codex 输出 `finish`。
-- 达到最大动作数，建议 30。
-- 达到 stage timeout。
-- 连续 invalid actions 超过阈值，建议 3。
-- 浏览器 wrapper 失败。
+```text
+internal/operator/
+internal/producer/
+internal/agent/
+internal/workspace/
+internal/operator/upload/selftest/
+cmd/operator.go
+cmd/new.go
+```
+
+## 架构决策
+
+### ADR 1：p2ro 采用独立 fork 产品仓
+
+Decision：
+
+p2ro MVP 从当前 p2r 仓 fork 出独立仓库，保留 upstream 指向 p2r。p2ro 新增 producer 产品层，不把 P0-P10 塞进 p2r A-G 质检阶段。
+
+Drivers：
+
+- p2r 是质检端，p2ro 是作业端 producer，两者产品语义不同。
+- Go `internal/` 不能作为跨仓稳定共享 API。
+- 当前共享能力尚在演进，MVP 先 fork 比提前抽 module 更稳。
+
+Consequences：
+
+- 共享能力变更 upstream-first。
+- p2ro 产品逻辑必须放在专属目录。
+- 当同一 shared 文件频繁双向修改时，再抽 `p2r_core`。
+
+### ADR 2：Stage G 作为共享 runtime 基线
+
+Decision：
+
+p2r Stage G 已作为当前源码基线，p2ro 不重新实现浏览器 E2E。p2ro 后续 P6 runtime-check 复用 p2r 的 B/G/C 或抽出的共享等价能力。
+
+Drivers：
+
+- G 已具备受控 Codex planning + p2r validated Playwright execution。
+- B/G/C 的 artifact、finding、runtime evidence 是 p2r 和 p2ro 的兼容契约。
+- 重写 G 会制造两套 runtime truth。
+
+### ADR 3：P10 由 p2ro 原生接管上传
+
+Decision：
+
+P10 使用 p2ro `native_http` provider 直接调用平台 self-test attachment API，不等待 quality-runner upload bridge。quality-runner 只作为已验证 API 行为和历史产物命名的参考。
+
+Drivers：
+
+- 用户目标是让 p2ro 接管 quality-runner 上传职责。
+- API 链路已经验证：exists/list/download_url、batch-presigned-url、PUT presigned URL、batch-confirm。
+- P10 必须可在 p2ro 内闭环，不被 quality-runner 二进制能力暴露情况阻塞。
+
+Security：
+
+- p2ro 只读取自身进程显式配置的上传凭据，默认 env 名为 `API_KEY`。
+- p2ro 不硬编码、不输出、不持久化 API key。
+- p2ro 不从 quality-runner 二进制、日志、进程环境或内存中提取密钥。
+- 日志和 manifest 不保存 presigned URL、Authorization、`X-Amz-Signature`、`X-Amz-Credential`。
+
+## 最终系统分层
+
+```text
+cmd/
+  root.go
+  operator.go
+  new.go
+  run.go
+  tui.go
+
+internal/operator/
+  model.go
+  store.go
+  migrate.go
+  lifecycle.go
+  stage.go
+  scheduler.go
+
+internal/producer/
+  stage_p0_intake.go
+  stage_p1_scaffold.go
+  stage_p2_test_freeze.go
+  stage_p3_implement.go
+  stage_p5_self_check.go
+  stage_p9_package.go
+  prompt_context.go
+  package_manifest.go
+  self_check.go
+
+internal/agent/
+  session.go
+  events.go
+  policy.go
+  permission.go
+  diff.go
+  claude_sdk_adapter.go
+  claude_cli_adapter.go
+  codex_appserver_adapter.go
+
+internal/workspace/
+  layout.go
+  scaffold.go
+  snapshot.go
+  cleanup.go
+  manifest.go
+
+internal/operator/upload/selftest/
+  client.go
+  mapping.go
+  runner.go
+  manifest.go
+  redaction.go
+
+internal/qaadapter/
+  p2r_scan.go
+  p2r_stage_a.go
+  runtime_check.go
+
+internal/tui/
+  operator board, detail, permission queue, artifact view
+```
+
+Shared 目录 MVP 先继承，不加 p2ro 产品语义：
+
+```text
+internal/config
+internal/db
+internal/executor
+internal/docker
+internal/browser
+internal/codex
+internal/preflight
+internal/projectlayout
+internal/scanner
+internal/pipeline
+assets/scripts
+```
+
+## 数据流
+
+```text
+prompt
+  -> P0 intake
+  -> package workspace
+  -> P1 scaffold
+  -> P2 test-freeze
+  -> P3 implement
+  -> P5 self-check
+  -> P9 package
+  -> P10 upload self-test attachments
+  -> ready_for_qa
+
+P9 package
+  -> p2r scanner.Scan
+  -> p2r Stage A
+  -> optional B/G/C compatibility check
+```
+
+## 作业状态机
+
+MVP 状态：
+
+```text
+queued
+intaking
+scaffolding
+test_freezing
+implementing
+self_checking
+packaging
+uploading_self_test
+ready_for_qa
+manual_required
+failed_blocked
+cancelled
+```
+
+后续状态：
+
+```text
+contract_testing
+runtime_checking
+reviewing
+repairing
+qa_failed
+qa_passed
+```
+
+默认成功路径：
+
+```text
+queued -> intaking -> scaffolding -> test_freezing -> implementing -> self_checking -> packaging -> uploading_self_test -> ready_for_qa
+```
+
+P10 上传完成不等于平台最终提交，MVP 默认终态仍是 `ready_for_qa`。
+
+## 实现阶段
+
+### M0：fork hygiene
+
+范围：
+
+- fork p2r 为 p2ro 仓。
+- module path、二进制名、CLI root 改为 p2ro。
+- 保留 upstream 指向 p2r。
+- 建立 shared 目录清单。
 
 验收：
 
-- Codex 能自主选择 URL candidate。
-- Codex invalid action 不会被执行。
-- 达到最大动作数时生成 partial summary。
-- summary schema invalid 时 G failed infra finding。
+- `go test ./...` 通过。
+- `p2ro version` 输出 p2ro 名称。
+- p2r A-G 质检逻辑未被产品文案污染。
 
-### 7. Summary schema 和 finding 映射
+### M1：operator 模型和存储
 
-新增文件：
+新增：
 
-```text
-internal/pipeline/frontend_e2e_schema.go
+```go
+type OperatorJob struct {
+	ID string
+	Prompt string
+	ProjectType string
+	Language string
+	Framework string
+	State string
+	CurrentRunID string
+	PackagePath string
+	CreatedAt string
+	UpdatedAt string
+}
+
+type OperatorRun struct {
+	RunID string
+	JobID string
+	Status string
+	ArtifactRoot string
+	PackagePath string
+}
+
+type OperatorStageRecord struct {
+	Stage string
+	Status string
+	LogPath string
+	ArtifactPaths []string
+	Findings []Finding
+}
 ```
 
-实现内容：
+表：
 
-- 定义 `frontend_e2e_summary.json` Go struct。
-- 校验 `schema_version == p2r.frontend_e2e.v1`。
-- 校验 severity 枚举。
-- summary finding 映射为 `model.Finding`。
-- screenshot 字段映射到 `SourcePath` 或 Evidence 文本。
+```text
+operator_jobs
+operator_runs
+operator_stages
+operator_permissions
+operator_artifacts
+```
 
 验收：
 
-- 空白页 summary 产生 High finding。
-- network 5xx summary 产生 High finding。
-- console runtime error summary 产生 Medium/High finding。
-- invalid schema 产生 infra High finding。
-- findings 插入 DB。
+- 能创建、查询、恢复作业。
+- 崩溃后 run 恢复为 terminal、`manual_required` 或 `failed_blocked`。
+- 不复用 p2r `tasks` 的质检状态文案。
 
-### 8. Artifact 和源码不变校验
+### M2：Agent runtime adapter
 
-新增文件：
+首选路径：
 
 ```text
-internal/pipeline/repo_snapshot.go
+Go TUI
+  -> internal/agent RuntimeAdapter
+  -> TypeScript sidecar JSONL protocol
+  -> @anthropic-ai/claude-agent-sdk
 ```
 
-实现内容：
+接口：
 
-- Stage G 前对 `repo/` 做 hash snapshot。
-- Stage G 后重新 hash。
-- 忽略测试产物和可允许 runtime cache。
-- 如果源文件变化，G failed + infra finding。
+```go
+type RuntimeAdapter interface {
+	StartSession(context.Context, SessionRequest) (Session, error)
+}
+
+type Session interface {
+	Send(context.Context, AgentInput) error
+	Events() <-chan Event
+	Wait(context.Context) (SessionResult, error)
+	Cancel(context.Context) error
+}
+```
+
+事件：
+
+```text
+session.started
+message.delta
+tool.call
+tool.result
+permission.request
+permission.decision
+file.changed
+diff.updated
+usage.updated
+stage.completed
+stage.failed
+runtime.error
+```
 
 验收：
 
-- wrapper 写 artifact 不触发源码变更。
-- 修改 `repo/src/*` 能被检测。
-- artifact root 内写入不被误判。
+- SDK sidecar 能流式输出、写 workspace、生成 diff、落盘 raw event。
+- `query.interrupt()` 用于软取消。
+- 进程树 kill 用于 hard cancel。
+- CLI adapter 只作为 fallback，不作为长期首选。
 
-### 9. Preflight
+### M3：workspace 与交付包隔离
 
-修改文件：
+布局：
 
 ```text
-internal/preflight/preflight.go
-tests/internal/preflight/preflight_test.go
+work/<job_id>/
+  package/TASK-xxx/
+    docs/
+    repo/
+    original_sessions/
+    metadata.json
+  .p2ro/
+    runs/<run_id>/
+      run_manifest.json
+      stage_status.json
+      permissions.jsonl
+      diff_summary.json
+      logs/
 ```
-
-实现内容：
-
-- 增加 browser runtime check。
-- Playwright 不可用时 G blocked。
-- 不影响 D/E/F 静态 Codex preflight。
-- Node 缺失时，如果 wrapper 自带运行时则 degraded，否则 G blocked。
 
 验收：
 
-- Playwright 缺失只影响 G。
-- Codex 静态能力缺失只影响 D/E/F。
-- Docker 缺失阻断 B/G/C。
+- `.p2ro/` 不进入 P9 交付包。
+- workspace path 防逃逸。
+- snapshot 可检测 P3/P5/P9 文件变更。
 
-### 10. Submit 和 Stage F 策略
+### M4：P0/P1/P2/P3 producer stages
 
-修改文件：
+P0 intake：
 
-```text
-internal/pipeline/submit.go
-internal/pipeline/stage_f.go
-```
+- 原始 prompt 原样写入 `metadata.json.prompt`。
+- 不确定事项写入 `docs/questions.md`。
+- prompt 不作为 shell 指令执行。
 
-第一轮策略：
+P1 scaffold：
 
-- G artifacts 先保留在本地 run artifact 和 DB findings。
-- 是否复制进最终 submit 目录单独开关，默认不上传。
-- Stage F 是否消费 G findings 默认关闭，避免修复报告语义扩大。
+- 生成 docs、repo、original_sessions、metadata。
+- 不写业务主体。
+- 只允许最小启动骨架。
 
-后续策略：
+P2 test-freeze：
 
-- p2ro repair loop 需要消费 G findings 时，再把 G 加入 repair brief。
-- 作业员自测 API 上传时，再明确 `frontend_e2e_report.md` 的 artifact type。
+- 生成 `repo/unit_tests/`、`repo/API_tests/`、`repo/run_tests.sh`、可选 `repo/run_tests.ps1`。
+- 测试必须可运行，允许因业务未实现失败。
+- 不允许弱化需求。
+
+P3 implement：
+
+- 按冻结测试和文档实现真实业务。
+- 每轮运行测试、记录日志、更新 diff summary。
+- 不允许 fake logic、硬编码成功、静态页面冒充真实功能。
 
 验收：
 
-- 现有 submit 行为不回归。
-- G failed 不破坏 A-F/B/C artifact 聚合。
+- 至少一个 fixture 可走完 P0-P3。
+- P1 业务主体检测能产生 finding。
+- P2 测试命令能启动并产生日志。
+- P3 产生真实 diff 和实现报告。
 
-## 测试矩阵
+### M5：P5 self-check 与 P9 package
 
-### 单元测试
-
-```text
-StageG 加入 AllStages 顺序
-stage timeout key 接受 G
-static-only 跳过 G
-B failed blocks G/C
-URL candidates 生成
-Action validator 拒绝非法动作
-Summary schema 校验
-Summary findings 映射
-Repo snapshot 检测源码变更
-```
-
-### 集成测试
+P5 复用：
 
 ```text
-fake Playwright wrapper 返回 blank_page
-fake Playwright wrapper 返回 console error
-fake Playwright wrapper 返回 network 500
-fake Codex 返回 invalid action
-fake Codex 返回 valid finish summary
-B failed 后 G/C blocked
+assets/scripts/run_validate.py
+assets/scripts/run_acceptance.py
+assets/scripts/check_required_artifacts.py
+assets/scripts/check_readme_alignment.py
+assets/scripts/check_local_dependency.py
+assets/scripts/check_fake_impl.py
+assets/scripts/check_english_only.py
 ```
 
-### TUI 测试
+P9 输出：
 
 ```text
-阶段数从 6 变为 7
-G 本地化显示
-重跑配置可选择 G
-static-only runtime 提示泛化
-从 B 起始运行展示 B,G,C
+handoff_summary.md
+p2ro_package_manifest.json
+p2ro_run_manifest.json
+ready-for-qa/<batch>/<task_id>/<task_id>/
 ```
 
-### 手工验证
+验收：
+
+- P5 Blocker/High 默认阻断 P9。
+- P9 使用白名单复制。
+- P9 包可被当前 `scanner.Scan` 识别。
+- Stage A 对有效包无结构阻断，对故意缺陷包产生预期 finding。
+
+### M6：P10 native self-test attachment upload
+
+模块：
 
 ```text
-p2r run TASK --stage G
-p2r run TASK --from B
-p2r run TASK --static-only
-TUI 中重跑 G
-查看 frontend_e2e_summary.json
-查看 frontend_e2e_screenshot.png
-查看 DB findings
+internal/operator/upload/selftest
 ```
+
+配置：
+
+```json
+{
+  "schema_version": "p2ro.self_test_upload.config.v1",
+  "enabled": true,
+  "provider": "native_http",
+  "base_url": "",
+  "read_api_key_env": "API_KEY",
+  "upload_api_key_env": "API_KEY",
+  "timeout_seconds": 60,
+  "retry_presigned_once": true,
+  "require_human_confirm": true
+}
+```
+
+接口：
+
+```go
+type SelfTestAttachmentClient interface {
+	Exists(ctx context.Context, req AttachmentExistsRequest) (AttachmentExistsResult, error)
+	List(ctx context.Context, req AttachmentListRequest) (AttachmentListResult, error)
+	BatchPresignedURL(ctx context.Context, req BatchPresignedURLRequest) (BatchPresignedURLResult, error)
+	UploadBytes(ctx context.Context, req UploadBytesRequest) error
+	BatchConfirm(ctx context.Context, req BatchConfirmRequest) (BatchConfirmResult, error)
+}
+```
+
+provider 选择：
+
+```text
+if native_http credentials configured and human confirmed:
+  use NativeHTTPProvider
+else:
+  manual_required
+```
+
+上传顺序：
+
+```text
+1. read P9 manifest
+2. materialize artifact mapping
+3. filter missing optional files
+4. compute file_size / file_type / sha256
+5. exists/list before upload
+6. batch-presigned-url
+7. PUT file bytes to presigned upload_url
+8. batch-confirm
+9. exists/list after upload
+10. write p2ro_upload_manifest.json
+```
+
+错误分类：
+
+| 类型 | 判定 | 阶段结果 |
+| --- | --- | --- |
+| `config_missing` | 上传凭据未配置、不可见或未授权 | `manual_required` |
+| `artifact_missing` | required file 不存在 | `failed` |
+| `artifact_optional_missing` | optional file 不存在 | `passed_with_warnings` |
+| `http_error` | HTTP status 非 2xx | `failed` |
+| `business_error` | HTTP 200 但 `code != 200` | `failed` |
+| `presigned_expired` | PUT 返回签名过期或 403 | retry once |
+| `confirm_failed` | `failed_items` 非空或 attachment ID 不在 `success_ids` | `failed` |
+| `verify_failed` | confirm 后 exists/list 不匹配 | `failed` |
+
+验收：
+
+- `codex_report.md` 上传并确认成功。
+- `logs/B_docker.log` 上传为 `docker_startup.log`。
+- `logs/C_tests.log` 上传为 `run_tests.log`。
+- `frontend_e2e_report.md` 和 `frontend_e2e_summary.json` 可作为 `ai_test_report` 上传。
+- 上传失败不删除本地 artifact，不改变 P9 package。
+- manifest 不保存 API key、Authorization、download_url、upload_url。
+
+### M7：operator TUI
+
+主视图：
+
+```text
+待生产 | 生产中/待人工 | 待质检/已完成
+```
+
+详情区：
+
+- prompt 摘要
+- 当前 P 阶段
+- 流式日志
+- diff 摘要
+- 权限队列
+- findings
+- artifact 列表
+- package path
+- P10 上传状态
+
+验收：
+
+- 能新建、启动、取消作业。
+- 能看到实时 P 阶段输出。
+- 能批准或拒绝 require human 权限。
+- 能查看 diff summary、package path、upload manifest。
+
+### M8：兼容验证和 hardening
+
+验证路径：
+
+```text
+p2ro P9 package -> p2r scan -> p2r run --stage A -> p2r run --from B
+```
+
+fixtures：
+
+```text
+fullstack valid package
+pure_backend valid package
+pure_frontend valid package
+missing metadata.prompt package
+fake implementation package
+frontend blank page package
+```
+
+验收：
+
+- p2r scanner 能识别 p2ro P9 包。
+- Stage A 对有效包通过，对缺陷包产生预期 finding。
+- B/G/C 可消费 p2ro fullstack 或 pure_frontend 包。
+- G finding 可进入 p2ro 后续 repair brief。
 
 ## 并行开发分工
 
-Lane A：stage plumbing 和 dependency graph
+| Lane | 模块 | 依赖 |
+| --- | --- | --- |
+| A | fork hygiene, cmd, config | 无 |
+| B | operator model, store, lifecycle | A |
+| C | agent adapter, policy, permissions | A |
+| D | workspace, package skeleton, snapshot | A |
+| E | P0/P1/P2/P3 stages | B, C, D |
+| F | P5/P9 self-check and package | D, E |
+| G | P10 native upload | B, F |
+| H | operator TUI | B, C, F, G |
+| I | compatibility fixtures | F, G |
+
+执行顺序：
 
 ```text
-internal/pipeline/model/
-internal/pipeline/stage.go
-internal/pipeline/run_lifecycle.go
-internal/tui/
+A
+  -> B + C + D
+  -> E
+  -> F + G
+  -> H + I
 ```
 
-Lane B：browser action/schema/url candidates
+## 不在 MVP 范围
 
-```text
-internal/pipeline/browser_*.go
-internal/pipeline/frontend_e2e_schema.go
-```
-
-Lane C：Playwright wrapper
-
-```text
-internal/browser/
-```
-
-Lane D：Codex browser session 和 prompt profile
-
-```text
-internal/pipeline/stage_g.go
-assets/prompt_profiles/frontend_e2e_browser.md
-```
-
-Lane E：tests and preflight
-
-```text
-tests/internal/pipeline/
-tests/internal/tui/
-tests/internal/preflight/
-internal/preflight/
-```
-
-合并顺序：
-
-```text
-Lane A -> Lane B + C -> Lane D -> Lane E
-```
-
-Lane A 必须先合，因为后续都依赖 `StageG` 和 dependency graph。
-
-## 不在第一轮范围
-
-- p2ro operator 命令入口。
-- repair loop。
-- 自动平台提交。
-- 质检员网页最终通过/打回。
-- 上传真实 AI 报告或反馈视频。
+- 自动平台最终提交。
+- 自动质检通过或打回。
+- 质检员题目管理系统网页自动化。
 - 多模型调度。
+- 多人协作。
+- P4/P6/P7/P8 默认闭环。
 - Playwright trace/video 强制产出。
+- `p2r_core` 抽包。
 
-## 完成标准
+## 最终完成标准
 
-- `Stage G` 已进入默认 runtime pipeline。
-- B 成功后 G 在 C 前运行。
-- B 失败时 G/C 都不会误跑。
-- Codex 能通过 action JSON 自主探索浏览器。
-- p2r 能拒绝非法 action。
-- Playwright wrapper 只能访问 allowlist URL。
-- G 生成 summary/report/screenshot/log。
-- G findings 能进入 StageRecord 和 DB。
-- G 不修改交付包源码。
-- 现有 A-F/B/C 流程不回归。
+- p2ro 独立仓可构建独立二进制。
+- P0/P1/P2/P3/P5/P9/P10 可串行完成。
+- P1 不写业务主体，P2 冻结可运行测试，P3 产生真实实现。
+- P5 能执行 prompt2repo 交付红线。
+- P9 产物能被 p2r `scanner.Scan` 和 Stage A 识别。
+- P10 原生上传 `ai_test_report` 附件并生成脱敏 manifest。
+- 权限策略覆盖 read/write/test/install/network/delete/git。
+- TUI 使用作业端语义，不复用质检端三栏文案。
+- 日志、manifest、stdout/stderr 不出现 API key、Authorization、presigned URL 明文。
+- 至少 3 个 fixture 覆盖 fullstack、pure_backend、pure_frontend。

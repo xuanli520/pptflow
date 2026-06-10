@@ -2,9 +2,9 @@
 
 ## 结论
 
-第一阶段不要大改质检端。p2r 质检端新增一个 Codex-guided Playwright 黑盒前端 E2E 阶段，用真实浏览器检查 Docker 启动后的页面是否可访问、可交互、无空白页、无明显控制台和网络错误。
+第一阶段不再大改质检端。p2r 质检端已经具备 Codex-guided Playwright 黑盒前端 E2E 阶段，用真实浏览器检查 Docker 启动后的页面是否可访问、可交互、无空白页、无明显控制台和网络错误。
 
-Stage G 第一版直接使用 Codex 自主浏览器测试，但 Codex 不直接执行 shell，也不直接调用 Playwright CLI。正确边界是：Codex 负责自主判断和规划；p2r 负责校验动作、限制权限、执行 Playwright wrapper；Playwright wrapper 只执行结构化 allowlist action。这样保留 Codex 处理复杂 runtime URL、入口页、路由、登录页和交互路径的能力，同时避免把浏览器阶段变成权限绕过入口。
+Stage G 使用 Codex 自主浏览器测试，但 Codex 不直接执行 shell，也不直接调用 Playwright CLI。正确边界是：Codex 负责自主判断和规划；p2r 负责校验动作、限制权限、执行 Playwright wrapper；Playwright wrapper 只执行结构化 allowlist action。这样保留 Codex 处理复杂 runtime URL、入口页、路由、登录页和交互路径的能力，同时避免把浏览器阶段变成权限绕过入口。
 
 p2ro 作业端不是 Claude Code 聊天壳，而是全自动 prompt-to-repo 生产流水线。它把初始化、测试冻结、开发、联调、自检、修复、打包变成有限状态机，用权限策略取代 Claude Code 中反复出现的 yes/no 确认。
 
@@ -47,24 +47,145 @@ B failed/no runtime -> G blocked + C blocked
 
 ### p2ro 作业端
 
-p2ro 使用同一套 repo、pipeline 基础设施、artifact 结构和质检能力，但默认角色是 producer：
+p2ro 采用独立 fork 仓库中的作业端产品层，但共享 p2r 已稳定的 repo、pipeline 基础设施、artifact 结构和质检能力：
 
 ```text
 prompt -> repo -> self-check -> repair -> recheck -> submit for QA
 ```
 
-它不 fork p2r 代码。可发行成单独二进制或命令入口，但共享内部模块。
+MVP 从 p2r fork 起步，保留 upstream 同步；生产逻辑放入 p2ro 专属目录，不把 P0-P10 塞进 p2r A-G 质检阶段。后续当 shared 文件频繁双向修改时，再抽出 `p2r_core`。
 
 ### 两套上传链路
 
 作业员自测 API：
 
 ```text
-run_quality.py / quality-runner.exe
+p2ro native self-test attachment adapter
 external self-test attachment API
 ```
 
-用途是作业员上传自测附件，不能等同质检员裁决。
+用途是作业员上传自测附件，不能等同质检员裁决。`run_quality.py` / `quality-runner.exe` 只作为已验证 API 行为的历史参考，P10 由 p2ro 接管上传实现。
+
+已实测的 self-test attachment API：
+
+```text
+POST /api/submissions/external/self-test-attachments/exists
+Content-Type: application/json
+X-API-Key: <configured key>
+
+{
+  "external_task_id": "TASK-...",
+  "dimension_type": "ai_test_report",
+  "file_name": "codex_report.md"
+}
+```
+
+```text
+POST /api/submissions/external/self-test-attachments
+Content-Type: application/json
+X-API-Key: <configured key>
+
+{
+  "external_task_id": "TASK-...",
+  "dimension_type": "ai_test_report"
+}
+```
+
+```text
+POST /api/submissions/external/self-test-attachments/batch-presigned-url
+Content-Type: application/json
+X-API-Key: <configured key>
+
+{
+  "external_task_id": "TASK-...",
+  "files": [
+    {
+      "dimension_type": "ai_test_report",
+      "file_name": "codex_report.md",
+      "file_size": 54690,
+      "file_type": "text/markdown"
+    }
+  ]
+}
+```
+
+```text
+PUT <presigned upload_url>
+Content-Type: text/markdown
+Body: file bytes
+```
+
+```text
+POST /api/submissions/external/self-test-attachments/batch-confirm
+Content-Type: application/json
+X-API-Key: <configured key>
+
+{
+  "attachment_ids": ["<attachment_id>"]
+}
+```
+
+观测结论：
+
+- `quality-runner.exe run` 支持 `--path`、`--task-id`、`--timeout`、`--report-name`、`--quiet`、`--verbose`、`--skip-ui`、`--skip-ui-interaction`、`--model`，没有 `--skip-upload`。
+- `exists` 对不存在任务返回 HTTP 400，body 为任务不存在。
+- 附件列表接口可能返回 HTTP 200 但业务码 407，需要同时检查 HTTP 状态和业务码。
+- 已对真实任务做只读验证，`ai_test_report/codex_report.md` 可返回存在状态、文件大小、`text/markdown` 类型和 `download_url`。
+- `download_url` 可直接读取报告内容。
+- 已对真实业务任务完成 `batch-presigned-url -> PUT OBS presigned URL -> batch-confirm` 写入验证。
+- `batch-presigned-url` 返回 `attachment_id`、`upload_url`、`object_path`、`expires_in`；`upload_url` 是短时有效签名 URL，日志和文档必须脱敏。
+- `batch-confirm` 返回 `success_ids` 和 `failed_items`，必须按业务字段判断确认结果。
+- 官方 sample 对 `operator_codex_report.md`、`run_tests.log`、`docker_startup.log`、`prompt_requirements_verification.md`、`codex_report_issues_verification.md`、`test_effectiveness_report.md`、`ui_interaction_steps.md`、`ui_interaction_report.md`、`final_validation_report.md` 都使用同一个 `dimension_type=ai_test_report` 查询。
+- 这里的字段名是 `ai_test_report`，不是 `api_test_report`。
+
+### 认证方式与凭据边界
+
+API 使用 `X-API-Key` 请求头进行认证。P10 由 p2ro 原生 adapter 读取显式配置的上传凭据，默认环境变量名为 `API_KEY`，也允许通过配置覆盖为其他变量名。
+
+安全要求：
+
+- `API_KEY` 不要在日志、stdout、manifest、DB 中明文打印或持久化。
+- p2ro 只能读取自身进程可见的显式配置，不从 quality-runner 二进制、日志、进程环境或内存中提取密钥。
+- quality-runner 内部只读任务列表 key 不是上传凭据，p2ro 不依赖、不抽取、不复用。
+- `batch-presigned-url` 返回的 `upload_url` 包含 `X-Amz-Signature`、`X-Amz-Credential` 等签名参数，日志中同样需要脱敏。
+- `API_KEY` 不可见或未授权时，P10 进入 `manual_required`。
+
+p2ro adapter 边界：
+
+- 配置项包括 provider、base URL、timeout、external task ID、dimension type、本地 artifact manifest path 和上传凭据 env 名。
+- MVP provider 是 `native_http`：p2ro 直接调用 exists/list/batch-presigned-url/PUT/batch-confirm。
+- quality-runner 只作为兼容验证对象，不作为 P10 前置依赖。
+- p2ro 不通过反编译、日志、内存或进程环境扫描从 quality-runner 中提取上传密钥。
+- report/log/summary 类附件首期统一使用 `dimension_type=ai_test_report`。
+- 首期支持已实测文件名的 exists/list/download_url/upload/confirm。
+- 写入必须只上传当前任务的正式报告，不上传 probe 文件。
+- 上传失败只记录 adapter finding，不删除本地 artifact，不影响 P9 package 留存。
+- adapter 必须显式维护 local path 到平台 `file_name` 的映射；不能把 `logs/B_docker.log`、`logs/C_tests.log` 这类本地路径直接作为平台文件名。
+
+平台附件映射：
+
+| 本地产物 | 平台 file_name | dimension_type | file_type |
+| --- | --- | --- | --- |
+| `codex_report.md` | `codex_report.md` | `ai_test_report` | `text/markdown` |
+| `codex_report_verification.md` | `codex_report_verification.md` | `ai_test_report` | `text/markdown` |
+| `operator_codex_report.md` | `operator_codex_report.md` | `ai_test_report` | `text/markdown` |
+| `operator_prompt_requirements_verification.md` | `operator_prompt_requirements_verification.md` | `ai_test_report` | `text/markdown` |
+| `prompt_requirements_verification.md` | `prompt_requirements_verification.md` | `ai_test_report` | `text/markdown` |
+| `operator_codex_report_issues_verification.md` | `operator_codex_report_issues_verification.md` | `ai_test_report` | `text/markdown` |
+| `codex_report_issues_verification.md` | `codex_report_issues_verification.md` | `ai_test_report` | `text/markdown` |
+| `test_effectiveness_report.md` | `test_effectiveness_report.md` | `ai_test_report` | `text/markdown` |
+| `test_effectiveness_verification.md` | `test_effectiveness_verification.md` | `ai_test_report` | `text/markdown` |
+| `final_validation_report.md` | `final_validation_report.md` | `ai_test_report` | `text/markdown` |
+| `ui_interaction_steps.md` | `ui_interaction_steps.md` | `ai_test_report` | `text/markdown` |
+| `ui_interaction_report.md` | `ui_interaction_report.md` | `ai_test_report` | `text/markdown` |
+| `logs/B_docker.log` | `docker_startup.log` | `ai_test_report` | `text/plain` |
+| `logs/C_tests.log` | `run_tests.log` | `ai_test_report` | `text/plain` |
+| `docker_runtime_summary.json` | `docker_runtime_summary.json` | `ai_test_report` | `application/json` |
+| `test_runtime_summary.json` | `test_runtime_summary.json` | `ai_test_report` | `application/json` |
+| `frontend_e2e_report.md` | `frontend_e2e_report.md` | `ai_test_report` | `text/markdown` |
+| `frontend_e2e_summary.json` | `frontend_e2e_summary.json` | `ai_test_report` | `application/json` |
+
+上传集合按文件存在性过滤。不存在的 sample 文件只做 exists/list 兼容，不应生成空文件凑数。
 
 质检员题目管理系统网页：
 
@@ -80,7 +201,7 @@ AI 报告文件上传
 
 这是后续需要用真实浏览器会话分析的链路。需要单独抓请求、认证方式和 CSRF / token 机制。
 
-## 质检端第一阶段：Stage G
+## 质检端 Stage G 基线
 
 ### 目标
 
@@ -472,7 +593,7 @@ runtime_checking
 reviewing
 repairing
 packaging
-submitted_for_qa
+ready_for_qa
 qa_failed
 qa_passed
 manual_required
@@ -593,22 +714,21 @@ p2ro 必须把以下规则机器化：
 
 ## 迭代计划
 
-### Iteration 1：质检端 Stage G
+### Iteration 1：质检端 Stage G 基线
 
-范围：
+当前源码已落地：
 
-- 新增 `StageG`
-- 新增 `stage_g.go`
-- 新增 runtime dependency graph，B 失败阻断 G/C
-- 新增 Codex-guided browser runtime harness
-- 新增 BrowserActionValidator
-- 新增 Playwright wrapper
-- 新增 URL candidates 生成和 allowlist
-- 写入 `frontend_e2e_summary.json`
-- 写入 `frontend_e2e_report.md`
-- 失败映射为 `model.Finding`
-- TUI 阶段列表自动显示 G
-- Stage G 前后校验 `repo/` 未被修改
+- `internal/pipeline/model/stages.go` 已定义 `A,D,E,F,B,G,C`，G 是 runtime stage。
+- `internal/pipeline/stage.go` 已实现 B 阻断 G/C 的 dependency graph 和 G blocked artifact。
+- `internal/pipeline/stage_g.go`、`browser_action.go`、`browser_policy.go`、`browser_url.go`、`frontend_e2e_schema.go`、`repo_snapshot.go` 已提供 Codex-guided browser loop、action validator、URL allowlist、summary/finding 映射和源码不变校验。
+- `internal/browser/` 已封装 Playwright wrapper 和 observation。
+- `assets/prompt_profiles/frontend_e2e_browser.md`、`frontend_e2e_browser_action_prompt.md` 已存在。
+
+后续只保留 hardening 范围：
+
+- 用 p2ro fixture 回归 B/G/C 兼容性。
+- 补齐真实 fullstack、pure_frontend、pure_backend 样例。
+- 继续收敛 G findings 到 p2ro repair brief。
 
 涉及文件：
 
@@ -646,10 +766,11 @@ assets/prompt_profiles/frontend_e2e_browser.md
 范围：
 
 - 新增 operator 命令入口或 mode
-- 新增 P0/P1/P2/P3/P5/P9 最小阶段
+- 新增 P0/P1/P2/P3/P5/P9/P10 最小阶段
 - agent session 支持流式输出
 - 权限策略支持 auto allow / require human / deny
 - 产出标准 prompt2repo 包
+- 上传 report/log/summary 类 `ai_test_report` 自测附件
 
 不做：
 
@@ -678,14 +799,20 @@ assets/prompt_profiles/frontend_e2e_browser.md
 范围：
 
 - 复用已分析的作业员 self-test attachment API
-- 上传 p2ro 产出的自测报告、run_tests.log、docker_startup.log、frontend_e2e_report
+- 首期只读验证平台已有 `ai_test_report/codex_report.md`
+- 上传 p2ro 产出的 report/log/summary 类 `ai_test_report` 附件
 - 不把自测通过等同质检通过
 
 要求：
 
-- API key 从配置或环境变量读取
-- 不硬编码 token
+- 上传凭据通过 p2ro 显式配置的环境变量注入，默认读取 `API_KEY`。
+- p2ro 不硬编码、不导出、不打印 token
+- `API_KEY` 不可见或未授权时进入 `manual_required`
 - 上传失败不影响本地 artifact 留存
+- HTTP 200 仍需检查业务码和响应结构
+- 写入前后必须记录 exists/list 对比
+- 不支持覆盖同名文件，除非官方确认覆盖语义
+- 日志必须脱敏 `upload_url`、`X-Amz-Signature`、`X-Amz-Credential`、API key 和 Authorization 值
 
 ### Iteration 5：质检员网页提交自动化
 
@@ -714,10 +841,6 @@ assets/prompt_profiles/frontend_e2e_browser.md
 
 ## 当前推荐落地顺序
 
-先做 p2r 的 Stage G。它收益最高、改动最窄、能直接提升质检质量。
+Stage G 已经成为当前 p2r runtime pipeline 基线。下一步直接做 p2ro operator MVP，把 prompt2repo 生产流程机器化。作业端复用本地 artifact 和 B/G/C，并把作业员 self-test attachment API 上传作为 P10 原生接管。
 
-Stage G 第一轮就做 Codex 自主浏览器测试，但必须采用“Codex 自主规划 + p2r 受控执行 + Playwright wrapper 强校验”的架构，不做纯硬编码 smoke，也不让 Codex 获得任意工具执行权。
-
-随后做 p2ro operator MVP，把 prompt2repo 生产流程机器化。作业端先复用本地 artifact 和 B/G/C，不急着接平台 API。
-
-最后再做两条上传链路：作业员自测 API 上传、质检员题目管理系统网页自动提交。两者分开实现、分开认证、分开配置。
+最后再做质检员题目管理系统网页自动提交。它和作业员自测 API 上传分开实现、分开认证、分开配置。
