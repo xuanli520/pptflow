@@ -12,6 +12,8 @@ Fork hygiene -> 产品入口 -> 作业模型 -> Claude runtime spike -> Agent ad
 
 ## Claude runtime 前置结论
 
+已验证agent sdk可用
+
 2026-06-09 调研结论：p2ro MVP 不能依赖未确认的 `claude app-server`。本机 Claude Code 2.1.143 没有暴露 Codex 风格 `app-server --listen stdio://`；官方 Anthropic 文档给出的可编程路径是 Claude Agent SDK 和 `claude -p` 的 headless/stream-json 模式。Remote Control 和 `claude mcp serve` 都不是 p2ro TUI 可直接消费的本地 agent 编排 API。
 
 开发顺序必须先做 spike，再写 P0-P9：
