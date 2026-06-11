@@ -1729,8 +1729,8 @@ func stageGBrowserContext(projectPath string) string {
 	if hints := stageGBrowserTestHints(projectPath); hints != "" {
 		builder.WriteString(hints)
 	}
-	for _, rel := range []string{"metadata.json", "README.md", "readme.md", filepath.Join("repo", "README.md"), filepath.Join("repo", "readme.md")} {
-		path := filepath.Join(projectPath, rel)
+	for _, rel := range []string{"metadata.json", "README.md", "readme.md", "repo/README.md", "repo/readme.md"} {
+		path := filepath.Join(projectPath, filepath.FromSlash(rel))
 		if content, err := readBoundedText(path, 512*1024); err == nil {
 			builder.WriteString(untrustedDocument(rel, path, content))
 		}
@@ -1814,8 +1814,8 @@ type stageGContextDocument struct {
 func stageGReadmeDocuments(projectPath string) []stageGContextDocument {
 	var docs []stageGContextDocument
 	seen := map[string]bool{}
-	for _, rel := range []string{"README.md", "readme.md", filepath.Join("repo", "README.md"), filepath.Join("repo", "readme.md")} {
-		path := filepath.Join(projectPath, rel)
+	for _, rel := range []string{"README.md", "readme.md", "repo/README.md", "repo/readme.md"} {
+		path := filepath.Join(projectPath, filepath.FromSlash(rel))
 		clean := filepath.Clean(path)
 		if seen[clean] {
 			continue
