@@ -499,12 +499,12 @@ func StageGPartialProductBlockerFindingForTest(observations []TestBrowserObserva
 	return stageGPartialProductBlockerFinding(observations, reason)
 }
 
-func StageGPositiveEvidenceOutcomeForTest(candidates []TestBrowserURLCandidate, observations []TestBrowserObservation, blocked []TestBlockedBrowserAction, reason string) (TestFrontendE2ESummary, bool) {
-	return stageGPositiveEvidenceOutcome(candidates, observations, blocked, reason)
+func StageGNativeDialogBoundaryEvidenceForTest(observations []TestBrowserObservation) string {
+	return stageGNativeDialogBoundaryEvidence(observations)
 }
 
-func StageGNeedsDeterministicEvidenceSnapshotForTest(observations []TestBrowserObservation) bool {
-	return stageGNeedsDeterministicEvidenceSnapshot(observations)
+func StageGPositiveEvidenceOutcomeForTest(candidates []TestBrowserURLCandidate, observations []TestBrowserObservation, blocked []TestBlockedBrowserAction, reason string) (TestFrontendE2ESummary, bool) {
+	return stageGPositiveEvidenceOutcome(candidates, observations, blocked, reason)
 }
 
 func AppendStageGRepoSnapshotFindingsForTest(record model.StageRecord, summary TestFrontendE2ESummary, repoPath string, before map[string]string) (model.StageRecord, TestFrontendE2ESummary) {

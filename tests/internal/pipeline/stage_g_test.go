@@ -249,7 +249,9 @@ func TestBrowserActionPromptTemplateRendersFromPromptProfileAsset(t *testing.T) 
 	}
 	for _, want := range []string{
 		"Run p2r stage G as a browser E2E planner.",
-		"finish requires at least 5 key browser screenshots",
+		"passed conclusions need strong distinct browser evidence",
+		"browser action tool errors",
+		"Authentication is not a universal success requirement",
 		"Do not use fill_input retries",
 		"Do not click logout",
 		"fill every visible username/email/account field and every password field before submitting",
@@ -436,6 +438,73 @@ func TestStageGPartialProductBlockerFindingDetectsAuthGate(t *testing.T) {
 	})
 	if finding, ok := pipelinepkg.StageGPartialProductBlockerFindingForTest(observations, "timeout"); ok {
 		t.Fatalf("recovered auth failure should not be a blocker: %#v", finding)
+	}
+}
+
+func TestStageGNativeDialogBoundarySupportsNonPassedConclusion(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:      "click_button",
+			OK:          false,
+			CurrentURL:  "http://127.0.0.1:5173/editor/1",
+			Title:       "SketchPad Studio",
+			VisibleText: "Editor + Page Components Preview",
+			Error:       "native prompt dismissed because action.value was not supplied",
+			Metadata: map[string]string{
+				"p2r_dialog_type":           "prompt",
+				"p2r_dialog_message":        "Page title?",
+				"p2r_dialog_default_value":  "Page 1",
+				"p2r_dialog_action":         "dismissed",
+				"p2r_dialog_reason":         "missing_action_value",
+				"p2r_dialog_value_supplied": "false",
+			},
+		},
+	}
+	evidence := pipelinepkg.StageGNativeDialogBoundaryEvidenceForTest(observations)
+	if !strings.Contains(evidence, "native prompt dialog") || !strings.Contains(evidence, "Page title?") {
+		t.Fatalf("unexpected native dialog evidence: %q", evidence)
+	}
+	finding, ok := pipelinepkg.StageGPartialProductBlockerFindingForTest(observations, "planner could not infer a safe dialog value")
+	if !ok {
+		t.Fatal("expected native dialog boundary finding")
+	}
+	if finding.Title != "Native browser dialog required explicit model input" {
+		t.Fatalf("unexpected finding: %#v", finding)
+	}
+	summary := pipelinepkg.TestFrontendE2ESummary{
+		Status: "blocked",
+		Findings: []pipelinepkg.FrontendE2EFinding{{
+			Severity: "High",
+			Title:    finding.Title,
+		}},
+	}
+	if reason := pipelinepkg.StageGFinishScreenshotBlockReasonForSummaryForTest(summary, observations); reason != "" {
+		t.Fatalf("native dialog boundary should allow limited screenshot finish, got %q", reason)
+	}
+}
+
+func TestStageGAuthGateProtectedAPI401DoesNotBecomeProductFailure(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:        "open_candidate",
+			OK:            true,
+			CurrentURL:    "http://127.0.0.1:18080/login",
+			Title:         "FreightNest - Warehouse Management",
+			VisibleText:   "FreightNest Sign In Email Password",
+			ConsoleErrors: []string{"Failed to load resource: the server responded with a status of 401 (Unauthorized)"},
+			NetworkIssues: []browserpkg.NetworkIssue{
+				{URL: "http://127.0.0.1:18080/api/dashboard", Status: 401},
+			},
+			NetworkEvents: []browserpkg.NetworkEvent{
+				{URL: "http://127.0.0.1:18080/api/dashboard", Method: "GET", Status: 401, ResourceType: "fetch"},
+			},
+		},
+	}
+	if finding, ok := pipelinepkg.StageGPartialProductBlockerFindingForTest(observations, "after opening login"); ok {
+		t.Fatalf("auth-gate protected API 401 should not be product blocker: %#v", finding)
+	}
+	if summary, ok := pipelinepkg.StageGPositiveEvidenceOutcomeForTest(nil, observations, nil, "after opening login"); ok {
+		t.Fatalf("auth-gate login shell should not pass either: %#v", summary)
 	}
 }
 
@@ -825,6 +894,53 @@ func TestStageGPositiveEvidenceOutcomePassesAuthenticatedInteractiveUIWithoutDom
 	notes := strings.Join(summary.Notes, "\n")
 	if !strings.Contains(notes, "business_network_endpoints=0") || !strings.Contains(notes, "interactive_product_states=2") || !strings.Contains(notes, "product_navigation_changes=1") {
 		t.Fatalf("unexpected evidence note: %s", notes)
+	}
+}
+
+func TestStageGPositiveEvidenceOutcomePassesPublicInteractiveUIWithoutAuth(t *testing.T) {
+	root := t.TempDir()
+	observations := []pipelinepkg.TestBrowserObservation{
+		{
+			Action:      "open_candidate",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/workspace",
+			Title:       "Northwind Desk",
+			VisibleText: "Northwind Desk Today Queue Assigned Items Waiting Review Recent Activity Search Filter Owner Priority Due Date",
+			Controls: []browserpkg.ControlSummary{
+				{Role: "link", Text: "Queue"},
+				{Role: "link", Text: "Calendar"},
+				{Role: "link", Text: "People"},
+				{Role: "button", Text: "Add Item"},
+				{Role: "button", Text: "Export"},
+				{Role: "input", Placeholder: "Search"},
+				{Role: "input", Type: "select", Name: "priority"},
+			},
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "workspace.png")),
+		},
+		{
+			Action:      "click_navigation",
+			OK:          true,
+			CurrentURL:  "http://127.0.0.1:5173/workspace/review",
+			Title:       "Northwind Desk",
+			VisibleText: "Northwind Desk Review Queue Pending Approval Assigned Items Recent Activity Search Filter Owner Status Due Date",
+			Controls: []browserpkg.ControlSummary{
+				{Role: "link", Text: "Queue"},
+				{Role: "link", Text: "Review"},
+				{Role: "button", Text: "Approve"},
+				{Role: "button", Text: "Export"},
+				{Role: "input", Placeholder: "Search"},
+				{Role: "input", Type: "select", Name: "status"},
+			},
+			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "workspace-review.png")),
+		},
+	}
+	summary, ok := pipelinepkg.StageGPositiveEvidenceOutcomeForTest(nil, observations, nil, "planner timeout")
+	if !ok {
+		t.Fatal("expected public interactive product UI evidence to finish Stage G without auth")
+	}
+	notes := strings.Join(summary.Notes, "\n")
+	if summary.Status != "passed" || strings.Contains(notes, "auth_success=true") || !strings.Contains(notes, "interactive_product_states=2") {
+		t.Fatalf("unexpected public UI evidence summary: %#v", summary)
 	}
 }
 
@@ -1253,7 +1369,50 @@ func TestStageGPlannerTimeoutRecognizesGenericTimeoutErrors(t *testing.T) {
 	}
 }
 
-func TestStageGStopsBeforePlannerCanPolluteSuccessfulEvidence(t *testing.T) {
+func TestStageGActionRunnerErrorFeedsPlannerReactLoop(t *testing.T) {
+	fixture := newStageGReplayFixture(t, "TASK-20260612-RUNNER-ERROR")
+	open := pipelinepkg.TestBrowserAction{Action: "open_candidate", URLID: "url_1", Reason: "open app"}
+	failedSummary := json.RawMessage(`{"schema_version":"p2r.frontend_e2e.v1","status":"failed","reason":"browser tool could not open the app","findings":[{"severity":"High","title":"browser tool failed","evidence":"wrapper launch failed"}]}`)
+	plannerCalls := 0
+	actionCalls := 0
+	runner := fixture.NewRunner(
+		pipelinepkg.WithStageGBrowserPlannerForTest(func(ctx context.Context, sc pipelinepkg.StageContext, promptTemplate, profile, contextText string, candidates []pipelinepkg.TestBrowserURLCandidate, observations []pipelinepkg.TestBrowserObservation, blocked []pipelinepkg.TestBlockedBrowserAction, round int, timeout time.Duration) (string, []pipelinepkg.ArtifactWarning, error) {
+			plannerCalls++
+			if plannerCalls == 1 {
+				content, err := json.Marshal(open)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(content), nil, nil
+			}
+			if len(observations) != 1 || observations[0].OK || !strings.Contains(observations[0].Error, "wrapper launch failed") {
+				t.Fatalf("planner did not receive runner error observation: %#v", observations)
+			}
+			content, err := json.Marshal(pipelinepkg.TestBrowserAction{Action: "finish", Reason: "conclude from browser tool error", Summary: failedSummary})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(content), nil, nil
+		}),
+		pipelinepkg.WithStageGBrowserActionRunnerForTest(func(ctx context.Context, action browserpkg.Action, policy browserpkg.Policy, timeout time.Duration) (pipelinepkg.TestBrowserObservation, error) {
+			actionCalls++
+			return pipelinepkg.TestBrowserObservation{}, errors.New("wrapper launch failed")
+		}),
+	)
+	record := runner.StageGForTest(context.Background(), fixture.Run, fixture.Project, fixture.Runtime)
+	if record.Status != model.StageFailed || record.ErrorSummary != "frontend E2E findings" {
+		t.Fatalf("Stage G runner-error record = %#v, want accepted failed agent conclusion", record)
+	}
+	if plannerCalls != 2 || actionCalls != 1 {
+		t.Fatalf("runner error should feed one planner retry, planner=%d action=%d", plannerCalls, actionCalls)
+	}
+	summary := readStageGSummaryForTest(t, fixture.ArtifactRoot)
+	if summary.Status != "failed" || len(summary.Findings) == 0 || summary.Findings[0].Title != "browser tool failed" {
+		t.Fatalf("Stage G runner-error summary = %#v", summary)
+	}
+}
+
+func TestStageGAcceptsModelFinishAfterSuccessfulEvidence(t *testing.T) {
 	fixture := newStageGReplayFixture(t, "TASK-20260611-REPLAY")
 	repoFile := filepath.Join(fixture.RepoPath, "src", "app.ts")
 	if err := os.MkdirAll(filepath.Dir(repoFile), 0o755); err != nil {
@@ -1267,7 +1426,7 @@ func TestStageGStopsBeforePlannerCanPolluteSuccessfulEvidence(t *testing.T) {
 		{Action: "fill_input", Selector: "input[type=\"email\"]", Value: "admin@example.com", Reason: "fill email"},
 		{Action: "fill_input", Selector: "input[type=\"password\"]", Value: "password", Reason: "fill password"},
 		{Action: "click_button", Selector: "button[type=\"submit\"]", Reason: "submit login"},
-		{Action: "click_navigation", Reason: "planner should not be asked after sufficient evidence"},
+		{Action: "finish", Reason: "model concluded from authenticated dashboard evidence", Summary: json.RawMessage(`{"schema_version":"p2r.frontend_e2e.v1","status":"passed","reason":"authenticated dashboard workflow was reached","findings":[]}`)},
 	}
 	plannerCalls := 0
 	actionCalls := 0
@@ -1328,8 +1487,8 @@ func TestStageGStopsBeforePlannerCanPolluteSuccessfulEvidence(t *testing.T) {
 	if record.Status != model.StageDone || record.ErrorSummary != "" {
 		t.Fatalf("Stage G record = %#v, want done without error", record)
 	}
-	if plannerCalls != 3 || actionCalls != 4 {
-		t.Fatalf("Stage G should stop after successful evidence before polluted planner action, planner=%d action=%d", plannerCalls, actionCalls)
+	if plannerCalls != 5 || actionCalls != 4 {
+		t.Fatalf("Stage G should wait for explicit model finish after successful evidence, planner=%d action=%d", plannerCalls, actionCalls)
 	}
 	if len(record.Findings) != 1 || record.Findings[0].Title != "Stage G modified repository source files" {
 		t.Fatalf("Stage G replay should preserve repo mutation finding, got %#v", record.Findings)
@@ -1372,6 +1531,7 @@ func TestStageGRepoSnapshotFailureContinuesBrowserExploration(t *testing.T) {
 		{Action: "fill_input", Selector: "input[type=\"email\"]", Value: "admin@example.com", Reason: "fill email"},
 		{Action: "fill_input", Selector: "input[type=\"password\"]", Value: "password", Reason: "fill password"},
 		{Action: "click_button", Selector: "button[type=\"submit\"]", Reason: "submit login"},
+		{Action: "finish", Reason: "model concluded from authenticated dashboard evidence", Summary: json.RawMessage(`{"schema_version":"p2r.frontend_e2e.v1","status":"passed","reason":"authenticated dashboard workflow was reached","findings":[]}`)},
 	}
 	plannerCalls := 0
 	actionCalls := 0
@@ -1425,7 +1585,7 @@ func TestStageGRepoSnapshotFailureContinuesBrowserExploration(t *testing.T) {
 	if record.Status != model.StageDone || record.ErrorSummary != "" {
 		t.Fatalf("Stage G snapshot failure record = %#v, want done with finding after browser evidence", record)
 	}
-	if plannerCalls != 3 || actionCalls != 4 {
+	if plannerCalls != 5 || actionCalls != 4 {
 		t.Fatalf("Stage G should continue after repo snapshot failure, planner=%d action=%d", plannerCalls, actionCalls)
 	}
 	if len(record.Findings) == 0 || record.Findings[0].Title != "Stage G repository snapshot failed" {
@@ -1455,7 +1615,7 @@ func TestStageGReplayLoginServerErrorFailsWithProductEvidence(t *testing.T) {
 		{Action: "fill_input", Selector: "input[type=\"text\"]", Value: "admin", Reason: "fill username"},
 		{Action: "fill_input", Selector: "input[type=\"password\"]", Value: "password", Reason: "fill password"},
 		{Action: "click_button", Selector: "form button", Reason: "submit login"},
-		{Action: "fill_input", Selector: "input[type=\"text\"]", Value: "admin", Reason: "retry username"},
+		{Action: "finish", Reason: "model concluded from login server error", Summary: json.RawMessage(`{"schema_version":"p2r.frontend_e2e.v1","status":"failed","reason":"login request returned a server error","findings":[{"severity":"High","title":"Login request returned server error","rule":"Credentialed login should not return 5xx","evidence":"POST /api/auth/login status=500","impact":"Users cannot reach authenticated workflows.","minimum_fix":"Fix the login endpoint and rerun Stage G."}]}`)},
 	}
 	plannerCalls := 0
 	actionCalls := 0
@@ -1504,10 +1664,10 @@ func TestStageGReplayLoginServerErrorFailsWithProductEvidence(t *testing.T) {
 	if record.Status != model.StageFailed || record.ErrorSummary != "frontend E2E findings" {
 		t.Fatalf("Stage G login 500 record = %#v, want failed product evidence", record)
 	}
-	if plannerCalls != 3 || actionCalls != 4 {
-		t.Fatalf("Stage G login 500 replay calls planner=%d action=%d, want evidence failure after login submit", plannerCalls, actionCalls)
+	if plannerCalls != 5 || actionCalls != 4 {
+		t.Fatalf("Stage G login 500 replay calls planner=%d action=%d, want model finish after login submit", plannerCalls, actionCalls)
 	}
-	if len(record.Findings) == 0 || record.Findings[0].Title != "Frontend workflow could not progress after product error" || !strings.Contains(record.Findings[0].Evidence, "status=500") {
+	if len(record.Findings) == 0 || record.Findings[0].Title != "Login request returned server error" || !strings.Contains(record.Findings[0].Evidence, "status=500") {
 		t.Fatalf("Stage G login 500 missing product error finding: %#v", record.Findings)
 	}
 	summary := readStageGSummaryForTest(t, fixture.ArtifactRoot)
@@ -1572,7 +1732,7 @@ func TestStageGReplayAuthAcceptedStillOnLoginFailsAsAuthTransition(t *testing.T)
 	if record.Status != model.StageFailed || record.ErrorSummary != "frontend E2E findings" {
 		t.Fatalf("Stage G auth-stuck record = %#v, want failed auth transition", record)
 	}
-	if plannerCalls != 4 || actionCalls != 5 {
+	if plannerCalls != 5 || actionCalls != 5 {
 		t.Fatalf("Stage G auth-stuck replay calls planner=%d action=%d, want failure after accepted auth follow-up stays on login", plannerCalls, actionCalls)
 	}
 	if len(record.Findings) == 0 || record.Findings[0].Title != "Authentication response did not reach authenticated browser workflow" || !strings.Contains(record.Findings[0].Evidence, "status=200") {
@@ -1584,13 +1744,14 @@ func TestStageGReplayAuthAcceptedStillOnLoginFailsAsAuthTransition(t *testing.T)
 	}
 }
 
-func TestStageGDeterministicallySubmitsFilledAuthGateBeforePlannerRetry(t *testing.T) {
-	fixture := newStageGReplayFixture(t, "TASK-20260612-AUTH-AUTOSUBMIT")
+func TestStageGUsesModelSubmittedAuthActionBeforeFinish(t *testing.T) {
+	fixture := newStageGReplayFixture(t, "TASK-20260612-AUTH-MODEL-SUBMIT")
 	actions := []pipelinepkg.TestBrowserAction{
 		{Action: "open_candidate", URLID: "url_1", Reason: "open login"},
 		{Action: "fill_input", Selector: "input[type=\"email\"]", Value: "admin@example.com", Reason: "fill email"},
 		{Action: "fill_input", Selector: "input[type=\"password\"]", Value: "password", Reason: "fill password"},
-		{Action: "fill_input", Selector: "form input[type=\"email\"]", Value: "admin@example.com", Reason: "bad retry should not be requested"},
+		{Action: "click_button", Text: "Sign In", Reason: "model submits the observed filled login button"},
+		{Action: "finish", Reason: "model concluded from authenticated dashboard evidence", Summary: json.RawMessage(`{"schema_version":"p2r.frontend_e2e.v1","status":"passed","reason":"authenticated dashboard workflow was reached","findings":[]}`)},
 	}
 	plannerCalls := 0
 	actionCalls := 0
@@ -1624,8 +1785,8 @@ func TestStageGDeterministicallySubmitsFilledAuthGateBeforePlannerRetry(t *testi
 			case 3:
 				observation.Controls = loginControls(true, true)
 			case 4:
-				if action.Name != "click_button" || action.Selector != "button[type=submit], form button, input[type=submit]" {
-					t.Fatalf("expected deterministic submit action, got %#v", action)
+				if action.Name != "click_button" || action.Text != "Sign In" {
+					t.Fatalf("expected model-selected submit action, got %#v", action)
 				}
 				observation.CurrentURL = "http://127.0.0.1:5173/admin/dashboard"
 				observation.Title = "Admin Dashboard"
@@ -1644,14 +1805,14 @@ func TestStageGDeterministicallySubmitsFilledAuthGateBeforePlannerRetry(t *testi
 	)
 	record := runner.StageGForTest(context.Background(), fixture.Run, fixture.Project, fixture.Runtime)
 	if record.Status != model.StageDone || record.ErrorSummary != "" {
-		t.Fatalf("Stage G deterministic auth submit record = %#v", record)
+		t.Fatalf("Stage G model auth submit record = %#v", record)
 	}
-	if plannerCalls != 3 || actionCalls != 4 {
-		t.Fatalf("deterministic submit should skip planner retry, planner=%d action=%d", plannerCalls, actionCalls)
+	if plannerCalls != 5 || actionCalls != 4 {
+		t.Fatalf("model submit should be explicit before finish, planner=%d action=%d", plannerCalls, actionCalls)
 	}
 	summary := readStageGSummaryForTest(t, fixture.ArtifactRoot)
 	if summary.Status != "passed" || !strings.Contains(strings.Join(summary.Notes, "\n"), "business_network_endpoints=2") {
-		t.Fatalf("unexpected deterministic auth submit summary: %#v", summary)
+		t.Fatalf("unexpected model auth submit summary: %#v", summary)
 	}
 }
 
@@ -1661,7 +1822,8 @@ func TestStageGReplayBlazorAuthSelectorTimeoutFailsAsAuthCoverage(t *testing.T) 
 		{Action: "open_candidate", URLID: "url_1", Reason: "open Blazor app"},
 		{Action: "fill_input", Selector: "input[type=\"email\"]", Value: "admin@example.com", Reason: "fill email"},
 		{Action: "fill_input", Selector: "input[type=\"password\"]", Value: "password", Reason: "fill password"},
-		{Action: "fill_input", Selector: "form input[type=\"email\"]", Value: "admin@example.com", Reason: "bad retry should not be requested"},
+		{Action: "click_button", Text: "Sign In", Reason: "model submits the observed filled login button"},
+		{Action: "fill_input", Selector: "form input[type=\"email\"]", Value: "admin@example.com", Reason: "retry username after submit selector failure"},
 	}
 	plannerCalls := 0
 	actionCalls := 0
@@ -1697,12 +1859,12 @@ func TestStageGReplayBlazorAuthSelectorTimeoutFailsAsAuthCoverage(t *testing.T) 
 			case 3:
 				observation.Controls = loginControls(true, true)
 			case 4:
-				if action.Name != "click_button" || action.Selector != "button[type=submit], form button, input[type=submit]" {
-					t.Fatalf("expected deterministic submit action, got %#v", action)
+				if action.Name != "click_button" || action.Text != "Sign In" {
+					t.Fatalf("expected model-selected submit action, got %#v", action)
 				}
 				observation.OK = false
 				observation.Controls = loginControls(true, true)
-				observation.Error = `locator.click: Timeout 5000ms exceeded. waiting for locator('button[type=submit], form button, input[type=submit]').first()`
+				observation.Error = `locator.click: Timeout 5000ms exceeded. waiting for getByRole('button', { name: 'Sign In' })`
 			case 5:
 				if action.Name != "fill_input" {
 					t.Fatalf("expected planner fallback after one submit failure, got %#v", action)
@@ -1720,8 +1882,8 @@ func TestStageGReplayBlazorAuthSelectorTimeoutFailsAsAuthCoverage(t *testing.T) 
 	if record.Status != model.StageFailed || record.ErrorSummary != "frontend E2E findings" {
 		t.Fatalf("Stage G Blazor timeout record = %#v, want failed auth coverage", record)
 	}
-	if plannerCalls != 4 || actionCalls != 5 {
-		t.Fatalf("Stage G Blazor timeout replay calls planner=%d action=%d, want deterministic submit failure after credentials", plannerCalls, actionCalls)
+	if plannerCalls != 6 || actionCalls != 5 {
+		t.Fatalf("Stage G Blazor timeout replay calls planner=%d action=%d, want model submit failure then fallback", plannerCalls, actionCalls)
 	}
 	if len(record.Findings) == 0 || record.Findings[0].Title != "Authentication controls prevented browser workflow coverage" || !strings.Contains(record.Findings[0].Evidence, "selector failure(s)") {
 		t.Fatalf("Stage G Blazor timeout missing auth selector finding: %#v", record.Findings)
@@ -1729,71 +1891,6 @@ func TestStageGReplayBlazorAuthSelectorTimeoutFailsAsAuthCoverage(t *testing.T) 
 	summary := readStageGSummaryForTest(t, fixture.ArtifactRoot)
 	if summary.Status != "failed" || len(summary.Findings) == 0 || !strings.Contains(summary.Findings[0].Evidence, "selector failure(s)") {
 		t.Fatalf("Stage G Blazor timeout summary = %#v", summary)
-	}
-}
-
-func TestStageGNeedsDeterministicEvidenceSnapshotWhenOnlyOneSupportScreenshot(t *testing.T) {
-	root := t.TempDir()
-	observations := []pipelinepkg.TestBrowserObservation{
-		{
-			Action:      "click_button",
-			OK:          true,
-			CurrentURL:  "http://127.0.0.1:5173/admin/dashboard",
-			Title:       "Admin Dashboard",
-			VisibleText: "Admin Dashboard User Management Analytics Settings",
-			NetworkEvents: []browserpkg.NetworkEvent{
-				{URL: "http://127.0.0.1:5173/api/login", Method: "POST", Status: 200, ResourceType: "xhr"},
-				{URL: "http://127.0.0.1:5173/api/users", Method: "GET", Status: 200, ResourceType: "xhr"},
-				{URL: "http://127.0.0.1:5173/api/analytics", Method: "GET", Status: 200, ResourceType: "xhr"},
-			},
-			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "dashboard.png")),
-		},
-	}
-	if !pipelinepkg.StageGNeedsDeterministicEvidenceSnapshotForTest(observations) {
-		t.Fatal("expected deterministic snapshot when core business evidence is ready with one support screenshot")
-	}
-	observations = append(observations, pipelinepkg.TestBrowserObservation{
-		Action:      "snapshot",
-		OK:          true,
-		CurrentURL:  "http://127.0.0.1:5173/admin/dashboard",
-		Title:       "Admin Dashboard",
-		VisibleText: "Admin Dashboard User Management Analytics Settings",
-	})
-	if pipelinepkg.StageGNeedsDeterministicEvidenceSnapshotForTest(observations) {
-		t.Fatal("failed support snapshot should not trigger an unbounded snapshot loop")
-	}
-	observations[len(observations)-1].ScreenshotPath = writeTinyPNG(t, filepath.Join(root, "dashboard-2.png"))
-	if pipelinepkg.StageGNeedsDeterministicEvidenceSnapshotForTest(observations) {
-		t.Fatal("snapshot should stop once support screenshots are sufficient")
-	}
-}
-
-func TestStageGNeedsDeterministicEvidenceSnapshotCanCaptureSecondSupportScreenshot(t *testing.T) {
-	root := t.TempDir()
-	observations := []pipelinepkg.TestBrowserObservation{
-		{
-			Action:      "click_button",
-			OK:          true,
-			CurrentURL:  "http://127.0.0.1:5173/admin/dashboard",
-			Title:       "Admin Dashboard",
-			VisibleText: "Admin Dashboard User Management Analytics Settings",
-			NetworkEvents: []browserpkg.NetworkEvent{
-				{URL: "http://127.0.0.1:5173/api/login", Method: "POST", Status: 200, ResourceType: "xhr"},
-				{URL: "http://127.0.0.1:5173/api/users", Method: "GET", Status: 200, ResourceType: "xhr"},
-				{URL: "http://127.0.0.1:5173/api/analytics", Method: "GET", Status: 200, ResourceType: "xhr"},
-			},
-		},
-		{
-			Action:         "snapshot",
-			OK:             true,
-			CurrentURL:     "http://127.0.0.1:5173/admin/dashboard",
-			Title:          "Admin Dashboard",
-			VisibleText:    "Admin Dashboard User Management Analytics Settings",
-			ScreenshotPath: writeTinyPNG(t, filepath.Join(root, "dashboard-2.png")),
-		},
-	}
-	if !pipelinepkg.StageGNeedsDeterministicEvidenceSnapshotForTest(observations) {
-		t.Fatal("one successful support snapshot should allow one more deterministic snapshot")
 	}
 }
 
@@ -1976,6 +2073,34 @@ func TestStageGRepeatedStateStallIgnoresAuthGateBeforeSubmitLimit(t *testing.T) 
 	}
 	if reason := pipelinepkg.StageGObservationStopReasonForTest(observations); reason != "" {
 		t.Fatalf("one submit should not stop auth exploration, got %q", reason)
+	}
+}
+
+func TestStageGAuthGateStallIgnoresFailedSelectorSubmits(t *testing.T) {
+	observations := []pipelinepkg.TestBrowserObservation{
+		{Action: "open_candidate", OK: true, Controls: loginControls(true, true)},
+		{
+			Action:   "click_button",
+			OK:       false,
+			Controls: loginControls(true, true),
+			Error:    "locator.click: Timeout 5000ms exceeded. waiting for locator('button[type=submit]').first()",
+		},
+		{
+			Action:   "submit_local_form",
+			OK:       false,
+			Controls: loginControls(true, true),
+			Error:    "locator.press: Target page, context or browser has been closed",
+		},
+	}
+	for index := range observations {
+		observations[index].CurrentURL = "http://127.0.0.1:5173/login"
+		observations[index].VisibleText = "SketchPad Studio Sign in Username Password"
+	}
+	if evidence := pipelinepkg.StageGAuthGateStallEvidenceForTest(observations); evidence != "" {
+		t.Fatalf("failed selector/tool submit attempts should not count as auth-gate stall, got %q", evidence)
+	}
+	if reason := pipelinepkg.StageGObservationStopReasonForTest(observations); reason != "" {
+		t.Fatalf("failed selector/tool submit attempts should feed react loop, got %q", reason)
 	}
 }
 

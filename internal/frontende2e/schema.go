@@ -1,4 +1,4 @@
-package pipeline
+package frontende2e
 
 import (
 	"encoding/json"
@@ -9,6 +9,8 @@ import (
 )
 
 const frontendE2ESchemaVersion = "p2r.frontend_e2e.v1"
+
+const SchemaVersion = frontendE2ESchemaVersion
 
 type FrontendE2ESummary struct {
 	SchemaVersion  string                 `json:"schema_version"`
@@ -46,6 +48,10 @@ func parseFrontendE2ESummary(raw json.RawMessage) (FrontendE2ESummary, error) {
 	return summary, nil
 }
 
+func ParseSummary(raw json.RawMessage) (FrontendE2ESummary, error) {
+	return parseFrontendE2ESummary(raw)
+}
+
 func validateFrontendE2ESummary(summary FrontendE2ESummary) error {
 	if summary.SchemaVersion != frontendE2ESchemaVersion {
 		return fmt.Errorf("schema_version must be %s", frontendE2ESchemaVersion)
@@ -64,6 +70,10 @@ func validateFrontendE2ESummary(summary FrontendE2ESummary) error {
 		}
 	}
 	return nil
+}
+
+func ValidateSummary(summary FrontendE2ESummary) error {
+	return validateFrontendE2ESummary(summary)
 }
 
 func validFrontendE2ESeverity(severity string) bool {
@@ -99,6 +109,10 @@ func frontendE2EFindings(summary FrontendE2ESummary, sourcePath string) []model.
 	return findings
 }
 
+func Findings(summary FrontendE2ESummary, sourcePath string) []model.Finding {
+	return frontendE2EFindings(summary, sourcePath)
+}
+
 func frontendE2ESchemaFailureFinding(sourcePath string, err error) model.Finding {
 	return model.Finding{
 		Stage:      string(model.StageG),
@@ -110,4 +124,8 @@ func frontendE2ESchemaFailureFinding(sourcePath string, err error) model.Finding
 		MinimumFix: "Rerun Stage G with a valid finish summary.",
 		SourcePath: sourcePath,
 	}
+}
+
+func SchemaFailureFinding(sourcePath string, err error) model.Finding {
+	return frontendE2ESchemaFailureFinding(sourcePath, err)
 }

@@ -1,24 +1,66 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"sort"
 	"strings"
+
+	browserpkg "github.com/xuanli520/p2r_tui/internal/browser"
+	"github.com/xuanli520/p2r_tui/internal/frontende2e"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 )
 
-type BrowserURLCandidate struct {
-	ID            string `json:"id"`
-	URL           string `json:"url"`
-	Origin        string `json:"origin"`
-	Service       string `json:"service"`
-	Source        string `json:"source"`
-	ProbeOK       bool   `json:"probe_ok"`
-	ProbeStatus   int    `json:"probe_status,omitempty"`
-	ProbeError    string `json:"probe_error,omitempty"`
-	ContainerPort int    `json:"container_port"`
-	HostPort      int    `json:"host_port"`
-	Protocol      string `json:"protocol,omitempty"`
+type BrowserURLCandidate = frontende2e.BrowserURLCandidate
+type BrowserActionRisk = frontende2e.BrowserActionRisk
+
+const (
+	BrowserRiskReadOnly      = frontende2e.BrowserRiskReadOnly
+	BrowserRiskNavigation    = frontende2e.BrowserRiskNavigation
+	BrowserRiskLocalStateful = frontende2e.BrowserRiskLocalStateful
+	BrowserRiskDestructive   = frontende2e.BrowserRiskDestructive
+)
+
+type BrowserAction = frontende2e.BrowserAction
+type BlockedBrowserAction = frontende2e.BlockedBrowserAction
+type FrontendE2ESummary = frontende2e.FrontendE2ESummary
+type FrontendE2EFinding = frontende2e.FrontendE2EFinding
+
+const frontendE2ESchemaVersion = frontende2e.SchemaVersion
+
+type browserActionValidation = frontende2e.BrowserActionValidation
+
+func parseBrowserAction(raw string, candidates []BrowserURLCandidate) browserActionValidation {
+	return frontende2e.ParseBrowserAction(raw, candidates)
+}
+
+func validateBrowserAction(action BrowserAction, candidates []BrowserURLCandidate, raw string) browserActionValidation {
+	return frontende2e.ValidateBrowserAction(action, candidates, raw)
+}
+
+func browserActionForWrapper(action BrowserAction, candidates []BrowserURLCandidate) (browserpkg.Action, error) {
+	return frontende2e.BrowserActionForWrapper(action, candidates)
+}
+
+func browserActionTextEndsSession(value string) bool {
+	return frontende2e.BrowserActionTextEndsSession(value)
+}
+
+func parseFrontendE2ESummary(raw json.RawMessage) (FrontendE2ESummary, error) {
+	return frontende2e.ParseSummary(raw)
+}
+
+func validateFrontendE2ESummary(summary FrontendE2ESummary) error {
+	return frontende2e.ValidateSummary(summary)
+}
+
+func frontendE2EFindings(summary FrontendE2ESummary, sourcePath string) []model.Finding {
+	return frontende2e.Findings(summary, sourcePath)
+}
+
+func frontendE2ESchemaFailureFinding(sourcePath string, err error) model.Finding {
+	return frontende2e.SchemaFailureFinding(sourcePath, err)
 }
 
 func browserURLCandidates(runtime RuntimeState) []BrowserURLCandidate {
@@ -98,18 +140,7 @@ func browserCandidateKey(service string, mapping portMapping, candidateURL strin
 }
 
 func browserAllowlistOrigins(candidates []BrowserURLCandidate) []string {
-	seen := map[string]bool{}
-	var origins []string
-	for _, candidate := range candidates {
-		origin := strings.TrimSpace(candidate.Origin)
-		if origin == "" || seen[origin] {
-			continue
-		}
-		seen[origin] = true
-		origins = append(origins, origin)
-	}
-	sort.Strings(origins)
-	return origins
+	return frontende2e.AllowlistOrigins(candidates)
 }
 
 func browserCandidateURL(mapping portMapping) string {

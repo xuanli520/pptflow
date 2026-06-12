@@ -1,9 +1,11 @@
-package pipeline
+package frontende2e
 
 import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	browserpkg "github.com/xuanli520/p2r_tui/internal/browser"
 )
 
 type BrowserActionRisk string
@@ -40,6 +42,8 @@ type browserActionValidation struct {
 	Blocked *BlockedBrowserAction
 }
 
+type BrowserActionValidation = browserActionValidation
+
 var browserActionRisks = map[string]BrowserActionRisk{
 	"open_candidate":    BrowserRiskNavigation,
 	"wait":              BrowserRiskReadOnly,
@@ -62,6 +66,10 @@ func parseBrowserAction(raw string, candidates []BrowserURLCandidate) browserAct
 		return invalidBrowserAction("", "invalid action JSON: "+err.Error(), "", raw)
 	}
 	return validateBrowserAction(action, candidates, raw)
+}
+
+func ParseBrowserAction(raw string, candidates []BrowserURLCandidate) BrowserActionValidation {
+	return parseBrowserAction(raw, candidates)
 }
 
 func validateBrowserAction(action BrowserAction, candidates []BrowserURLCandidate, raw string) browserActionValidation {
@@ -111,6 +119,10 @@ func validateBrowserAction(action BrowserAction, candidates []BrowserURLCandidat
 		return invalidBrowserAction(action.Action, "input value exceeds 2000 characters", string(risk), raw)
 	}
 	return browserActionValidation{Action: action, Risk: risk}
+}
+
+func ValidateBrowserAction(action BrowserAction, candidates []BrowserURLCandidate, raw string) BrowserActionValidation {
+	return validateBrowserAction(action, candidates, raw)
 }
 
 func browserActionEndsSession(action BrowserAction) bool {
@@ -190,4 +202,29 @@ func browserCandidateByID(id string, candidates []BrowserURLCandidate) (BrowserU
 		}
 	}
 	return BrowserURLCandidate{}, fmt.Errorf("unknown url_id %q", id)
+}
+
+func BrowserActionForWrapper(action BrowserAction, candidates []BrowserURLCandidate) (browserpkg.Action, error) {
+	result := browserpkg.Action{
+		Name:     action.Action,
+		Selector: action.Selector,
+		Text:     action.Text,
+		Value:    action.Value,
+		Reason:   action.Reason,
+	}
+	if action.Action == "open_candidate" {
+		candidate, err := browserCandidateByID(action.URLID, candidates)
+		if err != nil {
+			return result, err
+		}
+		result.URL = candidate.URL
+	}
+	if action.Action == "wait" {
+		result.WaitMS = 1000
+	}
+	return result, nil
+}
+
+func BrowserActionTextEndsSession(value string) bool {
+	return browserActionTextEndsSession(value)
 }

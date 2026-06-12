@@ -138,6 +138,8 @@ const pageErrors = [];
 const networkIssues = [];
 const networkEvents = [];
 const blockedRequests = [];
+const dialogEvents = [];
+const pendingDialogHandlers = [];
 let blockedSessionRequest = '';
 
 function trim(value, limit) {
@@ -234,6 +236,95 @@ function looksSessionEndingURL(raw) {
   } catch (_) {
     return looksSessionEndingText(raw);
   }
+}
+
+function actionCanHandleNativeDialogValue() {
+  return ['click_navigation', 'click_button', 'submit_local_form'].includes(action.name);
+}
+
+function dialogAcceptsPositiveValue(value) {
+  return ['1', 'true', 'yes', 'y', 'ok', 'accept', 'accepted', 'confirm', 'continue', 'proceed'].includes(String(value || '').trim().toLowerCase());
+}
+
+function dialogMetadata() {
+  if (dialogEvents.length === 0) return undefined;
+  const last = dialogEvents[dialogEvents.length - 1] || {};
+  const metadata = {
+    p2r_dialog_count: String(dialogEvents.length),
+    p2r_dialog_type: trim(last.type || '', 80),
+    p2r_dialog_message: trim(last.message || '', 500),
+    p2r_dialog_default_value: trim(last.defaultValue || '', 240),
+    p2r_dialog_action: trim(last.action || '', 80),
+    p2r_dialog_reason: trim(last.reason || '', 120),
+    p2r_dialog_value_supplied: last.valueSupplied ? 'true' : 'false'
+  };
+  return metadata;
+}
+
+function lastDialogNeedsExplicitValue() {
+  if (dialogEvents.length === 0) return false;
+  const last = dialogEvents[dialogEvents.length - 1] || {};
+  return ['prompt', 'confirm'].includes(last.type) &&
+    last.action === 'dismissed' &&
+    ['missing_action_value', 'action_cannot_use_dialog_value'].includes(last.reason);
+}
+
+async function handleNativeDialog(dialog) {
+  const event = {
+    type: '',
+    message: '',
+    defaultValue: '',
+    action: 'dismissed',
+    reason: '',
+    valueSupplied: false
+  };
+  try {
+    event.type = dialog.type();
+    event.message = dialog.message();
+    if (typeof dialog.defaultValue === 'function') event.defaultValue = dialog.defaultValue();
+    const value = String(action.value || '');
+    const hasValue = value.trim() !== '';
+    event.valueSupplied = hasValue;
+    if (event.type === 'alert') {
+      await dialog.accept();
+      event.action = 'accepted';
+      event.reason = 'alert_acknowledged';
+    } else if (event.type === 'prompt' && hasValue && actionCanHandleNativeDialogValue()) {
+      await dialog.accept(value);
+      event.action = 'accepted';
+      event.reason = 'action_value';
+    } else if (event.type === 'confirm' && hasValue && actionCanHandleNativeDialogValue()) {
+      if (dialogAcceptsPositiveValue(value)) {
+        await dialog.accept();
+        event.action = 'accepted';
+      } else {
+        await dialog.dismiss();
+        event.action = 'dismissed';
+      }
+      event.reason = 'action_value';
+    } else {
+      await dialog.dismiss();
+      event.action = 'dismissed';
+      event.reason = hasValue ? 'action_cannot_use_dialog_value' : 'missing_action_value';
+    }
+  } catch (err) {
+    event.reason = 'dialog_handler_error: ' + (err && err.message ? err.message : String(err));
+  } finally {
+    dialogEvents.push(event);
+    if (dialogEvents.length > 20) dialogEvents.shift();
+  }
+}
+
+function trackNativeDialog(dialog) {
+  const pending = handleNativeDialog(dialog);
+  pendingDialogHandlers.push(pending);
+  return pending;
+}
+
+async function settleNativeDialogs() {
+  if (pendingDialogHandlers.length === 0) return;
+  const pending = pendingDialogHandlers.splice(0, pendingDialogHandlers.length);
+  await Promise.allSettled(pending);
 }
 
 async function sessionEndingLocatorEvidence(locator) {
@@ -381,6 +472,7 @@ async function actionLocator(page) {
 }
 
 async function collect(page, ok, error) {
+  await settleNativeDialogs();
   let title = '';
   let visibleText = '';
   let controls = [];
@@ -426,7 +518,7 @@ async function collect(page, ok, error) {
       await page.context().storageState({ path: policy.storage_state_path });
     }
   } catch (_) {}
-  return {
+  const observation = {
     action: action.name,
     ok,
     current_url: currentURL,
@@ -441,6 +533,9 @@ async function collect(page, ok, error) {
     screenshot_path: screenshotPath,
     error: error || ''
   };
+  const metadata = dialogMetadata();
+  if (metadata) observation.metadata = metadata;
+  return observation;
 }
 
 (async () => {
@@ -481,6 +576,9 @@ async function collect(page, ok, error) {
       return route.abort('blockedbyclient');
     });
     page = await context.newPage();
+    page.on('dialog', (dialog) => {
+      trackNativeDialog(dialog);
+    });
     const formState = loadFormState();
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(trim(msg.text(), 1000));
@@ -531,6 +629,8 @@ async function collect(page, ok, error) {
       ]);
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(750);
+      await settleNativeDialogs();
+      if (lastDialogNeedsExplicitValue()) throw new Error('native ' + dialogEvents[dialogEvents.length - 1].type + ' dismissed because action.value was not supplied');
       if (blockedSessionRequest) throw new Error('session-ending browser request blocked: ' + blockedSessionRequest);
     } else if (action.name === 'fill_input') {
       const locator = await actionLocator(page);
@@ -552,6 +652,8 @@ async function collect(page, ok, error) {
       }
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(750);
+      await settleNativeDialogs();
+      if (lastDialogNeedsExplicitValue()) throw new Error('native ' + dialogEvents[dialogEvents.length - 1].type + ' dismissed because action.value was not supplied');
       if (blockedSessionRequest) throw new Error('session-ending browser request blocked: ' + blockedSessionRequest);
     } else if (action.name === 'go_back') {
       await page.goBack({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
