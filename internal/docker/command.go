@@ -39,6 +39,7 @@ func (c commandContext) runStreaming(ctx context.Context, step string, timeout t
 		c.logLine(fmt.Sprintf("=== %s end: skipped ===", step), "p2r", true)
 		return executor.Result{}
 	}
+	c.logLine("$ "+CommandLine("docker", args), "p2r", false)
 	onOutput := func(line string, source string) {
 		if c.Progress != nil {
 			c.Progress(ProgressEvent{Line: RedactLogText(line), Source: source})

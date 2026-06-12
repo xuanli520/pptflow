@@ -63,7 +63,7 @@ func (r Runner) stageCIsolated(ctx context.Context, run model.RunRecord, project
 	record.LogPath = logPath
 	record.ArtifactPaths = append(record.ArtifactPaths, logPath, screenshotPath, summaryPath, proxyPath, envPath, overridePath)
 	writer := NewArtifactWriter(run.ArtifactRoot)
-	repoPath := filepath.Join(project.Path, "repo")
+	repoPath := runtimeInputRepoPath(run, project.Path)
 
 	fail := func(reason string, finding *model.Finding, extra map[string]any) model.StageRecord {
 		if extra == nil {

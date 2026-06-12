@@ -47,6 +47,9 @@ type DockerRuntimeSummary struct {
 	RunID                string                     `json:"run_id"`
 	TaskID               string                     `json:"task_id"`
 	ComposeProject       string                     `json:"compose_project"`
+	ComposeProjectSource string                     `json:"compose_project_source,omitempty"`
+	GeneratedProject     string                     `json:"generated_compose_project,omitempty"`
+	DeclaredProject      string                     `json:"declared_compose_project,omitempty"`
 	ComposeFile          string                     `json:"compose_file,omitempty"`
 	ComposeFiles         []string                   `json:"compose_files,omitempty"`
 	WorkDir              string                     `json:"work_dir"`
@@ -116,8 +119,8 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		timeouts.Port = 30 * time.Second
 	}
 	repoPath := filepath.Clean(req.RepoPath)
-	projectName := ComposeProjectName(s.Config.ComposeProjectPrefix, req.TaskID, req.RunID)
-	composeFile := FindCompose(repoPath)
+	discoveredComposeFiles := FindComposeFiles(repoPath)
+	composeFile := firstComposeFile(discoveredComposeFiles)
 	readmeCommand := []string{}
 	if composeFile == "" {
 		readmeCommand = ReadmeComposeCommand(repoPath)
@@ -140,17 +143,36 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	if composeFile != "" {
 		workDir = filepath.Dir(composeFile)
 	}
+	envPrep := runtimeEnvFilePreparation{}
+	if composeFile != "" {
+		envPrep = prepareRuntimeEnvFiles(composeFile, workDir, req.ArtifactRoot)
+	}
+	projectSelection := SelectComposeProjectName(ComposeProjectSelectionRequest{
+		Prefix:        s.Config.ComposeProjectPrefix,
+		TaskID:        req.TaskID,
+		RunID:         req.RunID,
+		ComposeFiles:  discoveredComposeFiles,
+		WorkDir:       workDir,
+		ReadmeCommand: readmeCommand,
+		Env:           req.Env,
+		EnvFiles:      envPrep.EnvFiles,
+	})
+	projectName := projectSelection.Name
 	cmd := commandContext{Exec: s.Exec, WorkDir: workDir, Env: req.Env, Log: req.Log, Progress: req.Progress}
 	result := StartRuntimeResult{}
 	summary := DockerRuntimeSummary{
-		RunID:          req.RunID,
-		TaskID:         req.TaskID,
-		ComposeProject: projectName,
-		ComposeFile:    composeFile,
-		ComposeFiles:   []string{},
-		WorkDir:        workDir,
-		PullPolicy:     s.Config.PullPolicy,
+		RunID:                req.RunID,
+		TaskID:               req.TaskID,
+		ComposeProject:       projectName,
+		ComposeProjectSource: projectSelection.Source,
+		GeneratedProject:     projectSelection.Generated,
+		DeclaredProject:      projectSelection.Declared,
+		ComposeFile:          composeFile,
+		ComposeFiles:         []string{},
+		WorkDir:              workDir,
+		PullPolicy:           s.Config.PullPolicy,
 	}
+	summary.Warnings = append(summary.Warnings, projectSelection.Warnings...)
 	mirrorSummary := BuildMirrorSummary{
 		Enabled:      s.Config.BuildMirrors.Enabled,
 		Mode:         s.Config.BuildMirrors.Mode,
@@ -166,14 +188,13 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	composeEnvFiles := []string{}
 	var effectiveConfig string
 	if composeFile != "" {
-		envPrep := prepareRuntimeEnvFiles(composeFile, workDir, req.ArtifactRoot)
 		composeEnvFiles = append(composeEnvFiles, envPrep.EnvFiles...)
 		summary.EnvFilesPrepared = append(summary.EnvFilesPrepared, envPrep.Generated...)
 		summary.Warnings = append(summary.Warnings, envPrep.Warnings...)
 		for _, generated := range envPrep.Generated {
 			cmd.logLine("prepared runtime env file from example: "+generated, "p2r", false)
 		}
-		originalFiles = []string{composeFile}
+		originalFiles = append([]string{}, discoveredComposeFiles...)
 		baseRuntimeFiles = append([]string{}, originalFiles...)
 		if envPrep.ComposeFile != "" {
 			baseRuntimeFiles = append(baseRuntimeFiles, envPrep.ComposeFile)
@@ -249,14 +270,21 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 		}
 	} else {
 		summary.ReadmeCommandMode = true
+		summary.Pull = StepSummary{Status: "skipped"}
+		summary.Build = BuildStepSummary{Status: "skipped"}
+		readmeRuntimeFiles = append([]string{}, readmeComposeFiles(readmeCommand)...)
 		summary.Warnings = append(summary.Warnings, "README compose command mode: pull/build/mirror patch skipped")
 		mirrorSummary.Warnings = append(mirrorSummary.Warnings, "README compose command mode: Dockerfile patch skipped")
 	}
-	summary.ComposeFiles = append([]string{}, activeFiles...)
-	summary.ComposeFile = firstComposeFile(activeFiles)
-	mirrorSummary.ComposeFiles = append([]string{}, activeFiles...)
+	summaryFiles := activeFiles
+	if composeFile == "" {
+		summaryFiles = readmeRuntimeFiles
+	}
+	summary.ComposeFiles = append([]string{}, summaryFiles...)
+	summary.ComposeFile = firstComposeFile(summaryFiles)
+	mirrorSummary.ComposeFiles = append([]string{}, summaryFiles...)
 	if mirrorSummary.ComposeFile == "" {
-		mirrorSummary.ComposeFile = firstComposeFile(activeFiles)
+		mirrorSummary.ComposeFile = firstComposeFile(summaryFiles)
 	}
 	if composeFile != "" {
 		pullPolicy := strings.TrimSpace(s.Config.PullPolicy)
@@ -280,43 +308,36 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 			}
 		}
 		usingMirrorOverride := len(activeFiles) > len(baseRuntimeFiles)
-		build := cmd.runStreaming(ctx, "B2 docker compose build", timeouts.Build, ComposeCommandArgsWithProjectDirAndEnvFiles(activeFiles, workDir, projectName, composeEnvFiles, "build"), true)
-		summary.Build = buildSummaryFromResult(build, usingMirrorOverride)
-		if build.Err != nil && usingMirrorOverride && s.Config.BuildMirrors.FallbackToOriginal {
-			reason := "patched build failed: " + trimResultText(build)
-			fallbackReason := reason
-			if dockerfilePathOutsideContextFailure(build) {
-				fallbackReason = "dockerfile_path_outside_context"
+		if usingMirrorOverride {
+			build := cmd.runStreaming(ctx, "B2 docker compose build", timeouts.Build, ComposeCommandArgsWithProjectDirAndEnvFiles(activeFiles, workDir, projectName, composeEnvFiles, "build"), true)
+			summary.Build = buildSummaryFromResult(build, usingMirrorOverride)
+			if build.Err != nil && s.Config.BuildMirrors.FallbackToOriginal {
+				reason := "patched build failed: " + trimResultText(build)
+				fallbackReason := reason
+				if dockerfilePathOutsideContextFailure(build) {
+					fallbackReason = "dockerfile_path_outside_context"
+				}
+				cmd.logLine(reason, "p2r", false)
+				cmd.logLine("falling back to base compose file set for docker compose up --build", "p2r", false)
+				mirrorSummary.FallbackUsed = true
+				mirrorSummary.FallbackReason = fallbackReason
+				mirrorSummary.Warnings = append(mirrorSummary.Warnings, reason)
+				mirrorSummary.FallbackFrom = append([]string{}, activeFiles...)
+				mirrorSummary.FallbackTo = append([]string{}, baseRuntimeFiles...)
+				summary.Build.Status = "warning"
+				summary.Build.FallbackUsed = true
+				summary.Build.UsingMirrorOverride = false
+				summary.Build.Error = reason
+				activeFiles = append([]string{}, baseRuntimeFiles...)
+			} else if build.Err != nil {
+				reason := "prebuild failed; continuing with docker compose up --build: " + trimResultText(build)
+				cmd.logLine(reason, "p2r", false)
+				summary.Build.Status = "warning"
+				summary.Build.Error = reason
+				summary.Warnings = append(summary.Warnings, reason)
 			}
-			cmd.logLine(reason, "p2r", false)
-			cmd.logLine("falling back to base compose file set for build/up", "p2r", false)
-			mirrorSummary.FallbackUsed = true
-			mirrorSummary.FallbackReason = fallbackReason
-			mirrorSummary.Warnings = append(mirrorSummary.Warnings, reason)
-			mirrorSummary.FallbackFrom = append([]string{}, activeFiles...)
-			mirrorSummary.FallbackTo = append([]string{}, baseRuntimeFiles...)
-			summary.Build.FallbackUsed = true
-			activeFiles = append([]string{}, baseRuntimeFiles...)
-			fallbackBuild := cmd.runStreaming(ctx, "B2 docker compose build fallback", timeouts.Build, ComposeCommandArgsWithProjectDirAndEnvFiles(activeFiles, workDir, projectName, composeEnvFiles, "build"), true)
-			if fallbackBuild.Err != nil {
-				summary.Build.Status = "failed"
-				summary.Build.Error = "patched build and fallback build failed: " + trimResultText(fallbackBuild)
-				summary.RuntimeErrorCategory = "patched_build_failed_and_fallback_failed"
-				result.RuntimeSummary = summary
-				result.MirrorSummary = mirrorSummary
-				return result, &StartRuntimeError{Category: "patched_build_failed_and_fallback_failed", Message: summary.Build.Error, Fix: "Fix Dockerfile build failures or disable docker.build_mirrors.", Result: fallbackBuild}
-			}
-			summary.Build.Status = "ok"
-			summary.Build.Command = fallbackBuild.Command
-			summary.Build.ExitCode = fallbackBuild.ExitCode
-			summary.Build.Error = ""
-			summary.Build.UsingMirrorOverride = false
-		} else if build.Err != nil {
-			summary.Build.Status = "failed"
-			summary.RuntimeErrorCategory = "build_failed"
-			result.RuntimeSummary = summary
-			result.MirrorSummary = mirrorSummary
-			return result, &StartRuntimeError{Category: "build_failed", Message: "B2 docker compose build failed: " + trimResultText(build), Fix: "Fix Docker build failures and rerun stage B.", Result: build}
+		} else {
+			summary.Build = BuildStepSummary{Status: "skipped"}
 		}
 	}
 	if composeFile != "" {
@@ -376,7 +397,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	}
 	var upArgs []string
 	if composeFile != "" {
-		upArgs = ComposeCommandArgsWithProjectDirAndEnvFiles(activeFiles, workDir, projectName, composeEnvFiles, "up", "-d")
+		upArgs = ComposeCommandArgsWithProjectDirAndEnvFiles(activeFiles, workDir, projectName, composeEnvFiles, "up", "-d", "--build")
 	} else {
 		upArgs = ComposeArgsWithProjectFiles(readmeCommand, projectName, readmeLabelFiles)
 	}

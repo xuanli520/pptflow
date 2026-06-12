@@ -603,6 +603,51 @@ func TestStageBReturnsRuntimeStateWhenPortMapWriteFails(t *testing.T) {
 	}
 }
 
+func TestStageBUsesScriptInputSnapshotRepoWhenPresent(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	originalRepo := filepath.Join(projectPath, "repo")
+	artifactRoot := filepath.Join(root, "run")
+	snapshotRepo := filepath.Join(artifactRoot, "script_input_snapshot", "repo")
+	for _, dir := range []string{originalRepo, snapshotRepo, filepath.Join(artifactRoot, "logs")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(originalRepo, "docker-compose.yml"), []byte("name: original\nservices:\n  web:\n    image: original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapshotRepo, "docker-compose.yml"), []byte("name: snapshot\nservices:\n  web:\n    image: snapshot\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Docker.PullPolicy = "skip"
+	cfg.Docker.BuildMirrors.Enabled = false
+	cfg.Docker.HealthCheckTimeoutSeconds = 1
+	outcome := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(stageBDockerRunner{})).StageBForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath})
+
+	if outcome.Record.Status != model.StageDone {
+		t.Fatalf("Stage B should succeed, got %#v", outcome.Record)
+	}
+	if outcome.Runtime == nil || outcome.Runtime.WorkDir != snapshotRepo || outcome.Runtime.ComposeProject != "snapshot" {
+		t.Fatalf("Stage B should run against script_input_snapshot repo: %#v", outcome.Runtime)
+	}
+	summary, err := os.ReadFile(filepath.Join(artifactRoot, "docker_runtime_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{snapshotRepo, `"compose_project": "snapshot"`, `"compose_project_source": "compose_name"`} {
+		if !strings.Contains(string(summary), want) {
+			t.Fatalf("runtime summary missing %q:\n%s", want, summary)
+		}
+	}
+}
+
 func TestStageBEmptyPortMappingKeepsTaskDockerRunning(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()

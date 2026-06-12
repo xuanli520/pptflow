@@ -314,6 +314,253 @@ func TestFindComposeRecursesDeterministicallyAfterTopLevelPriority(t *testing.T)
 	}
 }
 
+func TestFindComposeFilesIncludesDefaultOverride(t *testing.T) {
+	repo := t.TempDir()
+	base := filepath.Join(repo, "docker-compose.yml")
+	override := filepath.Join(repo, "docker-compose.override.yml")
+	if err := os.WriteFile(base, []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(override, []byte("services:\n  web:\n    environment:\n      APP_ENV: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files := dockermgr.FindComposeFiles(repo)
+	if strings.Join(files, ",") != base+","+override {
+		t.Fatalf("compose files = %#v, want base plus default override", files)
+	}
+}
+
+func TestStartRuntimeUsesDeclaredComposeProjectName(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docker-compose.yml"), []byte("name: piw8e0fa7\nservices:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.Runtime.ComposeProject != "piw8e0fa7" || result.RuntimeSummary.ComposeProjectSource != "compose_name" {
+		t.Fatalf("compose project selection should honor declared name: runtime=%#v summary=%#v", result.Runtime, result.RuntimeSummary)
+	}
+	if containsCommand(runner.commands, "-p p2rqa_") || !containsCommand(runner.commands, "-p piw8e0fa7") {
+		t.Fatalf("docker commands should use declared compose project name: %#v", runner.commands)
+	}
+	if !containsCommand(runner.commands, " up -d --build") {
+		t.Fatalf("runtime startup should use up --build semantics: %#v", runner.commands)
+	}
+}
+
+func TestStartRuntimeLayersDefaultComposeOverride(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(repo, "docker-compose.yml")
+	override := filepath.Join(repo, "docker-compose.override.yml")
+	if err := os.WriteFile(base, []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(override, []byte("services:\n  web:\n    environment:\n      APP_ENV: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if !stringSliceContains(result.Runtime.ComposeFiles, base) || !stringSliceContains(result.Runtime.ComposeFiles, override) {
+		t.Fatalf("runtime compose files should include default override: %#v", result.Runtime.ComposeFiles)
+	}
+	if !containsCommand(runner.commands, "-f "+base+" -f "+override+" ") {
+		t.Fatalf("docker commands should layer default override like manual compose: %#v", runner.commands)
+	}
+}
+
+func TestStartRuntimeUsesComposeProjectNameFromEnvFile(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docker-compose.yml"), []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".env"), []byte("COMPOSE_PROJECT_NAME=envproj\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.Runtime.ComposeProject != "envproj" || result.RuntimeSummary.ComposeProjectSource != "compose_project_env" {
+		t.Fatalf("COMPOSE_PROJECT_NAME should match manual compose precedence: runtime=%#v summary=%#v", result.Runtime, result.RuntimeSummary)
+	}
+	if containsCommand(runner.commands, "-p p2rqa_") || !containsCommand(runner.commands, "-p envproj") {
+		t.Fatalf("docker commands should use COMPOSE_PROJECT_NAME project: %#v", runner.commands)
+	}
+}
+
+func TestStartRuntimeUsesComposeProjectNameFromDefaultOverride(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(repo, "docker-compose.yml")
+	override := filepath.Join(repo, "docker-compose.override.yml")
+	if err := os.WriteFile(base, []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(override, []byte("name: overrideproj\nservices:\n  web:\n    environment:\n      APP_ENV: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.Runtime.ComposeProject != "overrideproj" || result.RuntimeSummary.ComposeProjectSource != "compose_name" {
+		t.Fatalf("compose override name should be honored: runtime=%#v summary=%#v", result.Runtime, result.RuntimeSummary)
+	}
+	if !containsCommand(runner.commands, "-f "+base+" -f "+override+" -p overrideproj") {
+		t.Fatalf("docker commands should layer override and use its project name: %#v", runner.commands)
+	}
+}
+
+func TestStartRuntimeKeepsGeneratedProjectWhenComposeNameIsImplicit(t *testing.T) {
+	repo := writeComposeProject(t, t.TempDir())
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: t.TempDir(),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.RuntimeSummary.ComposeProjectSource != "generated" || !strings.HasPrefix(result.Runtime.ComposeProject, "p2rqa_") {
+		t.Fatalf("implicit compose project should keep p2r isolation: runtime=%#v summary=%#v", result.Runtime, result.RuntimeSummary)
+	}
+}
+
+func TestStartRuntimeResolvesComposeProjectNameFromGeneratedEnvFile(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	compose := "name: ${COMPOSE_PROJECT_NAME:-fallbackproj}\nservices:\n  api:\n    image: nginx\n    environment:\n      APP_ENV: ${APP_ENV}\n"
+	if err := os.WriteFile(filepath.Join(repo, "docker-compose.yml"), []byte(compose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".env.example"), []byte("COMPOSE_PROJECT_NAME=exampleproj\nAPP_ENV=test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.Runtime.ComposeProject != "exampleproj" || result.RuntimeSummary.ComposeProjectSource != "compose_project_env" {
+		t.Fatalf("generated env file should drive compose project selection: runtime=%#v summary=%#v", result.Runtime, result.RuntimeSummary)
+	}
+	if len(result.Runtime.EnvFiles) != 1 || !containsCommand(runner.commands, "--env-file "+result.Runtime.EnvFiles[0]+" ") {
+		t.Fatalf("docker commands should use generated env file: runtime=%#v commands=%#v", result.Runtime, runner.commands)
+	}
+	if containsCommand(runner.commands, "-p fallbackproj") || !containsCommand(runner.commands, "-p exampleproj") {
+		t.Fatalf("docker commands should use env-resolved project: %#v", runner.commands)
+	}
+}
+
+func TestStartRuntimeSkipsHardPrebuildWithoutMirrorOverride(t *testing.T) {
+	repo := writeComposeProject(t, t.TempDir())
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: t.TempDir(),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.RuntimeSummary.Build.Status != "skipped" {
+		t.Fatalf("prebuild should be skipped when no p2r mirror override is active: %#v", result.RuntimeSummary.Build)
+	}
+	if containsExplicitComposeBuildCommand(runner.commands) || !containsCommand(runner.commands, " up -d --build") {
+		t.Fatalf("startup should rely on up --build without separate hard build: %#v", runner.commands)
+	}
+}
+
 func TestStartRuntimeCopiesEnvExampleBeforeComposeConfig(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
@@ -535,6 +782,42 @@ func TestStartRuntimeAddsManagedLabelOverride(t *testing.T) {
 	}
 	if !containsCommand(runner.commands, overridePath+" -p") {
 		t.Fatalf("docker compose commands should include label override file: %#v", runner.commands)
+	}
+}
+
+func TestStartRuntimeReadmeCommandHonorsExplicitProjectAndFiles(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("`docker compose -p readmeproj -f custom.yml up --build`\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "custom.yml"), []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{}
+	cfg := config.Default().Docker
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.Runtime.ComposeProject != "readmeproj" || result.RuntimeSummary.ComposeProjectSource != "readme_project_flag" {
+		t.Fatalf("README explicit project should be preserved: runtime=%#v summary=%#v", result.Runtime, result.RuntimeSummary)
+	}
+	if !stringSliceContains(result.Runtime.ComposeFiles, "custom.yml") || result.RuntimeSummary.Pull.Status != "skipped" || result.RuntimeSummary.Build.Status != "skipped" {
+		t.Fatalf("README runtime should record command files and skipped prep steps: runtime=%#v summary=%#v", result.Runtime, result.RuntimeSummary)
+	}
+	if containsCommand(runner.commands, "-p p2rqa_") || !containsCommand(runner.commands, "-p readmeproj") || !containsCommand(runner.commands, "-f custom.yml") {
+		t.Fatalf("docker commands should preserve README project and files: %#v", runner.commands)
 	}
 }
 
@@ -970,6 +1253,15 @@ func writeComposeProject(t *testing.T, root string) string {
 func containsCommand(commands []string, needle string) bool {
 	for _, command := range commands {
 		if strings.Contains(command, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsExplicitComposeBuildCommand(commands []string) bool {
+	for _, command := range commands {
+		if strings.HasSuffix(command, " build") || strings.Contains(command, " build ") {
 			return true
 		}
 	}

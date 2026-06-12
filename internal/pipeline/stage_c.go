@@ -32,7 +32,7 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
 		record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), summary)
 	}
-	repoPath := filepath.Join(project.Path, "repo")
+	repoPath := runtimeInputRepoPath(run, project.Path)
 	script := filepath.Join(repoPath, "run_tests.sh")
 	if !fileExists(script) {
 		evidence := "Package spec violation: repo/run_tests.sh was not found. Stage C requires the repo/run_tests.sh entrypoint."

@@ -28,17 +28,25 @@ type composePSService struct {
 }
 
 func FindCompose(repoPath string) string {
+	files := FindComposeFiles(repoPath)
+	if len(files) > 0 {
+		return files[0]
+	}
+	return ""
+}
+
+func FindComposeFiles(repoPath string) []string {
 	for _, name := range composeFilePriorityNames() {
 		path := filepath.Join(repoPath, name)
 		if fileExists(path) {
-			return path
+			return appendDefaultComposeOverrides(path)
 		}
 	}
 	candidates := recursiveComposeCandidates(repoPath, 5)
 	if len(candidates) > 0 {
-		return candidates[0].Path
+		return appendDefaultComposeOverrides(candidates[0].Path)
 	}
-	return ""
+	return nil
 }
 
 type composeCandidate struct {
@@ -98,7 +106,31 @@ func recursiveComposeCandidates(repoPath string, maxDepth int) []composeCandidat
 }
 
 func composeFilePriorityNames() []string {
-	return []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+	return []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+}
+
+func appendDefaultComposeOverrides(composeFile string) []string {
+	composeFile = filepath.Clean(composeFile)
+	files := []string{composeFile}
+	dir := filepath.Dir(composeFile)
+	for _, name := range defaultComposeOverrideNames(filepath.Base(composeFile)) {
+		path := filepath.Join(dir, name)
+		if fileExists(path) {
+			files = append(files, path)
+		}
+	}
+	return files
+}
+
+func defaultComposeOverrideNames(base string) []string {
+	switch strings.ToLower(strings.TrimSpace(base)) {
+	case "compose.yaml", "compose.yml":
+		return []string{"compose.override.yaml", "compose.override.yml"}
+	case "docker-compose.yaml", "docker-compose.yml":
+		return []string{"docker-compose.override.yaml", "docker-compose.override.yml"}
+	default:
+		return nil
+	}
 }
 
 func composeDirDepth(rel string) int {
