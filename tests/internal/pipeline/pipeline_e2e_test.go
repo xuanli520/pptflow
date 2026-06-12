@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 	pipelinepkg "github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
@@ -147,8 +149,9 @@ exit 0
 		result pipelinepkg.Result
 		err    error
 	}, 1)
+	commandRunner := stageACancelCommandRunner{pythonPath: filepath.Join(fakeBin, "python")}
 	go func() {
-		result, err := pipelinepkg.NewRunner(store, cfg).Run(ctx, "TASK-CANCEL", pipelinepkg.RunOptions{Stage: "A"})
+		result, err := pipelinepkg.NewRunner(store, cfg, pipelinepkg.WithCommandRunner(commandRunner)).Run(ctx, "TASK-CANCEL", pipelinepkg.RunOptions{Stage: "A"})
 		resultCh <- struct {
 			result pipelinepkg.Result
 			err    error
@@ -204,6 +207,30 @@ exit 0
 	if got := len(strings.Fields(string(content))); got != 1 {
 		t.Fatalf("Stage A should stop launching helper scripts after cancellation, got %d invocations:\n%s", got, content)
 	}
+}
+
+type stageACancelCommandRunner struct {
+	pythonPath string
+	delegate   executor.Runner
+}
+
+func (r stageACancelCommandRunner) LookPath(name string) (string, error) {
+	switch filepath.Base(name) {
+	case "python":
+		return r.pythonPath, nil
+	case "python3", "uv", "node", "docker", "bash", "codex":
+		return "", errors.New("not found")
+	default:
+		return r.delegate.LookPath(name)
+	}
+}
+
+func (r stageACancelCommandRunner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	return r.delegate.Run(ctx, timeout, dir, env, name, args...)
+}
+
+func (r stageACancelCommandRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
+	return r.delegate.RunStreamingWithOutput(ctx, timeout, dir, env, writer, onOutput, name, args...)
 }
 
 func TestRunCapturesCodexAppServerFinalMessage(t *testing.T) {
