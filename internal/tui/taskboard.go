@@ -201,19 +201,18 @@ func applyJobToTaskProject(task *TaskProject, job scheduler.JobSnapshot) {
 		task.CurrentStatus = model.StageRunning
 	}
 	for _, stage := range job.Stages {
-		switch stage.Status {
-		case model.StageRunning:
+		if stage.Status == model.StageRunning {
 			task.CurrentStage = stage.Stage
 			task.CurrentStatus = stage.Status
 			return
-		case model.StageFailed, model.StageBlocked:
-			if task.FailedStage == "" {
-				task.FailedStage = stage.Stage
-				task.FailedSummary = stage.ErrorSummary
-				task.CurrentStage = stage.Stage
-				task.CurrentStatus = stage.Status
-			}
 		}
+	}
+	stage, summary, status := primaryFailedStage(job.Stages)
+	if stage != "" {
+		task.FailedStage = stage
+		task.FailedSummary = summary
+		task.CurrentStage = stage
+		task.CurrentStatus = status
 	}
 }
 

@@ -358,7 +358,6 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 		record.ArtifactPaths = append(record.ArtifactPaths, summaryPath)
 	case "G":
 		logPath := filepath.Join(run.ArtifactRoot, "logs", "G_frontend_e2e.log")
-		screenshotPath := qaArtifactPath(run.ArtifactRoot, "frontend_e2e_screenshot.png")
 		summaryPath := filepath.Join(run.ArtifactRoot, "frontend_e2e_summary.json")
 		reportPath := qaArtifactPath(run.ArtifactRoot, "frontend_e2e_report.md")
 		reason := record.ErrorSummary
@@ -380,9 +379,8 @@ func (r Runner) materializeSkippedStage(run model.RunRecord, record model.StageR
 		if err := writer.RequiredText("frontend_e2e_report.md", "# Browser Frontend E2E\n\n"+reason+"\n"); err != nil {
 			record = recordArtifactWriteError(record, err, reportPath)
 		}
-		pages, _ := renderTerminalLog(reason, screenshotPath)
 		record.LogPath = logPath
-		record.ArtifactPaths = append([]string{logPath, summaryPath, reportPath}, pages...)
+		record.ArtifactPaths = []string{logPath, summaryPath, reportPath}
 	}
 	return record
 }

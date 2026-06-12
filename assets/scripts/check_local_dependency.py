@@ -48,6 +48,8 @@ PRIVATE_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 PRIVATE_HINTS = ("internal", "intranet", "corp", "local", "lan")
+LOCALHOST_LABELS = {"localhost_reference", "loopback_reference"}
+ABSOLUTE_PATH_LABELS = {"absolute_windows_path", "absolute_unix_path"}
 
 
 def should_scan(path: Path, include_markdown: bool) -> bool:
@@ -56,6 +58,59 @@ def should_scan(path: Path, include_markdown: bool) -> bool:
             return False
         return True
     return path.name in {"Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+
+
+def is_test_path(path: Path) -> bool:
+    parts = {part.lower() for part in path.parts}
+    name = path.name.lower()
+    return bool(parts & {"test", "tests", "__tests__", "spec", "specs", "mocks", "mock", "fixtures"}) or (
+        "_test." in name
+        or name.startswith("test_")
+        or name.endswith(".test.js")
+        or name.endswith(".test.ts")
+        or name.endswith(".spec.js")
+        or name.endswith(".spec.ts")
+    )
+
+
+def is_compose_path(path: Path) -> bool:
+    return path.name.lower() in {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+
+
+def is_comment_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith(("#", "//", "/*", "*"))
+
+
+def is_metadata_path_field(path: Path, line: str) -> bool:
+    if path.name.lower() != "metadata.json":
+        return False
+    return bool(re.search(r'"(?:cwd|path|project_path|workspace|artifact_root|output_dir)"\s*:', line, re.IGNORECASE))
+
+
+def localhost_allowed_context(path: Path, line: str) -> bool:
+    lowered = line.lower()
+    if path.name.lower() == "run_tests.sh":
+        return True
+    if is_test_path(path):
+        return True
+    if is_comment_line(line):
+        return True
+    if is_compose_path(path):
+        if any(marker in lowered for marker in ("healthcheck", "test:", "curl ", "wget ", "nc ")):
+            return True
+        return bool(re.search(r"['\"]?(?:localhost|127\.0\.0\.1):\d+:\d+", lowered))
+    return False
+
+
+def should_ignore_match(label: str, path: Path, line: str) -> bool:
+    if label in LOCALHOST_LABELS:
+        return localhost_allowed_context(path, line)
+    if label in ABSOLUTE_PATH_LABELS:
+        return is_test_path(path) or is_metadata_path_field(path, line) or is_comment_line(line)
+    if label == "host_docker_internal":
+        return is_comment_line(line)
+    return False
 
 
 def main() -> int:
@@ -86,7 +141,7 @@ def main() -> int:
 
         for line_number, line in enumerate(content.splitlines(), start=1):
             for label, pattern in PATTERNS:
-                if pattern.search(line):
+                if pattern.search(line) and not should_ignore_match(label, path, line):
                     findings.append(f"{label}: {path}:{line_number}: {line.strip()}")
             image_match = PRIVATE_IMAGE_RE.match(line)
             if image_match:

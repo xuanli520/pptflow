@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	browserpkg "github.com/xuanli520/p2r_tui/internal/browser"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
@@ -107,10 +108,16 @@ type CommandRunner interface {
 
 type RunnerOption func(*Runner)
 
+type stageGBrowserPlanner func(context.Context, StageContext, string, string, string, []BrowserURLCandidate, []browserpkg.Observation, []BlockedBrowserAction, int, time.Duration) (string, []ArtifactWarning, error)
+
+type stageGBrowserActionRunner func(context.Context, browserpkg.Action, browserpkg.Policy, time.Duration) (browserpkg.Observation, error)
+
 type Runner struct {
-	store runStore
-	cfg   config.Config
-	exec  CommandRunner
+	store               runStore
+	cfg                 config.Config
+	exec                CommandRunner
+	stageGBrowserPlan   stageGBrowserPlanner
+	stageGBrowserAction stageGBrowserActionRunner
 }
 
 func WithCommandRunner(exec CommandRunner) RunnerOption {

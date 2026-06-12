@@ -41,10 +41,14 @@ func (c commandContext) runStreaming(ctx context.Context, step string, timeout t
 	}
 	onOutput := func(line string, source string) {
 		if c.Progress != nil {
-			c.Progress(ProgressEvent{Line: line, Source: source})
+			c.Progress(ProgressEvent{Line: RedactLogText(line), Source: source})
 		}
 	}
-	result := c.Exec.RunStreamingWithOutput(ctx, timeout, c.WorkDir, c.Env, c.Log, onOutput, "docker", args...)
+	logWriter := newRedactingWriter(c.Log)
+	result := c.Exec.RunStreamingWithOutput(ctx, timeout, c.WorkDir, c.Env, logWriter, onOutput, "docker", args...)
+	if err := logWriter.Flush(); err != nil && result.Err == nil {
+		result.Err = err
+	}
 	endLine := fmt.Sprintf("=== %s end: exit=%d timeout=%t err=%v ===", step, result.ExitCode, result.Timeout, result.Err)
 	c.logLine("", "p2r", false)
 	c.logLine(endLine, "p2r", true)
@@ -60,10 +64,10 @@ func (c commandContext) logLine(line, source string, done bool) {
 		if line == "" {
 			_, _ = fmt.Fprintln(c.Log)
 		} else {
-			_, _ = fmt.Fprintln(c.Log, line)
+			_, _ = fmt.Fprintln(c.Log, RedactLogText(line))
 		}
 	}
 	if c.Progress != nil && line != "" {
-		c.Progress(ProgressEvent{Line: line, Source: source, Done: done})
+		c.Progress(ProgressEvent{Line: RedactLogText(line), Source: source, Done: done})
 	}
 }

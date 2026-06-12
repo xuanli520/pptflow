@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/xuanli520/p2r_tui/assets"
 	"github.com/xuanli520/p2r_tui/internal/displaytime"
@@ -41,6 +43,7 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 		"defer_runtime_cleanup": opts.DeferRuntimeCleanup,
 		"self_test_report":      r.cfg.Pipeline.SelfTestReportPath,
 		"preflight":             "preflight.json",
+		"run_failure_summary":   "run_failure_summary.md",
 		"stage_timeouts":        r.cfg.Pipeline.StageTimeouts,
 		"tool_versions":         map[string]string{"p2r": "dev"},
 		"assets":                released,
@@ -106,7 +109,15 @@ func firstErrorString(errors ...error) string {
 }
 
 func (r Runner) writeStageStatus(runID, artifactRoot string, stages []model.StageRecord) error {
-	return NewArtifactWriter(artifactRoot).RequiredJSON("stage_status.json", model.StageStatusFile{RunID: runID, Stages: stages})
+	writer := NewArtifactWriter(artifactRoot)
+	if err := writer.RequiredJSON("stage_status.json", model.StageStatusFile{RunID: runID, Stages: stages}); err != nil {
+		return err
+	}
+	summary := runFailureSummary(runID, stages)
+	if err := writer.RequiredJSON("run_failure_summary.json", summary); err != nil {
+		return err
+	}
+	return writer.RequiredText("run_failure_summary.md", runFailureSummaryMarkdown(summary))
 }
 
 func runStatus(stages []model.StageRecord) string {
@@ -116,4 +127,147 @@ func runStatus(stages []model.StageRecord) string {
 		}
 	}
 	return model.RunCompletedClean
+}
+
+type runFailureSummaryPayload struct {
+	SchemaVersion         string                     `json:"schema_version"`
+	RunID                 string                     `json:"run_id"`
+	PrimaryStage          string                     `json:"primary_stage,omitempty"`
+	PrimaryStatus         string                     `json:"primary_status,omitempty"`
+	PrimaryErrorSummary   string                     `json:"primary_error_summary,omitempty"`
+	AcceptanceReportScope string                     `json:"acceptance_report_scope"`
+	Failures              []runFailureStageSummary   `json:"failures"`
+	Stages                []runFailureStatusSnapshot `json:"stages"`
+}
+
+type runFailureStageSummary struct {
+	Stage        string `json:"stage"`
+	Status       string `json:"status"`
+	ErrorSummary string `json:"error_summary,omitempty"`
+	FindingCount int    `json:"finding_count,omitempty"`
+}
+
+type runFailureStatusSnapshot struct {
+	Stage        string `json:"stage"`
+	Status       string `json:"status"`
+	ErrorSummary string `json:"error_summary,omitempty"`
+	FindingCount int    `json:"finding_count,omitempty"`
+}
+
+func runFailureSummary(runID string, stages []model.StageRecord) runFailureSummaryPayload {
+	summary := runFailureSummaryPayload{
+		SchemaVersion:         "p2r.run_failure_summary.v1",
+		RunID:                 runID,
+		AcceptanceReportScope: "acceptance_report.md is Stage A static acceptance evidence only; use run_failure_summary.json and stage_status.json for run-level failure aggregation.",
+		Failures:              []runFailureStageSummary{},
+		Stages:                []runFailureStatusSnapshot{},
+	}
+	for _, stage := range stages {
+		snapshot := runFailureStatusSnapshot{
+			Stage:        stage.Stage,
+			Status:       stage.Status,
+			ErrorSummary: strings.TrimSpace(stage.ErrorSummary),
+			FindingCount: len(stage.Findings),
+		}
+		summary.Stages = append(summary.Stages, snapshot)
+		if stage.Status == model.StageFailed || stage.Status == model.StageBlocked || len(stage.Findings) > 0 {
+			summary.Failures = append(summary.Failures, runFailureStageSummary(snapshot))
+		}
+	}
+	if primary, ok := primaryRunFailureStage(stages); ok {
+		summary.PrimaryStage = primary.Stage
+		summary.PrimaryStatus = primary.Status
+		summary.PrimaryErrorSummary = strings.TrimSpace(primary.ErrorSummary)
+	}
+	return summary
+}
+
+func primaryRunFailureStage(stages []model.StageRecord) (model.StageRecord, bool) {
+	bestPriority := 0
+	var best model.StageRecord
+	for _, stage := range stages {
+		priority := runFailureStagePriority(stage)
+		if priority == 0 {
+			continue
+		}
+		if bestPriority == 0 || priority < bestPriority {
+			bestPriority = priority
+			best = stage
+		}
+	}
+	return best, bestPriority != 0
+}
+
+func runFailureStagePriority(stage model.StageRecord) int {
+	switch stage.Status {
+	case model.StageFailed:
+		switch stage.Stage {
+		case string(model.StageB):
+			return 1
+		case string(model.StageG):
+			return 2
+		case string(model.StageC):
+			return 3
+		default:
+			return 10 + runFailureStageOrder(stage.Stage)
+		}
+	case model.StageBlocked:
+		switch stage.Stage {
+		case string(model.StageB):
+			return 30
+		case string(model.StageG):
+			return 31
+		case string(model.StageC):
+			return 32
+		default:
+			return 40 + runFailureStageOrder(stage.Stage)
+		}
+	default:
+		if len(stage.Findings) > 0 {
+			return 60 + runFailureStageOrder(stage.Stage)
+		}
+		return 0
+	}
+}
+
+func runFailureStageOrder(stage string) int {
+	for index, item := range model.AllStages() {
+		if item == stage {
+			return index
+		}
+	}
+	return 99
+}
+
+func runFailureSummaryMarkdown(summary runFailureSummaryPayload) string {
+	var builder strings.Builder
+	builder.WriteString("# Run Failure Summary\n\n")
+	builder.WriteString("This is the run-level failure aggregation. `acceptance_report.md` is Stage A static acceptance evidence only.\n\n")
+	if summary.PrimaryStage == "" {
+		builder.WriteString("Primary failure: none\n")
+	} else {
+		builder.WriteString("Primary failure: Stage " + summary.PrimaryStage + " " + summary.PrimaryStatus)
+		if summary.PrimaryErrorSummary != "" {
+			builder.WriteString(" - " + summary.PrimaryErrorSummary)
+		}
+		builder.WriteString("\n")
+	}
+	if len(summary.Failures) > 0 {
+		builder.WriteString("\n## Failed Or Finding Stages\n")
+		for _, item := range summary.Failures {
+			builder.WriteString("- " + item.Stage + " " + item.Status)
+			if item.ErrorSummary != "" {
+				builder.WriteString(": " + item.ErrorSummary)
+			}
+			if item.FindingCount > 0 {
+				builder.WriteString(" findings=" + strconv.Itoa(item.FindingCount))
+			}
+			builder.WriteString("\n")
+		}
+	}
+	builder.WriteString("\n## Stage Statuses\n")
+	for _, item := range summary.Stages {
+		builder.WriteString("- " + item.Stage + ": " + item.Status + "\n")
+	}
+	return builder.String()
 }

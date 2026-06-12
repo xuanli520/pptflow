@@ -662,7 +662,7 @@ failed_stage AS (
                s.stage,
                ROW_NUMBER() OVER (
                    PARTITION BY s.run_id
-                   ORDER BY %s, s.stage
+                   ORDER BY %s, %s, s.stage
                ) AS rn
         FROM run_stages s
         WHERE s.status IN ('failed', 'blocked')
@@ -720,7 +720,7 @@ project_rows AS (
     LEFT JOIN finding_counts fc ON fc.run_id = lr.run_id
     WHERE %s
 )
-`, stageOrderCaseSQL("s.stage"), where.sqlOrDefault())
+`, failurePriorityCaseSQL("s.status", "s.stage"), stageOrderCaseSQL("s.stage"), where.sqlOrDefault())
 }
 
 func normalizeProjectQuery(q ProjectQuery, paginated bool) ProjectQuery {
@@ -850,6 +850,19 @@ func stageOrderCaseSQL(column string) string {
 	}
 	builder.WriteString(" ELSE 99 END")
 	return builder.String()
+}
+
+func failurePriorityCaseSQL(statusColumn, stageColumn string) string {
+	return fmt.Sprintf(`CASE
+	WHEN %s = 'failed' AND %s = 'B' THEN 1
+	WHEN %s = 'failed' AND %s = 'G' THEN 2
+	WHEN %s = 'failed' AND %s = 'C' THEN 3
+	WHEN %s = 'failed' THEN 10
+	WHEN %s = 'blocked' AND %s = 'B' THEN 30
+	WHEN %s = 'blocked' AND %s = 'G' THEN 31
+	WHEN %s = 'blocked' AND %s = 'C' THEN 32
+	WHEN %s = 'blocked' THEN 40
+	ELSE 99 END`, statusColumn, stageColumn, statusColumn, stageColumn, statusColumn, stageColumn, statusColumn, statusColumn, stageColumn, statusColumn, stageColumn, statusColumn, stageColumn, statusColumn)
 }
 
 func projectSearchPredicate(search ProjectSearch) projectWhere {
@@ -1278,7 +1291,7 @@ func (s *Store) Findings(ctx context.Context, runID string) ([]model.Finding, er
 }
 
 func firstFailedStage(ctx context.Context, s *Store, runID string) string {
-	query := fmt.Sprintf(`SELECT COALESCE(stage, '') FROM run_stages WHERE run_id = ? AND status IN ('failed', 'blocked') ORDER BY %s, stage LIMIT 1`, stageOrderCaseSQL("stage"))
+	query := fmt.Sprintf(`SELECT COALESCE(stage, '') FROM run_stages WHERE run_id = ? AND status IN ('failed', 'blocked') ORDER BY %s, %s, stage LIMIT 1`, failurePriorityCaseSQL("status", "stage"), stageOrderCaseSQL("stage"))
 	row := s.db.QueryRowContext(ctx, query, runID)
 	var stage string
 	if err := row.Scan(&stage); err != nil {

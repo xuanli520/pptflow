@@ -282,6 +282,28 @@ func (r Runner) StageGForTest(ctx context.Context, run model.RunRecord, project 
 	})
 }
 
+func WithStageGBrowserPlannerForTest(planner func(context.Context, StageContext, string, string, string, []TestBrowserURLCandidate, []TestBrowserObservation, []TestBlockedBrowserAction, int, time.Duration) (string, []ArtifactWarning, error)) RunnerOption {
+	return func(r *Runner) {
+		if planner == nil {
+			return
+		}
+		r.stageGBrowserPlan = func(ctx context.Context, sc StageContext, promptTemplate, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int, timeout time.Duration) (string, []ArtifactWarning, error) {
+			return planner(ctx, sc, promptTemplate, profile, contextText, candidates, observations, blocked, round, timeout)
+		}
+	}
+}
+
+func WithStageGBrowserActionRunnerForTest(runner func(context.Context, browserpkg.Action, browserpkg.Policy, time.Duration) (TestBrowserObservation, error)) RunnerOption {
+	return func(r *Runner) {
+		if runner == nil {
+			return
+		}
+		r.stageGBrowserAction = func(ctx context.Context, action browserpkg.Action, policy browserpkg.Policy, timeout time.Duration) (browserpkg.Observation, error) {
+			return runner(ctx, action, policy, timeout)
+		}
+	}
+}
+
 func SubmitArtifactNamesForTest(mode string) []string {
 	return submitArtifactNames(mode)
 }
@@ -477,6 +499,18 @@ func StageGPartialProductBlockerFindingForTest(observations []TestBrowserObserva
 	return stageGPartialProductBlockerFinding(observations, reason)
 }
 
+func StageGPositiveEvidenceOutcomeForTest(candidates []TestBrowserURLCandidate, observations []TestBrowserObservation, blocked []TestBlockedBrowserAction, reason string) (TestFrontendE2ESummary, bool) {
+	return stageGPositiveEvidenceOutcome(candidates, observations, blocked, reason)
+}
+
+func StageGNeedsDeterministicEvidenceSnapshotForTest(observations []TestBrowserObservation) bool {
+	return stageGNeedsDeterministicEvidenceSnapshot(observations)
+}
+
+func AppendStageGRepoSnapshotFindingsForTest(record model.StageRecord, summary TestFrontendE2ESummary, repoPath string, before map[string]string) (model.StageRecord, TestFrontendE2ESummary) {
+	return appendStageGRepoSnapshotFindings(record, summary, repoPath, before)
+}
+
 func StageGObservationStopReasonForTest(observations []TestBrowserObservation) string {
 	return stageGObservationStopReason(observations)
 }
@@ -510,6 +544,10 @@ func SnapshotRepoForTest(repoPath string) (map[string]string, error) {
 
 func RepoSnapshotDiffForTest(before, after map[string]string) []string {
 	return repoSnapshotDiff(before, after)
+}
+
+func WriteStageStatusForTest(runID, artifactRoot string, stages []model.StageRecord) error {
+	return Runner{}.writeStageStatus(runID, artifactRoot, stages)
 }
 
 func FilteredRuntimeEnvForTest(environ, extra []string, docker bool) []string {

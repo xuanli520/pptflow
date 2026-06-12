@@ -27,6 +27,7 @@ const stageGRepeatedStateStallLimit = 7
 const stageGBrowserProfileName = "frontend_e2e_browser.md"
 const stageGBrowserActionPromptTemplateName = "frontend_e2e_browser_action_prompt.md"
 const stageGLegacyScreenshotName = "frontend_e2e_screenshot.png"
+const stageGEvidenceSummaryName = "frontend_e2e_evidence_summary.txt"
 const stageGKeyScreenshotDirName = "frontend_e2e_screenshots"
 
 func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
@@ -39,7 +40,7 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 	screenshotPath := qaArtifactPath(sc.Run.ArtifactRoot, stageGLegacyScreenshotName)
 	observationsPath := filepath.Join(sc.Run.ArtifactRoot, "frontend_e2e_observations.json")
 	record.LogPath = logPath
-	record.ArtifactPaths = []string{logPath, summaryPath, reportPath, screenshotPath, observationsPath}
+	record.ArtifactPaths = []string{logPath, summaryPath, reportPath, observationsPath}
 	timeout := stageTimeoutForStageContext(sc, r, string(model.StageG), 600)
 	stageCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -97,17 +98,11 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 			Title:      "Stage G repository snapshot failed",
 			Rule:       "Stage G must verify that browser exploration does not modify repo/ source files.",
 			Evidence:   snapshotErr.Error(),
-			Impact:     "Source mutation cannot be detected for this run.",
+			Impact:     "Browser exploration can continue, but source mutation cannot be detected for this run.",
 			MinimumFix: "Ensure repo/ is readable and rerun Stage G.",
 			SourcePath: repoPath,
 		})
-		return r.finishStageGUnavailable(record, writer, start, "repo snapshot failed", model.StageFailed, FrontendE2ESummary{
-			SchemaVersion: frontendE2ESchemaVersion,
-			Status:        "failed",
-			Reason:        "repo snapshot failed",
-			URLCandidates: candidates,
-			Findings:      []FrontendE2EFinding{},
-		}, nil)
+		before = nil
 	}
 
 	profilePath := filepath.Join(r.cfg.Codex.PromptProfilesDir, stageGBrowserProfileName)
@@ -162,22 +157,109 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 	var blocked []BlockedBrowserAction
 	invalidCount := 0
 	deadline := time.Now().Add(timeout)
+	executeAction := func(round int, planned BrowserAction, actionTimeout time.Duration) (browserpkg.Observation, error) {
+		action, err := browserActionForWrapper(planned, candidates)
+		if err != nil {
+			return browserpkg.Observation{}, err
+		}
+		actionPolicy := browserPolicy
+		if stageGShouldCaptureActionScreenshot(planned, observations) {
+			actionPolicy.ScreenshotPath = stageGRuntimeScreenshotPath(sc.Run.ArtifactRoot, round, action.Name)
+		} else {
+			actionPolicy.DisableScreenshot = true
+		}
+		return r.runStageGBrowserAction(stageCtx, nodePath, action, actionPolicy, actionTimeout)
+	}
 	for round := 1; round <= stageGMaxActions; round++ {
 		turnTimeout := time.Until(deadline)
 		if turnTimeout <= 0 || stageCtx.Err() != nil {
-			return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G timeout reached.")
+			return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G timeout reached.", repoPath, before)
+		}
+		if stageGNeedsDeterministicEvidenceSnapshot(observations) && turnTimeout > 8*time.Second {
+			actionTimeout := 45 * time.Second
+			if turnTimeout-2*time.Second < actionTimeout {
+				actionTimeout = turnTimeout - 2*time.Second
+			}
+			planned := BrowserAction{Action: "snapshot", Reason: "capture deterministic browser evidence before requesting another planner action"}
+			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogPlannedAction(round, planned))
+			observation, err := executeAction(round, planned, actionTimeout)
+			if err != nil {
+				if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "browser wrapper failed after sufficient deterministic browser evidence", repoPath, before); ok {
+					return finished
+				}
+				record.Findings = append(record.Findings, model.Finding{
+					Stage:      string(model.StageG),
+					Severity:   "High",
+					Title:      "Stage G browser wrapper failed",
+					Rule:       "Validated browser actions must execute through the p2r Playwright wrapper.",
+					Evidence:   err.Error(),
+					Impact:     "Browser E2E exploration stopped before completion.",
+					MinimumFix: "Install Playwright browser runtime or inspect the wrapper log and rerun Stage G.",
+					SourcePath: logPath,
+				})
+				return r.finishStageGUnavailable(record, writer, start, "browser wrapper failed", model.StageFailed, stageGSummary("failed", "browser wrapper failed", candidates, observations, blocked), observations)
+			}
+			observations = append(observations, observation)
+			bestEffortStageJSON(&record, writer, writer.RelativePath(observationsPath), observations)
+			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogObservation(round, observation))
+			appendStreamProgress(sc.Run.RunID, string(model.StageG), fmt.Sprintf("G action %d: %s -> ok=%t", round, planned.Action, observation.OK), "p2r", false, sc.Progress)
+			if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "Stage G collected sufficient deterministic browser evidence.", repoPath, before); ok {
+				return finished
+			}
+			if reason := stageGObservationStopReason(observations); reason != "" {
+				return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, reason, repoPath, before)
+			}
+			continue
+		}
+		if planned, ok := stageGDeterministicAuthSubmitAction(observations); ok && turnTimeout > 8*time.Second {
+			actionTimeout := 45 * time.Second
+			if turnTimeout-2*time.Second < actionTimeout {
+				actionTimeout = turnTimeout - 2*time.Second
+			}
+			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogPlannedAction(round, planned))
+			observation, err := executeAction(round, planned, actionTimeout)
+			if err != nil {
+				if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "browser wrapper failed after deterministic auth submit", repoPath, before); ok {
+					return finished
+				}
+				record.Findings = append(record.Findings, model.Finding{
+					Stage:      string(model.StageG),
+					Severity:   "High",
+					Title:      "Stage G browser wrapper failed",
+					Rule:       "Validated browser actions must execute through the p2r Playwright wrapper.",
+					Evidence:   err.Error(),
+					Impact:     "Browser E2E exploration stopped before completion.",
+					MinimumFix: "Install Playwright browser runtime or inspect the wrapper log and rerun Stage G.",
+					SourcePath: logPath,
+				})
+				return r.finishStageGUnavailable(record, writer, start, "browser wrapper failed", model.StageFailed, stageGSummary("failed", "browser wrapper failed", candidates, observations, blocked), observations)
+			}
+			observations = append(observations, observation)
+			bestEffortStageJSON(&record, writer, writer.RelativePath(observationsPath), observations)
+			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogObservation(round, observation))
+			appendStreamProgress(sc.Run.RunID, string(model.StageG), fmt.Sprintf("G action %d: %s -> ok=%t", round, planned.Action, observation.OK), "p2r", false, sc.Progress)
+			if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "Stage G completed after deterministic auth submit.", repoPath, before); ok {
+				return finished
+			}
+			if reason := stageGObservationStopReason(observations); reason != "" {
+				return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, reason, repoPath, before)
+			}
+			continue
 		}
 		if turnTimeout < 30*time.Second {
-			return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G timeout reached before another browser planning turn could complete.")
+			return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G timeout reached before another browser planning turn could complete.", repoPath, before)
 		}
 		if turnTimeout > 120*time.Second {
 			turnTimeout = 120 * time.Second
 		}
-		rawAction, warnings, err := r.nextBrowserAction(stageCtx, sc, string(promptTemplate), string(profile), contextText, candidates, observations, blocked, round, turnTimeout)
+		rawAction, warnings, err := r.nextStageGBrowserAction(stageCtx, sc, string(promptTemplate), string(profile), contextText, candidates, observations, blocked, round, turnTimeout)
 		recordArtifactWarnings(&record, writer, warnings)
 		if err != nil {
 			if stageGPlannerTimedOut(stageCtx, err) {
-				return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G timeout reached before Codex browser planner returned.")
+				return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G timeout reached before Codex browser planner returned.", repoPath, before)
+			}
+			if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "Codex browser planner failed after sufficient deterministic browser evidence", repoPath, before); ok {
+				return finished
 			}
 			record.Findings = append(record.Findings, model.Finding{
 				Stage:      string(model.StageG),
@@ -196,6 +278,9 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 			blocked = append(blocked, *validation.Blocked)
 			invalidCount++
 			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), fmt.Sprintf("blocked action round %d: %s\n", round, validation.Blocked.Reason))
+			if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "Stage G completed from collected browser evidence after planner returned an invalid action.", repoPath, before); ok {
+				return finished
+			}
 			if invalidCount > stageGMaxInvalidActions {
 				record.Findings = append(record.Findings, model.Finding{
 					Stage:      string(model.StageG),
@@ -211,13 +296,61 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 			}
 			continue
 		}
-		invalidCount = 0
 		if validation.Action.Action == "finish" {
 			summary, err := parseFrontendE2ESummary(validation.Action.Summary)
 			if err != nil {
+				if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "Stage G completed from collected browser evidence after planner returned an invalid finish summary.", repoPath, before); ok {
+					return finished
+				}
 				record.Findings = append(record.Findings, frontendE2ESchemaFailureFinding(summaryPath, err))
 				return r.finishStageGUnavailable(record, writer, start, "frontend E2E summary schema invalid", model.StageFailed, stageGSummary("failed", "frontend E2E summary schema invalid", candidates, observations, blocked), observations)
 			}
+			if strings.TrimSpace(summary.Status) == "passed" {
+				if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "Stage G completed from deterministic browser evidence after planner requested pass.", repoPath, before); ok {
+					return finished
+				}
+				if reason := stageGObservationStopReason(observations); reason != "" {
+					return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, reason, repoPath, before)
+				}
+				reason := "planner passed finish requires deterministic Stage G evidence"
+				blocked = append(blocked, BlockedBrowserAction{Action: validation.Action.Action, Reason: reason, Risk: string(validation.Risk), Raw: rawAction})
+				invalidCount++
+				bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), fmt.Sprintf("blocked action round %d: %s\n", round, reason))
+				if invalidCount > stageGMaxInvalidActions {
+					record.Findings = append(record.Findings, model.Finding{
+						Stage:      string(model.StageG),
+						Severity:   "High",
+						Title:      "Stage G received too many unsupported pass summaries",
+						Rule:       "Stage G pass status must be backed by deterministic browser evidence.",
+						Evidence:   reason,
+						Impact:     "Browser E2E exploration stopped before completion.",
+						MinimumFix: "Continue collecting authenticated product workflow evidence before returning a passed summary.",
+						SourcePath: logPath,
+					})
+					return r.finishStageGUnavailable(record, writer, start, "too many unsupported pass summaries", model.StageFailed, stageGSummary("blocked", "too many unsupported pass summaries", candidates, observations, blocked), observations)
+				}
+				continue
+			}
+			if reason := stageGFinishSummaryEvidenceBlockReason(summary, observations); reason != "" {
+				blocked = append(blocked, BlockedBrowserAction{Action: validation.Action.Action, Reason: reason, Risk: string(validation.Risk), Raw: rawAction})
+				invalidCount++
+				bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), fmt.Sprintf("blocked action round %d: %s\n", round, reason))
+				if invalidCount > stageGMaxInvalidActions {
+					record.Findings = append(record.Findings, model.Finding{
+						Stage:      string(model.StageG),
+						Severity:   "High",
+						Title:      "Stage G received too many unsupported finish summaries",
+						Rule:       "Stage G failed, partial, and blocked summaries must be backed by browser observations.",
+						Evidence:   reason,
+						Impact:     "Browser E2E exploration stopped before completion.",
+						MinimumFix: "Continue collecting concrete browser failure evidence before returning a non-passed summary.",
+						SourcePath: logPath,
+					})
+					return r.finishStageGUnavailable(record, writer, start, "too many unsupported finish summaries", model.StageFailed, stageGSummary("blocked", "too many unsupported finish summaries", candidates, observations, blocked), observations)
+				}
+				continue
+			}
+			invalidCount = 0
 			if reason := stageGFinishScreenshotBlockReasonForSummary(summary, observations); reason != "" {
 				blocked = append(blocked, BlockedBrowserAction{Action: validation.Action.Action, Reason: reason, Risk: string(validation.Risk), Raw: rawAction})
 				bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), fmt.Sprintf("blocked action round %d: %s\n", round, reason))
@@ -231,45 +364,23 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 			observationFindings := frontendE2EObservationFindings(observations, writer.RelativePath(screenshotPath), includeActionFailures)
 			record.Findings = append(record.Findings, observationFindings...)
 			summary.Findings = append(summary.Findings, frontendE2EFindingsFromModel(observationFindings)...)
-			after, snapshotErr := snapshotRepo(repoPath)
-			if snapshotErr != nil {
-				finding := model.Finding{
-					Stage:      string(model.StageG),
-					Severity:   "High",
-					Title:      "Stage G repository post-snapshot failed",
-					Rule:       "Stage G must verify that browser exploration does not modify repo/ source files.",
-					Evidence:   snapshotErr.Error(),
-					Impact:     "Source mutation cannot be ruled out for this run.",
-					MinimumFix: "Ensure repo/ is readable and rerun Stage G.",
-					SourcePath: repoPath,
-				}
-				record.Findings = append(record.Findings, finding)
-				summary.Findings = append(summary.Findings, frontendE2EFindingFromModel(finding))
-			} else if changes := repoSnapshotDiff(before, after); len(changes) > 0 {
-				finding := repoChangedFinding(changes, repoPath)
-				record.Findings = append(record.Findings, finding)
-				summary.Findings = append(summary.Findings, frontendE2EFindingFromModel(finding))
-			}
+			record, summary = appendStageGRepoSnapshotFindings(record, summary, repoPath, before)
 			record = r.writeStageGArtifacts(record, writer, summary, observations)
 			status := stageGFinishedStatus(record)
 			bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogFinish(summary.Status, record.ErrorSummary, len(observations), len(record.Findings)))
 			return finishStage(record, status, start)
 		}
-		action, err := browserActionForWrapper(validation.Action, candidates)
-		if err != nil {
+		if _, err := browserActionForWrapper(validation.Action, candidates); err != nil {
 			blocked = append(blocked, BlockedBrowserAction{Action: validation.Action.Action, Reason: err.Error(), Risk: string(validation.Risk), Raw: rawAction})
 			continue
 		}
+		invalidCount = 0
 		bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogPlannedAction(round, validation.Action))
-		actionPolicy := browserPolicy
-		if stageGShouldCaptureActionScreenshot(validation.Action, observations) {
-			actionPolicy.ScreenshotPath = stageGRuntimeScreenshotPath(sc.Run.ArtifactRoot, round, action.Name)
-		} else {
-			actionPolicy.DisableScreenshot = true
-		}
-		runner := browserpkg.NewPlaywrightWrapper(r.exec, nodePath, actionPolicy)
-		observation, err := runner.Run(stageCtx, action, 45*time.Second)
+		observation, err := executeAction(round, validation.Action, 45*time.Second)
 		if err != nil {
+			if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "browser wrapper failed after sufficient deterministic browser evidence", repoPath, before); ok {
+				return finished
+			}
 			record.Findings = append(record.Findings, model.Finding{
 				Stage:      string(model.StageG),
 				Severity:   "High",
@@ -286,11 +397,14 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 		bestEffortStageJSON(&record, writer, writer.RelativePath(observationsPath), observations)
 		bestEffortStageAppend(&record, writer, writer.RelativePath(logPath), stageGLogObservation(round, observation))
 		appendStreamProgress(sc.Run.RunID, string(model.StageG), fmt.Sprintf("G action %d: %s -> ok=%t", round, validation.Action.Action, observation.OK), "p2r", false, sc.Progress)
+		if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, "Stage G collected sufficient browser evidence before planner finish.", repoPath, before); ok {
+			return finished
+		}
 		if reason := stageGObservationStopReason(observations); reason != "" {
-			return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, reason)
+			return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, reason, repoPath, before)
 		}
 	}
-	return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G reached the maximum browser action count.")
+	return r.finishStageGPartial(record, writer, start, candidates, observations, blocked, "Stage G reached the maximum browser action count.", repoPath, before)
 }
 
 func stageGPlannerTimedOut(ctx context.Context, err error) bool {
@@ -300,7 +414,28 @@ func stageGPlannerTimedOut(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return true
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded")
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"context deadline exceeded", "timed out", "timeout", "deadline exceeded", "deadline"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r Runner) nextStageGBrowserAction(ctx context.Context, sc StageContext, promptTemplate, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int, timeout time.Duration) (string, []ArtifactWarning, error) {
+	if r.stageGBrowserPlan != nil {
+		return r.stageGBrowserPlan(ctx, sc, promptTemplate, profile, contextText, candidates, observations, blocked, round, timeout)
+	}
+	return r.nextBrowserAction(ctx, sc, promptTemplate, profile, contextText, candidates, observations, blocked, round, timeout)
+}
+
+func (r Runner) runStageGBrowserAction(ctx context.Context, nodePath string, action browserpkg.Action, policy browserpkg.Policy, timeout time.Duration) (browserpkg.Observation, error) {
+	if r.stageGBrowserAction != nil {
+		return r.stageGBrowserAction(ctx, action, policy, timeout)
+	}
+	runner := browserpkg.NewPlaywrightWrapper(r.exec, nodePath, policy)
+	return runner.Run(ctx, action, timeout)
 }
 
 func stageGFinishedStatus(record model.StageRecord) string {
@@ -406,6 +541,9 @@ func stageGFinishScreenshotBlockReasonForSummary(summary FrontendE2ESummary, obs
 
 func stageGSummaryCanFinishWithLimitedScreenshots(summary FrontendE2ESummary, observations []browserpkg.Observation) bool {
 	status := strings.TrimSpace(summary.Status)
+	if status == "passed" && len(summary.Findings) == 0 {
+		return stageGDeterministicPositiveEvidenceReady(observations)
+	}
 	if status != "failed" && status != "blocked" && status != "partial" {
 		return false
 	}
@@ -417,6 +555,37 @@ func stageGSummaryCanFinishWithLimitedScreenshots(summary FrontendE2ESummary, ob
 	}
 	for index := range observations {
 		if stageGObservationHasProductFailureEvidenceAt(index, observations) {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGFinishSummaryEvidenceBlockReason(summary FrontendE2ESummary, observations []browserpkg.Observation) string {
+	status := strings.TrimSpace(summary.Status)
+	if status != "failed" && status != "blocked" && status != "partial" {
+		return ""
+	}
+	if len(summary.Findings) == 0 || stageGObservationsBackNonPassedSummary(observations) {
+		return ""
+	}
+	return fmt.Sprintf("planner %s finish requires observation-backed Stage G evidence", status)
+}
+
+func stageGObservationsBackNonPassedSummary(observations []browserpkg.Observation) bool {
+	if stageGPostAuthSessionLossEvidence(observations) != "" ||
+		stageGAuthAcceptedNoTransitionEvidence(observations) != "" ||
+		stageGAuthGateBlockerEvidence(observations) != "" ||
+		stageGAuthSelectorBlockerEvidence(observations) != "" ||
+		stageGAuthGateStallEvidence(observations) != "" ||
+		stageGRepeatedStateStallEvidence(observations) != "" {
+		return true
+	}
+	for index, observation := range observations {
+		if stageGObservationHasProductFailureEvidenceAt(index, observations) {
+			return true
+		}
+		if observation.CurrentURL != "" && len(strings.TrimSpace(observation.VisibleText)) < 10 {
 			return true
 		}
 	}
@@ -488,7 +657,7 @@ func stageGKeyScreenshotObservationIndexes(observations []browserpkg.Observation
 }
 
 func stageGScreenshotObservationEligible(index int, observation browserpkg.Observation, observations []browserpkg.Observation) bool {
-	if path := strings.TrimSpace(observation.ScreenshotPath); path == "" || !fileExists(path) {
+	if path := strings.TrimSpace(observation.ScreenshotPath); path == "" || !stageGScreenshotFileUsable(path) {
 		return false
 	}
 	action := strings.TrimSpace(observation.Action)
@@ -532,19 +701,36 @@ func stageGObservationHasProductFailureEvidenceAt(index int, observations []brow
 		return true
 	}
 	for _, issue := range observation.NetworkIssues {
-		if !stageGNetworkIssueRecovered(index, issue, observations) {
+		if stageGNetworkIssueBlocksEvidence(index, issue, observations) {
 			return true
 		}
 	}
 	for _, event := range observation.NetworkEvents {
-		if event.Status >= 400 && !stageGNetworkEventRecovered(index, event, observations) {
-			return true
-		}
-		if strings.TrimSpace(event.Error) != "" {
+		if stageGNetworkEventBlocksEvidence(index, event, observations) {
 			return true
 		}
 	}
 	return false
+}
+
+func stageGNetworkIssueBlocksEvidence(index int, issue browserpkg.NetworkIssue, observations []browserpkg.Observation) bool {
+	if stageGNetworkIssueRecovered(index, issue, observations) {
+		return false
+	}
+	if stageGNetworkFailureLooksIgnorableNoise(issue.URL, "", issue.Status, issue.Error) {
+		return false
+	}
+	return issue.Status >= 400 || strings.TrimSpace(issue.Error) != ""
+}
+
+func stageGNetworkEventBlocksEvidence(index int, event browserpkg.NetworkEvent, observations []browserpkg.Observation) bool {
+	if stageGNetworkEventRecovered(index, event, observations) {
+		return false
+	}
+	if stageGNetworkFailureLooksIgnorableNoise(event.URL, event.ResourceType, event.Status, event.Error) {
+		return false
+	}
+	return event.Status >= 400 || strings.TrimSpace(event.Error) != ""
 }
 
 func stageGConsoleErrorsOnlyRecoveredAuthNoise(index int, observations []browserpkg.Observation) bool {
@@ -664,6 +850,24 @@ func stageGNetworkURLLooksAuth(raw string) bool {
 	return false
 }
 
+func stageGNetworkURLLooksLogout(raw string) bool {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	target := raw
+	if err == nil {
+		target = strings.ToLower(parsed.Path)
+	}
+	for _, keyword := range []string{"logout", "log-out", "log_off", "logoff", "signout", "sign-out", "sign_off", "signoff"} {
+		if strings.Contains(target, keyword) {
+			return true
+		}
+	}
+	return browserActionTextEndsSession(target)
+}
+
 func stageGNetworkURLKey(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -762,15 +966,13 @@ func stageGObservationHasBusinessNetworkEvidenceAt(index int, observations []bro
 		return false
 	}
 	for _, event := range observations[index].NetworkEvents {
-		method := strings.ToUpper(strings.TrimSpace(event.Method))
+		if stageGNetworkEventBlocksEvidence(index, event, observations) {
+			return true
+		}
 		if event.Status >= 400 || event.Error != "" {
-			if !stageGNetworkEventRecovered(index, event, observations) {
-				return true
-			}
 			continue
 		}
-		switch method {
-		case "POST", "PUT", "PATCH", "DELETE":
+		if stageGNetworkEventLooksSuccessfulBusiness(event) {
 			return true
 		}
 	}
@@ -944,6 +1146,20 @@ func stageGNetworkEventText(event browserpkg.NetworkEvent) string {
 	return strings.Join(parts, " ")
 }
 
+func stageGNetworkIssueText(issue browserpkg.NetworkIssue) string {
+	var parts []string
+	if issue.URL != "" {
+		parts = append(parts, issue.URL)
+	}
+	if issue.Status > 0 {
+		parts = append(parts, fmt.Sprintf("status=%d", issue.Status))
+	}
+	if issue.Error != "" {
+		parts = append(parts, "error="+issue.Error)
+	}
+	return strings.Join(parts, " ")
+}
+
 func stageGLogFinish(status, reason string, observationCount, findingCount int) string {
 	var builder strings.Builder
 	builder.WriteString("\nfinish\n")
@@ -966,15 +1182,64 @@ func (r Runner) finishStageGUnavailable(record model.StageRecord, writer Artifac
 	return finishStage(record, status, start)
 }
 
-func (r Runner) finishStageGPartial(record model.StageRecord, writer ArtifactWriter, start time.Time, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, reason string) model.StageRecord {
+func (r Runner) finishStageGOutcome(record model.StageRecord, writer ArtifactWriter, start time.Time, summary FrontendE2ESummary, observations []browserpkg.Observation, repoPath string, before map[string]string) model.StageRecord {
+	observationFindings := frontendE2EObservationFindings(observations, writer.RelativePath(writer.Path(stageGLegacyScreenshotName)), false)
+	record.Findings = append(record.Findings, observationFindings...)
+	summary.Findings = append(summary.Findings, frontendE2EFindingsFromModel(record.Findings)...)
+	record, summary = appendStageGRepoSnapshotFindings(record, summary, repoPath, before)
+	record = r.writeStageGArtifacts(record, writer, summary, observations)
+	bestEffortStageAppend(&record, writer, writer.RelativePath(record.LogPath), stageGLogFinish(summary.Status, summary.Reason, len(observations), len(record.Findings)))
+	return finishStage(record, stageGFinishedStatus(record), start)
+}
+
+func (r Runner) finishStageGDeterministicVerdict(record model.StageRecord, writer ArtifactWriter, start time.Time, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, reason string, repoPath string, before map[string]string) (model.StageRecord, bool) {
+	if outcome, ok := stageGPositiveEvidenceOutcome(candidates, observations, blocked, reason); ok {
+		return r.finishStageGOutcome(record, writer, start, outcome, observations, repoPath, before), true
+	}
 	if finding, ok := stageGPartialProductBlockerFinding(observations, reason); ok {
 		record.Findings = append(record.Findings, finding)
 		record.ErrorSummary = "frontend E2E findings"
 		summary := stageGSummary("failed", finding.Evidence, candidates, observations, blocked)
 		summary.Findings = append(summary.Findings, frontendE2EFindingsFromModel(record.Findings)...)
+		record, summary = appendStageGRepoSnapshotFindings(record, summary, repoPath, before)
 		record = r.writeStageGArtifacts(record, writer, summary, observations)
 		bestEffortStageAppend(&record, writer, writer.RelativePath(record.LogPath), stageGLogFinish(summary.Status, reason, len(observations), len(record.Findings)))
-		return finishStage(record, model.StageFailed, start)
+		return finishStage(record, model.StageFailed, start), true
+	}
+	return record, false
+}
+
+func appendStageGRepoSnapshotFindings(record model.StageRecord, summary FrontendE2ESummary, repoPath string, before map[string]string) (model.StageRecord, FrontendE2ESummary) {
+	if before == nil {
+		return record, summary
+	}
+	after, snapshotErr := snapshotRepo(repoPath)
+	if snapshotErr != nil {
+		finding := model.Finding{
+			Stage:      string(model.StageG),
+			Severity:   "High",
+			Title:      "Stage G repository post-snapshot failed",
+			Rule:       "Stage G must verify that browser exploration does not modify repo/ source files.",
+			Evidence:   snapshotErr.Error(),
+			Impact:     "Source mutation cannot be ruled out for this run.",
+			MinimumFix: "Ensure repo/ is readable and rerun Stage G.",
+			SourcePath: repoPath,
+		}
+		record.Findings = append(record.Findings, finding)
+		summary.Findings = append(summary.Findings, frontendE2EFindingFromModel(finding))
+		return record, summary
+	}
+	if changes := repoSnapshotDiff(before, after); len(changes) > 0 {
+		finding := repoChangedFinding(changes, repoPath)
+		record.Findings = append(record.Findings, finding)
+		summary.Findings = append(summary.Findings, frontendE2EFindingFromModel(finding))
+	}
+	return record, summary
+}
+
+func (r Runner) finishStageGPartial(record model.StageRecord, writer ArtifactWriter, start time.Time, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, reason string, repoPath string, before map[string]string) model.StageRecord {
+	if finished, ok := r.finishStageGDeterministicVerdict(record, writer, start, candidates, observations, blocked, reason, repoPath, before); ok {
+		return finished
 	}
 	record.Findings = append(record.Findings, model.Finding{
 		Stage:      string(model.StageG),
@@ -988,12 +1253,539 @@ func (r Runner) finishStageGPartial(record model.StageRecord, writer ArtifactWri
 	record.ErrorSummary = "frontend E2E incomplete"
 	summary := stageGSummary("partial", reason, candidates, observations, blocked)
 	summary.Findings = append(summary.Findings, frontendE2EFindingsFromModel(record.Findings)...)
+	record, summary = appendStageGRepoSnapshotFindings(record, summary, repoPath, before)
 	record = r.writeStageGArtifacts(record, writer, summary, observations)
 	bestEffortStageAppend(&record, writer, writer.RelativePath(record.LogPath), stageGLogFinish(summary.Status, reason, len(observations), len(record.Findings)))
 	return finishStage(record, model.StageFailed, start)
 }
 
+func stageGPositiveEvidenceOutcome(candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, reason string) (FrontendE2ESummary, bool) {
+	profile := stageGEvidenceProfileForObservations(observations)
+	if !profile.DeterministicPassReady() {
+		return FrontendE2ESummary{}, false
+	}
+	summary := stageGSummary("passed", reason, candidates, observations, blocked)
+	if blockReason := stageGFinishScreenshotBlockReasonForSummary(summary, observations); blockReason != "" {
+		return FrontendE2ESummary{}, false
+	}
+	summary.Notes = append(summary.Notes, stageGEvidenceNote(observations))
+	return summary, true
+}
+
+type stageGEvidenceProfile struct {
+	HasUnrecoveredProductFailure bool
+	HasPostAuthSessionLoss       bool
+	HasRenderedFrontend          bool
+	AuthSuccess                  bool
+	AuthenticatedState           bool
+	BusinessEndpointCount        int
+	BusinessUISignalCount        int
+	InteractiveProductUICount    int
+	InteractiveProductUIStates   int
+	ProductNavigationChangeCount int
+	DistinctMeaningfulStates     int
+	SupportScreenshotCount       int
+	KeyScreenshotCount           int
+}
+
+func stageGEvidenceProfileForObservations(observations []browserpkg.Observation) stageGEvidenceProfile {
+	evidenceObservations := observations
+	authSuccess := false
+	if authIndex := stageGCredentialedAuthSuccessIndex(observations); authIndex >= 0 {
+		evidenceObservations = observations[authIndex:]
+		authSuccess = true
+	}
+	return stageGEvidenceProfile{
+		HasUnrecoveredProductFailure: stageGHasUnrecoveredProductFailure(observations),
+		HasPostAuthSessionLoss:       stageGPostAuthSessionLossEvidence(observations) != "",
+		HasRenderedFrontend:          stageGHasRenderedFrontendEvidence(evidenceObservations),
+		AuthSuccess:                  authSuccess,
+		AuthenticatedState:           stageGHasAuthenticatedObservation(evidenceObservations),
+		BusinessEndpointCount:        stageGSuccessfulBusinessNetworkEvidenceCount(evidenceObservations),
+		BusinessUISignalCount:        stageGAuthenticatedBusinessUISignalCount(evidenceObservations),
+		InteractiveProductUICount:    stageGInteractiveProductUICount(evidenceObservations),
+		InteractiveProductUIStates:   stageGDistinctInteractiveProductUIStateCount(evidenceObservations),
+		ProductNavigationChangeCount: stageGProductNavigationChangeCount(evidenceObservations),
+		DistinctMeaningfulStates:     stageGDistinctMeaningfulStateCount(evidenceObservations),
+		SupportScreenshotCount:       stageGSupportScreenshotCount(observations),
+		KeyScreenshotCount:           stageGBrowserScreenshotCount(observations),
+	}
+}
+
+func (profile stageGEvidenceProfile) DeterministicPassReady() bool {
+	return !profile.HasUnrecoveredProductFailure &&
+		!profile.HasPostAuthSessionLoss &&
+		profile.HasRenderedFrontend &&
+		profile.SupportScreenshotCount >= 2 &&
+		profile.CoreBusinessWorkflowReady()
+}
+
+func (profile stageGEvidenceProfile) CoreBusinessWorkflowReady() bool {
+	hasNetworkWorkflow := profile.BusinessEndpointCount >= 2
+	hasStructuredUIWorkflow := profile.BusinessEndpointCount == 0 && profile.InteractiveProductUIStates >= 2 && profile.ProductNavigationChangeCount >= 1
+	hasNamedUIWorkflow := profile.BusinessEndpointCount == 0 && profile.BusinessUISignalCount >= 2 && profile.DistinctMeaningfulStates >= 2
+	hasAuthWorkflow := profile.AuthSuccess && profile.AuthenticatedState && (hasNetworkWorkflow || hasStructuredUIWorkflow || hasNamedUIWorkflow)
+	hasPublicWorkflow := profile.BusinessEndpointCount >= 2 && profile.DistinctMeaningfulStates >= 2
+	return hasAuthWorkflow || hasPublicWorkflow
+}
+
+func stageGNeedsDeterministicEvidenceSnapshot(observations []browserpkg.Observation) bool {
+	if len(observations) == 0 {
+		return false
+	}
+	profile := stageGEvidenceProfileForObservations(observations)
+	if profile.HasUnrecoveredProductFailure || !profile.HasRenderedFrontend || !profile.CoreBusinessWorkflowReady() || profile.SupportScreenshotCount >= 2 {
+		return false
+	}
+	last := observations[len(observations)-1]
+	if strings.TrimSpace(last.Action) == "snapshot" && !stageGScreenshotObservationCanSupportSummary(len(observations)-1, observations) {
+		return false
+	}
+	return strings.TrimSpace(last.CurrentURL) != ""
+}
+
+func stageGDeterministicAuthSubmitAction(observations []browserpkg.Observation) (BrowserAction, bool) {
+	if len(observations) == 0 {
+		return BrowserAction{}, false
+	}
+	last := observations[len(observations)-1]
+	hasCredentials := stageGObservationHasCredentialEvidence(last)
+	looksAuthGate := stageGObservationLooksAuthGate(last) || (hasCredentials && !stageGObservationLooksAuthenticated(last))
+	if !last.OK || !looksAuthGate || !hasCredentials || stageGObservationLooksSubmitAttempt(last) {
+		return BrowserAction{}, false
+	}
+	if strings.Contains(strings.ToLower(last.VisibleText), "captcha") {
+		return BrowserAction{}, false
+	}
+	credentialIndex := -1
+	for index, observation := range observations {
+		if stageGObservationHasCredentialEvidence(observation) && !stageGObservationLooksAuthenticated(observation) {
+			credentialIndex = index
+		}
+	}
+	if credentialIndex < 0 {
+		return BrowserAction{}, false
+	}
+	for _, observation := range observations[credentialIndex+1:] {
+		if stageGObservationLooksSubmitAttempt(observation) {
+			return BrowserAction{}, false
+		}
+	}
+	return BrowserAction{
+		Action:   "click_button",
+		Selector: "button[type=submit], form button, input[type=submit]",
+		Reason:   "submit the filled authentication form after both credential fields are present",
+	}, true
+}
+
+func stageGDeterministicPositiveEvidenceReady(observations []browserpkg.Observation) bool {
+	return stageGEvidenceProfileForObservations(observations).DeterministicPassReady()
+}
+
+func stageGSupportScreenshotCount(observations []browserpkg.Observation) int {
+	count := 0
+	for index := range observations {
+		if stageGScreenshotObservationCanSupportSummary(index, observations) {
+			count++
+		}
+	}
+	return count
+}
+
+func stageGHasUnrecoveredProductFailure(observations []browserpkg.Observation) bool {
+	for index := range observations {
+		if stageGObservationHasProductFailureEvidenceAt(index, observations) {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGHasRenderedFrontendEvidence(observations []browserpkg.Observation) bool {
+	for _, observation := range observations {
+		if !observation.OK {
+			continue
+		}
+		if strings.TrimSpace(observation.CurrentURL) == "" {
+			continue
+		}
+		if len(strings.TrimSpace(observation.VisibleText)) >= 20 {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGHasAuthenticatedObservation(observations []browserpkg.Observation) bool {
+	for _, observation := range observations {
+		if (stageGObservationLooksAuthenticated(observation) || stageGObservationLooksInteractiveProductUI(observation)) && !stageGObservationLooksAuthGate(observation) {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGHasSuccessfulBusinessNetworkEvidence(observations []browserpkg.Observation) bool {
+	return stageGSuccessfulBusinessNetworkEvidenceCount(observations) > 0
+}
+
+func stageGSuccessfulBusinessNetworkEvidenceCount(observations []browserpkg.Observation) int {
+	seen := map[string]bool{}
+	for _, observation := range observations {
+		for _, event := range observation.NetworkEvents {
+			if stageGNetworkEventLooksSuccessfulBusiness(event) {
+				key := stageGNetworkURLKey(event.URL)
+				if key == "" {
+					key = strings.TrimSpace(event.URL)
+				}
+				if key != "" {
+					seen[key] = true
+				}
+			}
+		}
+	}
+	return len(seen)
+}
+
+func stageGNetworkEventLooksSuccessfulBusiness(event browserpkg.NetworkEvent) bool {
+	if event.Status < 200 || event.Status >= 400 || strings.TrimSpace(event.Error) != "" {
+		return false
+	}
+	if stageGNetworkURLLooksAuth(event.URL) || stageGNetworkURLLooksLogout(event.URL) {
+		return false
+	}
+	if stageGNetworkURLLooksFrameworkNoise(event.URL) {
+		return false
+	}
+	resourceType := strings.ToLower(strings.TrimSpace(event.ResourceType))
+	if resourceType == "image" || resourceType == "font" || resourceType == "stylesheet" || resourceType == "script" || resourceType == "websocket" {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(event.URL))
+	if err != nil {
+		return false
+	}
+	path := strings.ToLower(parsed.Path)
+	if path == "" || path == "/" {
+		return false
+	}
+	for _, marker := range []string{"/api/", "/graphql", "/dashboard", "/admin", "/project", "/projects", "/user", "/users", "/audit", "/analytics", "/settings", "/module", "/modules", "/order", "/orders", "/product", "/products"} {
+		if strings.Contains(path, marker) {
+			return true
+		}
+	}
+	method := strings.ToUpper(strings.TrimSpace(event.Method))
+	return method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"
+}
+
+func stageGNetworkFailureLooksIgnorableNoise(raw, resourceType string, status int, message string) bool {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	target := raw
+	if err == nil {
+		target = strings.ToLower(parsed.Path)
+	}
+	resourceType = strings.ToLower(strings.TrimSpace(resourceType))
+	if resourceType == "websocket" || resourceType == "eventsource" {
+		return stageGNetworkURLLooksFrameworkNoise(raw)
+	}
+	for _, prefix := range []string{"/@vite", "/__vite", "/sockjs-node", "/socket.io", "/webpack"} {
+		if strings.HasPrefix(target, prefix) {
+			return true
+		}
+	}
+	for _, marker := range []string{"hot-update", "hmr", "livereload", "__webpack", "vite_ping"} {
+		if strings.Contains(target, marker) {
+			return true
+		}
+	}
+	if status >= 500 {
+		return false
+	}
+	if strings.HasPrefix(target, "/_blazor") && (strings.Contains(target, "negotiate") || resourceType == "fetch" || strings.TrimSpace(message) != "" || status == 0) {
+		return true
+	}
+	for _, suffix := range []string{".map", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2", ".ttf"} {
+		if strings.HasSuffix(target, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGNetworkURLLooksFrameworkNoise(raw string) bool {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	target := raw
+	if err == nil {
+		target = strings.ToLower(parsed.Path)
+	}
+	for _, prefix := range []string{
+		"/_blazor",
+		"/_framework",
+		"/_next/",
+		"/@vite",
+		"/__vite",
+		"/sockjs-node",
+		"/socket.io",
+		"/webpack",
+		"/vite",
+	} {
+		if strings.HasPrefix(target, prefix) {
+			return true
+		}
+	}
+	for _, marker := range []string{"hot-update", "hmr", "livereload", "__webpack", "vite_ping"} {
+		if strings.Contains(target, marker) {
+			return true
+		}
+	}
+	for _, suffix := range []string{".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2", ".ttf"} {
+		if strings.HasSuffix(target, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGAuthenticatedBusinessUISignalCount(observations []browserpkg.Observation) int {
+	signals := map[string]bool{}
+	for _, observation := range observations {
+		if !observation.OK || stageGObservationLooksAuthGate(observation) || stageGObservationHasPasswordControl(observation) || !stageGObservationLooksAuthenticated(observation) {
+			continue
+		}
+		stageGAddBusinessUISignals(signals, observation.CurrentURL)
+		stageGAddBusinessUISignals(signals, observation.Title)
+		stageGAddBusinessUISignals(signals, observation.VisibleText)
+		for _, control := range observation.Controls {
+			stageGAddBusinessUISignals(signals, strings.Join([]string{control.Role, control.Text, control.Name, control.Placeholder, control.Type}, " "))
+		}
+	}
+	return len(signals)
+}
+
+func stageGInteractiveProductUICount(observations []browserpkg.Observation) int {
+	count := 0
+	for _, observation := range observations {
+		if stageGObservationLooksInteractiveProductUI(observation) {
+			count++
+		}
+	}
+	return count
+}
+
+func stageGDistinctInteractiveProductUIStateCount(observations []browserpkg.Observation) int {
+	seen := map[string]bool{}
+	for _, observation := range observations {
+		if !stageGObservationLooksInteractiveProductUI(observation) {
+			continue
+		}
+		key := stageGObservationStateKey(observation)
+		if key != "" {
+			seen[key] = true
+		}
+	}
+	return len(seen)
+}
+
+func stageGProductNavigationChangeCount(observations []browserpkg.Observation) int {
+	changes := 0
+	previous := ""
+	for _, observation := range observations {
+		if !stageGObservationLooksInteractiveProductUI(observation) {
+			continue
+		}
+		current := stageGObservationURLPathKey(observation.CurrentURL)
+		if current == "" {
+			continue
+		}
+		if previous != "" && current != previous {
+			changes++
+		}
+		previous = current
+	}
+	return changes
+}
+
+func stageGObservationURLPathKey(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return strings.ToLower(raw)
+	}
+	path := strings.TrimSpace(parsed.Path)
+	if path == "" {
+		path = "/"
+	}
+	return strings.ToLower(path)
+}
+
+func stageGObservationLooksInteractiveProductUI(observation browserpkg.Observation) bool {
+	if !observation.OK || stageGObservationLooksAuthGate(observation) || stageGObservationLooksMarketingPage(observation) {
+		return false
+	}
+	if stageGObservationHasPasswordControl(observation) {
+		return false
+	}
+	text := strings.TrimSpace(observation.VisibleText)
+	if len(text) < 60 {
+		return false
+	}
+	links, buttons, inputs := stageGControlCounts(observation)
+	controlCount := links + buttons + inputs
+	if controlCount < 4 {
+		return false
+	}
+	signals := 0
+	if links >= 2 {
+		signals++
+	}
+	if buttons >= 2 {
+		signals++
+	}
+	if inputs >= 1 {
+		signals++
+	}
+	if controlCount >= 6 {
+		signals++
+	}
+	if stageGTextLooksDataOrWorkflow(text) {
+		signals++
+	}
+	return signals >= 3
+}
+
+func stageGControlCounts(observation browserpkg.Observation) (links, buttons, inputs int) {
+	for _, control := range observation.Controls {
+		role := strings.ToLower(strings.TrimSpace(control.Role))
+		target := strings.ToLower(strings.Join([]string{control.Role, control.Text, control.Name, control.Placeholder, control.Type}, " "))
+		switch role {
+		case "link":
+			links++
+		case "button":
+			buttons++
+		default:
+			if strings.Contains(target, "password") || strings.Contains(target, "passwd") {
+				continue
+			}
+			inputs++
+		}
+	}
+	return links, buttons, inputs
+}
+
+func stageGTextLooksDataOrWorkflow(value string) bool {
+	value = strings.ToLower(strings.Join(strings.Fields(value), " "))
+	matches := 0
+	for _, marker := range []string{"search", "filter", "status", "priority", "owner", "assigned", "recent", "activity", "queue", "review", "date", "total", "items", "calendar", "export"} {
+		if strings.Contains(value, marker) {
+			matches++
+		}
+	}
+	return matches >= 3
+}
+
+func stageGObservationLooksMarketingPage(observation browserpkg.Observation) bool {
+	urlValue := strings.ToLower(strings.TrimSpace(observation.CurrentURL))
+	text := strings.ToLower(strings.Join(strings.Fields(observation.VisibleText), " "))
+	if strings.Contains(urlValue, "/pricing") || strings.Contains(urlValue, "/contact") || strings.Contains(urlValue, "/about") || strings.Contains(urlValue, "/docs") {
+		return true
+	}
+	matches := 0
+	for _, marker := range []string{"pricing", "contact sales", "get started", "book a demo", "features", "testimonials", "hero", "learn more"} {
+		if strings.Contains(text, marker) {
+			matches++
+		}
+	}
+	links, buttons, inputs := stageGControlCounts(observation)
+	return matches >= 2 && inputs == 0 && links+buttons < 5
+}
+
+func stageGAddBusinessUISignals(signals map[string]bool, value string) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return
+	}
+	markers := map[string][]string{
+		"dashboard":  {"dashboard", "/dashboard"},
+		"admin":      {"admin", "/admin"},
+		"analytics":  {"analytics", "metrics"},
+		"users":      {"user management", "users", "/users"},
+		"projects":   {"projects", "/projects"},
+		"settings":   {"settings", "/settings"},
+		"modules":    {"modules", "/modules"},
+		"orders":     {"orders", "/orders"},
+		"products":   {"products", "/products", "catalog"},
+		"reports":    {"reports", "/reports"},
+		"audit":      {"audit", "activity log"},
+		"management": {"management"},
+		"create":     {"create", "new "},
+		"edit":       {"edit", "update"},
+		"save":       {"save", "publish"},
+	}
+	for signal, candidates := range markers {
+		for _, marker := range candidates {
+			if strings.Contains(value, marker) {
+				signals[signal] = true
+				break
+			}
+		}
+	}
+}
+
+func stageGDistinctMeaningfulStateCount(observations []browserpkg.Observation) int {
+	seen := map[string]bool{}
+	for _, observation := range observations {
+		if !observation.OK || stageGObservationLooksAuthGate(observation) {
+			continue
+		}
+		key := stageGObservationStateKey(observation)
+		if key != "" {
+			seen[key] = true
+		}
+	}
+	return len(seen)
+}
+
+func stageGEvidenceNote(observations []browserpkg.Observation) string {
+	profile := stageGEvidenceProfileForObservations(observations)
+	return fmt.Sprintf("Deterministic Stage G evidence: auth_success=%t authenticated_state=%t business_network_endpoints=%d business_ui_signals=%d interactive_product_ui=%d interactive_product_states=%d product_navigation_changes=%d support_screenshots=%d key_screenshots=%d distinct_states=%d.", profile.AuthSuccess, profile.AuthenticatedState, profile.BusinessEndpointCount, profile.BusinessUISignalCount, profile.InteractiveProductUICount, profile.InteractiveProductUIStates, profile.ProductNavigationChangeCount, profile.SupportScreenshotCount, profile.KeyScreenshotCount, profile.DistinctMeaningfulStates)
+}
+
 func stageGPartialProductBlockerFinding(observations []browserpkg.Observation, reason string) (model.Finding, bool) {
+	if evidence := stageGPostAuthSessionLossEvidence(observations); evidence != "" {
+		return model.Finding{
+			Stage:      string(model.StageG),
+			Severity:   "High",
+			Title:      "Authenticated browser session was lost during Stage G",
+			Rule:       "Stage G must preserve an authenticated browser session while exploring the documented product workflow.",
+			Evidence:   evidence + " " + strings.TrimSpace(reason),
+			Impact:     "Stage G cannot trust later browser evidence because the workflow returned to an unauthenticated state.",
+			MinimumFix: "Avoid logout/session-reset actions during E2E exploration and persist browser session state across Stage G browser actions.",
+			SourcePath: "frontend_e2e_observations.json",
+		}, true
+	}
+	if evidence := stageGAuthAcceptedNoTransitionEvidence(observations); evidence != "" {
+		return model.Finding{
+			Stage:      string(model.StageG),
+			Severity:   "High",
+			Title:      "Authentication response did not reach authenticated browser workflow",
+			Rule:       "A successful credentialed authentication response should establish an authenticated browser session and route to the documented product workflow.",
+			Evidence:   evidence + " " + strings.TrimSpace(reason),
+			Impact:     "Stage G cannot verify the authenticated product workflow even though the auth request returned success.",
+			MinimumFix: "Persist the browser session after login and redirect/render the authenticated workflow after successful credentials.",
+			SourcePath: "frontend_e2e_observations.json",
+		}, true
+	}
 	if evidence := stageGAuthGateBlockerEvidence(observations); evidence != "" {
 		return model.Finding{
 			Stage:      string(model.StageG),
@@ -1003,6 +1795,18 @@ func stageGPartialProductBlockerFinding(observations []browserpkg.Observation, r
 			Evidence:   evidence + " " + strings.TrimSpace(reason),
 			Impact:     "Stage G cannot verify the authenticated product workflow from the browser UI.",
 			MinimumFix: "Provide deterministic E2E credentials or a test-mode CAPTCHA bypass, and ensure the registration/login controls are reachable with stable selectors.",
+			SourcePath: "frontend_e2e_observations.json",
+		}, true
+	}
+	if evidence := stageGAuthSelectorBlockerEvidence(observations); evidence != "" {
+		return model.Finding{
+			Stage:      string(model.StageG),
+			Severity:   "High",
+			Title:      "Authentication controls prevented browser workflow coverage",
+			Rule:       "README-provided local credentials or safe registration paths should be usable through stable browser controls.",
+			Evidence:   evidence + " " + strings.TrimSpace(reason),
+			Impact:     "Stage G cannot verify the authenticated product workflow from the browser UI.",
+			MinimumFix: "Expose stable login/register selectors or provide deterministic E2E authentication controls.",
 			SourcePath: "frontend_e2e_observations.json",
 		}, true
 	}
@@ -1020,13 +1824,12 @@ func stageGPartialProductBlockerFinding(observations []browserpkg.Observation, r
 	}
 	for index := range observations {
 		if stageGObservationHasProductFailureEvidenceAt(index, observations) {
-			observation := observations[index]
 			return model.Finding{
 				Stage:      string(model.StageG),
 				Severity:   "High",
 				Title:      "Frontend workflow could not progress after product error",
 				Rule:       "Browser workflows should either reach the documented business state or expose a clear product failure.",
-				Evidence:   stageGPartialFailureEvidence(index, observation, reason),
+				Evidence:   stageGPartialFailureEvidence(index, observations, reason),
 				Impact:     "Stage G could not complete the documented frontend workflow.",
 				MinimumFix: "Fix the observed frontend/API failure and rerun Stage G.",
 				SourcePath: "frontend_e2e_observations.json",
@@ -1036,7 +1839,65 @@ func stageGPartialProductBlockerFinding(observations []browserpkg.Observation, r
 	return model.Finding{}, false
 }
 
+func stageGAuthSelectorBlockerEvidence(observations []browserpkg.Observation) string {
+	if stageGObservedAuthRecovery(observations) {
+		return ""
+	}
+	credentialEvidence := false
+	selectorFailures := 0
+	var firstFailure browserpkg.Observation
+	for _, observation := range observations {
+		if stageGObservationHasCredentialEvidence(observation) {
+			credentialEvidence = true
+		}
+		if observation.OK || !stageGObservationLooksAuthSelectorFailure(observation) {
+			continue
+		}
+		if !credentialEvidence && !stageGObservationLooksAuthInputAction(observation) {
+			continue
+		}
+		if selectorFailures == 0 {
+			firstFailure = observation
+		}
+		selectorFailures++
+	}
+	if selectorFailures < 2 {
+		return ""
+	}
+	target := strings.TrimSpace(firstFailure.CurrentURL)
+	if target == "" {
+		target = "the authentication UI"
+	}
+	return fmt.Sprintf("Credentialed authentication control failed on %s after %d selector failure(s): %s", target, selectorFailures, strings.TrimSpace(firstFailure.Error))
+}
+
+func stageGObservationLooksAuthSelectorFailure(observation browserpkg.Observation) bool {
+	errorText := strings.ToLower(strings.TrimSpace(observation.Error))
+	if errorText == "" || !strings.Contains(errorText, "timeout") {
+		return false
+	}
+	target := strings.ToLower(strings.Join([]string{observation.Action, observation.Error, observation.VisibleText, observation.CurrentURL}, " "))
+	for _, marker := range []string{"email", "password", "username", "login", "sign in", "signin", "register", "auth", "form input"} {
+		if strings.Contains(target, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func stageGObservationLooksAuthInputAction(observation browserpkg.Observation) bool {
+	target := strings.ToLower(strings.Join([]string{observation.Action, observation.Error, observation.VisibleText, observation.CurrentURL}, " "))
+	return strings.Contains(target, "fill_input") &&
+		(strings.Contains(target, "email") || strings.Contains(target, "password") || strings.Contains(target, "username") || strings.Contains(target, "login"))
+}
+
 func stageGObservationStopReason(observations []browserpkg.Observation) string {
+	if evidence := stageGPostAuthSessionLossEvidence(observations); evidence != "" {
+		return "Stage G stopped after authenticated session was lost. " + evidence
+	}
+	if evidence := stageGAuthAcceptedNoTransitionEvidence(observations); evidence != "" {
+		return "Stage G stopped after accepted authentication did not reach a product workflow. " + evidence
+	}
 	if stageGAuthGateStallEvidence(observations) != "" {
 		return "Stage G stopped after repeated authentication-gate attempts did not reach a product workflow."
 	}
@@ -1064,15 +1925,15 @@ func stageGAuthGateBlockerEvidence(observations []browserpkg.Observation) string
 			}
 		}
 		for _, issue := range observation.NetworkIssues {
-			if stageGNetworkURLLooksAuth(issue.URL) && issue.Status >= 400 {
+			if stageGNetworkURLLooksAuth(issue.URL) && stageGRecoverableAuthClientStatus(issue.Status) {
 				authFailure = fmt.Sprintf("%s status=%d", issue.URL, issue.Status)
 			}
 		}
 		for _, event := range observation.NetworkEvents {
-			if stageGNetworkURLLooksAuth(event.URL) && event.Status >= 200 && event.Status < 400 && strings.ToUpper(strings.TrimSpace(event.Method)) == "POST" {
+			if stageGNetworkURLLooksAuth(event.URL) && !stageGNetworkURLLooksLogout(event.URL) && event.Status >= 200 && event.Status < 400 && strings.ToUpper(strings.TrimSpace(event.Method)) == "POST" {
 				authSuccess = true
 			}
-			if stageGNetworkURLLooksAuth(event.URL) && event.Status >= 400 {
+			if stageGNetworkURLLooksAuth(event.URL) && stageGRecoverableAuthClientStatus(event.Status) {
 				authFailure = fmt.Sprintf("%s status=%d", event.URL, event.Status)
 			}
 		}
@@ -1090,8 +1951,66 @@ func stageGAuthGateBlockerEvidence(observations []browserpkg.Observation) string
 	return evidence
 }
 
+func stageGPostAuthSessionLossEvidence(observations []browserpkg.Observation) string {
+	establishedAt := -1
+	establishedBy := ""
+	authenticatedStateSeen := false
+	for index, observation := range observations {
+		if establishedAt >= 0 {
+			if stageGObservationHasSessionEndingError(observation) {
+				return fmt.Sprintf("After %s at observation %d, action %s attempted a session-ending browser operation: %s.", establishedBy, establishedAt+1, strings.TrimSpace(observation.Action), strings.TrimSpace(observation.Error))
+			}
+			for _, event := range observation.NetworkEvents {
+				if stageGNetworkURLLooksLogout(event.URL) && (event.Status >= 200 && event.Status < 400 || strings.TrimSpace(event.Error) != "") {
+					return fmt.Sprintf("After %s at observation %d, action %s triggered session-ending request %s.", establishedBy, establishedAt+1, strings.TrimSpace(observation.Action), stageGNetworkEventText(event))
+				}
+			}
+			for _, issue := range observation.NetworkIssues {
+				if stageGNetworkURLLooksLogout(issue.URL) && (issue.Status >= 200 || strings.TrimSpace(issue.Error) != "") {
+					return fmt.Sprintf("After %s at observation %d, action %s hit session-ending request %s.", establishedBy, establishedAt+1, strings.TrimSpace(observation.Action), stageGNetworkIssueText(issue))
+				}
+			}
+			if authenticatedStateSeen && stageGObservationLooksAuthGate(observation) {
+				target := strings.TrimSpace(observation.CurrentURL)
+				if target == "" {
+					target = "login/register UI"
+				}
+				return fmt.Sprintf("After %s at observation %d, browser returned to %s during action %s.", establishedBy, establishedAt+1, target, strings.TrimSpace(observation.Action))
+			}
+			if stageGObservationLooksAuthenticated(observation) && !stageGObservationLooksAuthGate(observation) {
+				authenticatedStateSeen = true
+				establishedBy = "authenticated browser state"
+			}
+			continue
+		}
+		if stageGObservationLooksAuthenticated(observation) && !stageGObservationLooksAuthGate(observation) {
+			establishedAt = index
+			establishedBy = "authenticated browser state"
+			authenticatedStateSeen = true
+			continue
+		}
+		for _, event := range observation.NetworkEvents {
+			if strings.ToUpper(strings.TrimSpace(event.Method)) == "POST" &&
+				event.Status >= 200 && event.Status < 400 &&
+				stageGNetworkURLLooksAuth(event.URL) &&
+				!stageGNetworkURLLooksLogout(event.URL) {
+				establishedAt = index
+				establishedBy = "successful credentialed authentication"
+				break
+			}
+		}
+	}
+	return ""
+}
+
+func stageGObservationHasSessionEndingError(observation browserpkg.Observation) bool {
+	errorText := strings.ToLower(strings.TrimSpace(observation.Error))
+	return strings.Contains(errorText, "session-ending browser target blocked") ||
+		strings.Contains(errorText, "session-ending browser request blocked")
+}
+
 func stageGAuthGateStallEvidence(observations []browserpkg.Observation) string {
-	if stageGObservedAuthSuccess(observations) || len(observations) == 0 {
+	if stageGObservedAuthRecovery(observations) || len(observations) == 0 {
 		return ""
 	}
 	last := observations[len(observations)-1]
@@ -1163,19 +2082,107 @@ func stageGRepeatedStateStallEvidence(observations []browserpkg.Observation) str
 }
 
 func stageGObservedAuthSuccess(observations []browserpkg.Observation) bool {
+	return stageGCredentialedAuthSuccessIndex(observations) >= 0
+}
+
+func stageGObservedAuthRecovery(observations []browserpkg.Observation) bool {
+	if stageGObservedAuthNetworkSuccess(observations) {
+		return true
+	}
+	return stageGObservedCredentialedAuthTransition(observations)
+}
+
+func stageGObservedAuthNetworkSuccess(observations []browserpkg.Observation) bool {
 	for _, observation := range observations {
-		if stageGObservationLooksAuthenticated(observation) {
-			return true
-		}
 		for _, event := range observation.NetworkEvents {
 			if strings.ToUpper(strings.TrimSpace(event.Method)) == "POST" &&
 				event.Status >= 200 && event.Status < 400 &&
-				stageGNetworkURLLooksAuth(event.URL) {
+				stageGNetworkURLLooksAuth(event.URL) &&
+				!stageGNetworkURLLooksLogout(event.URL) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func stageGCredentialedAuthSuccessIndex(observations []browserpkg.Observation) int {
+	if index, _, ok := stageGCredentialedAuthNetworkSuccess(observations); ok {
+		return index
+	}
+	return stageGCredentialedAuthTransitionIndex(observations)
+}
+
+func stageGObservedCredentialedAuthTransition(observations []browserpkg.Observation) bool {
+	return stageGCredentialedAuthTransitionIndex(observations) >= 0
+}
+
+func stageGCredentialedAuthTransitionIndex(observations []browserpkg.Observation) int {
+	credentialed := false
+	submitted := false
+	for index, observation := range observations {
+		if credentialed && stageGObservationLooksSubmitAttempt(observation) {
+			submitted = true
+		}
+		if stageGObservationLooksAuthGate(observation) {
+			if stageGObservationHasCredentialEvidence(observation) {
+				credentialed = true
+			}
+			continue
+		}
+		if submitted && stageGObservationLooksAuthenticated(observation) {
+			return index
+		}
+	}
+	return -1
+}
+
+func stageGAuthAcceptedNoTransitionEvidence(observations []browserpkg.Observation) string {
+	successIndex, event, ok := stageGCredentialedAuthNetworkSuccess(observations)
+	if !ok {
+		return ""
+	}
+	if successIndex >= len(observations)-1 {
+		return ""
+	}
+	for index := successIndex + 1; index < len(observations); index++ {
+		if stageGObservationLooksAuthenticated(observations[index]) && !stageGObservationLooksAuthGate(observations[index]) {
+			return ""
+		}
+	}
+	last := observations[len(observations)-1]
+	if !stageGObservationLooksAuthGate(last) {
+		return ""
+	}
+	target := strings.TrimSpace(last.CurrentURL)
+	if target == "" {
+		target = "the login/register UI"
+	}
+	return fmt.Sprintf("Credentialed authentication request succeeded (%s status=%d), but browser remained on %s for %d later observation(s) with no authenticated product UI.", event.URL, event.Status, target, len(observations)-successIndex-1)
+}
+
+func stageGCredentialedAuthNetworkSuccess(observations []browserpkg.Observation) (int, browserpkg.NetworkEvent, bool) {
+	credentialed := false
+	submitted := false
+	for index, observation := range observations {
+		if stageGObservationLooksAuthGate(observation) && stageGObservationHasCredentialEvidence(observation) {
+			credentialed = true
+		}
+		if credentialed && stageGObservationLooksSubmitAttempt(observation) {
+			submitted = true
+		}
+		authenticatedTransition := stageGObservationLooksAuthenticated(observation) && !stageGObservationLooksAuthGate(observation)
+		for _, event := range observation.NetworkEvents {
+			if (submitted || authenticatedTransition) &&
+				strings.ToUpper(strings.TrimSpace(event.Method)) == "POST" &&
+				event.Status >= 200 && event.Status < 400 &&
+				stageGNetworkURLLooksAuth(event.URL) &&
+				!stageGNetworkURLLooksLogout(event.URL) {
+				return index, event, true
+			}
+		}
+	}
+	return -1, browserpkg.NetworkEvent{}, false
 }
 
 func stageGObservationLooksAuthGate(observation browserpkg.Observation) bool {
@@ -1275,18 +2282,22 @@ func stageGObservationCountsAsProgressAttempt(observation browserpkg.Observation
 	}
 }
 
-func stageGPartialFailureEvidence(index int, observation browserpkg.Observation, reason string) string {
+func stageGPartialFailureEvidence(index int, observations []browserpkg.Observation, reason string) string {
 	var parts []string
+	if index < 0 || index >= len(observations) {
+		return strings.TrimSpace(reason)
+	}
+	observation := observations[index]
 	if observation.CurrentURL != "" {
 		parts = append(parts, "URL: "+observation.CurrentURL)
 	}
 	for _, issue := range observation.NetworkIssues {
-		if issue.Status >= 400 {
+		if stageGNetworkIssueBlocksEvidence(index, issue, observations) && issue.Status >= 400 {
 			parts = append(parts, fmt.Sprintf("%s status=%d", issue.URL, issue.Status))
 		}
 	}
 	for _, event := range observation.NetworkEvents {
-		if event.Status >= 400 {
+		if stageGNetworkEventBlocksEvidence(index, event, observations) && event.Status >= 400 {
 			parts = append(parts, fmt.Sprintf("%s status=%d", event.URL, event.Status))
 		}
 	}
@@ -1340,14 +2351,13 @@ func materializeStageGScreenshotArtifacts(record model.StageRecord, writer Artif
 		}
 	}
 	if len(screenshots) == 0 {
-		fallbackPath := writer.Path(stageGLegacyScreenshotName)
-		pages, err := renderTerminalLog(stageGScreenshotFallbackText(summary, observations), fallbackPath)
-		if err != nil {
-			record = recordArtifactWriteError(record, err, fallbackPath)
-		}
-		for _, page := range pages {
-			screenshots = append(screenshots, page)
-			record = ensureArtifactPath(record, page)
+		evidencePath := writer.Path(stageGEvidenceSummaryName)
+		if err := os.MkdirAll(filepath.Dir(evidencePath), 0o755); err != nil {
+			record = recordArtifactWriteError(record, err, evidencePath)
+		} else if err := os.WriteFile(evidencePath, []byte(stageGScreenshotFallbackText(summary, observations)), 0o644); err != nil {
+			record = recordArtifactWriteError(record, err, evidencePath)
+		} else {
+			record = ensureArtifactPath(record, evidencePath)
 		}
 	}
 	summary.Screenshots = screenshots
@@ -1372,7 +2382,8 @@ func stageGEnsureFindingEvidenceScreenshot(summary FrontendE2ESummary, observati
 }
 
 func stageGEnsureMinimumSupportScreenshots(summary FrontendE2ESummary, observations []browserpkg.Observation, selected []int) []int {
-	if !stageGSummaryNeedsFailureEvidenceScreenshot(summary) || len(selected) >= stageGMinBrowserScreenshots {
+	minimum := stageGMinimumSupportScreenshotCount(summary)
+	if minimum == 0 || len(selected) >= minimum {
 		return selected
 	}
 	selectedSet := map[int]bool{}
@@ -1380,10 +2391,10 @@ func stageGEnsureMinimumSupportScreenshots(summary FrontendE2ESummary, observati
 		selectedSet[index] = true
 	}
 	for index := range observations {
-		if len(selected) >= stageGMinBrowserScreenshots {
+		if len(selected) >= minimum {
 			break
 		}
-		if selectedSet[index] || !stageGScreenshotObservationCanSupportFinding(index, observations) {
+		if selectedSet[index] || !stageGScreenshotObservationCanSupportSummary(index, observations) {
 			continue
 		}
 		selected = append(selected, index)
@@ -1393,17 +2404,31 @@ func stageGEnsureMinimumSupportScreenshots(summary FrontendE2ESummary, observati
 	return selected
 }
 
+func stageGMinimumSupportScreenshotCount(summary FrontendE2ESummary) int {
+	if stageGSummaryNeedsFailureEvidenceScreenshot(summary) {
+		return stageGMinBrowserScreenshots
+	}
+	if strings.TrimSpace(summary.Status) == "passed" {
+		return 2
+	}
+	return 0
+}
+
 func stageGSummaryNeedsFailureEvidenceScreenshot(summary FrontendE2ESummary) bool {
 	status := strings.TrimSpace(summary.Status)
 	return status == "failed" || status == "partial" || len(summary.Findings) > 0
 }
 
 func stageGScreenshotObservationCanSupportFinding(index int, observations []browserpkg.Observation) bool {
+	return stageGScreenshotObservationCanSupportSummary(index, observations)
+}
+
+func stageGScreenshotObservationCanSupportSummary(index int, observations []browserpkg.Observation) bool {
 	if index < 0 || index >= len(observations) {
 		return false
 	}
 	observation := observations[index]
-	if path := strings.TrimSpace(observation.ScreenshotPath); path == "" || !fileExists(path) {
+	if path := strings.TrimSpace(observation.ScreenshotPath); path == "" || !stageGScreenshotFileUsable(path) {
 		return false
 	}
 	if strings.TrimSpace(observation.Action) == "fill_input" {
@@ -1451,6 +2476,9 @@ func copyStageGScreenshot(source, dest string) error {
 	if source == "" {
 		return fmt.Errorf("source screenshot path is empty")
 	}
+	if !stageGScreenshotFileUsable(source) {
+		return fmt.Errorf("source screenshot is not a valid PNG: %s", source)
+	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
@@ -1459,6 +2487,21 @@ func copyStageGScreenshot(source, dest string) error {
 		return err
 	}
 	return os.WriteFile(dest, content, 0o644)
+}
+
+func stageGScreenshotFileUsable(path string) bool {
+	content, err := os.ReadFile(strings.TrimSpace(path))
+	if err != nil || len(content) < 8 {
+		return false
+	}
+	return content[0] == 0x89 &&
+		content[1] == 'P' &&
+		content[2] == 'N' &&
+		content[3] == 'G' &&
+		content[4] == '\r' &&
+		content[5] == '\n' &&
+		content[6] == 0x1a &&
+		content[7] == '\n'
 }
 
 func stageGScreenshotFallbackText(summary FrontendE2ESummary, observations []browserpkg.Observation) string {
@@ -1599,7 +2642,7 @@ func frontendE2EObservationFindings(observations []browserpkg.Observation, scree
 			})
 		}
 		for _, issue := range observation.NetworkIssues {
-			if stageGNetworkIssueRecovered(index, issue, observations) {
+			if !stageGNetworkIssueBlocksEvidence(index, issue, observations) {
 				continue
 			}
 			if issue.Status >= 500 {

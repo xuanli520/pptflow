@@ -335,6 +335,73 @@ func TestListProjectsPaginatedSearchesTermsAndEscapesLikeWildcards(t *testing.T)
 	}
 }
 
+func TestListProjectsChoosesRuntimeFailureAsPrimaryFailedStage(t *testing.T) {
+	store, _ := newStore(t)
+	ctx := context.Background()
+	upsertTaskIDs(t, store, "TASK-RUNTIME")
+	createRun(t, store, "run-runtime", "TASK-RUNTIME", "2026-05-07T00:01:00Z", model.RunCompletedWithFindings, model.ManualFail)
+	for _, stage := range []model.StageRecord{
+		{Stage: "A", Status: model.StageFailed, ErrorSummary: "local-dependency-risk"},
+		{Stage: "B", Status: model.StageFailed, ErrorSummary: "docker build failed"},
+		{Stage: "G", Status: model.StageBlocked, ErrorSummary: "blocked by B"},
+	} {
+		if err := store.PutStage(ctx, "run-runtime", stage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projects, _, err := store.ListProjectsPaginated(ctx, db.ProjectQuery{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 || projects[0].FailedStage != "B" {
+		t.Fatalf("primary failed stage = %#v", projects)
+	}
+}
+
+func TestListProjectsPrimaryFailedStagePriorityMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stages []model.StageRecord
+		want   string
+	}{
+		{
+			name: "G failed beats C failed",
+			stages: []model.StageRecord{
+				{Stage: "C", Status: model.StageFailed, ErrorSummary: "run_tests failed"},
+				{Stage: "G", Status: model.StageFailed, ErrorSummary: "frontend E2E failed"},
+			},
+			want: "G",
+		},
+		{
+			name: "G failed beats B blocked",
+			stages: []model.StageRecord{
+				{Stage: "B", Status: model.StageBlocked, ErrorSummary: "docker unavailable"},
+				{Stage: "G", Status: model.StageFailed, ErrorSummary: "frontend E2E failed"},
+			},
+			want: "G",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, _ := newStore(t)
+			ctx := context.Background()
+			upsertTaskIDs(t, store, "TASK-PRIMARY")
+			createRun(t, store, "run-primary", "TASK-PRIMARY", "2026-05-07T00:01:00Z", model.RunCompletedWithFindings, model.ManualFail)
+			for _, stage := range tc.stages {
+				if err := store.PutStage(ctx, "run-primary", stage); err != nil {
+					t.Fatal(err)
+				}
+			}
+			projects, _, err := store.ListProjectsPaginated(ctx, db.ProjectQuery{Limit: 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(projects) != 1 || projects[0].FailedStage != tc.want {
+				t.Fatalf("primary failed stage = %#v, want %s", projects, tc.want)
+			}
+		})
+	}
+}
+
 func TestListProjectsAndPaginatedSummariesMatch(t *testing.T) {
 	store, _ := newStore(t)
 	upsertTaskIDs(t, store, "TASK-1", "TASK-2")

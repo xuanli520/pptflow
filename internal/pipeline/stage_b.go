@@ -80,7 +80,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	bestEffortStageJSON(&record, writer, "docker_runtime_summary.json", result.RuntimeSummary)
 	bestEffortStageJSON(&record, writer, "docker_mirror_summary.json", result.MirrorSummary)
 	if strings.TrimSpace(result.EffectiveConfigContent) != "" {
-		bestEffortStageText(&record, writer, "docker_compose_effective_config.yml", result.EffectiveConfigContent)
+		bestEffortStageText(&record, writer, "docker_compose_effective_config.yml", dockermgr.RedactLogText(result.EffectiveConfigContent))
 	}
 	mergeDockerRuntimeIntoManifest(run.ArtifactRoot, result)
 	cleanupMeta := cleanupMetaFromRuntime(run.RunID, project.TaskID, result.Runtime, r.cfg.Docker)

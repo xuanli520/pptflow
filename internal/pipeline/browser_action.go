@@ -88,6 +88,9 @@ func validateBrowserAction(action BrowserAction, candidates []BrowserURLCandidat
 	if action.OutputPath != "" {
 		return invalidBrowserAction(action.Action, "Codex-specified output paths are not accepted", string(risk), raw)
 	}
+	if browserActionEndsSession(action) {
+		return invalidBrowserAction(action.Action, "session-ending browser actions are not allowed during Stage G", string(risk), raw)
+	}
 	switch action.Action {
 	case "open_candidate":
 		if !browserCandidateExists(action.URLID, candidates) {
@@ -108,6 +111,58 @@ func validateBrowserAction(action BrowserAction, candidates []BrowserURLCandidat
 		return invalidBrowserAction(action.Action, "input value exceeds 2000 characters", string(risk), raw)
 	}
 	return browserActionValidation{Action: action, Risk: risk}
+}
+
+func browserActionEndsSession(action BrowserAction) bool {
+	switch action.Action {
+	case "click_navigation", "click_button", "submit_local_form":
+	default:
+		return false
+	}
+	return browserActionTextEndsSession(strings.Join([]string{action.Selector, action.Text, action.Reason}, " "))
+}
+
+func browserActionTextEndsSession(value string) bool {
+	tokens := browserActionSessionTokens(value)
+	for index, token := range tokens {
+		switch token {
+		case "logout", "signout", "logoff", "signoff":
+			return true
+		}
+		if index+1 >= len(tokens) {
+			continue
+		}
+		next := tokens[index+1]
+		if (token == "log" || token == "sign") && (next == "out" || next == "off") {
+			return true
+		}
+		if token == "end" && next == "session" {
+			return true
+		}
+		if (token == "session" && next == "exit") || (token == "exit" && next == "session") {
+			return true
+		}
+	}
+	return false
+}
+
+func browserActionSessionTokens(value string) []string {
+	var tokens []string
+	var builder strings.Builder
+	for _, ch := range strings.ToLower(value) {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
+			builder.WriteRune(ch)
+			continue
+		}
+		if builder.Len() > 0 {
+			tokens = append(tokens, builder.String())
+			builder.Reset()
+		}
+	}
+	if builder.Len() > 0 {
+		tokens = append(tokens, builder.String())
+	}
+	return tokens
 }
 
 func invalidBrowserAction(action, reason, risk, raw string) browserActionValidation {

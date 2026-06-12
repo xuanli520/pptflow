@@ -16,6 +16,77 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/executor"
 )
 
+func TestRedactLogTextRemovesSecrets(t *testing.T) {
+	input := strings.Join([]string{
+		"POSTGRES_PASSWORD=super-secret",
+		"api_key: abc123",
+		"Authorization: Bearer token-value",
+		"image: http://user:pass@example.com/app",
+		"jwt=eyJabc.def.ghi",
+	}, "\n")
+	output := dockermgr.RedactLogText(input)
+	for _, secret := range []string{"super-secret", "abc123", "token-value", "user:pass", "eyJabc.def.ghi"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("redacted output still contains %q: %s", secret, output)
+		}
+	}
+	if count := strings.Count(output, "[REDACTED]"); count < 4 {
+		t.Fatalf("expected redaction markers, got %d in %s", count, output)
+	}
+}
+
+func TestStartRuntimeRedactsDockerLogAndProgress(t *testing.T) {
+	repo := writeComposeProject(t, t.TempDir())
+	runner := &scriptedDockerRunner{configOutput: "services:\n  db:\n    environment:\n      POSTGRES_PASSWORD: super-secret\n"}
+	cfg := config.Default().Docker
+	cfg.BuildMirrors.Enabled = false
+	var log strings.Builder
+	var progress []string
+	_, _ = (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: t.TempDir(),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Log:          &log,
+		Progress: func(event dockermgr.ProgressEvent) {
+			progress = append(progress, event.Line)
+		},
+		Timeouts: dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	combined := log.String() + "\n" + strings.Join(progress, "\n")
+	if strings.Contains(combined, "super-secret") {
+		t.Fatalf("docker evidence leaked secret:\n%s", combined)
+	}
+	if !strings.Contains(combined, "[REDACTED]") {
+		t.Fatalf("docker evidence missing redaction marker:\n%s", combined)
+	}
+}
+
+func TestStartRuntimeRedactsDockerLogAcrossSplitWrites(t *testing.T) {
+	repo := writeComposeProject(t, t.TempDir())
+	runner := &scriptedDockerRunner{
+		configOutput: "services:\n  db:\n    environment:\n      POSTGRES_PASSWORD: super-secret\n",
+		streamChunks: []string{"POSTGRES_PASS", "WORD=super-secret"},
+	}
+	cfg := config.Default().Docker
+	cfg.BuildMirrors.Enabled = false
+	var log strings.Builder
+	_, _ = (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: t.TempDir(),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Log:          &log,
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if strings.Contains(log.String(), "super-secret") {
+		t.Fatalf("docker log leaked split secret:\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), "POSTGRES_PASSWORD=[REDACTED]") {
+		t.Fatalf("docker log missing redacted split secret:\n%s", log.String())
+	}
+}
+
 func TestStartRuntimePullPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -641,6 +712,7 @@ func TestRunGCGlobalScopeRequiresAllowGlobal(t *testing.T) {
 type scriptedDockerRunner struct {
 	pullErr                         bool
 	configOutput                    string
+	streamChunks                    []string
 	rejectMirrorBuildOutsideContext bool
 	commands                        []string
 }
@@ -659,7 +731,13 @@ func (r *scriptedDockerRunner) Run(ctx context.Context, timeout time.Duration, d
 func (r *scriptedDockerRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
 	result := r.result(name, args...)
 	if writer != nil {
-		_, _ = writer.Write([]byte(result.Stdout + result.Stderr))
+		if len(r.streamChunks) > 0 {
+			for _, chunk := range r.streamChunks {
+				_, _ = writer.Write([]byte(chunk))
+			}
+		} else {
+			_, _ = writer.Write([]byte(result.Stdout + result.Stderr))
+		}
 	}
 	if onOutput != nil && strings.TrimSpace(result.Stdout) != "" {
 		onOutput(strings.TrimSpace(result.Stdout), "stdout")

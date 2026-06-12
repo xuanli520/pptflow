@@ -471,6 +471,58 @@ func TestRunSubmitManifestMarksUnselectedArtifactsWithoutWarnings(t *testing.T) 
 	}
 }
 
+func TestWriteStageStatusWritesRunFailureSummary(t *testing.T) {
+	artifactRoot := t.TempDir()
+	stages := []model.StageRecord{
+		{Stage: "A", Status: model.StageFailed, ErrorSummary: "local-dependency-risk"},
+		{Stage: "B", Status: model.StageFailed, ErrorSummary: "docker build failed"},
+		{Stage: "G", Status: model.StageBlocked, ErrorSummary: "blocked by B"},
+	}
+	if err := pipelinepkg.WriteStageStatusForTest("run-summary", artifactRoot, stages); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "run_failure_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(content, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["primary_stage"] != "B" || payload["primary_error_summary"] != "docker build failed" {
+		t.Fatalf("unexpected run failure summary: %s", content)
+	}
+	report, err := os.ReadFile(filepath.Join(artifactRoot, "run_failure_summary.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "acceptance_report.md") || !strings.Contains(string(report), "Stage B failed - docker build failed") {
+		t.Fatalf("unexpected markdown summary:\n%s", report)
+	}
+}
+
+func TestWriteStageStatusUsesFindingOnlyStageInRunFailureSummary(t *testing.T) {
+	artifactRoot := t.TempDir()
+	stages := []model.StageRecord{
+		{Stage: "D", Status: model.StageDone, Findings: []model.Finding{{Stage: "D", Severity: "High", Title: "weak tests"}}},
+		{Stage: "E", Status: model.StageDone},
+	}
+	if err := pipelinepkg.WriteStageStatusForTest("run-findings", artifactRoot, stages); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "run_failure_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(content, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["primary_stage"] != "D" || payload["primary_status"] != model.StageDone {
+		t.Fatalf("unexpected run failure summary: %s", content)
+	}
+}
+
 func TestAggregateSubmitArtifactsAllowsMissingOptionalCodexReport(t *testing.T) {
 	root := t.TempDir()
 	artifactRoot := filepath.Join(root, "run")

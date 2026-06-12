@@ -182,23 +182,80 @@ func (s dbTaskQueryService) enrichTaskProject(ctx context.Context, project *Task
 		return
 	}
 	for _, stage := range stages {
-		switch stage.Status {
-		case model.StageRunning:
+		if stage.Status == model.StageRunning {
 			if project.CurrentStage == "" {
 				project.CurrentStage = stage.Stage
 				project.CurrentStatus = stage.Status
 			}
-		case model.StageFailed, model.StageBlocked:
-			if project.FailedStage == "" {
-				project.FailedStage = stage.Stage
-				project.FailedSummary = stage.ErrorSummary
-				if project.CurrentStage == "" {
-					project.CurrentStage = stage.Stage
-					project.CurrentStatus = stage.Status
-				}
-			}
 		}
 	}
+	stage, summary, status := primaryFailedStage(stages)
+	if stage != "" {
+		project.FailedStage = stage
+		project.FailedSummary = summary
+		if project.CurrentStage == "" {
+			project.CurrentStage = stage
+			project.CurrentStatus = status
+		}
+	}
+}
+
+func primaryFailedStage(stages []model.StageRecord) (string, string, string) {
+	bestIndex := -1
+	bestPriority := 0
+	for index, stage := range stages {
+		priority := failedStagePriority(stage)
+		if priority == 0 {
+			continue
+		}
+		if bestIndex < 0 || priority < bestPriority {
+			bestIndex = index
+			bestPriority = priority
+		}
+	}
+	if bestIndex < 0 {
+		return "", "", ""
+	}
+	stage := stages[bestIndex]
+	return stage.Stage, stage.ErrorSummary, stage.Status
+}
+
+func failedStagePriority(stage model.StageRecord) int {
+	switch stage.Status {
+	case model.StageFailed:
+		switch stage.Stage {
+		case string(model.StageB):
+			return 1
+		case string(model.StageG):
+			return 2
+		case string(model.StageC):
+			return 3
+		default:
+			return 10 + stageOrderRank(stage.Stage)
+		}
+	case model.StageBlocked:
+		switch stage.Stage {
+		case string(model.StageB):
+			return 30
+		case string(model.StageG):
+			return 31
+		case string(model.StageC):
+			return 32
+		default:
+			return 40 + stageOrderRank(stage.Stage)
+		}
+	default:
+		return 0
+	}
+}
+
+func stageOrderRank(stage string) int {
+	for index, item := range model.AllStages() {
+		if item == stage {
+			return index
+		}
+	}
+	return 99
 }
 
 type dbTaskActionService struct {

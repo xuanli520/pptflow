@@ -52,6 +52,9 @@ func (w PlaywrightWrapper) Run(ctx context.Context, action Action, timeout time.
 	if policy.StorageStatePath == "" {
 		policy.StorageStatePath = filepath.Join(stateDir, "storage_state.json")
 	}
+	if policy.SessionStatePath == "" {
+		policy.SessionStatePath = filepath.Join(stateDir, "session_state.json")
+	}
 	if policy.LastURLPath == "" {
 		policy.LastURLPath = filepath.Join(stateDir, "last_url.txt")
 	}
@@ -61,7 +64,7 @@ func (w PlaywrightWrapper) Run(ctx context.Context, action Action, timeout time.
 	if policy.ScreenshotPath == "" && !policy.DisableScreenshot {
 		policy.ScreenshotPath = filepath.Join(root, "frontend_e2e_screenshot.png")
 	}
-	for _, path := range []string{policy.StorageStatePath, policy.LastURLPath, policy.FormStatePath, policy.ScreenshotPath} {
+	for _, path := range []string{policy.StorageStatePath, policy.SessionStatePath, policy.LastURLPath, policy.FormStatePath, policy.ScreenshotPath} {
 		if strings.TrimSpace(path) == "" {
 			continue
 		}
@@ -135,6 +138,7 @@ const pageErrors = [];
 const networkIssues = [];
 const networkEvents = [];
 const blockedRequests = [];
+let blockedSessionRequest = '';
 
 function trim(value, limit) {
   value = String(value || '').replace(/\s+/g, ' ').trim();
@@ -158,6 +162,39 @@ function safeJSONRead(path) {
   }
 }
 
+function sessionStateKey(rawURL) {
+  try { return new URL(rawURL).origin; } catch (_) { return ''; }
+}
+
+function loadSessionState() {
+  if (!policy.session_state_path) return {};
+  const value = safeJSONRead(policy.session_state_path);
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function writeSessionState(state) {
+  if (!policy.session_state_path) return;
+  try {
+    fs.writeFileSync(policy.session_state_path, JSON.stringify(state));
+  } catch (_) {}
+}
+
+async function saveSessionState(page, state) {
+  const key = sessionStateKey(page.url());
+  if (!key) return;
+  const entries = await page.evaluate(() => {
+    const result = {};
+    for (let index = 0; index < sessionStorage.length; index++) {
+      const key = sessionStorage.key(index);
+      if (key) result[key] = sessionStorage.getItem(key) || '';
+    }
+    return result;
+  });
+  if (entries && Object.keys(entries).length > 0) state[key] = entries;
+  else delete state[key];
+  writeSessionState(state);
+}
+
 function safeURL(raw) {
   try {
     const value = new URL(raw);
@@ -171,6 +208,55 @@ function safeURL(raw) {
 
 function escapeRegExp(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function sessionTokens(value) {
+  return String(value || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function looksSessionEndingText(value) {
+  const tokens = sessionTokens(value);
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (['logout', 'signout', 'logoff', 'signoff'].includes(token)) return true;
+    const next = tokens[index + 1] || '';
+    if ((token === 'log' || token === 'sign') && (next === 'out' || next === 'off')) return true;
+    if (token === 'end' && next === 'session') return true;
+    if ((token === 'session' && next === 'exit') || (token === 'exit' && next === 'session')) return true;
+  }
+  return false;
+}
+
+function looksSessionEndingURL(raw) {
+  try {
+    const parsed = new URL(raw);
+    return looksSessionEndingText(parsed.pathname);
+  } catch (_) {
+    return looksSessionEndingText(raw);
+  }
+}
+
+async function sessionEndingLocatorEvidence(locator) {
+  return await locator.evaluate((el) => {
+    const values = [];
+    const push = (value) => {
+      if (value) values.push(String(value));
+    };
+    push(el.innerText);
+    push(el.textContent);
+    for (const attr of ['aria-label', 'title', 'href', 'action', 'formaction', 'value', 'data-testid', 'data-test', 'id', 'name']) {
+      push(el.getAttribute(attr));
+    }
+    const closest = el.closest ? el.closest('a[href], form[action], button, [role="button"], [role="link"]') : null;
+    if (closest && closest !== el) {
+      push(closest.innerText);
+      push(closest.textContent);
+      for (const attr of ['aria-label', 'title', 'href', 'action', 'formaction', 'value', 'data-testid', 'data-test', 'id', 'name']) {
+        push(closest.getAttribute(attr));
+      }
+    }
+    return values.join(' ');
+  }).then((value) => looksSessionEndingText(value) ? trim(value, 240) : '').catch(() => '');
 }
 
 function formStateKey(rawURL) {
@@ -272,8 +358,9 @@ async function actionLocator(page) {
       candidates.push(page.getByRole('button', { name: targetText, exact: false }));
       candidates.push(page.locator('button, [role="button"]').filter({ hasText: new RegExp(escapeRegExp(targetText), 'i') }));
       candidates.push(page.locator('input[type="submit"], input[type="button"]').filter({ hasText: new RegExp(escapeRegExp(targetText), 'i') }));
+      return firstAvailableLocator(candidates);
     }
-    candidates.push(page.locator('button, [role="button"], input[type="submit"], input[type="button"]'));
+    candidates.push(page.locator('button:not([disabled]), [role="button"]:not([aria-disabled="true"]), input[type="submit"]:not([disabled]), input[type="button"]:not([disabled])'));
     return firstAvailableLocator(candidates);
   }
   if (action.name === 'click_navigation') {
@@ -281,8 +368,9 @@ async function actionLocator(page) {
       candidates.push(page.getByRole('link', { name: targetText, exact: false }));
       candidates.push(page.getByRole('button', { name: targetText, exact: false }));
       candidates.push(page.locator('a, button, [role="link"], [role="button"]').filter({ hasText: new RegExp(escapeRegExp(targetText), 'i') }));
+      return firstAvailableLocator(candidates);
     }
-    candidates.push(page.locator('a, button, [role="link"], [role="button"]'));
+    candidates.push(page.locator('a[href], button:not([disabled]), [role="link"]:not([aria-disabled="true"]), [role="button"]:not([aria-disabled="true"])'));
     return firstAvailableLocator(candidates);
   }
   if (targetText) {
@@ -365,10 +453,27 @@ async function collect(page, ok, error) {
       contextOptions.storageState = policy.storage_state_path;
     }
     const context = await browser.newContext(contextOptions);
+    const sessionState = loadSessionState();
+    if (Object.keys(sessionState).length > 0) {
+      await context.addInitScript((state) => {
+        try {
+          const entries = state[window.location.origin] || {};
+          if (!entries || typeof entries !== 'object') return;
+          for (const [key, value] of Object.entries(entries)) {
+            sessionStorage.setItem(key, String(value));
+          }
+        } catch (_) {}
+      }, sessionState);
+    }
     await context.route('**/*', async (route) => {
       const raw = route.request().url();
       let parsed;
       try { parsed = new URL(raw); } catch (_) { return route.abort('blockedbyclient'); }
+      if (allowed.has(parsed.origin) && looksSessionEndingURL(raw)) {
+        blockedSessionRequest = raw;
+        blockedRequests.push({ url: raw, origin: parsed.origin });
+        return route.abort('blockedbyclient');
+      }
       if (['about:', 'data:', 'blob:'].includes(parsed.protocol) || allowed.has(parsed.origin)) {
         return route.continue();
       }
@@ -418,17 +523,22 @@ async function collect(page, ok, error) {
       await page.waitForTimeout(Math.max(100, Math.min(action.wait_ms || 1000, 5000)));
     } else if (action.name === 'click_navigation' || action.name === 'click_button') {
       const locator = await actionLocator(page);
+      const sessionEndingTarget = await sessionEndingLocatorEvidence(locator);
+      if (sessionEndingTarget) throw new Error('session-ending browser target blocked: ' + sessionEndingTarget);
       await Promise.race([
         locator.click({ timeout: 5000 }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('click timeout')), 5500))
       ]);
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(750);
+      if (blockedSessionRequest) throw new Error('session-ending browser request blocked: ' + blockedSessionRequest);
     } else if (action.name === 'fill_input') {
       const locator = await actionLocator(page);
       await locator.fill(action.value || '', { timeout: 5000 });
     } else if (action.name === 'submit_local_form') {
       const locator = await actionLocator(page);
+      const sessionEndingTarget = await sessionEndingLocatorEvidence(locator);
+      if (sessionEndingTarget) throw new Error('session-ending browser target blocked: ' + sessionEndingTarget);
       const submitted = await locator.evaluate((el) => {
         if (el && el.tagName && el.tagName.toLowerCase() === 'form') {
           if (typeof el.requestSubmit === 'function') el.requestSubmit();
@@ -442,10 +552,12 @@ async function collect(page, ok, error) {
       }
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(750);
+      if (blockedSessionRequest) throw new Error('session-ending browser request blocked: ' + blockedSessionRequest);
     } else if (action.name === 'go_back') {
       await page.goBack({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
     }
     await saveFormState(page, formState).catch(() => {});
+    await saveSessionState(page, sessionState).catch(() => {});
     const observation = await collect(page, true, '');
     await browser.close();
     process.stdout.write(JSON.stringify(observation));

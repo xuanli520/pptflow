@@ -13,6 +13,7 @@ Hard boundaries:
 - Do not include output paths.
 - Allowed actions: open_candidate, wait, snapshot, collect_console, collect_network, click_navigation, click_button, fill_input, submit_local_form, go_back, finish.
 - Destructive actions are forbidden.
+- Do not click logout, log out, sign out, sign-off, session-exit, or any control/link/form that could end the current browser session.
 - Use finish only when you can provide a valid p2r.frontend_e2e.v1 summary.
 - Do not use finish until at least {{.MinimumScreenshotCount}} key UI/business states have screenshots in previous observations. Do not use fill_input retries, repeated button clicks, or unchanged login-page states just to increase the screenshot count; navigate to or snapshot distinct business screens required by the README workflow.
 - Before concluding credentials are unavailable or login cannot be tested, use README-derived browser test hints from Project context. They may include local demo accounts, E2E check credentials, or README-referenced .env login passwords.

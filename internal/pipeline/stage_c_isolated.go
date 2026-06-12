@@ -412,7 +412,7 @@ func bestEffortStageCProxyArtifacts(record *model.StageRecord, writer ArtifactWr
 		return
 	}
 	if strings.TrimSpace(composeContent) != "" {
-		bestEffortStageText(record, writer, "docker_compose_stage_c_proxy_config.yml", composeContent)
+		bestEffortStageText(record, writer, "docker_compose_stage_c_proxy_config.yml", dockermgr.RedactLogText(composeContent))
 	}
 	bestEffortStageText(record, writer, writer.RelativePath(plan.EnvFile), plan.EnvContent)
 	bestEffortStageText(record, writer, writer.RelativePath(plan.OverrideFile), plan.OverrideContent)

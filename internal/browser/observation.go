@@ -22,6 +22,7 @@ type Policy struct {
 	ScreenshotPath    string   `json:"screenshot_path"`
 	DisableScreenshot bool     `json:"disable_screenshot,omitempty"`
 	StorageStatePath  string   `json:"storage_state_path"`
+	SessionStatePath  string   `json:"session_state_path"`
 	LastURLPath       string   `json:"last_url_path"`
 	FormStatePath     string   `json:"form_state_path"`
 }

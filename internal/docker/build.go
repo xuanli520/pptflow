@@ -382,7 +382,7 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	if ps.Err != nil || len(mappings) == 0 {
 		fallbackMappings, fallbackServices, fallbackLog := s.dockerPortFallback(ctx, cmd, timeouts.Port, psQArgs, servicesArgs)
 		if req.Log != nil {
-			_, _ = req.Log.Write([]byte(fallbackLog))
+			_, _ = req.Log.Write([]byte(RedactLogText(fallbackLog)))
 		}
 		if len(fallbackMappings) > 0 {
 			mappings = fallbackMappings
@@ -487,7 +487,7 @@ func trimResultText(result executor.Result) string {
 	if value == "" {
 		value = result.Command
 	}
-	return value
+	return RedactLogText(value)
 }
 
 func firstNonEmpty(values ...string) string {
