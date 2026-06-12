@@ -453,6 +453,51 @@ func TestStartRuntimeRewritesFixedHostPortsToComposeAllocatedPorts(t *testing.T)
 	}
 }
 
+func TestStartRuntimeAddsDeterministicNetworkIPAMOverride(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(repo, "docker-compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  web:\n    image: nginx\n    networks:\n      - appnet\nnetworks:\n  appnet: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedDockerRunner{configOutput: "services:\n  web:\n    image: nginx\n    networks:\n      appnet: null\nnetworks:\n  appnet:\n    name: p2r_test_appnet\n"}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: filepath.Join(root, "artifacts"),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("start runtime failed: %v", err)
+	}
+	if result.RuntimeSummary.NetworkIPAM == nil || !result.RuntimeSummary.NetworkIPAM.Generated {
+		t.Fatalf("network ipam override should be generated: %#v", result.RuntimeSummary.NetworkIPAM)
+	}
+	if len(result.RuntimeSummary.NetworkIPAM.Networks) != 1 || result.RuntimeSummary.NetworkIPAM.Networks[0].Network != "appnet" {
+		t.Fatalf("network ipam summary should target appnet: %#v", result.RuntimeSummary.NetworkIPAM)
+	}
+	content, err := os.ReadFile(result.RuntimeSummary.NetworkIPAM.ComposeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"appnet:", "ipam:", "subnet: 100."} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("network ipam override missing %q:\n%s", want, content)
+		}
+	}
+	if !containsCommand(runner.commands, composePath+" -f "+result.RuntimeSummary.NetworkIPAM.ComposeFile+" ") {
+		t.Fatalf("docker commands should layer original compose plus network override: %#v", runner.commands)
+	}
+}
+
 func TestStartRuntimeAddsManagedLabelOverride(t *testing.T) {
 	repo := writeComposeProject(t, t.TempDir())
 	artifactRoot := t.TempDir()

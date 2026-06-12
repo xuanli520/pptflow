@@ -32,7 +32,6 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 	screenshotPath := qaArtifactPath(run.ArtifactRoot, "docker_startup.png")
 	record.ArtifactPaths = append(record.ArtifactPaths, portMapPath, runtimeSummaryPath, mirrorSummaryPath, effectiveConfigPath, stageCProxyConfigPath, stageCProxyPath, stageCPortsEnvPath, screenshotPath)
 	repoPath := filepath.Join(project.Path, "repo")
-	rewriteFixedPorts := stageCNeedsRuntimePortRewrite(r.cfg.Pipeline.StageC, repoPath)
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		recordArtifactWarning(&record, newArtifactWarning(writer.RelativePath(logPath), "write_text", false, err))
@@ -55,7 +54,7 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		Labels:            runtimeLabels(r.cfg.Docker, project.TaskID, run.RunID),
 		Env:               dockerCommandEnv(),
 		Log:               logWriter,
-		RewriteFixedPorts: rewriteFixedPorts,
+		RewriteFixedPorts: true,
 		Progress: func(event dockermgr.ProgressEvent) {
 			appendStreamProgress(run.RunID, "B", event.Line, event.Source, event.Done, progress)
 		},

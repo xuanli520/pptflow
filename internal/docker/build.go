@@ -58,6 +58,7 @@ type DockerRuntimeSummary struct {
 	ReadmeCommandMode    bool                       `json:"readme_command_mode,omitempty"`
 	EffectiveConfig      string                     `json:"effective_config,omitempty"`
 	PortRewrite          *RuntimePortRewriteSummary `json:"port_rewrite,omitempty"`
+	NetworkIPAM          *RuntimeNetworkIPAMSummary `json:"network_ipam,omitempty"`
 	RuntimeErrorCategory string                     `json:"runtime_error_category,omitempty"`
 	FailureDiagnostics   *RuntimeFailureDiagnostics `json:"failure_diagnostics,omitempty"`
 	EnvFilesPrepared     []string                   `json:"env_files_prepared,omitempty"`
@@ -204,6 +205,23 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 					summary.Warnings = append(summary.Warnings, "runtime port rewrite config failed; falling back to original compose file: "+trimResultText(verify))
 					summary.PortRewrite.Warnings = append(summary.PortRewrite.Warnings, "config verification failed: "+trimResultText(verify))
 				}
+			}
+		}
+		networkIPAM := prepareRuntimeNetworkIPAMOverride(effectiveConfig, req.ArtifactRoot, projectName)
+		if len(networkIPAM.Summary.Warnings) > 0 {
+			summary.Warnings = append(summary.Warnings, networkIPAM.Summary.Warnings...)
+		}
+		if networkIPAM.Summary.Generated {
+			summary.NetworkIPAM = &networkIPAM.Summary
+			candidateFiles := append(append([]string{}, baseRuntimeFiles...), networkIPAM.Summary.ComposeFile)
+			verify := cmd.runStreaming(ctx, "B0 docker compose network ipam config", timeouts.Port, ComposeCommandArgsWithProjectDirAndEnvFiles(candidateFiles, workDir, projectName, composeEnvFiles, "config"), true)
+			if verify.Err == nil {
+				baseRuntimeFiles = candidateFiles
+				activeFiles = append([]string{}, baseRuntimeFiles...)
+				effectiveConfig = verify.Stdout
+			} else {
+				summary.Warnings = append(summary.Warnings, "runtime network ipam override config failed; falling back to Docker default address pools: "+trimResultText(verify))
+				summary.NetworkIPAM.Warnings = append(summary.NetworkIPAM.Warnings, "config verification failed: "+trimResultText(verify))
 			}
 		}
 		prepared := prepareBuildMirror(repoPath, composeFile, req.ArtifactRoot, s.Config)

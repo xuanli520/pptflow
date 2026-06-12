@@ -750,7 +750,7 @@ func TestStageBRewritesFixedPortsWhenRunTestsStartsDockerCompose(t *testing.T) {
 	}
 }
 
-func TestStageBDoesNotRewriteFixedPortsForComposeExecOnlyRunTests(t *testing.T) {
+func TestStageBRewritesFixedPortsForComposeExecOnlyRunTests(t *testing.T) {
 	root := t.TempDir()
 	projectPath := filepath.Join(root, "batch", "TASK-1")
 	repoPath := filepath.Join(projectPath, "repo")
@@ -784,8 +784,8 @@ func TestStageBDoesNotRewriteFixedPortsForComposeExecOnlyRunTests(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(content), `"generated": true`) || strings.Contains(string(content), "compose.ports.yml") {
-		t.Fatalf("exec-only run_tests should not force runtime port rewrite:\n%s", content)
+	if !strings.Contains(string(content), `"generated": true`) || !strings.Contains(string(content), "compose.ports.yml") {
+		t.Fatalf("Stage B should rewrite fixed ports even for exec-only run_tests to avoid concurrent host-port conflicts:\n%s", content)
 	}
 }
 
