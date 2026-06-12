@@ -22,6 +22,7 @@ type appServerCodexReviewSession struct {
 	processCtx            context.Context
 	cancel                context.CancelFunc
 	done                  chan struct{}
+	wg                    sync.WaitGroup
 	result                Result
 	err                   error
 	nextID                int
@@ -117,10 +118,20 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	s.mu.Lock()
 	s.cmd = cmd
 	s.stdin = stdin
+	s.wg.Add(3)
 	s.mu.Unlock()
-	go s.readStdout(stdout)
-	go s.readStderr(stderr)
-	go s.waitProcess(runCtx, commandString(request.CommandPath, args))
+	go func() {
+		defer s.wg.Done()
+		s.readStdout(stdout)
+	}()
+	go func() {
+		defer s.wg.Done()
+		s.readStderr(stderr)
+	}()
+	go func() {
+		defer s.wg.Done()
+		s.waitProcess(runCtx, commandString(request.CommandPath, args))
+	}()
 
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()

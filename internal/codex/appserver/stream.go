@@ -27,6 +27,7 @@ func (s *appServerCodexReviewSession) Wait(ctx context.Context) (Result, error) 
 		s.stop()
 		<-done
 	}
+	s.wg.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.result, s.err
