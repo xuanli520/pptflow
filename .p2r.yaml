@@ -34,6 +34,9 @@ pipeline:
         D: 9000
         E: 20000
         F: 10000
+        G: 12000
+    stage_g:
+        planner_turn_timeout_seconds: 480
     static_only: false
 scan_path: ./projects-qa
 tui:

@@ -33,6 +33,7 @@ type StartRuntimeRequest struct {
 
 type StartRuntimeResult struct {
 	Runtime                  RuntimeState
+	FailureRuntime           RuntimeState
 	MirrorSummary            BuildMirrorSummary
 	RuntimeSummary           DockerRuntimeSummary
 	EffectiveConfigContent   string
@@ -58,6 +59,7 @@ type DockerRuntimeSummary struct {
 	EffectiveConfig      string                     `json:"effective_config,omitempty"`
 	PortRewrite          *RuntimePortRewriteSummary `json:"port_rewrite,omitempty"`
 	RuntimeErrorCategory string                     `json:"runtime_error_category,omitempty"`
+	FailureDiagnostics   *RuntimeFailureDiagnostics `json:"failure_diagnostics,omitempty"`
 	EnvFilesPrepared     []string                   `json:"env_files_prepared,omitempty"`
 	Warnings             []string                   `json:"warnings,omitempty"`
 }
@@ -81,10 +83,11 @@ type BuildStepSummary struct {
 }
 
 type StartRuntimeError struct {
-	Category string
-	Message  string
-	Fix      string
-	Result   executor.Result
+	Category    string
+	Message     string
+	Fix         string
+	Result      executor.Result
+	Diagnostics *RuntimeFailureDiagnostics
 }
 
 func (e *StartRuntimeError) Error() string {
@@ -362,11 +365,52 @@ func (s Service) StartRuntime(ctx context.Context, req StartRuntimeRequest) (Sta
 	up := cmd.runStreaming(ctx, "B3 docker compose up", timeouts.Up, upArgs, true)
 	summary.Up = stepSummaryFromResult(up, true, "ok")
 	if up.Err != nil {
+		failureRuntime := RuntimeState{
+			ComposeProject: projectName,
+			ComposeFile:    firstComposeFile(activeFiles),
+			ComposeFiles:   append([]string{}, activeFiles...),
+			EnvFiles:       append([]string{}, composeEnvFiles...),
+			WorkDir:        workDir,
+			Mappings:       map[string][]PortMapping{},
+		}
+		if composeFile == "" {
+			failureRuntime.ComposeFile = firstComposeFile(readmeRuntimeFiles)
+			failureRuntime.ComposeFiles = append([]string{}, readmeRuntimeFiles...)
+		}
+		failureRuntime.Normalize()
+		diagnostics := s.diagnoseRuntimeFailure(ctx, cmd, runtimeFailureDiagnosticRequest{
+			Trigger:          "B3 docker compose up",
+			DefaultCategory:  "up_failed",
+			DefaultFix:       "Fix Docker startup and rerun stage B.",
+			Result:           up,
+			ProjectName:      projectName,
+			WorkDir:          workDir,
+			ComposeFiles:     failureRuntime.ComposeFiles,
+			EnvFiles:         failureRuntime.EnvFiles,
+			ReadmeCommand:    readmeCommand,
+			ReadmeLabelFiles: readmeLabelFiles,
+		})
+		if diagnostics.Category != "" {
+			summary.RuntimeErrorCategory = diagnostics.Category
+		} else {
+			summary.RuntimeErrorCategory = "up_failed"
+		}
+		summary.FailureDiagnostics = &diagnostics
 		summary.Up.Status = "failed"
-		summary.RuntimeErrorCategory = "up_failed"
 		result.RuntimeSummary = summary
 		result.MirrorSummary = mirrorSummary
-		return result, &StartRuntimeError{Category: "up_failed", Message: "B3 docker compose up failed: " + trimResultText(up), Fix: "Fix Docker startup and rerun stage B.", Result: up}
+		result.EffectiveConfigContent = effectiveConfig
+		result.StageCProxyConfigContent = effectiveConfig
+		result.FailureRuntime = failureRuntime
+		message := "B3 docker compose up failed: " + diagnostics.Cause
+		if strings.TrimSpace(diagnostics.Cause) == "" {
+			message = "B3 docker compose up failed: " + trimResultText(up)
+		}
+		fix := diagnostics.Fix
+		if strings.TrimSpace(fix) == "" {
+			fix = "Fix Docker startup and rerun stage B."
+		}
+		return result, &StartRuntimeError{Category: summary.RuntimeErrorCategory, Message: message, Fix: fix, Result: up, Diagnostics: &diagnostics}
 	}
 	psArgs := ComposeCommandArgsWithProjectDirAndEnvFiles(activeFiles, workDir, projectName, composeEnvFiles, "ps", "--format", "json")
 	psQArgs := ComposeCommandArgsWithProjectDirAndEnvFiles(activeFiles, workDir, projectName, composeEnvFiles, "ps", "-q")

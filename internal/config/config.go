@@ -52,6 +52,7 @@ type PipelineConfig struct {
 	MaxConcurrent      int
 	DefaultStages      map[string][]string
 	StageC             StageCConfig
+	StageG             StageGConfig
 }
 
 type StageCConfig struct {
@@ -59,6 +60,10 @@ type StageCConfig struct {
 	RunnerImage             string
 	ProxyImage              string
 	FailOnUnmappedLocalhost bool
+}
+
+type StageGConfig struct {
+	PlannerTurnTimeoutSeconds int
 }
 
 type GitConfig struct {
@@ -184,6 +189,7 @@ type rawPipelineConfig struct {
 	MaxConcurrent      *int                `yaml:"max_concurrent"`
 	DefaultStages      map[string][]string `yaml:"default_stages"`
 	StageC             *rawStageCConfig    `yaml:"stage_c"`
+	StageG             *rawStageGConfig    `yaml:"stage_g"`
 }
 
 type rawStageCConfig struct {
@@ -191,6 +197,10 @@ type rawStageCConfig struct {
 	RunnerImage             *string `yaml:"runner_image"`
 	ProxyImage              *string `yaml:"proxy_image"`
 	FailOnUnmappedLocalhost *bool   `yaml:"fail_on_unmapped_localhost"`
+}
+
+type rawStageGConfig struct {
+	PlannerTurnTimeoutSeconds *int `yaml:"planner_turn_timeout_seconds"`
 }
 
 type rawGitConfig struct {
@@ -293,6 +303,9 @@ func Default() Config {
 				Execution:               "auto",
 				ProxyImage:              "alpine/socat:latest",
 				FailOnUnmappedLocalhost: true,
+			},
+			StageG: StageGConfig{
+				PlannerTurnTimeoutSeconds: 120,
 			},
 		},
 		Git: GitConfig{
@@ -563,6 +576,9 @@ func applyRawConfig(cfg *Config, raw rawConfig, settings *fileSettings) error {
 		if raw.Pipeline.StageC != nil {
 			applyRawStageC(&cfg.Pipeline.StageC, raw.Pipeline.StageC)
 		}
+		if raw.Pipeline.StageG != nil {
+			applyRawStageG(&cfg.Pipeline.StageG, raw.Pipeline.StageG)
+		}
 	}
 	if raw.Git != nil {
 		if raw.Git.BaseURL != nil {
@@ -722,6 +738,12 @@ func applyRawStageC(cfg *StageCConfig, raw *rawStageCConfig) {
 	}
 	if raw.FailOnUnmappedLocalhost != nil {
 		cfg.FailOnUnmappedLocalhost = *raw.FailOnUnmappedLocalhost
+	}
+}
+
+func applyRawStageG(cfg *StageGConfig, raw *rawStageGConfig) {
+	if raw.PlannerTurnTimeoutSeconds != nil {
+		cfg.PlannerTurnTimeoutSeconds = *raw.PlannerTurnTimeoutSeconds
 	}
 }
 
@@ -927,6 +949,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Pipeline.StageC.Execution == "isolated" && strings.TrimSpace(cfg.Pipeline.StageC.ProxyImage) == "" {
 		return fmt.Errorf("pipeline.stage_c.proxy_image must not be empty")
+	}
+	if cfg.Pipeline.StageG.PlannerTurnTimeoutSeconds <= 0 {
+		return fmt.Errorf("pipeline.stage_g.planner_turn_timeout_seconds must be greater than 0")
 	}
 	if strings.TrimSpace(cfg.Git.BaseURL) == "" {
 		return fmt.Errorf("git.base_url must not be empty")

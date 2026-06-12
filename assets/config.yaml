@@ -19,6 +19,8 @@ pipeline:
     F: 900
   stage_c:
     execution: "auto"
+  stage_g:
+    planner_turn_timeout_seconds: 120
 
 docker:
   managed_label: "managed_by=p2rqa"

@@ -10,12 +10,13 @@ import (
 )
 
 const (
-	MaxActions               = 30
-	MaxInvalidActions        = 3
-	MinBrowserScreenshots    = 5
-	MaxBrowserScreenshots    = 10
-	AuthGateSubmitStallLimit = 2
-	RepeatedStateStallLimit  = 7
+	MaxActions                = 30
+	MaxInvalidActions         = 3
+	MinBrowserScreenshots     = 5
+	MaxBrowserScreenshots     = 10
+	AuthGateSubmitStallLimit  = 2
+	RepeatedStateStallLimit   = 7
+	DefaultPlannerTurnTimeout = 120 * time.Second
 )
 
 type ExplorerState string
@@ -68,18 +69,19 @@ type ExplorerFinishers struct {
 }
 
 type Explorer struct {
-	Ctx            context.Context
-	Candidates     []BrowserURLCandidate
-	Policy         browserpkg.Policy
-	Deadline       time.Time
-	SummaryPath    string
-	ScreenshotPath string
-	LogPath        string
-	Planner        PlannerFunc
-	ActionRunner   ActionRunnerFunc
-	Rules          ExplorerPolicy
-	Events         ExplorerEvents
-	Finishers      ExplorerFinishers
+	Ctx                context.Context
+	Candidates         []BrowserURLCandidate
+	Policy             browserpkg.Policy
+	Deadline           time.Time
+	PlannerTurnTimeout time.Duration
+	SummaryPath        string
+	ScreenshotPath     string
+	LogPath            string
+	Planner            PlannerFunc
+	ActionRunner       ActionRunnerFunc
+	Rules              ExplorerPolicy
+	Events             ExplorerEvents
+	Finishers          ExplorerFinishers
 
 	observations []browserpkg.Observation
 	blocked      []BlockedBrowserAction
@@ -109,10 +111,17 @@ func (e *Explorer) NextDecision() ExplorerDecision {
 	if turnTimeout < 30*time.Second {
 		return ExplorerDecision{State: ExplorerStateStop, Reason: "Stage G timeout reached before another browser planning turn could complete."}
 	}
-	if turnTimeout > 120*time.Second {
-		turnTimeout = 120 * time.Second
+	if maxTurnTimeout := e.maxPlannerTurnTimeout(); turnTimeout > maxTurnTimeout {
+		turnTimeout = maxTurnTimeout
 	}
 	return ExplorerDecision{State: ExplorerStatePlannerTurn, TurnTimeout: turnTimeout}
+}
+
+func (e *Explorer) maxPlannerTurnTimeout() time.Duration {
+	if e.PlannerTurnTimeout > 0 {
+		return e.PlannerTurnTimeout
+	}
+	return DefaultPlannerTurnTimeout
 }
 
 func BrowserActionTimeout(turnTimeout time.Duration) time.Duration {

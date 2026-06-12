@@ -652,6 +652,60 @@ func TestStageBEmptyPortMappingKeepsTaskDockerRunning(t *testing.T) {
 	}
 }
 
+func TestStageBUpFailureDiagnosticsDoNotReturnRuntimeAfterCleanup(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "docker-compose.yml"), []byte("services:\n  web:\n    image: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := filepath.Join(root, "run")
+	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	cfg.Docker.PullPolicy = "skip"
+	cfg.Docker.BuildMirrors.Enabled = false
+	runner := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(stageBUpFailureRunner{}))
+	outcome := runner.StageBForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath})
+
+	if outcome.Record.Status != model.StageFailed || !strings.Contains(outcome.Record.ErrorSummary, "docker_address_pool_exhausted") {
+		t.Fatalf("Stage B should classify address pool exhaustion: %#v", outcome.Record)
+	}
+	if outcome.Runtime != nil && outcome.Runtime.HasCleanupTarget() {
+		t.Fatalf("cleaned failure runtime should not be returned as running: %#v", outcome.Runtime)
+	}
+	portMap, err := os.ReadFile(filepath.Join(artifactRoot, "port_map.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"failure_diagnostics"`, `"failure_cleanup"`, `"compose_project"`} {
+		if !strings.Contains(string(portMap), want) {
+			t.Fatalf("port_map missing %q after up failure:\n%s", want, portMap)
+		}
+	}
+	summary, err := os.ReadFile(filepath.Join(artifactRoot, "docker_runtime_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"runtime_error_category": "docker_address_pool_exhausted"`, `"diagnostic_commands"`, `"cleanup"`} {
+		if !strings.Contains(string(summary), want) {
+			t.Fatalf("runtime summary missing %q:\n%s", want, summary)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(artifactRoot, "docker_compose_effective_config.yml")); err != nil {
+		t.Fatalf("effective compose config should be written for B3 failures: %v", err)
+	}
+}
+
 func TestStageBRewritesFixedPortsWhenRunTestsStartsDockerCompose(t *testing.T) {
 	root := t.TempDir()
 	projectPath := filepath.Join(root, "batch", "TASK-1")
@@ -1111,6 +1165,46 @@ func (stageBNoPortRunner) result(name string, args ...string) executor.Result {
 		return executor.Result{Command: command, Stdout: "container-web\n"}
 	case strings.Contains(command, " port "):
 		return executor.Result{Command: command, Stdout: ""}
+	default:
+		return executor.Result{Command: command, Stdout: fmt.Sprintf("%s ok\n", command)}
+	}
+}
+
+type stageBUpFailureRunner struct{}
+
+func (stageBUpFailureRunner) LookPath(name string) (string, error) {
+	if name == "docker" {
+		return "docker", nil
+	}
+	return name, nil
+}
+
+func (r stageBUpFailureRunner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	return r.result(name, args...)
+}
+
+func (r stageBUpFailureRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
+	result := r.result(name, args...)
+	if writer != nil {
+		_, _ = writer.Write([]byte(result.Stdout + result.Stderr))
+	}
+	return result
+}
+
+func (stageBUpFailureRunner) result(name string, args ...string) executor.Result {
+	command := strings.Join(append([]string{name}, args...), " ")
+	switch {
+	case strings.Contains(command, " up -d"):
+		return executor.Result{
+			Command:  command,
+			ExitCode: 1,
+			Stderr:   "failed to create network p2rqa_default: Error response from daemon: all predefined address pools have been fully subnetted",
+			Err:      fmt.Errorf("compose up failed"),
+		}
+	case strings.Contains(command, " ps --all -q"):
+		return executor.Result{Command: command}
+	case strings.Contains(command, " ps -q"):
+		return executor.Result{Command: command}
 	default:
 		return executor.Result{Command: command, Stdout: fmt.Sprintf("%s ok\n", command)}
 	}

@@ -1369,6 +1369,25 @@ func TestStageGPlannerTimeoutRecognizesGenericTimeoutErrors(t *testing.T) {
 	}
 }
 
+func TestStageGUsesConfiguredPlannerTurnTimeout(t *testing.T) {
+	fixture := newStageGReplayFixture(t, "TASK-20260612-PLANNER-TURN-TIMEOUT")
+	fixture.Cfg.Pipeline.StageG.PlannerTurnTimeoutSeconds = 45
+	var gotTimeout time.Duration
+	runner := fixture.NewRunner(
+		pipelinepkg.WithStageGBrowserPlannerForTest(func(ctx context.Context, sc pipelinepkg.StageContext, promptTemplate, profile, contextText string, candidates []pipelinepkg.TestBrowserURLCandidate, observations []pipelinepkg.TestBrowserObservation, blocked []pipelinepkg.TestBlockedBrowserAction, round int, timeout time.Duration) (string, []pipelinepkg.ArtifactWarning, error) {
+			gotTimeout = timeout
+			return "", nil, errors.New("turn timed out waiting for model response")
+		}),
+	)
+	record := runner.StageGForTest(context.Background(), fixture.Run, fixture.Project, fixture.Runtime)
+	if record.Status != model.StageFailed {
+		t.Fatalf("Stage G record = %#v", record)
+	}
+	if gotTimeout != 45*time.Second {
+		t.Fatalf("planner timeout = %s, want 45s", gotTimeout)
+	}
+}
+
 func TestStageGActionRunnerErrorFeedsPlannerReactLoop(t *testing.T) {
 	fixture := newStageGReplayFixture(t, "TASK-20260612-RUNNER-ERROR")
 	open := pipelinepkg.TestBrowserAction{Action: "open_candidate", URLID: "url_1", Reason: "open app"}

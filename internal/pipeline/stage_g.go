@@ -155,13 +155,14 @@ func (r Runner) stageG(ctx context.Context, sc StageContext) model.StageRecord {
 	}
 
 	explorer := frontende2e.Explorer{
-		Ctx:            stageCtx,
-		Candidates:     candidates,
-		Policy:         browserPolicy,
-		Deadline:       time.Now().Add(timeout),
-		SummaryPath:    summaryPath,
-		ScreenshotPath: writer.RelativePath(screenshotPath),
-		LogPath:        logPath,
+		Ctx:                stageCtx,
+		Candidates:         candidates,
+		Policy:             browserPolicy,
+		Deadline:           time.Now().Add(timeout),
+		PlannerTurnTimeout: stageGPlannerTurnTimeout(r.cfg.Pipeline.StageG),
+		SummaryPath:        summaryPath,
+		ScreenshotPath:     writer.RelativePath(screenshotPath),
+		LogPath:            logPath,
 		Planner: func(ctx context.Context, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int, timeout time.Duration) (string, []model.ArtifactWarning, error) {
 			return r.nextStageGBrowserAction(ctx, sc, string(promptTemplate), string(profile), contextText, candidates, observations, blocked, round, timeout)
 		},
@@ -239,6 +240,17 @@ func stageGPlannerTimedOut(ctx context.Context, err error) bool {
 		}
 	}
 	return false
+}
+
+func stageGPlannerTurnTimeout(cfg config.StageGConfig) time.Duration {
+	if cfg.PlannerTurnTimeoutSeconds <= 0 {
+		return frontende2e.DefaultPlannerTurnTimeout
+	}
+	return time.Duration(cfg.PlannerTurnTimeoutSeconds) * time.Second
+}
+
+func stageGPlannerTurnTimeoutSeconds(cfg config.StageGConfig) int {
+	return int(stageGPlannerTurnTimeout(cfg) / time.Second)
 }
 
 func (r Runner) nextStageGBrowserAction(ctx context.Context, sc StageContext, promptTemplate, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int, timeout time.Duration) (string, []ArtifactWarning, error) {

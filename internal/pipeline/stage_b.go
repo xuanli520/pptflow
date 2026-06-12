@@ -83,7 +83,6 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		bestEffortStageText(&record, writer, "docker_compose_effective_config.yml", dockermgr.RedactLogText(result.EffectiveConfigContent))
 	}
 	mergeDockerRuntimeIntoManifest(run.ArtifactRoot, result)
-	cleanupMeta := cleanupMetaFromRuntime(run.RunID, project.TaskID, result.Runtime, r.cfg.Docker)
 	if startErr != nil {
 		runtimeErr, _ := startErr.(*dockermgr.StartRuntimeError)
 		evidence := startErr.Error()
@@ -95,8 +94,23 @@ func (r Runner) stageB(ctx context.Context, run model.RunRecord, project scanner
 		if runtimeErr != nil && runtimeErr.Category != "" {
 			category = runtimeErr.Category
 		}
+		cleanupMeta := cleanupMetaFromRuntime(run.RunID, project.TaskID, result.Runtime, r.cfg.Docker)
+		failureRuntime := result.Runtime
+		if !failureRuntime.HasCleanupTarget() && result.FailureRuntime.HasCleanupTarget() {
+			failureRuntime = result.FailureRuntime
+			cleanupMeta = cleanupMetaFromRuntime(run.RunID, project.TaskID, result.FailureRuntime, r.cfg.Docker)
+		}
+		if diagnostics := result.RuntimeSummary.FailureDiagnostics; diagnostics != nil {
+			cleanupMeta["failure_diagnostics"] = "docker_runtime_summary.json"
+			if diagnostics.Cleanup != nil {
+				cleanupMeta["failure_cleanup"] = diagnostics.Cleanup
+			}
+			if runtimeFailureCleanupDone(diagnostics) {
+				failureRuntime = RuntimeState{}
+			}
+		}
 		record.ErrorSummary = category + ": " + evidence
-		return stageBFailureOutcome(r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, evidence, fix), cleanupMeta)
+		return stageBFailureOutcome(r.failB(record, start, logPath, portMapPath, screenshotPath, cleanupMeta, evidence, fix), failureRuntime)
 	}
 	portMap := map[string]any{
 		"run_id":                run.RunID,
@@ -232,12 +246,20 @@ func firstFrontendURL(runtime RuntimeState) string {
 	return ""
 }
 
-func stageBFailureOutcome(record model.StageRecord, meta map[string]any) StageOutcome {
-	runtime := runtimeStateFromCleanupMeta(meta)
+func stageBFailureOutcome(record model.StageRecord, runtime RuntimeState) StageOutcome {
+	runtime = runtime.Normalized()
 	if !runtime.HasCleanupTarget() {
 		return StageOutcome{Record: record, BlockedDependents: blockedDependents(string(model.StageB))}
 	}
 	return StageOutcome{Record: record, Runtime: &runtime, BlockedDependents: blockedDependents(string(model.StageB))}
+}
+
+func runtimeFailureCleanupDone(diagnostics *dockermgr.RuntimeFailureDiagnostics) bool {
+	if diagnostics == nil || diagnostics.Cleanup == nil {
+		return false
+	}
+	status := strings.TrimSpace(diagnostics.Cleanup.Status)
+	return status != "" && status != "failed"
 }
 
 func mergeDockerRuntimeIntoManifest(artifactRoot string, result dockermgr.StartRuntimeResult) {
@@ -262,19 +284,6 @@ func mergeDockerRuntimeIntoManifest(artifactRoot string, result dockermgr.StartR
 		"compose_files":   result.MirrorSummary.ComposeFiles,
 		"override_file":   result.MirrorSummary.OverrideFile,
 	})
-}
-
-func runtimeStateFromCleanupMeta(meta map[string]any) RuntimeState {
-	if len(meta) == 0 {
-		return RuntimeState{}
-	}
-	return RuntimeState{
-		ComposeProject: strings.TrimSpace(fmt.Sprint(meta["compose_project"])),
-		ComposeFile:    strings.TrimSpace(fmt.Sprint(meta["compose_file"])),
-		ComposeFiles:   metaStringSlice(meta, "compose_files"),
-		EnvFiles:       metaStringSlice(meta, "env_files"),
-		WorkDir:        strings.TrimSpace(fmt.Sprint(meta["work_dir"])),
-	}.Normalized()
 }
 
 func (r Runner) failB(record model.StageRecord, start time.Time, logPath, portMapPath, screenshotPath string, meta map[string]any, evidence, fix string) model.StageRecord {
@@ -340,27 +349,6 @@ func runtimeLabels(cfg config.DockerConfig, taskID, runID string) map[string]str
 		labels[strings.TrimSpace(cfg.ManagedLabel)] = "true"
 	}
 	return labels
-}
-
-func metaStringSlice(meta map[string]any, key string) []string {
-	raw, ok := meta[key]
-	if !ok {
-		return nil
-	}
-	switch typed := raw.(type) {
-	case []string:
-		return append([]string(nil), typed...)
-	case []any:
-		files := make([]string, 0, len(typed))
-		for _, item := range typed {
-			if text := strings.TrimSpace(fmt.Sprint(item)); text != "" {
-				files = append(files, text)
-			}
-		}
-		return files
-	default:
-		return nil
-	}
 }
 
 func dockerCleanupCommandText(cfg config.DockerConfig, composeFiles, envFiles []string, projectName, workDir string) string {

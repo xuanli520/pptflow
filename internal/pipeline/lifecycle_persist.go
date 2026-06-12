@@ -45,8 +45,11 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 		"preflight":             "preflight.json",
 		"run_failure_summary":   "run_failure_summary.md",
 		"stage_timeouts":        r.cfg.Pipeline.StageTimeouts,
-		"tool_versions":         map[string]string{"p2r": "dev"},
-		"assets":                released,
+		"stage_g": map[string]any{
+			"planner_turn_timeout_seconds": stageGPlannerTurnTimeoutSeconds(r.cfg.Pipeline.StageG),
+		},
+		"tool_versions": map[string]string{"p2r": "dev"},
+		"assets":        released,
 		"codex_policy": map[string]any{
 			"sandbox_image":       r.cfg.Codex.SandboxImage,
 			"network":             r.cfg.Codex.Network,

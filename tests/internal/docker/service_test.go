@@ -541,6 +541,96 @@ func TestStartRuntimeReadmeCommandModeAddsManagedLabelOverride(t *testing.T) {
 	}
 }
 
+func TestStartRuntimeDiagnosesAddressPoolExhaustionAndCleansFailure(t *testing.T) {
+	repo := writeComposeProject(t, t.TempDir())
+	runner := &scriptedDockerRunner{
+		upErr:    true,
+		upStderr: "failed to create network p2rqa_default: Error response from daemon: all predefined address pools have been fully subnetted",
+	}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	var log strings.Builder
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: t.TempDir(),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Log:          &log,
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err == nil {
+		t.Fatal("expected runtime startup error")
+	}
+	var runtimeErr *dockermgr.StartRuntimeError
+	if !errors.As(err, &runtimeErr) {
+		t.Fatalf("error type = %T, want StartRuntimeError", err)
+	}
+	if runtimeErr.Category != "docker_address_pool_exhausted" || result.RuntimeSummary.RuntimeErrorCategory != "docker_address_pool_exhausted" {
+		t.Fatalf("category not classified: err=%#v summary=%#v", runtimeErr, result.RuntimeSummary)
+	}
+	if result.Runtime.HasCleanupTarget() {
+		t.Fatalf("failed runtime should not be returned as a live runtime after cleanup: %#v", result.Runtime)
+	}
+	if !result.FailureRuntime.HasCleanupTarget() {
+		t.Fatalf("failure cleanup target should be recorded: %#v", result.FailureRuntime)
+	}
+	diagnostics := result.RuntimeSummary.FailureDiagnostics
+	if diagnostics == nil || diagnostics.Cleanup == nil || diagnostics.Cleanup.Status != "ok" {
+		t.Fatalf("failure cleanup not recorded: %#v", diagnostics)
+	}
+	if !containsCommand(runner.commands, " down ") {
+		t.Fatalf("failure path should run compose down: %#v", runner.commands)
+	}
+	if !containsDiagnostic(diagnostics.Commands, "docker_managed_networks") || !strings.Contains(log.String(), "docker_system_df") {
+		t.Fatalf("diagnostics should include Docker resource snapshots: diagnostics=%#v log=%s", diagnostics.Commands, log.String())
+	}
+}
+
+func TestStartRuntimeDiagnosesExitedServiceWithLogsAndInspect(t *testing.T) {
+	repo := writeComposeProject(t, t.TempDir())
+	runner := &scriptedDockerRunner{
+		upErr:        true,
+		upStderr:     "dependency failed to start: container p2rqa_backend_1 exited (1)",
+		psQAllOutput: "backend-container\n",
+		inspectOutput: `[
+  {"Name":"/p2rqa_backend_1","State":{"Status":"exited","ExitCode":1,"Error":""}}
+]`,
+		composeLogsOutput: "backend-1  Traceback: DATABASE_URL is required\n",
+	}
+	cfg := config.Default().Docker
+	cfg.PullPolicy = "skip"
+	cfg.BuildMirrors.Enabled = false
+
+	result, err := (dockermgr.Service{Exec: runner, Config: cfg}).StartRuntime(context.Background(), dockermgr.StartRuntimeRequest{
+		RepoPath:     repo,
+		ArtifactRoot: t.TempDir(),
+		TaskID:       "TASK-1",
+		RunID:        "run-1",
+		Timeouts:     dockermgr.RuntimeTimeouts{Health: time.Millisecond},
+	})
+	if err == nil {
+		t.Fatal("expected runtime startup error")
+	}
+	var runtimeErr *dockermgr.StartRuntimeError
+	if !errors.As(err, &runtimeErr) || runtimeErr.Category != "compose_service_failed" {
+		t.Fatalf("service failure not classified: err=%#v", err)
+	}
+	diagnostics := result.RuntimeSummary.FailureDiagnostics
+	if diagnostics == nil {
+		t.Fatal("expected failure diagnostics")
+	}
+	logs := diagnosticByName(diagnostics.Commands, "compose_logs_tail")
+	if !strings.Contains(logs.Stdout, "DATABASE_URL is required") {
+		t.Fatalf("compose logs not captured in diagnostics: %#v", logs)
+	}
+	inspect := diagnosticByName(diagnostics.Commands, "container_inspect")
+	if !strings.Contains(inspect.Stdout, `"ExitCode":1`) {
+		t.Fatalf("container inspect not captured in diagnostics: %#v", inspect)
+	}
+}
+
 func TestDaemonMirrorsApplyRestoreAndInvalidJSON(t *testing.T) {
 	root := t.TempDir()
 	daemonPath := filepath.Join(root, "daemon.json")
@@ -711,8 +801,13 @@ func TestRunGCGlobalScopeRequiresAllowGlobal(t *testing.T) {
 
 type scriptedDockerRunner struct {
 	pullErr                         bool
+	upErr                           bool
+	upStderr                        string
 	configOutput                    string
 	streamChunks                    []string
+	psQAllOutput                    string
+	inspectOutput                   string
+	composeLogsOutput               string
 	rejectMirrorBuildOutsideContext bool
 	commands                        []string
 }
@@ -751,8 +846,27 @@ func (r *scriptedDockerRunner) result(name string, args ...string) executor.Resu
 	if strings.Contains(command, " pull ") && r.pullErr {
 		return executor.Result{Command: command, ExitCode: 1, Stderr: "pull failed", Err: errors.New("pull failed")}
 	}
+	if strings.Contains(command, " up -d") && r.upErr {
+		stderr := r.upStderr
+		if strings.TrimSpace(stderr) == "" {
+			stderr = "compose up failed"
+		}
+		return executor.Result{Command: command, ExitCode: 1, Stderr: stderr, Err: errors.New("compose up failed")}
+	}
 	if strings.Contains(command, " build") && strings.Contains(command, "compose.mirror.override.yml") && r.rejectMirrorBuildOutsideContext {
 		return executor.Result{Command: command, ExitCode: 1, Stderr: "failed to read dockerfile: forbidden path outside the build context", Err: errors.New("build failed")}
+	}
+	if strings.Contains(command, " ps --all -q") {
+		return executor.Result{Command: command, Stdout: r.psQAllOutput}
+	}
+	if strings.Contains(command, " ps -q") {
+		return executor.Result{Command: command}
+	}
+	if strings.Contains(command, " logs ") {
+		return executor.Result{Command: command, Stdout: r.composeLogsOutput}
+	}
+	if strings.HasPrefix(command, "docker inspect ") {
+		return executor.Result{Command: command, Stdout: r.inspectOutput}
 	}
 	if strings.Contains(command, " config") && strings.TrimSpace(r.configOutput) != "" {
 		return executor.Result{Command: command, Stdout: r.configOutput}
@@ -833,6 +947,19 @@ func containsString(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func containsDiagnostic(commands []dockermgr.RuntimeDiagnosticCommand, name string) bool {
+	return diagnosticByName(commands, name).Name != ""
+}
+
+func diagnosticByName(commands []dockermgr.RuntimeDiagnosticCommand, name string) dockermgr.RuntimeDiagnosticCommand {
+	for _, command := range commands {
+		if command.Name == name {
+			return command
+		}
+	}
+	return dockermgr.RuntimeDiagnosticCommand{}
 }
 
 func testDebianMultiarchLibDir() string {

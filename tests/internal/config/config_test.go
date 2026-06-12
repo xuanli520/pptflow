@@ -136,6 +136,24 @@ func TestDefaultStageCExecutionIsAuto(t *testing.T) {
 	}
 }
 
+func TestLoadParsesStageGPlannerTurnTimeoutConfig(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`pipeline:
+  stage_g:
+    planner_turn_timeout_seconds: 240
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".p2r.yaml"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dir, config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.StageG.PlannerTurnTimeoutSeconds != 240 {
+		t.Fatalf("stage G planner turn timeout = %d, want 240", cfg.Pipeline.StageG.PlannerTurnTimeoutSeconds)
+	}
+}
+
 func TestLoadAcceptsStageCAutoExecutionConfig(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte(`pipeline:
@@ -288,6 +306,9 @@ func TestDefaultStaticCodexTimeoutsAllowFullReviews(t *testing.T) {
 	}
 	if cfg.Pipeline.StageTimeouts["G"] < 600 {
 		t.Fatalf("G timeout too short for browser E2E: %d", cfg.Pipeline.StageTimeouts["G"])
+	}
+	if cfg.Pipeline.StageG.PlannerTurnTimeoutSeconds != 120 {
+		t.Fatalf("default Stage G planner turn timeout = %d, want 120", cfg.Pipeline.StageG.PlannerTurnTimeoutSeconds)
 	}
 }
 
@@ -514,6 +535,13 @@ func TestLoadRejectsUnknownFieldsAndStageTimeoutKeys(t *testing.T) {
 			content: `pipeline:
   default_stages:
     initial: []
+`,
+		},
+		{
+			name: "invalid stage G planner turn timeout",
+			content: `pipeline:
+  stage_g:
+    planner_turn_timeout_seconds: 0
 `,
 		},
 	} {
