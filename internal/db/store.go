@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +47,7 @@ type ProjectSummary struct {
 	LatestStaticOnly   bool
 	HasTask            bool
 	TaskState          string
+	CurrentRunID       string
 	CompletionCount    int
 	FrontendURL        string
 	DockerRunning      bool
@@ -82,6 +85,14 @@ type ProjectQuery struct {
 	Search ProjectSearch
 	Limit  int
 	Offset int
+}
+
+type GitSyncErrorUpdate struct {
+	TaskID string
+	RunID  string
+	JobID  string
+	Err    error
+	Source string
 }
 
 type ArtifactPruneItem struct {
@@ -244,6 +255,14 @@ func (s *Store) CreateTaskWithBatch(ctx context.Context, taskID, gitURL, scanPat
 			taskID, batch.ID, repoPath); err != nil {
 			return err
 		}
+		if err := appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  taskID,
+			Kind:    "task_created",
+			Message: "task created",
+			Source:  "task_lifecycle",
+		}, now)); err != nil {
+			return err
+		}
 		task, err = getTaskTx(ctx, tx, taskID)
 		return err
 	})
@@ -287,18 +306,71 @@ func (s *Store) ListTasksWithDockerRunning(ctx context.Context) ([]model.Task, e
 	return scanTasks(rows)
 }
 
+func (s *Store) RecordTaskEvent(ctx context.Context, event model.TaskEvent) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return appendTaskEventTx(ctx, tx, normalizeTaskEvent(event, now))
+	})
+}
+
+func (s *Store) TaskEvents(ctx context.Context, taskID string, limit int) ([]model.TaskEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, COALESCE(run_id, ''), COALESCE(job_id, ''), kind, message, source, created_at
+		FROM task_events
+		WHERE task_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?`, taskID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []model.TaskEvent
+	for rows.Next() {
+		var event model.TaskEvent
+		if err := rows.Scan(&event.ID, &event.TaskID, &event.RunID, &event.JobID, &event.Kind, &event.Message, &event.Source, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
 func (s *Store) RecordTaskGitError(ctx context.Context, taskID string, syncErr error) error {
-	message := ""
-	if syncErr != nil {
-		message = syncErr.Error()
+	return s.SetGitSyncError(ctx, GitSyncErrorUpdate{TaskID: taskID, Err: syncErr, Source: "legacy"})
+}
+
+func (s *Store) SetGitSyncError(ctx context.Context, update GitSyncErrorUpdate) error {
+	message := errorMessage(update.Err)
+	source := strings.TrimSpace(update.Source)
+	if source == "" {
+		source = "git_sync"
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `UPDATE tasks SET sync_error = ?, updated_at = ? WHERE id = ?`, message, now, taskID)
+		result, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET sync_error = ?, updated_at = ?
+			WHERE id = ? AND current_run_id IS NULL`,
+			message, now, update.TaskID)
 		if err != nil {
 			return err
 		}
-		return requireAffected(result, "task", taskID)
+		if err := requireAffected(result, "idle task", update.TaskID); err != nil {
+			return err
+		}
+		kind := "git_sync_error_cleared"
+		if message != "" {
+			kind = "git_sync_error"
+		}
+		return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  update.TaskID,
+			RunID:   update.RunID,
+			JobID:   update.JobID,
+			Kind:    kind,
+			Message: message,
+			Source:  source,
+		}, now))
 	})
 }
 
@@ -324,24 +396,84 @@ func (s *Store) UpdateTaskGitURL(ctx context.Context, taskID string, gitURL stri
 }
 
 func (s *Store) RecordTaskTerminalGitError(ctx context.Context, taskID string, syncErr error) error {
-	message := ""
-	if syncErr != nil {
-		message = syncErr.Error()
-	}
+	message := errorMessage(syncErr)
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `UPDATE tasks
 				SET state = ?, current_run_id = NULL, frontend_url = '', docker_running = 0, compose_meta = '', entered_waiting_at = '', archived_at = '', sync_error = ?, updated_at = ?
-				WHERE id = ?`,
-			model.TaskCompleted, message, now, taskID)
+				WHERE id = ? AND state = ? AND current_run_id IS NULL`,
+			model.TaskCompleted, message, now, taskID, model.TaskInspecting)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(result, "idle inspecting task", taskID); err != nil {
+			return err
+		}
+		if err := appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  taskID,
+			Kind:    "git_sync_terminal_error",
+			Message: message,
+			Source:  "git_sync",
+		}, now)); err != nil {
+			return err
+		}
+		return archiveCompletedOverflowTx(ctx, tx, now)
+	})
+}
+
+func (s *Store) TerminalResetTaskForRerun(ctx context.Context, taskID string, reason string) (model.Task, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "diagnostic terminal reset"
+	}
+	var task model.Task
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE runs
+			SET status = ?,
+			    finished_at = CASE WHEN COALESCE(finished_at, '') = '' THEN ? ELSE finished_at END,
+			    duration_ms = CASE
+			        WHEN COALESCE(started_at, '') <> '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER)
+			        ELSE duration_ms
+			    END
+			WHERE task_id = ? AND status = ?`,
+			model.RunCrashed, now, now, taskID, model.RunRunning); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET state = ?,
+			    current_run_id = NULL,
+			    docker_running = 0,
+			    frontend_url = '',
+			    compose_meta = '',
+			    entered_waiting_at = '',
+			    archived_at = '',
+			    sync_error = '',
+			    updated_at = ?
+			WHERE id = ?`,
+			model.TaskCompleted, now, taskID)
 		if err != nil {
 			return err
 		}
 		if err := requireAffected(result, "task", taskID); err != nil {
 			return err
 		}
-		return archiveCompletedOverflowTx(ctx, tx, now)
+		if err := appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  taskID,
+			Kind:    "diagnostic_terminal_reset",
+			Message: reason,
+			Source:  "task_diagnostics",
+		}, now)); err != nil {
+			return err
+		}
+		if err := archiveCompletedOverflowTx(ctx, tx, now); err != nil {
+			return err
+		}
+		var getErr error
+		task, getErr = getTaskTx(ctx, tx, taskID)
+		return getErr
 	})
+	return task, err
 }
 
 func (s *Store) ReopenTaskForInspection(ctx context.Context, taskID string) error {
@@ -382,7 +514,15 @@ func (s *Store) MarkTaskDockerStopped(ctx context.Context, taskID string) error 
 		if err != nil {
 			return err
 		}
-		return requireTaskOrProjectOnlyRunTx(ctx, tx, result, taskID)
+		if err := requireTaskOrProjectOnlyRunTx(ctx, tx, result, taskID); err != nil {
+			return err
+		}
+		return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  taskID,
+			Kind:    "docker_stopped",
+			Message: "Docker runtime marked stopped",
+			Source:  "db",
+		}, now))
 	})
 }
 
@@ -392,7 +532,15 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string) (model.Task, er
 	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		var err error
 		task, err = completeWaitingTaskTx(ctx, tx, taskID, now)
-		return err
+		if err != nil {
+			return err
+		}
+		return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  taskID,
+			Kind:    "manual_completed",
+			Message: "manual completed",
+			Source:  "task_lifecycle",
+		}, now))
 	})
 	return task, err
 }
@@ -416,7 +564,15 @@ func (s *Store) CompleteTaskWithVerdict(ctx context.Context, taskID, verdict str
 			return err
 		}
 		task, err = completeWaitingTaskTx(ctx, tx, taskID, now)
-		return err
+		if err != nil {
+			return err
+		}
+		return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  taskID,
+			Kind:    "manual_completed",
+			Message: "manual verdict: " + verdict,
+			Source:  "task_lifecycle",
+		}, now))
 	})
 	return task, err
 }
@@ -425,7 +581,7 @@ func completeWaitingTaskTx(ctx context.Context, tx *sql.Tx, taskID, now string) 
 	result, err := tx.ExecContext(ctx, `UPDATE tasks
 		SET state = ?, current_run_id = NULL, docker_running = 0, completion_count = completion_count + 1,
 		    frontend_url = '', compose_meta = '', entered_waiting_at = '', last_completed_at = ?, updated_at = ?
-		WHERE id = ? AND state = ?`,
+		WHERE id = ? AND state = ? AND current_run_id IS NULL`,
 		model.TaskCompleted, now, now, taskID, model.TaskWaitingManual)
 	if err != nil {
 		return model.Task{}, err
@@ -586,10 +742,11 @@ func (s *Store) listProjectSummaries(ctx context.Context, q ProjectQuery, pagina
        blocking,
        high,
        latest_artifact_root,
-       latest_static_only,
-       has_task,
-       task_state,
-       completion_count,
+	       latest_static_only,
+	       has_task,
+	       task_state,
+	       current_run_id,
+	       completion_count,
        frontend_url,
        docker_running,
        entered_waiting_at,
@@ -630,6 +787,7 @@ LIMIT ? OFFSET ?`
 			&staticOnly,
 			&hasTask,
 			&project.TaskState,
+			&project.CurrentRunID,
 			&project.CompletionCount,
 			&project.FrontendURL,
 			&dockerRunning,
@@ -741,9 +899,10 @@ project_rows AS (
            COALESCE(fc.high, 0) AS high,
            COALESCE(lr.artifact_root, '') AS latest_artifact_root,
            COALESCE(lr.static_only, 0) AS latest_static_only,
-           CASE WHEN t.id IS NULL THEN 0 ELSE 1 END AS has_task,
-           COALESCE(t.state, '') AS task_state,
-           COALESCE(t.completion_count, 0) AS completion_count,
+	           CASE WHEN t.id IS NULL THEN 0 ELSE 1 END AS has_task,
+	           COALESCE(t.state, '') AS task_state,
+	           COALESCE(t.current_run_id, '') AS current_run_id,
+	           COALESCE(t.completion_count, 0) AS completion_count,
            COALESCE(t.frontend_url, '') AS frontend_url,
            COALESCE(t.docker_running, 0) AS docker_running,
            COALESCE(t.entered_waiting_at, '') AS entered_waiting_at,
@@ -1013,6 +1172,12 @@ func projectOrderClause(q ProjectQuery) string {
 }
 
 func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
+	if strings.TrimSpace(run.Status) == "" {
+		run.Status = model.RunRunning
+	}
+	if strings.TrimSpace(run.ManualVerdict) == "" {
+		run.ManualVerdict = model.ManualUnset
+	}
 	staticOnly := 0
 	if run.StaticOnly {
 		staticOnly = 1
@@ -1040,6 +1205,13 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 				return fmt.Errorf("task %s has invalid state %q", run.TaskID, state)
 			}
 		}
+		var runningCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE task_id = ? AND status = ?`, run.TaskID, model.RunRunning).Scan(&runningCount); err != nil {
+			return err
+		}
+		if runningCount > 0 {
+			return fmt.Errorf("task %s already has a running run", run.TaskID)
+		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, duration_ms, artifact_root, tool_versions, prompt_versions, completion_round)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			run.RunID, run.TaskID, run.StartedAt, run.Status, run.ManualVerdict, staticOnly, run.DurationMS, run.ArtifactRoot, run.ToolVersions, run.PromptVersions, round)
@@ -1063,7 +1235,13 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 				return err
 			}
 		}
-		return nil
+		return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  run.TaskID,
+			RunID:   run.RunID,
+			Kind:    "run_started",
+			Message: "run started",
+			Source:  "pipeline",
+		}, startedAt))
 	})
 }
 
@@ -1109,6 +1287,15 @@ func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, dur
 			err = requireAffected(taskResult, "active task", taskID)
 		}
 		if err != nil {
+			return err
+		}
+		if err := appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  taskID,
+			RunID:   runID,
+			Kind:    "run_finished",
+			Message: "run finished: " + status,
+			Source:  "pipeline",
+		}, now)); err != nil {
 			return err
 		}
 		if status == model.RunAborted || status == model.RunCrashed {
@@ -1223,10 +1410,14 @@ func putStageTx(ctx context.Context, tx *sql.Tx, runID string, stage model.Stage
 	if name == "" {
 		name = model.StageDisplayName(stage.Stage)
 	}
+	status := strings.TrimSpace(stage.Status)
+	if status == "" {
+		status = model.StagePending
+	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO run_stages(run_id, stage, name, status, started_at, finished_at, duration_ms, blocked_by, log_path, artifact_json, error_summary)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(run_id, stage) DO UPDATE SET name=excluded.name, status=excluded.status, started_at=excluded.started_at, finished_at=excluded.finished_at, duration_ms=excluded.duration_ms, blocked_by=excluded.blocked_by, log_path=excluded.log_path, artifact_json=excluded.artifact_json, error_summary=excluded.error_summary`,
-		runID, stage.Stage, name, stage.Status, stage.StartedAt, stage.FinishedAt, stage.DurationMS, string(blockedBy), stage.LogPath, string(artifacts), stage.ErrorSummary)
+		runID, stage.Stage, name, status, stage.StartedAt, stage.FinishedAt, stage.DurationMS, string(blockedBy), stage.LogPath, string(artifacts), stage.ErrorSummary)
 	return err
 }
 
@@ -1254,6 +1445,13 @@ func recordTaskRuntimeForWaitingManualTx(ctx context.Context, tx *sql.Tx, taskID
 }
 
 func recordTaskRuntimeForProjectRunTx(ctx context.Context, tx *sql.Tx, taskID string, runID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string) error {
+	var found string
+	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM runs WHERE run_id = ? AND task_id = ? AND status = ?`, runID, taskID, model.RunRunning).Scan(&found); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return FormatNotFound("running run", runID)
+		}
+		return err
+	}
 	composeMeta, err := marshalComposeMeta(meta)
 	if err != nil {
 		return err
@@ -1588,6 +1786,55 @@ func marshalComposeMeta(meta model.ComposeMeta) (string, error) {
 		return "", err
 	}
 	return string(content), nil
+}
+
+func appendTaskEventTx(ctx context.Context, tx *sql.Tx, event model.TaskEvent) error {
+	if strings.TrimSpace(event.TaskID) == "" || strings.TrimSpace(event.Kind) == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO task_events(id, task_id, run_id, job_id, kind, message, source, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.TaskID, nullEmpty(event.RunID), nullEmpty(event.JobID), event.Kind, event.Message, event.Source, event.CreatedAt)
+	return err
+}
+
+func normalizeTaskEvent(event model.TaskEvent, now string) model.TaskEvent {
+	event.TaskID = strings.TrimSpace(event.TaskID)
+	event.RunID = strings.TrimSpace(event.RunID)
+	event.JobID = strings.TrimSpace(event.JobID)
+	event.Kind = strings.TrimSpace(event.Kind)
+	event.Source = strings.TrimSpace(event.Source)
+	if event.Source == "" {
+		event.Source = "db"
+	}
+	if strings.TrimSpace(event.CreatedAt) == "" {
+		event.CreatedAt = now
+	}
+	if strings.TrimSpace(event.ID) == "" {
+		event.ID = newTaskEventID(event.TaskID, event.Kind, event.CreatedAt)
+	}
+	return event
+}
+
+func newTaskEventID(taskID, kind, createdAt string) string {
+	seed := fmt.Sprintf("%s|%s|%s|%d", taskID, kind, createdAt, time.Now().UnixNano())
+	sum := sha256.Sum256([]byte(seed))
+	return "evt_" + hex.EncodeToString(sum[:])[:24]
+}
+
+func nullEmpty(value string) any {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func errorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func requireAffected(result sql.Result, kind, id string) error {

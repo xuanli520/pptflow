@@ -55,7 +55,7 @@ func (p *schedulerPoller) HandleTick(m app, now time.Time) []tea.Cmd {
 	var cmds []tea.Cmd
 	if now.Sub(p.lastRecoveryAt) >= staleRunRecoveryInterval {
 		p.lastRecoveryAt = now
-		cmds = append(cmds, m.recoverStaleRunsCmd(), m.recoverOrphanInspectionCmd())
+		cmds = append(cmds, m.recoverStaleRunsCmd())
 	}
 	if now.Sub(p.lastPersistedRefreshAt) >= persistedStateRefreshInterval {
 		p.lastPersistedRefreshAt = now

@@ -420,7 +420,7 @@ func EvaluateInspectionAdmission(task model.Task, snapshot RuntimeSnapshot) Admi
 | waiting_manual | 任意 | 阻止：请先完成待处理判定；可提示 Ctrl+E/Ctrl+S |
 | inspecting | `CurrentRunID != ""` 或 scheduler active job | 阻止：已有运行中任务 |
 | inspecting | `sync_error != ""` 且无 active run | 阻止普通 Ctrl+R，提示 Ctrl+W 重试 Git |
-| inspecting | 无 active run、无 sync_error、无 running run | 阻止普通 Ctrl+R，提示 Ctrl+Shift+R 诊断 |
+| inspecting | 无 active run、无 sync_error、无 running run | 阻止普通 Ctrl+R，提示 Ctrl+D 诊断 |
 | 无 task 记录 | TaskInput 新题入口 | 允许创建并开始 Inspection |
 | Overview `HasTask=false` | 项目不是已创建 task | 阻止：请选择已创建任务或从输入框创建题目 |
 
@@ -878,7 +878,7 @@ WHERE status = 'running';
 
 | 维度 | RecoveryService | TaskDiagnostics |
 |------|-----------------|-----------------|
-| 触发 | 启动/轮询/Ctrl+X | 用户 Ctrl+Shift+R |
+| 触发 | 启动/轮询/Ctrl+X | 用户 Ctrl+D |
 | 范围 | running run 恢复 | 单 task 五维诊断 |
 | 可见性 | 主要静默 | 报告、确认、修复摘要 |
 | 数据 | DB + artifact + lock + runtime | DB + run + lock + docker + scheduler + task events |
@@ -996,7 +996,7 @@ func (s *Store) TerminalResetTaskForRerun(ctx context.Context, taskID string, re
    - 用 `EvaluateInspectionAdmission(task, snapshot)` 替代 `canOpenInspectionRunConfig(state string)`。
    - `waiting_manual` 保持阻止。
    - `inspecting + sync_error` 提示 Ctrl+W。
-   - 异常 inspecting 提示 Ctrl+Shift+R 诊断。
+   - 异常 inspecting 提示 Ctrl+D 诊断。
 
 3. **修复 submitInspection 错误分类**
    - 只有 Git sync runner 的错误写入 `sync_error`。
@@ -1056,7 +1056,7 @@ func (s *Store) TerminalResetTaskForRerun(ctx context.Context, taskID string, re
    - diagnostics/TUI 可按 taskID 查询并显示。
 
 7. **新增 TaskDiagnostics**
-   - Ctrl+Shift+R 打开诊断报告。
+   - Ctrl+D 打开诊断报告。
    - Enter 执行 `StopLeakedDocker` 或 `TerminalReset`。
    - Esc/q 关闭。
    - 修复日志写 `.qa-control/logs/diagnostic_<task>_<time>.log`。
@@ -1103,7 +1103,7 @@ func (s *Store) TerminalResetTaskForRerun(ctx context.Context, taskID string, re
 | TaskBoard waiting_manual + Ctrl+R | 不打开，提示先完成待处理 |
 | TaskBoard inspecting + current_run_id | 不打开，提示已有运行 |
 | TaskBoard inspecting + sync_error | 不打开普通重跑，提示 Ctrl+W |
-| TaskBoard inspecting + no run/no job/no sync_error | 不打开，提示 Ctrl+Shift+R 诊断 |
+| TaskBoard inspecting + no run/no job/no sync_error | 不打开，提示 Ctrl+D 诊断 |
 | Overview `HasTask=false` + Ctrl+R | 不打开 Pipeline，提示从任务输入框创建 |
 | Overview stale selectedID + Ctrl+R | 不打开 Pipeline，提示重新选择任务 |
 | Execution completed + Ctrl+R + 无文档 Enter | 走 Inspection，显示文档必填 |
@@ -1186,7 +1186,7 @@ func (s *Store) TerminalResetTaskForRerun(ctx context.Context, taskID string, re
 
 | 文件 | 阶段 | 变更 |
 |------|------|------|
-| `internal/tui/keymap.go` | P0 | Ctrl+R 统一入口，删除 Pipeline fallback，新增 Ctrl+Shift+R diagnostics |
+| `internal/tui/keymap.go` | P0 | Ctrl+R 统一入口，删除 Pipeline fallback，新增 Ctrl+D diagnostics |
 | `internal/tui/runconfig.go` | P0 | 删除 action enum 和 direct pipeline branch，submit 只生成生命周期命令 |
 | `internal/tui/render.go` | P0 | 删除基于 run config action 的渲染分支，统一质检配置展示 |
 | `internal/tui/viewmodel.go` | P0 | “启动流水线”文案改为“开始质检/重跑质检” |

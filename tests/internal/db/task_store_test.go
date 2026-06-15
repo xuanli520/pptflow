@@ -649,6 +649,72 @@ func TestStageRuntimeUpdateRejectsStaleTaskRun(t *testing.T) {
 	}
 }
 
+func TestTerminalResetTaskForRerunRecordsEventAndAllowsNextRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-RESET1", "https://gitlab.example/TASK-20260521-RESET1", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-stuck",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	meta := model.ComposeMeta{Project: "p2r_reset", ComposeFiles: []string{"compose.yml"}, WorkDir: task.RepoPath}
+	if err := store.RecordTaskRuntime(ctx, task.ID, "http://localhost:3000", true, meta); err != nil {
+		t.Fatal(err)
+	}
+
+	reset, err := store.TerminalResetTaskForRerun(ctx, task.ID, "diagnostic test reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.State != model.TaskCompleted || reset.CurrentRunID != "" || reset.DockerRunning || reset.CompletionCount != 0 {
+		t.Fatalf("reset task = %#v", reset)
+	}
+	runs, err := store.ListRunsForTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].RunID != "run-stuck" || runs[0].Status != model.RunCrashed {
+		t.Fatalf("reset should crash running run: %#v", runs)
+	}
+	events, err := store.TaskEvents(ctx, task.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTaskEventKind(events, "diagnostic_terminal_reset") {
+		t.Fatalf("reset should record diagnostic event: %#v", events)
+	}
+
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-after-reset",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != model.TaskInspecting || after.CurrentRunID != "run-after-reset" {
+		t.Fatalf("task should be reusable after reset: %#v", after)
+	}
+}
+
 func finishTaskRun(t *testing.T, store *db.Store, taskID string) {
 	t.Helper()
 	ctx := context.Background()

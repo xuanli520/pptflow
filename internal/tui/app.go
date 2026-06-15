@@ -36,14 +36,12 @@ const (
 )
 
 type app struct {
-	store              appStore
-	cfg                config.Config
-	scheduler          schedulerClient
-	recoverStaleRunsFn func(context.Context) error
-	recoverOrphanRunFn func(context.Context, string) (pipeline.RecoveryResult, error)
-	taskQuerySvc       TaskQueryService
-	lifecycle          *tasklifecycle.Manager
-	poller             *schedulerPoller
+	store        appStore
+	cfg          config.Config
+	scheduler    schedulerClient
+	taskQuerySvc TaskQueryService
+	lifecycle    *tasklifecycle.Manager
+	poller       *schedulerPoller
 
 	router                   *pageRouter
 	taskBoard                *TaskBoardModel
@@ -62,11 +60,12 @@ type app struct {
 	width  int
 	height int
 
-	message    string
-	pendingJob string
-	qaMode     string
-	runConfig  runConfig
-	activeJobs []scheduler.JobSnapshot
+	message     string
+	pendingJob  string
+	qaMode      string
+	runConfig   runConfig
+	diagnostics taskDiagnosticsState
+	activeJobs  []scheduler.JobSnapshot
 
 	confirmCancelTaskID         string
 	confirmCancelJobID          string
@@ -147,6 +146,16 @@ type orphanRunRecoveryMsg struct {
 
 type taskLifecycleMsg struct {
 	result tasklifecycle.Result
+	err    error
+}
+
+type taskDiagnosticsMsg struct {
+	snapshot tasklifecycle.TaskDiagnosticsSnapshot
+	err      error
+}
+
+type taskDiagnosticsRepairMsg struct {
+	result tasklifecycle.DiagnosticsRepairResult
 	err    error
 }
 
@@ -270,9 +279,9 @@ func shutdownSchedulerForExit(ctx context.Context, scheduler schedulerClient, st
 	}
 	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), orphanRunRecoveryTimeout)
 	defer recoverCancel()
-	_, recoverErr := pipeline.RecoverInterruptedRuns(recoverCtx, store, cfg, refs, reason)
-	repairErr := store.RepairTaskStates(recoverCtx)
-	return errors.Join(shutdownErr, recoverErr, repairErr)
+	manager := tasklifecycle.NewManager(store, cfg, nil)
+	_, recoverErr := manager.Recover(recoverCtx, tasklifecycle.RecoveryRequest{Scope: tasklifecycle.RecoveryScopeInterrupted, Refs: refs, Reason: reason})
+	return errors.Join(shutdownErr, recoverErr)
 }
 
 func schedulerRunReferences(jobs []scheduler.JobSnapshot) []pipeline.RunReference {
@@ -320,17 +329,6 @@ func newApp(store *db.Store, cfg config.Config) app {
 	if store != nil {
 		m.store = store
 		m.scheduler = scheduler.New(store, cfg)
-		m.recoverStaleRunsFn = func(ctx context.Context) error {
-			_, orphanErr := pipeline.RecoverOrphanedRuns(ctx, store, cfg)
-			staleErr := pipeline.RecoverStaleRuns(ctx, store, cfg)
-			repairErr := store.RepairTaskStates(ctx)
-			return errors.Join(orphanErr, staleErr, repairErr)
-		}
-		m.recoverOrphanRunFn = func(ctx context.Context, taskID string) (pipeline.RecoveryResult, error) {
-			result, recoverErr := pipeline.RecoverOrphanedRunForTask(ctx, store, cfg, taskID)
-			repairErr := store.RepairTaskStates(ctx)
-			return result, errors.Join(recoverErr, repairErr)
-		}
 		m.taskQuerySvc = newTaskQueryService(store, cfg)
 		m.lifecycle = tasklifecycle.NewManager(store, cfg, m.scheduler)
 	}
@@ -355,7 +353,7 @@ func (m app) Init() tea.Cmd {
 	if m.scheduler != nil {
 		activeJobs = len(m.scheduler.ActiveSnapshot())
 	}
-	return tea.Batch(m.recoverStaleRunsCmd(), m.recoverOrphanInspectionCmd(), m.refreshDockerHealthCmd(), m.taskBoard.Init(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), dockerStartupCheckCmd(m.cfg, activeJobs), m.tick())
+	return tea.Batch(m.recoverStaleRunsCmd(), m.refreshDockerHealthCmd(), m.taskBoard.Init(), m.overview.Init(), m.reloadSchedulerJobs(), m.waitSchedulerNotify(), dockerStartupCheckCmd(m.cfg, activeJobs), m.tick())
 }
 
 func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -377,6 +375,9 @@ func (m app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 	if handled := m.handleRecoveryMsg(msg, &cmds); handled {
+		return m, tea.Batch(cmds...)
+	}
+	if handled := m.handleDiagnosticsMsg(msg, &cmds); handled {
 		return m, tea.Batch(cmds...)
 	}
 	if handled := m.handleDockerMirrorMsg(msg, &cmds); handled {
@@ -836,7 +837,9 @@ func (m app) View() string {
 	}
 	builder.WriteString(renderPipelineBar(m))
 	builder.WriteString("\n")
-	if m.runConfig.active {
+	if m.diagnostics.active {
+		builder.WriteString(renderTaskDiagnostics(m))
+	} else if m.runConfig.active {
 		builder.WriteString(renderRunConfig(m))
 	} else if m.tab == panelTaskBoard {
 		builder.WriteString(renderTaskBoard(m))
@@ -902,53 +905,25 @@ func (m app) handleOverviewLoad(req overviewLoadRequestMsg) tea.Cmd {
 }
 
 func (m app) recoverStaleRunsCmd() tea.Cmd {
-	if m.recoverStaleRunsFn == nil {
+	if m.lifecycle == nil {
 		return nil
 	}
 	return func() tea.Msg {
-		return recoveryMsg{err: m.recoverStaleRunsFn(context.Background())}
+		_, err := m.lifecycle.Recover(context.Background(), tasklifecycle.RecoveryRequest{Scope: tasklifecycle.RecoveryScopeAll})
+		return recoveryMsg{err: err}
 	}
 }
 
 func (m app) recoverOrphanRunCmd(taskID string) tea.Cmd {
 	taskID = strings.TrimSpace(taskID)
-	if taskID == "" || m.recoverOrphanRunFn == nil {
+	if taskID == "" || m.lifecycle == nil {
 		return nil
 	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), orphanRunRecoveryTimeout)
 		defer cancel()
-		result, err := m.recoverOrphanRunFn(ctx, taskID)
+		result, err := m.lifecycle.Recover(ctx, tasklifecycle.RecoveryRequest{Scope: tasklifecycle.RecoveryScopeTaskOrphan, TaskID: taskID})
 		return orphanRunRecoveryMsg{taskID: taskID, result: result, err: err}
-	}
-}
-
-func (m app) recoverOrphanInspectionCmd() tea.Cmd {
-	if m.lifecycle == nil || m.taskQuerySvc == nil {
-		return nil
-	}
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		tasks, err := m.taskQuerySvc.FindStaleInspecting(ctx)
-		if err != nil {
-			return recoveryMsg{err: err}
-		}
-		var failures []string
-		for _, task := range tasks {
-			_, err := m.lifecycle.Execute(ctx, tasklifecycle.Command{
-				Kind:       tasklifecycle.CommandSubmitInspection,
-				TaskID:     task.ID,
-				RunOptions: pipeline.RunOptions{DeferRuntimeCleanup: true},
-			})
-			if err != nil {
-				failures = append(failures, task.ID+": "+err.Error())
-			}
-		}
-		if len(failures) > 0 {
-			return recoveryMsg{err: fmt.Errorf("恢复 Git 同步任务失败: %s", strings.Join(failures, "; "))}
-		}
-		return recoveryMsg{}
 	}
 }
 
@@ -1016,6 +991,31 @@ func (m app) taskLifecycleCmd(command tasklifecycle.Command, timeout time.Durati
 			result.Kind = command.Kind
 		}
 		return taskLifecycleMsg{result: result, err: err}
+	}
+}
+
+func (m app) taskDiagnosticsCmd(taskID string) tea.Cmd {
+	activeJobs := append([]scheduler.JobSnapshot(nil), m.activeJobs...)
+	return func() tea.Msg {
+		if m.lifecycle == nil {
+			return taskDiagnosticsMsg{err: fmt.Errorf("task lifecycle service unavailable")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		snapshot, err := m.lifecycle.DiagnoseTask(ctx, taskID, activeJobs)
+		return taskDiagnosticsMsg{snapshot: snapshot, err: err}
+	}
+}
+
+func (m app) taskDiagnosticsRepairCmd(snapshot tasklifecycle.TaskDiagnosticsSnapshot) tea.Cmd {
+	return func() tea.Msg {
+		if m.lifecycle == nil {
+			return taskDiagnosticsRepairMsg{err: fmt.Errorf("task lifecycle service unavailable")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		result, err := m.lifecycle.RepairTaskDiagnostics(ctx, snapshot)
+		return taskDiagnosticsRepairMsg{result: result, err: err}
 	}
 }
 

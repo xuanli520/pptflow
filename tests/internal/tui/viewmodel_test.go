@@ -150,7 +150,7 @@ func TestExecutionViewModelOnlyIncludesUsableCompletedRefRuns(t *testing.T) {
 	running := model.RunRecord{RunID: "run-running", TaskID: "TASK-1", StartedAt: "2026-04-30T00:01:00Z", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: runningRoot}
 	crashed := model.RunRecord{RunID: "run-crashed", TaskID: "TASK-1", StartedAt: "2026-04-30T00:02:00Z", Status: model.RunCrashed, ManualVerdict: model.ManualUnset, ArtifactRoot: crashedRoot}
 	missing := model.RunRecord{RunID: "run-missing-artifacts", TaskID: "TASK-1", StartedAt: "2026-04-30T00:00:00Z", Status: model.RunCompletedWithFindings, ManualVerdict: model.ManualUnset, ArtifactRoot: filepath.Join(filepath.Dir(artifactRoot), "missing")}
-	for _, run := range []model.RunRecord{completed, running, crashed, missing} {
+	for _, run := range []model.RunRecord{completed, crashed, missing, running} {
 		if err := store.CreateRun(ctx, run); err != nil {
 			t.Fatal(err)
 		}

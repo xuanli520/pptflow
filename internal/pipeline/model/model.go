@@ -58,6 +58,17 @@ type Task struct {
 	UpdatedAt        string      `json:"updated_at"`
 }
 
+type TaskEvent struct {
+	ID        string `json:"id"`
+	TaskID    string `json:"task_id"`
+	RunID     string `json:"run_id,omitempty"`
+	JobID     string `json:"job_id,omitempty"`
+	Kind      string `json:"kind"`
+	Message   string `json:"message"`
+	Source    string `json:"source"`
+	CreatedAt string `json:"created_at"`
+}
+
 type Batch struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`

@@ -27,10 +27,14 @@ func TestFindingsAreScopedByRun(t *testing.T) {
 	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: t.TempDir()}}); err != nil {
 		t.Fatal(err)
 	}
-	for _, runID := range []string{"run-1", "run-2"} {
-		if err := store.CreateRun(ctx, model.RunRecord{RunID: runID, TaskID: "TASK-1", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}); err != nil {
-			t.Fatal(err)
-		}
+	if err := store.CreateRun(ctx, model.RunRecord{RunID: "run-1", TaskID: "TASK-1", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, "run-1", "TASK-1", model.RunCompletedWithFindings, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{RunID: "run-2", TaskID: "TASK-1", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}); err != nil {
+		t.Fatal(err)
 	}
 	finding := model.Finding{ID: "P2R-A-BLK-001", Stage: "A", Severity: "Blocker", Title: "first", DoneCriteria: "done"}
 	if err := store.InsertFindings(ctx, "run-1", []model.Finding{finding}); err != nil {
@@ -110,6 +114,13 @@ func TestProjectOnlyRunCanPersistRuntimeStage(t *testing.T) {
 	if len(summaries) != 1 || summaries[0].HasTask || summaries[0].RunCount != 1 || summaries[0].LastRunID != run.RunID {
 		t.Fatalf("project summary = %#v", summaries)
 	}
+	events, err := store.TaskEvents(ctx, run.TaskID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTaskEventKind(events, "run_started") {
+		t.Fatalf("project-only run should record task events: %#v", events)
+	}
 }
 
 func TestConcurrentWritesAreSerialized(t *testing.T) {
@@ -120,7 +131,12 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 	projectPath := t.TempDir()
-	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: projectPath}}); err != nil {
+	projects := make([]scanner.Project, 0, 3)
+	for i := 0; i < 3; i++ {
+		taskID := "TASK-" + string(rune('A'+i))
+		projects = append(projects, scanner.Project{TaskID: taskID, Batch: "b", Path: filepath.Join(projectPath, taskID)})
+	}
+	if err := store.UpsertProjects(ctx, projects); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,10 +148,11 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			taskID := "TASK-" + string(rune('A'+i))
 			runID := "run-concurrent-" + string(rune('A'+i))
 			run := model.RunRecord{
 				RunID:         runID,
-				TaskID:        "TASK-1",
+				TaskID:        taskID,
 				StartedAt:     time.Now().UTC().Format(time.RFC3339),
 				Status:        model.RunRunning,
 				ManualVerdict: model.ManualUnset,
@@ -153,7 +170,7 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 				errCh <- err
 				return
 			}
-			if err := store.FinishRun(ctx, runID, "TASK-1", model.RunCompletedWithFindings, time.Second); err != nil {
+			if err := store.FinishRun(ctx, runID, taskID, model.RunCompletedWithFindings, time.Second); err != nil {
 				errCh <- err
 				return
 			}
@@ -166,12 +183,14 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	runs, err := store.ListRunsForTask(ctx, "TASK-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 3 {
-		t.Fatalf("run count = %d, want 3", len(runs))
+	for _, project := range projects {
+		runs, err := store.ListRunsForTask(ctx, project.TaskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(runs) != 1 {
+			t.Fatalf("%s run count = %d, want 1", project.TaskID, len(runs))
+		}
 	}
 }
 
@@ -858,6 +877,10 @@ func assertReadIndexes(t *testing.T, path string) {
 		"idx_tasks_batch",
 		"idx_tasks_batch_state",
 		"idx_tasks_state_docker",
+		"idx_tasks_state_archive",
+		"idx_task_events_task_created",
+		"idx_task_events_run_created",
+		"idx_runs_one_running_per_task",
 	}
 	for _, index := range want {
 		var name string
@@ -866,6 +889,19 @@ func assertReadIndexes(t *testing.T, path string) {
 			t.Fatalf("missing index %s: %v", index, err)
 		}
 	}
+	var tableName string
+	if err := handle.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_events'`).Scan(&tableName); err != nil {
+		t.Fatalf("missing task_events table: %v", err)
+	}
+}
+
+func hasTaskEventKind(events []model.TaskEvent, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func assertV5TaskSchema(t *testing.T, path string) {

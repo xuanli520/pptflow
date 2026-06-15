@@ -25,6 +25,7 @@ type TaskProject struct {
 	EnteredWaitingAt string
 	SyncError        string
 
+	CurrentRunID  string
 	LastRunID     string
 	LastRun       string
 	RunStatus     string
@@ -142,6 +143,10 @@ func (s dbTaskQueryService) enrichTaskProject(ctx context.Context, project *Task
 	}
 	run, err := s.store.LatestRunForTask(ctx, project.ID)
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			project.RunStatus = "error"
+			project.FailedSummary = "加载运行信息失败: " + err.Error()
+		}
 		return
 	}
 	project.LastRunID = run.RunID
@@ -154,6 +159,8 @@ func (s dbTaskQueryService) enrichTaskProject(ctx context.Context, project *Task
 	project.Mode = runMode(run)
 	stages, err := s.store.Stages(ctx, run.RunID)
 	if err != nil {
+		project.CurrentStatus = model.StageFailed
+		project.FailedSummary = "加载阶段信息失败: " + err.Error()
 		return
 	}
 	for _, stage := range stages {
@@ -246,6 +253,7 @@ func taskProjectFromTask(cfg config.Config, task model.Task) TaskProject {
 		LastCompletedAt:  task.LastCompletedAt,
 		EnteredWaitingAt: task.EnteredWaitingAt,
 		SyncError:        task.SyncError,
+		CurrentRunID:     task.CurrentRunID,
 		Path:             task.RepoPath,
 		DocsCount:        taskdocs.AvailableCount(cfg.ScanPath, task.ID),
 		Mode:             "initial",
@@ -257,13 +265,14 @@ func taskProjectFromSummary(cfg config.Config, project db.ProjectSummary) TaskPr
 		ID:               project.TaskID,
 		BatchID:          project.Batch,
 		TaskState:        project.TaskState,
+		CurrentRunID:     project.CurrentRunID,
+		LastRunID:        project.LastRunID,
 		CompletionCount:  project.CompletionCount,
 		FrontendURL:      project.FrontendURL,
 		DockerRunning:    project.DockerRunning,
 		LastCompletedAt:  project.LastCompletedAt,
 		EnteredWaitingAt: project.EnteredWaitingAt,
 		SyncError:        project.SyncError,
-		LastRunID:        project.LastRunID,
 		LastRun:          project.LastRunAt,
 		RunStatus:        project.RunStatus,
 		ManualVerdict:    project.ManualVerdict,

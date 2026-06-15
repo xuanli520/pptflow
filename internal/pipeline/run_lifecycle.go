@@ -2,8 +2,10 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,17 +132,24 @@ func appendStreamProgress(runID, stage, line, source string, done bool, progress
 func (r Runner) loadAndValidateRunInputs(ctx context.Context, taskID string, opts RunOptions, progress func(RunProgress)) (scanner.Project, []ProjectPathWarning, RunOptions, error) {
 	project, err := r.store.GetProject(ctx, taskID)
 	if err != nil {
-		err = dbNotFoundTask(taskID)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = dbNotFoundTask(taskID)
+		} else {
+			err = fmt.Errorf("load project %s: %w", taskID, err)
+		}
+		r.writePreRunFailure(taskID, "", "load_project", err)
 		progress(RunProgress{Event: EventRunCrashed, Done: true, Err: err})
 		return scanner.Project{}, nil, opts, err
 	}
 	project, pathWarnings, err := r.canonicalizeProjectForRun(project)
 	if err != nil {
+		r.writePreRunFailure(taskID, "", "canonicalize_project", err)
 		progress(RunProgress{Event: EventRunCrashed, Done: true, Err: err})
 		return scanner.Project{}, nil, opts, err
 	}
 	opts, err = r.normalizeRunOptions(ctx, project, opts)
 	if err != nil {
+		r.writePreRunFailure(taskID, "", "normalize_options", err)
 		progress(RunProgress{Event: EventRunCrashed, Done: true, Err: err})
 		return scanner.Project{}, nil, opts, err
 	}
@@ -151,12 +160,45 @@ func dbNotFoundTask(taskID string) error {
 	return db.FormatNotFound("task", taskID)
 }
 
+type preRunFailureRecord struct {
+	TaskID    string `json:"task_id"`
+	RunID     string `json:"run_id,omitempty"`
+	Phase     string `json:"phase"`
+	Error     string `json:"error"`
+	CreatedAt string `json:"created_at"`
+}
+
+func (r Runner) writePreRunFailure(taskID, runID, phase string, err error) {
+	if err == nil || strings.TrimSpace(taskID) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	record := preRunFailureRecord{
+		TaskID:    taskID,
+		RunID:     strings.TrimSpace(runID),
+		Phase:     strings.TrimSpace(phase),
+		Error:     err.Error(),
+		CreatedAt: now.Format(time.RFC3339),
+	}
+	content, marshalErr := json.MarshalIndent(record, "", "  ")
+	if marshalErr != nil {
+		return
+	}
+	dir := filepath.Join(r.cfg.ScanPath, ".qa-control", "run-failures")
+	if mkdirErr := os.MkdirAll(dir, 0o755); mkdirErr != nil {
+		return
+	}
+	name := safeLockName(taskID) + "_" + now.Format("20060102T150405.000000000Z") + ".json"
+	_ = os.WriteFile(filepath.Join(dir, name), content, 0o644)
+}
+
 func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
 	previousRuns, _ := r.store.ListRunsForTask(input.ctx, input.taskID)
 	start := time.Now().UTC()
 	runID := displaytime.RunID(start)
 	artifactRoot := runArtifactRoot(r.cfg.ScanPath, input.project, runID)
 	if err := os.MkdirAll(filepath.Join(artifactRoot, "logs"), 0o755); err != nil {
+		r.writePreRunFailure(input.taskID, runID, "create_artifact_root", err)
 		input.progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
 		return nil, err
 	}
@@ -171,6 +213,7 @@ func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
 	docsManifest, docsManifestErr := taskdocs.ReadManifest(r.cfg.ScanPath, input.taskID)
 	if initialRunRequiresSupplementalDocs(input.opts, input.opts.StaticOnly || r.cfg.Pipeline.StaticOnly) && docsManifestErr == nil && len(docsManifest.Docs) < 1 {
 		err := errors.New(taskdocs.InitialInspectionDocsRequiredMessage)
+		r.writePreRunFailure(input.taskID, runID, "validate_docs", err)
 		input.progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
 		return nil, err
 	}
@@ -188,6 +231,7 @@ func (r Runner) prepareRun(input runPrepareInput) (*runState, error) {
 		PromptVersions: string(toolVersions),
 	}
 	if err := r.store.CreateRun(input.ctx, run); err != nil {
+		r.writePreRunFailure(input.taskID, runID, "create_run", err)
 		input.progress(RunProgress{RunID: runID, Event: EventRunCrashed, Done: true, Err: err})
 		return nil, err
 	}

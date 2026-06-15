@@ -573,7 +573,13 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 			}
 			if err := s.enqueuePipelineAfterGit(job); err != nil {
 				if s.store != nil {
-					if recordErr := s.store.RecordTaskGitError(ctx, job.TaskID, err); recordErr != nil {
+					if recordErr := s.store.RecordTaskEvent(ctx, model.TaskEvent{
+						TaskID:  job.TaskID,
+						JobID:   job.JobID,
+						Kind:    "scheduler_enqueue_failed",
+						Message: err.Error(),
+						Source:  "scheduler",
+					}); recordErr != nil {
 						err = fmt.Errorf("%w; additionally failed to record scheduler error: %v", err, recordErr)
 					}
 				}
@@ -657,7 +663,7 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 		return errors.New("git syncer unavailable")
 	}
 	if s.store != nil {
-		if err := s.store.RecordTaskGitError(ctx, job.TaskID, nil); err != nil {
+		if err := s.store.SetGitSyncError(ctx, db.GitSyncErrorUpdate{TaskID: job.TaskID, JobID: job.JobID, Err: nil, Source: "git_sync"}); err != nil {
 			return fmt.Errorf("failed to clear git sync error for %s: %w", job.TaskID, err)
 		}
 	}
@@ -682,7 +688,7 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 				err = fmt.Errorf("%w; additionally failed to record terminal git sync error: %v", err, recordErr)
 			}
 		} else {
-			if recordErr := s.store.RecordTaskGitError(ctx, job.TaskID, err); recordErr != nil {
+			if recordErr := s.store.SetGitSyncError(ctx, db.GitSyncErrorUpdate{TaskID: job.TaskID, JobID: job.JobID, Err: err, Source: "git_sync"}); recordErr != nil {
 				err = fmt.Errorf("%w; additionally failed to record git sync error: %v", err, recordErr)
 			}
 		}

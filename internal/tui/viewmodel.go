@@ -29,6 +29,7 @@ type overviewItem struct {
 	Batch         string
 	Path          string
 	LastRunID     string
+	CurrentRunID  string
 	LastRun       string
 	RunStatus     string
 	HasTask       bool
@@ -105,6 +106,7 @@ func buildOverviewItems(cfg config.Config, projects []db.ProjectSummary) []overv
 			Batch:         project.Batch,
 			Path:          project.Path,
 			LastRunID:     project.LastRunID,
+			CurrentRunID:  project.CurrentRunID,
 			LastRun:       project.LastRunAt,
 			RunStatus:     project.RunStatus,
 			HasTask:       project.HasTask,

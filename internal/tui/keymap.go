@@ -129,7 +129,14 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			m.message = "请先关闭运行配置再终止作业"
 			return m, cmds
 		}
+		if isDiagnosticsKey(key) {
+			m.message = "请先关闭运行配置再诊断"
+			return m, cmds
+		}
 		return m.handleRunConfigKey(msg)
+	}
+	if m.diagnostics.active {
+		return m.handleTaskDiagnosticsKey(key, cmds)
 	}
 	if m.confirmCancelTaskID != "" {
 		switch key {
@@ -242,6 +249,8 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 		return m, cmds
+	case "ctrl+d":
+		return m.openTaskDiagnosticsForCurrentContext(cmds)
 	case "ctrl+r":
 		return m.openInspectionRunConfigForCurrentContext(cmds)
 	case "tab":
@@ -403,8 +412,44 @@ func canRetryGitSyncTask(task TaskProject) bool {
 	return task.TaskState == model.TaskInspecting || task.TaskState == model.TaskCompleted
 }
 
-func canOpenInspectionRunConfig(state string) bool {
-	return state != model.TaskInspecting && state != model.TaskWaitingManual
+type inspectionAdmission struct {
+	Allowed bool
+	Message string
+}
+
+func (m app) evaluateInspectionAdmission(task TaskProject) inspectionAdmission {
+	taskID := strings.TrimSpace(task.ID)
+	if taskID == "" {
+		return inspectionAdmission{Message: "请选择可重跑质检任务"}
+	}
+	if job, ok := m.activeJobForTask(taskID); ok {
+		return inspectionAdmission{Message: "该任务已有排队或运行中的作业: " + job.JobID}
+	}
+	if task.TaskState == model.TaskWaitingManual {
+		return inspectionAdmission{Message: "请先完成待处理判定，再重跑质检"}
+	}
+	if task.TaskState == model.TaskInspecting && strings.TrimSpace(task.SyncError) != "" {
+		return inspectionAdmission{Message: "Git 同步失败，请按 Ctrl+W 重试；需要修复状态请按 Ctrl+D 诊断"}
+	}
+	if strings.TrimSpace(task.CurrentRunID) != "" || task.RunStatus == model.RunRunning || task.CurrentStatus == model.StageRunning {
+		return inspectionAdmission{Message: "该任务已有运行记录未结束，请按 Ctrl+X 终止或 Ctrl+D 诊断"}
+	}
+	if task.TaskState == model.TaskInspecting {
+		return inspectionAdmission{Message: "题目检查状态异常，请按 Ctrl+D 打开诊断后重跑"}
+	}
+	return inspectionAdmission{Allowed: true}
+}
+
+func taskProjectFromOverviewItem(item overviewItem) TaskProject {
+	return TaskProject{
+		ID:            item.TaskID,
+		TaskState:     item.TaskState,
+		CurrentRunID:  item.CurrentRunID,
+		LastRunID:     item.LastRunID,
+		RunStatus:     item.RunStatus,
+		ManualVerdict: item.ManualVerdict,
+		FailedStage:   item.FailedStage,
+	}
 }
 
 func (m app) openInspectionRunConfigForCurrentContext(cmds []tea.Cmd) (app, []tea.Cmd) {
@@ -419,8 +464,8 @@ func (m app) openInspectionRunConfigForCurrentContext(cmds []tea.Cmd) (app, []te
 			m.message = "请选择可重跑质检任务"
 			return m, cmds
 		}
-		if !canOpenInspectionRunConfig(task.TaskState) {
-			m.message = "请选择可重跑质检任务"
+		if admission := m.evaluateInspectionAdmission(task); !admission.Allowed {
+			m.message = admission.Message
 			return m, cmds
 		}
 		m.openRunConfigForTask(task.ID)
@@ -435,8 +480,8 @@ func (m app) openInspectionRunConfigForCurrentContext(cmds []tea.Cmd) (app, []te
 			m.message = "该项目尚未创建任务，请从任务输入框开始质检"
 			return m, cmds
 		}
-		if !canOpenInspectionRunConfig(item.TaskState) {
-			m.message = "请选择可重跑质检任务"
+		if admission := m.evaluateInspectionAdmission(taskProjectFromOverviewItem(item)); !admission.Allowed {
+			m.message = admission.Message
 			return m, cmds
 		}
 		m.openRunConfigForTask(item.TaskID)
@@ -456,8 +501,8 @@ func (m app) openInspectionRunConfigForCurrentContext(cmds []tea.Cmd) (app, []te
 			m.message = "当前执行详情没有已创建任务"
 			return m, cmds
 		}
-		if !canOpenInspectionRunConfig(project.TaskState) {
-			m.message = "请选择可重跑质检任务"
+		if admission := m.evaluateInspectionAdmission(*project); !admission.Allowed {
+			m.message = admission.Message
 			return m, cmds
 		}
 		m.openRunConfigForTask(taskID)
@@ -508,7 +553,7 @@ func globalKeyWhileInput(key string) bool {
 		return true
 	}
 	switch key {
-	case "ctrl+c", "ctrl+q", "ctrl+o", "ctrl+e", "ctrl+w", "ctrl+x", "ctrl+r", "ctrl+s", "q":
+	case "ctrl+c", "ctrl+q", "ctrl+o", "ctrl+e", "ctrl+w", "ctrl+x", "ctrl+r", "ctrl+d", "ctrl+s", "q":
 		return true
 	default:
 		return false
@@ -683,6 +728,12 @@ func (m *app) openRunConfigForTaskWithProjectType(taskID string, projectType str
 	if taskID == "" {
 		return
 	}
+	if project, err := m.lookupTaskProject(taskID); err == nil && project != nil {
+		if admission := m.evaluateInspectionAdmission(*project); !admission.Allowed {
+			m.message = admission.Message
+			return
+		}
+	}
 	m.syncRefSelection()
 	if plan := m.rerunStagePlan(); plan.blockedReason != "" {
 		m.message = plan.blockedReason
@@ -744,7 +795,7 @@ func (m *app) openCancelConfirm() tea.Cmd {
 	}
 	job, ok := m.activeJobForTask(taskID)
 	if !ok {
-		if m.selectedTaskHasPersistedRunningRun(taskID) && m.recoverOrphanRunFn != nil {
+		if m.selectedTaskHasPersistedRunningRun(taskID) && m.lifecycle != nil {
 			m.message = "正在检查失联运行 " + taskID
 			return m.recoverOrphanRunCmd(taskID)
 		}
@@ -779,6 +830,12 @@ func footerFor(m app) string {
 	if m.runConfig.active {
 		return "Tab 切换  Space 选择  Enter 确认  Esc 取消"
 	}
+	if m.diagnostics.active {
+		if diagnosticsCanRepair(m.diagnostics.snapshot) {
+			return "Enter 修复  Esc/q 关闭诊断"
+		}
+		return "Esc/q 关闭诊断"
+	}
 	if m.confirmCancelTaskID != "" {
 		return "y/Enter 确认终止  n/Esc 取消"
 	}
@@ -799,19 +856,19 @@ func footerFor(m app) string {
 	}
 	switch m.focus {
 	case focusTaskBoard:
-		return "/ 输入题目  Ctrl+S 启动服务  Ctrl+E 判定完成  Ctrl+R 重检  Ctrl+W 重试Git  Ctrl+O 总览  Ctrl+/ 设置  Q 退出"
+		return "/ 输入题目  Ctrl+S 启动服务  Ctrl+E 判定完成  Ctrl+R 重检  Ctrl+W 重试Git  Ctrl+D 诊断  Ctrl+O 总览  Ctrl+/ 设置  Q 退出"
 	case focusTaskInput:
-		return "Enter 开始质检  Esc 清空  ←→ 光标  Ctrl+E/Ctrl+R/Ctrl+O 全局  Ctrl+/ 设置  Q 退出"
+		return "Enter 开始质检  Esc 清空  ←→ 光标  Ctrl+E/Ctrl+R/Ctrl+D/Ctrl+O 全局  Ctrl+/ 设置  Q 退出"
 	case focusSearch:
-		return "Ctrl+C 退出  Tab 执行详情  ↓ 表格  Ctrl+R 重跑  Ctrl+X 终止"
+		return "Ctrl+C 退出  Tab 执行详情  ↓ 表格  Ctrl+R 重跑  Ctrl+D 诊断  Ctrl+X 终止"
 	case focusOverviewTable:
-		return "↑↓选择 Enter详情 /搜索 s排序 S反向 PgUp/PgDn翻页 z条数 Ctrl+R重跑 Ctrl+X终止 m模式"
+		return "↑↓选择 Enter详情 /搜索 s排序 S反向 PgUp/PgDn翻页 z条数 Ctrl+R重跑 Ctrl+D诊断 Ctrl+X终止 m模式"
 	case focusStageList:
-		return "↑↓ 阶段  Enter 详情  Ctrl+R 重跑  Ctrl+X 终止  m 模式"
+		return "↑↓ 阶段  Enter 详情  Ctrl+R 重跑  Ctrl+D 诊断  Ctrl+X 终止  m 模式"
 	case focusRefRunList:
-		return "↑↓ 参考运行  Enter 选择  Esc 返回阶段  Ctrl+R 重跑  Ctrl+X 终止"
+		return "↑↓ 参考运行  Enter 选择  Esc 返回阶段  Ctrl+R 重跑  Ctrl+D 诊断  Ctrl+X 终止"
 	case focusDetailViewport:
-		return "↑↓ 滚动  PgUp/PgDn 翻页  Esc 返回阶段  Ctrl+X 终止"
+		return "↑↓ 滚动  PgUp/PgDn 翻页  Esc 返回阶段  Ctrl+D 诊断  Ctrl+X 终止"
 	default:
 		return "Ctrl+C 退出"
 	}

@@ -31,6 +31,15 @@ type taskRunLockStatus struct {
 	ReadErr error
 }
 
+type TaskRunLockStatus struct {
+	Path    string
+	Exists  bool
+	PID     int
+	TaskID  string
+	Stale   bool
+	ReadErr error
+}
+
 type cleanupOutcome struct {
 	Summary            dockermgr.CleanupSummary
 	Finding            *model.Finding
@@ -129,6 +138,10 @@ func (r Runner) acquireTaskRunLock(taskID string) (taskRunLock, error) {
 
 func taskRunLockPath(scanPath, taskID string) string {
 	return filepath.Join(scanPath, ".qa-control", "locks", safeLockName(taskID)+".lock")
+}
+
+func TaskRunLockPath(scanPath, taskID string) string {
+	return taskRunLockPath(scanPath, taskID)
 }
 
 func (l taskRunLock) Release() {
@@ -295,6 +308,29 @@ func staleTaskRunLock(path string) bool {
 
 func taskRunLockStatusForTask(scanPath, taskID string) taskRunLockStatus {
 	return readTaskRunLockStatus(taskRunLockPath(scanPath, taskID))
+}
+
+func TaskRunLockStatusForTask(scanPath, taskID string) TaskRunLockStatus {
+	return exportTaskRunLockStatus(taskRunLockStatusForTask(scanPath, taskID))
+}
+
+func RemoveTaskRunLock(scanPath, taskID string) error {
+	err := os.Remove(taskRunLockPath(scanPath, taskID))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func exportTaskRunLockStatus(status taskRunLockStatus) TaskRunLockStatus {
+	return TaskRunLockStatus{
+		Path:    status.Path,
+		Exists:  status.Exists,
+		PID:     status.PID,
+		TaskID:  status.TaskID,
+		Stale:   status.Stale,
+		ReadErr: status.ReadErr,
+	}
 }
 
 func readTaskRunLockStatus(path string) taskRunLockStatus {

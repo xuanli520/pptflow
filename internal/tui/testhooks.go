@@ -192,11 +192,6 @@ func (h TestHarness) ApplySchedulerNotifyForTest() (TestHarness, int) {
 	return h, len(cmds)
 }
 
-func (h TestHarness) WithOrphanRunRecoveryForTest(fn func(context.Context, string) (pipeline.RecoveryResult, error)) TestHarness {
-	h.model.recoverOrphanRunFn = fn
-	return h
-}
-
 func (h TestHarness) ApplyStartupDockerCheckForTest(count int, err error) TestHarness {
 	model := cloneAppForTest(h.model)
 	next, _ := model.Update(startupDockerCheckMsg{count: count, err: err})
@@ -590,6 +585,10 @@ func (h TestHarness) CancelConfirm() bool {
 	return h.model.confirmCancelTaskID != ""
 }
 
+func (h TestHarness) TaskDiagnosticsActive() bool {
+	return h.model.diagnostics.active
+}
+
 func (h TestHarness) StartupDockerCleanupConfirm() bool {
 	return h.model.confirmStartupDockerCleanup
 }
@@ -845,6 +844,8 @@ func testKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlQ}
 	case "ctrl+r":
 		return tea.KeyMsg{Type: tea.KeyCtrlR}
+	case "ctrl+d":
+		return tea.KeyMsg{Type: tea.KeyCtrlD}
 	case "ctrl+x":
 		return tea.KeyMsg{Type: tea.KeyCtrlX}
 	case "ctrl+w":

@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/xuanli520/p2r_tui/internal/config"
 	"github.com/xuanli520/p2r_tui/internal/db"
-	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
@@ -263,7 +263,7 @@ func TestCtrlROnOverviewWaitingTaskDoesNotOpenRunConfig(t *testing.T) {
 		SetFocus("overview-table")
 
 	next, result := h.Press("ctrl+r")
-	if next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.Message(), "请选择可重跑质检任务") {
+	if next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.Message(), "请先完成待处理判定") {
 		t.Fatalf("waiting task Ctrl+R should be blocked, confirm=%v cmds=%d message=%q", next.Confirm(), result.CmdCount, next.Message())
 	}
 }
@@ -305,6 +305,7 @@ func TestTaskInputEnterForExistingTaskOpensRunConfigWithoutTypePrompt(t *testing
 	if _, err := store.CreateTaskWithBatch(ctx, taskID, gitURL, cfg.ScanPath); err != nil {
 		t.Fatal(err)
 	}
+	completeTaskForRunConfigTest(t, store, taskID)
 
 	h := tuiapp.NewTestHarnessWithStore(store, cfg).ApplyTaskInputSubmitForTest(taskID)
 	view := h.View()
@@ -330,6 +331,7 @@ func TestRunConfigProjectTypeResetCyclesAtBottom(t *testing.T) {
 	if _, err := store.CreateTaskWithBatch(ctx, taskID, gitURL, cfg.ScanPath); err != nil {
 		t.Fatal(err)
 	}
+	completeTaskForRunConfigTest(t, store, taskID)
 
 	h := tuiapp.NewTestHarnessWithStore(store, cfg).ApplyTaskInputSubmitForTest(taskID)
 	for i := 0; i < 5; i++ {
@@ -471,15 +473,53 @@ func TestCtrlXWithoutActiveJobAndRunConfigPriority(t *testing.T) {
 }
 
 func TestCtrlXWithPersistedRunningRunStartsOrphanRecovery(t *testing.T) {
-	h := tuiapp.NewTestHarness(config.Default()).
-		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{{Stage: "C", Status: model.StageRunning}}, "C").
-		WithOrphanRunRecoveryForTest(func(context.Context, string) (pipeline.RecoveryResult, error) {
-			return pipeline.RecoveryResult{}, nil
-		})
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	taskID := "TASK-20260521-ABCDE1"
+	h := tuiapp.NewTestHarnessWithStore(store, cfg).
+		SeedExecutionRun(taskID, "run-1", []model.StageRecord{{Stage: "C", Status: model.StageRunning}}, "C")
 
 	next, result := h.Press("ctrl+x")
-	if next.CancelConfirm() || result.CmdCount != 1 || next.Message() != "正在检查失联运行 TASK-1" {
+	if next.CancelConfirm() || result.CmdCount != 1 || next.Message() != "正在检查失联运行 "+taskID {
 		t.Fatalf("ctrl+x should start orphan recovery, cancel=%v cmds=%d message=%q", next.CancelConfirm(), result.CmdCount, next.Message())
+	}
+}
+
+func TestCtrlDStartsTaskDiagnostics(t *testing.T) {
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	taskID := "TASK-20260521-ABCDEF"
+	if _, err := store.CreateTaskWithBatch(t.Context(), taskID, "https://gitlab.example/"+taskID, cfg.ScanPath); err != nil {
+		t.Fatal(err)
+	}
+	h := tuiapp.NewTestHarnessWithStore(store, cfg).
+		SeedOverviewTask(taskID, model.TaskInspecting).
+		SetFocus("overview-table")
+
+	next, result := h.Press("ctrl+d")
+	if result.CmdCount != 1 || !strings.Contains(next.Message(), "正在生成任务诊断报告") {
+		t.Fatalf("ctrl+d should start diagnostics, cmds=%d message=%q", result.CmdCount, next.Message())
+	}
+}
+
+func TestCtrlDBlockedWhileRunConfigOpen(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverviewTask("TASK-20260521-ABCDEF", model.TaskCompleted).
+		SetFocus("overview-table")
+	h, _ = h.Press("ctrl+r")
+	next, result := h.Press("ctrl+d")
+	if !next.Confirm() || result.CmdCount != 0 || next.Message() != "请先关闭运行配置再诊断" {
+		t.Fatalf("ctrl+d should not pass through run config, confirm=%v cmds=%d message=%q", next.Confirm(), result.CmdCount, next.Message())
 	}
 }
 
@@ -611,5 +651,27 @@ func TestShiftTabSwitchesPanel(t *testing.T) {
 	next, _ := h.Press("shift+tab")
 	if next.TabName() != "overview" || next.FocusName() != "overview-table" {
 		t.Fatalf("shift+tab should move back to overview table, tab=%s focus=%s", next.TabName(), next.FocusName())
+	}
+}
+
+func completeTaskForRunConfigTest(t *testing.T, store *db.Store, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	runID := taskID + "-run-1"
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:         runID,
+		TaskID:        taskID,
+		StartedAt:     time.Now().UTC().Format(time.RFC3339),
+		Status:        model.RunRunning,
+		ManualVerdict: model.ManualUnset,
+		ArtifactRoot:  t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, runID, taskID, model.RunCompletedClean, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteTask(ctx, taskID); err != nil {
+		t.Fatal(err)
 	}
 }

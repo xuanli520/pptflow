@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const currentSchemaVersion = 6
+const currentSchemaVersion = 7
 
 func migrate(ctx context.Context, handle *sql.DB) error {
 	tx, err := handle.BeginTx(ctx, nil)
@@ -68,6 +68,11 @@ func migrate(ctx context.Context, handle *sql.DB) error {
 				return err
 			}
 			version = 6
+		case 6:
+			if err := migrateV6ToV7(ctx, tx); err != nil {
+				return err
+			}
+			version = 7
 		default:
 			return fmt.Errorf("unsupported schema version %d", version)
 		}
@@ -113,6 +118,9 @@ func createCurrentSchema(ctx context.Context, tx *sql.Tx) error {
 	if err := ensureTaskTables(ctx, tx); err != nil {
 		return err
 	}
+	if err := ensureTaskEventTable(ctx, tx); err != nil {
+		return err
+	}
 	if err := ensureSchemaVersion(ctx, tx, currentSchemaVersion); err != nil {
 		return err
 	}
@@ -135,8 +143,8 @@ func ensureCoreTables(ctx context.Context, tx *sql.Tx) error {
 			task_id TEXT NOT NULL REFERENCES projects(task_id),
 			started_at TEXT,
 			finished_at TEXT,
-			status TEXT DEFAULT 'running',
-			manual_verdict TEXT DEFAULT 'unset',
+				status TEXT DEFAULT 'running' CHECK (status IN ('running', 'completed_clean', 'completed_with_findings', 'aborted', 'crashed')),
+				manual_verdict TEXT DEFAULT 'unset' CHECK (manual_verdict IN ('unset', 'pass', 'rework', 'fail')),
 			static_only INTEGER DEFAULT 0,
 			duration_ms INTEGER DEFAULT 0,
 			artifact_root TEXT NOT NULL,
@@ -148,7 +156,7 @@ func ensureCoreTables(ctx context.Context, tx *sql.Tx) error {
 			run_id TEXT NOT NULL REFERENCES runs(run_id),
 			stage TEXT NOT NULL,
 			name TEXT,
-			status TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'blocked', 'skipped')),
 			started_at TEXT,
 			finished_at TEXT,
 			duration_ms INTEGER DEFAULT 0,
@@ -158,6 +166,55 @@ func ensureCoreTables(ctx context.Context, tx *sql.Tx) error {
 			error_summary TEXT,
 			PRIMARY KEY (run_id, stage)
 		);`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureLifecycleIndexes(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE INDEX IF NOT EXISTS idx_task_events_task_created ON task_events(task_id, created_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_task_events_run_created ON task_events(run_id, created_at DESC);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_running_per_task ON runs(task_id) WHERE status = 'running';`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureLifecycleConstraintTriggers(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE TRIGGER IF NOT EXISTS validate_runs_status_insert
+		 BEFORE INSERT ON runs
+		 WHEN NEW.status NOT IN ('running', 'completed_clean', 'completed_with_findings', 'aborted', 'crashed')
+		 BEGIN SELECT RAISE(ABORT, 'invalid runs.status'); END;`,
+		`CREATE TRIGGER IF NOT EXISTS validate_runs_status_update
+		 BEFORE UPDATE OF status ON runs
+		 WHEN NEW.status NOT IN ('running', 'completed_clean', 'completed_with_findings', 'aborted', 'crashed')
+		 BEGIN SELECT RAISE(ABORT, 'invalid runs.status'); END;`,
+		`CREATE TRIGGER IF NOT EXISTS validate_runs_verdict_insert
+		 BEFORE INSERT ON runs
+		 WHEN NEW.manual_verdict NOT IN ('unset', 'pass', 'rework', 'fail')
+		 BEGIN SELECT RAISE(ABORT, 'invalid runs.manual_verdict'); END;`,
+		`CREATE TRIGGER IF NOT EXISTS validate_runs_verdict_update
+		 BEFORE UPDATE OF manual_verdict ON runs
+		 WHEN NEW.manual_verdict NOT IN ('unset', 'pass', 'rework', 'fail')
+		 BEGIN SELECT RAISE(ABORT, 'invalid runs.manual_verdict'); END;`,
+		`CREATE TRIGGER IF NOT EXISTS validate_run_stages_status_insert
+		 BEFORE INSERT ON run_stages
+		 WHEN NEW.status NOT IN ('pending', 'running', 'done', 'failed', 'blocked', 'skipped')
+		 BEGIN SELECT RAISE(ABORT, 'invalid run_stages.status'); END;`,
+		`CREATE TRIGGER IF NOT EXISTS validate_run_stages_status_update
+		 BEFORE UPDATE OF status ON run_stages
+		 WHEN NEW.status NOT IN ('pending', 'running', 'done', 'failed', 'blocked', 'skipped')
+		 BEGIN SELECT RAISE(ABORT, 'invalid run_stages.status'); END;`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -201,6 +258,9 @@ func inferLegacyVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 		if migrated, err := hasV6Tables(ctx, tx); err != nil || !migrated {
 			return 5, err
 		}
+		if migrated, err := hasV7Tables(ctx, tx); err != nil || !migrated {
+			return 6, err
+		}
 		return currentSchemaVersion, nil
 	}
 	columns, err := findingColumns(ctx, tx)
@@ -219,6 +279,9 @@ func inferLegacyVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 				}
 				if migrated, err := hasV6Tables(ctx, tx); err != nil || !migrated {
 					return 5, err
+				}
+				if migrated, err := hasV7Tables(ctx, tx); err != nil || !migrated {
+					return 6, err
 				}
 				return currentSchemaVersion, nil
 			}
@@ -312,6 +375,42 @@ func migrateV5ToV6(ctx context.Context, tx *sql.Tx) error {
 	return ensureTaskArchiveColumn(ctx, tx)
 }
 
+func migrateV6ToV7(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET current_run_id = NULL WHERE TRIM(COALESCE(current_run_id, '')) = ''`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE runs
+		SET status = 'crashed',
+		    finished_at = CASE WHEN COALESCE(finished_at, '') = '' THEN datetime('now') ELSE finished_at END,
+		    duration_ms = CASE
+		        WHEN COALESCE(started_at, '') <> '' THEN CAST((julianday(datetime('now')) - julianday(started_at)) * 86400000 AS INTEGER)
+		        ELSE duration_ms
+		    END
+		WHERE status = 'running'
+		  AND run_id IN (
+		      SELECT run_id
+		      FROM (
+		          SELECT run_id,
+		                 ROW_NUMBER() OVER (
+		                     PARTITION BY task_id
+		                     ORDER BY COALESCE(started_at, '') DESC, run_id DESC
+		                 ) AS rn
+		          FROM runs
+		          WHERE status = 'running'
+		      ) ranked
+		      WHERE rn > 1
+		  )`); err != nil {
+		return err
+	}
+	if err := ensureTaskEventTable(ctx, tx); err != nil {
+		return err
+	}
+	if err := ensureLifecycleConstraintTriggers(ctx, tx); err != nil {
+		return err
+	}
+	return ensureLifecycleIndexes(ctx, tx)
+}
+
 func ensureTaskTables(ctx context.Context, tx *sql.Tx) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS batches (
@@ -350,6 +449,20 @@ func ensureTaskTables(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func ensureTaskEventTable(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS task_events (
+		id TEXT PRIMARY KEY,
+		task_id TEXT NOT NULL REFERENCES projects(task_id) ON DELETE CASCADE,
+		run_id TEXT,
+		job_id TEXT,
+		kind TEXT NOT NULL,
+		message TEXT NOT NULL,
+		source TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	);`)
+	return err
+}
+
 func ensureTaskArchiveColumn(ctx context.Context, tx *sql.Tx) error {
 	columns, err := tableColumns(ctx, tx, "tasks")
 	if err != nil {
@@ -363,6 +476,9 @@ func ensureTaskArchiveColumn(ctx context.Context, tx *sql.Tx) error {
 }
 
 func ensureReadIndexes(ctx context.Context, tx *sql.Tx) error {
+	if err := ensureTaskEventTable(ctx, tx); err != nil {
+		return err
+	}
 	statements := []string{
 		`CREATE INDEX IF NOT EXISTS idx_runs_task_started ON runs(task_id, started_at DESC, run_id DESC);`,
 		`CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);`,
@@ -381,7 +497,10 @@ func ensureReadIndexes(ctx context.Context, tx *sql.Tx) error {
 			return err
 		}
 	}
-	return nil
+	if err := ensureLifecycleIndexes(ctx, tx); err != nil {
+		return err
+	}
+	return ensureLifecycleConstraintTriggers(ctx, tx)
 }
 
 func ensureSchemaVersion(ctx context.Context, tx *sql.Tx, version int) error {
@@ -432,9 +551,30 @@ func hasV6Tables(ctx context.Context, tx *sql.Tx) (bool, error) {
 	return ok, nil
 }
 
+func hasV7Tables(ctx context.Context, tx *sql.Tx) (bool, error) {
+	ok, err := hasV6Tables(ctx, tx)
+	if err != nil || !ok {
+		return ok, err
+	}
+	events, err := tableExists(ctx, tx, "task_events")
+	if err != nil || !events {
+		return false, err
+	}
+	return indexExists(ctx, tx, "idx_runs_one_running_per_task")
+}
+
 func tableExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
 	var found string
 	err := tx.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func indexExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
+	var found string
+	err := tx.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&found)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
