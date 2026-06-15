@@ -20,32 +20,50 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
 
+func submitPipeline(s *scheduler.Scheduler, taskID string, opts pipeline.RunOptions) (scheduler.SubmitResult, error) {
+	return s.Submit(context.Background(), scheduler.SubmitRequest{
+		TaskID: taskID,
+		Flow:   scheduler.FlowPipelineDirect,
+		Opts:   opts,
+	})
+}
+
+func submitInspection(s *scheduler.Scheduler, task model.Task, opts pipeline.RunOptions) (scheduler.SubmitResult, error) {
+	return s.Submit(context.Background(), scheduler.SubmitRequest{
+		TaskID:  task.ID,
+		Flow:    scheduler.FlowGitSyncThenPipeline,
+		BatchID: task.BatchID,
+		GitURL:  task.GitURL,
+		Opts:    opts,
+	})
+}
+
 func TestSubmitQueuesAndRejectsDuplicateTask(t *testing.T) {
 	s := newTestScheduler(t, time.Second, "TASK-1", "TASK-2")
 
-	firstJobID, err := s.Submit("TASK-1", pipeline.RunOptions{Stage: "A"})
+	firstJobID, err := submitPipeline(s, "TASK-1", pipeline.RunOptions{Stage: "A"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if firstJobID == "" {
+	if firstJobID.JobID == "" {
 		t.Fatal("job id should be returned")
 	}
-	secondJobID, err := s.Submit("TASK-2", pipeline.RunOptions{Stage: "A"})
+	secondJobID, err := submitPipeline(s, "TASK-2", pipeline.RunOptions{Stage: "A"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondJobID == "" {
+	if secondJobID.JobID == "" {
 		t.Fatal("queued job id should be returned")
 	}
-	if _, err := s.Submit("TASK-2", pipeline.RunOptions{}); err == nil || !strings.Contains(err.Error(), "already has an active job") {
+	if _, err := submitPipeline(s, "TASK-2", pipeline.RunOptions{}); err == nil || !strings.Contains(err.Error(), "already has an active job") {
 		t.Fatalf("duplicate active task should be rejected, got %v", err)
 	}
 
 	queued := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
 		return snapshot.TaskID == "TASK-2" && snapshot.State == scheduler.JobQueued
 	})
-	if queued.JobID != secondJobID {
-		t.Fatalf("queued snapshot job id = %s, want %s", queued.JobID, secondJobID)
+	if queued.JobID != secondJobID.JobID {
+		t.Fatalf("queued snapshot job id = %s, want %s", queued.JobID, secondJobID.JobID)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -62,7 +80,7 @@ func TestSubmitQueuesAndRejectsDuplicateTask(t *testing.T) {
 func TestSnapshotTracksRunProgressAndStageCompletion(t *testing.T) {
 	s := newTestScheduler(t, time.Second, "TASK-1")
 
-	if _, err := s.Submit("TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
+	if _, err := submitPipeline(s, "TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
 		t.Fatal(err)
 	}
 	running := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -93,13 +111,13 @@ func TestSnapshotTracksRunProgressAndStageCompletion(t *testing.T) {
 func TestCancelQueuedJobDoesNotReleaseRunningSlot(t *testing.T) {
 	s := newTestScheduler(t, 800*time.Millisecond, "TASK-1", "TASK-2", "TASK-3")
 
-	if _, err := s.Submit("TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
+	if _, err := submitPipeline(s, "TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
 		t.Fatal(err)
 	}
 	waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
 		return snapshot.TaskID == "TASK-1" && snapshot.State == scheduler.JobRunning
 	})
-	if _, err := s.Submit("TASK-2", pipeline.RunOptions{Stage: "A"}); err != nil {
+	if _, err := submitPipeline(s, "TASK-2", pipeline.RunOptions{Stage: "A"}); err != nil {
 		t.Fatal(err)
 	}
 	queued := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -114,7 +132,7 @@ func TestCancelQueuedJobDoesNotReleaseRunningSlot(t *testing.T) {
 	if cancelled.Err != scheduler.ErrJobCancelledByUser.Error() {
 		t.Fatalf("cancelled queued err = %q", cancelled.Err)
 	}
-	if _, err := s.Submit("TASK-3", pipeline.RunOptions{Stage: "A"}); err != nil {
+	if _, err := submitPipeline(s, "TASK-3", pipeline.RunOptions{Stage: "A"}); err != nil {
 		t.Fatal(err)
 	}
 	third := waitForSnapshot(t, s, 150*time.Millisecond, func(snapshot scheduler.JobSnapshot) bool {
@@ -131,7 +149,7 @@ func TestCancelQueuedJobDoesNotReleaseRunningSlot(t *testing.T) {
 func TestCancelRunningJobMarksUserCancelledAndKeepsPartialRun(t *testing.T) {
 	s := newTestScheduler(t, 3*time.Second, "TASK-1")
 
-	if _, err := s.Submit("TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
+	if _, err := submitPipeline(s, "TASK-1", pipeline.RunOptions{Stage: "A"}); err != nil {
 		t.Fatal(err)
 	}
 	running := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -190,7 +208,7 @@ func TestSchedulerUsesRunnerFactory(t *testing.T) {
 		_ = s.Shutdown(ctx)
 	})
 
-	if _, err := s.Submit("TASK-FACTORY", pipeline.RunOptions{}); err != nil {
+	if _, err := submitPipeline(s, "TASK-FACTORY", pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	done := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -206,6 +224,33 @@ func TestSchedulerUsesRunnerFactory(t *testing.T) {
 		}
 	default:
 		t.Fatal("factory runner was not called")
+	}
+}
+
+func TestSchedulerFailsWhenRunnerReturnsEmptyResultWithoutError(t *testing.T) {
+	cfg := config.Default()
+	factory := func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+		return fakePipelineRunner{
+			run: func(ctx context.Context, taskID string, opts pipeline.RunOptions) (pipeline.Result, error) {
+				return pipeline.Result{}, nil
+			},
+		}
+	}
+	s := scheduler.New(nil, cfg, scheduler.WithRunnerFactory(factory))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	})
+
+	if _, err := submitPipeline(s, "TASK-EMPTY", pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == "TASK-EMPTY" && snapshot.State == scheduler.JobFailed
+	})
+	if !strings.Contains(failed.Err, "produced no run record") {
+		t.Fatalf("empty result should fail loudly: %#v", failed)
 	}
 }
 
@@ -228,7 +273,7 @@ func TestSubmitInspectionRecordsGitFailureWithoutRunningPipeline(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+	if _, err := submitInspection(s, task, pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -278,7 +323,7 @@ func TestSubmitInspectionReleasesTaskOnInvalidDeliveryPackage(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+	if _, err := submitInspection(s, task, pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -326,7 +371,7 @@ func TestSubmitInspectionReleasesTaskWhenRemoteRepositoryMissing(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+	if _, err := submitInspection(s, task, pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -380,7 +425,7 @@ func TestSubmitInspectionRunsPipelineAfterGitSuccess(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+	if _, err := submitInspection(s, task, pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	gitDone := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -389,11 +434,17 @@ func TestSubmitInspectionRunsPipelineAfterGitSuccess(t *testing.T) {
 	if gitDone.SyncProgress.Phase != "done" || gitDone.RunID != "" {
 		t.Fatalf("done git sync snapshot = %#v", gitDone)
 	}
+	if gitDone.Flow != scheduler.FlowGitSyncThenPipeline || gitDone.FlowID == "" || gitDone.ParentJobID != "" {
+		t.Fatalf("git sync flow metadata = %#v", gitDone)
+	}
 	pipelineDone := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
 		return snapshot.TaskID == task.ID && snapshot.Kind == scheduler.JobPipeline && snapshot.State == scheduler.JobDone
 	})
 	if pipelineDone.RunID != "run-inspection" || stageStatus(pipelineDone.Stages, "A") != model.StageDone {
 		t.Fatalf("done pipeline snapshot = %#v", pipelineDone)
+	}
+	if pipelineDone.Flow != scheduler.FlowGitSyncThenPipeline || pipelineDone.FlowID != gitDone.FlowID || pipelineDone.ParentJobID != gitDone.JobID {
+		t.Fatalf("pipeline flow metadata = %#v, git = %#v", pipelineDone, gitDone)
 	}
 	select {
 	case got := <-pipelineCalled:
@@ -441,14 +492,14 @@ func TestSubmitInspectionKeepsTaskActiveBetweenGitAndPipeline(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err != nil {
+	if _, err := submitInspection(s, task, pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
 		return snapshot.TaskID == task.ID && snapshot.Kind == scheduler.JobGitSync && snapshot.State == scheduler.JobDone
 	})
 	<-pipelineStarted
-	if _, err := s.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{}); err == nil || !strings.Contains(err.Error(), "already has an active job") {
+	if _, err := submitInspection(s, task, pipeline.RunOptions{}); err == nil || !strings.Contains(err.Error(), "already has an active job") {
 		t.Fatalf("task should remain active while pipeline runs after git sync, got %v", err)
 	}
 }
@@ -495,7 +546,7 @@ func TestSchedulerBuffersAppendStreamInSnapshot(t *testing.T) {
 		_ = s.Shutdown(ctx)
 	})
 
-	if _, err := s.Submit("TASK-STREAM", pipeline.RunOptions{}); err != nil {
+	if _, err := submitPipeline(s, "TASK-STREAM", pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -553,7 +604,7 @@ func TestSchedulerCumulativeStreamDoesNotChangeStageState(t *testing.T) {
 		_ = s.Shutdown(ctx)
 	})
 
-	if _, err := s.Submit("TASK-CODEX", pipeline.RunOptions{}); err != nil {
+	if _, err := submitPipeline(s, "TASK-CODEX", pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
@@ -617,7 +668,7 @@ func TestSchedulerStreamProgressDoesNotNotifyPerDelta(t *testing.T) {
 		_ = s.Shutdown(ctx)
 	})
 
-	if _, err := s.Submit("TASK-NOTIFY", pipeline.RunOptions{}); err != nil {
+	if _, err := submitPipeline(s, "TASK-NOTIFY", pipeline.RunOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	<-ready
@@ -652,7 +703,7 @@ func TestActiveSnapshotDoesNotGrowWithHistoricalJobs(t *testing.T) {
 	})
 
 	for i := 0; i < 50; i++ {
-		if _, err := s.Submit(fmt.Sprintf("TASK-%02d", i), pipeline.RunOptions{}); err != nil {
+		if _, err := submitPipeline(s, fmt.Sprintf("TASK-%02d", i), pipeline.RunOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}

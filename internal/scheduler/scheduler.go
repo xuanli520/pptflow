@@ -33,10 +33,30 @@ const (
 type JobKind string
 
 const (
-	JobPipeline   JobKind = "pipeline"
-	JobGitSync    JobKind = "git_sync"
-	JobInspection JobKind = "inspection"
+	JobPipeline JobKind = "pipeline"
+	JobGitSync  JobKind = "git_sync"
 )
+
+type JobFlow string
+
+const (
+	FlowPipelineDirect      JobFlow = "pipeline_direct"
+	FlowGitSyncThenPipeline JobFlow = "git_sync_then_pipeline"
+	FlowGitSyncOnly         JobFlow = "git_sync_only"
+)
+
+type SubmitRequest struct {
+	TaskID  string
+	Flow    JobFlow
+	BatchID string
+	GitURL  string
+	Opts    pipeline.RunOptions
+}
+
+type SubmitResult struct {
+	FlowID string
+	JobID  string
+}
 
 func (s JobState) String() string {
 	switch s {
@@ -57,9 +77,12 @@ func (s JobState) String() string {
 
 type Job struct {
 	JobID         string
+	FlowID        string
+	ParentJobID   string
 	RunID         string
 	TaskID        string
 	Kind          JobKind
+	Flow          JobFlow
 	State         JobState
 	CurrentStage  string
 	Stages        []model.StageRecord
@@ -82,9 +105,12 @@ type Job struct {
 
 type JobSnapshot struct {
 	JobID         string
+	FlowID        string
+	ParentJobID   string
 	RunID         string
 	TaskID        string
 	Kind          JobKind
+	Flow          JobFlow
 	State         JobState
 	CurrentStage  string
 	Stages        []model.StageRecord
@@ -173,34 +199,62 @@ func defaultRunnerFactory(store *db.Store, cfg config.Config) PipelineRunner {
 	return pipeline.NewRunner(store, cfg)
 }
 
-func (s *Scheduler) Submit(taskID string, opts pipeline.RunOptions) (string, error) {
+func (s *Scheduler) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, error) {
 	if s == nil {
-		return "", errors.New("scheduler is nil")
+		return SubmitResult{}, errors.New("scheduler is nil")
 	}
-	taskID = strings.TrimSpace(taskID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	taskID := strings.TrimSpace(req.TaskID)
 	if taskID == "" {
-		return "", errors.New("task id is required")
+		return SubmitResult{}, errors.New("task id is required")
+	}
+	flow := req.Flow
+	if flow == "" {
+		flow = FlowPipelineDirect
+	}
+	kind := JobPipeline
+	switch flow {
+	case FlowPipelineDirect:
+	case FlowGitSyncThenPipeline, FlowGitSyncOnly:
+		kind = JobGitSync
+		req.BatchID = strings.TrimSpace(req.BatchID)
+		req.GitURL = strings.TrimSpace(req.GitURL)
+		if req.BatchID == "" {
+			return SubmitResult{}, errors.New("batch id is required")
+		}
+		if req.GitURL == "" {
+			return SubmitResult{}, errors.New("git url is required")
+		}
+	default:
+		return SubmitResult{}, fmt.Errorf("unknown job flow %q", flow)
 	}
 
 	var startNow bool
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return "", errors.New("scheduler is shut down")
+		return SubmitResult{}, errors.New("scheduler is shut down")
 	}
 	if existing := s.activeByTask[taskID]; existing != nil {
 		s.mu.Unlock()
-		return "", fmt.Errorf("task %s already has an active job %s", taskID, existing.JobID)
+		return SubmitResult{}, fmt.Errorf("task %s already has an active job %s", taskID, existing.JobID)
 	}
 	s.nextID++
-	jobID := fmt.Sprintf("job-%s-%06d", time.Now().UTC().Format("20060102-150405"), s.nextID)
+	now := time.Now().UTC()
+	jobID := fmt.Sprintf("job-%s-%06d", now.Format("20060102-150405"), s.nextID)
 	job := &Job{
 		JobID:       jobID,
+		FlowID:      jobID,
 		TaskID:      taskID,
-		Kind:        JobPipeline,
+		Kind:        kind,
+		Flow:        flow,
 		State:       JobQueued,
-		SubmittedAt: time.Now().UTC(),
-		opts:        opts,
+		SubmittedAt: now,
+		opts:        req.Opts,
+		batchID:     req.BatchID,
+		gitURL:      req.GitURL,
 	}
 	startNow = s.enqueueJobLocked(job)
 	s.mu.Unlock()
@@ -209,55 +263,7 @@ func (s *Scheduler) Submit(taskID string, opts pipeline.RunOptions) (string, err
 		s.startJob(job)
 	}
 	s.notify()
-	return jobID, nil
-}
-
-func (s *Scheduler) SubmitInspection(taskID, batchID, gitURL string, opts pipeline.RunOptions) (string, error) {
-	if s == nil {
-		return "", errors.New("scheduler is nil")
-	}
-	taskID = strings.TrimSpace(taskID)
-	batchID = strings.TrimSpace(batchID)
-	gitURL = strings.TrimSpace(gitURL)
-	if taskID == "" {
-		return "", errors.New("task id is required")
-	}
-	if batchID == "" {
-		return "", errors.New("batch id is required")
-	}
-	if gitURL == "" {
-		return "", errors.New("git url is required")
-	}
-
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return "", errors.New("scheduler is shut down")
-	}
-	if existing := s.activeByTask[taskID]; existing != nil {
-		s.mu.Unlock()
-		return "", fmt.Errorf("task %s already has an active job %s", taskID, existing.JobID)
-	}
-	s.nextID++
-	jobID := fmt.Sprintf("job-%s-%06d", time.Now().UTC().Format("20060102-150405"), s.nextID)
-	job := &Job{
-		JobID:       jobID,
-		TaskID:      taskID,
-		Kind:        JobGitSync,
-		State:       JobQueued,
-		SubmittedAt: time.Now().UTC(),
-		opts:        opts,
-		batchID:     batchID,
-		gitURL:      gitURL,
-	}
-	startNow := s.enqueueJobLocked(job)
-	s.mu.Unlock()
-
-	if startNow {
-		s.startJob(job)
-	}
-	s.notify()
-	return jobID, nil
+	return SubmitResult{FlowID: job.FlowID, JobID: jobID}, nil
 }
 
 func (s *Scheduler) enqueueJobLocked(job *Job) bool {
@@ -395,9 +401,12 @@ func snapshotJobs(jobs []*Job) []JobSnapshot {
 		job.mu.RLock()
 		snapshot := JobSnapshot{
 			JobID:           job.JobID,
+			FlowID:          job.FlowID,
+			ParentJobID:     job.ParentJobID,
 			RunID:           job.RunID,
 			TaskID:          job.TaskID,
 			Kind:            job.Kind,
+			Flow:            job.Flow,
 			State:           job.State,
 			CurrentStage:    job.CurrentStage,
 			Stages:          append([]model.StageRecord(nil), job.Stages...),
@@ -530,7 +539,7 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 		}
 	}()
 
-	if job.Kind == JobGitSync || job.Kind == JobInspection {
+	if job.Kind == JobGitSync {
 		if err := s.runGitSync(ctx, job); err != nil {
 			job.mu.Lock()
 			if job.cancelRequested || errors.Is(err, context.Canceled) {
@@ -558,9 +567,15 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 			job.CurrentStage = ""
 			job.FinishedAt = time.Now().UTC()
 			job.mu.Unlock()
+			if job.Flow == FlowGitSyncOnly {
+				s.notify()
+				return
+			}
 			if err := s.enqueuePipelineAfterGit(job); err != nil {
 				if s.store != nil {
-					_ = s.store.RecordTaskGitError(ctx, job.TaskID, err)
+					if recordErr := s.store.RecordTaskGitError(ctx, job.TaskID, err); recordErr != nil {
+						err = fmt.Errorf("%w; additionally failed to record scheduler error: %v", err, recordErr)
+					}
 				}
 				job.mu.Lock()
 				job.State = JobFailed
@@ -591,6 +606,11 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 		job.State = JobFailed
 		job.Err = err
 		job.FinishedAt = time.Now().UTC()
+	} else if strings.TrimSpace(result.Run.RunID) == "" {
+		job.State = JobFailed
+		job.Err = errors.New("pipeline returned no error but produced no run record")
+		job.CurrentStage = ""
+		job.FinishedAt = time.Now().UTC()
 	} else {
 		applyResultLocked(job, result)
 		job.State = JobDone
@@ -616,8 +636,11 @@ func (s *Scheduler) enqueuePipelineAfterGit(gitJob *Job) error {
 	jobID := fmt.Sprintf("job-%s-%06d", now.Format("20060102-150405"), s.nextID)
 	job := &Job{
 		JobID:       jobID,
+		FlowID:      gitJob.FlowID,
+		ParentJobID: gitJob.JobID,
 		TaskID:      gitJob.TaskID,
 		Kind:        JobPipeline,
+		Flow:        gitJob.Flow,
 		State:       JobQueued,
 		SubmittedAt: now,
 		opts:        gitJob.opts,
@@ -634,7 +657,9 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 		return errors.New("git syncer unavailable")
 	}
 	if s.store != nil {
-		_ = s.store.RecordTaskGitError(ctx, job.TaskID, nil)
+		if err := s.store.RecordTaskGitError(ctx, job.TaskID, nil); err != nil {
+			return fmt.Errorf("failed to clear git sync error for %s: %w", job.TaskID, err)
+		}
 	}
 	job.mu.Lock()
 	job.CurrentStage = "Git"
@@ -653,9 +678,13 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 	}
 	if s.store != nil {
 		if gitsync.IsTerminalSyncError(err) {
-			_ = s.store.RecordTaskTerminalGitError(ctx, job.TaskID, err)
+			if recordErr := s.store.RecordTaskTerminalGitError(ctx, job.TaskID, err); recordErr != nil {
+				err = fmt.Errorf("%w; additionally failed to record terminal git sync error: %v", err, recordErr)
+			}
 		} else {
-			_ = s.store.RecordTaskGitError(ctx, job.TaskID, err)
+			if recordErr := s.store.RecordTaskGitError(ctx, job.TaskID, err); recordErr != nil {
+				err = fmt.Errorf("%w; additionally failed to record git sync error: %v", err, recordErr)
+			}
 		}
 	}
 	job.mu.Lock()

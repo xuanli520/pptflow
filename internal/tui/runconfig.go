@@ -27,16 +27,8 @@ const (
 
 const runConfigFocusCount = int(runConfigFocusCancel) + 1
 
-type runConfigAction int
-
-const (
-	runConfigActionPipeline runConfigAction = iota
-	runConfigActionInspection
-)
-
 type runConfig struct {
 	active        bool
-	action        runConfigAction
 	focus         runConfigFocus
 	taskID        string
 	projectType   string
@@ -54,7 +46,7 @@ type runConfig struct {
 	err           string
 }
 
-func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, attachedCount int, action runConfigAction, configuredStages map[string][]string) runConfig {
+func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, attachedCount int, configuredStages map[string][]string) runConfig {
 	input := textinput.New()
 	input.Placeholder = "/absolute/path/to/doc.md"
 	input.Prompt = "路径: "
@@ -63,7 +55,6 @@ func newRunConfig(taskID, mode, refRun, selectedStage string, keepRuntime bool, 
 
 	cfg := runConfig{
 		active:        true,
-		action:        action,
 		focus:         runConfigFocusMode,
 		taskID:        taskID,
 		mode:          empty(mode, "initial"),
@@ -222,9 +213,6 @@ func (m *app) toggleRunConfigFocused() {
 }
 
 func (m *app) toggleRunConfigProjectType() {
-	if m.runConfig.action != runConfigActionInspection {
-		return
-	}
 	if m.runConfig.existingTask {
 		m.runConfig.projectType = nextExistingTaskProjectTypeReset(m.runConfig.projectType)
 		return
@@ -266,20 +254,15 @@ func (m *app) submitRunConfig() tea.Cmd {
 		return nil
 	}
 	m.runConfig.attachedCount = taskdocs.AvailableCount(m.cfg.ScanPath, m.runConfig.taskID)
-	if m.runConfig.action == runConfigActionInspection && strings.TrimSpace(strings.ToLower(m.runConfig.mode)) != "recheck" && m.runConfig.attachedCount < 1 {
+	if strings.TrimSpace(strings.ToLower(m.runConfig.mode)) != "recheck" && m.runConfig.attachedCount < 1 {
 		m.runConfig.err = taskdocs.InitialInspectionDocsRequiredMessage
 		return nil
 	}
 	opts := m.runConfig.toRunOptions(plan)
 	taskID := m.runConfig.taskID
-	var cmd tea.Cmd
-	if m.runConfig.action == runConfigActionInspection {
-		cmd = m.submitInspection(taskID, opts, m.runConfig.projectType)
-	} else {
-		cmd = m.submitRun(taskID, opts)
-	}
+	cmd := m.submitInspection(taskID, opts, m.runConfig.projectType)
 	m.runConfig = runConfig{}
-	m.message = "正在提交流水线 job..."
+	m.message = "正在提交质检 job..."
 	return cmd
 }
 

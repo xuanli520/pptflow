@@ -434,12 +434,10 @@ func renderRunConfig(m app) string {
 		stageText = "-"
 	}
 	lines = append(lines, mutedStyle.Render("将运行阶段: "+stageText))
-	if c.action == runConfigActionInspection {
-		if c.focus == runConfigFocusProjectType {
-			focusIndex = len(lines)
-		}
-		lines = append(lines, focusLine(c.focus == runConfigFocusProjectType, runConfigProjectTypeText(c)))
+	if c.focus == runConfigFocusProjectType {
+		focusIndex = len(lines)
 	}
+	lines = append(lines, focusLine(c.focus == runConfigFocusProjectType, runConfigProjectTypeText(c)))
 	lines = append(lines, "")
 	if c.focus == runConfigFocusSubmit {
 		focusIndex = len(lines)

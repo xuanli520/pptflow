@@ -93,6 +93,9 @@ func TestProjectOnlyRunCanPersistRuntimeStage(t *testing.T) {
 	if err := store.FinishRun(ctx, run.RunID, run.TaskID, model.RunCompletedClean, time.Second); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.FinishRun(ctx, run.RunID, run.TaskID, model.RunCompletedClean, time.Second); err == nil {
+		t.Fatal("expected second FinishRun on terminal project-only run to fail")
+	}
 	stages, err := store.Stages(ctx, run.RunID)
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +185,7 @@ func TestCreateRunMakesRunningRunLatest(t *testing.T) {
 	if err := store.UpsertProjects(ctx, []scanner.Project{{TaskID: "TASK-1", Batch: "b", Path: t.TempDir()}}); err != nil {
 		t.Fatal(err)
 	}
-	old := model.RunRecord{RunID: "run-old", TaskID: "TASK-1", StartedAt: "2026-04-30T00:00:00Z", Status: model.RunCompletedClean, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}
+	old := model.RunRecord{RunID: "run-old", TaskID: "TASK-1", StartedAt: "2026-04-30T00:00:00Z", Status: model.RunRunning, ManualVerdict: model.ManualUnset, ArtifactRoot: t.TempDir()}
 	if err := store.CreateRun(ctx, old); err != nil {
 		t.Fatal(err)
 	}

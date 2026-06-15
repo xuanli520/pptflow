@@ -3,6 +3,7 @@ package db_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -385,6 +386,266 @@ func TestTaskRunCASAndCompletionCountUnderConcurrency(t *testing.T) {
 	}
 	if task.State != model.TaskCompleted || task.CompletionCount != 1 {
 		t.Fatalf("completion count should increment once: %#v", task)
+	}
+}
+
+func TestCompleteTaskWithVerdictArchivesCompletedOverflow(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var firstTaskID string
+	for i := 0; i < db.CompletedTaskStateLimit+1; i++ {
+		taskID := fmt.Sprintf("TASK-20260521-A%05X", i)
+		if i == 0 {
+			firstTaskID = taskID
+		}
+		task, err := store.CreateTaskWithBatch(ctx, taskID, "https://gitlab.example/"+taskID, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		finishTaskRun(t, store, task.ID)
+		if _, err := store.CompleteTaskWithVerdict(ctx, task.ID, model.ManualPass); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	count, err := store.CountTasksByState(ctx, model.TaskCompleted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != db.CompletedTaskStateLimit {
+		t.Fatalf("visible completed count = %d, want %d", count, db.CompletedTaskStateLimit)
+	}
+	task, err := store.GetTask(ctx, firstTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ArchivedAt == "" {
+		t.Fatalf("oldest completed task should be archived: %#v", task)
+	}
+}
+
+func TestCreateRunRejectsWaitingManualTask(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-333333", "https://gitlab.example/TASK-20260521-333333", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishTaskRun(t, store, task.ID)
+
+	err = store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-waiting-manual",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "waiting for manual verdict") {
+		t.Fatalf("expected waiting manual CreateRun rejection, got %v", err)
+	}
+	if _, err := store.GetRun(ctx, "run-waiting-manual"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("rejected run should not be inserted, err=%v", err)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskWaitingManual || task.CurrentRunID != "" {
+		t.Fatalf("waiting task should remain unchanged: %#v", task)
+	}
+}
+
+func TestFinishRunRejectsMissingAndMismatchedRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-444444", "https://gitlab.example/TASK-20260521-444444", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-555555", "https://gitlab.example/TASK-20260521-555555", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-first",
+		TaskID:       first.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-second",
+		TaskID:       second.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.FinishRun(ctx, "run-missing", first.ID, model.RunCompletedClean, time.Second); err == nil {
+		t.Fatal("expected missing run finish to fail")
+	}
+	if err := store.FinishRun(ctx, "run-first", second.ID, model.RunCompletedClean, time.Second); err == nil {
+		t.Fatal("expected mismatched run/task finish to fail")
+	}
+	run, err := store.GetRun(ctx, "run-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != model.RunRunning {
+		t.Fatalf("mismatched finish should roll back run update, got %s", run.Status)
+	}
+	second, err = store.GetTask(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.CurrentRunID != "run-second" || second.State != model.TaskInspecting {
+		t.Fatalf("mismatched finish should leave other task active: %#v", second)
+	}
+}
+
+func TestFinishRunRejectsIdleTaskForOldRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-666666", "https://gitlab.example/TASK-20260521-666666", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-old-idle",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, "run-old-idle", task.ID, model.RunAborted, time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.FinishRun(ctx, "run-old-idle", task.ID, model.RunCompletedClean, time.Second); err == nil {
+		t.Fatal("expected old idle run finish to fail")
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskCompleted || task.CurrentRunID != "" {
+		t.Fatalf("old idle finish should not reopen task: %#v", task)
+	}
+	run, err := store.GetRun(ctx, "run-old-idle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != model.RunAborted {
+		t.Fatalf("old idle finish should roll back run update, got %s", run.Status)
+	}
+}
+
+func TestWaitingManualRuntimeUpdateRejectsCompletedTask(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-111111", "https://gitlab.example/TASK-20260521-111111", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishTaskRun(t, store, task.ID)
+	if _, err := store.CompleteTask(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	meta := model.ComposeMeta{Project: "p2r_stale", ComposeFiles: []string{"compose.yml"}, WorkDir: task.RepoPath}
+	if err := store.RecordWaitingManualTaskRuntime(ctx, task.ID, "http://localhost:3000", true, meta); err == nil {
+		t.Fatal("expected completed task runtime update to fail")
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskCompleted || task.DockerRunning || task.FrontendURL != "" || task.ComposeMeta.Project != "" {
+		t.Fatalf("completed task should not be marked running: %#v", task)
+	}
+}
+
+func TestStageRuntimeUpdateRejectsStaleTaskRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-222222", "https://gitlab.example/TASK-20260521-222222", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-stale",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishRun(ctx, "run-stale", task.ID, model.RunCompletedClean, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteTask(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-active",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stage := model.StageRecord{Stage: string(model.StageB), Status: model.StageDone}
+	meta := model.ComposeMeta{Project: "p2r_stale_stage", ComposeFiles: []string{"compose.yml"}, WorkDir: task.RepoPath}
+	if err := store.PutStageAndRecordTaskRuntime(ctx, "run-stale", stage, task.ID, "http://localhost:3000", true, meta); err == nil {
+		t.Fatal("expected stale run runtime update to fail")
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.CurrentRunID != "run-active" || task.DockerRunning || task.FrontendURL != "" || task.ComposeMeta.Project != "" {
+		t.Fatalf("stale run should not modify active task runtime: %#v", task)
+	}
+	stages, err := store.Stages(ctx, "run-stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range stages {
+		if got.Stage == string(model.StageB) {
+			t.Fatalf("stale runtime write should roll back stage upsert: %#v", stages)
+		}
 	}
 }
 

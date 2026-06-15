@@ -158,7 +158,7 @@ func (m app) handleTaskTypePromptKey(key string, cmds []tea.Cmd) (app, []tea.Cmd
 		taskID := m.taskTypePrompt.taskID
 		projectType := options[clamp(m.taskTypePrompt.index, 0, len(options)-1)].value
 		m.taskTypePrompt = taskTypePrompt{}
-		m.openRunConfigForTaskWithProjectType(taskID, runConfigActionInspection, projectType)
+		m.openRunConfigForTaskWithProjectType(taskID, projectType)
 	case "esc", "q":
 		m.taskTypePrompt = taskTypePrompt{}
 		m.message = "已取消新题质检"

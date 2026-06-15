@@ -15,10 +15,11 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 	tuiapp "github.com/xuanli520/p2r_tui/internal/tui"
 )
 
-func TestStartInspectionRecordsSyncErrorWhenSubmitFails(t *testing.T) {
+func TestStartInspectionDoesNotRecordSyncErrorWhenSubmitFails(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()
 	cfg.ScanPath = t.TempDir()
@@ -41,8 +42,8 @@ func TestStartInspectionRecordsSyncErrorWhenSubmitFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.State != model.TaskInspecting || task.CurrentRunID != "" || !strings.Contains(task.SyncError, "scheduler down") {
-		t.Fatalf("failed submit should leave retryable inspecting task with sync error: %#v", task)
+	if task.State != model.TaskInspecting || task.CurrentRunID != "" || strings.TrimSpace(task.SyncError) != "" {
+		t.Fatalf("scheduler submit failure should not be recorded as git sync error: %#v", task)
 	}
 }
 
@@ -380,10 +381,12 @@ type failingInspectionScheduler struct {
 	err    error
 	calls  int
 	gitURL string
+	flow   scheduler.JobFlow
 }
 
-func (s *failingInspectionScheduler) SubmitInspection(taskID, batchID, gitURL string, opts pipeline.RunOptions) (string, error) {
+func (s *failingInspectionScheduler) Submit(ctx context.Context, req scheduler.SubmitRequest) (scheduler.SubmitResult, error) {
 	s.calls++
-	s.gitURL = gitURL
-	return "job-test", s.err
+	s.gitURL = req.GitURL
+	s.flow = req.Flow
+	return scheduler.SubmitResult{FlowID: "flow-test", JobID: "job-test"}, s.err
 }

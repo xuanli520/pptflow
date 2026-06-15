@@ -55,6 +55,9 @@ func newRunCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if result.Run.RunID == "" {
+				return fmt.Errorf("pipeline returned no error but produced no run record")
+			}
 			fmt.Printf("[run] task=%s run_id=%s\n", result.Run.TaskID, result.Run.RunID)
 			for _, item := range result.Stages {
 				fmt.Printf("[%s] %-36s %s", item.Stage, item.Name, item.Status)

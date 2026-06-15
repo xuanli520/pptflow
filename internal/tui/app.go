@@ -20,6 +20,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
+	"github.com/xuanli520/p2r_tui/internal/tasklifecycle"
 )
 
 const (
@@ -41,7 +42,7 @@ type app struct {
 	recoverStaleRunsFn func(context.Context) error
 	recoverOrphanRunFn func(context.Context, string) (pipeline.RecoveryResult, error)
 	taskQuerySvc       TaskQueryService
-	taskActionSvc      TaskActionService
+	lifecycle          *tasklifecycle.Manager
 	poller             *schedulerPoller
 
 	router                   *pageRouter
@@ -144,9 +145,8 @@ type orphanRunRecoveryMsg struct {
 	err    error
 }
 
-type taskActionMsg struct {
-	action string
-	taskID string
+type taskLifecycleMsg struct {
+	result tasklifecycle.Result
 	err    error
 }
 
@@ -184,7 +184,7 @@ type appStore interface {
 }
 
 type schedulerClient interface {
-	Submit(string, pipeline.RunOptions) (string, error)
+	Submit(context.Context, scheduler.SubmitRequest) (scheduler.SubmitResult, error)
 	CancelTask(string) error
 	ActiveSnapshot() []scheduler.JobSnapshot
 	NotifyCh() <-chan struct{}
@@ -332,7 +332,7 @@ func newApp(store *db.Store, cfg config.Config) app {
 			return result, errors.Join(recoverErr, repairErr)
 		}
 		m.taskQuerySvc = newTaskQueryService(store, cfg)
-		m.taskActionSvc = newTaskActionService(store, cfg, m.scheduler)
+		m.lifecycle = tasklifecycle.NewManager(store, cfg, m.scheduler)
 	}
 	taskBoard := newTaskBoardModel(m.taskQuerySvc)
 	m.taskBoard = &taskBoard
@@ -439,26 +439,24 @@ func (m *app) handleTaskMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.taskInput.Blur()
 		m.setFocus(focusTaskBoard)
 		if existingTask {
-			m.openRunConfigForTask(value.TaskID, runConfigActionInspection)
+			m.openRunConfigForTask(value.TaskID)
 		} else {
 			m.openTaskTypePrompt(value.TaskID)
 		}
 		return true
-	case taskActionMsg:
+	case taskLifecycleMsg:
 		if value.err != nil {
 			m.message = value.err.Error()
 		} else {
-			switch value.action {
-			case "complete":
-				m.message = "已确认完成 " + value.taskID
-			case "reinspect":
-				m.message = "已提交重新质检 " + value.taskID
-			case "retry-git":
-				m.message = "已重试 Git 同步 " + value.taskID
-			case "start-docker":
-				m.message = "已启动待处理服务 " + value.taskID
+			switch value.result.Kind {
+			case tasklifecycle.CommandCompleteManual:
+				m.message = "已确认完成 " + value.result.TaskID
+			case tasklifecycle.CommandRetryGitSync:
+				m.message = "已重试 Git 同步 " + value.result.TaskID
+			case tasklifecycle.CommandStartDocker:
+				m.message = "已启动待处理服务 " + value.result.TaskID
 			default:
-				m.message = "已提交质检 " + value.taskID
+				m.message = "已提交质检 " + value.result.TaskID
 			}
 		}
 		*cmds = append(*cmds, m.taskBoard.Reload(), m.reloadOverview(), m.reloadSchedulerJobs())
@@ -506,19 +504,46 @@ func (m app) taskInputExistingTask(taskID string) (bool, error) {
 }
 
 func (m app) lookupTaskProject(taskID string) (*TaskProject, error) {
+	taskID = strings.TrimSpace(taskID)
 	if m.taskQuerySvc == nil {
-		return nil, nil
+		return m.lookupOverviewTaskProject(taskID), nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	project, err := m.taskQuerySvc.GetByID(ctx, strings.TrimSpace(taskID))
+	project, err := m.taskQuerySvc.GetByID(ctx, taskID)
 	if err == nil {
+		if project == nil {
+			return m.lookupOverviewTaskProject(taskID), nil
+		}
 		return project, nil
 	}
 	if isTaskNotFound(err) {
-		return nil, nil
+		return m.lookupOverviewTaskProject(taskID), nil
 	}
 	return nil, err
+}
+
+func (m app) lookupOverviewTaskProject(taskID string) *TaskProject {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" || m.overview == nil {
+		return nil
+	}
+	for _, item := range m.overview.items {
+		if item.TaskID == taskID && item.HasTask {
+			return &TaskProject{
+				ID:            item.TaskID,
+				TaskState:     item.TaskState,
+				LastRunID:     item.LastRunID,
+				RunStatus:     item.RunStatus,
+				ManualVerdict: item.ManualVerdict,
+				FailedStage:   item.FailedStage,
+				Blocking:      item.Blocking,
+				High:          item.High,
+				Mode:          item.Mode,
+			}
+		}
+	}
+	return nil
 }
 
 func (m *app) handleOverviewMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
@@ -899,12 +924,7 @@ func (m app) recoverOrphanRunCmd(taskID string) tea.Cmd {
 }
 
 func (m app) recoverOrphanInspectionCmd() tea.Cmd {
-	store, ok := m.store.(taskStateStore)
-	if !ok || store == nil || m.scheduler == nil || m.taskQuerySvc == nil {
-		return nil
-	}
-	submitter, ok := m.scheduler.(inspectionScheduler)
-	if !ok || submitter == nil {
+	if m.lifecycle == nil || m.taskQuerySvc == nil {
 		return nil
 	}
 	return func() tea.Msg {
@@ -916,10 +936,13 @@ func (m app) recoverOrphanInspectionCmd() tea.Cmd {
 		}
 		var failures []string
 		for _, task := range tasks {
-			_, err := submitter.SubmitInspection(task.ID, task.BatchID, task.GitURL, pipeline.RunOptions{DeferRuntimeCleanup: true})
+			_, err := m.lifecycle.Execute(ctx, tasklifecycle.Command{
+				Kind:       tasklifecycle.CommandSubmitInspection,
+				TaskID:     task.ID,
+				RunOptions: pipeline.RunOptions{DeferRuntimeCleanup: true},
+			})
 			if err != nil {
 				failures = append(failures, task.ID+": "+err.Error())
-				_ = store.RecordTaskGitError(ctx, task.ID, err)
 			}
 		}
 		if len(failures) > 0 {
@@ -957,57 +980,42 @@ func (m app) tick() tea.Cmd {
 	})
 }
 
-func (m app) submitRun(taskID string, opts pipeline.RunOptions) tea.Cmd {
-	return func() tea.Msg {
-		if m.scheduler == nil {
-			return runSubmitMsg{err: fmt.Errorf("scheduler unavailable")}
-		}
-		jobID, err := m.scheduler.Submit(taskID, opts)
-		return runSubmitMsg{jobID: jobID, err: err}
-	}
-}
-
 func (m app) submitInspection(taskID string, opts pipeline.RunOptions, projectType string) tea.Cmd {
-	return func() tea.Msg {
-		if m.taskActionSvc == nil {
-			return taskActionMsg{action: "inspect", taskID: taskID, err: fmt.Errorf("task service unavailable")}
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		err := m.taskActionSvc.SubmitInspectionForProjectType(ctx, taskID, projectType, opts)
-		return taskActionMsg{action: "inspect", taskID: taskID, err: err}
-	}
+	return m.taskLifecycleCmd(tasklifecycle.Command{
+		Kind:        tasklifecycle.CommandSubmitInspection,
+		TaskID:      taskID,
+		ProjectType: projectType,
+		RunOptions:  opts,
+	}, 10*time.Second)
 }
 
-func (m app) taskActionCmd(action, taskID string) tea.Cmd {
-	return m.taskActionCmdWithVerdict(action, taskID, "")
+func (m app) retryGitSyncCmd(taskID string) tea.Cmd {
+	return m.taskLifecycleCmd(tasklifecycle.Command{Kind: tasklifecycle.CommandRetryGitSync, TaskID: taskID}, 10*time.Second)
 }
 
-func (m app) taskActionCmdWithVerdict(action, taskID, verdict string) tea.Cmd {
+func (m app) startDockerCmd(taskID string) tea.Cmd {
+	return m.taskLifecycleCmd(tasklifecycle.Command{Kind: tasklifecycle.CommandStartDocker, TaskID: taskID}, 5*time.Minute)
+}
+
+func (m app) completeManualCmd(taskID, verdict string) tea.Cmd {
+	return m.taskLifecycleCmd(tasklifecycle.Command{Kind: tasklifecycle.CommandCompleteManual, TaskID: taskID, Verdict: verdict}, 5*time.Minute)
+}
+
+func (m app) taskLifecycleCmd(command tasklifecycle.Command, timeout time.Duration) tea.Cmd {
 	return func() tea.Msg {
-		if m.taskActionSvc == nil {
-			return taskActionMsg{action: action, taskID: taskID, err: fmt.Errorf("task service unavailable")}
-		}
-		timeout := 10 * time.Second
-		if action == "complete" || action == "start-docker" {
-			timeout = 5 * time.Minute
+		if m.lifecycle == nil {
+			return taskLifecycleMsg{result: tasklifecycle.Result{Kind: command.Kind, TaskID: command.TaskID}, err: fmt.Errorf("task lifecycle service unavailable")}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		var err error
-		switch action {
-		case "complete":
-			err = m.taskActionSvc.ConfirmComplete(ctx, taskID, verdict)
-		case "reinspect":
-			err = m.taskActionSvc.ReInspect(ctx, taskID, pipeline.RunOptions{})
-		case "retry-git":
-			err = m.taskActionSvc.RetryGitSync(ctx, taskID)
-		case "start-docker":
-			err = m.taskActionSvc.StartDocker(ctx, taskID)
-		default:
-			err = m.taskActionSvc.StartInspection(ctx, taskID, pipeline.RunOptions{})
+		result, err := m.lifecycle.Execute(ctx, command)
+		if result.TaskID == "" {
+			result.TaskID = command.TaskID
 		}
-		return taskActionMsg{action: action, taskID: taskID, err: err}
+		if result.Kind == "" {
+			result.Kind = command.Kind
+		}
+		return taskLifecycleMsg{result: result, err: err}
 	}
 }
 

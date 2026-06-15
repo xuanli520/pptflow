@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scheduler"
+	"github.com/xuanli520/p2r_tui/internal/tasklifecycle"
 )
 
 // TestHarness exposes narrow state-machine probes for the external tests under
@@ -212,8 +214,9 @@ func RefreshDockerHealthForTest(ctx context.Context, store *db.Store, cfg config
 }
 
 func ConfirmCompleteForTest(ctx context.Context, store *db.Store, cfg config.Config, exec executor.CommandRunner, taskID string) error {
-	service := dbTaskActionService{store: store, cfg: cfg, exec: exec}
-	return service.ConfirmComplete(ctx, taskID, model.ManualPass)
+	manager := tasklifecycle.NewManager(store, cfg, nil, tasklifecycle.WithExecutor(exec))
+	_, err := manager.Execute(ctx, tasklifecycle.Command{Kind: tasklifecycle.CommandCompleteManual, TaskID: taskID, Verdict: model.ManualPass})
+	return err
 }
 
 func FindStaleInspectingForTest(ctx context.Context, store *db.Store, cfg config.Config) ([]TaskProject, error) {
@@ -225,22 +228,25 @@ func FindStaleInspectingForTest(ctx context.Context, store *db.Store, cfg config
 }
 
 type InspectionSchedulerForTest interface {
-	SubmitInspection(string, string, string, pipeline.RunOptions) (string, error)
+	Submit(context.Context, scheduler.SubmitRequest) (scheduler.SubmitResult, error)
 }
 
-func StartInspectionForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID string) error {
-	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
-	return service.StartInspection(ctx, taskID, pipeline.RunOptions{})
+func StartInspectionForTest(ctx context.Context, store *db.Store, cfg config.Config, submitter InspectionSchedulerForTest, taskID string) error {
+	manager := tasklifecycle.NewManager(store, cfg, submitter)
+	_, err := manager.Execute(ctx, tasklifecycle.Command{Kind: tasklifecycle.CommandSubmitInspection, TaskID: taskID})
+	return err
 }
 
-func StartInspectionForProjectTypeForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID, projectType string) error {
-	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
-	return service.StartInspectionForProjectType(ctx, taskID, projectType, pipeline.RunOptions{})
+func StartInspectionForProjectTypeForTest(ctx context.Context, store *db.Store, cfg config.Config, submitter InspectionSchedulerForTest, taskID, projectType string) error {
+	manager := tasklifecycle.NewManager(store, cfg, submitter)
+	_, err := manager.Execute(ctx, tasklifecycle.Command{Kind: tasklifecycle.CommandSubmitInspection, TaskID: taskID, ProjectType: projectType})
+	return err
 }
 
-func SubmitInspectionForProjectTypeForTest(ctx context.Context, store *db.Store, cfg config.Config, scheduler InspectionSchedulerForTest, taskID, projectType string, opts pipeline.RunOptions) error {
-	service := dbTaskActionService{store: store, cfg: cfg, scheduler: scheduler}
-	return service.SubmitInspectionForProjectType(ctx, taskID, projectType, opts)
+func SubmitInspectionForProjectTypeForTest(ctx context.Context, store *db.Store, cfg config.Config, submitter InspectionSchedulerForTest, taskID, projectType string, opts pipeline.RunOptions) error {
+	manager := tasklifecycle.NewManager(store, cfg, submitter)
+	_, err := manager.Execute(ctx, tasklifecycle.Command{Kind: tasklifecycle.CommandSubmitInspection, TaskID: taskID, ProjectType: projectType, RunOptions: opts})
+	return err
 }
 
 func ForceExitCleanupForTest(ctx context.Context, cfg config.Config, exec executor.CommandRunner, tasks []TaskProject) error {
@@ -253,7 +259,7 @@ func ForceExitCleanupStoppedForTest(ctx context.Context, cfg config.Config, exec
 }
 
 func CleanupCheckpointPathForTest(scanPath string) string {
-	return cleanupCheckpointPath(scanPath)
+	return filepath.Join(scanPath, ".qa-control", "cleanup_checkpoint.json")
 }
 
 func TaskCardForTest(task TaskProject, width int, now time.Time) string {
@@ -350,7 +356,12 @@ func (h TestHarness) SetSize(width, height int) TestHarness {
 func (h TestHarness) SeedOverview(taskIDs ...string) TestHarness {
 	h.model.overview.items = nil
 	for _, taskID := range taskIDs {
-		item := overviewItem{TaskID: taskID, RunStatus: model.RunCompletedClean}
+		item := overviewItem{
+			TaskID:    taskID,
+			RunStatus: model.RunCompletedClean,
+			HasTask:   true,
+			TaskState: model.TaskCompleted,
+		}
 		item.SearchText = overviewSearchText(item)
 		h.model.overview.items = append(h.model.overview.items, item)
 	}
@@ -584,7 +595,7 @@ func (h TestHarness) StartupDockerCleanupConfirm() bool {
 }
 
 func (h TestHarness) Running() bool {
-	if h.model.message == "正在提交流水线 job..." {
+	if h.model.message == "正在提交流水线 job..." || h.model.message == "正在提交质检 job..." {
 		return true
 	}
 	for _, job := range activeJobSnapshots(h.model.activeJobs) {
@@ -792,7 +803,7 @@ func StagePlanWithOptionsForTest(mode, stage string, staticOnly bool, selected [
 func FooterForTest(focus string, confirm bool) string {
 	m := newApp(nil, config.Default())
 	if confirm {
-		m.runConfig = newRunConfig("TASK-1", "initial", "", "A", false, 0, runConfigActionPipeline, nil)
+		m.runConfig = newRunConfig("TASK-1", "initial", "", "A", false, 0, nil)
 	}
 	m.setFocus(testFocusArea(focus))
 	return footerFor(m)

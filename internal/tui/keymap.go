@@ -219,7 +219,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		if m.tab == panelTaskBoard {
 			if task, ok := m.taskBoard.SelectedTask(); ok && canRetryGitSyncTask(task) {
 				m.message = "正在重试 Git 同步 " + task.ID
-				return m, append(cmds, m.taskActionCmd("retry-git", task.ID))
+				return m, append(cmds, m.retryGitSyncCmd(task.ID))
 			}
 			m.message = "请选择 Git 同步失败的题目"
 			return m, cmds
@@ -232,7 +232,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 					return m, cmds
 				}
 				m.message = "正在启动待处理服务 " + task.ID
-				return m, append(cmds, m.taskActionCmd("start-docker", task.ID))
+				return m, append(cmds, m.startDockerCmd(task.ID))
 			}
 			m.message = "请选择待处理题目"
 			return m, cmds
@@ -243,29 +243,7 @@ func (m app) handleKey(msg tea.KeyMsg) (app, []tea.Cmd) {
 		}
 		return m, cmds
 	case "ctrl+r":
-		if m.focus == focusTaskInput && m.openRunConfigForTaskInput() {
-			return m, cmds
-		}
-		if m.tab == panelTaskBoard {
-			if task, ok := m.taskBoard.SelectedTask(); ok && canOpenInspectionRunConfig(task.TaskState) {
-				m.openRunConfigForTask(task.ID, runConfigActionInspection)
-				return m, cmds
-			}
-			m.message = "请选择可重跑质检任务"
-			return m, cmds
-		}
-		if m.tab == panelOverview {
-			if item, ok := m.overview.SelectedItem(); ok && item.HasTask {
-				if canOpenInspectionRunConfig(item.TaskState) {
-					m.openRunConfigForTask(item.TaskID, runConfigActionInspection)
-					return m, cmds
-				}
-				m.message = "请选择可重跑质检任务"
-				return m, cmds
-			}
-		}
-		m.openRunConfigForSelected(runConfigActionPipeline)
-		return m, cmds
+		return m.openInspectionRunConfigForCurrentContext(cmds)
 	case "tab":
 		m.switchPanel(1)
 		m.detailFollowTail = true
@@ -427,6 +405,67 @@ func canRetryGitSyncTask(task TaskProject) bool {
 
 func canOpenInspectionRunConfig(state string) bool {
 	return state != model.TaskInspecting && state != model.TaskWaitingManual
+}
+
+func (m app) openInspectionRunConfigForCurrentContext(cmds []tea.Cmd) (app, []tea.Cmd) {
+	if m.focus == focusTaskInput {
+		m.openInspectionFlowForTaskInput()
+		return m, cmds
+	}
+	switch m.tab {
+	case panelTaskBoard:
+		task, ok := m.taskBoard.SelectedTask()
+		if !ok {
+			m.message = "请选择可重跑质检任务"
+			return m, cmds
+		}
+		if !canOpenInspectionRunConfig(task.TaskState) {
+			m.message = "请选择可重跑质检任务"
+			return m, cmds
+		}
+		m.openRunConfigForTask(task.ID)
+		return m, cmds
+	case panelOverview:
+		item, ok := m.overview.SelectedItem()
+		if !ok {
+			m.message = "请选择一个已创建任务"
+			return m, cmds
+		}
+		if !item.HasTask {
+			m.message = "该项目尚未创建任务，请从任务输入框开始质检"
+			return m, cmds
+		}
+		if !canOpenInspectionRunConfig(item.TaskState) {
+			m.message = "请选择可重跑质检任务"
+			return m, cmds
+		}
+		m.openRunConfigForTask(item.TaskID)
+		return m, cmds
+	case panelExecution:
+		taskID := m.selectedTaskID()
+		if strings.TrimSpace(taskID) == "" {
+			m.message = "当前执行详情没有选中的任务"
+			return m, cmds
+		}
+		project, err := m.lookupTaskProject(taskID)
+		if err != nil {
+			m.message = err.Error()
+			return m, cmds
+		}
+		if project == nil {
+			m.message = "当前执行详情没有已创建任务"
+			return m, cmds
+		}
+		if !canOpenInspectionRunConfig(project.TaskState) {
+			m.message = "请选择可重跑质检任务"
+			return m, cmds
+		}
+		m.openRunConfigForTask(taskID)
+		return m, cmds
+	default:
+		m.message = "当前页面不支持重跑"
+		return m, cmds
+	}
 }
 
 func (m *app) switchPanel(delta int) {
@@ -595,7 +634,7 @@ func (m app) handleVerdictPromptKey(key string, cmds []tea.Cmd) (app, []tea.Cmd)
 		verdict := manualVerdictOptions()[m.verdictPrompt.index].value
 		m.verdictPrompt = verdictPrompt{}
 		m.message = "正在结束质检 " + taskID + "，判定: " + localizeManualVerdict(verdict)
-		return m, append(cmds, m.taskActionCmdWithVerdict("complete", taskID, verdict))
+		return m, append(cmds, m.completeManualCmd(taskID, verdict))
 	case "esc", "q":
 		m.verdictPrompt = verdictPrompt{}
 		m.message = "已取消结束质检"
@@ -628,18 +667,18 @@ func verdictIndex(verdict string) int {
 }
 
 func (m *app) openRunConfig() {
-	m.openRunConfigForSelected(runConfigActionPipeline)
+	m.openRunConfigForSelected()
 }
 
-func (m *app) openRunConfigForSelected(action runConfigAction) {
-	m.openRunConfigForTask(m.selectedTaskID(), action)
+func (m *app) openRunConfigForSelected() {
+	m.openRunConfigForTask(m.selectedTaskID())
 }
 
-func (m *app) openRunConfigForTask(taskID string, action runConfigAction) {
-	m.openRunConfigForTaskWithProjectType(taskID, action, "")
+func (m *app) openRunConfigForTask(taskID string) {
+	m.openRunConfigForTaskWithProjectType(taskID, "")
 }
 
-func (m *app) openRunConfigForTaskWithProjectType(taskID string, action runConfigAction, projectType string) {
+func (m *app) openRunConfigForTaskWithProjectType(taskID string, projectType string) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
 		return
@@ -657,17 +696,15 @@ func (m *app) openRunConfigForTaskWithProjectType(taskID string, action runConfi
 		return
 	}
 	availableDocs := taskdocs.AvailableCount(m.cfg.ScanPath, taskID)
-	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, availableDocs, action, m.cfg.Pipeline.DefaultStages)
-	if action == runConfigActionInspection {
-		if project, err := m.lookupTaskProject(taskID); err == nil && project != nil {
-			m.runConfig.existingTask = true
-			m.runConfig.currentType = taskTypeFromGitURL(m.cfg.Git, project.GitURL)
-		}
+	m.runConfig = newRunConfig(taskID, m.qaMode, m.selectedRefRun(), m.rerunStageKey(), m.cfg.Docker.KeepRuntime, availableDocs, m.cfg.Pipeline.DefaultStages)
+	if project, err := m.lookupTaskProject(taskID); err == nil && project != nil {
+		m.runConfig.existingTask = true
+		m.runConfig.currentType = taskTypeFromGitURL(m.cfg.Git, project.GitURL)
 	}
 	m.runConfig.projectType = config.NormalizeProjectType(projectType)
 }
 
-func (m *app) openRunConfigForTaskInput() bool {
+func (m *app) openInspectionFlowForTaskInput() bool {
 	if m.taskInput == nil {
 		return false
 	}
@@ -682,7 +719,20 @@ func (m *app) openRunConfigForTaskInput() bool {
 	m.focusManager.Pop()
 	m.taskInputFocusCaptured = false
 	m.setFocus(focusTaskBoard)
-	m.openRunConfigForTask(taskID, runConfigActionInspection)
+	existingTask, err := m.taskInputExistingTask(taskID)
+	if err != nil {
+		m.message = err.Error()
+		m.taskInput.SetValue(taskID)
+		m.taskInput.SetError(err.Error())
+		m.taskInput.Focus()
+		m.setFocus(focusTaskInput)
+		return true
+	}
+	if existingTask {
+		m.openRunConfigForTask(taskID)
+		return true
+	}
+	m.openTaskTypePrompt(taskID)
 	return true
 }
 

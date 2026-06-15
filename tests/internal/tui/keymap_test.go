@@ -224,7 +224,11 @@ func TestSearchMatchesLocalizedStatus(t *testing.T) {
 }
 
 func TestCtrlROpensConfirmAndConfirmKeys(t *testing.T) {
-	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1").SetFocus("overview-table")
+	cfg := config.Default()
+	cfg.ScanPath = t.TempDir()
+	taskID := "TASK-20260521-ABCDEF"
+	writeTUIDropboxDoc(t, cfg.ScanPath, taskID)
+	h := tuiapp.NewTestHarness(cfg).SeedOverview(taskID).SetFocus("overview-table")
 
 	next, _ := h.Press("ctrl+r")
 	if !next.Confirm() {
@@ -269,8 +273,8 @@ func TestTaskInputCtrlROpensRunConfigForTypedTaskID(t *testing.T) {
 	h, _ = h.Press("TASK-20260521-ABCDEF")
 
 	next, result := h.Press("ctrl+r")
-	if !next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.View(), "运行配置: TASK-20260521-ABCDEF") {
-		t.Fatalf("typed task Ctrl+R should open run config, confirm=%v cmds=%d message=%q\n%s", next.Confirm(), result.CmdCount, next.Message(), next.View())
+	if !next.TaskTypePrompt() || next.Confirm() || result.CmdCount != 0 || !strings.Contains(next.View(), "确认题型 TASK-20260521-ABCDEF") {
+		t.Fatalf("typed new task Ctrl+R should open task type prompt, prompt=%v confirm=%v cmds=%d message=%q\n%s", next.TaskTypePrompt(), next.Confirm(), result.CmdCount, next.Message(), next.View())
 	}
 }
 

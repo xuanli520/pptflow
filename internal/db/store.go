@@ -368,6 +368,13 @@ func (s *Store) RecordTaskRuntime(ctx context.Context, taskID string, frontendUR
 	})
 }
 
+func (s *Store) RecordWaitingManualTaskRuntime(ctx context.Context, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return recordTaskRuntimeForWaitingManualTx(ctx, tx, taskID, frontendURL, dockerRunning, meta, now)
+	})
+}
+
 func (s *Store) MarkTaskDockerStopped(ctx context.Context, taskID string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
@@ -383,24 +390,53 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string) (model.Task, er
 	now := time.Now().UTC().Format(time.RFC3339)
 	var task model.Task
 	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `UPDATE tasks
-			SET state = ?, current_run_id = NULL, docker_running = 0, completion_count = completion_count + 1,
-			    last_completed_at = ?, updated_at = ?
-			WHERE id = ? AND state = ?`,
-			model.TaskCompleted, now, now, taskID, model.TaskWaitingManual)
-		if err != nil {
-			return err
-		}
-		if err := requireAffected(result, "waiting task", taskID); err != nil {
-			return err
-		}
-		if err := archiveCompletedOverflowTx(ctx, tx, now); err != nil {
-			return err
-		}
-		task, err = getTaskTx(ctx, tx, taskID)
+		var err error
+		task, err = completeWaitingTaskTx(ctx, tx, taskID, now)
 		return err
 	})
 	return task, err
+}
+
+func (s *Store) CompleteTaskWithVerdict(ctx context.Context, taskID, verdict string) (model.Task, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	var task model.Task
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE runs
+			SET manual_verdict = ?
+			WHERE run_id = (
+				SELECT run_id FROM runs
+				WHERE task_id = ?
+				ORDER BY COALESCE(started_at, '') DESC, run_id DESC
+				LIMIT 1
+			)`, verdict, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(result, "latest run", taskID); err != nil {
+			return err
+		}
+		task, err = completeWaitingTaskTx(ctx, tx, taskID, now)
+		return err
+	})
+	return task, err
+}
+
+func completeWaitingTaskTx(ctx context.Context, tx *sql.Tx, taskID, now string) (model.Task, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE tasks
+		SET state = ?, current_run_id = NULL, docker_running = 0, completion_count = completion_count + 1,
+		    frontend_url = '', compose_meta = '', entered_waiting_at = '', last_completed_at = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		model.TaskCompleted, now, now, taskID, model.TaskWaitingManual)
+	if err != nil {
+		return model.Task{}, err
+	}
+	if err := requireAffected(result, "waiting task", taskID); err != nil {
+		return model.Task{}, err
+	}
+	if err := archiveCompletedOverflowTx(ctx, tx, now); err != nil {
+		return model.Task{}, err
+	}
+	return getTaskTx(ctx, tx, taskID)
 }
 
 func (s *Store) RepairTaskStates(ctx context.Context) error {
@@ -992,10 +1028,16 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 			if err := tx.QueryRowContext(ctx, `SELECT state, completion_count + 1 FROM tasks WHERE id = ?`, run.TaskID).Scan(&state, &round); err != nil {
 				return err
 			}
-			if state != model.TaskInspecting {
+			switch state {
+			case model.TaskInspecting:
+			case model.TaskCompleted:
 				if err := requireInspectingCapacityTx(ctx, tx); err != nil {
 					return err
 				}
+			case model.TaskWaitingManual:
+				return fmt.Errorf("task %s is waiting for manual verdict", run.TaskID)
+			default:
+				return fmt.Errorf("task %s has invalid state %q", run.TaskID, state)
 			}
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id, task_id, started_at, status, manual_verdict, static_only, duration_ms, artifact_root, tool_versions, prompt_versions, completion_round)
@@ -1028,9 +1070,12 @@ func (s *Store) CreateRun(ctx context.Context, run model.RunRecord) error {
 func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, duration time.Duration) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE runs SET finished_at = ?, status = ?, duration_ms = ? WHERE run_id = ?`,
-			now, status, duration.Milliseconds(), runID)
+		result, err := tx.ExecContext(ctx, `UPDATE runs SET finished_at = ?, status = ?, duration_ms = ? WHERE run_id = ? AND task_id = ? AND status = ?`,
+			now, status, duration.Milliseconds(), runID, taskID, model.RunRunning)
 		if err != nil {
+			return err
+		}
+		if err := requireAffected(result, "run", runID); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE projects SET run_count = run_count + 1, last_run_id = ?, last_run_at = ? WHERE task_id = ?`,
@@ -1042,26 +1087,26 @@ func (s *Store) FinishRun(ctx context.Context, runID, taskID, status string, dur
 		if err != nil || !taskExists {
 			return err
 		}
-		var result sql.Result
+		var taskResult sql.Result
 		switch status {
 		case model.RunCompletedClean, model.RunCompletedWithFindings:
-			result, err = tx.ExecContext(ctx, `UPDATE tasks
+			taskResult, err = tx.ExecContext(ctx, `UPDATE tasks
 				SET state = ?, current_run_id = NULL, entered_waiting_at = CASE WHEN entered_waiting_at = '' THEN ? ELSE entered_waiting_at END, updated_at = ?
-				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
+				WHERE id = ? AND current_run_id = ?`,
 				model.TaskWaitingManual, now, now, taskID, runID)
 			if err != nil {
 				return err
 			}
-			err = requireAffected(result, "active task", taskID)
+			err = requireAffected(taskResult, "active task", taskID)
 		case model.RunAborted, model.RunCrashed:
-			result, err = tx.ExecContext(ctx, `UPDATE tasks
+			taskResult, err = tx.ExecContext(ctx, `UPDATE tasks
 				SET state = ?, current_run_id = NULL, docker_running = 0, frontend_url = '', compose_meta = '', updated_at = ?
-				WHERE id = ? AND (current_run_id = ? OR current_run_id IS NULL)`,
+				WHERE id = ? AND current_run_id = ?`,
 				model.TaskCompleted, now, taskID, runID)
 			if err != nil {
 				return err
 			}
-			err = requireAffected(result, "active task", taskID)
+			err = requireAffected(taskResult, "active task", taskID)
 		}
 		if err != nil {
 			return err
@@ -1167,7 +1212,7 @@ func (s *Store) PutStageAndRecordTaskRuntime(ctx context.Context, runID string, 
 		if err := putStageTx(ctx, tx, runID, stage); err != nil {
 			return err
 		}
-		return recordTaskRuntimeForProjectRunTx(ctx, tx, taskID, frontendURL, dockerRunning, meta, now)
+		return recordTaskRuntimeForProjectRunTx(ctx, tx, taskID, runID, frontendURL, dockerRunning, meta, now)
 	})
 }
 
@@ -1189,8 +1234,42 @@ func recordTaskRuntimeTx(ctx context.Context, tx *sql.Tx, taskID string, fronten
 	return recordTaskRuntimeTxMode(ctx, tx, taskID, frontendURL, dockerRunning, meta, now, true)
 }
 
-func recordTaskRuntimeForProjectRunTx(ctx context.Context, tx *sql.Tx, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string) error {
-	return recordTaskRuntimeTxMode(ctx, tx, taskID, frontendURL, dockerRunning, meta, now, false)
+func recordTaskRuntimeForWaitingManualTx(ctx context.Context, tx *sql.Tx, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string) error {
+	composeMeta, err := marshalComposeMeta(meta)
+	if err != nil {
+		return err
+	}
+	dockerFlag := 0
+	if dockerRunning {
+		dockerFlag = 1
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE tasks
+		SET frontend_url = ?, docker_running = ?, compose_meta = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		frontendURL, dockerFlag, composeMeta, now, taskID, model.TaskWaitingManual)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "waiting task", taskID)
+}
+
+func recordTaskRuntimeForProjectRunTx(ctx context.Context, tx *sql.Tx, taskID string, runID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string) error {
+	composeMeta, err := marshalComposeMeta(meta)
+	if err != nil {
+		return err
+	}
+	dockerFlag := 0
+	if dockerRunning {
+		dockerFlag = 1
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE tasks
+		SET frontend_url = ?, docker_running = ?, compose_meta = ?, updated_at = ?
+		WHERE id = ? AND current_run_id = ?`,
+		frontendURL, dockerFlag, composeMeta, now, taskID, runID)
+	if err != nil {
+		return err
+	}
+	return requireTaskOrProjectOnlyRunTx(ctx, tx, result, taskID)
 }
 
 func recordTaskRuntimeTxMode(ctx context.Context, tx *sql.Tx, taskID string, frontendURL string, dockerRunning bool, meta model.ComposeMeta, now string, requireTask bool) error {
@@ -1222,6 +1301,13 @@ func requireTaskOrProjectOnlyRunTx(ctx context.Context, tx *sql.Tx, result sql.R
 	}
 	if affected == 1 {
 		return nil
+	}
+	taskExists, err := taskExistsTx(ctx, tx, taskID)
+	if err != nil {
+		return err
+	}
+	if taskExists {
+		return requireAffected(result, "active task", taskID)
 	}
 	exists, err := projectExistsTx(ctx, tx, taskID)
 	if err != nil {

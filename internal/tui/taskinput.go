@@ -1,18 +1,14 @@
 package tui
 
 import (
-	"fmt"
-	"regexp"
-	"strings"
-
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/xuanli520/p2r_tui/internal/tasklifecycle"
 )
 
-const maxTaskIDLength = 64
-
-var taskIDPattern = regexp.MustCompile(`^TASK-\d{8}-[A-F0-9]{6}$`)
+const taskInputMaxLength = 64
 
 type TaskInputSubmitMsg struct {
 	TaskID string
@@ -27,20 +23,13 @@ func newTaskInputModel() TaskInputModel {
 	input := textinput.New()
 	input.Prompt = "输入 TASK ID: "
 	input.Placeholder = "TASK-YYYYMMDD-XXXXXX"
-	input.CharLimit = maxTaskIDLength
+	input.CharLimit = taskInputMaxLength
 	input.Width = 34
 	return TaskInputModel{input: input}
 }
 
 func ValidateTaskID(raw string) (string, error) {
-	cleaned := strings.TrimSpace(raw)
-	if len(cleaned) > maxTaskIDLength {
-		return "", fmt.Errorf("TASK ID exceeds max length")
-	}
-	if !taskIDPattern.MatchString(cleaned) {
-		return "", fmt.Errorf("invalid TASK ID format, expected TASK-YYYYMMDD-XXXXXX")
-	}
-	return cleaned, nil
+	return tasklifecycle.NormalizeTaskID(raw)
 }
 
 func (m *TaskInputModel) Focus() {
@@ -94,8 +83,8 @@ func (m *TaskInputModel) Update(msg tea.KeyMsg) tea.Cmd {
 	default:
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
-		if len(m.input.Value()) > maxTaskIDLength {
-			m.input.SetValue(m.input.Value()[:maxTaskIDLength])
+		if len(m.input.Value()) > taskInputMaxLength {
+			m.input.SetValue(m.input.Value()[:taskInputMaxLength])
 		}
 		m.err = ""
 		return cmd
