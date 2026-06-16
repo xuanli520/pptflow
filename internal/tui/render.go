@@ -9,6 +9,7 @@ import (
 
 	"github.com/xuanli520/p2r_tui/internal/pipeline"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/scheduler"
 )
 
 var (
@@ -44,7 +45,30 @@ func renderHeader(m app) string {
 	} else {
 		settings = mutedStyle.Render(settings)
 	}
-	return titleStyle.Render("p2r QA 工作台") + "  " + taskBoard + "  " + overview + "  " + settings + "  " + mutedStyle.Render(mode)
+	parts := []string{titleStyle.Render("p2r QA 工作台"), taskBoard, overview, settings, mutedStyle.Render(mode)}
+	if failed := gitSyncFailureCount(m); failed > 0 {
+		parts = append(parts, errorStyle.Render(fmt.Sprintf("Git 同步失败: %d", failed)))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func gitSyncFailureCount(m app) int {
+	byTask := map[string]bool{}
+	if m.taskBoard != nil {
+		for _, col := range m.taskBoard.cols {
+			for _, task := range col.items {
+				if strings.TrimSpace(task.ID) != "" && strings.TrimSpace(task.SyncError) != "" {
+					byTask[task.ID] = true
+				}
+			}
+		}
+	}
+	for _, job := range m.activeJobs {
+		if job.Kind == scheduler.JobGitSync && job.State == scheduler.JobFailed && strings.TrimSpace(job.TaskID) != "" {
+			byTask[job.TaskID] = true
+		}
+	}
+	return len(byTask)
 }
 
 func renderTaskBoard(m app) string {

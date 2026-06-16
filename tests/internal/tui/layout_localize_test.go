@@ -277,6 +277,27 @@ func TestTaskBoardActiveJobStageOverridesPersistedFailure(t *testing.T) {
 	}
 }
 
+func TestTaskBoardFailedGitJobWithoutProgressShowsSyncError(t *testing.T) {
+	view := tuiapp.NewTestHarness(config.Default()).
+		SeedTaskBoardForTest([]tuiapp.TaskProject{{
+			ID:        "TASK-20260508-GITERR",
+			TaskState: model.TaskInspecting,
+		}}).
+		SetFocus("task-board").
+		SetSize(82, 30).
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-git",
+			TaskID: "TASK-20260508-GITERR",
+			Kind:   scheduler.JobGitSync,
+			State:  scheduler.JobFailed,
+			Err:    "failed to clear git sync error: current_run_id is stale",
+		}}).
+		View()
+	if !strings.Contains(view, "[Git 同步失败]") || !strings.Contains(view, "状态漂移") {
+		t.Fatalf("failed git job should surface sync error without progress:\n%s", view)
+	}
+}
+
 func TestRunConfigDialogFitsNarrowShortViewport(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedExecutionDetail("TASK-1").

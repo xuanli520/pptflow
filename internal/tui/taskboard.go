@@ -193,6 +193,12 @@ func applyJobToTaskProject(task *TaskProject, job scheduler.JobSnapshot) {
 			task.SyncError = job.SyncProgress.Message
 		}
 	}
+	if job.Kind == scheduler.JobGitSync && job.State == scheduler.JobFailed {
+		task.SyncPhase = "failed"
+		if task.SyncError == "" {
+			task.SyncError = firstNonEmpty(job.SyncProgress.Message, job.Err, "git sync failed")
+		}
+	}
 	if job.State == scheduler.JobQueued || job.State == scheduler.JobRunning {
 		task.RunStatus = model.RunRunning
 	}

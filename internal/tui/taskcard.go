@@ -156,6 +156,9 @@ func inspectingTaskLines(task TaskProject, width int) []taskCardLine {
 		if logPath != "" {
 			lines = append(lines, taskCardLine{text: "日志: " + logPath, style: mutedStyle, styled: true})
 		}
+		if hint := syncErrorDiagnosticHint(summary); hint != "" {
+			lines = append(lines, taskCardLine{text: "诊断: " + hint, style: mutedStyle, styled: true})
+		}
 		return lines
 	}
 	if strings.TrimSpace(task.SyncPhase) != "" && task.SyncPhase != "done" {
@@ -201,6 +204,18 @@ func splitSyncErrorLog(value string) (string, string) {
 	summary := strings.TrimSpace(value[:index])
 	logPath := strings.TrimSpace(value[index+len(marker):])
 	return summary, logPath
+}
+
+func syncErrorDiagnosticHint(value string) string {
+	text := strings.ToLower(value)
+	switch {
+	case strings.Contains(text, "git_sync_state_drift"), strings.Contains(text, "state drift"), strings.Contains(text, "current_run_id"):
+		return "任务状态漂移，错误已保留"
+	case strings.Contains(text, "git_sync_error_clear_failed"), strings.Contains(text, "clear git sync error"), strings.Contains(text, "failed to clear git sync error"):
+		return "清理旧同步错误失败"
+	default:
+		return ""
+	}
 }
 
 func waitingTaskLines(task TaskProject, width int) []taskCardLine {

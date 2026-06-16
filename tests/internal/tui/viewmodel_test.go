@@ -320,6 +320,29 @@ func TestTerminalSchedulerSnapshotTriggersSingleReload(t *testing.T) {
 	}
 }
 
+func TestUnselectedTerminalGitFailureTriggersTaskBoardReload(t *testing.T) {
+	job := scheduler.JobSnapshot{
+		JobID:  "job-git",
+		TaskID: "TASK-2",
+		Kind:   scheduler.JobGitSync,
+		State:  scheduler.JobFailed,
+		Err:    "git clean -fdx: Permission denied",
+	}
+	h := tuiapp.NewTestHarness(config.Default()).
+		SeedOverview("TASK-1").
+		SeedTaskBoardForTest([]tuiapp.TaskProject{{ID: "TASK-2", TaskState: model.TaskInspecting}}).
+		SetFocus("overview-table")
+
+	next, cmdCount := h.ApplySchedulerJobsCommandCountForTest([]scheduler.JobSnapshot{job})
+	if cmdCount != 2 {
+		t.Fatalf("unselected terminal git failure should refresh overview and task board, got %d commands", cmdCount)
+	}
+	_, cmdCount = next.ApplySchedulerJobsCommandCountForTest([]scheduler.JobSnapshot{job})
+	if cmdCount != 0 {
+		t.Fatalf("repeated terminal git failure should not refresh again, got %d commands", cmdCount)
+	}
+}
+
 func TestExecutionDetailRendersAppendStreamAndClearsAfterReload(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).
 		SeedExecutionRun("TASK-1", "run-1", []model.StageRecord{

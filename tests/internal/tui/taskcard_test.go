@@ -74,6 +74,17 @@ func TestTaskCardShowsGitErrorLogPathSeparately(t *testing.T) {
 	}
 }
 
+func TestTaskCardShowsGitStateDriftDiagnosticHint(t *testing.T) {
+	card := tuiapp.TaskCardForTest(tuiapp.TaskProject{
+		ID:        "TASK-20260521-ABCDEF",
+		TaskState: model.TaskInspecting,
+		SyncError: "git clean -fdx failed while current_run_id=run-stale",
+	}, 54, time.Time{})
+	if !strings.Contains(card, "诊断:") || !strings.Contains(card, "状态漂移") {
+		t.Fatalf("git state drift card should show diagnostic hint:\n%s", card)
+	}
+}
+
 func TestTaskCardShowsRunningProgressAndFailedStage(t *testing.T) {
 	running := tuiapp.TaskCardForTest(tuiapp.TaskProject{
 		ID:            "TASK-20260521-ABCDEF",

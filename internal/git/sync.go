@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,11 @@ import (
 )
 
 const cloneDoneMarker = ".qa-clone-done"
+
+var (
+	chmodUserWritableTreeFunc = chmodUserWritableTree
+	renamePathFunc            = os.Rename
+)
 
 type Syncer struct {
 	BasePath string
@@ -70,7 +76,7 @@ func (s *Syncer) Sync(ctx context.Context, taskID, batchID, gitURL string, onPro
 		return nil, fmt.Errorf("stat clone marker: %w", err)
 	}
 	if s.existingClone(repoPath) {
-		return s.forcePull(ctx, repoPath, repoPath, markerPath, onProgress)
+		return s.forcePull(ctx, taskPath, repoPath, repoPath, markerPath, gitURL, onProgress)
 	}
 	if err := s.discardIncompleteClone(taskPath, onProgress); err != nil {
 		return nil, err
@@ -179,7 +185,7 @@ func (s *Syncer) clone(ctx context.Context, clonePath, repoPath, markerPath, git
 	return &SyncResult{Operation: "clone", Commit: commit, RepoPath: repoPath, ClonePath: clonePath}, nil
 }
 
-func (s *Syncer) forcePull(ctx context.Context, clonePath, repoPath, markerPath string, onProgress SyncCallback) (*SyncResult, error) {
+func (s *Syncer) forcePull(ctx context.Context, taskPath, clonePath, repoPath, markerPath, gitURL string, onProgress SyncCallback) (*SyncResult, error) {
 	emit(onProgress, "fetch", -1, "fetching updates")
 	if err := s.verifyGitRepo(clonePath); err != nil {
 		return nil, err
@@ -203,7 +209,13 @@ func (s *Syncer) forcePull(ctx context.Context, clonePath, repoPath, markerPath 
 
 	emit(onProgress, "clean", -1, "cleaning working tree")
 	if err := s.runGit(ctx, clonePath, "clean", "-fdx"); err != nil {
-		return nil, err
+		recloned, result, recoverErr := s.recoverCleanFailure(ctx, taskPath, clonePath, repoPath, markerPath, gitURL, err, onProgress)
+		if recoverErr != nil {
+			return nil, recoverErr
+		}
+		if recloned {
+			return result, nil
+		}
 	}
 	if err := s.afterSync(ctx, clonePath); err != nil {
 		return nil, err
@@ -220,6 +232,87 @@ func (s *Syncer) forcePull(ctx context.Context, clonePath, repoPath, markerPath 
 	}
 	emit(onProgress, "force-pull", 100, "repository synchronized")
 	return &SyncResult{Operation: "force-pull", Commit: commit, RepoPath: repoPath, ClonePath: clonePath}, nil
+}
+
+func (s *Syncer) recoverCleanFailure(ctx context.Context, taskPath, clonePath, repoPath, markerPath, gitURL string, cleanErr error, onProgress SyncCallback) (bool, *SyncResult, error) {
+	if !isCleanPermissionError(cleanErr) {
+		return false, nil, cleanErr
+	}
+	if err := s.ensureRemovableCloneTarget(taskPath); err != nil {
+		return false, nil, fmt.Errorf("%w; refusing git clean recovery for unsafe task path %s: %v", cleanErr, taskPath, err)
+	}
+	if err := s.ensureTaskCloneBoundary(taskPath); err != nil {
+		return false, nil, fmt.Errorf("%w; refusing git clean recovery for unsafe task path %s: %v", cleanErr, taskPath, err)
+	}
+
+	recoveryCause := cleanErr
+	emit(onProgress, "clean", -1, "repairing working tree permissions")
+	if chmodErr := chmodUserWritableTreeFunc(clonePath); chmodErr == nil {
+		emit(onProgress, "clean", -1, "retrying clean after permission repair")
+		if retryErr := s.runGit(ctx, clonePath, "clean", "-fdx"); retryErr == nil {
+			return false, nil, nil
+		} else {
+			recoveryCause = fmt.Errorf("retry clean after chmod: %w", retryErr)
+		}
+	} else {
+		recoveryCause = fmt.Errorf("chmod recovery: %w", chmodErr)
+	}
+
+	emit(onProgress, "cleanup", -1, "quarantining contaminated working tree")
+	quarantinePath, err := s.quarantineTaskPath(taskPath)
+	if err != nil {
+		return false, nil, cleanRecoveryError(cleanErr, taskPath, "", fmt.Errorf("%v; %w", recoveryCause, err))
+	}
+	emit(onProgress, "clone", -1, "fresh clone after quarantining contaminated working tree")
+	result, cloneErr := s.clone(ctx, clonePath, repoPath, markerPath, gitURL, onProgress)
+	if cloneErr != nil {
+		return false, nil, cleanRecoveryError(cleanErr, taskPath, quarantinePath, fmt.Errorf("%v; %w", recoveryCause, cloneErr))
+	}
+	result.Operation = "reclone"
+	return true, result, nil
+}
+
+func (s *Syncer) quarantineTaskPath(taskPath string) (string, error) {
+	if err := s.ensureTaskCloneBoundary(taskPath); err != nil {
+		return "", err
+	}
+	root := filepath.Join(s.basePath(), ".qa-control", "git-sync-quarantine")
+	if err := s.ensureUnderBase(root); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", fmt.Errorf("create git sync quarantine root: %w", err)
+	}
+	name := safePathSegment(filepath.Base(taskPath), "task") + "-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	target := filepath.Join(root, name)
+	if err := renamePathFunc(taskPath, target); err != nil {
+		return "", fmt.Errorf("quarantine git sync task path %s to %s: %w", taskPath, target, err)
+	}
+	return target, nil
+}
+
+func (s *Syncer) ensureTaskCloneBoundary(path string) error {
+	if err := s.ensureUnderBase(path); err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(s.basePath(), absClean(path))
+	if err != nil {
+		return fmt.Errorf("validate task clone boundary: %w", err)
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 2 {
+		return fmt.Errorf("refuse to recover git clone outside exact batch/task scope: %s", path)
+	}
+	if _, err := validatePathSegment("batchID", parts[0]); err != nil {
+		return err
+	}
+	if strings.HasPrefix(parts[0], ".") {
+		return fmt.Errorf("refuse to recover git clone inside control directory: %s", path)
+	}
+	if _, err := validatePathSegment("taskID", parts[1]); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Syncer) afterSync(ctx context.Context, clonePath string) error {
@@ -354,6 +447,55 @@ func (s *Syncer) ensureUnderBase(path string) error {
 		return fmt.Errorf("path %s escapes base path %s", target, base)
 	}
 	return nil
+}
+
+func isCleanPermissionError(err error) bool {
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	if len(commandErr.Args) != 2 || commandErr.Args[0] != "clean" || commandErr.Args[1] != "-fdx" {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{commandErr.Stdout, commandErr.Stderr, commandErr.Error()}, "\n"))
+	for _, marker := range []string{"permission denied", "failed to remove", "unable to unlink"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func chmodUserWritableTree(root string) error {
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		mode := info.Mode()
+		next := mode | 0o600
+		if entry.IsDir() || mode&0o111 != 0 {
+			next |= 0o100
+		}
+		if next.Perm() == mode.Perm() {
+			return nil
+		}
+		return os.Chmod(path, next.Perm())
+	})
+}
+
+func cleanRecoveryError(cleanErr error, taskPath, quarantinePath string, cause error) error {
+	quarantineMessage := ""
+	if strings.TrimSpace(quarantinePath) != "" {
+		quarantineMessage = "; quarantined at " + quarantinePath
+	}
+	return fmt.Errorf("%w; failed to recover git clean permission error for %s%s: %v; manual cleanup: fix ownership or remove the path, then retry", cleanErr, taskPath, quarantineMessage, cause)
 }
 
 func emit(callback SyncCallback, phase string, percent int, message string) {

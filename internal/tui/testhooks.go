@@ -69,6 +69,12 @@ func NewTestHarnessWithStore(store *db.Store, cfg config.Config) TestHarness {
 
 func cloneAppForTest(m app) app {
 	next := m
+	if m.terminalRefreshJobIDs != nil {
+		next.terminalRefreshJobIDs = map[string]bool{}
+		for jobID, seen := range m.terminalRefreshJobIDs {
+			next.terminalRefreshJobIDs[jobID] = seen
+		}
+	}
 	if m.taskBoard != nil {
 		taskBoard := *m.taskBoard
 		next.taskBoard = &taskBoard

@@ -662,11 +662,6 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 	if s.gitSyncer == nil {
 		return errors.New("git syncer unavailable")
 	}
-	if s.store != nil {
-		if err := s.store.SetGitSyncError(ctx, db.GitSyncErrorUpdate{TaskID: job.TaskID, JobID: job.JobID, Err: nil, Source: "git_sync"}); err != nil {
-			return fmt.Errorf("failed to clear git sync error for %s: %w", job.TaskID, err)
-		}
-	}
 	job.mu.Lock()
 	job.CurrentStage = "Git"
 	job.SyncProgress = gitsync.SyncProgress{Phase: "queued", Percent: 0, Message: "waiting for git sync"}
@@ -683,12 +678,17 @@ func (s *Scheduler) runGitSync(ctx context.Context, job *Job) error {
 		err = s.writeGitSyncErrorLog(job, err)
 	}
 	if s.store != nil {
-		if gitsync.IsTerminalSyncError(err) {
+		switch {
+		case err == nil:
+			if recordErr := s.store.ClearGitSyncErrorAfterSyncSuccess(ctx, db.GitSyncErrorUpdate{TaskID: job.TaskID, JobID: job.JobID, Source: "git_sync"}); recordErr != nil {
+				err = fmt.Errorf("git sync completed but failed to clear git sync error for %s: %w", job.TaskID, recordErr)
+			}
+		case gitsync.IsTerminalSyncError(err):
 			if recordErr := s.store.RecordTaskTerminalGitError(ctx, job.TaskID, err); recordErr != nil {
 				err = fmt.Errorf("%w; additionally failed to record terminal git sync error: %v", err, recordErr)
 			}
-		} else {
-			if recordErr := s.store.SetGitSyncError(ctx, db.GitSyncErrorUpdate{TaskID: job.TaskID, JobID: job.JobID, Err: err, Source: "git_sync"}); recordErr != nil {
+		default:
+			if recordErr := s.store.RecordGitSyncFailure(ctx, db.GitSyncErrorUpdate{TaskID: job.TaskID, JobID: job.JobID, Err: err, Source: "git_sync"}); recordErr != nil {
 				err = fmt.Errorf("%w; additionally failed to record git sync error: %v", err, recordErr)
 			}
 		}

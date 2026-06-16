@@ -80,16 +80,16 @@ type app struct {
 }
 
 type executionState struct {
-	taskID                   string
-	detail                   viewport.Model
-	selectedStageKey         string
-	selectedRefRunID         string
-	stageIndex               int
-	refIndex                 int
-	detailVM                 executionViewModel
-	detailContent            string
-	detailFollowTail         bool
-	lastTerminalRefreshJobID string
+	taskID                string
+	detail                viewport.Model
+	selectedStageKey      string
+	selectedRefRunID      string
+	stageIndex            int
+	refIndex              int
+	detailVM              executionViewModel
+	detailContent         string
+	detailFollowTail      bool
+	terminalRefreshJobIDs map[string]bool
 }
 
 type settingsState struct {
@@ -317,7 +317,7 @@ func newApp(store *db.Store, cfg config.Config) app {
 		taskInput:      ptrTaskInput(newTaskInputModel()),
 		poller:         newSchedulerPoller(healthStore, cfg),
 		overview:       ptrOverview(newOverviewModel()),
-		executionState: executionState{detail: viewport.New(80, 10), detailFollowTail: true},
+		executionState: executionState{detail: viewport.New(80, 10), detailFollowTail: true, terminalRefreshJobIDs: map[string]bool{}},
 		settingsState:  settingsState{settingsUI: SettingsOverlay{}, dockerMirror: newDockerMirrorPanel(cfg), settings: newSettingsPanel()},
 		tab:            panelTaskBoard,
 		focus:          focusTaskBoard,
@@ -650,8 +650,8 @@ func (m *app) handleSchedulerMsg(msg tea.Msg, cmds *[]tea.Cmd) bool {
 		m.activeJobs = value.jobs
 		m.updatePendingCancelMessage(value.jobs)
 		m.updatePendingJobMessage(value.jobs)
-		if m.selectedJobIsTerminal(value.jobs) {
-			*cmds = append(*cmds, m.reload())
+		if m.newTerminalJobArrived(value.jobs) {
+			*cmds = append(*cmds, m.reloadTerminalJobViews()...)
 		}
 		streamChanged := m.mergeActiveStreamPreview()
 		if verticalChromeHeight(*m) != beforeChrome {
@@ -775,30 +775,35 @@ func findJobSnapshot(jobs []scheduler.JobSnapshot, jobID string) (scheduler.JobS
 	return scheduler.JobSnapshot{}, false
 }
 
-func (m *app) selectedJobIsTerminal(jobs []scheduler.JobSnapshot) bool {
-	taskID := m.selectedTaskID()
-	if taskID == "" {
-		return false
+func (m *app) newTerminalJobArrived(jobs []scheduler.JobSnapshot) bool {
+	if m.terminalRefreshJobIDs == nil {
+		m.terminalRefreshJobIDs = map[string]bool{}
 	}
+	changed := false
 	for _, job := range jobs {
-		if job.TaskID == taskID && (job.State == scheduler.JobQueued || job.State == scheduler.JobRunning) {
-			return false
-		}
-	}
-	for _, job := range jobs {
-		if job.TaskID != taskID || job.JobID == "" {
+		if job.JobID == "" {
 			continue
 		}
 		switch job.State {
 		case scheduler.JobDone, scheduler.JobCancelled, scheduler.JobFailed:
-			if m.lastTerminalRefreshJobID == job.JobID {
-				return false
+			if m.terminalRefreshJobIDs[job.JobID] {
+				continue
 			}
-			m.lastTerminalRefreshJobID = job.JobID
-			return true
+			m.terminalRefreshJobIDs[job.JobID] = true
+			changed = true
 		}
 	}
-	return false
+	return changed
+}
+
+func (m app) reloadTerminalJobViews() []tea.Cmd {
+	cmds := []tea.Cmd{m.reload()}
+	if m.taskBoard != nil {
+		if cmd := m.taskBoard.Reload(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return cmds
 }
 
 func (m app) View() string {

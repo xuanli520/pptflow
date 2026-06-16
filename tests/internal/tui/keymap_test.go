@@ -542,6 +542,24 @@ func TestPipelineBarShowsEachConfiguredRunningSlot(t *testing.T) {
 	}
 }
 
+func TestPipelineBarAndHeaderShowRecentFailedGitSync(t *testing.T) {
+	h := tuiapp.NewTestHarness(config.Default()).
+		SetSize(120, 20).
+		ApplySchedulerJobsForTest([]scheduler.JobSnapshot{{
+			JobID:  "job-git",
+			TaskID: "TASK-GIT",
+			Kind:   scheduler.JobGitSync,
+			State:  scheduler.JobFailed,
+			Err:    "git clean -fdx: Permission denied",
+		}})
+	view := h.View()
+	for _, want := range []string{"Git 同步失败: 1", "TASK-GIT"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("failed git sync should be visible in header and pipeline bar, missing %q:\n%s", want, view)
+		}
+	}
+}
+
 func TestOverviewTableMovesSelection(t *testing.T) {
 	h := tuiapp.NewTestHarness(config.Default()).SeedOverview("TASK-1", "TASK-2").SetFocus("overview-table")
 

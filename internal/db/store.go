@@ -338,10 +338,25 @@ func (s *Store) TaskEvents(ctx context.Context, taskID string, limit int) ([]mod
 }
 
 func (s *Store) RecordTaskGitError(ctx context.Context, taskID string, syncErr error) error {
-	return s.SetGitSyncError(ctx, GitSyncErrorUpdate{TaskID: taskID, Err: syncErr, Source: "legacy"})
+	return s.RecordGitSyncFailure(ctx, GitSyncErrorUpdate{TaskID: taskID, Err: syncErr, Source: "legacy"})
 }
 
 func (s *Store) SetGitSyncError(ctx context.Context, update GitSyncErrorUpdate) error {
+	if update.Err != nil {
+		return s.RecordGitSyncFailure(ctx, update)
+	}
+	return s.ClearGitSyncErrorForSyncStart(ctx, update)
+}
+
+func (s *Store) ClearGitSyncErrorForSyncStart(ctx context.Context, update GitSyncErrorUpdate) error {
+	return s.clearGitSyncError(ctx, update, false)
+}
+
+func (s *Store) ClearGitSyncErrorAfterSyncSuccess(ctx context.Context, update GitSyncErrorUpdate) error {
+	return s.clearGitSyncError(ctx, update, true)
+}
+
+func (s *Store) clearGitSyncError(ctx context.Context, update GitSyncErrorUpdate, allowActiveTask bool) error {
 	message := errorMessage(update.Err)
 	source := strings.TrimSpace(update.Source)
 	if source == "" {
@@ -349,28 +364,81 @@ func (s *Store) SetGitSyncError(ctx context.Context, update GitSyncErrorUpdate) 
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		state, currentRunID, err := taskSyncStateTx(ctx, tx, update.TaskID)
+		if err != nil {
+			return err
+		}
+		where := `WHERE id = ?`
+		if !allowActiveTask {
+			where += ` AND current_run_id IS NULL`
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE tasks
+			SET sync_error = '', updated_at = ?
+			`+where,
+			now, update.TaskID)
+		if err != nil {
+			return err
+		}
+		affectedKind := "task"
+		if !allowActiveTask {
+			affectedKind = "idle task"
+		}
+		if err := requireAffected(result, affectedKind, update.TaskID); err != nil {
+			return err
+		}
+		if err := appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+			TaskID:  update.TaskID,
+			RunID:   update.RunID,
+			JobID:   update.JobID,
+			Kind:    "git_sync_error_cleared",
+			Message: message,
+			Source:  source,
+		}, now)); err != nil {
+			return err
+		}
+		if allowActiveTask && currentRunID != "" {
+			return appendGitSyncStateDriftEventTx(ctx, tx, update, now, source, state, currentRunID)
+		}
+		return nil
+	})
+}
+
+func (s *Store) RecordGitSyncFailure(ctx context.Context, update GitSyncErrorUpdate) error {
+	message := errorMessage(update.Err)
+	source := strings.TrimSpace(update.Source)
+	if source == "" {
+		source = "git_sync"
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		state, currentRunID, err := taskSyncStateTx(ctx, tx, update.TaskID)
+		if err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `UPDATE tasks
 			SET sync_error = ?, updated_at = ?
-			WHERE id = ? AND current_run_id IS NULL`,
+			WHERE id = ?`,
 			message, now, update.TaskID)
 		if err != nil {
 			return err
 		}
-		if err := requireAffected(result, "idle task", update.TaskID); err != nil {
+		if err := requireAffected(result, "task", update.TaskID); err != nil {
 			return err
 		}
-		kind := "git_sync_error_cleared"
-		if message != "" {
-			kind = "git_sync_error"
-		}
-		return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+		if err := appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
 			TaskID:  update.TaskID,
 			RunID:   update.RunID,
 			JobID:   update.JobID,
-			Kind:    kind,
+			Kind:    "git_sync_error",
 			Message: message,
 			Source:  source,
-		}, now))
+		}, now)); err != nil {
+			return err
+		}
+		if currentRunID != "" {
+			return appendGitSyncStateDriftEventTx(ctx, tx, update, now, source, state, currentRunID)
+		}
+		return nil
 	})
 }
 
@@ -399,6 +467,36 @@ func (s *Store) RecordTaskTerminalGitError(ctx context.Context, taskID string, s
 	message := errorMessage(syncErr)
 	now := time.Now().UTC().Format(time.RFC3339)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		state, currentRunID, err := taskSyncStateTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if state != model.TaskInspecting || currentRunID != "" {
+			result, err := tx.ExecContext(ctx, `UPDATE tasks
+				SET sync_error = ?, updated_at = ?
+				WHERE id = ?`,
+				message, now, taskID)
+			if err != nil {
+				return err
+			}
+			if err := requireAffected(result, "task", taskID); err != nil {
+				return err
+			}
+			if err := appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+				TaskID:  taskID,
+				Kind:    "git_sync_terminal_error",
+				Message: message,
+				Source:  "git_sync",
+			}, now)); err != nil {
+				return err
+			}
+			return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+				TaskID:  taskID,
+				Kind:    "git_sync_terminal_error_state_drift",
+				Message: fmt.Sprintf("%s; state=%s current_run_id=%s", message, state, currentRunID),
+				Source:  "git_sync",
+			}, now))
+		}
 		result, err := tx.ExecContext(ctx, `UPDATE tasks
 				SET state = ?, current_run_id = NULL, frontend_url = '', docker_running = 0, compose_meta = '', entered_waiting_at = '', archived_at = '', sync_error = ?, updated_at = ?
 				WHERE id = ? AND state = ? AND current_run_id IS NULL`,
@@ -1796,6 +1894,30 @@ func appendTaskEventTx(ctx context.Context, tx *sql.Tx, event model.TaskEvent) e
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID, event.TaskID, nullEmpty(event.RunID), nullEmpty(event.JobID), event.Kind, event.Message, event.Source, event.CreatedAt)
 	return err
+}
+
+func taskSyncStateTx(ctx context.Context, tx *sql.Tx, taskID string) (string, string, error) {
+	var state string
+	var currentRunID string
+	err := tx.QueryRowContext(ctx, `SELECT state, COALESCE(current_run_id, '') FROM tasks WHERE id = ?`, taskID).Scan(&state, &currentRunID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", FormatNotFound("task", taskID)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return state, currentRunID, nil
+}
+
+func appendGitSyncStateDriftEventTx(ctx context.Context, tx *sql.Tx, update GitSyncErrorUpdate, now, source, state, currentRunID string) error {
+	return appendTaskEventTx(ctx, tx, normalizeTaskEvent(model.TaskEvent{
+		TaskID:  update.TaskID,
+		RunID:   update.RunID,
+		JobID:   update.JobID,
+		Kind:    "git_sync_state_drift",
+		Message: fmt.Sprintf("git sync touched task while state=%s current_run_id=%s", state, currentRunID),
+		Source:  source,
+	}, now))
 }
 
 func normalizeTaskEvent(event model.TaskEvent, now string) model.TaskEvent {

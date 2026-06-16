@@ -304,6 +304,67 @@ func TestSubmitInspectionRecordsGitFailureWithoutRunningPipeline(t *testing.T) {
 	}
 }
 
+func TestSubmitInspectionRunsGitSyncWhenTaskHasStaleCurrentRun(t *testing.T) {
+	store, cfg, task := newInspectionStore(t)
+	if err := store.CreateRun(context.Background(), model.RunRecord{
+		RunID:        "run-stale",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	syncCalled := make(chan struct{}, 1)
+	s := scheduler.New(store, cfg,
+		scheduler.WithGitSyncRunner(fakeGitSyncRunner{
+			err:    errors.New("clean permission denied"),
+			called: syncCalled,
+		}),
+		scheduler.WithRunnerFactory(func(store *db.Store, cfg config.Config) scheduler.PipelineRunner {
+			return fakePipelineRunner{run: func(context.Context, string, pipeline.RunOptions) (pipeline.Result, error) {
+				t.Fatal("pipeline should not run after git sync failure")
+				return pipeline.Result{}, nil
+			}}
+		}),
+	)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		_ = store.Close()
+	})
+
+	if _, err := submitInspection(s, task, pipeline.RunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForSnapshot(t, s, 2*time.Second, func(snapshot scheduler.JobSnapshot) bool {
+		return snapshot.TaskID == task.ID && snapshot.Kind == scheduler.JobGitSync && snapshot.State == scheduler.JobFailed
+	})
+	if !strings.Contains(failed.Err, "clean permission denied") {
+		t.Fatalf("failed git sync snapshot = %#v", failed)
+	}
+	select {
+	case <-syncCalled:
+	default:
+		t.Fatal("git sync runner was blocked before starting")
+	}
+	stored, err := store.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CurrentRunID != "run-stale" || !strings.Contains(stored.SyncError, "clean permission denied") {
+		t.Fatalf("sync failure should be persisted despite stale current run: %#v", stored)
+	}
+	events, err := store.TaskEvents(context.Background(), task.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTaskEventKind(events, "git_sync_state_drift") {
+		t.Fatalf("missing git sync drift event: %#v", events)
+	}
+}
+
 func TestSubmitInspectionReleasesTaskOnInvalidDeliveryPackage(t *testing.T) {
 	store, cfg, task := newInspectionStore(t)
 	pipelineCalled := make(chan struct{}, 1)
@@ -727,10 +788,14 @@ func (f fakePipelineRunner) Run(ctx context.Context, taskID string, opts pipelin
 }
 
 type fakeGitSyncRunner struct {
-	err error
+	err    error
+	called chan<- struct{}
 }
 
 func (f fakeGitSyncRunner) Sync(ctx context.Context, taskID, batchID, gitURL string, onProgress gitsync.SyncCallback) (*gitsync.SyncResult, error) {
+	if f.called != nil {
+		f.called <- struct{}{}
+	}
 	if onProgress != nil {
 		onProgress(gitsync.SyncProgress{Phase: "clone", Percent: 50, Message: "syncing"})
 	}
@@ -940,4 +1005,13 @@ func stageStatus(stages []model.StageRecord, stage string) string {
 		}
 	}
 	return ""
+}
+
+func hasTaskEventKind(events []model.TaskEvent, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
 }

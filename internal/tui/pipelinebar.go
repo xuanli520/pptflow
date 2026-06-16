@@ -25,10 +25,10 @@ func pipelineBarSnapshot(m app) PipelineBarModel {
 
 func renderPipelineBarSnapshot(snapshot PipelineBarModel, now time.Time) string {
 	maxParallel := normalizedMaxParallel(snapshot.MaxParallel)
-	active := activeJobSnapshots(snapshot.Jobs)
+	visible := pipelineVisibleJobSnapshots(snapshot.Jobs)
 	running := 0
 	queued := 0
-	for _, job := range active {
+	for _, job := range visible {
 		if job.State == scheduler.JobRunning {
 			running++
 		}
@@ -41,12 +41,12 @@ func renderPipelineBarSnapshot(snapshot PipelineBarModel, now time.Time) string 
 	if queued > 0 {
 		line += fmt.Sprintf("  排队: %d", queued)
 	}
-	if len(active) == 0 || snapshot.Width < 72 {
+	if len(visible) == 0 || snapshot.Width < 72 {
 		return mutedStyle.Render(line)
 	}
 	limit := pipelineJobLineLimit(snapshot)
 	lines := []string{mutedStyle.Render(line)}
-	for _, job := range active[:limit] {
+	for _, job := range visible[:limit] {
 		label := localizeJobState(job.State)
 		if job.CancelRequested {
 			label = "终止中"
@@ -60,31 +60,31 @@ func renderPipelineBarSnapshot(snapshot PipelineBarModel, now time.Time) string 
 		}
 		lines = append(lines, fmt.Sprintf("  %s %s  %s  %s", jobStateIcon(job.State), truncateMiddleDisplay(job.TaskID, 24), label, shortDurationAt(job, now)))
 	}
-	if len(active) > limit {
-		lines = append(lines, mutedStyle.Render(fmt.Sprintf("  另有 %d 个 job 排队/运行", len(active)-limit)))
+	if len(visible) > limit {
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("  另有 %d 个 job 未显示", len(visible)-limit)))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func pipelineBarSnapshotHeight(snapshot PipelineBarModel) int {
-	active := activeJobSnapshots(snapshot.Jobs)
-	if len(active) == 0 || snapshot.Width < 72 {
+	visible := pipelineVisibleJobSnapshots(snapshot.Jobs)
+	if len(visible) == 0 || snapshot.Width < 72 {
 		return 1
 	}
 	limit := pipelineJobLineLimit(snapshot)
 	height := 1 + limit
-	if len(active) > limit {
+	if len(visible) > limit {
 		height++
 	}
 	return height
 }
 
 func pipelineJobLineLimit(snapshot PipelineBarModel) int {
-	active := activeJobSnapshots(snapshot.Jobs)
-	if len(active) == 0 || snapshot.Width < 72 {
+	visible := pipelineVisibleJobSnapshots(snapshot.Jobs)
+	if len(visible) == 0 || snapshot.Width < 72 {
 		return 0
 	}
-	return min(normalizedMaxParallel(snapshot.MaxParallel), len(active))
+	return min(normalizedMaxParallel(snapshot.MaxParallel)+failedJobCount(visible), len(visible))
 }
 
 func activeJobSnapshots(jobs []scheduler.JobSnapshot) []scheduler.JobSnapshot {
@@ -95,6 +95,27 @@ func activeJobSnapshots(jobs []scheduler.JobSnapshot) []scheduler.JobSnapshot {
 		}
 	}
 	return active
+}
+
+func pipelineVisibleJobSnapshots(jobs []scheduler.JobSnapshot) []scheduler.JobSnapshot {
+	var visible []scheduler.JobSnapshot
+	for _, job := range jobs {
+		switch job.State {
+		case scheduler.JobQueued, scheduler.JobRunning, scheduler.JobFailed:
+			visible = append(visible, job)
+		}
+	}
+	return visible
+}
+
+func failedJobCount(jobs []scheduler.JobSnapshot) int {
+	count := 0
+	for _, job := range jobs {
+		if job.State == scheduler.JobFailed {
+			count++
+		}
+	}
+	return count
 }
 
 func slotBar(running, maxParallel int) string {

@@ -155,6 +155,141 @@ func TestTerminalGitErrorReleasesInspectingCapacity(t *testing.T) {
 	}
 }
 
+func TestGitSyncFailurePersistsWithStateDrift(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-DRIFT", "https://gitlab.example/TASK-20260521-DRIFT", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-drift",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RecordGitSyncFailure(ctx, db.GitSyncErrorUpdate{
+		TaskID: task.ID,
+		JobID:  "job-drift",
+		Err:    assertErr("clean permission denied"),
+		Source: "git_sync",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.CurrentRunID != "run-drift" || !strings.Contains(task.SyncError, "clean permission denied") {
+		t.Fatalf("state drift git failure should persist sync error without hiding current run: %#v", task)
+	}
+	events, err := store.TaskEvents(ctx, task.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTaskEventKind(events, "git_sync_error") || !hasTaskEventKind(events, "git_sync_state_drift") {
+		t.Fatalf("expected sync error and drift events, got %#v", events)
+	}
+}
+
+func TestTerminalGitErrorWithStateDriftPreservesOriginalError(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-TERDRF", "https://gitlab.example/TASK-20260521-TERDRF", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, model.RunRecord{
+		RunID:        "run-terminal-drift",
+		TaskID:       task.ID,
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Status:       model.RunRunning,
+		ArtifactRoot: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RecordTaskTerminalGitError(ctx, task.ID, assertErr("repository not found")); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskInspecting || task.CurrentRunID != "run-terminal-drift" || !strings.Contains(task.SyncError, "repository not found") {
+		t.Fatalf("terminal drift should keep task shape and persist original error: %#v", task)
+	}
+	events, err := store.TaskEvents(ctx, task.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTaskEventKind(events, "git_sync_terminal_error") || !hasTaskEventKind(events, "git_sync_terminal_error_state_drift") {
+		t.Fatalf("expected terminal error and drift events, got %#v", events)
+	}
+}
+
+func TestTerminalGitErrorOnCompletedTaskPreservesOriginalError(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	task, err := store.CreateTaskWithBatch(ctx, "TASK-20260521-TERCMP", "https://gitlab.example/TASK-20260521-TERCMP", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordTaskTerminalGitError(ctx, task.ID, assertErr("old terminal error")); err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskCompleted {
+		t.Fatalf("setup terminal failure did not complete task: %#v", task)
+	}
+
+	if err := store.RecordTaskTerminalGitError(ctx, task.ID, assertErr("repository not found")); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err = store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != model.TaskCompleted || !strings.Contains(task.SyncError, "repository not found") {
+		t.Fatalf("completed terminal drift should keep original new error visible: %#v", task)
+	}
+	if strings.Contains(task.SyncError, "old terminal error") {
+		t.Fatalf("completed terminal drift kept stale error: %#v", task)
+	}
+	events, err := store.TaskEvents(ctx, task.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTaskEventKind(events, "git_sync_terminal_error_state_drift") {
+		t.Fatalf("expected completed terminal drift event, got %#v", events)
+	}
+}
+
 func TestProjectQueryFiltersByTaskState(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(filepath.Join(t.TempDir(), "index.db"))
