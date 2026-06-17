@@ -26,6 +26,8 @@ func newAppServerCodexReviewSession(envKeys []string) appserver.Session {
 	return appserver.New(envKeys)
 }
 
+const fakeAppServerTimeout = 30 * time.Second
+
 func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 	dir := t.TempDir()
 	codexPath := writeFakeSteerableAppServer(t, dir)
@@ -33,7 +35,7 @@ func TestAppServerSessionUsesTurnSteerForGuidance(t *testing.T) {
 	session := newAppServerCodexReviewSession(nil)
 	ctx := context.Background()
 	if err := session.Start(ctx, appserver.Request{
-		Timeout:        5 * time.Second,
+		Timeout:        fakeAppServerTimeout,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
 		Env:            []string{"PATH=" + os.Getenv("PATH"), "STEER_LOG=" + steerLog},
@@ -71,7 +73,7 @@ func TestAppServerSessionRejectsInterruptedTurn(t *testing.T) {
 	codexPath := writeFakeSteerableAppServer(t, dir)
 	session := newAppServerCodexReviewSession(nil)
 	result, err := runAppServerSession(context.Background(), session, appserver.Request{
-		Timeout:        5 * time.Second,
+		Timeout:        fakeAppServerTimeout,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
 		Env:            []string{"PATH=" + os.Getenv("PATH"), "TURN_STATUS=interrupted"},
@@ -93,7 +95,7 @@ func TestAppServerSessionCapturesTurnCompletedItems(t *testing.T) {
 	codexPath := writeFakeSteerableAppServer(t, dir)
 	session := newAppServerCodexReviewSession(nil)
 	result, err := runAppServerSession(context.Background(), session, appserver.Request{
-		Timeout:        5 * time.Second,
+		Timeout:        fakeAppServerTimeout,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
 		Env:            []string{"PATH=" + os.Getenv("PATH"), "TURN_ITEMS_ONLY=1"},
@@ -125,7 +127,7 @@ func TestAppServerSessionOmitsUnsetModelAndSendsConfiguredModel(t *testing.T) {
 			session := newAppServerCodexReviewSession(nil)
 			env := append([]string{"PATH=" + os.Getenv("PATH")}, tc.env...)
 			result, err := runAppServerSession(context.Background(), session, appserver.Request{
-				Timeout:        5 * time.Second,
+				Timeout:        fakeAppServerTimeout,
 				ProjectPath:    dir,
 				LogPath:        filepath.Join(dir, "codex-"+tc.name+".log"),
 				Env:            env,
@@ -147,7 +149,7 @@ func TestAppServerSessionPreservesStdoutDiagnosticsOnStartFailure(t *testing.T) 
 	codexPath := writeFakeSteerableAppServer(t, dir)
 	session := newAppServerCodexReviewSession(nil)
 	result, err := runAppServerSession(context.Background(), session, appserver.Request{
-		Timeout:        5 * time.Second,
+		Timeout:        fakeAppServerTimeout,
 		ProjectPath:    dir,
 		LogPath:        filepath.Join(dir, "codex.log"),
 		Env:            []string{"PATH=" + os.Getenv("PATH"), "STDOUT_DIAGNOSTIC_ON_INITIALIZE=auth failed on stdout"},

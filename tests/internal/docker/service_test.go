@@ -873,7 +873,7 @@ func TestStartRuntimeDiagnosesAddressPoolExhaustionAndCleansFailure(t *testing.T
 	repo := writeComposeProject(t, t.TempDir())
 	runner := &scriptedDockerRunner{
 		upErr:    true,
-		upStderr: "failed to create network p2rqa_default: Error response from daemon: all predefined address pools have been fully subnetted",
+		upStderr: "failed to create network p2rqa_default: Error response from daemon: invalid pool request: Pool overlaps with other one on this address space",
 	}
 	cfg := config.Default().Docker
 	cfg.PullPolicy = "skip"

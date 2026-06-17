@@ -9,6 +9,7 @@ import (
 	"time"
 
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
+	"github.com/xuanli520/p2r_tui/internal/executor"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
@@ -92,14 +93,16 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	}
 	composeUsage := inspectRunTestsCompose(repoPath)
 	runTestsOwnsCompose := composeUsage.StartsStack
-	stageEnv := stageCEnvironment(runtime)
+	var stageEnv stageCCommandEnv
+	var testCompose stageCTestComposePlan
 	if runTestsOwnsCompose {
-		stageEnv = stageEnv.withoutComposeVars()
-		stageEnv.add("COMPOSE_PROJECT_NAME", stageCTestComposeProject(r.cfg.Docker.ComposeProjectPrefix, run.TaskID, run.RunID))
-		if composeFiles := runTestsHostComposeFiles(runtime); len(composeFiles) > 0 {
-			stageEnv.add("COMPOSE_FILE", strings.Join(composeFiles, string(os.PathListSeparator)))
+		testCompose = r.stageCTestComposePlanForRuntime(ctx, runtime, run.ArtifactRoot, stageCTestComposeProject(r.cfg.Docker.ComposeProjectPrefix, run.TaskID, run.RunID))
+		stageEnv.add("COMPOSE_PROJECT_NAME", testCompose.Project)
+		if len(testCompose.ComposeFiles) > 0 {
+			stageEnv.add("COMPOSE_FILE", strings.Join(testCompose.ComposeFiles, string(os.PathListSeparator)))
 		}
 	} else {
+		stageEnv = stageCEnvironment(runtime)
 		for _, item := range runTestsHostURLDefaultEnv(filepath.Join(repoPath, "run_tests.sh"), runtime) {
 			key, value, ok := strings.Cut(item, "=")
 			if ok {
@@ -140,6 +143,9 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	for _, warning := range envFileWarnings {
 		fmt.Fprintln(logFile, "Stage C env warning: "+warning)
 	}
+	for _, warning := range testCompose.Warnings {
+		fmt.Fprintln(logFile, "Stage C compose warning: "+warning)
+	}
 	fmt.Fprintln(logFile)
 	onOutput := func(line string, source string) {
 		appendStreamProgress(run.RunID, "C", line, source, false, progress)
@@ -176,22 +182,22 @@ func (r Runner) stageC(ctx context.Context, run model.RunRecord, project scanner
 	if len(envFileWarnings) > 0 {
 		summaryExtra["env_file_warnings"] = envFileWarnings
 	}
-	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(result.Err == nil, "", runtime, prior, summaryExtra))
+	if runTestsOwnsCompose {
+		summaryExtra["test_compose"] = testCompose
+	}
 	if result.Err != nil {
-		record.Findings = append(record.Findings, model.Finding{
-			Stage:      "C",
-			Severity:   "High",
-			Title:      "run_tests runtime evidence failed",
-			Rule:       "Stage C must execute the unified test entrypoint successfully.",
-			Evidence:   stageCTrimResult(result),
-			Impact:     "The delivery package does not currently have passing runtime test evidence.",
-			MinimumFix: "Fix the test entrypoint or application runtime and rerun C.",
-		})
+		finding, errorSummary, classification := stageCRunTestsFailure(result)
+		if classification != nil {
+			summaryExtra["failure_classification"] = classification
+		}
+		record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(false, "", runtime, prior, summaryExtra))
+		record.Findings = append(record.Findings, finding)
 		if record.ErrorSummary == "" {
-			record.ErrorSummary = "run_tests failed"
+			record.ErrorSummary = errorSummary
 		}
 		return finishStage(record, model.StageFailed, start)
 	}
+	record = requiredStageJSON(record, writer, writer.RelativePath(summaryPath), stageCRuntimeSummary(true, "", runtime, prior, summaryExtra))
 	return finishStage(record, model.StageDone, start)
 }
 
@@ -210,9 +216,47 @@ type stageCTestComposeCleanup struct {
 	SkippedReason string `json:"skipped_reason,omitempty"`
 }
 
+type stageCTestComposePlan struct {
+	Project      string                               `json:"project,omitempty"`
+	ComposeFiles []string                             `json:"compose_files,omitempty"`
+	NetworkIPAM  *dockermgr.RuntimeNetworkIPAMSummary `json:"network_ipam,omitempty"`
+	Warnings     []string                             `json:"warnings,omitempty"`
+}
+
+func stageCRunTestsFailure(result executor.Result) (model.Finding, string, *dockermgr.RuntimeFailureClassification) {
+	finding := model.Finding{
+		Stage:      "C",
+		Severity:   "High",
+		Title:      "run_tests runtime evidence failed",
+		Rule:       "Stage C must execute the unified test entrypoint successfully.",
+		Evidence:   stageCTrimResult(result),
+		Impact:     "The delivery package does not currently have passing runtime test evidence.",
+		MinimumFix: "Fix the test entrypoint or application runtime and rerun C.",
+	}
+	errorSummary := "run_tests failed"
+	classification, ok := dockermgr.ClassifyRuntimeFailureResult(result)
+	if !ok {
+		return finding, errorSummary, nil
+	}
+	if strings.TrimSpace(classification.Title) != "" {
+		finding.Title = classification.Title
+	}
+	if strings.TrimSpace(classification.Cause) != "" {
+		finding.Evidence = classification.Cause
+	}
+	if strings.TrimSpace(classification.Fix) != "" {
+		finding.MinimumFix = classification.Fix
+	}
+	if strings.TrimSpace(classification.Category) != "" {
+		errorSummary = classification.Category + ": " + stageCTrimResult(result)
+	}
+	return finding, errorSummary, &classification
+}
+
 func (r Runner) cleanupStageCTestCompose(ctx context.Context, repoPath string, env []string, logFile *os.File, usage runTestsComposeUsage) stageCTestComposeCleanup {
-	if usage.ExplicitProject {
-		reason := "run_tests.sh uses an explicit Docker Compose project; relying on its own cleanup trap"
+	projectName := strings.TrimSpace(usage.ProjectName)
+	if usage.ExplicitProject && projectName == "" {
+		reason := "run_tests.sh uses an explicit Docker Compose project that could not be resolved; relying on its own cleanup trap"
 		if logFile != nil {
 			fmt.Fprintln(logFile, "Stage C compose cleanup skipped: "+reason)
 		}
@@ -223,7 +267,8 @@ func (r Runner) cleanupStageCTestCompose(ctx context.Context, repoPath string, e
 		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 	}
-	result := r.exec.Run(ctx, 2*time.Minute, repoPath, env, "docker", "compose", "down", "--volumes", "--remove-orphans")
+	args := stageCTestComposeCleanupArgs(usage)
+	result := r.exec.Run(ctx, 2*time.Minute, repoPath, env, "docker", args...)
 	cleanup := stageCTestComposeCleanup{
 		Command:  result.Command,
 		ExitCode: result.ExitCode,
@@ -246,6 +291,23 @@ func (r Runner) cleanupStageCTestCompose(ctx context.Context, repoPath string, e
 		}
 	}
 	return cleanup
+}
+
+func stageCTestComposeCleanupArgs(usage runTestsComposeUsage) []string {
+	args := []string{"compose"}
+	if strings.TrimSpace(usage.ProjectDir) != "" {
+		args = append(args, "--project-directory", usage.ProjectDir)
+	}
+	for _, envFile := range usage.EnvFiles {
+		if strings.TrimSpace(envFile) != "" {
+			args = append(args, "--env-file", envFile)
+		}
+	}
+	args = append(args, dockermgr.ComposeFileArgs(usage.Files)...)
+	if strings.TrimSpace(usage.ProjectName) != "" {
+		args = append(args, "-p", strings.TrimSpace(usage.ProjectName))
+	}
+	return append(args, "down", "--volumes", "--remove-orphans")
 }
 
 var stageCTestArtifactNames = map[string]bool{
@@ -303,7 +365,7 @@ func cleanupStageCTestArtifacts(repoPath string) stageCTestArtifactCleanup {
 	return cleanup
 }
 
-func runTestsHostComposeFiles(runtime RuntimeState) []string {
+func runTestsHostComposeFiles(runtime RuntimeState, artifactRoot string) []string {
 	runtime.Normalize()
 	files := runtime.ComposeFiles
 	if len(files) == 0 && strings.TrimSpace(runtime.ComposeFile) != "" {
@@ -311,13 +373,58 @@ func runTestsHostComposeFiles(runtime RuntimeState) []string {
 	}
 	result := make([]string, 0, len(files))
 	for _, file := range files {
-		switch filepath.Base(file) {
-		case "compose.env.yml", "compose.ports.yml", "runtime_labels.compose.yml", "stage_c.runner.override.yml":
+		if stageCTestRuntimeOnlyComposeFile(file, artifactRoot) {
 			continue
 		}
 		result = append(result, file)
 	}
 	return result
+}
+
+func stageCTestRuntimeOnlyComposeFile(file, artifactRoot string) bool {
+	file = filepath.Clean(strings.TrimSpace(file))
+	artifactRoot = filepath.Clean(strings.TrimSpace(artifactRoot))
+	if file == "" || artifactRoot == "" {
+		return false
+	}
+	for _, generated := range []string{
+		filepath.Join(artifactRoot, "docker_runtime", "compose.ports.yml"),
+		filepath.Join(artifactRoot, "docker_runtime", "compose.networks.yml"),
+		filepath.Join(artifactRoot, "runtime_labels.compose.yml"),
+		filepath.Join(artifactRoot, "stage_c.runner.override.yml"),
+	} {
+		if filepath.Clean(generated) == file {
+			return true
+		}
+	}
+	return false
+}
+
+func (r Runner) stageCTestComposePlanForRuntime(ctx context.Context, runtime RuntimeState, artifactRoot, projectName string) stageCTestComposePlan {
+	plan := stageCTestComposePlan{
+		Project:      projectName,
+		ComposeFiles: runTestsHostComposeFiles(runtime, artifactRoot),
+	}
+	if len(plan.ComposeFiles) == 0 {
+		plan.Warnings = append(plan.Warnings, "stage C network ipam override skipped: compose file set is empty")
+		return plan
+	}
+	config := r.exec.Run(ctx, 30*time.Second, runtime.WorkDir, dockerCommandEnv(), "docker", dockermgr.ComposeCommandArgsWithProjectDirAndEnvFiles(plan.ComposeFiles, runtime.WorkDir, projectName, runtime.EnvFiles, "config")...)
+	if config.Err != nil {
+		plan.Warnings = append(plan.Warnings, "stage C network ipam override skipped: docker compose config failed: "+stageCTrimResult(config))
+		return plan
+	}
+	if strings.TrimSpace(config.Stdout) == "" {
+		plan.Warnings = append(plan.Warnings, "stage C network ipam override skipped: docker compose config output is empty")
+		return plan
+	}
+	summary := dockermgr.PrepareRuntimeNetworkIPAMOverrideFile(config.Stdout, filepath.Join(artifactRoot, "stage_c", "compose.networks.yml"), projectName)
+	plan.Warnings = append(plan.Warnings, summary.Warnings...)
+	if summary.Generated {
+		plan.NetworkIPAM = &summary
+		plan.ComposeFiles = append(plan.ComposeFiles, summary.ComposeFile)
+	}
+	return plan
 }
 
 func stageCTestComposeProject(prefix, taskID, runID string) string {

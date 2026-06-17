@@ -22,6 +22,13 @@ type RuntimeFailureDiagnostics struct {
 	Warnings []string                   `json:"warnings,omitempty"`
 }
 
+type RuntimeFailureClassification struct {
+	Category string `json:"category,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Cause    string `json:"cause,omitempty"`
+	Fix      string `json:"fix,omitempty"`
+}
+
 type RuntimeDiagnosticCommand struct {
 	Name     string `json:"name"`
 	Command  string `json:"command"`
@@ -30,6 +37,17 @@ type RuntimeDiagnosticCommand struct {
 	Stdout   string `json:"stdout,omitempty"`
 	Stderr   string `json:"stderr,omitempty"`
 	Error    string `json:"error,omitempty"`
+}
+
+func ClassifyRuntimeFailureResult(result executor.Result) (RuntimeFailureClassification, bool) {
+	category, title, cause, fix := classifyRuntimeFailure(runtimeFailureDiagnosticRequest{Result: result}, nil)
+	classification := RuntimeFailureClassification{
+		Category: category,
+		Title:    title,
+		Cause:    cause,
+		Fix:      fix,
+	}
+	return classification, strings.TrimSpace(category) != ""
 }
 
 type runtimeFailureDiagnosticRequest struct {
@@ -196,6 +214,8 @@ func classifyRuntimeFailure(req runtimeFailureDiagnosticRequest, commands []Runt
 	switch {
 	case strings.Contains(text, "all predefined address pools have been fully subnetted") ||
 		strings.Contains(text, "could not find an available, non-overlapping ipv4 address pool") ||
+		strings.Contains(text, "invalid pool request") ||
+		strings.Contains(text, "pool overlaps with other one on this address space") ||
 		strings.Contains(text, "no available network"):
 		return "docker_address_pool_exhausted",
 			"Docker address pools are exhausted",

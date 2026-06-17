@@ -29,15 +29,20 @@ type networkIPAMPreparation struct {
 }
 
 func prepareRuntimeNetworkIPAMOverride(effectiveConfig, artifactRoot, projectName string) networkIPAMPreparation {
+	path := filepath.Join(artifactRoot, "docker_runtime", "compose.networks.yml")
+	return networkIPAMPreparation{Summary: PrepareRuntimeNetworkIPAMOverrideFile(effectiveConfig, path, projectName)}
+}
+
+func PrepareRuntimeNetworkIPAMOverrideFile(effectiveConfig, path, projectName string) RuntimeNetworkIPAMSummary {
 	summary := RuntimeNetworkIPAMSummary{}
-	if strings.TrimSpace(artifactRoot) == "" {
-		summary.Warnings = append(summary.Warnings, "runtime network ipam override skipped: artifact root is empty")
-		return networkIPAMPreparation{Summary: summary}
+	if strings.TrimSpace(path) == "" {
+		summary.Warnings = append(summary.Warnings, "runtime network ipam override skipped: output path is empty")
+		return summary
 	}
 	networks, parsed, warnings := internalComposeNetworks(effectiveConfig)
 	summary.Warnings = append(summary.Warnings, warnings...)
 	if !parsed {
-		return networkIPAMPreparation{Summary: summary}
+		return summary
 	}
 	if len(networks) == 0 {
 		networks = []string{"default"}
@@ -54,22 +59,20 @@ func prepareRuntimeNetworkIPAMOverride(effectiveConfig, artifactRoot, projectNam
 	content, err := marshalRuntimeNetworkIPAMOverride(entries)
 	if err != nil {
 		summary.Warnings = append(summary.Warnings, "runtime network ipam override skipped: marshal compose: "+err.Error())
-		return networkIPAMPreparation{Summary: summary}
+		return summary
 	}
-	dir := filepath.Join(artifactRoot, "docker_runtime")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		summary.Warnings = append(summary.Warnings, "runtime network ipam override skipped: create artifact dir: "+err.Error())
-		return networkIPAMPreparation{Summary: summary}
+		return summary
 	}
-	path := filepath.Join(dir, "compose.networks.yml")
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		summary.Warnings = append(summary.Warnings, "runtime network ipam override skipped: write compose override: "+err.Error())
-		return networkIPAMPreparation{Summary: summary}
+		return summary
 	}
 	summary.Generated = true
 	summary.ComposeFile = path
 	summary.Networks = entries
-	return networkIPAMPreparation{Summary: summary}
+	return summary
 }
 
 func internalComposeNetworks(effectiveConfig string) ([]string, bool, []string) {

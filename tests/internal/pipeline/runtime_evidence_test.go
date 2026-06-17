@@ -641,10 +641,16 @@ func TestStageBUsesScriptInputSnapshotRepoWhenPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{snapshotRepo, `"compose_project": "snapshot"`, `"compose_project_source": "compose_name"`} {
-		if !strings.Contains(string(summary), want) {
-			t.Fatalf("runtime summary missing %q:\n%s", want, summary)
-		}
+	var payload struct {
+		WorkDir              string `json:"work_dir"`
+		ComposeProject       string `json:"compose_project"`
+		ComposeProjectSource string `json:"compose_project_source"`
+	}
+	if err := json.Unmarshal(summary, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.WorkDir != snapshotRepo || payload.ComposeProject != "snapshot" || payload.ComposeProjectSource != "compose_name" {
+		t.Fatalf("runtime summary used wrong repo/project: %#v\n%s", payload, summary)
 	}
 }
 
@@ -844,7 +850,7 @@ func TestRunTestsComposeUsageDetectsPathAndVariableCommands(t *testing.T) {
 		`#!/usr/bin/env bash`,
 		`COMPOSE_CMD="/usr/local/bin/docker compose"`,
 		`$COMPOSE_CMD exec -T backend pytest`,
-		`/usr/bin/docker-compose -p custom up -d backend`,
+		`/usr/bin/docker-compose --project-directory ./ops --env-file test.env -f compose.test.yml -p=custom up -d backend`,
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -853,6 +859,9 @@ func TestRunTestsComposeUsageDetectsPathAndVariableCommands(t *testing.T) {
 	usage := pipelinepkg.RunTestsComposeUsageForTest(repoPath)
 	if !usage.Uses || !usage.StartsStack || !usage.ExplicitProject {
 		t.Fatalf("compose usage not classified correctly: %#v", usage)
+	}
+	if usage.ProjectName != "custom" || usage.ProjectDir != "./ops" || !slices.Contains(usage.Files, "compose.test.yml") || !slices.Contains(usage.EnvFiles, "test.env") {
+		t.Fatalf("compose cleanup metadata not captured: %#v", usage)
 	}
 }
 
@@ -1002,7 +1011,7 @@ func TestStageCIsolatedRejectsDockerComposeOwningRunTests(t *testing.T) {
 	}
 }
 
-func TestStageCHostComposeOwningRunTestsKeepsMirrorOverrideOnly(t *testing.T) {
+func TestStageCHostComposeOwningRunTestsKeepsMirrorAndRegeneratesNetworkOverride(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///tmp/p2r-test-docker.sock")
 	root := t.TempDir()
 	projectPath := filepath.Join(root, "batch", "TASK-1")
@@ -1020,6 +1029,7 @@ func TestStageCHostComposeOwningRunTestsKeepsMirrorOverrideOnly(t *testing.T) {
 	portOverride := filepath.Join(artifactRoot, "docker_runtime", "compose.ports.yml")
 	envOverride := filepath.Join(artifactRoot, "docker_runtime", "compose.env.yml")
 	envFile := filepath.Join(artifactRoot, "docker_runtime", "runtime.env")
+	networkOverride := filepath.Join(artifactRoot, "docker_runtime", "compose.networks.yml")
 	mirrorOverride := filepath.Join(artifactRoot, "docker_mirror", "compose.mirror.override.yml")
 	labelOverride := filepath.Join(artifactRoot, "runtime_labels.compose.yml")
 	if err := os.MkdirAll(filepath.Dir(envFile), 0o755); err != nil {
@@ -1028,7 +1038,10 @@ func TestStageCHostComposeOwningRunTestsKeepsMirrorOverrideOnly(t *testing.T) {
 	if err := os.WriteFile(envFile, []byte("APP_ENV=stage-c\nSECRET_KEY=from-env-file\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runner := &stageCHostEnvRunner{}
+	if err := os.WriteFile(envOverride, []byte("services:\n  backend:\n    env_file: !override\n      - "+envFile+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &stageCHostEnvRunner{configStdout: "services:\n  backend:\n    image: nginx\n    networks:\n      cvnet: null\nnetworks:\n  cvnet:\n    name: p2rqa_task_run_tests_cvnet\n"}
 	cfg := config.Default()
 	cfg.Pipeline.StageC.Execution = "host"
 	record := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(runner)).StageCForTest(context.Background(), model.RunRecord{
@@ -1038,7 +1051,7 @@ func TestStageCHostComposeOwningRunTestsKeepsMirrorOverrideOnly(t *testing.T) {
 	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
 		ComposeProject: "p2rqa_task_run",
 		ComposeFile:    composePath,
-		ComposeFiles:   []string{composePath, envOverride, portOverride, mirrorOverride, labelOverride},
+		ComposeFiles:   []string{composePath, envOverride, portOverride, networkOverride, mirrorOverride, labelOverride},
 		EnvFiles:       []string{envFile},
 		WorkDir:        repoPath,
 		Mappings: map[string][]portMapping{
@@ -1060,15 +1073,74 @@ func TestStageCHostComposeOwningRunTestsKeepsMirrorOverrideOnly(t *testing.T) {
 		t.Fatalf("compose run_tests should receive generated runtime env-file values without logging them: %#v", values)
 	}
 	composeEnv := values["COMPOSE_FILE"]
-	if !strings.Contains(composeEnv, composePath) || !strings.Contains(composeEnv, mirrorOverride) {
-		t.Fatalf("COMPOSE_FILE should retain original plus mirror override, got %q", composeEnv)
+	if !strings.Contains(composeEnv, composePath) || !strings.Contains(composeEnv, envOverride) || !strings.Contains(composeEnv, mirrorOverride) {
+		t.Fatalf("COMPOSE_FILE should retain original plus env and mirror overrides, got %q", composeEnv)
 	}
-	if strings.Contains(composeEnv, envOverride) || strings.Contains(composeEnv, portOverride) || strings.Contains(composeEnv, labelOverride) {
+	stageCNetworkOverride := filepath.Join(artifactRoot, "stage_c", "compose.networks.yml")
+	if !strings.Contains(composeEnv, stageCNetworkOverride) {
+		t.Fatalf("COMPOSE_FILE should include Stage C network override, got %q", composeEnv)
+	}
+	if strings.Contains(composeEnv, portOverride) || strings.Contains(composeEnv, networkOverride) || strings.Contains(composeEnv, labelOverride) {
 		t.Fatalf("COMPOSE_FILE should omit p2r runtime-only overrides, got %q", composeEnv)
+	}
+	networkContent, err := os.ReadFile(stageCNetworkOverride)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(networkContent), "cvnet:") || !strings.Contains(string(networkContent), "subnet: 100.") || strings.Contains(string(networkContent), "100.96.1.0/24") {
+		t.Fatalf("Stage C network override should be regenerated from the test compose project:\n%s", networkContent)
 	}
 }
 
-func TestStageCHostSkipsGenericComposeCleanupForExplicitProject(t *testing.T) {
+func TestStageCHostClassifiesComposeNetworkPoolOverlap(t *testing.T) {
+	root := t.TempDir()
+	projectPath := filepath.Join(root, "batch", "TASK-1")
+	repoPath := filepath.Join(projectPath, "repo")
+	artifactRoot := filepath.Join(root, "artifacts")
+	for _, dir := range []string{repoPath, filepath.Join(artifactRoot, "logs")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "run_tests.sh"), []byte("#!/usr/bin/env bash\ndocker compose up -d backend\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &stageCHostFailureRunner{
+		configStdout: "services:\n  backend:\n    image: nginx\nnetworks:\n  default:\n    name: p2rqa_task_run_tests_default\n",
+		stderr:       "failed to create network p2rqa_default: Error response from daemon: invalid pool request: Pool overlaps with other one on this address space",
+	}
+	cfg := config.Default()
+	cfg.Pipeline.StageC.Execution = "host"
+	record := pipelinepkg.NewRunner(nil, cfg, pipelinepkg.WithCommandRunner(runner)).StageCForTest(context.Background(), model.RunRecord{
+		RunID:        "run-1",
+		TaskID:       "TASK-1",
+		ArtifactRoot: artifactRoot,
+	}, scanner.Project{TaskID: "TASK-1", Path: projectPath}, testRuntimeEvidence{
+		ComposeProject: "p2rqa_task_run",
+		ComposeFile:    filepath.Join(repoPath, "docker-compose.yml"),
+		ComposeFiles:   []string{filepath.Join(repoPath, "docker-compose.yml")},
+		WorkDir:        repoPath,
+		Mappings: map[string][]portMapping{
+			"backend": {{Service: "backend", URL: "0.0.0.0", Host: 32777, Container: 8000, Protocol: "tcp"}},
+		},
+	}, map[string]model.StageRecord{string(model.StageB): {Stage: "B", Status: model.StageDone}})
+
+	if record.Status != model.StageFailed || !strings.Contains(record.ErrorSummary, "docker_address_pool_exhausted") {
+		t.Fatalf("Stage C should classify Docker network overlap, got %#v", record)
+	}
+	if len(record.Findings) == 0 || record.Findings[0].Title != "Docker address pools are exhausted" {
+		t.Fatalf("Stage C finding should expose Docker network failure, got %#v", record.Findings)
+	}
+	content, err := os.ReadFile(filepath.Join(artifactRoot, "test_runtime_summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), `"category": "docker_address_pool_exhausted"`) {
+		t.Fatalf("summary should include failure classification:\n%s", content)
+	}
+}
+
+func TestStageCHostCleansExplicitComposeProject(t *testing.T) {
 	root := t.TempDir()
 	projectPath := filepath.Join(root, "batch", "TASK-1")
 	repoPath := filepath.Join(projectPath, "repo")
@@ -1101,10 +1173,10 @@ func TestStageCHostSkipsGenericComposeCleanupForExplicitProject(t *testing.T) {
 	if record.Status != model.StageDone {
 		t.Fatalf("Stage C should pass, got %#v", record)
 	}
-	if slices.ContainsFunc(runner.commands, func(command string) bool {
-		return strings.Contains(command, " compose down ")
+	if !slices.ContainsFunc(runner.commands, func(command string) bool {
+		return strings.Contains(command, " compose -p custom-tests down ")
 	}) {
-		t.Fatalf("explicit -p script should not get unrelated generic cleanup: %#v", runner.commands)
+		t.Fatalf("explicit -p script should clean its compose project: %#v", runner.commands)
 	}
 }
 
@@ -1285,8 +1357,9 @@ func (r *stageCIsolatedRunner) result(name string, args ...string) executor.Resu
 }
 
 type stageCHostEnvRunner struct {
-	env      []string
-	commands []string
+	env          []string
+	commands     []string
+	configStdout string
 }
 
 func (r *stageCHostEnvRunner) LookPath(name string) (string, error) {
@@ -1296,6 +1369,9 @@ func (r *stageCHostEnvRunner) LookPath(name string) (string, error) {
 func (r *stageCHostEnvRunner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
 	command := strings.Join(append([]string{name}, args...), " ")
 	r.commands = append(r.commands, command)
+	if strings.Contains(command, " config") {
+		return executor.Result{Command: command, Stdout: r.configStdout}
+	}
 	return executor.Result{Command: command}
 }
 
@@ -1310,6 +1386,40 @@ func (r *stageCHostEnvRunner) RunStreamingWithOutput(ctx context.Context, timeou
 		onOutput("ok", "stdout")
 	}
 	return executor.Result{Command: command, Stdout: "ok\n"}
+}
+
+type stageCHostFailureRunner struct {
+	env          []string
+	commands     []string
+	configStdout string
+	stderr       string
+}
+
+func (r *stageCHostFailureRunner) LookPath(name string) (string, error) {
+	return name, nil
+}
+
+func (r *stageCHostFailureRunner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	command := strings.Join(append([]string{name}, args...), " ")
+	r.commands = append(r.commands, command)
+	if strings.Contains(command, " config") {
+		return executor.Result{Command: command, Stdout: r.configStdout}
+	}
+	return executor.Result{Command: command}
+}
+
+func (r *stageCHostFailureRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput executor.OutputCallback, name string, args ...string) executor.Result {
+	r.env = append([]string{}, env...)
+	command := strings.Join(append([]string{name}, args...), " ")
+	r.commands = append(r.commands, command)
+	result := executor.Result{Command: command, ExitCode: 1, Stderr: r.stderr, Err: fmt.Errorf("run_tests failed")}
+	if writer != nil {
+		_, _ = writer.Write([]byte(result.Stderr))
+	}
+	if onOutput != nil && strings.TrimSpace(result.Stderr) != "" {
+		onOutput(strings.TrimSpace(result.Stderr), "stderr")
+	}
+	return result
 }
 
 type cancelledStageCIsolatedRunner struct {

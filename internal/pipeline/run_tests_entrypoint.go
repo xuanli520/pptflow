@@ -13,6 +13,10 @@ type runTestsComposeUsage struct {
 	Uses            bool
 	StartsStack     bool
 	ExplicitProject bool
+	ProjectName     string
+	Files           []string
+	ProjectDir      string
+	EnvFiles        []string
 }
 
 type runTestsRuntimeUsage struct {
@@ -75,6 +79,12 @@ func inspectRunTestsRuntime(repoPath string) runTestsRuntimeUsage {
 			usage.Compose.Uses = true
 			usage.Compose.StartsStack = usage.Compose.StartsStack || composeCommand.StartsStack
 			usage.Compose.ExplicitProject = usage.Compose.ExplicitProject || composeCommand.StartsStack && composeCommand.ExplicitProject
+			if composeCommand.StartsStack {
+				usage.Compose.ProjectName = firstNonEmpty(usage.Compose.ProjectName, composeCommand.ProjectName)
+				usage.Compose.ProjectDir = firstNonEmpty(usage.Compose.ProjectDir, composeCommand.ProjectDir)
+				usage.Compose.Files = append(usage.Compose.Files, composeCommand.Files...)
+				usage.Compose.EnvFiles = append(usage.Compose.EnvFiles, composeCommand.EnvFiles...)
+			}
 		}
 	}
 	if len(endpointHints) > 0 {
@@ -88,6 +98,10 @@ type runTestsComposeCommand struct {
 	Uses            bool
 	StartsStack     bool
 	ExplicitProject bool
+	ProjectName     string
+	Files           []string
+	ProjectDir      string
+	EnvFiles        []string
 }
 
 func classifyComposeCommand(words []string, composeVars map[string]bool) runTestsComposeCommand {
@@ -97,6 +111,12 @@ func classifyComposeCommand(words []string, composeVars map[string]bool) runTest
 		result.Uses = result.Uses || command.Uses
 		result.StartsStack = result.StartsStack || command.StartsStack
 		result.ExplicitProject = result.ExplicitProject || command.StartsStack && command.ExplicitProject
+		if command.StartsStack {
+			result.ProjectName = firstNonEmpty(result.ProjectName, command.ProjectName)
+			result.ProjectDir = firstNonEmpty(result.ProjectDir, command.ProjectDir)
+			result.Files = append(result.Files, command.Files...)
+			result.EnvFiles = append(result.EnvFiles, command.EnvFiles...)
+		}
 	}
 	return result
 }
@@ -262,8 +282,18 @@ func classifyComposeSubcommand(words []string, index int, explicitProject bool) 
 	command := runTestsComposeCommand{Uses: true, ExplicitProject: explicitProject}
 	for index < len(words) {
 		word := words[index]
-		if word == "-p" || (strings.HasPrefix(word, "-p") && !strings.HasPrefix(word, "--")) || word == "--project-name" || strings.HasPrefix(word, "--project-name=") {
+		if value, ok := shellOptionValue(words, index, "-p", "--project-name"); ok {
 			command.ExplicitProject = true
+			command.ProjectName = firstNonEmpty(command.ProjectName, value)
+		}
+		if value, ok := shellOptionValue(words, index, "-f", "--file"); ok {
+			command.Files = append(command.Files, value)
+		}
+		if value, ok := shellOptionValue(words, index, "", "--project-directory"); ok {
+			command.ProjectDir = firstNonEmpty(command.ProjectDir, value)
+		}
+		if value, ok := shellOptionValue(words, index, "", "--env-file"); ok {
+			command.EnvFiles = append(command.EnvFiles, value)
 		}
 		if !strings.HasPrefix(word, "-") {
 			command.StartsStack = runTestsComposeStartSubcommand(word)
@@ -272,6 +302,28 @@ func classifyComposeSubcommand(words []string, index int, explicitProject bool) 
 		index += 1 + shellOptionValueCount(word)
 	}
 	return command
+}
+
+func shellOptionValue(words []string, index int, short, long string) (string, bool) {
+	if index < 0 || index >= len(words) {
+		return "", false
+	}
+	word := strings.TrimSpace(words[index])
+	switch {
+	case word == short || word == long:
+		if index+1 < len(words) {
+			return strings.TrimSpace(words[index+1]), true
+		}
+		return "", true
+	case short != "" && strings.HasPrefix(word, short+"="):
+		return strings.TrimSpace(strings.TrimPrefix(word, short+"=")), true
+	case short != "" && strings.HasPrefix(word, short) && !strings.HasPrefix(word, "--") && len(word) > len(short):
+		return strings.TrimSpace(strings.TrimPrefix(word, short)), true
+	case long != "" && strings.HasPrefix(word, long+"="):
+		return strings.TrimSpace(strings.TrimPrefix(word, long+"=")), true
+	default:
+		return "", false
+	}
 }
 
 func shellAssignmentsSetProject(words []string) bool {

@@ -54,6 +54,10 @@ type TestRunTestsComposeUsage struct {
 	Uses            bool
 	StartsStack     bool
 	ExplicitProject bool
+	ProjectName     string
+	Files           []string
+	ProjectDir      string
+	EnvFiles        []string
 }
 
 type TestStageCExecutionDecision struct {
@@ -385,6 +389,10 @@ func RunTestsComposeUsageForTest(repoPath string) TestRunTestsComposeUsage {
 		Uses:            usage.Uses,
 		StartsStack:     usage.StartsStack,
 		ExplicitProject: usage.ExplicitProject,
+		ProjectName:     usage.ProjectName,
+		Files:           append([]string{}, usage.Files...),
+		ProjectDir:      usage.ProjectDir,
+		EnvFiles:        append([]string{}, usage.EnvFiles...),
 	}
 }
 

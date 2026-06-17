@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -29,6 +31,8 @@ type Store struct {
 	db      *sql.DB
 	writeMu sync.Mutex
 }
+
+var taskEventIDCounter atomic.Uint64
 
 type ProjectSummary struct {
 	TaskID        string
@@ -1939,7 +1943,11 @@ func normalizeTaskEvent(event model.TaskEvent, now string) model.TaskEvent {
 }
 
 func newTaskEventID(taskID, kind, createdAt string) string {
-	seed := fmt.Sprintf("%s|%s|%s|%d", taskID, kind, createdAt, time.Now().UnixNano())
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err == nil {
+		return "evt_" + hex.EncodeToString(random[:])[:24]
+	}
+	seed := fmt.Sprintf("%s|%s|%s|%d|%d", taskID, kind, createdAt, time.Now().UnixNano(), taskEventIDCounter.Add(1))
 	sum := sha256.Sum256([]byte(seed))
 	return "evt_" + hex.EncodeToString(sum[:])[:24]
 }
