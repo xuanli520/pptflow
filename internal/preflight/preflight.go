@@ -75,6 +75,15 @@ func (r CheckResult) BlockingCheck(stage string) (Check, bool) {
 	return Check{}, false
 }
 
+func (r CheckResult) NodePath() string {
+	for _, check := range r.Checks {
+		if check.Name == "node" && strings.TrimSpace(check.Path) != "" && check.Status != "missing" {
+			return check.Path
+		}
+	}
+	return ""
+}
+
 func checkBinary(ctx context.Context, exec executor.CommandRunner, name string, versionArgs []string, candidates []string, stages []string, missing string) Check {
 	path, err := exec.LookPath(name)
 	if err != nil || path == "" {

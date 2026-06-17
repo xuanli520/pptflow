@@ -12,6 +12,7 @@ import (
 	"github.com/xuanli520/p2r_tui/internal/config"
 	dockermgr "github.com/xuanli520/p2r_tui/internal/docker"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/stageg"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 )
 
@@ -451,7 +452,7 @@ func ExtractJSONObjectForTest(raw string) (string, error) {
 }
 
 func StageGBrowserContextForTest(projectPath string) string {
-	return stageGBrowserContext(projectPath)
+	return stageg.BrowserContext(projectPath)
 }
 
 func BrowserActionPromptForTest(templateText, profile, contextText string) (string, error) {
@@ -471,7 +472,7 @@ func BrowserActionPromptForTest(templateText, profile, contextText string) (stri
 }
 
 func ValidateBrowserActionForTest(action TestBrowserAction, candidates []TestBrowserURLCandidate) *TestBlockedBrowserAction {
-	validation := validateBrowserAction(action, candidates, "")
+	validation := stageg.ValidateBrowserAction(action, candidates, "")
 	if validation.Blocked == nil {
 		return nil
 	}
@@ -480,78 +481,78 @@ func ValidateBrowserActionForTest(action TestBrowserAction, candidates []TestBro
 }
 
 func ParseFrontendE2ESummaryForTest(raw []byte) (TestFrontendE2ESummary, error) {
-	return parseFrontendE2ESummary(raw)
+	return stageg.ParseSummary(raw)
 }
 
 func FrontendE2EObservationFindingsForTest(observations []TestBrowserObservation, includeActionFailures bool) []model.Finding {
-	return frontendE2EObservationFindings(observations, "frontend_e2e_screenshot.png", includeActionFailures)
+	return stageg.ObservationFindings(observations, "frontend_e2e_screenshot.png", includeActionFailures)
 }
 
 func StageGLogObservationForTest(round int, observation TestBrowserObservation) string {
-	return stageGLogObservation(round, observation)
+	return stageg.LogObservation(round, observation)
 }
 
 func StageGFinishedStatusForTest(record model.StageRecord) string {
-	return stageGFinishedStatus(record)
+	return stageg.FinishedStatus(record)
 }
 
 func StageGFinishScreenshotBlockReasonForTest(observations []TestBrowserObservation) string {
-	return stageGFinishScreenshotBlockReason(observations)
+	return stageg.FinishScreenshotBlockReason(observations)
 }
 
 func StageGFinishScreenshotBlockReasonForSummaryForTest(summary TestFrontendE2ESummary, observations []TestBrowserObservation) string {
-	return stageGFinishScreenshotBlockReasonForSummary(summary, observations)
+	return stageg.FinishScreenshotBlockReasonForSummary(summary, observations)
 }
 
 func StageGPartialProductBlockerFindingForTest(observations []TestBrowserObservation, reason string) (model.Finding, bool) {
-	return stageGPartialProductBlockerFinding(observations, reason)
+	return stageg.PartialProductBlockerFinding(observations, reason)
 }
 
 func StageGNativeDialogBoundaryEvidenceForTest(observations []TestBrowserObservation) string {
-	return stageGNativeDialogBoundaryEvidence(observations)
+	return stageg.NativeDialogBoundaryEvidence(observations)
 }
 
 func StageGPositiveEvidenceOutcomeForTest(candidates []TestBrowserURLCandidate, observations []TestBrowserObservation, blocked []TestBlockedBrowserAction, reason string) (TestFrontendE2ESummary, bool) {
-	return stageGPositiveEvidenceOutcome(candidates, observations, blocked, reason)
+	return stageg.PositiveEvidenceOutcome(candidates, observations, blocked, reason)
 }
 
 func AppendStageGRepoSnapshotFindingsForTest(record model.StageRecord, summary TestFrontendE2ESummary, repoPath string, before map[string]string) (model.StageRecord, TestFrontendE2ESummary) {
-	return appendStageGRepoSnapshotFindings(record, summary, repoPath, before)
+	return stageg.AppendRepoSnapshotFindings(record, summary, repoPath, before)
 }
 
 func StageGObservationStopReasonForTest(observations []TestBrowserObservation) string {
-	return stageGObservationStopReason(observations)
+	return stageg.ObservationStopReason(observations)
 }
 
 func StageGAuthGateStallEvidenceForTest(observations []TestBrowserObservation) string {
-	return stageGAuthGateStallEvidence(observations)
+	return stageg.AuthGateStallEvidence(observations)
 }
 
 func StageGRepeatedStateStallEvidenceForTest(observations []TestBrowserObservation) string {
-	return stageGRepeatedStateStallEvidence(observations)
+	return stageg.RepeatedStateStallEvidence(observations)
 }
 
 func StageGKeyScreenshotObservationIndexesForTest(observations []TestBrowserObservation) []int {
-	return stageGKeyScreenshotObservationIndexes(observations)
+	return stageg.KeyScreenshotObservationIndexes(observations)
 }
 
 func MaterializeStageGScreenshotArtifactsForTest(root string, summary TestFrontendE2ESummary, observations []TestBrowserObservation) (TestFrontendE2ESummary, []TestBrowserObservation, model.StageRecord) {
 	record := model.StageRecord{Stage: string(model.StageG)}
 	writer := NewArtifactWriter(root)
-	record, summary, observations = materializeStageGScreenshotArtifacts(record, writer, summary, observations)
+	record, summary, observations = stageg.MaterializeScreenshotArtifacts(record, writer, summary, observations)
 	return summary, observations, record
 }
 
 func IncludeStageGActionFailureFallbackForTest(summary TestFrontendE2ESummary, summaryFindings []model.Finding) bool {
-	return includeStageGActionFailureFallback(summary, summaryFindings)
+	return stageg.IncludeActionFailureFallback(summary, summaryFindings)
 }
 
 func SnapshotRepoForTest(repoPath string) (map[string]string, error) {
-	return snapshotRepo(repoPath)
+	return stageg.SnapshotRepo(repoPath)
 }
 
 func RepoSnapshotDiffForTest(before, after map[string]string) []string {
-	return repoSnapshotDiff(before, after)
+	return stageg.RepoSnapshotDiff(before, after)
 }
 
 func WriteStageStatusForTest(runID, artifactRoot string, stages []model.StageRecord) error {

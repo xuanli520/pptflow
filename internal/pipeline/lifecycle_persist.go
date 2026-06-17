@@ -8,6 +8,7 @@ import (
 	"github.com/xuanli520/p2r_tui/assets"
 	"github.com/xuanli520/p2r_tui/internal/displaytime"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/stageg"
 	"github.com/xuanli520/p2r_tui/internal/scanner"
 	"github.com/xuanli520/p2r_tui/internal/taskdocs"
 )
@@ -46,7 +47,7 @@ func (r Runner) writeRunManifest(run model.RunRecord, project scanner.Project, o
 		"run_failure_summary":   "run_failure_summary.md",
 		"stage_timeouts":        r.cfg.Pipeline.StageTimeouts,
 		"stage_g": map[string]any{
-			"planner_turn_timeout_seconds": stageGPlannerTurnTimeoutSeconds(r.cfg.Pipeline.StageG),
+			"planner_turn_timeout_seconds": stageg.PlannerTurnTimeoutSeconds(r.cfg.Pipeline.StageG),
 		},
 		"tool_versions": map[string]string{"p2r": "dev"},
 		"assets":        released,

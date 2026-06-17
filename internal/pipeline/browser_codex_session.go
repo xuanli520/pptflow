@@ -14,6 +14,7 @@ import (
 	browserpkg "github.com/xuanli520/p2r_tui/internal/browser"
 	"github.com/xuanli520/p2r_tui/internal/codex"
 	"github.com/xuanli520/p2r_tui/internal/pipeline/model"
+	"github.com/xuanli520/p2r_tui/internal/pipeline/stageg"
 )
 
 func (r Runner) nextBrowserAction(ctx context.Context, sc StageContext, promptTemplate, profile, contextText string, candidates []BrowserURLCandidate, observations []browserpkg.Observation, blocked []BlockedBrowserAction, round int, timeout time.Duration) (string, []ArtifactWarning, error) {
@@ -93,9 +94,9 @@ func browserActionPromptDataForStage(sc StageContext, profile, contextText strin
 		ProjectPath:              sc.Project.Path,
 		ArtifactRoot:             sc.Run.ArtifactRoot,
 		Round:                    round,
-		MinimumScreenshotCount:   stageGMinBrowserScreenshots,
-		MaximumScreenshotCount:   stageGMaxBrowserScreenshots,
-		CurrentScreenshotCount:   stageGBrowserScreenshotCount(observations),
+		MinimumScreenshotCount:   stageg.MinBrowserScreenshots,
+		MaximumScreenshotCount:   stageg.MaxBrowserScreenshots,
+		CurrentScreenshotCount:   stageg.BrowserScreenshotCount(observations),
 		URLCandidatesJSON:        string(candidateJSON),
 		PreviousObservationsJSON: string(observationJSON),
 		BlockedActionsJSON:       string(blockedJSON),
@@ -105,7 +106,7 @@ func browserActionPromptDataForStage(sc StageContext, profile, contextText strin
 }
 
 func browserActionPrompt(templateText string, data browserActionPromptData) (string, error) {
-	parsed, err := template.New(stageGBrowserActionPromptTemplateName).Option("missingkey=error").Parse(templateText)
+	parsed, err := template.New(stageg.BrowserActionPromptTemplateName).Option("missingkey=error").Parse(templateText)
 	if err != nil {
 		return "", fmt.Errorf("parse Stage G browser prompt template: %w", err)
 	}

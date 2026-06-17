@@ -1,4 +1,4 @@
-package pipeline
+package stageg
 
 import (
 	"crypto/sha256"
