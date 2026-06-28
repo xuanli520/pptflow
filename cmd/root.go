@@ -22,16 +22,10 @@ func Execute() {
 
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "p2r",
-		Short: "prompt2repo QA orchestration CLI",
+		Use:   "pptflow",
+		Short: "PPTflow local phase 0 runner",
 	}
-	root.AddCommand(newScanCommand())
-	root.AddCommand(newRunCommand())
-	root.AddCommand(newAttachCommand())
-	root.AddCommand(newDocsCommand())
-	root.AddCommand(newStatusCommand())
+	root.AddCommand(newPhase0Command())
 	root.AddCommand(newTUICommand())
-	root.AddCommand(newAdminCommand())
-	root.AddCommand(newVersionCommand())
 	return root
 }

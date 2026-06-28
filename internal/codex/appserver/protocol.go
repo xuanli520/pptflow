@@ -131,7 +131,7 @@ func (s *appServerCodexReviewSession) respondUnsupported(id json.RawMessage, met
 		"jsonrpc": "2.0",
 		"error": map[string]any{
 			"code":    -32601,
-			"message": "p2r app-server client does not implement server request method " + method,
+			"message": "pptflow app-server client does not implement server request method " + method,
 		},
 	}
 	var payload map[string]json.RawMessage
@@ -183,7 +183,7 @@ func appServerThreadStartParams(request Request) map[string]any {
 		"approvalPolicy": "never",
 		"cwd":            request.ProjectPath,
 		"ephemeral":      true,
-		"sandbox":        "read-only",
+		"sandbox":        normalizeSandboxMode(request.SandboxMode),
 	}
 	setAppServerModelParam(params, request.Model)
 	return params
@@ -198,13 +198,29 @@ func appServerTurnStartParams(request Request, threadID string) map[string]any {
 			"text": request.Prompt,
 		}},
 		"sandboxPolicy": map[string]any{
-			"type":          "readOnly",
-			"networkAccess": false,
+			"type":          normalizeSandboxPolicy(request.SandboxPolicy),
+			"networkAccess": request.NetworkAccess,
 		},
 		"threadId": threadID,
 	}
 	setAppServerModelParam(params, request.Model)
 	return params
+}
+
+func normalizeSandboxMode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "read-only"
+	}
+	return value
+}
+
+func normalizeSandboxPolicy(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "readOnly"
+	}
+	return value
 }
 
 func setAppServerModelParam(params map[string]any, model string) {

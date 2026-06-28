@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/pptflow/internal/executor"
 )
 
 type Session interface {
@@ -24,6 +24,9 @@ type Request struct {
 	CapabilitySummary string
 	HasAppServer      bool
 	Model             string
+	SandboxMode       string
+	SandboxPolicy     string
+	NetworkAccess     bool
 	MaxOutputBytes    int
 	OnDelta           func(update Update)
 }

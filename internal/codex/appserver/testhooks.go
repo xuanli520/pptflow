@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/pptflow/internal/executor"
 )
 
 type TestSessionProbe struct {

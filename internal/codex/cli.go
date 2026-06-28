@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/pptflow/internal/executor"
 )
 
 type Capability struct {
@@ -76,7 +76,7 @@ func ValidateAppServerCapability(cap Capability) error {
 		return fmt.Errorf("codex CLI does not expose app-server; static review requires codex app-server turn/steer")
 	}
 	if !cap.HasConfig {
-		return fmt.Errorf("codex app-server does not expose -c/--config; cannot force approval_policy=never and sandbox_mode=read-only")
+		return fmt.Errorf("codex app-server does not expose -c/--config; cannot configure approval policy and sandbox mode")
 	}
 	return nil
 }

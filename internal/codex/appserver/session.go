@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/pptflow/internal/executor"
 )
 
 type appServerCodexReviewSession struct {
@@ -79,7 +79,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	s.processCtx = runCtx
 	s.cancel = cancel
 	s.mu.Unlock()
-	args := []string{"app-server", "-c", `approval_policy="never"`, "-c", `sandbox_mode="read-only"`, "--listen", "stdio://"}
+	args := []string{"app-server", "-c", `approval_policy="never"`, "-c", fmt.Sprintf(`sandbox_mode="%s"`, normalizeSandboxMode(request.SandboxMode)), "--listen", "stdio://"}
 	cmd := exec.CommandContext(runCtx, request.CommandPath, args...)
 	executor.ConfigureCommand(cmd)
 	cmd.Dir = request.ProjectPath
@@ -105,6 +105,9 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 		"\n\nPrompt: supplied via app-server turn/start; sha256=" + sha256Text(request.Prompt) +
 		"\nCodex capability: " + request.CapabilitySummary +
 		"\nCodex env keys: " + strings.Join(s.envKeys, ",") +
+		"\nSandbox mode: " + normalizeSandboxMode(request.SandboxMode) +
+		"\nSandbox policy: " + normalizeSandboxPolicy(request.SandboxPolicy) +
+		"\nNetwork access: " + fmt.Sprint(request.NetworkAccess) +
 		"\nTimeout: " + request.Timeout.String() +
 		"\nStarted: " + time.Now().UTC().Format(time.RFC3339) +
 		"\n\n=== codex app-server JSON-RPC compact event log start ===\n"
@@ -136,7 +139,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	if _, err := s.sendRequest(initCtx, "initialize", map[string]any{
-		"clientInfo": map[string]any{"name": "p2r_tui", "version": "0"},
+		"clientInfo": map[string]any{"name": "pptflow", "version": "0"},
 		"capabilities": map[string]any{
 			"experimentalApi": true,
 		},

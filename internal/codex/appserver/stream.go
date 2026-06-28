@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/xuanli520/p2r_tui/internal/executor"
+	"github.com/xuanli520/pptflow/internal/executor"
 )
 
 func (s *appServerCodexReviewSession) Wait(ctx context.Context) (Result, error) {
