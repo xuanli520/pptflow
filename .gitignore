@@ -3,6 +3,8 @@
 .gomodcache
 /dist/
 testdata
+!internal/pptflow/testdata/
+!internal/pptflow/testdata/**
 .claude
 .gocache
 artifacts

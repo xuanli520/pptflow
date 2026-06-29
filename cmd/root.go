@@ -23,9 +23,12 @@ func Execute() {
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "pptflow",
-		Short: "PPTflow local phase 0 runner",
+		Short: "PPTflow — AI-driven visual presentation generator",
+		Long: `PPTflow generates beautiful, editable PowerPoint presentations using a pipeline of:
+  Codex (prompt optimization + content generation)
+  Image2 (slide image generation with consistent styling)
+  Codex (resource extraction + PPTX assembly)`,
 	}
-	root.AddCommand(newPhase0Command())
-	root.AddCommand(newTUICommand())
+	root.AddCommand(newPromptFlowCommand())
 	return root
 }
