@@ -19,6 +19,8 @@ func newPromptFlowCommand() *cobra.Command {
 		imageTimeoutSeconds int
 		codexTimeoutSeconds int
 		requireImages       bool
+		qualityMode         string
+		fallbackPolicy      string
 	)
 
 	cmd := &cobra.Command{
@@ -53,6 +55,8 @@ Requires:
 				ImageTimeoutSeconds: imageTimeoutSeconds,
 				CodexTimeoutSeconds: codexTimeoutSeconds,
 				RequireImages:       requireImages,
+				QualityMode:         qualityMode,
+				FallbackPolicy:      fallbackPolicy,
 			})
 			if err != nil {
 				return err
@@ -81,6 +85,8 @@ Requires:
 	cmd.Flags().IntVar(&imageTimeoutSeconds, "image-timeout", 180, "Timeout per image generation (seconds)")
 	cmd.Flags().IntVar(&codexTimeoutSeconds, "codex-timeout", 300, "Timeout per Codex turn (seconds)")
 	cmd.Flags().BoolVar(&requireImages, "require-images", false, "Fail if Image2 API is not configured")
+	cmd.Flags().StringVar(&qualityMode, "quality-mode", "production", "Run quality profile")
+	cmd.Flags().StringVar(&fallbackPolicy, "fallback-policy", "strict", "Fallback policy: strict, dev_placeholder, image_backed, partial_editable")
 
 	_ = cmd.MarkFlagRequired("prompt")
 	return cmd

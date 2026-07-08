@@ -19,10 +19,13 @@ type appServerCodexReviewSession struct {
 	req                   Request
 	cmd                   *exec.Cmd
 	stdin                 io.WriteCloser
+	stdoutPipe            io.Closer
+	stderrPipe            io.Closer
 	processCtx            context.Context
 	cancel                context.CancelFunc
 	done                  chan struct{}
 	wg                    sync.WaitGroup
+	shutdownOnce          sync.Once
 	result                Result
 	err                   error
 	nextID                int
@@ -79,7 +82,11 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	s.processCtx = runCtx
 	s.cancel = cancel
 	s.mu.Unlock()
-	args := []string{"app-server", "-c", `approval_policy="never"`, "-c", fmt.Sprintf(`sandbox_mode="%s"`, normalizeSandboxMode(request.SandboxMode)), "--listen", "stdio://"}
+	args := []string{"app-server", "-c", `approval_policy="never"`, "-c", fmt.Sprintf(`sandbox_mode="%s"`, normalizeSandboxMode(request.SandboxMode))}
+	if effort := strings.TrimSpace(request.ReasoningEffort); effort != "" {
+		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", effort))
+	}
+	args = append(args, "--listen", "stdio://")
 	cmd := exec.CommandContext(runCtx, request.CommandPath, args...)
 	executor.ConfigureCommand(cmd)
 	cmd.Dir = request.ProjectPath
@@ -121,6 +128,8 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	s.mu.Lock()
 	s.cmd = cmd
 	s.stdin = stdin
+	s.stdoutPipe = stdout
+	s.stderrPipe = stderr
 	s.wg.Add(3)
 	s.mu.Unlock()
 	go func() {
@@ -205,11 +214,8 @@ func (s *appServerCodexReviewSession) SendGuidance(ctx context.Context, message 
 	defer cancel()
 	_, err := s.sendRequest(guideCtx, "turn/steer", map[string]any{
 		"expectedTurnId": turnID,
-		"input": []map[string]any{{
-			"type": "text",
-			"text": message,
-		}},
-		"threadId": threadID,
+		"input":          appServerInput(Request{Prompt: message}),
+		"threadId":       threadID,
 	})
 	if err != nil {
 		s.appendLog("Codex app-server turn/steer failed: " + err.Error() + "\n")

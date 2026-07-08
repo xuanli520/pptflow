@@ -20,15 +20,26 @@ type Request struct {
 	LogPath           string
 	Env               []string
 	Prompt            string
+	Input             []InputPart
 	CommandPath       string
 	CapabilitySummary string
 	HasAppServer      bool
 	Model             string
+	ReasoningEffort   string
 	SandboxMode       string
 	SandboxPolicy     string
 	NetworkAccess     bool
+	WorkspaceRoots    []string
 	MaxOutputBytes    int
 	OnDelta           func(update Update)
+}
+
+type InputPart struct {
+	Type   string
+	Text   string
+	URL    string
+	Path   string
+	Detail string
 }
 
 type Result struct {

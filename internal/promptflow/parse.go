@@ -115,5 +115,116 @@ func parseLayoutAnalysis(text string) (LayoutAnalysis, error) {
 	if len(analysis.Slides) == 0 {
 		return LayoutAnalysis{}, fmt.Errorf("layout analysis has no slides")
 	}
+	normalizeLayoutAnalysis(&analysis)
 	return analysis, nil
+}
+
+func normalizeLayoutAnalysis(analysis *LayoutAnalysis) {
+	if analysis == nil {
+		return
+	}
+	width := analysis.SlideWidth
+	if width <= 0 {
+		width = 13.333
+	}
+	height := analysis.SlideHeight
+	if height <= 0 {
+		height = 7.5
+	}
+	for i := range analysis.Slides {
+		normalizeSlideLayout(&analysis.Slides[i])
+		clampSlideLayout(&analysis.Slides[i], width, height)
+	}
+}
+
+func normalizeSlideLayout(slide *SlideLayout) {
+	if slide == nil {
+		return
+	}
+	if len(slide.Regions) == 0 && len(slide.Elements) > 0 {
+		slide.Regions = append([]LayoutRegion(nil), slide.Elements...)
+	}
+	if len(slide.Elements) == 0 && len(slide.Regions) > 0 {
+		slide.Elements = append([]LayoutElement(nil), slide.Regions...)
+	}
+	for i := range slide.Regions {
+		normalizeLayoutRegion(&slide.Regions[i])
+	}
+	for i := range slide.Elements {
+		normalizeLayoutRegion(&slide.Elements[i])
+	}
+}
+
+func clampSlideLayout(slide *SlideLayout, width, height float64) {
+	for i := range slide.Regions {
+		clampLayoutRegion(&slide.Regions[i], width, height)
+	}
+	for i := range slide.Elements {
+		clampLayoutRegion(&slide.Elements[i], width, height)
+	}
+}
+
+func clampLayoutRegion(region *LayoutRegion, width, height float64) {
+	if region == nil {
+		return
+	}
+	if region.X < 0 {
+		region.W += region.X
+		region.X = 0
+	}
+	if region.Y < 0 {
+		region.H += region.Y
+		region.Y = 0
+	}
+	if region.X > width {
+		region.X = width
+		region.W = 0
+	}
+	if region.Y > height {
+		region.Y = height
+		region.H = 0
+	}
+	if region.X+region.W > width {
+		region.W = width - region.X
+	}
+	if region.Y+region.H > height {
+		region.H = height - region.Y
+	}
+	if region.W < 0 {
+		region.W = 0
+	}
+	if region.H < 0 {
+		region.H = 0
+	}
+}
+
+func normalizeLayoutRegion(region *LayoutRegion) {
+	if region == nil {
+		return
+	}
+	if region.Text != nil {
+		if region.TextContent == "" {
+			region.TextContent = region.Text.Content
+		}
+		if region.FontSizeEst == 0 && region.Text.FontSizePt > 0 {
+			region.FontSizeEst = FlexibleInt(region.Text.FontSizePt + 0.5)
+		}
+		if region.FontColorEst == "" {
+			region.FontColorEst = region.Text.Color
+		}
+		if region.Alignment == "" {
+			region.Alignment = region.Text.Alignment
+		}
+	}
+	if region.Image != nil {
+		if region.CropHint == "" {
+			region.CropHint = region.Image.CropHint
+		}
+		if strings.EqualFold(region.Image.BackgroundStrategy, "remove") {
+			region.HasBackground = true
+		}
+	}
+	if region.Role == "" && region.Text != nil {
+		region.Role = region.Text.Role
+	}
 }

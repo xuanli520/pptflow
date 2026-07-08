@@ -28,6 +28,10 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	if e == nil || e.registry == nil {
 		return RunResult{}, fmt.Errorf("workflow engine registry is required")
 	}
+	nodes, err := orderedWorkflowNodes(req.Workflow)
+	if err != nil {
+		return RunResult{}, err
+	}
 	runID := newRunID(req.Workflow.ID)
 	store, err := NewFileArtifactStore(filepath.Join(req.ArtifactRoot, runID))
 	if err != nil {
@@ -48,7 +52,7 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	}
 	_ = events.Emit(ctx, Event{RunID: runID, Type: "run_started", Message: req.Workflow.Name})
 	prior := map[string]NodeRun{}
-	for _, spec := range req.Workflow.Nodes {
+	for _, spec := range nodes {
 		nodeRun := NodeRun{NodeID: spec.ID, Kind: spec.Kind, Name: spec.Name, Status: NodePending}
 		if blockedBy := blockedDependency(spec, prior); blockedBy != "" {
 			nodeRun.Status = NodeSkipped
@@ -69,7 +73,7 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			result.Nodes = append(result.Nodes, nodeRun)
 			prior[spec.ID] = nodeRun
 			result.Status = RunFailed
-			break
+			continue
 		}
 		run, artifacts, err := e.executeNode(ctx, plugin, NodeRequest{
 			RunID:         runID,
@@ -87,7 +91,10 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 		prior[spec.ID] = run
 		if err != nil {
 			result.Status = RunFailed
-			break
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
@@ -176,7 +183,98 @@ func validateRunRequest(req RunRequest) error {
 			}
 		}
 	}
+	if _, err := orderedWorkflowNodes(req.Workflow); err != nil {
+		return err
+	}
 	return nil
+}
+
+func orderedWorkflowNodes(workflow WorkflowDefinition) ([]NodeSpec, error) {
+	nodes := append([]NodeSpec(nil), workflow.Nodes...)
+	indexByID := map[string]int{}
+	for i, node := range nodes {
+		indexByID[node.ID] = i
+	}
+	depsByID := map[string][]string{}
+	for _, node := range nodes {
+		depsByID[node.ID] = dedupeStrings(node.DependsOn)
+	}
+	for _, edge := range workflow.Edges {
+		from := strings.TrimSpace(edge.From)
+		to := strings.TrimSpace(edge.To)
+		if from == "" || to == "" {
+			return nil, fmt.Errorf("workflow edge requires from and to")
+		}
+		if from == to {
+			return nil, fmt.Errorf("workflow edge %s -> %s creates self dependency", from, to)
+		}
+		if _, ok := indexByID[from]; !ok {
+			return nil, fmt.Errorf("workflow edge depends on unknown node %s", from)
+		}
+		toIndex, ok := indexByID[to]
+		if !ok {
+			return nil, fmt.Errorf("workflow edge targets unknown node %s", to)
+		}
+		depsByID[to] = appendUnique(depsByID[to], from)
+		nodes[toIndex].DependsOn = depsByID[to]
+	}
+	for _, node := range nodes {
+		for _, dep := range depsByID[node.ID] {
+			if dep == node.ID {
+				return nil, fmt.Errorf("node %s depends on itself", node.ID)
+			}
+			if _, ok := indexByID[dep]; !ok {
+				return nil, fmt.Errorf("node %s depends on unknown node %s", node.ID, dep)
+			}
+		}
+	}
+	done := map[string]bool{}
+	ordered := make([]NodeSpec, 0, len(nodes))
+	for len(ordered) < len(nodes) {
+		progress := false
+		for _, node := range nodes {
+			if done[node.ID] {
+				continue
+			}
+			blocked := false
+			for _, dep := range depsByID[node.ID] {
+				if !done[dep] {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
+			ordered = append(ordered, node)
+			done[node.ID] = true
+			progress = true
+		}
+		if !progress {
+			return nil, fmt.Errorf("workflow dependency graph contains a cycle")
+		}
+	}
+	return ordered, nil
+}
+
+func dedupeStrings(values []string) []string {
+	result := []string{}
+	for _, value := range values {
+		result = appendUnique(result, strings.TrimSpace(value))
+	}
+	return result
+}
+
+func appendUnique(values []string, value string) []string {
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func blockedDependency(spec NodeSpec, prior map[string]NodeRun) string {

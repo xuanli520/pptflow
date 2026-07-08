@@ -193,18 +193,80 @@ func appServerTurnStartParams(request Request, threadID string) map[string]any {
 	params := map[string]any{
 		"approvalPolicy": "never",
 		"cwd":            request.ProjectPath,
-		"input": []map[string]any{{
-			"type": "text",
-			"text": request.Prompt,
-		}},
-		"sandboxPolicy": map[string]any{
-			"type":          normalizeSandboxPolicy(request.SandboxPolicy),
-			"networkAccess": request.NetworkAccess,
-		},
-		"threadId": threadID,
+		"input":          appServerInput(request),
+		"sandboxPolicy":  appServerSandboxPolicy(request),
+		"threadId":       threadID,
+	}
+	if len(request.WorkspaceRoots) > 0 {
+		params["runtimeWorkspaceRoots"] = append([]string{}, request.WorkspaceRoots...)
 	}
 	setAppServerModelParam(params, request.Model)
 	return params
+}
+
+func appServerSandboxPolicy(request Request) map[string]any {
+	policyType := normalizeSandboxPolicy(request.SandboxPolicy)
+	policy := map[string]any{"type": policyType}
+	switch policyType {
+	case "workspaceWrite":
+		policy["networkAccess"] = request.NetworkAccess
+		if len(request.WorkspaceRoots) > 0 {
+			policy["writableRoots"] = append([]string{}, request.WorkspaceRoots...)
+		}
+	case "readOnly":
+		policy["networkAccess"] = request.NetworkAccess
+	}
+	return policy
+}
+
+func appServerInput(request Request) []map[string]any {
+	input := make([]map[string]any, 0, len(request.Input)+1)
+	if strings.TrimSpace(request.Prompt) != "" {
+		input = append(input, map[string]any{"type": "text", "text": request.Prompt})
+	}
+	for _, part := range request.Input {
+		item := appServerInputPart(part)
+		if item != nil {
+			input = append(input, item)
+		}
+	}
+	if len(input) == 0 {
+		return []map[string]any{{"type": "text", "text": ""}}
+	}
+	return input
+}
+
+func appServerInputPart(part InputPart) map[string]any {
+	switch strings.TrimSpace(part.Type) {
+	case "text":
+		if strings.TrimSpace(part.Text) == "" {
+			return nil
+		}
+		return map[string]any{"type": "text", "text": part.Text}
+	case "image":
+		if strings.TrimSpace(part.URL) == "" {
+			return nil
+		}
+		item := map[string]any{"type": "image", "url": strings.TrimSpace(part.URL)}
+		setAppServerInputDetail(item, part.Detail)
+		return item
+	case "localImage":
+		if strings.TrimSpace(part.Path) == "" {
+			return nil
+		}
+		item := map[string]any{"type": "localImage", "path": strings.TrimSpace(part.Path)}
+		setAppServerInputDetail(item, part.Detail)
+		return item
+	default:
+		return nil
+	}
+}
+
+func setAppServerInputDetail(item map[string]any, detail string) {
+	detail = strings.TrimSpace(detail)
+	if detail == "high" || detail == "original" {
+		item["detail"] = detail
+	}
 }
 
 func normalizeSandboxMode(value string) string {
@@ -217,10 +279,16 @@ func normalizeSandboxMode(value string) string {
 
 func normalizeSandboxPolicy(value string) string {
 	value = strings.TrimSpace(value)
-	if value == "" {
+	switch value {
+	case "", "read-only", "read_only":
 		return "readOnly"
+	case "workspace-write", "workspace_write", "readWrite":
+		return "workspaceWrite"
+	case "danger-full-access", "danger_full_access":
+		return "dangerFullAccess"
+	default:
+		return value
 	}
-	return value
 }
 
 func setAppServerModelParam(params map[string]any, model string) {

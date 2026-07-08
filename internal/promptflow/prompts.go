@@ -3,6 +3,7 @@ package promptflow
 import (
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"strings"
 )
 
@@ -18,7 +19,7 @@ Ask yourself:
 2. Who is the audience? What do they care about?
 3. What is the core purpose — what should the audience think/feel/do after?
 4. What tone fits best? (premium, concise, innovative, trustworthy, energetic, academic, etc.)
-5. How many slides are appropriate? (typically 8-15 for a focused presentation)
+5. How many slides are appropriate? If the user gives an explicit slide count or upper limit, preserve it exactly. Otherwise use 8-15 for a focused presentation.
 6. What are the 3-5 key messages that MUST land?
 7. What language/locale?
 
@@ -62,6 +63,8 @@ Generate a slide-by-slide outline. Each slide must have:
 - has_chart: true if this slide benefits from a chart
 - has_table: true if this slide benefits from a comparison table
 - has_comparison: true if this slide compares options
+
+The outline must contain exactly requirements.slide_count slides. Do not add agenda, appendix, divider, or closing slides beyond that count.
 
 ## Part 2: Style Specification
 Define a unified visual style:
@@ -164,46 +167,93 @@ func buildLayoutAnalysisPrompt(manifest SlideImageManifest, outline Outline) str
 		imageDescs = append(imageDescs, fmt.Sprintf("Slide %d: title=%q, image=%s", img.SlideNumber, title, img.ImagePath))
 	}
 
-	return fmt.Sprintf(`You are analyzing presentation slide images to extract their exact visual layout for PPTX reproduction.
+	return fmt.Sprintf(`You are analyzing presentation slide images to extract their exact editable layout for PPTX reproduction.
 
 Slide dimensions: 16:9 (13.333 x 7.5 inches)
 
-For each slide image, identify ALL visible regions:
+For each slide image, identify the semantically important visible elements needed to recreate the slide as editable PowerPoint XML objects, not a full-slide screenshot.
 
-Slide images to analyze:
+The actual slide images are attached to this turn as localImage inputs in the same order as this list:
 %s
 
-For each slide, output regions like:
-- "title" regions: The main heading text area. Include text_content, font_size_est, font_color_est, alignment.
-- "body_text" regions: Paragraph or bullet text areas. Include text_content and estimated font size.
-- "image" regions: Photos, illustrations, icons. Include image_desc (a detailed description for Image2 to regenerate a standalone version), crop_hint, has_background (true if needs background removal).
-- "chart" regions: Data visualizations. Include chart_type (bar/line/pie/area), chart_data_hint.
-- "table" regions: Data tables. Include table_rows_hint, table_cols_hint.
-- "shape" regions: Decorative shapes, containers, colored blocks.
-- "decoration" regions: Background patterns, gradients, subtle decorative elements.
+Do not run shell commands or inspect files with tools. Use the attached image directly and return JSON only.
+
+Element rules:
+- The slide_number and image_path fields must exactly match the listed Slide N entry for each attached image.
+- Use type "text" for standalone editable text.
+- Use type "shape" for rectangles, rounded cards, pills, ellipses, badges, icon backgrounds, and decorative containers. Every shape must include shape, fill, stroke, and shadow objects.
+- Use type "line" for thin rules, dividers, timeline axes, ticks, connectors, and brackets. Do not fake lines with very thin rectangles.
+- Use type "image" or "icon" only for standalone visual assets that cannot be recreated with editable PPT shapes/lines/text. Do not output every tiny decorative glyph as an icon; convert simple glyphs, dots, arrows, dividers, badges, route nodes, and timeline markers into shape/line/text elements.
+- Do not classify a row/column of workflow icons, metric icon columns, sparklines, number badges, label pills, or status chips as one image/icon. Recreate those as native shapes, lines, and text.
+- Containers/cards/panels are background shapes only. Do not put body copy into the container shape when the same text should be a child text element.
+- Image/icon regions must never cover any text box. Put their z_order below nearby text, or split the layout into separate non-overlapping regions.
+- Every image/icon region must include a concrete non-empty image_desc that names the exact visual subject. Never leave image_desc empty or generic.
+- Keep the full slide compact: target 20-35 elements per slide, never more than 40. Merge repeated decorative shapes into one larger container when possible.
+- Keep image/icon asset count small: normally no more than 4 per slide. Prefer one background/photo/illustration asset plus at most three essential transparent icons.
+- Ignore purely decorative micro-icons, tiny texture marks, background dots, and redundant separators unless they carry text or clarify a workflow.
+- Transparent icons/logos/illustrations must set image.asset_kind to "transparent_icon", "logo", or "illustration" and image.background_strategy to "remove". Background photos, maps, and scene crops should use image.background_strategy "keep".
+- Transcribe all visible text, including text inside status pills, badges, numbered dots, timeline nodes, captions, metadata, and labels.
+- Use text.runs only when one text box contains mixed emphasis such as "Owner:" bold and the value regular. Every run must include its exact content; if you cannot split the content, omit runs and put the full text in text.content.
+- Rounded cards must be shape.kind "round_rect" with corner_radius and shadow.
+- Empty timeline nodes must be ellipse shapes with white fill and colored stroke. Filled nodes must be ellipse shapes with solid fill.
+- Timeline axis, tick, connector, milestone label, and node elements for the same timeline must share one group_id.
 
 All coordinates in inches, origin at top-left. Be precise with positions and sizes.
 
 Output ONLY valid JSON (no markdown):
 
 {
-  "schema_version": "pptflow.layout_analysis.v1",
+  "schema_version": "pptflow.layout_analysis.v2",
   "slide_width": 13.333,
   "slide_height": 7.5,
   "slides": [
     {
       "slide_number": 1,
       "image_path": "...",
-      "regions": [
+      "elements": [
         {
-          "id": "title",
-          "type": "title",
+          "id": "title_1",
+          "type": "text",
+          "role": "title",
           "x": 0.8, "y": 0.5, "w": 11.7, "h": 0.9,
           "z_order": 1,
-          "text_content": "...",
-          "font_size_est": 36,
-          "font_color_est": "#FFFFFF",
-          "alignment": "left"
+          "opacity": 1,
+          "text": {
+            "content": "...",
+            "role": "title",
+            "font_family": "Aptos Display",
+            "font_size_pt": 36,
+            "font_weight": "700",
+            "color": "#111827",
+            "alignment": "left",
+            "vertical_alignment": "top",
+            "margin_left_pt": 0,
+            "margin_right_pt": 0,
+            "margin_top_pt": 0,
+            "margin_bottom_pt": 0,
+            "runs": []
+          }
+        },
+        {
+          "id": "status_pill_1",
+          "type": "shape",
+          "role": "status_pill",
+          "x": 9.8, "y": 0.55, "w": 1.7, "h": 0.42,
+          "z_order": 2,
+          "shape": { "kind": "round_rect", "corner_radius": 0.2 },
+          "fill": { "type": "solid", "color": "#2563EB", "alpha": 1 },
+          "stroke": { "type": "none", "color": "#2563EB", "alpha": 0, "width_pt": 0, "dash": "solid" },
+          "shadow": { "enabled": false },
+          "text": { "content": "In Progress", "font_size_pt": 11, "font_weight": "700", "color": "#FFFFFF", "alignment": "center", "vertical_alignment": "middle" }
+        },
+        {
+          "id": "timeline_axis",
+          "type": "line",
+          "role": "timeline_axis",
+          "group_id": "timeline_main",
+          "x": 1.1, "y": 5.2, "w": 10.8, "h": 0,
+          "z_order": 3,
+          "stroke": { "type": "solid", "color": "#CBD5E1", "alpha": 1, "width_pt": 1.5, "dash": "solid", "cap": "round" }
         }
       ]
     }
@@ -220,64 +270,49 @@ func findOutlineSlide(outline Outline, num int) *OutlineSlide {
 	return nil
 }
 
-func buildExtractPrompt(region LayoutRegion) string {
+func buildExtractPrompt(region LayoutRegion, matte color.RGBA) string {
+	description := extractionDescription(region)
 	parts := []string{
-		"Extract this visual element as a standalone image suitable for PowerPoint.",
-		"Remove the background — make it transparent (PNG with alpha channel).",
-		"The element should be centered and clean, ready to place on a slide.",
-		fmt.Sprintf("Description: %s", region.ImageDesc),
+		"Extract the specified visual element from the attached source slide as a standalone PNG suitable for PowerPoint.",
+		"Use the source slide as the authority. Do not invent a new 3D object, decorative background, scene, label, or extra text.",
+		fmt.Sprintf("Region bbox in slide inches: x=%.3f y=%.3f w=%.3f h=%.3f.", region.X, region.Y, region.W, region.H),
+		fmt.Sprintf("Asset type: %s. Role: %s.", firstNonEmptyString(imageAssetKind(region), region.Type), firstNonEmptyString(region.Role, region.ID)),
+		fmt.Sprintf("Description: %s", description),
+		fmt.Sprintf("Background: place the extracted element on one flat solid matte color %s only.", matteHex(matte)),
+		"No checkerboard, no transparency grid, no tiled grid, no texture, no gradient, no shadow cast onto the matte background.",
+		"Keep edges clean so the solid matte can be removed by color keying after generation.",
 	}
 	if region.CropHint != "" {
 		parts = append(parts, fmt.Sprintf("Cropping: %s", region.CropHint))
 	}
 	parts = append(parts,
-		"No text labels, no watermarks, no slide backgrounds — just the isolated visual element.",
-		"Style: Clean, professional, with soft shadows if appropriate for depth.",
+		"No text labels, no watermarks, no slide backgrounds. Return only the isolated visual element on the matte background.",
+		"Style: match the attached source slide exactly.",
 	)
 	return strings.Join(parts, "\n")
 }
 
-func buildAssemblyPrompt(analysisJSON, resourcesJSON, styleJSON, workspaceRoot string) string {
-	return fmt.Sprintf(`You are a PowerPoint automation expert. You have:
-1. A layout analysis describing exactly where each element should be on each slide
-2. Extracted image resources (PNG files with transparent backgrounds)
-3. A style specification
+func extractionDescription(region LayoutRegion) string {
+	values := []string{
+		strings.TrimSpace(region.ImageDesc),
+		strings.TrimSpace(region.CropHint),
+		strings.TrimSpace(region.Role),
+		strings.TrimSpace(region.ID),
+	}
+	if region.Image != nil {
+		values = append(values, strings.TrimSpace(region.Image.AssetKind), strings.TrimSpace(region.Image.CropHint))
+	}
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return "standalone visual element"
+}
 
-Your job: Write and execute a Python script (using python-pptx) that generates deck.pptx at %s/output/deck.pptx
-
-## Layout Analysis (slide layouts with exact coordinates)
-%s
-
-## Extracted Resources (image files available)
-%s
-
-## Style Specification
-%s
-
-## Instructions for the Python script:
-
-1. Create a 16:9 presentation (13.333 x 7.5 inches)
-2. For EACH slide in the layout analysis:
-   a. Set the slide background color from the style spec
-   b. Add text boxes for all "title" and "body_text" regions at their exact positions
-      - Use the correct font size, color, and alignment
-      - For body text, format bullet points properly
-   c. Add pictures for all "image" regions at their exact positions
-      - Reference the extracted resource PNG files
-      - Maintain aspect ratio, fit within the region bounds
-   d. Add shapes for "shape" and "decoration" regions
-      - Use python-pptx shapes (rectangles, rounded rects, etc.)
-      - Match the fill colors and borders
-3. Save as %s/output/deck.pptx
-4. Print "DONE: deck.pptx created with N slides"
-
-## Important:
-- All text must be REAL PowerPoint text boxes (editable)
-- All images must be REAL PowerPoint picture objects (movable, scalable)
-- Charts should be added as images if no chart data is available, or created with python-pptx chart objects if data is provided
-- Every coordinate from the layout analysis must be respected
-- Fonts: Use the preferred fonts from the style spec
-
-Write the Python script to a file, then execute it with: python generate.py`,
-		workspaceRoot, analysisJSON, resourcesJSON, styleJSON, workspaceRoot)
+func imageAssetKind(region LayoutRegion) string {
+	if region.Image == nil {
+		return ""
+	}
+	return strings.TrimSpace(region.Image.AssetKind)
 }

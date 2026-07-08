@@ -9,4 +9,5 @@ testdata
 .gocache
 artifacts
 workspace
+manual_eval/
 bin

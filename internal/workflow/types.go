@@ -162,10 +162,19 @@ type PutArtifactRequest struct {
 	Content  io.Reader
 }
 
+type RegisterArtifactRequest struct {
+	Name     string
+	Type     string
+	Producer string
+	Metadata map[string]string
+	Path     string
+}
+
 type ArtifactStore interface {
 	Put(context.Context, PutArtifactRequest) (ArtifactRef, error)
 	PutJSON(context.Context, string, string, string, any) (ArtifactRef, error)
 	PutText(context.Context, string, string, string, string) (ArtifactRef, error)
+	Register(context.Context, RegisterArtifactRequest) (ArtifactRef, error)
 	Get(context.Context, ArtifactRef) (io.ReadCloser, ArtifactMeta, error)
 	ReadJSON(context.Context, string, any) (ArtifactRef, error)
 	List(context.Context, string) ([]ArtifactMeta, error)
@@ -206,14 +215,25 @@ type CommandRuntime interface {
 type AgentTurnRequest struct {
 	ProjectPath       string
 	Prompt            string
+	Input             []AgentInputPart
 	Model             string
+	ReasoningEffort   string
 	SandboxMode       string
 	SandboxPolicy     string
 	NetworkAccess     bool
+	WorkspaceRoots    []string
 	TimeoutSeconds    int
 	MaxOutputBytes    int
 	CapabilitySummary string
 	LogPath           string
+}
+
+type AgentInputPart struct {
+	Type   string `json:"type"`
+	Text   string `json:"text,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type AgentTurnResult struct {
@@ -228,11 +248,20 @@ type AgentRuntime interface {
 }
 
 type ImageRequest struct {
+	Model          string
 	Prompt         string
 	Size           string
 	Quality        string
 	OutputPath     string
+	SourceImages   []ImageSource
 	TimeoutSeconds int
+}
+
+type ImageSource struct {
+	Path   string `json:"path,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Role   string `json:"role,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type ImageResult struct {

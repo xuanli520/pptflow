@@ -23,6 +23,8 @@ type PromptFlowOptions struct {
 	ImageTimeoutSeconds int
 	CodexTimeoutSeconds int
 	RequireImages       bool
+	QualityMode         string
+	FallbackPolicy      string
 }
 
 func RunPromptFlow(ctx context.Context, opts PromptFlowOptions) (workflow.RunResult, error) {
@@ -66,6 +68,10 @@ func RunPromptFlow(ctx context.Context, opts PromptFlowOptions) (workflow.RunRes
 			ImageTimeoutSeconds: opts.ImageTimeoutSeconds,
 			CodexTimeoutSeconds: opts.CodexTimeoutSeconds,
 			RequireImages:       opts.RequireImages,
+			Profile: promptflow.RunProfile{
+				QualityMode:    opts.QualityMode,
+				FallbackPolicy: opts.FallbackPolicy,
+			},
 		}),
 		ArtifactRoot:  artifactRoot,
 		WorkspaceRoot: workspaceRoot,

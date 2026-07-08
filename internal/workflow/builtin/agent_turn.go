@@ -33,6 +33,7 @@ func (AgentTurnPlugin) Execute(ctx context.Context, req workflow.NodeRequest) (w
 		ProjectPath:       req.WorkspaceRoot,
 		Prompt:            stringConfig(req.Spec.Config, "prompt"),
 		Model:             stringConfig(req.Spec.Config, "model"),
+		ReasoningEffort:   stringConfig(req.Spec.Config, "reasoning_effort"),
 		SandboxMode:       stringConfig(req.Spec.Config, "sandbox_mode"),
 		SandboxPolicy:     stringConfig(req.Spec.Config, "sandbox_policy"),
 		NetworkAccess:     boolConfig(req.Spec.Config, "network_access"),

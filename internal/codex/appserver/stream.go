@@ -318,9 +318,7 @@ func (s *appServerCodexReviewSession) complete(result executor.Result, err error
 	s.responses = map[int]chan appServerRPCMessage{}
 	done := s.done
 	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	s.shutdownProcess(cancel)
 	s.logRemainingAggregatedDeltas()
 	s.mu.Lock()
 	s.result.Result = result
@@ -336,9 +334,40 @@ func (s *appServerCodexReviewSession) stop() {
 	s.mu.Lock()
 	cancel := s.cancel
 	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	s.shutdownProcess(cancel)
+}
+
+func (s *appServerCodexReviewSession) shutdownProcess(cancel context.CancelFunc) {
+	s.shutdownOnce.Do(func() {
+		s.mu.Lock()
+		stdin := s.stdin
+		stdout := s.stdoutPipe
+		stderr := s.stderrPipe
+		cmd := s.cmd
+		s.stdin = nil
+		s.stdoutPipe = nil
+		s.stderrPipe = nil
+		s.mu.Unlock()
+		s.writeMu.Lock()
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		s.writeMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if cmd != nil && cmd.Cancel != nil {
+			if err := cmd.Cancel(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				_ = err
+			}
+		}
+		if stdout != nil {
+			_ = stdout.Close()
+		}
+		if stderr != nil {
+			_ = stderr.Close()
+		}
+	})
 }
 
 func (s *appServerCodexReviewSession) failStart(command string, err error) {

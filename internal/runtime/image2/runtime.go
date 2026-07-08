@@ -80,11 +80,22 @@ func (r Runtime) Generate(ctx context.Context, req workflow.ImageRequest) (workf
 	if quality == "" {
 		quality = defaultQuality
 	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = r.model
+	}
 	body := map[string]any{
-		"model":   r.model,
+		"model":   model,
 		"prompt":  req.Prompt,
 		"size":    size,
 		"quality": quality,
+	}
+	if len(req.SourceImages) > 0 {
+		sources, err := sourceImagePayload(req.SourceImages)
+		if err != nil {
+			return workflow.ImageResult{}, err
+		}
+		body["source_images"] = sources
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -118,7 +129,45 @@ func (r Runtime) Generate(ctx context.Context, req workflow.ImageRequest) (workf
 	if err := os.WriteFile(req.OutputPath, image, 0o644); err != nil {
 		return workflow.ImageResult{}, err
 	}
-	return workflow.ImageResult{Path: req.OutputPath, Model: r.model, Size: size, Quality: quality, MIME: "image/png"}, nil
+	return workflow.ImageResult{Path: req.OutputPath, Model: model, Size: size, Quality: quality, MIME: "image/png"}, nil
+}
+
+func sourceImagePayload(sources []workflow.ImageSource) ([]map[string]any, error) {
+	result := make([]map[string]any, 0, len(sources))
+	for _, source := range sources {
+		item := map[string]any{}
+		if path := strings.TrimSpace(source.Path); path != "" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("read source image %s: %w", path, err)
+			}
+			item["image"] = "data:" + imageMIME(path) + ";base64," + base64.StdEncoding.EncodeToString(data)
+			item["path"] = path
+		} else if url := strings.TrimSpace(source.URL); url != "" {
+			item["url"] = url
+		} else {
+			continue
+		}
+		if role := strings.TrimSpace(source.Role); role != "" {
+			item["role"] = role
+		}
+		if detail := strings.TrimSpace(source.Detail); detail != "" {
+			item["detail"] = detail
+		}
+		result = append(result, item)
+	}
+	return result, nil
+}
+
+func imageMIME(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "image/png"
+	}
 }
 
 func decodeImagePayload(ctx context.Context, client *http.Client, data []byte) ([]byte, error) {

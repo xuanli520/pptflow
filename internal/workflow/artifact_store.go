@@ -76,7 +76,7 @@ func (s *FileArtifactStore) Put(ctx context.Context, req PutArtifactRequest) (Ar
 		Metadata:  copyStringMap(req.Metadata),
 		CreatedAt: time.Now().UTC(),
 	}
-	s.refs = append(s.refs, ref)
+	s.recordRef(ref)
 	return ref, nil
 }
 
@@ -91,6 +91,61 @@ func (s *FileArtifactStore) PutJSON(ctx context.Context, name, artifactType, pro
 
 func (s *FileArtifactStore) PutText(ctx context.Context, name, artifactType, producer, value string) (ArtifactRef, error) {
 	return s.Put(ctx, PutArtifactRequest{Name: name, Type: artifactType, Producer: producer, Content: strings.NewReader(value)})
+}
+
+func (s *FileArtifactStore) Register(ctx context.Context, req RegisterArtifactRequest) (ArtifactRef, error) {
+	if err := ctx.Err(); err != nil {
+		return ArtifactRef{}, err
+	}
+	if s == nil {
+		return ArtifactRef{}, fmt.Errorf("artifact store is nil")
+	}
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		var err error
+		path, err = s.Path(req.Name)
+		if err != nil {
+			return ArtifactRef{}, err
+		}
+	}
+	clean := filepath.Clean(path)
+	if !withinRoot(clean, s.root) {
+		return ArtifactRef{}, fmt.Errorf("artifact path escapes root: %s", path)
+	}
+	info, err := os.Stat(clean)
+	if err != nil {
+		return ArtifactRef{}, err
+	}
+	if info.IsDir() {
+		return ArtifactRef{}, fmt.Errorf("artifact path is a directory: %s", path)
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		rel, err := filepath.Rel(s.root, clean)
+		if err != nil {
+			return ArtifactRef{}, err
+		}
+		name = filepath.ToSlash(rel)
+	}
+	target, rel, err := s.resolveForWrite(name)
+	if err != nil {
+		return ArtifactRef{}, err
+	}
+	if filepath.Clean(target) != clean {
+		return ArtifactRef{}, fmt.Errorf("registered artifact name %s resolves to %s, got %s", name, target, clean)
+	}
+	s.sequence++
+	ref := ArtifactRef{
+		ID:        fmt.Sprintf("artifact-%04d", s.sequence),
+		Name:      filepath.ToSlash(rel),
+		Path:      clean,
+		Type:      strings.TrimSpace(req.Type),
+		Producer:  strings.TrimSpace(req.Producer),
+		Metadata:  copyStringMap(req.Metadata),
+		CreatedAt: time.Now().UTC(),
+	}
+	s.recordRef(ref)
+	return ref, nil
 }
 
 func (s *FileArtifactStore) Get(ctx context.Context, ref ArtifactRef) (io.ReadCloser, ArtifactMeta, error) {
@@ -198,4 +253,16 @@ func copyStringMap(input map[string]string) map[string]string {
 		output[key] = value
 	}
 	return output
+}
+
+func (s *FileArtifactStore) recordRef(ref ArtifactRef) {
+	cleanPath := filepath.Clean(ref.Path)
+	cleanName := filepath.ToSlash(ref.Name)
+	for i, existing := range s.refs {
+		if filepath.Clean(existing.Path) == cleanPath || filepath.ToSlash(existing.Name) == cleanName {
+			s.refs[i] = ref
+			return
+		}
+	}
+	s.refs = append(s.refs, ref)
 }
