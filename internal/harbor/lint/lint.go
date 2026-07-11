@@ -551,8 +551,22 @@ func checkTaskTOML(report *domain.LintReport, path string, strict bool) (taskTOM
 	checkPositiveFloat(report, "task_toml_agent_timeout", task.Agent.TimeoutSec, submissionStatus(strict), "task.toml [agent].timeout_sec must be positive", "task.toml agent timeout is positive", path)
 	checkPositiveFloat(report, "task_toml_build_timeout", task.Environment.BuildTimeoutSec, submissionStatus(strict), "task.toml [environment].build_timeout_sec must be positive", "task.toml environment build timeout is positive", path)
 	checkRequiredString(report, "task_toml_environment_os", task.Environment.OS, submissionStatus(strict), "task.toml [environment].os is required", "task.toml environment OS is present", path)
-	checkRequiredString(report, "task_toml_network_mode", task.Environment.NetworkMode, domain.CheckWarn, "task.toml [environment].network_mode should be explicit", "task.toml environment network mode is explicit", path)
+	checkTaskNetworkMode(report, task.Environment.NetworkMode, path)
 	return task.Metadata, true
+}
+
+func checkTaskNetworkMode(report *domain.LintReport, value, path string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		report.Add("task_toml_network_mode", domain.CheckWarn, "task.toml [environment].network_mode should be explicit", path)
+		return
+	}
+	switch value {
+	case "public", "no-network", "allowlist":
+		report.Add("task_toml_network_mode", domain.CheckPass, "task.toml environment network mode is valid", path)
+	default:
+		report.Add("task_toml_network_mode", domain.CheckFail, "task.toml environment network_mode must be one of public, no-network, or allowlist", path)
+	}
 }
 
 func checkRequiredString(report *domain.LintReport, id, value string, missingStatus domain.CheckStatus, missingMessage, passMessage, path string) {
@@ -1317,7 +1331,7 @@ func checkHarborResult(report *domain.LintReport, id, path, taskDir string, qwen
 		report.Add(id, domain.CheckFail, "harbor result cannot be read", path)
 		return
 	}
-	expectedModel := "claude-opus-4-6"
+	expectedModel := "claude-opus-4-8"
 	if qwen {
 		expectedModel = "qwen3.7-max"
 	}

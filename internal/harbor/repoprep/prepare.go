@@ -19,10 +19,12 @@ import (
 )
 
 type Options struct {
-	RepoURL    string
-	Commit     string
-	Workspace  string
-	AllowLocal bool
+	RepoURL            string
+	Commit             string
+	Workspace          string
+	AllowLocal         bool
+	MaxNetworkAttempts int
+	RetryDelay         time.Duration
 }
 
 func Prepare(ctx context.Context, opts Options) (domain.RepoPrepared, error) {
@@ -59,25 +61,39 @@ func Prepare(ctx context.Context, opts Options) (domain.RepoPrepared, error) {
 		if run == nil {
 			return
 		}
-		_ = persistCommandOutput(run, nodes.RepoPrepareCommandLogDir(workspace, run.Name))
+		outputDir := nodes.RepoPrepareCommandLogDir(workspace, run.Name)
+		if run.Attempt > 0 {
+			outputDir = filepath.Join(outputDir, fmt.Sprintf("attempt-%d", run.Attempt))
+		}
+		_ = persistCommandOutput(run, outputDir)
 		commands = append(commands, *run)
 		_ = writeCommandLogs(workspace, commands)
 	}
 	if isGitHub {
-		_, run, err := runGitPublicProbe(ctx, publicURL)
-		recordCommand(&run)
+		_, runs, err := runGitCommandWithRetry(ctx, "git_public_probe", publicGitEnv(), "", opts.MaxNetworkAttempts, opts.RetryDelay, nil, publicGitArgs("ls-remote", "--exit-code", publicURL, "HEAD")...)
+		for i := range runs {
+			recordCommand(&runs[i])
+		}
 		if err != nil {
 			return domain.RepoPrepared{}, fmt.Errorf("repo must be publicly reachable without credentials: %w", err)
 		}
 		cloneURL = publicURL
 		gitEnv = publicGitEnv()
 	}
-	_, run, err := runGitCommandWithEnv(ctx, "", gitEnv, "", publicGitArgs("clone", "--no-checkout", cloneURL, sourceDir)...)
-	recordCommand(&run)
+	cloneAttempts := 1
+	if isGitHub {
+		cloneAttempts = opts.MaxNetworkAttempts
+	}
+	_, cloneRuns, err := runGitCommandWithRetry(ctx, "git_clone", gitEnv, "", cloneAttempts, opts.RetryDelay, func(int) error {
+		return os.RemoveAll(sourceDir)
+	}, publicGitArgs("clone", "--no-checkout", cloneURL, sourceDir)...)
+	for i := range cloneRuns {
+		recordCommand(&cloneRuns[i])
+	}
 	if err != nil {
 		return domain.RepoPrepared{}, err
 	}
-	_, run, err = runGitCommandWithEnv(ctx, "", gitEnv, sourceDir, publicGitArgs("checkout", commit)...)
+	_, run, err := runGitCommandWithEnv(ctx, "", gitEnv, sourceDir, publicGitArgs("checkout", commit)...)
 	recordCommand(&run)
 	if err != nil {
 		return domain.RepoPrepared{}, err
@@ -124,6 +140,71 @@ func runGitCommand(ctx context.Context, dir string, args ...string) (string, dom
 func runGitPublicProbe(ctx context.Context, publicURL string) (string, domain.CommandRun, error) {
 	args := publicGitArgs("ls-remote", "--exit-code", publicURL, "HEAD")
 	return runGitCommandWithEnv(ctx, "git_public_probe", publicGitEnv(), "", args...)
+}
+
+func runGitCommandWithRetry(ctx context.Context, name string, env []string, dir string, maxAttempts int, delay time.Duration, beforeAttempt func(int) error, args ...string) (string, []domain.CommandRun, error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	if delay <= 0 {
+		delay = 500 * time.Millisecond
+	}
+	var runs []domain.CommandRun
+	var lastOutput string
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if beforeAttempt != nil {
+			if err := beforeAttempt(attempt); err != nil {
+				return lastOutput, runs, err
+			}
+		}
+		output, run, err := runGitCommandWithEnv(ctx, name, env, dir, args...)
+		run.Attempt = attempt
+		runs = append(runs, run)
+		lastOutput, lastErr = output, err
+		if err == nil {
+			return output, runs, nil
+		}
+		if attempt == maxAttempts || !isTransientGitFailure(run, err) {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return lastOutput, runs, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastOutput, runs, lastErr
+}
+
+func isTransientGitFailure(run domain.CommandRun, err error) bool {
+	text := strings.ToLower(run.Stdout + "\n" + run.Stderr)
+	if err != nil {
+		text += "\n" + strings.ToLower(err.Error())
+	}
+	for _, marker := range []string{
+		"tls connection was non-properly terminated",
+		"gnutls recv error",
+		"connection reset",
+		"connection timed out",
+		"operation timed out",
+		"temporary failure",
+		"network is unreachable",
+		"could not resolve host",
+		"remote end hung up unexpectedly",
+		"early eof",
+		"http 500",
+		"http 502",
+		"http 503",
+		"http 504",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func publicGitArgs(args ...string) []string {

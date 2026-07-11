@@ -38,6 +38,8 @@ type WorkspaceStatus struct {
 	Issues            []string                      `json:"issues,omitempty"`
 }
 
+const maxEventLogLineBytes = 4 << 20
+
 func ReadWorkspace(workspace string) (WorkspaceStatus, error) {
 	workspace = strings.TrimSpace(workspace)
 	if workspace == "" {
@@ -118,6 +120,7 @@ func readEvents(path, runID string) ([]domain.RunnerEvent, error) {
 	defer file.Close()
 	var events []domain.RunnerEvent
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxEventLogLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {

@@ -202,7 +202,12 @@ func isPlaceholderValue(value string) bool {
 		return true
 	}
 	lower := strings.ToLower(value)
+	lower = strings.ReplaceAll(lower, `\u003c`, "<")
+	lower = strings.ReplaceAll(lower, `\u003e`, ">")
 	if strings.HasPrefix(value, "$") || strings.HasPrefix(value, "${") || strings.HasPrefix(value, "<") {
+		return true
+	}
+	if strings.HasPrefix(lower, "<") {
 		return true
 	}
 	switch lower {
@@ -219,12 +224,16 @@ func isSecretKeyName(key string) bool {
 	case "KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "AUTH", "AUTHORIZATION":
 		return true
 	}
-	for _, marker := range []string{"_TOKEN", "-TOKEN", ".TOKEN", "_SECRET", "-SECRET", ".SECRET", "_PASSWORD", "-PASSWORD", ".PASSWORD", "_AUTH", "-AUTH", ".AUTH", "_KEY", "-KEY", ".KEY"} {
-		if strings.Contains(key, marker) {
+	parts := strings.FieldsFunc(key, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.'
+	})
+	for _, part := range parts {
+		switch part {
+		case "KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "AUTH", "AUTHORIZATION":
 			return true
 		}
 	}
-	return strings.HasSuffix(key, "APIKEY")
+	return false
 }
 
 func redactSnippet(line string) string {

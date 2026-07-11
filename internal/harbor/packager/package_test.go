@@ -29,7 +29,7 @@ func TestPackageCreatesZipWithSingleTaskRootAndSubmissionReport(t *testing.T) {
 	}, "qwen.png")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-6", []domain.TrialRun{
+	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-8", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -135,7 +135,7 @@ func TestPackageCreatesZipWithSingleTaskRootAndSubmissionReport(t *testing.T) {
 
 func TestPackageRejectsUnsafeTaskName(t *testing.T) {
 	taskDir := writePackageTask(t)
-	for _, name := range []string{"../escape", "/tmp/escape", "nested/name", `nested\name`, ".", "..", ".hidden", "bad:name", "bad name"} {
+	for _, name := range []string{"../escape", "/tmp/escape", "too/many/segments", `nested\name`, ".", "..", ".hidden", "bad:name", "bad name"} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Package(Options{
 				TaskDir:   taskDir,
@@ -146,6 +146,16 @@ func TestPackageRejectsUnsafeTaskName(t *testing.T) {
 				t.Fatalf("expected task name error for %q, got %v", name, err)
 			}
 		})
+	}
+}
+
+func TestNormalizeTaskNameAcceptsRegistryName(t *testing.T) {
+	got, err := NormalizeTaskName("codeedge/sample-harbor-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "sample-harbor-task" {
+		t.Fatalf("normalized task name = %q", got)
 	}
 }
 
@@ -920,7 +930,7 @@ func TestPackageFailsWhenHarborResultViolatesThresholds(t *testing.T) {
 	if err := os.WriteFile(qwenResult, []byte(`{"model":"qwen3.7-max","trials":4,"pass_count":2,"pass_at_4":0.50,"average_turns":23,"screenshot":"qwen.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opusResult, []byte(`{"model":"claude-opus-4-6","trials":4,"pass_count":3,"pass_at_4":0.75,"average_turns":28,"screenshot":"opus.png"}`), 0o644); err != nil {
+	if err := os.WriteFile(opusResult, []byte(`{"model":"claude-opus-4-8","trials":4,"pass_count":3,"pass_at_4":0.75,"average_turns":28,"screenshot":"opus.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := Package(Options{
@@ -1317,7 +1327,7 @@ timeout_sec = 1800
 
 [environment]
 build_timeout_sec = 600
-network_mode = "none"
+network_mode = "no-network"
 os = "linux"
 `,
 		"environment/Dockerfile": "FROM alpine\nRUN apk add --no-cache git\nRUN git clone https://github.com/org/repo /workspace/repo && cd /workspace/repo && git checkout abc1234\nWORKDIR /workspace/repo\n",
@@ -1345,7 +1355,7 @@ func writeTrialResults(t *testing.T, outputDir, taskDir string) (string, string)
 	}, "qwen.png")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-6", []domain.TrialRun{
+	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-8", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},

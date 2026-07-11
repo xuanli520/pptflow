@@ -122,6 +122,26 @@ func TestRunFailsWrongTaskTOMLSchema(t *testing.T) {
 	}
 }
 
+func TestRunFailsUnsupportedTaskNetworkMode(t *testing.T) {
+	taskDir := writeTask(t, false)
+	path := filepath.Join(taskDir, "task.toml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(string(raw), `network_mode = "public"`, `network_mode = "none"`, 1))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Passed || !hasFail(report.Checks, "task_toml_network_mode") {
+		t.Fatalf("unsupported Harbor network mode must fail: %+v", report.Checks)
+	}
+}
+
 func TestRunStrictSubmissionAllowsZeroToOneWithoutRepoCommit(t *testing.T) {
 	taskDir := writeTask(t, false)
 	raw, err := os.ReadFile(filepath.Join(taskDir, "task.toml"))

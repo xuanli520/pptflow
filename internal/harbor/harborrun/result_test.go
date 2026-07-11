@@ -52,6 +52,22 @@ func TestValidateForCodeEdgeFailsQwenThresholds(t *testing.T) {
 	}
 }
 
+func TestValidateForCodeEdgeDoesNotApplyQwenDifficultyThresholdToOpus(t *testing.T) {
+	result, err := ParseResult([]byte(`{
+		"model": "claude-opus-4-8",
+		"trials": 4,
+		"pass_count": 4,
+		"pass_at_4": 1,
+		"average_turns": 6
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failures := ValidateForCodeEdge(result, false); len(failures) != 0 {
+		t.Fatalf("Opus should not inherit Qwen difficulty thresholds: %+v", failures)
+	}
+}
+
 func TestValidateForCodeEdgeWithOptionsRequiresModelRunsAndDigest(t *testing.T) {
 	taskDir := writeHarborRunTask(t)
 	digest, err := ComputeTaskDigest(taskDir)

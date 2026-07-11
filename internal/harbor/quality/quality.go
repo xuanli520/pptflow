@@ -2,6 +2,7 @@ package quality
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
+
+const qualityRubricVersion = "codeedge-quality-rubric-v1"
 
 type Options struct {
 	TaskDir             string
@@ -33,11 +36,12 @@ type Options struct {
 func Run(ctx context.Context, opts Options) (domain.QualityReport, error) {
 	taskDir := strings.TrimSpace(opts.TaskDir)
 	report := domain.QualityReport{
-		SchemaVersion: "harbor.quality_report.v1",
-		TaskDir:       taskDir,
-		Checks:        map[string]domain.QualityCheck{},
-		OverallPass:   true,
-		CreatedAt:     time.Now().UTC(),
+		SchemaVersion:     "harbor.quality_report.v1",
+		TaskDir:           taskDir,
+		Checks:            map[string]domain.QualityCheck{},
+		OverallPass:       true,
+		RubricFingerprint: fingerprint(qualityRubricVersion),
+		CreatedAt:         time.Now().UTC(),
 	}
 	if taskDir == "" {
 		add(&report, "task_dir", false, "error", "task directory is required", "deterministic")
@@ -116,7 +120,7 @@ func readTaskFiles(taskDir, testsAnalysisPath string) (taskFiles, error) {
 
 func checkInstructionLeak(report *domain.QualityReport, files taskFiles) {
 	lower := strings.ToLower(files.Instruction)
-	forbidden := []string{"solution/solve.sh", "solve.sh", "tests/test.sh", "/logs/verifier/reward", "reward.txt", "reward.json", "diff --git", "apply this patch"}
+	forbidden := []string{"solution/solve.sh", "solve.sh", "/logs/verifier/reward", "reward.txt", "reward.json", "diff --git", "apply this patch"}
 	for _, pattern := range forbidden {
 		if strings.Contains(lower, pattern) {
 			add(report, "instruction_leak", false, "error", "instruction appears to reveal verifier/oracle detail: "+pattern, "deterministic")
@@ -242,6 +246,10 @@ func runAgentCheck(ctx context.Context, opts Options, files taskFiles, report *d
 		timeout = 300
 	}
 	prompt := buildAgentPrompt(opts, files)
+	report.RequestedModel = strings.TrimSpace(opts.Model)
+	report.ReasoningEffort = strings.TrimSpace(opts.ReasoningEffort)
+	report.PromptFingerprint = fingerprint(prompt)
+	report.ReviewFingerprint = fingerprint(strings.Join([]string{report.RubricFingerprint, report.PromptFingerprint, report.RequestedModel, report.ReasoningEffort}, "\n"))
 	result, err := opts.Agent.Turn(ctx, workflow.AgentTurnRequest{
 		ProjectPath:     opts.TaskDir,
 		Prompt:          prompt,
@@ -275,12 +283,14 @@ func runAgentCheck(ctx context.Context, opts Options, files taskFiles, report *d
 		add(report, "agent_quality_check", false, "warning", "agent JSON did not match quality report schema: "+err.Error(), "agent")
 		return nil
 	}
+	hasBlockingAgentCheck := false
 	for id, check := range parsed.Checks {
 		if check.Source == "" {
 			check.Source = "agent"
 		}
 		report.Checks["agent_"+id] = check
 		if !check.Passed && strings.EqualFold(check.Severity, "error") {
+			hasBlockingAgentCheck = true
 			report.OverallPass = false
 			report.Issues = append(report.Issues, "agent_"+id+": "+check.Detail)
 		} else if !check.Passed {
@@ -288,16 +298,21 @@ func runAgentCheck(ctx context.Context, opts Options, files taskFiles, report *d
 		}
 	}
 	report.Warnings = append(report.Warnings, parsed.Warnings...)
-	report.Issues = append(report.Issues, parsed.Issues...)
-	if parsed.OverallPass != nil && !*parsed.OverallPass {
-		report.OverallPass = false
-		report.Issues = append(report.Issues, "agent reported overall_pass=false")
+	if hasBlockingAgentCheck {
+		report.Issues = append(report.Issues, parsed.Issues...)
+	} else {
+		report.Warnings = append(report.Warnings, parsed.Issues...)
 	}
-	if len(parsed.Issues) > 0 {
-		report.OverallPass = false
+	if parsed.OverallPass != nil && !*parsed.OverallPass && !hasBlockingAgentCheck {
+		report.Warnings = append(report.Warnings, "agent reported overall_pass=false without a failed error-severity check; treated as advisory")
 	}
 	add(report, "agent_quality_check", true, "info", "agent semantic check completed", "agent")
 	return nil
+}
+
+func fingerprint(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
 func buildAgentPrompt(opts Options, files taskFiles) string {

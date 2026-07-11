@@ -45,6 +45,30 @@ func TestScanBytesIgnoresPlaceholders(t *testing.T) {
 	}
 }
 
+func TestScanBytesIgnoresProtocolKeyMetadata(t *testing.T) {
+	raw := []byte("keys=command,params_keys=path,model,result_keys=output,status\n")
+	if findings := ScanBytes("agent.log", raw); len(findings) != 0 {
+		t.Fatalf("protocol key metadata must not be treated as secrets: %+v", findings)
+	}
+}
+
+func TestScanBytesIgnoresJSONEscapedRedactionMarker(t *testing.T) {
+	raw := []byte(`{"command":"harbor --ae ANTHROPIC_AUTH_TOKEN=\u003credacted\u003e","argv":["ANTHROPIC_AUTH_TOKEN=\u003credacted\u003e"]}`)
+	if findings := ScanBytes("command_run.json", raw); len(findings) > 0 {
+		t.Fatalf("JSON-escaped redaction marker must not be treated as a secret: %+v", findings)
+	}
+}
+
+func TestScanBytesIgnoresTokenUsageMetadata(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		`{"n_input_tokens":0,"n_cache_tokens":0,"n_output_tokens":0}`,
+		`{"subtype":"thinking_tokens","estimated_tokens":53,"estimated_tokens_delta":6}`,
+	}, "\n"))
+	if findings := ScanBytes("result.json", raw); len(findings) > 0 {
+		t.Fatalf("token usage counters must not be treated as credentials: %+v", findings)
+	}
+}
+
 func TestScanBytesFindsJSONSecretAssignments(t *testing.T) {
 	secretValue := "raw-json-token"
 	findings := ScanBytes("result.json", []byte(`{"model":"qwen","API_TOKEN":"`+secretValue+`"}`))

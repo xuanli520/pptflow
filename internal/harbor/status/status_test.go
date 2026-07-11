@@ -49,6 +49,44 @@ func TestReadWorkspaceLoadsStateAndFiltersEvents(t *testing.T) {
 	}
 }
 
+func TestReadWorkspaceHandlesLargeGateEventLines(t *testing.T) {
+	workspace := t.TempDir()
+	summary := domain.RunSummary{RunID: "run-current", Workspace: workspace, Status: "running", Passed: true}
+	data, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "state.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	event := domain.RunnerEvent{
+		RunID:   "run-current",
+		Type:    "gate_requested",
+		NodeID:  "final_review",
+		Status:  "waiting",
+		Message: "review",
+		Artifacts: []domain.ArtifactPreview{{
+			Name:    "large-report.json",
+			Path:    "/tmp/large-report.json",
+			Content: strings.Repeat("x", 128*1024),
+		}},
+	}
+	line, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "event_log.jsonl"), append(line, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := ReadWorkspace(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.EventCount != 1 || report.LatestEvent == nil || len(report.LatestEvent.Artifacts) != 1 || report.LatestEvent.Artifacts[0].Content != "" {
+		t.Fatalf("large event was not parsed and stripped safely: %+v", report)
+	}
+}
+
 func TestReadWorkspaceRedactsLatestEvent(t *testing.T) {
 	workspace := t.TempDir()
 	secret := "raw-status-secret"

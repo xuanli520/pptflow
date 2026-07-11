@@ -134,7 +134,7 @@ func Run(ctx context.Context, opts Options) (domain.SimilarityReport, error) {
 			report.Issues = append(report.Issues, "at least one similarity source is required")
 		}
 	}
-	if opts.StrictSources && len(report.Sources) > 0 && len(report.SuccessfulSources) == 0 {
+	if len(report.Sources) > 0 && len(report.SuccessfulSources) == 0 {
 		report.OverallPass = false
 		report.Issues = append(report.Issues, "at least one similarity source must be scanned successfully")
 	}

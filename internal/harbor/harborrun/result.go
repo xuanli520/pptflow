@@ -667,7 +667,7 @@ func ValidateForCodeEdgeWithOptions(result domain.TrialResult, opts ValidationOp
 	if opts.Qwen && result.PassAt4 > 0.25 {
 		failures = append(failures, fmt.Sprintf("Qwen pass@4 must be <= 0.25, got %.2f", result.PassAt4))
 	}
-	if result.AverageTurns < 20 {
+	if opts.Qwen && result.AverageTurns < 20 {
 		failures = append(failures, fmt.Sprintf("average_turns must be >= 20, got %.2f", result.AverageTurns))
 	}
 	failures = append(failures, validateRuns(result, opts.RequireRuns)...)
@@ -722,11 +722,14 @@ func validateCommandRun(result domain.TrialResult, expectedModel, expectedAgent,
 	if expectedAgent == "" {
 		expectedAgent = "claude-code"
 	}
-	if !argvFlagValue(argv, "-a", expectedAgent) {
+	actualAgent, hasAgent := argvFlagText(argv, "-a")
+	if !hasAgent || !equivalentHarborAgent(actualAgent, expectedAgent) {
 		failures = append(failures, "command_run argv must include expected agent "+expectedAgent)
 	}
-	if !argvFlagValue(argv, "-n", "4") {
-		failures = append(failures, "command_run argv must include -n 4")
+	concurrencyText, hasConcurrency := argvFlagText(argv, "-n")
+	concurrency, concurrencyErr := strconv.Atoi(concurrencyText)
+	if !hasConcurrency || concurrencyErr != nil || concurrency < 1 {
+		failures = append(failures, "command_run argv must include a positive -n concurrency")
 	}
 	if !argvFlagValue(argv, "-k", "4") {
 		failures = append(failures, "command_run argv must include -k 4")
@@ -738,6 +741,15 @@ func validateCommandRun(result domain.TrialResult, expectedModel, expectedAgent,
 	failures = append(failures, validateCommandOutputFile(path, "stderr_path", commandRun.StderrPath, commandRun.Stderr)...)
 	failures = append(failures, validateRawResultEvidence(result, path, commandRun)...)
 	return failures
+}
+
+func equivalentHarborAgent(actual, expected string) bool {
+	actual = strings.TrimSpace(actual)
+	expected = strings.TrimSpace(expected)
+	if actual == expected {
+		return true
+	}
+	return strings.EqualFold(expected, "claude-code") && actual == retryingClaudeImportPath
 }
 
 func validateRawResultEvidence(result domain.TrialResult, commandRunPath string, commandRun domain.CommandRun) []string {

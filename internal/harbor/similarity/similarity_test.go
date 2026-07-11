@@ -150,6 +150,21 @@ func TestRunStrictSourcesFailsWhenConfiguredSourceCannotBeScanned(t *testing.T) 
 	}
 }
 
+func TestRunFailsWhenConfiguredSourceContainsNoScannableFiles(t *testing.T) {
+	taskDir := writeSimilarityTask(t)
+	history := t.TempDir()
+	report, err := Run(context.Background(), Options{
+		TaskDir:     taskDir,
+		HistoryDirs: []string{history},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OverallPass || len(report.SuccessfulSources) != 0 {
+		t.Fatalf("configured but unevaluated source must not be green: %+v", report)
+	}
+}
+
 func TestRunStrictSourcesFailsWhenGitHubSearchFails(t *testing.T) {
 	taskDir := writeSimilarityTask(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

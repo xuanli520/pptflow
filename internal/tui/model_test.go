@@ -39,13 +39,16 @@ func TestModelRendersRunnerEvents(t *testing.T) {
 	if !strings.Contains(rendered, "codeedge_lint") || !strings.Contains(rendered, "lint passed") {
 		t.Fatalf("rendered view missing event: %s", rendered)
 	}
+	if !strings.Contains(rendered, "Cancel model") {
+		t.Fatalf("TUI footer is missing the model-stage cancellation action: %s", rendered)
+	}
 }
 
 func TestStartViewRendersWorkflowForm(t *testing.T) {
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{})
 	m.width = 100
 	rendered := m.View()
-	for _, want := range []string{"Start Workflow", "Run existing task", "Task", "Workspace", "Docker verify", "Tests analysis", "Qwen result", "History dirs", "Similarity threshold", "Harbor agent", "Qwen model", "Task name", "Codex model"} {
+	for _, want := range []string{"Start Workflow", "Run existing task", "Task", "Workspace", "Docker verify", "Tests analysis", "Qwen result", "History dirs", "Similarity threshold", "Harbor agent", "Qwen model", "Qwen Harbor base URL", "Opus Harbor base URL", "Harbor setup timeout", "Harbor preflight", "Harbor concurrency", "Harbor attempts", "Harbor infra retries", "Task name", "Codex model"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("start view missing %q: %s", want, rendered)
 		}
@@ -239,7 +242,7 @@ func TestStartFormLaunchesPackageWithResultScreenshotFallback(t *testing.T) {
 	if err := os.WriteFile(qwen, []byte(`{"model":"qwen3.7-max","screenshot":"qwen.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-6","pass4_screenshot":"opus.png"}`), 0o644); err != nil {
+	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-8","pass4_screenshot":"opus.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{
@@ -268,7 +271,7 @@ func TestStartFormRejectsPackageWithoutScreenshotOrFallback(t *testing.T) {
 	if err := os.WriteFile(qwen, []byte(`{"model":"qwen3.7-max"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-6"}`), 0o644); err != nil {
+	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-8"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{
@@ -319,7 +322,14 @@ func TestStartFormPreservesAdvancedOptions(t *testing.T) {
 		HarborAgent:         "custom-agent",
 		QwenModel:           "qwen-custom",
 		OpusModel:           "opus-custom",
+		QwenHarborBaseURL:   "https://qwen.example/v1",
+		OpusHarborBaseURL:   "https://opus.example/v1",
 		HarborTimeout:       123,
+		HarborSetupTimeout:  321,
+		HarborPreflight:     true,
+		HarborConcurrency:   2,
+		HarborAttempts:      4,
+		HarborInfraRetries:  3,
 		TaskName:            "sample-task",
 		CodeLang:            "go",
 		TaskType:            "bugfix",
@@ -337,7 +347,7 @@ func TestStartFormPreservesAdvancedOptions(t *testing.T) {
 		t.Fatal("valid advanced options should launch workflow")
 	}
 	opts := updated.(model).opts
-	if !opts.QualityAgent || opts.SimilarityThreshold != 0.37 || opts.HarborAgent != "custom-agent" || opts.QwenModel != "qwen-custom" || opts.OpusModel != "opus-custom" || opts.HarborTimeout != 123 || opts.TaskName != "sample-task" || opts.CodeLang != "go" || opts.TaskType != "bugfix" || opts.Application != "cli" || opts.AHT != "45m" || opts.Description != "Fix config loading" || !opts.IsZeroToOne || opts.Model != "gpt-5.3-codex" || opts.Reasoning != "high" || opts.CodexPath != "/usr/local/bin/codex" || opts.AgentTimeout != 77 {
+	if !opts.QualityAgent || opts.SimilarityThreshold != 0.37 || opts.HarborAgent != "custom-agent" || opts.QwenModel != "qwen-custom" || opts.OpusModel != "opus-custom" || opts.QwenHarborBaseURL != "https://qwen.example/v1" || opts.OpusHarborBaseURL != "https://opus.example/v1" || opts.HarborTimeout != 123 || opts.HarborSetupTimeout != 321 || !opts.HarborPreflight || opts.HarborConcurrency != 2 || opts.HarborAttempts != 4 || opts.HarborInfraRetries != 3 || opts.TaskName != "sample-task" || opts.CodeLang != "go" || opts.TaskType != "bugfix" || opts.Application != "cli" || opts.AHT != "45m" || opts.Description != "Fix config loading" || !opts.IsZeroToOne || opts.Model != "gpt-5.3-codex" || opts.Reasoning != "high" || opts.CodexPath != "/usr/local/bin/codex" || opts.AgentTimeout != 77 {
 		t.Fatalf("advanced options not preserved: %+v", opts)
 	}
 }
@@ -523,6 +533,24 @@ func TestGateDecisionIncludesEditedFileSummary(t *testing.T) {
 	decision := updated.(model).makeGateDecision(true)
 	if !decision.Approved || decision.EditedFiles == nil || !strings.Contains(decision.EditedFiles[artifact], "size 6->13") {
 		t.Fatalf("decision missing edited file summary: %+v", decision)
+	}
+}
+
+func TestFinalReviewCanSubmitReviseAction(t *testing.T) {
+	m := initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: "workspace", TaskDir: "task"})
+	m.activeGate = &domain.GateRequest{RequestID: "phase2:final_review", GateID: "final_review"}
+	m.view = viewGate
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	if cmd == nil {
+		t.Fatal("revise action did not submit a decision")
+	}
+	msg := cmd()
+	written, ok := msg.(gateDecisionWrittenMsg)
+	if !ok || written.decision.Action != "revise" || written.decision.Approved {
+		t.Fatalf("unexpected revise decision: %#v", msg)
+	}
+	if updated.(model).activeGate != nil {
+		t.Fatal("gate should wait for the rerun request after submitting revise")
 	}
 }
 

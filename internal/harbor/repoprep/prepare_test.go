@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 )
@@ -217,6 +218,33 @@ echo "abc123	refs/heads/main"
 	}
 	if !strings.Contains(envText, "GIT_TERMINAL_PROMPT=<set>") || !strings.Contains(envText, "GIT_CONFIG_GLOBAL=<set>") {
 		t.Fatalf("public probe env missing noninteractive config: %s", envText)
+	}
+}
+
+func TestGitCommandRetryRecoversTransientTLSFailure(t *testing.T) {
+	binDir := t.TempDir()
+	counter := filepath.Join(t.TempDir(), "attempts")
+	script := fmt.Sprintf(`#!/bin/sh
+count=0
+if [ -f %q ]; then count=$(/bin/cat %q); fi
+count=$((count + 1))
+printf '%%s' "$count" > %q
+if [ "$count" -lt 3 ]; then
+  echo 'fatal: GnuTLS recv error (-110): The TLS connection was non-properly terminated.' >&2
+  exit 128
+fi
+echo 'abc123 refs/heads/main'
+`, counter, counter, counter)
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	_, runs, err := runGitCommandWithRetry(context.Background(), "git_public_probe", publicGitEnv(), "", 3, time.Millisecond, nil, "ls-remote", "https://github.com/org/repo.git", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 3 || runs[0].Attempt != 1 || runs[2].Attempt != 3 || !runs[2].Passed {
+		t.Fatalf("unexpected retry audit: %+v", runs)
 	}
 }
 

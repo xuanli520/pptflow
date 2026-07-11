@@ -3,7 +3,9 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -51,11 +53,20 @@ type RunnerOptions struct {
 	SimilarityThreshold   float64
 	GitHubToken           string
 	RunHarbor             bool
+	HarborModels          string
 	HarborAgent           string
 	HarborAgentEnv        []string
 	QwenModel             string
 	OpusModel             string
+	QwenHarborBaseURL     string
+	OpusHarborBaseURL     string
 	HarborTimeout         int
+	HarborSetupTimeout    int
+	HarborAgentCacheDir   string
+	HarborPreflight       bool
+	HarborConcurrency     int
+	HarborAttempts        int
+	HarborInfraRetries    int
 	HarborExec            executor.CommandRunner
 	VerifyExec            executor.CommandRunner
 	Package               bool
@@ -89,12 +100,24 @@ type Runner struct {
 	runID             string
 	currentSummary    *domain.RunSummary
 	persistenceErrors []string
+	stageMu           sync.Mutex
+	stageCancels      map[string]context.CancelFunc
 }
 
 const runnerOptionsSchemaVersion = "harbor.runner_options.v1"
 
+func DefaultHarborAgentCacheDir() string {
+	root, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(root) == "" {
+		root = filepath.Join(".", ".cache")
+	}
+	return filepath.Join(root, "harbor-factory", "agents", "claude-code")
+}
+
+var ErrHarborModelStageCanceled = errors.New("Harbor model stage canceled")
+
 func NewRunner(opts RunnerOptions) *Runner {
-	return &Runner{opts: opts, events: make(chan domain.RunnerEvent, 64), decisions: make(chan domain.GateDecision, 8)}
+	return &Runner{opts: opts, events: make(chan domain.RunnerEvent, 64), decisions: make(chan domain.GateDecision, 8), stageCancels: map[string]context.CancelFunc{}}
 }
 
 func SaveRunnerOptions(opts RunnerOptions) (domain.RunnerOptionsSnapshot, error) {
@@ -136,6 +159,32 @@ func (r *Runner) SubmitGateDecision(decision domain.GateDecision) {
 	r.decisions <- decision
 }
 
+func (r *Runner) CancelNode(nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID != nodes.HarborRunQwen && nodeID != nodes.HarborRunOpus {
+		return false
+	}
+	r.stageMu.Lock()
+	cancel := r.stageCancels[nodeID]
+	r.stageMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (r *Runner) registerStageCancel(nodeID string, cancel context.CancelFunc) func() {
+	r.stageMu.Lock()
+	r.stageCancels[nodeID] = cancel
+	r.stageMu.Unlock()
+	return func() {
+		r.stageMu.Lock()
+		delete(r.stageCancels, nodeID)
+		r.stageMu.Unlock()
+	}
+}
+
 func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr error) {
 	start := time.Now().UTC()
 	runID := r.ensureRunID()
@@ -144,16 +193,26 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 	summary.StartedAt = start
 	summary.Passed = true
 	summary.Status = "running"
+	if previousRunID := recoverablePreviousRunID(r.opts.Workspace); previousRunID != "" && previousRunID != runID {
+		summary.PreviousRunID = previousRunID
+		summary.Recovered = true
+	}
 	r.setCurrentSummary(&summary)
 	if _, err := SaveRunnerOptions(r.opts); err != nil {
 		r.recordPersistenceError("run_options.json: " + err.Error())
 	}
 	r.emit("run_started", "", "running", "run started", "")
+	if summary.Recovered {
+		r.emit("run_recovered", "", "running", fmt.Sprintf("recovered run: previous=%s new=%s; valid evidence will be reused and stale nodes rerun", summary.PreviousRunID, summary.RunID), "")
+	}
 	defer func() {
 		if summary.FinishedAt.IsZero() {
 			summary.FinishedAt = time.Now().UTC()
 		}
 		summary.Events = r.snapshot()
+		if summary.Recovered {
+			summary.ReusedNodes, summary.RerunNodes = recoveryNodeSets(summary.Events)
+		}
 		summary.GateDecisions = r.gateSnapshot()
 		if summary.Status == "" || summary.Status == "running" {
 			if summary.Passed && runErr == nil {
@@ -348,10 +407,14 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 	}
 	applyWorkspaceEvidenceDefaults(r.opts.Workspace, &effectiveTestsAnalysis, &effectiveQwenResult, &effectiveOpusResult, &effectiveQwenScreenshot, &effectiveOpusScreenshot)
 
+	reviewRevisionCount := 0
+	var harborModelErrors []error
+reviewChecks:
 	if effectiveTaskDir != "" && summary.Passed {
 		strictSubmission := r.opts.StrictSubmission || r.opts.Package
-		needQwenHarborRun := (r.opts.RunHarbor || r.opts.Package) && strings.TrimSpace(effectiveQwenResult) == ""
-		needOpusHarborRun := (r.opts.RunHarbor || r.opts.Package) && strings.TrimSpace(effectiveOpusResult) == ""
+		runQwen, runOpus, _ := harborModelSelection(r.opts.HarborModels)
+		needQwenHarborRun := (r.opts.Package || r.opts.RunHarbor && runQwen) && strings.TrimSpace(effectiveQwenResult) == ""
+		needOpusHarborRun := (r.opts.Package || r.opts.RunHarbor && runOpus) && strings.TrimSpace(effectiveOpusResult) == ""
 		needHarborRun := needQwenHarborRun || needOpusHarborRun
 		forceVerifyDocker := r.opts.VerifyDocker || r.opts.Package
 		preLintStrict := strictSubmission && !needHarborRun
@@ -488,33 +551,31 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 				qwenModel := defaultString(r.opts.QwenModel, "qwen3.7-max")
 				qwenResult, err := r.runHarborModel(ctx, effectiveTaskDir, nodes.HarborRunQwen, qwenModel)
 				if err != nil {
-					r.emit("node_failed", nodes.HarborRunQwen, "failed", err.Error(), "")
+					summary.QwenResult = &qwenResult
 					summary.Passed = false
-					summary.Status = "failed"
-					summary.FinishedAt = time.Now().UTC()
-					summary.Events = r.snapshot()
-					close(r.events)
-					return summary, err
+					if !errors.Is(err, ErrHarborModelStageCanceled) {
+						harborModelErrors = append(harborModelErrors, fmt.Errorf("Qwen Harbor stage: %w", err))
+					}
+				} else {
+					summary.QwenResult = &qwenResult
+					effectiveQwenResult = qwenResult.ResultPath
+					effectiveQwenScreenshot = defaultString(effectiveQwenScreenshot, qwenResult.Screenshot)
 				}
-				summary.QwenResult = &qwenResult
-				effectiveQwenResult = qwenResult.ResultPath
-				effectiveQwenScreenshot = defaultString(effectiveQwenScreenshot, qwenResult.Screenshot)
 			}
 			if needOpusHarborRun {
-				opusModel := defaultString(r.opts.OpusModel, "claude-opus-4-6")
+				opusModel := defaultString(r.opts.OpusModel, "claude-opus-4-8")
 				opusResult, err := r.runHarborModel(ctx, effectiveTaskDir, nodes.HarborRunOpus, opusModel)
 				if err != nil {
-					r.emit("node_failed", nodes.HarborRunOpus, "failed", err.Error(), "")
+					summary.OpusResult = &opusResult
 					summary.Passed = false
-					summary.Status = "failed"
-					summary.FinishedAt = time.Now().UTC()
-					summary.Events = r.snapshot()
-					close(r.events)
-					return summary, err
+					if !errors.Is(err, ErrHarborModelStageCanceled) {
+						harborModelErrors = append(harborModelErrors, fmt.Errorf("Opus Harbor stage: %w", err))
+					}
+				} else {
+					summary.OpusResult = &opusResult
+					effectiveOpusResult = opusResult.ResultPath
+					effectiveOpusScreenshot = defaultString(effectiveOpusScreenshot, opusResult.Screenshot)
 				}
-				summary.OpusResult = &opusResult
-				effectiveOpusResult = opusResult.ResultPath
-				effectiveOpusScreenshot = defaultString(effectiveOpusScreenshot, opusResult.Screenshot)
 			}
 		}
 		if (needHarborRun || (strictSubmission && !preLintStrict)) && summary.Passed {
@@ -564,7 +625,7 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 				}
 			}
 			if summary.OpusResult == nil && strings.TrimSpace(effectiveOpusResult) != "" {
-				opusModel := defaultString(r.opts.OpusModel, "claude-opus-4-6")
+				opusModel := defaultString(r.opts.OpusModel, "claude-opus-4-8")
 				opusResult, err := r.loadProvidedHarborResult(nodes.HarborRunOpus, effectiveOpusResult, effectiveTaskDir, opusModel, false)
 				if err != nil {
 					r.emit("node_failed", nodes.HarborRunOpus, "failed", err.Error(), effectiveOpusResult)
@@ -576,33 +637,58 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 			}
 		}
 		if (summary.QwenResult != nil || summary.OpusResult != nil) && summary.Passed {
-			resultArtifacts := gateArtifacts(effectiveQwenResult, effectiveOpusResult)
-			if strings.TrimSpace(effectiveQwenScreenshot) != "" {
-				resultArtifacts = append(resultArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveQwenScreenshot), Path: effectiveQwenScreenshot})
-			}
-			if strings.TrimSpace(effectiveOpusScreenshot) != "" {
-				resultArtifacts = append(resultArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveOpusScreenshot), Path: effectiveOpusScreenshot})
-			}
-			decision, err := r.reviewGate(ctx, nodes.ResultReview, "Result Review", nodes.ResultReview, "Review Harbor pass@4 evidence before final packaging.", resultChecklist(summary.QwenResult, summary.OpusResult, effectiveTaskDir, defaultString(r.opts.QwenModel, "qwen3.7-max"), defaultString(r.opts.OpusModel, "claude-opus-4-6"), defaultString(r.opts.HarborAgent, "claude-code"), effectiveQwenScreenshot, effectiveOpusScreenshot), resultArtifacts, "phase3")
-			if err != nil {
-				r.emit("node_failed", nodes.ResultReview, "failed", err.Error(), "")
-				summary.Passed = false
-				summary.Status = "failed"
-				summary.FinishedAt = time.Now().UTC()
-				summary.Events = r.snapshot()
-				summary.GateDecisions = r.gateSnapshot()
-				close(r.events)
-				return summary, err
-			}
-			summary.GateDecisions = append(summary.GateDecisions, decision)
-			if !decision.Approved {
-				r.emit("node_failed", nodes.ResultReview, "failed", "gate rejected", "")
-				summary.Passed = false
-			} else {
-				r.emit("node_succeeded", nodes.ResultReview, "succeeded", "gate approved", "")
+			for resultRevision := 0; ; {
+				resultArtifacts := gateArtifacts(effectiveQwenResult, effectiveOpusResult)
+				if strings.TrimSpace(effectiveQwenScreenshot) != "" {
+					resultArtifacts = append(resultArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveQwenScreenshot), Path: effectiveQwenScreenshot})
+				}
+				if strings.TrimSpace(effectiveOpusScreenshot) != "" {
+					resultArtifacts = append(resultArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveOpusScreenshot), Path: effectiveOpusScreenshot})
+				}
+				decision, err := r.reviewGate(ctx, nodes.ResultReview, "Result Review", nodes.ResultReview, "Review Harbor pass@4 evidence and screenshots before final packaging.", resultChecklist(summary.QwenResult, summary.OpusResult, effectiveTaskDir, defaultString(r.opts.QwenModel, "qwen3.7-max"), defaultString(r.opts.OpusModel, "claude-opus-4-8"), defaultString(r.opts.HarborAgent, "claude-code"), effectiveQwenScreenshot, effectiveOpusScreenshot), resultArtifacts, "phase3")
+				if err != nil {
+					r.emit("node_failed", nodes.ResultReview, "failed", err.Error(), "")
+					summary.Passed = false
+					summary.Status = "failed"
+					summary.FinishedAt = time.Now().UTC()
+					summary.Events = r.snapshot()
+					summary.GateDecisions = r.gateSnapshot()
+					close(r.events)
+					return summary, err
+				}
+				summary.GateDecisions = append(summary.GateDecisions, decision)
+				if decision.Action == "revise" {
+					resultRevision++
+					if resultRevision > 5 {
+						err := fmt.Errorf("result review exceeded the maximum of 5 evidence refresh rounds")
+						r.emit("node_failed", nodes.ResultReview, "failed", err.Error(), "")
+						summary.Passed = false
+						return summary, err
+					}
+					if err := r.archiveGateRevision("phase3", nodes.ResultReview, decision, resultRevision); err != nil {
+						return summary, err
+					}
+					r.emit("node_progress", nodes.ResultReview, "running", fmt.Sprintf("evidence refresh %d requested; reloading screenshot checklist", resultRevision), "")
+					continue
+				}
+				if !decision.Approved {
+					r.emit("node_failed", nodes.ResultReview, "failed", "gate rejected", "")
+					summary.Passed = false
+				} else {
+					r.emit("node_succeeded", nodes.ResultReview, "succeeded", "gate approved", "")
+				}
+				break
 			}
 		}
-		finalArtifacts := gateArtifacts(reportPath)
+		finalArtifacts := gateArtifacts(
+			reportPath,
+			filepath.Join(effectiveTaskDir, "instruction.md"),
+			filepath.Join(effectiveTaskDir, "task.toml"),
+			filepath.Join(effectiveTaskDir, "environment", "Dockerfile"),
+			filepath.Join(effectiveTaskDir, "solution", "solve.sh"),
+			filepath.Join(effectiveTaskDir, "tests", "test.sh"),
+			filepath.Join(effectiveTaskDir, "tests_analysis.md"),
+		)
 		if verifyPath != "" {
 			finalArtifacts = append(finalArtifacts, gateArtifacts(verifyPath)...)
 		}
@@ -640,6 +726,29 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 			return summary, err
 		}
 		summary.GateDecisions = append(summary.GateDecisions, decision)
+		if decision.Action == "revise" {
+			reviewRevisionCount++
+			if reviewRevisionCount > 5 {
+				err := fmt.Errorf("final review exceeded the maximum of 5 revise-and-rerun rounds")
+				r.emit("node_failed", nodes.FinalReview, "failed", err.Error(), "")
+				summary.Passed = false
+				return summary, err
+			}
+			if err := r.archiveGateRevision("phase2", nodes.FinalReview, decision, reviewRevisionCount); err != nil {
+				return summary, err
+			}
+			r.emit("node_progress", nodes.FinalReview, "running", fmt.Sprintf("revision %d accepted; rerunning lint, verification, quality, similarity, and model evidence", reviewRevisionCount), "")
+			summary.Passed = true
+			summary.LintReport = nil
+			summary.VerifyReport = nil
+			summary.QualityReport = nil
+			summary.SimilarityReport = nil
+			summary.QwenResult = nil
+			summary.OpusResult = nil
+			effectiveQwenResult = ""
+			effectiveOpusResult = ""
+			goto reviewChecks
+		}
 		if !decision.Approved {
 			r.emit("node_failed", nodes.FinalReview, "failed", "gate rejected", "")
 			summary.Passed = false
@@ -690,7 +799,51 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 	}
 	summary.Events = r.snapshot()
 	close(r.events)
-	return summary, nil
+	runErr = errors.Join(harborModelErrors...)
+	return summary, runErr
+}
+
+func recoverablePreviousRunID(workspace string) string {
+	workspace = defaultString(strings.TrimSpace(workspace), filepath.Join(".harbor-factory", "workspace"))
+	raw, err := os.ReadFile(filepath.Join(workspace, "state.json"))
+	if err != nil {
+		return ""
+	}
+	var previous domain.RunSummary
+	if json.Unmarshal(raw, &previous) != nil || strings.TrimSpace(previous.RunID) == "" {
+		return ""
+	}
+	if previous.Status == "succeeded" || previous.Status == "failed" || !previous.FinishedAt.IsZero() {
+		return ""
+	}
+	return strings.TrimSpace(previous.RunID)
+}
+
+func recoveryNodeSets(events []domain.RunnerEvent) ([]string, []string) {
+	reused := map[string]bool{}
+	rerun := map[string]bool{}
+	for _, event := range events {
+		if event.NodeID == "" {
+			continue
+		}
+		if event.Type == "node_started" {
+			rerun[event.NodeID] = true
+		}
+		if event.Type == "node_succeeded" && strings.Contains(strings.ToLower(event.Message), "reused existing") {
+			reused[event.NodeID] = true
+			delete(rerun, event.NodeID)
+		}
+	}
+	return sortedSet(reused), sortedSet(rerun)
+}
+
+func sortedSet(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r *Runner) loadProvidedHarborResult(nodeID, path, taskDir, expectedModel string, qwen bool) (domain.TrialResult, error) {
@@ -710,24 +863,72 @@ func (r *Runner) loadProvidedHarborResult(nodeID, path, taskDir, expectedModel s
 }
 
 func (r *Runner) runHarborModel(ctx context.Context, taskDir, nodeID, model string) (domain.TrialResult, error) {
+	modelCtx, cancel := context.WithCancel(ctx)
+	unregister := r.registerStageCancel(nodeID, cancel)
+	defer func() {
+		unregister()
+		cancel()
+	}()
 	r.emit("node_started", nodeID, "running", "running Harbor pass@4 for "+model, "")
 	outputDir := nodes.HarborRunDir(r.opts.Workspace, nodeID)
-	trialResult, commandRun, err := harborrun.Run(ctx, harborrun.Options{
-		TaskPath:       taskDir,
-		Model:          model,
-		Agent:          r.opts.HarborAgent,
-		AgentEnv:       r.opts.HarborAgentEnv,
-		OutputDir:      outputDir,
-		TimeoutSeconds: r.opts.HarborTimeout,
-		Exec:           r.opts.HarborExec,
-	})
-	if err != nil {
-		return trialResult, err
+	livePath := filepath.Join(outputDir, "live.log")
+	agentEnv := append([]string(nil), r.opts.HarborAgentEnv...)
+	switch nodeID {
+	case nodes.HarborRunQwen:
+		agentEnv = upsertEnv(agentEnv, "ANTHROPIC_BASE_URL", r.opts.QwenHarborBaseURL)
+	case nodes.HarborRunOpus:
+		agentEnv = upsertEnv(agentEnv, "ANTHROPIC_BASE_URL", r.opts.OpusHarborBaseURL)
 	}
-	if aliasPath, err := writeHarborResultAlias(outputDir, nodeID, &trialResult); err != nil {
+	lastProgress := time.Time{}
+	var progressMu sync.Mutex
+	trialResult, commandRun, err := harborrun.Run(modelCtx, harborrun.Options{
+		TaskPath:            taskDir,
+		Model:               model,
+		Agent:               r.opts.HarborAgent,
+		AgentEnv:            agentEnv,
+		OutputDir:           outputDir,
+		TimeoutSeconds:      r.opts.HarborTimeout,
+		SetupTimeoutSeconds: r.opts.HarborSetupTimeout,
+		AgentCacheDir:       r.opts.HarborAgentCacheDir,
+		Preflight:           r.opts.HarborPreflight,
+		Concurrency:         r.opts.HarborConcurrency,
+		Attempts:            r.opts.HarborAttempts,
+		InfraRetries:        r.opts.HarborInfraRetries,
+		Progress: func(line, source string) {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			now := time.Now()
+			if !lastProgress.IsZero() && now.Sub(lastProgress) < time.Second {
+				return
+			}
+			lastProgress = now
+			message := strings.TrimSpace(line)
+			if len(message) > 320 {
+				message = message[:320] + "..."
+			}
+			if message != "" {
+				r.emit("node_progress", nodeID, "running", source+": "+message, livePath)
+			}
+		},
+		Exec: r.opts.HarborExec,
+	})
+	if trialResult.ResultPath != "" {
+		aliasPath, aliasErr := writeHarborResultAlias(outputDir, nodeID, &trialResult)
+		if aliasErr != nil {
+			return trialResult, aliasErr
+		}
+		if aliasPath != "" {
+			trialResult.ResultPath = aliasPath
+		}
+	}
+	if err != nil {
+		path := firstNonEmpty(trialResult.ResultPath, trialResult.PreflightResultPath, trialResult.CommandRunPath, trialResult.PreflightRunPath, trialResult.SchemaPreflightPath)
+		r.emit("node_failed", nodeID, "failed", fmt.Sprintf("Harbor failed with partial result: trials=%d pass_count=%d: %v", trialResult.Trials, trialResult.PassCount, err), path)
+		if errors.Is(modelCtx.Err(), context.Canceled) && ctx.Err() == nil {
+			r.emit("node_canceled", nodeID, "canceled", "Harbor model stage canceled; continuing remaining workflow stages", path)
+			return trialResult, fmt.Errorf("%w: %s", ErrHarborModelStageCanceled, model)
+		}
 		return trialResult, err
-	} else if aliasPath != "" {
-		trialResult.ResultPath = aliasPath
 	}
 	path := trialResult.ResultPath
 	if path == "" {
@@ -858,7 +1059,130 @@ func (r *Runner) validateOptions() error {
 	if r.opts.Package && strings.TrimSpace(r.opts.OutputDir) == "" {
 		return fmt.Errorf("--package requires a non-empty --output")
 	}
+	if r.opts.Package && strings.TrimSpace(r.opts.TaskName) != "" {
+		taskName, err := packager.NormalizeTaskName(r.opts.TaskName)
+		if err != nil {
+			return err
+		}
+		r.opts.TaskName = taskName
+	}
+	if r.opts.HarborSetupTimeout <= 0 {
+		r.opts.HarborSetupTimeout = 1200
+	}
+	if r.opts.HarborConcurrency <= 0 {
+		r.opts.HarborConcurrency = 1
+	}
+	if r.opts.HarborAttempts <= 0 {
+		r.opts.HarborAttempts = 4
+	}
+	if r.opts.HarborInfraRetries < 0 {
+		return fmt.Errorf("--harbor-infra-retries must be non-negative")
+	}
+	if _, _, err := harborModelSelection(r.opts.HarborModels); err != nil {
+		return err
+	}
+	if err := validateHarborBaseURL("--qwen-harbor-base-url", r.opts.QwenHarborBaseURL); err != nil {
+		return err
+	}
+	if err := validateHarborBaseURL("--opus-harbor-base-url", r.opts.OpusHarborBaseURL); err != nil {
+		return err
+	}
+	if r.opts.RunHarbor && strings.EqualFold(defaultString(r.opts.HarborAgent, "claude-code"), "claude-code") && !hasClaudeCredential(r.opts.HarborAgentEnv) {
+		return fmt.Errorf("--run-harbor with claude-code requires a non-empty ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, or CLAUDE_CODE_OAUTH_TOKEN referenced via --harbor-agent-env; ${VAR} templates must resolve in the Factory process environment because host Claude OAuth is not inherited by Harbor trial containers")
+	}
 	return nil
+}
+
+func harborModelSelection(value string) (bool, bool, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return true, true, nil
+	}
+	var qwen, opus bool
+	for _, model := range strings.Split(value, ",") {
+		switch strings.ToLower(strings.TrimSpace(model)) {
+		case "qwen":
+			qwen = true
+		case "opus":
+			opus = true
+		case "":
+			return false, false, fmt.Errorf("--harbor-models contains an empty model name")
+		default:
+			return false, false, fmt.Errorf("--harbor-models accepts only qwen and opus")
+		}
+	}
+	if !qwen && !opus {
+		return false, false, fmt.Errorf("--harbor-models must select qwen, opus, or both")
+	}
+	return qwen, opus, nil
+}
+
+func validateHarborBaseURL(label, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return fmt.Errorf("%s must be an absolute HTTP(S) URL", label)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s must not contain credentials, query parameters, or a fragment", label)
+	}
+	return nil
+}
+
+func upsertEnv(values []string, key, value string) []string {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	out := make([]string, 0, len(values)+1)
+	for _, item := range values {
+		itemKey, _, ok := strings.Cut(item, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(itemKey), key) {
+			continue
+		}
+		if strings.TrimSpace(item) != "" {
+			out = append(out, item)
+		}
+	}
+	if key != "" && value != "" {
+		out = append(out, key+"="+value)
+	}
+	return out
+}
+
+func hasClaudeCredential(agentEnv []string) bool {
+	allowed := map[string]bool{
+		"ANTHROPIC_AUTH_TOKEN":    true,
+		"ANTHROPIC_API_KEY":       true,
+		"CLAUDE_CODE_OAUTH_TOKEN": true,
+	}
+	for _, item := range agentEnv {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || !allowed[strings.ToUpper(strings.TrimSpace(key))] {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if envName, templated := envTemplateName(value); templated {
+			if resolved, exists := os.LookupEnv(envName); exists && strings.TrimSpace(resolved) != "" {
+				return true
+			}
+			continue
+		}
+		if value != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func envTemplateName(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) < 4 || !strings.HasPrefix(value, "${") || !strings.HasSuffix(value, "}") {
+		return "", false
+	}
+	name := strings.TrimSpace(value[2 : len(value)-1])
+	return name, safeEnvKey(name)
 }
 
 func (r *Runner) emit(eventType, nodeID, status, message, path string) {
@@ -1070,12 +1394,21 @@ func runnerOptionsSnapshot(opts RunnerOptions) domain.RunnerOptionsSnapshot {
 		SimilarityThreshold:      opts.SimilarityThreshold,
 		GitHubTokenConfigured:    strings.TrimSpace(opts.GitHubToken) != "",
 		RunHarbor:                opts.RunHarbor,
+		HarborModels:             strings.TrimSpace(opts.HarborModels),
 		HarborAgent:              strings.TrimSpace(opts.HarborAgent),
 		HarborAgentEnvKeys:       harborAgentEnvKeys(opts.HarborAgentEnv),
 		HarborAgentEnvOmitted:    len(opts.HarborAgentEnv) > 0,
 		QwenModel:                strings.TrimSpace(opts.QwenModel),
 		OpusModel:                strings.TrimSpace(opts.OpusModel),
+		QwenHarborBaseURL:        strings.TrimSpace(opts.QwenHarborBaseURL),
+		OpusHarborBaseURL:        strings.TrimSpace(opts.OpusHarborBaseURL),
 		HarborTimeout:            opts.HarborTimeout,
+		HarborSetupTimeout:       opts.HarborSetupTimeout,
+		HarborAgentCacheDir:      strings.TrimSpace(opts.HarborAgentCacheDir),
+		HarborPreflight:          &opts.HarborPreflight,
+		HarborConcurrency:        opts.HarborConcurrency,
+		HarborAttempts:           opts.HarborAttempts,
+		HarborInfraRetries:       opts.HarborInfraRetries,
 		Package:                  opts.Package,
 		OutputDir:                strings.TrimSpace(opts.OutputDir),
 		StrictSubmission:         opts.StrictSubmission,
@@ -1100,6 +1433,10 @@ func runnerOptionsSnapshot(opts RunnerOptions) domain.RunnerOptionsSnapshot {
 }
 
 func runnerOptionsFromSnapshot(snapshot domain.RunnerOptionsSnapshot) RunnerOptions {
+	preflight := true
+	if snapshot.HarborPreflight != nil {
+		preflight = *snapshot.HarborPreflight
+	}
 	return RunnerOptions{
 		RepoURL:               snapshot.RepoURL,
 		Commit:                snapshot.Commit,
@@ -1121,10 +1458,20 @@ func runnerOptionsFromSnapshot(snapshot domain.RunnerOptionsSnapshot) RunnerOpti
 		SimilarityTB3Dirs:     append([]string(nil), snapshot.SimilarityTB3Dirs...),
 		SimilarityThreshold:   snapshot.SimilarityThreshold,
 		RunHarbor:             snapshot.RunHarbor,
+		HarborModels:          snapshot.HarborModels,
 		HarborAgent:           snapshot.HarborAgent,
+		HarborAgentEnv:        harborAgentEnvTemplates(snapshot.HarborAgentEnvKeys),
 		QwenModel:             snapshot.QwenModel,
 		OpusModel:             snapshot.OpusModel,
+		QwenHarborBaseURL:     snapshot.QwenHarborBaseURL,
+		OpusHarborBaseURL:     snapshot.OpusHarborBaseURL,
 		HarborTimeout:         snapshot.HarborTimeout,
+		HarborSetupTimeout:    defaultInt(snapshot.HarborSetupTimeout, 1200),
+		HarborAgentCacheDir:   snapshot.HarborAgentCacheDir,
+		HarborPreflight:       preflight,
+		HarborConcurrency:     defaultInt(snapshot.HarborConcurrency, 1),
+		HarborAttempts:        defaultInt(snapshot.HarborAttempts, 4),
+		HarborInfraRetries:    snapshot.HarborInfraRetries,
 		Package:               snapshot.Package,
 		OutputDir:             snapshot.OutputDir,
 		StrictSubmission:      snapshot.StrictSubmission,
@@ -1142,6 +1489,20 @@ func runnerOptionsFromSnapshot(snapshot domain.RunnerOptionsSnapshot) RunnerOpti
 		CodexPath:             snapshot.CodexPath,
 		AgentTimeout:          snapshot.AgentTimeout,
 	}
+}
+
+func harborAgentEnvTemplates(keys []string) []string {
+	seen := map[string]bool{}
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if !safeEnvKey(key) || seen[key] {
+			continue
+		}
+		seen[key] = true
+		values = append(values, key+"=${"+key+"}")
+	}
+	return values
 }
 
 func sensitiveRunnerOptionFields(opts RunnerOptions) []string {
@@ -1240,7 +1601,7 @@ func (r *Runner) reviewGate(ctx context.Context, gateID, gateName, nodeID, messa
 	})
 	var decision domain.GateDecision
 	if r.opts.AutoApprove {
-		decision = domain.GateDecision{RequestID: request.RequestID, GateID: gateID, Approved: true, Notes: "auto-approved by headless run", DecidedAt: time.Now().UTC()}
+		decision = domain.GateDecision{RequestID: request.RequestID, GateID: gateID, Action: "approve", Approved: true, Notes: "auto-approved by headless run", DecidedAt: time.Now().UTC()}
 	} else {
 		poll := time.NewTicker(500 * time.Millisecond)
 		defer poll.Stop()
@@ -1274,6 +1635,13 @@ func (r *Runner) reviewGate(ctx context.Context, gateID, gateName, nodeID, messa
 		}
 	}
 	decision = enforceGateDecision(request, decision)
+	if strings.TrimSpace(decision.Action) == "" {
+		if decision.Approved {
+			decision.Action = "approve"
+		} else {
+			decision.Action = "reject"
+		}
+	}
 	if err := r.writeGateDecision(phase, gateID, decision); err != nil {
 		return domain.GateDecision{}, err
 	}
@@ -1282,6 +1650,26 @@ func (r *Runner) reviewGate(ctx context.Context, gateID, gateName, nodeID, messa
 	r.gates = append(r.gates, decision)
 	r.mu.Unlock()
 	return decision, nil
+}
+
+func (r *Runner) archiveGateRevision(phase, gateID string, decision domain.GateDecision, revision int) error {
+	path := r.gateDecisionPath(phase, gateID)
+	dir := filepath.Join(filepath.Dir(path), "revisions")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(sanitizeGateDecision(decision), "", "  ")
+	if err != nil {
+		return err
+	}
+	revisionPath := filepath.Join(dir, fmt.Sprintf("revision-%03d.json", revision))
+	if err := os.WriteFile(revisionPath, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func stableGateRequestID(phase, gateID string) string {
@@ -1689,6 +2077,13 @@ func defaultString(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return strings.TrimSpace(fallback)
+	}
+	return value
+}
+
+func defaultInt(value, fallback int) int {
+	if value == 0 {
+		return fallback
 	}
 	return value
 }

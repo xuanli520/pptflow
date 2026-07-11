@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -240,6 +241,8 @@ func TestRunnerWriteStateRedactsSummary(t *testing.T) {
 func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) {
 	workspace := t.TempDir()
 	secret := "raw-run-options-secret"
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", secret)
+	t.Setenv("ANTHROPIC_BASE_URL", "https://example.invalid")
 	snapshot, err := SaveRunnerOptions(RunnerOptions{
 		Workspace:             workspace,
 		TaskDir:               "/tmp/task",
@@ -250,11 +253,19 @@ func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) 
 		SimilarityThreshold:   0.37,
 		GitHubToken:           "github_pat_" + secret + "123456",
 		RunHarbor:             true,
+		HarborModels:          "opus",
 		HarborAgent:           "claude-code",
 		HarborAgentEnv:        []string{"ANTHROPIC_AUTH_TOKEN=" + secret, "ANTHROPIC_BASE_URL=https://example.invalid"},
 		QwenModel:             "qwen3.7-max",
-		OpusModel:             "claude-opus-4-6",
+		OpusModel:             "claude-opus-4-8",
+		QwenHarborBaseURL:     "https://qwen.example/v1",
+		OpusHarborBaseURL:     "https://opus.example/v1",
 		HarborTimeout:         123,
+		HarborSetupTimeout:    321,
+		HarborPreflight:       true,
+		HarborConcurrency:     2,
+		HarborAttempts:        4,
+		HarborInfraRetries:    3,
 		Package:               true,
 		OutputDir:             "/tmp/output",
 		Description:           "Bearer " + secret,
@@ -287,11 +298,15 @@ func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Workspace != workspace || loaded.TaskDir != "/tmp/task" || !loaded.AutoApprove || !loaded.QualityCheck || loaded.SimilarityThreshold != 0.37 || !loaded.RunHarbor || loaded.HarborTimeout != 123 || !loaded.Package {
+	if loaded.Workspace != workspace || loaded.TaskDir != "/tmp/task" || !loaded.AutoApprove || !loaded.QualityCheck || loaded.SimilarityThreshold != 0.37 || !loaded.RunHarbor || loaded.HarborModels != "opus" || loaded.QwenHarborBaseURL != "https://qwen.example/v1" || loaded.OpusHarborBaseURL != "https://opus.example/v1" || loaded.HarborTimeout != 123 || loaded.HarborSetupTimeout != 321 || !loaded.HarborPreflight || loaded.HarborConcurrency != 2 || loaded.HarborAttempts != 4 || loaded.HarborInfraRetries != 3 || !loaded.Package {
 		t.Fatalf("loaded options lost non-sensitive fields: %+v", loaded)
 	}
-	if loaded.GitHubToken != "" || len(loaded.HarborAgentEnv) != 0 || loaded.VerifyExec != nil || loaded.Agent != nil {
+	if loaded.GitHubToken != "" || loaded.VerifyExec != nil || loaded.Agent != nil {
 		t.Fatalf("loaded options restored sensitive/unsupported fields: %+v", loaded)
+	}
+	wantAgentEnv := []string{"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}", "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}"}
+	if strings.Join(loaded.HarborAgentEnv, "\n") != strings.Join(wantAgentEnv, "\n") {
+		t.Fatalf("loaded options did not restore safe environment templates: got=%q want=%q", loaded.HarborAgentEnv, wantAgentEnv)
 	}
 	if !loadedSnapshot.HarborAgentEnvOmitted || len(loadedSnapshot.HarborAgentEnvKeys) != 2 {
 		t.Fatalf("loaded snapshot missing env omission metadata: %+v", loadedSnapshot)
@@ -324,6 +339,249 @@ func TestRunnerRedactsPersistedGateDecision(t *testing.T) {
 	}
 	if !strings.Contains(text, "redacted") {
 		t.Fatalf("decision file missing redaction marker: %s", text)
+	}
+}
+
+func TestRunnerFinalReviewCanReviseAndRerunChecks(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	workspace := t.TempDir()
+	runner := NewRunner(RunnerOptions{TaskDir: taskDir, Workspace: workspace})
+	type runResult struct {
+		summary domain.RunSummary
+		err     error
+	}
+	done := make(chan runResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() {
+		summary, err := runner.Run(ctx)
+		done <- runResult{summary: summary, err: err}
+	}()
+
+	revisionSubmitted := false
+	approvalSubmitted := false
+	lintPasses := 0
+	for !approvalSubmitted {
+		select {
+		case event := <-runner.Events():
+			if event.NodeID == nodes.CodeEdgeLint && event.Status == "succeeded" {
+				lintPasses++
+			}
+			if event.Type != "gate_requested" || event.Gate == nil || event.Gate.GateID != nodes.FinalReview {
+				continue
+			}
+			if !revisionSubmitted {
+				instruction := filepath.Join(taskDir, "instruction.md")
+				if err := os.WriteFile(instruction, []byte("Fix the task and preserve public behavior.\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "revise", EditedFiles: map[string]string{instruction: "updated"}})
+				revisionSubmitted = true
+				continue
+			}
+			runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "approve", Approved: true})
+			approvalSubmitted = true
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for revised Final Review")
+		}
+	}
+	result := <-done
+	if result.err != nil || !result.summary.Passed {
+		t.Fatalf("revised run failed: summary=%+v err=%v", result.summary, result.err)
+	}
+	if lintPasses < 2 {
+		t.Fatalf("expected lint to rerun, observed %d successful passes", lintPasses)
+	}
+	revisionPath := filepath.Join(workspace, "phase2", "artifacts", "reviews", nodes.FinalReview, "revisions", "revision-001.json")
+	if _, err := os.Stat(revisionPath); err != nil {
+		t.Fatalf("revision chain was not persisted: %v", err)
+	}
+}
+
+func TestRunnerLabelsRecoveredRunAndNodeReuseBoundary(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	workspace := t.TempDir()
+	previous := domain.RunSummary{RunID: "run-before-crash", Workspace: workspace, Status: "running"}
+	raw, err := json.Marshal(previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "state.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(RunnerOptions{TaskDir: taskDir, Workspace: workspace, AutoApprove: true})
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Recovered || summary.PreviousRunID != "run-before-crash" || summary.RunID == summary.PreviousRunID {
+		t.Fatalf("recovery boundary missing: %+v", summary)
+	}
+	if !eventMessageSeen(summary.Events, "", "previous=run-before-crash") || len(summary.RerunNodes) == 0 {
+		t.Fatalf("recovery evidence missing: %+v", summary)
+	}
+}
+
+func TestRunnerRejectsClaudeHarborRunWithoutContainerCredential(t *testing.T) {
+	runner := NewRunner(RunnerOptions{TaskDir: writeRunnerTask(t), Workspace: t.TempDir(), RunHarbor: true, AutoApprove: true})
+	summary, err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "host Claude OAuth is not inherited") {
+		t.Fatalf("expected actionable Harbor container credential error, summary=%+v err=%v", summary, err)
+	}
+}
+
+func TestRunnerRejectsClaudeHarborRunWithUnresolvedCredentialTemplate(t *testing.T) {
+	t.Setenv("MISSING_HARBOR_TOKEN", "")
+	runner := NewRunner(RunnerOptions{
+		TaskDir:        writeRunnerTask(t),
+		Workspace:      t.TempDir(),
+		RunHarbor:      true,
+		AutoApprove:    true,
+		HarborAgentEnv: []string{"ANTHROPIC_AUTH_TOKEN=${MISSING_HARBOR_TOKEN}"},
+	})
+	summary, err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "host Claude OAuth is not inherited") {
+		t.Fatalf("expected unresolved Harbor credential template error, summary=%+v err=%v", summary, err)
+	}
+}
+
+func TestRunnerAcceptsResolvedCredentialTemplate(t *testing.T) {
+	t.Setenv("HARBOR_TEST_TOKEN", "runtime-only-token")
+	if !hasClaudeCredential([]string{"ANTHROPIC_AUTH_TOKEN=${HARBOR_TEST_TOKEN}"}) {
+		t.Fatal("expected credential template backed by a non-empty host variable to be accepted")
+	}
+}
+
+func TestCancelQwenStageContinuesToOpus(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	workspace := t.TempDir()
+	exec := &runnerCancelableHarborExec{delegate: runnerHarborExec{outputs: []string{
+		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
+			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
+			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
+			{Trial: 4, Turns: 28},
+		}, ""),
+	}}}
+	runner := NewRunner(RunnerOptions{
+		TaskDir:           taskDir,
+		Workspace:         workspace,
+		AutoApprove:       true,
+		RunHarbor:         true,
+		HarborAgentEnv:    []string{"ANTHROPIC_AUTH_TOKEN=test-token"},
+		QwenHarborBaseURL: "https://qwen.example/v1",
+		OpusHarborBaseURL: "https://opus.example/v1",
+		HarborExec:        exec,
+	})
+	type runResult struct {
+		summary domain.RunSummary
+		err     error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		summary, err := runner.Run(context.Background())
+		done <- runResult{summary: summary, err: err}
+	}()
+	cancelRequested := false
+	for event := range runner.Events() {
+		if event.NodeID == nodes.HarborRunQwen && event.Type == "node_started" {
+			cancelRequested = runner.CancelNode(nodes.HarborRunQwen)
+		}
+	}
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("single-stage cancellation should not abort the runner: %v", result.err)
+	}
+	if !cancelRequested || result.summary.Passed {
+		t.Fatalf("expected an audited canceled stage and failing summary: requested=%v summary=%+v", cancelRequested, result.summary)
+	}
+	if result.summary.OpusResult == nil || !eventSeen(result.summary.Events, nodes.HarborRunOpus, "succeeded") || !eventSeen(result.summary.Events, nodes.HarborRunQwen, "canceled") {
+		t.Fatalf("Opus did not continue after Qwen cancellation: %+v", result.summary)
+	}
+}
+
+func TestFailedQwenStageStillRunsOpus(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	workspace := t.TempDir()
+	exec := &runnerFailFirstHarborExec{delegate: runnerHarborExec{outputs: []string{
+		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
+			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
+			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
+			{Trial: 4, Turns: 28},
+		}, ""),
+	}}}
+	runner := NewRunner(RunnerOptions{
+		TaskDir:        taskDir,
+		Workspace:      workspace,
+		AutoApprove:    true,
+		RunHarbor:      true,
+		HarborAgentEnv: []string{"ANTHROPIC_AUTH_TOKEN=test-token"},
+		HarborExec:     exec,
+	})
+	summary, err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Qwen Harbor stage") {
+		t.Fatalf("expected aggregated Qwen failure, summary=%+v err=%v", summary, err)
+	}
+	if summary.Passed || summary.QwenResult == nil || summary.OpusResult == nil {
+		t.Fatalf("expected failed Qwen evidence and successful Opus evidence: %+v", summary)
+	}
+	if !eventSeen(summary.Events, nodes.HarborRunQwen, "failed") || !eventSeen(summary.Events, nodes.HarborRunOpus, "succeeded") {
+		t.Fatalf("both model stages were not attempted: %+v", summary.Events)
+	}
+}
+
+func TestRunnerCanRunOnlyOpusForEvidenceRecovery(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	exec := &runnerHarborExec{outputs: []string{
+		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
+			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
+			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
+			{Trial: 4, Turns: 28},
+		}, ""),
+	}}
+	runner := NewRunner(RunnerOptions{
+		TaskDir:        taskDir,
+		Workspace:      t.TempDir(),
+		AutoApprove:    true,
+		RunHarbor:      true,
+		HarborModels:   "opus",
+		HarborAgentEnv: []string{"ANTHROPIC_AUTH_TOKEN=test-token"},
+		HarborExec:     exec,
+	})
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Passed || summary.QwenResult != nil || summary.OpusResult == nil || exec.counter != 1 {
+		t.Fatalf("expected one Opus-only recovery run with incomplete final evidence: executions=%d summary=%+v", exec.counter, summary)
+	}
+	if eventSeen(summary.Events, nodes.HarborRunQwen, "running") || !eventSeen(summary.Events, nodes.HarborRunOpus, "succeeded") {
+		t.Fatalf("unexpected model stages: %+v", summary.Events)
+	}
+}
+
+func TestRunnerRejectsUnknownHarborModelSelection(t *testing.T) {
+	runner := NewRunner(RunnerOptions{TaskDir: writeRunnerTask(t), Workspace: t.TempDir(), RunHarbor: true, HarborModels: "opus,other", HarborAgent: "other", AutoApprove: true})
+	_, err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "accepts only qwen and opus") {
+		t.Fatalf("expected invalid Harbor model selection error, got %v", err)
+	}
+}
+
+func TestRunnerRejectsCredentialedModelRouteURL(t *testing.T) {
+	runner := NewRunner(RunnerOptions{
+		TaskDir:           writeRunnerTask(t),
+		Workspace:         t.TempDir(),
+		RunHarbor:         true,
+		HarborAgentEnv:    []string{"ANTHROPIC_AUTH_TOKEN=test-token"},
+		QwenHarborBaseURL: "https://user:password@example.invalid/v1",
+		AutoApprove:       true,
+	})
+	_, err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "must not contain credentials") {
+		t.Fatalf("expected credentialed per-model route rejection, got %v", err)
 	}
 }
 
@@ -513,7 +771,7 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 			{Trial: 3, Turns: 23, Reward: 0},
 			{Trial: 4, Turns: 23, Reward: 0},
 		}, ""),
-		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -521,13 +779,16 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 		}, ""),
 	}}
 	runner := NewRunner(RunnerOptions{
-		TaskDir:        taskDir,
-		Workspace:      workspace,
-		AutoApprove:    true,
-		RunHarbor:      true,
-		HarborExec:     exec,
-		QwenScreenshot: qwenScreenshot,
-		OpusScreenshot: opusScreenshot,
+		TaskDir:           taskDir,
+		Workspace:         workspace,
+		AutoApprove:       true,
+		RunHarbor:         true,
+		HarborAgentEnv:    []string{"ANTHROPIC_AUTH_TOKEN=test-token"},
+		QwenHarborBaseURL: "https://qwen.example/v1",
+		OpusHarborBaseURL: "https://opus.example/v1",
+		HarborExec:        exec,
+		QwenScreenshot:    qwenScreenshot,
+		OpusScreenshot:    opusScreenshot,
 	})
 	summary, err := runner.Run(context.Background())
 	if err != nil {
@@ -545,6 +806,9 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 	if filepath.Base(summary.QwenResult.ResultPath) != "qwen_result.json" || filepath.Base(summary.OpusResult.ResultPath) != "opus_result.json" {
 		t.Fatalf("harbor result aliases not used: qwen=%s opus=%s", summary.QwenResult.ResultPath, summary.OpusResult.ResultPath)
 	}
+	if len(exec.commands) != 2 || !strings.Contains(exec.commands[0], "ANTHROPIC_BASE_URL=https://qwen.example/v1") || strings.Contains(exec.commands[0], "opus.example") || !strings.Contains(exec.commands[1], "ANTHROPIC_BASE_URL=https://opus.example/v1") || strings.Contains(exec.commands[1], "qwen.example") {
+		t.Fatalf("per-model Harbor routes were not isolated: %v", exec.commands)
+	}
 	for _, rel := range []string{
 		filepath.Join("phase3", "artifacts", "harbor_run_qwen", "qwen_result.json"),
 		filepath.Join("phase3", "artifacts", "harbor_run_qwen", "trial_result.json"),
@@ -558,6 +822,9 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 	}
 	if !eventSeen(summary.Events, "harbor_run_qwen", "succeeded") || !eventSeen(summary.Events, "harbor_run_opus", "succeeded") || !eventSeen(summary.Events, "submission_lint", "succeeded") || !eventSeen(summary.Events, "result_review", "succeeded") {
 		t.Fatalf("events missing harbor run nodes: %+v", summary.Events)
+	}
+	if !eventMessageSeen(summary.Events, nodes.HarborRunQwen, "trial started") {
+		t.Fatalf("Harbor live progress was not emitted: %+v", summary.Events)
 	}
 	if eventIndex(summary.Events, "codeedge_lint", "succeeded") > eventIndex(summary.Events, "harbor_run_qwen", "running") {
 		t.Fatalf("harbor started before lint passed: %+v", summary.Events)
@@ -589,7 +856,7 @@ func TestRunnerResumeDiscoversCompletedQwenAndRunsOnlyMissingOpus(t *testing.T) 
 		{Trial: 4, Turns: 23, Reward: 0},
 	}, digest)
 	exec := &runnerHarborExec{outputs: []string{
-		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -601,6 +868,7 @@ func TestRunnerResumeDiscoversCompletedQwenAndRunsOnlyMissingOpus(t *testing.T) 
 		Workspace:      workspace,
 		AutoApprove:    true,
 		RunHarbor:      true,
+		HarborAgentEnv: []string{"ANTHROPIC_AUTH_TOKEN=test-token"},
 		HarborExec:     exec,
 		QwenScreenshot: qwenScreenshot,
 		OpusScreenshot: opusScreenshot,
@@ -675,7 +943,7 @@ func TestRunnerReviewsProvidedHarborResults(t *testing.T) {
 		{Trial: 3, Turns: 23, Reward: 0},
 		{Trial: 4, Turns: 23, Reward: 0},
 	}, digest)
-	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-6", []domain.TrialRun{
+	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-8", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -727,7 +995,7 @@ func TestRunnerRejectsProvidedHarborResultWithoutCommandEvidence(t *testing.T) {
 	}, digest)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-6", []domain.TrialRun{
+	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-8", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -992,7 +1260,7 @@ func TestRunnerPackageForcesVerifyHarborAndSubmissionLint(t *testing.T) {
 			{Trial: 3, Turns: 23, Reward: 0},
 			{Trial: 4, Turns: 23, Reward: 0},
 		}, ""),
-		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -1126,7 +1394,7 @@ func TestRunnerPackageUsesDefaultWorkspaceForEvidenceReports(t *testing.T) {
 		{Trial: 3, Turns: 23, Reward: 0},
 		{Trial: 4, Turns: 23, Reward: 0},
 	}, digest)
-	writeRunnerTrialResult(t, opusResult, taskDir, "claude-opus-4-6", []domain.TrialRun{
+	writeRunnerTrialResult(t, opusResult, taskDir, "claude-opus-4-8", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -1391,8 +1659,8 @@ func (e *runnerResultExec) Run(_ context.Context, _ time.Duration, _ string, _ [
 	return result
 }
 
-func (e *runnerResultExec) RunStreamingWithOutput(context.Context, time.Duration, string, []string, io.Writer, executor.OutputCallback, string, ...string) executor.Result {
-	return executor.Result{}
+func (e *runnerResultExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, _ executor.OutputCallback, name string, args ...string) executor.Result {
+	return e.Run(ctx, timeout, dir, env, name, args...)
 }
 
 type runnerFakeAgent struct {
@@ -1409,8 +1677,57 @@ func (f *runnerFakeAgent) Turn(_ context.Context, req workflow.AgentTurnRequest)
 }
 
 type runnerHarborExec struct {
-	outputs []string
-	counter int
+	outputs  []string
+	counter  int
+	commands []string
+}
+
+type runnerCancelableHarborExec struct {
+	calls    int
+	delegate runnerHarborExec
+}
+
+type runnerFailFirstHarborExec struct {
+	calls    int
+	delegate runnerHarborExec
+}
+
+func (e *runnerFailFirstHarborExec) LookPath(name string) (string, error) {
+	return name, nil
+}
+
+func (e *runnerFailFirstHarborExec) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	return e.RunStreamingWithOutput(ctx, timeout, dir, env, io.Discard, nil, name, args...)
+}
+
+func (e *runnerFailFirstHarborExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, callback executor.OutputCallback, name string, args ...string) executor.Result {
+	if e.calls == 0 {
+		e.calls++
+		return executor.Result{Command: name + " " + strings.Join(args, " "), ExitCode: 35, Err: errors.New("transient Qwen failure")}
+	}
+	e.calls++
+	return e.delegate.RunStreamingWithOutput(ctx, timeout, dir, env, io.Discard, callback, name, args...)
+}
+
+func (e *runnerCancelableHarborExec) LookPath(name string) (string, error) {
+	return name, nil
+}
+
+func (e *runnerCancelableHarborExec) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+	return e.RunStreamingWithOutput(ctx, timeout, dir, env, io.Discard, nil, name, args...)
+}
+
+func (e *runnerCancelableHarborExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, callback executor.OutputCallback, name string, args ...string) executor.Result {
+	if e.calls == 0 {
+		e.calls++
+		<-ctx.Done()
+		return executor.Result{Command: name + " " + strings.Join(args, " "), ExitCode: -1, Err: ctx.Err()}
+	}
+	e.calls++
+	if callback != nil {
+		callback("opus trial started\n", "stdout")
+	}
+	return e.delegate.Run(ctx, timeout, dir, env, name, args...)
 }
 
 func (e *runnerHarborExec) LookPath(name string) (string, error) {
@@ -1418,6 +1735,7 @@ func (e *runnerHarborExec) LookPath(name string) (string, error) {
 }
 
 func (e *runnerHarborExec) Run(_ context.Context, _ time.Duration, _ string, _ []string, name string, args ...string) executor.Result {
+	e.commands = append(e.commands, name+" "+strings.Join(args, " "))
 	if len(e.outputs) == 0 {
 		return executor.Result{Command: name, Err: os.ErrInvalid}
 	}
@@ -1429,8 +1747,11 @@ func (e *runnerHarborExec) Run(_ context.Context, _ time.Duration, _ string, _ [
 	return executor.Result{Command: name + " " + strings.Join(args, " "), Stdout: out}
 }
 
-func (e *runnerHarborExec) RunStreamingWithOutput(context.Context, time.Duration, string, []string, io.Writer, executor.OutputCallback, string, ...string) executor.Result {
-	return executor.Result{}
+func (e *runnerHarborExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, callback executor.OutputCallback, name string, args ...string) executor.Result {
+	if callback != nil {
+		callback("trial started\n", "stdout")
+	}
+	return e.Run(ctx, timeout, dir, env, name, args...)
 }
 
 func (e *runnerHarborExec) materializeOutput(args []string, out string) (string, error) {

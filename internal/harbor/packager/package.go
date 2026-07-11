@@ -55,7 +55,7 @@ func Package(opts Options) (domain.PackageReport, error) {
 	if taskName == "" {
 		taskName = filepath.Base(taskDir)
 	}
-	taskName, err = validatePackageTaskName(taskName)
+	taskName, err = NormalizeTaskName(taskName)
 	if err != nil {
 		return domain.PackageReport{}, err
 	}
@@ -1113,7 +1113,7 @@ func parseTrial(label, path string) (domain.TrialResult, error) {
 }
 
 func validateTrial(label string, result domain.TrialResult, qwen bool, taskDir string) error {
-	expectedModel := "claude-opus-4-6"
+	expectedModel := "claude-opus-4-8"
 	if qwen {
 		expectedModel = "qwen3.7-max"
 	}
@@ -1164,6 +1164,27 @@ func validatePackageTaskName(value string) (string, error) {
 	return value, nil
 }
 
+// NormalizeTaskName accepts either a package root name or a Harbor registry
+// name in the conventional "org/task" form and returns the safe ZIP root.
+// It deliberately rejects filesystem paths and names with more than one slash.
+func NormalizeTaskName(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, `\`) {
+		return "", fmt.Errorf("task name must not contain a backslash: %q", value)
+	}
+	if strings.Count(value, "/") == 0 {
+		return validatePackageTaskName(value)
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("task name must be a safe segment or org/task registry name: %q", value)
+	}
+	if _, err := validatePackageTaskName(parts[0]); err != nil {
+		return "", fmt.Errorf("invalid task organization: %w", err)
+	}
+	return validatePackageTaskName(parts[1])
+}
+
 func isPackageTaskNameChar(r rune) bool {
 	return (r >= 'a' && r <= 'z') ||
 		(r >= 'A' && r <= 'Z') ||
@@ -1175,7 +1196,7 @@ func isPackageTaskNameChar(r rune) bool {
 
 func writeZip(taskDir, taskName, zipPath string) error {
 	var err error
-	taskName, err = validatePackageTaskName(taskName)
+	taskName, err = NormalizeTaskName(taskName)
 	if err != nil {
 		return err
 	}

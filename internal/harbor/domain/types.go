@@ -60,6 +60,10 @@ type RunnerEvent struct {
 
 type RunSummary struct {
 	RunID             string            `json:"run_id,omitempty"`
+	PreviousRunID     string            `json:"previous_run_id,omitempty"`
+	Recovered         bool              `json:"recovered,omitempty"`
+	ReusedNodes       []string          `json:"reused_nodes,omitempty"`
+	RerunNodes        []string          `json:"rerun_nodes,omitempty"`
 	Workspace         string            `json:"workspace"`
 	RepoPrepared      *RepoPrepared     `json:"repo_prepared,omitempty"`
 	GenReport         *GenReport        `json:"gen_report,omitempty"`
@@ -102,12 +106,21 @@ type RunnerOptionsSnapshot struct {
 	SimilarityThreshold      float64   `json:"similarity_threshold,omitempty"`
 	GitHubTokenConfigured    bool      `json:"github_credential_configured,omitempty"`
 	RunHarbor                bool      `json:"run_harbor"`
+	HarborModels             string    `json:"harbor_models,omitempty"`
 	HarborAgent              string    `json:"harbor_agent,omitempty"`
 	HarborAgentEnvKeys       []string  `json:"harbor_agent_env_names,omitempty"`
 	HarborAgentEnvOmitted    bool      `json:"harbor_agent_env_omitted,omitempty"`
 	QwenModel                string    `json:"qwen_model,omitempty"`
 	OpusModel                string    `json:"opus_model,omitempty"`
+	QwenHarborBaseURL        string    `json:"qwen_harbor_base_url,omitempty"`
+	OpusHarborBaseURL        string    `json:"opus_harbor_base_url,omitempty"`
 	HarborTimeout            int       `json:"harbor_timeout,omitempty"`
+	HarborSetupTimeout       int       `json:"harbor_setup_timeout,omitempty"`
+	HarborAgentCacheDir      string    `json:"harbor_agent_cache_dir,omitempty"`
+	HarborPreflight          *bool     `json:"harbor_preflight,omitempty"`
+	HarborConcurrency        int       `json:"harbor_concurrency,omitempty"`
+	HarborAttempts           int       `json:"harbor_attempts,omitempty"`
+	HarborInfraRetries       int       `json:"harbor_infra_retries,omitempty"`
 	Package                  bool      `json:"package"`
 	OutputDir                string    `json:"output_dir,omitempty"`
 	StrictSubmission         bool      `json:"strict_submission"`
@@ -203,24 +216,28 @@ type ResultFileEvidence struct {
 }
 
 type TrialResult struct {
-	SchemaVersion      string               `json:"schema_version"`
-	Model              string               `json:"model"`
-	Agent              string               `json:"agent,omitempty"`
-	Trials             int                  `json:"trials"`
-	PassCount          int                  `json:"pass_count"`
-	PassAt4            float64              `json:"pass_at_4"`
-	AverageTurns       float64              `json:"average_turns"`
-	Runs               []TrialRun           `json:"runs,omitempty"`
-	ResultPath         string               `json:"result_path,omitempty"`
-	RawResultPath      string               `json:"raw_result_path,omitempty"`
-	RawResultSHA256    string               `json:"raw_result_sha256,omitempty"`
-	RawTrialResults    []ResultFileEvidence `json:"raw_trial_results,omitempty"`
-	TaskDigest         string               `json:"task_digest,omitempty"`
-	HarborTaskChecksum string               `json:"harbor_task_checksum,omitempty"`
-	TaskPath           string               `json:"task_path,omitempty"`
-	CommandRunPath     string               `json:"command_run_path,omitempty"`
-	Screenshot         string               `json:"screenshot,omitempty"`
-	CreatedAt          time.Time            `json:"created_at,omitempty"`
+	SchemaVersion       string               `json:"schema_version"`
+	Model               string               `json:"model"`
+	Agent               string               `json:"agent,omitempty"`
+	Trials              int                  `json:"trials"`
+	PassCount           int                  `json:"pass_count"`
+	PassAt4             float64              `json:"pass_at_4"`
+	AverageTurns        float64              `json:"average_turns"`
+	Runs                []TrialRun           `json:"runs,omitempty"`
+	ResultPath          string               `json:"result_path,omitempty"`
+	RawResultPath       string               `json:"raw_result_path,omitempty"`
+	RawResultSHA256     string               `json:"raw_result_sha256,omitempty"`
+	RawTrialResults     []ResultFileEvidence `json:"raw_trial_results,omitempty"`
+	TaskDigest          string               `json:"task_digest,omitempty"`
+	HarborTaskChecksum  string               `json:"harbor_task_checksum,omitempty"`
+	TaskPath            string               `json:"task_path,omitempty"`
+	CommandRunPath      string               `json:"command_run_path,omitempty"`
+	SchemaPreflightPath string               `json:"schema_preflight_command_run_path,omitempty"`
+	PreflightRunPath    string               `json:"preflight_command_run_path,omitempty"`
+	PreflightResultPath string               `json:"preflight_result_path,omitempty"`
+	AgentCacheManifest  string               `json:"agent_cache_manifest_path,omitempty"`
+	Screenshot          string               `json:"screenshot,omitempty"`
+	CreatedAt           time.Time            `json:"created_at,omitempty"`
 }
 
 type QualityCheck struct {
@@ -231,15 +248,20 @@ type QualityCheck struct {
 }
 
 type QualityReport struct {
-	SchemaVersion string                  `json:"schema_version"`
-	TaskDir       string                  `json:"task_dir"`
-	Checks        map[string]QualityCheck `json:"checks"`
-	OverallPass   bool                    `json:"overall_pass"`
-	Warnings      []string                `json:"warnings,omitempty"`
-	Issues        []string                `json:"issues,omitempty"`
-	AgentModel    string                  `json:"agent_model,omitempty"`
-	AgentOutput   string                  `json:"agent_output,omitempty"`
-	CreatedAt     time.Time               `json:"created_at"`
+	SchemaVersion     string                  `json:"schema_version"`
+	TaskDir           string                  `json:"task_dir"`
+	Checks            map[string]QualityCheck `json:"checks"`
+	OverallPass       bool                    `json:"overall_pass"`
+	Warnings          []string                `json:"warnings,omitempty"`
+	Issues            []string                `json:"issues,omitempty"`
+	AgentModel        string                  `json:"agent_model,omitempty"`
+	RequestedModel    string                  `json:"requested_model,omitempty"`
+	ReasoningEffort   string                  `json:"reasoning_effort,omitempty"`
+	PromptFingerprint string                  `json:"prompt_fingerprint,omitempty"`
+	RubricFingerprint string                  `json:"rubric_fingerprint,omitempty"`
+	ReviewFingerprint string                  `json:"review_fingerprint,omitempty"`
+	AgentOutput       string                  `json:"agent_output,omitempty"`
+	CreatedAt         time.Time               `json:"created_at"`
 }
 
 type SimilarityCandidate struct {
@@ -320,6 +342,7 @@ type GateRequest struct {
 type GateDecision struct {
 	RequestID   string            `json:"request_id"`
 	GateID      string            `json:"gate_id"`
+	Action      string            `json:"action,omitempty"`
 	Approved    bool              `json:"approved"`
 	Notes       string            `json:"notes,omitempty"`
 	EditedFiles map[string]string `json:"edited_files,omitempty"`

@@ -47,7 +47,7 @@ func TestRunFailsLeakAndBypass(t *testing.T) {
 	}
 }
 
-func TestRunFailsWhenAgentOverallPassFalse(t *testing.T) {
+func TestRunTreatsAgentOverallPassFalseWithoutErrorCheckAsAdvisory(t *testing.T) {
 	taskDir := writeQualityTask(t, false)
 	analysis := filepath.Join(taskDir, "tests_analysis.md")
 	if err := os.WriteFile(analysis, []byte("## 1. instruction 和 environment 已提供的信息\nok\n## 2. 模型的理论通过路径\nok\n## 3. 模型具备通过条件的依据\nok\n"), 0o644); err != nil {
@@ -62,11 +62,43 @@ func TestRunFailsWhenAgentOverallPassFalse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.OverallPass {
-		t.Fatalf("expected agent overall_pass=false to fail, got %+v", report)
+	if !report.OverallPass {
+		t.Fatalf("warning-only agent review must remain advisory, got %+v", report)
 	}
-	if !strings.Contains(strings.Join(report.Issues, "\n"), "overall_pass=false") {
-		t.Fatalf("missing agent overall issue: %+v", report.Issues)
+	if !strings.Contains(strings.Join(report.Warnings, "\n"), "overall_pass=false") {
+		t.Fatalf("missing advisory agent warning: %+v", report.Warnings)
+	}
+	if report.PromptFingerprint == "" || report.RubricFingerprint == "" || report.ReviewFingerprint == "" {
+		t.Fatalf("quality review fingerprints missing: %+v", report)
+	}
+}
+
+func TestRunFailsWhenAgentReportsErrorSeverityCheck(t *testing.T) {
+	taskDir := writeQualityTask(t, false)
+	report, err := Run(context.Background(), Options{
+		TaskDir: taskDir,
+		Agent:   qualityFakeAgent(`{"overall_pass":false,"checks":{"alignment":{"passed":false,"severity":"error","detail":"blocking mismatch"}},"issues":["blocking mismatch"]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OverallPass || !strings.Contains(strings.Join(report.Issues, "\n"), "blocking mismatch") {
+		t.Fatalf("error-severity agent check must block: %+v", report)
+	}
+}
+
+func TestRunAllowsInstructionToNamePublicTestCommand(t *testing.T) {
+	taskDir := writeQualityTask(t, false)
+	path := filepath.Join(taskDir, "instruction.md")
+	if err := os.WriteFile(path, []byte("Fix config.go and validate with /tests/test.sh.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Checks["instruction_leak"].Passed {
+		t.Fatalf("public verifier command path is not answer leakage: %+v", report.Checks["instruction_leak"])
 	}
 }
 

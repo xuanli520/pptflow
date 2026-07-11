@@ -69,7 +69,14 @@ const (
 	startFieldHarborAgent
 	startFieldQwenModel
 	startFieldOpusModel
+	startFieldQwenHarborBaseURL
+	startFieldOpusHarborBaseURL
 	startFieldHarborTimeout
+	startFieldHarborSetupTimeout
+	startFieldHarborPreflight
+	startFieldHarborConcurrency
+	startFieldHarborAttempts
+	startFieldHarborInfraRetries
 	startFieldPackage
 	startFieldTaskName
 	startFieldCodeLang
@@ -179,6 +186,10 @@ func initialStartModel(ctx context.Context, cancel context.CancelFunc, opts app.
 }
 
 func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
+	if loaded, _, err := app.LoadRunnerOptions(defaultWorkspace(opts.Workspace)); err == nil {
+		loaded.AutoApprove = false
+		opts = loaded
+	}
 	opts.AutoApprove = false
 	summary, events := loadWorkspaceState(defaultWorkspace(opts.Workspace))
 	nodes := map[string]domain.RunnerEvent{}
@@ -299,6 +310,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "l":
 			m.view = viewLogs
+			return m, nil
+		case "x":
+			if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
+				m.notice = "Cancel requested for " + m.selectedNode + "; the other model stage may continue."
+				m.err = nil
+			}
 			return m, nil
 		case "e":
 			if artifact, ok := m.selectedNodeArtifact(); ok {
@@ -472,6 +489,18 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.view = viewOverview
 		return m, m.submitDecision(decision, gate)
+	case "v":
+		if m.activeGate.GateID != nodes.FinalReview && m.activeGate.GateID != nodes.ResultReview {
+			m.err = fmt.Errorf("revise/refresh is available at Final Review and Result Review")
+			return m, nil
+		}
+		gate := m.activeGate
+		decision := m.makeGateDecision(false)
+		decision.Action = "revise"
+		m.activeGate = nil
+		m.err = nil
+		m.view = viewOverview
+		return m, m.submitDecision(decision, gate)
 	case "n":
 		m.gateEditingNote = true
 		return m, nil
@@ -511,6 +540,12 @@ func (m model) updateLogsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "tab":
 		m.selectNextArtifact()
+		return m, nil
+	case "x":
+		if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
+			m.notice = "Cancel requested for " + m.selectedNode + "; the other model stage may continue."
+			m.err = nil
+		}
 		return m, nil
 	case "j", "down":
 		m.scrollLogFile(1)
@@ -559,7 +594,12 @@ func (m model) updateLogsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) makeGateDecision(approved bool) domain.GateDecision {
+	action := "reject"
+	if approved {
+		action = "approve"
+	}
 	decision := domain.GateDecision{
+		Action:      action,
 		Approved:    approved,
 		Notes:       m.gateNotes,
 		EditedFiles: m.editedFiles,
@@ -747,6 +787,9 @@ func activeGateFromSnapshot(summary domain.RunSummary, events []domain.RunnerEve
 	decidedRequests := map[string]bool{}
 	decidedLegacyGates := map[string]bool{}
 	for _, decision := range summary.GateDecisions {
+		if decision.Action == "revise" {
+			continue
+		}
 		if strings.TrimSpace(decision.RequestID) != "" {
 			decidedRequests[decision.RequestID] = true
 			continue
@@ -785,10 +828,10 @@ func activeGateFromSnapshot(summary domain.RunSummary, events []domain.RunnerEve
 
 func terminalRunnerEvent(event domain.RunnerEvent) bool {
 	switch event.Type {
-	case "node_succeeded", "node_failed", "run_succeeded", "run_failed":
+	case "node_succeeded", "node_failed", "node_canceled", "run_succeeded", "run_failed":
 		return true
 	}
-	return event.Status == "succeeded" || event.Status == "failed"
+	return event.Status == "succeeded" || event.Status == "failed" || event.Status == "canceled"
 }
 
 func sameGateNode(gate *domain.GateRequest, nodeID string) bool {
@@ -918,9 +961,30 @@ func (m model) renderStartField(field startField) string {
 	case startFieldOpusModel:
 		label = "Opus model"
 		value = emptyDash(m.opts.OpusModel)
+	case startFieldQwenHarborBaseURL:
+		label = "Qwen Harbor base URL"
+		value = emptyDash(m.opts.QwenHarborBaseURL)
+	case startFieldOpusHarborBaseURL:
+		label = "Opus Harbor base URL"
+		value = emptyDash(m.opts.OpusHarborBaseURL)
 	case startFieldHarborTimeout:
 		label = "Harbor timeout"
 		value = formatIntInput(m.opts.HarborTimeout)
+	case startFieldHarborSetupTimeout:
+		label = "Harbor setup timeout"
+		value = formatIntInput(m.opts.HarborSetupTimeout)
+	case startFieldHarborPreflight:
+		label = "Harbor preflight"
+		value = checkbox(m.opts.HarborPreflight)
+	case startFieldHarborConcurrency:
+		label = "Harbor concurrency"
+		value = formatIntInput(m.opts.HarborConcurrency)
+	case startFieldHarborAttempts:
+		label = "Harbor attempts"
+		value = formatIntInput(m.opts.HarborAttempts)
+	case startFieldHarborInfraRetries:
+		label = "Harbor infra retries"
+		value = formatIntInput(m.opts.HarborInfraRetries)
 	case startFieldPackage:
 		label = "Package"
 		value = checkbox(m.opts.Package)
@@ -992,7 +1056,14 @@ func (m model) activeStartFields() []startField {
 		startFieldHarborAgent,
 		startFieldQwenModel,
 		startFieldOpusModel,
+		startFieldQwenHarborBaseURL,
+		startFieldOpusHarborBaseURL,
 		startFieldHarborTimeout,
+		startFieldHarborSetupTimeout,
+		startFieldHarborPreflight,
+		startFieldHarborConcurrency,
+		startFieldHarborAttempts,
+		startFieldHarborInfraRetries,
 		startFieldQwenResult,
 		startFieldOpusResult,
 		startFieldQwenScreenshot,
@@ -1059,6 +1130,8 @@ func (m *model) toggleStartBool() bool {
 		m.opts.SimilarityGitHub = !m.opts.SimilarityGitHub
 	case startFieldRunHarbor:
 		m.opts.RunHarbor = !m.opts.RunHarbor
+	case startFieldHarborPreflight:
+		m.opts.HarborPreflight = !m.opts.HarborPreflight
 	case startFieldPackage:
 		m.opts.Package = !m.opts.Package
 	case startFieldZeroToOne:
@@ -1106,8 +1179,14 @@ func (m *model) appendStartInput(value string) {
 		m.opts.QwenModel += value
 	case startFieldOpusModel:
 		m.opts.OpusModel += value
+	case startFieldQwenHarborBaseURL:
+		m.opts.QwenHarborBaseURL += value
+	case startFieldOpusHarborBaseURL:
+		m.opts.OpusHarborBaseURL += value
 	case startFieldHarborTimeout:
 		m.setStartInt(startFieldHarborTimeout, currentStartFieldInput(m.opts, startFieldHarborTimeout)+value)
+	case startFieldHarborSetupTimeout, startFieldHarborConcurrency, startFieldHarborAttempts, startFieldHarborInfraRetries:
+		m.setStartInt(m.startField, currentStartFieldInput(m.opts, m.startField)+value)
 	case startFieldTaskName:
 		m.opts.TaskName += value
 	case startFieldCodeLang:
@@ -1167,8 +1246,14 @@ func (m *model) backspaceStartInput() {
 		m.opts.QwenModel = trimLastRune(m.opts.QwenModel)
 	case startFieldOpusModel:
 		m.opts.OpusModel = trimLastRune(m.opts.OpusModel)
+	case startFieldQwenHarborBaseURL:
+		m.opts.QwenHarborBaseURL = trimLastRune(m.opts.QwenHarborBaseURL)
+	case startFieldOpusHarborBaseURL:
+		m.opts.OpusHarborBaseURL = trimLastRune(m.opts.OpusHarborBaseURL)
 	case startFieldHarborTimeout:
 		m.setStartInt(startFieldHarborTimeout, trimLastRune(currentStartFieldInput(m.opts, startFieldHarborTimeout)))
+	case startFieldHarborSetupTimeout, startFieldHarborConcurrency, startFieldHarborAttempts, startFieldHarborInfraRetries:
+		m.setStartInt(m.startField, trimLastRune(currentStartFieldInput(m.opts, m.startField)))
 	case startFieldTaskName:
 		m.opts.TaskName = trimLastRune(m.opts.TaskName)
 	case startFieldCodeLang:
@@ -1228,8 +1313,20 @@ func (m *model) clearStartInput() {
 		m.opts.QwenModel = ""
 	case startFieldOpusModel:
 		m.opts.OpusModel = ""
+	case startFieldQwenHarborBaseURL:
+		m.opts.QwenHarborBaseURL = ""
+	case startFieldOpusHarborBaseURL:
+		m.opts.OpusHarborBaseURL = ""
 	case startFieldHarborTimeout:
 		m.opts.HarborTimeout = 0
+	case startFieldHarborSetupTimeout:
+		m.opts.HarborSetupTimeout = 0
+	case startFieldHarborConcurrency:
+		m.opts.HarborConcurrency = 0
+	case startFieldHarborAttempts:
+		m.opts.HarborAttempts = 0
+	case startFieldHarborInfraRetries:
+		m.opts.HarborInfraRetries = 0
 	case startFieldTaskName:
 		m.opts.TaskName = ""
 	case startFieldCodeLang:
@@ -1264,10 +1361,27 @@ func applyStartDefaults(opts app.RunnerOptions) app.RunnerOptions {
 		opts.QwenModel = "qwen3.7-max"
 	}
 	if strings.TrimSpace(opts.OpusModel) == "" {
-		opts.OpusModel = "claude-opus-4-6"
+		opts.OpusModel = "claude-opus-4-8"
 	}
 	if opts.HarborTimeout == 0 {
 		opts.HarborTimeout = 7200
+	}
+	if opts.HarborSetupTimeout == 0 {
+		opts.HarborSetupTimeout = 1200
+	}
+	if opts.HarborConcurrency == 0 {
+		opts.HarborConcurrency = 1
+	}
+	if opts.HarborAttempts == 0 {
+		opts.HarborAttempts = 4
+	}
+	// The TUI starts with the safe cold-cache preflight enabled. A CLI caller can
+	// still explicitly disable it with --harbor-preflight=false.
+	if !opts.HarborPreflight {
+		opts.HarborPreflight = true
+	}
+	if opts.HarborInfraRetries == 0 {
+		opts.HarborInfraRetries = 1
 	}
 	if opts.AgentTimeout == 0 {
 		opts.AgentTimeout = 600
@@ -1281,6 +1395,14 @@ func currentStartFieldInput(opts app.RunnerOptions, field startField) string {
 		return formatFloatInput(opts.SimilarityThreshold)
 	case startFieldHarborTimeout:
 		return formatIntInput(opts.HarborTimeout)
+	case startFieldHarborSetupTimeout:
+		return formatIntInput(opts.HarborSetupTimeout)
+	case startFieldHarborConcurrency:
+		return formatIntInput(opts.HarborConcurrency)
+	case startFieldHarborAttempts:
+		return formatIntInput(opts.HarborAttempts)
+	case startFieldHarborInfraRetries:
+		return formatIntInput(opts.HarborInfraRetries)
 	case startFieldAgentTimeout:
 		return formatIntInput(opts.AgentTimeout)
 	default:
@@ -1318,6 +1440,14 @@ func (m *model) setStartInt(field startField, value string) {
 		switch field {
 		case startFieldHarborTimeout:
 			m.opts.HarborTimeout = 0
+		case startFieldHarborSetupTimeout:
+			m.opts.HarborSetupTimeout = 0
+		case startFieldHarborConcurrency:
+			m.opts.HarborConcurrency = 0
+		case startFieldHarborAttempts:
+			m.opts.HarborAttempts = 0
+		case startFieldHarborInfraRetries:
+			m.opts.HarborInfraRetries = 0
 		case startFieldAgentTimeout:
 			m.opts.AgentTimeout = 0
 		}
@@ -1336,6 +1466,14 @@ func (m *model) setStartInt(field startField, value string) {
 	switch field {
 	case startFieldHarborTimeout:
 		m.opts.HarborTimeout = parsed
+	case startFieldHarborSetupTimeout:
+		m.opts.HarborSetupTimeout = parsed
+	case startFieldHarborConcurrency:
+		m.opts.HarborConcurrency = parsed
+	case startFieldHarborAttempts:
+		m.opts.HarborAttempts = parsed
+	case startFieldHarborInfraRetries:
+		m.opts.HarborInfraRetries = parsed
 	case startFieldAgentTimeout:
 		m.opts.AgentTimeout = parsed
 	}
@@ -1348,6 +1486,14 @@ func startFieldName(field startField) string {
 		return "similarity threshold"
 	case startFieldHarborTimeout:
 		return "harbor timeout"
+	case startFieldHarborSetupTimeout:
+		return "harbor setup timeout"
+	case startFieldHarborConcurrency:
+		return "harbor concurrency"
+	case startFieldHarborAttempts:
+		return "harbor attempts"
+	case startFieldHarborInfraRetries:
+		return "harbor infra retries"
 	case startFieldAgentTimeout:
 		return "agent timeout"
 	default:
@@ -1423,6 +1569,8 @@ func (m model) startOptions() (app.RunnerOptions, error) {
 	opts.HarborAgent = strings.TrimSpace(opts.HarborAgent)
 	opts.QwenModel = strings.TrimSpace(opts.QwenModel)
 	opts.OpusModel = strings.TrimSpace(opts.OpusModel)
+	opts.QwenHarborBaseURL = strings.TrimSpace(opts.QwenHarborBaseURL)
+	opts.OpusHarborBaseURL = strings.TrimSpace(opts.OpusHarborBaseURL)
 	opts.TaskName = strings.TrimSpace(opts.TaskName)
 	opts.CodeLang = strings.TrimSpace(opts.CodeLang)
 	opts.TaskType = strings.TrimSpace(opts.TaskType)
@@ -1660,7 +1808,13 @@ func (m model) gateView() string {
 	} else if m.gateNotes != "" {
 		lines = append(lines, "Notes: "+redactUI(m.gateNotes))
 	}
-	lines = append(lines, subtleStyle.Render("[a] approve  [r] reject  [n] notes  [e] edit artifact  [Tab] next artifact"))
+	actions := "[a] approve  [r] reject"
+	if gate.GateID == nodes.FinalReview {
+		actions += "  [v] revise and rerun checks"
+	} else if gate.GateID == nodes.ResultReview {
+		actions += "  [v] refresh screenshot evidence"
+	}
+	lines = append(lines, subtleStyle.Render(actions+"  [n] notes  [e] edit artifact  [Tab] next artifact"))
 	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
 }
 
@@ -1771,6 +1925,15 @@ func (m model) doneView() string {
 	} else {
 		lines = append(lines, passStyle.Render("Completed successfully."))
 	}
+	if m.summary.Recovered {
+		lines = append(lines, fmt.Sprintf("recovered run: %s -> %s", redactUI(m.summary.PreviousRunID), redactUI(m.summary.RunID)))
+		if len(m.summary.ReusedNodes) > 0 {
+			lines = append(lines, "reused nodes: "+redactUI(strings.Join(m.summary.ReusedNodes, ", ")))
+		}
+		if len(m.summary.RerunNodes) > 0 {
+			lines = append(lines, "rerun nodes: "+redactUI(strings.Join(m.summary.RerunNodes, ", ")))
+		}
+	}
 	if m.summary.RepoPrepared != nil {
 		lines = append(lines, "repo: "+redactUI(m.summary.RepoPrepared.ResolvedCommit))
 		lines = append(lines, subtleStyle.Render("source: "+redactUI(m.summary.RepoPrepared.SourcePath)))
@@ -1854,14 +2017,14 @@ func failedNodeEvent(event domain.RunnerEvent) bool {
 }
 
 func (m model) footer() string {
-	return subtleStyle.Render("[1] Overview  [2] Gate/Node  [3] Logs  [4] Done  [d] Detail  [q] Quit")
+	return subtleStyle.Render("[1] Overview  [2] Gate/Node  [3] Logs  [4] Done  [d] Detail  [x] Cancel model  [q] Quit")
 }
 
 func statusIcon(status string) string {
 	switch status {
 	case "succeeded", string(domain.CheckPass):
 		return passStyle.Render("OK")
-	case "failed", string(domain.CheckFail):
+	case "failed", "canceled", string(domain.CheckFail):
 		return failStyle.Render("!!")
 	case string(domain.CheckWarn):
 		return warnStyle.Render("!!")

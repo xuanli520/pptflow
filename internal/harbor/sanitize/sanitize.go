@@ -69,6 +69,7 @@ func GateRequest(request domain.GateRequest) domain.GateRequest {
 func GateDecision(decision domain.GateDecision) domain.GateDecision {
 	decision.RequestID = Text(decision.RequestID)
 	decision.GateID = Text(decision.GateID)
+	decision.Action = Text(decision.Action)
 	decision.Notes = Text(decision.Notes)
 	if len(decision.EditedFiles) > 0 {
 		edited := make(map[string]string, len(decision.EditedFiles))
@@ -233,6 +234,10 @@ func TrialResult(result domain.TrialResult) domain.TrialResult {
 	result.HarborTaskChecksum = Text(result.HarborTaskChecksum)
 	result.TaskPath = Text(result.TaskPath)
 	result.CommandRunPath = Text(result.CommandRunPath)
+	result.SchemaPreflightPath = Text(result.SchemaPreflightPath)
+	result.PreflightRunPath = Text(result.PreflightRunPath)
+	result.PreflightResultPath = Text(result.PreflightResultPath)
+	result.AgentCacheManifest = Text(result.AgentCacheManifest)
 	result.Screenshot = Text(result.Screenshot)
 	return result
 }
@@ -252,6 +257,11 @@ func QualityReport(report domain.QualityReport) domain.QualityReport {
 	report.Warnings = StringSlice(report.Warnings)
 	report.Issues = StringSlice(report.Issues)
 	report.AgentModel = Text(report.AgentModel)
+	report.RequestedModel = Text(report.RequestedModel)
+	report.ReasoningEffort = Text(report.ReasoningEffort)
+	report.PromptFingerprint = Text(report.PromptFingerprint)
+	report.RubricFingerprint = Text(report.RubricFingerprint)
+	report.ReviewFingerprint = Text(report.ReviewFingerprint)
 	report.AgentOutput = Text(report.AgentOutput)
 	return report
 }
@@ -302,6 +312,9 @@ func PackageReport(report domain.PackageReport) domain.PackageReport {
 
 func RunSummary(summary domain.RunSummary) domain.RunSummary {
 	summary.RunID = Text(summary.RunID)
+	summary.PreviousRunID = Text(summary.PreviousRunID)
+	summary.ReusedNodes = StringSlice(summary.ReusedNodes)
+	summary.RerunNodes = StringSlice(summary.RerunNodes)
 	summary.Workspace = Text(summary.Workspace)
 	if summary.RepoPrepared != nil {
 		report := RepoPrepared(*summary.RepoPrepared)
@@ -368,6 +381,8 @@ func RunnerOptionsSnapshot(snapshot domain.RunnerOptionsSnapshot) domain.RunnerO
 	snapshot.HarborAgentEnvKeys = StringSlice(snapshot.HarborAgentEnvKeys)
 	snapshot.QwenModel = Text(snapshot.QwenModel)
 	snapshot.OpusModel = Text(snapshot.OpusModel)
+	snapshot.QwenHarborBaseURL = Text(snapshot.QwenHarborBaseURL)
+	snapshot.OpusHarborBaseURL = Text(snapshot.OpusHarborBaseURL)
 	snapshot.OutputDir = Text(snapshot.OutputDir)
 	snapshot.TaskName = Text(snapshot.TaskName)
 	snapshot.CodeLang = Text(snapshot.CodeLang)

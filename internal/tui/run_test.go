@@ -104,7 +104,8 @@ func TestRunResumesWorkspaceFromRunOptionsWhenNonTerminal(t *testing.T) {
 
 func TestRunKeepsTerminalWorkspaceAsSnapshotEvenWithRunOptions(t *testing.T) {
 	workspace := t.TempDir()
-	if _, err := app.SaveRunnerOptions(app.RunnerOptions{Workspace: workspace, TaskDir: t.TempDir()}); err != nil {
+	taskDir := t.TempDir()
+	if _, err := app.SaveRunnerOptions(app.RunnerOptions{Workspace: workspace, TaskDir: taskDir, RepoURL: "https://github.com/org/repo.git"}); err != nil {
 		t.Fatal(err)
 	}
 	stateRaw, err := json.Marshal(domain.RunSummary{RunID: "run-1", Workspace: workspace, Status: "failed", FinishedAt: time.Now()})
@@ -132,6 +133,9 @@ func TestRunKeepsTerminalWorkspaceAsSnapshotEvenWithRunOptions(t *testing.T) {
 	}
 	if model.runner != nil || !model.done || model.view != viewDone {
 		t.Fatalf("terminal workspace should stay in snapshot done view: runner=%v done=%v view=%v", model.runner, model.done, model.view)
+	}
+	if model.opts.TaskDir != taskDir || model.opts.RepoURL != "https://github.com/org/repo.git" {
+		t.Fatalf("terminal snapshot did not hydrate task/repo context: %+v", model.opts)
 	}
 }
 
