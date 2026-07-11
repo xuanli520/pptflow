@@ -101,12 +101,13 @@ type model struct {
 	height int
 	view   viewMode
 
-	events  []domain.RunnerEvent
-	nodes   map[string]domain.RunnerEvent
-	summary domain.RunSummary
-	err     error
-	notice  string
-	done    bool
+	events   []domain.RunnerEvent
+	nodes    map[string]domain.RunnerEvent
+	summary  domain.RunSummary
+	err      error
+	notice   string
+	done     bool
+	readOnly bool
 
 	activeGate       *domain.GateRequest
 	gateNotes        string
@@ -222,6 +223,7 @@ func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts 
 		nodes:        nodes,
 		summary:      summary,
 		done:         done,
+		readOnly:     true,
 		activeGate:   activeGate,
 		selectedNode: selected,
 	}
@@ -312,12 +314,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.view = viewLogs
 			return m, nil
 		case "x":
-			if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
+			if m.readOnly {
+				m.err = fmt.Errorf("workspace snapshot is read-only while another Factory process owns the run")
+			} else if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
 				m.notice = "Cancel requested for " + m.selectedNode + "; the other model stage may continue."
 				m.err = nil
 			}
 			return m, nil
 		case "e":
+			if m.readOnly {
+				m.err = fmt.Errorf("workspace snapshot is read-only")
+				return m, nil
+			}
 			if artifact, ok := m.selectedNodeArtifact(); ok {
 				path, err := m.safeEditableArtifactPath(artifact.Path)
 				if err != nil {
@@ -453,6 +461,24 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = viewOverview
 		return m, nil
 	}
+	if m.readOnly {
+		switch msg.String() {
+		case "tab":
+			if idx, _, ok := m.selectedGateArtifact(); ok {
+				m.selectedArtifact = (idx + 1) % len(m.activeGate.Artifacts)
+			}
+		case "1":
+			m.view = viewOverview
+		case "3":
+			m.view = viewLogs
+		case "q", "ctrl+c":
+			m.cancelRun()
+			return m, tea.Quit
+		case "a", "r", "v", "n", "e":
+			m.err = fmt.Errorf("workspace snapshot is read-only while another Factory process owns the run")
+		}
+		return m, nil
+	}
 	if m.gateEditingNote {
 		switch msg.String() {
 		case "esc", "enter":
@@ -542,7 +568,9 @@ func (m model) updateLogsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.selectNextArtifact()
 		return m, nil
 	case "x":
-		if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
+		if m.readOnly {
+			m.err = fmt.Errorf("workspace snapshot is read-only while another Factory process owns the run")
+		} else if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
 			m.notice = "Cancel requested for " + m.selectedNode + "; the other model stage may continue."
 			m.err = nil
 		}
@@ -1734,6 +1762,7 @@ func (m model) startRunner(opts app.RunnerOptions) model {
 	m.summary = domain.RunSummary{}
 	m.err = nil
 	m.done = false
+	m.readOnly = false
 	m.activeGate = nil
 	m.gateNotes = ""
 	m.gateEditingNote = false
@@ -1808,6 +1837,10 @@ func (m model) gateView() string {
 	} else if m.gateNotes != "" {
 		lines = append(lines, "Notes: "+redactUI(m.gateNotes))
 	}
+	if m.readOnly {
+		lines = append(lines, subtleStyle.Render("Read-only snapshot  [Tab] next artifact  [1] overview  [3] logs"))
+		return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
+	}
 	actions := "[a] approve  [r] reject"
 	if gate.GateID == nodes.FinalReview {
 		actions += "  [v] revise and rerun checks"
@@ -1855,7 +1888,11 @@ func (m model) nodeDetailView() string {
 		lines = append(lines, trimLines(artifact.Content, detailPreviewLines(m.height)))
 	}
 	lines = append(lines, "")
-	lines = append(lines, subtleStyle.Render("[j/k] select node  [Tab] next artifact  [e] edit artifact  [l] logs"))
+	actions := "[j/k] select node  [Tab] next artifact  [e] edit artifact  [l] logs"
+	if m.readOnly {
+		actions = "Read-only snapshot  [j/k] select node  [Tab] next artifact  [l] logs"
+	}
+	lines = append(lines, subtleStyle.Render(actions))
 	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
 }
 
@@ -2017,6 +2054,9 @@ func failedNodeEvent(event domain.RunnerEvent) bool {
 }
 
 func (m model) footer() string {
+	if m.readOnly {
+		return subtleStyle.Render("[1] Overview  [2] Gate/Node  [3] Logs  [4] Done  [d] Detail  [q] Quit  (read-only)")
+	}
 	return subtleStyle.Render("[1] Overview  [2] Gate/Node  [3] Logs  [4] Done  [d] Detail  [x] Cancel model  [q] Quit")
 }
 

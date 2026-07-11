@@ -2,7 +2,9 @@ package harborrun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/executor"
+	"github.com/purplevoid/harbor-factory/internal/harbor/secretscan"
 )
 
 type fakeCommandRunner struct {
@@ -94,6 +97,19 @@ func TestRunParsesJSONStdoutAndWritesArtifacts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outputDir, ".factory-agent", "harbor_factory_retrying_claude.py")); err != nil {
 		t.Fatalf("retrying Claude agent shim missing: %v", err)
+	}
+	shim, err := os.ReadFile(filepath.Join(outputDir, ".factory-agent", "harbor_factory_retrying_claude.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shimText := string(shim)
+	for _, required := range []string{"_ProtectedEnvironment", "stdin_data=payload", "self._extra_env.pop", "set -a; ."} {
+		if !strings.Contains(shimText, required) {
+			t.Fatalf("retrying Claude shim missing secret-safe environment behavior %q", required)
+		}
+	}
+	if findings := secretscan.ScanBytes("harbor_factory_retrying_claude.py", shim); len(findings) != 0 {
+		t.Fatalf("retrying Claude shim triggers workspace secret scan: %+v", findings)
 	}
 	if !commandRun.Passed {
 		t.Fatalf("command should pass: %+v", commandRun)
@@ -322,6 +338,104 @@ func TestReadLatestJobLogLineReturnsNewestNonEmptyLine(t *testing.T) {
 	line, ok := readLatestJobLogLine(jobsDir)
 	if !ok || line != "trial 2 running" {
 		t.Fatalf("unexpected job log tail: ok=%v line=%q", ok, line)
+	}
+}
+
+func TestJobMonitorSnapshotsRetryEvidenceAndPromotesAPIRetry(t *testing.T) {
+	outputDir := t.TempDir()
+	jobsDir := filepath.Join(outputDir, "jobs")
+	trial := "task__retry123"
+	trialDir := filepath.Join(jobsDir, "2026-07-11__12-00-00", trial)
+	if err := os.MkdirAll(filepath.Join(trialDir, "agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trialDir, "exception.txt"), []byte("UnknownApiError\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trialDir, "trial.log"), []byte("ANTHROPIC_AUTH_TOKEN=unit-test-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agentLog := strings.Join([]string{
+		`{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":517.6,"error_status":524,"error":"response sk-unit-test-secret","uuid":"retry-1"}`,
+		`{"type":"system","subtype":"api_retry","attempt":2,"max_retries":10,"retry_delay_ms":1100.2,"error_status":"overloaded","error":"response body must stay private","uuid":"retry-2"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(trialDir, "agent", "claude-code.txt"), []byte(agentLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	jobLog := fmt.Sprintf("Trial %s failed with exception UnknownApiError. Retrying in 1.00 seconds...\n", trial)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(trialDir), "job.log"), []byte(jobLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var progress []string
+	monitor := newJobMonitor(jobsDir, outputDir, func(line, source string) {
+		progress = append(progress, source+":"+line)
+	})
+	monitor.poll(true)
+
+	manifestPath := monitor.retryEvidenceManifestPath()
+	if manifestPath == "" {
+		t.Fatal("retry evidence manifest was not produced")
+	}
+	manifestRaw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest retryEvidenceManifest
+	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Entries) != 1 || manifest.Entries[0].Trial != trial || manifest.Entries[0].Retry != 1 || len(manifest.Entries[0].Files) != 3 {
+		t.Fatalf("unexpected retry evidence manifest: %+v", manifest)
+	}
+	snapshot, err := os.ReadFile(filepath.Join(outputDir, "retry_evidence", trial, "retry-01", "trial.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(snapshot), "unit-test-secret") || !strings.Contains(string(snapshot), "<redacted>") {
+		t.Fatalf("retry snapshot was not redacted: %s", snapshot)
+	}
+	if findings, err := secretscan.ScanDir(filepath.Join(outputDir, "retry_evidence")); err != nil || len(findings) != 0 {
+		t.Fatalf("retry evidence secret scan failed: err=%v findings=%+v", err, findings)
+	}
+	joined := strings.Join(progress, "\n")
+	if strings.Count(joined, "harbor-api-retry:") != 1 || !strings.Contains(joined, "attempt=2/10") || !strings.Contains(joined, "delay_ms=1100") || !strings.Contains(joined, "status=overloaded") {
+		t.Fatalf("API retries were not coalesced into structured progress: %s", joined)
+	}
+	if strings.Contains(joined, "response body") || strings.Contains(joined, "unit-test-secret") || strings.Contains(joined, "sk-") {
+		t.Fatalf("API retry progress leaked raw error details: %s", joined)
+	}
+}
+
+func TestRunCarriesRetryEvidenceManifestWithoutProgressCallback(t *testing.T) {
+	outputDir := t.TempDir()
+	taskDir := writeHarborRunTask(t)
+	trial := "task__retry456"
+	exec := &fakeCommandRunner{result: executor.Result{Stdout: `{"model":"qwen","runs":[{"trial":1},{"trial":2},{"trial":3},{"trial":4}]}`}}
+	exec.onRun = func(_ int) {
+		trialDir := filepath.Join(outputDir, "jobs", "2026-07-11__12-00-00", trial)
+		if err := os.MkdirAll(filepath.Join(trialDir, "agent"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(trialDir, "exception.txt"), []byte("UnknownApiError\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(trialDir, "agent", "claude-code.txt"), []byte("retry log\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		line := fmt.Sprintf("Trial %s failed with exception UnknownApiError. Retrying in 1.00 seconds...\n", trial)
+		if err := os.WriteFile(filepath.Join(filepath.Dir(trialDir), "job.log"), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, _, err := Run(context.Background(), Options{TaskPath: taskDir, Model: "qwen", OutputDir: outputDir, Exec: exec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RetryEvidence == "" {
+		t.Fatalf("normalized result missing retry evidence path: %+v", result)
+	}
+	if _, err := os.Stat(result.RetryEvidence); err != nil {
+		t.Fatalf("retry evidence manifest missing: %v", err)
 	}
 }
 

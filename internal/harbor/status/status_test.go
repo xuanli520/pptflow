@@ -10,6 +10,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 )
 
 func TestReadWorkspaceLoadsStateAndFiltersEvents(t *testing.T) {
@@ -225,6 +226,45 @@ func TestReadWorkspaceReportsRunOptionsResumability(t *testing.T) {
 	}
 	if !strings.Contains(text, "redacted") {
 		t.Fatalf("workspace status missing run options redaction marker: %s", text)
+	}
+}
+
+func TestReadWorkspaceReportsActiveOwnerAsSnapshotOnly(t *testing.T) {
+	workspace := t.TempDir()
+	summary := domain.RunSummary{RunID: "run-active", Workspace: workspace, Status: "running"}
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "state.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "event_log.jsonl"), []byte(`{"run_id":"run-active","type":"run_started","status":"running"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	options := domain.RunnerOptionsSnapshot{Workspace: workspace, TaskDir: "/tmp/task"}
+	raw, err = json.Marshal(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nodes.RunOptionsPath(workspace), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := runlock.Acquire(workspace, runlock.Metadata{RunID: "run-active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	report, err := ReadWorkspace(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Active || report.Resumable || report.ResumeMode != "active_snapshot" {
+		t.Fatalf("active workspace status is unsafe: %+v", report)
+	}
+	if len(report.ResumeWarnings) != 1 || !strings.Contains(report.ResumeWarnings[0], "read-only") {
+		t.Fatalf("active snapshot warning missing: %+v", report.ResumeWarnings)
 	}
 }
 

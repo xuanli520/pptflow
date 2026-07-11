@@ -35,6 +35,22 @@ func TestParseResultNormalizesRuns(t *testing.T) {
 	}
 }
 
+func TestParseResultPreservesExplicitFailedRunWhenRewardExists(t *testing.T) {
+	result, err := ParseResult([]byte(`{
+		"model": "qwen3.7-max",
+		"runs": [
+			{"trial": 1, "passed": false, "turns": 46, "reward": 1, "failure_reason": "AgentTimeoutError"},
+			{"trial": 2, "turns": 20, "reward": 1}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Runs[0].Passed || !result.Runs[1].Passed || result.PassCount != 1 {
+		t.Fatalf("explicit pass state was not preserved: %+v", result)
+	}
+}
+
 func TestValidateForCodeEdgeFailsQwenThresholds(t *testing.T) {
 	result, err := ParseResult([]byte(`{
 		"model": "qwen3.7-max",
@@ -155,6 +171,37 @@ func TestParseHarborJobResultCollectsTrialResults(t *testing.T) {
 	})
 	if len(failures) != 0 {
 		t.Fatalf("unexpected strict validation failures: %+v", failures)
+	}
+}
+
+func TestParsePartialHarborJobPreservesPlannedTrialDenominator(t *testing.T) {
+	taskDir := writeHarborRunTask(t)
+	jobPath := writeHarborJobFixture(t, t.TempDir(), taskDir, "qwen3.7-max", []harborTrialFixture{
+		{Reward: 1, Turns: 24},
+		{Turns: 22, ExceptionType: "AgentTimeoutError"},
+	})
+	raw, err := os.ReadFile(jobPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(raw, &job); err != nil {
+		t.Fatal(err)
+	}
+	job["n_total_trials"] = 4
+	raw, err = json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ParseFile(jobPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trials != 4 || len(result.Runs) != 2 || result.PassCount != 1 || result.PassAt4 != 0.25 {
+		t.Fatalf("partial result used completed runs as the pass@4 denominator: %+v", result)
 	}
 }
 
@@ -371,6 +418,17 @@ func TestValidateForCodeEdgeRequiresCommandRunWhenStrict(t *testing.T) {
 	})
 	if !failureContains(failures, "secret-like values") {
 		t.Fatalf("expected command secret scan failure, got %+v", failures)
+	}
+}
+
+func TestCommandOutputReferencesSoftWrappedHarborResultPath(t *testing.T) {
+	path := "/tmp/harbor-factory/jobs/2026-07-11/result.json"
+	output := "Results written to \n/tmp/harbor-factory/jobs\r\n/2026-07-11/result.json\n"
+	if !commandOutputReferencesPath(output, path, path) {
+		t.Fatal("expected CR/LF-soft-wrapped Harbor result path to pass command audit")
+	}
+	if commandOutputReferencesPath("Results written to /tmp/harbor-factory/jobs /2026-07-11/result.json", path, path) {
+		t.Fatal("ordinary whitespace must not be removed while matching result paths")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 )
 
 type teaProgram interface {
@@ -23,7 +24,15 @@ func Run(ctx context.Context, opts app.RunnerOptions) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	model := initialStartModel(runCtx, cancel, opts)
-	if shouldResumeWorkspace(opts) {
+	active, activeErr := workspaceRunActive(opts)
+	if activeErr != nil {
+		model = initialWorkspaceModel(runCtx, cancel, opts)
+		model.err = activeErr
+		model.notice = "Workspace ownership could not be verified; opened as a read-only snapshot."
+	} else if active {
+		model = initialWorkspaceModel(runCtx, cancel, opts)
+		model.notice = "Workspace is owned by an active Factory process; opened as a read-only live snapshot."
+	} else if shouldResumeWorkspace(opts) {
 		resumeOpts, _, err := app.LoadRunnerOptions(defaultWorkspace(opts.Workspace))
 		if err == nil {
 			resumeOpts.AutoApprove = false
@@ -41,6 +50,13 @@ func Run(ctx context.Context, opts app.RunnerOptions) error {
 	program := newTeaProgram(model, tea.WithAltScreen())
 	_, err := program.Run()
 	return err
+}
+
+func workspaceRunActive(opts app.RunnerOptions) (bool, error) {
+	if opts.Generate || opts.TaskDir != "" {
+		return false, nil
+	}
+	return runlock.IsActive(defaultWorkspace(opts.Workspace))
 }
 
 func shouldResumeWorkspace(opts app.RunnerOptions) bool {

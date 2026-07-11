@@ -11,6 +11,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 )
 
@@ -23,6 +24,7 @@ type WorkspaceStatus struct {
 	StatePresent      bool                          `json:"state_present"`
 	EventLogPresent   bool                          `json:"event_log_present"`
 	RunOptionsPresent bool                          `json:"run_options_present"`
+	Active            bool                          `json:"active"`
 	RunID             string                        `json:"run_id,omitempty"`
 	Status            string                        `json:"status,omitempty"`
 	Passed            bool                          `json:"passed"`
@@ -98,6 +100,14 @@ func ReadWorkspace(workspace string) (WorkspaceStatus, error) {
 		}
 	} else if !os.IsNotExist(err) {
 		report.Issues = append(report.Issues, sanitize.Text("cannot read run_options.json: "+err.Error()))
+	}
+	if active, err := runlock.IsActive(workspace); err != nil {
+		report.Issues = append(report.Issues, sanitize.Text("cannot inspect workspace run lock: "+err.Error()))
+	} else if active {
+		report.Active = true
+		report.Resumable = false
+		report.ResumeMode = "active_snapshot"
+		report.ResumeWarnings = []string{"workspace is owned by an active Factory process; open as a read-only live snapshot"}
 	}
 	if !report.StatePresent && !report.EventLogPresent {
 		report.Issues = append(report.Issues, "workspace has no state.json or event_log.jsonl")

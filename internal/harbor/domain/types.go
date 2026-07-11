@@ -236,6 +236,7 @@ type TrialResult struct {
 	PreflightRunPath    string               `json:"preflight_command_run_path,omitempty"`
 	PreflightResultPath string               `json:"preflight_result_path,omitempty"`
 	AgentCacheManifest  string               `json:"agent_cache_manifest_path,omitempty"`
+	RetryEvidence       string               `json:"retry_evidence_manifest_path,omitempty"`
 	Screenshot          string               `json:"screenshot,omitempty"`
 	CreatedAt           time.Time            `json:"created_at,omitempty"`
 }

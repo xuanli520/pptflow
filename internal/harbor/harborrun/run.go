@@ -179,9 +179,9 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 			"--retry-include", "UnknownApiError",
 		)
 	}
-	stopJobMonitor := startJobProgressMonitor(ctx, jobsDir, opts.Progress)
+	stopJobMonitor := startJobProgressMonitor(ctx, jobsDir, outputDir, opts.Progress)
 	result := runHarborCommand(ctx, exec, timeout, outputDir, processEnv, opts.Progress, args)
-	stopJobMonitor()
+	retryEvidencePath := stopJobMonitor()
 	finished := time.Now().UTC()
 	stdout := commandlog.RedactText(result.Stdout)
 	stderr := commandlog.RedactText(result.Stderr)
@@ -225,6 +225,7 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 	trialResult.PreflightRunPath = preflightPath
 	trialResult.PreflightResultPath = preflightResultPath
 	trialResult.AgentCacheManifest = cacheManifestPath
+	trialResult.RetryEvidence = retryEvidencePath
 	if trialResult.CreatedAt.IsZero() {
 		trialResult.CreatedAt = finished
 	}
@@ -477,44 +478,31 @@ type jobProgress struct {
 	Retries   int
 }
 
-func startJobProgressMonitor(ctx context.Context, jobsDir string, progress func(line, source string)) func() {
+func startJobProgressMonitor(ctx context.Context, jobsDir, outputDir string, progress func(line, source string)) func() string {
 	if progress == nil {
-		return func() {}
+		progress = func(string, string) {}
 	}
+	monitor := newJobMonitor(jobsDir, outputDir, progress)
 	monitorCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	lastStats := ""
-	lastJobLog := ""
-	emit := func() {
-		if state, ok := readJobProgress(jobsDir); ok {
-			message := fmt.Sprintf("trials total=%d completed=%d errored=%d running=%d pending=%d cancelled=%d retries=%d", state.Total, state.Completed, state.Errored, state.Running, state.Pending, state.Cancelled, state.Retries)
-			if message != lastStats {
-				lastStats = message
-				progress(commandlog.RedactText(message), "harbor-result")
-			}
-		}
-		if line, ok := readLatestJobLogLine(jobsDir); ok && line != lastJobLog {
-			lastJobLog = line
-			progress(commandlog.RedactText(compactDiagnostic(line, 600)), "harbor-job")
-		}
-	}
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-monitorCtx.Done():
 				return
 			case <-ticker.C:
-				emit()
+				monitor.poll(false)
 			}
 		}
 	}()
-	return func() {
-		emit()
+	return func() string {
 		cancel()
 		<-done
+		monitor.poll(true)
+		return monitor.retryEvidenceManifestPath()
 	}
 }
 

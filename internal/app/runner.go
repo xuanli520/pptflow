@@ -24,6 +24,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/packager"
 	"github.com/purplevoid/harbor-factory/internal/harbor/quality"
 	"github.com/purplevoid/harbor-factory/internal/harbor/repoprep"
+	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 	"github.com/purplevoid/harbor-factory/internal/harbor/similarity"
 	"github.com/purplevoid/harbor-factory/internal/harbor/verify"
@@ -188,6 +189,11 @@ func (r *Runner) registerStageCancel(nodeID string, cancel context.CancelFunc) f
 func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr error) {
 	start := time.Now().UTC()
 	runID := r.ensureRunID()
+	workspaceLock, err := runlock.Acquire(defaultString(strings.TrimSpace(r.opts.Workspace), filepath.Join(".harbor-factory", "workspace")), runlock.Metadata{RunID: runID, StartedAt: start})
+	if err != nil {
+		return summary, err
+	}
+	defer workspaceLock.Close()
 	summary.RunID = runID
 	summary.Workspace = r.opts.Workspace
 	summary.StartedAt = start
@@ -873,13 +879,26 @@ func (r *Runner) runHarborModel(ctx context.Context, taskDir, nodeID, model stri
 	outputDir := nodes.HarborRunDir(r.opts.Workspace, nodeID)
 	livePath := filepath.Join(outputDir, "live.log")
 	agentEnv := append([]string(nil), r.opts.HarborAgentEnv...)
+	// Claude Code may choose tier defaults for built-in subagents even when the
+	// parent was launched with an explicit model. Keep every nested request on
+	// the current stage route instead of leaking Opus requests into Qwen-only
+	// gateways (or vice versa).
+	for _, key := range []string{
+		"CLAUDE_CODE_SUBAGENT_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL",
+	} {
+		agentEnv = upsertEnv(agentEnv, key, model)
+	}
 	switch nodeID {
 	case nodes.HarborRunQwen:
 		agentEnv = upsertEnv(agentEnv, "ANTHROPIC_BASE_URL", r.opts.QwenHarborBaseURL)
 	case nodes.HarborRunOpus:
 		agentEnv = upsertEnv(agentEnv, "ANTHROPIC_BASE_URL", r.opts.OpusHarborBaseURL)
 	}
-	lastProgress := time.Time{}
+	lastProgress := map[string]time.Time{}
 	var progressMu sync.Mutex
 	trialResult, commandRun, err := harborrun.Run(modelCtx, harborrun.Options{
 		TaskPath:            taskDir,
@@ -898,10 +917,10 @@ func (r *Runner) runHarborModel(ctx context.Context, taskDir, nodeID, model stri
 			progressMu.Lock()
 			defer progressMu.Unlock()
 			now := time.Now()
-			if !lastProgress.IsZero() && now.Sub(lastProgress) < time.Second {
+			if previous := lastProgress[source]; !previous.IsZero() && now.Sub(previous) < time.Second {
 				return
 			}
-			lastProgress = now
+			lastProgress[source] = now
 			message := strings.TrimSpace(line)
 			if len(message) > 320 {
 				message = message[:320] + "..."

@@ -238,6 +238,7 @@ func TrialResult(result domain.TrialResult) domain.TrialResult {
 	result.PreflightRunPath = Text(result.PreflightRunPath)
 	result.PreflightResultPath = Text(result.PreflightResultPath)
 	result.AgentCacheManifest = Text(result.AgentCacheManifest)
+	result.RetryEvidence = Text(result.RetryEvidence)
 	result.Screenshot = Text(result.Screenshot)
 	return result
 }

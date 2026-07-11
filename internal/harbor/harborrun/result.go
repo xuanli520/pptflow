@@ -67,6 +67,7 @@ func parseNormalizedResult(decoded map[string]any) domain.TrialResult {
 		HarborTaskChecksum: firstString(decoded, "harbor_task_checksum", "task_checksum"),
 		TaskPath:           firstString(decoded, "task_path"),
 		CommandRunPath:     firstString(decoded, "command_run_path", "command_path"),
+		RetryEvidence:      firstString(decoded, "retry_evidence_manifest_path"),
 		Screenshot:         firstString(decoded, "screenshot", "screenshot_path", "pass4_screenshot"),
 	}
 	result.Runs = parseRuns(decoded["runs"])
@@ -175,8 +176,10 @@ func parseHarborJobResult(decoded map[string]any, path string, raw []byte) (doma
 		}
 	}
 	if len(result.Runs) > 0 {
-		result.Trials = len(result.Runs)
-		result.PassAt4 = float64(result.PassCount) / float64(len(result.Runs))
+		if result.Trials <= 0 {
+			result.Trials = len(result.Runs)
+		}
+		result.PassAt4 = float64(result.PassCount) / float64(result.Trials)
 	}
 	if turnCount == len(result.Runs) && len(result.Runs) > 0 {
 		result.AverageTurns = float64(totalTurns) / float64(len(result.Runs))
@@ -967,12 +970,16 @@ func commandOutputReferencesPath(output, original, resolved string) bool {
 	if output == "" {
 		return false
 	}
+	// Rich wraps long Harbor result paths at terminal line boundaries. Preserve
+	// every non-newline byte so the audit still requires the exact path, while
+	// accepting a path split only by CR/LF soft wraps.
+	softUnwrappedOutput := strings.NewReplacer("\r\n", "", "\n", "", "\r", "").Replace(output)
 	candidates := []string{strings.TrimSpace(original), strings.TrimSpace(resolved)}
 	if abs, err := filepath.Abs(resolved); err == nil {
 		candidates = append(candidates, abs)
 	}
 	for _, candidate := range candidates {
-		if candidate != "" && strings.Contains(output, candidate) {
+		if candidate != "" && (strings.Contains(output, candidate) || strings.Contains(softUnwrappedOutput, candidate)) {
 			return true
 		}
 	}
@@ -1222,9 +1229,13 @@ func parseRuns(value any) []domain.TrialRun {
 			continue
 		}
 		trial := intValue(object["trial"])
+		passed, hasPassed := explicitBoolValue(object["passed"])
+		if !hasPassed {
+			passed = floatValue(object["reward"]) >= 1
+		}
 		runs = append(runs, domain.TrialRun{
 			Trial:           trial,
-			Passed:          boolValue(object["passed"]) || floatValue(object["reward"]) >= 1,
+			Passed:          passed,
 			Turns:           firstInt(object, "turns", "turn_count"),
 			DurationSeconds: firstInt(object, "duration_seconds", "duration_sec"),
 			Reward:          floatValue(object["reward"]),
@@ -1311,13 +1322,25 @@ func floatValue(value any) float64 {
 }
 
 func boolValue(value any) bool {
+	parsed, _ := explicitBoolValue(value)
+	return parsed
+}
+
+func explicitBoolValue(value any) (bool, bool) {
 	switch typed := value.(type) {
 	case bool:
-		return typed
+		return typed, true
 	case string:
-		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.TrimSpace(typed) == "1"
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "1":
+			return true, true
+		case "false", "0":
+			return false, true
+		default:
+			return false, false
+		}
 	default:
-		return false
+		return false, false
 	}
 }
 

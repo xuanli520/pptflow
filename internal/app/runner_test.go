@@ -20,6 +20,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 	"github.com/purplevoid/harbor-factory/internal/harbor/secretscan"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
@@ -102,6 +103,36 @@ func TestRunnerEmitsGateAndPersistsDecision(t *testing.T) {
 		if event.RunID == "" {
 			t.Fatalf("event missing run_id: %+v", event)
 		}
+	}
+}
+
+func TestRunnerRejectsConcurrentWorkspaceOwnerWithoutPersisting(t *testing.T) {
+	workspace := t.TempDir()
+	marker := []byte("existing event\n")
+	eventPath := filepath.Join(workspace, "event_log.jsonl")
+	if err := os.WriteFile(eventPath, marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := runlock.Acquire(workspace, runlock.Metadata{RunID: "run-owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	runner := NewRunner(RunnerOptions{Workspace: workspace, TaskDir: writeRunnerTask(t), AutoApprove: true})
+	summary, err := runner.Run(context.Background())
+	if !errors.Is(err, runlock.ErrActive) {
+		t.Fatalf("concurrent runner error = %v, want ErrActive", err)
+	}
+	if summary.RunID != "" || summary.Status != "" {
+		t.Fatalf("rejected runner should not claim a run: %+v", summary)
+	}
+	raw, readErr := os.ReadFile(eventPath)
+	if readErr != nil || string(raw) != string(marker) {
+		t.Fatalf("rejected runner modified event log: err=%v raw=%q", readErr, raw)
+	}
+	if _, statErr := os.Stat(filepath.Join(workspace, "state.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected runner wrote state.json: %v", statErr)
 	}
 }
 
@@ -808,6 +839,9 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 	}
 	if len(exec.commands) != 2 || !strings.Contains(exec.commands[0], "ANTHROPIC_BASE_URL=https://qwen.example/v1") || strings.Contains(exec.commands[0], "opus.example") || !strings.Contains(exec.commands[1], "ANTHROPIC_BASE_URL=https://opus.example/v1") || strings.Contains(exec.commands[1], "qwen.example") {
 		t.Fatalf("per-model Harbor routes were not isolated: %v", exec.commands)
+	}
+	if !strings.Contains(exec.commands[0], "CLAUDE_CODE_SUBAGENT_MODEL=qwen3.7-max") || !strings.Contains(exec.commands[0], "ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3.7-max") || !strings.Contains(exec.commands[1], "CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-4-8") || !strings.Contains(exec.commands[1], "ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8") {
+		t.Fatalf("nested Claude model routes were not pinned to their stages: %v", exec.commands)
 	}
 	for _, rel := range []string{
 		filepath.Join("phase3", "artifacts", "harbor_run_qwen", "qwen_result.json"),

@@ -7,12 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 )
 
 type fakeTeaProgram struct {
@@ -99,6 +102,68 @@ func TestRunResumesWorkspaceFromRunOptionsWhenNonTerminal(t *testing.T) {
 	}
 	if model.notice == "" {
 		t.Fatal("resume model should explain that run_options.json was used")
+	}
+}
+
+func TestRunOpensActiveWorkspaceAsReadOnlySnapshot(t *testing.T) {
+	workspace := t.TempDir()
+	taskDir := t.TempDir()
+	if _, err := app.SaveRunnerOptions(app.RunnerOptions{Workspace: workspace, TaskDir: taskDir}); err != nil {
+		t.Fatal(err)
+	}
+	stateRaw, err := json.Marshal(domain.RunSummary{RunID: "run-active", Workspace: workspace, Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "state.json"), stateRaw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gateEvent := domain.RunnerEvent{
+		RunID:  "run-active",
+		Type:   "gate_requested",
+		NodeID: nodes.FinalReview,
+		Status: "waiting",
+		Gate: &domain.GateRequest{
+			RequestID: "phase2:final_review",
+			GateID:    nodes.FinalReview,
+			GateName:  "Final Review",
+		},
+	}
+	eventRaw, err := json.Marshal(gateEvent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "event_log.jsonl"), append(eventRaw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := runlock.Acquire(workspace, runlock.Metadata{RunID: "run-active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	var captured tea.Model
+	previous := newTeaProgram
+	newTeaProgram = func(model tea.Model, opts ...tea.ProgramOption) teaProgram {
+		captured = model
+		return fakeTeaProgram{model: model}
+	}
+	defer func() { newTeaProgram = previous }()
+
+	if err := Run(context.Background(), app.RunnerOptions{Workspace: workspace}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := captured.(model)
+	if snapshot.runner != nil || !snapshot.readOnly || snapshot.summary.RunID != "run-active" || snapshot.activeGate == nil {
+		t.Fatalf("active workspace must be a snapshot: runner=%v summary=%+v", snapshot.runner, snapshot.summary)
+	}
+	if !strings.Contains(snapshot.notice, "read-only live snapshot") {
+		t.Fatalf("active snapshot notice missing: %q", snapshot.notice)
+	}
+	updated, cmd := snapshot.updateGateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	readOnly := updated.(model)
+	if cmd != nil || readOnly.activeGate == nil || readOnly.err == nil || !strings.Contains(readOnly.err.Error(), "read-only") {
+		t.Fatalf("read-only snapshot allowed gate mutation: cmd=%v model=%+v", cmd, readOnly)
 	}
 }
 
