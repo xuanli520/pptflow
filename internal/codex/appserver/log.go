@@ -193,8 +193,8 @@ func commandString(name string, args []string) string {
 }
 
 const (
-	staticReviewJSONStart = "<!-- pptflow:agent-json:start -->"
-	staticReviewJSONEnd   = "<!-- pptflow:agent-json:end -->"
+	staticReviewJSONStart = "<!-- harbor-factory:agent-json:start -->"
+	staticReviewJSONEnd   = "<!-- harbor-factory:agent-json:end -->"
 )
 
 func newWarning(path, op string, required bool, err error) Warning {

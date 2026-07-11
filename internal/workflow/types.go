@@ -189,7 +189,6 @@ type EventSink interface {
 type Runtimes struct {
 	Command CommandRuntime
 	Agent   AgentRuntime
-	Image   ImageRuntime
 }
 
 type CommandRequest struct {
@@ -245,34 +244,4 @@ type AgentTurnResult struct {
 
 type AgentRuntime interface {
 	Turn(context.Context, AgentTurnRequest) (AgentTurnResult, error)
-}
-
-type ImageRequest struct {
-	Model          string
-	Prompt         string
-	Size           string
-	Quality        string
-	OutputPath     string
-	SourceImages   []ImageSource
-	TimeoutSeconds int
-}
-
-type ImageSource struct {
-	Path   string `json:"path,omitempty"`
-	URL    string `json:"url,omitempty"`
-	Role   string `json:"role,omitempty"`
-	Detail string `json:"detail,omitempty"`
-}
-
-type ImageResult struct {
-	Path    string `json:"path"`
-	Model   string `json:"model"`
-	Size    string `json:"size"`
-	Quality string `json:"quality"`
-	MIME    string `json:"mime"`
-}
-
-type ImageRuntime interface {
-	Generate(context.Context, ImageRequest) (ImageResult, error)
-	Configured() bool
 }

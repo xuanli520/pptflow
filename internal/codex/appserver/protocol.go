@@ -131,7 +131,7 @@ func (s *appServerCodexReviewSession) respondUnsupported(id json.RawMessage, met
 		"jsonrpc": "2.0",
 		"error": map[string]any{
 			"code":    -32601,
-			"message": "pptflow app-server client does not implement server request method " + method,
+			"message": "harbor-factory app-server client does not implement server request method " + method,
 		},
 	}
 	var payload map[string]json.RawMessage

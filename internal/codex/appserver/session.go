@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xuanli520/pptflow/internal/executor"
+	"github.com/purplevoid/harbor-factory/internal/executor"
 )
 
 type appServerCodexReviewSession struct {
@@ -148,7 +148,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	if _, err := s.sendRequest(initCtx, "initialize", map[string]any{
-		"clientInfo": map[string]any{"name": "pptflow", "version": "0"},
+		"clientInfo": map[string]any{"name": "harbor-factory", "version": "0"},
 		"capabilities": map[string]any{
 			"experimentalApi": true,
 		},

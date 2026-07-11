@@ -1,6 +1,6 @@
 package main
 
-import "github.com/xuanli520/pptflow/cmd"
+import "github.com/purplevoid/harbor-factory/cmd"
 
 func main() {
 	cmd.Execute()

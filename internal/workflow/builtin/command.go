@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/xuanli520/pptflow/internal/workflow"
+	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
 type CommandPlugin struct{}

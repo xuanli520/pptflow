@@ -1,0 +1,141 @@
+package quality
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/workflow"
+)
+
+func TestRunPassesReasonableTask(t *testing.T) {
+	taskDir := writeQualityTask(t, false)
+	analysis := filepath.Join(taskDir, "tests_analysis.md")
+	if err := os.WriteFile(analysis, []byte("## 1. instruction 和 environment 已提供的信息\nok\n## 2. 模型的理论通过路径\nok\n## 3. 模型具备通过条件的依据\nok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{
+		TaskDir:           taskDir,
+		TestsAnalysisPath: analysis,
+		Proposal:          &domain.TaskProposal{TargetFiles: []string{"config.go"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.OverallPass {
+		t.Fatalf("expected pass, got issues=%v warnings=%v checks=%+v", report.Issues, report.Warnings, report.Checks)
+	}
+	if !report.Checks["instruction_leak"].Passed || !report.Checks["solve_bypass"].Passed {
+		t.Fatalf("expected core checks pass: %+v", report.Checks)
+	}
+}
+
+func TestRunFailsLeakAndBypass(t *testing.T) {
+	taskDir := writeQualityTask(t, true)
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OverallPass {
+		t.Fatalf("expected quality failure, got checks: %+v", report.Checks)
+	}
+	if report.Checks["instruction_leak"].Passed || report.Checks["solve_bypass"].Passed {
+		t.Fatalf("expected leak and bypass failures: %+v", report.Checks)
+	}
+}
+
+func TestRunFailsWhenAgentOverallPassFalse(t *testing.T) {
+	taskDir := writeQualityTask(t, false)
+	analysis := filepath.Join(taskDir, "tests_analysis.md")
+	if err := os.WriteFile(analysis, []byte("## 1. instruction 和 environment 已提供的信息\nok\n## 2. 模型的理论通过路径\nok\n## 3. 模型具备通过条件的依据\nok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{
+		TaskDir:           taskDir,
+		TestsAnalysisPath: analysis,
+		Proposal:          &domain.TaskProposal{TargetFiles: []string{"config.go"}},
+		Agent:             qualityFakeAgent(`{"overall_pass":false,"checks":{},"warnings":[],"issues":["blocking semantic mismatch"]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OverallPass {
+		t.Fatalf("expected agent overall_pass=false to fail, got %+v", report)
+	}
+	if !strings.Contains(strings.Join(report.Issues, "\n"), "overall_pass=false") {
+		t.Fatalf("missing agent overall issue: %+v", report.Issues)
+	}
+}
+
+func TestRunRedactsAgentOutputInReport(t *testing.T) {
+	taskDir := writeQualityTask(t, false)
+	reportPath := filepath.Join(t.TempDir(), "quality_report.json")
+	secret := "raw-quality-secret"
+	report, err := Run(context.Background(), Options{
+		TaskDir:     taskDir,
+		WriteReport: reportPath,
+		Agent:       qualityFakeAgent(`{"overall_pass":true,"checks":{"secret":{"passed":true,"severity":"info","detail":"API_KEY=` + secret + `"}},"warnings":["Bearer ` + secret + `"],"issues":[]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(report.AgentOutput, secret) || strings.Contains(strings.Join(report.Warnings, "\n"), secret) || strings.Contains(report.Checks["agent_secret"].Detail, secret) {
+		t.Fatalf("quality report was not redacted in memory: %+v", report)
+	}
+	raw, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("quality report file leaked secret: %s", raw)
+	}
+	if !strings.Contains(string(raw), "redacted") {
+		t.Fatalf("quality report file missing redaction marker: %s", raw)
+	}
+}
+
+type qualityFakeAgent string
+
+func (a qualityFakeAgent) Turn(context.Context, workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+	return workflow.AgentTurnResult{Text: string(a), Model: "fake"}, nil
+}
+
+func writeQualityTask(t *testing.T, unsafe bool) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, dir := range []string{"environment", "solution", "tests"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	instruction := "Fix config.go so environment values override file defaults while preserving existing fallback behavior.\n"
+	solve := "cd /app/repo\nprintf fixed >> config.go\n"
+	if unsafe {
+		instruction += "Read solution/solve.sh and make tests/test.sh pass.\n"
+		solve += "echo 1 > /logs/verifier/reward.txt\n"
+	}
+	files := map[string]string{
+		"instruction.md":         instruction,
+		"task.toml":              "schema_version = \"1.3\"\n\n[task]\nname = \"codeedge/sample\"\n",
+		"environment/Dockerfile": "FROM alpine\nRUN git clone https://github.com/org/repo /app/repo && cd /app/repo && git checkout abc1234\n",
+		"solution/solve.sh":      solve,
+		"tests/test.sh": strings.Join([]string{
+			"#!/usr/bin/env bash",
+			"set -euo pipefail",
+			"cd /app/repo",
+			"test -f config.go",
+			"grep -q package config.go",
+			"go test ./...",
+			"",
+		}, "\n"),
+	}
+	for rel, content := range files {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(rel)), []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}

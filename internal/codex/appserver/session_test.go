@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xuanli520/pptflow/internal/executor"
+	"github.com/purplevoid/harbor-factory/internal/executor"
 )
 
 func TestWaitReturnsAfterCompleteClosesOpenStreams(t *testing.T) {

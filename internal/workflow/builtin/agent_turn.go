@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/xuanli520/pptflow/internal/workflow"
+	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
 type AgentTurnPlugin struct{}
@@ -39,7 +39,7 @@ func (AgentTurnPlugin) Execute(ctx context.Context, req workflow.NodeRequest) (w
 		NetworkAccess:     boolConfig(req.Spec.Config, "network_access"),
 		TimeoutSeconds:    intConfig(req.Spec.Config, "timeout_seconds"),
 		MaxOutputBytes:    intConfig(req.Spec.Config, "max_output_bytes"),
-		CapabilitySummary: "pptflow agent turn",
+		CapabilitySummary: "harbor-factory agent turn",
 		LogPath:           logPath,
 	})
 	if err != nil {

@@ -22,13 +22,21 @@ func Execute() {
 
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "pptflow",
-		Short: "PPTflow — AI-driven visual presentation generator",
-		Long: `PPTflow generates beautiful, editable PowerPoint presentations using a pipeline of:
-  Codex (prompt optimization + content generation)
-  Image2 (slide image generation with consistent styling)
-  Codex (resource extraction + PPTX assembly)`,
+		Use:          "harbor-factory",
+		Short:        "Harbor Task Factory — CodeEdge task generation and validation",
+		SilenceUsage: true,
+		Long: `Harbor Task Factory prepares, validates, and packages Harbor benchmark tasks.
+
+The fork removes non-Harbor domain code and keeps reusable
+workflow, executor, Codex, and command runtime infrastructure for Harbor tasks.`,
 	}
-	root.AddCommand(newPromptFlowCommand())
+	root.AddCommand(
+		newRepoPrepareCommand(),
+		newLintCommand(),
+		newRunCommand(),
+		newTUICommand(),
+		newStatusCommand(),
+		newDoctorCommand(),
+	)
 	return root
 }

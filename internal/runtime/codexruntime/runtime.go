@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xuanli520/pptflow/internal/codex"
-	"github.com/xuanli520/pptflow/internal/codex/appserver"
-	"github.com/xuanli520/pptflow/internal/executor"
-	"github.com/xuanli520/pptflow/internal/workflow"
+	"github.com/purplevoid/harbor-factory/internal/codex"
+	"github.com/purplevoid/harbor-factory/internal/codex/appserver"
+	"github.com/purplevoid/harbor-factory/internal/executor"
+	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
 type Runtime struct {
@@ -38,7 +38,7 @@ func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workf
 	}
 	logPath := strings.TrimSpace(req.LogPath)
 	if logPath == "" {
-		logPath = filepath.Join(projectPath, ".pptflow-codex.log")
+		logPath = filepath.Join(projectPath, ".harbor-factory-codex.log")
 	}
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -62,7 +62,7 @@ func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workf
 	}
 	configuredEnv := copyEnv(r.env)
 	cleanupCodexHome := ""
-	sandbox, err := codex.NewSandbox(projectPath, filepath.Dir(logPath), fmt.Sprintf("pptflow-%d", time.Now().UnixNano()))
+	sandbox, err := codex.NewSandbox(projectPath, filepath.Dir(logPath), fmt.Sprintf("harbor-factory-%d", time.Now().UnixNano()))
 	if err != nil {
 		return workflow.AgentTurnResult{}, err
 	}
@@ -208,19 +208,17 @@ func writeAutomationCodexConfig(sourceHome, targetHome, projectPath string) erro
 	provider := topLevelConfigString(source, "model_provider")
 	model := topLevelConfigString(source, "model")
 	if provider == "" {
-		provider = "custom"
+		provider = strings.TrimSpace(os.Getenv("CODEX_MODEL_PROVIDER"))
+	}
+	if provider == "" {
+		provider = "openai"
 	}
 	if model == "" {
 		model = "gpt-5.5"
 	}
 	providerBlock := extractTomlTableBlock(source, "model_providers."+provider)
 	if strings.TrimSpace(providerBlock) == "" && provider == "custom" {
-		providerBlock = `[model_providers.custom]
-name = "custom"
-wire_api = "responses"
-requires_openai_auth = true
-base_url = "https://new-api.metalics.cn/v1"
-`
+		providerBlock = fallbackCustomProviderBlock()
 	}
 	config := strings.Join([]string{
 		fmt.Sprintf("model_provider = %q", provider),
@@ -234,6 +232,28 @@ base_url = "https://new-api.metalics.cn/v1"
 		"",
 	}, "\n")
 	return os.WriteFile(filepath.Join(targetHome, "config.toml"), []byte(config), 0o600)
+}
+
+func fallbackCustomProviderBlock() string {
+	lines := []string{
+		"[model_providers.custom]",
+		`name = "custom"`,
+		`wire_api = "responses"`,
+		`requires_openai_auth = true`,
+	}
+	if baseURL := firstEnv("CODEX_MODEL_BASE_URL", "OPENAI_BASE_URL"); baseURL != "" {
+		lines = append(lines, fmt.Sprintf("base_url = %q", baseURL))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func firstEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func topLevelConfigString(config, key string) string {

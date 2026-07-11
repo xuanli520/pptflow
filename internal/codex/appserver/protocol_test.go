@@ -4,16 +4,16 @@ import "testing"
 
 func TestAppServerTurnStartParamsUsesMultimodalInput(t *testing.T) {
 	params := appServerTurnStartParams(Request{
-		ProjectPath:   `H:\project\PPT_producer\workspace`,
-		Prompt:        "analyze these slides",
+		ProjectPath:   `H:\project\harbor_factory\workspace`,
+		Prompt:        "analyze this repository evidence",
 		SandboxPolicy: "readWrite",
 		WorkspaceRoots: []string{
-			`H:\project\PPT_producer\workspace`,
-			`H:\project\PPT_producer\artifacts`,
+			`H:\project\harbor_factory\workspace`,
+			`H:\project\harbor_factory\artifacts`,
 		},
 		Input: []InputPart{
-			{Type: "localImage", Path: `H:\project\PPT_producer\artifacts\slide_01.png`, Detail: "high"},
-			{Type: "image", URL: "https://example.com/slide.png", Detail: "original"},
+			{Type: "localImage", Path: `H:\project\harbor_factory\artifacts\terminal.png`, Detail: "high"},
+			{Type: "image", URL: "https://example.com/result.png", Detail: "original"},
 		},
 	}, "thread-1")
 
@@ -24,7 +24,7 @@ func TestAppServerTurnStartParamsUsesMultimodalInput(t *testing.T) {
 	if len(input) != 3 {
 		t.Fatalf("input length = %d", len(input))
 	}
-	if input[0]["type"] != "text" || input[0]["text"] != "analyze these slides" {
+	if input[0]["type"] != "text" || input[0]["text"] != "analyze this repository evidence" {
 		t.Fatalf("text input = %+v", input[0])
 	}
 	if input[1]["type"] != "localImage" || input[1]["path"] == "" || input[1]["detail"] != "high" {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xuanli520/pptflow/internal/executor"
+	"github.com/purplevoid/harbor-factory/internal/executor"
 )
 
 type Capability struct {

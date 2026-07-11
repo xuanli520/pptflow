@@ -147,20 +147,20 @@ func TestFileArtifactStoreRegisterRecordsExistingFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, err := store.Path("slide_images/slide_01.png")
+	path, err := store.Path("evidence/log.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("png"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("log"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Register(context.Background(), RegisterArtifactRequest{Name: "slide_images/slide_01.png", Type: "image", Producer: "generate_slides", Path: path}); err != nil {
+	if _, err := store.Register(context.Background(), RegisterArtifactRequest{Name: "evidence/log.txt", Type: "text", Producer: "collect_evidence", Path: path}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Register(context.Background(), RegisterArtifactRequest{Name: "slide_images/slide_01.png", Type: "image", Producer: "generate_slides", Path: path}); err != nil {
+	if _, err := store.Register(context.Background(), RegisterArtifactRequest{Name: "evidence/log.txt", Type: "text", Producer: "collect_evidence", Path: path}); err != nil {
 		t.Fatal(err)
 	}
 	refs, err := store.List(context.Background(), "")
@@ -170,7 +170,7 @@ func TestFileArtifactStoreRegisterRecordsExistingFile(t *testing.T) {
 	if len(refs) != 1 {
 		t.Fatalf("refs = %d", len(refs))
 	}
-	if refs[0].Name != "slide_images/slide_01.png" || refs[0].Type != "image" {
+	if refs[0].Name != "evidence/log.txt" || refs[0].Type != "text" {
 		t.Fatalf("ref = %+v", refs[0])
 	}
 }

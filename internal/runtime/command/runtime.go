@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/xuanli520/pptflow/internal/executor"
-	"github.com/xuanli520/pptflow/internal/workflow"
+	"github.com/purplevoid/harbor-factory/internal/executor"
+	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
 type Runtime struct {
