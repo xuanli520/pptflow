@@ -24,6 +24,17 @@ func TestTUICommandRejectsAutoApprove(t *testing.T) {
 	}
 }
 
+func TestTUICommandExposesTaskHubFlags(t *testing.T) {
+	cmd := newTUICommand()
+	if cmd.Flags().Lookup("workspace-root") == nil || cmd.Flags().Lookup("rescan") == nil {
+		t.Fatal("Task Hub workspace-root/rescan flags are missing")
+	}
+	root, err := cmd.Flags().GetString("workspace-root")
+	if err != nil || root != ".harbor-factory" {
+		t.Fatalf("unexpected workspace-root default: %q err=%v", root, err)
+	}
+}
+
 func TestRunnerEnvironmentDefaultsUseSafeCredentialTemplateAndStageRoutes(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "relay-secret")
 	t.Setenv("ANTHROPIC_API_KEY", "")

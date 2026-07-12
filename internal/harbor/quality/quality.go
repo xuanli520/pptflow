@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
@@ -47,6 +48,12 @@ func Run(ctx context.Context, opts Options) (domain.QualityReport, error) {
 		add(&report, "task_dir", false, "error", "task directory is required", "deterministic")
 		return finish(report, opts.WriteReport)
 	}
+	taskDigest, err := harborrun.ComputeTaskDigest(taskDir)
+	if err != nil {
+		add(&report, "task_digest", false, "error", "task digest cannot be computed: "+err.Error(), "deterministic")
+		return finish(report, opts.WriteReport)
+	}
+	report.TaskDigest = taskDigest
 	files, err := readTaskFiles(taskDir, opts.TestsAnalysisPath)
 	if err != nil {
 		add(&report, "task_files_readable", false, "error", err.Error(), "deterministic")

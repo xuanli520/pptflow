@@ -19,6 +19,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/repourl"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 	"github.com/purplevoid/harbor-factory/internal/harbor/secretscan"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -186,10 +187,10 @@ func checkTaskFileSet(report *domain.LintReport, taskDir string) {
 			nonRegular = append(nonRegular, rel)
 			return nil
 		}
-		if !isAllowedTaskFile(rel) {
+		if !taskpolicy.IsAllowedFile(rel) {
 			extras = append(extras, rel)
 		}
-		if legacyDomainMatch(rel) {
+		if taskpolicy.ContainsLegacyDomain(rel) {
 			legacy = append(legacy, rel)
 			return nil
 		}
@@ -197,7 +198,7 @@ func checkTaskFileSet(report *domain.LintReport, taskDir string) {
 		if err != nil {
 			return err
 		}
-		if legacyDomainMatch(string(raw)) {
+		if taskpolicy.ContainsLegacyDomain(string(raw)) {
 			legacy = append(legacy, rel)
 		}
 		return nil
@@ -221,30 +222,6 @@ func checkTaskFileSet(report *domain.LintReport, taskDir string) {
 	} else {
 		report.Add("task_file_set_legacy", domain.CheckPass, "task contains no PPT/promptflow/image2 legacy residue", taskDir)
 	}
-}
-
-func isAllowedTaskFile(rel string) bool {
-	switch rel {
-	case "instruction.md",
-		"task.toml",
-		"tests_analysis.md",
-		"environment/Dockerfile",
-		"environment/docker-compose.yaml",
-		"solution/solve.sh",
-		"tests/test.sh":
-		return true
-	}
-	return false
-}
-
-func legacyDomainMatch(value string) bool {
-	lower := strings.ToLower(value)
-	for _, term := range []string{"pptflow", "promptflow", "image2", "powerpoint", "presentation", "slide"} {
-		if strings.Contains(lower, term) {
-			return true
-		}
-	}
-	return false
 }
 
 func limitStrings(values []string, limit int) []string {
@@ -360,11 +337,11 @@ func checkZip(report *domain.LintReport, zipPath string) (string, bool) {
 			report.Add("zip_file_set", domain.CheckFail, "zip task root contains non-regular file: "+rel, zipPath)
 			return rootNames[0], false
 		}
-		if !isAllowedTaskFile(rel) {
+		if !taskpolicy.IsAllowedFile(rel) {
 			report.Add("zip_file_set", domain.CheckFail, "zip task root contains unexpected file: "+rel, zipPath)
 			return rootNames[0], false
 		}
-		if legacyDomainMatch(rel) {
+		if taskpolicy.ContainsLegacyDomain(rel) {
 			report.Add("zip_file_set", domain.CheckFail, "zip task root contains legacy non-Harbor file: "+rel, zipPath)
 			return rootNames[0], false
 		}
@@ -528,7 +505,7 @@ func checkTaskTOML(report *domain.LintReport, path string, strict bool) (taskTOM
 	}
 	if repo == "" && strict && !task.Metadata.IsZeroToOne {
 		report.Add("task_toml_github_match", domain.CheckFail, "task.toml missing github_url for non 0-1 task", path)
-	} else if repo != "" && report.RepoURL != "" && repo != report.RepoURL {
+	} else if repo != "" && report.RepoURL != "" && !repourl.Equivalent(repo, report.RepoURL) {
 		report.Add("task_toml_github_match", domain.CheckFail, "task.toml github_url does not match submitted repo URL", path)
 	} else if repo != "" || report.RepoURL == "" || task.Metadata.IsZeroToOne {
 		report.Add("task_toml_github_match", domain.CheckPass, "task.toml github_url matches or repo URL was not provided", path)
@@ -613,7 +590,8 @@ func checkDockerfile(report *domain.LintReport, path, repoURL, commit string) {
 		report.Add("dockerfile_read", domain.CheckFail, "cannot read file", path)
 		return
 	}
-	content := strings.ToLower(stripDockerfileComments(string(raw)))
+	rawContent := stripDockerfileComments(string(raw))
+	content := strings.ToLower(rawContent)
 	report.Add("dockerfile_read", domain.CheckPass, "Dockerfile is readable", path)
 	for _, forbidden := range []string{"copy tests", "copy ./tests", "copy solution", "copy ./solution", "add tests", "add ./tests", "add solution", "add ./solution"} {
 		if strings.Contains(content, forbidden) {
@@ -633,10 +611,10 @@ func checkDockerfile(report *domain.LintReport, path, repoURL, commit string) {
 		report.Add("dockerfile_no_reward", domain.CheckPass, "Dockerfile does not prewrite verifier reward", path)
 	}
 	if strings.Contains(content, "git clone") {
-		cloneURL := firstDockerfileGitCloneURL(content)
+		cloneURL := firstDockerfileGitCloneURL(rawContent)
 		if cloneURL == "" {
 			report.Add("dockerfile_repo_match", domain.CheckFail, "Dockerfile git clone URL could not be parsed", path)
-		} else if repoURL != "" && normalizeRepoURL(cloneURL) != normalizeRepoURL(repoURL) {
+		} else if repoURL != "" && !repourl.Equivalent(cloneURL, repoURL) {
 			report.Add("dockerfile_repo_match", domain.CheckFail, "Dockerfile git clone URL does not match submitted GitHub URL", path)
 		} else {
 			report.Add("dockerfile_repo_match", domain.CheckPass, "Dockerfile git clone URL matches or repo URL was not provided", path)
@@ -1463,7 +1441,7 @@ func firstDockerfileGitCloneURL(content string) string {
 	for _, line := range strings.Split(content, "\n") {
 		fields := strings.Fields(strings.Trim(line, ";&|"))
 		for i := 0; i+1 < len(fields); i++ {
-			if fields[i] != "git" || fields[i+1] != "clone" {
+			if !strings.EqualFold(fields[i], "git") || !strings.EqualFold(fields[i+1], "clone") {
 				continue
 			}
 			for _, field := range fields[i+2:] {
@@ -1526,23 +1504,6 @@ func isGitCheckoutLine(line string) bool {
 
 func isLikelyGitURL(value string) bool {
 	return filepath.IsAbs(value) || strings.Contains(value, "://") || strings.HasPrefix(value, "git@") || strings.Contains(value, "github.com/")
-}
-
-func normalizeRepoURL(value string) string {
-	value = strings.TrimSpace(strings.Trim(value, "\"'"))
-	value = strings.TrimSuffix(value, ".git")
-	value = strings.TrimSuffix(value, "/")
-	value = strings.ToLower(value)
-	value = strings.TrimPrefix(value, "ssh://")
-	if strings.HasPrefix(value, "git@github.com:") {
-		value = "https://github.com/" + strings.TrimPrefix(value, "git@github.com:")
-	}
-	if strings.HasPrefix(value, "git@github.com/") {
-		value = "https://github.com/" + strings.TrimPrefix(value, "git@github.com/")
-	}
-	value = strings.Replace(value, "https://www.github.com/", "https://github.com/", 1)
-	value = strings.Replace(value, "http://github.com/", "https://github.com/", 1)
-	return value
 }
 
 func isScreenshotExtension(path string) bool {

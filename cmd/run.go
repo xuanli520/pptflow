@@ -17,6 +17,10 @@ func newRunCommand() *cobra.Command {
 		Use:   "run",
 		Short: "Run the Harbor factory workflow",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := loadHarborEnvironment(); err != nil {
+				return err
+			}
+			applyRunnerEnvironmentDefaults(&opts)
 			runner := app.NewRunner(opts)
 			summary, err := runner.Run(cmd.Context())
 			data, marshalErr := json.MarshalIndent(summary, "", "  ")
@@ -105,6 +109,9 @@ func applyRunnerEnvironmentDefaults(opts *app.RunnerOptions) {
 				break
 			}
 		}
+	}
+	if strings.TrimSpace(opts.GitHubToken) == "" {
+		opts.GitHubToken = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
 	}
 	fallbackBaseURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL"))
 	if strings.TrimSpace(opts.QwenHarborBaseURL) == "" {

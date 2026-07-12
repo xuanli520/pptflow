@@ -65,6 +65,17 @@ func GitHubPublicHTTPSURL(raw string) (string, bool) {
 	return "https://github.com/" + owner + "/" + repo + ".git", true
 }
 
+func Equivalent(a, b string) bool {
+	a = strings.Trim(strings.TrimSpace(a), "\"'")
+	b = strings.Trim(strings.TrimSpace(b), "\"'")
+	if a == b {
+		return true
+	}
+	aOwner, aRepo, aOK := GitHubOwnerRepo(a)
+	bOwner, bRepo, bOK := GitHubOwnerRepo(b)
+	return aOK && bOK && strings.EqualFold(aOwner, bOwner) && strings.EqualFold(aRepo, bRepo)
+}
+
 func GitHubOwnerRepo(raw string) (string, string, bool) {
 	raw = strings.TrimSpace(raw)
 	raw = strings.TrimSuffix(raw, ".git")
@@ -78,7 +89,14 @@ func GitHubOwnerRepo(raw string) (string, string, bool) {
 		return splitOwnerRepo(strings.TrimPrefix(raw, "git@github.com/"))
 	}
 	parsed, ok := parse(raw)
-	if !ok || !strings.EqualFold(parsed.Hostname(), "github.com") {
+	if !ok {
+		return "", "", false
+	}
+	host := parsed.Hostname()
+	if strings.EqualFold(host, "www.github.com") {
+		host = "github.com"
+	}
+	if !strings.EqualFold(host, "github.com") {
 		return "", "", false
 	}
 	if parsed.Port() != "" || parsed.RawQuery != "" || parsed.Fragment != "" {

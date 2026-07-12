@@ -29,6 +29,26 @@ func TestRunPassesValidDockerfileTask(t *testing.T) {
 	}
 }
 
+func TestRunAllowsWordsContainingLegacySubstrings(t *testing.T) {
+	taskDir := writeTask(t, false)
+	solution := filepath.Join(taskDir, "solution", "solve.sh")
+	raw, err := os.ReadFile(solution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, []byte("\n# Preserve the encoded representation and slider state.\n")...)
+	if err := os.WriteFile(solution, raw, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFail(report.Checks, "task_file_set_legacy") {
+		t.Fatalf("normal identifier substrings were rejected: %+v", report.Checks)
+	}
+}
+
 func TestRunRequiresRootTestsAnalysisFile(t *testing.T) {
 	taskDir := writeTask(t, false)
 	if err := os.Remove(filepath.Join(taskDir, "tests_analysis.md")); err != nil {
@@ -257,6 +277,21 @@ func TestRunAcceptsEquivalentSSHGitHubDockerfileURL(t *testing.T) {
 	}
 	if hasFail(report.Checks, "dockerfile_repo_match") || hasFail(report.Checks, "dockerfile_commit_match") {
 		t.Fatalf("equivalent git URL should pass repo/commit checks: %+v", report.Checks)
+	}
+}
+
+func TestRunAcceptsEquivalentTaskMetadataGitHubURL(t *testing.T) {
+	taskDir := writeTask(t, false)
+	report, err := Run(context.Background(), Options{
+		TaskDir: taskDir,
+		RepoURL: "https://github.com/org/repo.git",
+		Commit:  "abc1234",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFail(report.Checks, "task_toml_github_match") {
+		t.Fatalf("equivalent task metadata URL should pass: %+v", report.Checks)
 	}
 }
 

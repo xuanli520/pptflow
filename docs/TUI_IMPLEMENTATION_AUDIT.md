@@ -55,3 +55,14 @@
 - 只读模式隐藏不可用操作，并阻止写入。
 - 工作区刷新始终只安排一个后续 tick，避免重叠轮询。
 - 所有可破坏操作均经过显式确认。
+
+## Task Hub 扩展
+
+| 阶段 | 实现 | 验证 |
+|---|---|---|
+| SQLite 索引与文件同步 | `internal/harbor/store`；Task/Run CRUD、搜索排序、启动全量同步、运行中增量刷新、索引重建 | `store_test.go` 的 CRUD、嵌套目录、中文搜索、刷新与重建测试 |
+| 工作区中枢 | `workspace_hub.go`；默认入口、表格、搜索、排序、磁盘统计、空状态和 5 秒轮询 | `task_hub_test.go` 的默认入口、加载、空状态与排序测试 |
+| 恢复与只读查看 | `workspace_resume.go`；恢复、新建克隆、只读查看 | `TestHubResumeOverlaySupportsResumeAndReadOnly` |
+| 重跑与配置克隆 | `runconfig_overlay.go`、`workspace_clone.go`；选择性复用证据，新工作区独立生命周期 | `workspace_clone_test.go`、`TestHubRerunCloneStartsNewRunnerWithSelectedConfig` |
+| 删除和导航闭环 | 删除确认、Done 返回/重跑/预填新建、数字键 1–5、Hub/运行 Tab 切换 | `TestHubDeleteRemovesWorkspaceAndIndex`、`TestHubLoadsAndOpensTerminalWorkspaceThenReturns` |
+| CLI 配置 | `--workspace-root`、`--rescan` | `TestTUICommandExposesTaskHubFlags` 和发行二进制帮助输出核验 |

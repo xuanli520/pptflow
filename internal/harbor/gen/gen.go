@@ -17,6 +17,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/repourl"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
@@ -31,6 +32,14 @@ type Options struct {
 	Agent               workflow.AgentRuntime
 	Progress            func(nodeID, status, message, path string)
 	TaskReview          func(analysis domain.RepoAnalysis, proposal domain.TaskProposal, proposalPath string) error
+}
+
+type generatedFileWrite struct {
+	nodeID       string
+	taskPath     string
+	artifactPath string
+	content      string
+	mode         os.FileMode
 }
 
 func Run(ctx context.Context, opts Options) (domain.GenReport, error) {
@@ -215,7 +224,7 @@ func loadReusableRepoAnalysis(path string, prepared domain.RepoPrepared) (domain
 	if err := validateRepoAnalysis(analysis); err != nil {
 		return domain.RepoAnalysis{}, false
 	}
-	if strings.TrimSpace(analysis.RepoURL) != strings.TrimSpace(prepared.RepoURL) {
+	if !repourl.Equivalent(analysis.RepoURL, prepared.RepoURL) {
 		return domain.RepoAnalysis{}, false
 	}
 	if strings.TrimSpace(analysis.CommitSHA) != strings.TrimSpace(prepared.ResolvedCommit) {
@@ -234,7 +243,7 @@ func loadReusableTaskProposal(path string, prepared domain.RepoPrepared) (domain
 	if err := validateTaskProposal(proposal); err != nil {
 		return domain.TaskProposal{}, false
 	}
-	if strings.TrimSpace(proposal.GitHubLink) != strings.TrimSpace(prepared.RepoURL) {
+	if !repourl.Equivalent(proposal.GitHubLink, prepared.RepoURL) {
 		return domain.TaskProposal{}, false
 	}
 	if strings.TrimSpace(proposal.CommitSHA) != strings.TrimSpace(prepared.ResolvedCommit) {
@@ -252,7 +261,7 @@ func loadReusableTaskFiles(path string, prepared domain.RepoPrepared, proposal d
 	if err := validateTaskFiles(files); err != nil {
 		return domain.GeneratedTaskFiles{}, false
 	}
-	if strings.TrimSpace(files.RepoURL) != strings.TrimSpace(prepared.RepoURL) {
+	if !repourl.Equivalent(files.RepoURL, prepared.RepoURL) {
 		return domain.GeneratedTaskFiles{}, false
 	}
 	if strings.TrimSpace(files.CommitSHA) != strings.TrimSpace(prepared.ResolvedCommit) {
@@ -308,24 +317,7 @@ func materializeTask(opts Options, taskDir, testsAnalysisPath string, prepared d
 	if workspace == "" {
 		workspace = filepath.Join(".harbor-factory", "workspace")
 	}
-	for _, dir := range []string{
-		taskDir,
-		filepath.Join(taskDir, "environment"),
-		filepath.Join(taskDir, "solution"),
-		filepath.Join(taskDir, "tests"),
-		filepath.Dir(testsAnalysisPath),
-	} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	writes := []struct {
-		nodeID       string
-		taskPath     string
-		artifactPath string
-		content      string
-		mode         os.FileMode
-	}{
+	writes := []generatedFileWrite{
 		{nodes.InstructionGen, filepath.Join(taskDir, "instruction.md"), nodes.InstructionPath(workspace), ensureFinalNewline(files.InstructionMD), 0o644},
 		{nodes.TaskTOMLGen, filepath.Join(taskDir, "task.toml"), nodes.TaskTOMLPath(workspace), renderTaskTOML(proposal), 0o644},
 		{nodes.DockerfileGen, filepath.Join(taskDir, "environment", "Dockerfile"), nodes.DockerfilePath(workspace), renderDockerfile(prepared, proposal), 0o644},
@@ -333,36 +325,98 @@ func materializeTask(opts Options, taskDir, testsAnalysisPath string, prepared d
 		{nodes.TestGen, filepath.Join(taskDir, "tests", "test.sh"), nodes.TestPath(workspace), normalizeTestScript(files.TestSH), 0o755},
 		{nodes.TestsAnalysis, filepath.Join(taskDir, "tests_analysis.md"), testsAnalysisPath, ensureTestsAnalysis(files.TestsAnalysis, proposal), 0o644},
 	}
+	if err := validateGeneratedFileWrites(taskDir, writes); err != nil {
+		return err
+	}
+
+	taskDir = filepath.Clean(taskDir)
+	parent := filepath.Dir(taskDir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	stageDir, err := os.MkdirTemp(parent, "."+filepath.Base(taskDir)+".staging-")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if stageDir != "" {
+			_ = os.RemoveAll(stageDir)
+		}
+	}()
+
 	for _, write := range writes {
 		progress(opts, write.nodeID, "running", "writing "+filepath.Base(write.artifactPath), write.artifactPath)
 		if err := writeGeneratedFile(write.artifactPath, write.content, write.mode); err != nil {
 			progress(opts, write.nodeID, "failed", err.Error(), write.artifactPath)
 			return err
 		}
-		if write.taskPath != write.artifactPath {
-			if err := writeGeneratedFile(write.taskPath, write.content, write.mode); err != nil {
-				progress(opts, write.nodeID, "failed", err.Error(), write.taskPath)
-				return err
-			}
+		rel, err := filepath.Rel(taskDir, write.taskPath)
+		if err != nil {
+			progress(opts, write.nodeID, "failed", err.Error(), write.taskPath)
+			return err
+		}
+		stagePath := filepath.Join(stageDir, rel)
+		if err := writeGeneratedFile(stagePath, write.content, write.mode); err != nil {
+			progress(opts, write.nodeID, "failed", err.Error(), write.taskPath)
+			return err
 		}
 		progress(opts, write.nodeID, "succeeded", filepath.Base(write.artifactPath)+" written", write.artifactPath)
 	}
-	if err := validateMaterializedTaskDir(taskDir); err != nil {
+	if err := validateMaterializedTaskDir(stageDir); err != nil {
 		return err
+	}
+	if err := publishGeneratedTaskDir(stageDir, taskDir); err != nil {
+		return err
+	}
+	stageDir = ""
+	return nil
+}
+
+func validateGeneratedFileWrites(taskDir string, writes []generatedFileWrite) error {
+	for _, write := range writes {
+		rel, err := filepath.Rel(taskDir, write.taskPath)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if !taskpolicy.IsAllowedFile(rel) {
+			return fmt.Errorf("unexpected file in generated Harbor task directory: %s", rel)
+		}
+		if taskpolicy.ContainsLegacyDomain(rel) {
+			return fmt.Errorf("legacy non-Harbor domain file is not allowed in generated task: %s", rel)
+		}
+		if taskpolicy.ContainsLegacyDomain(write.content) {
+			return fmt.Errorf("legacy non-Harbor domain content is not allowed in generated task: %s", rel)
+		}
+	}
+	return nil
+}
+
+func publishGeneratedTaskDir(stageDir, taskDir string) error {
+	if _, err := os.Lstat(taskDir); os.IsNotExist(err) {
+		return os.Rename(stageDir, taskDir)
+	} else if err != nil {
+		return err
+	}
+
+	backupDir := stageDir + ".previous"
+	if err := os.Rename(taskDir, backupDir); err != nil {
+		return fmt.Errorf("preserve previous generated task: %w", err)
+	}
+	if err := os.Rename(stageDir, taskDir); err != nil {
+		restoreErr := os.Rename(backupDir, taskDir)
+		if restoreErr != nil {
+			return fmt.Errorf("publish generated task: %w; restore previous task: %v", err, restoreErr)
+		}
+		return fmt.Errorf("publish generated task: %w", err)
+	}
+	if err := os.RemoveAll(backupDir); err != nil {
+		return fmt.Errorf("remove previous generated task backup: %w", err)
 	}
 	return nil
 }
 
 func validateMaterializedTaskDir(taskDir string) error {
-	allowed := map[string]bool{
-		"instruction.md":                  true,
-		"task.toml":                       true,
-		"tests_analysis.md":               true,
-		"environment/Dockerfile":          true,
-		"environment/docker-compose.yaml": true,
-		"solution/solve.sh":               true,
-		"tests/test.sh":                   true,
-	}
 	return filepath.WalkDir(taskDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -385,31 +439,21 @@ func validateMaterializedTaskDir(taskDir string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("non-regular file is not allowed in generated Harbor task directory: %s", rel)
 		}
-		if !allowed[rel] {
+		if !taskpolicy.IsAllowedFile(rel) {
 			return fmt.Errorf("unexpected file in generated Harbor task directory: %s", rel)
 		}
-		if legacyDomainMatch(rel) {
+		if taskpolicy.ContainsLegacyDomain(rel) {
 			return fmt.Errorf("legacy non-Harbor domain file is not allowed in generated task: %s", rel)
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		if legacyDomainMatch(string(raw)) {
+		if taskpolicy.ContainsLegacyDomain(string(raw)) {
 			return fmt.Errorf("legacy non-Harbor domain content is not allowed in generated task: %s", rel)
 		}
 		return nil
 	})
-}
-
-func legacyDomainMatch(value string) bool {
-	lower := strings.ToLower(value)
-	for _, term := range []string{"pptflow", "promptflow", "image2", "powerpoint", "presentation", "slide"} {
-		if strings.Contains(lower, term) {
-			return true
-		}
-	}
-	return false
 }
 
 func writeGeneratedFile(path, content string, mode os.FileMode) error {
@@ -472,6 +516,19 @@ func validateTaskFiles(files domain.GeneratedTaskFiles) error {
 	}
 	if strings.TrimSpace(files.TestsAnalysis) == "" {
 		return fmt.Errorf("generated tests_analysis_md is required")
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "instruction_md", value: files.InstructionMD},
+		{name: "solve_sh", value: files.SolveSH},
+		{name: "test_sh", value: files.TestSH},
+		{name: "tests_analysis_md", value: files.TestsAnalysis},
+	} {
+		if taskpolicy.ContainsLegacyDomain(field.value) {
+			return fmt.Errorf("generated %s contains legacy non-Harbor domain content", field.name)
+		}
 	}
 	return nil
 }
@@ -608,7 +665,9 @@ func normalizeTestScript(content string) string {
 		"}",
 		"trap finish EXIT",
 		"",
+		"(",
 		body,
+		")",
 		"",
 	}, "\n")
 }

@@ -17,6 +17,7 @@ const (
 	confirmCancelRun
 	confirmQuit
 	confirmEditArtifact
+	confirmDeleteWorkspace
 )
 
 type ConfirmDialog struct {
@@ -85,8 +86,10 @@ func (h *helpOverlay) View(width, height int) string {
 		"Esc 返回        q/Ctrl+Q 退出  ? 关闭帮助",
 	}
 	switch h.view {
+	case viewHub:
+		lines = append(lines, "", "工作区：↑↓/j k 选择  Enter 打开  Ctrl+N 新建  Ctrl+R 重跑  Del 删除  s/S 排序  / 搜索")
 	case viewGate:
-		lines = append(lines, "", "审查：a 批准  r 拒绝  v 修订/刷新  Ctrl+N 备注  e 编辑工件")
+		lines = append(lines, "", "审查：↑↓/j k 滚动  PgUp/PgDn 翻页  Home/End 首尾  a 批准  r 拒绝  v 修订/刷新  Ctrl+N 备注  e 编辑工件")
 	case viewLogs:
 		lines = append(lines, "", "日志：↑↓/j k 滚动  PgUp/PgDn 翻页  Home/End 首尾  t 跟踪")
 	case viewStart:

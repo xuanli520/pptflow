@@ -28,6 +28,9 @@ func TestRunPassesReasonableTask(t *testing.T) {
 	if !report.OverallPass {
 		t.Fatalf("expected pass, got issues=%v warnings=%v checks=%+v", report.Issues, report.Warnings, report.Checks)
 	}
+	if report.TaskDigest == "" {
+		t.Fatal("quality report must bind to the reviewed task digest")
+	}
 	if !report.Checks["instruction_leak"].Passed || !report.Checks["solve_bypass"].Passed {
 		t.Fatalf("expected core checks pass: %+v", report.Checks)
 	}
@@ -154,6 +157,7 @@ func writeQualityTask(t *testing.T, unsafe bool) string {
 		"task.toml":              "schema_version = \"1.3\"\n\n[task]\nname = \"codeedge/sample\"\n",
 		"environment/Dockerfile": "FROM alpine\nRUN git clone https://github.com/org/repo /app/repo && cd /app/repo && git checkout abc1234\n",
 		"solution/solve.sh":      solve,
+		"tests_analysis.md":      "## 1. instruction 和 environment 已提供的信息\nok\n## 2. 模型的理论通过路径\nok\n## 3. 模型具备通过条件的依据\nok\n",
 		"tests/test.sh": strings.Join([]string{
 			"#!/usr/bin/env bash",
 			"set -euo pipefail",

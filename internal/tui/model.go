@@ -28,12 +28,14 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 
 type viewMode int
 
 const (
-	viewStart viewMode = iota
+	viewHub viewMode = iota
+	viewStart
 	viewOverview
 	viewGate
 	viewNodeDetail
@@ -98,10 +100,28 @@ const (
 )
 
 type model struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	runner *app.Runner
-	opts   app.RunnerOptions
+	ctx         context.Context
+	cancel      context.CancelFunc
+	runner      *app.Runner
+	opts        app.RunnerOptions
+	runtimeOpts app.RunnerOptions
+	store       *store.Store
+
+	hubRoot       string
+	hubScanRoots  []string
+	hubItems      []store.RunWithTask
+	hubRowPaths   []string
+	hubSort       store.SortColumn
+	hubSortAsc    bool
+	hubLoading    bool
+	hubFilter     string
+	hubSearching  bool
+	hubTotalSize  int64
+	hubLastSync   time.Time
+	hubTable      table.Model
+	hubSearch     textinput.Model
+	runConfig     *RunConfigOverlay
+	resumeOverlay *WorkspaceResumeOverlay
 
 	width  int
 	height int
@@ -140,6 +160,7 @@ type model struct {
 	notesInput       textarea.Model
 	searchInput      textinput.Model
 	detailViewport   viewport.Model
+	gateViewport     viewport.Model
 	overviewTable    table.Model
 	overviewRowIDs   []string
 	confirm          *ConfirmDialog
@@ -149,6 +170,7 @@ type model struct {
 	filter           string
 	pathSuggestions  []string
 	detailScroll     int
+	gateScroll       int
 }
 type fileSnapshot struct {
 	exists bool
@@ -157,19 +179,22 @@ type fileSnapshot struct {
 }
 
 func initialModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
+	opts = app.HydrateRuntimeOptions(opts)
 	opts.AutoApprove = false
 	runner := app.NewRunner(opts)
 	return initModelComponents(model{
-		ctx:    ctx,
-		cancel: cancel,
-		runner: runner,
-		opts:   opts,
-		view:   viewOverview,
-		nodes:  map[string]domain.RunnerEvent{},
+		ctx:         ctx,
+		cancel:      cancel,
+		runner:      runner,
+		opts:        opts,
+		runtimeOpts: app.ExtractRuntimeOptions(opts),
+		view:        viewOverview,
+		nodes:       map[string]domain.RunnerEvent{},
 	})
 }
 
 func initialStartModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
+	opts = app.HydrateRuntimeOptions(opts)
 	opts = applyStartDefaults(opts)
 	opts.AutoApprove = false
 	if strings.TrimSpace(opts.Workspace) == "" {
@@ -183,20 +208,41 @@ func initialStartModel(ctx context.Context, cancel context.CancelFunc, opts app.
 		mode = startGenerateTask
 	}
 	return initModelComponents(model{
-		ctx:        ctx,
-		cancel:     cancel,
-		opts:       opts,
-		view:       viewStart,
-		nodes:      map[string]domain.RunnerEvent{},
-		startMode:  mode,
-		startField: startFieldMode,
+		ctx:         ctx,
+		cancel:      cancel,
+		opts:        opts,
+		runtimeOpts: app.ExtractRuntimeOptions(opts),
+		view:        viewStart,
+		nodes:       map[string]domain.RunnerEvent{},
+		startMode:   mode,
+		startField:  startFieldMode,
+	})
+}
+
+func initialHubModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions, dataStore *store.Store, root string, scanRoots []string) model {
+	opts = app.HydrateRuntimeOptions(opts)
+	opts = applyStartDefaults(opts)
+	opts.AutoApprove = false
+	return initModelComponents(model{
+		ctx:          ctx,
+		cancel:       cancel,
+		opts:         opts,
+		runtimeOpts:  app.ExtractRuntimeOptions(opts),
+		store:        dataStore,
+		hubRoot:      root,
+		hubScanRoots: append([]string(nil), scanRoots...),
+		view:         viewHub,
+		nodes:        map[string]domain.RunnerEvent{},
+		hubSort:      store.SortByStartedAt,
 	})
 }
 
 func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
+	opts = app.HydrateRuntimeOptions(opts)
+	runtimeOpts := app.ExtractRuntimeOptions(opts)
 	if loaded, _, err := app.LoadRunnerOptions(defaultWorkspace(opts.Workspace)); err == nil {
 		loaded.AutoApprove = false
-		opts = loaded
+		opts = app.MergeRuntimeOptions(loaded, runtimeOpts)
 	}
 	opts.AutoApprove = false
 	summary, events := loadWorkspaceState(defaultWorkspace(opts.Workspace))
@@ -225,6 +271,7 @@ func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts 
 		ctx:          ctx,
 		cancel:       cancel,
 		opts:         opts,
+		runtimeOpts:  runtimeOpts,
 		view:         view,
 		events:       events,
 		nodes:        nodes,
@@ -347,11 +394,15 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = viewOverview
 		return m, nil
 	}
+	if !m.gateEditingNote && m.scrollGate(msg.String()) {
+		return m, nil
+	}
 	if m.readOnly {
 		switch msg.String() {
 		case "tab":
 			if idx, _, ok := m.selectedGateArtifact(); ok {
 				m.selectedArtifact = (idx + 1) % len(m.visibleGateArtifacts(m.activeGate))
+				m.gateScroll = 0
 			}
 		case "shift+tab":
 			m.selectPrevArtifact()
@@ -386,6 +437,7 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a", "ctrl+a":
 		if blockers := gateBlockingChecklist(m.activeGate.Checklist); len(blockers) > 0 {
 			m.err = fmt.Errorf("无法批准：存在未通过的关键检查项：%s", strings.Join(blockers, "；"))
+			m.gateScroll = 0
 			return m, nil
 		}
 		gate := m.activeGate
@@ -420,10 +472,15 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.notesInput.SetValue(m.gateNotes)
 		m.notesInput.Focus()
 		m.focusMgr.Push(focusGateNotes)
+		if m.syncGateViewport(m.activeGate) {
+			m.gateViewport.GotoBottom()
+			m.gateScroll = m.gateViewport.YOffset
+		}
 		return m, m.notesInput.Cursor.BlinkCmd()
 	case "tab":
 		if idx, _, ok := m.selectedGateArtifact(); ok {
 			m.selectedArtifact = (idx + 1) % len(m.visibleGateArtifacts(m.activeGate))
+			m.gateScroll = 0
 		}
 		return m, nil
 	case "shift+tab":
@@ -684,6 +741,9 @@ func editorCommand(path string) *exec.Cmd {
 
 func (m model) runWorkflow() tea.Cmd {
 	return func() tea.Msg {
+		if m.runner == nil {
+			return runnerDoneMsg{err: fmt.Errorf("runner is not configured")}
+		}
 		summary, err := m.runner.Run(m.ctx)
 		return runnerDoneMsg{summary: summary, err: err}
 	}
@@ -691,6 +751,9 @@ func (m model) runWorkflow() tea.Cmd {
 
 func (m model) waitEvent() tea.Cmd {
 	return func() tea.Msg {
+		if m.runner == nil {
+			return nil
+		}
 		event, ok := <-m.runner.Events()
 		if !ok {
 			return nil
@@ -700,6 +763,9 @@ func (m model) waitEvent() tea.Cmd {
 }
 
 func (m model) refreshWorkspace() tea.Cmd {
+	if m.runner == nil && m.opts.Workspace == "" {
+		return nil
+	}
 	workspace := defaultWorkspace(m.opts.Workspace)
 	return tea.Tick(time.Second, func(time.Time) tea.Msg {
 		summary, events := loadWorkspaceState(workspace)
@@ -721,6 +787,7 @@ func (m *model) applyRunnerEvent(event domain.RunnerEvent) {
 		m.gateEditingNote = false
 		m.editedFiles = map[string]string{}
 		m.selectedArtifact = 0
+		m.gateScroll = 0
 		m.err = nil
 		m.view = viewGate
 		return
@@ -753,6 +820,9 @@ func (m *model) applyWorkspaceSnapshot(summary domain.RunSummary, events []domai
 		m.selectedNode = firstNodeID(m.nodes)
 	}
 	m.done = !summary.FinishedAt.IsZero() || summary.Status == "succeeded" || summary.Status == "failed"
+	if m.view == viewHub {
+		return
+	}
 	if m.done && m.view != viewNodeDetail && m.view != viewLogs {
 		m.view = viewDone
 	} else if m.activeGate != nil && m.view != viewNodeDetail && m.view != viewLogs {
@@ -769,6 +839,7 @@ func (m *model) resetGateLocalState() {
 	m.notesInput.Blur()
 	m.editedFiles = nil
 	m.selectedArtifact = 0
+	m.gateScroll = 0
 }
 
 func activeGateFromSnapshot(summary domain.RunSummary, events []domain.RunnerEvent, nodeEvents map[string]domain.RunnerEvent) *domain.GateRequest {
@@ -850,7 +921,12 @@ func isTerminalRunSummary(summary domain.RunSummary) bool {
 
 func (m model) header() string {
 	title := titleStyle.Render("Harbor 出题工坊")
-	context := redactUI(fmt.Sprintf("工作区=%s 任务=%s 仓库=%s", emptyDash(m.opts.Workspace), emptyDash(m.opts.TaskDir), emptyDash(m.opts.RepoURL)))
+	context := ""
+	if m.view == viewHub {
+		context = redactUI(fmt.Sprintf("工作区根=%s  已索引=%d", emptyDash(m.hubRoot), len(m.hubItems)))
+	} else {
+		context = redactUI(fmt.Sprintf("工作区=%s 任务=%s 仓库=%s", emptyDash(m.opts.Workspace), emptyDash(m.opts.TaskDir), emptyDash(m.opts.RepoURL)))
+	}
 	if m.width > 0 {
 		context = truncateDisplay(context, maxInt(20, m.width))
 	}
@@ -1332,8 +1408,9 @@ func requireReadableDir(label, path string) error {
 }
 
 func (m model) startRunner(opts app.RunnerOptions) model {
-	opts.AutoApprove = false
+	opts = app.MergeRuntimeOptions(opts, m.runtimeOpts)
 	m.opts = opts
+	m.runtimeOpts = app.ExtractRuntimeOptions(opts)
 	m.runner = app.NewRunner(opts)
 	m.view = viewOverview
 	m.events = nil
@@ -1502,6 +1579,7 @@ func (m *model) selectPrevArtifact() {
 		artifacts := m.visibleGateArtifacts(m.activeGate)
 		if len(artifacts) > 0 {
 			m.selectedArtifact = (m.selectedArtifact - 1 + len(artifacts)) % len(artifacts)
+			m.gateScroll = 0
 		}
 	}
 }

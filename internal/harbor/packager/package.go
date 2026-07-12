@@ -18,6 +18,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/repourl"
 	"github.com/purplevoid/harbor-factory/internal/harbor/secretscan"
 	similaritycheck "github.com/purplevoid/harbor-factory/internal/harbor/similarity"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 )
 
 type Options struct {
@@ -266,7 +267,7 @@ func ensureNoEvidenceLegacy(label, path string) error {
 	if err != nil {
 		return fmt.Errorf("%s cannot be read for legacy residue scan: %w", label, err)
 	}
-	if legacyDomainMatch(string(raw)) {
+	if taskpolicy.ContainsLegacyDomain(string(raw)) {
 		return fmt.Errorf("%s contains legacy non-Harbor domain content", label)
 	}
 	return nil
@@ -532,18 +533,18 @@ func validatePackageFileSet(taskDir string) error {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if !isAllowedPackageFile(rel) {
+		if !taskpolicy.IsAllowedFile(rel) {
 			return fmt.Errorf("unexpected file in Harbor package: %s", rel)
 		}
 		seen[rel] = true
-		if legacyDomainMatch(rel) {
+		if taskpolicy.ContainsLegacyDomain(rel) {
 			return fmt.Errorf("legacy non-Harbor domain file is not allowed in package: %s", rel)
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		if legacyDomainMatch(string(raw)) {
+		if taskpolicy.ContainsLegacyDomain(string(raw)) {
 			return fmt.Errorf("legacy non-Harbor domain content is not allowed in package: %s", rel)
 		}
 		return nil
@@ -556,37 +557,6 @@ func validatePackageFileSet(taskDir string) error {
 		}
 	}
 	return nil
-}
-
-func legacyDomainMatch(value string) bool {
-	lower := strings.ToLower(value)
-	for _, term := range []string{
-		"pptflow",
-		"promptflow",
-		"image2",
-		"powerpoint",
-		"presentation",
-		"slide",
-	} {
-		if strings.Contains(lower, term) {
-			return true
-		}
-	}
-	return false
-}
-
-func isAllowedPackageFile(rel string) bool {
-	switch rel {
-	case "instruction.md",
-		"task.toml",
-		"tests_analysis.md",
-		"environment/Dockerfile",
-		"environment/docker-compose.yaml",
-		"solution/solve.sh",
-		"tests/test.sh":
-		return true
-	}
-	return false
 }
 
 func requiredPackageFiles() []string {
@@ -1223,7 +1193,7 @@ func writeZip(taskDir, taskName, zipPath string) error {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if !isAllowedPackageFile(rel) {
+		if !taskpolicy.IsAllowedFile(rel) {
 			return fmt.Errorf("unexpected file in Harbor package: %s", rel)
 		}
 		name := filepath.ToSlash(filepath.Join(taskName, rel))

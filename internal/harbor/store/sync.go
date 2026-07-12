@@ -172,6 +172,53 @@ func (s *Store) SyncFromFilesystem(ctx context.Context, rootDirs []string) error
 	return s.CleanOrphanTasks()
 }
 
+// RefreshRunning updates volatile status fields for indexed non-terminal runs
+// without rescanning directory sizes or unrelated completed workspaces.
+func (s *Store) RefreshRunning(ctx context.Context) error {
+	paths, err := s.runningWorkspacePaths()
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		indexed, err := s.GetRunByWorkspace(path)
+		if err != nil {
+			return err
+		}
+		if indexed == nil {
+			continue
+		}
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			if err := s.DeleteRunByWorkspace(path); err != nil {
+				return err
+			}
+			continue
+		}
+		workspace, err := status.ReadWorkspace(path)
+		if err != nil {
+			continue
+		}
+		if err := s.UpsertRun(Run{
+			TaskID:        indexed.TaskID,
+			WorkspacePath: workspace.Workspace,
+			RunID:         workspace.RunID,
+			Status:        workspace.Status,
+			Passed:        workspace.Passed,
+			StartedAt:     workspace.StartedAt,
+			FinishedAt:    workspace.FinishedAt,
+			IsActive:      workspace.Active,
+			IsResumable:   workspace.Resumable,
+		}); err != nil {
+			return err
+		}
+	}
+	return s.CleanOrphanTasks()
+}
+
 // DefaultRootDirs returns the default workspace scan roots.
 func DefaultRootDirs() []string {
 	return []string{".harbor-factory"}

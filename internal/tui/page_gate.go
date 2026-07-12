@@ -4,7 +4,8 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 )
 
 type gatePage struct{ pageBase }
@@ -30,7 +31,7 @@ func (p *gatePage) View(width, height int) string {
 	return p.m.gateView()
 }
 
-func (m model) gateView() string {
+func (m *model) gateView() string {
 	gate := m.activeGate
 	if gate == nil && m.confirm != nil {
 		gate = m.confirm.Gate
@@ -38,6 +39,56 @@ func (m model) gateView() string {
 	if gate == nil {
 		return panelStyle.Width(contentWidth(m.width)).Render("暂无活跃审查关卡")
 	}
+	m.syncGateViewport(gate)
+	body := m.gateViewport.View()
+	if gateViewportShowsIndicator(m.gateViewport.Height, m.gatePanelInnerHeight()) {
+		body += "\n" + scrollIndicator(m.gateViewport.YOffset, m.gateViewport.Height, m.gateViewport.TotalLineCount())
+	}
+	return panelStyle.Width(contentWidth(m.width)).Render(body)
+}
+
+func (m *model) syncGateViewport(gate *domain.GateRequest) bool {
+	if gate == nil {
+		return false
+	}
+	innerHeight := m.gatePanelInnerHeight()
+	viewportHeight := innerHeight
+	if innerHeight >= 2 {
+		viewportHeight--
+	}
+	viewportWidth := maxInt(1, contentWidth(m.width)-panelStyle.GetHorizontalFrameSize())
+	m.gateViewport.Width = viewportWidth
+	m.gateViewport.Height = maxInt(1, viewportHeight)
+	m.gateViewport.MouseWheelEnabled = true
+	m.gateViewport.MouseWheelDelta = 3
+	content := lipgloss.NewStyle().Width(viewportWidth).MaxWidth(viewportWidth).Render(m.gateContent(gate))
+	m.gateViewport.SetContent(content)
+	m.gateViewport.SetYOffset(m.gateScroll)
+	m.gateScroll = m.gateViewport.YOffset
+	return true
+}
+
+func (m model) gatePanelInnerHeight() int {
+	height := m.height
+	if height <= 0 {
+		height = 24
+	}
+	chromeHeight := lipgloss.Height(m.header()) + lipgloss.Height(m.footer())
+	if status := m.statusBar(); status != "" {
+		chromeHeight += lipgloss.Height(status)
+	}
+	if toast := m.renderToast(); toast != "" {
+		chromeHeight += lipgloss.Height(toast)
+	}
+	panelHeight := maxInt(panelStyle.GetVerticalFrameSize()+1, height-chromeHeight)
+	return maxInt(1, panelHeight-panelStyle.GetVerticalFrameSize())
+}
+
+func gateViewportShowsIndicator(viewportHeight, innerHeight int) bool {
+	return innerHeight >= 2 && viewportHeight < innerHeight
+}
+
+func (m model) gateContent(gate *domain.GateRequest) string {
 	var lines []string
 	lines = append(lines, sectionStyle.Render(localizeGate(gate.GateID, gate.GateName)))
 	if strings.TrimSpace(m.filter) != "" {
@@ -55,12 +106,11 @@ func (m model) gateView() string {
 		artifact := artifacts[idx]
 		artifactLines = append(artifactLines, sectionStyle.Render(localizeCount(idx+1, len(artifacts))+"："+redactUI(artifact.Name)))
 		artifactLines = append(artifactLines, subtleStyle.Render(redactUI(artifact.Path)))
-		previewLines := 14
-		layout := layoutFor(m.width, m.height)
-		if layout.Mode == layoutWide || layout.Mode == layoutMedium {
-			previewLines = maxInt(8, layout.ContentHeight-8)
+		content := m.artifactContent(artifact)
+		if strings.TrimSpace(content) == "" {
+			content = subtleStyle.Render("（内容为空或不可用）")
 		}
-		artifactLines = append(artifactLines, trimLines(m.artifactContent(artifact), previewLines))
+		artifactLines = append(artifactLines, content)
 	} else {
 		artifactLines = append(artifactLines, subtleStyle.Render("当前关卡没有工件"))
 	}
@@ -76,16 +126,29 @@ func (m model) gateView() string {
 	} else if m.gateNotes != "" {
 		lines = append(lines, "审查备注："+redactUI(m.gateNotes))
 	}
-	if m.readOnly {
-		lines = append(lines, subtleStyle.Render("只读快照  [Tab] 下一个工件  [1] 总览  [3] 日志"))
-		return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) scrollGate(key string) bool {
+	if !m.syncGateViewport(m.activeGate) {
+		return false
 	}
-	actions := "[a/Ctrl+A] 批准  [r/Ctrl+R] 拒绝"
-	if gate.GateID == nodes.FinalReview {
-		actions += "  [v] 修订并重新运行检查"
-	} else if gate.GateID == nodes.ResultReview {
-		actions += "  [v] 刷新截图证据"
+	switch key {
+	case "j", "down":
+		m.gateViewport.LineDown(1)
+	case "k", "up":
+		m.gateViewport.LineUp(1)
+	case "pgdown":
+		m.gateViewport.PageDown()
+	case "pgup":
+		m.gateViewport.PageUp()
+	case "home", "g":
+		m.gateViewport.GotoTop()
+	case "end", "G":
+		m.gateViewport.GotoBottom()
+	default:
+		return false
 	}
-	lines = append(lines, subtleStyle.Render(actions+"  [Ctrl+N] 备注  [e] 编辑工件  [Tab] 下一工件"))
-	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
+	m.gateScroll = m.gateViewport.YOffset
+	return true
 }

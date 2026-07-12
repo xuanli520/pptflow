@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -9,6 +10,10 @@ import (
 )
 
 func (m model) Init() tea.Cmd {
+	if m.view == viewHub {
+		m.hubLoading = true
+		return tea.Batch(m.loadHub(true), hubPollCmd())
+	}
 	if m.view == viewStart {
 		return nil
 	}
@@ -29,7 +34,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		if m.done || m.view == viewStart {
+		if m.done || m.view == viewStart || m.view == viewHub {
 			return m, nil
 		}
 		return m, cmd
@@ -101,6 +106,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		m.done = true
 		m.view = viewDone
+		if m.store != nil {
+			return m, m.loadHub(true)
+		}
 		return m, nil
 	case workspaceRefreshMsg:
 		m.applyWorkspaceSnapshot(msg.summary, msg.events)
@@ -108,6 +116,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.refreshWorkspace()
+	case hubLoadedMsg:
+		if msg.err != nil {
+			m.hubLoading = false
+			m.err = msg.err
+			return m, nil
+		}
+		m.err = nil
+		m.applyHubItems(msg.items)
+		return m, nil
+	case hubPollMsg:
+		if m.view == viewHub {
+			m.hubLoading = true
+			return m, tea.Batch(m.refreshRunningHub(), hubPollCmd())
+		}
+		return m, hubPollCmd()
+	case hubSearchMsg:
+		if m.hubSearching && strings.TrimSpace(m.hubSearch.Value()) == msg.query {
+			m.hubFilter = msg.query
+			m.hubLoading = true
+			return m, m.loadHub(false)
+		}
+		return m, nil
+	case workspaceDeletedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.notice = "已删除工作区：" + msg.path
+		m.hubLoading = true
+		return m, tea.Batch(m.showToast("工作区已删除", toastSuccess), m.loadHub(true))
+	case clonePreparedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			if m.runConfig != nil {
+				m.runConfig.Loading = false
+			}
+			return m, nil
+		}
+		m.closeRunConfig()
+		m = m.startRunner(msg.opts)
+		m.setView(viewOverview)
+		m.notice = fmt.Sprintf("已从 %s 创建新工作区。", msg.manifest.SourceWorkspace)
+		return m, tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
 	}
 	return m, nil
 }

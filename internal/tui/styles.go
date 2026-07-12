@@ -44,12 +44,14 @@ var defaultTheme = newTheme()
 // Compatibility aliases keep business/render helpers small while all style
 // definitions still come from the theme.
 var (
-	titleStyle    = defaultTheme.Title
-	subtleStyle   = defaultTheme.Help
-	sectionStyle  = defaultTheme.Section
-	passStyle     = lipgloss.NewStyle().Foreground(defaultTheme.Success)
-	warnStyle     = lipgloss.NewStyle().Foreground(defaultTheme.Warning)
-	failStyle     = lipgloss.NewStyle().Foreground(defaultTheme.Error)
-	panelStyle    = defaultTheme.Panel
-	selectedStyle = defaultTheme.Selected
+	titleStyle         = defaultTheme.Title
+	subtleStyle        = defaultTheme.Help
+	sectionStyle       = defaultTheme.Section
+	passStyle          = lipgloss.NewStyle().Foreground(defaultTheme.Success)
+	warnStyle          = lipgloss.NewStyle().Foreground(defaultTheme.Warning)
+	failStyle          = lipgloss.NewStyle().Foreground(defaultTheme.Error)
+	panelStyle         = defaultTheme.Panel
+	selectedStyle      = defaultTheme.Selected
+	activeIconStyle    = lipgloss.NewStyle().Foreground(defaultTheme.Primary)
+	resumableIconStyle = lipgloss.NewStyle().Foreground(defaultTheme.Warning)
 )

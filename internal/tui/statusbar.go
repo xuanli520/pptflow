@@ -3,7 +3,7 @@ package tui
 import "time"
 
 func (m model) statusBar() string {
-	if m.view == viewStart {
+	if m.view == viewStart || m.view == viewHub {
 		return ""
 	}
 	status := localizeStatus(m.summary.Status)

@@ -245,6 +245,7 @@ func TrialResult(result domain.TrialResult) domain.TrialResult {
 
 func QualityReport(report domain.QualityReport) domain.QualityReport {
 	report.TaskDir = Text(report.TaskDir)
+	report.TaskDigest = Text(report.TaskDigest)
 	if report.Checks != nil {
 		checks := make(map[string]domain.QualityCheck, len(report.Checks))
 		for key, check := range report.Checks {

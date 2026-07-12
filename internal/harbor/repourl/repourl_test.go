@@ -87,3 +87,24 @@ func TestGitHubPublicHTTPSURL(t *testing.T) {
 		t.Fatalf("GitHubPublicHTTPSURL should reject port-qualified SSH URL, got %q %v", got, ok)
 	}
 }
+
+func TestEquivalentGitHubRepoURLs(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"https://github.com/org/repo", "https://github.com/org/repo.git"},
+		{"https://www.github.com/Org/Repo/", "git@github.com:org/repo.git"},
+		{"http://github.com/org/repo", "ssh://git@github.com/org/repo.git"},
+		{"'/tmp/local/repo'", "/tmp/local/repo"},
+	} {
+		if !Equivalent(pair[0], pair[1]) {
+			t.Errorf("expected equivalent repository URLs: %q and %q", pair[0], pair[1])
+		}
+	}
+	for _, pair := range [][2]string{
+		{"https://github.com/org/repo", "https://github.com/org/other"},
+		{"https://github.com/org/repo", "https://gitlab.com/org/repo"},
+	} {
+		if Equivalent(pair[0], pair[1]) {
+			t.Errorf("unexpected equivalent repository URLs: %q and %q", pair[0], pair[1])
+		}
+	}
+}

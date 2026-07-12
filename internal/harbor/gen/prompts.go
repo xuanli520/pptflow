@@ -100,6 +100,9 @@ task_proposal:
 2. 所有脚本默认工作目录是 /app/repo。
 3. 不要让 test_sh 依赖外网、私有 token、当前时间或随机数。
 4. 不要在 test_sh 中泄露 solve_sh 的完整实现细节。
+5. test_sh 使用的精确公开类型名、错误类型名和配置 API 必须在 instruction_md 中明确声明，不能把它们作为隐藏契约。
+6. instruction_md 若同时要求 Layer API 和直接 Service API，test_sh 必须分别覆盖两条公开配置路径。
+7. test_sh 可以设置清理 trap；系统会将脚本主体放入子 shell，清理逻辑不得写入或覆盖 /logs/verifier/reward 的父级 EXIT trap。
 
 只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。schema 必须是:
 {

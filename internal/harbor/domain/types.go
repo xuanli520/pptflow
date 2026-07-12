@@ -251,6 +251,7 @@ type QualityCheck struct {
 type QualityReport struct {
 	SchemaVersion     string                  `json:"schema_version"`
 	TaskDir           string                  `json:"task_dir"`
+	TaskDigest        string                  `json:"task_digest,omitempty"`
 	Checks            map[string]QualityCheck `json:"checks"`
 	OverallPass       bool                    `json:"overall_pass"`
 	Warnings          []string                `json:"warnings,omitempty"`

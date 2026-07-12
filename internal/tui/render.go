@@ -10,6 +10,7 @@ func (m *model) bindPages() {
 	if m.router == nil {
 		m.router = newPageRouter(m.view)
 	}
+	m.router.Register(viewHub, &hubPage{pageBase{m: m}})
 	m.router.Register(viewStart, &startPage{pageBase{m: m}})
 	m.router.Register(viewOverview, &overviewPage{pageBase{m: m}})
 	m.router.Register(viewGate, &gatePage{pageBase{m: m}})
@@ -31,6 +32,14 @@ func renderFrame(m model, body string) string {
 	}
 	if m.confirm != nil {
 		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.confirm.View(m.width, maxInt(8, m.height-3)), m.footer())
+		return strings.TrimRight(frame, "\n") + "\n"
+	}
+	if m.resumeOverlay != nil {
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.resumeOverlay.View(m.width, maxInt(8, m.height-3)), m.footer())
+		return strings.TrimRight(frame, "\n") + "\n"
+	}
+	if m.runConfig != nil {
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.runConfig.View(m.width, maxInt(8, m.height-3)), m.footer())
 		return strings.TrimRight(frame, "\n") + "\n"
 	}
 	parts := []string{m.header(), body}

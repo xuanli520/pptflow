@@ -270,6 +270,7 @@ func TestRunnerWriteStateRedactsSummary(t *testing.T) {
 }
 
 func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) {
+	clearClaudeEnvironment(t)
 	workspace := t.TempDir()
 	secret := "raw-run-options-secret"
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", secret)
@@ -324,6 +325,7 @@ func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) 
 	if findings := secretscan.ScanBytes("run_options.json", raw); len(findings) > 0 {
 		t.Fatalf("run_options.json should not trigger secret scanner: %+v\n%s", findings, text)
 	}
+	t.Setenv("ANTHROPIC_BASE_URL", "")
 
 	loaded, loadedSnapshot, err := LoadRunnerOptions(workspace)
 	if err != nil {
@@ -335,7 +337,7 @@ func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) 
 	if loaded.GitHubToken != "" || loaded.VerifyExec != nil || loaded.Agent != nil {
 		t.Fatalf("loaded options restored sensitive/unsupported fields: %+v", loaded)
 	}
-	wantAgentEnv := []string{"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}", "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}"}
+	wantAgentEnv := []string{"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}", "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}"}
 	if strings.Join(loaded.HarborAgentEnv, "\n") != strings.Join(wantAgentEnv, "\n") {
 		t.Fatalf("loaded options did not restore safe environment templates: got=%q want=%q", loaded.HarborAgentEnv, wantAgentEnv)
 	}
@@ -454,6 +456,7 @@ func TestRunnerLabelsRecoveredRunAndNodeReuseBoundary(t *testing.T) {
 }
 
 func TestRunnerRejectsClaudeHarborRunWithoutContainerCredential(t *testing.T) {
+	clearClaudeEnvironment(t)
 	runner := NewRunner(RunnerOptions{TaskDir: writeRunnerTask(t), Workspace: t.TempDir(), RunHarbor: true, AutoApprove: true})
 	summary, err := runner.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "host Claude OAuth is not inherited") {
@@ -462,6 +465,7 @@ func TestRunnerRejectsClaudeHarborRunWithoutContainerCredential(t *testing.T) {
 }
 
 func TestRunnerRejectsClaudeHarborRunWithUnresolvedCredentialTemplate(t *testing.T) {
+	clearClaudeEnvironment(t)
 	t.Setenv("MISSING_HARBOR_TOKEN", "")
 	runner := NewRunner(RunnerOptions{
 		TaskDir:        writeRunnerTask(t),
@@ -650,6 +654,25 @@ func TestGeneratedTaskChecklistBlocksDirtyLegacyOutput(t *testing.T) {
 	joined := strings.Join(blockers, "\n")
 	if !strings.Contains(joined, "unexpected files") || !strings.Contains(joined, "legacy residue") {
 		t.Fatalf("expected dirty output blockers, got items=%+v blockers=%v", items, blockers)
+	}
+}
+
+func TestGeneratedTaskChecklistAllowsWordsContainingLegacySubstrings(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	solution := filepath.Join(taskDir, "solution", "solve.sh")
+	raw, err := os.ReadFile(solution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(solution, append(raw, []byte("\n# encoded representation and slider state\n")...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	extras, legacy, err := generatedTaskResidue(taskDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extras) != 0 || len(legacy) != 0 {
+		t.Fatalf("normal identifier substrings were rejected: extras=%v legacy=%v", extras, legacy)
 	}
 }
 
@@ -1110,12 +1133,59 @@ func TestRunnerQualityCheckPersistsReport(t *testing.T) {
 	if summary.QualityReport == nil || !summary.QualityReport.OverallPass {
 		t.Fatalf("unexpected quality report: %+v", summary.QualityReport)
 	}
+	if summary.QualityReport.TaskDigest == "" {
+		t.Fatal("quality report must include the reviewed task digest")
+	}
 	qualityPath := filepath.Join(workspace, "phase2", "artifacts", "quality_check", "quality_report.json")
 	if _, err := os.Stat(qualityPath); err != nil {
 		t.Fatalf("missing quality report: %v", err)
 	}
 	if !eventSeen(summary.Events, "quality_check", "succeeded") {
 		t.Fatalf("quality_check event missing: %+v", summary.Events)
+	}
+}
+
+func TestLoadReusableQualityReportRequiresCurrentTaskDigest(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	digest, err := harborrun.ComputeTaskDigest(taskDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportPath := filepath.Join(t.TempDir(), "quality_report.json")
+	writeReport := func(taskDigest string) {
+		t.Helper()
+		report := domain.QualityReport{
+			SchemaVersion: "harbor.quality_report.v1",
+			TaskDir:       taskDir,
+			TaskDigest:    taskDigest,
+			Checks:        map[string]domain.QualityCheck{},
+			OverallPass:   true,
+			CreatedAt:     time.Now().UTC(),
+		}
+		raw, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(reportPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeReport("")
+	if _, ok := loadReusableQualityReport(taskDir, reportPath); ok {
+		t.Fatal("legacy quality report without task_digest must not be reused")
+	}
+
+	writeReport(digest)
+	if _, ok := loadReusableQualityReport(taskDir, reportPath); !ok {
+		t.Fatal("quality report with the current task digest should be reusable")
+	}
+
+	if err := os.WriteFile(filepath.Join(taskDir, "instruction.md"), []byte("changed task instruction\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loadReusableQualityReport(taskDir, reportPath); ok {
+		t.Fatal("quality report must not be reused after task content changes")
 	}
 }
 

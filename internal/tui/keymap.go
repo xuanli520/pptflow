@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
@@ -15,6 +16,8 @@ func (m *model) setView(view viewMode) {
 		m.router.SwitchTo(view)
 	}
 	switch view {
+	case viewHub:
+		m.focusMgr.SetCurrent(focusPage)
 	case viewStart:
 		m.focusMgr.SetCurrent(focusStartField)
 	case viewOverview:
@@ -39,6 +42,9 @@ func (m *model) cyclePage(delta int) {
 	if m.done {
 		pages = append(pages, viewDone)
 	}
+	if m.store != nil {
+		pages = append(pages, viewHub)
+	}
 	idx := 0
 	for i, p := range pages {
 		if p == m.view {
@@ -51,6 +57,12 @@ func (m *model) cyclePage(delta int) {
 
 func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	key := msg.String()
+	if m.runConfig != nil {
+		return true, m.updateRunConfigKey(msg)
+	}
+	if m.resumeOverlay != nil {
+		return true, m.updateResumeKey(msg)
+	}
 	if m.helpVisible {
 		if key == "?" || key == "esc" || key == "q" {
 			m.helpVisible = false
@@ -79,6 +91,9 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			m.focusMgr.Push(focusOverlay)
 			return true, nil
 		}
+		if key == "esc" && m.startStep == startStepBasic && m.store != nil {
+			return true, m.returnToHub()
+		}
 		return false, nil
 	}
 	switch key {
@@ -94,20 +109,24 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			m.beginSearch()
 			return true, nil
 		}
-	case "ctrl+o", "1":
+	case "1":
+		if m.store != nil {
+			return true, m.returnToHub()
+		}
+	case "ctrl+o", "2":
 		m.setView(viewOverview)
 		return true, nil
-	case "ctrl+g":
+	case "ctrl+g", "3":
 		if m.activeGate != nil {
 			m.setView(viewGate)
 		} else {
 			return true, m.showToast("当前没有活跃审查关卡", toastWarning)
 		}
 		return true, nil
-	case "ctrl+d":
+	case "ctrl+d", "4":
 		m.setView(viewNodeDetail)
 		return true, nil
-	case "ctrl+l":
+	case "ctrl+l", "5":
 		m.setView(viewLogs)
 		return true, nil
 	case "ctrl+e":
@@ -137,9 +156,15 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, m.requestQuit()
 		}
 	case "esc":
-		if m.view != viewOverview && m.view != viewStart {
+		if m.view == viewDone && m.store != nil {
+			return true, m.returnToHub()
+		}
+		if m.view != viewOverview && m.view != viewStart && m.view != viewHub {
 			m.setView(viewOverview)
 			return true, nil
+		}
+		if m.view == viewOverview && m.store != nil {
+			return true, m.returnToHub()
 		}
 	case "shift+tab":
 		if m.view == viewOverview || m.view == viewDone {
@@ -151,6 +176,16 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 }
 
 func (m *model) requestQuit() tea.Cmd {
+	if m.view == viewHub && m.runner == nil {
+		for _, item := range m.hubItems {
+			if item.Run.IsActive {
+				m.openConfirm(newConfirmDialog(confirmQuit, "确认退出", "仍有运行中的工作区。退出不会停止其他 Factory 进程，是否继续？"))
+				return func() tea.Msg { return confirmOpenedMsg{} }
+			}
+		}
+		m.cancelRun()
+		return tea.Quit
+	}
 	if m.done || m.readOnly || m.view == viewStart {
 		m.cancelRun()
 		return tea.Quit
@@ -204,6 +239,23 @@ func (m *model) updateConfirmKey(msg tea.KeyMsg) tea.Cmd {
 		return tea.Quit
 	case confirmEditArtifact:
 		return openEditorCmd(d.Path)
+	case confirmDeleteWorkspace:
+		path := d.Path
+		dataStore := m.store
+		return func() tea.Msg {
+			if err := os.RemoveAll(path); err != nil {
+				return workspaceDeletedMsg{path: path, err: err}
+			}
+			if dataStore != nil {
+				if err := dataStore.DeleteRunByWorkspace(path); err != nil {
+					return workspaceDeletedMsg{path: path, err: err}
+				}
+				if err := dataStore.CleanOrphanTasks(); err != nil {
+					return workspaceDeletedMsg{path: path, err: err}
+				}
+			}
+			return workspaceDeletedMsg{path: path}
+		}
 	}
 	return nil
 }
@@ -268,12 +320,23 @@ func (m *model) updateSearchKey(msg tea.KeyMsg) tea.Cmd {
 	var cmd tea.Cmd
 	m.searchInput, cmd = m.searchInput.Update(msg)
 	m.filter = m.searchInput.Value()
+	if m.view == viewGate {
+		m.gateScroll = 0
+	}
 	return cmd
 }
 
 func (m model) footer() string {
+	if m.runConfig != nil {
+		return subtleStyle.Render("[Tab/↑↓ 切换] [Space 开关] [Enter 开始重跑] [Esc 取消]")
+	}
+	if m.resumeOverlay != nil {
+		return subtleStyle.Render("[R 恢复运行] [N 新建运行] [V 只读查看] [Enter 确认] [Esc 取消]")
+	}
 	var text string
 	switch m.view {
+	case viewHub:
+		text = "[↑↓ 选择] [Enter 打开] [Ctrl+N 新建] [Ctrl+R 重跑] [Del 删除] [s/S 排序] [/ 搜索] [q 退出] [? 帮助]"
 	case viewStart:
 		if m.startStep == startStepBasic {
 			text = "[Tab/↓ 下一字段] [Shift+Tab/↑ 上一字段] [Space 切换模式] [Ctrl+Space 路径补全] [Enter 下一步] [Ctrl+Q 退出]"
@@ -282,9 +345,9 @@ func (m model) footer() string {
 		}
 	case viewGate:
 		if m.readOnly {
-			text = "[Tab 下一工件] [Esc 返回] [Ctrl+L 日志] [q 退出] （只读）"
+			text = "[↑↓/j k 滚动] [PgUp/PgDn 翻页] [Home/End 首尾] [Tab 下一工件] [Esc 返回] [Ctrl+L 日志] [q 退出] （只读）"
 		} else {
-			text = "[Ctrl+A/a 批准] [Ctrl+R/r 拒绝]"
+			text = "[↑↓/j k 滚动] [PgUp/PgDn 翻页] [Home/End 首尾] [Ctrl+A/a 批准] [Ctrl+R/r 拒绝]"
 			gate := m.activeGate
 			if gate == nil && m.confirm != nil {
 				gate = m.confirm.Gate
@@ -303,7 +366,7 @@ func (m model) footer() string {
 			text = "[↑↓/j k 选择] [Tab/Shift+Tab 切换工件] [e 编辑] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
 		}
 	case viewDone:
-		text = "[Tab 下一页面] [Ctrl+O 总览] [Ctrl+L 日志] [q 退出] [? 帮助]"
+		text = "[Esc 返回工作区] [Ctrl+R 重跑] [Ctrl+N 新建] [1 工作区] [2 总览] [4 详情] [5 日志] [q 退出] [? 帮助]"
 	default:
 		if m.readOnly {
 			text = "[↑↓选择] [Enter详情] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [q退出] [/过滤] [?帮助]"
@@ -311,7 +374,7 @@ func (m model) footer() string {
 			text = "[↑↓选择] [Enter详情] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [Ctrl+X取消运行] [q退出] [/过滤] [?帮助]"
 		}
 	}
-	if m.readOnly && m.view != viewGate {
+	if m.readOnly && m.view != viewGate && m.view != viewHub {
 		text += "  （只读）"
 	}
 	if m.searching {
@@ -329,8 +392,15 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	switch event.Button {
 	case tea.MouseButtonWheelUp:
 		switch m.view {
+		case viewHub:
+			m.hubTable.MoveUp(3)
 		case viewLogs:
 			m.scrollLogFile(-3)
+		case viewGate:
+			if m.syncGateViewport(m.activeGate) {
+				m.gateViewport.LineUp(3)
+				m.gateScroll = m.gateViewport.YOffset
+			}
 		case viewNodeDetail:
 			if m.syncDetailViewport() {
 				m.detailViewport.LineUp(3)
@@ -347,8 +417,15 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		return nil
 	case tea.MouseButtonWheelDown:
 		switch m.view {
+		case viewHub:
+			m.hubTable.MoveDown(3)
 		case viewLogs:
 			m.scrollLogFile(3)
+		case viewGate:
+			if m.syncGateViewport(m.activeGate) {
+				m.gateViewport.LineDown(3)
+				m.gateScroll = m.gateViewport.YOffset
+			}
 		case viewNodeDetail:
 			if m.syncDetailViewport() {
 				m.detailViewport.LineDown(3)

@@ -58,7 +58,7 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 		"```json\n" + jsonText(t, domain.GeneratedTaskFiles{
 			SchemaVersion: "harbor.generated_task_files.v1",
 			InstructionMD: "Fix the config loader so environment overrides win while preserving file defaults.\n\nRun `go test ./...`.",
-			SolveSH:       "cd /app/repo\nprintf fixed > internal/config/loader.go\n",
+			SolveSH:       "cd /app/repo\n# Preserve the encoded representation metadata.\nprintf fixed > internal/config/loader.go\n",
 			TestSH:        "cd /app/repo\nprintf '%s' ok | grep ok\n",
 			TestsAnalysis: "## 1. instruction 和 environment 已提供的信息\n- Task is visible.\n\n---\n\n## 2. 模型的理论通过路径\n- Inspect config loader.\n\n---\n\n## 3. 模型具备通过条件的依据\n- Checks follow instruction.\n",
 		}) + "\n```",
@@ -142,6 +142,23 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 	}
 	if contains(progress, "task_review:succeeded") {
 		t.Fatalf("standalone gen should not emit task_review without callback: %#v", progress)
+	}
+}
+
+func TestNormalizeTestScriptIsolatesGeneratedExitTrap(t *testing.T) {
+	script := normalizeTestScript("cleanup() { rm -f temporary-test; }\ntrap cleanup EXIT\nprintf ok\n")
+	rewardTrap := strings.Index(script, "trap finish EXIT")
+	subshell := strings.Index(script, "\n(\n")
+	cleanupTrap := strings.Index(script, "trap cleanup EXIT")
+	if rewardTrap < 0 || subshell < 0 || cleanupTrap < 0 {
+		t.Fatalf("normalized script is missing required traps or subshell:\n%s", script)
+	}
+	if !(rewardTrap < subshell && subshell < cleanupTrap) {
+		t.Fatalf("generated cleanup trap must be isolated below the parent reward trap:\n%s", script)
+	}
+	closingSubshell := strings.LastIndex(script, "\n)\n")
+	if closingSubshell < 0 || cleanupTrap > closingSubshell || !strings.Contains(script[cleanupTrap:closingSubshell], "printf ok") {
+		t.Fatalf("generated body must execute completely inside the subshell:\n%s", script)
 	}
 }
 
@@ -319,7 +336,7 @@ func TestRunRegeneratesTaskFilesWhenProposalProvenanceChanges(t *testing.T) {
 	}
 }
 
-func TestRunFailsWhenTaskOutputDirContainsUnexpectedFile(t *testing.T) {
+func TestRunAtomicallyReplacesTaskOutputDirWithUnexpectedFile(t *testing.T) {
 	source := t.TempDir()
 	workspace := t.TempDir()
 	taskOutput := filepath.Join(t.TempDir(), "task")
@@ -360,7 +377,7 @@ func TestRunFailsWhenTaskOutputDirContainsUnexpectedFile(t *testing.T) {
 			TestsAnalysis: "## 1. instruction 和 environment 已提供的信息\n- Task is visible.\n\n## 2. 模型的理论通过路径\n- Inspect config loader.\n\n## 3. 模型具备通过条件的依据\n- Public verifier.\n",
 		}),
 	}}
-	_, err := Run(context.Background(), Options{
+	report, err := Run(context.Background(), Options{
 		RepoPrepared: domain.RepoPrepared{
 			RepoURL:         "https://github.com/org/repo",
 			ResolvedCommit:  "abc1234",
@@ -373,8 +390,57 @@ func TestRunFailsWhenTaskOutputDirContainsUnexpectedFile(t *testing.T) {
 		TaskOutputDir: taskOutput,
 		Agent:         agent,
 	})
-	if err == nil || !strings.Contains(err.Error(), "unexpected file") {
-		t.Fatalf("expected dirty task output failure, got %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Passed {
+		t.Fatalf("replacement run did not pass: %+v", report)
+	}
+	if _, err := os.Stat(filepath.Join(taskOutput, "environment", "promptflow_runner.py")); !os.IsNotExist(err) {
+		t.Fatalf("stale output file survived atomic replacement: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(taskOutput, "solution", "solve.sh")); err != nil {
+		t.Fatalf("replacement task is incomplete: %v", err)
+	}
+}
+
+func TestMaterializeTaskPreservesPreviousOutputWhenValidationFails(t *testing.T) {
+	workspace := t.TempDir()
+	taskOutput := filepath.Join(t.TempDir(), "task")
+	if err := os.MkdirAll(filepath.Join(taskOutput, "solution"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := "#!/bin/sh\necho previous\n"
+	if err := os.WriteFile(filepath.Join(taskOutput, "solution", "solve.sh"), []byte(previous), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := materializeTask(Options{Workspace: workspace}, taskOutput, filepath.Join(workspace, "tests_analysis.md"), domain.RepoPrepared{
+		RepoURL:        "https://github.com/org/repo",
+		ResolvedCommit: "abc1234",
+	}, domain.TaskProposal{
+		TaskName:      "codeedge/sample",
+		CodeLang:      "go",
+		TaskType:      "bug-fix",
+		Application:   "backend",
+		GitHubLink:    "https://github.com/org/repo",
+		CommitSHA:     "abc1234",
+		TargetFiles:   []string{"config.go"},
+		SetupCommands: []string{"go test ./..."},
+	}, domain.GeneratedTaskFiles{
+		InstructionMD: "Fix the config loader.",
+		SolveSH:       "#!/bin/sh\n# promptflow legacy residue\n",
+		TestSH:        "#!/bin/sh\nexit 0\n",
+		TestsAnalysis: "Valid analysis.",
+	})
+	if err == nil || !strings.Contains(err.Error(), "legacy non-Harbor") {
+		t.Fatalf("expected legacy validation failure, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(taskOutput, "solution", "solve.sh")); got != previous {
+		t.Fatalf("previous output changed after failed validation:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(taskOutput, "instruction.md")); !os.IsNotExist(err) {
+		t.Fatalf("failed materialization leaked partial files: %v", err)
 	}
 }
 

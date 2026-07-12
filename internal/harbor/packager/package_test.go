@@ -1181,6 +1181,21 @@ func TestPackageFailsWhenTaskContainsLegacyDomainContent(t *testing.T) {
 	}
 }
 
+func TestValidatePackageFileSetAllowsWordsContainingLegacySubstrings(t *testing.T) {
+	taskDir := writePackageTask(t)
+	solution := filepath.Join(taskDir, "solution", "solve.sh")
+	raw, err := os.ReadFile(solution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(solution, append(raw, []byte("\n# encoded representation and slider state\n")...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePackageFileSet(taskDir); err != nil {
+		t.Fatalf("normal identifier substrings were rejected: %v", err)
+	}
+}
+
 func TestPackageFailsWhenTaskContainsLegacyDomainFileInAllowedDir(t *testing.T) {
 	taskDir := writePackageTask(t)
 	if err := os.WriteFile(filepath.Join(taskDir, "environment", "promptflow_runner.py"), []byte("print('legacy')\n"), 0o644); err != nil {

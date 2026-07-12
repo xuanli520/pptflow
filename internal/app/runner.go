@@ -27,6 +27,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 	"github.com/purplevoid/harbor-factory/internal/harbor/similarity"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/harbor/verify"
 	"github.com/purplevoid/harbor-factory/internal/runtime/codexruntime"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
@@ -118,10 +119,12 @@ func DefaultHarborAgentCacheDir() string {
 var ErrHarborModelStageCanceled = errors.New("Harbor model stage canceled")
 
 func NewRunner(opts RunnerOptions) *Runner {
+	opts = HydrateRuntimeOptions(opts)
 	return &Runner{opts: opts, events: make(chan domain.RunnerEvent, 64), decisions: make(chan domain.GateDecision, 8), stageCancels: map[string]context.CancelFunc{}}
 }
 
 func SaveRunnerOptions(opts RunnerOptions) (domain.RunnerOptionsSnapshot, error) {
+	opts = HydrateRuntimeOptions(opts)
 	snapshot := sanitize.RunnerOptionsSnapshot(runnerOptionsSnapshot(opts))
 	if err := writeRunnerOptionsSnapshot(snapshot); err != nil {
 		return snapshot, err
@@ -146,7 +149,9 @@ func LoadRunnerOptions(workspace string) (RunnerOptions, domain.RunnerOptionsSna
 	if strings.TrimSpace(snapshot.Workspace) == "" {
 		snapshot.Workspace = workspace
 	}
-	return runnerOptionsFromSnapshot(snapshot), sanitize.RunnerOptionsSnapshot(snapshot), nil
+	opts := runnerOptionsFromSnapshot(snapshot)
+	opts = MergeRuntimeOptions(opts, RuntimeOptionsFromEnvironment())
+	return opts, sanitize.RunnerOptionsSnapshot(snapshot), nil
 }
 
 func (r *Runner) Events() <-chan domain.RunnerEvent {
@@ -483,41 +488,46 @@ reviewChecks:
 		}
 		qualityPath := ""
 		if r.opts.QualityCheck {
-			r.emit("node_started", nodes.QualityCheck, "running", "running CodeEdge semantic quality check", "")
 			qualityPath = nodes.QualityReportPath(r.opts.Workspace)
-			var qualityAgent workflow.AgentRuntime
-			if r.opts.QualityAgent {
-				qualityAgent = r.opts.Agent
-				if qualityAgent == nil {
-					qualityAgent = codexruntime.New(nil, r.opts.CodexPath, nil)
-				}
-			}
-			var proposal *domain.TaskProposal
-			if summary.GenReport != nil {
-				proposal = &summary.GenReport.TaskProposal
-			}
-			qualityReport, err := quality.Run(ctx, quality.Options{
-				TaskDir:             effectiveTaskDir,
-				Workspace:           r.opts.Workspace,
-				RepoURL:             effectiveRepoURL,
-				Commit:              effectiveCommit,
-				TestsAnalysisPath:   effectiveTestsAnalysis,
-				Proposal:            proposal,
-				Agent:               qualityAgent,
-				Model:               r.opts.Model,
-				ReasoningEffort:     r.opts.Reasoning,
-				AgentTimeoutSeconds: r.opts.AgentTimeout,
-				WriteReport:         qualityPath,
-			})
-			summary.QualityReport = &qualityReport
-			if err != nil {
-				r.emit("node_failed", nodes.QualityCheck, "failed", err.Error(), qualityPath)
-				summary.Passed = false
-			} else if !qualityReport.OverallPass {
-				r.emit("node_failed", nodes.QualityCheck, "failed", "quality check found blocking issues", qualityPath)
-				summary.Passed = false
+			if qualityReport, ok := loadReusableQualityReport(effectiveTaskDir, qualityPath); ok {
+				summary.QualityReport = &qualityReport
+				r.emit("node_succeeded", nodes.QualityCheck, "succeeded", "reused existing quality report", qualityPath)
 			} else {
-				r.emit("node_succeeded", nodes.QualityCheck, "succeeded", "quality check passed", qualityPath)
+				r.emit("node_started", nodes.QualityCheck, "running", "running CodeEdge semantic quality check", "")
+				var qualityAgent workflow.AgentRuntime
+				if r.opts.QualityAgent {
+					qualityAgent = r.opts.Agent
+					if qualityAgent == nil {
+						qualityAgent = codexruntime.New(nil, r.opts.CodexPath, nil)
+					}
+				}
+				var proposal *domain.TaskProposal
+				if summary.GenReport != nil {
+					proposal = &summary.GenReport.TaskProposal
+				}
+				qualityReport, err := quality.Run(ctx, quality.Options{
+					TaskDir:             effectiveTaskDir,
+					Workspace:           r.opts.Workspace,
+					RepoURL:             effectiveRepoURL,
+					Commit:              effectiveCommit,
+					TestsAnalysisPath:   effectiveTestsAnalysis,
+					Proposal:            proposal,
+					Agent:               qualityAgent,
+					Model:               r.opts.Model,
+					ReasoningEffort:     r.opts.Reasoning,
+					AgentTimeoutSeconds: r.opts.AgentTimeout,
+					WriteReport:         qualityPath,
+				})
+				summary.QualityReport = &qualityReport
+				if err != nil {
+					r.emit("node_failed", nodes.QualityCheck, "failed", err.Error(), qualityPath)
+					summary.Passed = false
+				} else if !qualityReport.OverallPass {
+					r.emit("node_failed", nodes.QualityCheck, "failed", "quality check found blocking issues", qualityPath)
+					summary.Passed = false
+				} else {
+					r.emit("node_succeeded", nodes.QualityCheck, "succeeded", "quality check passed", qualityPath)
+				}
 			}
 		}
 		similarityPath := ""
@@ -1362,6 +1372,36 @@ func loadReusableSimilarityReport(taskDir, path string) (domain.SimilarityReport
 	return sanitize.SimilarityReport(report), true
 }
 
+func loadReusableQualityReport(taskDir, path string) (domain.QualityReport, bool) {
+	if !regularReadableFile(path) {
+		return domain.QualityReport{}, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return domain.QualityReport{}, false
+	}
+	var report domain.QualityReport
+	if err := json.Unmarshal(raw, &report); err != nil || report.SchemaVersion != "harbor.quality_report.v1" {
+		return domain.QualityReport{}, false
+	}
+	want, err := filepath.Abs(taskDir)
+	if err != nil {
+		return domain.QualityReport{}, false
+	}
+	got, err := filepath.Abs(report.TaskDir)
+	if err != nil || filepath.Clean(got) != filepath.Clean(want) {
+		return domain.QualityReport{}, false
+	}
+	if strings.TrimSpace(report.TaskDigest) == "" {
+		return domain.QualityReport{}, false
+	}
+	digest, err := harborrun.ComputeTaskDigest(taskDir)
+	if err != nil || !strings.EqualFold(report.TaskDigest, digest) {
+		return domain.QualityReport{}, false
+	}
+	return sanitize.QualityReport(report), true
+}
+
 func writeRunnerOptionsSnapshot(snapshot domain.RunnerOptionsSnapshot) error {
 	workspace := defaultString(strings.TrimSpace(snapshot.Workspace), filepath.Join(".harbor-factory", "workspace"))
 	if err := os.MkdirAll(workspace, 0o700); err != nil {
@@ -1845,14 +1885,6 @@ func nonEmptyRegularFile(path string) bool {
 }
 
 func generatedTaskResidue(taskDir string) ([]string, []string, error) {
-	allowed := map[string]bool{
-		"instruction.md":         true,
-		"task.toml":              true,
-		"tests_analysis.md":      true,
-		"environment/Dockerfile": true,
-		"solution/solve.sh":      true,
-		"tests/test.sh":          true,
-	}
 	var extras []string
 	var legacy []string
 	if strings.TrimSpace(taskDir) == "" {
@@ -1874,10 +1906,10 @@ func generatedTaskResidue(taskDir string) ([]string, []string, error) {
 			extras = append(extras, rel+" (symlink)")
 			return nil
 		}
-		if !allowed[rel] {
+		if !taskpolicy.IsAllowedFile(rel) {
 			extras = append(extras, rel)
 		}
-		if containsLegacyDomain(rel) {
+		if taskpolicy.ContainsLegacyDomain(rel) {
 			legacy = append(legacy, rel)
 			return nil
 		}
@@ -1885,22 +1917,12 @@ func generatedTaskResidue(taskDir string) ([]string, []string, error) {
 		if err != nil {
 			return err
 		}
-		if containsLegacyDomain(string(raw)) {
+		if taskpolicy.ContainsLegacyDomain(string(raw)) {
 			legacy = append(legacy, rel)
 		}
 		return nil
 	})
 	return extras, legacy, err
-}
-
-func containsLegacyDomain(value string) bool {
-	lower := strings.ToLower(value)
-	for _, term := range []string{"pptflow", "promptflow", "image2", "powerpoint", "presentation", "slide"} {
-		if strings.Contains(lower, term) {
-			return true
-		}
-	}
-	return false
 }
 
 func limitStrings(values []string, limit int) []string {

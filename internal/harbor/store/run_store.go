@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -104,9 +105,17 @@ func (s *Store) ListRuns(sortCol SortColumn, asc bool, filter string) ([]RunWith
 	`
 	var args []any
 	if filter != "" {
-		query += ` WHERE t.task_name LIKE ? OR t.code_lang LIKE ? OR t.task_type LIKE ? OR t.application LIKE ? OR r.status LIKE ?`
-		pattern := "%" + filter + "%"
-		args = append(args, pattern, pattern, pattern, pattern, pattern)
+		terms, resumable := searchTerms(filter)
+		var clauses []string
+		for _, term := range terms {
+			clauses = append(clauses, `(t.task_name LIKE ? OR t.code_lang LIKE ? OR t.task_type LIKE ? OR t.application LIKE ? OR r.status LIKE ?)`)
+			pattern := "%" + term + "%"
+			args = append(args, pattern, pattern, pattern, pattern, pattern)
+		}
+		if resumable {
+			clauses = append(clauses, "r.is_resumable = 1")
+		}
+		query += ` WHERE ` + strings.Join(clauses, " OR ")
 	}
 	query += ` ORDER BY ` + col + ` ` + order
 
@@ -139,6 +148,27 @@ func (s *Store) ListRuns(sortCol SortColumn, asc bool, filter string) ([]RunWith
 	return results, rows.Err()
 }
 
+func (s *Store) SearchRuns(query string) ([]RunWithTask, error) {
+	return s.ListRuns(SortByStartedAt, false, query)
+}
+
+func searchTerms(filter string) ([]string, bool) {
+	terms := []string{filter}
+	lower := strings.ToLower(filter)
+	aliases := map[string]string{
+		"成功":  "succeeded",
+		"失败":  "failed",
+		"运行中": "running",
+	}
+	for alias, status := range aliases {
+		if strings.Contains(alias, filter) || strings.Contains(filter, alias) || strings.Contains(lower, status) {
+			terms = append(terms, status)
+		}
+	}
+	resumable := strings.Contains("可恢复", filter) || strings.Contains(filter, "可恢复") || strings.Contains(lower, "resumable")
+	return terms, resumable
+}
+
 func (s *Store) DeleteRunByWorkspace(workspacePath string) error {
 	workspacePath = normalizePath(workspacePath)
 	if workspacePath == "" {
@@ -146,6 +176,43 @@ func (s *Store) DeleteRunByWorkspace(workspacePath string) error {
 	}
 	_, err := s.db.Exec("DELETE FROM runs WHERE workspace_path = ?", workspacePath)
 	return err
+}
+
+func (s *Store) ListRunsByTask(taskID int64) ([]Run, error) {
+	rows, err := s.db.Query(`SELECT id, task_id, workspace_path, run_id, status, passed, started_at, finished_at, size_bytes, is_active, is_resumable, created_at FROM runs WHERE task_id = ? ORDER BY started_at DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var runs []Run
+	for rows.Next() {
+		var run Run
+		var startedAt, finishedAt sql.NullTime
+		if err := rows.Scan(&run.ID, &run.TaskID, &run.WorkspacePath, &run.RunID, &run.Status, &run.Passed, &startedAt, &finishedAt, &run.SizeBytes, &run.IsActive, &run.IsResumable, &run.CreatedAt); err != nil {
+			return nil, err
+		}
+		run.StartedAt = nullableTime(startedAt)
+		run.FinishedAt = nullableTime(finishedAt)
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+func (s *Store) runningWorkspacePaths() ([]string, error) {
+	rows, err := s.db.Query(`SELECT workspace_path FROM runs WHERE status = 'running' OR is_active = 1 OR is_resumable = 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
 }
 
 func (s *Store) CleanOrphanTasks() error {

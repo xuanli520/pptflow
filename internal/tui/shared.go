@@ -9,11 +9,14 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 
 func initModelComponents(m model) model {
 	m.router = newPageRouter(m.view)
 	switch m.view {
+	case viewHub:
+		m.focusMgr = newFocusManager(focusPage)
 	case viewStart:
 		m.focusMgr = newFocusManager(focusStartField)
 	case viewOverview:
@@ -54,8 +57,15 @@ func initModelComponents(m model) model {
 	m.searchInput.Placeholder = "输入节点、消息或文件名"
 	m.searchInput.CharLimit = 256
 	m.searchInput.Width = 42
+	m.hubSearch = textinput.New()
+	m.hubSearch.Prompt = "/ "
+	m.hubSearch.Placeholder = "搜索名称、语言、类型或状态"
+	m.hubSearch.CharLimit = 256
+	m.hubSearch.Width = 42
 	m.detailViewport = viewport.New(40, 10)
+	m.gateViewport = viewport.New(40, 10)
 	m.overviewTable = table.New(table.WithColumns([]table.Column{{Title: "状态", Width: 8}, {Title: "节点", Width: 26}, {Title: "消息", Width: 48}}), table.WithFocused(true), table.WithHeight(12))
+	m.hubTable = table.New(table.WithColumns([]table.Column{{Title: "名称", Width: 24}, {Title: "状态", Width: 10}, {Title: "语言", Width: 8}, {Title: "类型", Width: 10}, {Title: "时间", Width: 16}, {Title: "大小", Width: 9}}), table.WithFocused(true), table.WithHeight(12))
 	return m
 }
 
@@ -85,10 +95,22 @@ func (m model) cloneForUpdate() model {
 	m.editedFiles = cloneStringMap(m.editedFiles)
 	m.pathSuggestions = append([]string(nil), m.pathSuggestions...)
 	m.overviewRowIDs = append([]string(nil), m.overviewRowIDs...)
+	m.hubItems = append([]store.RunWithTask(nil), m.hubItems...)
+	m.hubRowPaths = append([]string(nil), m.hubRowPaths...)
+	m.hubScanRoots = append([]string(nil), m.hubScanRoots...)
+	m.runtimeOpts.HarborAgentEnv = append([]string(nil), m.runtimeOpts.HarborAgentEnv...)
 	m.focusMgr.stack = append([]focusArea(nil), m.focusMgr.stack...)
 	if m.confirm != nil {
 		confirmation := *m.confirm
 		m.confirm = &confirmation
+	}
+	if m.runConfig != nil {
+		clone := *m.runConfig
+		m.runConfig = &clone
+	}
+	if m.resumeOverlay != nil {
+		clone := *m.resumeOverlay
+		m.resumeOverlay = &clone
 	}
 	return m
 }
@@ -103,8 +125,10 @@ func (m *model) refreshComponentSizes() {
 	m.notesInput.SetWidth(clampInt(l.ContentWidth-8, 24, 90))
 	m.notesInput.SetHeight(clampInt(l.ContentHeight/3, 3, 9))
 	m.searchInput.Width = clampInt(l.ContentWidth-16, 16, 64)
+	m.hubSearch.Width = clampInt(l.ContentWidth-16, 16, 64)
 	m.detailViewport.Width = maxInt(20, l.MainWidth-4)
 	m.detailViewport.Height = maxInt(4, l.ContentHeight/2)
+	m.gateViewport.Width = maxInt(20, l.ContentWidth-panelStyle.GetHorizontalFrameSize())
 }
 
 func matchesFilter(filter string, values ...string) bool {

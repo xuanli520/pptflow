@@ -80,6 +80,10 @@ func TestUpsertTask(t *testing.T) {
 	if got.RepoURL != "https://github.com/example/repo" {
 		t.Errorf("expected RepoURL preserved, got %q", got.RepoURL)
 	}
+	tasks, err := s.SearchTasks("updated")
+	if err != nil || len(tasks) != 1 || tasks[0].ID != id {
+		t.Fatalf("SearchTasks returned %+v err=%v", tasks, err)
+	}
 }
 
 func TestUpsertRun(t *testing.T) {
@@ -170,6 +174,18 @@ func TestListRuns(t *testing.T) {
 	if runs[0].Task.CodeLang != "py" {
 		t.Errorf("expected py, got %s", runs[0].Task.CodeLang)
 	}
+
+	runs, err = s.SearchRuns("失败")
+	if err != nil {
+		t.Fatalf("SearchRuns with Chinese status: %v", err)
+	}
+	if len(runs) != 1 || runs[0].Run.Status != "failed" {
+		t.Fatalf("Chinese status search returned %+v", runs)
+	}
+	taskRuns, err := s.ListRunsByTask(tid1)
+	if err != nil || len(taskRuns) != 1 || taskRuns[0].RunID != "r1" {
+		t.Fatalf("ListRunsByTask returned %+v err=%v", taskRuns, err)
+	}
 }
 
 func TestSyncFromFilesystem(t *testing.T) {
@@ -239,6 +255,47 @@ func TestSyncFromNestedWorkspacesDirectory(t *testing.T) {
 	}
 	if len(runs) != 1 || runs[0].Run.WorkspacePath != workspace {
 		t.Fatalf("nested workspace was not indexed: %+v", runs)
+	}
+}
+
+func TestRefreshRunningUpdatesStatusWithoutDroppingSize(t *testing.T) {
+	s := tempDB(t)
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspaces", "run-1")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeState := func(status string, finished bool) {
+		summary := `{"run_id":"refresh-run","status":"` + status + `","workspace":"` + workspace + `"`
+		if finished {
+			summary += `,"finished_at":"2026-01-01T01:00:00Z"`
+		}
+		summary += `}`
+		if err := os.WriteFile(filepath.Join(workspace, "state.json"), []byte(summary), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeState("running", false)
+	if err := os.WriteFile(filepath.Join(workspace, "run_options.json"), []byte(`{"task_dir":"/tmp/refresh-task","task_name":"refresh"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "payload"), make([]byte, 128), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncFromFilesystem(context.Background(), []string{root}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GetRunByWorkspace(workspace)
+	if err != nil || before == nil || before.SizeBytes == 0 {
+		t.Fatalf("initial run not indexed with size: %+v err=%v", before, err)
+	}
+	writeState("succeeded", true)
+	if err := s.RefreshRunning(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.GetRunByWorkspace(workspace)
+	if err != nil || after.Status != "succeeded" || after.SizeBytes != before.SizeBytes || after.IsResumable {
+		t.Fatalf("running refresh failed: before=%+v after=%+v err=%v", before, after, err)
 	}
 }
 
