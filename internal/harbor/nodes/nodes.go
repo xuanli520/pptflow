@@ -19,9 +19,12 @@ const (
 	TestGen           = "test_generate"
 	TestsAnalysis     = "tests_analysis"
 	MaterializeTask   = "materialize_task"
+	PublishTask       = "publish_task"
+	TaskRepair        = "task_repair"
 	RuntimeSelfCheck  = "runtime_self_check"
-	// ContentReview and ResultReview remain readable for historical workspaces,
-	// but new runs no longer place them in Order or request those redundant gates.
+	SolutionReview    = "solution_review"
+	// The five review gates are explicit workflow nodes so every approval has
+	// durable inputs, a stable artifact and an Engine-visible transition.
 	ContentReview   = "content_review"
 	CodeEdgeLint    = "codeedge_lint"
 	HarborVerify    = "harbor_verify"
@@ -48,22 +51,27 @@ func Order() []string {
 		InstructionGen,
 		TaskTOMLGen,
 		DockerfileGen,
+		ContentReview,
 		SolveGen,
 		TestGen,
 		TestsAnalysis,
+		SolutionReview,
 		MaterializeTask,
+		TaskRepair,
 		RuntimeSelfCheck,
-		CodeEdgeLint,
 		HarborVerify,
 		DockerBuild,
 		InitialVerify,
 		OracleVerify,
+		CodeEdgeLint,
 		QualityCheck,
 		SimilarityCheck,
+		FinalReview,
 		HarborRunQwen,
 		HarborRunOpus,
+		ResultReview,
 		SubmissionLint,
-		FinalReview,
+		PublishTask,
 		Package,
 	}
 }
@@ -103,10 +111,14 @@ func ArtifactPaths(workspace, nodeID string) []string {
 		return []string{TestPath(workspace)}
 	case TestsAnalysis, MaterializeTask:
 		return []string{TestsAnalysisPath(workspace)}
+	case PublishTask:
+		return []string{TaskPublishReceiptPath(workspace)}
 	case RuntimeSelfCheck:
 		return []string{AgentLogPath(workspace, RuntimeSelfCheck)}
 	case ContentReview:
 		return []string{ReviewDecisionPath(workspace, "phase1", ContentReview)}
+	case SolutionReview:
+		return []string{ReviewDecisionPath(workspace, "phase2", SolutionReview)}
 	case CodeEdgeLint:
 		return []string{CodeEdgeLintReportPath(workspace)}
 	case SubmissionLint:
@@ -206,6 +218,10 @@ func TestPath(workspace string) string {
 
 func TestsAnalysisPath(workspace string) string {
 	return filepath.Join(DefaultWorkspace(workspace), "phase3", "artifacts", TestsAnalysis, "tests_analysis.md")
+}
+
+func TaskPublishReceiptPath(workspace string) string {
+	return filepath.Join(DefaultWorkspace(workspace), "phase3", "artifacts", PublishTask, "publish_receipt.json")
 }
 
 func ReviewDecisionPath(workspace, phase, gateID string) string {

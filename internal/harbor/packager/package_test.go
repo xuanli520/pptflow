@@ -29,7 +29,7 @@ func TestPackageCreatesZipWithSingleTaskRootAndSubmissionReport(t *testing.T) {
 	}, "qwen.png")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-8", []domain.TrialRun{
+	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-6", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -930,7 +930,7 @@ func TestPackageFailsWhenHarborResultViolatesThresholds(t *testing.T) {
 	if err := os.WriteFile(qwenResult, []byte(`{"model":"qwen3.7-max","trials":4,"pass_count":2,"pass_at_4":0.50,"average_turns":23,"screenshot":"qwen.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opusResult, []byte(`{"model":"claude-opus-4-8","trials":4,"pass_count":3,"pass_at_4":0.75,"average_turns":28,"screenshot":"opus.png"}`), 0o644); err != nil {
+	if err := os.WriteFile(opusResult, []byte(`{"model":"claude-opus-4-6","trials":4,"pass_count":3,"pass_at_4":0.75,"average_turns":28,"screenshot":"opus.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := Package(Options{
@@ -1370,7 +1370,7 @@ func writeTrialResults(t *testing.T, outputDir, taskDir string) (string, string)
 	}, "qwen.png")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-8", []domain.TrialRun{
+	if err := os.WriteFile(opusResult, []byte(packageTrialResultJSON(t, outputDir, taskDir, "claude-opus-4-6", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},

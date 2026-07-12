@@ -1452,9 +1452,9 @@ func checkHarborResult(report *domain.LintReport, id, path, taskDir string, qwen
 		report.Add(id, domain.CheckFail, "harbor result cannot be read", path)
 		return
 	}
-	expectedModel := "claude-opus-4-8"
+	expectedModel := domain.DefaultOpusModel
 	if qwen {
-		expectedModel = "qwen3.7-max"
+		expectedModel = domain.DefaultQwenModel
 	}
 	failures := harborrun.ValidateForCodeEdgeWithOptions(result, harborrun.ValidationOptions{
 		Qwen:              qwen,

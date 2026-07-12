@@ -15,6 +15,10 @@ type repairAgent struct {
 	req  workflow.AgentTurnRequest
 }
 
+func (a *repairAgent) OpenConversation(context.Context, workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+	return a, nil
+}
+
 func (a *repairAgent) Turn(_ context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
 	a.req = req
 	if a.edit {
@@ -24,6 +28,8 @@ func (a *repairAgent) Turn(_ context.Context, req workflow.AgentTurnRequest) (wo
 	}
 	return workflow.AgentTurnResult{Text: "updated task", Model: "fake-codex"}, nil
 }
+
+func (*repairAgent) Close() error { return nil }
 
 func TestRunRepairsTaskWithWorkspaceWriteAndPersistsDigest(t *testing.T) {
 	taskDir := writeRepairTask(t)

@@ -257,7 +257,7 @@ func TestStartFormLaunchesPackageWithResultScreenshotFallback(t *testing.T) {
 	if err := os.WriteFile(qwen, []byte(`{"model":"qwen3.7-max","screenshot":"qwen.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-8","pass4_screenshot":"opus.png"}`), 0o644); err != nil {
+	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-6","pass4_screenshot":"opus.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{
@@ -286,7 +286,7 @@ func TestStartFormRejectsPackageWithoutScreenshotOrFallback(t *testing.T) {
 	if err := os.WriteFile(qwen, []byte(`{"model":"qwen3.7-max"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-8"}`), 0o644); err != nil {
+	if err := os.WriteFile(opus, []byte(`{"model":"claude-opus-4-6"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{

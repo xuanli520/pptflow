@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/spf13/cobra"
 )
 
@@ -65,8 +66,8 @@ func addRunnerFlags(cmd *cobra.Command, opts *app.RunnerOptions) {
 	cmd.Flags().StringVar(&opts.HarborModels, "harbor-models", "qwen,opus", "Comma-separated Harbor model stages to run: qwen, opus, or both")
 	cmd.Flags().StringVar(&opts.HarborAgent, "harbor-agent", "claude-code", "Harbor agent name")
 	cmd.Flags().StringArrayVar(&opts.HarborAgentEnv, "harbor-agent-env", opts.HarborAgentEnv, "Agent environment passed to harbor run as --ae KEY=VALUE")
-	cmd.Flags().StringVar(&opts.QwenModel, "qwen-model", "qwen3.7-max", "Qwen model for Harbor pass@4")
-	cmd.Flags().StringVar(&opts.OpusModel, "opus-model", "claude-opus-4-8", "Opus model for Harbor pass@4")
+	cmd.Flags().StringVar(&opts.QwenModel, "qwen-model", domain.DefaultQwenModel, "Qwen model for Harbor pass@4")
+	cmd.Flags().StringVar(&opts.OpusModel, "opus-model", domain.DefaultOpusModel, "Opus model for Harbor pass@4")
 	cmd.Flags().StringVar(&opts.QwenHarborBaseURL, "qwen-harbor-base-url", opts.QwenHarborBaseURL, "ANTHROPIC_BASE_URL used only for the Qwen Harbor stage")
 	cmd.Flags().StringVar(&opts.OpusHarborBaseURL, "opus-harbor-base-url", opts.OpusHarborBaseURL, "ANTHROPIC_BASE_URL used only for the Opus Harbor stage")
 	cmd.Flags().IntVar(&opts.HarborTimeout, "harbor-timeout", 7200, "Harbor run timeout per model in seconds")

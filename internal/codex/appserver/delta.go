@@ -139,10 +139,15 @@ func appendOutputBounded(current, addition string, limit int) (string, string, b
 }
 
 func (s *appServerCodexReviewSession) emitDeltaUpdate(update Update, ok bool) {
-	if !ok || s.req.OnDelta == nil {
+	if !ok {
 		return
 	}
-	s.req.OnDelta(update)
+	s.mu.Lock()
+	onDelta := s.req.OnDelta
+	s.mu.Unlock()
+	if onDelta != nil {
+		onDelta(update)
+	}
 }
 
 func (s *appServerCodexReviewSession) recordItemActivity(turnID, itemID, itemType string, raw json.RawMessage, done bool) {
@@ -151,7 +156,7 @@ func (s *appServerCodexReviewSession) recordItemActivity(turnID, itemID, itemTyp
 		return
 	}
 	s.mu.Lock()
-	if s.completed || (s.turnID != "" && turnID != s.turnID) || s.agentPreviewStarted {
+	if s.completed || s.turnDone == nil || (s.turnID != "" && turnID != s.turnID) || s.agentPreviewStarted {
 		s.mu.Unlock()
 		return
 	}
@@ -260,7 +265,7 @@ func (s *appServerCodexReviewSession) recordDelta(turnID, itemID, delta string) 
 		return
 	}
 	s.mu.Lock()
-	if s.completed || (s.turnID != "" && turnID != s.turnID) {
+	if s.completed || s.turnDone == nil || (s.turnID != "" && turnID != s.turnID) {
 		s.mu.Unlock()
 		return
 	}
@@ -312,7 +317,7 @@ func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text s
 		return
 	}
 	s.mu.Lock()
-	if s.completed || (s.turnID != "" && turnID != s.turnID) {
+	if s.completed || s.turnDone == nil || (s.turnID != "" && turnID != s.turnID) {
 		s.mu.Unlock()
 		return
 	}

@@ -10,12 +10,19 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
 type fakeAgent struct {
 	outputs  []string
 	requests []workflow.AgentTurnRequest
+	opens    []workflow.AgentConversationRequest
+}
+
+func (f *fakeAgent) OpenConversation(_ context.Context, req workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+	f.opens = append(f.opens, req)
+	return &fakeAgentConversation{agent: f}, nil
 }
 
 func (f *fakeAgent) Turn(_ context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
@@ -27,6 +34,28 @@ func (f *fakeAgent) Turn(_ context.Context, req workflow.AgentTurnRequest) (work
 	f.outputs = f.outputs[1:]
 	return workflow.AgentTurnResult{Text: out, Model: req.Model}, nil
 }
+
+func (*fakeAgent) Close() error { return nil }
+
+type fakeAgentConversation struct {
+	agent  *fakeAgent
+	result workflow.AgentTurnResult
+}
+
+func (c *fakeAgentConversation) Turn(_ context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+	c.agent.requests = append(c.agent.requests, req)
+	if c.result.Text != "" {
+		return c.result, nil
+	}
+	if len(c.agent.outputs) == 0 {
+		return workflow.AgentTurnResult{}, os.ErrInvalid
+	}
+	c.result = workflow.AgentTurnResult{Text: c.agent.outputs[0], Model: req.Model}
+	c.agent.outputs = c.agent.outputs[1:]
+	return c.result, nil
+}
+
+func (*fakeAgentConversation) Close() error { return nil }
 
 func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 	source := t.TempDir()
@@ -89,10 +118,25 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 	if !report.Passed || report.TaskDir != taskOutput {
 		t.Fatalf("unexpected report: %+v", report)
 	}
-	if len(agent.requests) != 4 {
+	if len(agent.requests) != 7 {
 		t.Fatalf("agent request count=%d, want generation plus runtime self-check", len(agent.requests))
 	}
-	selfCheck := agent.requests[3]
+	if len(agent.opens) != 4 {
+		t.Fatalf("agent conversation count=%d, want three isolated generation conversations plus self-check", len(agent.opens))
+	}
+	if agent.opens[0].ProjectPath != source {
+		t.Fatalf("repo analysis must be the only generation stage with source access: %+v", agent.opens[0])
+	}
+	if agent.opens[1].ProjectPath == source || agent.opens[2].ProjectPath == source || agent.opens[1].ProjectPath == agent.opens[2].ProjectPath {
+		t.Fatalf("task design and task files must use separate source-free workspaces: %#v", agent.opens[:3])
+	}
+	if !strings.Contains(agent.requests[2].Prompt, `"schema_version": "harbor.repo_analysis.v1"`) {
+		t.Fatalf("task design did not receive canonical repo analysis JSON: %s", agent.requests[2].Prompt)
+	}
+	if !strings.Contains(agent.requests[4].Prompt, `"schema_version": "harbor.task_proposal.v1"`) {
+		t.Fatalf("task files did not receive canonical proposal JSON: %s", agent.requests[4].Prompt)
+	}
+	selfCheck := agent.requests[6]
 	if selfCheck.ProjectPath != taskOutput || selfCheck.SandboxMode != "danger-full-access" || !selfCheck.NetworkAccess || selfCheck.TimeoutSeconds < 1800 {
 		t.Fatalf("runtime self-check lacks required execution permissions: %+v", selfCheck)
 	}
@@ -149,6 +193,62 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 	}
 	if contains(progress, "task_review:succeeded") {
 		t.Fatalf("standalone gen should not emit task_review without callback: %#v", progress)
+	}
+}
+
+type scriptedAgent struct {
+	outputs []string
+	opens   int
+	turns   int
+}
+
+type scriptedConversation struct{ agent *scriptedAgent }
+
+func (a *scriptedAgent) OpenConversation(context.Context, workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+	a.opens++
+	return &scriptedConversation{agent: a}, nil
+}
+
+func (c *scriptedConversation) Turn(context.Context, workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+	c.agent.turns++
+	if len(c.agent.outputs) == 0 {
+		return workflow.AgentTurnResult{}, os.ErrInvalid
+	}
+	out := c.agent.outputs[0]
+	c.agent.outputs = c.agent.outputs[1:]
+	return workflow.AgentTurnResult{Text: out, Model: "fake"}, nil
+}
+
+func (*scriptedConversation) Close() error { return nil }
+
+func TestRunJSONConversationCorrectsInvalidDraftInSameStageConversation(t *testing.T) {
+	prepared := domain.RepoPrepared{
+		RepoURL:        "https://github.com/org/repo",
+		ResolvedCommit: "abc1234",
+		SourcePath:     t.TempDir(),
+	}
+	valid := jsonText(t, domain.RepoAnalysis{
+		SchemaVersion: "harbor.repo_analysis.v1",
+		RepoURL:       prepared.RepoURL,
+		CommitSHA:     prepared.ResolvedCommit,
+		Language:      "go",
+		BuildSystem:   "go modules",
+		TestFramework: "go test",
+	})
+	agent := &scriptedAgent{outputs: []string{"not json", valid}}
+	opts := Options{RepoPrepared: prepared, Workspace: t.TempDir(), Agent: agent}
+	var analysis domain.RepoAnalysis
+	err := runJSONConversation(context.Background(), opts, 30, nodes.RepoAnalyze, "draft", &analysis, func() error {
+		return validateRepoAnalysis(analysis)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.opens != 1 || agent.turns != 2 {
+		t.Fatalf("correction must stay in one conversation: opens=%d turns=%d", agent.opens, agent.turns)
+	}
+	if analysis.Language != "go" {
+		t.Fatalf("unexpected corrected analysis: %+v", analysis)
 	}
 }
 
@@ -264,8 +364,8 @@ func TestRunReusesExistingAgentArtifacts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(firstAgent.requests) != 3 {
-		t.Fatalf("initial agent calls = %d, want 3", len(firstAgent.requests))
+	if len(firstAgent.requests) != 6 {
+		t.Fatalf("initial agent calls = %d, want 6", len(firstAgent.requests))
 	}
 
 	secondAgent := &fakeAgent{}
@@ -382,7 +482,7 @@ func TestRunRegeneratesTaskFilesWhenProposalProvenanceChanges(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(secondAgent.requests) != 1 || secondAgent.requests[0].LogPath == "" || !strings.Contains(secondAgent.requests[0].LogPath, "generate_task_files") {
+	if len(secondAgent.requests) != 2 || secondAgent.requests[0].LogPath == "" || !strings.Contains(secondAgent.requests[0].LogPath, "generate_task_files") {
 		t.Fatalf("expected only task file generation to re-run, got %#v", secondAgent.requests)
 	}
 }

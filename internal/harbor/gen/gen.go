@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -150,9 +151,13 @@ func runRuntimeSelfCheck(ctx context.Context, opts Options, taskDir string, time
 	if timeout < 1800 {
 		timeout = 1800
 	}
-	_, err := opts.Agent.Turn(ctx, workflow.AgentTurnRequest{
+	prompt, err := runtimeSelfCheckPrompt()
+	if err != nil {
+		return fmt.Errorf("render runtime self-check prompt: %w", err)
+	}
+	_, err = workflow.RunAgentTurn(ctx, opts.Agent, workflow.AgentTurnRequest{
 		ProjectPath:     taskDir,
-		Prompt:          runtimeSelfCheckPrompt(),
+		Prompt:          prompt,
 		Model:           opts.Model,
 		ReasoningEffort: opts.ReasoningEffort,
 		SandboxMode:     "danger-full-access",
@@ -190,15 +195,8 @@ func runRepoAnalyze(ctx context.Context, opts Options, workspace string, timeout
 	if analysis, ok := loadReusableRepoAnalysis(path, opts.RepoPrepared); ok {
 		return analysis, path, true, nil
 	}
-	prompt := repoAnalyzePrompt(opts.RepoPrepared)
-	var analysis domain.RepoAnalysis
-	if err := runJSONTurn(ctx, opts, timeout, nodes.RepoAnalyze, prompt, &analysis); err != nil {
-		return domain.RepoAnalysis{}, path, false, err
-	}
-	analysis.SchemaVersion = defaultString(analysis.SchemaVersion, "harbor.repo_analysis.v1")
-	analysis.RepoURL = defaultString(analysis.RepoURL, opts.RepoPrepared.RepoURL)
-	analysis.CommitSHA = defaultString(analysis.CommitSHA, opts.RepoPrepared.ResolvedCommit)
-	if err := validateRepoAnalysis(analysis); err != nil {
+	analysis, err := GenerateRepoAnalysis(ctx, ConversationOptions{Workspace: workspace, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, TimeoutSeconds: timeout, Agent: opts.Agent}, opts.RepoPrepared)
+	if err != nil {
 		return domain.RepoAnalysis{}, path, false, err
 	}
 	if err := writeJSON(path, analysis); err != nil {
@@ -212,15 +210,8 @@ func runTaskDesign(ctx context.Context, opts Options, workspace string, timeout 
 	if proposal, ok := loadReusableTaskProposal(path, opts.RepoPrepared); ok {
 		return proposal, path, true, nil
 	}
-	analysisJSON, _ := json.MarshalIndent(analysis, "", "  ")
-	prompt := taskDesignPrompt(string(analysisJSON))
-	var proposal domain.TaskProposal
-	if err := runJSONTurn(ctx, opts, timeout, nodes.TaskDesign, prompt, &proposal); err != nil {
-		return domain.TaskProposal{}, path, false, err
-	}
-	proposal.SchemaVersion = defaultString(proposal.SchemaVersion, "harbor.task_proposal.v1")
-	applyProposalDefaults(&proposal, opts.RepoPrepared)
-	if err := validateTaskProposal(proposal); err != nil {
+	proposal, err := GenerateTaskProposal(ctx, ConversationOptions{Workspace: workspace, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, TimeoutSeconds: timeout, Agent: opts.Agent}, opts.RepoPrepared, analysis)
+	if err != nil {
 		return domain.TaskProposal{}, path, false, err
 	}
 	if err := writeJSON(path, proposal); err != nil {
@@ -234,16 +225,8 @@ func runTaskFiles(ctx context.Context, opts Options, workspace string, timeout i
 	if files, ok := loadReusableTaskFiles(path, opts.RepoPrepared, proposal); ok {
 		return files, path, true, nil
 	}
-	analysisJSON, _ := json.MarshalIndent(analysis, "", "  ")
-	proposalJSON, _ := json.MarshalIndent(proposal, "", "  ")
-	prompt := taskFilesPrompt(string(analysisJSON), string(proposalJSON))
-	var files domain.GeneratedTaskFiles
-	if err := runJSONTurn(ctx, opts, timeout, nodes.GenerateTaskFiles, prompt, &files); err != nil {
-		return domain.GeneratedTaskFiles{}, path, false, err
-	}
-	files.SchemaVersion = defaultString(files.SchemaVersion, "harbor.generated_task_files.v1")
-	stampTaskFilesProvenance(&files, opts.RepoPrepared, proposal)
-	if err := validateTaskFiles(files); err != nil {
+	files, err := GenerateTaskFiles(ctx, ConversationOptions{Workspace: workspace, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, TimeoutSeconds: timeout, Agent: opts.Agent}, opts.RepoPrepared, analysis, proposal)
+	if err != nil {
 		return domain.GeneratedTaskFiles{}, path, false, err
 	}
 	if err := writeJSON(path, files); err != nil {
@@ -322,31 +305,102 @@ func readReusableJSON(path string, target any) bool {
 	return json.Unmarshal(raw, target) == nil
 }
 
-func runJSONTurn(ctx context.Context, opts Options, timeout int, nodeID, prompt string, target any) error {
-	result, err := opts.Agent.Turn(ctx, workflow.AgentTurnRequest{
-		ProjectPath:     opts.RepoPrepared.SourcePath,
-		Prompt:          prompt,
+const structuredOutputTurns = 3
+
+// runJSONConversation scopes one ephemeral thread to exactly one workflow
+// node. It always performs a draft and a self-review turn, then permits one
+// bounded correction turn. Only the final validated value may be persisted by
+// the caller; raw output and thread history never cross node boundaries.
+func runJSONConversation(ctx context.Context, opts Options, timeout int, nodeID, prompt string, target any, normalizeAndValidate func() error) error {
+	projectPath, err := isolatedAgentProject(opts, nodeID)
+	if err != nil {
+		return err
+	}
+	conversation, err := opts.Agent.OpenConversation(ctx, workflow.AgentConversationRequest{
+		ProjectPath:     projectPath,
 		Model:           opts.Model,
 		ReasoningEffort: opts.ReasoningEffort,
 		SandboxMode:     "read-only",
 		SandboxPolicy:   "readOnly",
 		NetworkAccess:   false,
-		WorkspaceRoots:  []string{opts.RepoPrepared.SourcePath},
+		WorkspaceRoots:  []string{projectPath},
 		TimeoutSeconds:  timeout,
 		MaxOutputBytes:  2 << 20,
 		LogPath:         nodes.AgentLogPath(opts.Workspace, nodeID),
 	})
 	if err != nil {
-		return fmt.Errorf("%s agent turn: %w", nodeID, err)
+		return fmt.Errorf("%s open agent conversation: %w", nodeID, err)
 	}
-	raw, err := extractJSONObject(result.Text)
+	closed := false
+	defer func() {
+		if !closed {
+			_ = conversation.Close()
+		}
+	}()
+
+	turnPrompt := prompt
+	var validationErr error
+	for turn := 1; turn <= structuredOutputTurns; turn++ {
+		result, turnErr := conversation.Turn(ctx, workflow.AgentTurnRequest{
+			Prompt:         turnPrompt,
+			Model:          opts.Model,
+			TimeoutSeconds: timeout,
+			MaxOutputBytes: 2 << 20,
+			LogPath:        nodes.AgentLogPath(opts.Workspace, nodeID),
+		})
+		if turnErr != nil {
+			return fmt.Errorf("%s agent turn %d: %w", nodeID, turn, turnErr)
+		}
+		validationErr = decodeStructuredOutput(result.Text, target, normalizeAndValidate)
+		if validationErr == nil && turn >= 2 {
+			closed = true
+			if err := conversation.Close(); err != nil {
+				return fmt.Errorf("%s close agent conversation: %w", nodeID, err)
+			}
+			return nil
+		}
+		turnPrompt = structuredRefinementPrompt(nodeID, turn, validationErr)
+	}
+	return fmt.Errorf("%s structured output remained invalid after %d turns: %w", nodeID, structuredOutputTurns, validationErr)
+}
+
+func isolatedAgentProject(opts Options, nodeID string) (string, error) {
+	if nodeID == nodes.RepoAnalyze {
+		return opts.RepoPrepared.SourcePath, nil
+	}
+	root := filepath.Join(nodes.DefaultWorkspace(opts.Workspace), ".agent-workspaces", nodeID)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("create isolated %s agent workspace: %w", nodeID, err)
+	}
+	return root, nil
+}
+
+func decodeStructuredOutput(text string, target any, normalizeAndValidate func() error) error {
+	value := reflect.ValueOf(target)
+	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() {
+		return fmt.Errorf("structured output target must be a non-nil pointer")
+	}
+	value.Elem().Set(reflect.Zero(value.Elem().Type()))
+	raw, err := extractJSONObject(text)
 	if err != nil {
-		return fmt.Errorf("%s parse JSON: %w", nodeID, err)
+		return fmt.Errorf("parse JSON: %w", err)
 	}
 	if err := json.Unmarshal(raw, target); err != nil {
-		return fmt.Errorf("%s decode JSON: %w", nodeID, err)
+		return fmt.Errorf("decode JSON: %w", err)
+	}
+	if normalizeAndValidate != nil {
+		if err := normalizeAndValidate(); err != nil {
+			return fmt.Errorf("validate JSON: %w", err)
+		}
 	}
 	return nil
+}
+
+func structuredRefinementPrompt(nodeID string, completedTurn int, validationErr error) string {
+	if validationErr != nil {
+		return fmt.Sprintf("Your previous %s JSON draft failed local validation after turn %d: %s. Correct every listed issue. Return only one complete JSON object matching the original schema; do not include Markdown or explanation.", nodeID, completedTurn, validationErr)
+	}
+	return fmt.Sprintf("Critically self-review your previous %s draft for schema accuracy, engineering realism, CodeEdge instruction/test derivability, reproducibility, and missing boundary conditions. Return the improved final answer as exactly one complete JSON object with no Markdown or explanation.", nodeID)
 }
 
 func materializeTask(opts Options, taskDir, testsAnalysisPath string, prepared domain.RepoPrepared, proposal domain.TaskProposal, files domain.GeneratedTaskFiles) error {
@@ -398,6 +452,42 @@ func materializeTask(opts Options, taskDir, testsAnalysisPath string, prepared d
 			return err
 		}
 		progress(opts, write.nodeID, "succeeded", filepath.Base(write.artifactPath)+" written", write.artifactPath)
+	}
+	if err := validateMaterializedTaskDir(stageDir); err != nil {
+		return err
+	}
+	if err := publishGeneratedTaskDir(stageDir, taskDir); err != nil {
+		return err
+	}
+	stageDir = ""
+	return nil
+}
+
+func publishCanonicalTask(taskDir string, writes []generatedFileWrite) error {
+	if err := validateGeneratedFileWrites(taskDir, writes); err != nil {
+		return err
+	}
+	parent := filepath.Dir(taskDir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	stageDir, err := os.MkdirTemp(parent, "."+filepath.Base(taskDir)+".staging-")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if stageDir != "" {
+			_ = os.RemoveAll(stageDir)
+		}
+	}()
+	for _, write := range writes {
+		rel, err := filepath.Rel(taskDir, write.taskPath)
+		if err != nil {
+			return err
+		}
+		if err := writeGeneratedFile(filepath.Join(stageDir, rel), write.content, write.mode); err != nil {
+			return err
+		}
 	}
 	if err := validateMaterializedTaskDir(stageDir); err != nil {
 		return err

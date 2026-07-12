@@ -72,6 +72,10 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 	if err != nil {
 		return domain.TrialResult{}, domain.CommandRun{}, fmt.Errorf("compute task digest: %w", err)
 	}
+	infraRetries := opts.InfraRetries
+	if infraRetries < 0 {
+		infraRetries = 0
+	}
 	exec := opts.Exec
 	if exec == nil {
 		exec = executor.New()
@@ -93,7 +97,7 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 				return domain.TrialResult{}, domain.CommandRun{}, err
 			}
 		}
-		agent, processEnv, err = prepareRetryingClaudeAgent(outputDir, processEnv)
+		agent, processEnv, err = prepareRetryingClaudeAgent(outputDir, processEnv, infraRetries)
 		if err != nil {
 			return domain.TrialResult{}, domain.CommandRun{}, err
 		}
@@ -109,10 +113,6 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 	attempts := opts.Attempts
 	if attempts <= 0 {
 		attempts = 4
-	}
-	infraRetries := opts.InfraRetries
-	if infraRetries < 0 {
-		infraRetries = 0
 	}
 	preflightPath := ""
 	schemaPreflightPath := ""
@@ -267,7 +267,7 @@ func appendCacheMount(args []string, mount string) []string {
 	return args
 }
 
-func prepareRetryingClaudeAgent(outputDir string, processEnv []string) (string, []string, error) {
+func prepareRetryingClaudeAgent(outputDir string, processEnv []string, infraRetries int) (string, []string, error) {
 	shimDir := filepath.Join(outputDir, ".factory-agent")
 	if err := os.MkdirAll(shimDir, 0o700); err != nil {
 		return "", nil, fmt.Errorf("create Harbor agent shim directory: %w", err)
@@ -280,7 +280,10 @@ func prepareRetryingClaudeAgent(outputDir string, processEnv []string) (string, 
 	if current := processEnvValue(processEnv, "PYTHONPATH"); current != "" {
 		pythonPath += string(os.PathListSeparator) + current
 	}
-	return retryingClaudeImportPath, upsertProcessEnv(processEnv, "PYTHONPATH", pythonPath), nil
+	processEnv = upsertProcessEnv(processEnv, "PYTHONPATH", pythonPath)
+	processEnv = upsertProcessEnv(processEnv, "HARBOR_FACTORY_INSTALL_ATTEMPTS", fmt.Sprintf("%d", infraRetries+1))
+	processEnv = upsertProcessEnv(processEnv, "HARBOR_FACTORY_NPM_FETCH_RETRIES", fmt.Sprintf("%d", infraRetries))
+	return retryingClaudeImportPath, processEnv, nil
 }
 
 func processEnvValue(values []string, key string) string {

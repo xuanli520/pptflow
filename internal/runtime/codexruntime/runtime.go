@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/codex"
@@ -27,10 +28,19 @@ func New(exec executor.CommandRunner, preferredPath string, env map[string]strin
 	return Runtime{exec: exec, preferredPath: strings.TrimSpace(preferredPath), env: copyEnv(env)}
 }
 
-func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+type conversation struct {
+	session   appserver.Session
+	defaults  workflow.AgentConversationRequest
+	model     string
+	cleanup   string
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r Runtime) OpenConversation(ctx context.Context, req workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
 	capability := codex.DetectCLI(ctx, r.exec, r.preferredPath)
 	if err := codex.ValidateAppServerCapability(capability); err != nil {
-		return workflow.AgentTurnResult{}, err
+		return nil, err
 	}
 	projectPath := strings.TrimSpace(req.ProjectPath)
 	if projectPath == "" {
@@ -39,10 +49,6 @@ func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workf
 	logPath := strings.TrimSpace(req.LogPath)
 	if logPath == "" {
 		logPath = filepath.Join(projectPath, ".harbor-factory-codex.log")
-	}
-	timeout := time.Duration(req.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 5 * time.Minute
 	}
 	maxOutputBytes := req.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -64,11 +70,11 @@ func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workf
 	cleanupCodexHome := ""
 	sandbox, err := codex.NewSandbox(projectPath, filepath.Dir(logPath), fmt.Sprintf("harbor-factory-%d", time.Now().UnixNano()))
 	if err != nil {
-		return workflow.AgentTurnResult{}, err
+		return nil, err
 	}
 	if !hasConfiguredEnv(configuredEnv, "CODEX_HOME") {
 		if err := prepareAutomationCodexHome(sandbox.Home, projectPath); err != nil {
-			return workflow.AgentTurnResult{}, err
+			return nil, err
 		}
 		if configuredEnv == nil {
 			configuredEnv = map[string]string{}
@@ -77,17 +83,11 @@ func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workf
 		cleanupCodexHome = sandbox.Home
 	}
 	env = sandbox.Env(env, configuredEnv)
-	if cleanupCodexHome != "" {
-		defer func() { _ = os.RemoveAll(cleanupCodexHome) }()
-	}
 	session := appserver.New(envKeys(env))
 	if err := session.Start(ctx, appserver.Request{
-		Timeout:           timeout,
 		ProjectPath:       projectPath,
 		LogPath:           logPath,
 		Env:               env,
-		Prompt:            req.Prompt,
-		Input:             appServerInput(req.Input),
 		CommandPath:       capability.Path,
 		CapabilitySummary: capability.Version,
 		HasAppServer:      capability.HasAppServer,
@@ -99,13 +99,52 @@ func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workf
 		WorkspaceRoots:    workspaceRoots(projectPath, req.WorkspaceRoots),
 		MaxOutputBytes:    maxOutputBytes,
 	}); err != nil {
-		result, _ := session.Wait(context.Background())
-		if result.Result.Stderr != "" {
-			return workflow.AgentTurnResult{}, fmt.Errorf("%w: %s", err, result.Result.Stderr)
+		_ = session.Close()
+		if cleanupCodexHome != "" {
+			_ = os.RemoveAll(cleanupCodexHome)
 		}
-		return workflow.AgentTurnResult{}, err
+		return nil, err
 	}
-	result, err := session.Wait(ctx)
+	defaults := req
+	defaults.ProjectPath = projectPath
+	defaults.LogPath = logPath
+	defaults.SandboxMode = sandboxMode
+	defaults.SandboxPolicy = sandboxPolicy
+	defaults.MaxOutputBytes = maxOutputBytes
+	defaults.WorkspaceRoots = workspaceRoots(projectPath, req.WorkspaceRoots)
+	return &conversation{session: session, defaults: defaults, model: req.Model, cleanup: cleanupCodexHome}, nil
+}
+
+func (c *conversation) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+	if c == nil || c.session == nil {
+		return workflow.AgentTurnResult{}, fmt.Errorf("codex conversation is not open")
+	}
+	if model := strings.TrimSpace(req.Model); model != "" && model != strings.TrimSpace(c.model) {
+		return workflow.AgentTurnResult{}, fmt.Errorf("codex conversation model cannot change from %q to %q", c.model, model)
+	}
+	timeoutSeconds := req.TimeoutSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = c.defaults.TimeoutSeconds
+	}
+	timeout := time.Duration(timeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	maxOutputBytes := req.MaxOutputBytes
+	if maxOutputBytes <= 0 {
+		maxOutputBytes = c.defaults.MaxOutputBytes
+	}
+	logPath := strings.TrimSpace(req.LogPath)
+	if logPath == "" {
+		logPath = c.defaults.LogPath
+	}
+	result, err := c.session.Turn(ctx, appserver.TurnRequest{
+		Timeout:        timeout,
+		Prompt:         req.Prompt,
+		Input:          appServerInput(req.Input),
+		LogPath:        logPath,
+		MaxOutputBytes: maxOutputBytes,
+	})
 	if err != nil {
 		return workflow.AgentTurnResult{}, err
 	}
@@ -115,7 +154,24 @@ func (r Runtime) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workf
 			warnings = append(warnings, warning.Error)
 		}
 	}
-	return workflow.AgentTurnResult{Text: result.Result.Stdout, Model: req.Model, Warnings: warnings}, nil
+	return workflow.AgentTurnResult{Text: result.Result.Stdout, Model: c.model, Warnings: warnings}, nil
+}
+
+func (c *conversation) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closeOnce.Do(func() {
+		if c.session != nil {
+			c.closeErr = c.session.Close()
+		}
+		if c.cleanup != "" {
+			if err := os.RemoveAll(c.cleanup); c.closeErr == nil {
+				c.closeErr = err
+			}
+		}
+	})
+	return c.closeErr
 }
 
 func appServerInput(input []workflow.AgentInputPart) []appserver.InputPart {

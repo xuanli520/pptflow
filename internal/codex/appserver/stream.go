@@ -14,25 +14,6 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/executor"
 )
 
-func (s *appServerCodexReviewSession) Wait(ctx context.Context) (Result, error) {
-	s.mu.Lock()
-	done := s.done
-	s.mu.Unlock()
-	if done == nil {
-		return Result{}, fmt.Errorf("codex app-server review session is not started")
-	}
-	select {
-	case <-done:
-	case <-ctx.Done():
-		s.stop()
-		<-done
-	}
-	s.wg.Wait()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.result, s.err
-}
-
 func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), appServerMaxLineBytes(s.maxOutputBytes()))
@@ -246,7 +227,7 @@ func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnEr
 	Message string `json:"message"`
 }) {
 	s.mu.Lock()
-	if s.turnID != "" && turnID != s.turnID {
+	if s.turnDone == nil || (s.turnID != "" && turnID != s.turnID) {
 		s.mu.Unlock()
 		return
 	}
@@ -279,7 +260,20 @@ func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnEr
 		err = fmt.Errorf("%s", message)
 		result.Err = err
 	}
-	s.complete(result, err)
+	s.finishTurn(Result{Result: result}, err)
+}
+
+func (s *appServerCodexReviewSession) resetTurnCaptureLocked() {
+	s.items = map[string]string{}
+	s.deltas = map[string]string{}
+	s.deltaLogged = map[string]bool{}
+	s.deltaPreview = map[string]string{}
+	s.deltaPreviewTruncated = map[string]bool{}
+	s.activityPreview = ""
+	s.activityTruncated = false
+	s.agentPreviewStarted = false
+	s.itemDone = map[string]bool{}
+	s.itemOrder = nil
 }
 
 func (s *appServerCodexReviewSession) waitProcess(ctx context.Context, command string) {
@@ -324,6 +318,7 @@ func (s *appServerCodexReviewSession) complete(result executor.Result, err error
 	s.result.Result = result
 	s.result.Warnings = append(s.result.Warnings, s.warnings...)
 	s.err = err
+	s.finishTurnLocked(Result{Result: result}, err)
 	s.mu.Unlock()
 	if done != nil {
 		close(done)

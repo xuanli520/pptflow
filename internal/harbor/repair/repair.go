@@ -11,6 +11,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/commandlog"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
+	prompttemplates "github.com/purplevoid/harbor-factory/internal/templates"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
@@ -68,9 +69,13 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	if timeout <= 0 {
 		timeout = 600
 	}
-	result, err := opts.Agent.Turn(ctx, workflow.AgentTurnRequest{
+	prompt, err := buildPrompt(report)
+	if err != nil {
+		return finish(report, opts.WriteReport, fmt.Errorf("render task repair prompt: %w", err))
+	}
+	result, err := workflow.RunAgentTurn(ctx, opts.Agent, workflow.AgentTurnRequest{
 		ProjectPath:     report.TaskDir,
-		Prompt:          buildPrompt(report),
+		Prompt:          prompt,
 		Model:           opts.Model,
 		ReasoningEffort: opts.ReasoningEffort,
 		SandboxMode:     "workspace-write",
@@ -125,7 +130,15 @@ func Reusable(path, taskDir, guidance, source string) (Report, bool) {
 	return report, true
 }
 
-func buildPrompt(report Report) string {
+type repairPromptData struct {
+	Source       string
+	Round        int
+	BeforeDigest string
+	Findings     string
+	Guidance     string
+}
+
+func buildPrompt(report Report) (string, error) {
 	findings := "- No machine-check finding was supplied. Inspect the task files and operator guidance carefully."
 	if len(report.Findings) > 0 {
 		var lines []string
@@ -138,19 +151,17 @@ func buildPrompt(report Report) string {
 	if guidance == "" {
 		guidance = "No additional operator guidance. Resolve the listed review failures with the smallest coherent task changes."
 	}
-	return fmt.Sprintf(`You are repairing a CodeEdge Harbor task after review failure.
-
-Review source: %s
-Repair round: %d
-Current task digest: %s
-
-Blocking findings:
-%s
-
-Operator guidance:
-%s
-
-Edit the task in the current working directory directly. You may change only the standard task files: instruction.md, task.toml, tests_analysis.md, environment/, solution/, and tests/. Keep the pinned repository and commit unless the guidance explicitly says they are wrong. Make instruction, public API contracts, verifier behavior, oracle implementation, and tests_analysis mutually consistent. Fix actual defects instead of weakening checks or hiding failures. Do not modify workspace reports, reward files, or external paths. Run focused local syntax or static checks that do not require network access when useful. Finish with a concise summary of files changed and why.`, report.Source, report.Round, report.BeforeDigest, findings, guidance)
+	engine, err := prompttemplates.Default()
+	if err != nil {
+		return "", fmt.Errorf("load prompt templates: %w", err)
+	}
+	return engine.Render("phase2/task_repair", repairPromptData{
+		Source:       report.Source,
+		Round:        report.Round,
+		BeforeDigest: report.BeforeDigest,
+		Findings:     findings,
+		Guidance:     guidance,
+	})
 }
 
 func finish(report Report, path string, runErr error) (Report, error) {

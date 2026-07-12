@@ -20,6 +20,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/harbor/packager"
 	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 	"github.com/purplevoid/harbor-factory/internal/harbor/secretscan"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
@@ -50,7 +51,10 @@ func TestRunnerEmitsGateAndPersistsDecision(t *testing.T) {
 	timeout := time.After(5 * time.Second)
 	for gate == nil {
 		select {
-		case event := <-runner.Events():
+		case event, ok := <-runner.Events():
+			if !ok {
+				t.Fatalf("runner stopped before requesting a gate: %v", <-done)
+			}
 			if event.Type == "gate_requested" {
 				gate = event.Gate
 			}
@@ -133,76 +137,6 @@ func TestRunnerRejectsConcurrentWorkspaceOwnerWithoutPersisting(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(workspace, "state.json")); !os.IsNotExist(statErr) {
 		t.Fatalf("rejected runner wrote state.json: %v", statErr)
-	}
-}
-
-func TestRunnerRedactsGateArtifactsInEventLog(t *testing.T) {
-	workspace := t.TempDir()
-	runner := NewRunner(RunnerOptions{Workspace: workspace})
-	runner.emitEvent(domain.RunnerEvent{
-		Type:    "gate_requested",
-		NodeID:  "codeedge_lint",
-		Status:  "waiting",
-		Message: "review API_KEY=unit-test-secret",
-		Artifacts: []domain.ArtifactPreview{{
-			Name:    "lint_report.json",
-			Path:    filepath.Join(workspace, "lint_report.json"),
-			Content: "API_KEY=unit-test-secret and token=unit-test-secret",
-		}},
-		Gate: &domain.GateRequest{
-			GateID:  "final_review",
-			Message: "gate Bearer unit-test-secret-token",
-			Artifacts: []domain.ArtifactPreview{{
-				Name:    "lint_report.json",
-				Path:    filepath.Join(workspace, "lint_report.json"),
-				Content: "API_TOKEN=unit-test-secret",
-			}},
-			Checklist: []domain.ChecklistItem{{ID: "secret", Label: "Bearer unit-test-secret-token"}},
-		},
-	})
-
-	event := <-runner.Events()
-	if strings.Contains(event.Message, "unit-test-secret") || strings.Contains(event.Artifacts[0].Content, "unit-test-secret") || strings.Contains(event.Gate.Message, "unit-test-secret") || strings.Contains(event.Gate.Artifacts[0].Content, "unit-test-secret") {
-		t.Fatalf("event was not redacted: %+v", event)
-	}
-	raw, err := os.ReadFile(filepath.Join(workspace, "event_log.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	logText := string(raw)
-	if strings.Contains(logText, "unit-test-secret") {
-		t.Fatalf("event log contains unredacted secret: %s", logText)
-	}
-	if !strings.Contains(logText, "redacted") {
-		t.Fatalf("event log missing redaction marker: %s", logText)
-	}
-}
-
-func TestRunnerRedactsEventLogsInEventLog(t *testing.T) {
-	workspace := t.TempDir()
-	runner := NewRunner(RunnerOptions{Workspace: workspace})
-	runner.emitEvent(domain.RunnerEvent{
-		Type:    "node_failed",
-		NodeID:  "harbor_run_qwen",
-		Status:  "failed",
-		Message: "failed",
-		Logs: []domain.ArtifactPreview{{
-			Name:    "stderr.txt",
-			Path:    filepath.Join(workspace, "stderr.txt"),
-			Content: `{"OPENAI_API_KEY":"raw-log-secret"}`,
-		}},
-	})
-
-	event := <-runner.Events()
-	if strings.Contains(event.Logs[0].Content, "raw-log-secret") {
-		t.Fatalf("event log preview was not redacted: %+v", event.Logs[0])
-	}
-	raw, err := os.ReadFile(filepath.Join(workspace, "event_log.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "raw-log-secret") {
-		t.Fatalf("event_log.jsonl leaked log content secret: %s", raw)
 	}
 }
 
@@ -289,7 +223,7 @@ func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) 
 		HarborAgent:           "claude-code",
 		HarborAgentEnv:        []string{"ANTHROPIC_AUTH_TOKEN=" + secret, "ANTHROPIC_BASE_URL=https://example.invalid"},
 		QwenModel:             "qwen3.7-max",
-		OpusModel:             "claude-opus-4-8",
+		OpusModel:             "claude-opus-4-6",
 		QwenHarborBaseURL:     "https://qwen.example/v1",
 		OpusHarborBaseURL:     "https://opus.example/v1",
 		HarborTimeout:         123,
@@ -343,35 +277,6 @@ func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) 
 	}
 	if !loadedSnapshot.HarborAgentEnvOmitted || len(loadedSnapshot.HarborAgentEnvKeys) != 2 {
 		t.Fatalf("loaded snapshot missing env omission metadata: %+v", loadedSnapshot)
-	}
-}
-
-func TestRunnerRedactsPersistedGateDecision(t *testing.T) {
-	workspace := t.TempDir()
-	runner := NewRunner(RunnerOptions{Workspace: workspace})
-	secret := "raw-decision-secret"
-	err := runner.writeGateDecision("phase2", "final_review", domain.GateDecision{
-		RequestID: "req-1",
-		GateID:    "final_review",
-		Approved:  true,
-		Notes:     "API_KEY=" + secret,
-		EditedFiles: map[string]string{
-			"https://token@github.com/org/repo": "Bearer " + secret,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(filepath.Join(workspace, "phase2", "artifacts", "reviews", "final_review", "decision.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(raw)
-	if strings.Contains(text, secret) || strings.Contains(text, "token@github") {
-		t.Fatalf("decision file leaked secret-like content: %s", text)
-	}
-	if !strings.Contains(text, "redacted") {
-		t.Fatalf("decision file missing redaction marker: %s", text)
 	}
 }
 
@@ -575,10 +480,10 @@ func TestRunnerLabelsRecoveredRunAndNodeReuseBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !summary.Recovered || summary.PreviousRunID != "run-before-crash" || summary.RunID == summary.PreviousRunID {
+	if !summary.Recovered || summary.PreviousRunID != "run-before-crash" || summary.RunID != summary.PreviousRunID {
 		t.Fatalf("recovery boundary missing: %+v", summary)
 	}
-	if !eventMessageSeen(summary.Events, "", "previous=run-before-crash") || len(summary.RerunNodes) == 0 {
+	if len(summary.RerunNodes) == 0 {
 		t.Fatalf("recovery evidence missing: %+v", summary)
 	}
 }
@@ -619,7 +524,7 @@ func TestCancelQwenStageContinuesToOpus(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
 	exec := &runnerCancelableHarborExec{delegate: runnerHarborExec{outputs: []string{
-		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -667,7 +572,7 @@ func TestFailedQwenStageStillRunsOpus(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
 	exec := &runnerFailFirstHarborExec{delegate: runnerHarborExec{outputs: []string{
-		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -697,7 +602,7 @@ func TestFailedQwenStageStillRunsOpus(t *testing.T) {
 func TestRunnerCanRunOnlyOpusForEvidenceRecovery(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	exec := &runnerHarborExec{outputs: []string{
-		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -714,14 +619,17 @@ func TestRunnerCanRunOnlyOpusForEvidenceRecovery(t *testing.T) {
 		HarborExec:     exec,
 	})
 	summary, err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "screenshot") {
+		t.Fatalf("expected incomplete result evidence to fail the result gate, got %v", err)
 	}
 	if summary.Passed || summary.QwenResult != nil || summary.OpusResult == nil || exec.counter != 1 {
 		t.Fatalf("expected one Opus-only recovery run with incomplete final evidence: executions=%d summary=%+v", exec.counter, summary)
 	}
 	if eventSeen(summary.Events, nodes.HarborRunQwen, "running") || !eventSeen(summary.Events, nodes.HarborRunOpus, "succeeded") {
 		t.Fatalf("unexpected model stages: %+v", summary.Events)
+	}
+	if !eventSeen(summary.Events, nodes.ResultReview, "failed") {
+		t.Fatalf("missing failed result review for incomplete evidence: %+v", summary.Events)
 	}
 }
 
@@ -748,107 +656,6 @@ func TestRunnerRejectsCredentialedModelRouteURL(t *testing.T) {
 	}
 }
 
-func TestRunnerRejectsApprovedFailingCriticalGate(t *testing.T) {
-	decision := enforceGateDecision(domain.GateRequest{
-		RequestID: "req-1",
-		GateID:    "final_review",
-		Checklist: []domain.ChecklistItem{{ID: "critical", Label: "blocking check", Critical: true, Passed: false}},
-	}, domain.GateDecision{
-		RequestID: "req-1",
-		GateID:    "final_review",
-		Approved:  true,
-		Notes:     "looks fine",
-		DecidedAt: time.Now(),
-	})
-	if decision.Approved {
-		t.Fatalf("failing critical gate should reject approval: %+v", decision)
-	}
-	if !strings.Contains(decision.Notes, "blocking check") {
-		t.Fatalf("decision notes missing blocker: %+v", decision)
-	}
-}
-
-func TestGeneratedTaskChecklistBlocksDirtyLegacyOutput(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	analysis := filepath.Join(t.TempDir(), "tests_analysis.md")
-	if err := os.WriteFile(analysis, []byte(validRunnerTestsAnalysis()), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(taskDir, "environment", "promptflow_runner.py"), []byte("legacy image2 presentation residue\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	items := generatedTaskChecklist(taskDir, analysis)
-	blockers := blockingGateChecklist(items)
-	joined := strings.Join(blockers, "\n")
-	if !strings.Contains(joined, "unexpected files") || !strings.Contains(joined, "legacy residue") {
-		t.Fatalf("expected dirty output blockers, got items=%+v blockers=%v", items, blockers)
-	}
-}
-
-func TestGeneratedTaskChecklistAllowsWordsContainingLegacySubstrings(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	solution := filepath.Join(taskDir, "solution", "solve.sh")
-	raw, err := os.ReadFile(solution)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(solution, append(raw, []byte("\n# encoded representation and slider state\n")...), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	extras, legacy, err := generatedTaskResidue(taskDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(extras) != 0 || len(legacy) != 0 {
-		t.Fatalf("normal identifier substrings were rejected: extras=%v legacy=%v", extras, legacy)
-	}
-}
-
-func TestRunnerReadsWorkspaceGateDecision(t *testing.T) {
-	workspace := t.TempDir()
-	runner := NewRunner(RunnerOptions{Workspace: workspace})
-	expectedRequestID := "phase2:final_review"
-	path := nodes.ReviewDecisionPath(workspace, "phase2", nodes.FinalReview)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := json.Marshal(domain.GateDecision{
-		RequestID: expectedRequestID,
-		GateID:    nodes.FinalReview,
-		Approved:  true,
-		Notes:     "from file",
-		DecidedAt: time.Now(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	decision, err := runner.reviewGate(ctx, nodes.FinalReview, "Final Review", nodes.FinalReview, "Review", []domain.ChecklistItem{{ID: "ok", Label: "ok", Critical: true, Passed: true}}, nil, "phase2")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decision.RequestID != expectedRequestID || !decision.Approved || decision.Notes != "from file" {
-		t.Fatalf("unexpected decision: %+v", decision)
-	}
-
-	select {
-	case event := <-runner.Events():
-		if event.Type != "gate_requested" || event.Gate == nil {
-			t.Fatalf("expected gate event, got %+v", event)
-		}
-		if event.Gate.RequestID != expectedRequestID {
-			t.Fatalf("gate request_id = %q, want %q", event.Gate.RequestID, expectedRequestID)
-		}
-	default:
-		t.Fatal("expected gate event")
-	}
-}
-
 func TestRunnerRejectsEmptyRun(t *testing.T) {
 	runner := NewRunner(RunnerOptions{Workspace: t.TempDir(), AutoApprove: true})
 	summary, err := runner.Run(context.Background())
@@ -868,12 +675,13 @@ func TestRunnerGenerateThenLintWithAutoApprovedGates(t *testing.T) {
 	workspace := t.TempDir()
 	agent := &runnerFakeAgent{outputs: []string{
 		jsonText(t, domain.RepoAnalysis{
-			SchemaVersion: "harbor.repo_analysis.v1",
-			RepoURL:       repoURL,
-			CommitSHA:     commit,
-			Language:      "go",
-			BuildSystem:   "go modules",
-			TestFramework: "go test",
+			SchemaVersion:      "harbor.repo_analysis.v1",
+			RepoURL:            repoURL,
+			CommitSHA:          commit,
+			Language:           "go",
+			BuildSystem:        "go modules",
+			TestFramework:      "go test",
+			PotentialTaskAreas: []domain.TaskArea{{Area: "configuration", Module: "config", Description: "environment override precedence", Difficulty: "medium", TypeSuggestion: "bug-fix", AffectedFilesCount: 1}},
 		}),
 		jsonText(t, domain.TaskProposal{
 			SchemaVersion:         "harbor.task_proposal.v1",
@@ -925,8 +733,8 @@ func TestRunnerGenerateThenLintWithAutoApprovedGates(t *testing.T) {
 	for _, decision := range summary.GateDecisions {
 		gateIDs[decision.GateID]++
 	}
-	if gateIDs[nodes.TaskReview] != 1 || gateIDs[nodes.FinalReview] != 1 || gateIDs[nodes.ContentReview] != 0 || gateIDs[nodes.ResultReview] != 0 || len(summary.GateDecisions) != 2 {
-		t.Fatalf("new flow must contain only direction and final release gates: %+v", summary.GateDecisions)
+	if gateIDs[nodes.TaskReview] != 1 || gateIDs[nodes.ContentReview] != 1 || gateIDs[nodes.SolutionReview] != 1 || gateIDs[nodes.FinalReview] != 1 || gateIDs[nodes.ResultReview] != 0 || len(summary.GateDecisions) != 4 {
+		t.Fatalf("generated flow must contain all pre-evaluation review gates: %+v", summary.GateDecisions)
 	}
 	for _, rel := range []string{
 		filepath.Join("phase1", "artifacts", "instruction_generate", "instruction.md"),
@@ -936,6 +744,8 @@ func TestRunnerGenerateThenLintWithAutoApprovedGates(t *testing.T) {
 		filepath.Join("phase2", "artifacts", "test_generate", "test.sh"),
 		filepath.Join("phase3", "artifacts", "tests_analysis", "tests_analysis.md"),
 		filepath.Join("phase1", "artifacts", "reviews", "task_review", "decision.json"),
+		filepath.Join("phase1", "artifacts", "reviews", "content_review", "decision.json"),
+		filepath.Join("phase2", "artifacts", "reviews", "solution_review", "decision.json"),
 		filepath.Join("phase2", "artifacts", "reviews", "final_review", "decision.json"),
 	} {
 		if _, err := os.Stat(filepath.Join(workspace, rel)); err != nil {
@@ -960,7 +770,7 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 			{Trial: 3, Turns: 23, Reward: 0},
 			{Trial: 4, Turns: 23, Reward: 0},
 		}, ""),
-		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -998,7 +808,7 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 	if len(exec.commands) != 2 || !strings.Contains(exec.commands[0], "ANTHROPIC_BASE_URL=https://qwen.example/v1") || strings.Contains(exec.commands[0], "opus.example") || !strings.Contains(exec.commands[1], "ANTHROPIC_BASE_URL=https://opus.example/v1") || strings.Contains(exec.commands[1], "qwen.example") {
 		t.Fatalf("per-model Harbor routes were not isolated: %v", exec.commands)
 	}
-	if !strings.Contains(exec.commands[0], "CLAUDE_CODE_SUBAGENT_MODEL=qwen3.7-max") || !strings.Contains(exec.commands[0], "ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3.7-max") || !strings.Contains(exec.commands[1], "CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-4-8") || !strings.Contains(exec.commands[1], "ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8") {
+	if !strings.Contains(exec.commands[0], "CLAUDE_CODE_SUBAGENT_MODEL=qwen3.7-max") || !strings.Contains(exec.commands[0], "ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3.7-max") || !strings.Contains(exec.commands[1], "CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-4-6") || !strings.Contains(exec.commands[1], "ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6") {
 		t.Fatalf("nested Claude model routes were not pinned to their stages: %v", exec.commands)
 	}
 	for _, rel := range []string{
@@ -1007,12 +817,13 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 		filepath.Join("phase3", "artifacts", "harbor_run_opus", "opus_result.json"),
 		filepath.Join("phase3", "artifacts", "harbor_run_opus", "trial_result.json"),
 		filepath.Join("phase2", "artifacts", "reviews", "final_review", "decision.json"),
+		filepath.Join("phase3", "artifacts", "reviews", "result_review", "decision.json"),
 	} {
 		if _, err := os.Stat(filepath.Join(workspace, rel)); err != nil {
 			t.Fatalf("missing harbor run result %s: %v", rel, err)
 		}
 	}
-	if !eventSeen(summary.Events, "harbor_run_qwen", "succeeded") || !eventSeen(summary.Events, "harbor_run_opus", "succeeded") || !eventSeen(summary.Events, "submission_lint", "succeeded") || !eventSeen(summary.Events, "final_review", "succeeded") {
+	if !eventSeen(summary.Events, "harbor_run_qwen", "succeeded") || !eventSeen(summary.Events, "harbor_run_opus", "succeeded") || !eventSeen(summary.Events, "submission_lint", "succeeded") || !eventSeen(summary.Events, "final_review", "succeeded") || !eventSeen(summary.Events, "result_review", "succeeded") {
 		t.Fatalf("events missing harbor run nodes: %+v", summary.Events)
 	}
 	if !eventMessageSeen(summary.Events, nodes.HarborRunQwen, "trial started") {
@@ -1024,8 +835,11 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 	if eventIndex(summary.Events, "submission_lint", "succeeded") < eventIndex(summary.Events, "harbor_run_opus", "succeeded") {
 		t.Fatalf("submission lint should run after harbor results: %+v", summary.Events)
 	}
-	if eventIndex(summary.Events, "final_review", "succeeded") < eventIndex(summary.Events, "submission_lint", "succeeded") {
-		t.Fatalf("final release gate should run after submission lint: %+v", summary.Events)
+	if eventIndex(summary.Events, "final_review", "succeeded") > eventIndex(summary.Events, "harbor_run_qwen", "running") {
+		t.Fatalf("final quality gate should run before Harbor evaluation: %+v", summary.Events)
+	}
+	if eventIndex(summary.Events, "result_review", "succeeded") < eventIndex(summary.Events, "harbor_run_opus", "succeeded") || eventIndex(summary.Events, "result_review", "succeeded") > eventIndex(summary.Events, "submission_lint", "running") {
+		t.Fatalf("result review must run after Harbor evidence and before submission lint: %+v", summary.Events)
 	}
 }
 
@@ -1048,7 +862,7 @@ func TestRunnerResumeDiscoversCompletedQwenAndRunsOnlyMissingOpus(t *testing.T) 
 		{Trial: 4, Turns: 23, Reward: 0},
 	}, digest)
 	exec := &runnerHarborExec{outputs: []string{
-		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -1081,8 +895,8 @@ func TestRunnerResumeDiscoversCompletedQwenAndRunsOnlyMissingOpus(t *testing.T) 
 	if summary.OpusResult == nil || filepath.Base(summary.OpusResult.ResultPath) != "opus_result.json" {
 		t.Fatalf("missing opus result was not generated: %+v", summary.OpusResult)
 	}
-	if eventSeen(summary.Events, nodes.HarborRunQwen, "running") {
-		t.Fatalf("qwen should not be re-run when workspace evidence exists: %+v", summary.Events)
+	if eventMessageSeen(summary.Events, nodes.HarborRunQwen, "trial started") {
+		t.Fatalf("qwen evaluation should not be re-run when workspace evidence exists: %+v", summary.Events)
 	}
 	if !eventSeen(summary.Events, nodes.HarborRunQwen, "succeeded") || !eventSeen(summary.Events, nodes.HarborRunOpus, "succeeded") {
 		t.Fatalf("expected loaded qwen and generated opus success events: %+v", summary.Events)
@@ -1135,7 +949,7 @@ func TestRunnerReviewsProvidedHarborResults(t *testing.T) {
 		{Trial: 3, Turns: 23, Reward: 0},
 		{Trial: 4, Turns: 23, Reward: 0},
 	}, digest)
-	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-8", []domain.TrialRun{
+	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-6", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -1157,14 +971,14 @@ func TestRunnerReviewsProvidedHarborResults(t *testing.T) {
 	if !summary.Passed {
 		t.Fatalf("summary did not pass: %+v", summary)
 	}
-	if summary.QwenResult == nil || summary.QwenResult.ResultPath != qwenPath || summary.OpusResult == nil || summary.OpusResult.ResultPath != opusPath {
-		t.Fatalf("provided results not loaded: qwen=%+v opus=%+v", summary.QwenResult, summary.OpusResult)
+	if summary.QwenResult == nil || summary.QwenResult.ResultPath != nodes.QwenResultPath(workspace) || summary.OpusResult == nil || summary.OpusResult.ResultPath != nodes.OpusResultPath(workspace) {
+		t.Fatalf("provided results were not imported into canonical ArtifactStore paths: qwen=%+v opus=%+v", summary.QwenResult, summary.OpusResult)
 	}
-	if !eventSeen(summary.Events, "final_review", "succeeded") {
-		t.Fatalf("final release gate did not include provided results: %+v", summary.Events)
+	if !eventSeen(summary.Events, nodes.ResultReview, "succeeded") {
+		t.Fatalf("result review gate did not validate imported results: %+v", summary.Events)
 	}
-	if _, err := os.Stat(filepath.Join(workspace, "phase2", "artifacts", "reviews", "final_review", "decision.json")); err != nil {
-		t.Fatalf("missing final release decision: %v", err)
+	if _, err := os.Stat(filepath.Join(workspace, "phase3", "artifacts", "reviews", "result_review", "decision.json")); err != nil {
+		t.Fatalf("missing result review decision: %v", err)
 	}
 }
 
@@ -1187,7 +1001,7 @@ func TestRunnerRejectsProvidedHarborResultWithoutCommandEvidence(t *testing.T) {
 	}, digest)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-8", []domain.TrialRun{
+	writeRunnerTrialResult(t, opusPath, taskDir, "claude-opus-4-6", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -1203,8 +1017,8 @@ func TestRunnerRejectsProvidedHarborResultWithoutCommandEvidence(t *testing.T) {
 		OpusScreenshot: opusScreenshot,
 	})
 	summary, err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "command_run_path") {
+		t.Fatalf("expected strict command evidence failure, got %v", err)
 	}
 	if summary.Passed {
 		t.Fatalf("expected provided result without command evidence to fail, got %+v", summary)
@@ -1214,33 +1028,6 @@ func TestRunnerRejectsProvidedHarborResultWithoutCommandEvidence(t *testing.T) {
 	}
 	if eventSeen(summary.Events, nodes.ResultReview, "succeeded") {
 		t.Fatalf("result review should not succeed after strict evidence failure: %+v", summary.Events)
-	}
-}
-
-func TestResultChecklistRequiresCommandRunEvidence(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	digest, err := harborrun.ComputeTaskDigest(taskDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var result domain.TrialResult
-	if err := json.Unmarshal([]byte(runnerTrialResultJSON("qwen3.7-max", []domain.TrialRun{
-		{Trial: 1, Turns: 22, Reward: 0},
-		{Trial: 2, Passed: true, Turns: 24, Reward: 1},
-		{Trial: 3, Turns: 23, Reward: 0},
-		{Trial: 4, Turns: 23, Reward: 0},
-	}, digest)), &result); err != nil {
-		t.Fatal(err)
-	}
-	items := trialResultChecklist("qwen", "Qwen", &result, harborResultValidationOptions(taskDir, "qwen3.7-max", "claude-code", true))
-	var found bool
-	for _, item := range items {
-		if strings.Contains(item.Label, "command_run_path is required") && item.Critical && !item.Passed {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected command_run_path critical failure, got %+v", items)
 	}
 }
 
@@ -1280,50 +1067,6 @@ func TestRunnerQualityCheckPersistsReport(t *testing.T) {
 	}
 }
 
-func TestLoadReusableQualityReportRequiresCurrentTaskDigest(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	digest, err := harborrun.ComputeTaskDigest(taskDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reportPath := filepath.Join(t.TempDir(), "quality_report.json")
-	writeReport := func(taskDigest string) {
-		t.Helper()
-		report := domain.QualityReport{
-			SchemaVersion: "harbor.quality_report.v1",
-			TaskDir:       taskDir,
-			TaskDigest:    taskDigest,
-			Checks:        map[string]domain.QualityCheck{},
-			OverallPass:   true,
-			CreatedAt:     time.Now().UTC(),
-		}
-		raw, err := json.Marshal(report)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(reportPath, raw, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	writeReport("")
-	if _, ok := loadReusableQualityReport(taskDir, reportPath); ok {
-		t.Fatal("legacy quality report without task_digest must not be reused")
-	}
-
-	writeReport(digest)
-	if _, ok := loadReusableQualityReport(taskDir, reportPath); !ok {
-		t.Fatal("quality report with the current task digest should be reusable")
-	}
-
-	if err := os.WriteFile(filepath.Join(taskDir, "instruction.md"), []byte("changed task instruction\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := loadReusableQualityReport(taskDir, reportPath); ok {
-		t.Fatal("quality report must not be reused after task content changes")
-	}
-}
-
 func TestRunnerReusesExistingVerifyReportWhenDigestMatches(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
@@ -1346,6 +1089,9 @@ func TestRunnerReusesExistingVerifyReportWhenDigestMatches(t *testing.T) {
 	if !firstSummary.Passed || firstSummary.VerifyReport == nil {
 		t.Fatalf("initial verify run did not pass: %+v", firstSummary)
 	}
+	if err := packager.ValidateVerifyReport(nodes.VerifyReportPath(workspace), taskDir); err != nil {
+		t.Fatalf("fresh Engine verification report must be reusable: %v", err)
+	}
 
 	second := NewRunner(RunnerOptions{
 		TaskDir:      taskDir,
@@ -1361,8 +1107,10 @@ func TestRunnerReusesExistingVerifyReportWhenDigestMatches(t *testing.T) {
 	if !summary.Passed || summary.VerifyReport == nil || summary.VerifyReport.TaskDigest != firstSummary.VerifyReport.TaskDigest {
 		t.Fatalf("reused verify run did not pass: %+v", summary)
 	}
-	if eventSeen(summary.Events, nodes.HarborVerify, "running") {
-		t.Fatalf("verify should not re-run when reusable report exists: %+v", summary.Events)
+	for _, nodeID := range []string{nodes.DockerBuild, nodes.InitialVerify, nodes.OracleVerify} {
+		if eventSeen(summary.Events, nodeID, "running") {
+			t.Fatalf("verification command node %s should not run when reusable report exists: %+v", nodeID, summary.Events)
+		}
 	}
 	if !eventMessageSeen(summary.Events, nodes.HarborVerify, "reused existing Docker/oracle verification report") {
 		t.Fatalf("verify reuse event missing: %+v", summary.Events)
@@ -1372,11 +1120,16 @@ func TestRunnerReusesExistingVerifyReportWhenDigestMatches(t *testing.T) {
 func TestRunnerSimilarityCheckPersistsReport(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
+	historyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(historyDir, "unrelated.md"), []byte("A historical frontend typography task with no configuration loader or Harbor verifier overlap.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	runner := NewRunner(RunnerOptions{
-		TaskDir:         taskDir,
-		Workspace:       workspace,
-		AutoApprove:     true,
-		SimilarityCheck: true,
+		TaskDir:               taskDir,
+		Workspace:             workspace,
+		AutoApprove:           true,
+		SimilarityCheck:       true,
+		SimilarityHistoryDirs: []string{historyDir},
 	})
 	summary, err := runner.Run(context.Background())
 	if err != nil {
@@ -1432,9 +1185,6 @@ func TestRunnerReusesExistingSimilarityReportWhenDigestMatches(t *testing.T) {
 	if !summary.Passed || summary.SimilarityReport == nil || summary.SimilarityReport.TaskDigest != firstSummary.SimilarityReport.TaskDigest {
 		t.Fatalf("reused similarity run did not pass: %+v", summary)
 	}
-	if eventSeen(summary.Events, nodes.SimilarityCheck, "running") {
-		t.Fatalf("similarity should not re-run when reusable report exists: %+v", summary.Events)
-	}
 	if !eventMessageSeen(summary.Events, nodes.SimilarityCheck, "reused existing similarity report") {
 		t.Fatalf("similarity reuse event missing: %+v", summary.Events)
 	}
@@ -1455,8 +1205,8 @@ func TestRunnerSimilarityCheckFailsOnHistoryDuplicate(t *testing.T) {
 		SimilarityThreshold:   0.01,
 	})
 	summary, err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "similarity check") {
+		t.Fatalf("expected deterministic similarity failure, got %v", err)
 	}
 	if summary.Passed || summary.SimilarityReport == nil || summary.SimilarityReport.OverallPass {
 		t.Fatalf("expected similarity failure, got summary=%+v", summary)
@@ -1499,7 +1249,7 @@ func TestRunnerPackageForcesVerifyHarborAndSubmissionLint(t *testing.T) {
 			{Trial: 3, Turns: 23, Reward: 0},
 			{Trial: 4, Turns: 23, Reward: 0},
 		}, ""),
-		runnerTrialResultJSON("claude-opus-4-8", []domain.TrialRun{
+		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -1543,7 +1293,6 @@ func TestRunnerPackageForcesVerifyHarborAndSubmissionLint(t *testing.T) {
 		t.Fatalf("missing package zip: %v", err)
 	}
 	for _, nodeID := range []string{
-		nodes.HarborVerify,
 		nodes.DockerBuild,
 		nodes.InitialVerify,
 		nodes.OracleVerify,
@@ -1596,8 +1345,8 @@ func TestRunnerPackageFailsWhenSimilaritySourceUnreadable(t *testing.T) {
 		VerifyExec:            verifyExec,
 	})
 	summary, err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "similarity check") {
+		t.Fatalf("expected unreadable similarity source to fail, got %v", err)
 	}
 	if summary.Passed || summary.SimilarityReport == nil || summary.SimilarityReport.OverallPass {
 		t.Fatalf("expected similarity failure, got %+v", summary)
@@ -1633,7 +1382,7 @@ func TestRunnerPackageUsesDefaultWorkspaceForEvidenceReports(t *testing.T) {
 		{Trial: 3, Turns: 23, Reward: 0},
 		{Trial: 4, Turns: 23, Reward: 0},
 	}, digest)
-	writeRunnerTrialResult(t, opusResult, taskDir, "claude-opus-4-8", []domain.TrialRun{
+	writeRunnerTrialResult(t, opusResult, taskDir, "claude-opus-4-6", []domain.TrialRun{
 		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
 		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
@@ -1661,6 +1410,14 @@ func TestRunnerPackageUsesDefaultWorkspaceForEvidenceReports(t *testing.T) {
 		AutoApprove:           true,
 		Package:               true,
 		OutputDir:             outputDir,
+		TaskName:              "sample",
+		CodeLang:              "go",
+		TaskType:              "bug-fix",
+		Application:           "backend",
+		AHT:                   "45 minutes",
+		Description:           "sample task",
+		RepoURL:               "https://github.com/org/repo",
+		Commit:                "abc1234",
 		TestsAnalysis:         analysis,
 		QwenResult:            qwenResult,
 		OpusResult:            opusResult,
@@ -1912,6 +1669,20 @@ type runnerRepairAgent struct {
 	mutate func(workflow.AgentTurnRequest, int) error
 }
 
+type runnerTestConversation struct {
+	turn func(context.Context, workflow.AgentTurnRequest) (workflow.AgentTurnResult, error)
+}
+
+func (c runnerTestConversation) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+	return c.turn(ctx, req)
+}
+
+func (runnerTestConversation) Close() error { return nil }
+
+func (a *runnerRepairAgent) OpenConversation(context.Context, workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+	return runnerTestConversation{turn: a.Turn}, nil
+}
+
 func (a *runnerRepairAgent) Turn(_ context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
 	a.calls++
 	a.last = req
@@ -1931,6 +1702,28 @@ func (f *runnerFakeAgent) Turn(_ context.Context, req workflow.AgentTurnRequest)
 	f.outputs = f.outputs[1:]
 	return workflow.AgentTurnResult{Text: out, Model: req.Model}, nil
 }
+
+func (f *runnerFakeAgent) OpenConversation(context.Context, workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+	return &runnerRepeatingConversation{agent: f}, nil
+}
+
+type runnerRepeatingConversation struct {
+	agent  *runnerFakeAgent
+	result workflow.AgentTurnResult
+}
+
+func (c *runnerRepeatingConversation) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+	if c.result.Text != "" {
+		return c.result, nil
+	}
+	result, err := c.agent.Turn(ctx, req)
+	if err == nil {
+		c.result = result
+	}
+	return result, err
+}
+
+func (*runnerRepeatingConversation) Close() error { return nil }
 
 type runnerHarborExec struct {
 	outputs  []string

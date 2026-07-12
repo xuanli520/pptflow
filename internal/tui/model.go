@@ -682,7 +682,7 @@ func reviewGatePhase(gateID string) (string, bool) {
 		return "phase1", true
 	case nodes.ResultReview:
 		return "phase3", true
-	case nodes.FinalReview:
+	case nodes.SolutionReview, nodes.FinalReview:
 		return "phase2", true
 	}
 	return "", false
@@ -1116,10 +1116,10 @@ func applyStartDefaults(opts app.RunnerOptions) app.RunnerOptions {
 		opts.HarborAgent = "claude-code"
 	}
 	if strings.TrimSpace(opts.QwenModel) == "" {
-		opts.QwenModel = "qwen3.7-max"
+		opts.QwenModel = domain.DefaultQwenModel
 	}
 	if strings.TrimSpace(opts.OpusModel) == "" {
-		opts.OpusModel = "claude-opus-4-8"
+		opts.OpusModel = domain.DefaultOpusModel
 	}
 	if opts.HarborTimeout == 0 {
 		opts.HarborTimeout = 7200
@@ -2036,7 +2036,7 @@ func (m model) editableWorkspaceArtifact(path string) bool {
 
 func editableWorkspaceArtifactPaths(workspace string) []string {
 	var paths []string
-	for _, gateID := range []string{nodes.TaskReview, nodes.ContentReview, nodes.FinalReview, nodes.ResultReview} {
+	for _, gateID := range []string{nodes.TaskReview, nodes.ContentReview, nodes.SolutionReview, nodes.FinalReview, nodes.ResultReview} {
 		paths = append(paths, nodes.ReviewDecisionPath(workspace, gateDecisionPhase(gateID), gateID))
 	}
 	return paths
@@ -2191,7 +2191,7 @@ func loadWorkspaceState(workspace string) (domain.RunSummary, []domain.RunnerEve
 
 func loadWorkspaceGateDecisions(workspace string) []domain.GateDecision {
 	var decisions []domain.GateDecision
-	for _, gateID := range []string{nodes.TaskReview, nodes.ContentReview, nodes.FinalReview, nodes.ResultReview} {
+	for _, gateID := range []string{nodes.TaskReview, nodes.ContentReview, nodes.SolutionReview, nodes.FinalReview, nodes.ResultReview} {
 		path := nodes.ReviewDecisionPath(workspace, gateDecisionPhase(gateID), gateID)
 		raw, err := os.ReadFile(path)
 		if err != nil {

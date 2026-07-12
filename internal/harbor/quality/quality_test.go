@@ -134,9 +134,15 @@ func TestRunRedactsAgentOutputInReport(t *testing.T) {
 
 type qualityFakeAgent string
 
+func (a qualityFakeAgent) OpenConversation(context.Context, workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+	return a, nil
+}
+
 func (a qualityFakeAgent) Turn(context.Context, workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
 	return workflow.AgentTurnResult{Text: string(a), Model: "fake"}, nil
 }
+
+func (qualityFakeAgent) Close() error { return nil }
 
 func writeQualityTask(t *testing.T, unsafe bool) string {
 	t.Helper()

@@ -32,6 +32,7 @@ func newSessionProbeForTest(req Request, turnID string, processCtx context.Conte
 		req:                   req,
 		processCtx:            processCtx,
 		done:                  make(chan struct{}),
+		turnDone:              make(chan struct{}),
 		responses:             map[int]chan appServerRPCMessage{},
 		turnID:                turnID,
 		items:                 map[string]string{},

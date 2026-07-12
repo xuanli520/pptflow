@@ -16,14 +16,9 @@ func TestOrderHasUniqueNodeIDs(t *testing.T) {
 		}
 		seen[id] = true
 	}
-	for _, id := range []string{TaskReview, RuntimeSelfCheck, InstructionGen, DockerBuild, InitialVerify, OracleVerify, HarborRunQwen, HarborRunOpus, FinalReview, Package} {
+	for _, id := range []string{TaskReview, ContentReview, SolutionReview, RuntimeSelfCheck, InstructionGen, DockerBuild, InitialVerify, OracleVerify, FinalReview, HarborRunQwen, HarborRunOpus, ResultReview, PublishTask, Package} {
 		if !seen[id] {
 			t.Fatalf("node order missing %s", id)
-		}
-	}
-	for _, redundant := range []string{ContentReview, ResultReview} {
-		if seen[redundant] {
-			t.Fatalf("redundant review node remains in active order: %s", redundant)
 		}
 	}
 }
@@ -41,6 +36,7 @@ func TestArtifactPathsMatchDevPlanLayout(t *testing.T) {
 		PrimaryArtifactPath(workspace, OracleVerify):   filepath.Join(workspace, "phase2", "artifacts", "oracle_verify", "oracle_result.json"),
 		PrimaryArtifactPath(workspace, HarborRunQwen):  filepath.Join(workspace, "phase3", "artifacts", "harbor_run_qwen", "qwen_result.json"),
 		PrimaryArtifactPath(workspace, HarborRunOpus):  filepath.Join(workspace, "phase3", "artifacts", "harbor_run_opus", "opus_result.json"),
+		PrimaryArtifactPath(workspace, PublishTask):    filepath.Join(workspace, "phase3", "artifacts", "publish_task", "publish_receipt.json"),
 	}
 	for got, want := range checks {
 		if got != want {

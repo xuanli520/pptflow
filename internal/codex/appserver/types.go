@@ -10,8 +10,9 @@ import (
 
 type Session interface {
 	Start(ctx context.Context, request Request) error
+	Turn(ctx context.Context, request TurnRequest) (Result, error)
 	SendGuidance(ctx context.Context, message string) error
-	Wait(ctx context.Context) (Result, error)
+	Close() error
 }
 
 type Request struct {
@@ -32,6 +33,15 @@ type Request struct {
 	WorkspaceRoots    []string
 	MaxOutputBytes    int
 	OnDelta           func(update Update)
+}
+
+type TurnRequest struct {
+	Timeout        time.Duration
+	Prompt         string
+	Input          []InputPart
+	LogPath        string
+	MaxOutputBytes int
+	OnDelta        func(update Update)
 }
 
 type InputPart struct {

@@ -29,7 +29,7 @@ func (AgentTurnPlugin) Execute(ctx context.Context, req workflow.NodeRequest) (w
 	if err != nil {
 		return workflow.NodeResult{}, err
 	}
-	result, err := req.Runtimes.Agent.Turn(ctx, workflow.AgentTurnRequest{
+	result, err := workflow.RunAgentTurn(ctx, req.Runtimes.Agent, workflow.AgentTurnRequest{
 		ProjectPath:       req.WorkspaceRoot,
 		Prompt:            stringConfig(req.Spec.Config, "prompt"),
 		Model:             stringConfig(req.Spec.Config, "model"),

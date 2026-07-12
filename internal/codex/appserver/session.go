@@ -16,6 +16,7 @@ import (
 type appServerCodexReviewSession struct {
 	mu                    sync.Mutex
 	writeMu               sync.Mutex
+	turnMu                sync.Mutex
 	req                   Request
 	cmd                   *exec.Cmd
 	stdin                 io.WriteCloser
@@ -28,6 +29,9 @@ type appServerCodexReviewSession struct {
 	shutdownOnce          sync.Once
 	result                Result
 	err                   error
+	turnDone              chan struct{}
+	turnResult            Result
+	turnErr               error
 	nextID                int
 	responses             map[int]chan appServerRPCMessage
 	threadID              string
@@ -109,7 +113,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 		return err
 	}
 	preamble := commandString(request.CommandPath, args) +
-		"\n\nPrompt: supplied via app-server turn/start; sha256=" + sha256Text(request.Prompt) +
+		"\n\nConversation: one ephemeral app-server thread with caller-driven turns" +
 		"\nCodex capability: " + request.CapabilitySummary +
 		"\nCodex env keys: " + strings.Join(s.envKeys, ",") +
 		"\nSandbox mode: " + normalizeSandboxMode(request.SandboxMode) +
@@ -174,21 +178,133 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	s.mu.Lock()
 	s.threadID = threadID
 	s.mu.Unlock()
-	turnResult, err := s.sendRequest(initCtx, "turn/start", appServerTurnStartParams(request, threadID))
-	if err != nil {
-		s.failStart(commandString(request.CommandPath, args), err)
-		return err
+	s.appendLog(fmt.Sprintf("Codex app-server thread=%s ready\n", threadID))
+	return nil
+}
+
+func (s *appServerCodexReviewSession) Turn(ctx context.Context, request TurnRequest) (Result, error) {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+
+	s.mu.Lock()
+	if s.done == nil || s.threadID == "" {
+		s.mu.Unlock()
+		return Result{}, fmt.Errorf("codex app-server conversation is not started")
 	}
-	turnID := stringAtPath(turnResult, "turn", "id")
-	if turnID == "" {
-		err := fmt.Errorf("codex app-server turn/start response missing turn.id")
-		s.failStart(commandString(request.CommandPath, args), err)
-		return err
+	if s.completed {
+		err := s.err
+		s.mu.Unlock()
+		if err == nil {
+			err = fmt.Errorf("codex app-server conversation is closed")
+		}
+		return Result{}, err
+	}
+	turnRequest := s.req
+	turnRequest.Prompt = request.Prompt
+	turnRequest.Input = append([]InputPart(nil), request.Input...)
+	if strings.TrimSpace(request.LogPath) != "" {
+		turnRequest.LogPath = request.LogPath
+	}
+	if request.MaxOutputBytes > 0 {
+		turnRequest.MaxOutputBytes = request.MaxOutputBytes
+	}
+	turnRequest.OnDelta = request.OnDelta
+	s.req = turnRequest
+	s.turnID = ""
+	s.turnDone = make(chan struct{})
+	s.turnResult = Result{}
+	s.turnErr = nil
+	s.stdoutDiagnostics.Reset()
+	s.stderr.Reset()
+	s.resetTurnCaptureLocked()
+	turnDone := s.turnDone
+	processDone := s.done
+	threadID := s.threadID
+	s.mu.Unlock()
+
+	s.appendLog("\n=== codex app-server turn requested ===\n" +
+		time.Now().UTC().Format(time.RFC3339) +
+		"\nprompt_sha256=" + sha256Text(request.Prompt) + "\n")
+
+	turnCtx := ctx
+	cancel := func() {}
+	if request.Timeout > 0 {
+		turnCtx, cancel = context.WithTimeout(ctx, request.Timeout)
+	}
+	defer cancel()
+	startCtx, startCancel := context.WithTimeout(turnCtx, 30*time.Second)
+	turnStartResult, err := s.sendRequest(startCtx, "turn/start", appServerTurnStartParams(turnRequest, threadID))
+	startCancel()
+	if err != nil {
+		s.finishTurn(Result{}, fmt.Errorf("start Codex turn: %w", err))
+	} else {
+		turnID := stringAtPath(turnStartResult, "turn", "id")
+		if turnID == "" {
+			s.finishTurn(Result{}, fmt.Errorf("codex app-server turn/start response missing turn.id"))
+		} else {
+			s.mu.Lock()
+			if s.turnDone == turnDone {
+				s.turnID = turnID
+			}
+			s.mu.Unlock()
+			s.appendLog(fmt.Sprintf("Codex app-server thread=%s turn=%s\n", threadID, turnID))
+		}
+	}
+
+	select {
+	case <-turnDone:
+	case <-processDone:
+	case <-turnCtx.Done():
+		s.stop()
+		<-processDone
 	}
 	s.mu.Lock()
-	s.turnID = turnID
+	result := s.turnResult
+	turnErr := s.turnErr
+	if turnErr == nil && turnCtx.Err() != nil {
+		turnErr = turnCtx.Err()
+	}
+	if s.turnDone == turnDone {
+		s.turnDone = nil
+	}
+	s.turnID = ""
 	s.mu.Unlock()
-	s.appendLog(fmt.Sprintf("Codex app-server thread=%s turn=%s\n", threadID, turnID))
+	return result, turnErr
+}
+
+func (s *appServerCodexReviewSession) finishTurn(result Result, err error) {
+	s.mu.Lock()
+	s.finishTurnLocked(result, err)
+	s.mu.Unlock()
+}
+
+func (s *appServerCodexReviewSession) finishTurnLocked(result Result, err error) {
+	if s.turnDone == nil {
+		return
+	}
+	result.Warnings = append(result.Warnings, s.warnings...)
+	s.warnings = nil
+	s.turnResult = result
+	s.turnErr = err
+	s.turnID = ""
+	done := s.turnDone
+	s.turnDone = nil
+	close(done)
+}
+
+func (s *appServerCodexReviewSession) Close() error {
+	s.mu.Lock()
+	done := s.done
+	completed := s.completed
+	s.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	if !completed {
+		s.stop()
+		<-done
+	}
+	s.wg.Wait()
 	return nil
 }
 

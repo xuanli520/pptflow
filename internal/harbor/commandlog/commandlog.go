@@ -3,34 +3,13 @@ package commandlog
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
+
+	"github.com/purplevoid/harbor-factory/internal/redact"
 )
 
-var agentEnvPattern = regexp.MustCompile(`(?i)(--ae\s+[A-Za-z0-9_.-]+)=([^[:space:]"']+)`)
-var secretAssignmentPattern = regexp.MustCompile(`(?i)\b([A-Z0-9_.-]*(?:TOKEN|KEY|SECRET|PASSWORD|AUTH)[A-Z0-9_.-]*)=([^[:space:]"']+)`)
-var secretKeyValuePattern = regexp.MustCompile(`(?i)(["']?[A-Z0-9_.-]*(?:TOKEN|KEY|SECRET|PASSWORD|AUTH)[A-Z0-9_.-]*["']?\s*[:=]\s*)(["']?)([^"',}\s]+)(["']?)`)
-var bearerPattern = regexp.MustCompile(`(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+`)
-var skPattern = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}\b`)
-var urlUserInfoPattern = regexp.MustCompile(`(?i)((?:https?|ssh)://)[^/@[:space:]"']+@`)
-var githubClassicTokenPattern = regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9_]{8,}\b`)
-var githubFineGrainedTokenPattern = regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{10,}\b`)
-var awsAccessKeyPattern = regexp.MustCompile(`\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b`)
-
 func RedactText(text string) string {
-	if text == "" {
-		return ""
-	}
-	text = agentEnvPattern.ReplaceAllString(text, "$1=<redacted>")
-	text = bearerPattern.ReplaceAllString(text, "$1<redacted>")
-	text = skPattern.ReplaceAllString(text, "sk-<redacted>")
-	text = githubFineGrainedTokenPattern.ReplaceAllString(text, "github_pat_<redacted>")
-	text = githubClassicTokenPattern.ReplaceAllString(text, "gh_<redacted>")
-	text = awsAccessKeyPattern.ReplaceAllString(text, "<redacted-aws-access-key>")
-	text = urlUserInfoPattern.ReplaceAllString(text, "$1<redacted>@")
-	text = secretAssignmentPattern.ReplaceAllString(text, "$1=<redacted>")
-	text = secretKeyValuePattern.ReplaceAllString(text, "$1$2<redacted>$4")
-	return text
+	return redact.Text(text)
 }
 
 func RedactEnv(env []string) []string {
@@ -183,12 +162,7 @@ func WriteOutputFiles(dir, stdout, stderr string) (string, string, error) {
 }
 
 func isSecretKey(key string) bool {
-	key = strings.ToUpper(key)
-	return strings.Contains(key, "TOKEN") ||
-		strings.Contains(key, "KEY") ||
-		strings.Contains(key, "SECRET") ||
-		strings.Contains(key, "PASSWORD") ||
-		strings.Contains(key, "AUTH")
+	return redact.SensitiveKey(key)
 }
 
 func redactAssignment(item string) string {

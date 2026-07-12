@@ -89,7 +89,7 @@ func TestRunParsesJSONStdoutAndWritesArtifacts(t *testing.T) {
 	if len(exec.commands) != 1 || !strings.Contains(exec.commands[0], "harbor run -p "+taskDir+" -a "+retryingClaudeImportPath+" -m qwen3.7-max -o "+filepath.Join(outputDir, "jobs")+" --ae ANTHROPIC_MODEL=qwen3.7-max --ae ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN} --yes -n 1 -k 4") || strings.Contains(exec.commands[0], "secret-token") {
 		t.Fatalf("unexpected commands: %v", exec.commands)
 	}
-	if len(exec.envs) != 1 || !envContains(exec.envs[0], "ANTHROPIC_AUTH_TOKEN=secret-token") || !envKeyHasPath(exec.envs[0], "PYTHONPATH", filepath.Join(outputDir, ".factory-agent")) {
+	if len(exec.envs) != 1 || !envContains(exec.envs[0], "ANTHROPIC_AUTH_TOKEN=secret-token") || !envKeyHasPath(exec.envs[0], "PYTHONPATH", filepath.Join(outputDir, ".factory-agent")) || !envContains(exec.envs[0], "HARBOR_FACTORY_INSTALL_ATTEMPTS=1") || !envContains(exec.envs[0], "HARBOR_FACTORY_NPM_FETCH_RETRIES=0") {
 		t.Fatalf("secret was not delivered through the Harbor process environment: %+v", exec.envs)
 	}
 	if result.Agent != "claude-code" {
@@ -202,6 +202,11 @@ func TestRunPreflightsAndUsesConfiguredPassAt4Settings(t *testing.T) {
 	}
 	if !strings.Contains(exec.commands[2], "--yes -n 2 -k 4 --max-retries 3 --retry-include RuntimeError --retry-include NetworkConnectionError --retry-include NonZeroAgentExitCodeError --retry-include ApiRateLimitError --retry-include ApiInternalServerError --retry-include ApiOverloadedError --retry-include ApiConnectionClosedError --retry-include UnknownApiError") {
 		t.Fatalf("unexpected main run: %s", exec.commands[2])
+	}
+	for index, env := range exec.envs {
+		if !envContains(env, "HARBOR_FACTORY_INSTALL_ATTEMPTS=4") || !envContains(env, "HARBOR_FACTORY_NPM_FETCH_RETRIES=3") {
+			t.Fatalf("command %d did not receive the unified retry budget: %+v", index, env)
+		}
 	}
 	if result.SchemaPreflightPath == "" || result.PreflightRunPath == "" || result.PreflightResultPath == "" {
 		t.Fatalf("preflight audit path missing: %+v", result)

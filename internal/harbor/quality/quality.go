@@ -15,6 +15,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
+	prompttemplates "github.com/purplevoid/harbor-factory/internal/templates"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
@@ -252,12 +253,15 @@ func runAgentCheck(ctx context.Context, opts Options, files taskFiles, report *d
 	if timeout <= 0 {
 		timeout = 300
 	}
-	prompt := buildAgentPrompt(opts, files)
+	prompt, err := buildAgentPrompt(opts, files)
+	if err != nil {
+		return fmt.Errorf("render quality agent prompt: %w", err)
+	}
 	report.RequestedModel = strings.TrimSpace(opts.Model)
 	report.ReasoningEffort = strings.TrimSpace(opts.ReasoningEffort)
 	report.PromptFingerprint = fingerprint(prompt)
 	report.ReviewFingerprint = fingerprint(strings.Join([]string{report.RubricFingerprint, report.PromptFingerprint, report.RequestedModel, report.ReasoningEffort}, "\n"))
-	result, err := opts.Agent.Turn(ctx, workflow.AgentTurnRequest{
+	result, err := workflow.RunAgentTurn(ctx, opts.Agent, workflow.AgentTurnRequest{
 		ProjectPath:     opts.TaskDir,
 		Prompt:          prompt,
 		Model:           opts.Model,
@@ -322,62 +326,41 @@ func fingerprint(value string) string {
 	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
-func buildAgentPrompt(opts Options, files taskFiles) string {
+type qualityPromptData struct {
+	RepoURL       string
+	Commit        string
+	ProposalJSON  string
+	Instruction   string
+	TaskTOML      string
+	Dockerfile    string
+	Compose       string
+	Solve         string
+	Test          string
+	TestsAnalysis string
+}
+
+func buildAgentPrompt(opts Options, files taskFiles) (string, error) {
 	proposal := ""
 	if opts.Proposal != nil {
 		data, _ := json.MarshalIndent(opts.Proposal, "", "  ")
 		proposal = string(data)
 	}
-	return fmt.Sprintf(`你是 CodeEdge Harbor 任务质量审查 Agent。只基于下面提供的本地任务文件做语义审查，不要声称你已访问外部 GitHub issue/TB3 数据集。
-
-审查重点:
-1. instruction 是否泄露答案、测试内部断言、solve.sh 或 reward 细节。
-2. tests 是否过松、过严、只贴合标准答案实现细节，或与 instruction 不一致。
-3. solve.sh 是否可信、可复核、没有绕过 tests/reward。
-4. 是否存在明显 GitHub issue/PR 直接改写痕迹。
-5. 失败是否可能来自 infra/network/token/path/permission，而不是模型能力。
-
-只返回 JSON 对象:
-{
-  "overall_pass": true,
-  "checks": {
-    "instruction_leak": {"passed": true, "severity": "info", "detail": "..."},
-    "github_issue_similarity": {"passed": true, "severity": "warning", "detail": "..."},
-    "test_looseness": {"passed": true, "severity": "info", "detail": "..."},
-    "test_strictness": {"passed": true, "severity": "info", "detail": "..."},
-    "instruction_test_alignment": {"passed": true, "severity": "info", "detail": "..."},
-    "solve_bypass": {"passed": true, "severity": "info", "detail": "..."}
-  },
-  "warnings": [],
-  "issues": []
-}
-
-repo_url: %s
-commit: %s
-task_proposal:
-%s
-
-instruction.md:
-%s
-
-task.toml:
-%s
-
-environment/Dockerfile:
-%s
-
-environment/docker-compose.yaml:
-%s
-
-solution/solve.sh:
-%s
-
-tests/test.sh:
-%s
-
-tests_analysis:
-%s
-`, opts.RepoURL, opts.Commit, proposal, files.Instruction, files.TaskTOML, files.Dockerfile, files.Compose, files.Solve, files.Test, files.TestsAnalysis)
+	engine, err := prompttemplates.Default()
+	if err != nil {
+		return "", fmt.Errorf("load prompt templates: %w", err)
+	}
+	return engine.Render("phase2/quality_check", qualityPromptData{
+		RepoURL:       opts.RepoURL,
+		Commit:        opts.Commit,
+		ProposalJSON:  proposal,
+		Instruction:   files.Instruction,
+		TaskTOML:      files.TaskTOML,
+		Dockerfile:    files.Dockerfile,
+		Compose:       files.Compose,
+		Solve:         files.Solve,
+		Test:          files.Test,
+		TestsAnalysis: files.TestsAnalysis,
+	})
 }
 
 func add(report *domain.QualityReport, id string, passed bool, severity, detail, source string) {

@@ -1083,9 +1083,9 @@ func parseTrial(label, path string) (domain.TrialResult, error) {
 }
 
 func validateTrial(label string, result domain.TrialResult, qwen bool, taskDir string) error {
-	expectedModel := "claude-opus-4-8"
+	expectedModel := domain.DefaultOpusModel
 	if qwen {
-		expectedModel = "qwen3.7-max"
+		expectedModel = domain.DefaultQwenModel
 	}
 	failures := harborrun.ValidateForCodeEdgeWithOptions(result, harborrun.ValidationOptions{
 		Qwen:              qwen,

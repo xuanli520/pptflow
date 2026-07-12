@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shlex
 
 from harbor.agents.installed.base import NetworkConnectionError
@@ -7,6 +8,22 @@ from harbor.agents.installed.claude_code import ClaudeCode
 
 _PROTECTED_ENV_PATH = "/tmp/harbor-factory-agent-env"
 _SENSITIVE_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
+
+
+def _bounded_retry_setting(name, default, minimum=0, maximum=10):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+_INSTALL_ATTEMPTS = _bounded_retry_setting(
+    "HARBOR_FACTORY_INSTALL_ATTEMPTS", 1, minimum=1
+)
+_NPM_FETCH_RETRIES = _bounded_retry_setting(
+    "HARBOR_FACTORY_NPM_FETCH_RETRIES", 0
+)
 
 
 def _is_sensitive_env(name):
@@ -90,7 +107,7 @@ class _ProtectedEnvironment:
 class RetryingClaudeCode(ClaudeCode):
     """Claude Code agent with bounded retries for transient installer failures."""
 
-    _INSTALL_ATTEMPTS = 4
+    _INSTALL_ATTEMPTS = _INSTALL_ATTEMPTS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -172,7 +189,7 @@ class RetryingClaudeCode(ClaudeCode):
             environment,
             command=(
                 "set -euo pipefail; "
-                "npm_config_fetch_retries=5 "
+                f"npm_config_fetch_retries={_NPM_FETCH_RETRIES} "
                 "npm_config_fetch_retry_mintimeout=2000 "
                 "npm_config_fetch_retry_maxtimeout=20000 "
                 f"npm install -g {shlex.quote(package)} && "

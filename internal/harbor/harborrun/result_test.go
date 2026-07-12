@@ -70,7 +70,7 @@ func TestValidateForCodeEdgeFailsQwenThresholds(t *testing.T) {
 
 func TestValidateForCodeEdgeDoesNotApplyQwenDifficultyThresholdToOpus(t *testing.T) {
 	result, err := ParseResult([]byte(`{
-		"model": "claude-opus-4-8",
+		"model": "claude-opus-4-6",
 		"trials": 4,
 		"pass_count": 4,
 		"pass_at_4": 1,
