@@ -29,6 +29,96 @@ func TestRunPassesValidDockerfileTask(t *testing.T) {
 	}
 }
 
+func TestRunFailsDuplicateRepoBootstrapNoOpCDAndBuildTimeTests(t *testing.T) {
+	taskDir := writeTask(t, false)
+	dockerfile := strings.Join([]string{
+		"FROM alpine",
+		"RUN git clone https://github.com/org/repo /app/repo && cd /app/repo && git checkout abc1234",
+		"RUN cd /app/repo && git clone https://github.com/org/repo",
+		"RUN cd /app/repo && cd repo",
+		"RUN cd /app/repo && git reset --hard abc1234",
+		"RUN cd /app/repo && cargo test --all-features",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(taskDir, "environment", "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir, RepoURL: "https://github.com/org/repo", Commit: "abc1234"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"dockerfile_repo_bootstrap_unique", "dockerfile_repo_pin_unique", "dockerfile_no_noop_cd_layer", "dockerfile_no_build_time_tests"} {
+		if !hasFail(report.Checks, id) {
+			t.Fatalf("missing Dockerfile semantic failure %s: %+v", id, report.Checks)
+		}
+	}
+}
+
+func TestRunRejectsUnguardedLockedCargoFetch(t *testing.T) {
+	taskDir := writeTask(t, false)
+	path := filepath.Join(taskDir, "environment", "Dockerfile")
+	unsafe := "FROM rust:1.96.0-bookworm\nRUN git clone https://github.com/org/repo /app/repo && cd /app/repo && git checkout abc1234\nRUN cd /app/repo && cargo fetch --locked\n"
+	if err := os.WriteFile(path, []byte(unsafe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFail(report.Checks, "dockerfile_cargo_lock_guard") {
+		t.Fatalf("unguarded cargo fetch --locked was not rejected: %+v", report.Checks)
+	}
+
+	guarded := strings.Replace(unsafe, "cargo fetch --locked", "if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo fetch; fi", 1)
+	if err := os.WriteFile(path, []byte(guarded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err = Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFail(report.Checks, "dockerfile_cargo_lock_guard") {
+		t.Fatalf("guarded Cargo.lock fetch was rejected: %+v", report.Checks)
+	}
+}
+
+func TestRunRequiresPinnedModernRustToolchain(t *testing.T) {
+	taskDir := writeTask(t, false)
+	taskTOML := filepath.Join(taskDir, "task.toml")
+	raw, err := os.ReadFile(taskTOML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(string(raw), `code_lang = "go"`, `code_lang = "rust"`, 1))
+	if err := os.WriteFile(taskTOML, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dockerfile := filepath.Join(taskDir, "environment", "Dockerfile")
+	legacy := "FROM ubuntu:24.04\nRUN apt-get update && apt-get install -y cargo rustc git\nRUN git clone https://github.com/org/repo /app/repo && cd /app/repo && git checkout abc1234\n"
+	if err := os.WriteFile(dockerfile, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFail(report.Checks, "dockerfile_rust_toolchain_pinned") {
+		t.Fatalf("legacy apt Rust toolchain was not rejected: %+v", report.Checks)
+	}
+
+	modern := "FROM rust:1.96.0-bookworm\nRUN apt-get update && apt-get install -y git\nRUN git clone https://github.com/org/repo /app/repo && cd /app/repo && git checkout abc1234\n"
+	if err := os.WriteFile(dockerfile, []byte(modern), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err = Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFail(report.Checks, "dockerfile_rust_toolchain_pinned") {
+		t.Fatalf("pinned Rust image was rejected: %+v", report.Checks)
+	}
+}
+
 func TestRunAllowsWordsContainingLegacySubstrings(t *testing.T) {
 	taskDir := writeTask(t, false)
 	solution := filepath.Join(taskDir, "solution", "solve.sh")
@@ -227,6 +317,37 @@ func TestRunFailsUnsafeDockerfileAndSolution(t *testing.T) {
 	}
 	if !hasFail(report.Checks, "solution_no_bypass") {
 		t.Fatalf("missing solution failure: %+v", report.Checks)
+	}
+}
+
+func TestRunRejectsCodexOnlyApplyPatchInSolution(t *testing.T) {
+	taskDir := writeTask(t, false)
+	path := filepath.Join(taskDir, "solution", "solve.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\napply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFail(report.Checks, "solution_portable_commands") {
+		t.Fatalf("Codex-only apply_patch was not rejected: %+v", report.Checks)
+	}
+}
+
+func TestRunRejectsCodexPatchMarkersPassedToGitApply(t *testing.T) {
+	taskDir := writeTask(t, false)
+	path := filepath.Join(taskDir, "solution", "solve.sh")
+	content := "#!/bin/sh\ngit apply <<'PATCH'\n*** Begin Patch\n*** Update File: file.go\n*** End Patch\nPATCH\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFail(report.Checks, "solution_patch_format") {
+		t.Fatalf("invalid git apply payload was not rejected: %+v", report.Checks)
 	}
 }
 

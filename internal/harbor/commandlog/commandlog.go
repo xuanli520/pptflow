@@ -128,7 +128,7 @@ func ClassifyFailure(exitCode int, timeout bool, stdout, stderr string) string {
 		return "missing_tool_or_path"
 	case strings.Contains(text, "permission denied") || strings.Contains(text, "authentication") || strings.Contains(text, "unauthorized") || strings.Contains(text, "forbidden"):
 		return "permission_or_auth"
-	case strings.Contains(text, "network") || strings.Contains(text, "connection") || strings.Contains(text, "timeout") || strings.Contains(text, "temporary failure"):
+	case containsNetworkFailure(text):
 		return "network_or_timeout"
 	case strings.Contains(text, "docker") && (strings.Contains(text, "daemon") || strings.Contains(text, "cannot connect")):
 		return "docker_daemon"
@@ -137,6 +137,31 @@ func ClassifyFailure(exitCode int, timeout bool, stdout, stderr string) string {
 	default:
 		return "command_failed"
 	}
+}
+
+func containsNetworkFailure(text string) bool {
+	for _, marker := range []string{
+		"network is unreachable",
+		"network error",
+		"network timeout",
+		"connection",
+		"timeout",
+		"temporary failure",
+		"tls handshake",
+		"gnutls recv error",
+		"unexpected disconnect",
+		"early eof",
+		"failed to resolve source metadata",
+		"could not resolve host",
+		"rpc failed; curl",
+		"failed to download",
+		"failed to fetch",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func WriteOutputFiles(dir, stdout, stderr string) (string, string, error) {

@@ -74,6 +74,69 @@ func TestRunBuildInitialFailOraclePass(t *testing.T) {
 	}
 }
 
+func TestRunRetriesTransientDockerRegistryBuildFailure(t *testing.T) {
+	taskDir := writeVerifyTask(t)
+	fake := &fakeExec{results: []executor.Result{
+		{Command: "docker build", ExitCode: 1, Stderr: "failed to resolve source metadata: ubuntu:24.04: not found"},
+		{Command: "docker build", ExitCode: 0},
+		{Command: "docker run initial", ExitCode: 1, Err: errors.New("test failed")},
+		{Command: "docker run oracle", ExitCode: 0},
+		{Command: "docker image rm", ExitCode: 0},
+	}}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir, Workspace: t.TempDir(), Exec: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Passed || report.DockerBuild == nil || report.DockerBuild.Attempt != 2 {
+		t.Fatalf("transient build retry did not recover: %+v", report)
+	}
+	if len(report.CommandLogs) != 5 || report.CommandLogs[0].Attempt != 1 || report.CommandLogs[1].Attempt != 2 {
+		t.Fatalf("build retry evidence missing: %+v", report.CommandLogs)
+	}
+}
+
+func TestRunRetriesTransientGitTLSFailureInsideDockerBuild(t *testing.T) {
+	taskDir := writeVerifyTask(t)
+	fake := &fakeExec{results: []executor.Result{
+		{Command: "docker build", ExitCode: 1, Stderr: "error: RPC failed; curl 56 GnuTLS recv error (-9); fatal: early EOF"},
+		{Command: "docker build", ExitCode: 0},
+		{Command: "docker run initial", ExitCode: 1, Err: errors.New("test failed")},
+		{Command: "docker run oracle", ExitCode: 0},
+		{Command: "docker image rm", ExitCode: 0},
+	}}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir, Workspace: t.TempDir(), Exec: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Passed || report.DockerBuild == nil || report.DockerBuild.Attempt != 2 {
+		t.Fatalf("Git TLS build retry did not recover: %+v", report)
+	}
+}
+
+func TestRunDoesNotRetryDeterministicDockerfileBuildFailure(t *testing.T) {
+	taskDir := writeVerifyTask(t)
+	fake := &fakeExec{results: []executor.Result{{Command: "docker build", ExitCode: 1, Stderr: "fatal: destination path already exists"}}}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir, Exec: fake})
+	if err == nil || report.DockerBuild == nil {
+		t.Fatalf("expected deterministic build failure: report=%+v err=%v", report, err)
+	}
+	if len(fake.commands) != 1 || report.DockerBuild.Attempt != 1 {
+		t.Fatalf("deterministic Dockerfile failure was retried: commands=%v report=%+v", fake.commands, report)
+	}
+}
+
+func TestRunDoesNotRetryMissingCargoLock(t *testing.T) {
+	taskDir := writeVerifyTask(t)
+	fake := &fakeExec{results: []executor.Result{{Command: "docker build", ExitCode: 101, Stderr: "cannot create the lock file /app/repo/Cargo.lock because --locked was passed; without accessing the network"}}}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir, Exec: fake})
+	if err == nil || report.DockerBuild == nil {
+		t.Fatalf("expected Cargo.lock build failure: report=%+v err=%v", report, err)
+	}
+	if len(fake.commands) != 1 || report.DockerBuild.Attempt != 1 {
+		t.Fatalf("missing Cargo.lock failure was retried: commands=%v report=%+v", fake.commands, report)
+	}
+}
+
 func TestWriteReportRedactsSecretLikeFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "verify_report.json")
 	report := domain.VerifyReport{

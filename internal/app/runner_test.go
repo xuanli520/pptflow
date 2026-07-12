@@ -431,6 +431,134 @@ func TestRunnerFinalReviewCanReviseAndRerunChecks(t *testing.T) {
 	}
 }
 
+func TestRunnerFinalReviewCodexRepairUsesOperatorGuidance(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	workspace := t.TempDir()
+	agent := &runnerRepairAgent{mutate: func(req workflow.AgentTurnRequest, _ int) error {
+		return os.WriteFile(filepath.Join(req.ProjectPath, "instruction.md"), []byte("Fix the task according to operator guidance while preserving public behavior.\n"), 0o644)
+	}}
+	runner := NewRunner(RunnerOptions{TaskDir: taskDir, Workspace: workspace, Agent: agent})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	type runResult struct {
+		summary domain.RunSummary
+		err     error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		summary, err := runner.Run(ctx)
+		done <- runResult{summary: summary, err: err}
+	}()
+	repaired := false
+	for {
+		select {
+		case event := <-runner.Events():
+			if event.Type != "gate_requested" || event.Gate == nil || event.Gate.GateID != nodes.FinalReview {
+				continue
+			}
+			if !repaired {
+				runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "repair", Notes: "机审要求公开 API 名称与测试保持一致"})
+				repaired = true
+				continue
+			}
+			runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "approve", Approved: true})
+			result := <-done
+			if result.err != nil || !result.summary.Passed {
+				t.Fatalf("guided repair run failed: summary=%+v err=%v", result.summary, result.err)
+			}
+			if agent.calls != 1 || agent.last.SandboxPolicy != "workspace-write" || !strings.Contains(agent.last.Prompt, "公开 API 名称") {
+				t.Fatalf("operator guidance was not passed to scoped Codex repair: calls=%d request=%+v", agent.calls, agent.last)
+			}
+			if _, err := os.Stat(nodes.TaskRepairReportPath(workspace, "final_review", 1)); err != nil {
+				t.Fatalf("repair evidence missing: %v", err)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for guided Final Review repair")
+		}
+	}
+}
+
+func TestRunnerAppliesExternalReviewRepairBeforeChecks(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	workspace := t.TempDir()
+	agent := &runnerRepairAgent{mutate: func(req workflow.AgentTurnRequest, _ int) error {
+		return os.WriteFile(filepath.Join(req.ProjectPath, "instruction.md"), []byte("Repaired from external review feedback.\n"), 0o644)
+	}}
+	runner := NewRunner(RunnerOptions{
+		TaskDir:        taskDir,
+		Workspace:      workspace,
+		AutoApprove:    true,
+		RepairGuidance: "题目方人工审核要求修正说明与 verifier 的契约",
+		RepairSource:   "external_review",
+		Agent:          agent,
+	})
+	summary, err := runner.Run(context.Background())
+	if err != nil || !summary.Passed {
+		t.Fatalf("external review repair run failed: summary=%+v err=%v", summary, err)
+	}
+	if agent.calls != 1 || !strings.Contains(agent.last.Prompt, "题目方人工审核") {
+		t.Fatalf("external review guidance was not used: calls=%d request=%+v", agent.calls, agent.last)
+	}
+	if _, err := os.Stat(nodes.TaskRepairReportPath(workspace, "external_review", 1)); err != nil {
+		t.Fatalf("external repair evidence missing: %v", err)
+	}
+}
+
+func TestRunnerFinalReviewAutomaticRepairLoopsUntilChecksPass(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	if err := os.WriteFile(filepath.Join(taskDir, "solution", "solve.sh"), []byte("#!/bin/sh\necho 1 > /logs/verifier/reward.txt\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agent := &runnerRepairAgent{mutate: func(req workflow.AgentTurnRequest, call int) error {
+		if call == 1 {
+			return os.WriteFile(filepath.Join(req.ProjectPath, "instruction.md"), []byte("First automatic repair round.\n"), 0o644)
+		}
+		return os.WriteFile(filepath.Join(req.ProjectPath, "solution", "solve.sh"), []byte("#!/bin/sh\nset -eu\nprintf 'package config\\n' > config.go\n"), 0o755)
+	}}
+	workspace := t.TempDir()
+	runner := NewRunner(RunnerOptions{TaskDir: taskDir, Workspace: workspace, Agent: agent})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	type runResult struct {
+		summary domain.RunSummary
+		err     error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		summary, err := runner.Run(ctx)
+		done <- runResult{summary: summary, err: err}
+	}()
+	loopStarted := false
+	for {
+		select {
+		case event := <-runner.Events():
+			if event.Type != "gate_requested" || event.Gate == nil || event.Gate.GateID != nodes.FinalReview {
+				continue
+			}
+			if !loopStarted {
+				runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "repair_loop", Notes: "持续返修直到关键检查通过"})
+				loopStarted = true
+				continue
+			}
+			runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "approve", Approved: true})
+			result := <-done
+			if result.err != nil || !result.summary.Passed {
+				t.Fatalf("automatic repair loop failed: summary=%+v err=%v", result.summary, result.err)
+			}
+			if agent.calls != 2 {
+				t.Fatalf("automatic repair calls = %d, want 2", agent.calls)
+			}
+			if _, err := os.Stat(nodes.TaskRepairReportPath(workspace, "final_review", 2)); err != nil {
+				t.Fatalf("second automatic repair evidence missing: %v", err)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for automatic Final Review repair loop")
+		}
+	}
+}
+
 func TestRunnerLabelsRecoveredRunAndNodeReuseBoundary(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
@@ -769,6 +897,7 @@ func TestRunnerGenerateThenLintWithAutoApprovedGates(t *testing.T) {
 			TestSH:        "cd /app/repo\ntest -f config.go\ngrep -q package config.go\n",
 			TestsAnalysis: validRunnerTestsAnalysis(),
 		}),
+		"runtime self-check complete",
 	}}
 	runner := NewRunner(RunnerOptions{
 		RepoURL:        repoURL,
@@ -792,6 +921,13 @@ func TestRunnerGenerateThenLintWithAutoApprovedGates(t *testing.T) {
 	if summary.LintReport == nil || !summary.LintReport.Passed {
 		t.Fatalf("missing or failing lint report: %+v", summary.LintReport)
 	}
+	gateIDs := map[string]int{}
+	for _, decision := range summary.GateDecisions {
+		gateIDs[decision.GateID]++
+	}
+	if gateIDs[nodes.TaskReview] != 1 || gateIDs[nodes.FinalReview] != 1 || gateIDs[nodes.ContentReview] != 0 || gateIDs[nodes.ResultReview] != 0 || len(summary.GateDecisions) != 2 {
+		t.Fatalf("new flow must contain only direction and final release gates: %+v", summary.GateDecisions)
+	}
 	for _, rel := range []string{
 		filepath.Join("phase1", "artifacts", "instruction_generate", "instruction.md"),
 		filepath.Join("phase1", "artifacts", "task_toml_generate", "task.toml"),
@@ -800,14 +936,13 @@ func TestRunnerGenerateThenLintWithAutoApprovedGates(t *testing.T) {
 		filepath.Join("phase2", "artifacts", "test_generate", "test.sh"),
 		filepath.Join("phase3", "artifacts", "tests_analysis", "tests_analysis.md"),
 		filepath.Join("phase1", "artifacts", "reviews", "task_review", "decision.json"),
-		filepath.Join("phase1", "artifacts", "reviews", "content_review", "decision.json"),
 		filepath.Join("phase2", "artifacts", "reviews", "final_review", "decision.json"),
 	} {
 		if _, err := os.Stat(filepath.Join(workspace, rel)); err != nil {
 			t.Fatalf("missing workflow artifact %s: %v", rel, err)
 		}
 	}
-	for _, nodeID := range []string{"repo_analyze", "task_design", "task_review", "instruction_generate", "task_toml_generate", "dockerfile_generate", "solve_generate", "test_generate", "tests_analysis", "codeedge_lint"} {
+	for _, nodeID := range []string{"repo_analyze", "task_design", "task_review", "instruction_generate", "task_toml_generate", "dockerfile_generate", "solve_generate", "test_generate", "tests_analysis", "runtime_self_check", "codeedge_lint"} {
 		if !eventSeen(summary.Events, nodeID, "succeeded") {
 			t.Fatalf("events missing generated flow node %s: %+v", nodeID, summary.Events)
 		}
@@ -871,13 +1006,13 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 		filepath.Join("phase3", "artifacts", "harbor_run_qwen", "trial_result.json"),
 		filepath.Join("phase3", "artifacts", "harbor_run_opus", "opus_result.json"),
 		filepath.Join("phase3", "artifacts", "harbor_run_opus", "trial_result.json"),
-		filepath.Join("phase3", "artifacts", "reviews", "result_review", "decision.json"),
+		filepath.Join("phase2", "artifacts", "reviews", "final_review", "decision.json"),
 	} {
 		if _, err := os.Stat(filepath.Join(workspace, rel)); err != nil {
 			t.Fatalf("missing harbor run result %s: %v", rel, err)
 		}
 	}
-	if !eventSeen(summary.Events, "harbor_run_qwen", "succeeded") || !eventSeen(summary.Events, "harbor_run_opus", "succeeded") || !eventSeen(summary.Events, "submission_lint", "succeeded") || !eventSeen(summary.Events, "result_review", "succeeded") {
+	if !eventSeen(summary.Events, "harbor_run_qwen", "succeeded") || !eventSeen(summary.Events, "harbor_run_opus", "succeeded") || !eventSeen(summary.Events, "submission_lint", "succeeded") || !eventSeen(summary.Events, "final_review", "succeeded") {
 		t.Fatalf("events missing harbor run nodes: %+v", summary.Events)
 	}
 	if !eventMessageSeen(summary.Events, nodes.HarborRunQwen, "trial started") {
@@ -889,8 +1024,8 @@ func TestRunnerRunsHarborAfterLintAndThenSubmissionLint(t *testing.T) {
 	if eventIndex(summary.Events, "submission_lint", "succeeded") < eventIndex(summary.Events, "harbor_run_opus", "succeeded") {
 		t.Fatalf("submission lint should run after harbor results: %+v", summary.Events)
 	}
-	if eventIndex(summary.Events, "result_review", "succeeded") < eventIndex(summary.Events, "submission_lint", "succeeded") {
-		t.Fatalf("result review should run after submission lint: %+v", summary.Events)
+	if eventIndex(summary.Events, "final_review", "succeeded") < eventIndex(summary.Events, "submission_lint", "succeeded") {
+		t.Fatalf("final release gate should run after submission lint: %+v", summary.Events)
 	}
 }
 
@@ -1025,11 +1160,11 @@ func TestRunnerReviewsProvidedHarborResults(t *testing.T) {
 	if summary.QwenResult == nil || summary.QwenResult.ResultPath != qwenPath || summary.OpusResult == nil || summary.OpusResult.ResultPath != opusPath {
 		t.Fatalf("provided results not loaded: qwen=%+v opus=%+v", summary.QwenResult, summary.OpusResult)
 	}
-	if !eventSeen(summary.Events, "result_review", "succeeded") {
-		t.Fatalf("result review did not run for provided results: %+v", summary.Events)
+	if !eventSeen(summary.Events, "final_review", "succeeded") {
+		t.Fatalf("final release gate did not include provided results: %+v", summary.Events)
 	}
-	if _, err := os.Stat(filepath.Join(workspace, "phase3", "artifacts", "reviews", "result_review", "decision.json")); err != nil {
-		t.Fatalf("missing result review decision: %v", err)
+	if _, err := os.Stat(filepath.Join(workspace, "phase2", "artifacts", "reviews", "final_review", "decision.json")); err != nil {
+		t.Fatalf("missing final release decision: %v", err)
 	}
 }
 
@@ -1414,7 +1549,7 @@ func TestRunnerPackageForcesVerifyHarborAndSubmissionLint(t *testing.T) {
 		nodes.OracleVerify,
 		nodes.SubmissionLint,
 		nodes.SimilarityCheck,
-		nodes.ResultReview,
+		nodes.FinalReview,
 		nodes.Package,
 	} {
 		if !eventSeen(summary.Events, nodeID, "succeeded") {
@@ -1769,6 +1904,23 @@ func (e *runnerResultExec) RunStreamingWithOutput(ctx context.Context, timeout t
 
 type runnerFakeAgent struct {
 	outputs []string
+}
+
+type runnerRepairAgent struct {
+	calls  int
+	last   workflow.AgentTurnRequest
+	mutate func(workflow.AgentTurnRequest, int) error
+}
+
+func (a *runnerRepairAgent) Turn(_ context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+	a.calls++
+	a.last = req
+	if a.mutate != nil {
+		if err := a.mutate(req, a.calls); err != nil {
+			return workflow.AgentTurnResult{}, err
+		}
+	}
+	return workflow.AgentTurnResult{Text: "task repaired", Model: "fake-codex"}, nil
 }
 
 func (f *runnerFakeAgent) Turn(_ context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {

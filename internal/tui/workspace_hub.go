@@ -142,6 +142,8 @@ func (m *model) updateHubKey(msg tea.KeyMsg) tea.Cmd {
 		return m.openStartFromHubSelection()
 	case "ctrl+r":
 		return m.openRunConfigForSelected()
+	case "f":
+		return m.openTaskRepairForSelected()
 	case "delete", "backspace":
 		return m.confirmDeleteSelectedWorkspace()
 	case "tab":
@@ -298,6 +300,30 @@ func (m *model) openRunConfigForSelected() tea.Cmd {
 		return m.showToast("请先选择工作区", toastWarning)
 	}
 	return m.openRunConfig(item.Run.WorkspacePath, item.Task.TaskName)
+}
+
+func (m *model) openTaskRepairForSelected() tea.Cmd {
+	if m.runner != nil && !m.done {
+		return m.showToast("请先等待当前运行结束", toastWarning)
+	}
+	item, ok := m.selectedHubItem()
+	if !ok {
+		return m.showToast("请先选择需要返修的工作区", toastWarning)
+	}
+	return m.openTaskRepair(item.Run.WorkspacePath, item.Task.TaskName)
+}
+
+func (m *model) openTaskRepair(source, taskName string) tea.Cmd {
+	if strings.TrimSpace(source) == "" {
+		return m.showToast("返修源工作区不能为空", toastWarning)
+	}
+	target := m.nextWorkspacePath(taskName, "repair")
+	m.taskRepair = NewTaskRepairOverlay(source, target, taskName)
+	if m.router != nil {
+		m.router.PushOverlay(m.taskRepair)
+	}
+	m.focusMgr.Push(focusOverlay)
+	return m.taskRepair.Target.Cursor.BlinkCmd()
 }
 
 func (m *model) openRunConfig(source, taskName string) tea.Cmd {

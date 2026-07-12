@@ -30,6 +30,7 @@ type Options struct {
 	ReasoningEffort     string
 	AgentTimeoutSeconds int
 	Agent               workflow.AgentRuntime
+	RuntimeSelfCheck    bool
 	Progress            func(nodeID, status, message, path string)
 	TaskReview          func(analysis domain.RepoAnalysis, proposal domain.TaskProposal, proposalPath string) error
 }
@@ -115,6 +116,16 @@ func Run(ctx context.Context, opts Options) (domain.GenReport, error) {
 		return domain.GenReport{}, err
 	}
 	progress(opts, nodes.MaterializeTask, "succeeded", "Harbor task directory materialized", taskDir)
+	if opts.RuntimeSelfCheck {
+		progress(opts, nodes.RuntimeSelfCheck, "running", "granting the design agent runtime access to build and exercise the generated task", taskDir)
+		if err := runRuntimeSelfCheck(ctx, opts, taskDir, timeout); err != nil {
+			// This is a model-assisted tolerance step, not an authoritative gate.
+			// Mandatory lint and verification still run immediately afterwards.
+			progress(opts, nodes.RuntimeSelfCheck, "succeeded", "runtime self-check could not complete; mandatory machine gates will decide: "+err.Error(), nodes.AgentLogPath(workspace, nodes.RuntimeSelfCheck))
+		} else {
+			progress(opts, nodes.RuntimeSelfCheck, "succeeded", "design agent completed runtime build/test self-check", nodes.AgentLogPath(workspace, nodes.RuntimeSelfCheck))
+		}
+	}
 
 	report := domain.GenReport{
 		SchemaVersion:     "harbor.gen_report.v1",
@@ -133,6 +144,32 @@ func Run(ctx context.Context, opts Options) (domain.GenReport, error) {
 		return report, err
 	}
 	return report, nil
+}
+
+func runRuntimeSelfCheck(ctx context.Context, opts Options, taskDir string, timeout int) error {
+	if timeout < 1800 {
+		timeout = 1800
+	}
+	_, err := opts.Agent.Turn(ctx, workflow.AgentTurnRequest{
+		ProjectPath:     taskDir,
+		Prompt:          runtimeSelfCheckPrompt(),
+		Model:           opts.Model,
+		ReasoningEffort: opts.ReasoningEffort,
+		SandboxMode:     "danger-full-access",
+		SandboxPolicy:   "danger-full-access",
+		NetworkAccess:   true,
+		WorkspaceRoots:  []string{taskDir},
+		TimeoutSeconds:  timeout,
+		MaxOutputBytes:  2 << 20,
+		LogPath:         nodes.AgentLogPath(opts.Workspace, nodes.RuntimeSelfCheck),
+	})
+	if err != nil {
+		return fmt.Errorf("runtime self-check agent turn: %w", err)
+	}
+	if err := validateMaterializedTaskDir(taskDir); err != nil {
+		return fmt.Errorf("runtime self-check left an invalid task: %w", err)
+	}
+	return nil
 }
 
 func progress(opts Options, nodeID, status, message, path string) {
@@ -597,27 +634,51 @@ func renderTaskTOML(proposal domain.TaskProposal) string {
 
 func renderDockerfile(prepared domain.RepoPrepared, proposal domain.TaskProposal) string {
 	var b strings.Builder
-	b.WriteString("FROM ubuntu:24.04\n\n")
+	b.WriteString("FROM ")
+	b.WriteString(baseImage(proposal.CodeLang))
+	b.WriteString("\n\n")
 	b.WriteString("ENV DEBIAN_FRONTEND=noninteractive\n")
 	b.WriteString("RUN apt-get update && apt-get install -y --no-install-recommends ")
 	b.WriteString(strings.Join(basePackages(proposal.CodeLang), " "))
 	b.WriteString(" && rm -rf /var/lib/apt/lists/*\n\n")
+	toolchainCommands := toolchainSetupCommands(proposal.CodeLang)
+	for _, command := range toolchainCommands {
+		b.WriteString("RUN ")
+		b.WriteString(command)
+		b.WriteString("\n")
+	}
+	if len(toolchainCommands) > 0 {
+		b.WriteString("\n")
+	}
 	b.WriteString("WORKDIR /app\n")
 	b.WriteString("RUN git clone ")
 	b.WriteString(shellQuote(prepared.RepoURL))
 	b.WriteString(" /app/repo && cd /app/repo && git checkout ")
 	b.WriteString(shellQuote(prepared.ResolvedCommit))
 	b.WriteString("\n")
-	for _, command := range proposal.SetupCommands {
-		command = strings.TrimSpace(command)
-		if safeSetupCommand(command) {
-			b.WriteString("RUN cd /app/repo && ")
-			b.WriteString(command)
-			b.WriteString("\n")
-		}
+	for _, command := range normalizedSetupCommands(proposal.SetupCommands) {
+		b.WriteString("RUN cd /app/repo && ")
+		b.WriteString(command)
+		b.WriteString("\n")
 	}
 	b.WriteString("\nWORKDIR /app/repo\n")
 	return b.String()
+}
+
+func toolchainSetupCommands(language string) []string {
+	if strings.Contains(strings.ToLower(language), "rust") {
+		return []string{"rustup component add rustfmt clippy"}
+	}
+	return nil
+}
+
+const rustBaseImage = "rust:1.96.0-bookworm"
+
+func baseImage(language string) string {
+	if strings.Contains(strings.ToLower(language), "rust") {
+		return rustBaseImage
+	}
+	return "ubuntu:24.04"
 }
 
 func basePackages(language string) []string {
@@ -631,7 +692,8 @@ func basePackages(language string) []string {
 	case strings.Contains(lower, "javascript"), strings.Contains(lower, "typescript"), strings.Contains(lower, "node"):
 		packages = append(packages, "nodejs", "npm")
 	case strings.Contains(lower, "rust"):
-		packages = append(packages, "cargo", "rustc")
+		// The pinned Rust base image owns cargo and rustc. Ubuntu 24.04 ships
+		// Cargo 1.75, which cannot resolve modern edition-2024 dependencies.
 	case strings.Contains(lower, "java"), strings.Contains(lower, "kotlin"):
 		packages = append(packages, "openjdk-17-jdk", "maven", "gradle")
 	case strings.Contains(lower, "ruby"):
@@ -798,10 +860,13 @@ func defaultString(value, fallback string) string {
 }
 
 var (
-	commitPattern       = regexp.MustCompile(`(?i)^[0-9a-f]{7,40}$`)
-	taskNameChars       = regexp.MustCompile(`[^a-z0-9._/-]+`)
-	taskDirChars        = regexp.MustCompile(`[^a-z0-9._-]+`)
-	forbiddenSetupToken = regexp.MustCompile(`(?i)(\bcopy\b|\badd\b|tests/|solution/|/logs/verifier|reward\.txt|reward\.json)`)
+	commitPattern        = regexp.MustCompile(`(?i)^[0-9a-f]{7,40}$`)
+	taskNameChars        = regexp.MustCompile(`[^a-z0-9._/-]+`)
+	taskDirChars         = regexp.MustCompile(`[^a-z0-9._-]+`)
+	forbiddenSetupToken  = regexp.MustCompile(`(?i)(\bcopy\b|\badd\b|tests/|solution/|/logs/verifier|reward\.txt|reward\.json)`)
+	repositorySetupToken = regexp.MustCompile(`(?i)\bgit\s+(clone|checkout|switch|reset|init|worktree)\b`)
+	testSetupToken       = regexp.MustCompile(`(?i)\b((go|cargo)\s+test\b|pytest\b|python\s+-m\s+pytest\b|npm\s+(run\s+)?test\b|pnpm\s+(run\s+)?test\b|yarn\s+test\b|mvn\s+test\b|gradle\s+test\b)`)
+	standaloneCDCommand  = regexp.MustCompile(`(?i)^cd(?:\s+[^;&|]+)?$`)
 )
 
 func safeHarborTaskName(name string) string {
@@ -830,7 +895,46 @@ func safeTaskDir(name string) string {
 }
 
 func safeSetupCommand(command string) bool {
-	return command != "" && !forbiddenSetupToken.MatchString(command)
+	command = strings.TrimSpace(command)
+	return command != "" &&
+		!forbiddenSetupToken.MatchString(command) &&
+		!repositorySetupToken.MatchString(command) &&
+		!testSetupToken.MatchString(command) &&
+		!standaloneCDCommand.MatchString(command)
+}
+
+func normalizedSetupCommands(commands []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(commands))
+	for _, command := range commands {
+		command = normalizeSetupCommand(command)
+		key := strings.Join(strings.Fields(command), " ")
+		if !safeSetupCommand(command) || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, command)
+	}
+	return out
+}
+
+func normalizeSetupCommand(command string) string {
+	command = strings.TrimSpace(command)
+	fields := strings.Fields(command)
+	if len(fields) < 2 || !strings.EqualFold(fields[0], "cargo") || !strings.EqualFold(fields[1], "fetch") || strings.ContainsAny(command, ";&|<>") {
+		return command
+	}
+	fetchFields := make([]string, 0, len(fields))
+	for _, field := range fields {
+		switch strings.ToLower(field) {
+		case "--locked", "--frozen", "--offline":
+			continue
+		default:
+			fetchFields = append(fetchFields, field)
+		}
+	}
+	base := strings.Join(fetchFields, " ")
+	return "if [ -f Cargo.lock ]; then " + base + " --locked; else " + base + "; fi"
 }
 
 func shellQuote(value string) string {

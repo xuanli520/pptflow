@@ -123,4 +123,20 @@ func TestClassifyFailure(t *testing.T) {
 	if got := ClassifyFailure(1, true, "", ""); got != "timeout" {
 		t.Fatalf("classification = %s", got)
 	}
+	for _, stderr := range []string{
+		"error: RPC failed; curl 56 GnuTLS recv error (-9): Error decoding the received TLS packet; fatal: early EOF",
+		"fetch-pack: unexpected disconnect while reading sideband packet",
+		"failed to resolve source metadata: TLS handshake timeout",
+	} {
+		if got := ClassifyFailure(1, false, "", stderr); got != "network_or_timeout" {
+			t.Fatalf("classification = %s for %q", got, stderr)
+		}
+	}
+	if got := ClassifyFailure(1, false, "", "fatal: destination path already exists"); got != "command_failed" {
+		t.Fatalf("deterministic failure classification = %s", got)
+	}
+	lockError := "error: cannot create the lock file /app/repo/Cargo.lock because --locked was passed; remove the --locked flag and use --offline instead; without accessing the network"
+	if got := ClassifyFailure(101, false, "", lockError); got == "network_or_timeout" {
+		t.Fatalf("Cargo.lock configuration error was misclassified as transient: %s", got)
+	}
 }

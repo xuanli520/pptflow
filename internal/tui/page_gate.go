@@ -117,14 +117,14 @@ func (m model) gateContent(gate *domain.GateRequest) string {
 	lines = append(lines, "", joinResponsiveColumns(layoutFor(m.width, m.height), strings.Join(checkLines, "\n"), strings.Join(artifactLines, "\n")))
 	lines = append(lines, "")
 	if m.gateEditingNote {
-		lines = append(lines, warnStyle.Render("正在编辑备注（Ctrl+S 保存，Esc 完成）："))
+		lines = append(lines, warnStyle.Render("正在编辑审查备注 / Codex 返修指导（Ctrl+S 保存，Esc 完成）："))
 		if sanitized := redactUI(m.notesInput.Value()); sanitized != m.notesInput.Value() {
 			lines = append(lines, sanitized)
 		} else {
 			lines = append(lines, m.notesInput.View())
 		}
 	} else if m.gateNotes != "" {
-		lines = append(lines, "审查备注："+redactUI(m.gateNotes))
+		lines = append(lines, "审查备注 / Codex 指导："+redactUI(m.gateNotes))
 	}
 	return strings.Join(lines, "\n")
 }

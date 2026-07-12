@@ -39,6 +39,16 @@ type Options struct {
 
 var commitPattern = regexp.MustCompile(`(?i)\b[0-9a-f]{7,40}\b`)
 
+var (
+	dockerGitClonePattern  = regexp.MustCompile(`(?i)\bgit\s+clone\b`)
+	dockerGitPinPattern    = regexp.MustCompile(`(?i)\bgit\s+(checkout|switch|reset\s+--hard)\b`)
+	dockerTestRunPattern   = regexp.MustCompile(`(?i)\b((go|cargo)\s+test\b|pytest\b|python\s+-m\s+pytest\b|npm\s+(run\s+)?test\b|pnpm\s+(run\s+)?test\b|yarn\s+test\b|mvn\s+test\b|gradle\s+test\b)`)
+	dockerPinnedRustImage  = regexp.MustCompile(`(?i)^FROM\s+rust:\d+\.\d+(?:\.\d+)?(?:[-@][^\s]+)?(?:\s+AS\s+\S+)?$`)
+	dockerPinnedRustup     = regexp.MustCompile(`(?i)\brustup\s+(?:toolchain\s+install|default)\s+\d+\.\d+(?:\.\d+)?\b`)
+	dockerAptRustToolchain = regexp.MustCompile(`(?i)\bapt(?:-get)?\s+install\b[^\n]*(?:\bcargo\b|\brustc\b)`)
+	dockerLockedCargoFetch = regexp.MustCompile(`(?i)\bcargo\s+fetch\b[^;&|]*(?:--locked|--frozen)\b`)
+)
+
 type taskTOML struct {
 	SchemaVersion string              `toml:"schema_version"`
 	Task          taskTOMLTask        `toml:"task"`
@@ -130,7 +140,11 @@ func Run(ctx context.Context, opts Options) (domain.LintReport, error) {
 			envCommit = strings.TrimSpace(metadata.CommitID)
 		}
 	}
-	checkEnvironment(&report, taskDir, envRepoURL, envCommit)
+	codeLang := ""
+	if hasMetadata {
+		codeLang = metadata.CodeLang
+	}
+	checkEnvironment(&report, taskDir, envRepoURL, envCommit, codeLang)
 	checkSolution(&report, taskDir)
 	checkTest(&report, taskDir)
 	checkTestsAnalysis(&report, opts.TestsAnalysis, opts.StrictSubmission)
@@ -562,7 +576,7 @@ func checkPositiveFloat(report *domain.LintReport, id string, value float64, mis
 	report.Add(id, domain.CheckPass, passMessage, path)
 }
 
-func checkEnvironment(report *domain.LintReport, taskDir, repoURL, commit string) {
+func checkEnvironment(report *domain.LintReport, taskDir, repoURL, commit, codeLang string) {
 	envDir := filepath.Join(taskDir, "environment")
 	dockerfile := filepath.Join(envDir, "Dockerfile")
 	compose := filepath.Join(envDir, "docker-compose.yaml")
@@ -572,19 +586,19 @@ func checkEnvironment(report *domain.LintReport, taskDir, repoURL, commit string
 	case dockerErr == nil && composeErr == nil:
 		report.Add("environment_single_mode", domain.CheckPass, "environment includes Dockerfile and docker-compose.yaml; compose source will be linted with Dockerfile provenance", envDir)
 		report.Add("environment_compose", domain.CheckPass, "docker-compose.yaml found and will be structurally linted", compose)
-		checkCompose(report, compose, repoURL, commit)
+		checkCompose(report, compose, repoURL, commit, codeLang)
 	case dockerErr != nil && composeErr != nil:
 		report.Add("environment_present", domain.CheckFail, "environment must contain Dockerfile or docker-compose.yaml", envDir)
 	case dockerErr == nil:
 		report.Add("environment_dockerfile", domain.CheckPass, "Dockerfile found", dockerfile)
-		checkDockerfile(report, dockerfile, repoURL, commit)
+		checkDockerfile(report, dockerfile, repoURL, commit, codeLang)
 	case composeErr == nil:
 		report.Add("environment_compose", domain.CheckPass, "docker-compose.yaml found and will be structurally linted", compose)
-		checkCompose(report, compose, repoURL, commit)
+		checkCompose(report, compose, repoURL, commit, codeLang)
 	}
 }
 
-func checkDockerfile(report *domain.LintReport, path, repoURL, commit string) {
+func checkDockerfile(report *domain.LintReport, path, repoURL, commit, codeLang string) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		report.Add("dockerfile_read", domain.CheckFail, "cannot read file", path)
@@ -593,6 +607,8 @@ func checkDockerfile(report *domain.LintReport, path, repoURL, commit string) {
 	rawContent := stripDockerfileComments(string(raw))
 	content := strings.ToLower(rawContent)
 	report.Add("dockerfile_read", domain.CheckPass, "Dockerfile is readable", path)
+	checkDockerfileBuildSemantics(report, rawContent, path)
+	checkRustToolchain(report, rawContent, path, codeLang)
 	for _, forbidden := range []string{"copy tests", "copy ./tests", "copy solution", "copy ./solution", "add tests", "add ./tests", "add solution", "add ./solution"} {
 		if strings.Contains(content, forbidden) {
 			report.Add("dockerfile_no_solution_tests", domain.CheckFail, "Dockerfile must not copy tests or solution into the image", path)
@@ -631,7 +647,124 @@ func checkDockerfile(report *domain.LintReport, path, repoURL, commit string) {
 	}
 }
 
-func checkCompose(report *domain.LintReport, path, repoURL, commit string) {
+func checkRustToolchain(report *domain.LintReport, content, path, codeLang string) {
+	if !strings.Contains(strings.ToLower(codeLang), "rust") {
+		return
+	}
+	pinned := false
+	for _, instruction := range dockerfileLogicalInstructions(content) {
+		if dockerPinnedRustImage.MatchString(instruction) || dockerPinnedRustup.MatchString(instruction) {
+			pinned = true
+			break
+		}
+	}
+	if !pinned || dockerAptRustToolchain.MatchString(content) {
+		report.Add("dockerfile_rust_toolchain_pinned", domain.CheckFail, "Rust Dockerfile must use an explicitly versioned Rust image or rustup toolchain and must not install cargo/rustc from apt", path)
+		return
+	}
+	report.Add("dockerfile_rust_toolchain_pinned", domain.CheckPass, "Rust Dockerfile uses an explicitly versioned modern toolchain", path)
+}
+
+func checkDockerfileBuildSemantics(report *domain.LintReport, content, path string) {
+	cloneCount := 0
+	pinCount := 0
+	hasNoOpDirectoryLayer := false
+	hasBuildTimeTests := false
+	hasUnguardedLockedCargoFetch := false
+	for _, instruction := range dockerfileLogicalInstructions(content) {
+		command, ok := dockerfileRunCommand(instruction)
+		if !ok {
+			continue
+		}
+		cloneCount += len(dockerGitClonePattern.FindAllStringIndex(command, -1))
+		pinCount += len(dockerGitPinPattern.FindAllStringIndex(command, -1))
+		hasNoOpDirectoryLayer = hasNoOpDirectoryLayer || dockerfileRunOnlyChangesDirectory(command)
+		hasBuildTimeTests = hasBuildTimeTests || dockerTestRunPattern.MatchString(command)
+		if dockerLockedCargoFetch.MatchString(command) && !dockerfileCargoLockGuarded(command) {
+			hasUnguardedLockedCargoFetch = true
+		}
+	}
+	if cloneCount > 1 {
+		report.Add("dockerfile_repo_bootstrap_unique", domain.CheckFail, "Dockerfile clones repositories more than once; repository bootstrap must be system-owned and unique", path)
+	} else {
+		report.Add("dockerfile_repo_bootstrap_unique", domain.CheckPass, "Dockerfile has at most one repository clone", path)
+	}
+	if pinCount > 1 {
+		report.Add("dockerfile_repo_pin_unique", domain.CheckFail, "Dockerfile pins or resets repository state more than once", path)
+	} else {
+		report.Add("dockerfile_repo_pin_unique", domain.CheckPass, "Dockerfile has at most one repository pin operation", path)
+	}
+	if hasNoOpDirectoryLayer {
+		report.Add("dockerfile_no_noop_cd_layer", domain.CheckFail, "Dockerfile contains a RUN layer that only changes directory; use WORKDIR or combine it with a real setup command", path)
+	} else {
+		report.Add("dockerfile_no_noop_cd_layer", domain.CheckPass, "Dockerfile has no directory-only RUN layers", path)
+	}
+	if hasBuildTimeTests {
+		report.Add("dockerfile_no_build_time_tests", domain.CheckFail, "Dockerfile must not run project tests during image build; Harbor verification runs tests after the initial image is built", path)
+	} else {
+		report.Add("dockerfile_no_build_time_tests", domain.CheckPass, "Dockerfile does not run project tests during image build", path)
+	}
+	if hasUnguardedLockedCargoFetch {
+		report.Add("dockerfile_cargo_lock_guard", domain.CheckFail, "Dockerfile uses cargo fetch --locked/--frozen without first handling repositories that do not contain Cargo.lock", path)
+	} else {
+		report.Add("dockerfile_cargo_lock_guard", domain.CheckPass, "Dockerfile dependency fetch handles optional Cargo.lock safely", path)
+	}
+}
+
+func dockerfileCargoLockGuarded(command string) bool {
+	lower := strings.ToLower(command)
+	return strings.Contains(lower, "[ -f cargo.lock ]") || strings.Contains(lower, "test -f cargo.lock")
+}
+
+func dockerfileLogicalInstructions(content string) []string {
+	var instructions []string
+	var current strings.Builder
+	for _, rawLine := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		continued := strings.HasSuffix(line, "\\")
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\\"))
+		if current.Len() > 0 {
+			current.WriteByte(' ')
+		}
+		current.WriteString(line)
+		if continued {
+			continue
+		}
+		instructions = append(instructions, current.String())
+		current.Reset()
+	}
+	if current.Len() > 0 {
+		instructions = append(instructions, current.String())
+	}
+	return instructions
+}
+
+func dockerfileRunCommand(instruction string) (string, bool) {
+	fields := strings.Fields(instruction)
+	if len(fields) < 2 || !strings.EqualFold(fields[0], "RUN") {
+		return "", false
+	}
+	return strings.TrimSpace(instruction[len(fields[0]):]), true
+}
+
+func dockerfileRunOnlyChangesDirectory(command string) bool {
+	parts := strings.Split(command, "&&")
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		fields := strings.Fields(strings.TrimSpace(part))
+		if len(fields) < 2 || !strings.EqualFold(fields[0], "cd") {
+			return false
+		}
+	}
+	return true
+}
+
+func checkCompose(report *domain.LintReport, path, repoURL, commit, codeLang string) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		report.Add("compose_read", domain.CheckFail, "cannot read file", path)
@@ -667,7 +800,7 @@ func checkCompose(report *domain.LintReport, path, repoURL, commit string) {
 
 	checkComposeMainSource(report, main, path)
 	checkComposeVolumes(report, main, path)
-	checkComposeRepoCommit(report, main, path, repoURL, commit)
+	checkComposeRepoCommit(report, main, path, repoURL, commit, codeLang)
 }
 
 func checkComposeMainSource(report *domain.LintReport, main *yaml.Node, path string) {
@@ -730,7 +863,7 @@ func checkComposeBuildContext(report *domain.LintReport, path, contextValue stri
 	}
 }
 
-func checkComposeRepoCommit(report *domain.LintReport, main *yaml.Node, composePath, repoURL, commit string) {
+func checkComposeRepoCommit(report *domain.LintReport, main *yaml.Node, composePath, repoURL, commit, codeLang string) {
 	if strings.TrimSpace(repoURL) == "" && strings.TrimSpace(commit) == "" {
 		report.Add("compose_repo_commit", domain.CheckPass, "compose repo/commit provenance not required without submitted repo metadata", composePath)
 		return
@@ -754,7 +887,7 @@ func checkComposeRepoCommit(report *domain.LintReport, main *yaml.Node, composeP
 		return
 	}
 	report.Add("compose_repo_commit", domain.CheckPass, "compose build Dockerfile will be checked for submitted repo and commit", dockerfilePath)
-	checkDockerfile(report, dockerfilePath, repoURL, commit)
+	checkDockerfile(report, dockerfilePath, repoURL, commit, codeLang)
 }
 
 func composeDockerfilePath(composePath string, build *yaml.Node) (string, error) {
@@ -1042,6 +1175,16 @@ func checkSolution(report *domain.LintReport, taskDir string) {
 		report.Add("solution_no_bypass", domain.CheckFail, "solve.sh appears to modify/run verifier internals or reward directly", path)
 	} else {
 		report.Add("solution_no_bypass", domain.CheckPass, "solve.sh has no obvious verifier bypass pattern", path)
+	}
+	if regexp.MustCompile(`(?m)^\s*apply_patch(?:\s|$)`).MatchString(content) {
+		report.Add("solution_portable_commands", domain.CheckFail, "solve.sh uses Codex-only apply_patch; use a command installed in the task environment such as git apply", path)
+	} else {
+		report.Add("solution_portable_commands", domain.CheckPass, "solve.sh uses environment-portable commands", path)
+	}
+	if strings.Contains(content, "git apply") && (strings.Contains(content, "*** begin patch") || strings.Contains(content, "*** update file")) {
+		report.Add("solution_patch_format", domain.CheckFail, "solve.sh passes Codex patch markers to git apply; git apply requires a real unified diff beginning with diff --git", path)
+	} else {
+		report.Add("solution_patch_format", domain.CheckPass, "solve.sh patch commands use a compatible format", path)
 	}
 }
 

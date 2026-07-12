@@ -62,6 +62,7 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 			TestSH:        "cd /app/repo\nprintf '%s' ok | grep ok\n",
 			TestsAnalysis: "## 1. instruction 和 environment 已提供的信息\n- Task is visible.\n\n---\n\n## 2. 模型的理论通过路径\n- Inspect config loader.\n\n---\n\n## 3. 模型具备通过条件的依据\n- Checks follow instruction.\n",
 		}) + "\n```",
+		"runtime self-check complete",
 	}}
 	var progress []string
 	report, err := Run(context.Background(), Options{
@@ -73,10 +74,11 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 			SourcePath:      source,
 			PreparedAt:      time.Now(),
 		},
-		Workspace:     workspace,
-		TaskOutputDir: taskOutput,
-		Model:         "test-model",
-		Agent:         agent,
+		Workspace:        workspace,
+		TaskOutputDir:    taskOutput,
+		Model:            "test-model",
+		Agent:            agent,
+		RuntimeSelfCheck: true,
 		Progress: func(nodeID, status, _ string, _ string) {
 			progress = append(progress, nodeID+":"+status)
 		},
@@ -86,6 +88,13 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 	}
 	if !report.Passed || report.TaskDir != taskOutput {
 		t.Fatalf("unexpected report: %+v", report)
+	}
+	if len(agent.requests) != 4 {
+		t.Fatalf("agent request count=%d, want generation plus runtime self-check", len(agent.requests))
+	}
+	selfCheck := agent.requests[3]
+	if selfCheck.ProjectPath != taskOutput || selfCheck.SandboxMode != "danger-full-access" || !selfCheck.NetworkAccess || selfCheck.TimeoutSeconds < 1800 {
+		t.Fatalf("runtime self-check lacks required execution permissions: %+v", selfCheck)
 	}
 	for _, rel := range []string{"instruction.md", "task.toml", "tests_analysis.md", "environment/Dockerfile", "solution/solve.sh", "tests/test.sh"} {
 		if _, err := os.Stat(filepath.Join(taskOutput, filepath.FromSlash(rel))); err != nil {
@@ -123,9 +132,6 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 	if !strings.Contains(testsAnalysis, "environment 通过 Dockerfile") || !strings.Contains(testsAnalysis, "原始生成备注") {
 		t.Fatalf("thin tests analysis was not expanded with structured attribution:\n%s", testsAnalysis)
 	}
-	if len(agent.requests) != 3 {
-		t.Fatalf("agent calls = %d, want 3", len(agent.requests))
-	}
 	for _, want := range []string{
 		"repo_analyze:succeeded",
 		"instruction_generate:succeeded",
@@ -135,6 +141,7 @@ func TestRunGeneratesHarborTaskFiles(t *testing.T) {
 		"test_generate:succeeded",
 		"tests_analysis:succeeded",
 		"materialize_task:succeeded",
+		"runtime_self_check:succeeded",
 	} {
 		if !contains(progress, want) {
 			t.Fatalf("progress missing %s: %#v", want, progress)
@@ -159,6 +166,50 @@ func TestNormalizeTestScriptIsolatesGeneratedExitTrap(t *testing.T) {
 	closingSubshell := strings.LastIndex(script, "\n)\n")
 	if closingSubshell < 0 || cleanupTrap > closingSubshell || !strings.Contains(script[cleanupTrap:closingSubshell], "printf ok") {
 		t.Fatalf("generated body must execute completely inside the subshell:\n%s", script)
+	}
+}
+
+func TestRenderDockerfileFiltersRepositoryLifecycleAndBuildTimeTests(t *testing.T) {
+	dockerfile := renderDockerfile(domain.RepoPrepared{
+		RepoURL:        "https://github.com/org/repo.git",
+		ResolvedCommit: "abc1234",
+	}, domain.TaskProposal{
+		CodeLang: "rust",
+		SetupCommands: []string{
+			"git clone https://github.com/org/repo.git",
+			"cd repo",
+			"git checkout abc1234",
+			"cargo fetch",
+			" cargo   fetch ",
+			"cargo fetch --locked",
+			"cargo test --all-features",
+		},
+	})
+	if strings.Count(dockerfile, "git clone") != 1 || strings.Count(dockerfile, "git checkout") != 1 {
+		t.Fatalf("Dockerfile must contain exactly one system-owned repo bootstrap:\n%s", dockerfile)
+	}
+	if strings.Contains(dockerfile, "RUN cd /app/repo && cd repo") || strings.Contains(dockerfile, "cargo test") {
+		t.Fatalf("Dockerfile retained invalid setup commands:\n%s", dockerfile)
+	}
+	guardedFetch := "RUN cd /app/repo && if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo fetch; fi"
+	if strings.Count(dockerfile, guardedFetch) != 1 {
+		t.Fatalf("Dockerfile did not retain and deduplicate dependency preparation:\n%s", dockerfile)
+	}
+	if !strings.HasPrefix(dockerfile, "FROM "+rustBaseImage+"\n") {
+		t.Fatalf("Rust Dockerfile must use the pinned modern toolchain image:\n%s", dockerfile)
+	}
+	if !strings.Contains(dockerfile, "RUN rustup component add rustfmt clippy") {
+		t.Fatalf("Rust Dockerfile must install validation components:\n%s", dockerfile)
+	}
+	installLine := "apt-get install -y --no-install-recommends " + strings.Join(basePackages("rust"), " ")
+	if strings.Contains(installLine, " cargo") || strings.Contains(installLine, " rustc") {
+		t.Fatalf("Rust Dockerfile must not install the obsolete Ubuntu toolchain:\n%s", dockerfile)
+	}
+}
+
+func TestBaseImageKeepsNonRustTasksOnUbuntu(t *testing.T) {
+	if got := baseImage("go"); got != "ubuntu:24.04" {
+		t.Fatalf("unexpected Go base image: %s", got)
 	}
 }
 

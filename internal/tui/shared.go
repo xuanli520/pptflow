@@ -48,7 +48,7 @@ func initModelComponents(m model) model {
 		m.startInputs[m.startField] = ti
 	}
 	m.notesInput = textarea.New()
-	m.notesInput.Placeholder = "输入审查备注（支持中文和多行）"
+	m.notesInput.Placeholder = "输入审查备注或给 Codex 的返修指导（支持中文和多行）"
 	m.notesInput.SetWidth(64)
 	m.notesInput.SetHeight(5)
 	m.notesInput.CharLimit = 10000
@@ -107,6 +107,10 @@ func (m model) cloneForUpdate() model {
 	if m.runConfig != nil {
 		clone := *m.runConfig
 		m.runConfig = &clone
+	}
+	if m.taskRepair != nil {
+		clone := *m.taskRepair
+		m.taskRepair = &clone
 	}
 	if m.resumeOverlay != nil {
 		clone := *m.resumeOverlay

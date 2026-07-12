@@ -40,16 +40,16 @@ func localizeStatus(status string) string {
 func localizeNode(id string) string {
 	names := map[string]string{
 		nodes.RepoPrepare: "仓库准备", nodes.RepoAnalyze: "仓库分析", nodes.TaskDesign: "任务设计",
-		nodes.TaskReview: "任务审查 [关卡]", nodes.GenerateTaskFiles: "生成任务文件",
+		nodes.TaskReview: "任务方向 [关卡]", nodes.GenerateTaskFiles: "生成任务文件",
 		nodes.InstructionGen: "生成指令文档", nodes.TaskTOMLGen: "生成任务配置",
 		nodes.DockerfileGen: "生成 Docker 配置", nodes.SolveGen: "生成解答脚本",
-		nodes.TestGen: "生成测试脚本", nodes.TestsAnalysis: "测试分析", nodes.MaterializeTask: "物化任务文件",
+		nodes.TestGen: "生成测试脚本", nodes.TestsAnalysis: "测试分析", nodes.MaterializeTask: "物化任务文件", nodes.RuntimeSelfCheck: "模型运行时自检",
 		nodes.ContentReview: "内容审查 [关卡]", nodes.CodeEdgeLint: "代码检查", nodes.HarborVerify: "Harbor 验证",
 		nodes.DockerBuild: "Docker 构建", nodes.InitialVerify: "初始验证", nodes.OracleVerify: "Oracle 验证",
 		nodes.QualityCheck: "质量检查", nodes.SimilarityCheck: "相似度检查",
 		nodes.HarborRunQwen: "Qwen 模型运行", nodes.HarborRunOpus: "Opus 模型运行",
 		nodes.SubmissionLint: "提交检查", nodes.ResultReview: "结果审查 [关卡]",
-		nodes.FinalReview: "最终审查 [关卡]", nodes.Package: "打包",
+		nodes.FinalReview: "最终发布 [关卡]", nodes.Package: "打包",
 	}
 	if name, ok := names[id]; ok {
 		return name
@@ -60,11 +60,11 @@ func localizeNode(id string) string {
 func localizeGate(id, fallback string) string {
 	switch id {
 	case nodes.TaskReview:
-		return "任务审查"
+		return "任务方向"
 	case nodes.ContentReview:
 		return "内容审查"
 	case nodes.FinalReview:
-		return "最终审查"
+		return "最终发布"
 	case nodes.ResultReview:
 		return "结果审查"
 	}

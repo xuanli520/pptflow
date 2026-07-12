@@ -1,6 +1,7 @@
 package nodes
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -18,20 +19,23 @@ const (
 	TestGen           = "test_generate"
 	TestsAnalysis     = "tests_analysis"
 	MaterializeTask   = "materialize_task"
-	ContentReview     = "content_review"
-	CodeEdgeLint      = "codeedge_lint"
-	HarborVerify      = "harbor_verify"
-	DockerBuild       = "docker_build"
-	InitialVerify     = "initial_verify"
-	OracleVerify      = "oracle_verify"
-	QualityCheck      = "quality_check"
-	SimilarityCheck   = "similarity_check"
-	HarborRunQwen     = "harbor_run_qwen"
-	HarborRunOpus     = "harbor_run_opus"
-	SubmissionLint    = "submission_lint"
-	ResultReview      = "result_review"
-	FinalReview       = "final_review"
-	Package           = "package"
+	RuntimeSelfCheck  = "runtime_self_check"
+	// ContentReview and ResultReview remain readable for historical workspaces,
+	// but new runs no longer place them in Order or request those redundant gates.
+	ContentReview   = "content_review"
+	CodeEdgeLint    = "codeedge_lint"
+	HarborVerify    = "harbor_verify"
+	DockerBuild     = "docker_build"
+	InitialVerify   = "initial_verify"
+	OracleVerify    = "oracle_verify"
+	QualityCheck    = "quality_check"
+	SimilarityCheck = "similarity_check"
+	HarborRunQwen   = "harbor_run_qwen"
+	HarborRunOpus   = "harbor_run_opus"
+	SubmissionLint  = "submission_lint"
+	ResultReview    = "result_review"
+	FinalReview     = "final_review"
+	Package         = "package"
 )
 
 func Order() []string {
@@ -48,7 +52,7 @@ func Order() []string {
 		TestGen,
 		TestsAnalysis,
 		MaterializeTask,
-		ContentReview,
+		RuntimeSelfCheck,
 		CodeEdgeLint,
 		HarborVerify,
 		DockerBuild,
@@ -59,7 +63,6 @@ func Order() []string {
 		HarborRunQwen,
 		HarborRunOpus,
 		SubmissionLint,
-		ResultReview,
 		FinalReview,
 		Package,
 	}
@@ -100,6 +103,8 @@ func ArtifactPaths(workspace, nodeID string) []string {
 		return []string{TestPath(workspace)}
 	case TestsAnalysis, MaterializeTask:
 		return []string{TestsAnalysisPath(workspace)}
+	case RuntimeSelfCheck:
+		return []string{AgentLogPath(workspace, RuntimeSelfCheck)}
 	case ContentReview:
 		return []string{ReviewDecisionPath(workspace, "phase1", ContentReview)}
 	case CodeEdgeLint:
@@ -241,6 +246,14 @@ func QualityReportPath(workspace string) string {
 
 func QualityAgentLogPath(workspace string) string {
 	return filepath.Join(DefaultWorkspace(workspace), "phase2", "artifacts", QualityCheck, "agent.log")
+}
+
+func TaskRepairReportPath(workspace, source string, round int) string {
+	return filepath.Join(DefaultWorkspace(workspace), "phase2", "artifacts", "task_repair", source, fmt.Sprintf("repair-%03d.json", round))
+}
+
+func TaskRepairAgentLogPath(workspace, source string, round int) string {
+	return filepath.Join(DefaultWorkspace(workspace), "phase2", "artifacts", "task_repair", source, fmt.Sprintf("repair-%03d-agent.log", round))
 }
 
 func SimilarityReportPath(workspace string) string {

@@ -642,8 +642,8 @@ func TestFooterHidesUnavailableActions(t *testing.T) {
 		t.Fatalf("task review footer exposed unavailable revise action: %s", footer)
 	}
 	m.activeGate.GateID = nodes.FinalReview
-	if footer := m.footer(); !strings.Contains(footer, "修订/刷新") {
-		t.Fatalf("final review footer hid revise action: %s", footer)
+	if footer := m.footer(); !strings.Contains(footer, "Codex指导返修") || !strings.Contains(footer, "Codex自动循环") || !strings.Contains(footer, "人工编辑后重跑") {
+		t.Fatalf("final review footer hid repair actions: %s", footer)
 	}
 }
 

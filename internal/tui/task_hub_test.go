@@ -145,6 +145,39 @@ func TestHubRerunCloneStartsNewRunnerWithSelectedConfig(t *testing.T) {
 	}
 }
 
+func TestHubExternalReviewRepairCreatesGuidedRun(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspaces", "source")
+	writeHubWorkspace(t, workspace, domain.RunSummary{RunID: "source-run", Workspace: workspace, Status: "succeeded", Passed: true, FinishedAt: time.Now()}, app.RunnerOptions{Workspace: workspace, TaskDir: t.TempDir(), TaskName: "repair-task", QualityCheck: true})
+	m, cleanup := testHubModel(t, root)
+	defer cleanup()
+	loaded := m.loadHub(true)().(hubLoadedMsg)
+	if loaded.err != nil {
+		t.Fatal(loaded.err)
+	}
+	m.applyHubItems(loaded.items)
+	if cmd := m.updateHubKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}}); cmd == nil || m.taskRepair == nil {
+		t.Fatal("external review repair did not open the feedback overlay")
+	}
+	target := filepath.Join(root, "workspaces", "repair-target")
+	m.taskRepair.Target.SetValue(target)
+	m.taskRepair.Feedback.SetValue("机审指出 instruction 与公开错误类型不一致，请修复并重跑。")
+	cmd := m.updateTaskRepairKey(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if cmd == nil {
+		t.Fatal("external review feedback did not create a repair command")
+	}
+	prepared := cmd().(clonePreparedMsg)
+	if prepared.err != nil {
+		t.Fatal(prepared.err)
+	}
+	if prepared.opts.RepairSource != "external_review" || !strings.Contains(prepared.opts.RepairGuidance, "公开错误类型") || prepared.opts.Workspace != target {
+		t.Fatalf("guided repair options missing external feedback: %+v", prepared.opts)
+	}
+	if prepared.opts.AutoApprove {
+		t.Fatal("external review repair must return to operator-controlled gates")
+	}
+}
+
 func TestDoneRerunFromLegacySnapshotCarriesCurrentRuntimeCredentials(t *testing.T) {
 	for _, key := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL", "QWEN_HARBOR_BASE_URL", "OPUS_HARBOR_BASE_URL"} {
 		t.Setenv(key, "")

@@ -121,6 +121,7 @@ type model struct {
 	hubTable      table.Model
 	hubSearch     textinput.Model
 	runConfig     *RunConfigOverlay
+	taskRepair    *TaskRepairOverlay
 	resumeOverlay *WorkspaceResumeOverlay
 
 	width  int
@@ -413,7 +414,7 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			m.cancelRun()
 			return m, tea.Quit
-		case "a", "ctrl+a", "r", "ctrl+r", "v", "ctrl+v", "n", "ctrl+n", "e":
+		case "a", "ctrl+a", "r", "ctrl+r", "v", "ctrl+v", "c", "u", "ctrl+u", "n", "ctrl+n", "e":
 			m.err = fmt.Errorf("工作区快照为只读，当前运行由另一个 Factory 进程持有")
 		}
 		return m, nil
@@ -458,6 +459,34 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "v", "ctrl+v":
 		if m.activeGate.GateID != nodes.FinalReview && m.activeGate.GateID != nodes.ResultReview {
 			m.err = fmt.Errorf("修订/刷新仅在最终审查和结果审查中可用")
+			return m, nil
+		}
+		gate := m.activeGate
+		decision := m.makeGateDecision(false)
+		if gate.GateID == nodes.FinalReview {
+			decision.Action = "repair"
+		} else {
+			decision.Action = "revise"
+		}
+		m.activeGate = nil
+		m.err = nil
+		m.view = viewOverview
+		return m, m.submitDecision(decision, gate)
+	case "c":
+		if m.activeGate.GateID != nodes.FinalReview {
+			m.err = fmt.Errorf("Codex 自动返修循环仅在最终审查中可用")
+			return m, nil
+		}
+		gate := m.activeGate
+		decision := m.makeGateDecision(false)
+		decision.Action = "repair_loop"
+		m.activeGate = nil
+		m.err = nil
+		m.view = viewOverview
+		return m, m.submitDecision(decision, gate)
+	case "u", "ctrl+u":
+		if m.activeGate.GateID != nodes.FinalReview {
+			m.err = fmt.Errorf("人工编辑后重跑仅在最终审查中可用")
 			return m, nil
 		}
 		gate := m.activeGate

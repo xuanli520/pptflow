@@ -57,6 +57,7 @@ repo_analysis:
 3. 任务目标和 tests 后续可验证点必须能从 instruction + environment 推导。
 4. Qwen pass@4 预期应不超过 1/4，平均轮数预期不少于 20。
 5. 非 0-1 任务必须保留 GitHub URL 和固定 commit。
+6. setup_commands 只包含仓库已位于 /app/repo 后所需的依赖准备命令。不得包含 git clone、git checkout/reset/switch、单独 cd、测试或 verifier 命令；仓库 clone 和 commit 固定由系统生成。
 
 只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。schema 必须是:
 {
@@ -75,7 +76,7 @@ repo_analysis:
   "difficulty_rationale": "...",
   "boundary_conditions": ["..."],
   "suggested_verification": "...",
-  "setup_commands": ["..."]
+  "setup_commands": ["仅依赖安装或预取命令，例如 cargo fetch、go mod download、npm ci"]
 }
 `, repoAnalysisJSON)
 }
@@ -103,6 +104,10 @@ task_proposal:
 5. test_sh 使用的精确公开类型名、错误类型名和配置 API 必须在 instruction_md 中明确声明，不能把它们作为隐藏契约。
 6. instruction_md 若同时要求 Layer API 和直接 Service API，test_sh 必须分别覆盖两条公开配置路径。
 7. test_sh 可以设置清理 trap；系统会将脚本主体放入子 shell，清理逻辑不得写入或覆盖 /logs/verifier/reward 的父级 EXIT trap。
+8. test_sh 或 solve_sh 创建临时源码/测试文件时，必须先用 mkdir -p 创建其父目录；不得假设目标仓库已存在 tests、fixtures 或生成目录。
+9. solve_sh 和 test_sh 只能使用 environment 中明确安装或基础镜像自带的命令。禁止使用 Codex 专用 apply_patch；补丁必须使用 git apply、patch、sed 等标准命令。
+   使用 git apply 时，heredoc 必须是真实 unified diff，以 diff --git、---、+++ 和带行号的 @@ -a,b +c,d @@ 组成；严禁把 *** Begin Patch / *** Update File 格式传给 git apply。
+10. Rust setup_commands 使用 cargo fetch 即可，不要添加 --locked、--frozen 或 --offline；系统会根据 Cargo.lock 是否存在自动选择锁定模式。
 
 只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。schema 必须是:
 {
@@ -114,4 +119,21 @@ task_proposal:
   "extra_notes": "..."
 }
 `, repoAnalysisJSON, proposalJSON)
+}
+
+func runtimeSelfCheckPrompt() string {
+	return `You are performing the first runtime self-check of the Harbor task you just designed.
+
+You have explicit authorization to edit the standard task files in the current task directory, access the network, and run Docker build/run commands. Inspect instruction.md, task.toml, environment/Dockerfile, solution/solve.sh, tests/test.sh, and tests_analysis.md as one contract.
+
+Required self-check:
+1. Run shell syntax checks and ensure every command used by solve.sh/test.sh exists in the image.
+2. Build environment/Dockerfile.
+3. Run tests/test.sh against the untouched image and confirm it fails for the intended behavioral reason, not missing paths/tools or syntax errors.
+4. Run solution/solve.sh followed by tests/test.sh and confirm the oracle passes.
+5. If any step fails, repair the task files and repeat the focused failing step.
+6. Do not weaken assertions, expose the solution in instruction.md, change the pinned repository/commit, or write credentials into task files.
+7. Remove temporary containers/images you created when practical.
+
+This is a repair-capable runtime validation turn. Finish only after the task is internally consistent, or clearly report the remaining concrete blocker so mandatory machine gates can reject it.`
 }

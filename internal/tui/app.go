@@ -152,9 +152,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.runConfig != nil {
 				m.runConfig.Loading = false
 			}
+			if m.taskRepair != nil {
+				m.taskRepair.Loading = false
+			}
 			return m, nil
 		}
-		m.closeRunConfig()
+		if m.taskRepair != nil {
+			m.closeTaskRepair()
+		} else {
+			m.closeRunConfig()
+		}
 		m = m.startRunner(msg.opts)
 		m.setView(viewOverview)
 		m.notice = fmt.Sprintf("已从 %s 创建新工作区。", msg.manifest.SourceWorkspace)

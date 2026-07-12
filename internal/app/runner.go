@@ -23,6 +23,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/packager"
 	"github.com/purplevoid/harbor-factory/internal/harbor/quality"
+	"github.com/purplevoid/harbor-factory/internal/harbor/repair"
 	"github.com/purplevoid/harbor-factory/internal/harbor/repoprep"
 	"github.com/purplevoid/harbor-factory/internal/harbor/runlock"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
@@ -87,6 +88,8 @@ type RunnerOptions struct {
 	Reasoning             string
 	CodexPath             string
 	AgentTimeout          int
+	RepairGuidance        string
+	RepairSource          string
 	Agent                 workflow.AgentRuntime
 }
 
@@ -323,12 +326,13 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 			ReasoningEffort:     r.opts.Reasoning,
 			AgentTimeoutSeconds: r.opts.AgentTimeout,
 			Agent:               agent,
+			RuntimeSelfCheck:    true,
 			TaskReview: func(analysis domain.RepoAnalysis, proposal domain.TaskProposal, proposalPath string) error {
 				artifacts := gateArtifacts(proposalPath)
 				if analysisPath := nodes.RepoAnalysisPath(r.opts.Workspace); isReadableFile(analysisPath) {
 					artifacts = append(gateArtifacts(analysisPath), artifacts...)
 				}
-				decision, err := r.reviewGate(ctx, nodes.TaskReview, "Task Review", nodes.TaskReview, "Review selected task proposal before generating Harbor files.", taskProposalChecklist(proposal), artifacts, "phase1")
+				decision, err := r.reviewGate(ctx, nodes.TaskReview, "Task Direction Gate", nodes.TaskReview, "Confirm the task direction before generating files and spending runtime validation resources.", taskProposalChecklist(proposal), artifacts, "phase1")
 				if err != nil {
 					return err
 				}
@@ -371,36 +375,6 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 		if genReport.TaskProposal.IsZeroToOne {
 			effectiveIsZeroToOne = true
 		}
-		contentArtifacts := gateArtifacts(
-			genReport.RepoAnalysisPath,
-			genReport.TaskProposalPath,
-			genReport.TaskFilesPath,
-			filepath.Join(genReport.TaskDir, "instruction.md"),
-			filepath.Join(genReport.TaskDir, "task.toml"),
-			filepath.Join(genReport.TaskDir, "environment", "Dockerfile"),
-			filepath.Join(genReport.TaskDir, "solution", "solve.sh"),
-			filepath.Join(genReport.TaskDir, "tests", "test.sh"),
-			filepath.Join(genReport.TaskDir, "tests_analysis.md"),
-			genReport.TestsAnalysisPath,
-		)
-		decision, err := r.reviewGate(ctx, nodes.ContentReview, "Content Review", nodes.ContentReview, "Review generated Harbor task files before lint and verification.", genChecklist(genReport), contentArtifacts, "phase1")
-		if err != nil {
-			r.emit("node_failed", nodes.ContentReview, "failed", err.Error(), "")
-			summary.Passed = false
-			summary.Status = "failed"
-			summary.FinishedAt = time.Now().UTC()
-			summary.Events = r.snapshot()
-			summary.GateDecisions = r.gateSnapshot()
-			close(r.events)
-			return summary, err
-		}
-		summary.GateDecisions = append(summary.GateDecisions, decision)
-		if !decision.Approved {
-			r.emit("node_failed", nodes.ContentReview, "failed", "gate rejected", "")
-			summary.Passed = false
-		} else {
-			r.emit("node_succeeded", nodes.ContentReview, "succeeded", "gate approved", "")
-		}
 	}
 	if effectiveTaskDir != "" {
 		defaults := readTaskDefaults(effectiveTaskDir)
@@ -416,9 +390,27 @@ func (r *Runner) Run(ctx context.Context) (summary domain.RunSummary, runErr err
 			effectiveIsZeroToOne = true
 		}
 	}
+	if guidance := strings.TrimSpace(r.opts.RepairGuidance); effectiveTaskDir != "" && guidance != "" {
+		source := normalizedRepairSource(r.opts.RepairSource)
+		reportPath := nodes.TaskRepairReportPath(r.opts.Workspace, source, 1)
+		if _, ok := repair.Reusable(reportPath, effectiveTaskDir, guidance, source); ok {
+			r.emit("node_succeeded", nodes.FinalReview, "succeeded", "reused completed external review repair", reportPath)
+		} else {
+			r.emit("node_started", nodes.FinalReview, "running", "Codex is repairing the task from operator/external review guidance", "")
+			if _, err := r.runTaskRepair(ctx, effectiveTaskDir, source, guidance, nil, 1); err != nil {
+				r.emit("node_failed", nodes.FinalReview, "failed", err.Error(), reportPath)
+				summary.Passed = false
+				summary.Status = "failed"
+				close(r.events)
+				return summary, err
+			}
+			r.emit("node_succeeded", nodes.FinalReview, "succeeded", "Codex external review repair changed the task; running all checks", reportPath)
+		}
+	}
 	applyWorkspaceEvidenceDefaults(r.opts.Workspace, &effectiveTestsAnalysis, &effectiveQwenResult, &effectiveOpusResult, &effectiveQwenScreenshot, &effectiveOpusScreenshot)
 
 	reviewRevisionCount := 0
+	autoRepairLoop := false
 	var harborModelErrors []error
 reviewChecks:
 	if effectiveTaskDir != "" && summary.Passed {
@@ -652,50 +644,6 @@ reviewChecks:
 				}
 			}
 		}
-		if (summary.QwenResult != nil || summary.OpusResult != nil) && summary.Passed {
-			for resultRevision := 0; ; {
-				resultArtifacts := gateArtifacts(effectiveQwenResult, effectiveOpusResult)
-				if strings.TrimSpace(effectiveQwenScreenshot) != "" {
-					resultArtifacts = append(resultArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveQwenScreenshot), Path: effectiveQwenScreenshot})
-				}
-				if strings.TrimSpace(effectiveOpusScreenshot) != "" {
-					resultArtifacts = append(resultArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveOpusScreenshot), Path: effectiveOpusScreenshot})
-				}
-				decision, err := r.reviewGate(ctx, nodes.ResultReview, "Result Review", nodes.ResultReview, "Review Harbor pass@4 evidence and screenshots before final packaging.", resultChecklist(summary.QwenResult, summary.OpusResult, effectiveTaskDir, defaultString(r.opts.QwenModel, "qwen3.7-max"), defaultString(r.opts.OpusModel, "claude-opus-4-8"), defaultString(r.opts.HarborAgent, "claude-code"), effectiveQwenScreenshot, effectiveOpusScreenshot), resultArtifacts, "phase3")
-				if err != nil {
-					r.emit("node_failed", nodes.ResultReview, "failed", err.Error(), "")
-					summary.Passed = false
-					summary.Status = "failed"
-					summary.FinishedAt = time.Now().UTC()
-					summary.Events = r.snapshot()
-					summary.GateDecisions = r.gateSnapshot()
-					close(r.events)
-					return summary, err
-				}
-				summary.GateDecisions = append(summary.GateDecisions, decision)
-				if decision.Action == "revise" {
-					resultRevision++
-					if resultRevision > 5 {
-						err := fmt.Errorf("result review exceeded the maximum of 5 evidence refresh rounds")
-						r.emit("node_failed", nodes.ResultReview, "failed", err.Error(), "")
-						summary.Passed = false
-						return summary, err
-					}
-					if err := r.archiveGateRevision("phase3", nodes.ResultReview, decision, resultRevision); err != nil {
-						return summary, err
-					}
-					r.emit("node_progress", nodes.ResultReview, "running", fmt.Sprintf("evidence refresh %d requested; reloading screenshot checklist", resultRevision), "")
-					continue
-				}
-				if !decision.Approved {
-					r.emit("node_failed", nodes.ResultReview, "failed", "gate rejected", "")
-					summary.Passed = false
-				} else {
-					r.emit("node_succeeded", nodes.ResultReview, "succeeded", "gate approved", "")
-				}
-				break
-			}
-		}
 		finalArtifacts := gateArtifacts(
 			reportPath,
 			filepath.Join(effectiveTaskDir, "instruction.md"),
@@ -714,8 +662,11 @@ reviewChecks:
 		if summary.OpusResult != nil && summary.OpusResult.ResultPath != "" {
 			finalArtifacts = append(finalArtifacts, gateArtifacts(summary.OpusResult.ResultPath)...)
 		}
-		if r.opts.Workspace != "" {
-			finalArtifacts = append(finalArtifacts, gateArtifacts(nodes.ReviewDecisionPath(r.opts.Workspace, "phase3", nodes.ResultReview))...)
+		if strings.TrimSpace(effectiveQwenScreenshot) != "" {
+			finalArtifacts = append(finalArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveQwenScreenshot), Path: effectiveQwenScreenshot})
+		}
+		if strings.TrimSpace(effectiveOpusScreenshot) != "" {
+			finalArtifacts = append(finalArtifacts, domain.ArtifactPreview{Name: filepath.Base(effectiveOpusScreenshot), Path: effectiveOpusScreenshot})
 		}
 		if qualityPath != "" {
 			finalArtifacts = append(finalArtifacts, gateArtifacts(qualityPath)...)
@@ -730,7 +681,37 @@ reviewChecks:
 		if summary.SimilarityReport != nil {
 			finalChecklist = append(finalChecklist, similarityChecklist(*summary.SimilarityReport)...)
 		}
-		decision, err := r.reviewGate(ctx, nodes.FinalReview, "Final Review", nodes.FinalReview, "Review CodeEdge lint and quality results before continuing.", finalChecklist, finalArtifacts, "phase2")
+		if summary.QwenResult != nil || summary.OpusResult != nil {
+			finalChecklist = append(finalChecklist, resultChecklist(summary.QwenResult, summary.OpusResult, effectiveTaskDir, defaultString(r.opts.QwenModel, "qwen3.7-max"), defaultString(r.opts.OpusModel, "claude-opus-4-8"), defaultString(r.opts.HarborAgent, "claude-code"), effectiveQwenScreenshot, effectiveOpusScreenshot)...)
+		}
+		if autoRepairLoop && len(blockingGateChecklist(finalChecklist)) > 0 {
+			reviewRevisionCount++
+			if reviewRevisionCount > 5 {
+				err := fmt.Errorf("automatic Final Review repair reached the maximum of 5 rounds")
+				r.emit("node_failed", nodes.FinalReview, "failed", err.Error(), "")
+				summary.Passed = false
+				return summary, err
+			}
+			decision := domain.GateDecision{RequestID: stableGateRequestID("phase2", nodes.FinalReview), GateID: nodes.FinalReview, Action: "repair_loop", Notes: "automatic Codex repair loop", DecidedAt: time.Now().UTC()}
+			if err := r.writeGateDecision("phase2", nodes.FinalReview, decision); err != nil {
+				return summary, err
+			}
+			if err := r.archiveGateRevision("phase2", nodes.FinalReview, decision, reviewRevisionCount); err != nil {
+				return summary, err
+			}
+			r.mu.Lock()
+			r.gates = append(r.gates, sanitizeGateDecision(decision))
+			r.mu.Unlock()
+			if _, err := r.runTaskRepair(ctx, effectiveTaskDir, "final_review", decision.Notes, blockingGateChecklist(finalChecklist), reviewRevisionCount); err != nil {
+				r.emit("node_failed", nodes.FinalReview, "failed", err.Error(), nodes.TaskRepairReportPath(r.opts.Workspace, "final_review", reviewRevisionCount))
+				summary.Passed = false
+				return summary, err
+			}
+			r.emit("node_progress", nodes.FinalReview, "running", fmt.Sprintf("automatic Codex repair round %d changed the task; rerunning all checks", reviewRevisionCount), "")
+			clearReviewEvidence(&summary, &effectiveQwenResult, &effectiveOpusResult)
+			goto reviewChecks
+		}
+		decision, err := r.reviewGate(ctx, nodes.FinalReview, "Final Release Gate", nodes.FinalReview, "Review all mandatory machine checks and model evidence, then approve or request repair.", finalChecklist, finalArtifacts, "phase2")
 		if err != nil {
 			r.emit("node_failed", nodes.FinalReview, "failed", err.Error(), "")
 			summary.Passed = false
@@ -742,7 +723,7 @@ reviewChecks:
 			return summary, err
 		}
 		summary.GateDecisions = append(summary.GateDecisions, decision)
-		if decision.Action == "revise" {
+		if decision.Action == "revise" || decision.Action == "repair" || decision.Action == "repair_loop" {
 			reviewRevisionCount++
 			if reviewRevisionCount > 5 {
 				err := fmt.Errorf("final review exceeded the maximum of 5 revise-and-rerun rounds")
@@ -753,16 +734,19 @@ reviewChecks:
 			if err := r.archiveGateRevision("phase2", nodes.FinalReview, decision, reviewRevisionCount); err != nil {
 				return summary, err
 			}
-			r.emit("node_progress", nodes.FinalReview, "running", fmt.Sprintf("revision %d accepted; rerunning lint, verification, quality, similarity, and model evidence", reviewRevisionCount), "")
-			summary.Passed = true
-			summary.LintReport = nil
-			summary.VerifyReport = nil
-			summary.QualityReport = nil
-			summary.SimilarityReport = nil
-			summary.QwenResult = nil
-			summary.OpusResult = nil
-			effectiveQwenResult = ""
-			effectiveOpusResult = ""
+			if decision.Action == "repair" || decision.Action == "repair_loop" {
+				if _, err := r.runTaskRepair(ctx, effectiveTaskDir, "final_review", decision.Notes, blockingGateChecklist(finalChecklist), reviewRevisionCount); err != nil {
+					r.emit("node_failed", nodes.FinalReview, "failed", err.Error(), nodes.TaskRepairReportPath(r.opts.Workspace, "final_review", reviewRevisionCount))
+					summary.Passed = false
+					return summary, err
+				}
+				autoRepairLoop = decision.Action == "repair_loop"
+				r.emit("node_progress", nodes.FinalReview, "running", fmt.Sprintf("Codex repair round %d changed the task; rerunning lint, verification, quality, similarity, and model evidence", reviewRevisionCount), "")
+			} else {
+				autoRepairLoop = false
+				r.emit("node_progress", nodes.FinalReview, "running", fmt.Sprintf("manual revision %d accepted; rerunning lint, verification, quality, similarity, and model evidence", reviewRevisionCount), "")
+			}
+			clearReviewEvidence(&summary, &effectiveQwenResult, &effectiveOpusResult)
 			goto reviewChecks
 		}
 		if !decision.Approved {
@@ -1484,6 +1468,8 @@ func runnerOptionsSnapshot(opts RunnerOptions) domain.RunnerOptionsSnapshot {
 		Reasoning:                strings.TrimSpace(opts.Reasoning),
 		CodexPath:                strings.TrimSpace(opts.CodexPath),
 		AgentTimeout:             opts.AgentTimeout,
+		RepairGuidance:           strings.TrimSpace(opts.RepairGuidance),
+		RepairSource:             strings.TrimSpace(opts.RepairSource),
 		SensitiveFieldsOmitted:   sensitiveRunnerOptionFields(opts),
 		UnsupportedFieldsOmitted: unsupportedRunnerOptionFields(opts),
 		CreatedAt:                time.Now().UTC(),
@@ -1547,6 +1533,8 @@ func runnerOptionsFromSnapshot(snapshot domain.RunnerOptionsSnapshot) RunnerOpti
 		Reasoning:             snapshot.Reasoning,
 		CodexPath:             snapshot.CodexPath,
 		AgentTimeout:          snapshot.AgentTimeout,
+		RepairGuidance:        snapshot.RepairGuidance,
+		RepairSource:          snapshot.RepairSource,
 	}
 }
 
@@ -1932,6 +1920,50 @@ func limitStrings(values []string, limit int) []string {
 	out := append([]string(nil), values[:limit]...)
 	out = append(out, "...")
 	return out
+}
+
+func (r *Runner) runTaskRepair(ctx context.Context, taskDir, source, guidance string, findings []string, round int) (repair.Report, error) {
+	source = normalizedRepairSource(source)
+	agent := r.opts.Agent
+	if agent == nil {
+		agent = codexruntime.New(nil, r.opts.CodexPath, nil)
+	}
+	return repair.Run(ctx, repair.Options{
+		TaskDir:         taskDir,
+		Guidance:        guidance,
+		Findings:        findings,
+		Source:          source,
+		Round:           round,
+		Agent:           agent,
+		Model:           r.opts.Model,
+		ReasoningEffort: r.opts.Reasoning,
+		TimeoutSeconds:  r.opts.AgentTimeout,
+		LogPath:         nodes.TaskRepairAgentLogPath(r.opts.Workspace, source, round),
+		WriteReport:     nodes.TaskRepairReportPath(r.opts.Workspace, source, round),
+	})
+}
+
+func normalizedRepairSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "final_review":
+		return "final_review"
+	case "external_review":
+		return "external_review"
+	default:
+		return "operator_review"
+	}
+}
+
+func clearReviewEvidence(summary *domain.RunSummary, qwenResult, opusResult *string) {
+	summary.Passed = true
+	summary.LintReport = nil
+	summary.VerifyReport = nil
+	summary.QualityReport = nil
+	summary.SimilarityReport = nil
+	summary.QwenResult = nil
+	summary.OpusResult = nil
+	*qwenResult = ""
+	*opusResult = ""
 }
 
 func taskProposalChecklist(proposal domain.TaskProposal) []domain.ChecklistItem {

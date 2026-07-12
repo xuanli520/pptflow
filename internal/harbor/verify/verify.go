@@ -70,13 +70,16 @@ func Run(ctx context.Context, opts Options) (domain.VerifyReport, error) {
 func runDockerfileVerify(ctx context.Context, exec executor.CommandRunner, timeout time.Duration, opts Options, report domain.VerifyReport, dockerfile, imageTag string) (domain.VerifyReport, error) {
 	taskDir := strings.TrimSpace(opts.TaskDir)
 	contextDir := filepath.Join(taskDir, "environment")
-	build, err := runCommand(ctx, exec, timeout, commandOutputDir(opts, nodes.DockerBuild), "", nodes.DockerBuild, "docker", "build", "-t", imageTag, "-f", dockerfile, contextDir)
+	buildAttempts, err := runDockerBuildWithRetry(ctx, exec, timeout, commandOutputDir(opts, nodes.DockerBuild), "", nodes.DockerBuild, "docker", "build", "-t", imageTag, "-f", dockerfile, contextDir)
 	if err != nil {
 		return report, err
 	}
+	build := buildAttempts[len(buildAttempts)-1]
 	build.Passed = build.ExitCode == 0 && !build.Timeout
 	report.DockerBuild = &build
-	addCommand(&report, build)
+	for _, attempt := range buildAttempts {
+		addCommand(&report, attempt)
+	}
 	if err := writeCommandArtifact(opts, nodes.DockerBuild, build); err != nil {
 		return report, err
 	}
@@ -145,13 +148,16 @@ func runDockerImageCleanup(exec executor.CommandRunner, timeout time.Duration, o
 func runComposeVerify(ctx context.Context, exec executor.CommandRunner, timeout time.Duration, opts Options, report domain.VerifyReport, compose string) (domain.VerifyReport, error) {
 	taskDir := strings.TrimSpace(opts.TaskDir)
 	project := "harbor-task-" + fmt.Sprintf("%d", time.Now().UnixNano())
-	build, err := runCommand(ctx, exec, timeout, commandOutputDir(opts, nodes.DockerBuild), taskDir, nodes.DockerBuild, "docker", "compose", "-p", project, "-f", compose, "--project-directory", taskDir, "build", "main")
+	buildAttempts, err := runDockerBuildWithRetry(ctx, exec, timeout, commandOutputDir(opts, nodes.DockerBuild), taskDir, nodes.DockerBuild, "docker", "compose", "-p", project, "-f", compose, "--project-directory", taskDir, "build", "main")
 	if err != nil {
 		return report, err
 	}
+	build := buildAttempts[len(buildAttempts)-1]
 	build.Passed = build.ExitCode == 0 && !build.Timeout
 	report.DockerBuild = &build
-	addCommand(&report, build)
+	for _, attempt := range buildAttempts {
+		addCommand(&report, attempt)
+	}
 	if err := writeCommandArtifact(opts, nodes.DockerBuild, build); err != nil {
 		return report, err
 	}
@@ -250,6 +256,37 @@ func runCommand(ctx context.Context, exec executor.CommandRunner, timeout time.D
 		return run, outputErr
 	}
 	return run, nil
+}
+
+func runDockerBuildWithRetry(ctx context.Context, exec executor.CommandRunner, timeout time.Duration, outputDir, dir, name, command string, args ...string) ([]domain.CommandRun, error) {
+	const maxAttempts = 2
+	runs := make([]domain.CommandRun, 0, maxAttempts)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptOutputDir := outputDir
+		if strings.TrimSpace(outputDir) != "" {
+			attemptOutputDir = filepath.Join(outputDir, fmt.Sprintf("attempt-%d", attempt))
+		}
+		run, err := runCommand(ctx, exec, timeout, attemptOutputDir, dir, name, command, args...)
+		if err != nil {
+			return runs, err
+		}
+		run.Attempt = attempt
+		run.Passed = run.ExitCode == 0 && !run.Timeout
+		runs = append(runs, run)
+		if run.Passed || !transientDockerBuildFailure(run) {
+			return runs, nil
+		}
+	}
+	return runs, nil
+}
+
+func transientDockerBuildFailure(run domain.CommandRun) bool {
+	if run.Timeout || run.FailureClass == "network_or_timeout" || run.FailureClass == "docker_daemon" {
+		return true
+	}
+	text := strings.ToLower(run.Stdout + "\n" + run.Stderr)
+	return strings.Contains(text, "failed to resolve source metadata") &&
+		(strings.Contains(text, "not found") || strings.Contains(text, "unexpected status") || strings.Contains(text, "connection reset") || strings.Contains(text, "tls handshake"))
 }
 
 func initialVerificationExposesIssue(run domain.CommandRun) bool {

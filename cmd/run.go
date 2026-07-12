@@ -93,6 +93,8 @@ func addRunnerFlags(cmd *cobra.Command, opts *app.RunnerOptions) {
 	cmd.Flags().StringVar(&opts.Reasoning, "reasoning", "", "Codex reasoning effort for generation")
 	cmd.Flags().StringVar(&opts.CodexPath, "codex-path", "", "Path to Codex CLI")
 	cmd.Flags().IntVar(&opts.AgentTimeout, "agent-timeout", 600, "Agent turn timeout in seconds")
+	cmd.Flags().StringVar(&opts.RepairGuidance, "repair-guidance", "", "Operator or external reviewer guidance for a Codex task repair before checks")
+	cmd.Flags().StringVar(&opts.RepairSource, "repair-source", "external_review", "Repair evidence source label")
 }
 
 // applyRunnerEnvironmentDefaults converts process credentials into references

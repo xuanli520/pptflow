@@ -16,9 +16,14 @@ func TestOrderHasUniqueNodeIDs(t *testing.T) {
 		}
 		seen[id] = true
 	}
-	for _, id := range []string{TaskReview, InstructionGen, DockerBuild, InitialVerify, OracleVerify, HarborRunQwen, HarborRunOpus, Package} {
+	for _, id := range []string{TaskReview, RuntimeSelfCheck, InstructionGen, DockerBuild, InitialVerify, OracleVerify, HarborRunQwen, HarborRunOpus, FinalReview, Package} {
 		if !seen[id] {
 			t.Fatalf("node order missing %s", id)
+		}
+	}
+	for _, redundant := range []string{ContentReview, ResultReview} {
+		if seen[redundant] {
+			t.Fatalf("redundant review node remains in active order: %s", redundant)
 		}
 	}
 }

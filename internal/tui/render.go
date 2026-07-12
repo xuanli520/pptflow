@@ -42,6 +42,10 @@ func renderFrame(m model, body string) string {
 		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.runConfig.View(m.width, maxInt(8, m.height-3)), m.footer())
 		return strings.TrimRight(frame, "\n") + "\n"
 	}
+	if m.taskRepair != nil {
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.taskRepair.View(m.width, maxInt(8, m.height-3)), m.footer())
+		return strings.TrimRight(frame, "\n") + "\n"
+	}
 	parts := []string{m.header(), body}
 	if status := m.statusBar(); status != "" {
 		parts = append(parts, status)

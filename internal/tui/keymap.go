@@ -60,6 +60,9 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	if m.runConfig != nil {
 		return true, m.updateRunConfigKey(msg)
 	}
+	if m.taskRepair != nil {
+		return true, m.updateTaskRepairKey(msg)
+	}
 	if m.resumeOverlay != nil {
 		return true, m.updateResumeKey(msg)
 	}
@@ -136,6 +139,10 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, m.showToast("运行尚未完成", toastWarning)
 		}
 		return true, nil
+	case "f":
+		if m.view == viewDone {
+			return true, m.openTaskRepair(m.opts.Workspace, taskLabel(m.opts, m.opts.Workspace))
+		}
 	case "ctrl+x", "x":
 		if m.view == viewStart {
 			return false, nil
@@ -330,13 +337,16 @@ func (m model) footer() string {
 	if m.runConfig != nil {
 		return subtleStyle.Render("[Tab/↑↓ 切换] [Space 开关] [Enter 开始重跑] [Esc 取消]")
 	}
+	if m.taskRepair != nil {
+		return subtleStyle.Render("[Tab 切换字段] [Ctrl+S 创建返修运行] [Esc 取消]")
+	}
 	if m.resumeOverlay != nil {
 		return subtleStyle.Render("[R 恢复运行] [N 新建运行] [V 只读查看] [Enter 确认] [Esc 取消]")
 	}
 	var text string
 	switch m.view {
 	case viewHub:
-		text = "[↑↓ 选择] [Enter 打开] [Ctrl+N 新建] [Ctrl+R 重跑] [Del 删除] [s/S 排序] [/ 搜索] [q 退出] [? 帮助]"
+		text = "[↑↓ 选择] [Enter 打开] [Ctrl+N 新建] [Ctrl+R 重跑] [f 外部审查返修] [Del 删除] [s/S 排序] [/ 搜索] [q 退出] [? 帮助]"
 	case viewStart:
 		if m.startStep == startStepBasic {
 			text = "[Tab/↓ 下一字段] [Shift+Tab/↑ 上一字段] [Space 切换模式] [Ctrl+Space 路径补全] [Enter 下一步] [Ctrl+Q 退出]"
@@ -352,10 +362,12 @@ func (m model) footer() string {
 			if gate == nil && m.confirm != nil {
 				gate = m.confirm.Gate
 			}
-			if gate != nil && (gate.GateID == nodes.FinalReview || gate.GateID == nodes.ResultReview) {
-				text += " [Ctrl+V/v 修订/刷新]"
+			if gate != nil && gate.GateID == nodes.FinalReview {
+				text += " [v Codex指导返修] [c Codex自动循环] [u 人工编辑后重跑]"
+			} else if gate != nil && gate.GateID == nodes.ResultReview {
+				text += " [Ctrl+V/v 刷新证据]"
 			}
-			text += " [Ctrl+N 备注] [e 编辑工件] [Tab 下一工件] [Esc 返回] [? 帮助]"
+			text += " [Ctrl+N 备注/指导] [e 编辑工件] [Tab 下一工件] [Esc 返回] [? 帮助]"
 		}
 	case viewLogs:
 		text = "[↑↓/j k 滚动] [PgUp/PgDn 翻页] [Home/End 首尾] [t 跟踪] [Tab/Shift+Tab 切换文件] [Ctrl+O 总览] [? 帮助]"
@@ -366,7 +378,7 @@ func (m model) footer() string {
 			text = "[↑↓/j k 选择] [Tab/Shift+Tab 切换工件] [e 编辑] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
 		}
 	case viewDone:
-		text = "[Esc 返回工作区] [Ctrl+R 重跑] [Ctrl+N 新建] [1 工作区] [2 总览] [4 详情] [5 日志] [q 退出] [? 帮助]"
+		text = "[f 外部审查返修] [Esc 返回工作区] [Ctrl+R 重跑] [Ctrl+N 新建] [1 工作区] [2 总览] [4 详情] [5 日志] [q 退出] [? 帮助]"
 	default:
 		if m.readOnly {
 			text = "[↑↓选择] [Enter详情] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [q退出] [/过滤] [?帮助]"

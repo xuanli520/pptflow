@@ -397,6 +397,8 @@ func RunnerOptionsSnapshot(snapshot domain.RunnerOptionsSnapshot) domain.RunnerO
 	snapshot.Model = Text(snapshot.Model)
 	snapshot.Reasoning = Text(snapshot.Reasoning)
 	snapshot.CodexPath = Text(snapshot.CodexPath)
+	snapshot.RepairGuidance = Text(snapshot.RepairGuidance)
+	snapshot.RepairSource = Text(snapshot.RepairSource)
 	snapshot.SensitiveFieldsOmitted = StringSlice(snapshot.SensitiveFieldsOmitted)
 	snapshot.UnsupportedFieldsOmitted = StringSlice(snapshot.UnsupportedFieldsOmitted)
 	return snapshot

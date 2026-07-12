@@ -387,7 +387,7 @@ func TestModelRendersGateAndSubmitsApprove(t *testing.T) {
 	}))
 	gateModel := updated.(model)
 	rendered := gateModel.View()
-	if !strings.Contains(rendered, "最终审查") || !strings.Contains(rendered, "lint_report.json") {
+	if !strings.Contains(rendered, "最终发布") || !strings.Contains(rendered, "lint_report.json") {
 		t.Fatalf("rendered gate missing content: %s", rendered)
 	}
 	approved, cmd := gateModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
@@ -551,21 +551,37 @@ func TestGateDecisionIncludesEditedFileSummary(t *testing.T) {
 	}
 }
 
-func TestFinalReviewCanSubmitReviseAction(t *testing.T) {
+func TestFinalReviewCanSubmitCodexRepairAction(t *testing.T) {
 	m := initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: "workspace", TaskDir: "task"})
 	m.activeGate = &domain.GateRequest{RequestID: "phase2:final_review", GateID: "final_review"}
 	m.view = viewGate
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
 	if cmd == nil {
-		t.Fatal("revise action did not submit a decision")
+		t.Fatal("repair action did not submit a decision")
 	}
 	msg := cmd()
 	written, ok := msg.(gateDecisionWrittenMsg)
-	if !ok || written.decision.Action != "revise" || written.decision.Approved {
-		t.Fatalf("unexpected revise decision: %#v", msg)
+	if !ok || written.decision.Action != "repair" || written.decision.Approved {
+		t.Fatalf("unexpected repair decision: %#v", msg)
 	}
 	if updated.(model).activeGate != nil {
 		t.Fatal("gate should wait for the rerun request after submitting revise")
+	}
+}
+
+func TestFinalReviewSupportsAutomaticAndManualRepairModes(t *testing.T) {
+	for key, action := range map[rune]string{'c': "repair_loop", 'u': "revise"} {
+		m := initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: "workspace", TaskDir: "task"})
+		m.activeGate = &domain.GateRequest{RequestID: "phase2:final_review", GateID: "final_review"}
+		m.view = viewGate
+		updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+		if cmd == nil {
+			t.Fatalf("key %q did not submit %s", key, action)
+		}
+		written := cmd().(gateDecisionWrittenMsg)
+		if written.decision.Action != action || updated.(model).activeGate != nil {
+			t.Fatalf("key %q produced unexpected decision: %+v", key, written.decision)
+		}
 	}
 }
 

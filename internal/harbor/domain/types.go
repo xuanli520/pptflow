@@ -137,6 +137,8 @@ type RunnerOptionsSnapshot struct {
 	Reasoning                string    `json:"reasoning,omitempty"`
 	CodexPath                string    `json:"codex_path,omitempty"`
 	AgentTimeout             int       `json:"agent_timeout,omitempty"`
+	RepairGuidance           string    `json:"repair_guidance,omitempty"`
+	RepairSource             string    `json:"repair_source,omitempty"`
 	SensitiveFieldsOmitted   []string  `json:"sensitive_fields_omitted,omitempty"`
 	UnsupportedFieldsOmitted []string  `json:"unsupported_fields_omitted,omitempty"`
 	CreatedAt                time.Time `json:"created_at"`
