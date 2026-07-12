@@ -3,6 +3,8 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/spf13/cobra"
@@ -36,6 +38,7 @@ func newRunCommand() *cobra.Command {
 }
 
 func addRunnerFlags(cmd *cobra.Command, opts *app.RunnerOptions) {
+	applyRunnerEnvironmentDefaults(opts)
 	cmd.Flags().StringVar(&opts.RepoURL, "repo", "", "GitHub repository URL")
 	cmd.Flags().StringVar(&opts.Commit, "commit", "", "Concrete commit SHA")
 	cmd.Flags().StringVar(&opts.TaskDir, "task", "", "Harbor task directory")
@@ -57,11 +60,11 @@ func addRunnerFlags(cmd *cobra.Command, opts *app.RunnerOptions) {
 	cmd.Flags().BoolVar(&opts.RunHarbor, "run-harbor", false, "Run Harbor pass@4 for Qwen and Opus before linting")
 	cmd.Flags().StringVar(&opts.HarborModels, "harbor-models", "qwen,opus", "Comma-separated Harbor model stages to run: qwen, opus, or both")
 	cmd.Flags().StringVar(&opts.HarborAgent, "harbor-agent", "claude-code", "Harbor agent name")
-	cmd.Flags().StringArrayVar(&opts.HarborAgentEnv, "harbor-agent-env", nil, "Agent environment passed to harbor run as --ae KEY=VALUE")
+	cmd.Flags().StringArrayVar(&opts.HarborAgentEnv, "harbor-agent-env", opts.HarborAgentEnv, "Agent environment passed to harbor run as --ae KEY=VALUE")
 	cmd.Flags().StringVar(&opts.QwenModel, "qwen-model", "qwen3.7-max", "Qwen model for Harbor pass@4")
 	cmd.Flags().StringVar(&opts.OpusModel, "opus-model", "claude-opus-4-8", "Opus model for Harbor pass@4")
-	cmd.Flags().StringVar(&opts.QwenHarborBaseURL, "qwen-harbor-base-url", "", "ANTHROPIC_BASE_URL used only for the Qwen Harbor stage")
-	cmd.Flags().StringVar(&opts.OpusHarborBaseURL, "opus-harbor-base-url", "", "ANTHROPIC_BASE_URL used only for the Opus Harbor stage")
+	cmd.Flags().StringVar(&opts.QwenHarborBaseURL, "qwen-harbor-base-url", opts.QwenHarborBaseURL, "ANTHROPIC_BASE_URL used only for the Qwen Harbor stage")
+	cmd.Flags().StringVar(&opts.OpusHarborBaseURL, "opus-harbor-base-url", opts.OpusHarborBaseURL, "ANTHROPIC_BASE_URL used only for the Opus Harbor stage")
 	cmd.Flags().IntVar(&opts.HarborTimeout, "harbor-timeout", 7200, "Harbor run timeout per model in seconds")
 	cmd.Flags().IntVar(&opts.HarborSetupTimeout, "harbor-setup-timeout", 1200, "Harbor preflight/setup timeout in seconds")
 	cmd.Flags().StringVar(&opts.HarborAgentCacheDir, "harbor-agent-cache", app.DefaultHarborAgentCacheDir(), "Host cache for pre-fetched Harbor agent binaries")
@@ -86,4 +89,35 @@ func addRunnerFlags(cmd *cobra.Command, opts *app.RunnerOptions) {
 	cmd.Flags().StringVar(&opts.Reasoning, "reasoning", "", "Codex reasoning effort for generation")
 	cmd.Flags().StringVar(&opts.CodexPath, "codex-path", "", "Path to Codex CLI")
 	cmd.Flags().IntVar(&opts.AgentTimeout, "agent-timeout", 600, "Agent turn timeout in seconds")
+}
+
+// applyRunnerEnvironmentDefaults converts process credentials into references
+// that Harbor can safely expand for trial containers. Secret values remain in
+// the process environment and are never embedded in flags or run snapshots.
+func applyRunnerEnvironmentDefaults(opts *app.RunnerOptions) {
+	if opts == nil {
+		return
+	}
+	if len(opts.HarborAgentEnv) == 0 {
+		for _, key := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"} {
+			if strings.TrimSpace(os.Getenv(key)) != "" {
+				opts.HarborAgentEnv = []string{key + "=${" + key + "}"}
+				break
+			}
+		}
+	}
+	fallbackBaseURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL"))
+	if strings.TrimSpace(opts.QwenHarborBaseURL) == "" {
+		opts.QwenHarborBaseURL = environmentOrDefault("QWEN_HARBOR_BASE_URL", fallbackBaseURL)
+	}
+	if strings.TrimSpace(opts.OpusHarborBaseURL) == "" {
+		opts.OpusHarborBaseURL = environmentOrDefault("OPUS_HARBOR_BASE_URL", fallbackBaseURL)
+	}
+}
+
+func environmentOrDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
 }

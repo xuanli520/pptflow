@@ -25,6 +25,18 @@ func writeTUITestFile(t *testing.T, name, content string) string {
 	return path
 }
 
+func submitStartForm(m model) (tea.Model, tea.Cmd) {
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		return updated, cmd
+	}
+	next := updated.(model)
+	if next.startStep != startStepAdvanced || next.err != nil {
+		return updated, nil
+	}
+	return next.Update(tea.KeyMsg{Type: tea.KeyEnter})
+}
+
 func TestModelRendersRunnerEvents(t *testing.T) {
 	m := initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: "workspace", TaskDir: "task"})
 	m.width = 100
@@ -39,7 +51,7 @@ func TestModelRendersRunnerEvents(t *testing.T) {
 	if !strings.Contains(rendered, "codeedge_lint") || !strings.Contains(rendered, "lint passed") {
 		t.Fatalf("rendered view missing event: %s", rendered)
 	}
-	if !strings.Contains(rendered, "Cancel model") {
+	if !strings.Contains(rendered, "取消运行") {
 		t.Fatalf("TUI footer is missing the model-stage cancellation action: %s", rendered)
 	}
 }
@@ -48,10 +60,13 @@ func TestStartViewRendersWorkflowForm(t *testing.T) {
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{})
 	m.width = 100
 	rendered := m.View()
-	for _, want := range []string{"Start Workflow", "Run existing task", "Task", "Workspace", "Docker verify", "Tests analysis", "Qwen result", "History dirs", "Similarity threshold", "Harbor agent", "Qwen model", "Qwen Harbor base URL", "Opus Harbor base URL", "Harbor setup timeout", "Harbor preflight", "Harbor concurrency", "Harbor attempts", "Harbor infra retries", "Task name", "Codex model"} {
+	for _, want := range []string{"启动工作流", "基本配置", "高级选项", "运行已有任务", "任务路径", "工作区路径", "Enter 进入高级选项"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("start view missing %q: %s", want, rendered)
 		}
+	}
+	if strings.Contains(rendered, "Harbor 超时") || strings.Contains(rendered, "质量检查") {
+		t.Fatalf("basic step should not render advanced fields: %s", rendered)
 	}
 }
 
@@ -97,7 +112,7 @@ func TestStartFormDoesNotExposeOrPreserveAutoApprove(t *testing.T) {
 	if rendered := m.View(); strings.Contains(rendered, "Auto approve") {
 		t.Fatalf("start view should not expose auto approve: %s", rendered)
 	}
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd == nil {
 		t.Fatal("valid start form should launch workflow")
 	}
@@ -109,7 +124,7 @@ func TestStartFormDoesNotExposeOrPreserveAutoApprove(t *testing.T) {
 func TestStartFormRejectsGenerateWithoutRepoCommit(t *testing.T) {
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{})
 	m.startMode = startGenerateTask
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd != nil {
 		t.Fatal("invalid start form should not launch workflow")
 	}
@@ -117,7 +132,7 @@ func TestStartFormRejectsGenerateWithoutRepoCommit(t *testing.T) {
 	if started.runner != nil {
 		t.Fatal("invalid start form created runner")
 	}
-	if started.err == nil || !strings.Contains(started.err.Error(), "repo and commit") {
+	if started.err == nil || !strings.Contains(started.err.Error(), "仓库地址和提交哈希") {
 		t.Fatalf("expected validation error, got %v", started.err)
 	}
 }
@@ -126,7 +141,7 @@ func TestStartFormLaunchesExistingTaskRunner(t *testing.T) {
 	taskDir := t.TempDir()
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir()})
 	m.opts.TaskDir = taskDir
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd == nil {
 		t.Fatal("valid start form should launch workflow")
 	}
@@ -143,7 +158,7 @@ func TestStartFormRejectsPackageWithoutEvidence(t *testing.T) {
 	taskDir := t.TempDir()
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir(), Package: true})
 	m.opts.TaskDir = taskDir
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd != nil {
 		t.Fatal("package form without evidence should not launch workflow")
 	}
@@ -151,7 +166,7 @@ func TestStartFormRejectsPackageWithoutEvidence(t *testing.T) {
 	if blocked.runner != nil {
 		t.Fatal("invalid package evidence created runner")
 	}
-	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "tests analysis") {
+	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "测试分析") {
 		t.Fatalf("expected tests analysis validation error, got %v", blocked.err)
 	}
 }
@@ -185,7 +200,7 @@ func TestStartFormLaunchesPackageWithEvidenceOptions(t *testing.T) {
 	m.opts.OpusScreenshot = opusShot
 	m.opts.SimilarityHistoryDirs = []string{historyA + "," + historyB}
 	m.opts.SimilarityTB3Dirs = []string{tb3}
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd == nil {
 		t.Fatal("valid package evidence should launch workflow")
 	}
@@ -218,7 +233,7 @@ func TestStartFormLaunchesPackageWithRunHarborWithoutScreenshots(t *testing.T) {
 		TestsAnalysis:         analysis,
 		SimilarityHistoryDirs: []string{t.TempDir()},
 	})
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd == nil {
 		t.Fatal("package with RunHarbor should launch without prefilled screenshots")
 	}
@@ -254,7 +269,7 @@ func TestStartFormLaunchesPackageWithResultScreenshotFallback(t *testing.T) {
 		OpusResult:            opus,
 		SimilarityHistoryDirs: []string{t.TempDir()},
 	})
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd == nil {
 		t.Fatal("package should launch when result JSON declares screenshots")
 	}
@@ -283,12 +298,12 @@ func TestStartFormRejectsPackageWithoutScreenshotOrFallback(t *testing.T) {
 		OpusResult:            opus,
 		SimilarityHistoryDirs: []string{t.TempDir()},
 	})
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd != nil {
 		t.Fatal("package without screenshot evidence should not launch workflow")
 	}
 	blocked := updated.(model)
-	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "screenshot") {
+	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "截图") {
 		t.Fatalf("expected screenshot validation error, got %v", blocked.err)
 	}
 }
@@ -303,12 +318,12 @@ func TestStartFormRejectsUnreadablePackageEvidencePaths(t *testing.T) {
 		OpusResult:            filepath.Join(t.TempDir(), "missing-opus.json"),
 		SimilarityHistoryDirs: []string{filepath.Join(t.TempDir(), "missing-history")},
 	})
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd != nil {
 		t.Fatal("unreadable package evidence should not launch workflow")
 	}
 	blocked := updated.(model)
-	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "tests analysis") {
+	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "测试分析") {
 		t.Fatalf("expected readable tests analysis validation error, got %v", blocked.err)
 	}
 }
@@ -342,7 +357,7 @@ func TestStartFormPreservesAdvancedOptions(t *testing.T) {
 		CodexPath:           "/usr/local/bin/codex",
 		AgentTimeout:        77,
 	})
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := submitStartForm(m)
 	if cmd == nil {
 		t.Fatal("valid advanced options should launch workflow")
 	}
@@ -372,7 +387,7 @@ func TestModelRendersGateAndSubmitsApprove(t *testing.T) {
 	}))
 	gateModel := updated.(model)
 	rendered := gateModel.View()
-	if !strings.Contains(rendered, "Final Review") || !strings.Contains(rendered, "lint_report.json") {
+	if !strings.Contains(rendered, "最终审查") || !strings.Contains(rendered, "lint_report.json") {
 		t.Fatalf("rendered gate missing content: %s", rendered)
 	}
 	approved, cmd := gateModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
@@ -404,7 +419,7 @@ func TestGateViewBlocksApproveWithFailingCriticalCheck(t *testing.T) {
 		t.Fatalf("gate should remain active with error: %+v", blocked)
 	}
 	rendered := blocked.View()
-	if !strings.Contains(rendered, "cannot approve") || !strings.Contains(rendered, "blocking check") {
+	if !strings.Contains(rendered, "无法批准") || !strings.Contains(rendered, "blocking check") {
 		t.Fatalf("gate view missing blocking error: %s", rendered)
 	}
 }
@@ -512,7 +527,7 @@ func TestNodeDetailUsesActualGeneratedArtifactPaths(t *testing.T) {
 		m.selectedNode = nodeID
 		m.selectedArtifact = 0
 		rendered := m.nodeDetailView()
-		if !strings.Contains(rendered, "Artifact") || strings.Contains(rendered, "(empty or unavailable)") {
+		if !strings.Contains(rendered, "工件") || strings.Contains(rendered, "内容为空或不可用") {
 			t.Fatalf("node %s did not render artifact content: %s", nodeID, rendered)
 		}
 	}
@@ -646,11 +661,11 @@ func TestSnapshotDecisionWriteShowsNoticeAndDoesNotReviveGate(t *testing.T) {
 	msg := m.submitDecision(decision, m.activeGate)()
 	updated, _ := m.Update(msg)
 	written := updated.(model)
-	if !strings.Contains(written.notice, "Decision written") || !strings.Contains(written.notice, "Snapshot mode") {
+	if !strings.Contains(written.notice, "决定已写入") || !strings.Contains(written.notice, "快照模式") {
 		t.Fatalf("decision write notice missing context: %q", written.notice)
 	}
 	rendered := written.overview()
-	if !strings.Contains(rendered, "Decision written") {
+	if !strings.Contains(rendered, "决定已写入") {
 		t.Fatalf("overview missing decision write notice: %s", rendered)
 	}
 
@@ -718,7 +733,7 @@ func TestGateEditRejectsArtifactOutsideAllowedRoots(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("unsafe artifact edit should not launch editor")
 	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "outside allowed TUI roots") {
+	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "超出允许的 TUI 根目录") {
 		t.Fatalf("unsafe artifact edit missing error: %+v", updated.(model).err)
 	}
 }
@@ -741,7 +756,7 @@ func TestGateEditRejectsNonArtifactInsideTaskDir(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("non-artifact task file should not launch editor")
 	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "not an editable Harbor artifact") {
+	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "不是可编辑的 Harbor 工件") {
 		t.Fatalf("non-artifact edit missing error: %+v", updated.(model).err)
 	}
 }
@@ -790,7 +805,7 @@ func TestGateEditRejectsWorkspaceGeneratedCopies(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("workspace generated copy should not launch editor")
 	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "not an editable Harbor artifact") {
+	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "不是可编辑的 Harbor 工件") {
 		t.Fatalf("workspace generated copy edit missing error: %+v", updated.(model).err)
 	}
 }
@@ -816,7 +831,7 @@ func TestNodeEditRejectsPollutedTaskDirArtifact(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("polluted node artifact should not launch editor")
 	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "not an editable Harbor artifact") {
+	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "不是可编辑的 Harbor 工件") {
 		t.Fatalf("polluted node edit missing error: %+v", updated.(model).err)
 	}
 }
@@ -958,7 +973,7 @@ func TestLogsViewTailShowsLargeFileEndAndRedacts(t *testing.T) {
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	tail := updated.(model)
 	rendered = tail.View()
-	if !strings.Contains(rendered, "FINAL_HARBOR_ERROR_AT_TAIL") || !strings.Contains(rendered, "[tail]") {
+	if !strings.Contains(rendered, "FINAL_HARBOR_ERROR_AT_TAIL") || !strings.Contains(rendered, "[尾部跟踪]") {
 		t.Fatalf("tail view missing final error: %s", rendered)
 	}
 	if strings.Contains(rendered, secret) || !strings.Contains(rendered, "redacted") {
@@ -993,7 +1008,7 @@ func TestLogsViewScrollsSelectedFile(t *testing.T) {
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
 	scrolled := updated.(model)
 	rendered := scrolled.View()
-	if !strings.Contains(rendered, "scroll-line-07") || strings.Contains(rendered, "scroll-line-00") || !strings.Contains(rendered, "lines above") {
+	if !strings.Contains(rendered, "scroll-line-07") || strings.Contains(rendered, "scroll-line-00") || !strings.Contains(rendered, "上方还有") {
 		t.Fatalf("paged log window did not scroll: %s", rendered)
 	}
 }
@@ -1163,14 +1178,14 @@ func TestEditorCommandSupportsVisualAndEditorArgs(t *testing.T) {
 	t.Setenv("VISUAL", "code --wait")
 	t.Setenv("EDITOR", "vim")
 	cmd := editorCommand("/tmp/task.md")
-	if len(cmd.Args) < 5 || cmd.Args[1] != "-c" || !strings.Contains(cmd.Args[2], "code --wait") || cmd.Args[len(cmd.Args)-1] != "/tmp/task.md" {
+	if filepath.Base(cmd.Path) != "code" || len(cmd.Args) != 3 || cmd.Args[1] != "--wait" || cmd.Args[2] != "/tmp/task.md" {
 		t.Fatalf("VISUAL command did not preserve args/path: %#v", cmd.Args)
 	}
 
 	t.Setenv("VISUAL", "")
 	t.Setenv("EDITOR", "vim -f")
 	cmd = editorCommand("/tmp/task.md")
-	if len(cmd.Args) < 5 || !strings.Contains(cmd.Args[2], "vim -f") || cmd.Args[len(cmd.Args)-1] != "/tmp/task.md" {
+	if filepath.Base(cmd.Path) != "vim" || len(cmd.Args) != 3 || cmd.Args[1] != "-f" || cmd.Args[2] != "/tmp/task.md" {
 		t.Fatalf("EDITOR command did not preserve args/path: %#v", cmd.Args)
 	}
 
@@ -1212,7 +1227,7 @@ func TestDoneViewShowsLastNodeFailure(t *testing.T) {
 		},
 	}
 	rendered := m.View()
-	if !strings.Contains(rendered, "last failure: package: package evidence missing") || !strings.Contains(rendered, "/tmp/package") {
+	if !strings.Contains(rendered, "最后失败：package：package evidence missing") || !strings.Contains(rendered, "/tmp/package") {
 		t.Fatalf("done view missing last node failure: %s", rendered)
 	}
 }

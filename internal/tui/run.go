@@ -28,16 +28,16 @@ func Run(ctx context.Context, opts app.RunnerOptions) error {
 	if activeErr != nil {
 		model = initialWorkspaceModel(runCtx, cancel, opts)
 		model.err = activeErr
-		model.notice = "Workspace ownership could not be verified; opened as a read-only snapshot."
+		model.notice = "无法验证工作区所有权；已作为只读快照打开。"
 	} else if active {
 		model = initialWorkspaceModel(runCtx, cancel, opts)
-		model.notice = "Workspace is owned by an active Factory process; opened as a read-only live snapshot."
+		model.notice = "工作区由另一个 Factory 进程持有；已作为只读实时快照打开。"
 	} else if shouldResumeWorkspace(opts) {
 		resumeOpts, _, err := app.LoadRunnerOptions(defaultWorkspace(opts.Workspace))
 		if err == nil {
 			resumeOpts.AutoApprove = false
 			model = initialModel(runCtx, cancel, resumeOpts)
-			model.notice = "Resuming workspace from run_options.json."
+			model.notice = "正在从 run_options.json 恢复工作区。"
 		} else {
 			model = initialWorkspaceModel(runCtx, cancel, opts)
 			model.err = err
@@ -47,7 +47,11 @@ func Run(ctx context.Context, opts app.RunnerOptions) error {
 	} else if opts.Generate || opts.TaskDir != "" {
 		model = initialModel(runCtx, cancel, opts)
 	}
-	program := newTeaProgram(model, tea.WithAltScreen())
+	program := newTeaProgram(model,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+		tea.WithReportFocus(),
+	)
 	_, err := program.Run()
 	return err
 }

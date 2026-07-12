@@ -27,6 +27,22 @@ func (p fakeTeaProgram) Run() (tea.Model, error) {
 	return p.model, p.err
 }
 
+func TestRunEnablesAltScreenMouseAndFocusReporting(t *testing.T) {
+	previous := newTeaProgram
+	defer func() { newTeaProgram = previous }()
+	optionCount := 0
+	newTeaProgram = func(model tea.Model, opts ...tea.ProgramOption) teaProgram {
+		optionCount = len(opts)
+		return fakeTeaProgram{model: model}
+	}
+	if err := Run(context.Background(), app.RunnerOptions{Workspace: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if optionCount != 3 {
+		t.Fatalf("expected alt-screen, mouse and focus options, got %d", optionCount)
+	}
+}
+
 func TestRunOpensWorkspaceSnapshotWhenNoTaskOrGenerate(t *testing.T) {
 	workspace := t.TempDir()
 	stateRaw, err := json.Marshal(domain.RunSummary{RunID: "run-1", Workspace: workspace, Status: "running"})
@@ -157,12 +173,12 @@ func TestRunOpensActiveWorkspaceAsReadOnlySnapshot(t *testing.T) {
 	if snapshot.runner != nil || !snapshot.readOnly || snapshot.summary.RunID != "run-active" || snapshot.activeGate == nil {
 		t.Fatalf("active workspace must be a snapshot: runner=%v summary=%+v", snapshot.runner, snapshot.summary)
 	}
-	if !strings.Contains(snapshot.notice, "read-only live snapshot") {
+	if !strings.Contains(snapshot.notice, "只读实时快照") {
 		t.Fatalf("active snapshot notice missing: %q", snapshot.notice)
 	}
 	updated, cmd := snapshot.updateGateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	readOnly := updated.(model)
-	if cmd != nil || readOnly.activeGate == nil || readOnly.err == nil || !strings.Contains(readOnly.err.Error(), "read-only") {
+	if cmd != nil || readOnly.activeGate == nil || readOnly.err == nil || !strings.Contains(readOnly.err.Error(), "只读") {
 		t.Fatalf("read-only snapshot allowed gate mutation: cmd=%v model=%+v", cmd, readOnly)
 	}
 }

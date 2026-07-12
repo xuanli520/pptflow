@@ -13,7 +13,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/purplevoid/harbor-factory/internal/app"
@@ -109,39 +115,40 @@ type model struct {
 	done     bool
 	readOnly bool
 
-	activeGate       *domain.GateRequest
-	gateNotes        string
-	gateEditingNote  bool
-	editedFiles      map[string]string
-	selectedNode     string
-	selectedArtifact int
-	selectedLogFile  int
-	logFileScroll    int
-	logTail          bool
-	startMode        startMode
-	startField       startField
-}
+	activeGate         *domain.GateRequest
+	gateNotes          string
+	gateEditingNote    bool
+	editedFiles        map[string]string
+	selectedNode       string
+	selectedArtifact   int
+	selectedLogFile    int
+	logFileScroll      int
+	logTail            bool
+	startMode          startMode
+	startField         startField
+	startStep          startStep
+	selectedStartGroup startGroup
 
-type runnerEventMsg domain.RunnerEvent
-type runnerDoneMsg struct {
-	summary domain.RunSummary
-	err     error
-}
-type workspaceRefreshMsg struct {
-	summary domain.RunSummary
-	events  []domain.RunnerEvent
-}
-type editorDoneMsg struct {
-	path   string
-	before fileSnapshot
-	after  fileSnapshot
-	err    error
-}
-type gateDecisionWrittenMsg struct {
-	path     string
-	gate     *domain.GateRequest
-	decision domain.GateDecision
-	err      error
+	// UI components and navigation are explicit sub-models. Workflow/domain
+	// state above remains the single source of truth.
+	router           *pageRouter
+	focusMgr         focusManager
+	spinner          spinner.Model
+	startInputs      map[startField]textinput.Model
+	dirtyStartInputs map[startField]bool
+	startCollapsed   map[startGroup]bool
+	notesInput       textarea.Model
+	searchInput      textinput.Model
+	detailViewport   viewport.Model
+	overviewTable    table.Model
+	overviewRowIDs   []string
+	confirm          *ConfirmDialog
+	toast            toastState
+	helpVisible      bool
+	searching        bool
+	filter           string
+	pathSuggestions  []string
+	detailScroll     int
 }
 type fileSnapshot struct {
 	exists bool
@@ -152,14 +159,14 @@ type fileSnapshot struct {
 func initialModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
 	opts.AutoApprove = false
 	runner := app.NewRunner(opts)
-	return model{
+	return initModelComponents(model{
 		ctx:    ctx,
 		cancel: cancel,
 		runner: runner,
 		opts:   opts,
 		view:   viewOverview,
 		nodes:  map[string]domain.RunnerEvent{},
-	}
+	})
 }
 
 func initialStartModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
@@ -175,7 +182,7 @@ func initialStartModel(ctx context.Context, cancel context.CancelFunc, opts app.
 	if opts.Generate {
 		mode = startGenerateTask
 	}
-	return model{
+	return initModelComponents(model{
 		ctx:        ctx,
 		cancel:     cancel,
 		opts:       opts,
@@ -183,7 +190,7 @@ func initialStartModel(ctx context.Context, cancel context.CancelFunc, opts app.
 		nodes:      map[string]domain.RunnerEvent{},
 		startMode:  mode,
 		startField: startFieldMode,
-	}
+	})
 }
 
 func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
@@ -214,7 +221,7 @@ func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts 
 	} else if activeGate != nil {
 		view = viewGate
 	}
-	return model{
+	return initModelComponents(model{
 		ctx:          ctx,
 		cancel:       cancel,
 		opts:         opts,
@@ -226,203 +233,54 @@ func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts 
 		readOnly:     true,
 		activeGate:   activeGate,
 		selectedNode: selected,
-	}
-}
-
-func (m model) Init() tea.Cmd {
-	if m.view == viewStart {
-		return nil
-	}
-	if m.runner == nil {
-		return m.refreshWorkspace()
-	}
-	return tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace())
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		return m, nil
-	case tea.KeyMsg:
-		if m.view == viewStart {
-			return m.updateStartKey(msg)
-		}
-		if m.view == viewGate {
-			return m.updateGateKey(msg)
-		}
-		if m.view == viewLogs {
-			return m.updateLogsKey(msg)
-		}
-		switch msg.String() {
-		case "q", "ctrl+c":
-			m.cancelRun()
-			return m, tea.Quit
-		case "tab":
-			if m.view == viewNodeDetail || m.view == viewLogs {
-				m.selectNextArtifact()
-			} else if m.view == viewOverview {
-				if m.activeGate != nil {
-					m.view = viewGate
-				} else {
-					m.view = viewNodeDetail
-				}
-			} else if m.view == viewNodeDetail {
-				m.view = viewLogs
-			} else if m.view == viewLogs && m.done {
-				m.view = viewDone
-			} else if m.done {
-				m.view = viewDone
-			} else {
-				m.view = viewOverview
-			}
-			return m, nil
-		case "1":
-			m.view = viewOverview
-			return m, nil
-		case "2":
-			if m.activeGate != nil {
-				m.view = viewGate
-			} else {
-				m.view = viewNodeDetail
-			}
-			return m, nil
-		case "3":
-			m.view = viewLogs
-			return m, nil
-		case "4":
-			if m.done {
-				m.view = viewDone
-			}
-			return m, nil
-		case "d":
-			m.view = viewNodeDetail
-			return m, nil
-		case "g":
-			if m.activeGate != nil {
-				m.view = viewGate
-			}
-			return m, nil
-		case "j", "down":
-			m.selectNextNode()
-			return m, nil
-		case "k", "up":
-			m.selectPrevNode()
-			return m, nil
-		case "l":
-			m.view = viewLogs
-			return m, nil
-		case "x":
-			if m.readOnly {
-				m.err = fmt.Errorf("workspace snapshot is read-only while another Factory process owns the run")
-			} else if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
-				m.notice = "Cancel requested for " + m.selectedNode + "; the other model stage may continue."
-				m.err = nil
-			}
-			return m, nil
-		case "e":
-			if m.readOnly {
-				m.err = fmt.Errorf("workspace snapshot is read-only")
-				return m, nil
-			}
-			if artifact, ok := m.selectedNodeArtifact(); ok {
-				path, err := m.safeEditableArtifactPath(artifact.Path)
-				if err != nil {
-					m.err = err
-					return m, nil
-				}
-				return m, openEditorCmd(path)
-			}
-			return m, nil
-		}
-	case runnerEventMsg:
-		event := domain.RunnerEvent(msg)
-		m.applyRunnerEvent(event)
-		return m, m.waitEvent()
-	case editorDoneMsg:
-		if msg.err != nil {
-			m.err = msg.err
-			return m, nil
-		}
-		if msg.before.changed(msg.after) {
-			if m.editedFiles == nil {
-				m.editedFiles = map[string]string{}
-			}
-			m.editedFiles[msg.path] = editSummary(msg.before, msg.after)
-		}
-		return m, nil
-	case gateDecisionWrittenMsg:
-		if msg.err != nil {
-			m.err = msg.err
-			m.notice = ""
-			m.activeGate = msg.gate
-			m.view = viewGate
-			return m, nil
-		}
-		m.err = nil
-		if msg.path != "" {
-			m.summary.GateDecisions = mergeGateDecisions(m.summary.GateDecisions, []domain.GateDecision{msg.decision})
-			m.notice = fmt.Sprintf("Decision written to %s. Snapshot mode writes the decision file only; an active external runner must consume it.", msg.path)
-		} else {
-			m.notice = ""
-		}
-		m.resetGateLocalState()
-		return m, nil
-	case runnerDoneMsg:
-		m.summary = msg.summary
-		m.err = msg.err
-		m.done = true
-		m.view = viewDone
-		return m, nil
-	case workspaceRefreshMsg:
-		m.applyWorkspaceSnapshot(msg.summary, msg.events)
-		if m.done {
-			return m, nil
-		}
-		return m, m.refreshWorkspace()
-	}
-	return m, nil
-}
-
-func (m model) View() string {
-	if m.width == 0 {
-		return "Starting Harbor Factory...\n"
-	}
-	var body string
-	switch m.view {
-	case viewStart:
-		body = m.startView()
-	case viewGate:
-		body = m.gateView()
-	case viewNodeDetail:
-		body = m.nodeDetailView()
-	case viewLogs:
-		body = m.logsView()
-	case viewDone:
-		body = m.doneView()
-	default:
-		body = m.overview()
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, m.header(), body, m.footer())
+	})
 }
 
 func (m model) updateStartKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "q", "ctrl+c":
+	key := msg.String()
+	if m.toggleStartGroup(key) {
+		return m, nil
+	}
+	switch key {
+	case "ctrl+q", "ctrl+c":
+		m.cancelRun()
+		return m, tea.Quit
+	case "q":
+		if isTextStartField(m.startField) {
+			return m, m.updateFocusedStartInput(msg)
+		}
 		m.cancelRun()
 		return m, tea.Quit
 	case "tab", "down":
 		m.selectNextStartField()
-		return m, nil
+		return m, m.focusStartInput(m.startField)
 	case "shift+tab", "up":
 		m.selectPrevStartField()
-		return m, nil
+		return m, m.focusStartInput(m.startField)
+	case "ctrl+left":
+		if m.startStep == startStepAdvanced {
+			m.selectAdvancedGroup(-1)
+			return m, nil
+		}
+	case "ctrl+right":
+		if m.startStep == startStepAdvanced {
+			m.selectAdvancedGroup(1)
+			return m, nil
+		}
+	case "esc":
+		if m.startStep == startStepAdvanced {
+			m.startStep = startStepBasic
+			m.startField = startFieldMode
+			m.focusStartInput(m.startField)
+			m.err = nil
+			return m, nil
+		}
 	case "left", "right":
 		if m.startField == startFieldMode {
 			m.toggleStartMode()
 			return m, nil
 		}
+		return m, m.updateFocusedStartInput(msg)
 	case " ":
 		if m.startField == startFieldMode {
 			m.toggleStartMode()
@@ -431,29 +289,57 @@ func (m model) updateStartKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.toggleStartBool() {
 			return m, nil
 		}
-		m.appendStartInput(" ")
-		return m, nil
-	case "backspace":
-		m.backspaceStartInput()
-		return m, nil
+		return m, m.updateFocusedStartInput(msg)
+	case "ctrl+space", "ctrl+@":
+		return m, m.completeFocusedPath()
 	case "ctrl+u":
-		m.clearStartInput()
+		if isTextStartField(m.startField) {
+			ti := m.startInputs[m.startField]
+			ti.SetValue("")
+			m.startInputs[m.startField] = ti
+			m.syncStartField(m.startField, "")
+		}
 		return m, nil
 	case "enter":
-		opts, err := m.startOptions()
-		if err != nil {
-			m.err = err
+		if m.startStep == startStepBasic {
+			if err := m.validateStartBasic(); err != nil {
+				m.err = err
+				return m, nil
+			}
+			m.startStep = startStepAdvanced
+			m.selectedStartGroup = startGroupHarbor
+			for _, group := range advancedGroups() {
+				m.startCollapsed[group] = group != startGroupHarbor
+			}
+			m.err = nil
+			fields := m.activeStartFields()
+			if len(fields) > 0 {
+				m.startField = fields[0]
+				return m, m.focusStartInput(m.startField)
+			}
 			return m, nil
 		}
-		m = m.startRunner(opts)
-		return m, tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace())
+		return m.launchStartWorkflow()
 	default:
-		if len(msg.Runes) > 0 {
-			m.appendStartInput(string(msg.Runes))
-			return m, nil
+		if isTextStartField(m.startField) {
+			return m, m.updateFocusedStartInput(msg)
 		}
 	}
 	return m, nil
+}
+
+func (m model) launchStartWorkflow() (tea.Model, tea.Cmd) {
+	if err := m.validateDirtyStartInputs(); err != nil {
+		m.err = err
+		return m, nil
+	}
+	opts, err := m.startOptions()
+	if err != nil {
+		m.err = err
+		return m, nil
+	}
+	m = m.startRunner(opts)
+	return m, tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
 }
 
 func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -465,8 +351,10 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "tab":
 			if idx, _, ok := m.selectedGateArtifact(); ok {
-				m.selectedArtifact = (idx + 1) % len(m.activeGate.Artifacts)
+				m.selectedArtifact = (idx + 1) % len(m.visibleGateArtifacts(m.activeGate))
 			}
+		case "shift+tab":
+			m.selectPrevArtifact()
 		case "1":
 			m.view = viewOverview
 		case "3":
@@ -474,50 +362,50 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			m.cancelRun()
 			return m, tea.Quit
-		case "a", "r", "v", "n", "e":
-			m.err = fmt.Errorf("workspace snapshot is read-only while another Factory process owns the run")
+		case "a", "ctrl+a", "r", "ctrl+r", "v", "ctrl+v", "n", "ctrl+n", "e":
+			m.err = fmt.Errorf("工作区快照为只读，当前运行由另一个 Factory 进程持有")
 		}
 		return m, nil
 	}
 	if m.gateEditingNote {
 		switch msg.String() {
-		case "esc", "enter":
+		case "esc", "ctrl+s":
 			m.gateEditingNote = false
-			return m, nil
-		case "backspace":
-			if len(m.gateNotes) > 0 {
-				m.gateNotes = m.gateNotes[:len(m.gateNotes)-1]
-			}
+			m.notesInput.Blur()
+			m.gateNotes = m.notesInput.Value()
+			m.focusMgr.Pop()
 			return m, nil
 		default:
-			if len(msg.Runes) > 0 {
-				m.gateNotes += string(msg.Runes)
-			}
-			return m, nil
+			var cmd tea.Cmd
+			m.notesInput, cmd = m.notesInput.Update(msg)
+			m.gateNotes = m.notesInput.Value()
+			return m, cmd
 		}
 	}
 	switch msg.String() {
-	case "a":
+	case "a", "ctrl+a":
 		if blockers := gateBlockingChecklist(m.activeGate.Checklist); len(blockers) > 0 {
-			m.err = fmt.Errorf("cannot approve gate with failing critical checks: %s", strings.Join(blockers, "; "))
+			m.err = fmt.Errorf("无法批准：存在未通过的关键检查项：%s", strings.Join(blockers, "；"))
 			return m, nil
 		}
 		gate := m.activeGate
-		decision := m.makeGateDecision(true)
 		m.activeGate = nil
 		m.err = nil
-		m.view = viewOverview
-		return m, m.submitDecision(decision, gate)
-	case "r":
+		dialog := newConfirmDialog(confirmApprove, "确认批准", "批准后工作流将进入下一阶段，是否继续？")
+		dialog.Gate = gate
+		m.openConfirm(dialog)
+		return m, func() tea.Msg { return confirmOpenedMsg{} }
+	case "r", "ctrl+r":
 		gate := m.activeGate
-		decision := m.makeGateDecision(false)
 		m.activeGate = nil
 		m.err = nil
-		m.view = viewOverview
-		return m, m.submitDecision(decision, gate)
-	case "v":
+		dialog := newConfirmDialog(confirmReject, "确认拒绝", "拒绝将中止或退回当前审查关卡，是否继续？")
+		dialog.Gate = gate
+		m.openConfirm(dialog)
+		return m, func() tea.Msg { return confirmOpenedMsg{} }
+	case "v", "ctrl+v":
 		if m.activeGate.GateID != nodes.FinalReview && m.activeGate.GateID != nodes.ResultReview {
-			m.err = fmt.Errorf("revise/refresh is available at Final Review and Result Review")
+			m.err = fmt.Errorf("修订/刷新仅在最终审查和结果审查中可用")
 			return m, nil
 		}
 		gate := m.activeGate
@@ -527,13 +415,19 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.view = viewOverview
 		return m, m.submitDecision(decision, gate)
-	case "n":
+	case "n", "ctrl+n":
 		m.gateEditingNote = true
-		return m, nil
+		m.notesInput.SetValue(m.gateNotes)
+		m.notesInput.Focus()
+		m.focusMgr.Push(focusGateNotes)
+		return m, m.notesInput.Cursor.BlinkCmd()
 	case "tab":
 		if idx, _, ok := m.selectedGateArtifact(); ok {
-			m.selectedArtifact = (idx + 1) % len(m.activeGate.Artifacts)
+			m.selectedArtifact = (idx + 1) % len(m.visibleGateArtifacts(m.activeGate))
 		}
+		return m, nil
+	case "shift+tab":
+		m.selectPrevArtifact()
 		return m, nil
 	case "e":
 		_, artifact, ok := m.selectedGateArtifact()
@@ -545,7 +439,10 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = err
 			return m, nil
 		}
-		return m, openEditorCmd(path)
+		dialog := newConfirmDialog(confirmEditArtifact, "确认编辑工件", "将使用外部编辑器打开：\n"+path)
+		dialog.Path = path
+		m.openConfirm(dialog)
+		return m, func() tea.Msg { return confirmOpenedMsg{} }
 	case "1":
 		m.view = viewOverview
 		return m, nil
@@ -567,11 +464,14 @@ func (m model) updateLogsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab":
 		m.selectNextArtifact()
 		return m, nil
+	case "shift+tab":
+		m.selectPrevArtifact()
+		return m, nil
 	case "x":
 		if m.readOnly {
-			m.err = fmt.Errorf("workspace snapshot is read-only while another Factory process owns the run")
+			m.err = fmt.Errorf("工作区快照为只读，当前运行由另一个 Factory 进程持有")
 		} else if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
-			m.notice = "Cancel requested for " + m.selectedNode + "; the other model stage may continue."
+			m.notice = "已请求取消 " + m.selectedNode + "；其他模型阶段可能继续运行。"
 			m.err = nil
 		}
 		return m, nil
@@ -615,6 +515,8 @@ func (m model) updateLogsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "4":
 		if m.done {
 			m.view = viewDone
+		} else {
+			return m, m.showToast("运行尚未完成", toastWarning)
 		}
 		return m, nil
 	}
@@ -663,12 +565,12 @@ func writeWorkspaceGateDecision(workspace string, decision domain.GateDecision) 
 	decision = sanitize.GateDecision(decision)
 	phase, ok := reviewGatePhase(decision.GateID)
 	if !ok {
-		return "", fmt.Errorf("unknown review gate id: %s", redactUI(decision.GateID))
+		return "", fmt.Errorf("未知审查关卡 ID：%s", redactUI(decision.GateID))
 	}
 	path := nodes.ReviewDecisionPath(workspace, phase, decision.GateID)
 	reviewsRoot := filepath.Join(defaultWorkspace(workspace), phase, "artifacts", "reviews")
 	if !pathWithinRoot(path, reviewsRoot) {
-		return "", fmt.Errorf("review decision path escapes workspace")
+		return "", fmt.Errorf("审查决定路径超出工作区")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return path, err
@@ -703,14 +605,17 @@ func reviewGatePhase(gateID string) (string, bool) {
 func openEditorCmd(path string) tea.Cmd {
 	return func() tea.Msg {
 		before := snapshotFile(path)
-		cmd := editorCommand(path)
+		cmd := safeEditorCommand(path)
 		return tea.ExecProcess(cmd, func(err error) tea.Msg {
 			return editorDoneMsg{path: path, before: before, after: snapshotFile(path), err: err}
 		})()
 	}
 }
 
-func editorCommand(path string) *exec.Cmd {
+// safeEditorCommand parses the conventional VISUAL/EDITOR command line and
+// invokes the executable directly. The path is always one argv element, so a
+// crafted filename cannot be interpreted by a shell.
+func safeEditorCommand(path string) *exec.Cmd {
 	editor := strings.TrimSpace(os.Getenv("VISUAL"))
 	if editor == "" {
 		editor = strings.TrimSpace(os.Getenv("EDITOR"))
@@ -718,7 +623,63 @@ func editorCommand(path string) *exec.Cmd {
 	if editor == "" {
 		return exec.Command("vi", path)
 	}
-	return exec.Command("sh", "-c", editor+" \"$1\"", "harbor-factory-editor", path)
+	args, err := splitCommandLine(editor)
+	if err != nil || len(args) == 0 {
+		return exec.Command("vi", path)
+	}
+	return exec.Command(args[0], append(args[1:], path)...)
+}
+
+func splitCommandLine(value string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	flush := func() {
+		if current.Len() > 0 {
+			args = append(args, current.String())
+			current.Reset()
+		}
+	}
+	for _, r := range value {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+		case ' ', '\t', '\n':
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if escaped {
+		current.WriteRune('\\')
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unclosed quote in editor command")
+	}
+	flush()
+	return args, nil
+}
+
+func editorCommand(path string) *exec.Cmd {
+	return safeEditorCommand(path)
 }
 
 func (m model) runWorkflow() tea.Cmd {
@@ -804,6 +765,8 @@ func (m *model) applyWorkspaceSnapshot(summary domain.RunSummary, events []domai
 func (m *model) resetGateLocalState() {
 	m.gateNotes = ""
 	m.gateEditingNote = false
+	m.notesInput.SetValue("")
+	m.notesInput.Blur()
 	m.editedFiles = nil
 	m.selectedArtifact = 0
 }
@@ -886,174 +849,13 @@ func isTerminalRunSummary(summary domain.RunSummary) bool {
 }
 
 func (m model) header() string {
-	title := titleStyle.Render("Harbor Task Factory")
-	contextLine := subtleStyle.Render(redactUI(fmt.Sprintf("workspace=%s task=%s repo=%s", emptyDash(m.opts.Workspace), emptyDash(m.opts.TaskDir), emptyDash(m.opts.RepoURL))))
+	title := titleStyle.Render("Harbor 出题工坊")
+	context := redactUI(fmt.Sprintf("工作区=%s 任务=%s 仓库=%s", emptyDash(m.opts.Workspace), emptyDash(m.opts.TaskDir), emptyDash(m.opts.RepoURL)))
+	if m.width > 0 {
+		context = truncateDisplay(context, maxInt(20, m.width))
+	}
+	contextLine := subtleStyle.Render(context)
 	return lipgloss.JoinVertical(lipgloss.Left, title, contextLine)
-}
-
-func (m model) startView() string {
-	var lines []string
-	lines = append(lines, sectionStyle.Render("Start Workflow"))
-	for _, field := range m.activeStartFields() {
-		lines = append(lines, m.renderStartField(field))
-	}
-	if m.err != nil {
-		lines = append(lines, "")
-		lines = append(lines, failStyle.Render(redactUI(m.err.Error())))
-	}
-	lines = append(lines, "")
-	lines = append(lines, subtleStyle.Render("[Tab] field  [Space] toggle  [Enter] start"))
-	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-}
-
-func (m model) renderStartField(field startField) string {
-	prefix := "  "
-	if field == m.startField {
-		prefix = "> "
-	}
-	var label, value string
-	switch field {
-	case startFieldMode:
-		label = "Mode"
-		if m.startMode == startGenerateTask {
-			value = "Generate from repo"
-		} else {
-			value = "Run existing task"
-		}
-	case startFieldTaskDir:
-		label = "Task"
-		value = emptyDash(m.opts.TaskDir)
-	case startFieldRepoURL:
-		label = "Repo"
-		value = emptyDash(m.opts.RepoURL)
-	case startFieldCommit:
-		label = "Commit"
-		value = emptyDash(m.opts.Commit)
-	case startFieldWorkspace:
-		label = "Workspace"
-		value = emptyDash(m.opts.Workspace)
-	case startFieldTaskOutput:
-		label = "Task output"
-		value = emptyDash(m.opts.TaskOutputDir)
-	case startFieldTestsAnalysis:
-		label = "Tests analysis"
-		value = emptyDash(m.opts.TestsAnalysis)
-	case startFieldQwenResult:
-		label = "Qwen result"
-		value = emptyDash(m.opts.QwenResult)
-	case startFieldOpusResult:
-		label = "Opus result"
-		value = emptyDash(m.opts.OpusResult)
-	case startFieldQwenScreenshot:
-		label = "Qwen screenshot"
-		value = emptyDash(m.opts.QwenScreenshot)
-	case startFieldOpusScreenshot:
-		label = "Opus screenshot"
-		value = emptyDash(m.opts.OpusScreenshot)
-	case startFieldOutput:
-		label = "Package output"
-		value = emptyDash(m.opts.OutputDir)
-	case startFieldVerifyDocker:
-		label = "Docker verify"
-		value = checkbox(m.opts.VerifyDocker)
-	case startFieldQualityCheck:
-		label = "Quality check"
-		value = checkbox(m.opts.QualityCheck)
-	case startFieldQualityAgent:
-		label = "Quality agent"
-		value = checkbox(m.opts.QualityAgent)
-	case startFieldSimilarityCheck:
-		label = "Similarity check"
-		value = checkbox(m.opts.SimilarityCheck)
-	case startFieldSimilarityGitHub:
-		label = "GitHub similarity"
-		value = checkbox(m.opts.SimilarityGitHub)
-	case startFieldSimilarityThreshold:
-		label = "Similarity threshold"
-		value = formatFloatInput(m.opts.SimilarityThreshold)
-	case startFieldHistoryDirs:
-		label = "History dirs"
-		value = emptyDash(joinStartList(m.opts.SimilarityHistoryDirs))
-	case startFieldTB3Dirs:
-		label = "TB3 dirs"
-		value = emptyDash(joinStartList(m.opts.SimilarityTB3Dirs))
-	case startFieldRunHarbor:
-		label = "Harbor pass@4"
-		value = checkbox(m.opts.RunHarbor)
-	case startFieldHarborAgent:
-		label = "Harbor agent"
-		value = emptyDash(m.opts.HarborAgent)
-	case startFieldQwenModel:
-		label = "Qwen model"
-		value = emptyDash(m.opts.QwenModel)
-	case startFieldOpusModel:
-		label = "Opus model"
-		value = emptyDash(m.opts.OpusModel)
-	case startFieldQwenHarborBaseURL:
-		label = "Qwen Harbor base URL"
-		value = emptyDash(m.opts.QwenHarborBaseURL)
-	case startFieldOpusHarborBaseURL:
-		label = "Opus Harbor base URL"
-		value = emptyDash(m.opts.OpusHarborBaseURL)
-	case startFieldHarborTimeout:
-		label = "Harbor timeout"
-		value = formatIntInput(m.opts.HarborTimeout)
-	case startFieldHarborSetupTimeout:
-		label = "Harbor setup timeout"
-		value = formatIntInput(m.opts.HarborSetupTimeout)
-	case startFieldHarborPreflight:
-		label = "Harbor preflight"
-		value = checkbox(m.opts.HarborPreflight)
-	case startFieldHarborConcurrency:
-		label = "Harbor concurrency"
-		value = formatIntInput(m.opts.HarborConcurrency)
-	case startFieldHarborAttempts:
-		label = "Harbor attempts"
-		value = formatIntInput(m.opts.HarborAttempts)
-	case startFieldHarborInfraRetries:
-		label = "Harbor infra retries"
-		value = formatIntInput(m.opts.HarborInfraRetries)
-	case startFieldPackage:
-		label = "Package"
-		value = checkbox(m.opts.Package)
-	case startFieldTaskName:
-		label = "Task name"
-		value = emptyDash(m.opts.TaskName)
-	case startFieldCodeLang:
-		label = "Code lang"
-		value = emptyDash(m.opts.CodeLang)
-	case startFieldTaskType:
-		label = "Task type"
-		value = emptyDash(m.opts.TaskType)
-	case startFieldApplication:
-		label = "Application"
-		value = emptyDash(m.opts.Application)
-	case startFieldAHT:
-		label = "AHT"
-		value = emptyDash(m.opts.AHT)
-	case startFieldDescription:
-		label = "Description"
-		value = emptyDash(m.opts.Description)
-	case startFieldZeroToOne:
-		label = "Zero to one"
-		value = checkbox(m.opts.IsZeroToOne)
-	case startFieldCodexModel:
-		label = "Codex model"
-		value = emptyDash(m.opts.Model)
-	case startFieldCodexReasoning:
-		label = "Codex reasoning"
-		value = emptyDash(m.opts.Reasoning)
-	case startFieldCodexPath:
-		label = "Codex path"
-		value = emptyDash(m.opts.CodexPath)
-	case startFieldAgentTimeout:
-		label = "Agent timeout"
-		value = formatIntInput(m.opts.AgentTimeout)
-	default:
-		label = "Field"
-		value = "-"
-	}
-	return fmt.Sprintf("%s%-22s %s", prefix, label, redactUI(value))
 }
 
 func checkbox(enabled bool) string {
@@ -1063,7 +865,7 @@ func checkbox(enabled bool) string {
 	return "[ ]"
 }
 
-func (m model) activeStartFields() []startField {
+func (m model) uncollapsedStartFields() []startField {
 	fields := []startField{startFieldMode}
 	if m.startMode == startGenerateTask {
 		fields = append(fields, startFieldRepoURL, startFieldCommit, startFieldTaskOutput)
@@ -1113,16 +915,47 @@ func (m model) activeStartFields() []startField {
 	return fields
 }
 
+func (m model) activeStartFields() []startField {
+	if m.startStep == startStepBasic {
+		fields := []startField{startFieldMode}
+		if m.startMode == startGenerateTask {
+			fields = append(fields, startFieldRepoURL, startFieldCommit, startFieldTaskOutput)
+		} else {
+			fields = append(fields, startFieldTaskDir)
+		}
+		return append(fields, startFieldWorkspace)
+	}
+	if m.startCollapsed[m.selectedStartGroup] {
+		return nil
+	}
+	all := m.uncollapsedStartFields()
+	out := make([]startField, 0, len(all))
+	for _, field := range all {
+		if groupForStartField(field) == m.selectedStartGroup {
+			out = append(out, field)
+		}
+	}
+	return out
+}
+
 func (m *model) selectNextStartField() {
 	fields := m.activeStartFields()
+	if len(fields) == 0 {
+		return
+	}
 	current := m.startFieldIndex(fields)
 	m.startField = fields[(current+1)%len(fields)]
+	m.pathSuggestions = nil
 }
 
 func (m *model) selectPrevStartField() {
 	fields := m.activeStartFields()
+	if len(fields) == 0 {
+		return
+	}
 	current := m.startFieldIndex(fields)
 	m.startField = fields[(current-1+len(fields))%len(fields)]
+	m.pathSuggestions = nil
 }
 
 func (m model) startFieldIndex(fields []startField) int {
@@ -1170,214 +1003,6 @@ func (m *model) toggleStartBool() bool {
 	return true
 }
 
-func (m *model) appendStartInput(value string) {
-	m.err = nil
-	switch m.startField {
-	case startFieldTaskDir:
-		m.opts.TaskDir += value
-	case startFieldRepoURL:
-		m.opts.RepoURL += value
-	case startFieldCommit:
-		m.opts.Commit += value
-	case startFieldWorkspace:
-		m.opts.Workspace += value
-	case startFieldTaskOutput:
-		m.opts.TaskOutputDir += value
-	case startFieldTestsAnalysis:
-		m.opts.TestsAnalysis += value
-	case startFieldQwenResult:
-		m.opts.QwenResult += value
-	case startFieldOpusResult:
-		m.opts.OpusResult += value
-	case startFieldQwenScreenshot:
-		m.opts.QwenScreenshot += value
-	case startFieldOpusScreenshot:
-		m.opts.OpusScreenshot += value
-	case startFieldSimilarityThreshold:
-		m.setStartFloat(startFieldSimilarityThreshold, currentStartFieldInput(m.opts, startFieldSimilarityThreshold)+value)
-	case startFieldHistoryDirs:
-		m.opts.SimilarityHistoryDirs = rawStartList(joinStartList(m.opts.SimilarityHistoryDirs) + value)
-	case startFieldTB3Dirs:
-		m.opts.SimilarityTB3Dirs = rawStartList(joinStartList(m.opts.SimilarityTB3Dirs) + value)
-	case startFieldOutput:
-		m.opts.OutputDir += value
-	case startFieldHarborAgent:
-		m.opts.HarborAgent += value
-	case startFieldQwenModel:
-		m.opts.QwenModel += value
-	case startFieldOpusModel:
-		m.opts.OpusModel += value
-	case startFieldQwenHarborBaseURL:
-		m.opts.QwenHarborBaseURL += value
-	case startFieldOpusHarborBaseURL:
-		m.opts.OpusHarborBaseURL += value
-	case startFieldHarborTimeout:
-		m.setStartInt(startFieldHarborTimeout, currentStartFieldInput(m.opts, startFieldHarborTimeout)+value)
-	case startFieldHarborSetupTimeout, startFieldHarborConcurrency, startFieldHarborAttempts, startFieldHarborInfraRetries:
-		m.setStartInt(m.startField, currentStartFieldInput(m.opts, m.startField)+value)
-	case startFieldTaskName:
-		m.opts.TaskName += value
-	case startFieldCodeLang:
-		m.opts.CodeLang += value
-	case startFieldTaskType:
-		m.opts.TaskType += value
-	case startFieldApplication:
-		m.opts.Application += value
-	case startFieldAHT:
-		m.opts.AHT += value
-	case startFieldDescription:
-		m.opts.Description += value
-	case startFieldCodexModel:
-		m.opts.Model += value
-	case startFieldCodexReasoning:
-		m.opts.Reasoning += value
-	case startFieldCodexPath:
-		m.opts.CodexPath += value
-	case startFieldAgentTimeout:
-		m.setStartInt(startFieldAgentTimeout, currentStartFieldInput(m.opts, startFieldAgentTimeout)+value)
-	}
-}
-
-func (m *model) backspaceStartInput() {
-	switch m.startField {
-	case startFieldTaskDir:
-		m.opts.TaskDir = trimLastRune(m.opts.TaskDir)
-	case startFieldRepoURL:
-		m.opts.RepoURL = trimLastRune(m.opts.RepoURL)
-	case startFieldCommit:
-		m.opts.Commit = trimLastRune(m.opts.Commit)
-	case startFieldWorkspace:
-		m.opts.Workspace = trimLastRune(m.opts.Workspace)
-	case startFieldTaskOutput:
-		m.opts.TaskOutputDir = trimLastRune(m.opts.TaskOutputDir)
-	case startFieldTestsAnalysis:
-		m.opts.TestsAnalysis = trimLastRune(m.opts.TestsAnalysis)
-	case startFieldQwenResult:
-		m.opts.QwenResult = trimLastRune(m.opts.QwenResult)
-	case startFieldOpusResult:
-		m.opts.OpusResult = trimLastRune(m.opts.OpusResult)
-	case startFieldQwenScreenshot:
-		m.opts.QwenScreenshot = trimLastRune(m.opts.QwenScreenshot)
-	case startFieldOpusScreenshot:
-		m.opts.OpusScreenshot = trimLastRune(m.opts.OpusScreenshot)
-	case startFieldSimilarityThreshold:
-		m.setStartFloat(startFieldSimilarityThreshold, trimLastRune(currentStartFieldInput(m.opts, startFieldSimilarityThreshold)))
-	case startFieldHistoryDirs:
-		m.opts.SimilarityHistoryDirs = rawStartList(trimLastRune(joinStartList(m.opts.SimilarityHistoryDirs)))
-	case startFieldTB3Dirs:
-		m.opts.SimilarityTB3Dirs = rawStartList(trimLastRune(joinStartList(m.opts.SimilarityTB3Dirs)))
-	case startFieldOutput:
-		m.opts.OutputDir = trimLastRune(m.opts.OutputDir)
-	case startFieldHarborAgent:
-		m.opts.HarborAgent = trimLastRune(m.opts.HarborAgent)
-	case startFieldQwenModel:
-		m.opts.QwenModel = trimLastRune(m.opts.QwenModel)
-	case startFieldOpusModel:
-		m.opts.OpusModel = trimLastRune(m.opts.OpusModel)
-	case startFieldQwenHarborBaseURL:
-		m.opts.QwenHarborBaseURL = trimLastRune(m.opts.QwenHarborBaseURL)
-	case startFieldOpusHarborBaseURL:
-		m.opts.OpusHarborBaseURL = trimLastRune(m.opts.OpusHarborBaseURL)
-	case startFieldHarborTimeout:
-		m.setStartInt(startFieldHarborTimeout, trimLastRune(currentStartFieldInput(m.opts, startFieldHarborTimeout)))
-	case startFieldHarborSetupTimeout, startFieldHarborConcurrency, startFieldHarborAttempts, startFieldHarborInfraRetries:
-		m.setStartInt(m.startField, trimLastRune(currentStartFieldInput(m.opts, m.startField)))
-	case startFieldTaskName:
-		m.opts.TaskName = trimLastRune(m.opts.TaskName)
-	case startFieldCodeLang:
-		m.opts.CodeLang = trimLastRune(m.opts.CodeLang)
-	case startFieldTaskType:
-		m.opts.TaskType = trimLastRune(m.opts.TaskType)
-	case startFieldApplication:
-		m.opts.Application = trimLastRune(m.opts.Application)
-	case startFieldAHT:
-		m.opts.AHT = trimLastRune(m.opts.AHT)
-	case startFieldDescription:
-		m.opts.Description = trimLastRune(m.opts.Description)
-	case startFieldCodexModel:
-		m.opts.Model = trimLastRune(m.opts.Model)
-	case startFieldCodexReasoning:
-		m.opts.Reasoning = trimLastRune(m.opts.Reasoning)
-	case startFieldCodexPath:
-		m.opts.CodexPath = trimLastRune(m.opts.CodexPath)
-	case startFieldAgentTimeout:
-		m.setStartInt(startFieldAgentTimeout, trimLastRune(currentStartFieldInput(m.opts, startFieldAgentTimeout)))
-	}
-}
-
-func (m *model) clearStartInput() {
-	switch m.startField {
-	case startFieldTaskDir:
-		m.opts.TaskDir = ""
-	case startFieldRepoURL:
-		m.opts.RepoURL = ""
-	case startFieldCommit:
-		m.opts.Commit = ""
-	case startFieldWorkspace:
-		m.opts.Workspace = ""
-	case startFieldTaskOutput:
-		m.opts.TaskOutputDir = ""
-	case startFieldTestsAnalysis:
-		m.opts.TestsAnalysis = ""
-	case startFieldQwenResult:
-		m.opts.QwenResult = ""
-	case startFieldOpusResult:
-		m.opts.OpusResult = ""
-	case startFieldQwenScreenshot:
-		m.opts.QwenScreenshot = ""
-	case startFieldOpusScreenshot:
-		m.opts.OpusScreenshot = ""
-	case startFieldSimilarityThreshold:
-		m.opts.SimilarityThreshold = 0
-	case startFieldHistoryDirs:
-		m.opts.SimilarityHistoryDirs = nil
-	case startFieldTB3Dirs:
-		m.opts.SimilarityTB3Dirs = nil
-	case startFieldOutput:
-		m.opts.OutputDir = ""
-	case startFieldHarborAgent:
-		m.opts.HarborAgent = ""
-	case startFieldQwenModel:
-		m.opts.QwenModel = ""
-	case startFieldOpusModel:
-		m.opts.OpusModel = ""
-	case startFieldQwenHarborBaseURL:
-		m.opts.QwenHarborBaseURL = ""
-	case startFieldOpusHarborBaseURL:
-		m.opts.OpusHarborBaseURL = ""
-	case startFieldHarborTimeout:
-		m.opts.HarborTimeout = 0
-	case startFieldHarborSetupTimeout:
-		m.opts.HarborSetupTimeout = 0
-	case startFieldHarborConcurrency:
-		m.opts.HarborConcurrency = 0
-	case startFieldHarborAttempts:
-		m.opts.HarborAttempts = 0
-	case startFieldHarborInfraRetries:
-		m.opts.HarborInfraRetries = 0
-	case startFieldTaskName:
-		m.opts.TaskName = ""
-	case startFieldCodeLang:
-		m.opts.CodeLang = ""
-	case startFieldTaskType:
-		m.opts.TaskType = ""
-	case startFieldApplication:
-		m.opts.Application = ""
-	case startFieldAHT:
-		m.opts.AHT = ""
-	case startFieldDescription:
-		m.opts.Description = ""
-	case startFieldCodexModel:
-		m.opts.Model = ""
-	case startFieldCodexReasoning:
-		m.opts.Reasoning = ""
-	case startFieldCodexPath:
-		m.opts.CodexPath = ""
-	case startFieldAgentTimeout:
-		m.opts.AgentTimeout = 0
-	}
-}
-
 func applyStartDefaults(opts app.RunnerOptions) app.RunnerOptions {
 	if opts.SimilarityThreshold == 0 {
 		opts.SimilarityThreshold = 0.42
@@ -1417,27 +1042,6 @@ func applyStartDefaults(opts app.RunnerOptions) app.RunnerOptions {
 	return opts
 }
 
-func currentStartFieldInput(opts app.RunnerOptions, field startField) string {
-	switch field {
-	case startFieldSimilarityThreshold:
-		return formatFloatInput(opts.SimilarityThreshold)
-	case startFieldHarborTimeout:
-		return formatIntInput(opts.HarborTimeout)
-	case startFieldHarborSetupTimeout:
-		return formatIntInput(opts.HarborSetupTimeout)
-	case startFieldHarborConcurrency:
-		return formatIntInput(opts.HarborConcurrency)
-	case startFieldHarborAttempts:
-		return formatIntInput(opts.HarborAttempts)
-	case startFieldHarborInfraRetries:
-		return formatIntInput(opts.HarborInfraRetries)
-	case startFieldAgentTimeout:
-		return formatIntInput(opts.AgentTimeout)
-	default:
-		return ""
-	}
-}
-
 func (m *model) setStartFloat(field startField, value string) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -1449,11 +1053,11 @@ func (m *model) setStartFloat(field startField, value string) {
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
-		m.err = fmt.Errorf("invalid %s", startFieldName(field))
+		m.err = fmt.Errorf("%s格式无效", startFieldName(field))
 		return
 	}
 	if parsed < 0 {
-		m.err = fmt.Errorf("%s must be non-negative", startFieldName(field))
+		m.err = fmt.Errorf("%s不能为负数", startFieldName(field))
 		return
 	}
 	if field == startFieldSimilarityThreshold {
@@ -1484,11 +1088,11 @@ func (m *model) setStartInt(field startField, value string) {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		m.err = fmt.Errorf("invalid %s", startFieldName(field))
+		m.err = fmt.Errorf("%s格式无效", startFieldName(field))
 		return
 	}
 	if parsed < 0 {
-		m.err = fmt.Errorf("%s must be non-negative", startFieldName(field))
+		m.err = fmt.Errorf("%s不能为负数", startFieldName(field))
 		return
 	}
 	switch field {
@@ -1509,24 +1113,7 @@ func (m *model) setStartInt(field startField, value string) {
 }
 
 func startFieldName(field startField) string {
-	switch field {
-	case startFieldSimilarityThreshold:
-		return "similarity threshold"
-	case startFieldHarborTimeout:
-		return "harbor timeout"
-	case startFieldHarborSetupTimeout:
-		return "harbor setup timeout"
-	case startFieldHarborConcurrency:
-		return "harbor concurrency"
-	case startFieldHarborAttempts:
-		return "harbor attempts"
-	case startFieldHarborInfraRetries:
-		return "harbor infra retries"
-	case startFieldAgentTimeout:
-		return "agent timeout"
-	default:
-		return "field"
-	}
+	return localizeField(field)
 }
 
 func formatFloatInput(value float64) string {
@@ -1535,14 +1122,6 @@ func formatFloatInput(value float64) string {
 
 func formatIntInput(value int) string {
 	return strconv.Itoa(value)
-}
-
-func trimLastRune(value string) string {
-	runes := []rune(value)
-	if len(runes) == 0 {
-		return ""
-	}
-	return string(runes[:len(runes)-1])
 }
 
 func joinStartList(values []string) string {
@@ -1617,13 +1196,13 @@ func (m model) startOptions() (app.RunnerOptions, error) {
 		opts.Generate = true
 		opts.TaskDir = ""
 		if opts.RepoURL == "" || opts.Commit == "" {
-			return app.RunnerOptions{}, fmt.Errorf("generate mode requires repo and commit")
+			return app.RunnerOptions{}, fmt.Errorf("从仓库生成需要填写仓库地址和提交哈希")
 		}
 		return opts, nil
 	}
 	opts.Generate = false
 	if opts.TaskDir == "" {
-		return app.RunnerOptions{}, fmt.Errorf("existing task mode requires task directory")
+		return app.RunnerOptions{}, fmt.Errorf("运行已有任务需要填写任务路径")
 	}
 	return opts, nil
 }
@@ -1633,34 +1212,34 @@ func validateStartEvidence(opts app.RunnerOptions, mode startMode) error {
 		return nil
 	}
 	if mode == startExistingTask && strings.TrimSpace(opts.TestsAnalysis) == "" {
-		return fmt.Errorf("package requires tests analysis")
+		return fmt.Errorf("打包需要测试分析文件")
 	}
 	if mode == startExistingTask {
-		if err := requireReadableFile("tests analysis", opts.TestsAnalysis); err != nil {
+		if err := requireReadableFile("测试分析文件", opts.TestsAnalysis); err != nil {
 			return err
 		}
 	}
 	if !opts.SimilarityGitHub && len(opts.SimilarityHistoryDirs) == 0 && len(opts.SimilarityTB3Dirs) == 0 {
-		return fmt.Errorf("package requires a GitHub, history, or TB3 similarity source")
+		return fmt.Errorf("打包需要 GitHub、历史目录或 TB3 目录中的至少一种相似度来源")
 	}
 	for _, dir := range opts.SimilarityHistoryDirs {
-		if err := requireReadableDir("history similarity source", dir); err != nil {
+		if err := requireReadableDir("历史相似度目录", dir); err != nil {
 			return err
 		}
 	}
 	for _, dir := range opts.SimilarityTB3Dirs {
-		if err := requireReadableDir("TB3 similarity source", dir); err != nil {
+		if err := requireReadableDir("TB3 相似度目录", dir); err != nil {
 			return err
 		}
 	}
 	if !opts.RunHarbor && (strings.TrimSpace(opts.QwenResult) == "" || strings.TrimSpace(opts.OpusResult) == "") {
-		return fmt.Errorf("package requires Harbor pass@4 run or both Qwen/Opus result paths")
+		return fmt.Errorf("打包需要运行 Harbor pass@4，或同时提供 Qwen 与 Opus 结果路径")
 	}
 	if !opts.RunHarbor {
-		if err := requireReadableFile("Qwen Harbor result", opts.QwenResult); err != nil {
+		if err := requireReadableFile("Qwen Harbor 结果", opts.QwenResult); err != nil {
 			return err
 		}
-		if err := requireReadableFile("Opus Harbor result", opts.OpusResult); err != nil {
+		if err := requireReadableFile("Opus Harbor 结果", opts.OpusResult); err != nil {
 			return err
 		}
 		if err := validateExplicitOrResultScreenshot("Qwen", opts.QwenScreenshot, opts.QwenResult); err != nil {
@@ -1681,11 +1260,11 @@ func validateExplicitOrResultScreenshot(label, explicit, resultPath string) erro
 	if !ok {
 		switch label {
 		case "Qwen":
-			return fmt.Errorf("package requires Qwen pass@4 screenshot or screenshot field in Qwen result")
+			return fmt.Errorf("打包需要 Qwen pass@4 截图，或 Qwen 结果中的截图字段")
 		case "Opus":
-			return fmt.Errorf("package requires Opus pass@4 screenshot or screenshot field in Opus result")
+			return fmt.Errorf("打包需要 Opus pass@4 截图，或 Opus 结果中的截图字段")
 		default:
-			return fmt.Errorf("package requires %s pass@4 screenshot or screenshot field in result", label)
+			return fmt.Errorf("打包需要 %s pass@4 截图，或结果中的截图字段", label)
 		}
 	}
 	return requireReadableFile(label+" result screenshot", screenshot)
@@ -1717,14 +1296,14 @@ func requireReadableFile(label, path string) error {
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("%s is not readable: %w", label, err)
+		return fmt.Errorf("%s不可读取：%w", label, err)
 	}
 	if info.IsDir() || !info.Mode().IsRegular() {
-		return fmt.Errorf("%s must be a regular file: %s", label, path)
+		return fmt.Errorf("%s必须是普通文件：%s", label, path)
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("%s is not readable: %w", label, err)
+		return fmt.Errorf("%s不可读取：%w", label, err)
 	}
 	return file.Close()
 }
@@ -1736,18 +1315,18 @@ func requireReadableDir(label, path string) error {
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("%s directory is not readable: %w", label, err)
+		return fmt.Errorf("%s不可读取：%w", label, err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("%s must be a directory: %s", label, path)
+		return fmt.Errorf("%s必须是目录：%s", label, path)
 	}
 	dir, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("%s directory is not readable: %w", label, err)
+		return fmt.Errorf("%s不可读取：%w", label, err)
 	}
 	defer dir.Close()
 	if _, err := dir.Readdirnames(1); err != nil && err != io.EOF {
-		return fmt.Errorf("%s directory is not readable: %w", label, err)
+		return fmt.Errorf("%s不可读取：%w", label, err)
 	}
 	return nil
 }
@@ -1773,248 +1352,6 @@ func (m model) startRunner(opts app.RunnerOptions) model {
 	m.logFileScroll = 0
 	m.logTail = false
 	return m
-}
-
-func (m model) overview() string {
-	var lines []string
-	lines = append(lines, sectionStyle.Render("Overview"))
-	if strings.TrimSpace(m.notice) != "" {
-		lines = append(lines, warnStyle.Render(redactUI(m.notice)))
-	}
-	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(m.err.Error())))
-	}
-	for _, id := range nodeOrder() {
-		event, ok := m.nodes[id]
-		if !ok {
-			lines = append(lines, fmt.Sprintf("%s %s", statusIcon("pending"), id))
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("%s %s %s", statusIcon(event.Status), id, redactUI(event.Message)))
-		if event.Path != "" {
-			lines = append(lines, subtleStyle.Render("  "+redactUI(event.Path)))
-		}
-	}
-	if len(m.events) == 0 {
-		lines = append(lines, subtleStyle.Render("No events yet."))
-	}
-	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-}
-
-func (m model) gateView() string {
-	if m.activeGate == nil {
-		return panelStyle.Width(contentWidth(m.width)).Render("No active gate.")
-	}
-	gate := m.activeGate
-	var lines []string
-	lines = append(lines, sectionStyle.Render(gate.GateName))
-	lines = append(lines, redactUI(gate.Message))
-	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(m.err.Error())))
-	}
-	lines = append(lines, "")
-	lines = append(lines, "Checklist")
-	for _, item := range gate.Checklist {
-		mark := statusIcon("failed")
-		if item.Passed {
-			mark = statusIcon("succeeded")
-		}
-		critical := ""
-		if item.Critical {
-			critical = " critical"
-		}
-		lines = append(lines, fmt.Sprintf("%s %s%s", mark, redactUI(item.Label), subtleStyle.Render(critical)))
-	}
-	if _, artifact, ok := m.selectedGateArtifact(); ok {
-		lines = append(lines, "")
-		lines = append(lines, sectionStyle.Render("Artifact: "+redactUI(artifact.Name)))
-		lines = append(lines, subtleStyle.Render(redactUI(artifact.Path)))
-		lines = append(lines, trimLines(m.artifactContent(artifact), 14))
-	}
-	lines = append(lines, "")
-	if m.gateEditingNote {
-		lines = append(lines, warnStyle.Render("Notes editing: ")+redactUI(m.gateNotes))
-	} else if m.gateNotes != "" {
-		lines = append(lines, "Notes: "+redactUI(m.gateNotes))
-	}
-	if m.readOnly {
-		lines = append(lines, subtleStyle.Render("Read-only snapshot  [Tab] next artifact  [1] overview  [3] logs"))
-		return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-	}
-	actions := "[a] approve  [r] reject"
-	if gate.GateID == nodes.FinalReview {
-		actions += "  [v] revise and rerun checks"
-	} else if gate.GateID == nodes.ResultReview {
-		actions += "  [v] refresh screenshot evidence"
-	}
-	lines = append(lines, subtleStyle.Render(actions+"  [n] notes  [e] edit artifact  [Tab] next artifact"))
-	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-}
-
-func (m model) nodeDetailView() string {
-	var lines []string
-	lines = append(lines, sectionStyle.Render("Node Detail"))
-	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(m.err.Error())))
-	}
-	if len(m.nodes) == 0 {
-		lines = append(lines, subtleStyle.Render("No node events yet."))
-		return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-	}
-	order := nodeOrder()
-	for _, id := range order {
-		event, ok := m.nodes[id]
-		if !ok {
-			continue
-		}
-		prefix := "  "
-		if id == m.selectedNode {
-			prefix = "> "
-		}
-		lines = append(lines, fmt.Sprintf("%s%s %s %s", prefix, statusIcon(event.Status), id, redactUI(event.Message)))
-		if id == m.selectedNode && event.Path != "" {
-			lines = append(lines, subtleStyle.Render("    "+redactUI(event.Path)))
-		}
-	}
-	if artifacts := m.nodeArtifacts(m.selectedNode); len(artifacts) > 0 {
-		idx := m.selectedArtifact
-		if idx < 0 || idx >= len(artifacts) {
-			idx = 0
-		}
-		artifact := artifacts[idx]
-		lines = append(lines, "")
-		lines = append(lines, sectionStyle.Render(fmt.Sprintf("Artifact %d/%d: %s", idx+1, len(artifacts), redactUI(artifact.Name))))
-		lines = append(lines, subtleStyle.Render(redactUI(artifact.Path)))
-		lines = append(lines, trimLines(artifact.Content, detailPreviewLines(m.height)))
-	}
-	lines = append(lines, "")
-	actions := "[j/k] select node  [Tab] next artifact  [e] edit artifact  [l] logs"
-	if m.readOnly {
-		actions = "Read-only snapshot  [j/k] select node  [Tab] next artifact  [l] logs"
-	}
-	lines = append(lines, subtleStyle.Render(actions))
-	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-}
-
-func (m model) logsView() string {
-	var lines []string
-	lines = append(lines, sectionStyle.Render("Logs"))
-	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(m.err.Error())))
-	}
-	start := 0
-	if len(m.events) > 18 {
-		start = len(m.events) - 18
-	}
-	for _, event := range m.events[start:] {
-		node := event.NodeID
-		if node == "" {
-			node = "run"
-		}
-		lines = append(lines, fmt.Sprintf("%s %-16s %s", event.CreatedAt.Format("15:04:05"), node, redactUI(event.Message)))
-	}
-	if len(lines) == 1 {
-		lines = append(lines, subtleStyle.Render("No logs yet."))
-	}
-	files := m.logArtifacts()
-	if len(files) > 0 {
-		idx := m.selectedLogFile
-		if idx < 0 || idx >= len(files) {
-			idx = 0
-		}
-		artifact := files[idx]
-		lines = append(lines, "")
-		mode := "top"
-		if m.logTail {
-			mode = "tail"
-		}
-		lines = append(lines, sectionStyle.Render(fmt.Sprintf("File %d/%d: %s [%s]", idx+1, len(files), redactUI(artifact.Name), mode)))
-		lines = append(lines, subtleStyle.Render(redactUI(artifact.Path)))
-		content := m.logArtifactContent(artifact)
-		offset := m.logContentOffset(content, logPreviewLines(m.height))
-		lines = append(lines, trimLinesFrom(content, logPreviewLines(m.height), offset))
-		lines = append(lines, subtleStyle.Render("[Tab] next file  [j/k] scroll  [PgUp/PgDn] page  [t] tail"))
-	}
-	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-}
-
-func (m model) doneView() string {
-	var lines []string
-	lines = append(lines, sectionStyle.Render("Done"))
-	if !m.done {
-		lines = append(lines, "Run is still in progress.")
-		return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
-	}
-	if m.err != nil {
-		lines = append(lines, failStyle.Render("Failed: "+redactUI(m.err.Error())))
-	} else if !m.summary.Passed {
-		lines = append(lines, failStyle.Render("Completed with failing checks."))
-		if event, ok := m.lastFailureEvent(); ok {
-			node := event.NodeID
-			if node == "" {
-				node = "run"
-			}
-			lines = append(lines, fmt.Sprintf("last failure: %s: %s", redactUI(node), redactUI(event.Message)))
-			if strings.TrimSpace(event.Path) != "" {
-				lines = append(lines, subtleStyle.Render("  "+redactUI(event.Path)))
-			}
-		}
-	} else {
-		lines = append(lines, passStyle.Render("Completed successfully."))
-	}
-	if m.summary.Recovered {
-		lines = append(lines, fmt.Sprintf("recovered run: %s -> %s", redactUI(m.summary.PreviousRunID), redactUI(m.summary.RunID)))
-		if len(m.summary.ReusedNodes) > 0 {
-			lines = append(lines, "reused nodes: "+redactUI(strings.Join(m.summary.ReusedNodes, ", ")))
-		}
-		if len(m.summary.RerunNodes) > 0 {
-			lines = append(lines, "rerun nodes: "+redactUI(strings.Join(m.summary.RerunNodes, ", ")))
-		}
-	}
-	if m.summary.RepoPrepared != nil {
-		lines = append(lines, "repo: "+redactUI(m.summary.RepoPrepared.ResolvedCommit))
-		lines = append(lines, subtleStyle.Render("source: "+redactUI(m.summary.RepoPrepared.SourcePath)))
-	}
-	if m.summary.LintReport != nil {
-		lines = append(lines, fmt.Sprintf("lint passed: %v (%d checks)", m.summary.LintReport.Passed, len(m.summary.LintReport.Checks)))
-		for _, check := range m.summary.LintReport.Checks {
-			if check.Status == domain.CheckFail || check.Status == domain.CheckWarn {
-				lines = append(lines, fmt.Sprintf("  %s %s: %s", statusIcon(string(check.Status)), check.ID, redactUI(check.Message)))
-			}
-		}
-	}
-	if m.summary.GenReport != nil {
-		lines = append(lines, fmt.Sprintf("generated task: %s", redactUI(m.summary.GenReport.TaskDir)))
-		lines = append(lines, fmt.Sprintf("proposal: %s", redactUI(m.summary.GenReport.TaskProposal.TaskName)))
-		lines = append(lines, subtleStyle.Render("tests analysis: "+redactUI(m.summary.GenReport.TestsAnalysisPath)))
-	}
-	if m.summary.VerifyReport != nil {
-		lines = append(lines, fmt.Sprintf("verify passed: %v", m.summary.VerifyReport.Passed))
-		lines = append(lines, fmt.Sprintf("initial exposes issue: %v", m.summary.VerifyReport.InitialExposesIssue))
-	}
-	if m.summary.QualityReport != nil {
-		lines = append(lines, fmt.Sprintf("quality passed: %v (%d checks)", m.summary.QualityReport.OverallPass, len(m.summary.QualityReport.Checks)))
-		for _, issue := range m.summary.QualityReport.Issues {
-			lines = append(lines, "  "+failStyle.Render(redactUI(issue)))
-		}
-	}
-	if m.summary.SimilarityReport != nil {
-		lines = append(lines, fmt.Sprintf("similarity passed: %v (max %.3f)", m.summary.SimilarityReport.OverallPass, m.summary.SimilarityReport.MaxScore))
-		for _, issue := range m.summary.SimilarityReport.Issues {
-			lines = append(lines, "  "+failStyle.Render(redactUI(issue)))
-		}
-	}
-	if m.summary.QwenResult != nil {
-		lines = append(lines, fmt.Sprintf("qwen pass@4: %.2f (%d/%d), avg turns %.1f", m.summary.QwenResult.PassAt4, m.summary.QwenResult.PassCount, m.summary.QwenResult.Trials, m.summary.QwenResult.AverageTurns))
-	}
-	if m.summary.OpusResult != nil {
-		lines = append(lines, fmt.Sprintf("opus pass@4: %.2f (%d/%d), avg turns %.1f", m.summary.OpusResult.PassAt4, m.summary.OpusResult.PassCount, m.summary.OpusResult.Trials, m.summary.OpusResult.AverageTurns))
-	}
-	if m.summary.PackageReport != nil {
-		lines = append(lines, fmt.Sprintf("package: %s", redactUI(m.summary.PackageReport.OutputZip)))
-		lines = append(lines, fmt.Sprintf("submission: %s", redactUI(m.summary.PackageReport.ReportPath)))
-	}
-	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
 }
 
 func (m model) lastFailureEvent() (domain.RunnerEvent, bool) {
@@ -2053,25 +1390,26 @@ func failedNodeEvent(event domain.RunnerEvent) bool {
 	return strings.TrimSpace(event.NodeID) != "" && (event.Type == "node_failed" || event.Status == "failed")
 }
 
-func (m model) footer() string {
-	if m.readOnly {
-		return subtleStyle.Render("[1] Overview  [2] Gate/Node  [3] Logs  [4] Done  [d] Detail  [q] Quit  (read-only)")
-	}
-	return subtleStyle.Render("[1] Overview  [2] Gate/Node  [3] Logs  [4] Done  [d] Detail  [x] Cancel model  [q] Quit")
-}
-
 func statusIcon(status string) string {
 	switch status {
 	case "succeeded", string(domain.CheckPass):
-		return passStyle.Render("OK")
-	case "failed", "canceled", string(domain.CheckFail):
-		return failStyle.Render("!!")
+		return passStyle.Render("✓")
+	case "failed", string(domain.CheckFail):
+		return failStyle.Render("✗")
+	case "canceled":
+		return failStyle.Render("⊗")
 	case string(domain.CheckWarn):
-		return warnStyle.Render("!!")
+		return warnStyle.Render("⚠")
 	case "running":
-		return warnStyle.Render("..")
+		return defaultTheme.Focused.Render("◌")
+	case "waiting", "gate_requested":
+		return warnStyle.Render("⚷")
+	case "blocked":
+		return warnStyle.Render("⊘")
+	case "skipped":
+		return subtleStyle.Render("–")
 	default:
-		return subtleStyle.Render("--")
+		return subtleStyle.Render("○")
 	}
 }
 
@@ -2100,7 +1438,7 @@ func (m *model) selectNextNode() {
 	}
 	for i := 1; i <= len(order); i++ {
 		next := order[(current+i)%len(order)]
-		if _, ok := m.nodes[next]; ok {
+		if event, ok := m.nodes[next]; ok && matchesFilter(m.filter, next, localizeNode(next), event.Message, event.Status) {
 			m.selectedNode = next
 			m.selectedArtifact = 0
 			return
@@ -2119,7 +1457,7 @@ func (m *model) selectPrevNode() {
 	}
 	for i := 1; i <= len(order); i++ {
 		next := order[(current-i+len(order))%len(order)]
-		if _, ok := m.nodes[next]; ok {
+		if event, ok := m.nodes[next]; ok && matchesFilter(m.filter, next, localizeNode(next), event.Message, event.Status) {
 			m.selectedNode = next
 			m.selectedArtifact = 0
 			return
@@ -2130,7 +1468,7 @@ func (m *model) selectPrevNode() {
 func (m *model) selectNextArtifact() {
 	switch m.view {
 	case viewLogs:
-		files := m.logArtifacts()
+		files := m.visibleLogArtifacts()
 		if len(files) > 0 {
 			m.selectedLogFile = (m.selectedLogFile + 1) % len(files)
 			m.logFileScroll = 0
@@ -2140,6 +1478,30 @@ func (m *model) selectNextArtifact() {
 		artifacts := m.nodeArtifacts(m.selectedNode)
 		if len(artifacts) > 0 {
 			m.selectedArtifact = (m.selectedArtifact + 1) % len(artifacts)
+			m.detailScroll = 0
+		}
+	}
+}
+
+func (m *model) selectPrevArtifact() {
+	switch m.view {
+	case viewLogs:
+		files := m.visibleLogArtifacts()
+		if len(files) > 0 {
+			m.selectedLogFile = (m.selectedLogFile - 1 + len(files)) % len(files)
+			m.logFileScroll = 0
+			m.logTail = false
+		}
+	case viewNodeDetail:
+		artifacts := m.nodeArtifacts(m.selectedNode)
+		if len(artifacts) > 0 {
+			m.selectedArtifact = (m.selectedArtifact - 1 + len(artifacts)) % len(artifacts)
+			m.detailScroll = 0
+		}
+	case viewGate:
+		artifacts := m.visibleGateArtifacts(m.activeGate)
+		if len(artifacts) > 0 {
+			m.selectedArtifact = (m.selectedArtifact - 1 + len(artifacts)) % len(artifacts)
 		}
 	}
 }
@@ -2179,18 +1541,38 @@ func (m model) selectedNodeArtifact() (domain.ArtifactPreview, bool) {
 }
 
 func (m model) selectedGateArtifact() (int, domain.ArtifactPreview, bool) {
-	if m.activeGate == nil || len(m.activeGate.Artifacts) == 0 {
+	if m.activeGate == nil {
+		return 0, domain.ArtifactPreview{}, false
+	}
+	artifacts := m.visibleGateArtifacts(m.activeGate)
+	if len(artifacts) == 0 {
 		return 0, domain.ArtifactPreview{}, false
 	}
 	idx := m.selectedArtifact
-	if idx < 0 || idx >= len(m.activeGate.Artifacts) {
+	if idx < 0 || idx >= len(artifacts) {
 		idx = 0
 	}
-	return idx, m.activeGate.Artifacts[idx], true
+	return idx, artifacts[idx], true
+}
+
+func (m model) visibleGateArtifacts(gate *domain.GateRequest) []domain.ArtifactPreview {
+	if gate == nil {
+		return nil
+	}
+	if strings.TrimSpace(m.filter) == "" {
+		return gate.Artifacts
+	}
+	artifacts := make([]domain.ArtifactPreview, 0, len(gate.Artifacts))
+	for _, artifact := range gate.Artifacts {
+		if matchesFilter(m.filter, artifact.Name, artifact.Path) {
+			artifacts = append(artifacts, artifact)
+		}
+	}
+	return artifacts
 }
 
 func (m model) selectedLogArtifact() (domain.ArtifactPreview, bool) {
-	files := m.logArtifacts()
+	files := m.visibleLogArtifacts()
 	if len(files) == 0 {
 		return domain.ArtifactPreview{}, false
 	}
@@ -2199,6 +1581,20 @@ func (m model) selectedLogArtifact() (domain.ArtifactPreview, bool) {
 		idx = 0
 	}
 	return files[idx], true
+}
+
+func (m model) visibleLogArtifacts() []domain.ArtifactPreview {
+	files := m.logArtifacts()
+	if strings.TrimSpace(m.filter) == "" {
+		return files
+	}
+	visible := make([]domain.ArtifactPreview, 0, len(files))
+	for _, artifact := range files {
+		if matchesFilter(m.filter, artifact.Name, artifact.Path) {
+			visible = append(visible, artifact)
+		}
+	}
+	return visible
 }
 
 func (m model) nodeArtifacts(nodeID string) []domain.ArtifactPreview {
@@ -2426,12 +1822,20 @@ func readPreview(path string, maxBytes int64) string {
 	if maxBytes <= 0 {
 		maxBytes = 20000
 	}
-	limit := int(maxBytes)
-	data := make([]byte, limit+1)
-	n, _ := file.Read(data)
-	content := string(data[:n])
-	if n > limit {
-		content = content[:limit] + "\n... truncated ..."
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return ""
+	}
+	truncated := int64(len(data)) > maxBytes
+	if truncated {
+		data = data[:maxBytes]
+	}
+	for len(data) > 0 && !utf8.Valid(data) {
+		data = data[:len(data)-1]
+	}
+	content := string(data)
+	if truncated {
+		content += "\n... 内容已截断 ..."
 	}
 	return redactUI(content)
 }
@@ -2462,9 +1866,16 @@ func readPreviewTail(path string, maxBytes int64) string {
 	}
 	data := make([]byte, int(readLen))
 	n, _ := file.ReadAt(data, start)
-	content := string(data[:n])
+	data = data[:n]
 	if truncated {
-		content = "... truncated from start ...\n" + content
+		for len(data) > 0 && !utf8.RuneStart(data[0]) {
+			data = data[1:]
+		}
+	}
+	content := string(data)
+	content = strings.ToValidUTF8(content, "�")
+	if truncated {
+		content = "... 已从开头截断 ...\n" + content
 	}
 	return redactUI(content)
 }
@@ -2633,11 +2044,11 @@ func relativePathWithinRoot(path, root string) (string, bool) {
 }
 
 func unsafeArtifactPathError(path string) error {
-	return fmt.Errorf("artifact path is outside allowed TUI roots: %s", redactUI(path))
+	return fmt.Errorf("工件路径超出允许的 TUI 根目录：%s", redactUI(path))
 }
 
 func nonEditableArtifactPathError(path string) error {
-	return fmt.Errorf("artifact path is not an editable Harbor artifact: %s", redactUI(path))
+	return fmt.Errorf("工件路径不是可编辑的 Harbor 工件：%s", redactUI(path))
 }
 
 func defaultWorkspace(workspace string) string {
@@ -2804,7 +2215,7 @@ func trimLines(content string, maxLines int) string {
 
 func trimLinesFrom(content string, maxLines, offset int) string {
 	if strings.TrimSpace(content) == "" {
-		return subtleStyle.Render("(empty or unavailable)")
+		return subtleStyle.Render("（内容为空或不可用）")
 	}
 	if maxLines <= 0 {
 		maxLines = 1
@@ -2823,11 +2234,11 @@ func trimLinesFrom(content string, maxLines, offset int) string {
 	}
 	out := make([]string, 0, maxLines+2)
 	if offset > 0 {
-		out = append(out, subtleStyle.Render(fmt.Sprintf("... %d lines above ...", offset)))
+		out = append(out, subtleStyle.Render(fmt.Sprintf("... 上方还有 %d 行 ...", offset)))
 	}
 	out = append(out, lines[offset:end]...)
 	if end < len(lines) {
-		out = append(out, subtleStyle.Render(fmt.Sprintf("... %d lines below ...", len(lines)-end)))
+		out = append(out, subtleStyle.Render(fmt.Sprintf("... 下方还有 %d 行 ...", len(lines)-end)))
 	}
 	return strings.Join(out, "\n")
 }
@@ -2901,7 +2312,7 @@ func gateBlockingChecklist(checklist []domain.ChecklistItem) []string {
 				label = strings.TrimSpace(item.ID)
 			}
 			if label == "" {
-				label = "unnamed critical check"
+				label = "检查项"
 			}
 			blockers = append(blockers, redactUI(label))
 		}

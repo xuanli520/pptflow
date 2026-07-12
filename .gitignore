@@ -3,6 +3,8 @@
 .gomodcache
 /dist/
 testdata
+!internal/tui/testdata/
+!internal/tui/testdata/*.golden
 .claude
 .gocache
 artifacts
