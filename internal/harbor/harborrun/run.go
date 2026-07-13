@@ -43,7 +43,32 @@ type Options struct {
 	CacheExec           executor.CommandRunner
 }
 
+type PassPlan struct {
+	Concurrency int
+	Attempts    int
+}
+
+func NormalizePassPlan(concurrency, attempts int) (PassPlan, error) {
+	if attempts == 0 {
+		attempts = domain.RequiredTrialCount
+	}
+	if attempts != domain.RequiredTrialCount {
+		return PassPlan{}, fmt.Errorf("Harbor pass@%d requires exactly %d attempts, got %d", domain.RequiredTrialCount, domain.RequiredTrialCount, attempts)
+	}
+	if concurrency == 0 {
+		concurrency = domain.DefaultHarborConcurrency
+	}
+	maxConcurrency := min(domain.MaxHarborConcurrency, attempts)
+	if concurrency < 1 || concurrency > maxConcurrency {
+		return PassPlan{}, fmt.Errorf("Harbor pass@%d concurrency must be between 1 and %d, got %d", attempts, maxConcurrency, concurrency)
+	}
+	return PassPlan{Concurrency: concurrency, Attempts: attempts}, nil
+}
+
 func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandRun, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.TrialResult{}, domain.CommandRun{}, err
+	}
 	taskPath := strings.TrimSpace(opts.TaskPath)
 	if taskPath == "" {
 		return domain.TrialResult{}, domain.CommandRun{}, fmt.Errorf("task path is required")
@@ -51,6 +76,10 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 	model := strings.TrimSpace(opts.Model)
 	if model == "" {
 		return domain.TrialResult{}, domain.CommandRun{}, fmt.Errorf("model is required")
+	}
+	plan, err := NormalizePassPlan(opts.Concurrency, opts.Attempts)
+	if err != nil {
+		return domain.TrialResult{}, domain.CommandRun{}, err
 	}
 	requestedAgent := strings.TrimSpace(opts.Agent)
 	if requestedAgent == "" {
@@ -106,14 +135,6 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 	if timeout <= 0 {
 		timeout = 2 * time.Hour
 	}
-	concurrency := opts.Concurrency
-	if concurrency <= 0 {
-		concurrency = 1
-	}
-	attempts := opts.Attempts
-	if attempts <= 0 {
-		attempts = 4
-	}
 	preflightPath := ""
 	schemaPreflightPath := ""
 	preflightResultPath := ""
@@ -165,7 +186,7 @@ func Run(ctx context.Context, opts Options) (domain.TrialResult, domain.CommandR
 	}
 	start := time.Now().UTC()
 	args := appendCacheMount(harborArgs(taskPath, agent, model, jobsDir, agentEnvArgs), cacheMount)
-	args = append(args, "--yes", "-n", fmt.Sprintf("%d", concurrency), "-k", fmt.Sprintf("%d", attempts))
+	args = append(args, "--yes", "-n", fmt.Sprintf("%d", plan.Concurrency), "-k", fmt.Sprintf("%d", plan.Attempts))
 	if infraRetries > 0 {
 		args = append(args,
 			"--max-retries", fmt.Sprintf("%d", infraRetries),
@@ -426,13 +447,20 @@ func executeHarborCommand(ctx context.Context, exec executor.CommandRunner, time
 
 func validateRunCompletion(result domain.TrialResult) []string {
 	var failures []string
-	if result.Trials != 4 {
-		failures = append(failures, fmt.Sprintf("harbor result must contain 4 trials, got %d", result.Trials))
+	if result.Trials != domain.RequiredTrialCount {
+		failures = append(failures, fmt.Sprintf("harbor result must contain %d trials, got %d", domain.RequiredTrialCount, result.Trials))
 	}
-	if len(result.Runs) != 4 {
-		failures = append(failures, fmt.Sprintf("harbor result runs must contain 4 records, got %d", len(result.Runs)))
+	if len(result.Runs) != domain.RequiredTrialCount {
+		failures = append(failures, fmt.Sprintf("harbor result runs must contain %d records, got %d", domain.RequiredTrialCount, len(result.Runs)))
 	}
+	seen := make(map[int]bool, len(result.Runs))
 	for _, run := range result.Runs {
+		if run.Trial < 1 || run.Trial > domain.RequiredTrialCount {
+			failures = append(failures, fmt.Sprintf("harbor trial number must be between 1 and %d, got %d", domain.RequiredTrialCount, run.Trial))
+		} else if seen[run.Trial] {
+			failures = append(failures, fmt.Sprintf("harbor result contains duplicate trial %d", run.Trial))
+		}
+		seen[run.Trial] = true
 		if strings.TrimSpace(run.FailureReason) != "" {
 			failures = append(failures, fmt.Sprintf("harbor trial %d errored: %s", run.Trial, compactDiagnostic(run.FailureReason, 600)))
 		}

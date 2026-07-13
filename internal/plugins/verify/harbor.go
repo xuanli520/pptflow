@@ -1,6 +1,7 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/commandlog"
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/evidence"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 	"github.com/purplevoid/harbor-factory/internal/plugins/pluginutil"
@@ -44,7 +46,11 @@ func validateHarborSpec(spec workflow.NodeSpec) error {
 	if err := pluginutil.RequiredString(spec, "task_dir"); err != nil {
 		return err
 	}
-	return pluginutil.RequiredString(spec, "model")
+	if err := pluginutil.RequiredString(spec, "model"); err != nil {
+		return err
+	}
+	_, err := harborrun.NormalizePassPlan(pluginutil.IntValue(spec.Config["concurrency"]), pluginutil.IntValue(spec.Config["attempts"]))
+	return err
 }
 
 func (HarborRunQwenPlugin) Execute(ctx context.Context, req workflow.NodeRequest) (workflow.NodeResult, error) {
@@ -74,6 +80,10 @@ func executeHarbor(ctx context.Context, req workflow.NodeRequest, slot string) (
 			return workflow.NodeResult{}, err
 		}
 	}
+	plan, err := harborrun.NormalizePassPlan(pluginutil.Int(req, "concurrency"), pluginutil.Int(req, "attempts"))
+	if err != nil {
+		return workflow.NodeResult{}, workflow.NewNodeError(workflow.FailurePermanent, false, "validate Harbor "+slot+" pass settings", err)
+	}
 	evaluation, runErr := req.Runtimes.Evaluation.Evaluate(ctx, workflow.EvaluationRequest{
 		NodeID:              req.Spec.ID,
 		TaskPath:            pluginutil.String(req, "task_dir"),
@@ -85,8 +95,8 @@ func executeHarbor(ctx context.Context, req workflow.NodeRequest, slot string) (
 		SetupTimeoutSeconds: pluginutil.Int(req, "setup_timeout_seconds"),
 		AgentCacheDir:       pluginutil.String(req, "agent_cache_dir"),
 		Preflight:           pluginutil.Bool(req, "preflight"),
-		Concurrency:         pluginutil.Int(req, "concurrency"),
-		Attempts:            4,
+		Concurrency:         plan.Concurrency,
+		Attempts:            plan.Attempts,
 		InfraRetries:        pluginutil.Int(req, "infra_retries"),
 		Env:                 pluginutil.Strings(req, "env"),
 		Progress: func(line, source string) {
@@ -162,6 +172,7 @@ func storeEvaluation(ctx context.Context, req workflow.NodeRequest, trial domain
 	commandName := base + "/command_run.json"
 	stdoutName := base + "/stdout.txt"
 	stderrName := base + "/stderr.txt"
+	screenshotName := base + "/pass4_evidence.png"
 	primaryPath, err := req.Store.Path(primaryName)
 	if err != nil {
 		return nil, err
@@ -186,15 +197,41 @@ func storeEvaluation(ctx context.Context, req workflow.NodeRequest, trial domain
 	}
 	trial.ResultPath = primaryPath
 	trial.CommandRunPath = commandPath
+	screenshotPath, err := req.Store.Path(screenshotName)
+	if err != nil {
+		return []workflow.ArtifactRef{commandRef, stdoutRef, stderrRef}, err
+	}
+	trial.Screenshot = filepath.Base(screenshotPath)
+	expectedModel := pluginutil.String(req, "model")
+	expectedAgent := pluginutil.String(req, "agent")
+	strictFailures := harborrun.ValidateForCodeEdgeWithOptions(trial, harborrun.ValidationOptions{
+		Qwen: strings.Contains(strings.ToLower(req.Spec.ID), "qwen"), ExpectedModel: expectedModel, ExpectedAgent: expectedAgent,
+		TaskDir: pluginutil.String(req, "task_dir"), RequireRuns: true, RequireTaskDigest: true, RequireCommandRun: true,
+	})
+	verified := command.Passed && !command.Timeout && validateEvaluationResult(trial, expectedModel) == nil && len(strictFailures) == 0
+	screenshotPNG, err := evidence.RenderPassAt4PNGWithStatus(req.Spec.ID, trial, evidence.RenderStatus{
+		Verified: verified, RawResultSHA256: trial.RawResultSHA256, CommandEvidenceSHA: commandRef.SHA256,
+	})
+	if err != nil {
+		return []workflow.ArtifactRef{commandRef, stdoutRef, stderrRef}, fmt.Errorf("render Harbor pass@4 screenshot: %w", err)
+	}
+	screenshotRef, err := req.Store.Put(ctx, workflow.PutArtifactRequest{
+		Name: screenshotName, Type: "pass4_screenshot", Producer: req.Spec.ID,
+		Metadata: map[string]string{"model": trial.Model, "trials": fmt.Sprintf("%d", trial.Trials)},
+		Content:  bytes.NewReader(screenshotPNG),
+	})
+	if err != nil {
+		return []workflow.ArtifactRef{commandRef, stdoutRef, stderrRef}, fmt.Errorf("store Harbor pass@4 screenshot: %w", err)
+	}
 	primaryRef, err := req.Store.PutJSON(ctx, primaryName, "trial_result", req.Spec.ID, trial)
 	if err != nil {
-		return []workflow.ArtifactRef{commandRef, stdoutRef, stderrRef}, fmt.Errorf("store Harbor primary result: %w", err)
+		return []workflow.ArtifactRef{screenshotRef, commandRef, stdoutRef, stderrRef}, fmt.Errorf("store Harbor primary result: %w", err)
 	}
 	trialRef, err := req.Store.PutJSON(ctx, trialName, "trial_result", req.Spec.ID, trial)
 	if err != nil {
-		return []workflow.ArtifactRef{primaryRef, commandRef, stdoutRef, stderrRef}, fmt.Errorf("store Harbor normalized result: %w", err)
+		return []workflow.ArtifactRef{primaryRef, screenshotRef, commandRef, stdoutRef, stderrRef}, fmt.Errorf("store Harbor normalized result: %w", err)
 	}
-	return []workflow.ArtifactRef{primaryRef, trialRef, commandRef, stdoutRef, stderrRef}, nil
+	return []workflow.ArtifactRef{primaryRef, trialRef, screenshotRef, commandRef, stdoutRef, stderrRef}, nil
 }
 
 func validateEvaluationResult(result domain.TrialResult, expectedModel string) error {

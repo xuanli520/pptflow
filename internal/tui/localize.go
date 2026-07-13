@@ -109,6 +109,14 @@ func localizeEventType(eventType string) string {
 		return "节点成功"
 	case "node_failed":
 		return "节点失败"
+	case "node_canceled":
+		return "节点已取消"
+	case "node_skipped":
+		return "节点已跳过"
+	case "node_requeued":
+		return "节点等待重新执行"
+	case "node_reused":
+		return "已复用节点结果"
 	case "gate_requested":
 		return "等待审查"
 	case "run_succeeded":

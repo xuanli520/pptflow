@@ -50,6 +50,10 @@ func Int(req workflow.NodeRequest, key string) int {
 	if !ok {
 		value = req.Spec.Config[key]
 	}
+	return IntValue(value)
+}
+
+func IntValue(value any) int {
 	switch typed := value.(type) {
 	case int:
 		return typed

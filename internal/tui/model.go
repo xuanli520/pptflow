@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/commandlog"
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
@@ -106,6 +107,7 @@ type model struct {
 	opts        app.RunnerOptions
 	runtimeOpts app.RunnerOptions
 	store       *store.Store
+	scheduler   *app.TaskScheduler
 
 	hubRoot       string
 	hubScanRoots  []string
@@ -247,12 +249,7 @@ func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts 
 	}
 	opts.AutoApprove = false
 	summary, events := loadWorkspaceState(defaultWorkspace(opts.Workspace))
-	nodes := map[string]domain.RunnerEvent{}
-	for _, event := range events {
-		if event.NodeID != "" {
-			nodes[event.NodeID] = event
-		}
-	}
+	nodes := reduceNodeEvents(events)
 	activeGate := activeGateFromSnapshot(summary, events, nodes)
 	selected := ""
 	for _, id := range nodeOrder() {
@@ -368,6 +365,10 @@ func (m model) updateStartKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.launchStartWorkflow()
+	case "ctrl+b":
+		if m.startStep == startStepAdvanced {
+			return m.launchStartWorkflowInBackground()
+		}
 	default:
 		if isTextStartField(m.startField) {
 			return m, m.updateFocusedStartInput(msg)
@@ -388,6 +389,32 @@ func (m model) launchStartWorkflow() (tea.Model, tea.Cmd) {
 	}
 	m = m.startRunner(opts)
 	return m, tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
+}
+
+func (m model) launchStartWorkflowInBackground() (tea.Model, tea.Cmd) {
+	if m.scheduler == nil {
+		m.err = fmt.Errorf("并行任务调度器不可用")
+		return m, nil
+	}
+	if err := m.validateDirtyStartInputs(); err != nil {
+		m.err = err
+		return m, nil
+	}
+	opts, err := m.startOptions()
+	if err != nil {
+		m.err = err
+		return m, nil
+	}
+	if _, err := m.scheduler.Submit(opts); err != nil {
+		m.err = err
+		return m, nil
+	}
+	m.runner = nil
+	m.err = nil
+	m.notice = "任务已加入并行队列：" + opts.Workspace
+	m.setView(viewHub)
+	m.hubLoading = true
+	return m, tea.Batch(m.showToast("任务已加入并行队列", toastSuccess), m.loadHub(true))
 }
 
 func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -630,6 +657,9 @@ func (m model) makeGateDecision(approved bool) domain.GateDecision {
 }
 
 func (m model) cancelRun() {
+	if m.scheduler != nil && m.scheduler.CancelWorkspace(m.opts.Workspace) {
+		return
+	}
 	if m.cancel != nil {
 		m.cancel()
 	}
@@ -805,7 +835,7 @@ func (m model) refreshWorkspace() tea.Cmd {
 func (m *model) applyRunnerEvent(event domain.RunnerEvent) {
 	m.events = append(m.events, event)
 	if event.NodeID != "" {
-		m.nodes[event.NodeID] = event
+		m.nodes[event.NodeID] = mergeNodeEvent(m.nodes[event.NodeID], event)
 		if m.selectedNode == "" {
 			m.selectedNode = event.NodeID
 		}
@@ -834,12 +864,7 @@ func (m *model) applyWorkspaceSnapshot(summary domain.RunSummary, events []domai
 	previousGate := m.activeGate
 	m.summary = summary
 	m.events = events
-	m.nodes = map[string]domain.RunnerEvent{}
-	for _, event := range events {
-		if event.NodeID != "" {
-			m.nodes[event.NodeID] = event
-		}
-	}
+	m.nodes = reduceNodeEvents(events)
 	nextGate := activeGateFromSnapshot(summary, events, m.nodes)
 	if !sameGateIdentity(previousGate, nextGate) {
 		m.resetGateLocalState()
@@ -952,12 +977,12 @@ func (m model) header() string {
 	title := titleStyle.Render("Harbor 出题工坊")
 	context := ""
 	if m.view == viewHub {
-		context = redactUI(fmt.Sprintf("工作区根=%s  已索引=%d", emptyDash(m.hubRoot), len(m.hubItems)))
+		context = redactSingleLineUI(fmt.Sprintf("工作区根=%s  已索引=%d", emptyDash(m.hubRoot), len(m.hubItems)))
 	} else {
-		context = redactUI(fmt.Sprintf("工作区=%s 任务=%s 仓库=%s", emptyDash(m.opts.Workspace), emptyDash(m.opts.TaskDir), emptyDash(m.opts.RepoURL)))
+		context = redactSingleLineUI(fmt.Sprintf("工作区=%s 任务=%s 仓库=%s", emptyDash(m.opts.Workspace), emptyDash(m.opts.TaskDir), emptyDash(m.opts.RepoURL)))
 	}
 	if m.width > 0 {
-		context = truncateDisplay(context, maxInt(20, m.width))
+		context = truncateDisplay(context, m.width)
 	}
 	contextLine := subtleStyle.Render(context)
 	return lipgloss.JoinVertical(lipgloss.Left, title, contextLine)
@@ -1128,7 +1153,7 @@ func applyStartDefaults(opts app.RunnerOptions) app.RunnerOptions {
 		opts.HarborSetupTimeout = 1200
 	}
 	if opts.HarborConcurrency == 0 {
-		opts.HarborConcurrency = 1
+		opts.HarborConcurrency = domain.DefaultHarborConcurrency
 	}
 	if opts.HarborAttempts == 0 {
 		opts.HarborAttempts = 4
@@ -1198,6 +1223,10 @@ func (m *model) setStartInt(field startField, value string) {
 	}
 	if parsed < 0 {
 		m.err = fmt.Errorf("%s不能为负数", startFieldName(field))
+		return
+	}
+	if err := validateStartHarborPassInt(field, parsed); err != nil {
+		m.err = err
 		return
 	}
 	switch field {
@@ -1497,25 +1526,49 @@ func failedNodeEvent(event domain.RunnerEvent) bool {
 }
 
 func statusIcon(status string) string {
+	glyph := statusGlyph(status)
 	switch status {
 	case "succeeded", string(domain.CheckPass):
-		return passStyle.Render("✓")
+		return passStyle.Render(glyph)
 	case "failed", string(domain.CheckFail):
-		return failStyle.Render("✗")
+		return failStyle.Render(glyph)
 	case "canceled":
-		return failStyle.Render("⊗")
+		return failStyle.Render(glyph)
 	case string(domain.CheckWarn):
-		return warnStyle.Render("⚠")
+		return warnStyle.Render(glyph)
 	case "running":
-		return defaultTheme.Focused.Render("◌")
+		return defaultTheme.Focused.Render(glyph)
 	case "waiting", "gate_requested":
-		return warnStyle.Render("⚷")
+		return warnStyle.Render(glyph)
 	case "blocked":
-		return warnStyle.Render("⊘")
+		return warnStyle.Render(glyph)
 	case "skipped":
-		return subtleStyle.Render("–")
+		return subtleStyle.Render(glyph)
 	default:
-		return subtleStyle.Render("○")
+		return subtleStyle.Render(glyph)
+	}
+}
+
+func statusGlyph(status string) string {
+	switch status {
+	case "succeeded", string(domain.CheckPass):
+		return "✓"
+	case "failed", string(domain.CheckFail):
+		return "✗"
+	case "canceled":
+		return "⊗"
+	case string(domain.CheckWarn):
+		return "⚠"
+	case "running":
+		return "◌"
+	case "waiting", "gate_requested":
+		return "⚷"
+	case "blocked":
+		return "⊘"
+	case "skipped":
+		return "–"
+	default:
+		return "○"
 	}
 }
 
@@ -1527,10 +1580,10 @@ func emptyDash(value string) string {
 }
 
 func contentWidth(width int) int {
-	if width < 20 {
+	if width <= 0 {
 		return 20
 	}
-	return width - 4
+	return maxInt(1, width-4)
 }
 
 func (m *model) selectNextNode() {
@@ -2277,7 +2330,18 @@ func marshalEventPreview(events []domain.RunnerEvent) string {
 }
 
 func redactUI(text string) string {
-	return commandlog.RedactText(text)
+	text = ansi.Strip(commandlog.RedactText(text))
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || r >= 0x20 && r != 0x7f {
+			return r
+		}
+		return -1
+	}, text)
+}
+
+func redactSingleLineUI(text string) string {
+	text = redactUI(text)
+	return strings.NewReplacer("\n", " ", "\t", " ").Replace(text)
 }
 
 func detailPreviewLines(height int) int {

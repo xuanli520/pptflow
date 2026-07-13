@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/evidence"
 )
 
 func writeTUITestFile(t *testing.T, name, content string) string {
@@ -23,6 +24,24 @@ func writeTUITestFile(t *testing.T, name, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeTUITestScreenshot(t *testing.T, path, slot, model string, passCount int) {
+	t.Helper()
+	runs := make([]domain.TrialRun, domain.RequiredTrialCount)
+	for i := range runs {
+		runs[i] = domain.TrialRun{Trial: i + 1, Passed: i < passCount, Turns: 20 + i}
+	}
+	pngData, err := evidence.RenderPassAt4PNG(slot, domain.TrialResult{
+		Model: model, Trials: domain.RequiredTrialCount, PassCount: passCount,
+		PassAt4: float64(passCount) / domain.RequiredTrialCount, AverageTurns: 21.5, Runs: runs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, pngData, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func submitStartForm(m model) (tea.Model, tea.Cmd) {
@@ -248,12 +267,8 @@ func TestStartFormLaunchesPackageWithResultScreenshotFallback(t *testing.T) {
 	resultDir := t.TempDir()
 	qwen := filepath.Join(resultDir, "qwen.json")
 	opus := filepath.Join(resultDir, "opus.json")
-	if err := os.WriteFile(filepath.Join(resultDir, "qwen.png"), []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(resultDir, "opus.png"), []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeTUITestScreenshot(t, filepath.Join(resultDir, "qwen.png"), "harbor_run_qwen", "qwen3.7-max", 1)
+	writeTUITestScreenshot(t, filepath.Join(resultDir, "opus.png"), "harbor_run_opus", "claude-opus-4-6", 3)
 	if err := os.WriteFile(qwen, []byte(`{"model":"qwen3.7-max","screenshot":"qwen.png"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}

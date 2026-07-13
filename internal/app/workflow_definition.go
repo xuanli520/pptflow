@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/packager"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
@@ -24,6 +25,12 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 	if taskDir == "" {
 		return workflow.WorkflowDefinition{}, fmt.Errorf("task directory is required")
 	}
+	passPlan, err := harborrun.NormalizePassPlan(opts.HarborConcurrency, opts.HarborAttempts)
+	if err != nil {
+		return workflow.WorkflowDefinition{}, fmt.Errorf("invalid Harbor pass settings: %w", err)
+	}
+	opts.HarborConcurrency = passPlan.Concurrency
+	opts.HarborAttempts = passPlan.Attempts
 
 	definition := workflow.WorkflowDefinition{ID: harborWorkflowID, Name: "Harbor Task Factory", Policy: workflow.Policy{MaxNodes: 40, MaxRevisions: 5}}
 	add := func(spec workflow.NodeSpec) {
@@ -171,6 +178,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		chain(nodes.HarborRunQwen, "harborfactory.harbor_run_qwen", []string{nodes.FinalReview}, opts.HarborTimeout, 1, config)
 		resultDeps = append(resultDeps, nodes.HarborRunQwen)
 		resultEvidence = append(resultEvidence, artifact("phase3/artifacts/harbor_run_qwen/qwen_result.json", "trial_result", nodes.HarborRunQwen))
+		resultEvidence = append(resultEvidence, artifact("phase3/artifacts/harbor_run_qwen/pass4_evidence.png", "pass4_screenshot", nodes.HarborRunQwen))
 	}
 	if opusProvided || (runHarbor && runOpus) {
 		config := harborConfig(opts, taskDir, nodes.HarborRunOpus, defaultString(opts.OpusModel, domain.DefaultOpusModel))
@@ -178,6 +186,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		chain(nodes.HarborRunOpus, "harborfactory.harbor_run_opus", []string{nodes.FinalReview}, opts.HarborTimeout, 1, config)
 		resultDeps = append(resultDeps, nodes.HarborRunOpus)
 		resultEvidence = append(resultEvidence, artifact("phase3/artifacts/harbor_run_opus/opus_result.json", "trial_result", nodes.HarborRunOpus))
+		resultEvidence = append(resultEvidence, artifact("phase3/artifacts/harbor_run_opus/pass4_evidence.png", "pass4_screenshot", nodes.HarborRunOpus))
 	}
 	needResultReview := runHarbor || qwenProvided || opusProvided || opts.Package
 	submissionDependency := nodes.FinalReview

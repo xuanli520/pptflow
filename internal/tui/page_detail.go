@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type detailPage struct{ pageBase }
@@ -94,16 +95,22 @@ func (p *detailPage) View(width, height int) string {
 func (m model) nodeDetailView() string {
 	lines := []string{sectionStyle.Render("节点详情")}
 	if strings.TrimSpace(m.filter) != "" {
-		lines = append(lines, defaultTheme.Focused.Render("筛选："+redactUI(m.filter)))
+		lines = append(lines, defaultTheme.Focused.Render("筛选："+redactSingleLineUI(m.filter)))
 	}
 	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(localizeRuntimeError(m.err))))
+		lines = append(lines, failStyle.Render(redactSingleLineUI(localizeRuntimeError(m.err))))
 	}
 	if len(m.nodes) == 0 {
 		lines = append(lines, subtleStyle.Render("暂无节点事件"))
 		return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
 	}
 	layout := layoutFor(m.width, m.height)
+	nodeLineWidth := styleContentWidth(contentWidth(m.width), panelStyle)
+	artifactLineWidth := nodeLineWidth
+	if layout.Mode == layoutWide || layout.Mode == layoutMedium {
+		nodeLineWidth = maxInt(1, layout.SidebarWidth-2)
+		artifactLineWidth = styleContentWidth(maxInt(24, layout.MainWidth-3), lipgloss.NewStyle().PaddingLeft(2))
+	}
 	nodeLines := []string{sectionStyle.Render("节点")}
 	selectedLine := 0
 	for _, id := range nodeOrder() {
@@ -119,9 +126,9 @@ func (m model) nodeDetailView() string {
 			prefix = "> "
 			selectedLine = len(nodeLines)
 		}
-		nodeLines = append(nodeLines, fmt.Sprintf("%s%s %s (%s) %s", prefix, statusIcon(event.Status), localizeNode(id), id, redactUI(event.Message)))
+		nodeLines = append(nodeLines, clipDisplay(fmt.Sprintf("%s%s %s (%s) %s", prefix, statusIcon(event.Status), localizeNode(id), id, redactSingleLineUI(event.Message)), nodeLineWidth))
 		if id == m.selectedNode && event.Path != "" {
-			nodeLines = append(nodeLines, subtleStyle.Render("    "+redactUI(event.Path)))
+			nodeLines = append(nodeLines, subtleStyle.Render(clipDisplay("    "+redactSingleLineUI(event.Path), nodeLineWidth)))
 		}
 	}
 	nodeLimit := 12
@@ -141,8 +148,8 @@ func (m model) nodeDetailView() string {
 			idx = 0
 		}
 		artifact := artifacts[idx]
-		artifactLines = append(artifactLines, sectionStyle.Render(fmt.Sprintf("%d/%d：%s", idx+1, len(artifacts), redactUI(artifact.Name))))
-		artifactLines = append(artifactLines, subtleStyle.Render(redactUI(artifact.Path)))
+		artifactLines = append(artifactLines, sectionStyle.Render(clipDisplay(fmt.Sprintf("%d/%d：%s", idx+1, len(artifacts), redactSingleLineUI(artifact.Name)), artifactLineWidth)))
+		artifactLines = append(artifactLines, subtleStyle.Render(clipDisplay(redactSingleLineUI(artifact.Path), artifactLineWidth)))
 		m.syncDetailViewport()
 		if layout.Mode == layoutWide || layout.Mode == layoutMedium {
 			m.detailViewport.Width = maxInt(24, layout.MainWidth-7)

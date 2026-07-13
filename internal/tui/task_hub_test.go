@@ -30,7 +30,7 @@ func TestRunWithOptionsDefaultsToTaskHub(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := captured.(model)
-	if got.view != viewHub || got.runner != nil || got.store == nil || got.hubRoot != root {
+	if got.view != viewHub || got.runner != nil || got.store == nil || got.scheduler == nil || got.scheduler.Snapshot().Limit != app.MaxTaskConcurrency || got.hubRoot != root {
 		t.Fatalf("default TUI did not open Task Hub: view=%v runner=%v root=%q", got.view, got.runner, got.hubRoot)
 	}
 }
@@ -142,6 +142,76 @@ func TestHubRerunCloneStartsNewRunnerWithSelectedConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(target, "run_options.json")); err != nil {
 		t.Fatalf("cloned options missing: %v", err)
+	}
+}
+
+func TestHubBackgroundRerunReturnsToHubAndUsesScheduler(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspaces", "source-background")
+	writeHubWorkspace(t, workspace, domain.RunSummary{RunID: "source-run", Workspace: workspace, Status: "failed", FinishedAt: time.Now()}, app.RunnerOptions{Workspace: workspace, TaskDir: t.TempDir(), TaskName: "source-background"})
+	m, cleanup := testHubModel(t, root)
+	defer cleanup()
+	scheduler, err := app.NewTaskScheduler(m.ctx, app.MaxTaskConcurrency)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scheduler.Close()
+	m.scheduler = scheduler
+	loaded := m.loadHub(true)().(hubLoadedMsg)
+	m.applyHubItems(loaded.items)
+	m.openRunConfigForSelected()
+	target := filepath.Join(root, "workspaces", "source-background-retry")
+	m.runConfig.Target.SetValue(target)
+	m.runConfig.Background = true
+	cmd := m.updateRunConfigKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("background rerun did not prepare clone")
+	}
+	prepared := cmd().(clonePreparedMsg)
+	if prepared.err != nil || !prepared.background {
+		t.Fatalf("background clone = %+v", prepared)
+	}
+	updated, refresh := m.Update(prepared)
+	queued := updated.(model)
+	if queued.view != viewHub || queued.runner != nil || refresh == nil {
+		t.Fatalf("background rerun did not return to Hub: view=%v runner=%v cmd=%v", queued.view, queued.runner, refresh)
+	}
+	snapshot := scheduler.Snapshot()
+	if len(snapshot.Tasks) != 1 || snapshot.Tasks[0].Workspace != target || snapshot.Limit != app.MaxTaskConcurrency {
+		t.Fatalf("scheduled task snapshot = %+v", snapshot)
+	}
+	if view := queued.hubView(); !strings.Contains(view, "并行任务") || !strings.Contains(view, "/10") {
+		t.Fatalf("Hub does not expose scheduler capacity: %s", view)
+	}
+}
+
+func TestStartFormCtrlBQueuesTaskAndAllowsAnotherCreation(t *testing.T) {
+	root := t.TempDir()
+	hub, cleanup := testHubModel(t, root)
+	defer cleanup()
+	scheduler, err := app.NewTaskScheduler(hub.ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scheduler.Close()
+	hub.scheduler = scheduler
+	opts := app.RunnerOptions{
+		Workspace: filepath.Join(root, "workspaces", "background-start"),
+		TaskDir:   t.TempDir(),
+		TaskName:  "background-start",
+	}
+	m := hub.attachHubContext(initialStartModel(hub.ctx, hub.cancel, opts))
+	m.startStep = startStepAdvanced
+	updated, cmd := m.updateStartKey(tea.KeyMsg{Type: tea.KeyCtrlB})
+	queued := updated.(model)
+	if queued.view != viewHub || queued.runner != nil || cmd == nil {
+		t.Fatalf("Ctrl+B did not queue and return to Hub: view=%v runner=%v cmd=%v err=%v", queued.view, queued.runner, cmd, queued.err)
+	}
+	if len(scheduler.Snapshot().Tasks) != 1 {
+		t.Fatalf("Ctrl+B scheduled tasks = %+v", scheduler.Snapshot())
+	}
+	if next := queued.openStartFromHubSelection(); next != nil || queued.view != viewStart {
+		t.Fatalf("parallel task prevented creating another task: view=%v cmd=%v", queued.view, next)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/evidence"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/repourl"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
@@ -150,10 +151,31 @@ func Run(ctx context.Context, opts Options) (domain.LintReport, error) {
 	checkTestsAnalysis(&report, opts.TestsAnalysis, opts.StrictSubmission)
 	checkHarborResult(&report, "qwen_result", opts.QwenResult, taskDir, true, opts.StrictSubmission)
 	checkHarborResult(&report, "opus_result", opts.OpusResult, taskDir, false, opts.StrictSubmission)
-	checkScreenshot(&report, "qwen_screenshot", opts.QwenScreenshot, opts.StrictSubmission)
-	checkScreenshot(&report, "opus_screenshot", opts.OpusScreenshot, opts.StrictSubmission)
-	checkDistinctScreenshots(&report, opts.QwenScreenshot, opts.OpusScreenshot, opts.StrictSubmission)
+	qwenScreenshot := resolveResultScreenshot(opts.QwenScreenshot, opts.QwenResult)
+	opusScreenshot := resolveResultScreenshot(opts.OpusScreenshot, opts.OpusResult)
+	checkScreenshot(&report, "qwen_screenshot", qwenScreenshot, opts.StrictSubmission)
+	checkScreenshot(&report, "opus_screenshot", opusScreenshot, opts.StrictSubmission)
+	checkDistinctScreenshots(&report, qwenScreenshot, opusScreenshot, opts.StrictSubmission)
 	return finish(report, opts.WriteReport)
+}
+
+func resolveResultScreenshot(explicit, resultPath string) string {
+	if explicit = strings.TrimSpace(explicit); explicit != "" {
+		return explicit
+	}
+	resultPath = strings.TrimSpace(resultPath)
+	if resultPath == "" {
+		return ""
+	}
+	result, err := harborrun.ParseFile(resultPath)
+	if err != nil {
+		return ""
+	}
+	screenshot := strings.TrimSpace(result.Screenshot)
+	if screenshot != "" && !filepath.IsAbs(screenshot) {
+		screenshot = filepath.Join(filepath.Dir(resultPath), screenshot)
+	}
+	return screenshot
 }
 
 func checkTaskSecrets(report *domain.LintReport, taskDir string) {
@@ -1481,15 +1503,11 @@ func checkScreenshot(report *domain.LintReport, id, path string, strict bool) {
 		report.Add(id, domain.CheckFail, "pass@4 screenshot path is not a readable file", path)
 		return
 	}
-	if info.Size() == 0 {
-		report.Add(id, domain.CheckFail, "pass@4 screenshot file is empty", path)
+	if err := evidence.ValidateImageFile(path); err != nil {
+		report.Add(id, domain.CheckFail, "pass@4 screenshot is not a valid image: "+err.Error(), path)
 		return
 	}
-	if !isScreenshotExtension(path) {
-		report.Add(id, domain.CheckFail, "pass@4 screenshot must be a png, jpg, jpeg, or webp file", path)
-		return
-	}
-	report.Add(id, domain.CheckPass, "pass@4 screenshot file exists and has an image extension", path)
+	report.Add(id, domain.CheckPass, "pass@4 screenshot is a readable image with valid dimensions", path)
 }
 
 func checkDistinctScreenshots(report *domain.LintReport, qwenPath, opusPath string, strict bool) {
@@ -1499,13 +1517,16 @@ func checkDistinctScreenshots(report *domain.LintReport, qwenPath, opusPath stri
 		report.Add("screenshots_distinct", submissionStatus(strict), "both pass@4 screenshot paths are required to compare distinct evidence", "")
 		return
 	}
-	qwenAbs, qwenErr := filepath.Abs(qwenPath)
-	opusAbs, opusErr := filepath.Abs(opusPath)
-	if qwenErr == nil && opusErr == nil && qwenAbs == opusAbs {
-		report.Add("screenshots_distinct", domain.CheckFail, "Qwen and Opus pass@4 screenshots must be distinct files", qwenPath)
+	same, err := evidence.SameFileContent(qwenPath, opusPath)
+	if err != nil {
+		report.Add("screenshots_distinct", domain.CheckFail, "pass@4 screenshots cannot be compared: "+err.Error(), "")
 		return
 	}
-	report.Add("screenshots_distinct", domain.CheckPass, "Qwen and Opus pass@4 screenshot paths are distinct", "")
+	if same {
+		report.Add("screenshots_distinct", domain.CheckFail, "Qwen and Opus pass@4 screenshots must contain distinct evidence", qwenPath)
+		return
+	}
+	report.Add("screenshots_distinct", domain.CheckPass, "Qwen and Opus pass@4 screenshots contain distinct evidence", "")
 }
 
 func readLower(report *domain.LintReport, id, path string) string {
@@ -1647,15 +1668,6 @@ func isGitCheckoutLine(line string) bool {
 
 func isLikelyGitURL(value string) bool {
 	return filepath.IsAbs(value) || strings.Contains(value, "://") || strings.HasPrefix(value, "git@") || strings.Contains(value, "github.com/")
-}
-
-func isScreenshotExtension(path string) bool {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".png", ".jpg", ".jpeg", ".webp":
-		return true
-	default:
-		return false
-	}
 }
 
 func sortedKeys(values map[string]bool) []string {

@@ -12,6 +12,7 @@ func newTUICommand() *cobra.Command {
 	var opts app.RunnerOptions
 	var workspaceRoot string
 	var rescan bool
+	var taskConcurrency int
 	cmd := &cobra.Command{
 		Use:   "tui",
 		Short: "Open the interactive Harbor factory TUI",
@@ -28,12 +29,14 @@ func newTUICommand() *cobra.Command {
 				WorkspaceRoot:     workspaceRoot,
 				WorkspaceExplicit: cmd.Flags().Changed("workspace"),
 				Rescan:            rescan,
+				TaskConcurrency:   taskConcurrency,
 			})
 		},
 	}
 	addRunnerFlags(cmd, &opts)
 	cmd.Flags().StringVar(&workspaceRoot, "workspace-root", ".harbor-factory", "Root directory for workspace history and the Task Hub index")
 	cmd.Flags().BoolVar(&rescan, "rescan", false, "Rebuild the Task Hub index from workspace files before opening")
+	cmd.Flags().IntVar(&taskConcurrency, "task-concurrency", app.MaxTaskConcurrency, "Maximum parallel TUI tasks (1-10)")
 	if flag := cmd.Flags().Lookup("auto-approve"); flag != nil {
 		flag.Hidden = true
 	}

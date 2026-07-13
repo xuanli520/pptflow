@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/executor"
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/evidence"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/packager"
@@ -277,6 +279,43 @@ func TestSaveRunnerOptionsPersistsResumableSnapshotWithoutSecrets(t *testing.T) 
 	}
 	if !loadedSnapshot.HarborAgentEnvOmitted || len(loadedSnapshot.HarborAgentEnvKeys) != 2 {
 		t.Fatalf("loaded snapshot missing env omission metadata: %+v", loadedSnapshot)
+	}
+}
+
+func TestSaveRunnerOptionsPersistsParallelPassDefaults(t *testing.T) {
+	workspace := t.TempDir()
+	snapshot, err := SaveRunnerOptions(RunnerOptions{Workspace: workspace, TaskDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.HarborConcurrency != domain.DefaultHarborConcurrency || snapshot.HarborAttempts != domain.RequiredTrialCount {
+		t.Fatalf("snapshot did not normalize Harbor pass defaults: %+v", snapshot)
+	}
+	loaded, _, err := LoadRunnerOptions(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.HarborConcurrency != domain.DefaultHarborConcurrency || loaded.HarborAttempts != domain.RequiredTrialCount {
+		t.Fatalf("loaded Harbor pass defaults differ: %+v", loaded)
+	}
+}
+
+func TestRunnerRejectsInvalidHarborPassSettings(t *testing.T) {
+	for _, opts := range []RunnerOptions{
+		{TaskDir: t.TempDir(), HarborConcurrency: 5, HarborAttempts: 4},
+		{TaskDir: t.TempDir(), HarborConcurrency: 2, HarborAttempts: 3},
+	} {
+		runner := NewRunner(opts)
+		if err := runner.validateOptions(); err == nil || !strings.Contains(err.Error(), "invalid Harbor pass settings") {
+			t.Fatalf("invalid settings unexpectedly passed validation: opts=%+v err=%v", opts, err)
+		}
+	}
+	runner := NewRunner(RunnerOptions{TaskDir: t.TempDir()})
+	if err := runner.validateOptions(); err != nil {
+		t.Fatal(err)
+	}
+	if runner.opts.HarborConcurrency != domain.DefaultHarborConcurrency || runner.opts.HarborAttempts != domain.RequiredTrialCount {
+		t.Fatalf("runner did not normalize Harbor pass defaults: %+v", runner.opts)
 	}
 }
 
@@ -568,6 +607,34 @@ func TestCancelQwenStageContinuesToOpus(t *testing.T) {
 	}
 }
 
+func TestCancelNodeQueuesBetweenStartedEventAndRuntimeRegistration(t *testing.T) {
+	runner := NewRunner(RunnerOptions{})
+	sink := runnerWorkflowEventSink{runner: runner}
+	if err := sink.Emit(context.Background(), workflow.Event{NodeID: nodes.HarborRunQwen, Type: "node_started"}); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.CancelNode(nodes.HarborRunQwen) {
+		t.Fatal("cancel request was rejected after the started event")
+	}
+	stageCtx, cancel := context.WithCancel(context.Background())
+	unregister := runner.registerStageCancel(nodes.HarborRunQwen, cancel)
+	defer unregister()
+	select {
+	case <-stageCtx.Done():
+		if !errors.Is(stageCtx.Err(), context.Canceled) {
+			t.Fatalf("unexpected cancellation cause: %v", stageCtx.Err())
+		}
+	default:
+		t.Fatal("queued cancellation was lost before runtime registration")
+	}
+	if err := sink.Emit(context.Background(), workflow.Event{NodeID: nodes.HarborRunQwen, Type: "node_canceled"}); err != nil {
+		t.Fatal(err)
+	}
+	if runner.CancelNode(nodes.HarborRunQwen) {
+		t.Fatal("completed stage accepted a stale cancellation request")
+	}
+}
+
 func TestFailedQwenStageStillRunsOpus(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
@@ -619,17 +686,17 @@ func TestRunnerCanRunOnlyOpusForEvidenceRecovery(t *testing.T) {
 		HarborExec:     exec,
 	})
 	summary, err := runner.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "screenshot") {
-		t.Fatalf("expected incomplete result evidence to fail the result gate, got %v", err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if summary.Passed || summary.QwenResult != nil || summary.OpusResult == nil || exec.counter != 1 {
-		t.Fatalf("expected one Opus-only recovery run with incomplete final evidence: executions=%d summary=%+v", exec.counter, summary)
+	if !summary.Passed || summary.QwenResult != nil || summary.OpusResult == nil || exec.counter != 1 {
+		t.Fatalf("expected one complete Opus-only recovery run: executions=%d summary=%+v", exec.counter, summary)
 	}
 	if eventSeen(summary.Events, nodes.HarborRunQwen, "running") || !eventSeen(summary.Events, nodes.HarborRunOpus, "succeeded") {
 		t.Fatalf("unexpected model stages: %+v", summary.Events)
 	}
-	if !eventSeen(summary.Events, nodes.ResultReview, "failed") {
-		t.Fatalf("missing failed result review for incomplete evidence: %+v", summary.Events)
+	if !eventSeen(summary.Events, nodes.ResultReview, "succeeded") {
+		t.Fatalf("missing successful result review for complete Opus evidence: %+v", summary.Events)
 	}
 }
 
@@ -910,9 +977,7 @@ func TestApplyWorkspaceEvidenceDefaultsUsesResultScreenshotFallback(t *testing.T
 		t.Fatal(err)
 	}
 	screenshot := filepath.Join(filepath.Dir(resultPath), "qwen.png")
-	if err := os.WriteFile(screenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeRunnerScreenshot(t, screenshot, "harbor_run_qwen", "qwen3.7-max", 1)
 	result := domain.TrialResult{
 		SchemaVersion: "harbor.trial_result.v1",
 		Model:         "qwen3.7-max",
@@ -1226,12 +1291,8 @@ func TestRunnerPackageForcesVerifyHarborAndSubmissionLint(t *testing.T) {
 	}
 	qwenScreenshot := filepath.Join(t.TempDir(), "qwen.png")
 	opusScreenshot := filepath.Join(t.TempDir(), "opus.png")
-	if err := os.WriteFile(qwenScreenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(opusScreenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeRunnerScreenshot(t, qwenScreenshot, "harbor_run_qwen", "qwen3.7-max", 1)
+	writeRunnerScreenshot(t, opusScreenshot, "harbor_run_opus", "claude-opus-4-6", 3)
 	history := t.TempDir()
 	if err := os.WriteFile(filepath.Join(history, "unrelated.md"), []byte("Legacy desktop widget telemetry notes with unrelated installation wording and no matching verifier behavior."), 0o644); err != nil {
 		t.Fatal(err)
@@ -1390,12 +1451,8 @@ func TestRunnerPackageUsesDefaultWorkspaceForEvidenceReports(t *testing.T) {
 	}, digest)
 	qwenScreenshot := filepath.Join(outputDir, "qwen.png")
 	opusScreenshot := filepath.Join(outputDir, "opus.png")
-	if err := os.WriteFile(qwenScreenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(opusScreenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeRunnerScreenshot(t, qwenScreenshot, "harbor_run_qwen", "qwen3.7-max", 1)
+	writeRunnerScreenshot(t, opusScreenshot, "harbor_run_opus", "claude-opus-4-6", 3)
 	history := t.TempDir()
 	if err := os.WriteFile(filepath.Join(history, "unrelated.md"), []byte("Unrelated notes about desktop clipboard rendering and theme preferences."), 0o644); err != nil {
 		t.Fatal(err)
@@ -1624,13 +1681,27 @@ func writeRunnerScreenshots(t *testing.T) (string, string) {
 	dir := t.TempDir()
 	qwen := filepath.Join(dir, "qwen.png")
 	opus := filepath.Join(dir, "opus.png")
-	if err := os.WriteFile(qwen, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(opus, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeRunnerScreenshot(t, qwen, "harbor_run_qwen", "qwen3.7-max", 1)
+	writeRunnerScreenshot(t, opus, "harbor_run_opus", "claude-opus-4-6", 3)
 	return qwen, opus
+}
+
+func writeRunnerScreenshot(t *testing.T, path, slot, model string, passCount int) {
+	t.Helper()
+	runs := make([]domain.TrialRun, 4)
+	for i := range runs {
+		runs[i] = domain.TrialRun{Trial: i + 1, Passed: i < passCount, Turns: 20 + i}
+	}
+	pngData, err := evidence.RenderPassAt4PNG(slot, domain.TrialResult{
+		Model: model, Trials: 4, PassCount: passCount, PassAt4: float64(passCount) / 4,
+		AverageTurns: 21.5, Runs: runs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, pngData, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 type runnerResultExec struct {
@@ -1767,7 +1838,7 @@ func (e *runnerCancelableHarborExec) Run(ctx context.Context, timeout time.Durat
 }
 
 func (e *runnerCancelableHarborExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, callback executor.OutputCallback, name string, args ...string) executor.Result {
-	if e.calls == 0 {
+	if slices.Contains(args, domain.DefaultQwenModel) {
 		e.calls++
 		<-ctx.Done()
 		return executor.Result{Command: name + " " + strings.Join(args, " "), ExitCode: -1, Err: ctx.Err()}

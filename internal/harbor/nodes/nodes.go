@@ -284,6 +284,7 @@ func HarborRunArtifactPaths(workspace, nodeID string) []string {
 	dir := HarborRunDir(workspace, nodeID)
 	paths := []string{
 		filepath.Join(dir, "trial_result.json"),
+		filepath.Join(dir, "pass4_evidence.png"),
 		filepath.Join(dir, "command_run.json"),
 		filepath.Join(dir, "stdout.txt"),
 		filepath.Join(dir, "stderr.txt"),
@@ -295,6 +296,10 @@ func HarborRunArtifactPaths(workspace, nodeID string) []string {
 		paths = append([]string{OpusResultPath(workspace)}, paths...)
 	}
 	return paths
+}
+
+func Pass4EvidencePath(workspace, nodeID string) string {
+	return filepath.Join(HarborRunDir(workspace, nodeID), "pass4_evidence.png")
 }
 
 func TrialResultPath(workspace, nodeID string) string {

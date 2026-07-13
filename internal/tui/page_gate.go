@@ -92,11 +92,11 @@ func (m model) gateContent(gate *domain.GateRequest) string {
 	var lines []string
 	lines = append(lines, sectionStyle.Render(localizeGate(gate.GateID, gate.GateName)))
 	if strings.TrimSpace(m.filter) != "" {
-		lines = append(lines, defaultTheme.Focused.Render("筛选："+redactUI(m.filter)))
+		lines = append(lines, defaultTheme.Focused.Render("筛选："+redactSingleLineUI(m.filter)))
 	}
 	lines = append(lines, redactUI(gate.Message))
 	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(localizeRuntimeError(m.err))))
+		lines = append(lines, failStyle.Render(redactSingleLineUI(localizeRuntimeError(m.err))))
 	}
 	checkLines := []string{sectionStyle.Render("检查清单"), renderChecklist(filterChecklist(gate.Checklist, m.filter))}
 	artifactLines := []string{sectionStyle.Render("工件预览")}
@@ -104,8 +104,8 @@ func (m model) gateContent(gate *domain.GateRequest) string {
 	if len(artifacts) > 0 {
 		idx := clampInt(m.selectedArtifact, 0, len(artifacts)-1)
 		artifact := artifacts[idx]
-		artifactLines = append(artifactLines, sectionStyle.Render(localizeCount(idx+1, len(artifacts))+"："+redactUI(artifact.Name)))
-		artifactLines = append(artifactLines, subtleStyle.Render(redactUI(artifact.Path)))
+		artifactLines = append(artifactLines, sectionStyle.Render(localizeCount(idx+1, len(artifacts))+"："+redactSingleLineUI(artifact.Name)))
+		artifactLines = append(artifactLines, subtleStyle.Render(redactSingleLineUI(artifact.Path)))
 		content := m.artifactContent(artifact)
 		if strings.TrimSpace(content) == "" {
 			content = subtleStyle.Render("（内容为空或不可用）")

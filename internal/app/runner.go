@@ -92,6 +92,7 @@ type Runner struct {
 	stateMu           sync.Mutex
 	runID             string
 	stageMu           sync.Mutex
+	stageActive       map[string]bool
 	stageCancels      map[string]context.CancelFunc
 	stageCancelQueued map[string]bool
 }
@@ -110,11 +111,20 @@ var ErrHarborModelStageCanceled = errors.New("Harbor model stage canceled")
 
 func NewRunner(opts RunnerOptions) *Runner {
 	opts = HydrateRuntimeOptions(opts)
-	return &Runner{opts: opts, events: make(chan domain.RunnerEvent, 64), decisions: make(chan domain.GateDecision, 8), stageCancels: map[string]context.CancelFunc{}, stageCancelQueued: map[string]bool{}}
+	return &Runner{
+		opts: opts, events: make(chan domain.RunnerEvent, 64), decisions: make(chan domain.GateDecision, 8),
+		stageActive: map[string]bool{}, stageCancels: map[string]context.CancelFunc{}, stageCancelQueued: map[string]bool{},
+	}
 }
 
 func SaveRunnerOptions(opts RunnerOptions) (domain.RunnerOptionsSnapshot, error) {
 	opts = HydrateRuntimeOptions(opts)
+	plan, err := harborrun.NormalizePassPlan(opts.HarborConcurrency, opts.HarborAttempts)
+	if err != nil {
+		return domain.RunnerOptionsSnapshot{}, err
+	}
+	opts.HarborConcurrency = plan.Concurrency
+	opts.HarborAttempts = plan.Attempts
 	snapshot := sanitize.RunnerOptionsSnapshot(runnerOptionsSnapshot(opts))
 	if err := writeRunnerOptionsSnapshot(snapshot); err != nil {
 		return snapshot, err
@@ -161,6 +171,10 @@ func (r *Runner) CancelNode(nodeID string) bool {
 		return false
 	}
 	r.stageMu.Lock()
+	if !r.stageActive[nodeID] {
+		r.stageMu.Unlock()
+		return false
+	}
 	cancel := r.stageCancels[nodeID]
 	if cancel == nil {
 		r.stageCancelQueued[nodeID] = true
@@ -171,6 +185,23 @@ func (r *Runner) CancelNode(nodeID string) bool {
 	}
 	cancel()
 	return true
+}
+
+func (r *Runner) recordStageEvent(nodeID, eventType string) {
+	if nodeID != nodes.HarborRunQwen && nodeID != nodes.HarborRunOpus {
+		return
+	}
+	r.stageMu.Lock()
+	defer r.stageMu.Unlock()
+	switch eventType {
+	case "node_started":
+		r.stageActive[nodeID] = true
+		delete(r.stageCancelQueued, nodeID)
+	case "node_succeeded", "node_failed", "node_canceled":
+		delete(r.stageActive, nodeID)
+		delete(r.stageCancels, nodeID)
+		delete(r.stageCancelQueued, nodeID)
+	}
 }
 
 func (r *Runner) registerStageCancel(nodeID string, cancel context.CancelFunc) func() {
@@ -264,12 +295,12 @@ func (r *Runner) validateOptions() error {
 	if r.opts.HarborSetupTimeout <= 0 {
 		r.opts.HarborSetupTimeout = 1200
 	}
-	if r.opts.HarborConcurrency <= 0 {
-		r.opts.HarborConcurrency = 1
+	plan, err := harborrun.NormalizePassPlan(r.opts.HarborConcurrency, r.opts.HarborAttempts)
+	if err != nil {
+		return fmt.Errorf("invalid Harbor pass settings: %w", err)
 	}
-	if r.opts.HarborAttempts <= 0 {
-		r.opts.HarborAttempts = 4
-	}
+	r.opts.HarborConcurrency = plan.Concurrency
+	r.opts.HarborAttempts = plan.Attempts
 	if r.opts.HarborInfraRetries < 0 {
 		return fmt.Errorf("--harbor-infra-retries must be non-negative")
 	}
@@ -580,8 +611,8 @@ func runnerOptionsFromSnapshot(snapshot domain.RunnerOptionsSnapshot) RunnerOpti
 		HarborSetupTimeout:    defaultInt(snapshot.HarborSetupTimeout, 1200),
 		HarborAgentCacheDir:   snapshot.HarborAgentCacheDir,
 		HarborPreflight:       preflight,
-		HarborConcurrency:     defaultInt(snapshot.HarborConcurrency, 1),
-		HarborAttempts:        defaultInt(snapshot.HarborAttempts, 4),
+		HarborConcurrency:     defaultInt(snapshot.HarborConcurrency, domain.DefaultHarborConcurrency),
+		HarborAttempts:        defaultInt(snapshot.HarborAttempts, domain.RequiredTrialCount),
 		HarborInfraRetries:    snapshot.HarborInfraRetries,
 		Package:               snapshot.Package,
 		OutputDir:             snapshot.OutputDir,

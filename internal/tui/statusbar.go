@@ -38,5 +38,9 @@ func (m model) statusBar() string {
 	if m.readOnly {
 		readonly = " · " + warnStyle.Render("只读快照")
 	}
-	return subtleStyle.Render(status+elapsed) + readonly
+	line := subtleStyle.Render(redactSingleLineUI(status+elapsed)) + readonly
+	if m.width > 0 {
+		line = clipDisplay(line, m.width)
+	}
+	return line
 }

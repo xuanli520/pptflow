@@ -87,12 +87,15 @@ func (m *model) syncOverviewTable() {
 		event, ok := m.nodes[id]
 		status, message := "pending", ""
 		if ok {
-			status, message = event.Status, redactUI(event.Message)
+			status, message = event.Status, redactSingleLineUI(event.Message)
 		}
 		if !matchesFilter(m.filter, id, localizeNode(id), message, status, localizeStatus(status)) {
 			continue
 		}
-		row := table.Row{statusIcon(status) + " " + localizeStatus(status), localizeNode(id) + " (" + id + ")", message}
+		// bubbles/table truncates cell values before styling and is not ANSI
+		// aware. Keep table data plain; the selected-row style still provides
+		// focus feedback, while detail views retain colored statusIcon output.
+		row := table.Row{statusGlyph(status) + " " + localizeStatus(status), localizeNode(id) + " (" + id + ")", message}
 		if l.Mode == layoutMinimal {
 			row = row[:2]
 		}
@@ -140,13 +143,13 @@ func (m *model) overview() string {
 	var lines []string
 	lines = append(lines, sectionStyle.Render("总览"))
 	if strings.TrimSpace(m.filter) != "" {
-		lines = append(lines, defaultTheme.Focused.Render("筛选："+redactUI(m.filter)))
+		lines = append(lines, defaultTheme.Focused.Render("筛选："+redactSingleLineUI(m.filter)))
 	}
 	if strings.TrimSpace(m.notice) != "" {
-		lines = append(lines, warnStyle.Render(redactUI(m.notice)))
+		lines = append(lines, warnStyle.Render(redactSingleLineUI(m.notice)))
 	}
 	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(localizeRuntimeError(m.err))))
+		lines = append(lines, failStyle.Render(redactSingleLineUI(localizeRuntimeError(m.err))))
 	}
 	m.syncOverviewTable()
 	if len(m.overviewRowIDs) == 0 {
@@ -159,7 +162,7 @@ func (m *model) overview() string {
 		lines = append(lines, m.overviewTable.View())
 		lines = append(lines, scrollIndicator(maxInt(0, m.overviewTable.Cursor()-m.overviewTable.Height()/2), m.overviewTable.Height(), len(m.overviewRowIDs)))
 		if event, ok := m.nodes[m.selectedNode]; ok && event.Path != "" {
-			lines = append(lines, subtleStyle.Render("路径："+redactUI(event.Path)))
+			lines = append(lines, subtleStyle.Render("路径："+redactSingleLineUI(event.Path)))
 		}
 	}
 	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))

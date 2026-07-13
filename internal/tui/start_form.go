@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 )
 
 type startGroup int
@@ -307,6 +308,9 @@ func (m *model) toggleStartGroup(key string) bool {
 	if m.startStep != startStepAdvanced {
 		return false
 	}
+	if !strings.HasPrefix(key, "f") {
+		return false
+	}
 	index, err := strconv.Atoi(strings.TrimPrefix(key, "f"))
 	if err != nil || index < 1 || index > len(advancedGroups()) {
 		return false
@@ -423,6 +427,24 @@ func (m model) validateDirtyStartInputs() error {
 			if err != nil || parsed < 0 {
 				return fmt.Errorf("%s格式无效", startFieldName(field))
 			}
+			if err := validateStartHarborPassInt(field, parsed); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateStartHarborPassInt(field startField, value int) error {
+	switch field {
+	case startFieldHarborConcurrency:
+		maximum := minInt(domain.MaxHarborConcurrency, domain.RequiredTrialCount)
+		if value > maximum {
+			return fmt.Errorf("%s不能超过 %d", startFieldName(field), maximum)
+		}
+	case startFieldHarborAttempts:
+		if value != 0 && value != domain.RequiredTrialCount {
+			return fmt.Errorf("%s必须为 %d", startFieldName(field), domain.RequiredTrialCount)
 		}
 	}
 	return nil

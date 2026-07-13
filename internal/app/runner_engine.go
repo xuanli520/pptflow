@@ -128,9 +128,12 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 	summary = projectRunSummary(store, result, r.opts, r.snapshot())
 	summary.Recovered = previousRunID != ""
 	summary.PreviousRunID = previousRunID
-	if r.opts.RunHarbor && (summary.QwenResult == nil || summary.OpusResult == nil) {
-		summary.Passed = false
-		summary.Status = "failed"
+	if r.opts.RunHarbor {
+		runQwen, runOpus, _ := harborModelSelection(r.opts.HarborModels)
+		if runQwen && summary.QwenResult == nil || runOpus && summary.OpusResult == nil {
+			summary.Passed = false
+			summary.Status = "failed"
+		}
 	}
 	if summary.Recovered {
 		summary.ReusedNodes, summary.RerunNodes = recoveryNodeSets(summary.Events)
@@ -177,6 +180,7 @@ func (s runnerWorkflowEventSink) Emit(_ context.Context, event workflow.Event) e
 		}
 	}
 	event = sanitize.RunnerEvent(event)
+	s.runner.recordStageEvent(event.NodeID, event.Type)
 	s.runner.mu.Lock()
 	s.runner.log = append(s.runner.log, event)
 	s.runner.mu.Unlock()

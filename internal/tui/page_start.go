@@ -100,19 +100,19 @@ func (m model) startView() string {
 		}
 	}
 	if m.err != nil {
-		lines = append(lines, "", failStyle.Render(redactUI(localizeRuntimeError(m.err))))
+		lines = append(lines, "", failStyle.Render(redactSingleLineUI(localizeRuntimeError(m.err))))
 	}
 	if len(m.pathSuggestions) > 1 {
 		preview := m.pathSuggestions
 		if len(preview) > 4 {
 			preview = preview[:4]
 		}
-		lines = append(lines, subtleStyle.Render("路径候选："+redactUI(strings.Join(preview, "  "))))
+		lines = append(lines, subtleStyle.Render("路径候选："+redactSingleLineUI(strings.Join(preview, "  "))))
 	}
 	if m.startStep == startStepBasic {
 		lines = append(lines, "", subtleStyle.Render("填写完成后按 Enter 进入高级选项"))
 	} else {
-		lines = append(lines, "", subtleStyle.Render("确认配置后按 Enter 启动工作流；Esc 返回基本配置"))
+		lines = append(lines, "", subtleStyle.Render("Enter 启动 · Ctrl+B 入队 · Esc 返回"))
 	}
 	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
 }
@@ -129,16 +129,17 @@ func (m model) renderStartField(field startField) string {
 	if field == startFieldMode {
 		return m.renderStartModeSelector()
 	}
-	lineWidth := maxInt(18, contentWidth(m.width)-2)
+	lineWidth := styleContentWidth(contentWidth(m.width), panelStyle)
 	layout := layoutFor(m.width, m.height)
 	if m.startStep == startStepAdvanced && (layout.Mode == layoutWide || layout.Mode == layoutMedium) {
-		lineWidth = maxInt(18, layout.MainWidth-3)
+		rightStyle := lipgloss.NewStyle().PaddingLeft(2)
+		lineWidth = styleContentWidth(maxInt(24, layout.MainWidth-3), rightStyle)
 	}
-	labelWidth := clampInt(lineWidth/2, 8, 30)
+	labelWidth := clampInt(lineWidth/2, 4, 30)
 	valueWidth := lineWidth - 2 - labelWidth - 1 - 4 // prefix, separator, and "[ ]"
-	if valueWidth < 3 {
-		labelWidth = maxInt(4, labelWidth-(3-valueWidth))
-		valueWidth = 3
+	if valueWidth < 1 {
+		labelWidth = maxInt(1, labelWidth-(1-valueWidth))
+		valueWidth = 1
 	}
 	prefix := "  "
 	if field == m.startField {
@@ -239,21 +240,23 @@ func (m model) renderStartField(field startField) string {
 	if unit := fieldUnit(field); unit != "" {
 		localizedLabel += " (" + unit + ")"
 	}
-	if field == m.startField && isTextStartField(field) {
-		if input, ok := m.startInputs[field]; ok {
-			input.Width = valueWidth
-			if sanitized := redactUI(input.Value()); sanitized != input.Value() {
-				value = truncateDisplay(sanitized, valueWidth)
+	if isTextStartField(field) {
+		if field == m.startField {
+			if input, ok := m.startInputs[field]; ok {
+				if sanitized := redactSingleLineUI(input.Value()); sanitized != input.Value() {
+					value = boxedText(sanitized, valueWidth+4)
+				} else {
+					value = boxedTextInput(input, valueWidth+4)
+				}
 			} else {
-				value = input.View()
+				value = boxedText(redactSingleLineUI(value), valueWidth+4)
 			}
+		} else {
+			value = boxedText(redactSingleLineUI(value), valueWidth+4)
 		}
 	}
-	if isTextStartField(field) {
-		value = "[ " + truncateDisplay(redactUI(value), valueWidth) + " ]"
-	}
 	localizedLabel = truncateDisplay(localizedLabel, labelWidth)
-	return prefix + padRightDisplay(localizedLabel, labelWidth) + " " + redactUI(value)
+	return clipDisplay(prefix+padRightDisplay(localizedLabel, labelWidth)+" "+value, lineWidth)
 }
 
 func (m model) renderStartModeSelector() string {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -59,6 +60,11 @@ func buildGateEvidence(ctx context.Context, req workflow.NodeRequest) ([]domain.
 			checklist = append(checklist, item)
 		}
 		if !seenArtifacts[meta.Path] {
+			if ref.Type == "pass4_screenshot" {
+				artifacts = append(artifacts, domain.ArtifactPreview{Name: ref.Name, Path: meta.Path, Content: "Headless Harbor pass@4 PNG evidence"})
+				seenArtifacts[meta.Path] = true
+				continue
+			}
 			preview := raw
 			if len(preview) > gatePreviewLimit {
 				preview = preview[:gatePreviewLimit]
@@ -173,6 +179,8 @@ func checklistForArtifact(ref workflow.ArtifactRef, raw []byte, req workflow.Nod
 		screenshot := strings.TrimSpace(result.Screenshot)
 		if configured := pluginutil.String(req, prefix+"_screenshot"); configured != "" {
 			screenshot = configured
+		} else if screenshot != "" && !filepath.IsAbs(screenshot) {
+			screenshot = filepath.Join(filepath.Dir(ref.Path), screenshot)
 		}
 		items = append(items, gateItem(prefix+"_screenshot", prefix+" pass@4 screenshot is readable", readableRegularFile(screenshot)))
 	}

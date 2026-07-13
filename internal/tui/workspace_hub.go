@@ -216,6 +216,16 @@ func (m *model) openSelectedWorkspace() tea.Cmd {
 		}
 		return m.showToast("当前运行尚未结束，不能切换到其他工作区", toastWarning)
 	}
+	if m.scheduler != nil {
+		if runner, _, scheduled := m.scheduler.RunnerForWorkspace(item.Run.WorkspacePath); scheduled {
+			next := initialWorkspaceModel(m.ctx, m.cancel, app.RunnerOptions{Workspace: item.Run.WorkspacePath})
+			next.runner = runner
+			next.readOnly = false
+			next.notice = "正在查看本进程的并行任务；Esc 可返回 Hub，任务会继续运行。"
+			*m = m.attachHubContext(next)
+			return tea.Batch(m.refreshWorkspace(), m.spinner.Tick)
+		}
+	}
 	if item.Run.IsResumable && !item.Run.IsActive {
 		m.resumeOverlay = NewWorkspaceResumeOverlay(item)
 		if m.router != nil {
@@ -241,6 +251,7 @@ func (m model) attachHubContext(next model) model {
 	next.opts = app.MergeRuntimeOptions(next.opts, runtimeOptions)
 	next.runtimeOpts = runtimeOptions
 	next.store = m.store
+	next.scheduler = m.scheduler
 	next.hubRoot = m.hubRoot
 	next.hubScanRoots = append([]string(nil), m.hubScanRoots...)
 	next.hubItems = append([]store.RunWithTask(nil), m.hubItems...)
@@ -260,6 +271,11 @@ func (m model) attachHubContext(next model) model {
 func (m *model) returnToHub() tea.Cmd {
 	if m.store == nil {
 		return m.showToast("工作区中枢不可用", toastWarning)
+	}
+	if m.scheduler != nil && m.runner != nil {
+		if m.scheduler.OwnsRunner(m.opts.Workspace, m.runner) {
+			m.runner = nil
+		}
 	}
 	m.setView(viewHub)
 	m.hubLoading = true
@@ -374,7 +390,8 @@ func (m *model) nextWorkspacePath(label, suffix string) string {
 	_ = os.MkdirAll(root, 0o700)
 	for index := 1; ; index++ {
 		candidate := filepath.Join(root, fmt.Sprintf("%s-%s-%d", base, suffix, index))
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+		reserved := m.scheduler != nil && m.scheduler.HasWorkspace(candidate)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) && !reserved {
 			return candidate
 		}
 	}
@@ -400,6 +417,10 @@ func (m model) hubView() string {
 		lines = append(lines, m.hubTable.View())
 	}
 	summary := fmt.Sprintf("共 %d 个工作区  磁盘占用 %s", len(m.hubItems), formatBytes(m.hubTotalSize))
+	if m.scheduler != nil {
+		tasks := m.scheduler.Snapshot()
+		summary += fmt.Sprintf("  并行任务 运行中 %d/%d  排队 %d", tasks.Running, tasks.Limit, tasks.Queued)
+	}
 	if m.hubLoading {
 		summary += "  正在刷新..."
 	}

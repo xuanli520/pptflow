@@ -128,6 +128,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case hubPollMsg:
 		if m.view == viewHub {
 			m.hubLoading = true
+			if m.scheduler != nil {
+				tasks := m.scheduler.Snapshot()
+				if tasks.Running > 0 || tasks.Queued > 0 {
+					return m, tea.Batch(m.loadHub(true), hubPollCmd())
+				}
+			}
 			return m, tea.Batch(m.refreshRunningHub(), hubPollCmd())
 		}
 		return m, hubPollCmd()
@@ -161,6 +167,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.closeTaskRepair()
 		} else {
 			m.closeRunConfig()
+		}
+		if msg.background {
+			if m.scheduler == nil {
+				m.err = fmt.Errorf("并行任务调度器不可用")
+				return m, nil
+			}
+			if _, err := m.scheduler.Submit(msg.opts); err != nil {
+				m.err = err
+				return m, nil
+			}
+			m.runner = nil
+			m.notice = fmt.Sprintf("已从 %s 创建并加入并行队列。", msg.manifest.SourceWorkspace)
+			m.setView(viewHub)
+			m.hubLoading = true
+			return m, tea.Batch(m.showToast("重跑任务已加入并行队列", toastSuccess), m.loadHub(true))
 		}
 		m = m.startRunner(msg.opts)
 		m.setView(viewOverview)

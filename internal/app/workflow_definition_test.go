@@ -73,5 +73,19 @@ func TestBuildWorkflowDefinitionKeepsPassAtFourTrialCount(t *testing.T) {
 		if got := spec.Config["attempts"]; got != 4 {
 			t.Fatalf("%s business trial count=%v, want 4", spec.ID, got)
 		}
+		if got := spec.Config["concurrency"]; got != 2 {
+			t.Fatalf("%s default concurrency=%v, want bounded parallelism 2", spec.ID, got)
+		}
+	}
+}
+
+func TestBuildWorkflowDefinitionRejectsInvalidHarborPassSettings(t *testing.T) {
+	for _, opts := range []RunnerOptions{
+		{TaskDir: t.TempDir(), HarborConcurrency: 5, HarborAttempts: 4},
+		{TaskDir: t.TempDir(), HarborConcurrency: 2, HarborAttempts: 3},
+	} {
+		if _, err := buildWorkflowDefinition(opts); err == nil {
+			t.Fatalf("invalid Harbor settings unexpectedly built a workflow: %+v", opts)
+		}
 	}
 }

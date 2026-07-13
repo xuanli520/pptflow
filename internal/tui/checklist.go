@@ -21,7 +21,7 @@ func renderChecklist(items []domain.ChecklistItem) string {
 		if item.Critical {
 			critical = " " + warnStyle.Render("[严重]")
 		}
-		lines = append(lines, fmt.Sprintf("%s %s%s", statusIcon(status), redactUI(item.Label), critical))
+		lines = append(lines, fmt.Sprintf("%s %s%s", statusIcon(status), redactSingleLineUI(item.Label), critical))
 	}
 	return strings.Join(lines, "\n")
 }

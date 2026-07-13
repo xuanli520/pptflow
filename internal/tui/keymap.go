@@ -85,7 +85,15 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	if m.searching {
 		return true, m.updateSearchKey(msg)
 	}
+	if m.hubSearching {
+		return true, m.updateHubSearch(msg)
+	}
 	if m.view == viewStart {
+		// Printable runes belong to the focused form input. In particular,
+		// numbers and "?" must not leak into navigation/help shortcuts.
+		if isTextStartField(m.startField) && msg.Type == tea.KeyRunes {
+			return false, nil
+		}
 		if key == "?" {
 			m.helpVisible = true
 			if m.router != nil {
@@ -183,6 +191,14 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 }
 
 func (m *model) requestQuit() tea.Cmd {
+	if m.scheduler != nil {
+		tasks := m.scheduler.Snapshot()
+		if active := tasks.Running + tasks.Queued; active > 0 {
+			message := fmt.Sprintf("本进程仍有 %d 个并行任务正在运行或排队。退出将取消这些任务并等待资源回收，是否继续？", active)
+			m.openConfirm(newConfirmDialog(confirmQuit, "确认退出", message))
+			return func() tea.Msg { return confirmOpenedMsg{} }
+		}
+	}
 	if m.view == viewHub && m.runner == nil {
 		for _, item := range m.hubItems {
 			if item.Run.IsActive {
@@ -351,7 +367,7 @@ func (m model) footer() string {
 		if m.startStep == startStepBasic {
 			text = "[Tab/↓ 下一字段] [Shift+Tab/↑ 上一字段] [Space 切换模式] [Ctrl+Space 路径补全] [Enter 下一步] [Ctrl+Q 退出]"
 		} else {
-			text = "[F1-F4 分组] [Ctrl+←→ 分组] [Tab/↓ 下项] [Shift+Tab/↑ 上项] [Space 切换] [Ctrl+Space 补全] [Enter 启动] [Esc 返回] [Ctrl+Q 退出]"
+			text = "[F1-F4 分组] [Ctrl+←→ 分组] [Tab/↓ 下项] [Shift+Tab/↑ 上项] [Space 切换] [Ctrl+Space 补全] [Enter 启动] [Ctrl+B 入队] [Esc 返回] [Ctrl+Q 退出]"
 		}
 	case viewGate:
 		if m.readOnly {
@@ -397,132 +413,4 @@ func (m model) footer() string {
 		style = style.Width(maxInt(20, m.width))
 	}
 	return style.Render(text)
-}
-
-func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
-	event := tea.MouseEvent(msg)
-	switch event.Button {
-	case tea.MouseButtonWheelUp:
-		switch m.view {
-		case viewHub:
-			m.hubTable.MoveUp(3)
-		case viewLogs:
-			m.scrollLogFile(-3)
-		case viewGate:
-			if m.syncGateViewport(m.activeGate) {
-				m.gateViewport.LineUp(3)
-				m.gateScroll = m.gateViewport.YOffset
-			}
-		case viewNodeDetail:
-			if m.syncDetailViewport() {
-				m.detailViewport.LineUp(3)
-				m.detailScroll = m.detailViewport.YOffset
-			}
-		case viewOverview:
-			m.syncOverviewTable()
-			m.overviewTable.MoveUp(3)
-			m.syncSelectedOverviewRow()
-		case viewStart:
-			m.selectPrevStartField()
-			m.focusStartInput(m.startField)
-		}
-		return nil
-	case tea.MouseButtonWheelDown:
-		switch m.view {
-		case viewHub:
-			m.hubTable.MoveDown(3)
-		case viewLogs:
-			m.scrollLogFile(3)
-		case viewGate:
-			if m.syncGateViewport(m.activeGate) {
-				m.gateViewport.LineDown(3)
-				m.gateScroll = m.gateViewport.YOffset
-			}
-		case viewNodeDetail:
-			if m.syncDetailViewport() {
-				m.detailViewport.LineDown(3)
-				m.detailScroll = m.detailViewport.YOffset
-			}
-		case viewOverview:
-			m.syncOverviewTable()
-			m.overviewTable.MoveDown(3)
-			m.syncSelectedOverviewRow()
-		case viewStart:
-			m.selectNextStartField()
-			m.focusStartInput(m.startField)
-		}
-		return nil
-	case tea.MouseButtonLeft:
-		if event.Action != tea.MouseActionPress {
-			return nil
-		}
-	default:
-		return nil
-	}
-	switch m.view {
-	case viewStart:
-		fields := m.activeStartFields()
-		if m.startStep == startStepBasic {
-			if event.Y == 9 || event.Y == 10 {
-				m.startMode = startExistingTask
-				if event.Y == 10 {
-					m.startMode = startGenerateTask
-				}
-				m.opts.Generate = m.startMode == startGenerateTask
-				m.startField = startFieldMode
-				return nil
-			}
-			if event.Y >= 11 && len(fields) > 1 {
-				idx := clampInt(1+event.Y-11, 1, len(fields)-1)
-				m.startField = fields[idx]
-				m.focusStartInput(m.startField)
-			}
-			return nil
-		}
-		layout := layoutFor(m.width, m.height)
-		if event.Y >= 9 && event.Y < 9+len(advancedGroups()) && (layout.Mode == layoutStacked || layout.Mode == layoutMinimal || event.X < layout.SidebarWidth) {
-			m.selectAdvancedGroupByNumber(event.Y - 8)
-			return nil
-		}
-		fieldRow := 14
-		if layout.Mode == layoutWide || layout.Mode == layoutMedium {
-			fieldRow = 9
-		}
-		if event.Y >= fieldRow && len(fields) > 0 {
-			idx := clampInt(event.Y-fieldRow, 0, len(fields)-1)
-			m.startField = fields[idx]
-			m.focusStartInput(m.startField)
-		}
-	case viewOverview, viewNodeDetail:
-		var ids []string
-		for _, id := range nodeOrder() {
-			if ev, ok := m.nodes[id]; ok && matchesFilter(m.filter, id, localizeNode(id), ev.Message) {
-				ids = append(ids, id)
-			} else if !ok && m.view == viewOverview && matchesFilter(m.filter, id, localizeNode(id)) {
-				ids = append(ids, id)
-			}
-		}
-		if len(ids) > 0 {
-			idx := clampInt(event.Y-5, 0, len(ids)-1)
-			m.selectedNode = ids[idx]
-			m.selectedArtifact = 0
-		}
-	case viewGate:
-		if m.readOnly {
-			return nil
-		}
-		if event.Y >= m.height-7 {
-			key := "a"
-			if event.X > m.width/3 {
-				key = "r"
-			}
-			if event.X > 2*m.width/3 {
-				key = "v"
-			}
-			updated, cmd := m.updateGateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-			*m = updated.(model)
-			return cmd
-		}
-	}
-	return nil
 }

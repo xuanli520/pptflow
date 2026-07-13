@@ -35,6 +35,26 @@ func TestParseResultNormalizesRuns(t *testing.T) {
 	}
 }
 
+func TestParseResultOrdersParallelTrialCompletionDeterministically(t *testing.T) {
+	result, err := ParseResult([]byte(`{
+		"model": "qwen3.7-max",
+		"runs": [
+			{"trial": 4, "turns": 24},
+			{"trial": 2, "turns": 22},
+			{"trial": 1, "turns": 21},
+			{"trial": 3, "turns": 23}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, run := range result.Runs {
+		if run.Trial != index+1 {
+			t.Fatalf("parallel trial results are not ordered: %+v", result.Runs)
+		}
+	}
+}
+
 func TestParseResultPreservesExplicitFailedRunWhenRewardExists(t *testing.T) {
 	result, err := ParseResult([]byte(`{
 		"model": "qwen3.7-max",

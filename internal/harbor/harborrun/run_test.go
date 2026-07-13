@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/executor"
+	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/secretscan"
 )
 
@@ -24,6 +25,101 @@ type fakeCommandRunner struct {
 	streamingSource string
 	onRun           func(call int)
 	envs            [][]string
+}
+
+type cancelAwareCommandRunner struct {
+	started chan struct{}
+}
+
+func (r *cancelAwareCommandRunner) LookPath(name string) (string, error) { return name, nil }
+
+func (r *cancelAwareCommandRunner) Run(ctx context.Context, _ time.Duration, _ string, _ []string, name string, args ...string) executor.Result {
+	close(r.started)
+	<-ctx.Done()
+	return executor.Result{Command: strings.Join(append([]string{name}, args...), " "), ExitCode: -1, Err: ctx.Err()}
+}
+
+func (r *cancelAwareCommandRunner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, _ executor.OutputCallback, name string, args ...string) executor.Result {
+	return r.Run(ctx, timeout, dir, env, name, args...)
+}
+
+func TestNormalizePassPlanDefaultsAndRejectsInvalidBounds(t *testing.T) {
+	plan, err := NormalizePassPlan(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Concurrency != domain.DefaultHarborConcurrency || plan.Attempts != domain.RequiredTrialCount {
+		t.Fatalf("unexpected default pass plan: %+v", plan)
+	}
+	for _, test := range []struct {
+		name        string
+		concurrency int
+		attempts    int
+	}{
+		{name: "negative concurrency", concurrency: -1, attempts: 4},
+		{name: "concurrency exceeds pass count", concurrency: 5, attempts: 4},
+		{name: "attempt count is not pass at four", concurrency: 2, attempts: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NormalizePassPlan(test.concurrency, test.attempts); err == nil {
+				t.Fatalf("NormalizePassPlan(%d, %d) unexpectedly succeeded", test.concurrency, test.attempts)
+			}
+		})
+	}
+	if plan, err := NormalizePassPlan(4, 4); err != nil || plan.Concurrency != 4 {
+		t.Fatalf("maximum useful pass@4 concurrency rejected: plan=%+v err=%v", plan, err)
+	}
+}
+
+func TestRunCancellationStopsParallelPassAndPreservesCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exec := &cancelAwareCommandRunner{started: make(chan struct{})}
+	taskDir := writeHarborRunTask(t)
+	outputDir := t.TempDir()
+	type outcome struct {
+		command domain.CommandRun
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		_, command, err := Run(ctx, Options{
+			TaskPath: taskDir, Model: "qwen", Agent: "test-agent",
+			OutputDir: outputDir, Concurrency: 2, Attempts: 4, Exec: exec,
+		})
+		done <- outcome{command: command, err: err}
+	}()
+	select {
+	case <-exec.started:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("Harbor pass did not start")
+	}
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("cancellation cause was not preserved: %v", got.err)
+		}
+		if got.command.Passed || got.command.ExitCode != -1 {
+			t.Fatalf("canceled command evidence is incorrect: %+v", got.command)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Harbor pass did not stop after cancellation")
+	}
+}
+
+func TestRunRejectsDuplicateParallelTrialResults(t *testing.T) {
+	exec := &fakeCommandRunner{result: executor.Result{Stdout: `{
+		"model":"qwen",
+		"runs":[{"trial":1},{"trial":2},{"trial":2},{"trial":4}]
+	}`}}
+	_, _, err := Run(context.Background(), Options{
+		TaskPath: writeHarborRunTask(t), Model: "qwen", Agent: "test-agent",
+		OutputDir: t.TempDir(), Concurrency: 2, Attempts: 4, Exec: exec,
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate trial 2") {
+		t.Fatalf("duplicate parallel result was not rejected: %v", err)
+	}
 }
 
 func (f *fakeCommandRunner) LookPath(name string) (string, error) {
@@ -86,7 +182,7 @@ func TestRunParsesJSONStdoutAndWritesArtifacts(t *testing.T) {
 	if result.TaskDigest == "" || result.CommandRunPath == "" {
 		t.Fatalf("result missing task digest or command path: %+v", result)
 	}
-	if len(exec.commands) != 1 || !strings.Contains(exec.commands[0], "harbor run -p "+taskDir+" -a "+retryingClaudeImportPath+" -m qwen3.7-max -o "+filepath.Join(outputDir, "jobs")+" --ae ANTHROPIC_MODEL=qwen3.7-max --ae ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN} --yes -n 1 -k 4") || strings.Contains(exec.commands[0], "secret-token") {
+	if len(exec.commands) != 1 || !strings.Contains(exec.commands[0], "harbor run -p "+taskDir+" -a "+retryingClaudeImportPath+" -m qwen3.7-max -o "+filepath.Join(outputDir, "jobs")+" --ae ANTHROPIC_MODEL=qwen3.7-max --ae ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN} --yes -n 2 -k 4") || strings.Contains(exec.commands[0], "secret-token") {
 		t.Fatalf("unexpected commands: %v", exec.commands)
 	}
 	if len(exec.envs) != 1 || !envContains(exec.envs[0], "ANTHROPIC_AUTH_TOKEN=secret-token") || !envKeyHasPath(exec.envs[0], "PYTHONPATH", filepath.Join(outputDir, ".factory-agent")) || !envContains(exec.envs[0], "HARBOR_FACTORY_INSTALL_ATTEMPTS=1") || !envContains(exec.envs[0], "HARBOR_FACTORY_NPM_FETCH_RETRIES=0") {

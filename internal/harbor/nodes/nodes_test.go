@@ -44,3 +44,20 @@ func TestArtifactPathsMatchDevPlanLayout(t *testing.T) {
 		}
 	}
 }
+
+func TestHarborRunArtifactPathsIncludePass4Evidence(t *testing.T) {
+	workspace := t.TempDir()
+	for _, nodeID := range []string{HarborRunQwen, HarborRunOpus} {
+		want := Pass4EvidencePath(workspace, nodeID)
+		found := false
+		for _, path := range HarborRunArtifactPaths(workspace, nodeID) {
+			if path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s artifact paths omit pass@4 evidence: %v", nodeID, HarborRunArtifactPaths(workspace, nodeID))
+		}
+	}
+}

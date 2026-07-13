@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/evidence"
 )
 
 func TestRunPassesValidDockerfileTask(t *testing.T) {
@@ -803,23 +804,62 @@ func TestRunZipFailsUnexpectedFile(t *testing.T) {
 func TestRunChecksScreenshotPathsWhenProvided(t *testing.T) {
 	taskDir := writeTask(t, false)
 	analysis := writeTestsAnalysis(t, taskDir)
-	screenshot := filepath.Join(taskDir, "qwen.png")
-	if err := os.WriteFile(screenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	evidenceDir := t.TempDir()
+	screenshot := filepath.Join(evidenceDir, "qwen.png")
+	writeLintScreenshot(t, screenshot, "harbor_run_qwen", "qwen3.7-max", 1)
 	report, err := Run(context.Background(), Options{
 		TaskDir:        taskDir,
 		RepoURL:        "https://github.com/org/repo",
 		Commit:         "abc1234",
 		TestsAnalysis:  analysis,
 		QwenScreenshot: screenshot,
-		OpusScreenshot: filepath.Join(taskDir, "missing.png"),
+		OpusScreenshot: filepath.Join(evidenceDir, "missing.png"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if report.Passed || !hasStatus(report.Checks, "qwen_screenshot", domain.CheckPass) || !hasFail(report.Checks, "opus_screenshot") {
 		t.Fatalf("expected screenshot pass/fail checks: %+v", report.Checks)
+	}
+}
+
+func TestRunDiscoversRelativeScreenshotsFromHarborResults(t *testing.T) {
+	taskDir := writeTask(t, false)
+	evidenceDir := t.TempDir()
+	qwenResult := filepath.Join(evidenceDir, "qwen_result.json")
+	opusResult := filepath.Join(evidenceDir, "opus_result.json")
+	writeLintScreenshot(t, filepath.Join(evidenceDir, "qwen.png"), "harbor_run_qwen", "qwen3.7-max", 1)
+	writeLintScreenshot(t, filepath.Join(evidenceDir, "opus.png"), "harbor_run_opus", "claude-opus-4-6", 3)
+	if err := os.WriteFile(qwenResult, []byte(`{"model":"qwen3.7-max","screenshot":"qwen.png"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(opusResult, []byte(`{"model":"claude-opus-4-6","screenshot":"opus.png"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{TaskDir: taskDir, QwenResult: qwenResult, OpusResult: opusResult})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasStatus(report.Checks, "qwen_screenshot", domain.CheckPass) || !hasStatus(report.Checks, "opus_screenshot", domain.CheckPass) || !hasStatus(report.Checks, "screenshots_distinct", domain.CheckPass) {
+		t.Fatalf("result-declared screenshots were not discovered: %+v", report.Checks)
+	}
+}
+
+func writeLintScreenshot(t *testing.T, path, slot, model string, passCount int) {
+	t.Helper()
+	runs := make([]domain.TrialRun, 4)
+	for i := range runs {
+		runs[i] = domain.TrialRun{Trial: i + 1, Passed: i < passCount, Turns: 20 + i}
+	}
+	pngData, err := evidence.RenderPassAt4PNG(slot, domain.TrialResult{
+		Model: model, Trials: 4, PassCount: passCount, PassAt4: float64(passCount) / 4,
+		AverageTurns: 21.5, Runs: runs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, pngData, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

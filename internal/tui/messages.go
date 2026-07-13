@@ -41,7 +41,8 @@ type workspaceDeletedMsg struct {
 	err  error
 }
 type clonePreparedMsg struct {
-	opts     app.RunnerOptions
-	manifest app.CloneWorkspaceManifest
-	err      error
+	opts       app.RunnerOptions
+	manifest   app.CloneWorkspaceManifest
+	background bool
+	err        error
 }

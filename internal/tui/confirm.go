@@ -59,13 +59,13 @@ func (d *ConfirmDialog) View(width, height int) string {
 	} else {
 		no = selectedStyle.Render(no)
 	}
-	body := lipgloss.JoinVertical(lipgloss.Center,
-		sectionStyle.Render(d.Title), "", redactUI(d.Message), "", yes+"    "+no, "",
-		subtleStyle.Render("[←/→] 选择  [Enter] 确认  [Esc] 取消"),
-	)
-	boxWidth := clampInt(width-8, 32, 68)
+	rows := []string{sectionStyle.Render(redactSingleLineUI(d.Title)), "", redactSingleLineUI(d.Message), "", yes + "    " + no, "", subtleStyle.Render("[←/→] 选择  [Enter] 确认  [Esc] 取消")}
+	rows = clipOverlayRows(rows, styleContentWidth(boundedPanelWidth(width, 32, 68), panelStyle))
+	rows = fitOverlayRows(rows, height, 4)
+	body := lipgloss.JoinVertical(lipgloss.Center, rows...)
+	boxWidth := boundedPanelWidth(width, 32, 68)
 	box := panelStyle.Width(boxWidth).Align(lipgloss.Center).Render(body)
-	return lipgloss.Place(maxInt(width, boxWidth), maxInt(height, 8), lipgloss.Center, lipgloss.Center, box)
+	return lipgloss.Place(maxInt(1, width), maxInt(1, height), lipgloss.Center, lipgloss.Center, box)
 }
 
 type helpOverlay struct{ view viewMode }
@@ -96,6 +96,8 @@ func (h *helpOverlay) View(width, height int) string {
 		lines = append(lines, "", "表单：↑↓/Tab 字段  Space 开关  Ctrl+Space 路径补全  Enter 下一步/启动  F1..F4 高级分组  Ctrl+Q 退出")
 	}
 	lines = append(lines, "", subtleStyle.Render("按 ?、Esc 或 q 关闭"))
-	box := panelStyle.Width(clampInt(width-8, 40, 82)).Render(strings.Join(lines, "\n"))
-	return lipgloss.Place(maxInt(width, 40), maxInt(height, 10), lipgloss.Center, lipgloss.Center, box)
+	lines = clipOverlayRows(lines, styleContentWidth(boundedPanelWidth(width, 40, 82), panelStyle))
+	lines = fitOverlayRows(lines, height, 1)
+	box := panelStyle.Width(boundedPanelWidth(width, 40, 82)).Render(strings.Join(lines, "\n"))
+	return lipgloss.Place(maxInt(1, width), maxInt(1, height), lipgloss.Center, lipgloss.Center, box)
 }

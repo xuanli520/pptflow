@@ -257,7 +257,7 @@ func TestMouseSelectsAdvancedFormGroup(t *testing.T) {
 	m := initialStartModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir(), TaskDir: t.TempDir()})
 	m.startStep = startStepAdvanced
 	m.width, m.height = 120, 35
-	m.handleMouse(tea.MouseMsg(tea.MouseEvent{X: 4, Y: 10, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	clickRenderedMarker(t, &m, "质量与相似度")
 	if m.selectedStartGroup != startGroupQuality {
 		t.Fatalf("mouse did not select quality group: %v", m.selectedStartGroup)
 	}
@@ -267,13 +267,13 @@ func TestMouseOperatesNodeAndGateTargets(t *testing.T) {
 	m := initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir(), TaskDir: t.TempDir()})
 	m.width, m.height = 100, 30
 	m.nodes[nodes.CodeEdgeLint] = domain.RunnerEvent{NodeID: nodes.CodeEdgeLint, Status: "succeeded"}
-	m.handleMouse(tea.MouseMsg(tea.MouseEvent{X: 8, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	clickRenderedMarker(t, &m, localizeNode(nodes.RepoPrepare)+" ("+nodes.RepoPrepare+")")
 	if m.selectedNode != nodes.RepoPrepare {
 		t.Fatalf("overview mouse did not select first visible row: %q", m.selectedNode)
 	}
 	m.view = viewGate
 	m.activeGate = &domain.GateRequest{RequestID: "r1", GateID: nodes.FinalReview, Checklist: []domain.ChecklistItem{{ID: "ok", Passed: true}}}
-	cmd := m.handleMouse(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 29, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	cmd := clickRenderedMarker(t, &m, "[Ctrl+A/a 批准]")
 	if cmd == nil || m.confirm == nil || m.confirm.Action != confirmApprove {
 		t.Fatalf("gate mouse did not open approve confirmation: confirm=%+v cmd=%v", m.confirm, cmd)
 	}

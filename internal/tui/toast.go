@@ -33,15 +33,20 @@ func (m model) renderToast() string {
 	if m.toast.Message == "" {
 		return ""
 	}
-	text := redactUI(m.toast.Message)
+	text := redactSingleLineUI(m.toast.Message)
+	var rendered string
 	switch m.toast.Level {
 	case toastSuccess:
-		return passStyle.Render("✓ " + text)
+		rendered = passStyle.Render("✓ " + text)
 	case toastWarning:
-		return warnStyle.Render("⚠ " + text)
+		rendered = warnStyle.Render("⚠ " + text)
 	case toastError:
-		return failStyle.Render("✗ " + text)
+		rendered = failStyle.Render("✗ " + text)
 	default:
-		return defaultTheme.Focused.Render("● " + text)
+		rendered = defaultTheme.Focused.Render("● " + text)
 	}
+	if m.width > 0 {
+		rendered = clipDisplay(rendered, m.width)
+	}
+	return rendered
 }

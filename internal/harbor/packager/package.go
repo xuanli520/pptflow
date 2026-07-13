@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/evidence"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/lint"
 	"github.com/purplevoid/harbor-factory/internal/harbor/repourl"
@@ -144,8 +145,10 @@ func Package(opts Options) (domain.PackageReport, error) {
 	if err := validateScreenshotEvidence("opus pass@4 screenshot", opusScreenshot); err != nil {
 		return domain.PackageReport{}, err
 	}
-	if qwenScreenshot == opusScreenshot {
-		return domain.PackageReport{}, fmt.Errorf("Qwen and Opus pass@4 screenshots must be distinct files")
+	if same, compareErr := evidence.SameFileContent(qwenScreenshot, opusScreenshot); compareErr != nil {
+		return domain.PackageReport{}, fmt.Errorf("compare Qwen and Opus pass@4 screenshots: %w", compareErr)
+	} else if same {
+		return domain.PackageReport{}, fmt.Errorf("Qwen and Opus pass@4 screenshots must contain distinct evidence")
 	}
 	if err := ensureLintPasses(taskDir, opts, testsAnalysis, qwenScreenshot, opusScreenshot); err != nil {
 		return domain.PackageReport{}, err
@@ -959,19 +962,10 @@ func pathWithinDir(path, dir string) bool {
 }
 
 func validateScreenshotEvidence(label, path string) error {
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return fmt.Errorf("%s is not a readable file: %s", label, path)
+	if err := evidence.ValidateImageFile(path); err != nil {
+		return fmt.Errorf("%s is not a valid image: %w", label, err)
 	}
-	if info.Size() == 0 {
-		return fmt.Errorf("%s is empty: %s", label, path)
-	}
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".png", ".jpg", ".jpeg", ".webp":
-		return nil
-	default:
-		return fmt.Errorf("%s must be a png, jpg, jpeg, or webp file: %s", label, path)
-	}
+	return nil
 }
 
 func ensureLintPasses(taskDir string, opts Options, testsAnalysis, qwenScreenshot, opusScreenshot string) error {

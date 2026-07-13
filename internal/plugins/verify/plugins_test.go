@@ -96,14 +96,39 @@ func TestHarborPluginUsesEvaluationRuntimeAndRequiresExactFourRuns(t *testing.T)
 	if evaluation.request.Attempts != 4 || evaluation.request.Model != "qwen-model" || evaluation.request.Concurrency != 2 {
 		t.Fatalf("Harbor routing/request mismatch: %+v", evaluation.request)
 	}
-	if len(result.Artifacts) != 5 || result.Artifacts[0].Type != "trial_result" || result.Artifacts[1].Type != "trial_result" || result.Artifacts[2].Type != "command_run" {
+	if len(result.Artifacts) != 6 || result.Artifacts[0].Type != "trial_result" || result.Artifacts[1].Type != "trial_result" || result.Artifacts[2].Type != "pass4_screenshot" || result.Artifacts[3].Type != "command_run" {
 		t.Fatalf("Harbor evidence mismatch: %+v", result.Artifacts)
+	}
+	var stored domain.TrialResult
+	storedRaw, readErr := os.ReadFile(result.Artifacts[0].Path)
+	if readErr != nil || json.Unmarshal(storedRaw, &stored) != nil {
+		t.Fatalf("read stored Harbor result: %v", readErr)
+	}
+	if stored.Screenshot != filepath.Base(result.Artifacts[2].Path) {
+		t.Fatalf("stored result does not point at generated screenshot: %+v", stored)
 	}
 
 	evaluation.result.TrialResult.Runs = evaluation.result.TrialResult.Runs[:3]
 	failed, err := (HarborRunQwenPlugin{}).Execute(context.Background(), workflow.NodeRequest{RunID: "run-2", Spec: spec, Store: store, Runtimes: workflow.Runtimes{Evaluation: evaluation}})
-	if err == nil || len(failed.Artifacts) != 5 {
+	if err == nil || len(failed.Artifacts) != 6 {
 		t.Fatalf("invalid four-run result should fail after storing evidence: %+v, %v", failed, err)
+	}
+}
+
+func TestHarborPluginRejectsInvalidPassConcurrencyBeforeEvaluation(t *testing.T) {
+	store := newStore(t)
+	evaluation := &fakeEvaluationRuntime{result: validEvaluation("qwen-model")}
+	spec := workflow.NodeSpec{ID: "harbor_run_qwen", Kind: HarborRunQwenKind, Config: map[string]any{
+		"task_dir": "/task", "model": "qwen-model", "concurrency": 5, "attempts": 4,
+	}}
+	if err := (HarborRunQwenPlugin{}).Validate(spec); err == nil {
+		t.Fatal("plugin validation accepted concurrency greater than the pass@4 trial count")
+	}
+	_, err := (HarborRunQwenPlugin{}).Execute(context.Background(), workflow.NodeRequest{
+		RunID: "run-1", Spec: spec, Store: store, Runtimes: workflow.Runtimes{Evaluation: evaluation},
+	})
+	if err == nil || evaluation.request.Model != "" {
+		t.Fatalf("invalid plan reached evaluation runtime: request=%+v err=%v", evaluation.request, err)
 	}
 }
 
@@ -177,7 +202,7 @@ func TestHarborPluginImportsStrictExistingEvidenceWithoutEvaluation(t *testing.T
 	if evaluation.request.Model != "" {
 		t.Fatalf("existing evidence unexpectedly invoked evaluation: %+v", evaluation.request)
 	}
-	if len(result.Artifacts) != 5 || result.Artifacts[0].Name != "phase3/artifacts/harbor_run_qwen/qwen_result.json" {
+	if len(result.Artifacts) != 6 || result.Artifacts[0].Name != "phase3/artifacts/harbor_run_qwen/qwen_result.json" || result.Artifacts[2].Type != "pass4_screenshot" {
 		t.Fatalf("imported evidence was not canonicalized in ArtifactStore: %+v", result.Artifacts)
 	}
 }
@@ -193,10 +218,10 @@ func TestHarborPluginStoresRedactedPartialEvidenceOnCancellation(t *testing.T) {
 	}
 	spec := workflow.NodeSpec{ID: "harbor_run_opus", Kind: HarborRunOpusKind, Config: map[string]any{"task_dir": "/task", "model": "opus-model"}}
 	result, err := (HarborRunOpusPlugin{}).Execute(context.Background(), workflow.NodeRequest{RunID: "run-1", Spec: spec, Store: store, Runtimes: workflow.Runtimes{Evaluation: evaluation}})
-	if err == nil || len(result.Artifacts) != 5 {
+	if err == nil || len(result.Artifacts) != 6 {
 		t.Fatalf("partial cancellation evidence was not retained: %+v, %v", result, err)
 	}
-	raw, readErr := os.ReadFile(result.Artifacts[2].Path)
+	raw, readErr := os.ReadFile(result.Artifacts[3].Path)
 	if readErr != nil {
 		t.Fatal(readErr)
 	}

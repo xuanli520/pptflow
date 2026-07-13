@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type logsPage struct{ pageBase }
@@ -32,12 +33,13 @@ func (p *logsPage) View(width, height int) string {
 
 func (m model) logsView() string {
 	var lines []string
+	lineWidth := styleContentWidth(contentWidth(m.width), panelStyle)
 	lines = append(lines, sectionStyle.Render("日志"))
 	if strings.TrimSpace(m.filter) != "" {
-		lines = append(lines, defaultTheme.Focused.Render("筛选："+redactUI(m.filter)))
+		lines = append(lines, defaultTheme.Focused.Render(clipDisplay("筛选："+redactSingleLineUI(m.filter), lineWidth)))
 	}
 	if m.err != nil {
-		lines = append(lines, failStyle.Render(redactUI(localizeRuntimeError(m.err))))
+		lines = append(lines, failStyle.Render(clipDisplay(redactSingleLineUI(localizeRuntimeError(m.err)), lineWidth)))
 	}
 	eventLimit := 18
 	if m.height > 0 {
@@ -56,7 +58,8 @@ func (m model) logsView() string {
 		if !matchesFilter(m.filter, node, localizeNode(node), event.Message, event.Type) {
 			continue
 		}
-		eventLines = append(eventLines, fmt.Sprintf("%s %s %s", event.CreatedAt.Format("15:04:05"), padRightDisplay(localizeNode(node)+" ("+node+")", 26), redactUI(event.Message)))
+		prefix := fmt.Sprintf("%s %s ", event.CreatedAt.Format("15:04:05"), padRightDisplay(localizeNode(node)+" ("+node+")", 26))
+		eventLines = append(eventLines, clipDisplay(prefix+clipDisplay(redactSingleLineUI(event.Message), maxInt(0, lineWidth-ansi.StringWidth(prefix))), lineWidth))
 	}
 	if len(eventLines) > eventLimit {
 		eventLines = eventLines[len(eventLines)-eventLimit:]
@@ -77,8 +80,8 @@ func (m model) logsView() string {
 		if m.logTail {
 			mode = "尾部跟踪"
 		}
-		lines = append(lines, sectionStyle.Render(fmt.Sprintf("文件 %d/%d：%s [%s]", idx+1, len(files), redactUI(artifact.Name), mode)))
-		lines = append(lines, subtleStyle.Render(redactUI(artifact.Path)))
+		lines = append(lines, sectionStyle.Render(clipDisplay(fmt.Sprintf("文件 %d/%d：%s [%s]", idx+1, len(files), redactSingleLineUI(artifact.Name), mode), lineWidth)))
+		lines = append(lines, subtleStyle.Render(clipDisplay(redactSingleLineUI(artifact.Path), lineWidth)))
 		content := m.logArtifactContent(artifact)
 		offset := m.logContentOffset(content, logPreviewLines(m.height))
 		lines = append(lines, trimLinesFrom(content, logPreviewLines(m.height), offset))

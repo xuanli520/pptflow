@@ -41,29 +41,32 @@ func (o *WorkspaceResumeOverlay) View(width, height int) string {
 		return ""
 	}
 	name := emptyDash(o.Item.Task.TaskName)
+	boxWidth := boundedPanelWidth(width, 42, 72)
+	lineWidth := styleContentWidth(boxWidth, panelStyle)
 	rows := []string{
 		sectionStyle.Render("工作区可恢复"),
 		"",
-		fmt.Sprintf("%s 上次运行于 %s", redactUI(name), hubTime(o.Item.Run)),
+		fmt.Sprintf("%s 上次运行于 %s", redactSingleLineUI(name), hubTime(o.Item.Run)),
 		fmt.Sprintf("已完成 %d/%d 个节点", o.Complete, o.Total),
 		"",
-		resumeChoice(o.Selected == 0, "R", "恢复运行", "从断点继续"),
-		resumeChoice(o.Selected == 1, "N", "新建运行", "复制配置到新工作区"),
-		resumeChoice(o.Selected == 2, "V", "只读查看", "不修改任何文件"),
+		resumeChoice(o.Selected == 0, "R", "恢复运行", "从断点继续", lineWidth),
+		resumeChoice(o.Selected == 1, "N", "新建运行", "复制配置到新工作区", lineWidth),
+		resumeChoice(o.Selected == 2, "V", "只读查看", "不修改任何文件", lineWidth),
 		"",
 		subtleStyle.Render("↑↓ 选择  Enter 确认  Esc 取消"),
 	}
-	boxWidth := clampInt(width-8, 42, 72)
+	rows = clipOverlayRows(rows, lineWidth)
+	rows = fitOverlayRows(rows, height, 5+o.Selected)
 	box := panelStyle.Width(boxWidth).Render(strings.Join(rows, "\n"))
-	return lipgloss.Place(maxInt(width, boxWidth), maxInt(height, 10), lipgloss.Center, lipgloss.Center, box)
+	return lipgloss.Place(maxInt(1, width), maxInt(1, height), lipgloss.Center, lipgloss.Center, box)
 }
 
-func resumeChoice(selected bool, key, title, detail string) string {
+func resumeChoice(selected bool, key, title, detail string, width int) string {
 	prefix := "  "
 	if selected {
 		prefix = selectedStyle.Render("> ")
 	}
-	return prefix + "[" + key + "] " + padRightDisplay(title, 12) + subtleStyle.Render(detail)
+	return clipDisplay(prefix+"["+key+"] "+padRightDisplay(title, 12)+subtleStyle.Render(detail), width)
 }
 
 func (m *model) updateResumeKey(msg tea.KeyMsg) tea.Cmd {

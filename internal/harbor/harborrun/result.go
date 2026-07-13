@@ -71,6 +71,9 @@ func parseNormalizedResult(decoded map[string]any) domain.TrialResult {
 		Screenshot:         firstString(decoded, "screenshot", "screenshot_path", "pass4_screenshot"),
 	}
 	result.Runs = parseRuns(decoded["runs"])
+	sort.SliceStable(result.Runs, func(i, j int) bool {
+		return result.Runs[i].Trial < result.Runs[j].Trial
+	})
 	if result.SchemaVersion == "" {
 		result.SchemaVersion = "harbor.trial_result.v1"
 	}

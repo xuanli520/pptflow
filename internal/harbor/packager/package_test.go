@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
+	"github.com/purplevoid/harbor-factory/internal/harbor/evidence"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	similaritycheck "github.com/purplevoid/harbor-factory/internal/harbor/similarity"
 )
@@ -39,12 +40,8 @@ func TestPackageCreatesZipWithSingleTaskRootAndSubmissionReport(t *testing.T) {
 	}
 	qwenScreenshot := filepath.Join(outputDir, "qwen.png")
 	opusScreenshot := filepath.Join(outputDir, "opus.png")
-	if err := os.WriteFile(qwenScreenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(opusScreenshot, []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writePackageScreenshot(t, qwenScreenshot, "harbor_run_qwen", "qwen3.7-max", 1)
+	writePackageScreenshot(t, opusScreenshot, "harbor_run_opus", "claude-opus-4-6", 3)
 	verifyReport := writeVerifyReport(t, outputDir, taskDir, true, true, true)
 	similarityReport := writeSimilarityReport(t, outputDir, taskDir, true, []string{"history:/tmp/history"})
 	report, err := Package(Options{
@@ -1378,13 +1375,27 @@ func writeTrialResults(t *testing.T, outputDir, taskDir string) (string, string)
 	}, "opus.png")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(outputDir, "qwen.png"), []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(outputDir, "opus.png"), []byte("png"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writePackageScreenshot(t, filepath.Join(outputDir, "qwen.png"), "harbor_run_qwen", "qwen3.7-max", 1)
+	writePackageScreenshot(t, filepath.Join(outputDir, "opus.png"), "harbor_run_opus", "claude-opus-4-6", 3)
 	return qwenResult, opusResult
+}
+
+func writePackageScreenshot(t *testing.T, path, slot, model string, passCount int) {
+	t.Helper()
+	runs := make([]domain.TrialRun, 4)
+	for i := range runs {
+		runs[i] = domain.TrialRun{Trial: i + 1, Passed: i < passCount, Turns: 20 + i}
+	}
+	pngData, err := evidence.RenderPassAt4PNG(slot, domain.TrialResult{
+		Model: model, Trials: 4, PassCount: passCount, PassAt4: float64(passCount) / 4,
+		AverageTurns: 21.5, Runs: runs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, pngData, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func packageTrialResultJSON(t *testing.T, outputDir, taskDir, model string, runs []domain.TrialRun, screenshot string) string {

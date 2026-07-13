@@ -45,20 +45,33 @@ func (o *TaskRepairOverlay) ZIndex() int                    { return 55 }
 func (o *TaskRepairOverlay) InterceptsAllKeys() bool        { return true }
 
 func (o *TaskRepairOverlay) View(width, height int) string {
+	boxWidth := boundedPanelWidth(width, 52, 92)
+	lineWidth := styleContentWidth(boxWidth, panelStyle)
+	feedbackHeight := 8
+	if height > 0 && height < 20 {
+		feedbackHeight = maxInt(1, height-9)
+	}
+	o.Feedback.SetWidth(lineWidth)
+	o.Feedback.SetHeight(feedbackHeight)
 	rows := []string{
-		sectionStyle.Render("外部审查题目返修"), "",
-		"源工作区: " + redactUI(o.SourceWorkspace),
-		fieldLine(o.Field == 0, "目标工作区", "[ "+redactUI(o.Target.View())+" ]"), "",
-		fieldLine(o.Field == 1, "机审 / 人工审核反馈", ""),
+		sectionStyle.Render(clipDisplay("外部审查题目返修", lineWidth)), "",
+		clipDisplay("源工作区: "+redactSingleLineUI(o.SourceWorkspace), lineWidth),
+		inputFieldLine(o.Field == 0, "目标工作区", o.Target, lineWidth), "",
+		fieldLine(o.Field == 1, "机审 / 人工审核反馈", "", lineWidth),
 		o.Feedback.View(), "",
-		subtleStyle.Render("Tab 切换字段  Ctrl+S 创建返修运行  Esc 取消"),
+		subtleStyle.Render(clipDisplay("Tab 切换字段  Ctrl+S 创建返修运行  Esc 取消", lineWidth)),
 	}
 	if o.Loading {
-		rows = append(rows, subtleStyle.Render("正在创建返修工作区..."))
+		rows = append(rows, subtleStyle.Render(clipDisplay("正在创建返修工作区...", lineWidth)))
 	}
-	boxWidth := clampInt(width-8, 52, 92)
+	rows = flattenRenderedLines(rows)
+	selectedRow := 3
+	if o.Field == 1 {
+		selectedRow = 5
+	}
+	rows = fitOverlayRows(rows, height, selectedRow)
 	box := panelStyle.Width(boxWidth).Render(strings.Join(rows, "\n"))
-	return lipgloss.Place(maxInt(width, boxWidth), maxInt(height, 16), lipgloss.Center, lipgloss.Center, box)
+	return lipgloss.Place(maxInt(1, width), maxInt(1, height), lipgloss.Center, lipgloss.Center, box)
 }
 
 func (m *model) updateTaskRepairKey(msg tea.KeyMsg) tea.Cmd {

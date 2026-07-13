@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/spf13/cobra"
 )
 
 func TestTUICommandRejectsAutoApprove(t *testing.T) {
@@ -26,12 +27,32 @@ func TestTUICommandRejectsAutoApprove(t *testing.T) {
 
 func TestTUICommandExposesTaskHubFlags(t *testing.T) {
 	cmd := newTUICommand()
-	if cmd.Flags().Lookup("workspace-root") == nil || cmd.Flags().Lookup("rescan") == nil {
+	if cmd.Flags().Lookup("workspace-root") == nil || cmd.Flags().Lookup("rescan") == nil || cmd.Flags().Lookup("task-concurrency") == nil {
 		t.Fatal("Task Hub workspace-root/rescan flags are missing")
 	}
 	root, err := cmd.Flags().GetString("workspace-root")
 	if err != nil || root != ".harbor-factory" {
 		t.Fatalf("unexpected workspace-root default: %q err=%v", root, err)
+	}
+	concurrency, err := cmd.Flags().GetInt("task-concurrency")
+	if err != nil || concurrency != app.MaxTaskConcurrency {
+		t.Fatalf("unexpected task-concurrency default: %d err=%v", concurrency, err)
+	}
+}
+
+func TestRunAndTUICommandsShareParallelHarborDefaults(t *testing.T) {
+	for _, command := range []*cobra.Command{newRunCommand(), newTUICommand()} {
+		concurrency, err := command.Flags().GetInt("harbor-concurrency")
+		if err != nil {
+			t.Fatal(err)
+		}
+		attempts, err := command.Flags().GetInt("harbor-attempts")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if concurrency != 2 || attempts != 4 {
+			t.Fatalf("%s Harbor defaults differ: concurrency=%d attempts=%d", command.Name(), concurrency, attempts)
+		}
 	}
 }
 

@@ -26,12 +26,16 @@ type RunOptions struct {
 	WorkspaceRoot     string
 	WorkspaceExplicit bool
 	Rescan            bool
+	TaskConcurrency   int
 }
+
+const defaultTaskConcurrency = app.MaxTaskConcurrency
 
 func Run(ctx context.Context, opts app.RunnerOptions) error {
 	return RunWithOptions(ctx, opts, RunOptions{
 		WorkspaceRoot:     defaultHubRoot(opts.Workspace),
 		WorkspaceExplicit: strings.TrimSpace(opts.Workspace) != "",
+		TaskConcurrency:   defaultTaskConcurrency,
 	})
 }
 
@@ -65,12 +69,22 @@ func RunWithOptions(ctx context.Context, opts app.RunnerOptions, runOptions RunO
 		}
 	}
 	defer dataStore.Close()
+	taskConcurrency := runOptions.TaskConcurrency
+	if taskConcurrency == 0 {
+		taskConcurrency = defaultTaskConcurrency
+	}
+	scheduler, err := app.NewTaskScheduler(runCtx, taskConcurrency)
+	if err != nil {
+		return err
+	}
+	defer scheduler.Close()
 
 	scanRoots := []string{root}
 	if runOptions.WorkspaceExplicit && strings.TrimSpace(opts.Workspace) != "" && !pathWithinDirectory(opts.Workspace, root) {
 		scanRoots = append(scanRoots, opts.Workspace)
 	}
 	hub := initialHubModel(runCtx, cancel, opts, dataStore, root, scanRoots)
+	hub.scheduler = scheduler
 	model := hub
 	if opts.Generate || opts.TaskDir != "" {
 		model = hub.attachHubContext(initialModel(runCtx, cancel, opts))
