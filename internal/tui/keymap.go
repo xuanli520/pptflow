@@ -111,7 +111,7 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "?":
 		m.helpVisible = true
 		if m.router != nil {
-			m.router.PushOverlay(&helpOverlay{view: m.view})
+			m.router.PushOverlay(&helpOverlay{view: m.view, readOnly: m.readOnly})
 		}
 		m.focusMgr.Push(focusOverlay)
 		return true, nil
@@ -279,6 +279,8 @@ func (m *model) updateConfirmKey(msg tea.KeyMsg) tea.Cmd {
 			}
 			return workspaceDeletedMsg{path: path}
 		}
+	case confirmRetryNode:
+		return m.prepareManualNodeRetry(d.NodeID, d.Affected)
 	}
 	return nil
 }
@@ -391,7 +393,7 @@ func (m model) footer() string {
 		if m.readOnly {
 			text = "[↑↓/j k 选择] [Tab/Shift+Tab 切换工件] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
 		} else {
-			text = "[↑↓/j k 选择] [Tab/Shift+Tab 切换工件] [e 编辑] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
+			text = "[↑↓/j k 选择] [r 重试节点] [Tab/Shift+Tab 切换工件] [e 编辑] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
 		}
 	case viewDone:
 		text = "[f 外部审查返修] [Esc 返回工作区] [Ctrl+R 重跑] [Ctrl+N 新建] [1 工作区] [2 总览] [4 详情] [5 日志] [q 退出] [? 帮助]"
@@ -399,7 +401,7 @@ func (m model) footer() string {
 		if m.readOnly {
 			text = "[↑↓选择] [Enter详情] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [q退出] [/过滤] [?帮助]"
 		} else {
-			text = "[↑↓选择] [Enter详情] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [Ctrl+X取消运行] [q退出] [/过滤] [?帮助]"
+			text = "[↑↓选择] [Enter详情] [r 重试节点] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [Ctrl+X取消运行] [q退出] [/过滤] [?帮助]"
 		}
 	}
 	if m.readOnly && m.view != viewGate && m.view != viewHub {

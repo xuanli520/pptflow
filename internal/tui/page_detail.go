@@ -60,6 +60,8 @@ func (p *detailPage) Update(msg tea.Msg) (bool, tea.Cmd) {
 		}
 	case "e":
 		return true, p.m.confirmSelectedNodeEdit()
+	case "r":
+		return true, p.m.confirmSelectedNodeRetry()
 	default:
 		return false, nil
 	}
@@ -162,7 +164,7 @@ func (m model) nodeDetailView() string {
 	}
 	lines = append(lines, joinResponsiveColumns(layout, strings.Join(nodeLines, "\n"), strings.Join(artifactLines, "\n")))
 	lines = append(lines, "")
-	actions := "[j/k] 选择节点  [PgUp/PgDn] 滚动  [Tab] 下一工件  [e] 编辑工件  [Ctrl+L] 日志"
+	actions := "[j/k] 选择节点  [PgUp/PgDn] 滚动  [Tab] 下一工件  [e] 编辑工件  [r 重试节点]  [Ctrl+L] 日志"
 	if m.readOnly {
 		actions = "只读快照  [j/k] 选择节点  [Tab] 下一工件  [Ctrl+L] 日志"
 	}

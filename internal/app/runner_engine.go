@@ -41,11 +41,25 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 	workspace := nodes.DefaultWorkspace(r.opts.Workspace)
 	r.opts.Workspace = workspace
 	started := time.Now().UTC()
-	previousRunID := recoverablePreviousRunID(workspace)
-	if previousRunID != "" {
+	manualRetry := r.retryIntent != nil
+	previousRunID := ""
+	var preliminaryRetry ManualRetryPlan
+	if manualRetry {
+		var err error
+		preliminaryRetry, err = planNodeRetry(r.opts, r.retryIntent.NodeID, true)
+		if err != nil {
+			return summary, err
+		}
 		r.stateMu.Lock()
-		r.runID = previousRunID
+		r.runID = preliminaryRetry.RunID
 		r.stateMu.Unlock()
+	} else {
+		previousRunID = recoverablePreviousRunID(workspace)
+		if previousRunID != "" {
+			r.stateMu.Lock()
+			r.runID = previousRunID
+			r.stateMu.Unlock()
+		}
 	}
 	runID := r.ensureRunID()
 	lock, err := runlock.Acquire(workspace, runlock.Metadata{RunID: runID, StartedAt: started})
@@ -56,9 +70,9 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 	defer close(r.events)
 
 	summary = domain.RunSummary{RunID: runID, Workspace: workspace, StartedAt: started, Status: "running", Passed: true}
-	if previousRunID != "" {
+	if previousRunID != "" || manualRetry {
 		summary.Recovered = true
-		summary.PreviousRunID = previousRunID
+		summary.PreviousRunID = runID
 	}
 	if err := r.validateOptions(); err != nil {
 		summary.Status, summary.Passed, summary.FinishedAt = "failed", false, time.Now().UTC()
@@ -92,13 +106,24 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 		Evaluation: cancelingEvaluationRuntime{runner: r, runtime: harborruntime.New(r.opts.HarborExec, nil)},
 	})
 	prior, revision := map[string]workflow.NodeRun(nil), 0
-	if previousRunID != "" {
+	var retryRequest *workflow.ManualRetryRequest
+	if manualRetry {
+		lockedPlan, planErr := planNodeRetry(r.opts, r.retryIntent.NodeID, false)
+		if planErr != nil {
+			return summary, planErr
+		}
+		if lockedPlan.RunID != preliminaryRetry.RunID || lockedPlan.CurrentRevision != preliminaryRetry.CurrentRevision {
+			return summary, fmt.Errorf("manual retry state changed before workspace lock was acquired")
+		}
+		prior, revision = loadWorkflowResume(workspace)
+		retryRequest = &workflow.ManualRetryRequest{NodeID: lockedPlan.RequestedNodeID}
+	} else if previousRunID != "" {
 		prior, revision = loadWorkflowResume(workspace)
 	}
 	requestInput := map[string]any{"github_token": r.opts.GitHubToken}
 	result, engineErr := engine.Run(ctx, workflow.RunRequest{
 		RunID: runID, Revision: revision, Workflow: definition, ArtifactRoot: workspace, WorkspaceRoot: workspace,
-		Input: requestInput, Store: store, Events: runnerWorkflowEventSink{runner: r}, Prior: prior,
+		Input: requestInput, Store: store, Events: runnerWorkflowEventSink{runner: r}, Prior: prior, Retry: retryRequest,
 		Checkpoint: func(_ context.Context, checkpoint workflow.RunResult) error {
 			projected := projectRunSummary(store, checkpoint, r.opts, r.snapshot())
 			if checkpoint.ActiveNodeID != "" {
@@ -106,8 +131,10 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 				projected.Passed = true
 				projected.FinishedAt = time.Time{}
 			}
-			projected.Recovered = previousRunID != ""
-			projected.PreviousRunID = previousRunID
+			projected.Recovered = previousRunID != "" || manualRetry
+			if projected.Recovered {
+				projected.PreviousRunID = runID
+			}
 			return r.writeState(projected)
 		},
 	})
@@ -126,8 +153,10 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 		}
 	}
 	summary = projectRunSummary(store, result, r.opts, r.snapshot())
-	summary.Recovered = previousRunID != ""
-	summary.PreviousRunID = previousRunID
+	summary.Recovered = previousRunID != "" || manualRetry
+	if summary.Recovered {
+		summary.PreviousRunID = runID
+	}
 	if r.opts.RunHarbor {
 		runQwen, runOpus, _ := harborModelSelection(r.opts.HarborModels)
 		if runQwen && summary.QwenResult == nil || runOpus && summary.OpusResult == nil {

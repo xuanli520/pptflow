@@ -1,9 +1,8 @@
 package tui
 
-import "github.com/purplevoid/harbor-factory/internal/harbor/domain"
-
 import (
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 

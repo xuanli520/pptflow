@@ -24,6 +24,8 @@ func localizeStatus(status string) string {
 		return "运行中"
 	case "waiting", "gate_requested":
 		return "等待审查"
+	case "requeued":
+		return "等待重试"
 	case "pending", "":
 		return "等待中"
 	case "blocked":
@@ -115,6 +117,10 @@ func localizeEventType(eventType string) string {
 		return "节点已跳过"
 	case "node_requeued":
 		return "节点等待重新执行"
+	case "manual_retry_started":
+		return "手动节点重试已开始"
+	case "node_preserved":
+		return "节点状态已保留"
 	case "node_reused":
 		return "已复用节点结果"
 	case "gate_requested":

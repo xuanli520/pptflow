@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
 func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
@@ -47,8 +48,22 @@ func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
 	}
 	internalTaskDir := filepath.Join(workspace, "phase2", "task", "generated-task")
 	for _, spec := range definition.Nodes {
-		if spec.ID == nodes.RepoPrepare && (spec.Policy.MaxAttempts != 1 || spec.Config["max_network_attempts"] != 3) {
-			t.Fatalf("repo_prepare must use one Engine attempt with its configured network budget: policy=%+v config=%+v", spec.Policy, spec.Config)
+		if spec.Kind == humanGatePluginKind {
+			if spec.Policy.MaxAttempts != 1 || len(spec.Policy.Retryable) != 0 {
+				t.Fatalf("human gate %s must not retry automatically: %+v", spec.ID, spec.Policy)
+			}
+		} else {
+			if spec.Policy.MaxAttempts != defaultNodeMaxAttempts {
+				t.Fatalf("node %s max attempts=%d, want %d", spec.ID, spec.Policy.MaxAttempts, defaultNodeMaxAttempts)
+			}
+			for _, kind := range defaultNodeRetryableFailures {
+				if !containsFailureKind(spec.Policy.Retryable, kind) {
+					t.Fatalf("node %s retry policy missing %s: %+v", spec.ID, kind, spec.Policy.Retryable)
+				}
+			}
+		}
+		if spec.ID == nodes.RepoPrepare && spec.Config["max_network_attempts"] != 3 {
+			t.Fatalf("repo_prepare lost its configured network budget: %+v", spec.Config)
 		}
 		if spec.ID == nodes.MaterializeTask && spec.Config["task_dir"] != internalTaskDir {
 			t.Fatalf("materialize task_dir=%v, want ArtifactStore-local %s", spec.Config["task_dir"], internalTaskDir)
@@ -59,6 +74,15 @@ func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
 			}
 		}
 	}
+}
+
+func containsFailureKind(values []workflow.FailureKind, target workflow.FailureKind) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildWorkflowDefinitionKeepsPassAtFourTrialCount(t *testing.T) {

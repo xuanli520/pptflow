@@ -69,3 +69,15 @@ func TestOverviewTableRendersPlainVisibleStatusCells(t *testing.T) {
 		}
 	}
 }
+
+func TestAttemptFailureIsNotReportedAsTerminalFailure(t *testing.T) {
+	events := []domain.RunnerEvent{
+		{NodeID: nodes.HarborRunQwen, Type: "node_attempt_failed", Status: "failed", Attempt: 1, Message: "temporary timeout"},
+		{NodeID: nodes.HarborRunQwen, Type: "node_retry_scheduled", Status: "running", Attempt: 2, Message: "retrying after 500ms"},
+		{NodeID: nodes.HarborRunQwen, Type: "node_attempt_started", Status: "running", Attempt: 2},
+		{NodeID: nodes.HarborRunQwen, Type: "node_succeeded", Status: "succeeded", Attempt: 2},
+	}
+	if event, ok := lastFailureInEvents(events); ok {
+		t.Fatalf("retryable attempt failure was treated as terminal: %+v", event)
+	}
+}

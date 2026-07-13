@@ -96,14 +96,25 @@ func TestPackagePluginSuccessAndFailure(t *testing.T) {
 	spec := packageSpec(output)
 	passing := PackagePlugin{Package: func(opts packager.Options) (domain.PackageReport, error) {
 		zipPath := filepath.Join(output, "task.zip")
+		deliveryPath := filepath.Join(output, "task-delivery.zip")
 		if err := os.WriteFile(zipPath, []byte("zip fixture"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		return domain.PackageReport{SchemaVersion: "harbor.package_report.v1", TaskDir: opts.TaskDir, OutputZip: zipPath, ReportPath: filepath.Join(output, "submission_report.json"), TaskName: "task", CreatedAt: time.Now().UTC(), Passed: true}, nil
+		if err := os.WriteFile(deliveryPath, []byte("delivery fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return domain.PackageReport{SchemaVersion: "harbor.package_report.v1", TaskDir: opts.TaskDir, OutputZip: zipPath, DeliveryZip: deliveryPath, ReportPath: filepath.Join(output, "submission_report.json"), TaskName: "task", CreatedAt: time.Now().UTC(), Passed: true}, nil
 	}}
 	result, err := passing.Execute(context.Background(), workflow.NodeRequest{Spec: spec, Store: store})
-	if err != nil || len(result.Artifacts) != 2 || result.Artifacts[1].Type != "harbor_task_zip" {
+	if err != nil || len(result.Artifacts) != 3 || result.Artifacts[1].Type != "harbor_task_zip" || result.Artifacts[2].Type != "submission_delivery_zip" {
 		t.Fatalf("unexpected package success: %+v, %v", result, err)
+	}
+	var storedReport domain.PackageReport
+	if _, err := store.ReadJSON(context.Background(), result.Artifacts[0].Name, &storedReport); err != nil {
+		t.Fatal(err)
+	}
+	if storedReport.TaskZipArtifact != result.Artifacts[1].Path || storedReport.DeliveryZipArtifact != result.Artifacts[2].Path {
+		t.Fatalf("package report omitted durable resume artifacts: %+v", storedReport)
 	}
 
 	want := errors.New("evidence rejected")
@@ -111,6 +122,11 @@ func TestPackagePluginSuccessAndFailure(t *testing.T) {
 	_, err = failing.Execute(context.Background(), workflow.NodeRequest{Spec: spec, Store: store})
 	if !errors.Is(err, want) {
 		t.Fatalf("expected package error, got %v", err)
+	}
+	for _, name := range []string{"task.zip", "task-delivery.zip"} {
+		if _, statErr := os.Stat(filepath.Join(output, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("failed retry left stale package output %s: %v", name, statErr)
+		}
 	}
 }
 
@@ -124,7 +140,7 @@ func similaritySpec() workflow.NodeSpec {
 
 func packageSpec(output string) workflow.NodeSpec {
 	return workflow.NodeSpec{ID: "package", Kind: PackageKind, Config: map[string]any{
-		"task_dir": "/task", "output_dir": output, "tests_analysis": "/evidence/tests_analysis.md", "verify_report": "/evidence/verify.json",
+		"task_dir": "/task", "output_dir": output, "task_name": "task", "tests_analysis": "/evidence/tests_analysis.md", "verify_report": "/evidence/verify.json",
 		"similarity_report": "/evidence/similarity.json", "qwen_result": "/evidence/qwen.json", "opus_result": "/evidence/opus.json",
 	}}
 }

@@ -635,10 +635,38 @@ func TestCancelNodeQueuesBetweenStartedEventAndRuntimeRegistration(t *testing.T)
 	}
 }
 
-func TestFailedQwenStageStillRunsOpus(t *testing.T) {
+func TestRunnerRetriesQwenStageUntilThirdAttempt(t *testing.T) {
+	taskDir := writeRunnerTask(t)
+	exec := &runnerFlakyQwenHarborExec{qwenFailures: 2, delegate: runnerHarborExec{outputs: []string{
+		runnerTrialResultJSON("qwen3.7-max", []domain.TrialRun{
+			{Trial: 1, Turns: 22}, {Trial: 2, Passed: true, Turns: 24, Reward: 1},
+			{Trial: 3, Turns: 23}, {Trial: 4, Turns: 23},
+		}, ""),
+		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
+			{Trial: 1, Passed: true, Turns: 28, Reward: 1}, {Trial: 2, Passed: true, Turns: 29, Reward: 1},
+			{Trial: 3, Passed: true, Turns: 27, Reward: 1}, {Trial: 4, Turns: 28},
+		}, ""),
+	}}}
+	runner := NewRunner(RunnerOptions{
+		TaskDir: taskDir, Workspace: t.TempDir(), AutoApprove: true, RunHarbor: true,
+		HarborAgentEnv: []string{"ANTHROPIC_AUTH_TOKEN=test-token"}, HarborExec: exec,
+	})
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Passed || summary.QwenResult == nil || summary.OpusResult == nil || exec.qwenCalls != 3 {
+		t.Fatalf("third-attempt recovery failed: calls=%d summary=%+v", exec.qwenCalls, summary)
+	}
+	if countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_failed") != 2 || countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_started") != 3 {
+		t.Fatalf("Qwen retry events are incomplete: %+v", summary.Events)
+	}
+}
+
+func TestFailedQwenStageStillRunsOpusAfterThreeAttempts(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
-	exec := &runnerFailFirstHarborExec{delegate: runnerHarborExec{outputs: []string{
+	exec := &runnerFlakyQwenHarborExec{qwenFailures: 3, delegate: runnerHarborExec{outputs: []string{
 		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
 			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
 			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
@@ -663,6 +691,9 @@ func TestFailedQwenStageStillRunsOpus(t *testing.T) {
 	}
 	if !eventSeen(summary.Events, nodes.HarborRunQwen, "failed") || !eventSeen(summary.Events, nodes.HarborRunOpus, "succeeded") {
 		t.Fatalf("both model stages were not attempted: %+v", summary.Events)
+	}
+	if exec.qwenCalls != 3 || countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_failed") != 3 {
+		t.Fatalf("Qwen did not exhaust exactly three attempts: calls=%d events=%+v", exec.qwenCalls, summary.Events)
 	}
 }
 
@@ -1350,8 +1381,15 @@ func TestRunnerPackageForcesVerifyHarborAndSubmissionLint(t *testing.T) {
 	if !strings.Contains(summary.VerifyReport.ImageTag, summary.RunID) || !strings.Contains(summary.VerifyReport.ImageTag, nodes.HarborVerify) {
 		t.Fatalf("verify image tag should include run and node identity: run=%s tag=%s", summary.RunID, summary.VerifyReport.ImageTag)
 	}
-	if _, err := os.Stat(summary.PackageReport.OutputZip); err != nil {
-		t.Fatalf("missing package zip: %v", err)
+	for _, path := range []string{
+		summary.PackageReport.OutputZip,
+		summary.PackageReport.DeliveryZip,
+		summary.PackageReport.TaskZipArtifact,
+		summary.PackageReport.DeliveryZipArtifact,
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("missing package delivery artifact %q: %v", path, err)
+		}
 	}
 	for _, nodeID := range []string{
 		nodes.DockerBuild,
@@ -1807,25 +1845,27 @@ type runnerCancelableHarborExec struct {
 	delegate runnerHarborExec
 }
 
-type runnerFailFirstHarborExec struct {
-	calls    int
-	delegate runnerHarborExec
+type runnerFlakyQwenHarborExec struct {
+	qwenFailures int
+	qwenCalls    int
+	delegate     runnerHarborExec
 }
 
-func (e *runnerFailFirstHarborExec) LookPath(name string) (string, error) {
+func (e *runnerFlakyQwenHarborExec) LookPath(name string) (string, error) {
 	return name, nil
 }
 
-func (e *runnerFailFirstHarborExec) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
+func (e *runnerFlakyQwenHarborExec) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) executor.Result {
 	return e.RunStreamingWithOutput(ctx, timeout, dir, env, io.Discard, nil, name, args...)
 }
 
-func (e *runnerFailFirstHarborExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, callback executor.OutputCallback, name string, args ...string) executor.Result {
-	if e.calls == 0 {
-		e.calls++
+func (e *runnerFlakyQwenHarborExec) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, _ io.Writer, callback executor.OutputCallback, name string, args ...string) executor.Result {
+	if slices.Contains(args, domain.DefaultQwenModel) {
+		e.qwenCalls++
+	}
+	if slices.Contains(args, domain.DefaultQwenModel) && e.qwenCalls <= e.qwenFailures {
 		return executor.Result{Command: name + " " + strings.Join(args, " "), ExitCode: 35, Err: errors.New("transient Qwen failure")}
 	}
-	e.calls++
 	return e.delegate.RunStreamingWithOutput(ctx, timeout, dir, env, io.Discard, callback, name, args...)
 }
 
@@ -1973,6 +2013,16 @@ func eventMessageSeen(events []domain.RunnerEvent, nodeID, message string) bool 
 		}
 	}
 	return false
+}
+
+func countEventType(events []domain.RunnerEvent, nodeID, eventType string) int {
+	count := 0
+	for _, event := range events {
+		if event.NodeID == nodeID && event.Type == eventType {
+			count++
+		}
+	}
+	return count
 }
 
 func eventIndex(events []domain.RunnerEvent, nodeID, status string) int {

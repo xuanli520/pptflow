@@ -68,6 +68,9 @@ func executeHarbor(ctx context.Context, req workflow.NodeRequest, slot string) (
 	if resultPath := strings.TrimSpace(pluginutil.String(req, "result_path")); resultPath != "" {
 		return importHarborResult(ctx, req, slot, resultPath)
 	}
+	if err := invalidateHarborArtifacts(ctx, req, slot); err != nil {
+		return workflow.NodeResult{}, err
+	}
 	if req.Runtimes.Evaluation == nil {
 		return workflow.NodeResult{}, fmt.Errorf("evaluation runtime is required")
 	}
@@ -122,7 +125,7 @@ func executeHarbor(ctx context.Context, req workflow.NodeRequest, slot string) (
 		return result, evaluationFailure(ctx, command, slot, runErr)
 	}
 	if err := validateEvaluationResult(trial, model); err != nil {
-		return result, workflow.NewNodeError(workflow.FailurePermanent, false, "validate Harbor "+slot+" result", err)
+		return result, workflow.NewNodeError(workflow.FailureTransient, true, "validate Harbor "+slot+" result", err)
 	}
 	return result, nil
 }
@@ -152,11 +155,25 @@ func importHarborResult(ctx context.Context, req workflow.NodeRequest, slot, res
 	if err := json.Unmarshal(raw, &command); err != nil {
 		return workflow.NodeResult{}, workflow.NewNodeError(workflow.FailurePermanent, false, "parse provided Harbor command evidence", err)
 	}
+	if err := invalidateHarborArtifacts(ctx, req, slot); err != nil {
+		return workflow.NodeResult{}, err
+	}
 	refs, err := storeEvaluation(ctx, req, sanitize.TrialResult(trial), sanitize.CommandRun(command))
 	if err != nil {
 		return workflow.NodeResult{Artifacts: refs}, err
 	}
 	return workflow.NodeResult{Artifacts: refs}, nil
+}
+
+func invalidateHarborArtifacts(ctx context.Context, req workflow.NodeRequest, slot string) error {
+	invalidator, ok := req.Store.(workflow.ArtifactInvalidator)
+	if !ok {
+		return nil
+	}
+	if err := invalidator.InvalidateProducers(ctx, []string{req.Spec.ID}); err != nil {
+		return fmt.Errorf("invalidate stale Harbor %s evidence: %w", slot, err)
+	}
+	return nil
 }
 
 func storeEvaluation(ctx context.Context, req workflow.NodeRequest, trial domain.TrialResult, command domain.CommandRun) ([]workflow.ArtifactRef, error) {

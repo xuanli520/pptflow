@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -187,6 +188,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setView(viewOverview)
 		m.notice = fmt.Sprintf("已从 %s 创建新工作区。", msg.manifest.SourceWorkspace)
 		return m, tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
+	case manualRetryPreparedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, m.showToast("节点重试启动失败", toastError)
+		}
+		if msg.runner == nil {
+			m.err = fmt.Errorf("节点重试运行器为空")
+			return m, m.showToast("节点重试启动失败", toastError)
+		}
+		m.runner = msg.runner
+		m.opts = msg.opts
+		m.summary.Status = "running"
+		m.summary.Passed = true
+		m.summary.FinishedAt = time.Time{}
+		m.err = nil
+		m.done = false
+		m.readOnly = false
+		m.activeGate = nil
+		m.selectedNode = msg.nodeID
+		m.selectedArtifact = 0
+		retryEvent := domain.RunnerEvent{NodeID: msg.nodeID, Type: "manual_retry_started", Status: "requeued", Message: "手动节点重试已启动"}
+		m.events = append(m.events, retryEvent)
+		m.nodes[msg.nodeID] = mergeNodeEvent(m.nodes[msg.nodeID], retryEvent)
+		m.notice = fmt.Sprintf("已从 %s 启动节点重试，%d 个节点将重新评估。", localizeNode(msg.nodeID), len(msg.affected))
+		m.setView(viewOverview)
+		return m, tea.Batch(m.showToast("节点重试已启动", toastSuccess), m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
 	}
 	return m, nil
 }

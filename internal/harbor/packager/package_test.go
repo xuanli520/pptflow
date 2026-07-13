@@ -85,6 +85,10 @@ func TestPackageCreatesZipWithSingleTaskRootAndSubmissionReport(t *testing.T) {
 	if submission["qwen_pass4_screenshot"] != qwenScreenshot || submission["opus_pass4_screenshot"] != opusScreenshot {
 		t.Fatalf("submission missing screenshot fields: %+v", submission)
 	}
+	deliveryArtifacts, ok := submission["delivery_artifacts"].(map[string]any)
+	if !ok || deliveryArtifacts["task_zip"] != "packages/sample-task.zip" || deliveryArtifacts["qwen_result"] != "evidence/qwen/qwen_result.json" || deliveryArtifacts["qwen_pass4_screenshot"] != "evidence/qwen/pass4_evidence.png" {
+		t.Fatalf("submission missing portable delivery artifact mapping: %+v", submission)
+	}
 	if submission["quality_report"] != "quality_report.json" {
 		t.Fatalf("submission missing quality report: %+v", submission)
 	}
@@ -126,6 +130,37 @@ func TestPackageCreatesZipWithSingleTaskRootAndSubmissionReport(t *testing.T) {
 	for name, found := range want {
 		if !found {
 			t.Fatalf("zip missing %s", name)
+		}
+	}
+	if report.DeliveryZip == "" {
+		t.Fatal("package report omitted self-contained delivery bundle")
+	}
+	delivery, err := zip.OpenReader(report.DeliveryZip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer delivery.Close()
+	wantDelivery := map[string]bool{
+		"task/sample-task/instruction.md":         false,
+		"task/sample-task/solution/solve.sh":      false,
+		"task/sample-task/tests/test.sh":          false,
+		"packages/sample-task.zip":                false,
+		"evidence/qwen/qwen_result.json":          false,
+		"evidence/opus/opus_result.json":          false,
+		"evidence/qwen/pass4_evidence.png":        false,
+		"evidence/opus/pass4_evidence.png":        false,
+		"evidence/reports/verify_report.json":     false,
+		"evidence/reports/similarity_report.json": false,
+		"submission_report.json":                  false,
+	}
+	for _, file := range delivery.File {
+		if _, ok := wantDelivery[file.Name]; ok {
+			wantDelivery[file.Name] = true
+		}
+	}
+	for name, found := range wantDelivery {
+		if !found {
+			t.Fatalf("delivery bundle missing %s", name)
 		}
 	}
 }

@@ -28,6 +28,9 @@ func mergeNodeEvent(previous, event domain.RunnerEvent) domain.RunnerEvent {
 	if event.Status == "" {
 		event.Status = previous.Status
 	}
+	if event.Type == "node_attempt_failed" || event.Type == "node_retry_scheduled" {
+		event.Status = "running"
+	}
 	if strings.TrimSpace(event.Message) == "" {
 		event.Message = nodeEventFallbackMessage(event)
 		if event.Message == "" {
@@ -56,7 +59,12 @@ func nodeEventFallbackMessage(event domain.RunnerEvent) string {
 			return fmt.Sprintf("正在执行第 %d 次尝试", event.Attempt)
 		}
 		return "节点尝试已开始"
-	case "node_succeeded", "node_failed", "node_canceled", "node_skipped", "node_requeued", "node_reused":
+	case "node_retry_scheduled":
+		if event.Attempt > 0 {
+			return fmt.Sprintf("已安排第 %d 次尝试", event.Attempt)
+		}
+		return "节点重试已安排"
+	case "node_succeeded", "node_failed", "node_canceled", "node_skipped", "node_requeued", "node_reused", "node_preserved", "manual_retry_started":
 		return localizeEventType(event.Type)
 	case "gate_requested":
 		return localizeEventType(event.Type)

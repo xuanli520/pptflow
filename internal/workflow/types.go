@@ -115,6 +115,11 @@ type RunRequest struct {
 	// Prior contains durable node snapshots from a previous invocation. Only
 	// succeeded nodes are reused; all other nodes are scheduled again.
 	Prior map[string]NodeRun `json:"-"`
+	// Retry requests a manual retry within the same durable run. Engine plans
+	// and applies the retry after acquiring the workspace-scoped infrastructure,
+	// preserving successful upstream nodes and invalidating only retry roots and
+	// their downstream dependants.
+	Retry *ManualRetryRequest `json:"-"`
 	// Checkpoint runs after Engine atomically persists run_result.json. It is
 	// intended for app.Runner state projection and must return an error if the
 	// durable checkpoint cannot be accepted.
@@ -122,20 +127,36 @@ type RunRequest struct {
 }
 
 type RunResult struct {
-	RunID         string        `json:"run_id"`
-	WorkflowID    string        `json:"workflow_id"`
-	Status        RunStatus     `json:"status"`
-	Revision      int           `json:"revision,omitempty"`
-	ActiveNodeID  string        `json:"active_node_id,omitempty"`
-	ActiveAttempt int           `json:"active_attempt,omitempty"`
-	ArtifactRoot  string        `json:"artifact_root"`
-	WorkspaceRoot string        `json:"workspace_root"`
-	Nodes         []NodeRun     `json:"nodes"`
-	Artifacts     []ArtifactRef `json:"artifacts"`
-	Events        []Event       `json:"events"`
-	StartedAt     time.Time     `json:"started_at"`
-	FinishedAt    time.Time     `json:"finished_at"`
-	DurationMS    int64         `json:"duration_ms"`
+	RunID         string           `json:"run_id"`
+	WorkflowID    string           `json:"workflow_id"`
+	Status        RunStatus        `json:"status"`
+	Revision      int              `json:"revision,omitempty"`
+	ActiveNodeID  string           `json:"active_node_id,omitempty"`
+	ActiveAttempt int              `json:"active_attempt,omitempty"`
+	ArtifactRoot  string           `json:"artifact_root"`
+	WorkspaceRoot string           `json:"workspace_root"`
+	Nodes         []NodeRun        `json:"nodes"`
+	Artifacts     []ArtifactRef    `json:"artifacts"`
+	Events        []Event          `json:"events"`
+	StartedAt     time.Time        `json:"started_at"`
+	FinishedAt    time.Time        `json:"finished_at"`
+	DurationMS    int64            `json:"duration_ms"`
+	ManualRetry   *ManualRetryPlan `json:"manual_retry,omitempty"`
+}
+
+type ManualRetryRequest struct {
+	NodeID string `json:"node_id"`
+}
+
+type ManualRetryPlan struct {
+	RequestedNodeID string   `json:"requested_node_id"`
+	RestartNodeID   string   `json:"restart_node_id"`
+	RetryRoots      []string `json:"retry_roots"`
+	AffectedNodes   []string `json:"affected_nodes"`
+	ReusedUpstream  []string `json:"reused_upstream"`
+	PreservedNodes  []string `json:"preserved_nodes,omitempty"`
+	CurrentRevision int      `json:"current_revision"`
+	NextRevision    int      `json:"next_revision"`
 }
 
 type PluginManifest struct {

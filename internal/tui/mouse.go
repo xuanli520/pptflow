@@ -249,6 +249,7 @@ func (m *model) mouseTargets() []mouseTarget {
 		"[Enter 打开]": "enter", "[Del 删除]": "delete", "[s/S 排序]": "s", "[/ 搜索]": "/",
 		"[q 退出]": "q", "[Enter 下一步]": "enter", "[Enter 启动]": "enter", "[Ctrl+Q 退出]": "ctrl+q",
 		"[Esc 返回]": "esc", "[Tab 下一工件]": "tab", "[Tab/Shift+Tab 切换文件]": "tab", "[/ 过滤]": "/",
+		"[r 重试节点]": "r",
 	} {
 		key := key
 		add(marker, func() tea.Cmd { return m.dispatchMouseKey(key) })

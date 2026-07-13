@@ -113,6 +113,52 @@ func TestHarborPluginUsesEvaluationRuntimeAndRequiresExactFourRuns(t *testing.T)
 	if err == nil || len(failed.Artifacts) != 6 {
 		t.Fatalf("invalid four-run result should fail after storing evidence: %+v, %v", failed, err)
 	}
+	var classified workflow.ClassifiedError
+	if !errors.As(err, &classified) || classified.FailureKind() != workflow.FailureTransient || !classified.Retryable() {
+		t.Fatalf("generated Harbor result validation must be retryable: %T %v", err, err)
+	}
+}
+
+func TestHarborPluginRetryInvalidatesAndReplacesOldEvidence(t *testing.T) {
+	store := newStore(t)
+	evaluation := &fakeEvaluationRuntime{result: validEvaluation("qwen-model")}
+	spec := workflow.NodeSpec{ID: "harbor_run_qwen", Kind: HarborRunQwenKind, Config: map[string]any{
+		"task_dir": "/task", "model": "qwen-model", "agent": "claude-code",
+	}}
+	first, err := (HarborRunQwenPlugin{}).Execute(context.Background(), workflow.NodeRequest{
+		RunID: "retry-run", Spec: spec, Store: store, Runtimes: workflow.Runtimes{Evaluation: evaluation},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstScreenshotDigest := first.Artifacts[2].SHA256
+	if _, err := store.PutText(context.Background(), "phase3/artifacts/harbor_run_qwen/obsolete-attempt.txt", "debug", spec.ID, "stale"); err != nil {
+		t.Fatal(err)
+	}
+	evaluation.result.TrialResult.Runs[0].Passed = false
+	evaluation.result.TrialResult.PassCount = 0
+	evaluation.result.TrialResult.PassAt4 = 0
+	second, err := (HarborRunQwenPlugin{}).Execute(context.Background(), workflow.NodeRequest{
+		RunID: "retry-run", Spec: spec, Store: store, Runtimes: workflow.Runtimes{Evaluation: evaluation},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Artifacts[2].SHA256 == firstScreenshotDigest {
+		t.Fatal("retry preserved the old screenshot content")
+	}
+	refs, err := store.List(context.Background(), "phase3/artifacts/harbor_run_qwen/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 6 {
+		t.Fatalf("retry left stale or duplicate artifacts: %+v", refs)
+	}
+	for _, ref := range refs {
+		if strings.Contains(ref.Name, "obsolete-attempt") {
+			t.Fatalf("retry did not invalidate old attempt evidence: %+v", refs)
+		}
+	}
 }
 
 func TestHarborPluginRejectsInvalidPassConcurrencyBeforeEvaluation(t *testing.T) {
@@ -204,6 +250,19 @@ func TestHarborPluginImportsStrictExistingEvidenceWithoutEvaluation(t *testing.T
 	}
 	if len(result.Artifacts) != 6 || result.Artifacts[0].Name != "phase3/artifacts/harbor_run_qwen/qwen_result.json" || result.Artifacts[2].Type != "pass4_screenshot" {
 		t.Fatalf("imported evidence was not canonicalized in ArtifactStore: %+v", result.Artifacts)
+	}
+	resumeSpec := spec
+	resumeSpec.Config = map[string]any{
+		"task_dir": taskDir, "model": "qwen3.7-max", "agent": "claude-code", "result_path": result.Artifacts[0].Path,
+	}
+	resumed, err := (HarborRunQwenPlugin{}).Execute(context.Background(), workflow.NodeRequest{
+		RunID: "run-import-resume", Spec: resumeSpec, Store: store, Runtimes: workflow.Runtimes{Evaluation: evaluation},
+	})
+	if err != nil {
+		t.Fatalf("resume could not re-import canonical result before invalidation: %v", err)
+	}
+	if len(resumed.Artifacts) != 6 || resumed.Artifacts[2].Type != "pass4_screenshot" {
+		t.Fatalf("resume did not regenerate canonical screenshot evidence: %+v", resumed.Artifacts)
 	}
 }
 

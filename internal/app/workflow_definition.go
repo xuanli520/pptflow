@@ -14,6 +14,19 @@ import (
 
 const harborWorkflowID = "harbor-factory"
 
+const (
+	defaultNodeMaxAttempts = 3
+	humanGatePluginKind    = "harborfactory.human_gate"
+)
+
+var defaultNodeRetryableFailures = []workflow.FailureKind{
+	workflow.FailureUnknown,
+	workflow.FailureTransient,
+	workflow.FailureTimeout,
+	workflow.FailureRateLimit,
+	workflow.FailureNetwork,
+}
+
 func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, error) {
 	workspace := nodes.DefaultWorkspace(opts.Workspace)
 	taskDir := strings.TrimSpace(opts.TaskDir)
@@ -37,16 +50,22 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		definition.Nodes = append(definition.Nodes, spec)
 	}
 	chain := func(id, kind string, depends []string, timeout, attempts int, config map[string]any, inputs ...workflow.ArtifactRef) {
+		maxAttempts := attempts
+		var retryable []workflow.FailureKind
+		if kind != humanGatePluginKind {
+			maxAttempts = defaultNodeMaxAttempts
+			retryable = append([]workflow.FailureKind(nil), defaultNodeRetryableFailures...)
+		}
 		add(workflow.NodeSpec{
 			ID: id, Kind: kind, PluginID: kind, Name: id, DependsOn: depends, Inputs: inputs, Config: config,
-			Policy: workflow.NodePolicy{TimeoutSeconds: timeout, MaxAttempts: attempts, RetryBackoffMS: 500, RetryMaxBackoffMS: 5000, Retryable: []workflow.FailureKind{workflow.FailureTransient, workflow.FailureTimeout, workflow.FailureRateLimit, workflow.FailureNetwork}},
+			Policy: workflow.NodePolicy{TimeoutSeconds: timeout, MaxAttempts: maxAttempts, RetryBackoffMS: 500, RetryMaxBackoffMS: 5000, Retryable: retryable},
 		})
 	}
 	artifact := func(name, artifactType, producer string) workflow.ArtifactRef {
 		return workflow.ArtifactRef{Name: filepath.ToSlash(name), Type: artifactType, Producer: producer}
 	}
 	gate := func(id, phase, name, message, restartFrom string, depends []string, inputs ...workflow.ArtifactRef) {
-		chain(id, "harborfactory.human_gate", depends, 86400, 1, map[string]any{
+		chain(id, humanGatePluginKind, depends, 86400, 1, map[string]any{
 			"phase": phase, "gate_id": id, "gate_name": name, "message": message,
 			"artifact_name": filepath.ToSlash(filepath.Join(phase, "artifacts", "reviews", id, "decision.json")),
 			"restart_from":  restartFrom, "task_dir": taskDir, "model": opts.Model,

@@ -2,8 +2,16 @@ package workflow
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
+
+type checkpointPersistError struct{ err error }
+
+func (e checkpointPersistError) Error() string {
+	return fmt.Sprintf("persist workflow checkpoint: %v", e.err)
+}
+func (e checkpointPersistError) Unwrap() error { return e.err }
 
 type checkpointManager struct {
 	mu        sync.Mutex
@@ -62,18 +70,29 @@ func (s checkpointEventSink) Emit(ctx context.Context, event Event) error {
 	if err := s.delegate.Emit(ctx, event); err != nil {
 		return err
 	}
-	if event.Type == "node_attempt_started" {
+	if event.Type == "node_attempt_started" || event.Type == "node_retry_scheduled" {
 		s.checkpoint.setActiveAttempt(event.Attempt)
 	}
 	switch event.Type {
-	case "node_started", "node_attempt_started", "node_attempt_failed", "gate_requested":
-		return s.checkpoint.persist(context.WithoutCancel(ctx))
+	case "node_started", "node_attempt_started", "node_attempt_failed", "node_retry_scheduled", "gate_requested":
+		if err := s.checkpoint.persist(context.WithoutCancel(ctx)); err != nil {
+			return checkpointPersistError{err: err}
+		}
+		return nil
 	default:
 		return nil
 	}
 }
 
 func cloneRunResult(result RunResult) RunResult {
+	if result.ManualRetry != nil {
+		plan := *result.ManualRetry
+		plan.RetryRoots = append([]string(nil), plan.RetryRoots...)
+		plan.AffectedNodes = append([]string(nil), plan.AffectedNodes...)
+		plan.ReusedUpstream = append([]string(nil), plan.ReusedUpstream...)
+		plan.PreservedNodes = append([]string(nil), plan.PreservedNodes...)
+		result.ManualRetry = &plan
+	}
 	if len(result.Nodes) > 0 {
 		nodes := make([]NodeRun, 0, len(result.Nodes))
 		for _, run := range result.Nodes {

@@ -44,6 +44,9 @@ func (p PackagePlugin) Execute(ctx context.Context, req workflow.NodeRequest) (w
 	if packageTask == nil {
 		packageTask = packager.Package
 	}
+	if err := removeStalePackageOutputs(pluginutil.String(req, "output_dir"), pluginutil.String(req, "task_name")); err != nil {
+		return workflow.NodeResult{}, fmt.Errorf("remove stale package outputs: %w", err)
+	}
 	report, err := packageTask(packager.Options{
 		TaskDir:          pluginutil.String(req, "task_dir"),
 		OutputDir:        pluginutil.String(req, "output_dir"),
@@ -71,10 +74,6 @@ func (p PackagePlugin) Execute(ctx context.Context, req workflow.NodeRequest) (w
 	if !report.Passed {
 		return workflow.NodeResult{}, workflow.NewNodeError(workflow.FailurePermanent, false, "package", fmt.Errorf("report did not pass"))
 	}
-	reportRef, err := req.Store.PutJSON(ctx, pluginutil.ArtifactName(req, "phase3/artifacts/"+req.Spec.ID+"/package_report.json"), "package_report", req.Spec.ID, report)
-	if err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("store package report: %w", err)
-	}
 	zip, err := os.Open(report.OutputZip)
 	if err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("open packaged ZIP: %w", err)
@@ -88,5 +87,46 @@ func (p PackagePlugin) Execute(ctx context.Context, req workflow.NodeRequest) (w
 	if err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("store packaged ZIP: %w", err)
 	}
-	return workflow.NodeResult{Artifacts: []workflow.ArtifactRef{reportRef, zipRef}}, nil
+	report.TaskZipArtifact = zipRef.Path
+	artifacts := []workflow.ArtifactRef{zipRef}
+	if report.DeliveryZip != "" {
+		delivery, err := os.Open(report.DeliveryZip)
+		if err != nil {
+			return workflow.NodeResult{Artifacts: artifacts}, fmt.Errorf("open delivery ZIP: %w", err)
+		}
+		defer delivery.Close()
+		deliveryName := pluginutil.String(req, "delivery_artifact_name")
+		if deliveryName == "" {
+			deliveryName = filepath.ToSlash(filepath.Join("phase3", "artifacts", req.Spec.ID, filepath.Base(report.DeliveryZip)))
+		}
+		deliveryRef, err := req.Store.Put(ctx, workflow.PutArtifactRequest{Name: deliveryName, Type: "submission_delivery_zip", Producer: req.Spec.ID, Content: delivery})
+		if err != nil {
+			return workflow.NodeResult{Artifacts: artifacts}, fmt.Errorf("store delivery ZIP: %w", err)
+		}
+		report.DeliveryZipArtifact = deliveryRef.Path
+		artifacts = append(artifacts, deliveryRef)
+	}
+	reportRef, err := req.Store.PutJSON(ctx, pluginutil.ArtifactName(req, "phase3/artifacts/"+req.Spec.ID+"/package_report.json"), "package_report", req.Spec.ID, report)
+	if err != nil {
+		return workflow.NodeResult{Artifacts: artifacts}, fmt.Errorf("store package report: %w", err)
+	}
+	artifacts = append([]workflow.ArtifactRef{reportRef}, artifacts...)
+	return workflow.NodeResult{Artifacts: artifacts}, nil
+}
+
+func removeStalePackageOutputs(outputDir, taskName string) error {
+	outputDir = filepath.Clean(outputDir)
+	if outputDir == "" || outputDir == "." {
+		return nil
+	}
+	normalized, err := packager.NormalizeTaskName(taskName)
+	if err != nil {
+		return nil
+	}
+	for _, name := range []string{normalized + ".zip", normalized + "-delivery.zip", "submission_report.json"} {
+		if err := os.Remove(filepath.Join(outputDir, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }

@@ -373,11 +373,14 @@ type VerifyReport struct {
 }
 
 type PackageReport struct {
-	SchemaVersion string    `json:"schema_version"`
-	TaskDir       string    `json:"task_dir"`
-	OutputZip     string    `json:"output_zip"`
-	ReportPath    string    `json:"report_path"`
-	TaskName      string    `json:"task_name"`
-	CreatedAt     time.Time `json:"created_at"`
-	Passed        bool      `json:"passed"`
+	SchemaVersion       string    `json:"schema_version"`
+	TaskDir             string    `json:"task_dir"`
+	OutputZip           string    `json:"output_zip"`
+	DeliveryZip         string    `json:"delivery_zip,omitempty"`
+	TaskZipArtifact     string    `json:"task_zip_artifact,omitempty"`
+	DeliveryZipArtifact string    `json:"delivery_zip_artifact,omitempty"`
+	ReportPath          string    `json:"report_path"`
+	TaskName            string    `json:"task_name"`
+	CreatedAt           time.Time `json:"created_at"`
+	Passed              bool      `json:"passed"`
 }

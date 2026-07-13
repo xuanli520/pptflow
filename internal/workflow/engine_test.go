@@ -180,11 +180,12 @@ func TestFileArtifactStoreRegisterRecordsExistingFile(t *testing.T) {
 }
 
 type productionPlugin struct {
-	mu       sync.Mutex
-	calls    map[string]int
-	attempts []int
-	inputs   []ArtifactRef
-	failures int
+	mu                   sync.Mutex
+	calls                map[string]int
+	attempts             []int
+	inputs               []ArtifactRef
+	failures             int
+	unclassifiedFailures int
 }
 
 func (p *productionPlugin) Manifest() PluginManifest {
@@ -203,6 +204,10 @@ func (p *productionPlugin) Execute(ctx context.Context, req NodeRequest) (NodeRe
 	if p.failures > 0 {
 		p.failures--
 		return NodeResult{}, NewNodeError(FailureTransient, true, "temporary", errors.New("unavailable"))
+	}
+	if p.unclassifiedFailures > 0 {
+		p.unclassifiedFailures--
+		return NodeResult{}, errors.New("temporary unclassified failure")
 	}
 	ref, err := req.Store.PutText(ctx, req.Spec.ID+".txt", "test", req.Spec.ID, req.Spec.ID)
 	return NodeResult{Artifacts: []ArtifactRef{ref}}, err
@@ -263,6 +268,62 @@ func TestEngineRetryUsesTypedFailureAndAttempt(t *testing.T) {
 	if result.Nodes[0].Metrics.RetryCount != 2 {
 		t.Fatalf("metrics = %+v", result.Nodes[0].Metrics)
 	}
+	if countWorkflowEvent(result.Events, "a", "node_retry_scheduled") != 2 {
+		t.Fatalf("retry schedule events missing: %+v", result.Events)
+	}
+}
+
+func TestEngineRetryAllowsUnclassifiedOperationalFailure(t *testing.T) {
+	plugin := &productionPlugin{unclassifiedFailures: 2}
+	registry := NewRegistry()
+	if err := registry.Register(plugin); err != nil {
+		t.Fatal(err)
+	}
+	var checkpoints []RunResult
+	result, err := NewEngine(registry, Runtimes{}).Run(context.Background(), RunRequest{
+		Workflow: WorkflowDefinition{ID: "retry-unknown", Nodes: []NodeSpec{{
+			ID: "a", Kind: "production", Policy: NodePolicy{
+				MaxAttempts: 3, RetryBackoffMS: 1, Retryable: []FailureKind{FailureUnknown},
+			},
+		}}},
+		ArtifactRoot: filepath.Join(t.TempDir(), "artifacts"), WorkspaceRoot: filepath.Join(t.TempDir(), "workspace"),
+		Checkpoint: func(_ context.Context, checkpoint RunResult) error {
+			checkpoints = append(checkpoints, checkpoint)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(plugin.attempts); got != "[1 2 3]" {
+		t.Fatalf("attempts = %s", got)
+	}
+	if result.Nodes[0].Metrics.RetryCount != 2 {
+		t.Fatalf("metrics = %+v", result.Nodes[0].Metrics)
+	}
+	retryCheckpoint := false
+	for _, checkpoint := range checkpoints {
+		if checkpoint.ActiveNodeID != "a" || checkpoint.ActiveAttempt != 2 || len(checkpoint.Events) == 0 {
+			continue
+		}
+		if checkpoint.Events[len(checkpoint.Events)-1].Type == "node_retry_scheduled" {
+			retryCheckpoint = true
+			break
+		}
+	}
+	if !retryCheckpoint {
+		t.Fatalf("scheduled retry was not durably checkpointed: %+v", checkpoints)
+	}
+}
+
+func countWorkflowEvent(events []Event, nodeID, eventType string) int {
+	count := 0
+	for _, event := range events {
+		if event.NodeID == nodeID && event.Type == eventType {
+			count++
+		}
+	}
+	return count
 }
 
 func TestEngineResolvesInputsAndReusesPriorNode(t *testing.T) {

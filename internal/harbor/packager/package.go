@@ -165,6 +165,21 @@ func Package(opts Options) (domain.PackageReport, error) {
 		return domain.PackageReport{}, err
 	}
 	submissionPath := filepath.Join(outputDir, "submission_report.json")
+	deliveryZip := filepath.Join(outputDir, taskName+"-delivery.zip")
+	deliveryArtifacts := map[string]string{
+		"task_root":             filepath.ToSlash(filepath.Join("task", taskName)),
+		"task_zip":              filepath.ToSlash(filepath.Join("packages", taskName+".zip")),
+		"qwen_result":           "evidence/qwen/qwen_result.json",
+		"opus_result":           "evidence/opus/opus_result.json",
+		"qwen_pass4_screenshot": "evidence/qwen/pass4_evidence" + strings.ToLower(filepath.Ext(qwenScreenshot)),
+		"opus_pass4_screenshot": "evidence/opus/pass4_evidence" + strings.ToLower(filepath.Ext(opusScreenshot)),
+		"verify_report":         "evidence/reports/verify_report.json",
+		"similarity_report":     "evidence/reports/similarity_report.json",
+		"submission_report":     "submission_report.json",
+	}
+	if regularFile(opts.QualityReport) {
+		deliveryArtifacts["quality_report"] = "evidence/reports/quality_report.json"
+	}
 	submission := map[string]any{
 		"schema_version":        "harbor.submission_report.v1",
 		"task_name":             taskName,
@@ -187,6 +202,8 @@ func Package(opts Options) (domain.PackageReport, error) {
 		"opus_result":           opts.OpusResult,
 		"qwen_pass4_screenshot": qwenScreenshot,
 		"opus_pass4_screenshot": opusScreenshot,
+		"delivery_bundle":       filepath.Base(deliveryZip),
+		"delivery_artifacts":    deliveryArtifacts,
 		"pass_at_4": map[string]float64{
 			"qwen": qwen.PassAt4,
 			"opus": opus.PassAt4,
@@ -203,6 +220,7 @@ func Package(opts Options) (domain.PackageReport, error) {
 	}
 	data, err := json.MarshalIndent(submission, "", "  ")
 	if err != nil {
+		_ = os.Remove(zipPath)
 		return domain.PackageReport{}, err
 	}
 	if err := ensureNoSubmissionSecrets(data); err != nil {
@@ -210,17 +228,129 @@ func Package(opts Options) (domain.PackageReport, error) {
 		return domain.PackageReport{}, err
 	}
 	if err := os.WriteFile(submissionPath, append(data, '\n'), 0o644); err != nil {
+		_ = os.Remove(submissionPath)
+		_ = os.Remove(zipPath)
 		return domain.PackageReport{}, err
+	}
+	if err := writeDeliveryZip(deliveryZip, taskDir, taskName, zipPath, submissionPath, opts.QwenResult, opts.OpusResult, qwenScreenshot, opusScreenshot, verifyReport, opts.QualityReport, similarityReport); err != nil {
+		_ = os.Remove(deliveryZip)
+		_ = os.Remove(submissionPath)
+		_ = os.Remove(zipPath)
+		return domain.PackageReport{}, fmt.Errorf("write delivery bundle: %w", err)
+	}
+	if err := ensureNoZipSecrets(deliveryZip); err != nil {
+		_ = os.Remove(deliveryZip)
+		_ = os.Remove(submissionPath)
+		_ = os.Remove(zipPath)
+		return domain.PackageReport{}, fmt.Errorf("delivery bundle %w", err)
 	}
 	return domain.PackageReport{
 		SchemaVersion: "harbor.package_report.v1",
 		TaskDir:       taskDir,
 		OutputZip:     zipPath,
+		DeliveryZip:   deliveryZip,
 		ReportPath:    submissionPath,
 		TaskName:      taskName,
 		CreatedAt:     time.Now().UTC(),
 		Passed:        true,
 	}, nil
+}
+
+type deliveryEvidence struct {
+	name string
+	path string
+}
+
+func writeDeliveryZip(zipPath, taskDir, taskName, taskZip, submissionPath, qwenResult, opusResult, qwenScreenshot, opusScreenshot, verifyReport, qualityReport, similarityReport string) (retErr error) {
+	out, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := out.Close(); retErr == nil && closeErr != nil {
+			retErr = closeErr
+		}
+	}()
+	writer := zip.NewWriter(out)
+	defer func() {
+		if closeErr := writer.Close(); retErr == nil && closeErr != nil {
+			retErr = closeErr
+		}
+	}()
+
+	taskName, err = NormalizeTaskName(taskName)
+	if err != nil {
+		return err
+	}
+	if err := filepath.WalkDir(taskDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(taskDir, path)
+		if err != nil {
+			return err
+		}
+		if !taskpolicy.IsAllowedFile(filepath.ToSlash(rel)) {
+			return fmt.Errorf("unexpected task file in delivery bundle: %s", rel)
+		}
+		return addDeliveryFile(writer, filepath.ToSlash(filepath.Join("task", taskName, rel)), path)
+	}); err != nil {
+		return err
+	}
+	evidenceFiles := []deliveryEvidence{
+		{name: "submission_report.json", path: submissionPath},
+		{name: filepath.ToSlash(filepath.Join("packages", taskName+".zip")), path: taskZip},
+		{name: "evidence/qwen/qwen_result.json", path: qwenResult},
+		{name: "evidence/opus/opus_result.json", path: opusResult},
+		{name: "evidence/qwen/pass4_evidence" + strings.ToLower(filepath.Ext(qwenScreenshot)), path: qwenScreenshot},
+		{name: "evidence/opus/pass4_evidence" + strings.ToLower(filepath.Ext(opusScreenshot)), path: opusScreenshot},
+		{name: "evidence/reports/verify_report.json", path: verifyReport},
+		{name: "evidence/reports/similarity_report.json", path: similarityReport},
+	}
+	if regularFile(qualityReport) {
+		evidenceFiles = append(evidenceFiles, deliveryEvidence{name: "evidence/reports/quality_report.json", path: qualityReport})
+	}
+	for _, item := range evidenceFiles {
+		if err := addDeliveryFile(writer, item.name, item.path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func regularFile(path string) bool {
+	info, err := os.Stat(strings.TrimSpace(path))
+	return err == nil && info.Mode().IsRegular()
+}
+
+func addDeliveryFile(writer *zip.Writer, name, source string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("delivery evidence is not a regular file: %s", source)
+	}
+	header, err := zip.FileInfoHeader(info)
+	if err != nil {
+		return err
+	}
+	header.Name = filepath.ToSlash(name)
+	header.Method = zip.Deflate
+	entry, err := writer.CreateHeader(header)
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = io.Copy(entry, file)
+	return err
 }
 
 func ensureNoDirSecrets(taskDir string) error {

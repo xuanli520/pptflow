@@ -944,10 +944,10 @@ func activeGateFromSnapshot(summary domain.RunSummary, events []domain.RunnerEve
 
 func terminalRunnerEvent(event domain.RunnerEvent) bool {
 	switch event.Type {
-	case "node_succeeded", "node_failed", "node_canceled", "run_succeeded", "run_failed":
+	case "node_succeeded", "node_failed", "node_canceled", "node_skipped", "run_succeeded", "run_failed":
 		return true
 	}
-	return event.Status == "succeeded" || event.Status == "failed" || event.Status == "canceled"
+	return event.Status == "succeeded" || event.Status == "failed" || event.Status == "canceled" || event.Status == "skipped"
 }
 
 func sameGateNode(gate *domain.GateRequest, nodeID string) bool {
@@ -1518,11 +1518,11 @@ func lastFailureInEvents(events []domain.RunnerEvent) (domain.RunnerEvent, bool)
 }
 
 func failedRunnerEvent(event domain.RunnerEvent) bool {
-	return event.Type == "node_failed" || event.Type == "run_failed" || event.Status == "failed"
+	return event.Type == "node_failed" || event.Type == "run_failed" || event.Status == "failed" && event.Type != "node_attempt_failed"
 }
 
 func failedNodeEvent(event domain.RunnerEvent) bool {
-	return strings.TrimSpace(event.NodeID) != "" && (event.Type == "node_failed" || event.Status == "failed")
+	return strings.TrimSpace(event.NodeID) != "" && (event.Type == "node_failed" || event.Status == "failed" && event.Type != "node_attempt_failed")
 }
 
 func statusIcon(status string) string {
@@ -1536,7 +1536,7 @@ func statusIcon(status string) string {
 		return failStyle.Render(glyph)
 	case string(domain.CheckWarn):
 		return warnStyle.Render(glyph)
-	case "running":
+	case "running", "requeued":
 		return defaultTheme.Focused.Render(glyph)
 	case "waiting", "gate_requested":
 		return warnStyle.Render(glyph)
@@ -1561,6 +1561,8 @@ func statusGlyph(status string) string {
 		return "⚠"
 	case "running":
 		return "◌"
+	case "requeued":
+		return "↻"
 	case "waiting", "gate_requested":
 		return "⚷"
 	case "blocked":

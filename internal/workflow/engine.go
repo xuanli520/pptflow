@@ -55,7 +55,17 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	if err != nil {
 		return RunResult{}, err
 	}
+	prior := clonePrior(req.Prior)
 	revision := req.Revision
+	var manualPlan *ManualRetryPlan
+	if req.Retry != nil {
+		plan, planErr := PlanManualRetry(req.Workflow, prior, revision, req.Retry.NodeID)
+		if planErr != nil {
+			return RunResult{}, planErr
+		}
+		manualPlan = &plan
+		revision = plan.NextRevision
+	}
 	result := RunResult{
 		RunID:         runID,
 		WorkflowID:    req.Workflow.ID,
@@ -64,7 +74,9 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 		ArtifactRoot:  store.Root(),
 		WorkspaceRoot: workspaceRoot,
 		StartedAt:     start,
+		ManualRetry:   manualPlan,
 	}
+	result.Nodes, result.Artifacts = priorSnapshot(nodes, prior)
 	checkpoint := newCheckpointManager(result, events, store, req.Checkpoint)
 	sink = checkpointEventSink{delegate: sink, checkpoint: checkpoint}
 	if err := sink.Emit(ctx, Event{RunID: runID, Type: "run_started", Message: req.Workflow.Name, Revision: revision}); err != nil {
@@ -73,9 +85,35 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	if err := checkpoint.persist(context.WithoutCancel(ctx)); err != nil {
 		return failCheckpoint(result, checkpoint, fmt.Errorf("persist initial workflow checkpoint: %w", err))
 	}
-	prior := clonePrior(req.Prior)
 	changed := map[string]bool{}
 	maxRevisions := boundedMaxRevisions(req.Workflow.Policy.MaxRevisions)
+	revisionLimit := revision + maxRevisions
+	manualAffected := manualRetryAffected(manualPlan)
+	if manualPlan != nil {
+		for _, nodeID := range manualPlan.ReusedUpstream {
+			run := prior[nodeID]
+			if !artifactsAvailable(ctx, store, run.Artifacts) {
+				return failCheckpoint(result, checkpoint, fmt.Errorf("manual retry cannot reuse node %s because its durable artifacts are unavailable", nodeID))
+			}
+		}
+		if err := applyManualRetry(ctx, store, prior, changed, *manualPlan); err != nil {
+			return failCheckpoint(result, checkpoint, fmt.Errorf("apply manual retry: %w", err))
+		}
+		result.Artifacts = withoutProducerArtifacts(result.Artifacts, manualPlan.AffectedNodes)
+		checkpoint.update(result)
+		if err := sink.Emit(ctx, Event{
+			RunID: runID, NodeID: manualPlan.RequestedNodeID, Type: "manual_retry_started", Status: NodeRequeued,
+			Revision: revision, Message: "manual node retry started", Fields: map[string]any{
+				"restart_from": manualPlan.RestartNodeID, "retry_roots": manualPlan.RetryRoots,
+				"invalidated_nodes": manualPlan.AffectedNodes, "reused_upstream": manualPlan.ReusedUpstream,
+			},
+		}); err != nil {
+			return failCheckpoint(result, checkpoint, err)
+		}
+		if err := checkpoint.persist(context.WithoutCancel(ctx)); err != nil {
+			return failCheckpoint(result, checkpoint, fmt.Errorf("persist manual retry revision %d: %w", revision, err))
+		}
+	}
 	for index := 0; index < len(nodes); {
 		spec := nodes[index]
 		result.ActiveNodeID = spec.ID
@@ -83,10 +121,34 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 		result.Revision = revision
 		checkpoint.update(result)
 		nodeRun := NodeRun{NodeID: spec.ID, Kind: spec.Kind, Name: spec.Name, Status: NodePending}
+		if manualAffected != nil && !manualAffected[spec.ID] {
+			preserved, ok := prior[spec.ID]
+			if !ok {
+				return failCheckpoint(result, checkpoint, fmt.Errorf("manual retry cannot preserve node %s without durable state", spec.ID))
+			}
+			preserved.Revision = revision
+			result.Nodes = upsertNodeRun(result.Nodes, preserved)
+			result.Artifacts = replaceProducerArtifacts(result.Artifacts, spec.ID, preserved.Artifacts)
+			result.ActiveNodeID = ""
+			result.ActiveAttempt = 0
+			eventType, message := "node_preserved", "preserved outside manual retry scope"
+			if preserved.Status == NodeSucceeded {
+				eventType, message = "node_reused", "reused durable node result"
+			}
+			if err := sink.Emit(ctx, Event{RunID: runID, NodeID: spec.ID, Type: eventType, Status: preserved.Status, Message: message, Artifacts: preserved.Artifacts, Revision: revision}); err != nil {
+				return failCheckpoint(result, checkpoint, fmt.Errorf("emit preserved node %s: %w", spec.ID, err))
+			}
+			checkpoint.update(result)
+			if err := checkpoint.persist(context.WithoutCancel(ctx)); err != nil {
+				return failCheckpoint(result, checkpoint, fmt.Errorf("persist preserved node %s: %w", spec.ID, err))
+			}
+			index++
+			continue
+		}
 		if reusable, ok := prior[spec.ID]; ok && reusable.Status == NodeSucceeded && dependenciesSucceeded(spec, prior) && !dependencyChanged(spec, changed) && artifactsAvailable(ctx, store, reusable.Artifacts) {
 			reusable.Revision = revision
-			result.Nodes = append(result.Nodes, reusable)
-			result.Artifacts = append(result.Artifacts, reusable.Artifacts...)
+			result.Nodes = upsertNodeRun(result.Nodes, reusable)
+			result.Artifacts = replaceProducerArtifacts(result.Artifacts, spec.ID, reusable.Artifacts)
 			result.ActiveNodeID = ""
 			result.ActiveAttempt = 0
 			if err := sink.Emit(ctx, Event{RunID: runID, NodeID: spec.ID, Type: "node_reused", Status: NodeSucceeded, Message: "reused durable node result", Artifacts: reusable.Artifacts, Revision: revision}); err != nil {
@@ -104,7 +166,8 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			nodeRun.Status = NodeSkipped
 			nodeRun.Revision = revision
 			nodeRun.Error = "dependency failed: " + blockedBy
-			result.Nodes = append(result.Nodes, nodeRun)
+			result.Nodes = upsertNodeRun(result.Nodes, nodeRun)
+			result.Artifacts = replaceProducerArtifacts(result.Artifacts, spec.ID, nil)
 			prior[spec.ID] = nodeRun
 			result.ActiveNodeID = ""
 			result.ActiveAttempt = 0
@@ -128,7 +191,8 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			nodeRun.Revision = revision
 			nodeRun.Error = err.Error()
 			nodeRun.Metrics = NodeMetrics{FailureType: "validation"}
-			result.Nodes = append(result.Nodes, nodeRun)
+			result.Nodes = upsertNodeRun(result.Nodes, nodeRun)
+			result.Artifacts = replaceProducerArtifacts(result.Artifacts, spec.ID, nil)
 			prior[spec.ID] = nodeRun
 			result.ActiveNodeID = ""
 			result.ActiveAttempt = 0
@@ -147,7 +211,8 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			changed[spec.ID] = true
 			nodeRun.Status, nodeRun.Error, nodeRun.Metrics.FailureType = NodeFailed, err.Error(), string(FailurePermanent)
 			nodeRun.Revision = revision
-			result.Nodes = append(result.Nodes, nodeRun)
+			result.Nodes = upsertNodeRun(result.Nodes, nodeRun)
+			result.Artifacts = replaceProducerArtifacts(result.Artifacts, spec.ID, nil)
 			prior[spec.ID] = nodeRun
 			result.ActiveNodeID = ""
 			result.ActiveAttempt = 0
@@ -174,9 +239,18 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			Runtimes:      e.runtimes,
 			Prior:         clonePrior(prior),
 		})
-		result.Nodes = append(result.Nodes, run)
+		var checkpointErr checkpointPersistError
+		if errors.As(err, &checkpointErr) {
+			return failCheckpoint(result, checkpoint, checkpointErr.err)
+		}
+		// If the node_started checkpoint itself fails, keep the previous durable
+		// node snapshot. No plugin work has begun, so replacing it with a synthetic
+		// running state would make a subsequent manual retry impossible to plan.
+		if err == nil || run.Status != NodeRunning || run.Attempt > 0 {
+			result.Nodes = upsertNodeRun(result.Nodes, run)
+		}
 		changed[spec.ID] = true
-		result.Artifacts = append(result.Artifacts, artifacts...)
+		result.Artifacts = replaceProducerArtifacts(result.Artifacts, spec.ID, artifacts)
 		prior[spec.ID] = run
 		result.ActiveNodeID = ""
 		result.ActiveAttempt = 0
@@ -200,7 +274,7 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			if directiveErr != nil {
 				return failCheckpoint(result, checkpoint, directiveErr)
 			}
-			if revision >= maxRevisions {
+			if revision >= revisionLimit {
 				return failCheckpoint(result, checkpoint, fmt.Errorf("workflow revision limit reached: maximum %d", maxRevisions))
 			}
 			revision++
@@ -231,6 +305,7 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	result.ActiveNodeID = ""
 	result.ActiveAttempt = 0
 	result.Revision = revision
+	result.Nodes = orderNodeRuns(nodes, result.Nodes)
 	terminalType := "run_succeeded"
 	terminalMessage := "workflow succeeded"
 	if result.Status == RunCancelled {
@@ -307,7 +382,19 @@ func (e *Engine) executeNode(ctx context.Context, plugin Plugin, req NodeRequest
 		if attempt == attempts || !policyAllowsRetry(spec.Policy, kind, retryable) {
 			break
 		}
-		if err := waitRetryBackoff(ctx, spec.Policy, attempt); err != nil {
+		delay := retryBackoffDuration(spec.Policy, attempt)
+		if emitErr := req.Events.Emit(ctx, Event{
+			RunID: req.RunID, NodeID: spec.ID, Type: "node_retry_scheduled", Status: NodeRunning,
+			Attempt: attempt + 1, Revision: req.Revision,
+			Message: fmt.Sprintf("retrying after %s", delay),
+			Fields: map[string]any{
+				"failed_attempt": attempt, "next_attempt": attempt + 1,
+				"backoff_ms": delay.Milliseconds(), "failure_type": kind,
+			},
+		}); emitErr != nil {
+			return run, artifacts, nil, emitErr
+		}
+		if err := waitRetryBackoff(ctx, delay); err != nil {
 			lastErr = err
 			break
 		}
@@ -612,6 +699,67 @@ func withoutProducerArtifacts(artifacts []ArtifactRef, producers []string) []Art
 	return kept
 }
 
+func withoutNodeRuns(runs []NodeRun, nodeIDs []string) []NodeRun {
+	invalid := make(map[string]bool, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		invalid[nodeID] = true
+	}
+	kept := make([]NodeRun, 0, len(runs))
+	for _, run := range runs {
+		if !invalid[run.NodeID] {
+			kept = append(kept, run)
+		}
+	}
+	return kept
+}
+
+func upsertNodeRun(runs []NodeRun, updated NodeRun) []NodeRun {
+	for index := range runs {
+		if runs[index].NodeID == updated.NodeID {
+			runs[index] = cloneNodeRun(updated)
+			return runs
+		}
+	}
+	return append(runs, cloneNodeRun(updated))
+}
+
+func orderNodeRuns(nodes []NodeSpec, runs []NodeRun) []NodeRun {
+	byID := make(map[string]NodeRun, len(runs))
+	for _, run := range runs {
+		byID[run.NodeID] = run
+	}
+	ordered := make([]NodeRun, 0, len(byID))
+	for _, spec := range nodes {
+		if run, ok := byID[spec.ID]; ok {
+			ordered = append(ordered, cloneNodeRun(run))
+		}
+	}
+	return ordered
+}
+
+func replaceProducerArtifacts(artifacts []ArtifactRef, producer string, replacements []ArtifactRef) []ArtifactRef {
+	kept := withoutProducerArtifacts(artifacts, []string{producer})
+	for _, artifact := range replacements {
+		kept = append(kept, cloneArtifactRef(artifact))
+	}
+	return kept
+}
+
+func priorSnapshot(nodes []NodeSpec, prior map[string]NodeRun) ([]NodeRun, []ArtifactRef) {
+	runs := make([]NodeRun, 0, len(prior))
+	var artifacts []ArtifactRef
+	for _, spec := range nodes {
+		run, ok := prior[spec.ID]
+		if !ok {
+			continue
+		}
+		run = cloneNodeRun(run)
+		runs = append(runs, run)
+		artifacts = append(artifacts, run.Artifacts...)
+	}
+	return runs, artifacts
+}
+
 func currentRunFailed(nodes []NodeSpec, prior map[string]NodeRun) bool {
 	for _, spec := range nodes {
 		run, ok := prior[spec.ID]
@@ -702,7 +850,7 @@ func policyAllowsRetry(policy NodePolicy, kind FailureKind, classifiedRetryable 
 	return false
 }
 
-func waitRetryBackoff(ctx context.Context, policy NodePolicy, failedAttempt int) error {
+func retryBackoffDuration(policy NodePolicy, failedAttempt int) time.Duration {
 	base := policy.RetryBackoffMS
 	if base <= 0 {
 		base = 100
@@ -714,6 +862,10 @@ func waitRetryBackoff(ctx context.Context, policy NodePolicy, failedAttempt int)
 	if max := policy.RetryMaxBackoffMS; max > 0 && delay > time.Duration(max)*time.Millisecond {
 		delay = time.Duration(max) * time.Millisecond
 	}
+	return delay
+}
+
+func waitRetryBackoff(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {

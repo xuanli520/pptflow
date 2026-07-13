@@ -27,7 +27,7 @@ func (m *model) currentPage() Page {
 
 func renderFrame(m model, body string) string {
 	if m.helpVisible {
-		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), (&helpOverlay{view: m.view}).View(m.width, maxInt(8, m.height-3)), m.footer())
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), (&helpOverlay{view: m.view, readOnly: m.readOnly}).View(m.width, maxInt(8, m.height-3)), m.footer())
 		return strings.TrimRight(frame, "\n") + "\n"
 	}
 	if m.confirm != nil {
