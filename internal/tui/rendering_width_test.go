@@ -78,40 +78,12 @@ func TestFocusedStartURLKeepsClosingBracketOnInputLine(t *testing.T) {
 	}
 }
 
-func TestInputOverlaysKeepFocusedFieldsOnOneLine(t *testing.T) {
-	const target = "/home/user/工作区/very-long-target-workspace/with/Cafe\u0301/and/emoji-👨‍👩‍👧‍👦"
-	for _, width := range []int{40, 60, 80} {
-		views := map[string]string{
-			"rerun":  NewRunConfigOverlay("/source/"+target, target, "task").View(width, 30),
-			"repair": NewTaskRepairOverlay("/source/"+target, target, "task").View(width, 30),
-		}
-		for name, view := range views {
-			assertRenderedWidth(t, name, view, width)
-			plain := ansi.Strip(view)
-			matches := 0
-			for _, line := range strings.Split(plain, "\n") {
-				if strings.Contains(line, "目标工作区") {
-					matches++
-					if !strings.Contains(line, " ]") {
-						t.Fatalf("%s at %d columns wrapped the focused field decoration:\n%s", name, width, plain)
-					}
-				}
-			}
-			if matches != 1 {
-				t.Fatalf("%s at %d columns rendered target field %d times:\n%s", name, width, matches, plain)
-			}
-		}
-	}
-}
-
 func TestOverlaysFitExtremeTerminalSizes(t *testing.T) {
 	for _, size := range []struct{ width, height int }{{20, 10}, {40, 12}} {
 		views := map[string]string{
-			"rerun":   NewRunConfigOverlay("source\npath", "target/工作区/👨‍👩‍👧‍👦", "task").View(size.width, size.height),
-			"repair":  NewTaskRepairOverlay("source\tpath", "target/工作区/👨‍👩‍👧‍👦", "task").View(size.width, size.height),
 			"confirm": newConfirmDialog(confirmQuit, "确认", "包含\r\n换行的确认消息").View(size.width, size.height),
+			"control": newRunControlOverlay("run\nidentifier", "target/工作区/👨‍👩‍👧‍👦", false, false).View(size.width, size.height),
 			"help":    (&helpOverlay{view: viewStart}).View(size.width, size.height),
-			"resume":  (&WorkspaceResumeOverlay{}).View(size.width, size.height),
 		}
 		for name, view := range views {
 			assertRenderedWidth(t, name, view, size.width)

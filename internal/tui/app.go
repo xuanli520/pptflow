@@ -3,7 +3,6 @@ package tui
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,17 +10,11 @@ import (
 )
 
 func (m model) Init() tea.Cmd {
-	if m.view == viewHub {
-		m.hubLoading = true
-		return tea.Batch(m.loadHub(true), hubPollCmd())
-	}
-	if m.view == viewStart {
+	if m.lifecycle == nil {
 		return nil
 	}
-	if m.runner == nil {
-		return tea.Batch(m.refreshWorkspace(), m.spinner.Tick)
-	}
-	return tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
+	m.taskHub.Loading = true
+	return tea.Batch(m.loadTaskHubV2(), taskHubPollCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -107,9 +100,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		m.done = true
 		m.view = viewDone
-		if m.store != nil {
-			return m, m.loadHub(true)
-		}
 		return m, nil
 	case workspaceRefreshMsg:
 		m.applyWorkspaceSnapshot(msg.summary, msg.events)
@@ -117,103 +107,137 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.refreshWorkspace()
-	case hubLoadedMsg:
+	case taskHubPollMsg:
+		if m.view == viewHub && m.lifecycle != nil {
+			m.taskHub.Loading = true
+			return m, tea.Batch(m.loadTaskHubV2(), taskHubPollCmd())
+		}
+		return m, nil
+	case taskHubLoadedMsg:
 		if msg.err != nil {
-			m.hubLoading = false
+			m.taskHub.Loading = false
 			m.err = msg.err
 			return m, nil
 		}
 		m.err = nil
-		m.applyHubItems(msg.items)
+		m.applyTaskHubSnapshot(msg.snapshot)
 		return m, nil
-	case hubPollMsg:
-		if m.view == viewHub {
-			m.hubLoading = true
-			if m.scheduler != nil {
-				tasks := m.scheduler.Snapshot()
-				if tasks.Running > 0 || tasks.Queued > 0 {
-					return m, tea.Batch(m.loadHub(true), hubPollCmd())
-				}
-			}
-			return m, tea.Batch(m.refreshRunningHub(), hubPollCmd())
-		}
-		return m, hubPollCmd()
-	case hubSearchMsg:
-		if m.hubSearching && strings.TrimSpace(m.hubSearch.Value()) == msg.query {
+	case taskHubSearchMsg:
+		if m.lifecycle != nil && m.hubSearching && strings.TrimSpace(m.hubSearch.Value()) == msg.query {
+			m.taskHub.Query.Filter = msg.query
 			m.hubFilter = msg.query
-			m.hubLoading = true
-			return m, m.loadHub(false)
+			m.taskHub.Loading = true
+			return m, m.loadTaskHubV2()
+		}
+	case taskHubPrefixTimeoutMsg:
+		if m.taskHubPrefix.Prefix != 0 && m.taskHubPrefix.Sequence == msg.sequence {
+			m.clearTaskHubPrefix()
 		}
 		return m, nil
-	case workspaceDeletedMsg:
+	case taskHubPlanMsg:
 		if msg.err != nil {
 			m.err = msg.err
+			return m, m.showToast("生命周期计划生成失败", toastError)
+		}
+		preview := msg.preview.Clone()
+		m.taskHubPlan = &preview
+		command := msg.command
+		m.taskHubPlanCommand = &command
+		m.notice = "已生成 " + taskHubActionLabel(msg.command.Action) + " 的计划预览。"
+		return m, m.showToast("计划预览已更新", toastSuccess)
+	case taskHubMutationPreparedMsg:
+		if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != msg.idempotencyKey || m.taskHubMutation.Phase != taskHubMutationPreparing {
 			return m, nil
 		}
-		m.notice = "已删除工作区：" + msg.path
-		m.hubLoading = true
-		return m, tea.Batch(m.showToast("工作区已删除", toastSuccess), m.loadHub(true))
-	case clonePreparedMsg:
+		m.taskHubMutation.Phase = taskHubMutationReady
 		if msg.err != nil {
+			m.taskHubMutation.Error = msg.err.Error()
 			m.err = msg.err
-			if m.runConfig != nil {
-				m.runConfig.Loading = false
-			}
-			if m.taskRepair != nil {
-				m.taskRepair.Loading = false
-			}
-			return m, nil
+			return m, m.showToast("冻结生命周期计划失败", toastError)
 		}
-		if m.taskRepair != nil {
-			m.closeTaskRepair()
-		} else {
-			m.closeRunConfig()
+		preview := msg.prepared.Preview.Clone()
+		m.taskHubMutation.Preview = preview
+		if err := m.taskHubMutation.lockFrozenProvenance(msg.prepared.Actor, msg.prepared.Reason); err != nil {
+			m.taskHubMutation.Error = err.Error()
+			m.err = err
+			return m, m.showToast("冻结计划缺少权威操作来源", toastError)
 		}
-		if msg.background {
-			if m.scheduler == nil {
-				m.err = fmt.Errorf("并行任务调度器不可用")
-				return m, nil
-			}
-			if _, err := m.scheduler.Submit(msg.opts); err != nil {
-				m.err = err
-				return m, nil
-			}
-			m.runner = nil
-			m.notice = fmt.Sprintf("已从 %s 创建并加入并行队列。", msg.manifest.SourceWorkspace)
-			m.setView(viewHub)
-			m.hubLoading = true
-			return m, tea.Batch(m.showToast("重跑任务已加入并行队列", toastSuccess), m.loadHub(true))
-		}
-		m = m.startRunner(msg.opts)
-		m.setView(viewOverview)
-		m.notice = fmt.Sprintf("已从 %s 创建新工作区。", msg.manifest.SourceWorkspace)
-		return m, tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
-	case manualRetryPreparedMsg:
-		if msg.err != nil {
-			m.err = msg.err
-			return m, m.showToast("节点重试启动失败", toastError)
-		}
-		if msg.runner == nil {
-			m.err = fmt.Errorf("节点重试运行器为空")
-			return m, m.showToast("节点重试启动失败", toastError)
-		}
-		m.runner = msg.runner
-		m.opts = msg.opts
-		m.summary.Status = "running"
-		m.summary.Passed = true
-		m.summary.FinishedAt = time.Time{}
+		m.taskHubPlan = &preview
 		m.err = nil
-		m.done = false
-		m.readOnly = false
-		m.activeGate = nil
-		m.selectedNode = msg.nodeID
-		m.selectedArtifact = 0
-		retryEvent := domain.RunnerEvent{NodeID: msg.nodeID, Type: "manual_retry_started", Status: "requeued", Message: "手动节点重试已启动"}
-		m.events = append(m.events, retryEvent)
-		m.nodes[msg.nodeID] = mergeNodeEvent(m.nodes[msg.nodeID], retryEvent)
-		m.notice = fmt.Sprintf("已从 %s 启动节点重试，%d 个节点将重新评估。", localizeNode(msg.nodeID), len(msg.affected))
-		m.setView(viewOverview)
-		return m, tea.Batch(m.showToast("节点重试已启动", toastSuccess), m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
+		m.notice = "已冻结计划；请再次确认后提交执行。"
+		return m, m.showToast("生命周期计划已冻结", toastSuccess)
+	case taskHubMutationExecutedMsg:
+		if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != msg.idempotencyKey || m.taskHubMutation.Phase != taskHubMutationExecuting {
+			return m, nil
+		}
+		m.taskHubMutation.Phase = taskHubMutationReady
+		if msg.err != nil {
+			m.taskHubMutation.Error = msg.err.Error()
+			m.err = msg.err
+			return m, m.showToast("生命周期操作未完成；可使用相同幂等键重试", toastError)
+		}
+		summary := strings.TrimSpace(msg.result.Summary)
+		if summary == "" {
+			summary = taskHubActionLabel(msg.result.Action) + "已提交"
+		}
+		m.closeTaskHubMutation()
+		m.taskHubPlan = nil
+		m.taskHubPlanCommand = nil
+		m.taskHub.Loading = true
+		m.err = nil
+		m.notice = summary
+		return m, tea.Batch(m.showToast(summary, toastSuccess), m.loadTaskHubV2())
+	case taskHubRunControlMutationExecutedMsg:
+		if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != msg.idempotencyKey || m.taskHubMutation.Phase != taskHubMutationExecuting {
+			return m, nil
+		}
+		m.taskHubMutation.Phase = taskHubMutationReady
+		if msg.err != nil {
+			m.taskHubMutation.Error = msg.err.Error()
+			m.err = msg.err
+			return m, m.showToast("运行控制未完成；可使用相同幂等键重试", toastError)
+		}
+		summary := strings.TrimSpace(msg.result.Summary)
+		if summary == "" {
+			summary = taskHubRunControlActionLabel(msg.result.Action) + "请求已提交"
+		}
+		m.closeTaskHubMutation()
+		m.taskHub.Loading = true
+		m.err = nil
+		m.notice = summary
+		return m, tea.Batch(m.showToast(summary, toastSuccess), m.loadTaskHubV2())
+	case taskHubDetailLoadedMsg:
+		if m.taskHubDetail == nil || !sameTaskHubDetailQuery(m.taskHubDetail.Query, msg.query) {
+			return m, nil
+		}
+		m.taskHubDetail.Loading = false
+		if msg.err != nil {
+			m.taskHubDetail.Error = msg.err.Error()
+			m.err = msg.err
+			return m, m.showToast("生命周期详情读取失败", toastError)
+		}
+		detail := msg.detail.Clone()
+		m.taskHubDetail.Detail = detail
+		m.taskHubDetail.Error = ""
+		m.taskHubDetail.Scroll = 0
+		m.syncTaskHubDetailSelections()
+		m.err = nil
+		m.notice = "已刷新只读生命周期详情。"
+		return m, nil
+	case taskHubRunControlPlanMsg:
+		// A late read-only preview must not reopen an overlay that the operator
+		// already dismissed with Esc, nor replace a newer selection's preview.
+		if m.runControl == nil || m.runControl.RunID != msg.runID || m.runControl.SelectedAction != msg.action {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.err = msg.err
+			return m, m.showToast("运行控制预览生成失败", toastError)
+		}
+		preview := msg.preview.Clone()
+		m.runControl.Preview = &preview
+		m.notice = "已生成 " + taskHubRunControlActionLabel(msg.action) + " 的只读影响预览。"
+		return m, m.showToast("运行控制预览已更新", toastSuccess)
 	}
 	return m, nil
 }

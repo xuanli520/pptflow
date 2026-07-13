@@ -8,11 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	harborgen "github.com/purplevoid/harbor-factory/internal/harbor/gen"
-	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/plugins/pluginutil"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
@@ -28,7 +26,6 @@ const (
 	TestKind              = "harborfactory.test_generate"
 	TestsAnalysisKind     = "harborfactory.tests_analysis"
 	MaterializeKind       = "harborfactory.materialize_task"
-	PublishTaskKind       = "harborfactory.publish_task"
 	RuntimeSelfCheckKind  = "harborfactory.runtime_self_check"
 )
 
@@ -42,7 +39,6 @@ type SolvePlugin struct{}
 type TestPlugin struct{}
 type TestsAnalysisPlugin struct{}
 type MaterializePlugin struct{}
-type PublishTaskPlugin struct{}
 
 type RuntimeSelfCheckFunc func(context.Context, harborgen.ConversationOptions, string, string) error
 type RuntimeSelfCheckPlugin struct{ Check RuntimeSelfCheckFunc }
@@ -59,7 +55,6 @@ func (SolvePlugin) Manifest() workflow.PluginManifest         { return manifest(
 func (TestPlugin) Manifest() workflow.PluginManifest          { return manifest(TestKind) }
 func (TestsAnalysisPlugin) Manifest() workflow.PluginManifest { return manifest(TestsAnalysisKind) }
 func (MaterializePlugin) Manifest() workflow.PluginManifest   { return manifest(MaterializeKind) }
-func (PublishTaskPlugin) Manifest() workflow.PluginManifest   { return manifest(PublishTaskKind) }
 func (RuntimeSelfCheckPlugin) Manifest() workflow.PluginManifest {
 	return manifest(RuntimeSelfCheckKind)
 }
@@ -82,15 +77,6 @@ func (MaterializePlugin) Validate(spec workflow.NodeSpec) error {
 		return err
 	}
 	return pluginutil.RequiredString(spec, "task_dir")
-}
-func (PublishTaskPlugin) Validate(spec workflow.NodeSpec) error {
-	if err := validateSpec(spec); err != nil {
-		return err
-	}
-	if err := pluginutil.RequiredString(spec, "task_dir"); err != nil {
-		return err
-	}
-	return pluginutil.RequiredString(spec, "destination_dir")
 }
 func (RuntimeSelfCheckPlugin) Validate(spec workflow.NodeSpec) error {
 	if err := validateAgentSpec(spec); err != nil {
@@ -274,51 +260,6 @@ func (MaterializePlugin) Execute(ctx context.Context, req workflow.NodeRequest) 
 	return result, nil
 }
 
-func (PublishTaskPlugin) Execute(ctx context.Context, req workflow.NodeRequest) (workflow.NodeResult, error) {
-	if req.Store == nil {
-		return workflow.NodeResult{}, fmt.Errorf("publish_task artifact store is required")
-	}
-	source := filepath.Clean(pluginutil.String(req, "task_dir"))
-	destination := filepath.Clean(pluginutil.String(req, "destination_dir"))
-	resolvedSource, err := resolvePathWithExistingAncestor(source)
-	if err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("resolve publish source: %w", err)
-	}
-	resolvedRoot, err := resolvePathWithExistingAncestor(req.Store.Root())
-	if err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("resolve artifact store root: %w", err)
-	}
-	if !withinRoot(resolvedSource, resolvedRoot) {
-		return workflow.NodeResult{}, fmt.Errorf("publish source must remain within artifact store root: %s", source)
-	}
-	resolvedDestination, err := resolvePathWithExistingAncestor(destination)
-	if err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("resolve publish destination: %w", err)
-	}
-	if withinRoot(resolvedDestination, resolvedRoot) || withinRoot(resolvedRoot, resolvedDestination) {
-		return workflow.NodeResult{}, fmt.Errorf("publish destination must not overlap artifact store root: %s", destination)
-	}
-	sourceDigest, err := harborrun.ComputeTaskDigest(source)
-	if err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("digest publish source: %w", err)
-	}
-	if err := harborgen.PublishCanonicalTask(source, destination); err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("publish canonical task: %w", err)
-	}
-	publishedDigest, err := harborrun.ComputeTaskDigest(destination)
-	if err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("digest published task: %w", err)
-	}
-	if publishedDigest != sourceDigest {
-		return workflow.NodeResult{}, fmt.Errorf("published task digest mismatch: source=%s destination=%s", sourceDigest, publishedDigest)
-	}
-	receipt := domain.TaskPublishReceipt{
-		SchemaVersion: "harbor.task_publish_receipt.v1", SourceTaskDir: source, DestinationDir: destination,
-		SourceDigest: sourceDigest, PublishedDigest: publishedDigest, CreatedAt: time.Now().UTC(), Passed: true,
-	}
-	return putJSON(ctx, req, "phase3/artifacts/task_publish/publish_receipt.json", "task_publish_receipt", receipt)
-}
-
 func (p RuntimeSelfCheckPlugin) Execute(ctx context.Context, req workflow.NodeRequest) (workflow.NodeResult, error) {
 	if req.Runtimes.Agent == nil {
 		return workflow.NodeResult{}, fmt.Errorf("runtime_self_check agent runtime is required")
@@ -351,7 +292,11 @@ func (p RuntimeSelfCheckPlugin) Execute(ctx context.Context, req workflow.NodeRe
 }
 
 func conversationOptions(req workflow.NodeRequest) harborgen.ConversationOptions {
-	return harborgen.ConversationOptions{Workspace: req.WorkspaceRoot, Model: pluginutil.String(req, "model"), ReasoningEffort: pluginutil.String(req, "reasoning_effort"), TimeoutSeconds: pluginutil.Int(req, "timeout_seconds"), Agent: req.Runtimes.Agent}
+	checkpointRoot := req.ArtifactRoot
+	if req.Store != nil {
+		checkpointRoot = req.Store.Root()
+	}
+	return harborgen.ConversationOptions{Workspace: req.WorkspaceRoot, CheckpointRoot: checkpointRoot, RunID: req.RunID, Attempt: req.Attempt, Model: pluginutil.String(req, "model"), ReasoningEffort: pluginutil.String(req, "reasoning_effort"), TimeoutSeconds: pluginutil.Int(req, "timeout_seconds"), Agent: req.Runtimes.Agent}
 }
 
 func putJSON(ctx context.Context, req workflow.NodeRequest, fallback, artifactType string, value any) (workflow.NodeResult, error) {
@@ -448,33 +393,4 @@ func withinRoot(path, root string) bool {
 	}
 	rel, err := filepath.Rel(absRoot, absPath)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-func resolvePathWithExistingAncestor(path string) (string, error) {
-	abs, err := filepath.Abs(filepath.Clean(strings.TrimSpace(path)))
-	if err != nil {
-		return "", err
-	}
-	current := abs
-	var suffix []string
-	for {
-		if _, err := os.Lstat(current); err == nil {
-			resolved, err := filepath.EvalSymlinks(current)
-			if err != nil {
-				return "", err
-			}
-			for index := len(suffix) - 1; index >= 0; index-- {
-				resolved = filepath.Join(resolved, suffix[index])
-			}
-			return filepath.Clean(resolved), nil
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return abs, nil
-		}
-		suffix = append(suffix, filepath.Base(current))
-		current = parent
-	}
 }

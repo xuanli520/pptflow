@@ -64,7 +64,7 @@ func nodeEventFallbackMessage(event domain.RunnerEvent) string {
 			return fmt.Sprintf("已安排第 %d 次尝试", event.Attempt)
 		}
 		return "节点重试已安排"
-	case "node_succeeded", "node_failed", "node_canceled", "node_skipped", "node_requeued", "node_reused", "node_preserved", "manual_retry_started":
+	case "node_succeeded", "node_failed", "node_canceled", "node_skipped", "node_requeued", "node_reused", "node_preserved":
 		return localizeEventType(event.Type)
 	case "gate_requested":
 		return localizeEventType(event.Type)

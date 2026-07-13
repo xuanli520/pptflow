@@ -273,6 +273,65 @@ func TestEngineRetryUsesTypedFailureAndAttempt(t *testing.T) {
 	}
 }
 
+type evidenceErrorPlugin struct{}
+
+func (evidenceErrorPlugin) Manifest() PluginManifest {
+	return PluginManifest{ID: "test.evidence-error", Version: "1", Kinds: []string{"evidence-error"}}
+}
+
+func (evidenceErrorPlugin) Validate(NodeSpec) error { return nil }
+
+func (evidenceErrorPlugin) Execute(ctx context.Context, req NodeRequest) (NodeResult, error) {
+	ref, err := req.Store.PutText(ctx, "failure-report.txt", "failure_report", req.Spec.ID, "diagnostic evidence")
+	if err != nil {
+		return NodeResult{}, err
+	}
+	return NodeResult{Artifacts: []ArtifactRef{ref}}, NewNodeError(FailurePermanent, false, "reported failure", errors.New("verification failed"))
+}
+
+func TestEngineKeepsArtifactsReturnedWithFailure(t *testing.T) {
+	registry := NewRegistry()
+	if err := registry.Register(evidenceErrorPlugin{}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewEngine(registry, Runtimes{}).Run(context.Background(), RunRequest{
+		Workflow:     WorkflowDefinition{ID: "failure-evidence", Nodes: []NodeSpec{{ID: "check", Kind: "evidence-error"}}},
+		ArtifactRoot: filepath.Join(t.TempDir(), "artifacts"), WorkspaceRoot: filepath.Join(t.TempDir(), "workspace"),
+	})
+	if err == nil {
+		t.Fatal("expected reported verification failure")
+	}
+	if len(result.Nodes) != 1 || result.Nodes[0].Status != NodeFailed || len(result.Nodes[0].Artifacts) != 1 {
+		t.Fatalf("failure evidence was dropped from node state: %+v", result.Nodes)
+	}
+	if len(result.Artifacts) != 1 || result.Artifacts[0].Type != "failure_report" {
+		t.Fatalf("failure evidence was dropped from run state: %+v", result.Artifacts)
+	}
+}
+
+func TestEngineRejectsInvalidParentChildBudgetBeforeExecution(t *testing.T) {
+	order := []string{}
+	registry := NewRegistry()
+	if err := registry.Register(testPlugin{order: &order}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewEngine(registry, Runtimes{}).Run(context.Background(), RunRequest{
+		Workflow: WorkflowDefinition{ID: "invalid-budget", Nodes: []NodeSpec{{
+			ID: "agent", Kind: "test", Policy: NodePolicy{
+				TimeoutSeconds: 600, MaxAttempts: 1, TurnTimeoutSeconds: 1800, MaxTurns: 2,
+				StartupGraceSeconds: 30, ShutdownGraceSeconds: 30, MaxElapsedSeconds: 600,
+			},
+		}}},
+		ArtifactRoot: filepath.Join(t.TempDir(), "artifacts"), WorkspaceRoot: filepath.Join(t.TempDir(), "workspace"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "attempt timeout") {
+		t.Fatalf("invalid budget error=%v", err)
+	}
+	if len(order) != 0 {
+		t.Fatalf("invalid budget executed a plugin: %v", order)
+	}
+}
+
 func TestEngineRetryAllowsUnclassifiedOperationalFailure(t *testing.T) {
 	plugin := &productionPlugin{unclassifiedFailures: 2}
 	registry := NewRegistry()
@@ -487,12 +546,10 @@ func TestPersistentEventRecorderRestoresSequencesAndPublishes(t *testing.T) {
 }
 
 type revisionPlugin struct {
-	mu          sync.Mutex
-	calls       map[string]int
-	requeueNode string
-	requeues    int
-	failNode    string
-	failures    int
+	mu       sync.Mutex
+	calls    map[string]int
+	failNode string
+	failures int
 }
 
 func (p *revisionPlugin) Manifest() PluginManifest {
@@ -510,7 +567,6 @@ func (p *revisionPlugin) Execute(ctx context.Context, req NodeRequest) (NodeResu
 	if shouldFail {
 		p.failures--
 	}
-	shouldRequeue := req.Spec.ID == p.requeueNode && call <= p.requeues
 	p.mu.Unlock()
 	if shouldFail {
 		return NodeResult{}, NewNodeError(FailurePermanent, false, "test failure", errors.New("failed"))
@@ -519,100 +575,7 @@ func (p *revisionPlugin) Execute(ctx context.Context, req NodeRequest) (NodeResu
 	if err != nil {
 		return NodeResult{}, err
 	}
-	if shouldRequeue {
-		if req.Events != nil {
-			if err := req.Events.Emit(ctx, Event{RunID: req.RunID, NodeID: req.Spec.ID, Type: "gate_requested", Status: NodeRunning, Attempt: req.Attempt}); err != nil {
-				return NodeResult{}, err
-			}
-		}
-		return NodeResult{Artifacts: []ArtifactRef{ref}, Directive: &NodeDirective{Action: DirectiveRequeue, RestartFrom: "b", Reason: "revise"}}, nil
-	}
 	return NodeResult{Artifacts: []ArtifactRef{ref}}, nil
-}
-
-func TestEngineRevisionRequeuesWithoutDAGCycleAndInvalidatesArtifacts(t *testing.T) {
-	root := t.TempDir()
-	store, err := NewFileArtifactStore(filepath.Join(root, "artifacts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	plugin := &revisionPlugin{requeueNode: "gate", requeues: 2}
-	registry := NewRegistry()
-	if err := registry.Register(plugin); err != nil {
-		t.Fatal(err)
-	}
-	var checkpoints []RunResult
-	result, err := NewEngine(registry, Runtimes{}).Run(context.Background(), RunRequest{
-		RunID: "revision-run",
-		Workflow: WorkflowDefinition{ID: "revision", Policy: Policy{MaxRevisions: 5}, Nodes: []NodeSpec{
-			{ID: "a", Kind: "revision"},
-			{ID: "b", Kind: "revision", DependsOn: []string{"a"}},
-			{ID: "gate", Kind: "revision", DependsOn: []string{"b"}},
-		}},
-		WorkspaceRoot: filepath.Join(root, "workspace"), Store: store,
-		Checkpoint: func(_ context.Context, checkpoint RunResult) error {
-			checkpoints = append(checkpoints, checkpoint)
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Revision != 2 || plugin.calls["a"] != 1 || plugin.calls["b"] != 3 || plugin.calls["gate"] != 3 {
-		t.Fatalf("revision=%d calls=%+v", result.Revision, plugin.calls)
-	}
-	refs, err := store.List(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	producerCounts := map[string]int{}
-	for _, ref := range refs {
-		producerCounts[ref.Producer]++
-		if (ref.Producer == "b" || ref.Producer == "gate") && !strings.Contains(ref.Name, "-r2-") {
-			t.Fatalf("stale revision artifact survived: %+v", ref)
-		}
-	}
-	if producerCounts["a"] != 1 || producerCounts["b"] != 1 || producerCounts["gate"] != 1 {
-		t.Fatalf("producer counts = %+v refs=%+v", producerCounts, refs)
-	}
-	foundActiveGate := false
-	for _, checkpoint := range checkpoints {
-		if checkpoint.Status == RunRunning && checkpoint.ActiveNodeID == "gate" && checkpoint.ActiveAttempt == 1 {
-			foundActiveGate = true
-			break
-		}
-	}
-	if !foundActiveGate {
-		t.Fatalf("gate wait was not observable in checkpoints: %+v", checkpoints)
-	}
-	for _, run := range result.Nodes {
-		if run.NodeID == "b" && run.Revision > 0 {
-			return
-		}
-	}
-	t.Fatalf("node revision metadata missing: %+v", result.Nodes)
-}
-
-func TestEngineRevisionLimitIsFive(t *testing.T) {
-	root := t.TempDir()
-	plugin := &revisionPlugin{requeueNode: "gate", requeues: 100}
-	registry := NewRegistry()
-	if err := registry.Register(plugin); err != nil {
-		t.Fatal(err)
-	}
-	result, err := NewEngine(registry, Runtimes{}).Run(context.Background(), RunRequest{
-		RunID: "bounded-revision",
-		Workflow: WorkflowDefinition{ID: "bounded", Policy: Policy{MaxRevisions: 99}, Nodes: []NodeSpec{
-			{ID: "b", Kind: "revision"}, {ID: "gate", Kind: "revision", DependsOn: []string{"b"}},
-		}},
-		ArtifactRoot: filepath.Join(root, "artifacts"), WorkspaceRoot: filepath.Join(root, "workspace"),
-	})
-	if err == nil || !strings.Contains(err.Error(), "maximum 5") {
-		t.Fatalf("expected five revision boundary, result=%+v err=%v", result, err)
-	}
-	if result.Revision != 5 || plugin.calls["gate"] != 6 {
-		t.Fatalf("revision=%d calls=%+v", result.Revision, plugin.calls)
-	}
 }
 
 func TestEngineCheckpointSupportsIntermediateRecovery(t *testing.T) {

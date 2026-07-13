@@ -85,14 +85,6 @@ func (s checkpointEventSink) Emit(ctx context.Context, event Event) error {
 }
 
 func cloneRunResult(result RunResult) RunResult {
-	if result.ManualRetry != nil {
-		plan := *result.ManualRetry
-		plan.RetryRoots = append([]string(nil), plan.RetryRoots...)
-		plan.AffectedNodes = append([]string(nil), plan.AffectedNodes...)
-		plan.ReusedUpstream = append([]string(nil), plan.ReusedUpstream...)
-		plan.PreservedNodes = append([]string(nil), plan.PreservedNodes...)
-		result.ManualRetry = &plan
-	}
 	if len(result.Nodes) > 0 {
 		nodes := make([]NodeRun, 0, len(result.Nodes))
 		for _, run := range result.Nodes {

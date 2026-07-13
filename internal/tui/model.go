@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -108,23 +107,28 @@ type model struct {
 	runtimeOpts app.RunnerOptions
 	store       *store.Store
 	scheduler   *app.TaskScheduler
+	lifecycle   TaskHubLifecycleService
 
-	hubRoot       string
-	hubScanRoots  []string
-	hubItems      []store.RunWithTask
-	hubRowPaths   []string
-	hubSort       store.SortColumn
-	hubSortAsc    bool
-	hubLoading    bool
-	hubFilter     string
-	hubSearching  bool
-	hubTotalSize  int64
-	hubLastSync   time.Time
-	hubTable      table.Model
-	hubSearch     textinput.Model
-	runConfig     *RunConfigOverlay
-	taskRepair    *TaskRepairOverlay
-	resumeOverlay *WorkspaceResumeOverlay
+	hubRoot            string
+	hubScanRoots       []string
+	hubItems           []store.RunWithTask
+	hubRowPaths        []string
+	hubSort            store.SortColumn
+	hubSortAsc         bool
+	hubLoading         bool
+	hubFilter          string
+	hubSearching       bool
+	hubTotalSize       int64
+	hubLastSync        time.Time
+	hubTable           table.Model
+	hubSearch          textinput.Model
+	taskHub            TaskHubState
+	taskHubPrefix      taskHubPrefixState
+	taskHubPlan        *TaskHubPlanPreview
+	taskHubPlanCommand *TaskHubCommand
+	taskHubDetail      *TaskHubDetailOverlay
+	taskHubMutation    *TaskHubMutationOverlay
+	runControl         *RunControlOverlay
 
 	width  int
 	height int
@@ -154,26 +158,27 @@ type model struct {
 
 	// UI components and navigation are explicit sub-models. Workflow/domain
 	// state above remains the single source of truth.
-	router           *pageRouter
-	focusMgr         focusManager
-	spinner          spinner.Model
-	startInputs      map[startField]textinput.Model
-	dirtyStartInputs map[startField]bool
-	startCollapsed   map[startGroup]bool
-	notesInput       textarea.Model
-	searchInput      textinput.Model
-	detailViewport   viewport.Model
-	gateViewport     viewport.Model
-	overviewTable    table.Model
-	overviewRowIDs   []string
-	confirm          *ConfirmDialog
-	toast            toastState
-	helpVisible      bool
-	searching        bool
-	filter           string
-	pathSuggestions  []string
-	detailScroll     int
-	gateScroll       int
+	router             *pageRouter
+	focusMgr           focusManager
+	spinner            spinner.Model
+	startInputs        map[startField]textinput.Model
+	dirtyStartInputs   map[startField]bool
+	startCollapsed     map[startGroup]bool
+	notesInput         textarea.Model
+	searchInput        textinput.Model
+	detailViewport     viewport.Model
+	gateViewport       viewport.Model
+	overviewTable      table.Model
+	overviewRowIDs     []string
+	confirm            *ConfirmDialog
+	toast              toastState
+	helpVisible        bool
+	taskHubHelpVisible bool
+	searching          bool
+	filter             string
+	pathSuggestions    []string
+	detailScroll       int
+	gateScroll         int
 }
 type fileSnapshot struct {
 	exists bool
@@ -240,6 +245,24 @@ func initialHubModel(ctx context.Context, cancel context.CancelFunc, opts app.Ru
 	})
 }
 
+// initialLifecycleHubModel is the V2 Task Hub entry point. Unlike the legacy
+// workspace hub, it receives only a lifecycle service and never opens or
+// mutates a filesystem/SQLite store from the TUI layer.
+func initialLifecycleHubModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions, lifecycle TaskHubLifecycleService) model {
+	opts = app.HydrateRuntimeOptions(opts)
+	opts.AutoApprove = false
+	return initModelComponents(model{
+		ctx:         ctx,
+		cancel:      cancel,
+		opts:        opts,
+		runtimeOpts: app.ExtractRuntimeOptions(opts),
+		lifecycle:   lifecycle,
+		taskHub:     newTaskHubState(),
+		view:        viewHub,
+		nodes:       map[string]domain.RunnerEvent{},
+	})
+}
+
 func initialWorkspaceModel(ctx context.Context, cancel context.CancelFunc, opts app.RunnerOptions) model {
 	opts = app.HydrateRuntimeOptions(opts)
 	runtimeOpts := app.ExtractRuntimeOptions(opts)
@@ -288,14 +311,12 @@ func (m model) updateStartKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch key {
 	case "ctrl+q", "ctrl+c":
-		m.cancelRun()
-		return m, tea.Quit
+		return m, m.requestQuit()
 	case "q":
 		if isTextStartField(m.startField) {
 			return m, m.updateFocusedStartInput(msg)
 		}
-		m.cancelRun()
-		return m, tea.Quit
+		return m, m.requestQuit()
 	case "tab", "down":
 		m.selectNextStartField()
 		return m, m.focusStartInput(m.startField)
@@ -367,7 +388,8 @@ func (m model) updateStartKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.launchStartWorkflow()
 	case "ctrl+b":
 		if m.startStep == startStepAdvanced {
-			return m.launchStartWorkflowInBackground()
+			m.err = ErrLegacyWorkspaceTUIUnavailable
+			return m, m.showToast("旧工作区后台队列已在生命周期切换后移除", toastWarning)
 		}
 	default:
 		if isTextStartField(m.startField) {
@@ -389,32 +411,6 @@ func (m model) launchStartWorkflow() (tea.Model, tea.Cmd) {
 	}
 	m = m.startRunner(opts)
 	return m, tea.Batch(m.runWorkflow(), m.waitEvent(), m.refreshWorkspace(), m.spinner.Tick)
-}
-
-func (m model) launchStartWorkflowInBackground() (tea.Model, tea.Cmd) {
-	if m.scheduler == nil {
-		m.err = fmt.Errorf("并行任务调度器不可用")
-		return m, nil
-	}
-	if err := m.validateDirtyStartInputs(); err != nil {
-		m.err = err
-		return m, nil
-	}
-	opts, err := m.startOptions()
-	if err != nil {
-		m.err = err
-		return m, nil
-	}
-	if _, err := m.scheduler.Submit(opts); err != nil {
-		m.err = err
-		return m, nil
-	}
-	m.runner = nil
-	m.err = nil
-	m.notice = "任务已加入并行队列：" + opts.Workspace
-	m.setView(viewHub)
-	m.hubLoading = true
-	return m, tea.Batch(m.showToast("任务已加入并行队列", toastSuccess), m.loadHub(true))
 }
 
 func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -439,8 +435,7 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "3":
 			m.view = viewLogs
 		case "q", "ctrl+c":
-			m.cancelRun()
-			return m, tea.Quit
+			return m, m.requestQuit()
 		case "a", "ctrl+a", "r", "ctrl+r", "v", "ctrl+v", "c", "u", "ctrl+u", "n", "ctrl+n", "e":
 			m.err = fmt.Errorf("工作区快照为只读，当前运行由另一个 Factory 进程持有")
 		}
@@ -542,20 +537,6 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		m.selectPrevArtifact()
 		return m, nil
-	case "e":
-		_, artifact, ok := m.selectedGateArtifact()
-		if !ok {
-			return m, nil
-		}
-		path, err := m.safeEditableArtifactPath(artifact.Path)
-		if err != nil {
-			m.err = err
-			return m, nil
-		}
-		dialog := newConfirmDialog(confirmEditArtifact, "确认编辑工件", "将使用外部编辑器打开：\n"+path)
-		dialog.Path = path
-		m.openConfirm(dialog)
-		return m, func() tea.Msg { return confirmOpenedMsg{} }
 	case "1":
 		m.view = viewOverview
 		return m, nil
@@ -563,8 +544,7 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = viewLogs
 		return m, nil
 	case "q", "ctrl+c":
-		m.cancelRun()
-		return m, tea.Quit
+		return m, m.requestQuit()
 	}
 	return m, nil
 }
@@ -572,21 +552,12 @@ func (m model) updateGateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateLogsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
-		m.cancelRun()
-		return m, tea.Quit
+		return m, m.requestQuit()
 	case "tab":
 		m.selectNextArtifact()
 		return m, nil
 	case "shift+tab":
 		m.selectPrevArtifact()
-		return m, nil
-	case "x":
-		if m.readOnly {
-			m.err = fmt.Errorf("工作区快照为只读，当前运行由另一个 Factory 进程持有")
-		} else if m.runner != nil && m.runner.CancelNode(m.selectedNode) {
-			m.notice = "已请求取消 " + m.selectedNode + "；其他模型阶段可能继续运行。"
-			m.err = nil
-		}
 		return m, nil
 	case "j", "down":
 		m.scrollLogFile(1)
@@ -656,46 +627,14 @@ func (m model) makeGateDecision(approved bool) domain.GateDecision {
 	return sanitize.GateDecision(decision)
 }
 
-func (m model) cancelRun() {
-	if m.scheduler != nil && m.scheduler.CancelWorkspace(m.opts.Workspace) {
-		return
-	}
-	if m.cancel != nil {
-		m.cancel()
-	}
-}
-
 func (m model) submitDecision(decision domain.GateDecision, gate *domain.GateRequest) tea.Cmd {
 	return func() tea.Msg {
 		decision = sanitize.GateDecision(decision)
-		if m.runner != nil {
-			m.runner.SubmitGateDecision(decision)
-			return gateDecisionWrittenMsg{gate: gate, decision: decision}
-		}
-		path, err := writeWorkspaceGateDecision(defaultWorkspace(m.opts.Workspace), decision)
-		return gateDecisionWrittenMsg{path: path, gate: gate, decision: decision, err: err}
+		// The old workspace runner wrote a decision file directly or fed a
+		// process-local Runner. Both paths bypassed the durable lifecycle
+		// command boundary and are intentionally retired.
+		return gateDecisionWrittenMsg{gate: gate, decision: decision, err: ErrLegacyWorkspaceTUIUnavailable}
 	}
-}
-
-func writeWorkspaceGateDecision(workspace string, decision domain.GateDecision) (string, error) {
-	decision = sanitize.GateDecision(decision)
-	phase, ok := reviewGatePhase(decision.GateID)
-	if !ok {
-		return "", fmt.Errorf("未知审查关卡 ID：%s", redactUI(decision.GateID))
-	}
-	path := nodes.ReviewDecisionPath(workspace, phase, decision.GateID)
-	reviewsRoot := filepath.Join(defaultWorkspace(workspace), phase, "artifacts", "reviews")
-	if !pathWithinRoot(path, reviewsRoot) {
-		return "", fmt.Errorf("审查决定路径超出工作区")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return path, err
-	}
-	data, err := json.MarshalIndent(decision, "", "  ")
-	if err != nil {
-		return path, err
-	}
-	return path, os.WriteFile(path, append(data, '\n'), 0o600)
 }
 
 func gateDecisionPhase(gateID string) string {
@@ -716,86 +655,6 @@ func reviewGatePhase(gateID string) (string, bool) {
 		return "phase2", true
 	}
 	return "", false
-}
-
-func openEditorCmd(path string) tea.Cmd {
-	return func() tea.Msg {
-		before := snapshotFile(path)
-		cmd := safeEditorCommand(path)
-		return tea.ExecProcess(cmd, func(err error) tea.Msg {
-			return editorDoneMsg{path: path, before: before, after: snapshotFile(path), err: err}
-		})()
-	}
-}
-
-// safeEditorCommand parses the conventional VISUAL/EDITOR command line and
-// invokes the executable directly. The path is always one argv element, so a
-// crafted filename cannot be interpreted by a shell.
-func safeEditorCommand(path string) *exec.Cmd {
-	editor := strings.TrimSpace(os.Getenv("VISUAL"))
-	if editor == "" {
-		editor = strings.TrimSpace(os.Getenv("EDITOR"))
-	}
-	if editor == "" {
-		return exec.Command("vi", path)
-	}
-	args, err := splitCommandLine(editor)
-	if err != nil || len(args) == 0 {
-		return exec.Command("vi", path)
-	}
-	return exec.Command(args[0], append(args[1:], path)...)
-}
-
-func splitCommandLine(value string) ([]string, error) {
-	var args []string
-	var current strings.Builder
-	var quote rune
-	escaped := false
-	flush := func() {
-		if current.Len() > 0 {
-			args = append(args, current.String())
-			current.Reset()
-		}
-	}
-	for _, r := range value {
-		if escaped {
-			current.WriteRune(r)
-			escaped = false
-			continue
-		}
-		if r == '\\' {
-			escaped = true
-			continue
-		}
-		if quote != 0 {
-			if r == quote {
-				quote = 0
-			} else {
-				current.WriteRune(r)
-			}
-			continue
-		}
-		switch r {
-		case '\'', '"':
-			quote = r
-		case ' ', '\t', '\n':
-			flush()
-		default:
-			current.WriteRune(r)
-		}
-	}
-	if escaped {
-		current.WriteRune('\\')
-	}
-	if quote != 0 {
-		return nil, fmt.Errorf("unclosed quote in editor command")
-	}
-	flush()
-	return args, nil
-}
-
-func editorCommand(path string) *exec.Cmd {
-	return safeEditorCommand(path)
 }
 
 func (m model) runWorkflow() tea.Cmd {
@@ -976,7 +835,9 @@ func isTerminalRunSummary(summary domain.RunSummary) bool {
 func (m model) header() string {
 	title := titleStyle.Render("Harbor 出题工坊")
 	context := ""
-	if m.view == viewHub {
+	if m.view == viewHub && m.lifecycle != nil {
+		context = redactSingleLineUI(fmt.Sprintf("生命周期：Task %d  Run %d  队列 %d", len(m.taskHub.Snapshot.Tasks), len(m.taskHub.Snapshot.Runs), m.taskHub.Snapshot.Queue.Queued))
+	} else if m.view == viewHub {
 		context = redactSingleLineUI(fmt.Sprintf("工作区根=%s  已索引=%d", emptyDash(m.hubRoot), len(m.hubItems)))
 	} else {
 		context = redactSingleLineUI(fmt.Sprintf("工作区=%s 任务=%s 仓库=%s", emptyDash(m.opts.Workspace), emptyDash(m.opts.TaskDir), emptyDash(m.opts.RepoURL)))

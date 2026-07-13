@@ -1,4 +1,10 @@
-# Harbor Flow 工作区管理中心（Task Hub）设计文档
+# 已归档：V1 Workspace Hub 设计
+
+> 状态：历史设计材料，已由 2026-07-13 的 V2 lifecycle refactor 取代。本文描述旧的 workspace-index 与 clone-rerun 方案，不是操作或实现契约。
+>
+> 当前行为以 [`WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_PLAN.md`](./WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_PLAN.md)、[`WORKFLOW_STABILITY_DECISIONS.md`](./WORKFLOW_STABILITY_DECISIONS.md) 和 [`TUI_USAGE.md`](./TUI_USAGE.md) 为准。
+
+## V1 原始文档：Harbor Flow 工作区管理中心（Task Hub）设计文档
 
 > 基于对 Harbor Flow 现有 TUI 源码（27 文件）、p2r_tui 参考项目（28 文件）、Bubble Tea 生态最佳实践的全面分析
 >

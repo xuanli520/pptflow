@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -68,8 +67,7 @@ func TestStartGroupUsesFunctionKeysOnly(t *testing.T) {
 }
 
 func TestHubSearchConsumesGlobalShortcutCharacters(t *testing.T) {
-	m := initialModel(context.Background(), func() {}, app.RunnerOptions{})
-	m.view = viewHub
+	m := initialLifecycleHubModel(context.Background(), func() {}, app.RunnerOptions{}, &fakeTaskHubLifecycle{})
 	m.hubSearching = true
 	m.hubSearch.Focus()
 
@@ -100,46 +98,6 @@ func TestMouseClickFocusesAndTogglesVisibleStartFields(t *testing.T) {
 	}
 }
 
-func TestMouseTogglesBackgroundRerunOption(t *testing.T) {
-	m := initialModel(context.Background(), func() {}, app.RunnerOptions{})
-	m.width, m.height = 100, 30
-	m.runConfig = NewRunConfigOverlay("source", "target", "task")
-	clickRenderedMarker(t, &m, "后台并行运行")
-	if m.runConfig.Field != 6 || !m.runConfig.Background {
-		t.Fatalf("background rerun click did not focus and toggle: field=%d value=%v", m.runConfig.Field, m.runConfig.Background)
-	}
-}
-
-func TestMouseCancelsRunConfigOverlayWithoutTouchingPage(t *testing.T) {
-	m := initialModel(context.Background(), func() {}, app.RunnerOptions{})
-	m.width, m.height, m.view = 100, 30, viewOverview
-	m.runConfig = NewRunConfigOverlay("source", "target", "task")
-	clickRenderedMarker(t, &m, "[Esc 取消]")
-	if m.runConfig != nil || m.view != viewOverview {
-		t.Fatalf("overlay cancel click leaked or failed: overlay=%v view=%v", m.runConfig, m.view)
-	}
-}
-
-func TestMouseCtrlBQueuesStartFormTask(t *testing.T) {
-	root := t.TempDir()
-	hub, cleanup := testHubModel(t, root)
-	defer cleanup()
-	scheduler, err := app.NewTaskScheduler(hub.ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer scheduler.Close()
-	hub.scheduler = scheduler
-	m := hub.attachHubContext(initialStartModel(hub.ctx, hub.cancel, app.RunnerOptions{
-		Workspace: filepath.Join(root, "workspaces", "mouse-background"), TaskDir: t.TempDir(),
-	}))
-	m.width, m.height, m.startStep = 120, 35, startStepAdvanced
-	cmd := clickRenderedMarker(t, &m, "Ctrl+B 入队")
-	if m.view != viewHub || m.runner != nil || cmd == nil || len(scheduler.Snapshot().Tasks) != 1 {
-		t.Fatalf("mouse Ctrl+B did not queue task: view=%v runner=%v cmd=%v tasks=%+v err=%v", m.view, m.runner, cmd, scheduler.Snapshot(), m.err)
-	}
-}
-
 func TestMouseUsesExactGateActionTarget(t *testing.T) {
 	m := initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir(), TaskDir: t.TempDir()})
 	m.width, m.height, m.view = 100, 30, viewGate
@@ -158,7 +116,7 @@ func TestMouseUsesExactGateActionTarget(t *testing.T) {
 func TestMouseConfirmationButtonsExecuteTheirChoice(t *testing.T) {
 	m := initialModel(context.Background(), func() {}, app.RunnerOptions{})
 	m.width, m.height = 80, 24
-	m.openConfirm(newConfirmDialog(confirmCancelRun, "确认", "确认取消"))
+	m.openConfirm(newConfirmDialog(confirmQuit, "确认", "确认退出"))
 	clickRenderedMarker(t, &m, "  否  ")
 	if m.confirm != nil {
 		t.Fatal("clicking no did not close confirmation")
@@ -174,7 +132,7 @@ func TestOverlayBlocksMouseWheelFromUnderlyingPage(t *testing.T) {
 	m.syncOverviewTable()
 	m.overviewTable.SetCursor(4)
 	m.syncSelectedOverviewRow()
-	m.openConfirm(newConfirmDialog(confirmCancelRun, "确认", "确认取消"))
+	m.openConfirm(newConfirmDialog(confirmQuit, "确认", "确认退出"))
 
 	m.handleMouse(tea.MouseMsg(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown}))
 	if got := m.overviewTable.Cursor(); got != 4 {

@@ -240,6 +240,7 @@ func (s *TaskScheduler) CancelWorkspace(workspace string) bool {
 	if job.snapshot.Status == TaskQueued {
 		job.snapshot.Status = TaskCanceled
 		job.snapshot.FinishedAt = time.Now().UTC()
+		s.releaseWorkspaceReservationLocked(job)
 	}
 	job.cancel()
 	s.mu.Unlock()
@@ -260,6 +261,7 @@ func (s *TaskScheduler) Close() {
 			if job.snapshot.Status == TaskQueued {
 				job.snapshot.Status = TaskCanceled
 				job.snapshot.FinishedAt = now
+				s.releaseWorkspaceReservationLocked(job)
 			}
 			if !terminalTaskStatus(job.snapshot.Status) {
 				job.cancel()
@@ -324,6 +326,7 @@ func (s *TaskScheduler) nextJob() *taskJob {
 			if job.ctx.Err() != nil {
 				job.snapshot.Status = TaskCanceled
 				job.snapshot.FinishedAt = time.Now().UTC()
+				s.releaseWorkspaceReservationLocked(job)
 				continue
 			}
 			job.snapshot.Status = TaskRunning
@@ -352,6 +355,16 @@ func (s *TaskScheduler) finish(job *taskJob, summary domain.RunSummary, err erro
 		job.snapshot.Error = "workflow completed with failed checks"
 	default:
 		job.snapshot.Status = TaskSucceeded
+	}
+	s.releaseWorkspaceReservationLocked(job)
+}
+
+func (s *TaskScheduler) releaseWorkspaceReservationLocked(job *taskJob) {
+	if s == nil || job == nil || strings.TrimSpace(job.snapshot.Workspace) == "" {
+		return
+	}
+	if s.workspace[job.snapshot.Workspace] == job {
+		delete(s.workspace, job.snapshot.Workspace)
 	}
 }
 

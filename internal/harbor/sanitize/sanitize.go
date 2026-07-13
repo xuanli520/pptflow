@@ -326,15 +326,6 @@ func RunSummary(summary domain.RunSummary) domain.RunSummary {
 		report := GenReport(*summary.GenReport)
 		summary.GenReport = &report
 	}
-	if summary.TaskPublish != nil {
-		receipt := *summary.TaskPublish
-		receipt.SchemaVersion = Text(receipt.SchemaVersion)
-		receipt.SourceTaskDir = Text(receipt.SourceTaskDir)
-		receipt.DestinationDir = Text(receipt.DestinationDir)
-		receipt.SourceDigest = Text(receipt.SourceDigest)
-		receipt.PublishedDigest = Text(receipt.PublishedDigest)
-		summary.TaskPublish = &receipt
-	}
 	if summary.LintReport != nil {
 		report := LintReport(*summary.LintReport)
 		summary.LintReport = &report

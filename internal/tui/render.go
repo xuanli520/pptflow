@@ -26,24 +26,28 @@ func (m *model) currentPage() Page {
 }
 
 func renderFrame(m model, body string) string {
+	if m.taskHubDetail != nil {
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.taskHubDetail.View(m.width, maxInt(8, m.height-3)), m.footer())
+		return strings.TrimRight(frame, "\n") + "\n"
+	}
+	if m.taskHubHelpVisible {
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), (taskHubHelpOverlay{}).View(m.width, maxInt(8, m.height-3)), m.footer())
+		return strings.TrimRight(frame, "\n") + "\n"
+	}
+	if m.taskHubMutation != nil {
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.taskHubMutation.View(m.width, maxInt(8, m.height-3)), m.footer())
+		return strings.TrimRight(frame, "\n") + "\n"
+	}
+	if m.runControl != nil {
+		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.runControl.View(m.width, maxInt(8, m.height-3)), m.footer())
+		return strings.TrimRight(frame, "\n") + "\n"
+	}
 	if m.helpVisible {
 		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), (&helpOverlay{view: m.view, readOnly: m.readOnly}).View(m.width, maxInt(8, m.height-3)), m.footer())
 		return strings.TrimRight(frame, "\n") + "\n"
 	}
 	if m.confirm != nil {
 		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.confirm.View(m.width, maxInt(8, m.height-3)), m.footer())
-		return strings.TrimRight(frame, "\n") + "\n"
-	}
-	if m.resumeOverlay != nil {
-		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.resumeOverlay.View(m.width, maxInt(8, m.height-3)), m.footer())
-		return strings.TrimRight(frame, "\n") + "\n"
-	}
-	if m.runConfig != nil {
-		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.runConfig.View(m.width, maxInt(8, m.height-3)), m.footer())
-		return strings.TrimRight(frame, "\n") + "\n"
-	}
-	if m.taskRepair != nil {
-		frame := lipgloss.JoinVertical(lipgloss.Left, m.header(), m.taskRepair.View(m.width, maxInt(8, m.height-3)), m.footer())
 		return strings.TrimRight(frame, "\n") + "\n"
 	}
 	parts := []string{m.header(), body}

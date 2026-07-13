@@ -11,310 +11,69 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
-	"github.com/purplevoid/harbor-factory/internal/harbor/repourl"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
-type Options struct {
-	RepoPrepared        domain.RepoPrepared
-	Workspace           string
-	TaskOutputDir       string
-	TaskName            string
-	Model               string
-	ReasoningEffort     string
-	AgentTimeoutSeconds int
-	Agent               workflow.AgentRuntime
-	RuntimeSelfCheck    bool
-	Progress            func(nodeID, status, message, path string)
-	TaskReview          func(analysis domain.RepoAnalysis, proposal domain.TaskProposal, proposalPath string) error
+type conversationRuntimeOptions struct {
+	RepoPrepared domain.RepoPrepared
+	Workspace    string
+	// CheckpointRoot is the durable artifact root used for per-attempt turn
+	// evidence. Empty keeps standalone generation self-contained in Workspace.
+	CheckpointRoot  string
+	RunID           string
+	Attempt         int
+	ForceFresh      bool
+	Model           string
+	ReasoningEffort string
+	Agent           workflow.AgentRuntime
 }
 
 type generatedFileWrite struct {
-	nodeID       string
-	taskPath     string
-	artifactPath string
-	content      string
-	mode         os.FileMode
-}
-
-func Run(ctx context.Context, opts Options) (domain.GenReport, error) {
-	if opts.Agent == nil {
-		return domain.GenReport{}, fmt.Errorf("agent runtime is required")
-	}
-	if strings.TrimSpace(opts.RepoPrepared.SourcePath) == "" {
-		return domain.GenReport{}, fmt.Errorf("prepared source path is required")
-	}
-	if strings.TrimSpace(opts.RepoPrepared.RepoURL) == "" || strings.TrimSpace(opts.RepoPrepared.ResolvedCommit) == "" {
-		return domain.GenReport{}, fmt.Errorf("prepared repo URL and resolved commit are required")
-	}
-	if err := repourl.RejectCredentials(opts.RepoPrepared.RepoURL); err != nil {
-		return domain.GenReport{}, err
-	}
-	workspace := strings.TrimSpace(opts.Workspace)
-	if workspace == "" {
-		workspace = filepath.Join(".harbor-factory", "workspace")
-	}
-	opts.Workspace = workspace
-	timeout := opts.AgentTimeoutSeconds
-	if timeout <= 0 {
-		timeout = 600
-	}
-
-	progress(opts, nodes.RepoAnalyze, "running", "analyzing prepared repository", "")
-	repoAnalysis, repoAnalysisPath, repoAnalysisReused, err := runRepoAnalyze(ctx, opts, workspace, timeout)
-	if err != nil {
-		progress(opts, nodes.RepoAnalyze, "failed", err.Error(), repoAnalysisPath)
-		return domain.GenReport{}, err
-	}
-	progress(opts, nodes.RepoAnalyze, "succeeded", reuseStatusMessage(repoAnalysisReused, "repo analysis generated", "reused existing repo analysis"), repoAnalysisPath)
-
-	progress(opts, nodes.TaskDesign, "running", "designing CodeEdge task", "")
-	taskProposal, taskProposalPath, taskProposalReused, err := runTaskDesign(ctx, opts, workspace, timeout, repoAnalysis)
-	if err != nil {
-		progress(opts, nodes.TaskDesign, "failed", err.Error(), taskProposalPath)
-		return domain.GenReport{}, err
-	}
-	progress(opts, nodes.TaskDesign, "succeeded", reuseStatusMessage(taskProposalReused, "task proposal generated", "reused existing task proposal"), taskProposalPath)
-	if strings.TrimSpace(opts.TaskName) != "" {
-		taskProposal.TaskName = opts.TaskName
-	}
-	applyProposalDefaults(&taskProposal, opts.RepoPrepared)
-	if err := writeJSON(taskProposalPath, taskProposal); err != nil {
-		progress(opts, nodes.TaskDesign, "failed", err.Error(), taskProposalPath)
-		return domain.GenReport{}, err
-	}
-	if opts.TaskReview != nil {
-		progress(opts, nodes.TaskReview, "running", "reviewing selected task proposal", taskProposalPath)
-		if err := opts.TaskReview(repoAnalysis, taskProposal, taskProposalPath); err != nil {
-			progress(opts, nodes.TaskReview, "failed", err.Error(), taskProposalPath)
-			return domain.GenReport{}, err
-		}
-		progress(opts, nodes.TaskReview, "succeeded", "task proposal approved", taskProposalPath)
-	}
-
-	progress(opts, nodes.GenerateTaskFiles, "running", "generating Harbor task files", "")
-	taskFiles, taskFilesPath, taskFilesReused, err := runTaskFiles(ctx, opts, workspace, timeout, repoAnalysis, taskProposal)
-	if err != nil {
-		progress(opts, nodes.GenerateTaskFiles, "failed", err.Error(), taskFilesPath)
-		return domain.GenReport{}, err
-	}
-	progress(opts, nodes.GenerateTaskFiles, "succeeded", reuseStatusMessage(taskFilesReused, "task file content generated", "reused existing task file content"), taskFilesPath)
-
-	taskDir := strings.TrimSpace(opts.TaskOutputDir)
-	if taskDir == "" {
-		taskDir = filepath.Join(workspace, "phase2", "task", safeTaskDir(taskProposal.TaskName))
-	}
-	testsAnalysisPath := nodes.TestsAnalysisPath(workspace)
-	if err := materializeTask(opts, taskDir, testsAnalysisPath, opts.RepoPrepared, taskProposal, taskFiles); err != nil {
-		progress(opts, nodes.MaterializeTask, "failed", err.Error(), taskDir)
-		return domain.GenReport{}, err
-	}
-	progress(opts, nodes.MaterializeTask, "succeeded", "Harbor task directory materialized", taskDir)
-	if opts.RuntimeSelfCheck {
-		progress(opts, nodes.RuntimeSelfCheck, "running", "granting the design agent runtime access to build and exercise the generated task", taskDir)
-		if err := runRuntimeSelfCheck(ctx, opts, taskDir, timeout); err != nil {
-			// This is a model-assisted tolerance step, not an authoritative gate.
-			// Mandatory lint and verification still run immediately afterwards.
-			progress(opts, nodes.RuntimeSelfCheck, "succeeded", "runtime self-check could not complete; mandatory machine gates will decide: "+err.Error(), nodes.AgentLogPath(workspace, nodes.RuntimeSelfCheck))
-		} else {
-			progress(opts, nodes.RuntimeSelfCheck, "succeeded", "design agent completed runtime build/test self-check", nodes.AgentLogPath(workspace, nodes.RuntimeSelfCheck))
-		}
-	}
-
-	report := domain.GenReport{
-		SchemaVersion:     "harbor.gen_report.v1",
-		TaskDir:           taskDir,
-		TestsAnalysisPath: testsAnalysisPath,
-		RepoAnalysisPath:  repoAnalysisPath,
-		TaskProposalPath:  taskProposalPath,
-		TaskFilesPath:     taskFilesPath,
-		RepoAnalysis:      repoAnalysis,
-		TaskProposal:      taskProposal,
-		CreatedAt:         time.Now().UTC(),
-		Passed:            true,
-	}
-	reportPath := nodes.GenReportPath(workspace)
-	if err := writeJSON(reportPath, report); err != nil {
-		return report, err
-	}
-	return report, nil
-}
-
-func runRuntimeSelfCheck(ctx context.Context, opts Options, taskDir string, timeout int) error {
-	if timeout < 1800 {
-		timeout = 1800
-	}
-	prompt, err := runtimeSelfCheckPrompt()
-	if err != nil {
-		return fmt.Errorf("render runtime self-check prompt: %w", err)
-	}
-	_, err = workflow.RunAgentTurn(ctx, opts.Agent, workflow.AgentTurnRequest{
-		ProjectPath:     taskDir,
-		Prompt:          prompt,
-		Model:           opts.Model,
-		ReasoningEffort: opts.ReasoningEffort,
-		SandboxMode:     "danger-full-access",
-		SandboxPolicy:   "danger-full-access",
-		NetworkAccess:   true,
-		WorkspaceRoots:  []string{taskDir},
-		TimeoutSeconds:  timeout,
-		MaxOutputBytes:  2 << 20,
-		LogPath:         nodes.AgentLogPath(opts.Workspace, nodes.RuntimeSelfCheck),
-	})
-	if err != nil {
-		return fmt.Errorf("runtime self-check agent turn: %w", err)
-	}
-	if err := validateMaterializedTaskDir(taskDir); err != nil {
-		return fmt.Errorf("runtime self-check left an invalid task: %w", err)
-	}
-	return nil
-}
-
-func progress(opts Options, nodeID, status, message, path string) {
-	if opts.Progress != nil {
-		opts.Progress(nodeID, status, message, path)
-	}
-}
-
-func reuseStatusMessage(reused bool, generated, reusedMessage string) string {
-	if reused {
-		return reusedMessage
-	}
-	return generated
-}
-
-func runRepoAnalyze(ctx context.Context, opts Options, workspace string, timeout int) (domain.RepoAnalysis, string, bool, error) {
-	path := nodes.RepoAnalysisPath(workspace)
-	if analysis, ok := loadReusableRepoAnalysis(path, opts.RepoPrepared); ok {
-		return analysis, path, true, nil
-	}
-	analysis, err := GenerateRepoAnalysis(ctx, ConversationOptions{Workspace: workspace, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, TimeoutSeconds: timeout, Agent: opts.Agent}, opts.RepoPrepared)
-	if err != nil {
-		return domain.RepoAnalysis{}, path, false, err
-	}
-	if err := writeJSON(path, analysis); err != nil {
-		return domain.RepoAnalysis{}, path, false, err
-	}
-	return analysis, path, false, nil
-}
-
-func runTaskDesign(ctx context.Context, opts Options, workspace string, timeout int, analysis domain.RepoAnalysis) (domain.TaskProposal, string, bool, error) {
-	path := nodes.TaskProposalPath(workspace)
-	if proposal, ok := loadReusableTaskProposal(path, opts.RepoPrepared); ok {
-		return proposal, path, true, nil
-	}
-	proposal, err := GenerateTaskProposal(ctx, ConversationOptions{Workspace: workspace, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, TimeoutSeconds: timeout, Agent: opts.Agent}, opts.RepoPrepared, analysis)
-	if err != nil {
-		return domain.TaskProposal{}, path, false, err
-	}
-	if err := writeJSON(path, proposal); err != nil {
-		return domain.TaskProposal{}, path, false, err
-	}
-	return proposal, path, false, nil
-}
-
-func runTaskFiles(ctx context.Context, opts Options, workspace string, timeout int, analysis domain.RepoAnalysis, proposal domain.TaskProposal) (domain.GeneratedTaskFiles, string, bool, error) {
-	path := nodes.TaskFilesPath(workspace)
-	if files, ok := loadReusableTaskFiles(path, opts.RepoPrepared, proposal); ok {
-		return files, path, true, nil
-	}
-	files, err := GenerateTaskFiles(ctx, ConversationOptions{Workspace: workspace, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, TimeoutSeconds: timeout, Agent: opts.Agent}, opts.RepoPrepared, analysis, proposal)
-	if err != nil {
-		return domain.GeneratedTaskFiles{}, path, false, err
-	}
-	if err := writeJSON(path, files); err != nil {
-		return domain.GeneratedTaskFiles{}, path, false, err
-	}
-	return files, path, false, nil
-}
-
-func loadReusableRepoAnalysis(path string, prepared domain.RepoPrepared) (domain.RepoAnalysis, bool) {
-	var analysis domain.RepoAnalysis
-	if !readReusableJSON(path, &analysis) {
-		return domain.RepoAnalysis{}, false
-	}
-	analysis.SchemaVersion = defaultString(analysis.SchemaVersion, "harbor.repo_analysis.v1")
-	if err := validateRepoAnalysis(analysis); err != nil {
-		return domain.RepoAnalysis{}, false
-	}
-	if !repourl.Equivalent(analysis.RepoURL, prepared.RepoURL) {
-		return domain.RepoAnalysis{}, false
-	}
-	if strings.TrimSpace(analysis.CommitSHA) != strings.TrimSpace(prepared.ResolvedCommit) {
-		return domain.RepoAnalysis{}, false
-	}
-	return analysis, true
-}
-
-func loadReusableTaskProposal(path string, prepared domain.RepoPrepared) (domain.TaskProposal, bool) {
-	var proposal domain.TaskProposal
-	if !readReusableJSON(path, &proposal) {
-		return domain.TaskProposal{}, false
-	}
-	proposal.SchemaVersion = defaultString(proposal.SchemaVersion, "harbor.task_proposal.v1")
-	applyProposalDefaults(&proposal, prepared)
-	if err := validateTaskProposal(proposal); err != nil {
-		return domain.TaskProposal{}, false
-	}
-	if !repourl.Equivalent(proposal.GitHubLink, prepared.RepoURL) {
-		return domain.TaskProposal{}, false
-	}
-	if strings.TrimSpace(proposal.CommitSHA) != strings.TrimSpace(prepared.ResolvedCommit) {
-		return domain.TaskProposal{}, false
-	}
-	return proposal, true
-}
-
-func loadReusableTaskFiles(path string, prepared domain.RepoPrepared, proposal domain.TaskProposal) (domain.GeneratedTaskFiles, bool) {
-	var files domain.GeneratedTaskFiles
-	if !readReusableJSON(path, &files) {
-		return domain.GeneratedTaskFiles{}, false
-	}
-	files.SchemaVersion = defaultString(files.SchemaVersion, "harbor.generated_task_files.v1")
-	if err := validateTaskFiles(files); err != nil {
-		return domain.GeneratedTaskFiles{}, false
-	}
-	if !repourl.Equivalent(files.RepoURL, prepared.RepoURL) {
-		return domain.GeneratedTaskFiles{}, false
-	}
-	if strings.TrimSpace(files.CommitSHA) != strings.TrimSpace(prepared.ResolvedCommit) {
-		return domain.GeneratedTaskFiles{}, false
-	}
-	if strings.TrimSpace(files.TaskProposalDigest) != taskProposalDigest(proposal) {
-		return domain.GeneratedTaskFiles{}, false
-	}
-	return files, true
-}
-
-func readReusableJSON(path string, target any) bool {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return false
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	return json.Unmarshal(raw, target) == nil
+	taskPath string
+	content  string
+	mode     os.FileMode
 }
 
 const structuredOutputTurns = 3
+
+type conversationCheckpoint struct {
+	SchemaVersion    string    `json:"schema_version"`
+	RunID            string    `json:"run_id"`
+	NodeID           string    `json:"node_id"`
+	Attempt          int       `json:"attempt"`
+	Turn             int       `json:"turn"`
+	Substep          string    `json:"substep"`
+	Status           string    `json:"status"`
+	CandidatePath    string    `json:"candidate_path,omitempty"`
+	InputFingerprint string    `json:"input_fingerprint"`
+	ValidationError  string    `json:"validation_error,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+}
 
 // runJSONConversation scopes one ephemeral thread to exactly one workflow
 // node. It always performs a draft and a self-review turn, then permits one
 // bounded correction turn. Only the final validated value may be persisted by
 // the caller; raw output and thread history never cross node boundaries.
-func runJSONConversation(ctx context.Context, opts Options, timeout int, nodeID, prompt string, target any, normalizeAndValidate func() error) error {
+func runJSONConversation(ctx context.Context, opts conversationRuntimeOptions, timeout int, nodeID, prompt string, target any, normalizeAndValidate func() error) error {
 	projectPath, err := isolatedAgentProject(opts, nodeID)
 	if err != nil {
 		return err
+	}
+	attemptDir, err := conversationAttemptDir(opts, nodeID)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(attemptDir, 0o700); err != nil {
+		return fmt.Errorf("create %s attempt checkpoint directory: %w", nodeID, err)
 	}
 	conversation, err := opts.Agent.OpenConversation(ctx, workflow.AgentConversationRequest{
 		ProjectPath:     projectPath,
@@ -326,7 +85,7 @@ func runJSONConversation(ctx context.Context, opts Options, timeout int, nodeID,
 		WorkspaceRoots:  []string{projectPath},
 		TimeoutSeconds:  timeout,
 		MaxOutputBytes:  2 << 20,
-		LogPath:         nodes.AgentLogPath(opts.Workspace, nodeID),
+		LogPath:         filepath.Join(attemptDir, "session.log"),
 	})
 	if err != nil {
 		return fmt.Errorf("%s open agent conversation: %w", nodeID, err)
@@ -339,19 +98,34 @@ func runJSONConversation(ctx context.Context, opts Options, timeout int, nodeID,
 	}()
 
 	turnPrompt := prompt
+	inputFingerprint := conversationInputFingerprint(opts, nodeID, prompt)
+	startTurn := 1
+	if resumed, resumeErr := restoreDraftCheckpoint(opts, nodeID, inputFingerprint, target, normalizeAndValidate); resumeErr != nil {
+		return fmt.Errorf("restore %s draft checkpoint: %w", nodeID, resumeErr)
+	} else if resumed {
+		startTurn = 2
+		turnPrompt = structuredRefinementPrompt(nodeID, 1, nil)
+	}
 	var validationErr error
-	for turn := 1; turn <= structuredOutputTurns; turn++ {
+	for turn := startTurn; turn <= structuredOutputTurns; turn++ {
+		turnDir := filepath.Join(attemptDir, fmt.Sprintf("turn-%03d", turn))
 		result, turnErr := conversation.Turn(ctx, workflow.AgentTurnRequest{
 			Prompt:         turnPrompt,
 			Model:          opts.Model,
 			TimeoutSeconds: timeout,
 			MaxOutputBytes: 2 << 20,
-			LogPath:        nodes.AgentLogPath(opts.Workspace, nodeID),
+			LogPath:        filepath.Join(turnDir, "agent.log"),
 		})
 		if turnErr != nil {
+			if checkpointErr := persistConversationCheckpoint(opts, nodeID, inputFingerprint, turn, nil, "", nil, turnErr); checkpointErr != nil {
+				return fmt.Errorf("%s persist interrupted turn %d: %w", nodeID, turn, checkpointErr)
+			}
 			return fmt.Errorf("%s agent turn %d: %w", nodeID, turn, turnErr)
 		}
 		validationErr = decodeStructuredOutput(result.Text, target, normalizeAndValidate)
+		if checkpointErr := persistConversationCheckpoint(opts, nodeID, inputFingerprint, turn, target, result.Text, validationErr, nil); checkpointErr != nil {
+			return fmt.Errorf("%s persist turn %d checkpoint: %w", nodeID, turn, checkpointErr)
+		}
 		if validationErr == nil && turn >= 2 {
 			closed = true
 			if err := conversation.Close(); err != nil {
@@ -364,7 +138,215 @@ func runJSONConversation(ctx context.Context, opts Options, timeout int, nodeID,
 	return fmt.Errorf("%s structured output remained invalid after %d turns: %w", nodeID, structuredOutputTurns, validationErr)
 }
 
-func isolatedAgentProject(opts Options, nodeID string) (string, error) {
+func conversationAttemptDir(opts conversationRuntimeOptions, nodeID string) (string, error) {
+	root := strings.TrimSpace(opts.CheckpointRoot)
+	if root == "" {
+		root = nodes.DefaultWorkspace(opts.Workspace)
+	}
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	runID := safeCheckpointComponent(opts.RunID, "standalone")
+	attempt := opts.Attempt
+	if attempt <= 0 {
+		attempt = 1
+	}
+	node := safeCheckpointComponent(nodeID, "node")
+	return filepath.Join(absolute, "runs", runID, "stages", node, "nodes", node, fmt.Sprintf("attempt-%03d", attempt)), nil
+}
+
+func conversationNodeRoot(opts conversationRuntimeOptions, nodeID string) (string, error) {
+	attemptDir, err := conversationAttemptDir(opts, nodeID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(attemptDir), nil
+}
+
+func safeCheckpointComponent(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '-'
+	}, value)
+	value = strings.Trim(value, ".-")
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func persistConversationCheckpoint(opts conversationRuntimeOptions, nodeID, inputFingerprint string, turn int, target any, raw string, validationErr, runtimeErr error) error {
+	attemptDir, err := conversationAttemptDir(opts, nodeID)
+	if err != nil {
+		return err
+	}
+	turnDir := filepath.Join(attemptDir, fmt.Sprintf("turn-%03d", turn))
+	if err := os.MkdirAll(turnDir, 0o700); err != nil {
+		return err
+	}
+	if raw != "" {
+		if err := atomicWriteFile(filepath.Join(turnDir, "response.txt"), []byte(raw), 0o600); err != nil {
+			return err
+		}
+	}
+	checkpoint := conversationCheckpoint{
+		SchemaVersion:    "harbor.turn_checkpoint.v1",
+		RunID:            safeCheckpointComponent(opts.RunID, "standalone"),
+		NodeID:           nodeID,
+		InputFingerprint: inputFingerprint,
+		Attempt:          opts.Attempt,
+		Turn:             turn,
+		Substep:          conversationSubstep(turn),
+		CreatedAt:        time.Now().UTC(),
+	}
+	if checkpoint.Attempt <= 0 {
+		checkpoint.Attempt = 1
+	}
+	if runtimeErr != nil {
+		checkpoint.Status = "interrupted"
+		checkpoint.Error = runtimeErr.Error()
+	} else {
+		checkpoint.Status = "completed"
+		if validationErr == nil {
+			candidate, marshalErr := json.MarshalIndent(target, "", "  ")
+			if marshalErr != nil {
+				return marshalErr
+			}
+			candidatePath := filepath.Join(turnDir, "candidate.json")
+			if err := atomicWriteFile(candidatePath, append(candidate, '\n'), 0o600); err != nil {
+				return err
+			}
+			checkpoint.CandidatePath = candidatePath
+		}
+	}
+	if runtimeErr != nil {
+		checkpoint.ValidationError = ""
+	} else if validationErr != nil {
+		checkpoint.ValidationError = validationErr.Error()
+	} else if raw == "" {
+		checkpoint.ValidationError = "agent response was empty"
+	}
+	if runtimeErr == nil {
+		// Store the validation result separately so a restore never treats an
+		// invalid candidate as a completed draft.
+		validation := struct {
+			Valid bool   `json:"valid"`
+			Error string `json:"error,omitempty"`
+		}{Valid: validationErr == nil, Error: checkpoint.ValidationError}
+		if err := atomicWriteJSON(filepath.Join(turnDir, "validation.json"), validation, 0o600); err != nil {
+			return err
+		}
+	}
+	if err := atomicWriteJSON(filepath.Join(turnDir, "checkpoint.json"), checkpoint, 0o600); err != nil {
+		return err
+	}
+	return atomicWriteJSON(filepath.Join(attemptDir, "checkpoint.json"), checkpoint, 0o600)
+}
+
+func conversationSubstep(turn int) string {
+	switch turn {
+	case 1:
+		return "draft"
+	case 2:
+		return "self_review"
+	default:
+		return "correction"
+	}
+}
+
+func restoreDraftCheckpoint(opts conversationRuntimeOptions, nodeID, inputFingerprint string, target any, normalizeAndValidate func() error) (bool, error) {
+	if opts.ForceFresh {
+		return false, nil
+	}
+	nodeRoot, err := conversationNodeRoot(opts, nodeID)
+	if err != nil {
+		return false, err
+	}
+	entries, err := os.ReadDir(nodeRoot)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	attempts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "attempt-") {
+			attempts = append(attempts, entry.Name())
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(attempts)))
+	for _, attempt := range attempts {
+		checkpointPath := filepath.Join(nodeRoot, attempt, "turn-001", "checkpoint.json")
+		var checkpoint conversationCheckpoint
+		raw, readErr := os.ReadFile(checkpointPath)
+		if readErr != nil || json.Unmarshal(raw, &checkpoint) != nil || checkpoint.Substep != "draft" || checkpoint.Status != "completed" || checkpoint.CandidatePath == "" || checkpoint.InputFingerprint != inputFingerprint {
+			continue
+		}
+		candidate, readErr := os.ReadFile(checkpoint.CandidatePath)
+		if readErr != nil || json.Unmarshal(candidate, target) != nil {
+			continue
+		}
+		if normalizeAndValidate != nil {
+			if err := normalizeAndValidate(); err != nil {
+				continue
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func conversationInputFingerprint(opts conversationRuntimeOptions, nodeID, prompt string) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("harbor.turn-input.v1\x00"))
+	_, _ = hash.Write([]byte(nodeID))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(opts.Model))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(opts.ReasoningEffort))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(prompt))
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func atomicWriteJSON(path string, value any, mode os.FileMode) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(path, append(data, '\n'), mode)
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".checkpoint-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(mode); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+func isolatedAgentProject(opts conversationRuntimeOptions, nodeID string) (string, error) {
 	if nodeID == nodes.RepoAnalyze {
 		return opts.RepoPrepared.SourcePath, nil
 	}
@@ -401,66 +383,6 @@ func structuredRefinementPrompt(nodeID string, completedTurn int, validationErr 
 		return fmt.Sprintf("Your previous %s JSON draft failed local validation after turn %d: %s. Correct every listed issue. Return only one complete JSON object matching the original schema; do not include Markdown or explanation.", nodeID, completedTurn, validationErr)
 	}
 	return fmt.Sprintf("Critically self-review your previous %s draft for schema accuracy, engineering realism, CodeEdge instruction/test derivability, reproducibility, and missing boundary conditions. Return the improved final answer as exactly one complete JSON object with no Markdown or explanation.", nodeID)
-}
-
-func materializeTask(opts Options, taskDir, testsAnalysisPath string, prepared domain.RepoPrepared, proposal domain.TaskProposal, files domain.GeneratedTaskFiles) error {
-	workspace := strings.TrimSpace(opts.Workspace)
-	if workspace == "" {
-		workspace = filepath.Join(".harbor-factory", "workspace")
-	}
-	writes := []generatedFileWrite{
-		{nodes.InstructionGen, filepath.Join(taskDir, "instruction.md"), nodes.InstructionPath(workspace), ensureFinalNewline(files.InstructionMD), 0o644},
-		{nodes.TaskTOMLGen, filepath.Join(taskDir, "task.toml"), nodes.TaskTOMLPath(workspace), renderTaskTOML(proposal), 0o644},
-		{nodes.DockerfileGen, filepath.Join(taskDir, "environment", "Dockerfile"), nodes.DockerfilePath(workspace), renderDockerfile(prepared, proposal), 0o644},
-		{nodes.SolveGen, filepath.Join(taskDir, "solution", "solve.sh"), nodes.SolvePath(workspace), normalizeShellScript(files.SolveSH), 0o755},
-		{nodes.TestGen, filepath.Join(taskDir, "tests", "test.sh"), nodes.TestPath(workspace), normalizeTestScript(files.TestSH), 0o755},
-		{nodes.TestsAnalysis, filepath.Join(taskDir, "tests_analysis.md"), testsAnalysisPath, ensureTestsAnalysis(files.TestsAnalysis, proposal), 0o644},
-	}
-	if err := validateGeneratedFileWrites(taskDir, writes); err != nil {
-		return err
-	}
-
-	taskDir = filepath.Clean(taskDir)
-	parent := filepath.Dir(taskDir)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return err
-	}
-	stageDir, err := os.MkdirTemp(parent, "."+filepath.Base(taskDir)+".staging-")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if stageDir != "" {
-			_ = os.RemoveAll(stageDir)
-		}
-	}()
-
-	for _, write := range writes {
-		progress(opts, write.nodeID, "running", "writing "+filepath.Base(write.artifactPath), write.artifactPath)
-		if err := writeGeneratedFile(write.artifactPath, write.content, write.mode); err != nil {
-			progress(opts, write.nodeID, "failed", err.Error(), write.artifactPath)
-			return err
-		}
-		rel, err := filepath.Rel(taskDir, write.taskPath)
-		if err != nil {
-			progress(opts, write.nodeID, "failed", err.Error(), write.taskPath)
-			return err
-		}
-		stagePath := filepath.Join(stageDir, rel)
-		if err := writeGeneratedFile(stagePath, write.content, write.mode); err != nil {
-			progress(opts, write.nodeID, "failed", err.Error(), write.taskPath)
-			return err
-		}
-		progress(opts, write.nodeID, "succeeded", filepath.Base(write.artifactPath)+" written", write.artifactPath)
-	}
-	if err := validateMaterializedTaskDir(stageDir); err != nil {
-		return err
-	}
-	if err := publishGeneratedTaskDir(stageDir, taskDir); err != nil {
-		return err
-	}
-	stageDir = ""
-	return nil
 }
 
 func publishCanonicalTask(taskDir string, writes []generatedFileWrite) error {
@@ -930,17 +852,6 @@ func extractJSONObject(text string) ([]byte, error) {
 	return nil, fmt.Errorf("no JSON object found")
 }
 
-func writeJSON(path string, value any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
-}
-
 func defaultString(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -952,7 +863,6 @@ func defaultString(value, fallback string) string {
 var (
 	commitPattern        = regexp.MustCompile(`(?i)^[0-9a-f]{7,40}$`)
 	taskNameChars        = regexp.MustCompile(`[^a-z0-9._/-]+`)
-	taskDirChars         = regexp.MustCompile(`[^a-z0-9._-]+`)
 	forbiddenSetupToken  = regexp.MustCompile(`(?i)(\bcopy\b|\badd\b|tests/|solution/|/logs/verifier|reward\.txt|reward\.json)`)
 	repositorySetupToken = regexp.MustCompile(`(?i)\bgit\s+(clone|checkout|switch|reset|init|worktree)\b`)
 	testSetupToken       = regexp.MustCompile(`(?i)\b((go|cargo)\s+test\b|pytest\b|python\s+-m\s+pytest\b|npm\s+(run\s+)?test\b|pnpm\s+(run\s+)?test\b|yarn\s+test\b|mvn\s+test\b|gradle\s+test\b)`)
@@ -969,17 +879,6 @@ func safeHarborTaskName(name string) string {
 	}
 	if !strings.Contains(name, "/") {
 		name = "codeedge/" + name
-	}
-	return name
-}
-
-func safeTaskDir(name string) string {
-	parts := strings.Split(safeHarborTaskName(name), "/")
-	name = parts[len(parts)-1]
-	name = taskDirChars.ReplaceAllString(name, "-")
-	name = strings.Trim(name, ".-")
-	if name == "" {
-		return "generated-task"
 	}
 	return name
 }

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -53,6 +54,14 @@ func (f renderedFrame) targets(marker string, activate func() tea.Cmd) []mouseTa
 func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	event := tea.MouseEvent(msg)
 	if event.Button == tea.MouseButtonWheelUp || event.Button == tea.MouseButtonWheelDown {
+		if m.taskHubDetail != nil {
+			delta := 3
+			if event.Button == tea.MouseButtonWheelUp {
+				delta = -delta
+			}
+			m.taskHubDetail.scroll(delta, m.taskHubDetailHeight())
+			return nil
+		}
 		if m.mouseOverlayVisible() {
 			return nil
 		}
@@ -75,13 +84,15 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 }
 
 func (m *model) mouseOverlayVisible() bool {
-	return m.helpVisible || m.confirm != nil || m.resumeOverlay != nil || m.runConfig != nil || m.taskRepair != nil
+	return m.taskHubDetail != nil || m.taskHubHelpVisible || m.helpVisible || m.confirm != nil || m.taskHubMutation != nil || m.runControl != nil
 }
 
 func (m *model) handleMouseWheel(delta int) {
 	switch m.view {
 	case viewHub:
-		if delta < 0 {
+		if m.lifecycle != nil {
+			m.moveTaskHubSelection(delta)
+		} else if delta < 0 {
 			m.hubTable.MoveUp(-delta)
 		} else {
 			m.hubTable.MoveDown(delta)
@@ -131,6 +142,54 @@ func (m *model) mouseTargets() []mouseTarget {
 		targets = append(targets, frame.targets(marker, activate)...)
 	}
 
+	if m.taskHubMutation != nil {
+		add("[Enter] 确认提交", func() tea.Cmd { return m.updateTaskHubMutationKey(mouseKey("enter")) })
+		add("[Esc] 取消", func() tea.Cmd { return m.updateTaskHubMutationKey(mouseKey("esc")) })
+		return targets
+	}
+	if m.runControl != nil {
+		add("  返回并保持运行  ", func() tea.Cmd {
+			m.runControl.selectReturn()
+			return m.updateRunControlKey(mouseKey("enter"))
+		})
+		if m.runControl.lifecycleControlAvailable() {
+			for _, choice := range []struct {
+				marker string
+				action TaskHubRunControlAction
+			}{
+				{"[P] 暂停运行", TaskHubRunControlPause},
+				{"[K] 取消选中阶段", TaskHubRunControlCancelStage},
+				{"[S] 终止本次运行", TaskHubRunControlTerminate},
+			} {
+				choice := choice
+				add(choice.marker, func() tea.Cmd {
+					m.runControl.selectAction(choice.action)
+					return nil
+				})
+			}
+			add("[Enter] 查看影响预览", func() tea.Cmd {
+				return m.updateRunControlKey(mouseKey("enter"))
+			})
+		}
+		return targets
+	}
+	if m.taskHubDetail != nil {
+		for _, tab := range taskHubDetailTabs() {
+			tab := tab
+			add(tab.label(), func() tea.Cmd {
+				m.taskHubDetail.Tab = tab
+				m.taskHubDetail.Scroll = 0
+				return nil
+			})
+		}
+		add("[r] 刷新", func() tea.Cmd { return m.updateTaskHubDetailKey(runeMouseKey("r")) })
+		add("[Esc] 返回", func() tea.Cmd { return m.updateTaskHubDetailKey(mouseKey("esc")) })
+		return targets
+	}
+	if m.taskHubHelpVisible {
+		add("[? / Esc / q] 关闭帮助", func() tea.Cmd { return m.dispatchMouseKey("esc") })
+		return targets
+	}
 	if m.helpVisible {
 		add("按 ?、Esc 或 q 关闭", func() tea.Cmd { return m.dispatchMouseKey("?") })
 		return targets
@@ -146,56 +205,62 @@ func (m *model) mouseTargets() []mouseTarget {
 		})
 		return targets
 	}
-	if m.resumeOverlay != nil {
-		for index, choice := range []struct{ marker, key string }{
-			{"[R] 恢复运行", "r"}, {"[N] 新建运行", "n"}, {"[V] 只读查看", "v"},
-		} {
-			index, key := index, choice.key
-			add(choice.marker, func() tea.Cmd {
-				m.resumeOverlay.Selected = index
-				return m.updateResumeKey(runeMouseKey(key))
-			})
-		}
-		return targets
-	}
-	if m.runConfig != nil {
-		for field, label := range []string{"目标工作区", "复用 Docker 验证结果", "复用质量检查结果", "复用相似度检查结果", "复用 Harbor 运行结果", "自动批准全部审查关卡", "后台并行运行"} {
-			field := field
-			add(label, func() tea.Cmd {
-				m.runConfig.Field = field
-				if field == 0 {
-					m.runConfig.Target.Focus()
-					return m.runConfig.Target.Cursor.BlinkCmd()
-				}
-				m.runConfig.Target.Blur()
-				m.runConfig.toggle()
-				return nil
-			})
-		}
-		add("[Enter 开始重跑]", func() tea.Cmd { return m.updateRunConfigKey(mouseKey("enter")) })
-		add("[Esc 取消]", func() tea.Cmd { return m.updateRunConfigKey(mouseKey("esc")) })
-		return targets
-	}
-	if m.taskRepair != nil {
-		add("目标工作区", func() tea.Cmd {
-			m.taskRepair.Field = 0
-			m.taskRepair.Feedback.Blur()
-			m.taskRepair.Target.Focus()
-			return m.taskRepair.Target.Cursor.BlinkCmd()
-		})
-		add("机审 / 人工审核反馈", func() tea.Cmd {
-			m.taskRepair.Field = 1
-			m.taskRepair.Target.Blur()
-			m.taskRepair.Feedback.Focus()
-			return m.taskRepair.Feedback.Cursor.BlinkCmd()
-		})
-		add("[Ctrl+S 创建返修运行]", func() tea.Cmd { return m.updateTaskRepairKey(mouseKey("ctrl+s")) })
-		add("[Esc 取消]", func() tea.Cmd { return m.updateTaskRepairKey(mouseKey("esc")) })
-		return targets
-	}
-
 	switch m.view {
 	case viewHub:
+		if m.lifecycle != nil {
+			for _, tab := range []struct {
+				marker string
+				tab    TaskHubTab
+			}{
+				{marker: "Tasks", tab: TaskHubTasksTab},
+				{marker: "Runs", tab: TaskHubRunsTab},
+				{marker: "Queue", tab: TaskHubQueueTab},
+			} {
+				tab := tab
+				add(tab.marker, func() tea.Cmd {
+					m.selectTaskHubTab(tab.tab)
+					return nil
+				})
+			}
+			switch m.taskHub.Query.Tab {
+			case TaskHubTasksTab:
+				for _, row := range m.taskHub.Rows {
+					row := row
+					add(shortTaskHubID(row.Task.TaskID), func() tea.Cmd {
+						m.taskHub.SelectedTaskID = row.Task.TaskID
+						if row.HasLatestRun {
+							m.taskHub.SelectedRunID = row.LatestRun.RunID
+						}
+						m.focusMgr.SetCurrent(focusPage)
+						return nil
+					})
+				}
+			case TaskHubRunsTab:
+				for _, run := range sortTaskHubRuns(m.taskHub.Snapshot.Runs) {
+					run := run
+					add(shortTaskHubID(run.RunID), func() tea.Cmd {
+						m.taskHub.SelectedRunID = run.RunID
+						m.taskHub.SelectedTaskID = run.TaskID
+						m.focusMgr.SetCurrent(focusPage)
+						return nil
+					})
+				}
+			case TaskHubQueueTab:
+				for _, run := range m.taskHub.Snapshot.Runs {
+					if run.QueuePosition <= 0 {
+						continue
+					}
+					run := run
+					add("#"+strconv.Itoa(run.QueuePosition), func() tea.Cmd {
+						m.taskHub.SelectedRunID = run.RunID
+						m.taskHub.SelectedTaskID = run.TaskID
+						m.focusMgr.SetCurrent(focusPage)
+						return nil
+					})
+				}
+			}
+			return appendTaskHubMouseFooterTargets(m, frame, targets)
+		}
 		for index, row := range m.hubTable.Rows() {
 			if len(row) == 0 {
 				continue
@@ -243,17 +308,26 @@ func (m *model) mouseTargets() []mouseTarget {
 		"[Ctrl+L 日志]": "ctrl+l", "[Ctrl+E 完成]": "ctrl+e", "[Ctrl+A/a 批准]": "a",
 		"[Ctrl+R/r 拒绝]": "r", "[v Codex指导返修]": "v", "[c Codex自动循环]": "c",
 		"[u 人工编辑后重跑]": "u", "[Ctrl+V/v 刷新证据]": "v", "[Ctrl+N 备注/指导]": "ctrl+n",
-		"[e 编辑工件]": "e", "[e 编辑]": "e", "[t 跟踪]": "t", "[f 外部审查返修]": "f",
-		"[Ctrl+R 重跑]": "ctrl+r", "[Ctrl+N 新建]": "ctrl+n", "[1 工作区]": "1", "[2 总览]": "2",
+		"[t 跟踪]": "t", "[1 工作区]": "1", "[2 总览]": "2",
 		"[4 详情]": "4", "[5 日志]": "5", "[? 帮助]": "?", "Ctrl+B 入队": "ctrl+b",
 		"[Enter 打开]": "enter", "[Del 删除]": "delete", "[s/S 排序]": "s", "[/ 搜索]": "/",
 		"[q 退出]": "q", "[Enter 下一步]": "enter", "[Enter 启动]": "enter", "[Ctrl+Q 退出]": "ctrl+q",
 		"[Esc 返回]": "esc", "[Tab 下一工件]": "tab", "[Tab/Shift+Tab 切换文件]": "tab", "[/ 过滤]": "/",
-		"[r 重试节点]": "r",
 	} {
 		key := key
 		add(marker, func() tea.Cmd { return m.dispatchMouseKey(key) })
 	}
+	return targets
+}
+
+func appendTaskHubMouseFooterTargets(m *model, frame renderedFrame, targets []mouseTarget) []mouseTarget {
+	add := func(marker string, activate func() tea.Cmd) {
+		targets = append(targets, frame.targets(marker, activate)...)
+	}
+	add("[Enter/d 详情]", func() tea.Cmd { return m.dispatchMouseKey("enter") })
+	add("[/ 搜索]", func() tea.Cmd { return m.dispatchMouseKey("/") })
+	add("[? 帮助]", func() tea.Cmd { return m.dispatchMouseKey("?") })
+	add("[q 退出]", func() tea.Cmd { return m.dispatchMouseKey("q") })
 	return targets
 }
 

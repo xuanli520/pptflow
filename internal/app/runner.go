@@ -18,7 +18,6 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
-	"github.com/purplevoid/harbor-factory/internal/harbor/packager"
 	"github.com/purplevoid/harbor-factory/internal/harbor/sanitize"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
@@ -95,17 +94,6 @@ type Runner struct {
 	stageActive       map[string]bool
 	stageCancels      map[string]context.CancelFunc
 	stageCancelQueued map[string]bool
-	retryIntent       *RetryIntent
-}
-
-type RetryIntent struct {
-	NodeID string
-}
-
-type ManualRetryPlan struct {
-	Workspace string
-	RunID     string
-	workflow.ManualRetryPlan
 }
 
 const runnerOptionsSchemaVersion = "harbor.runner_options.v1"
@@ -126,19 +114,6 @@ func NewRunner(opts RunnerOptions) *Runner {
 		opts: opts, events: make(chan domain.RunnerEvent, 64), decisions: make(chan domain.GateDecision, 8),
 		stageActive: map[string]bool{}, stageCancels: map[string]context.CancelFunc{}, stageCancelQueued: map[string]bool{},
 	}
-}
-
-// NewRetryRunner creates a fresh Runner with its own open event channel. The
-// retry is still executed by Run, so normal and manual runs share one engine
-// path and one workspace lock protocol.
-func NewRetryRunner(opts RunnerOptions, nodeID string) (*Runner, error) {
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" {
-		return nil, fmt.Errorf("manual retry node ID is required")
-	}
-	runner := NewRunner(opts)
-	runner.retryIntent = &RetryIntent{NodeID: nodeID}
-	return runner, nil
 }
 
 func SaveRunnerOptions(opts RunnerOptions) (domain.RunnerOptionsSnapshot, error) {
@@ -306,15 +281,8 @@ func (r *Runner) validateOptions() error {
 	if r.opts.Generate && (strings.TrimSpace(r.opts.RepoURL) == "" || strings.TrimSpace(r.opts.Commit) == "") {
 		return fmt.Errorf("--generate requires --repo and --commit")
 	}
-	if r.opts.Package && strings.TrimSpace(r.opts.OutputDir) == "" {
-		return fmt.Errorf("--package requires a non-empty --output")
-	}
-	if r.opts.Package && strings.TrimSpace(r.opts.TaskName) != "" {
-		taskName, err := packager.NormalizeTaskName(r.opts.TaskName)
-		if err != nil {
-			return err
-		}
-		r.opts.TaskName = taskName
+	if r.opts.Package {
+		return fmt.Errorf("legacy --package execution is unavailable; use the lifecycle release package command")
 	}
 	if r.opts.HarborSetupTimeout <= 0 {
 		r.opts.HarborSetupTimeout = 1200

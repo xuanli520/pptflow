@@ -10,11 +10,10 @@ import (
 
 func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
 	workspace := t.TempDir()
-	publishDestination := t.TempDir()
 	definition, err := buildWorkflowDefinition(RunnerOptions{
 		Generate: true, RepoURL: "https://github.com/org/repo", Commit: "abc1234", Workspace: workspace,
-		TaskOutputDir: publishDestination, VerifyDocker: true, QualityCheck: true, SimilarityCheck: true,
-		SimilarityHistoryDirs: []string{t.TempDir()}, RunHarbor: true, HarborModels: "qwen,opus", StrictSubmission: true,
+		TaskOutputDir: t.TempDir(), VerifyDocker: true, QualityCheck: true, SimilarityCheck: true,
+		SimilarityHistoryDirs: []string{t.TempDir()}, RunHarbor: true, HarborModels: "qwen,opus", StrictSubmission: true, Package: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -24,6 +23,20 @@ func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
 		nodes.FinalReview: false, nodes.ResultReview: false,
 	}
 	seen := map[string]bool{}
+	declaredAttempts := map[string]int{
+		nodes.RepoPrepare:       1,
+		nodes.RepoAnalyze:       3,
+		nodes.TaskDesign:        3,
+		nodes.GenerateTaskFiles: 3,
+		nodes.InstructionGen:    1,
+		nodes.DockerBuild:       3,
+		nodes.InitialVerify:     1,
+		nodes.OracleVerify:      1,
+		nodes.QualityCheck:      3,
+		nodes.SimilarityCheck:   2,
+		nodes.HarborRunQwen:     1,
+		nodes.HarborRunOpus:     1,
+	}
 	for _, spec := range definition.Nodes {
 		if seen[spec.ID] {
 			t.Fatalf("duplicate workflow node %s", spec.ID)
@@ -41,7 +54,7 @@ func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
 			t.Fatalf("workflow missing gate %s", gateID)
 		}
 	}
-	for _, nodeID := range []string{nodes.RepoPrepare, nodes.RepoAnalyze, nodes.TaskDesign, nodes.GenerateTaskFiles, nodes.DockerBuild, nodes.InitialVerify, nodes.OracleVerify, nodes.CodeEdgeLint, nodes.HarborRunQwen, nodes.HarborRunOpus, nodes.SubmissionLint, nodes.PublishTask} {
+	for _, nodeID := range []string{nodes.RepoPrepare, nodes.RepoAnalyze, nodes.TaskDesign, nodes.GenerateTaskFiles, nodes.DockerBuild, nodes.InitialVerify, nodes.OracleVerify, nodes.CodeEdgeLint, nodes.HarborRunQwen, nodes.HarborRunOpus, nodes.SubmissionLint} {
 		if !seen[nodeID] {
 			t.Fatalf("workflow missing production node %s", nodeID)
 		}
@@ -52,13 +65,18 @@ func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
 			if spec.Policy.MaxAttempts != 1 || len(spec.Policy.Retryable) != 0 {
 				t.Fatalf("human gate %s must not retry automatically: %+v", spec.ID, spec.Policy)
 			}
-		} else {
-			if spec.Policy.MaxAttempts != defaultNodeMaxAttempts {
-				t.Fatalf("node %s max attempts=%d, want %d", spec.ID, spec.Policy.MaxAttempts, defaultNodeMaxAttempts)
+		} else if want, tracked := declaredAttempts[spec.ID]; tracked {
+			if spec.Policy.MaxAttempts != want {
+				t.Fatalf("node %s max attempts=%d, want declared %d", spec.ID, spec.Policy.MaxAttempts, want)
 			}
-			for _, kind := range defaultNodeRetryableFailures {
-				if !containsFailureKind(spec.Policy.Retryable, kind) {
-					t.Fatalf("node %s retry policy missing %s: %+v", spec.ID, kind, spec.Policy.Retryable)
+			if want > 1 {
+				for _, kind := range defaultNodeRetryableFailures {
+					if !containsFailureKind(spec.Policy.Retryable, kind) {
+						t.Fatalf("node %s retry policy missing %s: %+v", spec.ID, kind, spec.Policy.Retryable)
+					}
+				}
+				if containsFailureKind(spec.Policy.Retryable, workflow.FailureUnknown) {
+					t.Fatalf("node %s must not blindly retry unknown failures: %+v", spec.ID, spec.Policy.Retryable)
 				}
 			}
 		}
@@ -68,10 +86,36 @@ func TestBuildWorkflowDefinitionUsesFiveExplicitGates(t *testing.T) {
 		if spec.ID == nodes.MaterializeTask && spec.Config["task_dir"] != internalTaskDir {
 			t.Fatalf("materialize task_dir=%v, want ArtifactStore-local %s", spec.Config["task_dir"], internalTaskDir)
 		}
-		if spec.ID == nodes.PublishTask {
-			if spec.Config["task_dir"] != internalTaskDir || spec.Config["destination_dir"] != publishDestination {
-				t.Fatalf("unexpected publish boundary config: %+v", spec.Config)
+		if spec.ID == nodes.PublishTask || spec.ID == nodes.Package || spec.Kind == "harborfactory.publish_task" || spec.Kind == "harborfactory.package" {
+			t.Fatalf("legacy external delivery route remains in workflow definition: %+v", spec)
+		}
+	}
+}
+
+func TestBuildWorkflowDefinitionExpandsMultiTurnAgentBudget(t *testing.T) {
+	definition, err := buildWorkflowDefinition(RunnerOptions{
+		Generate: true, RepoURL: "https://github.com/org/repo", Commit: "abc1234", Workspace: t.TempDir(),
+		TaskOutputDir: t.TempDir(), AgentTimeout: 1800,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{nodes.RepoAnalyze, nodes.TaskDesign, nodes.GenerateTaskFiles} {
+		var policy workflow.NodePolicy
+		for _, spec := range definition.Nodes {
+			if spec.ID == nodeID {
+				policy = spec.Policy
+				break
 			}
+		}
+		if policy.MaxTurns != 3 || policy.TurnTimeoutSeconds != 1800 {
+			t.Fatalf("%s turn budget=%+v", nodeID, policy)
+		}
+		if policy.TimeoutSeconds < 3*1800+defaultStartupGraceSeconds+defaultShutdownGraceSeconds {
+			t.Fatalf("%s parent attempt remains too short: %+v", nodeID, policy)
+		}
+		if policy.MaxElapsedSeconds < policy.MaxAttempts*policy.TimeoutSeconds {
+			t.Fatalf("%s max elapsed omits attempts: %+v", nodeID, policy)
 		}
 	}
 }

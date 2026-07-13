@@ -52,29 +52,28 @@ func (r *LintReport) Add(id string, status CheckStatus, message string, path str
 type RunnerEvent = runmodel.Event
 
 type RunSummary struct {
-	RunID             string              `json:"run_id,omitempty"`
-	PreviousRunID     string              `json:"previous_run_id,omitempty"`
-	Recovered         bool                `json:"recovered,omitempty"`
-	ReusedNodes       []string            `json:"reused_nodes,omitempty"`
-	RerunNodes        []string            `json:"rerun_nodes,omitempty"`
-	Workspace         string              `json:"workspace"`
-	RepoPrepared      *RepoPrepared       `json:"repo_prepared,omitempty"`
-	GenReport         *GenReport          `json:"gen_report,omitempty"`
-	TaskPublish       *TaskPublishReceipt `json:"task_publish,omitempty"`
-	LintReport        *LintReport         `json:"lint_report,omitempty"`
-	VerifyReport      *VerifyReport       `json:"verify_report,omitempty"`
-	QualityReport     *QualityReport      `json:"quality_report,omitempty"`
-	SimilarityReport  *SimilarityReport   `json:"similarity_report,omitempty"`
-	QwenResult        *TrialResult        `json:"qwen_result,omitempty"`
-	OpusResult        *TrialResult        `json:"opus_result,omitempty"`
-	PackageReport     *PackageReport      `json:"package_report,omitempty"`
-	GateDecisions     []GateDecision      `json:"gate_decisions,omitempty"`
-	StartedAt         time.Time           `json:"started_at"`
-	FinishedAt        time.Time           `json:"finished_at"`
-	Status            string              `json:"status,omitempty"`
-	Passed            bool                `json:"passed"`
-	Events            []RunnerEvent       `json:"events"`
-	PersistenceErrors []string            `json:"persistence_errors,omitempty"`
+	RunID             string            `json:"run_id,omitempty"`
+	PreviousRunID     string            `json:"previous_run_id,omitempty"`
+	Recovered         bool              `json:"recovered,omitempty"`
+	ReusedNodes       []string          `json:"reused_nodes,omitempty"`
+	RerunNodes        []string          `json:"rerun_nodes,omitempty"`
+	Workspace         string            `json:"workspace"`
+	RepoPrepared      *RepoPrepared     `json:"repo_prepared,omitempty"`
+	GenReport         *GenReport        `json:"gen_report,omitempty"`
+	LintReport        *LintReport       `json:"lint_report,omitempty"`
+	VerifyReport      *VerifyReport     `json:"verify_report,omitempty"`
+	QualityReport     *QualityReport    `json:"quality_report,omitempty"`
+	SimilarityReport  *SimilarityReport `json:"similarity_report,omitempty"`
+	QwenResult        *TrialResult      `json:"qwen_result,omitempty"`
+	OpusResult        *TrialResult      `json:"opus_result,omitempty"`
+	PackageReport     *PackageReport    `json:"package_report,omitempty"`
+	GateDecisions     []GateDecision    `json:"gate_decisions,omitempty"`
+	StartedAt         time.Time         `json:"started_at"`
+	FinishedAt        time.Time         `json:"finished_at"`
+	Status            string            `json:"status,omitempty"`
+	Passed            bool              `json:"passed"`
+	Events            []RunnerEvent     `json:"events"`
+	PersistenceErrors []string          `json:"persistence_errors,omitempty"`
 }
 
 type RunnerOptionsSnapshot struct {
@@ -311,16 +310,6 @@ type GenReport struct {
 	TaskProposal      TaskProposal `json:"task_proposal"`
 	CreatedAt         time.Time    `json:"created_at"`
 	Passed            bool         `json:"passed"`
-}
-
-type TaskPublishReceipt struct {
-	SchemaVersion   string    `json:"schema_version"`
-	SourceTaskDir   string    `json:"source_task_dir"`
-	DestinationDir  string    `json:"destination_dir"`
-	SourceDigest    string    `json:"source_digest"`
-	PublishedDigest string    `json:"published_digest"`
-	CreatedAt       time.Time `json:"created_at"`
-	Passed          bool      `json:"passed"`
 }
 
 type ChecklistItem = runmodel.ChecklistItem

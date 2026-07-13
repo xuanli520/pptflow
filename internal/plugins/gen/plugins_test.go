@@ -115,67 +115,18 @@ func TestGenerationContentPluginsAndMaterializeUseCanonicalArtifacts(t *testing.
 		}
 	}
 
-	destination := t.TempDir()
-	publishReq := nodeRequest(workspace, store, nil, "publish_task", PublishTaskKind, nil)
-	publishReq.Spec.Config["task_dir"] = taskDir
-	publishReq.Spec.Config["destination_dir"] = destination
-	published, err := (PublishTaskPlugin{}).Execute(ctx, publishReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(published.Artifacts) != 1 || published.Artifacts[0].Type != "task_publish_receipt" {
-		t.Fatalf("unexpected publish artifacts: %+v", published.Artifacts)
-	}
-	var receipt domain.TaskPublishReceipt
-	if _, err := store.ReadJSON(ctx, published.Artifacts[0].Name, &receipt); err != nil {
-		t.Fatal(err)
-	}
-	if !receipt.Passed || receipt.SourceDigest == "" || receipt.SourceDigest != receipt.PublishedDigest || receipt.DestinationDir != destination {
-		t.Fatalf("unexpected publish receipt: %+v", receipt)
-	}
-	for _, rel := range []string{"instruction.md", "task.toml", "environment/Dockerfile", "solution/solve.sh", "tests/test.sh", "tests_analysis.md"} {
-		if _, err := os.Stat(filepath.Join(destination, filepath.FromSlash(rel))); err != nil {
-			t.Fatalf("missing published %s: %v", rel, err)
-		}
-	}
-
-	overlapReq := publishReq
-	overlapReq.Spec.Config = map[string]any{"task_dir": taskDir, "destination_dir": filepath.Join(workspace, "export")}
-	if _, err := (PublishTaskPlugin{}).Execute(ctx, overlapReq); err == nil || !strings.Contains(err.Error(), "must not overlap") {
-		t.Fatalf("expected artifact root overlap rejection, got %v", err)
-	}
-	symlinkParent := filepath.Join(t.TempDir(), "workspace-link")
-	if err := os.Symlink(workspace, symlinkParent); err != nil {
-		t.Fatal(err)
-	}
-	symlinkReq := publishReq
-	symlinkReq.Spec.Config = map[string]any{"task_dir": taskDir, "destination_dir": filepath.Join(symlinkParent, "export")}
-	if _, err := (PublishTaskPlugin{}).Execute(ctx, symlinkReq); err == nil || !strings.Contains(err.Error(), "must not overlap") {
-		t.Fatalf("expected symlinked destination overlap rejection, got %v", err)
-	}
-	escapeReq := publishReq
-	escapeReq.Spec.Config = map[string]any{"task_dir": destination, "destination_dir": t.TempDir()}
-	if _, err := (PublishTaskPlugin{}).Execute(ctx, escapeReq); err == nil || !strings.Contains(err.Error(), "source must remain") {
-		t.Fatalf("expected publish source escape rejection, got %v", err)
-	}
 }
 
 func TestGenerationPluginsValidateAndFailWithoutCanonicalInput(t *testing.T) {
-	plugins := []workflow.Plugin{RepoAnalyzePlugin{}, TaskDesignPlugin{}, GenerateTaskFilesPlugin{}, InstructionPlugin{}, TaskTOMLPlugin{}, DockerfilePlugin{}, SolvePlugin{}, TestPlugin{}, TestsAnalysisPlugin{}, MaterializePlugin{}, PublishTaskPlugin{}, RuntimeSelfCheckPlugin{}}
+	plugins := []workflow.Plugin{RepoAnalyzePlugin{}, TaskDesignPlugin{}, GenerateTaskFilesPlugin{}, InstructionPlugin{}, TaskTOMLPlugin{}, DockerfilePlugin{}, SolvePlugin{}, TestPlugin{}, TestsAnalysisPlugin{}, MaterializePlugin{}, RuntimeSelfCheckPlugin{}}
 	for _, plugin := range plugins {
 		manifest := plugin.Manifest()
 		spec := workflow.NodeSpec{ID: manifest.ID, Kind: manifest.Kinds[0], Config: map[string]any{}}
-		if manifest.ID == MaterializeKind || manifest.ID == PublishTaskKind || manifest.ID == RuntimeSelfCheckKind {
+		if manifest.ID == MaterializeKind || manifest.ID == RuntimeSelfCheckKind {
 			if err := plugin.Validate(spec); err == nil {
 				t.Fatalf("%s validation accepted missing task_dir", manifest.ID)
 			}
 			spec.Config["task_dir"] = "/task"
-			if manifest.ID == PublishTaskKind {
-				if err := plugin.Validate(spec); err == nil {
-					t.Fatalf("%s validation accepted missing destination_dir", manifest.ID)
-				}
-				spec.Config["destination_dir"] = "/published-task"
-			}
 		}
 		if err := plugin.Validate(spec); err != nil {
 			t.Fatalf("%s validation failed: %v", manifest.ID, err)

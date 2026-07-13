@@ -17,8 +17,7 @@ type WorkflowDefinition struct {
 }
 
 type Policy struct {
-	MaxNodes     int `json:"max_nodes,omitempty"`
-	MaxRevisions int `json:"max_revisions,omitempty"`
+	MaxNodes int `json:"max_nodes,omitempty"`
 }
 
 type NodeSpec struct {
@@ -38,6 +37,14 @@ type NodePolicy struct {
 	RetryBackoffMS    int           `json:"retry_backoff_ms,omitempty"`
 	RetryMaxBackoffMS int           `json:"retry_max_backoff_ms,omitempty"`
 	Retryable         []FailureKind `json:"retryable_failure_types,omitempty"`
+	// The following fields make a node's parent/child execution budget
+	// explicit. They are optional for legacy descriptors, but must be complete
+	// whenever a node invokes one or more bounded turns.
+	TurnTimeoutSeconds   int `json:"turn_timeout_seconds,omitempty"`
+	MaxTurns             int `json:"max_turns,omitempty"`
+	StartupGraceSeconds  int `json:"startup_grace_seconds,omitempty"`
+	ShutdownGraceSeconds int `json:"shutdown_grace_seconds,omitempty"`
+	MaxElapsedSeconds    int `json:"max_elapsed_seconds,omitempty"`
 }
 
 type EdgeSpec struct {
@@ -69,7 +76,7 @@ type RunStatus string
 const (
 	RunSucceeded RunStatus = "succeeded"
 	RunFailed    RunStatus = "failed"
-	RunCancelled RunStatus = "cancelled"
+	RunCancelled RunStatus = "canceled"
 	RunRunning   RunStatus = "running"
 )
 
@@ -115,11 +122,6 @@ type RunRequest struct {
 	// Prior contains durable node snapshots from a previous invocation. Only
 	// succeeded nodes are reused; all other nodes are scheduled again.
 	Prior map[string]NodeRun `json:"-"`
-	// Retry requests a manual retry within the same durable run. Engine plans
-	// and applies the retry after acquiring the workspace-scoped infrastructure,
-	// preserving successful upstream nodes and invalidating only retry roots and
-	// their downstream dependants.
-	Retry *ManualRetryRequest `json:"-"`
 	// Checkpoint runs after Engine atomically persists run_result.json. It is
 	// intended for app.Runner state projection and must return an error if the
 	// durable checkpoint cannot be accepted.
@@ -127,36 +129,20 @@ type RunRequest struct {
 }
 
 type RunResult struct {
-	RunID         string           `json:"run_id"`
-	WorkflowID    string           `json:"workflow_id"`
-	Status        RunStatus        `json:"status"`
-	Revision      int              `json:"revision,omitempty"`
-	ActiveNodeID  string           `json:"active_node_id,omitempty"`
-	ActiveAttempt int              `json:"active_attempt,omitempty"`
-	ArtifactRoot  string           `json:"artifact_root"`
-	WorkspaceRoot string           `json:"workspace_root"`
-	Nodes         []NodeRun        `json:"nodes"`
-	Artifacts     []ArtifactRef    `json:"artifacts"`
-	Events        []Event          `json:"events"`
-	StartedAt     time.Time        `json:"started_at"`
-	FinishedAt    time.Time        `json:"finished_at"`
-	DurationMS    int64            `json:"duration_ms"`
-	ManualRetry   *ManualRetryPlan `json:"manual_retry,omitempty"`
-}
-
-type ManualRetryRequest struct {
-	NodeID string `json:"node_id"`
-}
-
-type ManualRetryPlan struct {
-	RequestedNodeID string   `json:"requested_node_id"`
-	RestartNodeID   string   `json:"restart_node_id"`
-	RetryRoots      []string `json:"retry_roots"`
-	AffectedNodes   []string `json:"affected_nodes"`
-	ReusedUpstream  []string `json:"reused_upstream"`
-	PreservedNodes  []string `json:"preserved_nodes,omitempty"`
-	CurrentRevision int      `json:"current_revision"`
-	NextRevision    int      `json:"next_revision"`
+	RunID         string        `json:"run_id"`
+	WorkflowID    string        `json:"workflow_id"`
+	Status        RunStatus     `json:"status"`
+	Revision      int           `json:"revision,omitempty"`
+	ActiveNodeID  string        `json:"active_node_id,omitempty"`
+	ActiveAttempt int           `json:"active_attempt,omitempty"`
+	ArtifactRoot  string        `json:"artifact_root"`
+	WorkspaceRoot string        `json:"workspace_root"`
+	Nodes         []NodeRun     `json:"nodes"`
+	Artifacts     []ArtifactRef `json:"artifacts"`
+	Events        []Event       `json:"events"`
+	StartedAt     time.Time     `json:"started_at"`
+	FinishedAt    time.Time     `json:"finished_at"`
+	DurationMS    int64         `json:"duration_ms"`
 }
 
 type PluginManifest struct {
@@ -189,19 +175,6 @@ type NodeRequest struct {
 type NodeResult struct {
 	Artifacts []ArtifactRef
 	Metrics   NodeMetrics
-	Directive *NodeDirective
-}
-
-type DirectiveAction string
-
-const DirectiveRequeue DirectiveAction = "requeue"
-
-// NodeDirective requests a bounded state-machine transition without adding a
-// cycle to the declarative DAG.
-type NodeDirective struct {
-	Action      DirectiveAction `json:"action"`
-	RestartFrom string          `json:"restart_from"`
-	Reason      string          `json:"reason,omitempty"`
 }
 
 type PutArtifactRequest struct {

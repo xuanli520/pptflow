@@ -61,8 +61,6 @@ func (p *overviewPage) Update(msg tea.Msg) (bool, tea.Cmd) {
 		if p.m.selectedNode != "" {
 			p.m.setView(viewNodeDetail)
 		}
-	case "r":
-		return true, p.m.confirmSelectedNodeRetry()
 	default:
 		return false, nil
 	}

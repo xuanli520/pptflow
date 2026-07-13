@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -18,6 +17,10 @@ import (
 // multi-turn conversation.
 type ConversationOptions struct {
 	Workspace       string
+	CheckpointRoot  string
+	RunID           string
+	Attempt         int
+	ForceFresh      bool
 	Model           string
 	ReasoningEffort string
 	TimeoutSeconds  int
@@ -123,59 +126,14 @@ func MaterializeCanonicalTask(taskDir string, files CanonicalTask) error {
 		return fmt.Errorf("task directory is required")
 	}
 	writes := []generatedFileWrite{
-		{nodeID: nodes.InstructionGen, taskPath: filepath.Join(taskDir, "instruction.md"), content: files.Instruction, mode: 0o644},
-		{nodeID: nodes.TaskTOMLGen, taskPath: filepath.Join(taskDir, "task.toml"), content: files.TaskTOML, mode: 0o644},
-		{nodeID: nodes.DockerfileGen, taskPath: filepath.Join(taskDir, "environment", "Dockerfile"), content: files.Dockerfile, mode: 0o644},
-		{nodeID: nodes.SolveGen, taskPath: filepath.Join(taskDir, "solution", "solve.sh"), content: files.SolveScript, mode: 0o755},
-		{nodeID: nodes.TestGen, taskPath: filepath.Join(taskDir, "tests", "test.sh"), content: files.TestScript, mode: 0o755},
-		{nodeID: nodes.TestsAnalysis, taskPath: filepath.Join(taskDir, "tests_analysis.md"), content: files.TestsAnalysis, mode: 0o644},
+		{taskPath: filepath.Join(taskDir, "instruction.md"), content: files.Instruction, mode: 0o644},
+		{taskPath: filepath.Join(taskDir, "task.toml"), content: files.TaskTOML, mode: 0o644},
+		{taskPath: filepath.Join(taskDir, "environment", "Dockerfile"), content: files.Dockerfile, mode: 0o644},
+		{taskPath: filepath.Join(taskDir, "solution", "solve.sh"), content: files.SolveScript, mode: 0o755},
+		{taskPath: filepath.Join(taskDir, "tests", "test.sh"), content: files.TestScript, mode: 0o755},
+		{taskPath: filepath.Join(taskDir, "tests_analysis.md"), content: files.TestsAnalysis, mode: 0o644},
 	}
 	return publishCanonicalTask(taskDir, writes)
-}
-
-// PublishCanonicalTask copies a validated task from the workflow-owned
-// workspace into an explicit external destination. The destination is
-// atomically replaced and contains only the canonical Harbor task file set.
-func PublishCanonicalTask(sourceDir, destinationDir string) error {
-	sourceDir = filepath.Clean(strings.TrimSpace(sourceDir))
-	destinationDir = filepath.Clean(strings.TrimSpace(destinationDir))
-	if sourceDir == "" || sourceDir == "." {
-		return fmt.Errorf("source task directory is required")
-	}
-	if destinationDir == "" || destinationDir == "." {
-		return fmt.Errorf("destination task directory is required")
-	}
-	if err := validateMaterializedTaskDir(sourceDir); err != nil {
-		return fmt.Errorf("validate source task: %w", err)
-	}
-	read := func(rel string) (string, error) {
-		raw, err := os.ReadFile(filepath.Join(sourceDir, filepath.FromSlash(rel)))
-		if err != nil {
-			return "", fmt.Errorf("read canonical task file %s: %w", rel, err)
-		}
-		return string(raw), nil
-	}
-	var files CanonicalTask
-	var err error
-	if files.Instruction, err = read("instruction.md"); err != nil {
-		return err
-	}
-	if files.TaskTOML, err = read("task.toml"); err != nil {
-		return err
-	}
-	if files.Dockerfile, err = read("environment/Dockerfile"); err != nil {
-		return err
-	}
-	if files.SolveScript, err = read("solution/solve.sh"); err != nil {
-		return err
-	}
-	if files.TestScript, err = read("tests/test.sh"); err != nil {
-		return err
-	}
-	if files.TestsAnalysis, err = read("tests_analysis.md"); err != nil {
-		return err
-	}
-	return MaterializeCanonicalTask(destinationDir, files)
 }
 
 func RuntimeSelfCheck(ctx context.Context, opts ConversationOptions, taskDir, logPath string) error {
@@ -197,8 +155,8 @@ func RuntimeSelfCheck(ctx context.Context, opts ConversationOptions, taskDir, lo
 	return validateMaterializedTaskDir(taskDir)
 }
 
-func conversationRunOptions(opts ConversationOptions, prepared domain.RepoPrepared) Options {
-	return Options{Workspace: opts.Workspace, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, AgentTimeoutSeconds: conversationTimeout(opts), Agent: opts.Agent, RepoPrepared: prepared}
+func conversationRunOptions(opts ConversationOptions, prepared domain.RepoPrepared) conversationRuntimeOptions {
+	return conversationRuntimeOptions{Workspace: opts.Workspace, CheckpointRoot: opts.CheckpointRoot, RunID: opts.RunID, Attempt: opts.Attempt, ForceFresh: opts.ForceFresh, Model: opts.Model, ReasoningEffort: opts.ReasoningEffort, Agent: opts.Agent, RepoPrepared: prepared}
 }
 
 func conversationTimeout(opts ConversationOptions) int {

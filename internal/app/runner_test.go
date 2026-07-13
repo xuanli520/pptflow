@@ -319,110 +319,6 @@ func TestRunnerRejectsInvalidHarborPassSettings(t *testing.T) {
 	}
 }
 
-func TestRunnerFinalReviewCanReviseAndRerunChecks(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	workspace := t.TempDir()
-	runner := NewRunner(RunnerOptions{TaskDir: taskDir, Workspace: workspace})
-	type runResult struct {
-		summary domain.RunSummary
-		err     error
-	}
-	done := make(chan runResult, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go func() {
-		summary, err := runner.Run(ctx)
-		done <- runResult{summary: summary, err: err}
-	}()
-
-	revisionSubmitted := false
-	approvalSubmitted := false
-	lintPasses := 0
-	for !approvalSubmitted {
-		select {
-		case event := <-runner.Events():
-			if event.NodeID == nodes.CodeEdgeLint && event.Status == "succeeded" {
-				lintPasses++
-			}
-			if event.Type != "gate_requested" || event.Gate == nil || event.Gate.GateID != nodes.FinalReview {
-				continue
-			}
-			if !revisionSubmitted {
-				instruction := filepath.Join(taskDir, "instruction.md")
-				if err := os.WriteFile(instruction, []byte("Fix the task and preserve public behavior.\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "revise", EditedFiles: map[string]string{instruction: "updated"}})
-				revisionSubmitted = true
-				continue
-			}
-			runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "approve", Approved: true})
-			approvalSubmitted = true
-		case <-ctx.Done():
-			t.Fatal("timed out waiting for revised Final Review")
-		}
-	}
-	result := <-done
-	if result.err != nil || !result.summary.Passed {
-		t.Fatalf("revised run failed: summary=%+v err=%v", result.summary, result.err)
-	}
-	if lintPasses < 2 {
-		t.Fatalf("expected lint to rerun, observed %d successful passes", lintPasses)
-	}
-	revisionPath := filepath.Join(workspace, "phase2", "artifacts", "reviews", nodes.FinalReview, "revisions", "revision-001.json")
-	if _, err := os.Stat(revisionPath); err != nil {
-		t.Fatalf("revision chain was not persisted: %v", err)
-	}
-}
-
-func TestRunnerFinalReviewCodexRepairUsesOperatorGuidance(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	workspace := t.TempDir()
-	agent := &runnerRepairAgent{mutate: func(req workflow.AgentTurnRequest, _ int) error {
-		return os.WriteFile(filepath.Join(req.ProjectPath, "instruction.md"), []byte("Fix the task according to operator guidance while preserving public behavior.\n"), 0o644)
-	}}
-	runner := NewRunner(RunnerOptions{TaskDir: taskDir, Workspace: workspace, Agent: agent})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	type runResult struct {
-		summary domain.RunSummary
-		err     error
-	}
-	done := make(chan runResult, 1)
-	go func() {
-		summary, err := runner.Run(ctx)
-		done <- runResult{summary: summary, err: err}
-	}()
-	repaired := false
-	for {
-		select {
-		case event := <-runner.Events():
-			if event.Type != "gate_requested" || event.Gate == nil || event.Gate.GateID != nodes.FinalReview {
-				continue
-			}
-			if !repaired {
-				runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "repair", Notes: "机审要求公开 API 名称与测试保持一致"})
-				repaired = true
-				continue
-			}
-			runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "approve", Approved: true})
-			result := <-done
-			if result.err != nil || !result.summary.Passed {
-				t.Fatalf("guided repair run failed: summary=%+v err=%v", result.summary, result.err)
-			}
-			if agent.calls != 1 || agent.last.SandboxPolicy != "workspace-write" || !strings.Contains(agent.last.Prompt, "公开 API 名称") {
-				t.Fatalf("operator guidance was not passed to scoped Codex repair: calls=%d request=%+v", agent.calls, agent.last)
-			}
-			if _, err := os.Stat(nodes.TaskRepairReportPath(workspace, "final_review", 1)); err != nil {
-				t.Fatalf("repair evidence missing: %v", err)
-			}
-			return
-		case <-ctx.Done():
-			t.Fatal("timed out waiting for guided Final Review repair")
-		}
-	}
-}
-
 func TestRunnerAppliesExternalReviewRepairBeforeChecks(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
@@ -446,60 +342,6 @@ func TestRunnerAppliesExternalReviewRepairBeforeChecks(t *testing.T) {
 	}
 	if _, err := os.Stat(nodes.TaskRepairReportPath(workspace, "external_review", 1)); err != nil {
 		t.Fatalf("external repair evidence missing: %v", err)
-	}
-}
-
-func TestRunnerFinalReviewAutomaticRepairLoopsUntilChecksPass(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	if err := os.WriteFile(filepath.Join(taskDir, "solution", "solve.sh"), []byte("#!/bin/sh\necho 1 > /logs/verifier/reward.txt\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	agent := &runnerRepairAgent{mutate: func(req workflow.AgentTurnRequest, call int) error {
-		if call == 1 {
-			return os.WriteFile(filepath.Join(req.ProjectPath, "instruction.md"), []byte("First automatic repair round.\n"), 0o644)
-		}
-		return os.WriteFile(filepath.Join(req.ProjectPath, "solution", "solve.sh"), []byte("#!/bin/sh\nset -eu\nprintf 'package config\\n' > config.go\n"), 0o755)
-	}}
-	workspace := t.TempDir()
-	runner := NewRunner(RunnerOptions{TaskDir: taskDir, Workspace: workspace, Agent: agent})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	type runResult struct {
-		summary domain.RunSummary
-		err     error
-	}
-	done := make(chan runResult, 1)
-	go func() {
-		summary, err := runner.Run(ctx)
-		done <- runResult{summary: summary, err: err}
-	}()
-	loopStarted := false
-	for {
-		select {
-		case event := <-runner.Events():
-			if event.Type != "gate_requested" || event.Gate == nil || event.Gate.GateID != nodes.FinalReview {
-				continue
-			}
-			if !loopStarted {
-				runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "repair_loop", Notes: "持续返修直到关键检查通过"})
-				loopStarted = true
-				continue
-			}
-			runner.SubmitGateDecision(domain.GateDecision{RequestID: event.Gate.RequestID, GateID: nodes.FinalReview, Action: "approve", Approved: true})
-			result := <-done
-			if result.err != nil || !result.summary.Passed {
-				t.Fatalf("automatic repair loop failed: summary=%+v err=%v", result.summary, result.err)
-			}
-			if agent.calls != 2 {
-				t.Fatalf("automatic repair calls = %d, want 2", agent.calls)
-			}
-			if _, err := os.Stat(nodes.TaskRepairReportPath(workspace, "final_review", 2)); err != nil {
-				t.Fatalf("second automatic repair evidence missing: %v", err)
-			}
-			return
-		case <-ctx.Done():
-			t.Fatal("timed out waiting for automatic Final Review repair loop")
-		}
 	}
 }
 
@@ -635,7 +477,19 @@ func TestCancelNodeQueuesBetweenStartedEventAndRuntimeRegistration(t *testing.T)
 	}
 }
 
-func TestRunnerRetriesQwenStageUntilThirdAttempt(t *testing.T) {
+func TestRunnerProjectsContextCancellationAsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	summary, err := NewRunner(RunnerOptions{TaskDir: writeRunnerTask(t), Workspace: t.TempDir(), AutoApprove: true}).Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation error, got %v", err)
+	}
+	if summary.Status != "canceled" || summary.Passed {
+		t.Fatalf("cancellation was projected as %+v", summary)
+	}
+}
+
+func TestRunnerDoesNotMultiplyHarborStageAttempts(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	exec := &runnerFlakyQwenHarborExec{qwenFailures: 2, delegate: runnerHarborExec{outputs: []string{
 		runnerTrialResultJSON("qwen3.7-max", []domain.TrialRun{
@@ -652,18 +506,18 @@ func TestRunnerRetriesQwenStageUntilThirdAttempt(t *testing.T) {
 		HarborAgentEnv: []string{"ANTHROPIC_AUTH_TOKEN=test-token"}, HarborExec: exec,
 	})
 	summary, err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "Qwen Harbor stage") {
+		t.Fatalf("expected one failed Harbor stage, summary=%+v err=%v", summary, err)
 	}
-	if !summary.Passed || summary.QwenResult == nil || summary.OpusResult == nil || exec.qwenCalls != 3 {
-		t.Fatalf("third-attempt recovery failed: calls=%d summary=%+v", exec.qwenCalls, summary)
+	if summary.Passed || summary.OpusResult == nil || exec.qwenCalls != 1 {
+		t.Fatalf("Harbor outer retry multiplied trials: calls=%d summary=%+v", exec.qwenCalls, summary)
 	}
-	if countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_failed") != 2 || countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_started") != 3 {
-		t.Fatalf("Qwen retry events are incomplete: %+v", summary.Events)
+	if countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_failed") != 1 || countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_started") != 1 {
+		t.Fatalf("Harbor stage must have one outer attempt: %+v", summary.Events)
 	}
 }
 
-func TestFailedQwenStageStillRunsOpusAfterThreeAttempts(t *testing.T) {
+func TestFailedQwenStageStillRunsOpusAfterOneOuterAttempt(t *testing.T) {
 	taskDir := writeRunnerTask(t)
 	workspace := t.TempDir()
 	exec := &runnerFlakyQwenHarborExec{qwenFailures: 3, delegate: runnerHarborExec{outputs: []string{
@@ -692,8 +546,8 @@ func TestFailedQwenStageStillRunsOpusAfterThreeAttempts(t *testing.T) {
 	if !eventSeen(summary.Events, nodes.HarborRunQwen, "failed") || !eventSeen(summary.Events, nodes.HarborRunOpus, "succeeded") {
 		t.Fatalf("both model stages were not attempted: %+v", summary.Events)
 	}
-	if exec.qwenCalls != 3 || countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_failed") != 3 {
-		t.Fatalf("Qwen did not exhaust exactly three attempts: calls=%d events=%+v", exec.qwenCalls, summary.Events)
+	if exec.qwenCalls != 1 || countEventType(summary.Events, nodes.HarborRunQwen, "node_attempt_failed") != 1 {
+		t.Fatalf("Qwen outer attempt was retried: calls=%d events=%+v", exec.qwenCalls, summary.Events)
 	}
 }
 
@@ -1312,248 +1166,10 @@ func TestRunnerSimilarityCheckFailsOnHistoryDuplicate(t *testing.T) {
 	}
 }
 
-func TestRunnerPackageForcesVerifyHarborAndSubmissionLint(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	workspace := t.TempDir()
-	outputDir := t.TempDir()
-	analysis := filepath.Join(taskDir, "tests_analysis.md")
-	if err := os.WriteFile(analysis, []byte(validRunnerTestsAnalysis()), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	qwenScreenshot := filepath.Join(t.TempDir(), "qwen.png")
-	opusScreenshot := filepath.Join(t.TempDir(), "opus.png")
-	writeRunnerScreenshot(t, qwenScreenshot, "harbor_run_qwen", "qwen3.7-max", 1)
-	writeRunnerScreenshot(t, opusScreenshot, "harbor_run_opus", "claude-opus-4-6", 3)
-	history := t.TempDir()
-	if err := os.WriteFile(filepath.Join(history, "unrelated.md"), []byte("Legacy desktop widget telemetry notes with unrelated installation wording and no matching verifier behavior."), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	writeRunnerTaskTOML(t, taskDir)
-	verifyExec := &runnerResultExec{results: []executor.Result{
-		{Command: "docker build", ExitCode: 0},
-		{Command: "docker run initial", ExitCode: 1, Err: os.ErrInvalid},
-		{Command: "docker run oracle", ExitCode: 0},
-	}}
-	harborExec := &runnerHarborExec{outputs: []string{
-		runnerTrialResultJSON("qwen3.7-max", []domain.TrialRun{
-			{Trial: 1, Turns: 22, Reward: 0},
-			{Trial: 2, Passed: true, Turns: 24, Reward: 1},
-			{Trial: 3, Turns: 23, Reward: 0},
-			{Trial: 4, Turns: 23, Reward: 0},
-		}, ""),
-		runnerTrialResultJSON("claude-opus-4-6", []domain.TrialRun{
-			{Trial: 1, Passed: true, Turns: 28, Reward: 1},
-			{Trial: 2, Passed: true, Turns: 29, Reward: 1},
-			{Trial: 3, Passed: true, Turns: 27, Reward: 1},
-			{Trial: 4, Turns: 28, Reward: 0},
-		}, ""),
-	}}
-	runner := NewRunner(RunnerOptions{
-		TaskDir:       taskDir,
-		Workspace:     workspace,
-		AutoApprove:   true,
-		Package:       true,
-		OutputDir:     outputDir,
-		RepoURL:       "https://github.com/org/repo",
-		Commit:        "abc1234",
-		TestsAnalysis: analysis,
-		TaskName:      "sample-task",
-		CodeLang:      "go",
-		TaskType:      "bug-fix",
-		Application:   "backend",
-		AHT:           "45 minutes",
-		Description:   "sample description",
-		SimilarityHistoryDirs: []string{
-			history,
-		},
-		QwenScreenshot: qwenScreenshot,
-		OpusScreenshot: opusScreenshot,
-		VerifyExec:     verifyExec,
-		HarborExec:     harborExec,
-	})
-	summary, err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !summary.Passed || summary.VerifyReport == nil || summary.QwenResult == nil || summary.OpusResult == nil || summary.PackageReport == nil {
-		t.Fatalf("expected complete package run, got %+v", summary)
-	}
-	if !strings.Contains(summary.VerifyReport.ImageTag, summary.RunID) || !strings.Contains(summary.VerifyReport.ImageTag, nodes.HarborVerify) {
-		t.Fatalf("verify image tag should include run and node identity: run=%s tag=%s", summary.RunID, summary.VerifyReport.ImageTag)
-	}
-	for _, path := range []string{
-		summary.PackageReport.OutputZip,
-		summary.PackageReport.DeliveryZip,
-		summary.PackageReport.TaskZipArtifact,
-		summary.PackageReport.DeliveryZipArtifact,
-	} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("missing package delivery artifact %q: %v", path, err)
-		}
-	}
-	for _, nodeID := range []string{
-		nodes.DockerBuild,
-		nodes.InitialVerify,
-		nodes.OracleVerify,
-		nodes.SubmissionLint,
-		nodes.SimilarityCheck,
-		nodes.FinalReview,
-		nodes.Package,
-	} {
-		if !eventSeen(summary.Events, nodeID, "succeeded") {
-			t.Fatalf("package run missing forced node %s: %+v", nodeID, summary.Events)
-		}
-	}
-	for _, rel := range []string{
-		"phase2/artifacts/docker_build/build_result.json",
-		"phase2/artifacts/initial_verify/initial_result.json",
-		"phase2/artifacts/oracle_verify/oracle_result.json",
-	} {
-		if _, err := os.Stat(filepath.Join(workspace, filepath.FromSlash(rel))); err != nil {
-			t.Fatalf("missing split verify artifact %s: %v", rel, err)
-		}
-	}
-	if eventIndex(summary.Events, "harbor_verify", "succeeded") > eventIndex(summary.Events, "harbor_run_qwen", "running") {
-		t.Fatalf("harbor started before verify passed: %+v", summary.Events)
-	}
-}
-
-func TestRunnerPackageFailsWhenSimilaritySourceUnreadable(t *testing.T) {
-	taskDir := writeRunnerTask(t)
-	outputDir := t.TempDir()
-	analysis := filepath.Join(taskDir, "tests_analysis.md")
-	if err := os.WriteFile(analysis, []byte(validRunnerTestsAnalysis()), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	verifyExec := &runnerResultExec{results: []executor.Result{
-		{Command: "docker build", ExitCode: 0},
-		{Command: "docker run initial", ExitCode: 1, Err: os.ErrInvalid},
-		{Command: "docker run oracle", ExitCode: 0},
-	}}
-	missingHistory := filepath.Join(t.TempDir(), "missing-history")
-	runner := NewRunner(RunnerOptions{
-		TaskDir:               taskDir,
-		Workspace:             t.TempDir(),
-		AutoApprove:           true,
-		Package:               true,
-		OutputDir:             outputDir,
-		RepoURL:               "https://github.com/org/repo",
-		Commit:                "abc1234",
-		TestsAnalysis:         analysis,
-		SimilarityHistoryDirs: []string{missingHistory},
-		VerifyExec:            verifyExec,
-	})
-	summary, err := runner.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "similarity check") {
-		t.Fatalf("expected unreadable similarity source to fail, got %v", err)
-	}
-	if summary.Passed || summary.SimilarityReport == nil || summary.SimilarityReport.OverallPass {
-		t.Fatalf("expected similarity failure, got %+v", summary)
-	}
-	if summary.PackageReport != nil {
-		t.Fatalf("package should not run after similarity failure: %+v", summary.PackageReport)
-	}
-	if !eventSeen(summary.Events, nodes.SimilarityCheck, "failed") {
-		t.Fatalf("similarity_check failure event missing: %+v", summary.Events)
-	}
-	if eventSeen(summary.Events, nodes.Package, "succeeded") {
-		t.Fatalf("package should not succeed after similarity failure: %+v", summary.Events)
-	}
-}
-
-func TestRunnerPackageUsesDefaultWorkspaceForEvidenceReports(t *testing.T) {
-	t.Chdir(t.TempDir())
-	taskDir := writeRunnerTask(t)
-	outputDir := t.TempDir()
-	analysis := filepath.Join(taskDir, "tests_analysis.md")
-	if err := os.WriteFile(analysis, []byte(validRunnerTestsAnalysis()), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	digest, err := harborrun.ComputeTaskDigest(taskDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	qwenResult := filepath.Join(outputDir, "qwen.json")
-	opusResult := filepath.Join(outputDir, "opus.json")
-	writeRunnerTrialResult(t, qwenResult, taskDir, "qwen3.7-max", []domain.TrialRun{
-		{Trial: 1, Turns: 22, Reward: 0},
-		{Trial: 2, Passed: true, Turns: 24, Reward: 1},
-		{Trial: 3, Turns: 23, Reward: 0},
-		{Trial: 4, Turns: 23, Reward: 0},
-	}, digest)
-	writeRunnerTrialResult(t, opusResult, taskDir, "claude-opus-4-6", []domain.TrialRun{
-		{Trial: 1, Passed: true, Turns: 28, Reward: 1},
-		{Trial: 2, Passed: true, Turns: 29, Reward: 1},
-		{Trial: 3, Passed: true, Turns: 27, Reward: 1},
-		{Trial: 4, Turns: 28, Reward: 0},
-	}, digest)
-	qwenScreenshot := filepath.Join(outputDir, "qwen.png")
-	opusScreenshot := filepath.Join(outputDir, "opus.png")
-	writeRunnerScreenshot(t, qwenScreenshot, "harbor_run_qwen", "qwen3.7-max", 1)
-	writeRunnerScreenshot(t, opusScreenshot, "harbor_run_opus", "claude-opus-4-6", 3)
-	history := t.TempDir()
-	if err := os.WriteFile(filepath.Join(history, "unrelated.md"), []byte("Unrelated notes about desktop clipboard rendering and theme preferences."), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	verifyExec := &runnerResultExec{results: []executor.Result{
-		{Command: "docker build", ExitCode: 0},
-		{Command: "docker run initial", ExitCode: 1, Err: os.ErrInvalid},
-		{Command: "docker run oracle", ExitCode: 0},
-	}}
-	runner := NewRunner(RunnerOptions{
-		TaskDir:               taskDir,
-		AutoApprove:           true,
-		Package:               true,
-		OutputDir:             outputDir,
-		TaskName:              "sample",
-		CodeLang:              "go",
-		TaskType:              "bug-fix",
-		Application:           "backend",
-		AHT:                   "45 minutes",
-		Description:           "sample task",
-		RepoURL:               "https://github.com/org/repo",
-		Commit:                "abc1234",
-		TestsAnalysis:         analysis,
-		QwenResult:            qwenResult,
-		OpusResult:            opusResult,
-		SimilarityHistoryDirs: []string{history},
-		QwenScreenshot:        qwenScreenshot,
-		OpusScreenshot:        opusScreenshot,
-		VerifyExec:            verifyExec,
-	})
-	summary, err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !summary.Passed || summary.PackageReport == nil {
-		t.Fatalf("expected package success with default workspace, got %+v", summary)
-	}
-	for _, path := range []string{nodes.VerifyReportPath(""), nodes.SimilarityReportPath("")} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("missing default workspace artifact %s: %v", path, err)
-		}
-	}
-	raw, err := os.ReadFile(summary.PackageReport.ReportPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var submission map[string]any
-	if err := json.Unmarshal(raw, &submission); err != nil {
-		t.Fatal(err)
-	}
-	for key, want := range map[string]string{
-		"task_name":            "sample",
-		"code_lang":            "go",
-		"task_type":            "bug-fix",
-		"application":          "backend",
-		"aht":                  "45 minutes",
-		"one_line_description": "sample task",
-		"github_url":           "https://github.com/org/repo",
-		"commit_id":            "abc1234",
-	} {
-		if submission[key] != want {
-			t.Fatalf("submission %s = %v, want %s; full=%+v", key, submission[key], want, submission)
-		}
+func TestRunnerRejectsLegacyExternalPackageExecution(t *testing.T) {
+	runner := NewRunner(RunnerOptions{TaskDir: writeRunnerTask(t), Package: true, OutputDir: t.TempDir()})
+	if _, err := runner.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "legacy --package execution is unavailable") {
+		t.Fatalf("legacy package execution error = %v", err)
 	}
 }
 

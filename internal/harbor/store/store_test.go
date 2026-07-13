@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -34,6 +36,88 @@ func TestOpenAndMigrate(t *testing.T) {
 	if count == 0 {
 		t.Error("expected schema_version row")
 	}
+}
+
+func TestOpenReadOnlyPreservesControlPlaneAndRejectsMutations(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writable, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := writable.CreateTaskV2(ctx, CreateTaskV2Request{Slug: "read-only-fixture", Actor: "tester", Reason: "fixture"})
+	if err != nil {
+		_ = writable.Close()
+		t.Fatal(err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotStoreFiles(t, root)
+
+	readOnly, err := OpenReadOnly(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readOnly.GetTaskV2(ctx, task.ID)
+	if err != nil || loaded == nil || loaded.ID != task.ID {
+		_ = readOnly.Close()
+		t.Fatalf("read-only task lookup = %+v, %v", loaded, err)
+	}
+	if _, err := readOnly.CreateTaskV2(ctx, CreateTaskV2Request{Slug: "must-not-write", Actor: "tester", Reason: "mutation rejection"}); !errors.Is(err, ErrReadOnly) {
+		_ = readOnly.Close()
+		t.Fatalf("read-only mutation error = %v, want ErrReadOnly", err)
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after := snapshotStoreFiles(t, root)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatal("read-only store changed control-plane or backup files")
+	}
+}
+
+func TestOpenReadOnlyDoesNotInitializeMissingStore(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "absent-control-plane")
+	if _, err := OpenReadOnly(root); err == nil {
+		t.Fatal("read-only open initialized a missing control plane")
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only open created root %q: %v", root, err)
+	}
+}
+
+func snapshotStoreFiles(t *testing.T, root string) map[string][]byte {
+	t.Helper()
+	files := make(map[string][]byte)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if path == filepath.Join(root, dbFileName+"-wal") || path == filepath.Join(root, dbFileName+"-shm") {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return errors.New("store snapshot encountered non-regular file")
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		files[filepath.ToSlash(relative)] = content
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
 }
 
 func TestUpsertTask(t *testing.T) {

@@ -1,4 +1,10 @@
-# Harbor Flow TUI 中文化与人性化改造方案
+# 已归档：V1 TUI 中文化与人性化改造方案
+
+> 状态：历史设计材料，已由 2026-07-13 的 V2 lifecycle 硬切换取代。本文记录 workspace-runner UI，不能据此推断支持的命令、参数、mutation 路径或验证要求。
+>
+> 当前来源以 [`WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_PLAN.md`](./WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_PLAN.md)、[`WORKFLOW_STABILITY_DECISIONS.md`](./WORKFLOW_STABILITY_DECISIONS.md) 和 [`TUI_USAGE.md`](./TUI_USAGE.md) 为准。
+
+## V1 原始文档：Harbor Flow TUI 中文化与人性化改造方案
 
 > **实施跟踪（2026-07-11）：** 逐项代码位置与测试证据见 [`TUI_IMPLEMENTATION_AUDIT.md`](./TUI_IMPLEMENTATION_AUDIT.md)，用户键位说明见 [`TUI_USAGE.md`](./TUI_USAGE.md)。
 

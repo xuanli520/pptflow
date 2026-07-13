@@ -26,7 +26,6 @@ func buildProductionRegistry(broker infraplugins.GateBroker) (*workflow.Registry
 		genplugins.TestPlugin{},
 		genplugins.TestsAnalysisPlugin{},
 		genplugins.MaterializePlugin{},
-		genplugins.PublishTaskPlugin{},
 		genplugins.RuntimeSelfCheckPlugin{},
 		verifyplugins.DockerBuildPlugin{},
 		verifyplugins.InitialVerifyPlugin{},
@@ -38,7 +37,6 @@ func buildProductionRegistry(broker infraplugins.GateBroker) (*workflow.Registry
 		deterministicplugins.SimilarityReportImportPlugin{},
 		verifyplugins.HarborRunQwenPlugin{},
 		verifyplugins.HarborRunOpusPlugin{},
-		deterministicplugins.PackagePlugin{},
 	}
 	for _, plugin := range plugins {
 		if err := registry.Register(plugin); err != nil {

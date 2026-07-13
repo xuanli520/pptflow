@@ -398,36 +398,18 @@ func TestStartWizardFitsTerminalHeight(t *testing.T) {
 	}
 }
 
-func TestAllDestructiveActionsUseConfirmation(t *testing.T) {
+func TestRunControlAndQuitUseSafeConfirmation(t *testing.T) {
 	taskDir := t.TempDir()
 	m := initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir(), TaskDir: taskDir})
 	m.width, m.height = 100, 30
-	cancelModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	if got := cancelModel.(model).confirm; got == nil || got.Action != confirmCancelRun {
-		t.Fatalf("cancel run did not require confirmation: %+v", got)
+	controlModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	if got := controlModel.(model).runControl; got == nil || got.State != "运行中" {
+		t.Fatalf("Ctrl+X did not open the non-mutating run control overlay: %+v", got)
 	}
+	m = initialModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir(), TaskDir: taskDir})
 	quitModel, _ := m.Update(runeKey("q"))
 	if got := quitModel.(model).confirm; got == nil || got.Action != confirmQuit {
 		t.Fatalf("quit did not require confirmation: %+v", got)
-	}
-	instruction := filepath.Join(taskDir, "instruction.md")
-	if err := os.WriteFile(instruction, []byte("task"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	m.view = viewNodeDetail
-	m.selectedNode = nodes.InstructionGen
-	m.nodes[nodes.InstructionGen] = domain.RunnerEvent{NodeID: nodes.InstructionGen, Status: "succeeded", Artifacts: []domain.ArtifactPreview{{Name: "instruction.md", Path: instruction}}}
-	artifact, ok := m.selectedNodeArtifact()
-	if !ok {
-		t.Fatal("test setup did not expose node artifact")
-	}
-	if _, err := m.safeEditableArtifactPath(artifact.Path); err != nil {
-		t.Fatalf("test setup artifact is not editable: %v", err)
-	}
-	editModel, editCmd := m.Update(runeKey("e"))
-	edited := editModel.(model)
-	if got := edited.confirm; got == nil || got.Action != confirmEditArtifact {
-		t.Fatalf("artifact edit did not require confirmation: confirm=%+v cmd=%v err=%v toast=%q view=%v router=%v", got, editCmd, edited.err, edited.toast.Message, edited.view, edited.router.Active())
 	}
 }
 
@@ -602,16 +584,6 @@ func TestReadPreviewDoesNotSplitUTF8(t *testing.T) {
 	got := readPreview(path, 5)
 	if strings.ContainsRune(got, '�') || !strings.Contains(got, "内容已截断") {
 		t.Fatalf("invalid UTF-8 preview: %q", got)
-	}
-}
-
-func TestSafeEditorCommandDoesNotUseShell(t *testing.T) {
-	t.Setenv("VISUAL", `code --wait --reuse-window`)
-	t.Setenv("EDITOR", "")
-	path := "/tmp/a file; touch PWNED.md"
-	cmd := safeEditorCommand(path)
-	if filepath.Base(cmd.Path) != "code" || len(cmd.Args) != 4 || cmd.Args[len(cmd.Args)-1] != path {
-		t.Fatalf("unsafe/incorrect editor command: path=%q args=%#v", cmd.Path, cmd.Args)
 	}
 }
 

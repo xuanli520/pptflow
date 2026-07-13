@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,25 +42,12 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 	workspace := nodes.DefaultWorkspace(r.opts.Workspace)
 	r.opts.Workspace = workspace
 	started := time.Now().UTC()
-	manualRetry := r.retryIntent != nil
 	previousRunID := ""
-	var preliminaryRetry ManualRetryPlan
-	if manualRetry {
-		var err error
-		preliminaryRetry, err = planNodeRetry(r.opts, r.retryIntent.NodeID, true)
-		if err != nil {
-			return summary, err
-		}
+	previousRunID = recoverablePreviousRunID(workspace)
+	if previousRunID != "" {
 		r.stateMu.Lock()
-		r.runID = preliminaryRetry.RunID
+		r.runID = previousRunID
 		r.stateMu.Unlock()
-	} else {
-		previousRunID = recoverablePreviousRunID(workspace)
-		if previousRunID != "" {
-			r.stateMu.Lock()
-			r.runID = previousRunID
-			r.stateMu.Unlock()
-		}
 	}
 	runID := r.ensureRunID()
 	lock, err := runlock.Acquire(workspace, runlock.Metadata{RunID: runID, StartedAt: started})
@@ -70,7 +58,7 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 	defer close(r.events)
 
 	summary = domain.RunSummary{RunID: runID, Workspace: workspace, StartedAt: started, Status: "running", Passed: true}
-	if previousRunID != "" || manualRetry {
+	if previousRunID != "" {
 		summary.Recovered = true
 		summary.PreviousRunID = runID
 	}
@@ -106,24 +94,13 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 		Evaluation: cancelingEvaluationRuntime{runner: r, runtime: harborruntime.New(r.opts.HarborExec, nil)},
 	})
 	prior, revision := map[string]workflow.NodeRun(nil), 0
-	var retryRequest *workflow.ManualRetryRequest
-	if manualRetry {
-		lockedPlan, planErr := planNodeRetry(r.opts, r.retryIntent.NodeID, false)
-		if planErr != nil {
-			return summary, planErr
-		}
-		if lockedPlan.RunID != preliminaryRetry.RunID || lockedPlan.CurrentRevision != preliminaryRetry.CurrentRevision {
-			return summary, fmt.Errorf("manual retry state changed before workspace lock was acquired")
-		}
-		prior, revision = loadWorkflowResume(workspace)
-		retryRequest = &workflow.ManualRetryRequest{NodeID: lockedPlan.RequestedNodeID}
-	} else if previousRunID != "" {
+	if previousRunID != "" {
 		prior, revision = loadWorkflowResume(workspace)
 	}
 	requestInput := map[string]any{"github_token": r.opts.GitHubToken}
 	result, engineErr := engine.Run(ctx, workflow.RunRequest{
 		RunID: runID, Revision: revision, Workflow: definition, ArtifactRoot: workspace, WorkspaceRoot: workspace,
-		Input: requestInput, Store: store, Events: runnerWorkflowEventSink{runner: r}, Prior: prior, Retry: retryRequest,
+		Input: requestInput, Store: store, Events: runnerWorkflowEventSink{runner: r}, Prior: prior,
 		Checkpoint: func(_ context.Context, checkpoint workflow.RunResult) error {
 			projected := projectRunSummary(store, checkpoint, r.opts, r.snapshot())
 			if checkpoint.ActiveNodeID != "" {
@@ -131,7 +108,7 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 				projected.Passed = true
 				projected.FinishedAt = time.Time{}
 			}
-			projected.Recovered = previousRunID != "" || manualRetry
+			projected.Recovered = previousRunID != ""
 			if projected.Recovered {
 				projected.PreviousRunID = runID
 			}
@@ -153,7 +130,7 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 		}
 	}
 	summary = projectRunSummary(store, result, r.opts, r.snapshot())
-	summary.Recovered = previousRunID != "" || manualRetry
+	summary.Recovered = previousRunID != ""
 	if summary.Recovered {
 		summary.PreviousRunID = runID
 	}
@@ -167,7 +144,13 @@ func (r *Runner) runWithEngine(ctx context.Context) (summary domain.RunSummary, 
 	if summary.Recovered {
 		summary.ReusedNodes, summary.RerunNodes = recoveryNodeSets(summary.Events)
 	}
-	if engineErr != nil {
+	if result.Status == workflow.RunCancelled || errors.Is(engineErr, context.Canceled) {
+		summary.Status = "canceled"
+		summary.Passed = false
+		if summary.FinishedAt.IsZero() {
+			summary.FinishedAt = time.Now().UTC()
+		}
+	} else if engineErr != nil {
 		summary.Status = "failed"
 		summary.Passed = false
 		if summary.FinishedAt.IsZero() {
@@ -345,15 +328,8 @@ func projectRunSummary(store workflow.ArtifactStore, result workflow.RunResult, 
 	read("phase1/artifacts/repo_analyze/repo_analysis.json", &analysis)
 	read("phase1/artifacts/task_design/task_proposal.json", &proposal)
 	read("phase1/artifacts/generate_task_files/task_files.json", &files)
-	var publish domain.TaskPublishReceipt
-	if read("phase3/artifacts/task_publish/publish_receipt.json", &publish) && publish.SchemaVersion != "" {
-		summary.TaskPublish = &publish
-	}
 	if proposal.SchemaVersion != "" {
 		taskDir := effectiveEngineTaskDir(opts)
-		if publish.Passed && strings.TrimSpace(publish.DestinationDir) != "" {
-			taskDir = publish.DestinationDir
-		}
 		summary.GenReport = &domain.GenReport{
 			SchemaVersion: "harbor.gen_report.v1", TaskDir: taskDir, TestsAnalysisPath: filepath.Join(taskDir, "tests_analysis.md"),
 			RepoAnalysisPath: nodes.RepoAnalysisPath(result.WorkspaceRoot), TaskProposalPath: nodes.TaskProposalPath(result.WorkspaceRoot),

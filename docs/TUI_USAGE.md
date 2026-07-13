@@ -1,85 +1,56 @@
-# Harbor Flow TUI 使用指南
+# Harbor Flow V2 Task Hub 使用指南
 
-Harbor Flow 的终端界面以中文为主，并保留少量英文业务标识，方便与日志和工件字段对应。
+TUI 是 V2 生命周期控制面的视图。它不接收 workspace 路径，不启动旧 Runner，不克隆 workspace，不直接编辑 live task 文件，也不直接删除 workspace。
 
-## 全局导航
+使用受管控制面根目录启动：
 
-未指定 `--task`、`--generate` 或显式 `--workspace` 时，TUI 默认进入工作区管理中枢。以下导航键适用于中枢和运行视图。文本框、搜索框或备注编辑器获得焦点时，可打印字符始终输入到当前控件，不会触发全局导航；因此 `1`-`5`、`q` 和 `?` 可以正常作为输入内容：
+```text
+harbor-factory --root .harbor-factory tui
+```
 
-| 键位 | 操作 |
-|---|---|
-| `1` | 工作区中枢 |
-| `2` / `Ctrl+O` | 总览 |
-| `3` / `Ctrl+G` | 当前审查关卡；没有活跃关卡时显示提示 |
-| `4` / `Ctrl+D` | 节点详情 |
-| `5` / `Ctrl+L` | 日志 |
-| `Ctrl+E` | 完成页；运行未结束时显示提示 |
-| `Ctrl+X` / `x` | 取消运行，执行前确认 |
-| `q` / `Ctrl+Q` / `Ctrl+C` | 退出；运行中执行前确认 |
-| `/` | 在总览、详情或日志中搜索/过滤 |
-| `?` | 打开或关闭快捷键帮助 |
-| `Esc` | 关闭弹窗、结束备注编辑、返回总览或从运行页返回中枢 |
+根命令不再提供 `--workspace`、`--workspace-root`、`--rescan`、`--task-concurrency` 或 `--auto-approve` 等旧 TUI 参数。持久化生命周期操作使用 `task`、`revision`、`run`、`review`、`release`、`budget` 与 `workspace` 命令组。
 
-鼠标点击与键盘遵循同一套操作语义：表格行、表单标签、复选项、弹窗按钮和底部实际显示的操作入口均可点击。空白区域不会推断或触发附近操作；弹窗打开时，滚轮和点击也不会穿透到底层页面。
+## Task Hub
 
-## 工作区中枢
+首屏是 Task Hub。它通过 application service 投影不可变的 Task、TaskRevision、WorkflowRun、持久化队列、Review、Repair 与本地 package 事实。workspace 只是可清理的受管执行环境，不是 TUI 选择的生命周期身份。
 
-中枢从 SQLite 索引读取任务和运行元数据，工作区文件仍是权威数据源。启动时会从 `--workspace-root`（默认 `.harbor-factory`）同步索引；`--rescan` 可删除并重建索引，不会删除工作区。
+| 键位 | 作用 |
+| --- | --- |
+| `Tab` / `Right` | 在 `Tasks`、`Runs` 和 `Queue` 标签间前进。 |
+| `Shift+Tab` / `Left` | 切换到上一个标签。 |
+| `Up` / `Down`、`j` / `k` | 在当前标签内移动 Task 或 Run 选择。 |
+| `/` | 过滤 Task Hub 投影；`Enter` 应用，`Esc` 取消。 |
+| `Enter` | 打开只读详情；计划预览存在时进入原生确认表单。 |
+| `Esc` | 取消待输入的前缀、确认表单或当前计划预览；从不提交 mutation。 |
+| `q`、`Ctrl+Q`、`Ctrl+C` | 退出；存在 active durable run 时，确认语义是 detach，不是取消。 |
 
-| 键位 | 操作 |
-|---|---|
-| `↑`/`↓`、`j`/`k` | 选择工作区 |
-| `Enter` | 打开完成快照、运行中只读快照或可恢复选项 |
-| `Ctrl+N` | 基于选中工作区预填新运行；空列表时创建首个运行 |
-| `Ctrl+R` | 打开重跑配置，可选择复用验证、质量、相似度和 Harbor 结果 |
-| `f` | 输入题目方机审/人工审核反馈，创建 Codex 返修工作区并完整重跑检查 |
-| `Del` | 确认后删除工作区及索引记录；运行中工作区不可删除 |
-| `/` | 实时搜索名称、语言、类型和中英文状态 |
-| `s` / `S` | 切换排序列 / 升降序 |
-| `Tab` | 有当前运行时返回运行总览 |
+Queue 标签显示观测到的运行中和排队数量。后端未暴露容量池时，容量显示为 `未配置`；`0` 不会被解释为已配置的零容量池。
 
-可恢复工作区支持恢复运行、新建克隆运行和只读查看。重跑始终创建新工作区，不复制旧 `state.json` 或 `event_log.jsonl`。
+## 生命周期序列
 
-TUI 内置有界任务调度器。启动表单高级页按 `Ctrl+B` 可将任务加入后台队列并立即返回中枢，随后可继续创建其他任务；重跑配置也可选择“后台并行运行”。中枢底部显示运行中数量、并发上限和排队数量。`--task-concurrency` 控制任务级并发，取值为 `1`-`10`，默认 `10`；每个工作区同一时间只能存在一个排队或运行任务。
+所有生命周期操作均使用两段式命名空间。第一个键只进入命名空间，在 1.2 秒后或按 `Esc` 失效，绝不改变状态。footer 会显示允许的第二键和服务端给出的禁用原因。
 
-## Tab 行为
+| 序列 | 请求的计划 |
+| --- | --- |
+| `t n`、`t i`、`t g` | 新建、导入或从仓库生成 Task。 |
+| `t e`、`t f`、`t a`、`t d`、`t u` | 创建编辑 candidate、Fork、归档、软删除或恢复选中的 Task。 |
+| `x c`、`x n`、`x a` | 继续处理、启动 Run 或 Attach 到 durable Run。 |
+| `x k` | 打开选中 Run 的 Run Control。 |
+| `v a`、`v c`、`v r` | 批准、要求修改或终止性拒绝选中的 Review。 |
+| `p p`、`p w` | 创建受管本地 package 或撤回 release。 |
 
-`Tab` 始终表示“当前上下文中的下一个项目”，`Shift+Tab` 表示上一个项目：
+V2 TUI 向 application layer 请求计划预览，不会在本地推断证据复用、失效范围、TaskRevision 变化、quota 或外部副作用。确认表单必须填写原因，操作员从本机 OS 账户派生，并在表单打开时生成 UUIDv7 幂等键；失败重试保留同一键。TUI 只通过 application service 提交已确认动作，不直接访问 SQLite、受管 snapshot、worker 或 provider。没有已确认服务契约的动作会保持禁用并显示原因。
 
-- 启动表单：切换字段；
-- 工作区中枢：返回当前运行总览；
-- 总览和完成页：切换页面；
-- 审查页和节点详情：切换工件；
-- 日志页：切换日志文件。
+## Run Control
 
-当前上下文允许的操作始终显示在底部帮助栏中。
+`Ctrl+X` 或 `x k` 为选中的 Run 打开 Run Control。初始选择为 `返回并保持运行`，因此 `Esc` 与默认路径没有副作用。`P`、`K`、`S` 分别选择暂停、取消选中 Stage 和终止 Run；第一次 `Enter` 请求影响预览，第二次 `Enter` 打开确认表单。仅当 application service 声明完整的控制提交契约时，确认后才创建 `ControlOperation`。
 
-## 启动表单
+overlay 会展示选中 run/stage、最近 checkpoint、durable control 状态、runtime receipt 数量、quota settlement 引用及任何不确定的外部结果。生命周期服务禁用的控制动作会保持禁用并显示原因。
 
-启动表单是两步向导。第一步只填写运行模式、任务或仓库来源以及工作区，按 `Enter` 进入高级选项；第二步在 Harbor 配置、质量与相似度、结果与打包、任务与代理四组之间切换，按 `Enter` 验证并以前台模式启动，或按 `Ctrl+B` 加入后台并行队列。
+## 鼠标与可访问性
 
-高级选项一次只展开一组。使用 `F1`–`F4` 或 `Ctrl+←`/`Ctrl+→` 切换分组，`Esc` 返回基本配置；在基本配置页按 `Esc` 返回中枢。`Space` 切换布尔项，`Ctrl+U` 清空文本字段。
+V2 Task Hub 的选择和生命周期命名空间以键盘为权威交互路径。指针输入绝不会从邻近文本推断或执行生命周期 mutation；它只作用于明确渲染且已启用的控件。当投影行或操作没有显式鼠标目标时，请使用上述键盘序列。
 
-启动表单中使用 `Ctrl+Q` 退出；普通的 `q` 会在文本字段中正常输入。
+## 旧路径切换
 
-文本字段支持光标移动、插入编辑、粘贴和中文输入法。路径字段按 `Ctrl+Space` 自动补全；有多个候选时补全公共前缀并显示候选摘要。
-
-Qwen 和 Opus 的 pass@4 各自固定运行 4 次独立 trial。`--harbor-concurrency` 默认值为 `2`，因此每个模型按两次并行、完成后再运行两次的 `2+2` 批次执行；可显式设置为 `1`-`4`，但 trial 总数必须保持为 4，非法配置会在启动前直接报错。
-
-## 审查和日志
-
-新流程只保留两个不可替代的人工门禁：生成前的“任务方向门禁”和所有机器检查完成后的“最终发布门禁”。生成文件后不再重复进行 Content Review，Harbor 证据也不再单独经过 Result Review；它们统一进入最终发布门禁。
-
-审查页使用 `a`/`Ctrl+A` 批准、`r`/`Ctrl+R` 拒绝、`Ctrl+N` 编辑多行审查备注或 Codex 返修指导、`e` 编辑工件。最终发布门禁支持 `v` 按当前备注执行一轮 Codex 指导返修、`c` 让 Codex 在关键检查仍失败时自动循环返修（最多 5 轮）、`u` 在操作员手工编辑工件后重跑全部强制检查。
-
-任务文件首次生成后，设计模型会在进入机器门禁前获得一次具备网络和 Docker 运行权限的自检回合，用真实 build、initial verifier 和 oracle verifier 结果修正脚本或环境。该回合用于提高容错，不替代 lint、Docker 验证、质量、相似度和最终发布门禁。
-
-日志页使用 `↑`/`↓` 或 `j`/`k` 逐行滚动，`PgUp`/`PgDn` 翻页，`Home`/`g` 跳到顶部，`End`/`G` 跳到底部，`t` 切换尾部自动跟踪。页面底部会显示当前行范围和滚动百分比。
-
-完成页使用 `f` 输入提交后的机审或人工审核意见并创建返修运行，`Esc` 返回工作区中枢，`Ctrl+R` 以当前配置重跑，`Ctrl+N` 基于当前配置打开新建表单。返修运行不复用旧质量、验证或 Harbor 结果；Codex 修改任务后，新 task digest 会强制所有相关检查重跑。
-
-## Harbor 凭据持久化
-
-`run` 和 `tui` 会自动读取 `~/.config/harbor-factory/env`。该文件必须是普通文件，并在 Unix 系统上使用 `0600` 权限；已有进程环境变量优先于文件内容。支持的变量包括 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY`、`CLAUDE_CODE_OAUTH_TOKEN`、`QWEN_HARBOR_BASE_URL` 和 `OPUS_HARBOR_BASE_URL`。
-
-配置值只注入 Factory 进程环境。`run_options.json` 只保存环境变量名称和 `KEY=${KEY}` 模板，不保存凭据值。旧工作区恢复或克隆运行时会合并当前运行时凭据和模型路由，因此无需修改历史快照。
+以下 V1 路径已明确不可用：manual retry、workspace clone rerun、repair overlay、直接删除 workspace、直接编辑 workspace、`run retry-stage`、`run rerun` 与 `repair start`。历史 workspace UI 材料只作为归档文档保留，不能作为操作指南。

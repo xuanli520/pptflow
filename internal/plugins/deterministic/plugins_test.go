@@ -2,16 +2,11 @@ package deterministic
 
 import (
 	"context"
-	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/lint"
-	"github.com/purplevoid/harbor-factory/internal/harbor/packager"
 	"github.com/purplevoid/harbor-factory/internal/harbor/similarity"
 	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
@@ -80,69 +75,12 @@ func TestSimilarityPluginSuccessAndFailure(t *testing.T) {
 	}
 }
 
-func TestPackagePluginValidate(t *testing.T) {
-	plugin := PackagePlugin{}
-	if err := plugin.Validate(workflow.NodeSpec{ID: "package", Kind: PackageKind, Config: map[string]any{"task_dir": "/task"}}); err == nil || !strings.Contains(err.Error(), "output_dir") {
-		t.Fatalf("expected package evidence validation error, got %v", err)
-	}
-	if err := plugin.Validate(packageSpec(t.TempDir())); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestPackagePluginSuccessAndFailure(t *testing.T) {
-	store := newStore(t)
-	output := t.TempDir()
-	spec := packageSpec(output)
-	passing := PackagePlugin{Package: func(opts packager.Options) (domain.PackageReport, error) {
-		zipPath := filepath.Join(output, "task.zip")
-		deliveryPath := filepath.Join(output, "task-delivery.zip")
-		if err := os.WriteFile(zipPath, []byte("zip fixture"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(deliveryPath, []byte("delivery fixture"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return domain.PackageReport{SchemaVersion: "harbor.package_report.v1", TaskDir: opts.TaskDir, OutputZip: zipPath, DeliveryZip: deliveryPath, ReportPath: filepath.Join(output, "submission_report.json"), TaskName: "task", CreatedAt: time.Now().UTC(), Passed: true}, nil
-	}}
-	result, err := passing.Execute(context.Background(), workflow.NodeRequest{Spec: spec, Store: store})
-	if err != nil || len(result.Artifacts) != 3 || result.Artifacts[1].Type != "harbor_task_zip" || result.Artifacts[2].Type != "submission_delivery_zip" {
-		t.Fatalf("unexpected package success: %+v, %v", result, err)
-	}
-	var storedReport domain.PackageReport
-	if _, err := store.ReadJSON(context.Background(), result.Artifacts[0].Name, &storedReport); err != nil {
-		t.Fatal(err)
-	}
-	if storedReport.TaskZipArtifact != result.Artifacts[1].Path || storedReport.DeliveryZipArtifact != result.Artifacts[2].Path {
-		t.Fatalf("package report omitted durable resume artifacts: %+v", storedReport)
-	}
-
-	want := errors.New("evidence rejected")
-	failing := PackagePlugin{Package: func(packager.Options) (domain.PackageReport, error) { return domain.PackageReport{}, want }}
-	_, err = failing.Execute(context.Background(), workflow.NodeRequest{Spec: spec, Store: store})
-	if !errors.Is(err, want) {
-		t.Fatalf("expected package error, got %v", err)
-	}
-	for _, name := range []string{"task.zip", "task-delivery.zip"} {
-		if _, statErr := os.Stat(filepath.Join(output, name)); !os.IsNotExist(statErr) {
-			t.Fatalf("failed retry left stale package output %s: %v", name, statErr)
-		}
-	}
-}
-
 func lintSpec() workflow.NodeSpec {
 	return workflow.NodeSpec{ID: "codeedge_lint", Kind: CodeEdgeLintKind, Config: map[string]any{"task_dir": "/task", "strict_submission": true}}
 }
 
 func similaritySpec() workflow.NodeSpec {
 	return workflow.NodeSpec{ID: "similarity_check", Kind: SimilarityKind, Config: map[string]any{"task_dir": "/task", "history_dirs": []string{"/history"}}}
-}
-
-func packageSpec(output string) workflow.NodeSpec {
-	return workflow.NodeSpec{ID: "package", Kind: PackageKind, Config: map[string]any{
-		"task_dir": "/task", "output_dir": output, "task_name": "task", "tests_analysis": "/evidence/tests_analysis.md", "verify_report": "/evidence/verify.json",
-		"similarity_report": "/evidence/similarity.json", "qwen_result": "/evidence/qwen.json", "opus_result": "/evidence/opus.json",
-	}}
 }
 
 func newStore(t *testing.T) *workflow.FileArtifactStore {

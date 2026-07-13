@@ -70,8 +70,8 @@ func TestModelRendersRunnerEvents(t *testing.T) {
 	if !strings.Contains(rendered, "codeedge_lint") || !strings.Contains(rendered, "lint passed") {
 		t.Fatalf("rendered view missing event: %s", rendered)
 	}
-	if !strings.Contains(rendered, "取消运行") {
-		t.Fatalf("TUI footer is missing the model-stage cancellation action: %s", rendered)
+	if !strings.Contains(rendered, "运行控制") {
+		t.Fatalf("TUI footer is missing the run control action: %s", rendered)
 	}
 }
 
@@ -615,70 +615,16 @@ func TestGateDecisionRedactsNotesAndEditedFiles(t *testing.T) {
 	}
 }
 
-func TestSubmitDecisionWritesWorkspaceDecisionWithoutRunner(t *testing.T) {
-	workspace := t.TempDir()
-	m := initialWorkspaceModel(context.Background(), func() {}, app.RunnerOptions{Workspace: workspace})
-	decision := domain.GateDecision{
-		RequestID: "req-1",
-		GateID:    "final_review",
-		Approved:  true,
-		Notes:     "reviewed",
-		DecidedAt: time.Now(),
-	}
-	msg := m.submitDecision(decision, nil)()
+func TestSubmitDecisionRejectsLegacyWorkspaceMutation(t *testing.T) {
+	m := initialWorkspaceModel(context.Background(), func() {}, app.RunnerOptions{Workspace: t.TempDir()})
+	msg := m.submitDecision(domain.GateDecision{RequestID: "req-1", GateID: "final_review", Approved: true}, nil)()
 	written, ok := msg.(gateDecisionWrittenMsg)
-	if !ok || written.err != nil {
-		t.Fatalf("expected written decision message, got %#v", msg)
-	}
-	raw, err := os.ReadFile(filepath.Join(workspace, "phase2", "artifacts", "reviews", "final_review", "decision.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), `"request_id": "req-1"`) || written.path == "" {
-		t.Fatalf("decision file missing content: path=%s raw=%s", written.path, raw)
+	if !ok || !errors.Is(written.err, ErrLegacyWorkspaceTUIUnavailable) {
+		t.Fatalf("legacy decision result = %#v, want lifecycle cutover error", msg)
 	}
 }
 
-func TestWorkspaceDecisionWriteRejectsUnknownGateIDAndRedacts(t *testing.T) {
-	workspace := t.TempDir()
-	secret := "raw-decision-secret"
-	_, err := writeWorkspaceGateDecision(workspace, domain.GateDecision{
-		RequestID: "req-1",
-		GateID:    "../final_review",
-		Approved:  true,
-		Notes:     "API_KEY=" + secret,
-		DecidedAt: time.Now(),
-	})
-	if err == nil {
-		t.Fatal("expected unknown/path-traversal gate id to be rejected")
-	}
-
-	path, err := writeWorkspaceGateDecision(workspace, domain.GateDecision{
-		RequestID:   "req-1",
-		GateID:      "final_review",
-		Approved:    true,
-		Notes:       "API_KEY=" + secret,
-		EditedFiles: map[string]string{"artifact.txt": "Bearer raw-token-value"},
-		DecidedAt:   time.Now(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, leaked := range []string{secret, "raw-token-value"} {
-		if strings.Contains(string(raw), leaked) {
-			t.Fatalf("decision write leaked %q: %s", leaked, raw)
-		}
-	}
-	if !strings.Contains(string(raw), "redacted") {
-		t.Fatalf("decision write missing redaction marker: %s", raw)
-	}
-}
-
-func TestSnapshotDecisionWriteShowsNoticeAndDoesNotReviveGate(t *testing.T) {
+func TestSnapshotDecisionRejectsDirectWorkspaceWrite(t *testing.T) {
 	workspace := t.TempDir()
 	writeWorkspaceSnapshot(t, workspace, domain.RunSummary{RunID: "run-current", Workspace: workspace, Status: "running"}, []domain.RunnerEvent{
 		{RunID: "run-current", Type: "gate_requested", NodeID: "final_review", Status: "waiting", Message: "review", Gate: &domain.GateRequest{RequestID: "req-1", GateID: "final_review", GateName: "Final Review", NodeID: "final_review"}},
@@ -691,19 +637,9 @@ func TestSnapshotDecisionWriteShowsNoticeAndDoesNotReviveGate(t *testing.T) {
 	decision := m.makeGateDecision(true)
 	msg := m.submitDecision(decision, m.activeGate)()
 	updated, _ := m.Update(msg)
-	written := updated.(model)
-	if !strings.Contains(written.notice, "决定已写入") || !strings.Contains(written.notice, "快照模式") {
-		t.Fatalf("decision write notice missing context: %q", written.notice)
-	}
-	rendered := written.overview()
-	if !strings.Contains(rendered, "决定已写入") {
-		t.Fatalf("overview missing decision write notice: %s", rendered)
-	}
-
-	summary, events := loadWorkspaceState(workspace)
-	refreshed, _ := written.Update(workspaceRefreshMsg{summary: summary, events: events})
-	if refreshed.(model).activeGate != nil {
-		t.Fatalf("gate should stay completed after decision file refresh: %+v", refreshed.(model).activeGate)
+	failed := updated.(model)
+	if failed.activeGate == nil || !errors.Is(failed.err, ErrLegacyWorkspaceTUIUnavailable) {
+		t.Fatalf("legacy decision write did not remain blocked: gate=%+v err=%v", failed.activeGate, failed.err)
 	}
 }
 
@@ -761,11 +697,8 @@ func TestGateEditRejectsArtifactOutsideAllowedRoots(t *testing.T) {
 		Artifacts: []domain.ArtifactPreview{{Name: "outside.txt", Path: outside}},
 	}
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
-	if cmd != nil {
-		t.Fatal("unsafe artifact edit should not launch editor")
-	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "超出允许的 TUI 根目录") {
-		t.Fatalf("unsafe artifact edit missing error: %+v", updated.(model).err)
+	if cmd != nil || updated.(model).err != nil {
+		t.Fatalf("retired editor shortcut mutated state: cmd=%v err=%v", cmd, updated.(model).err)
 	}
 }
 
@@ -784,11 +717,8 @@ func TestGateEditRejectsNonArtifactInsideTaskDir(t *testing.T) {
 		Artifacts: []domain.ArtifactPreview{{Name: "README.md", Path: readme}},
 	}
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
-	if cmd != nil {
-		t.Fatal("non-artifact task file should not launch editor")
-	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "不是可编辑的 Harbor 工件") {
-		t.Fatalf("non-artifact edit missing error: %+v", updated.(model).err)
+	if cmd != nil || updated.(model).err != nil {
+		t.Fatalf("retired editor shortcut mutated state: cmd=%v err=%v", cmd, updated.(model).err)
 	}
 }
 
@@ -807,11 +737,8 @@ func TestGateEditAllowsKnownGeneratedTaskFiles(t *testing.T) {
 		Artifacts: []domain.ArtifactPreview{{Name: "instruction.md", Path: instruction}},
 	}
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
-	if cmd == nil {
-		t.Fatalf("known Harbor task file should launch editor: err=%v", updated.(model).err)
-	}
-	if updated.(model).err != nil {
-		t.Fatalf("known Harbor task file edit should not set error: %v", updated.(model).err)
+	if cmd != nil || updated.(model).err != nil {
+		t.Fatalf("retired editor shortcut mutated state: cmd=%v err=%v", cmd, updated.(model).err)
 	}
 }
 
@@ -833,11 +760,8 @@ func TestGateEditRejectsWorkspaceGeneratedCopies(t *testing.T) {
 		Artifacts: []domain.ArtifactPreview{{Name: "instruction.md", Path: instruction}},
 	}
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
-	if cmd != nil {
-		t.Fatal("workspace generated copy should not launch editor")
-	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "不是可编辑的 Harbor 工件") {
-		t.Fatalf("workspace generated copy edit missing error: %+v", updated.(model).err)
+	if cmd != nil || updated.(model).err != nil {
+		t.Fatalf("retired editor shortcut mutated state: cmd=%v err=%v", cmd, updated.(model).err)
 	}
 }
 
@@ -859,11 +783,8 @@ func TestNodeEditRejectsPollutedTaskDirArtifact(t *testing.T) {
 		},
 	}
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
-	if cmd != nil {
-		t.Fatal("polluted node artifact should not launch editor")
-	}
-	if updated.(model).err == nil || !strings.Contains(updated.(model).err.Error(), "不是可编辑的 Harbor 工件") {
-		t.Fatalf("polluted node edit missing error: %+v", updated.(model).err)
+	if cmd != nil || updated.(model).err != nil {
+		t.Fatalf("retired editor shortcut mutated state: cmd=%v err=%v", cmd, updated.(model).err)
 	}
 }
 
@@ -1202,28 +1123,6 @@ func TestGateDecisionWriteFailureRestoresGate(t *testing.T) {
 	failed := updated.(model)
 	if failed.activeGate == nil || failed.activeGate.RequestID != "req-1" || failed.view != viewGate {
 		t.Fatalf("failed decision write should restore gate: %+v view=%v", failed.activeGate, failed.view)
-	}
-}
-
-func TestEditorCommandSupportsVisualAndEditorArgs(t *testing.T) {
-	t.Setenv("VISUAL", "code --wait")
-	t.Setenv("EDITOR", "vim")
-	cmd := editorCommand("/tmp/task.md")
-	if filepath.Base(cmd.Path) != "code" || len(cmd.Args) != 3 || cmd.Args[1] != "--wait" || cmd.Args[2] != "/tmp/task.md" {
-		t.Fatalf("VISUAL command did not preserve args/path: %#v", cmd.Args)
-	}
-
-	t.Setenv("VISUAL", "")
-	t.Setenv("EDITOR", "vim -f")
-	cmd = editorCommand("/tmp/task.md")
-	if filepath.Base(cmd.Path) != "vim" || len(cmd.Args) != 3 || cmd.Args[1] != "-f" || cmd.Args[2] != "/tmp/task.md" {
-		t.Fatalf("EDITOR command did not preserve args/path: %#v", cmd.Args)
-	}
-
-	t.Setenv("EDITOR", "")
-	cmd = editorCommand("/tmp/task.md")
-	if filepath.Base(cmd.Path) != "vi" || len(cmd.Args) != 2 || cmd.Args[1] != "/tmp/task.md" {
-		t.Fatalf("fallback editor command unexpected: path=%s args=%#v", cmd.Path, cmd.Args)
 	}
 }
 

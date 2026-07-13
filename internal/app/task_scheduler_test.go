@@ -73,9 +73,13 @@ func TestTaskSchedulerBoundsConcurrencyAndDrainsQueue(t *testing.T) {
 }
 
 func TestTaskSchedulerIsolatesFailureAndRejectsDuplicateWorkspace(t *testing.T) {
+	releaseBad := make(chan struct{})
+	badStarted := make(chan struct{})
 	scheduler, err := newTaskScheduler(context.Background(), 2, func(opts RunnerOptions) (*Runner, scheduledRunner) {
 		return nil, scheduledRunnerFunc(func(context.Context) (domain.RunSummary, error) {
 			if opts.TaskName == "bad" {
+				close(badStarted)
+				<-releaseBad
 				return domain.RunSummary{Status: "failed"}, errors.New("isolated failure")
 			}
 			return domain.RunSummary{Status: "succeeded", Passed: true}, nil
@@ -90,6 +94,11 @@ func TestTaskSchedulerIsolatesFailureAndRejectsDuplicateWorkspace(t *testing.T) 
 	if _, err := scheduler.Submit(RunnerOptions{Workspace: workspace, TaskName: "bad"}); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case <-badStarted:
+	case <-time.After(time.Second):
+		t.Fatal("bad task did not start")
+	}
 	if !scheduler.HasWorkspace(workspace) {
 		t.Fatal("submitted workspace was not reserved")
 	}
@@ -99,6 +108,7 @@ func TestTaskSchedulerIsolatesFailureAndRejectsDuplicateWorkspace(t *testing.T) 
 	if _, err := scheduler.Submit(RunnerOptions{Workspace: filepath.Join(t.TempDir(), "good"), TaskName: "good"}); err != nil {
 		t.Fatal(err)
 	}
+	close(releaseBad)
 	waitForScheduler(t, scheduler, func(snapshot TaskSchedulerSnapshot) bool {
 		return snapshot.Failed == 1 && snapshot.Succeeded == 1
 	})
@@ -149,6 +159,29 @@ func TestTaskSchedulerCancelsRunningTaskWithoutStoppingOthers(t *testing.T) {
 	waitForScheduler(t, scheduler, func(snapshot TaskSchedulerSnapshot) bool {
 		return snapshot.Canceled == 1 && snapshot.Succeeded == 1
 	})
+}
+
+func TestTaskSchedulerReleasesTerminalWorkspaceReservation(t *testing.T) {
+	scheduler, err := newTaskScheduler(context.Background(), 1, func(opts RunnerOptions) (*Runner, scheduledRunner) {
+		return nil, scheduledRunnerFunc(func(context.Context) (domain.RunSummary, error) {
+			return domain.RunSummary{Status: "succeeded", Passed: true}, nil
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scheduler.Close()
+	workspace := filepath.Join(t.TempDir(), "reusable")
+	if _, err := scheduler.Submit(RunnerOptions{Workspace: workspace}); err != nil {
+		t.Fatal(err)
+	}
+	waitForScheduler(t, scheduler, func(snapshot TaskSchedulerSnapshot) bool { return snapshot.Succeeded == 1 })
+	if scheduler.HasWorkspace(workspace) {
+		t.Fatal("terminal task kept its workspace reservation")
+	}
+	if _, err := scheduler.Submit(RunnerOptions{Workspace: workspace}); err != nil {
+		t.Fatalf("terminal workspace could not be submitted again: %v", err)
+	}
 }
 
 func TestTaskSchedulerCancelAndCloseWaitForRunningTasks(t *testing.T) {

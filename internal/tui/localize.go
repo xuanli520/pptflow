@@ -117,8 +117,6 @@ func localizeEventType(eventType string) string {
 		return "节点已跳过"
 	case "node_requeued":
 		return "节点等待重新执行"
-	case "manual_retry_started":
-		return "手动节点重试已开始"
 	case "node_preserved":
 		return "节点状态已保留"
 	case "node_reused":

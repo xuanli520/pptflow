@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
@@ -15,12 +16,12 @@ import (
 const harborWorkflowID = "harbor-factory"
 
 const (
-	defaultNodeMaxAttempts = 3
-	humanGatePluginKind    = "harborfactory.human_gate"
+	humanGatePluginKind         = "harborfactory.human_gate"
+	defaultStartupGraceSeconds  = 30
+	defaultShutdownGraceSeconds = 30
 )
 
 var defaultNodeRetryableFailures = []workflow.FailureKind{
-	workflow.FailureUnknown,
 	workflow.FailureTransient,
 	workflow.FailureTimeout,
 	workflow.FailureRateLimit,
@@ -30,10 +31,8 @@ var defaultNodeRetryableFailures = []workflow.FailureKind{
 func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, error) {
 	workspace := nodes.DefaultWorkspace(opts.Workspace)
 	taskDir := strings.TrimSpace(opts.TaskDir)
-	publishDestination := ""
 	if opts.Generate {
 		taskDir = filepath.Join(workspace, "phase2", "task", "generated-task")
-		publishDestination = strings.TrimSpace(opts.TaskOutputDir)
 	}
 	if taskDir == "" {
 		return workflow.WorkflowDefinition{}, fmt.Errorf("task directory is required")
@@ -45,30 +44,25 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 	opts.HarborConcurrency = passPlan.Concurrency
 	opts.HarborAttempts = passPlan.Attempts
 
-	definition := workflow.WorkflowDefinition{ID: harborWorkflowID, Name: "Harbor Task Factory", Policy: workflow.Policy{MaxNodes: 40, MaxRevisions: 5}}
+	definition := workflow.WorkflowDefinition{ID: harborWorkflowID, Name: "Harbor Task Factory", Policy: workflow.Policy{MaxNodes: 40}}
 	add := func(spec workflow.NodeSpec) {
 		definition.Nodes = append(definition.Nodes, spec)
 	}
 	chain := func(id, kind string, depends []string, timeout, attempts int, config map[string]any, inputs ...workflow.ArtifactRef) {
-		maxAttempts := attempts
-		var retryable []workflow.FailureKind
-		if kind != humanGatePluginKind {
-			maxAttempts = defaultNodeMaxAttempts
-			retryable = append([]workflow.FailureKind(nil), defaultNodeRetryableFailures...)
-		}
+		policy := productionNodePolicy(kind, timeout, attempts, config)
 		add(workflow.NodeSpec{
 			ID: id, Kind: kind, PluginID: kind, Name: id, DependsOn: depends, Inputs: inputs, Config: config,
-			Policy: workflow.NodePolicy{TimeoutSeconds: timeout, MaxAttempts: maxAttempts, RetryBackoffMS: 500, RetryMaxBackoffMS: 5000, Retryable: retryable},
+			Policy: policy,
 		})
 	}
 	artifact := func(name, artifactType, producer string) workflow.ArtifactRef {
 		return workflow.ArtifactRef{Name: filepath.ToSlash(name), Type: artifactType, Producer: producer}
 	}
-	gate := func(id, phase, name, message, restartFrom string, depends []string, inputs ...workflow.ArtifactRef) {
+	gate := func(id, phase, name, message string, depends []string, inputs ...workflow.ArtifactRef) {
 		chain(id, humanGatePluginKind, depends, 86400, 1, map[string]any{
 			"phase": phase, "gate_id": id, "gate_name": name, "message": message,
 			"artifact_name": filepath.ToSlash(filepath.Join(phase, "artifacts", "reviews", id, "decision.json")),
-			"restart_from":  restartFrom, "task_dir": taskDir, "model": opts.Model,
+			"task_dir":      taskDir, "model": opts.Model,
 			"reasoning_effort": opts.Reasoning, "agent_timeout_seconds": opts.AgentTimeout,
 			"qwen_model": defaultString(opts.QwenModel, domain.DefaultQwenModel), "opus_model": defaultString(opts.OpusModel, domain.DefaultOpusModel),
 			"harbor_agent": defaultString(opts.HarborAgent, domain.DefaultHarborAgent), "qwen_screenshot": opts.QwenScreenshot, "opus_screenshot": opts.OpusScreenshot,
@@ -86,7 +80,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		analysis := artifact("phase1/artifacts/repo_analyze/repo_analysis.json", "repo_analysis", nodes.RepoAnalyze)
 		chain(nodes.TaskDesign, "harborfactory.task_design", []string{nodes.RepoAnalyze}, 600, 3, agentConfig(opts, "phase1/artifacts/task_design/task_proposal.json"), prepared, analysis)
 		proposal := artifact("phase1/artifacts/task_design/task_proposal.json", "task_proposal", nodes.TaskDesign)
-		gate(nodes.TaskReview, "phase1", "Task Direction Gate", "Confirm that the task is a real, non-trivial CodeEdge engineering scenario before generating deliverables.", nodes.TaskDesign, []string{nodes.TaskDesign}, analysis, proposal)
+		gate(nodes.TaskReview, "phase1", "Task Direction Gate", "Confirm that the task is a real, non-trivial CodeEdge engineering scenario before generating deliverables.", []string{nodes.TaskDesign}, analysis, proposal)
 		taskDecision := artifact("phase1/artifacts/reviews/task_review/decision.json", "gate_decision", nodes.TaskReview)
 		chain(nodes.GenerateTaskFiles, "harborfactory.generate_task_files", []string{nodes.TaskReview}, 600, 3, agentConfig(opts, "phase1/artifacts/generate_task_files/task_files.json"), prepared, analysis, proposal, taskDecision)
 		files := artifact("phase1/artifacts/generate_task_files/task_files.json", "generated_task_files", nodes.GenerateTaskFiles)
@@ -97,7 +91,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		instruction := artifact("phase1/artifacts/instruction_generate/instruction.md", "instruction", nodes.InstructionGen)
 		taskTOML := artifact("phase1/artifacts/task_toml_generate/task.toml", "task_toml", nodes.TaskTOMLGen)
 		dockerfile := artifact("phase1/artifacts/dockerfile_generate/Dockerfile", "dockerfile", nodes.DockerfileGen)
-		gate(nodes.ContentReview, "phase1", "Content Gate", "Review instruction, task metadata and environment isolation before generating the oracle and verifier.", nodes.GenerateTaskFiles, []string{nodes.InstructionGen, nodes.TaskTOMLGen, nodes.DockerfileGen}, instruction, taskTOML, dockerfile)
+		gate(nodes.ContentReview, "phase1", "Content Gate", "Review instruction, task metadata and environment isolation before generating the oracle and verifier.", []string{nodes.InstructionGen, nodes.TaskTOMLGen, nodes.DockerfileGen}, instruction, taskTOML, dockerfile)
 
 		chain(nodes.SolveGen, "harborfactory.solve_generate", []string{nodes.ContentReview}, 120, 1, map[string]any{"artifact_name": "phase2/artifacts/solve_generate/solve.sh"}, files)
 		chain(nodes.TestGen, "harborfactory.test_generate", []string{nodes.ContentReview}, 120, 1, map[string]any{"artifact_name": "phase2/artifacts/test_generate/test.sh"}, files)
@@ -105,7 +99,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		solve := artifact("phase2/artifacts/solve_generate/solve.sh", "solve_script", nodes.SolveGen)
 		test := artifact("phase2/artifacts/test_generate/test.sh", "test_script", nodes.TestGen)
 		testsAnalysis := artifact("phase3/artifacts/tests_analysis/tests_analysis.md", "tests_analysis", nodes.TestsAnalysis)
-		gate(nodes.SolutionReview, "phase2", "Solution and Verifier Gate", "Confirm that the oracle is reproducible and the verifier is aligned, discriminating and free of hidden requirements.", nodes.GenerateTaskFiles, []string{nodes.SolveGen, nodes.TestGen, nodes.TestsAnalysis}, instruction, solve, test, testsAnalysis)
+		gate(nodes.SolutionReview, "phase2", "Solution and Verifier Gate", "Confirm that the oracle is reproducible and the verifier is aligned, discriminating and free of hidden requirements.", []string{nodes.SolveGen, nodes.TestGen, nodes.TestsAnalysis}, instruction, solve, test, testsAnalysis)
 
 		chain(nodes.MaterializeTask, "harborfactory.materialize_task", []string{nodes.SolutionReview}, 120, 1, map[string]any{"task_dir": taskDir}, instruction, taskTOML, dockerfile, solve, test, testsAnalysis)
 		materializeDependency = nodes.MaterializeTask
@@ -115,7 +109,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		source := normalizedRepairSource(opts.RepairSource)
 		chain(nodes.TaskRepair, "harborfactory.task_repair", compactDependency(materializeDependency), 600, 1, map[string]any{
 			"task_dir": taskDir, "guidance": guidance, "source": source,
-			"model": opts.Model, "reasoning_effort": opts.Reasoning, "agent_timeout_seconds": opts.AgentTimeout,
+			"model": opts.Model, "reasoning_effort": opts.Reasoning, "agent_timeout_seconds": resolvedAgentTimeout(opts),
 			"artifact_name":     fmt.Sprintf("phase2/artifacts/task_repair/%s/repair-001.json", source),
 			"log_artifact_name": fmt.Sprintf("phase2/artifacts/task_repair/%s/repair-001-agent.log", source),
 		})
@@ -126,7 +120,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		materializeDependency = nodes.RuntimeSelfCheck
 	}
 	baseDeps := compactDependency(materializeDependency)
-	forceVerify := opts.VerifyDocker || opts.Package
+	forceVerify := opts.VerifyDocker
 	lastChecks := append([]string(nil), baseDeps...)
 	verifyProducer := nodes.OracleVerify
 	if forceVerify {
@@ -163,7 +157,7 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		lastQuality = nodes.QualityCheck
 		finalEvidence = append(finalEvidence, artifact("phase2/artifacts/quality_check/quality_report.json", "quality_report", nodes.QualityCheck))
 	}
-	if opts.SimilarityCheck || opts.Package {
+	if opts.SimilarityCheck {
 		similarityPath := nodes.SimilarityReportPath(workspace)
 		if _, reuseErr := packager.ValidateSimilarityReport(similarityPath, taskDir); reuseErr == nil {
 			chain(nodes.SimilarityCheck, "harborfactory.similarity_report_import", []string{lastQuality}, 60, 1, map[string]any{
@@ -180,13 +174,13 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		lastQuality = nodes.SimilarityCheck
 		finalEvidence = append(finalEvidence, artifact("phase2/artifacts/similarity_check/similarity_report.json", "similarity_report", nodes.SimilarityCheck))
 	}
-	gate(nodes.FinalReview, "phase2", "Final Quality Gate", "Review deterministic lint, runtime verification, semantic quality and similarity evidence before model trials.", nodes.CodeEdgeLint, []string{lastQuality}, finalEvidence...)
+	gate(nodes.FinalReview, "phase2", "Final Quality Gate", "Review deterministic lint, runtime verification, semantic quality and similarity evidence before model trials.", []string{lastQuality}, finalEvidence...)
 
 	runQwen, runOpus, err := harborModelSelection(opts.HarborModels)
 	if err != nil {
 		return workflow.WorkflowDefinition{}, err
 	}
-	runHarbor := opts.RunHarbor || opts.Package
+	runHarbor := opts.RunHarbor
 	qwenProvided := strings.TrimSpace(opts.QwenResult) != ""
 	opusProvided := strings.TrimSpace(opts.OpusResult) != ""
 	resultDeps := []string{nodes.FinalReview}
@@ -207,16 +201,10 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 		resultEvidence = append(resultEvidence, artifact("phase3/artifacts/harbor_run_opus/opus_result.json", "trial_result", nodes.HarborRunOpus))
 		resultEvidence = append(resultEvidence, artifact("phase3/artifacts/harbor_run_opus/pass4_evidence.png", "pass4_screenshot", nodes.HarborRunOpus))
 	}
-	needResultReview := runHarbor || qwenProvided || opusProvided || opts.Package
+	needResultReview := runHarbor || qwenProvided || opusProvided
 	submissionDependency := nodes.FinalReview
 	if needResultReview {
-		resultRestart := nodes.FinalReview
-		if runHarbor && runQwen {
-			resultRestart = nodes.HarborRunQwen
-		} else if runHarbor && runOpus {
-			resultRestart = nodes.HarborRunOpus
-		}
-		gate(nodes.ResultReview, "phase3", "Model Result Gate", "Confirm model identity, four independent trials, task digest, pass@4 screenshots and average-turn evidence.", resultRestart, dedupeDependencies(resultDeps), resultEvidence...)
+		gate(nodes.ResultReview, "phase3", "Model Result Gate", "Confirm model identity, four independent trials, task digest, pass@4 screenshots and average-turn evidence.", dedupeDependencies(resultDeps), resultEvidence...)
 		submissionDependency = nodes.ResultReview
 	}
 
@@ -228,50 +216,123 @@ func buildWorkflowDefinition(opts RunnerOptions) (workflow.WorkflowDefinition, e
 	if opusResult == "" && runHarbor && runOpus {
 		opusResult = nodes.OpusResultPath(workspace)
 	}
-	packageDependency := submissionDependency
-	if needResultReview || opts.StrictSubmission || opts.Package {
+	if needResultReview || opts.StrictSubmission {
 		chain(nodes.SubmissionLint, "harborfactory.codeedge_lint", []string{submissionDependency}, 60, 1, map[string]any{
 			"task_dir": taskDir, "repo_url": opts.RepoURL, "commit": opts.Commit, "tests_analysis": testsAnalysisPath,
 			"qwen_result": qwenResult, "opus_result": opusResult, "qwen_screenshot": opts.QwenScreenshot, "opus_screenshot": opts.OpusScreenshot,
-			"strict_submission": opts.StrictSubmission || opts.Package, "artifact_name": "phase2/artifacts/submission_lint/lint_report.json",
-		})
-		packageDependency = nodes.SubmissionLint
-	}
-	if opts.Generate && publishDestination != "" && !sameWorkflowPath(taskDir, publishDestination) {
-		chain(nodes.PublishTask, "harborfactory.publish_task", []string{packageDependency}, 120, 1, map[string]any{
-			"task_dir": taskDir, "destination_dir": publishDestination,
-			"artifact_name": "phase3/artifacts/task_publish/publish_receipt.json",
-		})
-		packageDependency = nodes.PublishTask
-	}
-	if opts.Package {
-		chain(nodes.Package, "harborfactory.package", []string{packageDependency}, 60, 1, map[string]any{
-			"task_dir": taskDir, "output_dir": opts.OutputDir, "task_name": opts.TaskName, "code_lang": opts.CodeLang,
-			"task_type": opts.TaskType, "application": opts.Application, "aht": opts.AHT, "description": opts.Description,
-			"is_zero_to_one": opts.IsZeroToOne, "github_url": opts.RepoURL, "commit_id": opts.Commit,
-			"tests_analysis": testsAnalysisPath, "verify_report": nodes.VerifyReportPath(workspace),
-			"quality_report": nodes.QualityReportPath(workspace), "similarity_report": nodes.SimilarityReportPath(workspace),
-			"qwen_result": qwenResult, "opus_result": opusResult, "qwen_screenshot": opts.QwenScreenshot, "opus_screenshot": opts.OpusScreenshot,
+			"strict_submission": opts.StrictSubmission, "artifact_name": "phase2/artifacts/submission_lint/lint_report.json",
 		})
 	}
 	return definition, nil
 }
 
-func sameWorkflowPath(left, right string) bool {
-	leftAbs, leftErr := filepath.Abs(filepath.Clean(left))
-	rightAbs, rightErr := filepath.Abs(filepath.Clean(right))
-	return leftErr == nil && rightErr == nil && leftAbs == rightAbs
+// productionNodePolicy preserves each stage's declared retry count and makes
+// the known multi-turn agent stages safe against a shorter parent attempt
+// context. The V2 compiler later supplies the same values from an explicit
+// profile; this bridge prevents legacy definitions from recreating the 600s
+// parent/1800s child timeout incident during the migration.
+func productionNodePolicy(kind string, requestedTimeout, requestedAttempts int, config map[string]any) workflow.NodePolicy {
+	if kind == humanGatePluginKind {
+		// A gate is a durable waiting state, not a long-running execution.
+		return workflow.NodePolicy{MaxAttempts: 1}
+	}
+	attempts := requestedAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+	policy := workflow.NodePolicy{
+		TimeoutSeconds:    requestedTimeout,
+		MaxAttempts:       attempts,
+		RetryBackoffMS:    500,
+		RetryMaxBackoffMS: 5000,
+	}
+	if attempts > 1 {
+		policy.Retryable = append([]workflow.FailureKind(nil), defaultNodeRetryableFailures...)
+	}
+	turns := agentTurnCount(kind)
+	turnTimeout := configInt(config, "timeout_seconds")
+	if turnTimeout <= 0 {
+		turnTimeout = configInt(config, "agent_timeout_seconds")
+	}
+	if turns <= 0 || turnTimeout <= 0 {
+		return policy
+	}
+	minimumAttempt := turns*turnTimeout + defaultStartupGraceSeconds + defaultShutdownGraceSeconds
+	if policy.TimeoutSeconds < minimumAttempt {
+		policy.TimeoutSeconds = minimumAttempt
+	}
+	policy.TurnTimeoutSeconds = turnTimeout
+	policy.MaxTurns = turns
+	policy.StartupGraceSeconds = defaultStartupGraceSeconds
+	policy.ShutdownGraceSeconds = defaultShutdownGraceSeconds
+	policy.MaxElapsedSeconds = totalNodeElapsedSeconds(policy)
+	return policy
+}
+
+func agentTurnCount(kind string) int {
+	switch kind {
+	case "harborfactory.repo_analyze", "harborfactory.task_design", "harborfactory.generate_task_files":
+		return 3
+	case "harborfactory.runtime_self_check", "harborfactory.quality_check", "harborfactory.task_repair":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func configInt(config map[string]any, key string) int {
+	if config == nil {
+		return 0
+	}
+	switch value := config[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+func totalNodeElapsedSeconds(policy workflow.NodePolicy) int {
+	attempts := policy.MaxAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+	total := time.Duration(attempts*policy.TimeoutSeconds) * time.Second
+	backoff := time.Duration(policy.RetryBackoffMS) * time.Millisecond
+	if backoff <= 0 {
+		backoff = 100 * time.Millisecond
+	}
+	maximum := time.Duration(policy.RetryMaxBackoffMS) * time.Millisecond
+	for failedAttempt := 1; failedAttempt < attempts; failedAttempt++ {
+		delay := backoff
+		for exponent := 1; exponent < failedAttempt; exponent++ {
+			delay *= 2
+		}
+		if maximum > 0 && delay > maximum {
+			delay = maximum
+		}
+		total += delay
+	}
+	return int((total + time.Second - 1) / time.Second)
 }
 
 func agentConfig(opts RunnerOptions, artifactName string) map[string]any {
-	timeout := opts.AgentTimeout
-	if timeout <= 0 {
-		timeout = 600
-	}
+	timeout := resolvedAgentTimeout(opts)
 	return map[string]any{
 		"model": opts.Model, "reasoning_effort": opts.Reasoning, "timeout_seconds": timeout,
 		"artifact_name": artifactName,
 	}
+}
+
+func resolvedAgentTimeout(opts RunnerOptions) int {
+	if opts.AgentTimeout > 0 {
+		return opts.AgentTimeout
+	}
+	return 600
 }
 
 func harborConfig(opts RunnerOptions, taskDir, nodeID, model string) map[string]any {

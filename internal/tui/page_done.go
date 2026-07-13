@@ -18,10 +18,6 @@ func (p *donePage) Update(msg tea.Msg) (bool, tea.Cmd) {
 	switch key.String() {
 	case "tab":
 		p.m.cyclePage(1)
-	case "ctrl+r":
-		return true, p.m.openRunConfig(p.m.opts.Workspace, taskLabel(p.m.opts, p.m.opts.Workspace))
-	case "ctrl+n":
-		p.m.openStartForm(p.m.opts.Workspace)
 	case "2":
 		p.m.setView(viewNodeDetail)
 	case "3", "l":
@@ -119,6 +115,6 @@ func (m model) doneView() string {
 		lines = append(lines, fmt.Sprintf("打包文件: %s", redactSingleLineUI(m.summary.PackageReport.OutputZip)))
 		lines = append(lines, fmt.Sprintf("提交报告: %s", redactSingleLineUI(m.summary.PackageReport.ReportPath)))
 	}
-	lines = append(lines, "", subtleStyle.Render("Esc 返回工作区中枢  Ctrl+R 重跑  Ctrl+N 基于此配置新建"))
+	lines = append(lines, "", subtleStyle.Render("Esc 返回工作区中枢；继续处理请使用生命周期 Task Hub。"))
 	return panelStyle.Width(contentWidth(m.width)).Render(strings.Join(lines, "\n"))
 }

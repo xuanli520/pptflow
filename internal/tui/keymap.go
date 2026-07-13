@@ -1,8 +1,7 @@
 package tui
 
 import (
-	"fmt"
-	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
@@ -42,7 +41,7 @@ func (m *model) cyclePage(delta int) {
 	if m.done {
 		pages = append(pages, viewDone)
 	}
-	if m.store != nil {
+	if m.store != nil || m.lifecycle != nil {
 		pages = append(pages, viewHub)
 	}
 	idx := 0
@@ -57,14 +56,28 @@ func (m *model) cyclePage(delta int) {
 
 func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	key := msg.String()
-	if m.runConfig != nil {
-		return true, m.updateRunConfigKey(msg)
+	if m.taskHubDetail != nil {
+		return true, m.updateTaskHubDetailKey(msg)
 	}
-	if m.taskRepair != nil {
-		return true, m.updateTaskRepairKey(msg)
+	if m.taskHubHelpVisible {
+		if key == "?" || key == "esc" || key == "q" {
+			m.taskHubHelpVisible = false
+			m.focusMgr.Pop()
+		}
+		return true, nil
 	}
-	if m.resumeOverlay != nil {
-		return true, m.updateResumeKey(msg)
+	if m.taskHubMutation != nil {
+		return true, m.updateTaskHubMutationKey(msg)
+	}
+	if m.runControl != nil {
+		return true, m.updateRunControlKey(msg)
+	}
+	if m.confirm != nil {
+		return true, m.updateConfirmKey(msg)
+	}
+	if key == "ctrl+x" {
+		m.openRunControl()
+		return true, nil
 	}
 	if m.helpVisible {
 		if key == "?" || key == "esc" || key == "q" {
@@ -76,9 +89,6 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		}
 		return true, nil
 	}
-	if m.confirm != nil {
-		return true, m.updateConfirmKey(msg)
-	}
 	if m.gateEditingNote {
 		return false, nil
 	}
@@ -86,7 +96,15 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, m.updateSearchKey(msg)
 	}
 	if m.hubSearching {
-		return true, m.updateHubSearch(msg)
+		if m.lifecycle != nil {
+			return true, m.updateTaskHubV2Search(msg)
+		}
+		return true, nil
+	}
+	if m.lifecycle != nil && m.view == viewHub {
+		if handled, cmd := m.handleTaskHubPrefixKey(msg); handled {
+			return true, cmd
+		}
 	}
 	if m.view == viewStart {
 		// Printable runes belong to the focused form input. In particular,
@@ -109,6 +127,11 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	}
 	switch key {
 	case "?":
+		if m.lifecycle != nil && m.view == viewHub {
+			m.taskHubHelpVisible = true
+			m.focusMgr.Push(focusOverlay)
+			return true, nil
+		}
 		m.helpVisible = true
 		if m.router != nil {
 			m.router.PushOverlay(&helpOverlay{view: m.view, readOnly: m.readOnly})
@@ -121,7 +144,7 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, nil
 		}
 	case "1":
-		if m.store != nil {
+		if m.store != nil || m.lifecycle != nil {
 			return true, m.returnToHub()
 		}
 	case "ctrl+o", "2":
@@ -147,23 +170,6 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, m.showToast("运行尚未完成", toastWarning)
 		}
 		return true, nil
-	case "f":
-		if m.view == viewDone {
-			return true, m.openTaskRepair(m.opts.Workspace, taskLabel(m.opts, m.opts.Workspace))
-		}
-	case "ctrl+x", "x":
-		if m.view == viewStart {
-			return false, nil
-		}
-		if m.readOnly {
-			m.err = fmt.Errorf("workspace snapshot is read-only while another Factory process owns the run")
-			return true, nil
-		}
-		if m.done {
-			return true, m.showToast("运行已经结束", toastInfo)
-		}
-		m.openConfirm(newConfirmDialog(confirmCancelRun, "确认取消运行", "取消后当前工作流将停止，是否继续？"))
-		return true, func() tea.Msg { return confirmOpenedMsg{} }
 	case "ctrl+q", "ctrl+c":
 		return true, m.requestQuit()
 	case "q":
@@ -171,14 +177,14 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, m.requestQuit()
 		}
 	case "esc":
-		if m.view == viewDone && m.store != nil {
+		if m.view == viewDone && (m.store != nil || m.lifecycle != nil) {
 			return true, m.returnToHub()
 		}
 		if m.view != viewOverview && m.view != viewStart && m.view != viewHub {
 			m.setView(viewOverview)
 			return true, nil
 		}
-		if m.view == viewOverview && m.store != nil {
+		if m.view == viewOverview && (m.store != nil || m.lifecycle != nil) {
 			return true, m.returnToHub()
 		}
 	case "shift+tab":
@@ -191,30 +197,13 @@ func (m *model) handleGlobalKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 }
 
 func (m *model) requestQuit() tea.Cmd {
-	if m.scheduler != nil {
-		tasks := m.scheduler.Snapshot()
-		if active := tasks.Running + tasks.Queued; active > 0 {
-			message := fmt.Sprintf("本进程仍有 %d 个并行任务正在运行或排队。退出将取消这些任务并等待资源回收，是否继续？", active)
-			m.openConfirm(newConfirmDialog(confirmQuit, "确认退出", message))
-			return func() tea.Msg { return confirmOpenedMsg{} }
-		}
+	if m.hasActiveRun() {
+		dialog := newConfirmDialog(confirmQuit, "确认退出", "退出控制台不会停止当前运行，是否继续？")
+		dialog.FocusedYes = false
+		m.openConfirm(dialog)
+		return func() tea.Msg { return confirmOpenedMsg{} }
 	}
-	if m.view == viewHub && m.runner == nil {
-		for _, item := range m.hubItems {
-			if item.Run.IsActive {
-				m.openConfirm(newConfirmDialog(confirmQuit, "确认退出", "仍有运行中的工作区。退出不会停止其他 Factory 进程，是否继续？"))
-				return func() tea.Msg { return confirmOpenedMsg{} }
-			}
-		}
-		m.cancelRun()
-		return tea.Quit
-	}
-	if m.done || m.readOnly || m.view == viewStart {
-		m.cancelRun()
-		return tea.Quit
-	}
-	m.openConfirm(newConfirmDialog(confirmQuit, "确认退出", "工作流仍在运行。退出将取消当前运行，是否继续？"))
-	return func() tea.Msg { return confirmOpenedMsg{} }
+	return tea.Quit
 }
 
 func (m *model) updateConfirmKey(msg tea.KeyMsg) tea.Cmd {
@@ -253,34 +242,8 @@ func (m *model) updateConfirmKey(msg tea.KeyMsg) tea.Cmd {
 		m.activeGate = nil
 		m.setView(viewOverview)
 		return m.submitDecision(decision, gate)
-	case confirmCancelRun:
-		m.cancelRun()
-		m.notice = "已请求取消当前运行"
-		return m.showToast(m.notice, toastWarning)
 	case confirmQuit:
-		m.cancelRun()
 		return tea.Quit
-	case confirmEditArtifact:
-		return openEditorCmd(d.Path)
-	case confirmDeleteWorkspace:
-		path := d.Path
-		dataStore := m.store
-		return func() tea.Msg {
-			if err := os.RemoveAll(path); err != nil {
-				return workspaceDeletedMsg{path: path, err: err}
-			}
-			if dataStore != nil {
-				if err := dataStore.DeleteRunByWorkspace(path); err != nil {
-					return workspaceDeletedMsg{path: path, err: err}
-				}
-				if err := dataStore.CleanOrphanTasks(); err != nil {
-					return workspaceDeletedMsg{path: path, err: err}
-				}
-			}
-			return workspaceDeletedMsg{path: path}
-		}
-	case confirmRetryNode:
-		return m.prepareManualNodeRetry(d.NodeID, d.Affected)
 	}
 	return nil
 }
@@ -304,24 +267,115 @@ func (m *model) openConfirm(dialog *ConfirmDialog) {
 	m.focusMgr.Push(focusOverlay)
 }
 
-func (m *model) confirmSelectedNodeEdit() tea.Cmd {
-	if m.readOnly {
-		m.err = fmt.Errorf("工作区快照为只读，不能编辑工件")
+func (m *model) openRunControl() {
+	if m.lifecycle != nil {
+		m.runControl = newLifecycleRunControlOverlay(m.taskHubRunByID(m.controlRunID()))
+	} else {
+		m.runControl = newRunControlOverlay(m.controlRunID(), m.opts.Workspace, m.done, m.readOnly)
+	}
+	if m.router != nil {
+		m.router.PushOverlay(m.runControl)
+	}
+	m.focusMgr.Push(focusOverlay)
+}
+
+func (m model) controlRunID() string {
+	if m.lifecycle != nil {
+		if runID := strings.TrimSpace(m.taskHub.SelectedRunID); runID != "" {
+			return runID
+		}
+	}
+	if runID := strings.TrimSpace(m.summary.RunID); runID != "" {
+		return runID
+	}
+	for index := len(m.events) - 1; index >= 0; index-- {
+		if runID := strings.TrimSpace(m.events[index].RunID); runID != "" {
+			return runID
+		}
+	}
+	return ""
+}
+
+func (m *model) updateRunControlKey(msg tea.KeyMsg) tea.Cmd {
+	if m.runControl == nil {
 		return nil
 	}
-	artifact, ok := m.selectedNodeArtifact()
-	if !ok {
-		return m.showToast("当前节点没有可编辑工件", toastWarning)
+	switch msg.String() {
+	case "enter", "esc", "q", "ctrl+x":
+		if msg.String() != "enter" || m.runControl.selectedIsReturn() || !m.runControl.lifecycleControlAvailable() {
+			m.closeRunControl()
+			return nil
+		}
+		if m.runControl.Preview != nil {
+			if !m.runControl.Preview.ConfirmationNeeded {
+				return m.showToast("当前运行控制预览不可提交", toastWarning)
+			}
+			return m.openTaskHubRunControlConfirmation()
+		}
+		return m.previewTaskHubRunControl(m.runControl.SelectedAction)
+	case "p":
+		m.runControl.selectAction(TaskHubRunControlPause)
+	case "k":
+		m.runControl.selectAction(TaskHubRunControlCancelStage)
+	case "s":
+		m.runControl.selectAction(TaskHubRunControlTerminate)
+	case "up":
+		m.cycleRunControlSelection(-1)
+	case "down", "j":
+		m.cycleRunControlSelection(1)
 	}
-	path, err := m.safeEditableArtifactPath(artifact.Path)
-	if err != nil {
-		m.err = err
-		return nil
+	return nil
+}
+
+func (m *model) cycleRunControlSelection(delta int) {
+	if m.runControl == nil || !m.runControl.lifecycleControlAvailable() {
+		return
 	}
-	dialog := newConfirmDialog(confirmEditArtifact, "确认编辑工件", "将使用外部编辑器打开：\n"+path)
-	dialog.Path = path
-	m.openConfirm(dialog)
-	return func() tea.Msg { return confirmOpenedMsg{} }
+	choices := []TaskHubRunControlAction{
+		"",
+		TaskHubRunControlPause,
+		TaskHubRunControlCancelStage,
+		TaskHubRunControlTerminate,
+	}
+	current := 0
+	for index, action := range choices {
+		if action == m.runControl.SelectedAction {
+			current = index
+			break
+		}
+	}
+	next := (current + delta + len(choices)) % len(choices)
+	if choices[next] == "" {
+		m.runControl.selectReturn()
+		return
+	}
+	m.runControl.selectAction(choices[next])
+}
+
+func (m *model) closeRunControl() {
+	m.runControl = nil
+	if m.router != nil {
+		m.router.PopOverlay()
+	}
+	m.focusMgr.Pop()
+}
+
+func (m model) hasActiveRun() bool {
+	if m.lifecycle != nil {
+		for _, run := range m.taskHub.Snapshot.Runs {
+			if run.Active || run.QueuePosition > 0 {
+				return true
+			}
+		}
+	}
+	if m.runner != nil && !m.done {
+		return true
+	}
+	if m.scheduler != nil {
+		tasks := m.scheduler.Snapshot()
+		return tasks.Running+tasks.Queued > 0
+	}
+	return false
 }
 
 func (m *model) beginSearch() {
@@ -352,19 +406,32 @@ func (m *model) updateSearchKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m model) footer() string {
-	if m.runConfig != nil {
-		return subtleStyle.Render("[Tab/↑↓ 切换] [Space 开关] [Enter 开始重跑] [Esc 取消]")
+	if m.taskHubDetail != nil {
+		return subtleStyle.Render("[Tab/←→] 切换分类  [↑↓/j k] 浏览  [r] 刷新  [Esc] 返回")
 	}
-	if m.taskRepair != nil {
-		return subtleStyle.Render("[Tab 切换字段] [Ctrl+S 创建返修运行] [Esc 取消]")
+	if m.taskHubHelpVisible {
+		return subtleStyle.Render("[? / Esc / q] 关闭 Task Hub 帮助")
 	}
-	if m.resumeOverlay != nil {
-		return subtleStyle.Render("[R 恢复运行] [N 新建运行] [V 只读查看] [Enter 确认] [Esc 取消]")
+	if m.taskHubMutation != nil {
+		return subtleStyle.Render("[Tab] 切换字段  [Enter] 确认提交  [Esc] 取消")
+	}
+	if m.runControl != nil {
+		if m.runControl.lifecycleControlAvailable() {
+			return subtleStyle.Render("[P/K/S] 选择  [Enter] 查看影响预览  [Esc] 返回")
+		}
+		return subtleStyle.Render("[Enter/Esc] 返回")
 	}
 	var text string
 	switch m.view {
 	case viewHub:
-		text = "[↑↓ 选择] [Enter 打开] [Ctrl+N 新建] [Ctrl+R 重跑] [f 外部审查返修] [Del 删除] [s/S 排序] [/ 搜索] [q 退出] [? 帮助]"
+		if m.lifecycle != nil {
+			text = "[Tab Tasks/Runs/Queue] [↑↓ 选择] [Enter/d 详情] [/ 搜索] " + m.taskHubPrefixHint() + " [q 退出] [? 帮助]"
+			if m.taskHubPlan != nil {
+				text = "[Esc 关闭预览] " + m.taskHubPrefixHint()
+			}
+		} else {
+			text = "[↑↓ 选择] [Enter 打开] [s/S 排序] [/ 搜索] [q 退出] [? 帮助]"
+		}
 	case viewStart:
 		if m.startStep == startStepBasic {
 			text = "[Tab/↓ 下一字段] [Shift+Tab/↑ 上一字段] [Space 切换模式] [Ctrl+Space 路径补全] [Enter 下一步] [Ctrl+Q 退出]"
@@ -390,19 +457,11 @@ func (m model) footer() string {
 	case viewLogs:
 		text = "[↑↓/j k 滚动] [PgUp/PgDn 翻页] [Home/End 首尾] [t 跟踪] [Tab/Shift+Tab 切换文件] [Ctrl+O 总览] [? 帮助]"
 	case viewNodeDetail:
-		if m.readOnly {
-			text = "[↑↓/j k 选择] [Tab/Shift+Tab 切换工件] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
-		} else {
-			text = "[↑↓/j k 选择] [r 重试节点] [Tab/Shift+Tab 切换工件] [e 编辑] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
-		}
+		text = "[↑↓/j k 选择] [Tab/Shift+Tab 切换工件] [Ctrl+L 日志] [Ctrl+O 总览] [/ 过滤] [? 帮助]"
 	case viewDone:
-		text = "[f 外部审查返修] [Esc 返回工作区] [Ctrl+R 重跑] [Ctrl+N 新建] [1 工作区] [2 总览] [4 详情] [5 日志] [q 退出] [? 帮助]"
+		text = "[Esc 返回工作区] [1 工作区] [2 总览] [4 详情] [5 日志] [q 退出] [? 帮助]"
 	default:
-		if m.readOnly {
-			text = "[↑↓选择] [Enter详情] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [q退出] [/过滤] [?帮助]"
-		} else {
-			text = "[↑↓选择] [Enter详情] [r 重试节点] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [Ctrl+X取消运行] [q退出] [/过滤] [?帮助]"
-		}
+		text = "[↑↓选择] [Enter详情] [PgUp/PgDn翻页] [Tab下一页] [Ctrl+G审查] [Ctrl+L日志] [Ctrl+E完成] [Ctrl+X运行控制] [q退出] [/过滤] [?帮助]"
 	}
 	if m.readOnly && m.view != viewGate && m.view != viewHub {
 		text += "  （只读）"

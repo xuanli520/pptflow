@@ -98,23 +98,30 @@ func (m model) cloneForUpdate() model {
 	m.hubItems = append([]store.RunWithTask(nil), m.hubItems...)
 	m.hubRowPaths = append([]string(nil), m.hubRowPaths...)
 	m.hubScanRoots = append([]string(nil), m.hubScanRoots...)
+	m.taskHub = m.taskHub.Clone()
+	if m.taskHubPlan != nil {
+		preview := m.taskHubPlan.Clone()
+		m.taskHubPlan = &preview
+	}
+	if m.taskHubPlanCommand != nil {
+		command := *m.taskHubPlanCommand
+		command.Target = m.taskHubPlanCommand.Target
+		m.taskHubPlanCommand = &command
+	}
+	if m.taskHubDetail != nil {
+		m.taskHubDetail = m.taskHubDetail.Clone()
+	}
+	if m.taskHubMutation != nil {
+		m.taskHubMutation = m.taskHubMutation.Clone()
+	}
 	m.runtimeOpts.HarborAgentEnv = append([]string(nil), m.runtimeOpts.HarborAgentEnv...)
 	m.focusMgr.stack = append([]focusArea(nil), m.focusMgr.stack...)
 	if m.confirm != nil {
 		confirmation := *m.confirm
 		m.confirm = &confirmation
 	}
-	if m.runConfig != nil {
-		clone := *m.runConfig
-		m.runConfig = &clone
-	}
-	if m.taskRepair != nil {
-		clone := *m.taskRepair
-		m.taskRepair = &clone
-	}
-	if m.resumeOverlay != nil {
-		clone := *m.resumeOverlay
-		m.resumeOverlay = &clone
+	if m.runControl != nil {
+		m.runControl = m.runControl.Clone()
 	}
 	return m
 }

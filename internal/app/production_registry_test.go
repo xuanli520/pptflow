@@ -50,3 +50,18 @@ func TestProductionRegistryCoversEvidenceImportBranches(t *testing.T) {
 		}
 	}
 }
+
+func TestProductionRegistryExcludesLegacyExternalDeliveryRoutes(t *testing.T) {
+	registry, err := buildProductionRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range []workflow.NodeSpec{
+		{ID: nodes.PublishTask, Kind: "harborfactory.publish_task"},
+		{ID: nodes.Package, Kind: "harborfactory.package"},
+	} {
+		if plugin, lookupErr := registry.Lookup(spec); lookupErr == nil || plugin != nil {
+			t.Fatalf("legacy external delivery kind %q remains production-reachable: plugin=%T err=%v", spec.Kind, plugin, lookupErr)
+		}
+	}
+}
