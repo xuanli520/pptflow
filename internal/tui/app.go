@@ -83,6 +83,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		preview := msg.preview.Clone()
 		m.taskHubPlan = &preview
 		command := msg.command
+		// A CodeEdge package plan chooses the exact approved frozen Run at the
+		// application boundary. Keep the confirmation target aligned with that
+		// checkpoint so a later selection change cannot make the form appear to
+		// authorize a different Run.
+		if command.Action == TaskHubActionPackageRevision && strings.TrimSpace(preview.Expected.RunID) != "" {
+			command.Target.TaskID = strings.TrimSpace(preview.Expected.TaskID)
+			command.Target.RevisionID = strings.TrimSpace(preview.Expected.RevisionID)
+			command.Target.RunID = strings.TrimSpace(preview.Expected.RunID)
+			m.taskHub.SelectedTaskID = command.Target.TaskID
+			m.taskHub.SelectedRunID = command.Target.RunID
+		}
 		m.taskHubPlanCommand = &command
 		m.notice = "已生成 " + taskHubActionLabel(msg.command.Action) + " 的计划预览。"
 		return m, m.showToast("计划预览已更新", toastSuccess)

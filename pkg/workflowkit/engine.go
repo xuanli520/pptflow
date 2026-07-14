@@ -153,8 +153,9 @@ func (plan ExecutionPlan) Clone() ExecutionPlan {
 }
 
 // CompileDependencyExecutionPlan freezes the default initial scheduling
-// policy: all stages at the same DAG dependency level are placed in one batch.
-// This is the parallel-by-dependency-level policy selected for new Runs.
+// policy: every automatically dispatchable stage at the same DAG dependency
+// level is placed in one batch. Operator-only stages remain in the frozen DAG
+// as readiness contracts, but never become durable worker jobs.
 func CompileDependencyExecutionPlan(workflow WorkflowDescriptor) (ExecutionPlan, error) {
 	if err := workflow.Validate(); err != nil {
 		return ExecutionPlan{}, fmt.Errorf("%w: workflow: %v", ErrInvalidExecution, err)
@@ -176,13 +177,17 @@ func CompileDependencyExecutionPlan(workflow WorkflowDescriptor) (ExecutionPlan,
 			maxLevel = level
 		}
 	}
-	batches := make([]ScheduleBatch, maxLevel+1)
-	for level := range batches {
-		batches[level].ID = fmt.Sprintf("dependency-level-%03d", level+1)
-	}
-	for _, stage := range workflow.Stages {
-		level := levels[stage.Key]
-		batches[level].NodeIDs = append(batches[level].NodeIDs, NodeID(stage.Key))
+	batches := make([]ScheduleBatch, 0, maxLevel+1)
+	for level := 0; level <= maxLevel; level++ {
+		batch := ScheduleBatch{ID: fmt.Sprintf("dependency-level-%03d", level+1)}
+		for _, stage := range workflow.Stages {
+			if levels[stage.Key] == level && stage.AutomaticallyDispatchable() {
+				batch.NodeIDs = append(batch.NodeIDs, NodeID(stage.Key))
+			}
+		}
+		if len(batch.NodeIDs) != 0 {
+			batches = append(batches, batch)
+		}
 	}
 	return FreezeExecutionPlan(workflow, batches)
 }
@@ -206,8 +211,9 @@ func FreezeExecutionPlan(workflow WorkflowDescriptor, batches []ScheduleBatch) (
 	return plan, nil
 }
 
-// Validate verifies that a frozen execution plan remains a valid complete
-// partition of the supplied frozen workflow.
+// Validate verifies that a frozen execution plan remains a complete partition
+// of every automatically dispatchable stage in the supplied frozen workflow.
+// Operator-only stages must remain absent from the plan.
 func (plan ExecutionPlan) Validate(workflow WorkflowDescriptor) error {
 	if err := plan.validate(workflow); err != nil {
 		return err
@@ -229,7 +235,13 @@ func (plan ExecutionPlan) validate(workflow WorkflowDescriptor) error {
 	if err := workflow.Validate(); err != nil {
 		return fmt.Errorf("%w: workflow: %v", ErrInvalidExecution, err)
 	}
-	if len(plan.Batches) == 0 {
+	automaticStages := 0
+	for _, stage := range workflow.Stages {
+		if stage.AutomaticallyDispatchable() {
+			automaticStages++
+		}
+	}
+	if len(plan.Batches) == 0 && automaticStages != 0 {
 		return fmt.Errorf("%w: execution plan requires at least one batch", ErrInvalidExecution)
 	}
 	stageBatch := make(map[StageKey]int, len(workflow.Stages))
@@ -250,16 +262,23 @@ func (plan ExecutionPlan) validate(workflow WorkflowDescriptor) error {
 			if _, exists := stageBatch[key]; exists {
 				return fmt.Errorf("%w: stage %q appears in multiple execution batches", ErrInvalidExecution, key)
 			}
-			if _, found := workflow.Stage(key); !found {
+			stage, found := workflow.Stage(key)
+			if !found {
 				return fmt.Errorf("%w: execution plan references unknown stage %q", ErrInvalidExecution, key)
+			}
+			if !stage.AutomaticallyDispatchable() {
+				return fmt.Errorf("%w: execution plan schedules operator-only stage %q", ErrInvalidExecution, key)
 			}
 			stageBatch[key] = index
 		}
 	}
-	if len(stageBatch) != len(workflow.Stages) {
-		return fmt.Errorf("%w: execution plan must include every workflow stage", ErrInvalidExecution)
+	if len(stageBatch) != automaticStages {
+		return fmt.Errorf("%w: execution plan must include every automatically dispatchable workflow stage", ErrInvalidExecution)
 	}
 	for _, stage := range workflow.Stages {
+		if !stage.AutomaticallyDispatchable() {
+			continue
+		}
 		for _, dependency := range stage.Dependencies {
 			if stageBatch[dependency] >= stageBatch[stage.Key] {
 				return fmt.Errorf("%w: stage %q dependency %q is not in an earlier batch", ErrInvalidExecution, stage.Key, dependency)
@@ -1071,6 +1090,9 @@ func (engine *Engine) HandleClaim(ctx context.Context, claim JobClaim) (JobTermi
 
 func (engine *Engine) handleStageClaim(ctx context.Context, claim JobClaim) (JobTerminalState, error) {
 	stageClaim := claim.Stage.Clone()
+	if !stageClaim.Stage.AutomaticallyDispatchable() {
+		return engine.rejectStageClaim(ctx, claim, fmt.Errorf("%w: operator-only stage %q cannot execute from a generic worker claim", ErrInvalidJobClaim, stageClaim.Stage.Key))
+	}
 	executor, err := engine.executors.ResolvePlugin(stageClaim.Stage.Plugin)
 	if err != nil {
 		return engine.rejectStageClaim(ctx, claim, err)

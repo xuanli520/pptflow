@@ -9,6 +9,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -327,16 +328,41 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 		if strings.TrimSpace(revision.ValidationEvidenceManifest) == "" {
 			return unavailableTaskHubPlan(command.Action, "revision 缺少验证证据清单，不能创建本地 package"), nil
 		}
-		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, revision.ID, "", "")
+		runs, err := services.Runs.ListForTask(ctx, target.task.ID)
+		if err != nil {
+			return TaskHubPlanPreview{}, fmt.Errorf("list Runs for CodeEdge package authorization: %w", err)
+		}
+		preferredRunID := ""
+		if target.run != nil {
+			preferredRunID = target.run.ID
+		}
+		authorization, unavailable, err := taskHubCodeEdgePackageAuthorization(ctx, services, target.task, revision, runs, preferredRunID)
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		if unavailable != "" {
+			return unavailableTaskHubPlan(command.Action, unavailable), nil
+		}
+		selectedRunID := ""
+		executionScope := []string{target.task.ID, revision.ID}
+		reason := "当前 revision 已验证，并绑定了验证证据。"
+		summary := "确认后只会在 Harbor Flow 受管目录生成不可变本地 package；不会上传、复制到外部目的地或调用 provider。"
+		if authorization != nil {
+			selectedRunID = authorization.Run.ID
+			executionScope = append(executionScope, authorization.Run.ID, authorization.Record.ID)
+			reason = "当前 revision 存在 CodeEdge Phase-1 Run；已选择与当前 TaskRevision/digest 绑定的 approved 最终合规记录。"
+			summary = "确认后只会在 Harbor Flow 受管目录生成不可变本地 package；已冻结选中 CodeEdge Run、最终合规记录和授权指纹；不会上传、复制到外部目的地或调用 provider。"
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, revision.ID, selectedRunID, "")
 		if err != nil {
 			return TaskHubPlanPreview{}, err
 		}
 		return TaskHubPlanPreview{
 			Title:              "生成本地 package",
-			Summary:            "确认后只会在 Harbor Flow 受管目录生成不可变本地 package；不会上传、复制到外部目的地或调用 provider。",
-			Reason:             "当前 revision 已验证，并绑定了验证证据。",
+			Summary:            summary,
+			Reason:             reason,
 			RevisionImpact:     "revision 内容和 digest 不变；仅记录本地 package receipt。",
-			ExecutionScope:     []string{target.task.ID, revision.ID},
+			ExecutionScope:     executionScope,
 			ConfirmationNeeded: true,
 			Expected:           expected,
 		}, nil
@@ -1056,41 +1082,45 @@ func (adapter *AppTaskHubLifecycleAdapter) captureTaskHubReviewCheckpoint(ctx co
 
 func taskHubLifecycleCheckpoint(checkpoint app.LifecycleMutationCheckpoint) TaskHubLifecycleCheckpoint {
 	return TaskHubLifecycleCheckpoint{
-		TaskID:               checkpoint.TaskID,
-		TaskVersion:          checkpoint.TaskVersion,
-		RevisionID:           checkpoint.RevisionID,
-		RevisionStateVersion: checkpoint.RevisionStateVersion,
-		RevisionDigest:       checkpoint.RevisionDigest,
-		RunID:                checkpoint.RunID,
-		RunVersion:           checkpoint.RunVersion,
-		RunExecutionEpoch:    checkpoint.RunExecutionEpoch,
-		RunDefinitionHash:    checkpoint.RunDefinitionHash,
-		ReleaseID:            checkpoint.ReleaseID,
-		ReleaseRecordVersion: checkpoint.ReleaseRecordVersion,
-		ReviewRequestID:      checkpoint.ReviewRequestID,
-		ReviewRevisionID:     checkpoint.ReviewRevisionID,
-		ReviewState:          checkpoint.ReviewState,
-		ReviewEvidenceDigest: checkpoint.ReviewEvidenceDigest,
+		TaskID:                           checkpoint.TaskID,
+		TaskVersion:                      checkpoint.TaskVersion,
+		RevisionID:                       checkpoint.RevisionID,
+		RevisionStateVersion:             checkpoint.RevisionStateVersion,
+		RevisionDigest:                   checkpoint.RevisionDigest,
+		RunID:                            checkpoint.RunID,
+		RunVersion:                       checkpoint.RunVersion,
+		RunExecutionEpoch:                checkpoint.RunExecutionEpoch,
+		RunDefinitionHash:                checkpoint.RunDefinitionHash,
+		CodeEdgeComplianceRecordID:       checkpoint.CodeEdgeComplianceRecordID,
+		CodeEdgeAuthorizationFingerprint: checkpoint.CodeEdgeAuthorizationFingerprint,
+		ReleaseID:                        checkpoint.ReleaseID,
+		ReleaseRecordVersion:             checkpoint.ReleaseRecordVersion,
+		ReviewRequestID:                  checkpoint.ReviewRequestID,
+		ReviewRevisionID:                 checkpoint.ReviewRevisionID,
+		ReviewState:                      checkpoint.ReviewState,
+		ReviewEvidenceDigest:             checkpoint.ReviewEvidenceDigest,
 	}
 }
 
 func appLifecycleMutationCheckpoint(checkpoint TaskHubLifecycleCheckpoint) app.LifecycleMutationCheckpoint {
 	return app.LifecycleMutationCheckpoint{
-		TaskID:               strings.TrimSpace(checkpoint.TaskID),
-		TaskVersion:          checkpoint.TaskVersion,
-		RevisionID:           strings.TrimSpace(checkpoint.RevisionID),
-		RevisionStateVersion: checkpoint.RevisionStateVersion,
-		RevisionDigest:       strings.TrimSpace(checkpoint.RevisionDigest),
-		RunID:                strings.TrimSpace(checkpoint.RunID),
-		RunVersion:           checkpoint.RunVersion,
-		RunExecutionEpoch:    checkpoint.RunExecutionEpoch,
-		RunDefinitionHash:    strings.TrimSpace(checkpoint.RunDefinitionHash),
-		ReleaseID:            strings.TrimSpace(checkpoint.ReleaseID),
-		ReleaseRecordVersion: checkpoint.ReleaseRecordVersion,
-		ReviewRequestID:      strings.TrimSpace(checkpoint.ReviewRequestID),
-		ReviewRevisionID:     strings.TrimSpace(checkpoint.ReviewRevisionID),
-		ReviewState:          strings.TrimSpace(checkpoint.ReviewState),
-		ReviewEvidenceDigest: strings.TrimSpace(checkpoint.ReviewEvidenceDigest),
+		TaskID:                           strings.TrimSpace(checkpoint.TaskID),
+		TaskVersion:                      checkpoint.TaskVersion,
+		RevisionID:                       strings.TrimSpace(checkpoint.RevisionID),
+		RevisionStateVersion:             checkpoint.RevisionStateVersion,
+		RevisionDigest:                   strings.TrimSpace(checkpoint.RevisionDigest),
+		RunID:                            strings.TrimSpace(checkpoint.RunID),
+		RunVersion:                       checkpoint.RunVersion,
+		RunExecutionEpoch:                checkpoint.RunExecutionEpoch,
+		RunDefinitionHash:                strings.TrimSpace(checkpoint.RunDefinitionHash),
+		CodeEdgeComplianceRecordID:       strings.TrimSpace(checkpoint.CodeEdgeComplianceRecordID),
+		CodeEdgeAuthorizationFingerprint: strings.TrimSpace(checkpoint.CodeEdgeAuthorizationFingerprint),
+		ReleaseID:                        strings.TrimSpace(checkpoint.ReleaseID),
+		ReleaseRecordVersion:             checkpoint.ReleaseRecordVersion,
+		ReviewRequestID:                  strings.TrimSpace(checkpoint.ReviewRequestID),
+		ReviewRevisionID:                 strings.TrimSpace(checkpoint.ReviewRevisionID),
+		ReviewState:                      strings.TrimSpace(checkpoint.ReviewState),
+		ReviewEvidenceDigest:             strings.TrimSpace(checkpoint.ReviewEvidenceDigest),
 	}
 }
 
@@ -1306,7 +1336,14 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTask(ctx context.Context, serv
 		projection.ActiveReviewID = activeReview.ID
 		projection.ActiveReviewRevisionID = activeReview.RevisionID
 	}
-	projection.Actions = appTaskHubTaskActions(task, current, activeReview != nil, services.Mutations != nil)
+	codeEdgePackageUnavailable := ""
+	if current != nil {
+		_, codeEdgePackageUnavailable, err = taskHubCodeEdgePackageAuthorization(ctx, services, task, *current, runs, "")
+		if err != nil {
+			return TaskHubTask{}, nil, nil, fmt.Errorf("read CodeEdge package authorization for Task %s: %w", task.ID, err)
+		}
+	}
+	projection.Actions = appTaskHubTaskActions(task, current, activeReview != nil, services.Mutations != nil, codeEdgePackageUnavailable)
 
 	resultRuns := make([]TaskHubRun, 0, len(runs))
 	queued := make([]taskHubQueuedRun, 0)
@@ -1620,7 +1657,137 @@ func appTaskHubGlobalActions(mutationsAvailable bool) []TaskHubActionState {
 	}
 }
 
-func appTaskHubTaskActions(task store.TaskV2, current *store.TaskRevision, hasSingleOpenReview, mutationsAvailable bool) []TaskHubActionState {
+// taskHubCodeEdgePackageAuthorization is a read-only preflight for the TUI.
+// It does not treat a stored record as sufficient proof to package: the
+// application service repeats the full manifest, catalog, lock, artifact,
+// trial, and review verification when the confirmation is executed. Its only
+// purpose here is to select the exact immutable Run/record checkpoint or to
+// make the missing approval visible before the operator opens a form.
+type taskHubCodeEdgePackageAuthorizationBinding struct {
+	Run    store.WorkflowRun
+	Record store.CodeEdgeComplianceRecord
+}
+
+func taskHubCodeEdgePackageAuthorization(ctx context.Context, services *app.LifecycleServices, task store.TaskV2, revision store.TaskRevision, runs []store.WorkflowRun, preferredRunID string) (*taskHubCodeEdgePackageAuthorizationBinding, string, error) {
+	if services == nil || services.Store() == nil {
+		return nil, "", fmt.Errorf("CodeEdge package authorization store is unavailable")
+	}
+	codeEdgeRuns := taskHubCodeEdgeRuns(task, revision, runs)
+	recordsByRun := make(map[string]*store.CodeEdgeComplianceRecord)
+	preferredRunID = strings.TrimSpace(preferredRunID)
+	if preferred := taskHubCodeEdgeRunByID(codeEdgeRuns, preferredRunID); preferred != nil {
+		record, err := services.Store().GetCodeEdgeComplianceRecordForRun(ctx, preferred.ID)
+		if err != nil {
+			return nil, "", fmt.Errorf("read CodeEdge final compliance for Run %s: %w", preferred.ID, err)
+		}
+		recordsByRun[preferred.ID] = record
+		selected, unavailable := selectTaskHubCodeEdgePackageAuthorization(task, revision, runs, recordsByRun, preferred.ID)
+		return selected, unavailable, nil
+	}
+	for _, run := range codeEdgeRuns {
+		record, err := services.Store().GetCodeEdgeComplianceRecordForRun(ctx, run.ID)
+		if err != nil {
+			return nil, "", fmt.Errorf("read CodeEdge final compliance for Run %s: %w", run.ID, err)
+		}
+		recordsByRun[run.ID] = record
+	}
+	selected, unavailable := selectTaskHubCodeEdgePackageAuthorization(task, revision, runs, recordsByRun, preferredRunID)
+	return selected, unavailable, nil
+}
+
+func selectTaskHubCodeEdgePackageAuthorization(task store.TaskV2, revision store.TaskRevision, runs []store.WorkflowRun, recordsByRun map[string]*store.CodeEdgeComplianceRecord, preferredRunID string) (*taskHubCodeEdgePackageAuthorizationBinding, string) {
+	codeEdgeRuns := taskHubCodeEdgeRuns(task, revision, runs)
+	if len(codeEdgeRuns) == 0 {
+		return nil, ""
+	}
+	preferredRunID = strings.TrimSpace(preferredRunID)
+	if preferred := taskHubCodeEdgeRunByID(codeEdgeRuns, preferredRunID); preferred != nil {
+		return taskHubPreferredCodeEdgePackageAuthorization(task, revision, *preferred, recordsByRun[preferred.ID])
+	}
+
+	candidates := make([]taskHubCodeEdgePackageAuthorizationBinding, 0, len(codeEdgeRuns))
+	hasRecord := false
+	hasApprovedRecord := false
+	hasMismatchedApprovedRecord := false
+	for _, run := range codeEdgeRuns {
+		record := recordsByRun[run.ID]
+		if record == nil {
+			continue
+		}
+		hasRecord = true
+		if record.Status != store.CodeEdgeComplianceApproved {
+			continue
+		}
+		hasApprovedRecord = true
+		if record.RunID != run.ID || record.TaskID != task.ID || record.RevisionID != revision.ID || record.TaskDigest != revision.TaskDigest ||
+			workflowkit.Fingerprint(strings.TrimSpace(record.AuthorizationFingerprint)).Validate() != nil {
+			hasMismatchedApprovedRecord = true
+			continue
+		}
+		candidates = append(candidates, taskHubCodeEdgePackageAuthorizationBinding{Run: run, Record: *record})
+	}
+	if len(candidates) == 0 {
+		switch {
+		case !hasRecord:
+			return nil, "当前 revision 存在 CodeEdge Phase-1 Run，但没有已批准的最终合规记录，不能创建本地 package"
+		case !hasApprovedRecord:
+			return nil, "当前 revision 的 CodeEdge Phase-1 Run 没有已批准的最终合规记录，不能创建本地 package"
+		case hasMismatchedApprovedRecord:
+			return nil, "当前 revision 的 CodeEdge 已批准合规记录未与当前 TaskRevision/digest 和授权指纹一致绑定，不能创建本地 package"
+		default:
+			return nil, "当前 revision 的 CodeEdge Phase-1 Run 没有可用的已批准最终合规记录，不能创建本地 package"
+		}
+	}
+
+	sort.SliceStable(candidates, func(left, right int) bool {
+		if !candidates[left].Run.CreatedAt.Equal(candidates[right].Run.CreatedAt) {
+			return candidates[left].Run.CreatedAt.After(candidates[right].Run.CreatedAt)
+		}
+		return candidates[left].Run.ID < candidates[right].Run.ID
+	})
+	selected := candidates[0]
+	return &selected, ""
+}
+
+func taskHubCodeEdgeRuns(task store.TaskV2, revision store.TaskRevision, runs []store.WorkflowRun) []store.WorkflowRun {
+	codeEdgeRuns := make([]store.WorkflowRun, 0)
+	for _, run := range runs {
+		if run.TaskID == task.ID && run.RevisionID == revision.ID && taskHubIsCodeEdgePhase1Run(run) {
+			codeEdgeRuns = append(codeEdgeRuns, run)
+		}
+	}
+	return codeEdgeRuns
+}
+
+func taskHubCodeEdgeRunByID(runs []store.WorkflowRun, runID string) *store.WorkflowRun {
+	for index := range runs {
+		if runs[index].ID == runID {
+			return &runs[index]
+		}
+	}
+	return nil
+}
+
+func taskHubPreferredCodeEdgePackageAuthorization(task store.TaskV2, revision store.TaskRevision, run store.WorkflowRun, record *store.CodeEdgeComplianceRecord) (*taskHubCodeEdgePackageAuthorizationBinding, string) {
+	if record == nil {
+		return nil, "指定的 CodeEdge Phase-1 Run 没有已批准的最终合规记录，不能创建本地 package"
+	}
+	if record.Status != store.CodeEdgeComplianceApproved {
+		return nil, "指定的 CodeEdge Phase-1 Run 的最终合规记录尚未批准，不能创建本地 package"
+	}
+	if record.RunID != run.ID || record.TaskID != task.ID || record.RevisionID != revision.ID || record.TaskDigest != revision.TaskDigest ||
+		workflowkit.Fingerprint(strings.TrimSpace(record.AuthorizationFingerprint)).Validate() != nil {
+		return nil, "指定的 CodeEdge Phase-1 Run 的已批准合规记录未与当前 TaskRevision/digest 和授权指纹一致绑定，不能创建本地 package"
+	}
+	return &taskHubCodeEdgePackageAuthorizationBinding{Run: run, Record: *record}, ""
+}
+
+func taskHubIsCodeEdgePhase1Run(run store.WorkflowRun) bool {
+	return run.WorkflowTemplateID == workflowadapter.CodeEdgePhase1WorkflowTemplateID &&
+		run.WorkflowTemplateVersion == workflowadapter.CodeEdgePhase1WorkflowTemplateVersion
+}
+
+func appTaskHubTaskActions(task store.TaskV2, current *store.TaskRevision, hasSingleOpenReview, mutationsAvailable bool, codeEdgePackageUnavailable string) []TaskHubActionState {
 	if !mutationsAvailable {
 		return []TaskHubActionState{
 			{Action: TaskHubActionEditTask, DisabledReason: "LifecycleMutationService 不可用"},
@@ -1639,7 +1806,13 @@ func appTaskHubTaskActions(task store.TaskV2, current *store.TaskRevision, hasSi
 	hasCurrentRevision := current != nil
 	packageable := hasCurrentRevision &&
 		(current.State == store.RevisionStateValidated || current.State == store.RevisionStateReleased) &&
-		strings.TrimSpace(current.ValidationEvidenceManifest) != ""
+		strings.TrimSpace(current.ValidationEvidenceManifest) != "" &&
+		strings.TrimSpace(codeEdgePackageUnavailable) == ""
+	packageReason := "需要当前且已验证的 TaskRevision"
+	if hasCurrentRevision && (current.State == store.RevisionStateValidated || current.State == store.RevisionStateReleased) &&
+		strings.TrimSpace(current.ValidationEvidenceManifest) != "" && strings.TrimSpace(codeEdgePackageUnavailable) != "" {
+		packageReason = strings.TrimSpace(codeEdgePackageUnavailable)
+	}
 	actions := []TaskHubActionState{
 		{Action: TaskHubActionEditTask, Enabled: false, DisabledReason: "需要选择当前 TaskRevision 对应的 Run"},
 		{Action: TaskHubActionForkTask, Enabled: hasCurrentRevision, DisabledReason: "当前 Task 没有可 Fork 的 revision"},
@@ -1650,7 +1823,7 @@ func appTaskHubTaskActions(task store.TaskV2, current *store.TaskRevision, hasSi
 		{Action: TaskHubActionApproveReview, Enabled: hasSingleOpenReview, DisabledReason: "需要唯一且打开的 ReviewRequest"},
 		{Action: TaskHubActionRequestChanges, Enabled: hasSingleOpenReview, DisabledReason: "需要唯一且打开的 ReviewRequest"},
 		{Action: TaskHubActionRejectReview, Enabled: hasSingleOpenReview, DisabledReason: "需要唯一且打开的 ReviewRequest"},
-		{Action: TaskHubActionPackageRevision, Enabled: packageable, DisabledReason: "需要当前且已验证的 TaskRevision"},
+		{Action: TaskHubActionPackageRevision, Enabled: packageable, DisabledReason: packageReason},
 		{Action: TaskHubActionWithdrawRelease, Enabled: false, DisabledReason: "请从详情“本地包”分类选择明确的未撤回 release"},
 	}
 	for index := range actions {

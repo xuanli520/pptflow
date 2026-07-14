@@ -73,6 +73,16 @@ func TestTaskContinuationPlanIsFrozenIdempotentAndCoversEveryStage(t *testing.T)
 		if isContentChangingStage(stage) && transition.Disposition != workflowkit.DispositionPreserve {
 			t.Fatalf("no-content plan scheduled content-changing stage: %+v", transition)
 		}
+		if transition.NodeID == workflowkit.NodeID(workflowadapter.Package) && transition.Disposition != workflowkit.DispositionOperatorOnly {
+			t.Fatalf("no-content plan did not retain package as operator-only: %+v", transition)
+		}
+	}
+	for _, batch := range snapshot.Schedule {
+		for _, nodeID := range batch.NodeIDs {
+			if nodeID == workflowkit.NodeID(workflowadapter.Package) {
+				t.Fatalf("no-content continuation scheduled package: %#v", snapshot.Schedule)
+			}
+		}
 	}
 
 	fixture.services.core.now = func() time.Time { return plannedAt.Add(time.Hour) }
@@ -256,6 +266,15 @@ func TestTaskContinuationRejectsContentChangingStagesWithoutCandidate(t *testing
 				t.Fatalf("content-changing target error = %v, want ErrTaskContinuationTarget", err)
 			}
 		})
+	}
+}
+
+func TestTaskContinuationRejectsOperatorOnlyPackageStage(t *testing.T) {
+	ctx := context.Background()
+	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
+	_, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "operator-only-package", []workflowkit.NodeID{workflowadapter.Package}, true))
+	if !errors.Is(err, ErrTaskContinuationTarget) {
+		t.Fatalf("operator-only package continuation error = %v, want ErrTaskContinuationTarget", err)
 	}
 }
 
@@ -841,11 +860,8 @@ func continuationCommand(t *testing.T, ctx context.Context, fixture continuation
 		Expected:      checkpoint,
 		TargetNodeIDs: append([]workflowkit.NodeID(nil), targets...),
 		ForceSelected: force,
-		ExternalEffectConfirmations: []workflowkit.ExternalEffectConfirmation{{
-			NodeID: workflowadapter.Package, IdempotencyKey: key + ":package", Actor: "tester", ConfirmedAt: time.Now().UTC(),
-		}},
-		Actor:  "tester",
-		Reason: fmt.Sprintf("continue fixture %s", key),
+		Actor:         "tester",
+		Reason:        fmt.Sprintf("continue fixture %s", key),
 	}
 }
 

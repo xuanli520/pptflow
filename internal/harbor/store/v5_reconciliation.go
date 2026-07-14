@@ -109,6 +109,25 @@ func (s *Store) GetSideEffectOperation(ctx context.Context, operationID string) 
 	return &operation, nil
 }
 
+// GetSideEffectOperationByOperationKey reads the immutable operation fence
+// before a worker decides whether an external call is still safe to invoke.
+// The operation key, rather than a delivery job ID, is the durable identity
+// across worker lease recovery.
+func (s *Store) GetSideEffectOperationByOperationKey(ctx context.Context, operationKey string) (*SideEffectOperation, error) {
+	key, err := normalizeRequired(operationKey, "side effect operation key")
+	if err != nil {
+		return nil, err
+	}
+	operation, err := scanSideEffectOperation(s.db.QueryRowContext(ctx, sideEffectOperationV5Select+" WHERE operation_key = ?", key))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &operation, nil
+}
+
 func (s *Store) TransitionSideEffectOperation(ctx context.Context, request TransitionSideEffectOperationRequest) (SideEffectOperation, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return SideEffectOperation{}, err
@@ -293,6 +312,25 @@ func (s *Store) CompleteReconciliationAttempt(ctx context.Context, request Compl
 		return ReconciliationAttempt{}, err
 	}
 	return attempt, nil
+}
+
+// GetReconciliationAttemptByOperationKey returns the idempotent
+// reconciliation record for an externally visible operation. It is useful to
+// a reconciler and to read-only lifecycle projections without exposing write
+// access to the attempt.
+func (s *Store) GetReconciliationAttemptByOperationKey(ctx context.Context, operationKey string) (*ReconciliationAttempt, error) {
+	key, err := normalizeRequired(operationKey, "reconciliation operation key")
+	if err != nil {
+		return nil, err
+	}
+	attempt, err := scanReconciliationAttempt(s.db.QueryRowContext(ctx, reconciliationAttemptV5Select+" WHERE operation_key = ?", key))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &attempt, nil
 }
 
 type preparedSideEffectOperation struct {

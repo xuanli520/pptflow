@@ -7,10 +7,14 @@ const (
 	// closed production descriptor selected for CodeEdge Phase-1. It does not
 	// mutate or reinterpret the complete Standard lifecycle template.
 	CodeEdgePhase1WorkflowTemplateID      = "harbor.codeedge-phase1"
-	CodeEdgePhase1WorkflowTemplateVersion = "1.0.0"
+	CodeEdgePhase1WorkflowTemplateVersion = "2.1.0"
+	// CodeEdgeSubmissionReportSchemaVersion is the typed submission report
+	// consumed by final compliance, the result review gate, and packaging.
+	// Changing this schema changes the frozen workflow contract.
+	CodeEdgeSubmissionReportSchemaVersion = "codeedge.submission-report.v1"
 
 	codeEdgePhase1CatalogID      = "harbor.codeedge-phase1-stage-catalog"
-	codeEdgePhase1CatalogVersion = "1.0.0"
+	codeEdgePhase1CatalogVersion = "2.1.0"
 )
 
 // CodeEdgePhase1TemplateReference returns the immutable identity used by
@@ -126,9 +130,9 @@ func CodeEdgePhase1StageCatalog() StageCatalog {
 			gateStage(FinalReview, StageFinalReview, []string{SimilarityCheck}, ReviewFinalQuality, []workflowkit.ResourceKey{resourceEvidenceQuality, resourceEvidenceSimilarity}, []workflowkit.ResourceKey{resourceReviewFinalQuality}, artifactInput("quality_report"), artifactInput("similarity_report")),
 			codeEdgeEvaluationStage(HarborRunQwen, []string{FinalReview}, "harborfactory.harbor_run_qwen", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluationQwen}, artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutput("qwen_trial_result"), artifactOutput("qwen_pass4_evidence")),
 			codeEdgeEvaluationStage(HarborRunOpus, []string{HarborRunQwen}, "harborfactory.harbor_run_opus", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluationOpus}, artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutput("opus_trial_result"), artifactOutput("opus_pass4_evidence")),
-			stage(SubmissionLint, StageSubmission, []string{HarborRunQwen, HarborRunOpus}, "harborfactory.codeedge_lint", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus}, []workflowkit.ResourceKey{resourceEvidenceSubmissionLint}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), artifactInput("qwen_trial_result"), artifactInput("opus_trial_result"), artifactOutput("submission_lint_report")),
-			gateStage(ResultReview, StageSubmission, []string{SubmissionLint}, ReviewModelResult, []workflowkit.ResourceKey{resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus, resourceEvidenceSubmissionLint}, []workflowkit.ResourceKey{resourceReviewModelResult}, artifactInput("qwen_trial_result"), artifactInput("opus_trial_result"), artifactInput("submission_lint_report")),
-			stage(Package, StageDelivery, []string{ResultReview}, "harborfactory.local_package", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceSubmissionLint, resourceReviewModelResult}, []workflowkit.ResourceKey{resourceDeliveryPackage}, workflowkit.EffectExternalSideEffect, 1, deliveryVerdicts(), artifactInput("task_snapshot"), artifactInput("submission_lint_report"), reviewDecisionInput("model_result_decision"), artifactOutput("package_bundle")),
+			stage(SubmissionLint, StageSubmission, []string{HarborRunQwen, HarborRunOpus}, "harborfactory.codeedge_lint", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus}, []workflowkit.ResourceKey{resourceEvidenceSubmissionLint}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), artifactInput("qwen_trial_result"), artifactInput("opus_trial_result"), artifactOutputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion)),
+			gateStage(ResultReview, StageSubmission, []string{SubmissionLint}, ReviewModelResult, []workflowkit.ResourceKey{resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus, resourceEvidenceSubmissionLint}, []workflowkit.ResourceKey{resourceReviewModelResult}, artifactInput("qwen_trial_result"), artifactInput("opus_trial_result"), artifactInputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion)),
+			operatorOnlyLocalPackageStage([]string{ResultReview}, []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceSubmissionLint, resourceReviewModelResult}, []workflowkit.ResourceKey{resourceDeliveryPackage}, artifactInput("task_snapshot"), artifactInputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion), reviewDecisionInput("model_result_decision"), artifactOutput("package_bundle")),
 		},
 	}
 }

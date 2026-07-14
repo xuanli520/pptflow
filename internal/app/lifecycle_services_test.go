@@ -1,8 +1,10 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +22,67 @@ func newLifecycleServicesForTest(root string, dataStore *store.Store) (*Lifecycl
 	return NewLifecycleServicesWithOptions(root, dataStore, LifecycleServicesOptions{
 		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
 	})
+}
+
+func TestLifecycleServicesInstallsOnlyExplicitExternalChangeProviders(t *testing.T) {
+	root := t.TempDir()
+	database, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+		ChangeProviders:   []ChangeProvider{testChangeProvider{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := services.Changes.providers[testChangeProvider{}.ID()]; !found {
+		t.Fatal("explicit change provider was not installed at lifecycle composition")
+	}
+	if _, found := services.Changes.providers[AgentRepairProviderID]; found {
+		t.Fatal("ambient agent repair provider was installed without an explicit composition entry")
+	}
+}
+
+func TestLifecycleServicesExposesOnlyCatalogLockAttestedWorkerResolver(t *testing.T) {
+	root := t.TempDir()
+	database, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	taskID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	specification := testsupport.CompleteRunExecutionSpec(taskID, revisionID, "harbor.task.v2:sha256:"+strings.Repeat("a", 64))
+	resolver := catalogLockAttestedResolverForSpec(t, specification, "worker-composition-catalog", "v1", "lock-v1")
+	services := catalogLockLifecycleServices(t, root, database, resolver)
+	if got := services.CatalogLockAttestedWorkflowkitProviderResolver(); got != resolver {
+		t.Fatal("catalog-lock-attested resolver was not preserved for controlled worker composition")
+	}
+
+	nonProductionRoot := t.TempDir()
+	nonProductionDB, err := store.Open(nonProductionRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nonProductionDB.Close()
+	nonProduction, err := NewLifecycleServicesWithOptions(nonProductionRoot, nonProductionDB, LifecycleServicesOptions{
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nonProduction.CatalogLockAttestedWorkflowkitProviderResolver(); got != nil {
+		t.Fatal("non-production resolver was exposed to the worker as a production provider composition")
+	}
 }
 
 func TestLifecycleServicesMaterializeImmutableRevisionAndGateCurrentPromotion(t *testing.T) {
@@ -190,7 +253,7 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 		t.Fatal("run accepted an absent implicit profile")
 	}
 	profile := lifecycleCompleteProfile(t)
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{
+	request := StartRunRequest{
 		TaskID:         task.ID,
 		RevisionID:     revision.ID,
 		Profile:        profile,
@@ -199,7 +262,8 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 		ExecutionEpoch: 0,
 		Actor:          "tester",
 		Reason:         "freeze run fixture",
-	})
+	}
+	run, err := services.Runs.StartRun(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,12 +302,50 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 	if manifest.Resolved.DefinitionFingerprint == "" || manifest.Resolved.ExecutionProfileFingerprint == "" || manifest.Resolved.ContinuationPlanTTL != workflowadapter.RequiredContinuationPlanTTL || manifest.Inputs == nil || manifest.Inputs.ExecutionSpecFingerprint == "" || len(manifest.ExecutionSpec) == 0 {
 		t.Fatalf("run manifest is not frozen: %+v", manifest)
 	}
+	profileCanonical, err := profile.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileRaw, err := os.ReadFile(filepath.Join(root, managedRunsDirectory, run.ID, runExecutionProfileFileName))
+	if err != nil || !bytes.Equal(profileRaw, profileCanonical) {
+		t.Fatalf("managed execution profile = %q, %v; want canonical profile", profileRaw, err)
+	}
+	specificationRaw, err := os.ReadFile(filepath.Join(root, managedRunsDirectory, run.ID, runExecutionSpecFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestSpecification, err := workflowadapter.ParseRunExecutionSpecJSON(manifest.ExecutionSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestSpecificationCanonical, err := manifestSpecification.CanonicalJSON()
+	if err != nil || !bytes.Equal(specificationRaw, manifestSpecificationCanonical) {
+		t.Fatalf("managed execution specification does not match the manifest canonical bytes: %v", err)
+	}
+	if _, _, err := services.core.verifyRunManagedExecutionInputs(ctx, run); err != nil {
+		t.Fatalf("verify managed execution inputs: %v", err)
+	}
+	var dispatch workflowRunExecutionPayload
+	if err := json.Unmarshal([]byte(jobs[0].PayloadJSON), &dispatch); err != nil {
+		t.Fatal(err)
+	}
+	if dispatch.ExecutionSpecFingerprint != manifest.Inputs.ExecutionSpecFingerprint {
+		t.Fatalf("initial durable dispatch execution specification fingerprint = %s, want %s", dispatch.ExecutionSpecFingerprint, manifest.Inputs.ExecutionSpecFingerprint)
+	}
 	expectedInitialPlan, err := workflowkit.CompileDependencyExecutionPlan(manifest.Resolved.Descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := manifest.InitialExecutionPlan.Validate(manifest.Resolved.Descriptor); err != nil || manifest.InitialExecutionPlan.Fingerprint != expectedInitialPlan.Fingerprint {
 		t.Fatalf("run manifest initial execution plan = %+v, err=%v; want frozen dependency plan %s", manifest.InitialExecutionPlan, err, expectedInitialPlan.Fingerprint)
+	}
+	if err := os.WriteFile(filepath.Join(root, managedRunsDirectory, run.ID, runExecutionSpecFileName), []byte(`{"tampered":true}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	replay := request
+	replay.ID = run.ID
+	if _, err := services.Runs.StartRun(ctx, replay); !errors.Is(err, store.ErrIdempotencyConflict) {
+		t.Fatalf("replay accepted a tampered managed execution specification: %v", err)
 	}
 }
 

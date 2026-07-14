@@ -12,7 +12,7 @@ import (
 )
 
 var (
-	// ErrInvalidStageExecution marks a malformed Harbor-side durable projection
+// ErrInvalidStageExecution marks a malformed Harbor-side durable projection
 	// (artifact, checkpoint, usage, or control fact). Concrete executable
 	// results are validated by workflowkit.Engine before this adapter receives
 	// them.

@@ -4,6 +4,7 @@ package testsupport
 import (
 	"strings"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -126,14 +127,17 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 	selection := workflowadapter.RunSelectionReference{
 		TaskID: taskID, RevisionID: revisionID, RevisionDigest: workflowkit.SubjectDigest(revisionDigest),
 	}
+	policy := completeCodeEdgePhase1FinalCompliancePolicy()
 	catalog := workflowadapter.CodeEdgePhase1StageCatalog()
 	artifactIDs := map[string]string{
-		"harbor.artifact.v1":        "018f0a73-3b49-7000-8000-000000000006",
-		"harbor.review-decision.v1": "018f0a73-3b49-7000-8000-000000000007",
+		"harbor.artifact.v1":                                  "018f0a73-3b49-7000-8000-000000000006",
+		"harbor.review-decision.v1":                           "018f0a73-3b49-7000-8000-000000000007",
+		workflowadapter.CodeEdgeSubmissionReportSchemaVersion: "018f0a73-3b49-7000-8000-000000000008",
 	}
 	artifactDigests := map[string]workflowkit.Fingerprint{
-		"harbor.artifact.v1":        fixtureFingerprint('d'),
-		"harbor.review-decision.v1": fixtureFingerprint('e'),
+		"harbor.artifact.v1":                                  fixtureFingerprint('d'),
+		"harbor.review-decision.v1":                           fixtureFingerprint('e'),
+		workflowadapter.CodeEdgeSubmissionReportSchemaVersion: fixtureFingerprint('f'),
 	}
 	usedSchemas := make(map[string]struct{})
 	for _, definition := range catalog.Stages {
@@ -145,7 +149,7 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 		}
 	}
 	artifacts := make([]workflowadapter.ArtifactReference, 0, len(usedSchemas))
-	for _, schema := range []string{"harbor.artifact.v1", "harbor.review-decision.v1"} {
+	for _, schema := range []string{"harbor.artifact.v1", "harbor.review-decision.v1", workflowadapter.CodeEdgeSubmissionReportSchemaVersion} {
 		if _, used := usedSchemas[schema]; !used {
 			continue
 		}
@@ -156,6 +160,7 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 	specification := workflowadapter.RunExecutionSpec{
 		Format: workflowadapter.RunExecutionSpecFormat, Version: workflowadapter.RunExecutionSpecVersion,
 		Template: workflowadapter.CodeEdgePhase1TemplateReference(), Selection: selection,
+		CodeEdgeFinalCompliancePolicy: &policy,
 		References: workflowadapter.ExecutionReferenceSet{
 			Artifacts: artifacts,
 			Checkouts: []workflowadapter.CheckoutReference{
@@ -218,6 +223,43 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 		specification.Stages = append(specification.Stages, fixtureBinding(base))
 	}
 	return specification
+}
+
+func completeCodeEdgePhase1FinalCompliancePolicy() codeedge.FinalCompliancePolicy {
+	maximumPassingTrials := 1
+	qwen := codeedge.EvaluationPolicy{
+		ID:                 "codeedge.qwen.pass-at-four",
+		Version:            "1",
+		HarborResultFormat: codeedge.HarborJobResultV018,
+		Evaluator: codeedge.EvaluatorIdentity{
+			ProfileID: "codeedge-qwen-profile", ProfileVersion: "1",
+			AgentName: "codeedge-agent", AgentVersion: "1",
+			ModelName: "qwen-approved-model", ModelProvider: "controlled-provider",
+		},
+		LogicalTrialCount:        4,
+		PassRewardKey:            "reward",
+		PassRewardAtLeast:        1,
+		MaxPassingTrials:         &maximumPassingTrials,
+		MinimumAverageTurns:      20,
+		ScreenshotMediaType:      "image/png",
+		FailureClassifierID:      "codeedge-infra-classifier",
+		FailureClassifierVersion: "1",
+		InfraExceptionTypes:      []string{"DockerBuildError", "NetworkError"},
+	}
+	opus := qwen.Clone()
+	opus.ID = "codeedge.opus.reference"
+	opus.Evaluator.ProfileID = "codeedge-opus-profile"
+	opus.Evaluator.ModelName = "opus-reference-model"
+	opus.MaxPassingTrials = nil
+	return codeedge.FinalCompliancePolicy{
+		ID:                            "codeedge.phase1.final-compliance",
+		Version:                       "1",
+		QwenPolicy:                    qwen,
+		OpusPolicy:                    opus,
+		SubmissionCheckerID:           "codeedge.submission-check",
+		SubmissionCheckerVersion:      "1",
+		SubmissionReportSchemaVersion: workflowadapter.CodeEdgeSubmissionReportSchemaVersion,
+	}
 }
 
 func fixtureFingerprint(character byte) workflowkit.Fingerprint {

@@ -16,6 +16,8 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+const globalIdentityCollisionMessage = "global entity identity collision"
+
 func (s *Store) mutationPreflight(ctx context.Context) error {
 	_, err := s.BackupIfDue(ctx)
 	return err

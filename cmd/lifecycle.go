@@ -17,7 +17,25 @@ import (
 // contains only local control-plane settings: remote provider configuration
 // and package upload targets are not part of this command surface.
 type lifecycleCLIConfig struct {
-	root string
+	root                string
+	newLifecycleService lifecycleServicesFactory
+}
+
+// lifecycleServicesFactory is the one command-layer composition boundary for
+// lifecycle services. CLI commands, the Task Hub, and controlled child workers
+// must open the same deployment-bound service graph rather than each silently
+// constructing a different resolver set.
+type lifecycleServicesFactory func(root string, dataStore *store.Store) (*app.LifecycleServices, error)
+
+func (config *lifecycleCLIConfig) openLifecycleServices(dataStore *store.Store) (*app.LifecycleServices, error) {
+	if config == nil {
+		return nil, fmt.Errorf("lifecycle configuration is required")
+	}
+	factory := config.newLifecycleService
+	if factory == nil {
+		factory = app.NewLifecycleServices
+	}
+	return factory(config.root, dataStore)
 }
 
 func defaultLifecycleActor() string {
@@ -49,7 +67,7 @@ func executeLifecycleCommandWithStore(cmd *cobra.Command, config *lifecycleCLICo
 		return fmt.Errorf("open lifecycle control plane: %w", err)
 	}
 	defer database.Close()
-	services, err := app.NewLifecycleServices(config.root, database)
+	services, err := config.openLifecycleServices(database)
 	if err != nil {
 		return err
 	}
@@ -152,21 +170,23 @@ func lifecycleMutationCheckpointForKey(ctx context.Context, services *app.Lifecy
 		return app.LifecycleMutationCheckpoint{}, false, fmt.Errorf("%w: prepared legacy lifecycle operation %s has no persisted expected checkpoint identities", store.ErrIdempotencyConflict, operation.ID)
 	}
 	checkpoint := app.LifecycleMutationCheckpoint{
-		TaskID:               operation.ExpectedTaskID,
-		TaskVersion:          operation.ExpectedTaskVersion,
-		RevisionID:           operation.ExpectedRevisionID,
-		RevisionStateVersion: operation.ExpectedRevisionStateVersion,
-		RevisionDigest:       operation.ExpectedRevisionDigest,
-		RunID:                operation.ExpectedRunID,
-		RunVersion:           operation.ExpectedRunVersion,
-		RunExecutionEpoch:    operation.ExpectedRunExecutionEpoch,
-		RunDefinitionHash:    operation.ExpectedRunDefinitionHash,
-		ReleaseID:            operation.ExpectedReleaseID,
-		ReleaseRecordVersion: operation.ExpectedReleaseRecordVersion,
-		ReviewRequestID:      operation.ExpectedReviewRequestID,
-		ReviewRevisionID:     operation.ExpectedReviewRevisionID,
-		ReviewState:          operation.ExpectedReviewState,
-		ReviewEvidenceDigest: operation.ExpectedReviewEvidenceDigest,
+		TaskID:                           operation.ExpectedTaskID,
+		TaskVersion:                      operation.ExpectedTaskVersion,
+		RevisionID:                       operation.ExpectedRevisionID,
+		RevisionStateVersion:             operation.ExpectedRevisionStateVersion,
+		RevisionDigest:                   operation.ExpectedRevisionDigest,
+		RunID:                            operation.ExpectedRunID,
+		RunVersion:                       operation.ExpectedRunVersion,
+		RunExecutionEpoch:                operation.ExpectedRunExecutionEpoch,
+		RunDefinitionHash:                operation.ExpectedRunDefinitionHash,
+		CodeEdgeComplianceRecordID:       operation.ExpectedCodeEdgeComplianceRecordID,
+		CodeEdgeAuthorizationFingerprint: operation.ExpectedCodeEdgeAuthorizationFingerprint,
+		ReleaseID:                        operation.ExpectedReleaseID,
+		ReleaseRecordVersion:             operation.ExpectedReleaseRecordVersion,
+		ReviewRequestID:                  operation.ExpectedReviewRequestID,
+		ReviewRevisionID:                 operation.ExpectedReviewRevisionID,
+		ReviewState:                      operation.ExpectedReviewState,
+		ReviewEvidenceDigest:             operation.ExpectedReviewEvidenceDigest,
 	}
 	return checkpoint, true, nil
 }
@@ -1189,7 +1209,7 @@ func newReleaseCommand(config *lifecycleCLIConfig) *cobra.Command {
 }
 
 func newReleasePackageCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var revisionID, version, idempotencyKey, reason string
+	var revisionID, runID, version, idempotencyKey, reason string
 	var expectedStateVersion int64
 	command := &cobra.Command{
 		Use:   "package",
@@ -1224,12 +1244,15 @@ func newReleasePackageCommand(config *lifecycleCLIConfig) *cobra.Command {
 					return nil, err
 				}
 				if !replayed {
-					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, "", revisionID, "", "")
+					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, "", revisionID, runID, "")
 					if err != nil {
 						return nil, err
 					}
 				}
 				if err := requireLifecycleCheckpointIdentity("revision", revisionID, checkpoint.RevisionID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointIdentity("run", runID, checkpoint.RunID); err != nil {
 					return nil, err
 				}
 				if err := requireLifecycleCheckpointVersion("revision state", expectedStateVersion, checkpoint.RevisionStateVersion); err != nil {
@@ -1243,6 +1266,7 @@ func newReleasePackageCommand(config *lifecycleCLIConfig) *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&revisionID, "revision", "", "Validated current revision UUIDv7")
+	command.Flags().StringVar(&runID, "run", "", "Approved CodeEdge Phase-1 Run UUIDv7 when this revision has CodeEdge execution")
 	command.Flags().Int64Var(&expectedStateVersion, "expected-state-version", 0, "Current revision state version")
 	command.Flags().StringVar(&version, "version", "", "Globally unique local release version")
 	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")

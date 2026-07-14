@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,9 +17,17 @@ import (
 )
 
 const (
-	runtimeFixtureSourceStage = workflowkit.StageKey("runtime-source")
-	runtimeFixtureVerifyStage = workflowkit.StageKey("runtime-verify")
-	runtimeFixtureActor       = "runtime-test-actor"
+	runtimeFixtureSourceStage  = workflowkit.StageKey("runtime-source")
+	runtimeFixtureVerifyStage  = workflowkit.StageKey("runtime-verify")
+	runtimeFixturePackageStage = workflowkit.StageKey("runtime-package")
+	runtimeFixtureActor        = "runtime-test-actor"
+
+	// These fixture values exercise normal durable execution rather than lease
+	// expiry. Keep explicit expiry fixtures below on their own short values.
+	runtimeFixtureLeaseTTL            = 15 * time.Second
+	runtimeFixtureHeartbeatInterval   = 500 * time.Millisecond
+	runtimeFixtureStageTimeout        = 15 * time.Second
+	runtimeFixtureControlPollInterval = 50 * time.Millisecond
 )
 
 type frozenRuntimeFixture struct {
@@ -67,6 +77,9 @@ func TestFrozenExecutionRuntimeCompletesFrozenRunWithArtifactLineageAndQuotaSett
 		t.Fatalf("stage attempts = %+v, want exactly two", attempts)
 	}
 	for _, attempt := range attempts {
+		if attempt.StageKey == string(runtimeFixturePackageStage) {
+			t.Fatalf("operator-only stage unexpectedly received a StageAttempt: %+v", attempt)
+		}
 		if attempt.ExecutionStatus != store.StageExecutionCompleted || attempt.Verdict != store.VerdictPass || attempt.ArtifactManifestID == "" {
 			t.Fatalf("stage attempt terminal projection = %+v", attempt)
 		}
@@ -152,7 +165,7 @@ func TestFrozenExecutionRuntimeUsesPublicWorkflowkitEngineAndRetainsFailedEviden
 		t.Fatal(err)
 	}
 	runtime, err := NewFrozenExecutionRuntime(FrozenExecutionRuntimeConfig{
-		Services: services, WorkflowkitRegistry: registry, QuotaLeaseTTL: time.Second, ControlPollInterval: time.Millisecond,
+		Services: services, WorkflowkitRegistry: registry, QuotaLeaseTTL: runtimeFixtureLeaseTTL, ControlPollInterval: runtimeFixtureControlPollInterval,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -271,6 +284,17 @@ func TestFrozenExecutionRuntimeStageAttemptGateSurvivesTwoWorkerCoordinatorRace(
 	if err := runtime.enqueueNextCoordinator(ctx, *claim.Job, fixture.run, fixture.frozen, sourcePayload); err != nil {
 		t.Fatal(err)
 	}
+	nextCoordinator, err := fixture.store.GetDurableJobByIdempotency(ctx, "workflow-run-next:"+fixture.run.ID+":"+sourceJob.ID)
+	if err != nil || nextCoordinator == nil {
+		t.Fatalf("next durable coordinator = %+v, %v", nextCoordinator, err)
+	}
+	var nextPayload workflowRunExecutionPayload
+	if err := json.Unmarshal([]byte(nextCoordinator.PayloadJSON), &nextPayload); err != nil {
+		t.Fatal(err)
+	}
+	if nextPayload.ExecutionSpecFingerprint != fixture.frozen.ExecutionSpecFingerprint {
+		t.Fatalf("next durable coordinator execution specification fingerprint = %s, want %s", nextPayload.ExecutionSpecFingerprint, fixture.frozen.ExecutionSpecFingerprint)
+	}
 	secondWorker := newFrozenRuntimeWorker(t, fixture.store, runtime, "runtime-race-next-coordinator")
 	result, err := secondWorker.RunOnce(ctx)
 	if err != nil || result.FinalState != store.JobSucceeded || result.Job == nil || result.Job.CommandType != "workflow_run.execute" {
@@ -341,6 +365,32 @@ func TestFrozenExecutionRuntimeRecoveryRestoresMissingStageHandoffAfterExpiredLe
 	}
 	if matching != 1 {
 		t.Fatalf("recovered handoff jobs = %d, want 1", matching)
+	}
+}
+
+func TestFrozenExecutionRuntimeRecoveryRequeuesWorkflowPayloadWithExecutionSpecFingerprint(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, completedFixtureStage))
+
+	initial, err := fixture.store.GetDurableJobByIdempotency(ctx, "workflow-run-execution:"+fixture.run.ID)
+	if err != nil || initial == nil {
+		t.Fatalf("initial durable coordinator = %+v, %v", initial, err)
+	}
+	if err := runtime.reconcileRecoveredWorkflowCoordinator(ctx, *initial); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := fixture.store.GetDurableJobByIdempotency(ctx, "workflow-run-recover:"+fixture.run.ID+":"+initial.ID)
+	if err != nil || recovered == nil {
+		t.Fatalf("recovered durable coordinator = %+v, %v", recovered, err)
+	}
+	var payload workflowRunExecutionPayload
+	if err := json.Unmarshal([]byte(recovered.PayloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ExecutionSpecFingerprint != fixture.frozen.ExecutionSpecFingerprint {
+		t.Fatalf("recovered durable coordinator execution specification fingerprint = %s, want %s", payload.ExecutionSpecFingerprint, fixture.frozen.ExecutionSpecFingerprint)
 	}
 }
 
@@ -465,6 +515,61 @@ func TestFrozenExecutionRuntimeMalformedPayloadProjectsRunInDoubt(t *testing.T) 
 	run, getErr := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
 	if getErr != nil || run == nil || run.Status != store.WorkflowRunInDoubt {
 		t.Fatalf("malformed job run projection = %+v, %v", run, getErr)
+	}
+}
+
+func TestFrozenExecutionRuntimeRejectsMismatchedWorkflowPayloadExecutionSpecFingerprint(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, completedFixtureStage))
+
+	mismatchedFingerprint := workflowkit.SHA256Fingerprint([]byte("mismatched workflow coordinator execution specification"))
+	payload, err := json.Marshal(workflowRunExecutionPayload{
+		Format: workflowRunExecutionPayloadFormat, RunID: fixture.run.ID, DefinitionHash: fixture.run.DefinitionHash,
+		ExecutionSpecFingerprint: mismatchedFingerprint, QuotaPolicy: fixture.frozen.QuotaPolicy.Clone(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := fixture.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "workflow_run.execute", EntityType: "workflow_run", EntityID: fixture.run.ID, RunID: fixture.run.ID,
+		Priority: 100, PayloadJSON: string(payload), IdempotencyKey: "runtime-mismatched-execution-spec", Actor: runtimeFixtureActor, Reason: "mismatched execution specification fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := newFrozenRuntimeWorker(t, fixture.store, runtime, "runtime-mismatched-execution-spec-worker")
+	result, err := worker.RunOnce(ctx)
+	if err == nil || !errors.Is(err, ErrFrozenExecutionPayload) || result.FinalState != store.JobFailed || result.Job == nil || result.Job.ID != job.ID {
+		t.Fatalf("mismatched execution specification payload result = %+v, %v", result, err)
+	}
+	run, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || run == nil || run.Status != store.WorkflowRunInDoubt {
+		t.Fatalf("mismatched execution specification run projection = %+v, %v", run, err)
+	}
+}
+
+func TestWorkflowkitEngineBridgeRejectsManifestExecutionSpecDriftFromManagedInputs(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, completedFixtureStage))
+
+	var manifest runManifest
+	if err := decodeStrictJSON(fixture.run.RunManifestJSON, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Inputs.ExecutionSpecFingerprint = workflowkit.SHA256Fingerprint([]byte("drifted manifest execution specification"))
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := fixture.run
+	tampered.RunManifestJSON = string(encoded)
+	bridge := &workflowkitStageBackend{callContext: ctx, runtime: runtime, run: tampered, revision: fixture.revision, frozen: fixture.frozen}
+	if _, err := bridge.frozenExecution(); !errors.Is(err, ErrFrozenExecutionPayload) {
+		t.Fatalf("public Engine bridge accepted manifest execution specification drift: %v", err)
 	}
 }
 
@@ -593,7 +698,13 @@ func newFrozenRuntimeFixture(t *testing.T) frozenRuntimeFixture {
 		_ = dataStore.Close()
 		t.Fatal(err)
 	}
-	profileFingerprint, err := workflowkit.FingerprintBytes("app.runtime-fixture-profile.v1", []byte("runtime-fixture"))
+	profile := lifecycleCompleteProfile(t)
+	profileCanonical, err := profile.CanonicalJSON()
+	if err != nil {
+		_ = dataStore.Close()
+		t.Fatal(err)
+	}
+	profileFingerprint, err := profile.Fingerprint()
 	if err != nil {
 		_ = dataStore.Close()
 		t.Fatal(err)
@@ -615,6 +726,7 @@ func newFrozenRuntimeFixture(t *testing.T) frozenRuntimeFixture {
 		_ = dataStore.Close()
 		t.Fatal(err)
 	}
+	writeFrozenRuntimeFixtureManagedInputs(t, services, runID, profileCanonical, specificationCanonical)
 	resolved := workflowadapter.ResolvedWorkflow{
 		TemplateID: "runtime-fixture", TemplateVersion: "1", ExecutionProfileID: "runtime-fixture", ExecutionProfileVersion: "1",
 		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ExecutionProfileFingerprint: profileFingerprint, DefinitionFingerprint: definition,
@@ -659,12 +771,30 @@ func newFrozenRuntimeFixture(t *testing.T) frozenRuntimeFixture {
 	return frozenRuntimeFixture{store: dataStore, services: services, task: task, revision: revision, run: run, frozen: frozen}
 }
 
+// Runtime fixtures construct custom workflow descriptors directly so the
+// worker-level tests can focus on durable behavior. They still freeze the
+// same managed inputs as RunService, which makes the fixture exercise the
+// production admission proof instead of taking a test-only shortcut.
+func writeFrozenRuntimeFixtureManagedInputs(t *testing.T, services *LifecycleServices, runID string, profileCanonical, specificationCanonical []byte) {
+	t.Helper()
+	directory := services.core.layout.runDirectory(runID)
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNewBytes(filepath.Join(directory, runExecutionProfileFileName), profileCanonical); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNewBytes(filepath.Join(directory, runExecutionSpecFileName), specificationCanonical); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func runtimeFixtureWorkflow() workflowkit.WorkflowDescriptor {
 	claim := func(dimension string, units int64) workflowkit.QuotaClaim {
 		return workflowkit.QuotaClaim{Dimension: dimension, Units: units, ReclaimPolicy: workflowkit.ReclaimUnused}
 	}
 	budget := workflowkit.ExecutionBudget{
-		TurnTimeout: time.Second, MaxTurns: 1, AttemptTimeout: time.Second, MaxAttempts: 1, MaxElapsed: time.Second,
+		TurnTimeout: runtimeFixtureStageTimeout, MaxTurns: 1, AttemptTimeout: runtimeFixtureStageTimeout, MaxAttempts: 1, MaxElapsed: runtimeFixtureStageTimeout,
 	}
 	return workflowkit.WorkflowDescriptor{
 		ID: "runtime-fixture", Version: "1",
@@ -684,6 +814,15 @@ func runtimeFixtureWorkflow() workflowkit.WorkflowDescriptor {
 				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}, Reuse: workflowkit.ReuseWhenInputsMatch,
 				Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityCancel, workflowkit.CapabilityContinue},
 			},
+			{
+				Key: runtimeFixturePackageStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.package", Version: "1"}, Group: "runtime",
+				Dependencies: []workflowkit.StageKey{runtimeFixtureVerifyStage},
+				Inputs:       []workflowkit.ArtifactSpec{{Name: "verify_report", SchemaVersion: "runtime.v1", Required: true}},
+				Outputs:      []workflowkit.ArtifactSpec{{Name: "package_receipt", SchemaVersion: "runtime.v1", Required: true}},
+				Effect:       workflowkit.EffectExternalSideEffect, Dispatch: workflowkit.StageDispatchOperatorOnly,
+				Budget: budget, QuotaClaims: []workflowkit.QuotaClaim{claim("stage_attempt", 1)}, Retry: workflowkit.RetryPolicy{},
+				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}, Reuse: workflowkit.ReuseNever,
+			},
 		},
 	}
 }
@@ -699,6 +838,7 @@ func runtimeFixtureQuotaPolicy(t *testing.T) workflowadapter.ResolvedQuotaPolicy
 		Stages: []workflowadapter.StageQuotaPolicy{
 			{StageKey: runtimeFixtureSourceStage, Claims: []workflowkit.QuotaClaim{{Dimension: "stage_attempt", Units: 1, ReclaimPolicy: workflowkit.ReclaimUnused}, {Dimension: "agent_turn", Units: 2, ReclaimPolicy: workflowkit.ReclaimUnused}}},
 			{StageKey: runtimeFixtureVerifyStage, Claims: []workflowkit.QuotaClaim{{Dimension: "stage_attempt", Units: 1, ReclaimPolicy: workflowkit.ReclaimUnused}}},
+			{StageKey: runtimeFixturePackageStage, Claims: []workflowkit.QuotaClaim{{Dimension: "stage_attempt", Units: 1, ReclaimPolicy: workflowkit.ReclaimUnused}}},
 		},
 	}
 	fingerprint, err := policy.Fingerprint()
@@ -724,7 +864,7 @@ func frozenRuntimeRegistry(t *testing.T, workflow workflowkit.WorkflowDescriptor
 func newFrozenRuntime(t *testing.T, services *LifecycleServices, registry *workflowkit.ControlledPluginRegistry[workflowkit.StageExecutor]) *FrozenExecutionRuntime {
 	t.Helper()
 	runtime, err := NewFrozenExecutionRuntime(FrozenExecutionRuntimeConfig{
-		Services: services, WorkflowkitRegistry: registry, QuotaLeaseTTL: time.Second, ControlPollInterval: time.Millisecond,
+		Services: services, WorkflowkitRegistry: registry, QuotaLeaseTTL: runtimeFixtureLeaseTTL, ControlPollInterval: runtimeFixtureControlPollInterval,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -736,7 +876,7 @@ func newFrozenRuntimeWorker(t *testing.T, dataStore *store.Store, runtime *Froze
 	t.Helper()
 	worker, err := NewDurableWorker(DurableWorkerConfig{
 		Store: dataStore, Owner: owner, Actor: runtimeFixtureActor, Reason: "frozen runtime integration test",
-		LeaseTTL: time.Second, HeartbeatEvery: 100 * time.Millisecond, PollInterval: time.Millisecond, Handler: runtime,
+		LeaseTTL: runtimeFixtureLeaseTTL, HeartbeatEvery: runtimeFixtureHeartbeatInterval, PollInterval: time.Millisecond, Handler: runtime,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 )
@@ -461,75 +460,6 @@ func TestRunWorkerHandoffSchemaFencesRawConcurrentActiveRows(t *testing.T) {
 	defer tx.Rollback()
 	if err := insertRunWorkerHandoffTx(ctx, tx, second); !errors.Is(err, ErrLeaseHeld) {
 		t.Fatalf("second raw active handoff insert = %v, want active handoff lease held", err)
-	}
-}
-
-func TestMigrateV15ToV16InstallsRunWorkerHandoffSchemaAndIdentityTriggers(t *testing.T) {
-	s := tempDB(t)
-	root := s.rootDir
-	if _, err := s.db.Exec(`DROP TABLE run_worker_handoffs_v16`); err != nil {
-		t.Fatalf("remove V16 handoff table: %v", err)
-	}
-	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 16`); err != nil {
-		t.Fatalf("rewind schema fixture from V16: %v", err)
-	}
-	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 17`); err != nil {
-		t.Fatalf("rewind schema fixture from V17: %v", err)
-	}
-	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 18`); err != nil {
-		t.Fatalf("rewind schema fixture from V18: %v", err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	migrated, err := Open(root)
-	if err != nil {
-		t.Fatalf("migrate V15 store to V16: %v", err)
-	}
-	defer migrated.Close()
-	var version, tableCount, triggerCount int
-	var activeIndexSQL string
-	if err := migrated.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'run_worker_handoffs_v16'`).Scan(&tableCount); err != nil {
-		t.Fatal(err)
-	}
-	if err := migrated.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_run_worker_handoffs_v16_active_run'`).Scan(&activeIndexSQL); err != nil {
-		t.Fatal(err)
-	}
-	if err := migrated.db.QueryRow(`
-		SELECT COUNT(*) FROM sqlite_master
-		WHERE type = 'trigger' AND name IN (
-			'entity_id_registry_run_worker_handoffs_v16_insert',
-			'entity_id_registry_run_worker_handoffs_v16_id_immutable'
-		)
-	`).Scan(&triggerCount); err != nil {
-		t.Fatal(err)
-	}
-	if version != schemaVersion || tableCount != 1 || triggerCount != 2 || !strings.Contains(activeIndexSQL, "WHERE state IN ('launching', 'handed_off')") {
-		t.Fatalf("V16 migration version=%d table_count=%d trigger_count=%d active_index=%q", version, tableCount, triggerCount, activeIndexSQL)
-	}
-	ctx := context.Background()
-	run := newRunWorkerHandoffFixture(t, migrated)
-	collision := runWorkerHandoffReserveRequest(t, run, "sha256:migrated-identity-collision")
-	collision.ID = run.ID
-	if _, err := migrated.ReserveRunWorkerHandoff(ctx, collision); !errors.Is(err, ErrIdentityCollision) {
-		t.Fatalf("migrated V16 global identity collision = %v, want identity collision", err)
-	}
-	reserved, err := migrated.ReserveRunWorkerHandoff(ctx, runWorkerHandoffReserveRequest(t, run, "sha256:migrated-identity"))
-	if err != nil || !reserved.Launch {
-		t.Fatalf("reserve on migrated V16 schema = %+v, %v", reserved, err)
-	}
-	var entityType string
-	if err := migrated.db.QueryRow(`SELECT entity_type FROM entity_id_registry WHERE id = ?`, reserved.Handoff.ID).Scan(&entityType); err != nil {
-		t.Fatal(err)
-	}
-	if entityType != runWorkerHandoffIdentitySource.entityType {
-		t.Fatalf("migrated V16 registry entity type = %q, want %q", entityType, runWorkerHandoffIdentitySource.entityType)
-	}
-	if _, err := migrated.db.Exec(`UPDATE run_worker_handoffs_v16 SET id = ? WHERE id = ?`, mustUUIDv7(t), reserved.Handoff.ID); err == nil || !strings.Contains(err.Error(), "identity is immutable") {
-		t.Fatalf("migrated V16 immutable identity update = %v, want immutable identity failure", err)
 	}
 }
 

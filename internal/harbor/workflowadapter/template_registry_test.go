@@ -183,8 +183,19 @@ func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *
 		}
 	}
 	packageStage, present := template.Catalog.Stage(workflowkit.StageKey(Package))
-	if !present || !sameStageKeySet(packageStage.Dependencies, []workflowkit.StageKey{workflowkit.StageKey(ResultReview)}) {
+	if !present || !packageStage.Dispatch.IsOperatorOnly() || !sameStageKeySet(packageStage.Dependencies, []workflowkit.StageKey{workflowkit.StageKey(ResultReview)}) {
 		t.Fatalf("package dependencies = %#v, want only final ResultReview", packageStage.Dependencies)
+	}
+	initialPlan, err := workflowkit.CompileDependencyExecutionPlan(resolved.Descriptor)
+	if err != nil {
+		t.Fatalf("compile CodeEdge Phase-1 initial execution plan: %v", err)
+	}
+	for _, batch := range initialPlan.Batches {
+		for _, nodeID := range batch.NodeIDs {
+			if nodeID == workflowkit.NodeID(Package) {
+				t.Fatalf("CodeEdge initial plan scheduled operator-only package: %#v", initialPlan.Batches)
+			}
+		}
 	}
 	qwen, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunQwen))
 	opus, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunOpus))
@@ -211,14 +222,52 @@ func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *
 	}
 }
 
+func TestCodeEdgePhase1SubmissionReportUsesTheVersionedTypedContract(t *testing.T) {
+	template := CodeEdgePhase1WorkflowTemplate()
+	if template.Version != "2.1.0" || template.Catalog.Version != "2.1.0" {
+		t.Fatalf("CodeEdge semantic schema change did not receive template/catalog versions: %s / %s", template.Version, template.Catalog.Version)
+	}
+	stages := make(map[workflowkit.StageKey]StageDefinition, len(template.Catalog.Stages))
+	for _, stage := range template.Catalog.Stages {
+		stages[stage.Key] = stage
+	}
+	assertSchema := func(stage workflowkit.StageKey, artifacts []workflowkit.ArtifactSpec) {
+		t.Helper()
+		found := false
+		for _, artifact := range artifacts {
+			if artifact.Name != "submission_lint_report" {
+				continue
+			}
+			found = true
+			if artifact.SchemaVersion != CodeEdgeSubmissionReportSchemaVersion {
+				t.Fatalf("stage %s submission_lint_report schema = %q, want %q", stage, artifact.SchemaVersion, CodeEdgeSubmissionReportSchemaVersion)
+			}
+		}
+		if !found {
+			t.Fatalf("stage %s omitted submission_lint_report", stage)
+		}
+	}
+	submission, submissionPresent := stages[workflowkit.StageKey(SubmissionLint)]
+	resultReview, resultReviewPresent := stages[workflowkit.StageKey(ResultReview)]
+	localPackage, packagePresent := stages[workflowkit.StageKey(Package)]
+	if !submissionPresent || !resultReviewPresent || !packagePresent {
+		t.Fatalf("CodeEdge schema contract stages = submission:%t review:%t package:%t", submissionPresent, resultReviewPresent, packagePresent)
+	}
+	assertSchema(submission.Key, submission.Outputs)
+	assertSchema(resultReview.Key, resultReview.Inputs)
+	assertSchema(localPackage.Key, localPackage.Inputs)
+}
+
 func testCodeEdgePhase1RunExecutionSpec(t *testing.T) RunExecutionSpec {
 	t.Helper()
 	const digest = "harbor.task.v2:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	selection := RunSelectionReference{
 		TaskID: "018f0a73-3b49-7000-8000-000000000011", RevisionID: "018f0a73-3b49-7000-8000-000000000012", RevisionDigest: workflowkit.SubjectDigest(digest),
 	}
+	policy := testCodeEdgeFinalCompliancePolicy()
 	specification := RunExecutionSpec{
 		Format: RunExecutionSpecFormat, Version: RunExecutionSpecVersion, Template: CodeEdgePhase1TemplateReference(), Selection: selection,
+		CodeEdgeFinalCompliancePolicy: &policy,
 		References: ExecutionReferenceSet{
 			Artifacts: []ArtifactReference{{ID: "018f0a73-3b49-7000-8000-000000000013", ContentDigest: testFingerprint('d'), SchemaVersion: "harbor.artifact.v1"}},
 			Checkouts: []CheckoutReference{{ID: "checkout-codeedge", RevisionID: selection.RevisionID, RevisionDigest: selection.RevisionDigest}},

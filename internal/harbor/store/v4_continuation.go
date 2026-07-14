@@ -693,6 +693,11 @@ func (s *Store) CreateFrozenPlan(ctx context.Context, request CreateFrozenPlanRe
 		return FrozenPlan{}, err
 	}
 	defer tx.Rollback()
+	if candidate, candidateErr := getRevisionCandidateByCommandTx(ctx, tx, plan.CommandID); candidateErr == nil {
+		return FrozenPlan{}, fmt.Errorf("%w: revision candidate %s requires CreateAndBindRevisionCandidatePlan", ErrInvalidTransition, candidate.ID)
+	} else if !isNotFound(candidateErr) {
+		return FrozenPlan{}, candidateErr
+	}
 	if err := validateFrozenPlanDependenciesTx(ctx, tx, plan); err != nil {
 		return FrozenPlan{}, err
 	}

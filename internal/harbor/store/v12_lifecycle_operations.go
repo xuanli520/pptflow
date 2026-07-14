@@ -18,7 +18,8 @@ const lifecycleOperationV12Select = `
 	       expected_task_version, expected_revision_state_version, expected_revision_digest,
 	       expected_run_version, expected_run_execution_epoch, expected_run_definition_hash,
 	       expected_release_record_version, expected_review_revision_id, expected_review_state,
-	       expected_review_evidence_digest, actor, reason, state, result_json, created_at,
+	       expected_review_evidence_digest, expected_codeedge_compliance_record_id,
+	       expected_codeedge_authorization_fingerprint, actor, reason, state, result_json, created_at,
 	       updated_at, completed_at, version
 	FROM lifecycle_operations_v12`
 
@@ -62,7 +63,10 @@ func (s *Store) BeginLifecycleOperation(ctx context.Context, request BeginLifecy
 		ExpectedRunVersion: prepared.expectedRunVersion, ExpectedRunExecutionEpoch: prepared.expectedRunExecutionEpoch,
 		ExpectedRunDefinitionHash: prepared.expectedRunDefinitionHash, ExpectedReleaseRecordVersion: prepared.expectedReleaseRecordVersion,
 		ExpectedReviewRevisionID: prepared.expectedReviewRevisionID, ExpectedReviewState: prepared.expectedReviewState,
-		ExpectedReviewEvidenceDigest: prepared.expectedReviewEvidenceDigest, Actor: prepared.actor, Reason: prepared.reason,
+		ExpectedReviewEvidenceDigest:             prepared.expectedReviewEvidenceDigest,
+		ExpectedCodeEdgeComplianceRecordID:       prepared.expectedCodeEdgeComplianceRecordID,
+		ExpectedCodeEdgeAuthorizationFingerprint: prepared.expectedCodeEdgeAuthorizationFingerprint,
+		Actor:                                    prepared.actor, Reason: prepared.reason,
 		State: LifecycleOperationPrepared, CreatedAt: now, UpdatedAt: now, Version: 1,
 	}
 	if err := insertLifecycleOperationTx(ctx, tx, operation); err != nil {
@@ -408,34 +412,36 @@ func (s *Store) GetLifecycleOperationByIdempotencyKey(ctx context.Context, idemp
 }
 
 type preparedBeginLifecycleOperationRequest struct {
-	id                           string
-	idempotencyKey               string
-	action                       string
-	requestFingerprint           string
-	taskID                       string
-	revisionID                   string
-	runID                        string
-	reviewRequestID              string
-	releaseID                    string
-	deletionRecordID             string
-	targetLifecycleState         TaskLifecycleState
-	expectedTaskID               string
-	expectedRevisionID           string
-	expectedRunID                string
-	expectedReleaseID            string
-	expectedReviewRequestID      string
-	expectedTaskVersion          int64
-	expectedRevisionStateVersion int64
-	expectedRevisionDigest       string
-	expectedRunVersion           int64
-	expectedRunExecutionEpoch    int
-	expectedRunDefinitionHash    string
-	expectedReleaseRecordVersion int64
-	expectedReviewRevisionID     string
-	expectedReviewState          string
-	expectedReviewEvidenceDigest string
-	actor                        string
-	reason                       string
+	id                                       string
+	idempotencyKey                           string
+	action                                   string
+	requestFingerprint                       string
+	taskID                                   string
+	revisionID                               string
+	runID                                    string
+	reviewRequestID                          string
+	releaseID                                string
+	deletionRecordID                         string
+	targetLifecycleState                     TaskLifecycleState
+	expectedTaskID                           string
+	expectedRevisionID                       string
+	expectedRunID                            string
+	expectedReleaseID                        string
+	expectedReviewRequestID                  string
+	expectedTaskVersion                      int64
+	expectedRevisionStateVersion             int64
+	expectedRevisionDigest                   string
+	expectedRunVersion                       int64
+	expectedRunExecutionEpoch                int
+	expectedRunDefinitionHash                string
+	expectedReleaseRecordVersion             int64
+	expectedReviewRevisionID                 string
+	expectedReviewState                      string
+	expectedReviewEvidenceDigest             string
+	expectedCodeEdgeComplianceRecordID       string
+	expectedCodeEdgeAuthorizationFingerprint string
+	actor                                    string
+	reason                                   string
 }
 
 func prepareBeginLifecycleOperationRequest(s *Store, request BeginLifecycleOperationRequest) (preparedBeginLifecycleOperationRequest, error) {
@@ -471,6 +477,7 @@ func prepareBeginLifecycleOperationRequest(s *Store, request BeginLifecycleOpera
 		{"expected task", request.ExpectedTaskID}, {"expected revision", request.ExpectedRevisionID},
 		{"expected run", request.ExpectedRunID}, {"expected release", request.ExpectedReleaseID},
 		{"expected review request", request.ExpectedReviewRequestID}, {"expected review revision", request.ExpectedReviewRevisionID},
+		{"expected CodeEdge compliance record", request.ExpectedCodeEdgeComplianceRecordID},
 	} {
 		if strings.TrimSpace(identity.value) != "" && !isUUIDv7(identity.value) {
 			return preparedBeginLifecycleOperationRequest{}, fmt.Errorf("%s identity: %w", identity.name, ErrInvalidUUIDv7Identity)
@@ -496,7 +503,9 @@ func prepareBeginLifecycleOperationRequest(s *Store, request BeginLifecycleOpera
 		expectedRunExecutionEpoch: request.ExpectedRunExecutionEpoch, expectedRunDefinitionHash: strings.TrimSpace(request.ExpectedRunDefinitionHash),
 		expectedReleaseRecordVersion: request.ExpectedReleaseRecordVersion, expectedReviewRevisionID: strings.TrimSpace(request.ExpectedReviewRevisionID),
 		expectedReviewState: strings.TrimSpace(request.ExpectedReviewState), expectedReviewEvidenceDigest: strings.TrimSpace(request.ExpectedReviewEvidenceDigest),
-		actor: actor, reason: reason,
+		expectedCodeEdgeComplianceRecordID:       strings.TrimSpace(request.ExpectedCodeEdgeComplianceRecordID),
+		expectedCodeEdgeAuthorizationFingerprint: strings.TrimSpace(request.ExpectedCodeEdgeAuthorizationFingerprint),
+		actor:                                    actor, reason: reason,
 	}, nil
 }
 
@@ -508,11 +517,13 @@ func insertLifecycleOperationTx(ctx context.Context, tx *sql.Tx, operation Lifec
 			expected_release_id, expected_review_request_id, expected_task_version, expected_revision_state_version,
 			expected_revision_digest, expected_run_version, expected_run_execution_epoch, expected_run_definition_hash,
 			expected_release_record_version, expected_review_revision_id, expected_review_state, expected_review_evidence_digest,
+			expected_codeedge_compliance_record_id, expected_codeedge_authorization_fingerprint,
 			actor, reason, state, result_json, created_at, updated_at, completed_at, version
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?,
 			?, ?, ?,
 			'', ?, ?, NULL, ?
 		)
@@ -521,7 +532,9 @@ func insertLifecycleOperationTx(ctx context.Context, tx *sql.Tx, operation Lifec
 		operation.ExpectedTaskID, operation.ExpectedRevisionID, operation.ExpectedRunID, operation.ExpectedReleaseID, operation.ExpectedReviewRequestID, operation.ExpectedTaskVersion,
 		operation.ExpectedRevisionStateVersion, operation.ExpectedRevisionDigest, operation.ExpectedRunVersion, operation.ExpectedRunExecutionEpoch,
 		operation.ExpectedRunDefinitionHash, operation.ExpectedReleaseRecordVersion, operation.ExpectedReviewRevisionID,
-		operation.ExpectedReviewState, operation.ExpectedReviewEvidenceDigest, operation.Actor, operation.Reason, operation.State,
+		operation.ExpectedReviewState, operation.ExpectedReviewEvidenceDigest,
+		operation.ExpectedCodeEdgeComplianceRecordID, operation.ExpectedCodeEdgeAuthorizationFingerprint,
+		operation.Actor, operation.Reason, operation.State,
 		operation.CreatedAt, operation.UpdatedAt, operation.Version)
 	if err != nil && isUniqueConstraint(err) {
 		return fmt.Errorf("%w: lifecycle operation %s", ErrIdentityCollision, operation.ID)
@@ -558,7 +571,8 @@ func scanLifecycleOperation(scanner rowScanner) (LifecycleOperation, error) {
 		&operation.ExpectedTaskVersion, &operation.ExpectedRevisionStateVersion, &operation.ExpectedRevisionDigest,
 		&operation.ExpectedRunVersion, &operation.ExpectedRunExecutionEpoch, &operation.ExpectedRunDefinitionHash,
 		&operation.ExpectedReleaseRecordVersion, &operation.ExpectedReviewRevisionID, &operation.ExpectedReviewState,
-		&operation.ExpectedReviewEvidenceDigest, &operation.Actor, &operation.Reason, &operation.State, &operation.ResultJSON,
+		&operation.ExpectedReviewEvidenceDigest, &operation.ExpectedCodeEdgeComplianceRecordID,
+		&operation.ExpectedCodeEdgeAuthorizationFingerprint, &operation.Actor, &operation.Reason, &operation.State, &operation.ResultJSON,
 		&operation.CreatedAt, &operation.UpdatedAt, &completedAt, &operation.Version,
 	); err != nil {
 		return LifecycleOperation{}, err
@@ -569,7 +583,8 @@ func scanLifecycleOperation(scanner rowScanner) (LifecycleOperation, error) {
 		return LifecycleOperation{}, fmt.Errorf("invalid persisted lifecycle operation %s", operation.ID)
 	}
 	for _, identity := range []string{operation.TaskID, operation.RevisionID, operation.RunID, operation.ReviewRequestID, operation.ReleaseID, operation.DeletionRecordID,
-		operation.ExpectedTaskID, operation.ExpectedRevisionID, operation.ExpectedRunID, operation.ExpectedReleaseID, operation.ExpectedReviewRequestID, operation.ExpectedReviewRevisionID} {
+		operation.ExpectedTaskID, operation.ExpectedRevisionID, operation.ExpectedRunID, operation.ExpectedReleaseID, operation.ExpectedReviewRequestID, operation.ExpectedReviewRevisionID,
+		operation.ExpectedCodeEdgeComplianceRecordID} {
 		if identity != "" && !isUUIDv7(identity) {
 			return LifecycleOperation{}, fmt.Errorf("invalid persisted lifecycle operation %s target identity", operation.ID)
 		}

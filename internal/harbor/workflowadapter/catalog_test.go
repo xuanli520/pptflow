@@ -357,11 +357,26 @@ func TestRepairFirstPolicyAndResourceMapping(t *testing.T) {
 		t.Fatal("legacy publish stage is still exposed by the V2 catalog")
 	}
 	localPackage, present := catalog.Stage(workflowkit.StageKey(Package))
-	if !present || localPackage.Effect != workflowkit.EffectExternalSideEffect || localPackage.Plugin.ID != "harborfactory.local_package" {
+	if !present || localPackage.Effect != workflowkit.EffectExternalSideEffect || localPackage.Plugin.ID != "harborfactory.local_package" || !localPackage.Dispatch.IsOperatorOnly() {
 		t.Fatalf("local package delivery mapping = %#v, want the managed local package stage", localPackage)
 	}
 	if len(localPackage.Dependencies) != 1 || localPackage.Dependencies[0] != workflowkit.StageKey(SubmissionLint) {
 		t.Fatalf("local package must depend directly on submission lint: %#v", localPackage.Dependencies)
+	}
+	resolved, err := StandardWorkflowTemplate().Compile(explicitProfile(catalog))
+	if err != nil {
+		t.Fatalf("compile standard operator-only package descriptor: %v", err)
+	}
+	plan, err := workflowkit.CompileDependencyExecutionPlan(resolved.Descriptor)
+	if err != nil {
+		t.Fatalf("compile standard initial execution plan: %v", err)
+	}
+	for _, batch := range plan.Batches {
+		for _, nodeID := range batch.NodeIDs {
+			if nodeID == workflowkit.NodeID(Package) {
+				t.Fatalf("standard initial plan scheduled operator-only package: %#v", plan.Batches)
+			}
+		}
 	}
 	quality, _ := catalog.Stage(workflowkit.StageKey(QualityCheck))
 	for _, verdict := range []workflowkit.Verdict{workflowkit.VerdictPass, workflowkit.VerdictNeedsRepair, workflowkit.VerdictReject, workflowkit.VerdictAdvisory} {

@@ -25,14 +25,14 @@ const (
 // raw JSON into TaskHubDetail, while every field rendered by the TUI is
 // checked against the durable Run identity before it is exposed.
 type taskHubRunManifestProjection struct {
-	Format               string                              `json:"format"`
-	RunID                string                              `json:"run_id"`
-	TaskID               string                              `json:"task_id"`
-	RevisionID           string                              `json:"revision_id"`
-	Resolved             taskHubResolvedWorkflowProjection   `json:"resolved_workflow"`
-	InitialExecutionPlan taskHubExecutionPlanProjection      `json:"initial_execution_plan"`
-	Inputs               *taskHubRunManifestInputsProjection `json:"inputs,omitempty"`
-	DeploymentCatalog    json.RawMessage                     `json:"deployment_catalog_receipt,omitempty"`
+	Format                        string                                                `json:"format"`
+	RunID                         string                                                `json:"run_id"`
+	TaskID                        string                                                `json:"task_id"`
+	RevisionID                    string                                                `json:"revision_id"`
+	Resolved                      taskHubResolvedWorkflowProjection                     `json:"resolved_workflow"`
+	InitialExecutionPlan          taskHubExecutionPlanProjection                        `json:"initial_execution_plan"`
+	Inputs                        *taskHubRunManifestInputsProjection                   `json:"inputs,omitempty"`
+	DeploymentCatalog             json.RawMessage                                       `json:"deployment_catalog_receipt,omitempty"`
 	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity `json:"deployment_catalog_lock_identity,omitempty"`
 }
 

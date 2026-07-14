@@ -837,78 +837,11 @@ func insertMutationReceiptForCandidateTx(ctx context.Context, tx *sql.Tx, receip
 	return err
 }
 
-// BindRevisionCandidatePlan records the already-written managed final
-// snapshot and child run manifest against one frozen plan. It has no runtime
-// side effects; Execute later consumes this exact binding atomically.
-func (s *Store) BindRevisionCandidatePlan(ctx context.Context, request BindRevisionCandidatePlanRequest) (RevisionCandidate, error) {
-	if err := s.mutationPreflight(ctx); err != nil {
-		return RevisionCandidate{}, err
-	}
-	if !isUUIDv7(request.CandidateID) || !isUUIDv7(request.FrozenPlanID) {
-		return RevisionCandidate{}, ErrInvalidUUIDv7Identity
-	}
-	if request.ExpectedVersion <= 0 {
-		return RevisionCandidate{}, fmt.Errorf("expected candidate version must be positive")
-	}
-	manifestID, err := normalizeRequired(request.FinalManifestID, "candidate final manifest ID")
-	if err != nil {
-		return RevisionCandidate{}, err
-	}
-	childManifest, err := normalizeV4JSON(request.ChildRunManifestJSON, "candidate child run manifest")
-	if err != nil {
-		return RevisionCandidate{}, err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return RevisionCandidate{}, err
-	}
-	defer tx.Rollback()
-	candidate, err := getRevisionCandidateTx(ctx, tx, request.CandidateID)
-	if err != nil {
-		return RevisionCandidate{}, err
-	}
-	if candidate.FrozenPlanID == request.FrozenPlanID && candidate.FinalManifestID == manifestID && candidate.ChildRunManifestJSON == childManifest {
-		if err := tx.Commit(); err != nil {
-			return RevisionCandidate{}, err
-		}
-		return candidate, nil
-	}
-	if candidate.Version != request.ExpectedVersion || candidate.State != RevisionCandidatePrepared {
-		return RevisionCandidate{}, fmt.Errorf("%w: revision candidate %s", ErrOptimisticLock, candidate.ID)
-	}
-	plan, err := getFrozenPlanTx(ctx, tx, request.FrozenPlanID)
-	if err != nil {
-		return RevisionCandidate{}, err
-	}
-	if err := validateRevisionCandidatePlanFactsTx(ctx, tx, candidate, plan); err != nil {
-		return RevisionCandidate{}, err
-	}
-	now := s.now().UTC()
-	candidate.FrozenPlanID = request.FrozenPlanID
-	candidate.FinalManifestID = manifestID
-	candidate.ChildRunManifestJSON = childManifest
-	candidate.UpdatedAt = now
-	candidate.Version++
-	if err := updateRevisionCandidateTx(ctx, tx, candidate, request.ExpectedVersion); err != nil {
-		return RevisionCandidate{}, err
-	}
-	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{Actor: resolveActor(request.Actor), EntityType: "revision_candidate", EntityID: candidate.ID,
-		Action: "revision_candidate.plan_bound", Reason: request.Reason,
-		PayloadJSON:  auditPayload(map[string]any{"plan_id": request.FrozenPlanID, "manifest_id": manifestID, "target_run_id": candidate.TargetRunID}),
-		OperationKey: request.FrozenPlanID, CreatedAt: now}); err != nil {
-		return RevisionCandidate{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return RevisionCandidate{}, err
-	}
-	return candidate, nil
-}
-
 // CreateAndBindRevisionCandidatePlan is the crash-safe boundary between a
 // provider-verified candidate and an executable continuation. The plan row and
-// candidate binding become visible together. If an older process left an
-// unbound but otherwise identical plan behind, this method repairs that exact
-// binding without re-planning or extending the frozen expiration.
+// candidate binding become visible together. An already-persisted incomplete
+// binding is irreconcilable through this API: it must be investigated rather
+// than silently repaired or made executable.
 func (s *Store) CreateAndBindRevisionCandidatePlan(ctx context.Context, request CreateAndBindRevisionCandidatePlanRequest) (FrozenPlan, RevisionCandidate, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return FrozenPlan{}, RevisionCandidate{}, err
@@ -949,6 +882,9 @@ func (s *Store) CreateAndBindRevisionCandidatePlan(ctx context.Context, request 
 		if !isNotFound(err) {
 			return FrozenPlan{}, RevisionCandidate{}, err
 		}
+		if revisionCandidatePlanBindingStarted(candidate) {
+			return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: revision candidate %s has an incomplete persisted plan binding", ErrContinuationReconciliationRequired, candidate.ID)
+		}
 		if candidate.Version != request.ExpectedCandidateVersion || candidate.State != RevisionCandidatePrepared {
 			return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: revision candidate %s", ErrOptimisticLock, candidate.ID)
 		}
@@ -968,14 +904,16 @@ func (s *Store) CreateAndBindRevisionCandidatePlan(ctx context.Context, request 
 			return FrozenPlan{}, RevisionCandidate{}, err
 		}
 		storedPlan = plan
-	} else if !sameFrozenPlan(storedPlan, plan) {
-		return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: frozen plan command %s", ErrIdempotencyConflict, plan.CommandID)
-	}
-
-	if err := validateRevisionCandidatePlanFactsTx(ctx, tx, candidate, storedPlan); err != nil {
-		return FrozenPlan{}, RevisionCandidate{}, err
-	}
-	if candidate.FrozenPlanID == storedPlan.ID && candidate.FinalManifestID != "" && candidate.ChildRunManifestJSON != "" {
+	} else {
+		if !sameFrozenPlan(storedPlan, plan) {
+			return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: frozen plan command %s", ErrIdempotencyConflict, plan.CommandID)
+		}
+		if !revisionCandidatePlanBindingComplete(candidate) || candidate.FrozenPlanID != storedPlan.ID {
+			return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: frozen plan %s is not fully bound to revision candidate %s", ErrContinuationReconciliationRequired, storedPlan.ID, candidate.ID)
+		}
+		if err := validateRevisionCandidatePlanFactsTx(ctx, tx, candidate, storedPlan); err != nil {
+			return FrozenPlan{}, RevisionCandidate{}, err
+		}
 		if candidate.FinalManifestID != manifestID || candidate.ChildRunManifestJSON != childManifest {
 			return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: revision candidate %s", ErrIdempotencyConflict, candidate.ID)
 		}
@@ -984,15 +922,7 @@ func (s *Store) CreateAndBindRevisionCandidatePlan(ctx context.Context, request 
 		}
 		return storedPlan, candidate, nil
 	}
-	if candidate.FrozenPlanID != "" && candidate.FrozenPlanID != storedPlan.ID {
-		return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: revision candidate %s already binds plan %s", ErrIdempotencyConflict, candidate.ID, candidate.FrozenPlanID)
-	}
-	if candidate.FrozenPlanID == storedPlan.ID && (candidate.FinalManifestID != "" || candidate.ChildRunManifestJSON != "") {
-		return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: revision candidate %s has a partial plan binding", ErrIdempotencyConflict, candidate.ID)
-	}
-	if candidate.Version != request.ExpectedCandidateVersion || candidate.State != RevisionCandidatePrepared {
-		return FrozenPlan{}, RevisionCandidate{}, fmt.Errorf("%w: revision candidate %s", ErrOptimisticLock, candidate.ID)
-	}
+
 	now := s.now().UTC()
 	candidate.FrozenPlanID = storedPlan.ID
 	candidate.FinalManifestID = manifestID
@@ -1012,6 +942,14 @@ func (s *Store) CreateAndBindRevisionCandidatePlan(ctx context.Context, request 
 		return FrozenPlan{}, RevisionCandidate{}, err
 	}
 	return storedPlan, candidate, nil
+}
+
+func revisionCandidatePlanBindingComplete(candidate RevisionCandidate) bool {
+	return candidate.FrozenPlanID != "" && candidate.FinalManifestID != "" && candidate.ChildRunManifestJSON != ""
+}
+
+func revisionCandidatePlanBindingStarted(candidate RevisionCandidate) bool {
+	return candidate.FrozenPlanID != "" || candidate.FinalManifestID != "" || candidate.ChildRunManifestJSON != ""
 }
 
 func validateRevisionCandidatePlanFactsTx(ctx context.Context, tx *sql.Tx, candidate RevisionCandidate, plan FrozenPlan) error {

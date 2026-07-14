@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
-	"time"
 )
 
 func tempDB(t *testing.T) *Store {
@@ -42,15 +41,19 @@ func TestOpenBootstrapsV2OnlySchema(t *testing.T) {
 			t.Fatalf("V2 bootstrap retained legacy column %q", column)
 		}
 	}
-	var version, v1History int
-	if err := s.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil {
+	var version, versionRows, v1History int
+	if err := s.db.QueryRow(`SELECT MAX(version), COUNT(*) FROM schema_version`).Scan(&version, &versionRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE version = 1`).Scan(&v1History); err != nil {
 		t.Fatal(err)
 	}
-	if version != schemaVersion || v1History != 0 {
-		t.Fatalf("V2 bootstrap versions = current:%d v1_rows:%d", version, v1History)
+	var marker string
+	if err := s.db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, baselineV2MetadataKey).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion || versionRows != 1 || v1History != 0 || marker != baselineV2MetadataValue {
+		t.Fatalf("V2 bootstrap state = current:%d rows:%d v1_rows:%d marker:%q", version, versionRows, v1History, marker)
 	}
 }
 
@@ -192,133 +195,93 @@ func TestOpenAndOpenReadOnlyRejectV1StoreMarkers(t *testing.T) {
 	}
 }
 
-func TestMigratePureV16StoreRemovesRetiredIdentityColumns(t *testing.T) {
-	root := t.TempDir()
-	taskID, revisionID, runID := createPureV16StoreWithRetiredIdentityColumns(t, root)
-
-	s, err := Open(root)
-	if err != nil {
-		t.Fatalf("migrate pure V16 store: %v", err)
-	}
-	defer s.Close()
-
-	for _, column := range []string{"identity_state", "legacy_v1_task_id", "legacy_identity"} {
-		var found int
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('tasks_v2') WHERE name = ?`, column).Scan(&found); err != nil {
-			t.Fatal(err)
-		}
-		if found != 0 {
-			t.Fatalf("V17 retained retired column %q", column)
-		}
-	}
-	if task, err := s.GetTaskV2(context.Background(), taskID); err != nil || task == nil || task.ID != taskID || task.CurrentRevisionID != revisionID {
-		t.Fatalf("migrated task = %+v, %v", task, err)
-	}
-	if revision, err := s.GetTaskRevision(context.Background(), revisionID); err != nil || revision == nil || revision.TaskID != taskID {
-		t.Fatalf("migrated revision = %+v, %v", revision, err)
-	}
-	if run, err := s.GetWorkflowRun(context.Background(), runID); err != nil || run == nil || run.TaskID != taskID || run.RevisionID != revisionID {
-		t.Fatalf("migrated run = %+v, %v", run, err)
-	}
-	rows, err := s.db.Query(`PRAGMA foreign_key_check`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	if rows.Next() {
-		t.Fatal("V17 migration left a foreign-key violation")
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	var version, triggerCount int
-	if err := s.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'task_purge_v7_blocks_task_mutation'`).Scan(&triggerCount); err != nil {
-		t.Fatal(err)
-	}
-	if version != schemaVersion || triggerCount != 1 {
-		t.Fatalf("V17 migration state = version:%d purge_trigger:%d", version, triggerCount)
-	}
-}
-
-func createPureV16StoreWithRetiredIdentityColumns(t *testing.T, root string) (string, string, string) {
-	t.Helper()
-	dbPath := filepath.Join(root, dbFileName)
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(1)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(migrationV2); err != nil {
-		t.Fatalf("create V2 fixture: %v", err)
-	}
-	for _, statement := range []string{
-		`ALTER TABLE tasks_v2 ADD COLUMN identity_state TEXT NOT NULL DEFAULT 'canonical' CHECK (identity_state IN ('canonical', 'legacy_orphan'))`,
-		`ALTER TABLE tasks_v2 ADD COLUMN legacy_v1_task_id INTEGER`,
-		`ALTER TABLE tasks_v2 ADD COLUMN legacy_identity TEXT NOT NULL DEFAULT ''`,
-		`CREATE INDEX idx_tasks_v2_identity_state ON tasks_v2(identity_state)`,
-		`CREATE UNIQUE INDEX idx_tasks_v2_canonical_import_identity ON tasks_v2(legacy_identity, source_repo, source_commit) WHERE identity_state = 'canonical' AND legacy_identity <> ''`,
-	} {
-		if _, err := db.Exec(statement); err != nil {
-			t.Fatalf("extend V2 fixture with retired identity fields: %v", err)
-		}
-	}
-	if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (2)`); err != nil {
-		t.Fatal(err)
-	}
-	fixture := &Store{db: db}
-	for version := 3; version <= 16; version++ {
-		if err := fixture.applyMigration(version); err != nil {
-			t.Fatalf("apply V%d fixture migration: %v", version, err)
-		}
+func TestOpenAndOpenReadOnlyRejectPreConsolidationStoresWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		create func(*sql.DB) error
+		verify func(*sql.DB) error
+	}{
+		{
+			name: "historical_version_twenty",
+			create: func(db *sql.DB) error {
+				if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
+					return err
+				}
+				_, err := db.Exec(`INSERT INTO schema_version (version) VALUES (20)`)
+				return err
+			},
+			verify: func(db *sql.DB) error {
+				var version, metadataTables int
+				if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+					return err
+				}
+				if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_metadata'`).Scan(&metadataTables); err != nil {
+					return err
+				}
+				if version != 20 || metadataTables != 0 {
+					return errors.New("historical V20 fixture was rewritten")
+				}
+				return nil
+			},
+		},
+		{
+			name: "unmarked_historical_version_two",
+			create: func(db *sql.DB) error {
+				if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
+					return err
+				}
+				_, err := db.Exec(`INSERT INTO schema_version (version) VALUES (2)`)
+				return err
+			},
+			verify: func(db *sql.DB) error {
+				var version, metadataTables int
+				if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+					return err
+				}
+				if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_metadata'`).Scan(&metadataTables); err != nil {
+					return err
+				}
+				if version != 2 || metadataTables != 0 {
+					return errors.New("historical V2 fixture was rewritten")
+				}
+				return nil
+			},
+		},
 	}
 
-	taskID, err := NewUUIDv7()
-	if err != nil {
-		t.Fatal(err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			dbPath := filepath.Join(root, dbFileName)
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.create(db); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Open(root); !errors.Is(err, ErrPreConsolidationStore) {
+				t.Fatalf("Open pre-consolidation fixture error = %v, want ErrPreConsolidationStore", err)
+			}
+			if _, err := OpenReadOnly(root); !errors.Is(err, ErrPreConsolidationStore) {
+				t.Fatalf("OpenReadOnly pre-consolidation fixture error = %v, want ErrPreConsolidationStore", err)
+			}
+
+			db, err = sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := test.verify(db); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
-	revisionID, err := NewUUIDv7()
-	if err != nil {
-		t.Fatal(err)
-	}
-	runID, err := NewUUIDv7()
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	if _, err := db.Exec(`
-		INSERT INTO tasks_v2 (
-			id, slug, title, metadata_json, source_repo, source_commit,
-			lifecycle_state, current_revision_id, identity_state, legacy_v1_task_id,
-			legacy_identity, created_at, updated_at, deleted_at, version
-		) VALUES (?, 'v16-task', '', '{}', 'https://example.invalid/repo', 'commit', 'ready', ?, 'canonical', 42, 'retired-identity', ?, ?, NULL, 1)
-	`, taskID, revisionID, now, now); err != nil {
-		t.Fatalf("insert V16 task fixture: %v", err)
-	}
-	if _, err := db.Exec(`
-		INSERT INTO task_revisions (
-			id, task_id, version_number, parent_revision_id, origin, task_digest,
-			proposal_digest, manifest_id, state, validation_evidence_manifest, state_version,
-			state_updated_by, state_updated_at, change_summary, metadata_json, created_by, created_at
-		) VALUES (?, ?, 1, NULL, 'manual', ?, '', '', 'sealed', '', 1, 'fixture', ?, '', '{}', 'fixture', ?)
-	`, revisionID, taskID, validTaskDigest("a"), now, now); err != nil {
-		t.Fatalf("insert V16 task revision fixture: %v", err)
-	}
-	if _, err := db.Exec(`
-		INSERT INTO workflow_runs (
-			id, task_id, revision_id, workflow_template_id, workflow_template_version,
-			resolved_profile_hash, definition_hash, run_manifest_json, trigger, created_by, created_at
-		) VALUES (?, ?, ?, 'fixture.workflow', 'v1', 'profile', 'definition', '{}', 'fixture', 'fixture', ?)
-	`, runID, taskID, revisionID, now); err != nil {
-		t.Fatalf("insert V16 workflow run fixture: %v", err)
-	}
-	return taskID, revisionID, runID
 }
 
 func snapshotStoreFiles(t *testing.T, root string) map[string][]byte {

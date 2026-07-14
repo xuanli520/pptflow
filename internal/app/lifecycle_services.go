@@ -30,22 +30,23 @@ var (
 // and CLI adapters should depend on the individual services below rather than
 // modify workspaces, SQLite records, or task snapshots directly.
 type LifecycleServices struct {
-	Tasks          *TaskService
-	Revisions      *RevisionService
-	Runs           *RunService
-	Reviews        *ReviewService
-	Releases       *ReleaseService
-	Deletion       *DeletionService
-	Control        *ExecutionControlService
-	Budgets        *BudgetGrantService
-	Continuations  *TaskContinuationService
-	Changes        *ChangeProviderService
-	Repairs        *RepairLoopService
-	Candidates     *CandidateRetentionService
-	Inspection     *LifecycleInspectionService
-	LocalRuntime   *LocalRuntimeService
-	WorkerHandoffs *RunWorkerHandoffService
-	Mutations      *LifecycleMutationService
+	Tasks              *TaskService
+	Revisions          *RevisionService
+	Runs               *RunService
+	Reviews            *ReviewService
+	Releases           *ReleaseService
+	Deletion           *DeletionService
+	Control            *ExecutionControlService
+	Budgets            *BudgetGrantService
+	Continuations      *TaskContinuationService
+	Changes            *ChangeProviderService
+	Repairs            *RepairLoopService
+	Candidates         *CandidateRetentionService
+	Inspection         *LifecycleInspectionService
+	CodeEdgeCompliance *CodeEdgeComplianceService
+	LocalRuntime       *LocalRuntimeService
+	WorkerHandoffs     *RunWorkerHandoffService
+	Mutations          *LifecycleMutationService
 
 	core *lifecycleServiceCore
 }
@@ -66,6 +67,12 @@ type lifecycleServiceCore struct {
 // stage operation resolves through OperationResolver without performing work.
 type LifecycleServicesOptions struct {
 	OperationResolver workflowadapter.StageOperationResolver
+	// ChangeProviders are exact externally controlled change implementations
+	// installed at composition time. In particular, AgentRepairProvider must
+	// never be synthesized from PATH, ambient model defaults, or caller input.
+	// An omitted agent provider leaves automated repair unavailable while the
+	// explicit local patch provider remains available.
+	ChangeProviders []ChangeProvider
 	// DeploymentCatalogResolver opts this lifecycle composition into the
 	// immutable production operation-catalog receipt contract. It is separate
 	// from OperationResolver so test-only accept-all resolvers do not acquire a
@@ -137,28 +144,32 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	}
 	continuations := newTaskContinuationService(core)
 	changes := newChangeProviderService(core)
+	for _, provider := range options.ChangeProviders {
+		changes.Register(provider)
+	}
 	core.changes = changes
 	repairs := newRepairLoopService(core)
 	core.repairs = repairs
 	mutations := newLifecycleMutationService(core)
 	return &LifecycleServices{
-		Tasks:          &TaskService{core: core},
-		Revisions:      &RevisionService{core: core},
-		Runs:           &RunService{core: core},
-		Reviews:        &ReviewService{core: core},
-		Releases:       &ReleaseService{core: core},
-		Deletion:       &DeletionService{core: core},
-		Control:        &ExecutionControlService{core: core},
-		Budgets:        &BudgetGrantService{core: core},
-		Continuations:  continuations,
-		Changes:        changes,
-		Repairs:        repairs,
-		Candidates:     &CandidateRetentionService{core: core},
-		Inspection:     &LifecycleInspectionService{core: core},
-		LocalRuntime:   &LocalRuntimeService{core: core},
-		WorkerHandoffs: &RunWorkerHandoffService{core: core},
-		Mutations:      mutations,
-		core:           core,
+		Tasks:              &TaskService{core: core},
+		Revisions:          &RevisionService{core: core},
+		Runs:               &RunService{core: core},
+		Reviews:            &ReviewService{core: core},
+		Releases:           &ReleaseService{core: core},
+		Deletion:           &DeletionService{core: core},
+		Control:            &ExecutionControlService{core: core},
+		Budgets:            &BudgetGrantService{core: core},
+		Continuations:      continuations,
+		Changes:            changes,
+		Repairs:            repairs,
+		Candidates:         &CandidateRetentionService{core: core},
+		Inspection:         &LifecycleInspectionService{core: core},
+		CodeEdgeCompliance: &CodeEdgeComplianceService{core: core},
+		LocalRuntime:       &LocalRuntimeService{core: core},
+		WorkerHandoffs:     &RunWorkerHandoffService{core: core},
+		Mutations:          mutations,
+		core:               core,
 	}, nil
 }
 
@@ -180,6 +191,20 @@ func (services *LifecycleServices) Store() *store.Store {
 		return nil
 	}
 	return services.core.store
+}
+
+// CatalogLockAttestedWorkflowkitProviderResolver returns the one production
+// provider resolver that was installed when these services were composed. It
+// deliberately exposes only the catalog-lock-attested form: a worker must not
+// reuse an arbitrary test resolver, a mutable registry, or a PATH fallback.
+// Nil means this is a read/control-plane composition with no installed
+// production external-operation capability.
+func (services *LifecycleServices) CatalogLockAttestedWorkflowkitProviderResolver() *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver {
+	if services == nil || services.core == nil {
+		return nil
+	}
+	resolver, _ := services.core.operationResolver.(*stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver)
+	return resolver
 }
 
 // TaskService owns stable task identity and lifecycle-state mutations.
@@ -947,7 +972,7 @@ type workflowRunExecutionPayload struct {
 	Format                   string                              `json:"format"`
 	RunID                    string                              `json:"run_id"`
 	DefinitionHash           string                              `json:"definition_hash"`
-	ExecutionSpecFingerprint workflowkit.Fingerprint             `json:"execution_spec_fingerprint,omitempty"`
+	ExecutionSpecFingerprint workflowkit.Fingerprint             `json:"execution_spec_fingerprint"`
 	QuotaPolicy              workflowadapter.ResolvedQuotaPolicy `json:"quota_policy"`
 }
 
@@ -994,6 +1019,14 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("compile explicit execution profile: %w", err)
 	}
+	profileCanonical, err := request.Profile.CanonicalJSON()
+	if err != nil {
+		return store.WorkflowRun{}, fmt.Errorf("canonicalize explicit execution profile: %w", err)
+	}
+	profileFingerprint, err := request.Profile.Fingerprint()
+	if err != nil || profileFingerprint != resolved.ExecutionProfileFingerprint {
+		return store.WorkflowRun{}, fmt.Errorf("explicit execution profile fingerprint does not match compiled workflow")
+	}
 	if request.ProfileFingerprint != "" && request.ProfileFingerprint != resolved.ExecutionProfileFingerprint {
 		return store.WorkflowRun{}, fmt.Errorf("%w: supplied execution profile fingerprint does not match compiled profile", store.ErrIdempotencyConflict)
 	}
@@ -1022,7 +1055,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if existing, err := service.core.store.GetWorkflowRun(ctx, runID); err != nil {
 		return store.WorkflowRun{}, err
 	} else if existing != nil {
-		if err := service.validateReplayedWorkflowRun(*existing, request, resolved, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); err != nil {
+		if err := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, specificationCanonical, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); err != nil {
 			return store.WorkflowRun{}, err
 		}
 		return *existing, nil
@@ -1044,7 +1077,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		createdRunDirectory = true
 	}
 	if !createdRunDirectory {
-		storedManifest, err := readRecoverableRunManifest(manifestPath, runID, request, resolved, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity)
+		storedManifest, err := readRecoverableRunManifest(manifestPath, runID, request, resolved, profileCanonical, specificationCanonical, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity)
 		if err != nil {
 			return store.WorkflowRun{}, err
 		}
@@ -1085,6 +1118,12 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		return store.WorkflowRun{}, fmt.Errorf("encode run manifest: %w", err)
 	}
 	if createdRunDirectory {
+		if err := writeNewBytes(filepath.Join(runDirectory, runExecutionProfileFileName), profileCanonical); err != nil {
+			return store.WorkflowRun{}, fmt.Errorf("write frozen execution profile: %w", err)
+		}
+		if err := writeNewBytes(filepath.Join(runDirectory, runExecutionSpecFileName), specificationCanonical); err != nil {
+			return store.WorkflowRun{}, fmt.Errorf("write frozen execution specification: %w", err)
+		}
 		if len(catalogReceipt) != 0 {
 			if err := writeNewBytes(filepath.Join(runDirectory, deploymentCatalogReceiptFileName), catalogReceipt); err != nil {
 				return store.WorkflowRun{}, fmt.Errorf("write frozen deployment catalog receipt: %w", err)
@@ -1133,7 +1172,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		if errors.Is(err, store.ErrIdentityCollision) {
 			if existing, lookupErr := service.core.store.GetWorkflowRun(ctx, runID); lookupErr == nil && existing != nil {
-				if validateErr := service.validateReplayedWorkflowRun(*existing, request, resolved, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); validateErr == nil {
+				if validateErr := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, specificationCanonical, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); validateErr == nil {
 					return *existing, nil
 				}
 			}
@@ -1168,7 +1207,7 @@ func resolveFrozenRunTemplate(profile workflowadapter.ExecutionProfile, specific
 	return profileTemplate, nil
 }
 
-func readRecoverableRunManifest(path, runID string, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, specificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) (bool, error) {
+func readRecoverableRunManifest(path, runID string, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical, specificationCanonical []byte, specificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1183,7 +1222,7 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != runID || manifest.TaskID != request.TaskID || manifest.Revision != request.RevisionID ||
 		manifest.Resolved.TemplateID != resolved.TemplateID || manifest.Resolved.TemplateVersion != resolved.TemplateVersion ||
 		manifest.Resolved.ExecutionProfileFingerprint != resolved.ExecutionProfileFingerprint || manifest.Resolved.DefinitionFingerprint != resolved.DefinitionFingerprint ||
-		!manifestMatchesExecutionSpec(manifest, request, specificationFingerprint) ||
+		!manifestMatchesExecutionSpec(manifest, request, specificationCanonical, specificationFingerprint) ||
 		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, initialExecutionPlan) ||
 		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) ||
 		!manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
@@ -1198,6 +1237,20 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 		if !bytes.Equal(receiptRaw, catalogReceipt) {
 			return false, fmt.Errorf("existing managed deployment catalog receipt does not match the requested frozen profile")
 		}
+	}
+	profileRaw, profileErr := readManagedRunExecutionInputFile(filepath.Join(filepath.Dir(path), runExecutionProfileFileName), "execution profile")
+	if profileErr != nil {
+		return false, profileErr
+	}
+	if !bytes.Equal(profileRaw, profileCanonical) {
+		return false, fmt.Errorf("existing managed execution profile does not match the requested frozen profile")
+	}
+	specificationRaw, specificationErr := readManagedRunExecutionInputFile(filepath.Join(filepath.Dir(path), runExecutionSpecFileName), "execution specification")
+	if specificationErr != nil {
+		return false, specificationErr
+	}
+	if !bytes.Equal(specificationRaw, specificationCanonical) {
+		return false, fmt.Errorf("existing managed execution specification does not match the requested frozen profile")
 	}
 	if lockIdentity != nil {
 		lockPath := filepath.Join(filepath.Dir(path), deploymentCatalogLockIdentityFileName)
@@ -1216,7 +1269,7 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 	return true, nil
 }
 
-func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, specificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
+func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical, specificationCanonical []byte, specificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
 	if run.TaskID != request.TaskID || run.RevisionID != request.RevisionID || run.WorkflowTemplateID != resolved.TemplateID ||
 		run.WorkflowTemplateVersion != resolved.TemplateVersion || run.ResolvedProfileHash != string(resolved.ExecutionProfileFingerprint) ||
 		run.DefinitionHash != string(resolved.DefinitionFingerprint) || run.Trigger != request.Trigger || run.ExecutionEpoch != request.ExecutionEpoch {
@@ -1224,7 +1277,7 @@ func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, re
 	}
 	var manifest runManifest
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil ||
-		!manifestMatchesExecutionSpec(manifest, request, specificationFingerprint) ||
+		!manifestMatchesExecutionSpec(manifest, request, specificationCanonical, specificationFingerprint) ||
 		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, initialExecutionPlan) ||
 		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) ||
 		!manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
@@ -1232,6 +1285,14 @@ func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, re
 	}
 	if service == nil || service.core == nil {
 		return fmt.Errorf("run service is not configured")
+	}
+	profile, _, err := service.core.verifyRunManagedExecutionInputs(context.Background(), run)
+	if err != nil {
+		return fmt.Errorf("%w: workflow run %s managed execution inputs: %w", store.ErrIdempotencyConflict, run.ID, err)
+	}
+	canonicalProfile, err := profile.CanonicalJSON()
+	if err != nil || !bytes.Equal(canonicalProfile, profileCanonical) {
+		return fmt.Errorf("%w: workflow run %s execution profile", store.ErrIdempotencyConflict, run.ID)
 	}
 	if err := service.core.verifyRunDeploymentCatalogReceipt(run); err != nil {
 		return fmt.Errorf("%w: workflow run %s deployment catalog receipt: %w", store.ErrIdempotencyConflict, run.ID, err)
@@ -1278,7 +1339,7 @@ func validateRunExecutionSpecOperationResolver(specification workflowadapter.Run
 	return nil
 }
 
-func manifestMatchesExecutionSpec(manifest runManifest, request StartRunRequest, fingerprint workflowkit.Fingerprint) bool {
+func manifestMatchesExecutionSpec(manifest runManifest, request StartRunRequest, expectedCanonical []byte, fingerprint workflowkit.Fingerprint) bool {
 	if manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat ||
 		manifest.Inputs.ProfileFingerprint != manifest.Resolved.ExecutionProfileFingerprint ||
 		manifest.Inputs.ExecutionSpecFingerprint != fingerprint || len(manifest.ExecutionSpec) == 0 {
@@ -1289,6 +1350,10 @@ func manifestMatchesExecutionSpec(manifest runManifest, request StartRunRequest,
 	}
 	specification, err := workflowadapter.ParseRunExecutionSpecJSON(manifest.ExecutionSpec)
 	if err != nil {
+		return false
+	}
+	canonical, err := specification.CanonicalJSON()
+	if err != nil || !bytes.Equal(canonical, expectedCanonical) {
 		return false
 	}
 	storedFingerprint, err := specification.Fingerprint()

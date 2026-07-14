@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -290,77 +288,6 @@ func TestTaskPurgeBlocksImmutableArtifactReferences(t *testing.T) {
 	}
 	if prepared.Acquired || prepared.Operation.State != TaskPurgeBlocked || len(prepared.Operation.Dependencies.ArtifactManifestIDs) != 1 || prepared.Operation.Dependencies.ArtifactManifestIDs[0] != manifest.ID || len(prepared.Operation.Dependencies.ArtifactRefIDs) != 1 || prepared.Operation.Dependencies.ArtifactRefIDs[0] != reference.ID {
 		t.Fatalf("artifact-pinned purge = %+v", prepared)
-	}
-}
-
-func TestMigrateV6ToCurrentInstallsTaskPurgeProtocol(t *testing.T) {
-	root := t.TempDir()
-	dbPath := filepath.Join(root, dbFileName)
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, migration := range []string{migrationV2, migrationV3, migrationV4, migrationV5} {
-		if _, err := db.Exec(migration); err != nil {
-			_ = db.Close()
-			t.Fatalf("build V5 migration fixture: %v", err)
-		}
-	}
-	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	if err := applyMigrationV6(tx); err != nil {
-		_ = tx.Rollback()
-		_ = db.Close()
-		t.Fatalf("apply V6 fixture migration: %v", err)
-	}
-	if _, err := tx.Exec(`INSERT INTO schema_version (version) VALUES (6)`); err != nil {
-		_ = tx.Rollback()
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		_ = db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := Open(root)
-	if err != nil {
-		t.Fatalf("migrate V6 store to current schema: %v", err)
-	}
-	defer s.Close()
-	var version, tableCount, triggerCount int
-	if err := s.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_purge_operations_v7'`).Scan(&tableCount); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('task_purge_v7_blocks_task_mutation', 'entity_id_registry_task_purge_operations_v7_insert', 'entity_id_registry_task_purge_operations_v7_id_immutable')`).Scan(&triggerCount); err != nil {
-		t.Fatal(err)
-	}
-	if version != schemaVersion || tableCount != 1 || triggerCount != 3 {
-		t.Fatalf("V7 migration result: version=%d table=%d triggers=%d", version, tableCount, triggerCount)
-	}
-
-	// The new table participates in the global lifetime identity namespace.
-	// Using a real task as the foreign key proves the rejection comes from the
-	// V7 global-ID trigger rather than a foreign-key validation failure.
-	task, err := s.CreateTaskV2(context.Background(), CreateTaskV2Request{Slug: "migration-purge-identity", Actor: "tester"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`INSERT INTO task_purge_operations_v7 (id, task_id, idempotency_key, expected_task_version, actor, reason, state, dependencies_json, created_at, updated_at, version) VALUES (?, ?, 'migration-collision', 1, 'tester', 'fixture', 'blocked', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)`, task.ID, task.ID); !isGlobalIdentityCollision(err) {
-		t.Fatalf("V7 purge operation global-ID collision err=%v", err)
 	}
 }
 

@@ -29,12 +29,15 @@ type runWorkerCommandDependencies struct {
 func defaultRunWorkerRuntimeFactory(services *app.LifecycleServices) (app.DurableJobHandler, error) {
 	// A worker registers every closed template compiled into this Harbor build,
 	// but each plugin executor still dispatches only by the template frozen in
-	// the claimed RunExecutionSpec. With no installed production provider
-	// composition the registry is an explicit rejector; it never revives the
-	// retired app-specific executor, stage-name or PATH fallback.
-	registry, err := stageprovider.NewWorkflowkitStageExecutorRegistry(stageprovider.WorkflowkitRegistryOptions{
-		Templates: workflowadapter.BuiltinTemplateReferences(),
-	})
+	// the claimed RunExecutionSpec. A catalog-lock-attested resolver installed
+	// by the common lifecycle composition is reused exactly here. Without one,
+	// the registry is an explicit rejector; it never revives the retired
+	// app-specific executor, stage-name, PATH, or model-default fallback.
+	options := stageprovider.WorkflowkitRegistryOptions{Templates: workflowadapter.BuiltinTemplateReferences()}
+	if resolver := services.CatalogLockAttestedWorkflowkitProviderResolver(); resolver != nil {
+		options.Providers = resolver
+	}
+	registry, err := stageprovider.NewWorkflowkitStageExecutorRegistry(options)
 	if err != nil {
 		return nil, fmt.Errorf("create Harbor V2 workflowkit registry: %w", err)
 	}

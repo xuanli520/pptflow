@@ -8,14 +8,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
-	"github.com/purplevoid/harbor-factory/internal/runtime/codexruntime"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -51,7 +53,11 @@ func newChangeProviderService(core *lifecycleServiceCore) *ChangeProviderService
 	service := &ChangeProviderService{core: core, providers: make(map[string]ChangeProvider)}
 	service.observer = storeContinuationStateObserver{dataStore: core.store, objects: core.objects}
 	service.Register(LocalPatchProvider{})
-	service.Register(AgentRepairProvider{Agent: codexruntime.New(nil, "", nil)})
+	// An automated repair agent is an external side effect. It is deliberately
+	// not installed from host PATH or runtime defaults: a production composition
+	// must inject an exact, catalog/lock-attested provider before this service
+	// will accept agent_repair. Tests and embedding applications can register an
+	// explicit controlled implementation through Register.
 	return service
 }
 
@@ -105,9 +111,8 @@ func (service *ChangeProviderService) PlanTaskChange(ctx context.Context, comman
 			}
 			return ChangePlanResult{}, fmt.Errorf("%w: %s", store.ErrContinuationPlanExpired, existing.ID)
 		}
-		candidate, err = service.recoverFrozenCandidatePlanBinding(ctx, *candidate, *existing, command)
-		if err != nil {
-			return ChangePlanResult{}, err
+		if candidate.FrozenPlanID != existing.ID || candidate.FinalManifestID == "" || candidate.ChildRunManifestJSON == "" {
+			return ChangePlanResult{}, fmt.Errorf("%w: frozen continuation plan %s is not fully bound to candidate %s", ErrChangeReconciliationRequired, existing.ID, candidate.ID)
 		}
 		plan, err := (&TaskContinuationService{core: service.core}).decodeFrozenPlan(ctx, *existing)
 		if err != nil {
@@ -742,7 +747,7 @@ func (service *ChangeProviderService) freezeCandidatePlan(ctx context.Context, c
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, candidate, err
 	}
-	childManifest, err := service.ensureCandidateChildRunManifest(candidate, run)
+	childManifest, err := service.ensureCandidateChildRunManifest(ctx, candidate, run)
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, candidate, err
 	}
@@ -770,67 +775,6 @@ func (service *ChangeProviderService) freezeCandidatePlan(ctx context.Context, c
 	return decoded, candidate, nil
 }
 
-// recoverFrozenCandidatePlanBinding closes the compatibility window for a
-// process that died after older code wrote a frozen plan but before it bound
-// the candidate. It reuses the original immutable plan bytes and expiration;
-// it never re-plans or silently renews a 24-hour TTL.
-func (service *ChangeProviderService) recoverFrozenCandidatePlanBinding(ctx context.Context, candidate store.RevisionCandidate, plan store.FrozenPlan, command ContinueTaskCommand) (*store.RevisionCandidate, error) {
-	if candidate.FrozenPlanID == plan.ID && candidate.FinalManifestID != "" && candidate.ChildRunManifestJSON != "" {
-		return &candidate, nil
-	}
-	if candidate.State != store.RevisionCandidatePrepared {
-		return nil, fmt.Errorf("%w: revision candidate %s is %s", ErrChangeReconciliationRequired, candidate.ID, candidate.State)
-	}
-	run, task, revision, err := (&TaskContinuationService{core: service.core}).loadRunBinding(ctx, candidate.SourceRunID)
-	if err != nil {
-		return nil, err
-	}
-	if task.ID != candidate.TaskID || revision.ID != candidate.BaseRevisionID {
-		return nil, fmt.Errorf("revision candidate source binding changed")
-	}
-	manifestID, err := service.ensureCandidateFinalSnapshot(ctx, candidate)
-	if err != nil {
-		return nil, err
-	}
-	childManifest, err := service.ensureCandidateChildRunManifest(candidate, run)
-	if err != nil {
-		return nil, err
-	}
-	stored, bound, err := service.core.store.CreateAndBindRevisionCandidatePlan(ctx, store.CreateAndBindRevisionCandidatePlanRequest{
-		Plan:                     frozenPlanCreateRequest(plan, command),
-		CandidateID:              candidate.ID,
-		ExpectedCandidateVersion: candidate.Version,
-		FinalManifestID:          manifestID,
-		ChildRunManifestJSON:     childManifest,
-		Actor:                    command.Actor,
-		Reason:                   command.Reason,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if stored.ID != plan.ID {
-		return nil, fmt.Errorf("recovered candidate plan identity mismatch")
-	}
-	return &bound, nil
-}
-
-func frozenPlanCreateRequest(plan store.FrozenPlan, command ContinueTaskCommand) store.CreateFrozenPlanRequest {
-	return store.CreateFrozenPlanRequest{
-		ID:                  plan.ID,
-		CommandID:           plan.CommandID,
-		PreparedChangeID:    plan.PreparedChangeID,
-		SubjectID:           plan.SubjectID,
-		SubjectRevisionID:   plan.SubjectRevisionID,
-		SubjectDigest:       plan.SubjectDigest,
-		WorkflowFingerprint: plan.WorkflowFingerprint,
-		PlanFingerprint:     plan.PlanFingerprint,
-		PayloadJSON:         plan.PayloadJSON,
-		ExpiresAt:           plan.ExpiresAt,
-		Actor:               command.Actor,
-		Reason:              command.Reason,
-	}
-}
-
 func (service *ChangeProviderService) expireCandidatePlan(ctx context.Context, candidate store.RevisionCandidate, actor, reason string) error {
 	_, err := service.core.store.ExpireRevisionCandidate(ctx, store.ExpireRevisionCandidateRequest{
 		CandidateID: candidate.ID, ExpectedVersion: candidate.Version, Actor: actor, Reason: reason,
@@ -847,6 +791,12 @@ func buildRevisionCandidatePlan(planID, commandID string, command ContinueTaskCo
 	scheduled := make([]workflowkit.NodeID, 0, len(workflow.Stages))
 	for _, stage := range workflow.Stages {
 		transition := workflowkit.NodeTransition{NodeID: stage.Key, FromGeneration: 0, ToGeneration: 0, ExpectedInputFingerprint: emptyInputs}
+		if stage.OperatorOnly() {
+			transition.Disposition = workflowkit.DispositionOperatorOnly
+			transition.ReasonCodes = []workflowkit.PlanReason{"operator_only_lifecycle_action"}
+			transitions = append(transitions, transition)
+			continue
+		}
 		if stage.Effect == workflowkit.EffectExternalSideEffect {
 			transition.Disposition = workflowkit.DispositionInvalidate
 			transition.ReasonCodes = []workflowkit.PlanReason{"candidate_revision_changed", "external_confirmation_required"}
@@ -914,10 +864,22 @@ func (service *ChangeProviderService) ensureCandidateFinalSnapshot(ctx context.C
 	return string(object.Digest), nil
 }
 
-func (service *ChangeProviderService) ensureCandidateChildRunManifest(candidate store.RevisionCandidate, source store.WorkflowRun) (string, error) {
+func (service *ChangeProviderService) ensureCandidateChildRunManifest(ctx context.Context, candidate store.RevisionCandidate, source store.WorkflowRun) (string, error) {
 	var original runManifest
 	if err := decodeStrictJSON(source.RunManifestJSON, &original); err != nil {
 		return "", err
+	}
+	profile, _, err := service.core.verifyRunManagedExecutionInputs(ctx, source)
+	if err != nil {
+		return "", fmt.Errorf("verify source run managed execution inputs: %w", err)
+	}
+	profileCanonical, err := profile.CanonicalJSON()
+	if err != nil {
+		return "", fmt.Errorf("canonicalize source run execution profile: %w", err)
+	}
+	frozen, err := decodeFrozenRunDefinition(source)
+	if err != nil {
+		return "", fmt.Errorf("decode source frozen run definition: %w", err)
 	}
 	catalogReceipt, err := canonicalManifestDeploymentCatalogReceipt(original)
 	if err != nil {
@@ -930,16 +892,44 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(candidate 
 	if err := service.core.verifyRunDeploymentCatalogReceipt(source); err != nil {
 		return "", fmt.Errorf("verify source run deployment catalog receipt: %w", err)
 	}
-	if err := original.InitialExecutionPlan.Validate(original.Resolved.Descriptor); err != nil {
-		return "", fmt.Errorf("validate source run initial execution plan: %w", err)
+	childSpecification, childSpecificationCanonical, childSpecificationFingerprint, childInputs, err := rebindCandidateChildRunExecutionSpec(original, candidate)
+	if err != nil {
+		return "", err
+	}
+	if err := validateRunExecutionSpecOperationResolver(childSpecification, service.core.operationResolver); err != nil {
+		return "", fmt.Errorf("validate candidate child execution specification operations: %w", err)
+	}
+	if err := service.core.validateDeploymentCatalogExecutionSpec(childSpecification); err != nil {
+		return "", fmt.Errorf("validate candidate child execution specification against deployment catalog: %w", err)
+	}
+	initialExecutionPlan, err := workflowkit.CompileDependencyExecutionPlan(frozen.Workflow)
+	if err != nil {
+		return "", fmt.Errorf("compile candidate child initial execution plan: %w", err)
 	}
 	manifest := runManifest{Format: "harbor.workflow-run-manifest.v2", RunID: candidate.TargetRunID, TaskID: candidate.TaskID,
-		Revision: candidate.TargetRevisionID, Resolved: original.Resolved.Clone(), InitialExecutionPlan: original.InitialExecutionPlan.Clone(),
+		Revision: candidate.TargetRevisionID, Resolved: original.Resolved.Clone(), InitialExecutionPlan: initialExecutionPlan,
+		Inputs: childInputs, ExecutionSpec: append(json.RawMessage(nil), childSpecificationCanonical...),
 		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
 		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity), Created: service.core.now().UTC()}
 	path := filepath.Join(service.core.layout.runDirectory(candidate.TargetRunID), "run-manifest.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return "", err
+	}
+	manifestAlreadyExists, err := regularFileExists(path, "candidate child run manifest")
+	if err != nil {
+		return "", err
+	}
+	if manifestAlreadyExists {
+		if err := validateCandidateChildManagedExecutionInputs(filepath.Dir(path), profileCanonical, childSpecificationCanonical); err != nil {
+			return "", err
+		}
+	} else {
+		if err := ensureCandidateChildManagedExecutionInput(filepath.Join(filepath.Dir(path), runExecutionProfileFileName), "execution profile", profileCanonical); err != nil {
+			return "", err
+		}
+		if err := ensureCandidateChildManagedExecutionInput(filepath.Join(filepath.Dir(path), runExecutionSpecFileName), "execution specification", childSpecificationCanonical); err != nil {
+			return "", err
+		}
 	}
 	if len(catalogReceipt) != 0 {
 		receiptPath := filepath.Join(filepath.Dir(path), deploymentCatalogReceiptFileName)
@@ -972,7 +962,7 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(candidate 
 			}
 			existingLockIdentity, existingCanonicalLockIdentity, parseErr := parseDeploymentCatalogLockIdentityJSON(existingLockIdentityRaw)
 			if parseErr != nil || !bytes.Equal(existingLockIdentityRaw, existingCanonicalLockIdentity) || existingLockIdentity != *lockIdentity {
-				return "", fmt.Errorf("existing candidate child deployment catalog lock identity conflicts: %v", parseErr)
+				return "", fmt.Errorf("%w: existing candidate child deployment catalog lock identity conflicts: %v", stageprovider.ErrDeploymentOperationCatalogLockDrift, parseErr)
 			}
 		}
 	}
@@ -985,7 +975,7 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(candidate 
 			return "", readErr
 		}
 		var existing runManifest
-		if decodeErr := decodeStrictJSON(string(raw), &existing); decodeErr != nil || existing.RunID != manifest.RunID || existing.TaskID != manifest.TaskID || existing.Revision != manifest.Revision || !manifestMatchesDeploymentCatalogReceipt(existing, catalogReceipt) || !manifestMatchesDeploymentCatalogLockIdentity(existing, lockIdentity) {
+		if decodeErr := decodeStrictJSON(string(raw), &existing); decodeErr != nil || existing.RunID != manifest.RunID || existing.TaskID != manifest.TaskID || existing.Revision != manifest.Revision || !reflect.DeepEqual(existing.Resolved, manifest.Resolved) || !manifestMatchesInitialExecutionPlan(existing, frozen.Workflow, initialExecutionPlan) || !manifestMatchesCandidateChildExecutionSpec(existing, childInputs, childSpecificationCanonical, childSpecificationFingerprint) || !manifestMatchesDeploymentCatalogReceipt(existing, catalogReceipt) || !manifestMatchesDeploymentCatalogLockIdentity(existing, lockIdentity) {
 			return "", fmt.Errorf("existing candidate child run manifest conflicts: %v", decodeErr)
 		}
 		return string(raw), nil
@@ -995,6 +985,153 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(candidate 
 		return "", err
 	}
 	return string(encoded), nil
+}
+
+// ensureCandidateChildManagedExecutionInput preserves the same write-once
+// semantics as StartRun while allowing a crashed candidate-plan freeze to be
+// resumed. Existing files must be regular files with exactly the canonical
+// bytes this child manifest names; a child Run never inherits source files by
+// path or by mutable reference.
+func ensureCandidateChildManagedExecutionInput(path, label string, expected []byte) error {
+	if err := writeNewBytes(path, expected); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("write candidate child %s: %w", label, err)
+	}
+	actual, err := readManagedRunExecutionInputFile(path, label)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(actual, expected) {
+		return fmt.Errorf("existing candidate child %s conflicts", label)
+	}
+	return nil
+}
+
+func validateCandidateChildManagedExecutionInputs(directory string, expectedProfile, expectedSpecification []byte) error {
+	profile, err := readManagedRunExecutionInputFile(filepath.Join(directory, runExecutionProfileFileName), "execution profile")
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(profile, expectedProfile) {
+		return fmt.Errorf("existing candidate child execution profile conflicts")
+	}
+	specification, err := readManagedRunExecutionInputFile(filepath.Join(directory, runExecutionSpecFileName), "execution specification")
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(specification, expectedSpecification) {
+		return fmt.Errorf("existing candidate child execution specification conflicts")
+	}
+	return nil
+}
+
+func regularFileExists(path, label string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", label, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular file", label)
+	}
+	return true, nil
+}
+
+// rebindCandidateChildRunExecutionSpec creates a fresh execution selection
+// for a content-changing child Run. A source StartRun input bundle is tied to
+// its source revision and therefore cannot be reused. Only the controlled
+// operation/runtime configuration is retained; the selection and every
+// checkout are rebound to the candidate revision/digest, and the resulting
+// canonical spec receives its own fingerprint.
+//
+// Stage artifacts and evaluator evidence are not represented here. They are
+// run-scoped durable lineage records, and the child Run starts with no stage
+// attempts or artifact references. Its continuation plan must explicitly
+// schedule or invalidate work rather than preserving source-run evidence.
+func rebindCandidateChildRunExecutionSpec(original runManifest, candidate store.RevisionCandidate) (workflowadapter.RunExecutionSpec, []byte, workflowkit.Fingerprint, *runManifestInputs, error) {
+	if original.Inputs == nil || original.Inputs.Format != runManifestInputsFormat {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("source run manifest has no frozen execution inputs")
+	}
+	if original.Inputs.ProfileFingerprint != original.Resolved.ExecutionProfileFingerprint {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("source run manifest profile fingerprint does not match resolved workflow")
+	}
+	if candidate.TaskID != original.TaskID || candidate.BaseRevisionID != original.Revision {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("candidate does not bind source run task/revision")
+	}
+	if err := store.ValidateUUIDv7(candidate.TargetRevisionID); err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("candidate target revision ID: %w", err)
+	}
+	if err := store.ValidateUUIDv7(candidate.TargetRunID); err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("candidate target run ID: %w", err)
+	}
+	baseDigest := workflowkit.SubjectDigest(candidate.BaseDigest)
+	if err := baseDigest.Validate(); err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("candidate base revision digest: %w", err)
+	}
+	targetDigest := workflowkit.SubjectDigest(candidate.AfterDigest)
+	if err := targetDigest.Validate(); err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("candidate target revision digest: %w", err)
+	}
+	if len(original.ExecutionSpec) == 0 {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("source run manifest has no frozen execution specification")
+	}
+	sourceSpecification, err := workflowadapter.ParseRunExecutionSpecJSON(original.ExecutionSpec)
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("parse source frozen execution specification: %w", err)
+	}
+	sourceCanonical, err := sourceSpecification.CanonicalJSON()
+	if err != nil || !bytes.Equal(sourceCanonical, original.ExecutionSpec) {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("source run execution specification is not canonical")
+	}
+	sourceFingerprint, err := sourceSpecification.Fingerprint()
+	if err != nil || sourceFingerprint != original.Inputs.ExecutionSpecFingerprint {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("source run execution specification fingerprint does not match manifest inputs")
+	}
+	if sourceSpecification.Selection.TaskID != original.TaskID || sourceSpecification.Selection.RevisionID != original.Revision || sourceSpecification.Selection.RevisionDigest != baseDigest {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("source run execution specification selection does not match candidate base revision")
+	}
+
+	childSpecification := sourceSpecification.Clone()
+	childSpecification.Selection = workflowadapter.RunSelectionReference{
+		TaskID: candidate.TaskID, RevisionID: candidate.TargetRevisionID, RevisionDigest: targetDigest,
+	}
+	for index := range childSpecification.References.Checkouts {
+		childSpecification.References.Checkouts[index].RevisionID = candidate.TargetRevisionID
+		childSpecification.References.Checkouts[index].RevisionDigest = targetDigest
+	}
+	canonical, err := childSpecification.CanonicalJSON()
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("canonicalize candidate child execution specification: %w", err)
+	}
+	fingerprint, err := childSpecification.Fingerprint()
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", nil, fmt.Errorf("fingerprint candidate child execution specification: %w", err)
+	}
+	inputs := &runManifestInputs{
+		Format:                   runManifestInputsFormat,
+		ProfileFingerprint:       original.Inputs.ProfileFingerprint,
+		ExecutionSpecFingerprint: fingerprint,
+	}
+	return childSpecification, canonical, fingerprint, inputs, nil
+}
+
+func manifestMatchesCandidateChildExecutionSpec(manifest runManifest, expectedInputs *runManifestInputs, expectedCanonical []byte, expectedFingerprint workflowkit.Fingerprint) bool {
+	if expectedInputs == nil || manifest.Inputs == nil || *manifest.Inputs != *expectedInputs || len(manifest.ExecutionSpec) == 0 {
+		return false
+	}
+	specification, err := workflowadapter.ParseRunExecutionSpecJSON(manifest.ExecutionSpec)
+	if err != nil {
+		return false
+	}
+	canonical, err := specification.CanonicalJSON()
+	if err != nil || !bytes.Equal(canonical, expectedCanonical) {
+		return false
+	}
+	fingerprint, err := specification.Fingerprint()
+	return err == nil && fingerprint == expectedFingerprint && manifest.Inputs.ExecutionSpecFingerprint == expectedFingerprint
 }
 
 func mustJSON(value any) string {

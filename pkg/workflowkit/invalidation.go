@@ -70,6 +70,9 @@ const (
 	ImpactPreserve             InvalidationImpact = "preserve"
 	ImpactInvalidate           InvalidationImpact = "invalidate"
 	ImpactRequiresConfirmation InvalidationImpact = "requires_confirmation"
+	// ImpactOperatorOnly preserves a stage's readiness facts in invalidation
+	// output while making clear that continuation scheduling cannot act on it.
+	ImpactOperatorOnly InvalidationImpact = "operator_only"
 )
 
 // InvalidationReason is a stable, machine-readable explanation for an impact.
@@ -82,6 +85,7 @@ const (
 	InvalidationArtifactUnavailable   InvalidationReason = "artifact_unavailable"
 	InvalidationInputFingerprintDrift InvalidationReason = "input_fingerprint_drift"
 	InvalidationReuseForbidden        InvalidationReason = "reuse_forbidden"
+	InvalidationOperatorOnly          InvalidationReason = "operator_only"
 )
 
 // InvalidationEntry is the result for one compiled stage.
@@ -214,6 +218,14 @@ func PlanInvalidation(workflow WorkflowDescriptor, request InvalidationRequest) 
 			if nodeReasons == nil {
 				nodeReasons = make(map[InvalidationReason]struct{})
 				reasons[nodeID] = nodeReasons
+			}
+			if stage.OperatorOnly() {
+				nodeReasons[InvalidationOperatorOnly] = struct{}{}
+				if impacts[nodeID] != ImpactOperatorOnly {
+					impacts[nodeID] = ImpactOperatorOnly
+					changedPass = true
+				}
+				continue
 			}
 			if _, selected := recompute[nodeID]; selected {
 				nodeReasons[InvalidationRecomputeRequested] = struct{}{}

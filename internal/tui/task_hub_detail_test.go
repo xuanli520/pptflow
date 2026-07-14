@@ -117,6 +117,7 @@ func TestTaskHubFrozenExecutionTabShowsBoundCatalogAndExactEvaluationLineageRead
 		DeploymentCatalog: TaskHubDeploymentCatalogFact{
 			State: TaskHubDeploymentCatalogBound, CatalogID: "codeedge-phase1-production", CatalogVersion: "2026.07",
 			TemplateID: "harbor.codeedge-phase1", TemplateVersion: "1.0.0", CatalogFingerprint: "sha256:catalog",
+			LockState: TaskHubDeploymentCatalogLockBound, LockID: "codeedge-phase1-lock", LockVersion: "2026.07", LockFingerprint: "sha256:lock",
 		},
 	}}
 	detail.Runs[0].Stages = append(detail.Runs[0].Stages,
@@ -156,7 +157,7 @@ func TestTaskHubFrozenExecutionTabShowsBoundCatalogAndExactEvaluationLineageRead
 	}
 	rendered := ansi.Strip(m.View())
 	for _, required := range []string{
-		"冻结执行", "冻结 manifest：已解析并与 durable Run 身份一致", "codeedge-phase1-production@2026.07",
+		"冻结执行", "冻结 manifest：已解析并与 durable Run 身份一致", "codeedge-phase1-production@2026.07", "codeedge-phase1-lock@2026.07",
 		"harbor_run_qwen", "qwen-trial-result", "qwen-screenshot", "受验证评测摘要：尚未提供",
 	} {
 		if !strings.Contains(rendered, required) {

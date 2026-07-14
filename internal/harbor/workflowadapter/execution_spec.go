@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -20,7 +21,7 @@ const (
 	RunExecutionSpecFormat = "harbor.run-execution-spec.v1"
 	// RunExecutionSpecVersion is deliberately separate from Format so an
 	// incompatible document revision cannot be accepted by accident.
-	RunExecutionSpecVersion = "3"
+	RunExecutionSpecVersion = "4"
 )
 
 var errInvalidExecutionSpec = errors.New("harbor workflow adapter: invalid run execution spec")
@@ -355,12 +356,13 @@ func (PackageBinding) stageExecutionBinding()           {}
 // ExecutionProfile: profile carries budget policy while this document carries
 // the immutable runtime inputs selected for one Run.
 type RunExecutionSpec struct {
-	Format     string                  `json:"format"`
-	Version    string                  `json:"version"`
-	Template   TemplateReference       `json:"template"`
-	Selection  RunSelectionReference   `json:"selection"`
-	References ExecutionReferenceSet   `json:"references"`
-	Stages     []StageExecutionBinding `json:"stages"`
+	Format                        string                          `json:"format"`
+	Version                       string                          `json:"version"`
+	Template                      TemplateReference               `json:"template"`
+	Selection                     RunSelectionReference           `json:"selection"`
+	References                    ExecutionReferenceSet           `json:"references"`
+	Stages                        []StageExecutionBinding         `json:"stages"`
+	CodeEdgeFinalCompliancePolicy *codeedge.FinalCompliancePolicy `json:"codeedge_final_compliance_policy,omitempty"`
 }
 
 // StageOperationResolution is the complete immutable selection that a
@@ -400,6 +402,10 @@ type StageOperationResolver interface {
 // Clone returns a deep copy. Concrete stage binding types are preserved.
 func (spec RunExecutionSpec) Clone() RunExecutionSpec {
 	spec.References = spec.References.Clone()
+	if spec.CodeEdgeFinalCompliancePolicy != nil {
+		policy := spec.CodeEdgeFinalCompliancePolicy.Clone()
+		spec.CodeEdgeFinalCompliancePolicy = &policy
+	}
 	stages := spec.Stages
 	spec.Stages = make([]StageExecutionBinding, len(stages))
 	for index, binding := range stages {
@@ -518,6 +524,9 @@ func (spec RunExecutionSpec) ValidateFor(catalog StageCatalog) error {
 	if err := spec.Template.Validate(); err != nil {
 		return fmt.Errorf("%w: execution specification template: %v", errInvalidExecutionSpec, err)
 	}
+	if err := spec.validateTemplateExtension(); err != nil {
+		return err
+	}
 	if err := spec.Selection.validate(); err != nil {
 		return err
 	}
@@ -576,6 +585,25 @@ func (spec RunExecutionSpec) ValidateFor(catalog StageCatalog) error {
 	return nil
 }
 
+// validateTemplateExtension keeps deployment-specific policy out of generic
+// executions while requiring CodeEdge Phase-1 to freeze every final-compliance
+// decision input with its Run.
+func (spec RunExecutionSpec) validateTemplateExtension() error {
+	if spec.Template.Equal(CodeEdgePhase1TemplateReference()) {
+		if spec.CodeEdgeFinalCompliancePolicy == nil {
+			return fmt.Errorf("%w: CodeEdge Phase-1 execution specification requires a final compliance policy", errInvalidExecutionSpec)
+		}
+		if err := spec.CodeEdgeFinalCompliancePolicy.Validate(); err != nil {
+			return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy: %v", errInvalidExecutionSpec, err)
+		}
+		return nil
+	}
+	if spec.CodeEdgeFinalCompliancePolicy != nil {
+		return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy is not accepted by template %s@%s", errInvalidExecutionSpec, spec.Template.ID, spec.Template.Version)
+	}
+	return nil
+}
+
 // CanonicalJSON returns a validated canonical representation. Semantically
 // unordered reference and binding entries are sorted, while every field value
 // remains fingerprint-significant.
@@ -617,6 +645,11 @@ func ParseRunExecutionSpecJSON(raw []byte) (RunExecutionSpec, error) {
 		Format: document.Format, Version: document.Version, Template: document.Template, Selection: document.Selection,
 		References: document.References, Stages: make([]StageExecutionBinding, 0, len(document.Stages)),
 	}
+	policy, err := parseCodeEdgeFinalCompliancePolicy(document.CodeEdgeFinalCompliancePolicy)
+	if err != nil {
+		return RunExecutionSpec{}, fmt.Errorf("decode CodeEdge final compliance policy: %w", err)
+	}
+	spec.CodeEdgeFinalCompliancePolicy = policy
 	for index, rawBinding := range document.Stages {
 		binding, err := parseStageExecutionBinding(rawBinding)
 		if err != nil {
@@ -631,12 +664,27 @@ func ParseRunExecutionSpecJSON(raw []byte) (RunExecutionSpec, error) {
 }
 
 type runExecutionSpecDocument struct {
-	Format     string                `json:"format"`
-	Version    string                `json:"version"`
-	Template   TemplateReference     `json:"template"`
-	Selection  RunSelectionReference `json:"selection"`
-	References ExecutionReferenceSet `json:"references"`
-	Stages     []json.RawMessage     `json:"stages"`
+	Format                        string                `json:"format"`
+	Version                       string                `json:"version"`
+	Template                      TemplateReference     `json:"template"`
+	Selection                     RunSelectionReference `json:"selection"`
+	References                    ExecutionReferenceSet `json:"references"`
+	Stages                        []json.RawMessage     `json:"stages"`
+	CodeEdgeFinalCompliancePolicy json.RawMessage       `json:"codeedge_final_compliance_policy"`
+}
+
+func parseCodeEdgeFinalCompliancePolicy(raw json.RawMessage) (*codeedge.FinalCompliancePolicy, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, errors.New("final compliance policy must be an object, not null")
+	}
+	var policy codeedge.FinalCompliancePolicy
+	if err := decodeExecutionSpecJSON(raw, &policy); err != nil {
+		return nil, err
+	}
+	return &policy, nil
 }
 
 type stageBindingDiscriminator struct {
@@ -1152,6 +1200,12 @@ func (index executionReferenceIndex) validateAllUsed() error {
 }
 
 func (spec *RunExecutionSpec) normalize() {
+	if spec.CodeEdgeFinalCompliancePolicy != nil {
+		policy := spec.CodeEdgeFinalCompliancePolicy.Clone()
+		sort.Strings(policy.QwenPolicy.InfraExceptionTypes)
+		sort.Strings(policy.OpusPolicy.InfraExceptionTypes)
+		spec.CodeEdgeFinalCompliancePolicy = &policy
+	}
 	sort.Slice(spec.References.Artifacts, func(left, right int) bool {
 		return spec.References.Artifacts[left].ID < spec.References.Artifacts[right].ID
 	})

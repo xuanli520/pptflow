@@ -228,7 +228,7 @@ func TestRevisionCandidateUnknownOperationRejectsReplacementLease(t *testing.T) 
 	}
 }
 
-func TestCreateAndBindRevisionCandidatePlanIsAtomicAndRecoversUnboundPlan(t *testing.T) {
+func TestCreateAndBindRevisionCandidatePlanIsAtomicAndRejectsUnboundPlan(t *testing.T) {
 	t.Run("validation failure leaves no executable plan", func(t *testing.T) {
 		fixture := prepareRevisionCandidatePlanFixture(t)
 		request := fixture.planRequest(t, fixture.store.now().UTC().Add(time.Hour))
@@ -278,32 +278,55 @@ func TestCreateAndBindRevisionCandidatePlanIsAtomicAndRecoversUnboundPlan(t *tes
 		}
 	})
 
-	t.Run("legacy unbound plan is bound without renewal", func(t *testing.T) {
+	t.Run("persisted unbound plan requires reconciliation", func(t *testing.T) {
 		fixture := prepareRevisionCandidatePlanFixture(t)
 		expiresAt := fixture.store.now().UTC().Add(time.Hour)
 		request := fixture.planRequest(t, expiresAt)
-		legacy, err := fixture.store.CreateFrozenPlan(context.Background(), request)
-		if err != nil {
-			t.Fatal(err)
+		if _, err := fixture.store.CreateFrozenPlan(context.Background(), request); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("standalone candidate plan = %v, want ErrInvalidTransition", err)
 		}
-		stored, candidate, err := fixture.store.CreateAndBindRevisionCandidatePlan(context.Background(), CreateAndBindRevisionCandidatePlanRequest{
+		legacy := seedLegacyUnboundCandidatePlan(t, fixture.store, request)
+		_, _, err := fixture.store.CreateAndBindRevisionCandidatePlan(context.Background(), CreateAndBindRevisionCandidatePlanRequest{
 			Plan: request, CandidateID: fixture.candidate.ID, ExpectedCandidateVersion: fixture.candidate.Version,
-			FinalManifestID: "manifest-object", ChildRunManifestJSON: `{}`, Actor: "tester", Reason: "recover legacy binding",
+			FinalManifestID: "manifest-object", ChildRunManifestJSON: `{}`, Actor: "tester", Reason: "must not repair unbound plan",
 		})
-		if err != nil {
-			t.Fatal(err)
+		if !errors.Is(err, ErrContinuationReconciliationRequired) {
+			t.Fatalf("unbound plan replay = %v, want ErrContinuationReconciliationRequired", err)
 		}
-		if stored.ID != legacy.ID || !stored.ExpiresAt.Equal(expiresAt) || candidate.FrozenPlanID != legacy.ID || candidate.FinalManifestID != "manifest-object" {
-			t.Fatalf("recovered atomic binding = plan=%+v candidate=%+v", stored, candidate)
+		candidate, lookupErr := fixture.store.GetRevisionCandidate(context.Background(), fixture.candidate.ID)
+		if lookupErr != nil || candidate == nil || candidate.FrozenPlanID != "" || candidate.FinalManifestID != "" || candidate.ChildRunManifestJSON != "" {
+			t.Fatalf("unbound candidate was mutated = candidate=%+v err=%v", candidate, lookupErr)
 		}
-		replayedPlan, replayedCandidate, err := fixture.store.CreateAndBindRevisionCandidatePlan(context.Background(), CreateAndBindRevisionCandidatePlanRequest{
-			Plan: request, CandidateID: fixture.candidate.ID, ExpectedCandidateVersion: fixture.candidate.Version,
-			FinalManifestID: "manifest-object", ChildRunManifestJSON: `{}`, Actor: "tester", Reason: "replay binding",
-		})
-		if err != nil || replayedPlan.ID != legacy.ID || replayedCandidate.Version != candidate.Version {
-			t.Fatalf("idempotent bound plan replay = plan=%+v candidate=%+v err=%v", replayedPlan, replayedCandidate, err)
+		stored, lookupErr := fixture.store.GetFrozenPlanByCommand(context.Background(), fixture.command.ID)
+		if lookupErr != nil || stored == nil || stored.ID != legacy.ID || !stored.ExpiresAt.Equal(expiresAt) {
+			t.Fatalf("unbound plan was altered = plan=%+v err=%v", stored, lookupErr)
 		}
 	})
+}
+
+// seedLegacyUnboundCandidatePlan models a record from the retired standalone
+// write path. Current public APIs cannot create this state.
+func seedLegacyUnboundCandidatePlan(t *testing.T, s *Store, request CreateFrozenPlanRequest) FrozenPlan {
+	t.Helper()
+	plan, err := s.prepareFrozenPlan(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := validateFrozenPlanDependenciesTx(context.Background(), tx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertFrozenPlanTx(context.Background(), tx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }
 
 func TestExpireRevisionCandidateReleasesOnlyAnExpiredFrozenPlan(t *testing.T) {

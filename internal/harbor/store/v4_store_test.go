@@ -10,14 +10,7 @@ import (
 
 func tempV4DB(t *testing.T) *Store {
 	t.Helper()
-	s := tempDB(t)
-	if _, err := s.db.Exec(migrationV4); err != nil {
-		t.Fatalf("apply v4 schema: %v", err)
-	}
-	if _, err := s.db.Exec(migrationV4); err != nil {
-		t.Fatalf("reapply v4 schema: %v", err)
-	}
-	return s
+	return tempDB(t)
 }
 
 func TestV4ArtifactManifestAndRefsAreImmutableAndIdempotent(t *testing.T) {

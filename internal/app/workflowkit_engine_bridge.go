@@ -146,6 +146,13 @@ func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExe
 	if backend == nil || backend.runtime == nil {
 		return workflowkit.FrozenExecution{}, ErrFrozenExecutionRuntimeConfiguration
 	}
+	// The coordinator checks these files before it admits a stage job. Repeat
+	// that proof at the public Engine boundary so callers that construct a
+	// backend directly cannot turn a stale or substituted companion file into
+	// an Engine claim.
+	if _, _, err := backend.runtime.core.verifyRunManagedExecutionInputs(backend.callContext, backend.run); err != nil {
+		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: verify public Engine managed execution inputs: %w", ErrFrozenExecutionPayload, err)
+	}
 	// loadFrozenRun performs this check before a stage job is admitted. Keep it
 	// at the public Engine bridge as well so a future caller cannot construct a
 	// StageClaim from a catalog-drifted manifest by bypassing the normal
@@ -167,6 +174,16 @@ func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExe
 	canonical, err := specification.CanonicalJSON()
 	if err != nil || string(canonical) != string(manifest.ExecutionSpec) {
 		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine execution specification is not canonical", ErrFrozenExecutionPayload)
+	}
+	specificationFingerprint, err := specification.Fingerprint()
+	if err != nil || specificationFingerprint != manifest.Inputs.ExecutionSpecFingerprint {
+		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine execution specification fingerprint does not match manifest inputs", ErrFrozenExecutionPayload)
+	}
+	if specification.Selection.TaskID != backend.run.TaskID || specification.Selection.RevisionID != backend.run.RevisionID {
+		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine execution specification selection does not match Run", ErrFrozenExecutionPayload)
+	}
+	if backend.revision.ID != "" && (backend.revision.ID != backend.run.RevisionID || backend.revision.TaskID != backend.run.TaskID || string(specification.Selection.RevisionDigest) != backend.revision.TaskDigest) {
+		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine execution specification selection does not match TaskRevision", ErrFrozenExecutionPayload)
 	}
 	binding, err := workflowkit.NewOpaqueExecutionBinding(workflowadapter.RunExecutionSpecFormat, workflowadapter.RunExecutionSpecVersion, canonical)
 	if err != nil {

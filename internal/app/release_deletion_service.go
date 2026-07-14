@@ -23,6 +23,13 @@ type PackageRevisionRequest struct {
 	ReleaseVersion         string
 	Channel                string
 	ExpectedChannelVersion int64
+	// RunID and ExpectedAuthorizationFingerprint are required only when this
+	// revision has ever been executed by the closed CodeEdge Phase-1 template.
+	// They bind packaging to the approved immutable final-compliance record;
+	// callers cannot supply authorization JSON themselves.
+	RunID                            string
+	ExpectedComplianceRecordID       string
+	ExpectedAuthorizationFingerprint string
 	// IdempotencyKey binds a package-only request to one immutable local
 	// release. It must be UUIDv7 when supplied. Channel movement is a separate
 	// mutable command and therefore cannot share this key.
@@ -73,13 +80,6 @@ func (service *ReleaseService) PackageRevision(ctx context.Context, request Pack
 		if strings.TrimSpace(request.Channel) != "" {
 			return LocalPackageResult{}, fmt.Errorf("local package idempotency cannot include a mutable release channel")
 		}
-		existing, err := service.core.store.GetLocalPackageRelease(ctx, idempotencyKey)
-		if err != nil {
-			return LocalPackageResult{}, err
-		}
-		if existing != nil {
-			return service.replayLocalPackage(ctx, request, *existing)
-		}
 	}
 	revision, err := service.core.store.GetTaskRevision(ctx, request.RevisionID)
 	if err != nil {
@@ -107,6 +107,19 @@ func (service *ReleaseService) PackageRevision(ctx context.Context, request Pack
 	if strings.TrimSpace(revision.ValidationEvidenceManifest) == "" {
 		return LocalPackageResult{}, fmt.Errorf("released revision has no validation evidence manifest")
 	}
+	codeEdgeAuthorization, err := service.resolveCodeEdgePackageAuthorization(ctx, *task, *revision, request)
+	if err != nil {
+		return LocalPackageResult{}, err
+	}
+	if idempotencyKey != "" {
+		existing, lookupErr := service.core.store.GetLocalPackageRelease(ctx, idempotencyKey)
+		if lookupErr != nil {
+			return LocalPackageResult{}, lookupErr
+		}
+		if existing != nil {
+			return service.replayLocalPackage(ctx, request, *existing, codeEdgeAuthorization)
+		}
+	}
 	if err := service.core.layout.ensureRoot(); err != nil {
 		return LocalPackageResult{}, err
 	}
@@ -121,6 +134,7 @@ func (service *ReleaseService) PackageRevision(ctx context.Context, request Pack
 		RevisionID:     revision.ID,
 		TaskDigest:     revision.TaskDigest,
 		ReleaseVersion: request.ReleaseVersion,
+		CodeEdge:       codeEdgeAuthorization,
 	}
 	object, packagePath, reused, err := existingLocalPackage(ctx, service.core.objects, packageDirectory, expectedReceipt)
 	if err != nil {
@@ -209,7 +223,7 @@ func (service *ReleaseService) PackageRevision(ctx context.Context, request Pack
 // result. A response may be lost after the release record commits, so this
 // path also repairs the final ready -> published projection when it is still
 // safe to do so for the same current revision.
-func (service *ReleaseService) replayLocalPackage(ctx context.Context, request PackageRevisionRequest, release store.LocalPackageRelease) (LocalPackageResult, error) {
+func (service *ReleaseService) replayLocalPackage(ctx context.Context, request PackageRevisionRequest, release store.LocalPackageRelease, codeEdgeAuthorization *codeEdgeLocalPackageReceipt) (LocalPackageResult, error) {
 	if release.ReleaseVersion != strings.TrimSpace(request.ReleaseVersion) || release.RevisionID != strings.TrimSpace(request.RevisionID) {
 		return LocalPackageResult{}, fmt.Errorf("%w: local package key %s", store.ErrIdempotencyConflict, release.ID)
 	}
@@ -225,6 +239,7 @@ func (service *ReleaseService) replayLocalPackage(ctx context.Context, request P
 		RevisionID:     release.RevisionID,
 		TaskDigest:     release.TaskDigest,
 		ReleaseVersion: release.ReleaseVersion,
+		CodeEdge:       codeEdgeAuthorization,
 	}
 	_, packagePath, reused, err := existingLocalPackage(ctx, service.core.objects, service.core.layout.releaseDirectory(release.ReleaseVersion), expected)
 	if err != nil {

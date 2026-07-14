@@ -38,6 +38,48 @@ func TestCompileDependencyExecutionPlanGroupsIndependentStages(t *testing.T) {
 	}
 }
 
+func TestCompileDependencyExecutionPlanExcludesOperatorOnlyStages(t *testing.T) {
+	operatorOnly := testStage("deliver", []StageKey{"verify"}, EffectExternalSideEffect, []ResourceKey{"evidence/verify"}, []ResourceKey{"delivery/receipt"})
+	operatorOnly.Dispatch = StageDispatchOperatorOnly
+	operatorOnly.Retry = RetryPolicy{}
+	operatorOnly.Reuse = ReuseNever
+	workflow := WorkflowDescriptor{
+		ID: "operator-only-workflow", Version: "1",
+		Stages: []StageDescriptor{
+			testStage("source", nil, EffectEvidenceOnly, nil, []ResourceKey{"evidence/source"}),
+			testStage("verify", []StageKey{"source"}, EffectEvidenceOnly, []ResourceKey{"evidence/source"}, []ResourceKey{"evidence/verify"}),
+			operatorOnly,
+		},
+	}
+
+	plan, err := CompileDependencyExecutionPlan(workflow)
+	if err != nil {
+		t.Fatalf("compile operator-only execution plan: %v", err)
+	}
+	if err := plan.Validate(workflow); err != nil {
+		t.Fatalf("validate operator-only execution plan: %v", err)
+	}
+	if len(plan.Batches) != 2 || plan.Batches[0].NodeIDs[0] != "source" || plan.Batches[1].NodeIDs[0] != "verify" {
+		t.Fatalf("automatic batches = %#v, want only source then verify", plan.Batches)
+	}
+	for _, batch := range plan.Batches {
+		for _, nodeID := range batch.NodeIDs {
+			if nodeID == "deliver" {
+				t.Fatalf("operator-only stage appeared in initial execution plan: %#v", plan.Batches)
+			}
+		}
+	}
+
+	invalid, err := FreezeExecutionPlan(workflow, []ScheduleBatch{
+		{ID: "source", NodeIDs: []NodeID{"source"}},
+		{ID: "verify", NodeIDs: []NodeID{"verify"}},
+		{ID: "deliver", NodeIDs: []NodeID{"deliver"}},
+	})
+	if err == nil || invalid.Fingerprint != "" {
+		t.Fatalf("operator-only stage was accepted in a worker plan: %+v, %v", invalid, err)
+	}
+}
+
 func TestEngineFreezesExecutionAndCommitsFailureEvidence(t *testing.T) {
 	now := time.Date(2026, time.July, 14, 9, 0, 0, 0, time.UTC)
 	workflow := singleStageWorkflow(t)
@@ -143,6 +185,47 @@ func TestEngineRejectsPluginVersionDriftWithoutExecutingStage(t *testing.T) {
 	}
 	if backend.rejected == nil || !errors.Is(backend.rejected, ErrPluginVersionMismatch) {
 		t.Fatalf("plugin drift cause = %v, want ErrPluginVersionMismatch", backend.rejected)
+	}
+}
+
+func TestEngineRejectsOperatorOnlyStageClaimWithoutExecutingPlugin(t *testing.T) {
+	now := time.Date(2026, time.July, 14, 9, 0, 0, 0, time.UTC)
+	workflow := singleStageWorkflow(t)
+	workflow.Stages[0].Dispatch = StageDispatchOperatorOnly
+	workflow.Stages[0].Retry = RetryPolicy{}
+	workflow.Stages[0].Reuse = ReuseNever
+	if err := workflow.Validate(); err != nil {
+		t.Fatalf("validate operator-only workflow: %v", err)
+	}
+	binding, err := NewOpaqueExecutionBinding("example.execution", "1", []byte(`{"selection":"immutable"}`))
+	if err != nil {
+		t.Fatalf("freeze opaque binding: %v", err)
+	}
+	backend := &engineTestBackend{}
+	registry, err := NewControlledPluginRegistry([]PluginRegistration[StageExecutor]{
+		{Binding: workflow.Stages[0].Plugin, Implementation: StageExecutorFunc(func(context.Context, StageExecutionRequest) (StageExecutionResult, error) {
+			t.Fatal("operator-only stage plugin must never execute")
+			return StageExecutionResult{}, nil
+		})},
+	})
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	engine, err := NewEngine(EngineConfig{Backend: backend, Executors: registry, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	prepared := prepareEngineTestExecution(t, engine, workflow, binding)
+	state, err := engine.HandleClaim(context.Background(), JobClaim{
+		JobID: "job-operator-only", ClaimID: "claim-operator-only", Kind: JobStage, Owner: "worker-1", FencingToken: 1,
+		LeaseExpiresAt: now.Add(time.Minute), Execution: prepared.Execution,
+		Stage: &StageClaim{StageAttempt: AttemptIdentity{ID: "stage-operator-only", Kind: AttemptStage, ScopeID: "source", Ordinal: 1}, Stage: workflow.Stages[0]},
+	})
+	if err != nil || state != JobReconcileRequired {
+		t.Fatalf("operator-only claim result = %q, %v", state, err)
+	}
+	if !errors.Is(backend.rejected, ErrInvalidJobClaim) || backend.completion != nil {
+		t.Fatalf("operator-only claim rejection = %v completion=%+v", backend.rejected, backend.completion)
 	}
 }
 

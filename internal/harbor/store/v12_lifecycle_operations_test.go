@@ -91,20 +91,24 @@ func TestLifecycleOperationRetainsExpectedIdentitySeparatelyFromTargetIdentity(t
 	expectedRunID := mustUUIDv7(t)
 	expectedReleaseID := mustUUIDv7(t)
 	expectedReviewID := mustUUIDv7(t)
+	expectedCodeEdgeComplianceRecordID := mustUUIDv7(t)
+	const expectedCodeEdgeAuthorizationFingerprint = "sha256:codeedge-authorization"
 
 	started, err := s.BeginLifecycleOperation(ctx, BeginLifecycleOperationRequest{
-		IdempotencyKey:          mustUUIDv7(t),
-		Action:                  "task.fork",
-		RequestFingerprint:      "sha256:fork-source-checkpoint",
-		TaskID:                  targetTaskID,
-		RevisionID:              targetRevisionID,
-		ExpectedTaskID:          expectedTaskID,
-		ExpectedRevisionID:      expectedRevisionID,
-		ExpectedRunID:           expectedRunID,
-		ExpectedReleaseID:       expectedReleaseID,
-		ExpectedReviewRequestID: expectedReviewID,
-		Actor:                   "tester",
-		Reason:                  "retain original source checkpoint",
+		IdempotencyKey:                           mustUUIDv7(t),
+		Action:                                   "task.fork",
+		RequestFingerprint:                       "sha256:fork-source-checkpoint",
+		TaskID:                                   targetTaskID,
+		RevisionID:                               targetRevisionID,
+		ExpectedTaskID:                           expectedTaskID,
+		ExpectedRevisionID:                       expectedRevisionID,
+		ExpectedRunID:                            expectedRunID,
+		ExpectedReleaseID:                        expectedReleaseID,
+		ExpectedReviewRequestID:                  expectedReviewID,
+		ExpectedCodeEdgeComplianceRecordID:       expectedCodeEdgeComplianceRecordID,
+		ExpectedCodeEdgeAuthorizationFingerprint: expectedCodeEdgeAuthorizationFingerprint,
+		Actor:                                    "tester",
+		Reason:                                   "retain original source checkpoint",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -112,8 +116,23 @@ func TestLifecycleOperationRetainsExpectedIdentitySeparatelyFromTargetIdentity(t
 	op := started.Operation
 	if op.TaskID != targetTaskID || op.RevisionID != targetRevisionID ||
 		op.ExpectedTaskID != expectedTaskID || op.ExpectedRevisionID != expectedRevisionID ||
-		op.ExpectedRunID != expectedRunID || op.ExpectedReleaseID != expectedReleaseID || op.ExpectedReviewRequestID != expectedReviewID {
+		op.ExpectedRunID != expectedRunID || op.ExpectedReleaseID != expectedReleaseID || op.ExpectedReviewRequestID != expectedReviewID ||
+		op.ExpectedCodeEdgeComplianceRecordID != expectedCodeEdgeComplianceRecordID ||
+		op.ExpectedCodeEdgeAuthorizationFingerprint != expectedCodeEdgeAuthorizationFingerprint {
 		t.Fatalf("lifecycle operation lost target/source identity distinction: %+v", op)
+	}
+	loaded, err := s.GetLifecycleOperation(ctx, op.ID)
+	if err != nil || loaded == nil || loaded.ExpectedCodeEdgeComplianceRecordID != expectedCodeEdgeComplianceRecordID ||
+		loaded.ExpectedCodeEdgeAuthorizationFingerprint != expectedCodeEdgeAuthorizationFingerprint {
+		t.Fatalf("persisted CodeEdge lifecycle CAS facts = %+v, %v", loaded, err)
+	}
+
+	invalid := BeginLifecycleOperationRequest{
+		IdempotencyKey: mustUUIDv7(t), Action: "package.local", RequestFingerprint: "sha256:invalid-codeedge-record",
+		ExpectedCodeEdgeComplianceRecordID: "not-a-uuid", Actor: "tester", Reason: "reject invalid record identity",
+	}
+	if _, err := s.BeginLifecycleOperation(ctx, invalid); !errors.Is(err, ErrInvalidUUIDv7Identity) {
+		t.Fatalf("invalid CodeEdge compliance record identity = %v, want ErrInvalidUUIDv7Identity", err)
 	}
 }
 

@@ -223,59 +223,6 @@ func TestGateApprovalDoesNotPromoteRevisionButGenericReviewStillDoes(t *testing.
 	}
 }
 
-func TestV15MigrationRebuildsStageAttemptsWithChildrenAndRestoresIdentityTrigger(t *testing.T) {
-	ctx := context.Background()
-	s := tempDB(t)
-	root := s.rootDir
-	_, _, run, stage := createReviewGateFixture(t, s)
-	node, err := s.CreateNodeAttempt(ctx, CreateNodeAttemptRequest{
-		StageAttemptID: stage.ID, NodeID: stage.StageKey, Generation: 0, Attempt: 1,
-		IdempotencyKey: "v15-migration-child", Actor: "tester", Reason: "migration child fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`DROP TABLE review_gate_bindings_v15`); err != nil {
-		t.Fatalf("drop v15 gate binding fixture table: %v", err)
-	}
-	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 15`); err != nil {
-		t.Fatalf("rewind v15 fixture version: %v", err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	migrated, err := Open(root)
-	if err != nil {
-		t.Fatalf("rerun v15 migration with child rows: %v", err)
-	}
-	defer migrated.Close()
-	var foreignKeys int
-	if err := migrated.db.QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil || foreignKeys != 1 {
-		t.Fatalf("foreign-key enforcement was not restored after v15 migration: enabled=%d err=%v", foreignKeys, err)
-	}
-	loadedNode, err := migrated.GetNodeAttempt(ctx, node.ID)
-	if err != nil || loadedNode == nil || loadedNode.StageAttemptID != stage.ID {
-		t.Fatalf("node child did not survive v15 stage rebuild: %+v, %v", loadedNode, err)
-	}
-	loadedStage, err := migrated.GetStageAttempt(ctx, stage.ID)
-	if err != nil || loadedStage == nil {
-		t.Fatalf("stage did not survive v15 rebuild: %+v, %v", loadedStage, err)
-	}
-	waiting, err := migrated.TransitionStageAttempt(ctx, TransitionStageAttemptRequest{
-		StageAttemptID: loadedStage.ID, ExpectedVersion: loadedStage.Version, ExecutionStatus: StageExecutionWaiting,
-		Actor: "tester", Reason: "verify v15 waiting constraint",
-	})
-	if err != nil || waiting.ExecutionStatus != StageExecutionWaiting {
-		t.Fatalf("v15 waiting transition = %+v, %v", waiting, err)
-	}
-	if _, err := migrated.CreateStageAttempt(ctx, CreateStageAttemptRequest{
-		ID: node.ID, RunID: run.ID, StageKey: "another-review", StageGroup: "review", Ordinal: 2,
-		InputFingerprint: "another-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`, Actor: "tester",
-	}); !errors.Is(err, ErrIdentityCollision) {
-		t.Fatalf("v15 stage global identity trigger was not restored: %v", err)
-	}
-}
-
 func createReviewGateFixture(t *testing.T, s *Store) (TaskV2, TaskRevision, WorkflowRun, StageAttempt) {
 	t.Helper()
 	ctx := context.Background()

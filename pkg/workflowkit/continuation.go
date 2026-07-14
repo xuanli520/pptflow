@@ -80,11 +80,15 @@ const (
 	DispositionPreserve   NodeDisposition = "preserve"
 	DispositionSchedule   NodeDisposition = "schedule"
 	DispositionInvalidate NodeDisposition = "invalidate"
+	// DispositionOperatorOnly records a frozen stage that remains visible in a
+	// continuation's complete topology but is exclusively owned by a separate
+	// domain lifecycle operation. It can never be placed in a worker schedule.
+	DispositionOperatorOnly NodeDisposition = "operator_only"
 )
 
 func (disposition NodeDisposition) valid() bool {
 	switch disposition {
-	case DispositionPreserve, DispositionSchedule, DispositionInvalidate:
+	case DispositionPreserve, DispositionSchedule, DispositionInvalidate, DispositionOperatorOnly:
 		return true
 	default:
 		return false
@@ -127,8 +131,8 @@ func (transition NodeTransition) validate() error {
 	if !transition.Disposition.valid() {
 		return fmt.Errorf("%w: unsupported node disposition %q", ErrInvalidContinuationPlan, transition.Disposition)
 	}
-	if transition.Disposition == DispositionPreserve && transition.ToGeneration != transition.FromGeneration {
-		return fmt.Errorf("%w: preserved node %q cannot change generation", ErrInvalidContinuationPlan, transition.NodeID)
+	if (transition.Disposition == DispositionPreserve || transition.Disposition == DispositionOperatorOnly) && transition.ToGeneration != transition.FromGeneration {
+		return fmt.Errorf("%w: non-scheduled node %q cannot change generation", ErrInvalidContinuationPlan, transition.NodeID)
 	}
 	if len(transition.ReasonCodes) == 0 {
 		return fmt.Errorf("%w: transition node %q needs an explanatory reason", ErrInvalidContinuationPlan, transition.NodeID)
@@ -425,6 +429,12 @@ func validateTransitionCoverage(transitions []NodeTransition, workflow WorkflowD
 		if transition.Disposition == DispositionPreserve && stage.Reuse != ReuseWhenInputsMatch {
 			return nil, fmt.Errorf("%w: stage %q does not permit reuse", ErrInvalidContinuationPlan, transition.NodeID)
 		}
+		if stage.OperatorOnly() && transition.Disposition != DispositionOperatorOnly {
+			return nil, fmt.Errorf("%w: operator-only stage %q must retain the operator-only disposition", ErrInvalidContinuationPlan, transition.NodeID)
+		}
+		if !stage.OperatorOnly() && transition.Disposition == DispositionOperatorOnly {
+			return nil, fmt.Errorf("%w: automatically dispatchable stage %q cannot use the operator-only disposition", ErrInvalidContinuationPlan, transition.NodeID)
+		}
 		if err := validateTransitionBindings(transition, stage); err != nil {
 			return nil, err
 		}
@@ -503,6 +513,9 @@ func validateExternalEffectConfirmations(confirmations []ExternalEffectConfirmat
 		if stage.Effect != EffectExternalSideEffect {
 			return nil, fmt.Errorf("%w: confirmation is only valid for external side-effect stage %q", ErrInvalidContinuationPlan, confirmation.NodeID)
 		}
+		if stage.OperatorOnly() {
+			return nil, fmt.Errorf("%w: operator-only stage %q cannot be authorized through a continuation", ErrInvalidContinuationPlan, confirmation.NodeID)
+		}
 		if _, duplicate := result[confirmation.NodeID]; duplicate {
 			return nil, fmt.Errorf("%w: duplicate external effect confirmation for stage %q", ErrInvalidContinuationPlan, confirmation.NodeID)
 		}
@@ -539,6 +552,9 @@ func validateSchedule(batches []ScheduleBatch, workflow WorkflowDescriptor, tran
 			}
 			if transition.Disposition != DispositionSchedule {
 				return fmt.Errorf("%w: stage %q is scheduled but disposition is %q", ErrInvalidContinuationPlan, nodeID, transition.Disposition)
+			}
+			if !stageByID[nodeID].AutomaticallyDispatchable() {
+				return fmt.Errorf("%w: schedule contains operator-only stage %q", ErrInvalidContinuationPlan, nodeID)
 			}
 			if _, duplicate := batchForNode[nodeID]; duplicate {
 				return fmt.Errorf("%w: stage %q appears in multiple schedule batches", ErrInvalidContinuationPlan, nodeID)

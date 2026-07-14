@@ -271,6 +271,44 @@ func TestContinuationPlanFreezesCoverageTopologyAndExternalConfirmation(t *testi
 	}
 }
 
+func TestContinuationPlanKeepsOperatorOnlyStagesOutOfWorkerSchedules(t *testing.T) {
+	workflow := testWorkflow(t)
+	workflow.Stages[2].Dispatch = StageDispatchOperatorOnly
+	workflow.Stages[2].Retry = RetryPolicy{}
+	workflow.Stages[2].Reuse = ReuseNever
+	if err := workflow.Validate(); err != nil {
+		t.Fatalf("validate operator-only workflow: %v", err)
+	}
+	workflowFingerprint := mustWorkflowFingerprint(t, workflow)
+	emptyInputs := mustInputFingerprint(t, nil)
+	now := time.Date(2026, time.July, 14, 10, 0, 0, 0, time.UTC)
+	snapshot := ContinuationPlanSnapshot{
+		PlanID: "operator-only-plan", CommandID: "operator-only-command", Strategy: StrategyRecompute,
+		BaseCheckpoint: testCheckpoint(workflowFingerprint), NextExecutionEpoch: 1, SourceRunID: "run-1",
+		TargetRunRelation: RelationSameRunAttempt, SubjectRevisionID: "revision-1", SubjectDigest: SubjectDigest(SHA256Fingerprint([]byte("subject-1"))),
+		Nodes: []NodeTransition{
+			{NodeID: "source", FromGeneration: 0, ToGeneration: 1, Disposition: DispositionSchedule, ReasonCodes: []PlanReason{"requested"}, ExpectedInputFingerprint: emptyInputs},
+			{NodeID: "verify", FromGeneration: 0, ToGeneration: 1, Disposition: DispositionSchedule, ReasonCodes: []PlanReason{"dependency"}, ExpectedInputFingerprint: emptyInputs},
+			{NodeID: "deliver", FromGeneration: 0, ToGeneration: 0, Disposition: DispositionOperatorOnly, ReasonCodes: []PlanReason{"operator_only_lifecycle_action"}, ExpectedInputFingerprint: emptyInputs},
+		},
+		Schedule:  []ScheduleBatch{{ID: "source", NodeIDs: []NodeID{"source"}}, {ID: "verify", NodeIDs: []NodeID{"verify"}}},
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if _, err := FreezeContinuationPlan(snapshot, workflow); err != nil {
+		t.Fatalf("freeze operator-only continuation plan: %v", err)
+	}
+
+	forged := snapshot.Clone()
+	forged.Nodes[2].Disposition = DispositionSchedule
+	forged.Nodes[2].ToGeneration = 1
+	forged.Nodes[2].ReasonCodes = []PlanReason{"forged"}
+	forged.Schedule = append(forged.Schedule, ScheduleBatch{ID: "deliver", NodeIDs: []NodeID{"deliver"}})
+	forged.ExternalEffectConfirmations = []ExternalEffectConfirmation{{NodeID: "deliver", IdempotencyKey: "forged", Actor: "operator", ConfirmedAt: now}}
+	if _, err := FreezeContinuationPlan(forged, workflow); !errors.Is(err, ErrInvalidContinuationPlan) {
+		t.Fatalf("operator-only continuation schedule error = %v, want ErrInvalidContinuationPlan", err)
+	}
+}
+
 func TestContinuationPlanAllowsUnresolvedInputsOnlyForScheduledOrInvalidatedStages(t *testing.T) {
 	workflow := testWorkflow(t)
 	workflow.Stages[1].Inputs = []ArtifactSpec{{Name: "source_output", SchemaVersion: "v1", Required: true}}

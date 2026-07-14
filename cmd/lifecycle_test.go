@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,33 @@ func TestDefaultLifecycleActorIgnoresEnvironmentOverrides(t *testing.T) {
 	}
 	if current, err := user.Current(); err == nil && current.Username != "" && actor != current.Username {
 		t.Fatalf("lifecycle actor = %q, want current OS user %q", actor, current.Username)
+	}
+}
+
+func TestLifecycleCLICommandUsesConfiguredServiceFactory(t *testing.T) {
+	root := t.TempDir()
+	calls := 0
+	config := &lifecycleCLIConfig{
+		root: root,
+		newLifecycleService: func(factoryRoot string, database *store.Store) (*app.LifecycleServices, error) {
+			calls++
+			if factoryRoot != root {
+				t.Fatalf("factory root = %q, want %q", factoryRoot, root)
+			}
+			return app.NewLifecycleServicesWithOptions(factoryRoot, database, app.LifecycleServicesOptions{
+				OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+			})
+		},
+	}
+	command := newTaskListCommand(config)
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetErr(&output)
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("task list through composed lifecycle services: %v\n%s", err, output.String())
+	}
+	if calls != 1 {
+		t.Fatalf("configured lifecycle service factory calls = %d, want 1", calls)
 	}
 }
 
@@ -790,6 +818,37 @@ func hasCommandPurgeBlocker(blockers []app.PurgeTaskBlocker, code, id string) bo
 		}
 	}
 	return false
+}
+
+func TestLifecycleMutationCheckpointReplayRestoresCodeEdgePackageAuthorization(t *testing.T) {
+	ctx := context.Background()
+	services := openCommandLifecycle(t, t.TempDir())
+	defer services.Store().Close()
+
+	key := commandLifecycleUUID(t)
+	expectedTaskID := commandLifecycleUUID(t)
+	expectedRevisionID := commandLifecycleUUID(t)
+	expectedRunID := commandLifecycleUUID(t)
+	expectedComplianceID := commandLifecycleUUID(t)
+	expectedAuthorization := string(workflowkit.SHA256Fingerprint([]byte("command-codeedge-authorization")))
+	if _, err := services.Store().BeginLifecycleOperation(ctx, store.BeginLifecycleOperationRequest{
+		IdempotencyKey: key, Action: string(app.LifecycleMutationPackage), RequestFingerprint: "sha256:command-codeedge-checkpoint",
+		TaskID: expectedTaskID, RevisionID: expectedRevisionID, RunID: expectedRunID, ReleaseID: key,
+		ExpectedTaskID: expectedTaskID, ExpectedRevisionID: expectedRevisionID, ExpectedRunID: expectedRunID,
+		ExpectedTaskVersion: 1, ExpectedRevisionStateVersion: 1, ExpectedRevisionDigest: "harbor.task.v2:sha256:" + strings.Repeat("a", 64),
+		ExpectedRunVersion: 1, ExpectedRunDefinitionHash: "sha256:" + strings.Repeat("b", 64),
+		ExpectedCodeEdgeComplianceRecordID: expectedComplianceID, ExpectedCodeEdgeAuthorizationFingerprint: expectedAuthorization,
+		Actor: "tester", Reason: "persist CodeEdge package checkpoint",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, found, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationPackage, key)
+	if err != nil || !found {
+		t.Fatalf("restore package checkpoint = %+v found=%t err=%v", checkpoint, found, err)
+	}
+	if checkpoint.RunID != expectedRunID || checkpoint.CodeEdgeComplianceRecordID != expectedComplianceID || checkpoint.CodeEdgeAuthorizationFingerprint != expectedAuthorization {
+		t.Fatalf("replayed CodeEdge package checkpoint = %+v", checkpoint)
+	}
 }
 
 func openCommandLifecycle(t *testing.T, root string) *app.LifecycleServices {

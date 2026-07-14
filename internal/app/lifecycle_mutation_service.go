@@ -48,12 +48,18 @@ type LifecycleMutationCheckpoint struct {
 	RunVersion           int64  `json:"run_version,omitempty"`
 	RunExecutionEpoch    int    `json:"run_execution_epoch,omitempty"`
 	RunDefinitionHash    string `json:"run_definition_hash,omitempty"`
-	ReleaseID            string `json:"release_id,omitempty"`
-	ReleaseRecordVersion int64  `json:"release_record_version,omitempty"`
-	ReviewRequestID      string `json:"review_request_id,omitempty"`
-	ReviewRevisionID     string `json:"review_revision_id,omitempty"`
-	ReviewState          string `json:"review_state,omitempty"`
-	ReviewEvidenceDigest string `json:"review_evidence_digest,omitempty"`
+	// CodeEdgeComplianceRecordID and CodeEdgeAuthorizationFingerprint bind a
+	// package confirmation to the exact immutable authorization observed for
+	// its selected Run. They are populated only when that Run has a recorded
+	// CodeEdge final-compliance result.
+	CodeEdgeComplianceRecordID       string `json:"codeedge_compliance_record_id,omitempty"`
+	CodeEdgeAuthorizationFingerprint string `json:"codeedge_authorization_fingerprint,omitempty"`
+	ReleaseID                        string `json:"release_id,omitempty"`
+	ReleaseRecordVersion             int64  `json:"release_record_version,omitempty"`
+	ReviewRequestID                  string `json:"review_request_id,omitempty"`
+	ReviewRevisionID                 string `json:"review_revision_id,omitempty"`
+	ReviewState                      string `json:"review_state,omitempty"`
+	ReviewEvidenceDigest             string `json:"review_evidence_digest,omitempty"`
 }
 
 // LifecycleMutationCommandBase holds common operator provenance and the
@@ -220,6 +226,14 @@ func (service *LifecycleMutationService) captureCheckpoint(ctx context.Context, 
 			return LifecycleMutationCheckpoint{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 		}
 		checkpoint.RunID, checkpoint.RunVersion, checkpoint.RunExecutionEpoch, checkpoint.RunDefinitionHash = run.ID, run.Version, run.ExecutionEpoch, run.DefinitionHash
+		compliance, complianceErr := service.core.store.GetCodeEdgeComplianceRecordForRun(ctx, run.ID)
+		if complianceErr != nil {
+			return LifecycleMutationCheckpoint{}, complianceErr
+		}
+		if compliance != nil {
+			checkpoint.CodeEdgeComplianceRecordID = compliance.ID
+			checkpoint.CodeEdgeAuthorizationFingerprint = compliance.AuthorizationFingerprint
+		}
 		if taskID == "" {
 			taskID = run.TaskID
 		}
@@ -493,7 +507,7 @@ func (service *LifecycleMutationService) Package(ctx context.Context, command Pa
 	if strings.TrimSpace(command.ReleaseVersion) == "" {
 		return LifecycleMutationReceipt{}, fmt.Errorf("local package release version is required")
 	}
-	op, replay, err := service.begin(ctx, LifecycleMutationPackage, command.LifecycleMutationCommandBase, command, lifecycleOperationTargets{TaskID: command.Expected.TaskID, RevisionID: command.Expected.RevisionID, ReleaseID: command.IdempotencyKey})
+	op, replay, err := service.begin(ctx, LifecycleMutationPackage, command.LifecycleMutationCommandBase, command, lifecycleOperationTargets{TaskID: command.Expected.TaskID, RevisionID: command.Expected.RevisionID, RunID: command.Expected.RunID, ReleaseID: command.IdempotencyKey})
 	if err != nil || replay != nil {
 		return lifecycleReplayResult(replay, err)
 	}
@@ -506,7 +520,9 @@ func (service *LifecycleMutationService) Package(ctx context.Context, command Pa
 	}
 	result, err := (&ReleaseService{core: service.core}).PackageRevision(ctx, PackageRevisionRequest{
 		RevisionID: op.RevisionID, ExpectedStateVersion: command.Expected.RevisionStateVersion, ReleaseVersion: command.ReleaseVersion,
-		IdempotencyKey: op.IdempotencyKey, Actor: op.Actor, Reason: op.Reason,
+		RunID: op.RunID, ExpectedComplianceRecordID: command.Expected.CodeEdgeComplianceRecordID,
+		ExpectedAuthorizationFingerprint: command.Expected.CodeEdgeAuthorizationFingerprint,
+		IdempotencyKey:                   op.IdempotencyKey, Actor: op.Actor, Reason: op.Reason,
 	})
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
@@ -695,7 +711,9 @@ func (service *LifecycleMutationService) begin(ctx context.Context, action Lifec
 		ExpectedTaskVersion: base.Expected.TaskVersion, ExpectedRevisionStateVersion: base.Expected.RevisionStateVersion, ExpectedRevisionDigest: base.Expected.RevisionDigest,
 		ExpectedRunVersion: base.Expected.RunVersion, ExpectedRunExecutionEpoch: base.Expected.RunExecutionEpoch, ExpectedRunDefinitionHash: base.Expected.RunDefinitionHash,
 		ExpectedReleaseRecordVersion: base.Expected.ReleaseRecordVersion, ExpectedReviewRevisionID: base.Expected.ReviewRevisionID, ExpectedReviewState: base.Expected.ReviewState, ExpectedReviewEvidenceDigest: base.Expected.ReviewEvidenceDigest,
-		ReviewRequestID: base.Expected.ReviewRequestID, Actor: base.Actor, Reason: base.Reason,
+		ExpectedCodeEdgeComplianceRecordID:       base.Expected.CodeEdgeComplianceRecordID,
+		ExpectedCodeEdgeAuthorizationFingerprint: base.Expected.CodeEdgeAuthorizationFingerprint,
+		ReviewRequestID:                          base.Expected.ReviewRequestID, Actor: base.Actor, Reason: base.Reason,
 	})
 	if err != nil {
 		return store.LifecycleOperation{}, nil, err
@@ -811,6 +829,7 @@ func (service *LifecycleMutationService) validateCheckpoint(ctx context.Context,
 	if current.TaskID != expected.TaskID || current.TaskVersion != expected.TaskVersion ||
 		current.RevisionID != expected.RevisionID || current.RevisionStateVersion != expected.RevisionStateVersion || current.RevisionDigest != expected.RevisionDigest ||
 		current.RunID != expected.RunID || current.RunVersion != expected.RunVersion || current.RunExecutionEpoch != expected.RunExecutionEpoch || current.RunDefinitionHash != expected.RunDefinitionHash ||
+		current.CodeEdgeComplianceRecordID != expected.CodeEdgeComplianceRecordID || current.CodeEdgeAuthorizationFingerprint != expected.CodeEdgeAuthorizationFingerprint ||
 		current.ReleaseID != expected.ReleaseID || current.ReleaseRecordVersion != expected.ReleaseRecordVersion ||
 		current.ReviewRequestID != expected.ReviewRequestID || current.ReviewRevisionID != expected.ReviewRevisionID || current.ReviewState != expected.ReviewState || current.ReviewEvidenceDigest != expected.ReviewEvidenceDigest {
 		return fmt.Errorf("%w: lifecycle mutation checkpoint is stale", store.ErrOptimisticLock)
@@ -929,7 +948,7 @@ func lifecycleReplayResult(replay *LifecycleMutationReceipt, err error) (Lifecyc
 
 func (checkpoint LifecycleMutationCheckpoint) empty() bool {
 	return checkpoint.TaskID == "" && checkpoint.TaskVersion == 0 && checkpoint.RevisionID == "" && checkpoint.RevisionStateVersion == 0 && checkpoint.RevisionDigest == "" &&
-		checkpoint.RunID == "" && checkpoint.RunVersion == 0 && checkpoint.RunExecutionEpoch == 0 && checkpoint.RunDefinitionHash == "" &&
+		checkpoint.RunID == "" && checkpoint.RunVersion == 0 && checkpoint.RunExecutionEpoch == 0 && checkpoint.RunDefinitionHash == "" && checkpoint.CodeEdgeComplianceRecordID == "" && checkpoint.CodeEdgeAuthorizationFingerprint == "" &&
 		checkpoint.ReleaseID == "" && checkpoint.ReleaseRecordVersion == 0 && checkpoint.ReviewRequestID == "" && checkpoint.ReviewRevisionID == "" && checkpoint.ReviewState == "" && checkpoint.ReviewEvidenceDigest == ""
 }
 

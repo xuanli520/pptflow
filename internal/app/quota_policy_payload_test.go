@@ -29,6 +29,9 @@ func TestDurableExecutionPayloadsFreezeCompleteQuotaPolicy(t *testing.T) {
 	if initialPayload.Format != workflowRunExecutionPayloadFormat || initialPayload.RunID != fixture.run.ID || initialPayload.DefinitionHash != fixture.run.DefinitionHash {
 		t.Fatalf("initial durable payload binding = %+v", initialPayload)
 	}
+	if initialPayload.ExecutionSpecFingerprint != frozen.ExecutionSpecFingerprint {
+		t.Fatalf("initial durable payload execution specification fingerprint = %s, want %s", initialPayload.ExecutionSpecFingerprint, frozen.ExecutionSpecFingerprint)
+	}
 	assertFrozenQuotaPayload(t, initialPayload.QuotaPolicy, frozen)
 
 	plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx,

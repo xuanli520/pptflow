@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -89,6 +90,130 @@ func TestRunExecutionSpecStrictJSONDecoder(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseRunExecutionSpecJSON(malformed); err == nil {
 				t.Fatalf("malformed JSON accepted: %s", malformed)
+			}
+		})
+	}
+}
+
+func TestRunExecutionSpecScopesCodeEdgeFinalCompliancePolicyToCodeEdgeTemplate(t *testing.T) {
+	standard := testRunExecutionSpec(t)
+	policy := testCodeEdgeFinalCompliancePolicy()
+	standard.CodeEdgeFinalCompliancePolicy = &policy
+	if err := standard.Validate(); err == nil || !strings.Contains(err.Error(), "not accepted") {
+		t.Fatalf("standard execution spec with CodeEdge policy = %v, want template-scoped rejection", err)
+	}
+
+	standardRaw, err := json.Marshal(testRunExecutionSpec(t))
+	if err != nil {
+		t.Fatalf("marshal standard execution spec: %v", err)
+	}
+	if strings.Contains(string(standardRaw), `"codeedge_final_compliance_policy"`) {
+		t.Fatal("standard execution spec marshal emitted a CodeEdge-only policy field")
+	}
+	standardWithNullPolicy := append([]byte(`{"codeedge_final_compliance_policy":null,`), standardRaw[1:]...)
+	if _, err := ParseRunExecutionSpecJSON(standardWithNullPolicy); err == nil {
+		t.Fatal("standard execution spec parser accepted an explicit CodeEdge policy field")
+	}
+
+	codeEdge := testCodeEdgePhase1RunExecutionSpec(t)
+	if codeEdge.CodeEdgeFinalCompliancePolicy == nil {
+		t.Fatal("CodeEdge fixture has no final compliance policy")
+	}
+	codeEdge.CodeEdgeFinalCompliancePolicy = nil
+	if err := codeEdge.Validate(); err == nil || !strings.Contains(err.Error(), "requires a final compliance policy") {
+		t.Fatalf("CodeEdge execution spec without policy = %v, want required-policy rejection", err)
+	}
+}
+
+func TestCodeEdgeFinalCompliancePolicyRoundTripStrictnessCanonicalizationAndClone(t *testing.T) {
+	specification := testCodeEdgePhase1RunExecutionSpec(t)
+	raw, err := json.Marshal(specification)
+	if err != nil {
+		t.Fatalf("marshal CodeEdge execution spec: %v", err)
+	}
+	if !strings.Contains(string(raw), `"codeedge_final_compliance_policy"`) {
+		t.Fatal("CodeEdge execution spec marshal omitted final compliance policy")
+	}
+	parsed, err := ParseRunExecutionSpecJSON(raw)
+	if err != nil {
+		t.Fatalf("parse valid CodeEdge execution spec: %v", err)
+	}
+	if parsed.CodeEdgeFinalCompliancePolicy == nil {
+		t.Fatal("parsed CodeEdge execution spec lost final compliance policy")
+	}
+	if got, want := parsed.CodeEdgeFinalCompliancePolicy.QwenPolicy.Evaluator.ModelName, specification.CodeEdgeFinalCompliancePolicy.QwenPolicy.Evaluator.ModelName; got != want {
+		t.Fatalf("parsed Qwen model = %q, want %q", got, want)
+	}
+	canonical, err := specification.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonicalize original CodeEdge execution spec: %v", err)
+	}
+	parsedCanonical, err := parsed.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonicalize parsed CodeEdge execution spec: %v", err)
+	}
+	if string(parsedCanonical) != string(canonical) {
+		t.Fatalf("CodeEdge execution spec canonical round trip changed:\n%s\n!=\n%s", parsedCanonical, canonical)
+	}
+	remarshaled, err := json.Marshal(parsed)
+	if err != nil {
+		t.Fatalf("re-marshal parsed CodeEdge execution spec: %v", err)
+	}
+	reparsed, err := ParseRunExecutionSpecJSON(remarshaled)
+	if err != nil {
+		t.Fatalf("re-parse marshaled CodeEdge execution spec: %v", err)
+	}
+	originalPolicyFingerprint, err := specification.CodeEdgeFinalCompliancePolicy.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint original CodeEdge policy: %v", err)
+	}
+	reparsedPolicyFingerprint, err := reparsed.CodeEdgeFinalCompliancePolicy.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint re-parsed CodeEdge policy: %v", err)
+	}
+	if reparsedPolicyFingerprint != originalPolicyFingerprint {
+		t.Fatalf("CodeEdge policy marshal/parse changed fingerprint: %q != %q", reparsedPolicyFingerprint, originalPolicyFingerprint)
+	}
+
+	baseline, err := specification.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint CodeEdge execution spec: %v", err)
+	}
+	reordered := specification.Clone()
+	reverseStrings(reordered.CodeEdgeFinalCompliancePolicy.QwenPolicy.InfraExceptionTypes)
+	reverseStrings(reordered.CodeEdgeFinalCompliancePolicy.OpusPolicy.InfraExceptionTypes)
+	reorderedFingerprint, err := reordered.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint reordered CodeEdge policy: %v", err)
+	}
+	if reorderedFingerprint != baseline {
+		t.Fatalf("policy exception order changed execution-spec fingerprint: %q != %q", reorderedFingerprint, baseline)
+	}
+
+	changed := specification.Clone()
+	changed.CodeEdgeFinalCompliancePolicy.QwenPolicy.Evaluator.ModelName = "another-approved-model"
+	changedFingerprint, err := changed.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint changed CodeEdge policy: %v", err)
+	}
+	if changedFingerprint == baseline {
+		t.Fatal("changing the frozen CodeEdge policy did not change execution-spec fingerprint")
+	}
+	clone := specification.Clone()
+	clone.CodeEdgeFinalCompliancePolicy.QwenPolicy.InfraExceptionTypes[0] = "ChangedException"
+	if specification.CodeEdgeFinalCompliancePolicy.QwenPolicy.InfraExceptionTypes[0] == "ChangedException" {
+		t.Fatal("CodeEdge policy clone mutated the original execution spec")
+	}
+
+	unknownPolicyField := []byte(strings.Replace(string(raw), `"id":"codeedge.phase1.final-compliance"`, `"id":"codeedge.phase1.final-compliance","unexpected":true`, 1))
+	duplicatePolicyField := []byte(strings.Replace(string(raw), `"id":"codeedge.phase1.final-compliance"`, `"id":"codeedge.phase1.final-compliance","id":"codeedge.phase1.final-compliance"`, 1))
+	for name, malformed := range map[string][]byte{
+		"unknown policy field":   unknownPolicyField,
+		"duplicate policy field": duplicatePolicyField,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseRunExecutionSpecJSON(malformed); err == nil {
+				t.Fatalf("malformed CodeEdge policy accepted: %s", malformed)
 			}
 		})
 	}
@@ -306,6 +431,43 @@ func testRunExecutionSpec(t *testing.T) RunExecutionSpec {
 		spec.Stages = append(spec.Stages, bindingForTest(t, base))
 	}
 	return spec
+}
+
+func testCodeEdgeFinalCompliancePolicy() codeedge.FinalCompliancePolicy {
+	maximumPassingTrials := 1
+	qwen := codeedge.EvaluationPolicy{
+		ID:                 "codeedge.qwen.pass-at-four",
+		Version:            "1",
+		HarborResultFormat: codeedge.HarborJobResultV018,
+		Evaluator: codeedge.EvaluatorIdentity{
+			ProfileID: "codeedge-qwen-profile", ProfileVersion: "1",
+			AgentName: "codeedge-agent", AgentVersion: "1",
+			ModelName: "qwen-approved-model", ModelProvider: "controlled-provider",
+		},
+		LogicalTrialCount:        4,
+		PassRewardKey:            "reward",
+		PassRewardAtLeast:        1,
+		MaxPassingTrials:         &maximumPassingTrials,
+		MinimumAverageTurns:      20,
+		ScreenshotMediaType:      "image/png",
+		FailureClassifierID:      "codeedge-infra-classifier",
+		FailureClassifierVersion: "1",
+		InfraExceptionTypes:      []string{"DockerBuildError", "NetworkError"},
+	}
+	opus := qwen.Clone()
+	opus.ID = "codeedge.opus.reference"
+	opus.Evaluator.ProfileID = "codeedge-opus-profile"
+	opus.Evaluator.ModelName = "opus-reference-model"
+	opus.MaxPassingTrials = nil
+	return codeedge.FinalCompliancePolicy{
+		ID:                            "codeedge.phase1.final-compliance",
+		Version:                       "1",
+		QwenPolicy:                    qwen,
+		OpusPolicy:                    opus,
+		SubmissionCheckerID:           "codeedge.submission-check",
+		SubmissionCheckerVersion:      "1",
+		SubmissionReportSchemaVersion: CodeEdgeSubmissionReportSchemaVersion,
+	}
 }
 
 func bindingForTest(t *testing.T, base StageBindingBase) StageExecutionBinding {

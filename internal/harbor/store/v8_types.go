@@ -151,16 +151,6 @@ type FinalizeChangeOperationRequest struct {
 	Reason                    string
 }
 
-type BindRevisionCandidatePlanRequest struct {
-	CandidateID          string
-	ExpectedVersion      int64
-	FrozenPlanID         string
-	FinalManifestID      string
-	ChildRunManifestJSON string
-	Actor                string
-	Reason               string
-}
-
 // CreateAndBindRevisionCandidatePlanRequest commits the immutable plan and
 // its candidate binding in one SQLite transaction. It deliberately carries
 // the final filesystem facts produced before the transaction, so a crash can

@@ -324,6 +324,7 @@ func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWork
 			ReadSet:      append([]workflowkit.ResourceKey(nil), definition.ReadSet...),
 			WriteSet:     append([]workflowkit.ResourceKey(nil), definition.WriteSet...),
 			Effect:       definition.Effect,
+			Dispatch:     definition.Dispatch,
 			Budget:       budget,
 			QuotaClaims:  quotaClaims,
 			Retry:        definition.Retry.Clone(),

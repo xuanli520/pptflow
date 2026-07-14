@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 var _ TaskHubDetailReader = (*AppTaskHubLifecycleAdapter)(nil)
@@ -21,6 +23,10 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 	}
 	if services.Inspection == nil {
 		return TaskHubDetail{}, fmt.Errorf("Task Hub lifecycle inspection service is unavailable")
+	}
+	dataStore := services.Store()
+	if dataStore == nil {
+		return TaskHubDetail{}, fmt.Errorf("Task Hub read-only lifecycle store is unavailable")
 	}
 	inspection, err := services.Inspection.ReadTaskDetail(ctx, app.TaskInspectionQuery{
 		TaskID: strings.TrimSpace(query.TaskID),
@@ -44,7 +50,9 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 		SelectedRunID: inspection.SelectedRunID,
 		ObservedAt:    inspection.ObservedAt,
 	}
+	revisionsByID := make(map[string]store.TaskRevision, len(inspection.Revisions))
 	for _, revision := range inspection.Revisions {
+		revisionsByID[revision.ID] = revision
 		detail.Revisions = append(detail.Revisions, TaskHubRevisionFact{
 			RevisionID:                 revision.ID,
 			VersionNumber:              revision.VersionNumber,
@@ -98,6 +106,17 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 			})
 		}
 		detail.Runs = append(detail.Runs, projection)
+		if taskHubIsCodeEdgePhase1Run(run) {
+			record, recordErr := dataStore.GetCodeEdgeComplianceRecordForRun(ctx, run.ID)
+			if recordErr != nil {
+				return TaskHubDetail{}, fmt.Errorf("read CodeEdge final compliance for Run %s: %w", run.ID, recordErr)
+			}
+			revision, found := revisionsByID[run.RevisionID]
+			if !found {
+				return TaskHubDetail{}, fmt.Errorf("CodeEdge Run %s references unavailable revision %s", run.ID, run.RevisionID)
+			}
+			detail.CodeEdgeCompliance = append(detail.CodeEdgeCompliance, taskHubCodeEdgeComplianceFact(run, revision, record))
+		}
 	}
 	for _, release := range inspection.Releases {
 		detail.Releases = append(detail.Releases, TaskHubReleaseFact{
@@ -188,4 +207,40 @@ func taskHubDetailOptionalTime(value *time.Time) time.Time {
 		return time.Time{}
 	}
 	return value.UTC()
+}
+
+func taskHubCodeEdgeComplianceFact(run store.WorkflowRun, revision store.TaskRevision, record *store.CodeEdgeComplianceRecord) TaskHubCodeEdgeComplianceFact {
+	fact := TaskHubCodeEdgeComplianceFact{RunID: run.ID, State: TaskHubCodeEdgeComplianceNotRecorded}
+	if record == nil {
+		return fact
+	}
+	fact.ComplianceRecordID = record.ID
+	fact.RecordedAt = record.CreatedAt
+	if record.RunID != run.ID || record.TaskID != run.TaskID || record.RevisionID != run.RevisionID || record.RevisionID != revision.ID || record.TaskDigest != revision.TaskDigest ||
+		workflowkit.Fingerprint(strings.TrimSpace(record.DecisionFingerprint)).Validate() != nil {
+		fact.State = TaskHubCodeEdgeComplianceInvalid
+		return fact
+	}
+	switch record.Status {
+	case store.CodeEdgeComplianceApproved:
+		if workflowkit.Fingerprint(strings.TrimSpace(record.AuthorizationFingerprint)).Validate() != nil {
+			fact.State = TaskHubCodeEdgeComplianceInvalid
+			return fact
+		}
+		fact.State = TaskHubCodeEdgeComplianceApproved
+	case store.CodeEdgeComplianceRejected:
+		if strings.TrimSpace(record.AuthorizationFingerprint) != "" {
+			fact.State = TaskHubCodeEdgeComplianceInvalid
+			return fact
+		}
+		fact.State = TaskHubCodeEdgeComplianceRejected
+	default:
+		fact.State = TaskHubCodeEdgeComplianceInvalid
+		return fact
+	}
+	fact.RevisionID = record.RevisionID
+	fact.TaskDigest = record.TaskDigest
+	fact.DecisionFingerprint = record.DecisionFingerprint
+	fact.AuthorizationFingerprint = record.AuthorizationFingerprint
+	return fact
 }

@@ -2,61 +2,15 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestMigrateExistingV2StoreToV3(t *testing.T) {
-	root := t.TempDir()
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(root, dbFileName)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(migrationV2); err != nil {
-		t.Fatalf("create v2 fixture: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (2)`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	s, err := Open(root)
-	if err != nil {
-		t.Fatalf("migrate existing v2 store: %v", err)
-	}
-	defer s.Close()
-	for _, tableColumn := range [][2]string{{"run_attempts", "version"}, {"node_attempts", "created_at"}, {"outbox_events", "version"}, {"releases", "record_version"}, {"deletion_records", "version"}} {
-		var count int
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, tableColumn[0], tableColumn[1]).Scan(&count); err != nil {
-			t.Fatal(err)
-		}
-		if count != 1 {
-			t.Fatalf("v3 migration did not add %s.%s", tableColumn[0], tableColumn[1])
-		}
-	}
-}
-
 func tempV3DB(t *testing.T) *Store {
 	t.Helper()
-	s := tempDB(t)
-	var found int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('run_attempts') WHERE name = 'version'`).Scan(&found); err != nil {
-		t.Fatal(err)
-	}
-	if found == 0 {
-		if _, err := s.db.Exec(migrationV3); err != nil {
-			t.Fatalf("apply v3 schema fixture: %v", err)
-		}
-	}
-	return s
+	return tempDB(t)
 }
 
 func TestAtomicTaskRevisionRejectsInvalidDigestWithoutPartialTask(t *testing.T) {

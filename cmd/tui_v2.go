@@ -15,6 +15,12 @@ import (
 // task identity, lifecycle mutations, and plans must come from the control
 // plane rather than an arbitrary workspace path.
 func newLifecycleTUICommand(config *lifecycleCLIConfig) *cobra.Command {
+	return newLifecycleTUICommandWithRunner(config, tui.RunWithLifecycle)
+}
+
+type lifecycleTUIRunner func(context.Context, tui.TaskHubLifecycleService) error
+
+func newLifecycleTUICommandWithRunner(config *lifecycleCLIConfig, runner lifecycleTUIRunner) *cobra.Command {
 	return &cobra.Command{
 		Use:   "tui",
 		Short: "Open the V2 Task Hub",
@@ -23,12 +29,15 @@ func newLifecycleTUICommand(config *lifecycleCLIConfig) *cobra.Command {
 			if config == nil {
 				return fmt.Errorf("lifecycle configuration is required")
 			}
+			if runner == nil {
+				return fmt.Errorf("lifecycle TUI runner is required")
+			}
 			dataStore, err := store.Open(config.root)
 			if err != nil {
 				return fmt.Errorf("open lifecycle control plane: %w", err)
 			}
 			defer dataStore.Close()
-			services, err := app.NewLifecycleServices(config.root, dataStore)
+			services, err := config.openLifecycleServices(dataStore)
 			if err != nil {
 				return err
 			}
@@ -36,7 +45,7 @@ func newLifecycleTUICommand(config *lifecycleCLIConfig) *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			return tui.RunWithLifecycle(ctx, newLifecycleTUIAdapter(services))
+			return runner(ctx, newLifecycleTUIAdapter(services))
 		},
 	}
 }

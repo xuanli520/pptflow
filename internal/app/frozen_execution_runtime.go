@@ -170,17 +170,18 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered stage job does not bind its payload", ErrFrozenExecutionPayload))
 		return projected
 	}
-	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.QuotaPolicy)
+	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, "", payload.QuotaPolicy)
 	if err != nil {
 		_, projected := runtime.failMalformedJob(ctx, job, err)
 		return projected
 	}
-	if run.Status != store.WorkflowRunRunning {
-		return runtime.enqueueAutomaticRepairOutcome(ctx, run.ID, job.CreatedBy, "recover repair-loop handoff after terminal stage projection")
-	}
 	stage, found := frozen.Workflow.Stage(payload.StageKey)
 	if !found {
 		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen workflow omits recovered stage %q", ErrFrozenExecutionPayload, payload.StageKey))
+		return projected
+	}
+	if !stage.AutomaticallyDispatchable() {
+		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered job targets operator-only stage %q", ErrFrozenExecutionPayload, stage.Key))
 		return projected
 	}
 	attempt, err := runtime.core.store.GetStageAttempt(ctx, payload.StageAttemptID)
@@ -194,6 +195,18 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 	if err := runtime.validateStageAttemptPlanBinding(*attempt, payload); err != nil {
 		_, projected := runtime.failMalformedJob(ctx, job, err)
 		return projected
+	}
+	if isCodeEdgeEvaluatorStage(run, stage) {
+		handled, reconcileErr := runtime.reconcileRecoveredCodeEdgeEvaluatorStage(ctx, job, run, *attempt, stage)
+		if reconcileErr != nil {
+			return reconcileErr
+		}
+		if handled {
+			return nil
+		}
+	}
+	if run.Status != store.WorkflowRunRunning {
+		return runtime.enqueueAutomaticRepairOutcome(ctx, run.ID, job.CreatedBy, "recover repair-loop handoff after terminal stage projection")
 	}
 	if !recoverableStageTerminalStatus(attempt.ExecutionStatus) {
 		return nil
@@ -220,11 +233,11 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredWorkflowCoordinator(ctx
 		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("decode recovered workflow coordinator payload: %w", err))
 		return projected
 	}
-	if payload.Format != workflowRunExecutionPayloadFormat || payload.RunID != job.RunID || payload.RunID != job.EntityID {
+	if err := validateWorkflowRunExecutionPayload(payload, job); err != nil {
 		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered workflow coordinator does not bind its payload", ErrFrozenExecutionPayload))
 		return projected
 	}
-	run, _, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.QuotaPolicy)
+	run, _, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.ExecutionSpecFingerprint, payload.QuotaPolicy)
 	if err != nil {
 		_, projected := runtime.failMalformedJob(ctx, job, err)
 		return projected
@@ -258,7 +271,7 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredContinuationCoordinator
 		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered continuation execution does not match durable job", ErrFrozenExecutionPayload))
 		return projected
 	}
-	run, _, err := runtime.loadFrozenRun(ctx, payload.RunID, "", payload.QuotaPolicy)
+	run, _, err := runtime.loadFrozenRun(ctx, payload.RunID, "", "", payload.QuotaPolicy)
 	if err != nil {
 		_, projected := runtime.failMalformedJob(ctx, job, err)
 		return projected
@@ -332,15 +345,25 @@ func (plan runtimeExecutionPlan) stageTransition(key workflowkit.StageKey) (work
 	return transition.Clone(), found
 }
 
+func validateWorkflowRunExecutionPayload(payload workflowRunExecutionPayload, job store.DurableJob) error {
+	if payload.Format != workflowRunExecutionPayloadFormat || payload.RunID != job.RunID || payload.RunID != job.EntityID {
+		return fmt.Errorf("workflow run job does not bind its payload")
+	}
+	if err := payload.ExecutionSpecFingerprint.Validate(); err != nil {
+		return fmt.Errorf("workflow run execution specification fingerprint: %w", err)
+	}
+	return nil
+}
+
 func (runtime *FrozenExecutionRuntime) handleWorkflowRun(ctx context.Context, execution DurableJobExecution, job store.DurableJob) (store.JobState, error) {
 	var payload workflowRunExecutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
 		return runtime.failMalformedJob(ctx, job, fmt.Errorf("decode workflow run payload: %w", err))
 	}
-	if payload.Format != workflowRunExecutionPayloadFormat || payload.RunID != job.RunID || payload.RunID != job.EntityID {
+	if err := validateWorkflowRunExecutionPayload(payload, job); err != nil {
 		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: workflow run job does not bind its payload", ErrFrozenExecutionPayload))
 	}
-	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.QuotaPolicy)
+	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.ExecutionSpecFingerprint, payload.QuotaPolicy)
 	if err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
@@ -378,7 +401,7 @@ func (runtime *FrozenExecutionRuntime) handleContinuation(ctx context.Context, e
 	if continuation == nil || continuation.RunID != job.RunID || continuation.PlanID != payload.PlanID || continuation.PayloadJSON != job.PayloadJSON {
 		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: continuation execution does not match durable job", ErrFrozenExecutionPayload))
 	}
-	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, "", payload.QuotaPolicy)
+	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, "", "", payload.QuotaPolicy)
 	if err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
@@ -436,7 +459,7 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredRepairSessionAdvance(ct
 	return err
 }
 
-func (runtime *FrozenExecutionRuntime) loadFrozenRun(ctx context.Context, runID, definitionHash string, payloadPolicy workflowadapter.ResolvedQuotaPolicy) (store.WorkflowRun, frozenRunDefinition, error) {
+func (runtime *FrozenExecutionRuntime) loadFrozenRun(ctx context.Context, runID, definitionHash string, expectedExecutionSpecFingerprint workflowkit.Fingerprint, payloadPolicy workflowadapter.ResolvedQuotaPolicy) (store.WorkflowRun, frozenRunDefinition, error) {
 	run, err := runtime.core.store.GetWorkflowRun(ctx, runID)
 	if err != nil {
 		return store.WorkflowRun{}, frozenRunDefinition{}, err
@@ -448,11 +471,17 @@ func (runtime *FrozenExecutionRuntime) loadFrozenRun(ctx context.Context, runID,
 	if err != nil {
 		return store.WorkflowRun{}, frozenRunDefinition{}, err
 	}
+	if _, _, err := runtime.core.verifyRunManagedExecutionInputs(ctx, *run); err != nil {
+		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: verify frozen managed execution inputs: %w", ErrFrozenExecutionPayload, err)
+	}
 	if err := runtime.core.verifyRunDeploymentCatalogReceipt(*run); err != nil {
 		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: verify frozen deployment catalog receipt: %w", ErrFrozenExecutionPayload, err)
 	}
 	if definitionHash != "" && definitionHash != run.DefinitionHash {
 		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: workflow definition hash mismatch", ErrFrozenExecutionPayload)
+	}
+	if expectedExecutionSpecFingerprint != "" && expectedExecutionSpecFingerprint != frozen.ExecutionSpecFingerprint {
+		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: workflow execution specification fingerprint differs from run manifest", ErrFrozenExecutionPayload)
 	}
 	if err := payloadPolicy.Validate(); err != nil {
 		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: payload quota policy: %v", ErrFrozenExecutionPayload, err)
@@ -479,7 +508,15 @@ func initialRuntimeExecutionPlan(frozen frozenRunDefinition) (runtimeExecutionPl
 		QuotaPolicy:  frozen.QuotaPolicy.Clone(),
 	}
 	for _, key := range mustTopologicalStageKeys(frozen.Workflow) {
-		plan.Transitions[key] = workflowkit.NodeTransition{NodeID: key, FromGeneration: 0, ToGeneration: 0, Disposition: workflowkit.DispositionSchedule}
+		stage, found := frozen.Workflow.Stage(key)
+		if !found {
+			return runtimeExecutionPlan{}, fmt.Errorf("%w: frozen workflow omits initial stage %q", ErrFrozenExecutionPayload, key)
+		}
+		disposition := workflowkit.DispositionSchedule
+		if stage.OperatorOnly() {
+			disposition = workflowkit.DispositionOperatorOnly
+		}
+		plan.Transitions[key] = workflowkit.NodeTransition{NodeID: key, FromGeneration: 0, ToGeneration: 0, Disposition: disposition}
 	}
 	return plan, nil
 }
@@ -709,6 +746,9 @@ func (runtime *FrozenExecutionRuntime) scheduleNextBatch(ctx context.Context, pa
 			if !found {
 				return fmt.Errorf("%w: batch %s refers to unknown stage %q", ErrFrozenExecutionPayload, batch.ID, stageKey)
 			}
+			if !stage.AutomaticallyDispatchable() {
+				return fmt.Errorf("%w: batch %s targets operator-only stage %q", ErrFrozenExecutionPayload, batch.ID, stageKey)
+			}
 			transition, found := plan.stageTransition(stageKey)
 			if !found || transition.Disposition != workflowkit.DispositionSchedule {
 				return fmt.Errorf("%w: batch %s stage %q is not frozen for scheduling", ErrFrozenExecutionPayload, batch.ID, stageKey)
@@ -810,6 +850,9 @@ func stageExecutionKey(payload frozenStageExecutionPayload) string {
 }
 
 func (runtime *FrozenExecutionRuntime) enqueueStageAttempt(ctx context.Context, parentJob store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan, stage workflowkit.StageDescriptor, transition workflowkit.NodeTransition) error {
+	if !stage.AutomaticallyDispatchable() {
+		return fmt.Errorf("%w: operator-only stage %q cannot receive a StageAttempt", ErrFrozenExecutionPayload, stage.Key)
+	}
 	revision, err := runtime.core.store.GetTaskRevision(ctx, run.RevisionID)
 	if err != nil {
 		return err
@@ -955,13 +998,16 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	if payload.Format != frozenStageExecutionPayloadFormat || payload.RunID != job.RunID || payload.StageAttemptID != job.StageAttemptID || payload.StageAttemptID != job.EntityID || payload.Generation < 0 {
 		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: stage job does not bind its payload", ErrFrozenExecutionPayload))
 	}
-	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.QuotaPolicy)
+	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, "", payload.QuotaPolicy)
 	if err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
 	stage, found := frozen.Workflow.Stage(payload.StageKey)
 	if !found {
 		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen workflow omits stage %q", ErrFrozenExecutionPayload, payload.StageKey))
+	}
+	if !stage.AutomaticallyDispatchable() {
+		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: operator-only stage %q cannot execute from a durable worker job", ErrFrozenExecutionPayload, stage.Key))
 	}
 	loadedStageAttempt, err := runtime.core.store.GetStageAttempt(ctx, payload.StageAttemptID)
 	if err != nil {
@@ -972,6 +1018,16 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	}
 	if err := runtime.validateStageAttemptPlanBinding(*loadedStageAttempt, payload); err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
+	}
+	isCodeEdgeEvaluator := isCodeEdgeEvaluatorStage(run, stage)
+	if isCodeEdgeEvaluator {
+		effect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, *loadedStageAttempt, stage)
+		if effectErr != nil {
+			return runtime.failMalformedJob(ctx, job, effectErr)
+		}
+		if effect != nil && !(effect.State == store.SideEffectSucceeded && loadedStageAttempt.ExecutionStatus == store.StageExecutionCompleted) {
+			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, *loadedStageAttempt, stage, stageQuotaReservation{}, *effect, nil, "CodeEdge evaluator invocation fence was already started")
+		}
 	}
 	if loadedStageAttempt.ExecutionStatus == store.StageExecutionCompleted || loadedStageAttempt.ExecutionStatus == store.StageExecutionInfraFailed || loadedStageAttempt.ExecutionStatus == store.StageExecutionInterrupted || loadedStageAttempt.ExecutionStatus == store.StageExecutionCanceled {
 		return store.JobSucceeded, nil
@@ -992,6 +1048,11 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	}
 	if state, handled, controlErr := runtime.handlePreStageControl(ctx, job, run, *revision, stageAttempt); handled || controlErr != nil {
 		return state, controlErr
+	}
+	if isCodeEdgeEvaluator {
+		if err := validateCodeEdgeEvaluatorBudget(stage); err != nil {
+			return runtime.failMalformedJob(ctx, job, err)
+		}
 	}
 	if stageAttempt.ExecutionStatus == store.StageExecutionQueued {
 		stageAttempt, err = runtime.core.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
@@ -1047,10 +1108,24 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	if string(inputFingerprint) != stageAttempt.InputFingerprint {
 		return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, fmt.Errorf("%w: stage attempt input fingerprint drift", ErrFrozenExecutionPayload))
 	}
+	var codeEdgeEffect *store.SideEffectOperation
+	if isCodeEdgeEvaluator {
+		fence, fenceErr := runtime.prepareCodeEdgeEvaluatorEffect(ctx, job, run, stageAttempt, stage)
+		if fenceErr != nil {
+			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, fenceErr)
+		}
+		codeEdgeEffect = &fence.Operation
+		if !fence.Invoke {
+			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, fence.Operation, nil, "CodeEdge evaluator invocation fence prevents replay")
+		}
+	}
 	var result StageExecutionResult
 	for ordinal := 1; ordinal <= stage.Budget.MaxAttempts; ordinal++ {
 		nodeAttempt, nodeErr := runtime.createRunningNodeAttempt(ctx, stageAttempt, stage, payload.Generation, ordinal, job.CreatedBy)
 		if nodeErr != nil {
+			if codeEdgeEffect != nil {
+				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, nodeErr.Error())
+			}
 			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, nodeErr)
 		}
 		attemptContext, attemptCancel := context.WithTimeout(stageContext, stage.Budget.AttemptTimeout)
@@ -1064,7 +1139,14 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		if result.Outcome.Status == workflowkit.StatusCompleted && !stage.Verdicts.Allows(result.Outcome.Verdict) {
 			result = StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePolicy}, ErrorText: fmt.Sprintf("stage emitted frozen-disallowed verdict %q", result.Outcome.Verdict), FailureClass: string(workflowkit.FailurePolicy)}
 		}
-		if err := runtime.transitionNodeAttempt(ctx, nodeAttempt, result.Outcome, result.ErrorText, job.CreatedBy); err != nil {
+		nodeOutcome := result.Outcome
+		if codeEdgeEffect != nil && codeEdgeEvaluatorOutcomeIsUncertain(result, reservation, execution.LeaseLost, monitor) {
+			nodeOutcome = workflowkit.Outcome{Status: workflowkit.StatusInDoubt}
+		}
+		if err := runtime.transitionNodeAttempt(ctx, nodeAttempt, nodeOutcome, result.ErrorText, job.CreatedBy); err != nil {
+			if codeEdgeEffect != nil {
+				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, err.Error())
+			}
 			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, err)
 		}
 		if result.Outcome.Status == workflowkit.StatusInfraFailed && stageRetryable(stage, result.Outcome.Failure) && ordinal < stage.Budget.MaxAttempts && stageContext.Err() == nil {
@@ -1728,6 +1810,19 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 	if monitor != nil {
 		operation = monitor.current()
 	}
+	var codeEdgeEffect *store.SideEffectOperation
+	if isCodeEdgeEvaluatorStage(run, stage) {
+		effect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, attempt, stage)
+		if effectErr != nil {
+			return store.JobFailed, effectErr
+		}
+		if effect != nil {
+			codeEdgeEffect = effect
+			if effect.State != store.SideEffectStarted || codeEdgeEvaluatorOutcomeIsUncertain(result, reservation, workerLeaseLost, monitor) {
+				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *effect, operation, "CodeEdge evaluator terminal projection cannot prove the external outcome")
+			}
+		}
+	}
 	unknownOutcome := reservation.lost() || channelClosed(workerLeaseLost) || result.Outcome.Status == workflowkit.StatusInDoubt
 	if operation != nil && operation.Action == store.ControlActionTerminate && stage.Effect == workflowkit.EffectExternalSideEffect && result.Outcome.Status != workflowkit.StatusCompleted {
 		unknownOutcome = true
@@ -1765,6 +1860,7 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 	}
 
 	manifestID := ""
+	var manifest store.ArtifactManifest
 	if len(result.Artifacts) != 0 {
 		persist := persistStageEvidence
 		reason := "persist frozen stage diagnostic evidence"
@@ -1772,17 +1868,26 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 			persist = persistStageArtifacts
 			reason = "persist frozen stage outputs"
 		}
-		manifest, _, err := persist(ctx, runtime.core, run, revision, attempt, latestNodeAttempt(ctx, runtime.core.store, attempt.ID), stage, inputs, result.Artifacts, job.CreatedBy, reason)
+		persistedManifest, _, err := persist(ctx, runtime.core, run, revision, attempt, latestNodeAttempt(ctx, runtime.core.store, attempt.ID), stage, inputs, result.Artifacts, job.CreatedBy, reason)
 		if err != nil {
 			result = StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePermanent}, ErrorText: err.Error(), FailureClass: string(workflowkit.FailurePermanent)}
 		} else {
+			manifest = persistedManifest
 			manifestID = manifest.ID
 		}
+	}
+	if codeEdgeEffect != nil && codeEdgeEvaluatorOutcomeIsUncertain(result, reservation, workerLeaseLost, monitor) {
+		return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *codeEdgeEffect, operation, "CodeEdge evaluator evidence persistence cannot prove the external outcome")
 	}
 
 	stageStatus, verdict, failureClass, err := stageProjection(result.Outcome)
 	if err != nil {
 		return store.JobFailed, err
+	}
+	if codeEdgeEffect != nil && stageStatus == store.StageExecutionCompleted {
+		if err := runtime.completeCodeEdgeEvaluatorEffect(ctx, run, attempt, stage, manifest, job.CreatedBy); err != nil {
+			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *codeEdgeEffect, operation, "CodeEdge evaluator success fence could not be finalized: "+err.Error())
+		}
 	}
 	settlementOutcome := store.QuotaSettlementCanceled
 	if stageStatus == store.StageExecutionCompleted {
@@ -1990,7 +2095,7 @@ func (runtime *FrozenExecutionRuntime) enqueueNextCoordinator(ctx context.Contex
 	if payload.ContinuationPlanID == "" {
 		encoded, err := json.Marshal(workflowRunExecutionPayload{
 			Format: workflowRunExecutionPayloadFormat, RunID: run.ID, DefinitionHash: run.DefinitionHash,
-			QuotaPolicy: frozen.QuotaPolicy.Clone(),
+			ExecutionSpecFingerprint: frozen.ExecutionSpecFingerprint, QuotaPolicy: frozen.QuotaPolicy.Clone(),
 		})
 		if err != nil {
 			return err

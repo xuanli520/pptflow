@@ -475,6 +475,215 @@ func TestAppTaskHubLifecycleAdapterPlansOnlyLocalPackageForReviewedRevision(t *t
 	}
 }
 
+func TestTaskHubCodeEdgePackageRequiresApprovedRecordAndBindsSelectedRun(t *testing.T) {
+	ctx, services, task, revision := newTaskHubLocalPackageMutationFixture(t)
+	run := taskHubCreateCodeEdgePackageRun(t, ctx, services, task, revision)
+	record := taskHubApprovedCodeEdgeComplianceRecord(t, run, task, revision)
+	adapter := NewAppTaskHubLifecycleAdapter(services)
+
+	alternate := run
+	alternate.ID = mustTaskHubCodeEdgeUUID(t)
+	alternate.CreatedAt = run.CreatedAt.Add(time.Second)
+	alternateRecord := taskHubApprovedCodeEdgeComplianceRecord(t, alternate, task, revision)
+	selected, unavailable := selectTaskHubCodeEdgePackageAuthorization(task, revision, []store.WorkflowRun{run, alternate}, map[string]*store.CodeEdgeComplianceRecord{run.ID: &record, alternate.ID: &alternateRecord}, "")
+	if unavailable != "" || selected == nil || selected.Run.ID != alternate.ID || selected.Record.ID != alternateRecord.ID {
+		t.Fatalf("approved CodeEdge package default selection = %+v / %q", selected, unavailable)
+	}
+	selected, unavailable = selectTaskHubCodeEdgePackageAuthorization(task, revision, []store.WorkflowRun{run, alternate}, map[string]*store.CodeEdgeComplianceRecord{run.ID: &record, alternate.ID: &alternateRecord}, run.ID)
+	if unavailable != "" || selected == nil || selected.Run.ID != run.ID || selected.Record.ID != record.ID {
+		t.Fatalf("preferred approved CodeEdge package selection = %+v / %q", selected, unavailable)
+	}
+	expected := TaskHubLifecycleCheckpoint{
+		TaskID: task.ID, RevisionID: revision.ID, RevisionDigest: revision.TaskDigest,
+		RunID: run.ID, RunVersion: run.Version, RunExecutionEpoch: run.ExecutionEpoch, RunDefinitionHash: run.DefinitionHash,
+		CodeEdgeComplianceRecordID: record.ID, CodeEdgeAuthorizationFingerprint: record.AuthorizationFingerprint,
+	}
+	converted := appLifecycleMutationCheckpoint(expected)
+	if converted.RunID != run.ID || converted.CodeEdgeComplianceRecordID != record.ID ||
+		converted.CodeEdgeAuthorizationFingerprint != record.AuthorizationFingerprint {
+		t.Fatalf("CodeEdge Task Hub checkpoint did not survive app conversion: %+v", converted)
+	}
+
+	// The TUI must carry the application-selected Run into its confirmation
+	// target, rather than retaining a stale task-row selection after p p.
+	plan := TaskHubPlanPreview{Title: "生成本地 package", Summary: "已选择 approved CodeEdge Run", ConfirmationNeeded: true, Expected: expected}
+	fake := &fakeTaskHubLifecycle{snapshot: TaskHubSnapshot{
+		Tasks: []TaskHubTask{{TaskID: task.ID, RevisionID: revision.ID, Actions: []TaskHubActionState{{Action: TaskHubActionPackageRevision, Enabled: true}}}},
+		Runs:  []TaskHubRun{{RunID: run.ID, TaskID: task.ID, RevisionID: revision.ID}},
+	}, plan: plan}
+	m, cleanup := newTestTaskHubV2Model(t, fake)
+	defer cleanup()
+	updated, _ := m.Update(runeKey("p"))
+	m = updated.(model)
+	updated, planCommand := m.Update(runeKey("p"))
+	m = updated.(model)
+	if planCommand == nil {
+		t.Fatal("p p did not request a CodeEdge package plan")
+	}
+	updated, _ = m.Update(planCommand())
+	m = updated.(model)
+	if m.taskHubPlan == nil || m.taskHubPlanCommand == nil || m.taskHubPlan.Expected.RunID != run.ID ||
+		m.taskHubPlanCommand.Target.RunID != run.ID || m.taskHub.SelectedRunID != run.ID {
+		t.Fatalf("p p did not bind its selected CodeEdge Run: plan=%+v command=%+v selected=%s", m.taskHubPlan, m.taskHubPlanCommand, m.taskHub.SelectedRunID)
+	}
+
+	// A caller cannot bypass the selected authorization by constructing a TUI
+	// request with a task/revision checkpoint but no CodeEdge Run. The release
+	// service must reject it before creating a local package.
+	checkpoint, err := services.Mutations.CaptureCheckpoint(ctx, task.ID, revision.ID, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bypassKey, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = adapter.ExecuteTaskHubMutation(ctx, TaskHubMutationRequest{
+		Action:         TaskHubActionPackageRevision,
+		Target:         TaskHubTarget{TaskID: task.ID, RevisionID: revision.ID},
+		Expected:       taskHubLifecycleCheckpoint(checkpoint),
+		IdempotencyKey: bypassKey,
+		Actor:          "tester",
+		Reason:         "prove Task Hub cannot omit CodeEdge authorization",
+		Values:         map[string]string{taskHubPackageVersionField: "codeedge-bypass-must-fail"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "CodeEdge package requires an approved Run ID") {
+		t.Fatalf("unbound CodeEdge TUI package request error = %v", err)
+	}
+	releases, err := services.Releases.List(ctx, task.ID)
+	if err != nil || len(releases) != 0 {
+		t.Fatalf("unbound CodeEdge TUI package request created releases = %+v, %v", releases, err)
+	}
+
+	detail, err := adapter.QueryTaskHubDetail(ctx, TaskHubDetailQuery{TaskID: task.ID, RunID: run.ID})
+	if err != nil || len(detail.CodeEdgeCompliance) != 1 || detail.CodeEdgeCompliance[0].State != TaskHubCodeEdgeComplianceNotRecorded {
+		t.Fatalf("CodeEdge unrecorded detail projection = %+v, %v", detail.CodeEdgeCompliance, err)
+	}
+	compliance := taskHubCodeEdgeComplianceFact(run, revision, &record)
+	if compliance.State != TaskHubCodeEdgeComplianceApproved || compliance.ComplianceRecordID != record.ID || compliance.AuthorizationFingerprint != record.AuthorizationFingerprint {
+		t.Fatalf("CodeEdge safe compliance fact = %+v", compliance)
+	}
+	overlay := newTaskHubDetailOverlay(TaskHubDetailQuery{TaskID: task.ID, RunID: run.ID})
+	overlay.Loading = false
+	overlay.Detail = TaskHubDetail{FrozenExecutions: []TaskHubFrozenExecutionFact{{RunID: run.ID, State: TaskHubFrozenExecutionUnavailable}}, CodeEdgeCompliance: []TaskHubCodeEdgeComplianceFact{compliance}}
+	overlay.Tab = TaskHubDetailFrozenTab
+	rendered := overlay.View(120, 60)
+	for _, hidden := range []string{"qwen-receipt-secret", "submission-receipt-secret", "authorization-secret"} {
+		if strings.Contains(rendered, hidden) {
+			t.Fatalf("CodeEdge detail leaked raw immutable receipt content %q:\n%s", hidden, rendered)
+		}
+	}
+	if !strings.Contains(rendered, "CodeEdge 最终合规") || !strings.Contains(rendered, record.AuthorizationFingerprint) {
+		t.Fatalf("CodeEdge detail omitted safe compliance projection:\n%s", rendered)
+	}
+}
+
+func TestSelectTaskHubCodeEdgePackageAuthorizationDoesNotFallbackFromCurrentPreferredRun(t *testing.T) {
+	_, _, task, revision := newTaskHubLocalPackageMutationFixture(t)
+	preferred := store.WorkflowRun{
+		ID:                      mustTaskHubCodeEdgeUUID(t),
+		TaskID:                  task.ID,
+		RevisionID:              revision.ID,
+		WorkflowTemplateID:      workflowadapter.CodeEdgePhase1WorkflowTemplateID,
+		WorkflowTemplateVersion: workflowadapter.CodeEdgePhase1WorkflowTemplateVersion,
+		CreatedAt:               time.Now().UTC(),
+	}
+	approved := preferred
+	approved.ID = mustTaskHubCodeEdgeUUID(t)
+	approved.CreatedAt = preferred.CreatedAt.Add(time.Second)
+	approvedRecord := taskHubApprovedCodeEdgeComplianceRecord(t, approved, task, revision)
+	runs := []store.WorkflowRun{preferred, approved}
+
+	selected, unavailable := selectTaskHubCodeEdgePackageAuthorization(task, revision, runs, map[string]*store.CodeEdgeComplianceRecord{
+		approved.ID: &approvedRecord,
+	}, preferred.ID)
+	if selected != nil || !strings.Contains(unavailable, "指定的 CodeEdge Phase-1 Run") || !strings.Contains(unavailable, "没有已批准") {
+		t.Fatalf("missing preferred CodeEdge approval selected = %+v / %q, want explicit unavailability without fallback", selected, unavailable)
+	}
+
+	nonCodeEdge := preferred
+	nonCodeEdge.ID = mustTaskHubCodeEdgeUUID(t)
+	nonCodeEdge.WorkflowTemplateID = workflowadapter.StandardWorkflowTemplateID
+	nonCodeEdge.WorkflowTemplateVersion = workflowadapter.StandardWorkflowTemplateVersion
+	selected, unavailable = selectTaskHubCodeEdgePackageAuthorization(task, revision, append(runs, nonCodeEdge), map[string]*store.CodeEdgeComplianceRecord{
+		approved.ID: &approvedRecord,
+	}, nonCodeEdge.ID)
+	if unavailable != "" || selected == nil || selected.Run.ID != approved.ID || selected.Record.ID != approvedRecord.ID {
+		t.Fatalf("invalid preferred CodeEdge Run did not fall back to ordered approved candidate: %+v / %q", selected, unavailable)
+	}
+}
+
+func TestTaskHubCodeEdgePackageIsUnavailableWithoutApprovedRecord(t *testing.T) {
+	ctx, services, task, revision := newTaskHubLocalPackageMutationFixture(t)
+	_ = taskHubCreateCodeEdgePackageRun(t, ctx, services, task, revision)
+	adapter := NewAppTaskHubLifecycleAdapter(services)
+
+	snapshot, err := adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubTasksTab})
+	if err != nil || len(snapshot.Tasks) != 1 {
+		t.Fatalf("query unapproved CodeEdge package fixture = %+v, %v", snapshot, err)
+	}
+	packageAction, found := taskHubActionStateFor(snapshot.Tasks[0].Actions, TaskHubActionPackageRevision)
+	if !found || packageAction.Enabled || !strings.Contains(packageAction.DisabledReason, "没有已批准") {
+		t.Fatalf("unapproved CodeEdge package action = %+v, want a clear disabled reason", packageAction)
+	}
+	plan, err := adapter.PlanTaskHubCommand(ctx, TaskHubCommand{
+		Action: TaskHubActionPackageRevision,
+		Target: TaskHubTarget{TaskID: task.ID, RevisionID: revision.ID},
+	})
+	if err != nil || plan.ConfirmationNeeded || !strings.Contains(plan.Reason, "没有已批准") {
+		t.Fatalf("unapproved CodeEdge package plan = %+v, %v", plan, err)
+	}
+}
+
+func taskHubCreateCodeEdgePackageRun(t *testing.T, ctx context.Context, services *app.LifecycleServices, task store.TaskV2, revision store.TaskRevision) store.WorkflowRun {
+	t.Helper()
+	profile := taskHubAdapterCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
+	run, err := services.Runs.StartRun(ctx, app.StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID,
+		Profile:       profile,
+		ExecutionSpec: testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
+		Trigger:       "task-hub-codeedge-package-fixture",
+		Actor:         "tester",
+		Reason:        "create CodeEdge package fixture",
+	})
+	if err != nil {
+		t.Fatalf("start CodeEdge package fixture Run: %v", err)
+	}
+	return run
+}
+
+func taskHubApprovedCodeEdgeComplianceRecord(t *testing.T, run store.WorkflowRun, task store.TaskV2, revision store.TaskRevision) store.CodeEdgeComplianceRecord {
+	t.Helper()
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store.CodeEdgeComplianceRecord{
+		ID: key, RunID: run.ID, TaskID: task.ID, RevisionID: revision.ID, TaskDigest: revision.TaskDigest,
+		Status:                   store.CodeEdgeComplianceApproved,
+		QwenReceiptJSON:          `{"receipt":"qwen-receipt-secret"}`,
+		OpusReceiptJSON:          `{"receipt":"opus-receipt-secret"}`,
+		SubmissionReceiptJSON:    `{"receipt":"submission-receipt-secret"}`,
+		DecisionJSON:             `{"decision":"approved"}`,
+		DecisionFingerprint:      taskHubTestFingerprint('a'),
+		AuthorizationJSON:        `{"authorization":"authorization-secret"}`,
+		AuthorizationFingerprint: taskHubTestFingerprint('b'),
+	}
+}
+
+func taskHubTestFingerprint(character rune) string {
+	return "sha256:" + strings.Repeat(string(character), 64)
+}
+
+func mustTaskHubCodeEdgeUUID(t *testing.T) string {
+	t.Helper()
+	id, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func TestAppTaskHubLifecycleAdapterReviewDecisionUsesV12CheckpointAndReceipt(t *testing.T) {
 	ctx, services, task, revision, review := newTaskHubReviewMutationFixture(t)
 	adapter := NewAppTaskHubLifecycleAdapter(services)
@@ -1143,10 +1352,14 @@ func taskHubRunControlActionStateFor(states []TaskHubRunControlActionState, acti
 }
 
 func taskHubAdapterCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
+	return taskHubAdapterCompleteProfileForTemplate(t, workflowadapter.StandardWorkflowTemplate())
+}
+
+func taskHubAdapterCompleteProfileForTemplate(t *testing.T, template workflowadapter.WorkflowTemplate) workflowadapter.ExecutionProfile {
 	t.Helper()
-	catalog := workflowadapter.StandardStageCatalog()
+	catalog := template.Catalog
 	profile := workflowadapter.ExecutionProfile{
-		Template:            workflowadapter.StandardTemplateReference(),
+		Template:            template.Reference(),
 		ID:                  "task-hub-integration",
 		Version:             "1",
 		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL,

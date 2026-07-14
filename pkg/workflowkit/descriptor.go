@@ -29,6 +29,45 @@ func (effect StageEffect) valid() bool {
 	}
 }
 
+// StageDispatchPolicy determines whether the generic durable executor may
+// create a StageAttempt for a frozen stage. It is separate from StageEffect:
+// a domain can keep an operator-controlled effect in its DAG as a readable
+// readiness contract without allowing a Run or continuation to invoke it.
+type StageDispatchPolicy string
+
+const (
+	// StageDispatchAutomatic is the normal durable worker path. The empty value
+	// is treated as automatic for source compatibility with already-constructed
+	// generic descriptors.
+	StageDispatchAutomatic StageDispatchPolicy = "automatic"
+	// StageDispatchOperatorOnly preserves a stage in the frozen descriptor but
+	// excludes it from execution plans. A domain-specific lifecycle service must
+	// own any corresponding operation, authorization, and idempotency contract.
+	StageDispatchOperatorOnly StageDispatchPolicy = "operator_only"
+)
+
+// IsAutomatic reports whether a stage participates in normal Run and
+// continuation scheduling.
+func (policy StageDispatchPolicy) IsAutomatic() bool {
+	return policy == "" || policy == StageDispatchAutomatic
+}
+
+// IsOperatorOnly reports whether a stage is represented for readiness only.
+func (policy StageDispatchPolicy) IsOperatorOnly() bool {
+	return policy == StageDispatchOperatorOnly
+}
+
+// Validate checks that a dispatch policy is known to this version of the
+// generic execution contract.
+func (policy StageDispatchPolicy) Validate() error {
+	switch policy {
+	case "", StageDispatchAutomatic, StageDispatchOperatorOnly:
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported stage dispatch policy %q", ErrInvalidDescriptor, policy)
+	}
+}
+
 // Capability describes an explicit operation a stage supports.
 type Capability string
 
@@ -188,22 +227,35 @@ func (policy VerdictPolicy) validate() error {
 // stage. It deliberately has no untyped configuration map: domain adapters
 // decode their configuration before constructing this descriptor.
 type StageDescriptor struct {
-	Key          StageKey        `json:"key"`
-	Version      string          `json:"version"`
-	Plugin       PluginBinding   `json:"plugin"`
-	Group        string          `json:"group"`
-	Dependencies []StageKey      `json:"dependencies"`
-	Inputs       []ArtifactSpec  `json:"inputs"`
-	Outputs      []ArtifactSpec  `json:"outputs"`
-	ReadSet      []ResourceKey   `json:"read_set"`
-	WriteSet     []ResourceKey   `json:"write_set"`
-	Effect       StageEffect     `json:"effect"`
-	Budget       ExecutionBudget `json:"budget"`
-	QuotaClaims  []QuotaClaim    `json:"quota_claims"`
-	Retry        RetryPolicy     `json:"retry"`
-	Verdicts     VerdictPolicy   `json:"verdicts"`
-	Reuse        ReusePolicy     `json:"reuse"`
-	Capabilities CapabilitySet   `json:"capabilities"`
+	Key          StageKey            `json:"key"`
+	Version      string              `json:"version"`
+	Plugin       PluginBinding       `json:"plugin"`
+	Group        string              `json:"group"`
+	Dependencies []StageKey          `json:"dependencies"`
+	Inputs       []ArtifactSpec      `json:"inputs"`
+	Outputs      []ArtifactSpec      `json:"outputs"`
+	ReadSet      []ResourceKey       `json:"read_set"`
+	WriteSet     []ResourceKey       `json:"write_set"`
+	Effect       StageEffect         `json:"effect"`
+	Dispatch     StageDispatchPolicy `json:"dispatch,omitempty"`
+	Budget       ExecutionBudget     `json:"budget"`
+	QuotaClaims  []QuotaClaim        `json:"quota_claims"`
+	Retry        RetryPolicy         `json:"retry"`
+	Verdicts     VerdictPolicy       `json:"verdicts"`
+	Reuse        ReusePolicy         `json:"reuse"`
+	Capabilities CapabilitySet       `json:"capabilities"`
+}
+
+// AutomaticallyDispatchable reports whether the generic worker may execute
+// this stage as part of a frozen Run or continuation plan.
+func (descriptor StageDescriptor) AutomaticallyDispatchable() bool {
+	return descriptor.Dispatch.IsAutomatic()
+}
+
+// OperatorOnly reports whether this stage is retained solely as an explicit
+// lifecycle/readiness contract and cannot be scheduled by the generic engine.
+func (descriptor StageDescriptor) OperatorOnly() bool {
+	return descriptor.Dispatch.IsOperatorOnly()
 }
 
 // Clone returns a deep copy suitable for a caller to modify before freezing a
@@ -259,6 +311,9 @@ func (descriptor StageDescriptor) Validate() error {
 	}
 	if !descriptor.Effect.valid() {
 		return fmt.Errorf("%w: unsupported stage effect %q", ErrInvalidDescriptor, descriptor.Effect)
+	}
+	if err := descriptor.Dispatch.Validate(); err != nil {
+		return err
 	}
 	if descriptor.Effect == EffectReadOnly && len(descriptor.WriteSet) > 0 {
 		return fmt.Errorf("%w: read-only stage %q cannot declare writes", ErrInvalidDescriptor, descriptor.Key)
@@ -327,6 +382,9 @@ func (workflow WorkflowDescriptor) Validate() error {
 		for _, dependency := range descriptor.Dependencies {
 			if _, exists := stages[dependency]; !exists {
 				return fmt.Errorf("%w: stage %q depends on unknown stage %q", ErrInvalidDescriptor, descriptor.Key, dependency)
+			}
+			if descriptor.AutomaticallyDispatchable() && stages[dependency].OperatorOnly() {
+				return fmt.Errorf("%w: automatically dispatched stage %q cannot depend on operator-only stage %q", ErrInvalidDescriptor, descriptor.Key, dependency)
 			}
 		}
 	}

@@ -15,21 +15,14 @@ import (
 
 const (
 	// StandardWorkflowTemplateID and StandardWorkflowTemplateVersion identify
-	// Harbor's complete V2 lifecycle template. The historical Harbor names are
-	// retained as source aliases below, but no profile/spec may omit the exact
-	// template reference or silently select this template.
+	// Harbor's complete V2 lifecycle template. Profiles and execution specs must
+	// use the exact template reference; no compatibility aliases remain.
 	StandardWorkflowTemplateID      = "harbor.task-lifecycle"
-	StandardWorkflowTemplateVersion = "2.1.0"
-
-	// HarborWorkflowTemplateID and HarborWorkflowTemplateVersion are retained
-	// for source compatibility inside the V2 adapter. New code should use
-	// StandardTemplateReference instead of separate string fields.
-	HarborWorkflowTemplateID      = StandardWorkflowTemplateID
-	HarborWorkflowTemplateVersion = StandardWorkflowTemplateVersion
+	StandardWorkflowTemplateVersion = "2.2.0"
 
 	standardCatalogID       = "harbor.standard-stage-catalog"
-	standardCatalogVersion  = "2.1.0"
-	stageDescriptorVersion  = "2.0.0"
+	standardCatalogVersion  = "2.2.0"
+	stageDescriptorVersion  = "2.1.0"
 	pluginDescriptorVersion = "1.0.0"
 )
 
@@ -136,22 +129,23 @@ func (plugin PluginDescriptor) validate() error {
 // ExecutionBudget is deliberately excluded: every run must supply its fully
 // explicit budget through an ExecutionProfile.
 type StageDefinition struct {
-	Key           workflowkit.StageKey       `json:"key"`
-	Version       string                     `json:"version"`
-	Group         StageGroup                 `json:"group"`
-	Dependencies  []workflowkit.StageKey     `json:"dependencies"`
-	Plugin        PluginDescriptor           `json:"plugin"`
-	Inputs        []workflowkit.ArtifactSpec `json:"inputs"`
-	Outputs       []workflowkit.ArtifactSpec `json:"outputs"`
-	ReadSet       []workflowkit.ResourceKey  `json:"read_set"`
-	WriteSet      []workflowkit.ResourceKey  `json:"write_set"`
-	Effect        workflowkit.StageEffect    `json:"effect"`
-	RequiredTurns int                        `json:"required_turns"`
-	Retry         workflowkit.RetryPolicy    `json:"retry"`
-	Verdicts      workflowkit.VerdictPolicy  `json:"verdicts"`
-	Reuse         workflowkit.ReusePolicy    `json:"reuse"`
-	Capabilities  workflowkit.CapabilitySet  `json:"capabilities"`
-	Gate          *GateDefinition            `json:"gate,omitempty"`
+	Key           workflowkit.StageKey            `json:"key"`
+	Version       string                          `json:"version"`
+	Group         StageGroup                      `json:"group"`
+	Dependencies  []workflowkit.StageKey          `json:"dependencies"`
+	Plugin        PluginDescriptor                `json:"plugin"`
+	Inputs        []workflowkit.ArtifactSpec      `json:"inputs"`
+	Outputs       []workflowkit.ArtifactSpec      `json:"outputs"`
+	ReadSet       []workflowkit.ResourceKey       `json:"read_set"`
+	WriteSet      []workflowkit.ResourceKey       `json:"write_set"`
+	Effect        workflowkit.StageEffect         `json:"effect"`
+	Dispatch      workflowkit.StageDispatchPolicy `json:"dispatch,omitempty"`
+	RequiredTurns int                             `json:"required_turns"`
+	Retry         workflowkit.RetryPolicy         `json:"retry"`
+	Verdicts      workflowkit.VerdictPolicy       `json:"verdicts"`
+	Reuse         workflowkit.ReusePolicy         `json:"reuse"`
+	Capabilities  workflowkit.CapabilitySet       `json:"capabilities"`
+	Gate          *GateDefinition                 `json:"gate,omitempty"`
 }
 
 // Clone returns an independently mutable definition.
@@ -247,7 +241,7 @@ func StandardStageCatalog() StageCatalog {
 			stage(HarborRunOpus, StageEvaluation, []string{FinalReview}, "harborfactory.harbor_run_opus", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluationOpus}, workflowkit.EffectEvidenceOnly, 1, evaluationVerdicts(), artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutput("opus_trial_result"), artifactOutput("opus_pass4_evidence")),
 			gateStage(ResultReview, StageSubmission, []string{HarborRunQwen, HarborRunOpus}, ReviewModelResult, []workflowkit.ResourceKey{resourceTaskDigest, resourceReviewFinalQuality, resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus}, []workflowkit.ResourceKey{resourceReviewModelResult}, artifactInput("qwen_trial_result"), artifactInput("opus_trial_result")),
 			stage(SubmissionLint, StageSubmission, []string{ResultReview}, "harborfactory.codeedge_lint", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskTestsAnalysis, resourceReviewModelResult, resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus}, []workflowkit.ResourceKey{resourceEvidenceSubmissionLint}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), artifactInput("tests_analysis"), reviewDecisionInput("model_result_decision"), artifactOutput("submission_lint_report")),
-			stage(Package, StageDelivery, []string{SubmissionLint}, "harborfactory.local_package", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceEvidenceSubmissionLint}, []workflowkit.ResourceKey{resourceDeliveryPackage}, workflowkit.EffectExternalSideEffect, 1, deliveryVerdicts(), artifactInput("task_snapshot"), artifactInput("submission_lint_report"), artifactOutput("package_bundle")),
+			operatorOnlyLocalPackageStage([]string{SubmissionLint}, []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceEvidenceSubmissionLint}, []workflowkit.ResourceKey{resourceDeliveryPackage}, artifactInput("task_snapshot"), artifactInput("submission_lint_report"), artifactOutput("package_bundle")),
 		},
 	}
 }
@@ -265,6 +259,7 @@ func stage(key string, group StageGroup, dependencies []string, pluginID string,
 		ReadSet:       append([]workflowkit.ResourceKey(nil), reads...),
 		WriteSet:      append([]workflowkit.ResourceKey(nil), writes...),
 		Effect:        effect,
+		Dispatch:      workflowkit.StageDispatchAutomatic,
 		RequiredTurns: requiredTurns,
 		Retry: workflowkit.RetryPolicy{Retryable: []workflowkit.FailureClass{
 			workflowkit.FailureTransient,
@@ -277,6 +272,18 @@ func stage(key string, group StageGroup, dependencies []string, pluginID string,
 		Reuse:        workflowkit.ReuseWhenInputsMatch,
 		Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityCancel, workflowkit.CapabilityContinue},
 	}
+}
+
+// operatorOnlyLocalPackageStage keeps local package readiness and dependencies
+// in the frozen workflow contract while reserving actual materialization for
+// LifecycleMutationService.Package/ReleaseService. A normal Run or
+// continuation must never create a StageAttempt for this stage.
+func operatorOnlyLocalPackageStage(dependencies []string, reads, writes []workflowkit.ResourceKey, artifacts ...stageArtifact) StageDefinition {
+	definition := stage(Package, StageDelivery, dependencies, "harborfactory.local_package", reads, writes, workflowkit.EffectExternalSideEffect, 1, deliveryVerdicts(), artifacts...)
+	definition.Dispatch = workflowkit.StageDispatchOperatorOnly
+	definition.Retry = workflowkit.RetryPolicy{}
+	definition.Reuse = workflowkit.ReuseNever
+	return definition
 }
 
 func gateStage(key string, group StageGroup, dependencies []string, reviewKind ReviewKind, reads, writes []workflowkit.ResourceKey, artifacts ...stageArtifact) StageDefinition {
@@ -295,7 +302,11 @@ type stageArtifact struct {
 }
 
 func artifactInput(name string) stageArtifact {
-	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: "harbor.artifact.v1", Required: true}, input: true}
+	return artifactInputWithSchema(name, "harbor.artifact.v1")
+}
+
+func artifactInputWithSchema(name, schemaVersion string) stageArtifact {
+	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion, Required: true}, input: true}
 }
 
 func reviewDecisionInput(name string) stageArtifact {
@@ -303,7 +314,11 @@ func reviewDecisionInput(name string) stageArtifact {
 }
 
 func artifactOutput(name string) stageArtifact {
-	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: "harbor.artifact.v1", Required: true}, output: true}
+	return artifactOutputWithSchema(name, "harbor.artifact.v1")
+}
+
+func artifactOutputWithSchema(name, schemaVersion string) stageArtifact {
+	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion, Required: true}, output: true}
 }
 
 func reviewDecisionArtifact(kind ReviewKind) workflowkit.ArtifactSpec {
@@ -424,6 +439,10 @@ func (catalog StageCatalog) Validate() error {
 			return fmt.Errorf("%w: template %s@%s stage %q is not cataloged", errInvalidCatalog, catalog.Template.ID, catalog.Template.Version, node)
 		}
 	}
+	packageStage := stages[workflowkit.StageKey(Package)]
+	if !packageStage.Dispatch.IsOperatorOnly() {
+		return fmt.Errorf("%w: local package stage must be operator-only", errInvalidCatalog)
+	}
 	if len(groups) != len(policy.groups) {
 		return fmt.Errorf("%w: template %s@%s got %d stage groups; want %d", errInvalidCatalog, catalog.Template.ID, catalog.Template.Version, len(groups), len(policy.groups))
 	}
@@ -482,6 +501,9 @@ func (definition StageDefinition) validate() error {
 	}
 	if !validEffect(definition.Effect) {
 		return fmt.Errorf("%w: stage %q has unsupported effect %q", errInvalidCatalog, definition.Key, definition.Effect)
+	}
+	if err := definition.Dispatch.Validate(); err != nil {
+		return fmt.Errorf("%w: stage %q: %v", errInvalidCatalog, definition.Key, err)
 	}
 	if definition.Effect == workflowkit.EffectReadOnly && len(definition.WriteSet) > 0 {
 		return fmt.Errorf("%w: read-only stage %q declares writes", errInvalidCatalog, definition.Key)

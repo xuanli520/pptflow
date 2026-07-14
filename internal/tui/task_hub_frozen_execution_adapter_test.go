@@ -24,7 +24,7 @@ func TestTaskHubFrozenExecutionFromRunProjectsBoundCatalogReceipt(t *testing.T) 
 	if fact.ContinuationPlanTTL != workflowadapter.RequiredContinuationPlanTTL || fact.ControlGracePeriod != 45*time.Second || fact.InputBundleID == "" || fact.ExecutionSpecFingerprint == "" {
 		t.Fatalf("frozen execution policy/input projection = %+v", fact)
 	}
-	if fact.DeploymentCatalog.State != TaskHubDeploymentCatalogBound || fact.DeploymentCatalog.CatalogID != expectedCatalog.CatalogID || fact.DeploymentCatalog.CatalogVersion != expectedCatalog.CatalogVersion || fact.DeploymentCatalog.CatalogFingerprint != string(expectedCatalog.CatalogFingerprint) {
+	if fact.DeploymentCatalog.State != TaskHubDeploymentCatalogBound || fact.DeploymentCatalog.CatalogID != expectedCatalog.CatalogID || fact.DeploymentCatalog.CatalogVersion != expectedCatalog.CatalogVersion || fact.DeploymentCatalog.CatalogFingerprint != string(expectedCatalog.CatalogFingerprint) || fact.DeploymentCatalog.LockState != TaskHubDeploymentCatalogLockBound || fact.DeploymentCatalog.LockID != "codeedge-phase1-production-lock" || fact.DeploymentCatalog.LockVersion != "2026.07" {
 		t.Fatalf("catalog receipt projection = %+v, want %+v", fact.DeploymentCatalog, expectedCatalog)
 	}
 }
@@ -96,6 +96,10 @@ func taskHubFrozenExecutionRunFixture(t *testing.T) (store.WorkflowRun, stagepro
 			ExecutionSpecFingerprint: specFingerprint,
 		},
 		DeploymentCatalog: catalogRaw,
+		DeploymentCatalogLockIdentity: &stageprovider.DeploymentOperationCatalogLockIdentity{
+			LockID: "codeedge-phase1-production-lock", LockVersion: "2026.07",
+			Fingerprint: workflowkit.Fingerprint("sha256:2222222222222222222222222222222222222222222222222222222222222222"),
+		},
 	}
 	manifest.Resolved.Template.ID = template.ID
 	manifest.Resolved.Template.Version = template.Version

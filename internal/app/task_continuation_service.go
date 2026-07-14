@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -521,6 +522,7 @@ func (service *TaskContinuationService) decodeFrozenPlan(ctx context.Context, st
 type frozenRunDefinition struct {
 	Workflow                      workflowkit.WorkflowDescriptor
 	InitialExecutionPlan          workflowkit.ExecutionPlan
+	ExecutionSpecFingerprint      workflowkit.Fingerprint
 	ContinuationPlanTTL           time.Duration
 	ControlGracePeriod            time.Duration
 	QuotaPolicy                   workflowadapter.ResolvedQuotaPolicy
@@ -536,6 +538,10 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	}
 	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID || manifest.TaskID != run.TaskID || manifest.Revision != run.RevisionID {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s does not match its control-plane run", run.ID)
+	}
+	_, _, executionSpecFingerprint, err := canonicalFrozenRunExecutionSpec(manifest, run)
+	if err != nil {
+		return frozenRunDefinition{}, fmt.Errorf("validate frozen run manifest %s execution specification: %w", run.ID, err)
 	}
 	catalogReceipt, err := canonicalManifestDeploymentCatalogReceipt(manifest)
 	if err != nil {
@@ -600,6 +606,7 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	return frozenRunDefinition{
 		Workflow:                      workflow,
 		InitialExecutionPlan:          initialExecutionPlan,
+		ExecutionSpecFingerprint:      executionSpecFingerprint,
 		ContinuationPlanTTL:           manifest.Resolved.ContinuationPlanTTL,
 		ControlGracePeriod:            manifest.Resolved.ControlGracePeriod,
 		QuotaPolicy:                   quotaPolicy,
@@ -607,6 +614,38 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 		DeploymentCatalogReceipt:      append([]byte(nil), catalogReceipt...),
 		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
 	}, nil
+}
+
+// canonicalFrozenRunExecutionSpec proves the embedded execution specification
+// is the exact canonical selection sealed with this Run. It intentionally
+// performs no filesystem access; worker callers separately compare it with
+// the managed companion file before beginning work.
+func canonicalFrozenRunExecutionSpec(manifest runManifest, run store.WorkflowRun) (workflowadapter.RunExecutionSpec, []byte, workflowkit.Fingerprint, error) {
+	if manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat || len(manifest.ExecutionSpec) == 0 {
+		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest has no canonical execution specification")
+	}
+	if manifest.Inputs.ProfileFingerprint != manifest.Resolved.ExecutionProfileFingerprint {
+		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest execution profile fingerprint does not match resolved workflow")
+	}
+	specification, err := workflowadapter.ParseRunExecutionSpecJSON(manifest.ExecutionSpec)
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", err
+	}
+	canonical, err := specification.CanonicalJSON()
+	if err != nil || !bytes.Equal(canonical, manifest.ExecutionSpec) {
+		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest execution specification is not canonical")
+	}
+	fingerprint, err := specification.Fingerprint()
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", err
+	}
+	if fingerprint != manifest.Inputs.ExecutionSpecFingerprint {
+		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest execution specification fingerprint does not match inputs")
+	}
+	if specification.Selection.TaskID != run.TaskID || specification.Selection.RevisionID != run.RevisionID {
+		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest execution specification selection does not match Run")
+	}
+	return specification, canonical, fingerprint, nil
 }
 
 func (definition frozenRunDefinition) ReviewStage(key workflowkit.StageKey) (workflowadapter.ReviewStage, bool) {
@@ -866,8 +905,12 @@ func expandContinuationStageGroups(command normalizedContinuationCommand, workfl
 func continuationTargets(command normalizedContinuationCommand, run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState) ([]workflowkit.NodeID, workflowkit.ContinuationStrategy, error) {
 	if len(command.TargetNodeIDs) > 0 {
 		for _, nodeID := range command.TargetNodeIDs {
-			if _, exists := workflow.Stage(nodeID); !exists {
+			stage, exists := workflow.Stage(nodeID)
+			if !exists {
 				return nil, "", fmt.Errorf("%w: unknown frozen stage %q", ErrTaskContinuationTarget, nodeID)
+			}
+			if stage.OperatorOnly() {
+				return nil, "", fmt.Errorf("%w: stage %q is operator-only and requires its explicit lifecycle operation", ErrTaskContinuationTarget, nodeID)
 			}
 			if latest, exists := state.Latest[nodeID]; exists && latest.ExecutionStatus == store.StageExecutionCompleted && !command.ForceSelected {
 				return nil, "", fmt.Errorf("%w: successful stage %q requires force_selected", ErrTaskContinuationTarget, nodeID)
@@ -928,8 +971,14 @@ func rejectContentContinuationTargets(workflow workflowkit.WorkflowDescriptor, t
 		if !exists {
 			return fmt.Errorf("%w: unknown frozen stage %q", ErrTaskContinuationTarget, nodeID)
 		}
+		if isCodeEdgeEvaluatorNode(workflow, nodeID) {
+			return fmt.Errorf("%w: CodeEdge evaluator stage %q requires TrialExecution reconciliation and cannot use an ordinary stage retry", ErrTaskContinuationTarget, nodeID)
+		}
 		if isContentChangingStage(stage) {
 			return fmt.Errorf("%w: stage %q requires a candidate revision and ChangeProvider transaction", ErrTaskContinuationTarget, nodeID)
+		}
+		if stage.OperatorOnly() {
+			return fmt.Errorf("%w: stage %q is operator-only and requires its explicit lifecycle operation", ErrTaskContinuationTarget, nodeID)
 		}
 	}
 	return nil
@@ -975,6 +1024,15 @@ func buildNoChangeContinuationPlan(planID, commandID string, command normalizedC
 			ToGeneration:             generation,
 			ExpectedInputFingerprint: emptyInputs,
 		}
+		if stage.OperatorOnly() {
+			// Packaging and other operator-only stages stay visible in every
+			// continuation snapshot, but their lifecycle service owns intent,
+			// authorization, versioning, idempotency, and reconciliation.
+			transition.Disposition = workflowkit.DispositionOperatorOnly
+			transition.ReasonCodes = []workflowkit.PlanReason{"operator_only_lifecycle_action"}
+			transitions = append(transitions, transition)
+			continue
+		}
 		switch entry.Impact {
 		case workflowkit.ImpactPreserve:
 			reuse, present := reuseByNode[stage.Key]
@@ -1009,6 +1067,8 @@ func buildNoChangeContinuationPlan(planID, commandID string, command normalizedC
 				transition.Disposition = workflowkit.DispositionInvalidate
 				transition.ReasonCodes = []workflowkit.PlanReason{"external_confirmation_required"}
 			}
+		case workflowkit.ImpactOperatorOnly:
+			return workflowkit.ContinuationPlanSnapshot{}, fmt.Errorf("operator-only invalidation impact on automatically dispatchable stage %q", stage.Key)
 		default:
 			return workflowkit.ContinuationPlanSnapshot{}, fmt.Errorf("unsupported invalidation impact %q", entry.Impact)
 		}

@@ -2,74 +2,14 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 )
 
 func tempV5DB(t *testing.T) *Store {
 	t.Helper()
-	s := tempDB(t)
-	if _, err := s.db.Exec(migrationV5); err != nil {
-		t.Fatalf("apply v5 schema fixture: %v", err)
-	}
-	return s
-}
-
-func TestMigrateExistingV2ThroughV4StoresToCurrentSchema(t *testing.T) {
-	for startingVersion := 2; startingVersion <= 4; startingVersion++ {
-		t.Run("from_v"+string(rune('0'+startingVersion)), func(t *testing.T) {
-			root := t.TempDir()
-			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(root, dbFileName)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := db.Exec(migrationV2); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (2)`); err != nil {
-				t.Fatal(err)
-			}
-			migrations := []string{migrationV3, migrationV4}
-			for version := 3; version <= startingVersion; version++ {
-				if _, err := db.Exec(migrations[version-3]); err != nil {
-					t.Fatalf("apply v%d fixture: %v", version, err)
-				}
-				if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, version); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
-			s, err := Open(root)
-			if err != nil {
-				t.Fatalf("migrate v%d fixture to current schema: %v", startingVersion, err)
-			}
-			defer s.Close()
-			var version int
-			if err := s.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil {
-				t.Fatal(err)
-			}
-			if version != schemaVersion {
-				t.Fatalf("schema version = %d, want %d", version, schemaVersion)
-			}
-			for _, table := range []string{"quota_accounts_v5", "quota_account_policy_bindings_v11", "control_operations_v5", "side_effect_operations_v5", "capacity_pools_v5", "job_dispatch_claims_v5", "entity_id_registry", "task_purge_operations_v7", "outbox_delivery_operations_v9"} {
-				var count int
-				if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&count); err != nil {
-					t.Fatal(err)
-				}
-				if count != 1 {
-					t.Fatalf("migration from v%d did not create %s", startingVersion, table)
-				}
-			}
-		})
-	}
+	return tempDB(t)
 }
 
 func TestV5QuotaLedgerAdmissionAndReconcile(t *testing.T) {

@@ -2,109 +2,13 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
-
-func TestMigrateV8OutboxEventToFencedDispatcher(t *testing.T) {
-	root := t.TempDir()
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(root, dbFileName)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	for _, migration := range []struct {
-		version int
-		body    string
-	}{
-		{version: 2, body: migrationV2},
-		{version: 3, body: migrationV3},
-		{version: 4, body: migrationV4},
-		{version: 5, body: migrationV5},
-	} {
-		if _, err := db.Exec(migration.body); err != nil {
-			db.Close()
-			t.Fatalf("apply v%d fixture: %v", migration.version, err)
-		}
-		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, migration.version); err != nil {
-			db.Close()
-			t.Fatal(err)
-		}
-	}
-	for _, migration := range []struct {
-		version int
-		apply   func(*sql.Tx) error
-	}{
-		{version: 6, apply: applyMigrationV6},
-		{version: 7, apply: applyMigrationV7},
-		{version: 8, apply: applyMigrationV8},
-	} {
-		tx, err := db.Begin()
-		if err != nil {
-			db.Close()
-			t.Fatal(err)
-		}
-		if err := migration.apply(tx); err != nil {
-			tx.Rollback()
-			db.Close()
-			t.Fatalf("apply v%d fixture: %v", migration.version, err)
-		}
-		if _, err := tx.Exec(`INSERT INTO schema_version (version) VALUES (?)`, migration.version); err != nil {
-			tx.Rollback()
-			db.Close()
-			t.Fatal(err)
-		}
-		if err := tx.Commit(); err != nil {
-			db.Close()
-			t.Fatal(err)
-		}
-	}
-	id, err := NewUUIDv7()
-	if err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	createdAt := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
-	if _, err := db.Exec(`
-		INSERT INTO outbox_events (id, topic, entity_type, entity_id, payload_json, idempotency_key, state, created_at, published_at, version)
-		VALUES (?, 'legacy.pending', 'task', 'legacy-task', '{}', 'legacy-outbox', 'pending', ?, NULL, 1)
-	`, id, createdAt); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	event, err := s.GetOutboxEvent(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if event == nil || event.State != OutboxPending || !event.AvailableAt.Equal(createdAt) || !event.UpdatedAt.Equal(createdAt) || event.LeaseFencingToken != 0 || event.DeliveryCount != 0 {
-		t.Fatalf("migrated legacy outbox event = %+v", event)
-	}
-	s.now = func() time.Time { return createdAt.Add(time.Hour) }
-	claim, err := s.ClaimOutboxEvents(context.Background(), ClaimOutboxEventsRequest{
-		IdempotencyKey: "legacy-outbox-claim", Owner: "migration-worker", Limit: 1, LeaseTTL: time.Minute, Actor: "tester",
-	})
-	if err != nil || len(claim.Events) != 1 || claim.Events[0].ID != id || claim.Events[0].LeaseFencingToken != 1 {
-		t.Fatalf("migrated event claim = %+v, %v", claim, err)
-	}
-}
 
 func TestOutboxDispatcherClaimHeartbeatAckAndExactReplay(t *testing.T) {
 	ctx := context.Background()

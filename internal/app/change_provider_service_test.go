@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,16 @@ func (sleepingChangeProvider) ValidatePayload(raw json.RawMessage) (json.RawMess
 func (provider sleepingChangeProvider) Apply(_ context.Context, _ ChangeProviderRequest) (ChangeProviderReceipt, error) {
 	time.Sleep(provider.delay)
 	return ChangeProviderReceipt{Format: "test.sleeping-provider.v1", ProviderID: provider.ID()}, nil
+}
+
+func TestChangeProviderServiceDoesNotInstallAmbientAgentRepair(t *testing.T) {
+	service := newChangeProviderService(&lifecycleServiceCore{})
+	if _, installed := service.providers[AgentRepairProviderID]; installed {
+		t.Fatal("agent repair provider must require explicit controlled registration")
+	}
+	if _, installed := service.providers[LocalPatchProviderID]; !installed {
+		t.Fatal("explicit local patch provider must remain installed")
+	}
 }
 
 func (testChangeProvider) ID() string { return "test_change" }
@@ -132,6 +143,11 @@ func TestFindingBundleRequiresNonEmptyCanonicalReportEvidence(t *testing.T) {
 }
 
 func TestCandidateLeaseHeartbeatReturnsLatestFenceAcrossMultipleRenewals(t *testing.T) {
+	const (
+		leaseTTL       = 6 * time.Second
+		providerDelay  = 5 * time.Second
+		providerBudget = 10 * time.Second
+	)
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.Open(root)
@@ -143,18 +159,18 @@ func TestCandidateLeaseHeartbeatReturnsLatestFenceAcrossMultipleRenewals(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "heartbeat-task", Owner: "heartbeat-owner", TTL: time.Second, Actor: "tester"})
+	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "heartbeat-task", Owner: "heartbeat-owner", TTL: leaseTTL, Actor: "tester"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, latest, err := services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: 350 * time.Millisecond}, ChangeProviderRequest{Actor: "tester", Timeout: time.Second}, lease, 150*time.Millisecond)
+	_, latest, err := services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: providerDelay}, ChangeProviderRequest{Actor: "tester", Timeout: providerBudget}, lease, leaseTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if latest.Version < lease.Version+2 {
 		t.Fatalf("latest heartbeat lease version = %d, want at least %d", latest.Version, lease.Version+2)
 	}
-	if _, err := database.HeartbeatLease(ctx, store.HeartbeatLeaseRequest{LeaseID: latest.ID, Owner: latest.Owner, FencingToken: latest.FencingToken, ExpectedVersion: latest.Version, TTL: time.Second, Actor: "tester", Reason: "prove latest fence"}); err != nil {
+	if _, err := database.HeartbeatLease(ctx, store.HeartbeatLeaseRequest{LeaseID: latest.ID, Owner: latest.Owner, FencingToken: latest.FencingToken, ExpectedVersion: latest.Version, TTL: leaseTTL, Actor: "tester", Reason: "prove latest fence"}); err != nil {
 		t.Fatalf("latest heartbeat fence cannot finalize a subsequent CAS: %v", err)
 	}
 }
@@ -248,6 +264,11 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 	if snapshot.Strategy != "revise_subject" || snapshot.TargetRunRelation != "child_run" || snapshot.CandidateRevisionID == "" {
 		t.Fatalf("content continuation plan = %+v", snapshot)
 	}
+	for _, transition := range snapshot.Nodes {
+		if transition.Disposition == workflowkit.DispositionPreserve {
+			t.Fatalf("candidate continuation preserved source evidence for %q: %+v", transition.NodeID, transition)
+		}
+	}
 	candidate, err := database.GetRevisionCandidate(ctx, snapshot.CandidateRevisionID)
 	if err != nil || candidate == nil || candidate.State != store.RevisionCandidatePrepared || candidate.AfterDigest == revision.TaskDigest {
 		t.Fatalf("candidate = %+v, err=%v", candidate, err)
@@ -297,6 +318,86 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 	if childRevision.ParentRevisionID != revision.ID || childRevision.Origin != store.RevisionOriginManual || childRevision.TaskDigest != candidate.AfterDigest {
 		t.Fatalf("child revision = %+v", childRevision)
 	}
+	var childManifest runManifest
+	if err := decodeStrictJSON(childRun.RunManifestJSON, &childManifest); err != nil {
+		t.Fatal(err)
+	}
+	if childManifest.Inputs == nil || childManifest.Inputs.Format != runManifestInputsFormat || childManifest.Inputs.BundleID != "" || childManifest.Inputs.ProfileFingerprint == "" || len(childManifest.ExecutionSpec) == 0 {
+		t.Fatalf("child run did not create fresh execution inputs: %+v", childManifest.Inputs)
+	}
+	childSpecification, err := workflowadapter.ParseRunExecutionSpecJSON(childManifest.ExecutionSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childSpecification.Selection.TaskID != task.ID || childSpecification.Selection.RevisionID != childRevision.ID || string(childSpecification.Selection.RevisionDigest) != childRevision.TaskDigest {
+		t.Fatalf("child execution selection = %+v, want child revision %s", childSpecification.Selection, childRevision.ID)
+	}
+	for _, checkout := range childSpecification.References.Checkouts {
+		if checkout.RevisionID != childRevision.ID || string(checkout.RevisionDigest) != childRevision.TaskDigest {
+			t.Fatalf("child checkout %q did not rebind to candidate revision: %+v", checkout.ID, checkout)
+		}
+	}
+	childSpecificationFingerprint, err := childSpecification.Fingerprint()
+	if err != nil || childSpecificationFingerprint != childManifest.Inputs.ExecutionSpecFingerprint {
+		t.Fatalf("child execution specification fingerprint = %s, %v; manifest=%s", childSpecificationFingerprint, err, childManifest.Inputs.ExecutionSpecFingerprint)
+	}
+	var sourceManifest runManifest
+	if err := decodeStrictJSON(run.RunManifestJSON, &sourceManifest); err != nil {
+		t.Fatal(err)
+	}
+	sourceSpecification, err := workflowadapter.ParseRunExecutionSpecJSON(sourceManifest.ExecutionSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceSpecificationFingerprint, err := sourceSpecification.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childSpecificationFingerprint == sourceSpecificationFingerprint {
+		t.Fatal("child execution specification reused the source revision binding")
+	}
+	childDirectory := filepath.Join(root, managedRunsDirectory, childRun.ID)
+	childProfileRaw, err := os.ReadFile(filepath.Join(childDirectory, runExecutionProfileFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceProfileRaw, err := os.ReadFile(filepath.Join(root, managedRunsDirectory, run.ID, runExecutionProfileFileName))
+	if err != nil || !bytes.Equal(childProfileRaw, sourceProfileRaw) {
+		t.Fatalf("child managed execution profile = %q, %v; want source frozen profile", childProfileRaw, err)
+	}
+	childSpecificationRaw, err := os.ReadFile(filepath.Join(childDirectory, runExecutionSpecFileName))
+	if err != nil || !bytes.Equal(childSpecificationRaw, childManifest.ExecutionSpec) {
+		t.Fatalf("child managed execution specification = %q, %v; want child manifest", childSpecificationRaw, err)
+	}
+	if _, _, err := services.core.verifyRunManagedExecutionInputs(ctx, childRun); err != nil {
+		t.Fatalf("child managed execution inputs do not bind the child manifest/revision: %v", err)
+	}
+	expectedChildPlan, err := workflowkit.CompileDependencyExecutionPlan(childManifest.Resolved.Descriptor)
+	if err != nil || !manifestMatchesInitialExecutionPlan(childManifest, childManifest.Resolved.Descriptor, expectedChildPlan) {
+		t.Fatalf("child initial execution plan was not rebuilt: %+v, %v", childManifest.InitialExecutionPlan, err)
+	}
+	childAttempts, err := database.ListStageAttemptsForRun(ctx, childRun.ID)
+	if err != nil || len(childAttempts) != 0 {
+		t.Fatalf("child Run inherited stage attempts/evidence = %+v, %v", childAttempts, err)
+	}
+	childFrozen, err := decodeFrozenRunDefinition(childRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridgeRegistry, err := workflowkit.NewControlledPluginRegistry([]workflowkit.PluginRegistration[workflowkit.StageExecutor]{
+		{Binding: childFrozen.Workflow.Stages[0].Plugin, Implementation: workflowkit.StageExecutorFunc(completedFixtureStage)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFrozenRuntime(t, services, bridgeRegistry)
+	bridge := &workflowkitStageBackend{
+		runtime: runtime, run: childRun, revision: childRevision, frozen: childFrozen,
+		job: store.DurableJob{CreatedBy: "tester"},
+	}
+	if _, err := bridge.frozenExecution(); err != nil {
+		t.Fatalf("public Engine bridge rejected rebound child Run: %v", err)
+	}
 	updatedCandidate, err := database.GetRevisionCandidate(ctx, candidate.ID)
 	if err != nil || updatedCandidate == nil || updatedCandidate.State != store.RevisionCandidateCommitted {
 		t.Fatalf("candidate commit = %+v, %v", updatedCandidate, err)
@@ -304,6 +405,15 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 	replayed, err := services.Continuations.ExecuteTaskContinuation(ctx, plan.ID())
 	if err != nil || replayed.ID != execution.ID {
 		t.Fatalf("idempotent candidate execution = %+v, %v", replayed, err)
+	}
+	if _, err := services.Changes.ensureCandidateChildRunManifest(ctx, *candidate, run); err != nil {
+		t.Fatalf("candidate child recovery rejected matching managed execution inputs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(childDirectory, runExecutionSpecFileName), []byte(`{"tampered":true}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := services.Changes.ensureCandidateChildRunManifest(ctx, *candidate, run); err == nil {
+		t.Fatal("candidate child recovery accepted a tampered managed execution specification")
 	}
 }
 

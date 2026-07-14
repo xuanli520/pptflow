@@ -308,7 +308,13 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 		_ = dataStore.Close()
 		t.Fatal(err)
 	}
-	profileFingerprint, err := workflowkit.FingerprintBytes("app.runtime-review-gate-profile.v1", []byte("runtime-review-gate"))
+	profile := lifecycleCompleteProfile(t)
+	profileCanonical, err := profile.CanonicalJSON()
+	if err != nil {
+		_ = dataStore.Close()
+		t.Fatal(err)
+	}
+	profileFingerprint, err := profile.Fingerprint()
 	if err != nil {
 		_ = dataStore.Close()
 		t.Fatal(err)
@@ -330,6 +336,7 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 		_ = dataStore.Close()
 		t.Fatal(err)
 	}
+	writeFrozenRuntimeFixtureManagedInputs(t, services, runID, profileCanonical, specificationCanonical)
 	decisionArtifact := workflowkit.ArtifactSpec{Name: runtimeReviewDecisionKey, SchemaVersion: "harbor.review-decision.v1", Required: true}
 	resolved := workflowadapter.ResolvedWorkflow{
 		TemplateID: "runtime-review-gate", TemplateVersion: "1", ExecutionProfileID: "runtime-review-gate", ExecutionProfileVersion: "1",

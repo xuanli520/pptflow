@@ -84,11 +84,16 @@ type TaskHubDetail struct {
 	// secrets, filesystem locations, and runtime attestation payloads remain
 	// unavailable to the TUI.
 	FrozenExecutions []TaskHubFrozenExecutionFact `json:"frozen_executions,omitempty"`
-	Releases         []TaskHubReleaseFact         `json:"releases,omitempty"`
-	Artifacts        []TaskHubArtifactFact        `json:"artifacts,omitempty"`
-	Reviews          []TaskHubReviewFact          `json:"reviews,omitempty"`
-	Repairs          []TaskHubRepairFact          `json:"repairs,omitempty"`
-	ObservedAt       time.Time                    `json:"observed_at"`
+	// CodeEdgeCompliance contains the compact final-compliance record identity
+	// for CodeEdge Runs. Raw evaluator receipts, submission reports, final
+	// decision documents, and package authorization documents are never
+	// projected into the TUI.
+	CodeEdgeCompliance []TaskHubCodeEdgeComplianceFact `json:"codeedge_compliance,omitempty"`
+	Releases           []TaskHubReleaseFact            `json:"releases,omitempty"`
+	Artifacts          []TaskHubArtifactFact           `json:"artifacts,omitempty"`
+	Reviews            []TaskHubReviewFact             `json:"reviews,omitempty"`
+	Repairs            []TaskHubRepairFact             `json:"repairs,omitempty"`
+	ObservedAt         time.Time                       `json:"observed_at"`
 }
 
 // TaskHubDetailTask is the stable Task identity and lifecycle summary.
@@ -138,6 +143,33 @@ type TaskHubRunFact struct {
 	Stages              []TaskHubStageFact `json:"stages,omitempty"`
 }
 
+// TaskHubCodeEdgeComplianceState is the conservative display state of an
+// immutable CodeEdge final-compliance record. An approved record is only a
+// recorded authorization fact; package execution still re-verifies the
+// frozen Run and all linked evidence through the application service.
+type TaskHubCodeEdgeComplianceState string
+
+const (
+	TaskHubCodeEdgeComplianceNotRecorded TaskHubCodeEdgeComplianceState = "not_recorded"
+	TaskHubCodeEdgeComplianceApproved    TaskHubCodeEdgeComplianceState = "approved"
+	TaskHubCodeEdgeComplianceRejected    TaskHubCodeEdgeComplianceState = "rejected"
+	TaskHubCodeEdgeComplianceInvalid     TaskHubCodeEdgeComplianceState = "invalid"
+)
+
+// TaskHubCodeEdgeComplianceFact contains only durable public identities and
+// fingerprints. In particular it cannot expose receipt JSON, authorization
+// JSON, provider input, secret values, or operator audit reasons.
+type TaskHubCodeEdgeComplianceFact struct {
+	RunID                    string                         `json:"run_id"`
+	State                    TaskHubCodeEdgeComplianceState `json:"state"`
+	ComplianceRecordID       string                         `json:"compliance_record_id,omitempty"`
+	RevisionID               string                         `json:"revision_id,omitempty"`
+	TaskDigest               string                         `json:"task_digest,omitempty"`
+	DecisionFingerprint      string                         `json:"decision_fingerprint,omitempty"`
+	AuthorizationFingerprint string                         `json:"authorization_fingerprint,omitempty"`
+	RecordedAt               time.Time                      `json:"recorded_at,omitempty"`
+}
+
 // TaskHubFrozenExecutionState describes whether the projection can prove the
 // stored manifest is structurally usable for read-only display and bound to
 // the durable Run row. It is intentionally not a runtime-attestation state:
@@ -178,16 +210,16 @@ const (
 // frozen with a Run. It intentionally excludes catalog operations, secret
 // values, deployment paths, and lock/runtime-attestation payloads.
 type TaskHubDeploymentCatalogFact struct {
-	State              TaskHubDeploymentCatalogState `json:"state"`
-	CatalogID          string                        `json:"catalog_id,omitempty"`
-	CatalogVersion     string                        `json:"catalog_version,omitempty"`
-	TemplateID         string                        `json:"template_id,omitempty"`
-	TemplateVersion    string                        `json:"template_version,omitempty"`
-	CatalogFingerprint string                        `json:"catalog_fingerprint,omitempty"`
+	State              TaskHubDeploymentCatalogState     `json:"state"`
+	CatalogID          string                            `json:"catalog_id,omitempty"`
+	CatalogVersion     string                            `json:"catalog_version,omitempty"`
+	TemplateID         string                            `json:"template_id,omitempty"`
+	TemplateVersion    string                            `json:"template_version,omitempty"`
+	CatalogFingerprint string                            `json:"catalog_fingerprint,omitempty"`
 	LockState          TaskHubDeploymentCatalogLockState `json:"lock_state"`
-	LockID             string                        `json:"lock_id,omitempty"`
-	LockVersion        string                        `json:"lock_version,omitempty"`
-	LockFingerprint    string                        `json:"lock_fingerprint,omitempty"`
+	LockID             string                            `json:"lock_id,omitempty"`
+	LockVersion        string                            `json:"lock_version,omitempty"`
+	LockFingerprint    string                            `json:"lock_fingerprint,omitempty"`
 }
 
 // TaskHubFrozenExecutionFact is a read-only summary of a frozen Run manifest.
@@ -326,6 +358,7 @@ func (detail TaskHubDetail) Clone() TaskHubDetail {
 		detail.Runs[index].Stages = append([]TaskHubStageFact(nil), detail.Runs[index].Stages...)
 	}
 	detail.FrozenExecutions = append([]TaskHubFrozenExecutionFact(nil), detail.FrozenExecutions...)
+	detail.CodeEdgeCompliance = append([]TaskHubCodeEdgeComplianceFact(nil), detail.CodeEdgeCompliance...)
 	detail.Releases = append([]TaskHubReleaseFact(nil), detail.Releases...)
 	detail.Artifacts = append([]TaskHubArtifactFact(nil), detail.Artifacts...)
 	for index := range detail.Artifacts {
@@ -637,6 +670,9 @@ func (overlay *TaskHubDetailOverlay) overviewRows() []string {
 		fmt.Sprintf("冻结执行 %d（按 Tab 查看目录与评测证据摘要）", len(overlay.Detail.FrozenExecutions)),
 		"读取时间："+taskHubDetailTime(overlay.Detail.ObservedAt),
 	)
+	if len(overlay.Detail.CodeEdgeCompliance) > 0 {
+		rows = append(rows, fmt.Sprintf("CodeEdge 最终合规记录 %d（仅投影状态和稳定指纹）", len(overlay.Detail.CodeEdgeCompliance)))
+	}
 	return rows
 }
 
@@ -737,6 +773,7 @@ func (overlay *TaskHubDetailOverlay) frozenExecutionRows() []string {
 		default:
 			rows = append(rows, failStyle.Render("冻结 manifest：未知投影状态"))
 		}
+		rows = append(rows, overlay.codeEdgeComplianceRows(fact.RunID)...)
 		if fact.State != TaskHubFrozenExecutionBound {
 			rows = append(rows, "")
 			continue
@@ -759,6 +796,48 @@ func (overlay *TaskHubDetailOverlay) frozenExecutionRows() []string {
 		rows = append(rows, "")
 	}
 	return rows
+}
+
+func (overlay *TaskHubDetailOverlay) codeEdgeComplianceRows(runID string) []string {
+	for _, fact := range overlay.Detail.CodeEdgeCompliance {
+		if fact.RunID != runID {
+			continue
+		}
+		rows := []string{sectionStyle.Render("CodeEdge 最终合规（只读记录）")}
+		switch fact.State {
+		case TaskHubCodeEdgeComplianceNotRecorded:
+			rows = append(rows, warnStyle.Render("状态：未记录 approved 最终合规；该 Run 不能授权本地 package。"))
+		case TaskHubCodeEdgeComplianceApproved:
+			rows = append(rows, "状态：approved（打包时仍会重验冻结 Run、catalog/lock 和全部证据）")
+		case TaskHubCodeEdgeComplianceRejected:
+			rows = append(rows, failStyle.Render("状态：rejected；该 Run 不能授权本地 package。"))
+		case TaskHubCodeEdgeComplianceInvalid:
+			rows = append(rows, failStyle.Render("状态：记录绑定无效；不会将其视为 package 授权。"))
+		default:
+			rows = append(rows, failStyle.Render("状态：未知；不会将其视为 package 授权。"))
+		}
+		if fact.ComplianceRecordID != "" {
+			rows = append(rows, "合规记录："+fact.ComplianceRecordID)
+		}
+		if fact.RevisionID != "" {
+			rows = append(rows, "revision："+fact.RevisionID)
+		}
+		if fact.TaskDigest != "" {
+			rows = append(rows, "digest："+fact.TaskDigest)
+		}
+		if fact.DecisionFingerprint != "" {
+			rows = append(rows, "最终决定 fingerprint："+fact.DecisionFingerprint)
+		}
+		if fact.AuthorizationFingerprint != "" {
+			rows = append(rows, "打包授权 fingerprint："+fact.AuthorizationFingerprint)
+		}
+		if !fact.RecordedAt.IsZero() {
+			rows = append(rows, "记录时间："+taskHubDetailTime(fact.RecordedAt))
+		}
+		rows = append(rows, subtleStyle.Render("不会显示 evaluator receipt、submission report 或 package authorization 原文。"))
+		return rows
+	}
+	return nil
 }
 
 func taskHubDuration(value time.Duration) string {

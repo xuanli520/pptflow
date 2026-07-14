@@ -12,20 +12,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-const localPackageReceiptFormat = "harbor.local-package-receipt.v2"
+const localPackageReceiptFormat = "harbor.local-package-receipt.v3"
+
+// codeEdgeLocalPackageReceipt pins the exact final-compliance authorization
+// consumed by a CodeEdge package. The full typed authorization is retained so
+// a crash replay can prove the same immutable decision, rather than accepting
+// a caller's current summary or recomputing from mutable deployment state.
+type codeEdgeLocalPackageReceipt struct {
+	ComplianceRecordID       string                             `json:"compliance_record_id"`
+	RunID                    string                             `json:"run_id"`
+	DecisionFingerprint      workflowkit.Fingerprint            `json:"decision_fingerprint"`
+	AuthorizationFingerprint workflowkit.Fingerprint            `json:"authorization_fingerprint"`
+	Authorization            codeedge.LocalPackageAuthorization `json:"authorization"`
+}
 
 type localPackageReceipt struct {
-	Format         string                    `json:"format"`
-	TaskID         string                    `json:"task_id"`
-	RevisionID     string                    `json:"revision_id"`
-	TaskDigest     string                    `json:"task_digest"`
-	ReleaseVersion string                    `json:"release_version"`
-	Package        workflowruntime.ObjectRef `json:"package"`
-	CreatedAt      time.Time                 `json:"created_at"`
+	Format         string                       `json:"format"`
+	TaskID         string                       `json:"task_id"`
+	RevisionID     string                       `json:"revision_id"`
+	TaskDigest     string                       `json:"task_digest"`
+	ReleaseVersion string                       `json:"release_version"`
+	CodeEdge       *codeEdgeLocalPackageReceipt `json:"codeedge,omitempty"`
+	Package        workflowruntime.ObjectRef    `json:"package"`
+	CreatedAt      time.Time                    `json:"created_at"`
 }
 
 func validateLocalReleaseVersion(value string) error {
@@ -139,8 +154,13 @@ func existingLocalPackage(ctx context.Context, objects *workflowruntime.Artifact
 	if err := decoder.Decode(&receipt); err != nil {
 		return workflowruntime.ObjectRef{}, "", false, fmt.Errorf("decode local package receipt: %w", err)
 	}
-	if receipt.Format != localPackageReceiptFormat || receipt.TaskID != expected.TaskID || receipt.RevisionID != expected.RevisionID || receipt.TaskDigest != expected.TaskDigest || receipt.ReleaseVersion != expected.ReleaseVersion {
+	if receipt.Format != localPackageReceiptFormat || receipt.TaskID != expected.TaskID || receipt.RevisionID != expected.RevisionID || receipt.TaskDigest != expected.TaskDigest || receipt.ReleaseVersion != expected.ReleaseVersion || !sameCodeEdgeLocalPackageReceipt(receipt.CodeEdge, expected.CodeEdge) {
 		return workflowruntime.ObjectRef{}, "", false, fmt.Errorf("local package receipt does not match requested release")
+	}
+	if receipt.CodeEdge != nil {
+		if err := receipt.CodeEdge.Validate(); err != nil {
+			return workflowruntime.ObjectRef{}, "", false, fmt.Errorf("validate CodeEdge local package authorization: %w", err)
+		}
 	}
 	if err := receipt.Package.Validate(); err != nil {
 		return workflowruntime.ObjectRef{}, "", false, fmt.Errorf("validate local package receipt object: %w", err)
@@ -168,6 +188,46 @@ func existingLocalPackage(ctx context.Context, objects *workflowruntime.Artifact
 		return workflowruntime.ObjectRef{}, "", false, fmt.Errorf("local package path is not linked to its immutable object")
 	}
 	return receipt.Package, packagePath, true, nil
+}
+
+func (receipt codeEdgeLocalPackageReceipt) Validate() error {
+	if strings.TrimSpace(receipt.ComplianceRecordID) == "" || strings.TrimSpace(receipt.RunID) == "" {
+		return fmt.Errorf("CodeEdge compliance record and Run identities are required")
+	}
+	if err := receipt.DecisionFingerprint.Validate(); err != nil {
+		return fmt.Errorf("CodeEdge decision fingerprint: %w", err)
+	}
+	if err := receipt.AuthorizationFingerprint.Validate(); err != nil {
+		return fmt.Errorf("CodeEdge authorization fingerprint: %w", err)
+	}
+	if err := receipt.Authorization.Validate(); err != nil {
+		return err
+	}
+	decisionFingerprint, err := receipt.Authorization.Decision.Fingerprint()
+	if err != nil {
+		return err
+	}
+	if decisionFingerprint != receipt.DecisionFingerprint || receipt.Authorization.DecisionFingerprint != receipt.DecisionFingerprint {
+		return fmt.Errorf("CodeEdge local package decision fingerprint does not match authorization")
+	}
+	authorizationFingerprint, err := receipt.Authorization.Fingerprint()
+	if err != nil {
+		return err
+	}
+	if authorizationFingerprint != receipt.AuthorizationFingerprint {
+		return fmt.Errorf("CodeEdge local package authorization fingerprint does not match authorization")
+	}
+	return nil
+}
+
+func sameCodeEdgeLocalPackageReceipt(left, right *codeEdgeLocalPackageReceipt) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.ComplianceRecordID == right.ComplianceRecordID &&
+		left.RunID == right.RunID &&
+		left.DecisionFingerprint == right.DecisionFingerprint &&
+		left.AuthorizationFingerprint == right.AuthorizationFingerprint
 }
 
 func writeCanonicalPackageZip(ctx context.Context, writer *zip.Writer, snapshot, taskName string, createdAt time.Time) error {

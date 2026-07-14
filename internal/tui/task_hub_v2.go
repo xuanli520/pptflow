@@ -137,12 +137,17 @@ type TaskHubLifecycleCheckpoint struct {
 	RunVersion           int64  `json:"run_version,omitempty"`
 	RunExecutionEpoch    int    `json:"run_execution_epoch,omitempty"`
 	RunDefinitionHash    string `json:"run_definition_hash,omitempty"`
-	ReleaseID            string `json:"release_id,omitempty"`
-	ReleaseRecordVersion int64  `json:"release_record_version,omitempty"`
-	ReviewRequestID      string `json:"review_request_id,omitempty"`
-	ReviewRevisionID     string `json:"review_revision_id,omitempty"`
-	ReviewState          string `json:"review_state,omitempty"`
-	ReviewEvidenceDigest string `json:"review_evidence_digest,omitempty"`
+	// CodeEdgeComplianceRecordID and CodeEdgeAuthorizationFingerprint bind a
+	// CodeEdge local-package confirmation to the immutable authorization that
+	// was observed for the selected frozen Run. They are never user-editable.
+	CodeEdgeComplianceRecordID       string `json:"codeedge_compliance_record_id,omitempty"`
+	CodeEdgeAuthorizationFingerprint string `json:"codeedge_authorization_fingerprint,omitempty"`
+	ReleaseID                        string `json:"release_id,omitempty"`
+	ReleaseRecordVersion             int64  `json:"release_record_version,omitempty"`
+	ReviewRequestID                  string `json:"review_request_id,omitempty"`
+	ReviewRevisionID                 string `json:"review_revision_id,omitempty"`
+	ReviewState                      string `json:"review_state,omitempty"`
+	ReviewEvidenceDigest             string `json:"review_evidence_digest,omitempty"`
 }
 
 // TaskHubRunControl is a read-only summary of the durable control facts that
