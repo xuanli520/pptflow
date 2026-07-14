@@ -618,6 +618,57 @@ func newTestTaskHubV2Model(t *testing.T, service TaskHubLifecycleService) (model
 	return m, cancel
 }
 
+func TestTaskHubIgnoresOutOfOrderAsyncQueryResponses(t *testing.T) {
+	service := &fakeTaskHubLifecycle{snapshot: enabledTaskHubSnapshot()}
+	m, cancel := newTestTaskHubV2Model(t, service)
+	defer cancel()
+
+	// Start an older search, then replace it before its result arrives. The
+	// response payloads are deliberately distinct so this catches an old result
+	// being applied over the active query rather than merely testing a guard.
+	m.taskHub.Query.Filter = "older"
+	m.taskHub.Loading = true
+	olderCmd := m.loadTaskHubV2()
+	m.taskHub.Query.Filter = "newer"
+	newerCmd := m.loadTaskHubV2()
+	older := olderCmd().(taskHubLoadedMsg)
+	older.snapshot.Tasks[0].Name = "stale search result"
+	newer := newerCmd().(taskHubLoadedMsg)
+	newer.snapshot.Tasks[0].Name = "current search result"
+
+	updated, _ := m.Update(older)
+	m = updated.(model)
+	if m.taskHub.Query.Filter != "newer" || m.taskHub.Snapshot.Tasks[0].Name == "stale search result" || !m.taskHub.Loading {
+		t.Fatalf("stale query response changed Task Hub state: query=%q snapshot=%+v loading=%t", m.taskHub.Query.Filter, m.taskHub.Snapshot, m.taskHub.Loading)
+	}
+	updated, _ = m.Update(newer)
+	m = updated.(model)
+	if m.taskHub.Snapshot.Tasks[0].Name != "current search result" || m.taskHub.Loading {
+		t.Fatalf("current query response was not applied: snapshot=%+v loading=%t", m.taskHub.Snapshot, m.taskHub.Loading)
+	}
+
+	// Polls can overlap even when their query is identical. The later request
+	// remains authoritative, preventing an older poll from regressing visible
+	// lifecycle facts after a newer response has arrived.
+	m.taskHub.Loading = true
+	olderPollCmd := m.loadTaskHubV2()
+	newerPollCmd := m.loadTaskHubV2()
+	olderPoll := olderPollCmd().(taskHubLoadedMsg)
+	olderPoll.snapshot.Tasks[0].Name = "stale poll result"
+	newerPoll := newerPollCmd().(taskHubLoadedMsg)
+	newerPoll.snapshot.Tasks[0].Name = "current poll result"
+	updated, _ = m.Update(olderPoll)
+	m = updated.(model)
+	if m.taskHub.Snapshot.Tasks[0].Name == "stale poll result" || !m.taskHub.Loading {
+		t.Fatalf("stale poll response changed Task Hub state: snapshot=%+v loading=%t", m.taskHub.Snapshot, m.taskHub.Loading)
+	}
+	updated, _ = m.Update(newerPoll)
+	m = updated.(model)
+	if m.taskHub.Snapshot.Tasks[0].Name != "current poll result" || m.taskHub.Loading {
+		t.Fatalf("latest poll response was not applied: snapshot=%+v loading=%t", m.taskHub.Snapshot, m.taskHub.Loading)
+	}
+}
+
 func enabledTaskHubSnapshot() TaskHubSnapshot {
 	return TaskHubSnapshot{
 		Tasks: []TaskHubTask{{

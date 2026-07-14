@@ -25,6 +25,12 @@ type sleepingChangeProvider struct {
 	delay time.Duration
 }
 
+const (
+	candidateHeartbeatLeaseTTL       = 6 * time.Second
+	candidateHeartbeatProviderDelay  = 5 * time.Second
+	candidateHeartbeatProviderBudget = 10 * time.Second
+)
+
 func (provider sleepingChangeProvider) ID() string { return "sleeping_change" }
 
 func (sleepingChangeProvider) ValidatePayload(raw json.RawMessage) (json.RawMessage, error) {
@@ -143,11 +149,6 @@ func TestFindingBundleRequiresNonEmptyCanonicalReportEvidence(t *testing.T) {
 }
 
 func TestCandidateLeaseHeartbeatReturnsLatestFenceAcrossMultipleRenewals(t *testing.T) {
-	const (
-		leaseTTL       = 6 * time.Second
-		providerDelay  = 5 * time.Second
-		providerBudget = 10 * time.Second
-	)
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.Open(root)
@@ -159,18 +160,18 @@ func TestCandidateLeaseHeartbeatReturnsLatestFenceAcrossMultipleRenewals(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "heartbeat-task", Owner: "heartbeat-owner", TTL: leaseTTL, Actor: "tester"})
+	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "heartbeat-task", Owner: "heartbeat-owner", TTL: candidateHeartbeatLeaseTTL, Actor: "tester"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, latest, err := services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: providerDelay}, ChangeProviderRequest{Actor: "tester", Timeout: providerBudget}, lease, leaseTTL)
+	_, latest, err := services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: candidateHeartbeatProviderDelay}, ChangeProviderRequest{Actor: "tester", Timeout: candidateHeartbeatProviderBudget}, lease, candidateHeartbeatLeaseTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if latest.Version < lease.Version+2 {
 		t.Fatalf("latest heartbeat lease version = %d, want at least %d", latest.Version, lease.Version+2)
 	}
-	if _, err := database.HeartbeatLease(ctx, store.HeartbeatLeaseRequest{LeaseID: latest.ID, Owner: latest.Owner, FencingToken: latest.FencingToken, ExpectedVersion: latest.Version, TTL: leaseTTL, Actor: "tester", Reason: "prove latest fence"}); err != nil {
+	if _, err := database.HeartbeatLease(ctx, store.HeartbeatLeaseRequest{LeaseID: latest.ID, Owner: latest.Owner, FencingToken: latest.FencingToken, ExpectedVersion: latest.Version, TTL: candidateHeartbeatLeaseTTL, Actor: "tester", Reason: "prove latest fence"}); err != nil {
 		t.Fatalf("latest heartbeat fence cannot finalize a subsequent CAS: %v", err)
 	}
 }
@@ -187,11 +188,11 @@ func TestCandidateLeaseHeartbeatRenewsBeforeProviderStarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "start-heartbeat-task", Owner: "start-heartbeat-owner", TTL: time.Second, Actor: "tester"})
+	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "start-heartbeat-task", Owner: "start-heartbeat-owner", TTL: candidateHeartbeatLeaseTTL, Actor: "tester"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, latest, err := services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: 5 * time.Millisecond}, ChangeProviderRequest{Actor: "tester", Timeout: time.Second}, lease, time.Second)
+	_, latest, err := services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: 5 * time.Millisecond}, ChangeProviderRequest{Actor: "tester", Timeout: time.Second}, lease, candidateHeartbeatLeaseTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,11 +213,11 @@ func TestCandidateLeaseHeartbeatEnforcesProviderBudgetDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "budget-task", Owner: "budget-owner", TTL: time.Second, Actor: "tester"})
+	lease, err := database.AcquireLease(ctx, store.AcquireLeaseRequest{ResourceType: "task_revision_candidate", ResourceID: "budget-task", Owner: "budget-owner", TTL: candidateHeartbeatLeaseTTL, Actor: "tester"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: 120 * time.Millisecond}, ChangeProviderRequest{Actor: "tester", Timeout: 30 * time.Millisecond}, lease, time.Second)
+	_, _, err = services.Changes.applyWithCandidateLeaseHeartbeat(ctx, sleepingChangeProvider{delay: 120 * time.Millisecond}, ChangeProviderRequest{Actor: "tester", Timeout: 30 * time.Millisecond}, lease, candidateHeartbeatLeaseTTL)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("provider that ignored its deadline err=%v, want context deadline exceeded", err)
 	}
@@ -243,7 +244,7 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify base"})
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCandidateLeaseProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify base"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +428,7 @@ func TestLocalPatchProviderRejectsPathTraversalAndDoesNotWriteOutsideCandidate(t
 func TestLocalPatchProviderAppliesOnlyCanonicalUnifiedDiff(t *testing.T) {
 	checkout := writeLifecycleSnapshot(t, "original instruction\n")
 	provider := LocalPatchProvider{}
-	payload, err := provider.ValidatePayload(json.RawMessage(`{"format":"harbor.local-unified-diff.v1","diff":"--- a/instruction.md\n+++ b/instruction.md\n@@ -1 +1 @@\n-original instruction\n+patched instruction\n"}`))
+	payload, err := provider.ValidatePayload(json.RawMessage(`{"format":"harbor.local-unified-diff.v1","diff":"--- a/instruction.md\n+++ b/instruction.md\n@@ -1 +1 @@ instruction\n-original instruction\n+patched instruction\n"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,6 +442,70 @@ func TestLocalPatchProviderAppliesOnlyCanonicalUnifiedDiff(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join(checkout, "instruction.md"))
 	if err != nil || string(contents) != "patched instruction\n" {
 		t.Fatalf("patched instruction = %q, %v", contents, err)
+	}
+}
+
+func TestLocalPatchProviderAppliesWithoutPATHOrExternalPatchExecutable(t *testing.T) {
+	t.Setenv("PATH", "")
+	checkout := writeLifecycleSnapshot(t, "original instruction\n")
+	provider := LocalPatchProvider{}
+	payload, err := provider.ValidatePayload(json.RawMessage(`{"format":"harbor.local-unified-diff.v1","diff":"--- a/instruction.md\n+++ b/instruction.md\n@@ -1 +1 @@\n-original instruction\n+patched without path\n"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Apply(context.Background(), ChangeProviderRequest{Checkout: checkout, Payload: payload}); err != nil {
+		t.Fatalf("in-process local patch with PATH unset: %v", err)
+	}
+	contents, err := os.ReadFile(filepath.Join(checkout, "instruction.md"))
+	if err != nil || string(contents) != "patched without path\n" {
+		t.Fatalf("PATH-independent patch contents = %q, %v", contents, err)
+	}
+}
+
+func TestLocalPatchProviderAppliesMultipleHunksInOneManagedFile(t *testing.T) {
+	checkout := writeLifecycleSnapshot(t, "first\nsecond\nthird\nfourth\nfifth\n")
+	provider := LocalPatchProvider{}
+	payload, err := provider.ValidatePayload(json.RawMessage(`{"format":"harbor.local-unified-diff.v1","diff":"--- a/instruction.md\n+++ b/instruction.md\n@@ -1,2 +1,2 @@\n first\n-second\n+updated second\n@@ -4,2 +4,3 @@\n fourth\n-fifth\n+updated fifth\n+tail\n"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Apply(context.Background(), ChangeProviderRequest{Checkout: checkout, Payload: payload}); err != nil {
+		t.Fatalf("apply multi-hunk local patch: %v", err)
+	}
+	contents, err := os.ReadFile(filepath.Join(checkout, "instruction.md"))
+	if err != nil || string(contents) != "first\nupdated second\nthird\nfourth\nupdated fifth\ntail\n" {
+		t.Fatalf("multi-hunk patched contents = %q, %v", contents, err)
+	}
+}
+
+func TestLocalPatchProviderStaleLaterFileLeavesAllManagedTargetsUnchanged(t *testing.T) {
+	checkout := writeLifecycleSnapshot(t, "original instruction\n")
+	beforeInstruction, err := os.ReadFile(filepath.Join(checkout, "instruction.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeTask, err := os.ReadFile(filepath.Join(checkout, "task.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := LocalPatchProvider{}
+	payload, err := provider.ValidatePayload(json.RawMessage(`{"format":"harbor.local-unified-diff.v1","diff":"--- a/instruction.md\n+++ b/instruction.md\n@@ -1 +1 @@\n-original instruction\n+would have changed\n--- a/task.toml\n+++ b/task.toml\n@@ -1 +1 @@\n-stale task manifest line\n+would have changed too\n"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Apply(context.Background(), ChangeProviderRequest{Checkout: checkout, Payload: payload}); err == nil {
+		t.Fatal("local patch accepted a stale later-file hunk")
+	}
+	afterInstruction, err := os.ReadFile(filepath.Join(checkout, "instruction.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterTask, err := os.ReadFile(filepath.Join(checkout, "task.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterInstruction) != string(beforeInstruction) || string(afterTask) != string(beforeTask) {
+		t.Fatalf("stale multi-file patch partially wrote candidate: instruction=%q task=%q", afterInstruction, afterTask)
 	}
 }
 
@@ -483,7 +548,7 @@ func TestAgentRepairProviderCreatesBoundRepairSessionInCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify"})
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCandidateLeaseProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +644,7 @@ func TestChangeProviderMarksMismatchedDeclaredPathsForReconciliation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify"})
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCandidateLeaseProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify"})
 	if err != nil {
 		t.Fatal(err)
 	}

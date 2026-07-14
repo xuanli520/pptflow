@@ -274,7 +274,7 @@ func TestLocalRuntimeReconcileExpiresClaimedWorkerHandoffWithItsSupervisorLease(
 	}
 	claim, err := services.Store().ClaimRunWorkerHandoff(ctx, store.ClaimRunWorkerHandoffRequest{
 		OperationID: operationID, RunID: run.ID, Owner: "runtime-claimed-handoff-owner", ProcessID: 8181,
-		LogPath: "/managed/runtime-claimed-handoff.log", LeaseTTL: 10 * time.Millisecond,
+		LogPath: "/managed/runtime-claimed-handoff.log", LeaseTTL: time.Second,
 		Actor: "runtime-claimed-handoff", Reason: "claim local runtime handoff fixture",
 	})
 	if err != nil || claim.Handoff.State != store.RunWorkerHandoffHandedOff || claim.WorkerLease.State != store.LeaseActive {
@@ -289,7 +289,7 @@ func TestLocalRuntimeReconcileExpiresClaimedWorkerHandoffWithItsSupervisorLease(
 		t.Fatalf("claimed worker attachment = %+v", attachment)
 	}
 
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 	reconciled, err := services.LocalRuntime.ReconcileRun(ctx, ReconcileRunRequest{
 		RunID: run.ID, Actor: "runtime-claimed-handoff", Reason: "reconcile claimed worker lease loss",
 	})

@@ -349,6 +349,7 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB) error {
 	for _, table := range []string{
 		"entity_id_registry",
 		"lifecycle_operations_v12",
+		"run_input_artifacts",
 		"trial_executions_v19",
 		"trial_attempts_v19",
 		"codeedge_compliance_records_v20",

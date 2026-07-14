@@ -159,8 +159,7 @@ func (m *model) mouseTargets() []mouseTarget {
 	} {
 		tab := tab
 		add(tab.marker, func() tea.Cmd {
-			m.selectTaskHubTab(tab.tab)
-			return nil
+			return m.selectTaskHubTab(tab.tab)
 		})
 	}
 	switch m.taskHub.Query.Tab {

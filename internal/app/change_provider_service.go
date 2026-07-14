@@ -1119,7 +1119,7 @@ func rebindCandidateChildRunExecutionSpec(original runManifest, candidate store.
 }
 
 func manifestMatchesCandidateChildExecutionSpec(manifest runManifest, expectedInputs *runManifestInputs, expectedCanonical []byte, expectedFingerprint workflowkit.Fingerprint) bool {
-	if expectedInputs == nil || manifest.Inputs == nil || *manifest.Inputs != *expectedInputs || len(manifest.ExecutionSpec) == 0 {
+	if expectedInputs == nil || manifest.Inputs == nil || !reflect.DeepEqual(*manifest.Inputs, *expectedInputs) || len(manifest.ExecutionSpec) == 0 {
 		return false
 	}
 	specification, err := workflowadapter.ParseRunExecutionSpecJSON(manifest.ExecutionSpec)

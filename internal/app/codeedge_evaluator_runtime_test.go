@@ -223,7 +223,6 @@ func createCodeEdgeEvaluatorRuntimeStageJob(t *testing.T, ctx context.Context, f
 	if !found {
 		t.Fatalf("frozen CodeEdge workflow has no evaluator %q", stageKey)
 	}
-	seedCodeEdgeRuntimeTaskSnapshot(t, ctx, fixture, run, descriptor)
 	inputs, err := resolveStageInputs(ctx, fixture.database, fixture.services.core.objects, run, fixture.revision, descriptor)
 	if err != nil {
 		t.Fatalf("resolve frozen evaluator inputs: %v", err)
@@ -279,84 +278,6 @@ func createCodeEdgeEvaluatorRuntimeStageJob(t *testing.T, ctx context.Context, f
 		t.Fatal(err)
 	}
 	return stage, job, payload
-}
-
-// The final-compliance fixture intentionally seeds only the receipt evidence
-// it validates. Runtime execution additionally needs a managed immutable task
-// snapshot binding, so this test-local producer creates that lineage through
-// the same object/manifest APIs used by real stage outputs.
-func seedCodeEdgeRuntimeTaskSnapshot(t *testing.T, ctx context.Context, fixture *codeEdgeComplianceFixture, run store.WorkflowRun, evaluator workflowkit.StageDescriptor) {
-	t.Helper()
-	var snapshot workflowkit.ArtifactSpec
-	found := false
-	for _, input := range evaluator.Inputs {
-		if input.Name == "task_snapshot" {
-			snapshot = input
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("CodeEdge evaluator %q has no task_snapshot input", evaluator.Key)
-	}
-	emptyInputs, err := workflowkit.FingerprintArtifactBindings(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stage, err := fixture.database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
-		RunID: run.ID, StageKey: "codeedge-runtime-task-snapshot-fixture", StageGroup: "fixture", Ordinal: 1,
-		InputFingerprint: string(emptyInputs), BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
-		Actor: runtimeFixtureActor, Reason: "seed immutable CodeEdge runtime task snapshot input",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stage, err = fixture.database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
-		StageAttemptID: stage.ID, ExpectedVersion: stage.Version, ExecutionStatus: store.StageExecutionRunning,
-		Actor: runtimeFixtureActor, Reason: "materialize immutable CodeEdge runtime task snapshot input",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err := fixture.database.CreateNodeAttempt(ctx, store.CreateNodeAttemptRequest{
-		StageAttemptID: stage.ID, NodeID: stage.StageKey, Generation: 0, Attempt: 1,
-		IdempotencyKey: "codeedge-runtime-task-snapshot-node:" + stage.ID, Actor: runtimeFixtureActor,
-		Reason: "materialize immutable CodeEdge runtime task snapshot input",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err = fixture.database.TransitionNodeAttempt(ctx, store.TransitionNodeAttemptRequest{
-		NodeAttemptID: node.ID, ExpectedVersion: node.Version, Status: store.NodeAttemptRunning,
-		Actor: runtimeFixtureActor, Reason: "materialize immutable CodeEdge runtime task snapshot input",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	producer := workflowkit.StageDescriptor{
-		Key: workflowkit.StageKey(stage.StageKey), Version: "fixture", Outputs: []workflowkit.ArtifactSpec{{
-			Name: snapshot.Name, SchemaVersion: snapshot.SchemaVersion, Required: true,
-		}},
-	}
-	manifest, _, err := persistStageArtifacts(ctx, fixture.services.core, run, fixture.revision, stage, node, producer, nil, []StageArtifact{{
-		Key: snapshot.Name, SchemaVersion: snapshot.SchemaVersion, Content: []byte("immutable CodeEdge task snapshot fixture\n"), TurnOrdinal: 1,
-	}}, runtimeFixtureActor, "persist immutable CodeEdge runtime task snapshot input")
-	if err != nil {
-		t.Fatal(err)
-	}
-	stage, err = fixture.database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
-		StageAttemptID: stage.ID, ExpectedVersion: stage.Version, ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictPass,
-		ArtifactManifestID: manifest.ID, Actor: runtimeFixtureActor, Reason: "complete immutable CodeEdge runtime task snapshot input",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.database.TransitionNodeAttempt(ctx, store.TransitionNodeAttemptRequest{
-		NodeAttemptID: node.ID, ExpectedVersion: node.Version, Status: store.NodeAttemptCompleted,
-		Actor: runtimeFixtureActor, Reason: "complete immutable CodeEdge runtime task snapshot input",
-	}); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func codeEdgeRuntimeFrozenDefinition(t *testing.T, run store.WorkflowRun) frozenRunDefinition {

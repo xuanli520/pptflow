@@ -53,6 +53,26 @@ CREATE TABLE artifact_refs_v4 (
     UNIQUE(manifest_id, artifact_key)
 );
 
+-- table run_input_artifacts
+-- Immutable, run-scoped subject inputs. These are intentionally distinct
+-- from stage-produced artifact refs: no synthetic producer StageAttempt is
+-- needed to make a sealed revision available to a root workflow stage.
+CREATE TABLE run_input_artifacts (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    task_id         TEXT NOT NULL REFERENCES tasks_v2(id) ON DELETE RESTRICT,
+    revision_id     TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
+    revision_digest TEXT NOT NULL,
+    port            TEXT NOT NULL,
+    content_digest  TEXT NOT NULL,
+    schema_version  TEXT NOT NULL,
+    size_bytes      INTEGER NOT NULL CHECK (size_bytes >= 0),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by      TEXT NOT NULL,
+    created_at      DATETIME NOT NULL,
+    UNIQUE (run_id, port)
+);
+
 -- table audit_events
 CREATE TABLE audit_events (
     id            TEXT PRIMARY KEY,
@@ -1076,6 +1096,10 @@ CREATE INDEX idx_artifact_refs_v4_lineage
 -- index idx_artifact_refs_v4_manifest
 CREATE INDEX idx_artifact_refs_v4_manifest ON artifact_refs_v4(manifest_id, artifact_key);
 
+-- index idx_run_input_artifacts_run_port
+CREATE INDEX idx_run_input_artifacts_run_port
+    ON run_input_artifacts(run_id, port);
+
 -- index idx_audit_events_actor
 CREATE INDEX idx_audit_events_actor ON audit_events(actor, created_at DESC);
 
@@ -1411,6 +1435,20 @@ BEGIN
     SELECT RAISE(ABORT, 'artifact refs are immutable');
 END;
 
+-- trigger run_input_artifacts_no_delete
+CREATE TRIGGER run_input_artifacts_no_delete
+BEFORE DELETE ON run_input_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'run input artifacts are immutable');
+END;
+
+-- trigger run_input_artifacts_no_update
+CREATE TRIGGER run_input_artifacts_no_update
+BEFORE UPDATE ON run_input_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'run input artifacts are immutable');
+END;
+
 -- trigger audit_events_no_delete
 CREATE TRIGGER audit_events_no_delete
 BEFORE DELETE ON audit_events
@@ -1520,6 +1558,24 @@ BEGIN
         THEN RAISE(ABORT, 'global entity identity collision')
     END;
     INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'artifact_ref');
+END;
+
+-- trigger entity_id_registry_run_input_artifacts_id_immutable
+CREATE TRIGGER entity_id_registry_run_input_artifacts_id_immutable
+BEFORE UPDATE OF id ON run_input_artifacts
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_run_input_artifacts_insert
+CREATE TRIGGER entity_id_registry_run_input_artifacts_insert
+BEFORE INSERT ON run_input_artifacts
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'run_input_artifact');
 END;
 
 -- trigger entity_id_registry_audit_events_id_immutable

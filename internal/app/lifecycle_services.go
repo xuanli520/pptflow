@@ -955,13 +955,26 @@ type runManifest struct {
 }
 
 type runManifestInputs struct {
-	Format                   string                  `json:"format"`
-	BundleID                 string                  `json:"bundle_id,omitempty"`
-	ProfileFingerprint       workflowkit.Fingerprint `json:"profile_fingerprint"`
-	ExecutionSpecFingerprint workflowkit.Fingerprint `json:"execution_spec_fingerprint"`
+	Format                            string                    `json:"format"`
+	BundleID                          string                    `json:"bundle_id,omitempty"`
+	ProfileFingerprint                workflowkit.Fingerprint   `json:"profile_fingerprint"`
+	RequestedExecutionSpecFingerprint workflowkit.Fingerprint   `json:"requested_execution_spec_fingerprint"`
+	ExecutionSpecFingerprint          workflowkit.Fingerprint   `json:"execution_spec_fingerprint"`
+	ManagedInputs                     []runManifestManagedInput `json:"managed_inputs,omitempty"`
 }
 
 const runManifestInputsFormat = "harbor.run-manifest-inputs.v1"
+
+func decodeRunManifest(run store.WorkflowRun) (runManifest, error) {
+	var manifest runManifest
+	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
+		return runManifest{}, err
+	}
+	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID || manifest.TaskID != run.TaskID || manifest.Revision != run.RevisionID || manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat {
+		return runManifest{}, fmt.Errorf("run manifest does not match workflow run")
+	}
+	return manifest, nil
+}
 
 // workflowRunExecutionPayload is the durable child-worker handoff. It carries
 // the complete frozen quota snapshot as well as the definition identity so a
@@ -1003,7 +1016,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
-	specificationCanonical, specificationFingerprint, err := service.validateRunExecutionSpec(ctx, request)
+	_, requestedSpecificationFingerprint, err := service.validateRunExecutionSpec(ctx, request)
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
@@ -1034,7 +1047,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("compile initial dependency execution plan: %w", err)
 	}
-	if request.ExecutionSpecFingerprint != "" && request.ExecutionSpecFingerprint != specificationFingerprint {
+	if request.ExecutionSpecFingerprint != "" && request.ExecutionSpecFingerprint != requestedSpecificationFingerprint {
 		return store.WorkflowRun{}, fmt.Errorf("%w: supplied execution specification fingerprint does not match canonical specification", store.ErrIdempotencyConflict)
 	}
 	if strings.TrimSpace(request.InputBundleID) != "" {
@@ -1052,10 +1065,38 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err := store.ValidateUUIDv7(runID); err != nil {
 		return store.WorkflowRun{}, err
 	}
+	revision, err := service.core.store.GetTaskRevision(ctx, request.RevisionID)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if revision == nil || revision.TaskID != request.TaskID {
+		return store.WorkflowRun{}, fmt.Errorf("%w: TaskRevision %s", ErrLifecycleNotFound, request.RevisionID)
+	}
 	if existing, err := service.core.store.GetWorkflowRun(ctx, runID); err != nil {
 		return store.WorkflowRun{}, err
 	} else if existing != nil {
-		if err := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, specificationCanonical, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); err != nil {
+		manifest, err := decodeRunManifest(*existing)
+		if err != nil {
+			return store.WorkflowRun{}, fmt.Errorf("%w: workflow run %s manifest: %v", store.ErrIdempotencyConflict, existing.ID, err)
+		}
+		finalSpecification, _, err := service.prepareManagedInitialRunInputs(ctx, runID, *revision, request.ExecutionSpec, manifest.Inputs.ManagedInputs)
+		if err != nil {
+			return store.WorkflowRun{}, fmt.Errorf("%w: workflow run %s managed inputs: %v", store.ErrIdempotencyConflict, existing.ID, err)
+		}
+		finalRequest := request
+		finalRequest.ExecutionSpec = finalSpecification
+		finalRequest.ExecutionSpecFingerprint = ""
+		finalSpecificationCanonical, finalSpecificationFingerprint, err := service.validateRunExecutionSpec(ctx, finalRequest)
+		if err != nil {
+			return store.WorkflowRun{}, err
+		}
+		if err := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); err != nil {
+			return store.WorkflowRun{}, err
+		}
+		if err := service.ensureRunInputArtifacts(ctx, *existing, manifest); err != nil {
+			return store.WorkflowRun{}, err
+		}
+		if err := service.ensureInitialWorkflowRunDispatch(ctx, *existing, manifest); err != nil {
 			return store.WorkflowRun{}, err
 		}
 		return *existing, nil
@@ -1077,16 +1118,49 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		createdRunDirectory = true
 	}
 	if !createdRunDirectory {
-		storedManifest, err := readRecoverableRunManifest(manifestPath, runID, request, resolved, profileCanonical, specificationCanonical, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity)
+		raw, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return store.WorkflowRun{}, fmt.Errorf("run directory already exists without a recoverable frozen manifest: %s", runDirectory)
+		}
+		var recovered runManifest
+		if err := decodeStrictJSON(string(raw), &recovered); err != nil || recovered.Inputs == nil || recovered.Inputs.Format != runManifestInputsFormat || recovered.Inputs.RequestedExecutionSpecFingerprint != requestedSpecificationFingerprint {
+			return store.WorkflowRun{}, fmt.Errorf("run directory already exists without a matching recoverable frozen manifest: %s", runDirectory)
+		}
+		// The deterministic materializer below adopts only this manifest's
+		// immutable input identities; it still recreates and verifies the
+		// exact object bytes before the recovered Run can be committed.
+		_ = recovered
+	}
+	var recoveredInputs []runManifestManagedInput
+	if !createdRunDirectory {
+		raw, err := os.ReadFile(manifestPath)
 		if err != nil {
 			return store.WorkflowRun{}, err
 		}
-		if storedManifest {
-			// A previous process wrote the immutable manifest but stopped before
-			// the control-plane transaction. Reuse only that exact frozen
-			// definition; CreateWorkflowRun below remains the atomic DB boundary.
-		} else {
-			return store.WorkflowRun{}, fmt.Errorf("run directory already exists without a recoverable frozen manifest: %s", runDirectory)
+		var recovered runManifest
+		if err := decodeStrictJSON(string(raw), &recovered); err != nil || recovered.Inputs == nil {
+			return store.WorkflowRun{}, fmt.Errorf("decode recoverable run manifest: %w", err)
+		}
+		recoveredInputs = append([]runManifestManagedInput(nil), recovered.Inputs.ManagedInputs...)
+	}
+	finalSpecification, managedInputs, err := service.prepareManagedInitialRunInputs(ctx, runID, *revision, request.ExecutionSpec, recoveredInputs)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	finalRequest := request
+	finalRequest.ExecutionSpec = finalSpecification
+	finalRequest.ExecutionSpecFingerprint = ""
+	finalSpecificationCanonical, finalSpecificationFingerprint, err := service.validateRunExecutionSpec(ctx, finalRequest)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if !createdRunDirectory {
+		storedManifest, err := readRecoverableRunManifest(manifestPath, runID, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity)
+		if err != nil || !storedManifest {
+			if err == nil {
+				err = fmt.Errorf("run directory already exists without a recoverable frozen manifest: %s", runDirectory)
+			}
+			return store.WorkflowRun{}, err
 		}
 	}
 	committed := false
@@ -1103,12 +1177,14 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		Resolved:             resolved.Clone(),
 		InitialExecutionPlan: initialExecutionPlan.Clone(),
 		Inputs: &runManifestInputs{
-			Format:                   runManifestInputsFormat,
-			BundleID:                 strings.TrimSpace(request.InputBundleID),
-			ProfileFingerprint:       resolved.ExecutionProfileFingerprint,
-			ExecutionSpecFingerprint: specificationFingerprint,
+			Format:                            runManifestInputsFormat,
+			BundleID:                          strings.TrimSpace(request.InputBundleID),
+			ProfileFingerprint:                resolved.ExecutionProfileFingerprint,
+			RequestedExecutionSpecFingerprint: requestedSpecificationFingerprint,
+			ExecutionSpecFingerprint:          finalSpecificationFingerprint,
+			ManagedInputs:                     append([]runManifestManagedInput(nil), managedInputs...),
 		},
-		ExecutionSpec:                 append(json.RawMessage(nil), specificationCanonical...),
+		ExecutionSpec:                 append(json.RawMessage(nil), finalSpecificationCanonical...),
 		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
 		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
 		Created:                       service.core.now().UTC(),
@@ -1121,7 +1197,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		if err := writeNewBytes(filepath.Join(runDirectory, runExecutionProfileFileName), profileCanonical); err != nil {
 			return store.WorkflowRun{}, fmt.Errorf("write frozen execution profile: %w", err)
 		}
-		if err := writeNewBytes(filepath.Join(runDirectory, runExecutionSpecFileName), specificationCanonical); err != nil {
+		if err := writeNewBytes(filepath.Join(runDirectory, runExecutionSpecFileName), finalSpecificationCanonical); err != nil {
 			return store.WorkflowRun{}, fmt.Errorf("write frozen execution specification: %w", err)
 		}
 		if len(catalogReceipt) != 0 {
@@ -1142,13 +1218,6 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 			return store.WorkflowRun{}, fmt.Errorf("write run manifest: %w", err)
 		}
 	}
-	dispatchPayload, err := json.Marshal(workflowRunExecutionPayload{
-		Format: workflowRunExecutionPayloadFormat, RunID: runID, DefinitionHash: string(resolved.DefinitionFingerprint),
-		ExecutionSpecFingerprint: specificationFingerprint, QuotaPolicy: resolved.QuotaPolicy.Clone(),
-	})
-	if err != nil {
-		return store.WorkflowRun{}, fmt.Errorf("encode initial workflow run dispatch: %w", err)
-	}
 	run, err := service.core.store.CreateWorkflowRun(ctx, store.CreateWorkflowRunRequest{
 		ID:                      runID,
 		TaskID:                  request.TaskID,
@@ -1163,23 +1232,27 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		ExecutionEpoch:          request.ExecutionEpoch,
 		Actor:                   request.Actor,
 		Reason:                  request.Reason,
-		Dispatch: &store.WorkflowRunDispatchRequest{
-			CommandType:    "workflow_run.execute",
-			PayloadJSON:    string(dispatchPayload),
-			IdempotencyKey: "workflow-run-execution:" + runID,
-		},
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrIdentityCollision) {
 			if existing, lookupErr := service.core.store.GetWorkflowRun(ctx, runID); lookupErr == nil && existing != nil {
-				if validateErr := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, specificationCanonical, specificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); validateErr == nil {
-					return *existing, nil
+				if validateErr := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); validateErr == nil {
+					existingManifest, manifestErr := decodeRunManifest(*existing)
+					if manifestErr == nil && service.ensureRunInputArtifacts(ctx, *existing, existingManifest) == nil && service.ensureInitialWorkflowRunDispatch(ctx, *existing, existingManifest) == nil {
+						return *existing, nil
+					}
 				}
 			}
 		}
 		return store.WorkflowRun{}, err
 	}
 	committed = true
+	if err := service.ensureRunInputArtifacts(ctx, run, manifest); err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if err := service.ensureInitialWorkflowRunDispatch(ctx, run, manifest); err != nil {
+		return store.WorkflowRun{}, err
+	}
 	return run, nil
 }
 
@@ -1207,7 +1280,7 @@ func resolveFrozenRunTemplate(profile workflowadapter.ExecutionProfile, specific
 	return profileTemplate, nil
 }
 
-func readRecoverableRunManifest(path, runID string, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical, specificationCanonical []byte, specificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) (bool, error) {
+func readRecoverableRunManifest(path, runID string, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical []byte, requestedSpecificationFingerprint workflowkit.Fingerprint, finalSpecificationCanonical []byte, finalSpecificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1222,7 +1295,7 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != runID || manifest.TaskID != request.TaskID || manifest.Revision != request.RevisionID ||
 		manifest.Resolved.TemplateID != resolved.TemplateID || manifest.Resolved.TemplateVersion != resolved.TemplateVersion ||
 		manifest.Resolved.ExecutionProfileFingerprint != resolved.ExecutionProfileFingerprint || manifest.Resolved.DefinitionFingerprint != resolved.DefinitionFingerprint ||
-		!manifestMatchesExecutionSpec(manifest, request, specificationCanonical, specificationFingerprint) ||
+		!manifestMatchesExecutionSpec(manifest, request, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint) ||
 		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, initialExecutionPlan) ||
 		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) ||
 		!manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
@@ -1249,7 +1322,7 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 	if specificationErr != nil {
 		return false, specificationErr
 	}
-	if !bytes.Equal(specificationRaw, specificationCanonical) {
+	if !bytes.Equal(specificationRaw, finalSpecificationCanonical) {
 		return false, fmt.Errorf("existing managed execution specification does not match the requested frozen profile")
 	}
 	if lockIdentity != nil {
@@ -1269,7 +1342,7 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 	return true, nil
 }
 
-func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical, specificationCanonical []byte, specificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
+func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical []byte, requestedSpecificationFingerprint workflowkit.Fingerprint, finalSpecificationCanonical []byte, finalSpecificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
 	if run.TaskID != request.TaskID || run.RevisionID != request.RevisionID || run.WorkflowTemplateID != resolved.TemplateID ||
 		run.WorkflowTemplateVersion != resolved.TemplateVersion || run.ResolvedProfileHash != string(resolved.ExecutionProfileFingerprint) ||
 		run.DefinitionHash != string(resolved.DefinitionFingerprint) || run.Trigger != request.Trigger || run.ExecutionEpoch != request.ExecutionEpoch {
@@ -1277,7 +1350,7 @@ func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, re
 	}
 	var manifest runManifest
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil ||
-		!manifestMatchesExecutionSpec(manifest, request, specificationCanonical, specificationFingerprint) ||
+		!manifestMatchesExecutionSpec(manifest, request, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint) ||
 		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, initialExecutionPlan) ||
 		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) ||
 		!manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
@@ -1339,10 +1412,11 @@ func validateRunExecutionSpecOperationResolver(specification workflowadapter.Run
 	return nil
 }
 
-func manifestMatchesExecutionSpec(manifest runManifest, request StartRunRequest, expectedCanonical []byte, fingerprint workflowkit.Fingerprint) bool {
+func manifestMatchesExecutionSpec(manifest runManifest, request StartRunRequest, requestedFingerprint workflowkit.Fingerprint, expectedCanonical []byte, finalFingerprint workflowkit.Fingerprint) bool {
 	if manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat ||
 		manifest.Inputs.ProfileFingerprint != manifest.Resolved.ExecutionProfileFingerprint ||
-		manifest.Inputs.ExecutionSpecFingerprint != fingerprint || len(manifest.ExecutionSpec) == 0 {
+		manifest.Inputs.RequestedExecutionSpecFingerprint != requestedFingerprint ||
+		manifest.Inputs.ExecutionSpecFingerprint != finalFingerprint || len(manifest.ExecutionSpec) == 0 {
 		return false
 	}
 	if request.InputBundleID != "" && manifest.Inputs.BundleID != request.InputBundleID {
@@ -1357,7 +1431,7 @@ func manifestMatchesExecutionSpec(manifest runManifest, request StartRunRequest,
 		return false
 	}
 	storedFingerprint, err := specification.Fingerprint()
-	if err != nil || storedFingerprint != fingerprint {
+	if err != nil || storedFingerprint != finalFingerprint {
 		return false
 	}
 	return specification.Selection.TaskID == request.TaskID && specification.Selection.RevisionID == request.RevisionID

@@ -677,6 +677,8 @@ type taskHubPrefixState struct {
 
 type taskHubLoadedMsg struct {
 	snapshot TaskHubSnapshot
+	query    TaskHubQuery
+	sequence uint64
 	err      error
 }
 
@@ -713,16 +715,33 @@ type taskHubRunControlPlanMsg struct {
 
 type taskHubPrefixTimeoutMsg struct{ sequence uint64 }
 
-func (m model) loadTaskHubV2() tea.Cmd {
-	service := m.lifecycle
-	query := m.taskHub.Query
+// initialTaskHubLoadV2 deliberately does not advance the stored request
+// sequence: Bubble Tea invokes Init on a value copy. Any later request gets a
+// greater sequence and makes this initial response stale before it can apply.
+func (m model) initialTaskHubLoadV2() tea.Cmd {
+	return taskHubLoadCommand(m.lifecycle, m.ctx, m.taskHub.Query, m.taskHubLoadSequence)
+}
+
+// loadTaskHubV2 captures both a monotonically increasing request generation
+// and the exact query. Poll, search, and mutation refreshes may overlap; only
+// the newest request for the current query may update the displayed snapshot.
+func (m *model) loadTaskHubV2() tea.Cmd {
+	m.taskHubLoadSequence++
+	return taskHubLoadCommand(m.lifecycle, m.ctx, m.taskHub.Query, m.taskHubLoadSequence)
+}
+
+func taskHubLoadCommand(service TaskHubLifecycleService, ctx context.Context, query TaskHubQuery, sequence uint64) tea.Cmd {
 	return func() tea.Msg {
 		if service == nil {
-			return taskHubLoadedMsg{err: fmt.Errorf("task lifecycle service is unavailable")}
+			return taskHubLoadedMsg{query: query, sequence: sequence, err: fmt.Errorf("task lifecycle service is unavailable")}
 		}
-		snapshot, err := service.QueryTaskHub(m.ctx, query)
-		return taskHubLoadedMsg{snapshot: snapshot, err: err}
+		snapshot, err := service.QueryTaskHub(ctx, query)
+		return taskHubLoadedMsg{snapshot: snapshot, query: query, sequence: sequence, err: err}
 	}
+}
+
+func sameTaskHubQuery(left, right TaskHubQuery) bool {
+	return left.Tab == right.Tab && strings.TrimSpace(left.Filter) == strings.TrimSpace(right.Filter)
 }
 
 func (m *model) applyTaskHubSnapshot(snapshot TaskHubSnapshot) {
@@ -755,8 +774,12 @@ func (m *model) updateTaskHubV2Key(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
 	case "tab", "right":
 		m.cycleTaskHubTab(1)
+		m.taskHub.Loading = true
+		return m.loadTaskHubV2()
 	case "shift+tab", "left":
 		m.cycleTaskHubTab(-1)
+		m.taskHub.Loading = true
+		return m.loadTaskHubV2()
 	case "up", "k":
 		m.moveTaskHubSelection(-1)
 	case "down", "j":
@@ -996,12 +1019,17 @@ func (m *model) cycleTaskHubTab(delta int) {
 	m.normalizeTaskHubSelection()
 }
 
-func (m *model) selectTaskHubTab(tab TaskHubTab) {
+func (m *model) selectTaskHubTab(tab TaskHubTab) tea.Cmd {
 	if !tab.valid() {
-		return
+		return nil
+	}
+	if m.taskHub.Query.Tab == tab {
+		return nil
 	}
 	m.taskHub.Query.Tab = tab
 	m.normalizeTaskHubSelection()
+	m.taskHub.Loading = true
+	return m.loadTaskHubV2()
 }
 
 func (m *model) moveTaskHubSelection(delta int) {

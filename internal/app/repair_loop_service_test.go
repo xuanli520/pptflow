@@ -84,7 +84,7 @@ func newRepairLoopFixture(t *testing.T, maxRounds int) repairLoopFixture {
 		t.Fatal(err)
 	}
 	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
+		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCandidateLeaseProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
 		Trigger: "verify", Actor: "repair-owner", Reason: "verify automatic repair fixture",
 	})
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
@@ -329,7 +330,7 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 	resolver := catalogLockAttestedResolverForSpec(t, specification, "codeedge-compliance-catalog", "v1", "lock-v1")
 	services := catalogLockLifecycleServices(t, root, database, resolver)
 	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate()), ExecutionSpec: specification,
+		TaskID: task.ID, RevisionID: revision.ID, Profile: codeEdgeEvaluatorRuntimeProfile(t), ExecutionSpec: specification,
 		Trigger: "codeedge-final-compliance", Actor: "codeedge-test", Reason: "freeze trusted CodeEdge Run",
 	})
 	if err != nil {
@@ -370,6 +371,24 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 		fixture.makeRevisionPackageable(t, ctx)
 	}
 	return fixture
+}
+
+// Race instrumentation makes the evaluator's durable preallocation and fence
+// setup exceed the generic one-second fixture budget. Keep this scoped to the
+// two external evaluator stages: it exercises the same production policy
+// shape without converting a scheduler-timing artifact into an interruption.
+func codeEdgeEvaluatorRuntimeProfile(t *testing.T) workflowadapter.ExecutionProfile {
+	t.Helper()
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
+	for index := range profile.Stages {
+		if profile.Stages[index].StageKey != workflowkit.StageKey(workflowadapter.HarborRunQwen) && profile.Stages[index].StageKey != workflowkit.StageKey(workflowadapter.HarborRunOpus) {
+			continue
+		}
+		profile.Stages[index].Budget.TurnTimeout = 20 * time.Second
+		profile.Stages[index].Budget.AttemptTimeout = 20 * time.Second
+		profile.Stages[index].Budget.MaxElapsed = 20 * time.Second
+	}
+	return profile
 }
 
 func (fixture *codeEdgeComplianceFixture) complianceRequest(t *testing.T) RecordCodeEdgeFinalComplianceRequest {

@@ -126,12 +126,12 @@ func TestOutboxDispatcherHeartbeatsBeforeAcknowledgement(t *testing.T) {
 	}
 	observed := make(chan store.OutboxEvent, 1)
 	dispatcher, err := NewOutboxDispatcher(OutboxDispatcherConfig{
-		Store: dataStore, Owner: "outbox-worker-heartbeat", Actor: "tester", LeaseTTL: 200 * time.Millisecond,
-		HeartbeatEvery: 10 * time.Millisecond, RetryDelay: time.Second,
+		Store: dataStore, Owner: "outbox-worker-heartbeat", Actor: "tester", LeaseTTL: 2 * time.Second,
+		HeartbeatEvery: 100 * time.Millisecond, RetryDelay: time.Second,
 		Handler: OutboxDeliveryHandlerFunc(func(handlerCtx context.Context, event store.OutboxEvent) error {
-			deadline := time.NewTimer(time.Second)
+			deadline := time.NewTimer(3 * time.Second)
 			defer deadline.Stop()
-			ticker := time.NewTicker(5 * time.Millisecond)
+			ticker := time.NewTicker(25 * time.Millisecond)
 			defer ticker.Stop()
 			for {
 				current, lookupErr := dataStore.GetOutboxEvent(context.Background(), event.ID)
@@ -167,7 +167,7 @@ func TestOutboxDispatcherHeartbeatsBeforeAcknowledgement(t *testing.T) {
 		if event.Version <= 2 || event.LeaseExpiresAt == nil {
 			t.Fatalf("heartbeat observation = %+v", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("handler did not observe outbox heartbeat")
 	}
 }

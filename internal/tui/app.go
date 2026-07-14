@@ -11,7 +11,7 @@ func (m model) Init() tea.Cmd {
 		return nil
 	}
 	m.taskHub.Loading = true
-	return tea.Batch(m.loadTaskHubV2(), taskHubPollCmd())
+	return tea.Batch(m.initialTaskHubLoadV2(), taskHubPollCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -56,6 +56,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case taskHubLoadedMsg:
+		if msg.sequence != m.taskHubLoadSequence || !sameTaskHubQuery(m.taskHub.Query, msg.query) {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.taskHub.Loading = false
 			m.err = msg.err

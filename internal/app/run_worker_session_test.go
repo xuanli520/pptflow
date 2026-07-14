@@ -10,6 +10,11 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 
+const (
+	runWorkerSessionReadyTimeout = 5 * time.Second
+	runWorkerSessionExitTimeout  = 3 * time.Second
+)
+
 func TestRunWorkerSessionFencesOneRunAndReleasesItsSupervisorLease(t *testing.T) {
 	ctx := context.Background()
 	_, services, _, _, run := newLocalRuntimeServiceFixture(t, "run-worker-owner")
@@ -18,7 +23,7 @@ func TestRunWorkerSessionFencesOneRunAndReleasesItsSupervisorLease(t *testing.T)
 	})
 	first, err := NewRunWorkerSession(RunWorkerSessionConfig{
 		Services: services, RunID: run.ID, Owner: "run-worker-a", Actor: "run-worker-owner", Reason: "test controlled child worker",
-		Handler: handler, LeaseTTL: time.Second, HeartbeatEvery: 50 * time.Millisecond, PollInterval: time.Millisecond,
+		Handler: handler,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +42,7 @@ func TestRunWorkerSessionFencesOneRunAndReleasesItsSupervisorLease(t *testing.T)
 
 	second, err := NewRunWorkerSession(RunWorkerSessionConfig{
 		Services: services, RunID: run.ID, Owner: "run-worker-b", Actor: "run-worker-owner", Reason: "test competing child worker",
-		Handler: handler, LeaseTTL: time.Second, HeartbeatEvery: 50 * time.Millisecond, PollInterval: time.Millisecond,
+		Handler: handler,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -45,6 +50,7 @@ func TestRunWorkerSessionFencesOneRunAndReleasesItsSupervisorLease(t *testing.T)
 	if _, err := second.Run(context.Background()); !errors.Is(err, store.ErrLeaseHeld) {
 		t.Fatalf("second run worker error = %v, want held supervisor lease", err)
 	}
+	waitForRunWorkerInitialDelivery(t, ctx, services, run.ID)
 
 	cancel()
 	select {
@@ -52,7 +58,7 @@ func TestRunWorkerSessionFencesOneRunAndReleasesItsSupervisorLease(t *testing.T)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("first worker result = %v, want context cancellation", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(runWorkerSessionExitTimeout):
 		t.Fatal("first worker did not leave after its process context was canceled")
 	}
 	waitForRunWorkerLease(t, ctx, services, run.ID, false)
@@ -89,8 +95,7 @@ func TestRunWorkerSessionConsumesReservedHandoffLeaseAndReleasesIt(t *testing.T)
 	session, err := NewRunWorkerSession(RunWorkerSessionConfig{
 		Services: services, RunID: run.ID, Owner: "handoff-child", Actor: "run-worker-handoff", Reason: "handoff child worker",
 		HandoffOperationID: operationID, HandoffProcessID: 4242, HandoffLogPath: "/managed/worker.log",
-		Handler:  DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) { return store.JobSucceeded, nil }),
-		LeaseTTL: time.Second, HeartbeatEvery: 50 * time.Millisecond, PollInterval: time.Millisecond,
+		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) { return store.JobSucceeded, nil }),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +121,7 @@ func TestRunWorkerSessionConsumesReservedHandoffLeaseAndReleasesIt(t *testing.T)
 	if err != nil || len(leases) != 1 || leases[0].ID != claimed.WorkerLeaseID || leases[0].Owner != "handoff-child" {
 		t.Fatalf("handoff worker lease = %+v, %v", leases, err)
 	}
+	waitForRunWorkerInitialDelivery(t, ctx, services, run.ID)
 
 	cancel()
 	select {
@@ -126,7 +132,7 @@ func TestRunWorkerSessionConsumesReservedHandoffLeaseAndReleasesIt(t *testing.T)
 		if completed.result.Handoff == nil || completed.result.Handoff.ID != operationID {
 			t.Fatalf("handoff worker result omitted claimed operation: %+v", completed.result)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(runWorkerSessionExitTimeout):
 		t.Fatal("handoff worker did not stop after process context cancellation")
 	}
 	released := waitForRunWorkerHandoffState(t, ctx, services, run.ID, store.RunWorkerHandoffReleased)
@@ -232,7 +238,7 @@ func TestLocalRuntimeAttachAndReconcileIncludeControlledWorkerLease(t *testing.T
 	ctx := context.Background()
 	_, services, _, _, run := newLocalRuntimeServiceFixture(t, "run-worker-reconcile")
 	lease, err := services.Store().AcquireLease(ctx, store.AcquireLeaseRequest{
-		ResourceType: RunWorkerLeaseResourceType, ResourceID: run.ID, Owner: "stale-controlled-worker", TTL: 10 * time.Millisecond,
+		ResourceType: RunWorkerLeaseResourceType, ResourceID: run.ID, Owner: "stale-controlled-worker", TTL: time.Second,
 		Actor: "run-worker-reconcile", Reason: "fixture controlled worker lease",
 	})
 	if err != nil {
@@ -242,7 +248,7 @@ func TestLocalRuntimeAttachAndReconcileIncludeControlledWorkerLease(t *testing.T
 	if err != nil || len(attachment.WorkerLeases) != 1 || attachment.WorkerLeases[0].Lease.ID != lease.ID || !attachment.WorkerLeases[0].Valid {
 		t.Fatalf("attached worker leases = %+v, %v", attachment.WorkerLeases, err)
 	}
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 	reconciled, err := services.LocalRuntime.ReconcileRun(ctx, ReconcileRunRequest{
 		RunID: run.ID, Actor: "run-worker-reconcile", Reason: "recover stale controlled worker",
 	})
@@ -275,6 +281,28 @@ func waitForRunWorkerLease(t *testing.T, ctx context.Context, services *Lifecycl
 	}
 	t.Fatalf("timed out waiting for released worker lease for run %s", runID)
 	return store.Lease{}
+}
+
+func waitForRunWorkerInitialDelivery(t *testing.T, ctx context.Context, services *LifecycleServices, runID string) {
+	t.Helper()
+	deadline := time.NewTimer(runWorkerSessionReadyTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		job, err := services.Store().GetDurableJobByIdempotency(ctx, "workflow-run-execution:"+runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job != nil && job.State == store.JobSucceeded {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for initial durable delivery for run %s: %+v", runID, job)
+		case <-ticker.C:
+		}
+	}
 }
 
 func waitForRunWorkerHandoffState(t *testing.T, ctx context.Context, services *LifecycleServices, runID string, wanted store.RunWorkerHandoffState) store.RunWorkerHandoff {

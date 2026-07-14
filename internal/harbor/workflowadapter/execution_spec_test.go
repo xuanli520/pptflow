@@ -300,6 +300,54 @@ func TestRunExecutionSpecValidatesArtifactReferencesAndUsage(t *testing.T) {
 	}
 }
 
+func TestRunExecutionSpecBindsOnlyIntrinsicManagedArtifactInput(t *testing.T) {
+	specification := testCodeEdgePhase1RunExecutionSpec(t)
+	managed := ArtifactReference{
+		ID: "018f0a73-3b49-7000-8000-0000000000ff", ContentDigest: testFingerprint('e'), SchemaVersion: "harbor.artifact.v1",
+	}
+	bound, err := specification.BindManagedArtifactInput("task_snapshot", managed)
+	if err != nil {
+		t.Fatalf("bind intrinsic task snapshot: %v", err)
+	}
+	if err := bound.Validate(); err != nil {
+		t.Fatalf("validate bound execution spec: %v", err)
+	}
+	foundReference := false
+	for _, reference := range bound.References.Artifacts {
+		if reference.ID == managed.ID {
+			foundReference = reference.ContentDigest == managed.ContentDigest && reference.SchemaVersion == managed.SchemaVersion
+		}
+	}
+	if !foundReference {
+		t.Fatalf("bound execution spec did not retain managed artifact reference: %+v", bound.References.Artifacts)
+	}
+	for _, stage := range CodeEdgePhase1StageCatalog().Stages {
+		usesSnapshot := false
+		for _, input := range stage.Inputs {
+			usesSnapshot = usesSnapshot || input.Name == "task_snapshot"
+		}
+		if !usesSnapshot {
+			continue
+		}
+		resolution, err := bound.ResolveStageOperation(stage.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		matched := false
+		for _, input := range resolution.ArtifactInputs {
+			if input.Port == "task_snapshot" {
+				matched = input.ArtifactID == managed.ID
+			}
+		}
+		if !matched {
+			t.Fatalf("stage %q does not bind managed task_snapshot", stage.Key)
+		}
+	}
+	if _, err := testRunExecutionSpec(t).BindManagedArtifactInput("task_snapshot", managed); err == nil {
+		t.Fatal("accepted a managed binding for standard task_snapshot, which has workflow producers")
+	}
+}
+
 func TestRunExecutionSpecRequiresExactStageOperationProviderBinding(t *testing.T) {
 	missingOperation := testRunExecutionSpec(t)
 	base, ok := stageBindingBaseOf(missingOperation.Stages[0])

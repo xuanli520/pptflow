@@ -46,6 +46,9 @@ func (core *lifecycleServiceCore) verifyRunManagedExecutionInputs(ctx context.Co
 	if revision == nil || revision.TaskID != run.TaskID || string(specification.Selection.RevisionDigest) != revision.TaskDigest {
 		return workflowadapter.ExecutionProfile{}, workflowadapter.RunExecutionSpec{}, fmt.Errorf("execution specification selection does not match TaskRevision")
 	}
+	if err := verifyManagedRunInputs(ctx, core, run, *revision, manifest, specification); err != nil {
+		return workflowadapter.ExecutionProfile{}, workflowadapter.RunExecutionSpec{}, err
+	}
 
 	runDirectory := core.layout.runDirectory(run.ID)
 	profileRaw, err := readManagedRunExecutionInputFile(filepath.Join(runDirectory, runExecutionProfileFileName), "execution profile")

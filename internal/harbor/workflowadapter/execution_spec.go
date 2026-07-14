@@ -414,6 +414,96 @@ func (spec RunExecutionSpec) Clone() RunExecutionSpec {
 	return spec
 }
 
+// BindManagedArtifactInput binds one intrinsic catalog input port to a
+// Harbor-managed immutable artifact. It is deliberately limited to ports with
+// no workflow producer: stage-produced lineage continues to be selected from
+// completed StageAttempts and cannot be overwritten by Run admission.
+//
+// Existing caller-provided bindings for the port are replaced and references
+// made unused by that replacement are removed before the returned spec is
+// revalidated. This lets StartRun replace a provisional input reference without
+// retaining an unreachable or fake artifact in the final frozen contract.
+func (spec RunExecutionSpec) BindManagedArtifactInput(port string, artifact ArtifactReference) (RunExecutionSpec, error) {
+	if err := validateExecutionSpecString("managed artifact input port", port); err != nil {
+		return RunExecutionSpec{}, err
+	}
+	if err := artifact.validate(); err != nil {
+		return RunExecutionSpec{}, err
+	}
+	template, err := ResolveWorkflowTemplate(spec.Template)
+	if err != nil {
+		return RunExecutionSpec{}, fmt.Errorf("%w: managed artifact input template: %v", errInvalidExecutionSpec, err)
+	}
+	consumers := make(map[workflowkit.StageKey]struct{})
+	for _, definition := range template.Catalog.Stages {
+		for _, output := range definition.Outputs {
+			if output.Name == port {
+				return RunExecutionSpec{}, fmt.Errorf("%w: managed artifact input port %q has workflow producer %q", errInvalidExecutionSpec, port, definition.Key)
+			}
+		}
+		for _, input := range definition.Inputs {
+			if input.Name != port {
+				continue
+			}
+			if input.SchemaVersion != artifact.SchemaVersion {
+				return RunExecutionSpec{}, fmt.Errorf("%w: managed artifact input port %q schema %q, want %q", errInvalidExecutionSpec, port, artifact.SchemaVersion, input.SchemaVersion)
+			}
+			consumers[definition.Key] = struct{}{}
+		}
+	}
+	if len(consumers) == 0 {
+		return RunExecutionSpec{}, fmt.Errorf("%w: managed artifact input port %q is not declared by the frozen template", errInvalidExecutionSpec, port)
+	}
+
+	bound := spec.Clone()
+	for index, binding := range bound.Stages {
+		base, ok := stageBindingBaseOf(binding)
+		if !ok {
+			return RunExecutionSpec{}, fmt.Errorf("%w: unsupported concrete stage binding %T", errInvalidExecutionSpec, binding)
+		}
+		if _, consumes := consumers[base.StageKey]; !consumes {
+			continue
+		}
+		inputs := make([]ArtifactInputReference, 0, len(base.ArtifactInputs)+1)
+		for _, input := range base.ArtifactInputs {
+			if input.Port != port {
+				inputs = append(inputs, input)
+			}
+		}
+		inputs = append(inputs, ArtifactInputReference{Port: port, ArtifactID: artifact.ID})
+		base.ArtifactInputs = inputs
+		bound.Stages[index] = replaceStageBindingBase(binding, base)
+	}
+
+	// Keep exactly the references used by the final bindings. This preserves
+	// the closed spec's no-unreachable-reference invariant while removing any
+	// provisional artifact that StartRun just superseded.
+	available := make(map[workflowkit.ArtifactID]ArtifactReference, len(bound.References.Artifacts)+1)
+	for _, reference := range bound.References.Artifacts {
+		available[reference.ID] = reference
+	}
+	available[artifact.ID] = artifact
+	used := make(map[workflowkit.ArtifactID]struct{})
+	for _, binding := range bound.Stages {
+		base, _ := stageBindingBaseOf(binding)
+		for _, input := range base.ArtifactInputs {
+			used[input.ArtifactID] = struct{}{}
+		}
+	}
+	bound.References.Artifacts = make([]ArtifactReference, 0, len(used))
+	for id := range used {
+		reference, present := available[id]
+		if !present {
+			return RunExecutionSpec{}, fmt.Errorf("%w: stage binding references unknown artifact %q", errInvalidExecutionSpec, id)
+		}
+		bound.References.Artifacts = append(bound.References.Artifacts, reference)
+	}
+	if err := bound.Validate(); err != nil {
+		return RunExecutionSpec{}, err
+	}
+	return bound, nil
+}
+
 // StageBinding returns a deep copy of the frozen concrete binding for key.
 func (spec RunExecutionSpec) StageBinding(key workflowkit.StageKey) (StageExecutionBinding, bool) {
 	for _, binding := range spec.Stages {

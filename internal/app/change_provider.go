@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,11 +10,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -121,11 +123,10 @@ type ChangeProvider interface {
 	Apply(context.Context, ChangeProviderRequest) (ChangeProviderReceipt, error)
 }
 
-type LocalPatchProvider struct {
-	// PatchPath is injectable for focused tests. Production uses PATH lookup
-	// for the standard POSIX patch utility and never invokes a shell.
-	PatchPath string
-}
+// LocalPatchProvider applies a constrained unified diff in process. It has no
+// executable, PATH, shell, or provider dependency: the candidate checkout and
+// the strict Harbor file policy are its complete authority boundary.
+type LocalPatchProvider struct{}
 
 func (LocalPatchProvider) ID() string { return LocalPatchProviderID }
 
@@ -166,40 +167,430 @@ func (provider LocalPatchProvider) Apply(ctx context.Context, request ChangeProv
 	if err != nil {
 		return ChangeProviderReceipt{}, err
 	}
-	diffFile, err := os.CreateTemp("", "harbor-candidate-*.diff")
-	if err != nil {
-		return ChangeProviderReceipt{}, fmt.Errorf("create temporary diff: %w", err)
-	}
-	diffPath := diffFile.Name()
-	defer os.Remove(diffPath)
-	if _, err := diffFile.WriteString(diff); err != nil {
-		_ = diffFile.Close()
+	if err := applyCanonicalUnifiedDiff(ctx, request.Checkout, diff); err != nil {
 		return ChangeProviderReceipt{}, err
-	}
-	if err := diffFile.Chmod(0o600); err != nil {
-		_ = diffFile.Close()
-		return ChangeProviderReceipt{}, err
-	}
-	if err := diffFile.Close(); err != nil {
-		return ChangeProviderReceipt{}, err
-	}
-	patchPath := strings.TrimSpace(provider.PatchPath)
-	if patchPath == "" {
-		patchPath, err = exec.LookPath("patch")
-		if err != nil {
-			return ChangeProviderReceipt{}, fmt.Errorf("local patch provider requires patch executable: %w", err)
-		}
-	}
-	command := exec.CommandContext(ctx, patchPath, "--batch", "--forward", "--posix", "--fuzz=0", "-p0", "-i", diffPath)
-	command.Dir = request.Checkout
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return ChangeProviderReceipt{}, fmt.Errorf("apply unified diff: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return ChangeProviderReceipt{
 		Format: "harbor.local-patch-receipt.v1", ProviderID: provider.ID(), ChangedPaths: paths,
 		Summary: "applied canonical unified diff " + digestText(diff),
 	}, nil
+}
+
+type canonicalUnifiedDiff struct {
+	files []canonicalUnifiedFilePatch
+}
+
+type canonicalUnifiedFilePatch struct {
+	path  string
+	hunks []canonicalUnifiedHunk
+}
+
+type canonicalUnifiedHunk struct {
+	oldStart int
+	oldCount int
+	newStart int
+	newCount int
+	lines    []canonicalUnifiedHunkLine
+}
+
+type canonicalUnifiedHunkLine struct {
+	kind      byte
+	text      string
+	noNewline bool
+}
+
+// applyCanonicalUnifiedDiff applies only the normalized format emitted by
+// normalizeUnifiedDiff. It reads and applies every target in memory before
+// staging any replacement. A stale hunk in one file therefore cannot write an
+// earlier file. Once all replacements are staged, each target rename is atomic
+// and a failed later rename restores already replaced targets from staged
+// originals as far as the local filesystem permits.
+func applyCanonicalUnifiedDiff(ctx context.Context, checkout, diff string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	parsed, err := parseCanonicalUnifiedDiff(diff)
+	if err != nil {
+		return err
+	}
+	targets := make([]stagedCandidatePatchTarget, 0, len(parsed.files))
+	seenPaths := make(map[string]struct{}, len(parsed.files))
+	for _, file := range parsed.files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, exists := seenPaths[file.path]; exists {
+			return fmt.Errorf("unified diff contains multiple file sections for %s", file.path)
+		}
+		seenPaths[file.path] = struct{}{}
+		path := filepath.Join(checkout, filepath.FromSlash(file.path))
+		contents, mode, readErr := readRegularCandidatePatchTarget(path)
+		if readErr != nil {
+			return fmt.Errorf("read candidate patch target %s: %w", file.path, readErr)
+		}
+		updated, applyErr := applyCanonicalUnifiedFilePatch(contents, file)
+		if applyErr != nil {
+			return fmt.Errorf("apply unified diff to %s: %w", file.path, applyErr)
+		}
+		targets = append(targets, stagedCandidatePatchTarget{
+			name: file.path, path: path, original: contents, replacement: updated, mode: mode,
+		})
+	}
+	for index := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := targets[index].stage(); err != nil {
+			cleanupStagedCandidatePatchTargets(targets)
+			return fmt.Errorf("stage candidate patch target %s: %w", targets[index].name, err)
+		}
+	}
+	defer cleanupStagedCandidatePatchTargets(targets)
+
+	// Recheck every original before the first rename. This closes the normal
+	// stale-checkout window without treating a caller-supplied path as trusted.
+	for _, target := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		contents, mode, readErr := readRegularCandidatePatchTarget(target.path)
+		if readErr != nil {
+			return fmt.Errorf("recheck candidate patch target %s: %w", target.name, readErr)
+		}
+		if mode != target.mode || !bytes.Equal(contents, target.original) {
+			return fmt.Errorf("candidate patch target %s changed while unified diff was prepared", target.name)
+		}
+	}
+	for index := range targets {
+		if err := os.Rename(targets[index].replacementPath, targets[index].path); err != nil {
+			restoreErr := restoreStagedCandidatePatchTargets(targets[:index])
+			if restoreErr != nil {
+				return fmt.Errorf("commit candidate patch target %s: %w; rollback earlier targets: %v", targets[index].name, err, restoreErr)
+			}
+			return fmt.Errorf("commit candidate patch target %s: %w", targets[index].name, err)
+		}
+		targets[index].replacementPath = ""
+	}
+	return nil
+}
+
+type stagedCandidatePatchTarget struct {
+	name            string
+	path            string
+	original        []byte
+	replacement     []byte
+	mode            os.FileMode
+	replacementPath string
+	rollbackPath    string
+}
+
+func (target *stagedCandidatePatchTarget) stage() error {
+	replacementPath, err := stageCandidatePatchFile(target.path, target.replacement, target.mode)
+	if err != nil {
+		return err
+	}
+	target.replacementPath = replacementPath
+	rollbackPath, err := stageCandidatePatchFile(target.path, target.original, target.mode)
+	if err != nil {
+		_ = os.Remove(target.replacementPath)
+		target.replacementPath = ""
+		return err
+	}
+	target.rollbackPath = rollbackPath
+	return nil
+}
+
+func stageCandidatePatchFile(targetPath string, contents []byte, mode os.FileMode) (string, error) {
+	file, err := os.CreateTemp(filepath.Dir(targetPath), ".harbor-patch-*")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	cleanup := func(cause error) (string, error) {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", cause
+	}
+	if err := file.Chmod(mode.Perm()); err != nil {
+		return cleanup(err)
+	}
+	if _, err := file.Write(contents); err != nil {
+		return cleanup(err)
+	}
+	if err := file.Sync(); err != nil {
+		return cleanup(err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+func cleanupStagedCandidatePatchTargets(targets []stagedCandidatePatchTarget) {
+	for _, target := range targets {
+		if target.replacementPath != "" {
+			_ = os.Remove(target.replacementPath)
+		}
+		if target.rollbackPath != "" {
+			_ = os.Remove(target.rollbackPath)
+		}
+	}
+}
+
+func restoreStagedCandidatePatchTargets(targets []stagedCandidatePatchTarget) error {
+	var restoreErr error
+	for index := len(targets) - 1; index >= 0; index-- {
+		target := &targets[index]
+		if target.rollbackPath == "" {
+			continue
+		}
+		if err := os.Rename(target.rollbackPath, target.path); err != nil && restoreErr == nil {
+			restoreErr = fmt.Errorf("restore %s: %w", target.name, err)
+		}
+		target.rollbackPath = ""
+	}
+	return restoreErr
+}
+
+func parseCanonicalUnifiedDiff(diff string) (canonicalUnifiedDiff, error) {
+	if !utf8.ValidString(diff) {
+		return canonicalUnifiedDiff{}, fmt.Errorf("local unified diff must be valid UTF-8 text")
+	}
+	lines := strings.Split(strings.TrimSuffix(diff, "\n"), "\n")
+	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+		return canonicalUnifiedDiff{}, fmt.Errorf("local unified diff is empty")
+	}
+	parsed := canonicalUnifiedDiff{}
+	for index := 0; index < len(lines); {
+		if !strings.HasPrefix(lines[index], "--- ") {
+			return canonicalUnifiedDiff{}, fmt.Errorf("expected --- file header at diff line %d", index+1)
+		}
+		oldPath := strings.TrimPrefix(lines[index], "--- ")
+		index++
+		if index >= len(lines) || !strings.HasPrefix(lines[index], "+++ ") {
+			return canonicalUnifiedDiff{}, fmt.Errorf("expected +++ file header after diff line %d", index)
+		}
+		newPath := strings.TrimPrefix(lines[index], "+++ ")
+		if oldPath != newPath {
+			return canonicalUnifiedDiff{}, fmt.Errorf("normalized unified diff attempts to rename %s to %s", oldPath, newPath)
+		}
+		file := canonicalUnifiedFilePatch{path: oldPath}
+		index++
+		for index < len(lines) && !strings.HasPrefix(lines[index], "--- ") {
+			if !strings.HasPrefix(lines[index], "@@ ") {
+				return canonicalUnifiedDiff{}, fmt.Errorf("expected hunk header at diff line %d", index+1)
+			}
+			hunk, next, err := parseCanonicalUnifiedHunk(lines, index)
+			if err != nil {
+				return canonicalUnifiedDiff{}, err
+			}
+			file.hunks = append(file.hunks, hunk)
+			index = next
+		}
+		if len(file.hunks) == 0 {
+			return canonicalUnifiedDiff{}, fmt.Errorf("unified diff for %s has no hunks", file.path)
+		}
+		parsed.files = append(parsed.files, file)
+	}
+	return parsed, nil
+}
+
+func parseCanonicalUnifiedHunk(lines []string, start int) (canonicalUnifiedHunk, int, error) {
+	header := lines[start]
+	if !strings.HasPrefix(header, "@@ ") {
+		return canonicalUnifiedHunk{}, start, fmt.Errorf("invalid hunk header at diff line %d", start+1)
+	}
+	ranges, _, found := strings.Cut(strings.TrimPrefix(header, "@@ "), " @@")
+	if !found {
+		return canonicalUnifiedHunk{}, start, fmt.Errorf("invalid hunk header at diff line %d", start+1)
+	}
+	parts := strings.Fields(ranges)
+	if len(parts) != 2 {
+		return canonicalUnifiedHunk{}, start, fmt.Errorf("invalid hunk range at diff line %d", start+1)
+	}
+	oldStart, oldCount, err := parseCanonicalUnifiedRange(parts[0], '-')
+	if err != nil {
+		return canonicalUnifiedHunk{}, start, fmt.Errorf("invalid old hunk range at diff line %d: %w", start+1, err)
+	}
+	newStart, newCount, err := parseCanonicalUnifiedRange(parts[1], '+')
+	if err != nil {
+		return canonicalUnifiedHunk{}, start, fmt.Errorf("invalid new hunk range at diff line %d: %w", start+1, err)
+	}
+	hunk := canonicalUnifiedHunk{oldStart: oldStart, oldCount: oldCount, newStart: newStart, newCount: newCount}
+	oldSeen, newSeen := 0, 0
+	index := start + 1
+	for index < len(lines) && !strings.HasPrefix(lines[index], "@@ ") && !strings.HasPrefix(lines[index], "--- ") {
+		line := lines[index]
+		if line == "\\ No newline at end of file" {
+			if len(hunk.lines) == 0 {
+				return canonicalUnifiedHunk{}, start, fmt.Errorf("newline marker without a hunk line at diff line %d", index+1)
+			}
+			hunk.lines[len(hunk.lines)-1].noNewline = true
+			index++
+			continue
+		}
+		if len(line) == 0 || (line[0] != ' ' && line[0] != '-' && line[0] != '+') {
+			return canonicalUnifiedHunk{}, start, fmt.Errorf("invalid hunk line at diff line %d", index+1)
+		}
+		entry := canonicalUnifiedHunkLine{kind: line[0], text: line[1:]}
+		switch entry.kind {
+		case ' ':
+			oldSeen++
+			newSeen++
+		case '-':
+			oldSeen++
+		case '+':
+			newSeen++
+		}
+		if oldSeen > oldCount || newSeen > newCount {
+			return canonicalUnifiedHunk{}, start, fmt.Errorf("hunk line counts exceed header at diff line %d", index+1)
+		}
+		hunk.lines = append(hunk.lines, entry)
+		index++
+	}
+	if oldSeen != oldCount || newSeen != newCount {
+		return canonicalUnifiedHunk{}, start, fmt.Errorf("hunk line counts do not match header")
+	}
+	return hunk, index, nil
+}
+
+func parseCanonicalUnifiedRange(value string, prefix byte) (int, int, error) {
+	if len(value) < 2 || value[0] != prefix {
+		return 0, 0, fmt.Errorf("missing %c range prefix", prefix)
+	}
+	parts := strings.Split(strings.TrimPrefix(value, string(prefix)), ",")
+	if len(parts) > 2 || parts[0] == "" {
+		return 0, 0, fmt.Errorf("malformed range %q", value)
+	}
+	start, err := strconv.Atoi(parts[0])
+	if err != nil || start < 0 {
+		return 0, 0, fmt.Errorf("invalid range start %q", parts[0])
+	}
+	count := 1
+	if len(parts) == 2 {
+		if parts[1] == "" {
+			return 0, 0, fmt.Errorf("missing range count")
+		}
+		count, err = strconv.Atoi(parts[1])
+		if err != nil || count < 0 {
+			return 0, 0, fmt.Errorf("invalid range count %q", parts[1])
+		}
+	}
+	if start == 0 && count != 0 {
+		return 0, 0, fmt.Errorf("range start zero requires count zero")
+	}
+	return start, count, nil
+}
+
+func applyCanonicalUnifiedFilePatch(contents []byte, patch canonicalUnifiedFilePatch) ([]byte, error) {
+	if !utf8.Valid(contents) {
+		return nil, fmt.Errorf("candidate target is not valid UTF-8 text")
+	}
+	original, trailingNewline := splitCanonicalPatchLines(string(contents))
+	updated := make([]string, 0, len(original))
+	cursor := 0
+	finalTrailingNewline := trailingNewline
+	for _, hunk := range patch.hunks {
+		target := hunk.oldStart
+		if target > 0 {
+			target--
+		}
+		if target < cursor || target > len(original) {
+			return nil, fmt.Errorf("hunk starts outside candidate file")
+		}
+		updated = append(updated, original[cursor:target]...)
+		cursor = target
+		oldSeen, newSeen := 0, 0
+		for _, line := range hunk.lines {
+			switch line.kind {
+			case ' ':
+				if cursor >= len(original) || original[cursor] != line.text {
+					return nil, fmt.Errorf("context does not match candidate file")
+				}
+				updated = append(updated, original[cursor])
+				cursor++
+				oldSeen++
+				newSeen++
+			case '-':
+				if cursor >= len(original) || original[cursor] != line.text {
+					return nil, fmt.Errorf("removed line does not match candidate file")
+				}
+				cursor++
+				oldSeen++
+			case '+':
+				updated = append(updated, line.text)
+				newSeen++
+			}
+			if line.noNewline {
+				switch line.kind {
+				case '-', ' ':
+					trailingNewline = false
+				case '+':
+					finalTrailingNewline = false
+				}
+			}
+		}
+		if oldSeen != hunk.oldCount || newSeen != hunk.newCount {
+			return nil, fmt.Errorf("hunk counts do not match parsed lines")
+		}
+	}
+	updated = append(updated, original[cursor:]...)
+	if len(updated) == 0 {
+		return []byte{}, nil
+	}
+	if finalTrailingNewline && trailingNewline {
+		return []byte(strings.Join(updated, "\n") + "\n"), nil
+	}
+	return []byte(strings.Join(updated, "\n")), nil
+}
+
+func splitCanonicalPatchLines(value string) ([]string, bool) {
+	if value == "" {
+		return nil, false
+	}
+	trailingNewline := strings.HasSuffix(value, "\n")
+	if trailingNewline {
+		value = strings.TrimSuffix(value, "\n")
+	}
+	return strings.Split(value, "\n"), trailingNewline
+}
+
+func readRegularCandidatePatchTarget(path string) ([]byte, os.FileMode, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return nil, 0, fmt.Errorf("candidate patch target is not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	contents, readErr := io.ReadAll(file)
+	stat, statErr := file.Stat()
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, 0, readErr
+	}
+	if statErr != nil {
+		return nil, 0, statErr
+	}
+	if closeErr != nil {
+		return nil, 0, closeErr
+	}
+	if stat.Mode()&os.ModeSymlink != 0 || !stat.Mode().IsRegular() || !os.SameFile(before, stat) {
+		return nil, 0, fmt.Errorf("candidate patch target changed while opening")
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	if after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || !os.SameFile(stat, after) {
+		return nil, 0, fmt.Errorf("candidate patch target changed while reading")
+	}
+	return contents, stat.Mode().Perm(), nil
 }
 
 type AgentRepairProvider struct {

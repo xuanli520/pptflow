@@ -29,14 +29,15 @@ type model struct {
 	err    error
 	notice string
 
-	taskHub            TaskHubState
-	taskHubPrefix      taskHubPrefixState
-	taskHubPlan        *TaskHubPlanPreview
-	taskHubPlanCommand *TaskHubCommand
-	taskHubDetail      *TaskHubDetailOverlay
-	taskHubMutation    *TaskHubMutationOverlay
-	runControl         *RunControlOverlay
-	exitHandoff        *taskHubExitHandoffOverlay
+	taskHub             TaskHubState
+	taskHubLoadSequence uint64
+	taskHubPrefix       taskHubPrefixState
+	taskHubPlan         *TaskHubPlanPreview
+	taskHubPlanCommand  *TaskHubCommand
+	taskHubDetail       *TaskHubDetailOverlay
+	taskHubMutation     *TaskHubMutationOverlay
+	runControl          *RunControlOverlay
+	exitHandoff         *taskHubExitHandoffOverlay
 
 	hubSearching       bool
 	hubSearch          textinput.Model

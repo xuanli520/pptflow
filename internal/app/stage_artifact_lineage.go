@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -41,6 +42,10 @@ func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *wo
 	if objects == nil {
 		return nil, fmt.Errorf("%w: artifact object store is required", ErrInvalidStageExecution)
 	}
+	managed, err := managedRunInputBindingsForStage(ctx, dataStore, objects, run, revision, stage)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve managed run inputs for stage %q: %w", ErrInvalidStageExecution, stage.Key, err)
+	}
 	attempts, err := dataStore.ListStageAttemptsForRun(ctx, run.ID)
 	if err != nil {
 		return nil, err
@@ -66,6 +71,13 @@ func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *wo
 	}
 	bindings := make([]workflowkit.ArtifactBinding, 0, len(stage.Inputs))
 	for _, input := range stage.Inputs {
+		if binding, declared := managed[input.Name]; declared {
+			if binding.SchemaVersion != input.SchemaVersion {
+				return nil, fmt.Errorf("%w: stage %q managed input %q has schema %q, want %q", ErrInvalidStageExecution, stage.Key, input.Name, binding.SchemaVersion, input.SchemaVersion)
+			}
+			bindings = append(bindings, binding)
+			continue
+		}
 		candidate, found := latest[input.Name]
 		if !found {
 			if input.Required {
@@ -97,6 +109,70 @@ func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *wo
 	return bindings, nil
 }
 
+// managedRunInputBindingsForStage resolves only manifest-declared run inputs
+// from the final frozen spec. It runs before StageAttempt lineage selection so
+// a later same-named stage artifact can never shadow an intrinsic input.
+func managedRunInputBindingsForStage(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, revision store.TaskRevision, stage workflowkit.StageDescriptor) (map[string]workflowkit.ArtifactBinding, error) {
+	var manifest runManifest
+	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
+		return nil, fmt.Errorf("decode run manifest: %w", err)
+	}
+	if manifest.Inputs == nil || len(manifest.Inputs.ManagedInputs) == 0 {
+		return nil, nil
+	}
+	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID || manifest.TaskID != run.TaskID || manifest.Revision != run.RevisionID {
+		return nil, fmt.Errorf("run manifest does not match workflow run")
+	}
+	specification, _, _, err := canonicalFrozenRunExecutionSpec(manifest, run)
+	if err != nil {
+		return nil, err
+	}
+	core := &lifecycleServiceCore{store: dataStore, objects: objects}
+	if err := verifyManagedRunInputs(ctx, core, run, revision, manifest, specification); err != nil {
+		return nil, err
+	}
+	resolution, err := specification.ResolveStageOperation(stage.Key)
+	if err != nil {
+		return nil, err
+	}
+	artifactByID := make(map[workflowkit.ArtifactID]workflowadapter.ArtifactReference, len(specification.References.Artifacts))
+	for _, artifact := range specification.References.Artifacts {
+		artifactByID[artifact.ID] = artifact
+	}
+	bindingByPort := make(map[string]workflowkit.ArtifactID, len(resolution.ArtifactInputs))
+	for _, binding := range resolution.ArtifactInputs {
+		if _, duplicate := bindingByPort[binding.Port]; duplicate {
+			return nil, fmt.Errorf("frozen stage binding has duplicate artifact input port %q", binding.Port)
+		}
+		bindingByPort[binding.Port] = binding.ArtifactID
+	}
+	stageInputs := make(map[string]workflowkit.ArtifactSpec, len(stage.Inputs))
+	for _, input := range stage.Inputs {
+		stageInputs[input.Name] = input
+	}
+	result := make(map[string]workflowkit.ArtifactBinding, len(manifest.Inputs.ManagedInputs))
+	for _, input := range manifest.Inputs.ManagedInputs {
+		stageInput, consumes := stageInputs[input.Port]
+		if !consumes {
+			continue
+		}
+		artifactID, bound := bindingByPort[input.Port]
+		if !bound || artifactID != workflowkit.ArtifactID(input.ID) {
+			return nil, fmt.Errorf("frozen stage binding does not use managed input %q", input.Port)
+		}
+		artifact, present := artifactByID[artifactID]
+		if !present || artifact.ContentDigest != input.ContentDigest || artifact.SchemaVersion != input.SchemaVersion || stageInput.SchemaVersion != input.SchemaVersion {
+			return nil, fmt.Errorf("managed input %q does not match frozen stage artifact contract", input.Port)
+		}
+		binding := workflowkit.ArtifactBinding{Name: input.Port, ArtifactID: artifactID, ContentDigest: input.ContentDigest, SchemaVersion: input.SchemaVersion}
+		if err := binding.Validate(); err != nil {
+			return nil, err
+		}
+		result[input.Port] = binding
+	}
+	return result, nil
+}
+
 // newStageInputReader gives a V2 executor read-only access to the exact
 // bindings verified for its current stage. It never resolves a path or accepts
 // a same-named artifact from a later attempt, so a plugin cannot bypass frozen
@@ -116,6 +192,13 @@ func newStageInputReader(dataStore *store.Store, objects *workflowruntime.Artifa
 		}
 		if dataStore == nil || objects == nil {
 			return nil, fmt.Errorf("%w: stage input reader is not configured", ErrInvalidStageExecution)
+		}
+		managed, managedErr := readManagedRunInput(ctx, dataStore, objects, run, revision, requested)
+		if managedErr != nil {
+			return nil, fmt.Errorf("%w: managed run input: %w", ErrInvalidStageExecution, managedErr)
+		}
+		if managed != nil {
+			return managed, nil
 		}
 		reference, err := dataStore.GetArtifactRef(ctx, string(requested.ArtifactID))
 		if err != nil {
@@ -139,6 +222,39 @@ func newStageInputReader(dataStore *store.Store, objects *workflowruntime.Artifa
 		}
 		return objects.ReadAll(ctx, object)
 	}
+}
+
+// readManagedRunInput reads a manifest-declared initial input only when the
+// requested binding exactly names its ID, port, digest, and schema. A durable
+// input record that is not declared by this Run's frozen manifest is never an
+// execution capability.
+func readManagedRunInput(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, revision store.TaskRevision, requested workflowkit.ArtifactBinding) ([]byte, error) {
+	var manifest runManifest
+	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
+		return nil, fmt.Errorf("decode run manifest: %w", err)
+	}
+	if manifest.Inputs == nil || len(manifest.Inputs.ManagedInputs) == 0 {
+		return nil, nil
+	}
+	for _, input := range manifest.Inputs.ManagedInputs {
+		if input.ID != string(requested.ArtifactID) {
+			continue
+		}
+		if input.Port != requested.Name || input.ContentDigest != requested.ContentDigest || input.SchemaVersion != requested.SchemaVersion || input.RevisionDigest != workflowkit.SubjectDigest(revision.TaskDigest) {
+			return nil, fmt.Errorf("requested binding does not match frozen managed run input")
+		}
+		persisted, err := dataStore.GetRunInputArtifact(ctx, input.ID)
+		if err != nil {
+			return nil, err
+		}
+		if persisted == nil || persisted.RunID != run.ID || persisted.TaskID != run.TaskID || persisted.RevisionID != revision.ID ||
+			persisted.RevisionDigest != revision.TaskDigest || persisted.Port != input.Port || persisted.ContentDigest != string(input.ContentDigest) ||
+			persisted.SchemaVersion != input.SchemaVersion || persisted.SizeBytes != input.SizeBytes {
+			return nil, fmt.Errorf("durable managed run input does not match frozen lineage")
+		}
+		return objects.ReadAll(ctx, input.objectRef())
+	}
+	return nil, nil
 }
 
 func artifactObjectUnavailable(err error) bool {
