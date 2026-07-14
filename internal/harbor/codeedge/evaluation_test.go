@@ -7,6 +7,8 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -26,8 +28,11 @@ func TestBuildEvaluationReceiptBindsFourTrustedTrialsAndOneScreenshot(t *testing
 	if receipt.PassCount != 1 || receipt.AverageTurns != 20 {
 		t.Fatalf("receipt aggregates = pass %d, turns %v; want 1, 20", receipt.PassCount, receipt.AverageTurns)
 	}
-	if len(receipt.Trials) != 4 || receipt.ScreenshotArtifactID != input.CanonicalScreenshot.ArtifactID {
-		t.Fatalf("receipt evidence = %#v, want four trials and frozen screenshot", receipt)
+	if len(receipt.Trials) != 4 || receipt.ScreenshotArtifactID != input.CanonicalScreenshot.ArtifactID || receipt.RunBundleArtifactID != input.HarborRunBundle.ArtifactID {
+		t.Fatalf("receipt evidence = %#v, want four trials and frozen bundle/screenshot", receipt)
+	}
+	if receipt.MaterializedTaskRootV2Digest != input.Binding.TaskSnapshotDigest {
+		t.Fatalf("receipt materialized task digest = %q, want frozen %q", receipt.MaterializedTaskRootV2Digest, input.Binding.TaskSnapshotDigest)
 	}
 	if _, err := receipt.CanonicalJSON(); err != nil {
 		t.Fatalf("CanonicalJSON() error = %v", err)
@@ -43,37 +48,40 @@ func TestBuildEvaluationReceiptBindsFourTrustedTrialsAndOneScreenshot(t *testing
 }
 
 func TestBuildEvaluationReceiptMarksClassifiedInfrastructureWithoutCountingItAsModelFailure(t *testing.T) {
-	input := validEvaluationInput(t, EvaluationPolicy{})
-	result := decodeEvaluationResult(t, input.HarborResult.Bytes)
-	trials := result["trial_results"].([]any)
-	trials[2].(map[string]any)["exception_info"] = map[string]any{
-		"exception_type": "NetworkError",
-	}
-	delete(trials[2].(map[string]any), "verifier_result")
-	delete(trials[2].(map[string]any), "agent_result")
-	input.HarborResult = evidenceForBytes("result", "harbor.result.v0.18", "application/json", marshalEvaluationResult(t, result))
-
-	receipt, err := BuildEvaluationReceipt(input)
+	fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+	fixture.updateTrial(t, 2, func(trial map[string]any) {
+		trial["exception_info"] = map[string]any{"exception_type": "NetworkError"}
+		delete(trial, "verifier_result")
+	})
+	receipt, err := BuildEvaluationReceipt(fixture.input(t))
 	if err != nil {
 		t.Fatalf("BuildEvaluationReceipt() error = %v", err)
 	}
 	if receipt.Status != EvaluationInfraFailed || receipt.PassCount != 1 || receipt.PolicyCompliant {
 		t.Fatalf("receipt = %#v, want classified infra failure and unchanged pass count", receipt)
 	}
-	if receipt.Trials[2].Status != EvaluationTrialInfraFailed || receipt.Trials[2].Passed {
-		t.Fatalf("trial receipt = %#v, want infra_failed non-pass", receipt.Trials[2])
+	infra := 0
+	for _, trial := range receipt.Trials {
+		if trial.Status == EvaluationTrialInfraFailed {
+			infra++
+			if trial.Passed || trial.FailureType != "NetworkError" {
+				t.Fatalf("infra trial receipt = %#v", trial)
+			}
+		}
+	}
+	if infra != 1 {
+		t.Fatalf("receipt trials = %#v, want one infra failure", receipt.Trials)
 	}
 }
 
 func TestBuildEvaluationReceiptPreservesContentNonCompliance(t *testing.T) {
 	maximumPasses := 1
-	input := validEvaluationInput(t, EvaluationPolicy{MaxPassingTrials: &maximumPasses})
-	result := decodeEvaluationResult(t, input.HarborResult.Bytes)
-	trials := result["trial_results"].([]any)
-	trials[1].(map[string]any)["verifier_result"].(map[string]any)["rewards"].(map[string]any)["reward"] = 1
-	input.HarborResult = evidenceForBytes("result", "harbor.result.v0.18", "application/json", marshalEvaluationResult(t, result))
+	policy := validEvaluationPolicy()
+	policy.MaxPassingTrials = &maximumPasses
+	fixture := newEvaluationBundleFixture(t, policy)
+	fixture.setTrialReward(t, 1, 1)
 
-	receipt, err := BuildEvaluationReceipt(input)
+	receipt, err := BuildEvaluationReceipt(fixture.input(t))
 	if err != nil {
 		t.Fatalf("BuildEvaluationReceipt() error = %v", err)
 	}
@@ -85,60 +93,59 @@ func TestBuildEvaluationReceiptPreservesContentNonCompliance(t *testing.T) {
 	}
 }
 
-func TestBuildEvaluationReceiptRejectsUntrustedResultDrift(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(map[string]any)
-		want   error
-	}{
-		{
-			name: "wrong evaluator",
-			mutate: func(result map[string]any) {
-				trials := result["trial_results"].([]any)
-				trials[0].(map[string]any)["agent_info"].(map[string]any)["model_info"].(map[string]any)["name"] = "unapproved-model"
-			},
-			want: ErrInvalidHarborResult,
-		},
-		{
-			name: "task digest drift",
-			mutate: func(result map[string]any) {
-				trials := result["trial_results"].([]any)
-				trials[0].(map[string]any)["task_checksum"] = "other-task"
-			},
-			want: ErrInvalidHarborResult,
-		},
-		{
-			name: "missing rollout detail",
-			mutate: func(result map[string]any) {
-				trials := result["trial_results"].([]any)
-				delete(trials[0].(map[string]any)["agent_result"].(map[string]any), "rollout_details")
-			},
-			want: ErrInvalidHarborResult,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			input := validEvaluationInput(t, EvaluationPolicy{})
-			result := decodeEvaluationResult(t, input.HarborResult.Bytes)
-			test.mutate(result)
-			input.HarborResult = evidenceForBytes("result", "harbor.result.v0.18", "application/json", marshalEvaluationResult(t, result))
-			_, err := BuildEvaluationReceipt(input)
-			if !errors.Is(err, test.want) {
-				t.Fatalf("BuildEvaluationReceipt() error = %v, want %v", err, test.want)
-			}
-		})
+func TestBuildEvaluationReceiptDoesNotEquateHarborTaskDigestsWithFlowV2Digest(t *testing.T) {
+	fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+	fixture.updateTrial(t, 0, func(trial map[string]any) {
+		trial["task_checksum"] = "different-harbor-dirhash-value"
+	})
+	if _, err := BuildEvaluationReceipt(fixture.input(t)); err != nil {
+		t.Fatalf("different Harbor task_checksum must remain separately evidenced, got %v", err)
 	}
 }
 
-func TestParseHarborJobResultV018RejectsDuplicateKeysAndNonterminalJob(t *testing.T) {
-	duplicate := []byte(`{"id":"job","id":"other","finished_at":"2026-07-14T00:00:00Z","n_total_trials":4,"trial_results":[]}`)
-	if _, err := ParseHarborJobResultV018(duplicate); !errors.Is(err, ErrInvalidHarborResult) {
-		t.Fatalf("duplicate JSON error = %v, want ErrInvalidHarborResult", err)
-	}
-	nonterminal := []byte(`{"id":"job","n_total_trials":4,"trial_results":[]}`)
-	if _, err := ParseHarborJobResultV018(nonterminal); !errors.Is(err, ErrInvalidHarborResult) {
-		t.Fatalf("nonterminal JSON error = %v, want ErrInvalidHarborResult", err)
-	}
+func TestBuildEvaluationReceiptRejectsInvalidBundleEvidence(t *testing.T) {
+	t.Run("wrong evaluator", func(t *testing.T) {
+		fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+		fixture.updateTrial(t, 0, func(trial map[string]any) {
+			trial["agent_info"].(map[string]any)["model_info"].(map[string]any)["name"] = "unapproved-model"
+		})
+		if _, err := BuildEvaluationReceipt(fixture.input(t)); !errors.Is(err, ErrInvalidHarborResult) {
+			t.Fatalf("wrong evaluator error = %v, want ErrInvalidHarborResult", err)
+		}
+	})
+	t.Run("missing trajectory", func(t *testing.T) {
+		fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+		if err := os.Remove(filepath.Join(fixture.harbor.jobRoot, fixture.harbor.trialDirectories[0], "agent", "trajectory.json")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := BuildEvaluationReceipt(fixture.input(t)); !errors.Is(err, ErrInvalidHarborResult) {
+			t.Fatalf("missing trajectory error = %v, want ErrInvalidHarborResult", err)
+		}
+	})
+	t.Run("frozen V2 binding drift", func(t *testing.T) {
+		fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+		input := fixture.input(t)
+		input.Binding.TaskSnapshotDigest = workflowkit.SubjectDigest("harbor.task.v2:sha256:" + strings.Repeat("b", 64))
+		if _, err := BuildEvaluationReceipt(input); !errors.Is(err, ErrInvalidHarborResult) {
+			t.Fatalf("binding drift error = %v, want ErrInvalidHarborResult", err)
+		}
+	})
+	t.Run("missing completed trial", func(t *testing.T) {
+		fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+		if err := os.Remove(filepath.Join(fixture.harbor.jobRoot, fixture.harbor.trialDirectories[0], "result.json")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := CaptureHarborRunBundleV018(fixture.harbor.request()); !errors.Is(err, ErrInvalidHarborRunBundle) {
+			t.Fatalf("torn bundle capture error = %v, want ErrInvalidHarborRunBundle", err)
+		}
+	})
+	t.Run("nonterminal job", func(t *testing.T) {
+		fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+		fixture.updateJob(t, func(job map[string]any) { delete(job, "finished_at") })
+		if _, err := CaptureHarborRunBundleV018(fixture.harbor.request()); !errors.Is(err, ErrInvalidHarborRunBundle) {
+			t.Fatalf("nonterminal bundle capture error = %v, want ErrInvalidHarborRunBundle", err)
+		}
+	})
 }
 
 func TestEvaluationPolicyRequiresExplicitPhaseOneRules(t *testing.T) {
@@ -154,35 +161,158 @@ func TestEvaluationPolicyRequiresExplicitPhaseOneRules(t *testing.T) {
 	}
 }
 
+type evaluationBundleFixture struct {
+	harbor harborRunBundleFixture
+	policy EvaluationPolicy
+}
+
+func newEvaluationBundleFixture(t *testing.T, policy EvaluationPolicy) evaluationBundleFixture {
+	t.Helper()
+	harbor := newHarborRunBundleFixture(t)
+	fixture := evaluationBundleFixture{harbor: harbor, policy: policy}
+	fixture.write(t)
+	return fixture
+}
+
 func validEvaluationInput(t *testing.T, overrides EvaluationPolicy) EvaluationInput {
 	t.Helper()
 	policy := validEvaluationPolicy()
 	if overrides.MaxPassingTrials != nil {
 		policy.MaxPassingTrials = overrides.MaxPassingTrials
 	}
-	resultBytes := marshalEvaluationResult(t, validHarborResult())
+	return newEvaluationBundleFixture(t, policy).input(t)
+}
+
+func validEvaluationInputForPolicy(t *testing.T, policy EvaluationPolicy) EvaluationInput {
+	t.Helper()
+	return newEvaluationBundleFixture(t, policy).input(t)
+}
+
+func (fixture evaluationBundleFixture) write(t *testing.T) {
+	t.Helper()
+	writeHarborRunBundleJSON(t, filepath.Join(fixture.harbor.jobRoot, "config.json"), map[string]any{
+		"n_attempts":   4,
+		"n_concurrent": 4,
+		"tasks":        []any{map[string]any{"path": fixture.harbor.taskRoot}},
+		"datasets":     []any{},
+		"agents":       []any{map[string]any{"name": fixture.policy.Evaluator.AgentName, "model_name": fixture.policy.Evaluator.ModelName}},
+	})
+	writeHarborRunBundleJSON(t, filepath.Join(fixture.harbor.jobRoot, "lock.json"), map[string]any{
+		"schema_version": 2,
+		"harbor":         map[string]any{"version": "0.18.0"},
+		"trials":         []any{},
+	})
+	fixture.updateJob(t, func(job map[string]any) {
+		job["id"] = "evaluation-job"
+		job["started_at"] = "2026-07-14T00:00:00Z"
+		job["finished_at"] = "2026-07-14T00:10:00Z"
+		job["n_total_trials"] = 4
+		job["stats"] = map[string]any{
+			"n_running_trials": 0,
+			"n_pending_trials": 0,
+			"evals": map[string]any{
+				fixture.policy.Evaluator.AgentName + "__" + fixture.policy.Evaluator.ModelName + "__adhoc": map[string]any{
+					"pass_at_k": map[string]any{"4": 1},
+				},
+			},
+		}
+	})
+	lockDigest := "sha256:" + strings.Repeat("a", 64)
+	for index, directory := range fixture.harbor.trialDirectories {
+		root := filepath.Join(fixture.harbor.jobRoot, directory)
+		writeHarborRunBundleJSON(t, filepath.Join(root, "config.json"), map[string]any{"job_id": "evaluation-job", "trial_name": directory})
+		writeHarborRunBundleJSON(t, filepath.Join(root, "lock.json"), map[string]any{"task": map[string]any{"digest": lockDigest}})
+		reward := 0
+		if index == 0 {
+			reward = 1
+		}
+		model := map[string]any{"name": fixture.policy.Evaluator.ModelName}
+		if fixture.policy.Evaluator.ModelProvider != "" {
+			model["provider"] = fixture.policy.Evaluator.ModelProvider
+		}
+		writeHarborRunBundleJSON(t, filepath.Join(root, "result.json"), map[string]any{
+			"id":             "evaluation-trial-" + string(rune('a'+index)),
+			"trial_name":     directory,
+			"task_checksum":  "dirhash-task-checksum-" + string(rune('a'+index)),
+			"config":         map[string]any{"job_id": "evaluation-job"},
+			"started_at":     "2026-07-14T00:00:00Z",
+			"finished_at":    "2026-07-14T00:01:00Z",
+			"exception_info": nil,
+			"agent_info": map[string]any{
+				"name": fixture.policy.Evaluator.AgentName, "version": fixture.policy.Evaluator.AgentVersion, "model_info": model,
+			},
+			"verifier_result": map[string]any{"rewards": map[string]any{fixture.policy.PassRewardKey: reward}},
+		})
+		writeHarborRunBundleJSON(t, filepath.Join(root, "agent", "trajectory.json"), map[string]any{"final_metrics": map[string]any{"total_steps": 20}})
+	}
+}
+
+func (fixture evaluationBundleFixture) input(t *testing.T) EvaluationInput {
+	t.Helper()
+	bundle, err := CaptureHarborRunBundleV018(fixture.harbor.request())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := bundle.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
 	return EvaluationInput{
-		Policy: policy,
+		Policy: fixture.policy,
 		Binding: EvaluationBinding{
-			TaskSnapshotDigest:       workflowkit.SubjectDigest("harbor.task.v2:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-			ExpectedHarborTaskDigest: "harbor-dirhash-task-digest",
-			HarborCLI:                HarborCLIIdentity{CommandID: "harbor-cli", Version: "0.18.0", ContentFingerprint: workflowkit.SHA256Fingerprint([]byte("harbor-cli"))},
-			CatalogFingerprint:       workflowkit.SHA256Fingerprint([]byte("catalog")),
-			LockFingerprint:          workflowkit.SHA256Fingerprint([]byte("lock")),
-			ManifestFingerprint:      workflowkit.SHA256Fingerprint([]byte("manifest")),
+			TaskSnapshotDigest:  fixture.harbor.digest,
+			CatalogFingerprint:  workflowkit.SHA256Fingerprint([]byte("catalog")),
+			LockFingerprint:     workflowkit.SHA256Fingerprint([]byte("lock")),
+			ManifestFingerprint: workflowkit.SHA256Fingerprint([]byte("manifest")),
 		},
-		HarborResult:        evidenceForBytes("result", "harbor.result.v0.18", "application/json", resultBytes),
+		HarborRunBundle:     evidenceForBytes("run-bundle", HarborRunBundleV018Format, "application/json", raw),
 		CanonicalScreenshot: evidenceForBytes("screenshot", "harbor.screenshot.v1", "image/png", validPNG(t)),
 	}
 }
 
+func (fixture evaluationBundleFixture) updateJob(t *testing.T, mutate func(map[string]any)) {
+	t.Helper()
+	path := filepath.Join(fixture.harbor.jobRoot, "result.json")
+	value := readEvaluationJSON(t, path)
+	mutate(value)
+	writeHarborRunBundleJSON(t, path, value)
+}
+
+func (fixture evaluationBundleFixture) updateTrial(t *testing.T, index int, mutate func(map[string]any)) {
+	t.Helper()
+	path := filepath.Join(fixture.harbor.jobRoot, fixture.harbor.trialDirectories[index], "result.json")
+	value := readEvaluationJSON(t, path)
+	mutate(value)
+	writeHarborRunBundleJSON(t, path, value)
+}
+
+func (fixture evaluationBundleFixture) setTrialReward(t *testing.T, index, reward int) {
+	t.Helper()
+	fixture.updateTrial(t, index, func(trial map[string]any) {
+		trial["verifier_result"].(map[string]any)["rewards"].(map[string]any)[fixture.policy.PassRewardKey] = reward
+	})
+}
+
+func readEvaluationJSON(t *testing.T, path string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
 func validEvaluationPolicy() EvaluationPolicy {
 	return EvaluationPolicy{
-		ID:                 "codeedge.qwen-pass-four",
-		Version:            "1",
-		HarborResultFormat: HarborJobResultV018,
+		ID:                   "codeedge.qwen-pass-four",
+		Version:              "1",
+		HarborEvidenceFormat: HarborRunBundleV018Format,
 		Evaluator: EvaluatorIdentity{
-			ProfileID: "qwen-profile", ProfileVersion: "1", AgentName: "claude-code", AgentVersion: "1.0.0", ModelName: "qwen-model", ModelProvider: "approved-provider",
+			ProfileID: "qwen-profile", ProfileVersion: "1", AgentName: "claude-code", AgentVersion: "1.0.0", ModelName: "qwen",
 		},
 		LogicalTrialCount:   4,
 		PassRewardKey:       "reward",
@@ -191,37 +321,6 @@ func validEvaluationPolicy() EvaluationPolicy {
 		ScreenshotMediaType: "image/png",
 		FailureClassifierID: "codeedge-infra", FailureClassifierVersion: "1",
 		InfraExceptionTypes: []string{"DockerBuildError", "NetworkError"},
-	}
-}
-
-func validHarborResult() map[string]any {
-	trials := make([]any, 0, 4)
-	for index := 0; index < 4; index++ {
-		reward := 0
-		if index == 0 {
-			reward = 1
-		}
-		trials = append(trials, validHarborTrial(index, reward))
-	}
-	return map[string]any{
-		"id": "harbor-job-id", "started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:10:00Z", "n_total_trials": 4,
-		"trial_results": trials,
-	}
-}
-
-func validHarborTrial(index, reward int) map[string]any {
-	turns := make([]any, 20)
-	for turn := range turns {
-		turns[turn] = []any{turn + 1}
-	}
-	return map[string]any{
-		"id": "trial-id-" + string(rune('a'+index)), "trial_name": "task__trial-" + string(rune('a'+index)),
-		"task_checksum": "harbor-dirhash-task-digest", "started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:01:00Z",
-		"agent_info": map[string]any{
-			"name": "claude-code", "version": "1.0.0", "model_info": map[string]any{"name": "qwen-model", "provider": "approved-provider"},
-		},
-		"agent_result":    map[string]any{"rollout_details": []any{map[string]any{"completion_token_ids": turns}}},
-		"verifier_result": map[string]any{"rewards": map[string]any{"reward": reward}},
 	}
 }
 
@@ -238,22 +337,4 @@ func validPNG(t *testing.T) []byte {
 		t.Fatalf("encode PNG: %v", err)
 	}
 	return buffer.Bytes()
-}
-
-func decodeEvaluationResult(t *testing.T, raw []byte) map[string]any {
-	t.Helper()
-	var result map[string]any
-	if err := json.Unmarshal(raw, &result); err != nil {
-		t.Fatalf("decode evaluation result: %v", err)
-	}
-	return result
-}
-
-func marshalEvaluationResult(t *testing.T, result map[string]any) []byte {
-	t.Helper()
-	raw, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("marshal evaluation result: %v", err)
-	}
-	return raw
 }

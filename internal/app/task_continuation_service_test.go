@@ -33,7 +33,10 @@ func TestSameArtifactBindingsTreatsNilAndEmptyAsEqual(t *testing.T) {
 func TestTaskContinuationPlanIsFrozenIdempotentAndCoversEveryStage(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-	plannedAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	// The app clock is injected below while the Store retains its real clock.
+	// Anchor the fixture at the current instant so the frozen 24-hour TTL is
+	// valid for both clocks regardless of the calendar date on which tests run.
+	plannedAt := time.Now().UTC()
 	fixture.services.core.now = func() time.Time { return plannedAt }
 	command := continuationCommand(t, ctx, fixture, "continue-idempotent", []workflowkit.NodeID{workflowadapter.QualityCheck}, false)
 

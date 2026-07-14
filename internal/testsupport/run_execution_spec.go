@@ -228,9 +228,9 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 func completeCodeEdgePhase1FinalCompliancePolicy() codeedge.FinalCompliancePolicy {
 	maximumPassingTrials := 1
 	qwen := codeedge.EvaluationPolicy{
-		ID:                 "codeedge.qwen.pass-at-four",
-		Version:            "1",
-		HarborResultFormat: codeedge.HarborJobResultV018,
+		ID:                   "codeedge.qwen.pass-at-four",
+		Version:              "1",
+		HarborEvidenceFormat: codeedge.HarborRunBundleV018Format,
 		Evaluator: codeedge.EvaluatorIdentity{
 			ProfileID: "codeedge-qwen-profile", ProfileVersion: "1",
 			AgentName: "codeedge-agent", AgentVersion: "1",

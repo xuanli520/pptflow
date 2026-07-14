@@ -525,6 +525,7 @@ type frozenRunDefinition struct {
 	ExecutionSpecFingerprint      workflowkit.Fingerprint
 	ContinuationPlanTTL           time.Duration
 	ControlGracePeriod            time.Duration
+	CandidateProviderBudget       workflowadapter.CandidateProviderBudget
 	QuotaPolicy                   workflowadapter.ResolvedQuotaPolicy
 	ReviewStages                  []workflowadapter.ReviewStage
 	DeploymentCatalogReceipt      []byte
@@ -573,6 +574,9 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	if manifest.Resolved.ControlGracePeriod < 0 {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s has a negative control grace period", run.ID)
 	}
+	if err := manifest.Resolved.CandidateProviderBudget.Validate(); err != nil {
+		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s candidate provider budget: %w", run.ID, err)
+	}
 	reviewStages := append([]workflowadapter.ReviewStage(nil), manifest.Resolved.ReviewStages...)
 	seenReviewStages := make(map[workflowkit.StageKey]struct{}, len(reviewStages))
 	for _, review := range reviewStages {
@@ -609,6 +613,7 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 		ExecutionSpecFingerprint:      executionSpecFingerprint,
 		ContinuationPlanTTL:           manifest.Resolved.ContinuationPlanTTL,
 		ControlGracePeriod:            manifest.Resolved.ControlGracePeriod,
+		CandidateProviderBudget:       manifest.Resolved.CandidateProviderBudget,
 		QuotaPolicy:                   quotaPolicy,
 		ReviewStages:                  reviewStages,
 		DeploymentCatalogReceipt:      append([]byte(nil), catalogReceipt...),

@@ -174,7 +174,7 @@ func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *
 		{workflowkit.StageKey(OracleVerify), workflowkit.StageKey(TestsAnalysis)},
 		{workflowkit.StageKey(TestsAnalysis), workflowkit.StageKey(SolutionReview)},
 		{workflowkit.StageKey(FinalReview), workflowkit.StageKey(HarborRunQwen)},
-		{workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(HarborRunOpus)},
+		{workflowkit.StageKey(FinalReview), workflowkit.StageKey(HarborRunOpus)},
 		{workflowkit.StageKey(HarborRunOpus), workflowkit.StageKey(ResultReview)},
 		{workflowkit.StageKey(ResultReview), workflowkit.StageKey(Package)},
 	} {
@@ -190,15 +190,34 @@ func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *
 	if err != nil {
 		t.Fatalf("compile CodeEdge Phase-1 initial execution plan: %v", err)
 	}
+	var evaluatorBatch []workflowkit.NodeID
 	for _, batch := range initialPlan.Batches {
+		containsQwen := false
+		containsOpus := false
 		for _, nodeID := range batch.NodeIDs {
 			if nodeID == workflowkit.NodeID(Package) {
 				t.Fatalf("CodeEdge initial plan scheduled operator-only package: %#v", initialPlan.Batches)
 			}
+			containsQwen = containsQwen || nodeID == workflowkit.NodeID(HarborRunQwen)
+			containsOpus = containsOpus || nodeID == workflowkit.NodeID(HarborRunOpus)
 		}
+		if containsQwen || containsOpus {
+			if !containsQwen || !containsOpus {
+				t.Fatalf("CodeEdge evaluator dependency layer split Qwen and Opus: %#v", initialPlan.Batches)
+			}
+			evaluatorBatch = append([]workflowkit.NodeID(nil), batch.NodeIDs...)
+		}
+	}
+	if len(evaluatorBatch) != 2 {
+		t.Fatalf("CodeEdge evaluator dependency layer = %#v, want concurrent Qwen/Opus batch", evaluatorBatch)
 	}
 	qwen, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunQwen))
 	opus, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunOpus))
+	for _, evaluator := range []workflowkit.StageDescriptor{qwen, opus} {
+		if !sameStageKeySet(evaluator.Dependencies, []workflowkit.StageKey{workflowkit.StageKey(FinalReview)}) {
+			t.Fatalf("CodeEdge evaluator %q dependencies = %#v, want only FinalReview", evaluator.Key, evaluator.Dependencies)
+		}
+	}
 	if !hasQuotaClaim(qwen.QuotaClaims, "trial", 4) || !hasQuotaClaim(opus.QuotaClaims, "trial", 4) {
 		t.Fatalf("CodeEdge evaluator quota claims qwen=%+v opus=%+v, want exactly four logical trials each", qwen.QuotaClaims, opus.QuotaClaims)
 	}
@@ -224,7 +243,7 @@ func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *
 
 func TestCodeEdgePhase1SubmissionReportUsesTheVersionedTypedContract(t *testing.T) {
 	template := CodeEdgePhase1WorkflowTemplate()
-	if template.Version != "2.1.0" || template.Catalog.Version != "2.1.0" {
+	if template.Version != "2.1.1" || template.Catalog.Version != "2.1.1" {
 		t.Fatalf("CodeEdge semantic schema change did not receive template/catalog versions: %s / %s", template.Version, template.Catalog.Version)
 	}
 	stages := make(map[workflowkit.StageKey]StageDefinition, len(template.Catalog.Stages))

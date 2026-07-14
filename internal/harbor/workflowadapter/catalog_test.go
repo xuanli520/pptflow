@@ -231,6 +231,16 @@ func TestCatalogAndProfileFingerprintsAreCanonicalAndSensitive(t *testing.T) {
 	if profileFingerprint == changedProfileFingerprint {
 		t.Fatal("profile fingerprint did not change after budget policy change")
 	}
+
+	changedCandidatePolicy := profile.Clone()
+	changedCandidatePolicy.CandidateProviderBudget.StartupGrace = time.Second
+	changedCandidatePolicyFingerprint, err := changedCandidatePolicy.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint candidate-policy-changed profile: %v", err)
+	}
+	if profileFingerprint == changedCandidatePolicyFingerprint {
+		t.Fatal("profile fingerprint did not change after candidate provider policy change")
+	}
 }
 
 func TestCompileFreezesTemplateProfileAndDescriptorFingerprints(t *testing.T) {
@@ -439,7 +449,7 @@ func TestWorkflowKitDoesNotContainHarborPolicyVocabulary(t *testing.T) {
 }
 
 func explicitProfile(catalog StageCatalog) ExecutionProfile {
-	profile := ExecutionProfile{Template: catalog.Template, ID: "test-explicit", Version: "1.0.0", ContinuationPlanTTL: RequiredContinuationPlanTTL, ControlGracePeriod: 30 * time.Second, Stages: make([]StageBudget, 0, len(catalog.Stages))}
+	profile := ExecutionProfile{Template: catalog.Template, ID: "test-explicit", Version: "1.0.0", ContinuationPlanTTL: RequiredContinuationPlanTTL, ControlGracePeriod: 30 * time.Second, CandidateProviderBudget: CandidateProviderBudget{AttemptTimeout: time.Minute}, Stages: make([]StageBudget, 0, len(catalog.Stages))}
 	for _, stage := range catalog.Stages {
 		profile.Stages = append(profile.Stages, StageBudget{StageKey: stage.Key, Budget: budgetForTurns(stage.RequiredTurns)})
 	}

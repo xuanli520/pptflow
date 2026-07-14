@@ -729,7 +729,7 @@ func newFrozenRuntimeFixture(t *testing.T) frozenRuntimeFixture {
 	writeFrozenRuntimeFixtureManagedInputs(t, services, runID, profileCanonical, specificationCanonical)
 	resolved := workflowadapter.ResolvedWorkflow{
 		TemplateID: "runtime-fixture", TemplateVersion: "1", ExecutionProfileID: "runtime-fixture", ExecutionProfileVersion: "1",
-		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ExecutionProfileFingerprint: profileFingerprint, DefinitionFingerprint: definition,
+		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, CandidateProviderBudget: profile.CandidateProviderBudget, ExecutionProfileFingerprint: profileFingerprint, DefinitionFingerprint: definition,
 		Descriptor: workflow, QuotaPolicy: policy,
 	}
 	manifest, err := json.Marshal(runManifest{

@@ -716,8 +716,13 @@ func writeLifecycleMutationProfile(t *testing.T, root string) string {
 	catalog := workflowadapter.StandardStageCatalog()
 	template := workflowadapter.StandardTemplateReference()
 	document := map[string]any{
-		"template": map[string]any{"id": template.ID, "version": template.Version},
-		"id":       "task-hub-explicit", "version": "1", "continuation_plan_ttl": "24h", "control_grace_period": "30s", "stages": make([]any, 0, len(catalog.Stages)),
+		"template":                  map[string]any{"id": template.ID, "version": template.Version},
+		"id":                        "task-hub-explicit",
+		"version":                   "1",
+		"continuation_plan_ttl":     "24h",
+		"control_grace_period":      "30s",
+		"candidate_provider_budget": map[string]any{"attempt_timeout": "10s", "startup_grace": "0s", "shutdown_grace": "0s"},
+		"stages":                    make([]any, 0, len(catalog.Stages)),
 	}
 	stages := document["stages"].([]any)
 	for _, stage := range catalog.Stages {

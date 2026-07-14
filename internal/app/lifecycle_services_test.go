@@ -436,21 +436,13 @@ func lifecycleCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
 
 // lifecycleCandidateLeaseProfile keeps candidate-provider tests focused on
 // their protocol instead of the deliberately tiny generic integration budget.
-// Explicit lease-expiry tests configure their own short TTLs.
+// The candidate policy is template-neutral; it must not infer a lease from a
+// task_repair stage that a closed workflow may not contain.
 func lifecycleCandidateLeaseProfile(t *testing.T) workflowadapter.ExecutionProfile {
 	t.Helper()
 	profile := lifecycleCompleteProfile(t)
-	for index := range profile.Stages {
-		if string(profile.Stages[index].StageKey) != workflowadapter.TaskRepair {
-			continue
-		}
-		profile.Stages[index].Budget.TurnTimeout = 15 * time.Second
-		profile.Stages[index].Budget.AttemptTimeout = 15 * time.Second
-		profile.Stages[index].Budget.MaxElapsed = 15 * time.Second
-		return profile
-	}
-	t.Fatal("standard lifecycle test profile omits task_repair")
-	return workflowadapter.ExecutionProfile{}
+	profile.CandidateProviderBudget = workflowadapter.CandidateProviderBudget{AttemptTimeout: 15 * time.Second}
+	return profile
 }
 
 func lifecycleCompleteProfileForTemplate(t *testing.T, template workflowadapter.WorkflowTemplate) workflowadapter.ExecutionProfile {
@@ -462,6 +454,9 @@ func lifecycleCompleteProfileForTemplate(t *testing.T, template workflowadapter.
 		Version:             "1",
 		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL,
 		ControlGracePeriod:  30 * time.Second,
+		CandidateProviderBudget: workflowadapter.CandidateProviderBudget{
+			AttemptTimeout: time.Second,
+		},
 	}
 	for _, stage := range catalog.Stages {
 		turns := stage.RequiredTurns

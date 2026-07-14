@@ -190,10 +190,15 @@ type CommitRevisionCandidateContinuationRequest struct {
 	IdempotencyKey string
 	PayloadJSON    string
 	Expected       ControlCheckpointRef
+	// ChildRunInputs are immutable, pre-materialized object bindings for the
+	// target Run. The commit derives run/task/revision identity itself and
+	// inserts these records in the same transaction as the child Run.
+	ChildRunInputs []CreateRunInputArtifactRequest
 	Actor          string
 	Reason         string
 	Priority       int
 }
+
 
 type RevisionCandidateContinuationCommit struct {
 	Candidate RevisionCandidate

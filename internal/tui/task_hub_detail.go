@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 // TaskHubDetailTab groups the read-only lifecycle facts available from a
@@ -23,6 +24,13 @@ const (
 	TaskHubDetailFrozenTab    TaskHubDetailTab = "frozen_execution"
 	TaskHubDetailReleasesTab  TaskHubDetailTab = "releases"
 	TaskHubDetailFactsTab     TaskHubDetailTab = "facts"
+)
+
+const (
+	taskHubCodeEdgeQwenTrialResultArtifactKey = "qwen_trial_result"
+	taskHubCodeEdgeQwenPass4EvidenceKey       = "qwen_pass4_evidence"
+	taskHubCodeEdgeOpusTrialResultArtifactKey = "opus_trial_result"
+	taskHubCodeEdgeOpusPass4EvidenceKey       = "opus_pass4_evidence"
 )
 
 func taskHubDetailTabs() []TaskHubDetailTab {
@@ -885,6 +893,17 @@ func (overlay *TaskHubDetailOverlay) deploymentCatalogRows(catalog TaskHubDeploy
 // payload is not read by the TUI, so it cannot be re-parsed, silently trusted,
 // or mistaken for a complete trial/compliance result.
 func (overlay *TaskHubDetailOverlay) evaluationEvidenceRows(runID string) []string {
+	run, found := overlay.runFact(runID)
+	if !found {
+		return []string{sectionStyle.Render("评测证据（immutable lineage）"), "该 Run 未出现在只读详情中；不会按 artifact key 推测评测状态。"}
+	}
+	if taskHubIsCodeEdgePhase1RunFact(run) {
+		return overlay.codeEdgeEvaluationEvidenceRows(run)
+	}
+	return overlay.genericEvaluationEvidenceRows(runID)
+}
+
+func (overlay *TaskHubDetailOverlay) genericEvaluationEvidenceRows(runID string) []string {
 	rows := []string{sectionStyle.Render("评测证据（immutable lineage）")}
 	stages := overlay.evaluationStagesForRun(runID)
 	if len(stages) == 0 {
@@ -906,6 +925,109 @@ func (overlay *TaskHubDetailOverlay) evaluationEvidenceRows(runID string) []stri
 		rows = append(rows, subtleStyle.Render("  受验证评测摘要：尚未提供（不会读取 artifact 原文或猜测四次 trial/合规结论）。"))
 	}
 	return rows
+}
+
+type taskHubCodeEdgeEvaluationSlot struct {
+	Role                     string
+	StageKey                 string
+	TrialResultArtifactKey   string
+	Pass4EvidenceArtifactKey string
+}
+
+func taskHubCodeEdgeEvaluationSlots() [2]taskHubCodeEdgeEvaluationSlot {
+	return [2]taskHubCodeEdgeEvaluationSlot{
+		{
+			Role:                     "Qwen",
+			StageKey:                 workflowadapter.HarborRunQwen,
+			TrialResultArtifactKey:   taskHubCodeEdgeQwenTrialResultArtifactKey,
+			Pass4EvidenceArtifactKey: taskHubCodeEdgeQwenPass4EvidenceKey,
+		},
+		{
+			Role:                     "Opus",
+			StageKey:                 workflowadapter.HarborRunOpus,
+			TrialResultArtifactKey:   taskHubCodeEdgeOpusTrialResultArtifactKey,
+			Pass4EvidenceArtifactKey: taskHubCodeEdgeOpusPass4EvidenceKey,
+		},
+	}
+}
+
+// codeEdgeEvaluationEvidenceRows renders the evidence identity expected by
+// the closed CodeEdge template. It intentionally reports only registration
+// metadata: a ref being present does not validate its payload or authorize a
+// continuation, retry, or package.
+func (overlay *TaskHubDetailOverlay) codeEdgeEvaluationEvidenceRows(run TaskHubRunFact) []string {
+	rows := []string{sectionStyle.Render("CodeEdge Harbor 评测证据（immutable lineage）")}
+	if taskHubReconciliationRequired(run.Status) {
+		rows = append(rows, warnStyle.Render("Run 状态："+run.Status+"；需 reconcile；TUI 不会继续或自动重跑。"))
+	}
+	stages := overlay.evaluationStagesForRun(run.RunID)
+	for _, slot := range taskHubCodeEdgeEvaluationSlots() {
+		matched := make([]TaskHubStageFact, 0, 1)
+		for _, stage := range stages {
+			if stage.StageKey == slot.StageKey {
+				matched = append(matched, stage)
+			}
+		}
+		if len(matched) == 0 {
+			rows = append(rows, slot.Role+" Harbor 运行：暂无 StageAttempt；不会按 artifact key 推测已运行。")
+			continue
+		}
+		for _, stage := range matched {
+			rows = append(rows, sectionStyle.Render(slot.Role+" Harbor 运行："+stage.StageAttemptID))
+			rows = append(rows, slot.Role+" StageAttempt 状态："+emptyDash(stage.ExecutionState)+"  verdict："+emptyDash(stage.Verdict))
+			if taskHubReconciliationRequired(stage.ExecutionState) {
+				rows = append(rows, warnStyle.Render(slot.Role+" StageAttempt 状态："+stage.ExecutionState+"；需 reconcile；TUI 不会继续或自动重跑。"))
+			}
+			references := overlay.evaluationEvidenceRefs(run.RunID, stage)
+			rows = append(rows,
+				taskHubExpectedEvidenceStatus(slot.Role+" Harbor 运行证据包状态", slot.TrialResultArtifactKey, references),
+				taskHubExpectedEvidenceStatus(slot.Role+" 截图状态", slot.Pass4EvidenceArtifactKey, references),
+			)
+		}
+	}
+	rows = append(rows, subtleStyle.Render("不会读取 Harbor result、截图或 artifact 原文；上述状态仅表示 immutable ref 是否已登记。"))
+	return rows
+}
+
+func taskHubExpectedEvidenceStatus(label, key string, references []TaskHubArtifactRefFact) string {
+	matches := make([]TaskHubArtifactRefFact, 0, 1)
+	for _, reference := range references {
+		if reference.ArtifactKey == key {
+			matches = append(matches, reference)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return label + "：未登记（需要 " + key + "）"
+	case 1:
+		reference := matches[0]
+		return label + "：已登记（" + key + "  " + reference.ContentDigest + "  " + emptyDash(reference.SchemaVersion) + "）"
+	default:
+		return label + "：登记了 " + fmt.Sprintf("%d", len(matches)) + " 条 " + key + " 引用；不会将其视为单一受验证证据。"
+	}
+}
+
+func taskHubReconciliationRequired(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "in_doubt", "interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
+func taskHubIsCodeEdgePhase1RunFact(run TaskHubRunFact) bool {
+	return run.WorkflowTemplateID == workflowadapter.CodeEdgePhase1WorkflowTemplateID &&
+		run.WorkflowTemplateVer == workflowadapter.CodeEdgePhase1WorkflowTemplateVersion
+}
+
+func (overlay *TaskHubDetailOverlay) runFact(runID string) (TaskHubRunFact, bool) {
+	for _, run := range overlay.Detail.Runs {
+		if run.RunID == runID {
+			return run, true
+		}
+	}
+	return TaskHubRunFact{}, false
 }
 
 func (overlay *TaskHubDetailOverlay) evaluationStagesForRun(runID string) []TaskHubStageFact {

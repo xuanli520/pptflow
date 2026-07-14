@@ -509,6 +509,21 @@ func TestCatalogLockIdentityPropagatesToCandidateChildManifest(t *testing.T) {
 		TaskID: task.ID, BaseRevisionID: revision.ID, BaseDigest: revision.TaskDigest, AfterDigest: revision.TaskDigest,
 		TargetRevisionID: mustLifecycleMutationUUID(t), TargetRunID: mustLifecycleMutationUUID(t),
 	}
+	// Candidate child managed inputs are derived from the pre-commit immutable
+	// target snapshot, not from the source Run's input identity. This fixture
+	// exercises only catalog-lock propagation, so materialize an unchanged
+	// target snapshot explicitly instead of bypassing that invariant.
+	baseSnapshot, err := services.Revisions.SnapshotDirectory(task.ID, revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparedSnapshot, _, err := (&RevisionService{core: services.core}).prepareSnapshot(ctx, task.ID, candidate.TargetRevisionID, baseSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preparedSnapshot.TaskDigest != candidate.AfterDigest {
+		t.Fatalf("prepared candidate snapshot digest = %s, want %s", preparedSnapshot.TaskDigest, candidate.AfterDigest)
+	}
 	childRaw, err := services.Changes.ensureCandidateChildRunManifest(ctx, candidate, run)
 	if err != nil {
 		t.Fatal(err)

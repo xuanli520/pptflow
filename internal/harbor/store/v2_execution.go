@@ -76,6 +76,10 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 		CreatedAt:               now,
 		Version:                 1,
 	}
+	initialInputs, err := prepareInitialWorkflowRunInputArtifacts(s, request.InitialInputArtifacts, run, now)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return WorkflowRun{}, err
@@ -118,6 +122,18 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 			return WorkflowRun{}, fmt.Errorf("%w: workflow run %s", ErrIdentityCollision, run.ID)
 		}
 		return WorkflowRun{}, err
+	}
+	// Run inputs precede the worker-visible job in this transaction. SQLite
+	// exposes all rows only at commit, while this ordering makes the invariant
+	// explicit and prevents future dispatch changes from publishing a job before
+	// its immutable subject is durable.
+	for _, input := range initialInputs {
+		if err := validateRunInputArtifactSubjectTx(ctx, tx, input); err != nil {
+			return WorkflowRun{}, err
+		}
+		if _, _, err := s.insertRunInputArtifactTx(ctx, tx, input, request.Actor, request.Reason); err != nil {
+			return WorkflowRun{}, err
+		}
 	}
 	if dispatch != nil {
 		dispatch.CreatedAt = now

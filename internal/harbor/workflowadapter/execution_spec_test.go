@@ -79,13 +79,15 @@ func TestRunExecutionSpecStrictJSONDecoder(t *testing.T) {
 	unknownBinding := []byte(strings.Replace(string(raw), `"type":"repo_prepare"`, `"type":"repo_prepare","unexpected":true`, 1))
 	duplicateRoot := []byte(strings.Replace(string(raw), `"format":"harbor.run-execution-spec.v1"`, `"format":"harbor.run-execution-spec.v1","format":"harbor.run-execution-spec.v1"`, 1))
 	unknownType := []byte(strings.Replace(string(raw), `"type":"repo_prepare"`, `"type":"not-a-stage"`, 1))
+	legacyDeploymentContract := append([]byte(`{"codeedge_phase1_deployment_contract":{"id":"legacy","version":"1","fingerprint":"sha256:legacy"},`), raw[1:]...)
 	trailing := append(append([]byte(nil), raw...), []byte(" null")...)
 	for name, malformed := range map[string][]byte{
-		"unknown root field":    unknownRoot,
-		"unknown binding field": unknownBinding,
-		"duplicate root field":  duplicateRoot,
-		"unknown discriminator": unknownType,
-		"trailing value":        trailing,
+		"unknown root field":                unknownRoot,
+		"unknown binding field":             unknownBinding,
+		"duplicate root field":              duplicateRoot,
+		"unknown discriminator":             unknownType,
+		"removed deployment contract field": legacyDeploymentContract,
+		"trailing value":                    trailing,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseRunExecutionSpecJSON(malformed); err == nil {
@@ -484,9 +486,9 @@ func testRunExecutionSpec(t *testing.T) RunExecutionSpec {
 func testCodeEdgeFinalCompliancePolicy() codeedge.FinalCompliancePolicy {
 	maximumPassingTrials := 1
 	qwen := codeedge.EvaluationPolicy{
-		ID:                 "codeedge.qwen.pass-at-four",
-		Version:            "1",
-		HarborResultFormat: codeedge.HarborJobResultV018,
+		ID:                   "codeedge.qwen.pass-at-four",
+		Version:              "1",
+		HarborEvidenceFormat: codeedge.HarborRunBundleV018Format,
 		Evaluator: codeedge.EvaluatorIdentity{
 			ProfileID: "codeedge-qwen-profile", ProfileVersion: "1",
 			AgentName: "codeedge-agent", AgentVersion: "1",

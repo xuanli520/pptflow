@@ -569,7 +569,7 @@ func validateEvaluationForFinalCompliance(role string, receipt EvaluationReceipt
 	if receipt.PolicyID != policy.ID || receipt.PolicyVersion != policy.Version || receipt.PolicyFingerprint != policyFingerprint {
 		return "", fmt.Errorf("%w: %s evaluation receipt does not match its frozen policy", ErrInvalidFinalCompliance, role)
 	}
-	if receipt.Evaluator != policy.Evaluator || receipt.HarborResultFormat != policy.HarborResultFormat {
+	if receipt.Evaluator != policy.Evaluator || receipt.HarborEvidenceFormat != policy.HarborEvidenceFormat {
 		return "", fmt.Errorf("%w: %s evaluation receipt evaluator or result format drift", ErrInvalidFinalCompliance, role)
 	}
 	receiptBinding := FrozenRunBinding{

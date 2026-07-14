@@ -340,7 +340,7 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 	decisionArtifact := workflowkit.ArtifactSpec{Name: runtimeReviewDecisionKey, SchemaVersion: "harbor.review-decision.v1", Required: true}
 	resolved := workflowadapter.ResolvedWorkflow{
 		TemplateID: "runtime-review-gate", TemplateVersion: "1", ExecutionProfileID: "runtime-review-gate", ExecutionProfileVersion: "1",
-		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ExecutionProfileFingerprint: profileFingerprint, DefinitionFingerprint: definition,
+		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, CandidateProviderBudget: profile.CandidateProviderBudget, ExecutionProfileFingerprint: profileFingerprint, DefinitionFingerprint: definition,
 		Descriptor: workflow, QuotaPolicy: policy,
 		ReviewStages: []workflowadapter.ReviewStage{{StageKey: runtimeReviewGateStage, ReviewKind: workflowadapter.ReviewTaskDirection, DecisionArtifact: decisionArtifact}},
 	}

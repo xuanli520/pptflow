@@ -162,6 +162,9 @@ func commandCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
 		Version:             "1",
 		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL,
 		ControlGracePeriod:  30 * time.Second,
+		CandidateProviderBudget: workflowadapter.CandidateProviderBudget{
+			AttemptTimeout: time.Second,
+		},
 	}
 	for _, stage := range catalog.Stages {
 		turns := stage.RequiredTurns

@@ -41,13 +41,18 @@ func ParseExecutionProfileJSON(raw []byte) (ExecutionProfile, error) {
 	if err != nil {
 		return ExecutionProfile{}, err
 	}
+	candidateProviderBudget, err := document.CandidateProviderBudget.resolve()
+	if err != nil {
+		return ExecutionProfile{}, fmt.Errorf("decode candidate provider budget: %w", err)
+	}
 	profile := ExecutionProfile{
-		Template:            document.Template,
-		ID:                  document.ID,
-		Version:             document.Version,
-		ContinuationPlanTTL: continuationPlanTTL,
-		ControlGracePeriod:  controlGracePeriod,
-		Stages:              make([]StageBudget, 0, len(document.Stages)),
+		Template:                document.Template,
+		ID:                      document.ID,
+		Version:                 document.Version,
+		ContinuationPlanTTL:     continuationPlanTTL,
+		ControlGracePeriod:      controlGracePeriod,
+		CandidateProviderBudget: candidateProviderBudget,
+		Stages:                  make([]StageBudget, 0, len(document.Stages)),
 	}
 	for _, stage := range document.Stages {
 		budget, err := stage.Budget.resolve()
@@ -84,7 +89,12 @@ func (profile ExecutionProfile) CanonicalJSON() ([]byte, error) {
 		Version:             canonical.Version,
 		ContinuationPlanTTL: canonical.ContinuationPlanTTL.String(),
 		ControlGracePeriod:  canonical.ControlGracePeriod.String(),
-		Stages:              make([]executionProfileStageEntry, 0, len(canonical.Stages)),
+		CandidateProviderBudget: executionProfileCandidateProviderBudgetJSON{
+			AttemptTimeout: canonical.CandidateProviderBudget.AttemptTimeout.String(),
+			StartupGrace:   canonical.CandidateProviderBudget.StartupGrace.String(),
+			ShutdownGrace:  canonical.CandidateProviderBudget.ShutdownGrace.String(),
+		},
+		Stages: make([]executionProfileStageEntry, 0, len(canonical.Stages)),
 	}
 	for _, stage := range canonical.Stages {
 		budget := stage.Budget
@@ -115,12 +125,39 @@ func (profile ExecutionProfile) CanonicalJSON() ([]byte, error) {
 }
 
 type executionProfileDocument struct {
-	Template            TemplateReference            `json:"template"`
-	ID                  string                       `json:"id"`
-	Version             string                       `json:"version"`
-	ContinuationPlanTTL string                       `json:"continuation_plan_ttl"`
-	ControlGracePeriod  string                       `json:"control_grace_period"`
-	Stages              []executionProfileStageEntry `json:"stages"`
+	Template                TemplateReference                           `json:"template"`
+	ID                      string                                      `json:"id"`
+	Version                 string                                      `json:"version"`
+	ContinuationPlanTTL     string                                      `json:"continuation_plan_ttl"`
+	ControlGracePeriod      string                                      `json:"control_grace_period"`
+	CandidateProviderBudget executionProfileCandidateProviderBudgetJSON `json:"candidate_provider_budget"`
+	Stages                  []executionProfileStageEntry                `json:"stages"`
+}
+
+type executionProfileCandidateProviderBudgetJSON struct {
+	AttemptTimeout string `json:"attempt_timeout"`
+	StartupGrace   string `json:"startup_grace"`
+	ShutdownGrace  string `json:"shutdown_grace"`
+}
+
+func (budget executionProfileCandidateProviderBudgetJSON) resolve() (CandidateProviderBudget, error) {
+	attemptTimeout, err := parseProfileDuration("candidate_provider_budget.attempt_timeout", budget.AttemptTimeout)
+	if err != nil {
+		return CandidateProviderBudget{}, err
+	}
+	startupGrace, err := parseProfileDuration("candidate_provider_budget.startup_grace", budget.StartupGrace)
+	if err != nil {
+		return CandidateProviderBudget{}, err
+	}
+	shutdownGrace, err := parseProfileDuration("candidate_provider_budget.shutdown_grace", budget.ShutdownGrace)
+	if err != nil {
+		return CandidateProviderBudget{}, err
+	}
+	resolved := CandidateProviderBudget{AttemptTimeout: attemptTimeout, StartupGrace: startupGrace, ShutdownGrace: shutdownGrace}
+	if err := resolved.Validate(); err != nil {
+		return CandidateProviderBudget{}, err
+	}
+	return resolved, nil
 }
 
 type executionProfileStageEntry struct {

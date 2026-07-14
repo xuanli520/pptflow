@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
@@ -65,8 +67,23 @@ func (input runManifestManagedInput) artifactReference() workflowadapter.Artifac
 // the first registered materializer. Future input kinds add an explicit
 // descriptor here rather than receiving a caller path or a generic fallback.
 func (service *RunService) prepareManagedInitialRunInputs(ctx context.Context, runID string, revision store.TaskRevision, specification workflowadapter.RunExecutionSpec, recovered []runManifestManagedInput) (workflowadapter.RunExecutionSpec, []runManifestManagedInput, error) {
+	archiveTimestamp, err := managedTaskSnapshotArchiveTimestamp(service.core, revision)
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, err
+	}
+	return service.prepareManagedInitialRunInputsAt(ctx, runID, revision, specification, recovered, archiveTimestamp)
+}
+
+// prepareManagedInitialRunInputsAt is the shared materialization/binding path
+// for normal StartRun and a pre-commit candidate child Run. Candidate snapshots
+// exist before their TaskRevision row, so their immutable revision manifest
+// supplies this timestamp rather than a mutable wall-clock value.
+func (service *RunService) prepareManagedInitialRunInputsAt(ctx context.Context, runID string, revision store.TaskRevision, specification workflowadapter.RunExecutionSpec, recovered []runManifestManagedInput, archiveTimestamp time.Time) (workflowadapter.RunExecutionSpec, []runManifestManagedInput, error) {
 	if service == nil || service.core == nil || service.core.objects == nil {
 		return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("managed run input materializer is not configured")
+	}
+	if archiveTimestamp.IsZero() {
+		return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("managed task snapshot archive timestamp is required")
 	}
 	requiresSnapshot, err := intrinsicTemplateInputPort(specification, managedTaskSnapshotInputPort)
 	if err != nil {
@@ -101,7 +118,7 @@ func (service *RunService) prepareManagedInitialRunInputs(ctx context.Context, r
 			RevisionDigest: workflowkit.SubjectDigest(revision.TaskDigest),
 		}
 	}
-	object, err := materializeManagedTaskSnapshotObject(ctx, service.core, revision)
+	object, err := materializeManagedTaskSnapshotObjectAt(ctx, service.core, revision, archiveTimestamp)
 	if err != nil {
 		return workflowadapter.RunExecutionSpec{}, nil, err
 	}
@@ -147,8 +164,37 @@ func intrinsicTemplateInputPort(specification workflowadapter.RunExecutionSpec, 
 // timestamp. taskpolicy validates both before the archive is read and after
 // the revision digest is recomputed, rejecting symlinks and non-regular files.
 func materializeManagedTaskSnapshotObject(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision) (workflowruntime.ObjectRef, error) {
+	archiveTimestamp, err := managedTaskSnapshotArchiveTimestamp(core, revision)
+	if err != nil {
+		return workflowruntime.ObjectRef{}, err
+	}
+	return materializeManagedTaskSnapshotObjectAt(ctx, core, revision, archiveTimestamp)
+}
+
+func managedTaskSnapshotArchiveTimestamp(core *lifecycleServiceCore, revision store.TaskRevision) (time.Time, error) {
+	if core == nil {
+		return time.Time{}, fmt.Errorf("managed task snapshot layout is not configured")
+	}
+	raw, err := os.ReadFile(core.layout.revisionManifestPath(revision.TaskID, revision.ID))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read sealed task revision manifest: %w", err)
+	}
+	var manifest revisionSnapshotManifest
+	if err := decodeStrictJSON(string(raw), &manifest); err != nil {
+		return time.Time{}, fmt.Errorf("decode sealed task revision manifest: %w", err)
+	}
+	if manifest.Format != "harbor.task-revision-manifest.v2" || manifest.TaskID != revision.TaskID || manifest.RevisionID != revision.ID || manifest.TaskDigest != revision.TaskDigest || manifest.SnapshotPath != "snapshot" || manifest.CreatedAt.IsZero() {
+		return time.Time{}, fmt.Errorf("sealed task revision manifest does not match immutable revision")
+	}
+	return manifest.CreatedAt.UTC(), nil
+}
+
+func materializeManagedTaskSnapshotObjectAt(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision, archiveTimestamp time.Time) (workflowruntime.ObjectRef, error) {
 	if core == nil || core.objects == nil {
 		return workflowruntime.ObjectRef{}, fmt.Errorf("managed task snapshot object store is not configured")
+	}
+	if archiveTimestamp.IsZero() {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("managed task snapshot archive timestamp is required")
 	}
 	snapshot := core.layout.snapshotDirectory(revision.TaskID, revision.ID)
 	if err := taskpolicy.ValidateManagedSnapshotV2(snapshot); err != nil {
@@ -163,7 +209,7 @@ func materializeManagedTaskSnapshotObject(ctx context.Context, core *lifecycleSe
 	}
 	var archive bytes.Buffer
 	writer := zip.NewWriter(&archive)
-	writeErr := writeCanonicalPackageZip(ctx, writer, snapshot, "task", revision.CreatedAt.UTC())
+	writeErr := writeCanonicalPackageZip(ctx, writer, snapshot, "task", archiveTimestamp.UTC())
 	if closeErr := writer.Close(); writeErr == nil {
 		writeErr = closeErr
 	}
@@ -295,23 +341,56 @@ func verifyManagedRunInputs(ctx context.Context, core *lifecycleServiceCore, run
 	return nil
 }
 
-// ensureInitialWorkflowRunDispatch closes the deliberate StartRun ordering:
-// the Run and all managed input records exist before a worker-visible job is
-// created. A crash between those steps repairs only this idempotent handoff.
-func (service *RunService) ensureInitialWorkflowRunDispatch(ctx context.Context, run store.WorkflowRun, manifest runManifest) error {
-	if service == nil || service.core == nil || manifest.Inputs == nil {
-		return fmt.Errorf("managed workflow run dispatch is not configured")
+func initialManagedRunInputArtifactRequests(runID, taskID, revisionID, revisionDigest, actor string, inputs []runManifestManagedInput) ([]store.CreateRunInputArtifactRequest, error) {
+	requests := make([]store.CreateRunInputArtifactRequest, 0, len(inputs))
+	for _, input := range inputs {
+		if err := input.validate(); err != nil {
+			return nil, err
+		}
+		if input.RevisionDigest != workflowkit.SubjectDigest(revisionDigest) {
+			return nil, fmt.Errorf("managed input %q revision digest does not match selected TaskRevision", input.Port)
+		}
+		requests = append(requests, store.CreateRunInputArtifactRequest{
+			ID: input.ID, RunID: runID, TaskID: taskID, RevisionID: revisionID,
+			RevisionDigest: string(input.RevisionDigest), Port: input.Port,
+			ContentDigest: string(input.ContentDigest), SchemaVersion: input.SchemaVersion, SizeBytes: input.SizeBytes,
+			IdempotencyKey: "run-input-artifact:" + runID + ":" + input.Port,
+			Actor:          actor, Reason: "persist sealed managed run input",
+		})
+	}
+	return requests, nil
+}
+
+func initialWorkflowRunDispatch(runID, definitionHash string, manifest runManifest) (store.WorkflowRunDispatchRequest, workflowRunExecutionPayload, error) {
+	if manifest.Inputs == nil {
+		return store.WorkflowRunDispatchRequest{}, workflowRunExecutionPayload{}, fmt.Errorf("managed workflow run dispatch is not configured")
 	}
 	payload := workflowRunExecutionPayload{
-		Format: workflowRunExecutionPayloadFormat, RunID: run.ID, DefinitionHash: run.DefinitionHash,
+		Format: workflowRunExecutionPayloadFormat, RunID: runID, DefinitionHash: definitionHash,
 		ExecutionSpecFingerprint: manifest.Inputs.ExecutionSpecFingerprint, QuotaPolicy: manifest.Resolved.QuotaPolicy.Clone(),
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("encode initial workflow run dispatch: %w", err)
+		return store.WorkflowRunDispatchRequest{}, workflowRunExecutionPayload{}, fmt.Errorf("encode initial workflow run dispatch: %w", err)
 	}
-	key := "workflow-run-execution:" + run.ID
-	existing, err := service.core.store.GetDurableJobByIdempotency(ctx, key)
+	return store.WorkflowRunDispatchRequest{
+		CommandType: "workflow_run.execute", PayloadJSON: string(encoded),
+		IdempotencyKey: "workflow-run-execution:" + runID,
+	}, payload, nil
+}
+
+// ensureInitialWorkflowRunDispatch is retained only for idempotent recovery
+// of an older partially persisted Run. New StartRun calls insert inputs, Run,
+// dispatch job, and outbox in one Store transaction.
+func (service *RunService) ensureInitialWorkflowRunDispatch(ctx context.Context, run store.WorkflowRun, manifest runManifest) error {
+	if service == nil || service.core == nil {
+		return fmt.Errorf("managed workflow run dispatch is not configured")
+	}
+	dispatch, payload, err := initialWorkflowRunDispatch(run.ID, run.DefinitionHash, manifest)
+	if err != nil {
+		return err
+	}
+	existing, err := service.core.store.GetDurableJobByIdempotency(ctx, dispatch.IdempotencyKey)
 	if err != nil {
 		return err
 	}
@@ -327,13 +406,13 @@ func (service *RunService) ensureInitialWorkflowRunDispatch(ctx context.Context,
 	}
 	created, err := service.core.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
 		CommandType: "workflow_run.execute", EntityType: "workflow_run", EntityID: run.ID, RunID: run.ID,
-		PayloadJSON: string(encoded), IdempotencyKey: key, Actor: run.CreatedBy,
+		PayloadJSON: dispatch.PayloadJSON, IdempotencyKey: dispatch.IdempotencyKey, Priority: dispatch.Priority, Actor: run.CreatedBy,
 		Reason: "dispatch frozen workflow run after managed inputs persist",
 	})
 	if err != nil {
 		return err
 	}
-	if created.CommandType != "workflow_run.execute" || created.RunID != run.ID || created.IdempotencyKey != key {
+	if created.CommandType != "workflow_run.execute" || created.RunID != run.ID || created.IdempotencyKey != dispatch.IdempotencyKey {
 		return fmt.Errorf("created initial workflow run dispatch does not match frozen run")
 	}
 	return nil

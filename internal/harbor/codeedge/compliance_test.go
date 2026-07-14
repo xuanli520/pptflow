@@ -193,18 +193,12 @@ func validFinalComplianceFixture(t *testing.T) finalComplianceFixture {
 		t.Fatalf("build Qwen receipt: %v", err)
 	}
 
-	opusInput := qwenInput
-	opusInput.Policy = qwenInput.Policy.Clone()
-	opusInput.Policy.ID = "codeedge.opus.pass-at-four"
-	opusInput.Policy.Evaluator.ProfileID = "opus-profile"
-	opusInput.Policy.Evaluator.ModelName = "opus-model"
-	opusInput.Policy.MaxPassingTrials = nil
-	opusResult := decodeEvaluationResult(t, opusInput.HarborResult.Bytes)
-	for _, item := range opusResult["trial_results"].([]any) {
-		trial := item.(map[string]any)
-		trial["agent_info"].(map[string]any)["model_info"].(map[string]any)["name"] = "opus-model"
-	}
-	opusInput.HarborResult = evidenceForBytes("opus-result", "harbor.result.v0.18", "application/json", marshalEvaluationResult(t, opusResult))
+	opusPolicy := qwenInput.Policy.Clone()
+	opusPolicy.ID = "codeedge.opus.pass-at-four"
+	opusPolicy.Evaluator.ProfileID = "opus-profile"
+	opusPolicy.Evaluator.ModelName = "opus-model"
+	opusPolicy.MaxPassingTrials = nil
+	opusInput := validEvaluationInputForPolicy(t, opusPolicy)
 	opusInput.CanonicalScreenshot = evidenceForBytes("opus-screenshot", "harbor.screenshot.v1", "image/png", validPNG(t))
 	opusReceipt, err := BuildEvaluationReceipt(opusInput)
 	if err != nil {

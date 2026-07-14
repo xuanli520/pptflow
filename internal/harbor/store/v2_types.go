@@ -326,7 +326,11 @@ type CreateWorkflowRunRequest struct {
 	ExecutionEpoch          int
 	Actor                   string
 	Reason                  string
-	Dispatch                *WorkflowRunDispatchRequest
+	// InitialInputArtifacts are inserted before Dispatch in the same
+	// transaction. A worker can therefore never claim an initial job whose
+	// immutable run inputs are not yet durable.
+	InitialInputArtifacts []CreateRunInputArtifactRequest
+	Dispatch              *WorkflowRunDispatchRequest
 }
 
 // WorkflowRunDispatchRequest optionally creates the initial durable worker

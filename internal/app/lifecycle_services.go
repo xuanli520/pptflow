@@ -1193,6 +1193,14 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("encode run manifest: %w", err)
 	}
+	initialInputs, err := initialManagedRunInputArtifactRequests(runID, request.TaskID, request.RevisionID, revision.TaskDigest, request.Actor, managedInputs)
+	if err != nil {
+		return store.WorkflowRun{}, fmt.Errorf("prepare initial managed run inputs: %w", err)
+	}
+	dispatch, _, err := initialWorkflowRunDispatch(runID, string(resolved.DefinitionFingerprint), manifest)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
 	if createdRunDirectory {
 		if err := writeNewBytes(filepath.Join(runDirectory, runExecutionProfileFileName), profileCanonical); err != nil {
 			return store.WorkflowRun{}, fmt.Errorf("write frozen execution profile: %w", err)
@@ -1232,6 +1240,8 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		ExecutionEpoch:          request.ExecutionEpoch,
 		Actor:                   request.Actor,
 		Reason:                  request.Reason,
+		InitialInputArtifacts:   initialInputs,
+		Dispatch:                &dispatch,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrIdentityCollision) {
@@ -1247,12 +1257,6 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		return store.WorkflowRun{}, err
 	}
 	committed = true
-	if err := service.ensureRunInputArtifacts(ctx, run, manifest); err != nil {
-		return store.WorkflowRun{}, err
-	}
-	if err := service.ensureInitialWorkflowRunDispatch(ctx, run, manifest); err != nil {
-		return store.WorkflowRun{}, err
-	}
 	return run, nil
 }
 

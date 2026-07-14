@@ -1411,7 +1411,7 @@ Admission 事务同时校验 frozen plan/policy、CAS quota bucket、写 BudgetL
 
 ### 18.1 V2-only Schema Baseline
 
-新 control-plane database 直接从 schema version 2 引导，不创建 V1 `tasks`/`runs` 表，不写入 schema-version 1。纯 V2 的历史数据库可继续在 V2 迁移链中升级；任何检测到 V1 `tasks`/`runs` 表或 schema-version 1 历史的数据库均在 `Open` 和 `OpenReadOnly` 被拒绝。拒绝前只识别 schema marker，不读取 V1 业务记录，不执行 import、migration、delete、drop 或 rewrite。损坏恢复也只接受 checksum 和 SQLite integrity 都验证通过的 pure-V2 backup；其余情况必须建立新的受管 root。
+新 control-plane database 直接从 schema version 2 引导，不创建 V1 `tasks`/`runs` 表，不写入 schema-version 1。此交付将 V2 schema 收敛为单一 consolidated baseline：任何 pre-consolidation V2 store，以及任何检测到 V1 `tasks`/`runs` 表或 schema-version 1 历史的数据库，均在 `Open` 和 `OpenReadOnly` 被拒绝，不做升级、转换或兼容读取。拒绝前只识别 schema marker，不读取业务记录，不执行 import、migration、delete、drop 或 rewrite。损坏恢复也只接受 checksum 和 SQLite integrity 都验证通过的 consolidated-V2 backup；其余情况必须建立新的受管 root。
 
 V2 baseline 包含：
 
@@ -1657,7 +1657,7 @@ internal/harbor/store/
 - scheduler 重启后 queued/running job 可 reconcile。
 - 新 V2 database 不含 V1 表或 version-1 history；
 - `Open` 与 `OpenReadOnly` 都拒绝 V1 table/history marker，且拒绝过程不创建版本表、不读取 V1 行或转换数据库；
-- pure-V2 historical store 升级后保留有效 Task/Revision/Run 外键，同时移除 retired identity columns。
+- 仅由当前 consolidated V2 baseline 创建、且完整性已验证的 backup 可以恢复；任何 pre-consolidation V2 store 均被拒绝且不会被转换。
 
 ### 21.5 取消、恢复与 quota
 

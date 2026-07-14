@@ -1130,6 +1130,9 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 		if err != nil {
 			return RevisionCandidateContinuationCommit{}, err
 		}
+		if err := s.verifyCandidateChildRunInputsTx(ctx, tx, prepared.childRunInputs, run, revision); err != nil {
+			return RevisionCandidateContinuationCommit{}, err
+		}
 		if err := tx.Commit(); err != nil {
 			return RevisionCandidateContinuationCommit{}, err
 		}
@@ -1268,6 +1271,9 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 		}
 		return RevisionCandidateContinuationCommit{}, err
 	}
+	if err := s.insertCandidateChildRunInputsTx(ctx, tx, prepared.childRunInputs, run, revision, now, prepared.actor, prepared.reason); err != nil {
+		return RevisionCandidateContinuationCommit{}, err
+	}
 	previousRunVersion := sourceRun.Version
 	sourceRun.ExecutionEpoch = snapshot.NextExecutionEpoch
 	sourceRun.Version++
@@ -1344,6 +1350,51 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 	return RevisionCandidateContinuationCommit{Candidate: candidate, Revision: revision, Run: run, Execution: execution, Job: job}, nil
 }
 
+// insertCandidateChildRunInputsTx makes intrinsic subject inputs live at the
+// same durable boundary as the target revision and Run. Object publication is
+// intentionally completed by the application before this transaction; this
+// method never fabricates an object or a synthetic stage producer.
+func (s *Store) insertCandidateChildRunInputsTx(ctx context.Context, tx *sql.Tx, requests []CreateRunInputArtifactRequest, run WorkflowRun, revision TaskRevision, now time.Time, actor, reason string) error {
+	inputs, err := prepareInitialWorkflowRunInputArtifacts(s, requests, run, now)
+	if err != nil {
+		return err
+	}
+	for _, input := range inputs {
+		if err := validateRunInputArtifactSubjectTx(ctx, tx, input); err != nil {
+			return err
+		}
+		if _, _, err := s.insertRunInputArtifactTx(ctx, tx, input, actor, reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) verifyCandidateChildRunInputsTx(ctx context.Context, tx *sql.Tx, requests []CreateRunInputArtifactRequest, run WorkflowRun, revision TaskRevision) error {
+	expectedInputs, err := prepareInitialWorkflowRunInputArtifacts(s, requests, run, run.CreatedAt)
+	if err != nil {
+		return err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_input_artifacts WHERE run_id = ?`, run.ID).Scan(&count); err != nil {
+		return err
+	}
+	if count != len(expectedInputs) {
+		return fmt.Errorf("%w: candidate child Run input count does not match replay", ErrIdempotencyConflict)
+	}
+	for _, input := range expectedInputs {
+		stored, err := getRunInputArtifactForPortTx(ctx, tx, run.ID, input.Port)
+		if err != nil {
+			return err
+		}
+		if stored.ID != input.ID || stored.TaskID != run.TaskID || stored.RevisionID != revision.ID || stored.RevisionDigest != revision.TaskDigest ||
+			stored.ContentDigest != input.ContentDigest || stored.SchemaVersion != input.SchemaVersion || stored.SizeBytes != input.SizeBytes {
+			return fmt.Errorf("%w: candidate child Run input %q does not match replay", ErrIdempotencyConflict, input.Port)
+		}
+	}
+	return nil
+}
+
 type preparedRevisionCandidateContinuationCommit struct {
 	executionID    string
 	planID         string
@@ -1351,6 +1402,7 @@ type preparedRevisionCandidateContinuationCommit struct {
 	idempotencyKey string
 	payloadJSON    string
 	expected       ControlCheckpointRef
+	childRunInputs []CreateRunInputArtifactRequest
 	actor          string
 	reason         string
 	priority       int
@@ -1389,9 +1441,10 @@ func prepareRevisionCandidateContinuationCommit(s *Store, request CommitRevision
 	if err != nil {
 		return preparedRevisionCandidateContinuationCommit{}, err
 	}
+	childRunInputs := append([]CreateRunInputArtifactRequest(nil), request.ChildRunInputs...)
 	return preparedRevisionCandidateContinuationCommit{executionID: id, planID: request.PlanID, candidateID: request.CandidateID,
 		idempotencyKey: key, payloadJSON: payload, expected: request.Expected, actor: actor, reason: reason,
-		priority: request.Priority, jobID: jobID, jobKey: "candidate-continuation-job:" + key}, nil
+		childRunInputs: childRunInputs, priority: request.Priority, jobID: jobID, jobKey: "candidate-continuation-job:" + key}, nil
 }
 
 func decodeStrictContinuationSnapshot(raw string, destination any) error {

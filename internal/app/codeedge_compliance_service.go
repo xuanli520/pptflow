@@ -344,14 +344,14 @@ func requireApprovedCodeEdgeReviewGate(ctx context.Context, dataStore *store.Sto
 	return nil
 }
 
-func (service *CodeEdgeComplianceService) rebuildCodeEdgeEvaluationReceipt(ctx context.Context, frozen frozenCodeEdgeRun, stage store.StageAttempt, stageKey, resultKey, screenshotKey string, policy codeedge.EvaluationPolicy, supplied codeedge.EvaluationReceipt) (codeedge.EvaluationReceipt, error) {
+func (service *CodeEdgeComplianceService) rebuildCodeEdgeEvaluationReceipt(ctx context.Context, frozen frozenCodeEdgeRun, stage store.StageAttempt, stageKey, bundleKey, screenshotKey string, policy codeedge.EvaluationPolicy, supplied codeedge.EvaluationReceipt) (codeedge.EvaluationReceipt, error) {
 	if supplied.Status != codeedge.EvaluationCompleted {
 		return codeedge.EvaluationReceipt{}, fmt.Errorf("CodeEdge %s receipt must be a completed trusted four-trial result before final compliance", stageKey)
 	}
 	if err := supplied.Validate(); err != nil {
 		return codeedge.EvaluationReceipt{}, fmt.Errorf("validate supplied CodeEdge %s receipt: %w", stageKey, err)
 	}
-	resultSchema, resultBytes, err := service.readCodeEdgeStageArtifact(ctx, frozen, stage, resultKey, supplied.ResultArtifactID, supplied.ResultContentDigest)
+	bundleSchema, bundleBytes, err := service.readCodeEdgeStageArtifact(ctx, frozen, stage, bundleKey, supplied.RunBundleArtifactID, supplied.RunBundleContentDigest)
 	if err != nil {
 		return codeedge.EvaluationReceipt{}, err
 	}
@@ -362,16 +362,14 @@ func (service *CodeEdgeComplianceService) rebuildCodeEdgeEvaluationReceipt(ctx c
 	rebuilt, err := codeedge.BuildEvaluationReceipt(codeedge.EvaluationInput{
 		Policy: policy,
 		Binding: codeedge.EvaluationBinding{
-			TaskSnapshotDigest:       frozen.Binding.TaskSnapshotDigest,
-			ExpectedHarborTaskDigest: supplied.HarborTaskDigest,
-			HarborCLI:                supplied.HarborCLI,
-			CatalogFingerprint:       frozen.Binding.CatalogFingerprint,
-			LockFingerprint:          frozen.Binding.LockFingerprint,
-			ManifestFingerprint:      frozen.Binding.ManifestFingerprint,
+			TaskSnapshotDigest:  frozen.Binding.TaskSnapshotDigest,
+			CatalogFingerprint:  frozen.Binding.CatalogFingerprint,
+			LockFingerprint:     frozen.Binding.LockFingerprint,
+			ManifestFingerprint: frozen.Binding.ManifestFingerprint,
 		},
-		HarborResult: codeedge.EvaluationEvidence{
-			ArtifactID: supplied.ResultArtifactID, ContentDigest: supplied.ResultContentDigest,
-			SchemaVersion: resultSchema, MediaType: "application/json", Bytes: resultBytes,
+		HarborRunBundle: codeedge.EvaluationEvidence{
+			ArtifactID: supplied.RunBundleArtifactID, ContentDigest: supplied.RunBundleContentDigest,
+			SchemaVersion: bundleSchema, MediaType: "application/json", Bytes: bundleBytes,
 		},
 		CanonicalScreenshot: codeedge.EvaluationEvidence{
 			ArtifactID: supplied.ScreenshotArtifactID, ContentDigest: supplied.ScreenshotContentDigest,

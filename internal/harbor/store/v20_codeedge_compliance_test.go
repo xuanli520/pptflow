@@ -209,11 +209,11 @@ func codeEdgeFixtureEvaluationReceipt(t *testing.T, role string, binding codeedg
 	receipt := codeedge.EvaluationReceipt{
 		Format: codeedge.EvaluationReceiptFormat, Version: codeedge.EvaluationReceiptVersion, Status: codeedge.EvaluationCompleted,
 		PolicyID: "fixture-" + role + "-policy", PolicyVersion: "1", PolicyFingerprint: codeEdgeFixtureFingerprint(role + "-policy"),
-		Evaluator:          codeedge.EvaluatorIdentity{ProfileID: role + "-profile", ProfileVersion: "1", AgentName: "fixture-agent", AgentVersion: "1", ModelName: role + "-model", ModelProvider: "fixture-provider"},
-		HarborResultFormat: codeedge.HarborJobResultV018, HarborCLI: codeedge.HarborCLIIdentity{CommandID: "fixture-harbor", Version: "0.18.0", ContentFingerprint: codeEdgeFixtureFingerprint("harbor-cli")},
-		HarborJobID: role + "-job", HarborTaskDigest: "fixture-harbor-task-digest", TaskSnapshotDigest: binding.TaskSnapshotDigest,
+		Evaluator:            codeedge.EvaluatorIdentity{ProfileID: role + "-profile", ProfileVersion: "1", AgentName: "fixture-agent", AgentVersion: "1", ModelName: role + "-model", ModelProvider: "fixture-provider"},
+		HarborEvidenceFormat: codeedge.HarborRunBundleV018Format, HarborCLI: codeedge.HarborCLIIdentity{CommandID: "fixture-harbor", Version: "0.18.0", ContentFingerprint: codeEdgeFixtureFingerprint("harbor-cli")},
+		HarborJobID: role + "-job", MaterializedTaskRootV2Digest: binding.TaskSnapshotDigest, TaskSnapshotDigest: binding.TaskSnapshotDigest,
 		CatalogFingerprint: binding.CatalogFingerprint, LockFingerprint: binding.LockFingerprint, ManifestFingerprint: binding.ManifestFingerprint,
-		ResultArtifactID: workflowkit.ArtifactID(role + "-result"), ResultContentDigest: codeEdgeFixtureFingerprint(role + "-result"),
+		RunBundleArtifactID: workflowkit.ArtifactID(role + "-result"), RunBundleContentDigest: codeEdgeFixtureFingerprint(role + "-result"),
 		ScreenshotArtifactID: workflowkit.ArtifactID(role + "-screenshot"), ScreenshotContentDigest: codeEdgeFixtureFingerprint(role + "-screenshot"), ScreenshotMediaType: "image/png",
 		Trials: trials, PassCount: 0, AverageTurns: 20, PolicyCompliant: true, ComplianceReasons: []string{},
 	}

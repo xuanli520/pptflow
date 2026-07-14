@@ -89,6 +89,49 @@ type StageBudget struct {
 	Budget   workflowkit.ExecutionBudget `json:"budget"`
 }
 
+// CandidateProviderBudget freezes the timeout and lease policy for a
+// content-revision provider. It is intentionally independent of any workflow
+// stage name: templates that have no task_repair stage can still create a
+// fenced candidate through the same lifecycle protocol.
+type CandidateProviderBudget struct {
+	AttemptTimeout time.Duration `json:"attempt_timeout"`
+	StartupGrace   time.Duration `json:"startup_grace"`
+	ShutdownGrace  time.Duration `json:"shutdown_grace"`
+}
+
+func (budget CandidateProviderBudget) Validate() error {
+	if budget.AttemptTimeout <= 0 {
+		return fmt.Errorf("candidate provider attempt timeout must be positive")
+	}
+	if budget.StartupGrace < 0 || budget.ShutdownGrace < 0 {
+		return fmt.Errorf("candidate provider grace periods cannot be negative")
+	}
+	if budget.AttemptTimeout <= budget.StartupGrace+budget.ShutdownGrace {
+		return fmt.Errorf("candidate provider attempt timeout must exceed startup and shutdown grace")
+	}
+	return nil
+}
+
+// ExecutionTimeout is the only provider execution window. Startup and
+// shutdown grace remain inside the frozen attempt boundary rather than
+// silently extending a provider's write authority.
+func (budget CandidateProviderBudget) ExecutionTimeout() (time.Duration, error) {
+	if err := budget.Validate(); err != nil {
+		return 0, err
+	}
+	return budget.AttemptTimeout - budget.StartupGrace - budget.ShutdownGrace, nil
+}
+
+// LeaseTTL is bounded by the whole frozen attempt. Candidate lease renewal
+// may keep a fence current during execution, but may never create a longer
+// authority window than the declared attempt.
+func (budget CandidateProviderBudget) LeaseTTL() (time.Duration, error) {
+	if err := budget.Validate(); err != nil {
+		return 0, err
+	}
+	return budget.AttemptTimeout, nil
+}
+
 // RequiredContinuationPlanTTL is the confirmed lifetime of a frozen
 // continuation plan. It is intentionally a versioned ExecutionProfile field
 // rather than a service default, so every Run manifest preserves the policy
@@ -106,12 +149,13 @@ func (budget StageBudget) Clone() StageBudget {
 // production instance because the confirmed policy requires full request
 // budgets instead of defaults.
 type ExecutionProfile struct {
-	Template            TemplateReference `json:"template"`
-	ID                  string            `json:"id"`
-	Version             string            `json:"version"`
-	ContinuationPlanTTL time.Duration     `json:"continuation_plan_ttl"`
-	ControlGracePeriod  time.Duration     `json:"control_grace_period"`
-	Stages              []StageBudget     `json:"stages"`
+	Template                 TemplateReference      `json:"template"`
+	ID                       string                 `json:"id"`
+	Version                  string                 `json:"version"`
+	ContinuationPlanTTL      time.Duration          `json:"continuation_plan_ttl"`
+	ControlGracePeriod       time.Duration          `json:"control_grace_period"`
+	CandidateProviderBudget  CandidateProviderBudget `json:"candidate_provider_budget"`
+	Stages                   []StageBudget          `json:"stages"`
 }
 
 // Clone returns an independent profile snapshot.
@@ -156,6 +200,9 @@ func (profile ExecutionProfile) validateLocal() error {
 	}
 	if profile.ControlGracePeriod < 0 {
 		return fmt.Errorf("%w: control grace period cannot be negative", errInvalidCatalog)
+	}
+	if err := profile.CandidateProviderBudget.Validate(); err != nil {
+		return fmt.Errorf("%w: candidate provider budget: %v", errInvalidCatalog, err)
 	}
 	if len(profile.Stages) == 0 {
 		return fmt.Errorf("%w: execution profile has no stage budgets", errInvalidCatalog)
@@ -246,6 +293,7 @@ type ResolvedWorkflow struct {
 	ExecutionProfileVersion     string                         `json:"execution_profile_version"`
 	ContinuationPlanTTL         time.Duration                  `json:"continuation_plan_ttl"`
 	ControlGracePeriod          time.Duration                  `json:"control_grace_period"`
+	CandidateProviderBudget     CandidateProviderBudget         `json:"candidate_provider_budget"`
 	TemplateFingerprint         workflowkit.Fingerprint        `json:"template_fingerprint"`
 	ExecutionProfileFingerprint workflowkit.Fingerprint        `json:"execution_profile_fingerprint"`
 	DefinitionFingerprint       workflowkit.Fingerprint        `json:"definition_fingerprint"`
@@ -363,6 +411,7 @@ func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWork
 		ExecutionProfileVersion:     profile.Version,
 		ContinuationPlanTTL:         profile.ContinuationPlanTTL,
 		ControlGracePeriod:          profile.ControlGracePeriod,
+		CandidateProviderBudget:     profile.CandidateProviderBudget,
 		TemplateFingerprint:         templateFingerprint,
 		ExecutionProfileFingerprint: profileFingerprint,
 		DefinitionFingerprint:       definitionFingerprint,

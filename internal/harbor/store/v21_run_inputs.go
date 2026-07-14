@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 const runInputArtifactSelect = `
@@ -19,6 +20,73 @@ func (s *Store) CreateRunInputArtifact(ctx context.Context, request CreateRunInp
 	if err := s.mutationPreflight(ctx); err != nil {
 		return RunInputArtifact{}, err
 	}
+	now := s.now().UTC()
+	artifact, err := prepareRunInputArtifact(s, request, now)
+	if err != nil {
+		return RunInputArtifact{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RunInputArtifact{}, err
+	}
+	defer tx.Rollback()
+	if err := validateRunInputArtifactSubjectTx(ctx, tx, artifact); err != nil {
+		return RunInputArtifact{}, err
+	}
+	persisted, _, err := s.insertRunInputArtifactTx(ctx, tx, artifact, request.Actor, request.Reason)
+	if err != nil {
+		return RunInputArtifact{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RunInputArtifact{}, err
+	}
+	return persisted, nil
+}
+
+// prepareInitialWorkflowRunInputArtifacts derives the immutable subject
+// coordinates from the new Run. Callers can provide the object identity, but
+// cannot bind it to another Run, Task, or TaskRevision in this transaction.
+func prepareInitialWorkflowRunInputArtifacts(s *Store, requests []CreateRunInputArtifactRequest, run WorkflowRun, now time.Time) ([]RunInputArtifact, error) {
+	prepared := make([]RunInputArtifact, 0, len(requests))
+	ports := make(map[string]struct{}, len(requests))
+	ids := make(map[string]struct{}, len(requests))
+	keys := make(map[string]struct{}, len(requests))
+	for _, request := range requests {
+		if request.RunID != "" && request.RunID != run.ID {
+			return nil, fmt.Errorf("initial run input belongs to another workflow run")
+		}
+		if request.TaskID != "" && request.TaskID != run.TaskID {
+			return nil, fmt.Errorf("initial run input belongs to another task")
+		}
+		if request.RevisionID != "" && request.RevisionID != run.RevisionID {
+			return nil, fmt.Errorf("initial run input belongs to another task revision")
+		}
+		request.RunID = run.ID
+		request.TaskID = run.TaskID
+		request.RevisionID = run.RevisionID
+		request.Actor = run.CreatedBy
+		artifact, err := prepareRunInputArtifact(s, request, now)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := ports[artifact.Port]; duplicate {
+			return nil, fmt.Errorf("workflow run has duplicate initial input port %q", artifact.Port)
+		}
+		if _, duplicate := ids[artifact.ID]; duplicate {
+			return nil, fmt.Errorf("workflow run has duplicate initial input ID %q", artifact.ID)
+		}
+		if _, duplicate := keys[artifact.IdempotencyKey]; duplicate {
+			return nil, fmt.Errorf("workflow run has duplicate initial input idempotency key %q", artifact.IdempotencyKey)
+		}
+		ports[artifact.Port] = struct{}{}
+		ids[artifact.ID] = struct{}{}
+		keys[artifact.IdempotencyKey] = struct{}{}
+		prepared = append(prepared, artifact)
+	}
+	return prepared, nil
+}
+
+func prepareRunInputArtifact(s *Store, request CreateRunInputArtifactRequest, now time.Time) (RunInputArtifact, error) {
 	id, err := s.newV2ID(request.ID)
 	if err != nil {
 		return RunInputArtifact{}, err
@@ -58,47 +126,47 @@ func (s *Store) CreateRunInputArtifact(ctx context.Context, request CreateRunInp
 	if err != nil {
 		return RunInputArtifact{}, err
 	}
-	now := s.now().UTC()
-	artifact := RunInputArtifact{
+	return RunInputArtifact{
 		ID: id, RunID: runID, TaskID: taskID, RevisionID: revisionID,
 		RevisionDigest: revisionDigest, Port: port, ContentDigest: contentDigest,
 		SchemaVersion: schemaVersion, SizeBytes: request.SizeBytes, IdempotencyKey: key,
-		CreatedBy: resolveActor(request.Actor), CreatedAt: now,
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return RunInputArtifact{}, err
-	}
-	defer tx.Rollback()
+		CreatedBy: resolveActor(request.Actor), CreatedAt: now.UTC(),
+	}, nil
+}
+
+func validateRunInputArtifactSubjectTx(ctx context.Context, tx *sql.Tx, artifact RunInputArtifact) error {
 	run, err := getWorkflowRunTx(ctx, tx, artifact.RunID)
 	if err != nil {
-		return RunInputArtifact{}, err
+		return err
 	}
 	if run.TaskID != artifact.TaskID || run.RevisionID != artifact.RevisionID {
-		return RunInputArtifact{}, fmt.Errorf("run input artifact does not match workflow run subject")
+		return fmt.Errorf("run input artifact does not match workflow run subject")
 	}
 	revision, err := getTaskRevisionTx(ctx, tx, artifact.RevisionID)
 	if err != nil {
-		return RunInputArtifact{}, err
+		return err
 	}
 	if revision.TaskID != artifact.TaskID || revision.TaskDigest != artifact.RevisionDigest {
-		return RunInputArtifact{}, fmt.Errorf("run input artifact does not match immutable task revision")
+		return fmt.Errorf("run input artifact does not match immutable task revision")
 	}
+	return nil
+}
+
+// insertRunInputArtifactTx owns the immutable insert and audit record. It is
+// shared by standalone recovery and StartRun's Run/input/job/outbox
+// transaction so the worker cannot observe a partially persisted subject.
+func (s *Store) insertRunInputArtifactTx(ctx context.Context, tx *sql.Tx, artifact RunInputArtifact, actor, reason string) (RunInputArtifact, bool, error) {
 	// Check the key before INSERT so a faithful replay with the same explicit
 	// UUID reaches idempotency semantics rather than the global-ID trigger.
-	// A different UUID under the same key is still rejected by sameRunInputArtifact.
 	if existing, existingErr := getRunInputArtifactByKeyTx(ctx, tx, artifact.IdempotencyKey); existingErr == nil {
 		if sameRunInputArtifact(existing, artifact) {
-			if err := tx.Commit(); err != nil {
-				return RunInputArtifact{}, err
-			}
-			return existing, nil
+			return existing, false, nil
 		}
-		return RunInputArtifact{}, fmt.Errorf("%w: run input artifact key %s", ErrIdempotencyConflict, artifact.IdempotencyKey)
+		return RunInputArtifact{}, false, fmt.Errorf("%w: run input artifact key %s", ErrIdempotencyConflict, artifact.IdempotencyKey)
 	} else if !isNotFound(existingErr) {
-		return RunInputArtifact{}, existingErr
+		return RunInputArtifact{}, false, existingErr
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO run_input_artifacts (
 			id, run_id, task_id, revision_id, revision_digest, port,
 			content_digest, schema_version, size_bytes, idempotency_key,
@@ -109,38 +177,32 @@ func (s *Store) CreateRunInputArtifact(ctx context.Context, request CreateRunInp
 		artifact.IdempotencyKey, artifact.CreatedBy, artifact.CreatedAt)
 	if err != nil {
 		if isGlobalIdentityCollision(err) {
-			return RunInputArtifact{}, fmt.Errorf("%w: run input artifact %s", ErrIdentityCollision, artifact.ID)
+			return RunInputArtifact{}, false, fmt.Errorf("%w: run input artifact %s", ErrIdentityCollision, artifact.ID)
 		}
 		if !isUniqueConstraint(err) {
-			return RunInputArtifact{}, err
+			return RunInputArtifact{}, false, err
 		}
-		byPort, portErr := getRunInputArtifactForPortTx(ctx, tx, artifact.RunID, artifact.Port)
+		_, portErr := getRunInputArtifactForPortTx(ctx, tx, artifact.RunID, artifact.Port)
 		if portErr == nil {
-			if sameRunInputArtifact(byPort, artifact) {
-				return RunInputArtifact{}, fmt.Errorf("%w: run input artifact port %s", ErrIdempotencyConflict, artifact.Port)
-			}
-			return RunInputArtifact{}, fmt.Errorf("%w: run input artifact port %s", ErrIdempotencyConflict, artifact.Port)
+			return RunInputArtifact{}, false, fmt.Errorf("%w: run input artifact port %s", ErrIdempotencyConflict, artifact.Port)
 		}
 		if !isNotFound(portErr) {
-			return RunInputArtifact{}, portErr
+			return RunInputArtifact{}, false, portErr
 		}
-		return RunInputArtifact{}, fmt.Errorf("%w: run input artifact %s", ErrIdentityCollision, artifact.ID)
+		return RunInputArtifact{}, false, fmt.Errorf("%w: run input artifact %s", ErrIdentityCollision, artifact.ID)
 	}
 	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
-		Actor: request.Actor, EntityType: "run_input_artifact", EntityID: artifact.ID,
-		Action: "run_input_artifact.created", Reason: request.Reason,
+		Actor: actor, EntityType: "run_input_artifact", EntityID: artifact.ID,
+		Action: "run_input_artifact.created", Reason: reason,
 		PayloadJSON: auditPayload(map[string]any{
 			"run_id": artifact.RunID, "port": artifact.Port,
 			"content_digest": artifact.ContentDigest, "idempotency_key": artifact.IdempotencyKey,
 		}),
-		CreatedAt: now,
+		CreatedAt: artifact.CreatedAt,
 	}); err != nil {
-		return RunInputArtifact{}, err
+		return RunInputArtifact{}, false, err
 	}
-	if err := tx.Commit(); err != nil {
-		return RunInputArtifact{}, err
-	}
-	return artifact, nil
+	return artifact, true, nil
 }
 
 // GetRunInputArtifact returns one immutable run input by its globally unique

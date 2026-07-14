@@ -10,6 +10,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -474,14 +475,14 @@ func seedCodeEdgeEvaluationStage(t *testing.T, ctx context.Context, services *Li
 		t.Fatal(err)
 	}
 
-	harborTaskDigest := "harbor-dirhash-" + key
-	result := codeEdgeHarborResultBytes(t, policy, harborTaskDigest, "harbor-job-"+key)
+	taskRoot := services.core.layout.snapshotDirectory(revision.TaskID, revision.ID)
+	bundle := codeEdgeHarborRunBundleBytes(t, taskRoot, frozen.Binding.TaskSnapshotDigest, policy, "harbor-job-"+key)
 	screenshot := codeEdgePNG(t)
 	artifacts := make([]StageArtifact, 0, len(descriptor.Outputs))
 	for _, output := range descriptor.Outputs {
 		content := screenshot
 		if output.Name == evaluatorResultArtifactKey(key) {
-			content = result
+			content = bundle
 		}
 		artifacts = append(artifacts, StageArtifact{Key: output.Name, SchemaVersion: output.SchemaVersion, Content: content})
 	}
@@ -512,11 +513,10 @@ func seedCodeEdgeEvaluationStage(t *testing.T, ctx context.Context, services *Li
 	receipt, err := codeedge.BuildEvaluationReceipt(codeedge.EvaluationInput{
 		Policy: policy,
 		Binding: codeedge.EvaluationBinding{
-			TaskSnapshotDigest: frozen.Binding.TaskSnapshotDigest, ExpectedHarborTaskDigest: harborTaskDigest,
-			HarborCLI:          codeedge.HarborCLIIdentity{CommandID: "harbor-cli", Version: "0.18.0", ContentFingerprint: workflowkit.SHA256Fingerprint([]byte("harbor-cli-" + key))},
+			TaskSnapshotDigest: frozen.Binding.TaskSnapshotDigest,
 			CatalogFingerprint: frozen.Binding.CatalogFingerprint, LockFingerprint: frozen.Binding.LockFingerprint, ManifestFingerprint: frozen.Binding.ManifestFingerprint,
 		},
-		HarborResult:        codeedge.EvaluationEvidence{ArtifactID: workflowkit.ArtifactID(resultRef.ID), ContentDigest: workflowkit.Fingerprint(resultRef.ContentDigest), SchemaVersion: resultRef.SchemaVersion, MediaType: "application/json", Bytes: result},
+		HarborRunBundle:     codeedge.EvaluationEvidence{ArtifactID: workflowkit.ArtifactID(resultRef.ID), ContentDigest: workflowkit.Fingerprint(resultRef.ContentDigest), SchemaVersion: resultRef.SchemaVersion, MediaType: "application/json", Bytes: bundle},
 		CanonicalScreenshot: codeedge.EvaluationEvidence{ArtifactID: workflowkit.ArtifactID(screenshotRef.ID), ContentDigest: workflowkit.Fingerprint(screenshotRef.ContentDigest), SchemaVersion: screenshotRef.SchemaVersion, MediaType: "image/png", Bytes: screenshot},
 	})
 	if err != nil {
@@ -714,36 +714,80 @@ func evaluatorScreenshotArtifactKey(stageKey string) string {
 	return "opus_pass4_evidence"
 }
 
-func codeEdgeHarborResultBytes(t *testing.T, policy codeedge.EvaluationPolicy, taskDigest, jobID string) []byte {
+func codeEdgeHarborRunBundleBytes(t *testing.T, taskRoot string, digest workflowkit.SubjectDigest, policy codeedge.EvaluationPolicy, jobID string) []byte {
 	t.Helper()
-	trials := make([]any, 0, 4)
+	jobRoot := filepath.Join(t.TempDir(), "harbor-job")
+	codeEdgeWriteHarborBundleJSON(t, filepath.Join(jobRoot, "config.json"), map[string]any{
+		"n_attempts":   4,
+		"n_concurrent": 4,
+		"tasks":        []any{map[string]any{"path": taskRoot}},
+		"datasets":     []any{},
+		"agents":       []any{map[string]any{"name": policy.Evaluator.AgentName, "model_name": policy.Evaluator.ModelName}},
+	})
+	codeEdgeWriteHarborBundleJSON(t, filepath.Join(jobRoot, "lock.json"), map[string]any{
+		"schema_version": 2,
+		"harbor":         map[string]any{"version": "0.18.0"},
+		"trials":         []any{},
+	})
+	codeEdgeWriteHarborBundleJSON(t, filepath.Join(jobRoot, "result.json"), map[string]any{
+		"id": jobID, "started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:10:00Z", "n_total_trials": 4,
+		"stats": map[string]any{
+			"n_running_trials": 0,
+			"n_pending_trials": 0,
+			"evals": map[string]any{
+				policy.Evaluator.AgentName + "__" + policy.Evaluator.ModelName + "__adhoc": map[string]any{"pass_at_k": map[string]any{"4": 1}},
+			},
+		},
+	})
+	lockDigest := "sha256:" + strings.Repeat("d", 64)
 	for index := 0; index < 4; index++ {
-		tokens := make([]any, 20)
-		for turn := range tokens {
-			tokens[turn] = []any{turn + 1}
-		}
+		directory := "task__trial-" + string(rune('a'+index))
+		root := filepath.Join(jobRoot, directory)
+		codeEdgeWriteHarborBundleJSON(t, filepath.Join(root, "config.json"), map[string]any{"job_id": jobID})
+		codeEdgeWriteHarborBundleJSON(t, filepath.Join(root, "lock.json"), map[string]any{"task": map[string]any{"digest": lockDigest}})
 		reward := 0
 		if index == 0 {
 			reward = 1
 		}
-		trials = append(trials, map[string]any{
-			"id": "trial-id-" + string(rune('a'+index)), "trial_name": "task__trial-" + string(rune('a'+index)), "task_checksum": taskDigest,
-			"started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:01:00Z",
-			"agent_info": map[string]any{
-				"name": policy.Evaluator.AgentName, "version": policy.Evaluator.AgentVersion,
-				"model_info": map[string]any{"name": policy.Evaluator.ModelName, "provider": policy.Evaluator.ModelProvider},
-			},
-			"agent_result":    map[string]any{"rollout_details": []any{map[string]any{"completion_token_ids": tokens}}},
+		model := map[string]any{"name": policy.Evaluator.ModelName}
+		if policy.Evaluator.ModelProvider != "" {
+			model["provider"] = policy.Evaluator.ModelProvider
+		}
+		codeEdgeWriteHarborBundleJSON(t, filepath.Join(root, "result.json"), map[string]any{
+			"id": "trial-id-" + string(rune('a'+index)), "trial_name": directory,
+			"task_checksum": "harbor-dirhash-" + string(rune('a'+index)), "config": map[string]any{"job_id": jobID},
+			"started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:01:00Z", "exception_info": nil,
+			"agent_info":      map[string]any{"name": policy.Evaluator.AgentName, "version": policy.Evaluator.AgentVersion, "model_info": model},
 			"verifier_result": map[string]any{"rewards": map[string]any{policy.PassRewardKey: reward}},
 		})
+		codeEdgeWriteHarborBundleJSON(t, filepath.Join(root, "agent", "trajectory.json"), map[string]any{"final_metrics": map[string]any{"total_steps": 20}})
 	}
-	raw, err := json.Marshal(map[string]any{
-		"id": jobID, "started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:10:00Z", "n_total_trials": 4, "trial_results": trials,
+	bundle, err := codeedge.CaptureHarborRunBundleV018(codeedge.HarborRunBundleCaptureRequest{
+		JobDirectory: jobRoot, MaterializedTaskRoot: taskRoot, FrozenTaskSnapshotDigest: digest,
+		HarborCLI: codeedge.HarborCLIIdentity{CommandID: "harbor-cli", Version: "0.18.0", ContentFingerprint: workflowkit.SHA256Fingerprint([]byte("harbor-cli-" + jobID))},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	raw, err := bundle.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
 	return raw
+}
+
+func codeEdgeWriteHarborBundleJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func codeEdgePNG(t *testing.T) []byte {
