@@ -138,6 +138,24 @@ func (s *Store) GetContinuationCommand(ctx context.Context, commandID string) (*
 	return &command, nil
 }
 
+// GetContinuationCommandByKey loads the immutable command identity used by a
+// crashed/retried coordinator before it recomputes a mutable Run checkpoint.
+// A missing command is distinct from an invalid key and is returned as nil.
+func (s *Store) GetContinuationCommandByKey(ctx context.Context, commandKey string) (*ContinuationCommand, error) {
+	commandKey, err := normalizeRequired(commandKey, "continuation command key")
+	if err != nil {
+		return nil, err
+	}
+	command, err := scanContinuationCommand(s.db.QueryRowContext(ctx, continuationCommandV4Select+" WHERE command_key = ?", commandKey))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &command, nil
+}
+
 // CreateRepairSession creates a bounded, CAS-projected session linked to one
 // immutable command. It does not invoke a mutator or modify any revision.
 func (s *Store) CreateRepairSession(ctx context.Context, request CreateRepairSessionRequest) (RepairSession, error) {
@@ -422,8 +440,12 @@ func (s *Store) CreatePreparedChange(ctx context.Context, request CreatePrepared
 		if err != nil {
 			return PreparedChange{}, err
 		}
-		if session.CommandID != change.CommandID {
-			return PreparedChange{}, fmt.Errorf("prepared change repair session belongs to another command")
+		command, err := getContinuationCommandTx(ctx, tx, change.CommandID)
+		if err != nil {
+			return PreparedChange{}, err
+		}
+		if command.SubjectID != session.SubjectID {
+			return PreparedChange{}, fmt.Errorf("prepared change repair session belongs to another task")
 		}
 	}
 	_, err = tx.ExecContext(ctx, `

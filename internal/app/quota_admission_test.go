@@ -4,7 +4,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -16,7 +15,7 @@ func TestBuildFrozenStageQuotaAdmissionUsesOnlyDescriptorClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stage, present := resolved.Descriptor.Stage(workflowkit.StageKey(nodes.HarborRunQwen))
+	stage, present := resolved.Descriptor.Stage(workflowkit.StageKey(workflowadapter.HarborRunQwen))
 	if !present {
 		t.Fatal("Qwen stage is absent")
 	}

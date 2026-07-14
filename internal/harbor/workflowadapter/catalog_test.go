@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -29,7 +28,7 @@ func TestStandardStageCatalogCoversAllNodesAndGroups(t *testing.T) {
 			t.Errorf("current Harbor node %q is absent from catalog", node)
 		}
 	}
-	if _, present := catalog.Stage(workflowkit.StageKey(nodes.PublishTask)); present {
+	if _, present := catalog.Stage(workflowkit.StageKey("publish_task")); present {
 		t.Fatal("V2 catalog must not expose the legacy publish task stage")
 	}
 	for _, group := range StandardStageGroups() {
@@ -54,17 +53,20 @@ func TestCatalogRepresentsGatesAsDurableReviewStages(t *testing.T) {
 		t.Fatalf("compile template: %v", err)
 	}
 
-	expected := map[workflowkit.StageKey]ReviewKind{
-		workflowkit.StageKey(nodes.TaskReview):     ReviewTaskDirection,
-		workflowkit.StageKey(nodes.ContentReview):  ReviewContent,
-		workflowkit.StageKey(nodes.SolutionReview): ReviewSolutionVerifier,
-		workflowkit.StageKey(nodes.FinalReview):    ReviewFinalQuality,
-		workflowkit.StageKey(nodes.ResultReview):   ReviewModelResult,
+	expected := map[workflowkit.StageKey]struct {
+		kind     ReviewKind
+		artifact string
+	}{
+		workflowkit.StageKey(TaskReview):     {ReviewTaskDirection, "task_review_decision"},
+		workflowkit.StageKey(ContentReview):  {ReviewContent, "content_review_decision"},
+		workflowkit.StageKey(SolutionReview): {ReviewSolutionVerifier, "solution_review_decision"},
+		workflowkit.StageKey(FinalReview):    {ReviewFinalQuality, "final_review_decision"},
+		workflowkit.StageKey(ResultReview):   {ReviewModelResult, "model_result_decision"},
 	}
 	if got, want := len(resolved.ReviewStages), len(expected); got != want {
 		t.Fatalf("review stage count = %d, want %d", got, want)
 	}
-	for key, kind := range expected {
+	for key, want := range expected {
 		definition, present := template.Catalog.Stage(key)
 		if !present {
 			t.Fatalf("missing gate %q", key)
@@ -82,8 +84,8 @@ func TestCatalogRepresentsGatesAsDurableReviewStages(t *testing.T) {
 			t.Errorf("gate %q does not support all review outcomes", key)
 		}
 		review, present := resolved.ReviewStage(key)
-		if !present || review.ReviewKind != kind {
-			t.Errorf("compiled review %q = %#v, want kind %q", key, review, kind)
+		if !present || review.ReviewKind != want.kind || review.DecisionArtifact.Name != want.artifact || review.DecisionArtifact.SchemaVersion != "harbor.review-decision.v1" {
+			t.Errorf("compiled review %q = %#v, want kind/artifact %q/%q", key, review, want.kind, want.artifact)
 		}
 		descriptor, present := resolved.Descriptor.Stage(key)
 		if !present || !descriptor.Capabilities.Has(workflowkit.CapabilityApprove) {
@@ -94,11 +96,45 @@ func TestCatalogRepresentsGatesAsDurableReviewStages(t *testing.T) {
 	identity := workflowkit.AttemptIdentity{
 		ID:      "gate-attempt-1",
 		Kind:    workflowkit.AttemptStage,
-		ScopeID: string(nodes.FinalReview),
+		ScopeID: string(FinalReview),
 		Ordinal: 1,
 	}
 	if _, err := workflowkit.NewOpenedAttemptRecord("gate-record-1", 1, identity, workflowkit.StatusQueued, time.Now().UTC()); err != nil {
 		t.Fatalf("review gate cannot be represented as durable stage attempt: %v", err)
+	}
+}
+
+func TestGateDecisionArtifactsMatchEveryDirectConsumer(t *testing.T) {
+	catalog := StandardStageCatalog()
+	checks := []struct {
+		producer workflowkit.StageKey
+		consumer workflowkit.StageKey
+	}{
+		{TaskReview, GenerateTaskFiles},
+		{SolutionReview, MaterializeTask},
+		{FinalReview, HarborRunQwen},
+		{FinalReview, HarborRunOpus},
+		{ResultReview, SubmissionLint},
+	}
+	for _, check := range checks {
+		producer, ok := catalog.Stage(check.producer)
+		if !ok || producer.Gate == nil {
+			t.Fatalf("missing gate producer %q", check.producer)
+		}
+		consumer, ok := catalog.Stage(check.consumer)
+		if !ok {
+			t.Fatalf("missing consumer %q", check.consumer)
+		}
+		found := false
+		for _, input := range consumer.Inputs {
+			if input == producer.Gate.DecisionArtifact {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("gate %q output %+v is not a typed input of %q", check.producer, producer.Gate.DecisionArtifact, check.consumer)
+		}
 	}
 }
 
@@ -117,7 +153,7 @@ func TestExplicitProfileIsRequiredAndPreservesTurnContract(t *testing.T) {
 
 	tooFewTurns := profile.Clone()
 	for index := range tooFewTurns.Stages {
-		if tooFewTurns.Stages[index].StageKey != workflowkit.StageKey(nodes.GenerateTaskFiles) {
+		if tooFewTurns.Stages[index].StageKey != workflowkit.StageKey(GenerateTaskFiles) {
 			continue
 		}
 		tooFewTurns.Stages[index].Budget = budgetForTurns(1)
@@ -309,25 +345,25 @@ func TestRepairFirstPolicyAndResourceMapping(t *testing.T) {
 	}
 
 	catalog := StandardStageCatalog()
-	materialize, _ := catalog.Stage(workflowkit.StageKey(nodes.MaterializeTask))
+	materialize, _ := catalog.Stage(workflowkit.StageKey(MaterializeTask))
 	if materialize.Effect != workflowkit.EffectContentMutator || !containsResource(materialize.WriteSet, resourceTaskDigest) {
 		t.Fatalf("materialize mapping = %#v, want content mutation and task digest write", materialize)
 	}
-	repair, _ := catalog.Stage(workflowkit.StageKey(nodes.TaskRepair))
+	repair, _ := catalog.Stage(workflowkit.StageKey(TaskRepair))
 	if repair.Effect != workflowkit.EffectContentMutator || !containsResource(repair.WriteSet, resourceTaskWildcard) {
 		t.Fatalf("repair mapping = %#v, want task-wide content mutation", repair)
 	}
-	if _, present := catalog.Stage(workflowkit.StageKey(nodes.PublishTask)); present {
+	if _, present := catalog.Stage(workflowkit.StageKey("publish_task")); present {
 		t.Fatal("legacy publish stage is still exposed by the V2 catalog")
 	}
-	localPackage, present := catalog.Stage(workflowkit.StageKey(nodes.Package))
+	localPackage, present := catalog.Stage(workflowkit.StageKey(Package))
 	if !present || localPackage.Effect != workflowkit.EffectExternalSideEffect || localPackage.Plugin.ID != "harborfactory.local_package" {
 		t.Fatalf("local package delivery mapping = %#v, want the managed local package stage", localPackage)
 	}
-	if len(localPackage.Dependencies) != 1 || localPackage.Dependencies[0] != workflowkit.StageKey(nodes.SubmissionLint) {
+	if len(localPackage.Dependencies) != 1 || localPackage.Dependencies[0] != workflowkit.StageKey(SubmissionLint) {
 		t.Fatalf("local package must depend directly on submission lint: %#v", localPackage.Dependencies)
 	}
-	quality, _ := catalog.Stage(workflowkit.StageKey(nodes.QualityCheck))
+	quality, _ := catalog.Stage(workflowkit.StageKey(QualityCheck))
 	for _, verdict := range []workflowkit.Verdict{workflowkit.VerdictPass, workflowkit.VerdictNeedsRepair, workflowkit.VerdictReject, workflowkit.VerdictAdvisory} {
 		if !quality.AllowsVerdict(verdict) {
 			t.Errorf("quality stage does not allow repair-first verdict %q", verdict)
@@ -344,7 +380,7 @@ func TestRepairFirstPolicyAndResourceMapping(t *testing.T) {
 func TestCatalogValidationRejectsBrokenGateAndCoverage(t *testing.T) {
 	catalog := StandardStageCatalog()
 	for index := range catalog.Stages {
-		if catalog.Stages[index].Key == workflowkit.StageKey(nodes.FinalReview) {
+		if catalog.Stages[index].Key == workflowkit.StageKey(FinalReview) {
 			catalog.Stages[index].Capabilities = nil
 			break
 		}
@@ -388,7 +424,7 @@ func TestWorkflowKitDoesNotContainHarborPolicyVocabulary(t *testing.T) {
 }
 
 func explicitProfile(catalog StageCatalog) ExecutionProfile {
-	profile := ExecutionProfile{ID: "test-explicit", Version: "1.0.0", ContinuationPlanTTL: RequiredContinuationPlanTTL, ControlGracePeriod: 30 * time.Second, Stages: make([]StageBudget, 0, len(catalog.Stages))}
+	profile := ExecutionProfile{Template: catalog.Template, ID: "test-explicit", Version: "1.0.0", ContinuationPlanTTL: RequiredContinuationPlanTTL, ControlGracePeriod: 30 * time.Second, Stages: make([]StageBudget, 0, len(catalog.Stages))}
 	for _, stage := range catalog.Stages {
 		profile.Stages = append(profile.Stages, StageBudget{StageKey: stage.Key, Budget: budgetForTurns(stage.RequiredTurns)})
 	}

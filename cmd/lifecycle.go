@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/user"
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
-	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 	"github.com/spf13/cobra"
 )
@@ -94,6 +92,106 @@ func requiredText(name, value string) (string, error) {
 	return value, nil
 }
 
+// requiredLifecycleIdempotencyKey keeps every CLI mutation on the V12
+// lifecycle-operation ledger. Callers retain the supplied UUIDv7 when a
+// response is lost, so the command can return the original immutable receipt.
+func requiredLifecycleIdempotencyKey(value string) (string, error) {
+	key, err := requiredText("idempotency-key", value)
+	if err != nil {
+		return "", err
+	}
+	if err := store.ValidateUUIDv7(key); err != nil {
+		return "", fmt.Errorf("idempotency-key must be a UUIDv7: %w", err)
+	}
+	return key, nil
+}
+
+func lifecycleMutationBase(idempotencyKey, actor, reason string, expected app.LifecycleMutationCheckpoint) app.LifecycleMutationCommandBase {
+	return app.LifecycleMutationCommandBase{
+		IdempotencyKey: idempotencyKey,
+		Actor:          actor,
+		Reason:         reason,
+		Expected:       expected,
+	}
+}
+
+func replayCompletedLifecycleMutation(ctx context.Context, services *app.LifecycleServices, action app.LifecycleMutationAction, idempotencyKey string) (*app.LifecycleMutationReceipt, error) {
+	if services == nil || services.Mutations == nil {
+		return nil, fmt.Errorf("lifecycle mutation services are not configured")
+	}
+	receipt, replayed, err := services.Mutations.ReplayCompleted(ctx, action, idempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+	if !replayed {
+		return nil, nil
+	}
+	return &receipt, nil
+}
+
+// lifecycleMutationCheckpointForKey returns the original full checkpoint for
+// a retry before any mutable entity is reread. This is necessary because a
+// successful mutation normally advances the very version the CLI initially
+// confirmed. New commands receive no stored checkpoint and must capture one
+// immediately before they call the typed application service.
+func lifecycleMutationCheckpointForKey(ctx context.Context, services *app.LifecycleServices, action app.LifecycleMutationAction, idempotencyKey string) (app.LifecycleMutationCheckpoint, bool, error) {
+	if services == nil || services.Store() == nil {
+		return app.LifecycleMutationCheckpoint{}, false, fmt.Errorf("lifecycle mutation services are not configured")
+	}
+	operation, err := services.Store().GetLifecycleOperationByIdempotencyKey(ctx, idempotencyKey)
+	if err != nil {
+		return app.LifecycleMutationCheckpoint{}, false, err
+	}
+	if operation == nil {
+		return app.LifecycleMutationCheckpoint{}, false, nil
+	}
+	if operation.Action != string(action) {
+		return app.LifecycleMutationCheckpoint{}, false, fmt.Errorf("%w: lifecycle operation key %s", store.ErrIdempotencyConflict, idempotencyKey)
+	}
+	if operation.State == store.LifecycleOperationPrepared && strings.TrimSpace(operation.ExpectedTaskID) == "" {
+		return app.LifecycleMutationCheckpoint{}, false, fmt.Errorf("%w: prepared legacy lifecycle operation %s has no persisted expected checkpoint identities", store.ErrIdempotencyConflict, operation.ID)
+	}
+	checkpoint := app.LifecycleMutationCheckpoint{
+		TaskID:               operation.ExpectedTaskID,
+		TaskVersion:          operation.ExpectedTaskVersion,
+		RevisionID:           operation.ExpectedRevisionID,
+		RevisionStateVersion: operation.ExpectedRevisionStateVersion,
+		RevisionDigest:       operation.ExpectedRevisionDigest,
+		RunID:                operation.ExpectedRunID,
+		RunVersion:           operation.ExpectedRunVersion,
+		RunExecutionEpoch:    operation.ExpectedRunExecutionEpoch,
+		RunDefinitionHash:    operation.ExpectedRunDefinitionHash,
+		ReleaseID:            operation.ExpectedReleaseID,
+		ReleaseRecordVersion: operation.ExpectedReleaseRecordVersion,
+		ReviewRequestID:      operation.ExpectedReviewRequestID,
+		ReviewRevisionID:     operation.ExpectedReviewRevisionID,
+		ReviewState:          operation.ExpectedReviewState,
+		ReviewEvidenceDigest: operation.ExpectedReviewEvidenceDigest,
+	}
+	return checkpoint, true, nil
+}
+
+func requireLifecycleCheckpointVersion(name string, supplied, captured int64) error {
+	if supplied != captured {
+		return fmt.Errorf("%w: %s checkpoint version %d does not match current version %d", store.ErrOptimisticLock, name, supplied, captured)
+	}
+	return nil
+}
+
+func requireLifecycleCheckpointDigest(supplied, captured string) error {
+	if strings.TrimSpace(supplied) != captured {
+		return fmt.Errorf("%w: expected revision digest does not match the captured revision", store.ErrOptimisticLock)
+	}
+	return nil
+}
+
+func requireLifecycleCheckpointIdentity(name, supplied, captured string) error {
+	if strings.TrimSpace(supplied) != captured {
+		return fmt.Errorf("%w: %s does not match the captured lifecycle checkpoint", store.ErrIdempotencyConflict, name)
+	}
+	return nil
+}
+
 func requiredPositive(name string, value int64) error {
 	if value <= 0 {
 		return fmt.Errorf("%s must be positive", name)
@@ -153,7 +251,7 @@ func newTaskShowCommand(config *lifecycleCLIConfig) *cobra.Command {
 }
 
 func newTaskCreateCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var id, slug, title, metadata, repo, commit, reason string
+	var slug, title, metadata, repo, commit, idempotencyKey, reason string
 	command := &cobra.Command{
 		Use:   "create",
 		Short: "Create a draft task",
@@ -166,26 +264,34 @@ func newTaskCreateCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if _, err := requiredText("slug", slug); err != nil {
 				return err
 			}
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				return services.Tasks.CreateDraft(ctx, app.CreateDraftTaskRequest{
-					ID: id, Slug: slug, Title: title, MetadataJSON: metadata, SourceRepo: repo, SourceCommit: commit,
-					Actor: actor, Reason: reason,
+				return services.Mutations.CreateDraft(ctx, app.CreateDraftLifecycleCommand{
+					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, app.LifecycleMutationCheckpoint{}),
+					Slug:                         slug,
+					Title:                        title,
+					MetadataJSON:                 metadata,
+					SourceRepo:                   repo,
+					SourceCommit:                 commit,
 				})
 			})
 		},
 	}
-	command.Flags().StringVar(&id, "id", "", "Optional UUIDv7 task identity")
 	command.Flags().StringVar(&slug, "slug", "", "Human-readable task slug")
 	command.Flags().StringVar(&title, "title", "", "Task title")
 	command.Flags().StringVar(&metadata, "metadata-json", "", "Task metadata JSON")
 	command.Flags().StringVar(&repo, "repo", "", "Source repository")
 	command.Flags().StringVar(&commit, "commit", "", "Source commit")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
 
 func newTaskImportCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var id, source, slug, title, metadata, repo, commit, proposalDigest, summary, reason string
+	var source, slug, title, metadata, repo, commit, proposalDigest, summary, idempotencyKey, reason string
 	command := &cobra.Command{
 		Use:   "import",
 		Short: "Import a strict Harbor task snapshot as an immutable revision",
@@ -201,25 +307,25 @@ func newTaskImportCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if _, err := requiredText("slug", slug); err != nil {
 				return err
 			}
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				task, revision, err := services.Tasks.ImportTask(ctx, app.ImportTaskRequest{
-					CreateDraftTaskRequest: app.CreateDraftTaskRequest{
-						ID: id, Slug: slug, Title: title, MetadataJSON: metadata, SourceRepo: repo, SourceCommit: commit,
-						Actor: actor, Reason: reason,
-					},
-					SourceDirectory: source, ProposalDigest: proposalDigest, ChangeSummary: summary,
+				return services.Mutations.Import(ctx, app.ImportLifecycleCommand{
+					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, app.LifecycleMutationCheckpoint{}),
+					Slug:                         slug,
+					Title:                        title,
+					MetadataJSON:                 metadata,
+					SourceRepo:                   repo,
+					SourceCommit:                 commit,
+					SourcePath:                   source,
+					ProposalDigest:               proposalDigest,
+					ChangeSummary:                summary,
 				})
-				if err != nil {
-					return nil, err
-				}
-				return struct {
-					Task     store.TaskV2       `json:"task"`
-					Revision store.TaskRevision `json:"revision"`
-				}{Task: task, Revision: revision}, nil
 			})
 		},
 	}
-	command.Flags().StringVar(&id, "id", "", "Optional UUIDv7 task identity")
 	command.Flags().StringVar(&source, "source", "", "Source task directory")
 	command.Flags().StringVar(&slug, "slug", "", "Human-readable task slug")
 	command.Flags().StringVar(&title, "title", "", "Task title")
@@ -228,12 +334,13 @@ func newTaskImportCommand(config *lifecycleCLIConfig) *cobra.Command {
 	command.Flags().StringVar(&commit, "commit", "", "Source commit")
 	command.Flags().StringVar(&proposalDigest, "proposal-digest", "", "Optional proposal digest")
 	command.Flags().StringVar(&summary, "change-summary", "", "Revision change summary")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
 
 func newTaskForkCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var sourceTask, sourceRevision, id, slug, title, metadata, reason string
+	var sourceTask, sourceRevision, slug, title, metadata, idempotencyKey, reason string
 	command := &cobra.Command{
 		Use:   "fork",
 		Short: "Fork an immutable task revision into a new task",
@@ -246,30 +353,47 @@ func newTaskForkCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if _, err := requiredText("source-task", sourceTask); err != nil {
 				return err
 			}
+			if _, err := requiredText("source-revision", sourceRevision); err != nil {
+				return err
+			}
 			if _, err := requiredText("slug", slug); err != nil {
 				return err
 			}
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				task, revision, err := services.Tasks.ForkTask(ctx, app.ForkTaskRequest{
-					SourceTaskID: sourceTask, SourceRevisionID: sourceRevision, ID: id, Slug: slug, Title: title,
-					MetadataJSON: metadata, Actor: actor, Reason: reason,
-				})
+				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationFork, idempotencyKey); err != nil {
+					return nil, err
+				} else if receipt != nil {
+					return *receipt, nil
+				}
+				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationFork, idempotencyKey)
 				if err != nil {
 					return nil, err
 				}
-				return struct {
-					Task     store.TaskV2       `json:"task"`
-					Revision store.TaskRevision `json:"revision"`
-				}{Task: task, Revision: revision}, nil
+				if !replayed {
+					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, sourceTask, sourceRevision, "", "")
+					if err != nil {
+						return nil, err
+					}
+				}
+				return services.Mutations.Fork(ctx, app.ForkLifecycleCommand{
+					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
+					Slug:                         slug,
+					Title:                        title,
+					MetadataJSON:                 metadata,
+				})
 			})
 		},
 	}
 	command.Flags().StringVar(&sourceTask, "source-task", "", "Source task UUIDv7")
-	command.Flags().StringVar(&sourceRevision, "source-revision", "", "Optional source revision UUIDv7")
-	command.Flags().StringVar(&id, "id", "", "Optional UUIDv7 fork identity")
+	command.Flags().StringVar(&sourceRevision, "source-revision", "", "Source immutable revision UUIDv7")
 	command.Flags().StringVar(&slug, "slug", "", "Fork task slug")
 	command.Flags().StringVar(&title, "title", "", "Fork task title")
 	command.Flags().StringVar(&metadata, "metadata-json", "", "Task metadata JSON")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
@@ -283,7 +407,7 @@ func newTaskDeleteCommand(config *lifecycleCLIConfig) *cobra.Command {
 }
 
 func newTaskTransitionCommand(config *lifecycleCLIConfig, use, short string, state store.TaskLifecycleState) *cobra.Command {
-	var taskID, reason string
+	var taskID, idempotencyKey, reason string
 	var expectedVersion int64
 	command := &cobra.Command{
 		Use:   use,
@@ -300,29 +424,53 @@ func newTaskTransitionCommand(config *lifecycleCLIConfig, use, short string, sta
 			if err := requiredPositive("expected-version", expectedVersion); err != nil {
 				return err
 			}
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+				action := app.LifecycleMutationArchive
 				if state == store.TaskLifecycleDeleted {
-					task, record, err := services.Deletion.SoftDeleteTask(ctx, taskID, expectedVersion, actor, reason)
+					action = app.LifecycleMutationSoftDelete
+				}
+				if receipt, err := replayCompletedLifecycleMutation(ctx, services, action, idempotencyKey); err != nil {
+					return nil, err
+				} else if receipt != nil {
+					return *receipt, nil
+				}
+				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, action, idempotencyKey)
+				if err != nil {
+					return nil, err
+				}
+				if !replayed {
+					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, taskID, "", "", "")
 					if err != nil {
 						return nil, err
 					}
-					return struct {
-						Task   store.TaskV2         `json:"task"`
-						Record store.DeletionRecord `json:"deletion_record"`
-					}{Task: task, Record: record}, nil
 				}
-				return services.Tasks.Archive(ctx, taskID, expectedVersion, actor, reason)
+				if err := requireLifecycleCheckpointIdentity("task", taskID, checkpoint.TaskID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointVersion("task", expectedVersion, checkpoint.TaskVersion); err != nil {
+					return nil, err
+				}
+				base := lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint)
+				if state == store.TaskLifecycleDeleted {
+					return services.Mutations.SoftDelete(ctx, base)
+				}
+				return services.Mutations.Archive(ctx, base)
 			})
 		},
 	}
 	command.Flags().StringVar(&taskID, "task", "", "Task UUIDv7")
 	command.Flags().Int64Var(&expectedVersion, "expected-version", 0, "Current task version")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
 
 func newTaskRestoreCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var taskID, state, reason string
+	var taskID, state, idempotencyKey, reason string
 	var expectedVersion int64
 	command := &cobra.Command{
 		Use:   "restore",
@@ -342,14 +490,43 @@ func newTaskRestoreCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if err := requiredPositive("expected-version", expectedVersion); err != nil {
 				return err
 			}
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				return services.Deletion.RestoreTask(ctx, taskID, expectedVersion, store.TaskLifecycleState(state), actor, reason)
+				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationRestore, idempotencyKey); err != nil {
+					return nil, err
+				} else if receipt != nil {
+					return *receipt, nil
+				}
+				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationRestore, idempotencyKey)
+				if err != nil {
+					return nil, err
+				}
+				if !replayed {
+					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, taskID, "", "", "")
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := requireLifecycleCheckpointIdentity("task", taskID, checkpoint.TaskID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointVersion("task", expectedVersion, checkpoint.TaskVersion); err != nil {
+					return nil, err
+				}
+				return services.Mutations.Restore(ctx, app.RestoreLifecycleCommand{
+					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
+					RestoreState:                 store.TaskLifecycleState(state),
+				})
 			})
 		},
 	}
 	command.Flags().StringVar(&taskID, "task", "", "Task UUIDv7")
 	command.Flags().StringVar(&state, "state", "", "Target lifecycle state: draft, ready, published, or archived")
 	command.Flags().Int64Var(&expectedVersion, "expected-version", 0, "Current task version")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
@@ -733,7 +910,7 @@ func newReviewRequestCommand(config *lifecycleCLIConfig) *cobra.Command {
 }
 
 func newReviewDecideCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var requestID, revisionID, action, digest, reason string
+	var requestID, revisionID, action, digest, idempotencyKey, reason string
 	command := &cobra.Command{
 		Use:   "decide",
 		Short: "Record an approve, request-changes, or terminal-reject decision",
@@ -755,10 +932,38 @@ func newReviewDecideCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if _, err := requiredText("expected-digest", digest); err != nil {
 				return err
 			}
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				return services.Reviews.Decide(ctx, app.DecideReviewRequest{
-					ReviewRequestID: requestID, RevisionID: revisionID, Action: store.ReviewDecisionAction(action),
-					ExpectedRevisionDigest: digest, Actor: actor, Reason: reason,
+				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationReview, idempotencyKey); err != nil {
+					return nil, err
+				} else if receipt != nil {
+					return *receipt, nil
+				}
+				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationReview, idempotencyKey)
+				if err != nil {
+					return nil, err
+				}
+				if !replayed {
+					checkpoint, err = services.Mutations.CaptureReviewCheckpoint(ctx, "", revisionID, requestID)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := requireLifecycleCheckpointIdentity("revision", revisionID, checkpoint.RevisionID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointIdentity("review request", requestID, checkpoint.ReviewRequestID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointDigest(digest, checkpoint.RevisionDigest); err != nil {
+					return nil, err
+				}
+				return services.Mutations.DecideReview(ctx, app.DecideReviewLifecycleCommand{
+					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
+					Decision:                     store.ReviewDecisionAction(action),
 				})
 			})
 		},
@@ -767,6 +972,7 @@ func newReviewDecideCommand(config *lifecycleCLIConfig) *cobra.Command {
 	command.Flags().StringVar(&revisionID, "revision", "", "Revision UUIDv7")
 	command.Flags().StringVar(&action, "action", "", "approve, request_changes, or reject_terminal")
 	command.Flags().StringVar(&digest, "expected-digest", "", "Approved revision digest")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
@@ -816,13 +1022,14 @@ func newRunCommandV2(config *lifecycleCLIConfig) *cobra.Command {
 		newRunControlShowCommand(config),
 		newRunAttachCommand(config),
 		newRunReconcileCommand(config),
+		newRunDetachCommand(config),
+		newRunWorkerCommand(config),
 	)
 	return command
 }
 
 func newRunStartCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var id, taskID, revisionID, profilePath, parentID, trigger, reason string
-	var epoch int
+	var taskID, revisionID, profilePath, executionSpecPath, trigger, idempotencyKey, reason string
 	command := &cobra.Command{
 		Use:   "start",
 		Short: "Freeze an explicit profile into a queued workflow run",
@@ -841,32 +1048,53 @@ func newRunStartCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if _, err := requiredText("profile", profilePath); err != nil {
 				return err
 			}
+			if _, err := requiredText("execution-spec", executionSpecPath); err != nil {
+				return err
+			}
 			if _, err := requiredText("trigger", trigger); err != nil {
 				return err
 			}
-			raw, err := os.ReadFile(profilePath)
-			if err != nil {
-				return fmt.Errorf("read explicit execution profile: %w", err)
-			}
-			profile, err := workflowadapter.ParseExecutionProfileJSON(raw)
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
 			if err != nil {
 				return err
 			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				return services.Runs.StartRun(ctx, app.StartRunRequest{
-					ID: id, TaskID: taskID, RevisionID: revisionID, Profile: profile, ParentRunID: parentID,
-					Trigger: trigger, ExecutionEpoch: epoch, Actor: actor, Reason: reason,
+				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationStartRun, idempotencyKey); err != nil {
+					return nil, err
+				} else if receipt != nil {
+					return *receipt, nil
+				}
+				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationStartRun, idempotencyKey)
+				if err != nil {
+					return nil, err
+				}
+				if !replayed {
+					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, taskID, revisionID, "", "")
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := requireLifecycleCheckpointIdentity("task", taskID, checkpoint.TaskID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointIdentity("revision", revisionID, checkpoint.RevisionID); err != nil {
+					return nil, err
+				}
+				return services.Mutations.StartRun(ctx, app.StartRunLifecycleCommand{
+					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
+					ProfilePath:                  profilePath,
+					ExecutionSpecPath:            executionSpecPath,
+					Trigger:                      trigger,
 				})
 			})
 		},
 	}
-	command.Flags().StringVar(&id, "id", "", "Optional UUIDv7 run identity")
 	command.Flags().StringVar(&taskID, "task", "", "Task UUIDv7")
 	command.Flags().StringVar(&revisionID, "revision", "", "Revision UUIDv7")
 	command.Flags().StringVar(&profilePath, "profile", "", "Complete explicit execution-profile JSON")
-	command.Flags().StringVar(&parentID, "parent-run", "", "Optional parent run UUIDv7")
+	command.Flags().StringVar(&executionSpecPath, "execution-spec", "", "Complete typed run-execution-spec JSON")
 	command.Flags().StringVar(&trigger, "trigger", "", "Run trigger")
-	command.Flags().IntVar(&epoch, "execution-epoch", 0, "Execution epoch")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
@@ -961,8 +1189,8 @@ func newReleaseCommand(config *lifecycleCLIConfig) *cobra.Command {
 }
 
 func newReleasePackageCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var revisionID, version, channel, reason string
-	var expectedStateVersion, expectedChannelVersion int64
+	var revisionID, version, idempotencyKey, reason string
+	var expectedStateVersion int64
 	command := &cobra.Command{
 		Use:   "package",
 		Short: "Build a local immutable package; it never uploads or publishes remotely",
@@ -981,10 +1209,35 @@ func newReleasePackageCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if err := requiredPositive("expected-state-version", expectedStateVersion); err != nil {
 				return err
 			}
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				return services.Releases.PackageRevision(ctx, app.PackageRevisionRequest{
-					RevisionID: revisionID, ExpectedStateVersion: expectedStateVersion, ReleaseVersion: version,
-					Channel: channel, ExpectedChannelVersion: expectedChannelVersion, Actor: actor, Reason: reason,
+				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationPackage, idempotencyKey); err != nil {
+					return nil, err
+				} else if receipt != nil {
+					return *receipt, nil
+				}
+				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationPackage, idempotencyKey)
+				if err != nil {
+					return nil, err
+				}
+				if !replayed {
+					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, "", revisionID, "", "")
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := requireLifecycleCheckpointIdentity("revision", revisionID, checkpoint.RevisionID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointVersion("revision state", expectedStateVersion, checkpoint.RevisionStateVersion); err != nil {
+					return nil, err
+				}
+				return services.Mutations.Package(ctx, app.PackageLifecycleCommand{
+					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
+					ReleaseVersion:               version,
 				})
 			})
 		},
@@ -992,8 +1245,7 @@ func newReleasePackageCommand(config *lifecycleCLIConfig) *cobra.Command {
 	command.Flags().StringVar(&revisionID, "revision", "", "Validated current revision UUIDv7")
 	command.Flags().Int64Var(&expectedStateVersion, "expected-state-version", 0, "Current revision state version")
 	command.Flags().StringVar(&version, "version", "", "Globally unique local release version")
-	command.Flags().StringVar(&channel, "channel", "", "Optional local movable channel")
-	command.Flags().Int64Var(&expectedChannelVersion, "expected-channel-version", 0, "Current channel version; zero creates a channel")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
@@ -1036,17 +1288,33 @@ func newReleaseWithdrawCommand(config *lifecycleCLIConfig) *cobra.Command {
 			if err := requiredPositive("expected-version", expectedVersion); err != nil {
 				return err
 			}
-			if _, err := requiredText("idempotency-key", idempotencyKey); err != nil {
+			idempotencyKey, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
 				return err
 			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				return services.Releases.Withdraw(ctx, app.WithdrawReleaseRequest{
-					ReleaseID:              releaseID,
-					ExpectedReleaseVersion: expectedVersion,
-					IdempotencyKey:         idempotencyKey,
-					Actor:                  actor,
-					Reason:                 reason,
-				})
+				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationWithdraw, idempotencyKey); err != nil {
+					return nil, err
+				} else if receipt != nil {
+					return *receipt, nil
+				}
+				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationWithdraw, idempotencyKey)
+				if err != nil {
+					return nil, err
+				}
+				if !replayed {
+					checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, "", "", "", releaseID)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := requireLifecycleCheckpointIdentity("release", releaseID, checkpoint.ReleaseID); err != nil {
+					return nil, err
+				}
+				if err := requireLifecycleCheckpointVersion("release", expectedVersion, checkpoint.ReleaseRecordVersion); err != nil {
+					return nil, err
+				}
+				return services.Mutations.Withdraw(ctx, lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint))
 			})
 		},
 	}

@@ -176,48 +176,26 @@ func TestValidateManagedSnapshotV2AllowsEitherEnvironmentFile(t *testing.T) {
 	}
 }
 
-func TestTaskDigestVersionsAreIsolated(t *testing.T) {
+func TestTaskDigestPolicyAcceptsOnlyV2(t *testing.T) {
 	root := writeCanonicalSnapshot(t, "docker")
 	v2, err := ComputeManagedTaskDigestV2(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v1 := LegacyTaskDigestPrefix + strings.Repeat("a", sha256.Size*2)
-
-	for _, test := range []struct {
-		name  string
-		value string
-		want  TaskDigestVersion
-	}{
-		{name: "legacy", value: v1, want: TaskDigestLegacyV1},
-		{name: "v2", value: v2, want: TaskDigestV2},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := ClassifyTaskDigest(test.value)
-			if err != nil || got != test.want {
-				t.Fatalf("ClassifyTaskDigest(%q) = (%q, %v), want (%q, nil)", test.value, got, err, test.want)
-			}
-		})
-	}
-	if !IsLegacyV1TaskDigest(v1) || IsV2TaskDigest(v1) {
-		t.Fatalf("legacy digest was not isolated: %q", v1)
-	}
-	if !IsV2TaskDigest(v2) || IsLegacyV1TaskDigest(v2) {
-		t.Fatalf("V2 digest was not isolated: %q", v2)
-	}
-	if err := ValidateV2TaskDigest(v1); err == nil {
-		t.Fatal("legacy evidence was accepted at a V2 revision boundary")
-	}
+	legacyShape := "sha256:" + strings.Repeat("a", sha256.Size*2)
 	if err := ValidateV2TaskDigest(v2); err != nil {
 		t.Fatalf("V2 evidence rejected at V2 revision boundary: %v", err)
+	}
+	if !IsV2TaskDigest(v2) {
+		t.Fatalf("V2 digest not recognized: %q", v2)
+	}
+	if err := ValidateV2TaskDigest(legacyShape); err == nil {
+		t.Fatal("non-V2 digest was accepted at a V2 revision boundary")
 	}
 	if err := ValidateV2TaskDigest(" " + v2); err == nil {
 		t.Fatal("non-canonical whitespace-wrapped V2 evidence was accepted")
 	}
-	if EqualTaskDigests(v1, v2) {
-		t.Fatal("cross-generation V1/V2 evidence compared equal")
-	}
-	if _, err := ClassifyTaskDigest(TaskDigestV2Prefix + "not-a-digest"); err == nil {
+	if err := ValidateV2TaskDigest(TaskDigestV2Prefix + "not-a-digest"); err == nil {
 		t.Fatal("malformed V2 digest was accepted")
 	}
 }

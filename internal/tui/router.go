@@ -80,7 +80,7 @@ func (r *pageRouter) SwitchTo(id viewMode) {
 
 func (r *pageRouter) Active() viewMode {
 	if r == nil {
-		return viewOverview
+		return viewHub
 	}
 	return r.active
 }

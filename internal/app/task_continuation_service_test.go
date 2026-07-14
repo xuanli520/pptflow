@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
@@ -36,7 +35,7 @@ func TestTaskContinuationPlanIsFrozenIdempotentAndCoversEveryStage(t *testing.T)
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
 	plannedAt := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	fixture.services.core.now = func() time.Time { return plannedAt }
-	command := continuationCommand(t, ctx, fixture, "continue-idempotent", []workflowkit.NodeID{nodes.QualityCheck}, false)
+	command := continuationCommand(t, ctx, fixture, "continue-idempotent", []workflowkit.NodeID{workflowadapter.QualityCheck}, false)
 
 	plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, command)
 	if err != nil {
@@ -82,7 +81,7 @@ func TestTaskContinuationPlanIsFrozenIdempotentAndCoversEveryStage(t *testing.T)
 		t.Fatalf("idempotent plan replay = id=%q fingerprint=%q err=%v; want id=%q fingerprint=%q", replayed.ID(), replayed.Fingerprint(), err, plan.ID(), plan.Fingerprint())
 	}
 	conflict := command
-	conflict.TargetNodeIDs = []workflowkit.NodeID{nodes.SimilarityCheck}
+	conflict.TargetNodeIDs = []workflowkit.NodeID{workflowadapter.SimilarityCheck}
 	if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, conflict); !errors.Is(err, store.ErrIdempotencyConflict) {
 		t.Fatalf("changed command payload error = %v, want ErrIdempotencyConflict", err)
 	}
@@ -91,7 +90,7 @@ func TestTaskContinuationPlanIsFrozenIdempotentAndCoversEveryStage(t *testing.T)
 func TestTaskContinuationKeepsImmutableCommandProvenanceAcrossPlanAndExecution(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-	command := continuationCommand(t, ctx, fixture, "immutable-provenance", []workflowkit.NodeID{nodes.QualityCheck}, false)
+	command := continuationCommand(t, ctx, fixture, "immutable-provenance", []workflowkit.NodeID{workflowadapter.QualityCheck}, false)
 	command.Actor = "provenance-actor"
 	command.Reason = "freeze this exact continuation intent"
 
@@ -150,7 +149,7 @@ func TestTaskContinuationKeepsImmutableCommandProvenanceAcrossPlanAndExecution(t
 func TestTaskContinuationForceRecomputeAdvancesGeneration(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-	plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "force-recompute", []workflowkit.NodeID{nodes.QualityCheck}, true))
+	plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "force-recompute", []workflowkit.NodeID{workflowadapter.QualityCheck}, true))
 	if err != nil {
 		t.Fatalf("plan force recompute: %v", err)
 	}
@@ -159,14 +158,14 @@ func TestTaskContinuationForceRecomputeAdvancesGeneration(t *testing.T) {
 		t.Fatalf("strategy = %q, want recompute", snapshot.Strategy)
 	}
 	for _, transition := range snapshot.Nodes {
-		if transition.NodeID == nodes.QualityCheck {
+		if transition.NodeID == workflowadapter.QualityCheck {
 			if transition.Disposition != workflowkit.DispositionSchedule || transition.ToGeneration != transition.FromGeneration+1 {
 				t.Fatalf("force-selected node transition = %+v", transition)
 			}
 			return
 		}
 	}
-	t.Fatalf("force-selected node %q missing from plan", nodes.QualityCheck)
+	t.Fatalf("force-selected node %q missing from plan", workflowadapter.QualityCheck)
 }
 
 func TestTaskContinuationExpandsFrozenStageGroupsWithoutPersistingNodeSelectors(t *testing.T) {
@@ -186,7 +185,7 @@ func TestTaskContinuationExpandsFrozenStageGroupsWithoutPersistingNodeSelectors(
 	for _, transition := range plan.Snapshot().Nodes {
 		transitions[transition.NodeID] = transition
 	}
-	for _, nodeID := range []workflowkit.NodeID{nodes.CodeEdgeLint, nodes.QualityCheck} {
+	for _, nodeID := range []workflowkit.NodeID{workflowadapter.CodeEdgeLint, workflowadapter.QualityCheck} {
 		transition, found := transitions[nodeID]
 		if !found || transition.Disposition != workflowkit.DispositionSchedule || transition.ToGeneration != transition.FromGeneration+1 {
 			t.Fatalf("quality group node %q transition = %+v", nodeID, transition)
@@ -250,7 +249,7 @@ func TestTaskContinuationPreviewDoesNotPersistDurableState(t *testing.T) {
 func TestTaskContinuationRejectsContentChangingStagesWithoutCandidate(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-	for _, target := range []workflowkit.NodeID{nodes.TaskDesign, nodes.MaterializeTask, nodes.TaskRepair} {
+	for _, target := range []workflowkit.NodeID{workflowadapter.TaskDesign, workflowadapter.MaterializeTask, workflowadapter.TaskRepair} {
 		t.Run(string(target), func(t *testing.T) {
 			_, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "content-stage-"+string(target), []workflowkit.NodeID{target}, true))
 			if !errors.Is(err, ErrTaskContinuationTarget) {
@@ -269,7 +268,7 @@ func TestTaskContinuationRejectsAutomaticallySelectedContentStage(t *testing.T) 
 		t.Fatal(err)
 	}
 	stage, err := fixture.dataStore.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
-		RunID: fixture.run.ID, StageKey: nodes.TaskDesign, StageGroup: "task_design", Ordinal: 2,
+		RunID: fixture.run.ID, StageKey: workflowadapter.TaskDesign, StageGroup: "task_design", Ordinal: 2,
 		InputFingerprint: string(emptyInputs), BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`, Actor: "tester", Reason: "content-stage fixture",
 	})
 	if err != nil {
@@ -294,7 +293,7 @@ func TestTaskContinuationRejectsAutomaticallySelectedContentStage(t *testing.T) 
 func TestTaskContinuationRejectsInvalidationClosureThatReachesContentStage(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-	if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "upstream-content-closure", []workflowkit.NodeID{nodes.RepoPrepare}, true)); !errors.Is(err, ErrTaskContinuationTarget) {
+	if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "upstream-content-closure", []workflowkit.NodeID{workflowadapter.RepoPrepare}, true)); !errors.Is(err, ErrTaskContinuationTarget) {
 		t.Fatalf("content-reaching invalidation closure error = %v, want ErrTaskContinuationTarget", err)
 	}
 }
@@ -306,9 +305,9 @@ func TestTaskContinuationStandardCatalogBlocksUnresolvedTaskRepairFindings(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	seedStandardLineageBeforeStage(t, ctx, fixture.dataStore, fixture.services.core.objects, fixture.run, fixture.revision, workflow, workflowkit.StageKey(nodes.TaskRepair))
+	seedStandardLineageBeforeStage(t, ctx, fixture.dataStore, fixture.services.core.objects, fixture.run, fixture.revision, workflow, workflowkit.StageKey(workflowadapter.TaskRepair))
 	fixture.services.Continuations.observer = storeContinuationStateObserver{dataStore: fixture.dataStore, objects: fixture.services.core.objects}
-	if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "unresolved-task-repair-findings", []workflowkit.NodeID{nodes.QualityCheck}, true)); !errors.Is(err, ErrTaskContinuationTarget) {
+	if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "unresolved-task-repair-findings", []workflowkit.NodeID{workflowadapter.QualityCheck}, true)); !errors.Is(err, ErrTaskContinuationTarget) {
 		t.Fatalf("unresolved task-repair findings error = %v, want ErrTaskContinuationTarget", err)
 	}
 }
@@ -320,7 +319,7 @@ func TestTaskContinuationReusesVerifiedV4ArtifactLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repoPrepare, exists := workflow.Stage(workflowkit.StageKey(nodes.RepoPrepare))
+	repoPrepare, exists := workflow.Stage(workflowkit.StageKey(workflowadapter.RepoPrepare))
 	if !exists {
 		t.Fatal("frozen workflow is missing repo_prepare")
 	}
@@ -335,19 +334,19 @@ func TestTaskContinuationReusesVerifiedV4ArtifactLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "reuse-v4-lineage", []workflowkit.NodeID{nodes.QualityCheck}, true))
+	plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "reuse-v4-lineage", []workflowkit.NodeID{workflowadapter.QualityCheck}, true))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, transition := range plan.Snapshot().Nodes {
-		if transition.NodeID == nodes.RepoPrepare {
+		if transition.NodeID == workflowadapter.RepoPrepare {
 			if transition.Disposition != workflowkit.DispositionPreserve || transition.ExpectedInputFingerprint != emptyInputs {
 				t.Fatalf("V4 lineage was not reused: %+v", transition)
 			}
 			return
 		}
 	}
-	t.Fatalf("missing %q transition", nodes.RepoPrepare)
+	t.Fatalf("missing %q transition", workflowadapter.RepoPrepare)
 }
 
 func TestTaskContinuationTreatsMissingAndCorruptArtifactObjectsAsUnavailable(t *testing.T) {
@@ -384,7 +383,7 @@ func TestTaskContinuationTreatsMissingAndCorruptArtifactObjectsAsUnavailable(t *
 			if err != nil {
 				t.Fatal(err)
 			}
-			repoPrepare, exists := workflow.Stage(workflowkit.StageKey(nodes.RepoPrepare))
+			repoPrepare, exists := workflow.Stage(workflowkit.StageKey(workflowadapter.RepoPrepare))
 			if !exists {
 				t.Fatal("frozen workflow is missing repo_prepare")
 			}
@@ -436,7 +435,7 @@ func TestTaskContinuationRejectsStaleAndExpiredPlans(t *testing.T) {
 	ctx := context.Background()
 	t.Run("stale checkpoint", func(t *testing.T) {
 		fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-		command := continuationCommand(t, ctx, fixture, "stale-checkpoint", []workflowkit.NodeID{nodes.QualityCheck}, false)
+		command := continuationCommand(t, ctx, fixture, "stale-checkpoint", []workflowkit.NodeID{workflowadapter.QualityCheck}, false)
 		command.Expected.Sequence++
 		if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, command); !errors.Is(err, store.ErrOptimisticLock) {
 			t.Fatalf("stale plan error = %v, want ErrOptimisticLock", err)
@@ -444,7 +443,7 @@ func TestTaskContinuationRejectsStaleAndExpiredPlans(t *testing.T) {
 	})
 	t.Run("expired frozen plan", func(t *testing.T) {
 		fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-		command := continuationCommand(t, ctx, fixture, "expired-plan", []workflowkit.NodeID{nodes.QualityCheck}, false)
+		command := continuationCommand(t, ctx, fixture, "expired-plan", []workflowkit.NodeID{workflowadapter.QualityCheck}, false)
 		plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, command)
 		if err != nil {
 			t.Fatal(err)
@@ -476,11 +475,11 @@ func TestTaskContinuationSupportsPausedAndCanceledRuns(t *testing.T) {
 func TestTaskContinuationExecuteUsesOneCASAndReplaysOneExecution(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
-	first, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "parallel-first", []workflowkit.NodeID{nodes.QualityCheck}, false))
+	first, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "parallel-first", []workflowkit.NodeID{workflowadapter.QualityCheck}, false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "parallel-second", []workflowkit.NodeID{nodes.SimilarityCheck}, false))
+	second, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "parallel-second", []workflowkit.NodeID{workflowadapter.SimilarityCheck}, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,13 +542,13 @@ func TestTaskContinuationBlocksInDoubtAndReconcilingEvidence(t *testing.T) {
 	ctx := context.Background()
 	t.Run("run in doubt", func(t *testing.T) {
 		fixture := newContinuationFixture(t, store.WorkflowRunInDoubt)
-		if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "run-in-doubt", []workflowkit.NodeID{nodes.QualityCheck}, false)); !errors.Is(err, store.ErrContinuationReconciliationRequired) {
+		if _, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "run-in-doubt", []workflowkit.NodeID{workflowadapter.QualityCheck}, false)); !errors.Is(err, store.ErrContinuationReconciliationRequired) {
 			t.Fatalf("in_doubt run plan error = %v, want ErrContinuationReconciliationRequired", err)
 		}
 	})
 	t.Run("stage reconciling before execute", func(t *testing.T) {
 		fixture := newContinuationFixture(t, store.WorkflowRunRunning)
-		plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "stage-reconciling", []workflowkit.NodeID{nodes.QualityCheck}, false))
+		plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "stage-reconciling", []workflowkit.NodeID{workflowadapter.QualityCheck}, false))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -563,7 +562,7 @@ func TestTaskContinuationBlocksInDoubtAndReconcilingEvidence(t *testing.T) {
 	})
 	t.Run("unknown side effect before execute", func(t *testing.T) {
 		fixture := newContinuationFixture(t, store.WorkflowRunRunning)
-		plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "side-effect-unknown", []workflowkit.NodeID{nodes.QualityCheck}, false))
+		plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx, continuationCommand(t, ctx, fixture, "side-effect-unknown", []workflowkit.NodeID{workflowadapter.QualityCheck}, false))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -596,7 +595,7 @@ func newContinuationFixture(t *testing.T, terminal store.WorkflowRunStatus) cont
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dataStore.Close() })
-	services, err := NewLifecycleServices(root, dataStore)
+	services, err := newLifecycleServicesForTest(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +611,7 @@ func newContinuationFixture(t *testing.T, terminal store.WorkflowRunStatus) cont
 		t.Fatal(err)
 	}
 	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "continue-fixture", Actor: "tester", Reason: "freeze fixture",
+		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "continue-fixture", Actor: "tester", Reason: "freeze fixture",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -688,7 +687,7 @@ func controlledNoContentFixtureState(workflow workflowkit.WorkflowDescriptor) (c
 			CurrentInputs:            bindings,
 		})
 	}
-	state.Latest[workflowkit.NodeID(nodes.QualityCheck)] = store.StageAttempt{StageKey: nodes.QualityCheck, ExecutionStatus: store.StageExecutionInfraFailed}
+	state.Latest[workflowkit.NodeID(workflowadapter.QualityCheck)] = store.StageAttempt{StageKey: workflowadapter.QualityCheck, ExecutionStatus: store.StageExecutionInfraFailed}
 	return state, nil
 }
 
@@ -843,7 +842,7 @@ func continuationCommand(t *testing.T, ctx context.Context, fixture continuation
 		TargetNodeIDs: append([]workflowkit.NodeID(nil), targets...),
 		ForceSelected: force,
 		ExternalEffectConfirmations: []workflowkit.ExternalEffectConfirmation{{
-			NodeID: nodes.Package, IdempotencyKey: key + ":package", Actor: "tester", ConfirmedAt: time.Now().UTC(),
+			NodeID: workflowadapter.Package, IdempotencyKey: key + ":package", Actor: "tester", ConfirmedAt: time.Now().UTC(),
 		}},
 		Actor:  "tester",
 		Reason: fmt.Sprintf("continue fixture %s", key),
@@ -857,7 +856,7 @@ func createReconcilingStage(t *testing.T, ctx context.Context, fixture continuat
 		t.Fatal(err)
 	}
 	stage, err := fixture.dataStore.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
-		RunID: fixture.run.ID, StageKey: nodes.QualityCheck, StageGroup: "quality", Ordinal: 2,
+		RunID: fixture.run.ID, StageKey: workflowadapter.QualityCheck, StageGroup: "quality", Ordinal: 2,
 		InputFingerprint: string(emptyInputs), BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`, Actor: "tester", Reason: "reconcile fixture",
 	})
 	if err != nil {

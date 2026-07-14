@@ -18,15 +18,7 @@ func TestMigrateV8OutboxEventToFencedDispatcher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(migrationV1); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
 	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (1)`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}

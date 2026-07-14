@@ -30,7 +30,7 @@ func TestRunControlAndBudgetCommandsUseLifecycleServices(t *testing.T) {
 		t.Fatal(err)
 	}
 	run, err := services.Runs.StartRun(ctx, app.StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: commandCompleteProfile(t), Trigger: "verify",
+		TaskID: task.ID, RevisionID: revision.ID, Profile: commandCompleteProfile(t), ExecutionSpec: commandExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify",
 		Actor: actor, Reason: "start CLI control fixture",
 	})
 	if err != nil {
@@ -156,7 +156,13 @@ func TestRunControlCommandRequiresOperationKeyAndRejectsGraceOverride(t *testing
 func commandCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
 	t.Helper()
 	catalog := workflowadapter.StandardStageCatalog()
-	profile := workflowadapter.ExecutionProfile{ID: "command-integration", Version: "1", ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ControlGracePeriod: 30 * time.Second}
+	profile := workflowadapter.ExecutionProfile{
+		Template:            workflowadapter.StandardTemplateReference(),
+		ID:                  "command-integration",
+		Version:             "1",
+		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL,
+		ControlGracePeriod:  30 * time.Second,
+	}
 	for _, stage := range catalog.Stages {
 		turns := stage.RequiredTurns
 		profile.Stages = append(profile.Stages, workflowadapter.StageBudget{
@@ -171,4 +177,24 @@ func commandCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
 		})
 	}
 	return profile
+}
+
+func TestCommandCompleteProfileFreezesStandardTemplateInProfileJSON(t *testing.T) {
+	profile := commandCompleteProfile(t)
+	if !profile.Template.Equal(workflowadapter.StandardTemplateReference()) {
+		t.Fatalf("command profile template = %#v, want %#v", profile.Template, workflowadapter.StandardTemplateReference())
+	}
+	raw, err := profile.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonical command profile: %v", err)
+	}
+	var document struct {
+		Template workflowadapter.TemplateReference `json:"template"`
+	}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatalf("decode canonical command profile: %v", err)
+	}
+	if !document.Template.Equal(workflowadapter.StandardTemplateReference()) {
+		t.Fatalf("canonical command profile template = %#v, want %#v", document.Template, workflowadapter.StandardTemplateReference())
+	}
 }

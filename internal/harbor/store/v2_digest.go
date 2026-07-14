@@ -7,8 +7,7 @@ import (
 const taskDigestV2Prefix = taskpolicy.TaskDigestV2Prefix
 
 // ValidateTaskDigestV2 is shared by the task-policy boundary and the durable
-// store. V1 evidence has no compatible namespace and cannot be persisted as a
-// V2 TaskRevision digest.
+// store. Only canonical V2 digests can be persisted as TaskRevision evidence.
 func ValidateTaskDigestV2(digest string) error {
 	return taskpolicy.ValidateV2TaskDigest(digest)
 }

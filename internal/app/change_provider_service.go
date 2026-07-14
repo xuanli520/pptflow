@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/runtime/codexruntime"
@@ -181,11 +181,13 @@ type normalizedChangeCommand struct {
 }
 
 type normalizedTaskChange struct {
-	ProviderID      string          `json:"provider_id"`
-	OperationKey    string          `json:"operation_key"`
-	Payload         json.RawMessage `json:"payload"`
-	Findings        FindingBundle   `json:"findings"`
-	MaxRepairRounds int             `json:"max_repair_rounds,omitempty"`
+	ProviderID         string          `json:"provider_id"`
+	OperationKey       string          `json:"operation_key"`
+	Payload            json.RawMessage `json:"payload"`
+	Findings           FindingBundle   `json:"findings"`
+	MaxRepairRounds    int             `json:"max_repair_rounds,omitempty"`
+	RepairSessionID    string          `json:"repair_session_id,omitempty"`
+	RepairRoundOrdinal int             `json:"repair_round_ordinal,omitempty"`
 }
 
 func (service *ChangeProviderService) normalizeChangeCommand(ctx context.Context, command ContinueTaskCommand, change TaskChangeRequest) (normalizedChangeCommand, ChangeProvider, error) {
@@ -209,21 +211,35 @@ func (service *ChangeProviderService) normalizeChangeCommand(ctx context.Context
 	if err != nil {
 		return normalizedChangeCommand{}, nil, fmt.Errorf("validate %s payload: %w", providerID, err)
 	}
-	if err := change.Findings.Validate(command.Expected.SubjectRevisionID, string(command.Expected.SubjectDigest)); err != nil {
-		return normalizedChangeCommand{}, nil, err
-	}
-	if err := service.validateFindingEvidence(ctx, command.RunID, command.Expected.SubjectRevisionID, string(command.Expected.SubjectDigest), change.Findings); err != nil {
-		return normalizedChangeCommand{}, nil, err
-	}
 	if providerID == AgentRepairProviderID && change.MaxRepairRounds <= 0 {
 		return normalizedChangeCommand{}, nil, fmt.Errorf("automated repair requires max repair rounds")
 	}
 	if providerID != AgentRepairProviderID && change.MaxRepairRounds != 0 {
 		return normalizedChangeCommand{}, nil, fmt.Errorf("manual patch does not accept automatic repair rounds")
 	}
+	if change.repairSessionID != "" {
+		if err := service.validateAutomaticRepairRound(ctx, command, change, providerID); err != nil {
+			return normalizedChangeCommand{}, nil, err
+		}
+	} else if providerID == LocalPatchProviderID && len(change.Findings.Findings) == 0 {
+		// A direct local unified-diff edit is a user-authored content change rather
+		// than a repair response. It still binds to the exact Run/revision
+		// checkpoint, but it has no fabricated checker artifact.
+		if change.Findings.Format != "harbor.findings.v1" || change.Findings.RevisionID != command.Expected.SubjectRevisionID || change.Findings.RevisionDigest != string(command.Expected.SubjectDigest) {
+			return normalizedChangeCommand{}, nil, fmt.Errorf("manual patch without findings must bind the selected revision checkpoint")
+		}
+	} else {
+		if err := change.Findings.Validate(command.Expected.SubjectRevisionID, string(command.Expected.SubjectDigest)); err != nil {
+			return normalizedChangeCommand{}, nil, err
+		}
+		if err := service.validateFindingEvidence(ctx, command.RunID, command.Expected.SubjectRevisionID, string(command.Expected.SubjectDigest), change.Findings); err != nil {
+			return normalizedChangeCommand{}, nil, err
+		}
+	}
 	return normalizedChangeCommand{
 		Format: "harbor.content-continuation-command.v1", Command: normalizedCommand,
-		Change: normalizedTaskChange{ProviderID: providerID, OperationKey: operationKey, Payload: payload, Findings: change.Findings, MaxRepairRounds: change.MaxRepairRounds},
+		Change: normalizedTaskChange{ProviderID: providerID, OperationKey: operationKey, Payload: payload, Findings: change.Findings, MaxRepairRounds: change.MaxRepairRounds,
+			RepairSessionID: change.repairSessionID, RepairRoundOrdinal: change.repairRoundOrdinal},
 	}, provider, nil
 }
 
@@ -334,15 +350,26 @@ func (service *ChangeProviderService) ensureCandidate(ctx context.Context, comma
 	repairSessionID := ""
 	round := 0
 	if normalized.Change.ProviderID == AgentRepairProviderID {
-		session, err := service.core.store.CreateRepairSession(ctx, store.CreateRepairSessionRequest{
-			CommandID: commandRecord.ID, SubjectID: task.ID, BaseRevisionID: revision.ID, MaxRounds: normalized.Change.MaxRepairRounds,
-			FindingsJSON: mustJSON(normalized.Change.Findings), PolicyJSON: mustJSON(map[string]any{"format": "harbor.repair-policy.v1", "max_rounds": normalized.Change.MaxRepairRounds}),
-			IdempotencyKey: "repair-session:" + commandRecord.ID, Actor: command.Actor, Reason: command.Reason,
-		})
-		if err != nil {
-			return store.RevisionCandidate{}, err
+		if normalized.Change.RepairSessionID != "" {
+			session, err := service.core.store.GetRepairSession(ctx, normalized.Change.RepairSessionID)
+			if err != nil {
+				return store.RevisionCandidate{}, err
+			}
+			if session == nil || session.Status != store.RepairSessionOpen || normalized.Change.RepairRoundOrdinal <= 1 || normalized.Change.RepairRoundOrdinal > session.MaxRounds {
+				return store.RevisionCandidate{}, fmt.Errorf("automatic repair session round is not actionable")
+			}
+			repairSessionID, round = session.ID, normalized.Change.RepairRoundOrdinal
+		} else {
+			session, err := service.core.store.CreateRepairSession(ctx, store.CreateRepairSessionRequest{
+				CommandID: commandRecord.ID, SubjectID: task.ID, BaseRevisionID: revision.ID, MaxRounds: normalized.Change.MaxRepairRounds,
+				FindingsJSON: mustJSON(normalized.Change.Findings), PolicyJSON: mustJSON(map[string]any{"format": "harbor.repair-policy.v1", "max_rounds": normalized.Change.MaxRepairRounds}),
+				IdempotencyKey: "repair-session:" + commandRecord.ID, Actor: command.Actor, Reason: command.Reason,
+			})
+			if err != nil {
+				return store.RevisionCandidate{}, err
+			}
+			repairSessionID, round = session.ID, 1
 		}
-		repairSessionID, round = session.ID, 1
 	}
 	candidate, err := service.core.store.CreateRevisionCandidate(ctx, store.CreateRevisionCandidateRequest{
 		ID: candidateID, TaskID: task.ID, SourceRunID: run.ID, CommandID: commandRecord.ID, RepairSessionID: repairSessionID,
@@ -441,11 +468,11 @@ func (service *ChangeProviderService) prepareCandidateChange(ctx context.Context
 		}
 		return started, store.PreparedChange{}, store.MutationReceipt{}, fmt.Errorf("%w: %v", ErrChangeReconciliationRequired, applyErr)
 	}
-	if err := harborrun.ValidateManagedTaskSnapshotV2(checkout); err != nil {
+	if err := taskpolicy.ValidateManagedSnapshotV2(checkout); err != nil {
 		_, _, _ = service.core.store.MarkChangeOperationUnknown(ctx, started.ID, started.Version, command.Actor, "provider output violated strict managed task policy")
 		return started, store.PreparedChange{}, store.MutationReceipt{}, fmt.Errorf("%w: validate candidate after provider: %v", ErrChangeReconciliationRequired, err)
 	}
-	afterDigest, err := harborrun.ComputeManagedTaskDigestV2(checkout)
+	afterDigest, err := taskpolicy.ComputeManagedTaskDigestV2(checkout)
 	if err != nil {
 		return started, store.PreparedChange{}, store.MutationReceipt{}, err
 	}
@@ -869,10 +896,10 @@ func (service *ChangeProviderService) ensureCandidateFinalSnapshot(ctx context.C
 		return "", err
 	}
 	path := service.core.layout.snapshotDirectory(candidate.TaskID, candidate.TargetRevisionID)
-	if validateErr := harborrun.ValidateManagedTaskSnapshotV2(path); validateErr != nil {
+	if validateErr := taskpolicy.ValidateManagedSnapshotV2(path); validateErr != nil {
 		return "", fmt.Errorf("validate recovered candidate final snapshot: %w", validateErr)
 	}
-	digest, digestErr := harborrun.ComputeManagedTaskDigestV2(path)
+	digest, digestErr := taskpolicy.ComputeManagedTaskDigestV2(path)
 	if digestErr != nil || digest != candidate.AfterDigest {
 		return "", fmt.Errorf("recovered candidate final snapshot digest mismatch: %v", digestErr)
 	}
@@ -892,11 +919,62 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(candidate 
 	if err := decodeStrictJSON(source.RunManifestJSON, &original); err != nil {
 		return "", err
 	}
+	catalogReceipt, err := canonicalManifestDeploymentCatalogReceipt(original)
+	if err != nil {
+		return "", fmt.Errorf("decode source run deployment catalog receipt: %w", err)
+	}
+	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(original)
+	if err != nil {
+		return "", fmt.Errorf("decode source run deployment catalog lock identity: %w", err)
+	}
+	if err := service.core.verifyRunDeploymentCatalogReceipt(source); err != nil {
+		return "", fmt.Errorf("verify source run deployment catalog receipt: %w", err)
+	}
+	if err := original.InitialExecutionPlan.Validate(original.Resolved.Descriptor); err != nil {
+		return "", fmt.Errorf("validate source run initial execution plan: %w", err)
+	}
 	manifest := runManifest{Format: "harbor.workflow-run-manifest.v2", RunID: candidate.TargetRunID, TaskID: candidate.TaskID,
-		Revision: candidate.TargetRevisionID, Resolved: original.Resolved.Clone(), Created: service.core.now().UTC()}
+		Revision: candidate.TargetRevisionID, Resolved: original.Resolved.Clone(), InitialExecutionPlan: original.InitialExecutionPlan.Clone(),
+		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
+		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity), Created: service.core.now().UTC()}
 	path := filepath.Join(service.core.layout.runDirectory(candidate.TargetRunID), "run-manifest.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return "", err
+	}
+	if len(catalogReceipt) != 0 {
+		receiptPath := filepath.Join(filepath.Dir(path), deploymentCatalogReceiptFileName)
+		if err := writeNewBytes(receiptPath, catalogReceipt); err != nil {
+			if !os.IsExist(err) {
+				return "", fmt.Errorf("write candidate child deployment catalog receipt: %w", err)
+			}
+			existingReceipt, readErr := readManagedRunReceiptFile(receiptPath)
+			if readErr != nil {
+				return "", readErr
+			}
+			if !bytes.Equal(existingReceipt, catalogReceipt) {
+				return "", fmt.Errorf("existing candidate child deployment catalog receipt conflicts")
+			}
+		}
+	}
+	if lockIdentity != nil {
+		canonicalLockIdentity, lockErr := canonicalDeploymentCatalogLockIdentity(*lockIdentity)
+		if lockErr != nil {
+			return "", fmt.Errorf("canonicalize candidate child deployment catalog lock identity: %w", lockErr)
+		}
+		lockPath := filepath.Join(filepath.Dir(path), deploymentCatalogLockIdentityFileName)
+		if lockErr := writeNewBytes(lockPath, canonicalLockIdentity); lockErr != nil {
+			if !os.IsExist(lockErr) {
+				return "", fmt.Errorf("write candidate child deployment catalog lock identity: %w", lockErr)
+			}
+			existingLockIdentityRaw, readErr := readManagedRunLockIdentityFile(lockPath)
+			if readErr != nil {
+				return "", readErr
+			}
+			existingLockIdentity, existingCanonicalLockIdentity, parseErr := parseDeploymentCatalogLockIdentityJSON(existingLockIdentityRaw)
+			if parseErr != nil || !bytes.Equal(existingLockIdentityRaw, existingCanonicalLockIdentity) || existingLockIdentity != *lockIdentity {
+				return "", fmt.Errorf("existing candidate child deployment catalog lock identity conflicts: %v", parseErr)
+			}
+		}
 	}
 	if err := writeNewJSON(path, manifest); err != nil {
 		if !os.IsExist(err) {
@@ -907,7 +985,7 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(candidate 
 			return "", readErr
 		}
 		var existing runManifest
-		if decodeErr := decodeStrictJSON(string(raw), &existing); decodeErr != nil || existing.RunID != manifest.RunID || existing.TaskID != manifest.TaskID || existing.Revision != manifest.Revision {
+		if decodeErr := decodeStrictJSON(string(raw), &existing); decodeErr != nil || existing.RunID != manifest.RunID || existing.TaskID != manifest.TaskID || existing.Revision != manifest.Revision || !manifestMatchesDeploymentCatalogReceipt(existing, catalogReceipt) || !manifestMatchesDeploymentCatalogLockIdentity(existing, lockIdentity) {
 			return "", fmt.Errorf("existing candidate child run manifest conflicts: %v", decodeErr)
 		}
 		return string(raw), nil

@@ -405,6 +405,202 @@ func TestTaskHubRunControlConfirmationCarriesCapturedCheckpoint(t *testing.T) {
 	}
 }
 
+func TestTaskHubMutationOverlayCollectsActionSpecificTypedInputs(t *testing.T) {
+	cases := []struct {
+		name   string
+		action TaskHubAction
+		values map[string]string
+	}{
+		{name: "create", action: TaskHubActionNewTask, values: map[string]string{taskHubTaskSlugField: "typed-create", taskHubTaskTitleField: "Typed Create", taskHubTaskMetadataJSONField: `{"kind":"fixture"}`}},
+		{name: "import", action: TaskHubActionImportTask, values: map[string]string{taskHubTaskSlugField: "typed-import", taskHubTaskTitleField: "Typed Import", taskHubImportSourcePathField: "/managed/snapshot"}},
+		{name: "fork", action: TaskHubActionForkTask, values: map[string]string{taskHubTaskSlugField: "typed-fork", taskHubTaskTitleField: "Typed Fork"}},
+		{name: "restore", action: TaskHubActionRestoreTask, values: map[string]string{taskHubRestoreStateField: "ready"}},
+		{name: "start", action: TaskHubActionStartRun, values: map[string]string{taskHubExecutionProfilePathField: "/profiles/explicit.json", taskHubExecutionSpecPathField: "/specs/frozen.json", taskHubRunTriggerField: "task_hub"}},
+		{name: "edit", action: TaskHubActionEditTask, values: map[string]string{taskHubUnifiedDiffField: "--- a/instruction.md\n+++ b/instruction.md\n@@ -1 +1 @@\n-old\n+new"}},
+		{name: "package", action: TaskHubActionPackageRevision, values: map[string]string{taskHubPackageVersionField: "v1.2.3"}},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			overlay, err := newTaskHubMutationOverlay(testCase.action, TaskHubTarget{}, TaskHubPlanPreview{ConfirmationNeeded: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			overlay.ReasonInput.SetValue("typed form fixture")
+			for field, value := range testCase.values {
+				setTaskHubMutationFormValue(t, overlay, field, value)
+			}
+			if err := overlay.validate(); err != nil {
+				t.Fatalf("validate %s form: %v", testCase.action, err)
+			}
+			request := overlay.request()
+			for field, want := range testCase.values {
+				if got := request.Values[field]; got != want {
+					t.Fatalf("request value %s = %q, want %q", field, got, want)
+				}
+			}
+			if err := store.ValidateUUIDv7(request.IdempotencyKey); err != nil {
+				t.Fatalf("form idempotency key %q is not UUIDv7: %v", request.IdempotencyKey, err)
+			}
+		})
+	}
+}
+
+func TestTaskHubRunStartFormRequiresIndependentProfileAndExecutionSpecPaths(t *testing.T) {
+	overlay, err := newTaskHubMutationOverlay(TaskHubActionStartRun, TaskHubTarget{TaskID: "task-1", RevisionID: "revision-1"}, TaskHubPlanPreview{ConfirmationNeeded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay.ReasonInput.SetValue("start frozen run")
+	setTaskHubMutationFormValue(t, overlay, taskHubExecutionProfilePathField, "/profiles/explicit.json")
+	setTaskHubMutationFormValue(t, overlay, taskHubRunTriggerField, "task_hub")
+	if err := overlay.validate(); err == nil || !strings.Contains(err.Error(), "Execution spec JSON") {
+		t.Fatalf("profile-only start form validation = %v, want execution-spec path error", err)
+	}
+
+	setTaskHubMutationFormValue(t, overlay, taskHubExecutionProfilePathField, "")
+	setTaskHubMutationFormValue(t, overlay, taskHubExecutionSpecPathField, "/specs/frozen.json")
+	if err := overlay.validate(); err == nil || !strings.Contains(err.Error(), "Execution profile JSON") {
+		t.Fatalf("execution-spec-only start form validation = %v, want profile path error", err)
+	}
+
+	setTaskHubMutationFormValue(t, overlay, taskHubExecutionProfilePathField, "/profiles/explicit.json")
+	if err := overlay.validate(); err != nil {
+		t.Fatalf("complete start form validation: %v", err)
+	}
+	wantOrder := []string{"reason", taskHubExecutionProfilePathField, taskHubExecutionSpecPathField, taskHubRunTriggerField}
+	if len(overlay.FieldOrder) != len(wantOrder) {
+		t.Fatalf("start form field order = %#v, want %#v", overlay.FieldOrder, wantOrder)
+	}
+	for index, want := range wantOrder {
+		if got := overlay.FieldOrder[index]; got != want {
+			t.Fatalf("start form field %d = %q, want %q", index, got, want)
+		}
+	}
+	request := overlay.request()
+	if request.Values[taskHubExecutionProfilePathField] != "/profiles/explicit.json" || request.Values[taskHubExecutionSpecPathField] != "/specs/frozen.json" || request.Values[taskHubRunTriggerField] != "task_hub" {
+		t.Fatalf("independent start paths were not preserved in request: %+v", request.Values)
+	}
+	if rendered := overlay.View(100, 30); !strings.Contains(rendered, "Execution profile JSON") || !strings.Contains(rendered, "Execution spec JSON") {
+		t.Fatalf("start form did not render both explicit path inputs:\n%s", rendered)
+	}
+}
+
+func TestTaskHubRunStartFormErrorRetainsPathsAndIdempotencyKeyForRetry(t *testing.T) {
+	service := &fakeTaskHubLifecycle{snapshot: enabledTaskHubSnapshot()}
+	m, cleanup := newTestTaskHubV2Model(t, service)
+	defer cleanup()
+
+	overlay, err := newTaskHubMutationOverlay(TaskHubActionStartRun, TaskHubTarget{TaskID: "task-1", RevisionID: "revision-1"}, TaskHubPlanPreview{ConfirmationNeeded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay.ReasonInput.SetValue("start after input validation")
+	setTaskHubMutationFormValue(t, overlay, taskHubExecutionProfilePathField, "/profiles/explicit.json")
+	setTaskHubMutationFormValue(t, overlay, taskHubExecutionSpecPathField, "/specs/frozen.json")
+	setTaskHubMutationFormValue(t, overlay, taskHubRunTriggerField, "task_hub")
+	m.taskHubMutation = overlay
+	key := overlay.IdempotencyKey
+	service.mu.Lock()
+	service.err = errors.New("freeze execution inputs failed")
+	service.mu.Unlock()
+
+	updated, first := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if first == nil {
+		t.Fatal("start form submission did not create a deferred mutation command")
+	}
+	updated, _ = m.Update(first())
+	m = updated.(model)
+	if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != key || m.taskHubMutation.Phase != taskHubMutationReady || m.taskHubMutation.Error == "" || m.taskHubMutation.isFrozen() {
+		t.Fatalf("failed StartRun input freeze did not retain retryable form: %+v", m.taskHubMutation)
+	}
+	if m.taskHubMutation.ValueInputs[taskHubExecutionProfilePathField].Value() != "/profiles/explicit.json" || m.taskHubMutation.ValueInputs[taskHubExecutionSpecPathField].Value() != "/specs/frozen.json" || m.taskHubMutation.ValueInputs[taskHubRunTriggerField].Value() != "task_hub" {
+		t.Fatalf("failed start mutation lost independent input paths: %+v", m.taskHubMutation.ValueInputs)
+	}
+
+	service.mu.Lock()
+	service.err = nil
+	service.mu.Unlock()
+	updated, retry := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if retry == nil {
+		t.Fatal("start form retry did not create a deferred input-freeze command")
+	}
+	updated, _ = m.Update(retry())
+	m = updated.(model)
+	if m.taskHubMutation == nil || !m.taskHubMutation.isFrozen() || m.taskHubMutation.IdempotencyKey != key {
+		t.Fatalf("successful StartRun input freeze did not retain final confirmation: %+v", m.taskHubMutation)
+	}
+	updated, execute := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if execute == nil {
+		t.Fatal("frozen StartRun did not create a deferred execution command")
+	}
+	updated, _ = m.Update(execute())
+	m = updated.(model)
+	if m.taskHubMutation != nil {
+		t.Fatalf("successful frozen StartRun did not close confirmation: %+v", m.taskHubMutation)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.prepareCommands) != 2 {
+		t.Fatalf("StartRun input-freeze attempts = %d, want 2", len(service.prepareCommands))
+	}
+	for index, request := range service.prepareCommands {
+		if request.IdempotencyKey != key || request.Values[taskHubExecutionProfilePathField] != "/profiles/explicit.json" || request.Values[taskHubExecutionSpecPathField] != "/specs/frozen.json" || request.Values[taskHubRunTriggerField] != "task_hub" {
+			t.Fatalf("StartRun freeze attempt %d lost retry inputs or idempotency key: %+v", index, request)
+		}
+	}
+	if len(service.mutationCommands) != 1 || service.mutationCommands[0].IdempotencyKey != key || service.mutationCommands[0].PlanID == "" {
+		t.Fatalf("frozen StartRun execution = %+v, want one final command with retained plan/key", service.mutationCommands)
+	}
+}
+
+func TestTaskHubMutationOverlayRejectsInvalidRestoreStateAndKeepsDiffEditable(t *testing.T) {
+	restore, err := newTaskHubMutationOverlay(TaskHubActionRestoreTask, TaskHubTarget{}, TaskHubPlanPreview{ConfirmationNeeded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore.ReasonInput.SetValue("restore fixture")
+	setTaskHubMutationFormValue(t, restore, taskHubRestoreStateField, "deleted")
+	if err := restore.validate(); err == nil || !strings.Contains(err.Error(), "draft") {
+		t.Fatalf("invalid restore state error = %v", err)
+	}
+
+	edit, err := newTaskHubMutationOverlay(TaskHubActionEditTask, TaskHubTarget{}, TaskHubPlanPreview{ConfirmationNeeded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit.ReasonInput.SetValue("patch fixture")
+	edit.focusInput(1)
+	if !edit.focusedInputIsMultiline() {
+		t.Fatal("unified diff field was not a native multiline input")
+	}
+	setTaskHubMutationFormValue(t, edit, taskHubUnifiedDiffField, "--- a/task.toml\n+++ b/task.toml\n@@ -1 +1 @@\n-old\n+new\n")
+	if err := edit.validate(); err != nil {
+		t.Fatalf("valid unified diff form rejected: %v", err)
+	}
+	if rendered := edit.View(100, 40); !strings.Contains(rendered, "Unified diff") || !strings.Contains(rendered, "--- a/task.toml") || !strings.Contains(rendered, "Ctrl+S") {
+		t.Fatalf("manual patch form did not render native multiline input controls:\n%s", rendered)
+	}
+}
+
+func setTaskHubMutationFormValue(t *testing.T, overlay *TaskHubMutationOverlay, field, value string) {
+	t.Helper()
+	if input, found := overlay.TextAreaInputs[field]; found {
+		input.SetValue(value)
+		overlay.TextAreaInputs[field] = input
+		return
+	}
+	input, found := overlay.ValueInputs[field]
+	if !found {
+		t.Fatalf("form has no input for field %q", field)
+	}
+	input.SetValue(value)
+	overlay.ValueInputs[field] = input
+}
+
 type lateReplyTaskHubAdapter struct {
 	*AppTaskHubLifecycleAdapter
 	failFirstMutationReply bool
@@ -450,7 +646,7 @@ func newTaskHubReviewMutationFixture(t *testing.T) (context.Context, *app.Lifecy
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dataStore.Close() })
-	services, err := app.NewLifecycleServices(root, dataStore)
+	services, err := newTaskHubAdapterLifecycleServices(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +677,7 @@ func newTaskHubMultipleReviewMutationFixture(t *testing.T) (context.Context, *ap
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dataStore.Close() })
-	services, err := app.NewLifecycleServices(root, dataStore)
+	services, err := newTaskHubAdapterLifecycleServices(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +712,7 @@ func newTaskHubLocalPackageMutationFixture(t *testing.T) (context.Context, *app.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dataStore.Close() })
-	services, err := app.NewLifecycleServices(root, dataStore)
+	services, err := newTaskHubAdapterLifecycleServices(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}

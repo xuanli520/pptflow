@@ -104,16 +104,16 @@ type ReleaseWithdrawOperation struct {
 // ReleaseWithdrawReceipt is an immutable confirmation of the exact release
 // record version that was withdrawn by a durable operation.
 type ReleaseWithdrawReceipt struct {
-	ID                   string
-	OperationID          string
-	ReleaseID            string
-	ReleaseVersion       string
+	ID                    string
+	OperationID           string
+	ReleaseID             string
+	ReleaseVersion        string
 	ExpectedRecordVersion int64
-	ResultRecordVersion  int64
-	ReceiptJSON          string
-	ReceiptDigest        string
-	CreatedBy            string
-	CreatedAt            time.Time
+	ResultRecordVersion   int64
+	ReceiptJSON           string
+	ReceiptDigest         string
+	CreatedBy             string
+	CreatedAt             time.Time
 }
 
 type ExecuteReleaseWithdrawRequest struct {

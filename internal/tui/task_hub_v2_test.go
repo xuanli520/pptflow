@@ -9,7 +9,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/purplevoid/harbor-factory/internal/app"
 )
 
 func TestAggregateTaskHubGroupsRunsByStableTaskID(t *testing.T) {
@@ -121,6 +120,23 @@ func TestTaskHubV2DisabledReasonIsShownAndDoesNotPlan(t *testing.T) {
 	}
 	if command == nil || !strings.Contains(m.notice, "存在活跃 Run") {
 		t.Fatalf("disabled action did not explain reason: notice=%q cmd=%v", m.notice, command)
+	}
+}
+
+func TestTaskHubEditActionRequiresSelectedCurrentRevisionRun(t *testing.T) {
+	snapshot := enabledTaskHubSnapshot()
+	snapshot.Tasks[0].Actions = append(snapshot.Tasks[0].Actions, TaskHubActionState{
+		Action: TaskHubActionEditTask, DisabledReason: "需要选择当前 TaskRevision 对应的 Run",
+	})
+	service := &fakeTaskHubLifecycle{snapshot: snapshot}
+	m, cleanup := newTestTaskHubV2Model(t, service)
+	defer cleanup()
+	if state := m.taskHubActionState(TaskHubActionEditTask); !state.Enabled {
+		t.Fatalf("selected current-revision Run did not enable manual patch: %+v", state)
+	}
+	m.taskHub.Snapshot.Runs[0].RevisionID = "revision-old"
+	if state := m.taskHubActionState(TaskHubActionEditTask); state.Enabled || !strings.Contains(state.DisabledReason, "选择") {
+		t.Fatalf("stale Run revision enabled manual patch: %+v", state)
 	}
 }
 
@@ -457,15 +473,15 @@ func TestRunWithLifecycleStartsServiceBackedHubWithoutLegacyStore(t *testing.T) 
 		captured = model
 		return fakeTeaProgram{model: model}
 	}
-	if err := RunWithLifecycle(context.Background(), app.RunnerOptions{Workspace: "/not-used-by-v2"}, service); err != nil {
+	if err := RunWithLifecycle(context.Background(), service); err != nil {
 		t.Fatalf("run V2 lifecycle hub: %v", err)
 	}
 	got, ok := captured.(model)
 	if !ok {
 		t.Fatalf("captured model type = %T, want tui model", captured)
 	}
-	if got.lifecycle == nil || got.store != nil || got.scheduler != nil || got.view != viewHub {
-		t.Fatalf("V2 lifecycle hub initialized legacy state: lifecycle=%v store=%v scheduler=%v view=%v", got.lifecycle != nil, got.store, got.scheduler, got.view)
+	if got.lifecycle == nil || got.view != viewHub {
+		t.Fatalf("V2 lifecycle hub did not initialize the lifecycle page: lifecycle=%v view=%v", got.lifecycle != nil, got.view)
 	}
 }
 
@@ -591,7 +607,7 @@ func (service *fakeTaskHubLifecycle) lastControlPlanCommand() TaskHubRunControlC
 func newTestTaskHubV2Model(t *testing.T, service TaskHubLifecycleService) (model, func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	m := initialLifecycleHubModel(ctx, cancel, app.RunnerOptions{}, service)
+	m := initialLifecycleHubModel(ctx, cancel, service)
 	m.width, m.height = 100, 30
 	loaded := m.loadTaskHubV2()().(taskHubLoadedMsg)
 	if loaded.err != nil {

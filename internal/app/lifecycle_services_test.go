@@ -9,11 +9,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/internal/testsupport"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
+
+func newLifecycleServicesForTest(root string, dataStore *store.Store) (*LifecycleServices, error) {
+	return NewLifecycleServicesWithOptions(root, dataStore, LifecycleServicesOptions{
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+	})
+}
 
 func TestLifecycleServicesMaterializeImmutableRevisionAndGateCurrentPromotion(t *testing.T) {
 	ctx := context.Background()
@@ -23,7 +30,7 @@ func TestLifecycleServicesMaterializeImmutableRevisionAndGateCurrentPromotion(t 
 		t.Fatal(err)
 	}
 	defer dataStore.Close()
-	services, err := NewLifecycleServices(root, dataStore)
+	services, err := newLifecycleServicesForTest(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +50,7 @@ func TestLifecycleServicesMaterializeImmutableRevisionAndGateCurrentPromotion(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := harborrun.ComputeManagedTaskDigestV2(snapshot); err != nil || got != revision.TaskDigest {
+	if got, err := taskpolicy.ComputeManagedTaskDigestV2(snapshot); err != nil || got != revision.TaskDigest {
 		t.Fatalf("managed snapshot digest = %q, %v; want %q", got, err, revision.TaskDigest)
 	}
 	if err := os.WriteFile(filepath.Join(source, "instruction.md"), []byte("source was changed\n"), 0o644); err != nil {
@@ -167,7 +174,7 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 		t.Fatal(err)
 	}
 	defer dataStore.Close()
-	services, err := NewLifecycleServices(root, dataStore)
+	services, err := newLifecycleServicesForTest(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +186,7 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Trigger: "verify"}); err == nil {
+	if _, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify"}); err == nil {
 		t.Fatal("run accepted an absent implicit profile")
 	}
 	profile := lifecycleCompleteProfile(t)
@@ -187,6 +194,7 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 		TaskID:         task.ID,
 		RevisionID:     revision.ID,
 		Profile:        profile,
+		ExecutionSpec:  lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
 		Trigger:        "verify",
 		ExecutionEpoch: 0,
 		Actor:          "tester",
@@ -227,12 +235,19 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Resolved.DefinitionFingerprint == "" || manifest.Resolved.ExecutionProfileFingerprint == "" || manifest.Resolved.ContinuationPlanTTL != workflowadapter.RequiredContinuationPlanTTL {
+	if manifest.Resolved.DefinitionFingerprint == "" || manifest.Resolved.ExecutionProfileFingerprint == "" || manifest.Resolved.ContinuationPlanTTL != workflowadapter.RequiredContinuationPlanTTL || manifest.Inputs == nil || manifest.Inputs.ExecutionSpecFingerprint == "" || len(manifest.ExecutionSpec) == 0 {
 		t.Fatalf("run manifest is not frozen: %+v", manifest)
+	}
+	expectedInitialPlan, err := workflowkit.CompileDependencyExecutionPlan(manifest.Resolved.Descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.InitialExecutionPlan.Validate(manifest.Resolved.Descriptor); err != nil || manifest.InitialExecutionPlan.Fingerprint != expectedInitialPlan.Fingerprint {
+		t.Fatalf("run manifest initial execution plan = %+v, err=%v; want frozen dependency plan %s", manifest.InitialExecutionPlan, err, expectedInitialPlan.Fingerprint)
 	}
 }
 
-func TestLegacyImportMergesOnlyExactCanonicalIdentityAndQuarantinesIncompleteSource(t *testing.T) {
+func TestRunServiceResolvesOnlyTheTemplateFrozenByProfileAndExecutionSpec(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	dataStore, err := store.Open(root)
@@ -240,57 +255,53 @@ func TestLegacyImportMergesOnlyExactCanonicalIdentityAndQuarantinesIncompleteSou
 		t.Fatal(err)
 	}
 	defer dataStore.Close()
-	services, err := NewLifecycleServices(root, dataStore)
+	services, err := newLifecycleServicesForTest(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := writeLifecycleSnapshot(t, "legacy exact\n")
-	first, err := services.Tasks.ImportLegacy(ctx, LegacyImportRequest{
-		SourceDirectory: source,
-		Slug:            "legacy-exact",
-		SourceRepo:      "https://example.invalid/repo",
-		SourceCommit:    "abc123",
-		LegacyIdentity:  "repo=https://example.invalid/repo;commit=abc123;proposal=abc",
-		ExactIdentity:   true,
-		Actor:           "tester",
+	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
+		CreateDraftTaskRequest: CreateDraftTaskRequest{Slug: "codeedge-template", Actor: "tester", Reason: "import fixture"},
+		SourceDirectory:        writeLifecycleSnapshot(t, "CodeEdge template selection\n"),
+		ChangeSummary:          "template selection fixture",
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if first.Merged || first.Orphan || first.Revision == nil {
-		t.Fatalf("first exact import was not a canonical revision: %+v", first)
-	}
-	second, err := services.Tasks.ImportLegacy(ctx, LegacyImportRequest{
-		SourceDirectory: source,
-		Slug:            "ignored-on-merge",
-		SourceRepo:      "https://example.invalid/repo",
-		SourceCommit:    "abc123",
-		LegacyIdentity:  "repo=https://example.invalid/repo;commit=abc123;proposal=abc",
-		ExactIdentity:   true,
-		Actor:           "tester",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !second.Merged || second.Orphan || second.Task.ID != first.Task.ID || second.Revision == nil || second.Revision.ID != first.Revision.ID {
-		t.Fatalf("exact identity did not merge the existing revision: first=%+v second=%+v", first, second)
 	}
 
-	incomplete := t.TempDir()
-	writeLifecycleFile(t, filepath.Join(incomplete, "notes.txt"), "unresolved legacy evidence\n", 0o600)
-	orphan, err := services.Tasks.ImportLegacy(ctx, LegacyImportRequest{
-		SourceDirectory: incomplete,
-		Slug:            "legacy-incomplete",
-		Actor:           "tester",
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
+	specification := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, Profile: profile, ExecutionSpec: specification,
+		Trigger: "codeedge-phase1", Actor: "tester", Reason: "freeze CodeEdge template",
 	})
+	if err != nil {
+		t.Fatalf("start CodeEdge run: %v", err)
+	}
+	if run.WorkflowTemplateID != workflowadapter.CodeEdgePhase1WorkflowTemplateID || run.WorkflowTemplateVersion != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion {
+		t.Fatalf("run template = %s@%s, want CodeEdge Phase-1", run.WorkflowTemplateID, run.WorkflowTemplateVersion)
+	}
+	var manifest runManifest
+	if err := json.Unmarshal([]byte(run.RunManifestJSON), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if !manifest.Resolved.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) || manifest.Resolved.Descriptor.Stages[len(manifest.Resolved.Descriptor.Stages)-1].Key != workflowkit.StageKey(workflowadapter.Package) {
+		t.Fatalf("CodeEdge run did not freeze its closed descriptor: %+v", manifest.Resolved.Template)
+	}
+
+	mismatched := specification.Clone()
+	mismatched.Template = workflowadapter.StandardTemplateReference()
+	if _, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, Profile: profile, ExecutionSpec: mismatched,
+		Trigger: "codeedge-template-mismatch", Actor: "tester", Reason: "reject template mismatch",
+	}); err == nil {
+		t.Fatal("run accepted mismatched profile/specification templates")
+	}
+	runs, err := dataStore.ListWorkflowRunsForTask(ctx, task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !orphan.Orphan || orphan.Merged || orphan.Task.IdentityState != store.TaskIdentityLegacyOrphan || orphan.Revision != nil {
-		t.Fatalf("incomplete legacy source did not become an orphan: %+v", orphan)
-	}
-	if _, err := os.Stat(filepath.Join(root, managedTasksDirectory, orphan.Task.ID, "legacy-snapshot", "notes.txt")); err != nil {
-		t.Fatalf("incomplete legacy source was not moved into a managed directory: %v", err)
+	if len(runs) != 1 || runs[0].ID != run.ID {
+		t.Fatalf("template mismatch created durable work: %+v", runs)
 	}
 }
 
@@ -318,8 +329,19 @@ func writeLifecycleFile(t *testing.T, path, content string, mode os.FileMode) {
 
 func lifecycleCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
 	t.Helper()
-	catalog := workflowadapter.StandardStageCatalog()
-	profile := workflowadapter.ExecutionProfile{ID: "integration", Version: "1", ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ControlGracePeriod: 30 * time.Second}
+	return lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardWorkflowTemplate())
+}
+
+func lifecycleCompleteProfileForTemplate(t *testing.T, template workflowadapter.WorkflowTemplate) workflowadapter.ExecutionProfile {
+	t.Helper()
+	catalog := template.Catalog
+	profile := workflowadapter.ExecutionProfile{
+		Template:            template.Reference(),
+		ID:                  "integration",
+		Version:             "1",
+		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL,
+		ControlGracePeriod:  30 * time.Second,
+	}
 	for _, stage := range catalog.Stages {
 		turns := stage.RequiredTurns
 		profile.Stages = append(profile.Stages, workflowadapter.StageBudget{
@@ -335,4 +357,10 @@ func lifecycleCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
 		})
 	}
 	return profile
+}
+
+func lifecycleExecutionSpec(taskID, revisionID, revisionDigest string) workflowadapter.RunExecutionSpec {
+	specification := testsupport.CompleteRunExecutionSpec(taskID, revisionID, revisionDigest)
+	specification.Template = workflowadapter.StandardTemplateReference()
+	return specification
 }

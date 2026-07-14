@@ -19,7 +19,7 @@ func TestPersistStageArtifactsBindsImmutableOutputToFrozenLineage(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer dataStore.Close()
-	services, err := NewLifecycleServices(root, dataStore)
+	services, err := newLifecycleServicesForTest(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestPersistStageArtifactsBindsImmutableOutputToFrozenLineage(t *testing.T) 
 		t.Fatal(err)
 	}
 	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "verify", Actor: "tester", Reason: "fixture",
+		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "fixture",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +104,16 @@ func TestPersistStageArtifactsBindsImmutableOutputToFrozenLineage(t *testing.T) 
 	}
 	if len(bindings) != 1 || bindings[0].ArtifactID != workflowkit.ArtifactID(references[0].ID) || bindings[0].ContentDigest != workflowkit.Fingerprint(references[0].ContentDigest) {
 		t.Fatalf("resolved immutable input bindings = %+v", bindings)
+	}
+	reader := newStageInputReader(dataStore, services.core.objects, run, revision, bindings)
+	content, err := reader(ctx, bindings[0])
+	if err != nil || string(content) != "actual report\n" {
+		t.Fatalf("read frozen stage input = %q, %v", content, err)
+	}
+	forged := bindings[0]
+	forged.Name = "another-report"
+	if _, err := reader(ctx, forged); !errors.Is(err, ErrInvalidStageExecution) {
+		t.Fatalf("read forged stage binding = %v, want ErrInvalidStageExecution", err)
 	}
 	// Replaying the same physical output uses the stage-attempt idempotency
 	// keys and cannot create a second manifest/ref lineage record.

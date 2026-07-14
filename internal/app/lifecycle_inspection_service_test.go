@@ -15,7 +15,7 @@ func TestLifecycleInspectionJoinsDurableJobsAndLeases(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dataStore.Close()
-	services, err := NewLifecycleServices(root, dataStore)
+	services, err := newLifecycleServicesForTest(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestLifecycleInspectionJoinsDurableJobsAndLeases(t *testing.T) {
 		t.Fatal(err)
 	}
 	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "verify", Actor: "tester", Reason: "fixture",
+		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "fixture",
 	})
 	if err != nil {
 		t.Fatal(err)

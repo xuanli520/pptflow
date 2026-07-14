@@ -3,7 +3,6 @@ package workflowadapter
 import (
 	"testing"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -60,15 +59,15 @@ func TestStandardQuotaPolicyCompilesExplicitAccountLimitsAndStageClaims(t *testi
 		}
 	}
 
-	repoAnalyze, _ := resolved.Descriptor.Stage(workflowkit.StageKey(nodes.RepoAnalyze))
+	repoAnalyze, _ := resolved.Descriptor.Stage(workflowkit.StageKey(RepoAnalyze))
 	if !hasQuotaClaim(repoAnalyze.QuotaClaims, "agent_turn", 3) {
 		t.Fatalf("repo analysis claims = %+v, want three frozen agent turns", repoAnalyze.QuotaClaims)
 	}
-	qwen, _ := resolved.Descriptor.Stage(workflowkit.StageKey(nodes.HarborRunQwen))
+	qwen, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunQwen))
 	if !hasQuotaClaim(qwen.QuotaClaims, "trial", 4) {
 		t.Fatalf("Qwen evaluation claims = %+v, want four logical trials", qwen.QuotaClaims)
 	}
-	repair, _ := resolved.Descriptor.Stage(workflowkit.StageKey(nodes.TaskRepair))
+	repair, _ := resolved.Descriptor.Stage(workflowkit.StageKey(TaskRepair))
 	if !hasQuotaClaim(repair.QuotaClaims, "repair_round", 1) {
 		t.Fatalf("repair claims = %+v, want one repair round", repair.QuotaClaims)
 	}
@@ -94,7 +93,7 @@ func TestQuotaPolicyMutationChangesFrozenManifestAndDescriptorAndRejectsDrift(t 
 
 	changedClaim := template.Clone()
 	for index := range changedClaim.QuotaPolicy.Stages {
-		if changedClaim.QuotaPolicy.Stages[index].StageKey != workflowkit.StageKey(nodes.RepoAnalyze) {
+		if changedClaim.QuotaPolicy.Stages[index].StageKey != workflowkit.StageKey(RepoAnalyze) {
 			continue
 		}
 		for claim := range changedClaim.QuotaPolicy.Stages[index].Claims {
@@ -113,7 +112,7 @@ func TestQuotaPolicyMutationChangesFrozenManifestAndDescriptorAndRejectsDrift(t 
 
 	tampered := baseline.Descriptor.Clone()
 	for index := range tampered.Stages {
-		if tampered.Stages[index].Key == workflowkit.StageKey(nodes.RepoAnalyze) {
+		if tampered.Stages[index].Key == workflowkit.StageKey(RepoAnalyze) {
 			tampered.Stages[index].QuotaClaims[0].Units++
 			break
 		}

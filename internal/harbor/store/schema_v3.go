@@ -5,10 +5,6 @@ package store
 // releases, outbox delivery, and deletion planning. It contains no runtime,
 // continuation, quota, or external-provider behavior.
 const migrationV3 = `
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_v2_canonical_import_identity
-    ON tasks_v2(legacy_identity, source_repo, source_commit)
-    WHERE identity_state = 'canonical' AND legacy_identity <> '';
-
 CREATE INDEX IF NOT EXISTS idx_workspaces_v2_state ON workspaces_v2(state, updated_at);
 
 ALTER TABLE run_attempts ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0);

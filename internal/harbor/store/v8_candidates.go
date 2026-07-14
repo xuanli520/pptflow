@@ -152,11 +152,24 @@ func (s *Store) CreateRevisionCandidate(ctx context.Context, request CreateRevis
 		if err != nil {
 			return RevisionCandidate{}, err
 		}
-		if session.CommandID != candidate.CommandID || session.SubjectID != candidate.TaskID || session.BaseRevisionID != candidate.BaseRevisionID {
-			return RevisionCandidate{}, fmt.Errorf("revision candidate repair session does not bind command/task/revision")
+		if session.Status != RepairSessionOpen || session.SubjectID != candidate.TaskID {
+			return RevisionCandidate{}, fmt.Errorf("revision candidate repair session is not open for this task")
 		}
 		if candidate.RoundOrdinal <= 0 || candidate.RoundOrdinal > session.MaxRounds {
 			return RevisionCandidate{}, fmt.Errorf("revision candidate repair round is outside session bounds")
+		}
+		if candidate.RoundOrdinal == 1 {
+			if session.CommandID != candidate.CommandID || session.BaseRevisionID != candidate.BaseRevisionID {
+				return RevisionCandidate{}, fmt.Errorf("initial repair candidate does not bind the session root command and revision")
+			}
+		} else {
+			previous, err := getRevisionCandidateByRepairRoundTx(ctx, tx, session.ID, candidate.RoundOrdinal-1)
+			if err != nil {
+				return RevisionCandidate{}, err
+			}
+			if previous.State != RevisionCandidateCommitted || previous.TargetRevisionID != candidate.BaseRevisionID || previous.TargetRunID != candidate.SourceRunID {
+				return RevisionCandidate{}, fmt.Errorf("repair candidate round %d does not continue the committed prior round", candidate.RoundOrdinal)
+			}
 		}
 	} else if candidate.RoundOrdinal != 0 {
 		return RevisionCandidate{}, fmt.Errorf("non-repair revision candidate must use round ordinal zero")
@@ -1594,6 +1607,14 @@ func getRevisionCandidateByCommandTx(ctx context.Context, tx *sql.Tx, commandID 
 	candidate, err := scanRevisionCandidate(tx.QueryRowContext(ctx, revisionCandidateV8Select+" WHERE command_id = ?", commandID))
 	if err == sql.ErrNoRows {
 		return RevisionCandidate{}, fmt.Errorf("%w: revision candidate command %s", ErrNotFound, commandID)
+	}
+	return candidate, err
+}
+
+func getRevisionCandidateByRepairRoundTx(ctx context.Context, tx *sql.Tx, repairSessionID string, roundOrdinal int) (RevisionCandidate, error) {
+	candidate, err := scanRevisionCandidate(tx.QueryRowContext(ctx, revisionCandidateV8Select+" WHERE repair_session_id = ? AND round_ordinal = ?", repairSessionID, roundOrdinal))
+	if err == sql.ErrNoRows {
+		return RevisionCandidate{}, fmt.Errorf("%w: repair session %s round %d candidate", ErrNotFound, repairSessionID, roundOrdinal)
 	}
 	return candidate, err
 }

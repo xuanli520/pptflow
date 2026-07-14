@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +17,9 @@ import (
 // representation, making an explicit production profile reviewable and
 // stable across CLI and TUI clients.
 func ParseExecutionProfileJSON(raw []byte) (ExecutionProfile, error) {
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return ExecutionProfile{}, fmt.Errorf("decode execution profile: %w", err)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var document executionProfileDocument
@@ -38,6 +42,7 @@ func ParseExecutionProfileJSON(raw []byte) (ExecutionProfile, error) {
 		return ExecutionProfile{}, err
 	}
 	profile := ExecutionProfile{
+		Template:            document.Template,
 		ID:                  document.ID,
 		Version:             document.Version,
 		ContinuationPlanTTL: continuationPlanTTL,
@@ -51,13 +56,66 @@ func ParseExecutionProfileJSON(raw []byte) (ExecutionProfile, error) {
 		}
 		profile.Stages = append(profile.Stages, StageBudget{StageKey: workflowkit.StageKey(stage.StageKey), Budget: budget})
 	}
-	if err := profile.Validate(); err != nil {
+	template, err := ResolveWorkflowTemplate(profile.Template)
+	if err != nil {
+		return ExecutionProfile{}, fmt.Errorf("decode execution profile template: %w", err)
+	}
+	if err := profile.ValidateFor(template.Catalog); err != nil {
 		return ExecutionProfile{}, err
 	}
 	return profile, nil
 }
 
+// CanonicalJSON returns the stable, human-readable persisted form of a
+// validated execution profile. It is deliberately separate from Fingerprint:
+// the latter retains its established hash representation while this form is
+// used when a caller freezes explicit profile input into managed storage.
+func (profile ExecutionProfile) CanonicalJSON() ([]byte, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	canonical := profile.Clone()
+	sort.Slice(canonical.Stages, func(left, right int) bool {
+		return canonical.Stages[left].StageKey < canonical.Stages[right].StageKey
+	})
+	document := executionProfileDocument{
+		Template:            canonical.Template,
+		ID:                  canonical.ID,
+		Version:             canonical.Version,
+		ContinuationPlanTTL: canonical.ContinuationPlanTTL.String(),
+		ControlGracePeriod:  canonical.ControlGracePeriod.String(),
+		Stages:              make([]executionProfileStageEntry, 0, len(canonical.Stages)),
+	}
+	for _, stage := range canonical.Stages {
+		budget := stage.Budget
+		retryDelays := make([]string, len(budget.Backoff.RetryDelays))
+		for index, delay := range budget.Backoff.RetryDelays {
+			retryDelays[index] = delay.String()
+		}
+		document.Stages = append(document.Stages, executionProfileStageEntry{
+			StageKey: string(stage.StageKey),
+			Budget: executionProfileBudgetJSON{
+				TurnTimeout:    budget.TurnTimeout.String(),
+				MaxTurns:       budget.MaxTurns,
+				AttemptTimeout: budget.AttemptTimeout.String(),
+				MaxAttempts:    budget.MaxAttempts,
+				MaxElapsed:     budget.MaxElapsed.String(),
+				IdleTimeout:    budget.IdleTimeout.String(),
+				StartupGrace:   budget.StartupGrace.String(),
+				ShutdownGrace:  budget.ShutdownGrace.String(),
+				Backoff:        executionProfileBackoffJSON{RetryDelays: retryDelays},
+			},
+		})
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode canonical execution profile: %w", err)
+	}
+	return encoded, nil
+}
+
 type executionProfileDocument struct {
+	Template            TemplateReference            `json:"template"`
 	ID                  string                       `json:"id"`
 	Version             string                       `json:"version"`
 	ContinuationPlanTTL string                       `json:"continuation_plan_ttl"`

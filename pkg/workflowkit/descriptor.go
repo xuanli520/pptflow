@@ -231,6 +231,9 @@ func (descriptor StageDescriptor) Validate() error {
 	if err := validateRequired("stage version", descriptor.Version, ErrInvalidDescriptor); err != nil {
 		return err
 	}
+	if err := descriptor.Plugin.Validate(); err != nil {
+		return err
+	}
 	if err := validateRequired("stage group", descriptor.Group, ErrInvalidDescriptor); err != nil {
 		return err
 	}

@@ -4,12 +4,6 @@ type focusArea int
 
 const (
 	focusPage focusArea = iota
-	focusStartField
-	focusOverviewTable
-	focusGateChecklist
-	focusGateNotes
-	focusDetailViewport
-	focusLogsViewport
 	focusSearch
 	focusOverlay
 )

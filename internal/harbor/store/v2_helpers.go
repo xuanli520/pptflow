@@ -90,6 +90,15 @@ func nullableTimePtr(value sql.NullTime) *time.Time {
 	return &result
 }
 
+// nullableTimeValue converts a nullable SQLite timestamp for V2 records that
+// store creation time as a required value in the public model.
+func nullableTimeValue(value sql.NullTime) time.Time {
+	if !value.Valid {
+		return time.Time{}
+	}
+	return value.Time.UTC()
+}
+
 func nullableInt64Ptr(value sql.NullInt64) *int64 {
 	if !value.Valid {
 		return nil

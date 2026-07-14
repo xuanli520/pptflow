@@ -18,7 +18,7 @@ func TestAppTaskHubDetailAdapterProjectsRealSQLiteFactsWithoutMutation(t *testin
 		t.Fatal(err)
 	}
 	defer dataStore.Close()
-	services, err := app.NewLifecycleServices(root, dataStore)
+	services, err := newTaskHubAdapterLifecycleServices(root, dataStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestAppTaskHubDetailAdapterProjectsRealSQLiteFactsWithoutMutation(t *testin
 		t.Fatal(err)
 	}
 	run, err := services.Runs.StartRun(ctx, app.StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: taskHubAdapterCompleteProfile(t), Trigger: "detail-integration", Actor: "tester", Reason: "start detail fixture",
+		TaskID: task.ID, RevisionID: revision.ID, Profile: taskHubAdapterCompleteProfile(t), ExecutionSpec: taskHubExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "detail-integration", Actor: "tester", Reason: "start detail fixture",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -171,6 +171,9 @@ func TestAppTaskHubDetailAdapterProjectsRealSQLiteFactsWithoutMutation(t *testin
 	if len(detail.Repairs) != 1 || len(detail.Repairs[0].Changes) != 1 || detail.Repairs[0].Changes[0].ProviderID != "local-patch" || len(detail.Repairs[0].Changes[0].Receipts) != 1 || detail.Repairs[0].Changes[0].Receipts[0].Outcome != string(store.MutationReceiptUncertain) {
 		t.Fatalf("repair facts were not projected: %+v", detail.Repairs)
 	}
+	if len(detail.FrozenExecutions) != 1 || detail.FrozenExecutions[0].RunID != run.ID || detail.FrozenExecutions[0].State != TaskHubFrozenExecutionBound || detail.FrozenExecutions[0].ProfileFingerprint != run.ResolvedProfileHash || detail.FrozenExecutions[0].DeploymentCatalog.State != TaskHubDeploymentCatalogNotRecorded {
+		t.Fatalf("frozen execution facts were not safely projected: %+v", detail.FrozenExecutions)
+	}
 
 	afterTask, _ := services.Tasks.Get(ctx, task.ID)
 	afterRun, _ := services.Runs.Get(ctx, run.ID)
@@ -196,7 +199,14 @@ func TestAppTaskHubDetailAdapterProjectsRealSQLiteFactsWithoutMutation(t *testin
 	if m.taskHubDetail == nil || m.taskHubDetail.Detail.SelectedRunID != run.ID {
 		t.Fatalf("real detail response did not bind selected Run: %+v", m.taskHubDetail)
 	}
-	for range []int{0, 1, 2, 3} {
+	for range []int{0, 1, 2} {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(model)
+	}
+	if m.taskHubDetail.Tab != TaskHubDetailFrozenTab || !strings.Contains(m.taskHubDetail.View(100, 30), "冻结 manifest") || !strings.Contains(m.taskHubDetail.View(100, 30), "task-hub-integration") {
+		t.Fatalf("real SQLite frozen execution facts did not survive TUI detail rendering:\n%s", m.taskHubDetail.View(100, 30))
+	}
+	for range []int{0, 1} {
 		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 		m = updated.(model)
 	}

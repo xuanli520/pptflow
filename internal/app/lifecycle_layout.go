@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 )
 
@@ -119,7 +118,7 @@ func materializeManagedSnapshot(ctx context.Context, source, destination string)
 	if source == "" {
 		return "", fmt.Errorf("source task snapshot is required")
 	}
-	if err := harborrun.ValidateManagedTaskSnapshotV2(source); err != nil {
+	if err := taskpolicy.ValidateManagedSnapshotV2(source); err != nil {
 		return "", fmt.Errorf("validate source task snapshot: %w", err)
 	}
 	if err := os.Mkdir(destination, 0o750); err != nil {
@@ -152,10 +151,10 @@ func materializeManagedSnapshot(ctx context.Context, source, destination string)
 			return "", fmt.Errorf("copy snapshot file %s: %w", file.Path, err)
 		}
 	}
-	if err := harborrun.ValidateManagedTaskSnapshotV2(destination); err != nil {
+	if err := taskpolicy.ValidateManagedSnapshotV2(destination); err != nil {
 		return "", fmt.Errorf("validate materialized task snapshot: %w", err)
 	}
-	digest, err := harborrun.ComputeManagedTaskDigestV2(destination)
+	digest, err := taskpolicy.ComputeManagedTaskDigestV2(destination)
 	if err != nil {
 		return "", fmt.Errorf("digest materialized task snapshot: %w", err)
 	}

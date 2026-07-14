@@ -95,6 +95,8 @@ var globalIdentitySourcesCurrent = append(
 	candidateGarbageCollectionOperationIdentitySource,
 	releaseWithdrawOperationIdentitySource,
 	releaseWithdrawReceiptIdentitySource,
+	lifecycleOperationIdentitySource,
+	runWorkerHandoffIdentitySource,
 )
 
 func applyMigrationV6(tx *sql.Tx) error {

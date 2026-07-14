@@ -17,7 +17,6 @@ type RunControlOverlay struct {
 	RunID                  string
 	TaskID                 string
 	RevisionID             string
-	Workspace              string
 	State                  string
 	Stage                  string
 	StageAttemptID         string
@@ -66,21 +65,6 @@ func newLifecycleRunControlOverlay(run TaskHubRun) *RunControlOverlay {
 		FailureReason:          strings.TrimSpace(control.FailureReason),
 		Expected:               control.Expected,
 		Actions:                append([]TaskHubRunControlActionState(nil), control.Actions...),
-	}
-}
-
-func newRunControlOverlay(runID, workspace string, done, readOnly bool) *RunControlOverlay {
-	state := "运行中"
-	switch {
-	case done:
-		state = "已结束"
-	case readOnly:
-		state = "只读快照"
-	}
-	return &RunControlOverlay{
-		RunID:     strings.TrimSpace(runID),
-		Workspace: strings.TrimSpace(workspace),
-		State:     state,
 	}
 }
 
@@ -162,9 +146,6 @@ func (o *RunControlOverlay) View(width, height int) string {
 		"",
 		"目标 Run：" + runID,
 		"状态：" + o.State,
-	}
-	if workspace := redactSingleLineUI(o.Workspace); workspace != "" {
-		rows = append(rows, "工作区："+workspace)
 	}
 	if o.Stage != "" {
 		stage := o.Stage

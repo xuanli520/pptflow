@@ -1,12 +1,9 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/purplevoid/harbor-factory/internal/harbor/domain"
 )
 
 func (m model) Init() tea.Cmd {
@@ -25,19 +22,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.refreshComponentSizes()
 		return m, nil
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		if m.done || m.view == viewStart || m.view == viewHub {
-			return m, nil
-		}
-		return m, cmd
 	case toastExpiredMsg:
 		if msg.id == m.toast.ID {
 			m.toast.Message = ""
 		}
-		return m, nil
-	case confirmOpenedMsg:
 		return m, nil
 	case tea.MouseMsg:
 		return m, m.handleMouse(msg)
@@ -61,54 +49,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if handled, cmd := m.router.Dispatch(msg); handled {
 			return m, cmd
 		}
-	case runnerEventMsg:
-		event := domain.RunnerEvent(msg)
-		m.applyRunnerEvent(event)
-		return m, m.waitEvent()
-	case editorDoneMsg:
-		if msg.err != nil {
-			m.err = msg.err
-			return m, nil
-		}
-		m.err = nil
-		if msg.before.changed(msg.after) {
-			if m.editedFiles == nil {
-				m.editedFiles = map[string]string{}
-			}
-			m.editedFiles[msg.path] = editSummary(msg.before, msg.after)
-		}
-		return m, m.showToast("工件编辑已完成", toastSuccess)
-	case gateDecisionWrittenMsg:
-		if msg.err != nil {
-			m.err = msg.err
-			m.notice = ""
-			m.activeGate = msg.gate
-			m.view = viewGate
-			return m, nil
-		}
-		m.err = nil
-		if msg.path != "" {
-			m.summary.GateDecisions = mergeGateDecisions(m.summary.GateDecisions, []domain.GateDecision{msg.decision})
-			m.notice = fmt.Sprintf("决定已写入 %s。快照模式只写决定文件，需由外部运行器消费。", msg.path)
-		} else {
-			m.notice = ""
-		}
-		m.resetGateLocalState()
-		return m, m.showToast("审查决定已提交", toastSuccess)
-	case runnerDoneMsg:
-		m.summary = msg.summary
-		m.err = msg.err
-		m.done = true
-		m.view = viewDone
-		return m, nil
-	case workspaceRefreshMsg:
-		m.applyWorkspaceSnapshot(msg.summary, msg.events)
-		if m.done {
-			return m, nil
-		}
-		return m, m.refreshWorkspace()
 	case taskHubPollMsg:
-		if m.view == viewHub && m.lifecycle != nil {
+		if m.lifecycle != nil {
 			m.taskHub.Loading = true
 			return m, tea.Batch(m.loadTaskHubV2(), taskHubPollCmd())
 		}
@@ -125,7 +67,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case taskHubSearchMsg:
 		if m.lifecycle != nil && m.hubSearching && strings.TrimSpace(m.hubSearch.Value()) == msg.query {
 			m.taskHub.Query.Filter = msg.query
-			m.hubFilter = msg.query
 			m.taskHub.Loading = true
 			return m, m.loadTaskHubV2()
 		}
@@ -225,8 +166,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.notice = "已刷新只读生命周期详情。"
 		return m, nil
 	case taskHubRunControlPlanMsg:
-		// A late read-only preview must not reopen an overlay that the operator
-		// already dismissed with Esc, nor replace a newer selection's preview.
 		if m.runControl == nil || m.runControl.RunID != msg.runID || m.runControl.SelectedAction != msg.action {
 			return m, nil
 		}
@@ -238,6 +177,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.runControl.Preview = &preview
 		m.notice = "已生成 " + taskHubRunControlActionLabel(msg.action) + " 的只读影响预览。"
 		return m, m.showToast("运行控制预览已更新", toastSuccess)
+	case taskHubRunHandoffExecutedMsg:
+		return m, m.applyTaskHubExitHandoffResult(msg)
 	}
 	return m, nil
 }

@@ -66,6 +66,8 @@ func TestTaskHubDetailKeyboardFlowIsReadOnlyAndRefreshes(t *testing.T) {
 	m = updated.(model)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(model)
 	factsView := ansi.Strip(m.View())
 	if m.taskHubDetail.Tab != TaskHubDetailFactsTab || !strings.Contains(factsView, "工件") || !strings.Contains(factsView, "审核") || !strings.Contains(factsView, "返修") {
 		t.Fatalf("facts tab omitted durable evidence/review/repair facts: tab=%q\n%s", m.taskHubDetail.Tab, ansi.Strip(m.View()))
@@ -91,6 +93,81 @@ func TestTaskHubDetailKeyboardFlowIsReadOnlyAndRefreshes(t *testing.T) {
 	m = updated.(model)
 	if m.taskHubDetail != nil || service.planCallCount() != 0 {
 		t.Fatalf("Esc did not dismiss read-only detail safely: overlay=%+v plans=%d", m.taskHubDetail, service.planCallCount())
+	}
+}
+
+func TestTaskHubFrozenExecutionTabShowsBoundCatalogAndExactEvaluationLineageReadOnly(t *testing.T) {
+	detail := taskHubDetailFixture()
+	detail.FrozenExecutions = []TaskHubFrozenExecutionFact{{
+		RunID:                       "run-1",
+		State:                       TaskHubFrozenExecutionBound,
+		TemplateID:                  "harbor.codeedge-phase1",
+		TemplateVersion:             "1.0.0",
+		ExecutionProfileID:          "codeedge-local",
+		ExecutionProfileVersion:     "2026.07",
+		ContinuationPlanTTL:         24 * time.Hour,
+		ControlGracePeriod:          30 * time.Second,
+		TemplateFingerprint:         "sha256:template",
+		ProfileFingerprint:          "sha256:profile",
+		DefinitionFingerprint:       "sha256:definition",
+		ResolvedManifestFingerprint: "sha256:manifest",
+		InitialPlanFingerprint:      "sha256:plan",
+		InputBundleID:               "bundle-1",
+		ExecutionSpecFingerprint:    "sha256:spec",
+		DeploymentCatalog: TaskHubDeploymentCatalogFact{
+			State: TaskHubDeploymentCatalogBound, CatalogID: "codeedge-phase1-production", CatalogVersion: "2026.07",
+			TemplateID: "harbor.codeedge-phase1", TemplateVersion: "1.0.0", CatalogFingerprint: "sha256:catalog",
+		},
+	}}
+	detail.Runs[0].Stages = append(detail.Runs[0].Stages,
+		TaskHubStageFact{StageAttemptID: "evaluation-attempt", StageKey: "harbor_run_qwen", StageGroup: "evaluation", Ordinal: 12, ExecutionState: "completed", Verdict: "pass"},
+	)
+	detail.Artifacts = append(detail.Artifacts, TaskHubArtifactFact{
+		ManifestID: "evaluation-manifest", RevisionID: "revision-1", SubjectDigest: "harbor.task.v2:sha256:fixture", WorkflowFingerprint: "sha256:workflow",
+		Refs: []TaskHubArtifactRefFact{
+			{ArtifactKey: "qwen-trial-result", ContentDigest: "sha256:qwen-result", SchemaVersion: "codeedge.phase1.evaluation-receipt.v1", RunID: "run-1", StageKey: "harbor_run_qwen", AttemptID: "evaluation-attempt"},
+			{ArtifactKey: "qwen-screenshot", ContentDigest: "sha256:qwen-screenshot", SchemaVersion: "image/png", RunID: "run-1", StageKey: "harbor_run_qwen", AttemptID: "evaluation-attempt"},
+			// This is deliberately for a different attempt and must not be
+			// attached to the selected evaluation summary.
+			{ArtifactKey: "stale-evidence", ContentDigest: "sha256:stale", SchemaVersion: "report.v1", RunID: "run-1", StageKey: "harbor_run_qwen", AttemptID: "older-attempt"},
+		},
+	})
+	service := &fakeTaskHubDetailLifecycle{
+		fakeTaskHubLifecycle: &fakeTaskHubLifecycle{snapshot: enabledTaskHubSnapshot()},
+		detail:               detail,
+	}
+	m, cleanup := newTestTaskHubV2Model(t, service)
+	defer cleanup()
+	m.width, m.height = 120, 52
+
+	updated, command := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if command == nil || m.taskHubDetail == nil || service.planCallCount() != 0 {
+		t.Fatalf("opening frozen execution detail must remain a deferred read: overlay=%+v plans=%d command=%v", m.taskHubDetail, service.planCallCount(), command)
+	}
+	updated, _ = m.Update(command())
+	m = updated.(model)
+	for range []int{0, 1, 2} {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(model)
+	}
+	if m.taskHubDetail.Tab != TaskHubDetailFrozenTab {
+		t.Fatalf("Tab sequence did not reach discoverable frozen-execution surface: %q", m.taskHubDetail.Tab)
+	}
+	rendered := ansi.Strip(m.View())
+	for _, required := range []string{
+		"冻结执行", "冻结 manifest：已解析并与 durable Run 身份一致", "codeedge-phase1-production@2026.07",
+		"harbor_run_qwen", "qwen-trial-result", "qwen-screenshot", "受验证评测摘要：尚未提供",
+	} {
+		if !strings.Contains(rendered, required) {
+			t.Fatalf("frozen execution detail omitted %q:\n%s", required, rendered)
+		}
+	}
+	if strings.Contains(rendered, "stale-evidence") {
+		t.Fatalf("frozen execution detail attached evidence from a different StageAttempt:\n%s", rendered)
+	}
+	if service.planCallCount() != 0 {
+		t.Fatalf("read-only frozen execution view requested a lifecycle plan: %d", service.planCallCount())
 	}
 }
 
@@ -123,6 +200,10 @@ func TestTaskHubDetailMouseTabsRowsAndHelpUseV2Surfaces(t *testing.T) {
 	clickRenderedMarker(t, &m, "修订")
 	if m.taskHubDetail.Tab != TaskHubDetailRevisionsTab {
 		t.Fatalf("detail mouse tab did not select revisions: %q", m.taskHubDetail.Tab)
+	}
+	clickRenderedMarker(t, &m, "冻结执行")
+	if m.taskHubDetail.Tab != TaskHubDetailFrozenTab {
+		t.Fatalf("detail mouse tab did not expose frozen execution facts: %q", m.taskHubDetail.Tab)
 	}
 	clickRenderedMarker(t, &m, "[Esc] 返回")
 	if m.taskHubDetail != nil {
@@ -231,7 +312,7 @@ func TestTaskHubDetailSelectionCapturesSpecificOpenReviewForTwoKeyPlan(t *testin
 	}
 }
 
-func TestTaskHubDetailSelectionCapturesReleaseWithoutEnablingWithdraw(t *testing.T) {
+func TestTaskHubDetailSelectionEnablesWithdrawWithCapturedRelease(t *testing.T) {
 	snapshot := enabledTaskHubSnapshot()
 	snapshot.Tasks[0].Actions = append(snapshot.Tasks[0].Actions,
 		TaskHubActionState{Action: TaskHubActionWithdrawRelease, DisabledReason: "需要明确的 release ID 和幂等撤回契约"},
@@ -265,8 +346,15 @@ func TestTaskHubDetailSelectionCapturesReleaseWithoutEnablingWithdraw(t *testing
 	m = updated.(model)
 	updated, command := m.Update(runeKey("w"))
 	m = updated.(model)
-	if command == nil || service.planCallCount() != 0 || !strings.Contains(m.notice, "幂等撤回契约") {
-		t.Fatalf("selected release bypassed unavailable withdraw contract: command=%v plans=%d notice=%q", command, service.planCallCount(), m.notice)
+	if command == nil {
+		t.Fatal("selected active release did not enter the withdraw plan path")
+	}
+	updated, _ = m.Update(command())
+	m = updated.(model)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.commands) != 1 || service.commands[0].Action != TaskHubActionWithdrawRelease || service.commands[0].Target.ReleaseID != "release-active-a" {
+		t.Fatalf("withdraw plan did not retain selected release identity: commands=%+v", service.commands)
 	}
 }
 

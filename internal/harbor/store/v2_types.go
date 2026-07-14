@@ -36,13 +36,6 @@ const (
 	TaskLifecycleDeleted   TaskLifecycleState = "deleted"
 )
 
-type TaskIdentityState string
-
-const (
-	TaskIdentityCanonical    TaskIdentityState = "canonical"
-	TaskIdentityLegacyOrphan TaskIdentityState = "legacy_orphan"
-)
-
 type RevisionOrigin string
 
 const (
@@ -90,6 +83,7 @@ type StageExecutionStatus string
 const (
 	StageExecutionQueued      StageExecutionStatus = "queued"
 	StageExecutionRunning     StageExecutionStatus = "running"
+	StageExecutionWaiting     StageExecutionStatus = "waiting"
 	StageExecutionCompleted   StageExecutionStatus = "completed"
 	StageExecutionInfraFailed StageExecutionStatus = "infra_failed"
 	StageExecutionInterrupted StageExecutionStatus = "interrupted"
@@ -164,6 +158,7 @@ type NodeAttemptStatus string
 const (
 	NodeAttemptQueued      NodeAttemptStatus = "queued"
 	NodeAttemptRunning     NodeAttemptStatus = "running"
+	NodeAttemptWaiting     NodeAttemptStatus = "waiting"
 	NodeAttemptCompleted   NodeAttemptStatus = "completed"
 	NodeAttemptInfraFailed NodeAttemptStatus = "infra_failed"
 	NodeAttemptInterrupted NodeAttemptStatus = "interrupted"
@@ -197,8 +192,7 @@ const (
 	DeletionCanceled  DeletionRecordState = "canceled"
 )
 
-// TaskV2 is the stable, path-independent task identity. Legacy task rows
-// remain in Task and are intentionally not embedded here.
+// TaskV2 is the stable, path-independent task identity.
 type TaskV2 struct {
 	ID                string
 	Slug              string
@@ -208,9 +202,6 @@ type TaskV2 struct {
 	SourceCommit      string
 	LifecycleState    TaskLifecycleState
 	CurrentRevisionID string
-	IdentityState     TaskIdentityState
-	LegacyV1TaskID    *int64
-	LegacyIdentity    string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	DeletedAt         *time.Time
@@ -225,20 +216,8 @@ type CreateTaskV2Request struct {
 	SourceRepo     string
 	SourceCommit   string
 	LifecycleState TaskLifecycleState
-	IdentityState  TaskIdentityState
-	LegacyV1TaskID *int64
-	LegacyIdentity string
 	Actor          string
 	Reason         string
-}
-
-// CanonicalIdentityLookup is the only automatic legacy-import match key.
-// Every field is exact; callers must create a legacy_orphan when any part of
-// the canonical identity is missing or ambiguous.
-type CanonicalIdentityLookup struct {
-	LegacyIdentity string
-	SourceRepo     string
-	SourceCommit   string
 }
 
 type UpdateTaskV2Request struct {

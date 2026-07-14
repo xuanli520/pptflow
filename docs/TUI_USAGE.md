@@ -22,9 +22,11 @@ harbor-factory --root .harbor-factory tui
 | `/` | 过滤 Task Hub 投影；`Enter` 应用，`Esc` 取消。 |
 | `Enter` | 打开只读详情；计划预览存在时进入原生确认表单。 |
 | `Esc` | 取消待输入的前缀、确认表单或当前计划预览；从不提交 mutation。 |
-| `q`、`Ctrl+Q`、`Ctrl+C` | 退出；存在 active durable run 时，确认语义是 detach，不是取消。 |
+| `q`、`Ctrl+Q`、`Ctrl+C` | 退出；存在 active durable run 时打开逐 Run 的受控 worker 交接面板，不是取消。 |
 
 Queue 标签显示观测到的运行中和排队数量。后端未暴露容量池时，容量显示为 `未配置`；`0` 不会被解释为已配置的零容量池。
+
+退出交接面板会枚举所有 active Run，并默认勾选每个当前可交接的 Run。可用 `Up`/`Down` 选择并用 `Space` 单独取消勾选；没有选中任何 Run 时，`Enter` 会直接退出，不启动任何 worker，也不会出现第二次确认。每个已选 Run 都保留自己的 UUIDv7 操作 ID、幂等键和已观察的 Run checkpoint，由 application service 按项交给受控 child worker。`Esc`、`q` 或 `Ctrl+C` 在面板内返回 Task Hub；它们不会取消 TUI 根 context、任何其他 Run 或 durable job。
 
 ## 生命周期序列
 
@@ -32,7 +34,7 @@ Queue 标签显示观测到的运行中和排队数量。后端未暴露容量�
 
 | 序列 | 请求的计划 |
 | --- | --- |
-| `t n`、`t i`、`t g` | 新建、导入或从仓库生成 Task。 |
+| `t n`、`t i` | 新建或导入 Task。 |
 | `t e`、`t f`、`t a`、`t d`、`t u` | 创建编辑 candidate、Fork、归档、软删除或恢复选中的 Task。 |
 | `x c`、`x n`、`x a` | 继续处理、启动 Run 或 Attach 到 durable Run。 |
 | `x k` | 打开选中 Run 的 Run Control。 |

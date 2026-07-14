@@ -10,8 +10,7 @@ import (
 
 const taskV2Select = `
 	SELECT id, slug, title, metadata_json, source_repo, source_commit,
-	       lifecycle_state, current_revision_id, identity_state,
-	       legacy_v1_task_id, legacy_identity, created_at, updated_at, deleted_at, version
+	       lifecycle_state, current_revision_id, created_at, updated_at, deleted_at, version
 	FROM tasks_v2`
 
 const reviewRequestSelect = `
@@ -47,17 +46,6 @@ func (s *Store) CreateTaskV2(ctx context.Context, request CreateTaskV2Request) (
 	if !validTaskLifecycleState(state) {
 		return TaskV2{}, fmt.Errorf("invalid task lifecycle state %q", state)
 	}
-	identityState := request.IdentityState
-	if identityState == "" {
-		identityState = TaskIdentityCanonical
-	}
-	if identityState != TaskIdentityCanonical && identityState != TaskIdentityLegacyOrphan {
-		return TaskV2{}, fmt.Errorf("invalid task identity state %q", identityState)
-	}
-	legacyIdentity := strings.TrimSpace(request.LegacyIdentity)
-	if identityState == TaskIdentityLegacyOrphan && legacyIdentity == "" {
-		return TaskV2{}, fmt.Errorf("legacy orphan tasks require a legacy identity description")
-	}
 	now := s.now().UTC()
 	task := TaskV2{
 		ID:             id,
@@ -67,9 +55,6 @@ func (s *Store) CreateTaskV2(ctx context.Context, request CreateTaskV2Request) (
 		SourceRepo:     strings.TrimSpace(request.SourceRepo),
 		SourceCommit:   strings.TrimSpace(request.SourceCommit),
 		LifecycleState: state,
-		IdentityState:  identityState,
-		LegacyV1TaskID: request.LegacyV1TaskID,
-		LegacyIdentity: legacyIdentity,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 		Version:        1,
@@ -86,12 +71,10 @@ func (s *Store) CreateTaskV2(ctx context.Context, request CreateTaskV2Request) (
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO tasks_v2 (
 			id, slug, title, metadata_json, source_repo, source_commit,
-			lifecycle_state, current_revision_id, identity_state, legacy_v1_task_id,
-			legacy_identity, created_at, updated_at, deleted_at, version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
+			lifecycle_state, current_revision_id, created_at, updated_at, deleted_at, version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
 	`, task.ID, task.Slug, task.Title, task.MetadataJSON, task.SourceRepo, task.SourceCommit,
-		task.LifecycleState, task.IdentityState, task.LegacyV1TaskID, task.LegacyIdentity,
-		task.CreatedAt, task.UpdatedAt, task.DeletedAt, task.Version)
+		task.LifecycleState, task.CreatedAt, task.UpdatedAt, task.DeletedAt, task.Version)
 	if err != nil {
 		if isUniqueConstraint(err) {
 			return TaskV2{}, fmt.Errorf("%w: task %s", ErrIdentityCollision, task.ID)
@@ -104,7 +87,7 @@ func (s *Store) CreateTaskV2(ctx context.Context, request CreateTaskV2Request) (
 		EntityID:    task.ID,
 		Action:      "task.created",
 		Reason:      request.Reason,
-		PayloadJSON: auditPayload(map[string]any{"identity_state": task.IdentityState, "slug": task.Slug}),
+		PayloadJSON: auditPayload(map[string]any{"slug": task.Slug}),
 		CreatedAt:   now,
 	}); err != nil {
 		return TaskV2{}, err
@@ -140,17 +123,6 @@ func (s *Store) CreateTaskWithRevision(ctx context.Context, request CreateTaskWi
 	}
 	if !validTaskLifecycleState(taskState) {
 		return CreateTaskWithRevisionResult{}, fmt.Errorf("invalid task lifecycle state %q", taskState)
-	}
-	identityState := request.Task.IdentityState
-	if identityState == "" {
-		identityState = TaskIdentityCanonical
-	}
-	if identityState != TaskIdentityCanonical && identityState != TaskIdentityLegacyOrphan {
-		return CreateTaskWithRevisionResult{}, fmt.Errorf("invalid task identity state %q", identityState)
-	}
-	legacyIdentity := strings.TrimSpace(request.Task.LegacyIdentity)
-	if identityState == TaskIdentityLegacyOrphan && legacyIdentity == "" {
-		return CreateTaskWithRevisionResult{}, fmt.Errorf("legacy orphan tasks require a legacy identity description")
 	}
 	if request.Revision.TaskID != "" && request.Revision.TaskID != taskID {
 		return CreateTaskWithRevisionResult{}, fmt.Errorf("initial revision task ID must match the created task")
@@ -188,9 +160,6 @@ func (s *Store) CreateTaskWithRevision(ctx context.Context, request CreateTaskWi
 		SourceRepo:     strings.TrimSpace(request.Task.SourceRepo),
 		SourceCommit:   strings.TrimSpace(request.Task.SourceCommit),
 		LifecycleState: taskState,
-		IdentityState:  identityState,
-		LegacyV1TaskID: request.Task.LegacyV1TaskID,
-		LegacyIdentity: legacyIdentity,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 		Version:        1,
@@ -227,12 +196,10 @@ func (s *Store) CreateTaskWithRevision(ctx context.Context, request CreateTaskWi
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO tasks_v2 (
 			id, slug, title, metadata_json, source_repo, source_commit,
-			lifecycle_state, current_revision_id, identity_state, legacy_v1_task_id,
-			legacy_identity, created_at, updated_at, deleted_at, version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
+			lifecycle_state, current_revision_id, created_at, updated_at, deleted_at, version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
 	`, task.ID, task.Slug, task.Title, task.MetadataJSON, task.SourceRepo, task.SourceCommit,
-		task.LifecycleState, task.IdentityState, task.LegacyV1TaskID, task.LegacyIdentity,
-		task.CreatedAt, task.UpdatedAt, task.DeletedAt, task.Version)
+		task.LifecycleState, task.CreatedAt, task.UpdatedAt, task.DeletedAt, task.Version)
 	if err != nil {
 		if isUniqueConstraint(err) {
 			return CreateTaskWithRevisionResult{}, fmt.Errorf("%w: task %s", ErrIdentityCollision, task.ID)
@@ -260,7 +227,7 @@ func (s *Store) CreateTaskWithRevision(ctx context.Context, request CreateTaskWi
 		EntityID:    task.ID,
 		Action:      "task.created",
 		Reason:      request.Task.Reason,
-		PayloadJSON: auditPayload(map[string]any{"identity_state": task.IdentityState, "slug": task.Slug, "atomic_initial_revision_id": revision.ID}),
+		PayloadJSON: auditPayload(map[string]any{"slug": task.Slug, "atomic_initial_revision_id": revision.ID}),
 		CreatedAt:   now,
 	}); err != nil {
 		return CreateTaskWithRevisionResult{}, err
@@ -282,39 +249,11 @@ func (s *Store) CreateTaskWithRevision(ctx context.Context, request CreateTaskWi
 	return CreateTaskWithRevisionResult{Task: task, Revision: revision}, nil
 }
 
-// CreateLegacyOrphan creates a deliberately non-merged legacy task. Higher
-// layers may later make an explicit human-reviewed merge decision.
-func (s *Store) CreateLegacyOrphan(ctx context.Context, request CreateTaskV2Request) (TaskV2, error) {
-	request.IdentityState = TaskIdentityLegacyOrphan
-	return s.CreateTaskV2(ctx, request)
-}
-
 func (s *Store) GetTaskV2(ctx context.Context, taskID string) (*TaskV2, error) {
 	if !isUUIDv7(taskID) {
 		return nil, ErrInvalidUUIDv7Identity
 	}
 	task, err := scanTaskV2(s.db.QueryRowContext(ctx, taskV2Select+" WHERE id = ?", taskID))
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &task, nil
-}
-
-// FindTaskByCanonicalIdentity performs an exact, read-only legacy-import
-// lookup. It never considers legacy_orphan rows and never merges identities.
-func (s *Store) FindTaskByCanonicalIdentity(ctx context.Context, lookup CanonicalIdentityLookup) (*TaskV2, error) {
-	legacyIdentity, err := normalizeRequired(lookup.LegacyIdentity, "canonical legacy identity")
-	if err != nil {
-		return nil, err
-	}
-	sourceRepo := strings.TrimSpace(lookup.SourceRepo)
-	sourceCommit := strings.TrimSpace(lookup.SourceCommit)
-	task, err := scanTaskV2(s.db.QueryRowContext(ctx, taskV2Select+`
-		WHERE identity_state = 'canonical' AND legacy_identity = ? AND source_repo = ? AND source_commit = ?
-	`, legacyIdentity, sourceRepo, sourceCommit))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -776,6 +715,23 @@ func (s *Store) ListReviewRequestsForRevision(ctx context.Context, revisionID st
 	return requests, rows.Err()
 }
 
+// GetReviewRequest returns one durable review envelope by its stable identity.
+// Lifecycle mutation checkpoints use this narrow read to bind an operator's
+// confirmation to the exact review state and evidence it displayed.
+func (s *Store) GetReviewRequest(ctx context.Context, reviewRequestID string) (*ReviewRequest, error) {
+	if !isUUIDv7(reviewRequestID) {
+		return nil, ErrInvalidUUIDv7Identity
+	}
+	review, err := scanReviewRequest(s.db.QueryRowContext(ctx, reviewRequestSelect+" WHERE id = ?", reviewRequestID))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &review, nil
+}
+
 // ListReviewDecisionsForRequest returns immutable decisions attached to a
 // review envelope. A normal V2 review has at most one decision, but returning
 // a slice preserves the audit model without projecting a mutable shortcut.
@@ -823,6 +779,13 @@ func (s *Store) RecordReviewDecision(ctx context.Context, request RecordReviewDe
 		return ReviewDecision{}, err
 	}
 	defer tx.Rollback()
+	gateBinding, err := getReviewGateBindingByReviewRequestTx(ctx, tx, request.ReviewRequestID)
+	if err != nil {
+		return ReviewDecision{}, err
+	}
+	if gateBinding != nil {
+		return ReviewDecision{}, fmt.Errorf("%w: review request %s is a workflow review gate", ErrInvalidTransition, request.ReviewRequestID)
+	}
 	var reviewRevisionID, reviewState string
 	err = tx.QueryRowContext(ctx, `SELECT revision_id, state FROM review_requests WHERE id = ?`, request.ReviewRequestID).Scan(&reviewRevisionID, &reviewState)
 	if err == sql.ErrNoRows {
@@ -923,6 +886,11 @@ func (s *Store) PromoteTaskCurrentRevision(ctx context.Context, request PromoteC
 	err = tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM review_decisions
 		WHERE revision_id = ? AND action = 'approve' AND expected_revision_digest = ?
+		  AND NOT EXISTS (
+			  SELECT 1
+			  FROM review_gate_bindings_v15 gate
+			  WHERE gate.review_request_id = review_decisions.review_request_id
+		  )
 	`, revision.ID, revision.TaskDigest).Scan(&approved)
 	if err != nil {
 		return TaskV2{}, err
@@ -988,16 +956,13 @@ func getTaskRevisionTx(ctx context.Context, tx *sql.Tx, revisionID string) (Task
 
 func scanTaskV2(scanner rowScanner) (TaskV2, error) {
 	var task TaskV2
-	var legacyID sql.NullInt64
 	var deletedAt sql.NullTime
 	if err := scanner.Scan(
 		&task.ID, &task.Slug, &task.Title, &task.MetadataJSON, &task.SourceRepo, &task.SourceCommit,
-		&task.LifecycleState, &task.CurrentRevisionID, &task.IdentityState, &legacyID, &task.LegacyIdentity,
-		&task.CreatedAt, &task.UpdatedAt, &deletedAt, &task.Version,
+		&task.LifecycleState, &task.CurrentRevisionID, &task.CreatedAt, &task.UpdatedAt, &deletedAt, &task.Version,
 	); err != nil {
 		return TaskV2{}, err
 	}
-	task.LegacyV1TaskID = nullableInt64Ptr(legacyID)
 	task.CreatedAt = task.CreatedAt.UTC()
 	task.UpdatedAt = task.UpdatedAt.UTC()
 	task.DeletedAt = nullableTimePtr(deletedAt)

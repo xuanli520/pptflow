@@ -13,6 +13,42 @@ func TestMigrateV10ToV11InstallsQuotaPolicyBindingTable(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TABLE quota_account_policy_bindings_v11`); err != nil {
 		t.Fatalf("remove v11 fixture table: %v", err)
 	}
+	if _, err := s.db.Exec(`DROP TABLE lifecycle_operations_v12`); err != nil {
+		t.Fatalf("remove v12 fixture table: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE review_gate_bindings_v15`); err != nil {
+		t.Fatalf("remove v15 fixture table: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE run_worker_handoffs_v16`); err != nil {
+		t.Fatalf("remove v16 fixture table: %v", err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE job_dispatch_claims_v5`); err != nil {
+		t.Fatalf("remove v13 fixture table: %v", err)
+	}
+	if _, err := s.db.Exec(migrationV5); err != nil {
+		t.Fatalf("restore pre-v13 v5 fixture table: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 13`); err != nil {
+		t.Fatalf("rewind schema fixture from v13: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 14`); err != nil {
+		t.Fatalf("rewind schema fixture from v14: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 15`); err != nil {
+		t.Fatalf("rewind schema fixture from v15: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 16`); err != nil {
+		t.Fatalf("rewind schema fixture from v16: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 17`); err != nil {
+		t.Fatalf("rewind schema fixture from v17: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 18`); err != nil {
+		t.Fatalf("rewind schema fixture from v18: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 12`); err != nil {
+		t.Fatalf("rewind schema fixture from v12: %v", err)
+	}
 	if _, err := s.db.Exec(`DELETE FROM schema_version WHERE version = 11`); err != nil {
 		t.Fatalf("rewind schema fixture to v10: %v", err)
 	}
@@ -32,7 +68,7 @@ func TestMigrateV10ToV11InstallsQuotaPolicyBindingTable(t *testing.T) {
 	if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'quota_account_policy_bindings_v11'`).Scan(&tableCount); err != nil {
 		t.Fatal(err)
 	}
-	if version != 11 || tableCount != 1 {
+	if version != schemaVersion || tableCount != 1 {
 		t.Fatalf("V11 migration result version=%d table_count=%d", version, tableCount)
 	}
 }

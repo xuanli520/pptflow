@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ const (
 	TaskHubDetailOverviewTab  TaskHubDetailTab = "overview"
 	TaskHubDetailRevisionsTab TaskHubDetailTab = "revisions"
 	TaskHubDetailRunsTab      TaskHubDetailTab = "runs_stages"
+	TaskHubDetailFrozenTab    TaskHubDetailTab = "frozen_execution"
 	TaskHubDetailReleasesTab  TaskHubDetailTab = "releases"
 	TaskHubDetailFactsTab     TaskHubDetailTab = "facts"
 )
@@ -28,6 +30,7 @@ func taskHubDetailTabs() []TaskHubDetailTab {
 		TaskHubDetailOverviewTab,
 		TaskHubDetailRevisionsTab,
 		TaskHubDetailRunsTab,
+		TaskHubDetailFrozenTab,
 		TaskHubDetailReleasesTab,
 		TaskHubDetailFactsTab,
 	}
@@ -41,6 +44,8 @@ func (tab TaskHubDetailTab) label() string {
 		return "修订"
 	case TaskHubDetailRunsTab:
 		return "运行/阶段"
+	case TaskHubDetailFrozenTab:
+		return "冻结执行"
 	case TaskHubDetailReleasesTab:
 		return "本地包"
 	case TaskHubDetailFactsTab:
@@ -73,11 +78,17 @@ type TaskHubDetail struct {
 	SelectedRunID string                `json:"selected_run_id,omitempty"`
 	Revisions     []TaskHubRevisionFact `json:"revisions,omitempty"`
 	Runs          []TaskHubRunFact      `json:"runs,omitempty"`
-	Releases      []TaskHubReleaseFact  `json:"releases,omitempty"`
-	Artifacts     []TaskHubArtifactFact `json:"artifacts,omitempty"`
-	Reviews       []TaskHubReviewFact   `json:"reviews,omitempty"`
-	Repairs       []TaskHubRepairFact   `json:"repairs,omitempty"`
-	ObservedAt    time.Time             `json:"observed_at"`
+	// FrozenExecutions contains UI-safe projections of each Run's immutable
+	// execution manifest. It contains only stable identities, policy values,
+	// and catalog receipt facts; raw manifests, execution-spec payloads,
+	// secrets, filesystem locations, and runtime attestation payloads remain
+	// unavailable to the TUI.
+	FrozenExecutions []TaskHubFrozenExecutionFact `json:"frozen_executions,omitempty"`
+	Releases         []TaskHubReleaseFact         `json:"releases,omitempty"`
+	Artifacts        []TaskHubArtifactFact        `json:"artifacts,omitempty"`
+	Reviews          []TaskHubReviewFact          `json:"reviews,omitempty"`
+	Repairs          []TaskHubRepairFact          `json:"repairs,omitempty"`
+	ObservedAt       time.Time                    `json:"observed_at"`
 }
 
 // TaskHubDetailTask is the stable Task identity and lifecycle summary.
@@ -125,6 +136,81 @@ type TaskHubRunFact struct {
 	StartedAt           time.Time          `json:"started_at,omitempty"`
 	FinishedAt          time.Time          `json:"finished_at,omitempty"`
 	Stages              []TaskHubStageFact `json:"stages,omitempty"`
+}
+
+// TaskHubFrozenExecutionState describes whether the projection can prove the
+// stored manifest is structurally usable for read-only display and bound to
+// the durable Run row. It is intentionally not a runtime-attestation state:
+// a detail query never contacts a worker, executable, image registry, or
+// secret provider.
+type TaskHubFrozenExecutionState string
+
+const (
+	TaskHubFrozenExecutionBound       TaskHubFrozenExecutionState = "bound"
+	TaskHubFrozenExecutionUnavailable TaskHubFrozenExecutionState = "unavailable"
+	TaskHubFrozenExecutionInvalid     TaskHubFrozenExecutionState = "invalid"
+)
+
+// TaskHubDeploymentCatalogState describes only the frozen catalog-receipt
+// binding visible in a Run manifest. A receipt being bound does not assert
+// that the currently installed deployment lock or runtime attestation has
+// passed; those facts require a separate application-service projection.
+type TaskHubDeploymentCatalogState string
+
+const (
+	TaskHubDeploymentCatalogBound       TaskHubDeploymentCatalogState = "bound"
+	TaskHubDeploymentCatalogNotRecorded TaskHubDeploymentCatalogState = "not_recorded"
+	TaskHubDeploymentCatalogInvalid     TaskHubDeploymentCatalogState = "invalid"
+)
+
+// TaskHubDeploymentCatalogLockState applies the same conservative projection
+// rule to the compact operation-catalog lock identity frozen with a Run. It
+// is not a statement that a worker's live runtime attestation passed.
+type TaskHubDeploymentCatalogLockState string
+
+const (
+	TaskHubDeploymentCatalogLockBound       TaskHubDeploymentCatalogLockState = "bound"
+	TaskHubDeploymentCatalogLockNotRecorded TaskHubDeploymentCatalogLockState = "not_recorded"
+	TaskHubDeploymentCatalogLockInvalid     TaskHubDeploymentCatalogLockState = "invalid"
+)
+
+// TaskHubDeploymentCatalogFact is the safe identity of a catalog receipt
+// frozen with a Run. It intentionally excludes catalog operations, secret
+// values, deployment paths, and lock/runtime-attestation payloads.
+type TaskHubDeploymentCatalogFact struct {
+	State              TaskHubDeploymentCatalogState `json:"state"`
+	CatalogID          string                        `json:"catalog_id,omitempty"`
+	CatalogVersion     string                        `json:"catalog_version,omitempty"`
+	TemplateID         string                        `json:"template_id,omitempty"`
+	TemplateVersion    string                        `json:"template_version,omitempty"`
+	CatalogFingerprint string                        `json:"catalog_fingerprint,omitempty"`
+	LockState          TaskHubDeploymentCatalogLockState `json:"lock_state"`
+	LockID             string                        `json:"lock_id,omitempty"`
+	LockVersion        string                        `json:"lock_version,omitempty"`
+	LockFingerprint    string                        `json:"lock_fingerprint,omitempty"`
+}
+
+// TaskHubFrozenExecutionFact is a read-only summary of a frozen Run manifest.
+// The State is deliberately conservative: invalid or unavailable manifests do
+// not expose a partial projection that could be mistaken for an executable
+// contract.
+type TaskHubFrozenExecutionFact struct {
+	RunID                       string                       `json:"run_id"`
+	State                       TaskHubFrozenExecutionState  `json:"state"`
+	TemplateID                  string                       `json:"template_id,omitempty"`
+	TemplateVersion             string                       `json:"template_version,omitempty"`
+	ExecutionProfileID          string                       `json:"execution_profile_id,omitempty"`
+	ExecutionProfileVersion     string                       `json:"execution_profile_version,omitempty"`
+	ContinuationPlanTTL         time.Duration                `json:"continuation_plan_ttl,omitempty"`
+	ControlGracePeriod          time.Duration                `json:"control_grace_period,omitempty"`
+	TemplateFingerprint         string                       `json:"template_fingerprint,omitempty"`
+	ProfileFingerprint          string                       `json:"profile_fingerprint,omitempty"`
+	DefinitionFingerprint       string                       `json:"definition_fingerprint,omitempty"`
+	ResolvedManifestFingerprint string                       `json:"resolved_manifest_fingerprint,omitempty"`
+	InitialPlanFingerprint      string                       `json:"initial_plan_fingerprint,omitempty"`
+	InputBundleID               string                       `json:"input_bundle_id,omitempty"`
+	ExecutionSpecFingerprint    string                       `json:"execution_spec_fingerprint,omitempty"`
+	DeploymentCatalog           TaskHubDeploymentCatalogFact `json:"deployment_catalog"`
 }
 
 // TaskHubStageFact is a safe view of one stage attempt. Raw error text and
@@ -239,6 +325,7 @@ func (detail TaskHubDetail) Clone() TaskHubDetail {
 	for index := range detail.Runs {
 		detail.Runs[index].Stages = append([]TaskHubStageFact(nil), detail.Runs[index].Stages...)
 	}
+	detail.FrozenExecutions = append([]TaskHubFrozenExecutionFact(nil), detail.FrozenExecutions...)
 	detail.Releases = append([]TaskHubReleaseFact(nil), detail.Releases...)
 	detail.Artifacts = append([]TaskHubArtifactFact(nil), detail.Artifacts...)
 	for index := range detail.Artifacts {
@@ -503,6 +590,8 @@ func (overlay *TaskHubDetailOverlay) contentRows() []string {
 		return overlay.revisionRows()
 	case TaskHubDetailRunsTab:
 		return overlay.runRows()
+	case TaskHubDetailFrozenTab:
+		return overlay.frozenExecutionRows()
 	case TaskHubDetailReleasesTab:
 		return overlay.releaseRows()
 	case TaskHubDetailFactsTab:
@@ -545,6 +634,7 @@ func (overlay *TaskHubDetailOverlay) overviewRows() []string {
 		sectionStyle.Render("可用事实"),
 		fmt.Sprintf("修订 %d  |  Run %d  |  本地包 %d", len(overlay.Detail.Revisions), len(overlay.Detail.Runs), len(overlay.Detail.Releases)),
 		fmt.Sprintf("工件 %d  |  审核 %d  |  返修 %d", len(overlay.Detail.Artifacts), len(overlay.Detail.Reviews), len(overlay.Detail.Repairs)),
+		fmt.Sprintf("冻结执行 %d（按 Tab 查看目录与评测证据摘要）", len(overlay.Detail.FrozenExecutions)),
 		"读取时间："+taskHubDetailTime(overlay.Detail.ObservedAt),
 	)
 	return rows
@@ -611,6 +701,175 @@ func (overlay *TaskHubDetailOverlay) runRows() []string {
 		rows = append(rows, "")
 	}
 	return rows
+}
+
+// frozenExecutionRows renders only immutable identities already projected by
+// the application-facing detail reader. It never opens the managed Run
+// directory, decodes raw artifact bytes, or initiates a provider/runtime
+// verification from the TUI process.
+func (overlay *TaskHubDetailOverlay) frozenExecutionRows() []string {
+	if len(overlay.Detail.FrozenExecutions) == 0 {
+		return []string{"暂无可投影的冻结执行说明书。该详情读取不会猜测 profile、catalog 或评测结果。"}
+	}
+	facts := append([]TaskHubFrozenExecutionFact(nil), overlay.Detail.FrozenExecutions...)
+	sort.SliceStable(facts, func(left, right int) bool {
+		leftSelected := facts[left].RunID == overlay.Detail.SelectedRunID
+		rightSelected := facts[right].RunID == overlay.Detail.SelectedRunID
+		if leftSelected != rightSelected {
+			return leftSelected
+		}
+		return facts[left].RunID < facts[right].RunID
+	})
+	rows := make([]string, 0, len(facts)*18)
+	for _, fact := range facts {
+		label := "Run：" + emptyDash(fact.RunID)
+		if fact.RunID == overlay.Detail.SelectedRunID {
+			label += "  当前查看"
+		}
+		rows = append(rows, sectionStyle.Render(label))
+		switch fact.State {
+		case TaskHubFrozenExecutionBound:
+			rows = append(rows, "冻结 manifest：已解析并与 durable Run 身份一致")
+		case TaskHubFrozenExecutionUnavailable:
+			rows = append(rows, warnStyle.Render("冻结 manifest：未记录；不会从当前配置或工作目录推测执行契约"))
+		case TaskHubFrozenExecutionInvalid:
+			rows = append(rows, failStyle.Render("冻结 manifest：无法通过只读结构/身份绑定检查；不显示部分执行契约"))
+		default:
+			rows = append(rows, failStyle.Render("冻结 manifest：未知投影状态"))
+		}
+		if fact.State != TaskHubFrozenExecutionBound {
+			rows = append(rows, "")
+			continue
+		}
+		rows = append(rows,
+			"模板："+fact.TemplateID+"@"+fact.TemplateVersion,
+			"执行 profile："+fact.ExecutionProfileID+"@"+fact.ExecutionProfileVersion,
+			"continuation TTL："+taskHubDuration(fact.ContinuationPlanTTL),
+			"控制 grace："+taskHubDuration(fact.ControlGracePeriod),
+			"模板 fingerprint："+fact.TemplateFingerprint,
+			"profile fingerprint："+fact.ProfileFingerprint,
+			"定义 fingerprint："+fact.DefinitionFingerprint,
+			"解析 manifest fingerprint："+fact.ResolvedManifestFingerprint,
+			"初始执行计划 fingerprint："+fact.InitialPlanFingerprint,
+			"输入 bundle："+emptyDash(fact.InputBundleID),
+			"execution spec fingerprint："+fact.ExecutionSpecFingerprint,
+		)
+		rows = append(rows, overlay.deploymentCatalogRows(fact.DeploymentCatalog)...)
+		rows = append(rows, overlay.evaluationEvidenceRows(fact.RunID)...)
+		rows = append(rows, "")
+	}
+	return rows
+}
+
+func taskHubDuration(value time.Duration) string {
+	if value < 0 {
+		return "-"
+	}
+	return value.String()
+}
+
+func (overlay *TaskHubDetailOverlay) deploymentCatalogRows(catalog TaskHubDeploymentCatalogFact) []string {
+	rows := []string{sectionStyle.Render("Deployment catalog（冻结 receipt）")}
+	switch catalog.State {
+	case TaskHubDeploymentCatalogBound:
+		rows = append(rows,
+			"catalog："+catalog.CatalogID+"@"+catalog.CatalogVersion,
+			"catalog 模板："+catalog.TemplateID+"@"+catalog.TemplateVersion,
+			"catalog fingerprint："+catalog.CatalogFingerprint,
+		)
+		switch catalog.LockState {
+		case TaskHubDeploymentCatalogLockBound:
+			rows = append(rows,
+				"operation lock："+catalog.LockID+"@"+catalog.LockVersion,
+				"lock fingerprint："+catalog.LockFingerprint,
+			)
+		case TaskHubDeploymentCatalogLockInvalid:
+			rows = append(rows, failStyle.Render("冻结 operation lock identity 无法通过只读结构检查。"))
+		case TaskHubDeploymentCatalogLockNotRecorded, "":
+			rows = append(rows, warnStyle.Render("未冻结 operation lock identity；不能显示受验证的生产 lock 状态。"))
+		default:
+			rows = append(rows, failStyle.Render("operation lock identity 状态未知。"))
+		}
+		rows = append(rows, "运行时 attestation：此只读详情不声明已通过；worker 会在外部副作用前重验。")
+	case TaskHubDeploymentCatalogNotRecorded:
+		rows = append(rows, warnStyle.Render("未冻结 deployment catalog receipt；不会假定当前部署、PATH、镜像或模型可执行。"))
+	case TaskHubDeploymentCatalogInvalid:
+		rows = append(rows, failStyle.Render("deployment catalog receipt 无法通过只读结构/模板绑定检查。"))
+	default:
+		rows = append(rows, failStyle.Render("deployment catalog receipt 状态未知。"))
+	}
+	return rows
+}
+
+// evaluationEvidenceRows deliberately summarizes only immutable artifact
+// lineage already supplied by the detail reader. The actual EvaluationReceipt
+// payload is not read by the TUI, so it cannot be re-parsed, silently trusted,
+// or mistaken for a complete trial/compliance result.
+func (overlay *TaskHubDetailOverlay) evaluationEvidenceRows(runID string) []string {
+	rows := []string{sectionStyle.Render("评测证据（immutable lineage）")}
+	stages := overlay.evaluationStagesForRun(runID)
+	if len(stages) == 0 {
+		return append(rows, "该 Run 暂无 evaluation StageAttempt；不会按 stage 名称或 artifact key 猜测评测。")
+	}
+	for _, stage := range stages {
+		rows = append(rows,
+			"阶段："+taskHubStageLabel(stage.StageGroup, stage.StageKey)+"  状态："+emptyDash(stage.ExecutionState)+"  verdict："+emptyDash(stage.Verdict),
+			"StageAttempt："+stage.StageAttemptID,
+		)
+		references := overlay.evaluationEvidenceRefs(runID, stage)
+		if len(references) == 0 {
+			rows = append(rows, "  暂无与该 StageAttempt 精确绑定的 immutable evidence ref。")
+		} else {
+			for _, reference := range references {
+				rows = append(rows, "  evidence："+reference.ArtifactKey+"  "+reference.ContentDigest+"  "+emptyDash(reference.SchemaVersion))
+			}
+		}
+		rows = append(rows, subtleStyle.Render("  受验证评测摘要：尚未提供（不会读取 artifact 原文或猜测四次 trial/合规结论）。"))
+	}
+	return rows
+}
+
+func (overlay *TaskHubDetailOverlay) evaluationStagesForRun(runID string) []TaskHubStageFact {
+	for _, run := range overlay.Detail.Runs {
+		if run.RunID != runID {
+			continue
+		}
+		stages := make([]TaskHubStageFact, 0, len(run.Stages))
+		for _, stage := range run.Stages {
+			if strings.EqualFold(strings.TrimSpace(stage.StageGroup), "evaluation") {
+				stages = append(stages, stage)
+			}
+		}
+		sort.SliceStable(stages, func(left, right int) bool {
+			if stages[left].Ordinal != stages[right].Ordinal {
+				return stages[left].Ordinal < stages[right].Ordinal
+			}
+			return stages[left].StageAttemptID < stages[right].StageAttemptID
+		})
+		return stages
+	}
+	return nil
+}
+
+func (overlay *TaskHubDetailOverlay) evaluationEvidenceRefs(runID string, stage TaskHubStageFact) []TaskHubArtifactRefFact {
+	refs := make([]TaskHubArtifactRefFact, 0)
+	for _, artifact := range overlay.Detail.Artifacts {
+		for _, reference := range artifact.Refs {
+			if reference.RunID == runID && reference.StageKey == stage.StageKey && reference.AttemptID == stage.StageAttemptID {
+				refs = append(refs, reference)
+			}
+		}
+	}
+	sort.SliceStable(refs, func(left, right int) bool {
+		if refs[left].ArtifactKey != refs[right].ArtifactKey {
+			return refs[left].ArtifactKey < refs[right].ArtifactKey
+		}
+		if refs[left].ContentDigest != refs[right].ContentDigest {
+			return refs[left].ContentDigest < refs[right].ContentDigest
+		}
+		return refs[left].SchemaVersion < refs[right].SchemaVersion
+	})
+	return refs
 }
 
 func (overlay *TaskHubDetailOverlay) releaseRows() []string {

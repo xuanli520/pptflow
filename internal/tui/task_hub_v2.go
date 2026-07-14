@@ -38,7 +38,6 @@ type TaskHubAction string
 const (
 	TaskHubActionNewTask         TaskHubAction = "task.new"
 	TaskHubActionImportTask      TaskHubAction = "task.import"
-	TaskHubActionGenerateTask    TaskHubAction = "task.generate"
 	TaskHubActionEditTask        TaskHubAction = "task.edit"
 	TaskHubActionForkTask        TaskHubAction = "task.fork"
 	TaskHubActionArchiveTask     TaskHubAction = "task.archive"
@@ -124,6 +123,28 @@ type TaskHubControlCheckpoint struct {
 	WorkflowFingerprint string `json:"workflow_fingerprint,omitempty"`
 }
 
+// TaskHubLifecycleCheckpoint is the full task/revision/run/release/review CAS
+// identity captured by a lifecycle plan preview. It is passed unchanged by the
+// confirmation form and must be rejected when any relevant durable fact has
+// moved rather than silently rebound to newer state.
+type TaskHubLifecycleCheckpoint struct {
+	TaskID               string `json:"task_id,omitempty"`
+	TaskVersion          int64  `json:"task_version,omitempty"`
+	RevisionID           string `json:"revision_id,omitempty"`
+	RevisionStateVersion int64  `json:"revision_state_version,omitempty"`
+	RevisionDigest       string `json:"revision_digest,omitempty"`
+	RunID                string `json:"run_id,omitempty"`
+	RunVersion           int64  `json:"run_version,omitempty"`
+	RunExecutionEpoch    int    `json:"run_execution_epoch,omitempty"`
+	RunDefinitionHash    string `json:"run_definition_hash,omitempty"`
+	ReleaseID            string `json:"release_id,omitempty"`
+	ReleaseRecordVersion int64  `json:"release_record_version,omitempty"`
+	ReviewRequestID      string `json:"review_request_id,omitempty"`
+	ReviewRevisionID     string `json:"review_revision_id,omitempty"`
+	ReviewState          string `json:"review_state,omitempty"`
+	ReviewEvidenceDigest string `json:"review_evidence_digest,omitempty"`
+}
+
 // TaskHubRunControl is a read-only summary of the durable control facts that
 // matter while an operator is considering an action. The confirmation form
 // supplies the actor, reason, and idempotency key; this projection supplies the
@@ -156,27 +177,71 @@ func (control TaskHubRunControl) Clone() TaskHubRunControl {
 	return control
 }
 
+// TaskHubWorkerHandoff is the UI-safe, read-only summary of the most recent
+// controlled child-worker handoff for a Run. Process IDs and log paths remain
+// diagnostics in the durable store and are intentionally not rendered by the
+// Task Hub.
+type TaskHubWorkerHandoff struct {
+	OperationID      string    `json:"operation_id"`
+	State            string    `json:"state"`
+	WorkerLeaseID    string    `json:"worker_lease_id,omitempty"`
+	LaunchDeadlineAt time.Time `json:"launch_deadline_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	FailureRecorded  bool      `json:"failure_recorded,omitempty"`
+}
+
+// Clone returns an independent handoff summary.
+func (handoff *TaskHubWorkerHandoff) Clone() *TaskHubWorkerHandoff {
+	if handoff == nil {
+		return nil
+	}
+	copy := *handoff
+	return &copy
+}
+
+// TaskHubRunHandoffCheckpoint is the complete Run identity an operator
+// inspected before requesting a controlled child worker. It is deliberately
+// separate from control checkpoints: handoff must reject a new Run version,
+// execution epoch, or frozen definition instead of silently targeting it.
+type TaskHubRunHandoffCheckpoint struct {
+	RunVersion     int64  `json:"run_version"`
+	ExecutionEpoch int    `json:"execution_epoch"`
+	DefinitionHash string `json:"definition_hash"`
+}
+
+// TaskHubRunHandoffCapability is the authoritative handoff capability
+// projection for one active Run. A disabled Run remains visible in the exit
+// panel so the operator can see why no child worker needs or may receive it.
+type TaskHubRunHandoffCapability struct {
+	Enabled        bool                        `json:"enabled"`
+	DisabledReason string                      `json:"disabled_reason,omitempty"`
+	Expected       TaskHubRunHandoffCheckpoint `json:"expected"`
+}
+
 // TaskHubRun is the UI-safe run projection returned by a lifecycle query.
 type TaskHubRun struct {
-	RunID          string               `json:"run_id"`
-	TaskID         string               `json:"task_id"`
-	RevisionID     string               `json:"revision_id,omitempty"`
-	ExecutionState string               `json:"execution_state"`
-	Stage          string               `json:"stage,omitempty"`
-	Failure        string               `json:"failure,omitempty"`
-	ControlStatus  string               `json:"control_status,omitempty"`
-	Active         bool                 `json:"active"`
-	QueuePosition  int                  `json:"queue_position,omitempty"`
-	StartedAt      time.Time            `json:"started_at"`
-	FinishedAt     time.Time            `json:"finished_at,omitempty"`
-	Actions        []TaskHubActionState `json:"actions,omitempty"`
-	Control        TaskHubRunControl    `json:"control,omitempty"`
+	RunID          string                      `json:"run_id"`
+	TaskID         string                      `json:"task_id"`
+	RevisionID     string                      `json:"revision_id,omitempty"`
+	ExecutionState string                      `json:"execution_state"`
+	Stage          string                      `json:"stage,omitempty"`
+	Failure        string                      `json:"failure,omitempty"`
+	ControlStatus  string                      `json:"control_status,omitempty"`
+	Active         bool                        `json:"active"`
+	QueuePosition  int                         `json:"queue_position,omitempty"`
+	StartedAt      time.Time                   `json:"started_at"`
+	FinishedAt     time.Time                   `json:"finished_at,omitempty"`
+	Actions        []TaskHubActionState        `json:"actions,omitempty"`
+	Control        TaskHubRunControl           `json:"control,omitempty"`
+	WorkerHandoff  *TaskHubWorkerHandoff       `json:"worker_handoff,omitempty"`
+	Handoff        TaskHubRunHandoffCapability `json:"handoff"`
 }
 
 // Clone returns an independent projection value.
 func (run TaskHubRun) Clone() TaskHubRun {
 	run.Actions = append([]TaskHubActionState(nil), run.Actions...)
 	run.Control = run.Control.Clone()
+	run.WorkerHandoff = run.WorkerHandoff.Clone()
 	return run
 }
 
@@ -248,17 +313,18 @@ type TaskHubCommand struct {
 // TaskHubPlanPreview is a UI projection of a frozen lifecycle plan. It keeps
 // the planner explanation visible before any confirmation/execution step.
 type TaskHubPlanPreview struct {
-	PlanID              string   `json:"plan_id,omitempty"`
-	Title               string   `json:"title"`
-	Summary             string   `json:"summary"`
-	Reason              string   `json:"reason,omitempty"`
-	RevisionImpact      string   `json:"revision_impact,omitempty"`
-	ExecutionScope      []string `json:"execution_scope,omitempty"`
-	InvalidatedEvidence []string `json:"invalidated_evidence,omitempty"`
-	ReusedEvidence      []string `json:"reused_evidence,omitempty"`
-	BudgetImpact        string   `json:"budget_impact,omitempty"`
-	ExternalEffects     []string `json:"external_effects,omitempty"`
-	ConfirmationNeeded  bool     `json:"confirmation_needed"`
+	PlanID              string                     `json:"plan_id,omitempty"`
+	Title               string                     `json:"title"`
+	Summary             string                     `json:"summary"`
+	Reason              string                     `json:"reason,omitempty"`
+	RevisionImpact      string                     `json:"revision_impact,omitempty"`
+	ExecutionScope      []string                   `json:"execution_scope,omitempty"`
+	InvalidatedEvidence []string                   `json:"invalidated_evidence,omitempty"`
+	ReusedEvidence      []string                   `json:"reused_evidence,omitempty"`
+	BudgetImpact        string                     `json:"budget_impact,omitempty"`
+	ExternalEffects     []string                   `json:"external_effects,omitempty"`
+	ConfirmationNeeded  bool                       `json:"confirmation_needed"`
+	Expected            TaskHubLifecycleCheckpoint `json:"expected,omitempty"`
 }
 
 // Clone returns an independent plan preview.
@@ -324,16 +390,18 @@ type TaskHubLifecycleService interface {
 
 // TaskHubMutationRequest is submitted only after a native Task Hub
 // confirmation form collected a non-empty reason, derived a local OS actor,
-// and allocated a UUIDv7 idempotency key. Values holds action-specific form
-// fields such as a local package version; it never carries a workspace path.
+// and allocated a UUIDv7 idempotency key. Values holds action-specific typed
+// fields such as a local package version or import snapshot source. It never
+// carries a mutable target workspace, database path, or execution default.
 type TaskHubMutationRequest struct {
-	Action         TaskHubAction     `json:"action"`
-	Target         TaskHubTarget     `json:"target"`
-	PlanID         string            `json:"plan_id,omitempty"`
-	Actor          string            `json:"actor"`
-	Reason         string            `json:"reason"`
-	IdempotencyKey string            `json:"idempotency_key"`
-	Values         map[string]string `json:"values,omitempty"`
+	Action         TaskHubAction              `json:"action"`
+	Target         TaskHubTarget              `json:"target"`
+	PlanID         string                     `json:"plan_id,omitempty"`
+	Actor          string                     `json:"actor"`
+	Reason         string                     `json:"reason"`
+	IdempotencyKey string                     `json:"idempotency_key"`
+	Expected       TaskHubLifecycleCheckpoint `json:"expected"`
+	Values         map[string]string          `json:"values,omitempty"`
 }
 
 // Clone returns an independent command value for asynchronous Bubble Tea work.
@@ -429,6 +497,36 @@ type TaskHubRunControlMutationResult struct {
 // the operator has confirmed the preview.
 type TaskHubRunControlMutationExecutor interface {
 	ExecuteTaskHubRunControlMutation(context.Context, TaskHubRunControlMutationRequest) (TaskHubRunControlMutationResult, error)
+}
+
+// TaskHubRunHandoffRequest is a narrow, per-Run request emitted only after an
+// operator has chosen that Run in the TUI exit panel. Both operation identity
+// fields are UUIDv7 values allocated when the panel opens so a lost response
+// replays the same durable handoff rather than spawning another child.
+type TaskHubRunHandoffRequest struct {
+	RunID              string                      `json:"run_id"`
+	Expected           TaskHubRunHandoffCheckpoint `json:"expected"`
+	HandoffOperationID string                      `json:"handoff_operation_id"`
+	IdempotencyKey     string                      `json:"idempotency_key"`
+	Owner              string                      `json:"owner"`
+	Actor              string                      `json:"actor"`
+	Reason             string                      `json:"reason"`
+}
+
+// TaskHubRunHandoffResult is a UI-safe receipt. It never exposes the child
+// PID or managed log path, which are retained as controlled diagnostics.
+type TaskHubRunHandoffResult struct {
+	RunID       string `json:"run_id"`
+	OperationID string `json:"operation_id"`
+	State       string `json:"state"`
+	Summary     string `json:"summary"`
+}
+
+// TaskHubRunHandoffExecutor is intentionally optional. The TUI can still
+// render a read-only Task Hub without a local process launcher, but selected
+// exit handoffs require this exact application-service contract.
+type TaskHubRunHandoffExecutor interface {
+	ExecuteTaskHubRunHandoff(context.Context, TaskHubRunHandoffRequest) (TaskHubRunHandoffResult, error)
 }
 
 // TaskHubRow aggregates one Task with its latest Run for the Tasks tab.
@@ -867,7 +965,6 @@ func (m *model) updateTaskHubV2Search(msg tea.KeyMsg) tea.Cmd {
 		m.hubSearch.Blur()
 		m.focusMgr.Pop()
 		m.taskHub.Query.Filter = strings.TrimSpace(m.hubSearch.Value())
-		m.hubFilter = m.taskHub.Query.Filter
 		m.taskHub.Loading = true
 		return m.loadTaskHubV2()
 	}
@@ -1012,11 +1109,11 @@ func (m *model) handleTaskHubPrefixKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 }
 
 func (m model) taskHubInputFocused() bool {
-	if m.hubSearching || m.searching || m.gateEditingNote {
+	if m.hubSearching {
 		return true
 	}
 	switch m.focusMgr.Current() {
-	case focusSearch, focusStartField, focusGateNotes:
+	case focusSearch:
 		return true
 	default:
 		return false
@@ -1047,8 +1144,6 @@ func taskHubActionForSequence(prefix, second rune) (TaskHubAction, bool) {
 			return TaskHubActionNewTask, true
 		case 'i':
 			return TaskHubActionImportTask, true
-		case 'g':
-			return TaskHubActionGenerateTask, true
 		case 'e':
 			return TaskHubActionEditTask, true
 		case 'f':
@@ -1094,7 +1189,7 @@ func taskHubActionForSequence(prefix, second rune) (TaskHubAction, bool) {
 func taskHubPrefixActions(prefix rune) []TaskHubAction {
 	switch prefix {
 	case 't':
-		return []TaskHubAction{TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionGenerateTask, TaskHubActionEditTask, TaskHubActionForkTask, TaskHubActionArchiveTask, TaskHubActionSoftDeleteTask, TaskHubActionRestoreTask}
+		return []TaskHubAction{TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionEditTask, TaskHubActionForkTask, TaskHubActionArchiveTask, TaskHubActionSoftDeleteTask, TaskHubActionRestoreTask}
 	case 'x':
 		return []TaskHubAction{TaskHubActionContinue, TaskHubActionStartRun, TaskHubActionAttachRun, TaskHubActionOpenRunControl}
 	case 'v':
@@ -1134,7 +1229,22 @@ func (m model) taskHubActionState(action TaskHubAction) TaskHubActionState {
 			}
 		}
 	}
-	if !state.Enabled && taskHubReviewAction(action) {
+	if !state.Enabled && action == TaskHubActionEditTask {
+		task := m.taskHubTaskByID(m.taskHub.SelectedTaskID)
+		run := m.taskHubRunByID(m.taskHub.SelectedRunID)
+		if task.TaskID != "" && run.RunID != "" && run.TaskID == task.TaskID &&
+			task.RevisionID != "" && run.RevisionID == task.RevisionID &&
+			!strings.Contains(state.DisabledReason, "LifecycleMutationService") {
+			return TaskHubActionState{Action: action, Enabled: true}
+		}
+	}
+	if !state.Enabled && action == TaskHubActionWithdrawRelease {
+		if releaseID, selected := m.taskHub.selectedReleaseForTask(m.taskHub.SelectedTaskID); selected && releaseID != "" &&
+			!strings.Contains(state.DisabledReason, "LifecycleMutationService") {
+			return TaskHubActionState{Action: action, Enabled: true}
+		}
+	}
+	if !state.Enabled && taskHubReviewAction(action) && !strings.Contains(state.DisabledReason, "LifecycleMutationService") {
 		if _, _, selected := m.taskHub.selectedReviewForTask(m.taskHub.SelectedTaskID); selected {
 			// Detail selection captures a stable request ID. The adapter still
 			// validates its Task/revision ownership and current open state.
@@ -1170,11 +1280,24 @@ func (m *model) previewTaskHubAction(action TaskHubAction) tea.Cmd {
 	if m.lifecycle == nil {
 		return m.showToast("生命周期服务不可用", toastError)
 	}
-	command := TaskHubCommand{Action: action, Target: m.taskHubTarget()}
+	target := TaskHubTarget{}
+	if !taskHubGlobalAction(action) {
+		target = m.taskHubTarget()
+	}
+	command := TaskHubCommand{Action: action, Target: target}
 	service := m.lifecycle
 	return func() tea.Msg {
 		preview, err := service.PlanTaskHubCommand(m.ctx, command)
 		return taskHubPlanMsg{command: command, preview: preview, err: err}
+	}
+}
+
+func taskHubGlobalAction(action TaskHubAction) bool {
+	switch action {
+	case TaskHubActionNewTask, TaskHubActionImportTask:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1256,7 +1379,10 @@ func (m *model) updateTaskHubMutationKey(msg tea.KeyMsg) tea.Cmd {
 	case "shift+tab", "up":
 		overlay.focusInput(overlay.FocusedField - 1)
 		return nil
-	case "enter":
+	case "enter", "ctrl+s":
+		if msg.String() == "enter" && overlay.focusedInputIsMultiline() {
+			return overlay.updateFocusedInput(msg)
+		}
 		if err := overlay.validate(); err != nil {
 			overlay.Error = err.Error()
 			return nil
@@ -1264,12 +1390,21 @@ func (m *model) updateTaskHubMutationKey(msg tea.KeyMsg) tea.Cmd {
 		if overlay.isRunControl() {
 			return m.executeTaskHubRunControlMutation()
 		}
-		if overlay.Action == TaskHubActionContinue && strings.TrimSpace(overlay.Preview.PlanID) == "" {
+		if taskHubMutationRequiresPreparation(overlay.Action) && strings.TrimSpace(overlay.Preview.PlanID) == "" {
 			return m.prepareTaskHubMutation()
 		}
 		return m.executeTaskHubMutation()
 	default:
 		return overlay.updateFocusedInput(msg)
+	}
+}
+
+func taskHubMutationRequiresPreparation(action TaskHubAction) bool {
+	switch action {
+	case TaskHubActionContinue, TaskHubActionEditTask, TaskHubActionStartRun:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1452,7 +1587,7 @@ func taskHubActionKey(action TaskHubAction) string {
 		second rune
 		action TaskHubAction
 	}{
-		{'t', 'n', TaskHubActionNewTask}, {'t', 'i', TaskHubActionImportTask}, {'t', 'g', TaskHubActionGenerateTask}, {'t', 'e', TaskHubActionEditTask}, {'t', 'f', TaskHubActionForkTask}, {'t', 'a', TaskHubActionArchiveTask}, {'t', 'd', TaskHubActionSoftDeleteTask}, {'t', 'u', TaskHubActionRestoreTask},
+		{'t', 'n', TaskHubActionNewTask}, {'t', 'i', TaskHubActionImportTask}, {'t', 'e', TaskHubActionEditTask}, {'t', 'f', TaskHubActionForkTask}, {'t', 'a', TaskHubActionArchiveTask}, {'t', 'd', TaskHubActionSoftDeleteTask}, {'t', 'u', TaskHubActionRestoreTask},
 		{'x', 'c', TaskHubActionContinue}, {'x', 'n', TaskHubActionStartRun}, {'x', 'a', TaskHubActionAttachRun}, {'x', 'k', TaskHubActionOpenRunControl},
 		{'v', 'a', TaskHubActionApproveReview}, {'v', 'c', TaskHubActionRequestChanges}, {'v', 'r', TaskHubActionRejectReview},
 		{'p', 'p', TaskHubActionPackageRevision}, {'p', 'w', TaskHubActionWithdrawRelease},
@@ -1470,8 +1605,6 @@ func taskHubActionLabel(action TaskHubAction) string {
 		return "新建 Task"
 	case TaskHubActionImportTask:
 		return "导入 Task"
-	case TaskHubActionGenerateTask:
-		return "从仓库出题"
 	case TaskHubActionEditTask:
 		return "创建 draft 修改"
 	case TaskHubActionForkTask:
@@ -1618,6 +1751,9 @@ func (m model) taskHubRunsLines(width int) []string {
 		if run.ControlStatus != "" {
 			line += " · " + run.ControlStatus
 		}
+		if run.WorkerHandoff != nil {
+			line += " · worker " + taskHubWorkerHandoffDisplayState(run.WorkerHandoff.State)
+		}
 		lines = append(lines, clipDisplay(line, width))
 	}
 	return lines
@@ -1658,6 +1794,23 @@ func taskHubRunDisplayState(run TaskHubRun) string {
 		return "阶段已取消·Run 仍进行"
 	}
 	return emptyDash(run.ExecutionState)
+}
+
+func taskHubWorkerHandoffDisplayState(state string) string {
+	switch strings.TrimSpace(state) {
+	case "launching":
+		return "启动中"
+	case "handed_off":
+		return "已接管"
+	case "released":
+		return "已释放"
+	case "failed":
+		return "启动失败"
+	case "expired":
+		return "已过期"
+	default:
+		return emptyDash(state)
+	}
 }
 
 func shortTaskHubID(value string) string {

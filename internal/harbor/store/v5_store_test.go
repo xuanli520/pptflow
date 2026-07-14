@@ -18,26 +18,26 @@ func tempV5DB(t *testing.T) *Store {
 	return s
 }
 
-func TestMigrateExistingV1ThroughV4StoresToCurrentSchema(t *testing.T) {
-	for startingVersion := 1; startingVersion <= 4; startingVersion++ {
+func TestMigrateExistingV2ThroughV4StoresToCurrentSchema(t *testing.T) {
+	for startingVersion := 2; startingVersion <= 4; startingVersion++ {
 		t.Run("from_v"+string(rune('0'+startingVersion)), func(t *testing.T) {
 			root := t.TempDir()
 			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(root, dbFileName)))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec(migrationV1); err != nil {
-				t.Fatal(err)
-			}
 			if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (1)`); err != nil {
+			if _, err := db.Exec(migrationV2); err != nil {
 				t.Fatal(err)
 			}
-			migrations := []string{migrationV2, migrationV3, migrationV4}
-			for version := 2; version <= startingVersion; version++ {
-				if _, err := db.Exec(migrations[version-2]); err != nil {
+			if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (2)`); err != nil {
+				t.Fatal(err)
+			}
+			migrations := []string{migrationV3, migrationV4}
+			for version := 3; version <= startingVersion; version++ {
+				if _, err := db.Exec(migrations[version-3]); err != nil {
 					t.Fatalf("apply v%d fixture: %v", version, err)
 				}
 				if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, version); err != nil {
@@ -316,4 +316,251 @@ func TestV5DurableDispatcherClaimsAndRecoversExpiredWorkers(t *testing.T) {
 	if err != nil || capacityLease == nil || capacityLease.State != LeaseReleased {
 		t.Fatalf("recovery did not release capacity lease: %+v, %v", capacityLease, err)
 	}
+}
+
+func TestV5ScopedDurableClaimFencesSelectionAndEmptyReplay(t *testing.T) {
+	ctx := context.Background()
+	s := tempV5DB(t)
+	task, revision := createValidatedTaskAndRevision(t, s)
+	runA := createV5ReconcileRun(t, ctx, s, task, revision, "scoped-dispatch-a")
+	runB := createV5ReconcileRun(t, ctx, s, task, revision, "scoped-dispatch-b")
+
+	jobA, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "execute", EntityType: "fixture", EntityID: "scoped-dispatch-a", RunID: runA.ID,
+		Priority: 1, PayloadJSON: `{}`, IdempotencyKey: "scoped-dispatch-job-a", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobB, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "execute", EntityType: "fixture", EntityID: "scoped-dispatch-b", RunID: runB.ID,
+		Priority: 100, PayloadJSON: `{}`, IdempotencyKey: "scoped-dispatch-job-b", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := ClaimNextDurableJobRequest{
+		IdempotencyKey: "scoped-dispatch-claim-a", Owner: "worker-a", RunID: runA.ID,
+		LeaseTTL: time.Minute, Actor: "tester", Reason: "claim only Run A",
+	}
+	claim, err := s.ClaimNextDurableJob(ctx, request)
+	if err != nil || claim.Job == nil || claim.Job.ID != jobA.ID || claim.RunID != runA.ID {
+		t.Fatalf("scoped claim = %+v, %v; want Run A job %s", claim, err, jobA.ID)
+	}
+	other, err := s.GetDurableJob(ctx, jobB.ID)
+	if err != nil || other == nil || other.State != JobQueued {
+		t.Fatalf("Run B job after Run A scoped claim = %+v, %v; want queued", other, err)
+	}
+
+	replayed, err := s.ClaimNextDurableJob(ctx, request)
+	if err != nil || replayed.ID != claim.ID || replayed.RunID != runA.ID || replayed.Job == nil || replayed.Job.ID != jobA.ID {
+		t.Fatalf("scoped active claim replay = %+v, %v; want %+v", replayed, err, claim)
+	}
+	conflict := request
+	conflict.RunID = runB.ID
+	if _, err := s.ClaimNextDurableJob(ctx, conflict); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("claim replay under another Run = %v, want ErrIdempotencyConflict", err)
+	}
+
+	emptyRequest := ClaimNextDurableJobRequest{
+		IdempotencyKey: "scoped-dispatch-empty-a", Owner: "worker-a", RunID: runA.ID,
+		LeaseTTL: time.Minute, Actor: "tester", Reason: "prove empty claim scope",
+	}
+	empty, err := s.ClaimNextDurableJob(ctx, emptyRequest)
+	if err != nil || empty.State != "empty" || empty.Job != nil || empty.RunID != runA.ID {
+		t.Fatalf("scoped empty claim = %+v, %v", empty, err)
+	}
+	emptyReplay, err := s.ClaimNextDurableJob(ctx, emptyRequest)
+	if err != nil || emptyReplay.ID != empty.ID || emptyReplay.State != "empty" || emptyReplay.RunID != runA.ID {
+		t.Fatalf("scoped empty replay = %+v, %v; want %+v", emptyReplay, err, empty)
+	}
+	emptyConflict := emptyRequest
+	emptyConflict.RunID = runB.ID
+	if _, err := s.ClaimNextDurableJob(ctx, emptyConflict); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("empty claim replay under another Run = %v, want ErrIdempotencyConflict", err)
+	}
+}
+
+func TestV5ScopedExpiredJobReconciliationLeavesOtherRunUntouched(t *testing.T) {
+	ctx := context.Background()
+	s := tempV5DB(t)
+	clock := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	task, revision := createValidatedTaskAndRevision(t, s)
+	runA := createV5ReconcileRun(t, ctx, s, task, revision, "scoped-reconcile-a")
+	runB := createV5ReconcileRun(t, ctx, s, task, revision, "scoped-reconcile-b")
+
+	jobA, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "execute", EntityType: "fixture", EntityID: "scoped-a", RunID: runA.ID,
+		PayloadJSON: `{}`, IdempotencyKey: "scoped-reconcile-job-a", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimA, err := s.ClaimNextDurableJob(ctx, ClaimNextDurableJobRequest{
+		IdempotencyKey: "scoped-reconcile-claim-a", Owner: "worker-a", LeaseTTL: time.Second, Actor: "tester", Reason: "fixture",
+	})
+	if err != nil || claimA.Job == nil || claimA.DispatchLease == nil || claimA.Job.ID != jobA.ID {
+		t.Fatalf("claim Run A job = %+v, %v", claimA, err)
+	}
+
+	jobB, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "execute", EntityType: "fixture", EntityID: "scoped-b", RunID: runB.ID,
+		PayloadJSON: `{}`, IdempotencyKey: "scoped-reconcile-job-b", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimB, err := s.ClaimNextDurableJob(ctx, ClaimNextDurableJobRequest{
+		IdempotencyKey: "scoped-reconcile-claim-b", Owner: "worker-b", LeaseTTL: time.Second, Actor: "tester", Reason: "fixture",
+	})
+	if err != nil || claimB.Job == nil || claimB.DispatchLease == nil || claimB.Job.ID != jobB.ID {
+		t.Fatalf("claim Run B job = %+v, %v", claimB, err)
+	}
+
+	clock = clock.Add(2 * time.Second)
+	recoveries, err := s.ScanExpiredDurableJobsForReconcile(ctx, ScanExpiredDurableJobsRequest{
+		RunID: runA.ID, Actor: "recovery", Reason: "recover only selected Run",
+	})
+	if err != nil || len(recoveries) != 1 || recoveries[0].Job.ID != jobA.ID || recoveries[0].Job.State != JobInterrupted {
+		t.Fatalf("scoped recovery = %+v, %v", recoveries, err)
+	}
+	otherJob, err := s.GetDurableJob(ctx, jobB.ID)
+	if err != nil || otherJob == nil || otherJob.State != JobRunning {
+		t.Fatalf("unselected Run job changed by scoped recovery: %+v, %v", otherJob, err)
+	}
+	otherLease, err := s.GetLease(ctx, claimB.DispatchLease.ID)
+	if err != nil || otherLease == nil || otherLease.State != LeaseActive {
+		t.Fatalf("unselected Run dispatch lease changed by scoped recovery: %+v, %v", otherLease, err)
+	}
+}
+
+func TestV5ExpireLeasesForRunLeavesOtherRunLeaseUntouched(t *testing.T) {
+	ctx := context.Background()
+	s := tempV5DB(t)
+	clock := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	task, revision := createValidatedTaskAndRevision(t, s)
+	runA := createV5ReconcileRun(t, ctx, s, task, revision, "scoped-lease-a")
+	runB := createV5ReconcileRun(t, ctx, s, task, revision, "scoped-lease-b")
+
+	jobA, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "execute", EntityType: "fixture", EntityID: "lease-a", RunID: runA.ID,
+		PayloadJSON: `{}`, IdempotencyKey: "scoped-lease-job-a", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimA, err := s.ClaimNextDurableJob(ctx, ClaimNextDurableJobRequest{
+		IdempotencyKey: "scoped-lease-claim-a", Owner: "worker-a", LeaseTTL: time.Second, Actor: "tester", Reason: "fixture",
+	})
+	if err != nil || claimA.Job == nil || claimA.DispatchLease == nil || claimA.Job.ID != jobA.ID {
+		t.Fatalf("claim Run A job = %+v, %v", claimA, err)
+	}
+
+	jobB, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "execute", EntityType: "fixture", EntityID: "lease-b", RunID: runB.ID,
+		PayloadJSON: `{}`, IdempotencyKey: "scoped-lease-job-b", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimB, err := s.ClaimNextDurableJob(ctx, ClaimNextDurableJobRequest{
+		IdempotencyKey: "scoped-lease-claim-b", Owner: "worker-b", LeaseTTL: time.Second, Actor: "tester", Reason: "fixture",
+	})
+	if err != nil || claimB.Job == nil || claimB.DispatchLease == nil || claimB.Job.ID != jobB.ID {
+		t.Fatalf("claim Run B job = %+v, %v", claimB, err)
+	}
+
+	clock = clock.Add(2 * time.Second)
+	expired, err := s.ExpireLeasesForRun(ctx, runA.ID, "recovery", "expire only selected Run leases")
+	if err != nil || expired != 1 {
+		t.Fatalf("expire selected Run leases = %d, %v", expired, err)
+	}
+	selectedLease, err := s.GetLease(ctx, claimA.DispatchLease.ID)
+	if err != nil || selectedLease == nil || selectedLease.State != LeaseExpired {
+		t.Fatalf("selected Run lease = %+v, %v", selectedLease, err)
+	}
+	otherLease, err := s.GetLease(ctx, claimB.DispatchLease.ID)
+	if err != nil || otherLease == nil || otherLease.State != LeaseActive {
+		t.Fatalf("unselected Run lease changed by scoped expiration: %+v, %v", otherLease, err)
+	}
+}
+
+func TestV5ExpireQuotaLeasesForScopeLeavesOtherScopesUntouched(t *testing.T) {
+	ctx := context.Background()
+	s := tempV5DB(t)
+	clock := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	taskA, _ := createValidatedTaskAndRevision(t, s)
+	taskB, _ := createValidatedTaskAndRevision(t, s)
+	const actorA = "scope-owner-a"
+	const actorB = "scope-owner-b"
+
+	for _, account := range []CreateQuotaAccountRequest{
+		{ScopeKind: QuotaScopeTask, ScopeID: taskA.ID, Dimension: "token", LimitUnits: 10, Actor: actorA, Reason: "fixture"},
+		{ScopeKind: QuotaScopeTask, ScopeID: taskB.ID, Dimension: "token", LimitUnits: 10, Actor: actorA, Reason: "fixture"},
+		{ScopeKind: QuotaScopeActor, ScopeID: actorA, Dimension: "token", LimitUnits: 10, Actor: actorA, Reason: "fixture"},
+		{ScopeKind: QuotaScopeActor, ScopeID: actorB, Dimension: "token", LimitUnits: 10, Actor: actorB, Reason: "fixture"},
+	} {
+		if _, err := s.CreateQuotaAccount(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reserve := func(key, owner string, scopeKind QuotaScopeKind, scopeID string) DurableQuotaLease {
+		t.Helper()
+		lease, err := s.ReserveQuota(ctx, QuotaLeaseRequest{
+			IdempotencyKey: key, Owner: owner, ScopeKind: scopeKind, ScopeID: scopeID, Dimension: "token", Units: 1,
+			ReclaimPolicy: QuotaReclaimUnused, TTL: time.Second, Actor: owner, Reason: "fixture",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lease
+	}
+	taskLeaseA := reserve("scoped-task-lease-a", actorA, QuotaScopeTask, taskA.ID)
+	taskLeaseB := reserve("scoped-task-lease-b", actorA, QuotaScopeTask, taskB.ID)
+	actorLeaseA := reserve("scoped-actor-lease-a", actorA, QuotaScopeActor, actorA)
+	actorLeaseB := reserve("scoped-actor-lease-b", actorB, QuotaScopeActor, actorB)
+
+	clock = clock.Add(2 * time.Second)
+	expiredTask, err := s.ExpireQuotaLeasesForScope(ctx, QuotaScopeTask, taskA.ID, actorA, "recover selected Task quota")
+	if err != nil || expiredTask != 1 {
+		t.Fatalf("expire selected Task quota lease = %d, %v", expiredTask, err)
+	}
+	expiredActor, err := s.ExpireQuotaLeasesForScope(ctx, QuotaScopeActor, actorA, actorA, "recover selected actor quota")
+	if err != nil || expiredActor != 1 {
+		t.Fatalf("expire selected actor quota lease = %d, %v", expiredActor, err)
+	}
+	for _, expectation := range []struct {
+		name  string
+		lease DurableQuotaLease
+		state DurableQuotaLeaseState
+	}{
+		{name: "selected task", lease: taskLeaseA, state: DurableQuotaLeaseExpired},
+		{name: "other task", lease: taskLeaseB, state: DurableQuotaLeaseActive},
+		{name: "selected actor", lease: actorLeaseA, state: DurableQuotaLeaseExpired},
+		{name: "other actor", lease: actorLeaseB, state: DurableQuotaLeaseActive},
+	} {
+		t.Run(expectation.name, func(t *testing.T) {
+			lease, err := s.GetDurableQuotaLease(ctx, expectation.lease.ID)
+			if err != nil || lease == nil || lease.State != expectation.state {
+				t.Fatalf("quota lease = %+v, %v; want state %s", lease, err, expectation.state)
+			}
+		})
+	}
+}
+
+func createV5ReconcileRun(t *testing.T, ctx context.Context, s *Store, task TaskV2, revision TaskRevision, trigger string) WorkflowRun {
+	t.Helper()
+	run, err := s.CreateWorkflowRun(ctx, CreateWorkflowRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, WorkflowTemplateID: "harbor.standard", WorkflowTemplateVersion: "v5",
+		ResolvedProfileHash: "profile", DefinitionHash: "workflow-fingerprint", RunManifestJSON: `{}`,
+		Trigger: trigger, Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return run
 }

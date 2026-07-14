@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -17,6 +16,14 @@ const (
 	// durable job payloads; callers cannot supply substitute numeric claims.
 	StandardQuotaPolicyID      = "harbor.local.operator"
 	StandardQuotaPolicyVersion = "1.0.0"
+
+	// CodeEdgePhase1QuotaPolicyID and Version identify the explicit quota
+	// policy for the closed Phase-1 compliance/evaluation descriptor. It is
+	// separate from Standard because Phase-1 has no implicit authoring or
+	// repair stage budget, while both evaluator operations still reserve four
+	// logical trials exactly.
+	CodeEdgePhase1QuotaPolicyID      = "harbor.codeedge-phase1.local.operator"
+	CodeEdgePhase1QuotaPolicyVersion = "1.0.0"
 
 	standardTaskStageAttemptLimit  int64 = 120
 	standardActorStageAttemptLimit int64 = 1200
@@ -352,6 +359,37 @@ func StandardQuotaPolicy() QuotaPolicy {
 	}
 }
 
+// CodeEdgePhase1QuotaPolicy returns the explicit resource policy for the
+// closed CodeEdge Phase-1 template. It intentionally contains no agent-turn
+// or repair-round account: this descriptor validates and evaluates an already
+// frozen task snapshot, and any future authoring/repair template must declare
+// its own typed stages and quota contract. Qwen and Opus each reserve exactly
+// four logical trials, matching the confirmed evaluator policy.
+func CodeEdgePhase1QuotaPolicy() QuotaPolicy {
+	catalog := CodeEdgePhase1StageCatalog()
+	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
+	for _, stage := range catalog.Stages {
+		claims := []workflowkit.QuotaClaim{standardQuotaClaim("stage_attempt", standardStageAttemptClaimUnits)}
+		if stage.IsGate() {
+			claims = []workflowkit.QuotaClaim{}
+		}
+		switch stage.Key {
+		case workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(HarborRunOpus):
+			claims = append(claims, standardQuotaClaim("trial", standardEvaluationTrialClaims))
+		}
+		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
+	}
+	return QuotaPolicy{
+		ID:      CodeEdgePhase1QuotaPolicyID,
+		Version: CodeEdgePhase1QuotaPolicyVersion,
+		AccountLimits: []QuotaAccountLimit{
+			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
+			{Dimension: "trial", TaskLimitUnits: standardTaskTrialLimit, ActorLimitUnits: standardActorTrialLimit},
+		},
+		Stages: stages,
+	}
+}
+
 func standardClaimsForStage(stage StageDefinition) []workflowkit.QuotaClaim {
 	if stage.IsGate() {
 		return []workflowkit.QuotaClaim{}
@@ -361,9 +399,9 @@ func standardClaimsForStage(stage StageDefinition) []workflowkit.QuotaClaim {
 		claims = append(claims, standardQuotaClaim("agent_turn", int64(stage.RequiredTurns)))
 	}
 	switch stage.Key {
-	case workflowkit.StageKey(nodes.HarborRunQwen), workflowkit.StageKey(nodes.HarborRunOpus):
+	case workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(HarborRunOpus):
 		claims = append(claims, standardQuotaClaim("trial", standardEvaluationTrialClaims))
-	case workflowkit.StageKey(nodes.TaskRepair):
+	case workflowkit.StageKey(TaskRepair):
 		claims = append(claims, standardQuotaClaim("repair_round", standardRepairRoundClaimUnits))
 	}
 	return claims
@@ -374,14 +412,14 @@ func standardQuotaClaim(dimension string, units int64) workflowkit.QuotaClaim {
 }
 
 var standardAgentQuotaStages = map[workflowkit.StageKey]struct{}{
-	workflowkit.StageKey(nodes.RepoAnalyze):       {},
-	workflowkit.StageKey(nodes.TaskDesign):        {},
-	workflowkit.StageKey(nodes.GenerateTaskFiles): {},
-	workflowkit.StageKey(nodes.InstructionGen):    {},
-	workflowkit.StageKey(nodes.TaskTOMLGen):       {},
-	workflowkit.StageKey(nodes.DockerfileGen):     {},
-	workflowkit.StageKey(nodes.SolveGen):          {},
-	workflowkit.StageKey(nodes.TestGen):           {},
-	workflowkit.StageKey(nodes.TestsAnalysis):     {},
-	workflowkit.StageKey(nodes.TaskRepair):        {},
+	workflowkit.StageKey(RepoAnalyze):       {},
+	workflowkit.StageKey(TaskDesign):        {},
+	workflowkit.StageKey(GenerateTaskFiles): {},
+	workflowkit.StageKey(InstructionGen):    {},
+	workflowkit.StageKey(TaskTOMLGen):       {},
+	workflowkit.StageKey(DockerfileGen):     {},
+	workflowkit.StageKey(SolveGen):          {},
+	workflowkit.StageKey(TestGen):           {},
+	workflowkit.StageKey(TestsAnalysis):     {},
+	workflowkit.StageKey(TaskRepair):        {},
 }

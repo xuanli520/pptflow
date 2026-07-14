@@ -270,11 +270,17 @@ func (s *Store) TransitionWorkflowRun(ctx context.Context, request TransitionWor
 	}
 	now := s.now().UTC()
 	run.Status = request.Status
-	if run.Status == WorkflowRunRunning && run.StartedAt == nil {
+	if (run.Status == WorkflowRunRunning || run.Status == WorkflowRunWaitingReview) && run.StartedAt == nil {
 		run.StartedAt = &now
 	}
-	if isTerminalWorkflowRunStatus(run.Status) {
+	if marksWorkflowRunFinished(run.Status) {
 		run.FinishedAt = &now
+	} else if run.Status == WorkflowRunRunning || run.Status == WorkflowRunQueued || run.Status == WorkflowRunResumeRequested {
+		// failed_recoverable remains an actionable terminal projection, but a
+		// committed continuation is permitted to resume the same immutable Run.
+		// Clear the previous completion timestamp only when execution becomes
+		// active again; history remains in RunAttempt/StageAttempt records.
+		run.FinishedAt = nil
 	}
 	run.Version++
 	result, err := tx.ExecContext(ctx, `
@@ -497,7 +503,7 @@ func (s *Store) TransitionStageAttempt(ctx context.Context, request TransitionSt
 	if value := strings.TrimSpace(request.FailureClass); value != "" {
 		attempt.FailureClass = value
 	}
-	if attempt.ExecutionStatus == StageExecutionRunning && attempt.StartedAt == nil {
+	if (attempt.ExecutionStatus == StageExecutionRunning || attempt.ExecutionStatus == StageExecutionWaiting) && attempt.StartedAt == nil {
 		attempt.StartedAt = &now
 	}
 	if isTerminalStageExecutionStatus(attempt.ExecutionStatus) {
@@ -609,7 +615,11 @@ func validWorkflowRunTransition(from, to WorkflowRunStatus) bool {
 	}
 	switch from {
 	case WorkflowRunQueued:
-		return to == WorkflowRunRunning || to == WorkflowRunCancelRequested || to == WorkflowRunCanceled
+		// A durable coordinator can discover a malformed frozen payload before
+		// it has begun execution. Preserve that integrity fact as in_doubt
+		// rather than leaving a queue entry that another worker would keep
+		// claiming as though it were safe work.
+		return to == WorkflowRunRunning || to == WorkflowRunCancelRequested || to == WorkflowRunCanceled || to == WorkflowRunInDoubt
 	case WorkflowRunRunning:
 		return to == WorkflowRunPauseRequested || to == WorkflowRunWaitingReview || to == WorkflowRunWaitingContinuation ||
 			to == WorkflowRunSucceeded || to == WorkflowRunFailedRecoverable || to == WorkflowRunFailedTerminal ||
@@ -623,7 +633,10 @@ func validWorkflowRunTransition(from, to WorkflowRunStatus) bool {
 		return to == WorkflowRunResumeRequested || to == WorkflowRunCancelRequested || to == WorkflowRunCanceled
 	case WorkflowRunResumeRequested:
 		return to == WorkflowRunRunning || to == WorkflowRunCancelRequested || to == WorkflowRunInterrupted
-	case WorkflowRunWaitingReview, WorkflowRunWaitingContinuation:
+	case WorkflowRunWaitingReview:
+		return to == WorkflowRunRunning || to == WorkflowRunWaitingContinuation || to == WorkflowRunFailedTerminal ||
+			to == WorkflowRunCancelRequested || to == WorkflowRunCanceled || to == WorkflowRunInDoubt
+	case WorkflowRunWaitingContinuation:
 		return to == WorkflowRunRunning || to == WorkflowRunCancelRequested || to == WorkflowRunCanceled || to == WorkflowRunInDoubt
 	case WorkflowRunCancelRequested, WorkflowRunStopRequested:
 		return to == WorkflowRunCanceling || to == WorkflowRunCanceled || to == WorkflowRunInDoubt || to == WorkflowRunInterrupted
@@ -631,12 +644,23 @@ func validWorkflowRunTransition(from, to WorkflowRunStatus) bool {
 		return to == WorkflowRunCanceled || to == WorkflowRunInDoubt || to == WorkflowRunInterrupted
 	case WorkflowRunInDoubt:
 		return to == WorkflowRunRunning || to == WorkflowRunSucceeded || to == WorkflowRunFailedRecoverable || to == WorkflowRunCanceled || to == WorkflowRunInterrupted
+	case WorkflowRunFailedRecoverable:
+		return to == WorkflowRunRunning || to == WorkflowRunResumeRequested || to == WorkflowRunCanceled || to == WorkflowRunInDoubt
 	default:
 		return false
 	}
 }
 
 func isTerminalWorkflowRunStatus(status WorkflowRunStatus) bool {
+	switch status {
+	case WorkflowRunSucceeded, WorkflowRunFailedTerminal, WorkflowRunCanceled, WorkflowRunInterrupted:
+		return true
+	default:
+		return false
+	}
+}
+
+func marksWorkflowRunFinished(status WorkflowRunStatus) bool {
 	switch status {
 	case WorkflowRunSucceeded, WorkflowRunFailedRecoverable, WorkflowRunFailedTerminal, WorkflowRunCanceled, WorkflowRunInterrupted:
 		return true
@@ -647,7 +671,7 @@ func isTerminalWorkflowRunStatus(status WorkflowRunStatus) bool {
 
 func validStageExecutionStatus(status StageExecutionStatus) bool {
 	switch status {
-	case StageExecutionQueued, StageExecutionRunning, StageExecutionCompleted, StageExecutionInfraFailed,
+	case StageExecutionQueued, StageExecutionRunning, StageExecutionWaiting, StageExecutionCompleted, StageExecutionInfraFailed,
 		StageExecutionInterrupted, StageExecutionInDoubt, StageExecutionReconciling, StageExecutionCanceled:
 		return true
 	default:
@@ -670,9 +694,11 @@ func validStageTransition(from, to StageExecutionStatus) bool {
 	}
 	switch from {
 	case StageExecutionQueued:
-		return to == StageExecutionRunning || to == StageExecutionCanceled
+		return to == StageExecutionRunning || to == StageExecutionWaiting || to == StageExecutionCanceled
 	case StageExecutionRunning:
-		return to == StageExecutionCompleted || to == StageExecutionInfraFailed || to == StageExecutionInterrupted || to == StageExecutionInDoubt || to == StageExecutionCanceled
+		return to == StageExecutionWaiting || to == StageExecutionCompleted || to == StageExecutionInfraFailed || to == StageExecutionInterrupted || to == StageExecutionInDoubt || to == StageExecutionCanceled
+	case StageExecutionWaiting:
+		return to == StageExecutionRunning || to == StageExecutionCompleted || to == StageExecutionInfraFailed || to == StageExecutionInterrupted || to == StageExecutionInDoubt || to == StageExecutionCanceled
 	case StageExecutionInDoubt:
 		return to == StageExecutionReconciling
 	case StageExecutionReconciling:

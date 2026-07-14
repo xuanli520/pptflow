@@ -505,13 +505,16 @@ type ListQueuedDurableJobsRequest struct {
 	Limit int
 }
 
-// ClaimNextDurableJobRequest is idempotent. A blank CapacityPoolKey means the
-// caller only needs a per-job dispatch lease; otherwise one pool slot is
-// acquired in the same transaction as the queued-to-running transition.
+// ClaimNextDurableJobRequest is idempotent. RunID narrows a controlled child
+// worker to durable jobs for one Run; blank preserves a deployment-wide worker
+// claim. A blank CapacityPoolKey means the caller only needs a per-job
+// dispatch lease; otherwise one pool slot is acquired in the same transaction
+// as the queued-to-running transition.
 type ClaimNextDurableJobRequest struct {
 	ID              string
 	IdempotencyKey  string
 	Owner           string
+	RunID           string
 	LeaseTTL        time.Duration
 	CapacityPoolKey string
 	Actor           string
@@ -524,6 +527,7 @@ type ClaimNextDurableJobRequest struct {
 type DurableJobDispatchClaim struct {
 	ID              string
 	IdempotencyKey  string
+	RunID           string
 	Job             *DurableJob
 	Owner           string
 	LeaseTTL        time.Duration

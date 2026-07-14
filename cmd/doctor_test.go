@@ -3,13 +3,12 @@ package cmd
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
 func TestRunDoctorReportsMissingRequiredTools(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	report := runDoctor("")
+	report := runDoctor()
 	if report.Passed {
 		t.Fatalf("doctor should fail when required tools are missing: %+v", report)
 	}
@@ -26,7 +25,7 @@ func TestRunDoctorFindsToolsInPath(t *testing.T) {
 	writeDoctorFake(t, binDir, "codex", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.133.0'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then echo 'app-server --listen stdio:// -c key=value'; exit 0; fi\nexit 1\n")
 	writeDoctorFake(t, binDir, "go", "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'go version go1.26.3 linux/amd64'; exit 0; fi\nexit 1\n")
 	t.Setenv("PATH", binDir)
-	report := runDoctor("")
+	report := runDoctor()
 	if !report.Passed {
 		t.Fatalf("doctor should pass with all required tools in PATH: %+v", report)
 	}
@@ -48,7 +47,7 @@ func TestRunDoctorReportsDockerDaemonFailure(t *testing.T) {
 	writeDoctorFake(t, binDir, "go", "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'go version go1.26.3 linux/amd64'; exit 0; fi\nexit 1\n")
 	writeDoctorFake(t, binDir, "docker", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Docker version 29.5.2'; exit 0; fi\nif [ \"$1\" = \"info\" ]; then echo daemon unavailable >&2; exit 1; fi\nexit 1\n")
 	t.Setenv("PATH", binDir)
-	report := runDoctor("")
+	report := runDoctor()
 	if report.Passed {
 		t.Fatalf("doctor should fail when docker daemon is unavailable: %+v", report)
 	}
@@ -65,7 +64,7 @@ func TestRunDoctorReportsGoVersionTooOld(t *testing.T) {
 	writeDoctorFake(t, binDir, "codex", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.133.0'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then echo 'app-server --listen stdio:// -c key=value'; exit 0; fi\nexit 1\n")
 	writeDoctorFake(t, binDir, "go", "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'go version go1.25.9 linux/amd64'; exit 0; fi\nexit 1\n")
 	t.Setenv("PATH", binDir)
-	report := runDoctor("")
+	report := runDoctor()
 	if report.Passed {
 		t.Fatalf("doctor should fail when Go is below go.mod requirement: %+v", report)
 	}
@@ -82,37 +81,12 @@ func TestRunDoctorRejectsHarborWithoutAgentFlag(t *testing.T) {
 	writeDoctorFake(t, binDir, "codex", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.133.0'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then echo 'app-server --listen stdio:// -c key=value'; exit 0; fi\nexit 1\n")
 	writeDoctorFake(t, binDir, "go", "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'go version go1.26.3 linux/amd64'; exit 0; fi\nexit 1\n")
 	t.Setenv("PATH", binDir)
-	report := runDoctor("")
+	report := runDoctor()
 	if report.Passed {
 		t.Fatalf("doctor should fail when harbor run lacks -a capability: %+v", report)
 	}
 	if !hasDoctorIssue(report, "harbor CLI health check failed") {
 		t.Fatalf("doctor report missing harbor health issue: %+v", report)
-	}
-}
-
-func TestRunDoctorScansWorkspaceForSecrets(t *testing.T) {
-	binDir := t.TempDir()
-	writeDoctorFake(t, binDir, "git", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'git version 2.47.3'; exit 0; fi\nexit 1\n")
-	writeDoctorFake(t, binDir, "docker", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Docker version 29.5.2'; exit 0; fi\nif [ \"$1\" = \"info\" ]; then echo '\"29.5.2\"'; exit 0; fi\nexit 1\n")
-	writeDoctorFake(t, binDir, "harbor", doctorFakeHarborHelp("run -p TASK -a AGENT -m MODEL -n 4 -k 4 --ae KEY=VALUE"))
-	writeDoctorFake(t, binDir, "codex", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.133.0'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then echo 'app-server --listen stdio:// -c key=value'; exit 0; fi\nexit 1\n")
-	writeDoctorFake(t, binDir, "go", "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'go version go1.26.3 linux/amd64'; exit 0; fi\nexit 1\n")
-	t.Setenv("PATH", binDir)
-
-	workspace := t.TempDir()
-	if err := os.WriteFile(filepath.Join(workspace, "command_run.json"), []byte("GPT_IMAGE_API_KEY=raw-image-secret\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	report := runDoctor(workspace)
-	if report.Passed || report.SecretScan == nil || report.SecretScan.Passed || report.SecretScan.FindingCount == 0 {
-		t.Fatalf("expected workspace secret scan failure: %+v", report)
-	}
-	if !hasDoctorIssue(report, "workspace secret scan failed") {
-		t.Fatalf("doctor report missing secret scan issue: %+v", report.Issues)
-	}
-	if strings.Contains(report.SecretScan.Summary, "raw-image-secret") {
-		t.Fatalf("secret scan summary leaked raw secret: %+v", report.SecretScan)
 	}
 }
 

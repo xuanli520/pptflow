@@ -1,18 +1,35 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/user"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 
-const taskHubPackageVersionField = "release_version"
+const (
+	taskHubPackageVersionField       = "release_version"
+	taskHubTaskSlugField             = "slug"
+	taskHubTaskTitleField            = "title"
+	taskHubTaskMetadataJSONField     = "metadata_json"
+	taskHubTaskSourceRepoField       = "source_repo"
+	taskHubTaskSourceCommitField     = "source_commit"
+	taskHubImportSourcePathField     = "source_path"
+	taskHubImportProposalDigestField = "proposal_digest"
+	taskHubImportChangeSummaryField  = "change_summary"
+	taskHubRestoreStateField         = "restore_state"
+	taskHubExecutionProfilePathField = "profile_path"
+	taskHubExecutionSpecPathField    = "execution_spec_path"
+	taskHubRunTriggerField           = "trigger"
+	taskHubUnifiedDiffField          = "unified_diff"
+)
 
 type taskHubMutationPhase string
 
@@ -26,21 +43,23 @@ const (
 // mutations. It owns only interaction state: application services remain the
 // sole owners of plans, durable commands, and all persistent effects.
 type TaskHubMutationOverlay struct {
-	Action         TaskHubAction
-	ControlAction  TaskHubRunControlAction
-	Target         TaskHubTarget
-	Expected       TaskHubControlCheckpoint
-	Preview        TaskHubPlanPreview
-	Actor          string
-	IdempotencyKey string
-	FrozenActor    string
-	FrozenReason   string
-	ReasonInput    textinput.Model
-	ValueInputs    map[string]textinput.Model
-	FieldOrder     []string
-	FocusedField   int
-	Phase          taskHubMutationPhase
-	Error          string
+	Action            TaskHubAction
+	ControlAction     TaskHubRunControlAction
+	Target            TaskHubTarget
+	Expected          TaskHubControlCheckpoint
+	ExpectedLifecycle TaskHubLifecycleCheckpoint
+	Preview           TaskHubPlanPreview
+	Actor             string
+	IdempotencyKey    string
+	FrozenActor       string
+	FrozenReason      string
+	ReasonInput       textinput.Model
+	ValueInputs       map[string]textinput.Model
+	TextAreaInputs    map[string]textarea.Model
+	FieldOrder        []string
+	FocusedField      int
+	Phase             taskHubMutationPhase
+	Error             string
 }
 
 // The indirections make actor/key failure paths deterministic in unit tests
@@ -63,13 +82,15 @@ func newTaskHubMutationOverlay(action TaskHubAction, target TaskHubTarget, previ
 		return nil, fmt.Errorf("allocate Task Hub idempotency key: %w", err)
 	}
 	overlay := &TaskHubMutationOverlay{
-		Action:         action,
-		Target:         target,
-		Preview:        preview.Clone(),
-		Actor:          actor,
-		IdempotencyKey: key,
-		ValueInputs:    make(map[string]textinput.Model),
-		Phase:          taskHubMutationReady,
+		Action:            action,
+		Target:            target,
+		Preview:           preview.Clone(),
+		ExpectedLifecycle: preview.Expected,
+		Actor:             actor,
+		IdempotencyKey:    key,
+		ValueInputs:       make(map[string]textinput.Model),
+		TextAreaInputs:    make(map[string]textarea.Model),
+		Phase:             taskHubMutationReady,
 	}
 	overlay.initializeInputs()
 	return overlay, nil
@@ -91,12 +112,108 @@ func (overlay *TaskHubMutationOverlay) initializeInputs() {
 	}
 	overlay.ReasonInput = newTaskHubMutationInput("操作原因", "说明这次操作的原因")
 	overlay.FieldOrder = []string{"reason"}
-	if overlay.Action == TaskHubActionPackageRevision {
-		input := newTaskHubMutationInput("本地 package 版本", "例如 v1.0.0")
-		overlay.ValueInputs[taskHubPackageVersionField] = input
-		overlay.FieldOrder = append(overlay.FieldOrder, taskHubPackageVersionField)
+	for _, field := range taskHubMutationFields(overlay.Action) {
+		if field.multiline {
+			overlay.addTextAreaInput(field.key, field.placeholder)
+			continue
+		}
+		overlay.addValueInput(field.key, field.placeholder)
 	}
 	overlay.focusInput(0)
+}
+
+type taskHubMutationField struct {
+	key         string
+	label       string
+	placeholder string
+	multiline   bool
+}
+
+func taskHubMutationFields(action TaskHubAction) []taskHubMutationField {
+	switch action {
+	case TaskHubActionNewTask:
+		return []taskHubMutationField{
+			{key: taskHubTaskSlugField, label: "Task 标识", placeholder: "例如 harbor-algorithms"},
+			{key: taskHubTaskTitleField, label: "Task 标题", placeholder: "Task 的可读标题"},
+			{key: taskHubTaskMetadataJSONField, label: "元数据 JSON（可选）", placeholder: "例如 {\"tags\":[\"go\"]}"},
+			{key: taskHubTaskSourceRepoField, label: "来源仓库（可选）", placeholder: "https://..."},
+			{key: taskHubTaskSourceCommitField, label: "来源提交（可选）", placeholder: "commit SHA"},
+		}
+	case TaskHubActionImportTask:
+		return []taskHubMutationField{
+			{key: taskHubTaskSlugField, label: "Task 标识", placeholder: "例如 harbor-algorithms"},
+			{key: taskHubTaskTitleField, label: "Task 标题", placeholder: "Task 的可读标题"},
+			{key: taskHubImportSourcePathField, label: "受管快照目录", placeholder: "/absolute/path/to/task-snapshot"},
+			{key: taskHubTaskMetadataJSONField, label: "元数据 JSON（可选）", placeholder: "例如 {\"tags\":[\"go\"]}"},
+			{key: taskHubTaskSourceRepoField, label: "来源仓库（可选）", placeholder: "https://..."},
+			{key: taskHubTaskSourceCommitField, label: "来源提交（可选）", placeholder: "commit SHA"},
+			{key: taskHubImportProposalDigestField, label: "提案摘要（可选）", placeholder: "sha256:..."},
+			{key: taskHubImportChangeSummaryField, label: "变更说明（可选）", placeholder: "导入说明"},
+		}
+	case TaskHubActionForkTask:
+		return []taskHubMutationField{
+			{key: taskHubTaskSlugField, label: "新 Task 标识", placeholder: "例如 harbor-algorithms-fork"},
+			{key: taskHubTaskTitleField, label: "新 Task 标题", placeholder: "Fork 的可读标题"},
+			{key: taskHubTaskMetadataJSONField, label: "元数据 JSON（可选）", placeholder: "例如 {\"fork\":true}"},
+		}
+	case TaskHubActionRestoreTask:
+		return []taskHubMutationField{{key: taskHubRestoreStateField, label: "恢复后的状态", placeholder: "draft | ready | published | archived"}}
+	case TaskHubActionStartRun:
+		return []taskHubMutationField{
+			{key: taskHubExecutionProfilePathField, label: "Execution profile JSON", placeholder: "/absolute/path/to/profile.json"},
+			{key: taskHubExecutionSpecPathField, label: "Execution spec JSON", placeholder: "/absolute/path/to/execution-spec.json"},
+			{key: taskHubRunTriggerField, label: "运行触发说明", placeholder: "例如 task_hub"},
+		}
+	case TaskHubActionEditTask:
+		return []taskHubMutationField{{key: taskHubUnifiedDiffField, label: "Unified diff", placeholder: "--- a/path\n+++ b/path\n@@ ...", multiline: true}}
+	case TaskHubActionPackageRevision:
+		return []taskHubMutationField{{key: taskHubPackageVersionField, label: "本地 package 版本", placeholder: "例如 v1.0.0"}}
+	default:
+		return nil
+	}
+}
+
+func taskHubMutationFieldLabel(field string) string {
+	if field == "reason" {
+		return "操作原因"
+	}
+	for _, action := range []TaskHubAction{
+		TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionForkTask, TaskHubActionRestoreTask,
+		TaskHubActionStartRun, TaskHubActionEditTask, TaskHubActionPackageRevision,
+	} {
+		for _, candidate := range taskHubMutationFields(action) {
+			if candidate.key == field {
+				return candidate.label
+			}
+		}
+	}
+	return field
+}
+
+func (overlay *TaskHubMutationOverlay) addValueInput(field, placeholder string) {
+	if overlay == nil {
+		return
+	}
+	input := newTaskHubMutationInput(taskHubMutationFieldLabel(field), placeholder)
+	if field == taskHubTaskMetadataJSONField || field == taskHubUnifiedDiffField {
+		input.CharLimit = 4096
+	}
+	overlay.ValueInputs[field] = input
+	overlay.FieldOrder = append(overlay.FieldOrder, field)
+}
+
+func (overlay *TaskHubMutationOverlay) addTextAreaInput(field, placeholder string) {
+	if overlay == nil {
+		return
+	}
+	input := textarea.New()
+	input.Prompt = ""
+	input.Placeholder = placeholder
+	input.CharLimit = 65536
+	input.SetWidth(52)
+	input.SetHeight(7)
+	overlay.TextAreaInputs[field] = input
+	overlay.FieldOrder = append(overlay.FieldOrder, field)
 }
 
 func newTaskHubMutationInput(_ string, placeholder string) textinput.Model {
@@ -136,6 +253,10 @@ func (overlay *TaskHubMutationOverlay) Clone() *TaskHubMutationOverlay {
 	for key, input := range overlay.ValueInputs {
 		clone.ValueInputs[key] = input
 	}
+	clone.TextAreaInputs = make(map[string]textarea.Model, len(overlay.TextAreaInputs))
+	for key, input := range overlay.TextAreaInputs {
+		clone.TextAreaInputs[key] = input
+	}
 	return &clone
 }
 
@@ -163,6 +284,15 @@ func (overlay *TaskHubMutationOverlay) focusInput(index int) {
 			}
 			continue
 		}
+		if input, found := overlay.TextAreaInputs[field]; found {
+			if current == overlay.FocusedField {
+				input.Focus()
+			} else {
+				input.Blur()
+			}
+			overlay.TextAreaInputs[field] = input
+			continue
+		}
 		input := overlay.ValueInputs[field]
 		if current == overlay.FocusedField {
 			input.Focus()
@@ -183,6 +313,11 @@ func (overlay *TaskHubMutationOverlay) updateFocusedInput(msg tea.KeyMsg) tea.Cm
 		overlay.ReasonInput, command = overlay.ReasonInput.Update(msg)
 		return command
 	}
+	if input, found := overlay.TextAreaInputs[field]; found {
+		updated, command := input.Update(msg)
+		overlay.TextAreaInputs[field] = updated
+		return command
+	}
 	input := overlay.ValueInputs[field]
 	updated, command := input.Update(msg)
 	overlay.ValueInputs[field] = updated
@@ -199,8 +334,11 @@ func (overlay *TaskHubMutationOverlay) request() TaskHubMutationRequest {
 		actor = overlay.FrozenActor
 		reason = overlay.FrozenReason
 	}
-	values := make(map[string]string, len(overlay.ValueInputs))
+	values := make(map[string]string, len(overlay.ValueInputs)+len(overlay.TextAreaInputs))
 	for key, input := range overlay.ValueInputs {
+		values[key] = strings.TrimSpace(input.Value())
+	}
+	for key, input := range overlay.TextAreaInputs {
 		values[key] = strings.TrimSpace(input.Value())
 	}
 	return TaskHubMutationRequest{
@@ -210,6 +348,7 @@ func (overlay *TaskHubMutationOverlay) request() TaskHubMutationRequest {
 		Actor:          actor,
 		Reason:         reason,
 		IdempotencyKey: strings.TrimSpace(overlay.IdempotencyKey),
+		Expected:       overlay.ExpectedLifecycle,
 		Values:         values,
 	}
 }
@@ -249,14 +388,64 @@ func (overlay *TaskHubMutationOverlay) validate() error {
 	if err := store.ValidateUUIDv7(request.IdempotencyKey); err != nil {
 		return fmt.Errorf("确认幂等键无效: %w", err)
 	}
-	if overlay.Action == TaskHubActionPackageRevision && strings.TrimSpace(request.Values[taskHubPackageVersionField]) == "" {
-		return fmt.Errorf("必须填写本地 package 版本")
+	return validateTaskHubMutationValues(request)
+}
+
+func validateTaskHubMutationValues(request TaskHubMutationRequest) error {
+	for _, field := range taskHubRequiredMutationFields(request.Action) {
+		if strings.TrimSpace(request.Values[field]) == "" {
+			return fmt.Errorf("必须填写%s", taskHubMutationFieldLabel(field))
+		}
+	}
+	if metadata := strings.TrimSpace(request.Values[taskHubTaskMetadataJSONField]); metadata != "" && !json.Valid([]byte(metadata)) {
+		return fmt.Errorf("元数据 JSON 必须是有效 JSON")
+	}
+	if request.Action == TaskHubActionRestoreTask && !taskHubRestoreStateValid(request.Values[taskHubRestoreStateField]) {
+		return fmt.Errorf("恢复后的状态必须是 draft、ready、published 或 archived")
 	}
 	return nil
 }
 
+func taskHubRequiredMutationFields(action TaskHubAction) []string {
+	switch action {
+	case TaskHubActionNewTask:
+		return []string{taskHubTaskSlugField, taskHubTaskTitleField}
+	case TaskHubActionImportTask:
+		return []string{taskHubTaskSlugField, taskHubTaskTitleField, taskHubImportSourcePathField}
+	case TaskHubActionForkTask:
+		return []string{taskHubTaskSlugField, taskHubTaskTitleField}
+	case TaskHubActionRestoreTask:
+		return []string{taskHubRestoreStateField}
+	case TaskHubActionStartRun:
+		return []string{taskHubExecutionProfilePathField, taskHubExecutionSpecPathField, taskHubRunTriggerField}
+	case TaskHubActionEditTask:
+		return []string{taskHubUnifiedDiffField}
+	case TaskHubActionPackageRevision:
+		return []string{taskHubPackageVersionField}
+	default:
+		return nil
+	}
+}
+
+func taskHubRestoreStateValid(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "draft", "ready", "published", "archived":
+		return true
+	default:
+		return false
+	}
+}
+
 func (overlay *TaskHubMutationOverlay) isRunControl() bool {
 	return overlay != nil && overlay.ControlAction != ""
+}
+
+func (overlay *TaskHubMutationOverlay) focusedInputIsMultiline() bool {
+	if overlay == nil || len(overlay.FieldOrder) == 0 || overlay.FocusedField < 0 || overlay.FocusedField >= len(overlay.FieldOrder) {
+		return false
+	}
+	_, found := overlay.TextAreaInputs[overlay.FieldOrder[overlay.FocusedField]]
+	return found
 }
 
 func (overlay *TaskHubMutationOverlay) actionLabel() string {
@@ -290,11 +479,19 @@ func (overlay *TaskHubMutationOverlay) View(width, height int) string {
 	} else {
 		rows = append(rows, "操作员："+redactSingleLineUI(overlay.Actor))
 	}
-	if overlay.Action == TaskHubActionPackageRevision {
-		rows = append(rows, "本地 package 版本："+overlay.ValueInputs[taskHubPackageVersionField].View())
-	}
+	focusedRow := len(rows)
 	if !overlay.isFrozen() {
-		rows = append(rows, "操作原因："+overlay.ReasonInput.View())
+		for index, field := range overlay.FieldOrder {
+			if index == overlay.FocusedField {
+				focusedRow = len(rows)
+			}
+			if _, multiline := overlay.TextAreaInputs[field]; multiline {
+				rows = append(rows, taskHubMutationFieldLabel(field)+"：")
+				rows = append(rows, strings.Split(overlay.fieldView(field, contentWidth), "\n")...)
+				continue
+			}
+			rows = append(rows, taskHubMutationFieldLabel(field)+"："+overlay.fieldView(field, contentWidth))
+		}
 	}
 	if overlay.Error != "" {
 		rows = append(rows, failStyle.Render(clipDisplay(redactSingleLineUI(overlay.Error), contentWidth)))
@@ -308,13 +505,30 @@ func (overlay *TaskHubMutationOverlay) View(width, height int) string {
 	}
 	if overlay.isFrozen() {
 		rows = append(rows, subtleStyle.Render("[Enter] 提交冻结计划  [Esc] 取消"))
+	} else if overlay.hasMultilineInput() {
+		rows = append(rows, subtleStyle.Render("[Tab] 切换字段  [Enter] 在 diff 中换行  [Ctrl+S] 确认提交  [Esc] 取消"))
 	} else {
 		rows = append(rows, subtleStyle.Render("[Tab] 切换字段  [Enter] 确认提交  [Esc] 取消"))
 	}
 	rows = clipOverlayRows(rows, contentWidth)
-	rows = fitOverlayRows(rows, height, len(rows)-3)
+	rows = fitOverlayRows(rows, height, focusedRow)
 	body := lipgloss.JoinVertical(lipgloss.Left, rows...)
 	boxWidth := boundedPanelWidth(width, 42, 82)
 	box := panelStyle.Width(boxWidth).Align(lipgloss.Left).Render(body)
 	return lipgloss.Place(maxInt(1, width), maxInt(1, height), lipgloss.Center, lipgloss.Center, box)
+}
+
+func (overlay *TaskHubMutationOverlay) fieldView(field string, contentWidth int) string {
+	if field == "reason" {
+		return textInputView(overlay.ReasonInput, maxInt(12, contentWidth-18))
+	}
+	if input, found := overlay.TextAreaInputs[field]; found {
+		input.SetWidth(maxInt(12, contentWidth-2))
+		return input.View()
+	}
+	return textInputView(overlay.ValueInputs[field], maxInt(12, contentWidth-18))
+}
+
+func (overlay *TaskHubMutationOverlay) hasMultilineInput() bool {
+	return overlay != nil && len(overlay.TextAreaInputs) > 0
 }

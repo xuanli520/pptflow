@@ -13,17 +13,6 @@ import (
 	"strings"
 )
 
-// TaskDigestVersion distinguishes legacy evidence from a canonical V2 task
-// revision snapshot. The legacy wire representation remains sha256:<hex> for
-// compatibility, while V2 always carries its scheme in the digest value.
-type TaskDigestVersion string
-
-const (
-	TaskDigestUnknown  TaskDigestVersion = ""
-	TaskDigestLegacyV1 TaskDigestVersion = "legacy.v1:sha256"
-	TaskDigestV2       TaskDigestVersion = TaskDigestV2Scheme
-)
-
 const canonicalManifestV2Domain = "harbor.task.v2"
 
 // SnapshotValidationError reports all deterministic V2 policy violations
@@ -95,71 +84,25 @@ func ComputeManagedTaskDigestV2(root string) (string, error) {
 	return TaskDigestV2Prefix + hex.EncodeToString(manifest.Sum(nil)), nil
 }
 
-// ClassifyTaskDigest verifies the wire format and returns its evidence
-// generation. It deliberately recognizes only the legacy V1 form and the
-// explicit V2 form, so callers cannot silently treat one generation as the
-// other.
-func ClassifyTaskDigest(value string) (TaskDigestVersion, error) {
-	value = strings.TrimSpace(value)
-	switch {
-	case strings.HasPrefix(value, TaskDigestV2Prefix):
-		if err := validateDigestHex(strings.TrimPrefix(value, TaskDigestV2Prefix)); err != nil {
-			return TaskDigestUnknown, fmt.Errorf("invalid %s digest: %w", TaskDigestV2Scheme, err)
-		}
-		return TaskDigestV2, nil
-	case strings.HasPrefix(value, LegacyTaskDigestPrefix):
-		if err := validateDigestHex(strings.TrimPrefix(value, LegacyTaskDigestPrefix)); err != nil {
-			return TaskDigestUnknown, fmt.Errorf("invalid legacy V1 task digest: %w", err)
-		}
-		return TaskDigestLegacyV1, nil
-	default:
-		return TaskDigestUnknown, fmt.Errorf("unknown task digest scheme")
-	}
-}
-
 // IsV2TaskDigest reports whether value is a valid canonical V2 digest.
 func IsV2TaskDigest(value string) bool {
-	version, err := ClassifyTaskDigest(value)
-	return err == nil && version == TaskDigestV2
+	return ValidateV2TaskDigest(value) == nil
 }
 
-// ValidateV2TaskDigest rejects malformed values and legacy evidence at the
-// V2 revision boundary. Control-plane persistence should call this before
-// binding a digest to a V2 TaskRevision.
+// ValidateV2TaskDigest validates the only task-digest format accepted by the
+// V2 revision boundary. Control-plane persistence calls it before binding a
+// digest to a TaskRevision.
 func ValidateV2TaskDigest(value string) error {
 	if value != strings.TrimSpace(value) {
 		return fmt.Errorf("V2 task digest must not contain surrounding whitespace")
 	}
-	version, err := ClassifyTaskDigest(value)
-	if err != nil {
-		return err
+	if !strings.HasPrefix(value, TaskDigestV2Prefix) {
+		return fmt.Errorf("V2 task digest must use %s", TaskDigestV2Prefix)
 	}
-	if version != TaskDigestV2 {
-		return fmt.Errorf("V2 task digest required; got %s", version)
+	if err := validateDigestHex(strings.TrimPrefix(value, TaskDigestV2Prefix)); err != nil {
+		return fmt.Errorf("invalid %s digest: %w", TaskDigestV2Scheme, err)
 	}
 	return nil
-}
-
-// IsLegacyV1TaskDigest reports whether value is a valid V1 compatibility
-// digest. V1 values are readable evidence only and must not be used to bind a
-// V2 task revision.
-func IsLegacyV1TaskDigest(value string) bool {
-	version, err := ClassifyTaskDigest(value)
-	return err == nil && version == TaskDigestLegacyV1
-}
-
-// EqualTaskDigests compares only valid task digests from the same generation.
-// In particular, legacy V1 evidence can never compare equal to V2 evidence.
-func EqualTaskDigests(left, right string) bool {
-	leftVersion, err := ClassifyTaskDigest(left)
-	if err != nil {
-		return false
-	}
-	rightVersion, err := ClassifyTaskDigest(right)
-	if err != nil || leftVersion != rightVersion {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
 }
 
 func inspectManagedSnapshotV2(root string) ([]snapshotFile, error) {

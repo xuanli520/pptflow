@@ -24,10 +24,10 @@ type GarbageCollectCandidateRequest struct {
 }
 
 type CandidateGarbageCollectionResult struct {
-	Candidate  store.RevisionCandidate                  `json:"candidate"`
+	Candidate  store.RevisionCandidate                   `json:"candidate"`
 	Operation  store.CandidateGarbageCollectionOperation `json:"operation"`
-	Collected  bool                                     `json:"collected"`
-	InProgress bool                                     `json:"in_progress"`
+	Collected  bool                                      `json:"collected"`
+	InProgress bool                                      `json:"in_progress"`
 }
 
 type SweepExpiredCandidateGarbageCollectionRequest struct {

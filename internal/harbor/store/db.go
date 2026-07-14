@@ -16,13 +16,19 @@ import (
 )
 
 const (
-	schemaVersion = 11
+	schemaVersion = 18
 	dbFileName    = "harbor.db"
 )
 
 // ErrReadOnly is returned when a caller tries to mutate a Store opened for a
 // no-side-effect preview.
-var ErrReadOnly = errors.New("store: read-only")
+var (
+	ErrReadOnly = errors.New("store: read-only")
+
+	// ErrLegacyV1Store rejects databases from the retired workspace-index
+	// implementation. Hard cutover never reads, migrates, or rewrites them.
+	ErrLegacyV1Store = errors.New("store: V1 database is incompatible with the hard cutover")
+)
 
 type Store struct {
 	db        *sql.DB
@@ -105,6 +111,10 @@ func OpenReadOnly(rootDir string) (*Store, error) {
 		backupStop: make(chan struct{}),
 		backupDone: make(chan struct{}),
 	}
+	if err := s.rejectLegacyV1Store(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := s.validateReadOnlySchema(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -161,22 +171,6 @@ func openAndMigrate(rootDir, dbPath string) (*Store, error) {
 	return s, nil
 }
 
-// ResetDatabase is retained only for legacy V1 index callers. V2 SQLite state
-// is authoritative and corruption is recovered through verified backups in
-// Open; new lifecycle code must not call this destructive compatibility API.
-//
-// Deprecated: use automatic verified-backup recovery instead.
-func ResetDatabase(rootDir string) error {
-	rootDir = normalizeStoreRoot(rootDir)
-	dbPath := filepath.Join(rootDir, dbFileName)
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if err := os.Remove(dbPath + suffix); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove store database: %w", err)
-		}
-	}
-	return nil
-}
-
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		if s.backupLoopStarted {
@@ -189,6 +183,10 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) migrate() error {
+	if err := s.rejectLegacyV1Store(); err != nil {
+		return err
+	}
+
 	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`)
 	if err != nil {
 		return err
@@ -196,6 +194,12 @@ func (s *Store) migrate() error {
 	var current int
 	if err := s.db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_version").Scan(&current); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
+	}
+	if current == 0 {
+		return s.bootstrapV2()
+	}
+	if current < 2 {
+		return fmt.Errorf("%w: schema version %d", ErrLegacyV1Store, current)
 	}
 	if current > schemaVersion {
 		return fmt.Errorf("store schema %d is newer than supported schema %d", current, schemaVersion)
@@ -213,7 +217,84 @@ func (s *Store) migrate() error {
 	return nil
 }
 
+// rejectLegacyV1Store recognizes only schema markers. It never reads V1 rows,
+// imports them, or makes a schema change before returning the hard-cutover
+// error. A verified pure-V2 backup is the only supported recovery source.
+func (s *Store) rejectLegacyV1Store() error {
+	legacyTables, err := s.hasLegacyV1Tables()
+	if err != nil {
+		return err
+	}
+	if legacyTables {
+		return legacyV1StoreError("retired V1 tasks/runs table")
+	}
+	v1History, err := s.hasV1SchemaHistory()
+	if err != nil {
+		return err
+	}
+	if v1History {
+		return legacyV1StoreError("schema version 1 history")
+	}
+	return nil
+}
+
+func legacyV1StoreError(marker string) error {
+	return fmt.Errorf("%w (%s): restore a verified pure V2 backup or initialize a new control-plane root", ErrLegacyV1Store, marker)
+}
+
+// hasLegacyV1Tables identifies the retired workspace-index schema without
+// opening or interpreting its rows.
+func (s *Store) hasLegacyV1Tables() (bool, error) {
+	var count int
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM sqlite_master
+		WHERE type = 'table' AND lower(name) IN ('tasks', 'runs')
+	`).Scan(&count); err != nil {
+		return false, fmt.Errorf("inspect legacy schema tables: %w", err)
+	}
+	return count != 0, nil
+}
+
+func (s *Store) hasV1SchemaHistory() (bool, error) {
+	var schemaVersionTable int
+	if err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM sqlite_master
+			WHERE type = 'table' AND lower(name) = 'schema_version'
+		)
+	`).Scan(&schemaVersionTable); err != nil {
+		return false, fmt.Errorf("inspect schema version table: %w", err)
+	}
+	if schemaVersionTable == 0 {
+		return false, nil
+	}
+	var v1History int
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_version WHERE version = 1)`).Scan(&v1History); err != nil {
+		return false, fmt.Errorf("read V1 schema history: %w", err)
+	}
+	return v1History != 0, nil
+}
+
+// bootstrapV2 initializes an empty database from the V2 control-plane schema.
+// Version 1 is intentionally absent: it belonged to the retired workspace
+// index and is never created for a new installation.
+func (s *Store) bootstrapV2() error {
+	for version := 2; version <= schemaVersion; version++ {
+		if err := s.applyMigration(version); err != nil {
+			return fmt.Errorf("bootstrap V2 schema version %d: %w", version, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) applyMigration(version int) error {
+	if version == 15 {
+		return s.applyMigrationV15WithForeignKeysDisabled()
+	}
+	if version == 17 {
+		return s.applyMigrationV17WithForeignKeysDisabled()
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -221,10 +302,6 @@ func (s *Store) applyMigration(version int) error {
 	defer tx.Rollback()
 
 	switch version {
-	case 1:
-		if _, err := tx.Exec(migrationV1); err != nil {
-			return fmt.Errorf("migration v1: %w", err)
-		}
 	case 2:
 		if _, err := tx.Exec(migrationV2); err != nil {
 			return fmt.Errorf("migration v2: %w", err)
@@ -265,6 +342,26 @@ func (s *Store) applyMigration(version int) error {
 		if err := applyMigrationV11(tx); err != nil {
 			return fmt.Errorf("migration v11: %w", err)
 		}
+	case 12:
+		if err := applyMigrationV12(tx); err != nil {
+			return fmt.Errorf("migration v12: %w", err)
+		}
+	case 13:
+		if err := applyMigrationV13(tx); err != nil {
+			return fmt.Errorf("migration v13: %w", err)
+		}
+	case 14:
+		if err := applyMigrationV14(tx); err != nil {
+			return fmt.Errorf("migration v14: %w", err)
+		}
+	case 16:
+		if err := applyMigrationV16(tx); err != nil {
+			return fmt.Errorf("migration v16: %w", err)
+		}
+	case 18:
+		if err := applyMigrationV18(tx); err != nil {
+			return fmt.Errorf("migration v18: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown migration version %d", version)
 	}
@@ -275,6 +372,110 @@ func (s *Store) applyMigration(version int) error {
 	return tx.Commit()
 }
 
+// applyMigrationV17WithForeignKeysDisabled rebuilds tasks_v2 without the
+// retired legacy-identity columns. It follows the same dedicated-connection
+// discipline as V15 because current V2 rows can be referenced by durable
+// lifecycle records.
+func (s *Store) applyMigrationV17WithForeignKeysDisabled() (returnErr error) {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("reserve connection for migration v17: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for migration v17: %w", err)
+	}
+	restored := false
+	restoreForeignKeys := func() error {
+		if restored {
+			return nil
+		}
+		restored = true
+		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+			return fmt.Errorf("restore foreign keys after migration v17: %w", err)
+		}
+		return nil
+	}
+	defer func() {
+		if err := restoreForeignKeys(); err != nil && returnErr == nil {
+			returnErr = err
+		}
+	}()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration v17: %w", err)
+	}
+	defer tx.Rollback()
+	if err := applyMigrationV17(tx); err != nil {
+		return fmt.Errorf("migration v17: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, 17); err != nil {
+		return fmt.Errorf("record migration v17: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration v17: %w", err)
+	}
+	if err := restoreForeignKeys(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applyMigrationV15WithForeignKeysDisabled rebuilds a SQLite table that is a
+// parent of pre-existing node, job, and control-operation rows. SQLite's
+// ON DELETE RESTRICT action is immediate even when defer_foreign_keys is set,
+// so a normal transactional DROP TABLE cannot safely replace stage_attempts.
+// This uses one reserved connection, checks every reference before commit,
+// and restores FK enforcement before releasing that connection.
+func (s *Store) applyMigrationV15WithForeignKeysDisabled() (returnErr error) {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("reserve connection for migration v15: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for migration v15: %w", err)
+	}
+	restored := false
+	restoreForeignKeys := func() error {
+		if restored {
+			return nil
+		}
+		restored = true
+		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+			return fmt.Errorf("restore foreign keys after migration v15: %w", err)
+		}
+		return nil
+	}
+	defer func() {
+		if err := restoreForeignKeys(); err != nil && returnErr == nil {
+			returnErr = err
+		}
+	}()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration v15: %w", err)
+	}
+	defer tx.Rollback()
+	if err := applyMigrationV15(tx); err != nil {
+		return fmt.Errorf("migration v15: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, 15); err != nil {
+		return fmt.Errorf("record migration v15: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration v15: %w", err)
+	}
+	if err := restoreForeignKeys(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func normalizeStoreRoot(rootDir string) string {
 	rootDir = strings.TrimSpace(rootDir)
 	if rootDir == "" {
@@ -282,44 +483,6 @@ func normalizeStoreRoot(rootDir string) string {
 	}
 	return rootDir
 }
-
-const migrationV1 = `
-CREATE TABLE IF NOT EXISTS tasks (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_dir     TEXT NOT NULL UNIQUE,
-    task_name    TEXT NOT NULL DEFAULT '',
-    code_lang    TEXT NOT NULL DEFAULT '',
-    task_type    TEXT NOT NULL DEFAULT '',
-    application  TEXT NOT NULL DEFAULT '',
-    repo_url     TEXT NOT NULL DEFAULT '',
-    commit_sha   TEXT NOT NULL DEFAULT '',
-    is_generated BOOLEAN NOT NULL DEFAULT 0,
-    first_seen   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_name ON tasks(task_name);
-CREATE INDEX IF NOT EXISTS idx_tasks_lang ON tasks(code_lang);
-
-CREATE TABLE IF NOT EXISTS runs (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    workspace_path  TEXT NOT NULL UNIQUE,
-    run_id          TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'unknown',
-    passed          BOOLEAN NOT NULL DEFAULT 0,
-    started_at      DATETIME,
-    finished_at     DATETIME,
-    size_bytes      INTEGER NOT NULL DEFAULT 0,
-    is_active       BOOLEAN NOT NULL DEFAULT 0,
-    is_resumable    BOOLEAN NOT NULL DEFAULT 0,
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_runs_task    ON runs(task_id);
-CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs(status);
-CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
-`
 
 func sanitizeText(s string) string {
 	return strings.TrimSpace(s)

@@ -1,8 +1,7 @@
 package store
 
-// migrationV2 deliberately leaves the v1 workspace index untouched. V2 is
-// the durable control plane; v1 remains readable while import and UI cutover
-// are completed by higher application layers.
+// migrationV2 is the initial hard-cutover control-plane schema. It has no
+// workspace-index tables and no identity bridge to the retired implementation.
 const migrationV2 = `
 CREATE TABLE IF NOT EXISTS store_metadata (
     key        TEXT PRIMARY KEY,
@@ -20,10 +19,6 @@ CREATE TABLE IF NOT EXISTS tasks_v2 (
     lifecycle_state     TEXT NOT NULL DEFAULT 'draft'
                         CHECK (lifecycle_state IN ('draft', 'ready', 'published', 'archived', 'deleted')),
     current_revision_id TEXT NOT NULL DEFAULT '',
-    identity_state      TEXT NOT NULL DEFAULT 'canonical'
-                        CHECK (identity_state IN ('canonical', 'legacy_orphan')),
-    legacy_v1_task_id   INTEGER,
-    legacy_identity     TEXT NOT NULL DEFAULT '',
     created_at          DATETIME NOT NULL,
     updated_at          DATETIME NOT NULL,
     deleted_at          DATETIME,
@@ -31,7 +26,6 @@ CREATE TABLE IF NOT EXISTS tasks_v2 (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_v2_slug ON tasks_v2(slug);
 CREATE INDEX IF NOT EXISTS idx_tasks_v2_current_revision ON tasks_v2(current_revision_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_v2_identity_state ON tasks_v2(identity_state);
 
 CREATE TABLE IF NOT EXISTS task_revisions (
     id                 TEXT PRIMARY KEY,

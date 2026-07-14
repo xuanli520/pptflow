@@ -97,6 +97,50 @@ func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *wo
 	return bindings, nil
 }
 
+// newStageInputReader gives a V2 executor read-only access to the exact
+// bindings verified for its current stage. It never resolves a path or accepts
+// a same-named artifact from a later attempt, so a plugin cannot bypass frozen
+// lineage by opening the object store directly.
+func newStageInputReader(dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, revision store.TaskRevision, bindings []workflowkit.ArtifactBinding) func(context.Context, workflowkit.ArtifactBinding) ([]byte, error) {
+	allowed := make(map[workflowkit.ArtifactID]workflowkit.ArtifactBinding, len(bindings))
+	for _, binding := range bindings {
+		allowed[binding.ArtifactID] = binding
+	}
+	return func(ctx context.Context, requested workflowkit.ArtifactBinding) ([]byte, error) {
+		if err := requested.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: requested input binding: %v", ErrInvalidStageExecution, err)
+		}
+		expected, found := allowed[requested.ArtifactID]
+		if !found || expected != requested {
+			return nil, fmt.Errorf("%w: requested input is not part of the frozen stage bindings", ErrInvalidStageExecution)
+		}
+		if dataStore == nil || objects == nil {
+			return nil, fmt.Errorf("%w: stage input reader is not configured", ErrInvalidStageExecution)
+		}
+		reference, err := dataStore.GetArtifactRef(ctx, string(requested.ArtifactID))
+		if err != nil {
+			return nil, err
+		}
+		if reference == nil || reference.ContentDigest != string(requested.ContentDigest) || reference.SchemaVersion != requested.SchemaVersion || reference.ArtifactKey != requested.Name ||
+			reference.RunID != run.ID || reference.SubjectRevisionID != revision.ID || reference.SubjectDigest != revision.TaskDigest || reference.WorkflowFingerprint != run.DefinitionHash {
+			return nil, fmt.Errorf("%w: requested input no longer matches its frozen lineage", ErrInvalidStageExecution)
+		}
+		index, err := loadStageArtifactManifestIndex(ctx, dataStore, reference.ManifestID)
+		if err != nil {
+			return nil, err
+		}
+		if index.manifest.SubjectRevisionID != revision.ID || index.manifest.SubjectDigest != revision.TaskDigest || index.manifest.WorkflowFingerprint != run.DefinitionHash || index.payload.RunID != run.ID ||
+			index.payload.StageAttemptID != reference.AttemptID || string(index.payload.StageKey) != reference.StageKey {
+			return nil, fmt.Errorf("%w: requested input manifest does not match frozen lineage", ErrInvalidStageExecution)
+		}
+		object, err := index.objectFor(*reference)
+		if err != nil {
+			return nil, err
+		}
+		return objects.ReadAll(ctx, object)
+	}
+}
+
 func artifactObjectUnavailable(err error) bool {
 	return errors.Is(err, workflowruntime.ErrObjectNotFound) ||
 		errors.Is(err, workflowruntime.ErrObjectCorrupt) ||
@@ -232,10 +276,22 @@ func verifyStageArtifactCandidateWithManifest(ctx context.Context, objects *work
 // store then records immutable manifest/ref lineage. It has no code path that
 // creates a synthetic artifact for a completed stage.
 func persistStageArtifacts(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, revision store.TaskRevision, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string) (store.ArtifactManifest, []store.ArtifactRef, error) {
+	return persistStageArtifactsWithCompleteness(ctx, core, run, revision, stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason, true)
+}
+
+// persistStageEvidence records declared partial artifacts produced by a failed
+// or interrupted execution. These artifacts are forensic evidence only:
+// resolveStageInputs deliberately considers manifests from completed attempts
+// exclusively, so diagnostic bytes can never become downstream workflow input.
+func persistStageEvidence(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, revision store.TaskRevision, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string) (store.ArtifactManifest, []store.ArtifactRef, error) {
+	return persistStageArtifactsWithCompleteness(ctx, core, run, revision, stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason, false)
+}
+
+func persistStageArtifactsWithCompleteness(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, revision store.TaskRevision, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string, requireComplete bool) (store.ArtifactManifest, []store.ArtifactRef, error) {
 	if core == nil || core.store == nil || core.objects == nil {
 		return store.ArtifactManifest{}, nil, fmt.Errorf("%w: artifact persistence is not configured", ErrInvalidStageExecution)
 	}
-	if err := RequiredStageArtifacts(stage, artifacts); err != nil {
+	if err := validateStageArtifactsForPersistence(stage, artifacts, requireComplete); err != nil {
 		return store.ArtifactManifest{}, nil, err
 	}
 	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(inputs)
@@ -293,6 +349,35 @@ func persistStageArtifacts(ctx context.Context, core *lifecycleServiceCore, run 
 		references = append(references, reference)
 	}
 	return manifest, references, nil
+}
+
+func validateStageArtifactsForPersistence(stage workflowkit.StageDescriptor, artifacts []StageArtifact, requireComplete bool) error {
+	if requireComplete {
+		return RequiredStageArtifacts(stage, artifacts)
+	}
+	declared := make(map[string]workflowkit.ArtifactSpec, len(stage.Outputs))
+	for _, output := range stage.Outputs {
+		declared[output.Name] = output
+	}
+	seen := make(map[string]struct{}, len(artifacts))
+	for _, artifact := range artifacts {
+		key := strings.TrimSpace(artifact.Key)
+		if key == "" {
+			return fmt.Errorf("%w: diagnostic artifact key is required", ErrInvalidStageExecution)
+		}
+		output, found := declared[key]
+		if !found {
+			return fmt.Errorf("%w: stage %q returned undeclared diagnostic artifact %q", ErrInvalidStageExecution, stage.Key, key)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("%w: stage %q returned duplicate diagnostic artifact %q", ErrInvalidStageExecution, stage.Key, key)
+		}
+		if artifact.SchemaVersion != output.SchemaVersion || artifact.TurnOrdinal < 0 {
+			return fmt.Errorf("%w: stage %q diagnostic artifact %q does not match its frozen output contract", ErrInvalidStageExecution, stage.Key, key)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
 }
 
 // VerifyStageArtifactObject reads the manifest's object reference when a

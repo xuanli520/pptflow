@@ -14,7 +14,7 @@ const capacityPoolV5Select = `
 	FROM capacity_pools_v5`
 
 const durableJobDispatchClaimV5Select = `
-	SELECT id, idempotency_key, job_id, owner, lease_ttl_ms, dispatch_lease_id,
+	SELECT id, idempotency_key, run_id, job_id, owner, lease_ttl_ms, dispatch_lease_id,
 	       capacity_pool_key, capacity_lease_id, state, claimed_at, updated_at
 	FROM job_dispatch_claims_v5`
 
@@ -152,11 +152,14 @@ func (s *Store) ClaimNextDurableJob(ctx context.Context, request ClaimNextDurabl
 	if existing, err := getDurableJobDispatchClaimByKeyTx(ctx, tx, prepared.IdempotencyKey); err != nil {
 		return DurableJobDispatchClaim{}, err
 	} else if existing != nil {
-		if existing.Owner != prepared.Owner || existing.LeaseTTL != time.Duration(durationMilliseconds(prepared.LeaseTTL))*time.Millisecond || existing.CapacityPoolKey != prepared.CapacityPoolKey {
+		if existing.Owner != prepared.Owner || existing.RunID != prepared.RunID || existing.LeaseTTL != time.Duration(durationMilliseconds(prepared.LeaseTTL))*time.Millisecond || existing.CapacityPoolKey != prepared.CapacityPoolKey {
 			return DurableJobDispatchClaim{}, fmt.Errorf("%w: durable job claim key %s", ErrIdempotencyConflict, prepared.IdempotencyKey)
 		}
 		if err := s.loadDurableJobDispatchClaimTx(ctx, tx, existing); err != nil {
 			return DurableJobDispatchClaim{}, err
+		}
+		if existing.Job != nil && existing.RunID != "" && existing.Job.RunID != prepared.RunID {
+			return DurableJobDispatchClaim{}, fmt.Errorf("%w: durable job claim key %s", ErrIdempotencyConflict, prepared.IdempotencyKey)
 		}
 		if err := tx.Commit(); err != nil {
 			return DurableJobDispatchClaim{}, err
@@ -174,12 +177,12 @@ func (s *Store) ClaimNextDurableJob(ctx context.Context, request ClaimNextDurabl
 		}
 	}
 	now := s.now().UTC()
-	job, err := selectNextQueuedDurableJobTx(ctx, tx, now)
+	job, err := selectNextQueuedDurableJobTx(ctx, tx, now, prepared.RunID)
 	if err != nil {
 		return DurableJobDispatchClaim{}, err
 	}
 	if job == nil {
-		claim := DurableJobDispatchClaim{ID: prepared.ID, IdempotencyKey: prepared.IdempotencyKey, Owner: prepared.Owner, LeaseTTL: prepared.LeaseTTL, CapacityPoolKey: prepared.CapacityPoolKey, State: "empty", ClaimedAt: now, UpdatedAt: now}
+		claim := DurableJobDispatchClaim{ID: prepared.ID, IdempotencyKey: prepared.IdempotencyKey, RunID: prepared.RunID, Owner: prepared.Owner, LeaseTTL: prepared.LeaseTTL, CapacityPoolKey: prepared.CapacityPoolKey, State: "empty", ClaimedAt: now, UpdatedAt: now}
 		if err := insertDurableJobDispatchClaimTx(ctx, tx, claim); err != nil {
 			return DurableJobDispatchClaim{}, err
 		}
@@ -217,7 +220,7 @@ func (s *Store) ClaimNextDurableJob(ctx context.Context, request ClaimNextDurabl
 	if changed != 1 {
 		return DurableJobDispatchClaim{}, fmt.Errorf("%w: durable job %s", ErrOptimisticLock, job.ID)
 	}
-	claim := DurableJobDispatchClaim{ID: prepared.ID, IdempotencyKey: prepared.IdempotencyKey, Job: job, Owner: prepared.Owner, LeaseTTL: prepared.LeaseTTL,
+	claim := DurableJobDispatchClaim{ID: prepared.ID, IdempotencyKey: prepared.IdempotencyKey, RunID: prepared.RunID, Job: job, Owner: prepared.Owner, LeaseTTL: prepared.LeaseTTL,
 		DispatchLease: &dispatchLease, CapacityPoolKey: prepared.CapacityPoolKey, CapacityLease: capacityLease, State: "active", ClaimedAt: now, UpdatedAt: now}
 	if err := insertDurableJobDispatchClaimTx(ctx, tx, claim); err != nil {
 		return DurableJobDispatchClaim{}, err
@@ -346,6 +349,7 @@ type preparedDurableJobClaim struct {
 	ID              string
 	IdempotencyKey  string
 	Owner           string
+	RunID           string
 	LeaseTTL        time.Duration
 	CapacityPoolKey string
 	Actor           string
@@ -368,8 +372,12 @@ func prepareDurableJobClaim(s *Store, request ClaimNextDurableJobRequest) (prepa
 	if request.LeaseTTL <= 0 {
 		return preparedDurableJobClaim{}, fmt.Errorf("%w: durable job claim ttl must be positive", ErrInvalidDispatch)
 	}
+	runID := strings.TrimSpace(request.RunID)
+	if runID != "" && !isUUIDv7(runID) {
+		return preparedDurableJobClaim{}, ErrInvalidUUIDv7Identity
+	}
 	return preparedDurableJobClaim{ID: id, IdempotencyKey: key, Owner: owner, LeaseTTL: request.LeaseTTL,
-		CapacityPoolKey: strings.TrimSpace(request.CapacityPoolKey), Actor: resolveActor(request.Actor), Reason: strings.TrimSpace(request.Reason)}, nil
+		RunID: runID, CapacityPoolKey: strings.TrimSpace(request.CapacityPoolKey), Actor: resolveActor(request.Actor), Reason: strings.TrimSpace(request.Reason)}, nil
 }
 
 func getCapacityPoolByKeyTx(ctx context.Context, tx *sql.Tx, poolKey string) (*CapacityPool, error) {
@@ -383,16 +391,21 @@ func getCapacityPoolByKeyTx(ctx context.Context, tx *sql.Tx, poolKey string) (*C
 	return &pool, nil
 }
 
-func selectNextQueuedDurableJobTx(ctx context.Context, tx *sql.Tx, now time.Time) (*DurableJob, error) {
-	job, err := scanDurableJob(tx.QueryRowContext(ctx, durableJobSelect+`
+func selectNextQueuedDurableJobTx(ctx context.Context, tx *sql.Tx, now time.Time, runID string) (*DurableJob, error) {
+	query := durableJobSelect + `
 		WHERE state = 'queued'
 		  AND NOT EXISTS (
 			SELECT 1 FROM leases
 			WHERE resource_type = 'job_dispatch' AND resource_id = jobs.id
 			  AND state = 'active' AND expires_at > ?
-		  )
-		ORDER BY priority DESC, created_at ASC, id ASC
-		LIMIT 1`, now))
+		  )`
+	args := []any{now}
+	if runID != "" {
+		query += ` AND run_id = ?`
+		args = append(args, runID)
+	}
+	query += ` ORDER BY priority DESC, created_at ASC, id ASC LIMIT 1`
+	job, err := scanDurableJob(tx.QueryRowContext(ctx, query, args...))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -490,10 +503,10 @@ func insertDurableJobDispatchClaimTx(ctx context.Context, tx *sql.Tx, claim Dura
 	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO job_dispatch_claims_v5 (
-			id, idempotency_key, job_id, owner, lease_ttl_ms, dispatch_lease_id,
+			id, idempotency_key, run_id, job_id, owner, lease_ttl_ms, dispatch_lease_id,
 			capacity_pool_key, capacity_lease_id, state, claimed_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, claim.ID, claim.IdempotencyKey, nullableString(jobID), claim.Owner, durationMilliseconds(claim.LeaseTTL),
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, claim.ID, claim.IdempotencyKey, claim.RunID, nullableString(jobID), claim.Owner, durationMilliseconds(claim.LeaseTTL),
 		nullableString(dispatchLeaseID), claim.CapacityPoolKey, nullableString(capacityLeaseID), claim.State, claim.ClaimedAt, claim.UpdatedAt)
 	if err != nil {
 		if isUniqueConstraint(err) {
@@ -628,7 +641,7 @@ func scanDurableJobDispatchClaim(scanner rowScanner) (DurableJobDispatchClaim, e
 	var claim DurableJobDispatchClaim
 	var jobID, dispatchLeaseID, capacityLeaseID sql.NullString
 	var ttlMilliseconds int64
-	if err := scanner.Scan(&claim.ID, &claim.IdempotencyKey, &jobID, &claim.Owner, &ttlMilliseconds,
+	if err := scanner.Scan(&claim.ID, &claim.IdempotencyKey, &claim.RunID, &jobID, &claim.Owner, &ttlMilliseconds,
 		&dispatchLeaseID, &claim.CapacityPoolKey, &capacityLeaseID, &claim.State, &claim.ClaimedAt, &claim.UpdatedAt); err != nil {
 		return DurableJobDispatchClaim{}, err
 	}
@@ -640,6 +653,9 @@ func scanDurableJobDispatchClaim(scanner rowScanner) (DurableJobDispatchClaim, e
 	}
 	if claim.State != "empty" && (!jobID.Valid || !dispatchLeaseID.Valid) {
 		return DurableJobDispatchClaim{}, fmt.Errorf("%w: incomplete durable job dispatch claim %s", ErrInvalidDispatch, claim.ID)
+	}
+	if claim.RunID != "" && !isUUIDv7(claim.RunID) {
+		return DurableJobDispatchClaim{}, fmt.Errorf("%w: invalid durable job dispatch claim run ID", ErrInvalidDispatch)
 	}
 	claim.LeaseTTL = time.Duration(ttlMilliseconds) * time.Millisecond
 	claim.ClaimedAt = claim.ClaimedAt.UTC()

@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
+	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
-	"github.com/purplevoid/harbor-factory/internal/workflow"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -76,9 +76,9 @@ func findingBundleForRun(t *testing.T, ctx context.Context, services *LifecycleS
 	if err != nil {
 		t.Fatal(err)
 	}
-	stage, found := workflow.Stage(workflowkit.StageKey(nodes.QualityCheck))
+	stage, found := workflow.Stage(workflowkit.StageKey(workflowadapter.QualityCheck))
 	if !found {
-		t.Fatalf("frozen workflow does not contain %q", nodes.QualityCheck)
+		t.Fatalf("frozen workflow does not contain %q", workflowadapter.QualityCheck)
 	}
 	bindings := fixtureInputBindings(stage)
 	fingerprint, err := workflowkit.FingerprintArtifactBindings(bindings)
@@ -93,7 +93,7 @@ func findingBundleForRun(t *testing.T, ctx context.Context, services *LifecycleS
 	return FindingBundle{
 		Format: "harbor.findings.v1", RevisionID: revision.ID, RevisionDigest: revision.TaskDigest,
 		Findings: []RepairFinding{{
-			CheckerID: "quality", StageKey: nodes.QualityCheck, CheckID: "instruction", Severity: "error", Message: message,
+			CheckerID: "quality", StageKey: workflowadapter.QualityCheck, CheckID: "instruction", Severity: "error", Message: message,
 			ReportArtifactID: report.ID, ReportContentDigest: report.ContentDigest,
 		}},
 	}
@@ -107,7 +107,7 @@ func TestFindingBundleRequiresNonEmptyCanonicalReportEvidence(t *testing.T) {
 	valid := FindingBundle{
 		Format: "harbor.findings.v1", RevisionID: "revision", RevisionDigest: "harbor.task.v2:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Findings: []RepairFinding{{
-			CheckerID: "quality", StageKey: nodes.QualityCheck, CheckID: "instruction", Severity: "error", Message: "invalid instruction",
+			CheckerID: "quality", StageKey: workflowadapter.QualityCheck, CheckID: "instruction", Severity: "error", Message: "invalid instruction",
 			ReportArtifactID: reportID, ReportContentDigest: string(workflowkit.SHA256Fingerprint([]byte("report"))),
 		}},
 	}
@@ -119,8 +119,8 @@ func TestFindingBundleRequiresNonEmptyCanonicalReportEvidence(t *testing.T) {
 		bundle FindingBundle
 	}{
 		{name: "empty findings", bundle: FindingBundle{Format: valid.Format, RevisionID: valid.RevisionID, RevisionDigest: valid.RevisionDigest}},
-		{name: "missing report ID", bundle: FindingBundle{Format: valid.Format, RevisionID: valid.RevisionID, RevisionDigest: valid.RevisionDigest, Findings: []RepairFinding{{CheckerID: "quality", StageKey: nodes.QualityCheck, CheckID: "instruction", Severity: "error", Message: "invalid instruction", ReportContentDigest: valid.Findings[0].ReportContentDigest}}}},
-		{name: "noncanonical report digest", bundle: FindingBundle{Format: valid.Format, RevisionID: valid.RevisionID, RevisionDigest: valid.RevisionDigest, Findings: []RepairFinding{{CheckerID: "quality", StageKey: nodes.QualityCheck, CheckID: "instruction", Severity: "error", Message: "invalid instruction", ReportArtifactID: reportID, ReportContentDigest: "sha256:ABC"}}}},
+		{name: "missing report ID", bundle: FindingBundle{Format: valid.Format, RevisionID: valid.RevisionID, RevisionDigest: valid.RevisionDigest, Findings: []RepairFinding{{CheckerID: "quality", StageKey: workflowadapter.QualityCheck, CheckID: "instruction", Severity: "error", Message: "invalid instruction", ReportContentDigest: valid.Findings[0].ReportContentDigest}}}},
+		{name: "noncanonical report digest", bundle: FindingBundle{Format: valid.Format, RevisionID: valid.RevisionID, RevisionDigest: valid.RevisionDigest, Findings: []RepairFinding{{CheckerID: "quality", StageKey: workflowadapter.QualityCheck, CheckID: "instruction", Severity: "error", Message: "invalid instruction", ReportArtifactID: reportID, ReportContentDigest: "sha256:ABC"}}}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -139,7 +139,7 @@ func TestCandidateLeaseHeartbeatReturnsLatestFenceAcrossMultipleRenewals(t *test
 		t.Fatal(err)
 	}
 	defer database.Close()
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestCandidateLeaseHeartbeatRenewsBeforeProviderStarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestCandidateLeaseHeartbeatEnforcesProviderBudgetDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "verify", Actor: "tester", Reason: "verify base"})
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify base"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,17 +336,19 @@ func TestLocalPatchProviderAppliesOnlyCanonicalUnifiedDiff(t *testing.T) {
 
 type testRepairAgent struct{}
 
-func (testRepairAgent) OpenConversation(_ context.Context, request workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+var _ agent.Runtime = testRepairAgent{}
+
+func (testRepairAgent) OpenConversation(_ context.Context, request agent.ConversationRequest) (agent.Conversation, error) {
 	return testRepairConversation{checkout: request.ProjectPath}, nil
 }
 
 type testRepairConversation struct{ checkout string }
 
-func (conversation testRepairConversation) Turn(_ context.Context, _ workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+func (conversation testRepairConversation) Turn(_ context.Context, _ agent.TurnRequest) (agent.TurnResult, error) {
 	if err := os.WriteFile(filepath.Join(conversation.checkout, "instruction.md"), []byte("agent repaired instruction\n"), 0o644); err != nil {
-		return workflow.AgentTurnResult{}, err
+		return agent.TurnResult{}, err
 	}
-	return workflow.AgentTurnResult{Text: "repaired", Model: "fake-agent"}, nil
+	return agent.TurnResult{Text: "repaired", Model: "fake-agent"}, nil
 }
 
 func (testRepairConversation) Close() error { return nil }
@@ -359,7 +361,7 @@ func TestAgentRepairProviderCreatesBoundRepairSessionInCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +373,7 @@ func TestAgentRepairProviderCreatesBoundRepairSessionInCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "verify", Actor: "tester", Reason: "verify"})
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +411,7 @@ func TestChangeProviderRejectsUntrustedFindingEvidenceBeforeCandidateCreation(t 
 		t.Fatal(err)
 	}
 	defer database.Close()
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +423,7 @@ func TestChangeProviderRejectsUntrustedFindingEvidenceBeforeCandidateCreation(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "verify", Actor: "tester", Reason: "verify"})
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +457,7 @@ func TestChangeProviderMarksMismatchedDeclaredPathsForReconciliation(t *testing.
 		t.Fatal(err)
 	}
 	defer database.Close()
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +469,7 @@ func TestChangeProviderMarksMismatchedDeclaredPathsForReconciliation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "verify", Actor: "tester", Reason: "verify"})
+	run, err := services.Runs.StartRun(ctx, StartRunRequest{TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify", Actor: "tester", Reason: "verify"})
 	if err != nil {
 		t.Fatal(err)
 	}

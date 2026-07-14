@@ -16,13 +16,7 @@ func TestMigrateExistingV2StoreToV3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(migrationV1); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (1)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(migrationV2); err != nil {
@@ -65,7 +59,7 @@ func tempV3DB(t *testing.T) *Store {
 	return s
 }
 
-func TestAtomicTaskRevisionAndCanonicalIdentityLookup(t *testing.T) {
+func TestAtomicTaskRevisionRejectsInvalidDigestWithoutPartialTask(t *testing.T) {
 	ctx := context.Background()
 	s := tempV3DB(t)
 	allocated, err := NewUUIDv7()
@@ -75,7 +69,7 @@ func TestAtomicTaskRevisionAndCanonicalIdentityLookup(t *testing.T) {
 	result, err := s.CreateTaskWithRevision(ctx, CreateTaskWithRevisionRequest{
 		Task: CreateTaskV2Request{
 			Slug: "imported-task", SourceRepo: "https://example.invalid/repo", SourceCommit: "abc123",
-			LegacyIdentity: "repo=example;proposal=42", Actor: "importer", Reason: "exact import",
+			Actor: "importer", Reason: "create managed task",
 		},
 		Revision: CreateTaskRevisionRequest{
 			Origin: RevisionOriginImported, TaskDigest: validTaskDigest("d"), ManifestID: "managed-manifest", Actor: "importer",
@@ -86,23 +80,6 @@ func TestAtomicTaskRevisionAndCanonicalIdentityLookup(t *testing.T) {
 	}
 	if result.Revision.TaskID != result.Task.ID || result.Revision.State != RevisionStateSealed || result.Revision.VersionNumber != 1 {
 		t.Fatalf("atomic task/revision binding is invalid: %+v", result)
-	}
-	matched, err := s.FindTaskByCanonicalIdentity(ctx, CanonicalIdentityLookup{
-		LegacyIdentity: "repo=example;proposal=42", SourceRepo: "https://example.invalid/repo", SourceCommit: "abc123",
-	})
-	if err != nil || matched == nil || matched.ID != result.Task.ID {
-		t.Fatalf("exact canonical lookup failed: task=%+v err=%v", matched, err)
-	}
-	if _, err := s.CreateTaskV2(ctx, CreateTaskV2Request{
-		Slug: "duplicate", SourceRepo: "https://example.invalid/repo", SourceCommit: "abc123", LegacyIdentity: "repo=example;proposal=42", Actor: "importer",
-	}); !errors.Is(err, ErrIdentityCollision) {
-		t.Fatalf("duplicate canonical import err=%v, want identity collision", err)
-	}
-	orphan, err := s.CreateLegacyOrphan(ctx, CreateTaskV2Request{
-		Slug: "ambiguous", LegacyIdentity: "repo=example;proposal=42", SourceRepo: "https://example.invalid/repo", SourceCommit: "abc123", Actor: "importer",
-	})
-	if err != nil || orphan.IdentityState != TaskIdentityLegacyOrphan {
-		t.Fatalf("ambiguous import was not retained as orphan: %+v err=%v", orphan, err)
 	}
 	if _, err := s.CreateTaskWithRevision(ctx, CreateTaskWithRevisionRequest{
 		Task:     CreateTaskV2Request{Slug: "must-roll-back", Actor: "importer"},

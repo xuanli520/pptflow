@@ -317,7 +317,7 @@ func (s *Store) TransitionNodeAttempt(ctx context.Context, request TransitionNod
 	if value := strings.TrimSpace(request.ErrorText); value != "" {
 		attempt.ErrorText = value
 	}
-	if attempt.Status == NodeAttemptRunning && attempt.StartedAt == nil {
+	if (attempt.Status == NodeAttemptRunning || attempt.Status == NodeAttemptWaiting) && attempt.StartedAt == nil {
 		attempt.StartedAt = &now
 	}
 	if isTerminalNodeAttemptStatus(attempt.Status) {
@@ -586,7 +586,7 @@ func scanNodeAttempt(scanner rowScanner) (NodeAttempt, error) {
 	if err := scanner.Scan(&attempt.ID, &attempt.StageAttemptID, &attempt.NodeID, &attempt.Generation, &attempt.Attempt, &attempt.Status, &attempt.IdempotencyKey, &attempt.ErrorText, &createdAt, &startedAt, &finishedAt, &attempt.Version); err != nil {
 		return NodeAttempt{}, err
 	}
-	attempt.CreatedAt = nullableTime(createdAt).UTC()
+	attempt.CreatedAt = nullableTimeValue(createdAt)
 	attempt.StartedAt = nullableTimePtr(startedAt)
 	attempt.FinishedAt = nullableTimePtr(finishedAt)
 	return attempt, nil
@@ -637,7 +637,7 @@ func isTerminalRunAttemptStatus(status RunAttemptStatus) bool {
 
 func validNodeAttemptStatus(status NodeAttemptStatus) bool {
 	switch status {
-	case NodeAttemptQueued, NodeAttemptRunning, NodeAttemptCompleted, NodeAttemptInfraFailed, NodeAttemptInterrupted, NodeAttemptInDoubt, NodeAttemptCanceled:
+	case NodeAttemptQueued, NodeAttemptRunning, NodeAttemptWaiting, NodeAttemptCompleted, NodeAttemptInfraFailed, NodeAttemptInterrupted, NodeAttemptInDoubt, NodeAttemptCanceled:
 		return true
 	default:
 		return false
@@ -650,9 +650,11 @@ func validNodeAttemptTransition(from, to NodeAttemptStatus) bool {
 	}
 	switch from {
 	case NodeAttemptQueued:
-		return to == NodeAttemptRunning || to == NodeAttemptCanceled
+		return to == NodeAttemptRunning || to == NodeAttemptWaiting || to == NodeAttemptCanceled
 	case NodeAttemptRunning:
-		return to == NodeAttemptCompleted || to == NodeAttemptInfraFailed || to == NodeAttemptInterrupted || to == NodeAttemptInDoubt || to == NodeAttemptCanceled
+		return to == NodeAttemptWaiting || to == NodeAttemptCompleted || to == NodeAttemptInfraFailed || to == NodeAttemptInterrupted || to == NodeAttemptInDoubt || to == NodeAttemptCanceled
+	case NodeAttemptWaiting:
+		return to == NodeAttemptRunning || to == NodeAttemptCompleted || to == NodeAttemptInfraFailed || to == NodeAttemptInterrupted || to == NodeAttemptInDoubt || to == NodeAttemptCanceled
 	case NodeAttemptInDoubt:
 		return to == NodeAttemptCompleted || to == NodeAttemptInfraFailed || to == NodeAttemptInterrupted || to == NodeAttemptCanceled
 	default:

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -33,7 +32,7 @@ func TestDurableExecutionPayloadsFreezeCompleteQuotaPolicy(t *testing.T) {
 	assertFrozenQuotaPayload(t, initialPayload.QuotaPolicy, frozen)
 
 	plan, err := fixture.services.Continuations.PlanTaskContinuation(ctx,
-		continuationCommand(t, ctx, fixture, "quota-payload-continuation", []workflowkit.NodeID{nodes.QualityCheck}, false))
+		continuationCommand(t, ctx, fixture, "quota-payload-continuation", []workflowkit.NodeID{workflowadapter.QualityCheck}, false))
 	if err != nil {
 		t.Fatalf("plan continuation: %v", err)
 	}

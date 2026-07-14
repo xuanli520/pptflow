@@ -20,6 +20,11 @@ type WorkflowTemplate struct {
 	QuotaPolicy QuotaPolicy  `json:"quota_policy"`
 }
 
+// Reference returns the exact immutable identity of this template.
+func (template WorkflowTemplate) Reference() TemplateReference {
+	return TemplateReference{ID: template.ID, Version: template.Version}
+}
+
 // Clone returns an independent template snapshot.
 func (template WorkflowTemplate) Clone() WorkflowTemplate {
 	template.Catalog = template.Catalog.Clone()
@@ -32,8 +37,8 @@ func (template WorkflowTemplate) Clone() WorkflowTemplate {
 // it; this function intentionally provides no production budget default.
 func StandardWorkflowTemplate() WorkflowTemplate {
 	return WorkflowTemplate{
-		ID:          HarborWorkflowTemplateID,
-		Version:     HarborWorkflowTemplateVersion,
+		ID:          StandardWorkflowTemplateID,
+		Version:     StandardWorkflowTemplateVersion,
 		Catalog:     StandardStageCatalog(),
 		QuotaPolicy: StandardQuotaPolicy(),
 	}
@@ -41,11 +46,12 @@ func StandardWorkflowTemplate() WorkflowTemplate {
 
 // Validate proves that the template has a complete valid Harbor catalog.
 func (template WorkflowTemplate) Validate() error {
-	if strings.TrimSpace(template.ID) == "" {
-		return fmt.Errorf("%w: workflow template id is required", errInvalidCatalog)
+	reference := template.Reference()
+	if err := reference.Validate(); err != nil {
+		return err
 	}
-	if strings.TrimSpace(template.Version) == "" {
-		return fmt.Errorf("%w: workflow template version is required", errInvalidCatalog)
+	if !template.Catalog.Template.Equal(reference) {
+		return fmt.Errorf("%w: %w: workflow template %s@%s cannot compile catalog bound to %s@%s", errInvalidCatalog, errTemplateMismatch, reference.ID, reference.Version, template.Catalog.Template.ID, template.Catalog.Template.Version)
 	}
 	if err := template.Catalog.Validate(); err != nil {
 		return err
@@ -67,7 +73,7 @@ func (template WorkflowTemplate) Fingerprint() (workflowkit.Fingerprint, error) 
 	if err != nil {
 		return "", err
 	}
-	return workflowkit.FingerprintParts("harbor.workflowadapter.workflow-template.v1", []workflowkit.FingerprintPart{
+	return workflowkit.FingerprintParts("harbor.workflowadapter.workflow-template.v2", []workflowkit.FingerprintPart{
 		{Name: "catalog_fingerprint", Value: []byte(catalogFingerprint)},
 		{Name: "id", Value: []byte(template.ID)},
 		{Name: "quota_policy_fingerprint", Value: []byte(quotaPolicyFingerprint)},
@@ -100,11 +106,12 @@ func (budget StageBudget) Clone() StageBudget {
 // production instance because the confirmed policy requires full request
 // budgets instead of defaults.
 type ExecutionProfile struct {
-	ID                  string        `json:"id"`
-	Version             string        `json:"version"`
-	ContinuationPlanTTL time.Duration `json:"continuation_plan_ttl"`
-	ControlGracePeriod  time.Duration `json:"control_grace_period"`
-	Stages              []StageBudget `json:"stages"`
+	Template            TemplateReference `json:"template"`
+	ID                  string            `json:"id"`
+	Version             string            `json:"version"`
+	ContinuationPlanTTL time.Duration     `json:"continuation_plan_ttl"`
+	ControlGracePeriod  time.Duration     `json:"control_grace_period"`
+	Stages              []StageBudget     `json:"stages"`
 }
 
 // Clone returns an independent profile snapshot.
@@ -127,9 +134,17 @@ func (profile ExecutionProfile) Budget(key workflowkit.StageKey) (workflowkit.Ex
 	return workflowkit.ExecutionBudget{}, false
 }
 
-// Validate checks local profile shape and every budget hierarchy. Full stage
-// coverage is validated against a template by Compile or ValidateFor.
+// Validate checks local profile shape, every budget hierarchy, and exact
+// coverage for the closed template explicitly bound into the profile.
 func (profile ExecutionProfile) Validate() error {
+	template, err := ResolveWorkflowTemplate(profile.Template)
+	if err != nil {
+		return fmt.Errorf("%w: execution profile template: %v", errInvalidCatalog, err)
+	}
+	return profile.ValidateFor(template.Catalog)
+}
+
+func (profile ExecutionProfile) validateLocal() error {
 	if strings.TrimSpace(profile.ID) == "" {
 		return fmt.Errorf("%w: execution profile id is required", errInvalidCatalog)
 	}
@@ -161,14 +176,18 @@ func (profile ExecutionProfile) Validate() error {
 	return nil
 }
 
-// ValidateFor proves profile coverage is exact for catalog and that every
+// ValidateFor proves profile coverage is exact for one catalog, that the
+// profile/candidate catalog share an exact template reference, and that every
 // multi-turn Harbor stage receives enough turns in its explicit budget.
 func (profile ExecutionProfile) ValidateFor(catalog StageCatalog) error {
-	if err := profile.Validate(); err != nil {
+	if err := profile.validateLocal(); err != nil {
 		return err
 	}
 	if err := catalog.Validate(); err != nil {
 		return err
+	}
+	if !profile.Template.Equal(catalog.Template) {
+		return fmt.Errorf("%w: %w: execution profile template %s@%s does not match catalog template %s@%s", errInvalidCatalog, errTemplateMismatch, profile.Template.ID, profile.Template.Version, catalog.Template.ID, catalog.Template.Version)
 	}
 	profileStages := make(map[workflowkit.StageKey]StageBudget, len(profile.Stages))
 	for _, stage := range profile.Stages {
@@ -205,20 +224,22 @@ func (profile ExecutionProfile) Fingerprint() (workflowkit.Fingerprint, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: encode execution profile: %v", errInvalidCatalog, err)
 	}
-	return workflowkit.FingerprintBytes("harbor.workflowadapter.execution-profile.v1", encoded)
+	return workflowkit.FingerprintBytes("harbor.workflowadapter.execution-profile.v2", encoded)
 }
 
 // ReviewStage captures the review capability that must be persisted alongside
 // its durable StageAttempt. It is derived during compile so a runtime never
 // needs to infer review behavior from a node identifier.
 type ReviewStage struct {
-	StageKey   workflowkit.StageKey `json:"stage_key"`
-	ReviewKind ReviewKind           `json:"review_kind"`
+	StageKey         workflowkit.StageKey     `json:"stage_key"`
+	ReviewKind       ReviewKind               `json:"review_kind"`
+	DecisionArtifact workflowkit.ArtifactSpec `json:"decision_artifact"`
 }
 
 // ResolvedWorkflow is the frozen product of a versioned template and explicit
 // profile. All fingerprints are persisted as one run-manifest contract.
 type ResolvedWorkflow struct {
+	Template                    TemplateReference              `json:"template"`
 	TemplateID                  string                         `json:"template_id"`
 	TemplateVersion             string                         `json:"template_version"`
 	ExecutionProfileID          string                         `json:"execution_profile_id"`
@@ -258,6 +279,9 @@ func (resolved ResolvedWorkflow) ReviewStage(key workflowkit.StageKey) (ReviewSt
 func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWorkflow, error) {
 	if err := template.Validate(); err != nil {
 		return ResolvedWorkflow{}, err
+	}
+	if !profile.Template.Equal(template.Reference()) {
+		return ResolvedWorkflow{}, fmt.Errorf("%w: %w: execution profile template %s@%s does not match workflow template %s@%s", errInvalidCatalog, errTemplateMismatch, profile.Template.ID, profile.Template.Version, template.ID, template.Version)
 	}
 	if err := profile.ValidateFor(template.Catalog); err != nil {
 		return ResolvedWorkflow{}, err
@@ -308,7 +332,7 @@ func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWork
 			Capabilities: definition.Capabilities.Clone(),
 		})
 		if definition.Gate != nil {
-			reviews = append(reviews, ReviewStage{StageKey: definition.Key, ReviewKind: definition.Gate.ReviewKind})
+			reviews = append(reviews, ReviewStage{StageKey: definition.Key, ReviewKind: definition.Gate.ReviewKind, DecisionArtifact: definition.Gate.DecisionArtifact})
 		}
 	}
 	if err := descriptor.Validate(); err != nil {
@@ -321,7 +345,7 @@ func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWork
 	if err != nil {
 		return ResolvedWorkflow{}, err
 	}
-	manifestFingerprint, err := workflowkit.FingerprintParts("harbor.workflowadapter.resolved-workflow.v1", []workflowkit.FingerprintPart{
+	manifestFingerprint, err := workflowkit.FingerprintParts("harbor.workflowadapter.resolved-workflow.v2", []workflowkit.FingerprintPart{
 		{Name: "definition", Value: []byte(definitionFingerprint)},
 		{Name: "execution_profile", Value: []byte(profileFingerprint)},
 		{Name: "quota_policy", Value: []byte(quotaPolicy.Fingerprint)},
@@ -331,6 +355,7 @@ func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWork
 		return ResolvedWorkflow{}, err
 	}
 	return ResolvedWorkflow{
+		Template:                    template.Reference(),
 		TemplateID:                  template.ID,
 		TemplateVersion:             template.Version,
 		ExecutionProfileID:          profile.ID,

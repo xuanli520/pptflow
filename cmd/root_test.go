@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"io"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -52,6 +53,19 @@ func TestLifecycleTUICommandHasNoLegacyRunnerFlags(t *testing.T) {
 	}
 }
 
+func TestDoctorCommandHasNoLegacyWorkspaceInput(t *testing.T) {
+	command := newDoctorCommand()
+	command.SetOut(io.Discard)
+	command.SetErr(io.Discard)
+	if command.Flags().Lookup("workspace") != nil {
+		t.Fatal("doctor retains retired --workspace input")
+	}
+	command.SetArgs([]string{"--workspace", t.TempDir()})
+	if err := command.Execute(); err == nil {
+		t.Fatal("doctor accepted retired --workspace input")
+	}
+}
+
 func TestV2CommandGroupsRejectUnexpectedPositionalArguments(t *testing.T) {
 	config := &lifecycleCLIConfig{root: t.TempDir()}
 	for _, testCase := range []struct {
@@ -98,6 +112,69 @@ func TestV2CommandGroupsStillResolveKnownSubcommands(t *testing.T) {
 			child, _, err := testCase.new(config).Find([]string{testCase.child})
 			if err != nil || child == nil || child.Name() != testCase.child {
 				t.Fatalf("known V2 child %q did not resolve: child=%v err=%v", testCase.child, child, err)
+			}
+		})
+	}
+}
+
+func TestTaskCommandDoesNotExposeLegacyImport(t *testing.T) {
+	command := newTaskCommand(&lifecycleCLIConfig{root: t.TempDir()})
+	child, _, err := command.Find([]string{"import-legacy"})
+	if err == nil && child != nil && child.Name() == "import-legacy" {
+		t.Fatal("legacy import command remained registered")
+	}
+}
+
+func TestTypedLifecycleMutationCommandsExposeUUIDv7KeysAndRetireUnownedIdentityFlags(t *testing.T) {
+	config := &lifecycleCLIConfig{root: t.TempDir()}
+	for _, testCase := range []struct {
+		name string
+		new  func(*lifecycleCLIConfig) *cobra.Command
+		path []string
+	}{
+		{name: "task create", new: newTaskCommand, path: []string{"create"}},
+		{name: "task import", new: newTaskCommand, path: []string{"import"}},
+		{name: "task fork", new: newTaskCommand, path: []string{"fork"}},
+		{name: "task archive", new: newTaskCommand, path: []string{"archive"}},
+		{name: "task delete", new: newTaskCommand, path: []string{"delete"}},
+		{name: "task restore", new: newTaskCommand, path: []string{"restore"}},
+		{name: "run start", new: newRunCommandV2, path: []string{"start"}},
+		{name: "review decide", new: newReviewCommand, path: []string{"decide"}},
+		{name: "release package", new: newReleaseCommand, path: []string{"package"}},
+		{name: "release withdraw", new: newReleaseCommand, path: []string{"withdraw"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			command, _, err := testCase.new(config).Find(testCase.path)
+			if err != nil || command == nil {
+				t.Fatalf("find command %q: %v", testCase.path, err)
+			}
+			if command.Flags().Lookup("idempotency-key") == nil {
+				t.Fatalf("%s is missing its required lifecycle idempotency-key flag", testCase.name)
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		new   func(*lifecycleCLIConfig) *cobra.Command
+		path  []string
+		flags []string
+	}{
+		{name: "task create", new: newTaskCommand, path: []string{"create"}, flags: []string{"id"}},
+		{name: "task import", new: newTaskCommand, path: []string{"import"}, flags: []string{"id"}},
+		{name: "task fork", new: newTaskCommand, path: []string{"fork"}, flags: []string{"id"}},
+		{name: "run start", new: newRunCommandV2, path: []string{"start"}, flags: []string{"id", "parent-run", "execution-epoch"}},
+		{name: "release package", new: newReleaseCommand, path: []string{"package"}, flags: []string{"channel", "expected-channel-version"}},
+	} {
+		t.Run(testCase.name+" retired flags", func(t *testing.T) {
+			command, _, err := testCase.new(config).Find(testCase.path)
+			if err != nil || command == nil {
+				t.Fatalf("find command %q: %v", testCase.path, err)
+			}
+			for _, flag := range testCase.flags {
+				if command.Flags().Lookup(flag) != nil {
+					t.Fatalf("%s retains an unowned legacy flag --%s", testCase.name, flag)
+				}
 			}
 		})
 	}

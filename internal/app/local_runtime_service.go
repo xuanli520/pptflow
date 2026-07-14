@@ -16,6 +16,8 @@ import (
 // own domain services, never by `run reconcile`.
 type LocalRuntimeService struct{ core *lifecycleServiceCore }
 
+const localRuntimeReconcileBatchSize = 100
+
 type AttachRunRequest struct {
 	RunID string
 }
@@ -27,6 +29,8 @@ type RunAttachment struct {
 	Run            store.WorkflowRun               `json:"run"`
 	Stages         []store.StageAttempt            `json:"stages"`
 	Jobs           []AttachedDurableJob            `json:"jobs"`
+	WorkerLeases   []LocalLeaseAttachment          `json:"worker_leases"`
+	WorkerHandoffs []store.RunWorkerHandoff        `json:"worker_handoffs"`
 	Controls       []store.DurableControlOperation `json:"controls"`
 	TaskQuota      LocalQuotaScopeAttachment       `json:"task_quota"`
 	ActorQuota     LocalQuotaScopeAttachment       `json:"actor_quota"`
@@ -72,6 +76,8 @@ type RunReconciliationResult struct {
 	Attachment            RunAttachment                     `json:"attachment"`
 	RecoveredJobs         []store.ExpiredDurableJobRecovery `json:"recovered_jobs"`
 	ExpiredJobLeases      int                               `json:"expired_job_leases"`
+	ExpiredWorkerLeases   int                               `json:"expired_worker_leases"`
+	ExpiredWorkerHandoffs []store.RunWorkerHandoff          `json:"expired_worker_handoffs"`
 	ExpiredTaskQuotas     int                               `json:"expired_task_quotas"`
 	ExpiredActorQuotas    int                               `json:"expired_actor_quotas"`
 	UnresolvedControls    []store.DurableControlOperation   `json:"unresolved_controls"`
@@ -126,6 +132,18 @@ func (service *LocalRuntimeService) AttachRun(ctx context.Context, request Attac
 		}
 		attachedJobs = append(attachedJobs, attached)
 	}
+	workerLeases, err := service.core.store.ListLeasesForResource(ctx, RunWorkerLeaseResourceType, run.ID)
+	if err != nil {
+		return RunAttachment{}, fmt.Errorf("list local worker leases for run %s: %w", run.ID, err)
+	}
+	attachedWorkerLeases := make([]LocalLeaseAttachment, 0, len(workerLeases))
+	for _, lease := range workerLeases {
+		attachedWorkerLeases = append(attachedWorkerLeases, LocalLeaseAttachment{Lease: lease, Valid: isValidLocalLease(lease, observedAt)})
+	}
+	handoffs, err := service.core.store.ListRunWorkerHandoffsForRun(ctx, run.ID)
+	if err != nil {
+		return RunAttachment{}, fmt.Errorf("list controlled worker handoffs for run %s: %w", run.ID, err)
+	}
 	controls, err := service.core.store.ListExecutionControlOperationsForRun(ctx, run.ID)
 	if err != nil {
 		return RunAttachment{}, fmt.Errorf("list execution controls for run %s: %w", run.ID, err)
@@ -139,8 +157,9 @@ func (service *LocalRuntimeService) AttachRun(ctx context.Context, request Attac
 		return RunAttachment{}, err
 	}
 	return RunAttachment{
-		Run: *run, Stages: append([]store.StageAttempt(nil), stages...), Jobs: attachedJobs,
-		Controls: append([]store.DurableControlOperation(nil), controls...), TaskQuota: taskQuota,
+		Run: *run, Stages: append([]store.StageAttempt(nil), stages...), Jobs: attachedJobs, WorkerLeases: attachedWorkerLeases,
+		WorkerHandoffs: append([]store.RunWorkerHandoff(nil), handoffs...),
+		Controls:       append([]store.DurableControlOperation(nil), controls...), TaskQuota: taskQuota,
 		ActorQuota: actorQuota, ObservedAt: observedAt, AttachableJobs: attachableJobs,
 	}, nil
 }
@@ -171,15 +190,32 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 	if run == nil {
 		return RunReconciliationResult{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 	}
-	recovered, err := service.core.store.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{
-		RunID: run.ID, Limit: 100, Actor: actor, Reason: reason,
-	})
-	if err != nil {
-		return RunReconciliationResult{}, fmt.Errorf("reconcile expired durable jobs for run %s: %w", run.ID, err)
+	var recovered []store.ExpiredDurableJobRecovery
+	for {
+		batch, err := service.core.store.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{
+			RunID: run.ID, Limit: localRuntimeReconcileBatchSize, Actor: actor, Reason: reason,
+		})
+		if err != nil {
+			return RunReconciliationResult{}, fmt.Errorf("reconcile expired durable jobs for run %s: %w", run.ID, err)
+		}
+		recovered = append(recovered, batch...)
+		if len(batch) < localRuntimeReconcileBatchSize {
+			break
+		}
 	}
 	expiredJobLeases, err := service.core.store.ExpireLeasesForRun(ctx, run.ID, actor, reason)
 	if err != nil {
 		return RunReconciliationResult{}, fmt.Errorf("expire local job leases for run %s: %w", run.ID, err)
+	}
+	expiredWorkerHandoffs, err := service.core.store.ReconcileRunWorkerHandoffs(ctx, store.ReconcileRunWorkerHandoffsRequest{
+		RunID: run.ID, Actor: actor, Reason: reason,
+	})
+	if err != nil {
+		return RunReconciliationResult{}, fmt.Errorf("reconcile controlled worker handoffs for run %s: %w", run.ID, err)
+	}
+	expiredWorkerLeases, err := service.core.store.ExpireLeasesForResource(ctx, RunWorkerLeaseResourceType, run.ID, actor, reason)
+	if err != nil {
+		return RunReconciliationResult{}, fmt.Errorf("expire local worker leases for run %s: %w", run.ID, err)
 	}
 	expiredTaskQuotas, err := service.core.store.ExpireQuotaLeasesForScope(ctx, store.QuotaScopeTask, run.TaskID, actor, reason)
 	if err != nil {
@@ -189,13 +225,20 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 	if err != nil {
 		return RunReconciliationResult{}, fmt.Errorf("expire actor quota leases for run %s: %w", run.ID, err)
 	}
+	if service.core.repairs != nil {
+		if _, err := service.core.repairs.RecoverRunOutcome(ctx, run.ID); err != nil {
+			return RunReconciliationResult{}, fmt.Errorf("recover automatic repair for run %s: %w", run.ID, err)
+		}
+	}
 	attachment, err := service.AttachRun(ctx, AttachRunRequest{RunID: run.ID})
 	if err != nil {
 		return RunReconciliationResult{}, err
 	}
 	result := RunReconciliationResult{
 		Attachment: attachment, RecoveredJobs: append([]store.ExpiredDurableJobRecovery(nil), recovered...),
-		ExpiredJobLeases: expiredJobLeases, ExpiredTaskQuotas: expiredTaskQuotas, ExpiredActorQuotas: expiredActorQuotas,
+		ExpiredJobLeases: expiredJobLeases, ExpiredWorkerLeases: expiredWorkerLeases,
+		ExpiredWorkerHandoffs: append([]store.RunWorkerHandoff(nil), expiredWorkerHandoffs...),
+		ExpiredTaskQuotas:     expiredTaskQuotas, ExpiredActorQuotas: expiredActorQuotas,
 	}
 	for _, operation := range attachment.Controls {
 		if operation.Status == store.ControlOperationReconcileRequired {

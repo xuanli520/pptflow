@@ -2,74 +2,10 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func TestMigrateV1ToV2PreservesLegacyTables(t *testing.T) {
-	root := t.TempDir()
-	dbPath := filepath.Join(root, dbFileName)
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(migrationV1); err != nil {
-		t.Fatalf("create v1 schema: %v", err)
-	}
-	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
-		t.Fatalf("create version table: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (1)`); err != nil {
-		t.Fatalf("record v1 schema: %v", err)
-	}
-	result, err := db.Exec(`INSERT INTO tasks (task_dir, task_name) VALUES (?, ?)`, "/tmp/legacy", "legacy")
-	if err != nil {
-		t.Fatalf("insert legacy task: %v", err)
-	}
-	legacyTaskID, err := result.LastInsertId()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO runs (task_id, workspace_path, run_id, status) VALUES (?, ?, ?, ?)`, legacyTaskID, "/tmp/legacy-workspace", "legacy-run", "succeeded"); err != nil {
-		t.Fatalf("insert legacy run: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := Open(root)
-	if err != nil {
-		t.Fatalf("migrate v1 store: %v", err)
-	}
-	defer s.Close()
-	var version, taskCount, runCount int
-	if err := s.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if version != schemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
-	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tasks`).Scan(&taskCount); err != nil || taskCount != 1 {
-		t.Fatalf("v1 tasks not preserved: count=%d err=%v", taskCount, err)
-	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM runs`).Scan(&runCount); err != nil || runCount != 1 {
-		t.Fatalf("v1 runs not preserved: count=%d err=%v", runCount, err)
-	}
-	var tableName string
-	if err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks_v2'`).Scan(&tableName); err != nil || tableName != "tasks_v2" {
-		t.Fatalf("tasks_v2 missing: %q err=%v", tableName, err)
-	}
-	backups, err := s.ListVerifiedBackups()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(backups) == 0 || backups[0].Reason != "critical:schema_migration" {
-		t.Fatalf("expected verified pre-migration backup, got %+v", backups)
-	}
-}
 
 func TestV2TaskRevisionReviewPromotionAndAudit(t *testing.T) {
 	ctx := context.Background()
@@ -84,7 +20,7 @@ func TestV2TaskRevisionReviewPromotionAndAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !isUUIDv7(task.ID) || task.Version != 1 || task.IdentityState != TaskIdentityCanonical {
+	if !isUUIDv7(task.ID) || task.Version != 1 {
 		t.Fatalf("unexpected task: %+v", task)
 	}
 	_, err = s.CreateTaskV2(ctx, CreateTaskV2Request{ID: task.ID, Slug: "duplicate", Actor: "tester"})
@@ -173,22 +109,6 @@ func TestV2TaskRevisionReviewPromotionAndAudit(t *testing.T) {
 	}
 	if _, err := s.db.Exec(`DELETE FROM audit_events WHERE id = ?`, events[0].ID); err == nil {
 		t.Fatal("append-only audit event accepted a delete")
-	}
-}
-
-func TestLegacyOrphanDoesNotMerge(t *testing.T) {
-	s := tempDB(t)
-	orphan, err := s.CreateLegacyOrphan(context.Background(), CreateTaskV2Request{
-		Slug:           "orphan-workspace",
-		Title:          "Unresolved legacy workspace",
-		LegacyIdentity: "workspace=/tmp/unknown; no canonical digest",
-		Actor:          "importer",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if orphan.IdentityState != TaskIdentityLegacyOrphan || orphan.LegacyIdentity == "" {
-		t.Fatalf("legacy orphan was not retained distinctly: %+v", orphan)
 	}
 }
 
@@ -317,6 +237,29 @@ func TestDurableJobIdempotencyAndLeaseRelease(t *testing.T) {
 	}
 	if next.FencingToken <= lease.FencingToken {
 		t.Fatalf("fencing token did not advance: old=%d new=%d", lease.FencingToken, next.FencingToken)
+	}
+}
+
+func TestDurableJobCanCancelFromRunningForAcknowledgedRuntimeControl(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	job, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "stage_attempt.execute", EntityType: "stage_attempt", EntityID: "control-fixture", PayloadJSON: `{}`,
+		IdempotencyKey: "durable-job-running-cancel", Actor: "tester", Reason: "control fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err = s.TransitionDurableJob(ctx, TransitionDurableJobRequest{JobID: job.ID, ExpectedVersion: job.Version, State: JobRunning, Actor: "tester", Reason: "worker began stage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err = s.TransitionDurableJob(ctx, TransitionDurableJobRequest{JobID: job.ID, ExpectedVersion: job.Version, State: JobCanceled, Actor: "tester", Reason: "runtime acknowledged cancellation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != JobCanceled || job.FinishedAt == nil {
+		t.Fatalf("running job cancellation = %+v", job)
 	}
 }
 

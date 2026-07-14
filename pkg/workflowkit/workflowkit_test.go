@@ -386,6 +386,7 @@ func testStage(key StageKey, dependencies []StageKey, effect StageEffect, reads,
 	return StageDescriptor{
 		Key:          key,
 		Version:      "v1",
+		Plugin:       PluginBinding{ID: "example." + string(key), Version: "1.0.0"},
 		Group:        "example",
 		Dependencies: dependencies,
 		ReadSet:      reads,

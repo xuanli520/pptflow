@@ -36,7 +36,15 @@ func newLifecycleTUICommand(config *lifecycleCLIConfig) *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			return tui.RunWithLifecycle(ctx, app.RunnerOptions{}, tui.NewAppTaskHubLifecycleAdapter(services))
+			return tui.RunWithLifecycle(ctx, newLifecycleTUIAdapter(services))
 		},
 	}
+}
+
+// newLifecycleTUIAdapter keeps TUI composition explicit: the Task Hub can
+// offer per-Run exit handoff only when its application adapter is supplied a
+// controlled child-worker launcher. The launcher shares the `run detach`
+// process boundary and never lets the TUI mutate worker state directly.
+func newLifecycleTUIAdapter(services *app.LifecycleServices) *tui.AppTaskHubLifecycleAdapter {
+	return tui.NewAppTaskHubLifecycleAdapterWithRunWorkerHandoffLauncher(services, executableRunWorkerLauncher{})
 }

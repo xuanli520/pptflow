@@ -61,6 +61,10 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 	}
 	for _, runInspection := range inspection.Runs {
 		run := runInspection.Run
+		// Project the immutable manifest through the narrow TUI-safe reader.
+		// The raw JSON never enters TaskHubDetail, and an invalid binding is
+		// retained only as a conservative status rather than a partial contract.
+		detail.FrozenExecutions = append(detail.FrozenExecutions, taskHubFrozenExecutionFromRun(run))
 		projection := TaskHubRunFact{
 			RunID:               run.ID,
 			RevisionID:          run.RevisionID,

@@ -318,8 +318,9 @@ V2 采用混合权威模型：
 
 - SQLite 是 Task/Revision/Run/Stage/Command/Lifecycle 状态的权威控制面；
 - 文件系统或内容寻址对象目录是 immutable artifact 内容的权威存储；
-- `state.json`、`run_result.json` 作为导出快照和兼容层，不再是唯一状态来源；
-- workspace scan 仅用于 legacy import/reconcile，不再负责创建正常生命周期身份。
+- `state.json`、`run_result.json` 仅可作为受管状态的导出投影，不存在兼容 reader；
+- V1 workspace scan、import 和 reconcile 已退休；正常生命周期身份只由受管 V2 control plane 创建；
+- 新数据库从 V2-only baseline 初始化，不创建 V1 `tasks`/`runs` 表或 schema-version 1。含任一 V1 表或版本 1 历史的数据库在 `Open` 与 `OpenReadOnly` 均被拒绝；系统不读取其中记录、不导入、不迁移、不删除也不转换，只能恢复经过验证的 pure-V2 backup 或新建 control-plane root。
 
 ### 5.3 可复用 Workflow Kernel 与 Harbor Domain 边界
 
@@ -353,7 +354,7 @@ Reusable Workflow Kernel
 | immutable artifact、plan、checkpoint、event | TaskRevision、Release 和 ReviewDecision schema |
 | generic subject revision binding | Harbor RevisionCandidate 的生成和切换规则 |
 
-Kernel 接收冻结后的 typed descriptors，不接收 Harbor 的 `map[string]any`：
+Kernel 接收冻结后的 typed descriptors，不接收 Harbor 的 `map[string]any`。`pkg/workflowkit` 只校验并执行通用 Workflow/ExecutionPlan；Harbor 的实际 stage operation、provider、checkout、runtime 和 secret reference 必须预先冻结在 typed `RunExecutionSpec` 中。不存在按旧 stage 名、Runner、动态 payload 或兼容分支回退的执行路径：
 
 ```go
 type SubjectBinding struct {
@@ -370,14 +371,11 @@ type DomainBindings interface {
 }
 ```
 
-架构约束：`internal/workflow` 和未来独立 module 不得导入 `internal/harbor`；Harbor adapter 可以依赖 Kernel。新增非 Harbor AI workflow 时，只实现 DomainBindings、plugins 和 policy bundle，不复制 Runner、timeout、取消、重跑和 scheduler 逻辑。
+架构约束：已删除的 `internal/workflow` 不得复活；`pkg/workflowkit` 不得导入 `internal/harbor`。Harbor adapter 可以依赖 Kernel。新增非 Harbor AI workflow 时，只实现自己的 typed binding、operation registry 和 policy bundle，不复制 Runner、timeout、取消、重跑和 scheduler 逻辑。
 
 ### 5.4 包与模块演进
 
-`internal/workflow` 目前受 Go internal import 规则限制，无法被其他项目复用。迁移分两步，避免一开始就冻结错误 API：
-
-1. 先在仓库内把 Harbor 依赖反转到 typed ports，并用架构测试稳定 Kernel contract；
-2. contract 稳定后移动到 `pkg/workflowkit`，持久化、进程和 SQLite 实现留在 `internal/workflowruntime`；需要独立发布时再拆为单独 Go module。
+本轮已经直接交付公开 `pkg/workflowkit`，并删除 `internal/workflow`。持久化、进程和 SQLite adapter 保留在 `internal/workflowruntime`；需要独立发布时再拆为单独 Go module，但不得重新引入旧 Engine 或 Harbor 领域依赖。
 
 Kernel public package 只依赖标准库和小型接口，不依赖 Cobra、Bubble Tea、SQLite schema、具体 Agent SDK 或本地路径。默认 runtime adapters 可以替换，因此其他 AI workflow 可选择内存、Postgres、Kubernetes Job 或远程 artifact store。
 
@@ -1037,11 +1035,13 @@ RepairSession 是 `revise_task` 策略的审计聚合，不是另一套执行入
 WorkflowTemplate + ExecutionProfile + EvaluatorProfiles + RunRequest
   → validate
   → resolved WorkflowDefinition
-  → persist run_manifest.json / definition_hash
+  → freeze typed RunExecutionSpec + canonical profile
+  → persist managed run inputs / run_manifest.json / definition_hash
+  → compile dependency-level ExecutionPlan
   → execute
 ```
 
-运行中不因磁盘突然出现 report 而改变 DAG。导入/复用应在执行阶段作为显式策略：导入失效时可回退重新执行，而不是构建出另一张图。
+`StartRun` 在任何 durable job 调度前把 canonical profile 和 typed `RunExecutionSpec` 写入受管 Run 目录，并将其 digest 写入 Run manifest；调用方的松散文件不是执行权威。初始 `ExecutionPlan` 按 DAG dependency level 分 batch，同一层的全部 ready stage 并发启动，只受冻结 quota/capacity 限制，不能因 catalog 顺序被意外串行化。运行中不因磁盘突然出现 report 而改变 DAG；不存在 V1 import/reuse fallback 或另一张兼容图。
 
 ### 13.2 Typed plugin contract
 
@@ -1127,6 +1127,8 @@ GrantBudget(expected_version)
 ```
 
 TaskContinuationService 是暂停/失败后的恢复、主动阶段重算和内容修订后的唯一 application service。ExecutionControlService 负责目标明确的暂停、stage cancel 和 Run terminate；它不自行决定后续重跑。任意声明 `cancel` capability 的耗时阶段均可取消，不再只支持 Qwen/Opus。
+
+`StartRun` 和 `TaskContinuationService` 都只接受完整的 frozen profile 与 `RunExecutionSpec`。profile/spec 的 canonical bytes、格式版本和 fingerprint 必须在受管目录与 Run manifest 中一致；缺失、篡改或不匹配时拒绝执行，绝不降级到旧 Runner、旧配置文件或 stage-name fallback。
 
 ### 14.4 ReviewService
 
@@ -1232,18 +1234,9 @@ x c  继续处理
 
 执行前显示 invalidation plan，不允许用四个无解释的“复用证据”布尔开关代替规划。
 
-### 15.4 旧入口迁移
+### 15.4 旧入口移除
 
-| 旧入口 | 后端兼容映射 |
-|---|---|
-| manual retry handler | 构造 ContinueTaskCommand，target=当前失败节点，ResolveBlockers=true |
-| clone rerun handler | 构造同 revision 的 recompute intent，workspace 由后端分配 |
-| task repair handler | 构造带 guidance/findings 的 ChangeRequest |
-| FinalReview repair handler | 构造单轮/多轮 ChangeRequest 或人工变更 receipt |
-
-旧单键不再触发 mutation；首次按下时只显示新的双键提示，避免兼容逻辑继续制造上下文冲突。旧 handler 在 application 层产生与新入口等价的 command，供迁移测试和旧 CLI alias 使用。稳定一个版本后删除 `manual_retry.go`、`runconfig_overlay.go` 和 `task_repair_overlay.go` 的独立业务逻辑，保留薄适配器期间也只能调用 TaskContinuationService。
-
-> 本轮确认实施：采用 hard cutover。本段保留为历史迁移推理；不保留 handler、薄适配器、迁移测试入口或旧 CLI alias，`manual_retry.go`、`runconfig_overlay.go` 和 `task_repair_overlay.go` 已删除。
+本轮采用 hard cutover：不保留 manual retry、clone rerun、task repair、FinalReview repair 的 handler、薄适配器、迁移测试入口或 CLI alias。所有用户可见继续、重算和内容修订都只能进入 typed `TaskContinuationService` 或 `ChangeProvider` 流程。
 
 ### 15.5 `Ctrl+X` 运行控制
 
@@ -1265,7 +1258,7 @@ x c  继续处理
 
 `P/K/S` 只改变 overlay 选中项，必须再按 Enter 查看影响预览并确认；默认选中“返回并保持运行”，`Esc` 永远无副作用。非支持 cancel capability 的 stage 禁用 K 并显示原因。确认后 UI 持续显示 `requested → pausing/canceling → acknowledged|reconcile_required`、最近 checkpoint、runtime ack 和 quota settlement。
 
-删除所有 plain `x` cancel 绑定。退出 TUI 默认 detach durable jobs，不再调用 run cancel；要暂停或终止必须显式进入 RunControlOverlay。TUI context、scheduler context、每个 run context 和每个 stage context 必须分离，任何 target cancel 都不得向上取消共享 root context。
+删除所有 plain `x` cancel 绑定。退出 TUI 不再是全局 detach：界面逐个列出 active Run，运营者对每个 Run 单独确认受控 child-worker handoff；未完成选择不得静默取消或把同一选择批量应用给所有 Run。要暂停或终止必须显式进入 RunControlOverlay。TUI context、scheduler context、每个 run context 和每个 stage context 必须分离，任何 target cancel 都不得向上取消共享 root context。
 
 Hub 使用四个不同标签：`已暂停·可继续`、`阶段已取消·Run 仍进行`、`已终止`、`异常中断·待 reconcile`。canceled/skipped stage 不计入“可复用成功阶段”。
 
@@ -1295,9 +1288,7 @@ harbor workspace list|trash|purge
 
 公开 CLI 不提供 `--mode retry|rerun|repair`。无参数时 Planner 根据 failure、verdict、findings、目标状态和 digest 自动诊断；`--from-stage` 只表达用户目标，不直接决定失效边界。
 
-旧 `run retry-stage`、`run rerun` 和 `repair start` 在一个兼容周期内作为隐藏/弃用 alias，将输入转换为 ContinueTaskCommand；它们不得继续调用各自的 Runner 或 workspace clone 路径。
-
-> 本轮确认实施：hard cutover 覆盖上述临时 alias 设想。`run retry-stage`、`run rerun` 和 `repair start` 不注册、不隐藏，也不提供兼容 mutation 路径。
+`run retry-stage`、`run rerun` 和 `repair start` 不注册、不隐藏，也不提供兼容 mutation 路径。旧 Runner 和 workspace-clone 路径已删除。
 
 所有 mutation command 包含：
 
@@ -1418,9 +1409,11 @@ Admission 事务同时校验 frozen plan/policy、CAS quota bucket、写 BudgetL
 
 ## 18. 数据库与文件布局迁移
 
-### 18.1 Schema v2
+### 18.1 V2-only Schema Baseline
 
-保留 v1 表，新增：
+新 control-plane database 直接从 schema version 2 引导，不创建 V1 `tasks`/`runs` 表，不写入 schema-version 1。纯 V2 的历史数据库可继续在 V2 迁移链中升级；任何检测到 V1 `tasks`/`runs` 表或 schema-version 1 历史的数据库均在 `Open` 和 `OpenReadOnly` 被拒绝。拒绝前只识别 schema marker，不读取 V1 业务记录，不执行 import、migration、delete、drop 或 rewrite。损坏恢复也只接受 checksum 和 SQLite integrity 都验证通过的 pure-V2 backup；其余情况必须建立新的受管 root。
+
+V2 baseline 包含：
 
 ```text
 tasks_v2
@@ -1463,15 +1456,9 @@ deletion_records
 
 ### 18.2 Legacy import
 
-旧 workspace 导入顺序：
-
-1. 有外部 TaskDir：按规范路径和当前 digest 建立初始 TaskRevision；
-2. generated task：优先读取 PublishReceipt、GenReport、TaskProposal 和 task digest 建立稳定 Task；
-3. 同 repo/commit/proposal identity/digest 的重跑合并到同一 Task；
-4. 每个 workspace 建 Workspace 和 WorkflowRun；
-5. `run_result.json` nodes 导入 StageAttempt/NodeAttempt；
-6. 旧 workflow revision 保留为 legacy metadata，不冒充 TaskRevision；
-7. 无法归并的数据标记 `legacy_orphan`，等待人工合并。
+已退休。V2 不读取、扫描、导入或兼容 V1 workspace、V1 task identity、
+V1 run result 或 V1 evidence。所有新 Task、Revision、Run、StageAttempt 和
+artifact lineage 必须由受管 V2 control plane 原生创建；不做 V1/V2 双写，也不把旧数据库转换为 V2。
 
 ### 18.3 文件布局
 
@@ -1510,18 +1497,19 @@ deletion_records
 - 引入通用 Execution/Attempt 状态机、BudgetManager、QuotaManager 和 AdmissionController；
 - 引入 target-scoped durable ControlOperation、runtime receipt、pause/terminate ack 和 restart reconcile；
 - 引入 TaskContinuationService、ContinuationPlanner 和冻结 plan；
-- 让现有 manual retry、clone rerun、repair guidance 成为 command adapter；
 - 允许 Continue 主动选择成功阶段并 force recompute；
 - TUI/CLI 上线单一 `继续处理` 主入口和计划预览；
 - artifact 改为 immutable + superseded；
-- import/reuse 在运行时校验并支持 fallback。
+- 初始 DAG 按 dependency layer 并发调度；
+- `StartRun` 在受管目录冻结 canonical profile 与 typed `RunExecutionSpec`；
+- 不保留旧 Runner、legacy import/reuse fallback 或 command adapter。
 
 ### M2：Task/TaskRevision 控制面
 
 - 上线 schema v2 和 stable Task ID；
 - 引入 immutable TaskRevision 和 RevisionCandidate checkout；
-- 双写 v1/v2；
-- 导入旧 workspace；
+- 新数据库只引导 V2；检测到 V1 history/table 时拒绝打开；
+- 不双写、不导入、不迁移旧 workspace；
 - Hub 按 Task 聚合。
 
 ### M3：ChangeProvider 与 RevisionCandidate
@@ -1548,10 +1536,11 @@ deletion_records
 ### M5：移除兼容债务
 
 - TUI 不再直接修改/删除 live 文件；
-- 删除 manual retry、workspace clone rerun 和 repair overlay 的兼容适配器；
+- 删除 manual retry、workspace clone rerun 和 repair overlay 的全部源代码与测试；
 - 删除裸 workspace evidence 引用；
-- 废弃 v1 tasks/runs 和 `restart_from`；
+- 移除 V1 `tasks`/`runs` schema 定义、读写接口和 `restart_from`；含 V1 marker 的已有数据库拒绝打开，不尝试删除或转换其内容；
 - 移除旧图外 `gen.Run` 编排；
+- 删除旧 prompt/template assets、Python shim、status/index 路径和所有 legacy TUI/CLI command；
 - 统一文档中的 Gate 和阶段定义。
 
 ## 20. 代码模块建议
@@ -1607,14 +1596,14 @@ internal/harbor/catalog/
   artifact.go
 
 internal/harbor/store/
-  migration_v2.go
-  task_v2_store.go
-  run_v2_store.go
+  schema_v2.go ... schema_v18.go
+  v2_tasks.go
+  v2_execution.go
   stage_store.go
   lifecycle_store.go
 ```
 
-不建议继续把更多 lifecycle 逻辑加入 `Runner` 或 `HumanGatePlugin`。Runner 应收缩为 RunService 的执行适配器，HumanGate 只负责 durable review decision。
+不再保留 `Runner`。通用执行逻辑属于 `pkg/workflowkit`，Harbor 实际 stage operation 只经由受控 registry 解析 frozen `RunExecutionSpec`；HumanGate 只负责 durable review decision。
 
 ## 21. 测试策略与不变量
 
@@ -1666,6 +1655,9 @@ internal/harbor/store/
 - soft delete 可恢复；
 - active run/release dependency 阻止 purge；
 - scheduler 重启后 queued/running job 可 reconcile。
+- 新 V2 database 不含 V1 表或 version-1 history；
+- `Open` 与 `OpenReadOnly` 都拒绝 V1 table/history marker，且拒绝过程不创建版本表、不读取 V1 行或转换数据库；
+- pure-V2 historical store 升级后保留有效 Task/Revision/Run 外键，同时移除 retired identity columns。
 
 ### 21.5 取消、恢复与 quota
 
@@ -1676,6 +1668,7 @@ internal/harbor/store/
 - pause 在 checkpoint ack 后才进入 paused，恢复可用时不新增 attempt；
 - terminate 后 Engine、state projection、Scheduler 对状态统一为 `canceled`，不再出现 failed/cancelled/canceled 三套值；
 - stage cancel 只影响目标 capability，独立分支继续运行；
+- TUI exit 对每个 active Run 都有独立 handoff 决策和集成测试，任何单个选择都不影响其他 Run；
 - external side effect 未确认时进入 in_doubt，reconcile 前禁止 continue/retry；
 - terminal job 释放 active workspace reservation，但保留历史；
 - 已消费 token/API/trial/elapsed 不因 pause/cancel/clone/continuation 清零；
@@ -1683,8 +1676,10 @@ internal/harbor/store/
 
 ### 21.6 通用 Kernel 可复用性
 
-- 当前 `internal/workflow` 及目标 `pkg/workflowkit` 的依赖图中不存在 `internal/harbor`；
+- `pkg/workflowkit` 的依赖图中不存在 `internal/harbor`，且已删除的 `internal/workflow` 不得恢复；
 - 使用 fake domain bindings 可运行一个非 Harbor AI workflow，并复用预算、quota、checkpoint、取消和 continuation；
+- 同一 dependency level 的初始 stage 形成一个可并行 batch，跨 level 依赖顺序被验证；
+- 缺失、篡改或非 canonical 的 `RunExecutionSpec`/profile 被拒绝，且不存在 legacy Runner、stage-name 或动态 payload fallback；
 - Kernel 不包含 Qwen、Opus、pass@4、FinalReview、TaskRepair 等字符串或分支；
 - Harbor TrialCount、TrialAttempt 和 StageAttempt 三种计数不会互相覆盖或相乘；
 - 新增 evaluator/change provider 不修改 Engine 即可编译、计划、取消和恢复。

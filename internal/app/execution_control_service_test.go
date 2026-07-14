@@ -7,15 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/nodes"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 func TestExecutionControlServicePersistsTargetedControlWithCAS(t *testing.T) {
 	ctx := context.Background()
 	services, task, revision := newControlLifecycleFixture(t, "control-owner")
 	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), Trigger: "verify",
+		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "verify",
 		Actor: "control-owner", Reason: "start control fixture",
 	})
 	if err != nil {
@@ -109,7 +109,7 @@ func TestExecutionControlServicePersistsTargetedControlWithCAS(t *testing.T) {
 	}
 
 	stage, err := services.Store().CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
-		RunID: run.ID, StageKey: nodes.QualityCheck, StageGroup: "quality", Ordinal: 1,
+		RunID: run.ID, StageKey: workflowadapter.QualityCheck, StageGroup: "quality", Ordinal: 1,
 		InputFingerprint: "sha256:control-stage-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
 		Actor: "control-owner", Reason: "control fixture stage",
 	})
@@ -131,7 +131,7 @@ func TestExecutionControlServicePersistsTargetedControlWithCAS(t *testing.T) {
 		t.Fatalf("stage cancel operation = %+v", cancelStage)
 	}
 	gate, err := services.Store().CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
-		RunID: run.ID, StageKey: nodes.FinalReview, StageGroup: "review", Ordinal: 2,
+		RunID: run.ID, StageKey: workflowadapter.FinalReview, StageGroup: "review", Ordinal: 2,
 		InputFingerprint: "sha256:control-gate-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
 		Actor: "control-owner", Reason: "control fixture review gate",
 	})
@@ -173,7 +173,7 @@ func newControlLifecycleFixture(t *testing.T, actor string) (*LifecycleServices,
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	services, err := NewLifecycleServices(root, database)
+	services, err := newLifecycleServicesForTest(root, database)
 	if err != nil {
 		t.Fatal(err)
 	}

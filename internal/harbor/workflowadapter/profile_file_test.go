@@ -9,7 +9,7 @@ import (
 
 func TestParseExecutionProfileJSONUsesReadableDurationsAndRequiresCompleteCatalogAtCompile(t *testing.T) {
 	catalog := StandardStageCatalog()
-	document := map[string]any{"id": "explicit", "version": "1", "continuation_plan_ttl": "24h", "control_grace_period": "30s", "stages": make([]any, 0, len(catalog.Stages))}
+	document := map[string]any{"template": catalog.Template, "id": "explicit", "version": "1", "continuation_plan_ttl": "24h", "control_grace_period": "30s", "stages": make([]any, 0, len(catalog.Stages))}
 	stages := document["stages"].([]any)
 	for _, stage := range catalog.Stages {
 		stages = append(stages, map[string]any{

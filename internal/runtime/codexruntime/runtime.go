@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/codex"
 	"github.com/purplevoid/harbor-factory/internal/codex/appserver"
 	"github.com/purplevoid/harbor-factory/internal/executor"
-	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
 type Runtime struct {
@@ -30,14 +30,14 @@ func New(exec executor.CommandRunner, preferredPath string, env map[string]strin
 
 type conversation struct {
 	session   appserver.Session
-	defaults  workflow.AgentConversationRequest
+	defaults  agent.ConversationRequest
 	model     string
 	cleanup   string
 	closeOnce sync.Once
 	closeErr  error
 }
 
-func (r Runtime) OpenConversation(ctx context.Context, req workflow.AgentConversationRequest) (workflow.AgentConversation, error) {
+func (r Runtime) OpenConversation(ctx context.Context, req agent.ConversationRequest) (agent.Conversation, error) {
 	capability := codex.DetectCLI(ctx, r.exec, r.preferredPath)
 	if err := codex.ValidateAppServerCapability(capability); err != nil {
 		return nil, err
@@ -115,12 +115,12 @@ func (r Runtime) OpenConversation(ctx context.Context, req workflow.AgentConvers
 	return &conversation{session: session, defaults: defaults, model: req.Model, cleanup: cleanupCodexHome}, nil
 }
 
-func (c *conversation) Turn(ctx context.Context, req workflow.AgentTurnRequest) (workflow.AgentTurnResult, error) {
+func (c *conversation) Turn(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
 	if c == nil || c.session == nil {
-		return workflow.AgentTurnResult{}, fmt.Errorf("codex conversation is not open")
+		return agent.TurnResult{}, fmt.Errorf("codex conversation is not open")
 	}
 	if model := strings.TrimSpace(req.Model); model != "" && model != strings.TrimSpace(c.model) {
-		return workflow.AgentTurnResult{}, fmt.Errorf("codex conversation model cannot change from %q to %q", c.model, model)
+		return agent.TurnResult{}, fmt.Errorf("codex conversation model cannot change from %q to %q", c.model, model)
 	}
 	timeoutSeconds := req.TimeoutSeconds
 	if timeoutSeconds <= 0 {
@@ -146,7 +146,7 @@ func (c *conversation) Turn(ctx context.Context, req workflow.AgentTurnRequest) 
 		MaxOutputBytes: maxOutputBytes,
 	})
 	if err != nil {
-		return workflow.AgentTurnResult{}, err
+		return agent.TurnResult{}, err
 	}
 	warnings := make([]string, 0, len(result.Warnings))
 	for _, warning := range result.Warnings {
@@ -154,7 +154,7 @@ func (c *conversation) Turn(ctx context.Context, req workflow.AgentTurnRequest) 
 			warnings = append(warnings, warning.Error)
 		}
 	}
-	return workflow.AgentTurnResult{Text: result.Result.Stdout, Model: c.model, Warnings: warnings}, nil
+	return agent.TurnResult{Text: result.Result.Stdout, Model: c.model, Warnings: warnings}, nil
 }
 
 func (c *conversation) Close() error {
@@ -174,7 +174,7 @@ func (c *conversation) Close() error {
 	return c.closeErr
 }
 
-func appServerInput(input []workflow.AgentInputPart) []appserver.InputPart {
+func appServerInput(input []agent.InputPart) []appserver.InputPart {
 	if len(input) == 0 {
 		return nil
 	}

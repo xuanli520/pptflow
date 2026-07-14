@@ -29,6 +29,20 @@ type DurableJobHandler interface {
 	HandleDurableJob(context.Context, DurableJobExecution) (store.JobState, error)
 }
 
+// DurableJobRecoveryHandler is an optional domain reconciliation hook. The
+// store has already fenced and projected every recovered job before this hook
+// runs. Implementations may therefore restore only durable follow-up work
+// that is provably missing; they must not resume the interrupted job itself.
+//
+// It is deliberately separate from DurableJobHandler: recovery is not a
+// second attempt at an unknown side effect. In particular, a stage runtime may
+// enqueue a coordinator after observing an already-persisted terminal stage
+// result, while an external-effect stage remains in_doubt for explicit
+// reconciliation.
+type DurableJobRecoveryHandler interface {
+	ReconcileDurableJobRecoveries(context.Context, []store.ExpiredDurableJobRecovery) error
+}
+
 // DurableJobHandlerFunc adapts local functions and focused integration fakes.
 type DurableJobHandlerFunc func(context.Context, DurableJobExecution) (store.JobState, error)
 
@@ -48,10 +62,14 @@ type DurableJobExecution struct {
 // the confirmed 90 seconds / 20 seconds; callers may override both only as a
 // deployment profile, never through individual UI actions.
 type DurableWorkerConfig struct {
-	Store           *store.Store
-	Owner           string
-	Actor           string
-	Reason          string
+	Store  *store.Store
+	Owner  string
+	Actor  string
+	Reason string
+	// RunID fences a controlled child to jobs and expired-lease recovery for
+	// exactly one durable Run. An empty value is reserved for an explicitly
+	// deployment-wide worker supervisor.
+	RunID           string
 	LeaseTTL        time.Duration
 	HeartbeatEvery  time.Duration
 	CapacityPoolKey string
@@ -67,6 +85,7 @@ type DurableWorker struct {
 	owner           string
 	actor           string
 	reason          string
+	runID           string
 	leaseTTL        time.Duration
 	heartbeatEvery  time.Duration
 	capacityPoolKey string
@@ -86,6 +105,12 @@ func NewDurableWorker(config DurableWorkerConfig) (*DurableWorker, error) {
 	if config.Handler == nil {
 		return nil, fmt.Errorf("%w: handler is required", ErrDurableWorkerConfiguration)
 	}
+	runID := strings.TrimSpace(config.RunID)
+	if runID != "" {
+		if err := store.ValidateUUIDv7(runID); err != nil {
+			return nil, fmt.Errorf("%w: run ID: %v", ErrDurableWorkerConfiguration, err)
+		}
+	}
 	if config.LeaseTTL == 0 {
 		config.LeaseTTL = store.DefaultLeaseTTL
 	}
@@ -103,6 +128,7 @@ func NewDurableWorker(config DurableWorkerConfig) (*DurableWorker, error) {
 		owner:           owner,
 		actor:           defaultWorkerActor(config.Actor, owner),
 		reason:          strings.TrimSpace(config.Reason),
+		runID:           runID,
 		leaseTTL:        config.LeaseTTL,
 		heartbeatEvery:  config.HeartbeatEvery,
 		capacityPoolKey: strings.TrimSpace(config.CapacityPoolKey),
@@ -141,12 +167,18 @@ func (worker *DurableWorker) RunOnce(ctx context.Context) (DurableWorkerResult, 
 		return DurableWorkerResult{}, err
 	}
 	recoveries, err := worker.store.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{
+		RunID:  worker.runID,
 		Limit:  100,
 		Actor:  worker.actor,
 		Reason: worker.reasonFor("recover expired durable worker"),
 	})
 	if err != nil {
 		return DurableWorkerResult{}, fmt.Errorf("recover expired durable jobs: %w", err)
+	}
+	if reconciler, ok := worker.handler.(DurableJobRecoveryHandler); ok && len(recoveries) != 0 {
+		if err := reconciler.ReconcileDurableJobRecoveries(ctx, recoveries); err != nil {
+			return DurableWorkerResult{Recoveries: recoveries}, fmt.Errorf("reconcile recovered durable jobs: %w", err)
+		}
 	}
 	claimKey, err := store.NewUUIDv7()
 	if err != nil {
@@ -155,6 +187,7 @@ func (worker *DurableWorker) RunOnce(ctx context.Context) (DurableWorkerResult, 
 	claim, err := worker.store.ClaimNextDurableJob(ctx, store.ClaimNextDurableJobRequest{
 		IdempotencyKey:  "durable-worker-claim:" + claimKey,
 		Owner:           worker.owner,
+		RunID:           worker.runID,
 		LeaseTTL:        worker.leaseTTL,
 		CapacityPoolKey: worker.capacityPoolKey,
 		Actor:           worker.actor,

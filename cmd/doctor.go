@@ -13,20 +13,16 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/commandlog"
-	"github.com/purplevoid/harbor-factory/internal/harbor/secretscan"
-	harborstatus "github.com/purplevoid/harbor-factory/internal/harbor/status"
 	"github.com/spf13/cobra"
 )
 
 type doctorReport struct {
-	SchemaVersion string                        `json:"schema_version"`
-	GeneratedAt   time.Time                     `json:"generated_at"`
-	Tools         []toolCheck                   `json:"tools"`
-	Secrets       []secretCheck                 `json:"secrets,omitempty"`
-	Workspace     *harborstatus.WorkspaceStatus `json:"workspace,omitempty"`
-	SecretScan    *doctorSecretScan             `json:"secret_scan,omitempty"`
-	Passed        bool                          `json:"passed"`
-	Issues        []string                      `json:"issues,omitempty"`
+	SchemaVersion string        `json:"schema_version"`
+	GeneratedAt   time.Time     `json:"generated_at"`
+	Tools         []toolCheck   `json:"tools"`
+	Secrets       []secretCheck `json:"secrets,omitempty"`
+	Passed        bool          `json:"passed"`
+	Issues        []string      `json:"issues,omitempty"`
 }
 
 type toolCheck struct {
@@ -58,21 +54,13 @@ type secretCheck struct {
 	Present  bool   `json:"present"`
 }
 
-type doctorSecretScan struct {
-	Root         string   `json:"root"`
-	Passed       bool     `json:"passed"`
-	FindingCount int      `json:"finding_count"`
-	Summary      string   `json:"summary,omitempty"`
-	Issues       []string `json:"issues,omitempty"`
-}
-
 func newDoctorCommand() *cobra.Command {
-	var workspace string
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check local dependencies for Harbor factory E2E runs",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			report := runDoctor(workspace)
+			report := runDoctor()
 			data, err := json.MarshalIndent(report, "", "  ")
 			if err != nil {
 				return err
@@ -84,13 +72,12 @@ func newDoctorCommand() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&workspace, "workspace", "", "Optional workspace directory to inspect")
 	return cmd
 }
 
-func runDoctor(workspace string) doctorReport {
+func runDoctor() doctorReport {
 	report := doctorReport{
-		SchemaVersion: "harbor.doctor_report.v1",
+		SchemaVersion: "harbor.doctor_report.v2",
 		GeneratedAt:   time.Now().UTC(),
 		Passed:        true,
 	}
@@ -116,52 +103,7 @@ func runDoctor(workspace string) doctorReport {
 		Required: false,
 		Present:  strings.TrimSpace(os.Getenv("GPT_IMAGE_API_KEY")) != "",
 	})
-	if strings.TrimSpace(workspace) != "" {
-		ws, err := harborstatus.ReadWorkspace(workspace)
-		report.Workspace = &ws
-		if err != nil {
-			report.Passed = false
-			report.Issues = append(report.Issues, "workspace status: "+err.Error())
-		}
-		scan := runDoctorSecretScan(workspace)
-		report.SecretScan = &scan
-		if !scan.Passed {
-			report.Passed = false
-			report.Issues = append(report.Issues, "workspace secret scan failed")
-		}
-	}
 	return report
-}
-
-func runDoctorSecretScan(workspace string) doctorSecretScan {
-	workspace = strings.TrimSpace(workspace)
-	scan := doctorSecretScan{Root: commandlog.RedactText(workspace), Passed: true}
-	info, err := os.Stat(workspace)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return scan
-		}
-		scan.Passed = false
-		scan.Issues = append(scan.Issues, "cannot stat workspace: "+commandlog.RedactText(err.Error()))
-		return scan
-	}
-	if !info.IsDir() {
-		scan.Passed = false
-		scan.Issues = append(scan.Issues, "workspace is not a directory")
-		return scan
-	}
-	findings, err := secretscan.ScanDir(workspace)
-	if err != nil {
-		scan.Passed = false
-		scan.Issues = append(scan.Issues, "cannot scan workspace: "+commandlog.RedactText(err.Error()))
-		return scan
-	}
-	scan.FindingCount = len(findings)
-	if len(findings) > 0 {
-		scan.Passed = false
-		scan.Summary = secretscan.Summary(findings, 5)
-	}
-	return scan
 }
 
 type toolSpec struct {

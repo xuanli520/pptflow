@@ -13,11 +13,12 @@ import (
 )
 
 // AppTaskHubLifecycleAdapter projects the V2 application services into the
-// read/plan-only boundary consumed by the Task Hub. It deliberately has no
-// mutation path: confirmations are owned by the application service that
-// eventually executes a planned command.
+// Task Hub boundary. Every lifecycle confirmation is delegated to the typed
+// V12 mutation service; this adapter never writes through Store() or takes a
+// shortcut through a legacy domain service.
 type AppTaskHubLifecycleAdapter struct {
-	services *app.LifecycleServices
+	services                 *app.LifecycleServices
+	runWorkerHandoffLauncher app.RunWorkerHandoffLauncher
 }
 
 var _ TaskHubLifecycleService = (*AppTaskHubLifecycleAdapter)(nil)
@@ -25,12 +26,21 @@ var _ TaskHubRunControlPlanner = (*AppTaskHubLifecycleAdapter)(nil)
 var _ TaskHubMutationPlanner = (*AppTaskHubLifecycleAdapter)(nil)
 var _ TaskHubMutationExecutor = (*AppTaskHubLifecycleAdapter)(nil)
 var _ TaskHubRunControlMutationExecutor = (*AppTaskHubLifecycleAdapter)(nil)
+var _ TaskHubRunHandoffExecutor = (*AppTaskHubLifecycleAdapter)(nil)
 
 // NewAppTaskHubLifecycleAdapter creates the real Task Hub adapter for a V2
 // application service bundle. A nil bundle is retained so callers receive a
 // useful error from QueryTaskHub or PlanTaskHubCommand rather than a panic.
 func NewAppTaskHubLifecycleAdapter(services *app.LifecycleServices) *AppTaskHubLifecycleAdapter {
 	return &AppTaskHubLifecycleAdapter{services: services}
+}
+
+// NewAppTaskHubLifecycleAdapterWithRunWorkerHandoffLauncher creates the
+// composition-aware Task Hub adapter. The launcher is deliberately supplied
+// here, outside the TUI state machine: it is the only platform-specific step
+// after the application service has durably reserved one Run handoff.
+func NewAppTaskHubLifecycleAdapterWithRunWorkerHandoffLauncher(services *app.LifecycleServices, launcher app.RunWorkerHandoffLauncher) *AppTaskHubLifecycleAdapter {
+	return &AppTaskHubLifecycleAdapter{services: services, runWorkerHandoffLauncher: launcher}
 }
 
 // QueryTaskHub reads V2 lifecycle records through public application services.
@@ -54,7 +64,7 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHub(ctx context.Context, que
 	}
 
 	snapshot := TaskHubSnapshot{
-		GlobalActions: appTaskHubGlobalActions(),
+		GlobalActions: appTaskHubGlobalActions(services.Mutations != nil),
 		ObservedAt:    observedAt,
 	}
 	queued := make([]taskHubQueuedRun, 0)
@@ -86,11 +96,27 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 
 	switch command.Action {
 	case TaskHubActionNewTask:
-		return unavailableTaskHubPlan(command.Action, "新建 Task 需要标题、来源和审计原因；当前命令未携带这些输入"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		return TaskHubPlanPreview{
+			Title:              "新建 Task",
+			Summary:            "确认表单将收集新 Task 的标识、标题、可选来源与审计原因；提交后由 V12 幂等命令分配全局 UUIDv7 身份。",
+			Reason:             "尚未创建任何 Task、revision、Run 或本地 package。",
+			RevisionImpact:     "新 Task 以 draft 生命周期创建，不会修改已存在的 TaskRevision。",
+			ConfirmationNeeded: true,
+		}, nil
 	case TaskHubActionImportTask:
-		return unavailableTaskHubPlan(command.Action, "导入需要一个受管快照来源；当前命令未携带该输入"), nil
-	case TaskHubActionGenerateTask:
-		return unavailableTaskHubPlan(command.Action, "从仓库出题需要仓库和提交信息；当前命令未携带这些输入"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		return TaskHubPlanPreview{
+			Title:              "导入 Task",
+			Summary:            "确认表单将收集受管快照来源与 Task 元数据；提交后由 V12 幂等命令创建初始不可变 revision。",
+			Reason:             "导入源会在提交时按受管快照规则验证。",
+			RevisionImpact:     "创建独立 Task 和初始 imported revision；不会修改现有 TaskRevision。",
+			ConfirmationNeeded: true,
+		}, nil
 	}
 
 	target, err := adapter.resolveTaskHubTarget(ctx, services, command.Target)
@@ -100,17 +126,125 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 
 	switch command.Action {
 	case TaskHubActionEditTask:
-		return unavailableTaskHubPlan(command.Action, "创建修改需要候选快照和变更说明；当前命令未携带这些输入"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		if target.run == nil {
+			return unavailableTaskHubPlan(command.Action, "创建修改需要从 Run 视图选择明确的 Run"), nil
+		}
+		revision, unavailable, err := target.currentRevision(ctx, services)
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		if unavailable != "" {
+			return unavailableTaskHubPlan(command.Action, unavailable), nil
+		}
+		if target.run.RevisionID != revision.ID {
+			return unavailableTaskHubPlan(command.Action, "只能基于当前 TaskRevision 对应的 Run 创建候选修改"), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, revision.ID, target.run.ID, "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return TaskHubPlanPreview{
+			Title:              "基于当前 revision 创建 draft 修改",
+			Summary:            "确认表单将收集 unified diff；提交前先在隔离候选快照中冻结变更计划，第二次确认才会提交新 revision。",
+			Reason:             "修改绑定当前 Task、revision 与 Run checkpoint。",
+			RevisionImpact:     "不会原地修改当前 TaskRevision；有实际 digest 变化时才提交候选 revision。",
+			ExecutionScope:     []string{target.task.ID, revision.ID, target.run.ID},
+			ConfirmationNeeded: true,
+			Expected:           expected,
+		}, nil
 	case TaskHubActionForkTask:
-		return unavailableTaskHubPlan(command.Action, "Fork 需要新 Task 的名称和标识；当前命令未携带这些输入"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		var revision store.TaskRevision
+		if target.revision != nil {
+			revision = *target.revision
+		} else if strings.TrimSpace(target.task.CurrentRevisionID) != "" {
+			current, err := services.Revisions.Get(ctx, target.task.CurrentRevisionID)
+			if err != nil {
+				return TaskHubPlanPreview{}, err
+			}
+			revision = current
+		} else {
+			return unavailableTaskHubPlan(command.Action, "Fork 需要从详情选择明确的源 revision"), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, revision.ID, "", "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return TaskHubPlanPreview{
+			Title:              "Fork Task",
+			Summary:            "确认表单将收集新 Task 的标识和标题；提交后由 V12 幂等命令复制当前不可变 revision 到新的 Task 身份。",
+			Reason:             "Fork 绑定当前 Task 与当前 revision checkpoint。",
+			RevisionImpact:     "创建独立 Task 和 fork revision，不会修改源 TaskRevision。",
+			ExecutionScope:     []string{target.task.ID, revision.ID},
+			ConfirmationNeeded: true,
+			Expected:           expected,
+		}, nil
 	case TaskHubActionArchiveTask:
-		return unavailableTaskHubPlan(command.Action, "归档尚未提供带 UUIDv7 幂等键的 application command 契约"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		if target.task.LifecycleState != store.TaskLifecyclePublished {
+			return unavailableTaskHubPlan(command.Action, fmt.Sprintf("Task 当前处于 %s；只有 published Task 可以归档", target.task.LifecycleState)), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, "", "", "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return taskHubTaskTransitionPreview(command.Action, target.task, expected), nil
 	case TaskHubActionSoftDeleteTask:
-		return unavailableTaskHubPlan(command.Action, "软删除尚未提供带 UUIDv7 幂等键的 application command 契约"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		if target.task.LifecycleState == store.TaskLifecycleDeleted {
+			return unavailableTaskHubPlan(command.Action, "Task 已处于 deleted；请使用恢复操作"), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, "", "", "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return taskHubTaskTransitionPreview(command.Action, target.task, expected), nil
 	case TaskHubActionRestoreTask:
-		return unavailableTaskHubPlan(command.Action, "恢复需要明确的目标 lifecycle 状态；当前命令未携带该输入"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		if target.task.LifecycleState != store.TaskLifecycleDeleted {
+			return unavailableTaskHubPlan(command.Action, fmt.Sprintf("Task 当前处于 %s；只有 deleted Task 可以恢复", target.task.LifecycleState)), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, "", "", "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return taskHubTaskTransitionPreview(command.Action, target.task, expected), nil
 	case TaskHubActionStartRun:
-		return unavailableTaskHubPlan(command.Action, "启动 Run 需要完整且显式的执行 profile；当前命令未携带该输入"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		revision, unavailable, err := target.currentRevision(ctx, services)
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		if unavailable != "" {
+			return unavailableTaskHubPlan(command.Action, unavailable), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, revision.ID, "", "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return TaskHubPlanPreview{
+			Title:              "启动新 Run",
+			Summary:            "确认表单会收集独立的 execution profile 与 execution specification；首次确认将把二者 canonicalize 后迁入受管目录，第二次确认才创建冻结 Run。",
+			Reason:             "Run 绑定当前 TaskRevision 与 digest，不会从 workspace 或 UI 默认值推导执行输入。",
+			RevisionImpact:     "不会修改 TaskRevision 内容。",
+			ExecutionScope:     []string{target.task.ID, revision.ID},
+			ExternalEffects:    []string{"首次确认写入受管的 profile/spec 冻结副本"},
+			ConfirmationNeeded: true,
+			Expected:           expected,
+		}, nil
 	case TaskHubActionContinue:
 		if target.run == nil || services.Continuations == nil {
 			return unavailableTaskHubPlan(command.Action, "继续处理需要明确的 Run 和 TaskContinuationService"), nil
@@ -153,22 +287,33 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 			ConfirmationNeeded: false,
 		}, nil
 	case TaskHubActionApproveReview, TaskHubActionRequestChanges, TaskHubActionRejectReview:
-		review, unavailable, err := adapter.openTaskHubReview(ctx, services, target, false)
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		review, unavailable, err := adapter.openTaskHubReview(ctx, services, target)
 		if err != nil {
 			return TaskHubPlanPreview{}, err
 		}
 		if unavailable != "" {
 			return unavailableTaskHubPlan(command.Action, unavailable), nil
 		}
+		expected, err := adapter.captureTaskHubReviewCheckpoint(ctx, services, target.task.ID, review.RevisionID, review.ID)
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
 		return TaskHubPlanPreview{
 			Title:              taskHubActionLabel(command.Action),
-			Summary:            "确认后将记录不可变审核决定并关闭该 ReviewRequest。",
+			Summary:            "确认后将通过 V12 幂等审核命令记录不可变决定并关闭该 ReviewRequest。",
 			Reason:             "审核请求 " + review.ID + " 当前处于 open 状态。",
 			RevisionImpact:     "审核决定绑定当前 revision digest；不会原地修改 TaskRevision 内容。",
 			ExecutionScope:     []string{target.task.ID, review.RevisionID, review.ID},
 			ConfirmationNeeded: true,
+			Expected:           expected,
 		}, nil
 	case TaskHubActionPackageRevision:
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
 		revision, unavailable, err := target.currentRevision(ctx, services)
 		if err != nil {
 			return TaskHubPlanPreview{}, err
@@ -182,6 +327,10 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 		if strings.TrimSpace(revision.ValidationEvidenceManifest) == "" {
 			return unavailableTaskHubPlan(command.Action, "revision 缺少验证证据清单，不能创建本地 package"), nil
 		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, revision.ID, "", "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
 		return TaskHubPlanPreview{
 			Title:              "生成本地 package",
 			Summary:            "确认后只会在 Harbor Flow 受管目录生成不可变本地 package；不会上传、复制到外部目的地或调用 provider。",
@@ -189,9 +338,39 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 			RevisionImpact:     "revision 内容和 digest 不变；仅记录本地 package receipt。",
 			ExecutionScope:     []string{target.task.ID, revision.ID},
 			ConfirmationNeeded: true,
+			Expected:           expected,
 		}, nil
 	case TaskHubActionWithdrawRelease:
-		return unavailableTaskHubPlan(command.Action, "撤回需要明确的 release ID；当前 Task Hub 命令未携带该目标"), nil
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		releaseID := strings.TrimSpace(target.releaseID)
+		if releaseID == "" {
+			return unavailableTaskHubPlan(command.Action, "请从详情“本地包”分类选择明确的未撤回 release"), nil
+		}
+		release, err := services.Store().GetLocalPackageRelease(ctx, releaseID)
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		if release == nil || release.TaskID != target.task.ID {
+			return unavailableTaskHubPlan(command.Action, "指定 release 不属于当前 Task 或已不存在"), nil
+		}
+		if release.WithdrawnAt != nil {
+			return unavailableTaskHubPlan(command.Action, "指定 release 已撤回"), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, target.task.ID, release.RevisionID, "", release.ID)
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return TaskHubPlanPreview{
+			Title:              "撤回本地 package",
+			Summary:            "确认后由 V12 幂等命令记录 release 撤回；package 文件和证据不会被删除或上传。",
+			Reason:             "release " + release.ReleaseVersion + " 当前未撤回。",
+			RevisionImpact:     "TaskRevision 内容与 digest 不变；仅写入撤回 receipt。",
+			ExecutionScope:     []string{target.task.ID, release.RevisionID, release.ID},
+			ConfirmationNeeded: true,
+			Expected:           expected,
+		}, nil
 	default:
 		return TaskHubPlanPreview{}, fmt.Errorf("unsupported Task Hub action %q", command.Action)
 	}
@@ -260,8 +439,8 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubRunControl(ctx context.Con
 }
 
 // PrepareTaskHubMutation freezes actions that require a durable plan before
-// execution. At present only continuation uses this extra phase; ordinary
-// lifecycle actions remain read-only until the final confirmation submit.
+// execution. Continuation and manual patch both retain the exact operator
+// provenance and checkpoint that were reviewed in the confirmation form.
 func (adapter *AppTaskHubLifecycleAdapter) PrepareTaskHubMutation(ctx context.Context, request TaskHubMutationRequest) (TaskHubPreparedMutation, error) {
 	services, err := adapter.lifecycleServices()
 	if err != nil {
@@ -270,42 +449,98 @@ func (adapter *AppTaskHubLifecycleAdapter) PrepareTaskHubMutation(ctx context.Co
 	if err := validateTaskHubMutationRequest(request); err != nil {
 		return TaskHubPreparedMutation{}, err
 	}
-	if request.Action != TaskHubActionContinue {
-		return TaskHubPreparedMutation{}, fmt.Errorf("Task Hub action %q does not have a separate planning phase", request.Action)
-	}
-	if services.Continuations == nil {
-		return TaskHubPreparedMutation{}, fmt.Errorf("TaskContinuationService is not configured")
-	}
-	if strings.TrimSpace(request.PlanID) != "" {
-		plan, err := services.Continuations.GetTaskContinuationPlan(ctx, request.PlanID)
+	switch request.Action {
+	case TaskHubActionStartRun:
+		if services.Mutations == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		prepared, err := services.Mutations.PrepareStartRun(ctx, app.StartRunLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			ProfilePath:                  taskHubMutationValue(request, taskHubExecutionProfilePathField),
+			ExecutionSpecPath:            taskHubMutationValue(request, taskHubExecutionSpecPathField),
+			Trigger:                      taskHubMutationValue(request, taskHubRunTriggerField),
+		})
+		if err != nil {
+			return TaskHubPreparedMutation{}, err
+		}
+		return TaskHubPreparedMutation{
+			Preview: TaskHubPlanPreview{
+				PlanID:             "run-start:" + request.IdempotencyKey,
+				Title:              "启动新 Run（输入已冻结）",
+				Summary:            "execution profile 与 execution specification 已 canonicalize 并迁入受管目录；再次确认将创建唯一的 durable Run。",
+				Reason:             "profile " + prepared.ProfileFingerprint + "；execution spec " + prepared.ExecutionSpecFingerprint + "。",
+				RevisionImpact:     "不会修改 TaskRevision 内容。",
+				ExecutionScope:     []string{request.Target.TaskID, request.Target.RevisionID},
+				ExternalEffects:    []string{"第二次确认将创建 Run、durable job 与 outbox 记录"},
+				ConfirmationNeeded: true,
+				Expected:           request.Expected,
+			},
+			Actor:  request.Actor,
+			Reason: request.Reason,
+		}, nil
+	case TaskHubActionContinue:
+		if services.Continuations == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("TaskContinuationService is not configured")
+		}
+		if strings.TrimSpace(request.PlanID) != "" {
+			plan, err := services.Continuations.GetTaskContinuationPlan(ctx, request.PlanID)
+			if err != nil {
+				return TaskHubPreparedMutation{}, err
+			}
+			return adapter.preparedTaskHubContinuation(ctx, services, plan)
+		}
+		target, err := adapter.resolveTaskHubTarget(ctx, services, request.Target)
+		if err != nil {
+			return TaskHubPreparedMutation{}, err
+		}
+		if target.run == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("继续处理需要明确的 Run")
+		}
+		checkpoint, err := services.Continuations.CurrentCheckpoint(ctx, target.run.ID)
+		if err != nil {
+			return TaskHubPreparedMutation{}, err
+		}
+		plan, err := services.Continuations.PlanTaskContinuation(ctx, app.ContinueTaskCommand{
+			CommandKey: request.IdempotencyKey,
+			TaskID:     target.task.ID,
+			RunID:      target.run.ID,
+			Expected:   checkpoint,
+			Actor:      request.Actor,
+			Reason:     request.Reason,
+		})
 		if err != nil {
 			return TaskHubPreparedMutation{}, err
 		}
 		return adapter.preparedTaskHubContinuation(ctx, services, plan)
+	case TaskHubActionEditTask:
+		if services.Mutations == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		if strings.TrimSpace(request.PlanID) != "" {
+			return TaskHubPreparedMutation{}, fmt.Errorf("手工修改计划已经冻结")
+		}
+		receipt, err := services.Mutations.PrepareManualPatch(ctx, app.EditLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			UnifiedDiff:                  taskHubMutationValue(request, taskHubUnifiedDiffField),
+		})
+		if err != nil {
+			return TaskHubPreparedMutation{}, err
+		}
+		if strings.TrimSpace(receipt.PlanID) == "" || services.Continuations == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("手工修改未返回可执行的冻结计划")
+		}
+		plan, err := services.Continuations.GetTaskContinuationPlan(ctx, receipt.PlanID)
+		if err != nil {
+			return TaskHubPreparedMutation{}, err
+		}
+		preview := taskHubContinuationPlanPreview(plan)
+		preview.Title = "手工修改计划（已冻结）"
+		preview.Summary = "已在隔离候选快照中准备 unified diff；再次确认后才会提交候选 revision。"
+		preview.Expected = request.Expected
+		return TaskHubPreparedMutation{Preview: preview, Actor: request.Actor, Reason: request.Reason}, nil
+	default:
+		return TaskHubPreparedMutation{}, fmt.Errorf("Task Hub action %q does not have a separate planning phase", request.Action)
 	}
-	target, err := adapter.resolveTaskHubTarget(ctx, services, request.Target)
-	if err != nil {
-		return TaskHubPreparedMutation{}, err
-	}
-	if target.run == nil {
-		return TaskHubPreparedMutation{}, fmt.Errorf("继续处理需要明确的 Run")
-	}
-	checkpoint, err := services.Continuations.CurrentCheckpoint(ctx, target.run.ID)
-	if err != nil {
-		return TaskHubPreparedMutation{}, err
-	}
-	plan, err := services.Continuations.PlanTaskContinuation(ctx, app.ContinueTaskCommand{
-		CommandKey: request.IdempotencyKey,
-		TaskID:     target.task.ID,
-		RunID:      target.run.ID,
-		Expected:   checkpoint,
-		Actor:      request.Actor,
-		Reason:     request.Reason,
-	})
-	if err != nil {
-		return TaskHubPreparedMutation{}, err
-	}
-	return adapter.preparedTaskHubContinuation(ctx, services, plan)
 }
 
 func (adapter *AppTaskHubLifecycleAdapter) preparedTaskHubContinuation(ctx context.Context, services *app.LifecycleServices, plan workflowkit.ContinuationPlan) (TaskHubPreparedMutation, error) {
@@ -340,6 +575,99 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 		return TaskHubMutationResult{}, err
 	}
 	switch request.Action {
+	case TaskHubActionNewTask:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.CreateDraft(ctx, app.CreateDraftLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			Slug:                         taskHubMutationValue(request, taskHubTaskSlugField),
+			Title:                        taskHubMutationValue(request, taskHubTaskTitleField),
+			MetadataJSON:                 taskHubMutationValue(request, taskHubTaskMetadataJSONField),
+			SourceRepo:                   taskHubMutationValue(request, taskHubTaskSourceRepoField),
+			SourceCommit:                 taskHubMutationValue(request, taskHubTaskSourceCommitField),
+		})
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionImportTask:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.Import(ctx, app.ImportLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			Slug:                         taskHubMutationValue(request, taskHubTaskSlugField),
+			Title:                        taskHubMutationValue(request, taskHubTaskTitleField),
+			MetadataJSON:                 taskHubMutationValue(request, taskHubTaskMetadataJSONField),
+			SourceRepo:                   taskHubMutationValue(request, taskHubTaskSourceRepoField),
+			SourceCommit:                 taskHubMutationValue(request, taskHubTaskSourceCommitField),
+			SourcePath:                   taskHubMutationValue(request, taskHubImportSourcePathField),
+			ProposalDigest:               taskHubMutationValue(request, taskHubImportProposalDigestField),
+			ChangeSummary:                taskHubMutationValue(request, taskHubImportChangeSummaryField),
+		})
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionForkTask:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.Fork(ctx, app.ForkLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			Slug:                         taskHubMutationValue(request, taskHubTaskSlugField),
+			Title:                        taskHubMutationValue(request, taskHubTaskTitleField),
+			MetadataJSON:                 taskHubMutationValue(request, taskHubTaskMetadataJSONField),
+		})
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionArchiveTask:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.Archive(ctx, taskHubLifecycleMutationBase(request))
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionSoftDeleteTask:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.SoftDelete(ctx, taskHubLifecycleMutationBase(request))
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionRestoreTask:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.Restore(ctx, app.RestoreLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			RestoreState:                 store.TaskLifecycleState(taskHubMutationValue(request, taskHubRestoreStateField)),
+		})
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionStartRun:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.StartRun(ctx, app.StartRunLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			ProfilePath:                  taskHubMutationValue(request, taskHubExecutionProfilePathField),
+			ExecutionSpecPath:            taskHubMutationValue(request, taskHubExecutionSpecPathField),
+			Trigger:                      taskHubMutationValue(request, taskHubRunTriggerField),
+		})
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionContinue:
 		if services.Continuations == nil {
 			return TaskHubMutationResult{}, fmt.Errorf("TaskContinuationService is not configured")
@@ -369,79 +697,51 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 			ExecutionID: execution.ID,
 			Summary:     "续跑计划已提交到 durable worker 队列",
 		}, nil
+	case TaskHubActionEditTask:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		if strings.TrimSpace(request.PlanID) == "" {
+			return TaskHubMutationResult{}, fmt.Errorf("手工修改必须先冻结候选变更计划")
+		}
+		receipt, err := services.Mutations.ExecuteManualPatch(ctx, taskHubLifecycleMutationBase(request), request.PlanID)
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionApproveReview, TaskHubActionRequestChanges, TaskHubActionRejectReview:
-		if services.Reviews == nil {
-			return TaskHubMutationResult{}, fmt.Errorf("review service is not configured")
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
 		}
-		target, err := adapter.resolveTaskHubTarget(ctx, services, request.Target)
-		if err != nil {
-			return TaskHubMutationResult{}, err
-		}
-		review, unavailable, err := adapter.openTaskHubReview(ctx, services, target, true)
-		if err != nil {
-			return TaskHubMutationResult{}, err
-		}
-		if unavailable != "" {
-			return TaskHubMutationResult{}, fmt.Errorf("%s", unavailable)
-		}
-		revision, err := services.Revisions.Get(ctx, review.RevisionID)
-		if err != nil {
-			return TaskHubMutationResult{}, err
-		}
-		decision, err := services.Reviews.Decide(ctx, app.DecideReviewRequest{
-			ID:                     request.IdempotencyKey,
-			ReviewRequestID:        review.ID,
-			RevisionID:             review.RevisionID,
-			Action:                 taskHubReviewDecisionAction(request.Action),
-			ExpectedRevisionDigest: revision.TaskDigest,
-			Actor:                  request.Actor,
-			Reason:                 request.Reason,
+		receipt, err := services.Mutations.DecideReview(ctx, app.DecideReviewLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			Decision:                     taskHubReviewDecisionAction(request.Action),
 		})
 		if err != nil {
 			return TaskHubMutationResult{}, err
 		}
-		return TaskHubMutationResult{
-			Action:    request.Action,
-			Target:    request.Target,
-			ReceiptID: decision.ID,
-			Summary:   taskHubActionLabel(request.Action) + "已记录",
-		}, nil
+		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionPackageRevision:
-		if services.Releases == nil {
-			return TaskHubMutationResult{}, fmt.Errorf("release service is not configured")
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
 		}
-		target, err := adapter.resolveTaskHubTarget(ctx, services, request.Target)
-		if err != nil {
-			return TaskHubMutationResult{}, err
-		}
-		revision, unavailable, err := target.currentRevision(ctx, services)
-		if err != nil {
-			return TaskHubMutationResult{}, err
-		}
-		if unavailable != "" {
-			return TaskHubMutationResult{}, fmt.Errorf("%s", unavailable)
-		}
-		version := strings.TrimSpace(request.Values[taskHubPackageVersionField])
-		if version == "" {
-			return TaskHubMutationResult{}, fmt.Errorf("本地 package 版本是必填项")
-		}
-		result, err := services.Releases.PackageRevision(ctx, app.PackageRevisionRequest{
-			RevisionID:           revision.ID,
-			ExpectedStateVersion: revision.StateVersion,
-			ReleaseVersion:       version,
-			IdempotencyKey:       request.IdempotencyKey,
-			Actor:                request.Actor,
-			Reason:               request.Reason,
+		receipt, err := services.Mutations.Package(ctx, app.PackageLifecycleCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			ReleaseVersion:               taskHubMutationValue(request, taskHubPackageVersionField),
 		})
 		if err != nil {
 			return TaskHubMutationResult{}, err
 		}
-		return TaskHubMutationResult{
-			Action:    request.Action,
-			Target:    request.Target,
-			ReceiptID: result.Release.ID,
-			Summary:   "本地 package 已生成并记录；未上传或调用远端 provider",
-		}, nil
+		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionWithdrawRelease:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		receipt, err := services.Mutations.Withdraw(ctx, taskHubLifecycleMutationBase(request))
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
 	default:
 		return TaskHubMutationResult{}, fmt.Errorf("Task Hub action %q has no confirmed idempotent execution contract", request.Action)
 	}
@@ -503,6 +803,90 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubRunControlMutation(ctx 
 	}, nil
 }
 
+// ExecuteTaskHubRunHandoff transfers exactly one selected Run to the
+// application handoff service. It does not inspect SQLite or spawn processes
+// itself; the injected launcher remains behind RunWorkerHandoffService's
+// reserve-launch-receipt protocol.
+func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubRunHandoff(ctx context.Context, request TaskHubRunHandoffRequest) (TaskHubRunHandoffResult, error) {
+	if err := validateTaskHubRunHandoffRequest(request); err != nil {
+		return TaskHubRunHandoffResult{}, err
+	}
+	services, err := adapter.lifecycleServices()
+	if err != nil {
+		return TaskHubRunHandoffResult{}, err
+	}
+	if services.WorkerHandoffs == nil {
+		return TaskHubRunHandoffResult{}, fmt.Errorf("run-worker handoff service is not configured")
+	}
+	if adapter == nil || adapter.runWorkerHandoffLauncher == nil {
+		return TaskHubRunHandoffResult{}, fmt.Errorf("Task Hub controlled child-worker launcher is not configured")
+	}
+	handoff, err := services.WorkerHandoffs.LaunchRunWorkerHandoff(ctx, app.ReserveRunWorkerHandoffCommand{
+		ID:             strings.TrimSpace(request.HandoffOperationID),
+		IdempotencyKey: strings.TrimSpace(request.IdempotencyKey),
+		RunID:          strings.TrimSpace(request.RunID),
+		Expected: app.RunWorkerHandoffCheckpoint{
+			RunVersion:     request.Expected.RunVersion,
+			ExecutionEpoch: request.Expected.ExecutionEpoch,
+			DefinitionHash: strings.TrimSpace(request.Expected.DefinitionHash),
+		},
+		Owner:  strings.TrimSpace(request.Owner),
+		Actor:  strings.TrimSpace(request.Actor),
+		Reason: strings.TrimSpace(request.Reason),
+	}, adapter.runWorkerHandoffLauncher)
+	if err != nil {
+		return TaskHubRunHandoffResult{}, err
+	}
+	result := TaskHubRunHandoffResult{
+		RunID:       handoff.RunID,
+		OperationID: handoff.ID,
+		State:       string(handoff.State),
+		Summary:     "已提交受控 child-worker handoff",
+	}
+	switch handoff.State {
+	case store.RunWorkerHandoffLaunching, store.RunWorkerHandoffHandedOff, store.RunWorkerHandoffReleased:
+		return result, nil
+	case store.RunWorkerHandoffFailed:
+		failure := strings.TrimSpace(handoff.FailureReason)
+		if failure == "" {
+			failure = "controlled child worker launch failed"
+		}
+		return result, fmt.Errorf("run-worker handoff %s previously failed: %s", handoff.ID, failure)
+	case store.RunWorkerHandoffExpired:
+		return result, fmt.Errorf("run-worker handoff %s expired before a controlled worker was confirmed", handoff.ID)
+	default:
+		return result, fmt.Errorf("run-worker handoff %s returned unsupported state %s", handoff.ID, handoff.State)
+	}
+}
+
+func validateTaskHubRunHandoffRequest(request TaskHubRunHandoffRequest) error {
+	if err := store.ValidateUUIDv7(strings.TrimSpace(request.RunID)); err != nil {
+		return fmt.Errorf("Task Hub run-worker handoff run ID: %w", err)
+	}
+	if err := store.ValidateUUIDv7(strings.TrimSpace(request.HandoffOperationID)); err != nil {
+		return fmt.Errorf("Task Hub run-worker handoff operation ID: %w", err)
+	}
+	if err := store.ValidateUUIDv7(strings.TrimSpace(request.IdempotencyKey)); err != nil {
+		return fmt.Errorf("Task Hub run-worker handoff idempotency key: %w", err)
+	}
+	if request.Expected.RunVersion <= 0 || request.Expected.ExecutionEpoch < 0 || strings.TrimSpace(request.Expected.DefinitionHash) == "" {
+		return fmt.Errorf("Task Hub run-worker handoff Run checkpoint is required")
+	}
+	for _, field := range []struct {
+		label string
+		value string
+	}{
+		{label: "owner", value: request.Owner},
+		{label: "actor", value: request.Actor},
+		{label: "reason", value: request.Reason},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("Task Hub run-worker handoff %s is required", field.label)
+		}
+	}
+	return nil
+}
+
 func taskHubStoreControlAction(action TaskHubRunControlAction) (store.ControlAction, error) {
 	switch action {
 	case TaskHubRunControlPause:
@@ -517,29 +901,24 @@ func taskHubStoreControlAction(action TaskHubRunControlAction) (store.ControlAct
 }
 
 func (adapter *AppTaskHubLifecycleAdapter) taskHubAttachLease(ctx context.Context, services *app.LifecycleServices, runID string) (*store.DurableJob, *store.Lease, error) {
-	if services == nil || services.Inspection == nil {
-		return nil, nil, fmt.Errorf("lifecycle inspection service is not configured")
+	if services == nil || services.LocalRuntime == nil {
+		return nil, nil, fmt.Errorf("local durable runtime service is not configured")
 	}
-	detail, err := services.Inspection.ReadTaskDetail(ctx, app.TaskInspectionQuery{RunID: runID})
+	attachment, err := services.LocalRuntime.AttachRun(ctx, app.AttachRunRequest{RunID: runID})
 	if err != nil {
 		return nil, nil, err
 	}
-	now := time.Now().UTC()
-	for _, inspectedRun := range detail.Runs {
-		if inspectedRun.Run.ID != runID {
+	for _, attachedJob := range attachment.Jobs {
+		if !attachedJob.Attachable {
 			continue
 		}
-		for jobIndex := range inspectedRun.Jobs {
-			job := inspectedRun.Jobs[jobIndex].Job
-			if job.State != store.JobRunning {
+		for _, attachedLease := range attachedJob.Leases {
+			lease := attachedLease.Lease
+			if !attachedLease.Valid || lease.ResourceType != "job_dispatch" || lease.ResourceID != attachedJob.Job.ID {
 				continue
 			}
-			for leaseIndex := range inspectedRun.Jobs[jobIndex].Leases {
-				lease := inspectedRun.Jobs[jobIndex].Leases[leaseIndex]
-				if lease.State == store.LeaseActive && lease.ExpiresAt.After(now) {
-					return &job, &lease, nil
-				}
-			}
+			job := attachedJob.Job
+			return &job, &lease, nil
 		}
 	}
 	return nil, nil, nil
@@ -555,7 +934,7 @@ func validateTaskHubMutationRequest(request TaskHubMutationRequest) error {
 	if err := store.ValidateUUIDv7(strings.TrimSpace(request.IdempotencyKey)); err != nil {
 		return err
 	}
-	return nil
+	return validateTaskHubMutationValues(request)
 }
 
 func validateTaskHubRunControlMutationRequest(request TaskHubRunControlMutationRequest) error {
@@ -653,10 +1032,124 @@ func taskHubReviewDecisionAction(action TaskHubAction) store.ReviewDecisionActio
 	}
 }
 
+func (adapter *AppTaskHubLifecycleAdapter) captureTaskHubMutationCheckpoint(ctx context.Context, services *app.LifecycleServices, taskID, revisionID, runID, releaseID string) (TaskHubLifecycleCheckpoint, error) {
+	if services == nil || services.Mutations == nil {
+		return TaskHubLifecycleCheckpoint{}, fmt.Errorf("LifecycleMutationService is not configured")
+	}
+	checkpoint, err := services.Mutations.CaptureCheckpoint(ctx, taskID, revisionID, runID, releaseID)
+	if err != nil {
+		return TaskHubLifecycleCheckpoint{}, err
+	}
+	return taskHubLifecycleCheckpoint(checkpoint), nil
+}
+
+func (adapter *AppTaskHubLifecycleAdapter) captureTaskHubReviewCheckpoint(ctx context.Context, services *app.LifecycleServices, taskID, revisionID, reviewRequestID string) (TaskHubLifecycleCheckpoint, error) {
+	if services == nil || services.Mutations == nil {
+		return TaskHubLifecycleCheckpoint{}, fmt.Errorf("LifecycleMutationService is not configured")
+	}
+	checkpoint, err := services.Mutations.CaptureReviewCheckpoint(ctx, taskID, revisionID, reviewRequestID)
+	if err != nil {
+		return TaskHubLifecycleCheckpoint{}, err
+	}
+	return taskHubLifecycleCheckpoint(checkpoint), nil
+}
+
+func taskHubLifecycleCheckpoint(checkpoint app.LifecycleMutationCheckpoint) TaskHubLifecycleCheckpoint {
+	return TaskHubLifecycleCheckpoint{
+		TaskID:               checkpoint.TaskID,
+		TaskVersion:          checkpoint.TaskVersion,
+		RevisionID:           checkpoint.RevisionID,
+		RevisionStateVersion: checkpoint.RevisionStateVersion,
+		RevisionDigest:       checkpoint.RevisionDigest,
+		RunID:                checkpoint.RunID,
+		RunVersion:           checkpoint.RunVersion,
+		RunExecutionEpoch:    checkpoint.RunExecutionEpoch,
+		RunDefinitionHash:    checkpoint.RunDefinitionHash,
+		ReleaseID:            checkpoint.ReleaseID,
+		ReleaseRecordVersion: checkpoint.ReleaseRecordVersion,
+		ReviewRequestID:      checkpoint.ReviewRequestID,
+		ReviewRevisionID:     checkpoint.ReviewRevisionID,
+		ReviewState:          checkpoint.ReviewState,
+		ReviewEvidenceDigest: checkpoint.ReviewEvidenceDigest,
+	}
+}
+
+func appLifecycleMutationCheckpoint(checkpoint TaskHubLifecycleCheckpoint) app.LifecycleMutationCheckpoint {
+	return app.LifecycleMutationCheckpoint{
+		TaskID:               strings.TrimSpace(checkpoint.TaskID),
+		TaskVersion:          checkpoint.TaskVersion,
+		RevisionID:           strings.TrimSpace(checkpoint.RevisionID),
+		RevisionStateVersion: checkpoint.RevisionStateVersion,
+		RevisionDigest:       strings.TrimSpace(checkpoint.RevisionDigest),
+		RunID:                strings.TrimSpace(checkpoint.RunID),
+		RunVersion:           checkpoint.RunVersion,
+		RunExecutionEpoch:    checkpoint.RunExecutionEpoch,
+		RunDefinitionHash:    strings.TrimSpace(checkpoint.RunDefinitionHash),
+		ReleaseID:            strings.TrimSpace(checkpoint.ReleaseID),
+		ReleaseRecordVersion: checkpoint.ReleaseRecordVersion,
+		ReviewRequestID:      strings.TrimSpace(checkpoint.ReviewRequestID),
+		ReviewRevisionID:     strings.TrimSpace(checkpoint.ReviewRevisionID),
+		ReviewState:          strings.TrimSpace(checkpoint.ReviewState),
+		ReviewEvidenceDigest: strings.TrimSpace(checkpoint.ReviewEvidenceDigest),
+	}
+}
+
+func taskHubLifecycleMutationBase(request TaskHubMutationRequest) app.LifecycleMutationCommandBase {
+	return app.LifecycleMutationCommandBase{
+		IdempotencyKey: strings.TrimSpace(request.IdempotencyKey),
+		Actor:          strings.TrimSpace(request.Actor),
+		Reason:         strings.TrimSpace(request.Reason),
+		Expected:       appLifecycleMutationCheckpoint(request.Expected),
+	}
+}
+
+func taskHubMutationValue(request TaskHubMutationRequest, field string) string {
+	return strings.TrimSpace(request.Values[field])
+}
+
+func taskHubMutationResult(request TaskHubMutationRequest, receipt app.LifecycleMutationReceipt) TaskHubMutationResult {
+	summary := strings.TrimSpace(receipt.Summary)
+	if summary == "" {
+		summary = taskHubActionLabel(request.Action) + "已提交"
+	}
+	return TaskHubMutationResult{
+		Action:      request.Action,
+		Target:      request.Target,
+		PlanID:      receipt.PlanID,
+		ExecutionID: receipt.ExecutionID,
+		ReceiptID:   receipt.OperationID,
+		Summary:     summary,
+	}
+}
+
+func taskHubTaskTransitionPreview(action TaskHubAction, task store.TaskV2, expected TaskHubLifecycleCheckpoint) TaskHubPlanPreview {
+	preview := TaskHubPlanPreview{
+		Title:              taskHubActionLabel(action),
+		ExecutionScope:     []string{task.ID},
+		ConfirmationNeeded: true,
+		Expected:           expected,
+	}
+	switch action {
+	case TaskHubActionArchiveTask:
+		preview.Summary = "确认后由 V12 幂等命令将 published Task 归档；revision、package 与证据不会删除。"
+		preview.Reason = "Task 当前处于 published，已捕获完整 Task CAS checkpoint。"
+		preview.RevisionImpact = "TaskRevision 内容与 digest 不变；Task lifecycle 将变为 archived。"
+	case TaskHubActionSoftDeleteTask:
+		preview.Summary = "确认后由 V12 幂等命令写入可恢复 deletion record 并将 Task 置为 deleted。"
+		preview.Reason = "已捕获完整 Task CAS checkpoint；提交会拒绝已变化的 Task。"
+		preview.RevisionImpact = "TaskRevision、package 与证据保留；Task lifecycle 将变为 deleted。"
+	case TaskHubActionRestoreTask:
+		preview.Summary = "确认表单将要求明确选择恢复后的 lifecycle 状态；提交由 V12 幂等命令完成。"
+		preview.Reason = "Task 当前处于 deleted，已捕获完整 Task CAS checkpoint。"
+		preview.RevisionImpact = "TaskRevision、package 与证据保持不变；Task lifecycle 将恢复到所选状态。"
+	}
+	return preview
+}
+
 // openTaskHubReview resolves a specific open review. The adapter deliberately
 // refuses to choose between multiple open reviews: the projection must carry a
 // stable ReviewRequestID captured when the operator started the action.
-func (adapter *AppTaskHubLifecycleAdapter) openTaskHubReview(ctx context.Context, services *app.LifecycleServices, target taskHubResolvedTarget, allowRecordedReplay bool) (store.ReviewRequest, string, error) {
+func (adapter *AppTaskHubLifecycleAdapter) openTaskHubReview(ctx context.Context, services *app.LifecycleServices, target taskHubResolvedTarget) (store.ReviewRequest, string, error) {
 	if services == nil || services.Store() == nil {
 		return store.ReviewRequest{}, "", fmt.Errorf("review inspection store is unavailable")
 	}
@@ -694,7 +1187,7 @@ func (adapter *AppTaskHubLifecycleAdapter) openTaskHubReview(ctx context.Context
 			if review.ID != requestedID {
 				continue
 			}
-			if review.State != "open" && !allowRecordedReplay {
+			if review.State != "open" {
 				return store.ReviewRequest{}, "指定的 ReviewRequest 已关闭或不属于当前 revision", nil
 			}
 			return review, "", nil
@@ -813,7 +1306,7 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTask(ctx context.Context, serv
 		projection.ActiveReviewID = activeReview.ID
 		projection.ActiveReviewRevisionID = activeReview.RevisionID
 	}
-	projection.Actions = appTaskHubTaskActions(current, activeReview != nil)
+	projection.Actions = appTaskHubTaskActions(task, current, activeReview != nil, services.Mutations != nil)
 
 	resultRuns := make([]TaskHubRun, 0, len(runs))
 	queued := make([]taskHubQueuedRun, 0)
@@ -857,14 +1350,38 @@ func appTaskHubSingleOpenReview(ctx context.Context, services *app.LifecycleServ
 }
 
 func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context, services *app.LifecycleServices, run store.WorkflowRun) (TaskHubRun, error) {
+	attachable := false
+	attachReason := "只有由有效 durable lease 持有的 running job 可以附着"
+	var attachment *app.RunAttachment
+	if taskHubRunIsActive(run.Status) && services.LocalRuntime != nil {
+		loaded, err := services.LocalRuntime.AttachRun(ctx, app.AttachRunRequest{RunID: run.ID})
+		if err != nil {
+			return TaskHubRun{}, fmt.Errorf("read local durable state for Run %s: %w", run.ID, err)
+		}
+		attachment = &loaded
+	}
+	if taskHubRunCanAttach(run.Status) {
+		if attachment == nil {
+			attachReason = "本地 durable runtime 附着服务不可用"
+		} else {
+			attachable = attachment.AttachableJobs > 0
+			if !attachable {
+				attachReason = "当前 Run 没有由有效 durable lease 持有的运行中 job"
+			}
+		}
+	}
 	projection := TaskHubRun{
 		RunID:          run.ID,
 		TaskID:         run.TaskID,
 		RevisionID:     run.RevisionID,
 		ExecutionState: string(run.Status),
 		Active:         taskHubRunIsActive(run.Status),
-		Actions:        appTaskHubRunActions(run),
+		Actions:        appTaskHubRunActions(run, attachable, attachReason),
 	}
+	if attachment != nil {
+		projection.WorkerHandoff = taskHubLatestWorkerHandoff(attachment.WorkerHandoffs)
+	}
+	projection.Handoff = taskHubRunHandoffCapability(run, projection.WorkerHandoff, services.WorkerHandoffs != nil && adapter.runWorkerHandoffLauncher != nil)
 	if run.StartedAt != nil {
 		projection.StartedAt = *run.StartedAt
 	}
@@ -920,6 +1437,45 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context
 	}
 	projection.Control.Actions = appTaskHubRunControlActions(run, stage, true)
 	return projection, nil
+}
+
+func taskHubLatestWorkerHandoff(handoffs []store.RunWorkerHandoff) *TaskHubWorkerHandoff {
+	if len(handoffs) == 0 {
+		return nil
+	}
+	handoff := handoffs[len(handoffs)-1]
+	return &TaskHubWorkerHandoff{
+		OperationID:      handoff.ID,
+		State:            string(handoff.State),
+		WorkerLeaseID:    handoff.WorkerLeaseID,
+		LaunchDeadlineAt: handoff.LaunchDeadlineAt,
+		UpdatedAt:        handoff.UpdatedAt,
+		FailureRecorded:  strings.TrimSpace(handoff.FailureReason) != "",
+	}
+}
+
+func taskHubRunHandoffCapability(run store.WorkflowRun, current *TaskHubWorkerHandoff, launcherConfigured bool) TaskHubRunHandoffCapability {
+	capability := TaskHubRunHandoffCapability{
+		Expected: TaskHubRunHandoffCheckpoint{
+			RunVersion:     run.Version,
+			ExecutionEpoch: run.ExecutionEpoch,
+			DefinitionHash: run.DefinitionHash,
+		},
+	}
+	if !taskHubRunCanHandoff(run.Status) {
+		capability.DisabledReason = fmt.Sprintf("Run 当前处于 %s；此状态不需要或不能交接受控 worker", run.Status)
+		return capability
+	}
+	if current != nil && (current.State == string(store.RunWorkerHandoffLaunching) || current.State == string(store.RunWorkerHandoffHandedOff)) {
+		capability.DisabledReason = "当前 Run 已有受控 child worker handoff"
+		return capability
+	}
+	if !launcherConfigured {
+		capability.DisabledReason = "当前 Task Hub 未配置受控 child-worker launcher"
+		return capability
+	}
+	capability.Enabled = true
+	return capability
 }
 
 func taskHubControlCheckpoint(checkpoint app.ControlCheckpoint) TaskHubControlCheckpoint {
@@ -1051,35 +1607,53 @@ func taskHubRunConsumesExecutionSlot(status store.WorkflowRunStatus) bool {
 	}
 }
 
-func appTaskHubGlobalActions() []TaskHubActionState {
+func appTaskHubGlobalActions(mutationsAvailable bool) []TaskHubActionState {
+	if !mutationsAvailable {
+		return []TaskHubActionState{
+			{Action: TaskHubActionNewTask, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionImportTask, DisabledReason: "LifecycleMutationService 不可用"},
+		}
+	}
 	return []TaskHubActionState{
-		{Action: TaskHubActionNewTask, DisabledReason: "需要标题、来源和审计原因"},
-		{Action: TaskHubActionImportTask, DisabledReason: "需要受管快照来源"},
-		{Action: TaskHubActionGenerateTask, DisabledReason: "需要仓库和提交信息"},
+		{Action: TaskHubActionNewTask, Enabled: true},
+		{Action: TaskHubActionImportTask, Enabled: true},
 	}
 }
 
-func appTaskHubTaskActions(current *store.TaskRevision, hasSingleOpenReview bool) []TaskHubActionState {
+func appTaskHubTaskActions(task store.TaskV2, current *store.TaskRevision, hasSingleOpenReview, mutationsAvailable bool) []TaskHubActionState {
+	if !mutationsAvailable {
+		return []TaskHubActionState{
+			{Action: TaskHubActionEditTask, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionForkTask, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionArchiveTask, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionSoftDeleteTask, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionRestoreTask, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionStartRun, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionApproveReview, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionRequestChanges, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionRejectReview, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionPackageRevision, DisabledReason: "LifecycleMutationService 不可用"},
+			{Action: TaskHubActionWithdrawRelease, DisabledReason: "LifecycleMutationService 不可用"},
+		}
+	}
+	hasCurrentRevision := current != nil
+	packageable := hasCurrentRevision &&
+		(current.State == store.RevisionStateValidated || current.State == store.RevisionStateReleased) &&
+		strings.TrimSpace(current.ValidationEvidenceManifest) != ""
 	actions := []TaskHubActionState{
-		{Action: TaskHubActionEditTask, DisabledReason: "需要候选快照和变更说明"},
-		{Action: TaskHubActionForkTask, DisabledReason: "需要新 Task 的名称和标识"},
-		{Action: TaskHubActionArchiveTask, DisabledReason: "需要带 UUIDv7 幂等键的归档命令契约"},
-		{Action: TaskHubActionSoftDeleteTask, DisabledReason: "需要带 UUIDv7 幂等键的软删除命令契约"},
-		{Action: TaskHubActionRestoreTask, DisabledReason: "需要明确的目标 lifecycle 状态"},
-		{Action: TaskHubActionStartRun, DisabledReason: "需要完整且显式的执行 profile"},
+		{Action: TaskHubActionEditTask, Enabled: false, DisabledReason: "需要选择当前 TaskRevision 对应的 Run"},
+		{Action: TaskHubActionForkTask, Enabled: hasCurrentRevision, DisabledReason: "当前 Task 没有可 Fork 的 revision"},
+		{Action: TaskHubActionArchiveTask, Enabled: task.LifecycleState == store.TaskLifecyclePublished, DisabledReason: "只有 published Task 可以归档"},
+		{Action: TaskHubActionSoftDeleteTask, Enabled: task.LifecycleState != store.TaskLifecycleDeleted, DisabledReason: "Task 已处于 deleted；请使用恢复操作"},
+		{Action: TaskHubActionRestoreTask, Enabled: task.LifecycleState == store.TaskLifecycleDeleted, DisabledReason: "只有 deleted Task 可以恢复"},
+		{Action: TaskHubActionStartRun, Enabled: hasCurrentRevision && task.LifecycleState != store.TaskLifecycleDeleted, DisabledReason: "需要未删除 Task 的当前 TaskRevision"},
 		{Action: TaskHubActionApproveReview, Enabled: hasSingleOpenReview, DisabledReason: "需要唯一且打开的 ReviewRequest"},
 		{Action: TaskHubActionRequestChanges, Enabled: hasSingleOpenReview, DisabledReason: "需要唯一且打开的 ReviewRequest"},
 		{Action: TaskHubActionRejectReview, Enabled: hasSingleOpenReview, DisabledReason: "需要唯一且打开的 ReviewRequest"},
-		{Action: TaskHubActionPackageRevision, DisabledReason: "需要当前且已验证的 TaskRevision"},
-		{Action: TaskHubActionWithdrawRelease, DisabledReason: "需要明确的 release ID"},
+		{Action: TaskHubActionPackageRevision, Enabled: packageable, DisabledReason: "需要当前且已验证的 TaskRevision"},
+		{Action: TaskHubActionWithdrawRelease, Enabled: false, DisabledReason: "请从详情“本地包”分类选择明确的未撤回 release"},
 	}
 	for index := range actions {
-		switch actions[index].Action {
-		case TaskHubActionPackageRevision:
-			actions[index].Enabled = current != nil &&
-				(current.State == store.RevisionStateValidated || current.State == store.RevisionStateReleased) &&
-				strings.TrimSpace(current.ValidationEvidenceManifest) != ""
-		}
 		if actions[index].Enabled {
 			actions[index].DisabledReason = ""
 		}
@@ -1087,16 +1661,17 @@ func appTaskHubTaskActions(current *store.TaskRevision, hasSingleOpenReview bool
 	return actions
 }
 
-func appTaskHubRunActions(run store.WorkflowRun) []TaskHubActionState {
+func appTaskHubRunActions(run store.WorkflowRun, attachable bool, attachReason string) []TaskHubActionState {
 	continueEnabled := taskHubRunCanContinue(run.Status)
 	continueReason := "当前 Run 状态不能进入 continuation planner"
 	if continueEnabled {
 		continueReason = ""
 	}
-	attachEnabled := taskHubRunCanAttach(run.Status)
-	attachReason := "只有 running durable Run 可以附着"
+	attachEnabled := taskHubRunCanAttach(run.Status) && attachable
 	if attachEnabled {
 		attachReason = ""
+	} else if attachReason == "" {
+		attachReason = "只有由有效 durable lease 持有的 running job 可以附着"
 	}
 	return []TaskHubActionState{
 		{Action: TaskHubActionContinue, Enabled: continueEnabled, DisabledReason: continueReason},
@@ -1110,6 +1685,16 @@ func taskHubRunCanAttach(status store.WorkflowRunStatus) bool {
 	case store.WorkflowRunRunning, store.WorkflowRunPauseRequested, store.WorkflowRunPausing,
 		store.WorkflowRunResumeRequested, store.WorkflowRunCancelRequested, store.WorkflowRunStopRequested,
 		store.WorkflowRunCanceling:
+		return true
+	default:
+		return false
+	}
+}
+
+func taskHubRunCanHandoff(status store.WorkflowRunStatus) bool {
+	switch status {
+	case store.WorkflowRunQueued, store.WorkflowRunRunning, store.WorkflowRunPauseRequested, store.WorkflowRunPausing,
+		store.WorkflowRunResumeRequested, store.WorkflowRunCancelRequested, store.WorkflowRunStopRequested, store.WorkflowRunCanceling:
 		return true
 	default:
 		return false

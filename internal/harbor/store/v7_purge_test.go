@@ -300,7 +300,7 @@ func TestMigrateV6ToCurrentInstallsTaskPurgeProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, migration := range []string{migrationV1, migrationV2, migrationV3, migrationV4, migrationV5} {
+	for _, migration := range []string{migrationV2, migrationV3, migrationV4, migrationV5} {
 		if _, err := db.Exec(migration); err != nil {
 			_ = db.Close()
 			t.Fatalf("build V5 migration fixture: %v", err)

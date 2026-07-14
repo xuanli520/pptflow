@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/codex/appserver"
-	"github.com/purplevoid/harbor-factory/internal/workflow"
 )
 
-var _ workflow.AgentRuntime = Runtime{}
+var _ agent.Runtime = Runtime{}
 
 type fakeConversationSession struct {
 	turns  []appserver.TurnRequest
@@ -43,13 +43,13 @@ func TestConversationAppliesDefaultsAcrossTurnsAndCleansUp(t *testing.T) {
 		session: session,
 		model:   "test-model",
 		cleanup: cleanup,
-		defaults: workflow.AgentConversationRequest{
+		defaults: agent.ConversationRequest{
 			TimeoutSeconds: 17,
 			MaxOutputBytes: 2048,
 			LogPath:        "/tmp/default.log",
 		},
 	}
-	result, err := conversation.Turn(context.Background(), workflow.AgentTurnRequest{Prompt: "first"})
+	result, err := conversation.Turn(context.Background(), agent.TurnRequest{Prompt: "first"})
 	if err != nil {
 		t.Fatal(err)
 	}

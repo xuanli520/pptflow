@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
@@ -518,10 +519,14 @@ func (service *TaskContinuationService) decodeFrozenPlan(ctx context.Context, st
 }
 
 type frozenRunDefinition struct {
-	Workflow            workflowkit.WorkflowDescriptor
-	ContinuationPlanTTL time.Duration
-	ControlGracePeriod  time.Duration
-	QuotaPolicy         workflowadapter.ResolvedQuotaPolicy
+	Workflow                      workflowkit.WorkflowDescriptor
+	InitialExecutionPlan          workflowkit.ExecutionPlan
+	ContinuationPlanTTL           time.Duration
+	ControlGracePeriod            time.Duration
+	QuotaPolicy                   workflowadapter.ResolvedQuotaPolicy
+	ReviewStages                  []workflowadapter.ReviewStage
+	DeploymentCatalogReceipt      []byte
+	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
 }
 
 func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, error) {
@@ -531,6 +536,14 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	}
 	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID || manifest.TaskID != run.TaskID || manifest.Revision != run.RevisionID {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s does not match its control-plane run", run.ID)
+	}
+	catalogReceipt, err := canonicalManifestDeploymentCatalogReceipt(manifest)
+	if err != nil {
+		return frozenRunDefinition{}, fmt.Errorf("validate frozen run manifest %s deployment catalog receipt: %w", run.ID, err)
+	}
+	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
+	if err != nil {
+		return frozenRunDefinition{}, fmt.Errorf("validate frozen run manifest %s deployment catalog lock identity: %w", run.ID, err)
 	}
 	if manifest.Resolved.ContinuationPlanTTL != workflowadapter.RequiredContinuationPlanTTL {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s continuation plan TTL must be exactly %s", run.ID, workflowadapter.RequiredContinuationPlanTTL)
@@ -543,6 +556,10 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	if fingerprint != workflowkit.Fingerprint(run.DefinitionHash) || manifest.Resolved.DefinitionFingerprint != fingerprint {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s definition fingerprint mismatch", run.ID)
 	}
+	initialExecutionPlan := manifest.InitialExecutionPlan.Clone()
+	if err := initialExecutionPlan.Validate(workflow); err != nil {
+		return frozenRunDefinition{}, fmt.Errorf("validate frozen initial execution plan %s: %w", run.ID, err)
+	}
 	quotaPolicy := manifest.Resolved.QuotaPolicy.Clone()
 	if err := quotaPolicy.ValidateForDescriptor(workflow); err != nil {
 		return frozenRunDefinition{}, fmt.Errorf("validate frozen quota policy %s: %w", run.ID, err)
@@ -550,7 +567,55 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	if manifest.Resolved.ControlGracePeriod < 0 {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s has a negative control grace period", run.ID)
 	}
-	return frozenRunDefinition{Workflow: workflow, ContinuationPlanTTL: manifest.Resolved.ContinuationPlanTTL, ControlGracePeriod: manifest.Resolved.ControlGracePeriod, QuotaPolicy: quotaPolicy}, nil
+	reviewStages := append([]workflowadapter.ReviewStage(nil), manifest.Resolved.ReviewStages...)
+	seenReviewStages := make(map[workflowkit.StageKey]struct{}, len(reviewStages))
+	for _, review := range reviewStages {
+		if _, duplicate := seenReviewStages[review.StageKey]; duplicate {
+			return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s repeats review stage %q", run.ID, review.StageKey)
+		}
+		stage, found := workflow.Stage(review.StageKey)
+		if !found || !stage.Capabilities.Has(workflowkit.CapabilityApprove) || review.ReviewKind == "" ||
+			review.DecisionArtifact.Name == "" || review.DecisionArtifact.SchemaVersion == "" {
+			return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s has an invalid review stage %q", run.ID, review.StageKey)
+		}
+		foundOutput := false
+		for _, output := range stage.Outputs {
+			if output.Name == review.DecisionArtifact.Name && output.SchemaVersion == review.DecisionArtifact.SchemaVersion {
+				foundOutput = true
+				break
+			}
+		}
+		if !foundOutput {
+			return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s review stage %q does not declare its decision artifact", run.ID, review.StageKey)
+		}
+		seenReviewStages[review.StageKey] = struct{}{}
+	}
+	for _, stage := range workflow.Stages {
+		if stage.Capabilities.Has(workflowkit.CapabilityApprove) {
+			if _, found := seenReviewStages[stage.Key]; !found {
+				return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s omits review metadata for stage %q", run.ID, stage.Key)
+			}
+		}
+	}
+	return frozenRunDefinition{
+		Workflow:                      workflow,
+		InitialExecutionPlan:          initialExecutionPlan,
+		ContinuationPlanTTL:           manifest.Resolved.ContinuationPlanTTL,
+		ControlGracePeriod:            manifest.Resolved.ControlGracePeriod,
+		QuotaPolicy:                   quotaPolicy,
+		ReviewStages:                  reviewStages,
+		DeploymentCatalogReceipt:      append([]byte(nil), catalogReceipt...),
+		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
+	}, nil
+}
+
+func (definition frozenRunDefinition) ReviewStage(key workflowkit.StageKey) (workflowadapter.ReviewStage, bool) {
+	for _, review := range definition.ReviewStages {
+		if review.StageKey == key {
+			return review, true
+		}
+	}
+	return workflowadapter.ReviewStage{}, false
 }
 
 func decodeFrozenWorkflow(run store.WorkflowRun) (workflowkit.WorkflowDescriptor, error) {

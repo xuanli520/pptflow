@@ -410,6 +410,34 @@ func (s *Store) ListLeasesForJob(ctx context.Context, jobID string) ([]Lease, er
 	return leases, rows.Err()
 }
 
+// ListLeasesForResource returns append-only lease history for one explicitly
+// named resource. It is used by local worker supervision to expose the
+// run-scoped child-worker fence without conflating it with a dispatch lease.
+func (s *Store) ListLeasesForResource(ctx context.Context, resourceType, resourceID string) ([]Lease, error) {
+	resourceType, err := normalizeRequired(resourceType, "lease resource type")
+	if err != nil {
+		return nil, err
+	}
+	resourceID, err = normalizeRequired(resourceID, "lease resource ID")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, leaseSelect+" WHERE resource_type = ? AND resource_id = ? ORDER BY created_at ASC, id ASC", resourceType, resourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	leases := make([]Lease, 0)
+	for rows.Next() {
+		lease, err := scanLease(rows)
+		if err != nil {
+			return nil, err
+		}
+		leases = append(leases, lease)
+	}
+	return leases, rows.Err()
+}
+
 func (s *Store) HeartbeatLease(ctx context.Context, request HeartbeatLeaseRequest) (Lease, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return Lease{}, err
@@ -576,6 +604,27 @@ func (s *Store) ExpireLeasesForRun(ctx context.Context, runID, actor, reason str
 		return 0, err
 	}
 	return s.expireLeases(ctx, ` AND job_id IN (SELECT id FROM jobs WHERE run_id = ?)`, []any{runID}, actor, reason)
+}
+
+// ExpireLeasesForResource fences only stale leases for one explicitly named
+// resource. It is intentionally narrower than ExpireLeases so an attach or
+// reconcile action for one Run cannot change another worker's supervision
+// fence.
+func (s *Store) ExpireLeasesForResource(ctx context.Context, resourceType, resourceID, actor, reason string) (int, error) {
+	resourceType, err := normalizeRequired(resourceType, "lease resource type")
+	if err != nil {
+		return 0, err
+	}
+	resourceID, err = normalizeRequired(resourceID, "lease resource ID")
+	if err != nil {
+		return 0, err
+	}
+	actor = resolveActor(actor)
+	reason, err = normalizeRequired(reason, "lease reconciliation reason")
+	if err != nil {
+		return 0, err
+	}
+	return s.expireLeases(ctx, ` AND resource_type = ? AND resource_id = ?`, []any{resourceType, resourceID}, actor, reason)
 }
 
 func (s *Store) expireLeases(ctx context.Context, scopeClause string, scopeArgs []any, actor, reason string) (int, error) {
@@ -799,7 +848,7 @@ func validJobTransition(from, to JobState) bool {
 		return to == JobRunning || to == JobCancelRequested || to == JobCanceled
 	case JobRunning:
 		return to == JobPauseRequested || to == JobCancelRequested || to == JobStopRequested ||
-			to == JobSucceeded || to == JobFailed || to == JobInterrupted || to == JobInDoubt
+			to == JobCanceled || to == JobSucceeded || to == JobFailed || to == JobInterrupted || to == JobInDoubt
 	case JobPauseRequested:
 		return to == JobPaused || to == JobCancelRequested || to == JobInterrupted || to == JobInDoubt
 	case JobPaused:

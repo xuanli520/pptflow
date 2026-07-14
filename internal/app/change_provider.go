@@ -15,10 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/harborrun"
+	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
-	"github.com/purplevoid/harbor-factory/internal/workflow"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -84,6 +83,12 @@ type TaskChangeRequest struct {
 	Payload         json.RawMessage `json:"payload"`
 	Findings        FindingBundle   `json:"findings"`
 	MaxRepairRounds int             `json:"max_repair_rounds,omitempty"`
+
+	// Repair-session linkage is application-internal. Only the automatic repair
+	// coordinator can continue a session; external callers always create its
+	// root command through the normal typed ChangeProvider flow.
+	repairSessionID    string
+	repairRoundOrdinal int
 }
 
 type ChangeProviderRequest struct {
@@ -154,7 +159,7 @@ func (provider LocalPatchProvider) Apply(ctx context.Context, request ChangeProv
 	if err := decodeProviderPayload(request.Payload, &payload); err != nil {
 		return ChangeProviderReceipt{}, err
 	}
-	if err := harborrun.ValidateManagedTaskSnapshotV2(request.Checkout); err != nil {
+	if err := taskpolicy.ValidateManagedSnapshotV2(request.Checkout); err != nil {
 		return ChangeProviderReceipt{}, fmt.Errorf("validate candidate before patch: %w", err)
 	}
 	diff, paths, err := normalizeUnifiedDiff(payload.Diff)
@@ -198,7 +203,7 @@ func (provider LocalPatchProvider) Apply(ctx context.Context, request ChangeProv
 }
 
 type AgentRepairProvider struct {
-	Agent workflow.AgentRuntime
+	Agent agent.Runtime
 }
 
 func (AgentRepairProvider) ID() string { return AgentRepairProviderID }
@@ -233,7 +238,7 @@ func (provider AgentRepairProvider) Apply(ctx context.Context, request ChangePro
 	if err := decodeProviderPayload(request.Payload, &payload); err != nil {
 		return ChangeProviderReceipt{}, err
 	}
-	if err := harborrun.ValidateManagedTaskSnapshotV2(request.Checkout); err != nil {
+	if err := taskpolicy.ValidateManagedSnapshotV2(request.Checkout); err != nil {
 		return ChangeProviderReceipt{}, fmt.Errorf("validate candidate before agent repair: %w", err)
 	}
 	findings, err := json.Marshal(request.Findings)
@@ -250,7 +255,7 @@ func (provider AgentRepairProvider) Apply(ctx context.Context, request ChangePro
 		"Structured findings:", string(findings),
 		"Operator guidance:", strings.TrimSpace(payload.Guidance),
 	}, "\n")
-	result, err := workflow.RunAgentTurn(ctx, provider.Agent, workflow.AgentTurnRequest{
+	result, err := agent.RunTurn(ctx, provider.Agent, agent.TurnRequest{
 		ProjectPath: request.Checkout, Prompt: prompt, Model: payload.Model, ReasoningEffort: payload.ReasoningEffort,
 		SandboxMode: "workspace-write", SandboxPolicy: "workspace-write", NetworkAccess: false,
 		WorkspaceRoots: []string{request.Checkout}, TimeoutSeconds: timeoutSeconds, MaxOutputBytes: 2 << 20,
