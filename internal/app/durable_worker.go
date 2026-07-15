@@ -162,6 +162,14 @@ type DurableWorkerResult struct {
 // it. JobInDoubt is delivery-final; a new explicit redrive job owns any later
 // attempt.
 func (worker *DurableWorker) RunOnce(ctx context.Context) (DurableWorkerResult, error) {
+	return worker.RunOnceForCommandTypes(ctx, nil)
+}
+
+// RunOnceForCommandTypes processes one claimed job while optionally limiting
+// the SQLite claim to exact command types. RunWorkerSession uses this for
+// durable review, continuation, repair, and reconciliation states so an old
+// queued stage job cannot be selected outside ordinary Run execution.
+func (worker *DurableWorker) RunOnceForCommandTypes(ctx context.Context, commandTypes []string) (DurableWorkerResult, error) {
 	if err := worker.validate(); err != nil {
 		return DurableWorkerResult{}, err
 	}
@@ -190,6 +198,7 @@ func (worker *DurableWorker) RunOnce(ctx context.Context) (DurableWorkerResult, 
 		IdempotencyKey:  "durable-worker-claim:" + claimKey,
 		Owner:           worker.owner,
 		RunID:           worker.runID,
+		CommandTypes:    append([]string(nil), commandTypes...),
 		LeaseTTL:        worker.leaseTTL,
 		CapacityPoolKey: worker.capacityPoolKey,
 		Actor:           worker.actor,

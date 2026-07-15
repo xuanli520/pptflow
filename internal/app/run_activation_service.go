@@ -32,6 +32,11 @@ type RunActivationService struct {
 	launcher RunWorkerHandoffLauncher
 }
 
+type queuedRunActivation struct {
+	run store.WorkflowRun
+	job store.DurableJob
+}
+
 func (service *RunActivationService) Available() bool {
 	return service != nil && service.core != nil && service.core.store != nil && service.launcher != nil
 }
@@ -72,9 +77,10 @@ func (service *RunActivationService) Drain(ctx context.Context) error {
 			return fmt.Errorf("deliver queued Run activation: %w", runErr)
 		}
 		if result.Empty {
-			return nil
+			break
 		}
 	}
+	return service.sweepQueuedRunJobs(ctx)
 }
 
 func runActivationOutboxTopics() []string {
@@ -82,6 +88,7 @@ func runActivationOutboxTopics() []string {
 		workflowRunQueuedOutboxTopic,
 		continuationExecutionQueuedOutboxTopic,
 		revisionCandidateContinuationQueuedOutboxTopic,
+		store.DurableJobQueuedOutboxTopic,
 	}
 }
 
@@ -92,89 +99,139 @@ func (service *RunActivationService) DeliverOutboxEvent(ctx context.Context, eve
 	if !service.Available() {
 		return fmt.Errorf("run activation worker launcher is not configured")
 	}
-	run, jobEntityID, err := service.activationRunForEvent(ctx, event)
+	activation, found, err := service.activationForEvent(ctx, event)
 	if err != nil {
 		return err
 	}
-	if !runActivationRunnable(run.Status) {
+	if !found || !runWorkerJobIsEligible(activation.run.Status, activation.job) {
 		return nil
 	}
-	if err := service.verifyActivationJob(ctx, run, event.Topic, jobEntityID); err != nil {
-		return err
-	}
-	return service.ensureRunWorkerHandoff(ctx, run)
+	return service.ensureRunWorkerHandoff(ctx, activation.run)
 }
 
-func (service *RunActivationService) activationRunForEvent(ctx context.Context, event store.OutboxEvent) (store.WorkflowRun, string, error) {
+func (service *RunActivationService) activationForEvent(ctx context.Context, event store.OutboxEvent) (queuedRunActivation, bool, error) {
 	switch event.Topic {
 	case workflowRunQueuedOutboxTopic:
 		if event.EntityType != "workflow_run" {
-			return store.WorkflowRun{}, "", fmt.Errorf("queued Run activation event %s has entity type %q", event.ID, event.EntityType)
+			return queuedRunActivation{}, false, fmt.Errorf("queued Run activation event %s has entity type %q", event.ID, event.EntityType)
 		}
 		if err := store.ValidateUUIDv7(event.EntityID); err != nil {
-			return store.WorkflowRun{}, "", fmt.Errorf("queued Run activation event %s Run ID: %w", event.ID, err)
+			return queuedRunActivation{}, false, fmt.Errorf("queued Run activation event %s Run ID: %w", event.ID, err)
 		}
 		run, err := service.core.store.GetWorkflowRun(ctx, event.EntityID)
 		if err != nil {
-			return store.WorkflowRun{}, "", err
+			return queuedRunActivation{}, false, err
 		}
 		if run == nil {
-			return store.WorkflowRun{}, "", fmt.Errorf("%w: queued Run activation Run %s", ErrLifecycleNotFound, event.EntityID)
+			return queuedRunActivation{}, false, fmt.Errorf("%w: queued Run activation Run %s", ErrLifecycleNotFound, event.EntityID)
 		}
-		return *run, run.ID, nil
+		return service.queuedJobForRun(ctx, *run, func(job store.DurableJob) bool {
+			return job.CommandType == "workflow_run.execute" && job.EntityType == "workflow_run" && job.EntityID == run.ID
+		})
 	case continuationExecutionQueuedOutboxTopic, revisionCandidateContinuationQueuedOutboxTopic:
 		if event.EntityType != "continuation_execution" {
-			return store.WorkflowRun{}, "", fmt.Errorf("continuation activation event %s has entity type %q", event.ID, event.EntityType)
+			return queuedRunActivation{}, false, fmt.Errorf("continuation activation event %s has entity type %q", event.ID, event.EntityType)
 		}
 		execution, err := service.core.store.GetContinuationExecution(ctx, event.EntityID)
 		if err != nil {
-			return store.WorkflowRun{}, "", err
+			return queuedRunActivation{}, false, err
 		}
 		if execution == nil {
-			return store.WorkflowRun{}, "", fmt.Errorf("%w: continuation activation %s", ErrLifecycleNotFound, event.EntityID)
+			return queuedRunActivation{}, false, fmt.Errorf("%w: continuation activation %s", ErrLifecycleNotFound, event.EntityID)
 		}
 		run, err := service.core.store.GetWorkflowRun(ctx, execution.RunID)
 		if err != nil {
-			return store.WorkflowRun{}, "", err
+			return queuedRunActivation{}, false, err
 		}
 		if run == nil {
-			return store.WorkflowRun{}, "", fmt.Errorf("%w: continuation activation Run %s", ErrLifecycleNotFound, execution.RunID)
+			return queuedRunActivation{}, false, fmt.Errorf("%w: continuation activation Run %s", ErrLifecycleNotFound, execution.RunID)
 		}
-		return *run, execution.ID, nil
+		return service.queuedJobForRun(ctx, *run, func(job store.DurableJob) bool {
+			return job.EntityType == "continuation_execution" && job.EntityID == execution.ID
+		})
+	case store.DurableJobQueuedOutboxTopic:
+		if event.EntityType != "durable_job" {
+			return queuedRunActivation{}, false, fmt.Errorf("durable job activation event %s has entity type %q", event.ID, event.EntityType)
+		}
+		job, err := service.core.store.GetDurableJob(ctx, event.EntityID)
+		if err != nil {
+			return queuedRunActivation{}, false, err
+		}
+		if job == nil || job.State != store.JobQueued || job.RunID == "" {
+			return queuedRunActivation{}, false, nil
+		}
+		return service.queuedActivationForJob(ctx, *job)
 	default:
-		return store.WorkflowRun{}, "", fmt.Errorf("unsupported queued Run activation topic %q", event.Topic)
+		return queuedRunActivation{}, false, fmt.Errorf("unsupported queued Run activation topic %q", event.Topic)
 	}
 }
 
-func (service *RunActivationService) verifyActivationJob(ctx context.Context, run store.WorkflowRun, topic, entityID string) error {
+func (service *RunActivationService) queuedJobForRun(ctx context.Context, run store.WorkflowRun, matches func(store.DurableJob) bool) (queuedRunActivation, bool, error) {
 	jobs, err := service.core.store.ListDurableJobsForRun(ctx, run.ID)
+	if err != nil {
+		return queuedRunActivation{}, false, err
+	}
+	for _, job := range jobs {
+		if job.RunID != run.ID || job.State != store.JobQueued || !matches(job) {
+			continue
+		}
+		return queuedRunActivation{run: run, job: job}, true, nil
+	}
+	return queuedRunActivation{}, false, nil
+}
+
+func (service *RunActivationService) queuedActivationForJob(ctx context.Context, job store.DurableJob) (queuedRunActivation, bool, error) {
+	if job.State != store.JobQueued || job.RunID == "" {
+		return queuedRunActivation{}, false, nil
+	}
+	run, err := service.core.store.GetWorkflowRun(ctx, job.RunID)
+	if err != nil {
+		return queuedRunActivation{}, false, err
+	}
+	if run == nil {
+		return queuedRunActivation{}, false, fmt.Errorf("%w: durable job activation Run %s", ErrLifecycleNotFound, job.RunID)
+	}
+	return queuedRunActivation{run: *run, job: job}, true, nil
+}
+
+// sweepQueuedRunJobs repairs the small window after a parent records a child
+// spawn receipt but the child dies before claiming it. It re-reads queued jobs,
+// expires only provably stale handoffs, and lets the normal reserve/spawn
+// protocol create at most one replacement worker.
+func (service *RunActivationService) sweepQueuedRunJobs(ctx context.Context) error {
+	jobs, err := service.core.store.ListQueuedDurableJobs(ctx, store.ListQueuedDurableJobsRequest{})
 	if err != nil {
 		return err
 	}
+	seen := make(map[string]struct{}, len(jobs))
 	for _, job := range jobs {
-		if job.RunID != run.ID {
+		activation, found, err := service.queuedActivationForJob(ctx, job)
+		if err != nil {
+			return err
+		}
+		if !found || !runWorkerJobIsEligible(activation.run.Status, activation.job) {
 			continue
 		}
-		switch topic {
-		case workflowRunQueuedOutboxTopic:
-			if job.CommandType != "workflow_run.execute" || job.EntityType != "workflow_run" || job.EntityID != run.ID {
-				continue
-			}
-		case continuationExecutionQueuedOutboxTopic, revisionCandidateContinuationQueuedOutboxTopic:
-			if job.EntityType != "continuation_execution" || job.EntityID != entityID {
-				continue
-			}
-		default:
-			return fmt.Errorf("unsupported queued Run activation topic %q", topic)
+		if _, duplicate := seen[activation.run.ID]; duplicate {
+			continue
 		}
-		return nil
+		seen[activation.run.ID] = struct{}{}
+		if err := service.ensureRunWorkerHandoff(ctx, activation.run); err != nil {
+			return err
+		}
 	}
-	return fmt.Errorf("queued Run activation %s has no durable job for Run %s", topic, run.ID)
+	return nil
 }
 
 func (service *RunActivationService) ensureRunWorkerHandoff(ctx context.Context, run store.WorkflowRun) error {
-	if !runActivationRunnable(run.Status) {
-		return nil
+	actor := strings.TrimSpace(run.CreatedBy)
+	if actor == "" {
+		actor = runActivationActor
+	}
+	if _, err := service.core.store.ReconcileRunWorkerHandoffs(ctx, store.ReconcileRunWorkerHandoffsRequest{
+		RunID: run.ID, Actor: actor, Reason: runActivationReason,
+	}); err != nil {
+		return fmt.Errorf("reconcile queued Run worker handoffs: %w", err)
 	}
 	handoffs, err := service.core.store.ListRunWorkerHandoffsForRun(ctx, run.ID)
 	if err != nil {
@@ -189,10 +246,6 @@ func (service *RunActivationService) ensureRunWorkerHandoff(ctx context.Context,
 	key, err := store.NewUUIDv7()
 	if err != nil {
 		return fmt.Errorf("allocate queued Run worker handoff key: %w", err)
-	}
-	actor := strings.TrimSpace(run.CreatedBy)
-	if actor == "" {
-		actor = runActivationActor
 	}
 	handoff, err := (&RunWorkerHandoffService{core: service.core}).LaunchRunWorkerHandoff(ctx, ReserveRunWorkerHandoffCommand{
 		IdempotencyKey: key,
@@ -219,16 +272,6 @@ func (service *RunActivationService) ensureRunWorkerHandoff(ctx context.Context,
 		return fmt.Errorf("automatic Run worker handoff %s expired before child claim", handoff.ID)
 	default:
 		return fmt.Errorf("automatic Run worker handoff %s returned unsupported state %s", handoff.ID, handoff.State)
-	}
-}
-
-func runActivationRunnable(status store.WorkflowRunStatus) bool {
-	switch status {
-	case store.WorkflowRunQueued, store.WorkflowRunRunning, store.WorkflowRunPauseRequested, store.WorkflowRunPausing,
-		store.WorkflowRunResumeRequested, store.WorkflowRunCancelRequested, store.WorkflowRunStopRequested, store.WorkflowRunCanceling:
-		return true
-	default:
-		return false
 	}
 }
 

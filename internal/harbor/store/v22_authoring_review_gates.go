@@ -416,8 +416,14 @@ func (s *Store) DecideAuthoringReviewGate(ctx context.Context, request DecideAut
 		IdempotencyKey: AuthoringReviewGateResolutionJobKey(state.Binding.ID, decision.ID),
 		CreatedBy:      decision.Actor, CreatedAt: now, UpdatedAt: now, Version: 1,
 	}
-	if err := insertAuthoringReviewGateResolutionJobTx(ctx, tx, job); err != nil {
+	jobCreated, err := insertAuthoringReviewGateResolutionJobTx(ctx, tx, job)
+	if err != nil {
 		return AuthoringReviewGateDecisionResult{}, err
+	}
+	if jobCreated {
+		if err := s.appendDurableJobQueuedOutboxTx(ctx, tx, job, now); err != nil {
+			return AuthoringReviewGateDecisionResult{}, err
+		}
 	}
 	if err := appendAuthoringReviewGateDecisionAudits(ctx, s, tx, state.Request, state.Binding, decision, job, prepared.actor, prepared.reason, now); err != nil {
 		return AuthoringReviewGateDecisionResult{}, err
@@ -1174,7 +1180,7 @@ func scanAuthoringReviewGateResolution(scanner rowScanner) (AuthoringReviewGateR
 	return resolution, nil
 }
 
-func insertAuthoringReviewGateResolutionJobTx(ctx context.Context, tx *sql.Tx, job DurableJob) error {
+func insertAuthoringReviewGateResolutionJobTx(ctx context.Context, tx *sql.Tx, job DurableJob) (bool, error) {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO jobs (
 			id, command_type, entity_type, entity_id, run_id, stage_attempt_id, state,
@@ -1184,22 +1190,22 @@ func insertAuthoringReviewGateResolutionJobTx(ctx context.Context, tx *sql.Tx, j
 	`, job.ID, job.CommandType, job.EntityType, job.EntityID, job.RunID, job.StageAttemptID, job.State,
 		job.Priority, job.PayloadJSON, job.IdempotencyKey, job.CreatedBy, job.CreatedAt, job.UpdatedAt, job.Version)
 	if err == nil {
-		return nil
+		return true, nil
 	}
 	if isGlobalIdentityCollision(err) {
-		return fmt.Errorf("%w: authoring review resolution job %s", ErrIdentityCollision, job.ID)
+		return false, fmt.Errorf("%w: authoring review resolution job %s", ErrIdentityCollision, job.ID)
 	}
 	if !isUniqueConstraint(err) {
-		return err
+		return false, err
 	}
 	existing, existingErr := getDurableJobByIdempotencyTx(ctx, tx, job.IdempotencyKey)
 	if existingErr != nil {
-		return existingErr
+		return false, existingErr
 	}
 	if !sameDurableJobRequest(existing, job) || existing.ID != job.ID {
-		return fmt.Errorf("%w: authoring review resolution job %s", ErrIdempotencyConflict, job.IdempotencyKey)
+		return false, fmt.Errorf("%w: authoring review resolution job %s", ErrIdempotencyConflict, job.IdempotencyKey)
 	}
-	return nil
+	return false, nil
 }
 
 // validateAuthoringReviewGateResolutionManifestTx verifies generic artifact

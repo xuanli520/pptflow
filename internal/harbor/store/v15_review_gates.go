@@ -369,8 +369,14 @@ func (s *Store) RecordReviewGateDecision(ctx context.Context, request RecordRevi
 		UpdatedAt:      now,
 		Version:        1,
 	}
-	if err := insertReviewGateResolutionJobTx(ctx, tx, job); err != nil {
+	jobCreated, err := insertReviewGateResolutionJobTx(ctx, tx, job)
+	if err != nil {
 		return ReviewGateDecisionResult{}, err
+	}
+	if jobCreated {
+		if err := s.appendDurableJobQueuedOutboxTx(ctx, tx, job, now); err != nil {
+			return ReviewGateDecisionResult{}, err
+		}
 	}
 	if err := appendReviewGateDecisionAudits(ctx, s, tx, state.Binding, decision, job, prepared.actor, prepared.reason, now); err != nil {
 		return ReviewGateDecisionResult{}, err
@@ -746,7 +752,7 @@ func replayReviewGateDecisionTx(ctx context.Context, tx *sql.Tx, binding ReviewG
 	return ReviewGateDecisionResult{Binding: binding, Decision: decision, ResolutionJob: job}, nil
 }
 
-func insertReviewGateResolutionJobTx(ctx context.Context, tx *sql.Tx, job DurableJob) error {
+func insertReviewGateResolutionJobTx(ctx context.Context, tx *sql.Tx, job DurableJob) (bool, error) {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO jobs (
 			id, command_type, entity_type, entity_id, run_id, stage_attempt_id, state,
@@ -756,22 +762,22 @@ func insertReviewGateResolutionJobTx(ctx context.Context, tx *sql.Tx, job Durabl
 	`, job.ID, job.CommandType, job.EntityType, job.EntityID, job.RunID, job.StageAttemptID, job.State,
 		job.Priority, job.PayloadJSON, job.IdempotencyKey, job.CreatedBy, job.CreatedAt, job.UpdatedAt, job.Version)
 	if err == nil {
-		return nil
+		return true, nil
 	}
 	if isGlobalIdentityCollision(err) {
-		return fmt.Errorf("%w: review gate resolution job %s", ErrIdentityCollision, job.ID)
+		return false, fmt.Errorf("%w: review gate resolution job %s", ErrIdentityCollision, job.ID)
 	}
 	if !isUniqueConstraint(err) {
-		return err
+		return false, err
 	}
 	existing, existingErr := getDurableJobByIdempotencyTx(ctx, tx, job.IdempotencyKey)
 	if existingErr != nil {
-		return existingErr
+		return false, existingErr
 	}
 	if !sameDurableJobRequest(existing, job) || existing.ID != job.ID {
-		return fmt.Errorf("%w: review gate resolution job %s", ErrIdempotencyConflict, job.IdempotencyKey)
+		return false, fmt.Errorf("%w: review gate resolution job %s", ErrIdempotencyConflict, job.IdempotencyKey)
 	}
-	return nil
+	return false, nil
 }
 
 func validateReviewGateResolutionManifestTx(ctx context.Context, tx *sql.Tx, manifestID string, binding ReviewGateBinding) error {

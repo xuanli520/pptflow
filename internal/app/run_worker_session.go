@@ -163,7 +163,9 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 		}
 		return RunWorkerSessionResult{}, err
 	}
-	if !runWorkerRunnable(run.Status) {
+	if _, ready, readyErr := session.eligibleQueuedRunWork(ctx, run); readyErr != nil {
+		return RunWorkerSessionResult{}, fmt.Errorf("inspect eligible queued Run work: %w", readyErr)
+	} else if !ready {
 		return RunWorkerSessionResult{Run: run, StoppedFor: run.Status}, nil
 	}
 	var lease store.Lease
@@ -219,7 +221,15 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 		if err := heartbeats.err(); err != nil {
 			return result, fmt.Errorf("%w: %v", ErrRunWorkerLeaseLost, err)
 		}
-		cycle, cycleErr := session.worker.RunOnce(ctx)
+		commandTypes, ready, readyErr := session.eligibleQueuedRunWork(ctx, run)
+		if readyErr != nil {
+			return result, fmt.Errorf("inspect eligible queued Run work: %w", readyErr)
+		}
+		if !ready {
+			result.StoppedFor = run.Status
+			return result, nil
+		}
+		cycle, cycleErr := session.worker.RunOnceForCommandTypes(ctx, commandTypes)
 		result.LastCycle = cycle
 		if cycleErr != nil && cycle.FinalState == "" {
 			// A cancellation can race an otherwise-empty durable claim. SQLite
@@ -247,10 +257,7 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 			return result, err
 		}
 		result.Run = current
-		if !runWorkerRunnable(current.Status) {
-			result.StoppedFor = current.Status
-			return result, nil
-		}
+		run = current
 		if cycle.Empty {
 			if err := waitRunWorkerPoll(ctx, session.pollInterval); err != nil {
 				return result, err

@@ -281,6 +281,13 @@ func TestListDurableJobsAndLeasesForAttachProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pending, err := s.ListPendingOutboxEvents(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Topic != DurableJobQueuedOutboxTopic || pending[0].EntityType != "durable_job" || pending[0].EntityID != job.ID {
+		t.Fatalf("run-scoped durable job wake event = %+v", pending)
+	}
 	lease, err := s.AcquireLease(ctx, AcquireLeaseRequest{
 		ResourceType: "job_dispatch", ResourceID: job.ID, Owner: "worker", JobID: job.ID, Actor: "tester",
 	})

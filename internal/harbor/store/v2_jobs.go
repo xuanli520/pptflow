@@ -11,6 +11,10 @@ import (
 const (
 	DefaultLeaseTTL               = 90 * time.Second
 	DefaultLeaseHeartbeatInterval = 20 * time.Second
+	// DurableJobQueuedOutboxTopic is the durable wake-up signal for a Run
+	// scoped job. Consumers must re-read the job and its Run; the event payload
+	// is only a delivery hint.
+	DurableJobQueuedOutboxTopic = "durable_job.queued"
 )
 
 const durableJobSelect = `
@@ -127,10 +131,27 @@ func (s *Store) CreateDurableJob(ctx context.Context, request CreateDurableJobRe
 	}); err != nil {
 		return DurableJob{}, err
 	}
+	if err := s.appendDurableJobQueuedOutboxTx(ctx, tx, job, now); err != nil {
+		return DurableJob{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return DurableJob{}, err
 	}
 	return job, nil
+}
+
+// appendDurableJobQueuedOutboxTx records one delivery signal for every
+// Run-scoped queued job created through the generic store boundary. The job
+// itself remains authoritative, so callers never need to serialize executable
+// data into the outbox payload.
+func (s *Store) appendDurableJobQueuedOutboxTx(ctx context.Context, tx *sql.Tx, job DurableJob, now time.Time) error {
+	if job.RunID == "" || job.State != JobQueued {
+		return nil
+	}
+	return s.appendV5OutboxTx(ctx, tx, DurableJobQueuedOutboxTopic, "durable_job", job.ID,
+		job.IdempotencyKey+":queued", auditPayload(map[string]any{
+			"run_id": job.RunID, "command_type": job.CommandType, "entity_type": job.EntityType, "entity_id": job.EntityID,
+		}), now)
 }
 
 func (s *Store) GetDurableJob(ctx context.Context, jobID string) (*DurableJob, error) {

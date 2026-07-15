@@ -57,7 +57,11 @@ func (s *Store) ReserveRunWorkerHandoff(ctx context.Context, request ReserveRunW
 	if err := validateRunWorkerHandoffCheckpoint(run, prepared); err != nil {
 		return ReserveRunWorkerHandoffResult{}, err
 	}
-	if !runWorkerHandoffRunnable(run.Status) {
+	runnable, err := runWorkerHandoffRunnableTx(ctx, tx, run)
+	if err != nil {
+		return ReserveRunWorkerHandoffResult{}, err
+	}
+	if !runnable {
 		return ReserveRunWorkerHandoffResult{}, fmt.Errorf("%w: workflow run %s is %s", ErrInvalidTransition, run.ID, run.Status)
 	}
 	if err := s.reconcileActiveRunWorkerHandoffTx(ctx, tx, run.ID, prepared.actor, prepared.reason, now); err != nil {
@@ -231,7 +235,11 @@ func (s *Store) ClaimRunWorkerHandoff(ctx context.Context, request ClaimRunWorke
 	if err := validatePersistedRunWorkerHandoffCheckpoint(run, handoff); err != nil {
 		return RunWorkerHandoffClaim{}, err
 	}
-	if !runWorkerHandoffRunnable(run.Status) {
+	runnable, err := runWorkerHandoffRunnableTx(ctx, tx, run)
+	if err != nil {
+		return RunWorkerHandoffClaim{}, err
+	}
+	if !runnable {
 		return RunWorkerHandoffClaim{}, fmt.Errorf("%w: workflow run %s is %s", ErrInvalidTransition, run.ID, run.Status)
 	}
 	spawnRequest := preparedRecordRunWorkerHandoffSpawnedRequest{
@@ -984,6 +992,21 @@ func runWorkerHandoffRunnable(status WorkflowRunStatus) bool {
 	default:
 		return false
 	}
+}
+
+// runWorkerHandoffRunnableTx admits the normal active Run states and also a
+// Run in a durable wait/terminal projection when it has queued local work.
+// Review resolution, continuation, and repair coordinators legitimately run
+// from such projections; the queued job is the additional durable authority.
+func runWorkerHandoffRunnableTx(ctx context.Context, tx *sql.Tx, run WorkflowRun) (bool, error) {
+	if runWorkerHandoffRunnable(run.Status) {
+		return true, nil
+	}
+	var queued bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE run_id = ? AND state = 'queued')`, run.ID).Scan(&queued); err != nil {
+		return false, err
+	}
+	return queued, nil
 }
 
 func handoffHeldError(handoff RunWorkerHandoff) error {

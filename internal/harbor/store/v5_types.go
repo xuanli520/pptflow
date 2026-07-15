@@ -514,12 +514,15 @@ type ListQueuedDurableJobsRequest struct {
 // worker to durable jobs for one Run; blank preserves a deployment-wide worker
 // claim. A blank CapacityPoolKey means the caller only needs a per-job
 // dispatch lease; otherwise one pool slot is acquired in the same transaction
-// as the queued-to-running transition.
+// as the queued-to-running transition. CommandTypes optionally restricts a
+// special-state worker to an explicit allow-list; nil and empty preserve the
+// normal all-command claim behavior.
 type ClaimNextDurableJobRequest struct {
 	ID              string
 	IdempotencyKey  string
 	Owner           string
 	RunID           string
+	CommandTypes    []string
 	LeaseTTL        time.Duration
 	CapacityPoolKey string
 	Actor           string

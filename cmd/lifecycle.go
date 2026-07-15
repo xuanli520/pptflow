@@ -168,6 +168,20 @@ func replayCompletedLifecycleMutation(ctx context.Context, services *app.Lifecyc
 	return &receipt, nil
 }
 
+// drainQueuedRunActivations gives mutation commands the same immediate local
+// delivery behavior as the Task Hub. Compositions without a child launcher
+// deliberately keep activation unavailable, which preserves their read/control
+// boundary without making the mutation fail.
+func drainQueuedRunActivations(ctx context.Context, services *app.LifecycleServices) error {
+	if services == nil || services.RunActivations == nil || !services.RunActivations.Available() {
+		return nil
+	}
+	if err := services.RunActivations.Drain(ctx); err != nil {
+		return fmt.Errorf("activate queued Run: %w", err)
+	}
+	return nil
+}
+
 // lifecycleMutationCheckpointForKey returns the original full checkpoint for
 // a retry before any mutable entity is reread. This is necessary because a
 // successful mutation normally advances the very version the CLI initially
@@ -668,7 +682,14 @@ func newTaskContinueCommand(config *lifecycleCLIConfig) *cobra.Command {
 					return fmt.Errorf("--plan cannot be combined with run planning inputs")
 				}
 				return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-					return services.Continuations.ExecuteTaskContinuation(ctx, planID)
+					receipt, err := services.Continuations.ExecuteTaskContinuation(ctx, planID)
+					if err != nil {
+						return nil, err
+					}
+					if err := drainQueuedRunActivations(ctx, services); err != nil {
+						return nil, err
+					}
+					return receipt, nil
 				})
 			}
 			if yes {
@@ -981,6 +1002,9 @@ func newReviewDecideCommand(config *lifecycleCLIConfig) *cobra.Command {
 				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationReview, idempotencyKey); err != nil {
 					return nil, err
 				} else if receipt != nil {
+					if err := drainQueuedRunActivations(ctx, services); err != nil {
+						return nil, err
+					}
 					return *receipt, nil
 				}
 				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationReview, idempotencyKey)
@@ -1002,10 +1026,17 @@ func newReviewDecideCommand(config *lifecycleCLIConfig) *cobra.Command {
 				if err := requireLifecycleCheckpointDigest(digest, checkpoint.RevisionDigest); err != nil {
 					return nil, err
 				}
-				return services.Mutations.DecideReview(ctx, app.DecideReviewLifecycleCommand{
+				receipt, err := services.Mutations.DecideReview(ctx, app.DecideReviewLifecycleCommand{
 					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
 					Decision:                     store.ReviewDecisionAction(action),
 				})
+				if err != nil {
+					return nil, err
+				}
+				if err := drainQueuedRunActivations(ctx, services); err != nil {
+					return nil, err
+				}
+				return receipt, nil
 			})
 		},
 	}
@@ -1099,9 +1130,16 @@ func newAuthoringReviewDecideCommand(config *lifecycleCLIConfig) *cobra.Command 
 				if err != nil {
 					return nil, err
 				}
-				return services.AuthoringReviews.Decide(ctx, app.DecideAuthoringReviewRequest{
+				receipt, err := services.AuthoringReviews.Decide(ctx, app.DecideAuthoringReviewRequest{
 					IdempotencyKey: idempotencyKey, Action: store.ReviewDecisionAction(action), Actor: actor, Reason: reason, Expected: checkpoint,
 				})
+				if err != nil {
+					return nil, err
+				}
+				if err := drainQueuedRunActivations(ctx, services); err != nil {
+					return nil, err
+				}
+				return receipt, nil
 			})
 		},
 	}
@@ -1585,7 +1623,14 @@ func newRunReconcileCommand(config *lifecycleCLIConfig) *cobra.Command {
 				return err
 			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				return services.LocalRuntime.ReconcileRun(ctx, app.ReconcileRunRequest{RunID: runID, Actor: actor, Reason: reason})
+				result, err := services.LocalRuntime.ReconcileRun(ctx, app.ReconcileRunRequest{RunID: runID, Actor: actor, Reason: reason})
+				if err != nil {
+					return nil, err
+				}
+				if err := drainQueuedRunActivations(ctx, services); err != nil {
+					return nil, err
+				}
+				return result, nil
 			})
 		},
 	}

@@ -1028,6 +1028,9 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 			if err != nil {
 				return TaskHubMutationResult{}, err
 			}
+			if err := adapter.activateQueuedRuns(ctx, services); err != nil {
+				return TaskHubMutationResult{}, err
+			}
 			return TaskHubMutationResult{
 				Action: request.Action, Target: request.Target, ReceiptID: result.Decision.ID, ExecutionID: result.ResolutionJob.ID,
 				Summary: "已记录 source/session 审核决定，并排队本地受控 resolution job",
@@ -1041,6 +1044,9 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 			Decision:                     taskHubReviewDecisionAction(request.Action),
 		})
 		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		if err := adapter.activateQueuedRuns(ctx, services); err != nil {
 			return TaskHubMutationResult{}, err
 		}
 		return taskHubMutationResult(request, receipt), nil
@@ -1103,6 +1109,9 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubRunControlMutation(ctx 
 			Reason: request.Reason,
 		})
 		if err != nil {
+			return TaskHubRunControlMutationResult{}, err
+		}
+		if err := adapter.activateQueuedRuns(ctx, services); err != nil {
 			return TaskHubRunControlMutationResult{}, err
 		}
 		return TaskHubRunControlMutationResult{

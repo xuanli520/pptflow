@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -177,7 +178,7 @@ func (s *Store) ClaimNextDurableJob(ctx context.Context, request ClaimNextDurabl
 		}
 	}
 	now := s.now().UTC()
-	job, err := selectNextQueuedDurableJobTx(ctx, tx, now, prepared.RunID)
+	job, err := selectNextQueuedDurableJobTx(ctx, tx, now, prepared.RunID, prepared.CommandTypes)
 	if err != nil {
 		return DurableJobDispatchClaim{}, err
 	}
@@ -354,6 +355,7 @@ type preparedDurableJobClaim struct {
 	IdempotencyKey  string
 	Owner           string
 	RunID           string
+	CommandTypes    []string
 	LeaseTTL        time.Duration
 	CapacityPoolKey string
 	Actor           string
@@ -380,8 +382,36 @@ func prepareDurableJobClaim(s *Store, request ClaimNextDurableJobRequest) (prepa
 	if runID != "" && !isUUIDv7(runID) {
 		return preparedDurableJobClaim{}, ErrInvalidUUIDv7Identity
 	}
+	commandTypes, err := normalizeDurableJobCommandTypes(request.CommandTypes)
+	if err != nil {
+		return preparedDurableJobClaim{}, fmt.Errorf("%w: %v", ErrInvalidDispatch, err)
+	}
 	return preparedDurableJobClaim{ID: id, IdempotencyKey: key, Owner: owner, LeaseTTL: request.LeaseTTL,
-		RunID: runID, CapacityPoolKey: strings.TrimSpace(request.CapacityPoolKey), Actor: resolveActor(request.Actor), Reason: strings.TrimSpace(request.Reason)}, nil
+		RunID: runID, CommandTypes: commandTypes, CapacityPoolKey: strings.TrimSpace(request.CapacityPoolKey), Actor: resolveActor(request.Actor), Reason: strings.TrimSpace(request.Reason)}, nil
+}
+
+func normalizeDurableJobCommandTypes(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, fmt.Errorf("durable job command type is required")
+		}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	write := 0
+	for _, value := range result {
+		if write != 0 && result[write-1] == value {
+			continue
+		}
+		result[write] = value
+		write++
+	}
+	return result[:write], nil
 }
 
 func getCapacityPoolByKeyTx(ctx context.Context, tx *sql.Tx, poolKey string) (*CapacityPool, error) {
@@ -395,7 +425,7 @@ func getCapacityPoolByKeyTx(ctx context.Context, tx *sql.Tx, poolKey string) (*C
 	return &pool, nil
 }
 
-func selectNextQueuedDurableJobTx(ctx context.Context, tx *sql.Tx, now time.Time, runID string) (*DurableJob, error) {
+func selectNextQueuedDurableJobTx(ctx context.Context, tx *sql.Tx, now time.Time, runID string, commandTypes []string) (*DurableJob, error) {
 	query := durableJobSelect + `
 		WHERE state = 'queued'
 		  AND NOT EXISTS (
@@ -407,6 +437,14 @@ func selectNextQueuedDurableJobTx(ctx context.Context, tx *sql.Tx, now time.Time
 	if runID != "" {
 		query += ` AND run_id = ?`
 		args = append(args, runID)
+	}
+	if len(commandTypes) != 0 {
+		placeholders := make([]string, len(commandTypes))
+		for index, commandType := range commandTypes {
+			placeholders[index] = "?"
+			args = append(args, commandType)
+		}
+		query += ` AND command_type IN (` + strings.Join(placeholders, ", ") + `)`
 	}
 	query += ` ORDER BY priority DESC, created_at ASC, id ASC LIMIT 1`
 	job, err := scanDurableJob(tx.QueryRowContext(ctx, query, args...))

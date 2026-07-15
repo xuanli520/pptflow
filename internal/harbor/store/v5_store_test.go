@@ -322,6 +322,38 @@ func TestV5ScopedDurableClaimFencesSelectionAndEmptyReplay(t *testing.T) {
 	}
 }
 
+func TestV5ScopedDurableClaimFiltersCommandTypesBeforePriority(t *testing.T) {
+	ctx := context.Background()
+	s := tempV5DB(t)
+	task, revision := createValidatedTaskAndRevision(t, s)
+	run := createV5ReconcileRun(t, ctx, s, task, revision, "command-filter")
+	stale, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "stage_attempt.execute", EntityType: "fixture", EntityID: "stale", RunID: run.ID,
+		Priority: 100, PayloadJSON: `{}`, IdempotencyKey: "command-filter-stale", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "repair_session.advance", EntityType: "fixture", EntityID: "allowed", RunID: run.ID,
+		Priority: 1, PayloadJSON: `{}`, IdempotencyKey: "command-filter-allowed", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := s.ClaimNextDurableJob(ctx, ClaimNextDurableJobRequest{
+		IdempotencyKey: "command-filter-claim", Owner: "worker", RunID: run.ID, CommandTypes: []string{"repair_session.advance"},
+		LeaseTTL: time.Minute, Actor: "tester", Reason: "claim only eligible command",
+	})
+	if err != nil || claim.Job == nil || claim.Job.ID != allowed.ID {
+		t.Fatalf("filtered durable claim = %+v, %v; want %s", claim, err, allowed.ID)
+	}
+	storedStale, err := s.GetDurableJob(ctx, stale.ID)
+	if err != nil || storedStale == nil || storedStale.State != JobQueued {
+		t.Fatalf("filtered claim changed stale job = %+v, %v", storedStale, err)
+	}
+}
+
 func TestV5ScopedExpiredJobReconciliationLeavesOtherRunUntouched(t *testing.T) {
 	ctx := context.Background()
 	s := tempV5DB(t)
