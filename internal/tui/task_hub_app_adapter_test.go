@@ -136,6 +136,55 @@ func TestAppTaskHubLifecycleAdapterQueriesRealServicesAndPlansWithoutMutation(t 
 	}
 }
 
+func TestTaskHubQueryActivatesQueuedRunWithoutTUIExit(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	launcher := &recordingTaskHubRunWorkerLauncher{}
+	services, err := app.NewLifecycleServicesWithOptions(root, database, app.LifecycleServicesOptions{
+		OperationResolver:        testsupport.AcceptAllStageOperationResolver(),
+		RunWorkerHandoffLauncher: launcher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, revision, err := services.Tasks.ImportTask(ctx, app.ImportTaskRequest{
+		CreateDraftTaskRequest: app.CreateDraftTaskRequest{Slug: "tui-auto-activation", Title: "TUI Automatic Activation", Actor: "tester", Reason: "Task Hub activation fixture"},
+		SourceDirectory:        taskHubAdapterSnapshot(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := services.Runs.StartRun(ctx, app.StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, Profile: taskHubAdapterCompleteProfile(t),
+		ExecutionSpec: taskHubExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "task_hub_auto_activation", Actor: "tester", Reason: "queue Task Hub activation fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAppTaskHubLifecycleAdapter(services)
+	snapshot, err := adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubRunsTab})
+	if err != nil {
+		t.Fatalf("query Task Hub activates queued Run: %v", err)
+	}
+	if len(snapshot.Runs) != 1 || snapshot.Runs[0].RunID != run.ID {
+		t.Fatalf("Task Hub Run projection = %+v, want %s", snapshot.Runs, run.ID)
+	}
+	if launches := launcher.launchRequests(); len(launches) != 1 || launches[0].RunID != run.ID {
+		t.Fatalf("Task Hub did not activate queued Run: %+v", launches)
+	}
+	if _, err := adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubRunsTab}); err != nil {
+		t.Fatalf("repeat Task Hub query: %v", err)
+	}
+	if launches := launcher.launchRequests(); len(launches) != 1 {
+		t.Fatalf("repeat Task Hub query launched duplicate worker: %+v", launches)
+	}
+}
+
 func TestTaskHubRunStartTwoPhaseFlowFreezesInputsAndRetriesLostReply(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

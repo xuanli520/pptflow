@@ -24,7 +24,7 @@ harbor-factory --root .harbor-factory tui
 | `Esc` | 取消待输入的前缀、确认表单或当前计划预览；从不提交 mutation。 |
 | `q`、`Ctrl+Q`、`Ctrl+C` | 退出；存在 active durable run 时打开逐 Run 的受控 worker 交接面板，不是取消。 |
 
-Queue 标签显示观测到的运行中和排队数量。后端未暴露容量池时，容量显示为 `未配置`；`0` 不会被解释为已配置的零容量池。
+Queue 标签显示观测到的运行中和排队数量。新的 queued Run 会由本地受控 outbox 激活器立即交接给 child worker；TUI 重开和轮询也会恢复尚未启动的本地 queued Run，不需要退出 Task Hub。后端未暴露容量池时，容量显示为 `未配置`；`0` 不会被解释为已配置的零容量池。
 
 退出交接面板会枚举所有 active Run，并默认勾选每个当前可交接的 Run。可用 `Up`/`Down` 选择并用 `Space` 单独取消勾选；没有选中任何 Run 时，`Enter` 会直接退出，不启动任何 worker，也不会出现第二次确认。每个已选 Run 都保留自己的 UUIDv7 操作 ID、幂等键和已观察的 Run checkpoint，由 application service 按项交给受控 child worker。`Esc`、`q` 或 `Ctrl+C` 在面板内返回 Task Hub；它们不会取消 TUI 根 context、任何其他 Run 或 durable job。
 
@@ -35,7 +35,7 @@ Queue 标签显示观测到的运行中和排队数量。后端未暴露容量�
 | 序列 | 请求的计划 |
 | --- | --- |
 | `t n`、`t i` | 新建空 draft Task 或导入完整本地 Task 快照。 |
-| `t s` | 启动受控 Standard 创题：输入 HTTPS URI 或 SSH 地址（`ssh://git@host/...` 或 `git@host:org/repo.git`，不允许嵌入密码）的仓库 URL，与完整的 40/64 位小写 commit；再输入新题目标识、标题和可选元数据。SSH host 必须在当前生产包锁定的 `known_hosts` allow-list 中；需要认证时由启动进程的受管 agent socket 提供。系统捕获该精确源码，创建 revision-free draft Task、AuthoringSession 并排队 Standard Run。Codex/profile、模型和 catalog/lock 不从 TUI 输入。 |
+| `t s` | 启动受控 Standard 创题：输入 HTTPS URI 或 SSH 地址（`ssh://git@host/...` 或 `git@host:org/repo.git`，不允许嵌入密码）的仓库 URL，与完整的 40/64 位小写 commit；再输入新题目标识、标题和可选元数据。SSH host 必须在当前生产包锁定的 `known_hosts` allow-list 中；需要认证时由启动进程的受管 agent socket 提供。系统捕获该精确源码，创建 revision-free draft Task、AuthoringSession 并排队后立即交接 Standard Run 给受控 worker。Codex/profile、模型和 catalog/lock 不从 TUI 输入。 |
 | `t e`、`t f`、`t a`、`t d`、`t u` | 创建编辑 candidate、Fork、归档、软删除或恢复选中的 Task。 |
 | `x c`、`x n`、`x a` | 继续处理、启动 Run 或 Attach 到 durable Run。 |
 | `x k` | 打开选中 Run 的 Run Control。 |

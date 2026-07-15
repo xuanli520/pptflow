@@ -1460,6 +1460,11 @@ func newRunStartCommand(config *lifecycleCLIConfig) *cobra.Command {
 				if receipt, err := replayCompletedLifecycleMutation(ctx, services, app.LifecycleMutationStartRun, idempotencyKey); err != nil {
 					return nil, err
 				} else if receipt != nil {
+					if services.RunActivations != nil && services.RunActivations.Available() {
+						if err := services.RunActivations.Drain(ctx); err != nil {
+							return nil, fmt.Errorf("activate queued Run: %w", err)
+						}
+					}
 					return *receipt, nil
 				}
 				checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationStartRun, idempotencyKey)
@@ -1478,12 +1483,21 @@ func newRunStartCommand(config *lifecycleCLIConfig) *cobra.Command {
 				if err := requireLifecycleCheckpointIdentity("revision", revisionID, checkpoint.RevisionID); err != nil {
 					return nil, err
 				}
-				return services.Mutations.StartRun(ctx, app.StartRunLifecycleCommand{
+				receipt, err := services.Mutations.StartRun(ctx, app.StartRunLifecycleCommand{
 					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
 					ProfilePath:                  profilePath,
 					ExecutionSpecPath:            executionSpecPath,
 					Trigger:                      trigger,
 				})
+				if err != nil {
+					return nil, err
+				}
+				if services.RunActivations != nil && services.RunActivations.Available() {
+					if err := services.RunActivations.Drain(ctx); err != nil {
+						return nil, fmt.Errorf("activate queued Run: %w", err)
+					}
+				}
+				return receipt, nil
 			})
 		},
 	}

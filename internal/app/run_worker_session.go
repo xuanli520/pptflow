@@ -230,6 +230,15 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 			}
 			return result, cycleErr
 		}
+		// A completed handler can create another durable Run (for example the
+		// Standard materialization handoff) or queue continuation work. Drain
+		// the same filtered activation outbox before this supervisor observes
+		// its next state, so child Runs do not depend on a TUI exit gesture.
+		if !cycle.Empty && session.services.RunActivations != nil && session.services.RunActivations.Available() {
+			if err := session.services.RunActivations.Drain(ctx); err != nil {
+				return result, fmt.Errorf("activate queued child Run workers: %w", err)
+			}
+		}
 		current, err := session.services.Runs.Get(ctx, session.runID)
 		if err != nil {
 			if contextErr := ctx.Err(); contextErr != nil {

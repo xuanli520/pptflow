@@ -75,9 +75,10 @@ cd "$release_root"
 ```
 
 创建标准题目时，在 Task Hub 输入 `t` 后输入 `s`，审阅计划并按确认表单填写
-HTTPS/SSH Git 仓库 URL、完整 commit、slug、标题、可选 metadata 与原因。退出
-TUI 时，使用受控 worker 交接面板来启动已排队的 Run。外部 provider 的凭据只应
-通过受批准的环境变量和 secret reference 提供，不能写入此生产包或其部署文件。
+HTTPS/SSH Git 仓库 URL、完整 commit、slug、标题、可选 metadata 与原因。已入队的
+Run 会由本地受控 outbox 激活器立即交接给 child worker；退出 TUI 的交接面板仅用于
+仍在运行的 Run 的受控交接或恢复。外部 provider 的凭据只应通过受批准的环境变量和
+secret reference 提供，不能写入此生产包或其部署文件。
 
 Standard 创题的 HTTPS 拉取始终无凭据、非交互。SSH 只允许连接到
 `deployments/standard-authoring/ssh/known_hosts` 中已有精确 host key 的主机；该

@@ -72,6 +72,9 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 	if services.EvaluatorLaunches == nil || !services.EvaluatorLaunches.Available() {
 		t.Fatal("unified production composition omitted the lock-owned evaluator-child definition capability")
 	}
+	if services.RunActivations == nil || !services.RunActivations.Available() {
+		t.Fatal("unified production composition omitted the queued Run activation capability")
+	}
 
 	for _, test := range []struct {
 		name     string

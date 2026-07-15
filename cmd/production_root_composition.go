@@ -243,6 +243,7 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 		CodeEdgePhase1RunDefinitionProvider:    parent.Definitions,
 		EvaluatorRunDefinitionProvider:         evaluator.Definitions,
 		CodeEdgeEvaluatorObserver:              evaluator.Observer,
+		RunWorkerHandoffLauncher:               executableRunWorkerLauncher{},
 	})
 }
 

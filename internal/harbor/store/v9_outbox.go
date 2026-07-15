@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -33,6 +34,7 @@ type preparedOutboxClaim struct {
 	ID             string
 	IdempotencyKey string
 	Owner          string
+	Topics         []string
 	Limit          int
 	LeaseTTL       time.Duration
 	Actor          string
@@ -108,10 +110,23 @@ func (s *Store) ClaimOutboxEvents(ctx context.Context, request ClaimOutboxEvents
 	if err := s.requeueExpiredOutboxEventsTx(ctx, tx, now); err != nil {
 		return OutboxDispatchClaim{}, err
 	}
-	rows, err := tx.QueryContext(ctx, outboxEventSelect+`
-		WHERE state = 'pending' AND available_at <= ?
+	query := outboxEventSelect + `
+		WHERE state = 'pending' AND available_at <= ?`
+	arguments := make([]any, 0, 2+len(prepared.Topics))
+	arguments = append(arguments, now)
+	if len(prepared.Topics) > 0 {
+		placeholders := make([]string, len(prepared.Topics))
+		for index, topic := range prepared.Topics {
+			placeholders[index] = "?"
+			arguments = append(arguments, topic)
+		}
+		query += " AND topic IN (" + strings.Join(placeholders, ", ") + ")"
+	}
+	query += `
 		ORDER BY available_at ASC, created_at ASC, id ASC
-		LIMIT ?`, now, prepared.Limit)
+		LIMIT ?`
+	arguments = append(arguments, prepared.Limit)
+	rows, err := tx.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return OutboxDispatchClaim{}, err
 	}
@@ -418,14 +433,40 @@ func prepareOutboxClaim(s *Store, request ClaimOutboxEventsRequest) (preparedOut
 	if request.Limit <= 0 || request.LeaseTTL <= 0 {
 		return preparedOutboxClaim{}, fmt.Errorf("%w: outbox claim limit and lease TTL must be positive", ErrInvalidDispatch)
 	}
+	topics, err := normalizeOutboxClaimTopics(request.Topics)
+	if err != nil {
+		return preparedOutboxClaim{}, err
+	}
 	ttl := normalizedOutboxDuration(request.LeaseTTL)
-	prepared := preparedOutboxClaim{ID: id, IdempotencyKey: key, Owner: owner, Limit: request.Limit, LeaseTTL: ttl, Actor: resolveActor(request.Actor), Reason: strings.TrimSpace(request.Reason)}
+	prepared := preparedOutboxClaim{ID: id, IdempotencyKey: key, Owner: owner, Topics: topics, Limit: request.Limit, LeaseTTL: ttl, Actor: resolveActor(request.Actor), Reason: strings.TrimSpace(request.Reason)}
 	prepared.Fingerprint = outboxDispatchFingerprint(struct {
-		Owner      string `json:"owner"`
-		Limit      int    `json:"limit"`
-		LeaseTTLMS int64  `json:"lease_ttl_ms"`
-	}{Owner: prepared.Owner, Limit: prepared.Limit, LeaseTTLMS: durationMilliseconds(prepared.LeaseTTL)})
+		Owner      string   `json:"owner"`
+		Topics     []string `json:"topics,omitempty"`
+		Limit      int      `json:"limit"`
+		LeaseTTLMS int64    `json:"lease_ttl_ms"`
+	}{Owner: prepared.Owner, Topics: prepared.Topics, Limit: prepared.Limit, LeaseTTLMS: durationMilliseconds(prepared.LeaseTTL)})
 	return prepared, nil
+}
+
+func normalizeOutboxClaimTopics(topics []string) ([]string, error) {
+	if len(topics) == 0 {
+		return nil, nil
+	}
+	unique := make(map[string]struct{}, len(topics))
+	normalized := make([]string, 0, len(topics))
+	for _, topic := range topics {
+		topic, err := normalizeRequired(topic, "outbox claim topic")
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidDispatch, err)
+		}
+		if _, found := unique[topic]; found {
+			continue
+		}
+		unique[topic] = struct{}{}
+		normalized = append(normalized, topic)
+	}
+	sort.Strings(normalized)
+	return normalized, nil
 }
 
 func prepareOutboxHeartbeat(s *Store, request HeartbeatOutboxEventRequest) (preparedOutboxHeartbeat, error) {

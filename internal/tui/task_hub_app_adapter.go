@@ -45,11 +45,17 @@ func NewAppTaskHubLifecycleAdapterWithRunWorkerHandoffLauncher(services *app.Lif
 	return &AppTaskHubLifecycleAdapter{services: services, runWorkerHandoffLauncher: launcher}
 }
 
-// QueryTaskHub reads V2 lifecycle records through public application services.
-// Deleted tasks remain visible because restoring them is a Task Hub workflow.
+// QueryTaskHub projects V2 lifecycle records through public application
+// services. In a production composition it first drains only the durable
+// queued-Run activation route, so reopening the Task Hub recovers a Run that
+// was committed just before its original launcher process exited. The TUI
+// never accesses SQLite or starts a child itself.
 func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHub(ctx context.Context, query TaskHubQuery) (TaskHubSnapshot, error) {
 	services, err := adapter.lifecycleServices()
 	if err != nil {
+		return TaskHubSnapshot{}, err
+	}
+	if err := adapter.activateQueuedRuns(ctx, services); err != nil {
 		return TaskHubSnapshot{}, err
 	}
 	if query.Tab == "" {
@@ -83,6 +89,16 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHub(ctx context.Context, que
 	assignTaskHubQueuePositions(snapshot.Runs, queued)
 	snapshot.Queue = buildTaskHubQueue(snapshot.Runs, observedAt)
 	return filterTaskHubSnapshot(snapshot, query.Filter), nil
+}
+
+func (adapter *AppTaskHubLifecycleAdapter) activateQueuedRuns(ctx context.Context, services *app.LifecycleServices) error {
+	if services == nil || services.RunActivations == nil || !services.RunActivations.Available() {
+		return nil
+	}
+	if err := services.RunActivations.Drain(ctx); err != nil {
+		return fmt.Errorf("activate queued Run workers: %w", err)
+	}
+	return nil
 }
 
 // PlanTaskHubCommand validates the current authoritative entities and returns
@@ -826,6 +842,9 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 		if err != nil {
 			return TaskHubMutationResult{}, err
 		}
+		if err := adapter.activateQueuedRuns(ctx, services); err != nil {
+			return TaskHubMutationResult{}, err
+		}
 		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionImportTask:
 		if services.Mutations == nil {
@@ -903,6 +922,9 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 		if err != nil {
 			return TaskHubMutationResult{}, err
 		}
+		if err := adapter.activateQueuedRuns(ctx, services); err != nil {
+			return TaskHubMutationResult{}, err
+		}
 		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionEvaluateCodeEdge:
 		if services.EvaluatorLaunches == nil {
@@ -965,6 +987,9 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 		if err != nil {
 			return TaskHubMutationResult{}, err
 		}
+		if err := adapter.activateQueuedRuns(ctx, services); err != nil {
+			return TaskHubMutationResult{}, err
+		}
 		return TaskHubMutationResult{
 			Action:      request.Action,
 			Target:      request.Target,
@@ -981,6 +1006,9 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 		}
 		receipt, err := services.Mutations.ExecuteManualPatch(ctx, taskHubLifecycleMutationBase(request), request.PlanID)
 		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		if err := adapter.activateQueuedRuns(ctx, services); err != nil {
 			return TaskHubMutationResult{}, err
 		}
 		return taskHubMutationResult(request, receipt), nil

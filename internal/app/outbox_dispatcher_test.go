@@ -71,6 +71,62 @@ func TestOutboxDispatcherAcknowledgesSuccessfulDelivery(t *testing.T) {
 	}
 }
 
+func TestOutboxDispatcherClaimsOnlyConfiguredTopics(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := store.OpenForTest(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	unrelated, err := dataStore.CreateOutboxEvent(ctx, store.CreateOutboxEventRequest{
+		Topic: "control.requested", EntityType: "workflow_run", EntityID: "run-unrelated", PayloadJSON: `{}`,
+		IdempotencyKey: "dispatcher-unrelated-event", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := dataStore.CreateOutboxEvent(ctx, store.CreateOutboxEventRequest{
+		Topic: "workflow_run.execute", EntityType: "workflow_run", EntityID: "run-target", PayloadJSON: `{}`,
+		IdempotencyKey: "dispatcher-target-event", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled := make(chan store.OutboxEvent, 1)
+	dispatcher, err := NewOutboxDispatcher(OutboxDispatcherConfig{
+		Store: dataStore, Owner: "outbox-worker-filtered", Topics: []string{"workflow_run.execute", "workflow_run.execute"}, Actor: "tester", RetryDelay: time.Second,
+		Handler: OutboxDeliveryHandlerFunc(func(_ context.Context, event store.OutboxEvent) error {
+			handled <- event
+			return nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := dispatcher.RunOnce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Delivered || result.Event == nil || result.Event.ID != target.ID {
+		t.Fatalf("filtered dispatcher result = %+v", result)
+	}
+	select {
+	case event := <-handled:
+		if event.ID != target.ID || event.Topic != "workflow_run.execute" {
+			t.Fatalf("filtered handler event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("filtered dispatcher did not invoke handler")
+	}
+	pending, err := dataStore.GetOutboxEvent(ctx, unrelated.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending == nil || pending.State != store.OutboxPending {
+		t.Fatalf("unrelated event = %+v, want pending", pending)
+	}
+}
+
 func TestOutboxDispatcherNacksHandlerFailureWithClassifiedRetry(t *testing.T) {
 	ctx := context.Background()
 	dataStore, err := store.OpenForTest(t.TempDir())

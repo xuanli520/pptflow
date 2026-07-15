@@ -50,8 +50,13 @@ type LifecycleServices struct {
 	CodeEdgeCompliance *CodeEdgeComplianceService
 	LocalRuntime       *LocalRuntimeService
 	WorkerHandoffs     *RunWorkerHandoffService
-	Mutations          *LifecycleMutationService
-	EvaluatorLaunches  *CodeEdgeEvaluatorLaunchService
+	// RunActivations consumes the durable local queue-delivery events that
+	// wake controlled child workers. It is optional in non-production
+	// compositions, where tests and read-only control planes intentionally do
+	// not spawn processes.
+	RunActivations    *RunActivationService
+	Mutations         *LifecycleMutationService
+	EvaluatorLaunches *CodeEdgeEvaluatorLaunchService
 	// AuthoringLaunches owns source capture and the source/session half of a
 	// Standard task creation. It is distinct from StandardAuthoringHandoffs:
 	// launch has no task revision yet, while handoff starts only after the
@@ -161,6 +166,11 @@ type LifecycleServicesOptions struct {
 	// read/control-plane and test compositions; without it the runtime retains
 	// an uncertain effect as in_doubt rather than attempting a rerun.
 	CodeEdgeEvaluatorObserver CodeEdgeEvaluatorCompletedObserver
+	// RunWorkerHandoffLauncher is the composition-owned local process boundary
+	// used for automatic delivery of queued Run work. The application layer
+	// retains the durable reserve/spawn/claim protocol; this port only starts
+	// the child after a durable handoff has been reserved.
+	RunWorkerHandoffLauncher RunWorkerHandoffLauncher
 }
 
 // NewLifecycleServices wires a V2 control plane to its managed local
@@ -223,6 +233,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		evaluatorObserver:    options.CodeEdgeEvaluatorObserver,
 		now:                  time.Now,
 	}
+	activations := &RunActivationService{core: core, launcher: options.RunWorkerHandoffLauncher}
 	continuations := newTaskContinuationService(core)
 	changes := newChangeProviderService(core)
 	for _, provider := range options.ChangeProviders {
@@ -250,6 +261,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		CodeEdgeCompliance:        &CodeEdgeComplianceService{core: core},
 		LocalRuntime:              &LocalRuntimeService{core: core},
 		WorkerHandoffs:            &RunWorkerHandoffService{core: core},
+		RunActivations:            activations,
 		Mutations:                 mutations,
 		EvaluatorLaunches:         &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider},
 		AuthoringLaunches:         newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider),

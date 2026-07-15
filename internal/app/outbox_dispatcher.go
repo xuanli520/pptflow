@@ -39,8 +39,11 @@ type OutboxDeliveryFailure interface {
 // is required rather than hidden in the dispatcher, so deployment policy owns
 // retry pacing explicitly.
 type OutboxDispatcherConfig struct {
-	Store          *store.Store
-	Owner          string
+	Store *store.Store
+	Owner string
+	// Topics optionally restricts this worker to matching outbox topics. Nil
+	// and empty slices preserve the legacy all-topic dispatcher behavior.
+	Topics         []string
 	Actor          string
 	Reason         string
 	LeaseTTL       time.Duration
@@ -56,6 +59,7 @@ type OutboxDispatcherConfig struct {
 type OutboxDispatcher struct {
 	store          *store.Store
 	owner          string
+	topics         []string
 	actor          string
 	reason         string
 	leaseTTL       time.Duration
@@ -92,6 +96,7 @@ func NewOutboxDispatcher(config OutboxDispatcherConfig) (*OutboxDispatcher, erro
 	return &OutboxDispatcher{
 		store:          config.Store,
 		owner:          owner,
+		topics:         append([]string(nil), config.Topics...),
 		actor:          defaultWorkerActor(config.Actor, owner),
 		reason:         strings.TrimSpace(config.Reason),
 		leaseTTL:       config.LeaseTTL,
@@ -129,6 +134,7 @@ func (dispatcher *OutboxDispatcher) RunOnce(ctx context.Context) (OutboxDispatch
 	claim, err := dispatcher.store.ClaimOutboxEvents(ctx, store.ClaimOutboxEventsRequest{
 		IdempotencyKey: "outbox-dispatcher-claim:" + claimID,
 		Owner:          dispatcher.owner,
+		Topics:         dispatcher.topics,
 		Limit:          1,
 		LeaseTTL:       dispatcher.leaseTTL,
 		Actor:          dispatcher.actor,

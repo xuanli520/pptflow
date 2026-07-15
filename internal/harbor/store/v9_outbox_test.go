@@ -85,6 +85,74 @@ func TestOutboxDispatcherClaimHeartbeatAckAndExactReplay(t *testing.T) {
 	}
 }
 
+func TestClaimOutboxEventsFiltersCanonicalTopicsAndFencesReplay(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	clock := time.Date(2026, 7, 13, 12, 30, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	created := make(map[string]OutboxEvent)
+	for _, topic := range []string{"workflow_run.execute", "control.requested", "workflow_run.completed"} {
+		event, err := s.CreateOutboxEvent(ctx, CreateOutboxEventRequest{
+			Topic: topic, EntityType: "workflow_run", EntityID: "run-" + topic, PayloadJSON: `{}`,
+			IdempotencyKey: "filtered-" + topic, Actor: "tester",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		created[topic] = event
+	}
+	claim, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "filtered-claim", Owner: "dispatcher-a", Topics: []string{" workflow_run.completed ", "workflow_run.execute", "workflow_run.completed"},
+		Limit: 3, LeaseTTL: time.Minute, Actor: "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claim.Events) != 2 {
+		t.Fatalf("filtered claim events = %+v, want two", claim.Events)
+	}
+	claimedTopics := map[string]bool{}
+	for _, event := range claim.Events {
+		claimedTopics[event.Topic] = true
+		if event.State != OutboxLeased {
+			t.Fatalf("filtered event was not leased: %+v", event)
+		}
+	}
+	if !claimedTopics["workflow_run.execute"] || !claimedTopics["workflow_run.completed"] || claimedTopics["control.requested"] {
+		t.Fatalf("filtered claim topics = %#v", claimedTopics)
+	}
+	replay, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "filtered-claim", Owner: "dispatcher-a", Topics: []string{"workflow_run.execute", "workflow_run.completed"},
+		Limit: 3, LeaseTTL: time.Minute, Actor: "tester",
+	})
+	if err != nil || len(replay.Events) != len(claim.Events) || replay.Events[0].ID != claim.Events[0].ID || replay.Events[1].ID != claim.Events[1].ID {
+		t.Fatalf("canonical topic replay = %+v, %v", replay, err)
+	}
+	if _, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "filtered-claim", Owner: "dispatcher-a", Topics: []string{"control.requested"},
+		Limit: 3, LeaseTTL: time.Minute, Actor: "tester",
+	}); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("different topic replay = %v, want idempotency conflict", err)
+	}
+	remaining, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "all-topics-claim", Owner: "dispatcher-b", Topics: []string{}, Limit: 3, LeaseTTL: time.Minute, Actor: "tester",
+	})
+	if err != nil || len(remaining.Events) != 1 || remaining.Events[0].ID != created["control.requested"].ID {
+		t.Fatalf("empty topic filter claim = %+v, %v", remaining, err)
+	}
+	legacyReplay, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "all-topics-claim", Owner: "dispatcher-b", Limit: 3, LeaseTTL: time.Minute, Actor: "tester",
+	})
+	if err != nil || len(legacyReplay.Events) != 1 || legacyReplay.Events[0].ID != remaining.Events[0].ID {
+		t.Fatalf("nil topic filter replay = %+v, %v", legacyReplay, err)
+	}
+	if _, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "invalid-topic-filter", Owner: "dispatcher-c", Topics: []string{" "}, Limit: 1, LeaseTTL: time.Minute, Actor: "tester",
+	}); !errors.Is(err, ErrInvalidDispatch) {
+		t.Fatalf("blank topic filter = %v, want invalid dispatch", err)
+	}
+}
+
 func TestOutboxDispatcherNackRetryExpiryAndStaleFence(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)

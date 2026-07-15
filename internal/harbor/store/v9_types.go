@@ -9,10 +9,13 @@ type ClaimOutboxEventsRequest struct {
 	ID             string
 	IdempotencyKey string
 	Owner          string
-	Limit          int
-	LeaseTTL       time.Duration
-	Actor          string
-	Reason         string
+	// Topics optionally restricts the claim to matching event topics. Nil and
+	// empty slices retain the legacy behavior of claiming every ready topic.
+	Topics   []string
+	Limit    int
+	LeaseTTL time.Duration
+	Actor    string
+	Reason   string
 }
 
 // OutboxDispatchClaim is the batch-level durable result of one claim poll.

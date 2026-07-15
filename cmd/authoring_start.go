@@ -47,7 +47,7 @@ begin only after the authoring materialization handoff.`,
 				if services == nil || services.AuthoringLaunches == nil {
 					return nil, fmt.Errorf("Standard authoring launch service is not configured")
 				}
-				return services.AuthoringLaunches.Start(ctx, app.StandardAuthoringLaunchCommand{
+				receipt, err := services.AuthoringLaunches.Start(ctx, app.StandardAuthoringLaunchCommand{
 					LifecycleMutationCommandBase: app.LifecycleMutationCommandBase{IdempotencyKey: idempotencyKey, Actor: actor, Reason: reason},
 					RepositoryURL:                repositoryURL,
 					CommitSHA:                    commitSHA,
@@ -55,6 +55,15 @@ begin only after the authoring materialization handoff.`,
 					Title:                        title,
 					MetadataJSON:                 metadataJSON,
 				})
+				if err != nil {
+					return nil, err
+				}
+				if services.RunActivations != nil && services.RunActivations.Available() {
+					if err := services.RunActivations.Drain(ctx); err != nil {
+						return nil, fmt.Errorf("activate queued Standard Run: %w", err)
+					}
+				}
+				return receipt, nil
 			})
 		},
 	}
