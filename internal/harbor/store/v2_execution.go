@@ -14,6 +14,19 @@ const workflowRunSelect = `
 	       trigger, execution_epoch, status, created_by, created_at, started_at, finished_at, version
 	FROM workflow_runs`
 
+// These closed constants duplicate only the durable parent/child policy at
+// the Store boundary. The richer descriptor remains in workflowadapter, but
+// allowing an AuthoringSession parent for arbitrary task-bound templates here
+// would let a direct Store caller bypass the application-level persisted
+// handoff artifact verification.
+const (
+	standardAuthoringParentTemplateID      = "harbor.standard-authoring"
+	standardAuthoringParentTemplateVersion = "1.0.0"
+	codeEdgePhase1ChildTemplateID          = "harbor.codeedge-phase1"
+	codeEdgePhase1ChildTemplateVersion     = "2.2.0"
+	standardAuthoringChildTrigger          = "standard-authoring.materialized"
+)
+
 func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRunRequest) (WorkflowRun, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return WorkflowRun{}, err
@@ -22,6 +35,10 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 		return WorkflowRun{}, ErrInvalidUUIDv7Identity
 	}
 	if request.ParentRunID != "" && !isUUIDv7(request.ParentRunID) {
+		return WorkflowRun{}, ErrInvalidUUIDv7Identity
+	}
+	authoringHandoffID := strings.TrimSpace(request.AuthoringPhase1HandoffID)
+	if authoringHandoffID != "" && !isUUIDv7(authoringHandoffID) {
 		return WorkflowRun{}, ErrInvalidUUIDv7Identity
 	}
 	id, err := s.newV2ID(request.ID)
@@ -109,9 +126,52 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 		if err != nil {
 			return WorkflowRun{}, err
 		}
-		if parent.TaskID != run.TaskID {
-			return WorkflowRun{}, fmt.Errorf("parent workflow run belongs to another task")
+		if parent.TaskID == run.TaskID {
+			if authoringHandoffID != "" {
+				return WorkflowRun{}, fmt.Errorf("ordinary task-revision parent cannot use an authoring Phase-1 handoff")
+			}
+		} else {
+			// A Standard authoring Run deliberately has no task/revision subject
+			// before materialize_task. Its one permitted task-bound child is
+			// nevertheless rooted in the AuthoringSession's target Task, proved
+			// by the immutable materialization receipt. Do not force the child to
+			// fabricate a TaskRevision parent just to satisfy this relationship.
+			if parent.SubjectKind != WorkflowRunSubjectAuthoringSession || parent.TaskID != "" || parent.RevisionID != "" || parent.AuthoringSessionID == "" {
+				return WorkflowRun{}, fmt.Errorf("parent workflow run belongs to another task")
+			}
+			if parent.WorkflowTemplateID != standardAuthoringParentTemplateID || parent.WorkflowTemplateVersion != standardAuthoringParentTemplateVersion ||
+				run.WorkflowTemplateID != codeEdgePhase1ChildTemplateID || run.WorkflowTemplateVersion != codeEdgePhase1ChildTemplateVersion ||
+				run.Trigger != standardAuthoringChildTrigger {
+				return WorkflowRun{}, fmt.Errorf("authoring parent may create only its closed CodeEdge Phase-1 child")
+			}
+			if authoringHandoffID == "" {
+				return WorkflowRun{}, fmt.Errorf("authoring parent requires a persisted Phase-1 handoff")
+			}
+			session, sessionErr := getAuthoringSessionTx(ctx, tx, parent.AuthoringSessionID)
+			if sessionErr != nil || session.TargetTaskID != run.TaskID {
+				if sessionErr != nil {
+					return WorkflowRun{}, sessionErr
+				}
+				return WorkflowRun{}, fmt.Errorf("authoring parent workflow run does not own child task")
+			}
+			materialization, materializationErr := getAuthoringTaskMaterializationByRunTx(ctx, tx, parent.ID)
+			if materializationErr != nil {
+				return WorkflowRun{}, fmt.Errorf("authoring parent workflow run has no durable task materialization: %w", materializationErr)
+			}
+			if materialization.SessionID != session.ID || materialization.TaskID != run.TaskID || materialization.RevisionID != run.RevisionID || materialization.TaskDigest != revision.TaskDigest {
+				return WorkflowRun{}, fmt.Errorf("authoring parent workflow run does not match child TaskRevision")
+			}
+			handoff, handoffErr := getAuthoringPhase1HandoffTx(ctx, tx, "id", authoringHandoffID)
+			if handoffErr != nil {
+				return WorkflowRun{}, fmt.Errorf("authoring parent has no persisted Phase-1 handoff: %w", handoffErr)
+			}
+			if handoff.AuthoringRunID != parent.ID || handoff.AuthoringSessionID != session.ID || handoff.TaskID != run.TaskID ||
+				handoff.RevisionID != run.RevisionID || handoff.TaskDigest != revision.TaskDigest || handoff.ChildRunID != run.ID {
+				return WorkflowRun{}, fmt.Errorf("authoring Phase-1 handoff does not match child Run")
+			}
 		}
+	} else if authoringHandoffID != "" {
+		return WorkflowRun{}, fmt.Errorf("authoring Phase-1 handoff requires an authoring parent Run")
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO workflow_runs (
@@ -119,7 +179,7 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 			task_id, revision_id, authoring_session_id, workflow_template_id, workflow_template_version,
 			resolved_profile_hash, definition_hash, run_manifest_json, parent_run_id,
 			trigger, execution_epoch, status, created_by, created_at, started_at, finished_at, version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
 	`, run.ID, run.SubjectKind, run.SubjectID, run.SubjectRevisionID, run.SubjectDigest,
 		run.TaskID, run.RevisionID, run.WorkflowTemplateID, run.WorkflowTemplateVersion,
 		run.ResolvedProfileHash, run.DefinitionHash, run.RunManifestJSON, nullableString(run.ParentRunID),
@@ -253,6 +313,35 @@ func (s *Store) ListWorkflowRunsForTask(ctx context.Context, taskID string) ([]W
 	}
 	defer rows.Close()
 	var runs []WorkflowRun
+	for rows.Next() {
+		run, err := scanWorkflowRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+// ListAuthoringWorkflowRunsForTargetTask returns pre-materialization Runs
+// whose AuthoringSession is owned by the draft Task. These Runs intentionally
+// have NULL task_id/revision_id and therefore must never be folded into the
+// task-revision list above.
+func (s *Store) ListAuthoringWorkflowRunsForTargetTask(ctx context.Context, taskID string) ([]WorkflowRun, error) {
+	if !isUUIDv7(taskID) {
+		return nil, ErrInvalidUUIDv7Identity
+	}
+	rows, err := s.db.QueryContext(ctx, workflowRunSelect+`
+		WHERE subject_kind = ?
+		  AND authoring_session_id IN (
+			SELECT id FROM authoring_sessions_v2 WHERE target_task_id = ?
+		  )
+		ORDER BY created_at DESC, id DESC`, WorkflowRunSubjectAuthoringSession, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	runs := make([]WorkflowRun, 0)
 	for rows.Next() {
 		run, err := scanWorkflowRun(rows)
 		if err != nil {

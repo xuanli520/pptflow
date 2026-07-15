@@ -310,7 +310,7 @@ func (runtime *FrozenExecutionRuntime) codeEdgeEvaluatorObservationRequest(ctx c
 		runtime:     runtime,
 		job:         job,
 		run:         run,
-		revision:    revision,
+		subject:     taskRevisionSubjectForLineage(run, revision),
 		frozen:      frozen,
 		payload:     payload,
 		stage:       stage.Clone(),

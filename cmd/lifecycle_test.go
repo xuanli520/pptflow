@@ -468,6 +468,67 @@ func executeReviewCommand(t *testing.T, ctx context.Context, config *lifecycleCL
 	return output.String(), err
 }
 
+func TestAuthoringReviewDecideCommandUsesSourceSessionGateWithoutTaskRevision(t *testing.T) {
+	ctx := context.Background()
+	if defaultLifecycleActor() == "" {
+		t.Skip("local OS actor is unavailable in this test environment")
+	}
+	root := t.TempDir()
+	services := openCommandLifecycle(t, root)
+	opened := commandOpenAuthoringReviewGate(t, ctx, services.Store())
+	if err := services.Store().Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &lifecycleCLIConfig{root: root}
+	key := commandLifecycleUUID(t)
+	args := []string{
+		"review", "decide", "--request", opened.Request.ID, "--action", string(store.ReviewDecisionApprove),
+		"--idempotency-key", key, "--reason", "approve frozen authoring gate",
+	}
+	output, err := executeAuthoringCommand(t, ctx, config, args)
+	if err != nil {
+		t.Fatalf("authoring review decide: %v\n%s", err, output)
+	}
+	var result store.AuthoringReviewGateDecisionResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("decode authoring review decision output: %v\n%s", err, output)
+	}
+	if result.Request.ID != opened.Request.ID || result.Binding.ID != opened.Binding.ID || result.Decision.Action != store.ReviewDecisionApprove ||
+		result.ResolutionJob.CommandType != store.AuthoringReviewGateResolutionCommandType || result.ResolutionJob.RunID != opened.Run.ID ||
+		result.ResolutionJob.StageAttemptID != opened.StageAttempt.ID {
+		t.Fatalf("authoring review CLI result lost source/session gate lineage: %+v", result)
+	}
+
+	replayOutput, err := executeAuthoringCommand(t, ctx, config, args)
+	if err != nil {
+		t.Fatalf("authoring review replay: %v\n%s", err, replayOutput)
+	}
+	var replay store.AuthoringReviewGateDecisionResult
+	if err := json.Unmarshal([]byte(replayOutput), &replay); err != nil {
+		t.Fatalf("decode authoring review replay output: %v\n%s", err, replayOutput)
+	}
+	if replay.Decision.ID != result.Decision.ID || replay.ResolutionJob.ID != result.ResolutionJob.ID {
+		t.Fatalf("authoring review CLI replay created a different durable result: first=%+v replay=%+v", result, replay)
+	}
+	check := openCommandLifecycle(t, root)
+	defer check.Store().Close()
+	if generic, err := check.Store().GetReviewRequest(ctx, opened.Request.ID); err != nil || generic != nil {
+		t.Fatalf("authoring review command wrote task-review state: request=%+v err=%v", generic, err)
+	}
+}
+
+func executeAuthoringCommand(t *testing.T, ctx context.Context, config *lifecycleCLIConfig, args []string) (string, error) {
+	t.Helper()
+	command := newAuthoringCommand(config)
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetErr(&output)
+	command.SetArgs(args)
+	err := command.ExecuteContext(ctx)
+	return output.String(), err
+}
+
 func TestReleasePackageAndWithdrawCommandsReplayV12Receipts(t *testing.T) {
 	ctx := context.Background()
 	actor := defaultLifecycleActor()
@@ -865,6 +926,66 @@ func openCommandLifecycle(t *testing.T, root string) *app.LifecycleServices {
 		t.Fatal(err)
 	}
 	return services
+}
+
+func commandOpenAuthoringReviewGate(t *testing.T, ctx context.Context, database *store.Store) store.AuthoringReviewGateOpenResult {
+	t.Helper()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
+		SnapshotArtifactRef: digest, SnapshotContentDigest: digest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
+		IdempotencyKey: "command-authoring-source-" + t.Name(), Actor: "author", Reason: "freeze command authoring source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := database.CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: "command-authoring-review-" + strings.ToLower(strings.ReplaceAll(t.Name(), "_", "-")), Title: "Command authoring review",
+		SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA, Actor: "author", Reason: "reserve draft task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.0.0",
+		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "command-authoring-session-" + t.Name(), Actor: "author", Reason: "freeze authoring session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID, WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:command-authoring-profile", DefinitionHash: "sha256:command-authoring-definition",
+		RunManifestJSON: `{}`, Trigger: "task.generate", Actor: "author", Reason: "start authoring run",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning, Actor: "author", Reason: "run authoring fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: run.ID, StageKey: "task_review", StageGroup: "authoring", Ordinal: 1,
+		InputFingerprint: "sha256:command-authoring-review-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		Actor: "author", Reason: "prepare review gate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := database.OpenAuthoringReviewGate(ctx, store.OpenAuthoringReviewGateRequest{
+		IdempotencyKey: "open-command-authoring-review-" + stage.ID, RunID: run.ID, AuthoringSessionID: session.ID, AuthoringSourceID: source.ID,
+		SourceSnapshotDigest: source.SnapshotContentDigest, ExpectedRunVersion: run.Version, DefinitionHash: run.DefinitionHash,
+		StageAttemptID: stage.ID, ExpectedStageAttemptVersion: stage.Version, StageKey: stage.StageKey, ReviewKind: "task_direction",
+		NodeGeneration: 0, NodeAttemptOrdinal: 1, InputBindingsJSON: `{"ports":["repo_analysis"]}`,
+		InputFingerprint: stage.InputFingerprint, EvidenceManifestDigest: "sha256:command-authoring-review-evidence", Actor: "worker", Reason: "open source/session review gate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return opened
 }
 
 func writeCommandTaskSnapshot(t *testing.T, instruction string) string {

@@ -26,7 +26,7 @@ func TestAuthoringSourceSessionAndRunFreezePreRevisionSubject(t *testing.T) {
 		SourceID: source.ID, TargetTaskID: task.ID,
 		WorkflowTemplateID: "harbor.task-lifecycle", WorkflowTemplateVersion: "2.2.0",
 		SessionManifestJSON: `{"mode":"standard","source_snapshot":"readonly"}`,
-		IdempotencyKey: "session-a", Actor: "author", Reason: "freeze Standard authoring intent",
+		IdempotencyKey:      "session-a", Actor: "author", Reason: "freeze Standard authoring intent",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -39,16 +39,20 @@ func TestAuthoringSourceSessionAndRunFreezePreRevisionSubject(t *testing.T) {
 		WorkflowTemplateID: "harbor.task-lifecycle", WorkflowTemplateVersion: "2.2.0",
 		ResolvedProfileHash: "sha256:profile", DefinitionHash: "sha256:definition",
 		RunManifestJSON: `{"template":"harbor.task-lifecycle","mode":"standard"}`,
-		Trigger: "task.generate", Actor: "author", Reason: "start source-bound authoring",
+		Trigger:         "task.generate", Actor: "author", Reason: "start source-bound authoring",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !isUUIDv7(run.ID) || run.SubjectKind != WorkflowRunSubjectAuthoringSession || run.AuthoringSessionID != session.ID || run.TaskID != "" || run.RevisionID != "" {
+	if !isUUIDv7(run.ID) || run.SubjectKind != WorkflowRunSubjectAuthoringSession || run.AuthoringSessionID != session.ID ||
+		run.SubjectID != source.ID || run.SubjectRevisionID != session.ID || run.SubjectDigest != source.SnapshotContentDigest ||
+		run.TaskID != "" || run.RevisionID != "" {
 		t.Fatalf("authoring run has an invalid subject binding: %+v", run)
 	}
 	loadedRun, err := s.GetWorkflowRun(ctx, run.ID)
-	if err != nil || loadedRun == nil || loadedRun.SubjectKind != WorkflowRunSubjectAuthoringSession || loadedRun.AuthoringSessionID != session.ID || loadedRun.TaskID != "" || loadedRun.RevisionID != "" {
+	if err != nil || loadedRun == nil || loadedRun.SubjectKind != WorkflowRunSubjectAuthoringSession || loadedRun.AuthoringSessionID != session.ID ||
+		loadedRun.SubjectID != source.ID || loadedRun.SubjectRevisionID != session.ID || loadedRun.SubjectDigest != source.SnapshotContentDigest ||
+		loadedRun.TaskID != "" || loadedRun.RevisionID != "" {
 		t.Fatalf("loaded authoring run did not preserve nullable task/revision subject: %+v err=%v", loadedRun, err)
 	}
 	loadedSession, err := s.GetAuthoringSessionForRun(ctx, run.ID)
@@ -82,6 +86,51 @@ func TestAuthoringSourceSessionAndRunFreezePreRevisionSubject(t *testing.T) {
 	}
 	if _, err := s.db.Exec(`UPDATE workflow_runs SET subject_kind = 'task_revision' WHERE id = ?`, run.ID); err == nil {
 		t.Fatal("authoring workflow run was rebound to a task revision")
+	}
+}
+
+func TestListAuthoringWorkflowRunsForTargetTaskUsesSessionOwnership(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	source := createAuthoringSourceFixture(t, ctx, s, "list-authoring-runs-source")
+	task, err := s.CreateTaskV2(ctx, CreateTaskV2Request{
+		Slug: "list-authoring-runs", Title: "List authoring runs", SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA,
+		Actor: "author", Reason: "reserve draft task ownership",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTask, err := s.CreateTaskV2(ctx, CreateTaskV2Request{
+		Slug: "list-authoring-runs-other", Title: "Other draft", SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA,
+		Actor: "author", Reason: "reserve other draft task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := s.CreateAuthoringSession(ctx, CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.0.0",
+		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "list-authoring-runs-session", Actor: "author", Reason: "freeze authoring session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.CreateAuthoringWorkflowRun(ctx, CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID, WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:list-authoring-profile", DefinitionHash: "sha256:list-authoring-definition",
+		RunManifestJSON: `{}`, Trigger: "task.generate", Actor: "author", Reason: "create authoring Run",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := s.ListAuthoringWorkflowRunsForTargetTask(ctx, task.ID)
+	if err != nil || len(owned) != 1 || owned[0].ID != run.ID || owned[0].TaskID != "" || owned[0].RevisionID != "" {
+		t.Fatalf("authoring runs by session-owned task=%+v err=%v", owned, err)
+	}
+	if generic, err := s.ListWorkflowRunsForTask(ctx, task.ID); err != nil || len(generic) != 0 {
+		t.Fatalf("pre-materialization Run leaked into task-revision run listing: %+v err=%v", generic, err)
+	}
+	if other, err := s.ListAuthoringWorkflowRunsForTargetTask(ctx, otherTask.ID); err != nil || len(other) != 0 {
+		t.Fatalf("authoring Run leaked to unrelated task ownership: %+v err=%v", other, err)
 	}
 }
 
@@ -195,16 +244,88 @@ func TestAuthoringSourceGlobalIdentityAndRunSubjectExclusivity(t *testing.T) {
 	}
 	if _, err := s.db.Exec(`
 		INSERT INTO workflow_runs (
-			id, subject_kind, task_id, revision_id, authoring_session_id,
+			id, subject_kind, subject_id, subject_revision_id, subject_digest,
+			task_id, revision_id, authoring_session_id,
 			workflow_template_id, workflow_template_version, resolved_profile_hash,
 			definition_hash, run_manifest_json, trigger, execution_epoch, status,
 			created_by, created_at, version
-		) VALUES (?, 'authoring_session', ?, NULL, ?, 'harbor.task-lifecycle', '2.2.0', 'profile', 'definition', '{}', 'forged', 0, 'queued', 'author', CURRENT_TIMESTAMP, 1)
-	`, mustUUIDv7(t), draft.ID, session.ID); err == nil {
-		t.Fatal("a workflow run was allowed to mix task and authoring-session subjects")
+		) VALUES (?, 'authoring_session', ?, ?, ?, NULL, NULL, ?, 'harbor.task-lifecycle', '2.2.0', 'profile', 'definition', '{}', 'forged', 0, 'queued', 'author', CURRENT_TIMESTAMP, 1)
+	`, mustUUIDv7(t), session.ID, source.ID, source.SourceFingerprint, session.ID); err == nil || !strings.Contains(err.Error(), "workflow run subject binding") {
+		t.Fatalf("swapped authoring generic subject error=%v, want workflow run subject binding rejection", err)
 	}
 	if loaded, err := s.GetAuthoringSessionForRun(ctx, run.ID); err != nil || loaded == nil || loaded.ID != session.ID {
 		t.Fatalf("authoring session lookup lost exclusive run binding: %+v err=%v", loaded, err)
+	}
+}
+
+func TestMaterializeAuthoringTaskAtomicallyBridgesTheGenericSourceSessionSubject(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	source := createAuthoringSourceFixture(t, ctx, s, "source-materialize")
+	task, err := s.CreateTaskV2(ctx, CreateTaskV2Request{
+		Slug: "tower-http-materialization", Title: "Tower HTTP materialization draft",
+		SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA,
+		Actor: "author", Reason: "reserve revision-free draft",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := s.CreateAuthoringSession(ctx, CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID,
+		WorkflowTemplateID: "harbor.task-lifecycle", WorkflowTemplateVersion: "2.2.0",
+		SessionManifestJSON: `{"mode":"standard"}`,
+		IdempotencyKey:      "session-materialize", Actor: "author", Reason: "freeze materialization contract",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.CreateAuthoringWorkflowRun(ctx, CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID,
+		WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:profile", DefinitionHash: "sha256:definition",
+		RunManifestJSON: `{}`, Trigger: "task.generate", Actor: "author", Reason: "start authoring",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SubjectID != source.ID || run.SubjectRevisionID != session.ID || run.SubjectDigest != source.SnapshotContentDigest || run.SubjectDigest == source.SourceFingerprint {
+		t.Fatalf("authoring run did not retain the generic source/session snapshot subject: %+v source=%+v", run, source)
+	}
+	run, err = s.TransitionWorkflowRun(ctx, TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: WorkflowRunRunning,
+		Actor: "author", Reason: "materialize generated task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := MaterializeAuthoringTaskRequest{
+		IdempotencyKey: "materialize-authoring-task", AuthoringSessionID: session.ID, AuthoringRunID: run.ID,
+		ExpectedTaskVersion: task.Version, ExpectedRunVersion: run.Version,
+		TaskDigest: validTaskDigest("d"), ProposalDigest: "proposal-sha256", ManifestID: "authoring-manifest",
+		ChangeSummary: "initial generated task", MetadataJSON: `{"source":"tower-http"}`,
+		Actor: "author", Reason: "sealed authoring handoff",
+	}
+	result, err := s.MaterializeAuthoringTask(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Task.ID != task.ID || result.Task.Version != task.Version+1 || result.Revision.TaskID != task.ID ||
+		result.Revision.VersionNumber != 1 || result.Revision.Origin != RevisionOriginGenerated || result.Revision.State != RevisionStateSealed ||
+		result.Materialization.SessionID != session.ID || result.Materialization.SourceID != source.ID || result.Materialization.AuthoringRunID != run.ID ||
+		result.Materialization.SourceFingerprint != source.SourceFingerprint {
+		t.Fatalf("materialization did not preserve its immutable source/session/revision lineage: %+v", result)
+	}
+	input, err := s.GetAuthoringRunInputArtifactForPort(ctx, run.ID, authoringSourceSnapshotInputPort)
+	if err != nil || input == nil || input.SourceID != source.ID || input.SessionID != session.ID || input.ContentDigest != source.SnapshotContentDigest {
+		t.Fatalf("authoring source input was not retained as immutable evidence: input=%+v err=%v", input, err)
+	}
+	replayed, err := s.MaterializeAuthoringTask(ctx, request)
+	if err != nil || replayed.Revision.ID != result.Revision.ID || replayed.Materialization.ID != result.Materialization.ID {
+		t.Fatalf("materialization replay did not recover the committed receipt: %+v err=%v", replayed, err)
+	}
+	request.TaskDigest = validTaskDigest("e")
+	if _, err := s.MaterializeAuthoringTask(ctx, request); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed materialization replay err=%v, want idempotency conflict", err)
 	}
 }
 

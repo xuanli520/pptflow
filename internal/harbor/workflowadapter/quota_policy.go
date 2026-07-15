@@ -17,6 +17,13 @@ const (
 	StandardQuotaPolicyID      = "harbor.local.operator"
 	StandardQuotaPolicyVersion = "1.0.0"
 
+	// StandardAuthoringQuotaPolicyID and Version identify the bounded source
+	// session authoring policy. It carries only stage-attempt and agent-turn
+	// accounts: task-bound trial, repair, verification, and packaging quota
+	// begins only in the explicit child Run after materialization handoff.
+	StandardAuthoringQuotaPolicyID      = "harbor.standard-authoring.local.operator"
+	StandardAuthoringQuotaPolicyVersion = "1.0.0"
+
 	// CodeEdgePhase1QuotaPolicyID and Version identify the explicit quota
 	// policy for the closed Phase-1 compliance descriptor. It is separate from
 	// Standard because Phase-1 has no implicit authoring or repair stage budget.
@@ -360,6 +367,27 @@ func StandardQuotaPolicy() QuotaPolicy {
 			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
 			{Dimension: "trial", TaskLimitUnits: standardTaskTrialLimit, ActorLimitUnits: standardActorTrialLimit},
 			{Dimension: "repair_round", TaskLimitUnits: standardTaskRepairRoundLimit, ActorLimitUnits: standardActorRepairRoundLimit},
+		},
+		Stages: stages,
+	}
+}
+
+// StandardAuthoringQuotaPolicy returns the explicit pre-materialization quota
+// policy. It has no trial or repair-round account because this closed template
+// cannot invoke Qwen/Opus, repair a task revision, or package a task. The
+// child CodeEdge Phase-1 Run owns those task-bound capabilities separately.
+func StandardAuthoringQuotaPolicy() QuotaPolicy {
+	catalog := StandardAuthoringStageCatalog()
+	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
+	for _, stage := range catalog.Stages {
+		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: standardClaimsForStage(stage)})
+	}
+	return QuotaPolicy{
+		ID:      StandardAuthoringQuotaPolicyID,
+		Version: StandardAuthoringQuotaPolicyVersion,
+		AccountLimits: []QuotaAccountLimit{
+			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
+			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
 		},
 		Stages: stages,
 	}

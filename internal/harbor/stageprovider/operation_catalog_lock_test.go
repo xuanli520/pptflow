@@ -224,6 +224,48 @@ func TestDeploymentOperationCatalogLockRecordPinsContainerAndAgentIdentities(t *
 	}
 }
 
+func TestDeploymentOperationCatalogLockRecordPinsHarborBuiltinIdentity(t *testing.T) {
+	catalog, lock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare)
+	builtin := lock.Operations[0].Clone()
+	builtin.Operation.Payload = workflowadapter.HarborBuiltinOperationPayload{HandlerID: "standard-authoring.materialize-task"}
+	builtin.ExecutionKind = workflowadapter.StageOperationPayloadHarborBuiltin
+	builtin.LocalExecutable = nil
+	builtin.HarborFlowBuiltin = &HarborFlowBuiltinOperationLock{
+		Format: HarborFlowBuiltinOperationLockFormat, Version: HarborFlowBuiltinOperationLockVersion,
+		HandlerID: "standard-authoring.materialize-task", HandlerVersion: "1.0.0",
+	}
+	if err := builtin.Validate(); err != nil {
+		t.Fatalf("validate Harbor built-in record: %v", err)
+	}
+
+	wrongHandler := builtin.Clone()
+	wrongHandler.HarborFlowBuiltin.HandlerID = "standard-authoring.other"
+	if err := wrongHandler.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("mismatched Harbor built-in handler = %v, want invalid lock", err)
+	}
+	withExecutable := builtin.Clone()
+	withExecutable.LocalExecutable = &LocalExecutableLock{
+		CommandID: "unrelated", AbsolutePath: "/opt/harbor/bin/unrelated", Version: "v1.0.0",
+		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("unrelated")),
+	}
+	if err := withExecutable.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("Harbor built-in with executable = %v, want invalid lock", err)
+	}
+
+	catalogDocument := catalog.Catalog()
+	catalogDocument.Operations[0].Operation = builtin.Operation.Clone()
+	builtinCatalog, err := NewDeploymentOperationCatalogResolver(catalogDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builtinLock := lock.Clone()
+	builtinLock.CatalogReceipt = builtinCatalog.Receipt()
+	builtinLock.Operations[0] = builtin
+	if _, err := NewDeploymentOperationCatalogLockResolver(builtinCatalog, builtinLock); err != nil {
+		t.Fatalf("construct exact Harbor built-in catalog/lock: %v", err)
+	}
+}
+
 func TestCatalogLockAttestedResolverRejectsStaticDriftAndMissingOrFailedAttestationBeforeDelegate(t *testing.T) {
 	catalog, lock, resolutions := operationCatalogLockFixture(t, workflowadapter.RepoPrepare)
 	verifier, err := NewDeploymentOperationCatalogLockResolver(catalog, lock)

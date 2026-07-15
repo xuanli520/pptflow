@@ -182,28 +182,35 @@ type DecideReviewLifecycleCommand struct {
 // payload stored in the V12 operation result, allowing a retry to return the
 // original identities without recomputing against newer lifecycle state.
 type LifecycleMutationReceipt struct {
-	Action                              LifecycleMutationAction `json:"action"`
-	OperationID                         string                  `json:"operation_id"`
-	TaskID                              string                  `json:"task_id,omitempty"`
-	TaskVersion                         int64                   `json:"task_version,omitempty"`
-	RevisionID                          string                  `json:"revision_id,omitempty"`
-	RevisionStateVersion                int64                   `json:"revision_state_version,omitempty"`
-	RunID                               string                  `json:"run_id,omitempty"`
-	ParentRunID                         string                  `json:"parent_run_id,omitempty"`
-	ChildRunID                          string                  `json:"child_run_id,omitempty"`
-	RunVersion                          int64                   `json:"run_version,omitempty"`
-	EvaluatorEvidenceHandoffID          string                  `json:"evaluator_evidence_handoff_id,omitempty"`
-	EvaluatorEvidenceHandoffFingerprint string                  `json:"evaluator_evidence_handoff_fingerprint,omitempty"`
-	ReleaseID                           string                  `json:"release_id,omitempty"`
-	ReleaseVersion                      string                  `json:"release_version,omitempty"`
-	DeletionRecordID                    string                  `json:"deletion_record_id,omitempty"`
-	ReviewRequestID                     string                  `json:"review_request_id,omitempty"`
-	ReviewDecisionID                    string                  `json:"review_decision_id,omitempty"`
-	ReviewDecision                      string                  `json:"review_decision,omitempty"`
-	PlanID                              string                  `json:"plan_id,omitempty"`
-	ExecutionID                         string                  `json:"execution_id,omitempty"`
-	CandidateID                         string                  `json:"candidate_id,omitempty"`
-	Summary                             string                  `json:"summary"`
+	Action               LifecycleMutationAction `json:"action"`
+	OperationID          string                  `json:"operation_id"`
+	TaskID               string                  `json:"task_id,omitempty"`
+	TaskVersion          int64                   `json:"task_version,omitempty"`
+	RevisionID           string                  `json:"revision_id,omitempty"`
+	RevisionStateVersion int64                   `json:"revision_state_version,omitempty"`
+	RunID                string                  `json:"run_id,omitempty"`
+	ParentRunID          string                  `json:"parent_run_id,omitempty"`
+	ChildRunID           string                  `json:"child_run_id,omitempty"`
+	RunVersion           int64                   `json:"run_version,omitempty"`
+	// AuthoringSourceID/AuthoringSessionID are populated only by the closed
+	// Standard pre-materialization launch. They make the source/session subject
+	// observable without pretending that the revision-free draft Task is a
+	// TaskRevision.
+	AuthoringSourceID                   string `json:"authoring_source_id,omitempty"`
+	AuthoringSessionID                  string `json:"authoring_session_id,omitempty"`
+	SourceSnapshotDigest                string `json:"source_snapshot_digest,omitempty"`
+	EvaluatorEvidenceHandoffID          string `json:"evaluator_evidence_handoff_id,omitempty"`
+	EvaluatorEvidenceHandoffFingerprint string `json:"evaluator_evidence_handoff_fingerprint,omitempty"`
+	ReleaseID                           string `json:"release_id,omitempty"`
+	ReleaseVersion                      string `json:"release_version,omitempty"`
+	DeletionRecordID                    string `json:"deletion_record_id,omitempty"`
+	ReviewRequestID                     string `json:"review_request_id,omitempty"`
+	ReviewDecisionID                    string `json:"review_decision_id,omitempty"`
+	ReviewDecision                      string `json:"review_decision,omitempty"`
+	PlanID                              string `json:"plan_id,omitempty"`
+	ExecutionID                         string `json:"execution_id,omitempty"`
+	CandidateID                         string `json:"candidate_id,omitempty"`
+	Summary                             string `json:"summary"`
 }
 
 // LifecycleMutationService is the typed application boundary for Task Hub

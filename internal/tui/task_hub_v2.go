@@ -74,20 +74,22 @@ type TaskHubActionState struct {
 // It contains stable identities and summary facts, never a mutable workspace
 // path or database handle.
 type TaskHubTask struct {
-	TaskID                 string               `json:"task_id"`
-	Name                   string               `json:"name"`
-	Lifecycle              string               `json:"lifecycle"`
-	RevisionID             string               `json:"revision_id,omitempty"`
-	Revision               string               `json:"revision,omitempty"`
-	TaskDigest             string               `json:"task_digest,omitempty"`
-	LatestRelease          string               `json:"latest_release,omitempty"`
-	ActiveReview           string               `json:"active_review,omitempty"`
-	ActiveReviewID         string               `json:"active_review_id,omitempty"`
-	ActiveReviewRevisionID string               `json:"active_review_revision_id,omitempty"`
-	ActiveRepair           string               `json:"active_repair,omitempty"`
-	ArtifactBytes          int64                `json:"artifact_bytes,omitempty"`
-	UpdatedAt              time.Time            `json:"updated_at"`
-	Actions                []TaskHubActionState `json:"actions,omitempty"`
+	TaskID                     string               `json:"task_id"`
+	Name                       string               `json:"name"`
+	Lifecycle                  string               `json:"lifecycle"`
+	RevisionID                 string               `json:"revision_id,omitempty"`
+	Revision                   string               `json:"revision,omitempty"`
+	TaskDigest                 string               `json:"task_digest,omitempty"`
+	LatestRelease              string               `json:"latest_release,omitempty"`
+	ActiveReview               string               `json:"active_review,omitempty"`
+	ActiveReviewID             string               `json:"active_review_id,omitempty"`
+	ActiveReviewRevisionID     string               `json:"active_review_revision_id,omitempty"`
+	ActiveAuthoringReviewID    string               `json:"active_authoring_review_id,omitempty"`
+	ActiveAuthoringReviewRunID string               `json:"active_authoring_review_run_id,omitempty"`
+	ActiveRepair               string               `json:"active_repair,omitempty"`
+	ArtifactBytes              int64                `json:"artifact_bytes,omitempty"`
+	UpdatedAt                  time.Time            `json:"updated_at"`
+	Actions                    []TaskHubActionState `json:"actions,omitempty"`
 }
 
 // Clone returns an independent projection value.
@@ -158,6 +160,23 @@ type TaskHubLifecycleCheckpoint struct {
 	ReviewRevisionID                 string `json:"review_revision_id,omitempty"`
 	ReviewState                      string `json:"review_state,omitempty"`
 	ReviewEvidenceDigest             string `json:"review_evidence_digest,omitempty"`
+}
+
+// TaskHubAuthoringReviewCheckpoint is the source/session review counterpart
+// to TaskHubLifecycleCheckpoint. It never contains a TaskRevision identity.
+type TaskHubAuthoringReviewCheckpoint struct {
+	ReviewRequestID        string `json:"review_request_id,omitempty"`
+	BindingID              string `json:"binding_id,omitempty"`
+	RunID                  string `json:"run_id,omitempty"`
+	AuthoringSessionID     string `json:"authoring_session_id,omitempty"`
+	AuthoringSourceID      string `json:"authoring_source_id,omitempty"`
+	SourceSnapshotDigest   string `json:"source_snapshot_digest,omitempty"`
+	DefinitionHash         string `json:"definition_hash,omitempty"`
+	StageAttemptID         string `json:"stage_attempt_id,omitempty"`
+	InputFingerprint       string `json:"input_fingerprint,omitempty"`
+	EvidenceManifestDigest string `json:"evidence_manifest_digest,omitempty"`
+	RunVersion             int64  `json:"run_version,omitempty"`
+	StageAttemptVersion    int64  `json:"stage_attempt_version,omitempty"`
 }
 
 // TaskHubRunControl is a read-only summary of the durable control facts that
@@ -314,7 +333,10 @@ type TaskHubTarget struct {
 	StageAttemptID   string `json:"stage_attempt_id,omitempty"`
 	ReviewRequestID  string `json:"review_request_id,omitempty"`
 	ReviewRevisionID string `json:"review_revision_id,omitempty"`
-	ReleaseID        string `json:"release_id,omitempty"`
+	// AuthoringReviewRequestID names a source/session gate and is never
+	// interpreted as a TaskRevision ReviewRequest.
+	AuthoringReviewRequestID string `json:"authoring_review_request_id,omitempty"`
+	ReleaseID                string `json:"release_id,omitempty"`
 }
 
 // TaskHubCommand is a plan request. The service may use CommandID to make a
@@ -328,18 +350,19 @@ type TaskHubCommand struct {
 // TaskHubPlanPreview is a UI projection of a frozen lifecycle plan. It keeps
 // the planner explanation visible before any confirmation/execution step.
 type TaskHubPlanPreview struct {
-	PlanID              string                     `json:"plan_id,omitempty"`
-	Title               string                     `json:"title"`
-	Summary             string                     `json:"summary"`
-	Reason              string                     `json:"reason,omitempty"`
-	RevisionImpact      string                     `json:"revision_impact,omitempty"`
-	ExecutionScope      []string                   `json:"execution_scope,omitempty"`
-	InvalidatedEvidence []string                   `json:"invalidated_evidence,omitempty"`
-	ReusedEvidence      []string                   `json:"reused_evidence,omitempty"`
-	BudgetImpact        string                     `json:"budget_impact,omitempty"`
-	ExternalEffects     []string                   `json:"external_effects,omitempty"`
-	ConfirmationNeeded  bool                       `json:"confirmation_needed"`
-	Expected            TaskHubLifecycleCheckpoint `json:"expected,omitempty"`
+	PlanID                  string                           `json:"plan_id,omitempty"`
+	Title                   string                           `json:"title"`
+	Summary                 string                           `json:"summary"`
+	Reason                  string                           `json:"reason,omitempty"`
+	RevisionImpact          string                           `json:"revision_impact,omitempty"`
+	ExecutionScope          []string                         `json:"execution_scope,omitempty"`
+	InvalidatedEvidence     []string                         `json:"invalidated_evidence,omitempty"`
+	ReusedEvidence          []string                         `json:"reused_evidence,omitempty"`
+	BudgetImpact            string                           `json:"budget_impact,omitempty"`
+	ExternalEffects         []string                         `json:"external_effects,omitempty"`
+	ConfirmationNeeded      bool                             `json:"confirmation_needed"`
+	Expected                TaskHubLifecycleCheckpoint       `json:"expected,omitempty"`
+	AuthoringReviewExpected TaskHubAuthoringReviewCheckpoint `json:"authoring_review_expected,omitempty"`
 }
 
 // Clone returns an independent plan preview.
@@ -409,14 +432,15 @@ type TaskHubLifecycleService interface {
 // fields such as a local package version or import snapshot source. It never
 // carries a mutable target workspace, database path, or execution default.
 type TaskHubMutationRequest struct {
-	Action         TaskHubAction              `json:"action"`
-	Target         TaskHubTarget              `json:"target"`
-	PlanID         string                     `json:"plan_id,omitempty"`
-	Actor          string                     `json:"actor"`
-	Reason         string                     `json:"reason"`
-	IdempotencyKey string                     `json:"idempotency_key"`
-	Expected       TaskHubLifecycleCheckpoint `json:"expected"`
-	Values         map[string]string          `json:"values,omitempty"`
+	Action                  TaskHubAction                    `json:"action"`
+	Target                  TaskHubTarget                    `json:"target"`
+	PlanID                  string                           `json:"plan_id,omitempty"`
+	Actor                   string                           `json:"actor"`
+	Reason                  string                           `json:"reason"`
+	IdempotencyKey          string                           `json:"idempotency_key"`
+	Expected                TaskHubLifecycleCheckpoint       `json:"expected"`
+	AuthoringReviewExpected TaskHubAuthoringReviewCheckpoint `json:"authoring_review_expected,omitempty"`
+	Values                  map[string]string                `json:"values,omitempty"`
 }
 
 // Clone returns an independent command value for asynchronous Bubble Tea work.
@@ -560,18 +584,21 @@ type TaskHubRow struct {
 // facts are copies from TaskHubLifecycleService; it has no store or filesystem
 // pointer and cannot perform lifecycle mutations by itself.
 type TaskHubState struct {
-	Snapshot                 TaskHubSnapshot
-	Rows                     []TaskHubRow
-	Query                    TaskHubQuery
-	SelectedTaskID           string
-	SelectedRunID            string
-	SelectedReviewTaskID     string
-	SelectedReviewRequestID  string
-	SelectedReviewRevisionID string
-	SelectedReleaseTaskID    string
-	SelectedReleaseID        string
-	Loading                  bool
-	LastRefresh              time.Time
+	Snapshot                         TaskHubSnapshot
+	Rows                             []TaskHubRow
+	Query                            TaskHubQuery
+	SelectedTaskID                   string
+	SelectedRunID                    string
+	SelectedReviewTaskID             string
+	SelectedReviewRequestID          string
+	SelectedReviewRevisionID         string
+	SelectedAuthoringReviewTaskID    string
+	SelectedAuthoringReviewRequestID string
+	SelectedAuthoringReviewRunID     string
+	SelectedReleaseTaskID            string
+	SelectedReleaseID                string
+	Loading                          bool
+	LastRefresh                      time.Time
 }
 
 func newTaskHubState() TaskHubState {
@@ -602,6 +629,15 @@ func (state TaskHubState) selectedReviewForTask(taskID string) (requestID, revis
 	requestID = strings.TrimSpace(state.SelectedReviewRequestID)
 	revisionID = strings.TrimSpace(state.SelectedReviewRevisionID)
 	return requestID, revisionID, requestID != "" && revisionID != ""
+}
+
+func (state TaskHubState) selectedAuthoringReviewForTask(taskID string) (requestID, runID string, found bool) {
+	if strings.TrimSpace(state.SelectedAuthoringReviewTaskID) != strings.TrimSpace(taskID) {
+		return "", "", false
+	}
+	requestID = strings.TrimSpace(state.SelectedAuthoringReviewRequestID)
+	runID = strings.TrimSpace(state.SelectedAuthoringReviewRunID)
+	return requestID, runID, requestID != "" && runID != ""
 }
 
 func (state TaskHubState) selectedReleaseForTask(taskID string) (releaseID string, found bool) {
@@ -890,9 +926,13 @@ func (m *model) updateTaskHubDetailKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		switch m.taskHubDetail.Tab {
 		case TaskHubDetailFactsTab:
-			review, selected := m.taskHubDetail.cycleOpenReview(delta)
+			review, authoringReview, authoring, selected := m.taskHubDetail.cycleOpenReviewTarget(delta)
 			if !selected {
-				return m.showToast("当前详情没有可选择的打开 ReviewRequest", toastWarning)
+				return m.showToast("当前详情没有可选择的打开审核请求", toastWarning)
+			}
+			if authoring {
+				m.selectTaskHubDetailAuthoringReview(authoringReview)
+				return m.showToast("已选择 source/session 审核 "+shortTaskHubID(authoringReview.ReviewRequestID), toastSuccess)
 			}
 			m.selectTaskHubDetailReview(review)
 			return m.showToast("已选择 ReviewRequest "+shortTaskHubID(review.ReviewRequestID), toastSuccess)
@@ -939,6 +979,9 @@ func (m *model) restoreTaskHubDetailSelection() {
 	if requestID, _, found := m.taskHub.selectedReviewForTask(taskID); found {
 		m.taskHubDetail.SelectedReviewRequestID = requestID
 	}
+	if requestID, _, found := m.taskHub.selectedAuthoringReviewForTask(taskID); found {
+		m.taskHubDetail.SelectedAuthoringReviewRequestID = requestID
+	}
 	if releaseID, found := m.taskHub.selectedReleaseForTask(taskID); found {
 		m.taskHubDetail.SelectedReleaseID = releaseID
 	}
@@ -955,6 +998,27 @@ func (m *model) selectTaskHubDetailReview(review TaskHubReviewFact) {
 	m.taskHub.SelectedReviewTaskID = taskID
 	m.taskHub.SelectedReviewRequestID = strings.TrimSpace(review.ReviewRequestID)
 	m.taskHub.SelectedReviewRevisionID = strings.TrimSpace(review.RevisionID)
+	m.taskHub.SelectedAuthoringReviewTaskID = ""
+	m.taskHub.SelectedAuthoringReviewRequestID = ""
+	m.taskHub.SelectedAuthoringReviewRunID = ""
+	m.taskHubDetail.SelectedAuthoringReviewRequestID = ""
+}
+
+func (m *model) selectTaskHubDetailAuthoringReview(review TaskHubAuthoringReviewFact) {
+	if m == nil || m.taskHubDetail == nil {
+		return
+	}
+	taskID := strings.TrimSpace(m.taskHubDetail.Detail.Task.TaskID)
+	if taskID == "" {
+		taskID = strings.TrimSpace(m.taskHubDetail.Query.TaskID)
+	}
+	m.taskHub.SelectedAuthoringReviewTaskID = taskID
+	m.taskHub.SelectedAuthoringReviewRequestID = strings.TrimSpace(review.ReviewRequestID)
+	m.taskHub.SelectedAuthoringReviewRunID = strings.TrimSpace(review.RunID)
+	m.taskHub.SelectedReviewTaskID = ""
+	m.taskHub.SelectedReviewRequestID = ""
+	m.taskHub.SelectedReviewRevisionID = ""
+	m.taskHubDetail.SelectedReviewRequestID = ""
 }
 
 func (m *model) selectTaskHubDetailRelease(release TaskHubReleaseFact) {
@@ -985,6 +1049,14 @@ func (m *model) syncTaskHubDetailSelections() {
 	} else if m.taskHub.SelectedReviewTaskID == taskID {
 		m.taskHub.SelectedReviewRequestID = ""
 		m.taskHub.SelectedReviewRevisionID = ""
+	}
+	if review, found := m.taskHubDetail.selectedOpenAuthoringReview(); found {
+		m.taskHub.SelectedAuthoringReviewTaskID = taskID
+		m.taskHub.SelectedAuthoringReviewRequestID = review.ReviewRequestID
+		m.taskHub.SelectedAuthoringReviewRunID = review.RunID
+	} else if m.taskHub.SelectedAuthoringReviewTaskID == taskID {
+		m.taskHub.SelectedAuthoringReviewRequestID = ""
+		m.taskHub.SelectedAuthoringReviewRunID = ""
 	}
 	if release, found := m.taskHubDetail.selectedActiveRelease(); found {
 		m.taskHub.SelectedReleaseTaskID = taskID
@@ -1586,6 +1658,23 @@ func (m model) taskHubTarget() TaskHubTarget {
 }
 
 func (m model) applyTaskHubDetailTargetSelection(target TaskHubTarget) TaskHubTarget {
+	if requestID, runID, found := m.taskHub.selectedAuthoringReviewForTask(target.TaskID); found {
+		target.AuthoringReviewRequestID = requestID
+		target.RunID = runID
+		target.RevisionID = ""
+		target.ReviewRequestID = ""
+		target.ReviewRevisionID = ""
+		return target
+	}
+	if task := m.taskHubTaskByID(target.TaskID); task.TaskID != "" && strings.TrimSpace(task.ActiveAuthoringReviewID) != "" &&
+		strings.TrimSpace(task.ActiveAuthoringReviewRunID) != "" {
+		target.AuthoringReviewRequestID = strings.TrimSpace(task.ActiveAuthoringReviewID)
+		target.RunID = strings.TrimSpace(task.ActiveAuthoringReviewRunID)
+		target.RevisionID = ""
+		target.ReviewRequestID = ""
+		target.ReviewRevisionID = ""
+		return target
+	}
 	if requestID, revisionID, found := m.taskHub.selectedReviewForTask(target.TaskID); found {
 		target.ReviewRequestID = requestID
 		target.ReviewRevisionID = revisionID

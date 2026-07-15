@@ -36,13 +36,21 @@ type stageArtifactManifestIndex struct {
 // StageAttempts. It refuses references from another revision, workflow, or
 // run rather than selecting an arbitrary same-named file from a workspace.
 func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, revision store.TaskRevision, stage workflowkit.StageDescriptor) ([]workflowkit.ArtifactBinding, error) {
+	return resolveStageInputsForSubject(ctx, dataStore, objects, run, taskRevisionSubjectForLineage(run, revision), stage)
+}
+
+// resolveStageInputsForSubject is the subject-neutral artifact lineage
+// resolver used by the durable runtime.  TaskRevision callers retain the
+// small wrapper above; an AuthoringSession uses its source/session binding
+// without manufacturing a revision merely to reuse artifact plumbing.
+func resolveStageInputsForSubject(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, subject workflowRunSubject, stage workflowkit.StageDescriptor) ([]workflowkit.ArtifactBinding, error) {
 	if dataStore == nil {
 		return nil, fmt.Errorf("%w: artifact lineage store is required", ErrInvalidStageExecution)
 	}
 	if objects == nil {
 		return nil, fmt.Errorf("%w: artifact object store is required", ErrInvalidStageExecution)
 	}
-	managed, err := managedRunInputBindingsForStage(ctx, dataStore, objects, run, revision, stage)
+	managed, err := managedRunInputBindingsForStageForSubject(ctx, dataStore, objects, run, subject, stage)
 	if err != nil {
 		return nil, fmt.Errorf("%w: resolve managed run inputs for stage %q: %w", ErrInvalidStageExecution, stage.Key, err)
 	}
@@ -60,7 +68,7 @@ func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *wo
 			return nil, fmt.Errorf("list artifact refs for stage attempt %s: %w", attempt.ID, err)
 		}
 		for _, reference := range references {
-			if reference.RunID != run.ID || reference.SubjectRevisionID != revision.ID || reference.SubjectDigest != revision.TaskDigest || reference.WorkflowFingerprint != run.DefinitionHash || reference.StageKey != attempt.StageKey || reference.AttemptID != attempt.ID {
+			if reference.RunID != run.ID || reference.SubjectRevisionID != subject.subjectRevisionID() || reference.SubjectDigest != subject.subjectDigest() || reference.WorkflowFingerprint != run.DefinitionHash || reference.StageKey != attempt.StageKey || reference.AttemptID != attempt.ID {
 				return nil, fmt.Errorf("%w: artifact ref %s does not match frozen run lineage", ErrInvalidStageExecution, reference.ID)
 			}
 			current, exists := latest[reference.ArtifactKey]
@@ -88,7 +96,7 @@ func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *wo
 		if candidate.ref.SchemaVersion != input.SchemaVersion {
 			return nil, fmt.Errorf("%w: stage %q input %q has schema %q, want %q", ErrInvalidStageExecution, stage.Key, input.Name, candidate.ref.SchemaVersion, input.SchemaVersion)
 		}
-		if err := verifyStageArtifactCandidate(ctx, dataStore, objects, run, revision, candidate); err != nil {
+		if err := verifyStageArtifactCandidateForSubject(ctx, dataStore, objects, run, subject, candidate); err != nil {
 			if !input.Required && artifactObjectUnavailable(err) {
 				continue
 			}
@@ -109,10 +117,40 @@ func resolveStageInputs(ctx context.Context, dataStore *store.Store, objects *wo
 	return bindings, nil
 }
 
+func taskRevisionSubjectForLineage(run store.WorkflowRun, revision store.TaskRevision) workflowRunSubject {
+	subjectID := run.SubjectID
+	if subjectID == "" {
+		subjectID = run.TaskID
+	}
+	return workflowRunSubject{
+		Binding:  workflowkit.SubjectBinding{SubjectID: subjectID, RevisionID: revision.ID, Digest: workflowkit.SubjectDigest(revision.TaskDigest)},
+		Kind:     store.WorkflowRunSubjectTaskRevision,
+		Revision: &revision,
+	}
+}
+
 // managedRunInputBindingsForStage resolves only manifest-declared run inputs
 // from the final frozen spec. It runs before StageAttempt lineage selection so
 // a later same-named stage artifact can never shadow an intrinsic input.
 func managedRunInputBindingsForStage(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, revision store.TaskRevision, stage workflowkit.StageDescriptor) (map[string]workflowkit.ArtifactBinding, error) {
+	return managedRunInputBindingsForStageForSubject(ctx, dataStore, objects, run, taskRevisionSubjectForLineage(run, revision), stage)
+}
+
+func managedRunInputBindingsForStageForSubject(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, subject workflowRunSubject, stage workflowkit.StageDescriptor) (map[string]workflowkit.ArtifactBinding, error) {
+	if subject.isAuthoringSession() {
+		var manifest runManifest
+		if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
+			return nil, fmt.Errorf("decode authoring Run manifest: %w", err)
+		}
+		if len(manifest.Inputs.ManagedInputs) != 0 {
+			return nil, fmt.Errorf("authoring Run declares unsupported task-revision managed inputs")
+		}
+		return nil, nil
+	}
+	if !subject.isTaskRevision() || subject.Revision == nil {
+		return nil, fmt.Errorf("artifact lineage has an unsupported workflow subject")
+	}
+	revision := *subject.Revision
 	var manifest runManifest
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
 		return nil, fmt.Errorf("decode run manifest: %w", err)
@@ -178,6 +216,10 @@ func managedRunInputBindingsForStage(ctx context.Context, dataStore *store.Store
 // a same-named artifact from a later attempt, so a plugin cannot bypass frozen
 // lineage by opening the object store directly.
 func newStageInputReader(dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, revision store.TaskRevision, bindings []workflowkit.ArtifactBinding) func(context.Context, workflowkit.ArtifactBinding) ([]byte, error) {
+	return newStageInputReaderForSubject(dataStore, objects, run, taskRevisionSubjectForLineage(run, revision), bindings)
+}
+
+func newStageInputReaderForSubject(dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, subject workflowRunSubject, bindings []workflowkit.ArtifactBinding) func(context.Context, workflowkit.ArtifactBinding) ([]byte, error) {
 	allowed := make(map[workflowkit.ArtifactID]workflowkit.ArtifactBinding, len(bindings))
 	for _, binding := range bindings {
 		allowed[binding.ArtifactID] = binding
@@ -193,26 +235,28 @@ func newStageInputReader(dataStore *store.Store, objects *workflowruntime.Artifa
 		if dataStore == nil || objects == nil {
 			return nil, fmt.Errorf("%w: stage input reader is not configured", ErrInvalidStageExecution)
 		}
-		managed, managedErr := readManagedRunInput(ctx, dataStore, objects, run, revision, requested)
-		if managedErr != nil {
-			return nil, fmt.Errorf("%w: managed run input: %w", ErrInvalidStageExecution, managedErr)
-		}
-		if managed != nil {
-			return managed, nil
+		if subject.isTaskRevision() {
+			managed, managedErr := readManagedRunInput(ctx, dataStore, objects, run, *subject.Revision, requested)
+			if managedErr != nil {
+				return nil, fmt.Errorf("%w: managed run input: %w", ErrInvalidStageExecution, managedErr)
+			}
+			if managed != nil {
+				return managed, nil
+			}
 		}
 		reference, err := dataStore.GetArtifactRef(ctx, string(requested.ArtifactID))
 		if err != nil {
 			return nil, err
 		}
 		if reference == nil || reference.ContentDigest != string(requested.ContentDigest) || reference.SchemaVersion != requested.SchemaVersion || reference.ArtifactKey != requested.Name ||
-			reference.RunID != run.ID || reference.SubjectRevisionID != revision.ID || reference.SubjectDigest != revision.TaskDigest || reference.WorkflowFingerprint != run.DefinitionHash {
+			reference.RunID != run.ID || reference.SubjectRevisionID != subject.subjectRevisionID() || reference.SubjectDigest != subject.subjectDigest() || reference.WorkflowFingerprint != run.DefinitionHash {
 			return nil, fmt.Errorf("%w: requested input no longer matches its frozen lineage", ErrInvalidStageExecution)
 		}
 		index, err := loadStageArtifactManifestIndex(ctx, dataStore, reference.ManifestID)
 		if err != nil {
 			return nil, err
 		}
-		if index.manifest.SubjectRevisionID != revision.ID || index.manifest.SubjectDigest != revision.TaskDigest || index.manifest.WorkflowFingerprint != run.DefinitionHash || index.payload.RunID != run.ID ||
+		if index.manifest.SubjectRevisionID != subject.subjectRevisionID() || index.manifest.SubjectDigest != subject.subjectDigest() || index.manifest.WorkflowFingerprint != run.DefinitionHash || index.payload.RunID != run.ID ||
 			index.payload.StageAttemptID != reference.AttemptID || string(index.payload.StageKey) != reference.StageKey {
 			return nil, fmt.Errorf("%w: requested input manifest does not match frozen lineage", ErrInvalidStageExecution)
 		}
@@ -364,21 +408,29 @@ func (index stageArtifactManifestIndex) objectFor(reference store.ArtifactRef) (
 }
 
 func verifyStageArtifactCandidate(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, revision store.TaskRevision, candidate stageArtifactCandidate) error {
+	return verifyStageArtifactCandidateForSubject(ctx, dataStore, objects, run, taskRevisionSubjectForLineage(run, revision), candidate)
+}
+
+func verifyStageArtifactCandidateForSubject(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, subject workflowRunSubject, candidate stageArtifactCandidate) error {
 	index, err := loadStageArtifactManifestIndex(ctx, dataStore, candidate.ref.ManifestID)
 	if err != nil {
 		return err
 	}
-	return verifyStageArtifactCandidateWithManifest(ctx, objects, index, run, revision, candidate)
+	return verifyStageArtifactCandidateWithManifestForSubject(ctx, objects, index, run, subject, candidate)
 }
 
 func verifyStageArtifactCandidateWithManifest(ctx context.Context, objects *workflowruntime.ArtifactObjectStore, index stageArtifactManifestIndex, run store.WorkflowRun, revision store.TaskRevision, candidate stageArtifactCandidate) error {
+	return verifyStageArtifactCandidateWithManifestForSubject(ctx, objects, index, run, taskRevisionSubjectForLineage(run, revision), candidate)
+}
+
+func verifyStageArtifactCandidateWithManifestForSubject(ctx context.Context, objects *workflowruntime.ArtifactObjectStore, index stageArtifactManifestIndex, run store.WorkflowRun, subject workflowRunSubject, candidate stageArtifactCandidate) error {
 	if objects == nil {
 		return fmt.Errorf("artifact object store is required")
 	}
-	if index.manifest.SubjectRevisionID != revision.ID || index.manifest.SubjectDigest != revision.TaskDigest || index.manifest.WorkflowFingerprint != run.DefinitionHash ||
+	if index.manifest.SubjectRevisionID != subject.subjectRevisionID() || index.manifest.SubjectDigest != subject.subjectDigest() || index.manifest.WorkflowFingerprint != run.DefinitionHash ||
 		index.payload.RunID != run.ID || index.payload.StageAttemptID != candidate.attempt.ID || string(index.payload.StageKey) != candidate.attempt.StageKey ||
-		candidate.ref.AttemptID != candidate.attempt.ID || candidate.ref.RunID != run.ID || candidate.ref.SubjectRevisionID != revision.ID ||
-		candidate.ref.SubjectDigest != revision.TaskDigest || candidate.ref.WorkflowFingerprint != run.DefinitionHash || candidate.ref.StageKey != candidate.attempt.StageKey {
+		candidate.ref.AttemptID != candidate.attempt.ID || candidate.ref.RunID != run.ID || candidate.ref.SubjectRevisionID != subject.subjectRevisionID() ||
+		candidate.ref.SubjectDigest != subject.subjectDigest() || candidate.ref.WorkflowFingerprint != run.DefinitionHash || candidate.ref.StageKey != candidate.attempt.StageKey {
 		return fmt.Errorf("artifact ref %s does not match immutable stage lineage", candidate.ref.ID)
 	}
 	object, err := index.objectFor(candidate.ref)
@@ -392,7 +444,11 @@ func verifyStageArtifactCandidateWithManifest(ctx context.Context, objects *work
 // store then records immutable manifest/ref lineage. It has no code path that
 // creates a synthetic artifact for a completed stage.
 func persistStageArtifacts(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, revision store.TaskRevision, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string) (store.ArtifactManifest, []store.ArtifactRef, error) {
-	return persistStageArtifactsWithCompleteness(ctx, core, run, revision, stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason, true)
+	return persistStageArtifactsForSubject(ctx, core, run, taskRevisionSubjectForLineage(run, revision), stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason)
+}
+
+func persistStageArtifactsForSubject(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, subject workflowRunSubject, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string) (store.ArtifactManifest, []store.ArtifactRef, error) {
+	return persistStageArtifactsWithCompletenessForSubject(ctx, core, run, subject, stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason, true)
 }
 
 // persistStageEvidence records declared partial artifacts produced by a failed
@@ -400,12 +456,23 @@ func persistStageArtifacts(ctx context.Context, core *lifecycleServiceCore, run 
 // resolveStageInputs deliberately considers manifests from completed attempts
 // exclusively, so diagnostic bytes can never become downstream workflow input.
 func persistStageEvidence(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, revision store.TaskRevision, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string) (store.ArtifactManifest, []store.ArtifactRef, error) {
-	return persistStageArtifactsWithCompleteness(ctx, core, run, revision, stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason, false)
+	return persistStageEvidenceForSubject(ctx, core, run, taskRevisionSubjectForLineage(run, revision), stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason)
+}
+
+func persistStageEvidenceForSubject(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, subject workflowRunSubject, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string) (store.ArtifactManifest, []store.ArtifactRef, error) {
+	return persistStageArtifactsWithCompletenessForSubject(ctx, core, run, subject, stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason, false)
 }
 
 func persistStageArtifactsWithCompleteness(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, revision store.TaskRevision, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string, requireComplete bool) (store.ArtifactManifest, []store.ArtifactRef, error) {
+	return persistStageArtifactsWithCompletenessForSubject(ctx, core, run, taskRevisionSubjectForLineage(run, revision), stageAttempt, nodeAttempt, stage, inputs, artifacts, actor, reason, requireComplete)
+}
+
+func persistStageArtifactsWithCompletenessForSubject(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, subject workflowRunSubject, stageAttempt store.StageAttempt, nodeAttempt store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, artifacts []StageArtifact, actor, reason string, requireComplete bool) (store.ArtifactManifest, []store.ArtifactRef, error) {
 	if core == nil || core.store == nil || core.objects == nil {
 		return store.ArtifactManifest{}, nil, fmt.Errorf("%w: artifact persistence is not configured", ErrInvalidStageExecution)
+	}
+	if !subject.isTaskRevision() && !subject.isAuthoringSession() {
+		return store.ArtifactManifest{}, nil, fmt.Errorf("%w: artifact persistence has an unsupported workflow subject", ErrInvalidStageExecution)
 	}
 	if err := validateStageArtifactsForPersistence(stage, artifacts, requireComplete); err != nil {
 		return store.ArtifactManifest{}, nil, err
@@ -416,8 +483,15 @@ func persistStageArtifactsWithCompleteness(ctx context.Context, core *lifecycleS
 	}
 	outputs := append([]StageArtifact(nil), artifacts...)
 	sort.Slice(outputs, func(left, right int) bool { return outputs[left].Key < outputs[right].Key })
+	reservedIDs := make(map[string]struct{}, len(outputs))
 	objects := make([]stageArtifactObject, 0, len(outputs))
 	for _, output := range outputs {
+		if output.ID != "" {
+			if _, duplicate := reservedIDs[output.ID]; duplicate {
+				return store.ArtifactManifest{}, nil, fmt.Errorf("%w: stage %q returned duplicate reserved artifact ID %s", ErrInvalidStageExecution, stage.Key, output.ID)
+			}
+			reservedIDs[output.ID] = struct{}{}
+		}
 		object, err := core.objects.PutBytes(ctx, output.Content)
 		if err != nil {
 			return store.ArtifactManifest{}, nil, fmt.Errorf("publish immutable output %q: %w", output.Key, err)
@@ -439,7 +513,7 @@ func persistStageArtifactsWithCompleteness(ctx context.Context, core *lifecycleS
 	}
 	baseKey := "stage-artifact:" + stageAttempt.ID
 	manifest, err := core.store.CreateArtifactManifest(ctx, store.CreateArtifactManifestRequest{
-		SubjectRevisionID: revision.ID, SubjectDigest: revision.TaskDigest, WorkflowFingerprint: run.DefinitionHash,
+		SubjectRevisionID: subject.subjectRevisionID(), SubjectDigest: subject.subjectDigest(), WorkflowFingerprint: run.DefinitionHash,
 		ManifestJSON: string(encodedManifest), ManifestFingerprint: string(manifestFingerprint), IdempotencyKey: baseKey + ":manifest",
 		Actor: actor, Reason: reason,
 	})
@@ -452,10 +526,17 @@ func persistStageArtifactsWithCompleteness(ctx context.Context, core *lifecycleS
 	}
 	references := make([]store.ArtifactRef, 0, len(objects))
 	for _, output := range objects {
+		reservedID := ""
+		for _, artifact := range outputs {
+			if artifact.Key == output.Key {
+				reservedID = artifact.ID
+				break
+			}
+		}
 		reference, err := core.store.CreateArtifactRef(ctx, store.CreateArtifactRefRequest{
-			ManifestID: manifest.ID, ArtifactKey: output.Key, ContentDigest: string(output.Digest), SchemaVersion: output.SchemaVersion,
+			ID: reservedID, ManifestID: manifest.ID, ArtifactKey: output.Key, ContentDigest: string(output.Digest), SchemaVersion: output.SchemaVersion,
 			RunID: run.ID, StageKey: string(stage.Key), AttemptID: stageAttempt.ID, TurnOrdinal: output.TurnOrdinal,
-			SubjectRevisionID: revision.ID, SubjectDigest: revision.TaskDigest, WorkflowFingerprint: run.DefinitionHash,
+			SubjectRevisionID: subject.subjectRevisionID(), SubjectDigest: subject.subjectDigest(), WorkflowFingerprint: run.DefinitionHash,
 			InputBindingsJSON: string(encodedInputs), InputFingerprint: string(inputFingerprint), ProducerVersion: stage.Version,
 			IdempotencyKey: baseKey + ":artifact:" + output.Key, Actor: actor, Reason: reason,
 		})

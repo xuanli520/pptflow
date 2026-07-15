@@ -567,7 +567,7 @@ func TestWorkflowkitEngineBridgeRejectsManifestExecutionSpecDriftFromManagedInpu
 	}
 	tampered := fixture.run
 	tampered.RunManifestJSON = string(encoded)
-	bridge := &workflowkitStageBackend{callContext: ctx, runtime: runtime, run: tampered, revision: fixture.revision, frozen: fixture.frozen}
+	bridge := &workflowkitStageBackend{callContext: ctx, runtime: runtime, run: tampered, subject: taskRevisionSubjectForLineage(tampered, fixture.revision), frozen: fixture.frozen}
 	if _, err := bridge.frozenExecution(); !errors.Is(err, ErrFrozenExecutionPayload) {
 		t.Fatalf("public Engine bridge accepted manifest execution specification drift: %v", err)
 	}

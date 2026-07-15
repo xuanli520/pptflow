@@ -317,6 +317,11 @@ const (
 	ControlOperationFailed            ControlOperationStatus = "failed"
 )
 
+// AuthoringSessionControlSubjectVersion is the stable control-coordinate
+// version for an immutable AuthoringSession. A pre-materialization Run has no
+// TaskRevision and must not borrow its draft Task's mutable version.
+const AuthoringSessionControlSubjectVersion int64 = 0
+
 type ControlCheckpointRef struct {
 	Sequence            uint64
 	ExecutionEpoch      int

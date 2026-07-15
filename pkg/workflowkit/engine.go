@@ -768,10 +768,17 @@ func (usage StageUsage) validate() error {
 // an infrastructure error is valid and intentionally preserves failure
 // evidence.
 type StageArtifact struct {
-	Name          string `json:"name"`
-	SchemaVersion string `json:"schema_version"`
-	Content       []byte `json:"content"`
-	TurnOrdinal   int    `json:"turn_ordinal"`
+	// ID is an optional, executor-reserved persistent artifact identity.  Most
+	// generic executors leave it empty and the durable backend allocates an ID
+	// while publishing the result.  A closed domain operation may reserve one
+	// before it emits a typed handoff that must name another output in the same
+	// atomic stage result (for example, Standard authoring's task handoff).
+	// The backend remains responsible for validating global identity rules.
+	ID            ArtifactID `json:"id,omitempty"`
+	Name          string     `json:"name"`
+	SchemaVersion string     `json:"schema_version"`
+	Content       []byte     `json:"content"`
+	TurnOrdinal   int        `json:"turn_ordinal"`
 }
 
 // StageWaitKind identifies a nonterminal executor handoff. The kernel has one
@@ -817,6 +824,11 @@ func (artifact StageArtifact) Clone() StageArtifact {
 }
 
 func (artifact StageArtifact) validate() error {
+	if artifact.ID != "" {
+		if err := validateRequired("stage artifact id", string(artifact.ID), ErrInvalidStageResult); err != nil {
+			return err
+		}
+	}
 	if err := validateRequired("stage artifact name", artifact.Name, ErrInvalidStageResult); err != nil {
 		return err
 	}

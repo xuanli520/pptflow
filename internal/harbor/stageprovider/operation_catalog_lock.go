@@ -267,6 +267,12 @@ type DeploymentOperationCatalogLockRecord struct {
 	CodexAppServer      *CodexAppServerOperationLock  `json:"codex_app_server,omitempty"`
 	DurableReviewPolicy *DurableReviewPolicyLock      `json:"durable_review_policy,omitempty"`
 	HarborEvaluator     *HarborEvaluatorOperationLock `json:"harbor_evaluator,omitempty"`
+	// StandardAuthoringContract binds the deployment-relative prompt and
+	// schema assets used by one operation in the closed Standard authoring
+	// template. Its raw content identities remain the record's existing
+	// PromptContentFingerprint and SchemaContentFingerprint, so there is only
+	// one authoritative hash for each asset.
+	StandardAuthoringContract *StandardAuthoringContractLock `json:"standard_authoring_contract,omitempty"`
 }
 
 // Clone returns an independently owned lock record. Resolver accessors and
@@ -302,6 +308,10 @@ func (record DeploymentOperationCatalogLockRecord) Clone() DeploymentOperationCa
 	if record.HarborEvaluator != nil {
 		evaluator := record.HarborEvaluator.Clone()
 		record.HarborEvaluator = &evaluator
+	}
+	if record.StandardAuthoringContract != nil {
+		contract := record.StandardAuthoringContract.Clone()
+		record.StandardAuthoringContract = &contract
 	}
 	return record
 }
@@ -353,6 +363,11 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 	}
 	if err := record.SchemaContentFingerprint.Validate(); err != nil {
 		return fmt.Errorf("%w: schema content fingerprint: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	if record.StandardAuthoringContract != nil {
+		if err := record.StandardAuthoringContract.Validate(); err != nil {
+			return err
+		}
 	}
 	if record.Operation.Payload == nil {
 		return fmt.Errorf("%w: operation payload is required", ErrInvalidDeploymentOperationCatalogLock)
@@ -537,7 +552,7 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 		}
 		seen[coordinate] = struct{}{}
 	}
-	return nil
+	return validateStandardAuthoringLockContract(lock)
 }
 
 // CodeEdgeEvaluatorChildProfile returns the one complete child-owned profile

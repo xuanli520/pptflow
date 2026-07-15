@@ -1,0 +1,415 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
+)
+
+const (
+	standardAuthoringHandoffCommandType   = "standard_authoring.handoff"
+	standardAuthoringHandoffPayloadFormat = "harbor.standard-authoring-handoff-job.v1"
+	standardAuthoringHandoffRunTrigger    = "standard-authoring.materialized"
+)
+
+var (
+	// ErrCodeEdgePhase1DefinitionUnavailable is intentionally distinct from a
+	// generic Run-start error. A persisted authoring_task_handoff remains
+	// inspectable and retryable when this deployment has not installed the
+	// closed Phase-1 definition; the runtime must never invent a profile,
+	// provider, catalog, or external operation as a fallback.
+	ErrCodeEdgePhase1DefinitionUnavailable = errors.New("CodeEdge Phase-1 run definition is unavailable")
+	// ErrCodeEdgePhase1DefinitionInvalid masks deployment-provider details at
+	// this application boundary. Definition providers may inspect local
+	// deployment state, but an invalid result must not become a caller-visible
+	// source of endpoint, secret, or filesystem information.
+	ErrCodeEdgePhase1DefinitionInvalid = errors.New("CodeEdge Phase-1 run definition did not pass controlled validation")
+)
+
+// CodeEdgePhase1RunDefinitionRequest contains the complete immutable bridge
+// from Standard authoring to its task-bound child. It deliberately contains no
+// user-selected profile/specification, command, image, model, endpoint,
+// credential, or workspace path. Deployment composition is the only source of
+// the returned definition.
+type CodeEdgePhase1RunDefinitionRequest struct {
+	TaskID             string
+	RevisionID         string
+	RevisionDigest     workflowkit.SubjectDigest
+	AuthoringRunID     string
+	AuthoringSourceID  string
+	AuthoringSessionID string
+	TaskSnapshot       workflowadapter.ArtifactReference
+}
+
+// CodeEdgePhase1RunDefinition is the closed child definition supplied by a
+// deployment-owned provider. StartRun rebinds its intrinsic task_snapshot to
+// a fresh managed Run input after proving it is byte-identical to TaskSnapshot;
+// the provider therefore never obtains an object-store path or mutable task
+// directory.
+type CodeEdgePhase1RunDefinition struct {
+	Profile       workflowadapter.ExecutionProfile
+	ExecutionSpec workflowadapter.RunExecutionSpec
+}
+
+// CodeEdgePhase1RunDefinitionProvider is implemented only by controlled
+// deployment composition. CLI/TUI and source-authoring executors never create
+// one from user input or ambient command defaults.
+type CodeEdgePhase1RunDefinitionProvider interface {
+	DefinitionForCodeEdgePhase1Run(context.Context, CodeEdgePhase1RunDefinitionRequest) (CodeEdgePhase1RunDefinition, error)
+}
+
+// StandardAuthoringHandoffRequest is the durable job's closed input. All IDs
+// are allocated before the job is published; retries reuse the exact child Run
+// identity rather than allocating a second run after a crash.
+type StandardAuthoringHandoffRequest struct {
+	AuthoringRunID    string
+	StageAttemptID    string
+	HandoffArtifactID string
+	ChildRunID        string
+	Actor             string
+	Reason            string
+}
+
+// standardAuthoringHandoffPayload is intentionally small enough to be carried
+// by a durable local job. The artifact itself is re-read and fully verified at
+// execution time; this payload is an address, not an authority to fabricate a
+// task/revision handoff.
+type standardAuthoringHandoffPayload struct {
+	Format            string `json:"format"`
+	AuthoringRunID    string `json:"authoring_run_id"`
+	StageAttemptID    string `json:"stage_attempt_id"`
+	HandoffArtifactID string `json:"handoff_artifact_id"`
+	ChildRunID        string `json:"child_run_id"`
+}
+
+// StandardAuthoringHandoffService consumes a persisted materialize_task
+// receipt and freezes the independent task-bound CodeEdge Phase-1 Run. It is
+// intentionally an application lifecycle service, not an executor callback:
+// Stage output persistence is the authority boundary and this service never
+// starts task-bound work under the AuthoringSession subject.
+type StandardAuthoringHandoffService struct {
+	core        *lifecycleServiceCore
+	definitions CodeEdgePhase1RunDefinitionProvider
+}
+
+// Available reports whether a deployment has supplied the closed child
+// definition. False is fail-closed, not a reason to construct a generic
+// Phase-1 profile from the authoring Run.
+func (service *StandardAuthoringHandoffService) Available() bool {
+	return service != nil && service.core != nil && service.core.store != nil && service.definitions != nil
+}
+
+// Consume creates or replays exactly one child Run. It accepts only the
+// durable job coordinates, reloads the persisted handoff artifact, and checks
+// source/session/materialization/revision lineage before asking the deployment
+// provider for the frozen Phase-1 definition.
+func (service *StandardAuthoringHandoffService) Consume(ctx context.Context, request StandardAuthoringHandoffRequest) (store.WorkflowRun, error) {
+	if service == nil || service.core == nil || service.core.store == nil || service.core.objects == nil {
+		return store.WorkflowRun{}, fmt.Errorf("Standard authoring handoff service is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return store.WorkflowRun{}, err
+	}
+	for _, identity := range []struct {
+		label string
+		value string
+	}{
+		{"authoring Run", request.AuthoringRunID},
+		{"materialize stage attempt", request.StageAttemptID},
+		{"authoring task handoff artifact", request.HandoffArtifactID},
+		{"CodeEdge Phase-1 child Run", request.ChildRunID},
+	} {
+		if err := store.ValidateUUIDv7(strings.TrimSpace(identity.value)); err != nil {
+			return store.WorkflowRun{}, fmt.Errorf("Standard authoring handoff %s: %w", identity.label, err)
+		}
+	}
+
+	run, err := service.core.store.GetWorkflowRun(ctx, request.AuthoringRunID)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if run == nil {
+		return store.WorkflowRun{}, fmt.Errorf("%w: Standard authoring Run %s", ErrLifecycleNotFound, request.AuthoringRunID)
+	}
+	if run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
+		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion ||
+		run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+		return store.WorkflowRun{}, fmt.Errorf("Standard authoring handoff Run is not %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	}
+	subject, err := service.core.resolveWorkflowRunSubject(ctx, *run)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if !subject.isAuthoringSession() {
+		return store.WorkflowRun{}, fmt.Errorf("Standard authoring handoff Run has no source/session subject")
+	}
+
+	handoff, snapshot, err := service.readPersistedHandoff(ctx, *run, subject, request)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if err := service.validateMaterializedHandoff(ctx, *run, subject, handoff, snapshot); err != nil {
+		return store.WorkflowRun{}, err
+	}
+	handoffFingerprint, err := handoff.Fingerprint()
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	durableHandoff, err := service.core.store.PrepareAuthoringPhase1Handoff(ctx, store.PrepareAuthoringPhase1HandoffRequest{
+		AuthoringRunID:     run.ID,
+		AuthoringSessionID: handoff.AuthoringSessionID,
+		AuthoringSourceID:  handoff.AuthoringSourceID,
+		HandoffArtifactID:  request.HandoffArtifactID,
+		HandoffFingerprint: string(handoffFingerprint),
+		TaskID:             handoff.TaskID,
+		RevisionID:         handoff.RevisionID,
+		TaskDigest:         string(handoff.RevisionDigest),
+		ChildRunID:         request.ChildRunID,
+		IdempotencyKey:     "standard-authoring-phase1-handoff:" + run.ID,
+		Actor:              strings.TrimSpace(request.Actor),
+		Reason:             strings.TrimSpace(request.Reason),
+	})
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if err := validateDurableAuthoringPhase1Handoff(durableHandoff, *run, subject, handoff, request.HandoffArtifactID, handoffFingerprint); err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if existing, lookupErr := service.core.store.GetWorkflowRun(ctx, durableHandoff.ChildRunID); lookupErr != nil {
+		return store.WorkflowRun{}, lookupErr
+	} else if existing != nil {
+		if err := validateExistingAuthoringPhase1Child(*existing, durableHandoff, *run, handoff); err != nil {
+			return store.WorkflowRun{}, err
+		}
+		return *existing, nil
+	}
+	if service.definitions == nil {
+		// The prepared record and the original handoff artifact remain durable.
+		// A later controlled composition can consume the same record and its
+		// preallocated child identity without rerunning materialize_task.
+		return store.WorkflowRun{}, ErrCodeEdgePhase1DefinitionUnavailable
+	}
+
+	definition, err := service.definitions.DefinitionForCodeEdgePhase1Run(ctx, CodeEdgePhase1RunDefinitionRequest{
+		TaskID:             handoff.TaskID,
+		RevisionID:         handoff.RevisionID,
+		RevisionDigest:     handoff.RevisionDigest,
+		AuthoringRunID:     run.ID,
+		AuthoringSourceID:  handoff.AuthoringSourceID,
+		AuthoringSessionID: handoff.AuthoringSessionID,
+		TaskSnapshot:       handoff.TaskSnapshot,
+	})
+	if err != nil {
+		return store.WorkflowRun{}, ErrCodeEdgePhase1DefinitionInvalid
+	}
+	if err := validateCodeEdgePhase1HandoffDefinition(definition, handoff); err != nil {
+		return store.WorkflowRun{}, err
+	}
+
+	child, err := (&RunService{core: service.core}).StartRun(ctx, StartRunRequest{
+		ID:                       durableHandoff.ChildRunID,
+		TaskID:                   handoff.TaskID,
+		RevisionID:               handoff.RevisionID,
+		Profile:                  definition.Profile,
+		ExecutionSpec:            definition.ExecutionSpec,
+		ParentRunID:              run.ID,
+		authoringPhase1HandoffID: durableHandoff.ID,
+		Trigger:                  standardAuthoringHandoffRunTrigger,
+		ExecutionEpoch:           0,
+		Actor:                    strings.TrimSpace(request.Actor),
+		Reason:                   strings.TrimSpace(request.Reason),
+	})
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if err := validateExistingAuthoringPhase1Child(child, durableHandoff, *run, handoff); err != nil {
+		return store.WorkflowRun{}, err
+	}
+	return child, nil
+}
+
+func validateDurableAuthoringPhase1Handoff(record store.AuthoringPhase1Handoff, run store.WorkflowRun, subject workflowRunSubject, handoff workflowadapter.StandardAuthoringTaskHandoff, artifactID string, fingerprint workflowkit.Fingerprint) error {
+	if record.AuthoringRunID != run.ID || record.AuthoringSessionID != subject.AuthoringSession.ID || record.AuthoringSourceID != subject.AuthoringSource.ID ||
+		record.HandoffArtifactID != artifactID || record.HandoffFingerprint != string(fingerprint) || record.TaskID != handoff.TaskID ||
+		record.RevisionID != handoff.RevisionID || record.TaskDigest != string(handoff.RevisionDigest) {
+		return fmt.Errorf("%w: durable Standard authoring Phase-1 handoff differs from persisted receipt", store.ErrIdempotencyConflict)
+	}
+	return nil
+}
+
+func validateExistingAuthoringPhase1Child(child store.WorkflowRun, record store.AuthoringPhase1Handoff, parent store.WorkflowRun, handoff workflowadapter.StandardAuthoringTaskHandoff) error {
+	if child.ID != record.ChildRunID || child.ParentRunID != parent.ID || child.SubjectKind != store.WorkflowRunSubjectTaskRevision ||
+		child.TaskID != handoff.TaskID || child.RevisionID != handoff.RevisionID || child.SubjectDigest != string(handoff.RevisionDigest) ||
+		child.WorkflowTemplateID != workflowadapter.CodeEdgePhase1WorkflowTemplateID || child.WorkflowTemplateVersion != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion ||
+		child.Trigger != standardAuthoringHandoffRunTrigger {
+		return fmt.Errorf("%w: Standard authoring handoff child Run does not match frozen lineage", store.ErrIdempotencyConflict)
+	}
+	return nil
+}
+
+func validateCodeEdgePhase1HandoffDefinition(definition CodeEdgePhase1RunDefinition, handoff workflowadapter.StandardAuthoringTaskHandoff) error {
+	if !definition.Profile.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) ||
+		!definition.ExecutionSpec.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
+		return ErrCodeEdgePhase1DefinitionInvalid
+	}
+	selection, err := handoff.ChildSelection()
+	if err != nil {
+		return err
+	}
+	actualSelection, err := definition.ExecutionSpec.Selection.Canonical()
+	if err != nil || actualSelection != selection {
+		return ErrCodeEdgePhase1DefinitionInvalid
+	}
+	if err := definition.Profile.Validate(); err != nil {
+		return ErrCodeEdgePhase1DefinitionInvalid
+	}
+	if err := definition.ExecutionSpec.Validate(); err != nil {
+		return ErrCodeEdgePhase1DefinitionInvalid
+	}
+	return nil
+}
+
+// readPersistedHandoff verifies the exact completed materialize_task output
+// from its ArtifactRef and immutable manifest before parsing it. In
+// particular, a caller cannot pass JSON copied from a mutable workspace or a
+// similarly named artifact from another Run/attempt.
+func (service *StandardAuthoringHandoffService) readPersistedHandoff(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, request StandardAuthoringHandoffRequest) (workflowadapter.StandardAuthoringTaskHandoff, workflowadapter.ArtifactReference, error) {
+	attempt, err := service.core.store.GetStageAttempt(ctx, request.StageAttemptID)
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+	if attempt == nil || attempt.RunID != run.ID || attempt.StageKey != workflowadapter.MaterializeTask ||
+		attempt.ExecutionStatus != store.StageExecutionCompleted ||
+		(attempt.Verdict != store.VerdictPass && attempt.Verdict != store.VerdictAdvisory) || strings.TrimSpace(attempt.ArtifactManifestID) == "" {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("Standard authoring handoff does not reference a completed materialize_task stage")
+	}
+	reference, err := service.core.store.GetArtifactRef(ctx, request.HandoffArtifactID)
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+	if reference == nil || reference.ManifestID != attempt.ArtifactManifestID || reference.RunID != run.ID ||
+		reference.StageKey != workflowadapter.MaterializeTask || reference.AttemptID != attempt.ID ||
+		reference.ArtifactKey != workflowadapter.StandardAuthoringTaskHandoffArtifact ||
+		reference.SchemaVersion != workflowadapter.StandardAuthoringTaskHandoffSchemaVersion {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("Standard authoring handoff artifact does not match frozen materialize_task lineage")
+	}
+	index, err := loadStageArtifactManifestIndex(ctx, service.core.store, reference.ManifestID)
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+	candidate := stageArtifactCandidate{attempt: *attempt, ref: *reference}
+	if err := verifyStageArtifactCandidateWithManifestForSubject(ctx, service.core.objects, index, run, subject, candidate); err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+	object, err := index.objectFor(*reference)
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+	raw, err := service.core.objects.ReadAll(ctx, object)
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("read persisted Standard authoring handoff: %w", err)
+	}
+	handoff, err := workflowadapter.ParseStandardAuthoringTaskHandoffJSON(raw)
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+
+	references, err := service.core.store.ListArtifactRefs(ctx, reference.ManifestID)
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+	var snapshot *store.ArtifactRef
+	for index := range references {
+		candidate := &references[index]
+		if candidate.ArtifactKey != "task_snapshot" {
+			continue
+		}
+		if snapshot != nil {
+			return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("Standard authoring materialize_task has duplicate task_snapshot artifacts")
+		}
+		snapshot = candidate
+	}
+	if snapshot == nil || snapshot.ID != string(handoff.TaskSnapshot.ID) || snapshot.ContentDigest != string(handoff.TaskSnapshot.ContentDigest) ||
+		snapshot.SchemaVersion != handoff.TaskSnapshot.SchemaVersion || snapshot.RunID != run.ID || snapshot.StageKey != workflowadapter.MaterializeTask ||
+		snapshot.AttemptID != attempt.ID || snapshot.SubjectRevisionID != subject.subjectRevisionID() || snapshot.SubjectDigest != subject.subjectDigest() ||
+		snapshot.WorkflowFingerprint != run.DefinitionHash {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("Standard authoring handoff task_snapshot does not name its persisted stage artifact")
+	}
+	snapshotCandidate := stageArtifactCandidate{attempt: *attempt, ref: *snapshot}
+	if err := verifyStageArtifactCandidateWithManifestForSubject(ctx, service.core.objects, index, run, subject, snapshotCandidate); err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("verify Standard authoring handoff task_snapshot artifact: %w", err)
+	}
+	return handoff, handoff.TaskSnapshot, nil
+}
+
+func (service *StandardAuthoringHandoffService) validateMaterializedHandoff(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, handoff workflowadapter.StandardAuthoringTaskHandoff, snapshot workflowadapter.ArtifactReference) error {
+	if err := handoff.Validate(); err != nil {
+		return err
+	}
+	if handoff.AuthoringRunID != run.ID || handoff.AuthoringSourceID != subject.AuthoringSource.ID ||
+		handoff.AuthoringSessionID != subject.AuthoringSession.ID || handoff.AuthoringSourceDigest != workflowkit.SubjectDigest(subject.subjectDigest()) ||
+		handoff.TaskID != subject.TargetTask.ID || handoff.TaskSnapshot != snapshot {
+		return fmt.Errorf("Standard authoring handoff does not match its source/session Run")
+	}
+	materialization, err := service.core.store.GetAuthoringTaskMaterializationForRun(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if materialization == nil || materialization.SessionID != subject.AuthoringSession.ID || materialization.SourceID != subject.AuthoringSource.ID ||
+		materialization.TaskID != handoff.TaskID || materialization.RevisionID != handoff.RevisionID || materialization.TaskDigest != string(handoff.RevisionDigest) {
+		return fmt.Errorf("Standard authoring handoff has no matching durable task materialization")
+	}
+	revision, err := service.core.store.GetTaskRevision(ctx, handoff.RevisionID)
+	if err != nil {
+		return err
+	}
+	if revision == nil || revision.TaskID != handoff.TaskID || revision.TaskDigest != string(handoff.RevisionDigest) ||
+		revision.Origin != store.RevisionOriginGenerated || revision.State != store.RevisionStateSealed {
+		return fmt.Errorf("Standard authoring handoff revision is not the sealed generated materialization")
+	}
+	// The materialize stage's snapshot is a deterministic archive of this
+	// sealed revision. Recreate the archive from the managed snapshot and
+	// compare its content address before allowing a child to bind it.
+	expected, err := materializeManagedTaskSnapshotObject(ctx, service.core, *revision)
+	if err != nil {
+		return err
+	}
+	if expected.Digest != handoff.TaskSnapshot.ContentDigest {
+		return fmt.Errorf("Standard authoring handoff task_snapshot digest does not match sealed TaskRevision")
+	}
+	return nil
+}
+
+// standardAuthoringHandoffJobPayload validates a job without accepting a
+// caller-owned handoff document. It is shared by enqueue/recovery paths.
+func standardAuthoringHandoffJobPayload(job store.DurableJob) (standardAuthoringHandoffPayload, error) {
+	var payload standardAuthoringHandoffPayload
+	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
+		return standardAuthoringHandoffPayload{}, fmt.Errorf("decode Standard authoring handoff payload: %w", err)
+	}
+	if job.CommandType != standardAuthoringHandoffCommandType || job.EntityType != "artifact_ref" ||
+		payload.Format != standardAuthoringHandoffPayloadFormat || payload.AuthoringRunID != job.RunID ||
+		payload.StageAttemptID != job.StageAttemptID || payload.HandoffArtifactID != job.EntityID {
+		return standardAuthoringHandoffPayload{}, fmt.Errorf("Standard authoring handoff job does not match its immutable payload")
+	}
+	for _, identity := range []struct {
+		label string
+		value string
+	}{
+		{"authoring Run", payload.AuthoringRunID}, {"stage attempt", payload.StageAttemptID},
+		{"handoff artifact", payload.HandoffArtifactID}, {"child Run", payload.ChildRunID},
+	} {
+		if err := store.ValidateUUIDv7(identity.value); err != nil {
+			return standardAuthoringHandoffPayload{}, fmt.Errorf("Standard authoring handoff payload %s: %w", identity.label, err)
+		}
+	}
+	return payload, nil
+}

@@ -361,6 +361,9 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 			ConfirmationNeeded: false,
 		}, nil
 	case TaskHubActionApproveReview, TaskHubActionRequestChanges, TaskHubActionRejectReview:
+		if strings.TrimSpace(target.authoringReviewRequestID) != "" {
+			return adapter.planTaskHubAuthoringReview(ctx, services, command.Action, target)
+		}
 		if services.Mutations == nil {
 			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
 		}
@@ -947,6 +950,26 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 		}
 		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionApproveReview, TaskHubActionRequestChanges, TaskHubActionRejectReview:
+		if strings.TrimSpace(request.Target.AuthoringReviewRequestID) != "" {
+			if services.AuthoringReviews == nil {
+				return TaskHubMutationResult{}, fmt.Errorf("authoring review service is not configured")
+			}
+			if strings.TrimSpace(request.Target.AuthoringReviewRequestID) != strings.TrimSpace(request.AuthoringReviewExpected.ReviewRequestID) ||
+				strings.TrimSpace(request.Target.RunID) != strings.TrimSpace(request.AuthoringReviewExpected.RunID) {
+				return TaskHubMutationResult{}, fmt.Errorf("authoring review confirmation target differs from its frozen source/session checkpoint")
+			}
+			result, err := services.AuthoringReviews.Decide(ctx, app.DecideAuthoringReviewRequest{
+				IdempotencyKey: request.IdempotencyKey, Action: taskHubReviewDecisionAction(request.Action), Actor: request.Actor, Reason: request.Reason,
+				Expected: appAuthoringReviewCheckpoint(request.AuthoringReviewExpected),
+			})
+			if err != nil {
+				return TaskHubMutationResult{}, err
+			}
+			return TaskHubMutationResult{
+				Action: request.Action, Target: request.Target, ReceiptID: result.Decision.ID, ExecutionID: result.ResolutionJob.ID,
+				Summary: "已记录 source/session 审核决定，并排队本地受控 resolution job",
+			}, nil
+		}
 		if services.Mutations == nil {
 			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
 		}
@@ -1341,6 +1364,28 @@ func taskHubLifecycleCheckpoint(checkpoint app.LifecycleMutationCheckpoint) Task
 	}
 }
 
+func taskHubAuthoringReviewCheckpoint(checkpoint app.AuthoringReviewCheckpoint) TaskHubAuthoringReviewCheckpoint {
+	return TaskHubAuthoringReviewCheckpoint{
+		ReviewRequestID: checkpoint.ReviewRequestID, BindingID: checkpoint.BindingID, RunID: checkpoint.RunID,
+		AuthoringSessionID: checkpoint.AuthoringSessionID, AuthoringSourceID: checkpoint.AuthoringSourceID,
+		SourceSnapshotDigest: checkpoint.SourceSnapshotDigest, DefinitionHash: checkpoint.DefinitionHash,
+		StageAttemptID: checkpoint.StageAttemptID, InputFingerprint: checkpoint.InputFingerprint,
+		EvidenceManifestDigest: checkpoint.EvidenceManifestDigest, RunVersion: checkpoint.RunVersion,
+		StageAttemptVersion: checkpoint.StageAttemptVersion,
+	}
+}
+
+func appAuthoringReviewCheckpoint(checkpoint TaskHubAuthoringReviewCheckpoint) app.AuthoringReviewCheckpoint {
+	return app.AuthoringReviewCheckpoint{
+		ReviewRequestID: strings.TrimSpace(checkpoint.ReviewRequestID), BindingID: strings.TrimSpace(checkpoint.BindingID),
+		RunID: strings.TrimSpace(checkpoint.RunID), AuthoringSessionID: strings.TrimSpace(checkpoint.AuthoringSessionID),
+		AuthoringSourceID: strings.TrimSpace(checkpoint.AuthoringSourceID), SourceSnapshotDigest: strings.TrimSpace(checkpoint.SourceSnapshotDigest),
+		DefinitionHash: strings.TrimSpace(checkpoint.DefinitionHash), StageAttemptID: strings.TrimSpace(checkpoint.StageAttemptID),
+		InputFingerprint: strings.TrimSpace(checkpoint.InputFingerprint), EvidenceManifestDigest: strings.TrimSpace(checkpoint.EvidenceManifestDigest),
+		RunVersion: checkpoint.RunVersion, StageAttemptVersion: checkpoint.StageAttemptVersion,
+	}
+}
+
 func appLifecycleMutationCheckpoint(checkpoint TaskHubLifecycleCheckpoint) app.LifecycleMutationCheckpoint {
 	return app.LifecycleMutationCheckpoint{
 		TaskID:                           strings.TrimSpace(checkpoint.TaskID),
@@ -1472,6 +1517,63 @@ func (adapter *AppTaskHubLifecycleAdapter) openTaskHubReview(ctx context.Context
 	return open[0], "", nil
 }
 
+func (adapter *AppTaskHubLifecycleAdapter) planTaskHubAuthoringReview(ctx context.Context, services *app.LifecycleServices, action TaskHubAction, target taskHubResolvedTarget) (TaskHubPlanPreview, error) {
+	if services == nil || services.AuthoringReviews == nil {
+		return unavailableTaskHubPlan(action, "AuthoringReviewService 不可用"), nil
+	}
+	review, unavailable, err := adapter.openTaskHubAuthoringReview(ctx, services, target)
+	if err != nil {
+		return TaskHubPlanPreview{}, err
+	}
+	if unavailable != "" {
+		return unavailableTaskHubPlan(action, unavailable), nil
+	}
+	checkpoint, err := services.AuthoringReviews.CaptureCheckpoint(ctx, review.Request.ID)
+	if err != nil {
+		return TaskHubPlanPreview{}, err
+	}
+	if checkpoint.RunID != review.Binding.RunID || checkpoint.BindingID != review.Binding.ID || checkpoint.StageAttemptID != review.Binding.StageAttemptID {
+		return TaskHubPlanPreview{}, fmt.Errorf("authoring review checkpoint differs from inspected source/session gate")
+	}
+	return TaskHubPlanPreview{
+		Title:                   taskHubActionLabel(action),
+		Summary:                 "确认后将对冻结的 source/session 审核 gate 记录不可变决定，并排队本地受控 resolution job。",
+		Reason:                  "审核请求 " + review.Request.ID + " 当前处于 open 状态，绑定 AuthoringSession " + review.Binding.AuthoringSessionID + "。",
+		RevisionImpact:          "不会创建、伪造或修改 TaskRevision；决定只绑定冻结的 source/session、Run 与 StageAttempt。",
+		ExecutionScope:          []string{target.task.ID, review.Binding.AuthoringSourceID, review.Binding.AuthoringSessionID, review.Binding.RunID, review.Binding.StageAttemptID, review.Request.ID},
+		ConfirmationNeeded:      true,
+		AuthoringReviewExpected: taskHubAuthoringReviewCheckpoint(checkpoint),
+	}, nil
+}
+
+// openTaskHubAuthoringReview resolves only the explicit authoring request
+// selected in the detail surface. It never falls back to TaskRevision review
+// tables or guesses which source/session gate the operator meant.
+func (adapter *AppTaskHubLifecycleAdapter) openTaskHubAuthoringReview(ctx context.Context, services *app.LifecycleServices, target taskHubResolvedTarget) (app.AuthoringReviewGateSnapshot, string, error) {
+	if services == nil || services.AuthoringReviews == nil {
+		return app.AuthoringReviewGateSnapshot{}, "AuthoringReviewService 不可用", nil
+	}
+	requestID := strings.TrimSpace(target.authoringReviewRequestID)
+	if requestID == "" {
+		return app.AuthoringReviewGateSnapshot{}, "请从详情“证据/审核/返修”分类选择明确的 source/session 审核请求", nil
+	}
+	if target.run == nil || target.run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+		return app.AuthoringReviewGateSnapshot{}, "source/session 审核需要明确的 AuthoringSession Run", nil
+	}
+	review, err := services.AuthoringReviews.Inspect(ctx, requestID)
+	if err != nil {
+		return app.AuthoringReviewGateSnapshot{}, "", err
+	}
+	if review.Binding.RunID != target.run.ID || review.Run.ID != target.run.ID || review.Request.ID != requestID ||
+		review.Run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+		return app.AuthoringReviewGateSnapshot{}, "指定 source/session 审核请求不属于当前 AuthoringSession Run", nil
+	}
+	if review.State != store.AuthoringReviewGateOpen {
+		return app.AuthoringReviewGateSnapshot{}, "指定 source/session 审核请求已不再处于 open 状态", nil
+	}
+	return review, "", nil
+}
+
 func targetReviewRequestID(target taskHubResolvedTarget) string {
 	return target.reviewRequestID
 }
@@ -1566,6 +1668,10 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTask(ctx context.Context, serv
 	if err != nil {
 		return TaskHubTask{}, nil, nil, fmt.Errorf("list runs for Task %s: %w", task.ID, err)
 	}
+	authoringRuns, err := services.Store().ListAuthoringWorkflowRunsForTargetTask(ctx, task.ID)
+	if err != nil {
+		return TaskHubTask{}, nil, nil, fmt.Errorf("list AuthoringSession Runs for Task %s: %w", task.ID, err)
+	}
 	releases, err := services.Releases.List(ctx, task.ID)
 	if err != nil {
 		return TaskHubTask{}, nil, nil, fmt.Errorf("list local packages for Task %s: %w", task.ID, err)
@@ -1588,10 +1694,19 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTask(ctx context.Context, serv
 	if err != nil {
 		return TaskHubTask{}, nil, nil, err
 	}
+	activeAuthoringReview, err := appTaskHubSingleOpenAuthoringReview(ctx, services, task.ID)
+	if err != nil {
+		return TaskHubTask{}, nil, nil, err
+	}
 	if activeReview != nil {
 		projection.ActiveReview = "open"
 		projection.ActiveReviewID = activeReview.ID
 		projection.ActiveReviewRevisionID = activeReview.RevisionID
+	}
+	if activeReview == nil && activeAuthoringReview != nil {
+		projection.ActiveReview = "open"
+		projection.ActiveAuthoringReviewID = activeAuthoringReview.Request.ID
+		projection.ActiveAuthoringReviewRunID = activeAuthoringReview.Binding.RunID
 	}
 	codeEdgePackageUnavailable := ""
 	if current != nil {
@@ -1600,12 +1715,15 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTask(ctx context.Context, serv
 			return TaskHubTask{}, nil, nil, fmt.Errorf("read CodeEdge package authorization for Task %s: %w", task.ID, err)
 		}
 	}
-	projection.Actions = appTaskHubTaskActions(task, current, activeReview != nil, services.Mutations != nil, codeEdgePackageUnavailable)
+	projection.Actions = appTaskHubTaskActions(task, current, activeReview != nil || activeAuthoringReview != nil, services.Mutations != nil || services.AuthoringReviews != nil, codeEdgePackageUnavailable)
 
-	resultRuns := make([]TaskHubRun, 0, len(runs))
+	displayRuns := make([]store.WorkflowRun, 0, len(runs)+len(authoringRuns))
+	displayRuns = append(displayRuns, runs...)
+	displayRuns = append(displayRuns, authoringRuns...)
+	resultRuns := make([]TaskHubRun, 0, len(displayRuns))
 	queued := make([]taskHubQueuedRun, 0)
-	for _, run := range runs {
-		runProjection, projectErr := adapter.projectTaskHubRun(ctx, services, run)
+	for _, run := range displayRuns {
+		runProjection, projectErr := adapter.projectTaskHubRun(ctx, services, run, task.ID)
 		if projectErr != nil {
 			return TaskHubTask{}, nil, nil, projectErr
 		}
@@ -1643,20 +1761,75 @@ func appTaskHubSingleOpenReview(ctx context.Context, services *app.LifecycleServ
 	return active, nil
 }
 
-func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context, services *app.LifecycleServices, run store.WorkflowRun) (TaskHubRun, error) {
+// appTaskHubSingleOpenAuthoringReview finds one source/session gate owned by
+// a draft Task. Multiple open gates deliberately remain unselected: the
+// operator must choose one in the detail surface before a decision is planned.
+func appTaskHubSingleOpenAuthoringReview(ctx context.Context, services *app.LifecycleServices, taskID string) (*app.AuthoringReviewGateSnapshot, error) {
+	if services == nil || services.Store() == nil || services.AuthoringReviews == nil {
+		return nil, nil
+	}
+	runs, err := services.Store().ListAuthoringWorkflowRunsForTargetTask(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("list authoring Runs for Task Hub task %s: %w", taskID, err)
+	}
+	var active *app.AuthoringReviewGateSnapshot
+	for _, run := range runs {
+		stages, err := services.Store().ListStageAttemptsForRun(ctx, run.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list authoring stages for Run %s: %w", run.ID, err)
+		}
+		for _, stage := range stages {
+			binding, err := services.Store().GetAuthoringReviewGateBindingByStageAttempt(ctx, stage.ID)
+			if err != nil {
+				return nil, fmt.Errorf("read authoring review binding for stage %s: %w", stage.ID, err)
+			}
+			if binding == nil {
+				continue
+			}
+			review, err := services.AuthoringReviews.Inspect(ctx, binding.ReviewRequestID)
+			if err != nil {
+				return nil, fmt.Errorf("inspect authoring review %s: %w", binding.ReviewRequestID, err)
+			}
+			if review.State != store.AuthoringReviewGateOpen {
+				continue
+			}
+			if review.Binding.RunID != run.ID || review.Binding.StageAttemptID != stage.ID {
+				return nil, fmt.Errorf("authoring review %s differs from its task-owned Run/stage", review.Request.ID)
+			}
+			if active != nil {
+				return nil, nil
+			}
+			candidate := review
+			active = &candidate
+		}
+	}
+	return active, nil
+}
+
+func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context, services *app.LifecycleServices, run store.WorkflowRun, ownershipTaskID string) (TaskHubRun, error) {
+	if strings.TrimSpace(ownershipTaskID) == "" {
+		ownershipTaskID = run.TaskID
+	}
 	attachable := false
 	attachReason := "只有由有效 durable lease 持有的 running job 可以附着"
 	var attachment *app.RunAttachment
 	if taskHubRunIsActive(run.Status) && services.LocalRuntime != nil {
 		loaded, err := services.LocalRuntime.AttachRun(ctx, app.AttachRunRequest{RunID: run.ID})
 		if err != nil {
-			return TaskHubRun{}, fmt.Errorf("read local durable state for Run %s: %w", run.ID, err)
+			if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+				attachReason = "当前部署尚未公开 source/session Run 的本地 Attach capability"
+			} else {
+				return TaskHubRun{}, fmt.Errorf("read local durable state for Run %s: %w", run.ID, err)
+			}
+		} else {
+			attachment = &loaded
 		}
-		attachment = &loaded
 	}
 	if taskHubRunCanAttach(run.Status) {
 		if attachment == nil {
-			attachReason = "本地 durable runtime 附着服务不可用"
+			if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+				attachReason = "本地 durable runtime 附着服务不可用"
+			}
 		} else {
 			attachable = attachment.AttachableJobs > 0
 			if !attachable {
@@ -1673,7 +1846,7 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context
 	}
 	projection := TaskHubRun{
 		RunID:          run.ID,
-		TaskID:         run.TaskID,
+		TaskID:         ownershipTaskID,
 		RevisionID:     run.RevisionID,
 		ExecutionState: string(run.Status),
 		Active:         taskHubRunIsActive(run.Status),
@@ -1705,6 +1878,13 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context
 	}
 	checkpoint, err := services.Control.CurrentCheckpoint(ctx, run.ID)
 	if err != nil {
+		if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+			// The normal control service may not yet advertise source/session
+			// capability. Keep the Run visible with a capability-derived disabled
+			// projection; a later compatible backend will flow through unchanged.
+			projection.Control.Actions = appTaskHubRunControlActions(run, stage, false, services.LocalRuntime != nil)
+			return projection, nil
+		}
 		return TaskHubRun{}, fmt.Errorf("read control checkpoint for Run %s: %w", run.ID, err)
 	}
 	projection.Control.CheckpointSequence = checkpoint.Sequence
@@ -1712,11 +1892,19 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context
 	projection.Control.Expected = taskHubControlCheckpoint(checkpoint)
 	gracePeriod, err := services.Control.FrozenGracePeriod(ctx, run.ID)
 	if err != nil {
+		if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+			projection.Control.Actions = appTaskHubRunControlActions(run, stage, false, services.LocalRuntime != nil)
+			return projection, nil
+		}
 		return TaskHubRun{}, fmt.Errorf("read frozen control grace period for Run %s: %w", run.ID, err)
 	}
 	projection.Control.GracePeriod = gracePeriod
 	operations, err := services.Control.ListForRun(ctx, run.ID)
 	if err != nil {
+		if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+			projection.Control.Actions = appTaskHubRunControlActions(run, stage, false, services.LocalRuntime != nil)
+			return projection, nil
+		}
 		return TaskHubRun{}, fmt.Errorf("list control operations for Run %s: %w", run.ID, err)
 	}
 	if len(operations) > 0 {
@@ -2395,19 +2583,21 @@ func unavailableTaskHubPlan(action TaskHubAction, reason string) TaskHubPlanPrev
 }
 
 type taskHubResolvedTarget struct {
-	task             store.TaskV2
-	run              *store.WorkflowRun
-	revision         *store.TaskRevision
-	reviewRequestID  string
-	reviewRevisionID string
-	releaseID        string
+	task                     store.TaskV2
+	run                      *store.WorkflowRun
+	revision                 *store.TaskRevision
+	reviewRequestID          string
+	reviewRevisionID         string
+	authoringReviewRequestID string
+	releaseID                string
 }
 
 func (adapter *AppTaskHubLifecycleAdapter) resolveTaskHubTarget(ctx context.Context, services *app.LifecycleServices, target TaskHubTarget) (taskHubResolvedTarget, error) {
 	resolved := taskHubResolvedTarget{
-		reviewRequestID:  strings.TrimSpace(target.ReviewRequestID),
-		reviewRevisionID: strings.TrimSpace(target.ReviewRevisionID),
-		releaseID:        strings.TrimSpace(target.ReleaseID),
+		reviewRequestID:          strings.TrimSpace(target.ReviewRequestID),
+		reviewRevisionID:         strings.TrimSpace(target.ReviewRevisionID),
+		authoringReviewRequestID: strings.TrimSpace(target.AuthoringReviewRequestID),
+		releaseID:                strings.TrimSpace(target.ReleaseID),
 	}
 	if strings.TrimSpace(target.RunID) != "" {
 		run, err := services.Runs.Get(ctx, target.RunID)
@@ -2415,15 +2605,32 @@ func (adapter *AppTaskHubLifecycleAdapter) resolveTaskHubTarget(ctx context.Cont
 			return resolved, fmt.Errorf("get Run %s for Task Hub plan: %w", target.RunID, err)
 		}
 		resolved.run = &run
-		if target.TaskID != "" && target.TaskID != run.TaskID {
-			return resolved, fmt.Errorf("Task Hub target Run %s does not belong to Task %s", run.ID, target.TaskID)
-		}
-		if target.RevisionID != "" && target.RevisionID != run.RevisionID {
-			return resolved, fmt.Errorf("Task Hub target Run %s does not use revision %s", run.ID, target.RevisionID)
-		}
-		target.TaskID = run.TaskID
-		if target.RevisionID == "" {
-			target.RevisionID = run.RevisionID
+		if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+			session, err := services.Store().GetAuthoringSessionForRun(ctx, run.ID)
+			if err != nil {
+				return resolved, fmt.Errorf("get AuthoringSession for Task Hub Run %s: %w", run.ID, err)
+			}
+			if session == nil || strings.TrimSpace(session.TargetTaskID) == "" {
+				return resolved, fmt.Errorf("authoring Run %s has no draft Task ownership", run.ID)
+			}
+			if target.TaskID != "" && target.TaskID != session.TargetTaskID {
+				return resolved, fmt.Errorf("Task Hub target AuthoringSession Run %s does not belong to Task %s", run.ID, target.TaskID)
+			}
+			if target.RevisionID != "" {
+				return resolved, fmt.Errorf("Task Hub target AuthoringSession Run %s cannot use a TaskRevision", run.ID)
+			}
+			target.TaskID = session.TargetTaskID
+		} else {
+			if target.TaskID != "" && target.TaskID != run.TaskID {
+				return resolved, fmt.Errorf("Task Hub target Run %s does not belong to Task %s", run.ID, target.TaskID)
+			}
+			if target.RevisionID != "" && target.RevisionID != run.RevisionID {
+				return resolved, fmt.Errorf("Task Hub target Run %s does not use revision %s", run.ID, target.RevisionID)
+			}
+			target.TaskID = run.TaskID
+			if target.RevisionID == "" {
+				target.RevisionID = run.RevisionID
+			}
 		}
 	}
 	if strings.TrimSpace(target.RevisionID) != "" {

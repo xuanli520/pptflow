@@ -1,0 +1,1 @@
+{"format":"harbor.authoring-task-handoff.v1","version":"1","fields":["authoring_source_id","authoring_session_id","authoring_run_id","authoring_source_digest","task_id","task_revision_id","task_revision_digest","task_snapshot_artifact","child_template"]}

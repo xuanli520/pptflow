@@ -162,6 +162,35 @@ func TestLocalRuntimeReconcileRunRecoversOnlyLocalDurableFacts(t *testing.T) {
 	}
 }
 
+func TestLocalRuntimeAuthoringSessionUsesDraftTaskQuotaAndSkipsRevisionRepair(t *testing.T) {
+	ctx := context.Background()
+	services, _, _, task, run := newAuthoringSessionRuntimeFixture(t, "authoring-runtime-owner")
+	taskQuota, _ := reserveLocalRuntimeQuota(t, ctx, services, task.ID, run.CreatedBy, 10*time.Millisecond)
+
+	attachment, err := services.LocalRuntime.AttachRun(ctx, AttachRunRequest{RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.TaskQuota.ScopeKind != store.QuotaScopeTask || attachment.TaskQuota.ScopeID != task.ID || len(attachment.TaskQuota.Leases) != 1 || attachment.TaskQuota.Leases[0].Lease.ID != taskQuota.ID {
+		t.Fatalf("authoring runtime task quota attachment = %+v, want draft task scope %s", attachment.TaskQuota, task.ID)
+	}
+
+	time.Sleep(40 * time.Millisecond)
+	result, err := services.LocalRuntime.ReconcileRun(ctx, ReconcileRunRequest{
+		RunID: run.ID, Actor: "authoring-runtime-owner", Reason: "recover immutable authoring session local state",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExpiredTaskQuotas != 1 || result.Attachment.TaskQuota.ScopeID != task.ID {
+		t.Fatalf("authoring runtime quota reconciliation = %+v", result)
+	}
+	expired, err := services.Store().GetDurableQuotaLease(ctx, taskQuota.ID)
+	if err != nil || expired == nil || expired.State != store.DurableQuotaLeaseExpired {
+		t.Fatalf("authoring task quota after reconciliation = %+v, %v", expired, err)
+	}
+}
+
 func TestLocalRuntimeReconcileRunDrainsEveryExpiredJobBatch(t *testing.T) {
 	ctx := context.Background()
 	_, services, _, _, run := newLocalRuntimeServiceFixture(t, "runtime-batch-reconciler")

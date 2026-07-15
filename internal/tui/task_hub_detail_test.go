@@ -313,6 +313,44 @@ func TestTaskHubDetailSelectionCapturesSpecificOpenReviewForTwoKeyPlan(t *testin
 	}
 }
 
+func TestTaskHubDetailSelectionCapturesSourceSessionReviewAndAuthoringRunTarget(t *testing.T) {
+	snapshot := enabledTaskHubSnapshot()
+	detail := taskHubDetailFixture()
+	detail.AuthoringReviews = []TaskHubAuthoringReviewFact{{
+		ReviewRequestID: "authoring-review-open", BindingID: "authoring-binding", RunID: "authoring-run", AuthoringSessionID: "authoring-session",
+		AuthoringSourceID: "authoring-source", SourceSnapshotDigest: "sha256:source", DefinitionHash: "sha256:definition",
+		StageAttemptID: "authoring-stage", StageKey: "task_review", ReviewKind: "task_direction", InputFingerprint: "sha256:input",
+		EvidenceManifest: "sha256:evidence", State: "open",
+	}}
+	service := &fakeTaskHubDetailLifecycle{fakeTaskHubLifecycle: &fakeTaskHubLifecycle{snapshot: snapshot}, detail: detail}
+	m, cleanup := newTestTaskHubV2Model(t, service)
+	defer cleanup()
+
+	updated, detailCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if detailCommand == nil {
+		t.Fatal("did not open deferred detail for source/session review")
+	}
+	updated, _ = m.Update(detailCommand())
+	m = updated.(model)
+	m.taskHubDetail.Tab = TaskHubDetailFactsTab
+	updated, _ = m.Update(runeKey("]"))
+	m = updated.(model)
+	if m.taskHub.SelectedAuthoringReviewRequestID != "authoring-review-open" || m.taskHub.SelectedAuthoringReviewRunID != "authoring-run" ||
+		m.taskHub.SelectedReviewRequestID != "" {
+		t.Fatalf("detail did not preserve an explicit source/session review selection: %+v", m.taskHub)
+	}
+	target := m.taskHubTarget()
+	if target.TaskID != "task-1" || target.RunID != "authoring-run" || target.AuthoringReviewRequestID != "authoring-review-open" ||
+		target.RevisionID != "" || target.ReviewRequestID != "" {
+		t.Fatalf("Task Hub target manufactured a TaskRevision for authoring review: %+v", target)
+	}
+	if rendered := strings.Join(m.taskHubDetail.factRows(), "\n"); !strings.Contains(rendered, "> authoring review：authoring-review-open") ||
+		!strings.Contains(rendered, "session：authoring-session") {
+		t.Fatalf("source/session gate was not visibly selected in detail:\n%s", rendered)
+	}
+}
+
 func TestTaskHubDetailSelectionEnablesWithdrawWithCapturedRelease(t *testing.T) {
 	snapshot := enabledTaskHubSnapshot()
 	snapshot.Tasks[0].Actions = append(snapshot.Tasks[0].Actions,

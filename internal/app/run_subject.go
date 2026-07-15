@@ -30,11 +30,58 @@ type workflowRunSubject struct {
 }
 
 func (subject workflowRunSubject) isTaskRevision() bool {
-	return subject.Kind == store.WorkflowRunSubjectTaskRevision && subject.Revision != nil && subject.Task != nil
+	// Artifact-lineage helpers may intentionally carry only the immutable
+	// TaskRevision, whereas admission/ownership resolution additionally needs
+	// Task.  Requiring Task here would make a harmless lineage wrapper look
+	// like an unsupported subject and would tempt callers to fabricate one.
+	return subject.Kind == store.WorkflowRunSubjectTaskRevision && subject.Revision != nil
 }
 
 func (subject workflowRunSubject) isAuthoringSession() bool {
 	return subject.Kind == store.WorkflowRunSubjectAuthoringSession && subject.AuthoringSource != nil && subject.AuthoringSession != nil
+}
+
+// subjectRevisionID and subjectDigest are the sole lineage coordinates used by
+// the generic workflow runtime.  For an ordinary Run they are the real task
+// revision and task digest; for a pre-materialization Run they are the
+// AuthoringSession and immutable source-snapshot digest.  Keeping this
+// projection here prevents downstream runtime code from accidentally treating
+// a draft Task as a synthetic TaskRevision.
+func (subject workflowRunSubject) subjectRevisionID() string {
+	return subject.Binding.RevisionID
+}
+
+func (subject workflowRunSubject) subjectDigest() string {
+	return string(subject.Binding.Digest)
+}
+
+// quotaTaskID returns the durable Task account that owns quota.  An
+// AuthoringSession has a real draft Task for ownership and accounting, but
+// that Task never becomes the workflow subject until materialize_task creates
+// its first revision.
+func (subject workflowRunSubject) quotaTaskID() (string, error) {
+	switch {
+	case subject.isTaskRevision() && subject.Task != nil:
+		return subject.Task.ID, nil
+	case subject.isAuthoringSession() && subject.TargetTask != nil:
+		return subject.TargetTask.ID, nil
+	default:
+		return "", fmt.Errorf("workflow Run subject has no quota-owning Task")
+	}
+}
+
+func (subject workflowRunSubject) matchesRun(run store.WorkflowRun) bool {
+	if subject.Kind != run.SubjectKind || subject.Binding.SubjectID != run.SubjectID ||
+		subject.Binding.RevisionID != run.SubjectRevisionID || string(subject.Binding.Digest) != run.SubjectDigest {
+		return false
+	}
+	if subject.isTaskRevision() {
+		return subject.Revision != nil && run.TaskID == subject.Binding.SubjectID && run.RevisionID == subject.Revision.ID && run.AuthoringSessionID == ""
+	}
+	if subject.isAuthoringSession() {
+		return subject.AuthoringSession != nil && run.TaskID == "" && run.RevisionID == "" && run.AuthoringSessionID == subject.AuthoringSession.ID
+	}
+	return false
 }
 
 func (core *lifecycleServiceCore) resolveWorkflowRunSubject(ctx context.Context, run store.WorkflowRun) (workflowRunSubject, error) {
@@ -67,7 +114,11 @@ func (core *lifecycleServiceCore) resolveWorkflowRunSubject(ctx context.Context,
 		if err := binding.Validate(); err != nil {
 			return workflowRunSubject{}, fmt.Errorf("task-revision workflow subject: %w", err)
 		}
-		return workflowRunSubject{Binding: binding, Kind: run.SubjectKind, Task: task, Revision: revision}, nil
+		subject := workflowRunSubject{Binding: binding, Kind: run.SubjectKind, Task: task, Revision: revision}
+		if !subject.matchesRun(run) {
+			return workflowRunSubject{}, fmt.Errorf("workflow Run %s generic task-revision subject fields differ from its TaskRevision", run.ID)
+		}
+		return subject, nil
 
 	case store.WorkflowRunSubjectAuthoringSession:
 		if strings.TrimSpace(run.TaskID) != "" || strings.TrimSpace(run.RevisionID) != "" || strings.TrimSpace(run.AuthoringSessionID) == "" {
@@ -103,12 +154,32 @@ func (core *lifecycleServiceCore) resolveWorkflowRunSubject(ctx context.Context,
 		if err != nil {
 			return workflowRunSubject{}, err
 		}
-		if targetTask == nil || targetTask.LifecycleState != store.TaskLifecycleDraft || targetTask.CurrentRevisionID != "" || targetTask.SourceRepo != source.RepositoryURL || targetTask.SourceCommit != source.CommitSHA {
-			return workflowRunSubject{}, fmt.Errorf("authoring session %s draft Task ownership is no longer valid", session.ID)
+		if targetTask == nil || targetTask.SourceRepo != source.RepositoryURL || targetTask.SourceCommit != source.CommitSHA {
+			return workflowRunSubject{}, fmt.Errorf("authoring session %s target Task ownership is no longer valid", session.ID)
 		}
-		return workflowRunSubject{
+		// Before materialize_task, the target must still be the reserved draft.
+		// Afterwards this same source/session Run remains an immutable historical
+		// parent of the generated task-bound child Run, so resolving it must not
+		// pretend the newly-created revision makes its original subject invalid.
+		// Require the one durable materialization receipt in that case; a revision
+		// attached by any other path is not a valid Standard-authoring handoff.
+		if targetTask.CurrentRevisionID != "" || targetTask.LifecycleState != store.TaskLifecycleDraft {
+			materialization, materializationErr := core.store.GetAuthoringTaskMaterializationForRun(ctx, run.ID)
+			if materializationErr != nil {
+				return workflowRunSubject{}, materializationErr
+			}
+			if materialization == nil || materialization.SessionID != session.ID || materialization.SourceID != source.ID ||
+				materialization.TaskID != targetTask.ID || materialization.RevisionID != targetTask.CurrentRevisionID {
+				return workflowRunSubject{}, fmt.Errorf("authoring session %s target Task is no longer the durable materialization of Run %s", session.ID, run.ID)
+			}
+		}
+		subject := workflowRunSubject{
 			Binding: binding, Kind: run.SubjectKind, AuthoringSource: source, AuthoringSession: session, TargetTask: targetTask,
-		}, nil
+		}
+		if !subject.matchesRun(run) {
+			return workflowRunSubject{}, fmt.Errorf("workflow Run %s generic authoring subject fields differ from its AuthoringSession", run.ID)
+		}
+		return subject, nil
 
 	default:
 		return workflowRunSubject{}, fmt.Errorf("workflow Run %s has unsupported subject kind %q", run.ID, run.SubjectKind)

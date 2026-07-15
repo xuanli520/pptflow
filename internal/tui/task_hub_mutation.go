@@ -43,23 +43,24 @@ const (
 // mutations. It owns only interaction state: application services remain the
 // sole owners of plans, durable commands, and all persistent effects.
 type TaskHubMutationOverlay struct {
-	Action            TaskHubAction
-	ControlAction     TaskHubRunControlAction
-	Target            TaskHubTarget
-	Expected          TaskHubControlCheckpoint
-	ExpectedLifecycle TaskHubLifecycleCheckpoint
-	Preview           TaskHubPlanPreview
-	Actor             string
-	IdempotencyKey    string
-	FrozenActor       string
-	FrozenReason      string
-	ReasonInput       textinput.Model
-	ValueInputs       map[string]textinput.Model
-	TextAreaInputs    map[string]textarea.Model
-	FieldOrder        []string
-	FocusedField      int
-	Phase             taskHubMutationPhase
-	Error             string
+	Action                  TaskHubAction
+	ControlAction           TaskHubRunControlAction
+	Target                  TaskHubTarget
+	Expected                TaskHubControlCheckpoint
+	ExpectedLifecycle       TaskHubLifecycleCheckpoint
+	ExpectedAuthoringReview TaskHubAuthoringReviewCheckpoint
+	Preview                 TaskHubPlanPreview
+	Actor                   string
+	IdempotencyKey          string
+	FrozenActor             string
+	FrozenReason            string
+	ReasonInput             textinput.Model
+	ValueInputs             map[string]textinput.Model
+	TextAreaInputs          map[string]textarea.Model
+	FieldOrder              []string
+	FocusedField            int
+	Phase                   taskHubMutationPhase
+	Error                   string
 }
 
 // The indirections make actor/key failure paths deterministic in unit tests
@@ -82,15 +83,16 @@ func newTaskHubMutationOverlay(action TaskHubAction, target TaskHubTarget, previ
 		return nil, fmt.Errorf("allocate Task Hub idempotency key: %w", err)
 	}
 	overlay := &TaskHubMutationOverlay{
-		Action:            action,
-		Target:            target,
-		Preview:           preview.Clone(),
-		ExpectedLifecycle: preview.Expected,
-		Actor:             actor,
-		IdempotencyKey:    key,
-		ValueInputs:       make(map[string]textinput.Model),
-		TextAreaInputs:    make(map[string]textarea.Model),
-		Phase:             taskHubMutationReady,
+		Action:                  action,
+		Target:                  target,
+		Preview:                 preview.Clone(),
+		ExpectedLifecycle:       preview.Expected,
+		ExpectedAuthoringReview: preview.AuthoringReviewExpected,
+		Actor:                   actor,
+		IdempotencyKey:          key,
+		ValueInputs:             make(map[string]textinput.Model),
+		TextAreaInputs:          make(map[string]textarea.Model),
+		Phase:                   taskHubMutationReady,
 	}
 	overlay.initializeInputs()
 	return overlay, nil
@@ -342,14 +344,15 @@ func (overlay *TaskHubMutationOverlay) request() TaskHubMutationRequest {
 		values[key] = strings.TrimSpace(input.Value())
 	}
 	return TaskHubMutationRequest{
-		Action:         overlay.Action,
-		Target:         overlay.Target,
-		PlanID:         strings.TrimSpace(overlay.Preview.PlanID),
-		Actor:          actor,
-		Reason:         reason,
-		IdempotencyKey: strings.TrimSpace(overlay.IdempotencyKey),
-		Expected:       overlay.ExpectedLifecycle,
-		Values:         values,
+		Action:                  overlay.Action,
+		Target:                  overlay.Target,
+		PlanID:                  strings.TrimSpace(overlay.Preview.PlanID),
+		Actor:                   actor,
+		Reason:                  reason,
+		IdempotencyKey:          strings.TrimSpace(overlay.IdempotencyKey),
+		Expected:                overlay.ExpectedLifecycle,
+		AuthoringReviewExpected: overlay.ExpectedAuthoringReview,
+		Values:                  values,
 	}
 }
 

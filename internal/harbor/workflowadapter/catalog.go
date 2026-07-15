@@ -762,19 +762,24 @@ func canonicalizeStage(stage *StageDefinition) {
 }
 
 const (
-	resourceSourceRepository             workflowkit.ResourceKey = "source/repository"
-	resourceSourceSnapshot               workflowkit.ResourceKey = "source/snapshot"
-	resourceAnalysisRepository           workflowkit.ResourceKey = "analysis/repository"
-	resourceTaskDesign                   workflowkit.ResourceKey = "task/design"
-	resourceTaskGeneratedFiles           workflowkit.ResourceKey = "task/generated-files"
-	resourceTaskInstruction              workflowkit.ResourceKey = "task/instruction"
-	resourceTaskMetadata                 workflowkit.ResourceKey = "task/metadata"
-	resourceTaskEnvironment              workflowkit.ResourceKey = "task/environment"
-	resourceTaskSolution                 workflowkit.ResourceKey = "task/solution"
-	resourceTaskTests                    workflowkit.ResourceKey = "task/tests"
-	resourceTaskTestsAnalysis            workflowkit.ResourceKey = "task/tests-analysis"
-	resourceTaskSnapshot                 workflowkit.ResourceKey = "task/snapshot"
-	resourceTaskDigest                   workflowkit.ResourceKey = "task/digest"
+	resourceSourceRepository   workflowkit.ResourceKey = "source/repository"
+	resourceSourceSnapshot     workflowkit.ResourceKey = "source/snapshot"
+	resourceAnalysisRepository workflowkit.ResourceKey = "analysis/repository"
+	resourceTaskDesign         workflowkit.ResourceKey = "task/design"
+	resourceTaskGeneratedFiles workflowkit.ResourceKey = "task/generated-files"
+	resourceTaskInstruction    workflowkit.ResourceKey = "task/instruction"
+	resourceTaskMetadata       workflowkit.ResourceKey = "task/metadata"
+	resourceTaskEnvironment    workflowkit.ResourceKey = "task/environment"
+	resourceTaskSolution       workflowkit.ResourceKey = "task/solution"
+	resourceTaskTests          workflowkit.ResourceKey = "task/tests"
+	resourceTaskTestsAnalysis  workflowkit.ResourceKey = "task/tests-analysis"
+	resourceTaskSnapshot       workflowkit.ResourceKey = "task/snapshot"
+	resourceTaskDigest         workflowkit.ResourceKey = "task/digest"
+	// resourceAuthoringTaskHandoff is written exactly once by the closed
+	// AuthoringSession materialize_task stage. A task-bound child Run consumes
+	// its immutable receipt; it must never keep executing under the source
+	// session subject after this write.
+	resourceAuthoringTaskHandoff         workflowkit.ResourceKey = "authoring/task-handoff"
 	resourceTaskWildcard                 workflowkit.ResourceKey = "task/**"
 	resourceFindingWildcard              workflowkit.ResourceKey = "finding/**"
 	resourceReviewTaskDirection          workflowkit.ResourceKey = "review/task-direction"

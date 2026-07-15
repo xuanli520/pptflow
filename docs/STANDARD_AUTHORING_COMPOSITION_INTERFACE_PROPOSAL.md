@@ -1,97 +1,79 @@
-# Standard Authoring Composition Interface Proposal
+# Standard Authoring Composition Contract
 
-Status: proposal only.  It deliberately does not add a public payload kind,
-operation lock field, provider, or executable deployment catalog before that
-material API decision is confirmed.
+Status: implemented provider/attestation boundary. Application, CLI, and TUI
+admission still have to install this exact composition; there is no fallback
+from another template.
 
-## Problem boundary
+`harbor.standard-authoring@1.0.0` is the source-session half of task creation.
+Its `materialize_task` stage ends that Run after atomically creating the first
+TaskRevision and emitting a typed child handoff. It must not continue the
+task-bound CodeEdge lifecycle inside the AuthoringSession Run.
 
-`StandardWorkflowTemplate` contains both external host/model work and
-Harbor-Flow-internal lifecycle work.  A production composition needs to admit
-all exact stage bindings at StartRun, but must not claim that a Go handler is a
-shell command or a model call.  It also needs a distinct template-keyed
-resolver so a Standard Run cannot borrow CodeEdge evaluator capability.
+## Sealed operation kinds
 
-## Proposed narrow public extension
+The closed deployment catalog permits only:
 
-The recommended extension is a fifth sealed operation payload and matching
-lock specialization:
-
-```go
-// Proposed, not implemented.
-type HarborBuiltinOperationPayload struct {
-    HandlerID string `json:"handler_id"`
-}
-
-// Proposed, not implemented.
-type HarborFlowBuiltinOperationLock struct {
-    Format                string `json:"format"`  // harbor.flow.builtin-operation.v1
-    Version               string `json:"version"` // 1
-    HandlerID             string `json:"handler_id"`
-    HandlerVersion        string `json:"handler_version"`
-}
-
-// Proposed, not implemented.
-type BuiltinOperationExecutor interface {
-    ExecuteBuiltin(context.Context, StageOperationInvocation,
-        HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error)
-}
-```
-
-The enclosing deployment lock already carries `HarborFlowBuildIdentity`; the
-runtime attestor would require exact equality to the linker-bound build before
-dispatching a built-in handler.  The lock record would accept exactly one
-attestation specialization: local executable, container runtime, agent/model,
-durable review, or the new built-in handler.  This prevents an operation from
-being both an opaque Go handler and an unverified host command.
-
-## Proposed composition shape
-
-```go
-// Proposed composition contract; no implementation is installed yet.
-type StandardAuthoringProviderHandlers struct {
-    HostCommand stageprovider.LocalCommandOperationExecutor
-    AgentTurn   stageprovider.AgentTurnOperationExecutor
-    Builtin     BuiltinOperationExecutor
-    Review      workflowkit.StageExecutor // resolution-only durable review adapter
-}
-
-type StandardAuthoringComposition struct {
-    Template workflowadapter.TemplateReference // exactly harbor.task-lifecycle@2.2.0
-    Resolver *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
-    Registry *workflowkit.ControlledPluginRegistry[workflowkit.StageExecutor]
-}
-```
-
-Construction would load only a colocated Standard catalog/lock, prove that the
-catalog receipt names `harbor.task-lifecycle@2.2.0`, install the exact handler
-inventory, and pass that resolver under the same template key to StartRun,
-replay, foreground workers, and detached workers.  It would then be combined
-with CodeEdge parent/evaluator bindings only through an explicit
-multi-template registry; no resolver is a fallback for another template.
-
-## Handler ownership
-
-| Handler family | Owns | Must never do |
+| Payload kind | Standard authoring use | Runtime proof |
 | --- | --- | --- |
-| Host command | pinned Git/Docker invocation with direct argv | use PATH, use a shell, pick an image tag or arbitrary working directory |
-| Codex agent turn | locked App Server invocation and immutable prompt/schema artifacts | inherit arbitrary environment values, switch model, or serialize credentials |
-| Built-in | atomic AuthoringSession materialization, artifact/lifecycle handoff, package coordination | invent a TaskRevision, bypass store fencing, or call an unlocked external binary |
-| Durable review | exact policy resolution and external-decision wait | auto-approve a gate |
+| `local.command` | `repo_prepare` Git snapshot | exact regular Git executable, SHA-256, version, no caller argv |
+| `agent.turn` | analysis and content generation | pinned Codex JS launcher/Node/CODEX_HOME/sandbox plus locked prompt/schema assets |
+| `durable.review` | task, content, and solution gates | versioned durable-review policy; normal workflow handling waits for a decision |
+| `harbor.builtin` | `materialize_task` | exact handler ID/version and Harbor Flow build identity |
 
-## Required later tests
+`container.command` is rejected. Standard authoring does not claim an image
+or Docker execution ABI, so a generated task Dockerfile can never become an
+ambient container capability.
 
-Once approved and implemented, the implementation must replace the current
-negative parser guard with tests that prove:
+## Prompt/schema lock extension
 
-1. strict parse/canonical round-trip and duplicate/unknown-field rejection for
-   the new payload and lock;
-2. a built-in handler cannot execute after build, handler-ID, catalog receipt,
-   lock identity, or frozen stage-resolution drift;
-3. Standard StartRun refuses missing operations and never uses a CodeEdge
-   catalog as fallback;
-4. the same Standard resolver is used by StartRun, replay, foreground worker,
-   detached worker, and TUI-driven start;
-5. a `materialize_task` handler atomically creates the first revision from an
-   AuthoringSession and rejects duplicate/fenced invocation; and
-6. Docker stages reject unpinned image references before calling Docker.
+Each Standard lock record carries:
+
+```json
+"standard_authoring_contract": {
+  "format": "harbor.standard-authoring-contract.v1",
+  "version": "1",
+  "prompt": {"id": "...", "version": "...", "relative_path": "prompts/..."},
+  "schema": {"id": "...", "version": "...", "relative_path": "schemas/..."}
+}
+```
+
+The extension maps canonical asset IDs/versions and safe slash-relative paths
+to the enclosing record's existing raw prompt/schema SHA-256 fields. Standard
+locks require it for every operation; non-Standard locks reject it. Runtime
+attestation uses a deployment-owned `ContractRoot`, rejects containment
+escapes and all symlink path components, and rehashes both assets before every
+external effect. No asset path is returned to handlers.
+
+The `contract-assets.v1.json` manifest has exact closed-stage coverage and is
+the only input a final-lock generator may use to create these extensions.
+
+## Codex bridge injection
+
+`NewStandardAuthoringProviderComposition` keeps an explicit
+`StandardAuthoringOperationHandlers.AgentTurn` test/deployment seam. When the
+catalog has `agent.turn` operations and that handler is absent, it constructs
+`NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment` from the exact
+lock verifier, runtime attestor, and managed Codex workspace.
+
+The bridge deliberately loads prompt/schema assets at effect time, because a
+lock record does not have a Run's checkout revision or artifact identities. It
+then constructs a one-effect Codex executor and reattests the runtime just
+before `OpenConversation`. It never caches a Codex invocation, environment,
+prompt path, or raw provider response.
+
+## Composition ownership
+
+The stageprovider package owns catalog/lock parsing, asset validation, typed
+provider dispatch, and runtime attestation. Application composition must own
+the following injected handlers without widening the generic workflow engine:
+
+- Git snapshot executor;
+- atomic `standard-authoring.materialize-task` handler backed by the Store;
+- durable review projection/decision service; and
+- a managed non-symlink Codex workspace root.
+
+The application must install the same exact resolver for StartRun, replay,
+foreground worker, detached worker, CLI, and TUI. The later CodeEdge Phase-1
+parent and evaluator-child resolver are separate template-keyed compositions;
+they are reached only through the durable authoring handoff, never through a
+Standard provider fallback.

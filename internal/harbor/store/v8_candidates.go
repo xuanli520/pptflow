@@ -1265,7 +1265,9 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 		return RevisionCandidateContinuationCommit{}, err
 	}
 	run := WorkflowRun{
-		ID: candidate.TargetRunID, TaskID: task.ID, RevisionID: revision.ID,
+		ID: candidate.TargetRunID, SubjectKind: WorkflowRunSubjectTaskRevision,
+		SubjectID: task.ID, SubjectRevisionID: revision.ID, SubjectDigest: revision.TaskDigest,
+		TaskID: task.ID, RevisionID: revision.ID,
 		WorkflowTemplateID: sourceRun.WorkflowTemplateID, WorkflowTemplateVersion: sourceRun.WorkflowTemplateVersion,
 		ResolvedProfileHash: sourceRun.ResolvedProfileHash, DefinitionHash: sourceRun.DefinitionHash,
 		RunManifestJSON: candidate.ChildRunManifestJSON, ParentRunID: sourceRun.ID, Trigger: "continue",
@@ -1273,11 +1275,13 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workflow_runs (
-			id, task_id, revision_id, workflow_template_id, workflow_template_version, resolved_profile_hash,
+			id, subject_kind, subject_id, subject_revision_id, subject_digest,
+			task_id, revision_id, authoring_session_id, workflow_template_id, workflow_template_version, resolved_profile_hash,
 			definition_hash, run_manifest_json, parent_run_id, trigger, execution_epoch, status, created_by,
 			created_at, started_at, finished_at, version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
-	`, run.ID, run.TaskID, run.RevisionID, run.WorkflowTemplateID, run.WorkflowTemplateVersion, run.ResolvedProfileHash,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+	`, run.ID, run.SubjectKind, run.SubjectID, run.SubjectRevisionID, run.SubjectDigest,
+		run.TaskID, run.RevisionID, run.WorkflowTemplateID, run.WorkflowTemplateVersion, run.ResolvedProfileHash,
 		run.DefinitionHash, run.RunManifestJSON, run.ParentRunID, run.Trigger, run.ExecutionEpoch, run.Status,
 		run.CreatedBy, run.CreatedAt, run.Version); err != nil {
 		if isGlobalIdentityCollision(err) || isUniqueConstraint(err) {

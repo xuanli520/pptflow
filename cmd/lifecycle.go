@@ -1051,6 +1051,77 @@ func newReviewPromoteCommand(config *lifecycleCLIConfig) *cobra.Command {
 	return command
 }
 
+// newAuthoringCommand owns pre-materialization source/session operations.
+// It is intentionally separate from `review`: the latter is permanently
+// scoped to a real TaskRevision lifecycle.
+func newAuthoringCommand(config *lifecycleCLIConfig) *cobra.Command {
+	command := &cobra.Command{Use: "authoring", Short: "Manage source/session authoring operations", Args: cobra.NoArgs, RunE: showCommandGroupHelp}
+	command.AddCommand(
+		newAuthoringStartCommand(config),
+		newAuthoringReviewCommand(config),
+	)
+	return command
+}
+
+func newAuthoringReviewCommand(config *lifecycleCLIConfig) *cobra.Command {
+	command := &cobra.Command{Use: "review", Short: "Inspect and decide source/session review gates", Args: cobra.NoArgs, RunE: showCommandGroupHelp}
+	command.AddCommand(newAuthoringReviewDecideCommand(config))
+	return command
+}
+
+func newAuthoringReviewDecideCommand(config *lifecycleCLIConfig) *cobra.Command {
+	var requestID, action, idempotencyKey, reason string
+	command := &cobra.Command{
+		Use:   "decide",
+		Short: "Record one decision for a frozen source/session review gate",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			actor, reason, err := lifecycleActorAndReason(config, reason)
+			if err != nil {
+				return err
+			}
+			if _, err := requiredText("request", requestID); err != nil {
+				return err
+			}
+			if _, err := requiredText("action", action); err != nil {
+				return err
+			}
+			idempotencyKey, err = requiredAuthoringReviewIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
+			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+				if services.AuthoringReviews == nil {
+					return nil, fmt.Errorf("authoring review service is not configured")
+				}
+				checkpoint, err := services.AuthoringReviews.CaptureCheckpoint(ctx, requestID)
+				if err != nil {
+					return nil, err
+				}
+				return services.AuthoringReviews.Decide(ctx, app.DecideAuthoringReviewRequest{
+					IdempotencyKey: idempotencyKey, Action: store.ReviewDecisionAction(action), Actor: actor, Reason: reason, Expected: checkpoint,
+				})
+			})
+		},
+	}
+	command.Flags().StringVar(&requestID, "request", "", "Authoring review request UUIDv7")
+	command.Flags().StringVar(&action, "action", "", "approve, request_changes, or reject_terminal")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 authoring review idempotency key")
+	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
+	return command
+}
+
+func requiredAuthoringReviewIdempotencyKey(value string) (string, error) {
+	key, err := requiredText("idempotency-key", value)
+	if err != nil {
+		return "", err
+	}
+	if err := store.ValidateUUIDv7(key); err != nil {
+		return "", fmt.Errorf("authoring review idempotency-key must be a UUIDv7: %w", err)
+	}
+	return key, nil
+}
+
 func newRunCommandV2(config *lifecycleCLIConfig) *cobra.Command {
 	command := &cobra.Command{Use: "run", Short: "Create and inspect frozen workflow runs", Args: cobra.NoArgs, RunE: showCommandGroupHelp}
 	command.AddCommand(

@@ -40,7 +40,7 @@ func TestRunExecutionSpecCoversEveryCatalogStageWithConcreteBinding(t *testing.T
 }
 
 func TestRunExecutionSpecSupportsAuthoringSessionSubjectWithoutSyntheticTaskRevision(t *testing.T) {
-	spec := testRunExecutionSpec(t)
+	spec := testStandardAuthoringExecutionSpec(t)
 	const sourceDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	spec.Selection = RunSelectionReference{
 		Kind:                  RunSelectionAuthoringSession,
@@ -78,6 +78,23 @@ func TestRunExecutionSpecSupportsAuthoringSessionSubjectWithoutSyntheticTaskRevi
 	mixed.Selection.TaskID = "018f0a73-3b49-7000-8000-000000000001"
 	if err := mixed.Validate(); err == nil || !strings.Contains(err.Error(), "cannot contain task-revision") {
 		t.Fatalf("mixed selection validation = %v, want closed-union failure", err)
+	}
+}
+
+func TestRunExecutionSpecRejectsAuthoringSessionOnTaskBoundTemplate(t *testing.T) {
+	spec := testRunExecutionSpec(t)
+	spec.Selection = RunSelectionReference{
+		Kind:                  RunSelectionAuthoringSession,
+		AuthoringSourceID:     "018f0a73-3b49-7000-8000-000000000010",
+		AuthoringSessionID:    "018f0a73-3b49-7000-8000-000000000011",
+		AuthoringSourceDigest: workflowkit.SubjectDigest("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+	}
+	for index := range spec.References.Checkouts {
+		spec.References.Checkouts[index].RevisionID = spec.Selection.AuthoringSessionID
+		spec.References.Checkouts[index].RevisionDigest = spec.Selection.AuthoringSourceDigest
+	}
+	if err := spec.Validate(); err == nil || !strings.Contains(err.Error(), "only accepted by Standard authoring") {
+		t.Fatalf("full Standard authoring-session selection = %v, want template-bound rejection", err)
 	}
 }
 
@@ -522,6 +539,41 @@ func testRunExecutionSpec(t *testing.T) RunExecutionSpec {
 		}
 		spec.Stages = append(spec.Stages, bindingForTest(t, base))
 	}
+	return spec
+}
+
+func testStandardAuthoringExecutionSpec(t *testing.T) RunExecutionSpec {
+	t.Helper()
+	spec := testRunExecutionSpec(t)
+	spec.Template = StandardAuthoringTemplateReference()
+	spec.Selection = RunSelectionReference{
+		Kind:                  RunSelectionAuthoringSession,
+		AuthoringSourceID:     "018f0a73-3b49-7000-8000-000000000010",
+		AuthoringSessionID:    "018f0a73-3b49-7000-8000-000000000011",
+		AuthoringSourceDigest: workflowkit.SubjectDigest("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+	}
+	for index := range spec.References.Checkouts {
+		spec.References.Checkouts[index].RevisionID = spec.Selection.AuthoringSessionID
+		spec.References.Checkouts[index].RevisionDigest = spec.Selection.AuthoringSourceDigest
+	}
+	allowed := make(map[workflowkit.StageKey]struct{}, len(StandardAuthoringStageOrder()))
+	for _, key := range StandardAuthoringStageOrder() {
+		allowed[key] = struct{}{}
+	}
+	stages := make([]StageExecutionBinding, 0, len(allowed))
+	for _, binding := range spec.Stages {
+		base, ok := stageBindingBaseOf(binding)
+		if ok {
+			if _, present := allowed[base.StageKey]; present {
+				stages = append(stages, binding)
+			}
+		}
+	}
+	spec.Stages = stages
+	spec.References.Checkouts = []CheckoutReference{spec.References.Checkouts[0]}
+	spec.References.Runtimes = []RuntimeReference{spec.References.Runtimes[0]}
+	spec.References.Providers = []ProviderReference{spec.References.Providers[0], spec.References.Providers[2]}
+	spec.References.Secrets = []SecretReference{spec.References.Secrets[0]}
 	return spec
 }
 

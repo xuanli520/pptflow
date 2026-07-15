@@ -24,18 +24,42 @@ func TestStageOperationPayloadStrictDecodeAndCanonicalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHarborBuiltinOperationPayloadStrictDecodeAndCanonicalRoundTrip(t *testing.T) {
+	raw := []byte(`{"kind":"harbor.builtin","handler_id":"standard-authoring.materialize-task"}`)
+	payload, err := ParseStageOperationPayloadJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builtin, ok := payload.(HarborBuiltinOperationPayload)
+	if !ok || builtin.HandlerID != "standard-authoring.materialize-task" {
+		t.Fatalf("parsed payload = %#v", payload)
+	}
+	canonical, err := CanonicalStageOperationPayloadJSON(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(canonical) != string(raw) {
+		t.Fatalf("canonical payload = %s, want %s", canonical, raw)
+	}
+	if clone, ok := CloneStageOperationPayload(payload).(HarborBuiltinOperationPayload); !ok || clone != builtin {
+		t.Fatalf("cloned payload = %#v, want %#v", clone, builtin)
+	}
+}
+
 func TestStageOperationPayloadRejectsMalformedDocuments(t *testing.T) {
 	validDigest := strings.Repeat("a", 64)
 	for name, raw := range map[string][]byte{
-		"unknown field":         []byte(`{"kind":"local.command","command_id":"harbor-stage","arguments":[],"extra":true}`),
-		"missing command":       []byte(`{"kind":"local.command","arguments":[]}`),
-		"missing arguments":     []byte(`{"kind":"local.command","command_id":"harbor-stage"}`),
-		"null arguments":        []byte(`{"kind":"local.command","command_id":"harbor-stage","arguments":null}`),
-		"duplicate key":         []byte(`{"kind":"agent.turn","agent_id":"one","agent_id":"two","model_id":"model","max_turns":1}`),
-		"bad image pin":         []byte(`{"kind":"container.command","image_digest":"registry/example:latest","command":["run"]}`),
-		"bad turn limit":        []byte(`{"kind":"agent.turn","agent_id":"agent","model_id":"model","max_turns":0}`),
-		"unknown discriminator": []byte(`{"kind":"other.operation"}`),
-		"invalid digest hex":    []byte(`{"kind":"container.command","image_digest":"registry/example@sha256:` + validDigest[:63] + `z","command":["run"]}`),
+		"unknown field":          []byte(`{"kind":"local.command","command_id":"harbor-stage","arguments":[],"extra":true}`),
+		"missing command":        []byte(`{"kind":"local.command","arguments":[]}`),
+		"missing arguments":      []byte(`{"kind":"local.command","command_id":"harbor-stage"}`),
+		"null arguments":         []byte(`{"kind":"local.command","command_id":"harbor-stage","arguments":null}`),
+		"duplicate key":          []byte(`{"kind":"agent.turn","agent_id":"one","agent_id":"two","model_id":"model","max_turns":1}`),
+		"bad image pin":          []byte(`{"kind":"container.command","image_digest":"registry/example:latest","command":["run"]}`),
+		"bad turn limit":         []byte(`{"kind":"agent.turn","agent_id":"agent","model_id":"model","max_turns":0}`),
+		"empty built-in handler": []byte(`{"kind":"harbor.builtin","handler_id":""}`),
+		"built-in unknown field": []byte(`{"kind":"harbor.builtin","handler_id":"handler","arguments":[]}`),
+		"unknown discriminator":  []byte(`{"kind":"other.operation"}`),
+		"invalid digest hex":     []byte(`{"kind":"container.command","image_digest":"registry/example@sha256:` + validDigest[:63] + `z","command":["run"]}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseStageOperationPayloadJSON(raw); err == nil {

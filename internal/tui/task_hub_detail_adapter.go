@@ -182,6 +182,28 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 		}
 		detail.Reviews = append(detail.Reviews, projection)
 	}
+	for _, review := range inspection.AuthoringReviews {
+		projection := TaskHubAuthoringReviewFact{
+			ReviewRequestID: review.Request.ID, BindingID: review.Binding.ID, RunID: review.Binding.RunID,
+			AuthoringSessionID: review.Binding.AuthoringSessionID, AuthoringSourceID: review.Binding.AuthoringSourceID,
+			SourceSnapshotDigest: review.Binding.SourceSnapshotDigest, DefinitionHash: review.Binding.DefinitionHash,
+			StageAttemptID: review.Binding.StageAttemptID, StageKey: review.Binding.StageKey, ReviewKind: review.Binding.ReviewKind,
+			InputFingerprint: review.Binding.InputFingerprint, EvidenceManifest: review.Binding.EvidenceManifestDigest,
+			State: string(review.State), CreatedAt: review.Request.CreatedAt,
+		}
+		for _, decision := range review.Decisions {
+			projection.Decisions = append(projection.Decisions, TaskHubAuthoringReviewDecisionFact{
+				DecisionID: decision.ID, Action: string(decision.Action), CreatedAt: decision.CreatedAt,
+			})
+		}
+		if review.Resolution != nil {
+			projection.Resolution = &TaskHubAuthoringReviewResolutionFact{
+				ResolutionID: review.Resolution.ID, DecisionID: review.Resolution.DecisionID, Verdict: string(review.Resolution.Verdict),
+				ArtifactManifestID: review.Resolution.ArtifactManifestID, CreatedAt: review.Resolution.CreatedAt,
+			}
+		}
+		detail.AuthoringReviews = append(detail.AuthoringReviews, projection)
+	}
 	for _, repair := range inspection.Repairs {
 		projection := TaskHubRepairFact{
 			RepairSessionID: repair.Session.ID,

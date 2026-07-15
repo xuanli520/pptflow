@@ -1,0 +1,80 @@
+{
+  "format": "harbor.standard-authoring-contract-assets.v1",
+  "version": "1",
+  "template": {
+    "id": "harbor.standard-authoring",
+    "version": "1.0.0"
+  },
+  "operations": [
+    {
+      "stage_key": "repo_prepare",
+      "prompt": {"id": "standard-authoring.repo-prepare.prompt", "version": "1.0.0", "relative_path": "prompts/repo-prepare.md"},
+      "schema": {"id": "standard-authoring.repo-prepare.output-schema", "version": "1.0.0", "relative_path": "schemas/repo-prepare-output.json"}
+    },
+    {
+      "stage_key": "repo_analyze",
+      "prompt": {"id": "standard-authoring.repo-analyze.prompt", "version": "1.0.0", "relative_path": "prompts/repo-analyze.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "task_design",
+      "prompt": {"id": "standard-authoring.task-design.prompt", "version": "1.0.0", "relative_path": "prompts/task-design.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "task_review",
+      "prompt": {"id": "standard-authoring.task-review.prompt", "version": "1.0.0", "relative_path": "prompts/task-review.md"},
+      "schema": {"id": "standard-authoring.durable-review-decision-schema", "version": "1.0.0", "relative_path": "schemas/durable-review-decision.json"}
+    },
+    {
+      "stage_key": "generate_task_files",
+      "prompt": {"id": "standard-authoring.generate-task-files.prompt", "version": "1.0.0", "relative_path": "prompts/generate-task-files.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "instruction_generate",
+      "prompt": {"id": "standard-authoring.instruction-generate.prompt", "version": "1.0.0", "relative_path": "prompts/instruction-generate.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "task_toml_generate",
+      "prompt": {"id": "standard-authoring.task-toml-generate.prompt", "version": "1.0.0", "relative_path": "prompts/task-toml-generate.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "dockerfile_generate",
+      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "1.0.0", "relative_path": "prompts/dockerfile-generate.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "content_review",
+      "prompt": {"id": "standard-authoring.content-review.prompt", "version": "1.0.0", "relative_path": "prompts/content-review.md"},
+      "schema": {"id": "standard-authoring.durable-review-decision-schema", "version": "1.0.0", "relative_path": "schemas/durable-review-decision.json"}
+    },
+    {
+      "stage_key": "solve_generate",
+      "prompt": {"id": "standard-authoring.solve-generate.prompt", "version": "1.0.0", "relative_path": "prompts/solve-generate.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "test_generate",
+      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.0.0", "relative_path": "prompts/test-generate.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "tests_analysis",
+      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "1.0.0", "relative_path": "prompts/tests-analysis.json"},
+      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+    },
+    {
+      "stage_key": "solution_review",
+      "prompt": {"id": "standard-authoring.solution-review.prompt", "version": "1.0.0", "relative_path": "prompts/solution-review.md"},
+      "schema": {"id": "standard-authoring.durable-review-decision-schema", "version": "1.0.0", "relative_path": "schemas/durable-review-decision.json"}
+    },
+    {
+      "stage_key": "materialize_task",
+      "prompt": {"id": "standard-authoring.materialize-task.prompt", "version": "1.0.0", "relative_path": "prompts/materialize-task.md"},
+      "schema": {"id": "standard-authoring.authoring-task-handoff-schema", "version": "1.0.0", "relative_path": "schemas/authoring-task-handoff.json"}
+    }
+  ]
+}

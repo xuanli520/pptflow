@@ -60,32 +60,27 @@ func (service *ExecutionControlService) CurrentCheckpoint(ctx context.Context, r
 	if run == nil {
 		return ControlCheckpoint{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 	}
-	task, err := service.core.store.GetTaskV2(ctx, run.TaskID)
+	subject, err := service.core.resolveWorkflowRunSubject(ctx, *run)
 	if err != nil {
 		return ControlCheckpoint{}, err
 	}
-	if task == nil {
-		return ControlCheckpoint{}, fmt.Errorf("%w: task %s", ErrLifecycleNotFound, run.TaskID)
-	}
-	revision, err := service.core.store.GetTaskRevision(ctx, run.RevisionID)
-	if err != nil {
-		return ControlCheckpoint{}, err
-	}
-	if revision == nil {
-		return ControlCheckpoint{}, fmt.Errorf("%w: revision %s", ErrLifecycleNotFound, run.RevisionID)
-	}
-	if revision.TaskID != task.ID {
-		return ControlCheckpoint{}, fmt.Errorf("run revision does not belong to its task")
-	}
-	return ControlCheckpoint{
+	checkpoint := ControlCheckpoint{
 		Sequence:            uint64(run.Version),
 		ExecutionEpoch:      run.ExecutionEpoch,
-		SubjectVersion:      task.Version,
-		SubjectID:           task.ID,
-		SubjectRevisionID:   revision.ID,
-		SubjectDigest:       revision.TaskDigest,
+		SubjectID:           subject.Binding.SubjectID,
+		SubjectRevisionID:   subject.Binding.RevisionID,
+		SubjectDigest:       string(subject.Binding.Digest),
 		WorkflowFingerprint: run.DefinitionHash,
-	}, nil
+	}
+	switch {
+	case subject.isTaskRevision() && subject.Task != nil:
+		checkpoint.SubjectVersion = subject.Task.Version
+	case subject.isAuthoringSession():
+		checkpoint.SubjectVersion = store.AuthoringSessionControlSubjectVersion
+	default:
+		return ControlCheckpoint{}, fmt.Errorf("workflow Run %s has no supported control subject", run.ID)
+	}
+	return checkpoint, nil
 }
 
 // Request persists an idempotent, target-scoped control command. The V5 store

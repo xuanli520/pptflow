@@ -537,8 +537,11 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
 		return frozenRunDefinition{}, fmt.Errorf("decode frozen run manifest %s: %w", run.ID, err)
 	}
-	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID || manifest.TaskID != run.TaskID || manifest.Revision != run.RevisionID {
+	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s does not match its control-plane run", run.ID)
+	}
+	if err := validateRunManifestSubject(manifest, run); err != nil {
+		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s subject: %w", run.ID, err)
 	}
 	_, _, executionSpecFingerprint, err := canonicalFrozenRunExecutionSpec(manifest, run)
 	if err != nil {
@@ -647,7 +650,11 @@ func canonicalFrozenRunExecutionSpec(manifest runManifest, run store.WorkflowRun
 	if fingerprint != manifest.Inputs.ExecutionSpecFingerprint {
 		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest execution specification fingerprint does not match inputs")
 	}
-	if specification.Selection.TaskID != run.TaskID || specification.Selection.RevisionID != run.RevisionID {
+	binding, err := specification.Selection.SubjectBinding()
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest execution specification subject: %w", err)
+	}
+	if binding.SubjectID != run.SubjectID || binding.RevisionID != run.SubjectRevisionID || string(binding.Digest) != run.SubjectDigest {
 		return workflowadapter.RunExecutionSpec{}, nil, "", fmt.Errorf("run manifest execution specification selection does not match Run")
 	}
 	return specification, canonical, fingerprint, nil

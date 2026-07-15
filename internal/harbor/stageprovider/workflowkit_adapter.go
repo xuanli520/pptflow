@@ -237,8 +237,17 @@ func workflowkitRequestExecutionSpec(request workflowkit.StageExecutionRequest) 
 	if err != nil || !bytes.Equal(canonical, binding.Canonical) {
 		return workflowadapter.RunExecutionSpec{}, fmt.Errorf("%w: execution spec is not canonical", ErrFrozenExecutionSpec)
 	}
-	selection := specification.Selection
-	if selection.TaskID != request.Execution.Subject.SubjectID || selection.RevisionID != request.Execution.Subject.RevisionID || string(selection.RevisionDigest) != string(request.Execution.Subject.Digest) {
+	// The generic kernel sees only an opaque SubjectBinding.  A Harbor
+	// RunExecutionSpec can project either a sealed TaskRevision or the
+	// pre-materialization AuthoringSource/AuthoringSession pair onto that
+	// binding.  Do not read the task-only fields here: doing so would force an
+	// authoring workflow to fabricate a TaskRevision just to enter the common
+	// workflowkit runtime.
+	selectionBinding, err := specification.Selection.SubjectBinding()
+	if err != nil {
+		return workflowadapter.RunExecutionSpec{}, fmt.Errorf("%w: execution spec selection: %v", ErrFrozenExecutionSpec, err)
+	}
+	if selectionBinding != request.Execution.Subject {
 		return workflowadapter.RunExecutionSpec{}, fmt.Errorf("%w: execution spec selection does not match frozen subject", ErrFrozenExecutionSpec)
 	}
 	return specification, nil

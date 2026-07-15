@@ -394,7 +394,7 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 	}
 	runtime := newFrozenRuntime(t, services, bridgeRegistry)
 	bridge := &workflowkitStageBackend{
-		runtime: runtime, run: childRun, revision: childRevision, frozen: childFrozen,
+		runtime: runtime, run: childRun, subject: taskRevisionSubjectForLineage(childRun, childRevision), frozen: childFrozen,
 		job: store.DurableJob{CreatedBy: "tester"},
 	}
 	if _, err := bridge.frozenExecution(); err != nil {

@@ -101,6 +101,16 @@ func TestTypedWorkflowkitStageOperationProviderDispatchesOnlyTypedPayloads(t *te
 				})}
 			},
 		},
+		{
+			name:      "Harbor built-in",
+			operation: workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "builtin", Version: "1", Payload: workflowadapter.HarborBuiltinOperationPayload{HandlerID: "standard-authoring.materialize-task"}},
+			install: func(called *bool) TypedWorkflowkitOperationHandlers {
+				return TypedWorkflowkitOperationHandlers{HarborBuiltin: HarborBuiltinOperationExecutorFunc(func(_ context.Context, invocation StageOperationInvocation, payload workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error) {
+					*called = invocation.Resolution.Provider == provider && payload.HandlerID == "standard-authoring.materialize-task"
+					return workflowkit.StageExecutionResult{}, nil
+				})}
+			},
+		},
 	}
 
 	for _, test := range cases {

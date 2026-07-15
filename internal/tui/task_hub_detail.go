@@ -31,6 +31,7 @@ const (
 	taskHubCodeEdgeQwenPass4EvidenceKey       = "qwen_pass4_evidence"
 	taskHubCodeEdgeOpusTrialResultArtifactKey = "opus_trial_result"
 	taskHubCodeEdgeOpusPass4EvidenceKey       = "opus_pass4_evidence"
+	taskHubAuthoringReviewOpenState           = "open"
 )
 
 func taskHubDetailTabs() []TaskHubDetailTab {
@@ -102,11 +103,19 @@ type TaskHubDetail struct {
 	// parent displays the immutable adoption bridge rather than pretending it
 	// executed those stages itself.
 	CodeEdgeEvaluatorEvidenceHandoffs []TaskHubCodeEdgeEvaluatorEvidenceHandoffFact `json:"codeedge_evaluator_evidence_handoffs,omitempty"`
+	// StandardAuthoringPhase1Handoffs reports the read-only bridge from a
+	// source/session Standard authoring Run to its one task-bound CodeEdge
+	// Phase-1 child. It never starts, retries, or otherwise controls that child.
+	StandardAuthoringPhase1Handoffs []TaskHubStandardAuthoringPhase1HandoffFact `json:"standard_authoring_phase1_handoffs,omitempty"`
 	Releases                          []TaskHubReleaseFact                          `json:"releases,omitempty"`
 	Artifacts                         []TaskHubArtifactFact                         `json:"artifacts,omitempty"`
 	Reviews                           []TaskHubReviewFact                           `json:"reviews,omitempty"`
-	Repairs                           []TaskHubRepairFact                           `json:"repairs,omitempty"`
-	ObservedAt                        time.Time                                     `json:"observed_at"`
+	// AuthoringReviews are source/session gates shown before the draft Task
+	// receives a real TaskRevision. They intentionally remain separate from
+	// Reviews so selection cannot manufacture a revision identity.
+	AuthoringReviews []TaskHubAuthoringReviewFact `json:"authoring_reviews,omitempty"`
+	Repairs          []TaskHubRepairFact          `json:"repairs,omitempty"`
+	ObservedAt       time.Time                    `json:"observed_at"`
 }
 
 // TaskHubDetailTask is the stable Task identity and lifecycle summary.
@@ -206,6 +215,32 @@ type TaskHubCodeEdgeEvaluatorEvidenceHandoffFact struct {
 	ChildRunID         string                                       `json:"child_run_id,omitempty"`
 	HandoffFingerprint string                                       `json:"handoff_fingerprint,omitempty"`
 	RecordedAt         time.Time                                    `json:"recorded_at,omitempty"`
+}
+
+// TaskHubStandardAuthoringPhase1HandoffState is intentionally a conservative
+// observation, not a claim that a provider is installed or that a child has
+// executed successfully.
+type TaskHubStandardAuthoringPhase1HandoffState string
+
+const (
+	TaskHubStandardAuthoringPhase1HandoffNotRecorded TaskHubStandardAuthoringPhase1HandoffState = "not_recorded"
+	TaskHubStandardAuthoringPhase1HandoffPending     TaskHubStandardAuthoringPhase1HandoffState = "pending"
+	TaskHubStandardAuthoringPhase1HandoffBound       TaskHubStandardAuthoringPhase1HandoffState = "bound"
+	TaskHubStandardAuthoringPhase1HandoffInvalid     TaskHubStandardAuthoringPhase1HandoffState = "invalid"
+	TaskHubStandardAuthoringPhase1HandoffUnavailable TaskHubStandardAuthoringPhase1HandoffState = "unavailable"
+)
+
+// TaskHubStandardAuthoringPhase1HandoffFact contains only durable bridge
+// identities and its delivery-job state. It excludes the handoff document,
+// artifact bytes, provider definition, raw job payload, and storage errors.
+type TaskHubStandardAuthoringPhase1HandoffFact struct {
+	AuthoringRunID     string                                        `json:"authoring_run_id"`
+	State              TaskHubStandardAuthoringPhase1HandoffState    `json:"state"`
+	HandoffID          string                                        `json:"handoff_id,omitempty"`
+	ChildRunID         string                                        `json:"child_run_id,omitempty"`
+	HandoffFingerprint string                                        `json:"handoff_fingerprint,omitempty"`
+	JobState           string                                        `json:"job_state,omitempty"`
+	RecordedAt         time.Time                                     `json:"recorded_at,omitempty"`
 }
 
 // TaskHubFrozenExecutionState describes whether the projection can prove the
@@ -355,6 +390,46 @@ type TaskHubReviewDecisionFact struct {
 	CreatedAt              time.Time `json:"created_at"`
 }
 
+// TaskHubAuthoringReviewFact is the safe source/session review projection.
+// It exposes only immutable gate identities and outcomes, never raw source
+// snapshots, provider inputs, or reviewer reason text.
+type TaskHubAuthoringReviewFact struct {
+	ReviewRequestID      string                                `json:"review_request_id"`
+	BindingID            string                                `json:"binding_id"`
+	RunID                string                                `json:"run_id"`
+	AuthoringSessionID   string                                `json:"authoring_session_id"`
+	AuthoringSourceID    string                                `json:"authoring_source_id"`
+	SourceSnapshotDigest string                                `json:"source_snapshot_digest"`
+	DefinitionHash       string                                `json:"definition_hash"`
+	StageAttemptID       string                                `json:"stage_attempt_id"`
+	StageKey             string                                `json:"stage_key"`
+	ReviewKind           string                                `json:"review_kind"`
+	InputFingerprint     string                                `json:"input_fingerprint"`
+	EvidenceManifest     string                                `json:"evidence_manifest"`
+	State                string                                `json:"state"`
+	CreatedAt            time.Time                             `json:"created_at"`
+	Decisions            []TaskHubAuthoringReviewDecisionFact  `json:"decisions,omitempty"`
+	Resolution           *TaskHubAuthoringReviewResolutionFact `json:"resolution,omitempty"`
+}
+
+// TaskHubAuthoringReviewDecisionFact contains one immutable operator action
+// for a source/session gate. It does not expose any TaskRevision fields.
+type TaskHubAuthoringReviewDecisionFact struct {
+	DecisionID string    `json:"decision_id"`
+	Action     string    `json:"action"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// TaskHubAuthoringReviewResolutionFact is the worker's immutable projection
+// receipt after a decision has been materialized into stage evidence.
+type TaskHubAuthoringReviewResolutionFact struct {
+	ResolutionID       string    `json:"resolution_id"`
+	DecisionID         string    `json:"decision_id"`
+	Verdict            string    `json:"verdict"`
+	ArtifactManifestID string    `json:"artifact_manifest_id,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
 // TaskHubRepairFact summarizes bounded repair work and observed provider
 // receipt outcomes. The provider payload and raw findings stay out of the UI.
 type TaskHubRepairFact struct {
@@ -398,6 +473,7 @@ func (detail TaskHubDetail) Clone() TaskHubDetail {
 	detail.FrozenExecutions = append([]TaskHubFrozenExecutionFact(nil), detail.FrozenExecutions...)
 	detail.CodeEdgeCompliance = append([]TaskHubCodeEdgeComplianceFact(nil), detail.CodeEdgeCompliance...)
 	detail.CodeEdgeEvaluatorEvidenceHandoffs = append([]TaskHubCodeEdgeEvaluatorEvidenceHandoffFact(nil), detail.CodeEdgeEvaluatorEvidenceHandoffs...)
+	detail.StandardAuthoringPhase1Handoffs = append([]TaskHubStandardAuthoringPhase1HandoffFact(nil), detail.StandardAuthoringPhase1Handoffs...)
 	detail.Releases = append([]TaskHubReleaseFact(nil), detail.Releases...)
 	detail.Artifacts = append([]TaskHubArtifactFact(nil), detail.Artifacts...)
 	for index := range detail.Artifacts {
@@ -406,6 +482,14 @@ func (detail TaskHubDetail) Clone() TaskHubDetail {
 	detail.Reviews = append([]TaskHubReviewFact(nil), detail.Reviews...)
 	for index := range detail.Reviews {
 		detail.Reviews[index].Decisions = append([]TaskHubReviewDecisionFact(nil), detail.Reviews[index].Decisions...)
+	}
+	detail.AuthoringReviews = append([]TaskHubAuthoringReviewFact(nil), detail.AuthoringReviews...)
+	for index := range detail.AuthoringReviews {
+		detail.AuthoringReviews[index].Decisions = append([]TaskHubAuthoringReviewDecisionFact(nil), detail.AuthoringReviews[index].Decisions...)
+		if detail.AuthoringReviews[index].Resolution != nil {
+			resolution := *detail.AuthoringReviews[index].Resolution
+			detail.AuthoringReviews[index].Resolution = &resolution
+		}
 	}
 	detail.Repairs = append([]TaskHubRepairFact(nil), detail.Repairs...)
 	for index := range detail.Repairs {
@@ -428,14 +512,15 @@ type taskHubDetailLoadedMsg struct {
 // no mutation affordances. Selecting a review or release only captures a
 // stable identity for a later two-key lifecycle plan; it never changes state.
 type TaskHubDetailOverlay struct {
-	Query                   TaskHubDetailQuery
-	Detail                  TaskHubDetail
-	Tab                     TaskHubDetailTab
-	SelectedReviewRequestID string
-	SelectedReleaseID       string
-	Loading                 bool
-	Error                   string
-	Scroll                  int
+	Query                            TaskHubDetailQuery
+	Detail                           TaskHubDetail
+	Tab                              TaskHubDetailTab
+	SelectedReviewRequestID          string
+	SelectedAuthoringReviewRequestID string
+	SelectedReleaseID                string
+	Loading                          bool
+	Error                            string
+	Scroll                           int
 }
 
 func newTaskHubDetailOverlay(query TaskHubDetailQuery) *TaskHubDetailOverlay {
@@ -516,6 +601,19 @@ func (overlay *TaskHubDetailOverlay) selectableOpenReviews() []TaskHubReviewFact
 	return reviews
 }
 
+func (overlay *TaskHubDetailOverlay) selectableOpenAuthoringReviews() []TaskHubAuthoringReviewFact {
+	if overlay == nil {
+		return nil
+	}
+	reviews := make([]TaskHubAuthoringReviewFact, 0, len(overlay.Detail.AuthoringReviews))
+	for _, review := range overlay.Detail.AuthoringReviews {
+		if strings.TrimSpace(review.ReviewRequestID) != "" && review.State == taskHubAuthoringReviewOpenState {
+			reviews = append(reviews, review)
+		}
+	}
+	return reviews
+}
+
 func (overlay *TaskHubDetailOverlay) selectableActiveReleases() []TaskHubReleaseFact {
 	if overlay == nil {
 		return nil
@@ -538,6 +636,15 @@ func (overlay *TaskHubDetailOverlay) selectedOpenReview() (TaskHubReviewFact, bo
 	return TaskHubReviewFact{}, false
 }
 
+func (overlay *TaskHubDetailOverlay) selectedOpenAuthoringReview() (TaskHubAuthoringReviewFact, bool) {
+	for _, review := range overlay.selectableOpenAuthoringReviews() {
+		if review.ReviewRequestID == overlay.SelectedAuthoringReviewRequestID {
+			return review, true
+		}
+	}
+	return TaskHubAuthoringReviewFact{}, false
+}
+
 func (overlay *TaskHubDetailOverlay) selectedActiveRelease() (TaskHubReleaseFact, bool) {
 	for _, release := range overlay.selectableActiveReleases() {
 		if release.ReleaseID == overlay.SelectedReleaseID {
@@ -553,6 +660,12 @@ func (overlay *TaskHubDetailOverlay) normalizeSelections() {
 	}
 	if _, found := overlay.selectedOpenReview(); !found {
 		overlay.SelectedReviewRequestID = ""
+	}
+	if _, found := overlay.selectedOpenAuthoringReview(); !found {
+		overlay.SelectedAuthoringReviewRequestID = ""
+	}
+	if overlay.SelectedReviewRequestID != "" {
+		overlay.SelectedAuthoringReviewRequestID = ""
 	}
 	if _, found := overlay.selectedActiveRelease(); !found {
 		overlay.SelectedReleaseID = ""
@@ -588,6 +701,71 @@ func (overlay *TaskHubDetailOverlay) cycleOpenReview(delta int) (TaskHubReviewFa
 		overlay.SelectedReviewRequestID = review.ReviewRequestID
 	}
 	return review, found
+}
+
+func (overlay *TaskHubDetailOverlay) cycleOpenAuthoringReview(delta int) (TaskHubAuthoringReviewFact, bool) {
+	review, found := cycleTaskHubDetailSelection(overlay.selectableOpenAuthoringReviews(), overlay.SelectedAuthoringReviewRequestID, func(value TaskHubAuthoringReviewFact) string {
+		return value.ReviewRequestID
+	}, delta)
+	if found {
+		overlay.SelectedAuthoringReviewRequestID = review.ReviewRequestID
+		overlay.SelectedReviewRequestID = ""
+	}
+	return review, found
+}
+
+// cycleOpenReviewTarget rotates across both immutable review domains. The
+// request IDs are globally unique, but the kind remains explicit so a selected
+// authoring gate can never be submitted through the TaskRevision path.
+func (overlay *TaskHubDetailOverlay) cycleOpenReviewTarget(delta int) (TaskHubReviewFact, TaskHubAuthoringReviewFact, bool, bool) {
+	type target struct {
+		generic   *TaskHubReviewFact
+		authoring *TaskHubAuthoringReviewFact
+		key       string
+	}
+	targets := make([]target, 0, len(overlay.selectableOpenReviews())+len(overlay.selectableOpenAuthoringReviews()))
+	for _, review := range overlay.selectableOpenReviews() {
+		value := review
+		targets = append(targets, target{generic: &value, key: "task:" + review.ReviewRequestID})
+	}
+	for _, review := range overlay.selectableOpenAuthoringReviews() {
+		value := review
+		targets = append(targets, target{authoring: &value, key: "authoring:" + review.ReviewRequestID})
+	}
+	if len(targets) == 0 {
+		return TaskHubReviewFact{}, TaskHubAuthoringReviewFact{}, false, false
+	}
+	current := ""
+	if overlay.SelectedReviewRequestID != "" {
+		current = "task:" + overlay.SelectedReviewRequestID
+	} else if overlay.SelectedAuthoringReviewRequestID != "" {
+		current = "authoring:" + overlay.SelectedAuthoringReviewRequestID
+	}
+	index := -1
+	for candidate, value := range targets {
+		if value.key == current {
+			index = candidate
+			break
+		}
+	}
+	if index < 0 {
+		if delta < 0 {
+			index = len(targets) - 1
+		} else {
+			index = 0
+		}
+	} else {
+		index = (index + delta + len(targets)) % len(targets)
+	}
+	chosen := targets[index]
+	if chosen.generic != nil {
+		overlay.SelectedReviewRequestID = chosen.generic.ReviewRequestID
+		overlay.SelectedAuthoringReviewRequestID = ""
+		return *chosen.generic, TaskHubAuthoringReviewFact{}, false, true
+	}
+	overlay.SelectedReviewRequestID = ""
+	overlay.SelectedAuthoringReviewRequestID = chosen.authoring.ReviewRequestID
+	return TaskHubReviewFact{}, *chosen.authoring, true, true
 }
 
 func (overlay *TaskHubDetailOverlay) cycleActiveRelease(delta int) (TaskHubReleaseFact, bool) {
@@ -812,6 +990,7 @@ func (overlay *TaskHubDetailOverlay) frozenExecutionRows() []string {
 		default:
 			rows = append(rows, failStyle.Render("冻结 manifest：未知投影状态"))
 		}
+		rows = append(rows, overlay.standardAuthoringPhase1HandoffRows(fact.RunID)...)
 		rows = append(rows, overlay.codeEdgeComplianceRows(fact.RunID)...)
 		if fact.State != TaskHubFrozenExecutionBound {
 			rows = append(rows, "")
@@ -835,6 +1014,56 @@ func (overlay *TaskHubDetailOverlay) frozenExecutionRows() []string {
 		rows = append(rows, "")
 	}
 	return rows
+}
+
+// standardAuthoringPhase1HandoffRows renders only the durable topology from a
+// Standard authoring parent to its closed Phase-1 child. The display remains
+// intentionally fail-closed when the Store could not read the bridge: it does
+// not infer a child from parent_run_id or retry a durable job.
+func (overlay *TaskHubDetailOverlay) standardAuthoringPhase1HandoffRows(runID string) []string {
+	run, found := overlay.runFact(runID)
+	if !found || !taskHubIsStandardAuthoringRunFact(run) {
+		return nil
+	}
+	rows := []string{sectionStyle.Render("Standard -> Phase-1 handoff（只读记录）")}
+	for _, fact := range overlay.Detail.StandardAuthoringPhase1Handoffs {
+		if fact.AuthoringRunID != runID {
+			continue
+		}
+		switch fact.State {
+		case TaskHubStandardAuthoringPhase1HandoffNotRecorded:
+			rows = append(rows, warnStyle.Render("状态：尚未记录 Phase-1 handoff；不会从父子 Run 关系或当前配置推测 child。"))
+		case TaskHubStandardAuthoringPhase1HandoffPending:
+			rows = append(rows, warnStyle.Render("状态：已等待 Phase-1 child；TUI 不会启动、重试或交接该 Run。"))
+		case TaskHubStandardAuthoringPhase1HandoffBound:
+			rows = append(rows, "状态：已记录并绑定到受管 Phase-1 child；执行状态仍以 child Run 为准。")
+		case TaskHubStandardAuthoringPhase1HandoffInvalid:
+			rows = append(rows, failStyle.Render("状态：持久 handoff 与 source/session、TaskRevision 或 child Run 绑定无效。"))
+		case TaskHubStandardAuthoringPhase1HandoffUnavailable:
+			rows = append(rows, warnStyle.Render("状态：handoff 记录当前不可读取；不会将缺失信息解释为未创建。"))
+		default:
+			rows = append(rows, failStyle.Render("状态：未知；不会将其视为已绑定 handoff。"))
+		}
+		if fact.HandoffID != "" {
+			rows = append(rows, "handoff ID："+fact.HandoffID)
+		}
+		if fact.ChildRunID != "" {
+			rows = append(rows, "Phase-1 child Run："+fact.ChildRunID)
+		}
+		if fact.HandoffFingerprint != "" {
+			rows = append(rows, "handoff fingerprint："+fact.HandoffFingerprint)
+		}
+		if fact.JobState != "" {
+			rows = append(rows, "durable job 状态："+fact.JobState)
+		} else {
+			rows = append(rows, "durable job 状态：未记录")
+		}
+		if !fact.RecordedAt.IsZero() {
+			rows = append(rows, "记录时间："+taskHubDetailTime(fact.RecordedAt))
+		}
+		return rows
+	}
+	return append(rows, warnStyle.Render("状态：handoff 投影未返回；不会按 Run 拓扑猜测 Phase-1 child。"))
 }
 
 func (overlay *TaskHubDetailOverlay) codeEdgeComplianceRows(runID string) []string {
@@ -1086,6 +1315,11 @@ func taskHubIsCodeEdgePhase1RunFact(run TaskHubRunFact) bool {
 		run.WorkflowTemplateVer == workflowadapter.CodeEdgePhase1WorkflowTemplateVersion
 }
 
+func taskHubIsStandardAuthoringRunFact(run TaskHubRunFact) bool {
+	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
+		run.WorkflowTemplateVer == workflowadapter.StandardAuthoringWorkflowTemplateVersion
+}
+
 func taskHubIsCodeEdgeEvaluatorChildRunFact(run TaskHubRunFact) bool {
 	return run.WorkflowTemplateID == workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID &&
 		run.WorkflowTemplateVer == workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion
@@ -1178,7 +1412,7 @@ func (overlay *TaskHubDetailOverlay) factRows() []string {
 			}
 		}
 	}
-	rows = append(rows, "", sectionStyle.Render("审核"))
+	rows = append(rows, "", sectionStyle.Render("TaskRevision 审核"))
 	if len(overlay.Detail.Reviews) == 0 {
 		rows = append(rows, "暂无 ReviewRequest。")
 	} else {
@@ -1193,6 +1427,31 @@ func (overlay *TaskHubDetailOverlay) factRows() []string {
 			}
 			for _, decision := range review.Decisions {
 				rows = append(rows, "  决定："+decision.Action+"  "+taskHubDetailTime(decision.CreatedAt))
+			}
+		}
+	}
+	if len(overlay.Detail.AuthoringReviews) > 0 {
+		rows = append(rows, "", sectionStyle.Render("Source/Session 审核"))
+		for _, review := range overlay.Detail.AuthoringReviews {
+			marker := "  "
+			if review.ReviewRequestID == overlay.SelectedAuthoringReviewRequestID && review.State == taskHubAuthoringReviewOpenState {
+				marker = "> "
+			}
+			rows = append(rows,
+				marker+"authoring review："+review.ReviewRequestID+"  "+review.State,
+				"Run："+review.RunID,
+				"session："+review.AuthoringSessionID,
+				"stage："+review.StageKey+" / "+review.StageAttemptID,
+				"证据："+review.EvidenceManifest,
+			)
+			if len(review.Decisions) == 0 {
+				rows = append(rows, "  暂无 AuthoringReviewDecision")
+			}
+			for _, decision := range review.Decisions {
+				rows = append(rows, "  决定："+decision.Action+"  "+taskHubDetailTime(decision.CreatedAt))
+			}
+			if review.Resolution != nil {
+				rows = append(rows, "  resolution："+review.Resolution.Verdict+"  "+taskHubDetailTime(review.Resolution.CreatedAt))
 			}
 		}
 	}

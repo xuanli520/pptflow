@@ -132,6 +132,89 @@ CREATE TABLE authoring_run_input_artifacts_v2 (
     CHECK (substr(source_fingerprint, 8) NOT GLOB '*[^0-9a-f]*')
 );
 
+-- table authoring_review_requests_v22
+-- These request envelopes are purpose-built for the pre-materialization
+-- source/session subject. They deliberately do not reuse review_requests,
+-- which is a TaskRevision-only lifecycle contract.
+CREATE TABLE authoring_review_requests_v22 (
+    id                       TEXT PRIMARY KEY,
+    run_id                   TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    authoring_session_id     TEXT NOT NULL REFERENCES authoring_sessions_v2(id) ON DELETE RESTRICT,
+    authoring_source_id      TEXT NOT NULL REFERENCES authoring_sources_v2(id) ON DELETE RESTRICT,
+    source_snapshot_digest   TEXT NOT NULL,
+    definition_hash          TEXT NOT NULL,
+    evidence_manifest_digest TEXT NOT NULL,
+    request_fingerprint      TEXT NOT NULL UNIQUE,
+    idempotency_key          TEXT NOT NULL UNIQUE,
+    created_by               TEXT NOT NULL,
+    created_at               DATETIME NOT NULL,
+    CHECK (length(source_snapshot_digest) = 71),
+    CHECK (substr(source_snapshot_digest, 1, 7) = 'sha256:'),
+    CHECK (substr(source_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*')
+);
+
+-- table authoring_review_gate_bindings_v22
+-- The binding is the immutable source/session analogue of a task-revision
+-- review gate. Every operator decision and resolution references this fact.
+CREATE TABLE authoring_review_gate_bindings_v22 (
+    id                       TEXT PRIMARY KEY,
+    review_request_id        TEXT NOT NULL UNIQUE REFERENCES authoring_review_requests_v22(id) ON DELETE RESTRICT,
+    run_id                   TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    authoring_session_id     TEXT NOT NULL REFERENCES authoring_sessions_v2(id) ON DELETE RESTRICT,
+    authoring_source_id      TEXT NOT NULL REFERENCES authoring_sources_v2(id) ON DELETE RESTRICT,
+    source_snapshot_digest   TEXT NOT NULL,
+    definition_hash          TEXT NOT NULL,
+    stage_attempt_id         TEXT NOT NULL UNIQUE REFERENCES stage_attempts(id) ON DELETE RESTRICT,
+    stage_key                TEXT NOT NULL,
+    node_attempt_id          TEXT NOT NULL UNIQUE REFERENCES node_attempts(id) ON DELETE RESTRICT,
+    node_generation          INTEGER NOT NULL CHECK (node_generation >= 0),
+    node_attempt_ordinal     INTEGER NOT NULL CHECK (node_attempt_ordinal > 0),
+    review_kind              TEXT NOT NULL,
+    input_bindings_json      TEXT NOT NULL,
+    input_fingerprint        TEXT NOT NULL,
+    evidence_manifest_digest TEXT NOT NULL,
+    binding_fingerprint      TEXT NOT NULL UNIQUE,
+    created_at               DATETIME NOT NULL,
+    CHECK (length(source_snapshot_digest) = 71),
+    CHECK (substr(source_snapshot_digest, 1, 7) = 'sha256:'),
+    CHECK (substr(source_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*')
+);
+
+-- table authoring_review_decisions_v22
+-- At most one immutable operator decision may exist for an authoring review
+-- request. Its presence transitions the derived gate state from open to
+-- decided without mutating the request envelope.
+CREATE TABLE authoring_review_decisions_v22 (
+    id                   TEXT PRIMARY KEY,
+    review_request_id    TEXT NOT NULL UNIQUE REFERENCES authoring_review_requests_v22(id) ON DELETE RESTRICT,
+    binding_id           TEXT NOT NULL UNIQUE REFERENCES authoring_review_gate_bindings_v22(id) ON DELETE RESTRICT,
+    action               TEXT NOT NULL CHECK (action IN ('approve', 'request_changes', 'reject_terminal')),
+    decision_fingerprint TEXT NOT NULL UNIQUE,
+    idempotency_key      TEXT NOT NULL UNIQUE,
+    actor                TEXT NOT NULL,
+    reason               TEXT NOT NULL DEFAULT '',
+    created_at           DATETIME NOT NULL
+);
+
+-- table authoring_review_gate_resolutions_v22
+-- A completion receipt is immutable and one-to-one with the operator decision.
+-- Result evidence is deliberately opaque here: it is not misrepresented as a
+-- TaskRevision artifact before materialize_task has created one.
+CREATE TABLE authoring_review_gate_resolutions_v22 (
+    id                          TEXT PRIMARY KEY,
+    review_request_id           TEXT NOT NULL UNIQUE REFERENCES authoring_review_requests_v22(id) ON DELETE RESTRICT,
+    binding_id                  TEXT NOT NULL UNIQUE REFERENCES authoring_review_gate_bindings_v22(id) ON DELETE RESTRICT,
+    decision_id                 TEXT NOT NULL UNIQUE REFERENCES authoring_review_decisions_v22(id) ON DELETE RESTRICT,
+    verdict                     TEXT NOT NULL CHECK (verdict IN ('pass', 'needs_repair', 'reject')),
+    artifact_manifest_id        TEXT NOT NULL DEFAULT '',
+    resolution_evidence_digest  TEXT NOT NULL,
+    resolution_payload_json     TEXT NOT NULL,
+    resolution_fingerprint      TEXT NOT NULL UNIQUE,
+    idempotency_key             TEXT NOT NULL UNIQUE,
+    created_by                  TEXT NOT NULL,
+    created_at                  DATETIME NOT NULL
+);
+
 -- table run_input_artifacts
 -- Immutable, run-scoped subject inputs. These are intentionally distinct
 -- from stage-produced artifact refs: no synthetic producer StageAttempt is
@@ -1109,6 +1192,34 @@ CREATE TABLE authoring_task_materializations_v2 (
     CHECK (substr(request_fingerprint, 8) NOT GLOB '*[^0-9a-f]*')
 );
 
+-- table authoring_phase1_handoffs_v2
+-- This is the second, separately durable bridge: a persisted
+-- authoring_task_handoff artifact may prepare exactly one task-bound
+-- CodeEdge Phase-1 child Run. It reserves the child identity before Run
+-- creation, while the application layer verifies the artifact's strict JSON
+-- content and object bytes before inserting this row.
+CREATE TABLE authoring_phase1_handoffs_v2 (
+    id                    TEXT PRIMARY KEY,
+    authoring_run_id      TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    authoring_session_id  TEXT NOT NULL REFERENCES authoring_sessions_v2(id) ON DELETE RESTRICT,
+    authoring_source_id   TEXT NOT NULL REFERENCES authoring_sources_v2(id) ON DELETE RESTRICT,
+    handoff_artifact_id   TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
+    handoff_fingerprint   TEXT NOT NULL UNIQUE,
+    task_id               TEXT NOT NULL REFERENCES tasks_v2(id) ON DELETE RESTRICT,
+    revision_id           TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
+    task_digest           TEXT NOT NULL,
+    child_run_id          TEXT NOT NULL UNIQUE,
+    idempotency_key       TEXT NOT NULL UNIQUE,
+    created_by            TEXT NOT NULL,
+    created_at            DATETIME NOT NULL,
+    CHECK (length(handoff_fingerprint) = 71),
+    CHECK (substr(handoff_fingerprint, 1, 7) = 'sha256:'),
+    CHECK (substr(handoff_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(task_digest) = 86),
+    CHECK (substr(task_digest, 1, 22) = 'harbor.task.v2:sha256:'),
+    CHECK (substr(task_digest, 23) NOT GLOB '*[^0-9a-f]*')
+);
+
 -- table tasks_v2
 CREATE TABLE "tasks_v2" (
     id                  TEXT PRIMARY KEY,
@@ -1276,6 +1387,26 @@ CREATE INDEX idx_authoring_sessions_v2_source
 CREATE INDEX idx_authoring_run_input_artifacts_v2_run
     ON authoring_run_input_artifacts_v2(run_id, port);
 
+-- index idx_authoring_review_requests_v22_run
+CREATE INDEX idx_authoring_review_requests_v22_run
+    ON authoring_review_requests_v22(run_id, created_at DESC);
+
+-- index idx_authoring_review_gate_bindings_v22_stage
+CREATE INDEX idx_authoring_review_gate_bindings_v22_stage
+    ON authoring_review_gate_bindings_v22(run_id, stage_attempt_id);
+
+-- index idx_authoring_review_gate_bindings_v22_session
+CREATE INDEX idx_authoring_review_gate_bindings_v22_session
+    ON authoring_review_gate_bindings_v22(authoring_session_id, created_at DESC);
+
+-- index idx_authoring_review_decisions_v22_request
+CREATE INDEX idx_authoring_review_decisions_v22_request
+    ON authoring_review_decisions_v22(review_request_id, created_at ASC, id ASC);
+
+-- index idx_authoring_review_gate_resolutions_v22_request
+CREATE INDEX idx_authoring_review_gate_resolutions_v22_request
+    ON authoring_review_gate_resolutions_v22(review_request_id, created_at ASC, id ASC);
+
 -- index idx_authoring_task_materializations_v2_revision
 CREATE INDEX idx_authoring_task_materializations_v2_revision
     ON authoring_task_materializations_v2(revision_id);
@@ -1283,6 +1414,10 @@ CREATE INDEX idx_authoring_task_materializations_v2_revision
 -- index idx_authoring_task_materializations_v2_run
 CREATE INDEX idx_authoring_task_materializations_v2_run
     ON authoring_task_materializations_v2(authoring_run_id);
+
+-- index idx_authoring_phase1_handoffs_v2_task
+CREATE INDEX idx_authoring_phase1_handoffs_v2_task
+    ON authoring_phase1_handoffs_v2(task_id, revision_id, created_at DESC, id);
 
 -- index idx_run_input_artifacts_run_port
 CREATE INDEX idx_run_input_artifacts_run_port
@@ -1885,6 +2020,114 @@ BEGIN
         THEN RAISE(ABORT, 'global entity identity collision')
     END;
     INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_task_materialization');
+END;
+
+-- trigger entity_id_registry_authoring_phase1_handoffs_v2_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_phase1_handoffs_v2_id_immutable
+BEFORE UPDATE OF id ON authoring_phase1_handoffs_v2
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_phase1_handoffs_v2_insert
+CREATE TRIGGER entity_id_registry_authoring_phase1_handoffs_v2_insert
+BEFORE INSERT ON authoring_phase1_handoffs_v2
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_phase1_handoff');
+END;
+
+-- trigger entity_id_registry_authoring_run_input_artifacts_v2_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_run_input_artifacts_v2_id_immutable
+BEFORE UPDATE OF id ON authoring_run_input_artifacts_v2
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_run_input_artifacts_v2_insert
+CREATE TRIGGER entity_id_registry_authoring_run_input_artifacts_v2_insert
+BEFORE INSERT ON authoring_run_input_artifacts_v2
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_run_input_artifact');
+END;
+
+-- trigger entity_id_registry_authoring_review_requests_v22_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_review_requests_v22_id_immutable
+BEFORE UPDATE OF id ON authoring_review_requests_v22
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_review_requests_v22_insert
+CREATE TRIGGER entity_id_registry_authoring_review_requests_v22_insert
+BEFORE INSERT ON authoring_review_requests_v22
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_review_request');
+END;
+
+-- trigger entity_id_registry_authoring_review_gate_bindings_v22_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_review_gate_bindings_v22_id_immutable
+BEFORE UPDATE OF id ON authoring_review_gate_bindings_v22
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_review_gate_bindings_v22_insert
+CREATE TRIGGER entity_id_registry_authoring_review_gate_bindings_v22_insert
+BEFORE INSERT ON authoring_review_gate_bindings_v22
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_review_gate_binding');
+END;
+
+-- trigger entity_id_registry_authoring_review_decisions_v22_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_review_decisions_v22_id_immutable
+BEFORE UPDATE OF id ON authoring_review_decisions_v22
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_review_decisions_v22_insert
+CREATE TRIGGER entity_id_registry_authoring_review_decisions_v22_insert
+BEFORE INSERT ON authoring_review_decisions_v22
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_review_decision');
+END;
+
+-- trigger entity_id_registry_authoring_review_gate_resolutions_v22_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_review_gate_resolutions_v22_id_immutable
+BEFORE UPDATE OF id ON authoring_review_gate_resolutions_v22
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_review_gate_resolutions_v22_insert
+CREATE TRIGGER entity_id_registry_authoring_review_gate_resolutions_v22_insert
+BEFORE INSERT ON authoring_review_gate_resolutions_v22
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_review_gate_resolution');
 END;
 
 -- trigger entity_id_registry_run_input_artifacts_id_immutable
@@ -3040,6 +3283,20 @@ BEGIN
     SELECT RAISE(ABORT, 'authoring task materializations are immutable');
 END;
 
+-- trigger authoring_phase1_handoffs_v2_immutable
+CREATE TRIGGER authoring_phase1_handoffs_v2_immutable
+BEFORE UPDATE ON authoring_phase1_handoffs_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring Phase-1 handoffs are immutable');
+END;
+
+-- trigger authoring_phase1_handoffs_v2_no_delete
+CREATE TRIGGER authoring_phase1_handoffs_v2_no_delete
+BEFORE DELETE ON authoring_phase1_handoffs_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring Phase-1 handoffs are immutable');
+END;
+
 -- trigger authoring_run_input_artifacts_v2_immutable
 CREATE TRIGGER authoring_run_input_artifacts_v2_immutable
 BEFORE UPDATE ON authoring_run_input_artifacts_v2
@@ -3052,6 +3309,155 @@ CREATE TRIGGER authoring_run_input_artifacts_v2_no_delete
 BEFORE DELETE ON authoring_run_input_artifacts_v2
 BEGIN
     SELECT RAISE(ABORT, 'authoring run input artifacts are immutable');
+END;
+
+-- trigger authoring_review_requests_v22_immutable
+CREATE TRIGGER authoring_review_requests_v22_immutable
+BEFORE UPDATE ON authoring_review_requests_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review requests are immutable');
+END;
+
+-- trigger authoring_review_requests_v22_no_delete
+CREATE TRIGGER authoring_review_requests_v22_no_delete
+BEFORE DELETE ON authoring_review_requests_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review requests are append-only');
+END;
+
+-- trigger authoring_review_gate_bindings_v22_immutable
+CREATE TRIGGER authoring_review_gate_bindings_v22_immutable
+BEFORE UPDATE ON authoring_review_gate_bindings_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review gate bindings are immutable');
+END;
+
+-- trigger authoring_review_gate_bindings_v22_no_delete
+CREATE TRIGGER authoring_review_gate_bindings_v22_no_delete
+BEFORE DELETE ON authoring_review_gate_bindings_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review gate bindings are append-only');
+END;
+
+-- trigger authoring_review_decisions_v22_immutable
+CREATE TRIGGER authoring_review_decisions_v22_immutable
+BEFORE UPDATE ON authoring_review_decisions_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review decisions are immutable');
+END;
+
+-- trigger authoring_review_decisions_v22_no_delete
+CREATE TRIGGER authoring_review_decisions_v22_no_delete
+BEFORE DELETE ON authoring_review_decisions_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review decisions are append-only');
+END;
+
+-- trigger authoring_review_gate_resolutions_v22_immutable
+CREATE TRIGGER authoring_review_gate_resolutions_v22_immutable
+BEFORE UPDATE ON authoring_review_gate_resolutions_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review gate resolutions are immutable');
+END;
+
+-- trigger authoring_review_gate_resolutions_v22_no_delete
+CREATE TRIGGER authoring_review_gate_resolutions_v22_no_delete
+BEFORE DELETE ON authoring_review_gate_resolutions_v22
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review gate resolutions are append-only');
+END;
+
+-- trigger authoring_review_requests_v22_lineage_insert
+-- A source/session request must bind exactly the immutable generic subject of
+-- its authoring Run. No TaskRevision is valid on this side of materialization.
+CREATE TRIGGER authoring_review_requests_v22_lineage_insert
+BEFORE INSERT ON authoring_review_requests_v22
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_runs AS run
+    JOIN authoring_sessions_v2 AS session ON session.id = run.authoring_session_id
+    JOIN authoring_sources_v2 AS source ON source.id = session.source_id
+    WHERE run.id = NEW.run_id
+      AND run.subject_kind = 'authoring_session'
+      AND run.task_id IS NULL
+      AND run.revision_id IS NULL
+      AND run.authoring_session_id = NEW.authoring_session_id
+      AND run.subject_id = NEW.authoring_source_id
+      AND run.subject_revision_id = NEW.authoring_session_id
+      AND run.subject_digest = NEW.source_snapshot_digest
+      AND session.id = NEW.authoring_session_id
+      AND session.source_id = NEW.authoring_source_id
+      AND source.id = NEW.authoring_source_id
+      AND source.snapshot_content_digest = NEW.source_snapshot_digest
+      AND run.definition_hash = NEW.definition_hash
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review request does not match source/session run lineage');
+END;
+
+-- trigger authoring_review_gate_bindings_v22_lineage_insert
+CREATE TRIGGER authoring_review_gate_bindings_v22_lineage_insert
+BEFORE INSERT ON authoring_review_gate_bindings_v22
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM authoring_review_requests_v22 AS request
+    JOIN stage_attempts AS stage ON stage.id = NEW.stage_attempt_id
+    JOIN node_attempts AS node ON node.id = NEW.node_attempt_id
+    WHERE request.id = NEW.review_request_id
+      AND request.run_id = NEW.run_id
+      AND request.authoring_session_id = NEW.authoring_session_id
+      AND request.authoring_source_id = NEW.authoring_source_id
+      AND request.source_snapshot_digest = NEW.source_snapshot_digest
+      AND request.definition_hash = NEW.definition_hash
+      AND request.evidence_manifest_digest = NEW.evidence_manifest_digest
+      AND stage.run_id = NEW.run_id
+      AND stage.stage_key = NEW.stage_key
+      AND stage.input_fingerprint = NEW.input_fingerprint
+      AND stage.execution_status IN ('queued', 'running')
+      AND node.stage_attempt_id = NEW.stage_attempt_id
+      AND node.node_id = NEW.stage_key
+      AND node.generation = NEW.node_generation
+      AND node.attempt = NEW.node_attempt_ordinal
+      AND node.status = 'waiting'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review gate binding does not match frozen request or stage lineage');
+END;
+
+-- trigger authoring_review_decisions_v22_lineage_insert
+CREATE TRIGGER authoring_review_decisions_v22_lineage_insert
+BEFORE INSERT ON authoring_review_decisions_v22
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM authoring_review_requests_v22 AS request
+    JOIN authoring_review_gate_bindings_v22 AS binding ON binding.review_request_id = request.id
+    WHERE request.id = NEW.review_request_id
+      AND binding.id = NEW.binding_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review decision does not match immutable gate binding');
+END;
+
+-- trigger authoring_review_gate_resolutions_v22_lineage_insert
+CREATE TRIGGER authoring_review_gate_resolutions_v22_lineage_insert
+BEFORE INSERT ON authoring_review_gate_resolutions_v22
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM authoring_review_requests_v22 AS request
+    JOIN authoring_review_gate_bindings_v22 AS binding ON binding.review_request_id = request.id
+    JOIN authoring_review_decisions_v22 AS decision ON decision.binding_id = binding.id
+    WHERE request.id = NEW.review_request_id
+      AND binding.id = NEW.binding_id
+      AND decision.id = NEW.decision_id
+      AND decision.review_request_id = NEW.review_request_id
+      AND (
+          (decision.action = 'approve' AND NEW.verdict = 'pass')
+          OR (decision.action = 'request_changes' AND NEW.verdict = 'needs_repair')
+          OR (decision.action = 'reject_terminal' AND NEW.verdict = 'reject')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoring review gate resolution does not match immutable decision lineage');
 END;
 
 -- trigger workflow_runs_subject_binding_insert
@@ -3077,9 +3483,9 @@ WHEN (
         FROM authoring_sessions_v2 AS session
         JOIN authoring_sources_v2 AS source ON source.id = session.source_id
         WHERE session.id = NEW.authoring_session_id
-          AND NEW.subject_id = session.id
-          AND NEW.subject_revision_id = source.id
-          AND NEW.subject_digest = source.source_fingerprint
+          AND NEW.subject_id = source.id
+          AND NEW.subject_revision_id = session.id
+          AND NEW.subject_digest = source.snapshot_content_digest
     )
 )
 BEGIN
@@ -3125,9 +3531,9 @@ WHEN NOT EXISTS (
       AND task.source_commit = source.commit_sha
       AND run.subject_kind = 'authoring_session'
       AND run.authoring_session_id = session.id
-      AND run.subject_id = session.id
-      AND run.subject_revision_id = source.id
-      AND run.subject_digest = source.source_fingerprint
+      AND run.subject_id = source.id
+      AND run.subject_revision_id = session.id
+      AND run.subject_digest = source.snapshot_content_digest
       AND revision.task_id = task.id
       AND revision.version_number = 1
       AND revision.parent_revision_id IS NULL
@@ -3137,6 +3543,56 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'authoring task materialization does not match frozen session/run/source lineage');
+END;
+
+-- trigger authoring_phase1_handoffs_v2_binding_insert
+-- The Store cannot parse the handoff object bytes, but it still proves every
+-- relational fact around that artifact: it must be the unique completed
+-- materialize_task output of the same source/session Run and the one sealed
+-- generated revision recorded by authoring_task_materializations_v2.
+CREATE TRIGGER authoring_phase1_handoffs_v2_binding_insert
+BEFORE INSERT ON authoring_phase1_handoffs_v2
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_runs AS run
+    JOIN authoring_sessions_v2 AS session ON session.id = run.authoring_session_id
+    JOIN authoring_sources_v2 AS source ON source.id = session.source_id
+    JOIN authoring_task_materializations_v2 AS materialization ON materialization.authoring_run_id = run.id
+    JOIN task_revisions AS revision ON revision.id = materialization.revision_id
+    JOIN artifact_refs_v4 AS artifact ON artifact.id = NEW.handoff_artifact_id
+    JOIN stage_attempts AS attempt ON attempt.id = artifact.attempt_id
+    WHERE run.id = NEW.authoring_run_id
+      AND run.subject_kind = 'authoring_session'
+      AND run.workflow_template_id = 'harbor.standard-authoring'
+      AND run.workflow_template_version = '1.0.0'
+      AND run.authoring_session_id = NEW.authoring_session_id
+      AND run.subject_id = NEW.authoring_source_id
+      AND run.subject_revision_id = NEW.authoring_session_id
+      AND session.source_id = NEW.authoring_source_id
+      AND session.target_task_id = NEW.task_id
+      AND materialization.session_id = NEW.authoring_session_id
+      AND materialization.source_id = NEW.authoring_source_id
+      AND materialization.task_id = NEW.task_id
+      AND materialization.revision_id = NEW.revision_id
+      AND materialization.task_digest = NEW.task_digest
+      AND revision.task_id = NEW.task_id
+      AND revision.task_digest = NEW.task_digest
+      AND revision.origin = 'generated'
+      AND revision.state = 'sealed'
+      AND artifact.run_id = run.id
+      AND artifact.stage_key = 'materialize_task'
+      AND artifact.artifact_key = 'authoring_task_handoff'
+      AND artifact.schema_version = 'harbor.authoring-task-handoff.v1'
+      AND artifact.subject_revision_id = NEW.authoring_session_id
+      AND artifact.subject_digest = source.snapshot_content_digest
+      AND attempt.run_id = run.id
+      AND attempt.id = artifact.attempt_id
+      AND attempt.stage_key = 'materialize_task'
+      AND attempt.execution_status = 'completed'
+      AND attempt.verdict IN ('pass', 'advisory')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoring Phase-1 handoff does not match persisted materialization lineage');
 END;
 
 -- trigger workflow_runs_content_immutable

@@ -30,10 +30,14 @@ var (
 // and CLI adapters should depend on the individual services below rather than
 // modify workspaces, SQLite records, or task snapshots directly.
 type LifecycleServices struct {
-	Tasks              *TaskService
-	Revisions          *RevisionService
-	Runs               *RunService
-	Reviews            *ReviewService
+	Tasks     *TaskService
+	Revisions *RevisionService
+	Runs      *RunService
+	Reviews   *ReviewService
+	// AuthoringReviews owns source/session-bound review gates that exist
+	// before a generated task has its first TaskRevision. It is deliberately
+	// separate from Reviews, whose contract is restricted to TaskRevision.
+	AuthoringReviews   *AuthoringReviewService
 	Releases           *ReleaseService
 	Deletion           *DeletionService
 	Control            *ExecutionControlService
@@ -48,6 +52,15 @@ type LifecycleServices struct {
 	WorkerHandoffs     *RunWorkerHandoffService
 	Mutations          *LifecycleMutationService
 	EvaluatorLaunches  *CodeEdgeEvaluatorLaunchService
+	// AuthoringLaunches owns source capture and the source/session half of a
+	// Standard task creation. It is distinct from StandardAuthoringHandoffs:
+	// launch has no task revision yet, while handoff starts only after the
+	// materialize_task receipt has created one.
+	AuthoringLaunches *StandardAuthoringLaunchService
+	// StandardAuthoringHandoffs owns the only durable bridge from a persisted
+	// pre-materialization authoring receipt to an independent CodeEdge Phase-1
+	// task-revision Run. It never accepts a caller-created profile or spec.
+	StandardAuthoringHandoffs *StandardAuthoringHandoffService
 	// EvaluatorEvidenceHandoffs records the immutable, verified bridge from a
 	// completed CodeEdge evaluator child Run to its approved Phase-1 parent.
 	// It is deliberately separate from launch and compliance: it never starts
@@ -130,6 +143,18 @@ type LifecycleServicesOptions struct {
 	// CLI and TUI callers never provide its profile, execution specification,
 	// model selection, or stage operation data.
 	EvaluatorRunDefinitionProvider EvaluatorRunDefinitionProvider
+	// StandardAuthoringSourceCapturer and StandardAuthoringRunDefinitionProvider
+	// are the deployment-owned inputs for the fixed Tower HTTP Standard
+	// authoring launch. Neither is derived from a CLI/TUI request. Omitting
+	// either leaves the launch surface fail-closed while retaining the rest of
+	// the lifecycle control plane.
+	StandardAuthoringSourceCapturer        StandardAuthoringSourceCapturer
+	StandardAuthoringRunDefinitionProvider StandardAuthoringRunDefinitionProvider
+	// CodeEdgePhase1RunDefinitionProvider supplies the closed task-bound
+	// parent definition consumed after Standard authoring has persisted its
+	// materialization handoff. It is deliberately separate from the evaluator
+	// child provider: their templates and catalog/lock receipts are distinct.
+	CodeEdgePhase1RunDefinitionProvider CodeEdgePhase1RunDefinitionProvider
 	// CodeEdgeEvaluatorObserver is the deployment-owned, read-only recovery
 	// port for an already-started Qwen or Opus evaluator. It is optional for
 	// read/control-plane and test compositions; without it the runtime retains
@@ -211,6 +236,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		Revisions:                 &RevisionService{core: core},
 		Runs:                      &RunService{core: core},
 		Reviews:                   &ReviewService{core: core},
+		AuthoringReviews:          &AuthoringReviewService{core: core},
 		Releases:                  &ReleaseService{core: core},
 		Deletion:                  &DeletionService{core: core},
 		Control:                   &ExecutionControlService{core: core},
@@ -225,6 +251,8 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		WorkerHandoffs:            &RunWorkerHandoffService{core: core},
 		Mutations:                 mutations,
 		EvaluatorLaunches:         &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider},
+		AuthoringLaunches:         newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider),
+		StandardAuthoringHandoffs: &StandardAuthoringHandoffService{core: core, definitions: options.CodeEdgePhase1RunDefinitionProvider},
 		EvaluatorEvidenceHandoffs: &CodeEdgeEvaluatorEvidenceHandoffService{core: core},
 		core:                      core,
 	}, nil
@@ -252,15 +280,29 @@ func (services *LifecycleServices) Store() *store.Store {
 
 // CatalogLockAttestedWorkflowkitProviderResolver returns the one production
 // provider resolver that was installed when these services were composed. It
-// deliberately exposes only the catalog-lock-attested form: a worker must not
-// reuse an arbitrary test resolver, a mutable registry, or a PATH fallback.
-// Nil means this is a read/control-plane composition with no installed
-// production external-operation capability.
+// remains for the single-template composition API; a multi-template package
+// instead exposes TemplateWorkflowkitProviderOperationResolver through
+// WorkflowkitProviderOperationResolver below. A worker must never reuse an
+// arbitrary test resolver, mutable registry, or PATH fallback.
 func (services *LifecycleServices) CatalogLockAttestedWorkflowkitProviderResolver() *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver {
 	if services == nil || services.core == nil {
 		return nil
 	}
 	resolver, _ := services.core.operationResolver.(*stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver)
+	return resolver
+}
+
+// WorkflowkitProviderOperationResolver exposes the controlled production
+// provider boundary installed by composition. It can be either one
+// catalog-lock-attested template bundle or the explicit template router used
+// by a packaged Standard -> Phase-1 -> evaluator installation. Nil means this
+// is a read/control-plane composition and the worker must retain its rejecting
+// provider resolver.
+func (services *LifecycleServices) WorkflowkitProviderOperationResolver() stageprovider.WorkflowkitProviderOperationResolver {
+	if services == nil || services.core == nil {
+		return nil
+	}
+	resolver, _ := services.core.operationResolver.(stageprovider.WorkflowkitProviderOperationResolver)
 	return resolver
 }
 
@@ -991,15 +1033,28 @@ type StartRunRequest struct {
 	// the configured catalog-lock identity when the resolver provides one.
 	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
 	ParentRunID                   string
-	Trigger                       string
-	ExecutionEpoch                int
-	Actor                         string
-	Reason                        string
+	// authoringPhase1HandoffID is populated only by StandardAuthoringHandoffService
+	// after it has verified the persisted handoff artifact and prepared the
+	// unique Store bridge. It is deliberately not exported to CLI/TUI callers;
+	// generic StartRun rejects an AuthoringSession parent without it.
+	authoringPhase1HandoffID string
+	Trigger                  string
+	ExecutionEpoch           int
+	Actor                    string
+	Reason                   string
 }
 
 type runManifest struct {
-	Format                        string                                                `json:"format"`
-	RunID                         string                                                `json:"run_id"`
+	Format string `json:"format"`
+	RunID  string `json:"run_id"`
+	// Subject* is the generic, kernel-facing immutable subject identity.  The
+	// task/revision fields below remain the task-lifecycle projection and are
+	// intentionally empty for an AuthoringSession Run.
+	SubjectKind                   store.WorkflowRunSubjectKind                          `json:"subject_kind,omitempty"`
+	SubjectID                     string                                                `json:"subject_id,omitempty"`
+	SubjectRevisionID             string                                                `json:"subject_revision_id,omitempty"`
+	SubjectDigest                 string                                                `json:"subject_digest,omitempty"`
+	AuthoringSessionID            string                                                `json:"authoring_session_id,omitempty"`
 	TaskID                        string                                                `json:"task_id"`
 	Revision                      string                                                `json:"revision_id"`
 	Resolved                      workflowadapter.ResolvedWorkflow                      `json:"resolved_workflow"`
@@ -1027,10 +1082,47 @@ func decodeRunManifest(run store.WorkflowRun) (runManifest, error) {
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
 		return runManifest{}, err
 	}
-	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID || manifest.TaskID != run.TaskID || manifest.Revision != run.RevisionID || manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat {
+	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != run.ID || manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat {
 		return runManifest{}, fmt.Errorf("run manifest does not match workflow run")
 	}
+	if err := validateRunManifestSubject(manifest, run); err != nil {
+		return runManifest{}, err
+	}
 	return manifest, nil
+}
+
+// validateRunManifestSubject proves the durable row, its on-disk manifest,
+// and the typed execution specification all use the same closed subject
+// coordinate.  Older task-only test fixtures may omit the duplicate generic
+// fields, but a newly-created AuthoringSession Run must always persist them:
+// it has no task-revision projection to fall back to.
+func validateRunManifestSubject(manifest runManifest, run store.WorkflowRun) error {
+	if manifest.TaskID != run.TaskID || manifest.Revision != run.RevisionID {
+		return fmt.Errorf("run manifest task projection does not match workflow run")
+	}
+	switch run.SubjectKind {
+	case store.WorkflowRunSubjectTaskRevision:
+		if run.TaskID == "" || run.RevisionID == "" || run.AuthoringSessionID != "" {
+			return fmt.Errorf("workflow run has invalid task-revision subject")
+		}
+		// Keep fixture compatibility while requiring exact equality whenever a
+		// generic projection is present in a newly written manifest.
+		if manifest.SubjectKind != "" || manifest.SubjectID != "" || manifest.SubjectRevisionID != "" || manifest.SubjectDigest != "" || manifest.AuthoringSessionID != "" {
+			if manifest.SubjectKind != run.SubjectKind || manifest.SubjectID != run.SubjectID || manifest.SubjectRevisionID != run.SubjectRevisionID || manifest.SubjectDigest != run.SubjectDigest || manifest.AuthoringSessionID != "" {
+				return fmt.Errorf("run manifest generic task-revision subject does not match workflow run")
+			}
+		}
+	case store.WorkflowRunSubjectAuthoringSession:
+		if run.TaskID != "" || run.RevisionID != "" || run.AuthoringSessionID == "" ||
+			manifest.SubjectKind != run.SubjectKind || manifest.SubjectID != run.SubjectID ||
+			manifest.SubjectRevisionID != run.SubjectRevisionID || manifest.SubjectDigest != run.SubjectDigest ||
+			manifest.AuthoringSessionID != run.AuthoringSessionID {
+			return fmt.Errorf("run manifest generic authoring-session subject does not match workflow run")
+		}
+	default:
+		return fmt.Errorf("workflow run has unsupported subject kind %q", run.SubjectKind)
+	}
+	return nil
 }
 
 // workflowRunExecutionPayload is the durable child-worker handoff. It carries
@@ -1055,6 +1147,9 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if service == nil || service.core == nil {
 		return store.WorkflowRun{}, fmt.Errorf("run service is not configured")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := store.ValidateUUIDv7(request.TaskID); err != nil {
 		return store.WorkflowRun{}, err
 	}
@@ -1068,6 +1163,9 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	}
 	if strings.TrimSpace(request.Trigger) == "" {
 		return store.WorkflowRun{}, fmt.Errorf("run trigger is required")
+	}
+	if err := service.validateAuthoringPhase1Parent(ctx, request); err != nil {
+		return store.WorkflowRun{}, err
 	}
 	template, err := resolveFrozenRunTemplate(request.Profile, request.ExecutionSpec)
 	if err != nil {
@@ -1229,6 +1327,10 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	manifest := runManifest{
 		Format:               "harbor.workflow-run-manifest.v2",
 		RunID:                runID,
+		SubjectKind:          store.WorkflowRunSubjectTaskRevision,
+		SubjectID:            request.TaskID,
+		SubjectRevisionID:    request.RevisionID,
+		SubjectDigest:        revision.TaskDigest,
 		TaskID:               request.TaskID,
 		Revision:             request.RevisionID,
 		Resolved:             resolved.Clone(),
@@ -1284,21 +1386,22 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		}
 	}
 	run, err := service.core.store.CreateWorkflowRun(ctx, store.CreateWorkflowRunRequest{
-		ID:                      runID,
-		TaskID:                  request.TaskID,
-		RevisionID:              request.RevisionID,
-		WorkflowTemplateID:      resolved.TemplateID,
-		WorkflowTemplateVersion: resolved.TemplateVersion,
-		ResolvedProfileHash:     string(resolved.ExecutionProfileFingerprint),
-		DefinitionHash:          string(resolved.DefinitionFingerprint),
-		RunManifestJSON:         string(encoded),
-		ParentRunID:             request.ParentRunID,
-		Trigger:                 request.Trigger,
-		ExecutionEpoch:          request.ExecutionEpoch,
-		Actor:                   request.Actor,
-		Reason:                  request.Reason,
-		InitialInputArtifacts:   initialInputs,
-		Dispatch:                &dispatch,
+		ID:                       runID,
+		TaskID:                   request.TaskID,
+		RevisionID:               request.RevisionID,
+		WorkflowTemplateID:       resolved.TemplateID,
+		WorkflowTemplateVersion:  resolved.TemplateVersion,
+		ResolvedProfileHash:      string(resolved.ExecutionProfileFingerprint),
+		DefinitionHash:           string(resolved.DefinitionFingerprint),
+		RunManifestJSON:          string(encoded),
+		ParentRunID:              request.ParentRunID,
+		AuthoringPhase1HandoffID: request.authoringPhase1HandoffID,
+		Trigger:                  request.Trigger,
+		ExecutionEpoch:           request.ExecutionEpoch,
+		Actor:                    request.Actor,
+		Reason:                   request.Reason,
+		InitialInputArtifacts:    initialInputs,
+		Dispatch:                 &dispatch,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrIdentityCollision) {
@@ -1406,7 +1509,8 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical []byte, requestedSpecificationFingerprint workflowkit.Fingerprint, finalSpecificationCanonical []byte, finalSpecificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
 	if run.TaskID != request.TaskID || run.RevisionID != request.RevisionID || run.WorkflowTemplateID != resolved.TemplateID ||
 		run.WorkflowTemplateVersion != resolved.TemplateVersion || run.ResolvedProfileHash != string(resolved.ExecutionProfileFingerprint) ||
-		run.DefinitionHash != string(resolved.DefinitionFingerprint) || run.Trigger != request.Trigger || run.ExecutionEpoch != request.ExecutionEpoch {
+		run.DefinitionHash != string(resolved.DefinitionFingerprint) || run.ParentRunID != request.ParentRunID ||
+		run.Trigger != request.Trigger || run.ExecutionEpoch != request.ExecutionEpoch {
 		return fmt.Errorf("%w: workflow run %s does not match requested immutable definition", store.ErrIdempotencyConflict, run.ID)
 	}
 	var manifest runManifest
@@ -1461,6 +1565,51 @@ func (service *RunService) validateRunExecutionSpec(ctx context.Context, request
 		return nil, "", err
 	}
 	return canonical, fingerprint, nil
+}
+
+// validateAuthoringPhase1Parent prevents the generic StartRun surface from
+// turning a source/session Run into an arbitrary task-bound parent. Only the
+// private handoff service may supply the already-prepared Store bridge; the
+// Store repeats this proof atomically with workflow_runs insertion.
+func (service *RunService) validateAuthoringPhase1Parent(ctx context.Context, request StartRunRequest) error {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return fmt.Errorf("run service is not configured")
+	}
+	parentID := strings.TrimSpace(request.ParentRunID)
+	handoffID := strings.TrimSpace(request.authoringPhase1HandoffID)
+	if parentID == "" {
+		if handoffID != "" {
+			return fmt.Errorf("authoring Phase-1 handoff requires a parent Run")
+		}
+		return nil
+	}
+	parent, err := service.core.store.GetWorkflowRun(ctx, parentID)
+	if err != nil {
+		return err
+	}
+	if parent == nil {
+		return fmt.Errorf("%w: parent workflow Run %s", ErrLifecycleNotFound, parentID)
+	}
+	if parent.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+		if handoffID != "" {
+			return fmt.Errorf("authoring Phase-1 handoff requires an AuthoringSession parent")
+		}
+		return nil
+	}
+	if handoffID == "" {
+		return fmt.Errorf("authoring parent requires a persisted Phase-1 handoff")
+	}
+	handoff, err := service.core.store.GetAuthoringPhase1Handoff(ctx, handoffID)
+	if err != nil {
+		return err
+	}
+	if handoff == nil || handoff.AuthoringRunID != parent.ID || handoff.ChildRunID != strings.TrimSpace(request.ID) ||
+		handoff.TaskID != request.TaskID || handoff.RevisionID != request.RevisionID ||
+		request.ExecutionSpec.Template.ID != workflowadapter.CodeEdgePhase1WorkflowTemplateID || request.ExecutionSpec.Template.Version != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion ||
+		request.Trigger != standardAuthoringHandoffRunTrigger {
+		return fmt.Errorf("authoring Phase-1 handoff does not match requested child Run")
+	}
+	return nil
 }
 
 func validateRunExecutionSpecOperationResolver(specification workflowadapter.RunExecutionSpec, resolver workflowadapter.StageOperationResolver) error {

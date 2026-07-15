@@ -80,7 +80,9 @@ const (
 
 // WorkflowRunSubjectKind distinguishes an ordinary immutable task-revision
 // execution from the pre-materialization source/session subject used only by
-// Standard task authoring. A run is always exactly one of these kinds.
+// Standard task authoring. For authoring_session, the generic coordinate is
+// (AuthoringSource ID, AuthoringSession ID, immutable snapshot digest). A run
+// is always exactly one of these kinds.
 type WorkflowRunSubjectKind string
 
 const (
@@ -337,10 +339,15 @@ type CreateWorkflowRunRequest struct {
 	DefinitionHash          string
 	RunManifestJSON         string
 	ParentRunID             string
-	Trigger                 string
-	ExecutionEpoch          int
-	Actor                   string
-	Reason                  string
+	// AuthoringPhase1HandoffID is required only for the closed transition from
+	// a Standard AuthoringSession parent to its one CodeEdge Phase-1 child. A
+	// generic task-bound parent must leave it empty. The Store validates the
+	// referenced immutable handoff row before inserting the Run.
+	AuthoringPhase1HandoffID string
+	Trigger                  string
+	ExecutionEpoch           int
+	Actor                    string
+	Reason                   string
 	// InitialInputArtifacts are inserted before Dispatch in the same
 	// transaction. A worker can therefore never claim an initial job whose
 	// immutable run inputs are not yet durable.

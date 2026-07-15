@@ -164,6 +164,43 @@ func TestExecutionControlServicePersistsTargetedControlWithCAS(t *testing.T) {
 	}
 }
 
+func TestExecutionControlServiceUsesImmutableAuthoringSessionCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	services, source, session, task, run := newAuthoringSessionRuntimeFixture(t, "authoring-control-owner")
+
+	checkpoint, err := services.Control.CurrentCheckpoint(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.Sequence != uint64(run.Version) || checkpoint.ExecutionEpoch != run.ExecutionEpoch ||
+		checkpoint.SubjectVersion != store.AuthoringSessionControlSubjectVersion || checkpoint.SubjectID != source.ID ||
+		checkpoint.SubjectRevisionID != session.ID || checkpoint.SubjectDigest != source.SnapshotContentDigest ||
+		checkpoint.WorkflowFingerprint != run.DefinitionHash {
+		t.Fatalf("authoring control checkpoint = %+v, want immutable source/session coordinates", checkpoint)
+	}
+	if checkpoint.SubjectID == task.ID || checkpoint.SubjectRevisionID == task.CurrentRevisionID || checkpoint.SubjectVersion == task.Version {
+		t.Fatalf("authoring checkpoint borrowed mutable task coordinates: checkpoint=%+v task=%+v", checkpoint, task)
+	}
+
+	operation, err := services.Store().CreateExecutionControlOperation(ctx, store.ExecutionControlCommand{
+		OperationKey: "authoring-session-control-checkpoint", Action: store.ControlActionPause, RunID: run.ID,
+		Expected: checkpoint, Actor: "authoring-control-owner", Reason: "pause immutable authoring session", GracePeriod: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != store.ControlOperationRequested || operation.Expected != checkpoint {
+		t.Fatalf("authoring control operation = %+v", operation)
+	}
+	updated, err := services.Runs.Get(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != store.WorkflowRunPauseRequested || updated.Version != run.Version+1 {
+		t.Fatalf("authoring control did not atomically transition run: %+v", updated)
+	}
+}
+
 func newControlLifecycleFixture(t *testing.T, actor string) (*LifecycleServices, store.TaskV2, store.TaskRevision) {
 	t.Helper()
 	ctx := context.Background()
@@ -185,4 +222,57 @@ func newControlLifecycleFixture(t *testing.T, actor string) (*LifecycleServices,
 		t.Fatal(err)
 	}
 	return services, task, revision
+}
+
+func newAuthoringSessionRuntimeFixture(t *testing.T, actor string) (*LifecycleServices, store.AuthoringSource, store.AuthoringSession, store.TaskV2, store.WorkflowRun) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	services, err := newLifecycleServicesForTest(root, database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("a", 64)
+	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
+		SnapshotArtifactRef: digest, SnapshotContentDigest: digest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
+		IdempotencyKey: "authoring-session-runtime-source", Actor: actor, Reason: "freeze immutable authoring source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := database.CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: "authoring-session-runtime", Title: "Authoring session runtime fixture", SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA,
+		Actor: actor, Reason: "reserve draft task quota ownership",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.0.0",
+		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "authoring-session-runtime-session", Actor: actor, Reason: "freeze immutable authoring session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID, WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:authoring-session-runtime-profile", DefinitionHash: "sha256:authoring-session-runtime-definition",
+		RunManifestJSON: `{}`, Trigger: "task.generate", Actor: actor, Reason: "start immutable authoring session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning, Actor: actor, Reason: "start authoring session worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return services, source, session, task, run
 }

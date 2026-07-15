@@ -24,7 +24,7 @@ type workflowkitStageBackend struct {
 	execution   DurableJobExecution
 	job         store.DurableJob
 	run         store.WorkflowRun
-	revision    store.TaskRevision
+	subject     workflowRunSubject
 	frozen      frozenRunDefinition
 	payload     frozenStageExecutionPayload
 	stage       workflowkit.StageDescriptor
@@ -43,10 +43,10 @@ type workflowkitStageBackend struct {
 	reviewResult *store.JobState
 }
 
-func (runtime *FrozenExecutionRuntime) executeWorkflowkitStage(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, revision store.TaskRevision, frozen frozenRunDefinition, payload frozenStageExecutionPayload, attempt store.StageAttempt, node store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, reservation stageQuotaReservation, monitor *stageControlMonitor) (StageExecutionResult, error) {
+func (runtime *FrozenExecutionRuntime) executeWorkflowkitStage(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, subject workflowRunSubject, frozen frozenRunDefinition, payload frozenStageExecutionPayload, attempt store.StageAttempt, node store.NodeAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, reservation stageQuotaReservation, monitor *stageControlMonitor) (StageExecutionResult, error) {
 	backend := &workflowkitStageBackend{
 		callContext: ctx,
-		runtime:     runtime, execution: execution, job: job, run: run, revision: revision, frozen: frozen, payload: payload,
+		runtime:     runtime, execution: execution, job: job, run: run, subject: subject, frozen: frozen, payload: payload,
 		stage: stage.Clone(), attempt: attempt, node: node, inputs: append([]workflowkit.ArtifactBinding(nil), inputs...), reservation: reservation, monitor: monitor,
 	}
 	if _, err := runtime.handleWorkflowkitStageClaim(ctx, backend); err != nil {
@@ -65,17 +65,17 @@ func (runtime *FrozenExecutionRuntime) executeWorkflowkitStage(ctx context.Conte
 	return stageResultFromWorkflowkit(*backend.result), nil
 }
 
-func (runtime *FrozenExecutionRuntime) executeWorkflowkitReviewGate(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, revision store.TaskRevision, frozen frozenRunDefinition, payload frozenStageExecutionPayload, attempt store.StageAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, review workflowadapter.ReviewStage) (store.JobState, error) {
+func (runtime *FrozenExecutionRuntime) executeWorkflowkitReviewGate(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, subject workflowRunSubject, frozen frozenRunDefinition, payload frozenStageExecutionPayload, attempt store.StageAttempt, stage workflowkit.StageDescriptor, inputs []workflowkit.ArtifactBinding, review workflowadapter.ReviewStage) (store.JobState, error) {
 	backend := &workflowkitStageBackend{
 		callContext: ctx,
-		runtime:     runtime, execution: execution, job: job, run: run, revision: revision, frozen: frozen, payload: payload,
+		runtime:     runtime, execution: execution, job: job, run: run, subject: subject, frozen: frozen, payload: payload,
 		stage: stage.Clone(), attempt: attempt, inputs: append([]workflowkit.ArtifactBinding(nil), inputs...), review: &review,
 	}
 	if _, err := runtime.handleWorkflowkitStageClaim(ctx, backend); err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
 	if backend.rejected != nil {
-		return runtime.projectStageTerminal(ctx, job, run, frozen, payload, revision, stage, attempt, inputs, stageQuotaReservation{}, StageExecutionResult{
+		return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, attempt, inputs, stageQuotaReservation{}, StageExecutionResult{
 			Outcome:      workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePolicy},
 			ErrorText:    backend.rejected.Error(),
 			FailureClass: string(workflowkit.FailurePolicy),
@@ -149,18 +149,15 @@ func (backend *workflowkitCoordinatorBackend) claim() (workflowkit.JobClaim, err
 	if lease.FencingToken == 0 || lease.ExpiresAt.IsZero() || strings.TrimSpace(lease.Owner) == "" {
 		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine coordinator has an invalid durable dispatch lease", ErrFrozenExecutionPayload)
 	}
-	revision, err := backend.runtime.core.store.GetTaskRevision(backend.callContext, backend.run.RevisionID)
+	subject, err := backend.runtime.core.resolveWorkflowRunSubject(backend.callContext, backend.run)
 	if err != nil {
 		return workflowkit.JobClaim{}, err
-	}
-	if revision == nil || revision.TaskID != backend.run.TaskID {
-		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine coordinator Run revision", ErrLifecycleNotFound)
 	}
 	// frozenExecution owns the canonical managed-input, catalog receipt and
 	// execution-spec proof used by both coordinator and stage claims.
 	proof := &workflowkitStageBackend{
 		callContext: backend.callContext, runtime: backend.runtime, job: backend.job,
-		run: backend.run, revision: *revision, frozen: backend.frozen,
+		run: backend.run, subject: subject, frozen: backend.frozen,
 		executionReason: "advance frozen workflow coordinator",
 	}
 	frozenExecution, err := proof.frozenExecution()
@@ -338,8 +335,11 @@ func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExe
 	if err := decodeStrictJSON(backend.run.RunManifestJSON, &manifest); err != nil {
 		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: decode public Engine run manifest: %v", ErrFrozenExecutionPayload, err)
 	}
-	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != backend.run.ID || manifest.TaskID != backend.run.TaskID || manifest.Revision != backend.run.RevisionID || manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat || len(manifest.ExecutionSpec) == 0 {
+	if manifest.Format != "harbor.workflow-run-manifest.v2" || manifest.RunID != backend.run.ID || manifest.Inputs == nil || manifest.Inputs.Format != runManifestInputsFormat || len(manifest.ExecutionSpec) == 0 {
 		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine run manifest has no canonical execution specification", ErrFrozenExecutionPayload)
+	}
+	if err := validateRunManifestSubject(manifest, backend.run); err != nil {
+		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine run manifest subject: %v", ErrFrozenExecutionPayload, err)
 	}
 	specification, err := workflowadapter.ParseRunExecutionSpecJSON(manifest.ExecutionSpec)
 	if err != nil {
@@ -353,11 +353,9 @@ func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExe
 	if err != nil || specificationFingerprint != manifest.Inputs.ExecutionSpecFingerprint {
 		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine execution specification fingerprint does not match manifest inputs", ErrFrozenExecutionPayload)
 	}
-	if specification.Selection.TaskID != backend.run.TaskID || specification.Selection.RevisionID != backend.run.RevisionID {
+	specificationSubject, err := specification.Selection.SubjectBinding()
+	if err != nil || specificationSubject != backend.subject.Binding || !backend.subject.matchesRun(backend.run) {
 		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine execution specification selection does not match Run", ErrFrozenExecutionPayload)
-	}
-	if backend.revision.ID != "" && (backend.revision.ID != backend.run.RevisionID || backend.revision.TaskID != backend.run.TaskID || string(specification.Selection.RevisionDigest) != backend.revision.TaskDigest) {
-		return workflowkit.FrozenExecution{}, fmt.Errorf("%w: public Engine execution specification selection does not match TaskRevision", ErrFrozenExecutionPayload)
 	}
 	binding, err := workflowkit.NewOpaqueExecutionBinding(workflowadapter.RunExecutionSpecFormat, workflowadapter.RunExecutionSpecVersion, canonical)
 	if err != nil {
@@ -372,11 +370,9 @@ func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExe
 		reason = "execute frozen stage " + string(backend.stage.Key)
 	}
 	execution := workflowkit.FrozenExecution{
-		ID:             backend.run.ID,
-		IdempotencyKey: "workflow-run:" + backend.run.ID,
-		Subject: workflowkit.SubjectBinding{
-			SubjectID: backend.run.TaskID, RevisionID: backend.run.RevisionID, Digest: workflowkit.SubjectDigest(backend.revision.TaskDigest),
-		},
+		ID:                    backend.run.ID,
+		IdempotencyKey:        "workflow-run:" + backend.run.ID,
+		Subject:               backend.subject.Binding,
 		Workflow:              backend.frozen.Workflow.Clone(),
 		DefinitionFingerprint: workflowkit.Fingerprint(backend.run.DefinitionHash),
 		ProfileFingerprint:    manifest.Resolved.ExecutionProfileFingerprint,
@@ -408,7 +404,7 @@ func (backend *workflowkitStageBackend) ReadStageInput(ctx context.Context, clai
 	if err := backend.matchesClaim(claim); err != nil {
 		return nil, err
 	}
-	reader := newStageInputReader(backend.runtime.core.store, backend.runtime.core.objects, backend.run, backend.revision, backend.inputs)
+	reader := newStageInputReaderForSubject(backend.runtime.core.store, backend.runtime.core.objects, backend.run, backend.subject, backend.inputs)
 	return reader(ctx, binding)
 }
 
@@ -470,7 +466,7 @@ func (backend *workflowkitStageBackend) CommitStageWait(ctx context.Context, com
 	if backend.review == nil || commit.Wait.Kind != workflowkit.StageWaitExternalDecision {
 		return "", fmt.Errorf("%w: only a frozen Harbor review gate may enter a public Engine external-decision wait", ErrFrozenExecutionPayload)
 	}
-	state, err := backend.runtime.openReviewGate(ctx, backend.job, backend.run, backend.revision, backend.frozen, backend.payload, backend.stage, backend.attempt, backend.inputs, *backend.review)
+	state, err := backend.runtime.openReviewGate(ctx, backend.job, backend.run, backend.subject, backend.frozen, backend.payload, backend.stage, backend.attempt, backend.inputs, *backend.review)
 	if err != nil {
 		return "", err
 	}
@@ -514,7 +510,7 @@ func stageResultFromWorkflowkit(result workflowkit.StageExecutionResult) StageEx
 	converted := StageExecutionResult{Outcome: result.Outcome, ErrorText: result.ErrorText, FailureClass: string(result.Outcome.Failure)}
 	converted.Artifacts = make([]StageArtifact, len(result.Artifacts))
 	for index, artifact := range result.Artifacts {
-		converted.Artifacts[index] = StageArtifact{Key: artifact.Name, SchemaVersion: artifact.SchemaVersion, Content: append([]byte(nil), artifact.Content...), TurnOrdinal: artifact.TurnOrdinal}
+		converted.Artifacts[index] = StageArtifact{ID: string(artifact.ID), Key: artifact.Name, SchemaVersion: artifact.SchemaVersion, Content: append([]byte(nil), artifact.Content...), TurnOrdinal: artifact.TurnOrdinal}
 	}
 	return converted
 }

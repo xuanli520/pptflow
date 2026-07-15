@@ -13,7 +13,7 @@ func TestRootCommandUsesV2LifecycleHardCutover(t *testing.T) {
 	for _, command := range root.Commands() {
 		available[command.Name()] = true
 	}
-	for _, name := range []string{"task", "revision", "run", "review", "release", "budget", "workspace", "tui", "doctor"} {
+	for _, name := range []string{"task", "revision", "run", "review", "authoring", "release", "budget", "workspace", "tui", "doctor"} {
 		if !available[name] {
 			t.Fatalf("V2 root command %q is not registered: %v", name, available)
 		}
@@ -76,6 +76,7 @@ func TestV2CommandGroupsRejectUnexpectedPositionalArguments(t *testing.T) {
 		{name: "task", new: newTaskCommand, args: []string{"legacy-task-command"}},
 		{name: "revision", new: newRevisionCommand, args: []string{"legacy-revision-command"}},
 		{name: "review", new: newReviewCommand, args: []string{"legacy-review-command"}},
+		{name: "authoring", new: newAuthoringCommand, args: []string{"legacy-authoring-command"}},
 		{name: "run retry-stage", new: newRunCommandV2, args: []string{"retry-stage"}},
 		{name: "run rerun", new: newRunCommandV2, args: []string{"rerun"}},
 		{name: "release", new: newReleaseCommand, args: []string{"legacy-release-command"}},
@@ -103,6 +104,7 @@ func TestV2CommandGroupsStillResolveKnownSubcommands(t *testing.T) {
 		{name: "task purge", new: newTaskCommand, child: "purge"},
 		{name: "revision list", new: newRevisionCommand, child: "list"},
 		{name: "review decide", new: newReviewCommand, child: "decide"},
+		{name: "authoring review", new: newAuthoringCommand, child: "review"},
 		{name: "run start", new: newRunCommandV2, child: "start"},
 		{name: "release package", new: newReleaseCommand, child: "package"},
 		{name: "workspace list", new: newWorkspaceCommand, child: "list"},
@@ -140,6 +142,7 @@ func TestTypedLifecycleMutationCommandsExposeUUIDv7KeysAndRetireUnownedIdentityF
 		{name: "task restore", new: newTaskCommand, path: []string{"restore"}},
 		{name: "run start", new: newRunCommandV2, path: []string{"start"}},
 		{name: "review decide", new: newReviewCommand, path: []string{"decide"}},
+		{name: "authoring review decide", new: newAuthoringCommand, path: []string{"review", "decide"}},
 		{name: "release package", new: newReleaseCommand, path: []string{"package"}},
 		{name: "release withdraw", new: newReleaseCommand, path: []string{"withdraw"}},
 	} {

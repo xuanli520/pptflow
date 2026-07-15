@@ -854,6 +854,84 @@ func mustTaskHubCodeEdgeUUID(t *testing.T) string {
 	return id
 }
 
+func newTaskHubAuthoringReviewFixture(t *testing.T) (context.Context, *app.LifecycleServices, store.TaskV2, store.AuthoringReviewGateOpenResult) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services, err := newTaskHubAdapterLifecycleServices(root, database)
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("a", 64)
+	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
+		SnapshotArtifactRef: digest, SnapshotContentDigest: digest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
+		IdempotencyKey: "tui-authoring-source-" + t.Name(), Actor: "author", Reason: "freeze TUI authoring source",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	task, err := database.CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: "tui-authoring-review-" + strings.ToLower(strings.ReplaceAll(t.Name(), "_", "-")), Title: "TUI authoring review fixture",
+		SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA, Actor: "author", Reason: "reserve TUI draft ownership",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.0.0",
+		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "tui-authoring-session-" + t.Name(), Actor: "author", Reason: "freeze TUI authoring session",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	run, err := database.CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID, WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:tui-authoring-profile", DefinitionHash: "sha256:tui-authoring-definition",
+		RunManifestJSON: `{}`, Trigger: "task.generate", Actor: "author", Reason: "start TUI authoring Run",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning, Actor: "author", Reason: "run TUI authoring fixture",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	stage, err := database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: run.ID, StageKey: "task_review", StageGroup: "authoring", Ordinal: 1,
+		InputFingerprint: "sha256:tui-authoring-review-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		Actor: "author", Reason: "prepare TUI authoring review gate",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	opened, err := database.OpenAuthoringReviewGate(ctx, store.OpenAuthoringReviewGateRequest{
+		IdempotencyKey: "open-tui-authoring-review-" + stage.ID, RunID: run.ID, AuthoringSessionID: session.ID, AuthoringSourceID: source.ID,
+		SourceSnapshotDigest: source.SnapshotContentDigest, ExpectedRunVersion: run.Version, DefinitionHash: run.DefinitionHash,
+		StageAttemptID: stage.ID, ExpectedStageAttemptVersion: stage.Version, StageKey: stage.StageKey, ReviewKind: "task_direction",
+		NodeGeneration: 0, NodeAttemptOrdinal: 1, InputBindingsJSON: `{"ports":["repo_analysis"]}`,
+		InputFingerprint: stage.InputFingerprint, EvidenceManifestDigest: "sha256:tui-authoring-review-evidence", Actor: "worker", Reason: "open TUI source/session review gate",
+	})
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	return ctx, services, task, opened
+}
+
 func TestAppTaskHubLifecycleAdapterReviewDecisionUsesV12CheckpointAndReceipt(t *testing.T) {
 	ctx, services, task, revision, review := newTaskHubReviewMutationFixture(t)
 	adapter := NewAppTaskHubLifecycleAdapter(services)
@@ -906,6 +984,95 @@ func TestAppTaskHubLifecycleAdapterReviewDecisionUsesV12CheckpointAndReceipt(t *
 	decisions, err := services.Store().ListReviewDecisionsForRequest(ctx, review.ID)
 	if err != nil || len(decisions) != 1 || decisions[0].ID != key {
 		t.Fatalf("review decision replay did not retain one TUI idempotency key: %+v, %v", decisions, err)
+	}
+}
+
+func TestAppTaskHubLifecycleAdapterAuthoringReviewUsesSourceSessionCheckpoint(t *testing.T) {
+	ctx, services, task, opened := newTaskHubAuthoringReviewFixture(t)
+	defer services.Store().Close()
+	adapter := NewAppTaskHubLifecycleAdapter(services)
+
+	snapshot, err := adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubTasksTab})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taskProjection *TaskHubTask
+	for index := range snapshot.Tasks {
+		if snapshot.Tasks[index].TaskID == task.ID {
+			value := snapshot.Tasks[index]
+			taskProjection = &value
+			break
+		}
+	}
+	if taskProjection == nil || taskProjection.ActiveAuthoringReviewID != opened.Request.ID ||
+		taskProjection.ActiveAuthoringReviewRunID != opened.Run.ID {
+		t.Fatalf("Task Hub did not expose the single open authoring review target: %+v", taskProjection)
+	}
+	if state, found := taskHubActionStateFor(taskProjection.Actions, TaskHubActionApproveReview); !found || !state.Enabled {
+		t.Fatalf("source/session review action was not available on its draft Task: %+v", state)
+	}
+	var runProjection *TaskHubRun
+	for index := range snapshot.Runs {
+		if snapshot.Runs[index].RunID == opened.Run.ID {
+			value := snapshot.Runs[index]
+			runProjection = &value
+			break
+		}
+	}
+	if runProjection == nil || runProjection.TaskID != task.ID || runProjection.RevisionID != "" {
+		t.Fatalf("Task Hub did not project AuthoringSession Run through its draft Task ownership: %+v", runProjection)
+	}
+
+	detail, err := adapter.QueryTaskHubDetail(ctx, TaskHubDetailQuery{RunID: opened.Run.ID})
+	if err != nil {
+		t.Fatalf("read authoring Run detail without a TaskRevision: %v", err)
+	}
+	if detail.Task.TaskID != task.ID || detail.SelectedRunID != opened.Run.ID || len(detail.AuthoringReviews) != 1 {
+		t.Fatalf("authoring detail omitted its draft ownership or gate: %+v", detail)
+	}
+	projectedReview := detail.AuthoringReviews[0]
+	if projectedReview.ReviewRequestID != opened.Request.ID || projectedReview.BindingID != opened.Binding.ID ||
+		projectedReview.RunID != opened.Run.ID || projectedReview.AuthoringSessionID != opened.Request.AuthoringSessionID ||
+		projectedReview.AuthoringSourceID != opened.Request.AuthoringSourceID || projectedReview.StageAttemptID != opened.StageAttempt.ID ||
+		projectedReview.State != string(store.AuthoringReviewGateOpen) {
+		t.Fatalf("authoring review detail projection lost immutable source/session facts: %+v", projectedReview)
+	}
+
+	target := TaskHubTarget{TaskID: task.ID, RunID: opened.Run.ID, AuthoringReviewRequestID: opened.Request.ID}
+	plan, err := adapter.PlanTaskHubCommand(ctx, TaskHubCommand{Action: TaskHubActionApproveReview, Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ConfirmationNeeded || plan.AuthoringReviewExpected.ReviewRequestID != opened.Request.ID ||
+		plan.AuthoringReviewExpected.BindingID != opened.Binding.ID || plan.AuthoringReviewExpected.RunID != opened.Run.ID ||
+		plan.AuthoringReviewExpected.StageAttemptID != opened.StageAttempt.ID || plan.AuthoringReviewExpected.AuthoringSessionID != opened.Request.AuthoringSessionID ||
+		plan.Expected.RevisionID != "" || plan.Expected.ReviewRequestID != "" {
+		t.Fatalf("authoring review plan did not preserve a source/session-only checkpoint: %+v", plan)
+	}
+	key := mustTaskHubCodeEdgeUUID(t)
+	request := TaskHubMutationRequest{
+		Action: TaskHubActionApproveReview, Target: target, AuthoringReviewExpected: plan.AuthoringReviewExpected,
+		IdempotencyKey: key, Actor: "tester", Reason: "approve source/session gate through Task Hub",
+	}
+	result, err := adapter.ExecuteTaskHubMutation(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ReceiptID == "" || result.ExecutionID == "" {
+		t.Fatalf("authoring Task Hub decision did not return immutable decision/job identities: %+v", result)
+	}
+	replay, err := adapter.ExecuteTaskHubMutation(ctx, request)
+	if err != nil {
+		t.Fatalf("replay source/session review through Task Hub: %v", err)
+	}
+	if replay.ReceiptID != result.ReceiptID || replay.ExecutionID != result.ExecutionID {
+		t.Fatalf("authoring Task Hub replay created different durable identities: first=%+v replay=%+v", result, replay)
+	}
+	if decisions, err := services.Store().ListAuthoringReviewDecisionsForRequest(ctx, opened.Request.ID); err != nil || len(decisions) != 1 || decisions[0].ID != result.ReceiptID || decisions[0].IdempotencyKey != key {
+		t.Fatalf("authoring Task Hub decision was not persisted as one source/session fact: %+v err=%v", decisions, err)
+	}
+	if generic, err := services.Store().GetReviewRequest(ctx, opened.Request.ID); err != nil || generic != nil {
+		t.Fatalf("authoring Task Hub decision wrote TaskRevision review state: request=%+v err=%v", generic, err)
 	}
 }
 

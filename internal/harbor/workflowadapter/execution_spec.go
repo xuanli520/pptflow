@@ -509,6 +509,13 @@ type RunExecutionSpec struct {
 // their own controlled checkout/runtime/secret resolution and never receive
 // ambient paths or secret values from this document.
 type StageOperationResolution struct {
+	// Template is copied from the enclosing frozen RunExecutionSpec.  A
+	// multi-template deployment resolver uses this exact identity to select its
+	// one catalog/lock/provider bundle; it is never inferred from a stage key,
+	// provider ID, or operation name.  The field is derived rather than
+	// serialized because a StageOperationResolution is an execution-time view
+	// of the already-canonical specification.
+	Template       TemplateReference
 	StageKey       workflowkit.StageKey
 	StageType      StageBindingType
 	Plugin         workflowkit.PluginBinding
@@ -697,7 +704,7 @@ func (spec RunExecutionSpec) ResolveStageOperation(key workflowkit.StageKey) (St
 		secrets = append(secrets, secret)
 	}
 	return StageOperationResolution{
-		StageKey: key, StageType: stageType, Plugin: base.Plugin, Provider: provider,
+		Template: spec.Template, StageKey: key, StageType: stageType, Plugin: base.Plugin, Provider: provider,
 		Operation: base.Operation, Checkout: checkout, Runtime: runtime,
 		ArtifactInputs: append([]ArtifactInputReference(nil), base.ArtifactInputs...), Secrets: secrets,
 	}, nil
@@ -820,6 +827,17 @@ func (spec RunExecutionSpec) ValidateFor(catalog StageCatalog) error {
 // executions while requiring CodeEdge Phase-1 to freeze every final-compliance
 // decision input with its Run.
 func (spec RunExecutionSpec) validateTemplateExtension() error {
+	selectionKind, err := spec.Selection.resolvedKind()
+	if err != nil {
+		return err
+	}
+	if spec.Template.Equal(StandardAuthoringTemplateReference()) {
+		if selectionKind != RunSelectionAuthoringSession {
+			return fmt.Errorf("%w: Standard authoring execution specification requires an authoring-session selection", errInvalidExecutionSpec)
+		}
+	} else if selectionKind == RunSelectionAuthoringSession {
+		return fmt.Errorf("%w: authoring-session selection is only accepted by Standard authoring template %s@%s", errInvalidExecutionSpec, StandardAuthoringWorkflowTemplateID, StandardAuthoringWorkflowTemplateVersion)
+	}
 	if spec.Template.Equal(CodeEdgePhase1TemplateReference()) {
 		if spec.CodeEdgeFinalCompliancePolicy == nil {
 			return fmt.Errorf("%w: CodeEdge Phase-1 execution specification requires a final compliance policy", errInvalidExecutionSpec)

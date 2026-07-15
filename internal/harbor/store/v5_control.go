@@ -329,20 +329,46 @@ func validateControlCheckpoint(checkpoint ControlCheckpointRef) error {
 }
 
 func verifyControlCheckpointTx(ctx context.Context, tx *sql.Tx, run WorkflowRun, checkpoint ControlCheckpointRef) error {
-	task, err := getTaskV2Tx(ctx, tx, run.TaskID)
-	if err != nil {
-		return err
+	switch run.SubjectKind {
+	case WorkflowRunSubjectTaskRevision:
+		task, err := getTaskV2Tx(ctx, tx, run.TaskID)
+		if err != nil {
+			return err
+		}
+		revision, err := getTaskRevisionTx(ctx, tx, run.RevisionID)
+		if err != nil {
+			return err
+		}
+		if checkpoint.Sequence != uint64(run.Version) || checkpoint.SubjectID != run.TaskID || checkpoint.SubjectRevisionID != run.RevisionID ||
+			checkpoint.SubjectVersion != task.Version || checkpoint.SubjectDigest != revision.TaskDigest ||
+			checkpoint.WorkflowFingerprint != run.DefinitionHash || checkpoint.ExecutionEpoch != run.ExecutionEpoch {
+			return fmt.Errorf("%w: control checkpoint is stale", ErrOptimisticLock)
+		}
+		return nil
+
+	case WorkflowRunSubjectAuthoringSession:
+		if strings.TrimSpace(run.TaskID) != "" || strings.TrimSpace(run.RevisionID) != "" || strings.TrimSpace(run.AuthoringSessionID) == "" {
+			return fmt.Errorf("%w: authoring workflow run has an invalid subject binding", ErrInvalidControl)
+		}
+		session, err := getAuthoringSessionTx(ctx, tx, run.AuthoringSessionID)
+		if err != nil {
+			return err
+		}
+		source, err := getAuthoringSourceTx(ctx, tx, session.SourceID)
+		if err != nil {
+			return err
+		}
+		if checkpoint.Sequence != uint64(run.Version) || checkpoint.SubjectID != source.ID || checkpoint.SubjectRevisionID != session.ID ||
+			checkpoint.SubjectVersion != AuthoringSessionControlSubjectVersion || checkpoint.SubjectDigest != source.SnapshotContentDigest ||
+			checkpoint.WorkflowFingerprint != run.DefinitionHash || checkpoint.ExecutionEpoch != run.ExecutionEpoch ||
+			run.SubjectID != source.ID || run.SubjectRevisionID != session.ID || run.SubjectDigest != source.SnapshotContentDigest {
+			return fmt.Errorf("%w: control checkpoint is stale", ErrOptimisticLock)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("%w: unsupported workflow run subject kind %q", ErrInvalidControl, run.SubjectKind)
 	}
-	revision, err := getTaskRevisionTx(ctx, tx, run.RevisionID)
-	if err != nil {
-		return err
-	}
-	if checkpoint.Sequence != uint64(run.Version) || checkpoint.SubjectID != run.TaskID || checkpoint.SubjectRevisionID != run.RevisionID ||
-		checkpoint.SubjectVersion != task.Version || checkpoint.SubjectDigest != revision.TaskDigest ||
-		checkpoint.WorkflowFingerprint != run.DefinitionHash || checkpoint.ExecutionEpoch != run.ExecutionEpoch {
-		return fmt.Errorf("%w: control checkpoint is stale", ErrOptimisticLock)
-	}
-	return nil
 }
 
 // requestControlTargetTransitionTx makes the durable command and the run's

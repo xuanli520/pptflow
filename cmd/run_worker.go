@@ -34,7 +34,7 @@ func defaultRunWorkerRuntimeFactory(services *app.LifecycleServices) (app.Durabl
 	// the registry is an explicit rejector; it never revives the retired
 	// app-specific executor, stage-name, PATH, or model-default fallback.
 	options := stageprovider.WorkflowkitRegistryOptions{Templates: workflowadapter.BuiltinTemplateReferences()}
-	if resolver := services.CatalogLockAttestedWorkflowkitProviderResolver(); resolver != nil {
+	if resolver := services.WorkflowkitProviderOperationResolver(); resolver != nil {
 		options.Providers = resolver
 	}
 	registry, err := stageprovider.NewWorkflowkitStageExecutorRegistry(options)

@@ -42,6 +42,20 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 				workflowkit.StageKey(ResultReview),
 			},
 		}, nil
+	case reference.Equal(StandardAuthoringTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:                   standardAuthoringCatalogID,
+			catalogVersion:              standardAuthoringCatalogVersion,
+			stageOrder:                  StandardAuthoringStageOrder(),
+			groups:                      standardAuthoringStageGroups(),
+			requiresOperatorOnlyPackage: false,
+			gates: []workflowkit.StageKey{
+				workflowkit.StageKey(TaskReview),
+				workflowkit.StageKey(ContentReview),
+				workflowkit.StageKey(SolutionReview),
+			},
+			dependencies: standardAuthoringDependencies(),
+		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
 			catalogID:                   codeEdgePhase1CatalogID,

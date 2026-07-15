@@ -103,6 +103,14 @@ func (service *LocalRuntimeService) AttachRun(ctx context.Context, request Attac
 	if run == nil {
 		return RunAttachment{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 	}
+	subject, err := service.core.resolveWorkflowRunSubject(ctx, *run)
+	if err != nil {
+		return RunAttachment{}, err
+	}
+	taskQuotaID, err := subject.quotaTaskID()
+	if err != nil {
+		return RunAttachment{}, err
+	}
 	observedAt := service.core.now().UTC()
 	stages, err := service.core.store.ListStageAttemptsForRun(ctx, run.ID)
 	if err != nil {
@@ -148,7 +156,7 @@ func (service *LocalRuntimeService) AttachRun(ctx context.Context, request Attac
 	if err != nil {
 		return RunAttachment{}, fmt.Errorf("list execution controls for run %s: %w", run.ID, err)
 	}
-	taskQuota, err := service.readQuotaScope(ctx, store.QuotaScopeTask, run.TaskID, observedAt)
+	taskQuota, err := service.readQuotaScope(ctx, store.QuotaScopeTask, taskQuotaID, observedAt)
 	if err != nil {
 		return RunAttachment{}, err
 	}
@@ -190,6 +198,14 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 	if run == nil {
 		return RunReconciliationResult{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 	}
+	subject, err := service.core.resolveWorkflowRunSubject(ctx, *run)
+	if err != nil {
+		return RunReconciliationResult{}, err
+	}
+	taskQuotaID, err := subject.quotaTaskID()
+	if err != nil {
+		return RunReconciliationResult{}, err
+	}
 	var recovered []store.ExpiredDurableJobRecovery
 	for {
 		batch, err := service.core.store.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{
@@ -217,7 +233,7 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 	if err != nil {
 		return RunReconciliationResult{}, fmt.Errorf("expire local worker leases for run %s: %w", run.ID, err)
 	}
-	expiredTaskQuotas, err := service.core.store.ExpireQuotaLeasesForScope(ctx, store.QuotaScopeTask, run.TaskID, actor, reason)
+	expiredTaskQuotas, err := service.core.store.ExpireQuotaLeasesForScope(ctx, store.QuotaScopeTask, taskQuotaID, actor, reason)
 	if err != nil {
 		return RunReconciliationResult{}, fmt.Errorf("expire task quota leases for run %s: %w", run.ID, err)
 	}
@@ -225,7 +241,7 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 	if err != nil {
 		return RunReconciliationResult{}, fmt.Errorf("expire actor quota leases for run %s: %w", run.ID, err)
 	}
-	if service.core.repairs != nil {
+	if subject.isTaskRevision() && service.core.repairs != nil {
 		if _, err := service.core.repairs.RecoverRunOutcome(ctx, run.ID); err != nil {
 			return RunReconciliationResult{}, fmt.Errorf("recover automatic repair for run %s: %w", run.ID, err)
 		}

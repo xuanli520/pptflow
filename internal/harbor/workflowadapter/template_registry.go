@@ -78,10 +78,12 @@ func templateKey(reference TemplateReference) templateReferenceKey {
 // input.
 func DefaultTemplateRegistry() TemplateRegistry {
 	standard := StandardWorkflowTemplate()
+	standardAuthoring := StandardAuthoringWorkflowTemplate()
 	codeEdge := CodeEdgePhase1WorkflowTemplate()
 	codeEdgeEvaluator := CodeEdgeEvaluatorChildWorkflowTemplate()
 	return TemplateRegistry{templates: map[templateReferenceKey]WorkflowTemplate{
 		templateKey(standard.Reference()):          standard,
+		templateKey(standardAuthoring.Reference()): standardAuthoring,
 		templateKey(codeEdge.Reference()):          codeEdge,
 		templateKey(codeEdgeEvaluator.Reference()): codeEdgeEvaluator,
 	}}
@@ -111,6 +113,7 @@ func ResolveWorkflowTemplate(reference TemplateReference) (WorkflowTemplate, err
 func BuiltinTemplateReferences() []TemplateReference {
 	references := []TemplateReference{
 		StandardTemplateReference(),
+		StandardAuthoringTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	}
@@ -125,6 +128,7 @@ func BuiltinTemplateReferences() []TemplateReference {
 
 func isBuiltinTemplateReference(reference TemplateReference) bool {
 	return reference.Equal(StandardTemplateReference()) ||
+		reference.Equal(StandardAuthoringTemplateReference()) ||
 		reference.Equal(CodeEdgePhase1TemplateReference()) ||
 		reference.Equal(CodeEdgeEvaluatorChildTemplateReference())
 }

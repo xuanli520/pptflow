@@ -111,6 +111,10 @@ func (runtime *FrozenExecutionRuntime) HandleDurableJob(ctx context.Context, exe
 		return runtime.handleRepairSessionAdvance(ctx, job)
 	case store.ReviewGateResolutionCommandType:
 		return runtime.handleReviewGateResolution(ctx, execution, job)
+	case store.AuthoringReviewGateResolutionCommandType:
+		return runtime.handleAuthoringReviewGateResolution(ctx, execution, job)
+	case standardAuthoringHandoffCommandType:
+		return runtime.handleStandardAuthoringHandoff(ctx, job)
 	default:
 		return store.JobFailed, fmt.Errorf("%w: unsupported command type %q", ErrFrozenExecutionPayload, job.CommandType)
 	}
@@ -160,6 +164,14 @@ func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context
 			}
 		case store.ReviewGateResolutionCommandType:
 			if err := runtime.reconcileRecoveredReviewGateResolution(ctx, job); err != nil {
+				return err
+			}
+		case store.AuthoringReviewGateResolutionCommandType:
+			if err := runtime.reconcileRecoveredAuthoringReviewGateResolution(ctx, job); err != nil {
+				return err
+			}
+		case standardAuthoringHandoffCommandType:
+			if err := runtime.reconcileRecoveredStandardAuthoringHandoff(ctx, job); err != nil {
 				return err
 			}
 		}
@@ -931,14 +943,11 @@ func (runtime *FrozenExecutionRuntime) enqueueStageAttempt(ctx context.Context, 
 	if !stage.AutomaticallyDispatchable() {
 		return fmt.Errorf("%w: operator-only stage %q cannot receive a StageAttempt", ErrFrozenExecutionPayload, stage.Key)
 	}
-	revision, err := runtime.core.store.GetTaskRevision(ctx, run.RevisionID)
+	subject, err := runtime.core.resolveWorkflowRunSubject(ctx, run)
 	if err != nil {
 		return err
 	}
-	if revision == nil || revision.TaskID != run.TaskID {
-		return fmt.Errorf("%w: run %s has no matching immutable revision", ErrFrozenExecutionPayload, run.ID)
-	}
-	inputs, err := resolveStageInputs(ctx, runtime.core.store, runtime.core.objects, run, *revision, stage)
+	inputs, err := resolveStageInputsForSubject(ctx, runtime.core.store, runtime.core.objects, run, subject, stage)
 	if err != nil {
 		return fmt.Errorf("resolve immutable inputs for stage %q: %w", stage.Key, err)
 	}
@@ -1117,14 +1126,11 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		return store.JobSucceeded, nil
 	}
 	stageAttempt := *loadedStageAttempt
-	revision, err := runtime.core.store.GetTaskRevision(ctx, run.RevisionID)
+	subject, err := runtime.core.resolveWorkflowRunSubject(ctx, run)
 	if err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
-	if revision == nil || revision.TaskID != run.TaskID {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: stage run revision is unavailable", ErrFrozenExecutionPayload))
-	}
-	if state, handled, controlErr := runtime.handlePreStageControl(ctx, job, run, *revision, stageAttempt); handled || controlErr != nil {
+	if state, handled, controlErr := runtime.handlePreStageControl(ctx, job, run, stageAttempt); handled || controlErr != nil {
 		return state, controlErr
 	}
 	if isCodeEdgeEvaluator {
@@ -1146,9 +1152,9 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	}
 
 	if review, isReviewGate := frozen.ReviewStage(stage.Key); isReviewGate {
-		inputs, inputErr := resolveStageInputs(ctx, runtime.core.store, runtime.core.objects, run, *revision, stage)
+		inputs, inputErr := resolveStageInputsForSubject(ctx, runtime.core.store, runtime.core.objects, run, subject, stage)
 		if inputErr != nil {
-			return runtime.projectStageTerminal(ctx, job, run, frozen, payload, *revision, stage, stageAttempt, nil, stageQuotaReservation{}, StageExecutionResult{
+			return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, stageAttempt, nil, stageQuotaReservation{}, StageExecutionResult{
 				Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePermanent}, ErrorText: inputErr.Error(), FailureClass: string(workflowkit.FailurePermanent),
 			}, execution.LeaseLost, nil)
 		}
@@ -1159,12 +1165,12 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		if string(inputFingerprint) != stageAttempt.InputFingerprint {
 			return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate input fingerprint drift", ErrFrozenExecutionPayload))
 		}
-		return runtime.executeWorkflowkitReviewGate(ctx, execution, job, run, *revision, frozen, payload, stageAttempt, stage, inputs, review)
+		return runtime.executeWorkflowkitReviewGate(ctx, execution, job, run, subject, frozen, payload, stageAttempt, stage, inputs, review)
 	}
 
-	reservation, admissionErr := runtime.admitStageQuota(ctx, execution, job, run, frozen.QuotaPolicy, stage)
+	reservation, admissionErr := runtime.admitStageQuota(ctx, execution, job, run, subject, frozen.QuotaPolicy, stage)
 	if admissionErr != nil {
-		return runtime.projectAdmissionFailure(ctx, job, run, frozen, payload, *revision, stage, &stageAttempt, admissionErr)
+		return runtime.projectAdmissionFailure(ctx, job, run, frozen, payload, subject, stage, &stageAttempt, admissionErr)
 	}
 	defer reservation.stop()
 
@@ -1173,9 +1179,9 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	monitor := runtime.startStageControlMonitor(stageContext, cancel, run.ID, stageAttempt.ID, job.CreatedBy)
 	defer monitor.stop()
 
-	inputs, err := resolveStageInputs(stageContext, runtime.core.store, runtime.core.objects, run, *revision, stage)
+	inputs, err := resolveStageInputsForSubject(stageContext, runtime.core.store, runtime.core.objects, run, subject, stage)
 	if err != nil {
-		return runtime.projectStageTerminal(ctx, job, run, frozen, payload, *revision, stage, stageAttempt, nil, reservation, StageExecutionResult{
+		return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, stageAttempt, nil, reservation, StageExecutionResult{
 			Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePermanent}, ErrorText: err.Error(), FailureClass: string(workflowkit.FailurePermanent),
 		}, nil, monitor)
 	}
@@ -1207,7 +1213,7 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, nodeErr)
 		}
 		attemptContext, attemptCancel := context.WithTimeout(stageContext, stage.Budget.AttemptTimeout)
-		result, nodeErr = runtime.executeWorkflowkitStage(attemptContext, execution, job, run, *revision, frozen, payload, stageAttempt, nodeAttempt, stage, inputs, reservation, monitor)
+		result, nodeErr = runtime.executeWorkflowkitStage(attemptContext, execution, job, run, subject, frozen, payload, stageAttempt, nodeAttempt, stage, inputs, reservation, monitor)
 		attemptContextErr := attemptContext.Err()
 		attemptCancel()
 		result = normalizeStageExecutionResult(result, nodeErr, attemptContextErr)
@@ -1243,7 +1249,7 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		}
 		break
 	}
-	return runtime.projectStageTerminal(ctx, job, run, frozen, payload, *revision, stage, stageAttempt, inputs, reservation, result, execution.LeaseLost, monitor)
+	return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, stageAttempt, inputs, reservation, result, execution.LeaseLost, monitor)
 }
 
 // failAdmittedStageIntegrity closes the accounting boundary for a corruption
@@ -1379,7 +1385,7 @@ func (reservation stageQuotaReservation) lost() bool {
 	return reservation.heartbeats != nil && reservation.heartbeats.lostLease()
 }
 
-func (runtime *FrozenExecutionRuntime) admitStageQuota(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, policy workflowadapter.ResolvedQuotaPolicy, stage workflowkit.StageDescriptor) (stageQuotaReservation, error) {
+func (runtime *FrozenExecutionRuntime) admitStageQuota(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, subject workflowRunSubject, policy workflowadapter.ResolvedQuotaPolicy, stage workflowkit.StageDescriptor) (stageQuotaReservation, error) {
 	if len(stage.QuotaClaims) == 0 {
 		return stageQuotaReservation{}, nil
 	}
@@ -1390,9 +1396,13 @@ func (runtime *FrozenExecutionRuntime) admitStageQuota(ctx context.Context, exec
 	if execution.Claim.Owner == "" {
 		return stageQuotaReservation{}, fmt.Errorf("%w: durable worker owner is required for stage quota", ErrFrozenExecutionPayload)
 	}
+	taskID, err := subject.quotaTaskID()
+	if err != nil {
+		return stageQuotaReservation{}, fmt.Errorf("%w: resolve stage quota subject: %v", ErrFrozenExecutionPayload, err)
+	}
 	decision, err := runtime.core.store.AdmitTaskActorQuota(ctx, store.AdmitTaskActorQuotaRequest{
 		IdempotencyKey:    "stage-admission:" + job.ID,
-		TaskID:            run.TaskID,
+		TaskID:            taskID,
 		Actor:             job.CreatedBy,
 		LeaseOwner:        execution.Claim.Owner,
 		LeaseTTL:          runtime.quotaLeaseTTL,
@@ -1459,7 +1469,7 @@ func (reservation stageQuotaReservation) recordDimension(ctx context.Context, ru
 	return nil
 }
 
-func (runtime *FrozenExecutionRuntime) projectAdmissionFailure(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, revision store.TaskRevision, stage workflowkit.StageDescriptor, attempt *store.StageAttempt, admissionErr error) (store.JobState, error) {
+func (runtime *FrozenExecutionRuntime) projectAdmissionFailure(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, subject workflowRunSubject, stage workflowkit.StageDescriptor, attempt *store.StageAttempt, admissionErr error) (store.JobState, error) {
 	if attempt == nil {
 		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: stage attempt is required for admission projection", ErrFrozenExecutionPayload))
 	}
@@ -1468,7 +1478,7 @@ func (runtime *FrozenExecutionRuntime) projectAdmissionFailure(ctx context.Conte
 		ErrorText:    admissionErr.Error(),
 		FailureClass: string(workflowkit.FailurePolicy),
 	}
-	return runtime.projectStageTerminal(ctx, job, run, frozen, payload, revision, stage, *attempt, nil, stageQuotaReservation{}, result, nil, nil)
+	return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, *attempt, nil, stageQuotaReservation{}, result, nil, nil)
 }
 
 // quotaLeaseHeartbeats keeps admission fences alive independently from the
@@ -1818,7 +1828,7 @@ func (runtime *FrozenExecutionRuntime) pendingStageControl(ctx context.Context, 
 	return &transitioned, nil
 }
 
-func (runtime *FrozenExecutionRuntime) handlePreStageControl(ctx context.Context, job store.DurableJob, run store.WorkflowRun, revision store.TaskRevision, attempt store.StageAttempt) (store.JobState, bool, error) {
+func (runtime *FrozenExecutionRuntime) handlePreStageControl(ctx context.Context, job store.DurableJob, run store.WorkflowRun, attempt store.StageAttempt) (store.JobState, bool, error) {
 	operation, err := runtime.pendingStageControl(ctx, run.ID, attempt.ID, job.CreatedBy)
 	if err != nil || operation == nil {
 		return "", operation != nil && err != nil, err
@@ -1880,7 +1890,7 @@ func (runtime *FrozenExecutionRuntime) handlePreStageControl(ctx context.Context
 	}
 }
 
-func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, revision store.TaskRevision, stage workflowkit.StageDescriptor, attempt store.StageAttempt, inputs []workflowkit.ArtifactBinding, reservation stageQuotaReservation, result StageExecutionResult, workerLeaseLost <-chan struct{}, monitor *stageControlMonitor) (store.JobState, error) {
+func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, subject workflowRunSubject, stage workflowkit.StageDescriptor, attempt store.StageAttempt, inputs []workflowkit.ArtifactBinding, reservation stageQuotaReservation, result StageExecutionResult, workerLeaseLost <-chan struct{}, monitor *stageControlMonitor) (store.JobState, error) {
 	reservation.stop()
 	var operation *store.DurableControlOperation
 	if monitor != nil {
@@ -1938,13 +1948,13 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 	manifestID := ""
 	var manifest store.ArtifactManifest
 	if len(result.Artifacts) != 0 {
-		persist := persistStageEvidence
+		persist := persistStageEvidenceForSubject
 		reason := "persist frozen stage diagnostic evidence"
 		if result.Outcome.Status == workflowkit.StatusCompleted {
-			persist = persistStageArtifacts
+			persist = persistStageArtifactsForSubject
 			reason = "persist frozen stage outputs"
 		}
-		persistedManifest, _, err := persist(ctx, runtime.core, run, revision, attempt, latestNodeAttempt(ctx, runtime.core.store, attempt.ID), stage, inputs, result.Artifacts, job.CreatedBy, reason)
+		persistedManifest, _, err := persist(ctx, runtime.core, run, subject, attempt, latestNodeAttempt(ctx, runtime.core.store, attempt.ID), stage, inputs, result.Artifacts, job.CreatedBy, reason)
 		if err != nil {
 			result = StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePermanent}, ErrorText: err.Error(), FailureClass: string(workflowkit.FailurePermanent)}
 		} else {
@@ -2103,6 +2113,13 @@ func (runtime *FrozenExecutionRuntime) afterStageTerminal(ctx context.Context, j
 	case store.StageExecutionCompleted:
 		switch attempt.Verdict {
 		case store.VerdictPass, store.VerdictAdvisory:
+			if run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
+				run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringWorkflowTemplateVersion &&
+				stage.Key == workflowkit.StageKey(workflowadapter.MaterializeTask) {
+				if err := runtime.enqueueStandardAuthoringHandoff(ctx, job, run, attempt); err != nil {
+					return runtime.failMalformedJob(ctx, job, fmt.Errorf("enqueue Standard authoring task handoff: %w", err))
+				}
+			}
 			// The StageAttempt has already committed its artifact, quota, and
 			// terminal-result projection. The following coordinator therefore
 			// gates on that state, rather than waiting for this worker's later
@@ -2206,6 +2223,116 @@ func (runtime *FrozenExecutionRuntime) enqueueNextCoordinator(ctx context.Contex
 		PayloadJSON: execution.PayloadJSON, IdempotencyKey: "continuation-next:" + execution.ID + ":" + stageJob.ID,
 		Actor: stageJob.CreatedBy, Reason: "advance frozen continuation after stage " + payload.StageAttemptID,
 	})
+	return err
+}
+
+// enqueueStandardAuthoringHandoff records the independent child-Run handoff
+// only after materialize_task's immutable output manifest and ArtifactRef are
+// durable. The generated ChildRunID lives in this job payload, so a crash or
+// replay cannot allocate a second Phase-1 Run for the same source/session
+// materialization.
+func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringHandoff(ctx context.Context, stageJob store.DurableJob, run store.WorkflowRun, attempt store.StageAttempt) error {
+	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || attempt.RunID != run.ID ||
+		attempt.StageKey != workflowadapter.MaterializeTask || attempt.ArtifactManifestID == "" {
+		return fmt.Errorf("Standard authoring handoff source does not match a materialized authoring Run")
+	}
+	key := "standard-authoring-handoff:" + attempt.ID
+	if existing, err := runtime.core.store.GetDurableJobByIdempotency(ctx, key); err != nil {
+		return err
+	} else if existing != nil {
+		payload, payloadErr := standardAuthoringHandoffJobPayload(*existing)
+		if payloadErr != nil {
+			return payloadErr
+		}
+		if payload.AuthoringRunID != run.ID || payload.StageAttemptID != attempt.ID {
+			return fmt.Errorf("existing Standard authoring handoff job does not match materialize_task")
+		}
+		return nil
+	}
+	references, err := runtime.core.store.ListArtifactRefs(ctx, attempt.ArtifactManifestID)
+	if err != nil {
+		return err
+	}
+	handoffArtifactID := ""
+	for _, reference := range references {
+		if reference.ArtifactKey != workflowadapter.StandardAuthoringTaskHandoffArtifact {
+			continue
+		}
+		if handoffArtifactID != "" || reference.RunID != run.ID || reference.AttemptID != attempt.ID ||
+			reference.StageKey != workflowadapter.MaterializeTask || reference.SchemaVersion != workflowadapter.StandardAuthoringTaskHandoffSchemaVersion {
+			return fmt.Errorf("materialize_task has an invalid Standard authoring handoff artifact")
+		}
+		handoffArtifactID = reference.ID
+	}
+	if handoffArtifactID == "" {
+		return fmt.Errorf("materialize_task omitted the Standard authoring handoff artifact")
+	}
+	childRunID, err := store.NewUUIDv7()
+	if err != nil {
+		return fmt.Errorf("allocate CodeEdge Phase-1 child Run ID: %w", err)
+	}
+	payload := standardAuthoringHandoffPayload{
+		Format: standardAuthoringHandoffPayloadFormat, AuthoringRunID: run.ID,
+		StageAttemptID: attempt.ID, HandoffArtifactID: handoffArtifactID, ChildRunID: childRunID,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = runtime.core.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: standardAuthoringHandoffCommandType, EntityType: "artifact_ref", EntityID: handoffArtifactID,
+		RunID: run.ID, StageAttemptID: attempt.ID, Priority: stageJob.Priority, PayloadJSON: string(encoded),
+		IdempotencyKey: key, Actor: stageJob.CreatedBy, Reason: "create CodeEdge Phase-1 child Run from persisted Standard authoring handoff",
+	})
+	return err
+}
+
+func (runtime *FrozenExecutionRuntime) handleStandardAuthoringHandoff(ctx context.Context, job store.DurableJob) (store.JobState, error) {
+	payload, err := standardAuthoringHandoffJobPayload(job)
+	if err != nil {
+		return runtime.failMalformedJob(ctx, job, err)
+	}
+	if runtime.services == nil || runtime.services.StandardAuthoringHandoffs == nil {
+		return store.JobFailed, ErrCodeEdgePhase1DefinitionUnavailable
+	}
+	_, err = runtime.services.StandardAuthoringHandoffs.Consume(ctx, StandardAuthoringHandoffRequest{
+		AuthoringRunID: payload.AuthoringRunID, StageAttemptID: payload.StageAttemptID,
+		HandoffArtifactID: payload.HandoffArtifactID, ChildRunID: payload.ChildRunID,
+		Actor: job.CreatedBy, Reason: "consume persisted Standard authoring task handoff",
+	})
+	if err == nil {
+		return store.JobSucceeded, nil
+	}
+	if errors.Is(err, ErrCodeEdgePhase1DefinitionUnavailable) || errors.Is(err, ErrCodeEdgePhase1DefinitionInvalid) {
+		// The immutable handoff artifact and job remain intact. Do not label the
+		// authoring Run in_doubt merely because this process lacks a separately
+		// approved Phase-1 deployment definition.
+		return store.JobFailed, err
+	}
+	return runtime.failMalformedJob(ctx, job, fmt.Errorf("consume Standard authoring handoff: %w", err))
+}
+
+// reconcileRecoveredStandardAuthoringHandoff is safe because the child Run is
+// a local durable mutation guarded by the handoff job's preallocated ID. It
+// never re-executes an external operation; StartRun either replays the exact
+// frozen child or creates it once.
+func (runtime *FrozenExecutionRuntime) reconcileRecoveredStandardAuthoringHandoff(ctx context.Context, job store.DurableJob) error {
+	payload, err := standardAuthoringHandoffJobPayload(job)
+	if err != nil {
+		_, projected := runtime.failMalformedJob(ctx, job, err)
+		return projected
+	}
+	if runtime.services == nil || runtime.services.StandardAuthoringHandoffs == nil {
+		return nil
+	}
+	_, err = runtime.services.StandardAuthoringHandoffs.Consume(ctx, StandardAuthoringHandoffRequest{
+		AuthoringRunID: payload.AuthoringRunID, StageAttemptID: payload.StageAttemptID,
+		HandoffArtifactID: payload.HandoffArtifactID, ChildRunID: payload.ChildRunID,
+		Actor: job.CreatedBy, Reason: "recover persisted Standard authoring task handoff",
+	})
+	if errors.Is(err, ErrCodeEdgePhase1DefinitionUnavailable) || errors.Is(err, ErrCodeEdgePhase1DefinitionInvalid) {
+		return nil
+	}
 	return err
 }
 

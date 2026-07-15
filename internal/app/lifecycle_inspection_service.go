@@ -27,15 +27,16 @@ type TaskInspectionQuery struct {
 // the store records for auditability, but presentation adapters should project
 // only fields that are safe and meaningful for their surface.
 type TaskInspectionSnapshot struct {
-	Task          store.TaskV2
-	SelectedRunID string
-	Revisions     []store.TaskRevision
-	Runs          []RunInspection
-	Releases      []store.LocalPackageRelease
-	Artifacts     []ArtifactInspection
-	Reviews       []ReviewInspection
-	Repairs       []RepairInspection
-	ObservedAt    time.Time
+	Task             store.TaskV2
+	SelectedRunID    string
+	Revisions        []store.TaskRevision
+	Runs             []RunInspection
+	Releases         []store.LocalPackageRelease
+	Artifacts        []ArtifactInspection
+	Reviews          []ReviewInspection
+	AuthoringReviews []AuthoringReviewInspection
+	Repairs          []RepairInspection
+	ObservedAt       time.Time
 }
 
 // RunInspection associates a run with all of its durable stage attempts.
@@ -64,6 +65,17 @@ type ArtifactInspection struct {
 type ReviewInspection struct {
 	Request   store.ReviewRequest
 	Decisions []store.ReviewDecision
+}
+
+// AuthoringReviewInspection is the separate source/session counterpart to a
+// TaskRevision review. The pre-materialization contract deliberately carries
+// no RevisionID.
+type AuthoringReviewInspection struct {
+	Request    store.AuthoringReviewRequest
+	Binding    store.AuthoringReviewGateBinding
+	Decisions  []store.AuthoringReviewDecision
+	Resolution *store.AuthoringReviewGateResolution
+	State      store.AuthoringReviewGateState
 }
 
 // RepairInspection joins a bounded repair session to prepared provider facts.
@@ -98,9 +110,20 @@ func (service *LifecycleInspectionService) ReadTaskDetail(ctx context.Context, q
 			return TaskInspectionSnapshot{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, query.RunID)
 		}
 		selectedRun = run
+		ownershipTaskID := run.TaskID
+		if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+			session, sessionErr := service.core.store.GetAuthoringSessionForRun(ctx, run.ID)
+			if sessionErr != nil {
+				return TaskInspectionSnapshot{}, fmt.Errorf("read authoring session for selected Run %s: %w", run.ID, sessionErr)
+			}
+			if session == nil || strings.TrimSpace(session.TargetTaskID) == "" {
+				return TaskInspectionSnapshot{}, fmt.Errorf("%w: authoring session ownership for Run %s", ErrLifecycleNotFound, run.ID)
+			}
+			ownershipTaskID = session.TargetTaskID
+		}
 		if query.TaskID == "" {
-			query.TaskID = run.TaskID
-		} else if query.TaskID != run.TaskID {
+			query.TaskID = ownershipTaskID
+		} else if query.TaskID != ownershipTaskID {
 			return TaskInspectionSnapshot{}, fmt.Errorf("run %s does not belong to task %s", run.ID, query.TaskID)
 		}
 	}
@@ -123,6 +146,11 @@ func (service *LifecycleInspectionService) ReadTaskDetail(ctx context.Context, q
 	if err != nil {
 		return TaskInspectionSnapshot{}, fmt.Errorf("list runs for task %s: %w", task.ID, err)
 	}
+	authoringRuns, err := service.core.store.ListAuthoringWorkflowRunsForTargetTask(ctx, task.ID)
+	if err != nil {
+		return TaskInspectionSnapshot{}, fmt.Errorf("list authoring runs for task %s: %w", task.ID, err)
+	}
+	runs = append(runs, authoringRuns...)
 	releases, err := service.core.store.ListLocalPackageReleasesForTask(ctx, task.ID)
 	if err != nil {
 		return TaskInspectionSnapshot{}, fmt.Errorf("list local packages for task %s: %w", task.ID, err)
@@ -147,6 +175,9 @@ func (service *LifecycleInspectionService) ReadTaskDetail(ctx context.Context, q
 			return TaskInspectionSnapshot{}, err
 		}
 		snapshot.Runs = append(snapshot.Runs, RunInspection{Run: run, Stages: append([]store.StageAttempt(nil), stages...), Jobs: jobs})
+		if err := service.appendAuthoringReviewInspection(ctx, &snapshot, run, stages); err != nil {
+			return TaskInspectionSnapshot{}, err
+		}
 	}
 	for _, revision := range revisions {
 		if err := service.appendRevisionInspection(ctx, &snapshot, revision); err != nil {
@@ -162,7 +193,58 @@ func (service *LifecycleInspectionService) ReadTaskDetail(ctx context.Context, q
 		}
 		return snapshot.Runs[left].Run.ID < snapshot.Runs[right].Run.ID
 	})
+	sort.SliceStable(snapshot.AuthoringReviews, func(left, right int) bool {
+		if !snapshot.AuthoringReviews[left].Request.CreatedAt.Equal(snapshot.AuthoringReviews[right].Request.CreatedAt) {
+			return snapshot.AuthoringReviews[left].Request.CreatedAt.After(snapshot.AuthoringReviews[right].Request.CreatedAt)
+		}
+		return snapshot.AuthoringReviews[left].Request.ID < snapshot.AuthoringReviews[right].Request.ID
+	})
 	return snapshot, nil
+}
+
+func (service *LifecycleInspectionService) appendAuthoringReviewInspection(ctx context.Context, snapshot *TaskInspectionSnapshot, run store.WorkflowRun, stages []store.StageAttempt) error {
+	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+		return nil
+	}
+	for _, stage := range stages {
+		binding, err := service.core.store.GetAuthoringReviewGateBindingByStageAttempt(ctx, stage.ID)
+		if err != nil {
+			return fmt.Errorf("read authoring review binding for stage %s: %w", stage.ID, err)
+		}
+		if binding == nil {
+			continue
+		}
+		if binding.RunID != run.ID || binding.StageAttemptID != stage.ID {
+			return fmt.Errorf("authoring review binding for stage %s differs from Run %s", stage.ID, run.ID)
+		}
+		request, err := service.core.store.GetAuthoringReviewRequest(ctx, binding.ReviewRequestID)
+		if err != nil {
+			return fmt.Errorf("read authoring review request %s: %w", binding.ReviewRequestID, err)
+		}
+		if request == nil {
+			return fmt.Errorf("%w: authoring review request %s", ErrLifecycleNotFound, binding.ReviewRequestID)
+		}
+		if err := validateAuthoringReviewRequestBinding(*request, *binding); err != nil {
+			return err
+		}
+		decisions, err := service.core.store.ListAuthoringReviewDecisionsForRequest(ctx, request.ID)
+		if err != nil {
+			return fmt.Errorf("list authoring review decisions for request %s: %w", request.ID, err)
+		}
+		state, err := service.core.store.GetAuthoringReviewGateState(ctx, request.ID)
+		if err != nil {
+			return fmt.Errorf("read authoring review state for request %s: %w", request.ID, err)
+		}
+		resolution, err := service.core.store.GetAuthoringReviewGateResolution(ctx, request.ID)
+		if err != nil {
+			return fmt.Errorf("read authoring review resolution for request %s: %w", request.ID, err)
+		}
+		snapshot.AuthoringReviews = append(snapshot.AuthoringReviews, AuthoringReviewInspection{
+			Request: *request, Binding: *binding, Decisions: append([]store.AuthoringReviewDecision(nil), decisions...),
+			Resolution: resolution, State: state,
+		})
+	}
+	return nil
 }
 
 func (service *LifecycleInspectionService) inspectDurableJobs(ctx context.Context, runID string) ([]DurableJobInspection, error) {

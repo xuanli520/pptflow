@@ -24,6 +24,7 @@ var (
 // by the durable adapter; public executors never receive a writable revision
 // snapshot or direct database handle.
 type StageArtifact struct {
+	ID            string
 	Key           string
 	SchemaVersion string
 	Content       []byte
@@ -79,6 +80,11 @@ func RequiredStageArtifacts(stage workflowkit.StageDescriptor, artifacts []Stage
 	}
 	seen := make(map[string]struct{}, len(artifacts))
 	for _, artifact := range artifacts {
+		if artifact.ID != "" {
+			if err := store.ValidateUUIDv7(artifact.ID); err != nil {
+				return fmt.Errorf("%w: stage %q output %q artifact ID: %v", ErrInvalidStageExecution, stage.Key, artifact.Key, err)
+			}
+		}
 		key := strings.TrimSpace(artifact.Key)
 		if key == "" {
 			return fmt.Errorf("%w: output artifact key is required", ErrInvalidStageExecution)
