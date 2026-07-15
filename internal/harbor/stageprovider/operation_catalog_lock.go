@@ -26,12 +26,42 @@ const (
 	// DeploymentOperationCatalogLockVersion is deliberately strict. A schema
 	// change must use a new format/version instead of accepting a partial old
 	// document as though it were an attestation.
-	DeploymentOperationCatalogLockVersion = "1"
+	DeploymentOperationCatalogLockVersion = "2"
 
 	// DeploymentOperationCatalogLockFingerprintDomain separates a lock's
 	// content identity from both a catalog fingerprint and ordinary artifact
 	// content digests.
-	DeploymentOperationCatalogLockFingerprintDomain = "harbor.stageprovider.operation-catalog-lock.v1"
+	DeploymentOperationCatalogLockFingerprintDomain = "harbor.stageprovider.operation-catalog-lock.v2"
+
+	// StandardAuthoringSSHTransportLockFormat and Version identify the
+	// deployment-owned SSH acquisition contract used before a Standard
+	// AuthoringSession exists. It is intentionally a top-level template lock:
+	// source capture is not a stage operation and cannot borrow an arbitrary
+	// local.command record.
+	StandardAuthoringSSHTransportLockFormat  = "harbor.standard-authoring.ssh-transport.v1"
+	StandardAuthoringSSHTransportLockVersion = "1"
+	// StandardAuthoringSSHKnownHostsLockFormat and Version identify the
+	// package-owned public host-key allow-list carried by the SSH transport.
+	StandardAuthoringSSHKnownHostsLockFormat  = "harbor.standard-authoring.ssh-known-hosts.v1"
+	StandardAuthoringSSHKnownHostsLockVersion = "1"
+
+	// StandardAuthoringSSHTransportCommandID and
+	// StandardAuthoringSSHWrapperShellCommandID name the two locked
+	// executables used solely by the pre-session SSH capture adapter. They are
+	// not catalog local.command IDs and therefore cannot be selected by a Run.
+	StandardAuthoringSSHTransportCommandID    = "standard-authoring.ssh-transport"
+	StandardAuthoringSSHWrapperShellCommandID = "standard-authoring.ssh-wrapper-shell"
+
+	// StandardAuthoringSSHKnownHostsRelativePath is the one package-relative,
+	// lock-bound host-key allow-list. A package has no ambient ~/.ssh fallback.
+	StandardAuthoringSSHKnownHostsRelativePath = "ssh/known_hosts"
+	// StandardAuthoringSSHAgentSocketEnvironment is the only environment name
+	// production composition may consult for an optional SSH agent socket.
+	// Its value is never serialized into a lock, Run, source, or error.
+	StandardAuthoringSSHAgentSocketEnvironment = "HARBOR_FACTORY_STANDARD_AUTHORING_SSH_AUTH_SOCK"
+	// StandardAuthoringSSHKnownHostsMaxBytes bounds the static host-key asset
+	// before it is parsed or handed to OpenSSH.
+	StandardAuthoringSSHKnownHostsMaxBytes = 1 * 1024 * 1024
 )
 
 var (
@@ -446,6 +476,93 @@ type LocalExecutableLock struct {
 	ContentSHA256 workflowkit.Fingerprint `json:"content_sha256"`
 }
 
+// StandardAuthoringSSHKnownHostsLock pins the one package-relative OpenSSH
+// known_hosts allow-list used for Standard source capture. The file contains
+// public host keys, never private credentials; its raw bytes are still
+// fingerprinted so a package cannot change the allowed host identities after
+// its deployment lock has been generated.
+type StandardAuthoringSSHKnownHostsLock struct {
+	Format        string                  `json:"format"`
+	Version       string                  `json:"version"`
+	RelativePath  string                  `json:"relative_path"`
+	ContentSHA256 workflowkit.Fingerprint `json:"content_sha256"`
+}
+
+// Validate proves the known_hosts asset is a versioned, package-relative
+// allow-list identity instead of a caller- or environment-selected file.
+func (lock StandardAuthoringSSHKnownHostsLock) Validate() error {
+	if lock.Format != StandardAuthoringSSHKnownHostsLockFormat {
+		return fmt.Errorf("%w: unsupported Standard authoring SSH known_hosts format %q", ErrInvalidDeploymentOperationCatalogLock, lock.Format)
+	}
+	if lock.Version != StandardAuthoringSSHKnownHostsLockVersion {
+		return fmt.Errorf("%w: unsupported Standard authoring SSH known_hosts version %q", ErrInvalidDeploymentOperationCatalogLock, lock.Version)
+	}
+	if lock.RelativePath != StandardAuthoringSSHKnownHostsRelativePath {
+		return fmt.Errorf("%w: Standard authoring SSH known_hosts path must be %q", ErrInvalidDeploymentOperationCatalogLock, StandardAuthoringSSHKnownHostsRelativePath)
+	}
+	if err := lock.ContentSHA256.Validate(); err != nil {
+		return fmt.Errorf("%w: Standard authoring SSH known_hosts content SHA-256: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	return nil
+}
+
+// StandardAuthoringSSHTransportLock pins the complete noninteractive SSH
+// transport used by source capture before an AuthoringSource exists. It
+// intentionally names a fixed OpenSSH client, a fixed shell used only to
+// execute a generated argv-safe wrapper, one immutable known_hosts asset, and
+// one optional agent-socket environment reference. It cannot carry a private
+// key, password, host pattern, mutable config path, or caller input.
+type StandardAuthoringSSHTransportLock struct {
+	Format                     string                             `json:"format"`
+	Version                    string                             `json:"version"`
+	SSHExecutable              LocalExecutableLock                `json:"ssh_executable"`
+	WrapperShell               LocalExecutableLock                `json:"wrapper_shell"`
+	KnownHosts                 StandardAuthoringSSHKnownHostsLock `json:"known_hosts"`
+	AgentSocketEnvironmentName string                             `json:"agent_socket_environment_name"`
+}
+
+// Clone returns a value copy. All fields are scalar immutable identities.
+func (lock StandardAuthoringSSHTransportLock) Clone() StandardAuthoringSSHTransportLock { return lock }
+
+// Validate proves the pre-session SSH acquisition capability is completely
+// deployment-owned. The wrapper shell deliberately has no version probe
+// contract because POSIX shells such as dash do not provide a stable
+// noninteractive version ABI; its Version is instead required to equal its
+// content fingerprint and the runtime rehashes it before writing the wrapper.
+func (lock StandardAuthoringSSHTransportLock) Validate() error {
+	if lock.Format != StandardAuthoringSSHTransportLockFormat {
+		return fmt.Errorf("%w: unsupported Standard authoring SSH transport format %q", ErrInvalidDeploymentOperationCatalogLock, lock.Format)
+	}
+	if lock.Version != StandardAuthoringSSHTransportLockVersion {
+		return fmt.Errorf("%w: unsupported Standard authoring SSH transport version %q", ErrInvalidDeploymentOperationCatalogLock, lock.Version)
+	}
+	if err := validateLocalExecutableLock(lock.SSHExecutable); err != nil {
+		return fmt.Errorf("%w: Standard authoring SSH executable: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	if lock.SSHExecutable.CommandID != StandardAuthoringSSHTransportCommandID {
+		return fmt.Errorf("%w: Standard authoring SSH executable command id must be %q", ErrInvalidDeploymentOperationCatalogLock, StandardAuthoringSSHTransportCommandID)
+	}
+	if !strings.HasPrefix(lock.SSHExecutable.Version, "OpenSSH_") || strings.ContainsAny(lock.SSHExecutable.Version, " \t\r\n") {
+		return fmt.Errorf("%w: Standard authoring SSH executable version must be one OpenSSH identity token", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if err := validateLocalExecutableLock(lock.WrapperShell); err != nil {
+		return fmt.Errorf("%w: Standard authoring SSH wrapper shell: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	if lock.WrapperShell.CommandID != StandardAuthoringSSHWrapperShellCommandID {
+		return fmt.Errorf("%w: Standard authoring SSH wrapper shell command id must be %q", ErrInvalidDeploymentOperationCatalogLock, StandardAuthoringSSHWrapperShellCommandID)
+	}
+	if strings.ContainsAny(lock.WrapperShell.AbsolutePath, " \t\r\n") || lock.WrapperShell.Version != string(lock.WrapperShell.ContentSHA256) {
+		return fmt.Errorf("%w: Standard authoring SSH wrapper shell must use a shebang-safe content-derived version", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if err := lock.KnownHosts.Validate(); err != nil {
+		return err
+	}
+	if lock.AgentSocketEnvironmentName != StandardAuthoringSSHAgentSocketEnvironment {
+		return fmt.Errorf("%w: Standard authoring SSH agent socket environment must be %q", ErrInvalidDeploymentOperationCatalogLock, StandardAuthoringSSHAgentSocketEnvironment)
+	}
+	return nil
+}
+
 // PinnedContainerRuntimeLock records the exact digest-pinned container image
 // and the exact controlled runtime used to launch it. Runtime is duplicated
 // here intentionally: it makes an image/runtime pairing visible in the lock
@@ -769,6 +886,7 @@ type DeploymentOperationCatalogLock struct {
 	CatalogReceipt                         DeploymentOperationCatalogReceipt           `json:"catalog_receipt"`
 	HarborFlowBuild                        HarborFlowBuildIdentity                     `json:"harbor_flow_build"`
 	StandardAuthoringExecutionProfile      *StandardAuthoringExecutionProfileLock      `json:"standard_authoring_execution_profile,omitempty"`
+	StandardAuthoringSSHTransport          *StandardAuthoringSSHTransportLock          `json:"standard_authoring_ssh_transport,omitempty"`
 	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
 	CodeEdgePhase1ExecutionProfile         *CodeEdgePhase1ExecutionProfileLock         `json:"codeedge_phase1_execution_profile,omitempty"`
 	CodeEdgePhase1PreflightProfile         *CodeEdgePhase1PreflightProfileLock         `json:"codeedge_phase1_preflight_profile,omitempty"`
@@ -781,6 +899,10 @@ func (lock DeploymentOperationCatalogLock) Clone() DeploymentOperationCatalogLoc
 	if lock.StandardAuthoringExecutionProfile != nil {
 		profile := lock.StandardAuthoringExecutionProfile.Clone()
 		lock.StandardAuthoringExecutionProfile = &profile
+	}
+	if lock.StandardAuthoringSSHTransport != nil {
+		transport := lock.StandardAuthoringSSHTransport.Clone()
+		lock.StandardAuthoringSSHTransport = &transport
 	}
 	if lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
 		profile := lock.CodeEdgeEvaluatorChildExecutionProfile.Clone()
@@ -832,11 +954,17 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 		if lock.StandardAuthoringExecutionProfile == nil {
 			return fmt.Errorf("%w: Standard authoring execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
 		}
+		if lock.StandardAuthoringSSHTransport == nil {
+			return fmt.Errorf("%w: Standard authoring SSH transport is required", ErrInvalidDeploymentOperationCatalogLock)
+		}
 		if err := lock.StandardAuthoringExecutionProfile.Validate(); err != nil {
 			return err
 		}
-	} else if lock.StandardAuthoringExecutionProfile != nil {
-		return fmt.Errorf("%w: Standard authoring execution profile is only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+		if err := lock.StandardAuthoringSSHTransport.Validate(); err != nil {
+			return err
+		}
+	} else if lock.StandardAuthoringExecutionProfile != nil || lock.StandardAuthoringSSHTransport != nil {
+		return fmt.Errorf("%w: Standard authoring execution profile and SSH transport are only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
 	}
 	if lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
 		if !lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgeEvaluatorChildTemplateReference()) {
@@ -896,6 +1024,22 @@ func (lock DeploymentOperationCatalogLock) StandardAuthoringProfile() (workflowa
 		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: Standard authoring execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	return lock.StandardAuthoringExecutionProfile.ExecutionProfile()
+}
+
+// StandardAuthoringSSHTransportLock returns the required pre-session SSH capture
+// capability. It is intentionally distinct from stage operation locks because
+// Git source acquisition occurs before a Run has a stage attempt.
+func (lock DeploymentOperationCatalogLock) StandardAuthoringSSHTransportLock() (StandardAuthoringSSHTransportLock, error) {
+	if !lock.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+		return StandardAuthoringSSHTransportLock{}, fmt.Errorf("%w: Standard authoring SSH transport requires the Standard authoring template", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if lock.StandardAuthoringSSHTransport == nil {
+		return StandardAuthoringSSHTransportLock{}, fmt.Errorf("%w: Standard authoring SSH transport is required", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if err := lock.StandardAuthoringSSHTransport.Validate(); err != nil {
+		return StandardAuthoringSSHTransportLock{}, err
+	}
+	return lock.StandardAuthoringSSHTransport.Clone(), nil
 }
 
 // CodeEdgeEvaluatorChildProfile returns the one complete child-owned profile
@@ -1003,6 +1147,7 @@ func ParseDeploymentOperationCatalogLockJSON(raw []byte) (DeploymentOperationCat
 		Format: document.Format, Version: document.Version, LockID: document.LockID, LockVersion: document.LockVersion,
 		CatalogReceipt: document.CatalogReceipt, HarborFlowBuild: document.HarborFlowBuild,
 		StandardAuthoringExecutionProfile:      document.StandardAuthoringExecutionProfile,
+		StandardAuthoringSSHTransport:          document.StandardAuthoringSSHTransport,
 		CodeEdgeEvaluatorChildExecutionProfile: document.CodeEdgeEvaluatorChildExecutionProfile,
 		CodeEdgePhase1ExecutionProfile:         document.CodeEdgePhase1ExecutionProfile,
 		CodeEdgePhase1PreflightProfile:         document.CodeEdgePhase1PreflightProfile,
@@ -1036,6 +1181,7 @@ type deploymentOperationCatalogLockDocument struct {
 	CatalogReceipt                         DeploymentOperationCatalogReceipt           `json:"catalog_receipt"`
 	HarborFlowBuild                        HarborFlowBuildIdentity                     `json:"harbor_flow_build"`
 	StandardAuthoringExecutionProfile      *StandardAuthoringExecutionProfileLock      `json:"standard_authoring_execution_profile,omitempty"`
+	StandardAuthoringSSHTransport          *StandardAuthoringSSHTransportLock          `json:"standard_authoring_ssh_transport,omitempty"`
 	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
 	CodeEdgePhase1ExecutionProfile         *CodeEdgePhase1ExecutionProfileLock         `json:"codeedge_phase1_execution_profile,omitempty"`
 	CodeEdgePhase1PreflightProfile         *CodeEdgePhase1PreflightProfileLock         `json:"codeedge_phase1_preflight_profile,omitempty"`

@@ -167,6 +167,12 @@ func (m model) footer() string {
 		return subtleStyle.Render("[? / Esc / q] 关闭 Task Hub 帮助")
 	}
 	if m.taskHubMutation != nil {
+		if m.taskHubMutation.Phase == taskHubMutationExecuting && m.taskHubMutation.Action == TaskHubActionStartStandardAuthoring {
+			return subtleStyle.Render(m.taskHubMutation.phaseStatus())
+		}
+		if m.taskHubMutation.Phase == taskHubMutationPreparing || m.taskHubMutation.Phase == taskHubMutationExecuting {
+			return subtleStyle.Render("正在处理确认；请等待结果")
+		}
 		return subtleStyle.Render("[Tab] 切换字段  [Enter] 确认提交  [Esc] 取消")
 	}
 	if m.runControl != nil {

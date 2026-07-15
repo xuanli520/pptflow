@@ -39,8 +39,9 @@ const (
 	TaskHubActionNewTask    TaskHubAction = "task.new"
 	TaskHubActionImportTask TaskHubAction = "task.import"
 	// TaskHubActionStartStandardAuthoring starts the deployment-owned Standard
-	// authoring flow. It is global because it creates a new draft Task together
-	// with its source/session Run; it must never bind a selected TaskRevision.
+	// authoring flow for an operator-supplied, exact repository coordinate. It
+	// is global because it creates a new draft Task together with its
+	// source/session Run; it must never bind a selected TaskRevision.
 	TaskHubActionStartStandardAuthoring TaskHubAction = "authoring.standard.start"
 	TaskHubActionEditTask               TaskHubAction = "task.edit"
 	TaskHubActionForkTask               TaskHubAction = "task.fork"

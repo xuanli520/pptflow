@@ -149,6 +149,7 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 		Format: DeploymentOperationCatalogLockFormat, Version: DeploymentOperationCatalogLockVersion,
 		LockID: "standard-authoring-agent-only-composition-test-lock", LockVersion: "test-v1", CatalogReceipt: catalog.Receipt(), HarborFlowBuild: fixture.attestation.HarborFlowBuild,
 		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
+		StandardAuthoringSSHTransport:     standardAuthoringSSHTransportTestLock(t, []byte(standardAuthoringSSHTransportTestKnownHosts)),
 		Operations: []DeploymentOperationCatalogLockRecord{{
 			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
 			Checkout: registration.Checkout, Secrets: append([]workflowadapter.SecretReference{}, registration.Secrets...),
@@ -215,6 +216,7 @@ func standardAuthoringProviderCompositionFixture(t *testing.T) (*DeploymentOpera
 			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("standard-authoring-provider-composition")),
 		},
 		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
+		StandardAuthoringSSHTransport:     standardAuthoringSSHTransportTestLock(t, []byte(standardAuthoringSSHTransportTestKnownHosts)),
 		Operations: []DeploymentOperationCatalogLockRecord{
 			{
 				Stage: builtinStageContract(t, builtin), Provider: builtin.Provider, Operation: builtin.Operation.Clone(), Runtime: builtin.Runtime,

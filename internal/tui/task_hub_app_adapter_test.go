@@ -873,7 +873,7 @@ func newTaskHubAuthoringReviewFixture(t *testing.T) (context.Context, *app.Lifec
 	}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
-		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
+		RepositoryURL: "https://github.com/acme/tui-authoring-fixture.git", CommitSHA: "0123456789abcdef0123456789abcdef01234567",
 		SnapshotArtifactRef: digest, SnapshotContentDigest: digest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
 		IdempotencyKey: "tui-authoring-source-" + t.Name(), Actor: "author", Reason: "freeze TUI authoring source",
 	})

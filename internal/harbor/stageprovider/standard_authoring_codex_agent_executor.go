@@ -261,10 +261,11 @@ type StandardAuthoringCodexWorkspaceMode string
 const (
 	StandardAuthoringCodexWorkspaceStatic    StandardAuthoringCodexWorkspaceMode = "static"
 	StandardAuthoringCodexWorkspaceRunScoped StandardAuthoringCodexWorkspaceMode = "run_scoped"
-	// StandardAuthoringCodexRunSourceDirectory is the fixed archive root
-	// materialized by the lock-bound repo_prepare executor. It is a code-owned
-	// layout fact, not a catalog, CLI, or model input.
-	StandardAuthoringCodexRunSourceDirectory = "tower-http"
+	// StandardAuthoringCodexRunSourceDirectory is the fixed internal archive
+	// root materialized by the lock-bound repo_prepare executor. It deliberately
+	// does not derive from a caller-selected repository URL, keeping workspace
+	// layout stable and path-safe for every supported source.
+	StandardAuthoringCodexRunSourceDirectory = "source"
 )
 
 // StandardAuthoringCodexAgentTurnExecutorConfig contains only composition-owned

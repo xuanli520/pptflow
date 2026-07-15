@@ -59,6 +59,7 @@ type standardAuthoringProductionCompositionConfig struct {
 	HarborFlowBuild           stageprovider.HarborFlowBuildIdentity
 	CatalogReceiptFingerprint workflowkit.Fingerprint
 	LockIdentity              stageprovider.DeploymentOperationCatalogLockIdentity
+	LookupEnvironment         func(string) (string, bool)
 }
 
 // standardAuthoringProductionComposition is a template-keyed capability
@@ -110,7 +111,13 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	if err != nil {
 		return nil, err
 	}
-	capturer, err := app.NewLockedStandardAuthoringGitArchiveSourceCapturer(lockedGit)
+	sshTransport, err := bundle.Lock.StandardAuthoringSSHTransportLock()
+	if err != nil {
+		return nil, fmt.Errorf("load Standard authoring locked SSH transport: %w", err)
+	}
+	capturer, err := app.NewLockedStandardAuthoringGitArchiveSourceCapturerWithSSHTransport(lockedGit, app.StandardAuthoringSSHSourceCaptureTransportConfig{
+		ContractRoot: bundle.ContractRoot, Transport: sshTransport, LookupEnvironment: config.LookupEnvironment,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring source capturer: %w", err)
 	}

@@ -6,8 +6,8 @@ set -euo pipefail
 # credentials, endpoints, or arbitrary environment variables. The caller must
 # provide every host/model identity and the source-controlled complete
 # --execution-profile accepted by the Go generator, including --build-version,
-# --lock-version, --git-executable, --codex-node, --codex-launcher,
-# --codex-home, and --codex-model-version.
+# --lock-version, --git-executable, --ssh-executable, --ssh-wrapper-shell,
+# --codex-node, --codex-launcher, --codex-home, and --codex-model-version.
 
 die() {
   echo "generate-standard-authoring-lock: $*" >&2
@@ -23,9 +23,10 @@ catalog="$root/deployments/standard-authoring/operation-catalog.v1.json"
 assets="$root/deployments/standard-authoring/contract-assets.v1.json"
 profile="$root/deployments/standard-authoring/execution-profile.v1.json"
 contract_root="$root/deployments/standard-authoring"
+ssh_known_hosts="$contract_root/ssh/known_hosts"
 output="$root/deployments/standard-authoring/operation-catalog.lock.json"
 
-for file in "$catalog" "$assets" "$profile"; do
+for file in "$catalog" "$assets" "$profile" "$ssh_known_hosts"; do
   if [[ ! -f "$file" || -L "$file" ]]; then
     die "required regular deployment file is unavailable: $file"
   fi
@@ -41,4 +42,5 @@ exec env GOFLAGS= go run -mod=readonly ./tools/standard-authoring-lock-build \
   --execution-profile "$profile" \
   --contract-root "$contract_root" \
   --output "$output" \
-  "$@"
+  "$@" \
+  --ssh-known-hosts "$ssh_known_hosts"

@@ -9,17 +9,36 @@ printed.
 | Component | Absolute path | Observed version/output | SHA-256 |
 | --- | --- | --- | --- |
 | Git | `/usr/bin/git` | `git version 2.47.3` | `356db14e102d68a1a37d8a1ac577dfd678d45d46e92f468bef8b7154e7bfdc60` |
+| OpenSSH client | `/usr/bin/ssh` | `OpenSSH_10.0p2` | `af3b04ec5653755032fc18ad02445e4e51170e75d8bac4265647d423caa9a83e` |
+| SSH wrapper shell | `/usr/bin/dash` | content-derived identity | `a6f559e00b69a4aa4d8cb607be18d9386c5aee55c509e2c075549dcf00e00fc7` |
 | Docker client | `/usr/bin/docker` | `Docker version 29.5.2, build 79eb04c` | `abb24795f58721581130a7d4cca53e80a64099ae40a11bebd02cc2f45b9136b8` |
 | Docker server | daemon queried by `docker version` | `29.5.2` | not a regular executable; must be dynamically checked at execution time |
 | Node | `/root/.nvm/versions/node/v26.2.0/bin/node` | `v26.2.0` | `030a5e93e4f7a022b12a3ec80fecd22af9614356904a05ece6b1b2dbf4c1f588` |
 | Codex JavaScript launcher | `/root/.nvm/versions/node/v26.2.0/lib/node_modules/@openai/codex/bin/codex.js` | `codex-cli 0.133.0` | `aa3c64b122c9d06bf48eaf988f5970aa69556d69506c3118cf07d10b2401b48a` |
 | Harbor launcher | `/root/.local/share/uv/tools/harbor/bin/harbor` | `0.18.0` | `9b0852df4c749ab9431b7aff6b2f1b1de8b7365ee6a513cdbd7573a1678d4f97` |
 
-The approved source identity for the first authoring session is
-`https://github.com/tower-rs/tower-http.git` at
-`f066e10ebc07ea9050a2ce4576315abfa568edf4`.  That source fact is distinct
-from host executable attestation: the final Source record must still persist a
-read-only snapshot artifact and its content fingerprint.
+No repository is pre-approved by this host inventory. A Standard launch may
+select a credential-free HTTPS or SSH Git address together with one exact
+full commit; it is then captured by the locked Git executable as a read-only
+snapshot. That runtime source fact is distinct from host executable
+attestation: the final Source record must persist the canonical URL, full
+commit, snapshot artifact, and its content fingerprint. A prior source
+observation never authorizes a later repository, branch, tag, or checkout.
+
+## SSH source transport observation
+
+The Standard deployment owns `deployments/standard-authoring/ssh/known_hosts`
+as an explicit public host-key allow-list. The generated Standard lock binds
+the asset's relative path and SHA-256 along with the OpenSSH and dash bytes
+above. At source capture, the locked adapter checks the requested SSH host is
+listed before Git can open a network connection; it then uses a generated
+fixed-argv wrapper with strict host checking, no system/user SSH config, and
+password/keyboard authentication disabled.
+
+No ambient `~/.ssh`, `SSH_AUTH_SOCK`, SSH config, key path, or credential is
+part of the contract. A private repository may opt in only through the named
+`HARBOR_FACTORY_STANDARD_AUTHORING_SSH_AUTH_SOCK` environment reference, whose
+value must be a live absolute non-symlink Unix socket and is never recorded.
 
 ## Docker image observation
 

@@ -5,10 +5,40 @@ This directory is the source-controlled deployment input for the closed
 immutable `AuthoringSource` / `AuthoringSession`; it does not pretend that the
 source session is already a `TaskRevision`.
 
-The source subject currently approved for authoring is:
+## Frozen Git source input
 
-- repository: `https://github.com/tower-rs/tower-http.git`
-- commit: `f066e10ebc07ea9050a2ce4576315abfa568edf4`
+This deployment does not pre-approve one repository. Each Standard launch
+supplies one source subject that is frozen before an `AuthoringSource` or
+`AuthoringSession` exists:
+
+- a credential-free HTTPS Git URI, SSH Git URI, or SSH scp-style address;
+- one full lowercase 40- or 64-character Git commit ID; and
+- no branch, tag, ref expression, local path, query/fragment selector, or
+  inline credential.
+
+The locked Git executable fetches only that commit, verifies that it resolves
+to the requested commit object, and writes a bounded read-only archive. The
+canonical repository URL, full commit, archive content digest, and source
+fingerprint are then durable session facts. A caller-selected source can never
+select a catalog, profile, prompt, model, secret, workspace, or executable.
+
+HTTPS acquisition is non-interactive and credential-free. SSH acquisition is
+also non-interactive, but is permitted only when its exact host is present in
+the package-owned `ssh/known_hosts` allow-list bound into the deployment lock.
+The capture adapter rejects an unlisted host before Git invokes SSH, uses a
+locked OpenSSH client and locked wrapper shell, disables password and keyboard
+authentication, disables system/user SSH configuration, and enforces
+`StrictHostKeyChecking=yes`. It never reads `~/.ssh`, the ambient
+`SSH_AUTH_SOCK`, an SSH config, or inline credentials.
+
+For a private SSH repository, the process may supply one live agent socket
+only through `HARBOR_FACTORY_STANDARD_AUTHORING_SSH_AUTH_SOCK`. The value must
+be an absolute non-symlink Unix-domain socket; its name is locked but its value
+is not serialized. Without it, no ambient agent or key file is available, so
+an SSH server that requires authentication will fail closed. Host-key additions
+or rotations require a reviewed `ssh/known_hosts` change, a new Standard lock,
+and a new package; `accept-new`, wildcard, hashed, and ambient host-key entries
+are not supported.
 
 `materialize_task` is the sole Go-controlled operation allowed to atomically
 create the first Task and TaskRevision. It emits
@@ -20,13 +50,17 @@ handoff, compliance, and local packaging.
 ## Source-controlled inputs
 
 - `operation-catalog.v1.json` is the exact 14-stage allow-list. It contains
-  only Git snapshot preparation, locked Codex App Server turns, durable review
-  gates, and the `materialize_task` Harbor built-in.
+  only generic Git snapshot preparation, locked Codex App Server turns,
+  durable review gates, and the `materialize_task` Harbor built-in.
 - `contract-assets.v1.json` maps every closed stage to a canonical prompt and
   schema path. It has exact stage coverage and no path-discovery convention.
 - `prompts/` and `schemas/` contain immutable handler contracts. Codex prompt
   programs are canonical, self-fingerprinted JSON; their output schema is the
   exact `harbor.standard-authoring-codex-turn-output.v1` envelope.
+- `ssh/known_hosts` is the explicit OpenSSH host-key allow-list. Its fixed
+  relative path and raw content SHA-256, together with the pinned OpenSSH
+  client and wrapper shell, live in `standard_authoring_ssh_transport` in the
+  generated lock.
 
 There is deliberately no checked-in `operation-catalog.lock.json`. A lock
 must bind the exact final source snapshot and local executable bytes; placing a
@@ -42,6 +76,8 @@ scripts/generate-standard-authoring-lock.sh \
   --build-version v2.0.0 \
   --lock-version v2.0.0-<snapshot-commit> \
   --git-executable /usr/bin/git \
+  --ssh-executable /usr/bin/ssh \
+  --ssh-wrapper-shell /usr/bin/dash \
   --codex-node /absolute/path/to/node \
   --codex-launcher /absolute/path/to/codex.js \
   --codex-home /absolute/path/to/codex-home \
@@ -52,9 +88,10 @@ The generator refuses a dirty worktree, a pre-existing output lock, symlinked
 paths, unpinned assets, malformed prompts/schemas, a missing Codex App Server
 capability, or a catalog/asset mismatch. It computes the Harbor Flow build
 identity from `HEAD` and a source-tree SHA-256 manifest excluding the
-self-referential generated lock. It hashes every prompt/schema asset and the
-actual locked Git, Node, and Codex launcher files before writing the canonical
-lock atomically.
+self-referential generated lock. It hashes every prompt/schema asset, the
+package `ssh/known_hosts` asset, and the actual locked Git, OpenSSH, wrapper
+shell, Node, and Codex launcher files before writing the canonical lock
+atomically.
 
 The explicit model-version argument is intentional: no script should infer a
 mutable model alias. The generator reads no model endpoint, credential, token,

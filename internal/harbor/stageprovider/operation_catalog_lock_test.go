@@ -149,6 +149,16 @@ func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile
 	if err := missing.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
 		t.Fatalf("Standard authoring lock without profile error = %v, want invalid lock", err)
 	}
+	missingTransport := lock.Clone()
+	missingTransport.StandardAuthoringSSHTransport = nil
+	if err := missingTransport.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("Standard authoring lock without SSH transport error = %v, want invalid lock", err)
+	}
+	wrongKnownHostsVersion := lock.Clone()
+	wrongKnownHostsVersion.StandardAuthoringSSHTransport.KnownHosts.Version = "2"
+	if err := wrongKnownHostsVersion.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("Standard authoring lock with unsupported known_hosts version error = %v, want invalid lock", err)
+	}
 	wrongProfile := lock.Clone()
 	wrongProfile.StandardAuthoringExecutionProfile.Profile.Template = workflowadapter.StandardTemplateReference()
 	if err := wrongProfile.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
@@ -158,6 +168,11 @@ func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile
 	nonStandardLock.StandardAuthoringExecutionProfile = &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)}
 	if err := nonStandardLock.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
 		t.Fatalf("non-Standard lock carrying Standard profile error = %v, want invalid lock", err)
+	}
+	nonStandardLock.StandardAuthoringExecutionProfile = nil
+	nonStandardLock.StandardAuthoringSSHTransport = standardAuthoringSSHTransportTestLock(t, []byte(standardAuthoringSSHTransportTestKnownHosts))
+	if err := nonStandardLock.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("non-Standard lock carrying Standard SSH transport error = %v, want invalid lock", err)
 	}
 }
 

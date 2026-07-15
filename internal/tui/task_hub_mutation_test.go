@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -634,7 +635,13 @@ func TestTaskHubMutationOverlayCollectsActionSpecificTypedInputs(t *testing.T) {
 	}{
 		{name: "create", action: TaskHubActionNewTask, values: map[string]string{taskHubTaskSlugField: "typed-create", taskHubTaskTitleField: "Typed Create", taskHubTaskMetadataJSONField: `{"kind":"fixture"}`}},
 		{name: "import", action: TaskHubActionImportTask, values: map[string]string{taskHubTaskSlugField: "typed-import", taskHubTaskTitleField: "Typed Import", taskHubImportSourcePathField: "/managed/snapshot"}},
-		{name: "standard authoring", action: TaskHubActionStartStandardAuthoring, values: map[string]string{taskHubTaskSlugField: "typed-standard", taskHubTaskTitleField: "Typed Standard", taskHubTaskMetadataJSONField: `{"difficulty":"hard"}`}},
+		{name: "standard authoring", action: TaskHubActionStartStandardAuthoring, values: map[string]string{
+			taskHubStandardAuthoringRepositoryURLField: "https://github.com/acme/typed-standard.git",
+			taskHubStandardAuthoringCommitSHAField:     "0123456789abcdef0123456789abcdef01234567",
+			taskHubTaskSlugField:                       "typed-standard",
+			taskHubTaskTitleField:                      "Typed Standard",
+			taskHubTaskMetadataJSONField:               `{"difficulty":"hard"}`,
+		}},
 		{name: "fork", action: TaskHubActionForkTask, values: map[string]string{taskHubTaskSlugField: "typed-fork", taskHubTaskTitleField: "Typed Fork"}},
 		{name: "restore", action: TaskHubActionRestoreTask, values: map[string]string{taskHubRestoreStateField: "ready"}},
 		{name: "start", action: TaskHubActionStartRun, values: map[string]string{taskHubExecutionProfilePathField: "/profiles/explicit.json", taskHubExecutionSpecPathField: "/specs/frozen.json", taskHubRunTriggerField: "task_hub"}},
@@ -668,30 +675,70 @@ func TestTaskHubMutationOverlayCollectsActionSpecificTypedInputs(t *testing.T) {
 	}
 }
 
-func TestTaskHubStandardAuthoringFormOnlyExposesClosedInputs(t *testing.T) {
+func TestTaskHubStandardAuthoringFormCollectsSourceCoordinateAndProtectsDeploymentInputs(t *testing.T) {
 	overlay, err := newTaskHubMutationOverlay(TaskHubActionStartStandardAuthoring, TaskHubTarget{}, TaskHubPlanPreview{ConfirmationNeeded: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	overlay.ReasonInput.SetValue("start fixed Tower HTTP authoring")
-	setTaskHubMutationFormValue(t, overlay, taskHubTaskSlugField, "towerhttp-header-hardening")
-	setTaskHubMutationFormValue(t, overlay, taskHubTaskTitleField, "Tower HTTP header hardening")
+	overlay.ReasonInput.SetValue("start a source-selected authoring flow")
+	setTaskHubMutationFormValue(t, overlay, taskHubStandardAuthoringRepositoryURLField, "ssh://git@github.com/acme/header-hardening.git")
+	setTaskHubMutationFormValue(t, overlay, taskHubStandardAuthoringCommitSHAField, "0123456789abcdef0123456789abcdef01234567")
+	setTaskHubMutationFormValue(t, overlay, taskHubTaskSlugField, "generic-header-hardening")
+	setTaskHubMutationFormValue(t, overlay, taskHubTaskTitleField, "Generic header hardening")
 	setTaskHubMutationFormValue(t, overlay, taskHubTaskMetadataJSONField, `{"difficulty":"hard"}`)
 	if err := overlay.validate(); err != nil {
 		t.Fatalf("validate Standard authoring form: %v", err)
+	}
+	if got, want := overlay.FieldOrder[:3], []string{"reason", taskHubStandardAuthoringRepositoryURLField, taskHubStandardAuthoringCommitSHAField}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Standard authoring source fields must precede Task identity: got=%v want=%v", got, want)
 	}
 	for _, forbidden := range []string{taskHubTaskSourceRepoField, taskHubTaskSourceCommitField, taskHubExecutionProfilePathField, taskHubExecutionSpecPathField, taskHubRunTriggerField} {
 		if _, found := overlay.ValueInputs[forbidden]; found {
 			t.Fatalf("Standard authoring form exposed deployment-owned input %q", forbidden)
 		}
 	}
-	if rendered := overlay.View(100, 30); strings.Contains(rendered, "来源仓库") || strings.Contains(rendered, "Execution profile JSON") {
-		t.Fatalf("Standard authoring form rendered deployment-owned inputs:\n%s", rendered)
+	if rendered := overlay.View(100, 30); !strings.Contains(rendered, "来源仓库 URL") || !strings.Contains(rendered, "精确来源 commit") || strings.Contains(rendered, "Execution profile JSON") {
+		t.Fatalf("Standard authoring form did not render exactly its source inputs:\n%s", rendered)
 	}
 
 	setTaskHubMutationFormValue(t, overlay, taskHubTaskMetadataJSONField, "not-json")
 	if err := overlay.validate(); err == nil || !strings.Contains(err.Error(), "元数据 JSON") {
 		t.Fatalf("invalid Standard authoring metadata error = %v", err)
+	}
+}
+
+func TestTaskHubStandardAuthoringSourceCoordinateValidation(t *testing.T) {
+	validCommit := "0123456789abcdef0123456789abcdef01234567"
+	cases := []struct {
+		name          string
+		repositoryURL string
+		commitSHA     string
+		valid         bool
+	}{
+		{name: "https", repositoryURL: "https://github.com/acme/repository.git", commitSHA: validCommit, valid: true},
+		{name: "ssh with git user", repositoryURL: "ssh://git@github.com/acme/repository.git", commitSHA: validCommit, valid: true},
+		{name: "scp-like ssh", repositoryURL: "git@github.com:acme/repository.git", commitSHA: validCommit, valid: true},
+		{name: "http", repositoryURL: "http://github.com/acme/repository.git", commitSHA: validCommit},
+		{name: "git protocol", repositoryURL: "git://github.com/acme/repository.git", commitSHA: validCommit},
+		{name: "https user info", repositoryURL: "https://token@github.com/acme/repository.git", commitSHA: validCommit},
+		{name: "ssh password", repositoryURL: "ssh://git:secret@github.com/acme/repository.git", commitSHA: validCommit},
+		{name: "query", repositoryURL: "https://github.com/acme/repository.git?branch=main", commitSHA: validCommit},
+		{name: "local path", repositoryURL: "file:///tmp/repository", commitSHA: validCommit},
+		{name: "branch", repositoryURL: "https://github.com/acme/repository.git", commitSHA: "main"},
+		{name: "short commit", repositoryURL: "https://github.com/acme/repository.git", commitSHA: "deadbeef"},
+		{name: "uppercase commit", repositoryURL: "https://github.com/acme/repository.git", commitSHA: strings.ToUpper(validCommit)},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateTaskHubStandardAuthoringSourceCoordinate(testCase.repositoryURL, testCase.commitSHA)
+			if testCase.valid && err != nil {
+				t.Fatalf("valid source coordinate rejected: %v", err)
+			}
+			if !testCase.valid && err == nil {
+				t.Fatalf("invalid source coordinate accepted: url=%q commit=%q", testCase.repositoryURL, testCase.commitSHA)
+			}
+		})
 	}
 }
 
@@ -803,6 +850,34 @@ func TestTaskHubRunStartFormErrorRetainsPathsAndIdempotencyKeyForRetry(t *testin
 	}
 	if len(service.mutationCommands) != 1 || service.mutationCommands[0].IdempotencyKey != key || service.mutationCommands[0].PlanID == "" {
 		t.Fatalf("frozen StartRun execution = %+v, want one final command with retained plan/key", service.mutationCommands)
+	}
+}
+
+func TestTaskHubStandardAuthoringCaptureOverlayExplainsItsBoundedNonCancellablePhase(t *testing.T) {
+	overlay, err := newTaskHubMutationOverlay(TaskHubActionStartStandardAuthoring, TaskHubTarget{}, TaskHubPlanPreview{ConfirmationNeeded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay.Phase = taskHubMutationExecuting
+	rendered := overlay.View(100, 60)
+	for _, want := range []string{"正在受控捕获 Git 源码", "不可取消", "最长 10 分钟", "源码捕获期间不可取消"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("Standard authoring capture overlay omitted %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "正在提交确认...") || strings.Contains(rendered, "[Esc] 取消") {
+		t.Fatalf("Standard authoring capture overlay retained generic/cancellable submission text:\n%s", rendered)
+	}
+	m, cleanup := newTestTaskHubV2Model(t, &fakeTaskHubLifecycle{snapshot: enabledTaskHubSnapshot()})
+	defer cleanup()
+	m.taskHubMutation = overlay
+	if footer := m.footer(); !strings.Contains(footer, "不可取消") || strings.Contains(footer, "[Esc] 取消") {
+		t.Fatalf("Standard authoring capture footer is misleading: %q", footer)
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	if m.taskHubMutation == nil || m.taskHubMutation.Phase != taskHubMutationExecuting {
+		t.Fatal("Standard authoring capture Esc closed a phase advertised as non-cancellable")
 	}
 }
 

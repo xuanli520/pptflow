@@ -6,29 +6,37 @@ import (
 	"os"
 	"os/user"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 
 const (
-	taskHubPackageVersionField       = "release_version"
-	taskHubTaskSlugField             = "slug"
-	taskHubTaskTitleField            = "title"
-	taskHubTaskMetadataJSONField     = "metadata_json"
-	taskHubTaskSourceRepoField       = "source_repo"
-	taskHubTaskSourceCommitField     = "source_commit"
-	taskHubImportSourcePathField     = "source_path"
-	taskHubImportProposalDigestField = "proposal_digest"
-	taskHubImportChangeSummaryField  = "change_summary"
-	taskHubRestoreStateField         = "restore_state"
-	taskHubExecutionProfilePathField = "profile_path"
-	taskHubExecutionSpecPathField    = "execution_spec_path"
-	taskHubRunTriggerField           = "trigger"
-	taskHubUnifiedDiffField          = "unified_diff"
+	taskHubPackageVersionField   = "release_version"
+	taskHubTaskSlugField         = "slug"
+	taskHubTaskTitleField        = "title"
+	taskHubTaskMetadataJSONField = "metadata_json"
+	taskHubTaskSourceRepoField   = "source_repo"
+	taskHubTaskSourceCommitField = "source_commit"
+	// Standard authoring provenance is deliberately distinct from the optional
+	// provenance fields on ordinary draft/import actions. A Standard launch
+	// needs an exact, caller-selected repository coordinate before it can be
+	// captured and frozen into its source/session Run.
+	taskHubStandardAuthoringRepositoryURLField = "repository_url"
+	taskHubStandardAuthoringCommitSHAField     = "commit_sha"
+	taskHubImportSourcePathField               = "source_path"
+	taskHubImportProposalDigestField           = "proposal_digest"
+	taskHubImportChangeSummaryField            = "change_summary"
+	taskHubRestoreStateField                   = "restore_state"
+	taskHubExecutionProfilePathField           = "profile_path"
+	taskHubExecutionSpecPathField              = "execution_spec_path"
+	taskHubRunTriggerField                     = "trigger"
+	taskHubUnifiedDiffField                    = "unified_diff"
 )
 
 type taskHubMutationPhase string
@@ -154,7 +162,9 @@ func taskHubMutationFields(action TaskHubAction) []taskHubMutationField {
 		}
 	case TaskHubActionStartStandardAuthoring:
 		return []taskHubMutationField{
-			{key: taskHubTaskSlugField, label: "Task 标识", placeholder: "例如 towerhttp-request-id"},
+			{key: taskHubStandardAuthoringRepositoryURLField, label: "来源仓库 URL", placeholder: "https://...、ssh://... 或 git@host:org/repo.git"},
+			{key: taskHubStandardAuthoringCommitSHAField, label: "精确来源 commit", placeholder: "40 或 64 位小写十六进制对象 ID"},
+			{key: taskHubTaskSlugField, label: "Task 标识", placeholder: "例如 request-id-hardening"},
 			{key: taskHubTaskTitleField, label: "Task 标题", placeholder: "Task 的可读标题"},
 			{key: taskHubTaskMetadataJSONField, label: "元数据 JSON（可选）", placeholder: "例如 {\"difficulty\":\"hard\"}"},
 		}
@@ -412,13 +422,28 @@ func validateTaskHubMutationValues(request TaskHubMutationRequest) error {
 	if request.Action == TaskHubActionRestoreTask && !taskHubRestoreStateValid(request.Values[taskHubRestoreStateField]) {
 		return fmt.Errorf("恢复后的状态必须是 draft、ready、published 或 archived")
 	}
+	if request.Action == TaskHubActionStartStandardAuthoring {
+		if err := validateTaskHubStandardAuthoringSourceCoordinate(
+			request.Values[taskHubStandardAuthoringRepositoryURLField],
+			request.Values[taskHubStandardAuthoringCommitSHAField],
+		); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func taskHubRequiredMutationFields(action TaskHubAction) []string {
 	switch action {
-	case TaskHubActionNewTask, TaskHubActionStartStandardAuthoring:
+	case TaskHubActionNewTask:
 		return []string{taskHubTaskSlugField, taskHubTaskTitleField}
+	case TaskHubActionStartStandardAuthoring:
+		return []string{
+			taskHubStandardAuthoringRepositoryURLField,
+			taskHubStandardAuthoringCommitSHAField,
+			taskHubTaskSlugField,
+			taskHubTaskTitleField,
+		}
 	case TaskHubActionImportTask:
 		return []string{taskHubTaskSlugField, taskHubTaskTitleField, taskHubImportSourcePathField}
 	case TaskHubActionForkTask:
@@ -434,6 +459,21 @@ func taskHubRequiredMutationFields(action TaskHubAction) []string {
 	default:
 		return nil
 	}
+}
+
+// validateTaskHubStandardAuthoringSourceCoordinate gives TUI operators an
+// immediate, local explanation for malformed provenance. It deliberately
+// delegates to the public application-coordinate validator so TUI rules do
+// not drift from the final authority that runs before source capture.
+func validateTaskHubStandardAuthoringSourceCoordinate(repositoryURL, commitSHA string) error {
+	coordinate := app.StandardAuthoringSourceCoordinate{
+		RepositoryURL: strings.TrimSpace(repositoryURL),
+		CommitSHA:     strings.TrimSpace(commitSHA),
+	}
+	if err := coordinate.Validate(); err != nil {
+		return fmt.Errorf("Standard 创题来源坐标无效: %w", err)
+	}
+	return nil
 }
 
 func taskHubRestoreStateValid(value string) bool {
@@ -506,13 +546,17 @@ func (overlay *TaskHubMutationOverlay) View(width, height int) string {
 		rows = append(rows, failStyle.Render(clipDisplay(redactSingleLineUI(overlay.Error), contentWidth)))
 	}
 	if overlay.Phase == taskHubMutationPreparing || overlay.Phase == taskHubMutationExecuting {
-		rows = append(rows, subtleStyle.Render("正在提交确认..."))
+		rows = append(rows, subtleStyle.Render(overlay.phaseStatus()))
 	}
 	rows = append(rows, "")
 	if overlay.Preview.PlanID != "" {
 		rows = append(rows, subtleStyle.Render("已冻结计划："+clipDisplay(overlay.Preview.PlanID, maxInt(12, contentWidth-12))))
 	}
-	if overlay.isFrozen() {
+	if overlay.Phase == taskHubMutationExecuting && overlay.Action == TaskHubActionStartStandardAuthoring {
+		rows = append(rows, subtleStyle.Render("源码捕获期间不可取消；请等待完成或超时。"))
+	} else if overlay.Phase == taskHubMutationPreparing || overlay.Phase == taskHubMutationExecuting {
+		rows = append(rows, subtleStyle.Render("正在处理确认；请等待结果。"))
+	} else if overlay.isFrozen() {
 		rows = append(rows, subtleStyle.Render("[Enter] 提交冻结计划  [Esc] 取消"))
 	} else if overlay.hasMultilineInput() {
 		rows = append(rows, subtleStyle.Render("[Tab] 切换字段  [Enter] 在 diff 中换行  [Ctrl+S] 确认提交  [Esc] 取消"))
@@ -525,6 +569,14 @@ func (overlay *TaskHubMutationOverlay) View(width, height int) string {
 	boxWidth := boundedPanelWidth(width, 42, 82)
 	box := panelStyle.Width(boxWidth).Align(lipgloss.Left).Render(body)
 	return lipgloss.Place(maxInt(1, width), maxInt(1, height), lipgloss.Center, lipgloss.Center, box)
+}
+
+func (overlay *TaskHubMutationOverlay) phaseStatus() string {
+	if overlay != nil && overlay.Phase == taskHubMutationExecuting && overlay.Action == TaskHubActionStartStandardAuthoring {
+		minutes := int(app.StandardAuthoringSourceCaptureTimeout / time.Minute)
+		return fmt.Sprintf("正在受控捕获 Git 源码（不可取消，最长 %d 分钟）", minutes)
+	}
+	return "正在提交确认..."
 }
 
 func (overlay *TaskHubMutationOverlay) fieldView(field string, contentWidth int) string {

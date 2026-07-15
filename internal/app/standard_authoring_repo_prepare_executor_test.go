@@ -153,7 +153,7 @@ func TestStandardAuthoringRepoPrepareRejectsCommandOrSubjectDriftBeforeSideEffec
 func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, database *store.Store, object workflowruntime.ObjectRef) (store.AuthoringSource, store.TaskV2, store.AuthoringSession, store.WorkflowRun, store.StageAttempt) {
 	t.Helper()
 	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
-		RepositoryURL: StandardAuthoringSourceRepositoryURL, CommitSHA: StandardAuthoringSourceCommit,
+		RepositoryURL: standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		SnapshotArtifactRef: string(object.Digest), SnapshotContentDigest: string(object.Digest), SnapshotSchemaVersion: StandardAuthoringSourceSnapshotSchemaVersion,
 		IdempotencyKey: "repo-prepare-source", Actor: "author", Reason: "freeze source fixture",
 	})
@@ -222,10 +222,13 @@ func standardAuthoringRepoPrepareArchive(t *testing.T) []byte {
 	t.Helper()
 	var archive bytes.Buffer
 	writer := tar.NewWriter(&archive)
+	if err := writer.WriteHeader(&tar.Header{Name: standardAuthoringGitPAXGlobalHeaderName, Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": standardAuthoringLaunchTestCoordinate.CommitSHA}}); err != nil {
+		t.Fatal(err)
+	}
 	for name, contents := range map[string]string{
-		"tower-http/Cargo.toml":     "[package]\nname = \"tower-http\"\n",
-		"tower-http/src/lib.rs":     "pub fn source_fixture() {}\n",
-		"tower-http/src/request.rs": "pub fn request_fixture() {}\n",
+		"source/Cargo.toml":     "[package]\nname = \"tower-http\"\n",
+		"source/src/lib.rs":     "pub fn source_fixture() {}\n",
+		"source/src/request.rs": "pub fn request_fixture() {}\n",
 	} {
 		if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(contents)), Typeflag: tar.TypeReg}); err != nil {
 			t.Fatal(err)

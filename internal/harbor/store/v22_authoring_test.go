@@ -204,6 +204,41 @@ func TestAuthoringSourceAndSessionReplayAndValidation(t *testing.T) {
 	}
 }
 
+func TestNormalizeAuthoringRepositoryURLAllowsOnlyHTTPSAndSSHGitCoordinates(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "https", input: "https://GitHub.com/rust-lang/cargo.git/", want: "https://github.com/rust-lang/cargo.git"},
+		{name: "ssh URI", input: "ssh://git@GitHub.com/rust-lang/cargo.git", want: "ssh://git@github.com/rust-lang/cargo.git"},
+		{name: "scp-like SSH", input: "git@GitHub.com:rust-lang/cargo.git", want: "ssh://git@github.com/rust-lang/cargo.git"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := NormalizeAuthoringRepositoryURL(testCase.input)
+			if err != nil || got != testCase.want {
+				t.Fatalf("NormalizeAuthoringRepositoryURL(%q) = %q, %v; want %q", testCase.input, got, err, testCase.want)
+			}
+		})
+	}
+	for _, input := range []string{
+		"http://github.com/rust-lang/cargo.git",
+		"git://github.com/rust-lang/cargo.git",
+		"file:///tmp/cargo",
+		"https://github.com/rust-lang/cargo.git?",
+		"https://github.com/rust-lang/cargo.git#main",
+		"https://token@github.com/rust-lang/cargo.git",
+		"ssh://git:secret@github.com/rust-lang/cargo.git",
+		"ssh://github.com/rust-lang/cargo.git",
+		"https://github.com/rust-lang/../cargo.git",
+	} {
+		if _, err := NormalizeAuthoringRepositoryURL(input); err == nil {
+			t.Fatalf("NormalizeAuthoringRepositoryURL accepted %q", input)
+		}
+	}
+}
+
 func TestAuthoringSourceGlobalIdentityAndRunSubjectExclusivity(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)

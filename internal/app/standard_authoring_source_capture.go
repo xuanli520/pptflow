@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -15,14 +16,23 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 const (
-	standardAuthoringSourceArchiveRoot     = "tower-http/"
+	// standardAuthoringSourceArchiveRoot is deliberately code-owned rather
+	// than derived from a caller's repository URL. It keeps both archive and
+	// run-scoped workspace paths stable while keeping user-controlled text out
+	// of filesystem layout decisions.
+	standardAuthoringSourceArchiveRoot     = "source/"
 	standardAuthoringSourceArchiveMaxBytes = 128 * 1024 * 1024
-	standardAuthoringSourceCaptureTimeout  = 10 * time.Minute
-	standardAuthoringGitCommandOutputMax   = 64 * 1024
+	// StandardAuthoringSourceCaptureTimeout bounds one non-interactive Git
+	// capture. The TUI renders this same deployment-independent bound while a
+	// launch is in flight, so operators are not given a misleading cancel hint.
+	StandardAuthoringSourceCaptureTimeout   = 10 * time.Minute
+	standardAuthoringGitCommandOutputMax    = 64 * 1024
+	standardAuthoringGitPAXGlobalHeaderName = "pax_global_header"
 )
 
 var (
@@ -30,14 +40,67 @@ var (
 	errStandardAuthoringGitOutputTooLarge     = errors.New("Standard authoring Git command output exceeds the fixed size limit")
 )
 
-// StandardAuthoringGitArchiveSourceCapturer captures only the approved Tower
-// HTTP commit as a deterministic Git tar archive. The executable must be an
-// explicit absolute non-symlink regular file; there is intentionally no PATH
-// discovery fallback. The deployment composition should pass the same locked
-// Git executable that its Standard authoring provider attests at stage time.
+// StandardAuthoringSourceCoordinate identifies the one immutable Git object
+// that a Standard authoring launch is permitted to capture. It intentionally
+// accepts only credential-free HTTPS and SSH URI forms; references, local
+// paths, query/fragment selectors, and inline credentials are not a source
+// identity.
+type StandardAuthoringSourceCoordinate struct {
+	RepositoryURL string
+	CommitSHA     string
+}
+
+// Canonical returns the durable representation of a source coordinate. The
+// caller must retain this exact result in the AuthoringSource, Task, session,
+// and Run so the identity used to fetch the object is also the identity later
+// audited and materialized.
+func (coordinate StandardAuthoringSourceCoordinate) Canonical() (StandardAuthoringSourceCoordinate, error) {
+	repositoryURL, err := store.NormalizeAuthoringRepositoryURL(coordinate.RepositoryURL)
+	if err != nil {
+		return StandardAuthoringSourceCoordinate{}, err
+	}
+	commitSHA, err := store.NormalizeAuthoringCommitSHA(coordinate.CommitSHA)
+	if err != nil {
+		return StandardAuthoringSourceCoordinate{}, err
+	}
+	return StandardAuthoringSourceCoordinate{RepositoryURL: repositoryURL, CommitSHA: commitSHA}, nil
+}
+
+// Validate reports whether the coordinate has a safe, immutable source
+// identity. Canonicalization is intentionally available separately because
+// callers need to persist one stable spelling of an accepted URL.
+func (coordinate StandardAuthoringSourceCoordinate) Validate() error {
+	_, err := coordinate.Canonical()
+	return err
+}
+
+// StandardAuthoringGitArchiveSourceCapturer captures a caller-selected,
+// validated immutable commit as a deterministic Git tar archive. The
+// executable must be an explicit absolute non-symlink regular file; there is
+// intentionally no PATH discovery fallback. The deployment composition should
+// pass the same locked Git executable that its Standard authoring provider
+// attests at stage time.
 type StandardAuthoringGitArchiveSourceCapturer struct {
 	gitExecutable string
 	lockedGit     *stageprovider.LocalExecutableLock
+	sshTransport  *standardAuthoringSSHSourceCaptureTransport
+}
+
+// StandardAuthoringSSHSourceCaptureTransportConfig contains only deployment
+// lock facts and the narrowly scoped environment lookup used for an optional
+// SSH agent socket. The lookup is never called for HTTPS and its value is
+// never made durable. Production composition must pass an explicit lookup;
+// nil means no agent, never an ambient SSH_AUTH_SOCK fallback.
+type StandardAuthoringSSHSourceCaptureTransportConfig struct {
+	ContractRoot      string
+	Transport         stageprovider.StandardAuthoringSSHTransportLock
+	LookupEnvironment func(string) (string, bool)
+}
+
+type standardAuthoringSSHSourceCaptureTransport struct {
+	contractRoot      string
+	transport         stageprovider.StandardAuthoringSSHTransportLock
+	lookupEnvironment func(string) (string, bool)
 }
 
 // NewStandardAuthoringGitArchiveSourceCapturer validates a deployment-owned
@@ -54,7 +117,7 @@ func NewStandardAuthoringGitArchiveSourceCapturer(gitExecutable string) (*Standa
 // NewLockedStandardAuthoringGitArchiveSourceCapturer additionally binds
 // source capture to the exact local.command record selected by a generated
 // Standard operation lock. Capture rechecks the executable's bytes and
-// `git --version` immediately before it contacts the public source remote.
+// `git --version` immediately before it contacts the requested source remote.
 // This is separate from (and complementary to) the per-stage runtime
 // attestor because source capture occurs before an AuthoringSession exists.
 func NewLockedStandardAuthoringGitArchiveSourceCapturer(locked stageprovider.LocalExecutableLock) (*StandardAuthoringGitArchiveSourceCapturer, error) {
@@ -73,12 +136,40 @@ func NewLockedStandardAuthoringGitArchiveSourceCapturer(locked stageprovider.Loc
 	return capturer, nil
 }
 
-// CaptureStandardAuthoringSource fetches only the fixed immutable commit into
-// a private temporary bare repository, verifies the resolved commit object,
-// and archives that exact object. No mutable ref, user URL, checkout path,
-// credential, global Git config, or interactive prompt participates in this
-// operation. The temporary repository is deleted before this method returns.
-func (capturer *StandardAuthoringGitArchiveSourceCapturer) CaptureStandardAuthoringSource(ctx context.Context) (StandardAuthoringSourceSnapshot, error) {
+// NewLockedStandardAuthoringGitArchiveSourceCapturerWithSSHTransport binds a
+// source capturer to the lock-owned SSH acquisition contract. HTTPS capture
+// remains credential-free and unchanged; SSH capture becomes available only
+// through the pinned client, wrapper shell, packaged known_hosts allow-list,
+// and optional explicitly named agent socket described by this configuration.
+func NewLockedStandardAuthoringGitArchiveSourceCapturerWithSSHTransport(locked stageprovider.LocalExecutableLock, config StandardAuthoringSSHSourceCaptureTransportConfig) (*StandardAuthoringGitArchiveSourceCapturer, error) {
+	capturer, err := NewLockedStandardAuthoringGitArchiveSourceCapturer(locked)
+	if err != nil {
+		return nil, err
+	}
+	if err := config.Transport.Validate(); err != nil {
+		return nil, fmt.Errorf("Standard authoring SSH transport lock: %w", err)
+	}
+	contractRoot, err := filepath.Abs(strings.TrimSpace(config.ContractRoot))
+	if err != nil || filepath.Clean(contractRoot) != contractRoot {
+		return nil, fmt.Errorf("Standard authoring SSH contract root is invalid")
+	}
+	if _, err := stageprovider.ReadStandardAuthoringSSHKnownHostsAsset(contractRoot, config.Transport.KnownHosts); err != nil {
+		return nil, fmt.Errorf("Standard authoring SSH known_hosts asset: %w", err)
+	}
+	transport := config.Transport.Clone()
+	capturer.sshTransport = &standardAuthoringSSHSourceCaptureTransport{
+		contractRoot: contractRoot, transport: transport, lookupEnvironment: config.LookupEnvironment,
+	}
+	return capturer, nil
+}
+
+// CaptureStandardAuthoringSource fetches one caller-selected but fully
+// validated immutable commit into a private temporary bare repository,
+// verifies the resolved commit object, and archives that exact object. No
+// mutable ref, checkout path, credential, global Git config, or interactive
+// prompt participates in this operation. The temporary repository is deleted
+// before this method returns.
+func (capturer *StandardAuthoringGitArchiveSourceCapturer) CaptureStandardAuthoringSource(ctx context.Context, source StandardAuthoringSourceCoordinate) (StandardAuthoringSourceSnapshot, error) {
 	if capturer == nil || strings.TrimSpace(capturer.gitExecutable) == "" {
 		return StandardAuthoringSourceSnapshot{}, ErrStandardAuthoringLaunchUnavailable
 	}
@@ -88,7 +179,11 @@ func (capturer *StandardAuthoringGitArchiveSourceCapturer) CaptureStandardAuthor
 	if err := ctx.Err(); err != nil {
 		return StandardAuthoringSourceSnapshot{}, err
 	}
-	captureContext, cancel := context.WithTimeout(ctx, standardAuthoringSourceCaptureTimeout)
+	coordinate, err := source.Canonical()
+	if err != nil {
+		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("validate Standard authoring source coordinate: %w", err)
+	}
+	captureContext, cancel := context.WithTimeout(ctx, StandardAuthoringSourceCaptureTimeout)
 	defer cancel()
 
 	temporaryRoot, err := os.MkdirTemp("", "harbor-standard-authoring-source-")
@@ -104,26 +199,30 @@ func (capturer *StandardAuthoringGitArchiveSourceCapturer) CaptureStandardAuthor
 	if _, err := capturer.runGit(captureContext, temporaryRoot, "init", "--bare", repository); err != nil {
 		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("initialize private Standard authoring Git repository: %w", err)
 	}
-	if _, err := capturer.runGit(captureContext, temporaryRoot, "--git-dir", repository, "fetch", "--no-tags", "--depth=1", StandardAuthoringSourceRepositoryURL, StandardAuthoringSourceCommit); err != nil {
-		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("fetch approved Standard authoring Git commit: %w", err)
-	}
-	resolved, err := capturer.runGit(captureContext, temporaryRoot, "--git-dir", repository, "rev-parse", "--verify", StandardAuthoringSourceCommit+"^{commit}")
-	if err != nil {
-		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("verify approved Standard authoring Git commit: %w", err)
-	}
-	if strings.TrimSpace(string(resolved)) != StandardAuthoringSourceCommit {
-		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("approved Standard authoring Git commit resolved to another object")
-	}
-	archive, err := capturer.runGitArchive(captureContext, temporaryRoot, repository)
+	fetchEnvironment, err := capturer.sourceFetchEnvironment(captureContext, temporaryRoot, coordinate)
 	if err != nil {
 		return StandardAuthoringSourceSnapshot{}, err
 	}
-	if err := validateStandardAuthoringSourceArchive(archive); err != nil {
+	if _, err := capturer.runGitWithEnvironment(captureContext, temporaryRoot, standardAuthoringGitCommandOutputMax, fetchEnvironment, "--git-dir", repository, "fetch", "--no-tags", "--depth=1", coordinate.RepositoryURL, coordinate.CommitSHA); err != nil {
+		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("fetch requested Standard authoring Git commit: %w", err)
+	}
+	resolved, err := capturer.runGit(captureContext, temporaryRoot, "--git-dir", repository, "rev-parse", "--verify", coordinate.CommitSHA+"^{commit}")
+	if err != nil {
+		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("verify requested Standard authoring Git commit: %w", err)
+	}
+	if strings.TrimSpace(string(resolved)) != coordinate.CommitSHA {
+		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("requested Standard authoring Git commit resolved to another object")
+	}
+	archive, err := capturer.runGitArchive(captureContext, temporaryRoot, repository, coordinate)
+	if err != nil {
+		return StandardAuthoringSourceSnapshot{}, err
+	}
+	if err := validateStandardAuthoringSourceArchive(archive, coordinate); err != nil {
 		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("validate captured Standard authoring Git archive: %w", err)
 	}
 	return StandardAuthoringSourceSnapshot{
-		RepositoryURL: StandardAuthoringSourceRepositoryURL,
-		CommitSHA:     StandardAuthoringSourceCommit,
+		RepositoryURL: coordinate.RepositoryURL,
+		CommitSHA:     coordinate.CommitSHA,
 		SchemaVersion: StandardAuthoringSourceSnapshotSchemaVersion,
 		Content:       archive,
 	}, nil
@@ -147,13 +246,13 @@ func (capturer *StandardAuthoringGitArchiveSourceCapturer) verifyLockedGit(ctx c
 	return nil
 }
 
-func (capturer *StandardAuthoringGitArchiveSourceCapturer) runGitArchive(ctx context.Context, workdir, repository string) ([]byte, error) {
-	archive, err := capturer.runGitWithLimit(ctx, workdir, int64(standardAuthoringSourceArchiveMaxBytes), "--git-dir", repository, "archive", "--format=tar", "--prefix="+standardAuthoringSourceArchiveRoot, StandardAuthoringSourceCommit)
+func (capturer *StandardAuthoringGitArchiveSourceCapturer) runGitArchive(ctx context.Context, workdir, repository string, coordinate StandardAuthoringSourceCoordinate) ([]byte, error) {
+	archive, err := capturer.runGitWithLimit(ctx, workdir, int64(standardAuthoringSourceArchiveMaxBytes), "--git-dir", repository, "archive", "--format=tar", "--prefix="+standardAuthoringSourceArchiveRoot, coordinate.CommitSHA)
 	if err != nil {
 		if errors.Is(err, errStandardAuthoringGitOutputTooLarge) {
 			return nil, errStandardAuthoringSourceArchiveTooLarge
 		}
-		return nil, fmt.Errorf("archive approved Standard authoring Git commit: %w", err)
+		return nil, fmt.Errorf("archive requested Standard authoring Git commit: %w", err)
 	}
 	return archive, nil
 }
@@ -163,6 +262,10 @@ func (capturer *StandardAuthoringGitArchiveSourceCapturer) runGit(ctx context.Co
 }
 
 func (capturer *StandardAuthoringGitArchiveSourceCapturer) runGitWithLimit(ctx context.Context, workdir string, limit int64, arguments ...string) ([]byte, error) {
+	return capturer.runGitWithEnvironment(ctx, workdir, limit, standardAuthoringGitEnvironment(workdir), arguments...)
+}
+
+func (capturer *StandardAuthoringGitArchiveSourceCapturer) runGitWithEnvironment(ctx context.Context, workdir string, limit int64, environment []string, arguments ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -170,7 +273,7 @@ func (capturer *StandardAuthoringGitArchiveSourceCapturer) runGitWithLimit(ctx c
 	stderr := newStandardAuthoringLimitedBuffer(standardAuthoringGitCommandOutputMax)
 	command := exec.CommandContext(ctx, capturer.gitExecutable, arguments...)
 	command.Dir = workdir
-	command.Env = standardAuthoringGitEnvironment(workdir)
+	command.Env = append([]string(nil), environment...)
 	command.Stdout = output
 	command.Stderr = stderr
 	if err := command.Run(); err != nil {
@@ -203,7 +306,261 @@ func standardAuthoringGitEnvironment(temporaryRoot string) []string {
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ALLOW_PROTOCOL=https:ssh",
+		"GIT_PROTOCOL_FROM_USER=0",
+		"SSH_ASKPASS_REQUIRE=never",
 	}
+}
+
+// sourceFetchEnvironment selects the one transport that may contact the
+// caller-selected remote. HTTPS has no credential or SSH configuration. SSH
+// is available only when production composition supplied the fully verified
+// transport contract; this check occurs before Git receives the remote URL.
+func (capturer *StandardAuthoringGitArchiveSourceCapturer) sourceFetchEnvironment(ctx context.Context, temporaryRoot string, source StandardAuthoringSourceCoordinate) ([]string, error) {
+	parsed, err := url.Parse(source.RepositoryURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse Standard authoring source transport")
+	}
+	switch parsed.Scheme {
+	case "https":
+		return standardAuthoringGitEnvironment(temporaryRoot), nil
+	case "ssh":
+		if capturer == nil || capturer.sshTransport == nil {
+			return nil, fmt.Errorf("Standard authoring SSH source capture is not configured")
+		}
+		return capturer.sshTransport.gitEnvironment(ctx, temporaryRoot, parsed)
+	default:
+		return nil, fmt.Errorf("Standard authoring source transport is not permitted")
+	}
+}
+
+func (transport *standardAuthoringSSHSourceCaptureTransport) gitEnvironment(ctx context.Context, temporaryRoot string, sourceURL *url.URL) ([]string, error) {
+	if transport == nil || sourceURL == nil || sourceURL.Scheme != "ssh" {
+		return nil, fmt.Errorf("Standard authoring SSH transport is unavailable")
+	}
+	if sourceURL.User == nil || !standardAuthoringSSHUsername(sourceURL.User.Username()) {
+		return nil, fmt.Errorf("Standard authoring SSH source user is invalid")
+	}
+	hostname := strings.ToLower(strings.TrimSpace(sourceURL.Hostname()))
+	port := strings.TrimSpace(sourceURL.Port())
+	knownHosts, err := stageprovider.ReadStandardAuthoringSSHKnownHostsAsset(transport.contractRoot, transport.transport.KnownHosts)
+	if err != nil {
+		return nil, fmt.Errorf("verify Standard authoring SSH known_hosts asset: %w", err)
+	}
+	allowed, err := stageprovider.StandardAuthoringSSHKnownHostsAllowsHost(knownHosts, hostname, port)
+	if err != nil {
+		return nil, fmt.Errorf("validate Standard authoring SSH source host: %w", err)
+	}
+	if !allowed {
+		return nil, fmt.Errorf("Standard authoring SSH source host is not in the packaged known_hosts allow-list")
+	}
+	if err := transport.verifyLockedExecutables(ctx, temporaryRoot); err != nil {
+		return nil, err
+	}
+	agentSocket, err := transport.optionalAgentSocket()
+	if err != nil {
+		return nil, err
+	}
+	knownHostsPath, err := standardAuthoringWriteKnownHostsSnapshot(temporaryRoot, knownHosts)
+	if err != nil {
+		return nil, err
+	}
+	wrapper, err := transport.writeSSHWrapper(temporaryRoot, knownHostsPath, agentSocket)
+	if err != nil {
+		return nil, err
+	}
+	environment := standardAuthoringGitEnvironment(temporaryRoot)
+	environment = append(environment, "GIT_SSH="+wrapper, "GIT_SSH_VARIANT=ssh")
+	return environment, nil
+}
+
+func (transport *standardAuthoringSSHSourceCaptureTransport) verifyLockedExecutables(ctx context.Context, temporaryRoot string) error {
+	if transport == nil {
+		return fmt.Errorf("Standard authoring SSH transport is unavailable")
+	}
+	if err := standardAuthoringVerifyLockedExecutable(transport.transport.SSHExecutable); err != nil {
+		return fmt.Errorf("verify Standard authoring locked SSH executable: %w", err)
+	}
+	if err := standardAuthoringVerifyLockedExecutable(transport.transport.WrapperShell); err != nil {
+		return fmt.Errorf("verify Standard authoring locked SSH wrapper shell: %w", err)
+	}
+	version, err := standardAuthoringSSHVersion(ctx, temporaryRoot, transport.transport.SSHExecutable.AbsolutePath)
+	if err != nil || version != transport.transport.SSHExecutable.Version {
+		return fmt.Errorf("verify Standard authoring locked SSH version")
+	}
+	return nil
+}
+
+func standardAuthoringVerifyLockedExecutable(locked stageprovider.LocalExecutableLock) error {
+	path, err := standardAuthoringRegularExecutable(locked.AbsolutePath)
+	if err != nil || path != locked.AbsolutePath {
+		return errors.New("locked executable path is unavailable")
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || workflowkit.SHA256Fingerprint(contents) != locked.ContentSHA256 {
+		return errors.New("locked executable bytes do not match")
+	}
+	return nil
+}
+
+func standardAuthoringSSHVersion(ctx context.Context, workdir, executable string) (string, error) {
+	output := newStandardAuthoringLimitedBuffer(standardAuthoringGitCommandOutputMax)
+	stderr := newStandardAuthoringLimitedBuffer(standardAuthoringGitCommandOutputMax)
+	command := exec.CommandContext(ctx, executable, "-V")
+	command.Dir = workdir
+	command.Env = standardAuthoringGitEnvironment(workdir)
+	command.Stdout = output
+	command.Stderr = stderr
+	if err := command.Run(); err != nil || output.exceeded || stderr.exceeded || ctx.Err() != nil {
+		return "", errors.New("controlled SSH version command failed")
+	}
+	value := strings.TrimSpace(string(append(append([]byte(nil), output.Bytes()...), stderr.Bytes()...)))
+	if value == "" || strings.ContainsAny(value, "\r\n\x00") {
+		return "", errors.New("SSH version output is invalid")
+	}
+	parts := strings.Fields(value)
+	if len(parts) == 0 || !strings.HasPrefix(parts[0], "OpenSSH_") {
+		return "", errors.New("SSH version output is invalid")
+	}
+	return parts[0], nil
+}
+
+func (transport *standardAuthoringSSHSourceCaptureTransport) optionalAgentSocket() (string, error) {
+	if transport == nil || transport.lookupEnvironment == nil {
+		return "", nil
+	}
+	value, present := transport.lookupEnvironment(transport.transport.AgentSocketEnvironmentName)
+	if !present || strings.TrimSpace(value) == "" {
+		return "", nil
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("configured Standard authoring SSH agent socket is invalid")
+	}
+	if err := standardAuthoringUnixSocket(value); err != nil {
+		return "", fmt.Errorf("configured Standard authoring SSH agent socket is unavailable")
+	}
+	return value, nil
+}
+
+func standardAuthoringUnixSocket(value string) error {
+	if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsAny(value, "\r\n\x00") {
+		return errors.New("socket path is invalid")
+	}
+	for current := value; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("socket path is unavailable")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	info, err := os.Lstat(value)
+	if err != nil || info.Mode()&os.ModeSocket == 0 {
+		return errors.New("socket is unavailable")
+	}
+	return nil
+}
+
+// standardAuthoringWriteKnownHostsSnapshot closes the deployment-file TOCTOU
+// window after its hash and contents have been verified. OpenSSH receives only
+// this private, immutable-for-the-capture copy rather than reopening the
+// package path later during Git's SSH transport.
+func standardAuthoringWriteKnownHostsSnapshot(temporaryRoot string, contents []byte) (string, error) {
+	if len(contents) == 0 || len(contents) > stageprovider.StandardAuthoringSSHKnownHostsMaxBytes {
+		return "", errors.New("controlled SSH known_hosts snapshot is invalid")
+	}
+	path := filepath.Join(temporaryRoot, "ssh-known_hosts")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", errors.New("create controlled SSH known_hosts snapshot")
+	}
+	if _, writeErr := file.Write(contents); writeErr != nil || file.Sync() != nil || file.Close() != nil {
+		file.Close()
+		_ = os.Remove(path)
+		return "", errors.New("write controlled SSH known_hosts snapshot")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != int64(len(contents)) {
+		_ = os.Remove(path)
+		return "", errors.New("verify controlled SSH known_hosts snapshot")
+	}
+	return path, nil
+}
+
+func (transport *standardAuthoringSSHSourceCaptureTransport) writeSSHWrapper(temporaryRoot, knownHostsPath, agentSocket string) (string, error) {
+	if transport == nil {
+		return "", errors.New("SSH transport is unavailable")
+	}
+	arguments := []string{
+		transport.transport.SSHExecutable.AbsolutePath,
+		"-F", "/dev/null",
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=" + knownHostsPath,
+		"-o", "GlobalKnownHostsFile=/dev/null",
+		"-o", "UpdateHostKeys=no",
+		"-o", "PasswordAuthentication=no",
+		"-o", "KbdInteractiveAuthentication=no",
+		"-o", "ChallengeResponseAuthentication=no",
+		"-o", "HostbasedAuthentication=no",
+		"-o", "GSSAPIAuthentication=no",
+		"-o", "PubkeyAuthentication=yes",
+		"-o", "NumberOfPasswordPrompts=0",
+		"-o", "PreferredAuthentications=publickey",
+		"-o", "ForwardAgent=no",
+		"-o", "PermitLocalCommand=no",
+		"-o", "ProxyCommand=none",
+		"-o", "ProxyJump=none",
+	}
+	if agentSocket == "" {
+		arguments = append(arguments, "-o", "IdentityAgent=none")
+	} else {
+		arguments = append(arguments, "-o", "IdentityAgent="+agentSocket)
+	}
+	quoted := make([]string, 0, len(arguments))
+	for _, argument := range arguments {
+		quoted = append(quoted, standardAuthoringPOSIXShellQuote(argument))
+	}
+	contents := "#!" + transport.transport.WrapperShell.AbsolutePath + "\nexec " + strings.Join(quoted, " ") + " \"$@\"\n"
+	path := filepath.Join(temporaryRoot, "git-ssh-wrapper")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		return "", errors.New("create controlled SSH wrapper")
+	}
+	if _, writeErr := io.WriteString(file, contents); writeErr != nil || file.Sync() != nil || file.Close() != nil {
+		file.Close()
+		_ = os.Remove(path)
+		return "", errors.New("write controlled SSH wrapper")
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		_ = os.Remove(path)
+		return "", errors.New("seal controlled SSH wrapper")
+	}
+	if _, err := standardAuthoringRegularExecutable(path); err != nil {
+		_ = os.Remove(path)
+		return "", errors.New("verify controlled SSH wrapper")
+	}
+	return path, nil
+}
+
+func standardAuthoringPOSIXShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func standardAuthoringSSHUsername(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
+			(index > 0 && (character == '.' || character == '_' || character == '-')) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func standardAuthoringRegularExecutable(value string) (string, error) {
@@ -235,12 +592,19 @@ func standardAuthoringRegularExecutable(value string) (string, error) {
 	return absolute, nil
 }
 
-// validateStandardAuthoringSourceArchive proves the source object is a safe
-// deterministic Git archive before it becomes durable evidence. It refuses
-// paths outside the fixed archive root, duplicate names, links, devices, and
-// other non-regular entries, so a later controlled checkout cannot interpret
-// a source snapshot as a filesystem escape hatch.
-func validateStandardAuthoringSourceArchive(raw []byte) error {
+// validateStandardAuthoringSourceArchive proves the source object is a safe,
+// deterministic Git archive before it becomes durable evidence. Git archive
+// emits one PAX global header naming the commit. It may also emit a local PAX
+// path record for a path that cannot be represented by USTAR; recognize only
+// that exact record and reject every other metadata extension. The remaining
+// archive refuses paths outside the fixed archive root, duplicate names,
+// links, devices, and other non-regular entries, so a later controlled
+// checkout cannot interpret a source snapshot as a filesystem escape hatch.
+func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoringSourceCoordinate) error {
+	coordinate, err := source.Canonical()
+	if err != nil {
+		return fmt.Errorf("archive source coordinate is invalid: %w", err)
+	}
 	if len(raw) == 0 {
 		return errors.New("archive is empty")
 	}
@@ -251,6 +615,7 @@ func validateStandardAuthoringSourceArchive(raw []byte) error {
 	seen := make(map[string]struct{})
 	regularFiles := 0
 	var total int64
+	sawGitPAXGlobalHeader := false
 	for {
 		header, err := reader.Next()
 		if errors.Is(err, io.EOF) {
@@ -258,6 +623,16 @@ func validateStandardAuthoringSourceArchive(raw []byte) error {
 		}
 		if err != nil {
 			return errors.New("archive cannot be read")
+		}
+		if header.Typeflag == tar.TypeXGlobalHeader {
+			if sawGitPAXGlobalHeader || len(seen) != 0 || !standardAuthoringGitPAXGlobalHeader(header, coordinate.CommitSHA) {
+				return errors.New("archive contains unsupported PAX global metadata")
+			}
+			sawGitPAXGlobalHeader = true
+			continue
+		}
+		if !standardAuthoringGitArchiveEntryMetadata(header) {
+			return errors.New("archive contains unsupported metadata")
 		}
 		name := header.Name
 		if !standardAuthoringArchivePath(name) {
@@ -286,10 +661,41 @@ func validateStandardAuthoringSourceArchive(raw []byte) error {
 			return errors.New("archive contains a link or unsupported entry")
 		}
 	}
+	if !sawGitPAXGlobalHeader {
+		return errors.New("archive is missing the Git PAX commit header")
+	}
 	if regularFiles == 0 {
 		return errors.New("archive has no regular files")
 	}
 	return nil
+}
+
+func standardAuthoringGitPAXGlobalHeader(header *tar.Header, commitSHA string) bool {
+	if header == nil || header.Name != standardAuthoringGitPAXGlobalHeaderName || header.Typeflag != tar.TypeXGlobalHeader ||
+		header.Size != 0 || header.Linkname != "" || len(header.Xattrs) != 0 || len(header.PAXRecords) != 1 {
+		return false
+	}
+	comment, ok := header.PAXRecords["comment"]
+	return ok && comment == commitSHA
+}
+
+// standardAuthoringGitArchiveEntryMetadata recognizes the only non-USTAR
+// metadata emitted by the supported Git archive path: a local PAX `path`
+// record. archive/tar applies that record before returning the entry, so the
+// value must exactly equal Header.Name. Callers must validate Header.Name
+// afterwards, because it is the final, filesystem-relevant path.
+func standardAuthoringGitArchiveEntryMetadata(header *tar.Header) bool {
+	if header == nil || header.Linkname != "" || len(header.Xattrs) != 0 {
+		return false
+	}
+	if len(header.PAXRecords) == 0 {
+		return header.Format == tar.FormatUSTAR
+	}
+	if header.Format != tar.FormatPAX || len(header.PAXRecords) != 1 {
+		return false
+	}
+	paxPath, ok := header.PAXRecords["path"]
+	return ok && paxPath != "" && paxPath == header.Name
 }
 
 func standardAuthoringArchivePath(name string) bool {

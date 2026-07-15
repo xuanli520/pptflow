@@ -130,7 +130,7 @@ func TestTaskHubStandardAuthoringShortcutIsGlobalAndPreservesAnEmptyTarget(t *te
 	service := &fakeTaskHubLifecycle{
 		snapshot: snapshot,
 		plan: TaskHubPlanPreview{
-			Title: "启动 Standard 创题", Summary: "捕获固定 Tower HTTP 源并排队 AuthoringSession Run", ConfirmationNeeded: true,
+			Title: "启动 Standard 创题", Summary: "捕获所填精确源码并排队 AuthoringSession Run", ConfirmationNeeded: true,
 		},
 	}
 	m, cleanup := newTestTaskHubV2Model(t, service)

@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 )
 
 const (
@@ -95,6 +97,9 @@ func productionDeploymentPathsBesideExecutable(executable string) (productionDep
 		*entry.catalogDest, *entry.lockDest = catalog, lock
 	}
 	if _, err := requireCodeEdgeProductionFileWithin("Standard authoring contract asset manifest", filepath.Join(standard, standardAuthoringContractManifestFile), root); err != nil {
+		return productionDeploymentPaths{}, err
+	}
+	if _, err := requireCodeEdgeProductionFileWithin("Standard authoring SSH known_hosts", filepath.Join(standard, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath)), root); err != nil {
 		return productionDeploymentPaths{}, err
 	}
 	return paths, nil

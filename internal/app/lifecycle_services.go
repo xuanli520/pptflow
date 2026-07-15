@@ -144,10 +144,11 @@ type LifecycleServicesOptions struct {
 	// model selection, or stage operation data.
 	EvaluatorRunDefinitionProvider EvaluatorRunDefinitionProvider
 	// StandardAuthoringSourceCapturer and StandardAuthoringRunDefinitionProvider
-	// are the deployment-owned inputs for the fixed Tower HTTP Standard
-	// authoring launch. Neither is derived from a CLI/TUI request. Omitting
-	// either leaves the launch surface fail-closed while retaining the rest of
-	// the lifecycle control plane.
+	// are the deployment-owned inputs for Standard authoring. The caller selects
+	// only a validated immutable HTTPS/SSH source coordinate; capture mechanics,
+	// execution definition, models, secrets, and catalog/lock remain closed.
+	// Omitting either leaves the launch surface fail-closed while retaining the
+	// rest of the lifecycle control plane.
 	StandardAuthoringSourceCapturer        StandardAuthoringSourceCapturer
 	StandardAuthoringRunDefinitionProvider StandardAuthoringRunDefinitionProvider
 	// CodeEdgePhase1RunDefinitionProvider supplies the closed task-bound

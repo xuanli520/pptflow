@@ -17,6 +17,11 @@ const (
 	managedTasksDirectory = "tasks"
 	managedRunsDirectory  = "runs"
 	managedTrashDirectory = "trash"
+	// managedLifecycleOperationsDirectory contains immutable preparation
+	// records that exist before a Task, Revision, or Run can exist. It is kept
+	// separate from runs because a prepared lifecycle operation may fail before
+	// it has a durable workflow subject.
+	managedLifecycleOperationsDirectory = "operations"
 )
 
 // managedLayout owns the V2 filesystem layout. A task snapshot deliberately
@@ -78,6 +83,10 @@ func (layout managedLayout) candidateCheckoutRelpath(taskID, candidateID string)
 
 func (layout managedLayout) runDirectory(runID string) string {
 	return filepath.Join(layout.root, managedRunsDirectory, runID)
+}
+
+func (layout managedLayout) lifecycleOperationDirectory(operationID string) string {
+	return filepath.Join(layout.root, managedLifecycleOperationsDirectory, operationID)
 }
 
 func (layout managedLayout) releaseDirectory(version string) string {

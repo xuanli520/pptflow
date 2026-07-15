@@ -164,6 +164,30 @@ func (s *Store) GetAuthoringSourceByFingerprint(ctx context.Context, sourceFinge
 	return &source, nil
 }
 
+// GetAuthoringSourceByCoordinateAndSnapshot finds the immutable source whose
+// canonical remote coordinate and content-addressed snapshot are exact. The
+// Store owns normalization and fingerprint construction so callers cannot
+// duplicate the source identity format when safely reusing a snapshot.
+func (s *Store) GetAuthoringSourceByCoordinateAndSnapshot(ctx context.Context, repositoryURL, commitSHA, contentDigest, schemaVersion string) (*AuthoringSource, error) {
+	repositoryURL, err := NormalizeAuthoringRepositoryURL(repositoryURL)
+	if err != nil {
+		return nil, err
+	}
+	commitSHA, err = NormalizeAuthoringCommitSHA(commitSHA)
+	if err != nil {
+		return nil, err
+	}
+	contentDigest, err = normalizeAuthoringSHA256(contentDigest, "authoring source snapshot content digest")
+	if err != nil {
+		return nil, err
+	}
+	schemaVersion, err = normalizeRequired(schemaVersion, "authoring source snapshot schema version")
+	if err != nil {
+		return nil, err
+	}
+	return s.GetAuthoringSourceByFingerprint(ctx, authoringSourceFingerprint(repositoryURL, commitSHA, contentDigest, contentDigest, schemaVersion))
+}
+
 type preparedAuthoringSession struct {
 	sourceID                string
 	targetTaskID            string
@@ -934,11 +958,11 @@ func getAuthoringTaskMaterialization(ctx context.Context, querier interface {
 }
 
 func prepareAuthoringSource(request CreateAuthoringSourceRequest) (preparedAuthoringSource, error) {
-	repositoryURL, err := normalizeAuthoringRepositoryURL(request.RepositoryURL)
+	repositoryURL, err := NormalizeAuthoringRepositoryURL(request.RepositoryURL)
 	if err != nil {
 		return preparedAuthoringSource{}, err
 	}
-	commitSHA, err := normalizeAuthoringCommitSHA(request.CommitSHA)
+	commitSHA, err := NormalizeAuthoringCommitSHA(request.CommitSHA)
 	if err != nil {
 		return preparedAuthoringSource{}, err
 	}
@@ -1166,29 +1190,89 @@ func sameAuthoringRunInputArtifact(left, right AuthoringRunInputArtifact) bool {
 		left.SchemaVersion == right.SchemaVersion && left.IdempotencyKey == right.IdempotencyKey
 }
 
-func normalizeAuthoringRepositoryURL(value string) (string, error) {
+// NormalizeAuthoringRepositoryURL accepts only immutable remote Git source
+// coordinates. HTTPS repositories must be credential-free. SSH repositories
+// may name a login user, but never a password, and support both URI and the
+// common scp-like Git spelling. The result is a canonical URL suitable for a
+// durable AuthoringSource fingerprint.
+func NormalizeAuthoringRepositoryURL(value string) (string, error) {
 	value = strings.TrimSpace(value)
-	parsed, err := url.Parse(value)
+	if strings.ContainsAny(value, "?#") {
+		return "", fmt.Errorf("authoring source repository URL must not contain query or fragment")
+	}
+	if normalized, recognized, err := normalizeAuthoringScpLikeSSHURL(value); recognized {
+		return normalized, err
+	}
+	parsed, err := url.ParseRequestURI(value)
 	if err != nil || parsed == nil {
 		return "", fmt.Errorf("authoring source repository URL is invalid")
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	if parsed.Scheme != "https" && parsed.Scheme != "ssh" && parsed.Scheme != "git" {
-		return "", fmt.Errorf("authoring source repository URL must use https, ssh, or git")
+	if parsed.Scheme != "https" && parsed.Scheme != "ssh" {
+		return "", fmt.Errorf("authoring source repository URL must use https or ssh")
 	}
-	if parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
-		return "", fmt.Errorf("authoring source repository URL must be an absolute credential-free repository URL")
+	if parsed.Host == "" || parsed.Hostname() == "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" {
+		return "", fmt.Errorf("authoring source repository URL must be an absolute repository URL without query or fragment")
+	}
+	if parsed.Scheme == "https" && parsed.User != nil {
+		return "", fmt.Errorf("authoring source HTTPS URL must not contain credentials")
+	}
+	if parsed.Scheme == "ssh" {
+		hasPassword := false
+		if parsed.User != nil {
+			_, hasPassword = parsed.User.Password()
+		}
+		if parsed.User == nil || parsed.User.Username() == "" || strings.Contains(parsed.User.Username(), ":") || hasPassword {
+			return "", fmt.Errorf("authoring source SSH URL must contain a username but no password")
+		}
+	}
+	path, err := normalizeAuthoringRepositoryPath(parsed.Path)
+	if err != nil {
+		return "", err
 	}
 	parsed.Host = strings.ToLower(parsed.Host)
-	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	if parsed.Path == "" || parsed.Path == "/" {
-		return "", fmt.Errorf("authoring source repository URL must identify a repository path")
-	}
+	parsed.Path = path
 	parsed.RawPath = ""
 	return parsed.String(), nil
 }
 
-func normalizeAuthoringCommitSHA(value string) (string, error) {
+func normalizeAuthoringScpLikeSSHURL(value string) (string, bool, error) {
+	if value == "" || strings.Contains(value, "://") {
+		return "", false, nil
+	}
+	at := strings.IndexByte(value, '@')
+	colon := strings.IndexByte(value, ':')
+	if at <= 0 || colon <= at+1 || strings.Count(value, "@") != 1 || strings.Count(value, ":") != 1 {
+		return "", false, nil
+	}
+	user, host, repositoryPath := value[:at], value[at+1:colon], value[colon+1:]
+	if strings.ContainsAny(user, "\t\r\n :/") || strings.ContainsAny(host, "\t\r\n /@") || host == "" || strings.Contains(user, ":") {
+		return "", true, fmt.Errorf("authoring source SSH URL is invalid")
+	}
+	path, err := normalizeAuthoringRepositoryPath("/" + repositoryPath)
+	if err != nil {
+		return "", true, err
+	}
+	return (&url.URL{Scheme: "ssh", User: url.User(user), Host: strings.ToLower(host), Path: path}).String(), true, nil
+}
+
+func normalizeAuthoringRepositoryPath(value string) (string, error) {
+	value = strings.TrimRight(strings.TrimSpace(value), "/")
+	if value == "" || value == "/" || !strings.HasPrefix(value, "/") || strings.ContainsAny(value, "\\\t\r\n\x00") {
+		return "", fmt.Errorf("authoring source repository URL must identify a repository path")
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(value, "/"), "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("authoring source repository URL has an unsafe repository path")
+		}
+	}
+	return value, nil
+}
+
+// NormalizeAuthoringCommitSHA accepts a full immutable Git object ID. Both
+// SHA-1 and SHA-256 repository formats are supported, but abbreviated refs,
+// branches, and tags are not.
+func NormalizeAuthoringCommitSHA(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if len(value) != 40 && len(value) != 64 {
 		return "", fmt.Errorf("authoring source commit must be a full 40- or 64-hex object ID")

@@ -135,6 +135,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if summary == "" {
 			summary = taskHubActionLabel(msg.result.Action) + "已提交"
 		}
+		if msg.result.Action == TaskHubActionStartStandardAuthoring {
+			// Standard authoring is a global launch, so its request target is
+			// intentionally empty. Its completed receipt supplies the new draft
+			// Task and source/session Run that the next refresh must preserve.
+			m.taskHub.SelectedTaskID = strings.TrimSpace(msg.result.Target.TaskID)
+			m.taskHub.SelectedRunID = strings.TrimSpace(msg.result.Target.RunID)
+			if m.taskHub.SelectedRunID == "" {
+				m.taskHub.SelectedRunID = strings.TrimSpace(msg.result.ExecutionID)
+			}
+			// A completed global launch must remain visible so the selected output
+			// is not immediately replaced by a row from a stale search result.
+			m.taskHub.Query.Filter = ""
+			m.hubSearch.SetValue("")
+		}
 		m.closeTaskHubMutation()
 		m.taskHubPlan = nil
 		m.taskHubPlanCommand = nil

@@ -196,7 +196,11 @@ func (executor *StandardAuthoringRepoPrepareExecutor) readFrozenAuthoringSource(
 		return nil, err
 	}
 	source := subject.AuthoringSource
-	if err := validateStandardAuthoringLaunchSource(*source); err != nil {
+	coordinate, err := standardAuthoringStoredSourceCoordinate(*source)
+	if err != nil {
+		return nil, fmt.Errorf("validate frozen Standard authoring source: %w", err)
+	}
+	if err := validateStandardAuthoringLaunchSource(*source, coordinate); err != nil {
 		return nil, fmt.Errorf("validate frozen Standard authoring source: %w", err)
 	}
 	if input == nil || input.RunID != run.ID || input.SessionID != subject.AuthoringSession.ID || input.SourceID != source.ID ||
@@ -219,7 +223,7 @@ func (executor *StandardAuthoringRepoPrepareExecutor) readFrozenAuthoringSource(
 	if len(content) > standardAuthoringSourceArchiveMaxBytes || workflowkit.SHA256Fingerprint(content) != workflowkit.Fingerprint(source.SnapshotContentDigest) {
 		return nil, fmt.Errorf("Standard authoring source snapshot object does not match its immutable digest")
 	}
-	if err := validateStandardAuthoringSourceArchive(content); err != nil {
+	if err := validateStandardAuthoringSourceArchive(content, coordinate); err != nil {
 		return nil, fmt.Errorf("validate frozen Standard authoring source snapshot: %w", err)
 	}
 	return content, nil
@@ -264,13 +268,20 @@ func (executor *StandardAuthoringRepoPrepareExecutor) ensurePreparedWorkspace(ct
 	if err := ensureStandardAuthoringWorkspaceRoot(executor.workspaceRoot); err != nil {
 		return err
 	}
+	if !subject.isAuthoringSession() || subject.AuthoringSource == nil {
+		return fmt.Errorf("Standard authoring repo_prepare source/session subject is unavailable")
+	}
+	coordinate, err := standardAuthoringStoredSourceCoordinate(*subject.AuthoringSource)
+	if err != nil {
+		return fmt.Errorf("validate Standard authoring workspace source: %w", err)
+	}
 	workspace := filepath.Join(executor.workspaceRoot, run.ID)
 	sourceRoot := filepath.Join(workspace, stageprovider.StandardAuthoringCodexRunSourceDirectory)
 	if !standardAuthoringWorkspacePathWithin(executor.workspaceRoot, workspace) || !standardAuthoringWorkspacePathWithin(executor.workspaceRoot, sourceRoot) {
 		return fmt.Errorf("Standard authoring repo_prepare workspace path escapes managed root")
 	}
 	if _, err := os.Lstat(workspace); err == nil {
-		return verifyStandardAuthoringPreparedWorkspace(ctx, workspace, sourceRoot, subject, snapshot)
+		return verifyStandardAuthoringPreparedWorkspace(ctx, workspace, sourceRoot, subject, snapshot, coordinate)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect Standard authoring workspace: %w", err)
 	}
@@ -281,7 +292,7 @@ func (executor *StandardAuthoringRepoPrepareExecutor) ensurePreparedWorkspace(ct
 	}
 	defer os.RemoveAll(staging)
 	stagedSource := filepath.Join(staging, stageprovider.StandardAuthoringCodexRunSourceDirectory)
-	if err := extractStandardAuthoringSourceSnapshot(ctx, snapshot, staging); err != nil {
+	if err := extractStandardAuthoringSourceSnapshot(ctx, snapshot, staging, coordinate); err != nil {
 		return err
 	}
 	manifest, err := standardAuthoringWorkspaceManifestFor(subject)
@@ -303,11 +314,11 @@ func (executor *StandardAuthoringRepoPrepareExecutor) ensurePreparedWorkspace(ct
 	}
 	if err := os.Rename(staging, workspace); err != nil {
 		if _, statErr := os.Lstat(workspace); statErr == nil {
-			return verifyStandardAuthoringPreparedWorkspace(ctx, workspace, sourceRoot, subject, snapshot)
+			return verifyStandardAuthoringPreparedWorkspace(ctx, workspace, sourceRoot, subject, snapshot, coordinate)
 		}
 		return fmt.Errorf("publish Standard authoring workspace: %w", err)
 	}
-	return verifyStandardAuthoringPreparedWorkspace(ctx, workspace, sourceRoot, subject, snapshot)
+	return verifyStandardAuthoringPreparedWorkspace(ctx, workspace, sourceRoot, subject, snapshot, coordinate)
 }
 
 type standardAuthoringWorkspaceManifest struct {
@@ -333,7 +344,7 @@ func standardAuthoringWorkspaceManifestFor(subject workflowRunSubject) (standard
 	}, nil
 }
 
-func verifyStandardAuthoringPreparedWorkspace(ctx context.Context, workspace, sourceRoot string, subject workflowRunSubject, snapshot []byte) error {
+func verifyStandardAuthoringPreparedWorkspace(ctx context.Context, workspace, sourceRoot string, subject workflowRunSubject, snapshot []byte, coordinate StandardAuthoringSourceCoordinate) error {
 	for _, directory := range []string{workspace, sourceRoot} {
 		info, err := os.Lstat(directory)
 		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
@@ -356,11 +367,11 @@ func verifyStandardAuthoringPreparedWorkspace(ctx context.Context, workspace, so
 	if err != nil || !bytes.Equal(raw, canonical) {
 		return fmt.Errorf("Standard authoring workspace manifest is not canonical")
 	}
-	return verifyStandardAuthoringExtractedSnapshot(ctx, snapshot, sourceRoot)
+	return verifyStandardAuthoringExtractedSnapshot(ctx, snapshot, sourceRoot, coordinate)
 }
 
-func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte, workspace string) error {
-	if err := validateStandardAuthoringSourceArchive(snapshot); err != nil {
+func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte, workspace string, coordinate StandardAuthoringSourceCoordinate) error {
+	if err := validateStandardAuthoringSourceArchive(snapshot, coordinate); err != nil {
 		return fmt.Errorf("validate Standard authoring workspace source snapshot: %w", err)
 	}
 	reader := tar.NewReader(bytes.NewReader(snapshot))
@@ -374,6 +385,15 @@ func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte
 		}
 		if err != nil {
 			return fmt.Errorf("read Standard authoring source archive: %w", err)
+		}
+		if header.Typeflag == tar.TypeXGlobalHeader {
+			if !standardAuthoringGitPAXGlobalHeader(header, coordinate.CommitSHA) {
+				return fmt.Errorf("Standard authoring source archive has unsupported PAX metadata")
+			}
+			continue
+		}
+		if !standardAuthoringGitArchiveEntryMetadata(header) {
+			return fmt.Errorf("Standard authoring source archive has unsupported metadata")
 		}
 		name := filepath.FromSlash(header.Name)
 		path := filepath.Join(workspace, name)
@@ -412,8 +432,8 @@ func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte
 	return nil
 }
 
-func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []byte, sourceRoot string) error {
-	if err := validateStandardAuthoringSourceArchive(snapshot); err != nil {
+func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []byte, sourceRoot string, coordinate StandardAuthoringSourceCoordinate) error {
+	if err := validateStandardAuthoringSourceArchive(snapshot, coordinate); err != nil {
 		return err
 	}
 	expected := make(map[string][]byte)
@@ -428,6 +448,15 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 		}
 		if err != nil {
 			return err
+		}
+		if header.Typeflag == tar.TypeXGlobalHeader {
+			if !standardAuthoringGitPAXGlobalHeader(header, coordinate.CommitSHA) {
+				return fmt.Errorf("Standard authoring source archive has unsupported PAX metadata")
+			}
+			continue
+		}
+		if !standardAuthoringGitArchiveEntryMetadata(header) {
+			return fmt.Errorf("Standard authoring source archive has unsupported metadata")
 		}
 		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
 			continue

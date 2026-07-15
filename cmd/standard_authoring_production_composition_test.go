@@ -69,8 +69,8 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 
 	definition, err := composition.Definitions.StandardAuthoringRunDefinition(context.Background(), app.StandardAuthoringRunDefinitionSubject{
 		SourceID: "018f0a73-3b49-7000-8000-0000000000e1", AuthoringSessionID: "018f0a73-3b49-7000-8000-0000000000e2",
-		TargetTaskID: "018f0a73-3b49-7000-8000-0000000000e3", RepositoryURL: app.StandardAuthoringSourceRepositoryURL,
-		CommitSHA: app.StandardAuthoringSourceCommit, SourceSnapshotDigest: workflowkit.SubjectDigest("sha256:" + strings.Repeat("a", 64)),
+		TargetTaskID: "018f0a73-3b49-7000-8000-0000000000e3", RepositoryURL: "https://github.com/example/fixture-repository.git",
+		CommitSHA: "0123456789abcdef0123456789abcdef01234567", SourceSnapshotDigest: workflowkit.SubjectDigest("sha256:" + strings.Repeat("a", 64)),
 		SourceSnapshotSchema: app.StandardAuthoringSourceSnapshotSchemaVersion,
 	})
 	if err != nil {
@@ -179,6 +179,7 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 		LockID: "standard-authoring-composition-test", LockVersion: "1.0.0", CatalogReceipt: catalog.Receipt(),
 		HarborFlowBuild:                   stageprovider.HarborFlowBuildIdentity{Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("standard-authoring-composition-test"))},
 		StandardAuthoringExecutionProfile: &stageprovider.StandardAuthoringExecutionProfileLock{Profile: standardAuthoringProductionTestProfile(t)},
+		StandardAuthoringSSHTransport:     standardAuthoringProductionTestSSHTransport(t, deploymentRoot),
 		Operations:                        operations,
 	}
 	canonical, err := lock.CanonicalJSON()
@@ -236,6 +237,28 @@ func standardAuthoringProductionTestGit(t *testing.T) stageprovider.LocalExecuta
 		t.Fatalf("unexpected Git version %q", output)
 	}
 	return stageprovider.LocalExecutableLock{CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, AbsolutePath: path, Version: version, ContentSHA256: workflowkit.SHA256Fingerprint(contents)}
+}
+
+func standardAuthoringProductionTestSSHTransport(t *testing.T, deploymentRoot string) *stageprovider.StandardAuthoringSSHTransportLock {
+	t.Helper()
+	knownHosts, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshContent := workflowkit.SHA256Fingerprint([]byte("standard-authoring-test-ssh"))
+	shellContent := workflowkit.SHA256Fingerprint([]byte("standard-authoring-test-shell"))
+	return &stageprovider.StandardAuthoringSSHTransportLock{
+		Format:  stageprovider.StandardAuthoringSSHTransportLockFormat,
+		Version: stageprovider.StandardAuthoringSSHTransportLockVersion,
+		SSHExecutable: stageprovider.LocalExecutableLock{
+			CommandID: stageprovider.StandardAuthoringSSHTransportCommandID, AbsolutePath: "/opt/standard-authoring-test/ssh", Version: "OpenSSH_10.0p2", ContentSHA256: sshContent,
+		},
+		WrapperShell: stageprovider.LocalExecutableLock{
+			CommandID: stageprovider.StandardAuthoringSSHWrapperShellCommandID, AbsolutePath: "/opt/standard-authoring-test/dash", Version: string(shellContent), ContentSHA256: shellContent,
+		},
+		KnownHosts:                 stageprovider.StandardAuthoringSSHKnownHostsLock{Format: stageprovider.StandardAuthoringSSHKnownHostsLockFormat, Version: stageprovider.StandardAuthoringSSHKnownHostsLockVersion, RelativePath: stageprovider.StandardAuthoringSSHKnownHostsRelativePath, ContentSHA256: workflowkit.SHA256Fingerprint(knownHosts)},
+		AgentSocketEnvironmentName: stageprovider.StandardAuthoringSSHAgentSocketEnvironment,
+	}
 }
 
 func standardAuthoringProductionRepositoryRoot(t *testing.T) string {

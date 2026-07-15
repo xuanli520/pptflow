@@ -8,27 +8,27 @@
   "operations": [
     {
       "stage_key": "repo_prepare",
-      "prompt": {"id": "standard-authoring.repo-prepare.prompt", "version": "1.0.0", "relative_path": "prompts/repo-prepare.md"},
+      "prompt": {"id": "standard-authoring.repo-prepare.prompt", "version": "1.1.0", "relative_path": "prompts/repo-prepare.md"},
       "schema": {"id": "standard-authoring.repo-prepare.output-schema", "version": "1.0.0", "relative_path": "schemas/repo-prepare-output.json"}
     },
     {
       "stage_key": "repo_analyze",
-      "prompt": {"id": "standard-authoring.repo-analyze.prompt", "version": "1.0.0", "relative_path": "prompts/repo-analyze.json"},
+      "prompt": {"id": "standard-authoring.repo-analyze.prompt", "version": "1.1.0", "relative_path": "prompts/repo-analyze.json"},
       "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
     },
     {
       "stage_key": "task_design",
-      "prompt": {"id": "standard-authoring.task-design.prompt", "version": "1.0.0", "relative_path": "prompts/task-design.json"},
+      "prompt": {"id": "standard-authoring.task-design.prompt", "version": "1.1.0", "relative_path": "prompts/task-design.json"},
       "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
     },
     {
       "stage_key": "task_review",
-      "prompt": {"id": "standard-authoring.task-review.prompt", "version": "1.0.0", "relative_path": "prompts/task-review.md"},
+      "prompt": {"id": "standard-authoring.task-review.prompt", "version": "1.1.0", "relative_path": "prompts/task-review.md"},
       "schema": {"id": "standard-authoring.durable-review-decision-schema", "version": "1.0.0", "relative_path": "schemas/durable-review-decision.json"}
     },
     {
       "stage_key": "generate_task_files",
-      "prompt": {"id": "standard-authoring.generate-task-files.prompt", "version": "1.0.0", "relative_path": "prompts/generate-task-files.json"},
+      "prompt": {"id": "standard-authoring.generate-task-files.prompt", "version": "1.1.0", "relative_path": "prompts/generate-task-files.json"},
       "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
     },
     {

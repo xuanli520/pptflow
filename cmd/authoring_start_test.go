@@ -10,18 +10,18 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 
-func TestAuthoringStartCommandExposesOnlyClosedSourceSessionInputs(t *testing.T) {
+func TestAuthoringStartCommandExposesSourceCoordinateAndClosedExecutionInputs(t *testing.T) {
 	command, _, err := newAuthoringCommand(&lifecycleCLIConfig{root: t.TempDir()}).Find([]string{"start"})
 	if err != nil || command == nil || command.Name() != "start" {
 		t.Fatalf("find authoring start command: command=%v err=%v", command, err)
 	}
-	for _, required := range []string{"slug", "title", "metadata-json", "idempotency-key", "reason"} {
+	for _, required := range []string{"repository-url", "commit-sha", "slug", "title", "metadata-json", "idempotency-key", "reason"} {
 		if command.Flags().Lookup(required) == nil {
 			t.Fatalf("authoring start is missing --%s", required)
 		}
 	}
 	for _, forbidden := range []string{
-		"repo", "repository", "commit", "source", "profile", "execution-spec", "model", "provider", "agent", "secret", "id", "parent-run", "execution-epoch",
+		"repo", "source", "profile", "execution-spec", "model", "provider", "agent", "secret", "id", "parent-run", "execution-epoch",
 	} {
 		if command.Flags().Lookup(forbidden) != nil {
 			t.Fatalf("authoring start exposes deployment-owned override --%s", forbidden)
@@ -47,8 +47,10 @@ func TestAuthoringStartCommandFailsClosedWithoutDeploymentCapabilityAndCreatesNo
 	command.SetErr(&output)
 	command.SetArgs([]string{
 		"start",
-		"--slug", "tower-http-authoring",
-		"--title", "Tower HTTP authoring",
+		"--repository-url", "https://github.com/example/fixture-repository.git",
+		"--commit-sha", "0123456789abcdef0123456789abcdef01234567",
+		"--slug", "fixture-authoring",
+		"--title", "Fixture authoring",
 		"--metadata-json", `{"difficulty":"hard"}`,
 		"--idempotency-key", key,
 		"--reason", "verify closed deployment boundary",

@@ -107,18 +107,56 @@ func TestStandardAuthoringContractAssetManifestRejectsMissingOrUnknownStage(t *t
 	}
 }
 
+func TestStandardAuthoringSSHKnownHostsAssetRequiresExplicitPreNetworkHosts(t *testing.T) {
+	knownHosts := []byte("github.com ssh-ed25519 AQID\n[git.example]:2222 ssh-ed25519 BAUG\n")
+	if err := ValidateStandardAuthoringSSHKnownHostsAsset(knownHosts); err != nil {
+		t.Fatalf("validate explicit known_hosts allow-list: %v", err)
+	}
+	for _, test := range []struct {
+		host string
+		port string
+		want bool
+	}{
+		{host: "github.com", want: true},
+		{host: "github.com", port: "22", want: true},
+		{host: "github.com", port: "2222", want: false},
+		{host: "git.example", port: "2222", want: true},
+		{host: "git.example", want: false},
+		{host: "unlisted.example", want: false},
+	} {
+		got, err := StandardAuthoringSSHKnownHostsAllowsHost(knownHosts, test.host, test.port)
+		if err != nil || got != test.want {
+			t.Fatalf("allow host %q:%q = %t, %v; want %t", test.host, test.port, got, err, test.want)
+		}
+	}
+	for _, raw := range [][]byte{
+		[]byte("*.example ssh-ed25519 AQID\n"),
+		[]byte("|1|salt|hash ssh-ed25519 AQID\n"),
+		[]byte("@cert-authority example ssh-ed25519 AQID\n"),
+		[]byte("github.com ssh-ed25519 not-base64\n"),
+	} {
+		if err := ValidateStandardAuthoringSSHKnownHostsAsset(raw); err == nil {
+			t.Fatalf("non-explicit known_hosts input was accepted: %q", raw)
+		}
+	}
+}
+
 func TestLoadStandardAuthoringDeploymentAssetBundleStrictlyBindsGeneratedLockAndAssets(t *testing.T) {
 	root := standardAuthoringDeploymentRepositoryRoot(t)
 	deploymentRoot := filepath.Join(t.TempDir(), "deployments", "standard-authoring")
 	if err := os.MkdirAll(deploymentRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"operation-catalog.v1.json", "contract-assets.v1.json"} {
+	for _, name := range []string{"operation-catalog.v1.json", "contract-assets.v1.json", filepath.Join("ssh", "known_hosts")} {
 		contents, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", name))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(deploymentRoot, name), contents, 0o600); err != nil {
+		target := filepath.Join(deploymentRoot, name)
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, contents, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -247,12 +285,37 @@ func standardAuthoringDeploymentTestLock(t *testing.T, catalog *DeploymentOperat
 		}
 		operations = append(operations, record)
 	}
+	knownHosts, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(StandardAuthoringSSHKnownHostsRelativePath)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	return DeploymentOperationCatalogLock{
 		Format: DeploymentOperationCatalogLockFormat, Version: DeploymentOperationCatalogLockVersion,
 		LockID: "standard-authoring-deployment-assets-test", LockVersion: "test-v1", CatalogReceipt: catalog.Receipt(),
 		HarborFlowBuild:                   HarborFlowBuildIdentity{Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("test build"))},
 		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
+		StandardAuthoringSSHTransport:     standardAuthoringSSHTransportTestLock(t, knownHosts),
 		Operations:                        operations,
+	}
+}
+
+const standardAuthoringSSHTransportTestKnownHosts = "github.com ssh-ed25519 AQID\n"
+
+func standardAuthoringSSHTransportTestLock(t *testing.T, knownHosts []byte) *StandardAuthoringSSHTransportLock {
+	t.Helper()
+	sshContent := workflowkit.SHA256Fingerprint([]byte("locked ssh"))
+	shellContent := workflowkit.SHA256Fingerprint([]byte("locked shell"))
+	return &StandardAuthoringSSHTransportLock{
+		Format:  StandardAuthoringSSHTransportLockFormat,
+		Version: StandardAuthoringSSHTransportLockVersion,
+		SSHExecutable: LocalExecutableLock{
+			CommandID: StandardAuthoringSSHTransportCommandID, AbsolutePath: "/opt/standard-authoring/ssh", Version: "OpenSSH_10.0p2", ContentSHA256: sshContent,
+		},
+		WrapperShell: LocalExecutableLock{
+			CommandID: StandardAuthoringSSHWrapperShellCommandID, AbsolutePath: "/opt/standard-authoring/dash", Version: string(shellContent), ContentSHA256: shellContent,
+		},
+		KnownHosts:                 StandardAuthoringSSHKnownHostsLock{Format: StandardAuthoringSSHKnownHostsLockFormat, Version: StandardAuthoringSSHKnownHostsLockVersion, RelativePath: StandardAuthoringSSHKnownHostsRelativePath, ContentSHA256: workflowkit.SHA256Fingerprint(knownHosts)},
+		AgentSocketEnvironmentName: StandardAuthoringSSHAgentSocketEnvironment,
 	}
 }
 

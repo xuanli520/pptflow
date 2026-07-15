@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -17,14 +18,22 @@ import (
 )
 
 type taskHubStandardAuthoringCapturer struct {
-	snapshot app.StandardAuthoringSourceSnapshot
-	calls    int
+	snapshot    app.StandardAuthoringSourceSnapshot
+	calls       int
+	coordinates []app.StandardAuthoringSourceCoordinate
 }
 
-func (capturer *taskHubStandardAuthoringCapturer) CaptureStandardAuthoringSource(context.Context) (app.StandardAuthoringSourceSnapshot, error) {
+func (capturer *taskHubStandardAuthoringCapturer) CaptureStandardAuthoringSource(_ context.Context, coordinate app.StandardAuthoringSourceCoordinate) (app.StandardAuthoringSourceSnapshot, error) {
 	capturer.calls++
+	capturer.coordinates = append(capturer.coordinates, coordinate)
+	content, err := taskHubStandardAuthoringArchive(coordinate.CommitSHA)
+	if err != nil {
+		return app.StandardAuthoringSourceSnapshot{}, err
+	}
 	result := capturer.snapshot
-	result.Content = append([]byte(nil), capturer.snapshot.Content...)
+	result.RepositoryURL = coordinate.RepositoryURL
+	result.CommitSHA = coordinate.CommitSHA
+	result.Content = content
 	return result, nil
 }
 
@@ -41,10 +50,14 @@ func newTaskHubStandardAuthoringTestServices(t *testing.T) (*app.LifecycleServic
 		}
 	})
 	capturer := &taskHubStandardAuthoringCapturer{snapshot: taskHubStandardAuthoringSnapshot(t)}
+	definitions, catalog := newTaskHubStandardAuthoringDefinitionProvider(t)
 	services, err := app.NewLifecycleServicesWithOptions(root, database, app.LifecycleServicesOptions{
-		OperationResolver:                      testsupport.AcceptAllStageOperationResolver(),
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+		DeploymentCatalogResolvers: []app.TemplateDeploymentCatalogResolver{{
+			Template: workflowadapter.StandardAuthoringTemplateReference(), Resolver: catalog,
+		}},
 		StandardAuthoringSourceCapturer:        capturer,
-		StandardAuthoringRunDefinitionProvider: newTaskHubStandardAuthoringDefinitionProvider(t),
+		StandardAuthoringRunDefinitionProvider: definitions,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +82,7 @@ func TestAppTaskHubStandardAuthoringPlansLaunchesAndReplays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !plan.ConfirmationNeeded || plan.Expected != (TaskHubLifecycleCheckpoint{}) || !bytes.Contains([]byte(plan.Summary), []byte("AuthoringSession")) || !bytes.Contains([]byte(plan.RevisionImpact), []byte("不会立即创建 TaskRevision")) {
+	if !plan.ConfirmationNeeded || plan.Expected != (TaskHubLifecycleCheckpoint{}) || !bytes.Contains([]byte(plan.Summary), []byte("来源仓库 URL")) || !bytes.Contains([]byte(plan.Summary), []byte("AuthoringSession")) || !bytes.Contains([]byte(plan.RevisionImpact), []byte("不会立即创建 TaskRevision")) {
 		t.Fatalf("Standard authoring plan = %+v", plan)
 	}
 	if tasks, err := services.Tasks.List(ctx, true); err != nil || len(tasks) != 0 {
@@ -87,11 +100,13 @@ func TestAppTaskHubStandardAuthoringPlansLaunchesAndReplays(t *testing.T) {
 		Action:         TaskHubActionStartStandardAuthoring,
 		IdempotencyKey: key,
 		Actor:          "tester",
-		Reason:         "create a fixed Tower HTTP task through Task Hub",
+		Reason:         "create a source-selected task through Task Hub",
 		Values: map[string]string{
-			taskHubTaskSlugField:         "towerhttp-cors-origin-policy",
-			taskHubTaskTitleField:        "Tower HTTP CORS origin policy",
-			taskHubTaskMetadataJSONField: `{"difficulty":"hard"}`,
+			taskHubStandardAuthoringRepositoryURLField: "https://github.com/acme/cors-origin-policy.git",
+			taskHubStandardAuthoringCommitSHAField:     "0123456789abcdef0123456789abcdef01234567",
+			taskHubTaskSlugField:                       "cors-origin-policy",
+			taskHubTaskTitleField:                      "CORS origin policy",
+			taskHubTaskMetadataJSONField:               `{"difficulty":"hard"}`,
 		},
 	}
 	invalidTarget := request
@@ -103,11 +118,17 @@ func TestAppTaskHubStandardAuthoringPlansLaunchesAndReplays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.ReceiptID == "" || first.ExecutionID == "" || first.Target != (TaskHubTarget{}) {
+	if first.ReceiptID == "" || first.ExecutionID == "" || first.Target.TaskID == "" || first.Target.RunID != first.ExecutionID {
 		t.Fatalf("Standard authoring Task Hub result = %+v", first)
 	}
 	if capturer.calls != 1 {
 		t.Fatalf("source captures = %d, want one", capturer.calls)
+	}
+	if got, want := capturer.coordinates, []app.StandardAuthoringSourceCoordinate{{
+		RepositoryURL: request.Values[taskHubStandardAuthoringRepositoryURLField],
+		CommitSHA:     request.Values[taskHubStandardAuthoringCommitSHAField],
+	}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("source capture coordinate = %+v, want %+v", got, want)
 	}
 
 	tasks, err := services.Tasks.List(ctx, true)
@@ -115,7 +136,7 @@ func TestAppTaskHubStandardAuthoringPlansLaunchesAndReplays(t *testing.T) {
 		t.Fatalf("launched Standard Task list = %+v, %v", tasks, err)
 	}
 	task := tasks[0]
-	if task.Slug != request.Values[taskHubTaskSlugField] || task.CurrentRevisionID != "" || task.LifecycleState != store.TaskLifecycleDraft || task.SourceRepo != app.StandardAuthoringSourceRepositoryURL || task.SourceCommit != app.StandardAuthoringSourceCommit {
+	if task.Slug != request.Values[taskHubTaskSlugField] || task.CurrentRevisionID != "" || task.LifecycleState != store.TaskLifecycleDraft || task.SourceRepo != request.Values[taskHubStandardAuthoringRepositoryURLField] || task.SourceCommit != request.Values[taskHubStandardAuthoringCommitSHAField] {
 		t.Fatalf("Standard authoring Task = %+v", task)
 	}
 	authoringRuns, err := services.Store().ListAuthoringWorkflowRunsForTargetTask(ctx, task.ID)
@@ -134,7 +155,7 @@ func TestAppTaskHubStandardAuthoringPlansLaunchesAndReplays(t *testing.T) {
 		t.Fatalf("Standard authoring session = %+v, %v", session, err)
 	}
 	source, err := services.Store().GetAuthoringSource(ctx, session.SourceID)
-	if err != nil || source == nil || source.RepositoryURL != app.StandardAuthoringSourceRepositoryURL || source.CommitSHA != app.StandardAuthoringSourceCommit {
+	if err != nil || source == nil || source.RepositoryURL != request.Values[taskHubStandardAuthoringRepositoryURLField] || source.CommitSHA != request.Values[taskHubStandardAuthoringCommitSHAField] {
 		t.Fatalf("Standard authoring source = %+v, %v", source, err)
 	}
 	if jobs, err := services.Store().ListDurableJobsForRun(ctx, run.ID); err != nil || len(jobs) != 1 {
@@ -159,12 +180,36 @@ func TestAppTaskHubStandardAuthoringPlansLaunchesAndReplays(t *testing.T) {
 
 func TestTaskHubStandardAuthoringRetryRetainsOneFrozenLaunch(t *testing.T) {
 	services, capturer := newTaskHubStandardAuthoringTestServices(t)
+	ctx := context.Background()
+	oldKey, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := services.AuthoringLaunches.Start(ctx, app.StandardAuthoringLaunchCommand{
+		LifecycleMutationCommandBase: app.LifecycleMutationCommandBase{IdempotencyKey: oldKey, Actor: "fixture", Reason: "seed an existing Standard authoring selection"},
+		RepositoryURL:                "https://github.com/acme/existing-source.git",
+		CommitSHA:                    "0123456789abcdef0123456789abcdef01234567",
+		Slug:                         "existing-source",
+		Title:                        "Existing source authoring",
+		MetadataJSON:                 `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.TaskID == "" || old.RunID == "" || capturer.calls != 1 {
+		t.Fatalf("seed Standard authoring launch = %+v, captures=%d", old, capturer.calls)
+	}
 	adapter := &lateReplyTaskHubAdapter{
 		AppTaskHubLifecycleAdapter: NewAppTaskHubLifecycleAdapter(services),
 		failFirstMutationReply:     true,
 	}
 	m, cleanup := newTestTaskHubV2Model(t, adapter)
 	defer cleanup()
+	if m.taskHub.SelectedTaskID != old.TaskID || m.taskHub.SelectedRunID != old.RunID {
+		t.Fatalf("seed Standard authoring selection = task=%q run=%q, want task=%q run=%q", m.taskHub.SelectedTaskID, m.taskHub.SelectedRunID, old.TaskID, old.RunID)
+	}
+	m.taskHub.Query.Filter = "existing-source"
+	m.hubSearch.SetValue("existing-source")
 
 	updated, _ := m.Update(runeKey("t"))
 	m = updated.(model)
@@ -184,9 +229,11 @@ func TestTaskHubStandardAuthoringRetryRetainsOneFrozenLaunch(t *testing.T) {
 		t.Fatalf("t s did not open an unfrozen one-step Standard authoring form: %+v", m.taskHubMutation)
 	}
 	form := m.taskHubMutation
-	form.ReasonInput.SetValue("launch fixed Tower HTTP authoring through Task Hub")
-	setTaskHubMutationFormValue(t, form, taskHubTaskSlugField, "towerhttp-retry-safe")
-	setTaskHubMutationFormValue(t, form, taskHubTaskTitleField, "Tower HTTP retry-safe authoring")
+	form.ReasonInput.SetValue("launch source-selected authoring through Task Hub")
+	setTaskHubMutationFormValue(t, form, taskHubStandardAuthoringRepositoryURLField, "ssh://git@github.com/acme/retry-safe.git")
+	setTaskHubMutationFormValue(t, form, taskHubStandardAuthoringCommitSHAField, "89abcdef0123456789abcdef0123456789abcdef")
+	setTaskHubMutationFormValue(t, form, taskHubTaskSlugField, "source-retry-safe")
+	setTaskHubMutationFormValue(t, form, taskHubTaskTitleField, "Source retry-safe authoring")
 	setTaskHubMutationFormValue(t, form, taskHubTaskMetadataJSONField, `{"topic":"headers"}`)
 	key := form.IdempotencyKey
 
@@ -197,8 +244,12 @@ func TestTaskHubStandardAuthoringRetryRetainsOneFrozenLaunch(t *testing.T) {
 	}
 	updated, _ = m.Update(firstCommand())
 	m = updated.(model)
-	if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != key || m.taskHubMutation.Error == "" || capturer.calls != 1 {
+	if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != key || m.taskHubMutation.Error == "" || capturer.calls != 2 {
 		t.Fatalf("lost Standard authoring reply did not retain retryable form: form=%+v captures=%d", m.taskHubMutation, capturer.calls)
+	}
+	retained := m.taskHubMutation.request()
+	if retained.Values[taskHubStandardAuthoringRepositoryURLField] != "ssh://git@github.com/acme/retry-safe.git" || retained.Values[taskHubStandardAuthoringCommitSHAField] != "89abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("lost Standard authoring reply changed retained source coordinate: %+v", retained.Values)
 	}
 
 	updated, retryCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -211,53 +262,93 @@ func TestTaskHubStandardAuthoringRetryRetainsOneFrozenLaunch(t *testing.T) {
 	if m.taskHubMutation != nil {
 		t.Fatalf("replayed Standard authoring mutation did not close the form: %+v", m.taskHubMutation)
 	}
-	if capturer.calls != 1 {
+	if capturer.calls != 2 {
 		t.Fatalf("Standard authoring retry recaptured source %d times", capturer.calls)
 	}
 
 	tasks, err := services.Tasks.List(context.Background(), true)
-	if err != nil || len(tasks) != 1 {
+	if err != nil || len(tasks) != 2 {
 		t.Fatalf("Standard authoring retry Task list = %+v, %v", tasks, err)
 	}
-	runs, err := services.Store().ListAuthoringWorkflowRunsForTargetTask(context.Background(), tasks[0].ID)
+	var created store.TaskV2
+	for _, task := range tasks {
+		if task.Slug == "source-retry-safe" {
+			created = task
+			break
+		}
+	}
+	if created.ID == "" {
+		t.Fatalf("new Standard authoring Task was not found in %+v", tasks)
+	}
+	runs, err := services.Store().ListAuthoringWorkflowRunsForTargetTask(context.Background(), created.ID)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("Standard authoring retry runs = %+v, %v", runs, err)
 	}
-	if generic, err := services.Store().ListWorkflowRunsForTask(context.Background(), tasks[0].ID); err != nil || len(generic) != 0 {
+	if m.taskHub.Query.Filter != "" || m.hubSearch.Value() != "" {
+		t.Fatalf("successful Standard authoring launch retained a filter that hides its new Task: filter=%q search=%q", m.taskHub.Query.Filter, m.hubSearch.Value())
+	}
+	if m.taskHub.SelectedTaskID != created.ID || m.taskHub.SelectedRunID != runs[0].ID {
+		t.Fatalf("successful Standard authoring launch did not replace the old selection: task=%q run=%q want task=%q run=%q", m.taskHub.SelectedTaskID, m.taskHub.SelectedRunID, created.ID, runs[0].ID)
+	}
+	updated, _ = m.Update(m.loadTaskHubV2()())
+	m = updated.(model)
+	if m.taskHub.SelectedTaskID != created.ID || m.taskHub.SelectedRunID != runs[0].ID {
+		t.Fatalf("Standard authoring refresh did not preserve its new Task/Run selection: task=%q run=%q want task=%q run=%q", m.taskHub.SelectedTaskID, m.taskHub.SelectedRunID, created.ID, runs[0].ID)
+	}
+	if generic, err := services.Store().ListWorkflowRunsForTask(context.Background(), created.ID); err != nil || len(generic) != 0 {
 		t.Fatalf("Standard authoring retry created generic Runs: %+v, %v", generic, err)
 	}
 }
 
 func taskHubStandardAuthoringSnapshot(t *testing.T) app.StandardAuthoringSourceSnapshot {
 	t.Helper()
+	commit := "0123456789abcdef0123456789abcdef01234567"
+	archive, err := taskHubStandardAuthoringArchive(commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return app.StandardAuthoringSourceSnapshot{
+		RepositoryURL: "https://github.com/acme/fixture-repository.git",
+		CommitSHA:     commit,
+		SchemaVersion: app.StandardAuthoringSourceSnapshotSchemaVersion,
+		Content:       archive,
+	}
+}
+
+func taskHubStandardAuthoringArchive(commit string) ([]byte, error) {
 	var archive bytes.Buffer
 	writer := tar.NewWriter(&archive)
+	if err := writer.WriteHeader(&tar.Header{
+		Name:       "pax_global_header",
+		Typeflag:   tar.TypeXGlobalHeader,
+		PAXRecords: map[string]string{"comment": commit},
+	}); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteHeader(&tar.Header{Name: "source/", Mode: 0o755, Typeflag: tar.TypeDir}); err != nil {
+		return nil, err
+	}
 	for _, entry := range []struct {
 		name    string
 		content string
 	}{
-		{name: "tower-http/Cargo.toml", content: "[package]\nname = \"tower-http\"\n"},
-		{name: "tower-http/src/lib.rs", content: "pub fn fixture() {}\n"},
+		{name: "source/README.md", content: "# source fixture\n"},
+		{name: "source/src/lib.rs", content: "pub fn fixture() {}\n"},
 	} {
 		if err := writer.WriteHeader(&tar.Header{Name: entry.name, Mode: 0o644, Size: int64(len(entry.content)), Typeflag: tar.TypeReg}); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 		if _, err := writer.Write([]byte(entry.content)); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 	}
 	if err := writer.Close(); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	return app.StandardAuthoringSourceSnapshot{
-		RepositoryURL: app.StandardAuthoringSourceRepositoryURL,
-		CommitSHA:     app.StandardAuthoringSourceCommit,
-		SchemaVersion: app.StandardAuthoringSourceSnapshotSchemaVersion,
-		Content:       archive.Bytes(),
-	}
+	return archive.Bytes(), nil
 }
 
-func newTaskHubStandardAuthoringDefinitionProvider(t *testing.T) app.StandardAuthoringRunDefinitionProvider {
+func newTaskHubStandardAuthoringDefinitionProvider(t *testing.T) (app.StandardAuthoringRunDefinitionProvider, *stageprovider.DeploymentOperationCatalogResolver) {
 	t.Helper()
 	document := stageprovider.DeploymentOperationCatalog{
 		Format: stageprovider.DeploymentOperationCatalogFormat, Version: stageprovider.DeploymentOperationCatalogVersion,
@@ -292,7 +383,7 @@ func newTaskHubStandardAuthoringDefinitionProvider(t *testing.T) app.StandardAut
 	if err != nil {
 		t.Fatal(err)
 	}
-	return provider
+	return provider, catalog
 }
 
 func taskHubStandardAuthoringStageType(t *testing.T, key workflowkit.StageKey) workflowadapter.StageBindingType {

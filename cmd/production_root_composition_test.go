@@ -149,6 +149,10 @@ func TestProductionDeploymentPathsBesideExecutableRequiresAllThreeBundlesAndStan
 		t.Fatalf("package without Standard contract manifest error = %v", err)
 	}
 	rootCompositionWritePathFixtureFile(t, filepath.Join(standard, standardAuthoringContractManifestFile))
+	if _, err := productionDeploymentPathsBesideExecutable(executable); err == nil || !strings.Contains(err.Error(), "Standard authoring SSH known_hosts") {
+		t.Fatalf("package without Standard SSH known_hosts error = %v", err)
+	}
+	rootCompositionWritePathFixtureFile(t, filepath.Join(standard, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath)))
 
 	if err := os.Remove(filepath.Join(parent, productionDeploymentLockFile)); err != nil {
 		t.Fatal(err)
@@ -182,6 +186,28 @@ func TestProductionDeploymentPathsBesideExecutableRequiresAllThreeBundlesAndStan
 	if paths != want {
 		t.Fatalf("production deployment paths = %#v, want %#v", paths, want)
 	}
+}
+
+func TestPreflightHarborFlowProductionDeploymentBundlesRejectsStaleLockWithoutManagedRoot(t *testing.T) {
+	fixture := newHarborFlowProductionCompositionFixture(t)
+	lockPath := fixture.config.Paths.StandardLock
+	raw, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := strings.Replace(string(raw), `"version":"2"`, `"version":"1"`, 1)
+	if stale == string(raw) {
+		t.Fatal("could not produce stale Standard authoring lock fixture")
+	}
+	if err := os.WriteFile(lockPath, []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	managedRoot := filepath.Join(t.TempDir(), "managed-control-plane")
+	err = preflightHarborFlowProductionDeploymentBundles(fixture.config.Paths, fixture.config.StandardBinding, fixture.config.CodeEdgePhase1Binding, fixture.config.EvaluatorBinding)
+	if err == nil || !strings.Contains(err.Error(), "Standard authoring") {
+		t.Fatalf("stale Standard lock preflight error = %v", err)
+	}
+	assertNoPreflightManagedRoot(t, managedRoot)
 }
 
 type harborFlowProductionCompositionFixture struct {
@@ -436,6 +462,9 @@ func rootCompositionWritePathFixtureBundle(t *testing.T, directory string, catal
 
 func rootCompositionWritePathFixtureFile(t *testing.T, path string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte("fixture"), 0o644); err != nil {
 		t.Fatal(err)
 	}

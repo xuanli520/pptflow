@@ -75,6 +75,20 @@ cd "$release_root"
 ```
 
 创建标准题目时，在 Task Hub 输入 `t` 后输入 `s`，审阅计划并按确认表单填写
-slug、标题、可选 metadata 与原因。退出 TUI 时，使用受控 worker 交接面板来
-启动已排队的 Run。外部 provider 的凭据只应通过受批准的环境变量和 secret
-reference 提供，不能写入此生产包或其部署文件。
+HTTPS/SSH Git 仓库 URL、完整 commit、slug、标题、可选 metadata 与原因。退出
+TUI 时，使用受控 worker 交接面板来启动已排队的 Run。外部 provider 的凭据只应
+通过受批准的环境变量和 secret reference 提供，不能写入此生产包或其部署文件。
+
+Standard 创题的 HTTPS 拉取始终无凭据、非交互。SSH 只允许连接到
+`deployments/standard-authoring/ssh/known_hosts` 中已有精确 host key 的主机；该
+文件、OpenSSH client 与 wrapper shell 都由 Standard lock 固定。程序不会读取
+`~/.ssh`、普通 `SSH_AUTH_SOCK`、用户 SSH config，也不会接受 `accept-new`。
+任何需要 SSH 认证的仓库都必须在启动进程时显式提供一个受管 Unix socket：
+
+```text
+HARBOR_FACTORY_STANDARD_AUTHORING_SSH_AUTH_SOCK=/absolute/path/to/agent.sock
+```
+
+该值仅在 SSH 拉取瞬间使用，不进入数据库、Run、日志契约或发布包。新增或轮换
+SSH host key 必须更新受管 `known_hosts`、重新生成 Standard lock，并重新构建完整
+生产包。

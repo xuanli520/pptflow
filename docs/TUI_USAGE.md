@@ -35,7 +35,7 @@ Queue 标签显示观测到的运行中和排队数量。后端未暴露容量�
 | 序列 | 请求的计划 |
 | --- | --- |
 | `t n`、`t i` | 新建空 draft Task 或导入完整本地 Task 快照。 |
-| `t s` | 启动受控 Standard 创题：捕获部署冻结的 Tower HTTP 源码，创建 revision-free draft Task、AuthoringSession 并排队 Standard Run。来源、提交、Codex/profile、模型和 catalog/lock 不从 TUI 输入。 |
+| `t s` | 启动受控 Standard 创题：输入 HTTPS URI 或 SSH 地址（`ssh://git@host/...` 或 `git@host:org/repo.git`，不允许嵌入密码）的仓库 URL，与完整的 40/64 位小写 commit；再输入新题目标识、标题和可选元数据。SSH host 必须在当前生产包锁定的 `known_hosts` allow-list 中；需要认证时由启动进程的受管 agent socket 提供。系统捕获该精确源码，创建 revision-free draft Task、AuthoringSession 并排队 Standard Run。Codex/profile、模型和 catalog/lock 不从 TUI 输入。 |
 | `t e`、`t f`、`t a`、`t d`、`t u` | 创建编辑 candidate、Fork、归档、软删除或恢复选中的 Task。 |
 | `x c`、`x n`、`x a` | 继续处理、启动 Run 或 Attach 到 durable Run。 |
 | `x k` | 打开选中 Run 的 Run Control。 |

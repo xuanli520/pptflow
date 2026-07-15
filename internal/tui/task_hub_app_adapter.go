@@ -118,10 +118,10 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 		}
 		return TaskHubPlanPreview{
 			Title:              "启动 Standard 创题",
-			Summary:            "确认表单将收集新题目的标识、标题与可选元数据；提交后捕获已锁定的 Tower HTTP 源码，创建 revision-free draft Task 与 AuthoringSession，并排队 Standard 创题 Run。",
-			Reason:             "来源仓库、固定提交、Codex/profile、模型与 catalog/lock 全部由当前部署冻结，不接受 TUI 覆盖。",
+			Summary:            "确认表单将收集来源仓库 URL、精确 commit、新题目标识、标题与可选元数据；提交后捕获该精确源码，创建 revision-free draft Task 与 AuthoringSession，并排队 Standard 创题 Run。",
+			Reason:             "来源仓库 URL 与精确 commit 会冻结进本次 source/session/Run；Codex/profile、模型与 catalog/lock 仍完全由当前部署冻结，不接受 TUI 覆盖。",
 			RevisionImpact:     "不会立即创建 TaskRevision；只有 Standard authoring materialize 阶段完成后才会生成首个不可变 revision。",
-			ExternalEffects:    []string{"受控捕获已批准的 Tower HTTP 源码", "创建本地 AuthoringSource、AuthoringSession 与 Standard Run"},
+			ExternalEffects:    []string{"受控捕获所填仓库 URL 与精确 commit 对应的源码", "创建本地 AuthoringSource、AuthoringSession 与 Standard Run"},
 			ConfirmationNeeded: true,
 		}, nil
 	case TaskHubActionImportTask:
@@ -817,6 +817,8 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 		}
 		receipt, err := services.AuthoringLaunches.Start(ctx, app.StandardAuthoringLaunchCommand{
 			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			RepositoryURL:                taskHubMutationValue(request, taskHubStandardAuthoringRepositoryURLField),
+			CommitSHA:                    taskHubMutationValue(request, taskHubStandardAuthoringCommitSHAField),
 			Slug:                         taskHubMutationValue(request, taskHubTaskSlugField),
 			Title:                        taskHubMutationValue(request, taskHubTaskTitleField),
 			MetadataJSON:                 taskHubMutationValue(request, taskHubTaskMetadataJSONField),
@@ -1463,9 +1465,13 @@ func taskHubMutationResult(request TaskHubMutationRequest, receipt app.Lifecycle
 	if executionID == "" {
 		executionID = strings.TrimSpace(receipt.RunID)
 	}
+	target := request.Target
+	if request.Action == TaskHubActionStartStandardAuthoring {
+		target = TaskHubTarget{TaskID: strings.TrimSpace(receipt.TaskID), RunID: strings.TrimSpace(receipt.RunID)}
+	}
 	return TaskHubMutationResult{
 		Action:      request.Action,
-		Target:      request.Target,
+		Target:      target,
 		PlanID:      receipt.PlanID,
 		ExecutionID: executionID,
 		ReceiptID:   receipt.OperationID,

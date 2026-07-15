@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -135,6 +136,38 @@ func TestProbeMultilineAcceptsBoundedCodexStyleHelp(t *testing.T) {
 	}
 	if !strings.Contains(output, "--listen") || !strings.Contains(output, "--config") {
 		t.Fatalf("capability help = %q", output)
+	}
+}
+
+func TestDiscoverStandardAuthoringSSHTransportPinsClientShellAndKnownHosts(t *testing.T) {
+	root := t.TempDir()
+	ssh := filepath.Join(root, "ssh")
+	if err := os.WriteFile(ssh, []byte("#!/bin/sh\nprintf '%s\\n' OpenSSH_9.9p1 >&2\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shell := filepath.Join(root, "dash")
+	if err := os.WriteFile(shell, []byte("test wrapper shell\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contractRoot := filepath.Join(root, "contract")
+	knownHosts := filepath.Join(contractRoot, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath))
+	writeTestFile(t, knownHosts, "github.com ssh-ed25519 AQID\n")
+	transport, err := discoverStandardAuthoringSSHTransport(buildConfig{
+		sshExecutable: ssh, sshWrapperShell: shell, sshKnownHosts: knownHosts,
+	})
+	if err != nil {
+		t.Fatalf("discover SSH transport: %v", err)
+	}
+	if err := transport.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if transport.SSHExecutable.Version != "OpenSSH_9.9p1" || transport.WrapperShell.Version != string(transport.WrapperShell.ContentSHA256) ||
+		transport.KnownHosts.RelativePath != stageprovider.StandardAuthoringSSHKnownHostsRelativePath ||
+		transport.AgentSocketEnvironmentName != stageprovider.StandardAuthoringSSHAgentSocketEnvironment {
+		t.Fatalf("discovered SSH transport = %+v", transport)
+	}
+	if _, err := discoverStandardAuthoringSSHTransport(buildConfig{sshExecutable: ssh, sshWrapperShell: shell, sshKnownHosts: filepath.Join(root, "other-known-hosts")}); err == nil {
+		t.Fatal("missing/non-contract known_hosts input was accepted")
 	}
 }
 

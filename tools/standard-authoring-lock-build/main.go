@@ -52,6 +52,9 @@ type buildConfig struct {
 	lockID            string
 	lockVersion       string
 	gitExecutable     string
+	sshExecutable     string
+	sshWrapperShell   string
+	sshKnownHosts     string
 	codexNode         string
 	codexLauncher     string
 	codexHome         string
@@ -70,6 +73,9 @@ func main() {
 	flag.StringVar(&config.lockID, "lock-id", "standard-authoring-production-lock", "immutable deployment lock id")
 	flag.StringVar(&config.lockVersion, "lock-version", "", "immutable deployment lock version")
 	flag.StringVar(&config.gitExecutable, "git-executable", "", "absolute locked Git executable")
+	flag.StringVar(&config.sshExecutable, "ssh-executable", "", "absolute locked OpenSSH executable for source capture")
+	flag.StringVar(&config.sshWrapperShell, "ssh-wrapper-shell", "", "absolute locked POSIX shell for the generated SSH wrapper")
+	flag.StringVar(&config.sshKnownHosts, "ssh-known-hosts", "", "lock-bound deployment-relative OpenSSH known_hosts asset")
 	flag.StringVar(&config.codexNode, "codex-node", "", "absolute locked Node executable")
 	flag.StringVar(&config.codexLauncher, "codex-launcher", "", "absolute locked Codex JavaScript launcher")
 	flag.StringVar(&config.codexHome, "codex-home", "", "absolute controlled CODEX_HOME directory")
@@ -136,6 +142,10 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	}
 
 	gitLock, err := discoverGitLock(config.gitExecutable)
+	if err != nil {
+		return stageprovider.DeploymentOperationCatalogLock{}, err
+	}
+	sshTransport, err := discoverStandardAuthoringSSHTransport(config)
 	if err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, err
 	}
@@ -208,6 +218,7 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 		Format: stageprovider.DeploymentOperationCatalogLockFormat, Version: stageprovider.DeploymentOperationCatalogLockVersion,
 		LockID: config.lockID, LockVersion: config.lockVersion, CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build,
 		StandardAuthoringExecutionProfile: &stageprovider.StandardAuthoringExecutionProfileLock{Profile: profile},
+		StandardAuthoringSSHTransport:     &sshTransport,
 		Operations:                        operations,
 	}
 	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
@@ -236,7 +247,7 @@ func validateConfig(config *buildConfig) error {
 		return errors.New("build configuration is required")
 	}
 	var err error
-	for _, field := range []*string{&config.sourceRoot, &config.catalogPath, &config.manifestPath, &config.profilePath, &config.contractRoot, &config.outputPath, &config.gitExecutable, &config.codexNode, &config.codexLauncher, &config.codexHome} {
+	for _, field := range []*string{&config.sourceRoot, &config.catalogPath, &config.manifestPath, &config.profilePath, &config.contractRoot, &config.outputPath, &config.gitExecutable, &config.sshExecutable, &config.sshWrapperShell, &config.sshKnownHosts, &config.codexNode, &config.codexLauncher, &config.codexHome} {
 		*field, err = cleanAbsolutePath(*field)
 		if err != nil {
 			return err
@@ -267,6 +278,10 @@ func validateConfig(config *buildConfig) error {
 	if err := requireNonSymlinkDirectory(config.codexHome); err != nil {
 		return fmt.Errorf("Codex home: %w", err)
 	}
+	expectedKnownHosts := filepath.Join(config.contractRoot, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath))
+	if config.sshKnownHosts != expectedKnownHosts {
+		return fmt.Errorf("SSH known_hosts must be %s below contract root", stageprovider.StandardAuthoringSSHKnownHostsRelativePath)
+	}
 	return nil
 }
 
@@ -284,6 +299,77 @@ func discoverGitLock(path string) (stageprovider.LocalExecutableLock, error) {
 		return stageprovider.LocalExecutableLock{}, errors.New("locked Git version is invalid")
 	}
 	return stageprovider.LocalExecutableLock{CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, AbsolutePath: path, Version: version, ContentSHA256: content}, nil
+}
+
+func discoverStandardAuthoringSSHTransport(config buildConfig) (stageprovider.StandardAuthoringSSHTransportLock, error) {
+	sshContent, err := fingerprintRegularFile(config.sshExecutable)
+	if err != nil {
+		return stageprovider.StandardAuthoringSSHTransportLock{}, fmt.Errorf("SSH executable: %w", err)
+	}
+	sshVersion, err := probeSSHVersion(config.sshExecutable)
+	if err != nil {
+		return stageprovider.StandardAuthoringSSHTransportLock{}, errors.New("locked SSH -V probe failed")
+	}
+	shellContent, err := fingerprintRegularFile(config.sshWrapperShell)
+	if err != nil {
+		return stageprovider.StandardAuthoringSSHTransportLock{}, fmt.Errorf("SSH wrapper shell: %w", err)
+	}
+	if strings.ContainsAny(config.sshWrapperShell, " \t\r\n") {
+		return stageprovider.StandardAuthoringSSHTransportLock{}, errors.New("SSH wrapper shell path is not shebang-safe")
+	}
+	knownHosts, err := readRegularFile(config.sshKnownHosts, stageprovider.StandardAuthoringSSHKnownHostsMaxBytes)
+	if err != nil {
+		return stageprovider.StandardAuthoringSSHTransportLock{}, fmt.Errorf("SSH known_hosts: %w", err)
+	}
+	if err := stageprovider.ValidateStandardAuthoringSSHKnownHostsAsset(knownHosts); err != nil {
+		return stageprovider.StandardAuthoringSSHTransportLock{}, fmt.Errorf("SSH known_hosts: %w", err)
+	}
+	transport := stageprovider.StandardAuthoringSSHTransportLock{
+		Format:  stageprovider.StandardAuthoringSSHTransportLockFormat,
+		Version: stageprovider.StandardAuthoringSSHTransportLockVersion,
+		SSHExecutable: stageprovider.LocalExecutableLock{
+			CommandID: stageprovider.StandardAuthoringSSHTransportCommandID, AbsolutePath: config.sshExecutable,
+			Version: sshVersion, ContentSHA256: sshContent,
+		},
+		WrapperShell: stageprovider.LocalExecutableLock{
+			CommandID: stageprovider.StandardAuthoringSSHWrapperShellCommandID, AbsolutePath: config.sshWrapperShell,
+			Version: string(shellContent), ContentSHA256: shellContent,
+		},
+		KnownHosts: stageprovider.StandardAuthoringSSHKnownHostsLock{
+			Format: stageprovider.StandardAuthoringSSHKnownHostsLockFormat, Version: stageprovider.StandardAuthoringSSHKnownHostsLockVersion,
+			RelativePath: stageprovider.StandardAuthoringSSHKnownHostsRelativePath, ContentSHA256: workflowkit.SHA256Fingerprint(knownHosts),
+		},
+		AgentSocketEnvironmentName: stageprovider.StandardAuthoringSSHAgentSocketEnvironment,
+	}
+	if err := transport.Validate(); err != nil {
+		return stageprovider.StandardAuthoringSSHTransportLock{}, err
+	}
+	return transport, nil
+}
+
+func probeSSHVersion(command string) (string, error) {
+	probeContext, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	var stdout, stderr limitedBuffer
+	stdout.limit = maxProbeBytes
+	stderr.limit = maxProbeBytes
+	process := exec.CommandContext(probeContext, command, "-V")
+	process.Dir = filepath.Dir(command)
+	process.Env = []string{"HOME=" + filepath.Dir(command), "PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C", "LC_ALL=C", "SSH_ASKPASS_REQUIRE=never"}
+	process.Stdout = &stdout
+	process.Stderr = &stderr
+	if err := process.Run(); err != nil || stdout.exceeded || stderr.exceeded || probeContext.Err() != nil {
+		return "", errors.New("controlled probe failed")
+	}
+	value := strings.TrimSpace(string(append(append([]byte(nil), stdout.buffer.Bytes()...), stderr.buffer.Bytes()...)))
+	if value == "" || strings.ContainsAny(value, "\r\n\x00") {
+		return "", errors.New("SSH version output is invalid")
+	}
+	fields := strings.Fields(value)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "OpenSSH_") {
+		return "", errors.New("SSH version output is invalid")
+	}
+	return fields[0], nil
 }
 
 func discoverCodexLock(config buildConfig) (stageprovider.CodexAppServerOperationLock, error) {
