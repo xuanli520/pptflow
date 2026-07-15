@@ -634,6 +634,7 @@ func TestTaskHubMutationOverlayCollectsActionSpecificTypedInputs(t *testing.T) {
 	}{
 		{name: "create", action: TaskHubActionNewTask, values: map[string]string{taskHubTaskSlugField: "typed-create", taskHubTaskTitleField: "Typed Create", taskHubTaskMetadataJSONField: `{"kind":"fixture"}`}},
 		{name: "import", action: TaskHubActionImportTask, values: map[string]string{taskHubTaskSlugField: "typed-import", taskHubTaskTitleField: "Typed Import", taskHubImportSourcePathField: "/managed/snapshot"}},
+		{name: "standard authoring", action: TaskHubActionStartStandardAuthoring, values: map[string]string{taskHubTaskSlugField: "typed-standard", taskHubTaskTitleField: "Typed Standard", taskHubTaskMetadataJSONField: `{"difficulty":"hard"}`}},
 		{name: "fork", action: TaskHubActionForkTask, values: map[string]string{taskHubTaskSlugField: "typed-fork", taskHubTaskTitleField: "Typed Fork"}},
 		{name: "restore", action: TaskHubActionRestoreTask, values: map[string]string{taskHubRestoreStateField: "ready"}},
 		{name: "start", action: TaskHubActionStartRun, values: map[string]string{taskHubExecutionProfilePathField: "/profiles/explicit.json", taskHubExecutionSpecPathField: "/specs/frozen.json", taskHubRunTriggerField: "task_hub"}},
@@ -664,6 +665,33 @@ func TestTaskHubMutationOverlayCollectsActionSpecificTypedInputs(t *testing.T) {
 				t.Fatalf("form idempotency key %q is not UUIDv7: %v", request.IdempotencyKey, err)
 			}
 		})
+	}
+}
+
+func TestTaskHubStandardAuthoringFormOnlyExposesClosedInputs(t *testing.T) {
+	overlay, err := newTaskHubMutationOverlay(TaskHubActionStartStandardAuthoring, TaskHubTarget{}, TaskHubPlanPreview{ConfirmationNeeded: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay.ReasonInput.SetValue("start fixed Tower HTTP authoring")
+	setTaskHubMutationFormValue(t, overlay, taskHubTaskSlugField, "towerhttp-header-hardening")
+	setTaskHubMutationFormValue(t, overlay, taskHubTaskTitleField, "Tower HTTP header hardening")
+	setTaskHubMutationFormValue(t, overlay, taskHubTaskMetadataJSONField, `{"difficulty":"hard"}`)
+	if err := overlay.validate(); err != nil {
+		t.Fatalf("validate Standard authoring form: %v", err)
+	}
+	for _, forbidden := range []string{taskHubTaskSourceRepoField, taskHubTaskSourceCommitField, taskHubExecutionProfilePathField, taskHubExecutionSpecPathField, taskHubRunTriggerField} {
+		if _, found := overlay.ValueInputs[forbidden]; found {
+			t.Fatalf("Standard authoring form exposed deployment-owned input %q", forbidden)
+		}
+	}
+	if rendered := overlay.View(100, 30); strings.Contains(rendered, "来源仓库") || strings.Contains(rendered, "Execution profile JSON") {
+		t.Fatalf("Standard authoring form rendered deployment-owned inputs:\n%s", rendered)
+	}
+
+	setTaskHubMutationFormValue(t, overlay, taskHubTaskMetadataJSONField, "not-json")
+	if err := overlay.validate(); err == nil || !strings.Contains(err.Error(), "元数据 JSON") {
+		t.Fatalf("invalid Standard authoring metadata error = %v", err)
 	}
 }
 

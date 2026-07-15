@@ -22,12 +22,12 @@ func TestProductionPackageScriptBuildsThreeAttestedBundlesWithoutDiscoveryMateri
 
 	first := filepath.Join(outputs, "first")
 	runProductionPackage(t, fixture, first, nil)
-	assertUnifiedProductionPackage(t, first)
+	assertUnifiedProductionPackage(t, fixture, first)
 	assertUnifiedProductionBuildToolInvocation(t, fixture)
 
 	second := filepath.Join(outputs, "second")
 	runProductionPackage(t, fixture, second, nil)
-	assertUnifiedProductionPackage(t, second)
+	assertUnifiedProductionPackage(t, fixture, second)
 	for _, name := range []string{productionPackageArchiveName, "SHA256SUMS"} {
 		firstBytes, err := os.ReadFile(filepath.Join(first, name))
 		if err != nil {
@@ -98,6 +98,18 @@ func TestProductionPackageScriptRequiresAllThreeCatalogLockPairs(t *testing.T) {
 	}
 }
 
+func TestProductionPackageScriptRequiresSourceControlledProductionPackageReadme(t *testing.T) {
+	requireProductionPackageCommands(t)
+	fixture := newProductionPackageFixture(t)
+	if err := os.Remove(filepath.Join(fixture.root, "docs", "PRODUCTION_PACKAGE.md")); err != nil {
+		t.Fatal(err)
+	}
+	outputText, err := runProductionPackageResult(fixture, filepath.Join(t.TempDir(), "missing-production-package-readme"), nil)
+	if err == nil || !strings.Contains(outputText, "Production package README must be a regular non-symlink file") {
+		t.Fatalf("missing production package README error = %q, want explicit source-controlled README rejection", outputText)
+	}
+}
+
 type productionPackageFixture struct {
 	root            string
 	script          string
@@ -111,6 +123,7 @@ func newProductionPackageFixture(t *testing.T) productionPackageFixture {
 	root := t.TempDir()
 	script := filepath.Join(root, "scripts", "build-codeedge-production.sh")
 	copyPackagingFixtureFile(t, filepath.Join("..", "..", "scripts", "build-codeedge-production.sh"), script, 0o755)
+	copyPackagingFixtureFile(t, filepath.Join("..", "..", "docs", "PRODUCTION_PACKAGE.md"), filepath.Join(root, "docs", "PRODUCTION_PACKAGE.md"), 0o644)
 
 	writeProductionBundleFixture(t, root, "standard-authoring", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json", "contract-assets.v1.json", "execution-profile.v1.json",
@@ -285,9 +298,10 @@ func assertUnifiedProductionBuildToolInvocation(t *testing.T, fixture production
 	}
 }
 
-func assertUnifiedProductionPackage(t *testing.T, output string) {
+func assertUnifiedProductionPackage(t *testing.T, fixture productionPackageFixture, output string) {
 	t.Helper()
 	for path, mode := range map[string]os.FileMode{
+		"README.md":      0o644,
 		"harbor-factory": 0o755,
 		"deployments":    0o755,
 		"SHA256SUMS":     0o644,
@@ -318,6 +332,22 @@ func assertUnifiedProductionPackage(t *testing.T, output string) {
 	if strings.Contains(string(checksums), "  SHA256SUMS\n") {
 		t.Fatalf("SHA256SUMS must not contain a self-referential checksum:\n%s", checksums)
 	}
+	sourceReadme, err := os.ReadFile(filepath.Join(fixture.root, "docs", "PRODUCTION_PACKAGE.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"binary-only", "符号链接", "完整", "`deployments/`"} {
+		if !strings.Contains(string(sourceReadme), want) {
+			t.Fatalf("source-controlled production package guide omits %q", want)
+		}
+	}
+	packagedReadme, err := os.ReadFile(filepath.Join(output, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(packagedReadme, sourceReadme) {
+		t.Fatal("package README.md does not match the source-controlled production package guide")
+	}
 
 	archiveCommand := exec.Command("tar", "-tzf", filepath.Join(output, productionPackageArchiveName))
 	archiveOutput, err := archiveCommand.CombinedOutput()
@@ -342,6 +372,7 @@ func assertUnifiedProductionPackage(t *testing.T, output string) {
 
 func productionPackagePayloads() []string {
 	return []string{
+		"README.md",
 		"deployments/codeedge-evaluator-child/README.md",
 		"deployments/codeedge-evaluator-child/operation-catalog.lock.json",
 		"deployments/codeedge-evaluator-child/operation-catalog.v1.json",

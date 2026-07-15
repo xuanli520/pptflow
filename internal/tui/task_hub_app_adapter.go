@@ -65,8 +65,9 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHub(ctx context.Context, que
 		return TaskHubSnapshot{}, fmt.Errorf("list Task Hub tasks: %w", err)
 	}
 
+	standardAuthoringAvailable := services.AuthoringLaunches != nil && services.AuthoringLaunches.Available()
 	snapshot := TaskHubSnapshot{
-		GlobalActions: appTaskHubGlobalActions(services.Mutations != nil),
+		GlobalActions: appTaskHubGlobalActions(services.Mutations != nil, standardAuthoringAvailable),
 		ObservedAt:    observedAt,
 	}
 	queued := make([]taskHubQueuedRun, 0)
@@ -106,6 +107,21 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 			Summary:            "确认表单将收集新 Task 的标识、标题、可选来源与审计原因；提交后由 V12 幂等命令分配全局 UUIDv7 身份。",
 			Reason:             "尚未创建任何 Task、revision、Run 或本地 package。",
 			RevisionImpact:     "新 Task 以 draft 生命周期创建，不会修改已存在的 TaskRevision。",
+			ConfirmationNeeded: true,
+		}, nil
+	case TaskHubActionStartStandardAuthoring:
+		if command.Target != (TaskHubTarget{}) {
+			return TaskHubPlanPreview{}, fmt.Errorf("Standard authoring launch is global and cannot target an existing Task, Run, or revision")
+		}
+		if services.AuthoringLaunches == nil || !services.AuthoringLaunches.Available() {
+			return unavailableTaskHubPlan(command.Action, "当前部署未配置受控 Standard 创题定义"), nil
+		}
+		return TaskHubPlanPreview{
+			Title:              "启动 Standard 创题",
+			Summary:            "确认表单将收集新题目的标识、标题与可选元数据；提交后捕获已锁定的 Tower HTTP 源码，创建 revision-free draft Task 与 AuthoringSession，并排队 Standard 创题 Run。",
+			Reason:             "来源仓库、固定提交、Codex/profile、模型与 catalog/lock 全部由当前部署冻结，不接受 TUI 覆盖。",
+			RevisionImpact:     "不会立即创建 TaskRevision；只有 Standard authoring materialize 阶段完成后才会生成首个不可变 revision。",
+			ExternalEffects:    []string{"受控捕获已批准的 Tower HTTP 源码", "创建本地 AuthoringSource、AuthoringSession 与 Standard Run"},
 			ConfirmationNeeded: true,
 		}, nil
 	case TaskHubActionImportTask:
@@ -792,6 +808,23 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 			return TaskHubMutationResult{}, err
 		}
 		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionStartStandardAuthoring:
+		if request.Target != (TaskHubTarget{}) {
+			return TaskHubMutationResult{}, fmt.Errorf("Standard authoring launch is global and cannot target an existing Task, Run, or revision")
+		}
+		if services.AuthoringLaunches == nil || !services.AuthoringLaunches.Available() {
+			return TaskHubMutationResult{}, fmt.Errorf("controlled Standard authoring launch service is not configured")
+		}
+		receipt, err := services.AuthoringLaunches.Start(ctx, app.StandardAuthoringLaunchCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			Slug:                         taskHubMutationValue(request, taskHubTaskSlugField),
+			Title:                        taskHubMutationValue(request, taskHubTaskTitleField),
+			MetadataJSON:                 taskHubMutationValue(request, taskHubTaskMetadataJSONField),
+		})
+		if err != nil {
+			return TaskHubMutationResult{}, err
+		}
+		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionImportTask:
 		if services.Mutations == nil {
 			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
@@ -1426,11 +1459,15 @@ func taskHubMutationResult(request TaskHubMutationRequest, receipt app.Lifecycle
 	if summary == "" {
 		summary = taskHubActionLabel(request.Action) + "已提交"
 	}
+	executionID := strings.TrimSpace(receipt.ExecutionID)
+	if executionID == "" {
+		executionID = strings.TrimSpace(receipt.RunID)
+	}
 	return TaskHubMutationResult{
 		Action:      request.Action,
 		Target:      request.Target,
 		PlanID:      receipt.PlanID,
-		ExecutionID: receipt.ExecutionID,
+		ExecutionID: executionID,
 		ReceiptID:   receipt.OperationID,
 		Summary:     summary,
 	}
@@ -2096,17 +2133,18 @@ func taskHubRunConsumesExecutionSlot(status store.WorkflowRunStatus) bool {
 	}
 }
 
-func appTaskHubGlobalActions(mutationsAvailable bool) []TaskHubActionState {
-	if !mutationsAvailable {
-		return []TaskHubActionState{
-			{Action: TaskHubActionNewTask, DisabledReason: "LifecycleMutationService 不可用"},
-			{Action: TaskHubActionImportTask, DisabledReason: "LifecycleMutationService 不可用"},
+func appTaskHubGlobalActions(mutationsAvailable, standardAuthoringAvailable bool) []TaskHubActionState {
+	actions := []TaskHubActionState{
+		{Action: TaskHubActionNewTask, Enabled: mutationsAvailable, DisabledReason: "LifecycleMutationService 不可用"},
+		{Action: TaskHubActionImportTask, Enabled: mutationsAvailable, DisabledReason: "LifecycleMutationService 不可用"},
+		{Action: TaskHubActionStartStandardAuthoring, Enabled: standardAuthoringAvailable, DisabledReason: "当前部署未配置受控 Standard 创题定义"},
+	}
+	for index := range actions {
+		if actions[index].Enabled {
+			actions[index].DisabledReason = ""
 		}
 	}
-	return []TaskHubActionState{
-		{Action: TaskHubActionNewTask, Enabled: true},
-		{Action: TaskHubActionImportTask, Enabled: true},
-	}
+	return actions
 }
 
 // taskHubCodeEdgePackageAuthorization is a read-only preflight for the TUI.

@@ -34,7 +34,8 @@ Queue 标签显示观测到的运行中和排队数量。后端未暴露容量�
 
 | 序列 | 请求的计划 |
 | --- | --- |
-| `t n`、`t i` | 新建或导入 Task。 |
+| `t n`、`t i` | 新建空 draft Task 或导入完整本地 Task 快照。 |
+| `t s` | 启动受控 Standard 创题：捕获部署冻结的 Tower HTTP 源码，创建 revision-free draft Task、AuthoringSession 并排队 Standard Run。来源、提交、Codex/profile、模型和 catalog/lock 不从 TUI 输入。 |
 | `t e`、`t f`、`t a`、`t d`、`t u` | 创建编辑 candidate、Fork、归档、软删除或恢复选中的 Task。 |
 | `x c`、`x n`、`x a` | 继续处理、启动 Run 或 Attach 到 durable Run。 |
 | `x k` | 打开选中 Run 的 Run Control。 |

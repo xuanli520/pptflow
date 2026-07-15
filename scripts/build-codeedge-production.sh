@@ -124,6 +124,7 @@ parent_catalog="$root/deployments/codeedge-phase1/operation-catalog.v1.json"
 parent_lock="$root/deployments/codeedge-phase1/operation-catalog.lock.json"
 evaluator_catalog="$root/deployments/codeedge-evaluator-child/operation-catalog.v1.json"
 evaluator_lock="$root/deployments/codeedge-evaluator-child/operation-catalog.lock.json"
+production_package_readme="$root/docs/PRODUCTION_PACKAGE.md"
 
 for entry in \
   "Standard authoring catalog:$standard_catalog" \
@@ -131,7 +132,8 @@ for entry in \
   "CodeEdge Phase-1 catalog:$parent_catalog" \
   "CodeEdge Phase-1 lock:$parent_lock" \
   "CodeEdge evaluator child catalog:$evaluator_catalog" \
-  "CodeEdge evaluator child lock:$evaluator_lock"; do
+  "CodeEdge evaluator child lock:$evaluator_lock" \
+  "Production package README:$production_package_readme"; do
   require_regular_file "${entry%%:*}" "${entry#*:}"
 done
 
@@ -172,6 +174,7 @@ ldflags="$(cd "$root" && env GOFLAGS= go run -mod=readonly ./tools/harbor-flow-p
   --source-manifest "$source_manifest")"
 
 mkdir -p "$package/deployments"
+install -m 0644 "$production_package_readme" "$package/README.md"
 copy_deployment_tree "staged Standard authoring" "$inputs/deployments/standard-authoring" "$package/deployments/standard-authoring" 0
 copy_deployment_tree "staged CodeEdge Phase-1" "$inputs/deployments/codeedge-phase1" "$package/deployments/codeedge-phase1" 0
 copy_deployment_tree "staged CodeEdge evaluator child" "$inputs/deployments/codeedge-evaluator-child" "$package/deployments/codeedge-evaluator-child" 0
@@ -194,11 +197,12 @@ archive_name="harbor-factory-harbor-flow-production.tar.gz"
     --format=posix \
     --pax-option=delete=atime,delete=ctime \
     -cf - \
+    README.md \
     harbor-factory \
     deployments | gzip -n -9 > "$archive_name"
 
   mapfile -d '' package_payloads < <(find -P deployments -type f -print0 | LC_ALL=C sort -z)
-  package_payloads+=(harbor-factory "$archive_name")
+  package_payloads+=(README.md harbor-factory "$archive_name")
   sha256sum "${package_payloads[@]}" > SHA256SUMS
 )
 

@@ -124,6 +124,59 @@ func TestTaskHubV2DisabledReasonIsShownAndDoesNotPlan(t *testing.T) {
 	}
 }
 
+func TestTaskHubStandardAuthoringShortcutIsGlobalAndPreservesAnEmptyTarget(t *testing.T) {
+	snapshot := enabledTaskHubSnapshot()
+	snapshot.GlobalActions = append(snapshot.GlobalActions, TaskHubActionState{Action: TaskHubActionStartStandardAuthoring, Enabled: true})
+	service := &fakeTaskHubLifecycle{
+		snapshot: snapshot,
+		plan: TaskHubPlanPreview{
+			Title: "启动 Standard 创题", Summary: "捕获固定 Tower HTTP 源并排队 AuthoringSession Run", ConfirmationNeeded: true,
+		},
+	}
+	m, cleanup := newTestTaskHubV2Model(t, service)
+	defer cleanup()
+
+	updated, _ := m.Update(runeKey("t"))
+	m = updated.(model)
+	if hint := m.taskHubPrefixHint(); !strings.Contains(hint, "t s 启动 Standard 创题") {
+		t.Fatalf("Task prefix hint omitted Standard authoring shortcut: %q", hint)
+	}
+	updated, command := m.Update(runeKey("s"))
+	m = updated.(model)
+	if command == nil || service.planCallCount() != 0 {
+		t.Fatalf("t s did not return one deferred plan command: command=%v plans=%d", command, service.planCallCount())
+	}
+	updated, _ = m.Update(command())
+	m = updated.(model)
+	if service.planCallCount() != 1 || m.taskHubPlan == nil || m.taskHubPlanCommand == nil || m.taskHubPlanCommand.Action != TaskHubActionStartStandardAuthoring {
+		t.Fatalf("t s did not install Standard authoring plan: plan=%+v command=%+v calls=%d", m.taskHubPlan, m.taskHubPlanCommand, service.planCallCount())
+	}
+	if m.taskHubPlanCommand.Target != (TaskHubTarget{}) {
+		t.Fatalf("global Standard authoring plan captured a selected Task/Run target: %+v", m.taskHubPlanCommand.Target)
+	}
+	if taskHubActionKey(TaskHubActionStartStandardAuthoring) != "t s" || !taskHubGlobalAction(TaskHubActionStartStandardAuthoring) {
+		t.Fatal("Standard authoring action is not registered as the t s global action")
+	}
+}
+
+func TestTaskHubStandardAuthoringDisabledReasonDoesNotPlan(t *testing.T) {
+	snapshot := enabledTaskHubSnapshot()
+	snapshot.GlobalActions = append(snapshot.GlobalActions, TaskHubActionState{
+		Action: TaskHubActionStartStandardAuthoring, DisabledReason: "当前部署未配置受控 Standard 创题定义",
+	})
+	service := &fakeTaskHubLifecycle{snapshot: snapshot}
+	m, cleanup := newTestTaskHubV2Model(t, service)
+	defer cleanup()
+
+	updated, _ := m.Update(runeKey("t"))
+	m = updated.(model)
+	updated, command := m.Update(runeKey("s"))
+	m = updated.(model)
+	if service.planCallCount() != 0 || command == nil || !strings.Contains(m.notice, "当前部署未配置受控 Standard 创题定义") {
+		t.Fatalf("disabled t s planned or hid its reason: plans=%d notice=%q command=%v", service.planCallCount(), m.notice, command)
+	}
+}
+
 func TestTaskHubEditActionRequiresSelectedCurrentRevisionRun(t *testing.T) {
 	snapshot := enabledTaskHubSnapshot()
 	snapshot.Tasks[0].Actions = append(snapshot.Tasks[0].Actions, TaskHubActionState{

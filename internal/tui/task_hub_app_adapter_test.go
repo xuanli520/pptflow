@@ -97,6 +97,10 @@ func TestAppTaskHubLifecycleAdapterQueriesRealServicesAndPlansWithoutMutation(t 
 	if !found || !newTask.Enabled {
 		t.Fatalf("global create capability = %+v, want V12 confirmation-capable action", newTask)
 	}
+	standardAuthoring, found := taskHubActionStateFor(snapshot.GlobalActions, TaskHubActionStartStandardAuthoring)
+	if !found || standardAuthoring.Enabled || !strings.Contains(standardAuthoring.DisabledReason, "受控 Standard 创题定义") {
+		t.Fatalf("global Standard authoring capability = %+v, want fail-closed deployment gate", standardAuthoring)
+	}
 	startKey, err := store.NewUUIDv7()
 	if err != nil {
 		t.Fatal(err)

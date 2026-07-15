@@ -36,16 +36,20 @@ func (tab TaskHubTab) valid() bool {
 type TaskHubAction string
 
 const (
-	TaskHubActionNewTask          TaskHubAction = "task.new"
-	TaskHubActionImportTask       TaskHubAction = "task.import"
-	TaskHubActionEditTask         TaskHubAction = "task.edit"
-	TaskHubActionForkTask         TaskHubAction = "task.fork"
-	TaskHubActionArchiveTask      TaskHubAction = "task.archive"
-	TaskHubActionSoftDeleteTask   TaskHubAction = "task.soft_delete"
-	TaskHubActionRestoreTask      TaskHubAction = "task.restore"
-	TaskHubActionContinue         TaskHubAction = "execution.continue"
-	TaskHubActionStartRun         TaskHubAction = "execution.start"
-	TaskHubActionEvaluateCodeEdge TaskHubAction = "evaluation.codeedge.start"
+	TaskHubActionNewTask    TaskHubAction = "task.new"
+	TaskHubActionImportTask TaskHubAction = "task.import"
+	// TaskHubActionStartStandardAuthoring starts the deployment-owned Standard
+	// authoring flow. It is global because it creates a new draft Task together
+	// with its source/session Run; it must never bind a selected TaskRevision.
+	TaskHubActionStartStandardAuthoring TaskHubAction = "authoring.standard.start"
+	TaskHubActionEditTask               TaskHubAction = "task.edit"
+	TaskHubActionForkTask               TaskHubAction = "task.fork"
+	TaskHubActionArchiveTask            TaskHubAction = "task.archive"
+	TaskHubActionSoftDeleteTask         TaskHubAction = "task.soft_delete"
+	TaskHubActionRestoreTask            TaskHubAction = "task.restore"
+	TaskHubActionContinue               TaskHubAction = "execution.continue"
+	TaskHubActionStartRun               TaskHubAction = "execution.start"
+	TaskHubActionEvaluateCodeEdge       TaskHubAction = "evaluation.codeedge.start"
 	// TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff adopts the verified
 	// Qwen/Opus evidence of one completed evaluator child Run into its durable
 	// Phase-1 parent. The selected Run is always the child; the adapter derives
@@ -1262,6 +1266,8 @@ func taskHubActionForSequence(prefix, second rune) (TaskHubAction, bool) {
 			return TaskHubActionNewTask, true
 		case 'i':
 			return TaskHubActionImportTask, true
+		case 's':
+			return TaskHubActionStartStandardAuthoring, true
 		case 'e':
 			return TaskHubActionEditTask, true
 		case 'f':
@@ -1311,7 +1317,7 @@ func taskHubActionForSequence(prefix, second rune) (TaskHubAction, bool) {
 func taskHubPrefixActions(prefix rune) []TaskHubAction {
 	switch prefix {
 	case 't':
-		return []TaskHubAction{TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionEditTask, TaskHubActionForkTask, TaskHubActionArchiveTask, TaskHubActionSoftDeleteTask, TaskHubActionRestoreTask}
+		return []TaskHubAction{TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionStartStandardAuthoring, TaskHubActionEditTask, TaskHubActionForkTask, TaskHubActionArchiveTask, TaskHubActionSoftDeleteTask, TaskHubActionRestoreTask}
 	case 'x':
 		return []TaskHubAction{TaskHubActionContinue, TaskHubActionStartRun, TaskHubActionEvaluateCodeEdge, TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff, TaskHubActionAttachRun, TaskHubActionOpenRunControl}
 	case 'v':
@@ -1416,7 +1422,7 @@ func (m *model) previewTaskHubAction(action TaskHubAction) tea.Cmd {
 
 func taskHubGlobalAction(action TaskHubAction) bool {
 	switch action {
-	case TaskHubActionNewTask, TaskHubActionImportTask:
+	case TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionStartStandardAuthoring:
 		return true
 	default:
 		return false
@@ -1726,7 +1732,7 @@ func taskHubActionKey(action TaskHubAction) string {
 		second rune
 		action TaskHubAction
 	}{
-		{'t', 'n', TaskHubActionNewTask}, {'t', 'i', TaskHubActionImportTask}, {'t', 'e', TaskHubActionEditTask}, {'t', 'f', TaskHubActionForkTask}, {'t', 'a', TaskHubActionArchiveTask}, {'t', 'd', TaskHubActionSoftDeleteTask}, {'t', 'u', TaskHubActionRestoreTask},
+		{'t', 'n', TaskHubActionNewTask}, {'t', 'i', TaskHubActionImportTask}, {'t', 's', TaskHubActionStartStandardAuthoring}, {'t', 'e', TaskHubActionEditTask}, {'t', 'f', TaskHubActionForkTask}, {'t', 'a', TaskHubActionArchiveTask}, {'t', 'd', TaskHubActionSoftDeleteTask}, {'t', 'u', TaskHubActionRestoreTask},
 		{'x', 'c', TaskHubActionContinue}, {'x', 'n', TaskHubActionStartRun}, {'x', 'e', TaskHubActionEvaluateCodeEdge}, {'x', 'h', TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff}, {'x', 'a', TaskHubActionAttachRun}, {'x', 'k', TaskHubActionOpenRunControl},
 		{'v', 'a', TaskHubActionApproveReview}, {'v', 'c', TaskHubActionRequestChanges}, {'v', 'r', TaskHubActionRejectReview},
 		{'p', 'p', TaskHubActionPackageRevision}, {'p', 'w', TaskHubActionWithdrawRelease},
@@ -1744,6 +1750,8 @@ func taskHubActionLabel(action TaskHubAction) string {
 		return "新建 Task"
 	case TaskHubActionImportTask:
 		return "导入 Task"
+	case TaskHubActionStartStandardAuthoring:
+		return "启动 Standard 创题"
 	case TaskHubActionEditTask:
 		return "创建 draft 修改"
 	case TaskHubActionForkTask:

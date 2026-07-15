@@ -152,6 +152,12 @@ func taskHubMutationFields(action TaskHubAction) []taskHubMutationField {
 			{key: taskHubImportProposalDigestField, label: "提案摘要（可选）", placeholder: "sha256:..."},
 			{key: taskHubImportChangeSummaryField, label: "变更说明（可选）", placeholder: "导入说明"},
 		}
+	case TaskHubActionStartStandardAuthoring:
+		return []taskHubMutationField{
+			{key: taskHubTaskSlugField, label: "Task 标识", placeholder: "例如 towerhttp-request-id"},
+			{key: taskHubTaskTitleField, label: "Task 标题", placeholder: "Task 的可读标题"},
+			{key: taskHubTaskMetadataJSONField, label: "元数据 JSON（可选）", placeholder: "例如 {\"difficulty\":\"hard\"}"},
+		}
 	case TaskHubActionForkTask:
 		return []taskHubMutationField{
 			{key: taskHubTaskSlugField, label: "新 Task 标识", placeholder: "例如 harbor-algorithms-fork"},
@@ -180,7 +186,7 @@ func taskHubMutationFieldLabel(field string) string {
 		return "操作原因"
 	}
 	for _, action := range []TaskHubAction{
-		TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionForkTask, TaskHubActionRestoreTask,
+		TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionStartStandardAuthoring, TaskHubActionForkTask, TaskHubActionRestoreTask,
 		TaskHubActionStartRun, TaskHubActionEditTask, TaskHubActionPackageRevision,
 	} {
 		for _, candidate := range taskHubMutationFields(action) {
@@ -411,7 +417,7 @@ func validateTaskHubMutationValues(request TaskHubMutationRequest) error {
 
 func taskHubRequiredMutationFields(action TaskHubAction) []string {
 	switch action {
-	case TaskHubActionNewTask:
+	case TaskHubActionNewTask, TaskHubActionStartStandardAuthoring:
 		return []string{taskHubTaskSlugField, taskHubTaskTitleField}
 	case TaskHubActionImportTask:
 		return []string{taskHubTaskSlugField, taskHubTaskTitleField, taskHubImportSourcePathField}
