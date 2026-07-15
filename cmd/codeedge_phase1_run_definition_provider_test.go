@@ -93,7 +93,7 @@ func TestCodeEdgePhase1DefinitionProviderBuildsOnlyLockOwnedParentDefinition(t *
 	// deployment materials before a later handoff.
 	definition.Profile.ControlGracePeriod += time.Second
 	definition.ExecutionSpec.CodeEdgeFinalCompliancePolicy.Version = "forged"
-	definition.ExecutionSpec.Stages[0] = workflowadapter.RepoPrepareBinding{StageBindingBase: workflowadapter.StageBindingBase{}}
+	definition.ExecutionSpec.Stages[0] = workflowadapter.UniversalStageBinding{StageBindingBase: workflowadapter.StageBindingBase{}}
 	replayed, err := provider.DefinitionForCodeEdgePhase1Run(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)

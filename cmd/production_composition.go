@@ -684,9 +684,9 @@ func (provider *codeEdgeEvaluatorRunDefinitionProvider) executionSpec(request ap
 		}
 		switch stageKey {
 		case workflowkit.StageKey(workflowadapter.HarborRunQwen):
-			specification.Stages = append(specification.Stages, workflowadapter.HarborRunQwenBinding{StageBindingBase: base})
+			specification.Stages = append(specification.Stages, workflowadapter.UniversalStageBinding{StageBindingBase: base})
 		case workflowkit.StageKey(workflowadapter.HarborRunOpus):
-			specification.Stages = append(specification.Stages, workflowadapter.HarborRunOpusBinding{StageBindingBase: base})
+			specification.Stages = append(specification.Stages, workflowadapter.UniversalStageBinding{StageBindingBase: base})
 		default:
 			return workflowadapter.RunExecutionSpec{}, fmt.Errorf("stored child definition has unsupported stage %q", stageKey)
 		}

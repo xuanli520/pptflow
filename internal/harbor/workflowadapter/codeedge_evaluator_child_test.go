@@ -266,8 +266,8 @@ func testCodeEdgeEvaluatorChildRunExecutionSpec(t *testing.T) RunExecutionSpec {
 			Providers: []ProviderReference{{ID: "provider-codeedge-evaluator", Kind: "evaluation", Version: "1"}},
 		},
 		Stages: []StageExecutionBinding{
-			HarborRunQwenBinding{StageBindingBase: qwen},
-			HarborRunOpusBinding{StageBindingBase: opus},
+			UniversalStageBinding{StageBindingBase: qwen},
+			UniversalStageBinding{StageBindingBase: opus},
 		},
 	}
 	if err := specification.Validate(); err != nil {

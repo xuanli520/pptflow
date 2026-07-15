@@ -104,30 +104,30 @@ func StandardAuthoringWorkflowTemplate() WorkflowTemplate {
 	}
 }
 
-// StandardAuthoringStageCatalog defines the complete closed pre-materialize
-// topology. It intentionally reuses the same typed stage bindings and
-// artifact names as the corresponding Standard stages, except that
-// materialize_task emits a mandatory immutable task-handoff receipt.
+// StandardAuthoringStageCatalog derives from the canonical StandardStageCatalog.
+// The first 13 stages (repo_prepare through solution_review) are identical to the
+// Standard catalog; only materialize_task is overridden to emit the mandatory
+// immutable task-handoff receipt.
 func StandardAuthoringStageCatalog() StageCatalog {
+	canonical := StandardStageCatalog()
+	stages := make([]StageDefinition, 0, len(canonical.Stages))
+	stages = append(stages, canonical.Stages[:13]...)
+	stages = append(stages,
+		stage(MaterializeTask, StageTaskGeneration, []string{SolutionReview}, "harborfactory.materialize_task",
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceReviewSolutionVerifier},
+			[]workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceAuthoringTaskHandoff},
+			workflowkit.EffectContentMutator, 1, contentVerdicts(),
+			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"),
+			artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"),
+			reviewDecisionInput("solution_review_decision"),
+			artifactOutput("task_snapshot"), artifactOutput("task_digest"),
+			artifactOutputWithSchema(StandardAuthoringTaskHandoffArtifact, StandardAuthoringTaskHandoffSchemaVersion),
+		),
+	)
 	return StageCatalog{
 		Template: StandardAuthoringTemplateReference(),
 		ID:       standardAuthoringCatalogID,
 		Version:  standardAuthoringCatalogVersion,
-		Stages: []StageDefinition{
-			stage(RepoPrepare, StageSourcePrepare, nil, "harborfactory.repo_prepare", []workflowkit.ResourceKey{resourceSourceRepository}, []workflowkit.ResourceKey{resourceSourceSnapshot, resourceEvidenceRepoPrepare}, workflowkit.EffectEvidenceOnly, 1, passOnly(), artifactOutput("repo_prepared")),
-			stage(RepoAnalyze, StageTaskAnalysis, []string{RepoPrepare}, "harborfactory.repo_analyze", []workflowkit.ResourceKey{resourceSourceSnapshot}, []workflowkit.ResourceKey{resourceAnalysisRepository}, workflowkit.EffectEvidenceOnly, 3, passOnly(), artifactInput("repo_prepared"), artifactOutput("repo_analysis")),
-			stage(TaskDesign, StageTaskDesign, []string{RepoAnalyze}, "harborfactory.task_design", []workflowkit.ResourceKey{resourceSourceSnapshot, resourceAnalysisRepository}, []workflowkit.ResourceKey{resourceTaskDesign}, workflowkit.EffectContentProducer, 3, contentVerdicts(), artifactInput("repo_prepared"), artifactInput("repo_analysis"), artifactOutput("task_proposal")),
-			gateStage(TaskReview, StageTaskDesign, []string{TaskDesign}, ReviewTaskDirection, []workflowkit.ResourceKey{resourceAnalysisRepository, resourceTaskDesign}, []workflowkit.ResourceKey{resourceReviewTaskDirection}, artifactInput("repo_analysis"), artifactInput("task_proposal")),
-			stage(GenerateTaskFiles, StageTaskGeneration, []string{TaskReview}, "harborfactory.generate_task_files", []workflowkit.ResourceKey{resourceSourceSnapshot, resourceAnalysisRepository, resourceTaskDesign, resourceReviewTaskDirection}, []workflowkit.ResourceKey{resourceTaskGeneratedFiles}, workflowkit.EffectContentProducer, 3, contentVerdicts(), artifactInput("repo_prepared"), artifactInput("repo_analysis"), artifactInput("task_proposal"), reviewDecisionInput("task_review_decision"), artifactOutput("generated_task_files")),
-			stage(InstructionGen, StageTaskGeneration, []string{GenerateTaskFiles}, "harborfactory.instruction_generate", []workflowkit.ResourceKey{resourceTaskGeneratedFiles}, []workflowkit.ResourceKey{resourceTaskInstruction}, workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("generated_task_files"), artifactOutput("instruction")),
-			stage(TaskTOMLGen, StageTaskGeneration, []string{GenerateTaskFiles}, "harborfactory.task_toml_generate", []workflowkit.ResourceKey{resourceTaskGeneratedFiles, resourceTaskDesign}, []workflowkit.ResourceKey{resourceTaskMetadata}, workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("generated_task_files"), artifactInput("task_proposal"), artifactOutput("task_toml")),
-			stage(DockerfileGen, StageTaskGeneration, []string{GenerateTaskFiles}, "harborfactory.dockerfile_generate", []workflowkit.ResourceKey{resourceSourceSnapshot, resourceTaskDesign}, []workflowkit.ResourceKey{resourceTaskEnvironment}, workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("repo_prepared"), artifactInput("task_proposal"), artifactOutput("dockerfile")),
-			gateStage(ContentReview, StageTaskGeneration, []string{InstructionGen, TaskTOMLGen, DockerfileGen}, ReviewContent, []workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment}, []workflowkit.ResourceKey{resourceReviewContent}, artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile")),
-			stage(SolveGen, StageTaskGeneration, []string{ContentReview}, "harborfactory.solve_generate", []workflowkit.ResourceKey{resourceTaskGeneratedFiles}, []workflowkit.ResourceKey{resourceTaskSolution}, workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("generated_task_files"), artifactOutput("solve_script")),
-			stage(TestGen, StageTaskGeneration, []string{ContentReview}, "harborfactory.test_generate", []workflowkit.ResourceKey{resourceTaskGeneratedFiles}, []workflowkit.ResourceKey{resourceTaskTests}, workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("generated_task_files"), artifactOutput("test_script")),
-			stage(TestsAnalysis, StageTaskGeneration, []string{ContentReview}, "harborfactory.tests_analysis", []workflowkit.ResourceKey{resourceTaskGeneratedFiles, resourceTaskDesign}, []workflowkit.ResourceKey{resourceTaskTestsAnalysis}, workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("generated_task_files"), artifactInput("task_proposal"), artifactOutput("tests_analysis")),
-			gateStage(SolutionReview, StageTaskGeneration, []string{SolveGen, TestGen, TestsAnalysis}, ReviewSolutionVerifier, []workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis}, []workflowkit.ResourceKey{resourceReviewSolutionVerifier}, artifactInput("instruction"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis")),
-			stage(MaterializeTask, StageTaskGeneration, []string{SolutionReview}, "harborfactory.materialize_task", []workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceReviewSolutionVerifier}, []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceAuthoringTaskHandoff}, workflowkit.EffectContentMutator, 1, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), reviewDecisionInput("solution_review_decision"), artifactOutput("task_snapshot"), artifactOutput("task_digest"), artifactOutputWithSchema(StandardAuthoringTaskHandoffArtifact, StandardAuthoringTaskHandoffSchemaVersion)),
-		},
+		Stages:   stages,
 	}
 }

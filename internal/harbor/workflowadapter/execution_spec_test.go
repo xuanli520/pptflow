@@ -127,8 +127,8 @@ func TestRunExecutionSpecStrictJSONDecoder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse valid spec: %v", err)
 	}
-	if _, ok := parsed.Stages[0].(RepoPrepareBinding); !ok {
-		t.Fatalf("first parsed binding type = %T, want RepoPrepareBinding", parsed.Stages[0])
+	if _, ok := parsed.Stages[0].(UniversalStageBinding); !ok {
+		t.Fatalf("first parsed binding type = %T, want UniversalStageBinding", parsed.Stages[0])
 	}
 	if got, want := len(parsed.Stages), len(spec.Stages); got != want {
 		t.Fatalf("parsed stage count = %d, want %d", got, want)
@@ -618,65 +618,65 @@ func bindingForTest(t *testing.T, base StageBindingBase) StageExecutionBinding {
 	t.Helper()
 	switch base.Type {
 	case StageBindingRepoPrepare:
-		return RepoPrepareBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingRepoAnalyze:
-		return RepoAnalyzeBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTaskDesign:
-		return TaskDesignBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTaskReview:
-		return TaskReviewBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingGenerateTaskFiles:
-		return GenerateTaskFilesBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingInstructionGen:
-		return InstructionGenBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTaskTOMLGen:
-		return TaskTOMLGenBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingDockerfileGen:
-		return DockerfileGenBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingContentReview:
-		return ContentReviewBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingSolveGen:
-		return SolveGenBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTestGen:
-		return TestGenBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTestsAnalysis:
-		return TestsAnalysisBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingSolutionReview:
-		return SolutionReviewBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingMaterializeTask:
-		return MaterializeTaskBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTaskRepair:
-		return TaskRepairBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingRuntimeSelfCheck:
-		return RuntimeSelfCheckBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingHarborVerify:
-		return HarborVerifyBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingDockerBuild:
-		return DockerBuildBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingInitialVerify:
-		return InitialVerifyBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingOracleVerify:
-		return OracleVerifyBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingCodeEdgeLint:
-		return CodeEdgeLintBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingQualityCheck:
-		return QualityCheckBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingSimilarityCheck:
-		return SimilarityCheckBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingFinalReview:
-		return FinalReviewBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingHarborRunQwen:
-		return HarborRunQwenBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingHarborRunOpus:
-		return HarborRunOpusBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingEvaluatorEvidenceHandoff:
-		return EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingResultReview:
-		return ResultReviewBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingSubmissionLint:
-		return SubmissionLintBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingPackage:
-		return PackageBinding{StageBindingBase: base}
+		return UniversalStageBinding{StageBindingBase: base}
 	default:
 		t.Fatalf("unknown fixture binding type %q", base.Type)
 		return nil

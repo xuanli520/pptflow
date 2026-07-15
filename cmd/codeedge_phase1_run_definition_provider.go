@@ -252,35 +252,35 @@ func (provider *codeEdgePhase1RunDefinitionProvider) executionSpec(request app.C
 func codeEdgePhase1CatalogStageBinding(base workflowadapter.StageBindingBase) (workflowadapter.StageExecutionBinding, error) {
 	switch base.Type {
 	case workflowadapter.StageBindingRepoPrepare:
-		return workflowadapter.RepoPrepareBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingRepoAnalyze:
-		return workflowadapter.RepoAnalyzeBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingCodeEdgeLint:
-		return workflowadapter.CodeEdgeLintBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingDockerBuild:
-		return workflowadapter.DockerBuildBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingInitialVerify:
-		return workflowadapter.InitialVerifyBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingOracleVerify:
-		return workflowadapter.OracleVerifyBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTestsAnalysis:
-		return workflowadapter.TestsAnalysisBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingSolutionReview:
-		return workflowadapter.SolutionReviewBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingQualityCheck:
-		return workflowadapter.QualityCheckBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingSimilarityCheck:
-		return workflowadapter.SimilarityCheckBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingFinalReview:
-		return workflowadapter.FinalReviewBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingEvaluatorEvidenceHandoff:
-		return workflowadapter.EvaluatorEvidenceHandoffBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingSubmissionLint:
-		return workflowadapter.SubmissionLintBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingResultReview:
-		return workflowadapter.ResultReviewBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingPackage:
-		return workflowadapter.PackageBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	default:
 		return nil, fmt.Errorf("CodeEdge Phase-1 definition has unsupported stage binding type %q", base.Type)
 	}

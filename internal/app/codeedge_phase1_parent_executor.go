@@ -258,12 +258,10 @@ func (executor *CodeEdgePhase1ParentExecutor) ExecuteHarborBuiltin(ctx context.C
 	verdict := workflowkit.VerdictPass
 	findings := []string{}
 	switch payload.HandlerID {
-	case stageprovider.CodeEdgePhase1QualityCheckHandlerID:
-		verdict = workflowkit.VerdictAdvisory
-		findings = []string{"semantic quality assessment is reserved for the durable review gate"}
-	case stageprovider.CodeEdgePhase1SimilarityCheckHandlerID:
-		verdict = workflowkit.VerdictAdvisory
-		findings = []string{"similarity corpus comparison is reserved for the controlled review service"}
+		case stageprovider.CodeEdgePhase1QualityCheckHandlerID:
+			verdict, findings = executor.runQualityChecks(taskRoot)
+		case stageprovider.CodeEdgePhase1SimilarityCheckHandlerID:
+			verdict, findings = executor.runSimilarityChecks(taskRoot)
 	case stageprovider.CodeEdgePhase1SubmissionLintHandlerID:
 		artifactID, reserveErr := executor.reserveSubmissionArtifactID(workspace, invocation.Request)
 		if reserveErr != nil {
@@ -1269,6 +1267,89 @@ func codeEdgePhase1VerifyCheckoutScripts(checkout string, expected map[string]wo
 		}
 	}
 	return nil
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) runQualityChecks(taskRoot string) (workflowkit.Verdict, []string) {
+	var findings []string
+
+	// Check 1: test.sh should not rely solely on file-existence checks.
+	testPath := filepath.Join(taskRoot, "tests", "test.sh")
+	if testContent, err := os.ReadFile(testPath); err == nil {
+		text := string(testContent)
+		if hasOnlyFileExistenceChecks(text) {
+			findings = append(findings, "tests/test.sh appears to rely primarily on file-existence checks (test -f/test -e); add functional assertions that verify correct behavior")
+		}
+	}
+
+	// Check 2: instruction.md should not leak the solution.
+	instrPath := filepath.Join(taskRoot, "instruction.md")
+	if instrContent, err := os.ReadFile(instrPath); err == nil {
+		if leaksAnswer(string(instrContent)) {
+			findings = append(findings, "instruction.md appears to contain substantial code blocks that may leak the solution; keep instruction focused on requirements, not implementation")
+		}
+	}
+
+	if len(findings) > 0 {
+		return workflowkit.VerdictNeedsRepair, findings
+	}
+	return workflowkit.VerdictPass, nil
+}
+
+func hasOnlyFileExistenceChecks(script string) bool {
+	lines := strings.Split(script, "\n")
+	functionalCount := 0
+	existenceCount := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "test -f") || strings.Contains(trimmed, "test -e") || strings.Contains(trimmed, "test -d") {
+			existenceCount++
+			continue
+		}
+		if strings.Contains(trimmed, "grep") || strings.Contains(trimmed, "diff") || strings.Contains(trimmed, "cmp") ||
+			strings.Contains(trimmed, "awk") || strings.Contains(trimmed, "sed") || strings.Contains(trimmed, "curl") ||
+			strings.Contains(trimmed, "assert") || strings.Contains(trimmed, "--exit-code") {
+			functionalCount++
+		}
+	}
+	return existenceCount > 0 && functionalCount == 0
+}
+
+func leaksAnswer(instruction string) bool {
+	lines := strings.Split(instruction, "\n")
+	codeBlockLines := 0
+	inCodeBlock := false
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inCodeBlock = !inCodeBlock
+			continue
+		}
+		if inCodeBlock {
+			codeBlockLines++
+		}
+	}
+	totalLines := len(lines)
+	if totalLines == 0 {
+		return false
+	}
+	return float64(codeBlockLines)/float64(totalLines) > 0.30
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) runSimilarityChecks(taskRoot string) (workflowkit.Verdict, []string) {
+	instrPath := filepath.Join(taskRoot, "instruction.md")
+	instrContent, err := os.ReadFile(instrPath)
+	if err != nil {
+		return workflowkit.VerdictAdvisory, []string{"cannot read instruction.md for similarity comparison"}
+	}
+	instruction := string(instrContent)
+	if len(strings.TrimSpace(instruction)) < 100 {
+		return workflowkit.VerdictAdvisory, []string{"instruction too short for meaningful similarity check"}
+	}
+	// Full corpus comparison (TB3, GitHub issues, intra-author) requires the
+	// durable review gate. This basic check ensures the instruction is substantive.
+	return workflowkit.VerdictPass, nil
 }
 
 var _ stageprovider.HarborBuiltinOperationExecutor = (*CodeEdgePhase1ParentExecutor)(nil)

@@ -252,8 +252,8 @@ func CompleteCodeEdgeEvaluatorChildRunExecutionSpec(taskID, revisionID, revision
 			}},
 		},
 		Stages: []workflowadapter.StageExecutionBinding{
-			workflowadapter.HarborRunQwenBinding{StageBindingBase: base(qwenDefinition, workflowadapter.StageBindingHarborRunQwen, "codeedge.qwen.pass-at-four", "codeedge-qwen-pass4")},
-			workflowadapter.HarborRunOpusBinding{StageBindingBase: base(opusDefinition, workflowadapter.StageBindingHarborRunOpus, "codeedge.opus.pass-at-four", "codeedge-opus-pass4")},
+			workflowadapter.UniversalStageBinding{StageBindingBase: base(qwenDefinition, workflowadapter.StageBindingHarborRunQwen, "codeedge.qwen.pass-at-four", "codeedge-qwen-pass4")},
+			workflowadapter.UniversalStageBinding{StageBindingBase: base(opusDefinition, workflowadapter.StageBindingHarborRunOpus, "codeedge.opus.pass-at-four", "codeedge-opus-pass4")},
 		},
 	}
 	if err := specification.Validate(); err != nil {
@@ -306,65 +306,65 @@ func fixtureFingerprint(character byte) workflowkit.Fingerprint {
 func fixtureBinding(base workflowadapter.StageBindingBase) workflowadapter.StageExecutionBinding {
 	switch base.Type {
 	case workflowadapter.StageBindingRepoPrepare:
-		return workflowadapter.RepoPrepareBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingRepoAnalyze:
-		return workflowadapter.RepoAnalyzeBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingTaskDesign:
-		return workflowadapter.TaskDesignBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingTaskReview:
-		return workflowadapter.TaskReviewBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingGenerateTaskFiles:
-		return workflowadapter.GenerateTaskFilesBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingInstructionGen:
-		return workflowadapter.InstructionGenBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingTaskTOMLGen:
-		return workflowadapter.TaskTOMLGenBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingDockerfileGen:
-		return workflowadapter.DockerfileGenBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingContentReview:
-		return workflowadapter.ContentReviewBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingSolveGen:
-		return workflowadapter.SolveGenBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingTestGen:
-		return workflowadapter.TestGenBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingTestsAnalysis:
-		return workflowadapter.TestsAnalysisBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingSolutionReview:
-		return workflowadapter.SolutionReviewBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingMaterializeTask:
-		return workflowadapter.MaterializeTaskBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingTaskRepair:
-		return workflowadapter.TaskRepairBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingRuntimeSelfCheck:
-		return workflowadapter.RuntimeSelfCheckBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingHarborVerify:
-		return workflowadapter.HarborVerifyBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingDockerBuild:
-		return workflowadapter.DockerBuildBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingInitialVerify:
-		return workflowadapter.InitialVerifyBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingOracleVerify:
-		return workflowadapter.OracleVerifyBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingCodeEdgeLint:
-		return workflowadapter.CodeEdgeLintBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingQualityCheck:
-		return workflowadapter.QualityCheckBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingSimilarityCheck:
-		return workflowadapter.SimilarityCheckBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingFinalReview:
-		return workflowadapter.FinalReviewBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingHarborRunQwen:
-		return workflowadapter.HarborRunQwenBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingHarborRunOpus:
-		return workflowadapter.HarborRunOpusBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingEvaluatorEvidenceHandoff:
-		return workflowadapter.EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingResultReview:
-		return workflowadapter.ResultReviewBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingSubmissionLint:
-		return workflowadapter.SubmissionLintBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingPackage:
-		return workflowadapter.PackageBinding{StageBindingBase: base}
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}
 	default:
 		panic("unsupported Harbor V2 test stage binding")
 	}

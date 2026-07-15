@@ -223,7 +223,8 @@ func writeProductionBuildFixtureBundle(t *testing.T, root, name string, template
 	switch {
 	case template.Catalog.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()):
 		lock.StandardAuthoringExecutionProfile = &stageprovider.StandardAuthoringExecutionProfileLock{Profile: profile}
-	case template.Catalog.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()):
+			lock.StandardAuthoringSSHTransport = fixtureStandardAuthoringSSHTransport()
+		case template.Catalog.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()):
 		lock.CodeEdgePhase1ExecutionProfile = &stageprovider.CodeEdgePhase1ExecutionProfileLock{Profile: profile}
 		lock.CodeEdgePhase1PreflightProfile = &stageprovider.CodeEdgePhase1PreflightProfileLock{Profile: fixtureCodeEdgePhase1PreflightProfile()}
 		lock.CodeEdgePhase1FinalCompliancePolicy = &stageprovider.CodeEdgePhase1FinalCompliancePolicyLock{Policy: fixtureFinalCompliancePolicy()}
@@ -338,5 +339,27 @@ func writeFixtureFile(t *testing.T, path string, contents []byte) {
 	}
 	if err := os.WriteFile(path, contents, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func fixtureStandardAuthoringSSHTransport() *stageprovider.StandardAuthoringSSHTransportLock {
+	sshContent := workflowkit.SHA256Fingerprint([]byte("locked ssh"))
+	shellContent := workflowkit.SHA256Fingerprint([]byte("locked shell"))
+	return &stageprovider.StandardAuthoringSSHTransportLock{
+		Format:  stageprovider.StandardAuthoringSSHTransportLockFormat,
+		Version: stageprovider.StandardAuthoringSSHTransportLockVersion,
+		SSHExecutable: stageprovider.LocalExecutableLock{
+			CommandID: stageprovider.StandardAuthoringSSHTransportCommandID, AbsolutePath: "/opt/standard-authoring/ssh", Version: "OpenSSH_10.0p2", ContentSHA256: sshContent,
+		},
+		WrapperShell: stageprovider.LocalExecutableLock{
+			CommandID: stageprovider.StandardAuthoringSSHWrapperShellCommandID, AbsolutePath: "/opt/standard-authoring/dash", Version: string(shellContent), ContentSHA256: shellContent,
+		},
+		KnownHosts: stageprovider.StandardAuthoringSSHKnownHostsLock{
+			Format:       stageprovider.StandardAuthoringSSHKnownHostsLockFormat,
+			Version:      stageprovider.StandardAuthoringSSHKnownHostsLockVersion,
+			RelativePath: stageprovider.StandardAuthoringSSHKnownHostsRelativePath,
+			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("test known hosts")),
+		},
+		AgentSocketEnvironmentName: stageprovider.StandardAuthoringSSHAgentSocketEnvironment,
 	}
 }

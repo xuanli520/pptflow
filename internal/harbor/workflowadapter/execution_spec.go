@@ -417,77 +417,19 @@ func (binding StageBindingBase) Clone() StageBindingBase {
 	return binding
 }
 
-// StageExecutionBinding is deliberately sealed. A parser can only construct
-// one of the concrete types declared by this versioned Harbor contract.
+// StageExecutionBinding is the sealed interface for all stage binding types.
+// UniversalStageBinding is the sole implementation.
 type StageExecutionBinding interface {
 	stageExecutionBinding()
 }
 
-// The following structs are the full per-Harbor-stage binding union. Even
-// stages that currently need only the common frozen references have their own
-// concrete type, so a later stage-specific field is an additive, reviewable
-// contract change rather than an untyped configuration branch.
-type RepoPrepareBinding struct{ StageBindingBase }
-type RepoAnalyzeBinding struct{ StageBindingBase }
-type TaskDesignBinding struct{ StageBindingBase }
-type TaskReviewBinding struct{ StageBindingBase }
-type GenerateTaskFilesBinding struct{ StageBindingBase }
-type InstructionGenBinding struct{ StageBindingBase }
-type TaskTOMLGenBinding struct{ StageBindingBase }
-type DockerfileGenBinding struct{ StageBindingBase }
-type ContentReviewBinding struct{ StageBindingBase }
-type SolveGenBinding struct{ StageBindingBase }
-type TestGenBinding struct{ StageBindingBase }
-type TestsAnalysisBinding struct{ StageBindingBase }
-type SolutionReviewBinding struct{ StageBindingBase }
-type MaterializeTaskBinding struct{ StageBindingBase }
-type TaskRepairBinding struct{ StageBindingBase }
-type RuntimeSelfCheckBinding struct{ StageBindingBase }
-type HarborVerifyBinding struct{ StageBindingBase }
-type DockerBuildBinding struct{ StageBindingBase }
-type InitialVerifyBinding struct{ StageBindingBase }
-type OracleVerifyBinding struct{ StageBindingBase }
-type CodeEdgeLintBinding struct{ StageBindingBase }
-type QualityCheckBinding struct{ StageBindingBase }
-type SimilarityCheckBinding struct{ StageBindingBase }
-type FinalReviewBinding struct{ StageBindingBase }
-type HarborRunQwenBinding struct{ StageBindingBase }
-type HarborRunOpusBinding struct{ StageBindingBase }
-type EvaluatorEvidenceHandoffBinding struct{ StageBindingBase }
-type ResultReviewBinding struct{ StageBindingBase }
-type SubmissionLintBinding struct{ StageBindingBase }
-type PackageBinding struct{ StageBindingBase }
+// UniversalStageBinding is the single stage binding type. All 30 stage kinds use the
+// same struct; differentiation is by the Type and StageKey fields on StageBindingBase.
+// This replaces the previous 30 identical concrete types while preserving the JSON
+// wire format through the existing StageBindingType discriminator.
+type UniversalStageBinding struct{ StageBindingBase }
 
-func (RepoPrepareBinding) stageExecutionBinding()              {}
-func (RepoAnalyzeBinding) stageExecutionBinding()              {}
-func (TaskDesignBinding) stageExecutionBinding()               {}
-func (TaskReviewBinding) stageExecutionBinding()               {}
-func (GenerateTaskFilesBinding) stageExecutionBinding()        {}
-func (InstructionGenBinding) stageExecutionBinding()           {}
-func (TaskTOMLGenBinding) stageExecutionBinding()              {}
-func (DockerfileGenBinding) stageExecutionBinding()            {}
-func (ContentReviewBinding) stageExecutionBinding()            {}
-func (SolveGenBinding) stageExecutionBinding()                 {}
-func (TestGenBinding) stageExecutionBinding()                  {}
-func (TestsAnalysisBinding) stageExecutionBinding()            {}
-func (SolutionReviewBinding) stageExecutionBinding()           {}
-func (MaterializeTaskBinding) stageExecutionBinding()          {}
-func (TaskRepairBinding) stageExecutionBinding()               {}
-func (RuntimeSelfCheckBinding) stageExecutionBinding()         {}
-func (HarborVerifyBinding) stageExecutionBinding()             {}
-func (DockerBuildBinding) stageExecutionBinding()              {}
-func (InitialVerifyBinding) stageExecutionBinding()            {}
-func (OracleVerifyBinding) stageExecutionBinding()             {}
-func (CodeEdgeLintBinding) stageExecutionBinding()             {}
-func (QualityCheckBinding) stageExecutionBinding()             {}
-func (SimilarityCheckBinding) stageExecutionBinding()          {}
-func (FinalReviewBinding) stageExecutionBinding()              {}
-func (HarborRunQwenBinding) stageExecutionBinding()            {}
-func (HarborRunOpusBinding) stageExecutionBinding()            {}
-func (EvaluatorEvidenceHandoffBinding) stageExecutionBinding() {}
-func (ResultReviewBinding) stageExecutionBinding()             {}
-func (SubmissionLintBinding) stageExecutionBinding()           {}
-func (PackageBinding) stageExecutionBinding()                  {}
+func (UniversalStageBinding) stageExecutionBinding() {}
 
 // RunExecutionSpec is the V2-only typed execution selection, reference set,
 // and complete per-stage binding union. It is intentionally independent from
@@ -951,271 +893,68 @@ func parseStageExecutionBinding(raw json.RawMessage) (StageExecutionBinding, err
 		}
 		return dereferenceStageBinding(destination), nil
 	}
-	switch discriminator.Type {
-	case StageBindingRepoPrepare:
-		return decode(&RepoPrepareBinding{})
-	case StageBindingRepoAnalyze:
-		return decode(&RepoAnalyzeBinding{})
-	case StageBindingTaskDesign:
-		return decode(&TaskDesignBinding{})
-	case StageBindingTaskReview:
-		return decode(&TaskReviewBinding{})
-	case StageBindingGenerateTaskFiles:
-		return decode(&GenerateTaskFilesBinding{})
-	case StageBindingInstructionGen:
-		return decode(&InstructionGenBinding{})
-	case StageBindingTaskTOMLGen:
-		return decode(&TaskTOMLGenBinding{})
-	case StageBindingDockerfileGen:
-		return decode(&DockerfileGenBinding{})
-	case StageBindingContentReview:
-		return decode(&ContentReviewBinding{})
-	case StageBindingSolveGen:
-		return decode(&SolveGenBinding{})
-	case StageBindingTestGen:
-		return decode(&TestGenBinding{})
-	case StageBindingTestsAnalysis:
-		return decode(&TestsAnalysisBinding{})
-	case StageBindingSolutionReview:
-		return decode(&SolutionReviewBinding{})
-	case StageBindingMaterializeTask:
-		return decode(&MaterializeTaskBinding{})
-	case StageBindingTaskRepair:
-		return decode(&TaskRepairBinding{})
-	case StageBindingRuntimeSelfCheck:
-		return decode(&RuntimeSelfCheckBinding{})
-	case StageBindingHarborVerify:
-		return decode(&HarborVerifyBinding{})
-	case StageBindingDockerBuild:
-		return decode(&DockerBuildBinding{})
-	case StageBindingInitialVerify:
-		return decode(&InitialVerifyBinding{})
-	case StageBindingOracleVerify:
-		return decode(&OracleVerifyBinding{})
-	case StageBindingCodeEdgeLint:
-		return decode(&CodeEdgeLintBinding{})
-	case StageBindingQualityCheck:
-		return decode(&QualityCheckBinding{})
-	case StageBindingSimilarityCheck:
-		return decode(&SimilarityCheckBinding{})
-	case StageBindingFinalReview:
-		return decode(&FinalReviewBinding{})
-	case StageBindingHarborRunQwen:
-		return decode(&HarborRunQwenBinding{})
-	case StageBindingHarborRunOpus:
-		return decode(&HarborRunOpusBinding{})
-	case StageBindingEvaluatorEvidenceHandoff:
-		return decode(&EvaluatorEvidenceHandoffBinding{})
-	case StageBindingResultReview:
-		return decode(&ResultReviewBinding{})
-	case StageBindingSubmissionLint:
-		return decode(&SubmissionLintBinding{})
-	case StageBindingPackage:
-		return decode(&PackageBinding{})
-	default:
+	if !isKnownStageBindingType(discriminator.Type) {
 		return nil, fmt.Errorf("%w: unsupported stage binding type %q", errInvalidExecutionSpec, discriminator.Type)
 	}
+	return decode(&UniversalStageBinding{})
 }
 
 func dereferenceStageBinding(binding StageExecutionBinding) StageExecutionBinding {
-	switch typed := binding.(type) {
-	case *RepoPrepareBinding:
+	if typed, ok := binding.(*UniversalStageBinding); ok {
 		return *typed
-	case *RepoAnalyzeBinding:
-		return *typed
-	case *TaskDesignBinding:
-		return *typed
-	case *TaskReviewBinding:
-		return *typed
-	case *GenerateTaskFilesBinding:
-		return *typed
-	case *InstructionGenBinding:
-		return *typed
-	case *TaskTOMLGenBinding:
-		return *typed
-	case *DockerfileGenBinding:
-		return *typed
-	case *ContentReviewBinding:
-		return *typed
-	case *SolveGenBinding:
-		return *typed
-	case *TestGenBinding:
-		return *typed
-	case *TestsAnalysisBinding:
-		return *typed
-	case *SolutionReviewBinding:
-		return *typed
-	case *MaterializeTaskBinding:
-		return *typed
-	case *TaskRepairBinding:
-		return *typed
-	case *RuntimeSelfCheckBinding:
-		return *typed
-	case *HarborVerifyBinding:
-		return *typed
-	case *DockerBuildBinding:
-		return *typed
-	case *InitialVerifyBinding:
-		return *typed
-	case *OracleVerifyBinding:
-		return *typed
-	case *CodeEdgeLintBinding:
-		return *typed
-	case *QualityCheckBinding:
-		return *typed
-	case *SimilarityCheckBinding:
-		return *typed
-	case *FinalReviewBinding:
-		return *typed
-	case *HarborRunQwenBinding:
-		return *typed
-	case *HarborRunOpusBinding:
-		return *typed
-	case *EvaluatorEvidenceHandoffBinding:
-		return *typed
-	case *ResultReviewBinding:
-		return *typed
-	case *SubmissionLintBinding:
-		return *typed
-	case *PackageBinding:
-		return *typed
-	default:
-		return binding
 	}
+	return binding
+}
+
+var knownStageBindingTypes = map[StageBindingType]bool{
+	StageBindingRepoPrepare:              true,
+	StageBindingRepoAnalyze:              true,
+	StageBindingTaskDesign:               true,
+	StageBindingTaskReview:               true,
+	StageBindingGenerateTaskFiles:        true,
+	StageBindingInstructionGen:           true,
+	StageBindingTaskTOMLGen:              true,
+	StageBindingDockerfileGen:            true,
+	StageBindingContentReview:            true,
+	StageBindingSolveGen:                 true,
+	StageBindingTestGen:                  true,
+	StageBindingTestsAnalysis:            true,
+	StageBindingSolutionReview:           true,
+	StageBindingMaterializeTask:          true,
+	StageBindingTaskRepair:               true,
+	StageBindingRuntimeSelfCheck:         true,
+	StageBindingHarborVerify:             true,
+	StageBindingDockerBuild:              true,
+	StageBindingInitialVerify:            true,
+	StageBindingOracleVerify:             true,
+	StageBindingCodeEdgeLint:             true,
+	StageBindingQualityCheck:             true,
+	StageBindingSimilarityCheck:          true,
+	StageBindingFinalReview:              true,
+	StageBindingHarborRunQwen:            true,
+	StageBindingHarborRunOpus:            true,
+	StageBindingEvaluatorEvidenceHandoff: true,
+	StageBindingResultReview:             true,
+	StageBindingSubmissionLint:           true,
+	StageBindingPackage:                  true,
+}
+
+func isKnownStageBindingType(typ StageBindingType) bool {
+	return knownStageBindingTypes[typ]
 }
 
 func stageBindingBaseOf(binding StageExecutionBinding) (StageBindingBase, bool) {
-	switch typed := binding.(type) {
-	case RepoPrepareBinding:
+	if typed, ok := binding.(UniversalStageBinding); ok {
 		return typed.StageBindingBase, true
-	case RepoAnalyzeBinding:
-		return typed.StageBindingBase, true
-	case TaskDesignBinding:
-		return typed.StageBindingBase, true
-	case TaskReviewBinding:
-		return typed.StageBindingBase, true
-	case GenerateTaskFilesBinding:
-		return typed.StageBindingBase, true
-	case InstructionGenBinding:
-		return typed.StageBindingBase, true
-	case TaskTOMLGenBinding:
-		return typed.StageBindingBase, true
-	case DockerfileGenBinding:
-		return typed.StageBindingBase, true
-	case ContentReviewBinding:
-		return typed.StageBindingBase, true
-	case SolveGenBinding:
-		return typed.StageBindingBase, true
-	case TestGenBinding:
-		return typed.StageBindingBase, true
-	case TestsAnalysisBinding:
-		return typed.StageBindingBase, true
-	case SolutionReviewBinding:
-		return typed.StageBindingBase, true
-	case MaterializeTaskBinding:
-		return typed.StageBindingBase, true
-	case TaskRepairBinding:
-		return typed.StageBindingBase, true
-	case RuntimeSelfCheckBinding:
-		return typed.StageBindingBase, true
-	case HarborVerifyBinding:
-		return typed.StageBindingBase, true
-	case DockerBuildBinding:
-		return typed.StageBindingBase, true
-	case InitialVerifyBinding:
-		return typed.StageBindingBase, true
-	case OracleVerifyBinding:
-		return typed.StageBindingBase, true
-	case CodeEdgeLintBinding:
-		return typed.StageBindingBase, true
-	case QualityCheckBinding:
-		return typed.StageBindingBase, true
-	case SimilarityCheckBinding:
-		return typed.StageBindingBase, true
-	case FinalReviewBinding:
-		return typed.StageBindingBase, true
-	case HarborRunQwenBinding:
-		return typed.StageBindingBase, true
-	case HarborRunOpusBinding:
-		return typed.StageBindingBase, true
-	case EvaluatorEvidenceHandoffBinding:
-		return typed.StageBindingBase, true
-	case ResultReviewBinding:
-		return typed.StageBindingBase, true
-	case SubmissionLintBinding:
-		return typed.StageBindingBase, true
-	case PackageBinding:
-		return typed.StageBindingBase, true
-	default:
-		return StageBindingBase{}, false
 	}
+	return StageBindingBase{}, false
 }
 
 func stageBindingIdentity(binding StageExecutionBinding) (workflowkit.StageKey, StageBindingType, bool) {
-	switch binding.(type) {
-	case RepoPrepareBinding:
-		return "repo_prepare", StageBindingRepoPrepare, true
-	case RepoAnalyzeBinding:
-		return "repo_analyze", StageBindingRepoAnalyze, true
-	case TaskDesignBinding:
-		return "task_design", StageBindingTaskDesign, true
-	case TaskReviewBinding:
-		return "task_review", StageBindingTaskReview, true
-	case GenerateTaskFilesBinding:
-		return "generate_task_files", StageBindingGenerateTaskFiles, true
-	case InstructionGenBinding:
-		return "instruction_generate", StageBindingInstructionGen, true
-	case TaskTOMLGenBinding:
-		return "task_toml_generate", StageBindingTaskTOMLGen, true
-	case DockerfileGenBinding:
-		return "dockerfile_generate", StageBindingDockerfileGen, true
-	case ContentReviewBinding:
-		return "content_review", StageBindingContentReview, true
-	case SolveGenBinding:
-		return "solve_generate", StageBindingSolveGen, true
-	case TestGenBinding:
-		return "test_generate", StageBindingTestGen, true
-	case TestsAnalysisBinding:
-		return "tests_analysis", StageBindingTestsAnalysis, true
-	case SolutionReviewBinding:
-		return "solution_review", StageBindingSolutionReview, true
-	case MaterializeTaskBinding:
-		return "materialize_task", StageBindingMaterializeTask, true
-	case TaskRepairBinding:
-		return "task_repair", StageBindingTaskRepair, true
-	case RuntimeSelfCheckBinding:
-		return "runtime_self_check", StageBindingRuntimeSelfCheck, true
-	case HarborVerifyBinding:
-		return "harbor_verify", StageBindingHarborVerify, true
-	case DockerBuildBinding:
-		return "docker_build", StageBindingDockerBuild, true
-	case InitialVerifyBinding:
-		return "initial_verify", StageBindingInitialVerify, true
-	case OracleVerifyBinding:
-		return "oracle_verify", StageBindingOracleVerify, true
-	case CodeEdgeLintBinding:
-		return "codeedge_lint", StageBindingCodeEdgeLint, true
-	case QualityCheckBinding:
-		return "quality_check", StageBindingQualityCheck, true
-	case SimilarityCheckBinding:
-		return "similarity_check", StageBindingSimilarityCheck, true
-	case FinalReviewBinding:
-		return "final_review", StageBindingFinalReview, true
-	case HarborRunQwenBinding:
-		return "harbor_run_qwen", StageBindingHarborRunQwen, true
-	case HarborRunOpusBinding:
-		return "harbor_run_opus", StageBindingHarborRunOpus, true
-	case EvaluatorEvidenceHandoffBinding:
-		return "evaluator_evidence_handoff", StageBindingEvaluatorEvidenceHandoff, true
-	case ResultReviewBinding:
-		return "result_review", StageBindingResultReview, true
-	case SubmissionLintBinding:
-		return "submission_lint", StageBindingSubmissionLint, true
-	case PackageBinding:
-		return "package", StageBindingPackage, true
-	default:
-		return "", "", false
+	if typed, ok := binding.(UniversalStageBinding); ok {
+		return typed.StageKey, typed.Type, true
 	}
+	return "", "", false
 }
 
 func cloneStageExecutionBinding(binding StageExecutionBinding) StageExecutionBinding {
@@ -1223,71 +962,7 @@ func cloneStageExecutionBinding(binding StageExecutionBinding) StageExecutionBin
 	if !ok {
 		return binding
 	}
-	base = base.Clone()
-	switch binding.(type) {
-	case RepoPrepareBinding:
-		return RepoPrepareBinding{StageBindingBase: base}
-	case RepoAnalyzeBinding:
-		return RepoAnalyzeBinding{StageBindingBase: base}
-	case TaskDesignBinding:
-		return TaskDesignBinding{StageBindingBase: base}
-	case TaskReviewBinding:
-		return TaskReviewBinding{StageBindingBase: base}
-	case GenerateTaskFilesBinding:
-		return GenerateTaskFilesBinding{StageBindingBase: base}
-	case InstructionGenBinding:
-		return InstructionGenBinding{StageBindingBase: base}
-	case TaskTOMLGenBinding:
-		return TaskTOMLGenBinding{StageBindingBase: base}
-	case DockerfileGenBinding:
-		return DockerfileGenBinding{StageBindingBase: base}
-	case ContentReviewBinding:
-		return ContentReviewBinding{StageBindingBase: base}
-	case SolveGenBinding:
-		return SolveGenBinding{StageBindingBase: base}
-	case TestGenBinding:
-		return TestGenBinding{StageBindingBase: base}
-	case TestsAnalysisBinding:
-		return TestsAnalysisBinding{StageBindingBase: base}
-	case SolutionReviewBinding:
-		return SolutionReviewBinding{StageBindingBase: base}
-	case MaterializeTaskBinding:
-		return MaterializeTaskBinding{StageBindingBase: base}
-	case TaskRepairBinding:
-		return TaskRepairBinding{StageBindingBase: base}
-	case RuntimeSelfCheckBinding:
-		return RuntimeSelfCheckBinding{StageBindingBase: base}
-	case HarborVerifyBinding:
-		return HarborVerifyBinding{StageBindingBase: base}
-	case DockerBuildBinding:
-		return DockerBuildBinding{StageBindingBase: base}
-	case InitialVerifyBinding:
-		return InitialVerifyBinding{StageBindingBase: base}
-	case OracleVerifyBinding:
-		return OracleVerifyBinding{StageBindingBase: base}
-	case CodeEdgeLintBinding:
-		return CodeEdgeLintBinding{StageBindingBase: base}
-	case QualityCheckBinding:
-		return QualityCheckBinding{StageBindingBase: base}
-	case SimilarityCheckBinding:
-		return SimilarityCheckBinding{StageBindingBase: base}
-	case FinalReviewBinding:
-		return FinalReviewBinding{StageBindingBase: base}
-	case HarborRunQwenBinding:
-		return HarborRunQwenBinding{StageBindingBase: base}
-	case HarborRunOpusBinding:
-		return HarborRunOpusBinding{StageBindingBase: base}
-	case EvaluatorEvidenceHandoffBinding:
-		return EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
-	case ResultReviewBinding:
-		return ResultReviewBinding{StageBindingBase: base}
-	case SubmissionLintBinding:
-		return SubmissionLintBinding{StageBindingBase: base}
-	case PackageBinding:
-		return PackageBinding{StageBindingBase: base}
-	default:
-		return binding
-	}
+	return UniversalStageBinding{StageBindingBase: base.Clone()}
 }
 
 type executionReferenceIndex struct {
@@ -1506,70 +1181,10 @@ func (spec *RunExecutionSpec) normalize() {
 }
 
 func replaceStageBindingBase(binding StageExecutionBinding, base StageBindingBase) StageExecutionBinding {
-	switch binding.(type) {
-	case RepoPrepareBinding:
-		return RepoPrepareBinding{StageBindingBase: base}
-	case RepoAnalyzeBinding:
-		return RepoAnalyzeBinding{StageBindingBase: base}
-	case TaskDesignBinding:
-		return TaskDesignBinding{StageBindingBase: base}
-	case TaskReviewBinding:
-		return TaskReviewBinding{StageBindingBase: base}
-	case GenerateTaskFilesBinding:
-		return GenerateTaskFilesBinding{StageBindingBase: base}
-	case InstructionGenBinding:
-		return InstructionGenBinding{StageBindingBase: base}
-	case TaskTOMLGenBinding:
-		return TaskTOMLGenBinding{StageBindingBase: base}
-	case DockerfileGenBinding:
-		return DockerfileGenBinding{StageBindingBase: base}
-	case ContentReviewBinding:
-		return ContentReviewBinding{StageBindingBase: base}
-	case SolveGenBinding:
-		return SolveGenBinding{StageBindingBase: base}
-	case TestGenBinding:
-		return TestGenBinding{StageBindingBase: base}
-	case TestsAnalysisBinding:
-		return TestsAnalysisBinding{StageBindingBase: base}
-	case SolutionReviewBinding:
-		return SolutionReviewBinding{StageBindingBase: base}
-	case MaterializeTaskBinding:
-		return MaterializeTaskBinding{StageBindingBase: base}
-	case TaskRepairBinding:
-		return TaskRepairBinding{StageBindingBase: base}
-	case RuntimeSelfCheckBinding:
-		return RuntimeSelfCheckBinding{StageBindingBase: base}
-	case HarborVerifyBinding:
-		return HarborVerifyBinding{StageBindingBase: base}
-	case DockerBuildBinding:
-		return DockerBuildBinding{StageBindingBase: base}
-	case InitialVerifyBinding:
-		return InitialVerifyBinding{StageBindingBase: base}
-	case OracleVerifyBinding:
-		return OracleVerifyBinding{StageBindingBase: base}
-	case CodeEdgeLintBinding:
-		return CodeEdgeLintBinding{StageBindingBase: base}
-	case QualityCheckBinding:
-		return QualityCheckBinding{StageBindingBase: base}
-	case SimilarityCheckBinding:
-		return SimilarityCheckBinding{StageBindingBase: base}
-	case FinalReviewBinding:
-		return FinalReviewBinding{StageBindingBase: base}
-	case HarborRunQwenBinding:
-		return HarborRunQwenBinding{StageBindingBase: base}
-	case HarborRunOpusBinding:
-		return HarborRunOpusBinding{StageBindingBase: base}
-	case EvaluatorEvidenceHandoffBinding:
-		return EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
-	case ResultReviewBinding:
-		return ResultReviewBinding{StageBindingBase: base}
-	case SubmissionLintBinding:
-		return SubmissionLintBinding{StageBindingBase: base}
-	case PackageBinding:
-		return PackageBinding{StageBindingBase: base}
-	default:
-		return binding
+	if _, ok := binding.(UniversalStageBinding); ok {
+		return UniversalStageBinding{StageBindingBase: base}
 	}
+	return binding
 }
 
 func decodeExecutionSpecJSON(raw []byte, destination any) error {

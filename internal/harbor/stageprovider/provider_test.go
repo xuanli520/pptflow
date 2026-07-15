@@ -169,7 +169,7 @@ func TestPublicWorkflowkitAdapterReadsFrozenOpaqueExecutionSpec(t *testing.T) {
 
 	drifted := specification.Clone()
 	for index, binding := range drifted.Stages {
-		typed, ok := binding.(workflowadapter.RepoPrepareBinding)
+		typed, ok := binding.(workflowadapter.UniversalStageBinding)
 		if !ok {
 			continue
 		}

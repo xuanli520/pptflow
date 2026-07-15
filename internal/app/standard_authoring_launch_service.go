@@ -1435,33 +1435,33 @@ func standardAuthoringCatalogStageBinding(registration stageprovider.DeploymentO
 	}
 	switch base.Type {
 	case workflowadapter.StageBindingRepoPrepare:
-		return workflowadapter.RepoPrepareBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingRepoAnalyze:
-		return workflowadapter.RepoAnalyzeBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTaskDesign:
-		return workflowadapter.TaskDesignBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTaskReview:
-		return workflowadapter.TaskReviewBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingGenerateTaskFiles:
-		return workflowadapter.GenerateTaskFilesBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingInstructionGen:
-		return workflowadapter.InstructionGenBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTaskTOMLGen:
-		return workflowadapter.TaskTOMLGenBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingDockerfileGen:
-		return workflowadapter.DockerfileGenBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingContentReview:
-		return workflowadapter.ContentReviewBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingSolveGen:
-		return workflowadapter.SolveGenBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTestGen:
-		return workflowadapter.TestGenBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTestsAnalysis:
-		return workflowadapter.TestsAnalysisBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingSolutionReview:
-		return workflowadapter.SolutionReviewBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingMaterializeTask:
-		return workflowadapter.MaterializeTaskBinding{StageBindingBase: base}, nil
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	default:
 		return nil, fmt.Errorf("Standard authoring catalog has unsupported stage binding type %q", base.Type)
 	}

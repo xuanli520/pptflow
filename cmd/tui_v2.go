@@ -10,20 +10,18 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newLifecycleTUICommand opens only the V2 service-backed Task Hub. The old
-// workspace-runner TUI is deliberately not registered after the hard cutover:
-// task identity, lifecycle mutations, and plans must come from the control
-// plane rather than an arbitrary workspace path.
+// newLifecycleTUICommand opens the new task-board TUI backed by lifecycle services.
 func newLifecycleTUICommand(config *lifecycleCLIConfig) *cobra.Command {
-	return newLifecycleTUICommandWithRunner(config, tui.RunWithLifecycle)
+	return newLifecycleTUICommandWithRunner(config, tui.RunNewTUIAdapter)
 }
 
-type lifecycleTUIRunner func(context.Context, tui.TaskHubLifecycleService) error
+// lifecycleTUIRunner exposes the TUI session so tests can inject a different runner.
+type lifecycleTUIRunner func(context.Context, *app.LifecycleServices) error
 
 func newLifecycleTUICommandWithRunner(config *lifecycleCLIConfig, runner lifecycleTUIRunner) *cobra.Command {
 	return &cobra.Command{
 		Use:   "tui",
-		Short: "Open the V2 Task Hub",
+		Short: "Open the Harbor Task Factory TUI",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if config == nil {
@@ -48,15 +46,7 @@ func newLifecycleTUICommandWithRunner(config *lifecycleCLIConfig, runner lifecyc
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			return runner(ctx, newLifecycleTUIAdapter(services))
+			return runner(ctx, services)
 		},
 	}
-}
-
-// newLifecycleTUIAdapter keeps TUI composition explicit: the Task Hub can
-// offer per-Run exit handoff only when its application adapter is supplied a
-// controlled child-worker launcher. The launcher shares the `run detach`
-// process boundary and never lets the TUI mutate worker state directly.
-func newLifecycleTUIAdapter(services *app.LifecycleServices) *tui.AppTaskHubLifecycleAdapter {
-	return tui.NewAppTaskHubLifecycleAdapterWithRunWorkerHandoffLauncher(services, executableRunWorkerLauncher{})
 }
