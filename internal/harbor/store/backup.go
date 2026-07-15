@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -450,8 +449,11 @@ func verifyConsolidatedV2SQLiteFile(path string) error {
 }
 
 func openImmutableSQLiteFile(path string) (*sql.DB, error) {
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
-	db, err := sql.Open("sqlite", u.String()+"?mode=ro&immutable=1&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	dsn, err := sqliteFileURI(path)
+	if err != nil {
+		return nil, fmt.Errorf("construct immutable SQLite URI: %w", err)
+	}
+	db, err := sql.Open("sqlite", dsn+"?mode=ro&immutable=1&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}

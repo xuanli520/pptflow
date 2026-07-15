@@ -103,7 +103,11 @@ func Open(rootDir string) (*Store, error) {
 // This is not a production fallback: normal CLI, TUI, worker, and service
 // composition continue to call Open and therefore retain verified backups.
 func OpenForTest(rootDir string) (*Store, error) {
-	rootDir = normalizeStoreRoot(rootDir)
+	var err error
+	rootDir, err = normalizeStoreRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(rootDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create test store directory: %w", err)
 	}
@@ -197,7 +201,11 @@ func consolidatedV2TestBaselineBytes() ([]byte, error) {
 }
 
 func openWritable(rootDir string, backupTestMode bool) (*Store, error) {
-	rootDir = normalizeStoreRoot(rootDir)
+	var err error
+	rootDir, err = normalizeStoreRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(rootDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create store directory: %w", err)
 	}
@@ -309,7 +317,11 @@ func preflightWritableStoreAdmission(dbPath string) error {
 // side effect.
 // A database that needs migration must be opened through Open first.
 func OpenReadOnly(rootDir string) (*Store, error) {
-	rootDir = normalizeStoreRoot(rootDir)
+	var err error
+	rootDir, err = normalizeStoreRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
 	dbPath := filepath.Join(rootDir, dbFileName)
 	info, err := os.Stat(dbPath)
 	if err != nil {
@@ -322,8 +334,11 @@ func OpenReadOnly(rootDir string) (*Store, error) {
 		return nil, fmt.Errorf("open read-only store: database is not a regular file: %s", dbPath)
 	}
 
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}
-	dsn := u.String() + "?mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	dsn, err := sqliteFileURI(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("construct read-only SQLite URI: %w", err)
+	}
+	dsn += "?mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open read-only store: %w", err)
@@ -366,7 +381,11 @@ func (s *Store) requireWritable() error {
 }
 
 func openAndMigrate(rootDir, dbPath string) (*Store, error) {
-	dsn := "file:" + filepath.ToSlash(dbPath) + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	dsn, err := sqliteFileURI(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("construct store SQLite URI: %w", err)
+	}
+	dsn += "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
@@ -698,12 +717,35 @@ func (s *Store) bootstrapV2() error {
 	return tx.Commit()
 }
 
-func normalizeStoreRoot(rootDir string) string {
+func normalizeStoreRoot(rootDir string) (string, error) {
 	rootDir = strings.TrimSpace(rootDir)
 	if rootDir == "" {
-		return ".harbor-factory"
+		rootDir = ".harbor-factory"
 	}
-	return rootDir
+	return absoluteCleanPath(rootDir)
+}
+
+// sqliteFileURI produces an absolute file URI. modernc SQLite treats a
+// relative path in a file: URI as a URI authority on some code paths, so all
+// connection modes must normalize it before SQLite sees it.
+func sqliteFileURI(path string) (string, error) {
+	absolutePath, err := absoluteCleanPath(path)
+	if err != nil {
+		return "", err
+	}
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(absolutePath)}
+	return u.String(), nil
+}
+
+func absoluteCleanPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute path %q: %w", path, err)
+	}
+	return filepath.Clean(absolutePath), nil
 }
 
 func sanitizeText(s string) string {

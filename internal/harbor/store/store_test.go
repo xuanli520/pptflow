@@ -73,6 +73,69 @@ func TestOpenBootstrapsV2OnlySchema(t *testing.T) {
 	}
 }
 
+func TestOpenRelativeRootCreatesVerifiedBackupWithAbsoluteSQLitePaths(t *testing.T) {
+	originalWorkingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	workingDirectory := t.TempDir()
+	if err := os.Chdir(workingDirectory); err != nil {
+		t.Fatalf("change to temporary working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalWorkingDirectory); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+
+	s, err := Open(".harbor-factory")
+	if err != nil {
+		t.Fatalf("open relative control-plane root: %v", err)
+	}
+
+	wantRoot := filepath.Join(workingDirectory, ".harbor-factory")
+	if s.rootDir != wantRoot || !filepath.IsAbs(s.rootDir) {
+		t.Fatalf("store root = %q, want absolute %q", s.rootDir, wantRoot)
+	}
+	if s.dbPath != filepath.Join(wantRoot, dbFileName) || !filepath.IsAbs(s.dbPath) {
+		t.Fatalf("store database path = %q, want absolute path below %q", s.dbPath, wantRoot)
+	}
+	if s.backupDir != filepath.Join(wantRoot, "backups") || !filepath.IsAbs(s.backupDir) {
+		t.Fatalf("store backup directory = %q, want absolute path below %q", s.backupDir, wantRoot)
+	}
+
+	backups, err := s.ListVerifiedBackups()
+	if err != nil {
+		t.Fatalf("list initial verified backups: %v", err)
+	}
+	if len(backups) != 1 || !filepath.IsAbs(backups[0].Path) {
+		t.Fatalf("initial verified backups = %+v, want one with an absolute path", backups)
+	}
+	relativeBackupPath, err := filepath.Rel(workingDirectory, backups[0].Path)
+	if err != nil {
+		t.Fatalf("derive relative verified backup path: %v", err)
+	}
+	if err := verifyConsolidatedV2SQLiteFile(relativeBackupPath); err != nil {
+		t.Fatalf("verify relative SQLite path: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close relative control-plane root: %v", err)
+	}
+
+	readOnly, err := OpenReadOnly(".harbor-factory")
+	if err != nil {
+		t.Fatalf("open relative read-only control-plane root: %v", err)
+	}
+	defer func() {
+		if err := readOnly.Close(); err != nil {
+			t.Errorf("close relative read-only control-plane root: %v", err)
+		}
+	}()
+	if readOnly.rootDir != wantRoot || !filepath.IsAbs(readOnly.dbPath) {
+		t.Fatalf("read-only store paths = root:%q db:%q, want absolute paths below %q", readOnly.rootDir, readOnly.dbPath, wantRoot)
+	}
+}
+
 func TestOpenReadOnlyPreservesControlPlaneAndRejectsMutations(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
