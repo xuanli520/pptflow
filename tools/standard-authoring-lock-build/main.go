@@ -308,7 +308,7 @@ func discoverCodexLock(config buildConfig) (stageprovider.CodexAppServerOperatio
 	if launcherVersion == "" || strings.ContainsAny(launcherVersion, " \t\r\n") {
 		return stageprovider.CodexAppServerOperationLock{}, errors.New("locked Codex CLI version is invalid")
 	}
-	help, err := probe(config.codexLauncher, environment, "app-server", "--help")
+	help, err := probeMultiline(config.codexLauncher, environment, "app-server", "--help")
 	if err != nil || !strings.Contains(help, "--listen") || (!strings.Contains(help, "--config") && !strings.Contains(help, "-c,")) {
 		return stageprovider.CodexAppServerOperationLock{}, errors.New("locked Codex CLI lacks app-server capability")
 	}
@@ -500,6 +500,21 @@ func inspectNoSymlinkPath(path string) (os.FileInfo, error) {
 
 func probe(command string, environment []string, arguments ...string) (string, error) {
 	return probeAt(filepath.Dir(command), command, environment, arguments...)
+}
+
+// probeMultiline is restricted to static capability help. Version identities
+// remain single-line probes above; app-server help is intentionally multi-line
+// in current Codex releases and must not be mistaken for an invalid runtime.
+func probeMultiline(command string, environment []string, arguments ...string) (string, error) {
+	output, err := runAt(filepath.Dir(command), command, environment, arguments...)
+	if err != nil {
+		return "", err
+	}
+	value := string(output)
+	if value == "" || strings.Contains(value, "\x00") {
+		return "", errors.New("capability probe output is invalid")
+	}
+	return value, nil
 }
 
 func probeAt(directory, command string, environment []string, arguments ...string) (string, error) {

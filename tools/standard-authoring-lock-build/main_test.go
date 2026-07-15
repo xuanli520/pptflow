@@ -124,6 +124,20 @@ func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T
 	}
 }
 
+func TestProbeMultilineAcceptsBoundedCodexStyleHelp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex-help")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' '--listen <URL>' '-c, --config <key=value>'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	output, err := probeMultiline(path, nil, "app-server", "--help")
+	if err != nil {
+		t.Fatalf("probe multiline capability help: %v", err)
+	}
+	if !strings.Contains(output, "--listen") || !strings.Contains(output, "--config") {
+		t.Fatalf("capability help = %q", output)
+	}
+}
+
 func standardAuthoringGeneratorTestProfile(t *testing.T) workflowadapter.ExecutionProfile {
 	t.Helper()
 	template := workflowadapter.StandardAuthoringWorkflowTemplate()
