@@ -21,12 +21,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.refreshComponentSizes()
+		m.toast.Offset = 0
+		if m.toastCanScroll() {
+			return m, toastScrollCmd(m.toast.ID)
+		}
 		return m, nil
 	case toastExpiredMsg:
 		if msg.id == m.toast.ID {
 			m.toast.Message = ""
+			m.toast.Offset = 0
 		}
 		return m, nil
+	case toastScrollMsg:
+		if msg.id != m.toast.ID || !m.toastCanScroll() {
+			return m, nil
+		}
+		cycleLength := toastCycleLength(redactSingleLineUI(m.toast.Message))
+		if cycleLength < 1 {
+			return m, nil
+		}
+		m.toast.Offset = (m.toast.Offset + 1) % cycleLength
+		return m, toastScrollCmd(msg.id)
 	case tea.MouseMsg:
 		return m, m.handleMouse(msg)
 	case tea.FocusMsg:

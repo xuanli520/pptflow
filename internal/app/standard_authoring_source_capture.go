@@ -679,17 +679,19 @@ func standardAuthoringGitPAXGlobalHeader(header *tar.Header, commitSHA string) b
 	return ok && comment == commitSHA
 }
 
-// standardAuthoringGitArchiveEntryMetadata recognizes the only non-USTAR
-// metadata emitted by the supported Git archive path: a local PAX `path`
-// record. archive/tar applies that record before returning the entry, so the
-// value must exactly equal Header.Name. Callers must validate Header.Name
-// afterwards, because it is the final, filesystem-relevant path.
+// standardAuthoringGitArchiveEntryMetadata recognizes the metadata emitted by
+// the supported Git archive path. Most entries are USTAR; long paths use one
+// local PAX `path` record. Go's archive/tar reports a raw USTAR header with a
+// non-ASCII pathname as FormatUnknown even though it contains no extension
+// metadata. That representation is safe to accept only when every other
+// extension field is empty; callers still validate Header.Name afterwards,
+// because it is the final, filesystem-relevant path.
 func standardAuthoringGitArchiveEntryMetadata(header *tar.Header) bool {
 	if header == nil || header.Linkname != "" || len(header.Xattrs) != 0 {
 		return false
 	}
 	if len(header.PAXRecords) == 0 {
-		return header.Format == tar.FormatUSTAR
+		return header.Format == tar.FormatUSTAR || header.Format == tar.FormatUnknown
 	}
 	if header.Format != tar.FormatPAX || len(header.PAXRecords) != 1 {
 		return false

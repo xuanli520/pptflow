@@ -413,6 +413,54 @@ func TestValidateStandardAuthoringSourceArchiveAcceptsAndProjectsRealGitPAXLongP
 	}
 }
 
+func TestValidateStandardAuthoringSourceArchiveAcceptsAndProjectsRealGitUnicodePath(t *testing.T) {
+	repository := t.TempDir()
+	standardAuthoringTestGitRun(t, repository, "init")
+	unicodePath := "你好世界.txt"
+	content := []byte("unicode source\n")
+	if err := os.WriteFile(filepath.Join(repository, unicodePath), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringTestGitRun(t, repository, "add", unicodePath)
+	standardAuthoringTestGitRun(t, repository, "-c", "user.name=Harbor Factory Test", "-c", "user.email=harbor-factory@example.invalid", "commit", "-m", "unicode capture fixture")
+	commit := strings.TrimSpace(string(standardAuthoringTestGitRun(t, repository, "rev-parse", "HEAD")))
+	archive := standardAuthoringTestGitRun(t, repository, "archive", "--format=tar", "--prefix="+standardAuthoringSourceArchiveRoot, "HEAD")
+	coordinate := StandardAuthoringSourceCoordinate{RepositoryURL: "https://github.com/example/repository.git", CommitSHA: commit}
+
+	reader := tar.NewReader(bytes.NewReader(archive))
+	sawUnicodeEntry := false
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Name == standardAuthoringSourceArchiveRoot+unicodePath {
+			sawUnicodeEntry = true
+			if !standardAuthoringGitArchiveEntryMetadata(header) {
+				t.Fatalf("Unicode Git archive entry metadata = %+v, want an accepted safe Git representation", header)
+			}
+		}
+	}
+	if !sawUnicodeEntry {
+		t.Fatalf("Git archive did not retain Unicode path %q", unicodePath)
+	}
+	if err := validateStandardAuthoringSourceArchive(archive, coordinate); err != nil {
+		t.Fatalf("validate real Git Unicode archive: %v", err)
+	}
+
+	workspace := t.TempDir()
+	if err := extractStandardAuthoringSourceSnapshot(context.Background(), archive, workspace, coordinate); err != nil {
+		t.Fatalf("extract real Git Unicode archive: %v", err)
+	}
+	projected, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(standardAuthoringSourceArchiveRoot+unicodePath)))
+	if err != nil || !bytes.Equal(projected, content) {
+		t.Fatalf("projected Unicode Git archive path = %q, %v; want %q", projected, err, content)
+	}
+}
+
 func TestValidateStandardAuthoringSourceArchiveRejectsUnexpectedPAXMetadata(t *testing.T) {
 	coordinate := StandardAuthoringSourceCoordinate{
 		RepositoryURL: "https://github.com/example/repository.git", CommitSHA: strings.Repeat("a", 40),
