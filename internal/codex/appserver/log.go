@@ -35,15 +35,12 @@ func formatAppServerRPCLogLine(message appServerRPCMessage) string {
 			Delta  string `json:"delta"`
 		}
 		if json.Unmarshal(message.Params, &params) == nil {
-			starts, ends := staticReviewMarkerCounts(params.Delta)
 			return fmt.Sprintf(
-				"JSON-RPC notification item/agentMessage/delta turn=%s item=%s delta_bytes=%d delta_sha256=%s contract_starts=%d contract_ends=%d\n",
+				"JSON-RPC notification item/agentMessage/delta turn=%s item=%s delta_bytes=%d delta_sha256=%s\n",
 				compactAppServerLogID(params.TurnID),
 				compactAppServerLogID(params.ItemID),
 				len(params.Delta),
 				shortAppServerLogHash(params.Delta),
-				starts,
-				ends,
 			)
 		}
 	case "item/completed":
@@ -52,16 +49,13 @@ func formatAppServerRPCLogLine(message appServerRPCMessage) string {
 			Item   appServerItem `json:"item"`
 		}
 		if json.Unmarshal(message.Params, &params) == nil {
-			starts, ends := staticReviewMarkerCounts(params.Item.Text)
 			return fmt.Sprintf(
-				"JSON-RPC notification item/completed turn=%s item=%s type=%s text_bytes=%d text_sha256=%s contract_starts=%d contract_ends=%d\n",
+				"JSON-RPC notification item/completed turn=%s item=%s type=%s text_bytes=%d text_sha256=%s\n",
 				compactAppServerLogID(params.TurnID),
 				compactAppServerLogID(params.Item.ID),
 				truncateAppServerLogValue(params.Item.Type),
 				len(params.Item.Text),
 				shortAppServerLogHash(params.Item.Text),
-				starts,
-				ends,
 			)
 		}
 	case "turn/completed":
@@ -167,7 +161,7 @@ func prefixRunes(value string, limit int) string {
 	return value
 }
 
-func (s *appServerCodexReviewSession) appendLog(content string) {
+func (s *appServerSession) appendLog(content string) {
 	s.mu.Lock()
 	path := s.req.LogPath
 	s.mu.Unlock()
@@ -179,7 +173,7 @@ func (s *appServerCodexReviewSession) appendLog(content string) {
 	}
 }
 
-func (s *appServerCodexReviewSession) addWarning(warning Warning) {
+func (s *appServerSession) addWarning(warning Warning) {
 	if warning.OK() {
 		return
 	}
@@ -191,11 +185,6 @@ func (s *appServerCodexReviewSession) addWarning(warning Warning) {
 func commandString(name string, args []string) string {
 	return strings.Join(append([]string{name}, args...), " ")
 }
-
-const (
-	staticReviewJSONStart = "<!-- harbor-factory:agent-json:start -->"
-	staticReviewJSONEnd   = "<!-- harbor-factory:agent-json:end -->"
-)
 
 func newWarning(path, op string, required bool, err error) Warning {
 	if err == nil {
@@ -211,21 +200,24 @@ func newWarning(path, op string, required bool, err error) Warning {
 }
 
 func writeText(path, content string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return os.WriteFile(path, []byte(content), 0o600)
 }
 
 func appendText(path, content string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	if err := file.Chmod(0o600); err != nil {
+		return err
+	}
 	_, err = file.WriteString(content)
 	return err
 }
@@ -233,10 +225,6 @@ func appendText(path, content string) error {
 func sha256Text(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
-}
-
-func staticReviewMarkerCounts(value string) (int, int) {
-	return strings.Count(value, staticReviewJSONStart), strings.Count(value, staticReviewJSONEnd)
 }
 
 func truncateStringPrefix(value string, limit int) string {

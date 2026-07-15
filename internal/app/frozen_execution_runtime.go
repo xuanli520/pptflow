@@ -84,7 +84,8 @@ func NewFrozenExecutionRuntime(config FrozenExecutionRuntimeConfig) (*FrozenExec
 var _ DurableJobHandler = (*FrozenExecutionRuntime)(nil)
 var _ DurableJobRecoveryHandler = (*FrozenExecutionRuntime)(nil)
 
-// HandleDurableJob dispatches only the three immutable V2 execution payloads.
+// HandleDurableJob dispatches immutable V2 execution payloads and the narrow,
+// read-only CodeEdge evaluator reconciliation handoff.
 // Domain failures are projected into the run/stage state machine and return a
 // successful worker delivery so unrelated queued jobs continue. Payload or
 // storage integrity failures return JobFailed after conservatively marking the
@@ -104,6 +105,8 @@ func (runtime *FrozenExecutionRuntime) HandleDurableJob(ctx context.Context, exe
 		return runtime.handleContinuation(ctx, execution, job)
 	case "stage_attempt.execute":
 		return runtime.handleStageAttempt(ctx, execution, job)
+	case codeEdgeEvaluatorReconciliationCommandType:
+		return runtime.handleCodeEdgeEvaluatorReconciliation(ctx, execution, job)
 	case repairSessionAdvanceCommandType:
 		return runtime.handleRepairSessionAdvance(ctx, job)
 	case store.ReviewGateResolutionCommandType:
@@ -137,6 +140,10 @@ func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context
 		switch job.CommandType {
 		case "stage_attempt.execute":
 			if err := runtime.reconcileRecoveredStageJob(ctx, job); err != nil {
+				return err
+			}
+		case codeEdgeEvaluatorReconciliationCommandType:
+			if err := runtime.reconcileRecoveredCodeEdgeEvaluatorReconciliation(ctx, job); err != nil {
 				return err
 			}
 		case "workflow_run.execute":
@@ -197,10 +204,19 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 		return projected
 	}
 	if isCodeEdgeEvaluatorStage(run, stage) {
-		handled, reconcileErr := runtime.reconcileRecoveredCodeEdgeEvaluatorStage(ctx, job, run, *attempt, stage)
+		handled, reconcileErr := runtime.reconcileRecoveredCodeEdgeEvaluatorStage(ctx, job, run, frozen, payload, *attempt, stage)
 		if reconcileErr != nil {
 			return reconcileErr
 		}
+		currentRun, currentRunErr := runtime.core.store.GetWorkflowRun(ctx, run.ID)
+		if currentRunErr != nil {
+			return currentRunErr
+		}
+		if currentRun == nil {
+			_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered CodeEdge evaluator Run disappeared", ErrLifecycleNotFound))
+			return projected
+		}
+		run = *currentRun
 		if handled {
 			return nil
 		}
@@ -337,12 +353,41 @@ type runtimeExecutionPlan struct {
 	Workflow                workflowkit.WorkflowDescriptor
 	Transitions             map[workflowkit.StageKey]workflowkit.NodeTransition
 	Schedule                []workflowkit.ScheduleBatch
-	QuotaPolicy             workflowadapter.ResolvedQuotaPolicy
+	// InitialExecutionPlan is present only for a newly-started Run. A
+	// continuation freezes a subset schedule in Schedule instead, because its
+	// preserved/invalidated nodes must not be admitted as worker jobs.
+	InitialExecutionPlan *workflowkit.ExecutionPlan
+	QuotaPolicy          workflowadapter.ResolvedQuotaPolicy
 }
 
 func (plan runtimeExecutionPlan) stageTransition(key workflowkit.StageKey) (workflowkit.NodeTransition, bool) {
 	transition, found := plan.Transitions[key]
 	return transition.Clone(), found
+}
+
+// frozenCoordinatorSchedule exposes the exact initial or continuation
+// schedule to the public kernel claim.  The app keeps only Harbor-specific
+// identifiers and quota projection in runtimeExecutionPlan; generic topology
+// is no longer hidden from workflowkit during continuation execution.
+func (plan runtimeExecutionPlan) frozenCoordinatorSchedule() (workflowkit.FrozenCoordinatorSchedule, error) {
+	if err := plan.Workflow.Validate(); err != nil {
+		return workflowkit.FrozenCoordinatorSchedule{}, fmt.Errorf("validate frozen coordinator workflow: %w", err)
+	}
+	if plan.InitialExecutionPlan != nil {
+		if err := plan.InitialExecutionPlan.Validate(plan.Workflow); err != nil {
+			return workflowkit.FrozenCoordinatorSchedule{}, fmt.Errorf("validate frozen initial coordinator plan: %w", err)
+		}
+		return workflowkit.FreezeCoordinatorSchedule(plan.Workflow, plan.ExecutionKey, workflowkit.CoordinatorScheduleExecutionPlan, plan.InitialExecutionPlan.Clone(), nil, nil)
+	}
+	transitions := make([]workflowkit.NodeTransition, 0, len(plan.Workflow.Stages))
+	for _, key := range mustTopologicalStageKeys(plan.Workflow) {
+		transition, found := plan.stageTransition(key)
+		if !found {
+			return workflowkit.FrozenCoordinatorSchedule{}, fmt.Errorf("%w: continuation coordinator schedule omits transition for stage %q", ErrFrozenExecutionPayload, key)
+		}
+		transitions = append(transitions, transition)
+	}
+	return workflowkit.FreezeCoordinatorSchedule(plan.Workflow, plan.ExecutionKey, workflowkit.CoordinatorScheduleTransitionSubset, workflowkit.ExecutionPlan{}, append([]workflowkit.ScheduleBatch(nil), plan.Schedule...), transitions)
 }
 
 func validateWorkflowRunExecutionPayload(payload workflowRunExecutionPayload, job store.DurableJob) error {
@@ -380,10 +425,11 @@ func (runtime *FrozenExecutionRuntime) handleWorkflowRun(ctx context.Context, ex
 	if err := runtime.ensureRunAttempt(ctx, run.ID, plan.ExecutionKey, job.CreatedBy, "begin workflow run attempt"); err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
-	if err := runtime.scheduleNextBatch(ctx, job, run, frozen, plan); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+	state, coordinatorErr := runtime.executeWorkflowkitCoordinator(ctx, execution, job, run, frozen, plan)
+	if coordinatorErr != nil {
+		return runtime.failMalformedJob(ctx, job, coordinatorErr)
 	}
-	return store.JobSucceeded, nil
+	return state, nil
 }
 
 func (runtime *FrozenExecutionRuntime) handleContinuation(ctx context.Context, execution DurableJobExecution, job store.DurableJob) (store.JobState, error) {
@@ -435,10 +481,11 @@ func (runtime *FrozenExecutionRuntime) handleContinuation(ctx context.Context, e
 	if err := runtime.ensureRunAttempt(ctx, run.ID, runtimePlan.ExecutionKey, job.CreatedBy, "begin continuation attempt"); err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
-	if err := runtime.scheduleNextBatch(ctx, job, run, frozen, runtimePlan); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+	state, coordinatorErr := runtime.executeWorkflowkitCoordinator(ctx, execution, job, run, frozen, runtimePlan)
+	if coordinatorErr != nil {
+		return runtime.failMalformedJob(ctx, job, coordinatorErr)
 	}
-	return store.JobSucceeded, nil
+	return state, nil
 }
 
 func (runtime *FrozenExecutionRuntime) handleRepairSessionAdvance(ctx context.Context, job store.DurableJob) (store.JobState, error) {
@@ -507,6 +554,8 @@ func initialRuntimeExecutionPlan(frozen frozenRunDefinition) (runtimeExecutionPl
 		Schedule:     append([]workflowkit.ScheduleBatch(nil), executionPlan.Batches...),
 		QuotaPolicy:  frozen.QuotaPolicy.Clone(),
 	}
+	initial := executionPlan.Clone()
+	plan.InitialExecutionPlan = &initial
 	for _, key := range mustTopologicalStageKeys(frozen.Workflow) {
 		stage, found := frozen.Workflow.Stage(key)
 		if !found {
@@ -711,55 +760,42 @@ func (runtime *FrozenExecutionRuntime) ackControl(ctx context.Context, operation
 	})
 }
 
-// scheduleNextBatch expands at most one immutable schedule batch. This makes
-// the durable job table the handoff boundary between batches: a process crash
-// cannot cause a later batch to run before its persisted predecessor has a
+// commitCoordinatorDecision applies exactly one generic workflowkit decision
+// to Harbor's durable control plane.  It deliberately receives an already
+// validated decision from workflowkit.Engine: this adapter may persist jobs
+// and projections, but must not make or replace scheduling policy.
+//
+// The durable job table remains the handoff boundary between batches, so a
+// process crash cannot make a later batch run before its predecessor has a
 // trustworthy terminal StageAttempt.
-func (runtime *FrozenExecutionRuntime) scheduleNextBatch(ctx context.Context, parentJob store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan) error {
-	if err := plan.Workflow.Validate(); err != nil {
-		return fmt.Errorf("validate runtime workflow: %w", err)
-	}
-	if frozen.QuotaPolicy.Fingerprint != plan.QuotaPolicy.Fingerprint || frozen.QuotaPolicy.ID != plan.QuotaPolicy.ID || frozen.QuotaPolicy.Version != plan.QuotaPolicy.Version {
-		return fmt.Errorf("%w: execution plan quota policy differs from frozen run", ErrFrozenExecutionPayload)
-	}
-	stageJobs, err := runtime.stageJobsForPlan(ctx, run.ID, plan.ExecutionKey)
-	if err != nil {
-		return err
-	}
-	for _, batch := range plan.Schedule {
-		ready, completed, err := runtime.batchState(ctx, batch, plan, stageJobs)
-		if err != nil {
-			return err
-		}
-		if completed {
-			continue
-		}
-		if !ready {
-			return nil
-		}
-		for _, nodeID := range batch.NodeIDs {
+func (runtime *FrozenExecutionRuntime) commitCoordinatorDecision(ctx context.Context, parentJob store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan, decision workflowkit.CoordinatorDecision) error {
+	switch decision.Kind {
+	case workflowkit.CoordinatorScheduleNextBatch:
+		for _, nodeID := range decision.NextBatch.NodeIDs {
 			stageKey := workflowkit.StageKey(nodeID)
-			if _, exists := stageJobs[stageKey]; exists {
-				continue
-			}
 			stage, found := plan.Workflow.Stage(stageKey)
-			if !found {
-				return fmt.Errorf("%w: batch %s refers to unknown stage %q", ErrFrozenExecutionPayload, batch.ID, stageKey)
-			}
-			if !stage.AutomaticallyDispatchable() {
-				return fmt.Errorf("%w: batch %s targets operator-only stage %q", ErrFrozenExecutionPayload, batch.ID, stageKey)
+			if !found || !stage.AutomaticallyDispatchable() {
+				return fmt.Errorf("%w: coordinator selected non-automatic stage %q", ErrFrozenExecutionPayload, stageKey)
 			}
 			transition, found := plan.stageTransition(stageKey)
 			if !found || transition.Disposition != workflowkit.DispositionSchedule {
-				return fmt.Errorf("%w: batch %s stage %q is not frozen for scheduling", ErrFrozenExecutionPayload, batch.ID, stageKey)
+				return fmt.Errorf("%w: coordinator selected stage %q without a frozen schedule transition", ErrFrozenExecutionPayload, stageKey)
 			}
 			if err := runtime.enqueueStageAttempt(ctx, parentJob, run, frozen, plan, stage, transition); err != nil {
 				return err
 			}
 		}
 		return nil
+	case workflowkit.CoordinatorWait, workflowkit.CoordinatorBlocked:
+		// A previous worker/review/reconciliation already owns the next
+		// durable transition. The coordinator deliberately creates neither a
+		// duplicate stage attempt nor a synthetic terminal Run outcome.
+		return nil
+	case workflowkit.CoordinatorComplete:
+		return runtime.completeExecutionIfSatisfied(ctx, parentJob, run, frozen, plan)
+	default:
+		return fmt.Errorf("%w: public workflow coordinator returned unsupported decision %q", ErrFrozenExecutionPayload, decision.Kind)
 	}
-	return runtime.completeExecutionIfSatisfied(ctx, parentJob, run, frozen, plan)
 }
 
 type runtimePlannedStageJob struct {
@@ -795,51 +831,93 @@ func (runtime *FrozenExecutionRuntime) stageJobsForPlan(ctx context.Context, run
 	return result, nil
 }
 
-func (runtime *FrozenExecutionRuntime) batchState(ctx context.Context, batch workflowkit.ScheduleBatch, plan runtimeExecutionPlan, jobs map[workflowkit.StageKey]runtimePlannedStageJob) (ready, completed bool, err error) {
-	if len(batch.NodeIDs) == 0 {
-		return false, false, fmt.Errorf("%w: empty schedule batch %q", ErrFrozenExecutionPayload, batch.ID)
+// workflowkitCoordinatorInput translates only durable Harbor facts into the
+// public kernel's domain-neutral coordinator snapshot. It deliberately makes
+// no scheduling decision itself: a status that cannot be proven from a
+// StageAttempt becomes a fail-closed error rather than a guessed successor.
+func (runtime *FrozenExecutionRuntime) workflowkitCoordinatorInput(ctx context.Context, plan runtimeExecutionPlan, jobs map[workflowkit.StageKey]runtimePlannedStageJob) (workflowkit.CoordinatorInput, error) {
+	input := workflowkit.CoordinatorInput{Workflow: plan.Workflow.Clone(), Nodes: make([]workflowkit.CoordinatorNodeState, 0, len(plan.Workflow.Stages))}
+	if plan.InitialExecutionPlan != nil {
+		input.ScheduleMode = workflowkit.CoordinatorScheduleExecutionPlan
+		input.Plan = plan.InitialExecutionPlan.Clone()
+	} else {
+		input.ScheduleMode = workflowkit.CoordinatorScheduleTransitionSubset
+		input.Schedule = append([]workflowkit.ScheduleBatch(nil), plan.Schedule...)
+		input.Transitions = make([]workflowkit.NodeTransition, 0, len(plan.Workflow.Stages))
 	}
-	allComplete := true
-	for _, nodeID := range batch.NodeIDs {
-		stageKey := workflowkit.StageKey(nodeID)
+	for _, stageKey := range mustTopologicalStageKeys(plan.Workflow) {
+		stage, found := plan.Workflow.Stage(stageKey)
+		if !found {
+			return workflowkit.CoordinatorInput{}, fmt.Errorf("%w: coordinator workflow omits stage %q", ErrFrozenExecutionPayload, stageKey)
+		}
 		transition, found := plan.stageTransition(stageKey)
-		if !found || transition.Disposition != workflowkit.DispositionSchedule {
-			return false, false, fmt.Errorf("%w: schedule batch %s has invalid stage %q", ErrFrozenExecutionPayload, batch.ID, stageKey)
+		if !found {
+			return workflowkit.CoordinatorInput{}, fmt.Errorf("%w: coordinator plan omits transition for stage %q", ErrFrozenExecutionPayload, stageKey)
 		}
-		planned, exists := jobs[stageKey]
-		if !exists {
-			allComplete = false
-			continue
+		if plan.InitialExecutionPlan == nil {
+			input.Transitions = append(input.Transitions, transition.Clone())
 		}
-		stageAttempt, getErr := runtime.core.store.GetStageAttempt(ctx, planned.Payload.StageAttemptID)
-		if getErr != nil {
-			return false, false, getErr
+		status, err := runtime.workflowkitCoordinatorNodeStatus(ctx, stage, transition, jobs)
+		if err != nil {
+			return workflowkit.CoordinatorInput{}, err
 		}
-		if stageAttempt == nil {
-			return false, false, fmt.Errorf("%w: stage job %s refers to missing attempt", ErrFrozenExecutionPayload, planned.Job.ID)
-		}
-		// The StageAttempt is the durable execution predecessor, not the worker
-		// delivery record. Its terminal projection happens only after artifacts
-		// and quota settlement are persisted. A following coordinator may be
-		// claimed while the predecessor worker is still committing JobSucceeded;
-		// requiring the job state here would let that coordinator disappear
-		// without ever scheduling the next batch.
-		if stageAttempt.ExecutionStatus == store.StageExecutionCompleted && verdictAllowsProgress(stageAttempt.Verdict) {
-			continue
-		}
-		allComplete = false
-		if planned.Job.State == store.JobQueued || planned.Job.State == store.JobRunning || planned.Job.State == store.JobPauseRequested || planned.Job.State == store.JobCancelRequested || planned.Job.State == store.JobStopRequested {
-			return false, false, nil
-		}
-		// A terminal non-success stage was already projected to a durable Run
-		// outcome by its handler. Do not manufacture a later batch from it.
-		return false, false, nil
+		input.Nodes = append(input.Nodes, workflowkit.CoordinatorNodeState{NodeID: workflowkit.NodeID(stageKey), Generation: transition.ToGeneration, Status: status})
 	}
-	return true, allComplete, nil
+	return input, nil
 }
 
-func verdictAllowsProgress(verdict store.Verdict) bool {
-	return verdict == store.VerdictPass || verdict == store.VerdictAdvisory
+func (runtime *FrozenExecutionRuntime) workflowkitCoordinatorNodeStatus(ctx context.Context, stage workflowkit.StageDescriptor, transition workflowkit.NodeTransition, jobs map[workflowkit.StageKey]runtimePlannedStageJob) (workflowkit.CoordinatorNodeStatus, error) {
+	switch transition.Disposition {
+	case workflowkit.DispositionPreserve:
+		// Continuation-plan assertion and artifact lineage validation already
+		// prove preservation before the durable continuation job is created.
+		return workflowkit.CoordinatorNodePreserved, nil
+	case workflowkit.DispositionInvalidate:
+		return workflowkit.CoordinatorNodeInvalidated, nil
+	case workflowkit.DispositionOperatorOnly:
+		if !stage.OperatorOnly() {
+			return "", fmt.Errorf("%w: automatic stage %q has operator-only coordinator transition", ErrFrozenExecutionPayload, stage.Key)
+		}
+		return workflowkit.CoordinatorNodePending, nil
+	case workflowkit.DispositionSchedule:
+		if !stage.AutomaticallyDispatchable() {
+			return "", fmt.Errorf("%w: operator-only stage %q has schedule coordinator transition", ErrFrozenExecutionPayload, stage.Key)
+		}
+	default:
+		return "", fmt.Errorf("%w: stage %q has unsupported coordinator transition %q", ErrFrozenExecutionPayload, stage.Key, transition.Disposition)
+	}
+	planned, found := jobs[stage.Key]
+	if !found {
+		return workflowkit.CoordinatorNodePending, nil
+	}
+	attempt, err := runtime.core.store.GetStageAttempt(ctx, planned.Payload.StageAttemptID)
+	if err != nil {
+		return "", err
+	}
+	if attempt == nil || attempt.RunID != planned.Job.RunID || attempt.StageKey != string(stage.Key) {
+		return "", fmt.Errorf("%w: coordinator stage job %s has no matching StageAttempt", ErrFrozenExecutionPayload, planned.Job.ID)
+	}
+	switch attempt.ExecutionStatus {
+	case store.StageExecutionQueued:
+		return workflowkit.CoordinatorNodeQueued, nil
+	case store.StageExecutionRunning:
+		return workflowkit.CoordinatorNodeRunning, nil
+	case store.StageExecutionWaiting:
+		return workflowkit.CoordinatorNodeWaiting, nil
+	case store.StageExecutionCompleted:
+		if attempt.Verdict == store.VerdictPass || attempt.Verdict == store.VerdictAdvisory {
+			return workflowkit.CoordinatorNodeSucceeded, nil
+		}
+		return workflowkit.CoordinatorNodeBlocked, nil
+	case store.StageExecutionInfraFailed, store.StageExecutionInterrupted:
+		return workflowkit.CoordinatorNodeFailed, nil
+	case store.StageExecutionInDoubt, store.StageExecutionReconciling:
+		return workflowkit.CoordinatorNodeInDoubt, nil
+	case store.StageExecutionCanceled:
+		return workflowkit.CoordinatorNodeCanceled, nil
+	default:
+		return "", fmt.Errorf("%w: stage %q has unsupported execution status %q", ErrFrozenExecutionPayload, stage.Key, attempt.ExecutionStatus)
+	}
 }
 
 func stageExecutionKey(payload frozenStageExecutionPayload) string {
@@ -1149,8 +1227,15 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 			}
 			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, err)
 		}
-		if result.Outcome.Status == workflowkit.StatusInfraFailed && stageRetryable(stage, result.Outcome.Failure) && ordinal < stage.Budget.MaxAttempts && stageContext.Err() == nil {
-			if err := waitStageRetry(stageContext, RetryDelay(stage, ordinal+1)); err != nil {
+		retry, retryErr := workflowkit.DecideStageRetry(stage, ordinal, result.Outcome)
+		if retryErr != nil {
+			if codeEdgeEffect != nil {
+				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, retryErr.Error())
+			}
+			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, retryErr)
+		}
+		if retry.Retry && stageContext.Err() == nil {
+			if err := waitStageRetry(stageContext, retry.Delay); err != nil {
 				result = StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInterrupted}, ErrorText: err.Error()}
 				break
 			}
@@ -1231,15 +1316,6 @@ func normalizeStageExecutionResult(result StageExecutionResult, executionErr, co
 		return StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailureTimeout}, ErrorText: executionErr.Error(), FailureClass: string(workflowkit.FailureTimeout)}
 	}
 	return StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailureUnknown}, ErrorText: executionErr.Error(), FailureClass: string(workflowkit.FailureUnknown)}
-}
-
-func stageRetryable(stage workflowkit.StageDescriptor, failure workflowkit.FailureClass) bool {
-	for _, candidate := range stage.Retry.Retryable {
-		if candidate == failure {
-			return true
-		}
-	}
-	return false
 }
 
 func waitStageRetry(ctx context.Context, delay time.Duration) error {
@@ -1888,6 +1964,17 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 		if err := runtime.completeCodeEdgeEvaluatorEffect(ctx, run, attempt, stage, manifest, job.CreatedBy); err != nil {
 			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *codeEdgeEffect, operation, "CodeEdge evaluator success fence could not be finalized: "+err.Error())
 		}
+		completedEffect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, attempt, stage)
+		if effectErr != nil {
+			return runtime.failMalformedJob(ctx, job, effectErr)
+		}
+		if completedEffect == nil || completedEffect.State != store.SideEffectSucceeded {
+			return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: completed CodeEdge evaluator has no succeeded side effect", ErrFrozenExecutionPayload))
+		}
+		codeEdgeEffect = completedEffect
+		if err := runtime.completeTrustedCodeEdgeEvaluatorTrials(ctx, run, attempt, job.CreatedBy, "project direct completed CodeEdge evaluator trials"); err != nil {
+			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *codeEdgeEffect, operation, "CodeEdge evaluator trusted trial projection could not be finalized: "+err.Error())
+		}
 	}
 	settlementOutcome := store.QuotaSettlementCanceled
 	if stageStatus == store.StageExecutionCompleted {
@@ -2156,7 +2243,7 @@ func (runtime *FrozenExecutionRuntime) completeRunIfSatisfied(ctx context.Contex
 			continue
 		}
 		attempt, found := latest[transition.NodeID]
-		if !found || attempt.ExecutionStatus != store.StageExecutionCompleted || !verdictAllowsProgress(attempt.Verdict) {
+		if !found || attempt.ExecutionStatus != store.StageExecutionCompleted || (attempt.Verdict != store.VerdictPass && attempt.Verdict != store.VerdictAdvisory) {
 			return fmt.Errorf("%w: scheduled stage %s is not completed with a progressing verdict", ErrFrozenExecutionPayload, transition.NodeID)
 		}
 	}

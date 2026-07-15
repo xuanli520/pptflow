@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
 
 func TestAggregateTaskHubGroupsRunsByStableTaskID(t *testing.T) {
@@ -424,11 +425,53 @@ func TestTaskHubV2RunControlEscDropsLatePreviewWithoutSideEffects(t *testing.T) 
 	}
 }
 
+func TestTaskHubV2RunControlReconcileKeyAndActionRequireEligibleRun(t *testing.T) {
+	normal := enabledTaskHubSnapshot()
+	normal.Runs[0].ExecutionState = string(store.WorkflowRunRunning)
+	normalService := &fakeTaskHubLifecycle{snapshot: normal}
+	normalModel, normalCleanup := newTestTaskHubV2Model(t, normalService)
+	defer normalCleanup()
+	normalModel.openRunControl()
+	if rendered := normalModel.runControl.View(88, 30); strings.Contains(rendered, "[R] 本地 reconcile") {
+		t.Fatalf("normal Run rendered a reconcile action:\n%s", rendered)
+	}
+	updated, command := normalModel.Update(runeKey("r"))
+	normalModel = updated.(model)
+	if command != nil || normalModel.runControl.SelectedAction != "" {
+		t.Fatalf("normal Run accepted reconcile mnemonic: action=%q command=%v", normalModel.runControl.SelectedAction, command)
+	}
+
+	eligible := enabledTaskHubSnapshot()
+	eligible.Runs[0].ExecutionState = string(store.WorkflowRunInDoubt)
+	eligible.Runs[0].Control.Actions = append(eligible.Runs[0].Control.Actions, TaskHubRunControlActionState{
+		Action: TaskHubRunControlReconcile, Enabled: true,
+	})
+	eligibleService := &fakeTaskHubLifecycle{snapshot: eligible}
+	eligibleModel, eligibleCleanup := newTestTaskHubV2Model(t, eligibleService)
+	defer eligibleCleanup()
+	eligibleModel.openRunControl()
+	if rendered := eligibleModel.runControl.View(88, 30); !strings.Contains(rendered, "[R] 本地 reconcile") || !strings.Contains(rendered, "[P/K/S/R]") {
+		t.Fatalf("reconcile-eligible Run did not render its explicit action/key hint:\n%s", rendered)
+	}
+	if footer := ansi.Strip(eligibleModel.footer()); !strings.Contains(footer, "[P/K/S/R]") {
+		t.Fatalf("reconcile-eligible Run footer omitted its available key: %q", footer)
+	}
+	updated, command = eligibleModel.Update(runeKey("r"))
+	eligibleModel = updated.(model)
+	if command != nil || eligibleModel.runControl.SelectedAction != TaskHubRunControlReconcile {
+		t.Fatalf("eligible Run did not select reconcile preview: action=%q command=%v", eligibleModel.runControl.SelectedAction, command)
+	}
+	eligibleModel.runControl.selectReturn()
+	if command = clickRenderedMarker(t, &eligibleModel, "[R] 本地 reconcile"); command != nil || eligibleModel.runControl.SelectedAction != TaskHubRunControlReconcile {
+		t.Fatalf("eligible Run mouse target did not select reconcile preview: action=%q command=%v", eligibleModel.runControl.SelectedAction, command)
+	}
+}
+
 func TestLifecycleRunControlNarrowLayoutFitsTerminal(t *testing.T) {
 	overlay := newLifecycleRunControlOverlay(TaskHubRun{
 		RunID:          "run-with-a-very-long-stable-identity",
 		TaskID:         "task-with-a-very-long-stable-identity",
-		ExecutionState: "pause_requested",
+		ExecutionState: "in_doubt",
 		Stage:          "evaluation/harbor_qwen",
 		ControlStatus:  "reconcile_required",
 		Control: TaskHubRunControl{
@@ -446,6 +489,7 @@ func TestLifecycleRunControlNarrowLayoutFitsTerminal(t *testing.T) {
 				{Action: TaskHubRunControlPause, DisabledReason: "需要操作者、操作原因和幂等键；当前 TUI 仅提供只读预览"},
 				{Action: TaskHubRunControlCancelStage, DisabledReason: "当前 StageAttempt 未声明 cancel capability；不能由 TUI 推断 provider 是否支持取消"},
 				{Action: TaskHubRunControlTerminate, DisabledReason: "需要操作者、操作原因和幂等键；当前 TUI 仅提供只读预览"},
+				{Action: TaskHubRunControlReconcile, Enabled: true},
 			},
 		},
 	})

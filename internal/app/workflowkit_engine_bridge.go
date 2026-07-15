@@ -34,6 +34,9 @@ type workflowkitStageBackend struct {
 	reservation stageQuotaReservation
 	monitor     *stageControlMonitor
 	review      *workflowadapter.ReviewStage
+	// executionReason lets a coordinator reuse the same frozen-execution
+	// reconstruction proof without pretending it is a stage invocation.
+	executionReason string
 
 	result       *workflowkit.StageExecutionResult
 	rejected     error
@@ -103,6 +106,169 @@ func (runtime *FrozenExecutionRuntime) handleWorkflowkitStageClaim(ctx context.C
 	return state, nil
 }
 
+// workflowkitCoordinatorBackend adapts one already-leased Harbor coordinator
+// job to the same public Engine boundary used by stage work. The generic
+// Engine validates the frozen claim, loads durable node facts, and decides the
+// next action; this adapter persists that already-decided action through
+// FrozenExecutionRuntime.
+type workflowkitCoordinatorBackend struct {
+	callContext context.Context
+	runtime     *FrozenExecutionRuntime
+	execution   DurableJobExecution
+	job         store.DurableJob
+	run         store.WorkflowRun
+	frozen      frozenRunDefinition
+	plan        runtimeExecutionPlan
+}
+
+func (runtime *FrozenExecutionRuntime) executeWorkflowkitCoordinator(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan) (store.JobState, error) {
+	backend := &workflowkitCoordinatorBackend{callContext: ctx, runtime: runtime, execution: execution, job: job, run: run, frozen: frozen, plan: plan}
+	claim, err := backend.claim()
+	if err != nil {
+		return store.JobFailed, err
+	}
+	engine, err := workflowkit.NewEngine(workflowkit.EngineConfig{Backend: backend, Executors: runtime.workflowkitRegistry})
+	if err != nil {
+		return store.JobFailed, fmt.Errorf("construct public workflow coordinator engine: %w", err)
+	}
+	state, err := engine.HandleClaim(ctx, claim)
+	if err != nil {
+		return store.JobFailed, fmt.Errorf("handle frozen public workflow coordinator claim: %w", err)
+	}
+	if state != workflowkit.JobCompleted {
+		return store.JobFailed, fmt.Errorf("%w: public workflow coordinator returned %q", ErrFrozenExecutionPayload, state)
+	}
+	return store.JobSucceeded, nil
+}
+
+func (backend *workflowkitCoordinatorBackend) claim() (workflowkit.JobClaim, error) {
+	if backend == nil || backend.runtime == nil || backend.execution.Claim.Job == nil || backend.execution.Claim.Job.ID != backend.job.ID || backend.execution.Claim.DispatchLease == nil {
+		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine coordinator has no matching durable dispatch claim", ErrFrozenExecutionPayload)
+	}
+	lease := backend.execution.Claim.DispatchLease
+	if lease.FencingToken == 0 || lease.ExpiresAt.IsZero() || strings.TrimSpace(lease.Owner) == "" {
+		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine coordinator has an invalid durable dispatch lease", ErrFrozenExecutionPayload)
+	}
+	revision, err := backend.runtime.core.store.GetTaskRevision(backend.callContext, backend.run.RevisionID)
+	if err != nil {
+		return workflowkit.JobClaim{}, err
+	}
+	if revision == nil || revision.TaskID != backend.run.TaskID {
+		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine coordinator Run revision", ErrLifecycleNotFound)
+	}
+	// frozenExecution owns the canonical managed-input, catalog receipt and
+	// execution-spec proof used by both coordinator and stage claims.
+	proof := &workflowkitStageBackend{
+		callContext: backend.callContext, runtime: backend.runtime, job: backend.job,
+		run: backend.run, revision: *revision, frozen: backend.frozen,
+		executionReason: "advance frozen workflow coordinator",
+	}
+	frozenExecution, err := proof.frozenExecution()
+	if err != nil {
+		return workflowkit.JobClaim{}, err
+	}
+	schedule, err := backend.plan.frozenCoordinatorSchedule()
+	if err != nil {
+		return workflowkit.JobClaim{}, err
+	}
+	claim := workflowkit.JobClaim{
+		JobID: backend.job.ID, ClaimID: backend.execution.Claim.ID, Kind: workflowkit.JobCoordinator,
+		Owner: lease.Owner, FencingToken: lease.FencingToken, LeaseExpiresAt: lease.ExpiresAt,
+		Execution: frozenExecution, Coordinator: &workflowkit.CoordinatorClaim{Schedule: schedule},
+	}
+	if err := claim.Validate(); err != nil {
+		return workflowkit.JobClaim{}, fmt.Errorf("%w: construct public Engine coordinator claim: %v", ErrFrozenExecutionPayload, err)
+	}
+	return claim, nil
+}
+
+func (backend *workflowkitCoordinatorBackend) PrepareExecution(context.Context, workflowkit.PrepareRequest, workflowkit.FrozenExecution) (workflowkit.PreparedExecution, error) {
+	return workflowkit.PreparedExecution{}, fmt.Errorf("%w: a claimed Harbor coordinator cannot prepare another execution", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) validateCoordinatorClaim(claim workflowkit.JobClaim) error {
+	if backend == nil || backend.runtime == nil || claim.JobID != backend.job.ID || claim.ClaimID != backend.execution.Claim.ID || claim.Kind != workflowkit.JobCoordinator || claim.Execution.ID != backend.run.ID || claim.Coordinator == nil {
+		return fmt.Errorf("%w: public Engine coordinator callback claim does not match the active Harbor job", ErrFrozenExecutionPayload)
+	}
+	return nil
+}
+
+// LoadCoordinatorInput is the Harbor-to-kernel half of the coordinator port.
+// It loads only frozen plan and durable node facts; it makes no scheduling
+// decision and cannot invoke a provider.
+func (backend *workflowkitCoordinatorBackend) LoadCoordinatorInput(ctx context.Context, claim workflowkit.JobClaim) (workflowkit.CoordinatorInput, error) {
+	if err := backend.validateCoordinatorClaim(claim); err != nil {
+		return workflowkit.CoordinatorInput{}, err
+	}
+	if err := backend.plan.Workflow.Validate(); err != nil {
+		return workflowkit.CoordinatorInput{}, fmt.Errorf("validate runtime workflow: %w", err)
+	}
+	if backend.frozen.QuotaPolicy.Fingerprint != backend.plan.QuotaPolicy.Fingerprint || backend.frozen.QuotaPolicy.ID != backend.plan.QuotaPolicy.ID || backend.frozen.QuotaPolicy.Version != backend.plan.QuotaPolicy.Version {
+		return workflowkit.CoordinatorInput{}, fmt.Errorf("%w: execution plan quota policy differs from frozen run", ErrFrozenExecutionPayload)
+	}
+	stageJobs, err := backend.runtime.stageJobsForPlan(ctx, backend.run.ID, backend.plan.ExecutionKey)
+	if err != nil {
+		return workflowkit.CoordinatorInput{}, err
+	}
+	input, err := backend.runtime.workflowkitCoordinatorInput(ctx, backend.plan, stageJobs)
+	if err != nil {
+		return workflowkit.CoordinatorInput{}, err
+	}
+	if claim.Coordinator.Schedule.ExecutionKey != backend.plan.ExecutionKey {
+		return workflowkit.CoordinatorInput{}, fmt.Errorf("%w: coordinator claim execution key differs from its durable plan", ErrFrozenExecutionPayload)
+	}
+	if err := claim.Coordinator.Schedule.ValidateInput(input); err != nil {
+		return workflowkit.CoordinatorInput{}, fmt.Errorf("%w: verify frozen coordinator schedule: %v", ErrFrozenExecutionPayload, err)
+	}
+	return input.Clone(), nil
+}
+
+// CommitCoordinatorDecision is the kernel-to-Harbor half of the coordinator
+// port.  It accepts no mutable stage selector or domain scheduling mode: the
+// only admitted work is the exact batch chosen from the frozen input by the
+// public workflowkit engine.
+func (backend *workflowkitCoordinatorBackend) CommitCoordinatorDecision(ctx context.Context, claim workflowkit.JobClaim, decision workflowkit.CoordinatorDecision) (workflowkit.JobTerminalState, error) {
+	if err := backend.validateCoordinatorClaim(claim); err != nil {
+		return "", err
+	}
+	if err := backend.runtime.commitCoordinatorDecision(ctx, backend.job, backend.run, backend.frozen, backend.plan, decision.Clone()); err != nil {
+		return "", err
+	}
+	return workflowkit.JobCompleted, nil
+}
+
+func (backend *workflowkitCoordinatorBackend) ReadStageInput(context.Context, workflowkit.JobClaim, workflowkit.ArtifactBinding) ([]byte, error) {
+	return nil, fmt.Errorf("%w: a coordinator has no stage input", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) RecordStageCheckpoint(context.Context, workflowkit.JobClaim, workflowkit.StageCheckpoint) (workflowkit.CheckpointReceipt, error) {
+	return workflowkit.CheckpointReceipt{}, fmt.Errorf("%w: a coordinator cannot checkpoint a stage", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) RecordStageUsage(context.Context, workflowkit.JobClaim, workflowkit.StageUsage) error {
+	return fmt.Errorf("%w: a coordinator cannot charge stage usage", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) CommitStage(context.Context, workflowkit.StageCompletion) (workflowkit.JobTerminalState, error) {
+	return "", fmt.Errorf("%w: a coordinator cannot commit a stage", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) CommitStageWait(context.Context, workflowkit.StageWaitCommit) (workflowkit.JobTerminalState, error) {
+	return "", fmt.Errorf("%w: a coordinator cannot enter a stage wait", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) RejectStageClaim(context.Context, workflowkit.JobClaim, error) (workflowkit.JobTerminalState, error) {
+	return "", fmt.Errorf("%w: a coordinator has no stage claim", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) ListRecoverySubjects(context.Context, workflowkit.RecoveryScope) ([]workflowkit.RecoverySubject, error) {
+	return nil, fmt.Errorf("%w: a claimed Harbor coordinator cannot list recovery subjects", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitCoordinatorBackend) ApplyRecovery(context.Context, workflowkit.RecoveryScope, []workflowkit.RecoveryDecision) error {
+	return fmt.Errorf("%w: a claimed Harbor coordinator cannot apply recovery", ErrFrozenExecutionPayload)
+}
+
 func (backend *workflowkitStageBackend) claim() (workflowkit.JobClaim, error) {
 	if backend == nil || backend.runtime == nil {
 		return workflowkit.JobClaim{}, ErrFrozenExecutionRuntimeConfiguration
@@ -131,6 +297,14 @@ func (backend *workflowkitStageBackend) claim() (workflowkit.JobClaim, error) {
 		Generation: backend.payload.Generation,
 		Inputs:     append([]workflowkit.ArtifactBinding(nil), backend.inputs...),
 		Control:    control,
+	}
+	if backend.node.ID != "" {
+		node := workflowkit.AttemptIdentity{
+			ID: workflowkit.AttemptID(backend.node.ID), Kind: workflowkit.AttemptNode,
+			ScopeID: backend.run.ID + ":" + string(backend.stage.Key), ParentAttemptID: workflowkit.AttemptID(backend.attempt.ID),
+			Ordinal: backend.node.Attempt,
+		}
+		stageClaim.NodeAttempt = &node
 	}
 	claim := workflowkit.JobClaim{
 		JobID: backend.job.ID, ClaimID: backend.execution.Claim.ID, Kind: workflowkit.JobStage, Owner: lease.Owner,
@@ -193,6 +367,10 @@ func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExe
 	if createdAt.IsZero() {
 		createdAt = backend.run.CreatedAt
 	}
+	reason := backend.executionReason
+	if strings.TrimSpace(reason) == "" {
+		reason = "execute frozen stage " + string(backend.stage.Key)
+	}
 	execution := workflowkit.FrozenExecution{
 		ID:             backend.run.ID,
 		IdempotencyKey: "workflow-run:" + backend.run.ID,
@@ -205,7 +383,7 @@ func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExe
 		Binding:               binding,
 		Plan:                  backend.frozen.InitialExecutionPlan.Clone(),
 		Actor:                 backend.job.CreatedBy,
-		Reason:                "execute frozen stage " + string(backend.stage.Key),
+		Reason:                reason,
 		CreatedAt:             createdAt.UTC(),
 	}
 	if err := execution.Validate(); err != nil {
@@ -218,8 +396,12 @@ func (backend *workflowkitStageBackend) PrepareExecution(context.Context, workfl
 	return workflowkit.PreparedExecution{}, fmt.Errorf("%w: a claimed Harbor stage backend cannot prepare another execution", ErrFrozenExecutionPayload)
 }
 
-func (backend *workflowkitStageBackend) AdvanceCoordinator(context.Context, workflowkit.JobClaim) (workflowkit.JobTerminalState, error) {
-	return "", fmt.Errorf("%w: a Harbor stage backend cannot advance a coordinator", ErrFrozenExecutionPayload)
+func (backend *workflowkitStageBackend) LoadCoordinatorInput(context.Context, workflowkit.JobClaim) (workflowkit.CoordinatorInput, error) {
+	return workflowkit.CoordinatorInput{}, fmt.Errorf("%w: a Harbor stage backend cannot load coordinator input", ErrFrozenExecutionPayload)
+}
+
+func (backend *workflowkitStageBackend) CommitCoordinatorDecision(context.Context, workflowkit.JobClaim, workflowkit.CoordinatorDecision) (workflowkit.JobTerminalState, error) {
+	return "", fmt.Errorf("%w: a Harbor stage backend cannot commit a coordinator decision", ErrFrozenExecutionPayload)
 }
 
 func (backend *workflowkitStageBackend) ReadStageInput(ctx context.Context, claim workflowkit.JobClaim, binding workflowkit.ArtifactBinding) ([]byte, error) {
@@ -316,6 +498,15 @@ func (backend *workflowkitStageBackend) matchesClaim(claim workflowkit.JobClaim)
 	if backend == nil || claim.JobID != backend.job.ID || claim.ClaimID != backend.execution.Claim.ID || claim.Execution.ID != backend.run.ID || claim.Stage == nil || claim.Stage.StageAttempt.ID != workflowkit.AttemptID(backend.attempt.ID) || claim.Stage.Stage.Key != backend.stage.Key {
 		return fmt.Errorf("%w: public Engine callback claim does not match the active Harbor stage", ErrFrozenExecutionPayload)
 	}
+	if backend.node.ID == "" {
+		if claim.Stage.NodeAttempt != nil {
+			return fmt.Errorf("%w: public Engine stage claim unexpectedly carries a node attempt", ErrFrozenExecutionPayload)
+		}
+		return nil
+	}
+	if claim.Stage.NodeAttempt == nil || claim.Stage.NodeAttempt.ID != workflowkit.AttemptID(backend.node.ID) || claim.Stage.NodeAttempt.Ordinal != backend.node.Attempt {
+		return fmt.Errorf("%w: public Engine stage node attempt does not match the active Harbor node", ErrFrozenExecutionPayload)
+	}
 	return nil
 }
 
@@ -377,3 +568,4 @@ func workflowkitControlSignals(ctx context.Context, source <-chan StageControlSi
 }
 
 var _ workflowkit.DurableBackend = (*workflowkitStageBackend)(nil)
+var _ workflowkit.DurableBackend = (*workflowkitCoordinatorBackend)(nil)

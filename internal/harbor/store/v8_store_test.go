@@ -304,6 +304,28 @@ func TestCreateAndBindRevisionCandidatePlanIsAtomicAndRejectsUnboundPlan(t *test
 	})
 }
 
+func TestGetRevisionCandidateByFrozenPlanUsesOnlyTheDurablePlanBinding(t *testing.T) {
+	fixture := prepareRevisionCandidatePlanFixture(t)
+	request := fixture.planRequest(t, fixture.store.now().UTC().Add(time.Hour))
+	if candidate, err := fixture.store.GetRevisionCandidateByFrozenPlan(context.Background(), request.ID); err != nil || candidate != nil {
+		t.Fatalf("unbound plan candidate = %+v, err=%v", candidate, err)
+	}
+	_, bound, err := fixture.store.CreateAndBindRevisionCandidatePlan(context.Background(), CreateAndBindRevisionCandidatePlanRequest{
+		Plan: request, CandidateID: fixture.candidate.ID, ExpectedCandidateVersion: fixture.candidate.Version,
+		FinalManifestID: "manifest-object", ChildRunManifestJSON: `{}`, Actor: "tester", Reason: "bind candidate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := fixture.store.GetRevisionCandidateByFrozenPlan(context.Background(), request.ID)
+	if err != nil || loaded == nil || loaded.ID != bound.ID || loaded.FrozenPlanID != request.ID {
+		t.Fatalf("bound plan candidate = %+v, err=%v", loaded, err)
+	}
+	if _, err := fixture.store.GetRevisionCandidateByFrozenPlan(context.Background(), "not-a-uuidv7"); !errors.Is(err, ErrInvalidUUIDv7Identity) {
+		t.Fatalf("invalid plan identity error = %v, want ErrInvalidUUIDv7Identity", err)
+	}
+}
+
 // seedLegacyUnboundCandidatePlan models a record from the retired standalone
 // write path. Current public APIs cannot create this state.
 func seedLegacyUnboundCandidatePlan(t *testing.T, s *Store, request CreateFrozenPlanRequest) FrozenPlan {

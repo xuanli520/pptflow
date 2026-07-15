@@ -848,7 +848,7 @@ func buildRevisionCandidatePlan(planID, commandID string, command ContinueTaskCo
 		PlanID: planID, CommandID: commandID, Strategy: workflowkit.StrategyReviseSubject, BaseCheckpoint: command.Expected,
 		NextExecutionEpoch: run.ExecutionEpoch + 1, SourceRunID: run.ID, TargetRunRelation: workflowkit.RelationChildRun,
 		PreparedChangeID: candidate.PreparedChangeID, SubjectRevisionID: candidate.TargetRevisionID,
-		SubjectDigest: workflowkit.SubjectDigest(candidate.AfterDigest), CandidateRevisionID: candidate.ID, Nodes: transitions,
+		SubjectDigest: workflowkit.SubjectDigest(candidate.AfterDigest), Nodes: transitions,
 		Schedule: schedule, Assertions: []workflowkit.PlanAssertion{{Kind: workflowkit.AssertionCheckpointCurrent, Subject: run.ID, Expected: checkpointFingerprint}},
 		ExpiresAt: expiresAt.UTC(),
 	}, nil
@@ -1314,7 +1314,7 @@ func (service *ChangeProviderService) ExecuteTaskChange(ctx context.Context, pla
 		return store.RevisionCandidateContinuationCommit{}, err
 	}
 	snapshot := plan.Snapshot()
-	if snapshot.Strategy != workflowkit.StrategyReviseSubject || snapshot.CandidateRevisionID == "" {
+	if snapshot.Strategy != workflowkit.StrategyReviseSubject {
 		return store.RevisionCandidateContinuationCommit{}, fmt.Errorf("plan %s is not a revision candidate continuation", planID)
 	}
 	command, err := service.core.store.GetContinuationCommand(ctx, snapshot.CommandID)
@@ -1345,12 +1345,17 @@ func (service *ChangeProviderService) ExecuteTaskChange(ctx context.Context, pla
 	if err != nil {
 		return store.RevisionCandidateContinuationCommit{}, err
 	}
-	candidate, err := service.core.store.GetRevisionCandidate(ctx, snapshot.CandidateRevisionID)
+	candidate, err := service.core.store.GetRevisionCandidateByFrozenPlan(ctx, snapshot.PlanID)
 	if err != nil {
 		return store.RevisionCandidateContinuationCommit{}, err
 	}
 	if candidate == nil {
 		return store.RevisionCandidateContinuationCommit{}, fmt.Errorf("revision candidate is missing for plan %s", snapshot.PlanID)
+	}
+	if candidate.FrozenPlanID != snapshot.PlanID || candidate.CommandID != snapshot.CommandID ||
+		candidate.PreparedChangeID != snapshot.PreparedChangeID || candidate.TargetRevisionID != snapshot.SubjectRevisionID ||
+		candidate.AfterDigest != string(snapshot.SubjectDigest) || candidate.SourceRunID != snapshot.SourceRunID {
+		return store.RevisionCandidateContinuationCommit{}, fmt.Errorf("%w: frozen plan and revision candidate facts do not match", store.ErrIdempotencyConflict)
 	}
 	childManifest, err := service.ensureCandidateChildRunManifest(ctx, *candidate, *sourceRun)
 	if err != nil {
@@ -1370,13 +1375,13 @@ func (service *ChangeProviderService) ExecuteTaskChange(ctx context.Context, pla
 		return store.RevisionCandidateContinuationCommit{}, err
 	}
 	commit, err := service.core.store.CommitRevisionCandidateContinuation(ctx, store.CommitRevisionCandidateContinuationRequest{
-		PlanID: snapshot.PlanID, CandidateID: snapshot.CandidateRevisionID, IdempotencyKey: continuationExecutionKey(snapshot.PlanID),
+		PlanID: snapshot.PlanID, IdempotencyKey: continuationExecutionKey(snapshot.PlanID),
 		PayloadJSON: string(encoded), Expected: storeCheckpoint(snapshot.BaseCheckpoint), ChildRunInputs: childRunInputs, Actor: actor, Reason: reason,
 	})
 	if !errors.Is(err, store.ErrContinuationPlanExpired) {
 		return commit, err
 	}
-	candidate, candidateErr := service.core.store.GetRevisionCandidate(ctx, snapshot.CandidateRevisionID)
+	candidate, candidateErr := service.core.store.GetRevisionCandidateByFrozenPlan(ctx, snapshot.PlanID)
 	if candidateErr != nil {
 		return store.RevisionCandidateContinuationCommit{}, candidateErr
 	}

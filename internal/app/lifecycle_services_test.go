@@ -26,7 +26,7 @@ func newLifecycleServicesForTest(root string, dataStore *store.Store) (*Lifecycl
 
 func TestLifecycleServicesInstallsOnlyExplicitExternalChangeProviders(t *testing.T) {
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestLifecycleServicesInstallsOnlyExplicitExternalChangeProviders(t *testing
 
 func TestLifecycleServicesExposesOnlyCatalogLockAttestedWorkerResolver(t *testing.T) {
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestLifecycleServicesExposesOnlyCatalogLockAttestedWorkerResolver(t *testin
 	}
 
 	nonProductionRoot := t.TempDir()
-	nonProductionDB, err := store.Open(nonProductionRoot)
+	nonProductionDB, err := store.OpenForTest(nonProductionRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestLifecycleServicesExposesOnlyCatalogLockAttestedWorkerResolver(t *testin
 func TestLifecycleServicesMaterializeImmutableRevisionAndGateCurrentPromotion(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestLifecycleServicesMaterializeImmutableRevisionAndGateCurrentPromotion(t 
 func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 func TestRunServiceResolvesOnlyTheTemplateFrozenByProfileAndExecutionSpec(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
@@ -28,16 +27,13 @@ type CodeEdgeComplianceService struct{ core *lifecycleServiceCore }
 // not appear here: accepting either from a caller would permit a package to be
 // authorized under a different deployment contract.
 type RecordCodeEdgeFinalComplianceRequest struct {
-	ID                 string
-	IdempotencyKey     string
-	RunID              string
-	QwenStageAttemptID string
-	OpusStageAttemptID string
-	Qwen               codeedge.EvaluationReceipt
-	Opus               codeedge.EvaluationReceipt
-	Submission         codeedge.SubmissionCheckReceipt
-	Actor              string
-	Reason             string
+	ID                         string
+	IdempotencyKey             string
+	RunID                      string
+	EvaluatorEvidenceHandoffID string
+	Submission                 codeedge.SubmissionCheckReceipt
+	Actor                      string
+	Reason                     string
 }
 
 // CodeEdgeFinalComplianceResult exposes durable facts safe for CLI/TUI
@@ -66,19 +62,11 @@ func (service *CodeEdgeComplianceService) RecordFinalCompliance(ctx context.Cont
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
-	qwenStage, err := requireCodeEdgeCompletedStage(ctx, service.core.store, frozen.Run, request.QwenStageAttemptID, workflowadapter.HarborRunQwen)
+	handoff, err := service.loadVerifiedCodeEdgeEvaluatorEvidenceHandoff(ctx, frozen, request.EvaluatorEvidenceHandoffID)
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
-	opusStage, err := requireCodeEdgeCompletedStage(ctx, service.core.store, frozen.Run, request.OpusStageAttemptID, workflowadapter.HarborRunOpus)
-	if err != nil {
-		return CodeEdgeFinalComplianceResult{}, err
-	}
-	qwen, err := service.rebuildCodeEdgeEvaluationReceipt(ctx, frozen, qwenStage, workflowadapter.HarborRunQwen, "qwen_trial_result", "qwen_pass4_evidence", frozen.Policy.QwenPolicy, request.Qwen)
-	if err != nil {
-		return CodeEdgeFinalComplianceResult{}, err
-	}
-	opus, err := service.rebuildCodeEdgeEvaluationReceipt(ctx, frozen, opusStage, workflowadapter.HarborRunOpus, "opus_trial_result", "opus_pass4_evidence", frozen.Policy.OpusPolicy, request.Opus)
+	handoffFingerprint, err := handoff.Fingerprint()
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
@@ -88,27 +76,23 @@ func (service *CodeEdgeComplianceService) RecordFinalCompliance(ctx context.Cont
 	if err := requireApprovedCodeEdgeReviewGate(ctx, service.core.store, frozen.Run, frozen.Revision, workflowadapter.FinalReview, workflowadapter.ReviewFinalQuality); err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
+	if err := requireApprovedCodeEdgeReviewGate(ctx, service.core.store, frozen.Run, frozen.Revision, workflowadapter.EvaluatorEvidenceHandoff, workflowadapter.ReviewEvaluatorEvidence); err != nil {
+		return CodeEdgeFinalComplianceResult{}, err
+	}
 	if err := requireApprovedCodeEdgeReviewGate(ctx, service.core.store, frozen.Run, frozen.Revision, workflowadapter.ResultReview, workflowadapter.ReviewModelResult); err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
-	if err := service.ensureTrustedTrialSet(ctx, frozen.Run, qwenStage, qwen, request.Actor, request.Reason); err != nil {
-		return CodeEdgeFinalComplianceResult{}, err
-	}
-	if err := service.ensureTrustedTrialSet(ctx, frozen.Run, opusStage, opus, request.Actor, request.Reason); err != nil {
-		return CodeEdgeFinalComplianceResult{}, err
-	}
-
 	result, err := (codeedge.FinalComplianceService{}).Evaluate(codeedge.FinalComplianceInput{
-		Policy: frozen.Policy, Binding: frozen.Binding, Qwen: qwen, Opus: opus, Submission: request.Submission,
+		Policy: frozen.Policy, Binding: frozen.Binding, Handoff: handoff, Submission: request.Submission,
 	})
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("evaluate frozen CodeEdge final compliance: %w", err)
 	}
-	qwenJSON, err := qwen.CanonicalJSON()
+	qwenJSON, err := handoff.Qwen.Receipt.CanonicalJSON()
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
-	opusJSON, err := opus.CanonicalJSON()
+	opusJSON, err := handoff.Opus.Receipt.CanonicalJSON()
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
@@ -144,22 +128,24 @@ func (service *CodeEdgeComplianceService) RecordFinalCompliance(ctx context.Cont
 		}
 	}
 	record, err := service.core.store.CreateCodeEdgeComplianceRecord(ctx, store.CreateCodeEdgeComplianceRecordRequest{
-		ID:                       strings.TrimSpace(request.ID),
-		RunID:                    frozen.Run.ID,
-		TaskID:                   frozen.Run.TaskID,
-		RevisionID:               frozen.Revision.ID,
-		TaskDigest:               frozen.Revision.TaskDigest,
-		Status:                   status,
-		QwenReceiptJSON:          string(qwenJSON),
-		OpusReceiptJSON:          string(opusJSON),
-		SubmissionReceiptJSON:    string(submissionJSON),
-		DecisionJSON:             string(decisionJSON),
-		DecisionFingerprint:      string(decisionFingerprint),
-		AuthorizationJSON:        authorizationJSON,
-		AuthorizationFingerprint: string(authorizationFingerprint),
-		IdempotencyKey:           strings.TrimSpace(request.IdempotencyKey),
-		Actor:                    request.Actor,
-		Reason:                   request.Reason,
+		ID:                                  strings.TrimSpace(request.ID),
+		RunID:                               frozen.Run.ID,
+		TaskID:                              frozen.Run.TaskID,
+		RevisionID:                          frozen.Revision.ID,
+		TaskDigest:                          frozen.Revision.TaskDigest,
+		Status:                              status,
+		EvaluatorEvidenceHandoffID:          request.EvaluatorEvidenceHandoffID,
+		EvaluatorEvidenceHandoffFingerprint: string(handoffFingerprint),
+		QwenReceiptJSON:                     string(qwenJSON),
+		OpusReceiptJSON:                     string(opusJSON),
+		SubmissionReceiptJSON:               string(submissionJSON),
+		DecisionJSON:                        string(decisionJSON),
+		DecisionFingerprint:                 string(decisionFingerprint),
+		AuthorizationJSON:                   authorizationJSON,
+		AuthorizationFingerprint:            string(authorizationFingerprint),
+		IdempotencyKey:                      strings.TrimSpace(request.IdempotencyKey),
+		Actor:                               request.Actor,
+		Reason:                              request.Reason,
 	})
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
@@ -187,10 +173,18 @@ func (core *lifecycleServiceCore) loadFrozenCodeEdgeRun(ctx context.Context, run
 	if err := store.ValidateUUIDv7(strings.TrimSpace(runID)); err != nil {
 		return frozenCodeEdgeRun{}, err
 	}
-	if core.deploymentCatalog == nil {
+	parentCatalog, configured := core.configuredDeploymentCatalogBindingForTemplate(workflowadapter.CodeEdgePhase1TemplateReference())
+	if !configured {
+		// Existing single-resolver evaluator compositions inspect a separately
+		// persisted parent Run while executing the child. Preserve that
+		// cross-Run evidence path, but never allow this fallback in StartRun or
+		// worker admission (those use the strict template lookup above).
+		parentCatalog, configured = core.deploymentCatalogs.soleBinding()
+	}
+	if !configured || parentCatalog == nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge final compliance requires a deployment catalog: %w", stageprovider.ErrDeploymentOperationCatalogUnavailable)
 	}
-	if core.deploymentCatalog.lockResolver == nil || core.deploymentCatalog.lockIdentity == nil {
+	if parentCatalog.lockResolver == nil || parentCatalog.lockIdentity == nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge final compliance requires a deployment catalog lock: %w", stageprovider.ErrDeploymentOperationCatalogLockUnavailable)
 	}
 	run, err := core.store.GetWorkflowRun(ctx, runID)
@@ -217,12 +211,15 @@ func (core *lifecycleServiceCore) loadFrozenCodeEdgeRun(ctx context.Context, run
 	if !profile.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) || !specification.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) || specification.CodeEdgeFinalCompliancePolicy == nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge Run does not contain its required frozen final compliance policy")
 	}
-	if err := core.verifyRunDeploymentCatalogReceipt(*run); err != nil {
-		return frozenCodeEdgeRun{}, fmt.Errorf("verify CodeEdge deployment catalog and lock: %w", err)
-	}
 	manifest, manifestFingerprint, err := core.verifyManagedCodeEdgeRunManifest(*run)
 	if err != nil {
 		return frozenCodeEdgeRun{}, err
+	}
+	// A parent and its evaluator child intentionally use distinct deployment
+	// catalogs. Always prove the parent persisted its own catalog/lock; compare
+	// against an actively installed catalog only when it names this template.
+	if err := core.verifyPersistedCodeEdgeCatalogProof(*run, manifest, workflowadapter.CodeEdgePhase1TemplateReference()); err != nil {
+		return frozenCodeEdgeRun{}, fmt.Errorf("verify CodeEdge deployment catalog and lock: %w", err)
 	}
 	catalogRaw, err := canonicalManifestDeploymentCatalogReceipt(manifest)
 	if err != nil {
@@ -262,12 +259,16 @@ func (core *lifecycleServiceCore) loadFrozenCodeEdgeRun(ctx context.Context, run
 }
 
 func (core *lifecycleServiceCore) verifyManagedCodeEdgeRunManifest(run store.WorkflowRun) (runManifest, workflowkit.Fingerprint, error) {
+	return core.verifyManagedRunManifestForTemplate(run, workflowadapter.CodeEdgePhase1TemplateReference(), "CodeEdge Run")
+}
+
+func (core *lifecycleServiceCore) verifyManagedRunManifestForTemplate(run store.WorkflowRun, template workflowadapter.TemplateReference, label string) (runManifest, workflowkit.Fingerprint, error) {
 	var stored runManifest
 	if err := decodeStrictJSON(run.RunManifestJSON, &stored); err != nil {
-		return runManifest{}, "", fmt.Errorf("decode CodeEdge Run manifest: %w", err)
+		return runManifest{}, "", fmt.Errorf("decode %s manifest: %w", label, err)
 	}
-	if stored.Format != "harbor.workflow-run-manifest.v2" || stored.RunID != run.ID || stored.TaskID != run.TaskID || stored.Revision != run.RevisionID || !stored.Resolved.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
-		return runManifest{}, "", fmt.Errorf("CodeEdge Run manifest does not match durable Run identity")
+	if stored.Format != "harbor.workflow-run-manifest.v2" || stored.RunID != run.ID || stored.TaskID != run.TaskID || stored.Revision != run.RevisionID || !stored.Resolved.Template.Equal(template) {
+		return runManifest{}, "", fmt.Errorf("%s manifest does not match durable Run identity", label)
 	}
 	raw, err := readManagedRunExecutionInputFile(filepath.Join(core.layout.runDirectory(run.ID), "run-manifest.json"), "run manifest")
 	if err != nil {
@@ -275,14 +276,14 @@ func (core *lifecycleServiceCore) verifyManagedCodeEdgeRunManifest(run store.Wor
 	}
 	var managed runManifest
 	if err := decodeStrictJSON(string(raw), &managed); err != nil {
-		return runManifest{}, "", fmt.Errorf("decode managed CodeEdge Run manifest: %w", err)
+		return runManifest{}, "", fmt.Errorf("decode managed %s manifest: %w", label, err)
 	}
 	canonical, err := json.Marshal(managed)
 	if err != nil {
-		return runManifest{}, "", fmt.Errorf("canonicalize managed CodeEdge Run manifest: %w", err)
+		return runManifest{}, "", fmt.Errorf("canonicalize managed %s manifest: %w", label, err)
 	}
 	if !bytes.Equal(canonical, []byte(run.RunManifestJSON)) {
-		return runManifest{}, "", fmt.Errorf("managed CodeEdge Run manifest differs from durable Run manifest")
+		return runManifest{}, "", fmt.Errorf("managed %s manifest differs from durable Run manifest", label)
 	}
 	fingerprint, err := workflowkit.FingerprintBytes("harbor.workflow-run-manifest.v2", []byte(run.RunManifestJSON))
 	if err != nil {
@@ -344,55 +345,6 @@ func requireApprovedCodeEdgeReviewGate(ctx context.Context, dataStore *store.Sto
 	return nil
 }
 
-func (service *CodeEdgeComplianceService) rebuildCodeEdgeEvaluationReceipt(ctx context.Context, frozen frozenCodeEdgeRun, stage store.StageAttempt, stageKey, bundleKey, screenshotKey string, policy codeedge.EvaluationPolicy, supplied codeedge.EvaluationReceipt) (codeedge.EvaluationReceipt, error) {
-	if supplied.Status != codeedge.EvaluationCompleted {
-		return codeedge.EvaluationReceipt{}, fmt.Errorf("CodeEdge %s receipt must be a completed trusted four-trial result before final compliance", stageKey)
-	}
-	if err := supplied.Validate(); err != nil {
-		return codeedge.EvaluationReceipt{}, fmt.Errorf("validate supplied CodeEdge %s receipt: %w", stageKey, err)
-	}
-	bundleSchema, bundleBytes, err := service.readCodeEdgeStageArtifact(ctx, frozen, stage, bundleKey, supplied.RunBundleArtifactID, supplied.RunBundleContentDigest)
-	if err != nil {
-		return codeedge.EvaluationReceipt{}, err
-	}
-	screenshotSchema, screenshotBytes, err := service.readCodeEdgeStageArtifact(ctx, frozen, stage, screenshotKey, supplied.ScreenshotArtifactID, supplied.ScreenshotContentDigest)
-	if err != nil {
-		return codeedge.EvaluationReceipt{}, err
-	}
-	rebuilt, err := codeedge.BuildEvaluationReceipt(codeedge.EvaluationInput{
-		Policy: policy,
-		Binding: codeedge.EvaluationBinding{
-			TaskSnapshotDigest:  frozen.Binding.TaskSnapshotDigest,
-			CatalogFingerprint:  frozen.Binding.CatalogFingerprint,
-			LockFingerprint:     frozen.Binding.LockFingerprint,
-			ManifestFingerprint: frozen.Binding.ManifestFingerprint,
-		},
-		HarborRunBundle: codeedge.EvaluationEvidence{
-			ArtifactID: supplied.RunBundleArtifactID, ContentDigest: supplied.RunBundleContentDigest,
-			SchemaVersion: bundleSchema, MediaType: "application/json", Bytes: bundleBytes,
-		},
-		CanonicalScreenshot: codeedge.EvaluationEvidence{
-			ArtifactID: supplied.ScreenshotArtifactID, ContentDigest: supplied.ScreenshotContentDigest,
-			SchemaVersion: screenshotSchema, MediaType: supplied.ScreenshotMediaType, Bytes: screenshotBytes,
-		},
-	})
-	if err != nil {
-		return codeedge.EvaluationReceipt{}, fmt.Errorf("rebuild trusted CodeEdge %s receipt: %w", stageKey, err)
-	}
-	suppliedCanonical, err := supplied.CanonicalJSON()
-	if err != nil {
-		return codeedge.EvaluationReceipt{}, err
-	}
-	rebuiltCanonical, err := rebuilt.CanonicalJSON()
-	if err != nil {
-		return codeedge.EvaluationReceipt{}, err
-	}
-	if !bytes.Equal(suppliedCanonical, rebuiltCanonical) {
-		return codeedge.EvaluationReceipt{}, fmt.Errorf("CodeEdge %s receipt does not match its trusted result and screenshot evidence", stageKey)
-	}
-	return rebuilt, nil
-}
-
 func (service *CodeEdgeComplianceService) verifyCodeEdgeSubmissionReceipt(ctx context.Context, frozen frozenCodeEdgeRun, receipt codeedge.SubmissionCheckReceipt) error {
 	if err := receipt.Validate(); err != nil {
 		return err
@@ -413,38 +365,6 @@ func (service *CodeEdgeComplianceService) verifyCodeEdgeSubmissionReceipt(ctx co
 	// is resolved and verified by readCodeEdgeArtifactBinding below.
 	_, _, err := service.readCodeEdgeArtifactBinding(ctx, frozen, receipt.Report, workflowadapter.SubmissionLint, "submission_lint_report")
 	return err
-}
-
-func (service *CodeEdgeComplianceService) readCodeEdgeStageArtifact(ctx context.Context, frozen frozenCodeEdgeRun, stage store.StageAttempt, artifactKey string, artifactID workflowkit.ArtifactID, contentDigest workflowkit.Fingerprint) (string, []byte, error) {
-	if strings.TrimSpace(string(artifactID)) == "" {
-		return "", nil, fmt.Errorf("CodeEdge artifact ID is required")
-	}
-	if err := contentDigest.Validate(); err != nil {
-		return "", nil, err
-	}
-	reference, err := service.core.store.GetArtifactRef(ctx, string(artifactID))
-	if err != nil {
-		return "", nil, err
-	}
-	if reference == nil || reference.ID != string(artifactID) || reference.ContentDigest != string(contentDigest) || reference.ArtifactKey != artifactKey || reference.RunID != frozen.Run.ID || reference.StageKey != stage.StageKey || reference.AttemptID != stage.ID || reference.SubjectRevisionID != frozen.Revision.ID || reference.SubjectDigest != frozen.Revision.TaskDigest || reference.WorkflowFingerprint != frozen.Run.DefinitionHash {
-		return "", nil, fmt.Errorf("CodeEdge artifact %s does not match frozen stage lineage", artifactID)
-	}
-	if err := verifyStageArtifactCandidate(ctx, service.core.store, service.core.objects, frozen.Run, frozen.Revision, stageArtifactCandidate{attempt: stage, ref: *reference}); err != nil {
-		return "", nil, fmt.Errorf("verify CodeEdge artifact %s: %w", artifactID, err)
-	}
-	index, err := loadStageArtifactManifestIndex(ctx, service.core.store, reference.ManifestID)
-	if err != nil {
-		return "", nil, err
-	}
-	object, err := index.objectFor(*reference)
-	if err != nil {
-		return "", nil, err
-	}
-	bytes, err := service.core.objects.ReadAll(ctx, object)
-	if err != nil {
-		return "", nil, err
-	}
-	return reference.SchemaVersion, bytes, nil
 }
 
 func (service *CodeEdgeComplianceService) readCodeEdgeArtifactBinding(ctx context.Context, frozen frozenCodeEdgeRun, binding workflowkit.ArtifactBinding, stageKey, artifactKey string) (store.StageAttempt, []byte, error) {
@@ -483,27 +403,30 @@ func (service *CodeEdgeComplianceService) readCodeEdgeArtifactBinding(ctx contex
 	return *stage, raw, nil
 }
 
-func (service *CodeEdgeComplianceService) ensureTrustedTrialSet(ctx context.Context, run store.WorkflowRun, stage store.StageAttempt, receipt codeedge.EvaluationReceipt, actor, reason string) error {
-	if receipt.Status != codeedge.EvaluationCompleted || len(receipt.Trials) != 4 {
-		return fmt.Errorf("CodeEdge trusted receipt must contain exactly four completed logical trials")
+// completeTrustedTrialSet projects an already independently verified set of
+// logical Harbor samples onto the durable UUIDv7 TrialExecution rows created
+// before the external call. The caller owns evidence validation; this helper
+// owns only the stable four-row identity bridge and technical-attempt state
+// transitions. It is used by both controlled evaluator completion and its
+// recovery path, so final compliance can remain a pure verifier of completed
+// child evidence.
+func (service *CodeEdgeComplianceService) completeTrustedTrialSet(ctx context.Context, run store.WorkflowRun, stage store.StageAttempt, expectedCount int, actor, reason string) error {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return fmt.Errorf("CodeEdge trusted trial projector is not configured")
 	}
-	trials := append([]codeedge.EvaluationTrialReceipt(nil), receipt.Trials...)
-	sort.Slice(trials, func(left, right int) bool {
-		if trials[left].HarborTrialName != trials[right].HarborTrialName {
-			return trials[left].HarborTrialName < trials[right].HarborTrialName
-		}
-		return trials[left].HarborTrialID < trials[right].HarborTrialID
-	})
+	if expectedCount != codeEdgeEvaluatorTrialCount {
+		return fmt.Errorf("CodeEdge trusted trial projector requires exactly four logical trials")
+	}
 	existing, err := service.core.store.ListTrialExecutionsForStageAttempt(ctx, stage.ID)
 	if err != nil {
 		return err
 	}
-	if len(existing) != len(trials) {
+	if len(existing) != expectedCount {
 		return fmt.Errorf("CodeEdge evaluator stage %s must have exactly four runtime-preallocated logical trials before trusted receipt projection", stage.ID)
 	}
-	byOrdinal := make(map[int]store.TrialExecution, len(existing))
+	byOrdinal := make(map[int]store.TrialExecution, expectedCount)
 	for _, execution := range existing {
-		if execution.RunID != run.ID || execution.StageAttemptID != stage.ID || execution.StageKey != stage.StageKey || execution.Ordinal < 1 || execution.Ordinal > len(trials) {
+		if execution.RunID != run.ID || execution.StageAttemptID != stage.ID || execution.StageKey != stage.StageKey || execution.Ordinal < 1 || execution.Ordinal > expectedCount {
 			return fmt.Errorf("CodeEdge evaluator trial execution does not match its frozen stage")
 		}
 		if _, duplicate := byOrdinal[execution.Ordinal]; duplicate {
@@ -511,7 +434,7 @@ func (service *CodeEdgeComplianceService) ensureTrustedTrialSet(ctx context.Cont
 		}
 		byOrdinal[execution.Ordinal] = execution
 	}
-	for ordinal := range trials {
+	for ordinal := 0; ordinal < expectedCount; ordinal++ {
 		execution, present := byOrdinal[ordinal+1]
 		if !present {
 			return fmt.Errorf("CodeEdge evaluator stage %s has no runtime-preallocated logical trial ordinal %d", stage.ID, ordinal+1)
@@ -595,6 +518,16 @@ func (service *CodeEdgeComplianceService) completeTrustedTrial(ctx context.Conte
 	}
 	if updatedExecution.Status == store.TrialExecutionCompleted {
 		return nil
+	}
+	if updatedExecution.Status == store.TrialExecutionInDoubt {
+		reconciled, transitionErr := service.core.store.TransitionTrialExecution(ctx, store.TransitionTrialExecutionRequest{
+			TrialExecutionID: updatedExecution.ID, ExpectedVersion: updatedExecution.Version, Status: store.TrialExecutionReconciling,
+			Actor: actor, Reason: "reconcile observed CodeEdge logical trial",
+		})
+		if transitionErr != nil {
+			return transitionErr
+		}
+		updatedExecution = &reconciled
 	}
 	if updatedExecution.Status != store.TrialExecutionRunning && updatedExecution.Status != store.TrialExecutionWaiting && updatedExecution.Status != store.TrialExecutionReconciling {
 		return fmt.Errorf("CodeEdge TrialExecution %s cannot be finalized from %s", execution.ID, updatedExecution.Status)

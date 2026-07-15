@@ -26,6 +26,11 @@ type reviewGateDecisionArtifact struct {
 	InputFingerprint       string                     `json:"input_fingerprint"`
 	DecisionActor          string                     `json:"decision_actor"`
 	DecisionReason         string                     `json:"decision_reason"`
+	// EvaluatorEvidenceHandoffID/Fingerprint are populated only for the
+	// CodeEdge evaluator-evidence gate. They bind the operator's approval to
+	// the exact immutable adoption record rather than an ambient child Run.
+	EvaluatorEvidenceHandoffID          string `json:"evaluator_evidence_handoff_id,omitempty"`
+	EvaluatorEvidenceHandoffFingerprint string `json:"evaluator_evidence_handoff_fingerprint,omitempty"`
 }
 
 func (runtime *FrozenExecutionRuntime) handleReviewGateResolution(ctx context.Context, _ DurableJobExecution, job store.DurableJob) (store.JobState, error) {
@@ -92,12 +97,17 @@ func (runtime *FrozenExecutionRuntime) handleReviewGateResolution(ctx context.Co
 	if err != nil {
 		return runtime.failMalformedJob(ctx, job, err)
 	}
+	handoffBinding, err := runtime.core.verifyCodeEdgeEvaluatorEvidenceHandoffGate(ctx, *binding)
+	if err != nil {
+		return runtime.failMalformedJob(ctx, job, err)
+	}
 	if attempt.ExecutionStatus == store.StageExecutionWaiting {
 		artifact, err := json.Marshal(reviewGateDecisionArtifact{
 			Format: reviewGateDecisionArtifactFormat, ReviewRequestID: binding.ReviewRequestID, ReviewDecisionID: decision.ID,
 			Action: decision.Action, RevisionID: binding.RevisionID, RevisionDigest: binding.RevisionDigest,
 			ReviewKind: binding.ReviewKind, EvidenceManifestDigest: binding.EvidenceManifestDigest,
 			InputFingerprint: binding.InputFingerprint, DecisionActor: decision.Actor, DecisionReason: decision.Reason,
+			EvaluatorEvidenceHandoffID: string(handoffBinding.ID), EvaluatorEvidenceHandoffFingerprint: string(handoffBinding.Fingerprint),
 		})
 		if err != nil {
 			return runtime.failMalformedJob(ctx, job, fmt.Errorf("encode review gate decision evidence: %w", err))

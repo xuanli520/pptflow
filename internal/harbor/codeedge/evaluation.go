@@ -286,9 +286,10 @@ const (
 )
 
 // EvaluationTrialStatus is the per-logical-trial classification persisted in
-// the receipt.  Harbor's internal retries replace a trial result under the
+// the receipt. Harbor's internal retries replace a trial result under the
 // same trial name; result.json therefore contributes exactly one final record
-// for each logical sample.
+// for each logical sample. The job-wide aggregate retry count is retained on
+// EvaluationReceipt; it cannot safely be inferred as per-trial attempts.
 type EvaluationTrialStatus string
 
 const (
@@ -324,6 +325,7 @@ type EvaluationReceipt struct {
 	HarborEvidenceFormat         string                    `json:"harbor_evidence_format"`
 	HarborCLI                    HarborCLIIdentity         `json:"harbor_cli"`
 	HarborJobID                  string                    `json:"harbor_job_id"`
+	HarborInternalRetryCount     int                       `json:"harbor_internal_retry_count"`
 	MaterializedTaskRootV2Digest workflowkit.SubjectDigest `json:"materialized_task_root_v2_digest"`
 	TaskSnapshotDigest           workflowkit.SubjectDigest `json:"task_snapshot_digest"`
 	CatalogFingerprint           workflowkit.Fingerprint   `json:"catalog_fingerprint"`
@@ -402,6 +404,9 @@ func (receipt EvaluationReceipt) Validate() error {
 	}
 	if receipt.HarborEvidenceFormat != HarborRunBundleV018Format || !supportedScreenshotMediaType(receipt.ScreenshotMediaType) {
 		return fmt.Errorf("%w: unsupported frozen evidence format", ErrInvalidEvaluationEvidence)
+	}
+	if receipt.HarborInternalRetryCount < 0 {
+		return fmt.Errorf("%w: Harbor internal retry count must be non-negative", ErrInvalidEvaluationEvidence)
 	}
 	if err := receipt.HarborCLI.Validate(); err != nil {
 		return err
@@ -558,6 +563,7 @@ func BuildEvaluationReceipt(input EvaluationInput) (EvaluationReceipt, error) {
 		HarborEvidenceFormat:         input.Policy.HarborEvidenceFormat,
 		HarborCLI:                    bundle.HarborCLI,
 		HarborJobID:                  job.ID,
+		HarborInternalRetryCount:     job.InternalRetryCount,
 		MaterializedTaskRootV2Digest: bundle.MaterializedTaskRootV2Digest,
 		TaskSnapshotDigest:           input.Binding.TaskSnapshotDigest,
 		CatalogFingerprint:           input.Binding.CatalogFingerprint,

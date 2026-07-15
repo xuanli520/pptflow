@@ -308,7 +308,7 @@ func newLocalRuntimeServiceFixture(t *testing.T, actor string) (string, *Lifecyc
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}

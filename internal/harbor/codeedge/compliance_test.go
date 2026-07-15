@@ -35,7 +35,7 @@ func TestFinalComplianceApprovesBoundQwenAndOpusEvidence(t *testing.T) {
 
 func TestFinalComplianceRejectsQwenHardGateButRetainsDecision(t *testing.T) {
 	fixture := validFinalComplianceFixture(t)
-	qwen := fixture.input.Qwen.Clone()
+	qwen := fixture.input.Handoff.Qwen.Receipt.Clone()
 	qwen.Trials[1].Passed = true
 	qwen.PassCount = 2
 	qwen.PolicyCompliant = false
@@ -43,7 +43,7 @@ func TestFinalComplianceRejectsQwenHardGateButRetainsDecision(t *testing.T) {
 	if err := qwen.Validate(); err != nil {
 		t.Fatalf("mutated Qwen receipt must remain structurally valid: %v", err)
 	}
-	fixture.input.Qwen = qwen
+	setFinalComplianceHandoffQwen(t, &fixture.input, qwen)
 
 	service := FinalComplianceService{}
 	result, err := service.Evaluate(fixture.input)
@@ -87,7 +87,7 @@ func TestFinalComplianceRecomputesQwenNumericHardRules(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := validFinalComplianceFixture(t)
-			qwen := fixture.input.Qwen.Clone()
+			qwen := fixture.input.Handoff.Qwen.Receipt.Clone()
 			test.mutate(&qwen)
 			// A persisted receipt flag alone is never authority for the Qwen
 			// hard gate; the final service recomputes both confirmed metrics.
@@ -96,7 +96,7 @@ func TestFinalComplianceRecomputesQwenNumericHardRules(t *testing.T) {
 			if err := qwen.Validate(); err != nil {
 				t.Fatalf("mutated Qwen receipt must remain structurally valid: %v", err)
 			}
-			fixture.input.Qwen = qwen
+			setFinalComplianceHandoffQwen(t, &fixture.input, qwen)
 
 			result, err := (FinalComplianceService{}).Evaluate(fixture.input)
 			if err != nil {
@@ -114,7 +114,7 @@ func TestFinalComplianceRecomputesQwenNumericHardRules(t *testing.T) {
 
 func TestFinalComplianceTreatsOpusAsReferenceOnly(t *testing.T) {
 	fixture := validFinalComplianceFixture(t)
-	opus := fixture.input.Opus.Clone()
+	opus := fixture.input.Handoff.Opus.Receipt.Clone()
 	opus.Trials[0].TurnCount = 19
 	opus.AverageTurns = 19.75
 	opus.PolicyCompliant = false
@@ -122,7 +122,7 @@ func TestFinalComplianceTreatsOpusAsReferenceOnly(t *testing.T) {
 	if err := opus.Validate(); err != nil {
 		t.Fatalf("mutated Opus receipt must remain structurally valid: %v", err)
 	}
-	fixture.input.Opus = opus
+	setFinalComplianceHandoffOpus(t, &fixture.input, opus)
 
 	result, err := (FinalComplianceService{}).Evaluate(fixture.input)
 	if err != nil {
@@ -146,7 +146,7 @@ func TestFinalComplianceRefusesASecondOpusHardThreshold(t *testing.T) {
 
 func TestFinalComplianceRejectsCrossRunEvidenceBeforePackageDecision(t *testing.T) {
 	fixture := validFinalComplianceFixture(t)
-	fixture.input.Opus.CatalogFingerprint = workflowkit.SHA256Fingerprint([]byte("other-catalog"))
+	fixture.input.Handoff.Opus.Receipt.CatalogFingerprint = workflowkit.SHA256Fingerprint([]byte("other-catalog"))
 
 	_, err := (FinalComplianceService{}).Evaluate(fixture.input)
 	if !errors.Is(err, ErrInvalidFinalCompliance) {
@@ -199,18 +199,21 @@ func validFinalComplianceFixture(t *testing.T) finalComplianceFixture {
 	opusPolicy.Evaluator.ModelName = "opus-model"
 	opusPolicy.MaxPassingTrials = nil
 	opusInput := validEvaluationInputForPolicy(t, opusPolicy)
+	opusInput.HarborRunBundle = evidenceForBytes("opus-bundle", HarborRunBundleV018Format, "application/json", opusInput.HarborRunBundle.Bytes)
 	opusInput.CanonicalScreenshot = evidenceForBytes("opus-screenshot", "harbor.screenshot.v1", "image/png", validPNG(t))
 	opusReceipt, err := BuildEvaluationReceipt(opusInput)
 	if err != nil {
 		t.Fatalf("build Opus receipt: %v", err)
 	}
 
-	binding := FrozenRunBinding{
+	childBinding := FrozenRunBinding{
 		TaskSnapshotDigest:  qwenInput.Binding.TaskSnapshotDigest,
 		CatalogFingerprint:  qwenInput.Binding.CatalogFingerprint,
 		LockFingerprint:     qwenInput.Binding.LockFingerprint,
 		ManifestFingerprint: qwenInput.Binding.ManifestFingerprint,
 	}
+	binding := childBinding
+	binding.ManifestFingerprint = workflowkit.SHA256Fingerprint([]byte("parent-run-manifest"))
 	policy := FinalCompliancePolicy{
 		ID:                            "codeedge.phase1.final-compliance",
 		Version:                       "1",
@@ -238,8 +241,55 @@ func validFinalComplianceFixture(t *testing.T) finalComplianceFixture {
 	return finalComplianceFixture{input: FinalComplianceInput{
 		Policy:     policy,
 		Binding:    binding,
-		Qwen:       qwenReceipt,
-		Opus:       opusReceipt,
+		Handoff:    finalComplianceHandoff(t, binding, childBinding, qwenReceipt, opusReceipt),
 		Submission: submission,
 	}}
+}
+
+func finalComplianceHandoff(t *testing.T, parent, child FrozenRunBinding, qwen, opus EvaluationReceipt) EvaluatorEvidenceHandoff {
+	t.Helper()
+	makeSource := func(stageID, bundleName, screenshotName string, receipt EvaluationReceipt) EvaluatorEvidenceSource {
+		receiptFingerprint, err := receipt.Fingerprint()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return EvaluatorEvidenceSource{
+			ChildStageAttemptID: stageID, ArtifactManifestFingerprint: workflowkit.SHA256Fingerprint([]byte(stageID + "-manifest")),
+			RunBundle:           workflowkit.ArtifactBinding{Name: bundleName, ArtifactID: receipt.RunBundleArtifactID, ContentDigest: receipt.RunBundleContentDigest, SchemaVersion: HarborRunBundleV018Format},
+			CanonicalScreenshot: workflowkit.ArtifactBinding{Name: screenshotName, ArtifactID: receipt.ScreenshotArtifactID, ContentDigest: receipt.ScreenshotContentDigest, SchemaVersion: "image/png"},
+			TrialSetFingerprint: workflowkit.SHA256Fingerprint([]byte(stageID + "-trials")),
+			Receipt:             receipt, ReceiptFingerprint: receiptFingerprint,
+		}
+	}
+	handoff := EvaluatorEvidenceHandoff{
+		Format: EvaluatorEvidenceHandoffFormat, Version: EvaluatorEvidenceHandoffVersion,
+		ParentRunID: "parent-run", ParentDefinitionFingerprint: workflowkit.SHA256Fingerprint([]byte("parent-definition")), ParentBinding: parent,
+		ChildRunID: "child-run", ChildTemplateID: "harbor.codeedge-evaluator", ChildTemplateVersion: "1.0.0", ChildDefinitionFingerprint: workflowkit.SHA256Fingerprint([]byte("child-definition")), ChildBinding: child,
+		Qwen: makeSource("qwen-child-stage", "qwen_trial_result", "qwen_pass4_evidence", qwen),
+		Opus: makeSource("opus-child-stage", "opus_trial_result", "opus_pass4_evidence", opus),
+	}
+	if err := handoff.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return handoff
+}
+
+func setFinalComplianceHandoffQwen(t *testing.T, input *FinalComplianceInput, receipt EvaluationReceipt) {
+	t.Helper()
+	fingerprint, err := receipt.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.Handoff.Qwen.Receipt = receipt
+	input.Handoff.Qwen.ReceiptFingerprint = fingerprint
+}
+
+func setFinalComplianceHandoffOpus(t *testing.T, input *FinalComplianceInput, receipt EvaluationReceipt) {
+	t.Helper()
+	fingerprint, err := receipt.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.Handoff.Opus.Receipt = receipt
+	input.Handoff.Opus.ReceiptFingerprint = fingerprint
 }

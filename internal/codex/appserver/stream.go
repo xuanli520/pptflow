@@ -14,7 +14,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/executor"
 )
 
-func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
+func (s *appServerSession) readStdout(stdout io.Reader) {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), appServerMaxLineBytes(s.maxOutputBytes()))
 	for scanner.Scan() {
@@ -48,7 +48,7 @@ func (s *appServerCodexReviewSession) readStdout(stdout io.Reader) {
 	}
 }
 
-func (s *appServerCodexReviewSession) readStderr(stderr io.Reader) {
+func (s *appServerSession) readStderr(stderr io.Reader) {
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 0, 64*1024), appServerMaxLineBytes(s.maxOutputBytes()))
 	for scanner.Scan() {
@@ -76,19 +76,19 @@ func appServerMaxLineBytes(maxOutputBytes int) int {
 	return limit
 }
 
-func (s *appServerCodexReviewSession) maxOutputBytes() int {
+func (s *appServerSession) maxOutputBytes() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.req.MaxOutputBytes
 }
 
-func (s *appServerCodexReviewSession) recordStderrLine(line string) {
+func (s *appServerSession) recordStderrLine(line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	appendBoundedLine(&s.stderr, line, s.req.MaxOutputBytes)
 }
 
-func (s *appServerCodexReviewSession) recordStdoutDiagnosticLine(line string) {
+func (s *appServerSession) recordStdoutDiagnosticLine(line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	appendBoundedLine(&s.stdoutDiagnostics, line, s.req.MaxOutputBytes)
@@ -117,7 +117,7 @@ func appendBoundedLine(buffer *bytes.Buffer, line string, limit int) {
 	}
 }
 
-func (s *appServerCodexReviewSession) completeStreamError(stream string, err error) {
+func (s *appServerSession) completeStreamError(stream string, err error) {
 	if err == nil {
 		return
 	}
@@ -137,7 +137,7 @@ func (s *appServerCodexReviewSession) completeStreamError(stream string, err err
 	s.complete(executor.Result{Command: command, Stdout: stdout, Stderr: stderr, Err: streamErr}, streamErr)
 }
 
-func (s *appServerCodexReviewSession) ignoreStreamError(err error) bool {
+func (s *appServerSession) ignoreStreamError(err error) bool {
 	s.mu.Lock()
 	completed := s.completed
 	processCtx := s.processCtx
@@ -159,7 +159,7 @@ func isClosedPipeReadError(err error) bool {
 	return strings.Contains(text, "file already closed") || strings.Contains(text, "use of closed file")
 }
 
-func (s *appServerCodexReviewSession) handleNotification(message appServerRPCMessage) {
+func (s *appServerSession) handleNotification(message appServerRPCMessage) {
 	switch message.Method {
 	case "item/started":
 		var params struct {
@@ -223,7 +223,7 @@ func appServerItemFromRaw(raw json.RawMessage) appServerItem {
 	return item
 }
 
-func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnErr *struct {
+func (s *appServerSession) completeTurn(turnID, status string, turnErr *struct {
 	Message string `json:"message"`
 }) {
 	s.mu.Lock()
@@ -263,7 +263,7 @@ func (s *appServerCodexReviewSession) completeTurn(turnID, status string, turnEr
 	s.finishTurn(Result{Result: result}, err)
 }
 
-func (s *appServerCodexReviewSession) resetTurnCaptureLocked() {
+func (s *appServerSession) resetTurnCaptureLocked() {
 	s.items = map[string]string{}
 	s.deltas = map[string]string{}
 	s.deltaLogged = map[string]bool{}
@@ -276,7 +276,7 @@ func (s *appServerCodexReviewSession) resetTurnCaptureLocked() {
 	s.itemOrder = nil
 }
 
-func (s *appServerCodexReviewSession) waitProcess(ctx context.Context, command string) {
+func (s *appServerSession) waitProcess(ctx context.Context, command string) {
 	err := s.cmd.Wait()
 	s.mu.Lock()
 	completed := s.completed
@@ -301,7 +301,7 @@ func (s *appServerCodexReviewSession) waitProcess(ctx context.Context, command s
 	s.complete(result, err)
 }
 
-func (s *appServerCodexReviewSession) complete(result executor.Result, err error) {
+func (s *appServerSession) complete(result executor.Result, err error) {
 	s.mu.Lock()
 	if s.completed {
 		s.mu.Unlock()
@@ -325,14 +325,14 @@ func (s *appServerCodexReviewSession) complete(result executor.Result, err error
 	}
 }
 
-func (s *appServerCodexReviewSession) stop() {
+func (s *appServerSession) stop() {
 	s.mu.Lock()
 	cancel := s.cancel
 	s.mu.Unlock()
 	s.shutdownProcess(cancel)
 }
 
-func (s *appServerCodexReviewSession) shutdownProcess(cancel context.CancelFunc) {
+func (s *appServerSession) shutdownProcess(cancel context.CancelFunc) {
 	s.shutdownOnce.Do(func() {
 		s.mu.Lock()
 		stdin := s.stdin
@@ -365,7 +365,7 @@ func (s *appServerCodexReviewSession) shutdownProcess(cancel context.CancelFunc)
 	})
 }
 
-func (s *appServerCodexReviewSession) failStart(command string, err error) {
+func (s *appServerSession) failStart(command string, err error) {
 	s.mu.Lock()
 	stdout := s.stdoutDiagnostics.String()
 	stderr := s.stderr.String()

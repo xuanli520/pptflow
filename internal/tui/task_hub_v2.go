@@ -36,22 +36,29 @@ func (tab TaskHubTab) valid() bool {
 type TaskHubAction string
 
 const (
-	TaskHubActionNewTask         TaskHubAction = "task.new"
-	TaskHubActionImportTask      TaskHubAction = "task.import"
-	TaskHubActionEditTask        TaskHubAction = "task.edit"
-	TaskHubActionForkTask        TaskHubAction = "task.fork"
-	TaskHubActionArchiveTask     TaskHubAction = "task.archive"
-	TaskHubActionSoftDeleteTask  TaskHubAction = "task.soft_delete"
-	TaskHubActionRestoreTask     TaskHubAction = "task.restore"
-	TaskHubActionContinue        TaskHubAction = "execution.continue"
-	TaskHubActionStartRun        TaskHubAction = "execution.start"
-	TaskHubActionAttachRun       TaskHubAction = "execution.attach"
-	TaskHubActionOpenRunControl  TaskHubAction = "execution.open_control"
-	TaskHubActionApproveReview   TaskHubAction = "review.approve"
-	TaskHubActionRequestChanges  TaskHubAction = "review.request_changes"
-	TaskHubActionRejectReview    TaskHubAction = "review.reject_terminal"
-	TaskHubActionPackageRevision TaskHubAction = "release.local_package"
-	TaskHubActionWithdrawRelease TaskHubAction = "release.withdraw"
+	TaskHubActionNewTask          TaskHubAction = "task.new"
+	TaskHubActionImportTask       TaskHubAction = "task.import"
+	TaskHubActionEditTask         TaskHubAction = "task.edit"
+	TaskHubActionForkTask         TaskHubAction = "task.fork"
+	TaskHubActionArchiveTask      TaskHubAction = "task.archive"
+	TaskHubActionSoftDeleteTask   TaskHubAction = "task.soft_delete"
+	TaskHubActionRestoreTask      TaskHubAction = "task.restore"
+	TaskHubActionContinue         TaskHubAction = "execution.continue"
+	TaskHubActionStartRun         TaskHubAction = "execution.start"
+	TaskHubActionEvaluateCodeEdge TaskHubAction = "evaluation.codeedge.start"
+	// TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff adopts the verified
+	// Qwen/Opus evidence of one completed evaluator child Run into its durable
+	// Phase-1 parent. The selected Run is always the child; the adapter derives
+	// the parent from immutable child lineage rather than accepting it from UI
+	// input.
+	TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff TaskHubAction = "evaluation.codeedge.adopt_evidence_handoff"
+	TaskHubActionAttachRun                             TaskHubAction = "execution.attach"
+	TaskHubActionOpenRunControl                        TaskHubAction = "execution.open_control"
+	TaskHubActionApproveReview                         TaskHubAction = "review.approve"
+	TaskHubActionRequestChanges                        TaskHubAction = "review.request_changes"
+	TaskHubActionRejectReview                          TaskHubAction = "review.reject_terminal"
+	TaskHubActionPackageRevision                       TaskHubAction = "release.local_package"
+	TaskHubActionWithdrawRelease                       TaskHubAction = "release.withdraw"
 )
 
 // TaskHubActionState is supplied by the lifecycle service for the currently
@@ -89,15 +96,18 @@ func (task TaskHubTask) Clone() TaskHubTask {
 	return task
 }
 
-// TaskHubRunControlAction identifies a durable control operation whose impact
-// can be inspected from the Run Control overlay. Selecting one in the TUI
-// never creates the operation.
+// TaskHubRunControlAction identifies an operator-initiated Run action whose
+// impact can be inspected from the Run Control overlay. Most actions create a
+// durable ControlOperation; reconcile instead invokes the same scoped local
+// recovery boundary as `harbor run reconcile`. Selecting any action in the
+// TUI never creates it.
 type TaskHubRunControlAction string
 
 const (
 	TaskHubRunControlPause       TaskHubRunControlAction = "pause"
 	TaskHubRunControlCancelStage TaskHubRunControlAction = "cancel_stage"
 	TaskHubRunControlTerminate   TaskHubRunControlAction = "terminate"
+	TaskHubRunControlReconcile   TaskHubRunControlAction = "reconcile"
 )
 
 // TaskHubRunControlActionState is an authoritative capability projection.
@@ -480,7 +490,9 @@ type TaskHubRunControlPlanner interface {
 
 // TaskHubRunControlMutationRequest is sent after the Run Control overlay has
 // shown its impact preview and the native confirmation form collected input.
-// Expected is the immutable checkpoint captured by that preview.
+// Expected is the immutable checkpoint captured by the preview for durable
+// control actions. The scoped local reconcile action deliberately follows the
+// CLI contract and uses only its explicit Run, actor, and audit reason.
 type TaskHubRunControlMutationRequest struct {
 	Action         TaskHubRunControlAction  `json:"action"`
 	Target         TaskHubTarget            `json:"target"`
@@ -490,16 +502,17 @@ type TaskHubRunControlMutationRequest struct {
 	IdempotencyKey string                   `json:"idempotency_key"`
 }
 
-// TaskHubRunControlMutationResult is a UI-safe durable control receipt.
+// TaskHubRunControlMutationResult is a UI-safe confirmed Run-action receipt.
 type TaskHubRunControlMutationResult struct {
 	Action      TaskHubRunControlAction `json:"action"`
 	OperationID string                  `json:"operation_id,omitempty"`
 	Summary     string                  `json:"summary"`
 }
 
-// TaskHubRunControlMutationExecutor owns the durable request. Implementations
-// must use the supplied expected checkpoint rather than recomputing one after
-// the operator has confirmed the preview.
+// TaskHubRunControlMutationExecutor owns the confirmed Run action.
+// ControlOperation actions must use the supplied expected checkpoint rather
+// than recomputing one after the operator has confirmed the preview. Local
+// reconciliation intentionally matches the CLI's scoped recovery contract.
 type TaskHubRunControlMutationExecutor interface {
 	ExecuteTaskHubRunControlMutation(context.Context, TaskHubRunControlMutationRequest) (TaskHubRunControlMutationResult, error)
 }
@@ -1194,6 +1207,10 @@ func taskHubActionForSequence(prefix, second rune) (TaskHubAction, bool) {
 			return TaskHubActionContinue, true
 		case 'n':
 			return TaskHubActionStartRun, true
+		case 'e':
+			return TaskHubActionEvaluateCodeEdge, true
+		case 'h':
+			return TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff, true
 		case 'a':
 			return TaskHubActionAttachRun, true
 		case 'k':
@@ -1224,7 +1241,7 @@ func taskHubPrefixActions(prefix rune) []TaskHubAction {
 	case 't':
 		return []TaskHubAction{TaskHubActionNewTask, TaskHubActionImportTask, TaskHubActionEditTask, TaskHubActionForkTask, TaskHubActionArchiveTask, TaskHubActionSoftDeleteTask, TaskHubActionRestoreTask}
 	case 'x':
-		return []TaskHubAction{TaskHubActionContinue, TaskHubActionStartRun, TaskHubActionAttachRun, TaskHubActionOpenRunControl}
+		return []TaskHubAction{TaskHubActionContinue, TaskHubActionStartRun, TaskHubActionEvaluateCodeEdge, TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff, TaskHubActionAttachRun, TaskHubActionOpenRunControl}
 	case 'v':
 		return []TaskHubAction{TaskHubActionApproveReview, TaskHubActionRequestChanges, TaskHubActionRejectReview}
 	case 'p':
@@ -1434,7 +1451,7 @@ func (m *model) updateTaskHubMutationKey(msg tea.KeyMsg) tea.Cmd {
 
 func taskHubMutationRequiresPreparation(action TaskHubAction) bool {
 	switch action {
-	case TaskHubActionContinue, TaskHubActionEditTask, TaskHubActionStartRun:
+	case TaskHubActionContinue, TaskHubActionEditTask, TaskHubActionStartRun, TaskHubActionEvaluateCodeEdge, TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff:
 		return true
 	default:
 		return false
@@ -1621,7 +1638,7 @@ func taskHubActionKey(action TaskHubAction) string {
 		action TaskHubAction
 	}{
 		{'t', 'n', TaskHubActionNewTask}, {'t', 'i', TaskHubActionImportTask}, {'t', 'e', TaskHubActionEditTask}, {'t', 'f', TaskHubActionForkTask}, {'t', 'a', TaskHubActionArchiveTask}, {'t', 'd', TaskHubActionSoftDeleteTask}, {'t', 'u', TaskHubActionRestoreTask},
-		{'x', 'c', TaskHubActionContinue}, {'x', 'n', TaskHubActionStartRun}, {'x', 'a', TaskHubActionAttachRun}, {'x', 'k', TaskHubActionOpenRunControl},
+		{'x', 'c', TaskHubActionContinue}, {'x', 'n', TaskHubActionStartRun}, {'x', 'e', TaskHubActionEvaluateCodeEdge}, {'x', 'h', TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff}, {'x', 'a', TaskHubActionAttachRun}, {'x', 'k', TaskHubActionOpenRunControl},
 		{'v', 'a', TaskHubActionApproveReview}, {'v', 'c', TaskHubActionRequestChanges}, {'v', 'r', TaskHubActionRejectReview},
 		{'p', 'p', TaskHubActionPackageRevision}, {'p', 'w', TaskHubActionWithdrawRelease},
 	} {
@@ -1652,6 +1669,10 @@ func taskHubActionLabel(action TaskHubAction) string {
 		return "继续处理"
 	case TaskHubActionStartRun:
 		return "启动新 Run"
+	case TaskHubActionEvaluateCodeEdge:
+		return "执行 CodeEdge 评测"
+	case TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff:
+		return "采用 CodeEdge 评测证据"
 	case TaskHubActionAttachRun:
 		return "Attach Run"
 	case TaskHubActionOpenRunControl:
@@ -1673,7 +1694,7 @@ func taskHubActionLabel(action TaskHubAction) string {
 
 func taskHubRunControlActionKnown(action TaskHubRunControlAction) bool {
 	switch action {
-	case TaskHubRunControlPause, TaskHubRunControlCancelStage, TaskHubRunControlTerminate:
+	case TaskHubRunControlPause, TaskHubRunControlCancelStage, TaskHubRunControlTerminate, TaskHubRunControlReconcile:
 		return true
 	default:
 		return false
@@ -1688,6 +1709,8 @@ func taskHubRunControlActionLabel(action TaskHubRunControlAction) string {
 		return "取消选中阶段"
 	case TaskHubRunControlTerminate:
 		return "终止本次运行"
+	case TaskHubRunControlReconcile:
+		return "本地 reconcile"
 	default:
 		return string(action)
 	}

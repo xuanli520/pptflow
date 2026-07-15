@@ -32,6 +32,9 @@ func newLifecycleTUICommandWithRunner(config *lifecycleCLIConfig, runner lifecyc
 			if runner == nil {
 				return fmt.Errorf("lifecycle TUI runner is required")
 			}
+			if err := config.preflightLifecycleServices(); err != nil {
+				return fmt.Errorf("preflight lifecycle deployment: %w", err)
+			}
 			dataStore, err := store.Open(config.root)
 			if err != nil {
 				return fmt.Errorf("open lifecycle control plane: %w", err)

@@ -155,6 +155,12 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 	}
 	run, err := session.services.Runs.Get(ctx, session.runID)
 	if err != nil {
+		// database/sql may surface SQLite's interrupted status when the process
+		// context is cancelled while a read is in flight. The session boundary
+		// promises process-cancellation semantics, not a driver-specific error.
+		if contextErr := ctx.Err(); contextErr != nil {
+			return RunWorkerSessionResult{}, contextErr
+		}
 		return RunWorkerSessionResult{}, err
 	}
 	if !runWorkerRunnable(run.Status) {
@@ -166,6 +172,9 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 		claim, claimErr := session.services.WorkerHandoffs.ClaimRunWorkerHandoff(ctx, session.handoffOperationID, session.runID, session.owner,
 			session.handoffProcessID, session.handoffLogPath, session.actor, session.reason+": child claim controlled handoff", session.leaseTTL)
 		if claimErr != nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return RunWorkerSessionResult{}, contextErr
+			}
 			return RunWorkerSessionResult{}, fmt.Errorf("claim controlled run-worker handoff: %w", claimErr)
 		}
 		lease = claim.WorkerLease
@@ -177,6 +186,9 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 			Actor: session.actor, Reason: session.reason + ": acquire controlled run worker",
 		})
 		if acquireErr != nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return RunWorkerSessionResult{}, contextErr
+			}
 			return RunWorkerSessionResult{}, fmt.Errorf("acquire controlled run-worker lease: %w", acquireErr)
 		}
 		lease = acquired
@@ -210,10 +222,19 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 		cycle, cycleErr := session.worker.RunOnce(ctx)
 		result.LastCycle = cycle
 		if cycleErr != nil && cycle.FinalState == "" {
+			// A cancellation can race an otherwise-empty durable claim. SQLite
+			// reports that race as "interrupted (9)" rather than context.Canceled;
+			// preserve the Run contract at the process boundary.
+			if contextErr := ctx.Err(); contextErr != nil {
+				return result, contextErr
+			}
 			return result, cycleErr
 		}
 		current, err := session.services.Runs.Get(ctx, session.runID)
 		if err != nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return result, contextErr
+			}
 			return result, err
 		}
 		result.Run = current

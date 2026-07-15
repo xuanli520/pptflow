@@ -406,7 +406,7 @@ func TestLifecycleMutationStartRunFreezesExplicitInputsBeforeExecution(t *testin
 func TestStartRunRejectsUnconfiguredOperationResolverBeforePersistentMutation(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +690,7 @@ func TestLifecycleMutationReviewUsesFullCheckpointAndRecoversAfterDecisionCommit
 func newLifecycleMutationTestServices(t *testing.T) (string, *LifecycleServices) {
 	t.Helper()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}

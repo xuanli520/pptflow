@@ -13,7 +13,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/executor"
 )
 
-type appServerCodexReviewSession struct {
+type appServerSession struct {
 	mu                    sync.Mutex
 	writeMu               sync.Mutex
 	turnMu                sync.Mutex
@@ -53,11 +53,11 @@ type appServerCodexReviewSession struct {
 	warnings              []Warning
 }
 
-func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request) error {
+func (s *appServerSession) Start(ctx context.Context, request Request) error {
 	s.mu.Lock()
 	if s.done != nil {
 		s.mu.Unlock()
-		return fmt.Errorf("codex app-server review session already started")
+		return fmt.Errorf("codex app-server session already started")
 	}
 	s.req = request
 	s.done = make(chan struct{})
@@ -71,7 +71,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	s.mu.Unlock()
 
 	if !request.HasAppServer {
-		err := fmt.Errorf("codex CLI does not expose app-server; active-turn guidance requires codex app-server turn/steer")
+		err := fmt.Errorf("codex CLI does not expose app-server; interactive agent turns require codex app-server")
 		s.complete(executor.Result{Command: request.CommandPath + " app-server --listen stdio://", Err: err, Stderr: err.Error()}, err)
 		return err
 	}
@@ -152,7 +152,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	if _, err := s.sendRequest(initCtx, "initialize", map[string]any{
-		"clientInfo": map[string]any{"name": "harbor-factory", "version": "0"},
+		"clientInfo": appServerClientInfo(request),
 		"capabilities": map[string]any{
 			"experimentalApi": true,
 		},
@@ -182,7 +182,7 @@ func (s *appServerCodexReviewSession) Start(ctx context.Context, request Request
 	return nil
 }
 
-func (s *appServerCodexReviewSession) Turn(ctx context.Context, request TurnRequest) (Result, error) {
+func (s *appServerSession) Turn(ctx context.Context, request TurnRequest) (Result, error) {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
 
@@ -272,13 +272,13 @@ func (s *appServerCodexReviewSession) Turn(ctx context.Context, request TurnRequ
 	return result, turnErr
 }
 
-func (s *appServerCodexReviewSession) finishTurn(result Result, err error) {
+func (s *appServerSession) finishTurn(result Result, err error) {
 	s.mu.Lock()
 	s.finishTurnLocked(result, err)
 	s.mu.Unlock()
 }
 
-func (s *appServerCodexReviewSession) finishTurnLocked(result Result, err error) {
+func (s *appServerSession) finishTurnLocked(result Result, err error) {
 	if s.turnDone == nil {
 		return
 	}
@@ -292,7 +292,7 @@ func (s *appServerCodexReviewSession) finishTurnLocked(result Result, err error)
 	close(done)
 }
 
-func (s *appServerCodexReviewSession) Close() error {
+func (s *appServerSession) Close() error {
 	s.mu.Lock()
 	done := s.done
 	completed := s.completed
@@ -308,14 +308,14 @@ func (s *appServerCodexReviewSession) Close() error {
 	return nil
 }
 
-func (s *appServerCodexReviewSession) SendGuidance(ctx context.Context, message string) error {
+func (s *appServerSession) SendGuidance(ctx context.Context, message string) error {
 	s.mu.Lock()
 	done := s.done
 	threadID := s.threadID
 	turnID := s.turnID
 	s.mu.Unlock()
 	if done == nil {
-		return fmt.Errorf("codex app-server review session is not started")
+		return fmt.Errorf("codex app-server session is not started")
 	}
 	select {
 	case <-done:

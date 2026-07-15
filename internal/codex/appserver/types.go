@@ -16,6 +16,8 @@ type Session interface {
 }
 
 type Request struct {
+	ClientName        string
+	ClientVersion     string
 	Timeout           time.Duration
 	ProjectPath       string
 	LogPath           string
@@ -75,7 +77,7 @@ type Warning struct {
 }
 
 func New(envKeys []string) Session {
-	return &appServerCodexReviewSession{envKeys: append([]string{}, envKeys...)}
+	return &appServerSession{envKeys: append([]string{}, envKeys...)}
 }
 
 func (w Warning) OK() bool {

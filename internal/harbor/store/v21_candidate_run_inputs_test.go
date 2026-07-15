@@ -29,6 +29,21 @@ func TestCommitRevisionCandidateContinuationAtomicallyPersistsChildRunInputsAndR
 	if run, err := fixture.store.GetWorkflowRun(ctx, fixture.candidate.TargetRunID); err != nil || run == nil || run.ID != committed.Run.ID || run.RevisionID != committed.Revision.ID {
 		t.Fatalf("committed child run = %+v, %v", run, err)
 	}
+	for _, identity := range []struct {
+		id         string
+		entityType string
+	}{
+		{id: committed.Revision.ID, entityType: "task_revision"},
+		{id: committed.Run.ID, entityType: "workflow_run"},
+	} {
+		var entityType string
+		if err := fixture.store.db.QueryRow(`SELECT entity_type FROM entity_id_registry WHERE id = ?`, identity.id).Scan(&entityType); err != nil {
+			t.Fatalf("read promoted identity %s: %v", identity.id, err)
+		}
+		if entityType != identity.entityType {
+			t.Fatalf("promoted identity %s registry type=%q, want %q", identity.id, entityType, identity.entityType)
+		}
+	}
 	input, err := fixture.store.GetRunInputArtifact(ctx, inputID)
 	if err != nil || input == nil {
 		t.Fatalf("committed child run input = %+v, %v", input, err)
@@ -118,18 +133,17 @@ func prepareCandidateContinuationCommitFixture(t *testing.T) (revisionCandidateP
 		WorkflowFingerprint: fixture.run.DefinitionHash,
 	}
 	snapshot := workflowkit.ContinuationPlanSnapshot{
-		PlanID:              planRequest.ID,
-		CommandID:           fixture.command.ID,
-		Strategy:            workflowkit.StrategyReviseSubject,
-		BaseCheckpoint:      workflowkit.CheckpointRef{Sequence: checkpoint.Sequence, ExecutionEpoch: checkpoint.ExecutionEpoch, SubjectVersion: checkpoint.SubjectVersion, SubjectID: checkpoint.SubjectID, SubjectRevisionID: checkpoint.SubjectRevisionID, SubjectDigest: workflowkit.SubjectDigest(checkpoint.SubjectDigest), WorkflowFingerprint: workflowkit.Fingerprint(checkpoint.WorkflowFingerprint)},
-		NextExecutionEpoch:  fixture.run.ExecutionEpoch + 1,
-		SourceRunID:         fixture.run.ID,
-		TargetRunRelation:   workflowkit.RelationChildRun,
-		PreparedChangeID:    fixture.change.ID,
-		SubjectRevisionID:   fixture.candidate.TargetRevisionID,
-		SubjectDigest:       workflowkit.SubjectDigest(fixture.candidate.AfterDigest),
-		CandidateRevisionID: fixture.candidate.ID,
-		ExpiresAt:           expiresAt,
+		PlanID:             planRequest.ID,
+		CommandID:          fixture.command.ID,
+		Strategy:           workflowkit.StrategyReviseSubject,
+		BaseCheckpoint:     workflowkit.CheckpointRef{Sequence: checkpoint.Sequence, ExecutionEpoch: checkpoint.ExecutionEpoch, SubjectVersion: checkpoint.SubjectVersion, SubjectID: checkpoint.SubjectID, SubjectRevisionID: checkpoint.SubjectRevisionID, SubjectDigest: workflowkit.SubjectDigest(checkpoint.SubjectDigest), WorkflowFingerprint: workflowkit.Fingerprint(checkpoint.WorkflowFingerprint)},
+		NextExecutionEpoch: fixture.run.ExecutionEpoch + 1,
+		SourceRunID:        fixture.run.ID,
+		TargetRunRelation:  workflowkit.RelationChildRun,
+		PreparedChangeID:   fixture.change.ID,
+		SubjectRevisionID:  fixture.candidate.TargetRevisionID,
+		SubjectDigest:      workflowkit.SubjectDigest(fixture.candidate.AfterDigest),
+		ExpiresAt:          expiresAt,
 	}
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
@@ -148,7 +162,6 @@ func prepareCandidateContinuationCommitFixture(t *testing.T) (revisionCandidateP
 	request := CommitRevisionCandidateContinuationRequest{
 		ID:             mustUUIDv7(t),
 		PlanID:         plan.ID,
-		CandidateID:    candidate.ID,
 		IdempotencyKey: "candidate-continuation:" + candidate.ID,
 		PayloadJSON:    `{"continuation":"candidate"}`,
 		Expected:       checkpoint,

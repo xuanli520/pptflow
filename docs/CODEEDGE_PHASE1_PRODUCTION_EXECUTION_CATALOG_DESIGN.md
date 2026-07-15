@@ -159,10 +159,11 @@ invocation policy（它必须归一化为四个逻辑 Trial）、结果格式、
 扩大到 5。
 
 本机已核验的 Harbor `0.18.0` 中，`-k/--n-attempts=4` 是每个 task/agent
-组合生成四个 attempt/trial，`-n/--n-concurrent=4` 是并发度；培训材料把这两个
-flag 的说明写反了。生产 operation 仍冻结用户确认的 `-n 4 -k 4`，但 receipt
-必须记录上述真实 CLI 语义、四个产生的 logical Trial ID 和结果，而不能把
-并发度误当作样本数。
+组合生成四个 attempt/trial，`-n/--n-concurrent=1` 是当前生产 profile 的串行
+并发度；培训材料把这两个 flag 的说明写反了。生产 operation 冻结用户确认的
+`--n-attempts 4 --n-concurrent 1 --max-retries 3`，并且 Qwen 完成后才允许
+Opus 开始。receipt 必须记录真实 CLI 语义、四个产生的 logical Trial ID 和
+结果，而不能把并发度误当作样本数。
 
 ## 6. 已确认的执行顺序与隔离边界
 
@@ -231,12 +232,15 @@ TUI、review 和自动 repair 使用；它们不得被下游当作成功输入�
 
 外部副作用（Docker build、Harbor CLI 评测、package 创建）在 worker 丢失或
 结果未知时进入 `in_doubt`，先通过 receipt/result/package digest reconcile，
-再决定 completed、failed_recoverable 或 needs_human。禁止盲目重跑而重复计算
-Trial 或制造第二个本地 package。
+再决定 completed、failed_recoverable 或 needs_human。Harbor evaluator 的
+reconcile 只读取受管本地 job 目录中的 `result.json`、Trial 结果、`config.json`
+和 `lock.json`；它不上传、下载或查询远端结果。禁止盲目重跑而重复计算 Trial 或
+制造第二个本地 package。
 
 ## 9. 已确认策略与仍需提供的真实部署值
 
-已确认：独立 CodeEdge descriptor；冻结 `harbor run -n 4 -k 4`；评测受管 task
+已确认：独立、串行的 CodeEdge evaluator child descriptor；冻结
+`harbor run --n-attempts 4 --n-concurrent 1 --max-retries 3`；评测受管 task
 snapshot；Qwen/Opus 后、最终合规 review 后才创建 package；每次外部副作用前
 重验 catalog/lock/attestation；显式 `MetadataFieldMapping`；可信 `result.json`
 加每模型一张截图；Opus 仅作参考；本地不实施三小时外部频控。

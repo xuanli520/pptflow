@@ -152,7 +152,7 @@ func TestFindingBundleRequiresNonEmptyCanonicalReportEvidence(t *testing.T) {
 func TestCandidateLeaseHeartbeatReturnsLatestFenceAcrossMultipleRenewals(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestCandidateLeaseHeartbeatReturnsLatestFenceAcrossMultipleRenewals(t *test
 func TestCandidateLeaseHeartbeatRenewsBeforeProviderStarts(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestCandidateLeaseHeartbeatRenewsBeforeProviderStarts(t *testing.T) {
 func TestCandidateLeaseHeartbeatEnforcesProviderBudgetDeadline(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestCandidateLeaseHeartbeatEnforcesProviderBudgetDeadline(t *testing.T) {
 func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := plan.Snapshot()
-	if snapshot.Strategy != "revise_subject" || snapshot.TargetRunRelation != "child_run" || snapshot.CandidateRevisionID == "" {
+	if snapshot.Strategy != "revise_subject" || snapshot.TargetRunRelation != "child_run" {
 		t.Fatalf("content continuation plan = %+v", snapshot)
 	}
 	for _, transition := range snapshot.Nodes {
@@ -271,7 +271,7 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 			t.Fatalf("candidate continuation preserved source evidence for %q: %+v", transition.NodeID, transition)
 		}
 	}
-	candidate, err := database.GetRevisionCandidate(ctx, snapshot.CandidateRevisionID)
+	candidate, err := database.GetRevisionCandidateByFrozenPlan(ctx, snapshot.PlanID)
 	if err != nil || candidate == nil || candidate.State != store.RevisionCandidatePrepared || candidate.AfterDigest == revision.TaskDigest {
 		t.Fatalf("candidate = %+v, err=%v", candidate, err)
 	}
@@ -422,7 +422,7 @@ func TestChangeProviderCreatesIsolatedRevisionAndChildRun(t *testing.T) {
 func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile := codeEdgeEvaluatorRuntimeProfile(t)
+	profile := codeEdgePhase1RuntimeProfile(t)
 	profile.CandidateProviderBudget = workflowadapter.CandidateProviderBudget{
 		AttemptTimeout: 15 * time.Second,
 		StartupGrace:   2 * time.Second,
@@ -486,15 +486,23 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	if transitions[workflowkit.NodeID(workflowadapter.RepoPrepare)].Disposition != workflowkit.DispositionSchedule {
 		t.Fatalf("CodeEdge candidate root transition = %+v, want schedule", transitions[workflowkit.NodeID(workflowadapter.RepoPrepare)])
 	}
-	for _, nodeID := range []workflowkit.NodeID{workflowadapter.HarborRunQwen, workflowadapter.HarborRunOpus, workflowadapter.SubmissionLint, workflowadapter.ResultReview} {
-		if transitions[nodeID].Disposition != workflowkit.DispositionInvalidate {
-			t.Fatalf("CodeEdge candidate external-effect closure transition %q = %+v, want invalidate", nodeID, transitions[nodeID])
+	// Qwen and Opus now belong to the separately frozen evaluator child. A
+	// content revision schedules the parent-owned evidence handoff and every
+	// downstream parent stage in the new Run; the next evaluator child is
+	// launched only after that parent reaches the handoff boundary.
+	for nodeID, want := range map[workflowkit.NodeID]workflowkit.NodeDisposition{
+		workflowadapter.EvaluatorEvidenceHandoff: workflowkit.DispositionSchedule,
+		workflowadapter.SubmissionLint:           workflowkit.DispositionSchedule,
+		workflowadapter.ResultReview:             workflowkit.DispositionSchedule,
+	} {
+		if transitions[nodeID].Disposition != want {
+			t.Fatalf("CodeEdge candidate external-effect closure transition %q = %+v, want %s", nodeID, transitions[nodeID], want)
 		}
 	}
 	if transitions[workflowkit.NodeID(workflowadapter.Package)].Disposition != workflowkit.DispositionOperatorOnly {
 		t.Fatalf("CodeEdge candidate package transition = %+v, want operator-only", transitions[workflowkit.NodeID(workflowadapter.Package)])
 	}
-	candidate, err := database.GetRevisionCandidate(ctx, plan.Snapshot().CandidateRevisionID)
+	candidate, err := database.GetRevisionCandidateByFrozenPlan(ctx, plan.ID())
 	if err != nil || candidate == nil {
 		t.Fatalf("load prepared CodeEdge candidate = %+v, %v", candidate, err)
 	}
@@ -678,7 +686,7 @@ func (testRepairConversation) Close() error { return nil }
 func TestAgentRepairProviderCreatesBoundRepairSessionInCandidate(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,7 +720,7 @@ func TestAgentRepairProviderCreatesBoundRepairSessionInCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate, err := database.GetRevisionCandidate(ctx, plan.Snapshot().CandidateRevisionID)
+	candidate, err := database.GetRevisionCandidateByFrozenPlan(ctx, plan.ID())
 	if err != nil || candidate == nil || candidate.RepairSessionID == "" || candidate.RoundOrdinal != 1 {
 		t.Fatalf("agent candidate = %+v, %v", candidate, err)
 	}
@@ -728,7 +736,7 @@ func TestAgentRepairProviderCreatesBoundRepairSessionInCandidate(t *testing.T) {
 func TestChangeProviderRejectsUntrustedFindingEvidenceBeforeCandidateCreation(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -774,7 +782,7 @@ func TestChangeProviderRejectsUntrustedFindingEvidenceBeforeCandidateCreation(t 
 func TestChangeProviderMarksMismatchedDeclaredPathsForReconciliation(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}

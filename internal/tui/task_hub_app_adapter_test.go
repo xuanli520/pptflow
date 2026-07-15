@@ -28,6 +28,29 @@ func newTaskHubAdapterLifecycleServices(root string, dataStore *store.Store) (*a
 	})
 }
 
+type taskHubEvaluatorDefinitionProvider struct {
+	profile workflowadapter.ExecutionProfile
+	spec    workflowadapter.RunExecutionSpec
+	err     error
+}
+
+func (provider *taskHubEvaluatorDefinitionProvider) DefinitionForEvaluatorRun(_ context.Context, _ app.EvaluatorRunDefinitionRequest) (app.EvaluatorRunDefinition, error) {
+	if provider == nil {
+		return app.EvaluatorRunDefinition{}, app.ErrCodeEdgeEvaluatorDefinitionUnavailable
+	}
+	if provider.err != nil {
+		return app.EvaluatorRunDefinition{}, provider.err
+	}
+	return app.EvaluatorRunDefinition{Profile: provider.profile.Clone(), ExecutionSpec: provider.spec.Clone()}, nil
+}
+
+func newTaskHubEvaluatorLifecycleServices(root string, dataStore *store.Store, provider app.EvaluatorRunDefinitionProvider) (*app.LifecycleServices, error) {
+	return app.NewLifecycleServicesWithOptions(root, dataStore, app.LifecycleServicesOptions{
+		OperationResolver:              testsupport.AcceptAllStageOperationResolver(),
+		EvaluatorRunDefinitionProvider: provider,
+	})
+}
+
 func TestAppTaskHubLifecycleAdapterQueriesRealServicesAndPlansWithoutMutation(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -652,6 +675,153 @@ func taskHubCreateCodeEdgePackageRun(t *testing.T, ctx context.Context, services
 	return run
 }
 
+func TestAppTaskHubProjectsCodeEdgeEvaluatorEligibilityWithoutLeakingDefinitionErrors(t *testing.T) {
+	ctx, services, provider, task, revision, parent := newTaskHubCodeEdgeEvaluatorFixture(t)
+	launcher := &recordingTaskHubRunWorkerLauncher{}
+	adapter := NewAppTaskHubLifecycleAdapterWithRunWorkerHandoffLauncher(services, launcher)
+
+	snapshot, err := adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubRunsTab})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentProjection := taskHubRunProjectionByID(t, snapshot, parent.ID)
+	action, found := taskHubActionStateFor(parentProjection.Actions, TaskHubActionEvaluateCodeEdge)
+	if !found || action.Enabled || !strings.Contains(action.DisabledReason, "FinalReview") {
+		t.Fatalf("unapproved evaluator action = %+v, want FinalReview-gated state", action)
+	}
+
+	parent = taskHubApproveCodeEdgeFinalReviewGate(t, ctx, services, parent, revision)
+	snapshot, err = adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubRunsTab})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentProjection = taskHubRunProjectionByID(t, snapshot, parent.ID)
+	action, found = taskHubActionStateFor(parentProjection.Actions, TaskHubActionEvaluateCodeEdge)
+	if !found || !action.Enabled || action.DisabledReason != "" {
+		t.Fatalf("approved evaluator action = %+v, want enabled", action)
+	}
+
+	provider.err = errors.New("definition provider rejected credential=unexposed-test-secret")
+	snapshot, err = adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubRunsTab})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentProjection = taskHubRunProjectionByID(t, snapshot, parent.ID)
+	action, found = taskHubActionStateFor(parentProjection.Actions, TaskHubActionEvaluateCodeEdge)
+	if !found || action.Enabled || strings.Contains(action.DisabledReason, "unexposed-test-secret") || !strings.Contains(action.DisabledReason, "定义") {
+		t.Fatalf("unsafe evaluator definition failure projection = %+v", action)
+	}
+	plan, err := adapter.PlanTaskHubCommand(ctx, TaskHubCommand{Action: TaskHubActionEvaluateCodeEdge, Target: TaskHubTarget{TaskID: task.ID, RevisionID: revision.ID, RunID: parent.ID}})
+	if err != nil || plan.ConfirmationNeeded || strings.Contains(plan.Reason, "unexposed-test-secret") || !strings.Contains(plan.Reason, "定义") {
+		t.Fatalf("unsafe evaluator plan projection = %+v, %v", plan, err)
+	}
+	expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, task.ID, revision.ID, parent.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, prepareErr := adapter.PrepareTaskHubMutation(ctx, TaskHubMutationRequest{
+		Action: TaskHubActionEvaluateCodeEdge, Target: TaskHubTarget{TaskID: task.ID, RevisionID: revision.ID, RunID: parent.ID},
+		Expected: expected, Actor: "tester", Reason: "assert provider errors remain private", IdempotencyKey: mustTaskHubCodeEdgeUUID(t),
+	})
+	if prepareErr == nil || strings.Contains(prepareErr.Error(), "unexposed-test-secret") || !strings.Contains(prepareErr.Error(), "定义") {
+		t.Fatalf("unsafe evaluator prepare error = %v", prepareErr)
+	}
+}
+
+func newTaskHubCodeEdgeEvaluatorFixture(t *testing.T) (context.Context, *app.LifecycleServices, *taskHubEvaluatorDefinitionProvider, store.TaskV2, store.TaskRevision, store.WorkflowRun) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	provider := &taskHubEvaluatorDefinitionProvider{
+		profile: taskHubAdapterCompleteProfileForTemplate(t, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplate()),
+	}
+	services, err := newTaskHubEvaluatorLifecycleServices(root, database, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, revision, err := services.Tasks.ImportTask(ctx, app.ImportTaskRequest{
+		CreateDraftTaskRequest: app.CreateDraftTaskRequest{Slug: "tui-codeedge-evaluator", Title: "TUI CodeEdge Evaluator", Actor: "tester", Reason: "create CodeEdge evaluator fixture"},
+		SourceDirectory:        taskHubAdapterSnapshot(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.spec = testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	parent := taskHubCreateCodeEdgePackageRun(t, ctx, services, task, revision)
+	return ctx, services, provider, task, revision, parent
+}
+
+func taskHubApproveCodeEdgeFinalReviewGate(t *testing.T, ctx context.Context, services *app.LifecycleServices, parent store.WorkflowRun, revision store.TaskRevision) store.WorkflowRun {
+	t.Helper()
+	running, err := services.Store().TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
+		Actor: "tester", Reason: "open approved CodeEdge FinalReview fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, found := workflowadapter.CodeEdgePhase1StageCatalog().Stage(workflowkit.StageKey(workflowadapter.FinalReview))
+	if !found {
+		t.Fatal("CodeEdge Phase-1 catalog lacks FinalReview")
+	}
+	inputFingerprint := taskHubTestFingerprint('c')
+	stage, err := services.Store().CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: running.ID, StageKey: workflowadapter.FinalReview, StageGroup: string(definition.Group), Ordinal: 1,
+		InputFingerprint: inputFingerprint, BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		Actor: "tester", Reason: "create approved CodeEdge FinalReview fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := services.Store().OpenReviewGate(ctx, store.OpenReviewGateRequest{
+		RunID: running.ID, ExpectedRunVersion: running.Version, RevisionID: revision.ID, RevisionDigest: revision.TaskDigest, DefinitionHash: running.DefinitionHash,
+		StageAttemptID: stage.ID, ExpectedStageAttemptVersion: stage.Version, StageKey: workflowadapter.FinalReview, ReviewKind: string(workflowadapter.ReviewFinalQuality),
+		NodeGeneration: 0, NodeAttempt: 1, InputBindingsJSON: `[]`, InputFingerprint: inputFingerprint, EvidenceManifestDigest: "sha256:codeedge-final-review-fixture",
+		Actor: "tester", Reason: "open approved CodeEdge FinalReview fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := services.Store().RecordReviewGateDecision(ctx, store.RecordReviewGateDecisionRequest{
+		ReviewRequestID: opened.Review.ID, RunID: opened.Run.ID, RevisionID: revision.ID, StageAttemptID: opened.StageAttempt.ID,
+		ExpectedRevisionDigest: revision.TaskDigest, ExpectedRunVersion: opened.Run.Version, ExpectedStageAttemptVersion: opened.StageAttempt.Version,
+		Action: store.ReviewDecisionApprove, ResolutionPayloadJSON: `{}`, Actor: "tester", Reason: "approve CodeEdge FinalReview fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	currentStage, err := services.Store().GetStageAttempt(ctx, opened.StageAttempt.ID)
+	if err != nil || currentStage == nil {
+		t.Fatalf("read approved CodeEdge FinalReview stage = %+v, %v", currentStage, err)
+	}
+	if _, err := services.Store().TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: currentStage.ID, ExpectedVersion: currentStage.Version, ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictPass,
+		Actor: "tester", Reason: "complete approved CodeEdge FinalReview fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := services.Runs.Get(ctx, parent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return updated
+}
+
+func taskHubRunProjectionByID(t *testing.T, snapshot TaskHubSnapshot, runID string) TaskHubRun {
+	t.Helper()
+	for _, run := range snapshot.Runs {
+		if run.RunID == runID {
+			return run
+		}
+	}
+	t.Fatalf("Task Hub snapshot does not contain Run %s: %+v", runID, snapshot.Runs)
+	return TaskHubRun{}
+}
+
 func taskHubApprovedCodeEdgeComplianceRecord(t *testing.T, run store.WorkflowRun, task store.TaskV2, revision store.TaskRevision) store.CodeEdgeComplianceRecord {
 	t.Helper()
 	key, err := store.NewUUIDv7()
@@ -974,7 +1144,7 @@ func TestAppTaskHubLifecycleAdapterPackageAndWithdrawUseV12Commands(t *testing.T
 func TestAppTaskHubLifecycleAdapterManualPatchUsesV12PrepareAndFrozenPlan(t *testing.T) {
 	ctx, services, task, revision := newTaskHubLocalPackageMutationFixture(t)
 	run, err := services.Runs.StartRun(ctx, app.StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: taskHubAdapterCompleteProfile(t), ExecutionSpec: taskHubExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "task_hub_edit",
+		TaskID: task.ID, RevisionID: revision.ID, Profile: taskHubAdapterCandidateLeaseProfile(t), ExecutionSpec: taskHubExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: "task_hub_edit",
 		Actor: "fixture", Reason: "start manual patch fixture",
 	})
 	if err != nil {
@@ -1333,6 +1503,249 @@ func TestAppTaskHubRunControlConfirmationUsesCapturedCheckpointAndFrozenGrace(t 
 	}
 }
 
+func TestAppTaskHubLocalReconcileUsesScopedCLIRecoveryThroughConfirmedTUI(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	dataStore, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	services, err := newTaskHubAdapterLifecycleServices(root, dataStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, revision, err := services.Tasks.ImportTask(ctx, app.ImportTaskRequest{
+		CreateDraftTaskRequest: app.CreateDraftTaskRequest{
+			Slug: "tui-local-reconcile", Title: "TUI local reconcile", Actor: "tester", Reason: "create Task Hub reconcile fixture",
+		},
+		SourceDirectory: taskHubAdapterSnapshot(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := func(trigger string) store.WorkflowRun {
+		t.Helper()
+		run, startErr := services.Runs.StartRun(ctx, app.StartRunRequest{
+			TaskID: task.ID, RevisionID: revision.ID, Profile: taskHubAdapterCompleteProfile(t),
+			ExecutionSpec: taskHubExecutionSpec(task.ID, revision.ID, revision.TaskDigest), Trigger: trigger,
+			Actor: "tester", Reason: "start Task Hub local reconcile fixture",
+		})
+		if startErr != nil {
+			t.Fatal(startErr)
+		}
+		return run
+	}
+	claim := func(runID string) store.DurableJobDispatchClaim {
+		t.Helper()
+		jobs, listErr := services.Store().ListDurableJobsForRun(ctx, runID)
+		if listErr != nil || len(jobs) != 1 {
+			t.Fatalf("list initial durable jobs for Run %s = %+v, %v", runID, jobs, listErr)
+		}
+		key, keyErr := store.NewUUIDv7()
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		claimed, claimErr := services.Store().ClaimNextDurableJob(ctx, store.ClaimNextDurableJobRequest{
+			IdempotencyKey: key, Owner: "tui-local-reconcile-worker", LeaseTTL: 10 * time.Millisecond,
+			Actor: "tester", Reason: "claim local reconcile fixture",
+		})
+		if claimErr != nil || claimed.Job == nil || claimed.DispatchLease == nil || claimed.Job.ID != jobs[0].ID || claimed.Job.RunID != runID {
+			t.Fatalf("claim durable job for Run %s = %+v, %v", runID, claimed, claimErr)
+		}
+		return claimed
+	}
+
+	selectedRun := start("selected-local-reconcile")
+	selectedClaim := claim(selectedRun.ID)
+	otherRun := start("other-local-reconcile")
+	otherClaim := claim(otherRun.ID)
+	selectedRun, err = services.Store().TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: selectedRun.ID, ExpectedVersion: selectedRun.Version, Status: store.WorkflowRunInDoubt,
+		Actor: "tester", Reason: "make selected Run reconcile-eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	effectKey, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect, err := services.Store().CreateSideEffectOperation(ctx, store.CreateSideEffectOperationRequest{
+		OperationKey: "tui-local-reconcile-external-effect-" + selectedRun.ID, IdempotencyKey: effectKey, RunID: selectedRun.ID,
+		EffectKind: "external_provider_fixture", SourceDigest: "sha256:tui-local-reconcile", PayloadJSON: `{}`,
+		Actor: "tester", Reason: "record unknown external effect that local reconcile must not infer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect, err = services.Store().TransitionSideEffectOperation(ctx, store.TransitionSideEffectOperationRequest{
+		OperationID: effect.ID, ExpectedVersion: effect.Version, State: store.SideEffectStarted,
+		Actor: "tester", Reason: "begin external fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect, err = services.Store().TransitionSideEffectOperation(ctx, store.TransitionSideEffectOperationRequest{
+		OperationID: effect.ID, ExpectedVersion: effect.Version, State: store.SideEffectUnknown,
+		Actor: "tester", Reason: "leave external outcome unknown",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectVersion := effect.Version
+
+	// Store time is intentionally opaque to the adapter. Let both claimed
+	// leases expire before the selected, confirmed local recovery occurs.
+	time.Sleep(40 * time.Millisecond)
+	adapter := NewAppTaskHubLifecycleAdapter(services)
+	snapshot, err := adapter.QueryTaskHub(ctx, TaskHubQuery{Tab: TaskHubRunsTab})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selectedProjection, otherProjection *TaskHubRun
+	for index := range snapshot.Runs {
+		switch snapshot.Runs[index].RunID {
+		case selectedRun.ID:
+			selectedProjection = &snapshot.Runs[index]
+		case otherRun.ID:
+			otherProjection = &snapshot.Runs[index]
+		}
+	}
+	if selectedProjection == nil || otherProjection == nil {
+		t.Fatalf("Task Hub did not project both reconcile fixture Runs: %+v", snapshot.Runs)
+	}
+	selectedCapability, selectedFound := taskHubRunControlActionStateFor(selectedProjection.Control.Actions, TaskHubRunControlReconcile)
+	if !selectedFound || !selectedCapability.Enabled || selectedCapability.DisabledReason != "" {
+		t.Fatalf("in_doubt Run reconcile capability = %+v", selectedCapability)
+	}
+	if capability, found := taskHubRunControlActionStateFor(otherProjection.Control.Actions, TaskHubRunControlReconcile); found {
+		t.Fatalf("normal Run exposed reconcile capability = %+v", capability)
+	}
+	preview, err := adapter.PlanTaskHubRunControl(ctx, TaskHubRunControlCommand{
+		Action: TaskHubRunControlReconcile,
+		Target: TaskHubTarget{TaskID: task.ID, RunID: selectedRun.ID, RevisionID: revision.ID},
+	})
+	if err != nil || !preview.ConfirmationNeeded || !strings.Contains(preview.Summary, "harbor run reconcile") || !strings.Contains(preview.Summary, "不调用 provider") {
+		t.Fatalf("selected local reconcile preview = %+v, err=%v", preview, err)
+	}
+	otherPreview, err := adapter.PlanTaskHubRunControl(ctx, TaskHubRunControlCommand{
+		Action: TaskHubRunControlReconcile,
+		Target: TaskHubTarget{TaskID: task.ID, RunID: otherRun.ID, RevisionID: revision.ID},
+	})
+	if err != nil || otherPreview.ConfirmationNeeded || !strings.Contains(otherPreview.Reason, "只有 interrupted 或 in_doubt") {
+		t.Fatalf("normal Run reconcile preview = %+v, err=%v", otherPreview, err)
+	}
+	missingReasonKey, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.ExecuteTaskHubRunControlMutation(ctx, TaskHubRunControlMutationRequest{
+		Action: TaskHubRunControlReconcile,
+		Target: TaskHubTarget{TaskID: task.ID, RunID: selectedRun.ID, RevisionID: revision.ID},
+		Actor:  "tester", IdempotencyKey: missingReasonKey,
+	}); err == nil {
+		t.Fatal("Task Hub local reconcile accepted a missing audit reason")
+	}
+
+	m, cleanup := newTestTaskHubV2Model(t, adapter)
+	defer cleanup()
+	m.taskHub.SelectedTaskID = task.ID
+	m.taskHub.SelectedRunID = selectedRun.ID
+	m.openRunControl()
+	updated, selectCommand := m.Update(runeKey("r"))
+	m = updated.(model)
+	if selectCommand != nil || m.runControl == nil || m.runControl.SelectedAction != TaskHubRunControlReconcile {
+		t.Fatalf("TUI did not select local reconcile preview: overlay=%+v command=%v", m.runControl, selectCommand)
+	}
+	updated, previewCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if previewCommand == nil {
+		t.Fatal("TUI local reconcile did not defer an impact preview")
+	}
+	updated, _ = m.Update(previewCommand())
+	m = updated.(model)
+	if m.runControl == nil || m.runControl.Preview == nil || !m.runControl.Preview.ConfirmationNeeded {
+		t.Fatalf("TUI local reconcile preview = %+v", m.runControl)
+	}
+	beforeConfirm, err := services.Store().GetDurableJob(ctx, selectedClaim.Job.ID)
+	if err != nil || beforeConfirm == nil || beforeConfirm.State != store.JobRunning {
+		t.Fatalf("preview changed selected durable job before confirmation: %+v, %v", beforeConfirm, err)
+	}
+	updated, confirmationCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if confirmationCommand != nil || m.taskHubMutation == nil || m.taskHubMutation.ControlAction != TaskHubRunControlReconcile {
+		t.Fatalf("TUI local reconcile did not open native confirmation: command=%v form=%+v", confirmationCommand, m.taskHubMutation)
+	}
+	m.taskHubMutation.ReasonInput.SetValue("recover only selected local durable Run")
+	actor := m.taskHubMutation.Actor
+	key := m.taskHubMutation.IdempotencyKey
+	expected := m.taskHubMutation.Expected
+	if err := store.ValidateUUIDv7(key); err != nil {
+		t.Fatalf("TUI local reconcile key %q is not UUIDv7: %v", key, err)
+	}
+	updated, executeCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if executeCommand == nil {
+		t.Fatal("TUI local reconcile confirmation did not defer execution")
+	}
+	updated, _ = m.Update(executeCommand())
+	m = updated.(model)
+	if m.taskHubMutation != nil || !strings.Contains(m.notice, "本地 reconcile 已完成") || !strings.Contains(m.notice, "未调用外部 provider") {
+		t.Fatalf("TUI local reconcile completion = form:%+v notice:%q", m.taskHubMutation, m.notice)
+	}
+
+	selectedAfter, err := services.Store().GetDurableJob(ctx, selectedClaim.Job.ID)
+	if err != nil || selectedAfter == nil || selectedAfter.State != store.JobInterrupted {
+		t.Fatalf("selected Run local recovery = %+v, %v", selectedAfter, err)
+	}
+	selectedLease, err := services.Store().GetLease(ctx, selectedClaim.DispatchLease.ID)
+	if err != nil || selectedLease == nil || selectedLease.State != store.LeaseExpired {
+		t.Fatalf("selected Run lease recovery = %+v, %v", selectedLease, err)
+	}
+	otherAfter, err := services.Store().GetDurableJob(ctx, otherClaim.Job.ID)
+	if err != nil || otherAfter == nil || otherAfter.State != store.JobRunning {
+		t.Fatalf("selected reconcile changed unselected Run job = %+v, %v", otherAfter, err)
+	}
+	otherLease, err := services.Store().GetLease(ctx, otherClaim.DispatchLease.ID)
+	if err != nil || otherLease == nil || otherLease.State != store.LeaseActive {
+		t.Fatalf("selected reconcile changed unselected Run lease = %+v, %v", otherLease, err)
+	}
+	unchangedEffect, err := services.Store().GetSideEffectOperation(ctx, effect.ID)
+	if err != nil || unchangedEffect == nil || unchangedEffect.State != store.SideEffectUnknown || unchangedEffect.Version != effectVersion {
+		t.Fatalf("local reconcile inferred or changed external provider fact: %+v, %v", unchangedEffect, err)
+	}
+	controls, err := services.Control.ListForRun(ctx, selectedRun.ID)
+	if err != nil || len(controls) != 0 {
+		t.Fatalf("local reconcile created a durable control operation: %+v, %v", controls, err)
+	}
+	selectedRunAfter, err := services.Runs.Get(ctx, selectedRun.ID)
+	if err != nil || selectedRunAfter.Status != store.WorkflowRunInDoubt {
+		t.Fatalf("local reconcile rewrote external in_doubt Run state: %+v, %v", selectedRunAfter, err)
+	}
+
+	// The UI keeps the UUIDv7 key across a lost reply, while the CLI-equivalent
+	// local recovery itself is repeat-safe: a direct replay must not re-touch
+	// either the selected terminal recovery or the unrelated Run.
+	replay, err := adapter.ExecuteTaskHubRunControlMutation(ctx, TaskHubRunControlMutationRequest{
+		Action:   TaskHubRunControlReconcile,
+		Target:   TaskHubTarget{TaskID: task.ID, RunID: selectedRun.ID, RevisionID: revision.ID},
+		Expected: expected, Actor: actor, Reason: "recover only selected local durable Run", IdempotencyKey: key,
+	})
+	if err != nil || replay.Action != TaskHubRunControlReconcile || replay.OperationID != "" {
+		t.Fatalf("repeat local reconcile result = %+v, err=%v", replay, err)
+	}
+	selectedReplay, err := services.Store().GetDurableJob(ctx, selectedClaim.Job.ID)
+	if err != nil || selectedReplay == nil || selectedReplay.Version != selectedAfter.Version || selectedReplay.State != selectedAfter.State {
+		t.Fatalf("repeat local reconcile changed selected terminal job: before=%+v after=%+v err=%v", selectedAfter, selectedReplay, err)
+	}
+	otherReplay, err := services.Store().GetDurableJob(ctx, otherClaim.Job.ID)
+	if err != nil || otherReplay == nil || otherReplay.Version != otherAfter.Version || otherReplay.State != otherAfter.State {
+		t.Fatalf("repeat local reconcile changed unselected Run job: before=%+v after=%+v err=%v", otherAfter, otherReplay, err)
+	}
+}
+
 func taskHubActionStateFor(states []TaskHubActionState, action TaskHubAction) (TaskHubActionState, bool) {
 	for _, state := range states {
 		if state.Action == action {
@@ -1353,6 +1766,17 @@ func taskHubRunControlActionStateFor(states []TaskHubRunControlActionState, acti
 
 func taskHubAdapterCompleteProfile(t *testing.T) workflowadapter.ExecutionProfile {
 	return taskHubAdapterCompleteProfileForTemplate(t, workflowadapter.StandardWorkflowTemplate())
+}
+
+// taskHubAdapterCandidateLeaseProfile gives candidate-provider integration
+// tests a realistic frozen provider window. The generic Task Hub profile keeps
+// its short stage budget for ordinary UI tests; a manual patch also
+// materializes, validates, and binds a candidate before the provider starts.
+func taskHubAdapterCandidateLeaseProfile(t *testing.T) workflowadapter.ExecutionProfile {
+	t.Helper()
+	profile := taskHubAdapterCompleteProfile(t)
+	profile.CandidateProviderBudget = workflowadapter.CandidateProviderBudget{AttemptTimeout: 15 * time.Second}
+	return profile
 }
 
 func taskHubAdapterCompleteProfileForTemplate(t *testing.T, template workflowadapter.WorkflowTemplate) workflowadapter.ExecutionProfile {

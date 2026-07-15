@@ -431,7 +431,11 @@ func TestWorkflowKitDoesNotContainHarborPolicyVocabulary(t *testing.T) {
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.IsDir() || filepath.Ext(path) != ".go" {
+		// The assertion protects the reusable production kernel.  Its own
+		// boundary tests necessarily name the product they reject, so test
+		// sources are not policy-bearing kernel code and must not participate
+		// in this scan.
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		content, err := os.ReadFile(path)

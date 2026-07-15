@@ -14,7 +14,7 @@ import (
 func TestPersistStageArtifactsBindsImmutableOutputToFrozenLineage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}

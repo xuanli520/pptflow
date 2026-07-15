@@ -10,7 +10,7 @@ import (
 
 func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T) {
 	registry := DefaultTemplateRegistry()
-	for _, reference := range []TemplateReference{StandardTemplateReference(), CodeEdgePhase1TemplateReference()} {
+	for _, reference := range []TemplateReference{StandardTemplateReference(), CodeEdgePhase1TemplateReference(), CodeEdgeEvaluatorChildTemplateReference()} {
 		template, err := registry.ResolveTemplate(reference)
 		if err != nil {
 			t.Fatalf("resolve %s@%s: %v", reference.ID, reference.Version, err)
@@ -146,7 +146,7 @@ func TestTemplateReferenceParticipatesInProfileAndSpecFingerprints(t *testing.T)
 	}
 }
 
-func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *testing.T) {
+func TestCodeEdgePhase1TopologyUsesChildEvidenceHandoffBeforeFinalCompliance(t *testing.T) {
 	template := CodeEdgePhase1WorkflowTemplate()
 	if err := template.Validate(); err != nil {
 		t.Fatalf("validate CodeEdge Phase-1 template: %v", err)
@@ -173,9 +173,9 @@ func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *
 		{workflowkit.StageKey(InitialVerify), workflowkit.StageKey(OracleVerify)},
 		{workflowkit.StageKey(OracleVerify), workflowkit.StageKey(TestsAnalysis)},
 		{workflowkit.StageKey(TestsAnalysis), workflowkit.StageKey(SolutionReview)},
-		{workflowkit.StageKey(FinalReview), workflowkit.StageKey(HarborRunQwen)},
-		{workflowkit.StageKey(FinalReview), workflowkit.StageKey(HarborRunOpus)},
-		{workflowkit.StageKey(HarborRunOpus), workflowkit.StageKey(ResultReview)},
+		{workflowkit.StageKey(FinalReview), workflowkit.StageKey(EvaluatorEvidenceHandoff)},
+		{workflowkit.StageKey(EvaluatorEvidenceHandoff), workflowkit.StageKey(SubmissionLint)},
+		{workflowkit.StageKey(SubmissionLint), workflowkit.StageKey(ResultReview)},
 		{workflowkit.StageKey(ResultReview), workflowkit.StageKey(Package)},
 	} {
 		if positions[relation[0]] >= positions[relation[1]] {
@@ -190,60 +190,59 @@ func TestCodeEdgePhase1TopologyKeepsPackageAfterEvaluationAndFinalCompliance(t *
 	if err != nil {
 		t.Fatalf("compile CodeEdge Phase-1 initial execution plan: %v", err)
 	}
-	var evaluatorBatch []workflowkit.NodeID
+	var handoffPresent bool
 	for _, batch := range initialPlan.Batches {
-		containsQwen := false
-		containsOpus := false
 		for _, nodeID := range batch.NodeIDs {
 			if nodeID == workflowkit.NodeID(Package) {
 				t.Fatalf("CodeEdge initial plan scheduled operator-only package: %#v", initialPlan.Batches)
 			}
-			containsQwen = containsQwen || nodeID == workflowkit.NodeID(HarborRunQwen)
-			containsOpus = containsOpus || nodeID == workflowkit.NodeID(HarborRunOpus)
-		}
-		if containsQwen || containsOpus {
-			if !containsQwen || !containsOpus {
-				t.Fatalf("CodeEdge evaluator dependency layer split Qwen and Opus: %#v", initialPlan.Batches)
+			if nodeID == workflowkit.NodeID(HarborRunQwen) || nodeID == workflowkit.NodeID(HarborRunOpus) {
+				t.Fatalf("parent CodeEdge plan retained direct evaluator node %q: %#v", nodeID, initialPlan.Batches)
 			}
-			evaluatorBatch = append([]workflowkit.NodeID(nil), batch.NodeIDs...)
+			handoffPresent = handoffPresent || nodeID == workflowkit.NodeID(EvaluatorEvidenceHandoff)
 		}
 	}
-	if len(evaluatorBatch) != 2 {
-		t.Fatalf("CodeEdge evaluator dependency layer = %#v, want concurrent Qwen/Opus batch", evaluatorBatch)
+	if !handoffPresent {
+		t.Fatalf("CodeEdge initial plan omitted evaluator evidence handoff: %#v", initialPlan.Batches)
 	}
-	qwen, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunQwen))
-	opus, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunOpus))
-	for _, evaluator := range []workflowkit.StageDescriptor{qwen, opus} {
-		if !sameStageKeySet(evaluator.Dependencies, []workflowkit.StageKey{workflowkit.StageKey(FinalReview)}) {
-			t.Fatalf("CodeEdge evaluator %q dependencies = %#v, want only FinalReview", evaluator.Key, evaluator.Dependencies)
-		}
+	if _, present := template.Catalog.Stage(workflowkit.StageKey(HarborRunQwen)); present {
+		t.Fatal("parent CodeEdge template retains direct Qwen evaluator stage")
 	}
-	if !hasQuotaClaim(qwen.QuotaClaims, "trial", 4) || !hasQuotaClaim(opus.QuotaClaims, "trial", 4) {
-		t.Fatalf("CodeEdge evaluator quota claims qwen=%+v opus=%+v, want exactly four logical trials each", qwen.QuotaClaims, opus.QuotaClaims)
+	if _, present := template.Catalog.Stage(workflowkit.StageKey(HarborRunOpus)); present {
+		t.Fatal("parent CodeEdge template retains direct Opus evaluator stage")
 	}
-	for _, evaluator := range []workflowkit.StageDescriptor{qwen, opus} {
-		if evaluator.Effect != workflowkit.EffectExternalSideEffect {
-			t.Fatalf("CodeEdge evaluator %q effect = %q, want external side effect", evaluator.Key, evaluator.Effect)
-		}
-		if len(evaluator.Retry.Retryable) != 0 || evaluator.Reuse != workflowkit.ReuseNever {
-			t.Fatalf("CodeEdge evaluator %q has generic retry/reuse policy %#v/%q; logical trials must reconcile below the stage", evaluator.Key, evaluator.Retry, evaluator.Reuse)
+	handoff, present := template.Catalog.Stage(workflowkit.StageKey(EvaluatorEvidenceHandoff))
+	if !present || !handoff.IsGate() || handoff.Gate == nil || handoff.Gate.ReviewKind != ReviewEvaluatorEvidence || handoff.Gate.DecisionArtifact.Name != "evaluator_evidence_handoff_decision" {
+		t.Fatalf("CodeEdge evaluator evidence handoff gate = %#v", handoff)
+	}
+	compiledHandoff, present := resolved.Descriptor.Stage(workflowkit.StageKey(EvaluatorEvidenceHandoff))
+	if !present || compiledHandoff.Effect != workflowkit.EffectEvidenceOnly || len(compiledHandoff.QuotaClaims) != 0 || !compiledHandoff.Capabilities.Has(workflowkit.CapabilityApprove) {
+		t.Fatalf("compiled CodeEdge evaluator evidence handoff = %#v", compiledHandoff)
+	}
+	submission, _ := template.Catalog.Stage(workflowkit.StageKey(SubmissionLint))
+	resultReview, _ := template.Catalog.Stage(workflowkit.StageKey(ResultReview))
+	for _, stage := range []StageDefinition{submission, resultReview} {
+		for _, artifact := range stage.Inputs {
+			if artifact.Name == "qwen_trial_result" || artifact.Name == "opus_trial_result" {
+				t.Fatalf("parent stage %q consumes child evaluator artifact %q directly", stage.Key, artifact.Name)
+			}
 		}
 	}
 
 	broken := template.Catalog.Clone()
 	for index := range broken.Stages {
-		if broken.Stages[index].Key == workflowkit.StageKey(Package) {
-			broken.Stages[index].Dependencies = []workflowkit.StageKey{workflowkit.StageKey(FinalReview)}
+		if broken.Stages[index].Key == workflowkit.StageKey(EvaluatorEvidenceHandoff) {
+			broken.Stages[index].Dependencies = []workflowkit.StageKey{workflowkit.StageKey(RepoPrepare)}
 		}
 	}
 	if err := broken.Validate(); err == nil || !strings.Contains(err.Error(), "frozen template topology") {
-		t.Fatalf("package-before-compliance topology mutation = %v, want rejection", err)
+		t.Fatalf("evaluator handoff topology mutation = %v, want rejection", err)
 	}
 }
 
 func TestCodeEdgePhase1SubmissionReportUsesTheVersionedTypedContract(t *testing.T) {
 	template := CodeEdgePhase1WorkflowTemplate()
-	if template.Version != "2.1.1" || template.Catalog.Version != "2.1.1" {
+	if template.Version != "2.2.0" || template.Catalog.Version != "2.2.0" {
 		t.Fatalf("CodeEdge semantic schema change did not receive template/catalog versions: %s / %s", template.Version, template.Catalog.Version)
 	}
 	stages := make(map[workflowkit.StageKey]StageDefinition, len(template.Catalog.Stages))
@@ -294,7 +293,6 @@ func testCodeEdgePhase1RunExecutionSpec(t *testing.T) RunExecutionSpec {
 			Providers: []ProviderReference{
 				{ID: "provider-codeedge-local", Kind: "native", Version: "1"},
 				{ID: "provider-codeedge-review", Kind: "durable-review", Version: "1"},
-				{ID: "provider-codeedge-evaluator", Kind: "evaluation", Version: "1"},
 			},
 		},
 	}
@@ -308,11 +306,9 @@ func testCodeEdgePhase1RunExecutionSpec(t *testing.T) RunExecutionSpec {
 		switch definition.Key {
 		case workflowkit.StageKey(RepoPrepare):
 			base.ArtifactInputs = []ArtifactInputReference{{Port: "task_snapshot", ArtifactID: "018f0a73-3b49-7000-8000-000000000013"}}
-		case workflowkit.StageKey(SolutionReview), workflowkit.StageKey(FinalReview), workflowkit.StageKey(ResultReview):
+		case workflowkit.StageKey(SolutionReview), workflowkit.StageKey(FinalReview), workflowkit.StageKey(EvaluatorEvidenceHandoff), workflowkit.StageKey(ResultReview):
 			base.Operation.ProviderID = "provider-codeedge-review"
 			base.Operation.Payload = DurableReviewOperationPayload{PolicyID: "codeedge-review.v1"}
-		case workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(HarborRunOpus):
-			base.Operation.ProviderID = "provider-codeedge-evaluator"
 		}
 		specification.Stages = append(specification.Stages, bindingForTest(t, base))
 	}

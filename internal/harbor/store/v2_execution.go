@@ -8,7 +8,8 @@ import (
 )
 
 const workflowRunSelect = `
-	SELECT id, task_id, revision_id, workflow_template_id, workflow_template_version,
+	SELECT id, subject_kind, subject_id, subject_revision_id, subject_digest,
+	       task_id, revision_id, authoring_session_id, workflow_template_id, workflow_template_version,
 	       resolved_profile_hash, definition_hash, run_manifest_json, parent_run_id,
 	       trigger, execution_epoch, status, created_by, created_at, started_at, finished_at, version
 	FROM workflow_runs`
@@ -61,6 +62,9 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 	now := s.now().UTC()
 	run := WorkflowRun{
 		ID:                      id,
+		SubjectKind:             WorkflowRunSubjectTaskRevision,
+		SubjectID:               request.TaskID,
+		SubjectRevisionID:       request.RevisionID,
 		TaskID:                  request.TaskID,
 		RevisionID:              request.RevisionID,
 		WorkflowTemplateID:      templateID,
@@ -99,6 +103,7 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 	if revision.TaskID != run.TaskID {
 		return WorkflowRun{}, fmt.Errorf("workflow run revision belongs to another task")
 	}
+	run.SubjectDigest = revision.TaskDigest
 	if run.ParentRunID != "" {
 		parent, err := getWorkflowRunTx(ctx, tx, run.ParentRunID)
 		if err != nil {
@@ -110,11 +115,13 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO workflow_runs (
-			id, task_id, revision_id, workflow_template_id, workflow_template_version,
+			id, subject_kind, subject_id, subject_revision_id, subject_digest,
+			task_id, revision_id, authoring_session_id, workflow_template_id, workflow_template_version,
 			resolved_profile_hash, definition_hash, run_manifest_json, parent_run_id,
 			trigger, execution_epoch, status, created_by, created_at, started_at, finished_at, version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
-	`, run.ID, run.TaskID, run.RevisionID, run.WorkflowTemplateID, run.WorkflowTemplateVersion,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+	`, run.ID, run.SubjectKind, run.SubjectID, run.SubjectRevisionID, run.SubjectDigest,
+		run.TaskID, run.RevisionID, run.WorkflowTemplateID, run.WorkflowTemplateVersion,
 		run.ResolvedProfileHash, run.DefinitionHash, run.RunManifestJSON, nullableString(run.ParentRunID),
 		run.Trigger, run.ExecutionEpoch, run.Status, run.CreatedBy, run.CreatedAt, run.Version)
 	if err != nil {
@@ -578,16 +585,20 @@ func getStageAttemptTx(ctx context.Context, tx *sql.Tx, stageAttemptID string) (
 
 func scanWorkflowRun(scanner rowScanner) (WorkflowRun, error) {
 	var run WorkflowRun
-	var parent sql.NullString
+	var taskID, revisionID, authoringSessionID, parent sql.NullString
 	var startedAt, finishedAt sql.NullTime
 	if err := scanner.Scan(
-		&run.ID, &run.TaskID, &run.RevisionID, &run.WorkflowTemplateID, &run.WorkflowTemplateVersion,
+		&run.ID, &run.SubjectKind, &run.SubjectID, &run.SubjectRevisionID, &run.SubjectDigest,
+		&taskID, &revisionID, &authoringSessionID, &run.WorkflowTemplateID, &run.WorkflowTemplateVersion,
 		&run.ResolvedProfileHash, &run.DefinitionHash, &run.RunManifestJSON, &parent,
 		&run.Trigger, &run.ExecutionEpoch, &run.Status, &run.CreatedBy, &run.CreatedAt, &startedAt, &finishedAt, &run.Version,
 	); err != nil {
 		return WorkflowRun{}, err
 	}
 	run.ParentRunID = nullableStringValue(parent)
+	run.TaskID = nullableStringValue(taskID)
+	run.RevisionID = nullableStringValue(revisionID)
+	run.AuthoringSessionID = nullableStringValue(authoringSessionID)
 	run.CreatedAt = run.CreatedAt.UTC()
 	run.StartedAt = nullableTimePtr(startedAt)
 	run.FinishedAt = nullableTimePtr(finishedAt)

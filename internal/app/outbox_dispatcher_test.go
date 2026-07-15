@@ -19,7 +19,7 @@ func (failure classifiedOutboxFailure) OutboxDeliveryErrorCode() string {
 
 func TestOutboxDispatcherAcknowledgesSuccessfulDelivery(t *testing.T) {
 	ctx := context.Background()
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestOutboxDispatcherAcknowledgesSuccessfulDelivery(t *testing.T) {
 
 func TestOutboxDispatcherNacksHandlerFailureWithClassifiedRetry(t *testing.T) {
 	ctx := context.Background()
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestOutboxDispatcherNacksHandlerFailureWithClassifiedRetry(t *testing.T) {
 
 func TestOutboxDispatcherHeartbeatsBeforeAcknowledgement(t *testing.T) {
 	ctx := context.Background()
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestOutboxDispatcherHeartbeatsBeforeAcknowledgement(t *testing.T) {
 }
 
 func TestOutboxDispatcherRequiresExplicitRetryDelay(t *testing.T) {
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

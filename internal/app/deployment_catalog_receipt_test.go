@@ -19,7 +19,7 @@ import (
 func TestLifecycleCatalogRequirementIsExplicitAndNonProductionDoesNotInventReceipt(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestLifecycleCatalogRequirementIsExplicitAndNonProductionDoesNotInventRecei
 func TestCatalogEnabledStartRunFreezesCanonicalReceiptInInputBundleAndRunManifest(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestCatalogEnabledStartRunFreezesCanonicalReceiptInInputBundleAndRunManifes
 func TestCatalogReceiptDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestCatalogReceiptDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *t
 func TestCatalogLockEnabledStartRunFreezesIdentityInBundleManifestAndManagedFiles(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +404,7 @@ func TestCatalogLockEnabledStartRunFreezesIdentityInBundleManifestAndManagedFile
 func TestCatalogLockDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,10 +478,186 @@ func TestCatalogLockDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *test
 	}
 }
 
+func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	bootstrap, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, revision := importCatalogReceiptFixture(t, ctx, bootstrap, "template-keyed-catalog-registry")
+	standardSpecification := catalogReceiptExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	parentSpecification := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	childSpecification := testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	standardResolver := catalogLockAttestedResolverForSpec(t, standardSpecification, "template-keyed-standard", "v1", "lock-standard")
+	parentResolver := catalogLockAttestedResolverForSpec(t, parentSpecification, "template-keyed-parent", "v1", "lock-parent")
+	childResolver := catalogLockAttestedResolverForSpec(t, childSpecification, "template-keyed-child", "v1", "lock-child")
+	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+		// The registry itself proves each complete specification against its
+		// template's catalog. An accept-all outer resolver keeps this focused
+		// test independent of a production multi-provider dispatcher.
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+		// Keep the existing single resolver field for the parent while adding
+		// the evaluator child through the template-keyed registry. This is the
+		// intended backward-compatible migration shape.
+		DeploymentCatalogResolver: parentResolver,
+		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{
+			{Template: standardSpecification.Template, Resolver: standardResolver},
+			{Template: childSpecification.Template, Resolver: childResolver},
+		},
+		RequireDeploymentCatalog: true,
+		RequireDeploymentLock:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	standard, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID,
+		Profile: catalogReceiptProfile(t), ExecutionSpec: standardSpecification,
+		Trigger: "template-keyed-standard", Actor: "tester", Reason: "freeze Standard template binding",
+	})
+	if err != nil {
+		t.Fatalf("start Standard Run: %v", err)
+	}
+	parent, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID,
+		Profile: codeEdgePhase1RuntimeProfile(t), ExecutionSpec: parentSpecification,
+		Trigger: "template-keyed-parent", Actor: "tester", Reason: "freeze parent template binding",
+	})
+	if err != nil {
+		t.Fatalf("start parent Run: %v", err)
+	}
+	childProfile := codeEdgeEvaluatorRuntimeProfile(t)
+	child, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, ParentRunID: parent.ID,
+		Profile: childProfile, ExecutionSpec: childSpecification,
+		Trigger: "template-keyed-child", Actor: "tester", Reason: "freeze evaluator child template binding",
+	})
+	if err != nil {
+		t.Fatalf("start evaluator child Run: %v", err)
+	}
+
+	assertTemplateCatalogBinding := func(run store.WorkflowRun, template workflowadapter.TemplateReference, resolver *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver) {
+		t.Helper()
+		var manifest runManifest
+		if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		receipt, err := canonicalManifestDeploymentCatalogReceipt(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedReceipt, err := resolver.CanonicalReceiptJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(receipt, expectedReceipt) {
+			t.Fatalf("Run %s catalog receipt = %s, want binding for %s@%s", run.ID, receipt, template.ID, template.Version)
+		}
+		parsedReceipt, err := stageprovider.ParseDeploymentOperationCatalogReceiptJSON(receipt)
+		if err != nil || !parsedReceipt.Template.Equal(template) {
+			t.Fatalf("Run %s receipt template = %+v, %v; want %s@%s", run.ID, parsedReceipt.Template, err, template.ID, template.Version)
+		}
+		identity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
+		if err != nil || identity == nil || *identity != resolver.LockIdentity() {
+			t.Fatalf("Run %s catalog lock identity = %+v, %v; want %+v", run.ID, identity, err, resolver.LockIdentity())
+		}
+		if err := services.core.verifyRunDeploymentCatalogReceipt(run); err != nil {
+			t.Fatalf("verify Run %s own template catalog binding: %v", run.ID, err)
+		}
+	}
+	assertTemplateCatalogBinding(standard, standardSpecification.Template, standardResolver)
+	assertTemplateCatalogBinding(parent, parentSpecification.Template, parentResolver)
+	assertTemplateCatalogBinding(child, childSpecification.Template, childResolver)
+
+	// The same durable worker entrypoint used before a stage claim reselects
+	// the binding from the child RunExecutionSpec.Template, not from the
+	// parent or whichever resolver was registered first.
+	childFrozen, err := decodeFrozenRunDefinition(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFrozenRuntime(t, services, frozenRuntimeRegistry(t, childFrozen.Workflow, completedFixtureStage))
+	if _, _, err := runtime.loadFrozenRun(ctx, child.ID, child.DefinitionHash, childFrozen.ExecutionSpecFingerprint, childFrozen.QuotaPolicy); err != nil {
+		t.Fatalf("worker load with child binding: %v", err)
+	}
+
+	// A normal idempotent replay also proves the child binding, rather than
+	// replacing it with the parent catalog/lock currently in memory.
+	if replayed, err := services.Runs.StartRun(ctx, StartRunRequest{
+		ID: child.ID, TaskID: task.ID, RevisionID: revision.ID, ParentRunID: parent.ID,
+		Profile: childProfile, ExecutionSpec: childSpecification,
+		Trigger: "template-keyed-child", Actor: "tester", Reason: "freeze evaluator child template binding",
+	}); err != nil || replayed.ID != child.ID {
+		t.Fatalf("replay child Run = %+v, %v; want existing Run", replayed, err)
+	}
+
+	parentReceipt, err := parentResolver.CanonicalReceiptJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childReceiptPath := filepath.Join(root, managedRunsDirectory, child.ID, deploymentCatalogReceiptFileName)
+	childReceipt, err := os.ReadFile(childReceiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childReceiptPath, parentReceipt, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runtime.loadFrozenRun(ctx, child.ID, child.DefinitionHash, childFrozen.ExecutionSpecFingerprint, childFrozen.QuotaPolicy); !errors.Is(err, ErrFrozenExecutionPayload) || !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogDrift) {
+		t.Fatalf("worker accepted parent receipt for evaluator child = %v", err)
+	}
+	if _, err := services.Runs.StartRun(ctx, StartRunRequest{
+		ID: child.ID, TaskID: task.ID, RevisionID: revision.ID, ParentRunID: parent.ID,
+		Profile: childProfile, ExecutionSpec: childSpecification,
+		Trigger: "template-keyed-child", Actor: "tester", Reason: "freeze evaluator child template binding",
+	}); !errors.Is(err, store.ErrIdempotencyConflict) || !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogDrift) {
+		t.Fatalf("replay accepted parent receipt for evaluator child = %v", err)
+	}
+	if err := os.WriteFile(childReceiptPath, childReceipt, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	parentLock, err := canonicalDeploymentCatalogLockIdentity(parentResolver.LockIdentity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	childLockPath := filepath.Join(root, managedRunsDirectory, child.ID, deploymentCatalogLockIdentityFileName)
+	childLock, err := os.ReadFile(childLockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childLockPath, parentLock, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runtime.loadFrozenRun(ctx, child.ID, child.DefinitionHash, childFrozen.ExecutionSpecFingerprint, childFrozen.QuotaPolicy); !errors.Is(err, ErrFrozenExecutionPayload) || !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
+		t.Fatalf("worker accepted parent lock for evaluator child = %v", err)
+	}
+	if _, err := services.Runs.StartRun(ctx, StartRunRequest{
+		ID: child.ID, TaskID: task.ID, RevisionID: revision.ID, ParentRunID: parent.ID,
+		Profile: childProfile, ExecutionSpec: childSpecification,
+		Trigger: "template-keyed-child", Actor: "tester", Reason: "freeze evaluator child template binding",
+	}); !errors.Is(err, store.ErrIdempotencyConflict) || !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
+		t.Fatalf("replay accepted parent lock for evaluator child = %v", err)
+	}
+	if err := os.WriteFile(childLockPath, childLock, 0o640); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCatalogLockIdentityPropagatesToCandidateChildManifest(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,11 +898,12 @@ func catalogLockAttestedResolverForSpec(t *testing.T, specification workflowadap
 			Stage: stageprovider.DeploymentStageContract{
 				Key: resolution.StageKey, Type: resolution.StageType, Group: stage.Group, Plugin: resolution.Plugin,
 			},
-			Provider:  resolution.Provider,
-			Operation: resolution.Operation.Clone(),
-			Runtime:   resolution.Runtime,
-			Checkout:  stageprovider.DeploymentCheckoutContract{ID: resolution.Checkout.ID, Purpose: "app-catalog-lock-test"},
-			Secrets:   secrets,
+			Provider:        resolution.Provider,
+			Operation:       resolution.Operation.Clone(),
+			Runtime:         resolution.Runtime,
+			Checkout:        stageprovider.DeploymentCheckoutContract{ID: resolution.Checkout.ID, Purpose: "app-catalog-lock-test"},
+			Secrets:         secrets,
+			HarborEvaluator: catalogLockFixtureHarborEvaluatorContract(t, resolution, secrets),
 		})
 	}
 	catalog, err := stageprovider.NewDeploymentOperationCatalogResolver(stageprovider.DeploymentOperationCatalog{
@@ -776,6 +953,24 @@ func catalogLockFixtureRecord(t *testing.T, registration stageprovider.Deploymen
 			CommandID: payload.CommandID, AbsolutePath: "/opt/harbor/bin/" + payload.CommandID, Version: "v1.0.0",
 			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("local:" + payload.CommandID)),
 		}
+		if registration.HarborEvaluator != nil {
+			contract := registration.HarborEvaluator.Clone()
+			record.HarborEvaluator = &stageprovider.HarborEvaluatorOperationLock{
+				Contract: contract, Launcher: *record.LocalExecutable,
+				PythonInterpreter: stageprovider.LocalExecutableLock{
+					CommandID: stageprovider.HarborEvaluatorPythonCommandID, AbsolutePath: "/opt/harbor/bin/python3", Version: "3.13.0",
+					ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-python-fixture")),
+				},
+				PythonSourceTree: stageprovider.HarborPythonSourceTreeLock{
+					AbsolutePath: "/opt/harbor/site-packages/harbor", PythonFilesSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-python-tree-fixture")),
+				},
+				DockerCLI: stageprovider.LocalExecutableLock{
+					CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: "/opt/harbor/bin/docker", Version: stageprovider.HarborEvaluatorDockerVersion,
+					ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-docker-fixture")),
+				},
+				HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion,
+			}
+		}
 	case workflowadapter.ContainerCommandOperationPayload:
 		record.ContainerRuntime = &stageprovider.PinnedContainerRuntimeLock{ImageDigest: payload.ImageDigest, Runtime: registration.Runtime}
 	case workflowadapter.AgentTurnOperationPayload:
@@ -788,6 +983,35 @@ func catalogLockFixtureRecord(t *testing.T, registration stageprovider.Deploymen
 		t.Fatalf("unsupported catalog-lock fixture payload %T", registration.Operation.Payload)
 	}
 	return record
+}
+
+func catalogLockFixtureHarborEvaluatorContract(t *testing.T, resolution workflowadapter.StageOperationResolution, secrets []workflowadapter.SecretReference) *stageprovider.HarborEvaluatorOperationContract {
+	t.Helper()
+	payload, ok := resolution.Operation.Payload.(workflowadapter.LocalCommandOperationPayload)
+	if !ok || (payload.CommandID != stageprovider.HarborEvaluatorQwenCommandID && payload.CommandID != stageprovider.HarborEvaluatorOpusCommandID) {
+		return nil
+	}
+	if len(secrets) != 1 {
+		t.Fatalf("CodeEdge evaluator fixture secrets = %+v, want one controlled reference", secrets)
+	}
+	model := "fixture-qwen"
+	endpoint := "FIXTURE_QWEN_HARBOR_BASE_URL"
+	if payload.CommandID == stageprovider.HarborEvaluatorOpusCommandID {
+		model = "fixture-opus"
+		endpoint = "FIXTURE_OPUS_HARBOR_BASE_URL"
+	}
+	return &stageprovider.HarborEvaluatorOperationContract{
+		Format: stageprovider.HarborEvaluatorOperationContractFormat, Version: stageprovider.HarborEvaluatorOperationContractVersion,
+		HarborVersion: stageprovider.HarborEvaluatorHarborVersion, ResultABIFormat: stageprovider.HarborEvaluatorResultABIFormat, ResultABIVersion: stageprovider.HarborEvaluatorResultABIVersion,
+		TaskArtifactPort: stageprovider.HarborEvaluatorTaskArtifactPort, TaskArtifactSchema: stageprovider.HarborEvaluatorTaskArtifactSchema,
+		AgentID: "fixture-agent", AgentVersion: "1", ModelID: model, ModelVersion: "1",
+		EndpointEnvName: endpoint, EndpointChildEnvKey: "ANTHROPIC_BASE_URL", EndpointFingerprint: workflowkit.SHA256Fingerprint([]byte("fixture-endpoint:" + endpoint)),
+		SecretEnvTemplates: []stageprovider.HarborEvaluatorSecretEnvTemplate{{
+			Secret: secrets[0], HostEnvKey: "FIXTURE_ANTHROPIC_AUTH_TOKEN", ChildEnvKey: "ANTHROPIC_AUTH_TOKEN", Template: stageprovider.HarborEvaluatorSecretValueTemplate,
+		}},
+		Attempts: stageprovider.HarborEvaluatorTrialCount, ConcurrentTrials: stageprovider.HarborEvaluatorConcurrentTrials, MaxRetries: stageprovider.HarborEvaluatorMaxRetries, RequireTrajectory: true,
+		ScreenshotRenderer: stageprovider.HarborEvaluatorScreenshotRenderer{ID: "harbor-terminal-png", Version: "1", SchemaVersion: workflowadapter.CodeEdgeEvaluatorScreenshotSchemaVersion},
+	}
 }
 
 type catalogLockFixtureDelegate struct{}

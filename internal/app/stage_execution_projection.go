@@ -12,7 +12,7 @@ import (
 )
 
 var (
-// ErrInvalidStageExecution marks a malformed Harbor-side durable projection
+	// ErrInvalidStageExecution marks a malformed Harbor-side durable projection
 	// (artifact, checkpoint, usage, or control fact). Concrete executable
 	// results are validated by workflowkit.Engine before this adapter receives
 	// them.
@@ -131,19 +131,4 @@ func NormalizeQuotaClaims(claims []store.TaskActorQuotaClaim) ([]store.TaskActor
 		}
 	}
 	return copyClaims, nil
-}
-
-// RetryDelay returns the explicit retry delay specified by the frozen stage
-// budget. It is separate from a plugin's own retry policy so repeated worker
-// processes cannot accidentally multiply retries or invent an exponential
-// backoff that was not frozen into the run manifest.
-func RetryDelay(stage workflowkit.StageDescriptor, attempt int) time.Duration {
-	if attempt <= 1 {
-		return 0
-	}
-	index := attempt - 2
-	if index < 0 || index >= len(stage.Budget.Backoff.RetryDelays) {
-		return 0
-	}
-	return stage.Budget.Backoff.RetryDelays[index]
 }

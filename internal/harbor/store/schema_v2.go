@@ -53,6 +53,85 @@ CREATE TABLE artifact_refs_v4 (
     UNIQUE(manifest_id, artifact_key)
 );
 
+-- table authoring_sources_v2
+-- A source is the immutable, content-addressed repository snapshot from
+-- which a Standard authoring Run may derive its first task revision. The
+-- artifact reference is deliberately the same canonical SHA-256 identity as
+-- the snapshot bytes; mutable paths and moving repository refs never enter
+-- the durable subject boundary.
+CREATE TABLE authoring_sources_v2 (
+    id                      TEXT PRIMARY KEY,
+    repository_url          TEXT NOT NULL,
+    commit_sha              TEXT NOT NULL,
+    snapshot_artifact_ref   TEXT NOT NULL,
+    snapshot_content_digest TEXT NOT NULL,
+    snapshot_schema_version TEXT NOT NULL,
+    source_fingerprint      TEXT NOT NULL UNIQUE,
+    idempotency_key         TEXT NOT NULL UNIQUE,
+    created_by              TEXT NOT NULL,
+    created_at              DATETIME NOT NULL,
+    UNIQUE(repository_url, commit_sha, snapshot_content_digest, snapshot_schema_version),
+    CHECK (length(commit_sha) IN (40, 64)),
+    CHECK (commit_sha = lower(commit_sha)),
+    CHECK (commit_sha NOT GLOB '*[^0-9a-f]*'),
+    CHECK (snapshot_artifact_ref = snapshot_content_digest),
+    CHECK (length(snapshot_content_digest) = 71),
+    CHECK (substr(snapshot_content_digest, 1, 7) = 'sha256:'),
+    CHECK (substr(snapshot_content_digest, 8) NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_fingerprint) = 71),
+    CHECK (substr(source_fingerprint, 1, 7) = 'sha256:'),
+    CHECK (substr(source_fingerprint, 8) NOT GLOB '*[^0-9a-f]*')
+);
+
+-- table authoring_sessions_v2
+-- A session freezes the Standard authoring contract over one source. It is
+-- intentionally not a TaskRevision: it exists before a task has been
+-- materialized and remains immutable after that materialization.
+CREATE TABLE authoring_sessions_v2 (
+    id                        TEXT PRIMARY KEY,
+    source_id                 TEXT NOT NULL REFERENCES authoring_sources_v2(id) ON DELETE RESTRICT,
+    target_task_id            TEXT NOT NULL UNIQUE REFERENCES tasks_v2(id) ON DELETE RESTRICT,
+    workflow_template_id      TEXT NOT NULL,
+    workflow_template_version TEXT NOT NULL,
+    session_manifest_json     TEXT NOT NULL,
+    session_fingerprint       TEXT NOT NULL UNIQUE,
+    idempotency_key           TEXT NOT NULL UNIQUE,
+    created_by                TEXT NOT NULL,
+    created_at                DATETIME NOT NULL,
+    UNIQUE(source_id, session_fingerprint),
+    CHECK (length(session_fingerprint) = 71),
+    CHECK (substr(session_fingerprint, 1, 7) = 'sha256:'),
+    CHECK (substr(session_fingerprint, 8) NOT GLOB '*[^0-9a-f]*')
+);
+
+-- table authoring_run_input_artifacts_v2
+-- A pre-materialization Run consumes the frozen source snapshot directly.
+-- This is intentionally separate from run_input_artifacts, whose foreign key
+-- contract is a real TaskRevision and would otherwise force a synthetic
+-- revision into the authoring path.
+CREATE TABLE authoring_run_input_artifacts_v2 (
+    id                    TEXT PRIMARY KEY,
+    run_id                TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    session_id            TEXT NOT NULL REFERENCES authoring_sessions_v2(id) ON DELETE RESTRICT,
+    source_id             TEXT NOT NULL REFERENCES authoring_sources_v2(id) ON DELETE RESTRICT,
+    source_fingerprint    TEXT NOT NULL,
+    port                  TEXT NOT NULL,
+    snapshot_artifact_ref TEXT NOT NULL,
+    content_digest        TEXT NOT NULL,
+    schema_version        TEXT NOT NULL,
+    idempotency_key       TEXT NOT NULL UNIQUE,
+    created_by            TEXT NOT NULL,
+    created_at            DATETIME NOT NULL,
+    UNIQUE(run_id, port),
+    CHECK (snapshot_artifact_ref = content_digest),
+    CHECK (length(content_digest) = 71),
+    CHECK (substr(content_digest, 1, 7) = 'sha256:'),
+    CHECK (substr(content_digest, 8) NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_fingerprint) = 71),
+    CHECK (substr(source_fingerprint, 1, 7) = 'sha256:'),
+    CHECK (substr(source_fingerprint, 8) NOT GLOB '*[^0-9a-f]*')
+);
+
 -- table run_input_artifacts
 -- Immutable, run-scoped subject inputs. These are intentionally distinct
 -- from stage-produced artifact refs: no synthetic producer StageAttempt is
@@ -160,6 +239,8 @@ CREATE TABLE codeedge_compliance_records_v20 (
     revision_id               TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
     task_digest               TEXT NOT NULL,
     status                    TEXT NOT NULL CHECK (status IN ('approved', 'rejected')),
+    evaluator_evidence_handoff_id TEXT NOT NULL UNIQUE REFERENCES codeedge_evaluator_evidence_handoffs_v2(id) ON DELETE RESTRICT,
+    evaluator_evidence_handoff_fingerprint TEXT NOT NULL,
     qwen_receipt_json         TEXT NOT NULL,
     opus_receipt_json         TEXT NOT NULL,
     submission_receipt_json   TEXT NOT NULL,
@@ -175,6 +256,54 @@ CREATE TABLE codeedge_compliance_records_v20 (
         OR
         (status = 'rejected' AND authorization_json = '' AND authorization_fingerprint = '')
     )
+);
+
+-- table codeedge_evaluator_evidence_handoffs_v2
+-- The parent CodeEdge Phase-1 Run remains the only compliance/package owner.
+-- This immutable record links it to the closed evaluator child Run without
+-- copying or re-labelling the child-owned Harbor evidence.
+CREATE TABLE codeedge_evaluator_evidence_handoffs_v2 (
+    id                                TEXT PRIMARY KEY,
+    parent_run_id                     TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    child_run_id                      TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    task_id                           TEXT NOT NULL REFERENCES tasks_v2(id) ON DELETE RESTRICT,
+    revision_id                       TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
+    task_digest                       TEXT NOT NULL,
+    parent_catalog_fingerprint        TEXT NOT NULL,
+    parent_lock_fingerprint           TEXT NOT NULL,
+    parent_manifest_fingerprint       TEXT NOT NULL,
+    parent_definition_fingerprint     TEXT NOT NULL,
+    child_catalog_fingerprint         TEXT NOT NULL,
+    child_lock_fingerprint            TEXT NOT NULL,
+    child_manifest_fingerprint        TEXT NOT NULL,
+    child_definition_fingerprint      TEXT NOT NULL,
+    qwen_stage_attempt_id             TEXT NOT NULL UNIQUE REFERENCES stage_attempts(id) ON DELETE RESTRICT,
+    qwen_bundle_artifact_id           TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
+    qwen_bundle_content_digest        TEXT NOT NULL,
+    qwen_bundle_schema_version        TEXT NOT NULL,
+    qwen_screenshot_artifact_id       TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
+    qwen_screenshot_content_digest    TEXT NOT NULL,
+    qwen_screenshot_schema_version    TEXT NOT NULL,
+    qwen_trial_set_fingerprint        TEXT NOT NULL,
+    opus_stage_attempt_id             TEXT NOT NULL UNIQUE REFERENCES stage_attempts(id) ON DELETE RESTRICT,
+    opus_bundle_artifact_id           TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
+    opus_bundle_content_digest        TEXT NOT NULL,
+    opus_bundle_schema_version        TEXT NOT NULL,
+    opus_screenshot_artifact_id       TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
+    opus_screenshot_content_digest    TEXT NOT NULL,
+    opus_screenshot_schema_version    TEXT NOT NULL,
+    opus_trial_set_fingerprint        TEXT NOT NULL,
+    handoff_json                      TEXT NOT NULL,
+    handoff_fingerprint               TEXT NOT NULL,
+    idempotency_key                   TEXT NOT NULL UNIQUE,
+    created_by                        TEXT NOT NULL,
+    created_at                        DATETIME NOT NULL,
+    CHECK (parent_run_id <> child_run_id),
+    CHECK (qwen_stage_attempt_id <> opus_stage_attempt_id),
+    CHECK (qwen_bundle_artifact_id <> qwen_screenshot_artifact_id),
+    CHECK (opus_bundle_artifact_id <> opus_screenshot_artifact_id),
+    CHECK (qwen_bundle_artifact_id <> opus_bundle_artifact_id),
+    CHECK (qwen_screenshot_artifact_id <> opus_screenshot_artifact_id)
 );
 
 -- table continuation_commands_v4
@@ -264,7 +393,7 @@ CREATE TABLE deletion_records (
 
 -- table entity_id_registry
 CREATE TABLE entity_id_registry (
-    id            TEXT PRIMARY KEY,
+    id            TEXT NOT NULL PRIMARY KEY,
     entity_type   TEXT NOT NULL,
     registered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -954,6 +1083,32 @@ CREATE TABLE task_revisions (
     UNIQUE(task_id, version_number)
 );
 
+-- table authoring_task_materializations_v2
+-- This is the one-way bridge from a pre-task AuthoringSession to the first
+-- real immutable TaskRevision. It is written in the same transaction as the
+-- Task and TaskRevision, so a retry can recover one committed identity but
+-- can never manufacture a seed or placeholder revision.
+CREATE TABLE authoring_task_materializations_v2 (
+    id                 TEXT PRIMARY KEY,
+    session_id         TEXT NOT NULL UNIQUE REFERENCES authoring_sessions_v2(id) ON DELETE RESTRICT,
+    source_id          TEXT NOT NULL REFERENCES authoring_sources_v2(id) ON DELETE RESTRICT,
+    authoring_run_id   TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
+    task_id            TEXT NOT NULL UNIQUE REFERENCES tasks_v2(id) ON DELETE RESTRICT,
+    revision_id        TEXT NOT NULL UNIQUE REFERENCES task_revisions(id) ON DELETE RESTRICT,
+    source_fingerprint TEXT NOT NULL,
+    task_digest        TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    idempotency_key    TEXT NOT NULL UNIQUE,
+    created_by         TEXT NOT NULL,
+    created_at         DATETIME NOT NULL,
+    CHECK (length(source_fingerprint) = 71),
+    CHECK (substr(source_fingerprint, 1, 7) = 'sha256:'),
+    CHECK (substr(source_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_fingerprint) = 71),
+    CHECK (substr(request_fingerprint, 1, 7) = 'sha256:'),
+    CHECK (substr(request_fingerprint, 8) NOT GLOB '*[^0-9a-f]*')
+);
+
 -- table tasks_v2
 CREATE TABLE "tasks_v2" (
     id                  TEXT PRIMARY KEY,
@@ -1036,8 +1191,14 @@ CREATE TABLE usage_events (
 -- table workflow_runs
 CREATE TABLE workflow_runs (
     id                        TEXT PRIMARY KEY,
-    task_id                   TEXT NOT NULL REFERENCES tasks_v2(id) ON DELETE RESTRICT,
-    revision_id               TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
+    subject_kind              TEXT NOT NULL DEFAULT 'task_revision'
+                              CHECK (subject_kind IN ('task_revision', 'authoring_session')),
+    subject_id                TEXT NOT NULL,
+    subject_revision_id       TEXT NOT NULL,
+    subject_digest            TEXT NOT NULL,
+    task_id                   TEXT REFERENCES tasks_v2(id) ON DELETE RESTRICT,
+    revision_id               TEXT REFERENCES task_revisions(id) ON DELETE RESTRICT,
+    authoring_session_id      TEXT REFERENCES authoring_sessions_v2(id) ON DELETE RESTRICT,
     workflow_template_id      TEXT NOT NULL,
     workflow_template_version TEXT NOT NULL,
     resolved_profile_hash     TEXT NOT NULL,
@@ -1058,7 +1219,18 @@ CREATE TABLE workflow_runs (
     created_at                DATETIME NOT NULL,
     started_at                DATETIME,
     finished_at               DATETIME,
-    version                   INTEGER NOT NULL DEFAULT 1 CHECK (version > 0)
+    version                   INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    CHECK (
+        (subject_kind = 'task_revision'
+         AND task_id IS NOT NULL
+         AND revision_id IS NOT NULL
+         AND authoring_session_id IS NULL)
+        OR
+        (subject_kind = 'authoring_session'
+         AND task_id IS NULL
+         AND revision_id IS NULL
+         AND authoring_session_id IS NOT NULL)
+    )
 );
 
 -- table workspaces_v2
@@ -1096,6 +1268,22 @@ CREATE INDEX idx_artifact_refs_v4_lineage
 -- index idx_artifact_refs_v4_manifest
 CREATE INDEX idx_artifact_refs_v4_manifest ON artifact_refs_v4(manifest_id, artifact_key);
 
+-- index idx_authoring_sessions_v2_source
+CREATE INDEX idx_authoring_sessions_v2_source
+    ON authoring_sessions_v2(source_id, created_at DESC);
+
+-- index idx_authoring_run_input_artifacts_v2_run
+CREATE INDEX idx_authoring_run_input_artifacts_v2_run
+    ON authoring_run_input_artifacts_v2(run_id, port);
+
+-- index idx_authoring_task_materializations_v2_revision
+CREATE INDEX idx_authoring_task_materializations_v2_revision
+    ON authoring_task_materializations_v2(revision_id);
+
+-- index idx_authoring_task_materializations_v2_run
+CREATE INDEX idx_authoring_task_materializations_v2_run
+    ON authoring_task_materializations_v2(authoring_run_id);
+
 -- index idx_run_input_artifacts_run_port
 CREATE INDEX idx_run_input_artifacts_run_port
     ON run_input_artifacts(run_id, port);
@@ -1129,6 +1317,10 @@ CREATE INDEX idx_codeedge_compliance_v20_revision
 -- index idx_codeedge_compliance_v20_task
 CREATE INDEX idx_codeedge_compliance_v20_task
     ON codeedge_compliance_records_v20(task_id, created_at, id);
+
+-- index idx_codeedge_evaluator_handoff_v2_task
+CREATE INDEX idx_codeedge_evaluator_handoff_v2_task
+    ON codeedge_evaluator_evidence_handoffs_v2(task_id, revision_id, created_at, id);
 
 -- index idx_continuation_commands_v4_subject
 CREATE INDEX idx_continuation_commands_v4_subject
@@ -1395,6 +1587,11 @@ CREATE INDEX idx_turn_checkpoints_node ON turn_checkpoints(node_attempt_id, turn
 -- index idx_workflow_runs_revision
 CREATE INDEX idx_workflow_runs_revision ON workflow_runs(revision_id, created_at DESC);
 
+-- index idx_workflow_runs_authoring_session
+CREATE UNIQUE INDEX idx_workflow_runs_authoring_session
+    ON workflow_runs(authoring_session_id)
+    WHERE authoring_session_id IS NOT NULL;
+
 -- index idx_workflow_runs_status
 CREATE INDEX idx_workflow_runs_status ON workflow_runs(status);
 
@@ -1412,6 +1609,68 @@ CREATE TRIGGER artifact_manifests_v4_no_delete
 BEFORE DELETE ON artifact_manifests_v4
 BEGIN
     SELECT RAISE(ABORT, 'artifact manifests are immutable');
+END;
+
+-- trigger entity_id_registry_uuidv7_insert
+-- Every lifecycle table enters the global identity namespace through an
+-- entity_id_registry insert trigger. Keep the UUIDv7 validation at that
+-- single SQLite boundary so raw SQL cannot introduce an empty, NULL, mixed
+-- case, non-hex, wrong-version, or wrong-variant lifecycle identity.
+CREATE TRIGGER entity_id_registry_uuidv7_insert
+BEFORE INSERT ON entity_id_registry
+WHEN NEW.id IS NULL
+  OR length(NEW.id) <> 36
+  OR NEW.id <> trim(NEW.id)
+  OR NEW.id <> lower(NEW.id)
+  OR substr(NEW.id, 9, 1) <> '-'
+  OR substr(NEW.id, 14, 1) <> '-'
+  OR substr(NEW.id, 15, 1) <> '7'
+  OR substr(NEW.id, 19, 1) <> '-'
+  OR substr(NEW.id, 20, 1) NOT IN ('8', '9', 'a', 'b')
+  OR substr(NEW.id, 24, 1) <> '-'
+  OR length(replace(NEW.id, '-', '')) <> 32
+  OR replace(NEW.id, '-', '') GLOB '*[^0-9a-f]*'
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity must be canonical UUIDv7');
+END;
+
+-- trigger entity_id_registry_no_update
+-- Registry entries are durable tombstones for real lifecycle identities. An
+-- entity must never be relabelled after it has occupied the global namespace.
+CREATE TRIGGER entity_id_registry_no_update
+BEFORE UPDATE ON entity_id_registry
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle identity registry entries are immutable');
+END;
+
+-- trigger entity_id_registry_no_delete
+-- A source entity can be deleted by a maintenance operation, but its UUIDv7
+-- must remain permanently occupied. Candidate target identities are the lone
+-- exception: they are provisional reservations that are atomically consumed
+-- immediately before the target task_revision/workflow_run insert.
+CREATE TRIGGER entity_id_registry_no_delete
+BEFORE DELETE ON entity_id_registry
+WHEN OLD.entity_type NOT IN ('reserved_task_revision', 'reserved_workflow_run')
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle identity registry entries are permanent');
+END;
+
+-- trigger entity_id_registry_reserved_delete_requires_reservation
+-- Preserve the candidate promotion path while rejecting a forged or orphaned
+-- reserved registry deletion. consumeCandidateIdentityReservationTx deletes
+-- this row first, then deletes the matching reservation, in one transaction.
+CREATE TRIGGER entity_id_registry_reserved_delete_requires_reservation
+BEFORE DELETE ON entity_id_registry
+WHEN (OLD.entity_type = 'reserved_task_revision' AND NOT EXISTS (
+        SELECT 1 FROM revision_candidate_identity_reservations_v8
+        WHERE reserved_id = OLD.id AND intended_type = 'task_revision'
+    ))
+  OR (OLD.entity_type = 'reserved_workflow_run' AND NOT EXISTS (
+        SELECT 1 FROM revision_candidate_identity_reservations_v8
+        WHERE reserved_id = OLD.id AND intended_type = 'workflow_run'
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'candidate identity reservation is required for registry promotion');
 END;
 
 -- trigger artifact_manifests_v4_no_update
@@ -1475,6 +1734,20 @@ CREATE TRIGGER codeedge_compliance_records_v20_no_delete
 BEFORE DELETE ON codeedge_compliance_records_v20
 BEGIN
     SELECT RAISE(ABORT, 'CodeEdge compliance records are append-only');
+END;
+
+-- trigger codeedge_evaluator_evidence_handoffs_v2_immutable
+CREATE TRIGGER codeedge_evaluator_evidence_handoffs_v2_immutable
+BEFORE UPDATE ON codeedge_evaluator_evidence_handoffs_v2
+BEGIN
+    SELECT RAISE(ABORT, 'CodeEdge evaluator evidence handoff is immutable');
+END;
+
+-- trigger codeedge_evaluator_evidence_handoffs_v2_no_delete
+CREATE TRIGGER codeedge_evaluator_evidence_handoffs_v2_no_delete
+BEFORE DELETE ON codeedge_evaluator_evidence_handoffs_v2
+BEGIN
+    SELECT RAISE(ABORT, 'CodeEdge evaluator evidence handoffs are append-only');
 END;
 
 -- trigger continuation_commands_v4_no_delete
@@ -1558,6 +1831,60 @@ BEGIN
         THEN RAISE(ABORT, 'global entity identity collision')
     END;
     INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'artifact_ref');
+END;
+
+-- trigger entity_id_registry_authoring_sources_v2_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_sources_v2_id_immutable
+BEFORE UPDATE OF id ON authoring_sources_v2
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_sources_v2_insert
+CREATE TRIGGER entity_id_registry_authoring_sources_v2_insert
+BEFORE INSERT ON authoring_sources_v2
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_source');
+END;
+
+-- trigger entity_id_registry_authoring_sessions_v2_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_sessions_v2_id_immutable
+BEFORE UPDATE OF id ON authoring_sessions_v2
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_sessions_v2_insert
+CREATE TRIGGER entity_id_registry_authoring_sessions_v2_insert
+BEFORE INSERT ON authoring_sessions_v2
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_session');
+END;
+
+-- trigger entity_id_registry_authoring_task_materializations_v2_id_immutable
+CREATE TRIGGER entity_id_registry_authoring_task_materializations_v2_id_immutable
+BEFORE UPDATE OF id ON authoring_task_materializations_v2
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_authoring_task_materializations_v2_insert
+CREATE TRIGGER entity_id_registry_authoring_task_materializations_v2_insert
+BEFORE INSERT ON authoring_task_materializations_v2
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_task_materialization');
 END;
 
 -- trigger entity_id_registry_run_input_artifacts_id_immutable
@@ -1702,6 +2029,24 @@ BEGIN
         THEN RAISE(ABORT, 'global entity identity collision')
     END;
     INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'codeedge_compliance_record');
+END;
+
+-- trigger entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_id_immutable
+CREATE TRIGGER entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_id_immutable
+BEFORE UPDATE OF id ON codeedge_evaluator_evidence_handoffs_v2
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_insert
+CREATE TRIGGER entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_insert
+BEFORE INSERT ON codeedge_evaluator_evidence_handoffs_v2
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'codeedge_evaluator_evidence_handoff');
 END;
 
 -- trigger entity_id_registry_continuation_commands_v4_id_immutable
@@ -2651,6 +2996,172 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'task purge is in progress');
+END;
+
+-- trigger authoring_sources_v2_immutable
+CREATE TRIGGER authoring_sources_v2_immutable
+BEFORE UPDATE ON authoring_sources_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring sources are immutable');
+END;
+
+-- trigger authoring_sources_v2_no_delete
+CREATE TRIGGER authoring_sources_v2_no_delete
+BEFORE DELETE ON authoring_sources_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring sources are immutable');
+END;
+
+-- trigger authoring_sessions_v2_immutable
+CREATE TRIGGER authoring_sessions_v2_immutable
+BEFORE UPDATE ON authoring_sessions_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring sessions are immutable');
+END;
+
+-- trigger authoring_sessions_v2_no_delete
+CREATE TRIGGER authoring_sessions_v2_no_delete
+BEFORE DELETE ON authoring_sessions_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring sessions are immutable');
+END;
+
+-- trigger authoring_task_materializations_v2_immutable
+CREATE TRIGGER authoring_task_materializations_v2_immutable
+BEFORE UPDATE ON authoring_task_materializations_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring task materializations are immutable');
+END;
+
+-- trigger authoring_task_materializations_v2_no_delete
+CREATE TRIGGER authoring_task_materializations_v2_no_delete
+BEFORE DELETE ON authoring_task_materializations_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring task materializations are immutable');
+END;
+
+-- trigger authoring_run_input_artifacts_v2_immutable
+CREATE TRIGGER authoring_run_input_artifacts_v2_immutable
+BEFORE UPDATE ON authoring_run_input_artifacts_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring run input artifacts are immutable');
+END;
+
+-- trigger authoring_run_input_artifacts_v2_no_delete
+CREATE TRIGGER authoring_run_input_artifacts_v2_no_delete
+BEFORE DELETE ON authoring_run_input_artifacts_v2
+BEGIN
+    SELECT RAISE(ABORT, 'authoring run input artifacts are immutable');
+END;
+
+-- trigger workflow_runs_subject_binding_insert
+-- FK checks establish that referenced rows exist. This trigger additionally
+-- proves a task revision belongs to its task and keeps authoring Runs rooted
+-- only in their immutable AuthoringSession.
+CREATE TRIGGER workflow_runs_subject_binding_insert
+BEFORE INSERT ON workflow_runs
+WHEN (
+    NEW.subject_kind = 'task_revision'
+    AND NOT EXISTS (
+        SELECT 1 FROM task_revisions
+        WHERE id = NEW.revision_id
+          AND task_id = NEW.task_id
+          AND NEW.subject_id = NEW.task_id
+          AND NEW.subject_revision_id = NEW.revision_id
+          AND NEW.subject_digest = task_digest
+    )
+) OR (
+    NEW.subject_kind = 'authoring_session'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM authoring_sessions_v2 AS session
+        JOIN authoring_sources_v2 AS source ON source.id = session.source_id
+        WHERE session.id = NEW.authoring_session_id
+          AND NEW.subject_id = session.id
+          AND NEW.subject_revision_id = source.id
+          AND NEW.subject_digest = source.source_fingerprint
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow run subject binding is invalid');
+END;
+
+-- trigger authoring_run_input_artifacts_v2_binding_insert
+CREATE TRIGGER authoring_run_input_artifacts_v2_binding_insert
+BEFORE INSERT ON authoring_run_input_artifacts_v2
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_runs AS run
+    JOIN authoring_sessions_v2 AS session ON session.id = run.authoring_session_id
+    JOIN authoring_sources_v2 AS source ON source.id = session.source_id
+    WHERE run.id = NEW.run_id
+      AND run.subject_kind = 'authoring_session'
+      AND run.authoring_session_id = NEW.session_id
+      AND NEW.source_id = source.id
+      AND NEW.source_fingerprint = source.source_fingerprint
+      AND NEW.snapshot_artifact_ref = source.snapshot_artifact_ref
+      AND NEW.content_digest = source.snapshot_content_digest
+      AND NEW.schema_version = source.snapshot_schema_version
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoring run input does not match its frozen source subject');
+END;
+
+-- trigger authoring_task_materializations_v2_binding_insert
+CREATE TRIGGER authoring_task_materializations_v2_binding_insert
+BEFORE INSERT ON authoring_task_materializations_v2
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM authoring_sessions_v2 AS session
+    JOIN authoring_sources_v2 AS source ON source.id = session.source_id
+    JOIN workflow_runs AS run ON run.id = NEW.authoring_run_id
+    JOIN tasks_v2 AS task ON task.id = NEW.task_id
+    JOIN task_revisions AS revision ON revision.id = NEW.revision_id
+    WHERE session.id = NEW.session_id
+      AND source.id = NEW.source_id
+      AND source.source_fingerprint = NEW.source_fingerprint
+      AND session.target_task_id = task.id
+      AND task.source_repo = source.repository_url
+      AND task.source_commit = source.commit_sha
+      AND run.subject_kind = 'authoring_session'
+      AND run.authoring_session_id = session.id
+      AND run.subject_id = session.id
+      AND run.subject_revision_id = source.id
+      AND run.subject_digest = source.source_fingerprint
+      AND revision.task_id = task.id
+      AND revision.version_number = 1
+      AND revision.parent_revision_id IS NULL
+      AND revision.origin = 'generated'
+      AND revision.state = 'sealed'
+      AND revision.task_digest = NEW.task_digest
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoring task materialization does not match frozen session/run/source lineage');
+END;
+
+-- trigger workflow_runs_content_immutable
+-- Execution state/epoch may advance, but a frozen workflow Run can never be
+-- rebound from a session to a revision or vice versa.
+CREATE TRIGGER workflow_runs_content_immutable
+BEFORE UPDATE ON workflow_runs
+WHEN NEW.subject_kind <> OLD.subject_kind
+  OR NEW.subject_id <> OLD.subject_id
+  OR NEW.subject_revision_id <> OLD.subject_revision_id
+  OR NEW.subject_digest <> OLD.subject_digest
+  OR NEW.task_id IS NOT OLD.task_id
+  OR NEW.revision_id IS NOT OLD.revision_id
+  OR NEW.authoring_session_id IS NOT OLD.authoring_session_id
+  OR NEW.workflow_template_id <> OLD.workflow_template_id
+  OR NEW.workflow_template_version <> OLD.workflow_template_version
+  OR NEW.resolved_profile_hash <> OLD.resolved_profile_hash
+  OR NEW.definition_hash <> OLD.definition_hash
+  OR NEW.run_manifest_json <> OLD.run_manifest_json
+  OR NEW.parent_run_id IS NOT OLD.parent_run_id
+  OR NEW.trigger <> OLD.trigger
+  OR NEW.created_by <> OLD.created_by
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'workflow run content is immutable');
 END;
 
 -- trigger task_revisions_content_immutable

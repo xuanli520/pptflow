@@ -125,3 +125,63 @@ func TestConsolidatedV2RejectsGlobalEntityIdentityCollisions(t *testing.T) {
 		t.Fatalf("registry entity type=%q, want task", entityType)
 	}
 }
+
+func TestConsolidatedV2RejectsRawNullAndNonCanonicalUUIDv7EntityIdentities(t *testing.T) {
+	s := tempDB(t)
+	now := time.Now().UTC()
+	canonical, err := NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for index, identity := range []any{nil, "", "not-a-uuidv7", strings.ToUpper(canonical)} {
+		_, err := s.db.Exec(`
+			INSERT INTO capacity_pools_v5 (id, pool_key, capacity, created_at, updated_at, version)
+			VALUES (?, ?, 1, ?, ?, 1)
+		`, identity, fmt.Sprintf("uuidv7-boundary-%d", index), now, now)
+		if err == nil || !strings.Contains(err.Error(), "canonical UUIDv7") {
+			t.Fatalf("raw capacity-pool identity %q error=%v, want canonical UUIDv7 rejection", identity, err)
+		}
+	}
+
+	if _, err := s.db.Exec(`INSERT INTO entity_id_registry (id, entity_type) VALUES (?, 'forged')`, strings.ToUpper(canonical)); err == nil || !strings.Contains(err.Error(), "canonical UUIDv7") {
+		t.Fatalf("raw registry noncanonical identity error=%v, want canonical UUIDv7 rejection", err)
+	}
+}
+
+func TestConsolidatedV2RegistryPermanentlyFencesDeletedEntityIdentity(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	pool, err := s.ConfigureCapacityPool(ctx, ConfigureCapacityPoolRequest{
+		PoolKey: "registry-permanent-original", Capacity: 1, ExpectedVersion: 0, Actor: "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE entity_id_registry SET entity_type = 'task' WHERE id = ?`, pool.ID); err == nil || !strings.Contains(err.Error(), "registry entries are immutable") {
+		t.Fatalf("raw registry update error=%v, want immutable registry rejection", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM entity_id_registry WHERE id = ?`, pool.ID); err == nil || !strings.Contains(err.Error(), "registry entries are permanent") {
+		t.Fatalf("raw registry delete error=%v, want permanent registry rejection", err)
+	}
+
+	// capacity pools are intentionally mutable control-plane configuration, so
+	// use a direct source-row deletion to prove that the global identity ledger
+	// remains a tombstone even when a lifecycle source row no longer exists.
+	if _, err := s.db.Exec(`DELETE FROM capacity_pools_v5 WHERE id = ?`, pool.ID); err != nil {
+		t.Fatalf("delete source entity: %v", err)
+	}
+	var entityType string
+	if err := s.db.QueryRow(`SELECT entity_type FROM entity_id_registry WHERE id = ?`, pool.ID).Scan(&entityType); err != nil {
+		t.Fatalf("read permanent registry tombstone: %v", err)
+	}
+	if entityType != "capacity_pool" {
+		t.Fatalf("registry tombstone entity type=%q, want capacity_pool", entityType)
+	}
+	if _, err := s.db.Exec(`
+		INSERT INTO capacity_pools_v5 (id, pool_key, capacity, created_at, updated_at, version)
+		VALUES (?, 'registry-permanent-reuse', 1, ?, ?, 1)
+	`, pool.ID, time.Now().UTC(), time.Now().UTC()); err == nil || !strings.Contains(err.Error(), globalIdentityCollisionMessage) {
+		t.Fatalf("reuse deleted entity identity error=%v, want global identity collision", err)
+	}
+}

@@ -66,3 +66,17 @@ func TestStageOperationBindingPayloadIsStrictAndCloned(t *testing.T) {
 		t.Fatal("binding without a typed payload was accepted")
 	}
 }
+
+func TestCloneStageOperationPayloadPreservesExplicitEmptyArgumentArrays(t *testing.T) {
+	payload := LocalCommandOperationPayload{CommandID: "harbor-stage", Arguments: []string{}}
+	clone, ok := CloneStageOperationPayload(payload).(LocalCommandOperationPayload)
+	if !ok {
+		t.Fatalf("clone type = %T, want LocalCommandOperationPayload", CloneStageOperationPayload(payload))
+	}
+	if clone.Arguments == nil || len(clone.Arguments) != 0 {
+		t.Fatalf("explicit empty local command arguments became %#v", clone.Arguments)
+	}
+	if err := (StageOperationBinding{ProviderID: "provider-local", OperationID: "stage", Version: "1", Payload: clone}).validate(); err != nil {
+		t.Fatalf("cloned explicit empty local command payload did not validate: %v", err)
+	}
+}

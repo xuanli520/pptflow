@@ -86,12 +86,15 @@ const (
 	ReviewContent          ReviewKind = "content"
 	ReviewSolutionVerifier ReviewKind = "solution_verifier"
 	ReviewFinalQuality     ReviewKind = "final_quality"
-	ReviewModelResult      ReviewKind = "model_result"
+	// ReviewEvaluatorEvidence approves the immutable parent-to-child evidence
+	// handoff after the child evaluator Run has been independently verified.
+	ReviewEvaluatorEvidence ReviewKind = "evaluator_evidence_handoff"
+	ReviewModelResult       ReviewKind = "model_result"
 )
 
 func (kind ReviewKind) valid() bool {
 	switch kind {
-	case ReviewTaskDirection, ReviewContent, ReviewSolutionVerifier, ReviewFinalQuality, ReviewModelResult:
+	case ReviewTaskDirection, ReviewContent, ReviewSolutionVerifier, ReviewFinalQuality, ReviewEvaluatorEvidence, ReviewModelResult:
 		return true
 	default:
 		return false
@@ -332,6 +335,8 @@ func reviewDecisionArtifact(kind ReviewKind) workflowkit.ArtifactSpec {
 		name = "solution_review_decision"
 	case ReviewFinalQuality:
 		name = "final_review_decision"
+	case ReviewEvaluatorEvidence:
+		name = "evaluator_evidence_handoff_decision"
 	case ReviewModelResult:
 		name = "model_result_decision"
 	}
@@ -439,9 +444,11 @@ func (catalog StageCatalog) Validate() error {
 			return fmt.Errorf("%w: template %s@%s stage %q is not cataloged", errInvalidCatalog, catalog.Template.ID, catalog.Template.Version, node)
 		}
 	}
-	packageStage := stages[workflowkit.StageKey(Package)]
-	if !packageStage.Dispatch.IsOperatorOnly() {
-		return fmt.Errorf("%w: local package stage must be operator-only", errInvalidCatalog)
+	if policy.requiresOperatorOnlyPackage {
+		packageStage := stages[workflowkit.StageKey(Package)]
+		if !packageStage.Dispatch.IsOperatorOnly() {
+			return fmt.Errorf("%w: local package stage must be operator-only", errInvalidCatalog)
+		}
 	}
 	if len(groups) != len(policy.groups) {
 		return fmt.Errorf("%w: template %s@%s got %d stage groups; want %d", errInvalidCatalog, catalog.Template.ID, catalog.Template.Version, len(groups), len(policy.groups))
@@ -458,6 +465,9 @@ func (catalog StageCatalog) Validate() error {
 		return err
 	}
 	if err := policy.validateTopology(stages); err != nil {
+		return err
+	}
+	if err := policy.validateStageDefinitions(stages); err != nil {
 		return err
 	}
 	return nil
@@ -771,6 +781,7 @@ const (
 	resourceReviewContent                workflowkit.ResourceKey = "review/content"
 	resourceReviewSolutionVerifier       workflowkit.ResourceKey = "review/solution-verifier"
 	resourceReviewFinalQuality           workflowkit.ResourceKey = "review/final-quality"
+	resourceReviewEvaluatorEvidence      workflowkit.ResourceKey = "review/evaluator-evidence-handoff"
 	resourceReviewModelResult            workflowkit.ResourceKey = "review/model-result"
 	resourceEvidenceRepoPrepare          workflowkit.ResourceKey = "evidence/repo-prepare"
 	resourceEvidenceTaskLayout           workflowkit.ResourceKey = "evidence/codeedge/task-layout"
@@ -788,6 +799,7 @@ const (
 	resourceEvidenceSimilarity           workflowkit.ResourceKey = "evidence/similarity"
 	resourceEvidenceEvaluationQwen       workflowkit.ResourceKey = "evidence/evaluation/qwen"
 	resourceEvidenceEvaluationOpus       workflowkit.ResourceKey = "evidence/evaluation/opus"
+	resourceEvidenceEvaluatorHandoff     workflowkit.ResourceKey = "evidence/evaluation/handoff"
 	resourceEvidenceSubmissionLint       workflowkit.ResourceKey = "evidence/submission-lint"
 	resourceDeliveryPublish              workflowkit.ResourceKey = "delivery/publish"
 	resourceDeliveryPackage              workflowkit.ResourceKey = "delivery/package"

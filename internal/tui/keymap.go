@@ -101,6 +101,13 @@ func (m *model) updateRunControlKey(msg tea.KeyMsg) tea.Cmd {
 		m.runControl.selectAction(TaskHubRunControlCancelStage)
 	case "s":
 		m.runControl.selectAction(TaskHubRunControlTerminate)
+	case "r":
+		// Reconcile is deliberately absent from ordinary Runs. Do not turn its
+		// mnemonic into a generic recovery shortcut when the authoritative
+		// capability projection did not expose it.
+		if m.runControl.declaresAction(TaskHubRunControlReconcile) {
+			m.runControl.selectAction(TaskHubRunControlReconcile)
+		}
 	case "up":
 		m.cycleRunControlSelection(-1)
 	case "down", "j":
@@ -114,6 +121,9 @@ func (m *model) cycleRunControlSelection(delta int) {
 		return
 	}
 	choices := []TaskHubRunControlAction{"", TaskHubRunControlPause, TaskHubRunControlCancelStage, TaskHubRunControlTerminate}
+	if m.runControl.declaresAction(TaskHubRunControlReconcile) {
+		choices = append(choices, TaskHubRunControlReconcile)
+	}
 	current := 0
 	for index, action := range choices {
 		if action == m.runControl.SelectedAction {
@@ -161,7 +171,7 @@ func (m model) footer() string {
 	}
 	if m.runControl != nil {
 		if m.runControl.lifecycleControlAvailable() {
-			return subtleStyle.Render("[P/K/S] 选择  [Enter] 查看影响预览  [Esc] 返回")
+			return subtleStyle.Render(m.runControl.actionKeyHint())
 		}
 		return subtleStyle.Render("[Enter/Esc] 返回")
 	}

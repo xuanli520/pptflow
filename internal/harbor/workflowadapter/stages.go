@@ -28,10 +28,14 @@ const (
 	SimilarityCheck   = "similarity_check"
 	HarborRunQwen     = "harbor_run_qwen"
 	HarborRunOpus     = "harbor_run_opus"
-	SubmissionLint    = "submission_lint"
-	ResultReview      = "result_review"
-	FinalReview       = "final_review"
-	Package           = "package"
+	// EvaluatorEvidenceHandoff is the parent-side durable gate that adopts
+	// externally executed evaluator child evidence. It never executes a model
+	// or re-labels child artifacts as outputs of the parent Run.
+	EvaluatorEvidenceHandoff = "evaluator_evidence_handoff"
+	SubmissionLint           = "submission_lint"
+	ResultReview             = "result_review"
+	FinalReview              = "final_review"
+	Package                  = "package"
 )
 
 var standardStageOrder = []string{

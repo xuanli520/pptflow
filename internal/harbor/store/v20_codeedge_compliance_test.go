@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -13,7 +14,7 @@ import (
 func TestCodeEdgeComplianceRecordIsImmutableRunBoundAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)
-	fixture := newTrialStoreFixture(t, s)
+	fixture := newCodeEdgeEvaluatorEvidenceHandoffFixture(t, s)
 	request := codeEdgeComplianceRecordFixture(t, s, fixture)
 
 	record, err := s.CreateCodeEdgeComplianceRecord(ctx, request)
@@ -30,7 +31,7 @@ func TestCodeEdgeComplianceRecordIsImmutableRunBoundAndIdempotent(t *testing.T) 
 	if entityType != "codeedge_compliance_record" {
 		t.Fatalf("CodeEdge compliance registry type = %q, want codeedge_compliance_record", entityType)
 	}
-	loaded, err := s.GetCodeEdgeComplianceRecordForRun(ctx, fixture.run.ID)
+	loaded, err := s.GetCodeEdgeComplianceRecordForRun(ctx, fixture.parent.ID)
 	if err != nil || loaded == nil || loaded.ID != record.ID {
 		t.Fatalf("load CodeEdge compliance record = %+v, %v", loaded, err)
 	}
@@ -54,11 +55,11 @@ func TestCodeEdgeComplianceRecordIsImmutableRunBoundAndIdempotent(t *testing.T) 
 func TestCodeEdgeComplianceRecordRejectsCrossRunAndAuthorizationShape(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)
-	fixture := newTrialStoreFixture(t, s)
+	fixture := newCodeEdgeEvaluatorEvidenceHandoffFixture(t, s)
 	request := codeEdgeComplianceRecordFixture(t, s, fixture)
 
-	other := newTrialStoreFixture(t, s)
-	request.RunID = other.run.ID
+	other := newCodeEdgeEvaluatorEvidenceHandoffFixture(t, s)
+	request.RunID = other.parent.ID
 	if _, err := s.CreateCodeEdgeComplianceRecord(ctx, request); err == nil || !strings.Contains(err.Error(), "Run does not match") {
 		t.Fatalf("cross-run CodeEdge compliance record = %v, want Run binding rejection", err)
 	}
@@ -78,7 +79,7 @@ func TestCodeEdgeComplianceRecordRejectsCrossRunAndAuthorizationShape(t *testing
 func TestCodeEdgeComplianceRecordRejectsNonCanonicalOrInconsistentTypedEvidence(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)
-	fixture := newTrialStoreFixture(t, s)
+	fixture := newCodeEdgeEvaluatorEvidenceHandoffFixture(t, s)
 
 	request := codeEdgeComplianceRecordFixture(t, s, fixture)
 	request.DecisionFingerprint = string(workflowkit.SHA256Fingerprint([]byte("forged-decision")))
@@ -97,26 +98,76 @@ func TestCodeEdgeComplianceRecordRejectsNonCanonicalOrInconsistentTypedEvidence(
 	if _, err := s.CreateCodeEdgeComplianceRecord(ctx, request); err == nil || !strings.Contains(err.Error(), "authorization fingerprint") {
 		t.Fatalf("forged authorization fingerprint = %v, want typed authorization rejection", err)
 	}
+
+	request = codeEdgeComplianceRecordFixture(t, s, fixture)
+	var qwen codeedge.EvaluationReceipt
+	if err := json.Unmarshal([]byte(request.QwenReceiptJSON), &qwen); err != nil {
+		t.Fatal(err)
+	}
+	qwen.HarborJobID = "different-but-structurally-valid-job"
+	rewriteCodeEdgeComplianceQwenReceipt(t, &request, qwen)
+	if _, err := s.CreateCodeEdgeComplianceRecord(ctx, request); err == nil || !strings.Contains(err.Error(), "handoff") {
+		t.Fatalf("receipt distinct from handoff = %v, want handoff binding rejection", err)
+	}
 }
 
-func codeEdgeComplianceRecordFixture(t *testing.T, s *Store, fixture trialStoreFixture) CreateCodeEdgeComplianceRecordRequest {
+func rewriteCodeEdgeComplianceQwenReceipt(t *testing.T, request *CreateCodeEdgeComplianceRecordRequest, qwen codeedge.EvaluationReceipt) {
+	t.Helper()
+	qwenJSON, err := qwen.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	qwenFingerprint, err := qwen.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decision codeedge.FinalComplianceDecision
+	if err := json.Unmarshal([]byte(request.DecisionJSON), &decision); err != nil {
+		t.Fatal(err)
+	}
+	decision.QwenReceiptFingerprint = qwenFingerprint
+	decisionJSON, err := decision.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisionFingerprint, err := decision.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization, err := (codeedge.FinalComplianceService{}).IssueLocalPackageAuthorization(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizationJSON, err := authorization.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizationFingerprint, err := authorization.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.QwenReceiptJSON = string(qwenJSON)
+	request.DecisionJSON = string(decisionJSON)
+	request.DecisionFingerprint = string(decisionFingerprint)
+	request.AuthorizationJSON = string(authorizationJSON)
+	request.AuthorizationFingerprint = string(authorizationFingerprint)
+}
+
+func codeEdgeComplianceRecordFixture(t *testing.T, s *Store, fixture codeEdgeEvaluatorEvidenceHandoffFixture) CreateCodeEdgeComplianceRecordRequest {
 	return codeEdgeComplianceRecordFixtureWithStatus(t, s, fixture, CodeEdgeComplianceApproved)
 }
 
-func codeEdgeComplianceRecordFixtureWithStatus(t *testing.T, s *Store, fixture trialStoreFixture, status CodeEdgeComplianceStatus) CreateCodeEdgeComplianceRecordRequest {
+func codeEdgeComplianceRecordFixtureWithStatus(t *testing.T, s *Store, fixture codeEdgeEvaluatorEvidenceHandoffFixture, status CodeEdgeComplianceStatus) CreateCodeEdgeComplianceRecordRequest {
 	t.Helper()
-	revision, err := s.GetTaskRevision(context.Background(), fixture.run.RevisionID)
-	if err != nil || revision == nil {
-		t.Fatalf("load CodeEdge compliance fixture revision = %+v, %v", revision, err)
+	handoffRecord := ensureCodeEdgeEvaluatorEvidenceHandoff(t, s, fixture)
+	handoff := fixture.document(t)
+	handoffFingerprint, err := handoff.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
 	}
-	binding := codeedge.FrozenRunBinding{
-		TaskSnapshotDigest:  workflowkit.SubjectDigest(revision.TaskDigest),
-		CatalogFingerprint:  codeEdgeFixtureFingerprint("catalog"),
-		LockFingerprint:     codeEdgeFixtureFingerprint("lock"),
-		ManifestFingerprint: codeEdgeFixtureFingerprint("manifest"),
-	}
-	qwen := codeEdgeFixtureEvaluationReceipt(t, "qwen", binding)
-	opus := codeEdgeFixtureEvaluationReceipt(t, "opus", binding)
+	binding := handoff.ParentBinding
+	qwen := handoff.Qwen.Receipt
+	opus := handoff.Opus.Receipt
 	submission := codeedge.SubmissionCheckReceipt{
 		Format: codeedge.SubmissionCheckReceiptFormat, Version: codeedge.SubmissionCheckReceiptVersion,
 		Status: codeedge.SubmissionCheckPassed, CheckerID: "fixture-submission-check", CheckerVersion: "1",
@@ -147,7 +198,8 @@ func codeEdgeComplianceRecordFixtureWithStatus(t *testing.T, s *Store, fixture t
 	decision := codeedge.FinalComplianceDecision{
 		Format: codeedge.FinalComplianceDecisionFormat, Version: codeedge.FinalComplianceDecisionVersion, Status: decisionStatus,
 		PolicyID: "fixture-final-compliance", PolicyVersion: "1", PolicyFingerprint: codeEdgeFixtureFingerprint("final-policy"),
-		Binding: binding, QwenReceiptFingerprint: qwenFingerprint, OpusReceiptFingerprint: opusFingerprint, SubmissionReceiptFingerprint: submissionFingerprint, Reasons: reasons,
+		Binding: binding, EvaluatorEvidenceHandoffFingerprint: handoffFingerprint,
+		QwenReceiptFingerprint: qwenFingerprint, OpusReceiptFingerprint: opusFingerprint, SubmissionReceiptFingerprint: submissionFingerprint, Reasons: reasons,
 	}
 	qwenJSON, err := qwen.CanonicalJSON()
 	if err != nil {
@@ -187,8 +239,9 @@ func codeEdgeComplianceRecordFixtureWithStatus(t *testing.T, s *Store, fixture t
 		authorizationFingerprint = string(authorizationFingerprintValue)
 	}
 	return CreateCodeEdgeComplianceRecordRequest{
-		RunID: fixture.run.ID, TaskID: fixture.run.TaskID, RevisionID: fixture.run.RevisionID,
-		TaskDigest: revision.TaskDigest, Status: status,
+		RunID: fixture.parent.ID, TaskID: fixture.parent.TaskID, RevisionID: fixture.parent.RevisionID,
+		TaskDigest: fixture.revision.TaskDigest, Status: status,
+		EvaluatorEvidenceHandoffID: handoffRecord.ID, EvaluatorEvidenceHandoffFingerprint: string(handoffFingerprint),
 		QwenReceiptJSON: string(qwenJSON), OpusReceiptJSON: string(opusJSON),
 		SubmissionReceiptJSON: string(submissionJSON), DecisionJSON: string(decisionJSON),
 		DecisionFingerprint: string(decisionFingerprint), AuthorizationJSON: authorizationJSON,
@@ -197,30 +250,20 @@ func codeEdgeComplianceRecordFixtureWithStatus(t *testing.T, s *Store, fixture t
 	}
 }
 
-func codeEdgeFixtureEvaluationReceipt(t *testing.T, role string, binding codeedge.FrozenRunBinding) codeedge.EvaluationReceipt {
+func ensureCodeEdgeEvaluatorEvidenceHandoff(t *testing.T, s *Store, fixture codeEdgeEvaluatorEvidenceHandoffFixture) CodeEdgeEvaluatorEvidenceHandoff {
 	t.Helper()
-	trials := make([]codeedge.EvaluationTrialReceipt, 0, 4)
-	for ordinal := 1; ordinal <= 4; ordinal++ {
-		trials = append(trials, codeedge.EvaluationTrialReceipt{
-			HarborTrialID: role + "-trial-id-" + string(rune('0'+ordinal)), HarborTrialName: role + "-trial-" + string(rune('0'+ordinal)),
-			Status: codeedge.EvaluationTrialCompleted, TurnCount: 20, ElapsedMillis: 1,
-		})
-	}
-	receipt := codeedge.EvaluationReceipt{
-		Format: codeedge.EvaluationReceiptFormat, Version: codeedge.EvaluationReceiptVersion, Status: codeedge.EvaluationCompleted,
-		PolicyID: "fixture-" + role + "-policy", PolicyVersion: "1", PolicyFingerprint: codeEdgeFixtureFingerprint(role + "-policy"),
-		Evaluator:            codeedge.EvaluatorIdentity{ProfileID: role + "-profile", ProfileVersion: "1", AgentName: "fixture-agent", AgentVersion: "1", ModelName: role + "-model", ModelProvider: "fixture-provider"},
-		HarborEvidenceFormat: codeedge.HarborRunBundleV018Format, HarborCLI: codeedge.HarborCLIIdentity{CommandID: "fixture-harbor", Version: "0.18.0", ContentFingerprint: codeEdgeFixtureFingerprint("harbor-cli")},
-		HarborJobID: role + "-job", MaterializedTaskRootV2Digest: binding.TaskSnapshotDigest, TaskSnapshotDigest: binding.TaskSnapshotDigest,
-		CatalogFingerprint: binding.CatalogFingerprint, LockFingerprint: binding.LockFingerprint, ManifestFingerprint: binding.ManifestFingerprint,
-		RunBundleArtifactID: workflowkit.ArtifactID(role + "-result"), RunBundleContentDigest: codeEdgeFixtureFingerprint(role + "-result"),
-		ScreenshotArtifactID: workflowkit.ArtifactID(role + "-screenshot"), ScreenshotContentDigest: codeEdgeFixtureFingerprint(role + "-screenshot"), ScreenshotMediaType: "image/png",
-		Trials: trials, PassCount: 0, AverageTurns: 20, PolicyCompliant: true, ComplianceReasons: []string{},
-	}
-	if err := receipt.Validate(); err != nil {
+	existing, err := s.GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(context.Background(), fixture.parent.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return receipt
+	if existing != nil {
+		return *existing
+	}
+	handoff, err := s.CreateCodeEdgeEvaluatorEvidenceHandoff(context.Background(), fixture.request(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handoff
 }
 
 func codeEdgeFixtureFingerprint(seed string) workflowkit.Fingerprint {

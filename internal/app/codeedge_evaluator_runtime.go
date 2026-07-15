@@ -51,7 +51,9 @@ type codeEdgeEvaluatorReconciliationObservation struct {
 }
 
 func isCodeEdgeEvaluatorStage(run store.WorkflowRun, stage workflowkit.StageDescriptor) bool {
-	return isCodeEdgePhase1Run(run) && isCodeEdgeEvaluatorStageKey(stage.Key)
+	return workflowadapter.IsCodeEdgeEvaluatorWorkflowTemplate(workflowadapter.TemplateReference{
+		ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion,
+	}) && isCodeEdgeEvaluatorStageKey(stage.Key)
 }
 
 func isCodeEdgeEvaluatorStageKey(key workflowkit.StageKey) bool {
@@ -59,9 +61,9 @@ func isCodeEdgeEvaluatorStageKey(key workflowkit.StageKey) bool {
 }
 
 func isCodeEdgeEvaluatorNode(workflow workflowkit.WorkflowDescriptor, key workflowkit.NodeID) bool {
-	return workflow.ID == workflowadapter.CodeEdgePhase1WorkflowTemplateID &&
-		workflow.Version == workflowadapter.CodeEdgePhase1WorkflowTemplateVersion &&
-		isCodeEdgeEvaluatorStageKey(workflowkit.StageKey(key))
+	return workflowadapter.IsCodeEdgeEvaluatorWorkflowTemplate(workflowadapter.TemplateReference{
+		ID: workflow.ID, Version: workflow.Version,
+	}) && isCodeEdgeEvaluatorStageKey(workflowkit.StageKey(key))
 }
 
 func validateCodeEdgeEvaluatorBudget(stage workflowkit.StageDescriptor) error {
@@ -391,6 +393,9 @@ func (runtime *FrozenExecutionRuntime) projectCodeEdgeEvaluatorInDoubt(ctx conte
 	if err := runtime.markCodeEdgeRunInDoubt(ctx, run.ID, job.CreatedBy, detail); err != nil {
 		failures = append(failures, err)
 	}
+	if err := runtime.enqueueCodeEdgeEvaluatorReconciliation(ctx, job, run, stageAttempt, stage); err != nil {
+		failures = append(failures, err)
+	}
 	if runtime.core.repairs != nil {
 		if err := runtime.enqueueAutomaticRepairOutcome(ctx, run.ID, job.CreatedBy, "CodeEdge evaluator external effect requires reconciliation"); err != nil {
 			failures = append(failures, err)
@@ -568,7 +573,33 @@ func (runtime *FrozenExecutionRuntime) completeCodeEdgeEvaluatorEffect(ctx conte
 	}
 }
 
-func (runtime *FrozenExecutionRuntime) reconcileRecoveredCodeEdgeEvaluatorStage(ctx context.Context, job store.DurableJob, run store.WorkflowRun, stageAttempt store.StageAttempt, stage workflowkit.StageDescriptor) (bool, error) {
+// completeTrustedCodeEdgeEvaluatorTrials projects the four logical samples
+// only after a controlled evaluator result has crossed the durable evidence
+// fence. Both the direct completion and the read-only recovery path use this
+// helper, so replay can finish an interrupted projection without allocating a
+// fifth sample or a second external invocation.
+func (runtime *FrozenExecutionRuntime) completeTrustedCodeEdgeEvaluatorTrials(ctx context.Context, run store.WorkflowRun, stage store.StageAttempt, actor, reason string) error {
+	if runtime == nil || runtime.core == nil || runtime.core.store == nil || runtime.services == nil || runtime.services.CodeEdgeCompliance == nil {
+		return errors.New("CodeEdge evaluator trusted trial projector is not configured")
+	}
+	stageDescriptor := workflowkit.StageDescriptor{Key: workflowkit.StageKey(stage.StageKey)}
+	if !isCodeEdgeEvaluatorStage(run, stageDescriptor) {
+		return fmt.Errorf("%w: trusted trial projection targets non-evaluator stage %q", ErrFrozenExecutionPayload, stage.StageKey)
+	}
+	effect, err := runtime.core.store.GetSideEffectOperationByOperationKey(ctx, codeEdgeEvaluatorOperationKey(run.ID, stage.ID))
+	if err != nil {
+		return err
+	}
+	if effect == nil {
+		return fmt.Errorf("%w: trusted trial projection has no evaluator side effect", ErrFrozenExecutionPayload)
+	}
+	if _, err := runtime.validateCodeEdgeEvaluatorEffect(ctx, *effect, run, stage, stageDescriptor); err != nil {
+		return err
+	}
+	return runtime.services.CodeEdgeCompliance.completeTrustedTrialSet(ctx, run, stage, codeEdgeEvaluatorTrialCount, actor, reason)
+}
+
+func (runtime *FrozenExecutionRuntime) reconcileRecoveredCodeEdgeEvaluatorStage(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, stageAttempt store.StageAttempt, stage workflowkit.StageDescriptor) (bool, error) {
 	effect, err := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, stageAttempt, stage)
 	if err != nil {
 		return false, err
@@ -577,11 +608,20 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredCodeEdgeEvaluatorStage(
 		return false, nil
 	}
 	if effect.State == store.SideEffectSucceeded && stageAttempt.ExecutionStatus == store.StageExecutionCompleted {
-		// A terminal stage with its immutable artifact receipt already bound to
-		// the side-effect operation is safe for the generic handoff restorer to
-		// project. It does not need another provider invocation or trial.
-		return false, nil
+		// The side effect and its immutable receipt are already final, but a
+		// worker can have died before restoring the Run projection. Resume only
+		// that deterministic projection; do not ask the observer to inspect or
+		// invoke anything again. A direct completion never owns a reconciliation
+		// attempt, so it must not fabricate one while replaying this path.
+		_, resumeErr := runtime.resumeCommittedCodeEdgeEvaluatorCompletion(ctx, job, run, frozen, payload, stage, stageAttempt, *effect)
+		return true, resumeErr
 	}
-	_, err = runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, stageQuotaReservation{}, *effect, nil, "expired durable stage job observed after CodeEdge evaluator invocation fence")
-	return true, err
+	if _, err := runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, stageQuotaReservation{}, *effect, nil, "expired durable stage job observed after CodeEdge evaluator invocation fence"); err != nil {
+		return true, err
+	}
+
+	// Recovery may only create the separate idempotent observation delivery. It
+	// must not inspect provider evidence itself: the recovered source job has no
+	// live dispatch lease and must never turn recovery into an implicit rerun.
+	return true, nil
 }

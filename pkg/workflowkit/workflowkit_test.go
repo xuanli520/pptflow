@@ -1,6 +1,7 @@
 package workflowkit
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -271,6 +272,48 @@ func TestContinuationPlanFreezesCoverageTopologyAndExternalConfirmation(t *testi
 	}
 }
 
+func TestRevisionContinuationPlanKeepsDomainCandidateStorageOutOfPublicSnapshot(t *testing.T) {
+	workflow := testWorkflow(t)
+	workflowFingerprint := mustWorkflowFingerprint(t, workflow)
+	emptyInputs := mustInputFingerprint(t, nil)
+	now := time.Date(2026, time.July, 15, 10, 0, 0, 0, time.UTC)
+	snapshot := ContinuationPlanSnapshot{
+		PlanID:             "revision-plan",
+		CommandID:          "revision-command",
+		Strategy:           StrategyReviseSubject,
+		BaseCheckpoint:     testCheckpoint(workflowFingerprint),
+		NextExecutionEpoch: 1,
+		SourceRunID:        "source-run",
+		TargetRunRelation:  RelationChildRun,
+		PreparedChangeID:   "prepared-change",
+		SubjectRevisionID:  "replacement-revision",
+		SubjectDigest:      SubjectDigest(SHA256Fingerprint([]byte("replacement-subject"))),
+		Nodes: []NodeTransition{
+			{NodeID: "source", FromGeneration: 0, ToGeneration: 1, Disposition: DispositionSchedule, ReasonCodes: []PlanReason{"subject_changed"}, ExpectedInputFingerprint: emptyInputs},
+			{NodeID: "verify", FromGeneration: 0, ToGeneration: 1, Disposition: DispositionSchedule, ReasonCodes: []PlanReason{"subject_changed"}, ExpectedInputFingerprint: emptyInputs},
+			{NodeID: "deliver", FromGeneration: 0, ToGeneration: 1, Disposition: DispositionSchedule, ReasonCodes: []PlanReason{"subject_changed"}, ExpectedInputFingerprint: emptyInputs},
+		},
+		Schedule: []ScheduleBatch{
+			{ID: "source", NodeIDs: []NodeID{"source"}},
+			{ID: "verify", NodeIDs: []NodeID{"verify"}},
+			{ID: "deliver", NodeIDs: []NodeID{"deliver"}},
+		},
+		ExternalEffectConfirmations: []ExternalEffectConfirmation{{NodeID: "deliver", IdempotencyKey: "delivery", Actor: "operator", ConfirmedAt: now}},
+		ExpiresAt:                   now.Add(time.Hour),
+	}
+	plan, err := FreezeContinuationPlan(snapshot, workflow)
+	if err != nil {
+		t.Fatalf("freeze generic revised-subject plan: %v", err)
+	}
+	encoded, err := json.Marshal(plan.Snapshot())
+	if err != nil {
+		t.Fatalf("marshal generic revised-subject plan: %v", err)
+	}
+	if strings.Contains(string(encoded), "candidate_id") || strings.Contains(string(encoded), "revision_candidate") {
+		t.Fatalf("public generic continuation leaked domain candidate storage: %s", encoded)
+	}
+}
+
 func TestContinuationPlanKeepsOperatorOnlyStagesOutOfWorkerSchedules(t *testing.T) {
 	workflow := testWorkflow(t)
 	workflow.Stages[2].Dispatch = StageDispatchOperatorOnly
@@ -403,6 +446,17 @@ func testBudget() ExecutionBudget {
 	}
 }
 
+func TestWorkflowRejectsImplicitStageDispatch(t *testing.T) {
+	workflow := testWorkflow(t)
+	workflow.Stages[0].Dispatch = ""
+	if StageDispatchPolicy("").IsAutomatic() {
+		t.Fatal("empty dispatch policy was treated as automatic")
+	}
+	if err := workflow.Validate(); !errors.Is(err, ErrInvalidDescriptor) {
+		t.Fatalf("implicit stage dispatch error = %v, want invalid descriptor", err)
+	}
+}
+
 func testWorkflow(t *testing.T) WorkflowDescriptor {
 	t.Helper()
 	workflow := WorkflowDescriptor{
@@ -430,6 +484,7 @@ func testStage(key StageKey, dependencies []StageKey, effect StageEffect, reads,
 		ReadSet:      reads,
 		WriteSet:     writes,
 		Effect:       effect,
+		Dispatch:     StageDispatchAutomatic,
 		Budget:       testBudget(),
 		Retry:        RetryPolicy{Retryable: []FailureClass{FailureTimeout, FailureNetwork}},
 		Verdicts:     VerdictPolicy{Allowed: []Verdict{VerdictPass, VerdictNeedsRepair, VerdictReject, VerdictAdvisory}},

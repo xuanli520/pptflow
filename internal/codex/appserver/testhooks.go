@@ -8,7 +8,7 @@ import (
 )
 
 type TestSessionProbe struct {
-	session *appServerCodexReviewSession
+	session *appServerSession
 }
 
 func NewSessionProbeForTest(logPath, turnID string, maxOutputBytes int, onDelta func(Update)) *TestSessionProbe {
@@ -28,7 +28,7 @@ func FormatAggregatedDeltaLogLineForTest(turnID, itemID, text string) string {
 }
 
 func newSessionProbeForTest(req Request, turnID string, processCtx context.Context) *TestSessionProbe {
-	return &TestSessionProbe{session: &appServerCodexReviewSession{
+	return &TestSessionProbe{session: &appServerSession{
 		req:                   req,
 		processCtx:            processCtx,
 		done:                  make(chan struct{}),

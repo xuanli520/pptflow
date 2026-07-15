@@ -173,6 +173,59 @@ type RecoveryReconciler interface {
 	Reconcile(context.Context, RecoverySubject) (RecoveryDecision, error)
 }
 
+// RecoveryDecisionBackend is the narrow durable port required to apply
+// generic recovery policy. It deliberately excludes stage execution,
+// scheduling, persistence schema, and provider reconciliation details.
+// Domain adapters load observed facts, while workflowkit derives the only
+// generic action allowed for each subject.
+type RecoveryDecisionBackend interface {
+	ListRecoverySubjects(context.Context, RecoveryScope) ([]RecoverySubject, error)
+	ApplyRecovery(context.Context, RecoveryScope, []RecoveryDecision) error
+}
+
+// ReconcileRecoveryScope loads durable recovery facts, derives conservative
+// generic decisions, and hands the immutable decisions back to the adapter.
+// It never restarts a provider, resumes an external side effect, or mutates a
+// task itself. A zero ObservedAt is filled from now exactly once before the
+// backend sees the scope, making retries/replays deterministic for a caller
+// that supplies a stable clock.
+func ReconcileRecoveryScope(ctx context.Context, backend RecoveryDecisionBackend, scope RecoveryScope, now time.Time) ([]RecoveryDecision, error) {
+	if backend == nil {
+		return nil, ErrInvalidEngineConfiguration
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		return nil, fmt.Errorf("%w: recovery clock time is required", ErrInvalidRecovery)
+	}
+	if scope.ObservedAt.IsZero() {
+		scope.ObservedAt = now.UTC()
+	}
+	if err := scope.validate(); err != nil {
+		return nil, err
+	}
+	subjects, err := backend.ListRecoverySubjects(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	decisions := make([]RecoveryDecision, 0, len(subjects))
+	for _, subject := range subjects {
+		if subject.ObservedAt.IsZero() {
+			subject.ObservedAt = scope.ObservedAt
+		}
+		decision, err := DecideRecovery(subject)
+		if err != nil {
+			return nil, err
+		}
+		decisions = append(decisions, decision)
+	}
+	if err := backend.ApplyRecovery(ctx, scope, append([]RecoveryDecision(nil), decisions...)); err != nil {
+		return nil, err
+	}
+	return decisions, nil
+}
+
 // DefaultRecoveryReconciler applies DecideRecovery without domain branches.
 type DefaultRecoveryReconciler struct{}
 

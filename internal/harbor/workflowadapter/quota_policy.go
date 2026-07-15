@@ -18,12 +18,18 @@ const (
 	StandardQuotaPolicyVersion = "1.0.0"
 
 	// CodeEdgePhase1QuotaPolicyID and Version identify the explicit quota
-	// policy for the closed Phase-1 compliance/evaluation descriptor. It is
-	// separate from Standard because Phase-1 has no implicit authoring or
-	// repair stage budget, while both evaluator operations still reserve four
-	// logical trials exactly.
+	// policy for the closed Phase-1 compliance descriptor. It is separate from
+	// Standard because Phase-1 has no implicit authoring or repair stage budget.
+	// The separately launched evaluator child owns every Qwen/Opus trial
+	// reservation, while the parent only owns the durable handoff gate.
 	CodeEdgePhase1QuotaPolicyID      = "harbor.codeedge-phase1.local.operator"
-	CodeEdgePhase1QuotaPolicyVersion = "1.0.0"
+	CodeEdgePhase1QuotaPolicyVersion = "2.0.0"
+
+	// CodeEdgeEvaluatorChildQuotaPolicyID and Version identify the quota
+	// envelope for the two-stage CodeEdge evaluator child. Its only billable
+	// work is Qwen and Opus, each of which owns exactly four logical trials.
+	CodeEdgeEvaluatorChildQuotaPolicyID      = "harbor.codeedge-evaluator.local.operator"
+	CodeEdgeEvaluatorChildQuotaPolicyVersion = "1.0.0"
 
 	standardTaskStageAttemptLimit  int64 = 120
 	standardActorStageAttemptLimit int64 = 1200
@@ -361,10 +367,9 @@ func StandardQuotaPolicy() QuotaPolicy {
 
 // CodeEdgePhase1QuotaPolicy returns the explicit resource policy for the
 // closed CodeEdge Phase-1 template. It intentionally contains no agent-turn
-// or repair-round account: this descriptor validates and evaluates an already
-// frozen task snapshot, and any future authoring/repair template must declare
-// its own typed stages and quota contract. Qwen and Opus each reserve exactly
-// four logical trials, matching the confirmed evaluator policy.
+// repair-round or trial account: this descriptor validates an already frozen
+// task snapshot and adopts child evidence. The evaluator child alone reserves
+// four logical trials per model.
 func CodeEdgePhase1QuotaPolicy() QuotaPolicy {
 	catalog := CodeEdgePhase1StageCatalog()
 	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
@@ -373,15 +378,38 @@ func CodeEdgePhase1QuotaPolicy() QuotaPolicy {
 		if stage.IsGate() {
 			claims = []workflowkit.QuotaClaim{}
 		}
-		switch stage.Key {
-		case workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(HarborRunOpus):
-			claims = append(claims, standardQuotaClaim("trial", standardEvaluationTrialClaims))
-		}
 		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
 	}
 	return QuotaPolicy{
 		ID:      CodeEdgePhase1QuotaPolicyID,
 		Version: CodeEdgePhase1QuotaPolicyVersion,
+		AccountLimits: []QuotaAccountLimit{{
+			Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit,
+		}},
+		Stages: stages,
+	}
+}
+
+// CodeEdgeEvaluatorChildQuotaPolicy reserves the complete evaluator charge at
+// Run admission: two stage attempts and eight logical trials. The account
+// limits remain intentionally broader than one Run so the durable quota model
+// can account for concurrent task/actor work; the closed template itself has
+// no node capable of creating additional trials.
+func CodeEdgeEvaluatorChildQuotaPolicy() QuotaPolicy {
+	catalog := CodeEdgeEvaluatorChildStageCatalog()
+	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
+	for _, stage := range catalog.Stages {
+		stages = append(stages, StageQuotaPolicy{
+			StageKey: stage.Key,
+			Claims: []workflowkit.QuotaClaim{
+				standardQuotaClaim("stage_attempt", standardStageAttemptClaimUnits),
+				standardQuotaClaim("trial", standardEvaluationTrialClaims),
+			},
+		})
+	}
+	return QuotaPolicy{
+		ID:      CodeEdgeEvaluatorChildQuotaPolicyID,
+		Version: CodeEdgeEvaluatorChildQuotaPolicyVersion,
 		AccountLimits: []QuotaAccountLimit{
 			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
 			{Dimension: "trial", TaskLimitUnits: standardTaskTrialLimit, ActorLimitUnits: standardActorTrialLimit},

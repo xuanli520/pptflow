@@ -13,7 +13,7 @@ import (
 func TestPreviewPurgeTaskIsReadOnlyAndReportsLifecycleAndDependencyBlockers(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestPurgeTaskBlockersIncludeImmutableArtifactReferences(t *testing.T) {
 func TestPurgeTaskRemovesOnlyManagedDirectoryAndReplaysIdempotently(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestPurgeTaskRemovesOnlyManagedDirectoryAndReplaysIdempotently(t *testing.T
 func TestPurgeTaskFinalizesWhenManagedDirectoryWasRemovedBeforeRecovery(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestPurgeTaskFinalizesWhenManagedDirectoryWasRemovedBeforeRecovery(t *testi
 func TestPurgeTaskRejectsSymlinkAndRecoversWithSameIdempotencyKey(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestPurgeTaskRejectsSymlinkAndRecoversWithSameIdempotencyKey(t *testing.T) 
 func TestPurgeTaskPersistsBlockedOperationWithoutFilesystemMutation(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}

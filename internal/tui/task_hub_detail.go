@@ -97,11 +97,16 @@ type TaskHubDetail struct {
 	// decision documents, and package authorization documents are never
 	// projected into the TUI.
 	CodeEdgeCompliance []TaskHubCodeEdgeComplianceFact `json:"codeedge_compliance,omitempty"`
-	Releases           []TaskHubReleaseFact            `json:"releases,omitempty"`
-	Artifacts          []TaskHubArtifactFact           `json:"artifacts,omitempty"`
-	Reviews            []TaskHubReviewFact             `json:"reviews,omitempty"`
-	Repairs            []TaskHubRepairFact             `json:"repairs,omitempty"`
-	ObservedAt         time.Time                       `json:"observed_at"`
+	// CodeEdgeEvaluatorEvidenceHandoffs belongs only to a Phase-1 parent Run.
+	// The child remains the owner of Qwen/Opus artifacts and trial history; the
+	// parent displays the immutable adoption bridge rather than pretending it
+	// executed those stages itself.
+	CodeEdgeEvaluatorEvidenceHandoffs []TaskHubCodeEdgeEvaluatorEvidenceHandoffFact `json:"codeedge_evaluator_evidence_handoffs,omitempty"`
+	Releases                          []TaskHubReleaseFact                          `json:"releases,omitempty"`
+	Artifacts                         []TaskHubArtifactFact                         `json:"artifacts,omitempty"`
+	Reviews                           []TaskHubReviewFact                           `json:"reviews,omitempty"`
+	Repairs                           []TaskHubRepairFact                           `json:"repairs,omitempty"`
+	ObservedAt                        time.Time                                     `json:"observed_at"`
 }
 
 // TaskHubDetailTask is the stable Task identity and lifecycle summary.
@@ -176,6 +181,31 @@ type TaskHubCodeEdgeComplianceFact struct {
 	DecisionFingerprint      string                         `json:"decision_fingerprint,omitempty"`
 	AuthorizationFingerprint string                         `json:"authorization_fingerprint,omitempty"`
 	RecordedAt               time.Time                      `json:"recorded_at,omitempty"`
+}
+
+// TaskHubCodeEdgeEvaluatorEvidenceHandoffState is deliberately weaker than a
+// package authorization: it tells an operator whether a durable handoff is
+// structurally bound to the parent and child Run. The gate and package path
+// re-verify every child artifact, trial, and frozen binding before relying on
+// it, so the read-only TUI never overstates validation.
+type TaskHubCodeEdgeEvaluatorEvidenceHandoffState string
+
+const (
+	TaskHubCodeEdgeEvaluatorEvidenceHandoffNotRecorded TaskHubCodeEdgeEvaluatorEvidenceHandoffState = "not_recorded"
+	TaskHubCodeEdgeEvaluatorEvidenceHandoffRecorded    TaskHubCodeEdgeEvaluatorEvidenceHandoffState = "recorded"
+	TaskHubCodeEdgeEvaluatorEvidenceHandoffInvalid     TaskHubCodeEdgeEvaluatorEvidenceHandoffState = "invalid"
+)
+
+// TaskHubCodeEdgeEvaluatorEvidenceHandoffFact is the safe parent-side bridge
+// projection. It excludes canonical handoff JSON, child artifacts, result
+// payloads, prompt/model config, endpoint values, and secret data.
+type TaskHubCodeEdgeEvaluatorEvidenceHandoffFact struct {
+	ParentRunID        string                                       `json:"parent_run_id"`
+	State              TaskHubCodeEdgeEvaluatorEvidenceHandoffState `json:"state"`
+	HandoffID          string                                       `json:"handoff_id,omitempty"`
+	ChildRunID         string                                       `json:"child_run_id,omitempty"`
+	HandoffFingerprint string                                       `json:"handoff_fingerprint,omitempty"`
+	RecordedAt         time.Time                                    `json:"recorded_at,omitempty"`
 }
 
 // TaskHubFrozenExecutionState describes whether the projection can prove the
@@ -367,6 +397,7 @@ func (detail TaskHubDetail) Clone() TaskHubDetail {
 	}
 	detail.FrozenExecutions = append([]TaskHubFrozenExecutionFact(nil), detail.FrozenExecutions...)
 	detail.CodeEdgeCompliance = append([]TaskHubCodeEdgeComplianceFact(nil), detail.CodeEdgeCompliance...)
+	detail.CodeEdgeEvaluatorEvidenceHandoffs = append([]TaskHubCodeEdgeEvaluatorEvidenceHandoffFact(nil), detail.CodeEdgeEvaluatorEvidenceHandoffs...)
 	detail.Releases = append([]TaskHubReleaseFact(nil), detail.Releases...)
 	detail.Artifacts = append([]TaskHubArtifactFact(nil), detail.Artifacts...)
 	for index := range detail.Artifacts {
@@ -898,7 +929,10 @@ func (overlay *TaskHubDetailOverlay) evaluationEvidenceRows(runID string) []stri
 		return []string{sectionStyle.Render("评测证据（immutable lineage）"), "该 Run 未出现在只读详情中；不会按 artifact key 推测评测状态。"}
 	}
 	if taskHubIsCodeEdgePhase1RunFact(run) {
-		return overlay.codeEdgeEvaluationEvidenceRows(run)
+		return overlay.codeEdgeParentEvidenceHandoffRows(run)
+	}
+	if taskHubIsCodeEdgeEvaluatorChildRunFact(run) {
+		return overlay.codeEdgeChildEvaluationEvidenceRows(run)
 	}
 	return overlay.genericEvaluationEvidenceRows(runID)
 }
@@ -955,7 +989,7 @@ func taskHubCodeEdgeEvaluationSlots() [2]taskHubCodeEdgeEvaluationSlot {
 // the closed CodeEdge template. It intentionally reports only registration
 // metadata: a ref being present does not validate its payload or authorize a
 // continuation, retry, or package.
-func (overlay *TaskHubDetailOverlay) codeEdgeEvaluationEvidenceRows(run TaskHubRunFact) []string {
+func (overlay *TaskHubDetailOverlay) codeEdgeChildEvaluationEvidenceRows(run TaskHubRunFact) []string {
 	rows := []string{sectionStyle.Render("CodeEdge Harbor 评测证据（immutable lineage）")}
 	if taskHubReconciliationRequired(run.Status) {
 		rows = append(rows, warnStyle.Render("Run 状态："+run.Status+"；需 reconcile；TUI 不会继续或自动重跑。"))
@@ -989,6 +1023,37 @@ func (overlay *TaskHubDetailOverlay) codeEdgeEvaluationEvidenceRows(run TaskHubR
 	return rows
 }
 
+// codeEdgeParentEvidenceHandoffRows renders the parent/child topology
+// explicitly. The parent never has Qwen/Opus StageAttempts in the V2.2
+// descriptor, so showing those names here would be an unsafe UI fabrication.
+func (overlay *TaskHubDetailOverlay) codeEdgeParentEvidenceHandoffRows(run TaskHubRunFact) []string {
+	rows := []string{sectionStyle.Render("CodeEdge evaluator evidence handoff（immutable lineage）")}
+	if taskHubReconciliationRequired(run.Status) {
+		rows = append(rows, warnStyle.Render("Run 状态："+run.Status+"；需 reconcile；TUI 不会继续或自动重跑。"))
+	}
+	for _, fact := range overlay.Detail.CodeEdgeEvaluatorEvidenceHandoffs {
+		if fact.ParentRunID != run.RunID {
+			continue
+		}
+		switch fact.State {
+		case TaskHubCodeEdgeEvaluatorEvidenceHandoffNotRecorded:
+			return append(rows, warnStyle.Render("状态：尚未采用已完成 evaluator child 的不可变证据；不能批准该 gate 或进入 submission。"))
+		case TaskHubCodeEdgeEvaluatorEvidenceHandoffRecorded:
+			return append(rows,
+				"状态：已记录；gate 与 package 仍会重新验证 child artifacts、四个逻辑 Trial 与冻结绑定。",
+				"handoff ID："+fact.HandoffID,
+				"evaluator child Run："+fact.ChildRunID,
+				"handoff fingerprint："+fact.HandoffFingerprint,
+			)
+		case TaskHubCodeEdgeEvaluatorEvidenceHandoffInvalid:
+			return append(rows, failStyle.Render("状态：持久 handoff 与父/子 Run 绑定无效；不会将其视为可批准证据。"))
+		default:
+			return append(rows, failStyle.Render("状态：未知；不会将其视为可批准证据。"))
+		}
+	}
+	return append(rows, warnStyle.Render("状态：未记录 evaluator evidence handoff；不能批准该 gate 或进入 submission。"))
+}
+
 func taskHubExpectedEvidenceStatus(label, key string, references []TaskHubArtifactRefFact) string {
 	matches := make([]TaskHubArtifactRefFact, 0, 1)
 	for _, reference := range references {
@@ -1019,6 +1084,11 @@ func taskHubReconciliationRequired(state string) bool {
 func taskHubIsCodeEdgePhase1RunFact(run TaskHubRunFact) bool {
 	return run.WorkflowTemplateID == workflowadapter.CodeEdgePhase1WorkflowTemplateID &&
 		run.WorkflowTemplateVer == workflowadapter.CodeEdgePhase1WorkflowTemplateVersion
+}
+
+func taskHubIsCodeEdgeEvaluatorChildRunFact(run TaskHubRunFact) bool {
+	return run.WorkflowTemplateID == workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID &&
+		run.WorkflowTemplateVer == workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion
 }
 
 func (overlay *TaskHubDetailOverlay) runFact(runID string) (TaskHubRunFact, bool) {

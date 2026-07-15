@@ -16,7 +16,7 @@ import (
 func TestStartRunMaterializesManagedTaskSnapshotWithoutSyntheticStageLineage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestStartRunMaterializesManagedTaskSnapshotWithoutSyntheticStageLineage(t *
 	}
 	requested := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	request := StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: codeEdgeEvaluatorRuntimeProfile(t), ExecutionSpec: requested,
+		TaskID: task.ID, RevisionID: revision.ID, Profile: codeEdgePhase1RuntimeProfile(t), ExecutionSpec: requested,
 		Trigger: "managed-input-test", Actor: "tester", Reason: "freeze managed task snapshot",
 	}
 	run, err := services.Runs.StartRun(ctx, request)

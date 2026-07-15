@@ -37,10 +37,12 @@ type PreparedStartRun struct {
 
 type runStartInputBundle struct {
 	Format                        string                                                `json:"format"`
+	Action                        LifecycleMutationAction                               `json:"action"`
 	IdempotencyKey                string                                                `json:"idempotency_key"`
 	Actor                         string                                                `json:"actor"`
 	Reason                        string                                                `json:"reason"`
 	Trigger                       string                                                `json:"trigger"`
+	ParentRunID                   string                                                `json:"parent_run_id,omitempty"`
 	Expected                      LifecycleMutationCheckpoint                           `json:"expected"`
 	ProfileFingerprint            workflowkit.Fingerprint                               `json:"profile_fingerprint"`
 	ExecutionSpecFingerprint      workflowkit.Fingerprint                               `json:"execution_spec_fingerprint"`
@@ -79,8 +81,30 @@ func (service *LifecycleMutationService) PrepareStartRun(ctx context.Context, co
 }
 
 func (service *LifecycleMutationService) prepareStartRunInputs(ctx context.Context, command StartRunLifecycleCommand) (frozenRunStartInputs, error) {
+	return service.prepareRunStartInputs(ctx, LifecycleMutationStartRun, command, func() (workflowadapter.ExecutionProfile, workflowadapter.RunExecutionSpec, error) {
+		profile, err := ReadExecutionProfileFile(command.ProfilePath)
+		if err != nil {
+			return workflowadapter.ExecutionProfile{}, workflowadapter.RunExecutionSpec{}, err
+		}
+		specification, err := ReadRunExecutionSpecFile(command.ExecutionSpecPath)
+		if err != nil {
+			return workflowadapter.ExecutionProfile{}, workflowadapter.RunExecutionSpec{}, err
+		}
+		return profile, specification, nil
+	})
+}
+
+// prepareRunStartInputs owns the common first-confirmation protocol for all
+// application-owned Run launchers. The supplied definition callback is not
+// evaluated until an existing immutable input bundle has been ruled out, so a
+// replay cannot silently read mutable files or rebuild a changed deployment
+// definition.
+func (service *LifecycleMutationService) prepareRunStartInputs(ctx context.Context, action LifecycleMutationAction, command StartRunLifecycleCommand, definition func() (workflowadapter.ExecutionProfile, workflowadapter.RunExecutionSpec, error)) (frozenRunStartInputs, error) {
 	if service == nil || service.core == nil || service.core.store == nil {
 		return frozenRunStartInputs{}, fmt.Errorf("lifecycle mutation service is not configured")
+	}
+	if definition == nil {
+		return frozenRunStartInputs{}, fmt.Errorf("Run start definition provider is required")
 	}
 	if err := validateStartRunInputCommand(command); err != nil {
 		return frozenRunStartInputs{}, err
@@ -94,16 +118,20 @@ func (service *LifecycleMutationService) prepareStartRunInputs(ctx context.Conte
 		return frozenRunStartInputs{}, err
 	}
 	if existing != nil {
-		if existing.Action != string(LifecycleMutationStartRun) {
+		if existing.Action != string(action) {
 			return frozenRunStartInputs{}, fmt.Errorf("%w: lifecycle operation key %s", store.ErrIdempotencyConflict, command.IdempotencyKey)
 		}
-		return service.readFrozenRunStartInputs(command)
+		return service.readFrozenRunStartInputs(action, command)
 	}
 
 	if directoryExists(service.core.layout.runStartInputDirectory(command.IdempotencyKey)) {
-		return service.readFrozenRunStartInputs(command)
+		return service.readFrozenRunStartInputs(action, command)
 	}
-	return service.freezeRunStartInputs(ctx, command)
+	profile, specification, err := definition()
+	if err != nil {
+		return frozenRunStartInputs{}, err
+	}
+	return service.freezeRunStartInputs(ctx, action, command, profile, specification)
 }
 
 func validateStartRunInputCommand(command StartRunLifecycleCommand) error {
@@ -115,6 +143,11 @@ func validateStartRunInputCommand(command StartRunLifecycleCommand) error {
 	}
 	if strings.TrimSpace(command.Trigger) == "" {
 		return fmt.Errorf("run trigger is required")
+	}
+	if parentRunID := strings.TrimSpace(command.ParentRunID); parentRunID != "" {
+		if err := store.ValidateUUIDv7(parentRunID); err != nil {
+			return fmt.Errorf("StartRun parent Run ID: %w", err)
+		}
 	}
 	expected := command.Expected
 	if err := store.ValidateUUIDv7(strings.TrimSpace(expected.TaskID)); err != nil {
@@ -129,15 +162,7 @@ func validateStartRunInputCommand(command StartRunLifecycleCommand) error {
 	return nil
 }
 
-func (service *LifecycleMutationService) freezeRunStartInputs(ctx context.Context, command StartRunLifecycleCommand) (frozenRunStartInputs, error) {
-	profile, err := ReadExecutionProfileFile(command.ProfilePath)
-	if err != nil {
-		return frozenRunStartInputs{}, err
-	}
-	specification, err := ReadRunExecutionSpecFile(command.ExecutionSpecPath)
-	if err != nil {
-		return frozenRunStartInputs{}, err
-	}
+func (service *LifecycleMutationService) freezeRunStartInputs(ctx context.Context, action LifecycleMutationAction, command StartRunLifecycleCommand, profile workflowadapter.ExecutionProfile, specification workflowadapter.RunExecutionSpec) (frozenRunStartInputs, error) {
 	if err := validateRunExecutionSpecSelection(specification, command.Expected); err != nil {
 		return frozenRunStartInputs{}, err
 	}
@@ -163,23 +188,25 @@ func (service *LifecycleMutationService) freezeRunStartInputs(ctx context.Contex
 	if err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("fingerprint execution specification: %w", err)
 	}
-	catalogReceipt, err := service.core.frozenDeploymentCatalogReceipt()
+	catalogReceipt, err := service.core.frozenDeploymentCatalogReceipt(specification.Template)
 	if err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("freeze deployment catalog receipt: %w", err)
 	}
-	if err := service.core.verifyDeploymentCatalogReceipt(catalogReceipt); err != nil {
+	if err := service.core.verifyDeploymentCatalogReceipt(specification.Template, catalogReceipt); err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("verify deployment catalog receipt before freezing StartRun inputs: %w", err)
 	}
-	lockIdentity, err := service.core.frozenDeploymentCatalogLockIdentity()
+	lockIdentity, err := service.core.frozenDeploymentCatalogLockIdentity(specification.Template)
 	if err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("freeze deployment catalog lock identity: %w", err)
 	}
 	bundle := runStartInputBundle{
 		Format:                        runStartInputBundleFormat,
+		Action:                        action,
 		IdempotencyKey:                strings.TrimSpace(command.IdempotencyKey),
 		Actor:                         strings.TrimSpace(command.Actor),
 		Reason:                        strings.TrimSpace(command.Reason),
 		Trigger:                       strings.TrimSpace(command.Trigger),
+		ParentRunID:                   strings.TrimSpace(command.ParentRunID),
 		Expected:                      command.Expected,
 		ProfileFingerprint:            profileFingerprint,
 		ExecutionSpecFingerprint:      specificationFingerprint,
@@ -200,7 +227,7 @@ func (service *LifecycleMutationService) freezeRunStartInputs(ctx context.Contex
 		if !errors.Is(err, os.ErrExist) {
 			return frozenRunStartInputs{}, err
 		}
-		return service.readFrozenRunStartInputs(command)
+		return service.readFrozenRunStartInputs(action, command)
 	}
 	return inputs, nil
 }
@@ -266,7 +293,7 @@ func (service *LifecycleMutationService) publishFrozenRunStartInputs(ctx context
 	return nil
 }
 
-func (service *LifecycleMutationService) readFrozenRunStartInputs(command StartRunLifecycleCommand) (frozenRunStartInputs, error) {
+func (service *LifecycleMutationService) readFrozenRunStartInputs(action LifecycleMutationAction, command StartRunLifecycleCommand) (frozenRunStartInputs, error) {
 	directory := service.core.layout.runStartInputDirectory(command.IdempotencyKey)
 	info, err := os.Lstat(directory)
 	if err != nil {
@@ -286,7 +313,7 @@ func (service *LifecycleMutationService) readFrozenRunStartInputs(command StartR
 	if err := decodeStrictJSON(string(manifestRaw), &bundle); err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("decode frozen StartRun input manifest: %w", err)
 	}
-	if bundle.Format != runStartInputBundleFormat || !sameRunStartInputCommand(bundle, command) {
+	if bundle.Format != runStartInputBundleFormat || bundle.Action != action || !sameRunStartInputCommand(bundle, command) {
 		return frozenRunStartInputs{}, fmt.Errorf("%w: frozen StartRun input bundle %s", store.ErrIdempotencyConflict, command.IdempotencyKey)
 	}
 	profileRaw, err := readManagedRunStartInputFile(directory, runStartInputProfileFileName)
@@ -337,14 +364,14 @@ func (service *LifecycleMutationService) readFrozenRunStartInputs(command StartR
 	if err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("parse frozen deployment catalog receipt: %w", err)
 	}
-	if err := service.core.verifyDeploymentCatalogReceipt(catalogReceipt); err != nil {
+	if err := service.core.verifyDeploymentCatalogReceipt(specification.Template, catalogReceipt); err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("verify frozen deployment catalog receipt: %w", err)
 	}
 	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(runManifest{DeploymentCatalogLockIdentity: bundle.DeploymentCatalogLockIdentity})
 	if err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("parse frozen deployment catalog lock identity: %w", err)
 	}
-	if err := service.core.verifyDeploymentCatalogLockIdentity(lockIdentity); err != nil {
+	if err := service.core.verifyDeploymentCatalogLockIdentity(specification.Template, lockIdentity); err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("verify frozen deployment catalog lock identity: %w", err)
 	}
 	if len(catalogReceipt) != 0 {
@@ -352,7 +379,7 @@ func (service *LifecycleMutationService) readFrozenRunStartInputs(command StartR
 		if readErr != nil {
 			return frozenRunStartInputs{}, readErr
 		}
-		if err := service.core.verifyDeploymentCatalogReceipt(receiptRaw); err != nil {
+		if err := service.core.verifyDeploymentCatalogReceipt(specification.Template, receiptRaw); err != nil {
 			return frozenRunStartInputs{}, fmt.Errorf("verify managed frozen deployment catalog receipt: %w", err)
 		}
 		if !bytes.Equal(receiptRaw, catalogReceipt) {
@@ -429,6 +456,7 @@ func sameRunStartInputCommand(bundle runStartInputBundle, command StartRunLifecy
 		bundle.Actor == strings.TrimSpace(command.Actor) &&
 		bundle.Reason == strings.TrimSpace(command.Reason) &&
 		bundle.Trigger == strings.TrimSpace(command.Trigger) &&
+		bundle.ParentRunID == strings.TrimSpace(command.ParentRunID) &&
 		bundle.Expected == command.Expected
 }
 

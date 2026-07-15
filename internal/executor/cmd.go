@@ -39,19 +39,11 @@ func (Runner) LookPath(name string) (string, error) {
 }
 
 func (Runner) Run(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) Result {
-	return runCommand(ctx, timeout, dir, env, nil, nil, name, args...)
+	return runCommand(ctx, timeout, dir, env, name, args...)
 }
 
 func (Runner) RunStreamingWithOutput(ctx context.Context, timeout time.Duration, dir string, env []string, writer io.Writer, onOutput OutputCallback, name string, args ...string) Result {
 	return runCommandStreamingWithOutput(ctx, timeout, dir, env, writer, onOutput, name, args...)
-}
-
-func (Runner) RunWithInput(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, name string, args ...string) Result {
-	return runCommand(ctx, timeout, dir, env, input, nil, name, args...)
-}
-
-func (Runner) RunWithInputStreaming(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, writer io.Writer, name string, args ...string) Result {
-	return runCommand(ctx, timeout, dir, env, input, writer, name, args...)
 }
 
 func ConfigureCommand(cmd *exec.Cmd) {
@@ -83,7 +75,7 @@ func configureCommandForRun(cmd *exec.Cmd) func() {
 	}
 }
 
-func runCommand(ctx context.Context, timeout time.Duration, dir string, env []string, input io.Reader, writer io.Writer, name string, args ...string) Result {
+func runCommand(ctx context.Context, timeout time.Duration, dir string, env []string, name string, args ...string) Result {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -95,18 +87,10 @@ func runCommand(ctx context.Context, timeout time.Duration, dir string, env []st
 	if len(env) > 0 {
 		cmd.Env = env
 	}
-	if input != nil {
-		cmd.Stdin = input
-	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	if writer != nil {
-		cmd.Stdout = io.MultiWriter(&stdout, writer)
-		cmd.Stderr = io.MultiWriter(&stderr, writer)
-	} else {
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-	}
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	err := cmd.Run()
 	commandDone()
 	result := Result{

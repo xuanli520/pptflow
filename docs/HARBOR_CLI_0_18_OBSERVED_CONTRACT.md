@@ -64,8 +64,9 @@ production evidence capture.
 
 `harbor run` is an alias for `harbor job start`.
 
-For one task, one agent configuration, and one model, the observed invocation
-for exactly four logical trials is:
+For one task, one agent configuration, and one model, the production CodeEdge
+profile uses the following strictly serial invocation for exactly four logical
+trials:
 
 ```bash
 harbor run \
@@ -73,13 +74,17 @@ harbor run \
   --agent <AGENT> \
   --model <MODEL> \
   --n-attempts 4 \
-  --n-concurrent 4 \
+  --n-concurrent 1 \
+  --max-retries 3 \
   --job-name <STABLE_JOB_NAME> \
   --jobs-dir <OUTPUT_DIRECTORY> \
   --quiet \
   --yes
 ```
 
+The isolated Oracle probe used the same four logical attempts with
+`--n-concurrent 4` to exercise Harbor's parallel scheduling behavior. That
+probe establishes output shape, not the production CodeEdge concurrency rule.
 For an Oracle-only local probe, `--model <MODEL>` is omitted:
 
 ```bash
@@ -100,9 +105,9 @@ harbor run \
 | --- | --- | --- |
 | `-k`, `--n-attempts` | Number of logical attempts for each task/agent configuration | Concurrency or a display-only pass@k selector |
 | `-n`, `--n-concurrent` | Maximum number of concurrently running trials | Number of logical attempts |
+| `--max-retries` | Maximum Harbor-internal retry count for an attempt | A license to create an additional logical sample |
 | `-o`, `--jobs-dir` | Parent directory for the local job directory | A remote result destination |
 | `--job-name` | Local job-directory name | A guaranteed global/remote job identity |
-| `--upload` | Explicit Harbor Hub upload opt-in | A required part of local evaluation |
 
 The Harbor 0.18.0 implementation constructs:
 
@@ -118,8 +123,21 @@ before it is accepted as four logical samples:
 - exactly one evaluator agent/model configuration; and
 - `job result.n_total_trials == 4`.
 
-`--n-concurrent 4` is useful for parallelism but is not itself evidence of four
-attempts.
+`--n-concurrent` controls parallelism but is not itself evidence of four
+attempts. The locked CodeEdge profile uses `--n-concurrent 1` so its four
+logical samples are serial and Qwen finishes before Opus is scheduled.
+
+The approved production profile sets `--max-retries 3`. Harbor retries under
+the same logical trial name and replaces its final result; this limit does not
+change `n_attempts`, create a fifth sample, or authorize a generic workflow
+stage retry.
+
+`stats.n_retries` is a job-wide count of Harbor-internal technical retries.
+The controlled adapter records it as an authenticated aggregate on the
+immutable evaluation receipt, but does not infer a per-TrialAttempt mapping:
+the observed 0.18.0 final layout contains exactly one final `result.json` for
+each of the four logical trials and does not establish which logical trial, if
+any, consumed an aggregate retry.
 
 ## Observed Facts: Local Result Layout
 
@@ -277,6 +295,10 @@ only the terminal rendering:
 8. Calculate the task's pass count and compliance from the four raw Trial
    records; retain Harbor's `stats.evals.*.pass_at_k["4"]` as corroborating
    evidence, not the only source of truth.
+9. Strictly parse and retain non-negative `stats.n_retries` as an immutable
+   job-wide technical-retry aggregate. Do not manufacture per-TrialAttempt
+   evidence from it; the four final logical Trial records remain the detail
+   authority.
 
 The four-trial Oracle probe completed successfully with all rewards `1.0` and
 reported:
@@ -305,21 +327,18 @@ omitted `trial_results`, while each Trial result carried its own reward and
 task checksum. This re-probe is the authority for the launcher fingerprint in
 this document.
 
-## Observation And Reconciliation Boundary
+## Local Observation And Reconciliation Boundary
 
-The locally installed CLI exposes:
-
-```text
-harbor job start
-harbor job resume -p <job directory>
-harbor job download <job UUID>
-harbor hub job list/show/tasks/trials/download
-```
+The CodeEdge evaluator is local-only. Its closed argv never includes upload or
+sharing flags, it does not call a hosted service, and the managed
+`<jobs-dir>/<job-name>` directory is the sole recovery source. A completed
+evaluation receipt is rebuilt only from the local `config.json`, `lock.json`,
+job `result.json`, exactly four completed Trial directories and their evidence,
+and Harbor Flow's locally written output provenance.
 
 It does not expose a local `job status`, `job list`, or `job cancel` command.
 Local completion observation is therefore a filesystem protocol, not a stable
-query API. Harbor Hub commands require separate authenticated remote access and
-are outside this local observation contract.
+query API.
 
 `harbor job resume` resumes a local job directory. It can remove selected
 errored Trial directories before rerunning them, so it is not an immutable
@@ -330,12 +349,13 @@ Until an adapter has an explicitly tested atomic snapshot rule, the safe
 behavior after an interrupted command is:
 
 1. Preserve the Run and TrialExecution as `in_doubt`.
-2. Persist the local job path, command, stdout/stderr, job config, lock, and
-   every discoverable Trial artifact as evidence.
-3. Do not count missing, malformed, or still-running Trial files as model
-   failures.
-4. Require an operator action or a future provider-specific reconciliation
-   contract before producing a final evaluation receipt.
+2. Retain only bounded, redacted local process evidence and the controlled
+   local job directory; never submit, upload, or query a remote result.
+3. Complete reconciliation only when the strict local parser can prove the
+   frozen task, CLI, agent/model, exactly-four-trial, result and secret-scan
+   invariants from a complete local result.
+4. Do not count missing, malformed, or still-running Trial files as model
+   failures; leave them `in_doubt` for an explicit later decision.
 
 ## Adapter Requirements Derived From This Probe
 
@@ -361,7 +381,7 @@ The adapter must not:
 - use a generated trial-directory suffix as a durable identity;
 - equate `task_checksum` with the lock's task digest;
 - treat a missing result file as a failed model Trial; or
-- claim that this observed contract is supplied by CodeEdge or the Harbor Hub.
+- claim that this locally observed adapter contract is supplied by CodeEdge.
 
 ## Re-Probe Checklist
 

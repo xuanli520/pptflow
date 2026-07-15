@@ -85,7 +85,8 @@ func (attestor *LocalFilesystemRuntimeAttestor) AttestDeploymentOperation(ctx co
 		return attestLockedRegularFile(ctx, *attestation.Record.LocalExecutable)
 	case workflowadapter.ContainerCommandOperationPayload,
 		workflowadapter.AgentTurnOperationPayload,
-		workflowadapter.DurableReviewOperationPayload:
+		workflowadapter.DurableReviewOperationPayload,
+		workflowadapter.HarborBuiltinOperationPayload:
 		return fmt.Errorf("%w: no explicit controlled verifier is installed for %s", ErrDeploymentOperationRuntimeAttestationUnavailable, attestation.Record.ExecutionKind)
 	default:
 		return fmt.Errorf("%w: unsupported deployment operation payload", ErrDeploymentOperationRuntimeAttestationFailed)

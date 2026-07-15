@@ -20,6 +20,11 @@ var testProfile = Profile{Metadata: MetadataFieldMapping{
 	IsZeroToOne: TOMLPath{"metadata", "is_0_to_1"},
 	GitHubURL:   TOMLPath{"metadata", "github_url"},
 	CommitID:    TOMLPath{"metadata", "commit_id"},
+}, ProtectedEnvironmentVariables: []string{
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_BASE_URL",
+	"QWEN_HARBOR_BASE_URL",
+	"OPUS_HARBOR_BASE_URL",
 }}
 
 func TestInspectPhase1TaskAcceptsManagedDockerTask(t *testing.T) {
@@ -159,7 +164,7 @@ func TestInspectPhase1TaskUsesExplicitMetadataFieldMapping(t *testing.T) {
 		IsZeroToOne: TOMLPath{"submission", "from_scratch"},
 		GitHubURL:   TOMLPath{"submission", "source_repository"},
 		CommitID:    TOMLPath{"submission", "source_revision"},
-	}}
+	}, ProtectedEnvironmentVariables: testProfile.ProtectedEnvironmentVariables}
 	root := writePhase1Task(t, phase1TaskOptions{taskTOML: `
 [submission]
 language = "go"
@@ -273,6 +278,114 @@ RUN git clone ` + testRepositoryURL + ` /app/repo && cd /app/repo && git checkou
 			assertViolationContains(t, validatePhase1Task(root), "environment_isolation", test.want)
 		})
 	}
+}
+
+func TestInspectPhase1TaskRejectsProtectedDeploymentEnvironmentReferences(t *testing.T) {
+	t.Run("Dockerfile rejects protected interpolation and declaration", func(t *testing.T) {
+		root := writePhase1Task(t, phase1TaskOptions{dockerfile: `
+FROM alpine
+ARG QWEN_HARBOR_BASE_URL
+RUN printf '%s' "${ANTHROPIC_AUTH_TOKEN}"
+RUN git clone ` + testRepositoryURL + ` /app/repo && cd /app/repo && git checkout ` + testCommit + `
+`})
+		err := validatePhase1Task(root)
+		assertViolationContains(t, err, "environment_isolation", "Dockerfile must not declare protected deployment environment variable QWEN_HARBOR_BASE_URL")
+		assertViolationContains(t, err, "environment_isolation", "Dockerfile must not interpolate protected deployment environment variable ANTHROPIC_AUTH_TOKEN")
+	})
+
+	t.Run("Dockerfile rejects a non-default escape directive", func(t *testing.T) {
+		root := writePhase1Task(t, phase1TaskOptions{dockerfile: "# escape=`\nARG ANTHROPIC_`\nAUTH_TOKEN\nFROM alpine\nRUN git clone " + testRepositoryURL + " /app/repo && cd /app/repo && git checkout " + testCommit + "\n"})
+		assertViolationContains(t, validatePhase1Task(root), "environment_isolation", "Dockerfile must not use a non-default escape directive")
+	})
+
+	t.Run("Compose rejects protected pass-through and interpolation", func(t *testing.T) {
+		root := writePhase1Task(t, phase1TaskOptions{useCompose: true, compose: `
+services:
+  main:
+    build:
+      context: .
+      args:
+        OPUS_HARBOR_BASE_URL:
+    environment:
+      ANTHROPIC_AUTH_TOKEN:
+      APP_ENDPOINT: "${QWEN_HARBOR_BASE_URL:-https://example.invalid}"
+    env_file:
+      - ANTHROPIC_BASE_URL
+`})
+		err := validatePhase1Task(root)
+		assertViolationContains(t, err, "environment_isolation", "Compose must not declare protected deployment environment variable OPUS_HARBOR_BASE_URL")
+		assertViolationContains(t, err, "environment_isolation", "Compose must not declare protected deployment environment variable ANTHROPIC_AUTH_TOKEN")
+		assertViolationContains(t, err, "environment_isolation", "Compose must not interpolate protected deployment environment variable QWEN_HARBOR_BASE_URL")
+		assertViolationContains(t, err, "environment_isolation", "Compose must not declare protected deployment environment variable ANTHROPIC_BASE_URL")
+	})
+
+	t.Run("unrelated application interpolation remains allowed", func(t *testing.T) {
+		root := writePhase1Task(t, phase1TaskOptions{useCompose: true, compose: `
+services:
+  main:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM alpine
+        RUN git clone https://github.com/acme/widget.git /app/repo && cd /app/repo && git checkout a1b2c3d4e5f60718293a4b5c6d7e8f9012345678
+    environment:
+      APP_MODE: "${APP_MODE:-production}"
+`})
+		if err := validatePhase1Task(root); err != nil {
+			t.Fatalf("unrelated compose interpolation rejected: %v", err)
+		}
+	})
+}
+
+func TestProtectedEnvironmentReferencesRejectHarborTaskEnvironmentTemplates(t *testing.T) {
+	tests := []struct {
+		name     string
+		taskTOML string
+		want     string
+	}{
+		{
+			name: "direct protected definition",
+			taskTOML: validTaskTOML() + `
+[environment.env]
+ANTHROPIC_AUTH_TOKEN = "literal-task-value"
+`,
+			want: "task.toml [environment.env] must not declare protected deployment environment variable ANTHROPIC_AUTH_TOKEN",
+		},
+		{
+			name: "protected bare pass-through",
+			taskTOML: validTaskTOML() + `
+[environment.env]
+ANTHROPIC_AUTH_TOKEN = "${ANTHROPIC_AUTH_TOKEN}"
+`,
+			want: "task.toml [environment.env] must not declare protected deployment environment variable ANTHROPIC_AUTH_TOKEN",
+		},
+		{
+			name: "protected alias interpolation",
+			taskTOML: validTaskTOML() + `
+[environment.env]
+LEAK = "${ANTHROPIC_AUTH_TOKEN:-fallback}"
+`,
+			want: "task.toml [environment.env] must not interpolate protected deployment environment variable ANTHROPIC_AUTH_TOKEN",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := writePhase1Task(t, phase1TaskOptions{taskTOML: test.taskTOML})
+			err := ValidateProtectedEnvironmentReferences(root, testProfile.ProtectedEnvironmentVariables)
+			assertViolationContains(t, err, "environment_isolation", test.want)
+			assertViolationContains(t, validatePhase1Task(root), "environment_isolation", test.want)
+		})
+	}
+
+	t.Run("unrelated task environment interpolation remains allowed", func(t *testing.T) {
+		root := writePhase1Task(t, phase1TaskOptions{taskTOML: validTaskTOML() + `
+[environment.env]
+APP_MODE = "${APP_MODE:-production}"
+`})
+		if err := ValidateProtectedEnvironmentReferences(root, testProfile.ProtectedEnvironmentVariables); err != nil {
+			t.Fatalf("unrelated task environment interpolation rejected: %v", err)
+		}
+	})
 }
 
 func TestInspectPhase1TaskChecksGitCloneAndCommitAgainstMetadata(t *testing.T) {

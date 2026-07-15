@@ -90,6 +90,38 @@ func TestBackupIfDueDoesNotTreatIneligibleSchemaBackupAsProtection(t *testing.T)
 	}
 }
 
+func TestBackupIfDueDoesNotTrustCachedBackupAfterChecksumDrift(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+
+	// Open creates the first backup. The first explicit interval preflight
+	// fully admits it and installs the in-process eligibility cache.
+	if due, err := s.BackupIfDue(ctx); err != nil || due != nil {
+		t.Fatalf("admit initial backup = %+v, %v", due, err)
+	}
+	if s.verifiedBackup == nil {
+		t.Fatal("eligible backup was not cached after full admission")
+	}
+	original := *s.verifiedBackup
+	if err := os.WriteFile(original.Path, []byte("corrupted cached backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A recent cache must not suppress a replacement when its bytes no longer
+	// match the manifest checksum. BackupIfDue falls back to full discovery and
+	// produces a newly verified V2 snapshot.
+	due, err := s.BackupIfDue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if due == nil || due.Path == original.Path || due.Reason != "interval" {
+		t.Fatalf("checksum-drifted cached backup suppressed replacement: original=%+v due=%+v", original, due)
+	}
+	if err := verifyConsolidatedV2SQLiteFile(due.Path); err != nil {
+		t.Fatalf("replacement backup is not eligible: %v", err)
+	}
+}
+
 func TestOpenRestoresLatestVerifiedBackupAfterCorruption(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

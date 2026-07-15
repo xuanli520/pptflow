@@ -526,16 +526,26 @@ func (signal StageControlSignal) validate() error {
 // are already resolved immutable artifact bindings; a backend must not reopen
 // a mutable workspace or recompute them after the claim is visible.
 type StageClaim struct {
-	StageAttempt AttemptIdentity           `json:"stage_attempt"`
-	Stage        StageDescriptor           `json:"stage"`
-	Generation   int                       `json:"generation"`
-	Inputs       []ArtifactBinding         `json:"inputs"`
-	Control      <-chan StageControlSignal `json:"-"`
+	StageAttempt AttemptIdentity `json:"stage_attempt"`
+	// NodeAttempt is an optional backend-owned concrete execution identity
+	// nested under the StageAttempt. A backend may have only one durable attempt
+	// level, or may materialize this identity atomically when a stage enters an
+	// external-decision wait. When present it binds checkpoints, usage, and
+	// retry evidence to the exact node ordinal.
+	NodeAttempt *AttemptIdentity          `json:"node_attempt,omitempty"`
+	Stage       StageDescriptor           `json:"stage"`
+	Generation  int                       `json:"generation"`
+	Inputs      []ArtifactBinding         `json:"inputs"`
+	Control     <-chan StageControlSignal `json:"-"`
 }
 
 // Clone returns independently owned stage work. Control is intentionally a
 // runtime-only channel and remains the same scoped signal source.
 func (claim StageClaim) Clone() StageClaim {
+	if claim.NodeAttempt != nil {
+		node := *claim.NodeAttempt
+		claim.NodeAttempt = &node
+	}
 	claim.Stage = claim.Stage.Clone()
 	claim.Inputs = append([]ArtifactBinding(nil), claim.Inputs...)
 	return claim
@@ -545,19 +555,24 @@ func (claim StageClaim) Clone() StageClaim {
 // while its fence is live; callers cannot substitute a stage descriptor or an
 // execution binding after a job is claimed.
 type JobClaim struct {
-	JobID          string          `json:"job_id"`
-	ClaimID        string          `json:"claim_id"`
-	Kind           JobKind         `json:"kind"`
-	Owner          string          `json:"owner"`
-	FencingToken   uint64          `json:"fencing_token"`
-	LeaseExpiresAt time.Time       `json:"lease_expires_at"`
-	Execution      FrozenExecution `json:"execution"`
-	Stage          *StageClaim     `json:"stage,omitempty"`
+	JobID          string            `json:"job_id"`
+	ClaimID        string            `json:"claim_id"`
+	Kind           JobKind           `json:"kind"`
+	Owner          string            `json:"owner"`
+	FencingToken   uint64            `json:"fencing_token"`
+	LeaseExpiresAt time.Time         `json:"lease_expires_at"`
+	Execution      FrozenExecution   `json:"execution"`
+	Coordinator    *CoordinatorClaim `json:"coordinator,omitempty"`
+	Stage          *StageClaim       `json:"stage,omitempty"`
 }
 
 // Clone returns independently owned job claim data.
 func (claim JobClaim) Clone() JobClaim {
 	claim.Execution = claim.Execution.Clone()
+	if claim.Coordinator != nil {
+		coordinator := claim.Coordinator.Clone()
+		claim.Coordinator = &coordinator
+	}
 	if claim.Stage != nil {
 		stage := claim.Stage.Clone()
 		claim.Stage = &stage
@@ -595,7 +610,16 @@ func (claim JobClaim) Validate() error {
 		if claim.Stage != nil {
 			return fmt.Errorf("%w: coordinator job cannot include stage work", ErrInvalidJobClaim)
 		}
+		if claim.Coordinator == nil {
+			return fmt.Errorf("%w: coordinator job requires a frozen coordinator claim", ErrInvalidJobClaim)
+		}
+		if err := claim.Coordinator.Schedule.Validate(claim.Execution.Workflow); err != nil {
+			return err
+		}
 	case JobStage:
+		if claim.Coordinator != nil {
+			return fmt.Errorf("%w: stage job cannot include coordinator work", ErrInvalidJobClaim)
+		}
 		if claim.Stage == nil {
 			return fmt.Errorf("%w: stage job requires stage work", ErrInvalidJobClaim)
 		}
@@ -616,6 +640,14 @@ func (claim JobClaim) validateStage() error {
 	}
 	if stageClaim.StageAttempt.Kind != AttemptStage {
 		return fmt.Errorf("%w: stage claim attempt kind must be stage", ErrInvalidJobClaim)
+	}
+	if stageClaim.NodeAttempt != nil {
+		if err := stageClaim.NodeAttempt.validate(); err != nil {
+			return err
+		}
+		if stageClaim.NodeAttempt.Kind != AttemptNode || stageClaim.NodeAttempt.ParentAttemptID != stageClaim.StageAttempt.ID || stageClaim.NodeAttempt.ScopeID != stageClaim.StageAttempt.ScopeID {
+			return fmt.Errorf("%w: node attempt must be a child of the claimed stage attempt", ErrInvalidJobClaim)
+		}
 	}
 	if err := stageClaim.Stage.Validate(); err != nil {
 		return err
@@ -976,7 +1008,8 @@ func (scope RecoveryScope) validate() error {
 // schema, scheduler row, filesystem layout, or product-domain type.
 type DurableBackend interface {
 	PrepareExecution(context.Context, PrepareRequest, FrozenExecution) (PreparedExecution, error)
-	AdvanceCoordinator(context.Context, JobClaim) (JobTerminalState, error)
+	LoadCoordinatorInput(context.Context, JobClaim) (CoordinatorInput, error)
+	CommitCoordinatorDecision(context.Context, JobClaim, CoordinatorDecision) (JobTerminalState, error)
 	ReadStageInput(context.Context, JobClaim, ArtifactBinding) ([]byte, error)
 	RecordStageCheckpoint(context.Context, JobClaim, StageCheckpoint) (CheckpointReceipt, error)
 	RecordStageUsage(context.Context, JobClaim, StageUsage) error
@@ -1058,9 +1091,9 @@ func (engine *Engine) Prepare(ctx context.Context, request PrepareRequest) (Prep
 	return prepared, nil
 }
 
-// HandleClaim executes one already-leased durable job. Coordinator scheduling
-// is backend-owned; concrete stage execution is Engine-owned and always uses
-// the exact frozen plugin binding.
+// HandleClaim executes one already-leased durable job. The Engine evaluates
+// coordinator scheduling from the frozen claim and backend-loaded durable
+// facts; concrete stage execution always uses the exact frozen plugin binding.
 func (engine *Engine) HandleClaim(ctx context.Context, claim JobClaim) (JobTerminalState, error) {
 	if err := engine.validate(); err != nil {
 		return "", err
@@ -1076,7 +1109,19 @@ func (engine *Engine) HandleClaim(ctx context.Context, claim JobClaim) (JobTermi
 		return "", ErrExpiredJobClaim
 	}
 	if claim.Kind == JobCoordinator {
-		state, err := engine.backend.AdvanceCoordinator(ctx, claim)
+		input, err := engine.backend.LoadCoordinatorInput(ctx, claim.Clone())
+		if err != nil {
+			return "", err
+		}
+		input = input.Clone()
+		if err := claim.Coordinator.Schedule.ValidateInput(input); err != nil {
+			return "", err
+		}
+		decision, err := DecideCoordinator(input)
+		if err != nil {
+			return "", err
+		}
+		state, err := engine.backend.CommitCoordinatorDecision(ctx, claim.Clone(), decision.Clone())
 		if err != nil {
 			return "", err
 		}
@@ -1175,34 +1220,7 @@ func (engine *Engine) Reconcile(ctx context.Context, scope RecoveryScope) ([]Rec
 	if err := engine.validate(); err != nil {
 		return nil, err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if scope.ObservedAt.IsZero() {
-		scope.ObservedAt = engine.now().UTC()
-	}
-	if err := scope.validate(); err != nil {
-		return nil, err
-	}
-	subjects, err := engine.backend.ListRecoverySubjects(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	decisions := make([]RecoveryDecision, 0, len(subjects))
-	for _, subject := range subjects {
-		if subject.ObservedAt.IsZero() {
-			subject.ObservedAt = scope.ObservedAt
-		}
-		decision, err := DecideRecovery(subject)
-		if err != nil {
-			return nil, err
-		}
-		decisions = append(decisions, decision)
-	}
-	if err := engine.backend.ApplyRecovery(ctx, scope, append([]RecoveryDecision(nil), decisions...)); err != nil {
-		return nil, err
-	}
-	return decisions, nil
+	return ReconcileRecoveryScope(ctx, engine.backend, scope, engine.now().UTC())
 }
 
 func (engine *Engine) validate() error {

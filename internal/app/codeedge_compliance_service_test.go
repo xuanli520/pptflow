@@ -78,6 +78,101 @@ func TestCodeEdgeComplianceRecordsTrustedEvidenceAndReconcilesTechnicalRetry(t *
 	}
 }
 
+func TestCodeEdgeEvaluatorEvidenceGateRequiresVerifiedAdoptedHandoff(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{stopBeforeHandoff: true})
+	opened := openCodeEdgeEvaluatorEvidenceReviewGateForDecision(t, ctx, fixture)
+
+	_, err := fixture.services.Reviews.Decide(ctx, DecideReviewRequest{
+		ID:                     newCodeEdgeComplianceUUID(t),
+		ReviewRequestID:        opened.Review.ID,
+		RevisionID:             fixture.revision.ID,
+		Action:                 store.ReviewDecisionApprove,
+		ExpectedRevisionDigest: fixture.revision.TaskDigest,
+		Actor:                  "codeedge-test",
+		Reason:                 "attempt approval before adopting evaluator evidence",
+	})
+	if err == nil || !strings.Contains(err.Error(), "adopted immutable handoff") {
+		t.Fatalf("evaluator evidence gate accepted missing handoff: %v", err)
+	}
+	decisions, err := fixture.database.ListReviewDecisionsForRequest(ctx, opened.Review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 0 {
+		t.Fatalf("missing-handoff gate persisted decisions: %+v", decisions)
+	}
+}
+
+func TestCodeEdgeEvaluatorEvidenceGateBindsVerifiedHandoffIntoDecisionArtifact(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{})
+	opened := openCodeEdgeEvaluatorEvidenceReviewGateForDecision(t, ctx, fixture)
+
+	decision, err := fixture.services.Reviews.Decide(ctx, DecideReviewRequest{
+		ID:                     newCodeEdgeComplianceUUID(t),
+		ReviewRequestID:        opened.Review.ID,
+		RevisionID:             fixture.revision.ID,
+		Action:                 store.ReviewDecisionApprove,
+		ExpectedRevisionDigest: fixture.revision.TaskDigest,
+		Actor:                  "codeedge-test",
+		Reason:                 "approve verified evaluator evidence handoff",
+	})
+	if err != nil {
+		t.Fatalf("approve verified evaluator evidence gate: %v", err)
+	}
+	if decision.ID == "" {
+		t.Fatal("verified evaluator evidence gate returned no decision")
+	}
+	// The durable resolution worker repeats this verification before it emits
+	// its artifact; exercising it here proves a later replay cannot approve an
+	// ambient or missing child Run.
+	if _, err := fixture.services.core.verifyCodeEdgeEvaluatorEvidenceHandoffGate(ctx, opened.Binding); err != nil {
+		t.Fatalf("verified evaluator evidence gate no longer validates: %v", err)
+	}
+}
+
+func TestLifecycleMutationAdoptsCodeEdgeEvaluatorEvidenceOnlyAfterPreparedConfirmation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{stopBeforeHandoff: true})
+	checkpoint, err := fixture.services.Mutations.CaptureCheckpoint(ctx, fixture.task.ID, fixture.revision.ID, fixture.run.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := newCodeEdgeComplianceUUID(t)
+	command := CodeEdgeEvaluatorEvidenceHandoffCommand{
+		LifecycleMutationCommandBase: LifecycleMutationCommandBase{
+			IdempotencyKey: key, Actor: "codeedge-test", Reason: "adopt completed CodeEdge evaluator child evidence", Expected: checkpoint,
+		},
+		ParentRunID: fixture.run.ID,
+		ChildRunID:  fixture.childRun.ID,
+	}
+	if _, err := fixture.services.Mutations.AdoptCodeEdgeEvaluatorEvidenceHandoff(ctx, command); err == nil || !strings.Contains(err.Error(), "must be prepared") {
+		t.Fatalf("direct evidence adoption bypassed first confirmation: %v", err)
+	}
+	prepared, err := fixture.services.Mutations.PrepareCodeEdgeEvaluatorEvidenceHandoff(ctx, command)
+	if err != nil {
+		t.Fatalf("prepare evaluator evidence adoption: %v", err)
+	}
+	if prepared.OperationID == "" || prepared.ParentRunID != fixture.run.ID || prepared.ChildRunID != fixture.childRun.ID || prepared.HandoffFingerprint == "" {
+		t.Fatalf("prepared evaluator evidence adoption = %+v", prepared)
+	}
+	if existing, lookupErr := fixture.database.GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, fixture.run.ID); lookupErr != nil || existing != nil {
+		t.Fatalf("prepare created evaluator evidence handoff = %+v, %v", existing, lookupErr)
+	}
+	receipt, err := fixture.services.Mutations.AdoptCodeEdgeEvaluatorEvidenceHandoff(ctx, command)
+	if err != nil {
+		t.Fatalf("confirm evaluator evidence adoption: %v", err)
+	}
+	if receipt.Action != LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff || receipt.EvaluatorEvidenceHandoffID != key || receipt.ParentRunID != fixture.run.ID || receipt.ChildRunID != fixture.childRun.ID || receipt.EvaluatorEvidenceHandoffFingerprint == "" {
+		t.Fatalf("evaluator evidence adoption receipt = %+v", receipt)
+	}
+	replayed, err := fixture.services.Mutations.AdoptCodeEdgeEvaluatorEvidenceHandoff(ctx, command)
+	if err != nil || replayed != receipt {
+		t.Fatalf("evaluator evidence adoption replay = %+v, %v; want %+v", replayed, err, receipt)
+	}
+}
+
 func TestCodeEdgeComplianceFailsClosedOnFrozenEvidenceDrift(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -152,8 +247,8 @@ func TestCodeEdgeComplianceFailsClosedOnFrozenEvidenceDrift(t *testing.T) {
 				if err := os.WriteFile(path, []byte("forged evaluator result"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				checker := &CodeEdgeComplianceService{core: fixture.services.core}
-				_, err = checker.rebuildCodeEdgeEvaluationReceipt(context.Background(), fixture.frozen, fixture.qwenStage, workflowadapter.HarborRunQwen, "qwen_trial_result", "qwen_pass4_evidence", fixture.frozen.Policy.QwenPolicy, fixture.qwen)
+				checker := &CodeEdgeEvaluatorEvidenceHandoffService{core: fixture.services.core}
+				_, _, _, err = checker.rebuildChildEvaluationReceipt(context.Background(), fixture.childFrozen, fixture.qwenStage, workflowadapter.HarborRunQwen, "qwen_trial_result", "qwen_pass4_evidence", fixture.frozen.Policy.QwenPolicy)
 				return err
 			},
 		},
@@ -285,6 +380,7 @@ type codeEdgeComplianceFixtureOptions struct {
 	omitResultReview    bool
 	packageableRevision bool
 	seedFailedQwenTrial bool
+	stopBeforeHandoff   bool
 }
 
 type codeEdgeComplianceFixture struct {
@@ -296,10 +392,14 @@ type codeEdgeComplianceFixture struct {
 	run           store.WorkflowRun
 	specification workflowadapter.RunExecutionSpec
 	frozen        frozenCodeEdgeRun
+	childRun      store.WorkflowRun
+	childFrozen   frozenCodeEdgeRun
+	runtimeRun    store.WorkflowRun
 	qwenStage     store.StageAttempt
 	opusStage     store.StageAttempt
 	qwen          codeedge.EvaluationReceipt
 	opus          codeedge.EvaluationReceipt
+	handoff       store.CodeEdgeEvaluatorEvidenceHandoff
 	submission    codeedge.SubmissionCheckReceipt
 
 	failedQwenTrialID string
@@ -309,7 +409,7 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,10 +428,10 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 		t.Fatal(err)
 	}
 	specification := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
-	resolver := catalogLockAttestedResolverForSpec(t, specification, "codeedge-compliance-catalog", "v1", "lock-v1")
-	services := catalogLockLifecycleServices(t, root, database, resolver)
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: codeEdgeEvaluatorRuntimeProfile(t), ExecutionSpec: specification,
+	parentResolver := catalogLockAttestedResolverForSpec(t, specification, "codeedge-compliance-catalog", "v1", "lock-v1")
+	parentServices := catalogLockLifecycleServices(t, root, database, parentResolver)
+	run, err := parentServices.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, Profile: codeEdgePhase1RuntimeProfile(t), ExecutionSpec: specification,
 		Trigger: "codeedge-final-compliance", Actor: "codeedge-test", Reason: "freeze trusted CodeEdge Run",
 	})
 	if err != nil {
@@ -341,46 +441,137 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 	if err != nil {
 		t.Fatal(err)
 	}
-	frozen, err := services.core.loadFrozenCodeEdgeRun(ctx, run.ID)
+	frozen, err := parentServices.core.loadFrozenCodeEdgeRun(ctx, run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	run = seedApprovedCodeEdgeReviewGate(t, ctx, services, run, revision, workflowadapter.FinalReview, workflowadapter.ReviewFinalQuality)
+	run = seedApprovedCodeEdgeReviewGate(t, ctx, parentServices, run, revision, workflowadapter.FinalReview, workflowadapter.ReviewFinalQuality)
 	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning, Actor: "codeedge-test", Reason: "continue after final review"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	qwenStage, qwen := seedCodeEdgeEvaluationStage(t, ctx, services, run, revision, frozen, workflowadapter.HarborRunQwen, frozen.Policy.QwenPolicy)
-	opusStage, opus := seedCodeEdgeEvaluationStage(t, ctx, services, run, revision, frozen, workflowadapter.HarborRunOpus, frozen.Policy.OpusPolicy)
-	seedPreallocatedCodeEdgeTrialSet(t, ctx, database, run, qwenStage)
-	seedPreallocatedCodeEdgeTrialSet(t, ctx, database, run, opusStage)
-	submission := seedCodeEdgeSubmissionStage(t, ctx, services, run, revision, frozen)
-	if !options.omitResultReview {
-		run = seedApprovedCodeEdgeReviewGate(t, ctx, services, run, revision, workflowadapter.ResultReview, workflowadapter.ReviewModelResult)
-	}
+	childSpecification := testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	childResolver := catalogLockAttestedResolverForSpec(t, childSpecification, "codeedge-evaluator-child-catalog", "v1", "lock-v1")
+	services := catalogLockLifecycleServices(t, root, database, childResolver)
+	childRun, childFrozen := startCodeEdgeEvaluatorFixtureRun(t, ctx, services, run, revision, childSpecification, "complete evaluator evidence")
+	qwenStage, qwen := seedCodeEdgeEvaluationStage(t, ctx, services, childRun, revision, childFrozen, workflowadapter.HarborRunQwen, frozen.Policy.QwenPolicy)
+	opusStage, opus := seedCodeEdgeEvaluationStage(t, ctx, services, childRun, revision, childFrozen, workflowadapter.HarborRunOpus, frozen.Policy.OpusPolicy)
+	seedPreallocatedCodeEdgeTrialSet(t, ctx, database, childRun, qwenStage)
+	seedPreallocatedCodeEdgeTrialSet(t, ctx, database, childRun, opusStage)
 
 	fixture := &codeEdgeComplianceFixture{
 		root: root, database: database, services: services, task: task, revision: revision, run: run, specification: specification,
-		frozen: frozen, qwenStage: qwenStage, opusStage: opusStage, qwen: qwen, opus: opus, submission: submission,
+		frozen: frozen, childRun: childRun, childFrozen: childFrozen, qwenStage: qwenStage, opusStage: opusStage, qwen: qwen, opus: opus,
 	}
 	if options.seedFailedQwenTrial {
-		fixture.failedQwenTrialID = seedFailedCodeEdgeQwenTrial(t, ctx, database, run, qwenStage)
+		fixture.failedQwenTrialID = seedFailedCodeEdgeQwenTrial(t, ctx, database, childRun, qwenStage)
 	}
+	projector := &CodeEdgeComplianceService{core: services.core}
+	if err := projector.completeTrustedTrialSet(ctx, childRun, qwenStage, codeEdgeEvaluatorTrialCount, "codeedge-test", "complete trusted Qwen child trials"); err != nil {
+		t.Fatal(err)
+	}
+	if err := projector.completeTrustedTrialSet(ctx, childRun, opusStage, codeEdgeEvaluatorTrialCount, "codeedge-test", "complete trusted Opus child trials"); err != nil {
+		t.Fatal(err)
+	}
+	childRun, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{RunID: childRun.ID, ExpectedVersion: childRun.Version, Status: store.WorkflowRunSucceeded, Actor: "codeedge-test", Reason: "complete trusted evaluator child evidence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.childRun = childRun
+	if options.stopBeforeHandoff {
+		return fixture
+	}
+	handoffID := newCodeEdgeComplianceUUID(t)
+	handoff, err := (&CodeEdgeEvaluatorEvidenceHandoffService{core: services.core}).Record(ctx, RecordCodeEdgeEvaluatorEvidenceHandoffRequest{
+		ID: handoffID, IdempotencyKey: handoffID, ParentRunID: run.ID, ChildRunID: childRun.ID,
+		Actor: "codeedge-test", Reason: "adopt trusted evaluator child evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.handoff = handoff
+	run = seedApprovedCodeEdgeReviewGate(t, ctx, services, run, revision, workflowadapter.EvaluatorEvidenceHandoff, workflowadapter.ReviewEvaluatorEvidence)
+	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning,
+		Actor: "codeedge-test", Reason: "continue after evaluator evidence handoff review",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := seedCodeEdgeSubmissionStage(t, ctx, services, run, revision, frozen)
+	fixture.submission = submission
+	if !options.omitResultReview {
+		run = seedApprovedCodeEdgeReviewGate(t, ctx, services, run, revision, workflowadapter.ResultReview, workflowadapter.ReviewModelResult)
+	}
+	fixture.run = run
+	fixture.runtimeRun, _ = startCodeEdgeEvaluatorFixtureRun(t, ctx, services, run, revision, childSpecification, "runtime evaluator exercise")
 	if options.packageableRevision {
 		fixture.makeRevisionPackageable(t, ctx)
 	}
 	return fixture
 }
 
+func openCodeEdgeEvaluatorEvidenceReviewGateForDecision(t *testing.T, ctx context.Context, fixture *codeEdgeComplianceFixture) store.ReviewGateOpenResult {
+	t.Helper()
+	if fixture.run.Status != store.WorkflowRunRunning {
+		run, err := fixture.database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+			RunID: fixture.run.ID, ExpectedVersion: fixture.run.Version, Status: store.WorkflowRunRunning,
+			Actor: "codeedge-test", Reason: "open independent evaluator evidence gate fixture",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.run = run
+	}
+	workflow, err := decodeFrozenRunDefinition(fixture.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, found := workflow.Workflow.Stage(workflowkit.StageKey(workflowadapter.EvaluatorEvidenceHandoff))
+	if !found {
+		t.Fatal("frozen workflow has no evaluator evidence handoff gate")
+	}
+	inputs, err := workflowkit.FingerprintArtifactBindings(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := fixture.database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: fixture.run.ID, StageKey: workflowadapter.EvaluatorEvidenceHandoff, StageGroup: descriptor.Group, Ordinal: 99,
+		InputFingerprint: string(inputs), BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		Actor: "codeedge-test", Reason: "open evaluator evidence gate through review service",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := fixture.database.OpenReviewGate(ctx, store.OpenReviewGateRequest{
+		RunID: fixture.run.ID, ExpectedRunVersion: fixture.run.Version, RevisionID: fixture.revision.ID, RevisionDigest: fixture.revision.TaskDigest,
+		DefinitionHash: fixture.run.DefinitionHash, StageAttemptID: stage.ID, ExpectedStageAttemptVersion: stage.Version,
+		StageKey: workflowadapter.EvaluatorEvidenceHandoff, ReviewKind: string(workflowadapter.ReviewEvaluatorEvidence),
+		NodeGeneration: 9, NodeAttempt: 1, InputBindingsJSON: `[]`, InputFingerprint: string(inputs),
+		EvidenceManifestDigest: "sha256:codeedge-evaluator-evidence-review-service-test", Actor: "codeedge-test", Reason: "open evaluator evidence gate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.run = opened.Run
+	return opened
+}
+
 // Race instrumentation makes the evaluator's durable preallocation and fence
 // setup exceed the generic one-second fixture budget. Keep this scoped to the
 // two external evaluator stages: it exercises the same production policy
 // shape without converting a scheduler-timing artifact into an interruption.
-func codeEdgeEvaluatorRuntimeProfile(t *testing.T) workflowadapter.ExecutionProfile {
+func codeEdgePhase1RuntimeProfile(t *testing.T) workflowadapter.ExecutionProfile {
 	t.Helper()
 	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
+	return profile
+}
+
+func codeEdgeEvaluatorRuntimeProfile(t *testing.T) workflowadapter.ExecutionProfile {
+	t.Helper()
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplate())
 	for index := range profile.Stages {
 		if profile.Stages[index].StageKey != workflowkit.StageKey(workflowadapter.HarborRunQwen) && profile.Stages[index].StageKey != workflowkit.StageKey(workflowadapter.HarborRunOpus) {
 			continue
@@ -392,13 +583,58 @@ func codeEdgeEvaluatorRuntimeProfile(t *testing.T) workflowadapter.ExecutionProf
 	return profile
 }
 
+func startCodeEdgeEvaluatorFixtureRun(t *testing.T, ctx context.Context, services *LifecycleServices, parent store.WorkflowRun, revision store.TaskRevision, specification workflowadapter.RunExecutionSpec, reason string) (store.WorkflowRun, frozenCodeEdgeRun) {
+	t.Helper()
+	child, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: parent.TaskID, RevisionID: revision.ID, ParentRunID: parent.ID,
+		Profile: codeEdgeEvaluatorRuntimeProfile(t), ExecutionSpec: specification,
+		Trigger: "codeedge-evaluator-fixture", Actor: "codeedge-test", Reason: reason,
+	})
+	if err != nil {
+		t.Fatalf("start evaluator child fixture: %v", err)
+	}
+	child, err = services.core.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: child.ID, ExpectedVersion: child.Version, Status: store.WorkflowRunRunning, Actor: "codeedge-test", Reason: "run evaluator child fixture",
+	})
+	if err != nil {
+		t.Fatalf("transition evaluator child fixture to running: %v", err)
+	}
+	manifest, manifestFingerprint, err := services.core.verifyManagedRunManifestForTemplate(child, workflowadapter.CodeEdgeEvaluatorChildTemplateReference(), "CodeEdge evaluator child fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := services.core.verifyPersistedCodeEdgeCatalogProof(child, manifest, workflowadapter.CodeEdgeEvaluatorChildTemplateReference()); err != nil {
+		t.Fatal(err)
+	}
+	catalogRaw, err := canonicalManifestDeploymentCatalogReceipt(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := stageprovider.ParseDeploymentOperationCatalogReceiptJSON(catalogRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
+	if err != nil || lock == nil {
+		t.Fatalf("read evaluator child catalog lock = %+v, %v", lock, err)
+	}
+	binding := codeedge.FrozenRunBinding{
+		TaskSnapshotDigest: workflowkit.SubjectDigest(revision.TaskDigest), CatalogFingerprint: receipt.CatalogFingerprint,
+		LockFingerprint: lock.Fingerprint, ManifestFingerprint: manifestFingerprint,
+	}
+	if err := binding.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return child, frozenCodeEdgeRun{Run: child, Revision: revision, Binding: binding}
+}
+
 func (fixture *codeEdgeComplianceFixture) complianceRequest(t *testing.T) RecordCodeEdgeFinalComplianceRequest {
 	t.Helper()
 	id := newCodeEdgeComplianceUUID(t)
 	return RecordCodeEdgeFinalComplianceRequest{
-		ID: id, IdempotencyKey: id, RunID: fixture.run.ID, QwenStageAttemptID: fixture.qwenStage.ID, OpusStageAttemptID: fixture.opusStage.ID,
-		Qwen: fixture.qwen.Clone(), Opus: fixture.opus.Clone(), Submission: fixture.submission.Clone(),
-		Actor: "codeedge-test", Reason: "record trusted final compliance",
+		ID: id, IdempotencyKey: id, RunID: fixture.run.ID, EvaluatorEvidenceHandoffID: fixture.handoff.ID,
+		Submission: fixture.submission.Clone(),
+		Actor:      "codeedge-test", Reason: "record trusted final compliance",
 	}
 }
 
@@ -718,22 +954,25 @@ func codeEdgeHarborRunBundleBytes(t *testing.T, taskRoot string, digest workflow
 	t.Helper()
 	jobRoot := filepath.Join(t.TempDir(), "harbor-job")
 	codeEdgeWriteHarborBundleJSON(t, filepath.Join(jobRoot, "config.json"), map[string]any{
-		"n_attempts":   4,
-		"n_concurrent": 4,
-		"tasks":        []any{map[string]any{"path": taskRoot}},
-		"datasets":     []any{},
-		"agents":       []any{map[string]any{"name": policy.Evaluator.AgentName, "model_name": policy.Evaluator.ModelName}},
+		"n_attempts":          4,
+		"n_concurrent_trials": 1,
+		"tasks":               []any{map[string]any{"path": taskRoot}},
+		"datasets":            []any{},
+		"agents":              []any{map[string]any{"name": policy.Evaluator.AgentName, "model_name": policy.Evaluator.ModelName}},
 	})
 	codeEdgeWriteHarborBundleJSON(t, filepath.Join(jobRoot, "lock.json"), map[string]any{
-		"schema_version": 2,
-		"harbor":         map[string]any{"version": "0.18.0"},
-		"trials":         []any{},
+		"schema_version":      2,
+		"harbor":              map[string]any{"version": "0.18.0"},
+		"n_concurrent_trials": 1,
+		"retry":               map[string]any{"max_retries": 3},
+		"trials":              []any{},
 	})
 	codeEdgeWriteHarborBundleJSON(t, filepath.Join(jobRoot, "result.json"), map[string]any{
 		"id": jobID, "started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:10:00Z", "n_total_trials": 4,
 		"stats": map[string]any{
 			"n_running_trials": 0,
 			"n_pending_trials": 0,
+			"n_retries":        0,
 			"evals": map[string]any{
 				policy.Evaluator.AgentName + "__" + policy.Evaluator.ModelName + "__adhoc": map[string]any{"pass_at_k": map[string]any{"4": 1}},
 			},

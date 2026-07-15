@@ -277,7 +277,7 @@ func (service *RepairLoopService) planAndCommitNextRound(ctx context.Context, ru
 	if err != nil {
 		return RepairLoopAdvanceResult{}, err
 	}
-	nextCandidate, err := service.core.store.GetRevisionCandidate(ctx, plan.Snapshot().CandidateRevisionID)
+	nextCandidate, err := service.core.store.GetRevisionCandidateByFrozenPlan(ctx, plan.ID())
 	if err != nil {
 		return RepairLoopAdvanceResult{}, err
 	}

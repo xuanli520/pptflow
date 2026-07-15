@@ -75,6 +75,83 @@ func TestHarborRunBundleV018InspectionRejectsCrossJobTrial(t *testing.T) {
 	}
 }
 
+func TestHarborRunBundleV018InspectionAuthenticatesStrictAggregateInternalRetryCount(t *testing.T) {
+	t.Run("positive aggregate remains job scoped", func(t *testing.T) {
+		fixture := newHarborRunBundleFixture(t)
+		updateHarborRunBundleJob(t, fixture, func(job map[string]any) {
+			job["stats"].(map[string]any)["n_retries"] = 2
+		})
+
+		bundle, err := CaptureHarborRunBundleV018(fixture.request())
+		if err != nil {
+			t.Fatalf("CaptureHarborRunBundleV018() error = %v", err)
+		}
+		inspection, err := InspectHarborRunBundleV018(bundle)
+		if err != nil {
+			t.Fatalf("InspectHarborRunBundleV018() error = %v", err)
+		}
+		if job := inspection.Job(); job.InternalRetryCount != 2 {
+			t.Fatalf("job InternalRetryCount = %d, want 2", job.InternalRetryCount)
+		}
+		if trials := inspection.Trials(); len(trials) != harborRunBundleExpectedTrialCount {
+			t.Fatalf("final logical trials = %d, want %d; aggregate retries must not create inferred trial facts", len(trials), harborRunBundleExpectedTrialCount)
+		}
+	})
+
+	for _, invalid := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "missing",
+			mutate: func(job map[string]any) {
+				delete(job["stats"].(map[string]any), "n_retries")
+			},
+		},
+		{
+			name: "negative",
+			mutate: func(job map[string]any) {
+				job["stats"].(map[string]any)["n_retries"] = -1
+			},
+		},
+		{
+			name: "fractional",
+			mutate: func(job map[string]any) {
+				job["stats"].(map[string]any)["n_retries"] = 1.5
+			},
+		},
+		{
+			name: "string",
+			mutate: func(job map[string]any) {
+				job["stats"].(map[string]any)["n_retries"] = "2"
+			},
+		},
+	} {
+		t.Run(invalid.name, func(t *testing.T) {
+			fixture := newHarborRunBundleFixture(t)
+			updateHarborRunBundleJob(t, fixture, invalid.mutate)
+			if _, err := CaptureHarborRunBundleV018(fixture.request()); !errors.Is(err, ErrInvalidHarborRunBundle) {
+				t.Fatalf("invalid stats.n_retries error = %v, want ErrInvalidHarborRunBundle", err)
+			}
+		})
+	}
+}
+
+func updateHarborRunBundleJob(t *testing.T, fixture harborRunBundleFixture, mutate func(map[string]any)) {
+	t.Helper()
+	path := filepath.Join(fixture.jobRoot, "result.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(raw, &job); err != nil {
+		t.Fatal(err)
+	}
+	mutate(job)
+	writeHarborRunBundleJSON(t, path, job)
+}
+
 type harborRunBundleFixture struct {
 	taskRoot         string
 	jobRoot          string
@@ -105,7 +182,7 @@ func newHarborRunBundleFixture(t *testing.T) harborRunBundleFixture {
 	writeHarborRunBundleJSON(t, filepath.Join(jobRoot, "result.json"), map[string]any{
 		"id": "job-1", "started_at": "2026-07-14T00:00:00Z", "finished_at": "2026-07-14T00:10:00Z", "n_total_trials": 4,
 		"stats": map[string]any{
-			"n_running_trials": 0, "n_pending_trials": 0,
+			"n_running_trials": 0, "n_pending_trials": 0, "n_retries": 0,
 			"evals": map[string]any{"claude-code__qwen__adhoc": map[string]any{"pass_at_k": map[string]any{"2": 0.25, "4": 0.25}}},
 		},
 	})

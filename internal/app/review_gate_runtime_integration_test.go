@@ -279,7 +279,7 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,21 +417,24 @@ func runtimeReviewGateWorkflow() workflowkit.WorkflowDescriptor {
 			{
 				Key: runtimeFixtureSourceStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.source", Version: "1"}, Group: "runtime",
 				Outputs: []workflowkit.ArtifactSpec{{Name: "source_report", SchemaVersion: "runtime.v1", Required: true}}, Effect: workflowkit.EffectEvidenceOnly,
-				Budget: budget, QuotaClaims: []workflowkit.QuotaClaim{claim}, Retry: workflowkit.RetryPolicy{},
+				Dispatch: workflowkit.StageDispatchAutomatic,
+				Budget:   budget, QuotaClaims: []workflowkit.QuotaClaim{claim}, Retry: workflowkit.RetryPolicy{},
 				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}, Reuse: workflowkit.ReuseWhenInputsMatch,
 				Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityCancel, workflowkit.CapabilityContinue},
 			},
 			{
 				Key: runtimeReviewGateStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.review-gate", Version: "1"}, Group: "runtime",
 				Dependencies: []workflowkit.StageKey{runtimeFixtureSourceStage}, Inputs: []workflowkit.ArtifactSpec{{Name: "source_report", SchemaVersion: "runtime.v1", Required: true}}, Outputs: []workflowkit.ArtifactSpec{decisionArtifact}, Effect: workflowkit.EffectEvidenceOnly,
-				Budget: budget, QuotaClaims: []workflowkit.QuotaClaim{}, Retry: workflowkit.RetryPolicy{},
+				Dispatch: workflowkit.StageDispatchAutomatic,
+				Budget:   budget, QuotaClaims: []workflowkit.QuotaClaim{}, Retry: workflowkit.RetryPolicy{},
 				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass, workflowkit.VerdictNeedsRepair, workflowkit.VerdictReject}}, Reuse: workflowkit.ReuseWhenInputsMatch,
 				Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityApprove},
 			},
 			{
 				Key: runtimeReviewSuccessorStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.review-successor", Version: "1"}, Group: "runtime",
 				Dependencies: []workflowkit.StageKey{runtimeReviewGateStage}, Inputs: []workflowkit.ArtifactSpec{decisionArtifact}, Outputs: []workflowkit.ArtifactSpec{{Name: "successor_report", SchemaVersion: "runtime.v1", Required: true}}, Effect: workflowkit.EffectEvidenceOnly,
-				Budget: budget, QuotaClaims: []workflowkit.QuotaClaim{claim}, Retry: workflowkit.RetryPolicy{},
+				Dispatch: workflowkit.StageDispatchAutomatic,
+				Budget:   budget, QuotaClaims: []workflowkit.QuotaClaim{claim}, Retry: workflowkit.RetryPolicy{},
 				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}, Reuse: workflowkit.ReuseWhenInputsMatch,
 				Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityCancel, workflowkit.CapabilityContinue},
 			},

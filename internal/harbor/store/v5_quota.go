@@ -940,6 +940,37 @@ func (s *Store) AdmitTaskActorQuota(ctx context.Context, request AdmitTaskActorQ
 	return decision, nil
 }
 
+// GetDurableAdmissionDecisionByIdempotencyKey returns the immutable admission
+// decision and every reservation created for one exact durable stage
+// admission. Reconciliation uses this read-only lookup to settle the same
+// fenced leases after a proven external outcome; it never recomputes a quota
+// request from current policy or caller input.
+func (s *Store) GetDurableAdmissionDecisionByIdempotencyKey(ctx context.Context, idempotencyKey string) (*DurableAdmissionDecision, error) {
+	key, err := normalizeRequired(idempotencyKey, "admission idempotency key")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidQuota, err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	row, err := getDurableAdmissionDecisionByKeyTx(ctx, tx, key)
+	if err != nil || row == nil {
+		return nil, err
+	}
+	leases, err := listDurableQuotaLeasesForAdmissionTx(ctx, tx, row.ID)
+	if err != nil {
+		return nil, err
+	}
+	decision := row.DurableAdmissionDecision
+	decision.Leases = leases
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &decision, nil
+}
+
 type quotaAdmissionAccountKey struct {
 	ScopeKind QuotaScopeKind
 	ScopeID   string

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -246,6 +247,78 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 			ConfirmationNeeded: true,
 			Expected:           expected,
 		}, nil
+	case TaskHubActionEvaluateCodeEdge:
+		if services.EvaluatorLaunches == nil || !services.EvaluatorLaunches.Available() {
+			return unavailableTaskHubPlan(command.Action, "当前部署未配置受控 CodeEdge 评测定义"), nil
+		}
+		if adapter == nil || adapter.runWorkerHandoffLauncher == nil {
+			return unavailableTaskHubPlan(command.Action, "当前 Task Hub 未配置受控 CodeEdge 评测 worker launcher"), nil
+		}
+		if target.run == nil {
+			return unavailableTaskHubPlan(command.Action, "执行 CodeEdge 评测需要明确的已批准 Phase-1 父 Run"), nil
+		}
+		launchPlan, err := services.EvaluatorLaunches.Plan(ctx, target.run.ID)
+		if err != nil {
+			return unavailableTaskHubPlan(command.Action, taskHubCodeEdgeEvaluatorPlanUnavailableReason(err)), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, launchPlan.TaskID, launchPlan.RevisionID, launchPlan.ParentRunID, "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return TaskHubPlanPreview{
+			Title:              "执行 CodeEdge 评测",
+			Summary:            "首次确认将冻结 Qwen 后 Opus 的严格 pass@4 child Run 说明书；第二次确认才会创建 child Run 并启动受控 worker。",
+			Reason:             "父 Run 已通过 FinalReview，并绑定当前 TaskRevision、受控 catalog/lock 与评测定义。",
+			RevisionImpact:     "不会修改 TaskRevision；评测证据仅写入新的 parent-linked child Run。",
+			ExecutionScope:     []string{launchPlan.ParentRunID, launchPlan.TaskID, launchPlan.RevisionID, string(launchPlan.Template.ID) + "@" + launchPlan.Template.Version},
+			BudgetImpact:       "Qwen 4 个逻辑 Trial，随后 Opus 4 个逻辑 Trial；每个阶段禁止通用 retry。",
+			ExternalEffects:    []string{"第二次确认将创建 child Run、durable job 和一个受控 child-worker handoff", "受控 worker 将按冻结白名单调用 Harbor"},
+			ConfirmationNeeded: true,
+			Expected:           expected,
+		}, nil
+	case TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff:
+		if services.Mutations == nil {
+			return unavailableTaskHubPlan(command.Action, "LifecycleMutationService 不可用"), nil
+		}
+		if services.EvaluatorEvidenceHandoffs == nil {
+			return unavailableTaskHubPlan(command.Action, "CodeEdge evaluator 证据交接服务不可用"), nil
+		}
+		if target.run == nil {
+			return unavailableTaskHubPlan(command.Action, "采用 CodeEdge 评测证据需要选择完成的 evaluator child Run"), nil
+		}
+		parent, child, err := adapter.resolveTaskHubCodeEdgeEvaluatorEvidenceHandoffRuns(ctx, services, target.run.ID)
+		if err != nil {
+			return unavailableTaskHubPlan(command.Action, taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err)), nil
+		}
+		existing, err := services.Store().GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, parent.ID)
+		if err != nil {
+			return TaskHubPlanPreview{}, fmt.Errorf("read CodeEdge evaluator evidence handoff for parent Run %s: %w", parent.ID, err)
+		}
+		if existing != nil {
+			return unavailableTaskHubPlan(command.Action, "该 Phase-1 父 Run 已采用一份不可变的 CodeEdge evaluator 证据交接"), nil
+		}
+		handoffPlan, err := services.EvaluatorEvidenceHandoffs.Plan(ctx, parent.ID, child.ID)
+		if err != nil {
+			return unavailableTaskHubPlan(command.Action, taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err)), nil
+		}
+		if handoffPlan.ParentRunID != parent.ID || handoffPlan.ChildRunID != child.ID ||
+			handoffPlan.TaskID != parent.TaskID || handoffPlan.RevisionID != parent.RevisionID {
+			return unavailableTaskHubPlan(command.Action, "CodeEdge evaluator 证据交接计划未绑定所选 child 与其冻结父 Run"), nil
+		}
+		expected, err := adapter.captureTaskHubMutationCheckpoint(ctx, services, parent.TaskID, parent.RevisionID, parent.ID, "")
+		if err != nil {
+			return TaskHubPlanPreview{}, err
+		}
+		return TaskHubPlanPreview{
+			Title:              "采用 CodeEdge 评测证据",
+			Summary:            "首次确认将冻结已验证的 Qwen/Opus pass@4 child 证据交接；再次确认才会将其采用到 Phase-1 父 Run。",
+			Reason:             "已从完成的 evaluator child Run 重新解析其不可变 parent lineage、Qwen/Opus trial 集合与证据指纹。",
+			RevisionImpact:     "不会修改 TaskRevision；仅为已冻结 Phase-1 父 Run 记录一份不可变证据交接。",
+			ExecutionScope:     []string{parent.ID, child.ID, parent.TaskID, parent.RevisionID},
+			ReusedEvidence:     []string{string(handoffPlan.HandoffFingerprint), string(handoffPlan.QwenTrialFingerprint), string(handoffPlan.OpusTrialFingerprint)},
+			ConfirmationNeeded: true,
+			Expected:           expected,
+		}, nil
 	case TaskHubActionContinue:
 		if target.run == nil || services.Continuations == nil {
 			return unavailableTaskHubPlan(command.Action, "继续处理需要明确的 Run 和 TaskContinuationService"), nil
@@ -405,7 +478,7 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubCommand(ctx context.Contex
 // PlanTaskHubRunControl reads the currently authoritative Run and returns a
 // non-mutating impact preview. The Task Hub deliberately does not collect the
 // actor, reason, idempotency key, confirmation, or provider capability needed
-// to create a durable control command, so this method can never submit one.
+// to submit a Run action, so this method can never submit one.
 func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubRunControl(ctx context.Context, command TaskHubRunControlCommand) (TaskHubPlanPreview, error) {
 	services, err := adapter.lifecycleServices()
 	if err != nil {
@@ -420,6 +493,9 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubRunControl(ctx context.Con
 	}
 	if target.run == nil {
 		return unavailableTaskHubPlan(TaskHubActionOpenRunControl, "运行控制需要明确的 Run"), nil
+	}
+	if command.Action == TaskHubRunControlReconcile {
+		return adapter.planTaskHubLocalRunReconcile(ctx, services, target)
 	}
 	if services.Control == nil {
 		return unavailableRunControlPlan(command.Action, "运行控制服务不可用"), nil
@@ -464,6 +540,38 @@ func (adapter *AppTaskHubLifecycleAdapter) PlanTaskHubRunControl(ctx context.Con
 	}, nil
 }
 
+// planTaskHubLocalRunReconcile previews exactly the local boundary exposed by
+// `harbor run reconcile`. It intentionally does not inspect a provider,
+// interpret external receipts, or promise that an unknown external effect has
+// been resolved.
+func (adapter *AppTaskHubLifecycleAdapter) planTaskHubLocalRunReconcile(ctx context.Context, services *app.LifecycleServices, target taskHubResolvedTarget) (TaskHubPlanPreview, error) {
+	if target.run == nil {
+		return unavailableRunControlPlan(TaskHubRunControlReconcile, "本地 reconcile 需要明确的 Run"), nil
+	}
+	if services == nil || services.LocalRuntime == nil {
+		return unavailableRunControlPlan(TaskHubRunControlReconcile, "本地 durable runtime 服务不可用"), nil
+	}
+	if reason := taskHubRunControlTargetReason(TaskHubRunControlReconcile, *target.run, nil); reason != "" {
+		return unavailableRunControlPlan(TaskHubRunControlReconcile, reason), nil
+	}
+	attachment, err := services.LocalRuntime.AttachRun(ctx, app.AttachRunRequest{RunID: target.run.ID})
+	if err != nil {
+		return TaskHubPlanPreview{}, fmt.Errorf("read local runtime attachment for Run %s reconciliation preview: %w", target.run.ID, err)
+	}
+	return TaskHubPlanPreview{
+		Title:   "本地 reconcile 影响预览",
+		Summary: "确认后将调用与 harbor run reconcile 相同的本地 durable-state recovery；仅处理所选 Run，不调用 provider、模型、Docker 或重跑 workflow。",
+		Reason: fmt.Sprintf(
+			"Run 当前处于 %s；当前本地投影包含 %d 个 job、%d 个 worker lease、%d 个 worker handoff、%d 个 task quota lease 和 %d 个 actor quota lease。过期事实会在提交时重新判定。",
+			target.run.Status, len(attachment.Jobs), len(attachment.WorkerLeases), len(attachment.WorkerHandoffs), len(attachment.TaskQuota.Leases), len(attachment.ActorQuota.Leases),
+		),
+		RevisionImpact:     "本次操作不会修改 TaskRevision，也不会猜测或覆盖外部 provider 结果。",
+		ExecutionScope:     []string{target.task.ID, target.run.ID},
+		ExternalEffects:    taskHubRunControlPotentialEffects(TaskHubRunControlReconcile),
+		ConfirmationNeeded: true,
+	}, nil
+}
+
 // PrepareTaskHubMutation freezes actions that require a durable plan before
 // execution. Continuation and manual patch both retain the exact operator
 // provenance and checkpoint that were reviewed in the confirmation form.
@@ -498,6 +606,70 @@ func (adapter *AppTaskHubLifecycleAdapter) PrepareTaskHubMutation(ctx context.Co
 				RevisionImpact:     "不会修改 TaskRevision 内容。",
 				ExecutionScope:     []string{request.Target.TaskID, request.Target.RevisionID},
 				ExternalEffects:    []string{"第二次确认将创建 Run、durable job 与 outbox 记录"},
+				ConfirmationNeeded: true,
+				Expected:           request.Expected,
+			},
+			Actor:  request.Actor,
+			Reason: request.Reason,
+		}, nil
+	case TaskHubActionEvaluateCodeEdge:
+		if services.EvaluatorLaunches == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("CodeEdge evaluator launch service is not configured")
+		}
+		prepared, err := services.EvaluatorLaunches.Prepare(ctx, app.CodeEdgeEvaluatorLaunchCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			ParentRunID:                  strings.TrimSpace(request.Target.RunID),
+		})
+		if err != nil {
+			return TaskHubPreparedMutation{}, taskHubCodeEdgeEvaluatorMutationError(err)
+		}
+		return TaskHubPreparedMutation{
+			Preview: TaskHubPlanPreview{
+				PlanID:             "codeedge-evaluator:" + request.IdempotencyKey,
+				Title:              "执行 CodeEdge 评测（说明书已冻结）",
+				Summary:            "Qwen 与 Opus 的严格 child Run profile/spec 已迁入受管目录；再次确认将创建 Run 并启动受控 worker。",
+				Reason:             "profile " + prepared.ProfileFingerprint + "；execution spec " + prepared.ExecutionSpecFingerprint + "。",
+				RevisionImpact:     "不会修改 TaskRevision；新的 child Run 绑定父 Run " + prepared.ParentRunID + "。",
+				ExecutionScope:     []string{prepared.ParentRunID, request.Target.TaskID, request.Target.RevisionID},
+				BudgetImpact:       "Qwen 4 个逻辑 Trial，随后 Opus 4 个逻辑 Trial。",
+				ExternalEffects:    []string{"第二次确认将创建 child Run、durable job 和一个受控 child-worker handoff"},
+				ConfirmationNeeded: true,
+				Expected:           request.Expected,
+			},
+			Actor:  request.Actor,
+			Reason: request.Reason,
+		}, nil
+	case TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff:
+		if services.Mutations == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		if services.EvaluatorEvidenceHandoffs == nil {
+			return TaskHubPreparedMutation{}, fmt.Errorf("CodeEdge evaluator evidence handoff service is not configured")
+		}
+		parent, child, err := adapter.resolveTaskHubCodeEdgeEvaluatorEvidenceHandoffRuns(ctx, services, request.Target.RunID)
+		if err != nil {
+			return TaskHubPreparedMutation{}, errors.New(taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err))
+		}
+		prepared, err := services.Mutations.PrepareCodeEdgeEvaluatorEvidenceHandoff(ctx, app.CodeEdgeEvaluatorEvidenceHandoffCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			ParentRunID:                  parent.ID,
+			ChildRunID:                   child.ID,
+		})
+		if err != nil {
+			return TaskHubPreparedMutation{}, errors.New(taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err))
+		}
+		if prepared.ParentRunID != parent.ID || prepared.ChildRunID != child.ID || strings.TrimSpace(string(prepared.HandoffFingerprint)) == "" {
+			return TaskHubPreparedMutation{}, errors.New("CodeEdge evaluator 证据交接冻结结果未绑定所选 parent/child 证据")
+		}
+		return TaskHubPreparedMutation{
+			Preview: TaskHubPlanPreview{
+				PlanID:             "codeedge-evaluator-evidence-handoff:" + request.IdempotencyKey,
+				Title:              "采用 CodeEdge 评测证据（交接已冻结）",
+				Summary:            "已冻结 parent/child 身份和已验证的 Qwen/Opus pass@4 证据指纹；再次确认才会写入不可变证据交接。",
+				Reason:             "交接指纹 " + string(prepared.HandoffFingerprint) + "。",
+				RevisionImpact:     "不会修改 TaskRevision；仅在已冻结 Phase-1 父 Run 上采用这份 child 证据。",
+				ExecutionScope:     []string{prepared.ParentRunID, prepared.ChildRunID},
+				ReusedEvidence:     []string{string(prepared.QwenTrialFingerprint), string(prepared.OpusTrialFingerprint)},
 				ConfirmationNeeded: true,
 				Expected:           request.Expected,
 			},
@@ -694,6 +866,45 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 			return TaskHubMutationResult{}, err
 		}
 		return taskHubMutationResult(request, receipt), nil
+	case TaskHubActionEvaluateCodeEdge:
+		if services.EvaluatorLaunches == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("CodeEdge evaluator launch service is not configured")
+		}
+		if adapter == nil || adapter.runWorkerHandoffLauncher == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("Task Hub CodeEdge evaluator worker launcher is not configured")
+		}
+		result, err := services.EvaluatorLaunches.ConfirmAndLaunch(ctx, app.CodeEdgeEvaluatorLaunchCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			ParentRunID:                  strings.TrimSpace(request.Target.RunID),
+		}, adapter.runWorkerHandoffLauncher)
+		if err != nil {
+			return TaskHubMutationResult{}, taskHubCodeEdgeEvaluatorMutationError(err)
+		}
+		return TaskHubMutationResult{
+			Action:      request.Action,
+			Target:      request.Target,
+			PlanID:      request.PlanID,
+			ExecutionID: result.Receipt.RunID,
+			ReceiptID:   result.Handoff.ID,
+			Summary:     "CodeEdge 评测 child Run 已入队并启动受控 worker",
+		}, nil
+	case TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff:
+		if services.Mutations == nil {
+			return TaskHubMutationResult{}, fmt.Errorf("LifecycleMutationService is not configured")
+		}
+		parent, child, err := adapter.resolveTaskHubCodeEdgeEvaluatorEvidenceHandoffRuns(ctx, services, request.Target.RunID)
+		if err != nil {
+			return TaskHubMutationResult{}, errors.New(taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err))
+		}
+		receipt, err := services.Mutations.AdoptCodeEdgeEvaluatorEvidenceHandoff(ctx, app.CodeEdgeEvaluatorEvidenceHandoffCommand{
+			LifecycleMutationCommandBase: taskHubLifecycleMutationBase(request),
+			ParentRunID:                  parent.ID,
+			ChildRunID:                   child.ID,
+		})
+		if err != nil {
+			return TaskHubMutationResult{}, errors.New(taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err))
+		}
+		return taskHubMutationResult(request, receipt), nil
 	case TaskHubActionContinue:
 		if services.Continuations == nil {
 			return TaskHubMutationResult{}, fmt.Errorf("TaskContinuationService is not configured")
@@ -773,10 +984,11 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubMutation(ctx context.Co
 	}
 }
 
-// ExecuteTaskHubRunControlMutation creates a target-scoped durable control
-// operation using exactly the checkpoint the operator inspected. The service
-// reads grace policy only from the frozen run manifest; this adapter never
-// accepts a per-request override or recomputes a newer checkpoint.
+// ExecuteTaskHubRunControlMutation executes one confirmed, target-scoped Run
+// action. Durable control operations use exactly the checkpoint the operator
+// inspected. Local reconcile deliberately mirrors the CLI contract instead:
+// it invokes LocalRuntime.ReconcileRun with the explicit Run, actor, and audit
+// reason, without creating a ControlOperation or contacting a provider.
 func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubRunControlMutation(ctx context.Context, request TaskHubRunControlMutationRequest) (TaskHubRunControlMutationResult, error) {
 	if err := validateTaskHubRunControlMutationRequest(request); err != nil {
 		return TaskHubRunControlMutationResult{}, err
@@ -785,15 +997,35 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubRunControlMutation(ctx 
 	if err != nil {
 		return TaskHubRunControlMutationResult{}, err
 	}
-	if services.Control == nil {
-		return TaskHubRunControlMutationResult{}, fmt.Errorf("execution control service is not configured")
-	}
 	target, err := adapter.resolveTaskHubTarget(ctx, services, request.Target)
 	if err != nil {
 		return TaskHubRunControlMutationResult{}, err
 	}
 	if target.run == nil {
 		return TaskHubRunControlMutationResult{}, fmt.Errorf("运行控制需要明确的 Run")
+	}
+	if request.Action == TaskHubRunControlReconcile {
+		if services.LocalRuntime == nil {
+			return TaskHubRunControlMutationResult{}, fmt.Errorf("local durable runtime service is not configured")
+		}
+		if reason := taskHubRunControlTargetReason(TaskHubRunControlReconcile, *target.run, nil); reason != "" {
+			return TaskHubRunControlMutationResult{}, fmt.Errorf("本地 reconcile 不可提交：%s", reason)
+		}
+		result, err := services.LocalRuntime.ReconcileRun(ctx, app.ReconcileRunRequest{
+			RunID:  target.run.ID,
+			Actor:  request.Actor,
+			Reason: request.Reason,
+		})
+		if err != nil {
+			return TaskHubRunControlMutationResult{}, err
+		}
+		return TaskHubRunControlMutationResult{
+			Action:  request.Action,
+			Summary: taskHubLocalRunReconcileSummary(result),
+		}, nil
+	}
+	if services.Control == nil {
+		return TaskHubRunControlMutationResult{}, fmt.Errorf("execution control service is not configured")
 	}
 	if request.Expected.SubjectID != target.task.ID || request.Expected.SubjectRevisionID != target.run.RevisionID {
 		return TaskHubRunControlMutationResult{}, fmt.Errorf("运行控制 checkpoint 不属于当前 Task 或 Run revision")
@@ -827,6 +1059,13 @@ func (adapter *AppTaskHubLifecycleAdapter) ExecuteTaskHubRunControlMutation(ctx 
 		OperationID: operation.ID,
 		Summary:     taskHubRunControlActionLabel(request.Action) + "请求已提交到 durable 控制队列",
 	}, nil
+}
+
+func taskHubLocalRunReconcileSummary(result app.RunReconciliationResult) string {
+	return fmt.Sprintf(
+		"本地 reconcile 已完成：恢复 %d 个过期 job，过期 job lease %d、worker lease %d、worker handoff %d、task quota %d、actor quota %d；未调用外部 provider 或重跑 workflow。",
+		len(result.RecoveredJobs), result.ExpiredJobLeases, result.ExpiredWorkerLeases, len(result.ExpiredWorkerHandoffs), result.ExpiredTaskQuotas, result.ExpiredActorQuotas,
+	)
 }
 
 // ExecuteTaskHubRunHandoff transfers exactly one selected Run to the
@@ -1030,8 +1269,8 @@ func taskHubContinuationTransitionLabel(transition workflowkit.NodeTransition) s
 }
 
 func taskHubContinuationRevisionImpact(snapshot workflowkit.ContinuationPlanSnapshot) string {
-	if snapshot.CandidateRevisionID != "" {
-		return "计划包含候选 revision；仅在最终执行 CAS 成功时提交新版本。"
+	if snapshot.Strategy == workflowkit.StrategyReviseSubject && snapshot.TargetRunRelation == workflowkit.RelationChildRun {
+		return "计划包含候选主体；仅在最终执行 CAS 成功时提交新版本。"
 	}
 	return "当前 TaskRevision 保持不变。"
 }
@@ -1240,7 +1479,7 @@ func targetReviewRequestID(target taskHubResolvedTarget) string {
 func unavailableRunControlPlan(action TaskHubRunControlAction, reason string) TaskHubPlanPreview {
 	return TaskHubPlanPreview{
 		Title:   taskHubRunControlActionLabel(action) + "（不可提交）",
-		Summary: "当前状态下不能生成可提交的运行控制命令；本次调用只读取事实，不会创建 ControlOperation。",
+		Summary: "当前状态下不能生成可提交的 Run 操作；本次调用只读取事实，不会创建 ControlOperation、调用 provider 或重跑 workflow。",
 		Reason:  reason,
 	}
 }
@@ -1267,8 +1506,21 @@ func taskHubRunControlTargetReason(action TaskHubRunControlAction, run store.Wor
 		default:
 			return fmt.Sprintf("Run 当前处于 %s，不能请求终止", run.Status)
 		}
+	case TaskHubRunControlReconcile:
+		if !taskHubRunReconcileEligible(run.Status) {
+			return fmt.Sprintf("Run 当前处于 %s；只有 interrupted 或 in_doubt Run 可以执行本地 reconcile", run.Status)
+		}
 	}
 	return ""
+}
+
+func taskHubRunReconcileEligible(status store.WorkflowRunStatus) bool {
+	switch status {
+	case store.WorkflowRunInterrupted, store.WorkflowRunInDoubt:
+		return true
+	default:
+		return false
+	}
 }
 
 func taskHubRunControlPotentialEffects(action TaskHubRunControlAction) []string {
@@ -1279,6 +1531,11 @@ func taskHubRunControlPotentialEffects(action TaskHubRunControlAction) []string 
 		return []string{"提交后仅会影响选中的 StageAttempt；本次预览不会取消阶段"}
 	case TaskHubRunControlTerminate:
 		return []string{"提交后 worker 会执行目标 scoped 的 graceful termination；本次预览不会终止运行"}
+	case TaskHubRunControlReconcile:
+		return []string{
+			"提交后仅回收所选 Run 的过期本地 durable 状态；本次预览不会修改任何事实。",
+			"不会调用 provider、模型或 Docker，也不会重跑 workflow；未知外部副作用仍保持 in_doubt，须由受控 provider-specific reconciler 处理。",
+		}
 	default:
 		return nil
 	}
@@ -1407,13 +1664,20 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context
 			}
 		}
 	}
+	actions := appTaskHubRunActions(run, attachable, attachReason)
+	if evaluatorAction, applies := adapter.taskHubCodeEdgeEvaluatorRunAction(ctx, services, run); applies {
+		actions = append(actions, evaluatorAction)
+	}
+	if handoffAction, applies := adapter.taskHubCodeEdgeEvaluatorEvidenceHandoffRunAction(ctx, services, run); applies {
+		actions = append(actions, handoffAction)
+	}
 	projection := TaskHubRun{
 		RunID:          run.ID,
 		TaskID:         run.TaskID,
 		RevisionID:     run.RevisionID,
 		ExecutionState: string(run.Status),
 		Active:         taskHubRunIsActive(run.Status),
-		Actions:        appTaskHubRunActions(run, attachable, attachReason),
+		Actions:        actions,
 	}
 	if attachment != nil {
 		projection.WorkerHandoff = taskHubLatestWorkerHandoff(attachment.WorkerHandoffs)
@@ -1436,7 +1700,7 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context
 		projection.Control.StageExecutionState = string(stage.ExecutionStatus)
 	}
 	if services.Control == nil {
-		projection.Control.Actions = appTaskHubRunControlActions(run, stage, false)
+		projection.Control.Actions = appTaskHubRunControlActions(run, stage, false, services.LocalRuntime != nil)
 		return projection, nil
 	}
 	checkpoint, err := services.Control.CurrentCheckpoint(ctx, run.ID)
@@ -1472,7 +1736,7 @@ func (adapter *AppTaskHubLifecycleAdapter) projectTaskHubRun(ctx context.Context
 			}
 		}
 	}
-	projection.Control.Actions = appTaskHubRunControlActions(run, stage, true)
+	projection.Control.Actions = appTaskHubRunControlActions(run, stage, true, services.LocalRuntime != nil)
 	return projection, nil
 }
 
@@ -1853,6 +2117,198 @@ func appTaskHubRunActions(run store.WorkflowRun, attachable bool, attachReason s
 	}
 }
 
+// taskHubCodeEdgeEvaluatorRunAction exposes the evaluator only on a concrete
+// Phase-1 parent Run. Plan is read-only, so this projection can surface the
+// same authoritative gate that the first confirmation will enforce without
+// creating a bundle, child Run, durable job, or provider effect.
+func (adapter *AppTaskHubLifecycleAdapter) taskHubCodeEdgeEvaluatorRunAction(ctx context.Context, services *app.LifecycleServices, run store.WorkflowRun) (TaskHubActionState, bool) {
+	if run.WorkflowTemplateID != workflowadapter.CodeEdgePhase1WorkflowTemplateID ||
+		run.WorkflowTemplateVersion != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion {
+		return TaskHubActionState{}, false
+	}
+	state := TaskHubActionState{Action: TaskHubActionEvaluateCodeEdge}
+	if services == nil || services.EvaluatorLaunches == nil || !services.EvaluatorLaunches.Available() {
+		state.DisabledReason = "当前部署未配置受控 CodeEdge 评测定义"
+		return state, true
+	}
+	if adapter == nil || adapter.runWorkerHandoffLauncher == nil {
+		state.DisabledReason = "当前 Task Hub 未配置受控 CodeEdge 评测 worker launcher"
+		return state, true
+	}
+	if _, err := services.EvaluatorLaunches.Plan(ctx, run.ID); err != nil {
+		state.DisabledReason = taskHubCodeEdgeEvaluatorPlanUnavailableReason(err)
+		return state, true
+	}
+	state.Enabled = true
+	return state, true
+}
+
+// taskHubCodeEdgeEvaluatorEvidenceHandoffRunAction exposes adoption only on a
+// closed evaluator child Run. It never accepts a parent identity from the TUI:
+// the authoritative parent is reloaded from the child's immutable lineage and
+// then validated by the application handoff planner.
+func (adapter *AppTaskHubLifecycleAdapter) taskHubCodeEdgeEvaluatorEvidenceHandoffRunAction(ctx context.Context, services *app.LifecycleServices, run store.WorkflowRun) (TaskHubActionState, bool) {
+	if run.WorkflowTemplateID != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID ||
+		run.WorkflowTemplateVersion != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion {
+		return TaskHubActionState{}, false
+	}
+	state := TaskHubActionState{Action: TaskHubActionAdoptCodeEdgeEvaluatorEvidenceHandoff}
+	if services == nil || services.Mutations == nil {
+		state.DisabledReason = "LifecycleMutationService 不可用"
+		return state, true
+	}
+	if services.EvaluatorEvidenceHandoffs == nil {
+		state.DisabledReason = "CodeEdge evaluator 证据交接服务不可用"
+		return state, true
+	}
+	if run.Status != store.WorkflowRunSucceeded {
+		state.DisabledReason = "只有已成功完成的 CodeEdge evaluator child Run 可以采用证据"
+		return state, true
+	}
+	parent, child, err := adapter.resolveTaskHubCodeEdgeEvaluatorEvidenceHandoffRuns(ctx, services, run.ID)
+	if err != nil {
+		state.DisabledReason = taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err)
+		return state, true
+	}
+	if services.Store() == nil {
+		state.DisabledReason = "CodeEdge evaluator 证据交接存储不可用"
+		return state, true
+	}
+	existing, err := services.Store().GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, parent.ID)
+	if err != nil {
+		state.DisabledReason = "无法读取 Phase-1 父 Run 的既有证据交接"
+		return state, true
+	}
+	if existing != nil {
+		state.DisabledReason = "该 Phase-1 父 Run 已采用一份不可变的 CodeEdge evaluator 证据交接"
+		return state, true
+	}
+	plan, err := services.EvaluatorEvidenceHandoffs.Plan(ctx, parent.ID, child.ID)
+	if err != nil {
+		state.DisabledReason = taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err)
+		return state, true
+	}
+	if plan.ParentRunID != parent.ID || plan.ChildRunID != child.ID || plan.TaskID != parent.TaskID || plan.RevisionID != parent.RevisionID {
+		state.DisabledReason = "CodeEdge evaluator 证据交接计划未绑定所选 child 与其冻结父 Run"
+		return state, true
+	}
+	state.Enabled = true
+	return state, true
+}
+
+// resolveTaskHubCodeEdgeEvaluatorEvidenceHandoffRuns reads the child again
+// from lifecycle services and proves its durable parent relation. Callers only
+// pass the selected child Run ID; this prevents a stale or manually assembled
+// UI target from rebinding valid child evidence to another Phase-1 parent.
+func (adapter *AppTaskHubLifecycleAdapter) resolveTaskHubCodeEdgeEvaluatorEvidenceHandoffRuns(ctx context.Context, services *app.LifecycleServices, childRunID string) (store.WorkflowRun, store.WorkflowRun, error) {
+	if services == nil || services.Runs == nil {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("CodeEdge evaluator run service is not configured")
+	}
+	if err := store.ValidateUUIDv7(strings.TrimSpace(childRunID)); err != nil {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("CodeEdge evaluator child Run: %w", err)
+	}
+	child, err := services.Runs.Get(ctx, childRunID)
+	if err != nil {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("read CodeEdge evaluator child Run: %w", err)
+	}
+	if child.WorkflowTemplateID != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID ||
+		child.WorkflowTemplateVersion != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("selected Run is not a CodeEdge evaluator child")
+	}
+	if child.Status != store.WorkflowRunSucceeded {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("CodeEdge evaluator child Run is not successfully completed")
+	}
+	parentRunID := strings.TrimSpace(child.ParentRunID)
+	if err := store.ValidateUUIDv7(parentRunID); err != nil {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("CodeEdge evaluator child Run has no valid parent Run identity: %w", err)
+	}
+	parent, err := services.Runs.Get(ctx, parentRunID)
+	if err != nil {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("read CodeEdge evaluator parent Run: %w", err)
+	}
+	if parent.WorkflowTemplateID != workflowadapter.CodeEdgePhase1WorkflowTemplateID ||
+		parent.WorkflowTemplateVersion != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("CodeEdge evaluator child Run parent is not a CodeEdge Phase-1 Run")
+	}
+	if parent.TaskID != child.TaskID || parent.RevisionID != child.RevisionID {
+		return store.WorkflowRun{}, store.WorkflowRun{}, fmt.Errorf("CodeEdge evaluator child Run does not share its parent TaskRevision")
+	}
+	return parent, child, nil
+}
+
+// taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason is deliberately
+// coarse. Evidence verification errors can name internal artifacts, managed
+// paths, or deployment facts, none of which should become an operator-facing
+// TUI error string.
+func taskHubCodeEdgeEvaluatorEvidenceHandoffUnavailableReason(err error) string {
+	if err == nil {
+		return "CodeEdge evaluator 证据当前不可采用"
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "must be prepared"):
+		return "CodeEdge evaluator 证据采用必须先完成第一步冻结确认"
+	case strings.Contains(text, "idempotency"), strings.Contains(text, "completed codeedge evaluator evidence handoff"):
+		return "该 CodeEdge evaluator 证据交接已完成或幂等键与既有操作冲突"
+	case strings.Contains(text, "final_review"), strings.Contains(text, "final review"):
+		return "父 Run 的 FinalReview 尚未完成已批准审批"
+	case strings.Contains(text, "parent"), strings.Contains(text, "child run"):
+		return "所选 Run 未形成有效的完成态 CodeEdge evaluator child 到 Phase-1 父 Run 谱系"
+	case strings.Contains(text, "trial"), strings.Contains(text, "artifact"), strings.Contains(text, "evidence"):
+		return "child Run 的 Qwen/Opus 证据或四个逻辑 Trial 尚未完整验证"
+	case strings.Contains(text, "catalog"), strings.Contains(text, "lock"), strings.Contains(text, "manifest"), strings.Contains(text, "frozen"), strings.Contains(text, "binding"):
+		return "父 Run 或 child Run 的冻结 catalog、lock 或执行说明书未通过校验"
+	default:
+		return "CodeEdge evaluator 证据当前不可采用；请检查 child 完成状态、父 Run 审批和受控证据"
+	}
+}
+
+// taskHubCodeEdgeEvaluatorPlanUnavailableReason intentionally maps app-layer
+// failures to operator-safe categories. A definition provider may consult
+// environment-backed credentials at execution time; its raw error must never
+// become a TUI string because it could include deployment-only data.
+func taskHubCodeEdgeEvaluatorPlanUnavailableReason(err error) string {
+	if err == nil {
+		return "受控 CodeEdge 评测当前不可用"
+	}
+	if errors.Is(err, app.ErrCodeEdgeEvaluatorDefinitionUnavailable) {
+		return "当前部署未配置受控 CodeEdge 评测定义"
+	}
+	if errors.Is(err, app.ErrCodeEdgeEvaluatorDefinitionInvalid) {
+		return "受控 CodeEdge 评测定义未通过校验"
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "final_review"), strings.Contains(text, "final review"):
+		return "父 Run 的 FinalReview 尚未完成已批准审批"
+	case strings.Contains(text, "must use"), strings.Contains(text, "parent run"):
+		return "所选 Run 不是可评测的 CodeEdge Phase-1 父 Run"
+	case strings.Contains(text, "catalog"), strings.Contains(text, "operation resolver"), strings.Contains(text, "operation provider"):
+		return "部署 catalog/lock 或受控操作白名单未通过校验"
+	case strings.Contains(text, "managed task snapshot"):
+		return "任务快照不能作为受控评测输入冻结"
+	case strings.Contains(text, "definition"):
+		return "受控 CodeEdge 评测定义未通过校验"
+	default:
+		return "受控 CodeEdge 评测当前不可用；请检查父 Run 审批与部署说明书"
+	}
+}
+
+func taskHubCodeEdgeEvaluatorMutationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "handoff"), strings.Contains(text, "worker launcher"), strings.Contains(text, "child worker"):
+		return errors.New("受控 CodeEdge child worker 未完成启动；可使用相同幂等键重试")
+	case strings.Contains(text, "frozen"), strings.Contains(text, "input bundle"), strings.Contains(text, "no such file"):
+		return errors.New("CodeEdge 评测说明书未冻结或不可用；请重新查看计划后准备")
+	default:
+		return errors.New(taskHubCodeEdgeEvaluatorPlanUnavailableReason(err))
+	}
+}
+
 func taskHubRunCanAttach(status store.WorkflowRunStatus) bool {
 	switch status {
 	case store.WorkflowRunRunning, store.WorkflowRunPauseRequested, store.WorkflowRunPausing,
@@ -1884,13 +2340,27 @@ func taskHubRunCanContinue(status store.WorkflowRunStatus) bool {
 	}
 }
 
-func appTaskHubRunControlActions(run store.WorkflowRun, stage *store.StageAttempt, controlAvailable bool) []TaskHubRunControlActionState {
+func appTaskHubRunControlActions(run store.WorkflowRun, stage *store.StageAttempt, controlAvailable, localRuntimeAvailable bool) []TaskHubRunControlActionState {
 	actions := []TaskHubRunControlActionState{
 		{Action: TaskHubRunControlPause},
 		{Action: TaskHubRunControlCancelStage},
 		{Action: TaskHubRunControlTerminate},
 	}
+	// Reconcile is deliberately not a generic command. The projection exposes
+	// it only for the two durable Run states that already mean reconciliation is
+	// required; normal/active Runs do not render or accept its mnemonic.
+	if taskHubRunReconcileEligible(run.Status) {
+		actions = append(actions, TaskHubRunControlActionState{Action: TaskHubRunControlReconcile})
+	}
 	for index := range actions {
+		if actions[index].Action == TaskHubRunControlReconcile {
+			if !localRuntimeAvailable {
+				actions[index].DisabledReason = "本地 durable runtime 服务不可用"
+				continue
+			}
+			actions[index].Enabled = true
+			continue
+		}
 		if !controlAvailable {
 			actions[index].DisabledReason = "运行控制服务不可用"
 			continue

@@ -73,6 +73,13 @@ func (service *ReviewService) decideReviewGate(ctx context.Context, binding stor
 		strings.TrimSpace(request.ExpectedRevisionDigest) != binding.RevisionDigest {
 		return store.ReviewDecision{}, fmt.Errorf("review decision does not match immutable review gate binding")
 	}
+	// The evaluator-evidence gate is special only at the Harbor application
+	// boundary: its approval is meaningful solely when a verified child-to-
+	// parent handoff exists. Recheck before both a new decision and idempotent
+	// replay; workflowkit itself remains entirely domain-neutral.
+	if _, err := service.core.verifyCodeEdgeEvaluatorEvidenceHandoffGate(ctx, binding); err != nil {
+		return store.ReviewDecision{}, err
+	}
 
 	// Direct application callers without a client idempotency key still get a
 	// stable replay when the gate already has the exact immutable decision.

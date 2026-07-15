@@ -52,6 +52,28 @@ func (p BackoffPolicy) TotalDelay(maxAttempts int) (time.Duration, error) {
 	return total, nil
 }
 
+// RetryDelayBefore returns the frozen delay before the supplied one-based
+// attempt ordinal. Attempt one has no predecessor and therefore has zero
+// delay. A caller cannot obtain an implicit exponential/default backoff from
+// this helper.
+func (p BackoffPolicy) RetryDelayBefore(attempt int) (time.Duration, error) {
+	if attempt < 1 {
+		return 0, fmt.Errorf("%w: retry attempt must be positive", ErrInvalidBudget)
+	}
+	if attempt == 1 {
+		return 0, nil
+	}
+	index := attempt - 2
+	if index >= len(p.RetryDelays) {
+		return 0, fmt.Errorf("%w: retry delay is unavailable for attempt %d", ErrInvalidBudget, attempt)
+	}
+	delay := p.RetryDelays[index]
+	if delay < 0 {
+		return 0, fmt.Errorf("%w: retry delay %d is negative", ErrInvalidBudget, index)
+	}
+	return delay, nil
+}
+
 // ExecutionBudget is a fully resolved execution envelope. Zero IdleTimeout
 // explicitly disables idle detection; all other limits required to admit work
 // must be positive.

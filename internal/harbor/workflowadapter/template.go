@@ -149,13 +149,13 @@ func (budget StageBudget) Clone() StageBudget {
 // production instance because the confirmed policy requires full request
 // budgets instead of defaults.
 type ExecutionProfile struct {
-	Template                 TemplateReference      `json:"template"`
-	ID                       string                 `json:"id"`
-	Version                  string                 `json:"version"`
-	ContinuationPlanTTL      time.Duration          `json:"continuation_plan_ttl"`
-	ControlGracePeriod       time.Duration          `json:"control_grace_period"`
-	CandidateProviderBudget  CandidateProviderBudget `json:"candidate_provider_budget"`
-	Stages                   []StageBudget          `json:"stages"`
+	Template                TemplateReference       `json:"template"`
+	ID                      string                  `json:"id"`
+	Version                 string                  `json:"version"`
+	ContinuationPlanTTL     time.Duration           `json:"continuation_plan_ttl"`
+	ControlGracePeriod      time.Duration           `json:"control_grace_period"`
+	CandidateProviderBudget CandidateProviderBudget `json:"candidate_provider_budget"`
+	Stages                  []StageBudget           `json:"stages"`
 }
 
 // Clone returns an independent profile snapshot.
@@ -254,6 +254,25 @@ func (profile ExecutionProfile) ValidateFor(catalog StageCatalog) error {
 			return fmt.Errorf("%w: execution profile contains unknown Harbor node %q", errInvalidCatalog, key)
 		}
 	}
+	if err := profile.validateCodeEdgeEvaluatorChildPolicy(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (profile ExecutionProfile) validateCodeEdgeEvaluatorChildPolicy() error {
+	if !profile.Template.Equal(CodeEdgeEvaluatorChildTemplateReference()) {
+		return nil
+	}
+	for _, key := range CodeEdgeEvaluatorChildStageOrder() {
+		budget, present := profile.Budget(key)
+		if !present {
+			return fmt.Errorf("%w: CodeEdge evaluator child profile omits stage %q", errInvalidCatalog, key)
+		}
+		if budget.MaxAttempts != 1 {
+			return fmt.Errorf("%w: CodeEdge evaluator child stage %q requires max_attempts=1", errInvalidCatalog, key)
+		}
+	}
 	return nil
 }
 
@@ -293,7 +312,7 @@ type ResolvedWorkflow struct {
 	ExecutionProfileVersion     string                         `json:"execution_profile_version"`
 	ContinuationPlanTTL         time.Duration                  `json:"continuation_plan_ttl"`
 	ControlGracePeriod          time.Duration                  `json:"control_grace_period"`
-	CandidateProviderBudget     CandidateProviderBudget         `json:"candidate_provider_budget"`
+	CandidateProviderBudget     CandidateProviderBudget        `json:"candidate_provider_budget"`
 	TemplateFingerprint         workflowkit.Fingerprint        `json:"template_fingerprint"`
 	ExecutionProfileFingerprint workflowkit.Fingerprint        `json:"execution_profile_fingerprint"`
 	DefinitionFingerprint       workflowkit.Fingerprint        `json:"definition_fingerprint"`

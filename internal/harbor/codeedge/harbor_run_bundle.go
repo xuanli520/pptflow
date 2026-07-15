@@ -351,6 +351,14 @@ func harborRunBundleValidateJobConfigTaskRoot(configPath, taskRoot string) error
 	if err != nil {
 		return fmt.Errorf("%w: read Harbor job config: %v", ErrInvalidHarborRunBundle, err)
 	}
+	return harborRunBundleValidateJobConfigTaskRootJSON(raw, taskRoot)
+}
+
+// harborRunBundleValidateJobConfigTaskRootJSON applies the controlled task
+// root binding to already-captured config bytes. Keeping the parser separate
+// from filesystem I/O lets the complete local-result parser validate the
+// secret-scanned bytes it captures, instead of re-reading a mutable file.
+func harborRunBundleValidateJobConfigTaskRootJSON(raw []byte, taskRoot string) error {
 	root, err := harborRunBundleJSONObject(raw, "Harbor job config")
 	if err != nil {
 		return err

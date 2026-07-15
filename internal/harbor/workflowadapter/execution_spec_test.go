@@ -39,6 +39,48 @@ func TestRunExecutionSpecCoversEveryCatalogStageWithConcreteBinding(t *testing.T
 	}
 }
 
+func TestRunExecutionSpecSupportsAuthoringSessionSubjectWithoutSyntheticTaskRevision(t *testing.T) {
+	spec := testRunExecutionSpec(t)
+	const sourceDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	spec.Selection = RunSelectionReference{
+		Kind:                  RunSelectionAuthoringSession,
+		AuthoringSourceID:     "018f0a73-3b49-7000-8000-000000000010",
+		AuthoringSessionID:    "018f0a73-3b49-7000-8000-000000000011",
+		AuthoringSourceDigest: workflowkit.SubjectDigest(sourceDigest),
+	}
+	for index := range spec.References.Checkouts {
+		spec.References.Checkouts[index].RevisionID = spec.Selection.AuthoringSessionID
+		spec.References.Checkouts[index].RevisionDigest = spec.Selection.AuthoringSourceDigest
+	}
+	if err := spec.Validate(); err != nil {
+		t.Fatalf("validate authoring-session execution spec: %v", err)
+	}
+	binding, err := spec.Selection.SubjectBinding()
+	if err != nil {
+		t.Fatalf("project authoring selection to generic subject: %v", err)
+	}
+	if binding.SubjectID != spec.Selection.AuthoringSourceID || binding.RevisionID != spec.Selection.AuthoringSessionID || binding.Digest != spec.Selection.AuthoringSourceDigest {
+		t.Fatalf("authoring subject binding = %+v", binding)
+	}
+	canonical, err := spec.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonical authoring-session execution spec: %v", err)
+	}
+	decoded, err := ParseRunExecutionSpecJSON(canonical)
+	if err != nil {
+		t.Fatalf("parse canonical authoring-session execution spec: %v", err)
+	}
+	if decoded.Selection.Kind != RunSelectionAuthoringSession || decoded.Selection.TaskID != "" || decoded.Selection.RevisionID != "" {
+		t.Fatalf("decoded authoring selection = %+v", decoded.Selection)
+	}
+
+	mixed := spec.Clone()
+	mixed.Selection.TaskID = "018f0a73-3b49-7000-8000-000000000001"
+	if err := mixed.Validate(); err == nil || !strings.Contains(err.Error(), "cannot contain task-revision") {
+		t.Fatalf("mixed selection validation = %v, want closed-union failure", err)
+	}
+}
+
 func TestRunExecutionSpecRejectsMissingBindingAndPluginDrift(t *testing.T) {
 	missing := testRunExecutionSpec(t)
 	missing.Stages = missing.Stages[:len(missing.Stages)-1]
@@ -575,6 +617,8 @@ func bindingForTest(t *testing.T, base StageBindingBase) StageExecutionBinding {
 		return HarborRunQwenBinding{StageBindingBase: base}
 	case StageBindingHarborRunOpus:
 		return HarborRunOpusBinding{StageBindingBase: base}
+	case StageBindingEvaluatorEvidenceHandoff:
+		return EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
 	case StageBindingResultReview:
 		return ResultReviewBinding{StageBindingBase: base}
 	case StageBindingSubmissionLint:
@@ -641,6 +685,8 @@ func bindingTypeForTest(key workflowkit.StageKey) StageBindingType {
 		return StageBindingHarborRunQwen
 	case "harbor_run_opus":
 		return StageBindingHarborRunOpus
+	case "evaluator_evidence_handoff":
+		return StageBindingEvaluatorEvidenceHandoff
 	case "result_review":
 		return StageBindingResultReview
 	case "submission_lint":

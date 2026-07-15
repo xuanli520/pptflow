@@ -65,7 +65,7 @@ func newRepairLoopFixture(t *testing.T, maxRounds int) repairLoopFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func newRepairLoopFixture(t *testing.T, maxRounds int) repairLoopFixture {
 	if _, err := services.Continuations.ExecuteTaskContinuation(ctx, plan.ID()); err != nil {
 		t.Fatalf("commit first repair candidate: %v", err)
 	}
-	candidate, err := database.GetRevisionCandidate(ctx, plan.Snapshot().CandidateRevisionID)
+	candidate, err := database.GetRevisionCandidateByFrozenPlan(ctx, plan.ID())
 	if err != nil || candidate == nil {
 		t.Fatalf("load first repair candidate = %+v, %v", candidate, err)
 	}
@@ -208,7 +208,7 @@ func TestRepairLoopQueuesBoundSecondRoundAndReplaysIdempotently(t *testing.T) {
 	if err != nil || command == nil || command.CommandKey != automaticRepairCommandKey(fixture.session.ID, 2) {
 		t.Fatalf("round two continuation command = %+v, %v", command, err)
 	}
-	if plan, err := fixture.services.Continuations.GetTaskContinuationPlan(ctx, result.PlanID); err != nil || plan.Snapshot().CandidateRevisionID != result.Candidate.ID {
+	if plan, err := fixture.services.Continuations.GetTaskContinuationPlan(ctx, result.PlanID); err != nil || result.Candidate.FrozenPlanID != plan.ID() {
 		t.Fatalf("round two frozen plan = %+v, %v", plan, err)
 	}
 

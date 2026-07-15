@@ -15,20 +15,17 @@ type aggregatedDeltaLog struct {
 }
 
 func formatAggregatedDeltaLogLine(log aggregatedDeltaLog) string {
-	starts, ends := staticReviewMarkerCounts(log.text)
 	return fmt.Sprintf(
-		"JSON-RPC notification item/agentMessage/delta aggregated turn=%s item=%s total_bytes=%d delta_sha256=%s contract_starts=%d contract_ends=%d text_prefix=%q\n",
+		"JSON-RPC notification item/agentMessage/delta aggregated turn=%s item=%s total_bytes=%d delta_sha256=%s text_prefix=%q\n",
 		compactAppServerLogID(log.turnID),
 		compactAppServerLogID(log.itemID),
 		len(log.text),
 		shortAppServerLogHash(log.text),
-		starts,
-		ends,
 		truncateAppServerLogValue(prefixRunes(log.text, 10)),
 	)
 }
 
-func (s *appServerCodexReviewSession) aggregatedDeltaLogForItem(itemID string) (aggregatedDeltaLog, bool) {
+func (s *appServerSession) aggregatedDeltaLogForItem(itemID string) (aggregatedDeltaLog, bool) {
 	itemID = strings.TrimSpace(itemID)
 	if itemID == "" {
 		return aggregatedDeltaLog{}, false
@@ -49,7 +46,7 @@ func (s *appServerCodexReviewSession) aggregatedDeltaLogForItem(itemID string) (
 	return aggregatedDeltaLog{turnID: s.turnID, itemID: itemID, text: text}, true
 }
 
-func (s *appServerCodexReviewSession) logAggregatedDelta(itemID string) {
+func (s *appServerSession) logAggregatedDelta(itemID string) {
 	log, ok := s.aggregatedDeltaLogForItem(itemID)
 	if !ok {
 		return
@@ -57,7 +54,7 @@ func (s *appServerCodexReviewSession) logAggregatedDelta(itemID string) {
 	s.appendLog(formatAggregatedDeltaLogLine(log))
 }
 
-func (s *appServerCodexReviewSession) remainingAggregatedDeltaLogs() []aggregatedDeltaLog {
+func (s *appServerSession) remainingAggregatedDeltaLogs() []aggregatedDeltaLog {
 	s.mu.Lock()
 	if s.deltaLogged == nil {
 		s.deltaLogged = map[string]bool{}
@@ -77,7 +74,7 @@ func (s *appServerCodexReviewSession) remainingAggregatedDeltaLogs() []aggregate
 	return logs
 }
 
-func (s *appServerCodexReviewSession) logRemainingAggregatedDeltas() {
+func (s *appServerSession) logRemainingAggregatedDeltas() {
 	for _, log := range s.remainingAggregatedDeltaLogs() {
 		s.appendLog(formatAggregatedDeltaLogLine(log))
 	}
@@ -138,7 +135,7 @@ func appendOutputBounded(current, addition string, limit int) (string, string, b
 	return current + appended, appended, true
 }
 
-func (s *appServerCodexReviewSession) emitDeltaUpdate(update Update, ok bool) {
+func (s *appServerSession) emitDeltaUpdate(update Update, ok bool) {
 	if !ok {
 		return
 	}
@@ -150,7 +147,7 @@ func (s *appServerCodexReviewSession) emitDeltaUpdate(update Update, ok bool) {
 	}
 }
 
-func (s *appServerCodexReviewSession) recordItemActivity(turnID, itemID, itemType string, raw json.RawMessage, done bool) {
+func (s *appServerSession) recordItemActivity(turnID, itemID, itemType string, raw json.RawMessage, done bool) {
 	itemType = strings.TrimSpace(itemType)
 	if itemType == "" || itemType == "userMessage" {
 		return
@@ -260,7 +257,7 @@ func appServerStringAtPath(raw json.RawMessage, path ...string) string {
 	}
 }
 
-func (s *appServerCodexReviewSession) recordDelta(turnID, itemID, delta string) {
+func (s *appServerSession) recordDelta(turnID, itemID, delta string) {
 	if strings.TrimSpace(itemID) == "" {
 		return
 	}
@@ -312,7 +309,7 @@ func (s *appServerCodexReviewSession) recordDelta(turnID, itemID, delta string) 
 	s.emitDeltaUpdate(update, emit)
 }
 
-func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text string) {
+func (s *appServerSession) recordCompletedItem(turnID, itemID, text string) {
 	if strings.TrimSpace(itemID) == "" {
 		return
 	}
@@ -362,7 +359,7 @@ func (s *appServerCodexReviewSession) recordCompletedItem(turnID, itemID, text s
 	s.emitDeltaUpdate(update, hadPreview || storedText != "" || outputTruncated)
 }
 
-func (s *appServerCodexReviewSession) finalReportLocked() string {
+func (s *appServerSession) finalReportLocked() string {
 	if len(s.itemOrder) == 0 {
 		for id := range s.items {
 			s.itemOrder = append(s.itemOrder, id)

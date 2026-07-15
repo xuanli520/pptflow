@@ -114,16 +114,9 @@ func (m *model) mouseTargets() []mouseTarget {
 			return m.updateRunControlKey(mouseKey("enter"))
 		})
 		if m.runControl.lifecycleControlAvailable() {
-			for _, choice := range []struct {
-				marker string
-				action TaskHubRunControlAction
-			}{
-				{"[P] 暂停运行", TaskHubRunControlPause},
-				{"[K] 取消选中阶段", TaskHubRunControlCancelStage},
-				{"[S] 终止本次运行", TaskHubRunControlTerminate},
-			} {
-				choice := choice
-				add(choice.marker, func() tea.Cmd {
+			for _, option := range m.runControl.choices() {
+				choice := option
+				add(choice.label, func() tea.Cmd {
 					m.runControl.selectAction(choice.action)
 					return nil
 				})

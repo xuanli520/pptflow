@@ -72,6 +72,25 @@ func (function AgentTurnOperationExecutorFunc) ExecuteAgentTurn(ctx context.Cont
 	return function(ctx, invocation.clone(), payload)
 }
 
+// HarborBuiltinOperationExecutor executes one explicitly registered
+// Go-controlled Harbor Flow operation. Unlike LocalCommandOperationExecutor,
+// it receives no executable path, argv, environment, or shell surface. Its
+// exact handler identity is frozen by HarborBuiltinOperationPayload and its
+// linker-bound implementation is proven by the deployment lock attestor.
+type HarborBuiltinOperationExecutor interface {
+	ExecuteHarborBuiltin(context.Context, StageOperationInvocation, workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error)
+}
+
+// HarborBuiltinOperationExecutorFunc is the function adapter for a typed
+// Harbor-built-in executor. Keeping it separate from LocalCommandOperationExecutor
+// makes accidental use of an external command path impossible at this boundary.
+type HarborBuiltinOperationExecutorFunc func(context.Context, StageOperationInvocation, workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error)
+
+// ExecuteHarborBuiltin invokes the adapted built-in operation callback.
+func (function HarborBuiltinOperationExecutorFunc) ExecuteHarborBuiltin(ctx context.Context, invocation StageOperationInvocation, payload workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error) {
+	return function(ctx, invocation.clone(), payload)
+}
+
 // TypedWorkflowkitOperationHandlers installs the capability-specific
 // executors supported by one controlled provider. A provider cannot resolve a
 // registered payload kind whose executor is absent.
@@ -79,6 +98,7 @@ type TypedWorkflowkitOperationHandlers struct {
 	LocalCommand     LocalCommandOperationExecutor
 	ContainerCommand ContainerCommandOperationExecutor
 	AgentTurn        AgentTurnOperationExecutor
+	HarborBuiltin    HarborBuiltinOperationExecutor
 }
 
 // TypedWorkflowkitStageOperationRegistration describes an exact stage
@@ -96,8 +116,9 @@ type TypedWorkflowkitStageOperationProviderConfig struct {
 }
 
 // TypedWorkflowkitStageOperationProvider implements a controlled operation
-// catalog for local.command, container.command, and agent.turn. The catalog
-// stores canonical payload bytes and rejects any identity or payload drift.
+// catalog for local.command, container.command, agent.turn, and
+// harbor.builtin. The catalog stores canonical payload bytes and rejects any
+// identity or payload drift.
 type TypedWorkflowkitStageOperationProvider struct {
 	handlers   TypedWorkflowkitOperationHandlers
 	operations map[staticOperationKey]typedWorkflowkitOperation
@@ -173,6 +194,10 @@ func validateTypedPayloadHandler(payload workflowadapter.StageOperationPayload, 
 		if isNilAgentTurnOperationExecutor(handlers.AgentTurn) {
 			return fmt.Errorf("%w: agent.turn executor is not configured", ErrStageOperationUnavailable)
 		}
+	case workflowadapter.HarborBuiltinOperationPayload:
+		if isNilHarborBuiltinOperationExecutor(handlers.HarborBuiltin) {
+			return fmt.Errorf("%w: harbor.builtin executor is not configured", ErrStageOperationUnavailable)
+		}
 	default:
 		return fmt.Errorf("%w: typed provider does not support payload %T", ErrStageOperationUnavailable, payload)
 	}
@@ -197,6 +222,8 @@ func (executor typedWorkflowkitStageExecutor) ExecuteStage(ctx context.Context, 
 		return executor.handlers.ContainerCommand.ExecuteContainerCommand(ctx, invocation, cloneContainerCommandPayload(payload))
 	case workflowadapter.AgentTurnOperationPayload:
 		return executor.handlers.AgentTurn.ExecuteAgentTurn(ctx, invocation, payload)
+	case workflowadapter.HarborBuiltinOperationPayload:
+		return executor.handlers.HarborBuiltin.ExecuteHarborBuiltin(ctx, invocation, payload)
 	default:
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("%w: typed provider cannot execute payload %T", ErrInvalidStageOperation, payload)
 	}
@@ -221,6 +248,10 @@ func isNilContainerCommandOperationExecutor(executor ContainerCommandOperationEx
 }
 
 func isNilAgentTurnOperationExecutor(executor AgentTurnOperationExecutor) bool {
+	return isNilInterface(executor)
+}
+
+func isNilHarborBuiltinOperationExecutor(executor HarborBuiltinOperationExecutor) bool {
 	return isNilInterface(executor)
 }
 

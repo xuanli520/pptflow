@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 func TestTaskHubReviewConfirmationEscLeavesRealSQLiteUntouched(t *testing.T) {
@@ -101,6 +102,139 @@ func TestTaskHubReviewConfirmationRetriesWithSameKeyAgainstRealSQLite(t *testing
 	if len(decisions) != 1 || decisions[0].ID != key {
 		t.Fatalf("retry created duplicate or changed decision: %+v", decisions)
 	}
+}
+
+func TestTaskHubCodeEdgeEvaluatorTwoPhaseConfirmationRetriesLostReplyWithoutSecondWorker(t *testing.T) {
+	ctx, services, _, task, revision, parent := newTaskHubCodeEdgeEvaluatorFixture(t)
+	parent = taskHubApproveCodeEdgeFinalReviewGate(t, ctx, services, parent, revision)
+	launcher := &recordingTaskHubRunWorkerLauncher{}
+	adapter := &lateReplyTaskHubAdapter{
+		AppTaskHubLifecycleAdapter: NewAppTaskHubLifecycleAdapterWithRunWorkerHandoffLauncher(services, launcher),
+		failFirstMutationReply:     true,
+	}
+	m, cleanup := newTestTaskHubV2Model(t, adapter)
+	defer cleanup()
+	m.taskHub.SelectedTaskID = task.ID
+	m.taskHub.SelectedRunID = parent.ID
+
+	updated, _ := m.Update(runeKey("x"))
+	m = updated.(model)
+	updated, planCommand := m.Update(runeKey("e"))
+	m = updated.(model)
+	if planCommand == nil {
+		t.Fatal("x e did not request a CodeEdge evaluator plan")
+	}
+	updated, _ = m.Update(planCommand())
+	m = updated.(model)
+	if m.taskHubPlan == nil || m.taskHubPlanCommand == nil || m.taskHubPlanCommand.Action != TaskHubActionEvaluateCodeEdge ||
+		m.taskHubPlanCommand.Target.RunID != parent.ID || !m.taskHubPlan.ConfirmationNeeded {
+		t.Fatalf("CodeEdge evaluator plan did not bind the approved parent Run: plan=%+v command=%+v", m.taskHubPlan, m.taskHubPlanCommand)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if m.taskHubMutation == nil || m.taskHubMutation.Action != TaskHubActionEvaluateCodeEdge {
+		t.Fatalf("CodeEdge evaluator confirmation form was not opened: %+v", m.taskHubMutation)
+	}
+	m.taskHubMutation.ReasonInput.SetValue("run the approved CodeEdge evaluator")
+	key := m.taskHubMutation.IdempotencyKey
+	if err := store.ValidateUUIDv7(key); err != nil {
+		t.Fatalf("TUI evaluator idempotency key %q is not UUIDv7: %v", key, err)
+	}
+
+	updated, prepareCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if prepareCommand == nil {
+		t.Fatal("first evaluator confirmation did not create a prepare command")
+	}
+	updated, _ = m.Update(prepareCommand())
+	m = updated.(model)
+	if m.taskHubMutation == nil || !m.taskHubMutation.isFrozen() || m.taskHubMutation.IdempotencyKey != key ||
+		m.taskHubMutation.FrozenReason != "run the approved CodeEdge evaluator" || m.taskHubMutation.Preview.PlanID != "codeedge-evaluator:"+key {
+		t.Fatalf("evaluator prepare did not freeze the original confirmation: %+v", m.taskHubMutation)
+	}
+	runs, err := services.Store().ListWorkflowRunsForTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].ID != parent.ID {
+		t.Fatalf("evaluator prepare created a child Run: %+v", runs)
+	}
+	if launches := launcher.launchRequests(); len(launches) != 0 {
+		t.Fatalf("evaluator prepare launched a worker: %+v", launches)
+	}
+
+	updated, firstConfirmCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if firstConfirmCommand == nil {
+		t.Fatal("second evaluator confirmation did not create a launch command")
+	}
+	updated, _ = m.Update(firstConfirmCommand())
+	m = updated.(model)
+	if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != key || m.taskHubMutation.Error == "" || !m.taskHubMutation.isFrozen() {
+		t.Fatalf("lost evaluator response did not retain the frozen retry form: %+v", m.taskHubMutation)
+	}
+	runs, err = services.Store().ListWorkflowRunsForTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := taskHubEvaluatorChildRunForParent(t, runs, parent.ID)
+	if child.WorkflowTemplateID != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID ||
+		child.WorkflowTemplateVersion != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion || child.ParentRunID != parent.ID {
+		t.Fatalf("evaluator child Run did not preserve closed parent/template identity: %+v", child)
+	}
+	jobs, err := services.Store().ListDurableJobsForRun(ctx, child.ID)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("evaluator child durable jobs = %+v, %v; want one", jobs, err)
+	}
+	handoffs, err := services.Store().ListRunWorkerHandoffsForRun(ctx, child.ID)
+	if err != nil || len(handoffs) != 1 || handoffs[0].State != store.RunWorkerHandoffLaunching {
+		t.Fatalf("evaluator child durable handoffs = %+v, %v; want one launched handoff", handoffs, err)
+	}
+	if launches := launcher.launchRequests(); len(launches) != 1 || launches[0].RunID != child.ID {
+		t.Fatalf("first evaluator confirmation launches = %+v, want exactly one child worker", launches)
+	}
+
+	updated, retryCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if retryCommand == nil {
+		t.Fatal("lost evaluator response did not retain retry command")
+	}
+	updated, _ = m.Update(retryCommand())
+	m = updated.(model)
+	if m.taskHubMutation != nil {
+		t.Fatalf("idempotent evaluator retry did not close confirmation: %+v", m.taskHubMutation)
+	}
+	if launches := launcher.launchRequests(); len(launches) != 1 {
+		t.Fatalf("evaluator retry launched another child worker: %+v", launches)
+	}
+	runs, err = services.Store().ListWorkflowRunsForTask(ctx, task.ID)
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("evaluator retry created duplicate child Run: %+v, %v", runs, err)
+	}
+	handoffs, err = services.Store().ListRunWorkerHandoffsForRun(ctx, child.ID)
+	if err != nil || len(handoffs) != 1 {
+		t.Fatalf("evaluator retry created duplicate handoff: %+v, %v", handoffs, err)
+	}
+}
+
+func taskHubEvaluatorChildRunForParent(t *testing.T, runs []store.WorkflowRun, parentRunID string) store.WorkflowRun {
+	t.Helper()
+	var child *store.WorkflowRun
+	for index := range runs {
+		if runs[index].ParentRunID != parentRunID {
+			continue
+		}
+		if child != nil {
+			t.Fatalf("multiple evaluator child Runs for parent %s: %+v", parentRunID, runs)
+		}
+		candidate := runs[index]
+		child = &candidate
+	}
+	if child == nil {
+		t.Fatalf("no evaluator child Run for parent %s: %+v", parentRunID, runs)
+	}
+	return *child
 }
 
 func TestTaskHubDetailSelectedReviewExecutesOnlyCapturedReviewAgainstRealSQLite(t *testing.T) {
@@ -402,6 +536,93 @@ func TestTaskHubRunControlConfirmationCarriesCapturedCheckpoint(t *testing.T) {
 	}
 	if command.Reason != "pause before inspection" || command.Actor == "" || command.IdempotencyKey == "" {
 		t.Fatalf("run-control confirmation omitted required input: %+v", command)
+	}
+}
+
+func TestTaskHubRunControlReconcileRequiresConfirmationAndRetainsUUIDv7KeyForRetry(t *testing.T) {
+	snapshot := enabledTaskHubSnapshot()
+	snapshot.Runs[0].ExecutionState = string(store.WorkflowRunInDoubt)
+	snapshot.Runs[0].Control.Actions = append(snapshot.Runs[0].Control.Actions, TaskHubRunControlActionState{
+		Action: TaskHubRunControlReconcile, Enabled: true,
+	})
+	service := &fakeTaskHubLifecycle{
+		snapshot: snapshot,
+		controlPlan: TaskHubPlanPreview{
+			Title:              "本地 reconcile 影响预览",
+			Summary:            "确认后只恢复本地 durable 状态",
+			ConfirmationNeeded: true,
+		},
+	}
+	m, cleanup := newTestTaskHubV2Model(t, service)
+	defer cleanup()
+	m.openRunControl()
+
+	updated, selectCommand := m.Update(runeKey("r"))
+	m = updated.(model)
+	if selectCommand != nil || m.runControl == nil || m.runControl.SelectedAction != TaskHubRunControlReconcile || service.controlMutationCallCount() != 0 {
+		t.Fatalf("reconcile selection performed work before preview: overlay=%+v command=%v mutations=%d", m.runControl, selectCommand, service.controlMutationCallCount())
+	}
+	updated, previewCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if previewCommand == nil || service.controlPlanCallCount() != 0 || service.controlMutationCallCount() != 0 {
+		t.Fatalf("reconcile Enter did not defer a read-only preview: plan=%d mutations=%d command=%v", service.controlPlanCallCount(), service.controlMutationCallCount(), previewCommand)
+	}
+	updated, _ = m.Update(previewCommand())
+	m = updated.(model)
+	if m.runControl == nil || m.runControl.Preview == nil || !m.runControl.Preview.ConfirmationNeeded || service.controlMutationCallCount() != 0 {
+		t.Fatalf("reconcile preview was not retained before confirmation: overlay=%+v mutations=%d", m.runControl, service.controlMutationCallCount())
+	}
+	if planned := service.lastControlPlanCommand(); planned.Action != TaskHubRunControlReconcile || planned.Target.RunID != snapshot.Runs[0].RunID {
+		t.Fatalf("reconcile preview target/action = %+v", planned)
+	}
+	updated, confirmationCommand := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if confirmationCommand != nil || m.taskHubMutation == nil || !m.taskHubMutation.isRunControl() || m.taskHubMutation.ControlAction != TaskHubRunControlReconcile {
+		t.Fatalf("reconcile preview did not open native confirmation: command=%v form=%+v", confirmationCommand, m.taskHubMutation)
+	}
+	m.taskHubMutation.ReasonInput.SetValue("recover selected local durable facts")
+	key := m.taskHubMutation.IdempotencyKey
+	if err := store.ValidateUUIDv7(key); err != nil {
+		t.Fatalf("reconcile confirmation key %q is not UUIDv7: %v", key, err)
+	}
+
+	service.mu.Lock()
+	service.err = errors.New("simulated response loss after local reconcile")
+	service.mu.Unlock()
+	updated, firstExecute := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if firstExecute == nil {
+		t.Fatal("reconcile confirmation did not defer execution")
+	}
+	updated, _ = m.Update(firstExecute())
+	m = updated.(model)
+	if m.taskHubMutation == nil || m.taskHubMutation.IdempotencyKey != key || m.taskHubMutation.ReasonInput.Value() != "recover selected local durable facts" || m.taskHubMutation.Error == "" {
+		t.Fatalf("failed reconcile response did not retain retryable form/key: %+v", m.taskHubMutation)
+	}
+
+	service.mu.Lock()
+	service.err = nil
+	service.mu.Unlock()
+	updated, retryExecute := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if retryExecute == nil {
+		t.Fatal("reconcile retry did not defer execution")
+	}
+	updated, _ = m.Update(retryExecute())
+	m = updated.(model)
+	if m.taskHubMutation != nil {
+		t.Fatalf("successful reconcile retry did not close confirmation: %+v", m.taskHubMutation)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.controlMutations) != 2 {
+		t.Fatalf("reconcile execution calls = %d, want two retries", len(service.controlMutations))
+	}
+	for _, command := range service.controlMutations {
+		if command.Action != TaskHubRunControlReconcile || command.Target.RunID != snapshot.Runs[0].RunID || command.IdempotencyKey != key ||
+			command.Reason != "recover selected local durable facts" || command.Actor == "" {
+			t.Fatalf("reconcile retry lost its confirmed input: %+v", command)
+		}
 	}
 }
 

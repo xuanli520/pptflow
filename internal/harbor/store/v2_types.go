@@ -78,6 +78,16 @@ const (
 	WorkflowRunInDoubt             WorkflowRunStatus = "in_doubt"
 )
 
+// WorkflowRunSubjectKind distinguishes an ordinary immutable task-revision
+// execution from the pre-materialization source/session subject used only by
+// Standard task authoring. A run is always exactly one of these kinds.
+type WorkflowRunSubjectKind string
+
+const (
+	WorkflowRunSubjectTaskRevision     WorkflowRunSubjectKind = "task_revision"
+	WorkflowRunSubjectAuthoringSession WorkflowRunSubjectKind = "authoring_session"
+)
+
 type StageExecutionStatus string
 
 const (
@@ -294,8 +304,13 @@ type TransitionTaskRevisionStateRequest struct {
 
 type WorkflowRun struct {
 	ID                      string
+	SubjectKind             WorkflowRunSubjectKind
+	SubjectID               string
+	SubjectRevisionID       string
+	SubjectDigest           string
 	TaskID                  string
 	RevisionID              string
+	AuthoringSessionID      string
 	WorkflowTemplateID      string
 	WorkflowTemplateVersion string
 	ResolvedProfileHash     string

@@ -186,7 +186,6 @@ type ExpireRevisionCandidateRequest struct {
 type CommitRevisionCandidateContinuationRequest struct {
 	ID             string
 	PlanID         string
-	CandidateID    string
 	IdempotencyKey string
 	PayloadJSON    string
 	Expected       ControlCheckpointRef
@@ -198,7 +197,6 @@ type CommitRevisionCandidateContinuationRequest struct {
 	Reason         string
 	Priority       int
 }
-
 
 type RevisionCandidateContinuationCommit struct {
 	Candidate RevisionCandidate

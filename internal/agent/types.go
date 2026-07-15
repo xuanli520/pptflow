@@ -1,8 +1,8 @@
 // Package agent defines the narrow, replaceable conversation port used by
-// Harbor-owned stage executors and change providers.
+// application-owned stage executors and change providers.
 //
-// It deliberately does not depend on workflowkit or a concrete Agent SDK:
-// runtime adapters own process, provider, and sandbox implementation details.
+// It deliberately depends only on the standard library rather than a concrete
+// Agent SDK; runtime adapters own process, provider, and sandbox details.
 package agent
 
 import "context"
@@ -65,11 +65,46 @@ type TurnResult struct {
 	Warnings   []string   `json:"warnings,omitempty"`
 }
 
+// TurnUpdate is one best-effort live update produced while an Agent turn is
+// running. It is intentionally provider-neutral: callers can present partial
+// text and item completion without depending on a provider event protocol.
+// The final TurnResult remains the durable result of the turn.
+type TurnUpdate struct {
+	TurnID    string `json:"turn_id,omitempty"`
+	ItemID    string `json:"item_id,omitempty"`
+	Delta     string `json:"delta,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Done      bool   `json:"done,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
+
+// TurnUpdateHandler receives best-effort live turn updates. Implementations
+// invoke it synchronously with their provider event stream; callers should
+// keep it bounded and safe for repeated or partial updates.
+type TurnUpdateHandler func(TurnUpdate)
+
 // Conversation owns one ephemeral provider session. Callers must close it
 // after their final Turn.
 type Conversation interface {
 	Turn(context.Context, TurnRequest) (TurnResult, error)
 	Close() error
+}
+
+// StreamingConversation is an optional capability for conversations that can
+// deliver live updates while a turn runs. It extends, rather than changes, the
+// base Conversation contract so runtimes without streaming remain compatible.
+type StreamingConversation interface {
+	Conversation
+	TurnStream(context.Context, TurnRequest, TurnUpdateHandler) (TurnResult, error)
+}
+
+// SteerableConversation is an optional capability for a caller to send live
+// guidance to an active turn. The guidance is ephemeral control input; the
+// base Conversation contract remains usable by runtimes that do not support
+// live steering.
+type SteerableConversation interface {
+	Conversation
+	Steer(context.Context, string) error
 }
 
 // Runtime opens isolated Agent conversations. Implementations must not share

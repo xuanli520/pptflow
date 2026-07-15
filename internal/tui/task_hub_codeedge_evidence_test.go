@@ -11,6 +11,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/internal/testsupport"
 )
 
 func TestTaskHubCodeEdgeEvidenceRowsUseExactImmutableRefsAndWarnFailClosed(t *testing.T) {
@@ -45,6 +46,35 @@ func TestTaskHubCodeEdgeEvidenceRowsUseExactImmutableRefsAndWarnFailClosed(t *te
 		if strings.Contains(rendered, unexpected) {
 			t.Fatalf("CodeEdge evidence rows accepted stale or mismatched ref %q:\n%s", unexpected, rendered)
 		}
+	}
+}
+
+func TestTaskHubCodeEdgeParentShowsHandoffInsteadOfChildOwnedQwenOpusStages(t *testing.T) {
+	detail := taskHubDetailFixture()
+	parent := &detail.Runs[0]
+	parent.WorkflowTemplateID = workflowadapter.CodeEdgePhase1WorkflowTemplateID
+	parent.WorkflowTemplateVer = workflowadapter.CodeEdgePhase1WorkflowTemplateVersion
+	// Deliberately retain a stale-looking Qwen stage: parent rendering must not
+	// reinterpret it as current evaluator evidence after the child split.
+	parent.Stages = []TaskHubStageFact{{
+		StageAttemptID: "stale-parent-qwen", StageKey: workflowadapter.HarborRunQwen, StageGroup: "evaluation", ExecutionState: string(store.StageExecutionCompleted),
+	}}
+	detail.CodeEdgeEvaluatorEvidenceHandoffs = []TaskHubCodeEdgeEvaluatorEvidenceHandoffFact{{
+		ParentRunID: parent.RunID, State: TaskHubCodeEdgeEvaluatorEvidenceHandoffRecorded,
+		HandoffID: "019f6207-2345-7000-8000-000000000001", ChildRunID: "019f6207-2345-7000-8000-000000000002",
+		HandoffFingerprint: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}}
+	overlay := newTaskHubDetailOverlay(TaskHubDetailQuery{TaskID: detail.Task.TaskID, RunID: parent.RunID})
+	overlay.Loading = false
+	overlay.Detail = detail
+	rendered := strings.Join(overlay.evaluationEvidenceRows(parent.RunID), "\n")
+	for _, required := range []string{"CodeEdge evaluator evidence handoff", "evaluator child Run：019f6207-2345-7000-8000-000000000002", "handoff fingerprint：sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"} {
+		if !strings.Contains(rendered, required) {
+			t.Fatalf("parent handoff rows omitted %q:\n%s", required, rendered)
+		}
+	}
+	if strings.Contains(rendered, "stale-parent-qwen") || strings.Contains(rendered, "Qwen Harbor 运行") {
+		t.Fatalf("parent evidence rows rendered child-owned evaluator stages:\n%s", rendered)
 	}
 }
 
@@ -87,8 +117,16 @@ func TestTaskHubCodeEdgeEvidenceDetailOnlyReadsAndNeverPlansLifecycleAction(t *t
 
 func TestAppTaskHubDetailAdapterProjectsCodeEdgeEvidenceFromSQLite(t *testing.T) {
 	ctx, services, task, revision := newTaskHubLocalPackageMutationFixture(t)
-	run := taskHubCreateCodeEdgePackageRun(t, ctx, services, task, revision)
-	var err error
+	parent := taskHubCreateCodeEdgePackageRun(t, ctx, services, task, revision)
+	run, err := services.Runs.StartRun(ctx, app.StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, ParentRunID: parent.ID,
+		Profile:       taskHubAdapterCompleteProfileForTemplate(t, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplate()),
+		ExecutionSpec: testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
+		Trigger:       "task-hub-codeedge-evidence-child", Actor: "tester", Reason: "create CodeEdge evaluator child evidence fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	run, err = services.Store().TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
 		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning,
 		Actor: "tester", Reason: "start CodeEdge evidence fixture",
@@ -139,7 +177,14 @@ func TestAppTaskHubDetailAdapterProjectsCodeEdgeEvidenceFromSQLite(t *testing.T)
 	if err != nil {
 		t.Fatalf("query CodeEdge evidence detail from SQLite: %v", err)
 	}
-	if len(detail.Runs) != 1 || detail.Runs[0].RunID != run.ID || detail.Runs[0].Status != string(store.WorkflowRunInDoubt) || len(detail.Runs[0].Stages) != 2 {
+	var childProjection *TaskHubRunFact
+	for index := range detail.Runs {
+		if detail.Runs[index].RunID == run.ID {
+			childProjection = &detail.Runs[index]
+			break
+		}
+	}
+	if len(detail.Runs) != 2 || childProjection == nil || childProjection.ParentRunID != parent.ID || childProjection.Status != string(store.WorkflowRunInDoubt) || len(childProjection.Stages) != 2 {
 		t.Fatalf("SQLite CodeEdge Run/stage projection = %+v", detail.Runs)
 	}
 	artifactRefCount := 0
@@ -149,7 +194,13 @@ func TestAppTaskHubDetailAdapterProjectsCodeEdgeEvidenceFromSQLite(t *testing.T)
 	if len(detail.Artifacts) != 2 || artifactRefCount != 6 {
 		t.Fatalf("SQLite CodeEdge artifact projection = %+v", detail.Artifacts)
 	}
-	if len(detail.FrozenExecutions) != 1 || detail.FrozenExecutions[0].State != TaskHubFrozenExecutionBound {
+	childFrozen := false
+	for _, frozen := range detail.FrozenExecutions {
+		if frozen.RunID == run.ID && frozen.State == TaskHubFrozenExecutionBound && frozen.TemplateID == workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID {
+			childFrozen = true
+		}
+	}
+	if len(detail.FrozenExecutions) != 2 || !childFrozen {
 		t.Fatalf("SQLite CodeEdge frozen execution projection = %+v", detail.FrozenExecutions)
 	}
 
@@ -196,8 +247,12 @@ func TestAppTaskHubDetailAdapterProjectsCodeEdgeEvidenceFromSQLite(t *testing.T)
 func taskHubCodeEdgeEvidenceDetailFixture() TaskHubDetail {
 	detail := taskHubDetailFixture()
 	detail.Runs[0].Status = string(store.WorkflowRunInDoubt)
-	detail.Runs[0].WorkflowTemplateID = workflowadapter.CodeEdgePhase1WorkflowTemplateID
-	detail.Runs[0].WorkflowTemplateVer = workflowadapter.CodeEdgePhase1WorkflowTemplateVersion
+	// Qwen and Opus are owned by the closed evaluator child, never by the
+	// Phase-1 parent. Keep this fixture on the child topology so the TUI cannot
+	// accidentally regress to showing fabricated parent-owned evaluator stages.
+	detail.Runs[0].ParentRunID = "parent-codeedge-run"
+	detail.Runs[0].WorkflowTemplateID = workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID
+	detail.Runs[0].WorkflowTemplateVer = workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion
 	detail.Runs[0].Stages = []TaskHubStageFact{
 		{
 			StageAttemptID: "qwen-current-attempt", StageKey: workflowadapter.HarborRunQwen, StageGroup: "evaluation", Ordinal: 12,
@@ -210,7 +265,7 @@ func taskHubCodeEdgeEvidenceDetailFixture() TaskHubDetail {
 	}
 	detail.FrozenExecutions = []TaskHubFrozenExecutionFact{{
 		RunID: detail.Runs[0].RunID, State: TaskHubFrozenExecutionBound,
-		TemplateID: workflowadapter.CodeEdgePhase1WorkflowTemplateID, TemplateVersion: workflowadapter.CodeEdgePhase1WorkflowTemplateVersion,
+		TemplateID: workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID, TemplateVersion: workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion,
 		ExecutionProfileID: "codeedge-test", ExecutionProfileVersion: "1",
 		DeploymentCatalog: TaskHubDeploymentCatalogFact{State: TaskHubDeploymentCatalogNotRecorded},
 	}}

@@ -51,12 +51,98 @@ type DeploymentCatalogLockIdentityResolver interface {
 	VerifyLockIdentity(stageprovider.DeploymentOperationCatalogLockIdentity) error
 }
 
+// TemplateDeploymentCatalogResolver installs one immutable deployment catalog
+// (and, when supported by Resolver, its immutable operation lock) for exactly
+// one closed workflow template. The explicit template key prevents a catalog
+// for a CodeEdge parent Run from authorizing its evaluator child, or vice
+// versa.
+//
+// Resolver's receipt must name exactly Template. NewLifecycleServicesWithOptions
+// rejects a mismatch during composition rather than deferring it to a later
+// StartRun or worker claim.
+type TemplateDeploymentCatalogResolver struct {
+	Template workflowadapter.TemplateReference
+	Resolver DeploymentCatalogReceiptResolver
+}
+
 type deploymentCatalogBinding struct {
+	template              workflowadapter.TemplateReference
 	resolver              DeploymentCatalogReceiptResolver
 	canonical             []byte
 	lockResolver          DeploymentCatalogLockIdentityResolver
 	lockIdentity          *stageprovider.DeploymentOperationCatalogLockIdentity
 	canonicalLockIdentity []byte
+}
+
+// deploymentCatalogRegistry is an immutable, template-keyed deployment
+// capability snapshot. It intentionally has no fallback binding: once a
+// deployment opts into catalog enforcement, every admitted Run must resolve
+// the catalog matching its own frozen template.
+type deploymentCatalogRegistry struct {
+	bindings map[workflowadapter.TemplateReference]*deploymentCatalogBinding
+}
+
+func newDeploymentCatalogRegistry(configured []TemplateDeploymentCatalogResolver) (*deploymentCatalogRegistry, error) {
+	if len(configured) == 0 {
+		return nil, nil
+	}
+	registry := &deploymentCatalogRegistry{
+		bindings: make(map[workflowadapter.TemplateReference]*deploymentCatalogBinding, len(configured)),
+	}
+	for index, entry := range configured {
+		if err := entry.Template.Validate(); err != nil {
+			return nil, fmt.Errorf("validate deployment catalog binding %d template: %w", index, err)
+		}
+		if entry.Resolver == nil {
+			return nil, fmt.Errorf("%w: deployment catalog binding %s@%s has no resolver", stageprovider.ErrDeploymentOperationCatalogUnavailable, entry.Template.ID, entry.Template.Version)
+		}
+		if _, duplicate := registry.bindings[entry.Template]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate deployment catalog binding for workflow template %s@%s", stageprovider.ErrDeploymentOperationCatalogDrift, entry.Template.ID, entry.Template.Version)
+		}
+		binding, err := newDeploymentCatalogBinding(entry.Resolver)
+		if err != nil {
+			return nil, fmt.Errorf("configure deployment catalog binding %s@%s: %w", entry.Template.ID, entry.Template.Version, err)
+		}
+		if binding == nil || !binding.template.Equal(entry.Template) {
+			return nil, fmt.Errorf("%w: deployment catalog binding %s@%s receipt names another workflow template", stageprovider.ErrDeploymentOperationCatalogDrift, entry.Template.ID, entry.Template.Version)
+		}
+		registry.bindings[entry.Template] = binding
+	}
+	return registry, nil
+}
+
+func (registry *deploymentCatalogRegistry) bindingFor(template workflowadapter.TemplateReference) (*deploymentCatalogBinding, bool) {
+	if registry == nil {
+		return nil, false
+	}
+	binding, present := registry.bindings[template]
+	return binding, present
+}
+
+func (registry *deploymentCatalogRegistry) allBindingsHaveLocks() bool {
+	if registry == nil || len(registry.bindings) == 0 {
+		return false
+	}
+	for _, binding := range registry.bindings {
+		if binding == nil || binding.lockResolver == nil || binding.lockIdentity == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// soleBinding preserves the legacy single-resolver composition only for
+// cross-Run CodeEdge evidence inspection. It must never be used by StartRun,
+// replay, or worker admission, where a catalog from another template would be
+// an unsafe fallback.
+func (registry *deploymentCatalogRegistry) soleBinding() (*deploymentCatalogBinding, bool) {
+	if registry == nil || len(registry.bindings) != 1 {
+		return nil, false
+	}
+	for _, binding := range registry.bindings {
+		return binding, binding != nil
+	}
+	return nil, false
 }
 
 func newDeploymentCatalogBinding(resolver DeploymentCatalogReceiptResolver) (*deploymentCatalogBinding, error) {
@@ -86,7 +172,7 @@ func newDeploymentCatalogBinding(resolver DeploymentCatalogReceiptResolver) (*de
 		return nil, fmt.Errorf("verify configured deployment catalog receipt: %w", err)
 	}
 	binding := &deploymentCatalogBinding{
-		resolver: resolver, canonical: append([]byte(nil), canonical...),
+		template: receipt.Template, resolver: resolver, canonical: append([]byte(nil), canonical...),
 	}
 	if lockResolver, ok := resolver.(DeploymentCatalogLockIdentityResolver); ok {
 		identity := lockResolver.LockIdentity()
@@ -161,26 +247,57 @@ func cloneDeploymentCatalogLockIdentity(identity *stageprovider.DeploymentOperat
 	return &copy
 }
 
-// frozenDeploymentCatalogReceipt returns the immutable receipt configured for
-// a new Run. A nil byte slice means this is an explicitly non-production
-// lifecycle composition; it never fabricates a catalog identity for an
-// accept-all fixture resolver.
-func (core *lifecycleServiceCore) frozenDeploymentCatalogReceipt() ([]byte, error) {
-	if core == nil || core.deploymentCatalog == nil {
+// deploymentCatalogBindingForTemplate returns the one immutable catalog
+// binding that may authorize a Run for template. A configured registry never
+// falls back to another template's catalog: a missing key is a fail-closed
+// deployment error, not a request to reuse the first installed resolver.
+func (core *lifecycleServiceCore) deploymentCatalogBindingForTemplate(template workflowadapter.TemplateReference) (*deploymentCatalogBinding, error) {
+	if core == nil || core.deploymentCatalogs == nil {
 		return nil, nil
 	}
-	return append([]byte(nil), core.deploymentCatalog.canonical...), nil
+	if err := template.Validate(); err != nil {
+		return nil, fmt.Errorf("validate deployment catalog template: %w", err)
+	}
+	binding, present := core.deploymentCatalogs.bindingFor(template)
+	if !present || binding == nil {
+		return nil, fmt.Errorf("%w: no configured deployment catalog binding for workflow template %s@%s", stageprovider.ErrDeploymentOperationCatalogUnavailable, template.ID, template.Version)
+	}
+	return binding, nil
+}
+
+// configuredDeploymentCatalogBindingForTemplate is the non-failing lookup
+// used only by cross-Run CodeEdge evidence inspection. Normal StartRun,
+// replay, and worker paths must use deploymentCatalogBindingForTemplate so an
+// unbound executable Run remains fail-closed.
+func (core *lifecycleServiceCore) configuredDeploymentCatalogBindingForTemplate(template workflowadapter.TemplateReference) (*deploymentCatalogBinding, bool) {
+	if core == nil || core.deploymentCatalogs == nil {
+		return nil, false
+	}
+	return core.deploymentCatalogs.bindingFor(template)
+}
+
+// frozenDeploymentCatalogReceipt returns the immutable receipt configured for
+// a new Run's exact template. A nil byte slice means this is an explicitly
+// non-production lifecycle composition; it never fabricates a catalog
+// identity for an accept-all fixture resolver.
+func (core *lifecycleServiceCore) frozenDeploymentCatalogReceipt(template workflowadapter.TemplateReference) ([]byte, error) {
+	binding, err := core.deploymentCatalogBindingForTemplate(template)
+	if err != nil || binding == nil {
+		return nil, err
+	}
+	return append([]byte(nil), binding.canonical...), nil
 }
 
 // frozenDeploymentCatalogLockIdentity returns the immutable configured lock
-// identity for a new Run. A nil identity preserves the explicit catalog-only
-// and non-production composition modes.
-func (core *lifecycleServiceCore) frozenDeploymentCatalogLockIdentity() (*stageprovider.DeploymentOperationCatalogLockIdentity, error) {
-	if core == nil || core.deploymentCatalog == nil || core.deploymentCatalog.lockResolver == nil || core.deploymentCatalog.lockIdentity == nil {
-		return nil, nil
+// identity for a new Run's exact template. A nil identity preserves the
+// explicit catalog-only and non-production composition modes.
+func (core *lifecycleServiceCore) frozenDeploymentCatalogLockIdentity(template workflowadapter.TemplateReference) (*stageprovider.DeploymentOperationCatalogLockIdentity, error) {
+	binding, err := core.deploymentCatalogBindingForTemplate(template)
+	if err != nil || binding == nil || binding.lockResolver == nil || binding.lockIdentity == nil {
+		return nil, err
 	}
-	identity := *core.deploymentCatalog.lockIdentity
-	if err := core.verifyDeploymentCatalogLockIdentity(&identity); err != nil {
+	identity := *binding.lockIdentity
+	if err := core.verifyDeploymentCatalogLockIdentity(template, &identity); err != nil {
 		return nil, err
 	}
 	return &identity, nil
@@ -188,16 +305,16 @@ func (core *lifecycleServiceCore) frozenDeploymentCatalogLockIdentity() (*stagep
 
 // resolveStartRunDeploymentCatalogReceipt either verifies the receipt already
 // sealed in an input bundle or obtains the one immutable receipt owned by this
-// process's configured catalog. It never replaces a bundle receipt with a new
-// current catalog value: that substitution would turn a retry into a different
-// Run definition.
-func (core *lifecycleServiceCore) resolveStartRunDeploymentCatalogReceipt(raw []byte) ([]byte, error) {
+// process's binding for template. It never replaces a bundle receipt with a
+// new current catalog value: that substitution would turn a retry into a
+// different Run definition.
+func (core *lifecycleServiceCore) resolveStartRunDeploymentCatalogReceipt(template workflowadapter.TemplateReference, raw []byte) ([]byte, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		frozen, err := core.frozenDeploymentCatalogReceipt()
+		frozen, err := core.frozenDeploymentCatalogReceipt(template)
 		if err != nil {
 			return nil, err
 		}
-		if err := core.verifyDeploymentCatalogReceipt(frozen); err != nil {
+		if err := core.verifyDeploymentCatalogReceipt(template, frozen); err != nil {
 			return nil, err
 		}
 		return frozen, nil
@@ -206,32 +323,37 @@ func (core *lifecycleServiceCore) resolveStartRunDeploymentCatalogReceipt(raw []
 	if err != nil {
 		return nil, err
 	}
-	if err := core.verifyDeploymentCatalogReceipt(canonical); err != nil {
+	if err := core.verifyDeploymentCatalogReceipt(template, canonical); err != nil {
 		return nil, err
 	}
 	return canonical, nil
 }
 
 // resolveStartRunDeploymentCatalogLockIdentity either verifies the identity
-// sealed in a StartRun input bundle or freezes this process's configured lock.
-// It never substitutes a newly loaded lock for a bundle identity on replay.
-func (core *lifecycleServiceCore) resolveStartRunDeploymentCatalogLockIdentity(identity *stageprovider.DeploymentOperationCatalogLockIdentity) (*stageprovider.DeploymentOperationCatalogLockIdentity, error) {
+// sealed in a StartRun input bundle or freezes this process's template-bound
+// lock. It never substitutes a newly loaded lock for a bundle identity on
+// replay.
+func (core *lifecycleServiceCore) resolveStartRunDeploymentCatalogLockIdentity(template workflowadapter.TemplateReference, identity *stageprovider.DeploymentOperationCatalogLockIdentity) (*stageprovider.DeploymentOperationCatalogLockIdentity, error) {
 	if identity == nil {
-		return core.frozenDeploymentCatalogLockIdentity()
+		return core.frozenDeploymentCatalogLockIdentity(template)
 	}
 	copy := *identity
-	if err := core.verifyDeploymentCatalogLockIdentity(&copy); err != nil {
+	if err := core.verifyDeploymentCatalogLockIdentity(template, &copy); err != nil {
 		return nil, err
 	}
 	return &copy, nil
 }
 
-// verifyDeploymentCatalogReceipt checks both the canonical receipt bytes
-// frozen into a bundle/manifest and the currently loaded deployment catalog.
-// The second check is what makes a separately started worker reject a catalog
-// substitution before it can start an external side effect.
-func (core *lifecycleServiceCore) verifyDeploymentCatalogReceipt(raw []byte) error {
-	if core == nil || core.deploymentCatalog == nil {
+// verifyDeploymentCatalogReceipt checks both canonical receipt bytes frozen
+// into a bundle/manifest and the catalog bound to template. The second check
+// is what makes a separately started worker reject a catalog substitution
+// before it can start an external side effect.
+func (core *lifecycleServiceCore) verifyDeploymentCatalogReceipt(template workflowadapter.TemplateReference, raw []byte) error {
+	binding, err := core.deploymentCatalogBindingForTemplate(template)
+	if err != nil {
+		return err
+	}
+	if binding == nil {
 		if len(bytes.TrimSpace(raw)) != 0 {
 			return fmt.Errorf("%w: frozen deployment catalog receipt has no configured verifier", stageprovider.ErrDeploymentOperationCatalogUnavailable)
 		}
@@ -241,25 +363,32 @@ func (core *lifecycleServiceCore) verifyDeploymentCatalogReceipt(raw []byte) err
 	if err != nil {
 		return fmt.Errorf("validate frozen deployment catalog receipt: %w", err)
 	}
+	if !receipt.Template.Equal(template) {
+		return fmt.Errorf("%w: frozen deployment catalog receipt template %s@%s does not match Run template %s@%s", stageprovider.ErrDeploymentOperationCatalogDrift, receipt.Template.ID, receipt.Template.Version, template.ID, template.Version)
+	}
 	if !bytes.Equal(raw, canonical) {
 		return fmt.Errorf("%w: frozen deployment catalog receipt is not canonical", stageprovider.ErrDeploymentOperationCatalogDrift)
 	}
-	if !bytes.Equal(canonical, core.deploymentCatalog.canonical) {
+	if !bytes.Equal(canonical, binding.canonical) {
 		return fmt.Errorf("%w: frozen deployment catalog receipt differs from this deployment", stageprovider.ErrDeploymentOperationCatalogDrift)
 	}
-	if err := core.deploymentCatalog.resolver.VerifyReceipt(receipt); err != nil {
+	if err := binding.resolver.VerifyReceipt(receipt); err != nil {
 		return fmt.Errorf("verify frozen deployment catalog receipt: %w", err)
 	}
 	return nil
 }
 
 // verifyDeploymentCatalogLockIdentity proves that a frozen lock identity is
-// exactly the one installed in this process. A configured catalog-only
-// resolver remains valid with no identity; a lock-aware resolver rejects an
-// absent identity so an older or tampered manifest cannot silently bypass the
+// exactly the one installed for template. A configured catalog-only resolver
+// remains valid with no identity; a lock-aware resolver rejects an absent
+// identity so an older or tampered manifest cannot silently bypass the
 // stronger production boundary.
-func (core *lifecycleServiceCore) verifyDeploymentCatalogLockIdentity(identity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
-	if core == nil || core.deploymentCatalog == nil || core.deploymentCatalog.lockResolver == nil || core.deploymentCatalog.lockIdentity == nil {
+func (core *lifecycleServiceCore) verifyDeploymentCatalogLockIdentity(template workflowadapter.TemplateReference, identity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
+	binding, err := core.deploymentCatalogBindingForTemplate(template)
+	if err != nil {
+		return err
+	}
+	if binding == nil || binding.lockResolver == nil || binding.lockIdentity == nil {
 		if identity != nil {
 			return fmt.Errorf("%w: frozen deployment catalog lock identity has no configured verifier", stageprovider.ErrDeploymentOperationCatalogLockUnavailable)
 		}
@@ -275,23 +404,24 @@ func (core *lifecycleServiceCore) verifyDeploymentCatalogLockIdentity(identity *
 	if err != nil {
 		return fmt.Errorf("canonicalize frozen deployment catalog lock identity: %w", err)
 	}
-	if !bytes.Equal(canonical, core.deploymentCatalog.canonicalLockIdentity) {
+	if !bytes.Equal(canonical, binding.canonicalLockIdentity) {
 		return fmt.Errorf("%w: frozen deployment catalog lock identity is not this deployment's canonical identity", stageprovider.ErrDeploymentOperationCatalogLockDrift)
 	}
-	if *identity != *core.deploymentCatalog.lockIdentity {
+	if *identity != *binding.lockIdentity {
 		return fmt.Errorf("%w: frozen deployment catalog lock identity differs from this deployment", stageprovider.ErrDeploymentOperationCatalogLockDrift)
 	}
-	if err := core.deploymentCatalog.lockResolver.VerifyLockIdentity(*identity); err != nil {
+	if err := binding.lockResolver.VerifyLockIdentity(*identity); err != nil {
 		return fmt.Errorf("verify frozen deployment catalog lock identity: %w", err)
 	}
 	return nil
 }
 
 func (core *lifecycleServiceCore) validateDeploymentCatalogExecutionSpec(specification workflowadapter.RunExecutionSpec) error {
-	if core == nil || core.deploymentCatalog == nil {
-		return nil
+	binding, err := core.deploymentCatalogBindingForTemplate(specification.Template)
+	if err != nil || binding == nil {
+		return err
 	}
-	if err := specification.ValidateWithOperationResolver(core.deploymentCatalog.resolver); err != nil {
+	if err := specification.ValidateWithOperationResolver(binding.resolver); err != nil {
 		return fmt.Errorf("validate explicit execution specification against deployment catalog: %w", err)
 	}
 	return nil
@@ -329,25 +459,33 @@ func canonicalManifestDeploymentCatalogLockIdentity(manifest runManifest) (*stag
 // for a lifecycle composition that did not opt into catalog enforcement, so
 // existing non-production test resolvers do not gain an invented identity.
 func (core *lifecycleServiceCore) verifyRunDeploymentCatalogReceipt(run store.WorkflowRun) error {
-	if core == nil || core.deploymentCatalog == nil {
+	if core == nil || core.deploymentCatalogs == nil {
 		return nil
 	}
 	var manifest runManifest
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
 		return fmt.Errorf("decode run manifest deployment catalog receipt: %w", err)
 	}
+	specification, _, _, err := canonicalFrozenRunExecutionSpec(manifest, run)
+	if err != nil {
+		return fmt.Errorf("decode run manifest execution specification for deployment catalog receipt: %w", err)
+	}
+	template := specification.Template
+	if run.WorkflowTemplateID != template.ID || run.WorkflowTemplateVersion != template.Version || !manifest.Resolved.Template.Equal(template) {
+		return fmt.Errorf("%w: Run template identity does not match its frozen execution specification", stageprovider.ErrDeploymentOperationCatalogDrift)
+	}
 	canonical, err := canonicalManifestDeploymentCatalogReceipt(manifest)
 	if err != nil {
 		return fmt.Errorf("decode run manifest deployment catalog receipt: %w", err)
 	}
-	if err := core.verifyDeploymentCatalogReceipt(canonical); err != nil {
+	if err := core.verifyDeploymentCatalogReceipt(template, canonical); err != nil {
 		return fmt.Errorf("verify run manifest deployment catalog receipt: %w", err)
 	}
 	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
 	if err != nil {
 		return fmt.Errorf("decode run manifest deployment catalog lock identity: %w", err)
 	}
-	if err := core.verifyDeploymentCatalogLockIdentity(lockIdentity); err != nil {
+	if err := core.verifyDeploymentCatalogLockIdentity(template, lockIdentity); err != nil {
 		return fmt.Errorf("verify run manifest deployment catalog lock identity: %w", err)
 	}
 
@@ -363,7 +501,7 @@ func (core *lifecycleServiceCore) verifyRunDeploymentCatalogReceipt(run store.Wo
 	if err != nil {
 		return fmt.Errorf("read managed deployment catalog receipt: %w", err)
 	}
-	if err := core.verifyDeploymentCatalogReceipt(raw); err != nil {
+	if err := core.verifyDeploymentCatalogReceipt(template, raw); err != nil {
 		return fmt.Errorf("verify managed deployment catalog receipt: %w", err)
 	}
 	if !bytes.Equal(raw, canonical) {
@@ -382,7 +520,7 @@ func (core *lifecycleServiceCore) verifyRunDeploymentCatalogReceipt(run store.Wo
 		if !bytes.Equal(lockRaw, canonicalLockIdentity) {
 			return fmt.Errorf("%w: managed deployment catalog lock identity is not canonical", stageprovider.ErrDeploymentOperationCatalogLockDrift)
 		}
-		if err := core.verifyDeploymentCatalogLockIdentity(&parsedLockIdentity); err != nil {
+		if err := core.verifyDeploymentCatalogLockIdentity(template, &parsedLockIdentity); err != nil {
 			return fmt.Errorf("verify managed deployment catalog lock identity: %w", err)
 		}
 		if parsedLockIdentity != *lockIdentity {

@@ -78,6 +78,11 @@ type MetadataFieldMapping struct {
 // never provider configuration, credentials, or secret values.
 type Profile struct {
 	Metadata MetadataFieldMapping
+	// ProtectedEnvironmentVariables is the explicit deployment-derived set of
+	// host and child environment names that a task-owned Dockerfile or Compose
+	// document may never interpolate or request for pass-through. It stores
+	// names only, never endpoint or credential values.
+	ProtectedEnvironmentVariables []string
 }
 
 // Report is the deterministic, non-secret result of a successful Phase-1
@@ -131,6 +136,37 @@ func ValidatePhase1Task(root string, profile Profile) error {
 	return err
 }
 
+// ValidateProtectedEnvironmentReferences checks whether task-owned Dockerfile,
+// Compose, or Harbor [environment.env] content can request, declare, or
+// interpolate one of the deployment-controlled environment variable names.
+// It deliberately does not interpret task metadata. It does inspect
+// [environment.env], whose schema is an observed Harbor runtime contract:
+// Harbor resolves its values from its own process environment before it starts
+// the task environment.
+//
+// The supplied list is names only and must be explicit, non-empty, valid, and
+// duplicate-free. Values must never cross this API boundary.
+func ValidateProtectedEnvironmentReferences(root string, protectedEnvironmentVariables []string) error {
+	root = strings.TrimSpace(root)
+	collector := newViolationCollector()
+	if root == "" {
+		collector.add("task_root", "", "task root is required")
+		return collector.err()
+	}
+	valid, protected := validateProtectedEnvironmentVariables(protectedEnvironmentVariables, collector)
+	if !valid {
+		return collector.err()
+	}
+	validateTaskTOMLProtectedEnvironmentReferences(root, protected, collector)
+	if raw, ok := readRegularTaskFile(root, "environment/Dockerfile", collector); ok {
+		validateDockerfileProtectedEnvironmentReferences(string(raw), "environment/Dockerfile", protected, collector)
+	}
+	if raw, ok := readRegularTaskFile(root, "environment/docker-compose.yaml", collector); ok {
+		validateComposeProtectedEnvironmentReferencesRaw(raw, "environment/docker-compose.yaml", protected, collector)
+	}
+	return collector.err()
+}
+
 // InspectPhase1Task validates a prospective CodeEdge Phase-1 managed task
 // snapshot and returns its selected environment and required metadata only on
 // success.
@@ -147,21 +183,22 @@ func InspectPhase1Task(root string, profile Profile) (Report, error) {
 		return Report{}, collector.err()
 	}
 
-	profileValid := validateProfile(profile, collector)
+	profileValid, protectedEnvironmentVariables := validateProfile(profile, collector)
 	validateManagedLayout(root, collector)
 	environment, environmentPath := detectSingleEnvironment(root, collector)
 	metadata, provenance := Metadata{}, repositoryProvenance{}
 	if profileValid {
 		metadata, provenance = inspectTaskMetadata(root, profile.Metadata, collector)
+		validateTaskTOMLProtectedEnvironmentReferences(root, protectedEnvironmentVariables, collector)
 	}
 	validateTestsAnalysis(root, collector)
 
 	var environmentEvidence gitEvidence
 	switch environment {
 	case EnvironmentDockerfile:
-		environmentEvidence = inspectDockerfilePath(root, environmentPath, collector)
+		environmentEvidence = inspectDockerfilePath(root, environmentPath, protectedEnvironmentVariables, collector)
 	case EnvironmentCompose:
-		environmentEvidence = inspectComposePath(root, environmentPath, collector)
+		environmentEvidence = inspectComposePath(root, environmentPath, protectedEnvironmentVariables, collector)
 	}
 	if provenance.required && provenance.valid && environment != "" {
 		validateRepositoryProvenance(environmentPath, provenance.repository, provenance.commit, environmentEvidence, collector)
@@ -250,7 +287,7 @@ func regularFileExists(root, relativePath string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-func validateProfile(profile Profile, collector *violationCollector) bool {
+func validateProfile(profile Profile, collector *violationCollector) (bool, map[string]struct{}) {
 	fields := []struct {
 		name string
 		path TOMLPath
@@ -285,7 +322,48 @@ func validateProfile(profile Profile, collector *violationCollector) bool {
 		}
 		seen[path] = field.name
 	}
-	return valid
+	protectedValid, protected := validateProtectedEnvironmentVariables(profile.ProtectedEnvironmentVariables, collector)
+	valid = valid && protectedValid
+	return valid, protected
+}
+
+func validateProtectedEnvironmentVariables(variables []string, collector *violationCollector) (bool, map[string]struct{}) {
+	protected := make(map[string]struct{}, len(variables))
+	if variables == nil || len(variables) == 0 {
+		collector.add("deployment_profile", "", "protected deployment environment variables must be an explicit non-empty list")
+		return false, protected
+	}
+	valid := true
+	for _, variable := range variables {
+		if !validEnvironmentVariableName(variable) {
+			collector.add("deployment_profile", "", "protected deployment environment variable is invalid: "+variable)
+			valid = false
+			continue
+		}
+		if _, duplicate := protected[variable]; duplicate {
+			collector.add("deployment_profile", "", "protected deployment environment variable is duplicated: "+variable)
+			valid = false
+			continue
+		}
+		protected[variable] = struct{}{}
+	}
+	return valid, protected
+}
+
+func validEnvironmentVariableName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'A' && character <= 'Z') || character == '_' {
+			continue
+		}
+		if index > 0 && character >= '0' && character <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type repositoryProvenance struct {
@@ -338,6 +416,45 @@ func inspectTaskMetadata(root string, fields MetadataFieldMapping, collector *vi
 		provenance.commit = commit
 	}
 	return metadata, provenance
+}
+
+// validateTaskTOMLProtectedEnvironmentReferences validates only Harbor's
+// [environment.env] runtime map. It intentionally shares the same
+// name-only policy with Dockerfile and Compose inspection so an evaluator can
+// call it after materializing an immutable snapshot without reading a secret.
+func validateTaskTOMLProtectedEnvironmentReferences(root string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) {
+	if len(protectedEnvironmentVariables) == 0 {
+		return
+	}
+	raw, ok := readRegularTaskFile(root, "task.toml", collector)
+	if !ok {
+		return
+	}
+	var document map[string]any
+	if err := toml.Unmarshal(raw, &document); err != nil {
+		collector.add("environment_isolation", "task.toml", "task.toml must be valid TOML: "+err.Error())
+		return
+	}
+	value, found := tomlValueAt(document, TOMLPath{"environment", "env"})
+	if !found {
+		return
+	}
+	variables, ok := value.(map[string]any)
+	if !ok {
+		collector.add("environment_isolation", "task.toml", "task.toml [environment.env] must be a string map")
+		return
+	}
+	for name, rawValue := range variables {
+		if _, protected := protectedEnvironmentVariables[name]; protected {
+			collector.add("environment_isolation", "task.toml", "task.toml [environment.env] must not declare protected deployment environment variable "+name)
+		}
+		value, ok := rawValue.(string)
+		if !ok {
+			collector.add("environment_isolation", "task.toml", "task.toml [environment.env]."+name+" must be a string")
+			continue
+		}
+		validateProtectedEnvironmentInterpolations(value, "task.toml", "task.toml [environment.env]", protectedEnvironmentVariables, collector)
+	}
 }
 
 func taskTOMLMetadataToReport(document map[string]any, fields MetadataFieldMapping, collector *violationCollector) Metadata {
@@ -662,16 +779,17 @@ func (evidence *gitEvidence) add(other gitEvidence) {
 	evidence.commits = append(evidence.commits, other.commits...)
 }
 
-func inspectDockerfilePath(root, relativePath string, collector *violationCollector) gitEvidence {
+func inspectDockerfilePath(root, relativePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) gitEvidence {
 	raw, ok := readRegularTaskFile(root, relativePath, collector)
 	if !ok {
 		return gitEvidence{}
 	}
-	return inspectDockerfile(string(raw), relativePath, collector)
+	return inspectDockerfile(string(raw), relativePath, protectedEnvironmentVariables, collector)
 }
 
-func inspectDockerfile(raw, filePath string, collector *violationCollector) gitEvidence {
+func inspectDockerfile(raw, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) gitEvidence {
 	evidence := gitEvidence{}
+	validateDockerfileProtectedEnvironmentReferences(raw, filePath, protectedEnvironmentVariables, collector)
 	for _, instruction := range parseDockerInstructions(raw) {
 		if containsRewardReference(instruction.args) {
 			collector.add("environment_isolation", filePath, "environment must not prewrite or include verifier reward files")
@@ -930,15 +1048,15 @@ func validateRepositoryProvenance(filePath string, repository githubRepository, 
 	collector.add("repo_provenance", filePath, "git checkout/reset commit must match the mapped commit ID "+commit)
 }
 
-func inspectComposePath(root, relativePath string, collector *violationCollector) gitEvidence {
+func inspectComposePath(root, relativePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) gitEvidence {
 	raw, ok := readRegularTaskFile(root, relativePath, collector)
 	if !ok {
 		return gitEvidence{}
 	}
-	return inspectCompose(raw, relativePath, collector)
+	return inspectCompose(raw, relativePath, protectedEnvironmentVariables, collector)
 }
 
-func inspectCompose(raw []byte, filePath string, collector *violationCollector) gitEvidence {
+func inspectCompose(raw []byte, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) gitEvidence {
 	var document yaml.Node
 	if err := yaml.Unmarshal(raw, &document); err != nil {
 		collector.add("environment_isolation", filePath, "docker-compose.yaml must be valid YAML: "+err.Error())
@@ -958,6 +1076,7 @@ func inspectCompose(raw []byte, filePath string, collector *violationCollector) 
 	if mainService == nil || mainService.Kind != yaml.MappingNode {
 		collector.add("environment_isolation", filePath, "docker-compose.yaml must define a main service")
 	}
+	validateComposeProtectedEnvironmentReferences(root, filePath, protectedEnvironmentVariables, collector)
 
 	evidence := gitEvidence{}
 	for index := 0; index+1 < len(services.Content); index += 2 {
@@ -968,7 +1087,7 @@ func inspectCompose(raw []byte, filePath string, collector *violationCollector) 
 			continue
 		}
 		if build := yamlMappingValue(service, "build"); build != nil {
-			evidence.add(inspectComposeBuild(build, filePath, collector))
+			evidence.add(inspectComposeBuild(build, filePath, protectedEnvironmentVariables, collector))
 		}
 		if volumes := yamlMappingValue(service, "volumes"); volumes != nil {
 			validateComposeVolumes(volumes, filePath, collector)
@@ -1008,7 +1127,7 @@ func yamlMappingValue(mapping *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
-func inspectComposeBuild(build *yaml.Node, filePath string, collector *violationCollector) gitEvidence {
+func inspectComposeBuild(build *yaml.Node, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) gitEvidence {
 	evidence := gitEvidence{}
 	switch build.Kind {
 	case yaml.ScalarNode:
@@ -1026,12 +1145,196 @@ func inspectComposeBuild(build *yaml.Node, filePath string, collector *violation
 			}
 		}
 		if inline := yamlMappingValue(build, "dockerfile_inline"); inline != nil && inline.Kind == yaml.ScalarNode {
-			evidence.add(inspectDockerfile(inline.Value, filePath, collector))
+			evidence.add(inspectDockerfile(inline.Value, filePath, protectedEnvironmentVariables, collector))
 		}
 	default:
 		collector.add("environment_isolation", filePath, "compose build must be a context string or mapping")
 	}
 	return evidence
+}
+
+func validateDockerEnvironmentDeclarations(args, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) {
+	tokens := dockerArgumentTokens(args)
+	if len(tokens) == 0 {
+		return
+	}
+	for index, token := range tokens {
+		if index > 0 && !strings.Contains(token, "=") {
+			break
+		}
+		name := strings.SplitN(token, "=", 2)[0]
+		if _, protected := protectedEnvironmentVariables[name]; protected {
+			collector.add("environment_isolation", filePath, "Dockerfile must not declare protected deployment environment variable "+name)
+		}
+	}
+}
+
+func validateDockerfileProtectedEnvironmentReferences(raw, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) {
+	if dockerUsesNonDefaultEscapeDirective(raw) {
+		// The Dockerfile parser supports a backtick escape directive, but this
+		// controlled scanner only joins the default backslash continuations.
+		// Rejecting it prevents a protected name from being split across lines.
+		collector.add("environment_isolation", filePath, "Dockerfile must not use a non-default escape directive while protected deployment environment validation is active")
+		return
+	}
+	for _, instruction := range parseDockerInstructions(raw) {
+		validateProtectedEnvironmentInterpolations(instruction.args, filePath, "Dockerfile", protectedEnvironmentVariables, collector)
+		switch instruction.verb {
+		case "arg", "env":
+			validateDockerEnvironmentDeclarations(instruction.args, filePath, protectedEnvironmentVariables, collector)
+		}
+	}
+}
+
+func dockerUsesNonDefaultEscapeDirective(raw string) bool {
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "#") {
+			return false
+		}
+		directive := strings.TrimSpace(strings.TrimPrefix(trimmed, "#"))
+		if !strings.HasPrefix(strings.ToLower(directive), "escape=") {
+			continue
+		}
+		return strings.TrimSpace(directive[len("escape="):]) != "\\"
+	}
+	return false
+}
+
+func validateComposeProtectedEnvironmentReferencesRaw(raw []byte, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) {
+	var document yaml.Node
+	if err := yaml.Unmarshal(raw, &document); err != nil {
+		collector.add("environment_isolation", filePath, "docker-compose.yaml must be valid YAML: "+err.Error())
+		return
+	}
+	root := yamlDocumentRoot(&document)
+	if root == nil || root.Kind != yaml.MappingNode {
+		collector.add("environment_isolation", filePath, "docker-compose.yaml must contain a top-level mapping")
+		return
+	}
+	validateComposeProtectedEnvironmentReferences(root, filePath, protectedEnvironmentVariables, collector)
+}
+
+func validateComposeProtectedEnvironmentReferences(node *yaml.Node, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) {
+	if node == nil || len(protectedEnvironmentVariables) == 0 {
+		return
+	}
+	var visit func(*yaml.Node)
+	visit = func(current *yaml.Node) {
+		if current == nil {
+			return
+		}
+		if current.Kind == yaml.ScalarNode {
+			validateProtectedEnvironmentInterpolations(current.Value, filePath, "Compose", protectedEnvironmentVariables, collector)
+			return
+		}
+		if current.Kind == yaml.MappingNode {
+			for index := 0; index+1 < len(current.Content); index += 2 {
+				key := current.Content[index]
+				value := current.Content[index+1]
+				if key.Value == "environment" || key.Value == "env_file" || key.Value == "args" {
+					validateComposeProtectedEnvironmentDeclarations(value, filePath, protectedEnvironmentVariables, collector)
+				}
+				visit(key)
+				visit(value)
+			}
+			return
+		}
+		for _, child := range current.Content {
+			visit(child)
+		}
+	}
+	visit(node)
+}
+
+func validateComposeProtectedEnvironmentDeclarations(node *yaml.Node, filePath string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) {
+	if node == nil {
+		return
+	}
+	switch node.Kind {
+	case yaml.MappingNode:
+		for index := 0; index+1 < len(node.Content); index += 2 {
+			name := node.Content[index].Value
+			if _, protected := protectedEnvironmentVariables[name]; protected {
+				collector.add("environment_isolation", filePath, "Compose must not declare protected deployment environment variable "+name)
+			}
+		}
+	case yaml.SequenceNode:
+		for _, entry := range node.Content {
+			if entry.Kind != yaml.ScalarNode {
+				continue
+			}
+			name := strings.SplitN(entry.Value, "=", 2)[0]
+			if _, protected := protectedEnvironmentVariables[name]; protected {
+				collector.add("environment_isolation", filePath, "Compose must not declare protected deployment environment variable "+name)
+			}
+		}
+	case yaml.ScalarNode:
+		name := strings.SplitN(node.Value, "=", 2)[0]
+		if _, protected := protectedEnvironmentVariables[name]; protected {
+			collector.add("environment_isolation", filePath, "Compose must not declare protected deployment environment variable "+name)
+		}
+	}
+}
+
+func validateProtectedEnvironmentInterpolations(value, filePath, source string, protectedEnvironmentVariables map[string]struct{}, collector *violationCollector) {
+	for _, name := range protectedEnvironmentInterpolations(value, protectedEnvironmentVariables) {
+		collector.add("environment_isolation", filePath, source+" must not interpolate protected deployment environment variable "+name)
+	}
+}
+
+func protectedEnvironmentInterpolations(value string, protectedEnvironmentVariables map[string]struct{}) []string {
+	found := make(map[string]struct{})
+	for index := 0; index < len(value); index++ {
+		if value[index] != '$' {
+			continue
+		}
+		if index+1 >= len(value) {
+			break
+		}
+		if value[index+1] == '$' {
+			index++
+			continue
+		}
+		start := index + 1
+		braced := value[start] == '{'
+		if braced {
+			start++
+			if start < len(value) && value[start] == '!' {
+				start++
+			}
+		}
+		end := start
+		for end < len(value) && ((value[end] >= 'A' && value[end] <= 'Z') || (value[end] >= 'a' && value[end] <= 'z') || (value[end] >= '0' && value[end] <= '9') || value[end] == '_') {
+			end++
+		}
+		if end == start {
+			continue
+		}
+		name := value[start:end]
+		if _, protected := protectedEnvironmentVariables[name]; protected {
+			found[name] = struct{}{}
+		}
+		if braced {
+			for end < len(value) && value[end] != '}' {
+				end++
+			}
+			if end < len(value) {
+				index = end
+			}
+		} else {
+			index = end - 1
+		}
+	}
+	result := make([]string, 0, len(found))
+	for name := range found {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func validateComposeBuildContext(value, filePath string, collector *violationCollector) {

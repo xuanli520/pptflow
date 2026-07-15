@@ -36,9 +36,7 @@ func (effect StageEffect) valid() bool {
 type StageDispatchPolicy string
 
 const (
-	// StageDispatchAutomatic is the normal durable worker path. The empty value
-	// is treated as automatic for source compatibility with already-constructed
-	// generic descriptors.
+	// StageDispatchAutomatic is the normal durable worker path.
 	StageDispatchAutomatic StageDispatchPolicy = "automatic"
 	// StageDispatchOperatorOnly preserves a stage in the frozen descriptor but
 	// excludes it from execution plans. A domain-specific lifecycle service must
@@ -49,7 +47,7 @@ const (
 // IsAutomatic reports whether a stage participates in normal Run and
 // continuation scheduling.
 func (policy StageDispatchPolicy) IsAutomatic() bool {
-	return policy == "" || policy == StageDispatchAutomatic
+	return policy == StageDispatchAutomatic
 }
 
 // IsOperatorOnly reports whether a stage is represented for readiness only.
@@ -61,7 +59,7 @@ func (policy StageDispatchPolicy) IsOperatorOnly() bool {
 // generic execution contract.
 func (policy StageDispatchPolicy) Validate() error {
 	switch policy {
-	case "", StageDispatchAutomatic, StageDispatchOperatorOnly:
+	case StageDispatchAutomatic, StageDispatchOperatorOnly:
 		return nil
 	default:
 		return fmt.Errorf("%w: unsupported stage dispatch policy %q", ErrInvalidDescriptor, policy)
@@ -170,6 +168,21 @@ type RetryPolicy struct {
 func (policy RetryPolicy) Clone() RetryPolicy {
 	policy.Retryable = append([]FailureClass(nil), policy.Retryable...)
 	return policy
+}
+
+// Allows reports whether this frozen retry policy permits another attempt for
+// the classified infrastructure failure. It intentionally never treats an
+// empty/unknown class as retryable.
+func (policy RetryPolicy) Allows(class FailureClass) bool {
+	if !class.valid() || class == FailureNone {
+		return false
+	}
+	for _, candidate := range policy.Retryable {
+		if candidate == class {
+			return true
+		}
+	}
+	return false
 }
 
 func (policy RetryPolicy) validate() error {

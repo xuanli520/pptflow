@@ -8,6 +8,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -116,6 +117,18 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 				return TaskHubDetail{}, fmt.Errorf("CodeEdge Run %s references unavailable revision %s", run.ID, run.RevisionID)
 			}
 			detail.CodeEdgeCompliance = append(detail.CodeEdgeCompliance, taskHubCodeEdgeComplianceFact(run, revision, record))
+			handoff, handoffErr := dataStore.GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, run.ID)
+			if handoffErr != nil {
+				return TaskHubDetail{}, fmt.Errorf("read CodeEdge evaluator evidence handoff for Run %s: %w", run.ID, handoffErr)
+			}
+			var child *store.WorkflowRun
+			if handoff != nil {
+				child, handoffErr = dataStore.GetWorkflowRun(ctx, handoff.ChildRunID)
+				if handoffErr != nil {
+					return TaskHubDetail{}, fmt.Errorf("read CodeEdge evaluator child Run %s: %w", handoff.ChildRunID, handoffErr)
+				}
+			}
+			detail.CodeEdgeEvaluatorEvidenceHandoffs = append(detail.CodeEdgeEvaluatorEvidenceHandoffs, taskHubCodeEdgeEvaluatorEvidenceHandoffFact(run, revision, handoff, child))
 		}
 	}
 	for _, release := range inspection.Releases {
@@ -200,6 +213,27 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 		detail.Repairs = append(detail.Repairs, projection)
 	}
 	return detail, nil
+}
+
+func taskHubCodeEdgeEvaluatorEvidenceHandoffFact(parent store.WorkflowRun, revision store.TaskRevision, handoff *store.CodeEdgeEvaluatorEvidenceHandoff, child *store.WorkflowRun) TaskHubCodeEdgeEvaluatorEvidenceHandoffFact {
+	fact := TaskHubCodeEdgeEvaluatorEvidenceHandoffFact{ParentRunID: parent.ID, State: TaskHubCodeEdgeEvaluatorEvidenceHandoffNotRecorded}
+	if handoff == nil {
+		return fact
+	}
+	fact.HandoffID = handoff.ID
+	fact.ChildRunID = handoff.ChildRunID
+	fact.HandoffFingerprint = handoff.HandoffFingerprint
+	fact.RecordedAt = handoff.CreatedAt
+	if store.ValidateUUIDv7(handoff.ID) != nil || store.ValidateUUIDv7(handoff.ChildRunID) != nil ||
+		workflowkit.Fingerprint(strings.TrimSpace(handoff.HandoffFingerprint)).Validate() != nil ||
+		handoff.ParentRunID != parent.ID || handoff.TaskID != parent.TaskID || handoff.RevisionID != parent.RevisionID || handoff.RevisionID != revision.ID || handoff.TaskDigest != revision.TaskDigest ||
+		child == nil || child.ID != handoff.ChildRunID || child.ParentRunID != parent.ID || child.TaskID != parent.TaskID || child.RevisionID != parent.RevisionID ||
+		child.WorkflowTemplateID != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID || child.WorkflowTemplateVersion != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion {
+		fact.State = TaskHubCodeEdgeEvaluatorEvidenceHandoffInvalid
+		return fact
+	}
+	fact.State = TaskHubCodeEdgeEvaluatorEvidenceHandoffRecorded
+	return fact
 }
 
 func taskHubDetailOptionalTime(value *time.Time) time.Time {

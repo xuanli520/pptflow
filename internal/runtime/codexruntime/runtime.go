@@ -1,3 +1,6 @@
+// Package codexruntime adapts the Codex App Server to the general agent
+// conversation port.  It owns only process/session mechanics; callers own
+// operation policy, provider selection, prompt contracts, and credentials.
 package codexruntime
 
 import (
@@ -15,40 +18,61 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/executor"
 )
 
+// Runtime is a concrete implementation of agent.Runtime for an explicitly
+// configured Codex App Server executable.  It deliberately does not discover
+// an executable, copy an ambient CODEX_HOME, or select a model/provider.
+// Those facts must be supplied by the composition that owns the operation.
 type Runtime struct {
-	exec          executor.CommandRunner
-	preferredPath string
-	env           map[string]string
+	exec        executor.CommandRunner
+	commandPath string
+	env         map[string]string
 }
 
-func New(exec executor.CommandRunner, preferredPath string, env map[string]string) Runtime {
+// New constructs a runtime from explicit process inputs.  OpenConversation
+// verifies that commandPath is an absolute executable path and that env
+// contains an explicit, existing CODEX_HOME.  The supplied environment is
+// copied so later caller mutation cannot alter a live runtime.
+func New(exec executor.CommandRunner, commandPath string, env map[string]string) Runtime {
 	if exec == nil {
 		exec = executor.New()
 	}
-	return Runtime{exec: exec, preferredPath: strings.TrimSpace(preferredPath), env: copyEnv(env)}
+	return Runtime{exec: exec, commandPath: strings.TrimSpace(commandPath), env: copyEnv(env)}
 }
 
 type conversation struct {
 	session   appserver.Session
 	defaults  agent.ConversationRequest
 	model     string
-	cleanup   string
 	closeOnce sync.Once
 	closeErr  error
 }
 
 func (r Runtime) OpenConversation(ctx context.Context, req agent.ConversationRequest) (agent.Conversation, error) {
-	capability := codex.DetectCLI(ctx, r.exec, r.preferredPath)
-	if err := codex.ValidateAppServerCapability(capability); err != nil {
+	configuredEnv := copyEnv(r.env)
+	if err := validateExplicitCodexEnvironment(configuredEnv); err != nil {
 		return nil, err
 	}
-	projectPath := strings.TrimSpace(req.ProjectPath)
-	if projectPath == "" {
-		projectPath = "."
+	// Probe the approved executable with the same sanitized environment that
+	// will be used for the App Server itself.  This keeps version/help probing
+	// from consulting an ambient home, credential, endpoint, or PATH mutation.
+	env := codex.SanitizeEnvironment(os.Environ(), configuredEnv)
+	capability := codex.InspectCLIWithEnvironment(ctx, r.exec, r.commandPath, env)
+	if err := codex.ValidateControlledAppServerCapability(capability); err != nil {
+		return nil, err
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		return nil, fmt.Errorf("codex agent runtime requires an explicit model")
+	}
+	projectPath, err := absoluteConfiguredPath(req.ProjectPath, "project path")
+	if err != nil {
+		return nil, err
 	}
 	logPath := strings.TrimSpace(req.LogPath)
 	if logPath == "" {
-		logPath = filepath.Join(projectPath, ".harbor-factory-codex.log")
+		logPath = filepath.Join(projectPath, ".codex-app-server.log")
+	} else if logPath, err = filepath.Abs(logPath); err != nil {
+		return nil, fmt.Errorf("resolve Codex log path: %w", err)
 	}
 	maxOutputBytes := req.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -62,36 +86,21 @@ func (r Runtime) OpenConversation(ctx context.Context, req agent.ConversationReq
 	if sandboxPolicy == "" {
 		sandboxPolicy = "readOnly"
 	}
-	env := os.Environ()
-	if capability.NodePath != "" {
-		env = codex.WithNodeOnPATH(env, capability.NodePath)
-	}
-	configuredEnv := copyEnv(r.env)
-	cleanupCodexHome := ""
-	sandbox, err := codex.NewSandbox(projectPath, filepath.Dir(logPath), fmt.Sprintf("harbor-factory-%d", time.Now().UnixNano()))
-	if err != nil {
-		return nil, err
-	}
-	if !hasConfiguredEnv(configuredEnv, "CODEX_HOME") {
-		if err := prepareAutomationCodexHome(sandbox.Home, projectPath); err != nil {
-			return nil, err
-		}
-		if configuredEnv == nil {
-			configuredEnv = map[string]string{}
-		}
-		configuredEnv["CODEX_HOME"] = sandbox.Home
-		cleanupCodexHome = sandbox.Home
-	}
-	env = sandbox.Env(env, configuredEnv)
+
+	// The base environment is intentionally sanitized.  In particular, an
+	// ambient CODEX_HOME, API key, or provider endpoint cannot silently become
+	// part of this operation; only explicitly supplied values survive.
 	session := appserver.New(envKeys(env))
 	if err := session.Start(ctx, appserver.Request{
+		ClientName:        "codex-agent-runtime",
+		ClientVersion:     "1",
 		ProjectPath:       projectPath,
 		LogPath:           logPath,
 		Env:               env,
 		CommandPath:       capability.Path,
 		CapabilitySummary: capability.Version,
 		HasAppServer:      capability.HasAppServer,
-		Model:             req.Model,
+		Model:             model,
 		ReasoningEffort:   req.ReasoningEffort,
 		SandboxMode:       sandboxMode,
 		SandboxPolicy:     sandboxPolicy,
@@ -100,26 +109,34 @@ func (r Runtime) OpenConversation(ctx context.Context, req agent.ConversationReq
 		MaxOutputBytes:    maxOutputBytes,
 	}); err != nil {
 		_ = session.Close()
-		if cleanupCodexHome != "" {
-			_ = os.RemoveAll(cleanupCodexHome)
-		}
 		return nil, err
 	}
 	defaults := req
 	defaults.ProjectPath = projectPath
+	defaults.Model = model
 	defaults.LogPath = logPath
 	defaults.SandboxMode = sandboxMode
 	defaults.SandboxPolicy = sandboxPolicy
 	defaults.MaxOutputBytes = maxOutputBytes
 	defaults.WorkspaceRoots = workspaceRoots(projectPath, req.WorkspaceRoots)
-	return &conversation{session: session, defaults: defaults, model: req.Model, cleanup: cleanupCodexHome}, nil
+	return &conversation{session: session, defaults: defaults, model: model}, nil
 }
 
 func (c *conversation) Turn(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
+	return c.turn(ctx, req, nil)
+}
+
+// TurnStream performs one Codex turn and forwards its best-effort App Server
+// updates through the generic Agent streaming capability.
+func (c *conversation) TurnStream(ctx context.Context, req agent.TurnRequest, onUpdate agent.TurnUpdateHandler) (agent.TurnResult, error) {
+	return c.turn(ctx, req, onUpdate)
+}
+
+func (c *conversation) turn(ctx context.Context, req agent.TurnRequest, onUpdate agent.TurnUpdateHandler) (agent.TurnResult, error) {
 	if c == nil || c.session == nil {
 		return agent.TurnResult{}, fmt.Errorf("codex conversation is not open")
 	}
-	if model := strings.TrimSpace(req.Model); model != "" && model != strings.TrimSpace(c.model) {
+	if model := strings.TrimSpace(req.Model); model != "" && model != c.model {
 		return agent.TurnResult{}, fmt.Errorf("codex conversation model cannot change from %q to %q", c.model, model)
 	}
 	timeoutSeconds := req.TimeoutSeconds
@@ -138,13 +155,26 @@ func (c *conversation) Turn(ctx context.Context, req agent.TurnRequest) (agent.T
 	if logPath == "" {
 		logPath = c.defaults.LogPath
 	}
-	result, err := c.session.Turn(ctx, appserver.TurnRequest{
+	turnRequest := appserver.TurnRequest{
 		Timeout:        timeout,
 		Prompt:         req.Prompt,
 		Input:          appServerInput(req.Input),
 		LogPath:        logPath,
 		MaxOutputBytes: maxOutputBytes,
-	})
+	}
+	if onUpdate != nil {
+		turnRequest.OnDelta = func(update appserver.Update) {
+			onUpdate(agent.TurnUpdate{
+				TurnID:    update.TurnID,
+				ItemID:    update.ItemID,
+				Delta:     update.Delta,
+				Text:      update.Text,
+				Done:      update.Done,
+				Truncated: update.Truncated,
+			})
+		}
+	}
+	result, err := c.session.Turn(ctx, turnRequest)
 	if err != nil {
 		return agent.TurnResult{}, err
 	}
@@ -157,6 +187,15 @@ func (c *conversation) Turn(ctx context.Context, req agent.TurnRequest) (agent.T
 	return agent.TurnResult{Text: result.Result.Stdout, Model: c.model, Warnings: warnings}, nil
 }
 
+// Steer forwards live caller guidance to the active Codex App Server turn.
+// The App Server enforces that a turn is active before accepting it.
+func (c *conversation) Steer(ctx context.Context, guidance string) error {
+	if c == nil || c.session == nil {
+		return fmt.Errorf("codex conversation is not open")
+	}
+	return c.session.SendGuidance(ctx, guidance)
+}
+
 func (c *conversation) Close() error {
 	if c == nil {
 		return nil
@@ -164,11 +203,6 @@ func (c *conversation) Close() error {
 	c.closeOnce.Do(func() {
 		if c.session != nil {
 			c.closeErr = c.session.Close()
-		}
-		if c.cleanup != "" {
-			if err := os.RemoveAll(c.cleanup); c.closeErr == nil {
-				c.closeErr = err
-			}
 		}
 	})
 	return c.closeErr
@@ -227,153 +261,39 @@ func copyEnv(input map[string]string) map[string]string {
 	return output
 }
 
-func hasConfiguredEnv(env map[string]string, key string) bool {
-	for item := range env {
-		if strings.EqualFold(item, key) {
-			return true
-		}
+func validateExplicitCodexEnvironment(env map[string]string) error {
+	home, ok := configuredEnvValue(env, "CODEX_HOME")
+	if !ok || strings.TrimSpace(home) == "" {
+		return fmt.Errorf("codex agent runtime requires an explicit CODEX_HOME in its configured environment")
 	}
-	return false
-}
-
-func prepareAutomationCodexHome(home, projectPath string) error {
-	if err := os.MkdirAll(home, 0o755); err != nil {
-		return err
+	if !filepath.IsAbs(home) {
+		return fmt.Errorf("codex agent runtime CODEX_HOME must be an absolute path")
 	}
-	source := strings.TrimSpace(os.Getenv("CODEX_HOME"))
-	if source == "" {
-		userHome, err := os.UserHomeDir()
-		if err != nil {
-			return err
-		}
-		source = filepath.Join(userHome, ".codex")
+	info, err := os.Stat(home)
+	if err != nil {
+		return fmt.Errorf("stat configured CODEX_HOME: %w", err)
 	}
-	if err := writeAutomationCodexConfig(source, home, projectPath); err != nil {
-		return err
-	}
-	if err := copyCodexHomeFile(source, home, "auth.json"); err != nil {
-		return err
+	if !info.IsDir() {
+		return fmt.Errorf("configured CODEX_HOME is not a directory: %s", home)
 	}
 	return nil
 }
 
-func writeAutomationCodexConfig(sourceHome, targetHome, projectPath string) error {
-	sourcePath := filepath.Join(sourceHome, "config.toml")
-	data, _ := os.ReadFile(sourcePath)
-	source := string(data)
-	provider := topLevelConfigString(source, "model_provider")
-	model := topLevelConfigString(source, "model")
-	if provider == "" {
-		provider = strings.TrimSpace(os.Getenv("CODEX_MODEL_PROVIDER"))
-	}
-	if provider == "" {
-		provider = "openai"
-	}
-	if model == "" {
-		model = "gpt-5.5"
-	}
-	providerBlock := extractTomlTableBlock(source, "model_providers."+provider)
-	if strings.TrimSpace(providerBlock) == "" && provider == "custom" {
-		providerBlock = fallbackCustomProviderBlock()
-	}
-	config := strings.Join([]string{
-		fmt.Sprintf("model_provider = %q", provider),
-		fmt.Sprintf("model = %q", model),
-		"disable_response_storage = true",
-		"",
-		strings.TrimSpace(providerBlock),
-		"",
-		fmt.Sprintf("[projects.%q]", filepath.Clean(projectPath)),
-		`trust_level = "trusted"`,
-		"",
-	}, "\n")
-	return os.WriteFile(filepath.Join(targetHome, "config.toml"), []byte(config), 0o600)
+func configuredEnvValue(env map[string]string, key string) (string, bool) {
+	value, ok := env[key]
+	return strings.TrimSpace(value), ok
 }
 
-func fallbackCustomProviderBlock() string {
-	lines := []string{
-		"[model_providers.custom]",
-		`name = "custom"`,
-		`wire_api = "responses"`,
-		`requires_openai_auth = true`,
+func absoluteConfiguredPath(value, label string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("codex agent runtime requires an explicit %s", label)
 	}
-	if baseURL := firstEnv("CODEX_MODEL_BASE_URL", "OPENAI_BASE_URL"); baseURL != "" {
-		lines = append(lines, fmt.Sprintf("base_url = %q", baseURL))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func firstEnv(keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func topLevelConfigString(config, key string) string {
-	for _, line := range strings.Split(config, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
-			continue
-		}
-		left, right, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(left) != key {
-			continue
-		}
-		value := strings.TrimSpace(strings.SplitN(right, "#", 2)[0])
-		value = strings.Trim(value, `"'`)
-		return strings.TrimSpace(value)
-	}
-	return ""
-}
-
-func extractTomlTableBlock(config, table string) string {
-	header := "[" + table + "]"
-	lines := strings.Split(config, "\n")
-	start := -1
-	for i, line := range lines {
-		if strings.TrimSpace(line) == header {
-			start = i
-			break
-		}
-	}
-	if start < 0 {
-		return ""
-	}
-	end := len(lines)
-	for i := start + 1; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			end = i
-			break
-		}
-	}
-	return strings.TrimSpace(strings.Join(lines[start:end], "\n"))
-}
-
-func copyCodexHomeFile(sourceHome, targetHome, name string) error {
-	sourcePath := filepath.Join(sourceHome, name)
-	data, err := os.ReadFile(sourcePath)
+	abs, err := filepath.Abs(value)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
+		return "", fmt.Errorf("resolve %s: %w", label, err)
 	}
-	return os.WriteFile(filepath.Join(targetHome, name), data, 0o600)
-}
-
-func mergeEnv(base []string, configured map[string]string) []string {
-	if len(configured) == 0 {
-		return base
-	}
-	result := append([]string{}, base...)
-	for key, value := range configured {
-		result = append(result, key+"="+value)
-	}
-	return result
+	return filepath.Clean(abs), nil
 }
 
 func envKeys(env []string) []string {
@@ -386,3 +306,10 @@ func envKeys(env []string) []string {
 	}
 	return keys
 }
+
+var (
+	_ agent.Runtime               = Runtime{}
+	_ agent.Conversation          = (*conversation)(nil)
+	_ agent.StreamingConversation = (*conversation)(nil)
+	_ agent.SteerableConversation = (*conversation)(nil)
+)

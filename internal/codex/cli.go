@@ -27,30 +27,87 @@ type Capability struct {
 	OptionalMissingMessage string `json:"optional_missing_message,omitempty"`
 }
 
+// DetectCLI is a diagnostic helper that may discover Codex on PATH.  It is
+// intentionally separate from InspectCLI: controlled runtimes must use an
+// explicitly configured executable and never call this helper.
 func DetectCLI(ctx context.Context, exec executor.CommandRunner, preferredPath string) Capability {
-	cap := Capability{}
+	if exec == nil {
+		exec = executor.New()
+	}
 	path := strings.TrimSpace(preferredPath)
 	if path == "" {
 		found, err := exec.LookPath("codex")
 		if err != nil {
-			cap.DetectionError = err.Error()
-			return cap
+			return Capability{DetectionError: err.Error()}
 		}
 		path = found
 	}
+	return inspectCLI(ctx, exec, path)
+}
+
+// InspectCLI probes one explicitly configured Codex executable.  It never
+// searches PATH and rejects relative or non-executable paths before invoking
+// the command.  It is suitable for a composition that has already selected
+// and attested the executable.
+func InspectCLI(ctx context.Context, exec executor.CommandRunner, commandPath string) Capability {
+	if exec == nil {
+		exec = executor.New()
+	}
+	return inspectExplicitCLI(ctx, exec, commandPath, os.Environ(), true)
+}
+
+// InspectCLIWithEnvironment probes an explicitly configured executable using
+// exactly the supplied environment.  It does not discover a Node runtime or
+// alter PATH: a controlled composition must provide every process dependency
+// it intends the executable to use.
+func InspectCLIWithEnvironment(ctx context.Context, exec executor.CommandRunner, commandPath string, env []string) Capability {
+	if exec == nil {
+		exec = executor.New()
+	}
+	return inspectExplicitCLI(ctx, exec, commandPath, env, false)
+}
+
+func inspectExplicitCLI(ctx context.Context, exec executor.CommandRunner, commandPath string, env []string, discoverNode bool) Capability {
+	path := strings.TrimSpace(commandPath)
+	if path == "" {
+		return Capability{DetectionError: "codex executable path is required"}
+	}
+	if !filepath.IsAbs(path) {
+		return Capability{Path: path, DetectionError: "codex executable path must be absolute"}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return Capability{Path: path, DetectionError: fmt.Sprintf("stat codex executable: %v", err)}
+	}
+	if info.IsDir() || !isExecutableFile(path) {
+		return Capability{Path: path, DetectionError: "codex executable path is not an executable file"}
+	}
+	return inspectCLIWithEnvironment(ctx, exec, path, env, discoverNode)
+}
+
+func inspectCLI(ctx context.Context, exec executor.CommandRunner, path string) Capability {
+	return inspectCLIWithEnvironment(ctx, exec, path, os.Environ(), true)
+}
+
+func inspectCLIWithEnvironment(ctx context.Context, exec executor.CommandRunner, path string, env []string, discoverNode bool) Capability {
+	cap := Capability{}
 	cap.Path = path
 	cap.ResolvedPath = resolvePath(path)
-	cap.NodePath, cap.PathPrependedForNode, cap.NodeDetectionMessage = detectNodeForCodex(cap.Path, cap.ResolvedPath, os.Getenv("PATH"))
-	env := os.Environ()
-	if cap.NodePath != "" {
-		env = WithNodeOnPATH(env, cap.NodePath)
+	probeEnv := append([]string(nil), env...)
+	if discoverNode {
+		cap.NodePath, cap.PathPrependedForNode, cap.NodeDetectionMessage = detectNodeForCodex(cap.Path, cap.ResolvedPath, environmentValue(probeEnv, "PATH"))
+		if cap.NodePath != "" {
+			probeEnv = WithNodeOnPATH(probeEnv, cap.NodePath)
+		}
+	} else {
+		cap.NodeDetectionMessage = "node resolution is delegated to the configured process environment"
 	}
-	version := exec.Run(ctx, 5*time.Second, "", env, path, "--version")
+	version := exec.Run(ctx, 5*time.Second, "", probeEnv, path, "--version")
 	cap.Version = firstLine(firstNonEmpty(version.Stdout, version.Stderr))
 	if version.Err != nil && cap.DetectionError == "" {
 		cap.DetectionError = version.Err.Error()
 	}
-	help := exec.Run(ctx, 5*time.Second, "", env, path, "app-server", "--help")
+	help := exec.Run(ctx, 5*time.Second, "", probeEnv, path, "app-server", "--help")
 	helpText := help.Stdout + "\n" + help.Stderr
 	if strings.TrimSpace(helpText) != "" && help.Err == nil {
 		cap.AppServerHelpAvailable = true
@@ -73,7 +130,7 @@ func ValidateAppServerCapability(cap Capability) error {
 		return fmt.Errorf("codex executable not found")
 	}
 	if !cap.HasAppServer {
-		return fmt.Errorf("codex CLI does not expose app-server; static review requires codex app-server turn/steer")
+		return fmt.Errorf("codex CLI does not expose app-server; interactive agent turns require codex app-server")
 	}
 	if !cap.HasConfig {
 		return fmt.Errorf("codex app-server does not expose -c/--config; cannot configure approval policy and sandbox mode")
@@ -81,70 +138,17 @@ func ValidateAppServerCapability(cap Capability) error {
 	return nil
 }
 
-func ValidateAppServerExtraArgs(args []string) ([]string, error) {
-	modelSeen := false
-	for i := 0; i < len(args); i++ {
-		arg := strings.TrimSpace(args[i])
-		switch {
-		case arg == "--model" || arg == "-m":
-			if modelSeen {
-				return nil, fmt.Errorf("codex.extra_args contains duplicate model selection")
-			}
-			if i+1 >= len(args) {
-				return nil, missingAppServerModelValueError(arg)
-			}
-			if err := validateAppServerModelValue(arg, args[i+1]); err != nil {
-				return nil, err
-			}
-			modelSeen = true
-			i++
-		case strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "-m="):
-			if modelSeen {
-				return nil, fmt.Errorf("codex.extra_args contains duplicate model selection")
-			}
-			flag, value, _ := strings.Cut(arg, "=")
-			if err := validateAppServerModelValue(flag, value); err != nil {
-				return nil, err
-			}
-			modelSeen = true
-		default:
-			return nil, fmt.Errorf("codex.extra_args contains unsupported app-server argument: %s", arg)
-		}
+// ValidateControlledAppServerCapability validates a capability returned by
+// InspectCLI.  It additionally rejects any probe failure so a caller cannot
+// accidentally execute an unverified or PATH-discovered command.
+func ValidateControlledAppServerCapability(cap Capability) error {
+	if strings.TrimSpace(cap.DetectionError) != "" {
+		return fmt.Errorf("inspect codex executable: %s", cap.DetectionError)
 	}
-	return append([]string{}, args...), nil
-}
-
-func validateAppServerModelValue(flag, value string) error {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return missingAppServerModelValueError(flag)
+	if !filepath.IsAbs(cap.Path) {
+		return fmt.Errorf("codex executable path must be absolute")
 	}
-	if strings.HasPrefix(value, "-") {
-		return fmt.Errorf("codex.extra_args %s requires a model value, got option-like value %q", flag, value)
-	}
-	return nil
-}
-
-func missingAppServerModelValueError(flag string) error {
-	return fmt.Errorf("codex.extra_args %s requires a model value", flag)
-}
-
-func AppServerModelFromArgs(args []string) string {
-	for i, arg := range args {
-		arg = strings.TrimSpace(arg)
-		if arg == "--model" || arg == "-m" {
-			if i+1 < len(args) {
-				return strings.TrimSpace(args[i+1])
-			}
-			return ""
-		}
-		for _, prefix := range []string{"--model=", "-m="} {
-			if strings.HasPrefix(arg, prefix) {
-				return strings.TrimSpace(strings.TrimPrefix(arg, prefix))
-			}
-		}
-	}
-	return ""
+	return ValidateAppServerCapability(cap)
 }
 
 func WithNodeOnPATH(env []string, nodePath string) []string {
@@ -296,6 +300,16 @@ func firstLine(value string) string {
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func environmentValue(env []string, key string) string {
+	for _, item := range env {
+		name, value, ok := strings.Cut(item, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(name), key) {
 			return value
 		}
 	}

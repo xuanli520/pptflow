@@ -19,14 +19,18 @@ const harborRunBundleExpectedTrialCount = 4
 
 // HarborRunBundleJobFactsV018 is the minimal typed projection required by the
 // 0.18 evaluator adapter. PassAtK is grouped exactly as Harbor's job summary
-// writes it: evaluator group -> string k -> value.
+// writes it: evaluator group -> string k -> value. InternalRetryCount is
+// Harbor's authenticated job-wide stats.n_retries aggregate. Harbor 0.18 does
+// not expose a verified mapping from that aggregate to an individual final
+// Trial result, so it must never be expanded into inferred TrialAttempt facts.
 type HarborRunBundleJobFactsV018 struct {
-	ID            string                        `json:"id"`
-	FinishedAt    time.Time                     `json:"finished_at"`
-	TotalTrials   int                           `json:"n_total_trials"`
-	RunningTrials int                           `json:"n_running_trials"`
-	PendingTrials int                           `json:"n_pending_trials"`
-	PassAtK       map[string]map[string]float64 `json:"pass_at_k"`
+	ID                 string                        `json:"id"`
+	FinishedAt         time.Time                     `json:"finished_at"`
+	TotalTrials        int                           `json:"n_total_trials"`
+	RunningTrials      int                           `json:"n_running_trials"`
+	PendingTrials      int                           `json:"n_pending_trials"`
+	InternalRetryCount int                           `json:"n_retries"`
+	PassAtK            map[string]map[string]float64 `json:"pass_at_k"`
 }
 
 // HarborRunBundleEvaluatorFactsV018 reflects Harbor's TrialResult agent_info.
@@ -412,11 +416,18 @@ func harborRunBundleParseJobFacts(raw []byte) (HarborRunBundleJobFactsV018, erro
 	if err != nil {
 		return HarborRunBundleJobFactsV018{}, err
 	}
+	internalRetries, err := harborRunBundleRequiredNonNegativeInt(stats, "n_retries", "Harbor job result.stats")
+	if err != nil {
+		return HarborRunBundleJobFactsV018{}, err
+	}
 	passAtK, err := harborRunBundleParsePassAtK(stats)
 	if err != nil {
 		return HarborRunBundleJobFactsV018{}, err
 	}
-	return HarborRunBundleJobFactsV018{ID: id, FinishedAt: finishedAt, TotalTrials: total, RunningTrials: running, PendingTrials: pending, PassAtK: passAtK}, nil
+	return HarborRunBundleJobFactsV018{
+		ID: id, FinishedAt: finishedAt, TotalTrials: total, RunningTrials: running, PendingTrials: pending,
+		InternalRetryCount: internalRetries, PassAtK: passAtK,
+	}, nil
 }
 
 func harborRunBundleParsePassAtK(stats map[string]json.RawMessage) (map[string]map[string]float64, error) {
@@ -687,12 +698,16 @@ func harborRunBundleRequiredNonNegativeInt(object map[string]json.RawMessage, ke
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.UseNumber()
-	var number json.Number
-	if err := decoder.Decode(&number); err != nil {
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
 		return 0, fmt.Errorf("%w: %s.%s must be an integer", ErrInvalidHarborRunBundle, label, key)
 	}
 	if _, err := decoder.Token(); err != io.EOF {
 		return 0, fmt.Errorf("%w: %s.%s has trailing JSON", ErrInvalidHarborRunBundle, label, key)
+	}
+	number, numeric := decoded.(json.Number)
+	if !numeric {
+		return 0, fmt.Errorf("%w: %s.%s must be an integer", ErrInvalidHarborRunBundle, label, key)
 	}
 	value, err := number.Int64()
 	if err != nil || value < 0 || int64(int(value)) != value {

@@ -29,10 +29,19 @@ const (
 	LifecycleMutationSoftDelete  LifecycleMutationAction = "task.soft_delete"
 	LifecycleMutationRestore     LifecycleMutationAction = "task.restore"
 	LifecycleMutationStartRun    LifecycleMutationAction = "run.start"
-	LifecycleMutationPackage     LifecycleMutationAction = "release.local_package"
-	LifecycleMutationWithdraw    LifecycleMutationAction = "release.withdraw"
-	LifecycleMutationEdit        LifecycleMutationAction = "task.edit"
-	LifecycleMutationReview      LifecycleMutationAction = "review.decide"
+	// LifecycleMutationCodeEdgeEvaluator records the strict child Run used to
+	// collect the Qwen then Opus pass@4 evidence for one approved Phase-1 Run.
+	// It is distinct from generic run.start so a frozen generic input bundle can
+	// never be replayed as a production evaluator invocation.
+	LifecycleMutationCodeEdgeEvaluator LifecycleMutationAction = "run.codeedge_evaluator"
+	// LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff adopts one completed
+	// child Run's verified evidence into its Phase-1 parent. It is not a generic
+	// artifact import and accepts no caller-supplied receipt bytes.
+	LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff LifecycleMutationAction = "run.codeedge_evaluator_evidence_handoff"
+	LifecycleMutationPackage                          LifecycleMutationAction = "release.local_package"
+	LifecycleMutationWithdraw                         LifecycleMutationAction = "release.withdraw"
+	LifecycleMutationEdit                             LifecycleMutationAction = "task.edit"
+	LifecycleMutationReview                           LifecycleMutationAction = "review.decide"
 )
 
 // LifecycleMutationCheckpoint is the complete optimistic identity captured by
@@ -109,7 +118,46 @@ type StartRunLifecycleCommand struct {
 	LifecycleMutationCommandBase
 	ProfilePath       string `json:"profile_path"`
 	ExecutionSpecPath string `json:"execution_spec_path"`
-	Trigger           string `json:"trigger"`
+	// ParentRunID is optional for the generic run-start surface. The strict
+	// evaluator launch service always requires and freezes it.
+	ParentRunID string `json:"parent_run_id,omitempty"`
+	Trigger     string `json:"trigger"`
+}
+
+// CodeEdgeEvaluatorLaunchCommand intentionally contains no profile, spec,
+// provider, model, endpoint, secret, or argv fields. Those facts are owned by
+// the catalog/lock-attested definition provider installed at composition time.
+type CodeEdgeEvaluatorLaunchCommand struct {
+	LifecycleMutationCommandBase
+	ParentRunID string `json:"parent_run_id"`
+}
+
+// CodeEdgeEvaluatorEvidenceHandoffCommand deliberately accepts only the two
+// durable Run identities. The application service rebuilds and verifies every
+// receipt, trial, artifact, catalog, and manifest fact itself; callers cannot
+// smuggle a handoff document or any evidence bytes across this boundary.
+type CodeEdgeEvaluatorEvidenceHandoffCommand struct {
+	LifecycleMutationCommandBase
+	ParentRunID string `json:"parent_run_id"`
+	ChildRunID  string `json:"child_run_id"`
+}
+
+// PreparedCodeEdgeEvaluatorEvidenceHandoff is the durable first-confirmation
+// receipt for an evidence adoption. Confirming it later consumes precisely the
+// captured parent checkpoint and child identity; a direct confirm is rejected.
+type PreparedCodeEdgeEvaluatorEvidenceHandoff struct {
+	OperationID          string
+	ParentRunID          string
+	ChildRunID           string
+	HandoffFingerprint   workflowkit.Fingerprint
+	QwenTrialFingerprint workflowkit.Fingerprint
+	OpusTrialFingerprint workflowkit.Fingerprint
+}
+
+type codeEdgeEvaluatorEvidenceHandoffPayload struct {
+	Format      string `json:"format"`
+	ParentRunID string `json:"parent_run_id"`
+	ChildRunID  string `json:"child_run_id"`
 }
 
 type PackageLifecycleCommand struct {
@@ -134,24 +182,28 @@ type DecideReviewLifecycleCommand struct {
 // payload stored in the V12 operation result, allowing a retry to return the
 // original identities without recomputing against newer lifecycle state.
 type LifecycleMutationReceipt struct {
-	Action               LifecycleMutationAction `json:"action"`
-	OperationID          string                  `json:"operation_id"`
-	TaskID               string                  `json:"task_id,omitempty"`
-	TaskVersion          int64                   `json:"task_version,omitempty"`
-	RevisionID           string                  `json:"revision_id,omitempty"`
-	RevisionStateVersion int64                   `json:"revision_state_version,omitempty"`
-	RunID                string                  `json:"run_id,omitempty"`
-	RunVersion           int64                   `json:"run_version,omitempty"`
-	ReleaseID            string                  `json:"release_id,omitempty"`
-	ReleaseVersion       string                  `json:"release_version,omitempty"`
-	DeletionRecordID     string                  `json:"deletion_record_id,omitempty"`
-	ReviewRequestID      string                  `json:"review_request_id,omitempty"`
-	ReviewDecisionID     string                  `json:"review_decision_id,omitempty"`
-	ReviewDecision       string                  `json:"review_decision,omitempty"`
-	PlanID               string                  `json:"plan_id,omitempty"`
-	ExecutionID          string                  `json:"execution_id,omitempty"`
-	CandidateID          string                  `json:"candidate_id,omitempty"`
-	Summary              string                  `json:"summary"`
+	Action                              LifecycleMutationAction `json:"action"`
+	OperationID                         string                  `json:"operation_id"`
+	TaskID                              string                  `json:"task_id,omitempty"`
+	TaskVersion                         int64                   `json:"task_version,omitempty"`
+	RevisionID                          string                  `json:"revision_id,omitempty"`
+	RevisionStateVersion                int64                   `json:"revision_state_version,omitempty"`
+	RunID                               string                  `json:"run_id,omitempty"`
+	ParentRunID                         string                  `json:"parent_run_id,omitempty"`
+	ChildRunID                          string                  `json:"child_run_id,omitempty"`
+	RunVersion                          int64                   `json:"run_version,omitempty"`
+	EvaluatorEvidenceHandoffID          string                  `json:"evaluator_evidence_handoff_id,omitempty"`
+	EvaluatorEvidenceHandoffFingerprint string                  `json:"evaluator_evidence_handoff_fingerprint,omitempty"`
+	ReleaseID                           string                  `json:"release_id,omitempty"`
+	ReleaseVersion                      string                  `json:"release_version,omitempty"`
+	DeletionRecordID                    string                  `json:"deletion_record_id,omitempty"`
+	ReviewRequestID                     string                  `json:"review_request_id,omitempty"`
+	ReviewDecisionID                    string                  `json:"review_decision_id,omitempty"`
+	ReviewDecision                      string                  `json:"review_decision,omitempty"`
+	PlanID                              string                  `json:"plan_id,omitempty"`
+	ExecutionID                         string                  `json:"execution_id,omitempty"`
+	CandidateID                         string                  `json:"candidate_id,omitempty"`
+	Summary                             string                  `json:"summary"`
 }
 
 // LifecycleMutationService is the typed application boundary for Task Hub
@@ -495,12 +547,123 @@ func (service *LifecycleMutationService) StartRun(ctx context.Context, command S
 		ExecutionSpecFingerprint:      inputs.Bundle.ExecutionSpecFingerprint,
 		DeploymentCatalogReceipt:      append([]byte(nil), inputs.DeploymentCatalogReceipt...),
 		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(inputs.DeploymentCatalogLockIdentity),
-		Trigger:                       command.Trigger, Actor: op.Actor, Reason: op.Reason,
+		ParentRunID:                   inputs.Bundle.ParentRunID,
+		Trigger:                       inputs.Bundle.Trigger, Actor: op.Actor, Reason: op.Reason,
 	})
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
 	}
 	return service.complete(ctx, op, receiptForRun(LifecycleMutationStartRun, run))
+}
+
+// PrepareCodeEdgeEvaluatorEvidenceHandoff writes the first-confirmation
+// lifecycle receipt only after read-only verification of the closed
+// parent/child evidence graph. It deliberately creates no handoff and no
+// provider side effect.
+func (service *LifecycleMutationService) PrepareCodeEdgeEvaluatorEvidenceHandoff(ctx context.Context, command CodeEdgeEvaluatorEvidenceHandoffCommand) (PreparedCodeEdgeEvaluatorEvidenceHandoff, error) {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, fmt.Errorf("lifecycle mutation service is not configured")
+	}
+	if err := validateCodeEdgeEvaluatorEvidenceHandoffCommand(command); err != nil {
+		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
+	}
+	plan, err := (&CodeEdgeEvaluatorEvidenceHandoffService{core: service.core}).Plan(ctx, command.ParentRunID, command.ChildRunID)
+	if err != nil {
+		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
+	}
+	op, replay, err := service.begin(ctx, LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff, command.LifecycleMutationCommandBase, codeEdgeEvaluatorEvidenceHandoffPayload{
+		Format: "harbor.codeedge-evaluator-evidence-handoff.prepare.v1", ParentRunID: strings.TrimSpace(command.ParentRunID), ChildRunID: strings.TrimSpace(command.ChildRunID),
+	}, lifecycleOperationTargets{TaskID: command.Expected.TaskID, RevisionID: command.Expected.RevisionID, RunID: command.ParentRunID})
+	if err != nil {
+		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
+	}
+	if replay != nil {
+		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, fmt.Errorf("completed CodeEdge evaluator evidence handoff cannot be prepared again")
+	}
+	if err := service.validateCheckpoint(ctx, command.Expected); err != nil {
+		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
+	}
+	return PreparedCodeEdgeEvaluatorEvidenceHandoff{
+		OperationID:          op.ID,
+		ParentRunID:          plan.ParentRunID,
+		ChildRunID:           plan.ChildRunID,
+		HandoffFingerprint:   plan.HandoffFingerprint,
+		QwenTrialFingerprint: plan.QwenTrialFingerprint,
+		OpusTrialFingerprint: plan.OpusTrialFingerprint,
+	}, nil
+}
+
+// AdoptCodeEdgeEvaluatorEvidenceHandoff is the sole generic lifecycle-mutation
+// route for adopting a completed child evaluator Run. It is UUIDv7-idempotent
+// and keeps its durable operation separate from the handoff identity, so a
+// lost response can be replayed without manufacturing a second evidence
+// bridge. The child is never supplied as a caller-owned evidence payload.
+func (service *LifecycleMutationService) AdoptCodeEdgeEvaluatorEvidenceHandoff(ctx context.Context, command CodeEdgeEvaluatorEvidenceHandoffCommand) (LifecycleMutationReceipt, error) {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return LifecycleMutationReceipt{}, fmt.Errorf("lifecycle mutation service is not configured")
+	}
+	if err := validateCodeEdgeEvaluatorEvidenceHandoffCommand(command); err != nil {
+		return LifecycleMutationReceipt{}, err
+	}
+	if receipt, replayed, err := service.completedOperationReplay(ctx, LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff, command.LifecycleMutationCommandBase); err != nil {
+		return LifecycleMutationReceipt{}, err
+	} else if replayed {
+		return receipt, nil
+	}
+	prepared, err := service.core.store.GetLifecycleOperationByIdempotencyKey(ctx, command.IdempotencyKey)
+	if err != nil {
+		return LifecycleMutationReceipt{}, err
+	}
+	if prepared == nil || prepared.Action != string(LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff) || prepared.State != store.LifecycleOperationPrepared {
+		return LifecycleMutationReceipt{}, fmt.Errorf("CodeEdge evaluator evidence handoff must be prepared before confirmation")
+	}
+	op, replay, err := service.begin(ctx, LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff, command.LifecycleMutationCommandBase, codeEdgeEvaluatorEvidenceHandoffPayload{
+		Format: "harbor.codeedge-evaluator-evidence-handoff.prepare.v1", ParentRunID: strings.TrimSpace(command.ParentRunID), ChildRunID: strings.TrimSpace(command.ChildRunID),
+	}, lifecycleOperationTargets{TaskID: command.Expected.TaskID, RevisionID: command.Expected.RevisionID, RunID: command.ParentRunID})
+	if err != nil || replay != nil {
+		return lifecycleReplayResult(replay, err)
+	}
+	if err := service.validateCheckpoint(ctx, command.Expected); err != nil {
+		return LifecycleMutationReceipt{}, err
+	}
+	handoff, err := (&CodeEdgeEvaluatorEvidenceHandoffService{core: service.core}).Record(ctx, RecordCodeEdgeEvaluatorEvidenceHandoffRequest{
+		ID:             op.IdempotencyKey,
+		IdempotencyKey: op.IdempotencyKey,
+		ParentRunID:    command.ParentRunID,
+		ChildRunID:     command.ChildRunID,
+		Actor:          op.Actor,
+		Reason:         op.Reason,
+	})
+	if err != nil {
+		return LifecycleMutationReceipt{}, err
+	}
+	return service.complete(ctx, op, LifecycleMutationReceipt{
+		Action:                              LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff,
+		TaskID:                              handoff.TaskID,
+		RevisionID:                          handoff.RevisionID,
+		RunID:                               handoff.ParentRunID,
+		ParentRunID:                         handoff.ParentRunID,
+		ChildRunID:                          handoff.ChildRunID,
+		EvaluatorEvidenceHandoffID:          handoff.ID,
+		EvaluatorEvidenceHandoffFingerprint: handoff.HandoffFingerprint,
+		Summary:                             "已采用并验证 CodeEdge evaluator child 证据",
+	})
+}
+
+func validateCodeEdgeEvaluatorEvidenceHandoffCommand(command CodeEdgeEvaluatorEvidenceHandoffCommand) error {
+	if err := store.ValidateUUIDv7(strings.TrimSpace(command.ParentRunID)); err != nil {
+		return fmt.Errorf("CodeEdge evaluator parent Run: %w", err)
+	}
+	if err := store.ValidateUUIDv7(strings.TrimSpace(command.ChildRunID)); err != nil {
+		return fmt.Errorf("CodeEdge evaluator child Run: %w", err)
+	}
+	if command.Expected.RunID != strings.TrimSpace(command.ParentRunID) || command.Expected.RunVersion <= 0 || command.Expected.RunDefinitionHash == "" {
+		return fmt.Errorf("CodeEdge evaluator evidence handoff requires the captured parent Run checkpoint")
+	}
+	if command.Expected.TaskID == "" || command.Expected.RevisionID == "" || command.Expected.RevisionDigest == "" {
+		return fmt.Errorf("CodeEdge evaluator evidence handoff requires the captured TaskRevision checkpoint")
+	}
+	return nil
 }
 
 func (service *LifecycleMutationService) Package(ctx context.Context, command PackageLifecycleCommand) (LifecycleMutationReceipt, error) {

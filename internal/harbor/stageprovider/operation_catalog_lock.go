@@ -83,6 +83,80 @@ func (identity HarborFlowBuildIdentity) Validate() error {
 	return nil
 }
 
+// CodeEdgeEvaluatorChildExecutionProfileLock is the complete, deployment-
+// owned execution envelope for the closed CodeEdge evaluator child. It is
+// intentionally a typed ExecutionProfile rather than a projection of a
+// parent Run profile: the evaluator child has its own lifecycle, budget,
+// continuation, and candidate-provider limits.
+//
+// Its JSON representation is workflowadapter.ExecutionProfile's canonical
+// human-readable profile document (with duration strings), while the Go
+// boundary retains the fully resolved typed value. This makes every budget
+// field fingerprint-significant through the enclosing deployment lock without
+// admitting an untyped configuration bag.
+type CodeEdgeEvaluatorChildExecutionProfileLock struct {
+	Profile workflowadapter.ExecutionProfile `json:"-"`
+}
+
+// Clone returns independently owned profile data so inspection callers cannot
+// mutate the process-installed child execution envelope.
+func (profile CodeEdgeEvaluatorChildExecutionProfileLock) Clone() CodeEdgeEvaluatorChildExecutionProfileLock {
+	profile.Profile = profile.Profile.Clone()
+	return profile
+}
+
+// Validate proves that the embedded profile is complete for precisely the
+// closed evaluator-child template. The template's own validation enforces
+// exact stage coverage and max_attempts=1, so these limits cannot become a
+// generic evaluator-stage retry policy.
+func (profile CodeEdgeEvaluatorChildExecutionProfileLock) Validate() error {
+	if !profile.Profile.Template.Equal(workflowadapter.CodeEdgeEvaluatorChildTemplateReference()) {
+		return fmt.Errorf("%w: CodeEdge evaluator child execution profile must bind %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion)
+	}
+	if err := profile.Profile.Validate(); err != nil {
+		return fmt.Errorf("%w: CodeEdge evaluator child execution profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	return nil
+}
+
+// ExecutionProfile returns a validated defensive copy suitable for controlled
+// application composition. It deliberately exposes no parent-derived fallback.
+func (profile CodeEdgeEvaluatorChildExecutionProfileLock) ExecutionProfile() (workflowadapter.ExecutionProfile, error) {
+	if err := profile.Validate(); err != nil {
+		return workflowadapter.ExecutionProfile{}, err
+	}
+	return profile.Profile.Clone(), nil
+}
+
+// MarshalJSON persists exactly the canonical execution-profile document. This
+// keeps reviewed lock material readable while the enclosing lock canonicalizer
+// still includes every field in its immutable fingerprint.
+func (profile CodeEdgeEvaluatorChildExecutionProfileLock) MarshalJSON() ([]byte, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	return profile.Profile.CanonicalJSON()
+}
+
+// UnmarshalJSON accepts only the strict workflowadapter profile document.
+// Duplicate-key rejection is also performed by the enclosing deployment-lock
+// parser before this method runs.
+func (profile *CodeEdgeEvaluatorChildExecutionProfileLock) UnmarshalJSON(raw []byte) error {
+	if profile == nil {
+		return fmt.Errorf("%w: nil CodeEdge evaluator child execution profile", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	parsed, err := workflowadapter.ParseExecutionProfileJSON(raw)
+	if err != nil {
+		return fmt.Errorf("%w: decode CodeEdge evaluator child execution profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	resolved := CodeEdgeEvaluatorChildExecutionProfileLock{Profile: parsed}
+	if err := resolved.Validate(); err != nil {
+		return err
+	}
+	*profile = resolved
+	return nil
+}
+
 // LocalExecutableLock records the exact executable selected by a
 // local.command payload. AbsolutePath is intentionally an attested deployment
 // path rather than a Run input: callers can never replace it with PATH lookup
@@ -122,6 +196,46 @@ type DurableReviewPolicyLock struct {
 	Version  string `json:"version"`
 }
 
+const (
+	// HarborFlowBuiltinOperationLockFormat identifies a Go-controlled Harbor
+	// Flow operation. It is intentionally separate from local.command: a
+	// built-in handler has no executable path, argv, shell, or image identity.
+	// Its enclosing deployment lock's HarborFlowBuild binds the implementation
+	// that may dispatch it.
+	HarborFlowBuiltinOperationLockFormat  = "harbor.flow.builtin-operation.v1"
+	HarborFlowBuiltinOperationLockVersion = "1"
+)
+
+// HarborFlowBuiltinOperationLock pins the exact deployment-owned handler for
+// one harbor.builtin payload. HandlerVersion is independent from the outer
+// operation version so a reviewed implementation can evolve its internal
+// contract only through a new typed lock revision.
+type HarborFlowBuiltinOperationLock struct {
+	Format         string `json:"format"`
+	Version        string `json:"version"`
+	HandlerID      string `json:"handler_id"`
+	HandlerVersion string `json:"handler_version"`
+}
+
+// Clone returns an independently owned copy of a built-in handler lock.
+func (lock HarborFlowBuiltinOperationLock) Clone() HarborFlowBuiltinOperationLock { return lock }
+
+// Validate proves a built-in handler identity is explicit and versioned. It
+// deliberately does not accept an executable path, Go symbol, config map, or
+// caller-selected module: those would reintroduce an ambient execution path.
+func (lock HarborFlowBuiltinOperationLock) Validate() error {
+	if lock.Format != HarborFlowBuiltinOperationLockFormat {
+		return fmt.Errorf("%w: unsupported Harbor built-in lock format %q", ErrInvalidDeploymentOperationCatalogLock, lock.Format)
+	}
+	if lock.Version != HarborFlowBuiltinOperationLockVersion {
+		return fmt.Errorf("%w: unsupported Harbor built-in lock version %q", ErrInvalidDeploymentOperationCatalogLock, lock.Version)
+	}
+	if err := validateOperationCatalogLockToken("Harbor built-in handler id", lock.HandlerID); err != nil {
+		return err
+	}
+	return validateOperationCatalogLockVersion("Harbor built-in handler", lock.HandlerVersion)
+}
+
 // DeploymentOperationCatalogLockRecord is one fully pinned catalog entry.
 // PromptContentFingerprint and SchemaContentFingerprint are fingerprints of
 // the immutable prompt/template and schema bytes respectively. They are
@@ -140,7 +254,19 @@ type DeploymentOperationCatalogLockRecord struct {
 	LocalExecutable          *LocalExecutableLock                      `json:"local_executable,omitempty"`
 	ContainerRuntime         *PinnedContainerRuntimeLock               `json:"container_runtime,omitempty"`
 	AgentModel               *AgentModelLock                           `json:"agent_model,omitempty"`
-	DurableReviewPolicy      *DurableReviewPolicyLock                  `json:"durable_review_policy,omitempty"`
+	// HarborFlowBuiltin is the typed lock for a Go-controlled
+	// harbor.builtin operation. It is mutually exclusive with external
+	// executable/image/agent/review attestation records.
+	HarborFlowBuiltin *HarborFlowBuiltinOperationLock `json:"harbor_flow_builtin,omitempty"`
+	// CodexAppServer is an optional, typed runtime extension for agent.turn.
+	// It does not replace AgentModel: the latter remains the generic semantic
+	// agent/model binding while this field freezes the concrete local Codex App
+	// Server implementation. Keeping the extension optional preserves support
+	// for other controlled agent runtimes without admitting an untyped config
+	// bag to the generic engine.
+	CodexAppServer      *CodexAppServerOperationLock  `json:"codex_app_server,omitempty"`
+	DurableReviewPolicy *DurableReviewPolicyLock      `json:"durable_review_policy,omitempty"`
+	HarborEvaluator     *HarborEvaluatorOperationLock `json:"harbor_evaluator,omitempty"`
 }
 
 // Clone returns an independently owned lock record. Resolver accessors and
@@ -161,9 +287,21 @@ func (record DeploymentOperationCatalogLockRecord) Clone() DeploymentOperationCa
 		agent := *record.AgentModel
 		record.AgentModel = &agent
 	}
+	if record.HarborFlowBuiltin != nil {
+		builtin := record.HarborFlowBuiltin.Clone()
+		record.HarborFlowBuiltin = &builtin
+	}
+	if record.CodexAppServer != nil {
+		codex := record.CodexAppServer.Clone()
+		record.CodexAppServer = &codex
+	}
 	if record.DurableReviewPolicy != nil {
 		review := *record.DurableReviewPolicy
 		record.DurableReviewPolicy = &review
+	}
+	if record.HarborEvaluator != nil {
+		evaluator := record.HarborEvaluator.Clone()
+		record.HarborEvaluator = &evaluator
 	}
 	return record
 }
@@ -236,13 +374,16 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 	if record.DurableReviewPolicy != nil {
 		specializations++
 	}
+	if record.HarborFlowBuiltin != nil {
+		specializations++
+	}
 	if specializations != 1 {
 		return fmt.Errorf("%w: operation must contain exactly one execution attestation record", ErrInvalidDeploymentOperationCatalogLock)
 	}
 
 	switch payload := record.Operation.Payload.(type) {
 	case workflowadapter.LocalCommandOperationPayload:
-		if record.LocalExecutable == nil || record.ContainerRuntime != nil || record.AgentModel != nil || record.DurableReviewPolicy != nil {
+		if record.LocalExecutable == nil || record.ContainerRuntime != nil || record.AgentModel != nil || record.HarborFlowBuiltin != nil || record.CodexAppServer != nil || record.DurableReviewPolicy != nil {
 			return fmt.Errorf("%w: local.command requires only local_executable", ErrInvalidDeploymentOperationCatalogLock)
 		}
 		if err := validateLocalExecutableLock(*record.LocalExecutable); err != nil {
@@ -251,8 +392,27 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 		if record.LocalExecutable.CommandID != payload.CommandID {
 			return fmt.Errorf("%w: local executable command id %q does not match payload %q", ErrInvalidDeploymentOperationCatalogLock, record.LocalExecutable.CommandID, payload.CommandID)
 		}
+		if record.HarborEvaluator != nil {
+			if !isHarborEvaluatorCommandID(payload.CommandID) {
+				return fmt.Errorf("%w: Harbor evaluator lock requires one approved evaluator command id", ErrInvalidDeploymentOperationCatalogLock)
+			}
+			if len(payload.Arguments) != 0 {
+				return fmt.Errorf("%w: Harbor evaluator local.command must not accept argv", ErrInvalidDeploymentOperationCatalogLock)
+			}
+			if err := record.HarborEvaluator.Validate(); err != nil {
+				return err
+			}
+			if record.HarborEvaluator.Launcher != *record.LocalExecutable {
+				return fmt.Errorf("%w: Harbor evaluator launcher does not match local executable lock", ErrInvalidDeploymentOperationCatalogLock)
+			}
+			if record.HarborEvaluator.Launcher.CommandID != payload.CommandID {
+				return fmt.Errorf("%w: Harbor evaluator launcher command id does not match payload", ErrInvalidDeploymentOperationCatalogLock)
+			}
+		} else if isHarborEvaluatorCommandID(payload.CommandID) {
+			return fmt.Errorf("%w: Harbor evaluator command requires a typed Harbor evaluator lock", ErrInvalidDeploymentOperationCatalogLock)
+		}
 	case workflowadapter.ContainerCommandOperationPayload:
-		if record.ContainerRuntime == nil || record.LocalExecutable != nil || record.AgentModel != nil || record.DurableReviewPolicy != nil {
+		if record.ContainerRuntime == nil || record.LocalExecutable != nil || record.AgentModel != nil || record.HarborFlowBuiltin != nil || record.CodexAppServer != nil || record.DurableReviewPolicy != nil || record.HarborEvaluator != nil {
 			return fmt.Errorf("%w: container.command requires only container_runtime", ErrInvalidDeploymentOperationCatalogLock)
 		}
 		if err := validatePinnedContainerRuntimeLock(*record.ContainerRuntime, record.Runtime); err != nil {
@@ -262,7 +422,7 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 			return fmt.Errorf("%w: container image digest %q does not match payload %q", ErrInvalidDeploymentOperationCatalogLock, record.ContainerRuntime.ImageDigest, payload.ImageDigest)
 		}
 	case workflowadapter.AgentTurnOperationPayload:
-		if record.AgentModel == nil || record.LocalExecutable != nil || record.ContainerRuntime != nil || record.DurableReviewPolicy != nil {
+		if record.AgentModel == nil || record.LocalExecutable != nil || record.ContainerRuntime != nil || record.HarborFlowBuiltin != nil || record.DurableReviewPolicy != nil || record.HarborEvaluator != nil {
 			return fmt.Errorf("%w: agent.turn requires only agent_model", ErrInvalidDeploymentOperationCatalogLock)
 		}
 		if err := validateAgentModelLock(*record.AgentModel); err != nil {
@@ -271,8 +431,16 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 		if record.AgentModel.AgentID != payload.AgentID || record.AgentModel.ModelID != payload.ModelID {
 			return fmt.Errorf("%w: locked agent/model %q/%q does not match payload %q/%q", ErrInvalidDeploymentOperationCatalogLock, record.AgentModel.AgentID, record.AgentModel.ModelID, payload.AgentID, payload.ModelID)
 		}
+		if record.CodexAppServer != nil {
+			if record.AgentModel.ModelID != CodexAppServerProductionModelID {
+				return fmt.Errorf("%w: Codex App Server agent.turn must pin model %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerProductionModelID)
+			}
+			if err := record.CodexAppServer.Validate(); err != nil {
+				return err
+			}
+		}
 	case workflowadapter.DurableReviewOperationPayload:
-		if record.DurableReviewPolicy == nil || record.LocalExecutable != nil || record.ContainerRuntime != nil || record.AgentModel != nil {
+		if record.DurableReviewPolicy == nil || record.LocalExecutable != nil || record.ContainerRuntime != nil || record.AgentModel != nil || record.HarborFlowBuiltin != nil || record.CodexAppServer != nil || record.HarborEvaluator != nil {
 			return fmt.Errorf("%w: durable.review requires only durable_review_policy", ErrInvalidDeploymentOperationCatalogLock)
 		}
 		if err := validateDurableReviewPolicyLock(*record.DurableReviewPolicy); err != nil {
@@ -280,6 +448,16 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 		}
 		if record.DurableReviewPolicy.PolicyID != payload.PolicyID {
 			return fmt.Errorf("%w: locked review policy %q does not match payload %q", ErrInvalidDeploymentOperationCatalogLock, record.DurableReviewPolicy.PolicyID, payload.PolicyID)
+		}
+	case workflowadapter.HarborBuiltinOperationPayload:
+		if record.HarborFlowBuiltin == nil || record.LocalExecutable != nil || record.ContainerRuntime != nil || record.AgentModel != nil || record.CodexAppServer != nil || record.DurableReviewPolicy != nil || record.HarborEvaluator != nil {
+			return fmt.Errorf("%w: harbor.builtin requires only harbor_flow_builtin", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		if err := record.HarborFlowBuiltin.Validate(); err != nil {
+			return err
+		}
+		if record.HarborFlowBuiltin.HandlerID != payload.HandlerID {
+			return fmt.Errorf("%w: locked Harbor built-in handler %q does not match payload %q", ErrInvalidDeploymentOperationCatalogLock, record.HarborFlowBuiltin.HandlerID, payload.HandlerID)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported operation payload %T", ErrInvalidDeploymentOperationCatalogLock, record.Operation.Payload)
@@ -291,17 +469,22 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 // exactly one DeploymentOperationCatalogReceipt. It holds no secret material,
 // mutable paths supplied by a Run, provider defaults, or unpinned image tags.
 type DeploymentOperationCatalogLock struct {
-	Format          string                                 `json:"format"`
-	Version         string                                 `json:"version"`
-	LockID          string                                 `json:"lock_id"`
-	LockVersion     string                                 `json:"lock_version"`
-	CatalogReceipt  DeploymentOperationCatalogReceipt      `json:"catalog_receipt"`
-	HarborFlowBuild HarborFlowBuildIdentity                `json:"harbor_flow_build"`
-	Operations      []DeploymentOperationCatalogLockRecord `json:"operations"`
+	Format                                 string                                      `json:"format"`
+	Version                                string                                      `json:"version"`
+	LockID                                 string                                      `json:"lock_id"`
+	LockVersion                            string                                      `json:"lock_version"`
+	CatalogReceipt                         DeploymentOperationCatalogReceipt           `json:"catalog_receipt"`
+	HarborFlowBuild                        HarborFlowBuildIdentity                     `json:"harbor_flow_build"`
+	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
+	Operations                             []DeploymentOperationCatalogLockRecord      `json:"operations"`
 }
 
 // Clone returns a deep copy suitable for canonicalization and inspection.
 func (lock DeploymentOperationCatalogLock) Clone() DeploymentOperationCatalogLock {
+	if lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
+		profile := lock.CodeEdgeEvaluatorChildExecutionProfile.Clone()
+		lock.CodeEdgeEvaluatorChildExecutionProfile = &profile
+	}
 	operations := lock.Operations
 	lock.Operations = make([]DeploymentOperationCatalogLockRecord, len(operations))
 	for index, operation := range operations {
@@ -332,6 +515,14 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 	if err := lock.HarborFlowBuild.Validate(); err != nil {
 		return err
 	}
+	if lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
+		if !lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgeEvaluatorChildTemplateReference()) {
+			return fmt.Errorf("%w: CodeEdge evaluator child execution profile is only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion)
+		}
+		if err := lock.CodeEdgeEvaluatorChildExecutionProfile.Validate(); err != nil {
+			return err
+		}
+	}
 	if lock.Operations == nil {
 		return fmt.Errorf("%w: operations must be an explicit array", ErrInvalidDeploymentOperationCatalogLock)
 	}
@@ -349,6 +540,17 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 	return nil
 }
 
+// CodeEdgeEvaluatorChildProfile returns the one complete child-owned profile
+// carried by this immutable lock. A missing value is intentionally an error:
+// production composition must never borrow a parent profile or invent a
+// budget default while launching an external evaluator.
+func (lock DeploymentOperationCatalogLock) CodeEdgeEvaluatorChildProfile() (workflowadapter.ExecutionProfile, error) {
+	if lock.CodeEdgeEvaluatorChildExecutionProfile == nil {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: CodeEdge evaluator child execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return lock.CodeEdgeEvaluatorChildExecutionProfile.ExecutionProfile()
+}
+
 // CanonicalJSON returns a validated stable lock representation. Operation and
 // secret-reference ordering is semantic-set ordering; all content identities
 // remain fingerprint-significant.
@@ -361,6 +563,11 @@ func (lock DeploymentOperationCatalogLock) CanonicalJSON() ([]byte, error) {
 		sort.Slice(canonical.Operations[index].Secrets, func(left, right int) bool {
 			return deploymentSecretLess(canonical.Operations[index].Secrets[left], canonical.Operations[index].Secrets[right])
 		})
+		if canonical.Operations[index].HarborEvaluator != nil {
+			evaluator := canonical.Operations[index].HarborEvaluator.Clone()
+			evaluator.Contract = evaluator.Contract.canonicalized()
+			canonical.Operations[index].HarborEvaluator = &evaluator
+		}
 	}
 	sort.Slice(canonical.Operations, func(left, right int) bool {
 		return deploymentCoordinateForLockRecord(canonical.Operations[left]).less(deploymentCoordinateForLockRecord(canonical.Operations[right]))
@@ -397,7 +604,9 @@ func ParseDeploymentOperationCatalogLockJSON(raw []byte) (DeploymentOperationCat
 	}
 	lock := DeploymentOperationCatalogLock{
 		Format: document.Format, Version: document.Version, LockID: document.LockID, LockVersion: document.LockVersion,
-		CatalogReceipt: document.CatalogReceipt, HarborFlowBuild: document.HarborFlowBuild, Operations: document.Operations,
+		CatalogReceipt: document.CatalogReceipt, HarborFlowBuild: document.HarborFlowBuild,
+		CodeEdgeEvaluatorChildExecutionProfile: document.CodeEdgeEvaluatorChildExecutionProfile,
+		Operations:                             document.Operations,
 	}
 	if err := lock.Validate(); err != nil {
 		return DeploymentOperationCatalogLock{}, err
@@ -419,13 +628,14 @@ func (lock *DeploymentOperationCatalogLock) UnmarshalJSON(raw []byte) error {
 }
 
 type deploymentOperationCatalogLockDocument struct {
-	Format          string                                 `json:"format"`
-	Version         string                                 `json:"version"`
-	LockID          string                                 `json:"lock_id"`
-	LockVersion     string                                 `json:"lock_version"`
-	CatalogReceipt  DeploymentOperationCatalogReceipt      `json:"catalog_receipt"`
-	HarborFlowBuild HarborFlowBuildIdentity                `json:"harbor_flow_build"`
-	Operations      []DeploymentOperationCatalogLockRecord `json:"operations"`
+	Format                                 string                                      `json:"format"`
+	Version                                string                                      `json:"version"`
+	LockID                                 string                                      `json:"lock_id"`
+	LockVersion                            string                                      `json:"lock_version"`
+	CatalogReceipt                         DeploymentOperationCatalogReceipt           `json:"catalog_receipt"`
+	HarborFlowBuild                        HarborFlowBuildIdentity                     `json:"harbor_flow_build"`
+	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
+	Operations                             []DeploymentOperationCatalogLockRecord      `json:"operations"`
 }
 
 // DeploymentOperationCatalogLockIdentity is the small immutable tuple that a
@@ -879,6 +1089,15 @@ func verifyOperationCatalogLockRecordRegistration(record DeploymentOperationCata
 	if record.Operation.ProviderID != registration.Operation.ProviderID || record.Operation.OperationID != registration.Operation.OperationID || record.Operation.Version != registration.Operation.Version || !bytes.Equal(lockedPayload, registeredPayload) {
 		return fmt.Errorf("%w: lock operation differs for %s", ErrDeploymentOperationCatalogLockDrift, deploymentCoordinateForLockRecord(record))
 	}
+	if registration.HarborEvaluator == nil && record.HarborEvaluator == nil {
+		return nil
+	}
+	if registration.HarborEvaluator == nil || record.HarborEvaluator == nil {
+		return fmt.Errorf("%w: Harbor evaluator contract differs for %s", ErrDeploymentOperationCatalogLockDrift, deploymentCoordinateForLockRecord(record))
+	}
+	if !sameHarborEvaluatorContract(record.HarborEvaluator.Contract, *registration.HarborEvaluator) {
+		return fmt.Errorf("%w: Harbor evaluator contract differs for %s", ErrDeploymentOperationCatalogLockDrift, deploymentCoordinateForLockRecord(record))
+	}
 	return nil
 }
 
@@ -987,6 +1206,23 @@ func validateOperationCatalogLockString(label, value string) error {
 		if unicode.IsControl(character) {
 			return fmt.Errorf("%w: %s contains a control character", ErrInvalidDeploymentOperationCatalogLock, label)
 		}
+	}
+	return nil
+}
+
+// validateOperationCatalogLockToken admits only stable machine identities for
+// typed handler/command names. Human-readable versions and paths continue to
+// use validateOperationCatalogLockString; a handler ID must never contain a
+// shell fragment, whitespace, slash, or other execution syntax.
+func validateOperationCatalogLockToken(label, value string) error {
+	if err := validateOperationCatalogLockString(label, value); err != nil {
+		return err
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '.' || character == '_' || character == '-' {
+			continue
+		}
+		return fmt.Errorf("%w: %s contains unsupported character %q", ErrInvalidDeploymentOperationCatalogLock, label, character)
 	}
 	return nil
 }

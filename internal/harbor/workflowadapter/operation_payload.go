@@ -18,6 +18,12 @@ const (
 	StageOperationPayloadContainerCommand StageOperationPayloadKind = "container.command"
 	StageOperationPayloadAgentTurn        StageOperationPayloadKind = "agent.turn"
 	StageOperationPayloadDurableReview    StageOperationPayloadKind = "durable.review"
+	// StageOperationPayloadHarborBuiltin selects a versioned Go-controlled
+	// Harbor Flow operation. It is deliberately distinct from local.command:
+	// a built-in handler has no ambient executable path or shell contract and
+	// must instead be attested against the linked Harbor Flow build by a typed
+	// deployment lock.
+	StageOperationPayloadHarborBuiltin StageOperationPayloadKind = "harbor.builtin"
 )
 
 // StageOperationPayload is sealed to the concrete payloads in this package.
@@ -87,18 +93,42 @@ func (DurableReviewOperationPayload) Kind() StageOperationPayloadKind {
 
 func (DurableReviewOperationPayload) stageOperationPayload() {}
 
+// HarborBuiltinOperationPayload selects one exact built-in handler from a
+// deployment-owned registry. HandlerID is an immutable capability identity,
+// not a Go symbol, package path, shell fragment, or caller-supplied config
+// bag. The matching handler version and linker-bound Harbor Flow build belong
+// in the deployment operation lock.
+type HarborBuiltinOperationPayload struct {
+	HandlerID string `json:"handler_id"`
+}
+
+// Kind identifies the Harbor Flow built-in operation variant.
+func (HarborBuiltinOperationPayload) Kind() StageOperationPayloadKind {
+	return StageOperationPayloadHarborBuiltin
+}
+
+func (HarborBuiltinOperationPayload) stageOperationPayload() {}
+
 // CloneStageOperationPayload returns an independently owned payload value.
 func CloneStageOperationPayload(payload StageOperationPayload) StageOperationPayload {
 	switch typed := payload.(type) {
 	case LocalCommandOperationPayload:
-		typed.Arguments = append([]string(nil), typed.Arguments...)
+		if typed.Arguments != nil {
+			// An explicit empty argv tail is valid and semantically distinct from
+			// a missing array in the strict execution-spec contract.
+			typed.Arguments = append([]string{}, typed.Arguments...)
+		}
 		return typed
 	case ContainerCommandOperationPayload:
-		typed.Command = append([]string(nil), typed.Command...)
+		if typed.Command != nil {
+			typed.Command = append([]string{}, typed.Command...)
+		}
 		return typed
 	case AgentTurnOperationPayload:
 		return typed
 	case DurableReviewOperationPayload:
+		return typed
+	case HarborBuiltinOperationPayload:
 		return typed
 	default:
 		return nil
@@ -113,17 +143,19 @@ func CanonicalStageOperationPayloadJSON(payload StageOperationPayload) ([]byte, 
 	}
 	switch typed := payload.(type) {
 	case LocalCommandOperationPayload:
+		arguments := append([]string{}, typed.Arguments...)
 		return json.Marshal(struct {
 			Kind      StageOperationPayloadKind `json:"kind"`
 			CommandID string                    `json:"command_id"`
 			Arguments []string                  `json:"arguments"`
-		}{Kind: typed.Kind(), CommandID: typed.CommandID, Arguments: append([]string(nil), typed.Arguments...)})
+		}{Kind: typed.Kind(), CommandID: typed.CommandID, Arguments: arguments})
 	case ContainerCommandOperationPayload:
+		command := append([]string{}, typed.Command...)
 		return json.Marshal(struct {
 			Kind        StageOperationPayloadKind `json:"kind"`
 			ImageDigest string                    `json:"image_digest"`
 			Command     []string                  `json:"command"`
-		}{Kind: typed.Kind(), ImageDigest: typed.ImageDigest, Command: append([]string(nil), typed.Command...)})
+		}{Kind: typed.Kind(), ImageDigest: typed.ImageDigest, Command: command})
 	case AgentTurnOperationPayload:
 		return json.Marshal(struct {
 			Kind     StageOperationPayloadKind `json:"kind"`
@@ -136,6 +168,11 @@ func CanonicalStageOperationPayloadJSON(payload StageOperationPayload) ([]byte, 
 			Kind     StageOperationPayloadKind `json:"kind"`
 			PolicyID string                    `json:"policy_id"`
 		}{Kind: typed.Kind(), PolicyID: typed.PolicyID})
+	case HarborBuiltinOperationPayload:
+		return json.Marshal(struct {
+			Kind      StageOperationPayloadKind `json:"kind"`
+			HandlerID string                    `json:"handler_id"`
+		}{Kind: typed.Kind(), HandlerID: typed.HandlerID})
 	default:
 		return nil, fmt.Errorf("%w: unsupported stage operation payload %T", errInvalidExecutionSpec, payload)
 	}
@@ -200,6 +237,15 @@ func ParseStageOperationPayloadJSON(raw []byte) (StageOperationPayload, error) {
 			return nil, fmt.Errorf("%w: decode durable.review payload: %v", errInvalidExecutionSpec, err)
 		}
 		payload = DurableReviewOperationPayload{PolicyID: document.PolicyID}
+	case StageOperationPayloadHarborBuiltin:
+		var document struct {
+			Kind      StageOperationPayloadKind `json:"kind"`
+			HandlerID string                    `json:"handler_id"`
+		}
+		if err := decodeExecutionSpecJSON(raw, &document); err != nil {
+			return nil, fmt.Errorf("%w: decode harbor.builtin payload: %v", errInvalidExecutionSpec, err)
+		}
+		payload = HarborBuiltinOperationPayload{HandlerID: document.HandlerID}
 	default:
 		return nil, fmt.Errorf("%w: unsupported stage operation payload kind %q", errInvalidExecutionSpec, discriminator.Kind)
 	}
@@ -250,6 +296,8 @@ func validateStageOperationPayload(payload StageOperationPayload) error {
 		return nil
 	case DurableReviewOperationPayload:
 		return validateOperationPayloadToken("durable review policy id", typed.PolicyID)
+	case HarborBuiltinOperationPayload:
+		return validateOperationPayloadToken("Harbor built-in handler id", typed.HandlerID)
 	default:
 		return fmt.Errorf("%w: unsupported stage operation payload %T", errInvalidExecutionSpec, payload)
 	}

@@ -12,7 +12,7 @@ import (
 
 func TestDurableWorkerClaimsProjectsAndReleasesOneJob(t *testing.T) {
 	ctx := context.Background()
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestDurableWorkerClaimsProjectsAndReleasesOneJob(t *testing.T) {
 
 func TestDurableWorkerProjectsHandlerFailureWithoutFalseSuccess(t *testing.T) {
 	ctx := context.Background()
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestDurableWorkerProjectsHandlerFailureWithoutFalseSuccess(t *testing.T) {
 
 func TestDurableWorkerHeartbeatsDispatchFenceDuringActiveHandler(t *testing.T) {
 	ctx := context.Background()
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestDurableWorkerHeartbeatsDispatchFenceDuringActiveHandler(t *testing.T) {
 }
 
 func TestDurableWorkerRunContinuesAfterProjectedJobFailure(t *testing.T) {
-	dataStore, err := store.Open(t.TempDir())
+	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

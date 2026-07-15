@@ -50,3 +50,14 @@ func TestAppServerTurnStartParamsUsesMultimodalInput(t *testing.T) {
 		t.Fatalf("runtime roots = %#v", params["runtimeWorkspaceRoots"])
 	}
 }
+
+func TestAppServerClientInfoIsGenericAndConfigurable(t *testing.T) {
+	defaults := appServerClientInfo(Request{})
+	if defaults["name"] != "agent-runtime" || defaults["version"] != "1" {
+		t.Fatalf("generic defaults = %#v", defaults)
+	}
+	configured := appServerClientInfo(Request{ClientName: "controlled-standard-flow", ClientVersion: "v2"})
+	if configured["name"] != "controlled-standard-flow" || configured["version"] != "v2" {
+		t.Fatalf("configured client info = %#v", configured)
+	}
+}

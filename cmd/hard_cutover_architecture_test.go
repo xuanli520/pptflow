@@ -143,11 +143,80 @@ func TestHardCutoverRemovesLegacyExecutionSources(t *testing.T) {
 		"internal/templates/phase2/runtime_self_check.md",
 		"internal/templates/phase2/task_repair.md",
 		"internal/harbor/stageexecutor/registry.go",
+		"internal/workflowruntime/process_runtime.go",
 	} {
 		_, err := os.Stat(filepath.Join(root, relativePath))
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("legacy execution source %s remains available: %v", relativePath, err)
 		}
+	}
+}
+
+// The V2 cutover deliberately removes the former Harbor-specific execution
+// graph, not the reusable process and conversation ports that a V2 stage may
+// use. Codex App Server is one implementation of internal/agent; keeping this
+// small presence check here prevents a future cleanup from accidentally
+// deleting the generic runtime while still relying on the import/source-path
+// bans above to stop it from reconnecting to V1.
+func TestHardCutoverRetainsGenericAgentRuntimeSources(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, relativePath := range []string{
+		"internal/agent/types.go",
+		"internal/agent/turn.go",
+		"internal/codex/cli.go",
+		"internal/codex/appserver/session.go",
+		"internal/executor/cmd.go",
+		"internal/runtime/codexruntime/runtime.go",
+	} {
+		info, err := os.Stat(filepath.Join(root, relativePath))
+		if err != nil {
+			t.Fatalf("generic agent runtime source %s is unavailable: %v", relativePath, err)
+		}
+		if info.IsDir() {
+			t.Fatalf("generic agent runtime source %s is unexpectedly a directory", relativePath)
+		}
+	}
+}
+
+// workflowkit is a reusable public kernel.  Keep this structural test beside
+// the hard-cutover checks so a future Harbor feature cannot quietly pull a
+// product package, SQLite adapter, CLI, or provider implementation back into
+// the generic execution layer.
+func TestWorkflowkitHasNoHarborFactoryImports(t *testing.T) {
+	root := repositoryRoot(t)
+	kernelRoot := filepath.Join(root, "pkg", "workflowkit")
+	var violations []string
+	err := filepath.WalkDir(kernelRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		for _, specification := range file.Imports {
+			importPath, err := strconv.Unquote(specification.Path.Value)
+			if err != nil {
+				return err
+			}
+			if importPath == hardCutoverModulePath || strings.HasPrefix(importPath, hardCutoverModulePath+"/") {
+				violations = append(violations, filepath.ToSlash(relative)+" imports product package "+importPath)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk workflowkit sources: %v", err)
+	}
+	if len(violations) != 0 {
+		t.Fatalf("public workflowkit leaked Harbor Factory dependencies:\n%s", strings.Join(violations, "\n"))
 	}
 }
 

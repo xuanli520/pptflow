@@ -17,7 +17,7 @@ const (
 	SubmissionCheckReceiptFormat     = "codeedge.phase1.submission-check-receipt.v1"
 	SubmissionCheckReceiptVersion    = "1"
 	FinalComplianceDecisionFormat    = "codeedge.phase1.final-compliance-decision.v1"
-	FinalComplianceDecisionVersion   = "1"
+	FinalComplianceDecisionVersion   = "2"
 	LocalPackageAuthorizationFormat  = "codeedge.phase1.local-package-authorization.v1"
 	LocalPackageAuthorizationVersion = "1"
 
@@ -275,13 +275,14 @@ func (policy FinalCompliancePolicy) Fingerprint() (workflowkit.Fingerprint, erro
 }
 
 // FinalComplianceInput combines all evidence required before a CodeEdge local
-// package can be created. Every receipt must bind to Binding exactly.
+// package can be created. Evaluator receipts remain bound to their dedicated
+// child Run; the versioned handoff is the only authority that adopts them for
+// this parent binding.
 type FinalComplianceInput struct {
-	Policy     FinalCompliancePolicy  `json:"policy"`
-	Binding    FrozenRunBinding       `json:"binding"`
-	Qwen       EvaluationReceipt      `json:"qwen"`
-	Opus       EvaluationReceipt      `json:"opus"`
-	Submission SubmissionCheckReceipt `json:"submission"`
+	Policy     FinalCompliancePolicy    `json:"policy"`
+	Binding    FrozenRunBinding         `json:"binding"`
+	Handoff    EvaluatorEvidenceHandoff `json:"evaluator_evidence_handoff"`
+	Submission SubmissionCheckReceipt   `json:"submission"`
 }
 
 // FinalComplianceStatus is the durable outcome of final review. Rejected is
@@ -297,17 +298,18 @@ const (
 // package eligibility. It contains receipt fingerprints instead of copied
 // external result documents, preserving the artifact store as the byte owner.
 type FinalComplianceDecision struct {
-	Format                       string                  `json:"format"`
-	Version                      string                  `json:"version"`
-	Status                       FinalComplianceStatus   `json:"status"`
-	PolicyID                     string                  `json:"policy_id"`
-	PolicyVersion                string                  `json:"policy_version"`
-	PolicyFingerprint            workflowkit.Fingerprint `json:"policy_fingerprint"`
-	Binding                      FrozenRunBinding        `json:"binding"`
-	QwenReceiptFingerprint       workflowkit.Fingerprint `json:"qwen_receipt_fingerprint"`
-	OpusReceiptFingerprint       workflowkit.Fingerprint `json:"opus_receipt_fingerprint"`
-	SubmissionReceiptFingerprint workflowkit.Fingerprint `json:"submission_receipt_fingerprint"`
-	Reasons                      []string                `json:"reasons"`
+	Format                              string                  `json:"format"`
+	Version                             string                  `json:"version"`
+	Status                              FinalComplianceStatus   `json:"status"`
+	PolicyID                            string                  `json:"policy_id"`
+	PolicyVersion                       string                  `json:"policy_version"`
+	PolicyFingerprint                   workflowkit.Fingerprint `json:"policy_fingerprint"`
+	Binding                             FrozenRunBinding        `json:"binding"`
+	EvaluatorEvidenceHandoffFingerprint workflowkit.Fingerprint `json:"evaluator_evidence_handoff_fingerprint"`
+	QwenReceiptFingerprint              workflowkit.Fingerprint `json:"qwen_receipt_fingerprint"`
+	OpusReceiptFingerprint              workflowkit.Fingerprint `json:"opus_receipt_fingerprint"`
+	SubmissionReceiptFingerprint        workflowkit.Fingerprint `json:"submission_receipt_fingerprint"`
+	Reasons                             []string                `json:"reasons"`
 }
 
 // Clone returns an independently owned decision.
@@ -345,6 +347,9 @@ func (decision FinalComplianceDecision) Validate() error {
 	}
 	if err := decision.Binding.Validate(); err != nil {
 		return err
+	}
+	if err := decision.EvaluatorEvidenceHandoffFingerprint.Validate(); err != nil {
+		return fmt.Errorf("%w: final decision evaluator evidence handoff fingerprint: %v", ErrInvalidFinalCompliance, err)
 	}
 	for _, field := range []struct {
 		name  string
@@ -483,16 +488,28 @@ func (FinalComplianceService) Evaluate(input FinalComplianceInput) (FinalComplia
 	if err := input.Binding.Validate(); err != nil {
 		return FinalComplianceResult{}, err
 	}
+	if err := input.Handoff.Validate(); err != nil {
+		return FinalComplianceResult{}, err
+	}
+	if !sameFrozenRunBinding(input.Handoff.ParentBinding, input.Binding) {
+		return FinalComplianceResult{}, fmt.Errorf("%w: evaluator evidence handoff is bound to another parent Run", ErrInvalidFinalCompliance)
+	}
 
 	policyFingerprint, err := input.Policy.Fingerprint()
 	if err != nil {
 		return FinalComplianceResult{}, err
 	}
-	qwenFingerprint, err := validateEvaluationForFinalCompliance("Qwen", input.Qwen, input.Policy.QwenPolicy, input.Binding)
+	handoffFingerprint, err := input.Handoff.Fingerprint()
 	if err != nil {
 		return FinalComplianceResult{}, err
 	}
-	opusFingerprint, err := validateEvaluationForFinalCompliance("Opus", input.Opus, input.Policy.OpusPolicy, input.Binding)
+	qwen := input.Handoff.Qwen.Receipt.Clone()
+	opus := input.Handoff.Opus.Receipt.Clone()
+	qwenFingerprint, err := validateEvaluationForFinalCompliance("Qwen", qwen, input.Policy.QwenPolicy, input.Handoff.ChildBinding)
+	if err != nil {
+		return FinalComplianceResult{}, err
+	}
+	opusFingerprint, err := validateEvaluationForFinalCompliance("Opus", opus, input.Policy.OpusPolicy, input.Handoff.ChildBinding)
 	if err != nil {
 		return FinalComplianceResult{}, err
 	}
@@ -501,23 +518,24 @@ func (FinalComplianceService) Evaluate(input FinalComplianceInput) (FinalComplia
 		return FinalComplianceResult{}, err
 	}
 
-	reasons := finalComplianceReasons(input.Qwen, input.Opus, input.Submission)
+	reasons := finalComplianceReasons(qwen, opus, input.Submission)
 	status := FinalComplianceApproved
 	if len(reasons) != 0 {
 		status = FinalComplianceRejected
 	}
 	decision := FinalComplianceDecision{
-		Format:                       FinalComplianceDecisionFormat,
-		Version:                      FinalComplianceDecisionVersion,
-		Status:                       status,
-		PolicyID:                     input.Policy.ID,
-		PolicyVersion:                input.Policy.Version,
-		PolicyFingerprint:            policyFingerprint,
-		Binding:                      input.Binding,
-		QwenReceiptFingerprint:       qwenFingerprint,
-		OpusReceiptFingerprint:       opusFingerprint,
-		SubmissionReceiptFingerprint: submissionFingerprint,
-		Reasons:                      reasons,
+		Format:                              FinalComplianceDecisionFormat,
+		Version:                             FinalComplianceDecisionVersion,
+		Status:                              status,
+		PolicyID:                            input.Policy.ID,
+		PolicyVersion:                       input.Policy.Version,
+		PolicyFingerprint:                   policyFingerprint,
+		Binding:                             input.Binding,
+		EvaluatorEvidenceHandoffFingerprint: handoffFingerprint,
+		QwenReceiptFingerprint:              qwenFingerprint,
+		OpusReceiptFingerprint:              opusFingerprint,
+		SubmissionReceiptFingerprint:        submissionFingerprint,
+		Reasons:                             reasons,
 	}
 	if err := decision.Validate(); err != nil {
 		return FinalComplianceResult{}, err

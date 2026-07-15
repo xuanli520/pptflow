@@ -119,7 +119,7 @@ func TestFrozenExecutionRuntimeCompletesFrozenRunWithArtifactLineageAndQuotaSett
 func TestFrozenExecutionRuntimeUsesPublicWorkflowkitEngineAndRetainsFailedEvidence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +669,7 @@ func newFrozenRuntimeFixture(t *testing.T) frozenRuntimeFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	dataStore, err := store.Open(root)
+	dataStore, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,7 +802,8 @@ func runtimeFixtureWorkflow() workflowkit.WorkflowDescriptor {
 			{
 				Key: runtimeFixtureSourceStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.source", Version: "1"}, Group: "runtime",
 				Outputs: []workflowkit.ArtifactSpec{{Name: "source_report", SchemaVersion: "runtime.v1", Required: true}}, Effect: workflowkit.EffectEvidenceOnly,
-				Budget: budget, QuotaClaims: []workflowkit.QuotaClaim{claim("stage_attempt", 1), claim("agent_turn", 2)}, Retry: workflowkit.RetryPolicy{},
+				Dispatch: workflowkit.StageDispatchAutomatic,
+				Budget:   budget, QuotaClaims: []workflowkit.QuotaClaim{claim("stage_attempt", 1), claim("agent_turn", 2)}, Retry: workflowkit.RetryPolicy{},
 				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}, Reuse: workflowkit.ReuseWhenInputsMatch,
 				Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityCancel, workflowkit.CapabilityContinue},
 			},
@@ -810,7 +811,8 @@ func runtimeFixtureWorkflow() workflowkit.WorkflowDescriptor {
 				Key: runtimeFixtureVerifyStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.verify", Version: "1"}, Group: "runtime",
 				Dependencies: []workflowkit.StageKey{runtimeFixtureSourceStage},
 				Outputs:      []workflowkit.ArtifactSpec{{Name: "verify_report", SchemaVersion: "runtime.v1", Required: true}}, Effect: workflowkit.EffectEvidenceOnly,
-				Budget: budget, QuotaClaims: []workflowkit.QuotaClaim{claim("stage_attempt", 1)}, Retry: workflowkit.RetryPolicy{},
+				Dispatch: workflowkit.StageDispatchAutomatic,
+				Budget:   budget, QuotaClaims: []workflowkit.QuotaClaim{claim("stage_attempt", 1)}, Retry: workflowkit.RetryPolicy{},
 				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}, Reuse: workflowkit.ReuseWhenInputsMatch,
 				Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityCancel, workflowkit.CapabilityContinue},
 			},

@@ -153,6 +153,165 @@ func TestEngineFreezesExecutionAndCommitsFailureEvidence(t *testing.T) {
 	}
 }
 
+func TestEngineCoordinatorClaimUsesMandatoryGenericDecisionPort(t *testing.T) {
+	now := time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC)
+	workflow := singleStageWorkflow(t)
+	binding, err := NewOpaqueExecutionBinding("example.execution", "1", []byte(`{"selection":"immutable"}`))
+	if err != nil {
+		t.Fatalf("freeze opaque binding: %v", err)
+	}
+	plan, err := CompileDependencyExecutionPlan(workflow)
+	if err != nil {
+		t.Fatalf("compile coordinator plan: %v", err)
+	}
+	backend := &coordinatorDecisionTestBackend{input: CoordinatorInput{
+		Workflow: workflow.Clone(), ScheduleMode: CoordinatorScheduleExecutionPlan, Plan: plan.Clone(),
+		Nodes: []CoordinatorNodeState{{NodeID: "source", Generation: 0, Status: CoordinatorNodePending}},
+	}}
+	registry, err := NewControlledPluginRegistry([]PluginRegistration[StageExecutor]{{
+		Binding: workflow.Stages[0].Plugin,
+		Implementation: StageExecutorFunc(func(context.Context, StageExecutionRequest) (StageExecutionResult, error) {
+			t.Fatal("coordinator claim must not invoke a stage executor")
+			return StageExecutionResult{}, nil
+		}),
+	}})
+	if err != nil {
+		t.Fatalf("create executor registry: %v", err)
+	}
+	engine, err := NewEngine(EngineConfig{Backend: backend, Executors: registry, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	prepared := prepareEngineTestExecution(t, engine, workflow, binding)
+	schedule, err := FreezeCoordinatorSchedule(prepared.Execution.Workflow, prepared.Execution.ID, CoordinatorScheduleExecutionPlan, plan, nil, nil)
+	if err != nil {
+		t.Fatalf("freeze coordinator schedule: %v", err)
+	}
+	state, err := engine.HandleClaim(context.Background(), JobClaim{
+		JobID: "coordinator-job", ClaimID: "coordinator-claim", Kind: JobCoordinator,
+		Owner: "worker-1", FencingToken: 1, LeaseExpiresAt: now.Add(time.Minute), Execution: prepared.Execution,
+		Coordinator: &CoordinatorClaim{Schedule: schedule},
+	})
+	if err != nil {
+		t.Fatalf("handle coordinator claim: %v", err)
+	}
+	if state != JobCompleted {
+		t.Fatalf("coordinator terminal state = %q, want %q", state, JobCompleted)
+	}
+	if backend.committed == nil || backend.committed.Kind != CoordinatorScheduleNextBatch || len(backend.committed.NextBatch.NodeIDs) != 1 || backend.committed.NextBatch.NodeIDs[0] != "source" {
+		t.Fatalf("committed coordinator decision = %#v, want first frozen batch", backend.committed)
+	}
+}
+
+func TestCoordinatorClaimRequiresFrozenSchedule(t *testing.T) {
+	now := time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC)
+	workflow := singleStageWorkflow(t)
+	binding, err := NewOpaqueExecutionBinding("example.execution", "1", []byte(`{"selection":"immutable"}`))
+	if err != nil {
+		t.Fatalf("freeze opaque binding: %v", err)
+	}
+	execution, err := freezeExecution(PrepareRequest{
+		ExecutionID: "missing-coordinator-claim", IdempotencyKey: "missing-coordinator-claim-key",
+		Subject:  SubjectBinding{SubjectID: "subject", RevisionID: "revision", Digest: SubjectDigest(SHA256Fingerprint([]byte("subject")))},
+		Workflow: workflow, ProfileFingerprint: SHA256Fingerprint([]byte("profile")), Binding: binding, Actor: "operator", Reason: "test missing coordinator claim",
+	}, now)
+	if err != nil {
+		t.Fatalf("freeze execution: %v", err)
+	}
+	claim := JobClaim{
+		JobID: "coordinator-job", ClaimID: "coordinator-claim", Kind: JobCoordinator,
+		Owner: "worker", FencingToken: 1, LeaseExpiresAt: now.Add(time.Minute), Execution: execution,
+	}
+	if err := claim.Validate(); !errors.Is(err, ErrInvalidJobClaim) {
+		t.Fatalf("coordinator claim without frozen schedule error = %v, want invalid job claim", err)
+	}
+}
+
+func TestEngineRejectsCoordinatorInputOutsideFrozenClaim(t *testing.T) {
+	now := time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC)
+	workflow := singleStageWorkflow(t)
+	binding, err := NewOpaqueExecutionBinding("example.execution", "1", []byte(`{"selection":"immutable"}`))
+	if err != nil {
+		t.Fatalf("freeze opaque binding: %v", err)
+	}
+	plan, err := CompileDependencyExecutionPlan(workflow)
+	if err != nil {
+		t.Fatalf("compile coordinator plan: %v", err)
+	}
+	backend := &coordinatorDecisionTestBackend{input: CoordinatorInput{
+		Workflow: workflow.Clone(), ScheduleMode: CoordinatorScheduleTransitionSubset,
+		Schedule:    []ScheduleBatch{{ID: "drifted-schedule", NodeIDs: []NodeID{"source"}}},
+		Transitions: []NodeTransition{coordinatorTransition(t, "source", DispositionSchedule, 0, 0)},
+		Nodes:       []CoordinatorNodeState{{NodeID: "source", Generation: 0, Status: CoordinatorNodePending}},
+	}}
+	registry, err := NewControlledPluginRegistry([]PluginRegistration[StageExecutor]{{
+		Binding: workflow.Stages[0].Plugin,
+		Implementation: StageExecutorFunc(func(context.Context, StageExecutionRequest) (StageExecutionResult, error) {
+			t.Fatal("coordinator claim must not invoke a stage executor")
+			return StageExecutionResult{}, nil
+		}),
+	}})
+	if err != nil {
+		t.Fatalf("create executor registry: %v", err)
+	}
+	engine, err := NewEngine(EngineConfig{Backend: backend, Executors: registry, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	prepared := prepareEngineTestExecution(t, engine, workflow, binding)
+	schedule, err := FreezeCoordinatorSchedule(prepared.Execution.Workflow, prepared.Execution.ID, CoordinatorScheduleExecutionPlan, plan, nil, nil)
+	if err != nil {
+		t.Fatalf("freeze coordinator schedule: %v", err)
+	}
+	_, err = engine.HandleClaim(context.Background(), JobClaim{
+		JobID: "coordinator-job", ClaimID: "coordinator-claim", Kind: JobCoordinator,
+		Owner: "worker", FencingToken: 1, LeaseExpiresAt: now.Add(time.Minute), Execution: prepared.Execution,
+		Coordinator: &CoordinatorClaim{Schedule: schedule},
+	})
+	if !errors.Is(err, ErrInvalidJobClaim) {
+		t.Fatalf("schedule-drifted coordinator input error = %v, want invalid job claim", err)
+	}
+	if backend.committed != nil {
+		t.Fatalf("schedule-drifted coordinator input reached commit: %#v", backend.committed)
+	}
+}
+
+func TestStageClaimOptionalNodeAttemptMustBindItsParentStageAttempt(t *testing.T) {
+	workflow := singleStageWorkflow(t)
+	binding, err := NewOpaqueExecutionBinding("example.execution", "1", []byte(`{"selection":"immutable"}`))
+	if err != nil {
+		t.Fatalf("freeze opaque binding: %v", err)
+	}
+	execution, err := freezeExecution(PrepareRequest{
+		ExecutionID: "node-claim-execution", IdempotencyKey: "node-claim-key",
+		Subject:  SubjectBinding{SubjectID: "subject", RevisionID: "revision", Digest: SubjectDigest(SHA256Fingerprint([]byte("subject")))},
+		Workflow: workflow, ProfileFingerprint: SHA256Fingerprint([]byte("profile")), Binding: binding, Actor: "operator", Reason: "test node attempt binding",
+	}, time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("freeze execution: %v", err)
+	}
+	stageAttempt := AttemptIdentity{ID: "stage-attempt", Kind: AttemptStage, ScopeID: "scope", Ordinal: 1}
+	nodeAttempt := AttemptIdentity{ID: "node-attempt", Kind: AttemptNode, ScopeID: "scope", ParentAttemptID: stageAttempt.ID, Ordinal: 1}
+	claim := JobClaim{
+		JobID: "node-job", ClaimID: "node-claim", Kind: JobStage, Owner: "worker", FencingToken: 1,
+		LeaseExpiresAt: time.Date(2026, time.July, 15, 10, 0, 0, 0, time.UTC), Execution: execution,
+		Stage: &StageClaim{StageAttempt: stageAttempt, NodeAttempt: &nodeAttempt, Stage: workflow.Stages[0]},
+	}
+	if err := claim.Validate(); err != nil {
+		t.Fatalf("valid child node attempt was rejected: %v", err)
+	}
+	withoutNode := claim.Clone()
+	withoutNode.Stage.NodeAttempt = nil
+	if err := withoutNode.Validate(); err != nil {
+		t.Fatalf("stage claim without backend-owned nested node attempt was rejected: %v", err)
+	}
+	forged := claim.Clone()
+	forged.Stage.NodeAttempt.ParentAttemptID = "another-stage-attempt"
+	if err := forged.Validate(); !errors.Is(err, ErrInvalidJobClaim) {
+		t.Fatalf("forged node parent error = %v, want invalid job claim", err)
+	}
+}
+
 func TestEngineRejectsPluginVersionDriftWithoutExecutingStage(t *testing.T) {
 	now := time.Date(2026, time.July, 14, 9, 0, 0, 0, time.UTC)
 	workflow := singleStageWorkflow(t)
@@ -370,14 +529,34 @@ type engineTestBackend struct {
 	appliedRecovery  []RecoveryDecision
 }
 
+type coordinatorDecisionTestBackend struct {
+	engineTestBackend
+	input     CoordinatorInput
+	committed *CoordinatorDecision
+}
+
+func (backend *coordinatorDecisionTestBackend) LoadCoordinatorInput(_ context.Context, _ JobClaim) (CoordinatorInput, error) {
+	return backend.input.Clone(), nil
+}
+
+func (backend *coordinatorDecisionTestBackend) CommitCoordinatorDecision(_ context.Context, _ JobClaim, decision CoordinatorDecision) (JobTerminalState, error) {
+	copyDecision := decision.Clone()
+	backend.committed = &copyDecision
+	return JobCompleted, nil
+}
+
 func (backend *engineTestBackend) PrepareExecution(_ context.Context, _ PrepareRequest, execution FrozenExecution) (PreparedExecution, error) {
 	prepared := PreparedExecution{Execution: execution.Clone(), CoordinatorJobID: "coordinator-" + execution.ID}
 	backend.prepared = &prepared
 	return prepared, nil
 }
 
-func (backend *engineTestBackend) AdvanceCoordinator(context.Context, JobClaim) (JobTerminalState, error) {
-	return JobCompleted, nil
+func (backend *engineTestBackend) LoadCoordinatorInput(context.Context, JobClaim) (CoordinatorInput, error) {
+	return CoordinatorInput{}, errors.New("stage-only test backend cannot load coordinator input")
+}
+
+func (backend *engineTestBackend) CommitCoordinatorDecision(context.Context, JobClaim, CoordinatorDecision) (JobTerminalState, error) {
+	return "", errors.New("stage-only test backend cannot commit coordinator decision")
 }
 
 func (backend *engineTestBackend) ReadStageInput(context.Context, JobClaim, ArtifactBinding) ([]byte, error) {

@@ -3,14 +3,18 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 
 	_ "modernc.org/sqlite"
 )
@@ -20,6 +24,29 @@ const (
 	dbFileName              = "harbor.db"
 	baselineV2MetadataKey   = "schema_baseline"
 	baselineV2MetadataValue = "harbor-workflow-v2-consolidated"
+
+	// baselineV2SchemaContractMetadataKey records the exact SQLite DDL contract
+	// produced by migrationV2. Version 2 intentionally has one destructive
+	// baseline, so marker/version checks alone are not sufficient to admit a
+	// database whose tables, constraints, indexes, or triggers have drifted.
+	baselineV2SchemaContractMetadataKey = "schema_contract_fingerprint"
+	baselineV2SchemaContractDomain      = "harbor.store.consolidated-v2-schema-contract.v1"
+)
+
+type sqliteSchemaContractObject struct {
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Table string `json:"table"`
+	SQL   string `json:"sql"`
+}
+
+var (
+	consolidatedV2SchemaContractOnce        sync.Once
+	consolidatedV2SchemaContractFingerprint string
+	consolidatedV2SchemaContractErr         error
+	testBaselineV2Once                      sync.Once
+	testBaselineV2Bytes                     []byte
+	testBaselineV2Err                       error
 )
 
 // ErrReadOnly is returned when a caller tries to mutate a Store opened for a
@@ -46,8 +73,14 @@ type Store struct {
 	backupDir string
 	now       func() time.Time
 	readOnly  bool
+	// backupTestMode is set only by OpenForTest. It preserves migration and
+	// SQLite integrity admission while omitting backup I/O from application
+	// unit fixtures that do not exercise disaster-recovery behavior.
+	backupTestMode bool
 
 	backupMu          sync.Mutex
+	backupVerifyMu    sync.Mutex
+	verifiedBackup    *BackupRecord
 	backupStop        chan struct{}
 	backupDone        chan struct{}
 	backupLoopStarted bool
@@ -59,11 +92,125 @@ type Store struct {
 }
 
 func Open(rootDir string) (*Store, error) {
+	return openWritable(rootDir, false)
+}
+
+// OpenForTest opens the same writable, migrated, integrity-checked V2 store
+// as Open, but deliberately omits automatic and critical-operation backup
+// work. It exists for internal application unit fixtures; backup/restore
+// tests must use Open so production recovery semantics remain covered.
+//
+// This is not a production fallback: normal CLI, TUI, worker, and service
+// composition continue to call Open and therefore retain verified backups.
+func OpenForTest(rootDir string) (*Store, error) {
+	rootDir = normalizeStoreRoot(rootDir)
+	if err := os.MkdirAll(rootDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create test store directory: %w", err)
+	}
+	dbPath := filepath.Join(rootDir, dbFileName)
+	if info, err := os.Lstat(dbPath); errors.Is(err, os.ErrNotExist) {
+		if err := seedConsolidatedV2TestBaseline(dbPath); err != nil {
+			return nil, fmt.Errorf("seed test V2 baseline: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("inspect test store database: %w", err)
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("test store database must be a regular non-symlink file: %s", dbPath)
+	}
+	return openWritable(rootDir, true)
+}
+
+// seedConsolidatedV2TestBaseline copies a process-local pristine V2 database
+// into a fresh test root. Each copied database still passes through
+// openAndMigrate's normal SQLite quick-check and baseline-contract admission;
+// the cache only avoids reparsing the large immutable migration SQL for every
+// independent application test fixture.
+func seedConsolidatedV2TestBaseline(dbPath string) error {
+	contents, err := consolidatedV2TestBaselineBytes()
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(dbPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	written, writeErr := file.Write(contents)
+	if writeErr == nil && written != len(contents) {
+		writeErr = io.ErrShortWrite
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = os.Remove(dbPath)
+		if writeErr != nil {
+			return writeErr
+		}
+		if syncErr != nil {
+			return syncErr
+		}
+		return closeErr
+	}
+	return nil
+}
+
+func consolidatedV2TestBaselineBytes() ([]byte, error) {
+	testBaselineV2Once.Do(func() {
+		root, err := os.MkdirTemp("", "harbor-store-v2-test-baseline-")
+		if err != nil {
+			testBaselineV2Err = err
+			return
+		}
+		defer os.RemoveAll(root)
+		dbPath := filepath.Join(root, dbFileName)
+		store, err := openAndMigrate(root, dbPath)
+		if err != nil {
+			testBaselineV2Err = err
+			return
+		}
+		if _, err := store.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			_ = store.db.Close()
+			testBaselineV2Err = err
+			return
+		}
+		if err := store.db.Close(); err != nil {
+			testBaselineV2Err = err
+			return
+		}
+		contents, err := os.ReadFile(dbPath)
+		if err != nil {
+			testBaselineV2Err = err
+			return
+		}
+		if len(contents) == 0 {
+			testBaselineV2Err = fmt.Errorf("empty consolidated V2 baseline")
+			return
+		}
+		testBaselineV2Bytes = append([]byte(nil), contents...)
+	})
+	if testBaselineV2Err != nil {
+		return nil, testBaselineV2Err
+	}
+	return append([]byte(nil), testBaselineV2Bytes...), nil
+}
+
+func openWritable(rootDir string, backupTestMode bool) (*Store, error) {
 	rootDir = normalizeStoreRoot(rootDir)
 	if err := os.MkdirAll(rootDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create store directory: %w", err)
 	}
 	dbPath := filepath.Join(rootDir, dbFileName)
+	// Do not let the writable WAL connection touch an existing retired or
+	// pre-consolidation database merely to discover that it is inadmissible.
+	// In particular, SQLite's journal_mode=WAL pragma is persistent and can
+	// create sidecars. The immutable preflight below reads only schema markers
+	// and integrity metadata; a database it cannot inspect is deliberately
+	// left to the established writable-open/corruption-recovery path.
+	if err := preflightWritableStoreAdmission(dbPath); err != nil {
+		return nil, err
+	}
 	s, err := openAndMigrate(rootDir, dbPath)
 	if err != nil && isSQLiteCorruption(err) {
 		if restoreErr := restoreLatestVerifiedBackup(rootDir, dbPath); restoreErr != nil {
@@ -74,12 +221,84 @@ func Open(rootDir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.backupTestMode = backupTestMode
+	if backupTestMode {
+		return s, nil
+	}
 	if _, err := s.BackupIfDue(context.Background()); err != nil {
 		_ = s.db.Close()
 		return nil, fmt.Errorf("create initial verified backup: %w", err)
 	}
 	s.startBackupLoop()
 	return s, nil
+}
+
+// preflightWritableStoreAdmission rejects a readable existing database only
+// when its schema markers prove it is a retired V1 or pre-consolidation
+// control plane. It intentionally opens immutable/read-only so these
+// rejection paths cannot persist journal_mode=WAL, create WAL/SHM files, or
+// otherwise rewrite the rejected database. A malformed, locked, or otherwise
+// uninspectable file returns nil: openAndMigrate remains the single place that
+// classifies corruption and performs verified V2 backup recovery.
+func preflightWritableStoreAdmission(dbPath string) error {
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("inspect existing store database: %w", err)
+	}
+
+	db, err := openImmutableSQLiteFile(dbPath)
+	if err != nil {
+		return nil
+	}
+	defer db.Close()
+
+	// V1 detection is intentionally first and only reads sqlite_master plus
+	// schema_version. It must not be replaced by generic V2 admission because
+	// callers rely on the precise hard-cutover error for retired databases.
+	if err := rejectLegacyV1Database(db); err != nil {
+		if errors.Is(err, ErrLegacyV1Store) {
+			return err
+		}
+		return nil
+	}
+
+	hasVersionTable, err := hasSchemaVersionTableDatabase(db)
+	if err != nil {
+		return nil
+	}
+	if !hasVersionTable {
+		var userTableCount int
+		if err := db.QueryRow(`
+			SELECT COUNT(*)
+			FROM sqlite_master
+			WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+		`).Scan(&userTableCount); err != nil {
+			return nil
+		}
+		// A deliberately empty pre-created SQLite file is still a valid target
+		// for the sole V2 bootstrap, exactly as it was before this preflight.
+		if userTableCount == 0 {
+			return nil
+		}
+		return preConsolidationStoreError("database has tables but no V2 baseline marker")
+	}
+
+	if err := validateConsolidatedV2BaselineDatabase(db); err != nil {
+		if errors.Is(err, ErrPreConsolidationStore) {
+			return err
+		}
+		return nil
+	}
+
+	// A current baseline that cannot pass a physical integrity scan is not
+	// rejected as an old schema. Leave that case to openAndMigrate so the
+	// existing verified-backup corruption-recovery path remains authoritative.
+	if err := verifySQLiteDatabase(db); err != nil {
+		return nil
+	}
+	return nil
 }
 
 // OpenReadOnly opens an already-migrated control plane without creating a
@@ -346,25 +565,98 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB) error {
 	if marker != baselineV2MetadataValue {
 		return preConsolidationStoreError("V2 baseline marker does not match this control plane")
 	}
-	for _, table := range []string{
-		"entity_id_registry",
-		"lifecycle_operations_v12",
-		"run_input_artifacts",
-		"trial_executions_v19",
-		"trial_attempts_v19",
-		"codeedge_compliance_records_v20",
-	} {
-		var exists int
-		if err := db.QueryRow(`
-			SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)
-		`, table).Scan(&exists); err != nil {
-			return fmt.Errorf("inspect V2 baseline table %s: %w", table, err)
+	expectedContract, err := consolidatedV2SchemaContract()
+	if err != nil {
+		return fmt.Errorf("derive consolidated V2 schema contract: %w", err)
+	}
+	var recordedContract string
+	if err := db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return preConsolidationStoreError("V2 schema contract marker is absent")
 		}
-		if exists == 0 {
-			return preConsolidationStoreError(fmt.Sprintf("V2 baseline table %s is absent", table))
-		}
+		return preConsolidationStoreError(fmt.Sprintf("read V2 schema contract marker: %v", err))
+	}
+	if recordedContract != expectedContract {
+		return preConsolidationStoreError("V2 schema contract marker does not match this control plane")
+	}
+	actualContract, err := sqliteSchemaContract(db)
+	if err != nil {
+		return fmt.Errorf("derive persisted V2 schema contract: %w", err)
+	}
+	if actualContract != expectedContract {
+		return preConsolidationStoreError("V2 physical schema does not match the consolidated baseline")
 	}
 	return nil
+}
+
+// consolidatedV2SchemaContract derives the canonical DDL fingerprint from a
+// fresh in-memory application of migrationV2. Comparing sqlite_master rather
+// than source text verifies the schema SQLite actually enforces, including
+// table columns/constraints and all named indexes and triggers.
+func consolidatedV2SchemaContract() (string, error) {
+	consolidatedV2SchemaContractOnce.Do(func() {
+		db, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			consolidatedV2SchemaContractErr = err
+			return
+		}
+		defer db.Close()
+		db.SetMaxOpenConns(1)
+		if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+			consolidatedV2SchemaContractErr = err
+			return
+		}
+		if _, err := db.Exec(migrationV2); err != nil {
+			consolidatedV2SchemaContractErr = err
+			return
+		}
+		consolidatedV2SchemaContractFingerprint, consolidatedV2SchemaContractErr = sqliteSchemaContract(db)
+	})
+	return consolidatedV2SchemaContractFingerprint, consolidatedV2SchemaContractErr
+}
+
+// sqliteSchemaContract returns one domain-separated fingerprint for every
+// application-owned schema object. sqlite_master stores each table's complete
+// CREATE statement, so its digest covers column shape, foreign keys, CHECK and
+// UNIQUE constraints; named indexes and triggers are included separately.
+// SQLite-owned autoindexes/statistics tables are intentionally excluded.
+func sqliteSchemaContract(db *sql.DB) (string, error) {
+	rows, err := db.Query(`
+		SELECT type, name, tbl_name, sql
+		FROM sqlite_master
+		WHERE type IN ('table', 'index', 'trigger', 'view')
+		  AND name NOT LIKE 'sqlite_%'
+		  AND sql IS NOT NULL
+		ORDER BY type, name, tbl_name
+	`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	objects := make([]sqliteSchemaContractObject, 0, 128)
+	for rows.Next() {
+		var object sqliteSchemaContractObject
+		if err := rows.Scan(&object.Type, &object.Name, &object.Table, &object.SQL); err != nil {
+			return "", err
+		}
+		object.SQL = strings.TrimSpace(object.SQL)
+		if object.Type == "" || object.Name == "" || object.Table == "" || object.SQL == "" {
+			return "", fmt.Errorf("sqlite_master returned an incomplete schema object")
+		}
+		objects = append(objects, object)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(objects)
+	if err != nil {
+		return "", err
+	}
+	fingerprint, err := workflowkit.FingerprintBytes(baselineV2SchemaContractDomain, payload)
+	if err != nil {
+		return "", err
+	}
+	return string(fingerprint), nil
 }
 
 func preConsolidationStoreError(marker string) error {
@@ -387,11 +679,21 @@ func (s *Store) bootstrapV2() error {
 	if _, err := tx.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
 		return fmt.Errorf("record V2 baseline schema version: %w", err)
 	}
+	contract, err := consolidatedV2SchemaContract()
+	if err != nil {
+		return fmt.Errorf("derive consolidated V2 schema contract: %w", err)
+	}
 	if _, err := tx.Exec(`
 		INSERT INTO store_metadata (key, value, updated_at)
 		VALUES (?, ?, ?)
 	`, baselineV2MetadataKey, baselineV2MetadataValue, s.now().UTC()); err != nil {
 		return fmt.Errorf("record V2 baseline marker: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO store_metadata (key, value, updated_at)
+		VALUES (?, ?, ?)
+	`, baselineV2SchemaContractMetadataKey, contract, s.now().UTC()); err != nil {
+		return fmt.Errorf("record V2 schema contract marker: %w", err)
 	}
 	return tx.Commit()
 }

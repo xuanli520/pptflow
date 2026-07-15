@@ -26,25 +26,152 @@ const (
 
 var errInvalidExecutionSpec = errors.New("harbor workflow adapter: invalid run execution spec")
 
+// RunSelectionKind names the immutable subject family bound to one execution.
+// The workflow kernel deliberately sees only SubjectBinding; this Harbor
+// adapter records the domain identity needed to resolve that binding without
+// pretending that an unpublished source-authoring session is already a
+// TaskRevision.
+type RunSelectionKind string
+
+const (
+	// RunSelectionTaskRevision is the normal lifecycle subject: one sealed
+	// Harbor TaskRevision.
+	RunSelectionTaskRevision RunSelectionKind = "task_revision"
+	// RunSelectionAuthoringSession is the pre-materialization Standard subject:
+	// one immutable source snapshot plus one durable authoring session. It is
+	// intentionally distinct from a TaskRevision; materialize_task is the only
+	// operation allowed to create the latter.
+	RunSelectionAuthoringSession RunSelectionKind = "authoring_session"
+)
+
 // RunSelectionReference freezes the subject selected for execution. It uses
-// durable IDs and a subject digest, never a mutable workspace path.
+// durable IDs and a subject digest, never a mutable workspace path. The
+// task-revision fields and authoring-session fields are a closed union; callers
+// must never populate both families in one specification.
 type RunSelectionReference struct {
-	TaskID         string                    `json:"task_id"`
-	RevisionID     string                    `json:"revision_id"`
-	RevisionDigest workflowkit.SubjectDigest `json:"revision_digest"`
+	Kind                  RunSelectionKind          `json:"kind"`
+	TaskID                string                    `json:"task_id"`
+	RevisionID            string                    `json:"revision_id"`
+	RevisionDigest        workflowkit.SubjectDigest `json:"revision_digest"`
+	AuthoringSourceID     string                    `json:"authoring_source_id"`
+	AuthoringSessionID    string                    `json:"authoring_session_id"`
+	AuthoringSourceDigest workflowkit.SubjectDigest `json:"authoring_source_digest"`
 }
 
 func (selection RunSelectionReference) validate() error {
-	if err := validatePersistentUUIDv7("selection task id", selection.TaskID); err != nil {
+	kind, err := selection.resolvedKind()
+	if err != nil {
 		return err
 	}
-	if err := validatePersistentUUIDv7("selection revision id", selection.RevisionID); err != nil {
-		return err
+	switch kind {
+	case RunSelectionTaskRevision:
+		if strings.TrimSpace(selection.AuthoringSourceID) != "" || strings.TrimSpace(selection.AuthoringSessionID) != "" || selection.AuthoringSourceDigest != "" {
+			return fmt.Errorf("%w: task-revision selection cannot contain authoring-session fields", errInvalidExecutionSpec)
+		}
+		if err := validatePersistentUUIDv7("selection task id", selection.TaskID); err != nil {
+			return err
+		}
+		if err := validatePersistentUUIDv7("selection revision id", selection.RevisionID); err != nil {
+			return err
+		}
+		if err := selection.RevisionDigest.Validate(); err != nil {
+			return fmt.Errorf("%w: selection revision digest: %v", errInvalidExecutionSpec, err)
+		}
+		return nil
+	case RunSelectionAuthoringSession:
+		if strings.TrimSpace(selection.TaskID) != "" || strings.TrimSpace(selection.RevisionID) != "" || selection.RevisionDigest != "" {
+			return fmt.Errorf("%w: authoring-session selection cannot contain task-revision fields", errInvalidExecutionSpec)
+		}
+		if err := validatePersistentUUIDv7("selection authoring source id", selection.AuthoringSourceID); err != nil {
+			return err
+		}
+		if err := validatePersistentUUIDv7("selection authoring session id", selection.AuthoringSessionID); err != nil {
+			return err
+		}
+		if err := selection.AuthoringSourceDigest.Validate(); err != nil {
+			return fmt.Errorf("%w: selection authoring source digest: %v", errInvalidExecutionSpec, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported selection kind %q", errInvalidExecutionSpec, kind)
 	}
-	if err := selection.RevisionDigest.Validate(); err != nil {
-		return fmt.Errorf("%w: selection revision digest: %v", errInvalidExecutionSpec, err)
+}
+
+// resolvedKind retains strict union validation while accepting source-built
+// in-memory task-revision specifications that predate the explicit kind field.
+// CanonicalJSON always writes the resolved discriminator, so managed V2 Run
+// inputs never preserve the implicit form.
+func (selection RunSelectionReference) resolvedKind() (RunSelectionKind, error) {
+	kind := selection.Kind
+	if kind == "" {
+		hasTask := strings.TrimSpace(selection.TaskID) != "" || strings.TrimSpace(selection.RevisionID) != "" || selection.RevisionDigest != ""
+		hasAuthoring := strings.TrimSpace(selection.AuthoringSourceID) != "" || strings.TrimSpace(selection.AuthoringSessionID) != "" || selection.AuthoringSourceDigest != ""
+		switch {
+		case hasTask && !hasAuthoring:
+			return RunSelectionTaskRevision, nil
+		case hasAuthoring && !hasTask:
+			return RunSelectionAuthoringSession, nil
+		default:
+			return "", fmt.Errorf("%w: selection kind is required for an empty or mixed subject union", errInvalidExecutionSpec)
+		}
 	}
-	return nil
+	if kind != RunSelectionTaskRevision && kind != RunSelectionAuthoringSession {
+		return "", fmt.Errorf("%w: unsupported selection kind %q", errInvalidExecutionSpec, kind)
+	}
+	return kind, nil
+}
+
+// Canonical returns the same selection with its inferred kind materialized.
+func (selection RunSelectionReference) Canonical() (RunSelectionReference, error) {
+	if err := selection.validate(); err != nil {
+		return RunSelectionReference{}, err
+	}
+	kind, _ := selection.resolvedKind()
+	selection.Kind = kind
+	return selection, nil
+}
+
+// SubjectBinding projects this closed Harbor selection onto workflowkit's
+// domain-neutral immutable subject contract.
+func (selection RunSelectionReference) SubjectBinding() (workflowkit.SubjectBinding, error) {
+	canonical, err := selection.Canonical()
+	if err != nil {
+		return workflowkit.SubjectBinding{}, err
+	}
+	switch canonical.Kind {
+	case RunSelectionTaskRevision:
+		return workflowkit.SubjectBinding{SubjectID: canonical.TaskID, RevisionID: canonical.RevisionID, Digest: canonical.RevisionDigest}, nil
+	case RunSelectionAuthoringSession:
+		return workflowkit.SubjectBinding{SubjectID: canonical.AuthoringSourceID, RevisionID: canonical.AuthoringSessionID, Digest: canonical.AuthoringSourceDigest}, nil
+	default:
+		return workflowkit.SubjectBinding{}, fmt.Errorf("%w: unsupported selection kind %q", errInvalidExecutionSpec, canonical.Kind)
+	}
+}
+
+// SubjectRevisionID returns the opaque revision/session identity that a
+// controlled checkout must bind. It is not necessarily a TaskRevision ID.
+func (selection RunSelectionReference) SubjectRevisionID() (string, error) {
+	binding, err := selection.SubjectBinding()
+	if err != nil {
+		return "", err
+	}
+	return binding.RevisionID, nil
+}
+
+// SubjectDigest returns the opaque immutable source digest used by a
+// controlled checkout and the generic workflow engine.
+func (selection RunSelectionReference) SubjectDigest() (workflowkit.SubjectDigest, error) {
+	binding, err := selection.SubjectBinding()
+	if err != nil {
+		return "", err
+	}
+	return binding.Digest, nil
+}
+
+// IsTaskRevision reports whether this selection names a sealed task revision.
+func (selection RunSelectionReference) IsTaskRevision() bool {
+	kind, err := selection.resolvedKind()
+	return err == nil && kind == RunSelectionTaskRevision
 }
 
 // ArtifactReference identifies immutable artifact content that may be bound to
@@ -81,11 +208,19 @@ func (reference CheckoutReference) validate(selection RunSelectionReference) err
 	if err := validateExecutionSpecString("checkout id", reference.ID); err != nil {
 		return err
 	}
-	if reference.RevisionID != selection.RevisionID {
-		return fmt.Errorf("%w: checkout %q revision id does not match selected revision", errInvalidExecutionSpec, reference.ID)
+	subjectRevisionID, err := selection.SubjectRevisionID()
+	if err != nil {
+		return err
 	}
-	if reference.RevisionDigest != selection.RevisionDigest {
-		return fmt.Errorf("%w: checkout %q revision digest does not match selected revision", errInvalidExecutionSpec, reference.ID)
+	if reference.RevisionID != subjectRevisionID {
+		return fmt.Errorf("%w: checkout %q revision id does not match selected subject revision", errInvalidExecutionSpec, reference.ID)
+	}
+	subjectDigest, err := selection.SubjectDigest()
+	if err != nil {
+		return err
+	}
+	if reference.RevisionDigest != subjectDigest {
+		return fmt.Errorf("%w: checkout %q revision digest does not match selected subject digest", errInvalidExecutionSpec, reference.ID)
 	}
 	return nil
 }
@@ -228,35 +363,36 @@ func (reference ArtifactInputReference) validate() error {
 type StageBindingType string
 
 const (
-	StageBindingRepoPrepare       StageBindingType = "repo_prepare"
-	StageBindingRepoAnalyze       StageBindingType = "repo_analyze"
-	StageBindingTaskDesign        StageBindingType = "task_design"
-	StageBindingTaskReview        StageBindingType = "task_review"
-	StageBindingGenerateTaskFiles StageBindingType = "generate_task_files"
-	StageBindingInstructionGen    StageBindingType = "instruction_generate"
-	StageBindingTaskTOMLGen       StageBindingType = "task_toml_generate"
-	StageBindingDockerfileGen     StageBindingType = "dockerfile_generate"
-	StageBindingContentReview     StageBindingType = "content_review"
-	StageBindingSolveGen          StageBindingType = "solve_generate"
-	StageBindingTestGen           StageBindingType = "test_generate"
-	StageBindingTestsAnalysis     StageBindingType = "tests_analysis"
-	StageBindingSolutionReview    StageBindingType = "solution_review"
-	StageBindingMaterializeTask   StageBindingType = "materialize_task"
-	StageBindingTaskRepair        StageBindingType = "task_repair"
-	StageBindingRuntimeSelfCheck  StageBindingType = "runtime_self_check"
-	StageBindingHarborVerify      StageBindingType = "harbor_verify"
-	StageBindingDockerBuild       StageBindingType = "docker_build"
-	StageBindingInitialVerify     StageBindingType = "initial_verify"
-	StageBindingOracleVerify      StageBindingType = "oracle_verify"
-	StageBindingCodeEdgeLint      StageBindingType = "codeedge_lint"
-	StageBindingQualityCheck      StageBindingType = "quality_check"
-	StageBindingSimilarityCheck   StageBindingType = "similarity_check"
-	StageBindingFinalReview       StageBindingType = "final_review"
-	StageBindingHarborRunQwen     StageBindingType = "harbor_run_qwen"
-	StageBindingHarborRunOpus     StageBindingType = "harbor_run_opus"
-	StageBindingResultReview      StageBindingType = "result_review"
-	StageBindingSubmissionLint    StageBindingType = "submission_lint"
-	StageBindingPackage           StageBindingType = "package"
+	StageBindingRepoPrepare              StageBindingType = "repo_prepare"
+	StageBindingRepoAnalyze              StageBindingType = "repo_analyze"
+	StageBindingTaskDesign               StageBindingType = "task_design"
+	StageBindingTaskReview               StageBindingType = "task_review"
+	StageBindingGenerateTaskFiles        StageBindingType = "generate_task_files"
+	StageBindingInstructionGen           StageBindingType = "instruction_generate"
+	StageBindingTaskTOMLGen              StageBindingType = "task_toml_generate"
+	StageBindingDockerfileGen            StageBindingType = "dockerfile_generate"
+	StageBindingContentReview            StageBindingType = "content_review"
+	StageBindingSolveGen                 StageBindingType = "solve_generate"
+	StageBindingTestGen                  StageBindingType = "test_generate"
+	StageBindingTestsAnalysis            StageBindingType = "tests_analysis"
+	StageBindingSolutionReview           StageBindingType = "solution_review"
+	StageBindingMaterializeTask          StageBindingType = "materialize_task"
+	StageBindingTaskRepair               StageBindingType = "task_repair"
+	StageBindingRuntimeSelfCheck         StageBindingType = "runtime_self_check"
+	StageBindingHarborVerify             StageBindingType = "harbor_verify"
+	StageBindingDockerBuild              StageBindingType = "docker_build"
+	StageBindingInitialVerify            StageBindingType = "initial_verify"
+	StageBindingOracleVerify             StageBindingType = "oracle_verify"
+	StageBindingCodeEdgeLint             StageBindingType = "codeedge_lint"
+	StageBindingQualityCheck             StageBindingType = "quality_check"
+	StageBindingSimilarityCheck          StageBindingType = "similarity_check"
+	StageBindingFinalReview              StageBindingType = "final_review"
+	StageBindingHarborRunQwen            StageBindingType = "harbor_run_qwen"
+	StageBindingHarborRunOpus            StageBindingType = "harbor_run_opus"
+	StageBindingEvaluatorEvidenceHandoff StageBindingType = "evaluator_evidence_handoff"
+	StageBindingResultReview             StageBindingType = "result_review"
+	StageBindingSubmissionLint           StageBindingType = "submission_lint"
+	StageBindingPackage                  StageBindingType = "package"
 )
 
 // StageBindingBase is shared only by the sealed, concrete Harbor stage union
@@ -317,39 +453,41 @@ type SimilarityCheckBinding struct{ StageBindingBase }
 type FinalReviewBinding struct{ StageBindingBase }
 type HarborRunQwenBinding struct{ StageBindingBase }
 type HarborRunOpusBinding struct{ StageBindingBase }
+type EvaluatorEvidenceHandoffBinding struct{ StageBindingBase }
 type ResultReviewBinding struct{ StageBindingBase }
 type SubmissionLintBinding struct{ StageBindingBase }
 type PackageBinding struct{ StageBindingBase }
 
-func (RepoPrepareBinding) stageExecutionBinding()       {}
-func (RepoAnalyzeBinding) stageExecutionBinding()       {}
-func (TaskDesignBinding) stageExecutionBinding()        {}
-func (TaskReviewBinding) stageExecutionBinding()        {}
-func (GenerateTaskFilesBinding) stageExecutionBinding() {}
-func (InstructionGenBinding) stageExecutionBinding()    {}
-func (TaskTOMLGenBinding) stageExecutionBinding()       {}
-func (DockerfileGenBinding) stageExecutionBinding()     {}
-func (ContentReviewBinding) stageExecutionBinding()     {}
-func (SolveGenBinding) stageExecutionBinding()          {}
-func (TestGenBinding) stageExecutionBinding()           {}
-func (TestsAnalysisBinding) stageExecutionBinding()     {}
-func (SolutionReviewBinding) stageExecutionBinding()    {}
-func (MaterializeTaskBinding) stageExecutionBinding()   {}
-func (TaskRepairBinding) stageExecutionBinding()        {}
-func (RuntimeSelfCheckBinding) stageExecutionBinding()  {}
-func (HarborVerifyBinding) stageExecutionBinding()      {}
-func (DockerBuildBinding) stageExecutionBinding()       {}
-func (InitialVerifyBinding) stageExecutionBinding()     {}
-func (OracleVerifyBinding) stageExecutionBinding()      {}
-func (CodeEdgeLintBinding) stageExecutionBinding()      {}
-func (QualityCheckBinding) stageExecutionBinding()      {}
-func (SimilarityCheckBinding) stageExecutionBinding()   {}
-func (FinalReviewBinding) stageExecutionBinding()       {}
-func (HarborRunQwenBinding) stageExecutionBinding()     {}
-func (HarborRunOpusBinding) stageExecutionBinding()     {}
-func (ResultReviewBinding) stageExecutionBinding()      {}
-func (SubmissionLintBinding) stageExecutionBinding()    {}
-func (PackageBinding) stageExecutionBinding()           {}
+func (RepoPrepareBinding) stageExecutionBinding()              {}
+func (RepoAnalyzeBinding) stageExecutionBinding()              {}
+func (TaskDesignBinding) stageExecutionBinding()               {}
+func (TaskReviewBinding) stageExecutionBinding()               {}
+func (GenerateTaskFilesBinding) stageExecutionBinding()        {}
+func (InstructionGenBinding) stageExecutionBinding()           {}
+func (TaskTOMLGenBinding) stageExecutionBinding()              {}
+func (DockerfileGenBinding) stageExecutionBinding()            {}
+func (ContentReviewBinding) stageExecutionBinding()            {}
+func (SolveGenBinding) stageExecutionBinding()                 {}
+func (TestGenBinding) stageExecutionBinding()                  {}
+func (TestsAnalysisBinding) stageExecutionBinding()            {}
+func (SolutionReviewBinding) stageExecutionBinding()           {}
+func (MaterializeTaskBinding) stageExecutionBinding()          {}
+func (TaskRepairBinding) stageExecutionBinding()               {}
+func (RuntimeSelfCheckBinding) stageExecutionBinding()         {}
+func (HarborVerifyBinding) stageExecutionBinding()             {}
+func (DockerBuildBinding) stageExecutionBinding()              {}
+func (InitialVerifyBinding) stageExecutionBinding()            {}
+func (OracleVerifyBinding) stageExecutionBinding()             {}
+func (CodeEdgeLintBinding) stageExecutionBinding()             {}
+func (QualityCheckBinding) stageExecutionBinding()             {}
+func (SimilarityCheckBinding) stageExecutionBinding()          {}
+func (FinalReviewBinding) stageExecutionBinding()              {}
+func (HarborRunQwenBinding) stageExecutionBinding()            {}
+func (HarborRunOpusBinding) stageExecutionBinding()            {}
+func (EvaluatorEvidenceHandoffBinding) stageExecutionBinding() {}
+func (ResultReviewBinding) stageExecutionBinding()             {}
+func (SubmissionLintBinding) stageExecutionBinding()           {}
+func (PackageBinding) stageExecutionBinding()                  {}
 
 // RunExecutionSpec is the V2-only typed execution selection, reference set,
 // and complete per-stage binding union. It is intentionally independent from
@@ -669,6 +807,9 @@ func (spec RunExecutionSpec) ValidateFor(catalog StageCatalog) error {
 			return fmt.Errorf("%w: missing stage binding %q", errInvalidExecutionSpec, definition.Key)
 		}
 	}
+	if err := spec.validateCodeEdgeEvaluatorChildBindings(); err != nil {
+		return err
+	}
 	if err := index.validateAllUsed(); err != nil {
 		return err
 	}
@@ -845,6 +986,8 @@ func parseStageExecutionBinding(raw json.RawMessage) (StageExecutionBinding, err
 		return decode(&HarborRunQwenBinding{})
 	case StageBindingHarborRunOpus:
 		return decode(&HarborRunOpusBinding{})
+	case StageBindingEvaluatorEvidenceHandoff:
+		return decode(&EvaluatorEvidenceHandoffBinding{})
 	case StageBindingResultReview:
 		return decode(&ResultReviewBinding{})
 	case StageBindingSubmissionLint:
@@ -909,6 +1052,8 @@ func dereferenceStageBinding(binding StageExecutionBinding) StageExecutionBindin
 	case *HarborRunQwenBinding:
 		return *typed
 	case *HarborRunOpusBinding:
+		return *typed
+	case *EvaluatorEvidenceHandoffBinding:
 		return *typed
 	case *ResultReviewBinding:
 		return *typed
@@ -975,6 +1120,8 @@ func stageBindingBaseOf(binding StageExecutionBinding) (StageBindingBase, bool) 
 		return typed.StageBindingBase, true
 	case HarborRunOpusBinding:
 		return typed.StageBindingBase, true
+	case EvaluatorEvidenceHandoffBinding:
+		return typed.StageBindingBase, true
 	case ResultReviewBinding:
 		return typed.StageBindingBase, true
 	case SubmissionLintBinding:
@@ -1040,6 +1187,8 @@ func stageBindingIdentity(binding StageExecutionBinding) (workflowkit.StageKey, 
 		return "harbor_run_qwen", StageBindingHarborRunQwen, true
 	case HarborRunOpusBinding:
 		return "harbor_run_opus", StageBindingHarborRunOpus, true
+	case EvaluatorEvidenceHandoffBinding:
+		return "evaluator_evidence_handoff", StageBindingEvaluatorEvidenceHandoff, true
 	case ResultReviewBinding:
 		return "result_review", StageBindingResultReview, true
 	case SubmissionLintBinding:
@@ -1110,6 +1259,8 @@ func cloneStageExecutionBinding(binding StageExecutionBinding) StageExecutionBin
 		return HarborRunQwenBinding{StageBindingBase: base}
 	case HarborRunOpusBinding:
 		return HarborRunOpusBinding{StageBindingBase: base}
+	case EvaluatorEvidenceHandoffBinding:
+		return EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
 	case ResultReviewBinding:
 		return ResultReviewBinding{StageBindingBase: base}
 	case SubmissionLintBinding:
@@ -1290,6 +1441,10 @@ func (index executionReferenceIndex) validateAllUsed() error {
 }
 
 func (spec *RunExecutionSpec) normalize() {
+	selection, err := spec.Selection.Canonical()
+	if err == nil {
+		spec.Selection = selection
+	}
 	if spec.CodeEdgeFinalCompliancePolicy != nil {
 		policy := spec.CodeEdgeFinalCompliancePolicy.Clone()
 		sort.Strings(policy.QwenPolicy.InfraExceptionTypes)
@@ -1386,6 +1541,8 @@ func replaceStageBindingBase(binding StageExecutionBinding, base StageBindingBas
 		return HarborRunQwenBinding{StageBindingBase: base}
 	case HarborRunOpusBinding:
 		return HarborRunOpusBinding{StageBindingBase: base}
+	case EvaluatorEvidenceHandoffBinding:
+		return EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
 	case ResultReviewBinding:
 		return ResultReviewBinding{StageBindingBase: base}
 	case SubmissionLintBinding:

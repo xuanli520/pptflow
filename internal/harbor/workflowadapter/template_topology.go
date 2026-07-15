@@ -2,6 +2,7 @@ package workflowadapter
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -11,12 +12,14 @@ import (
 // revision, but it cannot change which Harbor stages constitute a template or
 // silently alter a closed template's required ordering.
 type catalogTemplatePolicy struct {
-	catalogID      string
-	catalogVersion string
-	stageOrder     []workflowkit.StageKey
-	groups         []StageGroup
-	gates          []workflowkit.StageKey
-	dependencies   map[workflowkit.StageKey][]workflowkit.StageKey
+	catalogID                   string
+	catalogVersion              string
+	stageOrder                  []workflowkit.StageKey
+	groups                      []StageGroup
+	gates                       []workflowkit.StageKey
+	dependencies                map[workflowkit.StageKey][]workflowkit.StageKey
+	requiresOperatorOnlyPackage bool
+	validateStages              func(map[workflowkit.StageKey]StageDefinition) error
 }
 
 func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error) {
@@ -26,10 +29,11 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 	switch {
 	case reference.Equal(StandardTemplateReference()):
 		return catalogTemplatePolicy{
-			catalogID:      standardCatalogID,
-			catalogVersion: standardCatalogVersion,
-			stageOrder:     standardCatalogStageOrder(),
-			groups:         StandardStageGroups(),
+			catalogID:                   standardCatalogID,
+			catalogVersion:              standardCatalogVersion,
+			stageOrder:                  standardCatalogStageOrder(),
+			groups:                      StandardStageGroups(),
+			requiresOperatorOnlyPackage: true,
 			gates: []workflowkit.StageKey{
 				workflowkit.StageKey(TaskReview),
 				workflowkit.StageKey(ContentReview),
@@ -40,16 +44,28 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
-			catalogID:      codeEdgePhase1CatalogID,
-			catalogVersion: codeEdgePhase1CatalogVersion,
-			stageOrder:     CodeEdgePhase1StageOrder(),
-			groups:         codeEdgePhase1StageGroups(),
+			catalogID:                   codeEdgePhase1CatalogID,
+			catalogVersion:              codeEdgePhase1CatalogVersion,
+			stageOrder:                  CodeEdgePhase1StageOrder(),
+			groups:                      codeEdgePhase1StageGroups(),
+			requiresOperatorOnlyPackage: true,
 			gates: []workflowkit.StageKey{
 				workflowkit.StageKey(SolutionReview),
 				workflowkit.StageKey(FinalReview),
+				workflowkit.StageKey(EvaluatorEvidenceHandoff),
 				workflowkit.StageKey(ResultReview),
 			},
 			dependencies: codeEdgePhase1Dependencies(),
+		}, nil
+	case reference.Equal(CodeEdgeEvaluatorChildTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:      codeEdgeEvaluatorChildCatalogID,
+			catalogVersion: codeEdgeEvaluatorChildCatalogVersion,
+			stageOrder:     CodeEdgeEvaluatorChildStageOrder(),
+			groups:         codeEdgeEvaluatorChildStageGroups(),
+			gates:          []workflowkit.StageKey{},
+			dependencies:   codeEdgeEvaluatorChildDependencies(),
+			validateStages: validateCodeEdgeEvaluatorChildCatalogStages,
 		}, nil
 	default:
 		return catalogTemplatePolicy{}, fmt.Errorf("%w: workflow template %s@%s has no catalog policy", errInvalidCatalog, reference.ID, reference.Version)
@@ -76,6 +92,38 @@ func (policy catalogTemplatePolicy) validateTopology(stages map[workflowkit.Stag
 		}
 		if !sameStageKeySet(stage.Dependencies, expected) {
 			return fmt.Errorf("%w: stage %q dependencies %v do not match frozen template topology %v", errInvalidCatalog, key, stage.Dependencies, expected)
+		}
+	}
+	return nil
+}
+
+func (policy catalogTemplatePolicy) validateStageDefinitions(stages map[workflowkit.StageKey]StageDefinition) error {
+	if policy.validateStages == nil {
+		return nil
+	}
+	return policy.validateStages(stages)
+}
+
+// validateCodeEdgeEvaluatorChildCatalogStages freezes more than the DAG for
+// the evaluator child. It has only two externally billable operations, so an
+// altered screenshot schema, extra artifact, relaxed effect, or generic retry
+// would silently change the evidence contract even if the two stage keys and
+// their dependency still looked valid.
+func validateCodeEdgeEvaluatorChildCatalogStages(stages map[workflowkit.StageKey]StageDefinition) error {
+	expected := codeEdgeEvaluatorChildStageDefinitions()
+	if len(stages) != len(expected) {
+		return fmt.Errorf("%w: CodeEdge evaluator child stage count %d does not match frozen descriptor", errInvalidCatalog, len(stages))
+	}
+	for _, definition := range expected {
+		actual, present := stages[definition.Key]
+		// StageDefinition.Clone intentionally canonicalizes empty slices to nil,
+		// because registry resolution returns independent snapshots. Compare those
+		// owned copies so nil versus empty declaration storage cannot masquerade as
+		// a semantic descriptor drift.
+		actual = actual.Clone()
+		definition = definition.Clone()
+		if !present || !reflect.DeepEqual(actual, definition) {
+			return fmt.Errorf("%w: CodeEdge evaluator child stage %q does not match frozen descriptor", errInvalidCatalog, definition.Key)
 		}
 	}
 	return nil

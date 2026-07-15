@@ -168,7 +168,7 @@ func newControlLifecycleFixture(t *testing.T, actor string) (*LifecycleServices,
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	database, err := store.Open(root)
+	database, err := store.OpenForTest(root)
 	if err != nil {
 		t.Fatal(err)
 	}

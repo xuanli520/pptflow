@@ -14,6 +14,7 @@ import (
 
 const codeEdgeComplianceRecordSelect = `
 	SELECT id, run_id, task_id, revision_id, task_digest, status,
+	       evaluator_evidence_handoff_id, evaluator_evidence_handoff_fingerprint,
 	       qwen_receipt_json, opus_receipt_json, submission_receipt_json,
 	       decision_json, decision_fingerprint, authorization_json,
 	       authorization_fingerprint, idempotency_key, created_by, created_at
@@ -47,6 +48,13 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 	}
 	if !validCodeEdgeComplianceStatus(request.Status) {
 		return CodeEdgeComplianceRecord{}, fmt.Errorf("invalid CodeEdge compliance status %q", request.Status)
+	}
+	if !isUUIDv7(strings.TrimSpace(request.EvaluatorEvidenceHandoffID)) {
+		return CodeEdgeComplianceRecord{}, ErrInvalidUUIDv7Identity
+	}
+	handoffFingerprint, err := normalizeRequired(request.EvaluatorEvidenceHandoffFingerprint, "CodeEdge evaluator evidence handoff fingerprint")
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, err
 	}
 	qwen, err := normalizeV4JSON(request.QwenReceiptJSON, "CodeEdge Qwen receipt")
 	if err != nil {
@@ -83,7 +91,8 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 		return CodeEdgeComplianceRecord{}, fmt.Errorf("rejected CodeEdge compliance record cannot contain a package authorization")
 	}
 	if err := validateCanonicalCodeEdgeComplianceDocuments(
-		request.TaskDigest, request.Status, qwen, opus, submission, decision, decisionFingerprint, authorization, authorizationFingerprint,
+		request.TaskDigest, request.Status, request.EvaluatorEvidenceHandoffID, handoffFingerprint,
+		qwen, opus, submission, decision, decisionFingerprint, authorization, authorizationFingerprint,
 	); err != nil {
 		return CodeEdgeComplianceRecord{}, err
 	}
@@ -91,6 +100,7 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 	record := CodeEdgeComplianceRecord{
 		ID: id, RunID: strings.TrimSpace(request.RunID), TaskID: strings.TrimSpace(request.TaskID), RevisionID: strings.TrimSpace(request.RevisionID),
 		TaskDigest: strings.TrimSpace(request.TaskDigest), Status: request.Status,
+		EvaluatorEvidenceHandoffID: strings.TrimSpace(request.EvaluatorEvidenceHandoffID), EvaluatorEvidenceHandoffFingerprint: handoffFingerprint,
 		QwenReceiptJSON: qwen, OpusReceiptJSON: opus, SubmissionReceiptJSON: submission,
 		DecisionJSON: decision, DecisionFingerprint: decisionFingerprint,
 		AuthorizationJSON: authorization, AuthorizationFingerprint: authorizationFingerprint,
@@ -118,14 +128,29 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 	if _, err := getTaskV2Tx(ctx, tx, record.TaskID); err != nil {
 		return CodeEdgeComplianceRecord{}, err
 	}
+	handoff, err := scanCodeEdgeEvaluatorEvidenceHandoff(tx.QueryRowContext(ctx, codeEdgeEvaluatorEvidenceHandoffSelect+" WHERE id = ?", record.EvaluatorEvidenceHandoffID))
+	if err == sql.ErrNoRows {
+		return CodeEdgeComplianceRecord{}, fmt.Errorf("%w: CodeEdge evaluator evidence handoff %s", ErrNotFound, record.EvaluatorEvidenceHandoffID)
+	}
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, err
+	}
+	if handoff.ParentRunID != record.RunID || handoff.TaskID != record.TaskID || handoff.RevisionID != record.RevisionID || handoff.TaskDigest != record.TaskDigest || handoff.HandoffFingerprint != record.EvaluatorEvidenceHandoffFingerprint {
+		return CodeEdgeComplianceRecord{}, fmt.Errorf("CodeEdge compliance handoff does not match parent Run or frozen task")
+	}
+	if err := validateCodeEdgeComplianceHandoffReceiptBinding(handoff, record); err != nil {
+		return CodeEdgeComplianceRecord{}, err
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO codeedge_compliance_records_v20 (
 			id, run_id, task_id, revision_id, task_digest, status,
+			evaluator_evidence_handoff_id, evaluator_evidence_handoff_fingerprint,
 			qwen_receipt_json, opus_receipt_json, submission_receipt_json,
 			decision_json, decision_fingerprint, authorization_json,
 			authorization_fingerprint, idempotency_key, created_by, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, record.ID, record.RunID, record.TaskID, record.RevisionID, record.TaskDigest, record.Status,
+		record.EvaluatorEvidenceHandoffID, record.EvaluatorEvidenceHandoffFingerprint,
 		record.QwenReceiptJSON, record.OpusReceiptJSON, record.SubmissionReceiptJSON,
 		record.DecisionJSON, record.DecisionFingerprint, record.AuthorizationJSON,
 		record.AuthorizationFingerprint, record.IdempotencyKey, record.CreatedBy, record.CreatedAt)
@@ -162,6 +187,7 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 		Action: "codeedge_compliance.recorded", Reason: request.Reason,
 		PayloadJSON: auditPayload(map[string]any{
 			"run_id": record.RunID, "revision_id": record.RevisionID, "status": record.Status,
+			"evaluator_evidence_handoff_id": record.EvaluatorEvidenceHandoffID, "evaluator_evidence_handoff_fingerprint": record.EvaluatorEvidenceHandoffFingerprint,
 			"decision_fingerprint": record.DecisionFingerprint, "authorization_fingerprint": record.AuthorizationFingerprint,
 		}),
 		CreatedAt: now,
@@ -211,6 +237,7 @@ func scanCodeEdgeComplianceRecord(scanner rowScanner) (CodeEdgeComplianceRecord,
 	var record CodeEdgeComplianceRecord
 	if err := scanner.Scan(
 		&record.ID, &record.RunID, &record.TaskID, &record.RevisionID, &record.TaskDigest, &record.Status,
+		&record.EvaluatorEvidenceHandoffID, &record.EvaluatorEvidenceHandoffFingerprint,
 		&record.QwenReceiptJSON, &record.OpusReceiptJSON, &record.SubmissionReceiptJSON,
 		&record.DecisionJSON, &record.DecisionFingerprint, &record.AuthorizationJSON,
 		&record.AuthorizationFingerprint, &record.IdempotencyKey, &record.CreatedBy, &record.CreatedAt,
@@ -230,7 +257,7 @@ func validCodeEdgeComplianceStatus(status CodeEdgeComplianceStatus) bool {
 // performs stronger Run/catalog/artifact verification; this boundary rejects
 // malformed, non-canonical, internally inconsistent, or forged typed evidence
 // before it can become durable state.
-func validateCanonicalCodeEdgeComplianceDocuments(taskDigest string, status CodeEdgeComplianceStatus, qwenRaw, opusRaw, submissionRaw, decisionRaw, decisionFingerprint, authorizationRaw, authorizationFingerprint string) error {
+func validateCanonicalCodeEdgeComplianceDocuments(taskDigest string, status CodeEdgeComplianceStatus, handoffID, handoffFingerprint, qwenRaw, opusRaw, submissionRaw, decisionRaw, decisionFingerprint, authorizationRaw, authorizationFingerprint string) error {
 	var qwen, opus codeedge.EvaluationReceipt
 	var submission codeedge.SubmissionCheckReceipt
 	var decision codeedge.FinalComplianceDecision
@@ -256,6 +283,9 @@ func validateCanonicalCodeEdgeComplianceDocuments(taskDigest string, status Code
 	}
 	if decision.Binding.TaskSnapshotDigest != workflowkit.SubjectDigest(taskDigest) {
 		return fmt.Errorf("CodeEdge final compliance decision is bound to another task digest")
+	}
+	if !isUUIDv7(strings.TrimSpace(handoffID)) || decision.EvaluatorEvidenceHandoffFingerprint != workflowkit.Fingerprint(handoffFingerprint) {
+		return fmt.Errorf("CodeEdge final compliance decision does not match evaluator evidence handoff")
 	}
 	if decision.Status == codeedge.FinalComplianceApproved && status != CodeEdgeComplianceApproved {
 		return fmt.Errorf("approved CodeEdge final decision requires approved record status")
@@ -306,6 +336,63 @@ func validateCanonicalCodeEdgeComplianceDocuments(taskDigest string, status Code
 	return nil
 }
 
+// validateCodeEdgeComplianceHandoffReceiptBinding makes the immutable handoff
+// authoritative even for direct Store callers. The application layer rebuilds
+// child artifacts; this transaction-level proof prevents a caller from pairing
+// a real handoff fingerprint with another syntactically valid receipt/decision.
+func validateCodeEdgeComplianceHandoffReceiptBinding(handoff CodeEdgeEvaluatorEvidenceHandoff, record CodeEdgeComplianceRecord) error {
+	var document codeedge.EvaluatorEvidenceHandoff
+	if err := decodeCanonicalCodeEdgeDocument(handoff.HandoffJSON, "CodeEdge evaluator evidence handoff", &document, codeedge.EvaluatorEvidenceHandoff.CanonicalJSON); err != nil {
+		return err
+	}
+	fingerprint, err := document.Fingerprint()
+	if err != nil {
+		return err
+	}
+	if string(fingerprint) != handoff.HandoffFingerprint || handoff.HandoffFingerprint != record.EvaluatorEvidenceHandoffFingerprint {
+		return fmt.Errorf("CodeEdge evaluator evidence handoff fingerprint does not match canonical handoff")
+	}
+	if document.ParentRunID != record.RunID || document.ChildRunID != handoff.ChildRunID ||
+		string(document.ParentBinding.TaskSnapshotDigest) != record.TaskDigest ||
+		string(document.ParentDefinitionFingerprint) != handoff.ParentDefinitionFingerprint ||
+		string(document.ChildDefinitionFingerprint) != handoff.ChildDefinitionFingerprint ||
+		document.Qwen.ChildStageAttemptID != handoff.QwenStageAttemptID ||
+		document.Opus.ChildStageAttemptID != handoff.OpusStageAttemptID ||
+		string(document.Qwen.TrialSetFingerprint) != handoff.QwenTrialSetFingerprint ||
+		string(document.Opus.TrialSetFingerprint) != handoff.OpusTrialSetFingerprint {
+		return fmt.Errorf("CodeEdge evaluator evidence handoff document does not match durable linkage")
+	}
+	var qwen, opus codeedge.EvaluationReceipt
+	if err := decodeCanonicalCodeEdgeDocument(record.QwenReceiptJSON, "CodeEdge Qwen receipt", &qwen, codeedge.EvaluationReceipt.CanonicalJSON); err != nil {
+		return err
+	}
+	if err := decodeCanonicalCodeEdgeDocument(record.OpusReceiptJSON, "CodeEdge Opus receipt", &opus, codeedge.EvaluationReceipt.CanonicalJSON); err != nil {
+		return err
+	}
+	if err := requireSameCanonicalCodeEdgeEvaluationReceipt("Qwen", qwen, document.Qwen.Receipt); err != nil {
+		return err
+	}
+	if err := requireSameCanonicalCodeEdgeEvaluationReceipt("Opus", opus, document.Opus.Receipt); err != nil {
+		return err
+	}
+	return nil
+}
+
+func requireSameCanonicalCodeEdgeEvaluationReceipt(role string, left, right codeedge.EvaluationReceipt) error {
+	leftCanonical, err := left.CanonicalJSON()
+	if err != nil {
+		return err
+	}
+	rightCanonical, err := right.CanonicalJSON()
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(leftCanonical, rightCanonical) {
+		return fmt.Errorf("CodeEdge %s receipt does not match evaluator evidence handoff", role)
+	}
+	return nil
+}
+
 func decodeCanonicalCodeEdgeDocument[T any](raw, name string, target *T, canonical func(T) ([]byte, error)) error {
 	if err := json.Unmarshal([]byte(raw), target); err != nil {
 		return fmt.Errorf("decode %s: %w", name, err)
@@ -325,17 +412,11 @@ func verifyCodeEdgeReceiptDecisionBinding(role string, receipt codeedge.Evaluati
 	if err != nil {
 		return err
 	}
-	binding := codeedge.FrozenRunBinding{
-		TaskSnapshotDigest:  receipt.TaskSnapshotDigest,
-		CatalogFingerprint:  receipt.CatalogFingerprint,
-		LockFingerprint:     receipt.LockFingerprint,
-		ManifestFingerprint: receipt.ManifestFingerprint,
-	}
 	expected := decision.QwenReceiptFingerprint
 	if role == "Opus" {
 		expected = decision.OpusReceiptFingerprint
 	}
-	if binding != decision.Binding || expected != fingerprint {
+	if expected != fingerprint {
 		return fmt.Errorf("CodeEdge %s receipt does not match final compliance decision", role)
 	}
 	return nil
@@ -348,6 +429,8 @@ func sameCodeEdgeComplianceRecord(left, right CodeEdgeComplianceRecord) bool {
 		left.RevisionID == right.RevisionID &&
 		left.TaskDigest == right.TaskDigest &&
 		left.Status == right.Status &&
+		left.EvaluatorEvidenceHandoffID == right.EvaluatorEvidenceHandoffID &&
+		left.EvaluatorEvidenceHandoffFingerprint == right.EvaluatorEvidenceHandoffFingerprint &&
 		left.QwenReceiptJSON == right.QwenReceiptJSON &&
 		left.OpusReceiptJSON == right.OpusReceiptJSON &&
 		left.SubmissionReceiptJSON == right.SubmissionReceiptJSON &&

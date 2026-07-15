@@ -28,6 +28,9 @@ func TestBuildEvaluationReceiptBindsFourTrustedTrialsAndOneScreenshot(t *testing
 	if receipt.PassCount != 1 || receipt.AverageTurns != 20 {
 		t.Fatalf("receipt aggregates = pass %d, turns %v; want 1, 20", receipt.PassCount, receipt.AverageTurns)
 	}
+	if receipt.HarborInternalRetryCount != 0 {
+		t.Fatalf("receipt Harbor internal retry count = %d, want 0", receipt.HarborInternalRetryCount)
+	}
 	if len(receipt.Trials) != 4 || receipt.ScreenshotArtifactID != input.CanonicalScreenshot.ArtifactID || receipt.RunBundleArtifactID != input.HarborRunBundle.ArtifactID {
 		t.Fatalf("receipt evidence = %#v, want four trials and frozen bundle/screenshot", receipt)
 	}
@@ -44,6 +47,58 @@ func TestBuildEvaluationReceiptBindsFourTrustedTrialsAndOneScreenshot(t *testing
 	second, err := receipt.Fingerprint()
 	if err != nil || first != second {
 		t.Fatalf("Fingerprint() = %q, %v then %q, %v; want stable", first, err, second, err)
+	}
+}
+
+func TestBuildEvaluationReceiptCarriesAggregateHarborRetriesWithoutFabricatingTrialAttempts(t *testing.T) {
+	fixture := newEvaluationBundleFixture(t, validEvaluationPolicy())
+	fixture.updateJob(t, func(job map[string]any) {
+		job["stats"].(map[string]any)["n_retries"] = 3
+	})
+
+	receipt, err := BuildEvaluationReceipt(fixture.input(t))
+	if err != nil {
+		t.Fatalf("BuildEvaluationReceipt() error = %v", err)
+	}
+	if receipt.HarborInternalRetryCount != 3 {
+		t.Fatalf("HarborInternalRetryCount = %d, want 3", receipt.HarborInternalRetryCount)
+	}
+	if len(receipt.Trials) != 4 {
+		t.Fatalf("receipt logical trials = %d, want exactly 4 despite aggregate internal retries", len(receipt.Trials))
+	}
+	seen := make(map[string]struct{}, len(receipt.Trials))
+	for _, trial := range receipt.Trials {
+		if _, duplicate := seen[trial.HarborTrialID]; duplicate {
+			t.Fatalf("receipt fabricated duplicate logical trial for retry: %#v", receipt.Trials)
+		}
+		seen[trial.HarborTrialID] = struct{}{}
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("receipt with aggregate retries must remain valid: %v", err)
+	}
+	fingerprint, err := receipt.Fingerprint()
+	if err != nil {
+		t.Fatalf("receipt Fingerprint() error = %v", err)
+	}
+	changed := receipt.Clone()
+	changed.HarborInternalRetryCount = 2
+	changedFingerprint, err := changed.Fingerprint()
+	if err != nil {
+		t.Fatalf("changed receipt Fingerprint() error = %v", err)
+	}
+	if changedFingerprint == fingerprint {
+		t.Fatal("aggregate Harbor retry count is absent from immutable receipt fingerprint")
+	}
+}
+
+func TestEvaluationReceiptRejectsNegativeHarborInternalRetryCount(t *testing.T) {
+	receipt, err := BuildEvaluationReceipt(validEvaluationInput(t, EvaluationPolicy{}))
+	if err != nil {
+		t.Fatalf("BuildEvaluationReceipt() error = %v", err)
+	}
+	receipt.HarborInternalRetryCount = -1
+	if err := receipt.Validate(); !errors.Is(err, ErrInvalidEvaluationEvidence) {
+		t.Fatalf("negative Harbor internal retry count error = %v, want ErrInvalidEvaluationEvidence", err)
 	}
 }
 
@@ -210,6 +265,7 @@ func (fixture evaluationBundleFixture) write(t *testing.T) {
 		job["stats"] = map[string]any{
 			"n_running_trials": 0,
 			"n_pending_trials": 0,
+			"n_retries":        0,
 			"evals": map[string]any{
 				fixture.policy.Evaluator.AgentName + "__" + fixture.policy.Evaluator.ModelName + "__adhoc": map[string]any{
 					"pass_at_k": map[string]any{"4": 1},

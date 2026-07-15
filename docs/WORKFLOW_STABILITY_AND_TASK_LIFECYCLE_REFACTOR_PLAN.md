@@ -113,7 +113,7 @@ draft
 | RuntimeSelfCheck | 外层 1800 秒 | 内层最低 1800 秒，无收尾余量 |
 | Human Gate | 86400 秒 | 长等待被建模为执行 timeout，而非 waiting 状态 |
 | Harbor | 7200 秒 | 会与错误的外层三次 retry 相乘 |
-| Codex turn fallback | 5 分钟 | 又一套默认值 |
+| V1 Codex turn fallback | 5 分钟 | 又一套默认值 |
 
 系统没有验证：
 
@@ -375,7 +375,7 @@ type DomainBindings interface {
 
 ### 5.4 包与模块演进
 
-本轮已经直接交付公开 `pkg/workflowkit`，并删除 `internal/workflow`。持久化、进程和 SQLite adapter 保留在 `internal/workflowruntime`；需要独立发布时再拆为单独 Go module，但不得重新引入旧 Engine 或 Harbor 领域依赖。
+本轮已经直接交付公开 `pkg/workflowkit`，并删除 `internal/workflow`。`internal/workflowruntime` 只保留被 V2 实际使用的 durable artifact/object-store adapter；SQLite control plane 归 `internal/harbor/store`，受控 detached worker 归 `internal/app.RunWorkerSession`。未接线的内存 child-runtime 原型已删除，避免形成第二套不具 durable lease/fencing 语义的执行路径。需要独立发布时再拆为单独 Go module，但不得重新引入旧 Engine 或 Harbor 领域依赖。
 
 Kernel public package 只依赖标准库和小型接口，不依赖 Cobra、Bubble Tea、SQLite schema、具体 Agent SDK 或本地路径。默认 runtime adapters 可以替换，因此其他 AI workflow 可选择内存、Postgres、Kubernetes Job 或远程 artifact store。
 
@@ -847,7 +847,6 @@ type ContinuationPlan struct {
     PreparedChangeID     string
     TaskRevisionID      string
     TaskDigest          string
-    CandidateRevisionID string
     Nodes               []NodeTransition
     RetireArtifacts     []string
     Schedule            []ScheduleBatch
@@ -1249,6 +1248,7 @@ x c  继续处理
   P 暂停运行
   K 取消选中阶段
   S 终止本次运行
+  R 本地 reconcile（仅 interrupted/in_doubt Run）
 
 当前阶段          harbor_qwen / attempt 2
 最近 checkpoint  14:32:18 / turn 3
@@ -1256,7 +1256,7 @@ x c  继续处理
 未决副作用        无
 ```
 
-`P/K/S` 只改变 overlay 选中项，必须再按 Enter 查看影响预览并确认；默认选中“返回并保持运行”，`Esc` 永远无副作用。非支持 cancel capability 的 stage 禁用 K 并显示原因。确认后 UI 持续显示 `requested → pausing/canceling → acknowledged|reconcile_required`、最近 checkpoint、runtime ack 和 quota settlement。
+`P/K/S` 只改变 overlay 选中项，必须再按 Enter 查看影响预览并确认；默认选中“返回并保持运行”，`Esc` 永远无副作用。非支持 cancel capability 的 stage 禁用 K 并显示原因。仅 `interrupted` 或 `in_doubt` 的 Run 才显示 `R`；它同样必须先预览、填写原因并确认，然后调用与 `harbor run reconcile` 相同的 scoped local recovery，不创建 ControlOperation、不调用 provider，也不自动重跑 workflow。确认后 UI 持续显示 `requested → pausing/canceling → acknowledged|reconcile_required`、最近 checkpoint、runtime ack 和 quota settlement。
 
 删除所有 plain `x` cancel 绑定。退出 TUI 不再是全局 detach：界面逐个列出 active Run，运营者对每个 Run 单独确认受控 child-worker handoff；未完成选择不得静默取消或把同一选择批量应用给所有 Run。要暂停或终止必须显式进入 RunControlOverlay。TUI context、scheduler context、每个 run context 和每个 stage context 必须分离，任何 target cancel 都不得向上取消共享 root context。
 
@@ -1531,7 +1531,7 @@ artifact lineage 必须由受管 V2 control plane 原生创建；不做 V1/V2 �
 - immutable Release；
 - soft delete/trash/restore/purge；
 - durable scheduler/jobs/leases；
-- Harbor TrialExecution/TrialAttempt 与本地 package materialization 接入 quota 与 reconcile；本轮 package reconcile 仅基于 immutable receipt、package digest 和 source digest，远端 provider/publish/upload 不在范围内。
+- Harbor TrialExecution/TrialAttempt 与本地 package materialization 接入 quota 与 reconcile；本轮 Harbor evaluator reconcile 仅基于受管本地 job 目录、immutable receipt、严格解析的 `result.json`/Trial 证据、package digest 和 source digest，远端 provider/publish/upload 不在范围内。
 
 ### M5：移除兼容债务
 
@@ -1576,10 +1576,7 @@ pkg/workflowkit/
   outcome.go
 
 internal/workflowruntime/
-  sqlite_store.go
-  durable_scheduler.go
-  process_runtime.go
-  outbox_dispatcher.go
+  artifact.go
   artifact_store.go
 
 internal/harbor/workflowadapter/
@@ -1662,7 +1659,7 @@ internal/harbor/store/
 ### 21.5 取消、恢复与 quota
 
 - plain `x` 在任何页面都不触发 mutation，`Ctrl+X` 只打开 RunControlOverlay；
-- overlay 默认“返回并保持运行”，`P/K/S` 只选择，Enter+确认后才创建 ControlOperation；
+- overlay 默认“返回并保持运行”，`P/K/S` 只选择，Enter+确认后才创建 ControlOperation；仅 `interrupted`/`in_doubt` Run 额外显示 `R`，经同样确认后执行 scoped local reconcile，不调用 provider 或重跑 workflow；
 - 取消一个前台 Run 不会取消 TUI root context、其他 queued/running jobs 或 Hub；
 - queued cancel 不创建 StageAttempt，不消费 trial，仅释放 reservation；
 - pause 在 checkpoint ack 后才进入 paused，恢复可用时不新增 attempt；

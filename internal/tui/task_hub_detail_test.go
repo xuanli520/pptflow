@@ -214,7 +214,7 @@ func TestTaskHubDetailMouseTabsRowsAndHelpUseV2Surfaces(t *testing.T) {
 	updated, _ = m.Update(runeKey("?"))
 	m = updated.(model)
 	help := ansi.Strip(m.View())
-	if !m.taskHubHelpVisible || !strings.Contains(help, "两键计划与确认") || !strings.Contains(help, "UUIDv7 幂等键") {
+	if !m.taskHubHelpVisible || !strings.Contains(help, "两键计划与确认") || !strings.Contains(help, "UUIDv7 幂等键") || !strings.Contains(help, "[R] 本地 reconcile") {
 		t.Fatalf("V2 Task Hub help was not rendered:\n%s", help)
 	}
 	if strings.Contains(help, "Ctrl+O") || strings.Contains(help, "工作区") {

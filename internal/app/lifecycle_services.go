@@ -47,19 +47,47 @@ type LifecycleServices struct {
 	LocalRuntime       *LocalRuntimeService
 	WorkerHandoffs     *RunWorkerHandoffService
 	Mutations          *LifecycleMutationService
+	EvaluatorLaunches  *CodeEdgeEvaluatorLaunchService
+	// EvaluatorEvidenceHandoffs records the immutable, verified bridge from a
+	// completed CodeEdge evaluator child Run to its approved Phase-1 parent.
+	// It is deliberately separate from launch and compliance: it never starts
+	// a provider or authorizes a package.
+	EvaluatorEvidenceHandoffs *CodeEdgeEvaluatorEvidenceHandoffService
 
 	core *lifecycleServiceCore
 }
 
 type lifecycleServiceCore struct {
-	store             *store.Store
-	layout            managedLayout
-	objects           *workflowruntime.ArtifactObjectStore
-	operationResolver workflowadapter.StageOperationResolver
-	deploymentCatalog *deploymentCatalogBinding
-	now               func() time.Time
-	changes           *ChangeProviderService
-	repairs           *RepairLoopService
+	store                *store.Store
+	layout               managedLayout
+	objects              *workflowruntime.ArtifactObjectStore
+	operationResolver    workflowadapter.StageOperationResolver
+	deploymentCatalogs   *deploymentCatalogRegistry
+	evaluatorDefinitions EvaluatorRunDefinitionProvider
+	evaluatorObserver    CodeEdgeEvaluatorCompletedObserver
+	now                  func() time.Time
+	changes              *ChangeProviderService
+	repairs              *RepairLoopService
+}
+
+// CodeEdgeEvaluatorObservationRequest carries the same frozen execution
+// capability that the original evaluator received. It is intentionally free
+// of host paths, environment values, secrets, or caller-provided command
+// arguments. A provider-specific observer may only inspect a deterministic
+// previously-created local job and report a completed result; it must never
+// launch, resume, or otherwise mutate an external evaluator.
+type CodeEdgeEvaluatorObservationRequest struct {
+	Execution  workflowkit.StageExecutionRequest
+	Resolution workflowadapter.StageOperationResolution
+}
+
+// CodeEdgeEvaluatorCompletedObserver is the narrow reconciliation port for
+// the closed Qwen/Opus Harbor evaluator. observed=false leaves the durable
+// Run, StageAttempt, and four logical TrialExecutions in_doubt. A successful
+// observation returns the exact immutable artifacts that the original stage
+// would have returned; it does not create another logical sample.
+type CodeEdgeEvaluatorCompletedObserver interface {
+	ObserveCompletedCodeEdgeEvaluator(context.Context, CodeEdgeEvaluatorObservationRequest) (workflowkit.StageExecutionResult, bool, error)
 }
 
 // LifecycleServicesOptions supplies controlled integrations used by the V2
@@ -89,6 +117,24 @@ type LifecycleServicesOptions struct {
 	// remain backward-safe while production composition can require both
 	// allow-list layers.
 	RequireDeploymentLock bool
+	// DeploymentCatalogResolvers installs immutable deployment catalog/lock
+	// verifiers keyed by their exact closed workflow template. It is the
+	// multi-template successor to DeploymentCatalogResolver: a StartRun,
+	// replay, or worker claim selects only the binding named by its frozen
+	// RunExecutionSpec.Template. The legacy DeploymentCatalogResolver, when
+	// supplied, is converted into one additional template-keyed binding; a
+	// duplicate template is rejected rather than becoming a fallback.
+	DeploymentCatalogResolvers []TemplateDeploymentCatalogResolver
+	// EvaluatorRunDefinitionProvider supplies the one already-attested
+	// CodeEdge evaluator child definition installed by deployment composition.
+	// CLI and TUI callers never provide its profile, execution specification,
+	// model selection, or stage operation data.
+	EvaluatorRunDefinitionProvider EvaluatorRunDefinitionProvider
+	// CodeEdgeEvaluatorObserver is the deployment-owned, read-only recovery
+	// port for an already-started Qwen or Opus evaluator. It is optional for
+	// read/control-plane and test compositions; without it the runtime retains
+	// an uncertain effect as in_doubt rather than attempting a rerun.
+	CodeEdgeEvaluatorObserver CodeEdgeEvaluatorCompletedObserver
 }
 
 // NewLifecycleServices wires a V2 control plane to its managed local
@@ -118,29 +164,38 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	if operationResolver == nil {
 		operationResolver = unavailableStageOperationResolver{}
 	}
+	catalogResolvers := append([]TemplateDeploymentCatalogResolver(nil), options.DeploymentCatalogResolvers...)
 	catalogResolver := options.DeploymentCatalogResolver
-	if catalogResolver == nil {
+	if catalogResolver == nil && len(catalogResolvers) == 0 {
 		if derived, ok := operationResolver.(DeploymentCatalogReceiptResolver); ok {
 			catalogResolver = derived
 		}
 	}
-	if catalogResolver == nil && options.RequireDeploymentCatalog {
+	if catalogResolver != nil {
+		catalogResolvers = append(catalogResolvers, TemplateDeploymentCatalogResolver{
+			Template: catalogResolver.Receipt().Template,
+			Resolver: catalogResolver,
+		})
+	}
+	if len(catalogResolvers) == 0 && options.RequireDeploymentCatalog {
 		return nil, fmt.Errorf("%w: a catalog-aware operation resolver is required", stageprovider.ErrDeploymentOperationCatalogUnavailable)
 	}
-	catalogBinding, err := newDeploymentCatalogBinding(catalogResolver)
+	catalogRegistry, err := newDeploymentCatalogRegistry(catalogResolvers)
 	if err != nil {
 		return nil, err
 	}
-	if options.RequireDeploymentLock && (catalogBinding == nil || catalogBinding.lockResolver == nil || catalogBinding.lockIdentity == nil) {
+	if options.RequireDeploymentLock && (catalogRegistry == nil || !catalogRegistry.allBindingsHaveLocks()) {
 		return nil, fmt.Errorf("%w: a catalog-lock-attested operation resolver is required", stageprovider.ErrDeploymentOperationCatalogLockUnavailable)
 	}
 	core := &lifecycleServiceCore{
-		store:             dataStore,
-		layout:            layout,
-		objects:           objects,
-		operationResolver: operationResolver,
-		deploymentCatalog: catalogBinding,
-		now:               time.Now,
+		store:                dataStore,
+		layout:               layout,
+		objects:              objects,
+		operationResolver:    operationResolver,
+		deploymentCatalogs:   catalogRegistry,
+		evaluatorDefinitions: options.EvaluatorRunDefinitionProvider,
+		evaluatorObserver:    options.CodeEdgeEvaluatorObserver,
+		now:                  time.Now,
 	}
 	continuations := newTaskContinuationService(core)
 	changes := newChangeProviderService(core)
@@ -152,24 +207,26 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	core.repairs = repairs
 	mutations := newLifecycleMutationService(core)
 	return &LifecycleServices{
-		Tasks:              &TaskService{core: core},
-		Revisions:          &RevisionService{core: core},
-		Runs:               &RunService{core: core},
-		Reviews:            &ReviewService{core: core},
-		Releases:           &ReleaseService{core: core},
-		Deletion:           &DeletionService{core: core},
-		Control:            &ExecutionControlService{core: core},
-		Budgets:            &BudgetGrantService{core: core},
-		Continuations:      continuations,
-		Changes:            changes,
-		Repairs:            repairs,
-		Candidates:         &CandidateRetentionService{core: core},
-		Inspection:         &LifecycleInspectionService{core: core},
-		CodeEdgeCompliance: &CodeEdgeComplianceService{core: core},
-		LocalRuntime:       &LocalRuntimeService{core: core},
-		WorkerHandoffs:     &RunWorkerHandoffService{core: core},
-		Mutations:          mutations,
-		core:               core,
+		Tasks:                     &TaskService{core: core},
+		Revisions:                 &RevisionService{core: core},
+		Runs:                      &RunService{core: core},
+		Reviews:                   &ReviewService{core: core},
+		Releases:                  &ReleaseService{core: core},
+		Deletion:                  &DeletionService{core: core},
+		Control:                   &ExecutionControlService{core: core},
+		Budgets:                   &BudgetGrantService{core: core},
+		Continuations:             continuations,
+		Changes:                   changes,
+		Repairs:                   repairs,
+		Candidates:                &CandidateRetentionService{core: core},
+		Inspection:                &LifecycleInspectionService{core: core},
+		CodeEdgeCompliance:        &CodeEdgeComplianceService{core: core},
+		LocalRuntime:              &LocalRuntimeService{core: core},
+		WorkerHandoffs:            &RunWorkerHandoffService{core: core},
+		Mutations:                 mutations,
+		EvaluatorLaunches:         &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider},
+		EvaluatorEvidenceHandoffs: &CodeEdgeEvaluatorEvidenceHandoffService{core: core},
+		core:                      core,
 	}, nil
 }
 
@@ -1020,11 +1077,11 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
-	catalogReceipt, err := service.core.resolveStartRunDeploymentCatalogReceipt(request.DeploymentCatalogReceipt)
+	catalogReceipt, err := service.core.resolveStartRunDeploymentCatalogReceipt(request.ExecutionSpec.Template, request.DeploymentCatalogReceipt)
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("freeze deployment catalog receipt for run: %w", err)
 	}
-	lockIdentity, err := service.core.resolveStartRunDeploymentCatalogLockIdentity(request.DeploymentCatalogLockIdentity)
+	lockIdentity, err := service.core.resolveStartRunDeploymentCatalogLockIdentity(request.ExecutionSpec.Template, request.DeploymentCatalogLockIdentity)
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("freeze deployment catalog lock identity for run: %w", err)
 	}

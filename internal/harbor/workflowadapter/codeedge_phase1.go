@@ -1,23 +1,20 @@
 package workflowadapter
 
-import (
-	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
-	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
-)
+import "github.com/purplevoid/harbor-factory/pkg/workflowkit"
 
 const (
 	// CodeEdgePhase1WorkflowTemplateID and Version identify the independent,
 	// closed production descriptor selected for CodeEdge Phase-1. It does not
 	// mutate or reinterpret the complete Standard lifecycle template.
 	CodeEdgePhase1WorkflowTemplateID      = "harbor.codeedge-phase1"
-	CodeEdgePhase1WorkflowTemplateVersion = "2.1.1"
+	CodeEdgePhase1WorkflowTemplateVersion = "2.2.0"
 	// CodeEdgeSubmissionReportSchemaVersion is the typed submission report
 	// consumed by final compliance, the result review gate, and packaging.
 	// Changing this schema changes the frozen workflow contract.
 	CodeEdgeSubmissionReportSchemaVersion = "codeedge.submission-report.v1"
 
 	codeEdgePhase1CatalogID      = "harbor.codeedge-phase1-stage-catalog"
-	codeEdgePhase1CatalogVersion = "2.1.1"
+	codeEdgePhase1CatalogVersion = "2.2.0"
 )
 
 // CodeEdgePhase1TemplateReference returns the immutable identity used by
@@ -38,8 +35,7 @@ var codeEdgePhase1StageOrder = []workflowkit.StageKey{
 	workflowkit.StageKey(QualityCheck),
 	workflowkit.StageKey(SimilarityCheck),
 	workflowkit.StageKey(FinalReview),
-	workflowkit.StageKey(HarborRunQwen),
-	workflowkit.StageKey(HarborRunOpus),
+	workflowkit.StageKey(EvaluatorEvidenceHandoff),
 	workflowkit.StageKey(SubmissionLint),
 	workflowkit.StageKey(ResultReview),
 	workflowkit.StageKey(Package),
@@ -81,14 +77,12 @@ func codeEdgePhase1Dependencies() map[workflowkit.StageKey][]workflowkit.StageKe
 		workflowkit.StageKey(QualityCheck):    {workflowkit.StageKey(SolutionReview)},
 		workflowkit.StageKey(SimilarityCheck): {workflowkit.StageKey(QualityCheck)},
 		workflowkit.StageKey(FinalReview):     {workflowkit.StageKey(SimilarityCheck)},
-		// Qwen and Opus retain separate frozen bindings and independent four-trial
-		// receipts. Neither consumes the other's evidence, so both become ready
-		// immediately after the shared FinalReview gate and compile into the same
-		// dependency layer.
-		workflowkit.StageKey(HarborRunQwen):  {workflowkit.StageKey(FinalReview)},
-		workflowkit.StageKey(HarborRunOpus):  {workflowkit.StageKey(FinalReview)},
-		workflowkit.StageKey(SubmissionLint): {workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(HarborRunOpus)},
-		workflowkit.StageKey(ResultReview):   {workflowkit.StageKey(SubmissionLint)},
+		// The evaluator child owns the real Qwen and Opus external effects. The
+		// parent waits for a separately verified, immutable handoff rather than
+		// calling either model or copying their artifacts into parent lineage.
+		workflowkit.StageKey(EvaluatorEvidenceHandoff): {workflowkit.StageKey(FinalReview)},
+		workflowkit.StageKey(SubmissionLint):           {workflowkit.StageKey(EvaluatorEvidenceHandoff)},
+		workflowkit.StageKey(ResultReview):             {workflowkit.StageKey(SubmissionLint)},
 		// The confirmed 3A policy creates the unique local package only after
 		// both evaluations and final compliance review have completed.
 		workflowkit.StageKey(Package): {workflowkit.StageKey(ResultReview)},
@@ -96,9 +90,9 @@ func codeEdgePhase1Dependencies() map[workflowkit.StageKey][]workflowkit.StageKe
 }
 
 // CodeEdgePhase1WorkflowTemplate returns Harbor's versioned CodeEdge
-// Phase-1 descriptor. It reuses only existing sealed Harbor stage binding
-// types; changing the set requires an additive typed binding/parser revision,
-// never an opaque stage-name or map payload escape hatch.
+// Phase-1 descriptor. It uses only sealed Harbor stage binding types;
+// changing the set requires an additive typed binding/parser revision, never
+// an opaque stage-name or map payload escape hatch.
 func CodeEdgePhase1WorkflowTemplate() WorkflowTemplate {
 	return WorkflowTemplate{
 		ID:          CodeEdgePhase1WorkflowTemplateID,
@@ -110,11 +104,11 @@ func CodeEdgePhase1WorkflowTemplate() WorkflowTemplate {
 
 // CodeEdgePhase1StageCatalog defines the confirmed production ordering:
 // structural/repository/environment preflight, controlled build, initial and
-// Oracle verification, tests-analysis review, quality/similarity review,
-// parallel-ready Qwen and Opus four-trial evaluation, final compliance
-// review, and only then the one immutable local package. Real
-// executable/image/model values remain outside this descriptor in the
-// deployment operation catalog.
+// Oracle verification, tests-analysis review, quality/similarity review, an
+// explicit evaluator-child evidence handoff, final compliance review, and
+// only then the one immutable local package. The parent never contains a
+// Qwen/Opus provider operation; real evaluator execution remains in the
+// closed child descriptor.
 func CodeEdgePhase1StageCatalog() StageCatalog {
 	return StageCatalog{
 		Template: CodeEdgePhase1TemplateReference(),
@@ -132,24 +126,10 @@ func CodeEdgePhase1StageCatalog() StageCatalog {
 			stage(QualityCheck, StageQuality, []string{SolutionReview}, "harborfactory.quality_check", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceTestsAnalysis, resourceReviewSolutionVerifier}, []workflowkit.ResourceKey{resourceEvidenceQuality}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), artifactInput("tests_analysis_report"), reviewDecisionInput("solution_review_decision"), artifactOutput("quality_report")),
 			stage(SimilarityCheck, StageSimilarity, []string{QualityCheck}, "harborfactory.similarity_check", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceQuality}, []workflowkit.ResourceKey{resourceEvidenceSimilarity}, workflowkit.EffectEvidenceOnly, 1, similarityVerdicts(), artifactInput("task_snapshot"), artifactInput("quality_report"), artifactOutput("similarity_report")),
 			gateStage(FinalReview, StageFinalReview, []string{SimilarityCheck}, ReviewFinalQuality, []workflowkit.ResourceKey{resourceEvidenceQuality, resourceEvidenceSimilarity}, []workflowkit.ResourceKey{resourceReviewFinalQuality}, artifactInput("quality_report"), artifactInput("similarity_report")),
-			codeEdgeEvaluationStage(HarborRunQwen, []string{FinalReview}, "harborfactory.harbor_run_qwen", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluationQwen}, artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutputWithSchema("qwen_trial_result", codeedge.HarborRunBundleV018Format), artifactOutput("qwen_pass4_evidence")),
-			codeEdgeEvaluationStage(HarborRunOpus, []string{FinalReview}, "harborfactory.harbor_run_opus", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluationOpus}, artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutputWithSchema("opus_trial_result", codeedge.HarborRunBundleV018Format), artifactOutput("opus_pass4_evidence")),
-			stage(SubmissionLint, StageSubmission, []string{HarborRunQwen, HarborRunOpus}, "harborfactory.codeedge_lint", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus}, []workflowkit.ResourceKey{resourceEvidenceSubmissionLint}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), artifactInput("qwen_trial_result"), artifactInput("opus_trial_result"), artifactOutputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion)),
-			gateStage(ResultReview, StageSubmission, []string{SubmissionLint}, ReviewModelResult, []workflowkit.ResourceKey{resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus, resourceEvidenceSubmissionLint}, []workflowkit.ResourceKey{resourceReviewModelResult}, artifactInput("qwen_trial_result"), artifactInput("opus_trial_result"), artifactInputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion)),
+			gateStage(EvaluatorEvidenceHandoff, StageEvaluation, []string{FinalReview}, ReviewEvaluatorEvidence, []workflowkit.ResourceKey{resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluatorHandoff, resourceReviewEvaluatorEvidence}, reviewDecisionInput("final_review_decision")),
+			stage(SubmissionLint, StageSubmission, []string{EvaluatorEvidenceHandoff}, "harborfactory.codeedge_lint", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceEvaluatorHandoff, resourceReviewEvaluatorEvidence}, []workflowkit.ResourceKey{resourceEvidenceSubmissionLint}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), reviewDecisionInput("evaluator_evidence_handoff_decision"), artifactOutputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion)),
+			gateStage(ResultReview, StageSubmission, []string{SubmissionLint}, ReviewModelResult, []workflowkit.ResourceKey{resourceEvidenceEvaluatorHandoff, resourceReviewEvaluatorEvidence, resourceEvidenceSubmissionLint}, []workflowkit.ResourceKey{resourceReviewModelResult}, reviewDecisionInput("evaluator_evidence_handoff_decision"), artifactInputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion)),
 			operatorOnlyLocalPackageStage([]string{ResultReview}, []workflowkit.ResourceKey{resourceTaskSnapshot, resourceEvidenceSubmissionLint, resourceReviewModelResult}, []workflowkit.ResourceKey{resourceDeliveryPackage}, artifactInput("task_snapshot"), artifactInputWithSchema("submission_lint_report", CodeEdgeSubmissionReportSchemaVersion), reviewDecisionInput("model_result_decision"), artifactOutput("package_bundle")),
 		},
 	}
-}
-
-// codeEdgeEvaluationStage marks a Harbor evaluator as an external side
-// effect and deliberately disables generic stage retries. One invocation
-// creates the confirmed four logical samples, so retrying the whole stage on
-// a transient/process failure could produce a second, incomparable group of
-// four. The durable TrialExecution reconciler owns technical retry beneath
-// the same logical trial identity instead.
-func codeEdgeEvaluationStage(key string, dependencies []string, pluginID string, reads, writes []workflowkit.ResourceKey, artifacts ...stageArtifact) StageDefinition {
-	definition := stage(key, StageEvaluation, dependencies, pluginID, reads, writes, workflowkit.EffectExternalSideEffect, 1, evaluationVerdicts(), artifacts...)
-	definition.Retry = workflowkit.RetryPolicy{}
-	definition.Reuse = workflowkit.ReuseNever
-	return definition
 }

@@ -9,10 +9,10 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// RunControlOverlay is a read/preview surface for durable run control. It
-// never turns a keypress into a process-context cancellation or a persistent
-// ControlOperation; mutation inputs and confirmation remain outside this TUI
-// overlay.
+// RunControlOverlay is a read/preview surface for controlled Run actions. It
+// never turns a keypress into a process-context cancellation, local recovery,
+// or a persistent ControlOperation; mutation inputs and confirmation remain
+// outside this TUI overlay.
 type RunControlOverlay struct {
 	RunID                  string
 	TaskID                 string
@@ -93,6 +93,46 @@ func (o *RunControlOverlay) actionState(action TaskHubRunControlAction) TaskHubR
 		}
 	}
 	return TaskHubRunControlActionState{Action: action, DisabledReason: "当前 Run 未声明此控制操作可用"}
+}
+
+// declaresAction reports whether the authoritative capability projection
+// actually exposes an action. Reconcile is intentionally omitted altogether
+// for Runs that do not require it, rather than rendered as a tempting generic
+// recovery command.
+func (o *RunControlOverlay) declaresAction(action TaskHubRunControlAction) bool {
+	if o == nil {
+		return false
+	}
+	for _, state := range o.Actions {
+		if state.Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+type taskHubRunControlChoice struct {
+	action TaskHubRunControlAction
+	label  string
+}
+
+func (o *RunControlOverlay) choices() []taskHubRunControlChoice {
+	choices := []taskHubRunControlChoice{
+		{TaskHubRunControlPause, "[P] 暂停运行"},
+		{TaskHubRunControlCancelStage, "[K] 取消选中阶段"},
+		{TaskHubRunControlTerminate, "[S] 终止本次运行"},
+	}
+	if o.declaresAction(TaskHubRunControlReconcile) {
+		choices = append(choices, taskHubRunControlChoice{TaskHubRunControlReconcile, "[R] 本地 reconcile"})
+	}
+	return choices
+}
+
+func (o *RunControlOverlay) actionKeyHint() string {
+	if o.declaresAction(TaskHubRunControlReconcile) {
+		return "[P/K/S/R] 选择  [Enter] 查看影响预览  [Esc] 返回"
+	}
+	return "[P/K/S] 选择  [Enter] 查看影响预览  [Esc] 返回"
 }
 
 func (o *RunControlOverlay) selectAction(action TaskHubRunControlAction) {
@@ -192,14 +232,7 @@ func (o *RunControlOverlay) View(width, height int) string {
 	selectedRow := len(rows)
 	rows = append(rows, o.choiceLine("  返回并保持运行  ", "", ""))
 	if o.lifecycleControlAvailable() {
-		for _, item := range []struct {
-			action TaskHubRunControlAction
-			label  string
-		}{
-			{TaskHubRunControlPause, "[P] 暂停运行"},
-			{TaskHubRunControlCancelStage, "[K] 取消选中阶段"},
-			{TaskHubRunControlTerminate, "[S] 终止本次运行"},
-		} {
+		for _, item := range o.choices() {
 			state := o.actionState(item.action)
 			reason := ""
 			if !state.Enabled {
@@ -221,7 +254,7 @@ func (o *RunControlOverlay) View(width, height int) string {
 	}
 	rows = append(rows, "")
 	if o.lifecycleControlAvailable() {
-		rows = append(rows, subtleStyle.Render("[P/K/S] 选择  [Enter] 查看影响预览  [Esc] 返回"))
+		rows = append(rows, subtleStyle.Render(o.actionKeyHint()))
 	} else {
 		rows = append(rows, subtleStyle.Render("[Enter/Esc] 返回"))
 	}

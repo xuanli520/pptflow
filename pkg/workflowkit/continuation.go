@@ -247,7 +247,6 @@ type ContinuationPlanSnapshot struct {
 	PreparedChangeID            string                       `json:"prepared_change_id,omitempty"`
 	SubjectRevisionID           string                       `json:"subject_revision_id"`
 	SubjectDigest               SubjectDigest                `json:"subject_digest"`
-	CandidateRevisionID         string                       `json:"candidate_revision_id,omitempty"`
 	Nodes                       []NodeTransition             `json:"nodes"`
 	RetireArtifacts             []ArtifactID                 `json:"retire_artifacts,omitempty"`
 	Schedule                    []ScheduleBatch              `json:"schedule"`
@@ -377,9 +376,6 @@ func validateContinuationPlan(snapshot ContinuationPlanSnapshot, workflow Workfl
 			return fmt.Errorf("%w: subject revision strategy requires a child run", ErrInvalidContinuationPlan)
 		}
 		if err := validateRequired("prepared change id", snapshot.PreparedChangeID, ErrInvalidContinuationPlan); err != nil {
-			return err
-		}
-		if err := validateRequired("candidate revision id", snapshot.CandidateRevisionID, ErrInvalidContinuationPlan); err != nil {
 			return err
 		}
 	}

@@ -38,7 +38,7 @@ func (e *appServerRPCError) Error() string {
 	return fmt.Sprintf("codex app-server JSON-RPC error %d: %s", e.Code, e.Message)
 }
 
-func (s *appServerCodexReviewSession) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
+func (s *appServerSession) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id, ch := s.registerResponse()
 	request := map[string]any{
 		"jsonrpc": "2.0",
@@ -51,9 +51,7 @@ func (s *appServerCodexReviewSession) sendRequest(ctx context.Context, method st
 		s.unregisterResponse(id)
 		return nil, err
 	}
-	s.writeMu.Lock()
-	_, writeErr := s.stdin.Write(append(data, '\n'))
-	s.writeMu.Unlock()
+	writeErr := s.writeMessage(data)
 	if writeErr != nil {
 		s.unregisterResponse(id)
 		return nil, writeErr
@@ -72,7 +70,7 @@ func (s *appServerCodexReviewSession) sendRequest(ctx context.Context, method st
 	}
 }
 
-func (s *appServerCodexReviewSession) sendNotification(ctx context.Context, method string, params any) error {
+func (s *appServerSession) sendNotification(ctx context.Context, method string, params any) error {
 	notification := map[string]any{
 		"jsonrpc": "2.0",
 		"method":  method,
@@ -91,16 +89,10 @@ func (s *appServerCodexReviewSession) sendNotification(ctx context.Context, meth
 		return fmt.Errorf("codex app-server exited before %s notification was sent", method)
 	default:
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.stdin == nil {
-		return fmt.Errorf("codex app-server stdin is not available")
-	}
-	_, err = s.stdin.Write(append(data, '\n'))
-	return err
+	return s.writeMessage(data)
 }
 
-func (s *appServerCodexReviewSession) registerResponse() (int, chan appServerRPCMessage) {
+func (s *appServerSession) registerResponse() (int, chan appServerRPCMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
@@ -110,13 +102,13 @@ func (s *appServerCodexReviewSession) registerResponse() (int, chan appServerRPC
 	return id, ch
 }
 
-func (s *appServerCodexReviewSession) unregisterResponse(id int) {
+func (s *appServerSession) unregisterResponse(id int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.responses, id)
 }
 
-func (s *appServerCodexReviewSession) dispatchResponse(id int, message appServerRPCMessage) {
+func (s *appServerSession) dispatchResponse(id int, message appServerRPCMessage) {
 	s.mu.Lock()
 	ch := s.responses[id]
 	delete(s.responses, id)
@@ -126,12 +118,12 @@ func (s *appServerCodexReviewSession) dispatchResponse(id int, message appServer
 	}
 }
 
-func (s *appServerCodexReviewSession) respondUnsupported(id json.RawMessage, method string) {
+func (s *appServerSession) respondUnsupported(id json.RawMessage, method string) {
 	response := map[string]any{
 		"jsonrpc": "2.0",
 		"error": map[string]any{
 			"code":    -32601,
-			"message": "harbor-factory app-server client does not implement server request method " + method,
+			"message": "agent-runtime app-server client does not implement server request method " + method,
 		},
 	}
 	var payload map[string]json.RawMessage
@@ -147,11 +139,23 @@ func (s *appServerCodexReviewSession) respondUnsupported(id json.RawMessage, met
 	if err != nil {
 		return
 	}
+	_ = s.writeMessage(data)
+}
+
+// writeMessage serializes JSON-RPC writes with shutdown.  The process may
+// exit while a caller is starting or steering a turn; report that condition
+// instead of dereferencing a closed stdin pipe.
+func (s *appServerSession) writeMessage(data []byte) error {
 	s.writeMu.Lock()
-	if s.stdin != nil {
-		_, _ = s.stdin.Write(append(data, '\n'))
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	stdin := s.stdin
+	s.mu.Unlock()
+	if stdin == nil {
+		return fmt.Errorf("codex app-server stdin is not available")
 	}
-	s.writeMu.Unlock()
+	_, err := stdin.Write(append(data, '\n'))
+	return err
 }
 
 func rpcIDInt(raw json.RawMessage) (int, bool) {
@@ -187,6 +191,18 @@ func appServerThreadStartParams(request Request) map[string]any {
 	}
 	setAppServerModelParam(params, request.Model)
 	return params
+}
+
+func appServerClientInfo(request Request) map[string]any {
+	name := strings.TrimSpace(request.ClientName)
+	if name == "" {
+		name = "agent-runtime"
+	}
+	version := strings.TrimSpace(request.ClientVersion)
+	if version == "" {
+		version = "1"
+	}
+	return map[string]any{"name": name, "version": version}
 }
 
 func appServerTurnStartParams(request Request, threadID string) map[string]any {

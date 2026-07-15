@@ -167,18 +167,13 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 				{ID: "checkout-main", RevisionID: revisionID, RevisionDigest: workflowkit.SubjectDigest(revisionDigest)},
 				{ID: "checkout-package", RevisionID: revisionID, RevisionDigest: workflowkit.SubjectDigest(revisionDigest)},
 			},
-			Runtimes: []workflowadapter.RuntimeReference{
-				{ID: "runtime-local", Kind: "local", Version: "1"},
-				{ID: "runtime-evaluator", Kind: "container", Version: "1"},
-			},
+			Runtimes: []workflowadapter.RuntimeReference{{ID: "runtime-local", Kind: "local", Version: "1"}},
 			Providers: []workflowadapter.ProviderReference{
 				{ID: "provider-local", Kind: "native", Version: "1"},
-				{ID: "provider-evaluator", Kind: "evaluation", Version: "1"},
 				{ID: "provider-review", Kind: "durable-review", Version: "1"},
 			},
 			Secrets: []workflowadapter.SecretReference{
 				{ID: "secret-repository", Provider: "local-keyring", Version: "1"},
-				{ID: "secret-evaluator", Provider: "local-keyring", Version: "1"},
 			},
 		},
 	}
@@ -197,30 +192,72 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 			},
 		}
 		switch definition.Key {
-		case workflowadapter.SolutionReview, workflowadapter.FinalReview, workflowadapter.ResultReview:
+		case workflowadapter.SolutionReview, workflowadapter.FinalReview, workflowadapter.EvaluatorEvidenceHandoff, workflowadapter.ResultReview:
 			base.Operation.ProviderID = "provider-review"
 			base.Operation.Payload = workflowadapter.DurableReviewOperationPayload{PolicyID: "harbor-review.v1"}
 		case workflowadapter.RepoPrepare:
 			base.SecretIDs = []string{"secret-repository"}
-		case workflowadapter.HarborRunQwen:
-			base.RuntimeID = "runtime-evaluator"
-			base.Operation.ProviderID = "provider-evaluator"
-			base.Operation.Payload = workflowadapter.ContainerCommandOperationPayload{
-				ImageDigest: "registry.example/harbor/evaluator@sha256:" + strings.Repeat("f", 64),
-				Command:     []string{"harbor-evaluator", string(definition.Key)},
-			}
-			base.SecretIDs = []string{"secret-evaluator", "secret-repository"}
-		case workflowadapter.HarborRunOpus:
-			base.RuntimeID = "runtime-evaluator"
-			base.Operation.ProviderID = "provider-evaluator"
-			base.Operation.Payload = workflowadapter.ContainerCommandOperationPayload{
-				ImageDigest: "registry.example/harbor/evaluator@sha256:" + strings.Repeat("f", 64),
-				Command:     []string{"harbor-evaluator", string(definition.Key)},
-			}
 		case workflowadapter.Package:
 			base.CheckoutID = "checkout-package"
 		}
 		specification.Stages = append(specification.Stages, fixtureBinding(base))
+	}
+	return specification
+}
+
+// CompleteCodeEdgeEvaluatorChildRunExecutionSpec returns the explicit
+// two-stage child evaluator contract used by application-boundary tests. The
+// provisional task_snapshot binding is intentionally replaced by the launch
+// service with the managed immutable snapshot it materializes for the child
+// Run. Production definitions come only from deployment composition.
+func CompleteCodeEdgeEvaluatorChildRunExecutionSpec(taskID, revisionID, revisionDigest string) workflowadapter.RunExecutionSpec {
+	selection := workflowadapter.RunSelectionReference{
+		TaskID: taskID, RevisionID: revisionID, RevisionDigest: workflowkit.SubjectDigest(revisionDigest),
+	}
+	taskSnapshot := workflowadapter.ArtifactReference{
+		ID: "018f0a73-3b49-7000-8000-000000000009", ContentDigest: fixtureFingerprint('a'), SchemaVersion: workflowadapter.CodeEdgeEvaluatorTaskSnapshotSchemaVersion,
+	}
+	catalog := workflowadapter.CodeEdgeEvaluatorChildStageCatalog()
+	qwenDefinition, found := catalog.Stage(workflowkit.StageKey(workflowadapter.HarborRunQwen))
+	if !found {
+		panic("testsupport: CodeEdge evaluator child catalog lacks Qwen stage")
+	}
+	opusDefinition, found := catalog.Stage(workflowkit.StageKey(workflowadapter.HarborRunOpus))
+	if !found {
+		panic("testsupport: CodeEdge evaluator child catalog lacks Opus stage")
+	}
+	base := func(definition workflowadapter.StageDefinition, bindingType workflowadapter.StageBindingType, operationID, commandID string) workflowadapter.StageBindingBase {
+		return workflowadapter.StageBindingBase{
+			Type: bindingType, StageKey: definition.Key, Plugin: workflowkit.PluginBinding{ID: definition.Plugin.ID, Version: definition.Plugin.Version},
+			ArtifactInputs: []workflowadapter.ArtifactInputReference{{Port: workflowadapter.CodeEdgeEvaluatorTaskSnapshotArtifact, ArtifactID: taskSnapshot.ID}},
+			CheckoutID:     "checkout-codeedge-evaluator", RuntimeID: "runtime-codeedge-evaluator", SecretIDs: []string{"secret-evaluator"},
+			Operation: workflowadapter.StageOperationBinding{
+				ProviderID: "provider-codeedge-evaluator", OperationID: operationID, Version: "1",
+				Payload: workflowadapter.LocalCommandOperationPayload{CommandID: commandID, Arguments: []string{}},
+			},
+		}
+	}
+	specification := workflowadapter.RunExecutionSpec{
+		Format: workflowadapter.RunExecutionSpecFormat, Version: workflowadapter.RunExecutionSpecVersion,
+		Template: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(), Selection: selection,
+		References: workflowadapter.ExecutionReferenceSet{
+			Artifacts: []workflowadapter.ArtifactReference{taskSnapshot},
+			Checkouts: []workflowadapter.CheckoutReference{{
+				ID: "checkout-codeedge-evaluator", RevisionID: revisionID, RevisionDigest: workflowkit.SubjectDigest(revisionDigest),
+			}},
+			Runtimes:  []workflowadapter.RuntimeReference{{ID: "runtime-codeedge-evaluator", Kind: "controlled", Version: "1"}},
+			Providers: []workflowadapter.ProviderReference{{ID: "provider-codeedge-evaluator", Kind: "evaluation", Version: "1"}},
+			Secrets: []workflowadapter.SecretReference{{
+				ID: "secret-evaluator", Provider: "environment", Version: "1",
+			}},
+		},
+		Stages: []workflowadapter.StageExecutionBinding{
+			workflowadapter.HarborRunQwenBinding{StageBindingBase: base(qwenDefinition, workflowadapter.StageBindingHarborRunQwen, "codeedge.qwen.pass-at-four", "codeedge-qwen-pass4")},
+			workflowadapter.HarborRunOpusBinding{StageBindingBase: base(opusDefinition, workflowadapter.StageBindingHarborRunOpus, "codeedge.opus.pass-at-four", "codeedge-opus-pass4")},
+		},
+	}
+	if err := specification.Validate(); err != nil {
+		panic("testsupport: invalid CodeEdge evaluator child execution spec: " + err.Error())
 	}
 	return specification
 }
@@ -320,6 +357,8 @@ func fixtureBinding(base workflowadapter.StageBindingBase) workflowadapter.Stage
 		return workflowadapter.HarborRunQwenBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingHarborRunOpus:
 		return workflowadapter.HarborRunOpusBinding{StageBindingBase: base}
+	case workflowadapter.StageBindingEvaluatorEvidenceHandoff:
+		return workflowadapter.EvaluatorEvidenceHandoffBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingResultReview:
 		return workflowadapter.ResultReviewBinding{StageBindingBase: base}
 	case workflowadapter.StageBindingSubmissionLint:
@@ -385,6 +424,8 @@ func fixtureBindingType(key workflowkit.StageKey) workflowadapter.StageBindingTy
 		return workflowadapter.StageBindingHarborRunQwen
 	case "harbor_run_opus":
 		return workflowadapter.StageBindingHarborRunOpus
+	case "evaluator_evidence_handoff":
+		return workflowadapter.StageBindingEvaluatorEvidenceHandoff
 	case "result_review":
 		return workflowadapter.StageBindingResultReview
 	case "submission_lint":

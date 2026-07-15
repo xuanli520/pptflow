@@ -345,6 +345,24 @@ func (s *Store) GetRevisionCandidateByTargetRevision(ctx context.Context, revisi
 	return &candidate, nil
 }
 
+// GetRevisionCandidateByFrozenPlan returns the one Harbor-owned revision
+// candidate atomically bound to a frozen continuation plan. The generic plan
+// snapshot intentionally carries no candidate-store identity; this relation is
+// enforced by revision_candidates_v8.frozen_plan_id's unique constraint.
+func (s *Store) GetRevisionCandidateByFrozenPlan(ctx context.Context, planID string) (*RevisionCandidate, error) {
+	if !isUUIDv7(planID) {
+		return nil, ErrInvalidUUIDv7Identity
+	}
+	candidate, err := scanRevisionCandidate(s.db.QueryRowContext(ctx, revisionCandidateV8Select+" WHERE frozen_plan_id = ?", planID))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &candidate, nil
+}
+
 func (s *Store) ListRevisionCandidatesForTask(ctx context.Context, taskID string) ([]RevisionCandidate, error) {
 	if !isUUIDv7(taskID) {
 		return nil, ErrInvalidUUIDv7Identity
@@ -1109,14 +1127,18 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 		return RevisionCandidateContinuationCommit{}, err
 	}
 	defer tx.Rollback()
+	plan, err := getFrozenPlanTx(ctx, tx, prepared.planID)
+	if err != nil {
+		return RevisionCandidateContinuationCommit{}, err
+	}
+	candidate, err := getRevisionCandidateByFrozenPlanTx(ctx, tx, plan.ID)
+	if err != nil {
+		return RevisionCandidateContinuationCommit{}, err
+	}
 
 	if existing, err := getContinuationExecutionByKeyTx(ctx, tx, prepared.idempotencyKey); err == nil {
 		if existing.PlanID != prepared.planID || existing.PayloadJSON != prepared.payloadJSON {
 			return RevisionCandidateContinuationCommit{}, fmt.Errorf("%w: revision candidate execution key %s", ErrIdempotencyConflict, prepared.idempotencyKey)
-		}
-		candidate, err := getRevisionCandidateTx(ctx, tx, prepared.candidateID)
-		if err != nil {
-			return RevisionCandidateContinuationCommit{}, err
 		}
 		revision, err := getTaskRevisionTx(ctx, tx, candidate.TargetRevisionID)
 		if err != nil {
@@ -1141,10 +1163,6 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 		return RevisionCandidateContinuationCommit{}, err
 	}
 
-	plan, err := getFrozenPlanTx(ctx, tx, prepared.planID)
-	if err != nil {
-		return RevisionCandidateContinuationCommit{}, err
-	}
 	now := s.now().UTC()
 	if !plan.ExpiresAt.After(now) {
 		return RevisionCandidateContinuationCommit{}, fmt.Errorf("%w: %s", ErrContinuationPlanExpired, plan.ID)
@@ -1152,10 +1170,6 @@ func (s *Store) CommitRevisionCandidateContinuation(ctx context.Context, request
 	var snapshot workflowkit.ContinuationPlanSnapshot
 	if err := decodeStrictContinuationSnapshot(plan.PayloadJSON, &snapshot); err != nil {
 		return RevisionCandidateContinuationCommit{}, fmt.Errorf("decode candidate continuation plan %s: %w", plan.ID, err)
-	}
-	candidate, err := getRevisionCandidateTx(ctx, tx, prepared.candidateID)
-	if err != nil {
-		return RevisionCandidateContinuationCommit{}, err
 	}
 	if candidate.State != RevisionCandidatePrepared || candidate.FrozenPlanID != plan.ID || candidate.PreparedChangeID == "" || candidate.FinalManifestID == "" || candidate.ChildRunManifestJSON == "" {
 		return RevisionCandidateContinuationCommit{}, fmt.Errorf("%w: revision candidate %s is not commit-ready", ErrInvalidTransition, candidate.ID)
@@ -1398,7 +1412,6 @@ func (s *Store) verifyCandidateChildRunInputsTx(ctx context.Context, tx *sql.Tx,
 type preparedRevisionCandidateContinuationCommit struct {
 	executionID    string
 	planID         string
-	candidateID    string
 	idempotencyKey string
 	payloadJSON    string
 	expected       ControlCheckpointRef
@@ -1415,7 +1428,7 @@ func prepareRevisionCandidateContinuationCommit(s *Store, request CommitRevision
 	if err != nil {
 		return preparedRevisionCandidateContinuationCommit{}, err
 	}
-	if !isUUIDv7(request.PlanID) || !isUUIDv7(request.CandidateID) {
+	if !isUUIDv7(request.PlanID) {
 		return preparedRevisionCandidateContinuationCommit{}, ErrInvalidUUIDv7Identity
 	}
 	key, err := normalizeRequired(request.IdempotencyKey, "candidate continuation execution idempotency key")
@@ -1442,7 +1455,7 @@ func prepareRevisionCandidateContinuationCommit(s *Store, request CommitRevision
 		return preparedRevisionCandidateContinuationCommit{}, err
 	}
 	childRunInputs := append([]CreateRunInputArtifactRequest(nil), request.ChildRunInputs...)
-	return preparedRevisionCandidateContinuationCommit{executionID: id, planID: request.PlanID, candidateID: request.CandidateID,
+	return preparedRevisionCandidateContinuationCommit{executionID: id, planID: request.PlanID,
 		idempotencyKey: key, payloadJSON: payload, expected: request.Expected, actor: actor, reason: reason,
 		childRunInputs: childRunInputs, priority: request.Priority, jobID: jobID, jobKey: "candidate-continuation-job:" + key}, nil
 }
@@ -1598,6 +1611,14 @@ func getRevisionCandidateByCommandTx(ctx context.Context, tx *sql.Tx, commandID 
 	candidate, err := scanRevisionCandidate(tx.QueryRowContext(ctx, revisionCandidateV8Select+" WHERE command_id = ?", commandID))
 	if err == sql.ErrNoRows {
 		return RevisionCandidate{}, fmt.Errorf("%w: revision candidate command %s", ErrNotFound, commandID)
+	}
+	return candidate, err
+}
+
+func getRevisionCandidateByFrozenPlanTx(ctx context.Context, tx *sql.Tx, planID string) (RevisionCandidate, error) {
+	candidate, err := scanRevisionCandidate(tx.QueryRowContext(ctx, revisionCandidateV8Select+" WHERE frozen_plan_id = ?", planID))
+	if err == sql.ErrNoRows {
+		return RevisionCandidate{}, fmt.Errorf("%w: frozen plan %s revision candidate", ErrNotFound, planID)
 	}
 	return candidate, err
 }

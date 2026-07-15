@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
@@ -60,6 +59,15 @@ func (service *ReleaseService) resolveCodeEdgePackageAuthorization(ctx context.C
 		return nil, fmt.Errorf("CodeEdge package authorization does not match the selected frozen Run")
 	}
 
+	checker := &CodeEdgeComplianceService{core: service.core}
+	handoff, err := checker.loadVerifiedCodeEdgeEvaluatorEvidenceHandoff(ctx, frozen, record.EvaluatorEvidenceHandoffID)
+	if err != nil {
+		return nil, err
+	}
+	handoffFingerprint, err := handoff.Fingerprint()
+	if err != nil || string(handoffFingerprint) != record.EvaluatorEvidenceHandoffFingerprint {
+		return nil, fmt.Errorf("CodeEdge package authorization handoff fingerprint drift")
+	}
 	qwen, err := decodeCanonicalCodeEdgeEvaluationReceipt(record.QwenReceiptJSON, "Qwen")
 	if err != nil {
 		return nil, err
@@ -80,21 +88,10 @@ func (service *ReleaseService) resolveCodeEdgePackageAuthorization(ctx context.C
 	if err != nil {
 		return nil, err
 	}
-	qwenStage, err := uniqueCodeEdgeStageAttempt(ctx, service.core.store, frozen.Run, workflowadapter.HarborRunQwen)
-	if err != nil {
+	if err := requireSameCodeEdgeEvaluationReceipt("Qwen", qwen, handoff.Qwen.Receipt); err != nil {
 		return nil, err
 	}
-	opusStage, err := uniqueCodeEdgeStageAttempt(ctx, service.core.store, frozen.Run, workflowadapter.HarborRunOpus)
-	if err != nil {
-		return nil, err
-	}
-	checker := &CodeEdgeComplianceService{core: service.core}
-	verifiedQwen, err := checker.rebuildCodeEdgeEvaluationReceipt(ctx, frozen, qwenStage, workflowadapter.HarborRunQwen, "qwen_trial_result", "qwen_pass4_evidence", frozen.Policy.QwenPolicy, qwen)
-	if err != nil {
-		return nil, err
-	}
-	verifiedOpus, err := checker.rebuildCodeEdgeEvaluationReceipt(ctx, frozen, opusStage, workflowadapter.HarborRunOpus, "opus_trial_result", "opus_pass4_evidence", frozen.Policy.OpusPolicy, opus)
-	if err != nil {
+	if err := requireSameCodeEdgeEvaluationReceipt("Opus", opus, handoff.Opus.Receipt); err != nil {
 		return nil, err
 	}
 	if err := checker.verifyCodeEdgeSubmissionReceipt(ctx, frozen, submission); err != nil {
@@ -103,18 +100,15 @@ func (service *ReleaseService) resolveCodeEdgePackageAuthorization(ctx context.C
 	if err := requireApprovedCodeEdgeReviewGate(ctx, service.core.store, frozen.Run, frozen.Revision, workflowadapter.FinalReview, workflowadapter.ReviewFinalQuality); err != nil {
 		return nil, err
 	}
+	if err := requireApprovedCodeEdgeReviewGate(ctx, service.core.store, frozen.Run, frozen.Revision, workflowadapter.EvaluatorEvidenceHandoff, workflowadapter.ReviewEvaluatorEvidence); err != nil {
+		return nil, err
+	}
 	if err := requireApprovedCodeEdgeReviewGate(ctx, service.core.store, frozen.Run, frozen.Revision, workflowadapter.ResultReview, workflowadapter.ReviewModelResult); err != nil {
-		return nil, err
-	}
-	if err := verifyCompletedCodeEdgeTrialSet(ctx, service.core.store, qwenStage, verifiedQwen); err != nil {
-		return nil, err
-	}
-	if err := verifyCompletedCodeEdgeTrialSet(ctx, service.core.store, opusStage, verifiedOpus); err != nil {
 		return nil, err
 	}
 
 	result, err := (codeedge.FinalComplianceService{}).Evaluate(codeedge.FinalComplianceInput{
-		Policy: frozen.Policy, Binding: frozen.Binding, Qwen: verifiedQwen, Opus: verifiedOpus, Submission: submission,
+		Policy: frozen.Policy, Binding: frozen.Binding, Handoff: handoff, Submission: submission,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("re-evaluate stored CodeEdge final compliance: %w", err)
@@ -137,46 +131,17 @@ func (service *ReleaseService) resolveCodeEdgePackageAuthorization(ctx context.C
 	}, nil
 }
 
-func uniqueCodeEdgeStageAttempt(ctx context.Context, dataStore *store.Store, run store.WorkflowRun, stageKey string) (store.StageAttempt, error) {
-	attempts, err := dataStore.ListStageAttemptsForRun(ctx, run.ID)
-	if err != nil {
-		return store.StageAttempt{}, err
-	}
-	matching := make([]store.StageAttempt, 0, 1)
-	for _, attempt := range attempts {
-		if attempt.StageKey == stageKey {
-			matching = append(matching, attempt)
-		}
-	}
-	if len(matching) != 1 || matching[0].ExecutionStatus != store.StageExecutionCompleted {
-		return store.StageAttempt{}, fmt.Errorf("CodeEdge Run %s must have exactly one completed %s stage", run.ID, stageKey)
-	}
-	return matching[0], nil
-}
-
-func verifyCompletedCodeEdgeTrialSet(ctx context.Context, dataStore *store.Store, stage store.StageAttempt, receipt codeedge.EvaluationReceipt) error {
-	if receipt.Status != codeedge.EvaluationCompleted || len(receipt.Trials) != 4 {
-		return fmt.Errorf("CodeEdge package authorization requires four completed trusted trials")
-	}
-	trials, err := dataStore.ListTrialExecutionsForStageAttempt(ctx, stage.ID)
+func requireSameCodeEdgeEvaluationReceipt(role string, stored, rebuilt codeedge.EvaluationReceipt) error {
+	storedCanonical, err := stored.CanonicalJSON()
 	if err != nil {
 		return err
 	}
-	if len(trials) != len(receipt.Trials) {
-		return fmt.Errorf("CodeEdge stage %s trial set does not match its trusted receipt", stage.ID)
+	rebuiltCanonical, err := rebuilt.CanonicalJSON()
+	if err != nil {
+		return err
 	}
-	sort.Slice(trials, func(left, right int) bool { return trials[left].Ordinal < trials[right].Ordinal })
-	for index, trial := range trials {
-		if trial.Ordinal != index+1 || trial.StageKey != stage.StageKey || trial.Status != store.TrialExecutionCompleted {
-			return fmt.Errorf("CodeEdge logical trial %s is not a completed trusted sample", trial.ID)
-		}
-		attempts, attemptErr := dataStore.ListTrialAttemptsForTrialExecution(ctx, trial.ID)
-		if attemptErr != nil {
-			return attemptErr
-		}
-		if len(attempts) == 0 || attempts[len(attempts)-1].Status != store.TrialAttemptCompleted {
-			return fmt.Errorf("CodeEdge logical trial %s has no completed final technical attempt", trial.ID)
-		}
+	if !bytes.Equal(storedCanonical, rebuiltCanonical) {
+		return fmt.Errorf("stored CodeEdge %s receipt differs from verified evaluator evidence handoff", role)
 	}
 	return nil
 }
