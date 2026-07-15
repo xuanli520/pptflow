@@ -2,6 +2,9 @@
 .go-cache
 .gomodcache
 /dist/
+deployments/standard-authoring/operation-catalog.lock.json
+deployments/codeedge-phase1/operation-catalog.lock.json
+deployments/codeedge-evaluator-child/operation-catalog.lock.json
 testdata
 !internal/tui/testdata/
 !internal/tui/testdata/*.golden

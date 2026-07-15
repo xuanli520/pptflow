@@ -1,8 +1,9 @@
 # CodeEdge 一阶段生产执行白名单与不可变运行说明书设计
 
-状态：核心安全模型和流程策略已确认；真实 deployment contract（可执行文件、
-镜像、模型、secret reference、prompt/schema、metadata TOML 路径及外部 ABI）
-仍须由受控 catalog/lock 明确提供，不能由实现猜测。
+状态：核心安全模型、流程策略和三 bundle 的源码契约已确认。每次本地生产
+打包前，受控 lock 生成器从干净提交和本机实际 Harbor/Codex/Docker 安装探测
+可执行文件路径、版本和 SHA-256；这些运行时事实只写入同包的 lock，绝不由
+worker、CLI/TUI 请求或实现默认值猜测。
 
 约束来源：`【CodeEdge】 一阶段专家培训文档.md`（2026-07-07 v1.1）和
 `WORKFLOW_STABILITY_DECISIONS.md`。
@@ -46,18 +47,36 @@ manifest、日志、截图或 artifact。
 
 ### 3.1 Deployment Operation Catalog：部署能做什么
 
-建议受管路径：
+受管包路径：
 
 ```text
-deployments/codeedge-phase1/
-  operation-catalog.v1.json
-  operation-catalog.lock.json
-  prompts/<prompt-id>@<version>.md
-  schemas/<artifact-or-result-schema>@<version>.json
+deployments/
+  standard-authoring/
+    operation-catalog.v1.json
+    contract-assets.v1.json
+    execution-profile.v1.json
+    operation-catalog.lock.json            # 本机生成，随包分发
+  codeedge-phase1/
+    operation-catalog.v1.json
+    execution-profile.v1.json
+    preflight-profile.v1.json
+    final-compliance-policy.v1.json
+    operation-catalog.lock.json            # 本机生成，随包分发
+  codeedge-evaluator-child/
+    operation-catalog.v1.json
+    contract-assets.v1.json
+    contracts/harbor-pass-at-four.v0.18.json
+    schemas/harbor-run-bundle.v0.18.json
+    execution-profile.v1.json
+    operation-catalog.lock.json            # 本机生成，随包分发
 ```
 
-该目录随源码与发布版本管理，常规 CLI/TUI 不提供在线编辑能力。启动时以
-canonical JSON 计算 catalog fingerprint；`operation-catalog.lock.json` 绑定：
+三份 catalog/lock 仅按冻结的 `TemplateReference` 路由，不能按 stage key、
+provider、路径或默认配置交叉授权。源码只跟踪可审阅的 catalog/profile/policy/
+contract assets；三份 lock 被排除出源码 manifest 以避免自引用，但包构建器会
+在链接前同时验证它们与同一提交的 manifest。常规 CLI/TUI 不提供在线编辑
+能力。启动时以 canonical JSON 计算 catalog fingerprint；每份
+`operation-catalog.lock.json` 绑定：
 
 - catalog 格式与版本；
 - canonical catalog SHA-256；
@@ -237,7 +256,7 @@ reconcile 只读取受管本地 job 目录中的 `result.json`、Trial 结果、
 和 `lock.json`；它不上传、下载或查询远端结果。禁止盲目重跑而重复计算 Trial 或
 制造第二个本地 package。
 
-## 9. 已确认策略与仍需提供的真实部署值
+## 9. 已确认策略与本机探测
 
 已确认：独立、串行的 CodeEdge evaluator child descriptor；冻结
 `harbor run --n-attempts 4 --n-concurrent 1 --max-retries 3`；评测受管 task
@@ -245,22 +264,16 @@ snapshot；Qwen/Opus 后、最终合规 review 后才创建 package；每次外�
 重验 catalog/lock/attestation；显式 `MetadataFieldMapping`；可信 `result.json`
 加每模型一张截图；Opus 仅作参考；本地不实施三小时外部频控。
 
-在以下值得到确认前，catalog 可以完成结构与预检实现，但不得对相应 stage
-放行：
+源码已冻结 Harbor `0.18.0` 结果 ABI、Qwen/Opus agent/model 身份、
+`--n-attempts 4 --n-concurrent 1 --max-retries 3`、secret reference 名称、
+Standard 的 Codex `gpt-5.5` 契约、父流程 metadata 映射、最终合规策略和所有
+prompt/schema fingerprint 输入。lock 生成器在本机严格探测 Git、Codex、Harbor
+launcher、Python source tree 和 Docker；只从允许的环境变量名称读取 endpoint
+与 secret，并仅保存 endpoint fingerprint 和 secret reference。
 
-1. Harbor CLI 的受支持路径、版本、结果格式与可信 binary fingerprint；
-2. Docker/compose runner 的版本、可用平台、网络策略与允许的 build policy；
-3. Qwen 的 agent、model ID、endpoint secret reference 名称、结果
-   parser 版本和截图生成机制；
-4. Opus 的 agent、model ID、endpoint secret reference 名称、结果
-   parser 版本和截图生成机制；
-5. 每种 `agent.turn` 的固定 prompt ID/version、允许模型和输入/输出 schema；
-6. 本地 package 形成 ZIP 的工具版本与允许的归档格式；
-7. 所有可执行 operation 的精确 command ID、resolved path 和版本/hash；
-8. 允许的公开仓库/网络访问范围（若需要额外限制）。
-
-未确认时的安全行为是明确的 `provider unavailable`/`policy rejected`，不是
-使用测试占位值、PATH 中任意同名工具、最新容器 tag、默认模型或隐式网络访问。
+任何缺失、版本漂移、路径含 symlink、endpoint 与 catalog fingerprint 不符、
+未提交源码、已有 lock 或不完整资产都会明确 fail-closed。系统不会使用测试
+占位值、PATH 中任意同名工具、最新容器 tag、默认模型或隐式网络访问。
 
 ## 10. 实施与验收清单
 

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build a locally packageable Harbor Factory binary whose runtime identity is
-# exactly the identity in deployments/codeedge-phase1/operation-catalog.lock.json.
-# This script never reads or writes model endpoints, credentials, or env files.
+# Build the local, immutable Harbor Flow production package. The package binds
+# three independent closed templates: Standard authoring, the CodeEdge Phase-1
+# parent, and the CodeEdge evaluator child. It intentionally reads neither
+# provider endpoints nor credentials.
 #
-# The output is published only after every payload and checksum has been built
-# in a private sibling directory.  An existing output path (including a
-# symlink) is always rejected instead of being replaced.
+# Every catalog/lock pair is copied into a private staging directory before it
+# is verified and linked. The binary and its colocated deployment payloads
+# therefore come from the same immutable input snapshot, even if a caller
+# changes a source file while packaging is in progress.
 
 umask 022
 export LC_ALL=C
@@ -24,8 +26,56 @@ require_clean_source() {
   fi
 }
 
+require_regular_file() {
+  local label="$1"
+  local path="$2"
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    die "$label must be a regular non-symlink file: $path"
+  fi
+}
+
+copy_deployment_tree() {
+  local label="$1"
+  local source="$2"
+  local destination="$3"
+  local exclude_candidates="$4"
+  local entry relative target
+
+  if [[ ! -d "$source" || -L "$source" ]]; then
+    die "$label deployment directory must be a non-symlink directory: $source"
+  fi
+  mkdir -p -- "$destination"
+  while IFS= read -r -d '' entry; do
+    relative="${entry#"$source"/}"
+    if [[ "$exclude_candidates" == "1" && ( "$relative" == "candidates" || "$relative" == candidates/* ) ]]; then
+      continue
+    fi
+    target="$destination/$relative"
+    if [[ -L "$entry" ]]; then
+      die "$label deployment contains a symlink: $relative"
+    fi
+    if [[ -d "$entry" ]]; then
+      mkdir -p -- "$target"
+    elif [[ -f "$entry" ]]; then
+      mkdir -p -- "$(dirname -- "$target")"
+      install -m 0644 "$entry" "$target"
+    else
+      die "$label deployment contains a non-regular file: $relative"
+    fi
+  done < <(find -P "$source" -mindepth 1 -print0)
+}
+
+reject_nonproduction_material() {
+  local root="$1"
+  local unexpected
+  unexpected="$(find -P "$root" \( -path '*/candidates' -o -path '*/candidates/*' -o -iname '*discovery*' \) -print -quit)"
+  if [[ -n "$unexpected" ]]; then
+    die "candidate or discovery material is not a production payload: ${unexpected#"$root"/}"
+  fi
+}
+
 root="$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-requested_output="${1:-"$root/dist/codeedge-production"}"
+requested_output="${1:-"$root/dist/harbor-flow-production"}"
 if [[ "$requested_output" != /* ]]; then
   requested_output="$PWD/$requested_output"
 fi
@@ -43,8 +93,8 @@ fi
 output_parent="$(dirname -- "$requested_output")"
 
 # Test the requested spelling before resolving its parent so that a dangling
-# symlink is rejected too.  Resolve the parent once for all later operations;
-# staging there guarantees that the final rename cannot cross filesystems.
+# symlink is rejected too. Resolve the parent once, which keeps final rename
+# within one filesystem.
 if [[ -e "$requested_output" || -L "$requested_output" ]]; then
   die "refusing to replace existing or symlink output target: $requested_output"
 fi
@@ -58,9 +108,8 @@ if [[ -e "$output" || -L "$output" ]]; then
   die "refusing to replace existing or symlink output target: $output"
 fi
 
-# A generated package inside the source tree must itself be ignored.  This
-# keeps the clean-source proof meaningful while preserving the documented
-# default of ./dist/codeedge-production.
+# A package written beneath the source tree must be ignored. This preserves
+# the clean-source proof while retaining the documented default output path.
 case "$output" in
   "$root"/*)
     if ! git -C "$root" check-ignore -q -- "$output"; then
@@ -69,9 +118,22 @@ case "$output" in
     ;;
 esac
 
-catalog="$root/deployments/codeedge-phase1/operation-catalog.v1.json"
-lock="$root/deployments/codeedge-phase1/operation-catalog.lock.json"
-excluded_lock="deployments/codeedge-phase1/operation-catalog.lock.json"
+standard_catalog="$root/deployments/standard-authoring/operation-catalog.v1.json"
+standard_lock="$root/deployments/standard-authoring/operation-catalog.lock.json"
+parent_catalog="$root/deployments/codeedge-phase1/operation-catalog.v1.json"
+parent_lock="$root/deployments/codeedge-phase1/operation-catalog.lock.json"
+evaluator_catalog="$root/deployments/codeedge-evaluator-child/operation-catalog.v1.json"
+evaluator_lock="$root/deployments/codeedge-evaluator-child/operation-catalog.lock.json"
+
+for entry in \
+  "Standard authoring catalog:$standard_catalog" \
+  "Standard authoring lock:$standard_lock" \
+  "CodeEdge Phase-1 catalog:$parent_catalog" \
+  "CodeEdge Phase-1 lock:$parent_lock" \
+  "CodeEdge evaluator child catalog:$evaluator_catalog" \
+  "CodeEdge evaluator child lock:$evaluator_lock"; do
+  require_regular_file "${entry%%:*}" "${entry#*:}"
+done
 
 source_commit="$(git -C "$root" rev-parse HEAD)"
 source_epoch="$(git -C "$root" show -s --format=%ct "$source_commit")"
@@ -80,30 +142,47 @@ if [[ ! "$source_epoch" =~ ^[0-9]+$ ]]; then
 fi
 export SOURCE_DATE_EPOCH="$source_epoch"
 
-# The source manifest is a SHA-256 over the canonical Git tree listing with the
-# self-referential lock omitted. The lock itself carries this value, so a later
-# reviewed release can update the lock without creating a hash cycle.
-source_manifest="sha256:$(git -C "$root" ls-tree -r --full-tree "$source_commit" | LC_ALL=C awk -F '\t' -v excluded="$excluded_lock" '$2 != excluded { print $0 }' | sha256sum | awk '{print $1}')"
-# The lock's commit is reviewed provenance, not an equality constraint on the
-# final packaging commit. The content manifest above is the binding source
-# proof; excluding the lock prevents a self-referential commit/hash cycle.
-ldflags="$(cd "$root" && env GOFLAGS= go run -mod=readonly ./tools/codeedge-production-build --catalog "$catalog" --lock "$lock" --source-manifest "$source_manifest")"
+# Every generated lock is omitted from the tree manifest. A lock carries this
+# digest itself, so including any one of the three would create a hash cycle.
+source_manifest="sha256:$(git -C "$root" ls-tree -r --full-tree "$source_commit" | LC_ALL=C awk -F '\t' '$2 != "deployments/standard-authoring/operation-catalog.lock.json" && $2 != "deployments/codeedge-phase1/operation-catalog.lock.json" && $2 != "deployments/codeedge-evaluator-child/operation-catalog.lock.json" { print $0 }' | sha256sum | awk '{print $1}')"
 
-workdir="$(mktemp -d "$output_parent/.codeedge-production.XXXXXX")"
+workdir="$(mktemp -d "$output_parent/.harbor-flow-production.XXXXXX")"
+inputs="$workdir/inputs"
 package="$workdir/package"
 cleanup() {
   rm -rf -- "$workdir"
 }
 trap cleanup EXIT
 
-mkdir -p "$package/deployments/codeedge-phase1"
-(cd "$root" && env GOFLAGS= go build -mod=readonly -trimpath -buildvcs=false -ldflags "$ldflags -buildid=" -o "$package/harbor-factory" .)
-chmod 0755 "$package" "$package/deployments" "$package/deployments/codeedge-phase1" "$package/harbor-factory"
-install -m 0644 "$catalog" "$package/deployments/codeedge-phase1/operation-catalog.v1.json"
-install -m 0644 "$lock" "$package/deployments/codeedge-phase1/operation-catalog.lock.json"
-install -m 0644 "$root/deployments/codeedge-phase1/README.md" "$package/deployments/codeedge-phase1/README.md"
+# The evaluator's candidates/ subtree is retained in source only as a
+# non-authoritative discovery record. It is deliberately excluded here rather
+# than treated as an input or copied into the release package.
+copy_deployment_tree "Standard authoring" "$root/deployments/standard-authoring" "$inputs/deployments/standard-authoring" 0
+copy_deployment_tree "CodeEdge Phase-1" "$root/deployments/codeedge-phase1" "$inputs/deployments/codeedge-phase1" 0
+copy_deployment_tree "CodeEdge evaluator child" "$root/deployments/codeedge-evaluator-child" "$inputs/deployments/codeedge-evaluator-child" 1
+reject_nonproduction_material "$inputs/deployments"
 
-archive_name="harbor-factory-codeedge-production.tar.gz"
+ldflags="$(cd "$root" && env GOFLAGS= go run -mod=readonly ./tools/harbor-flow-production-build \
+  --standard-authoring-catalog "$inputs/deployments/standard-authoring/operation-catalog.v1.json" \
+  --standard-authoring-lock "$inputs/deployments/standard-authoring/operation-catalog.lock.json" \
+  --codeedge-phase1-catalog "$inputs/deployments/codeedge-phase1/operation-catalog.v1.json" \
+  --codeedge-phase1-lock "$inputs/deployments/codeedge-phase1/operation-catalog.lock.json" \
+  --codeedge-evaluator-catalog "$inputs/deployments/codeedge-evaluator-child/operation-catalog.v1.json" \
+  --codeedge-evaluator-lock "$inputs/deployments/codeedge-evaluator-child/operation-catalog.lock.json" \
+  --source-manifest "$source_manifest")"
+
+mkdir -p "$package/deployments"
+copy_deployment_tree "staged Standard authoring" "$inputs/deployments/standard-authoring" "$package/deployments/standard-authoring" 0
+copy_deployment_tree "staged CodeEdge Phase-1" "$inputs/deployments/codeedge-phase1" "$package/deployments/codeedge-phase1" 0
+copy_deployment_tree "staged CodeEdge evaluator child" "$inputs/deployments/codeedge-evaluator-child" "$package/deployments/codeedge-evaluator-child" 0
+reject_nonproduction_material "$package/deployments"
+
+(cd "$root" && env GOFLAGS= go build -mod=readonly -trimpath -buildvcs=false -ldflags "$ldflags -buildid=" -o "$package/harbor-factory" .)
+find -P "$package/deployments" -type d -exec chmod 0755 {} +
+find -P "$package/deployments" -type f -exec chmod 0644 {} +
+chmod 0755 "$package" "$package/deployments" "$package/harbor-factory"
+
+archive_name="harbor-factory-harbor-flow-production.tar.gz"
 (
   cd "$package"
   tar \
@@ -118,26 +197,19 @@ archive_name="harbor-factory-codeedge-production.tar.gz"
     harbor-factory \
     deployments | gzip -n -9 > "$archive_name"
 
-  # SHA256SUMS deliberately excludes itself.  It covers every distributable
-  # payload and the compressed archive, so the archive can be validated before
-  # extraction and the colocated files can be validated afterwards.
-  sha256sum \
-    deployments/codeedge-phase1/README.md \
-    deployments/codeedge-phase1/operation-catalog.lock.json \
-    deployments/codeedge-phase1/operation-catalog.v1.json \
-    harbor-factory \
-    "$archive_name" > SHA256SUMS
+  mapfile -d '' package_payloads < <(find -P deployments -type f -print0 | LC_ALL=C sort -z)
+  package_payloads+=(harbor-factory "$archive_name")
+  sha256sum "${package_payloads[@]}" > SHA256SUMS
 )
 
-# No source change, including an ignored output staging directory, may mask a
-# change to the reviewed source while Go is compiling.
+# No source change may appear while Go is compiling. The staged inputs above
+# separately prevent a lock/catalog change from drifting between verification
+# and publication.
 require_clean_source
 if [[ -e "$output" || -L "$output" ]]; then
   die "refusing to replace output target created during packaging: $output"
 fi
 
-# GNU mv's no-clobber mode preserves an output that appears after the check
-# above.  The remaining source directory proves that no publication occurred.
 if ! mv -T -n -- "$package" "$output" || [[ -e "$package" || -L "$package" ]]; then
   die "output target appeared during atomic publication: $output"
 fi

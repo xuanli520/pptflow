@@ -241,7 +241,10 @@ func TestCodeEdgeProductionRuntimeAttestationAgainstLocalApprovedEnvironment(t *
 	if os.Getenv("HARBOR_FACTORY_RUN_LOCAL_PRODUCTION_ATTESTATION") != "1" {
 		t.Skip("set HARBOR_FACTORY_RUN_LOCAL_PRODUCTION_ATTESTATION=1 to attest the locally pinned Harbor installation")
 	}
-	catalogPath, lockPath := testCodeEdgeProductionDeploymentPaths(t)
+	if _, err := os.Lstat(sourceCodeEdgeEvaluatorProductionLockPath(t)); err != nil {
+		t.Skip("generate the ignored local evaluator deployment lock before attesting the real production environment")
+	}
+	catalogPath, lockPath := sourceCodeEdgeEvaluatorProductionCatalogPath(t), sourceCodeEdgeEvaluatorProductionLockPath(t)
 	catalog, err := stageprovider.LoadDeploymentOperationCatalogFile(catalogPath)
 	if err != nil {
 		t.Fatal(err)
@@ -360,7 +363,7 @@ func TestCodeEdgeProductionDeploymentPathsAreOnlyBesideExecutable(t *testing.T) 
 	if err := os.WriteFile(executable, []byte("binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	deployment := filepath.Join(packageRoot, codeEdgeProductionDeploymentDirectory)
+	deployment := filepath.Join(packageRoot, "deployments", codeEdgeProductionDeploymentDirectory)
 	if err := os.MkdirAll(deployment, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +388,7 @@ func TestCodeEdgeProductionDeploymentPathsAreOnlyBesideExecutable(t *testing.T) 
 	if err := os.WriteFile(legacyExecutable, []byte("binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	legacyDeployment := filepath.Join(legacyRoot, codeEdgeProductionDeploymentDirectory)
+	legacyDeployment := filepath.Join(legacyRoot, "deployments", codeEdgeProductionDeploymentDirectory)
 	if err := os.MkdirAll(legacyDeployment, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -492,20 +495,109 @@ func setCodeEdgeProductionBuildBindingForTest(t *testing.T, binding codeEdgeProd
 
 func testCodeEdgeProductionDeploymentPaths(t *testing.T) (string, string) {
 	t.Helper()
+	sourceCatalog := sourceCodeEdgeEvaluatorProductionCatalogPath(t)
+	raw, err := readCodeEdgeProductionFile(sourceCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := stageprovider.ParseDeploymentOperationCatalogJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := stageprovider.NewDeploymentOperationCatalogResolver(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := testCodeEdgeEvaluatorDeploymentLock(t, catalog)
+	lockRaw, err := lock.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(t.TempDir(), codeEdgeProductionDeploymentDirectory)
+	catalogPath := filepath.Join(directory, codeEdgeProductionCatalogFile)
+	lockPath := filepath.Join(directory, codeEdgeProductionLockFile)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalogPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, lockRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return catalogPath, lockPath
+}
+
+func sourceCodeEdgeEvaluatorProductionCatalogPath(t *testing.T) string {
+	t.Helper()
 	_, source, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate production composition test source")
 	}
-	root := filepath.Dir(filepath.Dir(source))
-	catalog := filepath.Join(root, codeEdgeProductionDeploymentDirectory, codeEdgeProductionCatalogFile)
-	lock := filepath.Join(root, codeEdgeProductionDeploymentDirectory, codeEdgeProductionLockFile)
-	if _, err := requireCodeEdgeProductionFile("catalog", catalog); err != nil {
+	return filepath.Join(filepath.Dir(filepath.Dir(source)), "deployments", codeEdgeProductionDeploymentDirectory, codeEdgeProductionCatalogFile)
+}
+
+func sourceCodeEdgeEvaluatorProductionLockPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(filepath.Dir(sourceCodeEdgeEvaluatorProductionCatalogPath(t)), codeEdgeProductionLockFile)
+}
+
+// testCodeEdgeEvaluatorDeploymentLock keeps ordinary unit tests independent
+// of a machine-generated deployment lock. Production packages instead load
+// the ignored real lock generated from the local Harbor installation.
+func testCodeEdgeEvaluatorDeploymentLock(t *testing.T, catalog *stageprovider.DeploymentOperationCatalogResolver) stageprovider.DeploymentOperationCatalogLock {
+	t.Helper()
+	build := stageprovider.HarborFlowBuildIdentity{
+		Module: "github.com/purplevoid/harbor-factory", Version: "v2-test", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("codeedge-evaluator-test-source")),
+	}
+	profile := workflowadapter.ExecutionProfile{
+		Template: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(), ID: "codeedge-evaluator-test-profile", Version: "1.0.0",
+		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ControlGracePeriod: time.Minute,
+		CandidateProviderBudget: workflowadapter.CandidateProviderBudget{AttemptTimeout: 30 * time.Minute, StartupGrace: 5 * time.Minute, ShutdownGrace: 5 * time.Minute},
+		Stages:                  make([]workflowadapter.StageBudget, 0, len(workflowadapter.CodeEdgeEvaluatorChildStageOrder())),
+	}
+	for _, stageKey := range workflowadapter.CodeEdgeEvaluatorChildStageOrder() {
+		profile.Stages = append(profile.Stages, workflowadapter.StageBudget{StageKey: stageKey, Budget: workflowkit.ExecutionBudget{
+			TurnTimeout: 110 * time.Minute, MaxTurns: 1, AttemptTimeout: 120 * time.Minute, MaxAttempts: 1, MaxElapsed: 120 * time.Minute,
+			StartupGrace: 5 * time.Minute, ShutdownGrace: 5 * time.Minute, Backoff: workflowkit.BackoffPolicy{RetryDelays: []time.Duration{}},
+		}})
+	}
+	if err := profile.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := requireCodeEdgeProductionFile("lock", lock); err != nil {
+	operations := make([]stageprovider.DeploymentOperationCatalogLockRecord, 0, len(catalog.Catalog().Operations))
+	for _, registration := range catalog.Catalog().Operations {
+		payload, ok := registration.Operation.Payload.(workflowadapter.LocalCommandOperationPayload)
+		if !ok || registration.HarborEvaluator == nil {
+			t.Fatalf("evaluator fixture registration %q is not a Harbor local command", registration.Stage.Key)
+		}
+		launcher := stageprovider.LocalExecutableLock{CommandID: payload.CommandID, AbsolutePath: "/usr/bin/true", Version: "0.18.0-test", ContentSHA256: workflowkit.SHA256Fingerprint([]byte(payload.CommandID + " launcher"))}
+		python := stageprovider.LocalExecutableLock{CommandID: stageprovider.HarborEvaluatorPythonCommandID, AbsolutePath: "/usr/bin/true", Version: "3.13.0", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("python"))}
+		docker := stageprovider.LocalExecutableLock{CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: "/usr/bin/true", Version: stageprovider.HarborEvaluatorDockerVersion, ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker"))}
+		contract := registration.HarborEvaluator.Clone()
+		operations = append(operations, stageprovider.DeploymentOperationCatalogLockRecord{
+			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
+			Checkout: registration.Checkout, Secrets: append([]workflowadapter.SecretReference(nil), registration.Secrets...),
+			PromptContentFingerprint: workflowkit.SHA256Fingerprint([]byte("fixture evaluator prompt " + string(registration.Stage.Key))),
+			SchemaContentFingerprint: workflowkit.SHA256Fingerprint([]byte("fixture evaluator schema " + string(registration.Stage.Key))),
+			ExecutionKind:            workflowadapter.StageOperationPayloadLocalCommand, LocalExecutable: &launcher,
+			HarborEvaluator: &stageprovider.HarborEvaluatorOperationLock{
+				Contract: contract, Launcher: launcher, PythonInterpreter: python,
+				PythonSourceTree: stageprovider.HarborPythonSourceTreeLock{AbsolutePath: "/tmp/harbor-evaluator-test-source", PythonFilesSHA256: workflowkit.SHA256Fingerprint([]byte("harbor source"))},
+				DockerCLI:        docker, HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion,
+			},
+		})
+	}
+	lock := stageprovider.DeploymentOperationCatalogLock{
+		Format: stageprovider.DeploymentOperationCatalogLockFormat, Version: stageprovider.DeploymentOperationCatalogLockVersion,
+		LockID: "codeedge-evaluator-test-lock", LockVersion: "1.0.0", CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build,
+		CodeEdgeEvaluatorChildExecutionProfile: &stageprovider.CodeEdgeEvaluatorChildExecutionProfileLock{Profile: profile}, Operations: operations,
+	}
+	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
 		t.Fatal(err)
 	}
-	return catalog, lock
+	return lock
 }
 
 func testCodeEdgeProductionBuildBinding(t *testing.T) codeEdgeProductionBuildBinding {

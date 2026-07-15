@@ -112,6 +112,83 @@ type CodeEdgePhase1ExecutionProfileLock struct {
 	Profile workflowadapter.ExecutionProfile `json:"-"`
 }
 
+// CodeEdgePhase1PreflightProfileLock freezes the task-contract mapping used
+// by the parent built-ins.  It is intentionally distinct from the execution
+// profile: metadata paths and protected environment names govern content
+// validation, not timing.  Keeping both in the immutable lock prevents a
+// package from changing its accepted task shape without changing its lock
+// identity and linker binding.
+type CodeEdgePhase1PreflightProfileLock struct {
+	Profile codeedge.Profile `json:"-"`
+}
+
+// Clone returns independently-owned slices so a caller cannot modify the
+// installed parent preflight policy through an accessor or a lock copy.
+func (profile CodeEdgePhase1PreflightProfileLock) Clone() CodeEdgePhase1PreflightProfileLock {
+	profile.Profile.Metadata.CodeLang = append(codeedge.TOMLPath(nil), profile.Profile.Metadata.CodeLang...)
+	profile.Profile.Metadata.TaskType = append(codeedge.TOMLPath(nil), profile.Profile.Metadata.TaskType...)
+	profile.Profile.Metadata.Application = append(codeedge.TOMLPath(nil), profile.Profile.Metadata.Application...)
+	profile.Profile.Metadata.IsZeroToOne = append(codeedge.TOMLPath(nil), profile.Profile.Metadata.IsZeroToOne...)
+	profile.Profile.Metadata.GitHubURL = append(codeedge.TOMLPath(nil), profile.Profile.Metadata.GitHubURL...)
+	profile.Profile.Metadata.CommitID = append(codeedge.TOMLPath(nil), profile.Profile.Metadata.CommitID...)
+	profile.Profile.ProtectedEnvironmentVariables = append([]string(nil), profile.Profile.ProtectedEnvironmentVariables...)
+	return profile
+}
+
+// Validate proves the parent preflight has every required metadata mapping
+// and an explicit non-secret protected-environment allow-list.
+func (profile CodeEdgePhase1PreflightProfileLock) Validate() error {
+	if err := codeedge.ValidateProfile(profile.Profile); err != nil {
+		return fmt.Errorf("%w: CodeEdge Phase-1 preflight profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	return nil
+}
+
+// PreflightProfile returns a validated defensive copy for the closed parent
+// executor.  There is no root-config or caller-provided profile fallback.
+func (profile CodeEdgePhase1PreflightProfileLock) PreflightProfile() (codeedge.Profile, error) {
+	if err := profile.Validate(); err != nil {
+		return codeedge.Profile{}, err
+	}
+	return profile.Clone().Profile, nil
+}
+
+// MarshalJSON canonicalizes the one set-like field before encoding it. TOML
+// path order remains meaningful, while protected variable order is not.
+func (profile CodeEdgePhase1PreflightProfileLock) MarshalJSON() ([]byte, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	canonical := profile.Clone()
+	sort.Strings(canonical.Profile.ProtectedEnvironmentVariables)
+	encoded, err := json.Marshal(canonical.Profile)
+	if err != nil {
+		return nil, fmt.Errorf("%w: encode CodeEdge Phase-1 preflight profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	return encoded, nil
+}
+
+// UnmarshalJSON accepts only a strict typed profile. The lock parser also
+// performs recursive duplicate-key rejection before this method is called.
+func (profile *CodeEdgePhase1PreflightProfileLock) UnmarshalJSON(raw []byte) error {
+	if profile == nil {
+		return fmt.Errorf("%w: nil CodeEdge Phase-1 preflight profile", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if err := rejectDuplicateDeploymentCatalogJSONKeys(raw); err != nil {
+		return fmt.Errorf("%w: decode CodeEdge Phase-1 preflight profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	var parsed codeedge.Profile
+	if err := decodeDeploymentCatalogJSON(raw, &parsed); err != nil {
+		return fmt.Errorf("%w: decode CodeEdge Phase-1 preflight profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	resolved := CodeEdgePhase1PreflightProfileLock{Profile: parsed}
+	if err := resolved.Validate(); err != nil {
+		return err
+	}
+	*profile = resolved
+	return nil
+}
+
 // StandardAuthoringExecutionProfileLock is the complete, deployment-owned
 // execution envelope for the Standard authoring template. It is deliberately
 // a template-specific lock field: authoring starts cannot accept a caller
@@ -694,6 +771,7 @@ type DeploymentOperationCatalogLock struct {
 	StandardAuthoringExecutionProfile      *StandardAuthoringExecutionProfileLock      `json:"standard_authoring_execution_profile,omitempty"`
 	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
 	CodeEdgePhase1ExecutionProfile         *CodeEdgePhase1ExecutionProfileLock         `json:"codeedge_phase1_execution_profile,omitempty"`
+	CodeEdgePhase1PreflightProfile         *CodeEdgePhase1PreflightProfileLock         `json:"codeedge_phase1_preflight_profile,omitempty"`
 	CodeEdgePhase1FinalCompliancePolicy    *CodeEdgePhase1FinalCompliancePolicyLock    `json:"codeedge_phase1_final_compliance_policy,omitempty"`
 	Operations                             []DeploymentOperationCatalogLockRecord      `json:"operations"`
 }
@@ -711,6 +789,10 @@ func (lock DeploymentOperationCatalogLock) Clone() DeploymentOperationCatalogLoc
 	if lock.CodeEdgePhase1ExecutionProfile != nil {
 		profile := lock.CodeEdgePhase1ExecutionProfile.Clone()
 		lock.CodeEdgePhase1ExecutionProfile = &profile
+	}
+	if lock.CodeEdgePhase1PreflightProfile != nil {
+		profile := lock.CodeEdgePhase1PreflightProfile.Clone()
+		lock.CodeEdgePhase1PreflightProfile = &profile
 	}
 	if lock.CodeEdgePhase1FinalCompliancePolicy != nil {
 		policy := lock.CodeEdgePhase1FinalCompliancePolicy.Clone()
@@ -771,14 +853,20 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 		if lock.CodeEdgePhase1FinalCompliancePolicy == nil {
 			return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy is required", ErrInvalidDeploymentOperationCatalogLock)
 		}
+		if lock.CodeEdgePhase1PreflightProfile == nil {
+			return fmt.Errorf("%w: CodeEdge Phase-1 preflight profile is required", ErrInvalidDeploymentOperationCatalogLock)
+		}
 		if err := lock.CodeEdgePhase1ExecutionProfile.Validate(); err != nil {
+			return err
+		}
+		if err := lock.CodeEdgePhase1PreflightProfile.Validate(); err != nil {
 			return err
 		}
 		if err := lock.CodeEdgePhase1FinalCompliancePolicy.Validate(); err != nil {
 			return err
 		}
-	} else if lock.CodeEdgePhase1ExecutionProfile != nil || lock.CodeEdgePhase1FinalCompliancePolicy != nil {
-		return fmt.Errorf("%w: CodeEdge Phase-1 execution profile and final compliance policy are only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.CodeEdgePhase1WorkflowTemplateID, workflowadapter.CodeEdgePhase1WorkflowTemplateVersion)
+	} else if lock.CodeEdgePhase1ExecutionProfile != nil || lock.CodeEdgePhase1PreflightProfile != nil || lock.CodeEdgePhase1FinalCompliancePolicy != nil {
+		return fmt.Errorf("%w: CodeEdge Phase-1 execution profile, preflight profile, and final compliance policy are only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.CodeEdgePhase1WorkflowTemplateID, workflowadapter.CodeEdgePhase1WorkflowTemplateVersion)
 	}
 	if lock.Operations == nil {
 		return fmt.Errorf("%w: operations must be an explicit array", ErrInvalidDeploymentOperationCatalogLock)
@@ -832,6 +920,19 @@ func (lock DeploymentOperationCatalogLock) CodeEdgePhase1Profile() (workflowadap
 		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: CodeEdge Phase-1 execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	return lock.CodeEdgePhase1ExecutionProfile.ExecutionProfile()
+}
+
+// CodeEdgePhase1Preflight returns the complete lock-owned preflight mapping.
+// A parent executor is never allowed to derive these task-contract fields
+// from a Run, a task snapshot, or mutable process configuration.
+func (lock DeploymentOperationCatalogLock) CodeEdgePhase1Preflight() (codeedge.Profile, error) {
+	if !lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
+		return codeedge.Profile{}, fmt.Errorf("%w: CodeEdge Phase-1 preflight profile requires the parent template", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if lock.CodeEdgePhase1PreflightProfile == nil {
+		return codeedge.Profile{}, fmt.Errorf("%w: CodeEdge Phase-1 preflight profile is required", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return lock.CodeEdgePhase1PreflightProfile.PreflightProfile()
 }
 
 // CodeEdgePhase1FinalCompliance returns the complete typed final-compliance
@@ -904,6 +1005,7 @@ func ParseDeploymentOperationCatalogLockJSON(raw []byte) (DeploymentOperationCat
 		StandardAuthoringExecutionProfile:      document.StandardAuthoringExecutionProfile,
 		CodeEdgeEvaluatorChildExecutionProfile: document.CodeEdgeEvaluatorChildExecutionProfile,
 		CodeEdgePhase1ExecutionProfile:         document.CodeEdgePhase1ExecutionProfile,
+		CodeEdgePhase1PreflightProfile:         document.CodeEdgePhase1PreflightProfile,
 		CodeEdgePhase1FinalCompliancePolicy:    document.CodeEdgePhase1FinalCompliancePolicy,
 		Operations:                             document.Operations,
 	}
@@ -936,6 +1038,7 @@ type deploymentOperationCatalogLockDocument struct {
 	StandardAuthoringExecutionProfile      *StandardAuthoringExecutionProfileLock      `json:"standard_authoring_execution_profile,omitempty"`
 	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
 	CodeEdgePhase1ExecutionProfile         *CodeEdgePhase1ExecutionProfileLock         `json:"codeedge_phase1_execution_profile,omitempty"`
+	CodeEdgePhase1PreflightProfile         *CodeEdgePhase1PreflightProfileLock         `json:"codeedge_phase1_preflight_profile,omitempty"`
 	CodeEdgePhase1FinalCompliancePolicy    *CodeEdgePhase1FinalCompliancePolicyLock    `json:"codeedge_phase1_final_compliance_policy,omitempty"`
 	Operations                             []DeploymentOperationCatalogLockRecord      `json:"operations"`
 }

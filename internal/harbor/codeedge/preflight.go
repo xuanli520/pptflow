@@ -65,24 +65,24 @@ func (path TOMLPath) String() string {
 // not prescribe a task.toml schema, so a controlled deployment must supply this
 // mapping rather than this package guessing table/key names.
 type MetadataFieldMapping struct {
-	CodeLang    TOMLPath
-	TaskType    TOMLPath
-	Application TOMLPath
-	IsZeroToOne TOMLPath
-	GitHubURL   TOMLPath
-	CommitID    TOMLPath
+	CodeLang    TOMLPath `json:"code_lang"`
+	TaskType    TOMLPath `json:"task_type"`
+	Application TOMLPath `json:"application"`
+	IsZeroToOne TOMLPath `json:"is_zero_to_one"`
+	GitHubURL   TOMLPath `json:"github_url"`
+	CommitID    TOMLPath `json:"commit_id"`
 }
 
 // Profile holds the explicit, version-controlled policy inputs needed by this
 // otherwise schema-agnostic preflight. It contains identities and field paths,
 // never provider configuration, credentials, or secret values.
 type Profile struct {
-	Metadata MetadataFieldMapping
+	Metadata MetadataFieldMapping `json:"metadata"`
 	// ProtectedEnvironmentVariables is the explicit deployment-derived set of
 	// host and child environment names that a task-owned Dockerfile or Compose
 	// document may never interpolate or request for pass-through. It stores
 	// names only, never endpoint or credential values.
-	ProtectedEnvironmentVariables []string
+	ProtectedEnvironmentVariables []string `json:"protected_environment_variables"`
 }
 
 // Report is the deterministic, non-secret result of a successful Phase-1

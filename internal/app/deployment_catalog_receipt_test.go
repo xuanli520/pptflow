@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -943,8 +944,10 @@ func catalogLockAttestedResolverForSpec(t *testing.T, specification workflowadap
 	}
 	if specification.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
 		profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
+		preflight := catalogLockFixtureCodeEdgePhase1PreflightProfile()
 		policy := specification.CodeEdgeFinalCompliancePolicy.Clone()
 		lock.CodeEdgePhase1ExecutionProfile = &stageprovider.CodeEdgePhase1ExecutionProfileLock{Profile: profile}
+		lock.CodeEdgePhase1PreflightProfile = &stageprovider.CodeEdgePhase1PreflightProfileLock{Profile: preflight}
 		lock.CodeEdgePhase1FinalCompliancePolicy = &stageprovider.CodeEdgePhase1FinalCompliancePolicyLock{Policy: policy}
 	}
 	for _, registration := range registrations {
@@ -959,6 +962,24 @@ func catalogLockAttestedResolverForSpec(t *testing.T, specification workflowadap
 		t.Fatal(err)
 	}
 	return resolver
+}
+
+func catalogLockFixtureCodeEdgePhase1PreflightProfile() codeedge.Profile {
+	return codeedge.Profile{
+		Metadata: codeedge.MetadataFieldMapping{
+			CodeLang:    codeedge.TOMLPath{"metadata", "code_lang"},
+			TaskType:    codeedge.TOMLPath{"metadata", "task_type"},
+			Application: codeedge.TOMLPath{"metadata", "application"},
+			IsZeroToOne: codeedge.TOMLPath{"metadata", "is_0_to_1"},
+			GitHubURL:   codeedge.TOMLPath{"metadata", "github_url"},
+			CommitID:    codeedge.TOMLPath{"metadata", "commit_id"},
+		},
+		ProtectedEnvironmentVariables: []string{
+			"ANTHROPIC_AUTH_TOKEN",
+			"ANTHROPIC_BASE_URL",
+			"QWEN_HARBOR_BASE_URL",
+		},
+	}
 }
 
 func catalogLockFixtureRecord(t *testing.T, registration stageprovider.DeploymentOperationRegistration) stageprovider.DeploymentOperationCatalogLockRecord {

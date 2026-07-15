@@ -186,7 +186,7 @@ func linkedStandardAuthoringProductionBuildBinding() (standardAuthoringProductio
 		},
 	}
 	if err := binding.Validate(); err != nil {
-		return standardAuthoringProductionBuildBinding{}, fmt.Errorf("Standard authoring production build binding is unavailable; build with a generated Standard operation lock and linker binding: %w", err)
+		return standardAuthoringProductionBuildBinding{}, fmt.Errorf("Standard authoring production build binding is unavailable; build with scripts/build-codeedge-production.sh: %w", err)
 	}
 	return binding, nil
 }

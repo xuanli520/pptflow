@@ -21,7 +21,7 @@ const (
 	// This is the evaluator-child bundle, not the Phase-1 parent bundle. The
 	// parent now owns deployments/codeedge-phase1; sharing that directory would
 	// let a child-only lock be mistaken for parent authority.
-	codeEdgeProductionDeploymentDirectory = "deployments/codeedge-evaluator-child"
+	codeEdgeProductionDeploymentDirectory = "codeedge-evaluator-child"
 	codeEdgeProductionCatalogFile         = "operation-catalog.v1.json"
 	codeEdgeProductionLockFile            = "operation-catalog.lock.json"
 )
@@ -339,7 +339,7 @@ func codeEdgeProductionDeploymentPathsBesideExecutable(executable string) (strin
 	if err != nil {
 		return "", "", fmt.Errorf("locate CodeEdge production deployment directory beside executable: %w", err)
 	}
-	phaseDirectory, err := requireCodeEdgeProductionManagedDirectory("deployment phase directory", filepath.Join(deploymentDirectory, "codeedge-phase1"), directory)
+	phaseDirectory, err := requireCodeEdgeProductionManagedDirectory("deployment phase directory", filepath.Join(deploymentDirectory, codeEdgeProductionDeploymentDirectory), directory)
 	if err != nil {
 		return "", "", fmt.Errorf("locate CodeEdge production deployment phase directory beside executable: %w", err)
 	}

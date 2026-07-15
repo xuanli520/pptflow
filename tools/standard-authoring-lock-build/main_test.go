@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,29 +13,33 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-func TestSourceBuildIdentityExcludesSelfReferentialLock(t *testing.T) {
+func TestSourceBuildIdentityExcludesAllGeneratedProductionLocks(t *testing.T) {
 	git := testGitExecutable(t)
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "tracked.txt"), "stable\n")
-	writeTestFile(t, filepath.Join(root, standardLockRelative), "first lock\n")
+	for lock := range generatedProductionLocks {
+		writeTestFile(t, filepath.Join(root, lock), "first lock\n")
+	}
 	testGit(t, root, git, "init")
 	testGit(t, root, git, "config", "user.email", "lock-test@example.invalid")
 	testGit(t, root, git, "config", "user.name", "Lock Test")
 	testGit(t, root, git, "add", ".")
 	testGit(t, root, git, "commit", "-m", "first")
-	_, first, err := sourceBuildIdentity(root, git, standardLockRelative)
+	_, first, err := sourceBuildIdentity(root, git)
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, filepath.Join(root, standardLockRelative), "second lock\n")
-	testGit(t, root, git, "add", standardLockRelative)
+	for lock := range generatedProductionLocks {
+		writeTestFile(t, filepath.Join(root, lock), "second lock\n")
+	}
+	testGit(t, root, git, "add", "deployments")
 	testGit(t, root, git, "commit", "-m", "lock only")
-	_, second, err := sourceBuildIdentity(root, git, standardLockRelative)
+	_, second, err := sourceBuildIdentity(root, git)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first != second {
-		t.Fatalf("source manifest changed only because the excluded lock changed: %s != %s", first, second)
+		t.Fatalf("source manifest changed only because generated locks changed: %s != %s", first, second)
 	}
 }
 
@@ -101,6 +106,21 @@ func TestReadStandardAuthoringExecutionProfileRequiresExactCompleteProfile(t *te
 	writeTestFile(t, wrongTemplate, strings.Replace(string(raw), "harbor.standard-authoring", "harbor.standard", 1))
 	if _, err := readStandardAuthoringExecutionProfile(wrongTemplate); err == nil {
 		t.Fatal("non-Standard execution profile was accepted by the lock generator")
+	}
+}
+
+func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate Standard authoring lock generator test")
+	}
+	path := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "deployments", "standard-authoring", "execution-profile.v1.json"))
+	profile, err := readStandardAuthoringExecutionProfile(path)
+	if err != nil {
+		t.Fatalf("read production Standard authoring execution profile asset: %v", err)
+	}
+	if !profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+		t.Fatalf("production execution profile template = %s@%s", profile.Template.ID, profile.Template.Version)
 	}
 }
 

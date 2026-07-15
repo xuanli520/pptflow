@@ -41,6 +41,28 @@ managed `--jobs-dir`, never passes Harbor upload or sharing flags, and rebuilds
 evidence only from the completed local job's `result.json`, Trial results,
 `config.json`, `lock.json` and Harbor Flow provenance.
 
+## Generate The Lock
+
+Generate the evaluator lock only from a clean committed source tree. The
+generator accepts no caller arguments and uses these explicitly supplied
+environment names for its controlled inputs:
+
+```bash
+export HARBOR_FACTORY_GIT_EXECUTABLE=/absolute/path/to/git
+export HARBOR_FACTORY_HARBOR_LAUNCHER=/absolute/path/to/harbor
+export HARBOR_FACTORY_PYTHON_INTERPRETER=/absolute/path/to/python
+export HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE=/absolute/path/to/site-packages/harbor
+export HARBOR_FACTORY_DOCKER_EXECUTABLE=/absolute/path/to/docker
+export HARBOR_FACTORY_BUILD_VERSION=v2.0.0
+export HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION=2026.07.15.1
+scripts/generate-codeedge-evaluator-lock.sh
+```
+
+`QWEN_HARBOR_BASE_URL`, `OPUS_HARBOR_BASE_URL`, and
+`ANTHROPIC_AUTH_TOKEN` must already be present in the invoking environment.
+They are compared against the catalog or checked for presence only; the script,
+generator, lock, and normal output do not print or persist their values.
+
 ## Local Production Package
 
 Build only from a clean, committed source tree:
@@ -50,9 +72,11 @@ scripts/build-codeedge-production.sh
 ```
 
 The unified production build produces `dist/harbor-flow-production/harbor-factory`
-with a colocated `deployments/codeedge-evaluator-child/` directory alongside
-the independently bound Standard-authoring and CodeEdge Phase-1 parent
-deployment directories, a local tarball, and `SHA256SUMS`.
+with colocated `deployments/standard-authoring/`,
+`deployments/codeedge-phase1/`, and
+`deployments/codeedge-evaluator-child/` directories, a local tarball, and
+`SHA256SUMS`. The evaluator's source-only `candidates/` discovery record is
+never copied into the package.
 `SHA256SUMS` covers every colocated payload plus the tarball (and intentionally
 does not checksum itself); validate it with `sha256sum -c SHA256SUMS` from the
 output directory. The archive is reproducible: it uses the source commit time,
@@ -60,8 +84,8 @@ sorted entries, normalized ownership, and a timestamp-free gzip header. The
 output directory must not already exist or be a symlink; it is assembled in a
 private sibling directory and atomically published only after all checksums are
 written. It computes a SHA-256 source manifest over the canonical Git tree
-listing excluding this self-referential lock and verifies it against
-`harbor_flow_build` in the lock.
+listing excluding all three self-referential generated locks and verifies the
+same manifest against `harbor_flow_build` in every lock.
 `harbor_flow_build.commit` is the reviewed source-baseline provenance recorded
 by that lock; it does not need to equal the final commit that carries the lock,
 because doing so would create a hash cycle. The content manifest is the

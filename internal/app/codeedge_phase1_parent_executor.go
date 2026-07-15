@@ -542,12 +542,12 @@ func (executor *CodeEdgePhase1ParentExecutor) ensureTaskWorkspace(ctx context.Co
 		return "", "", fmt.Errorf("materialize frozen CodeEdge task snapshot: %w", err)
 	}
 	receipt := codeEdgePhase1WorkspaceReceipt{
-		Format:              codeEdgePhase1WorkspaceReceiptFormat,
-		Version:             codeEdgePhase1WorkspaceReceiptVersion,
-		RunID:               runID,
-		TaskSnapshotDigest:  string(request.Execution.Subject.Digest),
-		SnapshotZIPDigest:   string(binding.ContentDigest),
-		TaskSnapshotSchema:  binding.SchemaVersion,
+		Format:             codeEdgePhase1WorkspaceReceiptFormat,
+		Version:            codeEdgePhase1WorkspaceReceiptVersion,
+		RunID:              runID,
+		TaskSnapshotDigest: string(request.Execution.Subject.Digest),
+		SnapshotZIPDigest:  string(binding.ContentDigest),
+		TaskSnapshotSchema: binding.SchemaVersion,
 	}
 	if err := codeEdgePhase1WriteJSON(filepath.Join(staging, "workspace-receipt.json"), receipt); err != nil {
 		return "", "", err
@@ -678,3 +678,598 @@ func codeEdgePhase1PreflightFindings(err error) ([]string, bool) {
 	}
 	return findings, true
 }
+
+type codeEdgePhase1InspectionReport struct {
+	Environment string `json:"environment"`
+	Metadata    struct {
+		CodeLang    string `json:"code_lang"`
+		TaskType    string `json:"task_type"`
+		Application string `json:"application"`
+		IsZeroToOne bool   `json:"is_zero_to_one"`
+		GitHubURL   string `json:"github_url"`
+		CommitID    string `json:"commit_id"`
+	} `json:"metadata"`
+}
+
+type codeEdgePhase1CommandReceipt struct {
+	CommandID         string                  `json:"command_id"`
+	ExecutableVersion string                  `json:"executable_version"`
+	ExitCode          int                     `json:"exit_code"`
+	OutputFingerprint workflowkit.Fingerprint `json:"output_fingerprint"`
+}
+
+// codeEdgePhase1StageReport is deliberately a report, not a final compliance
+// receipt. The latter can only be formed after artifact persistence assigns
+// the immutable content digest and lineage binding.
+type codeEdgePhase1StageReport struct {
+	Format             string                          `json:"format"`
+	Version            string                          `json:"version"`
+	Stage              string                          `json:"stage"`
+	RunID              string                          `json:"run_id"`
+	StageAttemptID     string                          `json:"stage_attempt_id"`
+	TaskSnapshotDigest string                          `json:"task_snapshot_digest"`
+	Verdict            workflowkit.Verdict             `json:"verdict"`
+	Findings           []string                        `json:"findings"`
+	Inspection         *codeEdgePhase1InspectionReport `json:"inspection,omitempty"`
+	Command            *codeEdgePhase1CommandReceipt   `json:"command,omitempty"`
+	ReservedArtifactID string                          `json:"reserved_artifact_id,omitempty"`
+}
+
+func codeEdgePhase1Inspection(report codeedge.Report) *codeEdgePhase1InspectionReport {
+	result := &codeEdgePhase1InspectionReport{Environment: string(report.Environment)}
+	result.Metadata.CodeLang = report.Metadata.CodeLang
+	result.Metadata.TaskType = report.Metadata.TaskType
+	result.Metadata.Application = report.Metadata.Application
+	result.Metadata.IsZeroToOne = report.Metadata.IsZeroToOne
+	result.Metadata.GitHubURL = report.Metadata.GitHubURL
+	result.Metadata.CommitID = report.Metadata.CommitID
+	return result
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) reportResult(request workflowkit.StageExecutionRequest, outputName, schema string, verdict workflowkit.Verdict, findings []string, inspection *codeedge.Report, reservedArtifactID, _ string) (workflowkit.StageExecutionResult, error) {
+	report := codeEdgePhase1StageReport{
+		Format:             codeEdgePhase1ReportFormat,
+		Version:            codeEdgePhase1ReportVersion,
+		Stage:              string(request.Stage.Key),
+		RunID:              request.Execution.ID,
+		StageAttemptID:     string(request.Claim.Stage.StageAttempt.ID),
+		TaskSnapshotDigest: string(request.Execution.Subject.Digest),
+		Verdict:            verdict,
+		Findings:           append([]string{}, findings...),
+		ReservedArtifactID: reservedArtifactID,
+	}
+	if inspection != nil {
+		report.Inspection = codeEdgePhase1Inspection(*inspection)
+	}
+	return codeEdgePhase1ReportStageResult(report, outputName, schema)
+}
+
+func codeEdgePhase1ReportStageResult(report codeEdgePhase1StageReport, outputName, schema string) (workflowkit.StageExecutionResult, error) {
+	sort.Strings(report.Findings)
+	if report.Findings == nil {
+		report.Findings = []string{}
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	artifact := workflowkit.StageArtifact{Name: outputName, SchemaVersion: schema, Content: encoded}
+	if report.ReservedArtifactID != "" {
+		if err := store.ValidateUUIDv7(report.ReservedArtifactID); err != nil {
+			return workflowkit.StageExecutionResult{}, err
+		}
+		artifact.ID = workflowkit.ArtifactID(report.ReservedArtifactID)
+	}
+	return workflowkit.StageExecutionResult{
+		Outcome:   workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: report.Verdict},
+		Artifacts: []workflowkit.StageArtifact{artifact},
+	}, nil
+}
+
+func codeEdgePhase1InfraResult(request workflowkit.StageExecutionRequest, outputName, schema, errorText string, report codeEdgePhase1StageReport, failure workflowkit.FailureClass) (workflowkit.StageExecutionResult, error) {
+	sort.Strings(report.Findings)
+	if report.Findings == nil {
+		report.Findings = []string{}
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	return workflowkit.StageExecutionResult{
+		Outcome:   workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: failure},
+		Artifacts: []workflowkit.StageArtifact{{Name: outputName, SchemaVersion: schema, Content: encoded}},
+		ErrorText: errorText,
+	}, nil
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) reportFor(request workflowkit.StageExecutionRequest, verdict workflowkit.Verdict, findings []string, inspection codeedge.Report) codeEdgePhase1StageReport {
+	return codeEdgePhase1StageReport{
+		Format:             codeEdgePhase1ReportFormat,
+		Version:            codeEdgePhase1ReportVersion,
+		Stage:              string(request.Stage.Key),
+		RunID:              request.Execution.ID,
+		StageAttemptID:     string(request.Claim.Stage.StageAttempt.ID),
+		TaskSnapshotDigest: string(request.Execution.Subject.Digest),
+		Verdict:            verdict,
+		Findings:           append([]string{}, findings...),
+		Inspection:         codeEdgePhase1Inspection(inspection),
+	}
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) reserveSubmissionArtifactID(workspace string, request workflowkit.StageExecutionRequest) (workflowkit.ArtifactID, error) {
+	if request.Claim.Stage == nil {
+		return "", errors.New("CodeEdge Phase-1 submission stage attempt is required")
+	}
+	directory := filepath.Join(workspace, "reserved-artifacts")
+	if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("CodeEdge Phase-1 reserved artifact directory is unsafe")
+	}
+	path := filepath.Join(directory, string(request.Claim.Stage.StageAttempt.ID)+"-submission-lint.id")
+	if existing, found, err := codeEdgePhase1ReadReservedID(path); err != nil {
+		return "", err
+	} else if found {
+		return workflowkit.ArtifactID(existing), nil
+	}
+	id, err := store.NewUUIDv7()
+	if err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		existing, found, readErr := codeEdgePhase1ReadReservedID(path)
+		if readErr != nil || !found {
+			return "", errors.New("CodeEdge Phase-1 reserved artifact ID raced without a valid value")
+		}
+		return workflowkit.ArtifactID(existing), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	writeErr := func() error {
+		if _, err := io.WriteString(file, id+"\n"); err != nil {
+			return err
+		}
+		return file.Sync()
+	}()
+	closeErr := file.Close()
+	if writeErr != nil {
+		_ = os.Remove(path)
+		return "", writeErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return workflowkit.ArtifactID(id), nil
+}
+
+func codeEdgePhase1ReadReservedID(path string) (string, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", false, errors.New("CodeEdge Phase-1 reserved artifact ID is unsafe")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	id := strings.TrimSpace(string(raw))
+	if string(raw) != id+"\n" || store.ValidateUUIDv7(id) != nil {
+		return "", false, errors.New("CodeEdge Phase-1 reserved artifact ID is malformed")
+	}
+	return id, true, nil
+}
+
+type codeEdgePhase1DockerBuildReceipt struct {
+	Format             string                  `json:"format"`
+	Version            string                  `json:"version"`
+	RunID              string                  `json:"run_id"`
+	TaskSnapshotDigest string                  `json:"task_snapshot_digest"`
+	ImageTag           string                  `json:"image_tag"`
+	ImageID            string                  `json:"image_id"`
+	OutputFingerprint  workflowkit.Fingerprint `json:"output_fingerprint"`
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) executeDockerBuild(ctx context.Context, request workflowkit.StageExecutionRequest, outputName, schema, workspace, taskRoot string, inspection codeedge.Report) (workflowkit.StageExecutionResult, error) {
+	report := executor.reportFor(request, workflowkit.VerdictPass, []string{}, inspection)
+	if inspection.Environment != codeedge.EnvironmentDockerfile {
+		report.Verdict = workflowkit.VerdictNeedsRepair
+		report.Findings = []string{"docker-compose environment requires a separately locked compose operation"}
+		return codeEdgePhase1ReportStageResult(report, outputName, schema)
+	}
+	lock := executor.commands[stageprovider.CodeEdgePhase1DockerBuildCommandID]
+	imageTag := codeEdgePhase1ImageTag(request.Execution.ID)
+	command := CodeEdgePhase1Command{
+		Path: lock.AbsolutePath,
+		Args: []string{
+			"build", "--pull=false", "--network=default",
+			"--label", "io.harbor-factory.codeedge.run_id=" + request.Execution.ID,
+			"--label", "io.harbor-factory.codeedge.task_digest=" + string(request.Execution.Subject.Digest),
+			"--tag", imageTag,
+			"--file", filepath.Join(taskRoot, "environment", "Dockerfile"),
+			filepath.Join(taskRoot, "environment"),
+		},
+		Dir: workspace,
+		Env: executor.commandEnvironment(workspace),
+	}
+	result, outputFingerprint, runErr := executor.runLockedCommand(ctx, command)
+	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
+	if runErr != nil {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Docker build could not start", report, codeEdgePhase1FailureClass(runErr))
+	}
+	if result.ExitCode != 0 {
+		// Training rules treat build/download/network failures as infra rather
+		// than a task-quality or model-capability verdict.
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Docker build failed", report, workflowkit.FailureProcess)
+	}
+	// Docker build output is intentionally not a contract: its format changes
+	// between legacy and BuildKit implementations. Resolve the tagged image
+	// through the same locked Docker executable instead, then freeze that
+	// immutable image ID in the run-scoped receipt.
+	imageID, inspectErr := executor.inspectDockerImage(ctx, workspace, stageprovider.CodeEdgePhase1DockerBuildCommandID, imageTag)
+	if inspectErr != nil {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Docker build image cannot be identified", report, codeEdgePhase1FailureClass(inspectErr))
+	}
+	if err := executor.writeDockerBuildReceipt(workspace, codeEdgePhase1DockerBuildReceipt{
+		Format: codeEdgePhase1BuildReceiptFormat, Version: codeEdgePhase1BuildReceiptVersion,
+		RunID: request.Execution.ID, TaskSnapshotDigest: string(request.Execution.Subject.Digest),
+		ImageTag: imageTag, ImageID: imageID, OutputFingerprint: outputFingerprint,
+	}); err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	return codeEdgePhase1ReportStageResult(report, outputName, schema)
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) executeInitialVerify(ctx context.Context, request workflowkit.StageExecutionRequest, outputName, schema, workspace, taskRoot string, inspection codeedge.Report) (workflowkit.StageExecutionResult, error) {
+	report := executor.reportFor(request, workflowkit.VerdictPass, []string{}, inspection)
+	build, err := executor.readDockerBuildReceipt(workspace, request)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	if err := executor.verifyDockerBuildImage(ctx, workspace, stageprovider.CodeEdgePhase1InitialVerifyCommandID, build); err != nil {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Docker build image cannot be re-attested", report, codeEdgePhase1FailureClass(err))
+	}
+	checkout, before, err := codeEdgePhase1PrepareVerificationCheckout(workspace, request, taskRoot, "initial", []string{"tests/test.sh"})
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	lock := executor.commands[stageprovider.CodeEdgePhase1InitialVerifyCommandID]
+	command := CodeEdgePhase1Command{
+		Path: lock.AbsolutePath,
+		Args: codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "initial"), "sh ./tests/test.sh"),
+		Dir:  workspace,
+		Env:  executor.commandEnvironment(workspace),
+	}
+	result, outputFingerprint, runErr := executor.runLockedCommand(ctx, command)
+	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
+	if runErr != nil {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled initial verification could not start", report, codeEdgePhase1FailureClass(runErr))
+	}
+	if err := codeEdgePhase1VerifyCheckoutScripts(checkout, before); err != nil {
+		report.Verdict = workflowkit.VerdictNeedsRepair
+		report.Findings = []string{"initial verifier modified its immutable test script"}
+		return codeEdgePhase1ReportStageResult(report, outputName, schema)
+	}
+	if result.ExitCode == 0 {
+		report.Verdict = workflowkit.VerdictNeedsRepair
+		report.Findings = []string{"initial verifier passed before the Oracle repair, so the task does not expose the intended problem"}
+		return codeEdgePhase1ReportStageResult(report, outputName, schema)
+	}
+	// A non-zero verifier result is the expected initial state. The command
+	// itself completed and returned a trustworthy report, so it is not infra.
+	return codeEdgePhase1ReportStageResult(report, outputName, schema)
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) executeOracleVerify(ctx context.Context, request workflowkit.StageExecutionRequest, outputName, schema, workspace, taskRoot string, inspection codeedge.Report) (workflowkit.StageExecutionResult, error) {
+	report := executor.reportFor(request, workflowkit.VerdictPass, []string{}, inspection)
+	build, err := executor.readDockerBuildReceipt(workspace, request)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	if err := executor.verifyDockerBuildImage(ctx, workspace, stageprovider.CodeEdgePhase1OracleVerifyCommandID, build); err != nil {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Docker build image cannot be re-attested", report, codeEdgePhase1FailureClass(err))
+	}
+	checkout, before, err := codeEdgePhase1PrepareVerificationCheckout(workspace, request, taskRoot, "oracle", []string{"solution/solve.sh", "tests/test.sh"})
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	lock := executor.commands[stageprovider.CodeEdgePhase1OracleVerifyCommandID]
+	command := CodeEdgePhase1Command{
+		Path: lock.AbsolutePath,
+		Args: codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "oracle"), "sh ./solution/solve.sh && sh ./tests/test.sh"),
+		Dir:  workspace,
+		Env:  executor.commandEnvironment(workspace),
+	}
+	result, outputFingerprint, runErr := executor.runLockedCommand(ctx, command)
+	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
+	if runErr != nil {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Oracle verification could not start", report, codeEdgePhase1FailureClass(runErr))
+	}
+	if err := codeEdgePhase1VerifyCheckoutScripts(checkout, before); err != nil {
+		report.Verdict = workflowkit.VerdictNeedsRepair
+		report.Findings = []string{"Oracle or verifier modified an immutable solution/test script"}
+		return codeEdgePhase1ReportStageResult(report, outputName, schema)
+	}
+	if result.ExitCode != 0 {
+		report.Verdict = workflowkit.VerdictNeedsRepair
+		report.Findings = []string{"Oracle repair followed by verifier did not pass"}
+		return codeEdgePhase1ReportStageResult(report, outputName, schema)
+	}
+	return codeEdgePhase1ReportStageResult(report, outputName, schema)
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) commandEnvironment(workspace string) []string {
+	return []string{
+		"HOME=" + filepath.Join(workspace, "command-home"),
+		"TMPDIR=" + filepath.Join(workspace, "command-tmp"),
+		"LANG=C.UTF-8",
+		"PATH=/nonexistent",
+	}
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) runLockedCommand(ctx context.Context, command CodeEdgePhase1Command) (CodeEdgePhase1CommandResult, workflowkit.Fingerprint, error) {
+	if err := os.MkdirAll(filepath.Join(command.Dir, "command-home"), 0o700); err != nil {
+		return CodeEdgePhase1CommandResult{}, "", err
+	}
+	if err := os.MkdirAll(filepath.Join(command.Dir, "command-tmp"), 0o700); err != nil {
+		return CodeEdgePhase1CommandResult{}, "", err
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, executor.timeout)
+	defer cancel()
+	result, err := executor.runner.Run(commandCtx, command)
+	if commandCtx.Err() != nil && err == nil {
+		err = commandCtx.Err()
+	}
+	fingerprint, fingerprintErr := workflowkit.FingerprintParts("harbor.codeedge-phase1.command-output.v1", []workflowkit.FingerprintPart{
+		{Name: "exit_code", Value: []byte(fmt.Sprintf("%d", result.ExitCode))},
+		{Name: "stdout", Value: result.Stdout},
+		{Name: "stderr", Value: result.Stderr},
+	})
+	if fingerprintErr != nil {
+		return CodeEdgePhase1CommandResult{}, "", fingerprintErr
+	}
+	return result, fingerprint, err
+}
+
+func codeEdgePhase1FailureClass(err error) workflowkit.FailureClass {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return workflowkit.FailureTimeout
+	}
+	return workflowkit.FailureProcess
+}
+
+func codeEdgePhase1ImageTag(runID string) string {
+	return "harbor-codeedge:" + strings.ToLower(runID)
+}
+
+func codeEdgePhase1DockerImageID(raw []byte) (string, error) {
+	lines := strings.Fields(string(raw))
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "sha256:") || len(lines[0]) != len("sha256:")+64 {
+		return "", errors.New("Docker build image identity is malformed")
+	}
+	for _, value := range lines[0][len("sha256:"):] {
+		if !(value >= '0' && value <= '9') && !(value >= 'a' && value <= 'f') {
+			return "", errors.New("Docker build image identity is malformed")
+		}
+	}
+	return lines[0], nil
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) writeDockerBuildReceipt(workspace string, receipt codeEdgePhase1DockerBuildReceipt) error {
+	if receipt.Format != codeEdgePhase1BuildReceiptFormat || receipt.Version != codeEdgePhase1BuildReceiptVersion ||
+		receipt.RunID == "" || receipt.TaskSnapshotDigest == "" || receipt.ImageTag == "" || receipt.ImageID == "" || receipt.OutputFingerprint.Validate() != nil {
+		return errors.New("CodeEdge Phase-1 Docker build receipt is invalid")
+	}
+	directory := filepath.Join(workspace, "runtime")
+	if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("CodeEdge Phase-1 runtime receipt directory is unsafe")
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".docker-build-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.Write(encoded); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(temporaryPath, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, filepath.Join(directory, "docker-build.json"))
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) readDockerBuildReceipt(workspace string, request workflowkit.StageExecutionRequest) (codeEdgePhase1DockerBuildReceipt, error) {
+	var receipt codeEdgePhase1DockerBuildReceipt
+	if err := codeEdgePhase1ReadJSON(filepath.Join(workspace, "runtime", "docker-build.json"), &receipt); err != nil {
+		return codeEdgePhase1DockerBuildReceipt{}, fmt.Errorf("read controlled Docker build receipt: %w", err)
+	}
+	if receipt.Format != codeEdgePhase1BuildReceiptFormat || receipt.Version != codeEdgePhase1BuildReceiptVersion || receipt.RunID != request.Execution.ID ||
+		receipt.TaskSnapshotDigest != string(request.Execution.Subject.Digest) || receipt.ImageTag != codeEdgePhase1ImageTag(request.Execution.ID) ||
+		receipt.OutputFingerprint.Validate() != nil {
+		return codeEdgePhase1DockerBuildReceipt{}, errors.New("controlled Docker build receipt does not match the frozen Run")
+	}
+	if _, err := codeEdgePhase1DockerImageID([]byte(receipt.ImageID)); err != nil {
+		return codeEdgePhase1DockerBuildReceipt{}, err
+	}
+	return receipt, nil
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) verifyDockerBuildImage(ctx context.Context, workspace, commandID string, build codeEdgePhase1DockerBuildReceipt) error {
+	imageID, err := executor.inspectDockerImage(ctx, workspace, commandID, build.ImageTag)
+	if err != nil {
+		return err
+	}
+	if imageID != build.ImageID {
+		return errors.New("controlled Docker image identity differs from the frozen build receipt")
+	}
+	return nil
+}
+
+func (executor *CodeEdgePhase1ParentExecutor) inspectDockerImage(ctx context.Context, workspace, commandID, imageTag string) (string, error) {
+	lock, found := executor.commands[commandID]
+	if !found {
+		return "", errors.New("CodeEdge Phase-1 Docker image verifier is not installed")
+	}
+	command := CodeEdgePhase1Command{
+		Path: lock.AbsolutePath,
+		Args: []string{"image", "inspect", "--format", "{{.Id}}", imageTag},
+		Dir:  workspace,
+		Env:  executor.commandEnvironment(workspace),
+	}
+	result, _, err := executor.runLockedCommand(ctx, command)
+	if err != nil {
+		return "", err
+	}
+	if result.ExitCode != 0 {
+		return "", errors.New("controlled Docker image inspection failed")
+	}
+	imageID, err := codeEdgePhase1DockerImageID(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return imageID, nil
+}
+
+func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) []string {
+	return []string{
+		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+		"--mount", "type=bind,src=" + checkout + ",dst=/oracle,rw",
+		"--workdir", "/oracle", "--name", "harbor-codeedge-" + name,
+		"--entrypoint", "/bin/sh", imageTag, "-ec", shellProgram,
+	}
+}
+
+func codeEdgePhase1ContainerName(request workflowkit.StageExecutionRequest, kind string) string {
+	return "harbor-codeedge-" + kind + "-" + strings.ToLower(request.Execution.ID) + "-" + strings.ToLower(string(request.Claim.Stage.StageAttempt.ID))
+}
+
+func codeEdgePhase1PrepareVerificationCheckout(workspace string, request workflowkit.StageExecutionRequest, taskRoot, kind string, files []string) (string, map[string]workflowkit.Fingerprint, error) {
+	if kind != "initial" && kind != "oracle" {
+		return "", nil, errors.New("CodeEdge Phase-1 verification checkout kind is unsupported")
+	}
+	if request.Claim.Stage == nil || request.Claim.Stage.StageAttempt.ID == "" {
+		return "", nil, errors.New("CodeEdge Phase-1 verification stage attempt is required")
+	}
+	checkout := filepath.Join(workspace, "verification", kind, string(request.Claim.Stage.StageAttempt.ID))
+	if !codeEdgePhase1PathWithin(workspace, checkout) {
+		return "", nil, errors.New("CodeEdge Phase-1 verification checkout escapes the managed workspace")
+	}
+	if err := os.MkdirAll(filepath.Dir(checkout), 0o700); err != nil {
+		return "", nil, err
+	}
+	if info, err := os.Lstat(checkout); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(checkout, 0o700); err != nil {
+			return "", nil, err
+		}
+	} else if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", nil, errors.New("CodeEdge Phase-1 verification checkout is unsafe")
+	}
+	before := make(map[string]workflowkit.Fingerprint, len(files))
+	for _, relative := range files {
+		if !codeEdgePhase1VerificationFile(relative) {
+			return "", nil, errors.New("CodeEdge Phase-1 verification checkout requested an unsafe file")
+		}
+		source := filepath.Join(taskRoot, filepath.FromSlash(relative))
+		content, digest, err := codeEdgePhase1ReadTaskScript(source)
+		if err != nil {
+			return "", nil, err
+		}
+		destination := filepath.Join(checkout, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+			return "", nil, err
+		}
+		if info, statErr := os.Lstat(destination); errors.Is(statErr, os.ErrNotExist) {
+			file, createErr := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+			if createErr != nil {
+				return "", nil, createErr
+			}
+			writeErr := func() error {
+				if _, err := file.Write(content); err != nil {
+					return err
+				}
+				return file.Sync()
+			}()
+			closeErr := file.Close()
+			if writeErr != nil {
+				_ = os.Remove(destination)
+				return "", nil, writeErr
+			}
+			if closeErr != nil {
+				return "", nil, closeErr
+			}
+		} else if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return "", nil, errors.New("CodeEdge Phase-1 verification checkout script is unsafe")
+		} else {
+			existing, existingDigest, readErr := codeEdgePhase1ReadTaskScript(destination)
+			if readErr != nil || existingDigest != digest || !bytes.Equal(existing, content) {
+				return "", nil, errors.New("CodeEdge Phase-1 verification checkout script differs from the frozen task")
+			}
+		}
+		before[relative] = digest
+	}
+	return checkout, before, nil
+}
+
+func codeEdgePhase1VerificationFile(relative string) bool {
+	return relative == "solution/solve.sh" || relative == "tests/test.sh"
+}
+
+func codeEdgePhase1ReadTaskScript(path string) ([]byte, workflowkit.Fingerprint, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > codeEdgePhase1ScriptLimit {
+		return nil, "", errors.New("CodeEdge Phase-1 verification script is unavailable")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, "", errors.New("CodeEdge Phase-1 verification script changed while opening")
+	}
+	content, err := io.ReadAll(io.LimitReader(file, codeEdgePhase1ScriptLimit+1))
+	if err != nil || int64(len(content)) != info.Size() {
+		return nil, "", errors.New("CodeEdge Phase-1 verification script changed while reading")
+	}
+	if after, err := file.Stat(); err != nil || !after.Mode().IsRegular() || !os.SameFile(opened, after) || after.Size() != int64(len(content)) {
+		return nil, "", errors.New("CodeEdge Phase-1 verification script changed while reading")
+	}
+	return content, workflowkit.SHA256Fingerprint(content), nil
+}
+
+func codeEdgePhase1VerifyCheckoutScripts(checkout string, expected map[string]workflowkit.Fingerprint) error {
+	for relative, digest := range expected {
+		_, actual, err := codeEdgePhase1ReadTaskScript(filepath.Join(checkout, filepath.FromSlash(relative)))
+		if err != nil || actual != digest {
+			return errors.New("CodeEdge Phase-1 verification checkout script changed")
+		}
+	}
+	return nil
+}
+
+var _ stageprovider.HarborBuiltinOperationExecutor = (*CodeEdgePhase1ParentExecutor)(nil)
+var _ stageprovider.LocalCommandOperationExecutor = (*CodeEdgePhase1ParentExecutor)(nil)

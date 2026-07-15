@@ -31,6 +31,16 @@ const (
 	standardLockRelative       = "deployments/standard-authoring/operation-catalog.lock.json"
 )
 
+// generatedProductionLocks are omitted from the source manifest signed by
+// every deployment lock. Including even one lock would create a hash cycle;
+// excluding only the lock currently being generated would make the three
+// independent bundles sign different source identities.
+var generatedProductionLocks = map[string]struct{}{
+	"deployments/standard-authoring/operation-catalog.lock.json":       {},
+	"deployments/codeedge-phase1/operation-catalog.lock.json":          {},
+	"deployments/codeedge-evaluator-child/operation-catalog.lock.json": {},
+}
+
 type buildConfig struct {
 	sourceRoot        string
 	catalogPath       string
@@ -133,7 +143,7 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	if err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, err
 	}
-	commit, manifestFingerprint, err := sourceBuildIdentity(config.sourceRoot, config.gitExecutable, standardLockRelative)
+	commit, manifestFingerprint, err := sourceBuildIdentity(config.sourceRoot, config.gitExecutable)
 	if err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, err
 	}
@@ -154,13 +164,15 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 		if err != nil {
 			return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q schema asset: %w", registration.Stage.Key, err)
 		}
+		secrets := make([]workflowadapter.SecretReference, len(registration.Secrets))
+		copy(secrets, registration.Secrets)
 		record := stageprovider.DeploymentOperationCatalogLockRecord{
 			Stage:                    registration.Stage,
 			Provider:                 registration.Provider,
 			Operation:                registration.Operation.Clone(),
 			Runtime:                  registration.Runtime,
 			Checkout:                 registration.Checkout,
-			Secrets:                  append([]workflowadapter.SecretReference(nil), registration.Secrets...),
+			Secrets:                  secrets,
 			PromptContentFingerprint: prompt,
 			SchemaContentFingerprint: schema,
 			ExecutionKind:            registration.Operation.Payload.Kind(),
@@ -349,7 +361,7 @@ func fingerprintContractAsset(root string, reference stageprovider.StandardAutho
 	return workflowkit.SHA256Fingerprint(contents), nil
 }
 
-func sourceBuildIdentity(root, gitPath, excluded string) (string, workflowkit.Fingerprint, error) {
+func sourceBuildIdentity(root, gitPath string) (string, workflowkit.Fingerprint, error) {
 	commit, err := probeAt(root, gitPath, []string{"PATH=/usr/local/bin:/usr/bin:/bin"}, "rev-parse", "HEAD")
 	if err != nil || len(commit) != 40 || strings.ToLower(commit) != commit {
 		return "", "", errors.New("resolve source Git commit")
@@ -364,7 +376,10 @@ func sourceBuildIdentity(root, gitPath, excluded string) (string, workflowkit.Fi
 			continue
 		}
 		parts := bytes.SplitN(bytes.TrimSuffix(line, []byte("\n")), []byte("\t"), 2)
-		if len(parts) != 2 || string(parts[1]) != excluded {
+		if len(parts) != 2 {
+			return "", "", errors.New("read source Git tree")
+		}
+		if _, generatedLock := generatedProductionLocks[string(parts[1])]; !generatedLock {
 			_, _ = manifest.Write(line)
 		}
 	}

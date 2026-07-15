@@ -128,6 +128,14 @@ func newStandardAuthoringLaunchService(core *lifecycleServiceCore, capturer Stan
 	return &StandardAuthoringLaunchService{core: core, capturer: capturer, definitions: definitions}
 }
 
+// Available reports whether this lifecycle composition has both deployment-
+// owned halves required to start the closed Standard authoring flow. It is a
+// read-only capability probe for CLI/TUI projection and does not capture a
+// source, create durable state, or infer missing authoring configuration.
+func (service *StandardAuthoringLaunchService) Available() bool {
+	return service != nil && service.core != nil && service.core.store != nil && service.core.objects != nil && service.capturer != nil && service.definitions != nil
+}
+
 // Start captures the approved Tower HTTP source exactly once for a completed
 // idempotency key, then freezes the complete source/session contract and
 // queues its Standard Run. The entity IDs are deterministic UUIDv7 derivatives

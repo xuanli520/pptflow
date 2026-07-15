@@ -57,7 +57,7 @@ func linkedCodeEdgePhase1ProductionBuildBinding() (codeEdgePhase1ProductionBuild
 		},
 	}
 	if err := binding.Validate(); err != nil {
-		return codeEdgePhase1ProductionBuildBinding{}, fmt.Errorf("CodeEdge Phase-1 production build binding is unavailable; build with scripts/build-harbor-flow-production.sh: %w", err)
+		return codeEdgePhase1ProductionBuildBinding{}, fmt.Errorf("CodeEdge Phase-1 production build binding is unavailable; build with scripts/build-codeedge-production.sh: %w", err)
 	}
 	return binding, nil
 }

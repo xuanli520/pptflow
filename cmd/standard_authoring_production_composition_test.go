@@ -33,6 +33,9 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	if err != nil {
 		t.Fatal(err)
 	}
+	lockIdentity := stageprovider.DeploymentOperationCatalogLockIdentity{
+		LockID: lock.LockID, LockVersion: lock.LockVersion, Fingerprint: lockFingerprint,
+	}
 	composition, err := newStandardAuthoringProductionComposition(standardAuthoringProductionCompositionConfig{
 		CatalogPath:               filepath.Join(deploymentRoot, "operation-catalog.v1.json"),
 		LockPath:                  filepath.Join(deploymentRoot, "operation-catalog.lock.json"),
@@ -41,9 +44,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 		Store:                     database,
 		HarborFlowBuild:           lock.HarborFlowBuild,
 		CatalogReceiptFingerprint: receiptFingerprint,
-		LockIdentity: stageprovider.DeploymentOperationCatalogLockIdentity{
-			LockID: lock.LockID, LockVersion: lock.LockVersion, Fingerprint: lockFingerprint,
-		},
+		LockIdentity:              lockIdentity,
 	})
 	if err != nil {
 		t.Fatalf("construct Standard authoring production composition: %v", err)
@@ -51,6 +52,12 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	if composition == nil || composition.Resolver == nil || composition.SourceCapturer == nil || composition.Definitions == nil ||
 		!composition.CatalogBinding.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
 		t.Fatalf("incomplete Standard authoring composition: %+v", composition)
+	}
+	if composition.CatalogBinding.Resolver != composition.Resolver {
+		t.Fatal("Standard authoring catalog binding and operation resolver must share one attested lock snapshot")
+	}
+	if composition.Resolver.LockIdentity() != lockIdentity {
+		t.Fatal("Standard authoring composition operation resolver lost its generated lock identity")
 	}
 	workspaceRoot, err := app.StandardAuthoringCodexWorkspaceRoot(root)
 	if err != nil {

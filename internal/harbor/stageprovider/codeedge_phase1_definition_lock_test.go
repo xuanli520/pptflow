@@ -33,6 +33,14 @@ func TestCodeEdgePhase1DeploymentLockRequiresTypedParentDefinitionMaterials(t *t
 		}
 	})
 
+	t.Run("absent preflight profile", func(t *testing.T) {
+		missing := lock.Clone()
+		missing.CodeEdgePhase1PreflightProfile = nil
+		if err := missing.Validate(); err == nil || !strings.Contains(err.Error(), "preflight profile is required") {
+			t.Fatalf("missing parent preflight profile error = %v", err)
+		}
+	})
+
 	t.Run("wrong profile template", func(t *testing.T) {
 		wrong := lock.Clone()
 		wrong.CodeEdgePhase1ExecutionProfile.Profile.Template = workflowadapter.StandardTemplateReference()
@@ -83,6 +91,22 @@ func TestCodeEdgePhase1DeploymentLockParentDefinitionMaterialsAreCanonicalAndDef
 		t.Fatal("parent final compliance policy is absent from deployment lock fingerprint")
 	}
 
+	preflightDrift := lock.Clone()
+	preflightDrift.CodeEdgePhase1PreflightProfile.Profile.ProtectedEnvironmentVariables = append(
+		preflightDrift.CodeEdgePhase1PreflightProfile.Profile.ProtectedEnvironmentVariables,
+		"HARBOR_CONTROL_TOKEN",
+	)
+	if err := preflightDrift.Validate(); err != nil {
+		t.Fatalf("validate preflight profile drift fixture: %v", err)
+	}
+	preflightFingerprint, err := preflightDrift.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preflightFingerprint == baseline {
+		t.Fatal("parent preflight profile is absent from deployment lock fingerprint")
+	}
+
 	canonical, err := lock.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
@@ -103,17 +127,28 @@ func TestCodeEdgePhase1DeploymentLockParentDefinitionMaterialsAreCanonicalAndDef
 	if err != nil {
 		t.Fatal(err)
 	}
+	preflight, err := lock.CodeEdgePhase1Preflight()
+	if err != nil {
+		t.Fatal(err)
+	}
 	profile.ControlGracePeriod += time.Second
 	policy.Version = "changed"
+	preflight.Metadata.CodeLang[0] = "forged"
+	preflight.ProtectedEnvironmentVariables[0] = "FORGED_TOKEN"
 	againProfile, profileErr := lock.CodeEdgePhase1Profile()
 	againPolicy, policyErr := lock.CodeEdgePhase1FinalCompliance()
-	if profileErr != nil || policyErr != nil {
-		t.Fatalf("read defensive parent definition copies: %v / %v", profileErr, policyErr)
+	againPreflight, preflightErr := lock.CodeEdgePhase1Preflight()
+	if profileErr != nil || policyErr != nil || preflightErr != nil {
+		t.Fatalf("read defensive parent definition copies: %v / %v / %v", profileErr, policyErr, preflightErr)
 	}
-	if againProfile.ControlGracePeriod == profile.ControlGracePeriod || againPolicy.Version == policy.Version {
+	if againProfile.ControlGracePeriod == profile.ControlGracePeriod || againPolicy.Version == policy.Version ||
+		againPreflight.Metadata.CodeLang[0] == preflight.Metadata.CodeLang[0] ||
+		againPreflight.ProtectedEnvironmentVariables[0] == preflight.ProtectedEnvironmentVariables[0] {
 		t.Fatal("parent definition accessor leaked mutable lock material")
 	}
-	if !reflect.DeepEqual(againProfile, lock.CodeEdgePhase1ExecutionProfile.Profile) || !reflect.DeepEqual(againPolicy, lock.CodeEdgePhase1FinalCompliancePolicy.Policy) {
+	if !reflect.DeepEqual(againProfile, lock.CodeEdgePhase1ExecutionProfile.Profile) ||
+		!reflect.DeepEqual(againPolicy, lock.CodeEdgePhase1FinalCompliancePolicy.Policy) ||
+		!reflect.DeepEqual(againPreflight, lock.CodeEdgePhase1PreflightProfile.Profile) {
 		t.Fatal("parent definition accessors did not return the locked definition")
 	}
 }
@@ -126,6 +161,7 @@ func codeEdgePhase1DefinitionLockFixture(t *testing.T) (*DeploymentOperationCata
 		t.Fatal(err)
 	}
 	profile := CodeEdgePhase1ExecutionProfileLock{Profile: codeEdgePhase1DefinitionProfile(t)}
+	preflight := CodeEdgePhase1PreflightProfileLock{Profile: codeEdgePhase1DefinitionPreflightProfile(t)}
 	policy := CodeEdgePhase1FinalCompliancePolicyLock{Policy: codeEdgePhase1DefinitionPolicy()}
 	lock := DeploymentOperationCatalogLock{
 		Format: DeploymentOperationCatalogLockFormat, Version: DeploymentOperationCatalogLockVersion,
@@ -136,6 +172,7 @@ func codeEdgePhase1DefinitionLockFixture(t *testing.T) (*DeploymentOperationCata
 			Commit: strings.Repeat("c", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("codeedge-phase1-parent-definition-test")),
 		},
 		CodeEdgePhase1ExecutionProfile:      &profile,
+		CodeEdgePhase1PreflightProfile:      &preflight,
 		CodeEdgePhase1FinalCompliancePolicy: &policy,
 		Operations:                          make([]DeploymentOperationCatalogLockRecord, 0, len(catalogDocument.Operations)),
 	}
@@ -204,6 +241,29 @@ func codeEdgePhase1DefinitionProfile(t *testing.T) workflowadapter.ExecutionProf
 	}
 	if err := profile.Validate(); err != nil {
 		t.Fatalf("build complete parent profile: %v", err)
+	}
+	return profile
+}
+
+func codeEdgePhase1DefinitionPreflightProfile(t *testing.T) codeedge.Profile {
+	t.Helper()
+	profile := codeedge.Profile{
+		Metadata: codeedge.MetadataFieldMapping{
+			CodeLang:    codeedge.TOMLPath{"metadata", "code_lang"},
+			TaskType:    codeedge.TOMLPath{"metadata", "task_type"},
+			Application: codeedge.TOMLPath{"metadata", "application"},
+			IsZeroToOne: codeedge.TOMLPath{"metadata", "is_0_to_1"},
+			GitHubURL:   codeedge.TOMLPath{"metadata", "github_url"},
+			CommitID:    codeedge.TOMLPath{"metadata", "commit_id"},
+		},
+		ProtectedEnvironmentVariables: []string{
+			"ANTHROPIC_AUTH_TOKEN",
+			"ANTHROPIC_BASE_URL",
+			"QWEN_HARBOR_BASE_URL",
+		},
+	}
+	if err := codeedge.ValidateProfile(profile); err != nil {
+		t.Fatalf("build complete parent preflight profile: %v", err)
 	}
 	return profile
 }

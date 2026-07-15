@@ -4,14 +4,14 @@ package stageprovider
 // catalog/lock binds them to one exact handler or local executable; they are
 // deliberately not paths, shell fragments, or user-configurable stage names.
 const (
-	CodeEdgePhase1TaskLayoutPreflightHandlerID          = "codeedge-phase1.task-layout-preflight"
-	CodeEdgePhase1RepoProvenancePreflightHandlerID      = "codeedge-phase1.repo-provenance-preflight"
+	CodeEdgePhase1TaskLayoutPreflightHandlerID           = "codeedge-phase1.task-layout-preflight"
+	CodeEdgePhase1RepoProvenancePreflightHandlerID       = "codeedge-phase1.repo-provenance-preflight"
 	CodeEdgePhase1EnvironmentIsolationPreflightHandlerID = "codeedge-phase1.environment-isolation-preflight"
-	CodeEdgePhase1TestsAnalysisValidateHandlerID        = "codeedge-phase1.tests-analysis-validate"
-	CodeEdgePhase1QualityCheckHandlerID                 = "codeedge-phase1.quality-check"
-	CodeEdgePhase1SimilarityCheckHandlerID              = "codeedge-phase1.similarity-check"
-	CodeEdgePhase1SubmissionLintHandlerID               = "codeedge-phase1.submission-lint"
-	CodeEdgePhase1LocalPackageHandlerID                 = "codeedge-phase1.local-package"
+	CodeEdgePhase1TestsAnalysisValidateHandlerID         = "codeedge-phase1.tests-analysis-validate"
+	CodeEdgePhase1QualityCheckHandlerID                  = "codeedge-phase1.quality-check"
+	CodeEdgePhase1SimilarityCheckHandlerID               = "codeedge-phase1.similarity-check"
+	CodeEdgePhase1SubmissionLintHandlerID                = "codeedge-phase1.submission-lint"
+	CodeEdgePhase1LocalPackageHandlerID                  = "codeedge-phase1.local-package"
 
 	CodeEdgePhase1DockerBuildCommandID   = "codeedge-phase1.docker-build"
 	CodeEdgePhase1InitialVerifyCommandID = "codeedge-phase1.initial-verify"

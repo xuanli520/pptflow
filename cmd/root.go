@@ -18,8 +18,8 @@ func Execute() {
 func NewRootCommand() *cobra.Command {
 	lifecycle := &lifecycleCLIConfig{
 		root:                      ".harbor-factory",
-		newLifecycleService:       newCodeEdgeProductionLifecycleServices,
-		preflightLifecycleService: preflightCodeEdgeProductionLifecycleServices,
+		newLifecycleService:       newHarborFlowProductionLifecycleServices,
+		preflightLifecycleService: preflightHarborFlowProductionLifecycleServices,
 	}
 	root := &cobra.Command{
 		Use:          "harbor-factory",

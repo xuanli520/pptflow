@@ -124,6 +124,25 @@ func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile
 	if updated == baseline {
 		t.Fatal("Standard authoring execution profile did not participate in lock fingerprint")
 	}
+	canonical, err := lock.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseDeploymentOperationCatalogLockJSON(canonical)
+	if err != nil {
+		t.Fatalf("parse canonical Standard authoring lock: %v", err)
+	}
+	parsedProfile, err := parsed.StandardAuthoringProfile()
+	if err != nil {
+		t.Fatalf("read Standard authoring profile after canonical round trip: %v", err)
+	}
+	parsedFingerprint, err := parsedProfile.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsedFingerprint != baselineProfileFingerprint(t, lock) {
+		t.Fatal("canonical Standard authoring lock did not retain the execution profile")
+	}
 
 	missing := lock.Clone()
 	missing.StandardAuthoringExecutionProfile = nil
@@ -140,6 +159,19 @@ func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile
 	if err := nonStandardLock.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
 		t.Fatalf("non-Standard lock carrying Standard profile error = %v, want invalid lock", err)
 	}
+}
+
+func baselineProfileFingerprint(t *testing.T, lock DeploymentOperationCatalogLock) workflowkit.Fingerprint {
+	t.Helper()
+	profile, err := lock.StandardAuthoringProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := profile.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fingerprint
 }
 
 func TestDeploymentOperationCatalogLockRejectsDuplicateUnknownUnversionedAndReceiptDrift(t *testing.T) {

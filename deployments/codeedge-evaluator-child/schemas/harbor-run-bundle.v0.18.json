@@ -1,0 +1,7 @@
+{
+  "format": "harbor.codeedge-evaluator-result-schema.v1",
+  "version": "1",
+  "bundle": {"format": "harbor.run-bundle.v0.18", "version": "1"},
+  "required_evidence": ["job.result.json", "job.lock.json", "trial.result.json", "trajectory.json", "terminal.png"],
+  "trial_contract": {"logical_trial_count": 4, "require_single_terminal_screenshot": true, "result_parser": "harbor-factory.codeedge.v0.18"}
+}

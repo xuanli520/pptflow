@@ -1,0 +1,12 @@
+{
+  "template": {"id": "harbor.codeedge-evaluator", "version": "1.0.0"},
+  "id": "codeedge-phase1-evaluator-child-local",
+  "version": "1.0.0",
+  "continuation_plan_ttl": "24h0m0s",
+  "control_grace_period": "1m0s",
+  "candidate_provider_budget": {"attempt_timeout": "30m0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s"},
+  "stages": [
+    {"stage_key": "harbor_run_opus", "budget": {"turn_timeout": "1h50m0s", "max_turns": 1, "attempt_timeout": "2h0m0s", "max_attempts": 1, "max_elapsed": "2h0m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
+    {"stage_key": "harbor_run_qwen", "budget": {"turn_timeout": "1h50m0s", "max_turns": 1, "attempt_timeout": "2h0m0s", "max_attempts": 1, "max_elapsed": "2h0m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}}
+  ]
+}

@@ -136,6 +136,11 @@ func TestCodeEdgePhase1DefinitionProviderRejectsInvalidRequestAndUnapprovedVerif
 	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(codeEdgePhase1DefinitionCatalogFixture(t), missingPolicy); err == nil {
 		t.Fatal("verified resolver accepted a parent lock without its typed final compliance policy")
 	}
+	missingPreflight := lock.Clone()
+	missingPreflight.CodeEdgePhase1PreflightProfile = nil
+	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(codeEdgePhase1DefinitionCatalogFixture(t), missingPreflight); err == nil {
+		t.Fatal("verified resolver accepted a parent lock without its typed preflight profile")
+	}
 }
 
 func codeEdgePhase1DefinitionRequest() app.CodeEdgePhase1RunDefinitionRequest {
@@ -161,6 +166,7 @@ func codeEdgePhase1DefinitionVerifierFixture(t *testing.T) (*stageprovider.Deplo
 			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("codeedge-phase1-definition-provider-test")),
 		},
 		CodeEdgePhase1ExecutionProfile:      &stageprovider.CodeEdgePhase1ExecutionProfileLock{Profile: codeEdgePhase1DefinitionProviderProfile(t)},
+		CodeEdgePhase1PreflightProfile:      &stageprovider.CodeEdgePhase1PreflightProfileLock{Profile: codeEdgePhase1DefinitionProviderPreflightProfile(t)},
 		CodeEdgePhase1FinalCompliancePolicy: &stageprovider.CodeEdgePhase1FinalCompliancePolicyLock{Policy: codeEdgePhase1DefinitionProviderPolicy()},
 		Operations:                          make([]stageprovider.DeploymentOperationCatalogLockRecord, 0, len(workflowadapter.CodeEdgePhase1StageOrder())),
 	}
@@ -243,6 +249,29 @@ func codeEdgePhase1DefinitionProviderProfile(t *testing.T) workflowadapter.Execu
 	}
 	if err := profile.Validate(); err != nil {
 		t.Fatalf("build complete parent profile: %v", err)
+	}
+	return profile
+}
+
+func codeEdgePhase1DefinitionProviderPreflightProfile(t *testing.T) codeedge.Profile {
+	t.Helper()
+	profile := codeedge.Profile{
+		Metadata: codeedge.MetadataFieldMapping{
+			CodeLang:    codeedge.TOMLPath{"metadata", "code_lang"},
+			TaskType:    codeedge.TOMLPath{"metadata", "task_type"},
+			Application: codeedge.TOMLPath{"metadata", "application"},
+			IsZeroToOne: codeedge.TOMLPath{"metadata", "is_0_to_1"},
+			GitHubURL:   codeedge.TOMLPath{"metadata", "github_url"},
+			CommitID:    codeedge.TOMLPath{"metadata", "commit_id"},
+		},
+		ProtectedEnvironmentVariables: []string{
+			"ANTHROPIC_AUTH_TOKEN",
+			"ANTHROPIC_BASE_URL",
+			"QWEN_HARBOR_BASE_URL",
+		},
+	}
+	if err := codeedge.ValidateProfile(profile); err != nil {
+		t.Fatalf("build complete parent preflight profile: %v", err)
 	}
 	return profile
 }

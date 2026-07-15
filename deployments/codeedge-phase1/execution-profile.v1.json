@@ -1,0 +1,227 @@
+{
+  "template": {
+    "id": "harbor.codeedge-phase1",
+    "version": "2.2.0"
+  },
+  "id": "codeedge-phase1-parent-local",
+  "version": "2026.07.15.1",
+  "continuation_plan_ttl": "24h0m0s",
+  "control_grace_period": "2m0s",
+  "candidate_provider_budget": {
+    "attempt_timeout": "30m0s",
+    "startup_grace": "5m0s",
+    "shutdown_grace": "5m0s"
+  },
+  "stages": [
+    {
+      "stage_key": "repo_prepare",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "repo_analyze",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "codeedge_lint",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "docker_build",
+      "budget": {
+        "turn_timeout": "50m0s",
+        "max_turns": 1,
+        "attempt_timeout": "1h0m0s",
+        "max_attempts": 1,
+        "max_elapsed": "1h0m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "5m0s",
+        "shutdown_grace": "5m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "initial_verify",
+      "budget": {
+        "turn_timeout": "25m0s",
+        "max_turns": 1,
+        "attempt_timeout": "30m0s",
+        "max_attempts": 1,
+        "max_elapsed": "30m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "2m0s",
+        "shutdown_grace": "2m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "oracle_verify",
+      "budget": {
+        "turn_timeout": "25m0s",
+        "max_turns": 1,
+        "attempt_timeout": "30m0s",
+        "max_attempts": 1,
+        "max_elapsed": "30m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "2m0s",
+        "shutdown_grace": "2m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "tests_analysis",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "solution_review",
+      "budget": {
+        "turn_timeout": "5m0s",
+        "max_turns": 1,
+        "attempt_timeout": "10m0s",
+        "max_attempts": 1,
+        "max_elapsed": "10m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "quality_check",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "similarity_check",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "final_review",
+      "budget": {
+        "turn_timeout": "5m0s",
+        "max_turns": 1,
+        "attempt_timeout": "10m0s",
+        "max_attempts": 1,
+        "max_elapsed": "10m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "evaluator_evidence_handoff",
+      "budget": {
+        "turn_timeout": "5m0s",
+        "max_turns": 1,
+        "attempt_timeout": "10m0s",
+        "max_attempts": 1,
+        "max_elapsed": "10m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "submission_lint",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "result_review",
+      "budget": {
+        "turn_timeout": "5m0s",
+        "max_turns": 1,
+        "attempt_timeout": "10m0s",
+        "max_attempts": 1,
+        "max_elapsed": "10m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    },
+    {
+      "stage_key": "package",
+      "budget": {
+        "turn_timeout": "10m0s",
+        "max_turns": 1,
+        "attempt_timeout": "15m0s",
+        "max_attempts": 1,
+        "max_elapsed": "15m0s",
+        "idle_timeout": "0s",
+        "startup_grace": "1m0s",
+        "shutdown_grace": "1m0s",
+        "backoff": {"retry_delays": []}
+      }
+    }
+  ]
+}
