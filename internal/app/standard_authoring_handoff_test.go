@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,6 +180,7 @@ func TestStandardAuthoringHandoffFailsClosedWithoutPhase1Definition(t *testing.T
 func TestFrozenRuntimeEnqueuesAndConsumesOneStandardAuthoringHandoffJob(t *testing.T) {
 	ctx := context.Background()
 	fixture := newStandardAuthoringHandoffFixture(t)
+	initial := queueStandardAuthoringInitialCoordinator(t, ctx, fixture)
 	provider := codeEdgePhase1DefinitionProviderFunc(func(_ context.Context, definition CodeEdgePhase1RunDefinitionRequest) (CodeEdgePhase1RunDefinition, error) {
 		return CodeEdgePhase1RunDefinition{
 			Profile:       lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate()),
@@ -208,6 +211,10 @@ func TestFrozenRuntimeEnqueuesAndConsumesOneStandardAuthoringHandoffJob(t *testi
 	if err != nil || state != store.JobSucceeded {
 		t.Fatalf("consume durable handoff = %s, %v", state, err)
 	}
+	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+job.ID)
+	if err != nil || completion == nil || completion.CommandType != "workflow_run.execute" || completion.RunID != fixture.run.ID || completion.PayloadJSON != initial.PayloadJSON {
+		t.Fatalf("handoff completion coordinator = %+v, %v", completion, err)
+	}
 	child, err := fixture.database.GetWorkflowRun(ctx, payload.ChildRunID)
 	if err != nil || child == nil || child.ParentRunID != fixture.run.ID {
 		t.Fatalf("durable handoff child = %+v, %v", child, err)
@@ -228,6 +235,347 @@ func TestFrozenRuntimeEnqueuesAndConsumesOneStandardAuthoringHandoffJob(t *testi
 	if count != 1 {
 		t.Fatalf("handoff jobs = %d; want exactly one", count)
 	}
+}
+
+func TestStandardAuthoringHandoffBlocksReverseCoordinatorCompletionUntilChildIsBound(t *testing.T) {
+	ctx := context.Background()
+	fixture := newStandardAuthoringHandoffFixture(t)
+	initial := queueStandardAuthoringInitialCoordinator(t, ctx, fixture)
+	services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+		OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
+		CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &FrozenExecutionRuntime{core: services.core, services: services}
+	stageJob := store.DurableJob{CreatedBy: "worker", Priority: 7}
+	if err := runtime.enqueueStandardAuthoringHandoff(ctx, stageJob, fixture.run, fixture.stageAttempt); err != nil {
+		t.Fatal(err)
+	}
+	handoffJob, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-handoff:"+fixture.stageAttempt.ID)
+	if err != nil || handoffJob == nil {
+		t.Fatalf("load queued Standard handoff = %+v, %v", handoffJob, err)
+	}
+	handoffDelivery := *handoffJob
+
+	// This call models the old reverse scheduling order: a coordinator that
+	// was already queued reaches its completion branch before the handoff job
+	// has created the Phase-1 child. It must complete harmlessly, not terminally.
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := frozenRunDefinition{Workflow: resolved.Descriptor}
+	plan := runtimeExecutionPlan{
+		Workflow: resolved.Descriptor,
+		Transitions: map[workflowkit.StageKey]workflowkit.NodeTransition{
+			workflowkit.StageKey(workflowadapter.MaterializeTask): {
+				NodeID: workflowkit.StageKey(workflowadapter.MaterializeTask), FromGeneration: 0, ToGeneration: 0,
+				Disposition: workflowkit.DispositionSchedule,
+			},
+		},
+	}
+	if err := runtime.completeExecutionIfSatisfied(ctx, initial, fixture.run, frozen, plan); err != nil {
+		t.Fatalf("reverse coordinator completion = %v", err)
+	}
+	parent, err := fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parent == nil || parent.Status != store.WorkflowRunRunning {
+		t.Fatalf("parent after reverse coordinator = %+v, %v; want running", parent, err)
+	}
+
+	handoffDelivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: handoffDelivery.ID, ExpectedVersion: handoffDelivery.Version, State: store.JobRunning, Actor: "worker", Reason: "consume queued Standard handoff",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := runtime.handleStandardAuthoringHandoff(ctx, handoffDelivery)
+	if err != nil || state != store.JobSucceeded {
+		t.Fatalf("consume Standard handoff = %s, %v", state, err)
+	}
+	handoffDelivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: handoffDelivery.ID, ExpectedVersion: handoffDelivery.Version, State: state, Actor: "worker", Reason: "record Standard handoff delivery",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+handoffDelivery.ID)
+	if err != nil || completion == nil || completion.State != store.JobQueued {
+		t.Fatalf("handoff completion coordinator = %+v, %v", completion, err)
+	}
+	if err := runtime.completeExecutionIfSatisfied(ctx, *completion, fixture.run, frozen, plan); err != nil {
+		t.Fatalf("post-handoff completion = %v", err)
+	}
+	parent, err = fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parent == nil || parent.Status != store.WorkflowRunSucceeded {
+		t.Fatalf("parent after bound child = %+v, %v; want succeeded", parent, err)
+	}
+}
+
+func TestStandardAuthoringHandoffDefinitionHoldRequiresExplicitRedriveAndReusesChild(t *testing.T) {
+	ctx := context.Background()
+	fixture := newStandardAuthoringHandoffFixture(t)
+	queueStandardAuthoringInitialCoordinator(t, ctx, fixture)
+	withoutDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &FrozenExecutionRuntime{core: withoutDefinition.core, services: withoutDefinition}
+	stageJob := store.DurableJob{CreatedBy: "worker", Priority: 7}
+	if err := runtime.enqueueStandardAuthoringHandoff(ctx, stageJob, fixture.run, fixture.stageAttempt); err != nil {
+		t.Fatal(err)
+	}
+	original, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-handoff:"+fixture.stageAttempt.ID)
+	if err != nil || original == nil {
+		t.Fatalf("original handoff job = %+v, %v", original, err)
+	}
+	originalDelivery := *original
+	originalDelivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: originalDelivery.ID, ExpectedVersion: originalDelivery.Version, State: store.JobRunning, Actor: "worker", Reason: "attempt unavailable Standard handoff",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, holdErr := runtime.handleStandardAuthoringHandoff(ctx, originalDelivery)
+	if state != store.JobInDoubt || !errors.Is(holdErr, ErrCodeEdgePhase1DefinitionUnavailable) {
+		t.Fatalf("definition hold = state %s err %v; want in_doubt/unavailable", state, holdErr)
+	}
+	originalDelivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: originalDelivery.ID, ExpectedVersion: originalDelivery.Version, State: state, Actor: "worker", Reason: "record unavailable Standard handoff hold",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if originalDelivery.FinishedAt == nil {
+		t.Fatalf("in_doubt handoff must finish its current delivery: %+v", originalDelivery)
+	}
+	payload, err := standardAuthoringHandoffJobPayload(originalDelivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	withDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+		OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
+		CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := RedriveStandardAuthoringHandoffCommand{AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "install approved Phase-1 definition"}
+	redrive, err := withDefinition.StandardAuthoringHandoffs.Redrive(ctx, command)
+	if err != nil || redrive.CommandType != standardAuthoringHandoffRedriveCommandType || redrive.State != store.JobQueued || redrive.PayloadJSON != originalDelivery.PayloadJSON {
+		t.Fatalf("explicit handoff redrive = %+v, %v", redrive, err)
+	}
+	replayed, err := withDefinition.StandardAuthoringHandoffs.Redrive(ctx, command)
+	if err != nil || replayed.ID != redrive.ID {
+		t.Fatalf("same redrive command did not replay its durable job: %+v, %v", replayed, err)
+	}
+	originalAfter, err := fixture.database.GetDurableJob(ctx, original.ID)
+	if err != nil || originalAfter == nil || originalAfter.State != store.JobInDoubt {
+		t.Fatalf("original handoff redrive fact = %+v, %v; want in_doubt", originalAfter, err)
+	}
+
+	runtime = &FrozenExecutionRuntime{core: withDefinition.core, services: withDefinition}
+	redrive, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: redrive.ID, ExpectedVersion: redrive.Version, State: store.JobRunning, Actor: "worker", Reason: "consume explicit Standard handoff redrive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = runtime.handleStandardAuthoringHandoff(ctx, redrive)
+	if err != nil || state != store.JobSucceeded {
+		t.Fatalf("redrive handoff delivery = %s, %v", state, err)
+	}
+	if _, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: redrive.ID, ExpectedVersion: redrive.Version, State: state, Actor: "worker", Reason: "record explicit Standard handoff redrive",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	child, err := fixture.database.GetWorkflowRun(ctx, payload.ChildRunID)
+	if err != nil || child == nil || child.ID != payload.ChildRunID || child.ParentRunID != fixture.run.ID {
+		t.Fatalf("redriven child = %+v, %v; want original child identity %s", child, err, payload.ChildRunID)
+	}
+	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+original.ID)
+	if err != nil || completion == nil || completion.CommandType != "workflow_run.execute" {
+		t.Fatalf("redrive completion coordinator = %+v, %v", completion, err)
+	}
+	jobs, err := fixture.database.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completionCount := 0
+	for _, job := range jobs {
+		if job.IdempotencyKey == "standard-authoring-completion:"+original.ID {
+			completionCount++
+		}
+	}
+	if completionCount != 1 {
+		t.Fatalf("redrive completion coordinators = %d; want exactly one", completionCount)
+	}
+}
+
+func TestRecoveredStandardAuthoringHandoffCreatesCompletionAfterChildWasPersisted(t *testing.T) {
+	ctx := context.Background()
+	fixture := newStandardAuthoringHandoffFixture(t)
+	initial := queueStandardAuthoringInitialCoordinator(t, ctx, fixture)
+	withDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+		OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
+		CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &FrozenExecutionRuntime{core: withDefinition.core, services: withDefinition}
+	stageJob := store.DurableJob{CreatedBy: "worker", Priority: 7}
+	if err := runtime.enqueueStandardAuthoringHandoff(ctx, stageJob, fixture.run, fixture.stageAttempt); err != nil {
+		t.Fatal(err)
+	}
+	original, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-handoff:"+fixture.stageAttempt.ID)
+	if err != nil || original == nil {
+		t.Fatalf("original recoverable handoff job = %+v, %v", original, err)
+	}
+	payload, err := standardAuthoringHandoffJobPayload(*original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash window after Consume commits the child but before the
+	// handler publishes its completion coordinator or records JobSucceeded.
+	child, err := withDefinition.StandardAuthoringHandoffs.Consume(ctx, StandardAuthoringHandoffRequest{
+		AuthoringRunID: payload.AuthoringRunID, StageAttemptID: payload.StageAttemptID, HandoffArtifactID: payload.HandoffArtifactID,
+		ChildRunID: payload.ChildRunID, Actor: "worker", Reason: "persist child before simulated worker loss",
+	})
+	if err != nil || child.ID != payload.ChildRunID {
+		t.Fatalf("persist child before recovery = %+v, %v", child, err)
+	}
+	delivery, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: original.ID, ExpectedVersion: original.Version, State: store.JobRunning, Actor: "worker", Reason: "simulate claimed handoff delivery",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: store.JobInterrupted, Actor: "recovery", Reason: "simulate expired worker lease",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime = &FrozenExecutionRuntime{core: withoutDefinition.core, services: withoutDefinition}
+	if err := runtime.reconcileRecoveredStandardAuthoringHandoff(ctx, delivery); err != nil {
+		t.Fatalf("recover child-persisted Standard handoff without provider = %v", err)
+	}
+	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+original.ID)
+	if err != nil || completion == nil || completion.State != store.JobQueued {
+		t.Fatalf("recovered completion coordinator = %+v, %v", completion, err)
+	}
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := frozenRunDefinition{Workflow: resolved.Descriptor}
+	plan := runtimeExecutionPlan{
+		Workflow: resolved.Descriptor,
+		Transitions: map[workflowkit.StageKey]workflowkit.NodeTransition{
+			workflowkit.StageKey(workflowadapter.MaterializeTask): {
+				NodeID: workflowkit.StageKey(workflowadapter.MaterializeTask), FromGeneration: 0, ToGeneration: 0,
+				Disposition: workflowkit.DispositionSchedule,
+			},
+		},
+	}
+	if err := runtime.completeExecutionIfSatisfied(ctx, initial, fixture.run, frozen, plan); err != nil {
+		t.Fatalf("recovered handoff completion barrier = %v", err)
+	}
+	parent, err := fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parent == nil || parent.Status != store.WorkflowRunSucceeded {
+		t.Fatalf("parent after recovered child handoff = %+v, %v; want succeeded", parent, err)
+	}
+}
+
+func TestStandardAuthoringHandoffRedriveRejectsUnavailableDefinitionAndNonInDoubtDelivery(t *testing.T) {
+	ctx := context.Background()
+	t.Run("definition unavailable", func(t *testing.T) {
+		fixture := newStandardAuthoringHandoffFixture(t)
+		services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := store.NewUUIDv7()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = services.StandardAuthoringHandoffs.Redrive(ctx, RedriveStandardAuthoringHandoffCommand{AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "attempt unavailable redrive"})
+		if !errors.Is(err, ErrCodeEdgePhase1DefinitionUnavailable) {
+			t.Fatalf("redrive without definition = %v, want unavailable", err)
+		}
+	})
+	t.Run("original delivery is not in doubt", func(t *testing.T) {
+		fixture := newStandardAuthoringHandoffFixture(t)
+		services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+			OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
+			CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime := &FrozenExecutionRuntime{core: services.core, services: services}
+		if err := runtime.enqueueStandardAuthoringHandoff(ctx, store.DurableJob{CreatedBy: "worker"}, fixture.run, fixture.stageAttempt); err != nil {
+			t.Fatal(err)
+		}
+		key, err := store.NewUUIDv7()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = services.StandardAuthoringHandoffs.Redrive(ctx, RedriveStandardAuthoringHandoffCommand{AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "reject queued original redrive"})
+		if err == nil || !strings.Contains(err.Error(), "not eligible") {
+			t.Fatalf("redrive queued original = %v; want not eligible", err)
+		}
+	})
+}
+
+func standardAuthoringHandoffDefinitionProvider(t *testing.T) CodeEdgePhase1RunDefinitionProvider {
+	t.Helper()
+	return codeEdgePhase1DefinitionProviderFunc(func(_ context.Context, definition CodeEdgePhase1RunDefinitionRequest) (CodeEdgePhase1RunDefinition, error) {
+		return CodeEdgePhase1RunDefinition{
+			Profile:       lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate()),
+			ExecutionSpec: testsupport.CompleteCodeEdgePhase1RunExecutionSpec(definition.TaskID, definition.RevisionID, string(definition.RevisionDigest)),
+		}, nil
+	})
+}
+
+// queueStandardAuthoringInitialCoordinator mirrors the immutable initial
+// dispatch written by StartAuthoringRun. The materializer fixture persists
+// only the terminal stage facts, so it needs this durable parent handoff to
+// exercise the same completion path as a production authoring Run.
+func queueStandardAuthoringInitialCoordinator(t *testing.T, ctx context.Context, fixture standardAuthoringHandoffFixture) store.DurableJob {
+	t.Helper()
+	payload, err := json.Marshal(workflowRunExecutionPayload{
+		Format:                   workflowRunExecutionPayloadFormat,
+		RunID:                    fixture.run.ID,
+		DefinitionHash:           fixture.run.DefinitionHash,
+		ExecutionSpecFingerprint: workflowkit.SHA256Fingerprint([]byte("standard authoring handoff fixture execution spec")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := fixture.database.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "workflow_run.execute", EntityType: "workflow_run", EntityID: fixture.run.ID, RunID: fixture.run.ID,
+		PayloadJSON: string(payload), IdempotencyKey: "workflow-run-execution:" + fixture.run.ID,
+		Actor: "worker", Reason: "queue frozen authoring initial coordinator fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return job
 }
 
 type standardAuthoringHandoffFixture struct {

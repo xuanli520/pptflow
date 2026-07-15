@@ -128,4 +128,3 @@ func (resolver *TemplateWorkflowkitProviderOperationResolver) ResolveWorkflowkit
 }
 
 var _ WorkflowkitProviderOperationResolver = (*TemplateWorkflowkitProviderOperationResolver)(nil)
-

@@ -1059,6 +1059,7 @@ func newAuthoringCommand(config *lifecycleCLIConfig) *cobra.Command {
 	command.AddCommand(
 		newAuthoringStartCommand(config),
 		newAuthoringReviewCommand(config),
+		newAuthoringHandoffCommand(config),
 	)
 	return command
 }

@@ -43,6 +43,7 @@ type StandardAuthoringAttestedAgentTurnBridgeConfig struct {
 	Verifier       DeploymentOperationCatalogLockVerifier
 	Attestor       StandardAuthoringCodexAppServerOperationAttestor
 	WorkspaceRoot  string
+	WorkspaceMode  StandardAuthoringCodexWorkspaceMode
 	ProgramByStage map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
 	RuntimeFactory StandardAuthoringCodexRuntimeFactory
 	Now            func() time.Time
@@ -57,6 +58,7 @@ type StandardAuthoringAttestedAgentTurnBridgeDeploymentConfig struct {
 	Verifier       DeploymentOperationCatalogLockVerifier
 	Attestor       StandardAuthoringCodexDeploymentAttestor
 	WorkspaceRoot  string
+	WorkspaceMode  StandardAuthoringCodexWorkspaceMode
 	RuntimeFactory StandardAuthoringCodexRuntimeFactory
 	Now            func() time.Time
 }
@@ -72,6 +74,7 @@ type StandardAuthoringAttestedAgentTurnBridge struct {
 	verifier         DeploymentOperationCatalogLockVerifier
 	attestor         StandardAuthoringCodexAppServerOperationAttestor
 	workspaceRoot    string
+	workspaceMode    StandardAuthoringCodexWorkspaceMode
 	runtimeFactory   StandardAuthoringCodexRuntimeFactory
 	now              func() time.Time
 	programForEffect standardAuthoringCodexProgramFactory
@@ -95,7 +98,7 @@ func NewStandardAuthoringAttestedAgentTurnBridge(config StandardAuthoringAtteste
 		}
 		programs[stageKey] = program.clone()
 	}
-	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.RuntimeFactory, config.Now)
+	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.WorkspaceMode, config.RuntimeFactory, config.Now)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +121,7 @@ func NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(config StandardAu
 	if isNilInterface(config.Attestor) {
 		return nil, ErrDeploymentOperationRuntimeAttestationUnavailable
 	}
-	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.RuntimeFactory, config.Now)
+	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.WorkspaceMode, config.RuntimeFactory, config.Now)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +131,7 @@ func NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(config StandardAu
 	return bridge, nil
 }
 
-func newStandardAuthoringAttestedAgentTurnBridge(verifier DeploymentOperationCatalogLockVerifier, attestor StandardAuthoringCodexAppServerOperationAttestor, workspaceRoot string, runtimeFactory StandardAuthoringCodexRuntimeFactory, now func() time.Time) (*StandardAuthoringAttestedAgentTurnBridge, error) {
+func newStandardAuthoringAttestedAgentTurnBridge(verifier DeploymentOperationCatalogLockVerifier, attestor StandardAuthoringCodexAppServerOperationAttestor, workspaceRoot string, workspaceMode StandardAuthoringCodexWorkspaceMode, runtimeFactory StandardAuthoringCodexRuntimeFactory, now func() time.Time) (*StandardAuthoringAttestedAgentTurnBridge, error) {
 	if isNilDeploymentOperationCatalogLockVerifier(verifier) {
 		return nil, ErrDeploymentOperationCatalogLockUnavailable
 	}
@@ -142,8 +145,12 @@ func newStandardAuthoringAttestedAgentTurnBridge(verifier DeploymentOperationCat
 	if err != nil {
 		return nil, err
 	}
+	mode, err := standardAuthoringCodexWorkspaceMode(workspaceMode)
+	if err != nil {
+		return nil, err
+	}
 	return &StandardAuthoringAttestedAgentTurnBridge{
-		verifier: verifier, attestor: attestor, workspaceRoot: root, runtimeFactory: runtimeFactory, now: now,
+		verifier: verifier, attestor: attestor, workspaceRoot: root, workspaceMode: mode, runtimeFactory: runtimeFactory, now: now,
 	}, nil
 }
 
@@ -167,6 +174,7 @@ func (bridge *StandardAuthoringAttestedAgentTurnBridge) ExecuteAgentTurn(ctx con
 			return bridge.attestInvocationForEffect(factoryCtx, factoryInvocation, factoryPayload, program)
 		},
 		WorkspaceRoot:  bridge.workspaceRoot,
+		WorkspaceMode:  bridge.workspaceMode,
 		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{invocation.Request.Stage.Key: program},
 		RuntimeFactory: bridge.runtimeFactory,
 		Now:            bridge.now,

@@ -5,7 +5,6 @@
 package evaluator
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -27,10 +26,7 @@ import (
 )
 
 const (
-	maxTaskSnapshotZIPBytes   = 32 << 20
-	maxTaskSnapshotFileBytes  = 16 << 20
-	maxTaskSnapshotTotalBytes = 48 << 20
-	maxTranscriptBytes        = 24 << 10
+	maxTranscriptBytes = 24 << 10
 
 	// forbiddenLocalEvaluatorCredentialEnvironment is deliberately forbidden
 	// from this local-only evaluator. Model credentials have their separately
@@ -185,10 +181,6 @@ func (executor *HarborEvaluatorLocalCommandExecutor) ExecuteLocalCommand(ctx con
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("read frozen Harbor task snapshot: %w", err)
 	}
-	if len(snapshot) == 0 || len(snapshot) > maxTaskSnapshotZIPBytes {
-		return workflowkit.StageExecutionResult{}, errors.New("frozen Harbor task snapshot ZIP has invalid size")
-	}
-
 	workspace, err := executor.workspace(invocation.Request)
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
@@ -826,75 +818,7 @@ func extractManagedTaskSnapshot(ctx context.Context, raw []byte, destination str
 	if err := expected.Validate(); err != nil {
 		return fmt.Errorf("expected task digest: %w", err)
 	}
-	reader, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
-	if err != nil {
-		return fmt.Errorf("read task snapshot ZIP: %w", err)
-	}
-	allowed := make(map[string]taskpolicy.CanonicalFile)
-	for _, file := range taskpolicy.CanonicalFiles() {
-		allowed["task/"+file.Path] = file
-	}
-	if err := os.Mkdir(destination, 0o700); err != nil {
-		return err
-	}
-	seen := make(map[string]struct{}, len(allowed))
-	var total uint64
-	for _, entry := range reader.File {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if entry.Name == "" || strings.Contains(entry.Name, "\\\\") || strings.HasPrefix(entry.Name, "/") || strings.Contains(entry.Name, "../") || strings.HasPrefix(entry.Name, "../") || filepath.Clean(entry.Name) != entry.Name {
-			return errors.New("task snapshot ZIP contains an unsafe path")
-		}
-		canonical, allowedEntry := allowed[entry.Name]
-		if !allowedEntry || entry.FileInfo().IsDir() || entry.FileInfo().Mode()&os.ModeSymlink != 0 || !entry.FileInfo().Mode().IsRegular() {
-			return errors.New("task snapshot ZIP contains an unexpected or non-regular entry")
-		}
-		if _, duplicate := seen[entry.Name]; duplicate {
-			return errors.New("task snapshot ZIP contains a duplicate entry")
-		}
-		if entry.UncompressedSize64 > maxTaskSnapshotFileBytes || entry.UncompressedSize64 > maxTaskSnapshotTotalBytes-total {
-			return errors.New("task snapshot ZIP exceeds extraction limits")
-		}
-		seen[entry.Name] = struct{}{}
-		total += entry.UncompressedSize64
-		path := filepath.Join(destination, filepath.FromSlash(canonical.Path))
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return err
-		}
-		input, openErr := entry.Open()
-		if openErr != nil {
-			return openErr
-		}
-		output, createErr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, canonical.Mode)
-		if createErr != nil {
-			_ = input.Close()
-			return createErr
-		}
-		written, copyErr := io.Copy(output, io.LimitReader(input, int64(entry.UncompressedSize64)+1))
-		closeOutputErr := output.Close()
-		closeInputErr := input.Close()
-		if copyErr != nil || closeOutputErr != nil || closeInputErr != nil || uint64(written) != entry.UncompressedSize64 {
-			return errors.New("extract task snapshot ZIP entry")
-		}
-		if err := os.Chmod(path, canonical.Mode); err != nil {
-			return err
-		}
-	}
-	if len(seen) == 0 {
-		return errors.New("task snapshot ZIP is empty")
-	}
-	if err := taskpolicy.ValidateManagedSnapshotV2(destination); err != nil {
-		return err
-	}
-	digest, err := taskpolicy.ComputeManagedTaskDigestV2(destination)
-	if err != nil {
-		return err
-	}
-	if workflowkit.SubjectDigest(digest) != expected {
-		return errors.New("materialized task snapshot digest does not equal frozen subject")
-	}
-	return nil
+	return taskpolicy.ExtractManagedSnapshotV2ZIP(ctx, raw, destination, string(expected))
 }
 
 var _ stageprovider.LocalCommandOperationExecutor = (*HarborEvaluatorLocalCommandExecutor)(nil)

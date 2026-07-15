@@ -250,8 +250,9 @@ func standardAuthoringDeploymentTestLock(t *testing.T, catalog *DeploymentOperat
 	return DeploymentOperationCatalogLock{
 		Format: DeploymentOperationCatalogLockFormat, Version: DeploymentOperationCatalogLockVersion,
 		LockID: "standard-authoring-deployment-assets-test", LockVersion: "test-v1", CatalogReceipt: catalog.Receipt(),
-		HarborFlowBuild: HarborFlowBuildIdentity{Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("test build"))},
-		Operations:      operations,
+		HarborFlowBuild:                   HarborFlowBuildIdentity{Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("test build"))},
+		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
+		Operations:                        operations,
 	}
 }
 

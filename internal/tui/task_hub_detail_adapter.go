@@ -14,6 +14,11 @@ import (
 
 var _ TaskHubDetailReader = (*AppTaskHubLifecycleAdapter)(nil)
 
+const (
+	taskHubStandardAuthoringHandoffCommandType        = "standard_authoring.handoff"
+	taskHubStandardAuthoringHandoffRedriveCommandType = "standard_authoring.handoff.redrive"
+)
+
 // QueryTaskHubDetail projects a joined lifecycle inspection snapshot into the
 // UI-safe Task/Run detail model. It performs no writes and never reads a
 // workspace, revision snapshot, artifact payload, or package path from TUI.
@@ -107,6 +112,19 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 			})
 		}
 		detail.Runs = append(detail.Runs, projection)
+		if run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+			handoff, handoffErr := dataStore.GetAuthoringPhase1HandoffForAuthoringRun(ctx, run.ID)
+			var child *store.WorkflowRun
+			if handoffErr == nil && handoff != nil {
+				child, handoffErr = dataStore.GetWorkflowRun(ctx, handoff.ChildRunID)
+			}
+			// This is deliberately non-fatal. A detail view must distinguish a
+			// storage read failure from a missing bridge and must not reveal the
+			// underlying storage error or infer a child from parent_run_id.
+			detail.StandardAuthoringPhase1Handoffs = append(detail.StandardAuthoringPhase1Handoffs,
+				taskHubStandardAuthoringPhase1HandoffFact(run, inspection.Task, revisionsByID, runInspection.Jobs, handoff, child, handoffErr))
+		}
 		if taskHubIsCodeEdgePhase1Run(run) {
 			record, recordErr := dataStore.GetCodeEdgeComplianceRecordForRun(ctx, run.ID)
 			if recordErr != nil {
@@ -235,6 +253,85 @@ func (adapter *AppTaskHubLifecycleAdapter) QueryTaskHubDetail(ctx context.Contex
 		detail.Repairs = append(detail.Repairs, projection)
 	}
 	return detail, nil
+}
+
+// taskHubStandardAuthoringPhase1HandoffFact projects the exact durable bridge
+// owned by a Standard authoring parent. It treats a lookup error as a distinct
+// unavailable state so callers never confuse it with an absent handoff.
+func taskHubStandardAuthoringPhase1HandoffFact(parent store.WorkflowRun, task store.TaskV2, revisions map[string]store.TaskRevision, jobs []app.DurableJobInspection, handoff *store.AuthoringPhase1Handoff, child *store.WorkflowRun, lookupErr error) TaskHubStandardAuthoringPhase1HandoffFact {
+	fact := TaskHubStandardAuthoringPhase1HandoffFact{
+		AuthoringRunID: parent.ID,
+		State:          TaskHubStandardAuthoringPhase1HandoffNotRecorded,
+	}
+	matchingJobs := make([]store.DurableJob, 0, 1)
+	var latestRedrive *store.DurableJob
+	for _, inspection := range jobs {
+		if inspection.Job.CommandType == taskHubStandardAuthoringHandoffCommandType {
+			matchingJobs = append(matchingJobs, inspection.Job)
+		}
+		if inspection.Job.CommandType == taskHubStandardAuthoringHandoffRedriveCommandType &&
+			(latestRedrive == nil || inspection.Job.CreatedAt.After(latestRedrive.CreatedAt) ||
+				(inspection.Job.CreatedAt.Equal(latestRedrive.CreatedAt) && inspection.Job.ID > latestRedrive.ID)) {
+			candidate := inspection.Job
+			latestRedrive = &candidate
+		}
+	}
+	if len(matchingJobs) == 1 {
+		fact.JobState = string(matchingJobs[0].State)
+	}
+	if latestRedrive != nil {
+		fact.RedriveJobState = string(latestRedrive.State)
+	}
+	if lookupErr != nil {
+		fact.State = TaskHubStandardAuthoringPhase1HandoffUnavailable
+		return fact
+	}
+	if len(matchingJobs) > 1 {
+		fact.State = TaskHubStandardAuthoringPhase1HandoffInvalid
+		return fact
+	}
+	if handoff == nil {
+		if len(matchingJobs) == 1 {
+			fact.State = TaskHubStandardAuthoringPhase1HandoffPending
+		}
+		return fact
+	}
+
+	fact.HandoffID = handoff.ID
+	fact.ChildRunID = handoff.ChildRunID
+	fact.HandoffFingerprint = handoff.HandoffFingerprint
+	fact.RecordedAt = handoff.CreatedAt
+	revision, found := revisions[handoff.RevisionID]
+	if parent.SubjectKind != store.WorkflowRunSubjectAuthoringSession ||
+		parent.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
+		parent.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion ||
+		store.ValidateUUIDv7(handoff.ID) != nil || store.ValidateUUIDv7(handoff.ChildRunID) != nil ||
+		workflowkit.Fingerprint(strings.TrimSpace(handoff.HandoffFingerprint)).Validate() != nil ||
+		handoff.AuthoringRunID != parent.ID || handoff.AuthoringSessionID != parent.AuthoringSessionID ||
+		handoff.AuthoringSourceID != parent.SubjectID || handoff.TaskID != task.ID || !found ||
+		revision.TaskID != task.ID || handoff.TaskDigest != revision.TaskDigest ||
+		store.ValidateTaskDigestV2(handoff.TaskDigest) != nil {
+		fact.State = TaskHubStandardAuthoringPhase1HandoffInvalid
+		return fact
+	}
+	if child == nil {
+		if fact.JobState == string(store.JobSucceeded) {
+			fact.State = TaskHubStandardAuthoringPhase1HandoffInvalid
+			return fact
+		}
+		fact.State = TaskHubStandardAuthoringPhase1HandoffPending
+		return fact
+	}
+	if child.ID != handoff.ChildRunID || child.ParentRunID != parent.ID ||
+		child.SubjectKind != store.WorkflowRunSubjectTaskRevision || child.TaskID != handoff.TaskID ||
+		child.RevisionID != handoff.RevisionID || child.SubjectDigest != handoff.TaskDigest ||
+		child.WorkflowTemplateID != workflowadapter.CodeEdgePhase1WorkflowTemplateID ||
+		child.WorkflowTemplateVersion != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion {
+		fact.State = TaskHubStandardAuthoringPhase1HandoffInvalid
+		return fact
+	}
+	fact.State = TaskHubStandardAuthoringPhase1HandoffBound
+	return fact
 }
 
 func taskHubCodeEdgeEvaluatorEvidenceHandoffFact(parent store.WorkflowRun, revision store.TaskRevision, handoff *store.CodeEdgeEvaluatorEvidenceHandoff, child *store.WorkflowRun) TaskHubCodeEdgeEvaluatorEvidenceHandoffFact {

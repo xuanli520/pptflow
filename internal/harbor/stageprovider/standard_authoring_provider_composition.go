@@ -47,6 +47,7 @@ type StandardAuthoringProviderCompositionConfig struct {
 	Attestor            *StandardAuthoringRuntimeAttestor
 	Handlers            StandardAuthoringOperationHandlers
 	CodexWorkspaceRoot  string
+	CodexWorkspaceMode  StandardAuthoringCodexWorkspaceMode
 	CodexRuntimeFactory StandardAuthoringCodexRuntimeFactory
 	CodexNow            func() time.Time
 }
@@ -132,6 +133,7 @@ func NewStandardAuthoringProviderComposition(config StandardAuthoringProviderCom
 	if requiresAgentTurn && isNilAgentTurnOperationExecutor(agentTurn) {
 		bridge, err := NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(StandardAuthoringAttestedAgentTurnBridgeDeploymentConfig{
 			Verifier: verifier, Attestor: config.Attestor, WorkspaceRoot: config.CodexWorkspaceRoot,
+			WorkspaceMode:  config.CodexWorkspaceMode,
 			RuntimeFactory: config.CodexRuntimeFactory, Now: config.CodexNow,
 		})
 		if err != nil {

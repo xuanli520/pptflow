@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +178,50 @@ func TestStandardAuthoringCodexAgentTurnExecutorRejectsModelAndPromptProgramDrif
 	})
 	if !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
 		t.Fatalf("tampered prompt program error = %v, want configuration failure", err)
+	}
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPreparedRunDirectory(t *testing.T) {
+	stage := standardAuthoringCodexTestStage(1)
+	now := time.Date(2026, 7, 15, 8, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	runID := "018f0a73-3b49-7000-8000-0000000000d1"
+	program, err := NewStandardAuthoringCodexTurnProgram("standard-authoring.repo-analysis", "1", standardAuthoringCodexTestPrompts(1), 64*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{results: []agent.TurnResult{{
+		Model: CodexAppServerProductionModelID, Text: standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("analysis")),
+	}}}}
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: root,
+		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	request.Execution.ID = runID
+	invocation := StageOperationInvocation{Request: request, Resolution: workflowadapter.StageOperationResolution{
+		StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: workflowadapter.AgentTurnOperationPayload{
+			AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1,
+		}},
+	}}
+	result, err := executor.ExecuteAgentTurn(context.Background(), invocation, workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1})
+	if err != nil || result.ErrorText != standardAuthoringCodexFailureConfiguration || len(runtime.openRequests) != 0 {
+		t.Fatalf("unprepared RunScoped workspace result=%+v err=%v opens=%d", result, err, len(runtime.openRequests))
+	}
+	workspace := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
+	if err := os.MkdirAll(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	result, err = executor.ExecuteAgentTurn(context.Background(), invocation, workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1})
+	if err != nil || result.Outcome.Status != workflowkit.StatusCompleted || len(runtime.openRequests) != 1 {
+		t.Fatalf("prepared RunScoped workspace result=%+v err=%v opens=%d", result, err, len(runtime.openRequests))
+	}
+	if runtime.openRequests[0].ProjectPath != workspace || len(runtime.openRequests[0].WorkspaceRoots) != 1 || runtime.openRequests[0].WorkspaceRoots[0] != workspace {
+		t.Fatalf("RunScoped Codex workspace = %+v, want %q", runtime.openRequests[0], workspace)
 	}
 }
 

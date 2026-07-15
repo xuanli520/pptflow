@@ -4,9 +4,10 @@ set -euo pipefail
 # Generate the final immutable Standard-authoring deployment lock from a clean
 # committed source snapshot. This script deliberately does not inspect model
 # credentials, endpoints, or arbitrary environment variables. The caller must
-# provide every host/model identity as an explicit flag accepted by the Go
-# generator, including --build-version, --lock-version, --git-executable,
-# --codex-node, --codex-launcher, --codex-home, and --codex-model-version.
+# provide every host/model identity and the source-controlled complete
+# --execution-profile accepted by the Go generator, including --build-version,
+# --lock-version, --git-executable, --codex-node, --codex-launcher,
+# --codex-home, and --codex-model-version.
 
 die() {
   echo "generate-standard-authoring-lock: $*" >&2
@@ -20,10 +21,11 @@ fi
 
 catalog="$root/deployments/standard-authoring/operation-catalog.v1.json"
 assets="$root/deployments/standard-authoring/contract-assets.v1.json"
+profile="$root/deployments/standard-authoring/execution-profile.v1.json"
 contract_root="$root/deployments/standard-authoring"
 output="$root/deployments/standard-authoring/operation-catalog.lock.json"
 
-for file in "$catalog" "$assets"; do
+for file in "$catalog" "$assets" "$profile"; do
   if [[ ! -f "$file" || -L "$file" ]]; then
     die "required regular deployment file is unavailable: $file"
   fi
@@ -36,6 +38,7 @@ exec env GOFLAGS= go run -mod=readonly ./tools/standard-authoring-lock-build \
   --source-root "$root" \
   --catalog "$catalog" \
   --asset-manifest "$assets" \
+  --execution-profile "$profile" \
   --contract-root "$contract_root" \
   --output "$output" \
   "$@"

@@ -301,10 +301,11 @@ func (s *Store) ScanExpiredDurableJobsForReconcile(ctx context.Context, request 
 			return nil, err
 		}
 		// The dispatch fence is the loss signal. Keep a paired capacity lease
-		// active until the terminal job projection below releases every active
-		// job lease in one place, even when its own TTL elapsed concurrently.
+		// active until the delivery-final job projection below releases every
+		// active job lease in one place, even when its own TTL elapsed
+		// concurrently.
 		job := *claim.Job
-		if !isTerminalJobState(job.State) {
+		if !isJobDeliveryFinalState(job.State) {
 			job.State = JobInterrupted
 			job.UpdatedAt = now
 			job.FinishedAt = &now
@@ -323,9 +324,12 @@ func (s *Store) ScanExpiredDurableJobsForReconcile(ctx context.Context, request 
 			if changed != 1 {
 				return nil, fmt.Errorf("%w: durable job %s", ErrOptimisticLock, job.ID)
 			}
-			if err := s.releaseJobLeasesTx(ctx, tx, job.ID, resolveActor(request.Actor), now); err != nil {
-				return nil, err
-			}
+		}
+		// New delivery-final transitions release leases synchronously. Keep this
+		// cleanup for a historical in_doubt record whose worker died before that
+		// invariant existed, so it cannot retain capacity indefinitely.
+		if err := s.releaseJobLeasesTx(ctx, tx, job.ID, resolveActor(request.Actor), now); err != nil {
+			return nil, err
 		}
 		claim.State = "expired"
 		claim.UpdatedAt = now

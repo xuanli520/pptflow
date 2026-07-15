@@ -18,7 +18,10 @@ import (
 )
 
 const (
-	codeEdgeProductionDeploymentDirectory = "deployments/codeedge-phase1"
+	// This is the evaluator-child bundle, not the Phase-1 parent bundle. The
+	// parent now owns deployments/codeedge-phase1; sharing that directory would
+	// let a child-only lock be mistaken for parent authority.
+	codeEdgeProductionDeploymentDirectory = "deployments/codeedge-evaluator-child"
 	codeEdgeProductionCatalogFile         = "operation-catalog.v1.json"
 	codeEdgeProductionLockFile            = "operation-catalog.lock.json"
 )
@@ -77,6 +80,18 @@ type codeEdgeProductionCompositionConfig struct {
 	LookupEnvironment         func(string) (string, bool)
 }
 
+// codeEdgeEvaluatorProductionComposition is the one closed capability bundle
+// for the evaluator child.  It intentionally does not construct lifecycle
+// services itself: root production composition combines this independent
+// child bundle with the distinct Standard-authoring and CodeEdge parent
+// bundles through the template router.
+type codeEdgeEvaluatorProductionComposition struct {
+	Resolver       *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
+	CatalogBinding app.TemplateDeploymentCatalogResolver
+	Definitions    app.EvaluatorRunDefinitionProvider
+	Observer       app.CodeEdgeEvaluatorCompletedObserver
+}
+
 // newCodeEdgeProductionLifecycleServices is the sole real-provider service
 // composition used by the CLI, Task Hub, foreground worker, and detached
 // worker. It is deliberately narrow: this installation approves only the
@@ -120,11 +135,29 @@ func preflightCodeEdgeProductionLifecycleServices(root string) error {
 }
 
 func newCodeEdgeProductionLifecycleServicesWithConfig(root string, dataStore *store.Store, config codeEdgeProductionCompositionConfig) (*app.LifecycleServices, error) {
+	composition, err := newCodeEdgeEvaluatorProductionCompositionWithConfig(root, dataStore, config)
+	if err != nil {
+		return nil, err
+	}
+	return app.NewLifecycleServicesWithOptions(root, dataStore, app.LifecycleServicesOptions{
+		OperationResolver:              composition.Resolver,
+		DeploymentCatalogResolver:      composition.Resolver,
+		RequireDeploymentCatalog:       true,
+		RequireDeploymentLock:          true,
+		EvaluatorRunDefinitionProvider: composition.Definitions,
+		CodeEdgeEvaluatorObserver:      composition.Observer,
+	})
+}
+
+// newCodeEdgeEvaluatorProductionCompositionWithConfig constructs only the
+// independently attested evaluator-child capability.  It has no parent
+// fallback and never installs a lifecycle service with this catalog alone.
+func newCodeEdgeEvaluatorProductionCompositionWithConfig(root string, dataStore *store.Store, config codeEdgeProductionCompositionConfig) (*codeEdgeEvaluatorProductionComposition, error) {
 	if strings.TrimSpace(root) == "" {
-		return nil, fmt.Errorf("managed root is required for CodeEdge production composition")
+		return nil, fmt.Errorf("managed root is required for CodeEdge evaluator production composition")
 	}
 	if dataStore == nil {
-		return nil, fmt.Errorf("lifecycle store is required for CodeEdge production composition")
+		return nil, fmt.Errorf("lifecycle store is required for CodeEdge evaluator production composition")
 	}
 	binding := codeEdgeProductionBuildBinding{
 		HarborFlowBuild:           config.HarborFlowBuild,
@@ -238,14 +271,14 @@ func newCodeEdgeProductionLifecycleServicesWithConfig(root string, dataStore *st
 	if err != nil {
 		return nil, fmt.Errorf("bind CodeEdge provider to deployment lock and attestor: %w", err)
 	}
-	return app.NewLifecycleServicesWithOptions(root, dataStore, app.LifecycleServicesOptions{
-		OperationResolver:              resolver,
-		DeploymentCatalogResolver:      resolver,
-		RequireDeploymentCatalog:       true,
-		RequireDeploymentLock:          true,
-		EvaluatorRunDefinitionProvider: evaluatorDefinitions,
-		CodeEdgeEvaluatorObserver:      observer,
-	})
+	return &codeEdgeEvaluatorProductionComposition{
+		Resolver: resolver,
+		CatalogBinding: app.TemplateDeploymentCatalogResolver{
+			Template: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(), Resolver: resolver,
+		},
+		Definitions: evaluatorDefinitions,
+		Observer:    observer,
+	}, nil
 }
 
 func linkedCodeEdgeProductionBuildBinding() (codeEdgeProductionBuildBinding, error) {

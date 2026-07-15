@@ -93,6 +93,15 @@ type Report struct {
 	Metadata    Metadata
 }
 
+// ValidateProfile verifies the explicit, deployment-owned policy inputs
+// before a worker accepts a task snapshot. It exposes no parsed task data and
+// never reads credentials or environment values.
+func ValidateProfile(profile Profile) error {
+	collector := newViolationCollector()
+	validateProfile(profile, collector)
+	return collector.err()
+}
+
 // Violation is one stable diagnostic emitted by the preflight. Code identifies
 // the policy family, Path identifies the managed task-relative input when
 // applicable, and Message is suitable for an operator-facing receipt.

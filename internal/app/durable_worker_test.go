@@ -113,6 +113,65 @@ func TestDurableWorkerProjectsHandlerFailureWithoutFalseSuccess(t *testing.T) {
 	}
 }
 
+func TestDurableWorkerProjectsInDoubtAsDeliveryFinalWithoutAutoRetry(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := store.OpenForTest(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	job, err := dataStore.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "test.execute", EntityType: "test", EntityID: "subject", PayloadJSON: `{}`,
+		IdempotencyKey: "durable-worker-in-doubt", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := dataStore.ConfigureCapacityPool(ctx, store.ConfigureCapacityPoolRequest{
+		PoolKey: "durable-worker-in-doubt", Capacity: 1, Actor: "tester", Reason: "reserve in_doubt worker capacity",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold := errors.New("controlled definition is unavailable")
+	worker, err := NewDurableWorker(DurableWorkerConfig{
+		Store: dataStore, Owner: "worker-in-doubt", Actor: "tester", Reason: "test in_doubt delivery", CapacityPoolKey: pool.PoolKey,
+		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) {
+			return store.JobInDoubt, hold
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := worker.RunOnce(ctx)
+	if !errors.Is(err, hold) || result.FinalState != store.JobInDoubt || result.Job == nil || result.Job.ID != job.ID {
+		t.Fatalf("in_doubt worker result = %+v, %v", result, err)
+	}
+	persisted, err := dataStore.GetDurableJob(ctx, job.ID)
+	if err != nil || persisted == nil || persisted.State != store.JobInDoubt || persisted.FinishedAt == nil {
+		t.Fatalf("in_doubt durable job = %+v, %v", persisted, err)
+	}
+	if _, err := dataStore.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: persisted.ID, ExpectedVersion: persisted.Version, State: store.JobRunning, Actor: "tester", Reason: "attempt implicit retry",
+	}); !errors.Is(err, store.ErrInvalidTransition) {
+		t.Fatalf("in_doubt delivery resumed without explicit redrive = %v, want invalid transition", err)
+	}
+	for _, leaseID := range []string{result.Claim.DispatchLease.ID, result.Claim.CapacityLease.ID} {
+		lease, leaseErr := dataStore.GetLease(ctx, leaseID)
+		if leaseErr != nil || lease == nil || lease.State != store.LeaseReleased {
+			t.Fatalf("in_doubt lease %s = %+v, %v; want released", leaseID, lease, leaseErr)
+		}
+	}
+	recoveries, err := dataStore.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{Actor: "tester", Reason: "verify in_doubt has no active dispatch"})
+	if err != nil || len(recoveries) != 0 {
+		t.Fatalf("in_doubt job entered expired recovery despite released delivery: %+v, %v", recoveries, err)
+	}
+	second, err := worker.RunOnce(ctx)
+	if err != nil || !second.Empty {
+		t.Fatalf("in_doubt job was retried without explicit redrive: %+v, %v", second, err)
+	}
+}
+
 func TestDurableWorkerHeartbeatsDispatchFenceDuringActiveHandler(t *testing.T) {
 	ctx := context.Background()
 	dataStore, err := store.OpenForTest(t.TempDir())

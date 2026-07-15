@@ -47,21 +47,18 @@ func (binding standardAuthoringProductionBuildBinding) Validate() error {
 }
 
 // standardAuthoringProductionCompositionConfig contains only deployment-owned
-// capability wiring. In particular, HostCommand is a required typed Git stage
-// implementation; this helper never synthesizes a shell command, PATH
-// fallback, or no-op repo_prepare executor.
+// static inputs. The repo_prepare executor is constructed here from the
+// generated lock and managed root; callers cannot inject a shell command,
+// PATH fallback, no-op, or alternate workspace implementation.
 type standardAuthoringProductionCompositionConfig struct {
 	CatalogPath               string
 	LockPath                  string
 	ContractRoot              string
-	CodexWorkspaceRoot        string
 	ManagedRoot               string
 	Store                     *store.Store
-	Profile                   workflowadapter.ExecutionProfile
 	HarborFlowBuild           stageprovider.HarborFlowBuildIdentity
 	CatalogReceiptFingerprint workflowkit.Fingerprint
 	LockIdentity              stageprovider.DeploymentOperationCatalogLockIdentity
-	HostCommand               stageprovider.LocalCommandOperationExecutor
 }
 
 // standardAuthoringProductionComposition is a template-keyed capability
@@ -85,13 +82,6 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	if config.Store == nil || strings.TrimSpace(config.ManagedRoot) == "" {
 		return nil, fmt.Errorf("Standard authoring production managed root and Store are required")
 	}
-	if !config.Profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return nil, fmt.Errorf("Standard authoring production execution profile is required")
-	}
-	if err := config.Profile.Validate(); err != nil {
-		return nil, fmt.Errorf("validate Standard authoring production execution profile: %w", err)
-	}
-
 	bundle, err := stageprovider.LoadStandardAuthoringDeploymentAssetBundle(config.CatalogPath, config.LockPath, config.ContractRoot)
 	if err != nil {
 		return nil, fmt.Errorf("load Standard authoring production deployment assets: %w", err)
@@ -105,6 +95,10 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	}
 	if receiptFingerprint != binding.CatalogReceiptFingerprint || bundle.Verifier.LockIdentity() != binding.LockIdentity {
 		return nil, fmt.Errorf("Standard authoring production catalog/lock does not match the installed binary binding")
+	}
+	profile, err := bundle.Lock.StandardAuthoringProfile()
+	if err != nil {
+		return nil, fmt.Errorf("load lock-owned Standard authoring execution profile: %w", err)
 	}
 	attestor, err := stageprovider.NewStandardAuthoringRuntimeAttestor(stageprovider.StandardAuthoringRuntimeAttestorConfig{
 		HarborFlowBuild: binding.HarborFlowBuild, ContractRoot: bundle.ContractRoot,
@@ -120,19 +114,30 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring source capturer: %w", err)
 	}
+	workspaceRoot, err := app.StandardAuthoringCodexWorkspaceRoot(config.ManagedRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Standard authoring Codex workspace root: %w", err)
+	}
+	repoPrepare, err := app.NewStandardAuthoringRepoPrepareExecutor(app.StandardAuthoringRepoPrepareExecutorConfig{
+		ManagedRoot: config.ManagedRoot, Store: config.Store, LockedGit: lockedGit, WorkspaceRoot: workspaceRoot,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("construct Standard authoring repo_prepare executor: %w", err)
+	}
 	materializer, err := app.NewStandardAuthoringMaterializeExecutor(app.StandardAuthoringMaterializeExecutorConfig{ManagedRoot: config.ManagedRoot, Store: config.Store})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring materializer: %w", err)
 	}
 	providers, err := stageprovider.NewStandardAuthoringProviderComposition(stageprovider.StandardAuthoringProviderCompositionConfig{
 		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: bundle.Catalog, Lock: bundle.Lock, Attestor: attestor,
-		Handlers:           stageprovider.StandardAuthoringOperationHandlers{HostCommand: config.HostCommand, HarborBuiltin: materializer},
-		CodexWorkspaceRoot: config.CodexWorkspaceRoot,
+		Handlers:           stageprovider.StandardAuthoringOperationHandlers{HostCommand: repoPrepare, HarborBuiltin: materializer},
+		CodexWorkspaceRoot: workspaceRoot,
+		CodexWorkspaceMode: stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring provider composition: %w", err)
 	}
-	definitions, err := app.NewCatalogStandardAuthoringRunDefinitionProvider(bundle.Catalog, config.Profile)
+	definitions, err := app.NewCatalogStandardAuthoringRunDefinitionProvider(bundle.Catalog, profile)
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring run definition provider: %w", err)
 	}

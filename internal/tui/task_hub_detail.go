@@ -107,9 +107,9 @@ type TaskHubDetail struct {
 	// source/session Standard authoring Run to its one task-bound CodeEdge
 	// Phase-1 child. It never starts, retries, or otherwise controls that child.
 	StandardAuthoringPhase1Handoffs []TaskHubStandardAuthoringPhase1HandoffFact `json:"standard_authoring_phase1_handoffs,omitempty"`
-	Releases                          []TaskHubReleaseFact                          `json:"releases,omitempty"`
-	Artifacts                         []TaskHubArtifactFact                         `json:"artifacts,omitempty"`
-	Reviews                           []TaskHubReviewFact                           `json:"reviews,omitempty"`
+	Releases                        []TaskHubReleaseFact                        `json:"releases,omitempty"`
+	Artifacts                       []TaskHubArtifactFact                       `json:"artifacts,omitempty"`
+	Reviews                         []TaskHubReviewFact                         `json:"reviews,omitempty"`
 	// AuthoringReviews are source/session gates shown before the draft Task
 	// receives a real TaskRevision. They intentionally remain separate from
 	// Reviews so selection cannot manufacture a revision identity.
@@ -234,13 +234,17 @@ const (
 // identities and its delivery-job state. It excludes the handoff document,
 // artifact bytes, provider definition, raw job payload, and storage errors.
 type TaskHubStandardAuthoringPhase1HandoffFact struct {
-	AuthoringRunID     string                                        `json:"authoring_run_id"`
-	State              TaskHubStandardAuthoringPhase1HandoffState    `json:"state"`
-	HandoffID          string                                        `json:"handoff_id,omitempty"`
-	ChildRunID         string                                        `json:"child_run_id,omitempty"`
-	HandoffFingerprint string                                        `json:"handoff_fingerprint,omitempty"`
-	JobState           string                                        `json:"job_state,omitempty"`
-	RecordedAt         time.Time                                     `json:"recorded_at,omitempty"`
+	AuthoringRunID     string                                     `json:"authoring_run_id"`
+	State              TaskHubStandardAuthoringPhase1HandoffState `json:"state"`
+	HandoffID          string                                     `json:"handoff_id,omitempty"`
+	ChildRunID         string                                     `json:"child_run_id,omitempty"`
+	HandoffFingerprint string                                     `json:"handoff_fingerprint,omitempty"`
+	JobState           string                                     `json:"job_state,omitempty"`
+	// RedriveJobState is the latest explicit redrive delivery state, if an
+	// operator has requested one. It intentionally exposes no actor, reason,
+	// payload, provider definition, or runtime error details.
+	RedriveJobState string    `json:"redrive_job_state,omitempty"`
+	RecordedAt      time.Time `json:"recorded_at,omitempty"`
 }
 
 // TaskHubFrozenExecutionState describes whether the projection can prove the
@@ -1034,7 +1038,20 @@ func (overlay *TaskHubDetailOverlay) standardAuthoringPhase1HandoffRows(runID st
 		case TaskHubStandardAuthoringPhase1HandoffNotRecorded:
 			rows = append(rows, warnStyle.Render("状态：尚未记录 Phase-1 handoff；不会从父子 Run 关系或当前配置推测 child。"))
 		case TaskHubStandardAuthoringPhase1HandoffPending:
-			rows = append(rows, warnStyle.Render("状态：已等待 Phase-1 child；TUI 不会启动、重试或交接该 Run。"))
+			switch fact.RedriveJobState {
+			case "queued", "running":
+				rows = append(rows, warnStyle.Render("状态：已显式 redrive Phase-1 handoff，正在等待受控 delivery；TUI 不会重复提交。"))
+			case "in_doubt":
+				rows = append(rows, warnStyle.Render("状态：最新 redrive delivery 仍为 in_doubt；须由操作员核对受控 definition 后重新 redrive。"))
+			case "succeeded":
+				rows = append(rows, warnStyle.Render("状态：redrive delivery 已完成，但 child 绑定尚未可读；不会推测 child。"))
+			default:
+				if fact.JobState == "in_doubt" {
+					rows = append(rows, warnStyle.Render("状态：Phase-1 handoff delivery 为 in_doubt；须由操作员在受控 definition 到位后显式 redrive。"))
+				} else {
+					rows = append(rows, warnStyle.Render("状态：已等待 Phase-1 child；TUI 不会启动、重试或交接该 Run。"))
+				}
+			}
 		case TaskHubStandardAuthoringPhase1HandoffBound:
 			rows = append(rows, "状态：已记录并绑定到受管 Phase-1 child；执行状态仍以 child Run 为准。")
 		case TaskHubStandardAuthoringPhase1HandoffInvalid:
@@ -1057,6 +1074,9 @@ func (overlay *TaskHubDetailOverlay) standardAuthoringPhase1HandoffRows(runID st
 			rows = append(rows, "durable job 状态："+fact.JobState)
 		} else {
 			rows = append(rows, "durable job 状态：未记录")
+		}
+		if fact.RedriveJobState != "" {
+			rows = append(rows, "最新 redrive delivery 状态："+fact.RedriveJobState)
 		}
 		if !fact.RecordedAt.IsZero() {
 			rows = append(rows, "记录时间："+taskHubDetailTime(fact.RecordedAt))

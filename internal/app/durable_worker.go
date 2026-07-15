@@ -156,9 +156,11 @@ type DurableWorkerResult struct {
 }
 
 // RunOnce first reconciles expired worker fences, then atomically claims and
-// executes one queued job. A claimed job always receives a terminal durable
-// projection unless a lease is lost, in which case recovery owns the later
-// interrupted/reconcile projection instead of a stale worker guessing it.
+// executes one queued job. A claimed job always receives a delivery-final
+// durable projection unless a lease is lost, in which case recovery owns the
+// later interrupted/reconcile projection instead of a stale worker guessing
+// it. JobInDoubt is delivery-final; a new explicit redrive job owns any later
+// attempt.
 func (worker *DurableWorker) RunOnce(ctx context.Context) (DurableWorkerResult, error) {
 	if err := worker.validate(); err != nil {
 		return DurableWorkerResult{}, err
@@ -314,7 +316,7 @@ func (worker *DurableWorker) reasonFor(action string) string {
 
 func isWorkerTerminalJobState(state store.JobState) bool {
 	switch state {
-	case store.JobSucceeded, store.JobFailed, store.JobCanceled, store.JobInterrupted:
+	case store.JobSucceeded, store.JobFailed, store.JobCanceled, store.JobInterrupted, store.JobInDoubt:
 		return true
 	default:
 		return false

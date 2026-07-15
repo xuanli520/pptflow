@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/testsupport"
@@ -147,6 +148,7 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 	lock := DeploymentOperationCatalogLock{
 		Format: DeploymentOperationCatalogLockFormat, Version: DeploymentOperationCatalogLockVersion,
 		LockID: "standard-authoring-agent-only-composition-test-lock", LockVersion: "test-v1", CatalogReceipt: catalog.Receipt(), HarborFlowBuild: fixture.attestation.HarborFlowBuild,
+		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
 		Operations: []DeploymentOperationCatalogLockRecord{{
 			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
 			Checkout: registration.Checkout, Secrets: append([]workflowadapter.SecretReference{}, registration.Secrets...),
@@ -212,6 +214,7 @@ func standardAuthoringProviderCompositionFixture(t *testing.T) (*DeploymentOpera
 			Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("standard-authoring-provider-composition")),
 		},
+		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
 		Operations: []DeploymentOperationCatalogLockRecord{
 			{
 				Stage: builtinStageContract(t, builtin), Provider: builtin.Provider, Operation: builtin.Operation.Clone(), Runtime: builtin.Runtime,
@@ -281,4 +284,39 @@ func builtinStageContract(t *testing.T, resolution workflowadapter.StageOperatio
 		t.Fatalf("stage %q is missing", resolution.StageKey)
 	}
 	return DeploymentStageContract{Key: resolution.StageKey, Type: resolution.StageType, Group: definition.Group, Plugin: resolution.Plugin}
+}
+
+func standardAuthoringTestExecutionProfile(t *testing.T) workflowadapter.ExecutionProfile {
+	t.Helper()
+	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	profile := workflowadapter.ExecutionProfile{
+		Template:                template.Reference(),
+		ID:                      "standard-authoring-lock-test",
+		Version:                 "1.0.0",
+		ContinuationPlanTTL:     workflowadapter.RequiredContinuationPlanTTL,
+		ControlGracePeriod:      time.Minute,
+		CandidateProviderBudget: workflowadapter.CandidateProviderBudget{AttemptTimeout: 5 * time.Minute},
+		Stages:                  make([]workflowadapter.StageBudget, 0, len(template.Catalog.Stages)),
+	}
+	for _, stage := range template.Catalog.Stages {
+		turns := stage.RequiredTurns
+		if turns < 1 {
+			turns = 1
+		}
+		attempt := time.Duration(turns) * time.Minute
+		profile.Stages = append(profile.Stages, workflowadapter.StageBudget{
+			StageKey: stage.Key,
+			Budget: workflowkit.ExecutionBudget{
+				TurnTimeout:    time.Minute,
+				MaxTurns:       turns,
+				AttemptTimeout: attempt,
+				MaxAttempts:    1,
+				MaxElapsed:     attempt,
+			},
+		})
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("build complete Standard authoring test execution profile: %v", err)
+	}
+	return profile
 }

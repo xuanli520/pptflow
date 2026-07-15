@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -96,6 +97,206 @@ func (identity HarborFlowBuildIdentity) Validate() error {
 // admitting an untyped configuration bag.
 type CodeEdgeEvaluatorChildExecutionProfileLock struct {
 	Profile workflowadapter.ExecutionProfile `json:"-"`
+}
+
+// CodeEdgePhase1ExecutionProfileLock is the complete, deployment-owned
+// execution envelope for the task-revision CodeEdge Phase-1 parent. It is a
+// separate lock field rather than a generic profile option: only the parent
+// template may carry it, and a handoff provider never derives it from an
+// AuthoringSession, evaluator child, or caller request.
+//
+// Its JSON representation is workflowadapter.ExecutionProfile's canonical
+// document. The enclosing deployment lock therefore makes every budget,
+// continuation, and candidate-provider limit fingerprint-significant.
+type CodeEdgePhase1ExecutionProfileLock struct {
+	Profile workflowadapter.ExecutionProfile `json:"-"`
+}
+
+// StandardAuthoringExecutionProfileLock is the complete, deployment-owned
+// execution envelope for the Standard authoring template. It is deliberately
+// a template-specific lock field: authoring starts cannot accept a caller
+// budget, derive a profile from a handoff, or fall back to a process default.
+//
+// Its JSON representation is workflowadapter.ExecutionProfile's canonical
+// document. The enclosing deployment lock therefore makes every stage budget,
+// continuation limit, and provider timing value fingerprint-significant.
+type StandardAuthoringExecutionProfileLock struct {
+	Profile workflowadapter.ExecutionProfile `json:"-"`
+}
+
+// Clone returns independently owned profile data.
+func (profile StandardAuthoringExecutionProfileLock) Clone() StandardAuthoringExecutionProfileLock {
+	profile.Profile = profile.Profile.Clone()
+	return profile
+}
+
+// Validate proves that the profile is complete for exactly the closed Standard
+// authoring template.
+func (profile StandardAuthoringExecutionProfileLock) Validate() error {
+	if !profile.Profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+		return fmt.Errorf("%w: Standard authoring execution profile must bind %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	}
+	if err := profile.Profile.Validate(); err != nil {
+		return fmt.Errorf("%w: Standard authoring execution profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	return nil
+}
+
+// ExecutionProfile returns a validated defensive copy suitable for controlled
+// Standard composition. It has no caller-profile or default-profile fallback.
+func (profile StandardAuthoringExecutionProfileLock) ExecutionProfile() (workflowadapter.ExecutionProfile, error) {
+	if err := profile.Validate(); err != nil {
+		return workflowadapter.ExecutionProfile{}, err
+	}
+	return profile.Profile.Clone(), nil
+}
+
+// MarshalJSON persists exactly the canonical execution profile document.
+func (profile StandardAuthoringExecutionProfileLock) MarshalJSON() ([]byte, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	return profile.Profile.CanonicalJSON()
+}
+
+// UnmarshalJSON accepts only the strict workflowadapter execution profile
+// document. The enclosing lock parser rejects duplicate keys before this
+// method is reached.
+func (profile *StandardAuthoringExecutionProfileLock) UnmarshalJSON(raw []byte) error {
+	if profile == nil {
+		return fmt.Errorf("%w: nil Standard authoring execution profile", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	parsed, err := workflowadapter.ParseExecutionProfileJSON(raw)
+	if err != nil {
+		return fmt.Errorf("%w: decode Standard authoring execution profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	resolved := StandardAuthoringExecutionProfileLock{Profile: parsed}
+	if err := resolved.Validate(); err != nil {
+		return err
+	}
+	*profile = resolved
+	return nil
+}
+
+// Clone returns independently owned profile data.
+func (profile CodeEdgePhase1ExecutionProfileLock) Clone() CodeEdgePhase1ExecutionProfileLock {
+	profile.Profile = profile.Profile.Clone()
+	return profile
+}
+
+// Validate proves that the profile is complete for exactly the closed parent
+// template. ExecutionProfile validation enforces the complete 15-stage
+// envelope, so an incomplete parent cannot be admitted through a lock.
+func (profile CodeEdgePhase1ExecutionProfileLock) Validate() error {
+	if !profile.Profile.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
+		return fmt.Errorf("%w: CodeEdge Phase-1 execution profile must bind %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.CodeEdgePhase1WorkflowTemplateID, workflowadapter.CodeEdgePhase1WorkflowTemplateVersion)
+	}
+	if err := profile.Profile.Validate(); err != nil {
+		return fmt.Errorf("%w: CodeEdge Phase-1 execution profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	return nil
+}
+
+// ExecutionProfile returns a validated defensive copy suitable for controlled
+// composition. It intentionally has no parent-profile fallback.
+func (profile CodeEdgePhase1ExecutionProfileLock) ExecutionProfile() (workflowadapter.ExecutionProfile, error) {
+	if err := profile.Validate(); err != nil {
+		return workflowadapter.ExecutionProfile{}, err
+	}
+	return profile.Profile.Clone(), nil
+}
+
+// MarshalJSON persists exactly the canonical execution profile document.
+func (profile CodeEdgePhase1ExecutionProfileLock) MarshalJSON() ([]byte, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	return profile.Profile.CanonicalJSON()
+}
+
+// UnmarshalJSON accepts only the strict workflowadapter execution profile
+// document. The enclosing lock parser rejects duplicate keys before this
+// method is reached.
+func (profile *CodeEdgePhase1ExecutionProfileLock) UnmarshalJSON(raw []byte) error {
+	if profile == nil {
+		return fmt.Errorf("%w: nil CodeEdge Phase-1 execution profile", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	parsed, err := workflowadapter.ParseExecutionProfileJSON(raw)
+	if err != nil {
+		return fmt.Errorf("%w: decode CodeEdge Phase-1 execution profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	resolved := CodeEdgePhase1ExecutionProfileLock{Profile: parsed}
+	if err := resolved.Validate(); err != nil {
+		return err
+	}
+	*profile = resolved
+	return nil
+}
+
+// CodeEdgePhase1FinalCompliancePolicyLock pins the complete typed policy that
+// the parent Run must freeze into its execution specification. It has no
+// arbitrary map or string payload: parser, validation, canonicalization, and
+// cloning are delegated to the closed CodeEdge policy contract.
+type CodeEdgePhase1FinalCompliancePolicyLock struct {
+	Policy codeedge.FinalCompliancePolicy `json:"-"`
+}
+
+// Clone returns independently owned policy data.
+func (policy CodeEdgePhase1FinalCompliancePolicyLock) Clone() CodeEdgePhase1FinalCompliancePolicyLock {
+	policy.Policy = policy.Policy.Clone()
+	return policy
+}
+
+// Validate proves the policy can govern exactly the parent submission
+// contract. The submission report schema is a template-level invariant, not
+// a deployment choice that an operator or caller may change.
+func (policy CodeEdgePhase1FinalCompliancePolicyLock) Validate() error {
+	if err := policy.Policy.Validate(); err != nil {
+		return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	if policy.Policy.SubmissionReportSchemaVersion != workflowadapter.CodeEdgeSubmissionReportSchemaVersion {
+		return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy submission report schema %q, want %q", ErrInvalidDeploymentOperationCatalogLock, policy.Policy.SubmissionReportSchemaVersion, workflowadapter.CodeEdgeSubmissionReportSchemaVersion)
+	}
+	return nil
+}
+
+// FinalCompliancePolicy returns a validated defensive copy suitable for the
+// lock-owned parent definition provider.
+func (policy CodeEdgePhase1FinalCompliancePolicyLock) FinalCompliancePolicy() (codeedge.FinalCompliancePolicy, error) {
+	if err := policy.Validate(); err != nil {
+		return codeedge.FinalCompliancePolicy{}, err
+	}
+	return policy.Policy.Clone(), nil
+}
+
+// MarshalJSON persists the policy's canonical typed representation.
+func (policy CodeEdgePhase1FinalCompliancePolicyLock) MarshalJSON() ([]byte, error) {
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	return policy.Policy.CanonicalJSON()
+}
+
+// UnmarshalJSON accepts only a strict full typed policy document. The
+// deployment-lock parser's recursive duplicate-key check is intentionally
+// repeated for direct decoding callers as well.
+func (policy *CodeEdgePhase1FinalCompliancePolicyLock) UnmarshalJSON(raw []byte) error {
+	if policy == nil {
+		return fmt.Errorf("%w: nil CodeEdge Phase-1 final compliance policy", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if err := rejectDuplicateDeploymentCatalogJSONKeys(raw); err != nil {
+		return fmt.Errorf("%w: decode CodeEdge Phase-1 final compliance policy: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	var parsed codeedge.FinalCompliancePolicy
+	if err := decodeDeploymentCatalogJSON(raw, &parsed); err != nil {
+		return fmt.Errorf("%w: decode CodeEdge Phase-1 final compliance policy: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	resolved := CodeEdgePhase1FinalCompliancePolicyLock{Policy: parsed}
+	if err := resolved.Validate(); err != nil {
+		return err
+	}
+	*policy = resolved
+	return nil
 }
 
 // Clone returns independently owned profile data so inspection callers cannot
@@ -490,15 +691,30 @@ type DeploymentOperationCatalogLock struct {
 	LockVersion                            string                                      `json:"lock_version"`
 	CatalogReceipt                         DeploymentOperationCatalogReceipt           `json:"catalog_receipt"`
 	HarborFlowBuild                        HarborFlowBuildIdentity                     `json:"harbor_flow_build"`
+	StandardAuthoringExecutionProfile      *StandardAuthoringExecutionProfileLock      `json:"standard_authoring_execution_profile,omitempty"`
 	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
+	CodeEdgePhase1ExecutionProfile         *CodeEdgePhase1ExecutionProfileLock         `json:"codeedge_phase1_execution_profile,omitempty"`
+	CodeEdgePhase1FinalCompliancePolicy    *CodeEdgePhase1FinalCompliancePolicyLock    `json:"codeedge_phase1_final_compliance_policy,omitempty"`
 	Operations                             []DeploymentOperationCatalogLockRecord      `json:"operations"`
 }
 
 // Clone returns a deep copy suitable for canonicalization and inspection.
 func (lock DeploymentOperationCatalogLock) Clone() DeploymentOperationCatalogLock {
+	if lock.StandardAuthoringExecutionProfile != nil {
+		profile := lock.StandardAuthoringExecutionProfile.Clone()
+		lock.StandardAuthoringExecutionProfile = &profile
+	}
 	if lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
 		profile := lock.CodeEdgeEvaluatorChildExecutionProfile.Clone()
 		lock.CodeEdgeEvaluatorChildExecutionProfile = &profile
+	}
+	if lock.CodeEdgePhase1ExecutionProfile != nil {
+		profile := lock.CodeEdgePhase1ExecutionProfile.Clone()
+		lock.CodeEdgePhase1ExecutionProfile = &profile
+	}
+	if lock.CodeEdgePhase1FinalCompliancePolicy != nil {
+		policy := lock.CodeEdgePhase1FinalCompliancePolicy.Clone()
+		lock.CodeEdgePhase1FinalCompliancePolicy = &policy
 	}
 	operations := lock.Operations
 	lock.Operations = make([]DeploymentOperationCatalogLockRecord, len(operations))
@@ -530,6 +746,16 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 	if err := lock.HarborFlowBuild.Validate(); err != nil {
 		return err
 	}
+	if lock.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+		if lock.StandardAuthoringExecutionProfile == nil {
+			return fmt.Errorf("%w: Standard authoring execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		if err := lock.StandardAuthoringExecutionProfile.Validate(); err != nil {
+			return err
+		}
+	} else if lock.StandardAuthoringExecutionProfile != nil {
+		return fmt.Errorf("%w: Standard authoring execution profile is only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	}
 	if lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
 		if !lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgeEvaluatorChildTemplateReference()) {
 			return fmt.Errorf("%w: CodeEdge evaluator child execution profile is only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID, workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion)
@@ -537,6 +763,22 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 		if err := lock.CodeEdgeEvaluatorChildExecutionProfile.Validate(); err != nil {
 			return err
 		}
+	}
+	if lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
+		if lock.CodeEdgePhase1ExecutionProfile == nil {
+			return fmt.Errorf("%w: CodeEdge Phase-1 execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		if lock.CodeEdgePhase1FinalCompliancePolicy == nil {
+			return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy is required", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		if err := lock.CodeEdgePhase1ExecutionProfile.Validate(); err != nil {
+			return err
+		}
+		if err := lock.CodeEdgePhase1FinalCompliancePolicy.Validate(); err != nil {
+			return err
+		}
+	} else if lock.CodeEdgePhase1ExecutionProfile != nil || lock.CodeEdgePhase1FinalCompliancePolicy != nil {
+		return fmt.Errorf("%w: CodeEdge Phase-1 execution profile and final compliance policy are only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.CodeEdgePhase1WorkflowTemplateID, workflowadapter.CodeEdgePhase1WorkflowTemplateVersion)
 	}
 	if lock.Operations == nil {
 		return fmt.Errorf("%w: operations must be an explicit array", ErrInvalidDeploymentOperationCatalogLock)
@@ -555,6 +797,19 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 	return validateStandardAuthoringLockContract(lock)
 }
 
+// StandardAuthoringProfile returns the required complete Standard authoring
+// execution envelope. A missing value is a hard deployment error: no CLI,
+// handoff, or production composition may provide a substitute budget policy.
+func (lock DeploymentOperationCatalogLock) StandardAuthoringProfile() (workflowadapter.ExecutionProfile, error) {
+	if !lock.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: Standard authoring profile requires the Standard authoring template", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if lock.StandardAuthoringExecutionProfile == nil {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: Standard authoring execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return lock.StandardAuthoringExecutionProfile.ExecutionProfile()
+}
+
 // CodeEdgeEvaluatorChildProfile returns the one complete child-owned profile
 // carried by this immutable lock. A missing value is intentionally an error:
 // production composition must never borrow a parent profile or invent a
@@ -564,6 +819,32 @@ func (lock DeploymentOperationCatalogLock) CodeEdgeEvaluatorChildProfile() (work
 		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: CodeEdge evaluator child execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	return lock.CodeEdgeEvaluatorChildExecutionProfile.ExecutionProfile()
+}
+
+// CodeEdgePhase1Profile returns the required complete parent-owned profile.
+// A missing value is a hard deployment error: no caller, Standard handoff, or
+// evaluator child may supply a substitute budget envelope.
+func (lock DeploymentOperationCatalogLock) CodeEdgePhase1Profile() (workflowadapter.ExecutionProfile, error) {
+	if !lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: CodeEdge Phase-1 profile requires the parent template", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if lock.CodeEdgePhase1ExecutionProfile == nil {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: CodeEdge Phase-1 execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return lock.CodeEdgePhase1ExecutionProfile.ExecutionProfile()
+}
+
+// CodeEdgePhase1FinalCompliance returns the complete typed final-compliance
+// policy required for the parent Run. It returns a defensive copy so neither
+// the caller nor a definition provider can mutate the installed lock.
+func (lock DeploymentOperationCatalogLock) CodeEdgePhase1FinalCompliance() (codeedge.FinalCompliancePolicy, error) {
+	if !lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
+		return codeedge.FinalCompliancePolicy{}, fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy requires the parent template", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if lock.CodeEdgePhase1FinalCompliancePolicy == nil {
+		return codeedge.FinalCompliancePolicy{}, fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy is required", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return lock.CodeEdgePhase1FinalCompliancePolicy.FinalCompliancePolicy()
 }
 
 // CanonicalJSON returns a validated stable lock representation. Operation and
@@ -620,7 +901,10 @@ func ParseDeploymentOperationCatalogLockJSON(raw []byte) (DeploymentOperationCat
 	lock := DeploymentOperationCatalogLock{
 		Format: document.Format, Version: document.Version, LockID: document.LockID, LockVersion: document.LockVersion,
 		CatalogReceipt: document.CatalogReceipt, HarborFlowBuild: document.HarborFlowBuild,
+		StandardAuthoringExecutionProfile:      document.StandardAuthoringExecutionProfile,
 		CodeEdgeEvaluatorChildExecutionProfile: document.CodeEdgeEvaluatorChildExecutionProfile,
+		CodeEdgePhase1ExecutionProfile:         document.CodeEdgePhase1ExecutionProfile,
+		CodeEdgePhase1FinalCompliancePolicy:    document.CodeEdgePhase1FinalCompliancePolicy,
 		Operations:                             document.Operations,
 	}
 	if err := lock.Validate(); err != nil {
@@ -649,7 +933,10 @@ type deploymentOperationCatalogLockDocument struct {
 	LockVersion                            string                                      `json:"lock_version"`
 	CatalogReceipt                         DeploymentOperationCatalogReceipt           `json:"catalog_receipt"`
 	HarborFlowBuild                        HarborFlowBuildIdentity                     `json:"harbor_flow_build"`
+	StandardAuthoringExecutionProfile      *StandardAuthoringExecutionProfileLock      `json:"standard_authoring_execution_profile,omitempty"`
 	CodeEdgeEvaluatorChildExecutionProfile *CodeEdgeEvaluatorChildExecutionProfileLock `json:"codeedge_evaluator_child_execution_profile,omitempty"`
+	CodeEdgePhase1ExecutionProfile         *CodeEdgePhase1ExecutionProfileLock         `json:"codeedge_phase1_execution_profile,omitempty"`
+	CodeEdgePhase1FinalCompliancePolicy    *CodeEdgePhase1FinalCompliancePolicyLock    `json:"codeedge_phase1_final_compliance_policy,omitempty"`
 	Operations                             []DeploymentOperationCatalogLockRecord      `json:"operations"`
 }
 

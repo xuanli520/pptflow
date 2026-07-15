@@ -219,7 +219,7 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 	if job.State == JobRunning && job.StartedAt == nil {
 		job.StartedAt = &now
 	}
-	if isTerminalJobState(job.State) {
+	if isJobDeliveryFinalState(job.State) {
 		job.FinishedAt = &now
 	}
 	job.Version++
@@ -237,7 +237,7 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 	if changed != 1 {
 		return DurableJob{}, fmt.Errorf("%w: job %s", ErrOptimisticLock, job.ID)
 	}
-	if isTerminalJobState(job.State) {
+	if isJobDeliveryFinalState(job.State) {
 		if err := s.releaseJobLeasesTx(ctx, tx, job.ID, resolveActor(request.Actor), now); err != nil {
 			return DurableJob{}, err
 		}
@@ -840,7 +840,7 @@ func validJobState(state JobState) bool {
 }
 
 func validJobTransition(from, to JobState) bool {
-	if from == to || isTerminalJobState(from) {
+	if from == to || isJobDeliveryFinalState(from) {
 		return false
 	}
 	switch from {
@@ -855,8 +855,6 @@ func validJobTransition(from, to JobState) bool {
 		return to == JobRunning || to == JobCancelRequested || to == JobCanceled
 	case JobCancelRequested, JobStopRequested:
 		return to == JobCanceled || to == JobInterrupted || to == JobInDoubt
-	case JobInDoubt:
-		return to == JobRunning || to == JobSucceeded || to == JobFailed || to == JobCanceled || to == JobInterrupted
 	default:
 		return false
 	}
@@ -869,4 +867,12 @@ func isTerminalJobState(state JobState) bool {
 	default:
 		return false
 	}
+}
+
+// isJobDeliveryFinalState identifies a completed worker delivery. in_doubt
+// remains a distinct reconciliation fact in the read model, but its current
+// delivery is closed: an operator must create a new controlled redrive job
+// rather than rewriting the original job back to running.
+func isJobDeliveryFinalState(state JobState) bool {
+	return isTerminalJobState(state) || state == JobInDoubt
 }

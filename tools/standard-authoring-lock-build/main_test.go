@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 func TestSourceBuildIdentityExcludesSelfReferentialLock(t *testing.T) {
@@ -66,6 +70,73 @@ func TestRequireCleanGitWorktreeRejectsUntrackedContent(t *testing.T) {
 	if err := requireCleanGitWorktree(root, git); err == nil {
 		t.Fatal("dirty worktree accepted")
 	}
+}
+
+func TestReadStandardAuthoringExecutionProfileRequiresExactCompleteProfile(t *testing.T) {
+	root := t.TempDir()
+	profile := standardAuthoringGeneratorTestProfile(t)
+	raw, err := profile.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "execution-profile.v1.json")
+	writeTestFile(t, path, string(raw))
+	loaded, err := readStandardAuthoringExecutionProfile(path)
+	if err != nil {
+		t.Fatalf("read valid Standard authoring execution profile: %v", err)
+	}
+	wantFingerprint, err := profile.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotFingerprint, err := loaded.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFingerprint != wantFingerprint {
+		t.Fatalf("loaded execution profile fingerprint = %s, want %s", gotFingerprint, wantFingerprint)
+	}
+
+	wrongTemplate := filepath.Join(root, "wrong-template.json")
+	writeTestFile(t, wrongTemplate, strings.Replace(string(raw), "harbor.standard-authoring", "harbor.standard", 1))
+	if _, err := readStandardAuthoringExecutionProfile(wrongTemplate); err == nil {
+		t.Fatal("non-Standard execution profile was accepted by the lock generator")
+	}
+}
+
+func standardAuthoringGeneratorTestProfile(t *testing.T) workflowadapter.ExecutionProfile {
+	t.Helper()
+	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	profile := workflowadapter.ExecutionProfile{
+		Template:                template.Reference(),
+		ID:                      "standard-authoring-generator-test",
+		Version:                 "1.0.0",
+		ContinuationPlanTTL:     workflowadapter.RequiredContinuationPlanTTL,
+		ControlGracePeriod:      time.Minute,
+		CandidateProviderBudget: workflowadapter.CandidateProviderBudget{AttemptTimeout: 5 * time.Minute},
+		Stages:                  make([]workflowadapter.StageBudget, 0, len(template.Catalog.Stages)),
+	}
+	for _, stage := range template.Catalog.Stages {
+		turns := stage.RequiredTurns
+		if turns < 1 {
+			turns = 1
+		}
+		attempt := time.Duration(turns) * time.Minute
+		profile.Stages = append(profile.Stages, workflowadapter.StageBudget{
+			StageKey: stage.Key,
+			Budget: workflowkit.ExecutionBudget{
+				TurnTimeout:    time.Minute,
+				MaxTurns:       turns,
+				AttemptTimeout: attempt,
+				MaxAttempts:    1,
+				MaxElapsed:     attempt,
+			},
+		})
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("build Standard authoring generator test profile: %v", err)
+	}
+	return profile
 }
 
 func testGitExecutable(t *testing.T) string {

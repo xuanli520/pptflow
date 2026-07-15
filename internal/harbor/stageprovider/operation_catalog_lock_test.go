@@ -90,6 +90,58 @@ func TestDeploymentOperationCatalogLockCanonicalStrictJSONAndFingerprint(t *test
 	}
 }
 
+func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile(t *testing.T) {
+	catalog, lock, _ := standardAuthoringProviderCompositionFixture(t)
+	if _, err := NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
+		t.Fatalf("valid Standard authoring lock was rejected: %v", err)
+	}
+	profile, err := lock.StandardAuthoringProfile()
+	if err != nil {
+		t.Fatalf("read lock-owned Standard authoring profile: %v", err)
+	}
+	if len(profile.Stages) == 0 {
+		t.Fatal("Standard authoring test profile has no stage budgets")
+	}
+	profile.Stages[0].Budget.MaxAttempts = 99
+	again, err := lock.StandardAuthoringProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Stages[0].Budget.MaxAttempts == 99 {
+		t.Fatal("Standard authoring profile accessor leaked mutable lock state")
+	}
+
+	baseline, err := lock.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := lock.Clone()
+	changed.StandardAuthoringExecutionProfile.Profile.Version = "1.0.1"
+	updated, err := changed.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated == baseline {
+		t.Fatal("Standard authoring execution profile did not participate in lock fingerprint")
+	}
+
+	missing := lock.Clone()
+	missing.StandardAuthoringExecutionProfile = nil
+	if err := missing.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("Standard authoring lock without profile error = %v, want invalid lock", err)
+	}
+	wrongProfile := lock.Clone()
+	wrongProfile.StandardAuthoringExecutionProfile.Profile.Template = workflowadapter.StandardTemplateReference()
+	if err := wrongProfile.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("Standard authoring lock with another template's profile error = %v, want invalid lock", err)
+	}
+	_, nonStandardLock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare)
+	nonStandardLock.StandardAuthoringExecutionProfile = &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)}
+	if err := nonStandardLock.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("non-Standard lock carrying Standard profile error = %v, want invalid lock", err)
+	}
+}
+
 func TestDeploymentOperationCatalogLockRejectsDuplicateUnknownUnversionedAndReceiptDrift(t *testing.T) {
 	catalog, lock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare)
 	cases := []struct {

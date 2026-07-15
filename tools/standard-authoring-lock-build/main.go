@@ -35,6 +35,7 @@ type buildConfig struct {
 	sourceRoot        string
 	catalogPath       string
 	manifestPath      string
+	profilePath       string
 	contractRoot      string
 	outputPath        string
 	buildVersion      string
@@ -52,6 +53,7 @@ func main() {
 	flag.StringVar(&config.sourceRoot, "source-root", "", "clean Git worktree root")
 	flag.StringVar(&config.catalogPath, "catalog", "", "Standard authoring operation catalog")
 	flag.StringVar(&config.manifestPath, "asset-manifest", "", "Standard authoring contract asset manifest")
+	flag.StringVar(&config.profilePath, "execution-profile", "", "source-controlled complete Standard authoring execution profile")
 	flag.StringVar(&config.contractRoot, "contract-root", "", "directory containing prompt/schema assets")
 	flag.StringVar(&config.outputPath, "output", "", "new operation catalog lock output path")
 	flag.StringVar(&config.buildVersion, "build-version", "", "immutable Harbor Flow build version")
@@ -105,6 +107,10 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	}
 	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) {
 		return stageprovider.DeploymentOperationCatalogLock{}, errors.New("catalog must bind harbor.standard-authoring@1.0.0")
+	}
+	profile, err := readStandardAuthoringExecutionProfile(config.profilePath)
+	if err != nil {
+		return stageprovider.DeploymentOperationCatalogLock{}, err
 	}
 	manifestRaw, err := readRegularFile(config.manifestPath, maxAssetBytes)
 	if err != nil {
@@ -188,7 +194,9 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	}
 	lock := stageprovider.DeploymentOperationCatalogLock{
 		Format: stageprovider.DeploymentOperationCatalogLockFormat, Version: stageprovider.DeploymentOperationCatalogLockVersion,
-		LockID: config.lockID, LockVersion: config.lockVersion, CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build, Operations: operations,
+		LockID: config.lockID, LockVersion: config.lockVersion, CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build,
+		StandardAuthoringExecutionProfile: &stageprovider.StandardAuthoringExecutionProfileLock{Profile: profile},
+		Operations:                        operations,
 	}
 	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("validate generated catalog lock: %w", err)
@@ -196,12 +204,27 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	return lock, nil
 }
 
+func readStandardAuthoringExecutionProfile(path string) (workflowadapter.ExecutionProfile, error) {
+	raw, err := readRegularFile(path, maxAssetBytes)
+	if err != nil {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("read execution profile: %w", err)
+	}
+	profile, err := workflowadapter.ParseExecutionProfileJSON(raw)
+	if err != nil {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("parse Standard authoring execution profile: %w", err)
+	}
+	if !profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+		return workflowadapter.ExecutionProfile{}, errors.New("execution profile must bind harbor.standard-authoring@1.0.0")
+	}
+	return profile.Clone(), nil
+}
+
 func validateConfig(config *buildConfig) error {
 	if config == nil {
 		return errors.New("build configuration is required")
 	}
 	var err error
-	for _, field := range []*string{&config.sourceRoot, &config.catalogPath, &config.manifestPath, &config.contractRoot, &config.outputPath, &config.gitExecutable, &config.codexNode, &config.codexLauncher, &config.codexHome} {
+	for _, field := range []*string{&config.sourceRoot, &config.catalogPath, &config.manifestPath, &config.profilePath, &config.contractRoot, &config.outputPath, &config.gitExecutable, &config.codexNode, &config.codexLauncher, &config.codexHome} {
 		*field, err = cleanAbsolutePath(*field)
 		if err != nil {
 			return err
@@ -218,7 +241,7 @@ func validateConfig(config *buildConfig) error {
 	if _, err := os.Lstat(config.outputPath); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return errors.New("output lock must not already exist")
 	}
-	for label, path := range map[string]string{"catalog": config.catalogPath, "asset manifest": config.manifestPath} {
+	for label, path := range map[string]string{"catalog": config.catalogPath, "asset manifest": config.manifestPath, "execution profile": config.profilePath} {
 		if !pathWithin(config.sourceRoot, path) {
 			return fmt.Errorf("%s must be below source root", label)
 		}

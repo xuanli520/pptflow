@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	standardAuthoringHandoffCommandType   = "standard_authoring.handoff"
-	standardAuthoringHandoffPayloadFormat = "harbor.standard-authoring-handoff-job.v1"
-	standardAuthoringHandoffRunTrigger    = "standard-authoring.materialized"
+	standardAuthoringHandoffCommandType        = "standard_authoring.handoff"
+	standardAuthoringHandoffRedriveCommandType = "standard_authoring.handoff.redrive"
+	standardAuthoringHandoffPayloadFormat      = "harbor.standard-authoring-handoff-job.v1"
+	standardAuthoringHandoffRunTrigger         = "standard-authoring.materialized"
 )
 
 var (
@@ -75,6 +76,19 @@ type StandardAuthoringHandoffRequest struct {
 	Reason            string
 }
 
+// RedriveStandardAuthoringHandoffCommand is the explicit operator action for
+// a handoff delivery held in_doubt because a controlled Phase-1 definition was
+// unavailable or invalid. It publishes a separate durable delivery record;
+// it never rewrites the original in_doubt fact or allocates a new child Run.
+// The caller-provided key must be a UUIDv7 so a lost reply can be replayed
+// without creating another redrive delivery.
+type RedriveStandardAuthoringHandoffCommand struct {
+	AuthoringRunID string
+	IdempotencyKey string
+	Actor          string
+	Reason         string
+}
+
 // standardAuthoringHandoffPayload is intentionally small enough to be carried
 // by a durable local job. The artifact itself is re-read and fully verified at
 // execution time; this payload is an address, not an authority to fabricate a
@@ -102,6 +116,61 @@ type StandardAuthoringHandoffService struct {
 // Phase-1 profile from the authoring Run.
 func (service *StandardAuthoringHandoffService) Available() bool {
 	return service != nil && service.core != nil && service.core.store != nil && service.definitions != nil
+}
+
+// Redrive explicitly republishes an in_doubt Standard authoring handoff after
+// a controlled deployment definition has been installed or corrected. It is
+// deliberately not called by worker recovery: absence of a definition is a
+// deployment decision, not a transient execution failure.
+func (service *StandardAuthoringHandoffService) Redrive(ctx context.Context, command RedriveStandardAuthoringHandoffCommand) (store.DurableJob, error) {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return store.DurableJob{}, fmt.Errorf("Standard authoring handoff service is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return store.DurableJob{}, err
+	}
+	runID := strings.TrimSpace(command.AuthoringRunID)
+	key := strings.TrimSpace(command.IdempotencyKey)
+	actor := strings.TrimSpace(command.Actor)
+	reason := strings.TrimSpace(command.Reason)
+	if err := store.ValidateUUIDv7(runID); err != nil {
+		return store.DurableJob{}, fmt.Errorf("Standard authoring handoff redrive Run ID: %w", err)
+	}
+	if err := store.ValidateUUIDv7(key); err != nil {
+		return store.DurableJob{}, fmt.Errorf("Standard authoring handoff redrive idempotency key: %w", err)
+	}
+	if actor == "" || reason == "" {
+		return store.DurableJob{}, fmt.Errorf("Standard authoring handoff redrive actor and reason are required")
+	}
+	if !service.Available() {
+		return store.DurableJob{}, ErrCodeEdgePhase1DefinitionUnavailable
+	}
+	original, payload, err := standardAuthoringHandoffJobForRun(ctx, service.core.store, runID)
+	if err != nil {
+		return store.DurableJob{}, err
+	}
+	redriveKey := "standard-authoring-handoff-redrive:" + original.ID + ":" + key
+	if existing, err := service.core.store.GetDurableJobByIdempotency(ctx, redriveKey); err != nil {
+		return store.DurableJob{}, err
+	} else if existing != nil {
+		existingPayload, payloadErr := standardAuthoringHandoffJobPayload(*existing)
+		if payloadErr != nil || existing.CommandType != standardAuthoringHandoffRedriveCommandType ||
+			existingPayload != payload {
+			return store.DurableJob{}, fmt.Errorf("existing Standard authoring handoff redrive does not match its immutable payload")
+		}
+		return *existing, nil
+	}
+	if original.State != store.JobInDoubt {
+		return store.DurableJob{}, fmt.Errorf("Standard authoring handoff %s is %s, not eligible for explicit redrive", original.ID, original.State)
+	}
+	return service.core.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: standardAuthoringHandoffRedriveCommandType, EntityType: original.EntityType, EntityID: original.EntityID,
+		RunID: original.RunID, StageAttemptID: original.StageAttemptID, Priority: original.Priority, PayloadJSON: original.PayloadJSON,
+		IdempotencyKey: redriveKey, Actor: actor, Reason: reason,
+	})
 }
 
 // Consume creates or replays exactly one child Run. It accepts only the
@@ -395,7 +464,7 @@ func standardAuthoringHandoffJobPayload(job store.DurableJob) (standardAuthoring
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
 		return standardAuthoringHandoffPayload{}, fmt.Errorf("decode Standard authoring handoff payload: %w", err)
 	}
-	if job.CommandType != standardAuthoringHandoffCommandType || job.EntityType != "artifact_ref" ||
+	if (job.CommandType != standardAuthoringHandoffCommandType && job.CommandType != standardAuthoringHandoffRedriveCommandType) || job.EntityType != "artifact_ref" ||
 		payload.Format != standardAuthoringHandoffPayloadFormat || payload.AuthoringRunID != job.RunID ||
 		payload.StageAttemptID != job.StageAttemptID || payload.HandoffArtifactID != job.EntityID {
 		return standardAuthoringHandoffPayload{}, fmt.Errorf("Standard authoring handoff job does not match its immutable payload")
@@ -412,4 +481,36 @@ func standardAuthoringHandoffJobPayload(job store.DurableJob) (standardAuthoring
 		}
 	}
 	return payload, nil
+}
+
+// standardAuthoringHandoffJobForRun resolves the single original delivery
+// record. Redrive jobs deliberately do not participate here: the original job
+// holds the authoritative in_doubt state and its payload reserves ChildRunID.
+func standardAuthoringHandoffJobForRun(ctx context.Context, dataStore *store.Store, runID string) (store.DurableJob, standardAuthoringHandoffPayload, error) {
+	if dataStore == nil {
+		return store.DurableJob{}, standardAuthoringHandoffPayload{}, fmt.Errorf("Standard authoring handoff store is unavailable")
+	}
+	jobs, err := dataStore.ListDurableJobsForRun(ctx, runID)
+	if err != nil {
+		return store.DurableJob{}, standardAuthoringHandoffPayload{}, err
+	}
+	var original *store.DurableJob
+	for index := range jobs {
+		candidate := jobs[index]
+		if candidate.CommandType != standardAuthoringHandoffCommandType {
+			continue
+		}
+		if original != nil {
+			return store.DurableJob{}, standardAuthoringHandoffPayload{}, fmt.Errorf("Standard authoring Run %s has multiple original handoff jobs", runID)
+		}
+		original = &candidate
+	}
+	if original == nil {
+		return store.DurableJob{}, standardAuthoringHandoffPayload{}, fmt.Errorf("Standard authoring Run %s has no durable handoff job", runID)
+	}
+	payload, err := standardAuthoringHandoffJobPayload(*original)
+	if err != nil {
+		return store.DurableJob{}, standardAuthoringHandoffPayload{}, err
+	}
+	return *original, payload, nil
 }

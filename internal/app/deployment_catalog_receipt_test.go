@@ -500,17 +500,22 @@ func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(
 	standardResolver := catalogLockAttestedResolverForSpec(t, standardSpecification, "template-keyed-standard", "v1", "lock-standard")
 	parentResolver := catalogLockAttestedResolverForSpec(t, parentSpecification, "template-keyed-parent", "v1", "lock-parent")
 	childResolver := catalogLockAttestedResolverForSpec(t, childSpecification, "template-keyed-child", "v1", "lock-child")
+	router, err := stageprovider.NewTemplateWorkflowkitProviderOperationResolver([]stageprovider.TemplateWorkflowkitProviderRegistration{
+		{Template: standardSpecification.Template, Resolver: standardResolver},
+		{Template: parentSpecification.Template, Resolver: parentResolver},
+		{Template: childSpecification.Template, Resolver: childResolver},
+	})
+	if err != nil {
+		t.Fatalf("construct exact multi-template provider router: %v", err)
+	}
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		// The registry itself proves each complete specification against its
-		// template's catalog. An accept-all outer resolver keeps this focused
-		// test independent of a production multi-provider dispatcher.
-		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
-		// Keep the existing single resolver field for the parent while adding
-		// the evaluator child through the template-keyed registry. This is the
-		// intended backward-compatible migration shape.
-		DeploymentCatalogResolver: parentResolver,
+		// Admission and worker execution both use the same exact template
+		// router. It never selects a catalog based on shared stage keys or on
+		// whichever bundle was registered first.
+		OperationResolver: router,
 		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{
 			{Template: standardSpecification.Template, Resolver: standardResolver},
+			{Template: parentSpecification.Template, Resolver: parentResolver},
 			{Template: childSpecification.Template, Resolver: childResolver},
 		},
 		RequireDeploymentCatalog: true,
@@ -518,6 +523,20 @@ func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := services.WorkflowkitProviderOperationResolver(); got != router {
+		t.Fatal("multi-template production router was not preserved for worker composition")
+	}
+	standardOperation, err := standardSpecification.ResolveStageOperation(workflowkit.StageKey(workflowadapter.RepoPrepare))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A router has no implicit Standard/current/default bundle. Even a valid
+	// stage operation is rejected if its enclosing frozen template is not one
+	// of the explicitly installed production bundles.
+	standardOperation.Template = workflowadapter.StandardAuthoringTemplateReference()
+	if err := router.ValidateStageOperation(standardOperation); !errors.Is(err, stageprovider.ErrProviderUnavailable) {
+		t.Fatalf("multi-template router fell back for an uninstalled template: %v", err)
 	}
 
 	standard, err := services.Runs.StartRun(ctx, StartRunRequest{
@@ -921,6 +940,12 @@ func catalogLockAttestedResolverForSpec(t *testing.T, specification workflowadap
 			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("app-catalog-lock-build:" + catalogID)),
 		},
 		Operations: make([]stageprovider.DeploymentOperationCatalogLockRecord, 0, len(registrations)),
+	}
+	if specification.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
+		profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
+		policy := specification.CodeEdgeFinalCompliancePolicy.Clone()
+		lock.CodeEdgePhase1ExecutionProfile = &stageprovider.CodeEdgePhase1ExecutionProfileLock{Profile: profile}
+		lock.CodeEdgePhase1FinalCompliancePolicy = &stageprovider.CodeEdgePhase1FinalCompliancePolicyLock{Policy: policy}
 	}
 	for _, registration := range registrations {
 		lock.Operations = append(lock.Operations, catalogLockFixtureRecord(t, registration))

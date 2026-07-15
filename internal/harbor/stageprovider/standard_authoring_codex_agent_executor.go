@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/runtime/codexruntime"
@@ -250,6 +251,22 @@ type StandardAuthoringCodexInvocationFactory func(context.Context, StageOperatio
 // receives a new controlled codexruntime.Runtime per external effect.
 type StandardAuthoringCodexRuntimeFactory func(CodexAppServerInvocation) agent.Runtime
 
+// StandardAuthoringCodexWorkspaceMode determines how a composition-owned
+// workspace root is projected into an individual Codex turn. Static remains a
+// focused test/embed seam. Production Standard authoring uses RunScoped, so a
+// turn may inspect only its own prepared immutable source checkout and never a
+// shared ambient directory.
+type StandardAuthoringCodexWorkspaceMode string
+
+const (
+	StandardAuthoringCodexWorkspaceStatic    StandardAuthoringCodexWorkspaceMode = "static"
+	StandardAuthoringCodexWorkspaceRunScoped StandardAuthoringCodexWorkspaceMode = "run_scoped"
+	// StandardAuthoringCodexRunSourceDirectory is the fixed archive root
+	// materialized by the lock-bound repo_prepare executor. It is a code-owned
+	// layout fact, not a catalog, CLI, or model input.
+	StandardAuthoringCodexRunSourceDirectory = "tower-http"
+)
+
 // StandardAuthoringCodexAgentTurnExecutorConfig contains only composition-owned
 // facts. InvocationFactory must obtain an invocation immediately before the
 // App Server conversation opens. ProgramByStage closes the prompt-choice
@@ -258,6 +275,7 @@ type StandardAuthoringCodexRuntimeFactory func(CodexAppServerInvocation) agent.R
 type StandardAuthoringCodexAgentTurnExecutorConfig struct {
 	InvocationFactory StandardAuthoringCodexInvocationFactory
 	WorkspaceRoot     string
+	WorkspaceMode     StandardAuthoringCodexWorkspaceMode
 	ProgramByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
 	RuntimeFactory    StandardAuthoringCodexRuntimeFactory
 	Now               func() time.Time
@@ -269,6 +287,7 @@ type StandardAuthoringCodexAgentTurnExecutorConfig struct {
 type StandardAuthoringCodexAgentTurnExecutor struct {
 	invocationFactory StandardAuthoringCodexInvocationFactory
 	workspaceRoot     string
+	workspaceMode     StandardAuthoringCodexWorkspaceMode
 	programByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
 	runtimeFactory    StandardAuthoringCodexRuntimeFactory
 	now               func() time.Time
@@ -285,6 +304,10 @@ func NewStandardAuthoringCodexAgentTurnExecutor(config StandardAuthoringCodexAge
 		return nil, fmt.Errorf("%w: invocation factory is required", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	workspaceRoot, err := standardAuthoringCodexWorkspaceRoot(config.WorkspaceRoot)
+	if err != nil {
+		return nil, err
+	}
+	workspaceMode, err := standardAuthoringCodexWorkspaceMode(config.WorkspaceMode)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +332,7 @@ func NewStandardAuthoringCodexAgentTurnExecutor(config StandardAuthoringCodexAge
 		now = time.Now
 	}
 	return &StandardAuthoringCodexAgentTurnExecutor{
-		invocationFactory: config.InvocationFactory, workspaceRoot: workspaceRoot, programByStage: programs,
+		invocationFactory: config.InvocationFactory, workspaceRoot: workspaceRoot, workspaceMode: workspaceMode, programByStage: programs,
 		runtimeFactory: config.RuntimeFactory, now: now,
 	}, nil
 }
@@ -338,6 +361,10 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
+	workspace, err := executor.workspaceForExecution(request.Execution.ID)
+	if err != nil {
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+	}
 	attestedInvocation, runtime, failure := executor.runtimeForEffect(ctx, invocation, payload)
 	if failure != "" {
 		if contextError(ctx) != nil {
@@ -346,12 +373,12 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failure), nil
 	}
 	conversation, err := runtime.OpenConversation(ctx, agent.ConversationRequest{
-		ProjectPath:       executor.workspaceRoot,
+		ProjectPath:       workspace,
 		Model:             CodexAppServerProductionModelID,
 		SandboxMode:       attestedInvocation.SandboxMode,
 		SandboxPolicy:     attestedInvocation.SandboxPolicy,
 		NetworkAccess:     false,
-		WorkspaceRoots:    []string{executor.workspaceRoot},
+		WorkspaceRoots:    []string{workspace},
 		TimeoutSeconds:    standardAuthoringCodexTimeoutSeconds(request.Stage.Budget.TurnTimeout),
 		MaxOutputBytes:    program.MaxOutputBytes,
 		CapabilitySummary: attestedInvocation.CLIVersionOutput,
@@ -386,13 +413,13 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureQuota), nil
 		}
 		turnRequest := agent.TurnRequest{
-			ProjectPath:       executor.workspaceRoot,
+			ProjectPath:       workspace,
 			Prompt:            prompt,
 			Model:             CodexAppServerProductionModelID,
 			SandboxMode:       attestedInvocation.SandboxMode,
 			SandboxPolicy:     attestedInvocation.SandboxPolicy,
 			NetworkAccess:     false,
-			WorkspaceRoots:    []string{executor.workspaceRoot},
+			WorkspaceRoots:    []string{workspace},
 			TimeoutSeconds:    standardAuthoringCodexTimeoutSeconds(request.Stage.Budget.TurnTimeout),
 			MaxOutputBytes:    program.MaxOutputBytes,
 			CapabilitySummary: attestedInvocation.CLIVersionOutput,
@@ -681,6 +708,53 @@ func standardAuthoringCodexWorkspaceRoot(value string) (string, error) {
 		return "", fmt.Errorf("%w: workspace root must be an existing non-symlink directory", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return abs, nil
+}
+
+func standardAuthoringCodexWorkspaceMode(value StandardAuthoringCodexWorkspaceMode) (StandardAuthoringCodexWorkspaceMode, error) {
+	if value == "" {
+		return StandardAuthoringCodexWorkspaceStatic, nil
+	}
+	switch value {
+	case StandardAuthoringCodexWorkspaceStatic, StandardAuthoringCodexWorkspaceRunScoped:
+		return value, nil
+	default:
+		return "", fmt.Errorf("%w: workspace mode is invalid", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+}
+
+// workspaceForExecution derives the sole directory a RunScoped Codex turn may
+// inspect. The frozen execution ID is Store-issued UUIDv7 data; revalidating
+// it here prevents malformed opaque bindings from becoming filesystem paths.
+// repo_prepare creates and verifies this directory from the immutable source
+// snapshot before an agent turn becomes dispatchable.
+func (executor *StandardAuthoringCodexAgentTurnExecutor) workspaceForExecution(executionID string) (string, error) {
+	if executor == nil {
+		return "", fmt.Errorf("%w: executor is required", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if executor.workspaceMode == StandardAuthoringCodexWorkspaceStatic {
+		return executor.workspaceRoot, nil
+	}
+	parsed, err := uuid.Parse(strings.TrimSpace(executionID))
+	if err != nil || parsed.Version() != 7 {
+		return "", fmt.Errorf("%w: RunScoped workspace requires a UUIDv7 execution ID", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	runRoot := filepath.Join(executor.workspaceRoot, parsed.String())
+	workspace := filepath.Join(runRoot, StandardAuthoringCodexRunSourceDirectory)
+	if !standardAuthoringPathWithin(executor.workspaceRoot, workspace) {
+		return "", fmt.Errorf("%w: RunScoped workspace escapes its managed root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	for _, candidate := range []string{runRoot, workspace} {
+		info, statErr := os.Lstat(candidate)
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return "", fmt.Errorf("%w: RunScoped workspace is unavailable", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+	}
+	return workspace, nil
+}
+
+func standardAuthoringPathWithin(root, candidate string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(candidate))
+	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
 }
 
 func standardAuthoringCodexToken(label, value string) error {

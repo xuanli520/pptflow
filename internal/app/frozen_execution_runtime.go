@@ -113,7 +113,7 @@ func (runtime *FrozenExecutionRuntime) HandleDurableJob(ctx context.Context, exe
 		return runtime.handleReviewGateResolution(ctx, execution, job)
 	case store.AuthoringReviewGateResolutionCommandType:
 		return runtime.handleAuthoringReviewGateResolution(ctx, execution, job)
-	case standardAuthoringHandoffCommandType:
+	case standardAuthoringHandoffCommandType, standardAuthoringHandoffRedriveCommandType:
 		return runtime.handleStandardAuthoringHandoff(ctx, job)
 	default:
 		return store.JobFailed, fmt.Errorf("%w: unsupported command type %q", ErrFrozenExecutionPayload, job.CommandType)
@@ -170,7 +170,7 @@ func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context
 			if err := runtime.reconcileRecoveredAuthoringReviewGateResolution(ctx, job); err != nil {
 				return err
 			}
-		case standardAuthoringHandoffCommandType:
+		case standardAuthoringHandoffCommandType, standardAuthoringHandoffRedriveCommandType:
 			if err := runtime.reconcileRecoveredStandardAuthoringHandoff(ctx, job); err != nil {
 				return err
 			}
@@ -1057,8 +1057,16 @@ func (runtime *FrozenExecutionRuntime) findOrCreatePlannedStageAttempt(ctx conte
 }
 
 func (runtime *FrozenExecutionRuntime) completeExecutionIfSatisfied(ctx context.Context, parentJob store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan) error {
-	if err := runtime.completeRunIfSatisfied(ctx, run, frozen, plan, parentJob.CreatedBy); err != nil {
+	completed, err := runtime.completeRunIfSatisfied(ctx, run, frozen, plan, parentJob.CreatedBy)
+	if err != nil {
 		return err
+	}
+	if !completed {
+		// A Standard authoring materialization may have a durable Phase-1
+		// handoff still in flight. A stale coordinator must finish harmlessly
+		// rather than terminally completing the parent before that bridge is
+		// consumed. The handoff handler publishes the replacement coordinator.
+		return nil
 	}
 	if plan.ContinuationExecutionID != "" {
 		execution, err := runtime.core.store.GetContinuationExecution(ctx, plan.ContinuationExecutionID)
@@ -2119,6 +2127,11 @@ func (runtime *FrozenExecutionRuntime) afterStageTerminal(ctx context.Context, j
 				if err := runtime.enqueueStandardAuthoringHandoff(ctx, job, run, attempt); err != nil {
 					return runtime.failMalformedJob(ctx, job, fmt.Errorf("enqueue Standard authoring task handoff: %w", err))
 				}
+				// materialize_task is the last Standard authoring stage, but the
+				// parent cannot complete until its persisted receipt has created
+				// the one task-bound Phase-1 child. The handoff worker publishes
+				// the idempotent completion coordinator after it proves that fact.
+				return store.JobSucceeded, nil
 			}
 			// The StageAttempt has already committed its artifact, quota, and
 			// terminal-result projection. The following coordinator therefore
@@ -2293,7 +2306,7 @@ func (runtime *FrozenExecutionRuntime) handleStandardAuthoringHandoff(ctx contex
 		return runtime.failMalformedJob(ctx, job, err)
 	}
 	if runtime.services == nil || runtime.services.StandardAuthoringHandoffs == nil {
-		return store.JobFailed, ErrCodeEdgePhase1DefinitionUnavailable
+		return store.JobInDoubt, ErrCodeEdgePhase1DefinitionUnavailable
 	}
 	_, err = runtime.services.StandardAuthoringHandoffs.Consume(ctx, StandardAuthoringHandoffRequest{
 		AuthoringRunID: payload.AuthoringRunID, StageAttemptID: payload.StageAttemptID,
@@ -2301,15 +2314,66 @@ func (runtime *FrozenExecutionRuntime) handleStandardAuthoringHandoff(ctx contex
 		Actor: job.CreatedBy, Reason: "consume persisted Standard authoring task handoff",
 	})
 	if err == nil {
+		if err := runtime.enqueueStandardAuthoringCompletionCoordinator(ctx, job, payload); err != nil {
+			return runtime.failMalformedJob(ctx, job, fmt.Errorf("enqueue Standard authoring completion coordinator: %w", err))
+		}
 		return store.JobSucceeded, nil
 	}
 	if errors.Is(err, ErrCodeEdgePhase1DefinitionUnavailable) || errors.Is(err, ErrCodeEdgePhase1DefinitionInvalid) {
-		// The immutable handoff artifact and job remain intact. Do not label the
-		// authoring Run in_doubt merely because this process lacks a separately
-		// approved Phase-1 deployment definition.
-		return store.JobFailed, err
+		// The immutable handoff artifact and preallocated child identity remain
+		// intact. This is a deployment hold, not a malformed workflow result:
+		// leave the delivery explicitly in_doubt until an operator republishes
+		// it through StandardAuthoringHandoffService.Redrive.
+		return store.JobInDoubt, err
 	}
 	return runtime.failMalformedJob(ctx, job, fmt.Errorf("consume Standard authoring handoff: %w", err))
+}
+
+// enqueueStandardAuthoringCompletionCoordinator publishes the parent-side
+// completion coordinator only after Consume has created or replayed the exact
+// task-bound child. It reuses the immutable initial coordinator payload; the
+// original handoff job ID is its sole idempotency anchor, so an explicit
+// redrive or recovery cannot create a second completion transition.
+func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringCompletionCoordinator(ctx context.Context, handoffJob store.DurableJob, payload standardAuthoringHandoffPayload) error {
+	run, err := runtime.core.store.GetWorkflowRun(ctx, payload.AuthoringRunID)
+	if err != nil {
+		return err
+	}
+	if run == nil || run.ID != handoffJob.RunID || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession ||
+		run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
+		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+		return fmt.Errorf("Standard authoring completion does not match its parent Run")
+	}
+	sourceJob, sourcePayload, err := standardAuthoringHandoffJobForRun(ctx, runtime.core.store, run.ID)
+	if err != nil {
+		return err
+	}
+	if sourcePayload.AuthoringRunID != payload.AuthoringRunID || sourcePayload.StageAttemptID != payload.StageAttemptID ||
+		sourcePayload.HandoffArtifactID != payload.HandoffArtifactID || sourcePayload.ChildRunID != payload.ChildRunID {
+		return fmt.Errorf("Standard authoring redrive does not match the original handoff payload")
+	}
+	initialCoordinator, err := runtime.core.store.GetDurableJobByIdempotency(ctx, "workflow-run-execution:"+run.ID)
+	if err != nil {
+		return err
+	}
+	if initialCoordinator == nil {
+		return fmt.Errorf("Standard authoring parent Run has no immutable initial coordinator")
+	}
+	var initialPayload workflowRunExecutionPayload
+	if err := decodeStrictJSON(initialCoordinator.PayloadJSON, &initialPayload); err != nil {
+		return fmt.Errorf("decode Standard authoring initial coordinator payload: %w", err)
+	}
+	if initialCoordinator.CommandType != "workflow_run.execute" || initialCoordinator.EntityType != "workflow_run" ||
+		initialCoordinator.RunID != run.ID || initialCoordinator.EntityID != run.ID || validateWorkflowRunExecutionPayload(initialPayload, *initialCoordinator) != nil {
+		return fmt.Errorf("Standard authoring initial coordinator does not bind the parent Run")
+	}
+	_, err = runtime.core.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "workflow_run.execute", EntityType: "workflow_run", EntityID: run.ID, RunID: run.ID,
+		Priority: handoffJob.Priority, PayloadJSON: initialCoordinator.PayloadJSON,
+		IdempotencyKey: "standard-authoring-completion:" + sourceJob.ID,
+		Actor:          handoffJob.CreatedBy, Reason: "complete Standard authoring parent after persisted Phase-1 handoff",
+	})
+	return err
 }
 
 // reconcileRecoveredStandardAuthoringHandoff is safe because the child Run is
@@ -2333,22 +2397,25 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStandardAuthoringHandof
 	if errors.Is(err, ErrCodeEdgePhase1DefinitionUnavailable) || errors.Is(err, ErrCodeEdgePhase1DefinitionInvalid) {
 		return nil
 	}
-	return err
-}
-
-func (runtime *FrozenExecutionRuntime) completeRunIfSatisfied(ctx context.Context, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan, actor string) error {
-	current, err := runtime.core.store.GetWorkflowRun(ctx, run.ID)
 	if err != nil {
 		return err
 	}
+	return runtime.enqueueStandardAuthoringCompletionCoordinator(ctx, job, payload)
+}
+
+func (runtime *FrozenExecutionRuntime) completeRunIfSatisfied(ctx context.Context, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan, actor string) (bool, error) {
+	current, err := runtime.core.store.GetWorkflowRun(ctx, run.ID)
+	if err != nil {
+		return false, err
+	}
 	if current == nil {
-		return fmt.Errorf("%w: workflow run %s", ErrLifecycleNotFound, run.ID)
+		return false, fmt.Errorf("%w: workflow run %s", ErrLifecycleNotFound, run.ID)
 	}
 	if current.Status == store.WorkflowRunSucceeded {
-		return nil
+		return true, nil
 	}
 	if current.Status != store.WorkflowRunRunning {
-		return fmt.Errorf("%w: workflow run %s cannot complete from %s", ErrFrozenExecutionPayload, current.ID, current.Status)
+		return false, fmt.Errorf("%w: workflow run %s cannot complete from %s", ErrFrozenExecutionPayload, current.ID, current.Status)
 	}
 
 	// Defend the final projection against a corrupted coordinator payload even
@@ -2356,7 +2423,7 @@ func (runtime *FrozenExecutionRuntime) completeRunIfSatisfied(ctx context.Contex
 	latest := make(map[workflowkit.StageKey]store.StageAttempt)
 	attempts, err := runtime.core.store.ListStageAttemptsForRun(ctx, run.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, attempt := range attempts {
 		key := workflowkit.StageKey(attempt.StageKey)
@@ -2371,16 +2438,62 @@ func (runtime *FrozenExecutionRuntime) completeRunIfSatisfied(ctx context.Contex
 		}
 		attempt, found := latest[transition.NodeID]
 		if !found || attempt.ExecutionStatus != store.StageExecutionCompleted || (attempt.Verdict != store.VerdictPass && attempt.Verdict != store.VerdictAdvisory) {
-			return fmt.Errorf("%w: scheduled stage %s is not completed with a progressing verdict", ErrFrozenExecutionPayload, transition.NodeID)
+			return false, fmt.Errorf("%w: scheduled stage %s is not completed with a progressing verdict", ErrFrozenExecutionPayload, transition.NodeID)
 		}
 	}
 	if err := frozen.Workflow.Validate(); err != nil {
-		return err
+		return false, err
+	}
+	ready, err := runtime.standardAuthoringPhase1HandoffCompletionReady(ctx, *current)
+	if err != nil {
+		return false, err
+	}
+	if !ready {
+		return false, nil
 	}
 	if err := runtime.finishRunWithStatus(ctx, run.ID, store.WorkflowRunSucceeded, actor, "all frozen schedule batches completed"); err != nil {
-		return err
+		return false, err
 	}
-	return runtime.enqueueAutomaticRepairOutcome(ctx, run.ID, actor, "repair child run passed all frozen checks")
+	// A Standard authoring parent is a source/session Run. It has no
+	// TaskRevision lifecycle to repair; its durable Phase-1 child owns that
+	// task-bound follow-up work after the handoff barrier has completed.
+	if current.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+		return true, nil
+	}
+	return true, runtime.enqueueAutomaticRepairOutcome(ctx, run.ID, actor, "repair child run passed all frozen checks")
+}
+
+// standardAuthoringPhase1HandoffCompletionReady is a final defensive barrier
+// for old or recovered coordinators that predate the handoff ordering. It
+// does not reconstruct or redrive anything: unless the exact persisted
+// handoff has created its child with the expected parent, the caller leaves
+// the source/session Run running for the handoff path to finish. In
+// particular, an interrupted delivery may already have been reconciled into a
+// child, so the delivery job state alone is not the completion fact.
+func (runtime *FrozenExecutionRuntime) standardAuthoringPhase1HandoffCompletionReady(ctx context.Context, run store.WorkflowRun) (bool, error) {
+	if run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
+		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+		return true, nil
+	}
+	_, payload, err := standardAuthoringHandoffJobForRun(ctx, runtime.core.store, run.ID)
+	if err != nil {
+		return false, err
+	}
+	handoff, err := runtime.core.store.GetAuthoringPhase1HandoffForAuthoringRun(ctx, run.ID)
+	if err != nil {
+		return false, err
+	}
+	if handoff == nil || handoff.ChildRunID != payload.ChildRunID || handoff.HandoffArtifactID != payload.HandoffArtifactID {
+		return false, nil
+	}
+	child, err := runtime.core.store.GetWorkflowRun(ctx, handoff.ChildRunID)
+	if err != nil {
+		return false, err
+	}
+	if child == nil || child.ParentRunID != run.ID || child.ID != payload.ChildRunID {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (runtime *FrozenExecutionRuntime) enqueueAutomaticRepairOutcome(ctx context.Context, runID, actor, reason string) error {
