@@ -2,6 +2,7 @@ package stageprovider
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -111,6 +112,42 @@ func TestStandardAuthoringProviderCompositionInjectsAttestedCodexBridgeWhenNoAge
 	}
 }
 
+func TestStandardAuthoringProviderCompositionRejectsLegacyCodexConfigurationAfterAuditLoad(t *testing.T) {
+	catalog, lock, _ := standardAuthoringAgentOnlyCompositionFixture(t)
+	legacyDocument := catalog.Catalog()
+	legacyPayload := legacyDocument.Operations[0].Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+	legacyPayload.ModelID = "gpt-5.5"
+	legacyPayload.ReasoningEffort = ""
+	legacyDocument.Operations[0].Operation.Payload = legacyPayload
+	legacyCatalog, err := NewDeploymentOperationCatalogResolver(legacyDocument)
+	if err != nil {
+		t.Fatalf("load historical Standard catalog: %v", err)
+	}
+	legacyLock := lock.Clone()
+	legacyLock.CatalogReceipt = legacyCatalog.Receipt()
+	legacyLock.Operations[0].Operation.Payload = legacyPayload
+	legacyLock.Operations[0].AgentModel.ModelID = legacyPayload.ModelID
+	if _, err := NewDeploymentOperationCatalogLockResolver(legacyCatalog, legacyLock); err != nil {
+		t.Fatalf("load historical Standard lock for audit: %v", err)
+	}
+
+	contractRoot := t.TempDir()
+	writeStandardAuthoringContractAssets(t, contractRoot, legacyLock)
+	attestor, err := NewStandardAuthoringRuntimeAttestor(StandardAuthoringRuntimeAttestorConfig{HarborFlowBuild: legacyLock.HarborFlowBuild, ContractRoot: contractRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
+		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: legacyCatalog, Lock: legacyLock, Attestor: attestor,
+		Handlers: StandardAuthoringOperationHandlers{AgentTurn: AgentTurnOperationExecutorFunc(func(context.Context, StageOperationInvocation, workflowadapter.AgentTurnOperationPayload) (workflowkit.StageExecutionResult, error) {
+			return workflowkit.StageExecutionResult{}, nil
+		})},
+	})
+	if err == nil || !errors.Is(err, ErrDeploymentOperationCatalogDrift) {
+		t.Fatalf("legacy Standard configuration composition error = %v, want catalog drift", err)
+	}
+}
+
 func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOperationCatalogResolver, DeploymentOperationCatalogLock, workflowadapter.StageOperationResolution) {
 	t.Helper()
 	fixture := newCodexAppServerAttestationFixture(t)
@@ -128,7 +165,10 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 		t.Fatal("missing Standard authoring repo_analyze stage")
 	}
 	provider := workflowadapter.ProviderReference{ID: StandardAuthoringProviderID, Kind: StandardAuthoringProviderKind, Version: StandardAuthoringProviderVersion}
-	payload := workflowadapter.AgentTurnOperationPayload{AgentID: "codex-app-server", ModelID: CodexAppServerProductionModelID, MaxTurns: 3}
+	payload := workflowadapter.AgentTurnOperationPayload{
+		AgentID: "codex-app-server", ModelID: CodexAppServerProductionModelID,
+		ReasoningEffort: CodexAppServerProductionReasoningEffort, MaxTurns: 3,
+	}
 	resolution.Provider = provider
 	resolution.Operation = workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "standard-authoring.codex.repo-analyze", Version: "1.0.0", Payload: payload}
 	registration := DeploymentOperationRegistration{
@@ -154,8 +194,11 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
 			Checkout: registration.Checkout, Secrets: append([]workflowadapter.SecretReference{}, registration.Secrets...),
 			PromptContentFingerprint: workflowkit.SHA256Fingerprint([]byte("agent-prompt")), SchemaContentFingerprint: workflowkit.SHA256Fingerprint([]byte("agent-schema")),
-			ExecutionKind:  workflowadapter.StageOperationPayloadAgentTurn,
-			AgentModel:     &AgentModelLock{AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID, ModelVersion: "gpt-5.5"},
+			ExecutionKind: workflowadapter.StageOperationPayloadAgentTurn,
+			AgentModel: &AgentModelLock{
+				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
+				ModelVersion: "gpt-5.6-terra",
+			},
 			CodexAppServer: &codex,
 			StandardAuthoringContract: &StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion,
 				Prompt: StandardAuthoringContractAssetReference{ID: "standard-authoring.repo-analyze.prompt", Version: "1.0.0", RelativePath: "prompts/repo-analyze.json"},

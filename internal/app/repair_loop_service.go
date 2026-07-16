@@ -22,11 +22,12 @@ const (
 // protocol. It does not mutate a task itself: every new round is planned and
 // committed through TaskContinuationService and ChangeProviderService.
 type RepairLoopService struct {
-	core *lifecycleServiceCore
+	core          *lifecycleServiceCore
+	continuations *TaskContinuationService
 }
 
-func newRepairLoopService(core *lifecycleServiceCore) *RepairLoopService {
-	return &RepairLoopService{core: core}
+func newRepairLoopService(core *lifecycleServiceCore, continuations *TaskContinuationService) *RepairLoopService {
+	return &RepairLoopService{core: core, continuations: continuations}
 }
 
 type repairSessionAdvancePayload struct {
@@ -249,6 +250,9 @@ func (service *RepairLoopService) requireRepairableFinding(ctx context.Context, 
 }
 
 func (service *RepairLoopService) planAndCommitNextRound(ctx context.Context, run store.WorkflowRun, previous store.RevisionCandidate, session store.RepairSession) (RepairLoopAdvanceResult, error) {
+	if service == nil || service.continuations == nil {
+		return RepairLoopAdvanceResult{}, fmt.Errorf("repair loop continuation service is not configured")
+	}
 	root, err := service.core.store.GetContinuationCommand(ctx, session.CommandID)
 	if err != nil {
 		return RepairLoopAdvanceResult{}, err
@@ -269,11 +273,11 @@ func (service *RepairLoopService) planAndCommitNextRound(ctx context.Context, ru
 	if err != nil {
 		return RepairLoopAdvanceResult{}, err
 	}
-	plan, err := (&TaskContinuationService{core: service.core}).PlanTaskContinuation(ctx, command)
+	plan, err := service.continuations.PlanTaskContinuation(ctx, command)
 	if err != nil {
 		return RepairLoopAdvanceResult{}, err
 	}
-	execution, err := (&TaskContinuationService{core: service.core}).ExecuteTaskContinuation(ctx, plan.ID())
+	execution, err := service.continuations.ExecuteTaskContinuation(ctx, plan.ID())
 	if err != nil {
 		return RepairLoopAdvanceResult{}, err
 	}
@@ -317,7 +321,7 @@ func (service *RepairLoopService) automaticRoundCommand(ctx context.Context, run
 	if err != nil {
 		return ContinueTaskCommand{}, err
 	}
-	checkpoint, err := (&TaskContinuationService{core: service.core}).CurrentCheckpoint(ctx, run.ID)
+	checkpoint, err := currentContinuationCheckpoint(ctx, service.core, run.ID)
 	if err != nil {
 		return ContinueTaskCommand{}, err
 	}
@@ -339,7 +343,7 @@ func (service *RepairLoopService) retargetSessionFindings(ctx context.Context, s
 	if err := decodeStrictJSON(session.FindingsJSON, &findings); err != nil {
 		return FindingBundle{}, fmt.Errorf("decode frozen repair findings: %w", err)
 	}
-	rootRun, _, rootRevision, err := (&TaskContinuationService{core: service.core}).loadRunBinding(ctx, root.RunID)
+	rootRun, _, rootRevision, err := loadContinuationRunBinding(ctx, service.core, root.RunID)
 	if err != nil {
 		return FindingBundle{}, err
 	}

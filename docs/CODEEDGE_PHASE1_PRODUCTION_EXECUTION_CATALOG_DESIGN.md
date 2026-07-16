@@ -266,7 +266,7 @@ snapshot；Qwen/Opus 后、最终合规 review 后才创建 package；每次外�
 
 源码已冻结 Harbor `0.18.0` 结果 ABI、Qwen/Opus agent/model 身份、
 `--n-attempts 4 --n-concurrent 1 --max-retries 3`、secret reference 名称、
-Standard 的 Codex `gpt-5.5` 契约、父流程 metadata 映射、最终合规策略和所有
+Standard 的 Codex `gpt-5.6-terra` / `xhigh` 契约、父流程 metadata 映射、最终合规策略和所有
 prompt/schema fingerprint 输入。lock 生成器在本机严格探测 Git、Codex、Harbor
 launcher、Python source tree 和 Docker；只从允许的环境变量名称读取 endpoint
 与 secret，并仅保存 endpoint fingerprint 和 secret reference。

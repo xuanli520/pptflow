@@ -164,7 +164,10 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 			git := lockedGit
 			record.LocalExecutable = &git
 		case workflowadapter.AgentTurnOperationPayload:
-			record.AgentModel = &stageprovider.AgentModelLock{AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID, ModelVersion: "gpt-5.5"}
+			record.AgentModel = &stageprovider.AgentModelLock{
+				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
+				ModelVersion: "gpt-5.6-terra",
+			}
 		case workflowadapter.DurableReviewOperationPayload:
 			record.DurableReviewPolicy = &stageprovider.DurableReviewPolicyLock{PolicyID: payload.PolicyID, Version: "1.0.0"}
 		case workflowadapter.HarborBuiltinOperationPayload:

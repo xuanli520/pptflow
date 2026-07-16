@@ -43,10 +43,13 @@ type LifecycleServices struct {
 	Control          *ExecutionControlService
 	Budgets          *BudgetGrantService
 	Continuations    *TaskContinuationService
-	Changes          *ChangeProviderService
-	Repairs          *RepairLoopService
-	Candidates       *CandidateRetentionService
-	Inspection       *LifecycleInspectionService
+	// AuthoringRecovery resumes a failed pre-materialization Standard
+	// authoring source/session Run with its frozen definition.
+	AuthoringRecovery *AuthoringRecoveryService
+	Changes           *ChangeProviderService
+	Repairs           *RepairLoopService
+	Candidates        *CandidateRetentionService
+	Inspection        *LifecycleInspectionService
 	// TaskBoard is the compact application boundary consumed by the terminal
 	// task board. It projects durable state and delegates its mutations to the
 	// existing authoring, review, and activation services.
@@ -239,19 +242,20 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	}
 	activations := &RunActivationService{core: core, launcher: options.RunWorkerHandoffLauncher}
 	continuations := newTaskContinuationService(core)
+	authoringRecovery := newAuthoringRecoveryService(core)
 	changes := newChangeProviderService(core)
 	for _, provider := range options.ChangeProviders {
 		changes.Register(provider)
 	}
 	core.changes = changes
-	repairs := newRepairLoopService(core)
+	repairs := newRepairLoopService(core, continuations)
 	core.repairs = repairs
 	mutations := newLifecycleMutationService(core)
 	inspection := &LifecycleInspectionService{core: core}
 	control := &ExecutionControlService{core: core}
 	authoringReviews := &AuthoringReviewService{core: core}
 	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
-	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control)
+	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control, authoringRecovery)
 	return &LifecycleServices{
 		Tasks:                     &TaskService{core: core},
 		Revisions:                 &RevisionService{core: core},
@@ -263,6 +267,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		Control:                   control,
 		Budgets:                   &BudgetGrantService{core: core},
 		Continuations:             continuations,
+		AuthoringRecovery:         authoringRecovery,
 		Changes:                   changes,
 		Repairs:                   repairs,
 		Candidates:                &CandidateRetentionService{core: core},

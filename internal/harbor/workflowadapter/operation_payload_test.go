@@ -6,13 +6,13 @@ import (
 )
 
 func TestStageOperationPayloadStrictDecodeAndCanonicalRoundTrip(t *testing.T) {
-	raw := []byte(`{"kind":"agent.turn","agent_id":"repair_agent","model_id":"model_v2","max_turns":3}`)
+	raw := []byte(`{"kind":"agent.turn","agent_id":"repair_agent","model_id":"model_v2","reasoning_effort":"high","max_turns":3}`)
 	payload, err := ParseStageOperationPayloadJSON(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	agent, ok := payload.(AgentTurnOperationPayload)
-	if !ok || agent.AgentID != "repair_agent" || agent.ModelID != "model_v2" || agent.MaxTurns != 3 {
+	if !ok || agent.AgentID != "repair_agent" || agent.ModelID != "model_v2" || agent.ReasoningEffort != AgentReasoningEffortHigh || agent.MaxTurns != 3 {
 		t.Fatalf("parsed payload = %#v", payload)
 	}
 	canonical, err := CanonicalStageOperationPayloadJSON(payload)
@@ -21,6 +21,25 @@ func TestStageOperationPayloadStrictDecodeAndCanonicalRoundTrip(t *testing.T) {
 	}
 	if string(canonical) != string(raw) {
 		t.Fatalf("canonical payload = %s, want %s", canonical, raw)
+	}
+}
+
+func TestStageOperationPayloadLegacyAgentTurnRoundTripsWithoutReasoningEffort(t *testing.T) {
+	raw := []byte(`{"kind":"agent.turn","agent_id":"repair_agent","model_id":"model_v2","max_turns":3}`)
+	payload, err := ParseStageOperationPayloadJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, ok := payload.(AgentTurnOperationPayload)
+	if !ok || agent.ReasoningEffort != "" {
+		t.Fatalf("parsed legacy payload = %#v", payload)
+	}
+	canonical, err := CanonicalStageOperationPayloadJSON(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(canonical) != string(raw) {
+		t.Fatalf("legacy canonical payload = %s, want %s", canonical, raw)
 	}
 }
 
@@ -54,6 +73,7 @@ func TestStageOperationPayloadRejectsMalformedDocuments(t *testing.T) {
 		"missing arguments":      []byte(`{"kind":"local.command","command_id":"harbor-stage"}`),
 		"null arguments":         []byte(`{"kind":"local.command","command_id":"harbor-stage","arguments":null}`),
 		"duplicate key":          []byte(`{"kind":"agent.turn","agent_id":"one","agent_id":"two","model_id":"model","max_turns":1}`),
+		"unsupported reasoning":  []byte(`{"kind":"agent.turn","agent_id":"agent","model_id":"model","reasoning_effort":"ultra","max_turns":1}`),
 		"bad image pin":          []byte(`{"kind":"container.command","image_digest":"registry/example:latest","command":["run"]}`),
 		"bad turn limit":         []byte(`{"kind":"agent.turn","agent_id":"agent","model_id":"model","max_turns":0}`),
 		"empty built-in handler": []byte(`{"kind":"harbor.builtin","handler_id":""}`),

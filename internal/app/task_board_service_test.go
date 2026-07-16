@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
@@ -79,6 +81,124 @@ func TestTaskBoardServiceRetriesTheSelectedTaskRevisionRun(t *testing.T) {
 	}
 }
 
+func TestTaskBoardServiceRecoversAuthoringRunThroughDedicatedPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	capturer := &standardAuthoringSourceCapturerFixture{
+		coordinate: standardAuthoringLaunchTestCoordinate,
+		snapshot:   standardAuthoringLaunchTestSnapshot(t, standardAuthoringLaunchTestCoordinate),
+	}
+	definitions := standardAuthoringLaunchTestDefinitionProvider(t)
+	services, err := NewLifecycleServicesWithOptions(root, database, standardAuthoringLaunchTestOptions(capturer, definitions, definitions.catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.TaskBoard.actor = func() (string, error) { return "task-board-authoring-recovery", nil }
+	launchKey, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := services.AuthoringLaunches.Start(ctx, StandardAuthoringLaunchCommand{
+		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: launchKey, Actor: "author", Reason: "create recoverable authoring board fixture"},
+		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
+		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		Slug:                         "task-board-authoring-recovery",
+		Title:                        "Task board authoring recovery",
+		MetadataJSON:                 `{}`,
+	})
+	if err != nil {
+		t.Fatalf("launch authoring fixture: %v", err)
+	}
+	storedRun, err := database.GetWorkflowRun(ctx, receipt.RunID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("load authoring Run: %+v, %v", storedRun, err)
+	}
+	run := *storedRun
+	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning, Actor: "worker", Reason: "start authoring recovery fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: run.ID, StageKey: workflowadapter.RepoPrepare, StageGroup: string(workflowadapter.StageSourcePrepare), Ordinal: 1,
+		InputFingerprint: "sha256:authoring-board-recovery-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		Actor: "worker", Reason: "create recoverable authoring stage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err = database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionRunning,
+		Actor: "worker", Reason: "start recoverable authoring stage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionInfraFailed,
+		ErrorText: "transient provider network failure", FailureClass: string(workflowkit.FailureNetwork), Actor: "worker", Reason: "record recoverable authoring failure",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunFailedRecoverable, Actor: "worker", Reason: "project recoverable authoring failure",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatalf("project recoverable authoring Run: %v", err)
+	}
+	task := taskBoardTaskByID(t, snapshot, receipt.TaskID)
+	if len(task.Runs) != 1 || !task.Runs[0].CanRetry || task.Runs[0].RetryStrategy != TaskBoardRetryStrategyAuthoringRecovery {
+		t.Fatalf("authoring recovery board projection = %+v", task.Runs)
+	}
+	recoveryKey, err := services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryRequest := TaskBoardRetryRunRequest{
+		IdempotencyKey: recoveryKey, TaskID: receipt.TaskID, RunID: run.ID, Reason: "recover transient provider failure",
+	}
+	services.TaskBoard.activations = &RunActivationService{core: services.core, launcher: failingTaskBoardActivationLauncher{}}
+	if _, err := services.TaskBoard.RetryRun(ctx, recoveryRequest); err == nil {
+		t.Fatal("authoring recovery unexpectedly succeeded while activation failed")
+	}
+	services.TaskBoard.activations = nil
+	result, err := services.TaskBoard.RetryRun(ctx, recoveryRequest)
+	if err != nil {
+		t.Fatalf("replay authoring recovery through board: %v", err)
+	}
+	if result.TaskID != receipt.TaskID || result.RunID != run.ID || result.Summary == "" {
+		t.Fatalf("authoring recovery board result = %+v", result)
+	}
+	updated, err := database.GetWorkflowRun(ctx, run.ID)
+	if err != nil || updated == nil || updated.ExecutionEpoch != run.ExecutionEpoch+1 {
+		t.Fatalf("recovered authoring Run = %+v, %v", updated, err)
+	}
+	jobs, err := database.ListDurableJobsForRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveries int
+	for _, job := range jobs {
+		if job.CommandType == "task_continuation.execute" {
+			recoveries++
+		}
+	}
+	if recoveries != 1 {
+		t.Fatalf("authoring recovery jobs = %+v", jobs)
+	}
+}
+
 func TestTaskBoardServiceCancelsTheSelectedRun(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunRunning)
@@ -114,6 +234,12 @@ func TestTaskBoardRetryAvailabilityDoesNotOfferUnsupportedAuthoringRetry(t *test
 	})
 	if !available || reason != "" {
 		t.Fatalf("task revision retry availability = available:%t reason:%q", available, reason)
+	}
+	if strategy := taskBoardRetryStrategy(store.WorkflowRun{SubjectKind: store.WorkflowRunSubjectAuthoringSession}); strategy != TaskBoardRetryStrategyAuthoringRecovery {
+		t.Fatalf("authoring retry strategy = %q", strategy)
+	}
+	if strategy := taskBoardRetryStrategy(store.WorkflowRun{SubjectKind: store.WorkflowRunSubjectTaskRevision}); strategy != TaskBoardRetryStrategyTaskContinuation {
+		t.Fatalf("task retry strategy = %q", strategy)
 	}
 }
 

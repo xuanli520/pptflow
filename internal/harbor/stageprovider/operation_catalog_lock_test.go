@@ -283,10 +283,14 @@ func TestDeploymentOperationCatalogLockRecordPinsContainerAndAgentIdentities(t *
 
 	localCatalog, localLock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare)
 	agent := localLock.Operations[0].Clone()
-	agent.Operation.Payload = workflowadapter.AgentTurnOperationPayload{AgentID: "codeedge-agent", ModelID: "codeedge-model", MaxTurns: 4}
+	agent.Operation.Payload = workflowadapter.AgentTurnOperationPayload{
+		AgentID: "codeedge-agent", ModelID: "codeedge-model", ReasoningEffort: workflowadapter.AgentReasoningEffortHigh, MaxTurns: 4,
+	}
 	agent.ExecutionKind = workflowadapter.StageOperationPayloadAgentTurn
 	agent.LocalExecutable = nil
-	agent.AgentModel = &AgentModelLock{AgentID: "codeedge-agent", AgentVersion: "v1.0.0", ModelID: "codeedge-model", ModelVersion: "v2026.07"}
+	agent.AgentModel = &AgentModelLock{
+		AgentID: "codeedge-agent", AgentVersion: "v1.0.0", ModelID: "codeedge-model", ModelVersion: "v2026.07",
+	}
 	if err := agent.Validate(); err != nil {
 		t.Fatalf("validate pinned agent/model/secret record: %v", err)
 	}
@@ -320,6 +324,42 @@ func TestDeploymentOperationCatalogLockRecordPinsContainerAndAgentIdentities(t *
 	secretDrift.Operations[0].Secrets[0].Version = "v2.0.0"
 	if _, err := NewDeploymentOperationCatalogLockResolver(agentCatalog, secretDrift); err == nil || !errors.Is(err, ErrDeploymentOperationCatalogLockDrift) {
 		t.Fatalf("agent secret reference drift error = %v, want lock drift", err)
+	}
+
+	// Older frozen records did not carry reasoning_effort. They must remain
+	// readable and canonicalizable for audit/reconciliation even though the
+	// current Standard authoring runtime will refuse to execute them.
+	legacyCatalogDocument := agentCatalog.Catalog()
+	legacyPayload := agent.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+	legacyPayload.ReasoningEffort = ""
+	legacyCatalogDocument.Operations[0].Operation.Payload = legacyPayload
+	legacyCatalog, err := NewDeploymentOperationCatalogResolver(legacyCatalogDocument)
+	if err != nil {
+		t.Fatalf("decode legacy agent catalog: %v", err)
+	}
+	legacyLock := agentLock.Clone()
+	legacyLock.CatalogReceipt = legacyCatalog.Receipt()
+	legacyLock.Operations[0].Operation.Payload = legacyPayload
+	legacyCanonical, err := legacyLock.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonicalize legacy agent lock: %v", err)
+	}
+	if strings.Contains(string(legacyCanonical), "reasoning_effort") {
+		t.Fatalf("legacy lock canonicalization introduced a new field: %s", legacyCanonical)
+	}
+	parsedLegacy, err := ParseDeploymentOperationCatalogLockJSON(legacyCanonical)
+	if err != nil {
+		t.Fatalf("parse legacy agent lock: %v", err)
+	}
+	parsedCanonical, err := parsedLegacy.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("recall canonical legacy agent lock: %v", err)
+	}
+	if string(parsedCanonical) != string(legacyCanonical) {
+		t.Fatalf("legacy agent lock canonical bytes drifted:\n got %s\nwant %s", parsedCanonical, legacyCanonical)
+	}
+	if _, err := NewDeploymentOperationCatalogLockResolver(legacyCatalog, parsedLegacy); err != nil {
+		t.Fatalf("resolve historical agent lock for audit: %v", err)
 	}
 }
 
@@ -566,7 +606,9 @@ func operationCatalogLockRecord(t *testing.T, registration DeploymentOperationRe
 	case workflowadapter.ContainerCommandOperationPayload:
 		record.ContainerRuntime = &PinnedContainerRuntimeLock{ImageDigest: payload.ImageDigest, Runtime: registration.Runtime}
 	case workflowadapter.AgentTurnOperationPayload:
-		record.AgentModel = &AgentModelLock{AgentID: payload.AgentID, AgentVersion: "v1.0.0", ModelID: payload.ModelID, ModelVersion: "v1.0.0"}
+		record.AgentModel = &AgentModelLock{
+			AgentID: payload.AgentID, AgentVersion: "v1.0.0", ModelID: payload.ModelID, ModelVersion: "v1.0.0",
+		}
 	case workflowadapter.DurableReviewOperationPayload:
 		record.DurableReviewPolicy = &DurableReviewPolicyLock{PolicyID: payload.PolicyID, Version: "v1.0.0"}
 	default:

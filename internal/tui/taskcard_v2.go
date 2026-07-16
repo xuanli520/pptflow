@@ -50,6 +50,7 @@ type TaskRunItem struct {
 	HasLog        bool
 	CanRetry      bool
 	RetryReason   string
+	RetryStrategy app.TaskBoardRetryStrategy
 }
 
 func truncate(s string, maxLen int) string {

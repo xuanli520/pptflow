@@ -114,7 +114,7 @@ func (service *ChangeProviderService) PlanTaskChange(ctx context.Context, comman
 		if candidate.FrozenPlanID != existing.ID || candidate.FinalManifestID == "" || candidate.ChildRunManifestJSON == "" {
 			return ChangePlanResult{}, fmt.Errorf("%w: frozen continuation plan %s is not fully bound to candidate %s", ErrChangeReconciliationRequired, existing.ID, candidate.ID)
 		}
-		plan, err := (&TaskContinuationService{core: service.core}).decodeFrozenPlan(ctx, *existing)
+		plan, err := decodeFrozenContinuationPlan(ctx, service.core, *existing)
 		if err != nil {
 			return ChangePlanResult{}, err
 		}
@@ -132,7 +132,7 @@ func (service *ChangeProviderService) PlanTaskChange(ctx context.Context, comman
 		return result, nil
 	}
 
-	run, task, revision, err := (&TaskContinuationService{core: service.core}).loadRunBinding(ctx, command.RunID)
+	run, task, revision, err := loadContinuationRunBinding(ctx, service.core, command.RunID)
 	if err != nil {
 		return ChangePlanResult{}, err
 	}
@@ -196,10 +196,9 @@ type normalizedTaskChange struct {
 }
 
 func (service *ChangeProviderService) normalizeChangeCommand(ctx context.Context, command ContinueTaskCommand, change TaskChangeRequest) (normalizedChangeCommand, ChangeProvider, error) {
-	base := &TaskContinuationService{core: service.core}
 	noContentCommand := command
 	noContentCommand.Change = nil
-	normalizedCommand, err := base.normalizeCommand(noContentCommand)
+	normalizedCommand, err := normalizeContinuationCommand(noContentCommand)
 	if err != nil {
 		return normalizedChangeCommand{}, nil, err
 	}
@@ -768,7 +767,7 @@ func (service *ChangeProviderService) freezeCandidatePlan(ctx context.Context, c
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, candidate, err
 	}
-	decoded, err := (&TaskContinuationService{core: service.core}).decodeFrozenPlan(ctx, stored)
+	decoded, err := decodeFrozenContinuationPlan(ctx, service.core, stored)
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, candidate, err
 	}
@@ -1309,7 +1308,7 @@ func (service *ChangeProviderService) ExecuteTaskChange(ctx context.Context, pla
 	if service == nil || service.core == nil {
 		return store.RevisionCandidateContinuationCommit{}, fmt.Errorf("change provider service is not configured")
 	}
-	plan, err := (&TaskContinuationService{core: service.core}).GetTaskContinuationPlan(ctx, planID)
+	plan, err := getFrozenContinuationPlan(ctx, service.core, planID)
 	if err != nil {
 		return store.RevisionCandidateContinuationCommit{}, err
 	}

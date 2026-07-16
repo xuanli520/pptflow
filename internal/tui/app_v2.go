@@ -146,23 +146,29 @@ func (prompt *reviewPrompt) View(width int) string {
 
 type runActionPrompt struct {
 	kind          taskBoardRunActionKind
+	strategy      app.TaskBoardRetryStrategy
 	reasonInput   textinput.Model
 	validationErr string
 }
 
-func newRunActionPrompt(kind taskBoardRunActionKind) *runActionPrompt {
+func newRunActionPrompt(kind taskBoardRunActionKind, strategy app.TaskBoardRetryStrategy) *runActionPrompt {
 	input := textinput.New()
 	input.Prompt = "原因 "
 	input.Placeholder = "记录本次操作的原因"
 	input.CharLimit = 240
 	input.Width = 52
 	input.Focus()
-	return &runActionPrompt{kind: kind, reasonInput: input}
+	return &runActionPrompt{kind: kind, strategy: strategy, reasonInput: input}
 }
 
 func (prompt *runActionPrompt) View(width int) string {
 	label := "重试当前 Run"
-	if prompt.kind == taskBoardCancelAction {
+	switch prompt.kind {
+	case taskBoardRetryAction:
+		if prompt.strategy == app.TaskBoardRetryStrategyAuthoringRecovery {
+			label = "恢复/重试创题 Run"
+		}
+	case taskBoardCancelAction:
 		label = "取消当前 Run"
 	}
 	content := detailSectionTitleStyle.Render(label) + "\n" + prompt.reasonInput.View()
@@ -523,7 +529,7 @@ func (m appModel) openRunActionPrompt(kind taskBoardRunActionKind, inputCmd tea.
 	if m.mutationInFlight() || m.detail == nil || !m.detail.hasCurrentRun() {
 		return m, inputCmd
 	}
-	if kind == taskBoardRetryAction && !m.detail.canRetryCurrentRun() {
+	if isRetryAction(kind) && !m.detail.canRetryCurrentRun() {
 		m.notice = m.detail.currentRun().RetryReason
 		if m.notice == "" {
 			m.notice = "当前 Run 不可重试"
@@ -534,8 +540,12 @@ func (m appModel) openRunActionPrompt(kind taskBoardRunActionKind, inputCmd tea.
 		m.notice = "当前 Run 已是终态，无法取消"
 		return m, inputCmd
 	}
-	m.action = newRunActionPrompt(kind)
+	m.action = newRunActionPrompt(kind, m.detail.currentRun().RetryStrategy)
 	return m, tea.Batch(inputCmd, textinput.Blink)
+}
+
+func isRetryAction(kind taskBoardRunActionKind) bool {
+	return kind == taskBoardRetryAction
 }
 
 func (m appModel) openLog(inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
@@ -795,6 +805,7 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 				HasLog:        run.HasLog,
 				CanRetry:      run.CanRetry,
 				RetryReason:   run.RetryReason,
+				RetryStrategy: run.RetryStrategy,
 			})
 		}
 		switch task.Column {
@@ -884,7 +895,11 @@ func detailFooterText(detail *detailModel) string {
 	if detail != nil && detail.hasCurrentRun() {
 		actions = append(actions, "[l] 日志")
 		if detail.canRetryCurrentRun() {
-			actions = append(actions, "[t] 重试")
+			label := "重试"
+			if detail.currentRun().RetryStrategy == app.TaskBoardRetryStrategyAuthoringRecovery {
+				label = "恢复/重试"
+			}
+			actions = append(actions, "[t] "+label)
 		}
 		if detail.canCancelCurrentRun() {
 			actions = append(actions, "[x] 取消")

@@ -572,10 +572,9 @@ type PinnedContainerRuntimeLock struct {
 	Runtime     workflowadapter.RuntimeReference `json:"runtime"`
 }
 
-// AgentModelLock pins the exact logical agent and model identities. Secret
-// references are held at the enclosing operation record so one immutable set
-// is compared with the catalog and supplied to the runtime attestor without
-// ever serializing secret material.
+// AgentModelLock pins the exact logical agent and model identities. Reasoning
+// effort lives only in the frozen operation payload, which is already part of
+// the canonical deployment lock and Run definition.
 type AgentModelLock struct {
 	AgentID      string `json:"agent_id"`
 	AgentVersion string `json:"agent_version"`
@@ -839,12 +838,9 @@ func (record DeploymentOperationCatalogLockRecord) Validate() error {
 			return err
 		}
 		if record.AgentModel.AgentID != payload.AgentID || record.AgentModel.ModelID != payload.ModelID {
-			return fmt.Errorf("%w: locked agent/model %q/%q does not match payload %q/%q", ErrInvalidDeploymentOperationCatalogLock, record.AgentModel.AgentID, record.AgentModel.ModelID, payload.AgentID, payload.ModelID)
+			return fmt.Errorf("%w: locked agent/model does not match payload", ErrInvalidDeploymentOperationCatalogLock)
 		}
 		if record.CodexAppServer != nil {
-			if record.AgentModel.ModelID != CodexAppServerProductionModelID {
-				return fmt.Errorf("%w: Codex App Server agent.turn must pin model %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerProductionModelID)
-			}
 			if err := record.CodexAppServer.Validate(); err != nil {
 				return err
 			}

@@ -2331,9 +2331,12 @@ func (runtime *FrozenExecutionRuntime) handleStandardAuthoringHandoff(ctx contex
 
 // enqueueStandardAuthoringCompletionCoordinator publishes the parent-side
 // completion coordinator only after Consume has created or replayed the exact
-// task-bound child. It reuses the immutable initial coordinator payload; the
-// original handoff job ID is its sole idempotency anchor, so an explicit
-// redrive or recovery cannot create a second completion transition.
+// task-bound child. An initial materialize_task resumes the immutable initial
+// coordinator. A materialize_task scheduled by an authoring recovery instead
+// resumes its exact continuation execution, which is recorded in the durable
+// StageAttempt snapshot. The original handoff job ID remains the idempotency
+// anchor, so an explicit redrive or recovery cannot create a second completion
+// transition.
 func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringCompletionCoordinator(ctx context.Context, handoffJob store.DurableJob, payload standardAuthoringHandoffPayload) error {
 	run, err := runtime.core.store.GetWorkflowRun(ctx, payload.AuthoringRunID)
 	if err != nil {
@@ -2351,6 +2354,29 @@ func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringCompletionCoordin
 	if sourcePayload.AuthoringRunID != payload.AuthoringRunID || sourcePayload.StageAttemptID != payload.StageAttemptID ||
 		sourcePayload.HandoffArtifactID != payload.HandoffArtifactID || sourcePayload.ChildRunID != payload.ChildRunID {
 		return fmt.Errorf("Standard authoring redrive does not match the original handoff payload")
+	}
+	continuation, err := runtime.continuationForMaterializedAuthoringStage(ctx, *run, payload.StageAttemptID)
+	if err != nil {
+		return err
+	}
+	if continuation != nil {
+		if continuation.State == store.ContinuationExecutionCompleted {
+			if run.Status != store.WorkflowRunSucceeded {
+				return fmt.Errorf("%w: completed Standard authoring continuation has a nonterminal parent Run", ErrFrozenExecutionPayload)
+			}
+			// completeExecutionIfSatisfied advances the parent before completing
+			// the continuation. A replay after that point must not enqueue a
+			// coordinator that would try to transition the completed execution
+			// back to running.
+			return nil
+		}
+		_, err = runtime.core.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+			CommandType: "task_continuation.execute", EntityType: "continuation_execution", EntityID: continuation.ID, RunID: run.ID,
+			Priority: handoffJob.Priority, PayloadJSON: continuation.PayloadJSON,
+			IdempotencyKey: "standard-authoring-completion:" + sourceJob.ID,
+			Actor:          handoffJob.CreatedBy, Reason: "complete Standard authoring continuation after persisted Phase-1 handoff",
+		})
+		return err
 	}
 	initialCoordinator, err := runtime.core.store.GetDurableJobByIdempotency(ctx, "workflow-run-execution:"+run.ID)
 	if err != nil {
@@ -2374,6 +2400,72 @@ func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringCompletionCoordin
 		Actor:          handoffJob.CreatedBy, Reason: "complete Standard authoring parent after persisted Phase-1 handoff",
 	})
 	return err
+}
+
+// continuationForMaterializedAuthoringStage returns the matching continuation
+// that scheduled one materialize_task, if any. Older initial attempts have no
+// runtime snapshot and deliberately retain the initial-coordinator path. Once
+// a snapshot claims a continuation, every binding is rechecked before a handoff
+// may enqueue its completion coordinator.
+func (runtime *FrozenExecutionRuntime) continuationForMaterializedAuthoringStage(ctx context.Context, run store.WorkflowRun, stageAttemptID string) (*store.ContinuationExecution, error) {
+	attempt, err := runtime.core.store.GetStageAttempt(ctx, stageAttemptID)
+	if err != nil {
+		return nil, err
+	}
+	if attempt == nil || attempt.RunID != run.ID || attempt.StageKey != workflowadapter.MaterializeTask ||
+		attempt.ExecutionStatus != store.StageExecutionCompleted ||
+		(attempt.Verdict != store.VerdictPass && attempt.Verdict != store.VerdictAdvisory) {
+		return nil, fmt.Errorf("%w: Standard authoring completion source is not a completed materialize_task", ErrFrozenExecutionPayload)
+	}
+
+	var snapshot runtimeStageAttemptSnapshot
+	if err := decodeStrictJSON(attempt.RetrySnapshotJSON, &snapshot); err != nil {
+		return nil, fmt.Errorf("%w: decode Standard authoring materialize_task schedule snapshot: %v", ErrFrozenExecutionPayload, err)
+	}
+	if snapshot.Format == "" {
+		if snapshot.ContinuationExecutionID != "" || snapshot.ContinuationPlanID != "" {
+			return nil, fmt.Errorf("%w: legacy materialize_task snapshot has a partial continuation binding", ErrFrozenExecutionPayload)
+		}
+		return nil, nil
+	}
+	if snapshot.Format != runtimeStageAttemptSnapshotFormat || snapshot.Generation < 0 {
+		return nil, fmt.Errorf("%w: Standard authoring materialize_task has an invalid schedule snapshot", ErrFrozenExecutionPayload)
+	}
+	if snapshot.ContinuationExecutionID == "" && snapshot.ContinuationPlanID == "" {
+		if snapshot.ExecutionKey != "initial" {
+			return nil, fmt.Errorf("%w: initial materialize_task has an invalid execution key", ErrFrozenExecutionPayload)
+		}
+		return nil, nil
+	}
+	if snapshot.ContinuationExecutionID == "" || snapshot.ContinuationPlanID == "" || snapshot.ExecutionKey != snapshot.ContinuationPlanID {
+		return nil, fmt.Errorf("%w: Standard authoring materialize_task has a partial continuation binding", ErrFrozenExecutionPayload)
+	}
+
+	execution, err := runtime.core.store.GetContinuationExecution(ctx, snapshot.ContinuationExecutionID)
+	if err != nil {
+		return nil, err
+	}
+	if execution == nil || execution.RunID != run.ID || execution.PlanID != snapshot.ContinuationPlanID ||
+		(execution.State != store.ContinuationExecutionRunning && execution.State != store.ContinuationExecutionCompleted) {
+		return nil, fmt.Errorf("%w: Standard authoring materialize_task continuation does not match a live execution", ErrFrozenExecutionPayload)
+	}
+	plan, err := runtime.core.store.GetFrozenPlan(ctx, execution.PlanID)
+	if err != nil {
+		return nil, err
+	}
+	if plan == nil {
+		return nil, fmt.Errorf("%w: Standard authoring materialize_task continuation has no frozen plan", ErrFrozenExecutionPayload)
+	}
+	var executionPayload continuationExecutionPayload
+	if err := decodeStrictJSON(execution.PayloadJSON, &executionPayload); err != nil {
+		return nil, fmt.Errorf("%w: decode Standard authoring continuation execution payload: %v", ErrFrozenExecutionPayload, err)
+	}
+	if executionPayload.Format != continuationExecutionFormat || executionPayload.PlanID != execution.PlanID ||
+		executionPayload.RunID != run.ID || executionPayload.SourceRunID != run.ID ||
+		executionPayload.PlanFingerprint != workflowkit.Fingerprint(plan.PlanFingerprint) {
+		return nil, fmt.Errorf("%w: Standard authoring materialize_task continuation payload does not match its frozen plan", ErrFrozenExecutionPayload)
+	}
+	return execution, nil
 }
 
 // reconcileRecoveredStandardAuthoringHandoff is safe because the child Run is

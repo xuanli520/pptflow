@@ -125,6 +125,62 @@ func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T
 	}
 }
 
+func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate Standard authoring lock generator test")
+	}
+	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring")
+	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := stageprovider.ParseDeploymentOperationCatalogJSON(catalogRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := stageprovider.ParseStandardAuthoringContractAssetManifestJSON(manifestRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assets := make(map[workflowkit.StageKey]stageprovider.StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))
+	for _, entry := range manifest.Operations {
+		assets[entry.StageKey] = entry
+	}
+	for _, registration := range catalog.Operations {
+		payload, isAgentTurn := registration.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+		if !isAgentTurn {
+			continue
+		}
+		entry, found := assets[registration.Stage.Key]
+		if !found {
+			t.Fatalf("agent stage %q has no contract assets", registration.Stage.Key)
+		}
+		if err := validateCodexStageAssets(deploymentRoot, entry, payload); err != nil {
+			t.Fatalf("validate production Codex stage %q: %v", registration.Stage.Key, err)
+		}
+		for name, mutate := range map[string]func(*workflowadapter.AgentTurnOperationPayload){
+			"model drift": func(candidate *workflowadapter.AgentTurnOperationPayload) { candidate.ModelID = "other-model" },
+			"reasoning effort drift": func(candidate *workflowadapter.AgentTurnOperationPayload) {
+				candidate.ReasoningEffort = workflowadapter.AgentReasoningEffortHigh
+			},
+		} {
+			t.Run(string(registration.Stage.Key)+"/"+name, func(t *testing.T) {
+				candidate := payload
+				mutate(&candidate)
+				if err := validateCodexStageAssets(deploymentRoot, entry, candidate); err == nil {
+					t.Fatalf("Codex stage assets accepted %s: %+v", name, candidate)
+				}
+			})
+		}
+	}
+}
+
 func TestProbeMultilineAcceptsBoundedCodexStyleHelp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "codex-help")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' '--listen <URL>' '-c, --config <key=value>'\n"), 0o700); err != nil {

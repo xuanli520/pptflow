@@ -79,7 +79,7 @@ func main() {
 	flag.StringVar(&config.codexNode, "codex-node", "", "absolute locked Node executable")
 	flag.StringVar(&config.codexLauncher, "codex-launcher", "", "absolute locked Codex JavaScript launcher")
 	flag.StringVar(&config.codexHome, "codex-home", "", "absolute controlled CODEX_HOME directory")
-	flag.StringVar(&config.codexModelVersion, "codex-model-version", "", "approved immutable gpt-5.5 model version")
+	flag.StringVar(&config.codexModelVersion, "codex-model-version", "", "approved immutable gpt-5.6-terra model version")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		fail("unexpected positional arguments")
@@ -199,10 +199,16 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 			local := gitLock
 			record.LocalExecutable = &local
 		case workflowadapter.AgentTurnOperationPayload:
+			if !stageprovider.IsCodexAppServerProductionPayload(payload) {
+				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q must pin the approved Codex agent profile", registration.Stage.Key)
+			}
 			if err := validateCodexStageAssets(config.contractRoot, entry, payload); err != nil {
 				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q Codex assets: %w", registration.Stage.Key, err)
 			}
-			record.AgentModel = &stageprovider.AgentModelLock{AgentID: payload.AgentID, AgentVersion: codex.JavaScriptLauncher.Version, ModelID: payload.ModelID, ModelVersion: config.codexModelVersion}
+			record.AgentModel = &stageprovider.AgentModelLock{
+				AgentID: payload.AgentID, AgentVersion: codex.JavaScriptLauncher.Version,
+				ModelID: payload.ModelID, ModelVersion: config.codexModelVersion,
+			}
 			copyCodex := codex
 			record.CodexAppServer = &copyCodex
 		case workflowadapter.DurableReviewOperationPayload:
@@ -421,7 +427,7 @@ func validateCodexStageAssets(root string, entry stageprovider.StandardAuthoring
 	if err != nil {
 		return err
 	}
-	if program.ID != entry.Prompt.ID || program.Version != entry.Prompt.Version || len(program.TurnPrompts) != payload.MaxTurns || payload.AgentID != "codex-app-server" || payload.ModelID != stageprovider.CodexAppServerProductionModelID {
+	if program.ID != entry.Prompt.ID || program.Version != entry.Prompt.Version || len(program.TurnPrompts) != payload.MaxTurns || payload.AgentID != stageprovider.CodexAppServerProductionAgentID || payload.ModelID != stageprovider.CodexAppServerProductionModelID || payload.ReasoningEffort != stageprovider.CodexAppServerProductionReasoningEffort {
 		return errors.New("Codex prompt program does not match its frozen stage operation")
 	}
 	schemaPath, err := contractAssetPath(root, entry.Schema.RelativePath)

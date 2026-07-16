@@ -30,10 +30,14 @@ const (
 	// required to be regular files with no symbolic-link component.
 	CodexAppServerJavaScriptLauncherCommandID = "codex.app-server.javascript-launcher"
 	CodexAppServerNodeExecutableCommandID     = "codex.app-server.node"
-	// CodexAppServerProductionModelID is the explicitly approved model for
-	// this deployment profile. Other generic agent runtimes remain available
-	// through AgentModelLock without this Codex-specific extension.
-	CodexAppServerProductionModelID = "gpt-5.5"
+	// CodexAppServerProductionAgentID, CodexAppServerProductionModelID, and
+	// CodexAppServerProductionReasoningEffort are the explicitly approved
+	// agent configuration for this deployment profile. Other generic agent
+	// runtimes remain available through AgentModelLock without this
+	// Codex-specific extension.
+	CodexAppServerProductionAgentID         = "codex-app-server"
+	CodexAppServerProductionModelID         = "gpt-5.6-terra"
+	CodexAppServerProductionReasoningEffort = workflowadapter.AgentReasoningEffortXHigh
 
 	// The selected production profile permits edits only inside the controlled
 	// workspace and never gives the App Server network access. A future policy
@@ -150,17 +154,18 @@ type CodexAppServerRuntimeAttestor struct {
 // returns a fresh explicit map containing only CODEX_HOME and the fixed PATH
 // necessary for the pinned JavaScript launcher to reach the pinned Node.
 type CodexAppServerInvocation struct {
-	AgentID                string `json:"agent_id"`
-	AgentVersion           string `json:"agent_version"`
-	ModelID                string `json:"model_id"`
-	ModelVersion           string `json:"model_version"`
-	JavaScriptLauncherPath string `json:"javascript_launcher_path"`
-	NodeExecutablePath     string `json:"node_executable_path"`
-	CodexHomeDirectory     string `json:"codex_home_directory"`
-	CLIVersionOutput       string `json:"cli_version_output"`
-	SandboxMode            string `json:"sandbox_mode"`
-	SandboxPolicy          string `json:"sandbox_policy"`
-	NetworkAccess          bool   `json:"network_access"`
+	AgentID                string                               `json:"agent_id"`
+	AgentVersion           string                               `json:"agent_version"`
+	ModelID                string                               `json:"model_id"`
+	ModelVersion           string                               `json:"model_version"`
+	ReasoningEffort        workflowadapter.AgentReasoningEffort `json:"reasoning_effort"`
+	JavaScriptLauncherPath string                               `json:"javascript_launcher_path"`
+	NodeExecutablePath     string                               `json:"node_executable_path"`
+	CodexHomeDirectory     string                               `json:"codex_home_directory"`
+	CLIVersionOutput       string                               `json:"cli_version_output"`
+	SandboxMode            string                               `json:"sandbox_mode"`
+	SandboxPolicy          string                               `json:"sandbox_policy"`
+	NetworkAccess          bool                                 `json:"network_access"`
 }
 
 // Environment returns the only process values supplied by this lock. It
@@ -224,7 +229,10 @@ func (attestor *CodexAppServerRuntimeAttestor) AttestCodexAppServerOperation(ctx
 		return CodexAppServerInvocation{}, fmt.Errorf("%w: no typed Codex App Server lock is installed for this operation", ErrDeploymentOperationRuntimeAttestationUnavailable)
 	}
 	if attestation.Record.AgentModel.AgentID != payload.AgentID || attestation.Record.AgentModel.ModelID != payload.ModelID {
-		return CodexAppServerInvocation{}, fmt.Errorf("%w: locked Codex agent/model does not match the frozen operation", ErrDeploymentOperationRuntimeAttestationFailed)
+		return CodexAppServerInvocation{}, fmt.Errorf("%w: locked Codex agent configuration does not match the frozen operation", ErrDeploymentOperationRuntimeAttestationFailed)
+	}
+	if !IsCodexAppServerProductionPayload(payload) {
+		return CodexAppServerInvocation{}, fmt.Errorf("%w: Codex App Server operation must pin model %q with reasoning effort %q", ErrDeploymentOperationRuntimeAttestationFailed, CodexAppServerProductionModelID, CodexAppServerProductionReasoningEffort)
 	}
 	lock := attestation.Record.CodexAppServer.Clone()
 	if err := lock.Validate(); err != nil {
@@ -255,15 +263,16 @@ func (attestor *CodexAppServerRuntimeAttestor) AttestCodexAppServerOperation(ctx
 	if err := attestCodexCLICapability(ctx, lock, environment); err != nil {
 		return CodexAppServerInvocation{}, err
 	}
-	return codexAppServerInvocationFromLock(lock, *attestation.Record.AgentModel), nil
+	return codexAppServerInvocationFromLock(lock, *attestation.Record.AgentModel, payload.ReasoningEffort), nil
 }
 
-func codexAppServerInvocationFromLock(lock CodexAppServerOperationLock, agent AgentModelLock) CodexAppServerInvocation {
+func codexAppServerInvocationFromLock(lock CodexAppServerOperationLock, agent AgentModelLock, reasoningEffort workflowadapter.AgentReasoningEffort) CodexAppServerInvocation {
 	return CodexAppServerInvocation{
 		AgentID:                agent.AgentID,
 		AgentVersion:           agent.AgentVersion,
 		ModelID:                agent.ModelID,
 		ModelVersion:           agent.ModelVersion,
+		ReasoningEffort:        reasoningEffort,
 		JavaScriptLauncherPath: lock.JavaScriptLauncher.AbsolutePath,
 		NodeExecutablePath:     lock.NodeExecutable.AbsolutePath,
 		CodexHomeDirectory:     lock.CodexHomeDirectory,
@@ -272,6 +281,13 @@ func codexAppServerInvocationFromLock(lock CodexAppServerOperationLock, agent Ag
 		SandboxPolicy:          lock.SandboxPolicy,
 		NetworkAccess:          lock.NetworkAccess,
 	}
+}
+
+// IsCodexAppServerProductionPayload verifies the one approved Standard
+// authoring agent profile. The catalog, generator, attestor, and executor use
+// the same predicate while still enforcing it at their own trust boundaries.
+func IsCodexAppServerProductionPayload(payload workflowadapter.AgentTurnOperationPayload) bool {
+	return payload.AgentID == CodexAppServerProductionAgentID && payload.ModelID == CodexAppServerProductionModelID && payload.ReasoningEffort == CodexAppServerProductionReasoningEffort
 }
 
 func validateCodexAppServerDirectoryPath(value string) error {

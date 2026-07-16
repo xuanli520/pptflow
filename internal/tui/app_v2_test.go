@@ -323,6 +323,46 @@ func TestDetailRunActionsAndLogsTargetTheCurrentRun(t *testing.T) {
 	}
 }
 
+func TestAppModelRoutesAuthoringRecoveryThroughRetryAndRetainsItsIdempotencyKey(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringRecovery
+	stub := &taskBoardGatewayStub{snapshot: snapshot, retryErr: errors.New("activation unavailable")}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	updated, _ := model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	if model.action == nil || model.action.kind != taskBoardRetryAction || model.action.strategy != app.TaskBoardRetryStrategyAuthoringRecovery {
+		t.Fatalf("authoring recovery prompt = %+v", model.action)
+	}
+	model.action.reasonInput.SetValue("recover transient provider failure")
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardRetryMutation || command == nil {
+		t.Fatalf("authoring recovery start = active:%q command:%v", model.activeMutation, command)
+	}
+	first := command().(taskBoardMutationMsg)
+	if first.kind != taskBoardRetryMutation {
+		t.Fatalf("authoring recovery message = %#v", first)
+	}
+	updated, _ = model.Update(first)
+	model = updated.(appModel)
+	if model.action == nil || model.pendingAction == nil {
+		t.Fatalf("failed recovery did not preserve pending action: action=%+v pending=%+v", model.action, model.pendingAction)
+	}
+
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	_ = model
+	_ = command().(taskBoardMutationMsg)
+	if len(stub.retryRequests) != 2 {
+		t.Fatalf("authoring recovery dispatches = %+v", stub.retryRequests)
+	}
+	if first, replay := stub.retryRequests[0], stub.retryRequests[1]; first.IdempotencyKey == "" || first.IdempotencyKey != replay.IdempotencyKey || first.TaskID != "task-1" || first.RunID != "run-1" || first.Reason != "recover transient provider failure" {
+		t.Fatalf("authoring recovery idempotency/replay = first:%+v replay:%+v", first, replay)
+	}
+}
+
 func TestAppDetailAndLogViewsFitTheWindow(t *testing.T) {
 	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
 	model := loadedTaskBoardModel(t, stub)

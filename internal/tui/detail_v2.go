@@ -118,6 +118,10 @@ func (d *detailModel) currentRunFields(width int) string {
 		logPath = "暂无本地日志"
 	}
 	retry := "可用"
+	retryLabel := "重试"
+	if run.RetryStrategy == app.TaskBoardRetryStrategyAuthoringRecovery {
+		retryLabel = "恢复/重试"
+	}
 	if !run.CanRetry {
 		retry = run.RetryReason
 		if retry == "" {
@@ -134,7 +138,7 @@ func (d *detailModel) currentRunFields(width int) string {
 		detailField("当前阶段", stage, width),
 		detailField("开始时间", formatDetailTime(run.StartedAt, &run.CreatedAt), width),
 		detailField("日志文件", logPath, width),
-		detailField("重试", retry, width),
+		detailField(retryLabel, retry, width),
 		detailField("取消", cancel, width),
 	)
 }

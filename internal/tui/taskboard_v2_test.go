@@ -74,6 +74,20 @@ func TestDetailGroupsCurrentRunHistoryFailureAndLogPath(t *testing.T) {
 	}
 }
 
+func TestDetailLabelsAuthoringRecoveryWithoutCallingItGenericRetry(t *testing.T) {
+	detail := newDetailModel(&TaskItem{
+		Name: "Task one", Slug: "task-one", RunID: "run-current",
+		Runs: []TaskRunItem{{
+			ID: "run-current", Status: "failed_recoverable", CanRetry: true,
+			RetryStrategy: app.TaskBoardRetryStrategyAuthoringRecovery,
+		}},
+	})
+	rendered := ansi.Strip(detail.View(100, 28))
+	if !strings.Contains(rendered, "恢复/重试") {
+		t.Fatalf("authoring recovery label missing:\n%s", rendered)
+	}
+}
+
 func TestLogModelScrollsBoundedContent(t *testing.T) {
 	logs := newLogModel(&TaskItem{Name: "Task one"}, app.TaskBoardLog{
 		RunID: "run-1", Path: "/managed/logs/run-1.log", Content: strings.Repeat("log line\n", 32),

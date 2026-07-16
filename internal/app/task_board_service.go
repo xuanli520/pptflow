@@ -78,7 +78,19 @@ type TaskBoardRun struct {
 	HasLog        bool
 	CanRetry      bool
 	RetryReason   string
+	RetryStrategy TaskBoardRetryStrategy
 }
+
+// TaskBoardRetryStrategy identifies the durable recovery contract selected for
+// a Run. The terminal adapter uses it only to route an already-confirmed
+// action; each application service revalidates the full subject checkpoint.
+type TaskBoardRetryStrategy string
+
+const (
+	TaskBoardRetryStrategyNone              TaskBoardRetryStrategy = ""
+	TaskBoardRetryStrategyTaskContinuation  TaskBoardRetryStrategy = "task_continuation"
+	TaskBoardRetryStrategyAuthoringRecovery TaskBoardRetryStrategy = "authoring_recovery"
+)
 
 // TaskBoardLog is a bounded read of a worker log selected through a Run's
 // durable handoff record. The TUI receives content, not a filesystem handle.
@@ -136,9 +148,9 @@ type TaskBoardReadRunLogRequest struct {
 	RunID  string
 }
 
-// TaskBoardRetryRunRequest resumes the selected Run through the existing
-// continuation service. Its key is retained by the TUI if a request needs to
-// be retried after an infrastructure failure.
+// TaskBoardRetryRunRequest identifies one confirmed retry or recovery action.
+// Its key is retained by the TUI if a request needs to be retried after an
+// infrastructure failure.
 type TaskBoardRetryRunRequest struct {
 	IdempotencyKey string
 	TaskID         string
@@ -197,28 +209,30 @@ func (service *TaskBoardService) NewIdempotencyKey() (string, error) {
 // rules: source capture, review CAS, durable jobs, and activation stay owned
 // by their established services.
 type TaskBoardService struct {
-	core             *lifecycleServiceCore
-	inspection       *LifecycleInspectionService
-	authoring        *StandardAuthoringLaunchService
-	authoringReviews *AuthoringReviewService
-	mutations        *LifecycleMutationService
-	activations      *RunActivationService
-	continuations    *TaskContinuationService
-	control          *ExecutionControlService
-	actor            func() (string, error)
+	core              *lifecycleServiceCore
+	inspection        *LifecycleInspectionService
+	authoring         *StandardAuthoringLaunchService
+	authoringReviews  *AuthoringReviewService
+	mutations         *LifecycleMutationService
+	activations       *RunActivationService
+	continuations     *TaskContinuationService
+	authoringRecovery *AuthoringRecoveryService
+	control           *ExecutionControlService
+	actor             func() (string, error)
 }
 
-func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService) *TaskBoardService {
+func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService, authoringRecovery *AuthoringRecoveryService) *TaskBoardService {
 	return &TaskBoardService{
-		core:             core,
-		inspection:       inspection,
-		authoring:        authoring,
-		authoringReviews: authoringReviews,
-		mutations:        mutations,
-		activations:      activations,
-		continuations:    continuations,
-		control:          control,
-		actor:            localTaskBoardActor,
+		core:              core,
+		inspection:        inspection,
+		authoring:         authoring,
+		authoringReviews:  authoringReviews,
+		mutations:         mutations,
+		activations:       activations,
+		continuations:     continuations,
+		authoringRecovery: authoringRecovery,
+		control:           control,
+		actor:             localTaskBoardActor,
 	}
 }
 
@@ -474,16 +488,34 @@ func (service *TaskBoardService) ReadRunLog(ctx context.Context, request TaskBoa
 	return log, nil
 }
 
-// RetryRun plans and executes the existing no-content continuation flow for
-// the selected Run. The continuation service remains the authority for which
-// stages are safe to retry and rejects content-changing or operator-only work.
+// RetryRun selects the recovery contract from the durable Run subject. The
+// terminal UI submits one retry intent; task revisions and pre-materialization
+// authoring sessions keep their distinct checkpoint and commit contracts here.
 func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoardRetryRunRequest) (TaskBoardMutation, error) {
-	if service == nil || service.continuations == nil {
-		return TaskBoardMutation{}, fmt.Errorf("task board continuation service is not configured")
+	if service == nil {
+		return TaskBoardMutation{}, fmt.Errorf("task board service is not configured")
 	}
 	prepared, actor, err := service.prepareTaskBoardRunAction(ctx, request.IdempotencyKey, request.TaskID, request.RunID, request.Reason)
 	if err != nil {
 		return TaskBoardMutation{}, err
+	}
+	run, err := service.taskBoardWorkflowRun(ctx, prepared.RunID)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	switch run.SubjectKind {
+	case store.WorkflowRunSubjectTaskRevision:
+		return service.retryTaskRevisionRun(ctx, prepared, actor)
+	case store.WorkflowRunSubjectAuthoringSession:
+		return service.recoverAuthoringRun(ctx, prepared, actor)
+	default:
+		return TaskBoardMutation{}, fmt.Errorf("Run %s has no retry contract", prepared.RunID)
+	}
+}
+
+func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string) (TaskBoardMutation, error) {
+	if service.continuations == nil {
+		return TaskBoardMutation{}, fmt.Errorf("task board continuation service is not configured")
 	}
 	checkpoint, err := service.continuations.CurrentCheckpoint(ctx, prepared.RunID)
 	if err != nil {
@@ -507,6 +539,33 @@ func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoard
 		return TaskBoardMutation{}, err
 	}
 	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Run 排队重试"}, nil
+}
+
+func (service *TaskBoardService) recoverAuthoringRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string) (TaskBoardMutation, error) {
+	if service.authoringRecovery == nil {
+		return TaskBoardMutation{}, fmt.Errorf("task board authoring recovery service is not configured")
+	}
+	checkpoint, err := service.authoringRecovery.CurrentCheckpoint(ctx, prepared.RunID)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	plan, err := service.authoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+		CommandKey: prepared.IdempotencyKey,
+		RunID:      prepared.RunID,
+		Expected:   checkpoint,
+		Actor:      actor,
+		Reason:     prepared.Reason,
+	})
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	if _, err := service.authoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID()); err != nil {
+		return TaskBoardMutation{}, err
+	}
+	if err := service.FlushQueuedRuns(ctx); err != nil {
+		return TaskBoardMutation{}, err
+	}
+	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Standard 创题 Run 排队恢复"}, nil
 }
 
 // CancelRun records a durable termination request for the selected Run. A
@@ -578,6 +637,20 @@ func (service *TaskBoardService) taskBoardRun(ctx context.Context, taskID, runID
 	return detail, nil
 }
 
+func (service *TaskBoardService) taskBoardWorkflowRun(ctx context.Context, runID string) (store.WorkflowRun, error) {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return store.WorkflowRun{}, fmt.Errorf("task board service is not configured")
+	}
+	run, err := service.core.store.GetWorkflowRun(ctx, runID)
+	if err != nil {
+		return store.WorkflowRun{}, fmt.Errorf("read task board Run %s: %w", runID, err)
+	}
+	if run == nil {
+		return store.WorkflowRun{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
+	}
+	return *run, nil
+}
+
 func validateTaskBoardReviewReceipt(receipt LifecycleMutationReceipt, request TaskBoardDecideReviewRequest, action store.ReviewDecisionAction) error {
 	if receipt.Action != LifecycleMutationReview || receipt.TaskID != request.TaskID || receipt.RevisionID != request.Review.RevisionID ||
 		receipt.ReviewRequestID != request.Review.RequestID || receipt.ReviewDecision != string(action) {
@@ -633,7 +706,8 @@ func (service *TaskBoardService) projectTaskBoardTask(ctx context.Context, detai
 		if err != nil {
 			return TaskBoardTask{}, fmt.Errorf("list worker handoffs for Run %s: %w", inspected.Run.ID, err)
 		}
-		task.Runs = append(task.Runs, projectTaskBoardRun(inspected, handoffs))
+		projected := service.projectTaskBoardRun(ctx, inspected, handoffs)
+		task.Runs = append(task.Runs, projected)
 	}
 	latest := task.Runs[0]
 	task.RunID = latest.ID
@@ -647,7 +721,7 @@ func (service *TaskBoardService) projectTaskBoardTask(ctx context.Context, detai
 	return task, nil
 }
 
-func projectTaskBoardRun(inspected RunInspection, handoffs []store.RunWorkerHandoff) TaskBoardRun {
+func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspected RunInspection, handoffs []store.RunWorkerHandoff) TaskBoardRun {
 	logPath := taskBoardLogPath(handoffs)
 	run := TaskBoardRun{
 		ID:           inspected.Run.ID,
@@ -663,8 +737,33 @@ func projectTaskBoardRun(inspected RunInspection, handoffs []store.RunWorkerHand
 	if run.FailureReason == "" {
 		run.FailureReason = taskBoardHandoffFailure(handoffs)
 	}
+	run.RetryStrategy = taskBoardRetryStrategy(inspected.Run)
+	if run.RetryStrategy == TaskBoardRetryStrategyAuthoringRecovery {
+		if service == nil || service.authoringRecovery == nil {
+			run.RetryReason = "Standard 创题恢复服务未配置"
+			return run
+		}
+		canRecover, reason, err := service.authoringRecovery.CanRecover(ctx, inspected.Run.ID)
+		if err != nil {
+			run.RetryReason = "无法验证 Standard 创题恢复资格: " + err.Error()
+			return run
+		}
+		run.CanRetry, run.RetryReason = canRecover, reason
+		return run
+	}
 	run.CanRetry, run.RetryReason = taskBoardRetryAvailability(inspected.Run)
 	return run
+}
+
+func taskBoardRetryStrategy(run store.WorkflowRun) TaskBoardRetryStrategy {
+	switch run.SubjectKind {
+	case store.WorkflowRunSubjectTaskRevision:
+		return TaskBoardRetryStrategyTaskContinuation
+	case store.WorkflowRunSubjectAuthoringSession:
+		return TaskBoardRetryStrategyAuthoringRecovery
+	default:
+		return TaskBoardRetryStrategyNone
+	}
 }
 
 func taskBoardRetryAvailability(run store.WorkflowRun) (bool, string) {

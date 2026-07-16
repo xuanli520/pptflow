@@ -18,6 +18,10 @@ var (
 	// ErrContinuationReconciliationRequired means an unknown side-effect
 	// outcome must be reconciled before another continuation can begin.
 	ErrContinuationReconciliationRequired = errors.New("store: continuation reconciliation is required")
+	// ErrAuthoringRecoveryBarrier means a pre-materialization authoring Run
+	// crossed, or no longer satisfies, the one-way task materialization
+	// boundary while a recovery was being committed.
+	ErrAuthoringRecoveryBarrier = errors.New("store: authoring recovery is blocked by materialization or handoff")
 )
 
 // CommitContinuationExecutionRequest is the single transactional boundary
@@ -34,6 +38,18 @@ type CommitContinuationExecutionRequest struct {
 	Actor          string
 	Reason         string
 	Priority       int
+}
+
+// CommitAuthoringRecoveryExecutionRequest carries the additional immutable
+// source/session and draft-task facts required to resume a Standard authoring
+// Run. They are verified in the same transaction as the continuation epoch
+// CAS, so a materialization cannot race a previously frozen recovery plan.
+type CommitAuthoringRecoveryExecutionRequest struct {
+	CommitContinuationExecutionRequest
+	AuthoringSourceID         string
+	AuthoringSessionID        string
+	TargetTaskID              string
+	ExpectedTargetTaskVersion int64
 }
 
 // ContinuationExecutionCommit is returned after the execution record, its
@@ -56,6 +72,13 @@ type preparedContinuationExecutionCommit struct {
 	Priority       int
 	JobID          string
 	JobKey         string
+}
+
+type authoringRecoveryCommitBarrier struct {
+	authoringSourceID         string
+	authoringSessionID        string
+	targetTaskID              string
+	expectedTargetTaskVersion int64
 }
 
 // GetFrozenPlanByCommand returns the one immutable plan associated with a
@@ -93,6 +116,24 @@ func (s *Store) GetContinuationExecutionByIdempotency(ctx context.Context, idemp
 	return &execution, nil
 }
 
+// HasActiveContinuationExecutionForRun reports whether a coordinator is
+// already queued or running for this Run. Authoring recovery uses it to avoid
+// constructing a second content-producing execution while the first recovery
+// still owns the pre-materialization subject.
+func (s *Store) HasActiveContinuationExecutionForRun(ctx context.Context, runID string) (bool, error) {
+	if !isUUIDv7(runID) {
+		return false, ErrInvalidUUIDv7Identity
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM continuation_executions_v4
+		WHERE run_id = ? AND state IN ('queued', 'running')
+	`, runID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // CommitContinuationExecution atomically proves a frozen plan is still bound
 // to the current run checkpoint, advances that run's execution epoch, writes
 // the immutable execution identity, and queues the worker job/outbox record.
@@ -100,6 +141,22 @@ func (s *Store) GetContinuationExecutionByIdempotency(ctx context.Context, idemp
 // advanced checkpoint, while a second plan based on the old checkpoint loses
 // the optimistic compare-and-swap.
 func (s *Store) CommitContinuationExecution(ctx context.Context, request CommitContinuationExecutionRequest) (ContinuationExecutionCommit, error) {
+	return s.commitContinuationExecution(ctx, request, nil)
+}
+
+// CommitAuthoringRecoveryExecution is the only continuation commit path that
+// may target an authoring_session Run. It intentionally does not relax the
+// generic continuation protocol; it strengthens it with the pre-materialize
+// barrier required by Standard authoring.
+func (s *Store) CommitAuthoringRecoveryExecution(ctx context.Context, request CommitAuthoringRecoveryExecutionRequest) (ContinuationExecutionCommit, error) {
+	barrier, err := prepareAuthoringRecoveryCommitBarrier(request)
+	if err != nil {
+		return ContinuationExecutionCommit{}, err
+	}
+	return s.commitContinuationExecution(ctx, request.CommitContinuationExecutionRequest, &barrier)
+}
+
+func (s *Store) commitContinuationExecution(ctx context.Context, request CommitContinuationExecutionRequest, authoringBarrier *authoringRecoveryCommitBarrier) (ContinuationExecutionCommit, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return ContinuationExecutionCommit{}, err
 	}
@@ -153,6 +210,16 @@ func (s *Store) CommitContinuationExecution(ctx context.Context, request CommitC
 	}
 	if err := verifyControlCheckpointTx(ctx, tx, run, prepared.Expected); err != nil {
 		return ContinuationExecutionCommit{}, err
+	}
+	if run.SubjectKind == WorkflowRunSubjectAuthoringSession {
+		if authoringBarrier == nil {
+			return ContinuationExecutionCommit{}, fmt.Errorf("%w: authoring_session Run requires CommitAuthoringRecoveryExecution", ErrInvalidTransition)
+		}
+		if err := verifyAuthoringRecoveryCommitBarrierTx(ctx, tx, run, prepared.Expected, *authoringBarrier); err != nil {
+			return ContinuationExecutionCommit{}, err
+		}
+	} else if authoringBarrier != nil {
+		return ContinuationExecutionCommit{}, fmt.Errorf("%w: authoring recovery commit requires authoring_session Run", ErrInvalidTransition)
 	}
 	if run.Status == WorkflowRunInDoubt {
 		return ContinuationExecutionCommit{}, fmt.Errorf("%w: workflow run %s is in_doubt", ErrContinuationReconciliationRequired, run.ID)
@@ -271,6 +338,89 @@ func (s *Store) CommitContinuationExecution(ctx context.Context, request CommitC
 		return ContinuationExecutionCommit{}, err
 	}
 	return ContinuationExecutionCommit{Execution: execution, Job: job, Run: run}, nil
+}
+
+func prepareAuthoringRecoveryCommitBarrier(request CommitAuthoringRecoveryExecutionRequest) (authoringRecoveryCommitBarrier, error) {
+	values := []struct {
+		name  string
+		value string
+	}{
+		{name: "authoring recovery source ID", value: request.AuthoringSourceID},
+		{name: "authoring recovery session ID", value: request.AuthoringSessionID},
+		{name: "authoring recovery target task ID", value: request.TargetTaskID},
+	}
+	for _, value := range values {
+		if _, err := requireV4ID(value.value, value.name); err != nil {
+			return authoringRecoveryCommitBarrier{}, err
+		}
+	}
+	if request.ExpectedTargetTaskVersion <= 0 {
+		return authoringRecoveryCommitBarrier{}, fmt.Errorf("authoring recovery expected draft task version must be positive")
+	}
+	return authoringRecoveryCommitBarrier{
+		authoringSourceID:         strings.TrimSpace(request.AuthoringSourceID),
+		authoringSessionID:        strings.TrimSpace(request.AuthoringSessionID),
+		targetTaskID:              strings.TrimSpace(request.TargetTaskID),
+		expectedTargetTaskVersion: request.ExpectedTargetTaskVersion,
+	}, nil
+}
+
+func verifyAuthoringRecoveryCommitBarrierTx(ctx context.Context, tx *sql.Tx, run WorkflowRun, checkpoint ControlCheckpointRef, barrier authoringRecoveryCommitBarrier) error {
+	if run.SubjectKind != WorkflowRunSubjectAuthoringSession || run.AuthoringSessionID != barrier.authoringSessionID ||
+		run.SubjectID != barrier.authoringSourceID || run.SubjectRevisionID != barrier.authoringSessionID ||
+		run.TaskID != "" || run.RevisionID != "" {
+		return fmt.Errorf("%w: authoring Run source/session binding changed", ErrAuthoringRecoveryBarrier)
+	}
+	switch run.Status {
+	case WorkflowRunFailedRecoverable, WorkflowRunPaused:
+	default:
+		if run.Status == WorkflowRunInDoubt {
+			return fmt.Errorf("%w: authoring Run %s", ErrContinuationReconciliationRequired, run.ID)
+		}
+		return fmt.Errorf("%w: authoring Run %s is %s", ErrAuthoringRecoveryBarrier, run.ID, run.Status)
+	}
+	session, err := getAuthoringSessionTx(ctx, tx, barrier.authoringSessionID)
+	if err != nil {
+		return err
+	}
+	if session.SourceID != barrier.authoringSourceID || session.TargetTaskID != barrier.targetTaskID {
+		return fmt.Errorf("%w: authoring session ownership changed", ErrAuthoringRecoveryBarrier)
+	}
+	source, err := getAuthoringSourceTx(ctx, tx, barrier.authoringSourceID)
+	if err != nil {
+		return err
+	}
+	if source.SnapshotContentDigest != checkpoint.SubjectDigest || run.SubjectDigest != source.SnapshotContentDigest {
+		return fmt.Errorf("%w: authoring source digest changed", ErrAuthoringRecoveryBarrier)
+	}
+	if _, err := getAuthoringTaskMaterializationByRunTx(ctx, tx, run.ID); err == nil {
+		return fmt.Errorf("%w: authoring Run %s already has a task materialization", ErrAuthoringRecoveryBarrier, run.ID)
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if _, err := getAuthoringPhase1HandoffByAuthoringRunTx(ctx, tx, run.ID); err == nil {
+		return fmt.Errorf("%w: authoring Run %s already has a Phase-1 handoff", ErrAuthoringRecoveryBarrier, run.ID)
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	task, err := getTaskV2Tx(ctx, tx, barrier.targetTaskID)
+	if err != nil {
+		return err
+	}
+	if task.Version != barrier.expectedTargetTaskVersion || task.CurrentRevisionID != "" || task.LifecycleState != TaskLifecycleDraft {
+		return fmt.Errorf("%w: authoring target task is no longer the expected draft", ErrAuthoringRecoveryBarrier)
+	}
+	var activeContinuations int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM continuation_executions_v4
+		WHERE run_id = ? AND state IN ('queued', 'running')
+	`, run.ID).Scan(&activeContinuations); err != nil {
+		return err
+	}
+	if activeContinuations != 0 {
+		return fmt.Errorf("%w: authoring Run %s already has an active recovery execution", ErrAuthoringRecoveryBarrier, run.ID)
+	}
+	return nil
 }
 
 func prepareContinuationExecutionCommit(s *Store, request CommitContinuationExecutionRequest) (preparedContinuationExecutionCommit, error) {

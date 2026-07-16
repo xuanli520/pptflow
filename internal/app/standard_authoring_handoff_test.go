@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -314,6 +315,104 @@ func TestStandardAuthoringHandoffBlocksReverseCoordinatorCompletionUntilChildIsB
 	}
 }
 
+func TestStandardAuthoringHandoffCompletionResumesMaterializedContinuation(t *testing.T) {
+	ctx := context.Background()
+	var continuation store.ContinuationExecution
+	fixture := newStandardAuthoringHandoffFixtureWithRetrySnapshot(t, func(ctx context.Context, database *store.Store, source store.AuthoringSource, session store.AuthoringSession, run store.WorkflowRun) string {
+		continuation = createStandardAuthoringHandoffContinuationExecution(t, ctx, database, source, session, run)
+		snapshot, err := json.Marshal(runtimeStageAttemptSnapshot{
+			Format:                  runtimeStageAttemptSnapshotFormat,
+			ExecutionKey:            continuation.PlanID,
+			ContinuationExecutionID: continuation.ID,
+			ContinuationPlanID:      continuation.PlanID,
+			Generation:              0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(snapshot)
+	})
+	services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+		OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
+		CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &FrozenExecutionRuntime{core: services.core, services: services}
+	if err := runtime.enqueueStandardAuthoringHandoff(ctx, store.DurableJob{CreatedBy: "worker", Priority: 7}, fixture.run, fixture.stageAttempt); err != nil {
+		t.Fatal(err)
+	}
+	handoff, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-handoff:"+fixture.stageAttempt.ID)
+	if err != nil || handoff == nil {
+		t.Fatalf("queued Standard handoff = %+v, %v", handoff, err)
+	}
+	delivery, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: handoff.ID, ExpectedVersion: handoff.Version, State: store.JobRunning, Actor: "worker", Reason: "consume continuation materialization handoff",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := runtime.handleStandardAuthoringHandoff(ctx, delivery)
+	if err != nil || state != store.JobSucceeded {
+		t.Fatalf("consume continuation materialization handoff = %s, %v", state, err)
+	}
+	if _, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: state, Actor: "worker", Reason: "record continuation materialization handoff",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+handoff.ID)
+	if err != nil || completion == nil || completion.CommandType != "task_continuation.execute" ||
+		completion.EntityType != "continuation_execution" || completion.EntityID != continuation.ID || completion.PayloadJSON != continuation.PayloadJSON {
+		t.Fatalf("continuation completion coordinator = %+v, %v", completion, err)
+	}
+
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := runtimeExecutionPlan{
+		ExecutionKey:            continuation.PlanID,
+		ContinuationExecutionID: continuation.ID,
+		ContinuationPlanID:      continuation.PlanID,
+		Workflow:                resolved.Descriptor,
+		Transitions: map[workflowkit.StageKey]workflowkit.NodeTransition{
+			workflowkit.StageKey(workflowadapter.MaterializeTask): {
+				NodeID: workflowkit.StageKey(workflowadapter.MaterializeTask), FromGeneration: 0, ToGeneration: 0,
+				Disposition: workflowkit.DispositionSchedule,
+			},
+		},
+	}
+	if err := runtime.completeExecutionIfSatisfied(ctx, *completion, fixture.run, frozenRunDefinition{Workflow: resolved.Descriptor}, plan); err != nil {
+		t.Fatalf("complete materialized continuation = %v", err)
+	}
+	parent, err := fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parent == nil || parent.Status != store.WorkflowRunSucceeded {
+		t.Fatalf("parent after continuation handoff = %+v, %v; want succeeded", parent, err)
+	}
+	completed, err := fixture.database.GetContinuationExecution(ctx, continuation.ID)
+	if err != nil || completed == nil || completed.State != store.ContinuationExecutionCompleted {
+		t.Fatalf("continuation after materialized handoff = %+v, %v; want completed", completed, err)
+	}
+	currentHandoff, err := fixture.database.GetDurableJob(ctx, handoff.ID)
+	if err != nil || currentHandoff == nil {
+		t.Fatalf("load completed handoff for reconciliation = %+v, %v", currentHandoff, err)
+	}
+	if err := runtime.reconcileRecoveredStandardAuthoringHandoff(ctx, *currentHandoff); err != nil {
+		t.Fatalf("reconcile completed continuation handoff = %v", err)
+	}
+	parent, err = fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parent == nil || parent.Status != store.WorkflowRunSucceeded {
+		t.Fatalf("parent after replayed continuation handoff = %+v, %v; want succeeded", parent, err)
+	}
+	completed, err = fixture.database.GetContinuationExecution(ctx, continuation.ID)
+	if err != nil || completed == nil || completed.State != store.ContinuationExecutionCompleted {
+		t.Fatalf("continuation after replayed handoff = %+v, %v; want completed", completed, err)
+	}
+}
+
 func TestStandardAuthoringHandoffDefinitionHoldRequiresExplicitRedriveAndReusesChild(t *testing.T) {
 	ctx := context.Background()
 	fixture := newStandardAuthoringHandoffFixture(t)
@@ -590,6 +689,10 @@ type standardAuthoringHandoffFixture struct {
 }
 
 func newStandardAuthoringHandoffFixture(t *testing.T) standardAuthoringHandoffFixture {
+	return newStandardAuthoringHandoffFixtureWithRetrySnapshot(t, nil)
+}
+
+func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnapshot func(context.Context, *store.Store, store.AuthoringSource, store.AuthoringSession, store.WorkflowRun) string) standardAuthoringHandoffFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -641,9 +744,13 @@ func newStandardAuthoringHandoffFixture(t *testing.T) standardAuthoringHandoffFi
 	if err != nil {
 		t.Fatal(err)
 	}
+	retrySnapshotJSON := `{}`
+	if retrySnapshot != nil {
+		retrySnapshotJSON = retrySnapshot(ctx, database, source, session, run)
+	}
 	stageAttempt, err := database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
 		RunID: run.ID, StageKey: workflowadapter.MaterializeTask, StageGroup: string(workflowadapter.StageTaskGeneration), Ordinal: 1,
-		InputFingerprint: "sha256:handoff-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		InputFingerprint: "sha256:handoff-input", BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: retrySnapshotJSON,
 		Actor: "worker", Reason: "create materialization stage",
 	})
 	if err != nil {
@@ -726,6 +833,48 @@ func newStandardAuthoringHandoffFixture(t *testing.T) standardAuthoringHandoffFi
 		t.Fatalf("materialized Task = %+v, %v; want current revision %s", materializedTask, err, handoff.RevisionID)
 	}
 	return standardAuthoringHandoffFixture{root: root, database: database, source: source, session: session, run: run, stageAttempt: stageAttempt, handoff: handoff, handoffArtifactID: handoffArtifactID}
+}
+
+func createStandardAuthoringHandoffContinuationExecution(t *testing.T, ctx context.Context, database *store.Store, source store.AuthoringSource, session store.AuthoringSession, run store.WorkflowRun) store.ContinuationExecution {
+	t.Helper()
+	command, err := database.CreateContinuationCommand(ctx, store.CreateContinuationCommandRequest{
+		CommandKey: "authoring-handoff-continuation-command:" + run.ID, SubjectID: source.ID, RunID: run.ID,
+		PayloadJSON: `{}`, Actor: "worker", Reason: "freeze continuation handoff fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := workflowkit.SHA256Fingerprint([]byte("authoring-handoff-continuation-plan:" + run.ID))
+	plan, err := database.CreateFrozenPlan(ctx, store.CreateFrozenPlanRequest{
+		CommandID: command.ID, SubjectID: source.ID, SubjectRevisionID: session.ID, SubjectDigest: source.SnapshotContentDigest,
+		WorkflowFingerprint: run.DefinitionHash, PlanFingerprint: string(fingerprint), PayloadJSON: `{}`,
+		ExpiresAt: time.Now().Add(time.Hour), Actor: "worker", Reason: "freeze continuation handoff fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(continuationExecutionPayload{
+		Format: continuationExecutionFormat, PlanID: plan.ID, CommandID: command.ID, PlanFingerprint: fingerprint,
+		RunID: run.ID, SourceRunID: run.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := database.CreateContinuationExecution(ctx, store.CreateContinuationExecutionRequest{
+		PlanID: plan.ID, RunID: run.ID, IdempotencyKey: "authoring-handoff-continuation-execution:" + run.ID,
+		PayloadJSON: string(payload), Actor: "worker", Reason: "create continuation handoff fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err = database.TransitionContinuationExecution(ctx, store.TransitionContinuationExecutionRequest{
+		ContinuationExecutionID: execution.ID, ExpectedVersion: execution.Version, State: store.ContinuationExecutionRunning,
+		Actor: "worker", Reason: "begin continuation handoff fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return execution
 }
 
 func errString(err error) string {

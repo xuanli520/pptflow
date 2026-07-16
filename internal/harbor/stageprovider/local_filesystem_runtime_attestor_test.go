@@ -223,7 +223,7 @@ func agentTurnRuntimeAttestationResolution(t *testing.T) workflowadapter.StageOp
 	t.Helper()
 	resolution := operationCatalogLockTestResolution(t, workflowadapter.RepoPrepare)
 	resolution.Operation.Payload = workflowadapter.AgentTurnOperationPayload{
-		AgentID: "codeedge-agent", ModelID: "codeedge-model", MaxTurns: 4,
+		AgentID: "codeedge-agent", ModelID: "codeedge-model", ReasoningEffort: workflowadapter.AgentReasoningEffortHigh, MaxTurns: 4,
 	}
 	return resolution
 }

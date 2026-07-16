@@ -73,19 +73,7 @@ func (service *TaskContinuationService) CurrentCheckpoint(ctx context.Context, r
 	if service == nil || service.core == nil {
 		return workflowkit.CheckpointRef{}, fmt.Errorf("task continuation service is not configured")
 	}
-	run, task, revision, err := service.loadRunBinding(ctx, runID)
-	if err != nil {
-		return workflowkit.CheckpointRef{}, err
-	}
-	return workflowkit.CheckpointRef{
-		Sequence:            uint64(run.Version),
-		ExecutionEpoch:      run.ExecutionEpoch,
-		SubjectVersion:      task.Version,
-		SubjectID:           task.ID,
-		SubjectRevisionID:   revision.ID,
-		SubjectDigest:       workflowkit.SubjectDigest(revision.TaskDigest),
-		WorkflowFingerprint: workflowkit.Fingerprint(run.DefinitionHash),
-	}, nil
+	return currentContinuationCheckpoint(ctx, service.core, runID)
 }
 
 // PlanTaskContinuation validates and persists an immutable user command,
@@ -109,7 +97,7 @@ func (service *TaskContinuationService) PlanTaskContinuation(ctx context.Context
 		}
 		return result.Plan, nil
 	}
-	payload, err := service.normalizeCommand(command)
+	payload, err := normalizeContinuationCommand(command)
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, err
 	}
@@ -135,7 +123,7 @@ func (service *TaskContinuationService) PlanTaskContinuation(ctx context.Context
 	if existing, err := service.core.store.GetFrozenPlanByCommand(ctx, commandRecord.ID); err != nil {
 		return workflowkit.ContinuationPlan{}, err
 	} else if existing != nil {
-		return service.decodeFrozenPlan(ctx, *existing)
+		return decodeFrozenContinuationPlan(ctx, service.core, *existing)
 	}
 
 	compiled, err := service.compileContinuationPlan(ctx, payload, commandRecord.ID)
@@ -166,12 +154,12 @@ func (service *TaskContinuationService) PlanTaskContinuation(ctx context.Context
 		// idempotency without reinterpreting selectors.
 		if errors.Is(err, store.ErrIdempotencyConflict) {
 			if existing, lookupErr := service.core.store.GetFrozenPlanByCommand(ctx, commandRecord.ID); lookupErr == nil && existing != nil {
-				return service.decodeFrozenPlan(ctx, *existing)
+				return decodeFrozenContinuationPlan(ctx, service.core, *existing)
 			}
 		}
 		return workflowkit.ContinuationPlan{}, err
 	}
-	return service.decodeFrozenPlan(ctx, stored)
+	return decodeFrozenContinuationPlan(ctx, service.core, stored)
 }
 
 // PreviewTaskContinuation computes the same frozen plan that a durable
@@ -182,7 +170,7 @@ func (service *TaskContinuationService) PreviewTaskContinuation(ctx context.Cont
 	if service == nil || service.core == nil {
 		return workflowkit.ContinuationPlan{}, fmt.Errorf("task continuation service is not configured")
 	}
-	payload, err := service.normalizeCommand(command)
+	payload, err := normalizeContinuationCommand(command)
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, err
 	}
@@ -208,7 +196,7 @@ type compiledContinuationPlan struct {
 // is shared by durable planning and dry-run preview so their frozen workflow,
 // invalidation, target, and TTL semantics cannot drift.
 func (service *TaskContinuationService) compileContinuationPlan(ctx context.Context, payload normalizedContinuationCommand, commandID string) (compiledContinuationPlan, error) {
-	run, task, revision, err := service.loadRunBinding(ctx, payload.RunID)
+	run, task, revision, err := loadContinuationRunBinding(ctx, service.core, payload.RunID)
 	if err != nil {
 		return compiledContinuationPlan{}, err
 	}
@@ -272,14 +260,24 @@ func (service *TaskContinuationService) GetTaskContinuationPlan(ctx context.Cont
 	if service == nil || service.core == nil {
 		return workflowkit.ContinuationPlan{}, fmt.Errorf("task continuation service is not configured")
 	}
-	plan, err := service.core.store.GetFrozenPlan(ctx, planID)
+	return getFrozenContinuationPlan(ctx, service.core, planID)
+}
+
+// getFrozenContinuationPlan verifies a plan against the workflow frozen in
+// its source Run. Several lifecycle services consume the same immutable plan,
+// so this intentionally belongs below the task-revision facade.
+func getFrozenContinuationPlan(ctx context.Context, core *lifecycleServiceCore, planID string) (workflowkit.ContinuationPlan, error) {
+	if core == nil || core.store == nil {
+		return workflowkit.ContinuationPlan{}, fmt.Errorf("continuation plan store is not configured")
+	}
+	plan, err := core.store.GetFrozenPlan(ctx, planID)
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, err
 	}
 	if plan == nil {
 		return workflowkit.ContinuationPlan{}, fmt.Errorf("%w: plan %s", ErrTaskContinuationNotFound, planID)
 	}
-	return service.decodeFrozenPlan(ctx, *plan)
+	return decodeFrozenContinuationPlan(ctx, core, *plan)
 }
 
 // ExecuteTaskContinuation consumes only a previously frozen plan. It creates
@@ -386,7 +384,9 @@ type continuationExecutionPayload struct {
 	QuotaPolicy workflowadapter.ResolvedQuotaPolicy `json:"quota_policy"`
 }
 
-func (service *TaskContinuationService) normalizeCommand(command ContinueTaskCommand) (normalizedContinuationCommand, error) {
+// normalizeContinuationCommand has no service dependencies, so content and
+// no-content continuation paths share the exact immutable command shape.
+func normalizeContinuationCommand(command ContinueTaskCommand) (normalizedContinuationCommand, error) {
 	if command.Change != nil {
 		return normalizedContinuationCommand{}, fmt.Errorf("content changes must be planned through ChangeProviderService")
 	}
@@ -458,22 +458,43 @@ func (service *TaskContinuationService) normalizeCommand(command ContinueTaskCom
 	}, nil
 }
 
-func (service *TaskContinuationService) loadRunBinding(ctx context.Context, runID string) (store.WorkflowRun, store.TaskV2, store.TaskRevision, error) {
-	run, err := service.core.store.GetWorkflowRun(ctx, runID)
+func currentContinuationCheckpoint(ctx context.Context, core *lifecycleServiceCore, runID string) (workflowkit.CheckpointRef, error) {
+	run, task, revision, err := loadContinuationRunBinding(ctx, core, runID)
+	if err != nil {
+		return workflowkit.CheckpointRef{}, err
+	}
+	return workflowkit.CheckpointRef{
+		Sequence:            uint64(run.Version),
+		ExecutionEpoch:      run.ExecutionEpoch,
+		SubjectVersion:      task.Version,
+		SubjectID:           task.ID,
+		SubjectRevisionID:   revision.ID,
+		SubjectDigest:       workflowkit.SubjectDigest(revision.TaskDigest),
+		WorkflowFingerprint: workflowkit.Fingerprint(run.DefinitionHash),
+	}, nil
+}
+
+// loadContinuationRunBinding resolves the exact task-revision lineage used
+// by continuation and content-change commands without constructing a service.
+func loadContinuationRunBinding(ctx context.Context, core *lifecycleServiceCore, runID string) (store.WorkflowRun, store.TaskV2, store.TaskRevision, error) {
+	if core == nil || core.store == nil {
+		return store.WorkflowRun{}, store.TaskV2{}, store.TaskRevision{}, fmt.Errorf("task continuation service is not configured")
+	}
+	run, err := core.store.GetWorkflowRun(ctx, runID)
 	if err != nil {
 		return store.WorkflowRun{}, store.TaskV2{}, store.TaskRevision{}, err
 	}
 	if run == nil {
 		return store.WorkflowRun{}, store.TaskV2{}, store.TaskRevision{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 	}
-	task, err := service.core.store.GetTaskV2(ctx, run.TaskID)
+	task, err := core.store.GetTaskV2(ctx, run.TaskID)
 	if err != nil {
 		return store.WorkflowRun{}, store.TaskV2{}, store.TaskRevision{}, err
 	}
 	if task == nil {
 		return store.WorkflowRun{}, store.TaskV2{}, store.TaskRevision{}, fmt.Errorf("%w: task %s", ErrLifecycleNotFound, run.TaskID)
 	}
-	revision, err := service.core.store.GetTaskRevision(ctx, run.RevisionID)
+	revision, err := core.store.GetTaskRevision(ctx, run.RevisionID)
 	if err != nil {
 		return store.WorkflowRun{}, store.TaskV2{}, store.TaskRevision{}, err
 	}
@@ -486,7 +507,10 @@ func (service *TaskContinuationService) loadRunBinding(ctx context.Context, runI
 	return *run, *task, *revision, nil
 }
 
-func (service *TaskContinuationService) decodeFrozenPlan(ctx context.Context, stored store.FrozenPlan) (workflowkit.ContinuationPlan, error) {
+func decodeFrozenContinuationPlan(ctx context.Context, core *lifecycleServiceCore, stored store.FrozenPlan) (workflowkit.ContinuationPlan, error) {
+	if core == nil || core.store == nil {
+		return workflowkit.ContinuationPlan{}, fmt.Errorf("continuation plan store is not configured")
+	}
 	var snapshot workflowkit.ContinuationPlanSnapshot
 	if err := decodeStrictJSON(stored.PayloadJSON, &snapshot); err != nil {
 		return workflowkit.ContinuationPlan{}, fmt.Errorf("decode frozen continuation plan %s: %w", stored.ID, err)
@@ -495,7 +519,7 @@ func (service *TaskContinuationService) decodeFrozenPlan(ctx context.Context, st
 		snapshot.SubjectDigest != workflowkit.SubjectDigest(stored.SubjectDigest) || !snapshot.ExpiresAt.Equal(stored.ExpiresAt) {
 		return workflowkit.ContinuationPlan{}, fmt.Errorf("stored continuation plan %s has inconsistent immutable fields", stored.ID)
 	}
-	run, err := service.core.store.GetWorkflowRun(ctx, snapshot.SourceRunID)
+	run, err := core.store.GetWorkflowRun(ctx, snapshot.SourceRunID)
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, err
 	}
@@ -746,17 +770,32 @@ type continuationStateObserver interface {
 	Observe(context.Context, store.WorkflowRun, store.TaskRevision, workflowkit.WorkflowDescriptor) (continuationRunState, error)
 }
 
+// continuationSubjectStateObserver is the subject-neutral counterpart used by
+// pre-materialization authoring recovery. Keeping the task-revision interface
+// above preserves the narrow contract used by task continuation and candidate
+// planning while sharing the durable artifact-lineage verification below.
+type continuationSubjectStateObserver interface {
+	ObserveSubject(context.Context, store.WorkflowRun, workflowRunSubject, workflowkit.WorkflowDescriptor) (continuationRunState, error)
+}
+
 type storeContinuationStateObserver struct {
 	dataStore *store.Store
 	objects   *workflowruntime.ArtifactObjectStore
 }
 
 func (observer storeContinuationStateObserver) Observe(ctx context.Context, run store.WorkflowRun, revision store.TaskRevision, workflow workflowkit.WorkflowDescriptor) (continuationRunState, error) {
+	return observer.ObserveSubject(ctx, run, taskRevisionSubjectForLineage(run, revision), workflow)
+}
+
+func (observer storeContinuationStateObserver) ObserveSubject(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, workflow workflowkit.WorkflowDescriptor) (continuationRunState, error) {
 	if observer.dataStore == nil {
 		return continuationRunState{}, fmt.Errorf("continuation state store is required")
 	}
 	if observer.objects == nil {
 		return continuationRunState{}, fmt.Errorf("continuation artifact object store is required")
+	}
+	if !subject.isTaskRevision() && !subject.isAuthoringSession() {
+		return continuationRunState{}, fmt.Errorf("continuation state subject is unsupported")
 	}
 	attempts, err := observer.dataStore.ListStageAttemptsForRun(ctx, run.ID)
 	if err != nil {
@@ -790,12 +829,12 @@ func (observer storeContinuationStateObserver) Observe(ctx context.Context, run 
 		}
 	}
 	for _, stage := range workflow.Stages {
-		state.ReuseStates = append(state.ReuseStates, observer.reuseState(ctx, run, revision, stage, state.Latest[stage.Key]))
+		state.ReuseStates = append(state.ReuseStates, observer.reuseStateForSubject(ctx, run, subject, stage, state.Latest[stage.Key]))
 	}
 	return state, nil
 }
 
-func (observer storeContinuationStateObserver) reuseState(ctx context.Context, run store.WorkflowRun, revision store.TaskRevision, stage workflowkit.StageDescriptor, latest store.StageAttempt) workflowkit.StageReuseState {
+func (observer storeContinuationStateObserver) reuseStateForSubject(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, stage workflowkit.StageDescriptor, latest store.StageAttempt) workflowkit.StageReuseState {
 	missing := workflowkit.StageReuseState{NodeID: stage.Key}
 	if latest.ID == "" || latest.ExecutionStatus != store.StageExecutionCompleted || strings.TrimSpace(latest.ArtifactManifestID) == "" {
 		return missing
@@ -819,8 +858,8 @@ func (observer storeContinuationStateObserver) reuseState(ctx context.Context, r
 	var expectedInputs workflowkit.Fingerprint
 	var currentInputs []workflowkit.ArtifactBinding
 	for _, reference := range references {
-		if reference.RunID != run.ID || reference.StageKey != string(stage.Key) || reference.SubjectRevisionID != revision.ID ||
-			reference.SubjectDigest != revision.TaskDigest || reference.WorkflowFingerprint != run.DefinitionHash || reference.AttemptID != latest.ID {
+		if reference.RunID != run.ID || reference.StageKey != string(stage.Key) || reference.SubjectRevisionID != subject.subjectRevisionID() ||
+			reference.SubjectDigest != subject.subjectDigest() || reference.WorkflowFingerprint != run.DefinitionHash || reference.AttemptID != latest.ID {
 			return missing
 		}
 		specification, exists := outputs[reference.ArtifactKey]
@@ -831,7 +870,7 @@ func (observer storeContinuationStateObserver) reuseState(ctx context.Context, r
 			return missing
 		}
 		seenOutputs[reference.ArtifactKey] = struct{}{}
-		if err := verifyStageArtifactCandidateWithManifest(ctx, observer.objects, manifest, run, revision, stageArtifactCandidate{attempt: latest, ref: reference}); err != nil {
+		if err := verifyStageArtifactCandidateWithManifestForSubject(ctx, observer.objects, manifest, run, subject, stageArtifactCandidate{attempt: latest, ref: reference}); err != nil {
 			return missing
 		}
 		var bindings []workflowkit.ArtifactBinding
@@ -1000,7 +1039,23 @@ func isContentChangingStage(stage workflowkit.StageDescriptor) bool {
 	return stage.Effect == workflowkit.EffectContentProducer || stage.Effect == workflowkit.EffectContentMutator
 }
 
+type continuationPlanInput struct {
+	Expected                    workflowkit.CheckpointRef
+	ExternalEffectConfirmations []workflowkit.ExternalEffectConfirmation
+}
+
 func buildNoChangeContinuationPlan(planID, commandID string, command normalizedContinuationCommand, run store.WorkflowRun, revision store.TaskRevision, workflow workflowkit.WorkflowDescriptor, state continuationRunState, invalidation workflowkit.InvalidationPlan, targets []workflowkit.NodeID, strategy workflowkit.ContinuationStrategy, expiresAt time.Time) (workflowkit.ContinuationPlanSnapshot, error) {
+	return buildSameRunContinuationPlan(planID, commandID, continuationPlanInput{
+		Expected:                    command.Expected,
+		ExternalEffectConfirmations: command.ExternalEffectConfirmations,
+	}, run, revision.ID, workflowkit.SubjectDigest(revision.TaskDigest), workflow, state, invalidation, targets, strategy, expiresAt, false)
+}
+
+// buildSameRunContinuationPlan owns the common immutable transition shape for
+// task-revision and pre-materialization authoring recoveries. The latter is
+// the one bounded case where content-producing stages remain inside the same
+// immutable source/session subject, before materialize_task exists.
+func buildSameRunContinuationPlan(planID, commandID string, input continuationPlanInput, run store.WorkflowRun, subjectRevisionID string, subjectDigest workflowkit.SubjectDigest, workflow workflowkit.WorkflowDescriptor, state continuationRunState, invalidation workflowkit.InvalidationPlan, targets []workflowkit.NodeID, strategy workflowkit.ContinuationStrategy, expiresAt time.Time, allowContentStages bool) (workflowkit.ContinuationPlanSnapshot, error) {
 	targetSet := make(map[workflowkit.NodeID]struct{}, len(targets))
 	for _, target := range targets {
 		targetSet[target] = struct{}{}
@@ -1013,8 +1068,8 @@ func buildNoChangeContinuationPlan(planID, commandID string, command normalizedC
 	for _, reuse := range state.ReuseStates {
 		reuseByNode[reuse.NodeID] = reuse
 	}
-	confirmations := make(map[workflowkit.NodeID]workflowkit.ExternalEffectConfirmation, len(command.ExternalEffectConfirmations))
-	for _, confirmation := range command.ExternalEffectConfirmations {
+	confirmations := make(map[workflowkit.NodeID]workflowkit.ExternalEffectConfirmation, len(input.ExternalEffectConfirmations))
+	for _, confirmation := range input.ExternalEffectConfirmations {
 		confirmations[confirmation.NodeID] = confirmation
 	}
 	emptyInputs, err := workflowkit.FingerprintArtifactBindings(nil)
@@ -1056,7 +1111,7 @@ func buildNoChangeContinuationPlan(planID, commandID string, command normalizedC
 			transition.ExpectedInputFingerprint = reuse.ExpectedInputFingerprint
 			transition.InputBindings = append([]workflowkit.ArtifactBinding(nil), reuse.CurrentInputs...)
 		case workflowkit.ImpactInvalidate:
-			if isContentChangingStage(stage) {
+			if !allowContentStages && isContentChangingStage(stage) {
 				return workflowkit.ContinuationPlanSnapshot{}, fmt.Errorf("%w: invalidation would schedule content-changing stage %q without a candidate revision", ErrTaskContinuationTarget, stage.Key)
 			}
 			transition.Disposition = workflowkit.DispositionSchedule
@@ -1102,7 +1157,7 @@ func buildNoChangeContinuationPlan(planID, commandID string, command normalizedC
 	if err != nil {
 		return workflowkit.ContinuationPlanSnapshot{}, err
 	}
-	checkpointFingerprint, err := continuationCheckpointFingerprint(command.Expected)
+	checkpointFingerprint, err := continuationCheckpointFingerprint(input.Expected)
 	if err != nil {
 		return workflowkit.ContinuationPlanSnapshot{}, err
 	}
@@ -1110,12 +1165,12 @@ func buildNoChangeContinuationPlan(planID, commandID string, command normalizedC
 		PlanID:                      planID,
 		CommandID:                   commandID,
 		Strategy:                    strategy,
-		BaseCheckpoint:              command.Expected,
+		BaseCheckpoint:              input.Expected,
 		NextExecutionEpoch:          run.ExecutionEpoch + 1,
 		SourceRunID:                 run.ID,
 		TargetRunRelation:           workflowkit.RelationSameRunAttempt,
-		SubjectRevisionID:           revision.ID,
-		SubjectDigest:               workflowkit.SubjectDigest(revision.TaskDigest),
+		SubjectRevisionID:           subjectRevisionID,
+		SubjectDigest:               subjectDigest,
 		Nodes:                       transitions,
 		Schedule:                    schedule,
 		Assertions:                  []workflowkit.PlanAssertion{{Kind: workflowkit.AssertionCheckpointCurrent, Subject: run.ID, Expected: checkpointFingerprint}},

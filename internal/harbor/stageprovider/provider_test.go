@@ -93,7 +93,7 @@ func TestTypedWorkflowkitStageOperationProviderDispatchesOnlyTypedPayloads(t *te
 		},
 		{
 			name:      "agent turn",
-			operation: workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "agent", Version: "1", Payload: workflowadapter.AgentTurnOperationPayload{AgentID: "repair_agent", ModelID: "model_v2", MaxTurns: 2}},
+			operation: workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "agent", Version: "1", Payload: workflowadapter.AgentTurnOperationPayload{AgentID: "repair_agent", ModelID: "model_v2", ReasoningEffort: workflowadapter.AgentReasoningEffortHigh, MaxTurns: 2}},
 			install: func(called *bool) TypedWorkflowkitOperationHandlers {
 				return TypedWorkflowkitOperationHandlers{AgentTurn: AgentTurnOperationExecutorFunc(func(_ context.Context, _ StageOperationInvocation, payload workflowadapter.AgentTurnOperationPayload) (workflowkit.StageExecutionResult, error) {
 					*called = payload.AgentID == "repair_agent" && payload.MaxTurns == 2

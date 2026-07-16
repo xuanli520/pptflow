@@ -8,6 +8,8 @@ set -euo pipefail
 # --execution-profile accepted by the Go generator, including --build-version,
 # --lock-version, --git-executable, --ssh-executable, --ssh-wrapper-shell,
 # --codex-node, --codex-launcher, --codex-home, and --codex-model-version.
+# The approved model and reasoning effort are source-controlled in the catalog;
+# ambient Codex configuration is never used as a substitute.
 
 die() {
   echo "generate-standard-authoring-lock: $*" >&2

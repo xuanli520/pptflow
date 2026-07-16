@@ -268,7 +268,7 @@ func standardAuthoringAttestedBridgeFixture(t *testing.T) (workflowkit.StageDesc
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1}
+	payload := standardAuthoringCodexTestPayload(1)
 	resolution := workflowadapter.StageOperationResolution{
 		StageKey:  stage.Key,
 		Operation: workflowadapter.StageOperationBinding{Payload: payload},

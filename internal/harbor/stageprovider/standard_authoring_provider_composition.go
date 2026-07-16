@@ -119,6 +119,10 @@ func NewStandardAuthoringProviderComposition(config StandardAuthoringProviderCom
 		case workflowadapter.LocalCommandOperationPayload, workflowadapter.HarborBuiltinOperationPayload:
 			typedRegistrations = append(typedRegistrations, TypedWorkflowkitStageOperationRegistration{StageKey: record.Stage.Key, Operation: record.Operation.Clone()})
 		case workflowadapter.AgentTurnOperationPayload:
+			payload := record.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+			if !IsCodexAppServerProductionPayload(payload) {
+				return nil, fmt.Errorf("%w: Standard authoring Codex agent.turn must pin model %q with reasoning effort %q", ErrDeploymentOperationCatalogDrift, CodexAppServerProductionModelID, CodexAppServerProductionReasoningEffort)
+			}
 			requiresAgentTurn = true
 			typedRegistrations = append(typedRegistrations, TypedWorkflowkitStageOperationRegistration{StageKey: record.Stage.Key, Operation: record.Operation.Clone()})
 		case workflowadapter.DurableReviewOperationPayload:

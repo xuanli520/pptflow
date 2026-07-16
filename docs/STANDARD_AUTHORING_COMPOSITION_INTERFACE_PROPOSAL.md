@@ -16,7 +16,7 @@ The closed deployment catalog permits only:
 | Payload kind | Standard authoring use | Runtime proof |
 | --- | --- | --- |
 | `local.command` | `repo_prepare` Git snapshot | exact regular Git executable, SHA-256, version, no caller argv |
-| `agent.turn` | analysis and content generation | pinned Codex JS launcher/Node/CODEX_HOME/sandbox plus locked prompt/schema assets |
+| `agent.turn` | analysis and content generation | pinned Codex JS launcher/Node/CODEX_HOME/sandbox, `gpt-5.6-terra` / `xhigh`, plus locked prompt/schema assets |
 | `durable.review` | task, content, and solution gates | versioned durable-review policy; normal workflow handling waits for a decision |
 | `harbor.builtin` | `materialize_task` | exact handler ID/version and Harbor Flow build identity |
 

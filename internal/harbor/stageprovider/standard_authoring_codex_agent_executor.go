@@ -375,7 +375,8 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	}
 	conversation, err := runtime.OpenConversation(ctx, agent.ConversationRequest{
 		ProjectPath:       workspace,
-		Model:             CodexAppServerProductionModelID,
+		Model:             attestedInvocation.ModelID,
+		ReasoningEffort:   string(attestedInvocation.ReasoningEffort),
 		SandboxMode:       attestedInvocation.SandboxMode,
 		SandboxPolicy:     attestedInvocation.SandboxPolicy,
 		NetworkAccess:     false,
@@ -416,7 +417,8 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		turnRequest := agent.TurnRequest{
 			ProjectPath:       workspace,
 			Prompt:            prompt,
-			Model:             CodexAppServerProductionModelID,
+			Model:             attestedInvocation.ModelID,
+			ReasoningEffort:   string(attestedInvocation.ReasoningEffort),
 			SandboxMode:       attestedInvocation.SandboxMode,
 			SandboxPolicy:     attestedInvocation.SandboxPolicy,
 			NetworkAccess:     false,
@@ -437,7 +439,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			}
 			return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 		}
-		if result.Model != CodexAppServerProductionModelID {
+		if result.Model != attestedInvocation.ModelID {
 			_ = conversation.Close()
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureRuntime), nil
 		}
@@ -475,7 +477,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionReques
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	expectedAgentTurns, hasAgentTurnQuota := standardAuthoringCodexAgentTurnQuota(request.Stage)
-	if payload.AgentID == "" || payload.ModelID != CodexAppServerProductionModelID || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns {
+	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns {
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	if request.Claim.Stage == nil || strings.TrimSpace(string(request.Claim.Stage.StageAttempt.ID)) == "" || request.Checkpoint == nil || request.Charge == nil {
@@ -503,7 +505,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) runtimeForEffect(ctx co
 	if err != nil {
 		return CodexAppServerInvocation{}, nil, standardAuthoringCodexFailureConfiguration
 	}
-	if err := validateStandardAuthoringCodexInvocation(attestedInvocation); err != nil || attestedInvocation.AgentID != payload.AgentID || attestedInvocation.ModelID != payload.ModelID {
+	if err := validateStandardAuthoringCodexInvocation(attestedInvocation); err != nil || attestedInvocation.AgentID != payload.AgentID || attestedInvocation.ModelID != payload.ModelID || attestedInvocation.ReasoningEffort != payload.ReasoningEffort {
 		return CodexAppServerInvocation{}, nil, standardAuthoringCodexFailureConfiguration
 	}
 	runtimeFactory := executor.runtimeFactory
@@ -689,7 +691,7 @@ func validateStandardAuthoringCodexInvocation(invocation CodexAppServerInvocatio
 			return err
 		}
 	}
-	if invocation.ModelID != CodexAppServerProductionModelID || invocation.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || invocation.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || invocation.NetworkAccess || !filepath.IsAbs(invocation.JavaScriptLauncherPath) || !filepath.IsAbs(invocation.NodeExecutablePath) || !filepath.IsAbs(invocation.CodexHomeDirectory) {
+	if invocation.AgentID != CodexAppServerProductionAgentID || invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || invocation.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || invocation.NetworkAccess || !filepath.IsAbs(invocation.JavaScriptLauncherPath) || !filepath.IsAbs(invocation.NodeExecutablePath) || !filepath.IsAbs(invocation.CodexHomeDirectory) {
 		return fmt.Errorf("%w: invocation does not satisfy the locked Codex production policy", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return nil

@@ -18,7 +18,7 @@ harbor-factory --root .harbor-factory tui
 | `Up` / `Down`、`j` / `k` | 选择任务。 |
 | `d` | 打开任务详情，分区查看来源、当前 Run、失败原因、运行记录、日志路径和审核状态。 |
 | `l` | 在任务详情中读取当前 Run 的受控本地日志；日志页支持滚动和刷新。 |
-| `t` | 对可续跑的当前任务修订 Run 打开重试确认。 |
+| `t` | 对可续跑的 Run 打开恢复/重试确认；创题 Run 使用专属恢复契约。 |
 | `x` | 对当前可取消的 Run 打开取消确认。 |
 | `n` | 创建 Standard 创题任务；仅在当前部署已配置该能力时显示。 |
 | `a` / `r` | 在详情中打开批准或要求修改的审核原因确认输入。 |
@@ -37,7 +37,18 @@ harbor-factory --root .harbor-factory tui
 
 详情页将来源、当前运行、失败原因和运行历史分区呈现。当前运行区会显示日志文件路径；按 `l` 后，TUI 只读取该 Run 的 durable worker handoff 已记录的本地日志，并展示最多 64 KiB 的尾部内容。它不会接受或打开任意用户提供的文件路径。
 
-`t` 和 `x` 都要求填写原因并按 `Enter` 确认。取消会写入 durable termination control，不会由 TUI 直接终止进程。重试复用既有 no-content continuation 契约，因此只对当前状态允许且任务修订型的 Run 显示；Standard 创题 Run 会明确显示需要专用恢复流程，而不会提供一个必然失败的重试动作。
+`t` 和 `x` 都要求填写原因并按 `Enter` 确认。取消会写入 durable termination control，不会由 TUI 直接终止进程。任务修订 Run 使用既有 no-content continuation；Standard 创题 Run 在 `failed_recoverable` 或 `paused` 时显示“恢复/重试”，并通过冻结的 source/session checkpoint 重新排队失败阶段及其下游。恢复不会修改模型、推理强度、源码快照或 Run 定义；模型或推理强度变更不能原地恢复旧的冻结 Run，必须通过新部署新建创题 Task、Session 和 Run，可复用同一 immutable source snapshot，但不得复用旧 artifacts。已物化题目或已交接 Phase-1 的 Run 不会提供该操作。
+
+CLI 可执行同一恢复路径：
+
+```text
+harbor-factory --root .harbor-factory authoring recover \
+  --run <authoring-run-uuidv7> \
+  --idempotency-key <uuidv7> \
+  --reason "recover transient provider failure"
+```
+
+附加 `--dry-run` 只返回恢复计划，不写入 command、plan、execution 或 worker job。网络响应丢失后，使用相同的幂等键重试；服务会重放原计划或执行回执，而不是重新解释较新的 Run 状态。
 
 ## 审核
 

@@ -52,6 +52,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		}
 	}
 
+	agentStages := 0
 	for _, registration := range catalog.Catalog().Operations {
 		entry, found := byStage[string(registration.Stage.Key)]
 		if !found {
@@ -60,6 +61,10 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		payload, isAgentTurn := registration.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
 		if !isAgentTurn {
 			continue
+		}
+		agentStages++
+		if !IsCodexAppServerProductionPayload(payload) {
+			t.Fatalf("agent stage %q payload = %+v, want frozen %s/%s", registration.Stage.Key, payload, CodexAppServerProductionModelID, CodexAppServerProductionReasoningEffort)
 		}
 		promptRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", filepath.FromSlash(entry.Prompt.RelativePath)))
 		if err != nil {
@@ -82,6 +87,9 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		if err := ValidateStandardAuthoringCodexOutputSchemaAsset(schemaRaw); err != nil {
 			t.Fatalf("validate canonical Codex schema asset for %q: %v", registration.Stage.Key, err)
 		}
+	}
+	if agentStages != 9 {
+		t.Fatalf("catalog Codex agent stages = %d, want 9", agentStages)
 	}
 }
 
@@ -274,7 +282,10 @@ func standardAuthoringDeploymentTestLock(t *testing.T, catalog *DeploymentOperat
 				CodexHomeDirectory: "/opt/standard-authoring/codex-home", CLIVersionOutput: "codex-cli 0.133.0",
 				SandboxMode: CodexAppServerSandboxModeWorkspaceWrite, SandboxPolicy: CodexAppServerSandboxPolicyWorkspaceWrite,
 			}
-			record.AgentModel = &AgentModelLock{AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID, ModelVersion: "gpt-5.5"}
+			record.AgentModel = &AgentModelLock{
+				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
+				ModelVersion: "gpt-5.6-terra",
+			}
 			record.CodexAppServer = &codex
 		case workflowadapter.DurableReviewOperationPayload:
 			record.DurableReviewPolicy = &DurableReviewPolicyLock{PolicyID: payload.PolicyID, Version: "1.0.0"}

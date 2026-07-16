@@ -14,7 +14,7 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-func TestCodexAppServerOperationLockValidatesOnlyClosedProductionProfile(t *testing.T) {
+func TestCodexAppServerOperationLockValidatesTypedRuntimeContract(t *testing.T) {
 	fixture := newCodexAppServerAttestationFixture(t)
 	cases := []struct {
 		name   string
@@ -78,16 +78,36 @@ func TestCodexAppServerOperationLockValidatesOnlyClosedProductionProfile(t *test
 			}
 		})
 	}
-	t.Run("unapproved model", func(t *testing.T) {
-		candidate := fixture.attestation.Record.Clone()
-		candidate.AgentModel.ModelID = "gpt-5.4"
-		candidate.Operation.Payload = workflowadapter.AgentTurnOperationPayload{
-			AgentID: candidate.AgentModel.AgentID, ModelID: candidate.AgentModel.ModelID, MaxTurns: 4,
-		}
-		if err := candidate.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
-			t.Fatalf("unapproved Codex model error = %v, want invalid deployment lock", err)
-		}
-	})
+	for name, mutate := range map[string]func(*DeploymentOperationCatalogLockRecord){
+		"unapproved model": func(candidate *DeploymentOperationCatalogLockRecord) {
+			candidate.AgentModel.ModelID = "gpt-5.4"
+			payload := candidate.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+			payload.ModelID = candidate.AgentModel.ModelID
+			candidate.Operation.Payload = payload
+		},
+		"legacy missing reasoning effort": func(candidate *DeploymentOperationCatalogLockRecord) {
+			payload := candidate.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+			payload.ReasoningEffort = ""
+			candidate.Operation.Payload = payload
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := fixture.attestation.Record.Clone()
+			mutate(&candidate)
+			if err := candidate.Validate(); err != nil {
+				t.Fatalf("historical Codex lock record should remain decodable: %v", err)
+			}
+			attestation := fixture.attestation
+			attestation.Record = candidate
+			attestor, err := NewCodexAppServerRuntimeAttestor(CodexAppServerRuntimeAttestorConfig{HarborFlowBuild: fixture.attestation.HarborFlowBuild})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := attestor.AttestCodexAppServerOperation(context.Background(), attestation); err == nil || !errors.Is(err, ErrDeploymentOperationRuntimeAttestationFailed) {
+				t.Fatalf("legacy/unapproved Codex execution error = %v, want runtime attestation failure", err)
+			}
+		})
+	}
 
 	t.Run("extension is only valid for agent turn", func(t *testing.T) {
 		resolution := operationCatalogLockTestResolution(t, workflowadapter.RepoPrepare)
@@ -120,8 +140,8 @@ func TestCodexAppServerRuntimeAttestorProvesPinnedRuntimeWithExplicitSecretFreeE
 	if invocation.JavaScriptLauncherPath != fixture.launcher || invocation.NodeExecutablePath != fixture.node || invocation.CodexHomeDirectory != fixture.home {
 		t.Fatalf("invocation paths = %+v, want launcher/node/home from immutable lock", invocation)
 	}
-	if invocation.ModelID != CodexAppServerProductionModelID || invocation.AgentID == "" || invocation.AgentVersion == "" || invocation.ModelVersion == "" {
-		t.Fatalf("invocation agent/model = %+v, want frozen gpt-5.5 agent identity", invocation)
+	if invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.AgentID == "" || invocation.AgentVersion == "" || invocation.ModelVersion == "" {
+		t.Fatalf("invocation agent configuration = %+v, want frozen production identity", invocation)
 	}
 	if invocation.CLIVersionOutput != "codex-cli 0.133.0" || invocation.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || invocation.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || invocation.NetworkAccess {
 		t.Fatalf("invocation policy = %+v, want locked workspace-write/network-disabled Codex policy", invocation)
@@ -307,7 +327,9 @@ exit 94
 
 	resolution := agentTurnRuntimeAttestationResolution(t)
 	payload := resolution.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+	payload.AgentID = CodexAppServerProductionAgentID
 	payload.ModelID = CodexAppServerProductionModelID
+	payload.ReasoningEffort = CodexAppServerProductionReasoningEffort
 	resolution.Operation.Payload = payload
 	catalogDocument := operationCatalogLockCatalogForResolutions(t, resolution)
 	catalog, err := NewDeploymentOperationCatalogResolver(catalogDocument)

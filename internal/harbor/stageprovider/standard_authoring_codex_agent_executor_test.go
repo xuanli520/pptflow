@@ -34,12 +34,10 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
 		Request: request,
 		Resolution: workflowadapter.StageOperationResolution{
-			StageKey: stage.Key,
-			Operation: workflowadapter.StageOperationBinding{Payload: workflowadapter.AgentTurnOperationPayload{
-				AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: len(program.TurnPrompts),
-			}},
+			StageKey:  stage.Key,
+			Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts))},
 		},
-	}, workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 2})
+	}, standardAuthoringCodexTestPayload(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,10 +51,10 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 		t.Fatalf("open requests = %d, want one", len(runtime.openRequests))
 	}
 	open := runtime.openRequests[0]
-	if open.Model != CodexAppServerProductionModelID || open.NetworkAccess || open.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || open.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || open.LogPath != os.DevNull {
+	if open.Model != CodexAppServerProductionModelID || open.ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || open.NetworkAccess || open.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || open.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || open.LogPath != os.DevNull {
 		t.Fatalf("controlled conversation request = %+v", open)
 	}
-	if len(runtime.conversation.requests) != 2 || runtime.conversation.requests[0].Model != CodexAppServerProductionModelID || len(runtime.conversation.requests[0].Input) != 1 || len(runtime.conversation.requests[1].Input) != 0 {
+	if len(runtime.conversation.requests) != 2 || runtime.conversation.requests[0].Model != CodexAppServerProductionModelID || runtime.conversation.requests[0].ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || runtime.conversation.requests[1].ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || len(runtime.conversation.requests[0].Input) != 1 || len(runtime.conversation.requests[1].Input) != 0 {
 		t.Fatalf("turn requests = %+v", runtime.conversation.requests)
 	}
 	firstInput := runtime.conversation.requests[0].Input[0].Text
@@ -136,9 +134,9 @@ func TestStandardAuthoringCodexAgentTurnExecutorFailsClosedWithoutLeakingProvide
 			result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
 				Request: request,
 				Resolution: workflowadapter.StageOperationResolution{StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{
-					Payload: workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: len(program.TurnPrompts)},
+					Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts)),
 				}},
-			}, workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1})
+			}, standardAuthoringCodexTestPayload(1))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -149,24 +147,40 @@ func TestStandardAuthoringCodexAgentTurnExecutorFailsClosedWithoutLeakingProvide
 	}
 }
 
-func TestStandardAuthoringCodexAgentTurnExecutorRejectsModelAndPromptProgramDrift(t *testing.T) {
+func TestStandardAuthoringCodexAgentTurnExecutorRejectsAgentConfigurationAndPromptProgramDrift(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 15, 8, 0, 0, 0, time.UTC)
 	stage := standardAuthoringCodexTestStage(1)
 	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{}}
 	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, 1)
 	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	driftedPayload := standardAuthoringCodexTestPayload(1)
+	driftedPayload.ModelID = "other-model"
 	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
 		Request: request,
 		Resolution: workflowadapter.StageOperationResolution{StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{
-			Payload: workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: len(program.TurnPrompts)},
+			Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts)),
 		}},
-	}, workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: "other-model", MaxTurns: 1})
+	}, driftedPayload)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.ErrorText != standardAuthoringCodexFailureConfiguration || len(runtime.openRequests) != 0 {
 		t.Fatalf("model drift result = %+v opens=%d", result, len(runtime.openRequests))
+	}
+	effortDrift := standardAuthoringCodexTestPayload(1)
+	effortDrift.ReasoningEffort = workflowadapter.AgentReasoningEffortHigh
+	result, err = executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{
+			Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts)),
+		}},
+	}, effortDrift)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ErrorText != standardAuthoringCodexFailureConfiguration || len(runtime.openRequests) != 0 {
+		t.Fatalf("reasoning effort drift result = %+v opens=%d", result, len(runtime.openRequests))
 	}
 
 	tampered := program
@@ -204,11 +218,9 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPrepar
 	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
 	request.Execution.ID = runID
 	invocation := StageOperationInvocation{Request: request, Resolution: workflowadapter.StageOperationResolution{
-		StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: workflowadapter.AgentTurnOperationPayload{
-			AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1,
-		}},
+		StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
 	}}
-	result, err := executor.ExecuteAgentTurn(context.Background(), invocation, workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1})
+	result, err := executor.ExecuteAgentTurn(context.Background(), invocation, standardAuthoringCodexTestPayload(1))
 	if err != nil || result.ErrorText != standardAuthoringCodexFailureConfiguration || len(runtime.openRequests) != 0 {
 		t.Fatalf("unprepared RunScoped workspace result=%+v err=%v opens=%d", result, err, len(runtime.openRequests))
 	}
@@ -216,7 +228,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPrepar
 	if err := os.MkdirAll(workspace, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	result, err = executor.ExecuteAgentTurn(context.Background(), invocation, workflowadapter.AgentTurnOperationPayload{AgentID: "standard-authoring", ModelID: CodexAppServerProductionModelID, MaxTurns: 1})
+	result, err = executor.ExecuteAgentTurn(context.Background(), invocation, standardAuthoringCodexTestPayload(1))
 	if err != nil || result.Outcome.Status != workflowkit.StatusCompleted || len(runtime.openRequests) != 1 {
 		t.Fatalf("prepared RunScoped workspace result=%+v err=%v opens=%d", result, err, len(runtime.openRequests))
 	}
@@ -264,11 +276,19 @@ func standardAuthoringCodexTestPrompts(turns int) []string {
 	return prompts
 }
 
+func standardAuthoringCodexTestPayload(turns int) workflowadapter.AgentTurnOperationPayload {
+	return workflowadapter.AgentTurnOperationPayload{
+		AgentID: CodexAppServerProductionAgentID, ModelID: CodexAppServerProductionModelID,
+		ReasoningEffort: CodexAppServerProductionReasoningEffort, MaxTurns: turns,
+	}
+}
+
 func standardAuthoringCodexTestInvocation(t *testing.T) CodexAppServerInvocation {
 	t.Helper()
 	root := t.TempDir()
 	return CodexAppServerInvocation{
-		AgentID: "standard-authoring", AgentVersion: "1.0.0", ModelID: CodexAppServerProductionModelID, ModelVersion: "2026-07-15",
+		AgentID: CodexAppServerProductionAgentID, AgentVersion: "1.0.0", ModelID: CodexAppServerProductionModelID, ModelVersion: "2026-07-15",
+		ReasoningEffort:        CodexAppServerProductionReasoningEffort,
 		JavaScriptLauncherPath: root + "/codex", NodeExecutablePath: root + "/node", CodexHomeDirectory: root,
 		CLIVersionOutput: "codex-cli 0.133.0", SandboxMode: CodexAppServerSandboxModeWorkspaceWrite,
 		SandboxPolicy: CodexAppServerSandboxPolicyWorkspaceWrite, NetworkAccess: false,

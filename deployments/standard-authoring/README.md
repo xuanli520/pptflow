@@ -81,7 +81,7 @@ scripts/generate-standard-authoring-lock.sh \
   --codex-node /absolute/path/to/node \
   --codex-launcher /absolute/path/to/codex.js \
   --codex-home /absolute/path/to/codex-home \
-  --codex-model-version <approved-gpt-5.5-version>
+  --codex-model-version <approved-gpt-5.6-terra-version>
 ```
 
 The generator refuses a dirty worktree, a pre-existing output lock, symlinked
@@ -96,6 +96,11 @@ atomically.
 The explicit model-version argument is intentional: no script should infer a
 mutable model alias. The generator reads no model endpoint, credential, token,
 or provider environment value.
+
+Each `agent.turn` in the source-controlled catalog also pins
+`gpt-5.6-terra` and `xhigh`. The generator copies that exact pair into the
+lock, and the runtime passes it to the App Server instead of inheriting a
+local Codex model or reasoning default.
 
 ## Runtime boundary
 

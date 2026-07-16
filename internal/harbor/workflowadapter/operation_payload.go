@@ -63,13 +63,39 @@ func (ContainerCommandOperationPayload) Kind() StageOperationPayloadKind {
 
 func (ContainerCommandOperationPayload) stageOperationPayload() {}
 
-// AgentTurnOperationPayload selects an exact controlled agent/model pair and
-// an explicit turn limit. Prompt material is supplied through frozen stage
-// inputs, never through an ambient request map.
+// AgentReasoningEffort is the closed set of reasoning budgets an agent.turn
+// may freeze into a deployment catalog. The executor must never inherit this
+// choice from a local Codex configuration.
+type AgentReasoningEffort string
+
+const (
+	AgentReasoningEffortMinimal AgentReasoningEffort = "minimal"
+	AgentReasoningEffortLow     AgentReasoningEffort = "low"
+	AgentReasoningEffortMedium  AgentReasoningEffort = "medium"
+	AgentReasoningEffortHigh    AgentReasoningEffort = "high"
+	AgentReasoningEffortXHigh   AgentReasoningEffort = "xhigh"
+)
+
+// Validate accepts an empty value only for decoding historical frozen
+// manifests created before reasoning effort was introduced. New controlled
+// compositions must require a concrete effort before they can execute.
+func (effort AgentReasoningEffort) Validate() error {
+	switch effort {
+	case "", AgentReasoningEffortMinimal, AgentReasoningEffortLow, AgentReasoningEffortMedium, AgentReasoningEffortHigh, AgentReasoningEffortXHigh:
+		return nil
+	default:
+		return fmt.Errorf("%w: agent reasoning effort %q is unsupported", errInvalidExecutionSpec, effort)
+	}
+}
+
+// AgentTurnOperationPayload selects an exact controlled agent/model pair,
+// reasoning effort, and explicit turn limit. Prompt material is supplied
+// through frozen stage inputs, never through an ambient request map.
 type AgentTurnOperationPayload struct {
-	AgentID  string `json:"agent_id"`
-	ModelID  string `json:"model_id"`
-	MaxTurns int    `json:"max_turns"`
+	AgentID         string               `json:"agent_id"`
+	ModelID         string               `json:"model_id"`
+	ReasoningEffort AgentReasoningEffort `json:"reasoning_effort,omitempty"`
+	MaxTurns        int                  `json:"max_turns"`
 }
 
 // Kind identifies the agent turn payload variant.
@@ -158,11 +184,12 @@ func CanonicalStageOperationPayloadJSON(payload StageOperationPayload) ([]byte, 
 		}{Kind: typed.Kind(), ImageDigest: typed.ImageDigest, Command: command})
 	case AgentTurnOperationPayload:
 		return json.Marshal(struct {
-			Kind     StageOperationPayloadKind `json:"kind"`
-			AgentID  string                    `json:"agent_id"`
-			ModelID  string                    `json:"model_id"`
-			MaxTurns int                       `json:"max_turns"`
-		}{Kind: typed.Kind(), AgentID: typed.AgentID, ModelID: typed.ModelID, MaxTurns: typed.MaxTurns})
+			Kind            StageOperationPayloadKind `json:"kind"`
+			AgentID         string                    `json:"agent_id"`
+			ModelID         string                    `json:"model_id"`
+			ReasoningEffort AgentReasoningEffort      `json:"reasoning_effort,omitempty"`
+			MaxTurns        int                       `json:"max_turns"`
+		}{Kind: typed.Kind(), AgentID: typed.AgentID, ModelID: typed.ModelID, ReasoningEffort: typed.ReasoningEffort, MaxTurns: typed.MaxTurns})
 	case DurableReviewOperationPayload:
 		return json.Marshal(struct {
 			Kind     StageOperationPayloadKind `json:"kind"`
@@ -219,15 +246,16 @@ func ParseStageOperationPayloadJSON(raw []byte) (StageOperationPayload, error) {
 		payload = ContainerCommandOperationPayload{ImageDigest: document.ImageDigest, Command: document.Command}
 	case StageOperationPayloadAgentTurn:
 		var document struct {
-			Kind     StageOperationPayloadKind `json:"kind"`
-			AgentID  string                    `json:"agent_id"`
-			ModelID  string                    `json:"model_id"`
-			MaxTurns int                       `json:"max_turns"`
+			Kind            StageOperationPayloadKind `json:"kind"`
+			AgentID         string                    `json:"agent_id"`
+			ModelID         string                    `json:"model_id"`
+			ReasoningEffort AgentReasoningEffort      `json:"reasoning_effort"`
+			MaxTurns        int                       `json:"max_turns"`
 		}
 		if err := decodeExecutionSpecJSON(raw, &document); err != nil {
 			return nil, fmt.Errorf("%w: decode agent.turn payload: %v", errInvalidExecutionSpec, err)
 		}
-		payload = AgentTurnOperationPayload{AgentID: document.AgentID, ModelID: document.ModelID, MaxTurns: document.MaxTurns}
+		payload = AgentTurnOperationPayload{AgentID: document.AgentID, ModelID: document.ModelID, ReasoningEffort: document.ReasoningEffort, MaxTurns: document.MaxTurns}
 	case StageOperationPayloadDurableReview:
 		var document struct {
 			Kind     StageOperationPayloadKind `json:"kind"`
@@ -288,6 +316,9 @@ func validateStageOperationPayload(payload StageOperationPayload) error {
 			return err
 		}
 		if err := validateOperationPayloadToken("model id", typed.ModelID); err != nil {
+			return err
+		}
+		if err := typed.ReasoningEffort.Validate(); err != nil {
 			return err
 		}
 		if typed.MaxTurns < 1 {

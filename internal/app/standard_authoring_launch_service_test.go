@@ -1043,7 +1043,7 @@ func standardAuthoringLaunchTestDefinitionProvider(t *testing.T) *CatalogStandar
 		case workflowkit.StageKey(workflowadapter.MaterializeTask):
 			operation.Payload = workflowadapter.HarborBuiltinOperationPayload{HandlerID: "test-materialize"}
 		default:
-			operation.Payload = workflowadapter.AgentTurnOperationPayload{AgentID: "test-agent", ModelID: "test-model", MaxTurns: stage.RequiredTurns}
+			operation.Payload = workflowadapter.AgentTurnOperationPayload{AgentID: "test-agent", ModelID: "test-model", ReasoningEffort: workflowadapter.AgentReasoningEffortHigh, MaxTurns: stage.RequiredTurns}
 		}
 		catalogDocument.Operations = append(catalogDocument.Operations, stageprovider.DeploymentOperationRegistration{
 			Stage:     stageprovider.DeploymentStageContract{Key: stage.Key, Type: standardAuthoringLaunchTestStageType(t, stage.Key), Group: stage.Group, Plugin: workflowkit.PluginBinding{ID: stage.Plugin.ID, Version: stage.Plugin.Version}},

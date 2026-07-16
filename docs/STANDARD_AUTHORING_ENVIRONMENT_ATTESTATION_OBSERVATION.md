@@ -61,8 +61,9 @@ A future lock-backed attestor must, immediately before each operation:
 3. verify the Docker daemon is reachable and reports the locked protocol
    version before Docker-dependent stages; and
 4. verify the Codex App Server launcher, Node, `CODEX_HOME`, model
-   `gpt-5.5`, workspace-write sandbox, and disabled network policy through
-   the existing typed Codex attestor before an `agent.turn`.
+   `gpt-5.6-terra` with `xhigh` reasoning effort, workspace-write sandbox,
+   and disabled network policy through the existing typed Codex attestor
+   before an `agent.turn`.
 
 Neither this inventory nor its paths may be used as a PATH fallback.  A change
 to any observed fact requires a reviewed lock revision and a newly built local
