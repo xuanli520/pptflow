@@ -3,9 +3,12 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"os/user"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
@@ -55,6 +58,36 @@ type TaskBoardTask struct {
 	CurrentStage    string
 	Review          *TaskBoardReview
 	OpenReviewCount int
+	Runs            []TaskBoardRun
+}
+
+// TaskBoardRun is the compact, presentation-neutral run history shown from a
+// task detail. It contains durable facts only and never exposes a direct
+// filesystem capability to the terminal adapter.
+type TaskBoardRun struct {
+	ID            string
+	Status        string
+	CurrentStage  string
+	FailureStage  string
+	FailureClass  string
+	FailureReason string
+	CreatedAt     time.Time
+	StartedAt     *time.Time
+	FinishedAt    *time.Time
+	LogPath       string
+	HasLog        bool
+	CanRetry      bool
+	RetryReason   string
+}
+
+// TaskBoardLog is a bounded read of a worker log selected through a Run's
+// durable handoff record. The TUI receives content, not a filesystem handle.
+type TaskBoardLog struct {
+	RunID     string
+	Path      string
+	Content   string
+	Message   string
+	Truncated bool
 }
 
 // TaskBoardSnapshot is a read-only point-in-time board projection.
@@ -96,6 +129,32 @@ type TaskBoardDecideReviewRequest struct {
 	Reason         string
 }
 
+// TaskBoardReadRunLogRequest identifies the selected task Run whose managed
+// local worker log should be rendered in the terminal.
+type TaskBoardReadRunLogRequest struct {
+	TaskID string
+	RunID  string
+}
+
+// TaskBoardRetryRunRequest resumes the selected Run through the existing
+// continuation service. Its key is retained by the TUI if a request needs to
+// be retried after an infrastructure failure.
+type TaskBoardRetryRunRequest struct {
+	IdempotencyKey string
+	TaskID         string
+	RunID          string
+	Reason         string
+}
+
+// TaskBoardCancelRunRequest requests durable termination for the selected
+// Run. It never cancels a local process directly.
+type TaskBoardCancelRunRequest struct {
+	IdempotencyKey string
+	TaskID         string
+	RunID          string
+	Reason         string
+}
+
 // TaskBoardMutation is the small success result a TUI needs to refresh its
 // projection and report the durable effect without interpreting raw records.
 type TaskBoardMutation struct {
@@ -111,8 +170,13 @@ type TaskBoardGateway interface {
 	List(context.Context) (TaskBoardSnapshot, error)
 	StartAuthoring(context.Context, TaskBoardStartAuthoringRequest) (TaskBoardMutation, error)
 	DecideReview(context.Context, TaskBoardDecideReviewRequest) (TaskBoardMutation, error)
+	ReadRunLog(context.Context, TaskBoardReadRunLogRequest) (TaskBoardLog, error)
+	RetryRun(context.Context, TaskBoardRetryRunRequest) (TaskBoardMutation, error)
+	CancelRun(context.Context, TaskBoardCancelRunRequest) (TaskBoardMutation, error)
 	FlushQueuedRuns(context.Context) error
 }
+
+const taskBoardLogReadLimit int64 = 64 * 1024
 
 // NewIdempotencyKey allocates a client command key for one board interaction.
 // The TUI retains it across retries; the durable application services remain
@@ -139,10 +203,12 @@ type TaskBoardService struct {
 	authoringReviews *AuthoringReviewService
 	mutations        *LifecycleMutationService
 	activations      *RunActivationService
+	continuations    *TaskContinuationService
+	control          *ExecutionControlService
 	actor            func() (string, error)
 }
 
-func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService) *TaskBoardService {
+func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService) *TaskBoardService {
 	return &TaskBoardService{
 		core:             core,
 		inspection:       inspection,
@@ -150,6 +216,8 @@ func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspec
 		authoringReviews: authoringReviews,
 		mutations:        mutations,
 		activations:      activations,
+		continuations:    continuations,
+		control:          control,
 		actor:            localTaskBoardActor,
 	}
 }
@@ -182,7 +250,11 @@ func (service *TaskBoardService) List(ctx context.Context) (TaskBoardSnapshot, e
 		if err != nil {
 			return TaskBoardSnapshot{}, fmt.Errorf("inspect task board task %s: %w", task.ID, err)
 		}
-		snapshot.Tasks = append(snapshot.Tasks, projectTaskBoardTask(detail))
+		projected, err := service.projectTaskBoardTask(ctx, detail)
+		if err != nil {
+			return TaskBoardSnapshot{}, fmt.Errorf("project task board task %s: %w", task.ID, err)
+		}
+		snapshot.Tasks = append(snapshot.Tasks, projected)
 	}
 	return snapshot, nil
 }
@@ -342,6 +414,170 @@ func (service *TaskBoardService) DecideReview(ctx context.Context, request TaskB
 	return result, nil
 }
 
+// ReadRunLog returns at most the tail of one worker log. The caller may name
+// a task and Run, but the service verifies their durable ownership before it
+// looks up the Run's own handoff record.
+func (service *TaskBoardService) ReadRunLog(ctx context.Context, request TaskBoardReadRunLogRequest) (TaskBoardLog, error) {
+	if service == nil || service.core == nil || service.core.store == nil || service.inspection == nil {
+		return TaskBoardLog{}, fmt.Errorf("task board service is not configured")
+	}
+	request.TaskID = strings.TrimSpace(request.TaskID)
+	request.RunID = strings.TrimSpace(request.RunID)
+	if _, err := service.taskBoardRun(ctx, request.TaskID, request.RunID); err != nil {
+		return TaskBoardLog{}, err
+	}
+
+	handoffs, err := service.core.store.ListRunWorkerHandoffsForRun(ctx, request.RunID)
+	if err != nil {
+		return TaskBoardLog{}, fmt.Errorf("list worker handoffs for Run %s: %w", request.RunID, err)
+	}
+	path := taskBoardLogPath(handoffs)
+	log := TaskBoardLog{RunID: request.RunID, Path: path}
+	if path == "" {
+		log.Message = "当前 Run 暂无可读取的本地日志"
+		return log, nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		log.Message = "日志暂时不可读取: " + err.Error()
+		return log, nil
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		log.Message = "无法读取日志信息: " + err.Error()
+		return log, nil
+	}
+	if !info.Mode().IsRegular() {
+		log.Message = "日志目标不是可读取的常规文件"
+		return log, nil
+	}
+
+	start := max(int64(0), info.Size()-taskBoardLogReadLimit)
+	content := make([]byte, info.Size()-start)
+	count, readErr := file.ReadAt(content, start)
+	if readErr != nil && readErr != io.EOF {
+		log.Message = "读取日志失败: " + readErr.Error()
+		return log, nil
+	}
+	log.Truncated = start > 0
+	log.Content = strings.ToValidUTF8(string(content[:count]), "?")
+	if log.Truncated {
+		if lineEnd := strings.IndexByte(log.Content, '\n'); lineEnd >= 0 {
+			log.Content = log.Content[lineEnd+1:]
+		}
+	}
+	if log.Content == "" {
+		log.Message = "日志文件当前为空"
+	}
+	return log, nil
+}
+
+// RetryRun plans and executes the existing no-content continuation flow for
+// the selected Run. The continuation service remains the authority for which
+// stages are safe to retry and rejects content-changing or operator-only work.
+func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoardRetryRunRequest) (TaskBoardMutation, error) {
+	if service == nil || service.continuations == nil {
+		return TaskBoardMutation{}, fmt.Errorf("task board continuation service is not configured")
+	}
+	prepared, actor, err := service.prepareTaskBoardRunAction(ctx, request.IdempotencyKey, request.TaskID, request.RunID, request.Reason)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	checkpoint, err := service.continuations.CurrentCheckpoint(ctx, prepared.RunID)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	plan, err := service.continuations.PlanTaskContinuation(ctx, ContinueTaskCommand{
+		CommandKey: prepared.IdempotencyKey,
+		TaskID:     prepared.TaskID,
+		RunID:      prepared.RunID,
+		Expected:   checkpoint,
+		Actor:      actor,
+		Reason:     prepared.Reason,
+	})
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	if _, err := service.continuations.ExecuteTaskContinuation(ctx, plan.ID()); err != nil {
+		return TaskBoardMutation{}, err
+	}
+	if err := service.FlushQueuedRuns(ctx); err != nil {
+		return TaskBoardMutation{}, err
+	}
+	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Run 排队重试"}, nil
+}
+
+// CancelRun records a durable termination request for the selected Run. A
+// worker observes and acknowledges the operation; the TUI never kills a
+// process on its own.
+func (service *TaskBoardService) CancelRun(ctx context.Context, request TaskBoardCancelRunRequest) (TaskBoardMutation, error) {
+	if service == nil || service.control == nil {
+		return TaskBoardMutation{}, fmt.Errorf("task board execution control service is not configured")
+	}
+	prepared, actor, err := service.prepareTaskBoardRunAction(ctx, request.IdempotencyKey, request.TaskID, request.RunID, request.Reason)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	checkpoint, err := service.control.CurrentCheckpoint(ctx, prepared.RunID)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	if _, err := service.control.Request(ctx, RequestExecutionControlRequest{
+		OperationKey: prepared.IdempotencyKey,
+		Action:       store.ControlActionTerminate,
+		RunID:        prepared.RunID,
+		Expected:     checkpoint,
+		Actor:        actor,
+		Reason:       prepared.Reason,
+	}); err != nil {
+		return TaskBoardMutation{}, err
+	}
+	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已请求取消当前 Run"}, nil
+}
+
+type preparedTaskBoardRunAction struct {
+	IdempotencyKey string
+	TaskID         string
+	RunID          string
+	Reason         string
+}
+
+func (service *TaskBoardService) prepareTaskBoardRunAction(ctx context.Context, idempotencyKey, taskID, runID, reason string) (preparedTaskBoardRunAction, string, error) {
+	prepared := preparedTaskBoardRunAction{
+		IdempotencyKey: strings.TrimSpace(idempotencyKey),
+		TaskID:         strings.TrimSpace(taskID),
+		RunID:          strings.TrimSpace(runID),
+		Reason:         strings.TrimSpace(reason),
+	}
+	if err := store.ValidateUUIDv7(prepared.IdempotencyKey); err != nil {
+		return preparedTaskBoardRunAction{}, "", fmt.Errorf("task board Run action idempotency key: %w", err)
+	}
+	if prepared.Reason == "" {
+		return preparedTaskBoardRunAction{}, "", fmt.Errorf("task board Run action reason is required")
+	}
+	if _, err := service.taskBoardRun(ctx, prepared.TaskID, prepared.RunID); err != nil {
+		return preparedTaskBoardRunAction{}, "", err
+	}
+	actor, err := service.currentActor()
+	if err != nil {
+		return preparedTaskBoardRunAction{}, "", err
+	}
+	return prepared, actor, nil
+}
+
+func (service *TaskBoardService) taskBoardRun(ctx context.Context, taskID, runID string) (TaskInspectionSnapshot, error) {
+	if service == nil || service.inspection == nil {
+		return TaskInspectionSnapshot{}, fmt.Errorf("task board inspection service is not configured")
+	}
+	detail, err := service.inspection.ReadTaskDetail(ctx, TaskInspectionQuery{TaskID: taskID, RunID: runID})
+	if err != nil {
+		return TaskInspectionSnapshot{}, fmt.Errorf("read task board Run: %w", err)
+	}
+	return detail, nil
+}
+
 func validateTaskBoardReviewReceipt(receipt LifecycleMutationReceipt, request TaskBoardDecideReviewRequest, action store.ReviewDecisionAction) error {
 	if receipt.Action != LifecycleMutationReview || receipt.TaskID != request.TaskID || receipt.RevisionID != request.Review.RevisionID ||
 		receipt.ReviewRequestID != request.Review.RequestID || receipt.ReviewDecision != string(action) {
@@ -377,7 +613,7 @@ func localTaskBoardActor() (string, error) {
 	return strings.TrimSpace(current.Username), nil
 }
 
-func projectTaskBoardTask(detail TaskInspectionSnapshot) TaskBoardTask {
+func (service *TaskBoardService) projectTaskBoardTask(ctx context.Context, detail TaskInspectionSnapshot) (TaskBoardTask, error) {
 	task := TaskBoardTask{
 		ID:             detail.Task.ID,
 		Slug:           detail.Task.Slug,
@@ -389,18 +625,88 @@ func projectTaskBoardTask(detail TaskInspectionSnapshot) TaskBoardTask {
 	}
 	task.Review, task.OpenReviewCount = taskBoardOpenReview(detail)
 	if len(detail.Runs) == 0 {
-		return task
+		return task, nil
 	}
-	latest := detail.Runs[0]
-	task.RunID = latest.Run.ID
-	task.RunStatus = string(latest.Run.Status)
-	task.CurrentStage = taskBoardCurrentStage(latest.Stages)
+	task.Runs = make([]TaskBoardRun, 0, len(detail.Runs))
+	for _, inspected := range detail.Runs {
+		handoffs, err := service.core.store.ListRunWorkerHandoffsForRun(ctx, inspected.Run.ID)
+		if err != nil {
+			return TaskBoardTask{}, fmt.Errorf("list worker handoffs for Run %s: %w", inspected.Run.ID, err)
+		}
+		task.Runs = append(task.Runs, projectTaskBoardRun(inspected, handoffs))
+	}
+	latest := task.Runs[0]
+	task.RunID = latest.ID
+	task.RunStatus = latest.Status
+	task.CurrentStage = latest.CurrentStage
 	if task.Review != nil {
 		task.Column = TaskBoardPending
-		return task
+		return task, nil
 	}
-	task.Column = taskBoardColumnForRun(latest.Run.Status)
-	return task
+	task.Column = taskBoardColumnForRun(detail.Runs[0].Run.Status)
+	return task, nil
+}
+
+func projectTaskBoardRun(inspected RunInspection, handoffs []store.RunWorkerHandoff) TaskBoardRun {
+	logPath := taskBoardLogPath(handoffs)
+	run := TaskBoardRun{
+		ID:           inspected.Run.ID,
+		Status:       string(inspected.Run.Status),
+		CurrentStage: taskBoardCurrentStage(inspected.Stages),
+		CreatedAt:    inspected.Run.CreatedAt,
+		StartedAt:    inspected.Run.StartedAt,
+		FinishedAt:   inspected.Run.FinishedAt,
+		LogPath:      logPath,
+		HasLog:       logPath != "",
+	}
+	run.FailureStage, run.FailureClass, run.FailureReason = taskBoardFailure(inspected.Stages)
+	if run.FailureReason == "" {
+		run.FailureReason = taskBoardHandoffFailure(handoffs)
+	}
+	run.CanRetry, run.RetryReason = taskBoardRetryAvailability(inspected.Run)
+	return run
+}
+
+func taskBoardRetryAvailability(run store.WorkflowRun) (bool, string) {
+	if run.SubjectKind != store.WorkflowRunSubjectTaskRevision {
+		return false, "Standard 创题 Run 需要专用恢复流程"
+	}
+	switch run.Status {
+	case store.WorkflowRunFailedRecoverable, store.WorkflowRunInterrupted, store.WorkflowRunCanceled,
+		store.WorkflowRunPaused, store.WorkflowRunWaitingContinuation:
+		return true, ""
+	default:
+		return false, "当前 Run 状态不可重试"
+	}
+}
+
+func taskBoardFailure(stages []store.StageAttempt) (stageKey, failureClass, reason string) {
+	for index := len(stages) - 1; index >= 0; index-- {
+		stage := stages[index]
+		if strings.TrimSpace(stage.ErrorText) == "" && strings.TrimSpace(stage.FailureClass) == "" {
+			continue
+		}
+		return stage.StageKey, stage.FailureClass, stage.ErrorText
+	}
+	return "", "", ""
+}
+
+func taskBoardHandoffFailure(handoffs []store.RunWorkerHandoff) string {
+	for index := len(handoffs) - 1; index >= 0; index-- {
+		if reason := strings.TrimSpace(handoffs[index].FailureReason); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+func taskBoardLogPath(handoffs []store.RunWorkerHandoff) string {
+	for index := len(handoffs) - 1; index >= 0; index-- {
+		if path := strings.TrimSpace(handoffs[index].LogPath); path != "" {
+			return path
+		}
+	}
+	return ""
 }
 
 func taskBoardOpenReview(detail TaskInspectionSnapshot) (*TaskBoardReview, int) {

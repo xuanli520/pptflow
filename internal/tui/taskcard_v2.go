@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/purplevoid/harbor-factory/internal/app"
@@ -30,6 +31,25 @@ type TaskItem struct {
 	Lifecycle    string
 	Review       *app.TaskBoardReview
 	OpenReviews  int
+	Runs         []TaskRunItem
+}
+
+// TaskRunItem is the terminal-facing copy of one durable Run record. It is
+// populated only from the task-board application projection.
+type TaskRunItem struct {
+	ID            string
+	Status        string
+	CurrentStage  string
+	FailureStage  string
+	FailureClass  string
+	FailureReason string
+	CreatedAt     time.Time
+	StartedAt     *time.Time
+	FinishedAt    *time.Time
+	LogPath       string
+	HasLog        bool
+	CanRetry      bool
+	RetryReason   string
 }
 
 func truncate(s string, maxLen int) string {

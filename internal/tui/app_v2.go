@@ -38,7 +38,9 @@ type appModel struct {
 	board  TaskBoardModel
 	input  TaskInputModel
 	detail *detailModel
+	logs   *logModel
 	review *reviewPrompt
+	action *runActionPrompt
 
 	width              int
 	height             int
@@ -48,7 +50,9 @@ type appModel struct {
 
 	pendingStart   *pendingTaskBoardStart
 	pendingReview  *pendingTaskBoardReview
+	pendingAction  *pendingTaskBoardRunAction
 	activeMutation taskBoardMutationKind
+	logEpoch       uint64
 
 	refreshInFlight  bool
 	refreshRequested bool
@@ -71,6 +75,12 @@ type taskBoardMutationMsg struct {
 	err      error
 }
 
+type taskBoardLogMsg struct {
+	log   app.TaskBoardLog
+	epoch uint64
+	err   error
+}
+
 type taskBoardExitMsg struct{ err error }
 
 type taskBoardMutationKind string
@@ -78,6 +88,15 @@ type taskBoardMutationKind string
 const (
 	taskBoardStartMutation  taskBoardMutationKind = "start_authoring"
 	taskBoardReviewMutation taskBoardMutationKind = "review"
+	taskBoardRetryMutation  taskBoardMutationKind = "retry_run"
+	taskBoardCancelMutation taskBoardMutationKind = "cancel_run"
+)
+
+type taskBoardRunActionKind string
+
+const (
+	taskBoardRetryAction  taskBoardRunActionKind = "retry"
+	taskBoardCancelAction taskBoardRunActionKind = "cancel"
 )
 
 type pendingTaskBoardStart struct {
@@ -93,6 +112,14 @@ type pendingTaskBoardReview struct {
 	key      string
 }
 
+type pendingTaskBoardRunAction struct {
+	kind   taskBoardRunActionKind
+	taskID string
+	runID  string
+	reason string
+	key    string
+}
+
 type reviewPrompt struct {
 	decision      app.TaskBoardReviewDecision
 	reasonInput   textinput.Model
@@ -101,8 +128,8 @@ type reviewPrompt struct {
 
 func newReviewPrompt(decision app.TaskBoardReviewDecision) *reviewPrompt {
 	input := textinput.New()
-	input.Prompt = "Reason "
-	input.Placeholder = "Why this review decision is appropriate"
+	input.Prompt = "原因 "
+	input.Placeholder = "说明审核决定的原因"
 	input.CharLimit = 240
 	input.Width = 52
 	input.Focus()
@@ -111,6 +138,34 @@ func newReviewPrompt(decision app.TaskBoardReviewDecision) *reviewPrompt {
 
 func (prompt *reviewPrompt) View(width int) string {
 	content := prompt.reasonInput.View()
+	if prompt.validationErr != "" {
+		content += "\n" + failStyleV2.Render(prompt.validationErr)
+	}
+	return inputStyle.Width(max(1, width)).Render(content)
+}
+
+type runActionPrompt struct {
+	kind          taskBoardRunActionKind
+	reasonInput   textinput.Model
+	validationErr string
+}
+
+func newRunActionPrompt(kind taskBoardRunActionKind) *runActionPrompt {
+	input := textinput.New()
+	input.Prompt = "原因 "
+	input.Placeholder = "记录本次操作的原因"
+	input.CharLimit = 240
+	input.Width = 52
+	input.Focus()
+	return &runActionPrompt{kind: kind, reasonInput: input}
+}
+
+func (prompt *runActionPrompt) View(width int) string {
+	label := "重试当前 Run"
+	if prompt.kind == taskBoardCancelAction {
+		label = "取消当前 Run"
+	}
+	content := detailSectionTitleStyle.Render(label) + "\n" + prompt.reasonInput.View()
 	if prompt.validationErr != "" {
 		content += "\n" + failStyleV2.Render(prompt.validationErr)
 	}
@@ -159,6 +214,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.review.reasonInput, command = m.review.reasonInput.Update(msg)
 			commands = append(commands, command)
 		}
+		if m.action != nil {
+			var command tea.Cmd
+			m.action.reasonInput, command = m.action.reasonInput.Update(msg)
+			commands = append(commands, command)
+		}
 		inputCmd = tea.Batch(commands...)
 	}
 
@@ -192,7 +252,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.board.SetTasks(taskItemsForSnapshot(msg.snapshot))
 			m.authoringAvailable = msg.snapshot.AuthoringAvailable
-			if m.pendingStart == nil && m.pendingReview == nil {
+			if m.pendingStart == nil && m.pendingReview == nil && m.pendingAction == nil {
 				m.err = nil
 			}
 		}
@@ -221,10 +281,26 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingReview = nil
 			m.review = nil
 			m.detail = nil
+		case taskBoardRetryMutation, taskBoardCancelMutation:
+			m.pendingAction = nil
+			m.action = nil
+			m.logs = nil
+			m.detail = nil
 		}
 		var refreshCmd tea.Cmd
 		m, refreshCmd = m.requestRefresh()
 		return m, tea.Batch(inputCmd, refreshCmd)
+
+	case taskBoardLogMsg:
+		if msg.epoch != m.logEpoch || m.logs == nil {
+			return m, inputCmd
+		}
+		if msg.err != nil {
+			m.logs = newLogModel(m.detailTask(), app.TaskBoardLog{RunID: m.logs.runID, Path: m.logs.path, Message: msg.err.Error()})
+			return m, inputCmd
+		}
+		m.logs = newLogModel(m.detailTask(), msg.log)
+		return m, inputCmd
 
 	case taskBoardExitMsg:
 		m.exitInFlight = false
@@ -246,6 +322,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
+	if m.logs != nil {
+		return m.handleLogKey(msg, inputCmd)
+	}
+
+	if m.action != nil {
+		return m.handleRunActionPromptKey(msg, inputCmd)
+	}
+
 	if m.review != nil {
 		return m.handleReviewPromptKey(msg, inputCmd)
 	}
@@ -261,12 +345,12 @@ func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cm
 		return m, tea.Batch(inputCmd, command)
 	}
 
+	if m.detail != nil {
+		return m.handleDetailKey(msg, inputCmd)
+	}
+
 	switch key {
 	case "esc":
-		if m.detail != nil {
-			m.detail = nil
-			return m, nil
-		}
 		return m, inputCmd
 
 	case "q", "ctrl+c":
@@ -277,19 +361,12 @@ func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cm
 			m.notice = "操作仍在进行，请等待结果后再退出"
 			return m, inputCmd
 		}
-		if m.detail != nil {
-			m.detail = nil
-			return m, inputCmd
-		}
 		if key == "ctrl+c" && m.exitFlushFailed {
 			return m, tea.Quit
 		}
 		return m.beginExit()
 
 	case "n":
-		if m.detail != nil {
-			return m, inputCmd
-		}
 		if !m.authoringAvailable {
 			m.err = app.ErrStandardAuthoringLaunchUnavailable
 			return m, inputCmd
@@ -331,19 +408,59 @@ func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cm
 		}
 		return m, inputCmd
 
-	case "a":
-		if m.detail != nil && m.detail.task.Review != nil {
-			return m.openReviewPrompt(app.TaskBoardApprove, inputCmd)
-		}
-		return m, inputCmd
-
-	case "r":
-		if m.detail != nil && m.detail.task.Review != nil {
-			return m.openReviewPrompt(app.TaskBoardRequestChanges, inputCmd)
-		}
-		return m, inputCmd
 	}
 
+	return m, inputCmd
+}
+
+func (m appModel) handleDetailKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", "ctrl+c":
+		m.detail = nil
+		return m, inputCmd
+	case "l":
+		return m.openLog(inputCmd)
+	case "t":
+		return m.openRunActionPrompt(taskBoardRetryAction, inputCmd)
+	case "x":
+		return m.openRunActionPrompt(taskBoardCancelAction, inputCmd)
+	case "a":
+		if m.detail.task.Review != nil {
+			return m.openReviewPrompt(app.TaskBoardApprove, inputCmd)
+		}
+	case "r":
+		if m.detail.task.Review != nil {
+			return m.openReviewPrompt(app.TaskBoardRequestChanges, inputCmd)
+		}
+	}
+	return m, inputCmd
+}
+
+func (m appModel) handleLogKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.logs == nil {
+		return m, inputCmd
+	}
+	width, height := m.logDimensions()
+	switch msg.String() {
+	case "esc", "q", "ctrl+c":
+		m.logs = nil
+		m.logEpoch++
+		return m, inputCmd
+	case "up", "k":
+		m.logs.MoveUp(width, height)
+	case "down", "j":
+		m.logs.MoveDown(width, height)
+	case "pgup", "ctrl+u":
+		m.logs.PageUp(width, height)
+	case "pgdown", "ctrl+d":
+		m.logs.PageDown(width, height)
+	case "home", "g":
+		m.logs.GoToStart()
+	case "end", "G":
+		m.logs.GoToEnd(width, height)
+	case "r":
+		return m.openLog(inputCmd)
+	}
 	return m, inputCmd
 }
 
@@ -375,6 +492,80 @@ func (m appModel) openReviewPrompt(decision app.TaskBoardReviewDecision, inputCm
 	}
 	m.review = newReviewPrompt(decision)
 	return m, tea.Batch(inputCmd, textinput.Blink)
+}
+
+func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.action == nil {
+		return m, inputCmd
+	}
+	if m.mutationInFlight() {
+		m.notice = "操作仍在提交，请等待结果"
+		return m, inputCmd
+	}
+	switch msg.String() {
+	case "esc":
+		m.action = nil
+		return m, inputCmd
+	case "enter":
+		reason := strings.TrimSpace(m.action.reasonInput.Value())
+		if reason == "" {
+			m.action.validationErr = "操作原因不能为空"
+			return m, inputCmd
+		}
+		return m.beginRunAction(m.action.kind, reason, inputCmd)
+	}
+	var command tea.Cmd
+	m.action.reasonInput, command = m.action.reasonInput.Update(msg)
+	return m, tea.Batch(inputCmd, command)
+}
+
+func (m appModel) openRunActionPrompt(kind taskBoardRunActionKind, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.mutationInFlight() || m.detail == nil || !m.detail.hasCurrentRun() {
+		return m, inputCmd
+	}
+	if kind == taskBoardRetryAction && !m.detail.canRetryCurrentRun() {
+		m.notice = m.detail.currentRun().RetryReason
+		if m.notice == "" {
+			m.notice = "当前 Run 不可重试"
+		}
+		return m, inputCmd
+	}
+	if kind == taskBoardCancelAction && !m.detail.canCancelCurrentRun() {
+		m.notice = "当前 Run 已是终态，无法取消"
+		return m, inputCmd
+	}
+	m.action = newRunActionPrompt(kind)
+	return m, tea.Batch(inputCmd, textinput.Blink)
+}
+
+func (m appModel) openLog(inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.detail == nil || !m.detail.hasCurrentRun() {
+		m.notice = "当前题目尚无 Run 日志"
+		return m, inputCmd
+	}
+	run := m.detail.currentRun()
+	m.logEpoch++
+	m.logs = newLogModel(m.detail.task, app.TaskBoardLog{
+		RunID:   run.ID,
+		Path:    run.LogPath,
+		Message: "正在读取日志...",
+	})
+	return m, tea.Batch(inputCmd, m.readRunLog(m.detail.task.ID, run.ID, m.logEpoch))
+}
+
+func (m appModel) detailTask() *TaskItem {
+	if m.detail == nil {
+		return nil
+	}
+	return m.detail.task
+}
+
+func (m appModel) logDimensions() (int, int) {
+	return m.contentWidth(), max(8, m.height-3)
+}
+
+func (m appModel) contentWidth() int {
+	return max(1, m.width-2)
 }
 
 func (m appModel) mutationInFlight() bool {
@@ -482,6 +673,72 @@ func (m appModel) decideReview(pending pendingTaskBoardReview) tea.Cmd {
 	}
 }
 
+func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.mutationInFlight() || m.refreshInFlight || m.detail == nil || !m.detail.hasCurrentRun() {
+		m.notice = "请等待当前操作完成"
+		return m, inputCmd
+	}
+	run := m.detail.currentRun()
+	current := pendingTaskBoardRunAction{
+		kind: kind, taskID: m.detail.task.ID, runID: run.ID, reason: strings.TrimSpace(reason),
+	}
+	if m.pendingAction == nil || m.pendingAction.kind != current.kind || m.pendingAction.taskID != current.taskID || m.pendingAction.runID != current.runID || m.pendingAction.reason != current.reason {
+		key, err := m.newIdempotencyKey()
+		if err != nil {
+			m.err = err
+			return m, inputCmd
+		}
+		current.key = key
+		m.pendingAction = &current
+	}
+	switch kind {
+	case taskBoardRetryAction:
+		m.activeMutation = taskBoardRetryMutation
+	case taskBoardCancelAction:
+		m.activeMutation = taskBoardCancelMutation
+	default:
+		m.err = fmt.Errorf("unsupported task board Run action %q", kind)
+		return m, inputCmd
+	}
+	return m, tea.Batch(inputCmd, m.runAction(*m.pendingAction))
+}
+
+func (m appModel) runAction(pending pendingTaskBoardRunAction) tea.Cmd {
+	return func() tea.Msg {
+		if m.gateway == nil {
+			kind := taskBoardRetryMutation
+			if pending.kind == taskBoardCancelAction {
+				kind = taskBoardCancelMutation
+			}
+			return taskBoardMutationMsg{kind: kind, err: fmt.Errorf("task board service is not configured")}
+		}
+		switch pending.kind {
+		case taskBoardRetryAction:
+			mutation, err := m.gateway.RetryRun(m.ctx, app.TaskBoardRetryRunRequest{
+				IdempotencyKey: pending.key, TaskID: pending.taskID, RunID: pending.runID, Reason: pending.reason,
+			})
+			return taskBoardMutationMsg{kind: taskBoardRetryMutation, mutation: mutation, err: err}
+		case taskBoardCancelAction:
+			mutation, err := m.gateway.CancelRun(m.ctx, app.TaskBoardCancelRunRequest{
+				IdempotencyKey: pending.key, TaskID: pending.taskID, RunID: pending.runID, Reason: pending.reason,
+			})
+			return taskBoardMutationMsg{kind: taskBoardCancelMutation, mutation: mutation, err: err}
+		default:
+			return taskBoardMutationMsg{err: fmt.Errorf("unsupported task board Run action %q", pending.kind)}
+		}
+	}
+}
+
+func (m appModel) readRunLog(taskID, runID string, epoch uint64) tea.Cmd {
+	return func() tea.Msg {
+		if m.gateway == nil {
+			return taskBoardLogMsg{epoch: epoch, err: fmt.Errorf("task board service is not configured")}
+		}
+		log, err := m.gateway.ReadRunLog(m.ctx, app.TaskBoardReadRunLogRequest{TaskID: taskID, RunID: runID})
+		return taskBoardLogMsg{log: log, epoch: epoch, err: err}
+	}
+}
+
 func (m appModel) newIdempotencyKey() (string, error) {
 	if m.gateway == nil {
 		return "", fmt.Errorf("task board service is not configured")
@@ -521,6 +778,24 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 			Lifecycle:    task.LifecycleState,
 			Review:       task.Review,
 			OpenReviews:  task.OpenReviewCount,
+			Runs:         make([]TaskRunItem, 0, len(task.Runs)),
+		}
+		for _, run := range task.Runs {
+			item.Runs = append(item.Runs, TaskRunItem{
+				ID:            run.ID,
+				Status:        run.Status,
+				CurrentStage:  run.CurrentStage,
+				FailureStage:  run.FailureStage,
+				FailureClass:  run.FailureClass,
+				FailureReason: run.FailureReason,
+				CreatedAt:     run.CreatedAt,
+				StartedAt:     run.StartedAt,
+				FinishedAt:    run.FinishedAt,
+				LogPath:       run.LogPath,
+				HasLog:        run.HasLog,
+				CanRetry:      run.CanRetry,
+				RetryReason:   run.RetryReason,
+			})
 		}
 		switch task.Column {
 		case app.TaskBoardRunning:
@@ -541,22 +816,38 @@ func (m appModel) View() string {
 	if m.width == 0 {
 		return "loading..."
 	}
+	contentWidth := m.contentWidth()
+
+	if m.logs != nil {
+		width, height := m.logDimensions()
+		return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
+			headerStyle.Width(contentWidth).Render("Harbor Task Factory"),
+			m.logs.View(width, height),
+			m.statusView(),
+			footerStyle.Render("[↑↓/jk] 滚动  [PgUp/PgDn] 翻页  [r] 刷新  [q] 返回详情"),
+		))
+	}
 
 	if m.detail != nil {
-		footer := footerStyle.Render("[q] 返回")
+		footer := detailFooter(m.detail)
 		if m.detail.task.Review != nil {
-			footer = footerStyle.Render("[a] 通过  [r] 返修  [q] 返回")
+			footer = footerStyle.Render("[a] 通过  [r] 返修  " + detailFooterText(m.detail))
 		}
 		prompt := ""
-		detailHeight := m.height - 4
+		detailHeight := max(8, m.height-3)
 		if m.review != nil {
-			prompt = m.review.View(m.width)
+			prompt = m.review.View(contentWidth)
 			detailHeight -= 4
 			footer = footerStyle.Render("[enter] 提交审核  [esc] 取消")
 		}
+		if m.action != nil {
+			prompt = m.action.View(contentWidth)
+			detailHeight -= 5
+			footer = footerStyle.Render("[enter] 确认操作  [esc] 取消")
+		}
 		return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
-			headerStyle.Width(m.width).Render("Harbor Task Factory"),
-			m.detail.View(m.width, max(1, detailHeight)),
+			headerStyle.Width(contentWidth).Render("Harbor Task Factory"),
+			m.detail.View(contentWidth, max(1, detailHeight)),
 			prompt,
 			m.statusView(),
 			footer,
@@ -576,12 +867,31 @@ func (m appModel) View() string {
 		footer = "[n] 新任务  " + footer
 	}
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
-		headerStyle.Width(m.width).Render("Harbor Task Factory"),
-		m.board.View(m.width, max(1, boardHeight)),
-		m.input.View(m.width),
+		headerStyle.Width(contentWidth).Render("Harbor Task Factory"),
+		m.board.View(contentWidth, max(1, boardHeight)),
+		m.input.View(contentWidth),
 		status,
 		footerStyle.Render(footer),
 	))
+}
+
+func detailFooter(detail *detailModel) string {
+	return footerStyle.Render(detailFooterText(detail))
+}
+
+func detailFooterText(detail *detailModel) string {
+	actions := make([]string, 0, 4)
+	if detail != nil && detail.hasCurrentRun() {
+		actions = append(actions, "[l] 日志")
+		if detail.canRetryCurrentRun() {
+			actions = append(actions, "[t] 重试")
+		}
+		if detail.canCancelCurrentRun() {
+			actions = append(actions, "[x] 取消")
+		}
+	}
+	actions = append(actions, "[q] 返回")
+	return strings.Join(actions, "  ")
 }
 
 func (m appModel) statusView() string {
@@ -600,39 +910,4 @@ func (m appModel) pollTick() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg{}
 	})
-}
-
-// detailModel renders task detail content for gate review.
-type detailModel struct {
-	task *TaskItem
-}
-
-func newDetailModel(task *TaskItem) *detailModel {
-	return &detailModel{task: task}
-}
-
-func (d *detailModel) View(width, height int) string {
-	lines := []string{
-		detailTitleStyle.Width(width).Render(d.task.Name),
-		mutedStyle.Render("slug:" + d.task.Slug),
-		mutedStyle.Render(d.task.RepoURL),
-		mutedStyle.Render("sha:" + d.task.CommitSHA),
-		mutedStyle.Render("状态: " + d.task.Lifecycle),
-	}
-	if d.task.RunStatus != "" {
-		run := "Run: " + d.task.RunStatus
-		if d.task.RunID != "" {
-			run = "Run: " + truncateMiddle(d.task.RunID, 16) + " (" + d.task.RunStatus + ")"
-		}
-		lines = append(lines, mutedStyle.Render(run))
-	}
-	if d.task.CurrentStage != "" {
-		lines = append(lines, mutedStyle.Render("阶段: "+d.task.CurrentStage))
-	}
-	if d.task.Review != nil {
-		lines = append(lines, highlightStyle.Render("待审核: "+string(d.task.Review.Kind)))
-	} else if d.task.OpenReviews > 1 {
-		lines = append(lines, failStyleV2.Render("存在多个待处理审核，请使用 CLI 选择明确的审核请求"))
-	}
-	return lipgloss.NewStyle().Width(max(1, width-2)).Height(max(1, height-2)).Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 }

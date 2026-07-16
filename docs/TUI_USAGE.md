@@ -16,7 +16,10 @@ harbor-factory --root .harbor-factory tui
 | --- | --- |
 | `Tab` / `Shift+Tab`、`Left` / `Right` | 切换列。 |
 | `Up` / `Down`、`j` / `k` | 选择任务。 |
-| `d` | 查看任务的来源、Run、阶段和审核状态。 |
+| `d` | 打开任务详情，分区查看来源、当前 Run、失败原因、运行记录、日志路径和审核状态。 |
+| `l` | 在任务详情中读取当前 Run 的受控本地日志；日志页支持滚动和刷新。 |
+| `t` | 对可续跑的当前任务修订 Run 打开重试确认。 |
+| `x` | 对当前可取消的 Run 打开取消确认。 |
 | `n` | 创建 Standard 创题任务；仅在当前部署已配置该能力时显示。 |
 | `a` / `r` | 在详情中打开批准或要求修改的审核原因确认输入。 |
 | `Esc` | 关闭当前输入或详情，不提交 mutation。 |
@@ -30,7 +33,13 @@ harbor-factory --root .harbor-factory tui
 
 表单可见时，所有键都只属于表单。输入 `d`、`a`、`r`、方向键或 `Tab` 不会在后台打开详情、移动选择或提交审核。
 
-## 审核与重试
+## 详情、日志与运行操作
+
+详情页将来源、当前运行、失败原因和运行历史分区呈现。当前运行区会显示日志文件路径；按 `l` 后，TUI 只读取该 Run 的 durable worker handoff 已记录的本地日志，并展示最多 64 KiB 的尾部内容。它不会接受或打开任意用户提供的文件路径。
+
+`t` 和 `x` 都要求填写原因并按 `Enter` 确认。取消会写入 durable termination control，不会由 TUI 直接终止进程。重试复用既有 no-content continuation 契约，因此只对当前状态允许且任务修订型的 Run 显示；Standard 创题 Run 会明确显示需要专用恢复流程，而不会提供一个必然失败的重试动作。
+
+## 审核
 
 详情只对恰好一个 open review 显示可执行操作。按 `a` 或 `r` 后必须填写审核原因并按 `Enter`，服务会根据 review 类型走 AuthoringSession 或 TaskRevision 的正确审核契约。
 
@@ -38,4 +47,4 @@ harbor-factory --root .harbor-factory tui
 
 TUI 在刷新或 mutation 仍在进行时拒绝退出，避免关闭控制面数据库后仍有在途命令访问它。退出前的 queued Run 激活失败时，`q` 会重试；确认没有在途 mutation 后再次按 `Ctrl+C` 可强制退出。成功 mutation 的 durable 摘要会显示在看板中。
 
-其他生命周期操作，例如导入、归档、恢复、run control、package、删除和终止性拒绝，继续通过显式 CLI 命令执行。
+其他生命周期操作，例如导入、归档、恢复、阶段级 run control、package、删除和终止性拒绝，继续通过显式 CLI 命令执行。

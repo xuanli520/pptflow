@@ -3,9 +3,12 @@ package tui
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/purplevoid/harbor-factory/internal/app"
 )
 
@@ -13,8 +16,14 @@ type taskBoardGatewayStub struct {
 	snapshot         app.TaskBoardSnapshot
 	startRequests    []app.TaskBoardStartAuthoringRequest
 	decisionRequests []app.TaskBoardDecideReviewRequest
+	retryRequests    []app.TaskBoardRetryRunRequest
+	cancelRequests   []app.TaskBoardCancelRunRequest
+	log              app.TaskBoardLog
 	startErr         error
 	decisionErr      error
+	retryErr         error
+	cancelErr        error
+	logErr           error
 	flushErr         error
 	listCalls        int
 	flushCalls       int
@@ -41,6 +50,20 @@ func (stub *taskBoardGatewayStub) DecideReview(_ context.Context, request app.Ta
 	return app.TaskBoardMutation{TaskID: request.TaskID, Summary: "decided"}, stub.decisionErr
 }
 
+func (stub *taskBoardGatewayStub) ReadRunLog(context.Context, app.TaskBoardReadRunLogRequest) (app.TaskBoardLog, error) {
+	return stub.log, stub.logErr
+}
+
+func (stub *taskBoardGatewayStub) RetryRun(_ context.Context, request app.TaskBoardRetryRunRequest) (app.TaskBoardMutation, error) {
+	stub.retryRequests = append(stub.retryRequests, request)
+	return app.TaskBoardMutation{TaskID: request.TaskID, RunID: request.RunID, Summary: "retried"}, stub.retryErr
+}
+
+func (stub *taskBoardGatewayStub) CancelRun(_ context.Context, request app.TaskBoardCancelRunRequest) (app.TaskBoardMutation, error) {
+	stub.cancelRequests = append(stub.cancelRequests, request)
+	return app.TaskBoardMutation{TaskID: request.TaskID, RunID: request.RunID, Summary: "canceled"}, stub.cancelErr
+}
+
 func (stub *taskBoardGatewayStub) FlushQueuedRuns(context.Context) error {
 	stub.flushCalls++
 	return stub.flushErr
@@ -52,6 +75,9 @@ func taskBoardTestSnapshot(authoringAvailable bool) app.TaskBoardSnapshot {
 		Tasks: []app.TaskBoardTask{{
 			ID: "task-1", Title: "Task one", RepositoryURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", Column: app.TaskBoardPending,
 			Review: &app.TaskBoardReview{Kind: app.TaskBoardAuthoringReview, RequestID: "review-1"},
+			RunID:  "run-1", RunStatus: "failed_recoverable", Runs: []app.TaskBoardRun{{
+				ID: "run-1", Status: "failed_recoverable", CurrentStage: "repo_prepare", LogPath: "/managed/logs/run-1.log", CanRetry: true,
+			}},
 		}},
 	}
 }
@@ -254,5 +280,68 @@ func TestTaskInputSubmissionRetainsValuesUntilTheBackendSucceeds(t *testing.T) {
 	input.Reset()
 	if input.repoInput.Value() != "" || input.reasonInput.Value() != "" {
 		t.Fatal("successful reset did not clear the form")
+	}
+}
+
+func TestDetailRunActionsAndLogsTargetTheCurrentRun(t *testing.T) {
+	stub := &taskBoardGatewayStub{
+		snapshot: taskBoardTestSnapshot(true),
+		log: app.TaskBoardLog{
+			RunID: "run-1", Path: "/managed/logs/run-1.log", Content: "first line\nsecond line",
+		},
+	}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	updated, _ := model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	if model.action == nil || model.action.kind != taskBoardRetryAction {
+		t.Fatalf("retry prompt = %+v", model.action)
+	}
+	model.action.reasonInput.SetValue("retry recoverable run")
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardRetryMutation || command == nil {
+		t.Fatalf("retry start = active:%q command:%v", model.activeMutation, command)
+	}
+	_ = command().(taskBoardMutationMsg)
+	if len(stub.retryRequests) != 1 || stub.retryRequests[0].TaskID != "task-1" || stub.retryRequests[0].RunID != "run-1" || stub.retryRequests[0].Reason != "retry recoverable run" || stub.retryRequests[0].IdempotencyKey == "" {
+		t.Fatalf("retry request = %+v", stub.retryRequests)
+	}
+
+	model = loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+	updated, logCommand := model.handleKey(keyRune('l'), nil)
+	model = updated.(appModel)
+	if model.logs == nil || logCommand == nil {
+		t.Fatalf("log open = logs:%+v command:%v", model.logs, logCommand)
+	}
+	updated, _ = model.Update(logCommand())
+	model = updated.(appModel)
+	if model.logs == nil || model.logs.path != "/managed/logs/run-1.log" || !strings.Contains(model.logs.content, "second line") {
+		t.Fatalf("loaded log = %+v", model.logs)
+	}
+}
+
+func TestAppDetailAndLogViewsFitTheWindow(t *testing.T) {
+	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
+	model := loadedTaskBoardModel(t, stub)
+	model.width = 120
+	model.height = 40
+	model.detail = newDetailModel(model.board.SelectedTask())
+	assertAppWidth(t, model.View(), model.width)
+
+	model.logs = newLogModel(model.detail.task, app.TaskBoardLog{
+		RunID: "run-1", Path: "/managed/logs/run-1.log", Content: strings.Repeat("a log line\n", 24),
+	})
+	assertAppWidth(t, model.View(), model.width)
+}
+
+func assertAppWidth(t *testing.T, rendered string, width int) {
+	t.Helper()
+	for _, line := range strings.Split(ansi.Strip(rendered), "\n") {
+		if actual := lipgloss.Width(line); actual > width {
+			t.Fatalf("application line width %d exceeds window width %d: %q", actual, width, line)
+		}
 	}
 }

@@ -3,7 +3,10 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
@@ -52,8 +55,96 @@ func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
 		t.Fatalf("list task board: %v", err)
 	}
 	task := taskBoardTaskByID(t, snapshot, created.TaskID)
-	if task.Column != TaskBoardPending || task.RunID != created.RunID || task.RunStatus != string(store.WorkflowRunQueued) || task.RepositoryURL != standardAuthoringLaunchTestCoordinate.RepositoryURL {
+	if task.Column != TaskBoardPending || task.RunID != created.RunID || task.RunStatus != string(store.WorkflowRunQueued) || task.RepositoryURL != standardAuthoringLaunchTestCoordinate.RepositoryURL || len(task.Runs) != 1 || task.Runs[0].ID != created.RunID {
 		t.Fatalf("task board projection = %+v", task)
+	}
+}
+
+func TestTaskBoardServiceRetriesTheSelectedTaskRevisionRun(t *testing.T) {
+	ctx := context.Background()
+	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)
+	fixture.services.TaskBoard.actor = func() (string, error) { return "task-board-retry", nil }
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "retry selected recoverable Run",
+	})
+	if err != nil {
+		t.Fatalf("retry task board Run: %v", err)
+	}
+	if result.TaskID != fixture.task.ID || result.RunID != fixture.run.ID || result.Summary == "" {
+		t.Fatalf("retry result = %+v", result)
+	}
+}
+
+func TestTaskBoardServiceCancelsTheSelectedRun(t *testing.T) {
+	ctx := context.Background()
+	fixture := newContinuationFixture(t, store.WorkflowRunRunning)
+	fixture.services.TaskBoard.actor = func() (string, error) { return "task-board-cancel", nil }
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := fixture.services.TaskBoard.CancelRun(ctx, TaskBoardCancelRunRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "cancel selected Run",
+	})
+	if err != nil {
+		t.Fatalf("cancel task board Run: %v", err)
+	}
+	if result.TaskID != fixture.task.ID || result.RunID != fixture.run.ID || result.Summary == "" {
+		t.Fatalf("cancel result = %+v", result)
+	}
+	controls, err := fixture.services.Control.ListForRun(ctx, fixture.run.ID)
+	if err != nil || len(controls) != 1 || controls[0].Action != store.ControlActionTerminate {
+		t.Fatalf("cancel controls = %+v, %v", controls, err)
+	}
+}
+
+func TestTaskBoardRetryAvailabilityDoesNotOfferUnsupportedAuthoringRetry(t *testing.T) {
+	available, reason := taskBoardRetryAvailability(store.WorkflowRun{
+		SubjectKind: store.WorkflowRunSubjectAuthoringSession, Status: store.WorkflowRunFailedRecoverable,
+	})
+	if available || reason == "" {
+		t.Fatalf("authoring retry availability = available:%t reason:%q", available, reason)
+	}
+	available, reason = taskBoardRetryAvailability(store.WorkflowRun{
+		SubjectKind: store.WorkflowRunSubjectTaskRevision, Status: store.WorkflowRunFailedRecoverable,
+	})
+	if !available || reason != "" {
+		t.Fatalf("task revision retry availability = available:%t reason:%q", available, reason)
+	}
+}
+
+func TestTaskBoardServiceReadsTheSelectedRunWorkerLog(t *testing.T) {
+	ctx := context.Background()
+	fixture := newContinuationFixture(t, store.WorkflowRunRunning)
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	if err := os.WriteFile(logPath, []byte("first line\nsecond line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := fixture.services.WorkerHandoffs.ReserveRunWorkerHandoff(ctx, ReserveRunWorkerHandoffCommand{
+		IdempotencyKey: key,
+		RunID:          fixture.run.ID,
+		Expected: RunWorkerHandoffCheckpoint{
+			RunVersion: fixture.run.Version, ExecutionEpoch: fixture.run.ExecutionEpoch, DefinitionHash: fixture.run.DefinitionHash,
+		},
+		Owner: "task-board-log-reader", Actor: "tester", Reason: "attach test log", LaunchTTL: time.Minute,
+	})
+	if err != nil || !reserved.Launch {
+		t.Fatalf("reserve log handoff = %+v, %v", reserved, err)
+	}
+	if _, err := fixture.services.WorkerHandoffs.RecordRunWorkerHandoffSpawned(ctx, reserved.Handoff.ID, 4242, logPath, "tester", "record test log"); err != nil {
+		t.Fatalf("record log handoff: %v", err)
+	}
+	log, err := fixture.services.TaskBoard.ReadRunLog(ctx, TaskBoardReadRunLogRequest{TaskID: fixture.task.ID, RunID: fixture.run.ID})
+	if err != nil || log.Path != logPath || log.Content != "first line\nsecond line\n" {
+		t.Fatalf("read task board log = %+v, %v", log, err)
 	}
 }
 

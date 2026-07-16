@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	taskCardHeight = 6
-	taskCardGap    = 1
+	taskCardHeight       = 6
+	taskCardGap          = 1
+	minimumThreeColumnUI = 90
 )
 
 // TaskBoardModel holds the three-column task board state.
@@ -84,16 +85,17 @@ func (m *TaskBoardModel) SelectedTask() *TaskItem {
 	return nil
 }
 
-// View renders the three-column task board. Single column if width < 80.
+// View renders the three-column task board. A narrow terminal falls back to a
+// single focused column so card content remains readable.
 func (m *TaskBoardModel) View(width, height int) string {
-	if width < 80 {
+	if width < minimumThreeColumnUI {
 		return m.viewSingle(width, height)
 	}
 	return m.viewColumns(width, height)
 }
 
 func (m *TaskBoardModel) viewColumns(width, height int) string {
-	colWidth := max(24, (width-4)/3)
+	colWidth := max(24, (width-2)/3)
 	bodyHeight := max(1, height-1)
 
 	pendingTitle := formatColTitle("待处理", len(m.pending), m.cursor == 0)
@@ -108,11 +110,11 @@ func (m *TaskBoardModel) viewColumns(width, height int) string {
 
 	return lipgloss.JoinVertical(lipgloss.Top,
 		lipgloss.JoinHorizontal(lipgloss.Top,
-			pendingTitle,
+			lipgloss.NewStyle().Width(colWidth).Render(pendingTitle),
 			separator,
-			runningTitle,
+			lipgloss.NewStyle().Width(colWidth).Render(runningTitle),
 			separator,
-			completedTitle,
+			lipgloss.NewStyle().Width(colWidth).Render(completedTitle),
 		),
 		lipgloss.JoinHorizontal(lipgloss.Top,
 			lipgloss.NewStyle().Width(colWidth).Render(pendingCol),
@@ -160,7 +162,7 @@ func formatColTitle(title string, count int, active bool) string {
 
 func renderColumn(items []TaskItem, width, bodyHeight int, active bool, selected int) string {
 	if len(items) == 0 {
-		return mutedStyle.Render("  暂无题目" + strings.Repeat("\n", max(0, bodyHeight-1)))
+		return strings.Repeat("\n", max(0, bodyHeight-1))
 	}
 
 	cardsPerScreen := (bodyHeight + taskCardGap) / (taskCardHeight + taskCardGap)

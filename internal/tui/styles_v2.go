@@ -56,6 +56,37 @@ var (
 				Padding(0, 1).
 				Bold(true)
 
+	detailBreadcrumbStyle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+
+	detailSubtitleStyle = lipgloss.NewStyle().
+				Foreground(colorHighlight).
+				Bold(true)
+
+	detailSectionStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorMuted).
+				Padding(0, 1)
+
+	detailSectionTitleStyle = lipgloss.NewStyle().
+				Foreground(colorPrimary).
+				Bold(true)
+
+	detailLabelStyle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+
+	detailValueStyle = lipgloss.NewStyle().
+				Foreground(colorHighlight)
+
+	detailHistoryCurrentStyle = lipgloss.NewStyle().
+					Foreground(colorSuccess).
+					Bold(true)
+
+	logContentStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorMuted).
+			Padding(0, 1)
+
 	mutedStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)
 

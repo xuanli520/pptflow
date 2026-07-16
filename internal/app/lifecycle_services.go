@@ -248,9 +248,10 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	core.repairs = repairs
 	mutations := newLifecycleMutationService(core)
 	inspection := &LifecycleInspectionService{core: core}
+	control := &ExecutionControlService{core: core}
 	authoringReviews := &AuthoringReviewService{core: core}
 	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
-	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations)
+	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control)
 	return &LifecycleServices{
 		Tasks:                     &TaskService{core: core},
 		Revisions:                 &RevisionService{core: core},
@@ -259,7 +260,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		AuthoringReviews:          authoringReviews,
 		Releases:                  &ReleaseService{core: core},
 		Deletion:                  &DeletionService{core: core},
-		Control:                   &ExecutionControlService{core: core},
+		Control:                   control,
 		Budgets:                   &BudgetGrantService{core: core},
 		Continuations:             continuations,
 		Changes:                   changes,
