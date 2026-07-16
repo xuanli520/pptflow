@@ -134,12 +134,18 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	first := command().(taskBoardMutationMsg)
 	updated, _ = model.Update(first)
 	model = updated.(appModel)
-	updated, command = model.beginAuthoring(message, nil)
+	updated, command = model.beginAuthoring(TaskSubmitMsg{
+		RepoURL: "  " + message.RepoURL + "  ", CommitSHA: "  " + message.CommitSHA + "  ", Slug: "  " + message.Slug + "  ",
+		Title: "  " + message.Title + "  ", Reason: "  " + message.Reason + "  ",
+	}, nil)
 	model = updated.(appModel)
 	_ = model
 	_ = command().(taskBoardMutationMsg)
 	if len(stub.startRequests) != 2 || stub.startRequests[0].IdempotencyKey != stub.startRequests[1].IdempotencyKey {
 		t.Fatalf("authoring retry keys = %+v", stub.startRequests)
+	}
+	if stub.startRequests[1].RepositoryURL != message.RepoURL || stub.startRequests[1].CommitSHA != message.CommitSHA || stub.startRequests[1].Slug != message.Slug || stub.startRequests[1].Title != message.Title || stub.startRequests[1].Reason != message.Reason {
+		t.Fatalf("authoring retry request = %+v, want normalized %+v", stub.startRequests[1], message)
 	}
 
 	reviewModel := loadedTaskBoardModel(t, stub)

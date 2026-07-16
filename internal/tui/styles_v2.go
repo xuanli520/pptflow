@@ -8,7 +8,6 @@ var (
 	colorDanger    = lipgloss.Color("#E05555")
 	colorMuted     = lipgloss.Color("#6B7280")
 	colorHighlight = lipgloss.Color("#F5F5F5")
-	colorBg        = lipgloss.Color("#1A1B26")
 
 	appStyle = lipgloss.NewStyle().Padding(0, 1)
 

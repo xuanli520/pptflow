@@ -412,6 +412,11 @@ func (m appModel) beginAuthoring(message TaskSubmitMsg, inputCmd tea.Cmd) (tea.M
 		m.notice = "请等待当前操作完成"
 		return m, inputCmd
 	}
+	message.RepoURL = strings.TrimSpace(message.RepoURL)
+	message.CommitSHA = strings.TrimSpace(message.CommitSHA)
+	message.Slug = strings.TrimSpace(message.Slug)
+	message.Title = strings.TrimSpace(message.Title)
+	message.Reason = strings.TrimSpace(message.Reason)
 	if m.pendingStart == nil || m.pendingStart.message != message {
 		key, err := m.newIdempotencyKey()
 		if err != nil {
