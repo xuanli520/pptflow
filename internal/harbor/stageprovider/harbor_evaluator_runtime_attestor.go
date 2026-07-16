@@ -212,12 +212,11 @@ func attestHarborEvaluatorLauncherInterpreter(launcher, interpreter LocalExecuta
 }
 
 func readHarborEvaluatorShebang(reader io.Reader) (string, error) {
-	raw, err := io.ReadAll(io.LimitReader(reader, harborEvaluatorShebangLimit+1))
-	if err != nil || len(raw) > harborEvaluatorShebangLimit {
+	firstLine, err := readBoundedShebangLine(reader, harborEvaluatorShebangLimit)
+	if err != nil {
 		return "", fmt.Errorf("%w: locked Harbor launcher shebang cannot be read", ErrDeploymentOperationRuntimeAttestationFailed)
 	}
-	firstLine, _, found := bytes.Cut(raw, []byte{'\n'})
-	if !found || !bytes.HasPrefix(firstLine, []byte("#!")) {
+	if !bytes.HasPrefix(firstLine, []byte("#!")) {
 		return "", fmt.Errorf("%w: locked Harbor launcher lacks a strict Python shebang", ErrDeploymentOperationRuntimeAttestationFailed)
 	}
 	interpreter := strings.TrimSuffix(string(firstLine[2:]), "\r")

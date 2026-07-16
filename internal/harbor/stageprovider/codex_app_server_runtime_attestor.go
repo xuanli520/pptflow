@@ -368,12 +368,11 @@ func attestCodexJavaScriptLauncher(launcher LocalExecutableLock) error {
 		return fmt.Errorf("%w: locked Codex JavaScript launcher cannot be opened for shebang verification", ErrDeploymentOperationRuntimeAttestationFailed)
 	}
 	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, codexAppServerShebangLimit+1))
-	if err != nil || len(raw) > codexAppServerShebangLimit {
+	line, err := readBoundedShebangLine(file, codexAppServerShebangLimit)
+	if err != nil {
 		return fmt.Errorf("%w: locked Codex JavaScript launcher shebang cannot be read", ErrDeploymentOperationRuntimeAttestationFailed)
 	}
-	line, _, found := bytes.Cut(raw, []byte{'\n'})
-	if !found || !bytes.Equal(line, []byte("#!/usr/bin/env node")) {
+	if !bytes.Equal(line, []byte("#!/usr/bin/env node")) {
 		return fmt.Errorf("%w: locked Codex JavaScript launcher must use the strict /usr/bin/env node shebang", ErrDeploymentOperationRuntimeAttestationFailed)
 	}
 	return nil

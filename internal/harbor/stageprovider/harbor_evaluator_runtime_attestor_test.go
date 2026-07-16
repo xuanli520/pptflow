@@ -307,7 +307,7 @@ func newHarborEvaluatorAttestationFixture(t *testing.T, commandID string) *harbo
 	interpreter := filepath.Join(root, "python")
 	writeHarborEvaluatorTestFile(t, interpreter, "#!/bin/sh\nexec /bin/sh \"$@\"\n", 0o700)
 	launcher := filepath.Join(root, "harbor")
-	launcherContents := "#!" + interpreter + "\nif [ \"$1\" = \"--version\" ]; then printf '0.18.0\\n'; exit 0; fi\nexit 1\n"
+	launcherContents := "#!" + interpreter + "\nif [ \"$1\" = \"--version\" ]; then printf '0.18.0\\n'; exit 0; fi\nexit 1\n" + strings.Repeat("# controlled Harbor launcher padding\n", 128)
 	writeHarborEvaluatorTestFile(t, launcher, launcherContents, 0o700)
 	docker := filepath.Join(root, "docker")
 	dockerContents := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Docker version 29.5.2, build controlled\\n'; exit 0; fi\nexit 1\n"

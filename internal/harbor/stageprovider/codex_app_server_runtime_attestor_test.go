@@ -145,6 +145,27 @@ func TestCodexAppServerRuntimeAttestorProvesPinnedRuntimeWithExplicitSecretFreeE
 	}
 }
 
+func TestReadBoundedShebangLineReadsOnlyTheFirstLine(t *testing.T) {
+	line, err := readBoundedShebangLine(strings.NewReader("#!/usr/bin/env node\n"+strings.Repeat("x", 16*1024)), codexAppServerShebangLimit)
+	if err != nil || string(line) != "#!/usr/bin/env node" {
+		t.Fatalf("large launcher shebang = %q, %v", line, err)
+	}
+	line, err = readBoundedShebangLine(strings.NewReader(strings.Repeat("x", codexAppServerShebangLimit)+"\n"), codexAppServerShebangLimit)
+	if err != nil || len(line) != codexAppServerShebangLimit {
+		t.Fatalf("boundary shebang length = %d, %v", len(line), err)
+	}
+	for name, input := range map[string]string{
+		"overlong":     strings.Repeat("x", codexAppServerShebangLimit+1) + "\n",
+		"unterminated": "#!/usr/bin/env node",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := readBoundedShebangLine(strings.NewReader(input), codexAppServerShebangLimit); err == nil {
+				t.Fatal("readBoundedShebangLine unexpectedly succeeded")
+			}
+		})
+	}
+}
+
 func TestCodexAppServerRuntimeAttestorFailsClosedOnDriftOrMissingTypedLock(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -266,7 +287,7 @@ func newCodexAppServerAttestationFixture(t *testing.T) *codexAppServerAttestatio
 	}
 	node := filepath.Join(nodeDirectory, "node")
 	launcher := filepath.Join(root, "codex.js")
-	launcherContents := "#!/usr/bin/env node\n// controlled Codex JavaScript launcher\n"
+	launcherContents := "#!/usr/bin/env node\n" + strings.Repeat("// controlled Codex JavaScript launcher\n", 128)
 	writeCodexAppServerTestFile(t, launcher, launcherContents, 0o700)
 	// The pinned launcher reaches this fake Node through its strict env-based
 	// shebang. It also rejects inherited credentials or an ambient CODEX_HOME.
