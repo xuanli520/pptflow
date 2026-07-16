@@ -10,7 +10,12 @@ import (
 
 func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T) {
 	registry := DefaultTemplateRegistry()
-	for _, reference := range []TemplateReference{StandardTemplateReference(), CodeEdgePhase1TemplateReference(), CodeEdgeEvaluatorChildTemplateReference()} {
+	for _, reference := range []TemplateReference{
+		StandardTemplateReference(),
+		StandardAuthoringTemplateReference(),
+		CodeEdgePhase1TemplateReference(),
+		CodeEdgeEvaluatorChildTemplateReference(),
+	} {
 		template, err := registry.ResolveTemplate(reference)
 		if err != nil {
 			t.Fatalf("resolve %s@%s: %v", reference.ID, reference.Version, err)
@@ -35,12 +40,37 @@ func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T
 
 	for _, reference := range []TemplateReference{
 		{ID: StandardWorkflowTemplateID, Version: "2.1.1"},
+		{ID: StandardAuthoringWorkflowTemplateID, Version: "1.0.0"},
 		{ID: "harbor.not-installed", Version: "1.0.0"},
 		{ID: StandardWorkflowTemplateID},
 	} {
 		if _, err := registry.ResolveTemplate(reference); err == nil {
 			t.Fatalf("unregistered reference %#v unexpectedly resolved", reference)
 		}
+	}
+}
+
+func TestStandardAuthoringV2BaselineAcceptsOnlyVersionOneDotOneDotZero(t *testing.T) {
+	current := StandardAuthoringWorkflowTemplate()
+	if current.Version != "1.1.0" || current.Catalog.Version != "1.1.0" || !current.Reference().Equal(StandardAuthoringTemplateReference()) {
+		t.Fatalf("current Standard authoring template = %s@%s catalog %s@%s", current.ID, current.Version, current.Catalog.ID, current.Catalog.Version)
+	}
+	if err := current.Validate(); err != nil {
+		t.Fatalf("validate current Standard authoring template: %v", err)
+	}
+
+	retired := TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: "1.0.0"}
+	if err := retired.Validate(); err == nil {
+		t.Fatal("retired Standard authoring template reference was accepted")
+	}
+	if _, err := ResolveWorkflowTemplate(retired); err == nil {
+		t.Fatal("retired Standard authoring template resolved from the default registry")
+	}
+	if IsStandardAuthoringWorkflowTemplate(retired) {
+		t.Fatal("retired Standard authoring template was recognized as executable")
+	}
+	if _, err := catalogPolicyFor(retired); err == nil {
+		t.Fatal("retired Standard authoring template received a catalog policy")
 	}
 }
 

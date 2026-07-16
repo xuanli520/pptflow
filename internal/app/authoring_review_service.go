@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 const authoringReviewGateResolutionPayloadFormat = "harbor.authoring-review-gate-resolution.v1"
@@ -94,6 +95,9 @@ func (service *AuthoringReviewService) Inspect(ctx context.Context, reviewReques
 	}
 	if run == nil {
 		return AuthoringReviewGateSnapshot{}, fmt.Errorf("%w: authoring review Run %s", ErrLifecycleNotFound, binding.RunID)
+	}
+	if !isCurrentStandardAuthoringRun(*run) {
+		return AuthoringReviewGateSnapshot{}, fmt.Errorf("authoring review Run is not %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
 	}
 	subject, err := service.core.resolveWorkflowRunSubject(ctx, *run)
 	if err != nil {

@@ -155,6 +155,7 @@ func newCommandAuthoringRecoveryFixture(t *testing.T, ctx context.Context) (stri
 		},
 		RepositoryURL: coordinate.RepositoryURL,
 		CommitSHA:     coordinate.CommitSHA,
+		BaseImage:     "docker.io/library/rust:1.65@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Slug:          "authoring-recover-cli",
 		Title:         "Authoring recover CLI fixture",
 		MetadataJSON:  `{}`,

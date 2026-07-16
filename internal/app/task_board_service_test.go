@@ -13,6 +13,8 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
+const taskBoardAuthoringTestBaseImage = "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -40,6 +42,7 @@ func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
 		IdempotencyKey: key,
 		RepositoryURL:  standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:      standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:      taskBoardAuthoringTestBaseImage,
 		Slug:           "task-board-authoring",
 		Title:          "Task board authoring",
 		MetadataJSON:   `{}`,
@@ -107,6 +110,7 @@ func TestTaskBoardServiceRecoversAuthoringRunThroughDedicatedPath(t *testing.T) 
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: launchKey, Actor: "author", Reason: "create recoverable authoring board fixture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    taskBoardAuthoringTestBaseImage,
 		Slug:                         "task-board-authoring-recovery",
 		Title:                        "Task board authoring recovery",
 		MetadataJSON:                 `{}`,
@@ -307,6 +311,7 @@ func TestTaskBoardServiceReplaysAuthoringLaunchAfterActivationFailure(t *testing
 		IdempotencyKey: key,
 		RepositoryURL:  standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:      standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:      taskBoardAuthoringTestBaseImage,
 		Slug:           "task-board-activation-retry",
 		Title:          "Task board activation retry",
 		MetadataJSON:   `{}`,

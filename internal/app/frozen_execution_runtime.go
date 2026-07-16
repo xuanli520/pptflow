@@ -2121,9 +2121,7 @@ func (runtime *FrozenExecutionRuntime) afterStageTerminal(ctx context.Context, j
 	case store.StageExecutionCompleted:
 		switch attempt.Verdict {
 		case store.VerdictPass, store.VerdictAdvisory:
-			if run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
-				run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringWorkflowTemplateVersion &&
-				stage.Key == workflowkit.StageKey(workflowadapter.MaterializeTask) {
+			if isCurrentStandardAuthoringRun(run) && stage.Key == workflowkit.StageKey(workflowadapter.MaterializeTask) {
 				if err := runtime.enqueueStandardAuthoringHandoff(ctx, job, run, attempt); err != nil {
 					return runtime.failMalformedJob(ctx, job, fmt.Errorf("enqueue Standard authoring task handoff: %w", err))
 				}
@@ -2245,7 +2243,7 @@ func (runtime *FrozenExecutionRuntime) enqueueNextCoordinator(ctx context.Contex
 // replay cannot allocate a second Phase-1 Run for the same source/session
 // materialization.
 func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringHandoff(ctx context.Context, stageJob store.DurableJob, run store.WorkflowRun, attempt store.StageAttempt) error {
-	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || attempt.RunID != run.ID ||
+	if !isCurrentStandardAuthoringRun(run) || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || attempt.RunID != run.ID ||
 		attempt.StageKey != workflowadapter.MaterializeTask || attempt.ArtifactManifestID == "" {
 		return fmt.Errorf("Standard authoring handoff source does not match a materialized authoring Run")
 	}
@@ -2342,9 +2340,7 @@ func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringCompletionCoordin
 	if err != nil {
 		return err
 	}
-	if run == nil || run.ID != handoffJob.RunID || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession ||
-		run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
-		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+	if run == nil || run.ID != handoffJob.RunID || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || !isCurrentStandardAuthoringRun(*run) {
 		return fmt.Errorf("Standard authoring completion does not match its parent Run")
 	}
 	sourceJob, sourcePayload, err := standardAuthoringHandoffJobForRun(ctx, runtime.core.store, run.ID)
@@ -2563,8 +2559,7 @@ func (runtime *FrozenExecutionRuntime) completeRunIfSatisfied(ctx context.Contex
 // particular, an interrupted delivery may already have been reconciled into a
 // child, so the delivery job state alone is not the completion fact.
 func (runtime *FrozenExecutionRuntime) standardAuthoringPhase1HandoffCompletionReady(ctx context.Context, run store.WorkflowRun) (bool, error) {
-	if run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
-		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+	if !isCurrentStandardAuthoringRun(run) {
 		return true, nil
 	}
 	_, payload, err := standardAuthoringHandoffJobForRun(ctx, runtime.core.store, run.ID)

@@ -12,6 +12,8 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/app"
 )
 
+const taskBoardTestBaseImage = "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 type taskBoardGatewayStub struct {
 	snapshot         app.TaskBoardSnapshot
 	startRequests    []app.TaskBoardStartAuthoringRequest
@@ -103,10 +105,10 @@ func TestAppModelRoutesBoardCommandsThroughGateway(t *testing.T) {
 		t.Fatalf("loaded board selection = %+v", selected)
 	}
 
-	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", Slug: "task-one", Title: "Task one", Reason: "create task"}
+	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", Reason: "create task"}
 	_, startCommand := model.beginAuthoring(message, nil)
 	mutationMessage := startCommand()
-	if _, ok := mutationMessage.(taskBoardMutationMsg); !ok || len(stub.startRequests) != 1 || stub.startRequests[0].Reason != message.Reason || stub.startRequests[0].Slug != message.Slug || stub.startRequests[0].IdempotencyKey == "" {
+	if _, ok := mutationMessage.(taskBoardMutationMsg); !ok || len(stub.startRequests) != 1 || stub.startRequests[0].Reason != message.Reason || stub.startRequests[0].BaseImage != message.BaseImage || stub.startRequests[0].Slug != message.Slug || stub.startRequests[0].IdempotencyKey == "" {
 		t.Fatalf("start command = %#v, request=%+v", mutationMessage, stub.startRequests)
 	}
 
@@ -146,13 +148,38 @@ func TestVisibleTaskInputConsumesBoardAndReviewKeys(t *testing.T) {
 	}
 }
 
+func TestTaskInputRequiresBaseImageAndIncludesItInTabOrder(t *testing.T) {
+	input := NewTaskInputModel()
+	input.Show()
+	input.repoInput.SetValue("https://example.invalid/repo.git")
+	input.commitInput.SetValue("abcdef0123456789abcdef0123456789abcdef01234567")
+	input.slugInput.SetValue("immutable-environment")
+	input.titleInput.SetValue("Immutable environment")
+	input.reasonInput.SetValue("exercise required task contract input")
+
+	for range 2 {
+		_, handled := input.Update(tea.KeyMsg{Type: tea.KeyTab})
+		if !handled {
+			t.Fatal("tab was not handled by the task form")
+		}
+	}
+	if input.focusIndex != 2 || !input.baseImageInput.Focused() {
+		t.Fatalf("base image focus = index:%d focused:%t", input.focusIndex, input.baseImageInput.Focused())
+	}
+
+	command, handled := input.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !handled || command != nil || !strings.Contains(input.validationErr, "base image") {
+		t.Fatalf("missing base image submission = command:%v handled:%t error:%q", command, handled, input.validationErr)
+	}
+}
+
 func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	stub := &taskBoardGatewayStub{
 		snapshot:    taskBoardTestSnapshot(true),
 		startErr:    errors.New("activation unavailable"),
 		decisionErr: errors.New("activation unavailable"),
 	}
-	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", Slug: "task-one", Title: "Task one", Reason: "create task"}
+	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", Reason: "create task"}
 
 	model := loadedTaskBoardModel(t, stub)
 	updated, command := model.beginAuthoring(message, nil)
@@ -161,7 +188,7 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	updated, _ = model.Update(first)
 	model = updated.(appModel)
 	updated, command = model.beginAuthoring(TaskSubmitMsg{
-		RepoURL: "  " + message.RepoURL + "  ", CommitSHA: "  " + message.CommitSHA + "  ", Slug: "  " + message.Slug + "  ",
+		RepoURL: "  " + message.RepoURL + "  ", CommitSHA: "  " + message.CommitSHA + "  ", BaseImage: "  " + message.BaseImage + "  ", Slug: "  " + message.Slug + "  ",
 		Title: "  " + message.Title + "  ", Reason: "  " + message.Reason + "  ",
 	}, nil)
 	model = updated.(appModel)
@@ -170,7 +197,7 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	if len(stub.startRequests) != 2 || stub.startRequests[0].IdempotencyKey != stub.startRequests[1].IdempotencyKey {
 		t.Fatalf("authoring retry keys = %+v", stub.startRequests)
 	}
-	if stub.startRequests[1].RepositoryURL != message.RepoURL || stub.startRequests[1].CommitSHA != message.CommitSHA || stub.startRequests[1].Slug != message.Slug || stub.startRequests[1].Title != message.Title || stub.startRequests[1].Reason != message.Reason {
+	if stub.startRequests[1].RepositoryURL != message.RepoURL || stub.startRequests[1].CommitSHA != message.CommitSHA || stub.startRequests[1].BaseImage != message.BaseImage || stub.startRequests[1].Slug != message.Slug || stub.startRequests[1].Title != message.Title || stub.startRequests[1].Reason != message.Reason {
 		t.Fatalf("authoring retry request = %+v, want normalized %+v", stub.startRequests[1], message)
 	}
 
@@ -201,6 +228,39 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestAppModelRetainsBaseImageAfterFailedStartAndClearsItAfterSuccess(t *testing.T) {
+	stub := &taskBoardGatewayStub{
+		snapshot: taskBoardTestSnapshot(true),
+		startErr: errors.New("activation unavailable"),
+	}
+	model := loadedTaskBoardModel(t, stub)
+	model.input.Show()
+	model.input.baseImageInput.SetValue(taskBoardTestBaseImage)
+	message := TaskSubmitMsg{
+		RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage,
+		Slug: "task-one", Title: "Task one", Reason: "create task",
+	}
+
+	updated, command := model.beginAuthoring(message, nil)
+	model = updated.(appModel)
+	failed := command().(taskBoardMutationMsg)
+	updated, _ = model.Update(failed)
+	model = updated.(appModel)
+	if !model.input.Visible() || model.input.baseImageInput.Value() != taskBoardTestBaseImage {
+		t.Fatalf("failed start cleared task contract input: visible:%t baseImage:%q", model.input.Visible(), model.input.baseImageInput.Value())
+	}
+
+	stub.startErr = nil
+	updated, command = model.beginAuthoring(message, nil)
+	model = updated.(appModel)
+	succeeded := command().(taskBoardMutationMsg)
+	updated, _ = model.Update(succeeded)
+	model = updated.(appModel)
+	if model.input.Visible() || model.input.baseImageInput.Value() != "" {
+		t.Fatalf("successful start retained task contract input: visible:%t baseImage:%q", model.input.Visible(), model.input.baseImageInput.Value())
+	}
+}
+
 func TestAppModelRefreshesQueuedRunsAndGatesUnavailableAuthoring(t *testing.T) {
 	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(false)}
 	model := newAppModelWithGateway(context.Background(), stub)
@@ -224,7 +284,7 @@ func TestAppModelRefreshesQueuedRunsAndGatesUnavailableAuthoring(t *testing.T) {
 func TestAppModelDoesNotExitWhileAMutationIsInFlight(t *testing.T) {
 	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
 	model := loadedTaskBoardModel(t, stub)
-	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", Slug: "task-one", Title: "Task one", Reason: "create task"}
+	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", Reason: "create task"}
 	updated, _ := model.beginAuthoring(message, nil)
 	model = updated.(appModel)
 	updated, exitCommand := model.handleKey(keyRune('q'), nil)
@@ -260,9 +320,13 @@ func TestTaskInputSubmissionRetainsValuesUntilTheBackendSucceeds(t *testing.T) {
 	if input.commitInput.CharLimit != 64 {
 		t.Fatalf("commit SHA limit = %d, want 64", input.commitInput.CharLimit)
 	}
+	if input.baseImageInput.CharLimit != 512 {
+		t.Fatalf("base image limit = %d, want 512", input.baseImageInput.CharLimit)
+	}
 	input.Show()
 	input.repoInput.SetValue("https://example.invalid/repo.git")
 	input.commitInput.SetValue("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+	input.baseImageInput.SetValue(taskBoardTestBaseImage)
 	input.slugInput.SetValue("retained-task")
 	input.titleInput.SetValue("Retained task")
 	input.reasonInput.SetValue("test retry")
@@ -271,14 +335,14 @@ func TestTaskInputSubmissionRetainsValuesUntilTheBackendSucceeds(t *testing.T) {
 		t.Fatal("complete form did not emit a submit message")
 	}
 	message, ok := command().(TaskSubmitMsg)
-	if !ok || message.Slug != "retained-task" || message.Reason != "test retry" || len(message.CommitSHA) != 64 {
+	if !ok || message.BaseImage != taskBoardTestBaseImage || message.Slug != "retained-task" || message.Reason != "test retry" || len(message.CommitSHA) != 64 {
 		t.Fatalf("submit message = %#v", message)
 	}
-	if input.repoInput.Value() == "" || input.reasonInput.Value() == "" {
+	if input.repoInput.Value() == "" || input.baseImageInput.Value() == "" || input.reasonInput.Value() == "" {
 		t.Fatal("input values were cleared before a successful backend response")
 	}
 	input.Reset()
-	if input.repoInput.Value() != "" || input.reasonInput.Value() != "" {
+	if input.repoInput.Value() != "" || input.baseImageInput.Value() != "" || input.reasonInput.Value() != "" {
 		t.Fatal("successful reset did not clear the form")
 	}
 }

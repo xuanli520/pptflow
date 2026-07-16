@@ -96,7 +96,7 @@ func TestStandardAuthoringCodexOutputSubmissionRejectsInvalidCandidatesWithoutPe
 		t.Run(testCase.name, func(t *testing.T) {
 			stage := standardAuthoringCodexTestStage(1)
 			request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
-			submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 3, func() time.Time { return now })
+			submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 3, func() time.Time { return now }, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -189,7 +189,7 @@ func TestStandardAuthoringCodexOutputSubmissionCanonicalizesSemanticEquivalentCa
 	for _, raw := range []json.RawMessage{canonical, spaced} {
 		stage := standardAuthoringCodexTestStage(1)
 		request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
-		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now })
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now }, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -211,6 +211,57 @@ func TestStandardAuthoringCodexOutputSubmissionCanonicalizesSemanticEquivalentCa
 	}
 }
 
+func TestStandardAuthoringCodexOutputSubmissionEnforcesFrozenDockerfileEnvironmentPolicy(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	policy := standardAuthoringCodexTestEnvironmentPolicy(t)
+	valid := []byte("FROM " + policy.BaseImage + " AS build\nRUN printf '%s\\n' ready\n")
+	cases := []struct {
+		name       string
+		content    []byte
+		wantAccept bool
+	}{
+		{name: "exact immutable image", content: valid, wantAccept: true},
+		{name: "different immutable image", content: []byte("FROM registry.example.com/team/other:1.2.3@sha256:" + strings.Repeat("b", 64) + "\n")},
+		{name: "variable expansion", content: []byte("ARG BASE=" + policy.BaseImage + "\nFROM ${BASE}\n")},
+		{name: "additional image", content: []byte("FROM " + policy.BaseImage + " AS build\nFROM registry.example.com/team/other:1.2.3@sha256:" + strings.Repeat("b", 64) + "\n")},
+		{name: "no from instruction", content: []byte("RUN printf '%s\\n' missing\n")},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			stage := standardAuthoringCodexTestDockerfileStage(1)
+			request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+			submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now }, &policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := submission.beginTurn(1); err != nil {
+				t.Fatal(err)
+			}
+			response, err := submission.dynamicTool().Handler(context.Background(), standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, testCase.content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if receipt.Accepted != testCase.wantAccept {
+				t.Fatalf("receipt = %+v, want accepted=%t", receipt, testCase.wantAccept)
+			}
+			if testCase.wantAccept {
+				accepted, found := submission.acceptedResult()
+				if !found || len(accepted.Artifacts) != 1 || string(accepted.Artifacts[0].Content) != string(testCase.content) {
+					t.Fatalf("accepted Dockerfile result = %+v", accepted)
+				}
+			} else if len(receipt.Errors) != 1 || receipt.Errors[0] != "dockerfile_environment_policy_mismatch" {
+				t.Fatalf("rejected Dockerfile receipt = %+v", receipt)
+			}
+			if len(*usages) != 1 || (*usages)[0].Dimension != standardAuthoringCodexOutputSubmissionQuotaDimension {
+				t.Fatalf("usage records = %+v, want one charged submission", *usages)
+			}
+		})
+	}
+}
+
 func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *testing.T) {
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
 	valid := standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("accepted artifact"))
@@ -219,7 +270,7 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *
 	t.Run("submission attempts are bounded independently from agent turns", func(t *testing.T) {
 		stage := standardAuthoringCodexTestStage(1)
 		request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
-		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now })
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now }, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -249,7 +300,7 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *
 	t.Run("byte limit rejects after charging the bounded submission attempt", func(t *testing.T) {
 		stage := standardAuthoringCodexTestStage(1)
 		request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
-		submission, err := newStandardAuthoringCodexOutputSubmission(request, len(valid)-1, 2, func() time.Time { return now })
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, len(valid)-1, 2, func() time.Time { return now }, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -273,7 +324,7 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *
 		stage := standardAuthoringCodexTestStage(1)
 		request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
 		request.Charge = func(context.Context, workflowkit.StageUsage) error { return errors.New("quota unavailable") }
-		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now })
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now }, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -311,7 +362,7 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *
 			cancel()
 			return nil
 		}
-		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now })
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now }, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

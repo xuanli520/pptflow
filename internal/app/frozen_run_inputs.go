@@ -106,17 +106,27 @@ func (core *lifecycleServiceCore) verifyWorkflowRunSubjectInputs(ctx context.Con
 	}
 }
 
-// verifyAuthoringSourceInput proves the source_snapshot row that was inserted
-// atomically with an AuthoringSession Run still names the session's immutable
-// source object.  Standard's initial repo_prepare reads it through the
-// controlled source adapter rather than pretending it is a TaskRevision run
-// input; no caller-supplied filesystem path is accepted here.
+// verifyAuthoringSourceInput proves both intrinsic authoring-session inputs:
+// source_snapshot stays available only to the controlled repo adapter, while
+// environment_policy is exposed as a normal immutable artifact binding to the
+// stages that declare it. Neither path accepts a caller filesystem path or a
+// mutable run-input record.
 func (core *lifecycleServiceCore) verifyAuthoringSourceInput(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, manifest runManifest, specification workflowadapter.RunExecutionSpec) error {
 	if core == nil || core.store == nil || core.objects == nil || !subject.isAuthoringSession() {
 		return fmt.Errorf("authoring source input verifier is not configured")
 	}
-	if len(manifest.Inputs.ManagedInputs) != 0 {
+	if manifest.Inputs == nil || len(manifest.Inputs.ManagedInputs) != 0 {
 		return fmt.Errorf("authoring Run manifest cannot declare task-revision managed inputs")
+	}
+	if err := validateCurrentStandardAuthoringFrozenContract(run, manifest, specification); err != nil {
+		return err
+	}
+	environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(*subject.AuthoringSession)
+	if err != nil {
+		return fmt.Errorf("verify authoring session environment policy: %w", err)
+	}
+	if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
+		return fmt.Errorf("verify authoring execution environment policy binding: %w", err)
 	}
 	input, err := core.store.GetAuthoringRunInputArtifactForPort(ctx, run.ID, "source_snapshot")
 	if err != nil {

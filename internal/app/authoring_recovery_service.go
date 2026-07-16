@@ -418,7 +418,7 @@ func (service *AuthoringRecoveryService) loadBinding(ctx context.Context, runID 
 	if run == nil {
 		return authoringRecoveryBinding{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 	}
-	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || !workflowadapter.IsStandardAuthoringWorkflowTemplate(workflowadapter.TemplateReference{ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion}) {
+	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || !isCurrentStandardAuthoringRun(*run) {
 		return authoringRecoveryBinding{}, fmt.Errorf("%w: workflow run %s is not a Standard authoring Run", ErrAuthoringRecoveryUnavailable, run.ID)
 	}
 	subject, err := service.core.resolveWorkflowRunSubject(ctx, *run)

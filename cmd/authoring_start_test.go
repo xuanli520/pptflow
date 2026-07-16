@@ -15,7 +15,7 @@ func TestAuthoringStartCommandExposesSourceCoordinateAndClosedExecutionInputs(t 
 	if err != nil || command == nil || command.Name() != "start" {
 		t.Fatalf("find authoring start command: command=%v err=%v", command, err)
 	}
-	for _, required := range []string{"repository-url", "commit-sha", "slug", "title", "metadata-json", "idempotency-key", "reason"} {
+	for _, required := range []string{"repository-url", "commit-sha", "base-image", "slug", "title", "metadata-json", "idempotency-key", "reason"} {
 		if command.Flags().Lookup(required) == nil {
 			t.Fatalf("authoring start is missing --%s", required)
 		}
@@ -68,6 +68,7 @@ func TestAuthoringStartCommandFailsClosedWithoutDeploymentCapabilityAndCreatesNo
 		"start",
 		"--repository-url", "https://github.com/example/fixture-repository.git",
 		"--commit-sha", "0123456789abcdef0123456789abcdef01234567",
+		"--base-image", "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"--slug", "fixture-authoring",
 		"--title", "Fixture authoring",
 		"--metadata-json", `{"difficulty":"hard"}`,
@@ -92,5 +93,25 @@ func TestAuthoringStartCommandFailsClosedWithoutDeploymentCapabilityAndCreatesNo
 	}
 	if len(tasks) != 0 {
 		t.Fatalf("uninjected authoring start created tasks: %+v", tasks)
+	}
+}
+
+func TestAuthoringStartCommandRequiresBaseImage(t *testing.T) {
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := newAuthoringCommand(&lifecycleCLIConfig{root: t.TempDir()})
+	command.SetArgs([]string{
+		"start",
+		"--repository-url", "https://github.com/example/fixture-repository.git",
+		"--commit-sha", "0123456789abcdef0123456789abcdef01234567",
+		"--slug", "fixture-authoring",
+		"--title", "Fixture authoring",
+		"--idempotency-key", key,
+		"--reason", "verify immutable task environment is required",
+	})
+	if err := command.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "base-image is required") {
+		t.Fatalf("missing base-image error = %v", err)
 	}
 }

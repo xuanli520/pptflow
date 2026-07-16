@@ -97,8 +97,7 @@ func (executor *StandardAuthoringMaterializeExecutor) ExecuteHarborBuiltin(ctx c
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	if !subject.isAuthoringSession() || subject.Binding != invocation.Request.Execution.Subject || run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
-		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+	if !isCurrentStandardAuthoringRun(*run) || !subject.isAuthoringSession() || subject.Binding != invocation.Request.Execution.Subject {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring materializer Run is not a frozen source/session subject")
 	}
 	if invocation.Request.Claim.Stage.StageAttempt.ID == "" {
@@ -157,22 +156,23 @@ type standardAuthoringMaterializeInputSet struct {
 }
 
 func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit.StageExecutionRequest, run store.WorkflowRun, subject workflowRunSubject) (standardAuthoringMaterializeInputSet, error) {
+	if !isCurrentStandardAuthoringRun(run) {
+		return standardAuthoringMaterializeInputSet{}, fmt.Errorf("Standard authoring materializer Run is not bound to the current template")
+	}
 	if request.ReadInput == nil {
 		return standardAuthoringMaterializeInputSet{}, fmt.Errorf("Standard authoring materializer has no frozen input reader")
 	}
-	expected := map[string]string{
-		"instruction":              workflowadapter.StandardAuthoringWorkflowTemplate().Catalog.Stages[5].Outputs[0].SchemaVersion,
-		"task_toml":                workflowadapter.StandardAuthoringWorkflowTemplate().Catalog.Stages[6].Outputs[0].SchemaVersion,
-		"dockerfile":               workflowadapter.StandardAuthoringWorkflowTemplate().Catalog.Stages[7].Outputs[0].SchemaVersion,
-		"solve_script":             workflowadapter.StandardAuthoringWorkflowTemplate().Catalog.Stages[9].Outputs[0].SchemaVersion,
-		"test_script":              workflowadapter.StandardAuthoringWorkflowTemplate().Catalog.Stages[10].Outputs[0].SchemaVersion,
-		"tests_analysis":           workflowadapter.StandardAuthoringWorkflowTemplate().Catalog.Stages[11].Outputs[0].SchemaVersion,
-		"solution_review_decision": "harbor.review-decision.v1",
+	expected, contractErr := standardAuthoringMaterializeInputContract(request.Stage)
+	if contractErr != nil {
+		return standardAuthoringMaterializeInputSet{}, contractErr
 	}
 	bindings := make(map[string]workflowkit.ArtifactBinding, len(request.Inputs))
 	for _, input := range request.Inputs {
 		if _, duplicate := bindings[input.Name]; duplicate {
 			return standardAuthoringMaterializeInputSet{}, fmt.Errorf("Standard authoring materializer received duplicate input %q", input.Name)
+		}
+		if _, expectedInput := expected[input.Name]; !expectedInput {
+			return standardAuthoringMaterializeInputSet{}, fmt.Errorf("Standard authoring materializer received undeclared input %q", input.Name)
 		}
 		bindings[input.Name] = input
 	}
@@ -198,6 +198,17 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 	if result.dockerfile, err = read("dockerfile"); err != nil {
 		return result, err
 	}
+	policyRaw, err := read(workflowadapter.StandardAuthoringEnvironmentPolicyArtifact)
+	if err != nil {
+		return result, err
+	}
+	environmentPolicy, err := workflowadapter.ParseStandardAuthoringEnvironmentPolicyJSON(policyRaw)
+	if err != nil {
+		return result, fmt.Errorf("decode frozen Standard authoring environment policy: %w", err)
+	}
+	if err := environmentPolicy.ValidateDockerfile(result.dockerfile); err != nil {
+		return result, fmt.Errorf("validate frozen Standard authoring Dockerfile base image: %w", err)
+	}
 	if result.solveScript, err = read("solve_script"); err != nil {
 		return result, err
 	}
@@ -220,6 +231,41 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 	}
 	result.proposalHash = string(inputFingerprint)
 	return result, nil
+}
+
+func standardAuthoringMaterializeInputContract(stage workflowkit.StageDescriptor) (map[string]string, error) {
+	if stage.Key != workflowkit.StageKey(workflowadapter.MaterializeTask) {
+		return nil, fmt.Errorf("Standard authoring materializer stage is not materialize_task")
+	}
+	current, found := workflowadapter.StandardAuthoringWorkflowTemplate().Catalog.Stage(workflowkit.StageKey(workflowadapter.MaterializeTask))
+	if !found {
+		return nil, fmt.Errorf("current Standard authoring catalog omits materialize_task")
+	}
+	expected := make(map[string]string, len(current.Inputs))
+	for _, input := range current.Inputs {
+		if !input.Required || input.SchemaVersion == "" {
+			return nil, fmt.Errorf("current Standard authoring materialize_task input contract is invalid")
+		}
+		if _, duplicate := expected[input.Name]; duplicate {
+			return nil, fmt.Errorf("current Standard authoring materialize_task repeats input %q", input.Name)
+		}
+		expected[input.Name] = input.SchemaVersion
+	}
+	if len(stage.Inputs) != len(expected) {
+		return nil, fmt.Errorf("Standard authoring materializer stage does not match the current input contract")
+	}
+	seen := make(map[string]struct{}, len(stage.Inputs))
+	for _, input := range stage.Inputs {
+		expectedSchema, requiredInput := expected[input.Name]
+		if _, duplicate := seen[input.Name]; duplicate || !requiredInput || !input.Required || input.SchemaVersion != expectedSchema {
+			return nil, fmt.Errorf("Standard authoring materializer stage does not match the current input contract")
+		}
+		seen[input.Name] = struct{}{}
+	}
+	if expected[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] != workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion {
+		return nil, fmt.Errorf("current Standard authoring environment policy schema is invalid")
+	}
+	return expected, nil
 }
 
 func validateApprovedAuthoringSolutionDecision(raw []byte, run store.WorkflowRun, subject workflowRunSubject) error {

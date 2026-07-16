@@ -55,6 +55,9 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 				workflowkit.StageKey(SolutionReview),
 			},
 			dependencies: standardAuthoringDependencies(),
+			validateStages: func(stages map[workflowkit.StageKey]StageDefinition) error {
+				return validateStandardAuthoringEnvironmentPolicyContract(stages)
+			},
 		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
@@ -160,4 +163,47 @@ func sameStageKeySet(left, right []workflowkit.StageKey) bool {
 		}
 	}
 	return true
+}
+
+// validateStandardAuthoringEnvironmentPolicyContract freezes the source-session
+// base-image boundary. Every consumer must declare exactly one required policy
+// input and read the corresponding resource; no other stage may consume it.
+func validateStandardAuthoringEnvironmentPolicyContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	for _, key := range StandardAuthoringStageOrder() {
+		stage, present := stages[key]
+		if !present {
+			return fmt.Errorf("%w: required Standard authoring stage %q is missing", errInvalidCatalog, key)
+		}
+		wantsPolicy := standardAuthoringStageUsesEnvironmentPolicy(key) || key == workflowkit.StageKey(MaterializeTask)
+		inputCount, exactInputCount := stageCatalogEnvironmentPolicyInputCounts(stage.Inputs)
+		resourceCount := stageCatalogResourceCount(stage.ReadSet, resourceAuthoringEnvironmentPolicy)
+		if (wantsPolicy && (inputCount != 1 || exactInputCount != 1 || resourceCount != 1)) ||
+			(!wantsPolicy && (inputCount != 0 || resourceCount != 0)) {
+			return fmt.Errorf("%w: Standard authoring template %q stage %q environment-policy contract does not match its version", errInvalidCatalog, stage.Key, key)
+		}
+	}
+	return nil
+}
+
+func stageCatalogEnvironmentPolicyInputCounts(inputs []workflowkit.ArtifactSpec) (total, exact int) {
+	for _, input := range inputs {
+		if input.Name != StandardAuthoringEnvironmentPolicyArtifact {
+			continue
+		}
+		total++
+		if input.SchemaVersion == StandardAuthoringEnvironmentPolicySchemaVersion && input.Required {
+			exact++
+		}
+	}
+	return total, exact
+}
+
+func stageCatalogResourceCount(resources []workflowkit.ResourceKey, target workflowkit.ResourceKey) int {
+	count := 0
+	for _, resource := range resources {
+		if resource == target {
+			count++
+		}
+	}
+	return count
 }

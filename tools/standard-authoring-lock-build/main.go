@@ -122,7 +122,7 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("resolve catalog: %w", err)
 	}
 	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return stageprovider.DeploymentOperationCatalogLock{}, errors.New("catalog must bind harbor.standard-authoring@1.0.0")
+		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("catalog must bind %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
 	}
 	profile, err := readStandardAuthoringExecutionProfile(config.profilePath)
 	if err != nil {
@@ -243,7 +243,7 @@ func readStandardAuthoringExecutionProfile(path string) (workflowadapter.Executi
 		return workflowadapter.ExecutionProfile{}, fmt.Errorf("parse Standard authoring execution profile: %w", err)
 	}
 	if !profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return workflowadapter.ExecutionProfile{}, errors.New("execution profile must bind harbor.standard-authoring@1.0.0")
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("execution profile must bind %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
 	}
 	return profile.Clone(), nil
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/agent"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -43,6 +44,12 @@ type standardAuthoringCodexOutputSubmission struct {
 	maxBytes    int
 	maxAttempts int
 	now         func() time.Time
+
+	// environmentPolicy is set only for dockerfile_generate after the executor
+	// has verified the canonical frozen environment_policy input. Keeping it on
+	// the submission authority prevents a model response from selecting its own
+	// image after it has seen the policy in the first-turn request.
+	environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy
 
 	currentTurn int
 	attempts    int
@@ -92,7 +99,7 @@ type standardAuthoringCodexSubmissionReceipt struct {
 	Digest    workflowkit.Fingerprint `json:"digest"`
 }
 
-func newStandardAuthoringCodexOutputSubmission(request workflowkit.StageExecutionRequest, maxBytes int, maxAttempts int, now func() time.Time) (*standardAuthoringCodexOutputSubmission, error) {
+func newStandardAuthoringCodexOutputSubmission(request workflowkit.StageExecutionRequest, maxBytes int, maxAttempts int, now func() time.Time, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) (*standardAuthoringCodexOutputSubmission, error) {
 	if maxBytes <= 0 || maxAttempts <= 0 || request.Charge == nil {
 		return nil, errors.New("invalid Standard authoring Codex output submission configuration")
 	}
@@ -102,10 +109,19 @@ func newStandardAuthoringCodexOutputSubmission(request workflowkit.StageExecutio
 	if now == nil {
 		now = time.Now
 	}
+	if request.Stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) {
+		if environmentPolicy == nil || environmentPolicy.Validate() != nil {
+			return nil, errors.New("invalid frozen Standard authoring Dockerfile environment policy")
+		}
+		policyCopy := *environmentPolicy
+		environmentPolicy = &policyCopy
+	} else {
+		environmentPolicy = nil
+	}
 	return &standardAuthoringCodexOutputSubmission{
 		request:  request,
 		stage:    request.Stage.Clone(),
-		maxBytes: maxBytes, maxAttempts: maxAttempts, now: now,
+		maxBytes: maxBytes, maxAttempts: maxAttempts, now: now, environmentPolicy: environmentPolicy,
 	}, nil
 }
 
@@ -229,7 +245,7 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 		return standardAuthoringCodexSubmissionResponse(false, []string{"byte_limit_exceeded"}, remaining, digest)
 	}
 
-	result, canonicalDigest, diagnostic := standardAuthoringCodexValidateSubmissionCandidate(raw, submission.stage, turn)
+	result, canonicalDigest, diagnostic := standardAuthoringCodexValidateSubmissionCandidate(raw, submission.stage, turn, submission.environmentPolicy)
 	if diagnostic != "" {
 		return standardAuthoringCodexSubmissionResponse(false, []string{diagnostic}, remaining, digest)
 	}
@@ -291,7 +307,7 @@ func standardAuthoringCodexSubmissionResponse(accepted bool, diagnostics []strin
 	return json.RawMessage(encoded), nil
 }
 
-func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflowkit.StageDescriptor, turnOrdinal int) (workflowkit.StageExecutionResult, workflowkit.Fingerprint, string) {
+func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflowkit.StageDescriptor, turnOrdinal int, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) (workflowkit.StageExecutionResult, workflowkit.Fingerprint, string) {
 	if turnOrdinal < 1 {
 		return workflowkit.StageExecutionResult{}, "", "submission_unavailable"
 	}
@@ -339,6 +355,14 @@ func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflo
 		artifacts = append(artifacts, workflowkit.StageArtifact{
 			Name: specification.Name, SchemaVersion: specification.SchemaVersion, Content: append([]byte(nil), content...), TurnOrdinal: turnOrdinal,
 		})
+	}
+	if stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) {
+		if environmentPolicy == nil || len(artifacts) != 1 || artifacts[0].Name != "dockerfile" {
+			return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+		}
+		if err := workflowadapter.ValidateDockerfileBaseImage(artifacts[0].Content, *environmentPolicy); err != nil {
+			return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+		}
 	}
 	canonicalBytes, err := json.Marshal(canonical)
 	if err != nil {

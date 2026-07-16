@@ -615,6 +615,7 @@ func (m appModel) beginAuthoring(message TaskSubmitMsg, inputCmd tea.Cmd) (tea.M
 	}
 	message.RepoURL = strings.TrimSpace(message.RepoURL)
 	message.CommitSHA = strings.TrimSpace(message.CommitSHA)
+	message.BaseImage = strings.TrimSpace(message.BaseImage)
 	message.Slug = strings.TrimSpace(message.Slug)
 	message.Title = strings.TrimSpace(message.Title)
 	message.Reason = strings.TrimSpace(message.Reason)
@@ -639,6 +640,7 @@ func (m appModel) startAuthoring(pending pendingTaskBoardStart) tea.Cmd {
 			IdempotencyKey: pending.key,
 			RepositoryURL:  pending.message.RepoURL,
 			CommitSHA:      pending.message.CommitSHA,
+			BaseImage:      pending.message.BaseImage,
 			Slug:           pending.message.Slug,
 			Title:          pending.message.Title,
 			MetadataJSON:   "{}",

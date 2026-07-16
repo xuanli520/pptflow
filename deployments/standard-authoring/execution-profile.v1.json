@@ -1,7 +1,7 @@
 {
-  "template": {"id": "harbor.standard-authoring", "version": "1.0.0"},
+  "template": {"id": "harbor.standard-authoring", "version": "1.1.0"},
   "id": "standard-authoring-production",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "continuation_plan_ttl": "24h0m0s",
   "control_grace_period": "2m0s",
   "candidate_provider_budget": {"attempt_timeout": "30m0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s"},

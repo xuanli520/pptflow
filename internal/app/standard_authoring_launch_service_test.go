@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,38 @@ import (
 var standardAuthoringLaunchTestCoordinate = StandardAuthoringSourceCoordinate{
 	RepositoryURL: "https://github.com/example/fixture-repository.git",
 	CommitSHA:     "0123456789abcdef0123456789abcdef01234567",
+}
+
+const standardAuthoringLaunchTestBaseImage = "docker.io/library/rust:1.65@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func mustStandardAuthoringEnvironmentPolicyInput(t *testing.T, artifactID string) standardAuthoringEnvironmentPolicyInput {
+	t.Helper()
+	policy, err := workflowadapter.NewStandardAuthoringEnvironmentPolicy(standardAuthoringLaunchTestBaseImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := newStandardAuthoringEnvironmentPolicyInput(artifactID, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return input
+}
+
+func standardAuthoringLaunchTestEnvironmentPolicyJSON(t *testing.T) []byte {
+	t.Helper()
+	policy, err := workflowadapter.NewStandardAuthoringEnvironmentPolicy(standardAuthoringLaunchTestBaseImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := policy.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func standardAuthoringLaunchTestDockerfile() []byte {
+	return []byte("FROM " + standardAuthoringLaunchTestBaseImage + "\n")
 }
 
 func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRun(t *testing.T) {
@@ -48,6 +81,7 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "create immutable source task"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
 		Slug:                         "fixture-authoring", Title: "Fixture authoring", MetadataJSON: `{"difficulty":"hard"}`,
 	}
 	receipt, err := services.AuthoringLaunches.Start(ctx, command)
@@ -94,6 +128,49 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 	if _, _, err := services.core.verifyRunManagedExecutionInputs(ctx, *run); err != nil {
 		t.Fatalf("verify frozen authoring execution inputs: %v", err)
 	}
+	policyInput, err := standardAuthoringEnvironmentPolicyInputFromSession(*session)
+	if err != nil {
+		t.Fatalf("read frozen session environment policy: %v", err)
+	}
+	if policyInput.Policy.BaseImage != standardAuthoringLaunchTestBaseImage {
+		t.Fatalf("session environment policy = %+v", policyInput.Policy)
+	}
+	manifest, err := decodeRunManifest(*run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specification, _, _, err := canonicalFrozenRunExecutionSpec(manifest, *run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, policyInput); err != nil {
+		t.Fatalf("validate frozen session environment policy bindings: %v", err)
+	}
+	resolvedWorkflow, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(standardAuthoringLaunchTestProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfileStage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.DockerfileGen))
+	if !found {
+		t.Fatal("Standard authoring catalog omitted dockerfile_generate")
+	}
+	subject, err := services.core.resolveWorkflowRunSubject(ctx, *run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedBindings, err := managedRunInputBindingsForStageForSubject(ctx, database, services.core.objects, *run, subject, dockerfileStage)
+	if err != nil {
+		t.Fatalf("resolve dockerfile environment policy binding: %v", err)
+	}
+	binding, found := managedBindings[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact]
+	if !found || binding != policyInput.artifactBinding() {
+		t.Fatalf("dockerfile environment policy binding = %+v, want %+v", binding, policyInput.artifactBinding())
+	}
+	readInput := newStageInputReaderForSubject(database, services.core.objects, *run, subject, []workflowkit.ArtifactBinding{binding})
+	policyBytes, err := readInput(ctx, binding)
+	if err != nil || !bytes.Equal(policyBytes, policyInput.CanonicalJSON) {
+		t.Fatalf("read dockerfile environment policy = %q err=%v", policyBytes, err)
+	}
 
 	replayed, err := services.AuthoringLaunches.Start(ctx, command)
 	if err != nil {
@@ -101,6 +178,50 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 	}
 	if replayed != receipt || capturer.calls != 1 {
 		t.Fatalf("replay = %+v; first=%+v; capturer calls=%d", replayed, receipt, capturer.calls)
+	}
+}
+
+func TestStandardAuthoringLaunchRejectsInvalidBaseImageBeforeAnyMutation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	capturer := &standardAuthoringSourceCapturerFixture{coordinate: standardAuthoringLaunchTestCoordinate, snapshot: standardAuthoringLaunchTestSnapshot(t, standardAuthoringLaunchTestCoordinate)}
+	definitions := standardAuthoringLaunchTestDefinitionProvider(t)
+	services, err := NewLifecycleServicesWithOptions(root, database, standardAuthoringLaunchTestOptions(capturer, definitions, definitions.catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, image := range []string{"", "docker.io/library/rust:1.65", " docker.io/library/rust:1.65@sha256:" + strings.Repeat("a", 64)} {
+		key, keyErr := store.NewUUIDv7()
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		_, startErr := services.AuthoringLaunches.Start(ctx, StandardAuthoringLaunchCommand{
+			LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "reject invalid environment policy"},
+			RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
+			CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+			BaseImage:                    image,
+			Slug:                         "invalid-environment-policy",
+			Title:                        "Invalid environment policy",
+		})
+		if startErr == nil {
+			t.Fatalf("base image %q unexpectedly started", image)
+		}
+		operation, operationErr := database.GetLifecycleOperationByIdempotencyKey(ctx, key)
+		if operationErr != nil || operation != nil {
+			t.Fatalf("invalid base image %q created lifecycle operation=%+v err=%v", image, operation, operationErr)
+		}
+	}
+	if capturer.calls != 0 {
+		t.Fatalf("invalid base images reached source capture: %d calls", capturer.calls)
+	}
+	tasks, err := database.ListTasksV2(ctx, true)
+	if err != nil || len(tasks) != 0 {
+		t.Fatalf("invalid base images created tasks=%+v err=%v", tasks, err)
 	}
 }
 
@@ -129,6 +250,7 @@ func TestStandardAuthoringLaunchReusesMatchingImmutableSourceForDistinctTasks(t 
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: firstKey, Actor: "author", Reason: "create first task from frozen source"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
 		Slug:                         "first-source-reuse-task",
 		Title:                        "First source reuse task",
 		MetadataJSON:                 `{"ordinal":1}`,
@@ -144,6 +266,7 @@ func TestStandardAuthoringLaunchReusesMatchingImmutableSourceForDistinctTasks(t 
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: secondKey, Actor: "author", Reason: "create second task from same frozen source"},
 		RepositoryURL:                "https://GitHub.com/example/fixture-repository.git/",
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
 		Slug:                         "second-source-reuse-task",
 		Title:                        "Second source reuse task",
 		MetadataJSON:                 `{"ordinal":2}`,
@@ -251,6 +374,7 @@ func TestStandardAuthoringLaunchPreservesSourceUUIDCollisionWhenNoMatchingSnapsh
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "prove source identity is not reused"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
 		Slug:                         "new-task-with-colliding-source-id",
 		Title:                        "New task with colliding source ID",
 		MetadataJSON:                 `{}`,
@@ -289,6 +413,7 @@ func TestStandardAuthoringLaunchRejectsChangedInputForCompletedKeyWithoutRecaptu
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "capture source"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
 		Slug:                         "fixture-source", Title: "Fixture source", MetadataJSON: `{}`,
 	}
 	first, err := services.AuthoringLaunches.Start(ctx, base)
@@ -309,6 +434,11 @@ func TestStandardAuthoringLaunchRejectsChangedInputForCompletedKeyWithoutRecaptu
 	changed.CommitSHA = "89abcdef0123456789abcdef0123456789abcdef"
 	if _, err := services.AuthoringLaunches.Start(ctx, changed); !errors.Is(err, store.ErrIdempotencyConflict) || capturer.calls != 1 {
 		t.Fatalf("changed completed commit = %v; want idempotency conflict and one capture", err)
+	}
+	changed = base
+	changed.BaseImage = "docker.io/library/rust:1.66@sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+	if _, err := services.AuthoringLaunches.Start(ctx, changed); !errors.Is(err, store.ErrIdempotencyConflict) || capturer.calls != 1 {
+		t.Fatalf("changed completed base image = %v; want idempotency conflict and one capture", err)
 	}
 	replayed, err := services.AuthoringLaunches.Start(ctx, base)
 	if err != nil || replayed != first || capturer.calls != 1 {
@@ -342,6 +472,7 @@ func TestStandardAuthoringLaunchRejectsChangedSourceForPreparedKeyBeforeRecaptur
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "retry source capture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
 		Slug:                         "prepared-source", Title: "Prepared source", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil || capturer.calls != 1 {
@@ -390,6 +521,7 @@ func TestStandardAuthoringLaunchRejectsDeploymentDriftBeforeRetryCapture(t *test
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "prove deployment retry fence"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
 		Slug:                         "deployment-drift-fence", Title: "Deployment drift fence", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil || capturer.calls != 1 {
@@ -465,7 +597,7 @@ func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileId
 	}
 	preparation := newStandardAuthoringLaunchPreparation(store.LifecycleOperation{
 		ID: operationID, Action: string(standardAuthoringLaunchAction), TaskID: ids.TaskID, RunID: ids.RunID, State: store.LifecycleOperationPrepared,
-	}, ids, definition)
+	}, ids, definition, mustStandardAuthoringEnvironmentPolicyInput(t, ids.EnvironmentPolicyArtifactID))
 	directory, err := os.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -522,7 +654,8 @@ func TestStandardAuthoringLaunchCompletedReplayIgnoresLaterDeploymentAvailabilit
 	command := StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "prove completed replay is deployment independent"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "completed-replay-deployment", Title: "Completed replay deployment", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "completed-replay-deployment", Title: "Completed replay deployment", MetadataJSON: `{}`,
 	}
 	firstReceipt, err := services.AuthoringLaunches.Start(ctx, command)
 	if err != nil {
@@ -587,7 +720,8 @@ func standardAuthoringAssertStaticCatalogPreflightFailure(t *testing.T, ctx cont
 	command := StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "prove static catalog preflight"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "static-catalog-preflight", Title: "Static catalog preflight", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "static-catalog-preflight", Title: "Static catalog preflight", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil {
 		t.Fatal("static catalog proof unexpectedly started capture")
@@ -622,7 +756,8 @@ func TestStandardAuthoringLaunchPreparedOperationWithoutPreparationFailsClosed(t
 	command := StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "simulate crash before preparation"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "missing-preparation", Title: "Missing preparation", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "missing-preparation", Title: "Missing preparation", MetadataJSON: `{}`,
 	}
 	coordinate, err := standardAuthoringLaunchCoordinate(command)
 	if err != nil {
@@ -637,7 +772,7 @@ func TestStandardAuthoringLaunchPreparedOperationWithoutPreparationFailsClosed(t
 		t.Fatal(err)
 	}
 	if _, replay, err := (&LifecycleMutationService{core: services.core}).begin(ctx, standardAuthoringLaunchAction, command.LifecycleMutationCommandBase, standardAuthoringLaunchRequest{
-		RepositoryURL: coordinate.RepositoryURL, CommitSHA: coordinate.CommitSHA, Slug: command.Slug, Title: command.Title, MetadataJSON: metadata,
+		RepositoryURL: coordinate.RepositoryURL, CommitSHA: coordinate.CommitSHA, BaseImage: command.BaseImage, Slug: command.Slug, Title: command.Title, MetadataJSON: metadata,
 	}, lifecycleOperationTargets{TaskID: ids.TaskID, RunID: ids.RunID}); err != nil || replay != nil {
 		t.Fatalf("prepare operation without filesystem definition: replay=%+v err=%v", replay, err)
 	}
@@ -672,7 +807,8 @@ func TestStandardAuthoringLaunchRejectsSymlinkedManagedRecordsWithoutRecapture(t
 	command := StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "reject malformed capture receipt"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "symlinked-capture-record", Title: "Symlinked capture record", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "symlinked-capture-record", Title: "Symlinked capture record", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil || capturer.calls != 1 {
 		t.Fatalf("initial transient capture failure = %v calls=%d", err, capturer.calls)
@@ -737,7 +873,8 @@ func TestStandardAuthoringLaunchRecoveryUsesCaptureReceiptWithoutRecapture(t *te
 	command := StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "recover durable capture receipt"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "expected-different-task", Title: "Expected different task", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "expected-different-task", Title: "Expected different task", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); !errors.Is(err, store.ErrIdempotencyConflict) || capturer.calls != 1 {
 		t.Fatalf("first post-receipt failure = %v calls=%d", err, capturer.calls)
@@ -784,7 +921,8 @@ func TestStandardAuthoringLaunchSerializesCaptureAndCancellationDoesNotPublishAn
 	command := StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "serialize same operation capture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "serialized-capture", Title: "Serialized capture", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "serialized-capture", Title: "Serialized capture", MetadataJSON: `{}`,
 	}
 	firstResult := make(chan struct {
 		receipt LifecycleMutationReceipt
@@ -862,7 +1000,8 @@ func TestStandardAuthoringLaunchConcurrentSuccessfulCallsShareOneCaptureReceipt(
 	command := StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "concurrent successful source capture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "concurrent-success-capture", Title: "Concurrent success capture", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "concurrent-success-capture", Title: "Concurrent success capture", MetadataJSON: `{}`,
 	}
 	type outcome struct {
 		receipt LifecycleMutationReceipt

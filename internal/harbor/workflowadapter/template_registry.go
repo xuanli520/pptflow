@@ -108,8 +108,8 @@ func ResolveWorkflowTemplate(reference TemplateReference) (WorkflowTemplate, err
 	return DefaultTemplateRegistry().ResolveTemplate(reference)
 }
 
-// BuiltinTemplateReferences returns stable identities in canonical order for
-// read-only CLI/TUI presentation. The returned slice and entries are copies.
+// BuiltinTemplateReferences returns the executable built-in templates in
+// canonical order. The returned slice and entries are copies.
 func BuiltinTemplateReferences() []TemplateReference {
 	references := []TemplateReference{
 		StandardTemplateReference(),

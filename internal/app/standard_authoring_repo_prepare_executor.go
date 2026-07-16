@@ -144,8 +144,7 @@ func (executor *StandardAuthoringRepoPrepareExecutor) ExecuteLocalCommand(ctx co
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	if run == nil || run.Status != store.WorkflowRunRunning || run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
-		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+	if run == nil || run.Status != store.WorkflowRunRunning || !isCurrentStandardAuthoringRun(*run) {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring repo_prepare Run is not active under the closed template")
 	}
 	subject, err := executor.core.resolveWorkflowRunSubject(ctx, *run)

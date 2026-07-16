@@ -9,10 +9,10 @@ const (
 	// materialize_task stage atomically creates the first task revision and
 	// emits an explicit handoff for a separate task-bound CodeEdge Phase-1 Run.
 	StandardAuthoringWorkflowTemplateID      = "harbor.standard-authoring"
-	StandardAuthoringWorkflowTemplateVersion = "1.0.0"
+	StandardAuthoringWorkflowTemplateVersion = "1.1.0"
 
 	standardAuthoringCatalogID      = "harbor.standard-authoring-stage-catalog"
-	standardAuthoringCatalogVersion = "1.0.0"
+	standardAuthoringCatalogVersion = "1.1.0"
 
 	// StandardAuthoringTaskHandoffArtifact is emitted only by materialize_task.
 	// It is a receipt for a newly sealed task revision, not a mutable workspace
@@ -104,20 +104,26 @@ func StandardAuthoringWorkflowTemplate() WorkflowTemplate {
 	}
 }
 
-// StandardAuthoringStageCatalog derives from the canonical StandardStageCatalog.
-// The first 13 stages (repo_prepare through solution_review) are identical to the
-// Standard catalog; only materialize_task is overridden to emit the mandatory
-// immutable task-handoff receipt.
+// StandardAuthoringStageCatalog derives the source-session catalog from the
+// canonical StandardStageCatalog. It overlays the required immutable
+// environment-policy input before materialize_task emits the handoff receipt.
 func StandardAuthoringStageCatalog() StageCatalog {
 	canonical := StandardStageCatalog()
 	stages := make([]StageDefinition, 0, len(canonical.Stages))
-	stages = append(stages, canonical.Stages[:13]...)
+	for _, definition := range canonical.Stages[:13] {
+		definition = definition.Clone()
+		if standardAuthoringStageUsesEnvironmentPolicy(definition.Key) {
+			definition.Inputs = append(definition.Inputs, standardAuthoringEnvironmentPolicyInput().spec)
+			definition.ReadSet = append(definition.ReadSet, resourceAuthoringEnvironmentPolicy)
+		}
+		stages = append(stages, definition)
+	}
 	stages = append(stages,
 		stage(MaterializeTask, StageTaskGeneration, []string{SolutionReview}, "harborfactory.materialize_task",
-			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceReviewSolutionVerifier},
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceReviewSolutionVerifier, resourceAuthoringEnvironmentPolicy},
 			[]workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceAuthoringTaskHandoff},
 			workflowkit.EffectContentMutator, 1, contentVerdicts(),
-			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"),
+			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), standardAuthoringEnvironmentPolicyInput(),
 			artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"),
 			reviewDecisionInput("solution_review_decision"),
 			artifactOutput("task_snapshot"), artifactOutput("task_digest"),
@@ -130,4 +136,17 @@ func StandardAuthoringStageCatalog() StageCatalog {
 		Version:  standardAuthoringCatalogVersion,
 		Stages:   stages,
 	}
+}
+
+func standardAuthoringStageUsesEnvironmentPolicy(key workflowkit.StageKey) bool {
+	switch key {
+	case workflowkit.StageKey(TaskDesign), workflowkit.StageKey(GenerateTaskFiles), workflowkit.StageKey(DockerfileGen), workflowkit.StageKey(ContentReview):
+		return true
+	default:
+		return false
+	}
+}
+
+func standardAuthoringEnvironmentPolicyInput() stageArtifact {
+	return artifactInputWithSchema(StandardAuthoringEnvironmentPolicyArtifact, StandardAuthoringEnvironmentPolicySchemaVersion)
 }

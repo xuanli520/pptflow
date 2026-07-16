@@ -131,6 +131,47 @@ func TestAuthoringRecoveryFreezesRetryPlanAndQueuesOneExecution(t *testing.T) {
 	}
 }
 
+func TestAuthoringRecoveryRejectsWaitingContinuationWithoutWritingRecoveryState(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
+	running, err := fixture.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: fixture.run.ID, ExpectedVersion: fixture.run.Version, Status: store.WorkflowRunRunning,
+		Actor: "worker", Reason: "reach a legal historical continuation transition",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := fixture.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: running.ID, ExpectedVersion: running.Version, Status: store.WorkflowRunWaitingContinuation,
+		Actor: "worker", Reason: "preserve historical authoring continuation state",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, reason, err := fixture.services.AuthoringRecovery.CanRecover(ctx, waiting.ID)
+	if err != nil || available || !strings.Contains(reason, string(store.WorkflowRunWaitingContinuation)) {
+		t.Fatalf("waiting continuation recovery availability = %t, %q, %v", available, reason, err)
+	}
+	checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, waiting.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := authoringRecoveryUUID(t)
+	_, err = fixture.services.AuthoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+		CommandKey: key, RunID: waiting.ID, Expected: checkpoint, Actor: "operator", Reason: "do not mutate historical waiting continuation",
+	})
+	if !errors.Is(err, ErrAuthoringRecoveryUnavailable) {
+		t.Fatalf("waiting continuation recovery plan = %v, want unavailable", err)
+	}
+	if command, lookupErr := fixture.store.GetContinuationCommandByKey(ctx, key); lookupErr != nil || command != nil {
+		t.Fatalf("waiting continuation created recovery command=%+v err=%v", command, lookupErr)
+	}
+	updated, err := fixture.store.GetWorkflowRun(ctx, waiting.ID)
+	if err != nil || updated == nil || updated.Version != waiting.Version || updated.ExecutionEpoch != waiting.ExecutionEpoch || updated.Status != store.WorkflowRunWaitingContinuation {
+		t.Fatalf("waiting continuation Run mutated by rejected recovery: %+v, %v", updated, err)
+	}
+}
+
 func TestAuthoringRecoveryResumesLegacyV1Command(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
@@ -577,7 +618,8 @@ func startAuthoringRecoveryLaunchFixture(t *testing.T, ctx context.Context, root
 	receipt, err := services.AuthoringLaunches.Start(ctx, StandardAuthoringLaunchCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: authoringRecoveryUUID(t), Actor: "author", Reason: "create authoring recovery fixture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
-		Slug: "authoring-recovery-fixture", Title: "Authoring recovery fixture", MetadataJSON: `{}`,
+		BaseImage: standardAuthoringLaunchTestBaseImage,
+		Slug:      "authoring-recovery-fixture", Title: "Authoring recovery fixture", MetadataJSON: `{}`,
 	})
 	if err != nil {
 		t.Fatal(err)

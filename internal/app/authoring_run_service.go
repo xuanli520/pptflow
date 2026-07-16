@@ -254,6 +254,13 @@ func validateAuthoringRunExecutionSpec(specification workflowadapter.RunExecutio
 	if err := validateRunExecutionSpecOperationResolver(specification, resolver); err != nil {
 		return err
 	}
+	environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(session)
+	if err != nil {
+		return fmt.Errorf("authoring session environment policy: %w", err)
+	}
+	if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
+		return err
+	}
 	if core == nil {
 		return fmt.Errorf("authoring execution specification deployment catalog is not configured")
 	}

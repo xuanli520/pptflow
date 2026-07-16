@@ -83,9 +83,79 @@ func TestCommitAuthoringRecoveryExecutionRejectsMaterializationAndInDoubt(t *tes
 	})
 }
 
-func materializedAuthoringRecoveryCommitFixture(t *testing.T, ctx context.Context) authoringRecoveryCommitFixture {
+func TestAuthoringPhase1HandoffRequiresCurrentAuthoringParent(t *testing.T) {
+	ctx := context.Background()
+	fixture := materializedAuthoringRecoveryCommitFixture(t, ctx)
+	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
+	if err != nil {
+		t.Fatalf("prepare current authoring parent handoff: %v", err)
+	}
+	child, err := createAuthoringPhase1ChildRun(t, ctx, fixture, handoff, codeEdgePhase1ChildTemplateVersion, standardAuthoringChildTrigger)
+	if err != nil {
+		t.Fatalf("create CodeEdge child for current authoring parent: %v", err)
+	}
+	if child.ParentRunID != fixture.run.ID || child.WorkflowTemplateID != codeEdgePhase1ChildTemplateID || child.WorkflowTemplateVersion != codeEdgePhase1ChildTemplateVersion || child.Trigger != standardAuthoringChildTrigger {
+		t.Fatalf("created child = %+v", child)
+	}
+}
+
+func TestAuthoringPhase1HandoffRejectsRetiredAuthoringParent(t *testing.T) {
+	ctx := context.Background()
+	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, "1.0.0")
+	if _, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture); err == nil {
+		t.Fatal("retired Standard authoring parent prepared a Phase-1 handoff")
+	}
+	prepared, err := fixture.store.GetAuthoringPhase1HandoffForAuthoringRun(ctx, fixture.run.ID)
+	if err != nil || prepared != nil {
+		t.Fatalf("retired Standard authoring parent handoff = %+v, %v", prepared, err)
+	}
+}
+
+func TestAuthoringPhase1ChildGuardRemainsClosed(t *testing.T) {
+	ctx := context.Background()
+	fixture := materializedAuthoringRecoveryCommitFixture(t, ctx)
+	handoff := prepareAuthoringRecoveryPhase1Handoff(t, ctx, fixture)
+	for _, testCase := range []struct {
+		name            string
+		childTemplateID string
+		childVersion    string
+		trigger         string
+	}{
+		{name: "wrong child template", childTemplateID: "harbor.task-lifecycle", childVersion: codeEdgePhase1ChildTemplateVersion, trigger: standardAuthoringChildTrigger},
+		{name: "wrong child version", childTemplateID: codeEdgePhase1ChildTemplateID, childVersion: "2.1.0", trigger: standardAuthoringChildTrigger},
+		{name: "wrong trigger", childTemplateID: codeEdgePhase1ChildTemplateID, childVersion: codeEdgePhase1ChildTemplateVersion, trigger: "authoring.manual"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := createAuthoringPhase1ChildRunWithTemplate(t, ctx, fixture, handoff, testCase.childTemplateID, testCase.childVersion, testCase.trigger); err == nil {
+				t.Fatal("closed authoring parent accepted a non-CodeEdge child contract")
+			}
+		})
+	}
+}
+
+func createAuthoringPhase1ChildRun(t *testing.T, ctx context.Context, fixture authoringRecoveryCommitFixture, handoff AuthoringPhase1Handoff, childVersion, trigger string) (WorkflowRun, error) {
 	t.Helper()
-	fixture := newAuthoringRecoveryCommitFixture(t, ctx)
+	return createAuthoringPhase1ChildRunWithTemplate(t, ctx, fixture, handoff, codeEdgePhase1ChildTemplateID, childVersion, trigger)
+}
+
+func createAuthoringPhase1ChildRunWithTemplate(t *testing.T, ctx context.Context, fixture authoringRecoveryCommitFixture, handoff AuthoringPhase1Handoff, childTemplateID, childVersion, trigger string) (WorkflowRun, error) {
+	t.Helper()
+	return fixture.store.CreateWorkflowRun(ctx, CreateWorkflowRunRequest{
+		ID: handoff.ChildRunID, TaskID: fixture.task.ID, RevisionID: fixture.task.CurrentRevisionID,
+		WorkflowTemplateID: childTemplateID, WorkflowTemplateVersion: childVersion,
+		ResolvedProfileHash: "sha256:authoring-phase1-profile", DefinitionHash: "sha256:authoring-phase1-definition",
+		RunManifestJSON: `{}`, ParentRunID: fixture.run.ID, AuthoringPhase1HandoffID: handoff.ID,
+		Trigger: trigger, Actor: "worker", Reason: "create frozen CodeEdge child",
+	})
+}
+
+func materializedAuthoringRecoveryCommitFixture(t *testing.T, ctx context.Context) authoringRecoveryCommitFixture {
+	return materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringParentTemplateVersion)
+}
+
+func materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t *testing.T, ctx context.Context, templateVersion string) authoringRecoveryCommitFixture {
+	t.Helper()
+	fixture := newAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, templateVersion)
 	run := transitionAuthoringRecoveryCommitRun(t, ctx, fixture.store, fixture.run, WorkflowRunRunning)
 	materialized, err := fixture.store.MaterializeAuthoringTask(ctx, MaterializeAuthoringTaskRequest{
 		IdempotencyKey: "authoring-recovery-materialization", AuthoringSessionID: fixture.session.ID, AuthoringRunID: run.ID,
@@ -108,6 +178,15 @@ func materializedAuthoringRecoveryCommitFixture(t *testing.T, ctx context.Contex
 // mutating the source Run checkpoint.
 func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fixture authoringRecoveryCommitFixture) AuthoringPhase1Handoff {
 	t.Helper()
+	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handoff
+}
+
+func prepareAuthoringRecoveryPhase1HandoffResult(t *testing.T, ctx context.Context, fixture authoringRecoveryCommitFixture) (AuthoringPhase1Handoff, error) {
+	t.Helper()
 	inputFingerprint := string(workflowkit.SHA256Fingerprint([]byte("authoring recovery handoff inputs")))
 	attempt, err := fixture.store.CreateStageAttempt(ctx, CreateStageAttemptRequest{
 		RunID: fixture.run.ID, StageKey: "materialize_task", StageGroup: "task_generation", Ordinal: 1,
@@ -115,14 +194,14 @@ func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fi
 		Actor: "worker", Reason: "prepare Phase-1 handoff barrier",
 	})
 	if err != nil {
-		t.Fatal(err)
+		return AuthoringPhase1Handoff{}, err
 	}
 	attempt, err = fixture.store.TransitionStageAttempt(ctx, TransitionStageAttemptRequest{
 		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: StageExecutionRunning,
 		Actor: "worker", Reason: "complete materialize_task handoff fixture",
 	})
 	if err != nil {
-		t.Fatal(err)
+		return AuthoringPhase1Handoff{}, err
 	}
 	manifest, err := fixture.store.CreateArtifactManifest(ctx, CreateArtifactManifestRequest{
 		SubjectRevisionID: fixture.session.ID, SubjectDigest: fixture.source.SnapshotContentDigest, WorkflowFingerprint: fixture.run.DefinitionHash,
@@ -132,7 +211,7 @@ func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fi
 		Actor:               "worker", Reason: "persist Phase-1 handoff artifact",
 	})
 	if err != nil {
-		t.Fatal(err)
+		return AuthoringPhase1Handoff{}, err
 	}
 	artifact, err := fixture.store.CreateArtifactRef(ctx, CreateArtifactRefRequest{
 		ManifestID: manifest.ID, ArtifactKey: "authoring_task_handoff", ContentDigest: string(workflowkit.SHA256Fingerprint([]byte("authoring recovery handoff artifact"))),
@@ -143,14 +222,14 @@ func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fi
 		Actor:          "worker", Reason: "persist Phase-1 handoff artifact",
 	})
 	if err != nil {
-		t.Fatal(err)
+		return AuthoringPhase1Handoff{}, err
 	}
 	attempt, err = fixture.store.TransitionStageAttempt(ctx, TransitionStageAttemptRequest{
 		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: StageExecutionCompleted, Verdict: VerdictPass,
 		ArtifactManifestID: manifest.ID, Actor: "worker", Reason: "complete materialize_task handoff fixture",
 	})
 	if err != nil {
-		t.Fatal(err)
+		return AuthoringPhase1Handoff{}, err
 	}
 	handoff, err := fixture.store.PrepareAuthoringPhase1Handoff(ctx, PrepareAuthoringPhase1HandoffRequest{
 		AuthoringRunID: fixture.run.ID, AuthoringSessionID: fixture.session.ID, AuthoringSourceID: fixture.source.ID,
@@ -159,13 +238,14 @@ func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fi
 		ChildRunID: authoringRecoveryCommitID(t), IdempotencyKey: "authoring-recovery-phase1-handoff-" + fixture.run.ID,
 		Actor: "worker", Reason: "write Phase-1 handoff after recovery plan freeze",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return handoff
+	return handoff, err
 }
 
 func newAuthoringRecoveryCommitFixture(t *testing.T, ctx context.Context) authoringRecoveryCommitFixture {
+	return newAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringParentTemplateVersion)
+}
+
+func newAuthoringRecoveryCommitFixtureForTemplateVersion(t *testing.T, ctx context.Context, templateVersion string) authoringRecoveryCommitFixture {
 	t.Helper()
 	dataStore := tempDB(t)
 	source := createAuthoringSourceFixture(t, ctx, dataStore, "authoring-recovery-commit-source")
@@ -177,7 +257,7 @@ func newAuthoringRecoveryCommitFixture(t *testing.T, ctx context.Context) author
 		t.Fatal(err)
 	}
 	session, err := dataStore.CreateAuthoringSession(ctx, CreateAuthoringSessionRequest{
-		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.0.0",
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: standardAuthoringParentTemplateID, WorkflowTemplateVersion: templateVersion,
 		SessionManifestJSON: `{}`, IdempotencyKey: "authoring-recovery-commit-session", Actor: "author", Reason: "freeze source session",
 	})
 	if err != nil {

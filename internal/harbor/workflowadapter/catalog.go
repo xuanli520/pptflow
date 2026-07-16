@@ -770,11 +770,15 @@ const (
 	resourceTaskInstruction    workflowkit.ResourceKey = "task/instruction"
 	resourceTaskMetadata       workflowkit.ResourceKey = "task/metadata"
 	resourceTaskEnvironment    workflowkit.ResourceKey = "task/environment"
-	resourceTaskSolution       workflowkit.ResourceKey = "task/solution"
-	resourceTaskTests          workflowkit.ResourceKey = "task/tests"
-	resourceTaskTestsAnalysis  workflowkit.ResourceKey = "task/tests-analysis"
-	resourceTaskSnapshot       workflowkit.ResourceKey = "task/snapshot"
-	resourceTaskDigest         workflowkit.ResourceKey = "task/digest"
+	// resourceAuthoringEnvironmentPolicy is the immutable per-session base
+	// image contract. It belongs only to the pre-materialization authoring
+	// graph; no task-revision workflow may infer it from a Dockerfile.
+	resourceAuthoringEnvironmentPolicy workflowkit.ResourceKey = "authoring/environment-policy"
+	resourceTaskSolution               workflowkit.ResourceKey = "task/solution"
+	resourceTaskTests                  workflowkit.ResourceKey = "task/tests"
+	resourceTaskTestsAnalysis          workflowkit.ResourceKey = "task/tests-analysis"
+	resourceTaskSnapshot               workflowkit.ResourceKey = "task/snapshot"
+	resourceTaskDigest                 workflowkit.ResourceKey = "task/digest"
 	// resourceAuthoringTaskHandoff is written exactly once by the closed
 	// AuthoringSession materialize_task stage. A task-bound child Run consumes
 	// its immutable receipt; it must never keep executing under the source

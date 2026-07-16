@@ -1,7 +1,7 @@
 # Standard Authoring Deployment Contract
 
 This directory is the source-controlled deployment input for the closed
-`harbor.standard-authoring@1.0.0` workflow. It creates a first task from an
+`harbor.standard-authoring@1.1.0` workflow. It creates a first task from an
 immutable `AuthoringSource` / `AuthoringSession`; it does not pretend that the
 source session is already a `TaskRevision`.
 
@@ -46,6 +46,39 @@ create the first Task and TaskRevision. It emits
 the source-bound Run. A separate task-bound
 `harbor.codeedge-phase1@2.2.0` Run owns subsequent verification, evaluator
 handoff, compliance, and local packaging.
+
+## Version boundary
+
+The required frozen environment policy is an execution-contract change, so it
+belongs to `harbor.standard-authoring@1.1.0`, not to a reinterpretation of a
+historical `@1.0.0` Run. The consolidated V2 store intentionally does not
+migrate its physical schema in place; install this release with a new managed
+control-plane root. Existing `@1.0.0` records remain immutable audit history
+and must be handled by the release that owns their frozen deployment contract.
+
+## Frozen task environment policy
+
+Each launch must also provide `--base-image` (or the matching TUI field) as
+one fully qualified OCI image reference pinned with a lowercase SHA-256
+digest, for example:
+
+```text
+docker.io/library/rust:1.65@sha256:<64 lowercase hex characters>
+```
+
+The service serializes it as the canonical `environment_policy` session input,
+binds its content digest into every consuming stage, and preserves it in the
+Run specification. `dockerfile_generate` receives those exact bytes and may
+use the value unchanged in every `FROM`; tag-only references, variables,
+additional images, substitutions, external `COPY`/`ADD --from` sources,
+external BuildKit `RUN --mount=from` sources, and parser directives are
+rejected. `COPY`/`ADD --from` may use an earlier local multi-stage alias or
+numeric index; `RUN --mount=from` may use only an earlier local alias because
+BuildKit does not treat a numeric mount source as a stage index.
+`materialize_task` repeats the same validation before a Dockerfile can become
+part of the sealed task.
+This is a task constraint, not an ambient host-image selection: a new session
+may choose another validated digest without changing a historical Run.
 
 ## Source-controlled inputs
 

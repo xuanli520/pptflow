@@ -96,7 +96,8 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	contents := map[string][]byte{
 		"instruction":              []byte("# Task\n\nImplement the requested behavior.\n"),
 		"task_toml":                []byte("[task]\nid = \"materializer-task\"\n"),
-		"dockerfile":               []byte("FROM alpine:3.20\n"),
+		"dockerfile":               standardAuthoringLaunchTestDockerfile(),
+		"environment_policy":       standardAuthoringLaunchTestEnvironmentPolicyJSON(t),
 		"solve_script":             []byte("#!/bin/sh\nexit 0\n"),
 		"test_script":              []byte("#!/bin/sh\nexit 0\n"),
 		"tests_analysis":           []byte("The tests validate the requested behavior.\n"),
@@ -179,6 +180,59 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	replayedHandoff := parseMaterializerHandoff(t, replayed)
 	if replayedHandoff.RevisionID != revision.ID || replayedHandoff.TaskID != task.ID || replayedHandoff.TaskSnapshot.ID == handoff.TaskSnapshot.ID {
 		t.Fatalf("materialization replay = %+v, want same revision and a fresh uncommitted output reference", replayedHandoff)
+	}
+}
+
+func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvironmentPolicy(t *testing.T) {
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, found := resolved.Descriptor.Stage(workflowkit.StageKey(workflowadapter.MaterializeTask))
+	if !found {
+		t.Fatal("compiled authoring workflow omitted materialize_task")
+	}
+	sourceID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := store.AuthoringSource{ID: sourceID, SnapshotContentDigest: "sha256:" + strings.Repeat("a", 64)}
+	session := store.AuthoringSession{ID: sessionID}
+	run := store.WorkflowRun{
+		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringWorkflowTemplateVersion,
+	}
+	contents := map[string][]byte{
+		"instruction":              []byte("# Task\n"),
+		"task_toml":                []byte("[task]\nid = \"fixture\"\n"),
+		"dockerfile":               []byte("FROM docker.io/library/debian:bookworm@sha256:" + strings.Repeat("b", 64) + "\n"),
+		"environment_policy":       standardAuthoringLaunchTestEnvironmentPolicyJSON(t),
+		"solve_script":             []byte("#!/bin/sh\nexit 0\n"),
+		"test_script":              []byte("#!/bin/sh\nexit 0\n"),
+		"tests_analysis":           []byte("tests\n"),
+		"solution_review_decision": approvedAuthoringSolutionDecision(t, source, session, run),
+	}
+	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
+	_, err = standardAuthoringMaterializeInputs(context.Background(), workflowkit.StageExecutionRequest{
+		Stage: stage, Inputs: inputs,
+		ReadInput: func(_ context.Context, binding workflowkit.ArtifactBinding) ([]byte, error) {
+			return append([]byte(nil), contents[binding.Name]...), nil
+		},
+	}, run, workflowRunSubject{
+		Binding: workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(source.SnapshotContentDigest)},
+		Kind:    store.WorkflowRunSubjectAuthoringSession, AuthoringSource: &source, AuthoringSession: &session,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Dockerfile base image") {
+		t.Fatalf("mismatched frozen Dockerfile policy error = %v", err)
 	}
 }
 

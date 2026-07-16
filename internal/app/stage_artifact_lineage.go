@@ -142,10 +142,35 @@ func managedRunInputBindingsForStageForSubject(ctx context.Context, dataStore *s
 		if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
 			return nil, fmt.Errorf("decode authoring Run manifest: %w", err)
 		}
-		if len(manifest.Inputs.ManagedInputs) != 0 {
+		if manifest.Inputs == nil || len(manifest.Inputs.ManagedInputs) != 0 {
 			return nil, fmt.Errorf("authoring Run declares unsupported task-revision managed inputs")
 		}
-		return nil, nil
+		specification, _, _, err := canonicalFrozenRunExecutionSpec(manifest, run)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateCurrentStandardAuthoringFrozenContract(run, manifest, specification); err != nil {
+			return nil, err
+		}
+		environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(*subject.AuthoringSession)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
+			return nil, err
+		}
+		result := make(map[string]workflowkit.ArtifactBinding)
+		for _, input := range stage.Inputs {
+			if input.Name != workflowadapter.StandardAuthoringEnvironmentPolicyArtifact {
+				continue
+			}
+			binding := environmentPolicy.artifactBinding()
+			if input.SchemaVersion != binding.SchemaVersion {
+				return nil, fmt.Errorf("authoring stage %q environment policy schema %q, want %q", stage.Key, input.SchemaVersion, binding.SchemaVersion)
+			}
+			result[binding.Name] = binding
+		}
+		return result, nil
 	}
 	if !subject.isTaskRevision() || subject.Revision == nil {
 		return nil, fmt.Errorf("artifact lineage has an unsupported workflow subject")
@@ -234,6 +259,18 @@ func newStageInputReaderForSubject(dataStore *store.Store, objects *workflowrunt
 		}
 		if dataStore == nil || objects == nil {
 			return nil, fmt.Errorf("%w: stage input reader is not configured", ErrInvalidStageExecution)
+		}
+		if subject.isAuthoringSession() {
+			if !isCurrentStandardAuthoringRun(run) {
+				return nil, fmt.Errorf("%w: authoring Run is not bound to the current Standard authoring template", ErrInvalidStageExecution)
+			}
+			environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(*subject.AuthoringSession)
+			if err != nil {
+				return nil, fmt.Errorf("%w: authoring session environment policy: %v", ErrInvalidStageExecution, err)
+			}
+			if requested == environmentPolicy.artifactBinding() {
+				return append([]byte(nil), environmentPolicy.CanonicalJSON...), nil
+			}
 		}
 		if subject.isTaskRevision() {
 			managed, managedErr := readManagedRunInput(ctx, dataStore, objects, run, *subject.Revision, requested)

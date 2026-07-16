@@ -103,6 +103,7 @@ func TestRunActivationDrainsQueuedRunOutboxThroughOneControlledHandoff(t *testin
 
 func TestRunActivationSweepReplacesExpiredUnclaimedHandoff(t *testing.T) {
 	ctx := context.Background()
+	const launchTTL = 5 * time.Second
 	root := t.TempDir()
 	database, err := store.OpenForTest(root)
 	if err != nil {
@@ -138,7 +139,7 @@ func TestRunActivationSweepReplacesExpiredUnclaimedHandoff(t *testing.T) {
 	reserved, err := services.WorkerHandoffs.ReserveRunWorkerHandoff(ctx, ReserveRunWorkerHandoffCommand{
 		IdempotencyKey: key, RunID: run.ID,
 		Expected: RunWorkerHandoffCheckpoint{RunVersion: run.Version, ExecutionEpoch: run.ExecutionEpoch, DefinitionHash: run.DefinitionHash},
-		Owner:    "expired-activation-child", Actor: "tester", Reason: "simulate child spawned before claim", LaunchTTL: 10 * time.Millisecond,
+		Owner:    "expired-activation-child", Actor: "tester", Reason: "simulate child spawned before claim", LaunchTTL: launchTTL,
 	})
 	if err != nil || !reserved.Launch {
 		t.Fatalf("reserve unclaimed activation handoff = %+v, %v", reserved, err)
@@ -153,7 +154,12 @@ func TestRunActivationSweepReplacesExpiredUnclaimedHandoff(t *testing.T) {
 		t.Fatalf("active handoff triggered duplicate launch: %+v", launches)
 	}
 
-	time.Sleep(40 * time.Millisecond)
+	// Race instrumentation can make the initial durable-outbox drain exceed a
+	// millisecond-scale lease. Use a realistic launch window, then wait until
+	// this exact handoff is provably expired before exercising recovery.
+	if wait := time.Until(reserved.Handoff.LaunchDeadlineAt.Add(50 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
 	if err := services.RunActivations.Drain(ctx); err != nil {
 		t.Fatalf("sweep expired unclaimed handoff: %v", err)
 	}

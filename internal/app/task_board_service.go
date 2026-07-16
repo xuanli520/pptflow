@@ -109,12 +109,14 @@ type TaskBoardSnapshot struct {
 }
 
 // TaskBoardStartAuthoringRequest contains the caller-selected immutable task
-// identity, source coordinate, audit reason, and client command key. The
-// service derives the actor and validates the full lifecycle protocol.
+// identity, source coordinate, environment policy input, audit reason, and
+// client command key. The service derives the actor and validates the full
+// lifecycle protocol.
 type TaskBoardStartAuthoringRequest struct {
 	IdempotencyKey string
 	RepositoryURL  string
 	CommitSHA      string
+	BaseImage      string
 	Slug           string
 	Title          string
 	MetadataJSON   string
@@ -298,6 +300,7 @@ func (service *TaskBoardService) StartAuthoring(ctx context.Context, request Tas
 		},
 		RepositoryURL: request.RepositoryURL,
 		CommitSHA:     request.CommitSHA,
+		BaseImage:     request.BaseImage,
 		Slug:          request.Slug,
 		Title:         request.Title,
 		MetadataJSON:  request.MetadataJSON,

@@ -254,7 +254,7 @@ func newAuthoringSessionRuntimeFixture(t *testing.T, actor string) (*LifecycleSe
 		t.Fatal(err)
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
-		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.0.0",
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringWorkflowTemplateVersion,
 		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "authoring-session-runtime-session", Actor: actor, Reason: "freeze immutable authoring session",
 	})
 	if err != nil {

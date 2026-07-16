@@ -4,7 +4,7 @@ Status: implemented provider/attestation boundary. Application, CLI, and TUI
 admission still have to install this exact composition; there is no fallback
 from another template.
 
-`harbor.standard-authoring@1.0.0` is the source-session half of task creation.
+`harbor.standard-authoring@1.1.0` is the source-session half of task creation.
 Its `materialize_task` stage ends that Run after atomically creating the first
 TaskRevision and emitting a typed child handoff. It must not continue the
 task-bound CodeEdge lifecycle inside the AuthoringSession Run.

@@ -772,7 +772,8 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	contents := map[string][]byte{
 		"instruction":              []byte("# Task\n\nImplement the requested behavior.\n"),
 		"task_toml":                []byte("[task]\nid = \"handoff-task\"\n"),
-		"dockerfile":               []byte("FROM alpine:3.20\n"),
+		"dockerfile":               standardAuthoringLaunchTestDockerfile(),
+		"environment_policy":       standardAuthoringLaunchTestEnvironmentPolicyJSON(t),
 		"solve_script":             []byte("#!/bin/sh\nexit 0\n"),
 		"test_script":              []byte("#!/bin/sh\nexit 0\n"),
 		"tests_analysis":           []byte("The tests validate the requested behavior.\n"),

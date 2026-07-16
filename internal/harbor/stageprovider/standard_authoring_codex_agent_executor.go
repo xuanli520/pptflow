@@ -334,6 +334,10 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
 	}
+	environmentPolicy, err := standardAuthoringCodexDockerfileEnvironmentPolicy(request.Stage, inputs)
+	if err != nil {
+		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
+	}
 	requestDocument, err := standardAuthoringCodexRequestDocument(request, program, inputs, inputFingerprint)
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
@@ -346,7 +350,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if !hasSubmissionQuota {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
-	submission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now)
+	submission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now, environmentPolicy)
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
@@ -597,6 +601,44 @@ func standardAuthoringCodexReadInputs(ctx context.Context, request workflowkit.S
 		})
 	}
 	return inputs, inputFingerprint, nil
+}
+
+// standardAuthoringCodexDockerfileEnvironmentPolicy extracts the intrinsic
+// session policy only for the Dockerfile producer. Its bytes have already been
+// read through the frozen binding and digest-checked by
+// standardAuthoringCodexReadInputs; requiring canonical bytes here prevents an
+// equivalent-but-unfrozen JSON spelling from becoming an output authority.
+func standardAuthoringCodexDockerfileEnvironmentPolicy(stage workflowkit.StageDescriptor, inputs []standardAuthoringCodexInput) (*workflowadapter.StandardAuthoringEnvironmentPolicy, error) {
+	if stage.Key != workflowkit.StageKey(workflowadapter.DockerfileGen) {
+		return nil, nil
+	}
+
+	var policy *workflowadapter.StandardAuthoringEnvironmentPolicy
+	for _, input := range inputs {
+		if input.Name != workflowadapter.StandardAuthoringEnvironmentPolicyArtifact {
+			continue
+		}
+		if policy != nil || input.SchemaVersion != workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion {
+			return nil, errors.New("frozen Dockerfile environment policy binding is invalid")
+		}
+		content, err := base64.StdEncoding.DecodeString(input.ContentBase64)
+		if err != nil || workflowkit.SHA256Fingerprint(content) != input.ContentDigest {
+			return nil, errors.New("frozen Dockerfile environment policy content is invalid")
+		}
+		parsed, err := workflowadapter.ParseStandardAuthoringEnvironmentPolicyJSON(content)
+		if err != nil {
+			return nil, errors.New("frozen Dockerfile environment policy is invalid")
+		}
+		canonical, err := parsed.CanonicalJSON()
+		if err != nil || !bytes.Equal(canonical, content) {
+			return nil, errors.New("frozen Dockerfile environment policy is not canonical")
+		}
+		policy = &parsed
+	}
+	if policy == nil {
+		return nil, errors.New("frozen Dockerfile environment policy is missing")
+	}
+	return policy, nil
 }
 
 func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint) ([]byte, error) {

@@ -208,10 +208,11 @@ func (service *StandardAuthoringHandoffService) Consume(ctx context.Context, req
 	if run == nil {
 		return store.WorkflowRun{}, fmt.Errorf("%w: Standard authoring Run %s", ErrLifecycleNotFound, request.AuthoringRunID)
 	}
-	if run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID ||
-		run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion ||
-		run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+	if !isCurrentStandardAuthoringRun(*run) || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
 		return store.WorkflowRun{}, fmt.Errorf("Standard authoring handoff Run is not %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	}
+	if err := service.core.verifyRunDeploymentCatalogReceipt(*run); err != nil {
+		return store.WorkflowRun{}, fmt.Errorf("verify frozen Standard authoring deployment catalog receipt: %w", err)
 	}
 	subject, err := service.core.resolveWorkflowRunSubject(ctx, *run)
 	if err != nil {

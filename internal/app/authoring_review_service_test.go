@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 func TestAuthoringReviewServiceDecidesFrozenSourceSessionGateAndReplays(t *testing.T) {
@@ -138,7 +139,7 @@ func openAuthoringReviewServiceGate(t *testing.T, ctx context.Context, database 
 		t.Fatal(err)
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
-		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.0.0",
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringWorkflowTemplateVersion,
 		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "authoring-review-session-" + t.Name(), Actor: "author", Reason: "freeze authoring session",
 	})
 	if err != nil {
