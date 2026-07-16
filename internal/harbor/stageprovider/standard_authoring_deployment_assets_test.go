@@ -77,7 +77,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		if program.ID != entry.Prompt.ID || program.Version != entry.Prompt.Version || len(program.TurnPrompts) != payload.MaxTurns {
 			t.Fatalf("prompt program for %q does not match frozen manifest/payload", registration.Stage.Key)
 		}
-		if entry.Schema.ID != "standard-authoring.codex-turn-output-schema" || entry.Schema.Version != "1.0.0" {
+		if entry.Schema.ID != "standard-authoring.codex-stage-output-schema" || entry.Schema.Version != "1.0.0" || entry.Schema.RelativePath != "schemas/codex-stage-output.schema.json" {
 			t.Fatalf("agent stage %q has non-Codex schema asset %q@%q", registration.Stage.Key, entry.Schema.ID, entry.Schema.Version)
 		}
 		schemaRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", filepath.FromSlash(entry.Schema.RelativePath)))

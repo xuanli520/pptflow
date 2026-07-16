@@ -36,10 +36,12 @@ func TestStandardAuthoringAttestedAgentTurnBridgeFromDeploymentLoadsFrozenAssets
 		},
 	}
 	firstRuntime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
-		results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("first verified deployment asset"))}},
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free assistant text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("first verified deployment asset"))}},
 	}}
 	secondRuntime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
-		results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("second verified deployment asset"))}},
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free assistant text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("second verified deployment asset"))}},
 	}}
 	runtimes := []agent.Runtime{firstRuntime, secondRuntime}
 	runtimeFactoryCalls := 0
@@ -89,7 +91,7 @@ func TestStandardAuthoringAttestedAgentTurnBridgeFromDeploymentRejectsBadSchemaB
 	if err != nil {
 		t.Fatal(err)
 	}
-	badSchema := []byte(`{"format":"` + StandardAuthoringCodexTurnOutputFormat + `","version":"1","fields":["format"],"fingerprint":"` + string(StandardAuthoringCodexOutputSchemaFingerprint()) + `"}`)
+	badSchema := []byte(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}`)
 	contract := verifier.record.StandardAuthoringContract.Clone()
 	verifier.record.PromptContentFingerprint = workflowkit.SHA256Fingerprint(prompt)
 	verifier.record.SchemaContentFingerprint = workflowkit.SHA256Fingerprint(badSchema)
@@ -164,8 +166,8 @@ func TestStandardAuthoringCodexContractAssetsRequireCanonicalSelfDescribingDocum
 			t.Fatal("schema asset with non-POSIX canonical whitespace was accepted")
 		}
 	}
-	if err := ValidateStandardAuthoringCodexOutputSchemaAsset([]byte(`{"format":"` + StandardAuthoringCodexTurnOutputFormat + `","version":"1","fields":["verdict","format","version","artifacts[name,schema_version,content_base64]"],"fingerprint":"` + string(StandardAuthoringCodexOutputSchemaFingerprint()) + `"}`)); err == nil {
-		t.Fatal("schema with reordered fields was accepted")
+	if err := ValidateStandardAuthoringCodexOutputSchemaAsset([]byte(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}`)); err == nil {
+		t.Fatal("incomplete JSON Schema was accepted")
 	}
 }
 
@@ -178,10 +180,12 @@ func TestStandardAuthoringAttestedAgentTurnBridgeReattestsAndRebuildsRuntimePerE
 	secondInvocation.CLIVersionOutput = "codex-cli 0.133.1"
 	attestor := &standardAuthoringAttestedBridgeAttestor{invocations: []CodexAppServerInvocation{firstInvocation, secondInvocation}}
 	firstRuntime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
-		results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("first"))}},
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free assistant text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("first"))}},
 	}}
 	secondRuntime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
-		results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("second"))}},
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free assistant text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("second"))}},
 	}}
 	runtimes := []agent.Runtime{firstRuntime, secondRuntime}
 	createdFor := []CodexAppServerInvocation{}
@@ -287,15 +291,7 @@ func standardAuthoringAttestedBridgeFixture(t *testing.T) (workflowkit.StageDesc
 
 func standardAuthoringCodexTestOutputSchemaAsset(t *testing.T) []byte {
 	t.Helper()
-	encoded, err := json.Marshal(standardAuthoringCodexOutputSchemaAsset{
-		Format: StandardAuthoringCodexTurnOutputFormat, Version: StandardAuthoringCodexTurnOutputVersion,
-		Fields:      []string{"format", "version", "verdict", "artifacts[name,schema_version,content_base64]"},
-		Fingerprint: StandardAuthoringCodexOutputSchemaFingerprint(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
+	return append([]byte(nil), standardAuthoringCodexOutputSchemaTemplate()...)
 }
 
 type standardAuthoringAttestedBridgeVerifier struct {

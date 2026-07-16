@@ -55,8 +55,15 @@ handoff, compliance, and local packaging.
 - `contract-assets.v1.json` maps every closed stage to a canonical prompt and
   schema path. It has exact stage coverage and no path-discovery convention.
 - `prompts/` and `schemas/` contain immutable handler contracts. Codex prompt
-  programs are canonical, self-fingerprinted JSON; their output schema is the
-  exact `harbor.standard-authoring-codex-turn-output.v1` envelope.
+  programs are canonical, self-fingerprinted JSON. The
+  `schemas/codex-stage-output.schema.json` asset is an actual Draft-07 JSON
+  Schema template, not a field-list description. Its exact locked bytes and
+  fingerprint are verified before the runtime derives the stricter per-stage
+  `turn/start.outputSchema` from the frozen `StageDescriptor`.
+- `schemas/codex-turn-output.json` is retained only to inspect historical
+  locks and Runs that froze the former final-text contract. No current catalog
+  entry may reference it, and it must never be used to reinterpret an old Run
+  under the dynamic-submit semantics.
 - `ssh/known_hosts` is the explicit OpenSSH host-key allow-list. Its fixed
   relative path and raw content SHA-256, together with the pinned OpenSSH
   client and wrapper shell, live in `standard_authoring_ssh_transport` in the
@@ -117,6 +124,35 @@ The only intended host executable in this authoring catalog is the pinned Git
 snapshot executable. Docker build/evaluation and Qwen/Opus pass@4 are not
 silently reused here: they belong to the later task-bound CodeEdge workflow
 and its separate evaluator deployment contract.
+
+## Codex output submission
+
+Each `agent.turn` opens an ephemeral Codex App Server conversation with one
+stage-private `harbor_submit_stage_output` dynamic tool. It is registered at
+`thread/start`; it is neither a global MCP tool nor a shell command. The host
+derives the tool schema, allowed verdicts, artifact names, schema versions,
+and paths from the frozen `StageDescriptor`. A model can submit only an
+allowed verdict and one base64 content value for each declared artifact in
+the declared order.
+
+The derived schema is also passed as `turn/start.outputSchema`, but it is only
+the first format barrier. The submit handler performs strict semantic
+validation and internally canonicalizes a passing candidate. A successful
+submission is the sole output authority for the stage; assistant free text,
+including text emitted after the tool call, cannot replace it.
+
+Each submission attempt is independently charged to the `output_submission`
+quota dimension. The current Standard-authoring policy reserves three such
+units per agent stage, separately from its `agent_turn` units. Candidate size
+and the frozen per-turn timeout still apply. Rejected candidates never enter
+durable state as raw content: Codex receives only stable diagnostics such as
+`invalid_json`, `wrong_verdict`, or `artifact_identity_mismatch`, together
+with a digest.
+
+The conversation-level ReAct loop is intentionally ephemeral. Checkpoints do
+not contain a resumable Codex session or raw transcript, so a worker crash
+does not automatically continue the conversation on another worker. Recovery
+currently starts a new fenced stage attempt; historical Runs remain frozen.
 
 See [the non-secret host observation](../../docs/STANDARD_AUTHORING_ENVIRONMENT_ATTESTATION_OBSERVATION.md)
 and [the Codex bridge contract](../../docs/STANDARD_AUTHORING_CODEX_AGENT_BOOTSTRAP.md)

@@ -73,6 +73,46 @@ func TestStandardQuotaPolicyCompilesExplicitAccountLimitsAndStageClaims(t *testi
 	}
 }
 
+func TestStandardAuthoringQuotaPolicySeparatelyBoundsOutputSubmissions(t *testing.T) {
+	template := StandardAuthoringWorkflowTemplate()
+	policy := template.QuotaPolicy
+	if policy.ID != StandardAuthoringQuotaPolicyID || policy.Version != StandardAuthoringQuotaPolicyVersion {
+		t.Fatalf("Standard authoring policy = %s@%s, want %s@%s", policy.ID, policy.Version, StandardAuthoringQuotaPolicyID, StandardAuthoringQuotaPolicyVersion)
+	}
+	if err := policy.ValidateFor(template.Catalog); err != nil {
+		t.Fatalf("validate Standard authoring quota policy: %v", err)
+	}
+	resolved, err := policy.ResolveFor(template.Catalog)
+	if err != nil {
+		t.Fatalf("resolve Standard authoring quota policy: %v", err)
+	}
+
+	limits := make(map[string]QuotaAccountLimit, len(policy.AccountLimits))
+	for _, limit := range policy.AccountLimits {
+		limits[limit.Dimension] = limit
+	}
+	if got, present := limits["output_submission"]; !present || got != (QuotaAccountLimit{Dimension: "output_submission", TaskLimitUnits: 64, ActorLimitUnits: 640}) {
+		t.Fatalf("output-submission account limit = %+v, present=%v", got, present)
+	}
+
+	for _, definition := range template.Catalog.Stages {
+		claims, present := resolved.ClaimsFor(definition.Key)
+		if !present {
+			t.Fatalf("policy omitted stage %q", definition.Key)
+		}
+		_, isAgentStage := standardAgentQuotaStages[definition.Key]
+		if isAgentStage {
+			if !hasQuotaClaim(claims, "agent_turn", int64(definition.RequiredTurns)) || !hasQuotaClaim(claims, "output_submission", StandardAuthoringOutputSubmissionClaimUnits) {
+				t.Fatalf("agent stage %q claims = %+v, want independent agent_turn and three output_submission units", definition.Key, claims)
+			}
+			continue
+		}
+		if hasQuotaClaim(claims, "output_submission", StandardAuthoringOutputSubmissionClaimUnits) {
+			t.Fatalf("non-agent stage %q unexpectedly has output-submission quota: %+v", definition.Key, claims)
+		}
+	}
+}
+
 func TestCodeEdgePhase1QuotaPolicyLeavesEvaluatorTrialsToChild(t *testing.T) {
 	parent := CodeEdgePhase1WorkflowTemplate()
 	if parent.QuotaPolicy.ID != CodeEdgePhase1QuotaPolicyID || parent.QuotaPolicy.Version != CodeEdgePhase1QuotaPolicyVersion {

@@ -3,6 +3,7 @@ package appserver
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
@@ -32,8 +33,11 @@ type appServerSession struct {
 	turnDone              chan struct{}
 	turnResult            Result
 	turnErr               error
+	turnContext           context.Context
+	turnStartRequestID    int
 	nextID                int
 	responses             map[int]chan appServerRPCMessage
+	dynamicTools          map[string]DynamicTool
 	threadID              string
 	turnID                string
 	items                 map[string]string
@@ -54,6 +58,11 @@ type appServerSession struct {
 }
 
 func (s *appServerSession) Start(ctx context.Context, request Request) error {
+	dynamicTools, err := normalizeDynamicTools(request.DynamicTools)
+	if err != nil {
+		return err
+	}
+	request.DynamicTools = normalizedDynamicToolSlice(request.DynamicTools, dynamicTools)
 	s.mu.Lock()
 	if s.done != nil {
 		s.mu.Unlock()
@@ -62,6 +71,7 @@ func (s *appServerSession) Start(ctx context.Context, request Request) error {
 	s.req = request
 	s.done = make(chan struct{})
 	s.responses = map[int]chan appServerRPCMessage{}
+	s.dynamicTools = dynamicTools
 	s.items = map[string]string{}
 	s.deltas = map[string]string{}
 	s.deltaLogged = map[string]bool{}
@@ -185,6 +195,14 @@ func (s *appServerSession) Start(ctx context.Context, request Request) error {
 func (s *appServerSession) Turn(ctx context.Context, request TurnRequest) (Result, error) {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
+	var outputSchema json.RawMessage
+	if len(request.OutputSchema) > 0 {
+		var err error
+		outputSchema, err = normalizeJSONSchema(request.OutputSchema)
+		if err != nil {
+			return Result{}, fmt.Errorf("codex app-server turn output schema: %w", err)
+		}
+	}
 
 	s.mu.Lock()
 	if s.done == nil || s.threadID == "" {
@@ -232,8 +250,13 @@ func (s *appServerSession) Turn(ctx context.Context, request TurnRequest) (Resul
 		turnCtx, cancel = context.WithTimeout(ctx, request.Timeout)
 	}
 	defer cancel()
+	s.mu.Lock()
+	if s.turnDone == turnDone {
+		s.turnContext = turnCtx
+	}
+	s.mu.Unlock()
 	startCtx, startCancel := context.WithTimeout(turnCtx, 30*time.Second)
-	turnStartResult, err := s.sendRequest(startCtx, "turn/start", appServerTurnStartParams(turnRequest, threadID))
+	turnStartResult, err := s.sendRequest(startCtx, "turn/start", appServerTurnStartParamsWithOutputSchema(turnRequest, threadID, outputSchema))
 	startCancel()
 	if err != nil {
 		s.finishTurn(Result{}, fmt.Errorf("start Codex turn: %w", err))
@@ -267,7 +290,11 @@ func (s *appServerSession) Turn(ctx context.Context, request TurnRequest) (Resul
 	if s.turnDone == turnDone {
 		s.turnDone = nil
 	}
+	if s.turnContext == turnCtx {
+		s.turnContext = nil
+	}
 	s.turnID = ""
+	s.turnStartRequestID = 0
 	s.mu.Unlock()
 	return result, turnErr
 }
@@ -287,6 +314,7 @@ func (s *appServerSession) finishTurnLocked(result Result, err error) {
 	s.turnResult = result
 	s.turnErr = err
 	s.turnID = ""
+	s.turnStartRequestID = 0
 	done := s.turnDone
 	s.turnDone = nil
 	close(done)

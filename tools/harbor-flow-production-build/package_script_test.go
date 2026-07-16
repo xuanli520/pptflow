@@ -127,7 +127,7 @@ func newProductionPackageFixture(t *testing.T) productionPackageFixture {
 
 	writeProductionBundleFixture(t, root, "standard-authoring", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json", "contract-assets.v1.json", "execution-profile.v1.json",
-		"prompts/task-design.json", "schemas/codex-turn-output.json",
+		"prompts/task-design.json", "schemas/codex-stage-output.schema.json",
 	})
 	writeProductionBundleFixture(t, root, "codeedge-phase1", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json",
@@ -385,7 +385,7 @@ func productionPackagePayloads() []string {
 		"deployments/standard-authoring/operation-catalog.lock.json",
 		"deployments/standard-authoring/operation-catalog.v1.json",
 		"deployments/standard-authoring/prompts/task-design.json",
-		"deployments/standard-authoring/schemas/codex-turn-output.json",
+		"deployments/standard-authoring/schemas/codex-stage-output.schema.json",
 		"harbor-factory",
 		productionPackageArchiveName,
 	}

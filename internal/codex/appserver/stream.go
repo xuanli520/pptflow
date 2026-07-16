@@ -31,12 +31,17 @@ func (s *appServerSession) readStdout(stdout io.Reader) {
 		}
 		if len(message.ID) > 0 && message.Method == "" {
 			if id, ok := rpcIDInt(message.ID); ok {
+				s.recordTurnStartResponse(id, message)
 				s.dispatchResponse(id, message)
 			}
 			continue
 		}
 		if len(message.ID) > 0 && message.Method != "" {
-			s.respondUnsupported(message.ID, message.Method)
+			if message.Method == "item/tool/call" {
+				s.respondDynamicToolCall(message.ID, message.Params)
+			} else {
+				s.respondUnsupported(message.ID, message.Method)
+			}
 			continue
 		}
 		if message.Method != "" {

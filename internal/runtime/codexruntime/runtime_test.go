@@ -2,6 +2,7 @@ package codexruntime
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -61,7 +62,8 @@ func TestConversationAppliesDefaultsAcrossTurnsAndClosesSession(t *testing.T) {
 			LogPath:        "/tmp/default.log",
 		},
 	}
-	result, err := conversation.Turn(context.Background(), agent.TurnRequest{Prompt: "first"})
+	outputSchema := json.RawMessage(`{"type":"object","properties":{"accepted":{"type":"boolean"}},"required":["accepted"]}`)
+	result, err := conversation.Turn(context.Background(), agent.TurnRequest{Prompt: "first", OutputSchema: outputSchema})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +72,9 @@ func TestConversationAppliesDefaultsAcrossTurnsAndClosesSession(t *testing.T) {
 	}
 	if len(session.turns) != 1 || session.turns[0].Timeout != 17*time.Second || session.turns[0].MaxOutputBytes != 2048 || session.turns[0].LogPath != "/tmp/default.log" {
 		t.Fatalf("conversation defaults not applied: %+v", session.turns)
+	}
+	if string(session.turns[0].OutputSchema) != string(outputSchema) {
+		t.Fatalf("output schema was not forwarded: %s", session.turns[0].OutputSchema)
 	}
 	if _, err := conversation.Turn(context.Background(), agent.TurnRequest{Prompt: "second", TimeoutSeconds: 3, MaxOutputBytes: 512, LogPath: "/tmp/second.log"}); err != nil {
 		t.Fatal(err)
@@ -85,6 +90,34 @@ func TestConversationAppliesDefaultsAcrossTurnsAndClosesSession(t *testing.T) {
 	}
 	if !session.closed || session.closeCalls != 1 {
 		t.Fatalf("app-server close lifecycle = closed=%t calls=%d, want true/1", session.closed, session.closeCalls)
+	}
+}
+
+func TestAppServerDynamicToolsCopiesGenericJSONHandler(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"candidate":{"type":"string"}},"required":["candidate"]}`)
+	seen := make(chan json.RawMessage, 1)
+	tools := appServerDynamicTools([]agent.DynamicTool{{
+		Name:        "submit_output",
+		Description: "Submit one JSON value.",
+		InputSchema: schema,
+		Handler: func(_ context.Context, arguments json.RawMessage) (json.RawMessage, error) {
+			seen <- append(json.RawMessage(nil), arguments...)
+			return json.RawMessage(`{"accepted":true}`), nil
+		},
+	}})
+	if len(tools) != 1 || tools[0].Name != "submit_output" || string(tools[0].InputSchema) != string(schema) || tools[0].Handler == nil {
+		t.Fatalf("converted dynamic tools = %+v", tools)
+	}
+	schema[2] = 'X'
+	if string(tools[0].InputSchema) == string(schema) {
+		t.Fatal("converted dynamic tool aliases caller schema bytes")
+	}
+	result, err := tools[0].Handler(context.Background(), json.RawMessage(`{"candidate":"value"}`))
+	if err != nil || string(result) != `{"accepted":true}` {
+		t.Fatalf("converted handler result = %s, %v", result, err)
+	}
+	if got := <-seen; string(got) != `{"candidate":"value"}` {
+		t.Fatalf("converted handler arguments = %s", got)
 	}
 }
 

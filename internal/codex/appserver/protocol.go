@@ -40,6 +40,11 @@ func (e *appServerRPCError) Error() string {
 
 func (s *appServerSession) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id, ch := s.registerResponse()
+	if method == "turn/start" {
+		s.mu.Lock()
+		s.turnStartRequestID = id
+		s.mu.Unlock()
+	}
 	request := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
@@ -106,6 +111,9 @@ func (s *appServerSession) unregisterResponse(id int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.responses, id)
+	if s.turnStartRequestID == id {
+		s.turnStartRequestID = 0
+	}
 }
 
 func (s *appServerSession) dispatchResponse(id int, message appServerRPCMessage) {
@@ -115,6 +123,26 @@ func (s *appServerSession) dispatchResponse(id int, message appServerRPCMessage)
 	s.mu.Unlock()
 	if ch != nil {
 		ch <- message
+	}
+}
+
+// recordTurnStartResponse makes the server-issued turn ID visible before the
+// stdout reader processes any following server request. A dynamic tool request
+// can legally arrive immediately after the turn/start response, but never
+// before it; requiring this state prevents a forged early turn ID from calling
+// a session-private handler.
+func (s *appServerSession) recordTurnStartResponse(id int, message appServerRPCMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnStartRequestID != id {
+		return
+	}
+	s.turnStartRequestID = 0
+	if message.Error != nil || s.turnDone == nil || s.completed {
+		return
+	}
+	if turnID := stringAtPath(message.Result, "turn", "id"); turnID != "" {
+		s.turnID = turnID
 	}
 }
 
@@ -189,6 +217,9 @@ func appServerThreadStartParams(request Request) map[string]any {
 		"ephemeral":      true,
 		"sandbox":        normalizeSandboxMode(request.SandboxMode),
 	}
+	if len(request.DynamicTools) > 0 {
+		params["dynamicTools"] = appServerDynamicToolSpecs(request.DynamicTools)
+	}
 	setAppServerModelParam(params, request.Model)
 	return params
 }
@@ -206,6 +237,10 @@ func appServerClientInfo(request Request) map[string]any {
 }
 
 func appServerTurnStartParams(request Request, threadID string) map[string]any {
+	return appServerTurnStartParamsWithOutputSchema(request, threadID, nil)
+}
+
+func appServerTurnStartParamsWithOutputSchema(request Request, threadID string, outputSchema json.RawMessage) map[string]any {
 	params := map[string]any{
 		"approvalPolicy": "never",
 		"cwd":            request.ProjectPath,
@@ -215,6 +250,9 @@ func appServerTurnStartParams(request Request, threadID string) map[string]any {
 	}
 	if len(request.WorkspaceRoots) > 0 {
 		params["runtimeWorkspaceRoots"] = append([]string{}, request.WorkspaceRoots...)
+	}
+	if len(outputSchema) > 0 {
+		params["outputSchema"] = append(json.RawMessage(nil), outputSchema...)
 	}
 	setAppServerModelParam(params, request.Model)
 	return params

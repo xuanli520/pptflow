@@ -18,11 +18,17 @@ const (
 	StandardQuotaPolicyVersion = "1.0.0"
 
 	// StandardAuthoringQuotaPolicyID and Version identify the bounded source
-	// session authoring policy. It carries only stage-attempt and agent-turn
-	// accounts: task-bound trial, repair, verification, and packaging quota
-	// begins only in the explicit child Run after materialization handoff.
+	// session authoring policy. It carries stage-attempt, agent-turn, and
+	// output-submission accounts: task-bound trial, repair, verification, and
+	// packaging quota begins only in the explicit child Run after materialization
+	// handoff. output_submission separately bounds model tool retries so they
+	// cannot bypass agent-turn accounting.
 	StandardAuthoringQuotaPolicyID      = "harbor.standard-authoring.local.operator"
-	StandardAuthoringQuotaPolicyVersion = "1.0.0"
+	StandardAuthoringQuotaPolicyVersion = "1.1.0"
+	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
+	// model-owned validate-and-submit calls reserved for every authoring agent
+	// stage. It is versioned with the policy rather than supplied by a Run.
+	StandardAuthoringOutputSubmissionClaimUnits int64 = 3
 
 	// CodeEdgePhase1QuotaPolicyID and Version identify the explicit quota
 	// policy for the closed Phase-1 compliance descriptor. It is separate from
@@ -38,14 +44,16 @@ const (
 	CodeEdgeEvaluatorChildQuotaPolicyID      = "harbor.codeedge-evaluator.local.operator"
 	CodeEdgeEvaluatorChildQuotaPolicyVersion = "1.0.0"
 
-	standardTaskStageAttemptLimit  int64 = 120
-	standardActorStageAttemptLimit int64 = 1200
-	standardTaskAgentTurnLimit     int64 = 64
-	standardActorAgentTurnLimit    int64 = 640
-	standardTaskTrialLimit         int64 = 32
-	standardActorTrialLimit        int64 = 320
-	standardTaskRepairRoundLimit   int64 = 3
-	standardActorRepairRoundLimit  int64 = 30
+	standardTaskStageAttemptLimit      int64 = 120
+	standardActorStageAttemptLimit     int64 = 1200
+	standardTaskAgentTurnLimit         int64 = 64
+	standardActorAgentTurnLimit        int64 = 640
+	standardTaskOutputSubmissionLimit  int64 = 64
+	standardActorOutputSubmissionLimit int64 = 640
+	standardTaskTrialLimit             int64 = 32
+	standardActorTrialLimit            int64 = 320
+	standardTaskRepairRoundLimit       int64 = 3
+	standardActorRepairRoundLimit      int64 = 30
 
 	standardStageAttemptClaimUnits int64 = 1
 	standardEvaluationTrialClaims  int64 = 4
@@ -380,7 +388,11 @@ func StandardAuthoringQuotaPolicy() QuotaPolicy {
 	catalog := StandardAuthoringStageCatalog()
 	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
 	for _, stage := range catalog.Stages {
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: standardClaimsForStage(stage)})
+		claims := standardClaimsForStage(stage)
+		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
+			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
+		}
+		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
 	}
 	return QuotaPolicy{
 		ID:      StandardAuthoringQuotaPolicyID,
@@ -388,6 +400,7 @@ func StandardAuthoringQuotaPolicy() QuotaPolicy {
 		AccountLimits: []QuotaAccountLimit{
 			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
 			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
+			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
 		},
 		Stages: stages,
 	}

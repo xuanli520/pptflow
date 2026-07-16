@@ -1,0 +1,434 @@
+package stageprovider
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/purplevoid/harbor-factory/internal/agent"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
+)
+
+func TestStandardAuthoringCodexOutputSubmissionRejectsInvalidCandidatesWithoutPersistingContent(t *testing.T) {
+	t.Parallel()
+	const secret = "invalid-candidate-must-not-escape"
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	encoded := base64.StdEncoding.EncodeToString([]byte("candidate bytes"))
+	cases := []struct {
+		name        string
+		raw         json.RawMessage
+		wantError   string
+		wantCharges int
+	}{
+		{
+			name:      "trailing garbage",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":[{"content_base64":"` + encoded + `"}]} {"secret":"` + secret + `"}`),
+			wantError: "invalid_json", wantCharges: 1,
+		},
+		{
+			name:      "duplicate key",
+			raw:       json.RawMessage(`{"verdict":"pass","verdict":"pass","artifacts":[{"content_base64":"` + encoded + `"}]}`),
+			wantError: "invalid_json", wantCharges: 1,
+		},
+		{
+			name:      "wrong verdict",
+			raw:       json.RawMessage(`{"verdict":"reject","artifacts":[{"content_base64":"` + encoded + `"}]}`),
+			wantError: "wrong_verdict", wantCharges: 1,
+		},
+		{
+			name:      "missing verdict",
+			raw:       json.RawMessage(`{"artifacts":[{"content_base64":"` + encoded + `"}]}`),
+			wantError: "wrong_verdict", wantCharges: 1,
+		},
+		{
+			name:      "null verdict",
+			raw:       json.RawMessage(`{"verdict":null,"artifacts":[{"content_base64":"` + encoded + `"}]}`),
+			wantError: "wrong_verdict", wantCharges: 1,
+		},
+		{
+			name:      "wrong artifact count",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":[]}`),
+			wantError: "artifact_identity_mismatch", wantCharges: 1,
+		},
+		{
+			name:      "missing artifacts",
+			raw:       json.RawMessage(`{"verdict":"pass"}`),
+			wantError: "artifact_identity_mismatch", wantCharges: 1,
+		},
+		{
+			name:      "null artifacts",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":null}`),
+			wantError: "artifact_identity_mismatch", wantCharges: 1,
+		},
+		{
+			name:      "missing base64",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":[{}]}`),
+			wantError: "invalid_content_encoding", wantCharges: 1,
+		},
+		{
+			name:      "null base64",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":[{"content_base64":null}]}`),
+			wantError: "invalid_content_encoding", wantCharges: 1,
+		},
+		{
+			name:      "non-string base64",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":[{"content_base64":7}]}`),
+			wantError: "invalid_json", wantCharges: 1,
+		},
+		{
+			name:      "invalid base64",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":[{"content_base64":"not base64"}]}`),
+			wantError: "invalid_content_encoding", wantCharges: 1,
+		},
+		{
+			name:      "caller supplied artifact identity",
+			raw:       json.RawMessage(`{"verdict":"pass","artifacts":[{"content_base64":"` + encoded + `","name":"other","schema_version":"other","path":"/tmp/other"}]}`),
+			wantError: "invalid_json", wantCharges: 1,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			stage := standardAuthoringCodexTestStage(1)
+			request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+			submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 3, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := submission.beginTurn(1); err != nil {
+				t.Fatal(err)
+			}
+
+			response, err := submission.dynamicTool().Handler(context.Background(), testCase.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != testCase.wantError || receipt.Digest != workflowkit.SHA256Fingerprint(testCase.raw) {
+				t.Fatalf("receipt = %+v, want rejected %q with raw digest", receipt, testCase.wantError)
+			}
+			if strings.Contains(string(response), secret) {
+				t.Fatalf("rejection response leaked invalid candidate content")
+			}
+			if _, accepted := submission.acceptedResult(); accepted {
+				t.Fatal("invalid candidate became an accepted artifact")
+			}
+			if len(*usages) != testCase.wantCharges {
+				t.Fatalf("usage records = %+v, want %d charged submission", *usages, testCase.wantCharges)
+			}
+			for _, usage := range *usages {
+				if usage.Dimension != standardAuthoringCodexOutputSubmissionQuotaDimension || strings.Contains(usage.OperationKey, secret) {
+					t.Fatalf("invalid candidate usage = %+v, want secret-free output-submission charge", usage)
+				}
+			}
+		})
+	}
+}
+
+func TestStandardAuthoringCodexOutputSubmissionDerivesClosedSchemaFromFrozenStage(t *testing.T) {
+	stage := standardAuthoringCodexTestStage(1)
+	stage.Outputs = append(stage.Outputs, workflowkit.ArtifactSpec{Name: "second_output", SchemaVersion: "harbor.artifact.v1", Required: true})
+
+	var schema map[string]any
+	if err := json.Unmarshal(standardAuthoringCodexSubmissionSchema(stage), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if schema["$schema"] != "http://json-schema.org/draft-07/schema#" || schema["$id"] != "harbor.standard-authoring-codex-stage-output.v1" || schema["additionalProperties"] != false {
+		t.Fatalf("derived top-level schema = %#v", schema)
+	}
+	required, ok := schema["required"].([]any)
+	if !ok || len(required) != 2 || required[0] != "verdict" || required[1] != "artifacts" {
+		t.Fatalf("derived required fields = %#v", schema["required"])
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("derived properties = %#v", schema["properties"])
+	}
+	verdict, ok := properties["verdict"].(map[string]any)
+	if !ok || verdict["type"] != "string" {
+		t.Fatalf("derived verdict property = %#v", properties["verdict"])
+	}
+	enum, ok := verdict["enum"].([]any)
+	if !ok || len(enum) != 2 || enum[0] != string(workflowkit.VerdictNeedsRepair) || enum[1] != string(workflowkit.VerdictPass) {
+		t.Fatalf("derived verdict enum = %#v", verdict["enum"])
+	}
+	artifacts, ok := properties["artifacts"].(map[string]any)
+	if !ok || artifacts["type"] != "array" || artifacts["minItems"] != float64(2) || artifacts["maxItems"] != float64(2) {
+		t.Fatalf("derived artifacts property = %#v", properties["artifacts"])
+	}
+	items, ok := artifacts["items"].(map[string]any)
+	if !ok || items["type"] != "object" || items["additionalProperties"] != false {
+		t.Fatalf("derived artifact item = %#v", artifacts["items"])
+	}
+	itemProperties, ok := items["properties"].(map[string]any)
+	if !ok || len(itemProperties) != 1 || itemProperties["content_base64"] == nil {
+		t.Fatalf("derived artifact fields = %#v", items["properties"])
+	}
+	for _, forbidden := range []string{"name", "schema_version", "path", "stage"} {
+		if _, exposed := itemProperties[forbidden]; exposed {
+			t.Fatalf("derived schema exposed host-owned %q field: %#v", forbidden, itemProperties)
+		}
+	}
+}
+
+func TestStandardAuthoringCodexOutputSubmissionCanonicalizesSemanticEquivalentCandidates(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	canonical := standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("canonical artifact"))
+	spaced := json.RawMessage(" \n\t" + string(canonical) + "\n")
+	if workflowkit.SHA256Fingerprint(canonical) == workflowkit.SHA256Fingerprint(spaced) {
+		t.Fatal("test inputs unexpectedly have the same raw digest")
+	}
+
+	acceptedDigests := make([]workflowkit.Fingerprint, 0, 2)
+	for _, raw := range []json.RawMessage{canonical, spaced} {
+		stage := standardAuthoringCodexTestStage(1)
+		request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		response, err := submission.dynamicTool().Handler(context.Background(), raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if !receipt.Accepted || len(receipt.Errors) != 0 {
+			t.Fatalf("receipt = %+v, want accepted candidate", receipt)
+		}
+		acceptedDigests = append(acceptedDigests, receipt.Digest)
+	}
+	if acceptedDigests[0] != acceptedDigests[1] {
+		t.Fatalf("semantic candidates received different canonical digests: %q and %q", acceptedDigests[0], acceptedDigests[1])
+	}
+}
+
+func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *testing.T) {
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	valid := standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("accepted artifact"))
+	invalid := standardAuthoringCodexTestCandidate(t, workflowkit.Verdict("not-allowed"), []byte("rejected artifact"))
+
+	t.Run("submission attempts are bounded independently from agent turns", func(t *testing.T) {
+		stage := standardAuthoringCodexTestStage(1)
+		request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		for index, raw := range []json.RawMessage{invalid, invalid, valid} {
+			response, err := submission.dynamicTool().Handler(context.Background(), raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if index == 2 {
+				if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "submit_attempts_exhausted" || receipt.Remaining != 0 {
+					t.Fatalf("exhausted receipt = %+v", receipt)
+				}
+			}
+		}
+		if len(*usages) != 2 {
+			t.Fatalf("usage records = %+v, want two charged output submissions", *usages)
+		}
+		if _, accepted := submission.acceptedResult(); accepted {
+			t.Fatal("candidate was accepted after submission attempts were exhausted")
+		}
+	})
+
+	t.Run("byte limit rejects after charging the bounded submission attempt", func(t *testing.T) {
+		stage := standardAuthoringCodexTestStage(1)
+		request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, len(valid)-1, 2, func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		response, err := submission.dynamicTool().Handler(context.Background(), valid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "byte_limit_exceeded" {
+			t.Fatalf("byte limit receipt = %+v", receipt)
+		}
+		if len(*usages) != 1 || (*usages)[0].Dimension != standardAuthoringCodexOutputSubmissionQuotaDimension {
+			t.Fatalf("byte-limited candidate usage = %+v, want one charged output submission", *usages)
+		}
+	})
+
+	t.Run("quota failure disables future submissions", func(t *testing.T) {
+		stage := standardAuthoringCodexTestStage(1)
+		request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+		request.Charge = func(context.Context, workflowkit.StageUsage) error { return errors.New("quota unavailable") }
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		response, err := submission.dynamicTool().Handler(context.Background(), valid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "submission_quota_exhausted" || submission.failure() != standardAuthoringCodexSubmissionFailureQuota {
+			t.Fatalf("quota receipt = %+v failure=%q", receipt, submission.failure())
+		}
+		response, err = submission.dynamicTool().Handler(context.Background(), valid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt = standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "submission_unavailable" {
+			t.Fatalf("post-quota receipt = %+v", receipt)
+		}
+	})
+
+	t.Run("expired context cannot accept after quota charge", func(t *testing.T) {
+		stage := standardAuthoringCodexTestStage(1)
+		request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+		originalCharge := request.Charge
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		request.Charge = func(chargeCtx context.Context, usage workflowkit.StageUsage) error {
+			if err := originalCharge(chargeCtx, usage); err != nil {
+				return err
+			}
+			cancel()
+			return nil
+		}
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		response, err := submission.dynamicTool().Handler(ctx, valid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "submission_timeout" {
+			t.Fatalf("timeout receipt = %+v", receipt)
+		}
+		if _, accepted := submission.acceptedResult(); accepted {
+			t.Fatal("timed-out submission accepted an artifact")
+		}
+		if len(*usages) != 1 || (*usages)[0].Dimension != standardAuthoringCodexOutputSubmissionQuotaDimension {
+			t.Fatalf("timeout usage = %+v, want completed pre-timeout quota charge", *usages)
+		}
+	})
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorValidateAndSubmitUsesOnlyFirstAcceptedArtifact(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	stage := standardAuthoringCodexTestStage(1)
+	rejected := standardAuthoringCodexTestCandidate(t, workflowkit.Verdict("not-allowed"), []byte("rejected candidate"))
+	accepted := standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("accepted artifact A"))
+	overwrite := standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("candidate B must not win"))
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
+		results: []agent.TurnResult{{
+			Model: CodexAppServerProductionModelID,
+			Text:  `{"verdict":"needs_repair","artifacts":[{"content_base64":"` + base64.StdEncoding.EncodeToString([]byte("free text B must not win")) + `"}]}`,
+		}},
+		submissions: [][]json.RawMessage{{rejected, accepted, overwrite}},
+	}}
+	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, 1)
+	request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts))},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome.Status != workflowkit.StatusCompleted || result.Outcome.Verdict != workflowkit.VerdictPass || len(result.Artifacts) != 1 || string(result.Artifacts[0].Content) != "accepted artifact A" || result.Artifacts[0].TurnOrdinal != 1 {
+		t.Fatalf("result = %+v, want only accepted artifact A", result)
+	}
+	if len(runtime.conversation.submissionErrors) != 3 {
+		t.Fatalf("tool calls = %d, want invalid, accepted, and post-accept calls", len(runtime.conversation.submissionErrors))
+	}
+	for _, toolErr := range runtime.conversation.submissionErrors {
+		if toolErr != nil {
+			t.Fatalf("dynamic tool returned error: %v", toolErr)
+		}
+	}
+	if len(runtime.conversation.submissionResponses) != 3 {
+		t.Fatalf("tool responses = %d, want three", len(runtime.conversation.submissionResponses))
+	}
+	first := standardAuthoringCodexTestSubmissionReceipt(t, runtime.conversation.submissionResponses[0])
+	second := standardAuthoringCodexTestSubmissionReceipt(t, runtime.conversation.submissionResponses[1])
+	third := standardAuthoringCodexTestSubmissionReceipt(t, runtime.conversation.submissionResponses[2])
+	if first.Accepted || len(first.Errors) != 1 || first.Errors[0] != "wrong_verdict" || second.Accepted == false || len(second.Errors) != 0 || third.Accepted || len(third.Errors) != 1 || third.Errors[0] != "already_accepted" {
+		t.Fatalf("tool receipts = first:%+v second:%+v third:%+v", first, second, third)
+	}
+	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != 1 || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 2 {
+		t.Fatalf("usage records = %+v, want one agent turn and two output submissions", *usages)
+	}
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorFailsWithoutToolSubmission(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	stage := standardAuthoringCodexTestStage(1)
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
+		results: []agent.TurnResult{{
+			Model: CodexAppServerProductionModelID,
+			Text:  string(standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("free text must not become an artifact"))),
+		}},
+	}}
+	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, 1)
+	request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts))},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome.Status != workflowkit.StatusInfraFailed || result.ErrorText != standardAuthoringCodexSubmissionFailureAbsent || len(result.Artifacts) != 0 {
+		t.Fatalf("free-text result = %+v, want missing output submission failure", result)
+	}
+	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != 1 || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 0 {
+		t.Fatalf("usage records = %+v, want no output-submission charge", *usages)
+	}
+}
+
+func standardAuthoringCodexTestSubmissionReceipt(t *testing.T, raw json.RawMessage) standardAuthoringCodexSubmissionReceipt {
+	t.Helper()
+	var receipt standardAuthoringCodexSubmissionReceipt
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		t.Fatalf("decode submission receipt: %v", err)
+	}
+	return receipt
+}
+
+func standardAuthoringCodexTestUsageCount(usages []workflowkit.StageUsage, dimension string) int {
+	count := 0
+	for _, usage := range usages {
+		if usage.Dimension == dimension {
+			count++
+		}
+	}
+	return count
+}

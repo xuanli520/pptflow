@@ -28,12 +28,6 @@ const (
 	StandardAuthoringCodexTurnRequestFormat  = "harbor.standard-authoring-codex-turn-request.v1"
 	StandardAuthoringCodexTurnRequestVersion = "1"
 
-	// StandardAuthoringCodexTurnOutputFormat is the only accepted final model
-	// response. A model response cannot select an output name, schema, or
-	// verdict outside the frozen StageDescriptor.
-	StandardAuthoringCodexTurnOutputFormat  = "harbor.standard-authoring-codex-turn-output.v1"
-	StandardAuthoringCodexTurnOutputVersion = "1"
-
 	standardAuthoringCodexCheckpointFormat = "harbor.standard-authoring-codex-turn-checkpoint.v1"
 
 	standardAuthoringCodexFailureConfiguration = "standard_authoring_codex_agent_turn.configuration"
@@ -140,19 +134,22 @@ func standardAuthoringCodexTurnProgramFingerprint(program StandardAuthoringCodex
 	return workflowkit.FingerprintBytes("harbor.standard-authoring-codex-turn-program.v1", encoded)
 }
 
+const standardAuthoringCodexOutputSchemaCanonicalJSON = `{"$id":"harbor.standard-authoring-codex-stage-output.v1","$schema":"http://json-schema.org/draft-07/schema#","additionalProperties":false,"properties":{"artifacts":{"items":{"additionalProperties":false,"properties":{"content_base64":{"type":"string"}},"required":["content_base64"],"type":"object"},"type":"array"},"verdict":{"type":"string"}},"required":["verdict","artifacts"],"type":"object"}`
+
 // StandardAuthoringCodexOutputSchemaFingerprint exposes the identity of the
-// strict response envelope so deployment materials can pin it next to a prompt
-// program fingerprint. It does not include any prompt or runtime fact.
+// real JSON Schema template pinned by deployment materials. The executor
+// derives a stricter per-stage schema from this closed template and the frozen
+// StageDescriptor immediately before opening its App Server conversation.
 func StandardAuthoringCodexOutputSchemaFingerprint() workflowkit.Fingerprint {
-	fingerprint, err := workflowkit.FingerprintParts("harbor.standard-authoring-codex-turn-output-schema.v1", []workflowkit.FingerprintPart{
-		{Name: "format", Value: []byte(StandardAuthoringCodexTurnOutputFormat)},
-		{Name: "version", Value: []byte(StandardAuthoringCodexTurnOutputVersion)},
-		{Name: "fields", Value: []byte("format,version,verdict,artifacts[name,schema_version,content_base64]")},
-	})
+	fingerprint, err := workflowkit.FingerprintBytes("harbor.standard-authoring-codex-stage-output-schema.v1", []byte(standardAuthoringCodexOutputSchemaCanonicalJSON))
 	if err != nil {
 		panic("fixed Standard Authoring Codex output schema fingerprint: " + err.Error())
 	}
 	return fingerprint
+}
+
+func standardAuthoringCodexOutputSchemaTemplate() []byte {
+	return []byte(standardAuthoringCodexOutputSchemaCanonicalJSON)
 }
 
 // ParseStandardAuthoringCodexTurnProgramAsset decodes the one supported
@@ -185,19 +182,11 @@ func ParseStandardAuthoringCodexTurnProgramAsset(raw []byte) (StandardAuthoringC
 	return program.clone(), nil
 }
 
-type standardAuthoringCodexOutputSchemaAsset struct {
-	Format      string                  `json:"format"`
-	Version     string                  `json:"version"`
-	Fields      []string                `json:"fields"`
-	Fingerprint workflowkit.Fingerprint `json:"fingerprint"`
-}
-
 // ValidateStandardAuthoringCodexOutputSchemaAsset accepts only the exact
-// versioned schema document used by parseStandardAuthoringCodexTurnOutput. It
+// versioned JSON Schema template used to generate turn/start.outputSchema. It
 // accepts at most one POSIX terminal LF under the same raw-byte-locking rule as
-// the prompt asset. It exists separately from the Go parser so a deployment
-// lock proves both the raw schema asset and the semantic schema fingerprint
-// before a model turn.
+// the prompt asset. A field-list document is intentionally not accepted: the
+// App Server requires an actual JSON Schema value.
 func ValidateStandardAuthoringCodexOutputSchemaAsset(raw []byte) error {
 	if len(raw) == 0 || len(raw) > standardAuthoringCodexContractAssetLimit {
 		return fmt.Errorf("%w: output schema asset has invalid size", ErrStandardAuthoringCodexAgentTurnConfiguration)
@@ -205,22 +194,8 @@ func ValidateStandardAuthoringCodexOutputSchemaAsset(raw []byte) error {
 	if err := rejectDuplicateDeploymentCatalogJSONKeys(raw); err != nil {
 		return fmt.Errorf("%w: output schema asset has duplicate fields", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
-	var schema standardAuthoringCodexOutputSchemaAsset
-	if err := decodeDeploymentCatalogJSON(raw, &schema); err != nil {
-		return fmt.Errorf("%w: output schema asset is invalid", ErrStandardAuthoringCodexAgentTurnConfiguration)
-	}
-	canonical, err := json.Marshal(schema)
-	if err != nil || !bytes.Equal(standardAuthoringCodexCanonicalAssetBody(raw), canonical) {
-		return fmt.Errorf("%w: output schema asset is not canonical", ErrStandardAuthoringCodexAgentTurnConfiguration)
-	}
-	expectedFields := []string{"format", "version", "verdict", "artifacts[name,schema_version,content_base64]"}
-	if schema.Format != StandardAuthoringCodexTurnOutputFormat || schema.Version != StandardAuthoringCodexTurnOutputVersion || schema.Fingerprint != StandardAuthoringCodexOutputSchemaFingerprint() || len(schema.Fields) != len(expectedFields) {
-		return fmt.Errorf("%w: output schema asset does not match the locked Codex output contract", ErrStandardAuthoringCodexAgentTurnConfiguration)
-	}
-	for index, expected := range expectedFields {
-		if schema.Fields[index] != expected {
-			return fmt.Errorf("%w: output schema asset does not match the locked Codex output contract", ErrStandardAuthoringCodexAgentTurnConfiguration)
-		}
+	if !json.Valid(raw) || !bytes.Equal(standardAuthoringCodexCanonicalAssetBody(raw), standardAuthoringCodexOutputSchemaTemplate()) {
+		return fmt.Errorf("%w: output schema asset is not the locked JSON Schema template", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return nil
 }
@@ -340,8 +315,9 @@ func NewStandardAuthoringCodexAgentTurnExecutor(config StandardAuthoringCodexAge
 
 // ExecuteAgentTurn implements AgentTurnOperationExecutor. It consumes every
 // declared frozen input through ReadInput, records secret-free checkpoints and
-// quota events for every real App Server turn, and admits only the canonical
-// response envelope declared in this file.
+// quota events for every real App Server turn, and admits only an artifact
+// accepted by its private validate-and-submit dynamic tool. Free assistant
+// text is never an output authority.
 func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx context.Context, invocation StageOperationInvocation, payload workflowadapter.AgentTurnOperationPayload) (workflowkit.StageExecutionResult, error) {
 	if executor == nil || isNilInterface(executor.invocationFactory) {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
@@ -366,6 +342,14 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
+	maxSubmissions, hasSubmissionQuota := standardAuthoringCodexOutputSubmissionQuota(request.Stage)
+	if !hasSubmissionQuota {
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+	}
+	submission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now)
+	if err != nil {
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+	}
 	attestedInvocation, runtime, failure := executor.runtimeForEffect(ctx, invocation, payload)
 	if failure != "" {
 		if contextError(ctx) != nil {
@@ -386,7 +370,8 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		CapabilitySummary: attestedInvocation.CLIVersionOutput,
 		// App Server protocol logs contain only hashes in the current runtime, but
 		// an operation must not leave even those records in a managed workspace.
-		LogPath: os.DevNull,
+		LogPath:      os.DevNull,
+		DynamicTools: []agent.DynamicTool{submission.dynamicTool()},
 	})
 	if err != nil {
 		if contextError(ctx) != nil {
@@ -394,10 +379,12 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		}
 		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 	}
-
-	var final agent.TurnResult
 	for ordinal, prompt := range program.TurnPrompts {
 		turn := ordinal + 1
+		if err := submission.beginTurn(turn); err != nil {
+			_ = conversation.Close()
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
 		if err := executor.checkpoint(ctx, request, program, inputFingerprint, turn, "turn_ready", ""); err != nil {
 			_ = conversation.Close()
 			if contextError(ctx) != nil {
@@ -427,6 +414,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			MaxOutputBytes:    program.MaxOutputBytes,
 			CapabilitySummary: attestedInvocation.CLIVersionOutput,
 			LogPath:           os.DevNull,
+			OutputSchema:      submission.outputSchema(),
 		}
 		if turn == 1 {
 			turnRequest.Input = []agent.InputPart{{Type: "text", Text: string(requestDocument)}}
@@ -443,6 +431,10 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			_ = conversation.Close()
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureRuntime), nil
 		}
+		if submission.failure() != "" {
+			_ = conversation.Close()
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, submission.failure()), nil
+		}
 		responseDigest := workflowkit.SHA256Fingerprint([]byte(result.Text))
 		if err := executor.checkpoint(ctx, request, program, inputFingerprint, turn, "turn_completed", string(responseDigest)); err != nil {
 			_ = conversation.Close()
@@ -451,19 +443,20 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			}
 			return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
 		}
-		final = result
+		if accepted, ok := submission.acceptedResult(); ok {
+			if err := conversation.Close(); err != nil {
+				return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
+			}
+			return accepted, nil
+		}
 	}
 	if err := conversation.Close(); err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 	}
-	if len(final.Text) > program.MaxOutputBytes {
-		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureOutput), nil
+	if submission.failure() != "" {
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, submission.failure()), nil
 	}
-	parsed, err := parseStandardAuthoringCodexTurnOutput([]byte(final.Text), request.Stage, len(program.TurnPrompts))
-	if err != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureOutput), nil
-	}
-	return parsed, nil
+	return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexSubmissionFailureAbsent), nil
 }
 
 func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionRequest(invocation StageOperationInvocation, payload workflowadapter.AgentTurnOperationPayload) (StandardAuthoringCodexTurnProgram, string) {
@@ -477,7 +470,8 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionReques
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	expectedAgentTurns, hasAgentTurnQuota := standardAuthoringCodexAgentTurnQuota(request.Stage)
-	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns {
+	expectedSubmissions, hasSubmissionQuota := standardAuthoringCodexOutputSubmissionQuota(request.Stage)
+	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns || !hasSubmissionQuota || expectedSubmissions != workflowadapter.StandardAuthoringOutputSubmissionClaimUnits {
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	if request.Claim.Stage == nil || strings.TrimSpace(string(request.Claim.Stage.StageAttempt.ID)) == "" || request.Checkpoint == nil || request.Charge == nil {
@@ -521,10 +515,18 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) runtimeForEffect(ctx co
 }
 
 func standardAuthoringCodexAgentTurnQuota(stage workflowkit.StageDescriptor) (int64, bool) {
+	return standardAuthoringCodexQuotaClaim(stage, "agent_turn")
+}
+
+func standardAuthoringCodexOutputSubmissionQuota(stage workflowkit.StageDescriptor) (int64, bool) {
+	return standardAuthoringCodexQuotaClaim(stage, standardAuthoringCodexOutputSubmissionQuotaDimension)
+}
+
+func standardAuthoringCodexQuotaClaim(stage workflowkit.StageDescriptor, dimension string) (int64, bool) {
 	var units int64
 	found := false
 	for _, claim := range stage.QuotaClaims {
-		if claim.Dimension != "agent_turn" {
+		if claim.Dimension != dimension {
 			continue
 		}
 		if found || claim.Units <= 0 {
@@ -628,57 +630,6 @@ func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionReq
 		OutputSchemaFingerprint: StandardAuthoringCodexOutputSchemaFingerprint(), StageKey: request.Stage.Key,
 		InputFingerprint: inputFingerprint, Inputs: inputs, Outputs: outputs,
 	})
-}
-
-type standardAuthoringCodexTurnOutput struct {
-	Format    string                                     `json:"format"`
-	Version   string                                     `json:"version"`
-	Verdict   workflowkit.Verdict                        `json:"verdict"`
-	Artifacts []standardAuthoringCodexTurnOutputArtifact `json:"artifacts"`
-}
-
-type standardAuthoringCodexTurnOutputArtifact struct {
-	Name          string `json:"name"`
-	SchemaVersion string `json:"schema_version"`
-	ContentBase64 string `json:"content_base64"`
-}
-
-func parseStandardAuthoringCodexTurnOutput(raw []byte, stage workflowkit.StageDescriptor, turnOrdinal int) (workflowkit.StageExecutionResult, error) {
-	if turnOrdinal < 1 {
-		return workflowkit.StageExecutionResult{}, errors.New("Codex response turn ordinal is invalid")
-	}
-	if len(raw) == 0 || len(raw) > 16<<20 {
-		return workflowkit.StageExecutionResult{}, errors.New("Codex response has invalid size")
-	}
-	if err := rejectDuplicateDeploymentCatalogJSONKeys(raw); err != nil {
-		return workflowkit.StageExecutionResult{}, err
-	}
-	var output standardAuthoringCodexTurnOutput
-	if err := decodeDeploymentCatalogJSON(raw, &output); err != nil {
-		return workflowkit.StageExecutionResult{}, err
-	}
-	if output.Format != StandardAuthoringCodexTurnOutputFormat || output.Version != StandardAuthoringCodexTurnOutputVersion || !stage.Verdicts.Allows(output.Verdict) || len(output.Artifacts) != len(stage.Outputs) {
-		return workflowkit.StageExecutionResult{}, errors.New("Codex response does not match the frozen output contract")
-	}
-	canonical, err := json.Marshal(output)
-	if err != nil || !bytes.Equal(raw, canonical) {
-		return workflowkit.StageExecutionResult{}, errors.New("Codex response is not canonical")
-	}
-	artifacts := make([]workflowkit.StageArtifact, 0, len(output.Artifacts))
-	for index, specification := range stage.Outputs {
-		artifact := output.Artifacts[index]
-		if artifact.Name != specification.Name || artifact.SchemaVersion != specification.SchemaVersion {
-			return workflowkit.StageExecutionResult{}, errors.New("Codex response output identity differs from the frozen stage")
-		}
-		content, err := base64.StdEncoding.DecodeString(artifact.ContentBase64)
-		if err != nil || base64.StdEncoding.EncodeToString(content) != artifact.ContentBase64 {
-			return workflowkit.StageExecutionResult{}, errors.New("Codex response output content is not canonical base64")
-		}
-		artifacts = append(artifacts, workflowkit.StageArtifact{
-			Name: artifact.Name, SchemaVersion: artifact.SchemaVersion, Content: content, TurnOrdinal: turnOrdinal,
-		})
-	}
-	return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: output.Verdict}, Artifacts: artifacts}, nil
 }
 
 func validateStandardAuthoringCodexInvocation(invocation CodexAppServerInvocation) error {

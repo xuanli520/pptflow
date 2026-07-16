@@ -14,12 +14,12 @@
     {
       "stage_key": "repo_analyze",
       "prompt": {"id": "standard-authoring.repo-analyze.prompt", "version": "1.1.0", "relative_path": "prompts/repo-analyze.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "task_design",
       "prompt": {"id": "standard-authoring.task-design.prompt", "version": "1.1.0", "relative_path": "prompts/task-design.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "task_review",
@@ -29,22 +29,22 @@
     {
       "stage_key": "generate_task_files",
       "prompt": {"id": "standard-authoring.generate-task-files.prompt", "version": "1.1.0", "relative_path": "prompts/generate-task-files.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "instruction_generate",
       "prompt": {"id": "standard-authoring.instruction-generate.prompt", "version": "1.0.0", "relative_path": "prompts/instruction-generate.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "task_toml_generate",
       "prompt": {"id": "standard-authoring.task-toml-generate.prompt", "version": "1.0.0", "relative_path": "prompts/task-toml-generate.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "dockerfile_generate",
       "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "1.0.0", "relative_path": "prompts/dockerfile-generate.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "content_review",
@@ -54,17 +54,17 @@
     {
       "stage_key": "solve_generate",
       "prompt": {"id": "standard-authoring.solve-generate.prompt", "version": "1.0.0", "relative_path": "prompts/solve-generate.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "test_generate",
       "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.0.0", "relative_path": "prompts/test-generate.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "tests_analysis",
       "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "1.0.0", "relative_path": "prompts/tests-analysis.json"},
-      "schema": {"id": "standard-authoring.codex-turn-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-turn-output.json"}
+      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "solution_review",

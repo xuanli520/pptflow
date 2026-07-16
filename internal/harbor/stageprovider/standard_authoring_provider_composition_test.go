@@ -202,7 +202,7 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 			CodexAppServer: &codex,
 			StandardAuthoringContract: &StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion,
 				Prompt: StandardAuthoringContractAssetReference{ID: "standard-authoring.repo-analyze.prompt", Version: "1.0.0", RelativePath: "prompts/repo-analyze.json"},
-				Schema: StandardAuthoringContractAssetReference{ID: "standard-authoring.codex-turn-output-schema", Version: "1.0.0", RelativePath: "schemas/codex-turn-output.json"}},
+				Schema: StandardAuthoringContractAssetReference{ID: "standard-authoring.codex-stage-output-schema", Version: "1.0.0", RelativePath: "schemas/codex-stage-output.schema.json"}},
 		}},
 	}
 	return catalog, lock, resolution

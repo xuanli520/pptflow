@@ -21,12 +21,15 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 	const secret = "not-for-durable-logs"
 	now := time.Date(2026, 7, 15, 8, 0, 0, 0, time.UTC)
 	stage := standardAuthoringCodexTestStage(2)
-	finalOutput := standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("sealed analysis"))
+	acceptedCandidate := standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("sealed analysis"))
 	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
 		results: []agent.TurnResult{
 			{Model: CodexAppServerProductionModelID, Text: `{"progress":"internal only"}`},
-			{Model: CodexAppServerProductionModelID, Text: finalOutput},
+			// Free assistant text is deliberately not an output authority. The
+			// accepted candidate below is the only artifact source.
+			{Model: CodexAppServerProductionModelID, Text: `{"verdict":"needs_repair","artifacts":[{"content_base64":"aWdub3JlZCBmcmVlIHRleHQ="}]}`},
 		},
+		submissions: [][]json.RawMessage{nil, {acceptedCandidate}},
 	}}
 	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, 2)
 	request, checkpoints, usages := standardAuthoringCodexTestRequest(stage, []byte(secret), now)
@@ -54,8 +57,16 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 	if open.Model != CodexAppServerProductionModelID || open.ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || open.NetworkAccess || open.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || open.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || open.LogPath != os.DevNull {
 		t.Fatalf("controlled conversation request = %+v", open)
 	}
+	if len(open.DynamicTools) != 1 || open.DynamicTools[0].Name != standardAuthoringCodexSubmitToolName || open.DynamicTools[0].Handler == nil || !json.Valid(open.DynamicTools[0].InputSchema) {
+		t.Fatalf("conversation dynamic tools = %+v, want one valid private submit tool", open.DynamicTools)
+	}
 	if len(runtime.conversation.requests) != 2 || runtime.conversation.requests[0].Model != CodexAppServerProductionModelID || runtime.conversation.requests[0].ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || runtime.conversation.requests[1].ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || len(runtime.conversation.requests[0].Input) != 1 || len(runtime.conversation.requests[1].Input) != 0 {
 		t.Fatalf("turn requests = %+v", runtime.conversation.requests)
+	}
+	for _, turn := range runtime.conversation.requests {
+		if !json.Valid(turn.OutputSchema) {
+			t.Fatalf("turn output schema = %q, want valid stage-derived JSON Schema", turn.OutputSchema)
+		}
 	}
 	firstInput := runtime.conversation.requests[0].Input[0].Text
 	if strings.Contains(firstInput, secret) || !strings.Contains(firstInput, base64.StdEncoding.EncodeToString([]byte(secret))) || !strings.Contains(firstInput, string(program.Fingerprint)) {
@@ -72,13 +83,32 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 			t.Fatalf("checkpoint leaked state or misrepresented resume semantics: %+v", checkpoint)
 		}
 	}
-	if len(*usages) != 2 {
-		t.Fatalf("usage records = %+v, want two consumed agent turns", *usages)
+	if len(*usages) != 3 {
+		t.Fatalf("usage records = %+v, want two agent turns and one output submission", *usages)
 	}
+	agentTurns := 0
+	outputSubmissions := 0
 	for _, usage := range *usages {
-		if usage.Dimension != "agent_turn" || usage.Units != 1 || !strings.HasPrefix(usage.OperationKey, "standard-authoring-codex-usage:sha256:") {
-			t.Fatalf("usage = %+v, want a secret-free frozen agent-turn charge", usage)
+		if usage.Units != 1 || strings.Contains(usage.OperationKey, secret) {
+			t.Fatalf("usage = %+v, want one secret-free usage unit", usage)
 		}
+		switch usage.Dimension {
+		case "agent_turn":
+			agentTurns++
+			if !strings.HasPrefix(usage.OperationKey, "standard-authoring-codex-usage:sha256:") {
+				t.Fatalf("agent-turn usage = %+v, want frozen operation key", usage)
+			}
+		case standardAuthoringCodexOutputSubmissionQuotaDimension:
+			outputSubmissions++
+			if !strings.HasPrefix(usage.OperationKey, "standard-authoring-codex-output-submission:sha256:") {
+				t.Fatalf("output-submission usage = %+v, want frozen operation key", usage)
+			}
+		default:
+			t.Fatalf("unexpected usage dimension: %+v", usage)
+		}
+	}
+	if agentTurns != 2 || outputSubmissions != 1 {
+		t.Fatalf("usage dimensions = agent_turn:%d output_submission:%d, want 2 and 1", agentTurns, outputSubmissions)
 	}
 }
 
@@ -117,11 +147,11 @@ func TestStandardAuthoringCodexAgentTurnExecutorFailsClosedWithoutLeakingProvide
 			wantCode: standardAuthoringCodexFailureCheckpoint,
 		},
 		{
-			name: "malformed final output",
+			name: "free text without tool submission",
 			runtime: &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
-				results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"format":"` + StandardAuthoringCodexTurnOutputFormat + `","secret":"` + secret + `"}`}},
+				results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"secret":"` + secret + `","verdict":"pass"}`}},
 			}},
-			wantCode: standardAuthoringCodexFailureOutput,
+			wantCode: standardAuthoringCodexSubmissionFailureAbsent,
 		},
 	}
 	for _, testCase := range cases {
@@ -182,6 +212,25 @@ func TestStandardAuthoringCodexAgentTurnExecutorRejectsAgentConfigurationAndProm
 	if result.ErrorText != standardAuthoringCodexFailureConfiguration || len(runtime.openRequests) != 0 {
 		t.Fatalf("reasoning effort drift result = %+v opens=%d", result, len(runtime.openRequests))
 	}
+	wrongSubmissionQuota := request
+	wrongSubmissionQuota.Stage = request.Stage.Clone()
+	for index := range wrongSubmissionQuota.Stage.QuotaClaims {
+		if wrongSubmissionQuota.Stage.QuotaClaims[index].Dimension == standardAuthoringCodexOutputSubmissionQuotaDimension {
+			wrongSubmissionQuota.Stage.QuotaClaims[index].Units = workflowadapter.StandardAuthoringOutputSubmissionClaimUnits - 1
+		}
+	}
+	result, err = executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: wrongSubmissionQuota,
+		Resolution: workflowadapter.StageOperationResolution{StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{
+			Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts)),
+		}},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ErrorText != standardAuthoringCodexFailureConfiguration || len(runtime.openRequests) != 0 {
+		t.Fatalf("output-submission quota drift result = %+v opens=%d", result, len(runtime.openRequests))
+	}
 
 	tampered := program
 	tampered.TurnPrompts[0] = "changed after fingerprint"
@@ -205,8 +254,8 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPrepar
 		t.Fatal(err)
 	}
 	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{results: []agent.TurnResult{{
-		Model: CodexAppServerProductionModelID, Text: standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("analysis")),
-	}}}}
+		Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`,
+	}}, submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("analysis"))}}}}
 	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
 		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: root,
 		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
@@ -234,19 +283,6 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPrepar
 	}
 	if runtime.openRequests[0].ProjectPath != workspace || len(runtime.openRequests[0].WorkspaceRoots) != 1 || runtime.openRequests[0].WorkspaceRoots[0] != workspace {
 		t.Fatalf("RunScoped Codex workspace = %+v, want %q", runtime.openRequests[0], workspace)
-	}
-}
-
-func TestParseStandardAuthoringCodexTurnOutputRejectsNoncanonicalOrDuplicateDocuments(t *testing.T) {
-	t.Parallel()
-	stage := standardAuthoringCodexTestStage(1)
-	duplicate := `{"format":"` + StandardAuthoringCodexTurnOutputFormat + `","format":"` + StandardAuthoringCodexTurnOutputFormat + `","version":"1","verdict":"pass","artifacts":[]}`
-	if _, err := parseStandardAuthoringCodexTurnOutput([]byte(duplicate), stage, 1); err == nil {
-		t.Fatal("duplicate-key output was accepted")
-	}
-	canonical := standardAuthoringCodexTestOutput(t, stage, workflowkit.VerdictPass, []byte("analysis"))
-	if _, err := parseStandardAuthoringCodexTurnOutput([]byte(canonical+"\n"), stage, 1); err == nil {
-		t.Fatal("noncanonical output whitespace was accepted")
 	}
 }
 
@@ -306,11 +342,25 @@ func standardAuthoringCodexTestRuntimeFactory(runtime agent.Runtime) StandardAut
 }
 
 func standardAuthoringCodexTestStage(turns int) workflowkit.StageDescriptor {
+	turnTimeout := 5 * time.Second
+	attemptTimeout := time.Duration(turns) * turnTimeout
 	return workflowkit.StageDescriptor{
-		Key: "repo_analyze", Outputs: []workflowkit.ArtifactSpec{{Name: "repo_analysis", SchemaVersion: "harbor.artifact.v1", Required: true}},
-		Budget:      workflowkit.ExecutionBudget{MaxTurns: turns, TurnTimeout: 5 * time.Second},
-		QuotaClaims: []workflowkit.QuotaClaim{{Dimension: "agent_turn", Units: int64(turns), ReclaimPolicy: workflowkit.ReclaimUnused}},
-		Verdicts:    workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass, workflowkit.VerdictNeedsRepair}},
+		Key: "repo_analyze", Version: "1", Plugin: workflowkit.PluginBinding{ID: "harborfactory.repo_analyze", Version: "1"}, Group: "test",
+		Outputs:  []workflowkit.ArtifactSpec{{Name: "repo_analysis", SchemaVersion: "harbor.artifact.v1", Required: true}},
+		ReadSet:  []workflowkit.ResourceKey{"test/input"},
+		WriteSet: []workflowkit.ResourceKey{"test/output"},
+		Effect:   workflowkit.EffectEvidenceOnly, Dispatch: workflowkit.StageDispatchAutomatic,
+		Budget: workflowkit.ExecutionBudget{
+			MaxTurns: turns, TurnTimeout: turnTimeout, AttemptTimeout: attemptTimeout, MaxAttempts: 1, MaxElapsed: attemptTimeout,
+			Backoff: workflowkit.BackoffPolicy{RetryDelays: []time.Duration{}},
+		},
+		QuotaClaims: []workflowkit.QuotaClaim{
+			{Dimension: "agent_turn", Units: int64(turns), ReclaimPolicy: workflowkit.ReclaimUnused},
+			{Dimension: standardAuthoringCodexOutputSubmissionQuotaDimension, Units: workflowadapter.StandardAuthoringOutputSubmissionClaimUnits, ReclaimPolicy: workflowkit.ReclaimUnused},
+		},
+		Retry:    workflowkit.RetryPolicy{},
+		Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass, workflowkit.VerdictNeedsRepair}},
+		Reuse:    workflowkit.ReuseWhenInputsMatch,
 	}
 }
 
@@ -341,19 +391,23 @@ func standardAuthoringCodexTestRequest(stage workflowkit.StageDescriptor, conten
 	return request, &checkpoints, &usages
 }
 
-func standardAuthoringCodexTestOutput(t *testing.T, stage workflowkit.StageDescriptor, verdict workflowkit.Verdict, content []byte) string {
+func standardAuthoringCodexTestCandidate(t *testing.T, verdict workflowkit.Verdict, contents ...[]byte) json.RawMessage {
 	t.Helper()
-	output := standardAuthoringCodexTurnOutput{
-		Format: StandardAuthoringCodexTurnOutputFormat, Version: StandardAuthoringCodexTurnOutputVersion, Verdict: verdict,
-		Artifacts: []standardAuthoringCodexTurnOutputArtifact{{
-			Name: stage.Outputs[0].Name, SchemaVersion: stage.Outputs[0].SchemaVersion, ContentBase64: base64.StdEncoding.EncodeToString(content),
-		}},
+	type candidatePart struct {
+		ContentBase64 string `json:"content_base64"`
 	}
-	encoded, err := json.Marshal(output)
+	candidate := struct {
+		Verdict   workflowkit.Verdict `json:"verdict"`
+		Artifacts []candidatePart     `json:"artifacts"`
+	}{Verdict: verdict, Artifacts: make([]candidatePart, 0, len(contents))}
+	for _, content := range contents {
+		candidate.Artifacts = append(candidate.Artifacts, candidatePart{ContentBase64: base64.StdEncoding.EncodeToString(content)})
+	}
+	encoded, err := json.Marshal(candidate)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(encoded)
+	return json.RawMessage(encoded)
 }
 
 type standardAuthoringCodexRuntimeStub struct {
@@ -370,6 +424,7 @@ func (runtime *standardAuthoringCodexRuntimeStub) OpenConversation(_ context.Con
 	if runtime.conversation == nil {
 		return nil, errors.New("missing test conversation")
 	}
+	runtime.conversation.dynamicTools = append([]agent.DynamicTool(nil), request.DynamicTools...)
 	return runtime.conversation, nil
 }
 
@@ -377,20 +432,50 @@ type standardAuthoringCodexConversationStub struct {
 	requests []agent.TurnRequest
 	results  []agent.TurnResult
 	errors   []error
-	closed   int
-	closeErr error
+	// submissions are invoked in order during each Turn. This makes the test
+	// runtime exercise the same conversation-private DynamicTool handler that
+	// the App Server invokes in production.
+	submissions         [][]json.RawMessage
+	dynamicTools        []agent.DynamicTool
+	submissionResponses []json.RawMessage
+	submissionErrors    []error
+	closed              int
+	closeErr            error
 }
 
-func (conversation *standardAuthoringCodexConversationStub) Turn(_ context.Context, request agent.TurnRequest) (agent.TurnResult, error) {
+func (conversation *standardAuthoringCodexConversationStub) Turn(ctx context.Context, request agent.TurnRequest) (agent.TurnResult, error) {
 	conversation.requests = append(conversation.requests, request)
 	index := len(conversation.requests) - 1
 	if index < len(conversation.errors) && conversation.errors[index] != nil {
 		return agent.TurnResult{}, conversation.errors[index]
 	}
+	if index < len(conversation.submissions) {
+		tool, found := standardAuthoringCodexTestDynamicTool(conversation.dynamicTools, standardAuthoringCodexSubmitToolName)
+		if !found || tool.Handler == nil {
+			return agent.TurnResult{}, errors.New("missing test output submission tool")
+		}
+		for _, candidate := range conversation.submissions[index] {
+			response, err := tool.Handler(ctx, append(json.RawMessage(nil), candidate...))
+			conversation.submissionResponses = append(conversation.submissionResponses, append(json.RawMessage(nil), response...))
+			conversation.submissionErrors = append(conversation.submissionErrors, err)
+			if err != nil {
+				return agent.TurnResult{}, err
+			}
+		}
+	}
 	if index >= len(conversation.results) {
 		return agent.TurnResult{}, errors.New("missing test result")
 	}
 	return conversation.results[index], nil
+}
+
+func standardAuthoringCodexTestDynamicTool(tools []agent.DynamicTool, name string) (agent.DynamicTool, bool) {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return tool, true
+		}
+	}
+	return agent.DynamicTool{}, false
 }
 
 func (conversation *standardAuthoringCodexConversationStub) Close() error {

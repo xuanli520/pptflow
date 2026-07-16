@@ -5,7 +5,10 @@
 // Agent SDK; runtime adapters own process, provider, and sandbox details.
 package agent
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // TokenUsage records provider-reported token consumption for one turn.
 type TokenUsage struct {
@@ -23,6 +26,21 @@ type InputPart struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+// DynamicToolHandler handles one model-requested function invocation. Both
+// arguments and the successful result are JSON values so this port stays
+// independent of a particular provider protocol or product domain.
+type DynamicToolHandler func(context.Context, json.RawMessage) (json.RawMessage, error)
+
+// DynamicTool describes one function available only to a single conversation.
+// InputSchema is a JSON Schema value. Implementations must not retain mutable
+// caller-owned schema bytes beyond opening the conversation.
+type DynamicTool struct {
+	Name        string
+	Description string
+	InputSchema json.RawMessage
+	Handler     DynamicToolHandler
+}
+
 // ConversationRequest fixes the settings shared by every turn in one
 // ephemeral Agent conversation.
 type ConversationRequest struct {
@@ -37,6 +55,7 @@ type ConversationRequest struct {
 	MaxOutputBytes    int
 	CapabilitySummary string
 	LogPath           string
+	DynamicTools      []DynamicTool
 }
 
 // TurnRequest supplies one conversation turn. A runtime may use unset
@@ -55,6 +74,10 @@ type TurnRequest struct {
 	MaxOutputBytes    int
 	CapabilitySummary string
 	LogPath           string
+	// OutputSchema constrains the final assistant message for this turn. It is
+	// a JSON Schema value and is intentionally separate from DynamicTools,
+	// which are fixed when the conversation starts.
+	OutputSchema json.RawMessage
 }
 
 // TurnResult is the durable caller-facing result of one Agent turn.

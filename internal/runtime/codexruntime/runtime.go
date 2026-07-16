@@ -5,6 +5,7 @@ package codexruntime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -107,6 +108,7 @@ func (r Runtime) OpenConversation(ctx context.Context, req agent.ConversationReq
 		NetworkAccess:     req.NetworkAccess,
 		WorkspaceRoots:    workspaceRoots(projectPath, req.WorkspaceRoots),
 		MaxOutputBytes:    maxOutputBytes,
+		DynamicTools:      appServerDynamicTools(req.DynamicTools),
 	}); err != nil {
 		_ = session.Close()
 		return nil, err
@@ -161,6 +163,7 @@ func (c *conversation) turn(ctx context.Context, req agent.TurnRequest, onUpdate
 		Input:          appServerInput(req.Input),
 		LogPath:        logPath,
 		MaxOutputBytes: maxOutputBytes,
+		OutputSchema:   append(json.RawMessage(nil), req.OutputSchema...),
 	}
 	if onUpdate != nil {
 		turnRequest.OnDelta = func(update appserver.Update) {
@@ -185,6 +188,22 @@ func (c *conversation) turn(ctx context.Context, req agent.TurnRequest, onUpdate
 		}
 	}
 	return agent.TurnResult{Text: result.Result.Stdout, Model: c.model, Warnings: warnings}, nil
+}
+
+func appServerDynamicTools(tools []agent.DynamicTool) []appserver.DynamicTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	result := make([]appserver.DynamicTool, 0, len(tools))
+	for _, tool := range tools {
+		result = append(result, appserver.DynamicTool{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: append(json.RawMessage(nil), tool.InputSchema...),
+			Handler:     appserver.DynamicToolHandler(tool.Handler),
+		})
+	}
+	return result
 }
 
 // Steer forwards live caller guidance to the active Codex App Server turn.

@@ -1,6 +1,10 @@
 package appserver
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"testing"
+)
 
 func TestAppServerTurnStartParamsUsesMultimodalInput(t *testing.T) {
 	params := appServerTurnStartParams(Request{
@@ -59,5 +63,41 @@ func TestAppServerClientInfoIsGenericAndConfigurable(t *testing.T) {
 	configured := appServerClientInfo(Request{ClientName: "controlled-standard-flow", ClientVersion: "v2"})
 	if configured["name"] != "controlled-standard-flow" || configured["version"] != "v2" {
 		t.Fatalf("configured client info = %#v", configured)
+	}
+}
+
+func TestAppServerThreadStartParamsRegistersPrivateDynamicFunctionTools(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"candidate":{"type":"string"}},"required":["candidate"]}`)
+	params := appServerThreadStartParams(Request{
+		ProjectPath: "/tmp/project",
+		DynamicTools: []DynamicTool{{
+			Name:        "submit_output",
+			Description: "Submit the verified output.",
+			InputSchema: schema,
+			Handler: func(context.Context, json.RawMessage) (json.RawMessage, error) {
+				return json.RawMessage(`{}`), nil
+			},
+		}},
+	})
+	tools, ok := params["dynamicTools"].([]map[string]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("dynamic tools = %#v", params["dynamicTools"])
+	}
+	tool := tools[0]
+	if tool["type"] != "function" || tool["name"] != "submit_output" || tool["description"] != "Submit the verified output." {
+		t.Fatalf("dynamic tool wire shape = %#v", tool)
+	}
+	wiredSchema, ok := tool["inputSchema"].(json.RawMessage)
+	if !ok || string(wiredSchema) != string(schema) {
+		t.Fatalf("dynamic tool schema = %T %s", tool["inputSchema"], wiredSchema)
+	}
+}
+
+func TestAppServerTurnStartParamsForwardsOutputSchema(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"accepted":{"type":"boolean"}},"required":["accepted"]}`)
+	params := appServerTurnStartParamsWithOutputSchema(Request{ProjectPath: "/tmp/project", Prompt: "submit"}, "thread-1", schema)
+	wiredSchema, ok := params["outputSchema"].(json.RawMessage)
+	if !ok || string(wiredSchema) != string(schema) {
+		t.Fatalf("output schema = %T %s", params["outputSchema"], wiredSchema)
 	}
 }
