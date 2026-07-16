@@ -28,14 +28,12 @@ var (
 	cardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorMuted).
-			Padding(0, 1).
-			MarginBottom(1)
+			Padding(0, 1)
 
 	cardSelectedStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorPrimary).
-				Padding(0, 1).
-				MarginBottom(1)
+				Padding(0, 1)
 
 	cardTitleStyle = lipgloss.NewStyle().
 			Foreground(colorHighlight).
@@ -44,18 +42,6 @@ var (
 	statusRunningStyle = lipgloss.NewStyle().
 				Foreground(colorSuccess).
 				Bold(true)
-
-	statusPendingStyle = lipgloss.NewStyle().
-			Foreground(colorMuted)
-
-	statusDoneStyle = lipgloss.NewStyle().
-			Foreground(colorSuccess)
-
-	statusFailStyle = lipgloss.NewStyle().
-			Foreground(colorDanger)
-
-	labelStyle = lipgloss.NewStyle().
-			Foreground(colorMuted)
 
 	inputStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -66,13 +52,10 @@ var (
 			Foreground(colorMuted)
 
 	detailTitleStyle = lipgloss.NewStyle().
-			Foreground(colorHighlight).
-			Background(colorPrimary).
-			Padding(0, 1).
-			Bold(true)
-
-	errorStyle = lipgloss.NewStyle().
-			Foreground(colorDanger)
+				Foreground(colorHighlight).
+				Background(colorPrimary).
+				Padding(0, 1).
+				Bold(true)
 
 	mutedStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)

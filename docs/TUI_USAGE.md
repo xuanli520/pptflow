@@ -1,59 +1,41 @@
-# Harbor Flow V2 Task Hub 使用指南
+# Harbor Flow Task Board 使用指南
 
-TUI 是 V2 生命周期控制面的视图。它不接收 workspace 路径，不启动旧 Runner，不克隆 workspace，不直接编辑 live task 文件，也不直接删除 workspace。
+TUI 是 V2 生命周期控制面的紧凑看板。它只通过 application service 读取任务和提交已确认的生命周期命令；不会直接访问 SQLite、工作区、快照或 worker。
 
-使用受管控制面根目录启动：
+从受管控制面根目录启动：
 
 ```text
 harbor-factory --root .harbor-factory tui
 ```
 
-根命令不再提供 `--workspace`、`--workspace-root`、`--rescan`、`--task-concurrency` 或 `--auto-approve` 等旧 TUI 参数。持久化生命周期操作使用 `task`、`revision`、`run`、`review`、`release`、`budget` 与 `workspace` 命令组。
+## 看板
 
-## Task Hub
-
-首屏是 Task Hub。它通过 application service 投影不可变的 Task、TaskRevision、WorkflowRun、持久化队列、Review、Repair 与本地 package 事实。workspace 只是可清理的受管执行环境，不是 TUI 选择的生命周期身份。
+首屏按 `待处理`、`运行中`、`已完成` 三列投影 durable Task、Run 和 Review 状态。`failed_recoverable`、`interrupted` 与 `in_doubt` 的 Run 保留在 `待处理`，不会被伪装成已完成。
 
 | 键位 | 作用 |
 | --- | --- |
-| `Tab` / `Right` | 在 `Tasks`、`Runs` 和 `Queue` 标签间前进。 |
-| `Shift+Tab` / `Left` | 切换到上一个标签。 |
-| `Up` / `Down`、`j` / `k` | 在当前标签内移动 Task 或 Run 选择。 |
-| `/` | 过滤 Task Hub 投影；`Enter` 应用，`Esc` 取消。 |
-| `Enter` | 打开只读详情；计划预览存在时进入原生确认表单。 |
-| `Esc` | 取消待输入的前缀、确认表单或当前计划预览；从不提交 mutation。 |
-| `q`、`Ctrl+Q`、`Ctrl+C` | 退出；存在 active durable run 时打开逐 Run 的受控 worker 交接面板，不是取消。 |
+| `Tab` / `Shift+Tab`、`Left` / `Right` | 切换列。 |
+| `Up` / `Down`、`j` / `k` | 选择任务。 |
+| `d` | 查看任务的来源、Run、阶段和审核状态。 |
+| `n` | 创建 Standard 创题任务；仅在当前部署已配置该能力时显示。 |
+| `a` / `r` | 在详情中打开批准或要求修改的审核原因确认输入。 |
+| `Esc` | 关闭当前输入或详情，不提交 mutation。 |
+| `q` / `Ctrl+C` | 从详情返回；在看板中先补发 queued Run 激活，再退出。 |
 
-Queue 标签显示观测到的运行中和排队数量。新的 queued Run 会由本地受控 outbox 激活器立即交接给 child worker；TUI 重开和轮询也会恢复尚未启动的本地 queued Run，不需要退出 Task Hub。后端未暴露容量池时，容量显示为 `未配置`；`0` 不会被解释为已配置的零容量池。
+打开看板和每次轮询都会尝试交接尚未启动的 queued Run 给受控 child worker。没有配置本地 launcher 时，这一步是安全的 no-op；不会改写已持久化的 Run。
 
-退出交接面板会枚举所有 active Run，并默认勾选每个当前可交接的 Run。可用 `Up`/`Down` 选择并用 `Space` 单独取消勾选；没有选中任何 Run 时，`Enter` 会直接退出，不启动任何 worker，也不会出现第二次确认。每个已选 Run 都保留自己的 UUIDv7 操作 ID、幂等键和已观察的 Run checkpoint，由 application service 按项交给受控 child worker。`Esc`、`q` 或 `Ctrl+C` 在面板内返回 Task Hub；它们不会取消 TUI 根 context、任何其他 Run 或 durable job。
+## 创建任务
 
-## 生命周期序列
+按 `n` 后填写 HTTPS/SSH Git URL、完整 40 或 64 位 commit SHA、slug、标题和原因。TUI 将这些事实交给 Standard authoring application service；它负责冻结源码、创建 draft Task、AuthoringSession 和 queued Run。
 
-所有生命周期操作均使用两段式命名空间。第一个键只进入命名空间，在 1.2 秒后或按 `Esc` 失效，绝不改变状态。footer 会显示允许的第二键和服务端给出的禁用原因。
+表单可见时，所有键都只属于表单。输入 `d`、`a`、`r`、方向键或 `Tab` 不会在后台打开详情、移动选择或提交审核。
 
-| 序列 | 请求的计划 |
-| --- | --- |
-| `t n`、`t i` | 新建空 draft Task 或导入完整本地 Task 快照。 |
-| `t s` | 启动受控 Standard 创题：输入 HTTPS URI 或 SSH 地址（`ssh://git@host/...` 或 `git@host:org/repo.git`，不允许嵌入密码）的仓库 URL，与完整的 40/64 位小写 commit；再输入新题目标识、标题和可选元数据。SSH host 必须在当前生产包锁定的 `known_hosts` allow-list 中；需要认证时由启动进程的受管 agent socket 提供。系统捕获该精确源码，创建 revision-free draft Task、AuthoringSession 并排队后立即交接 Standard Run 给受控 worker。Codex/profile、模型和 catalog/lock 不从 TUI 输入。 |
-| `t e`、`t f`、`t a`、`t d`、`t u` | 创建编辑 candidate、Fork、归档、软删除或恢复选中的 Task。 |
-| `x c`、`x n`、`x a` | 继续处理、启动 Run 或 Attach 到 durable Run。 |
-| `x k` | 打开选中 Run 的 Run Control。 |
-| `v a`、`v c`、`v r` | 批准、要求修改或终止性拒绝选中的 Review。 |
-| `p p`、`p w` | 创建受管本地 package 或撤回 release。 |
+## 审核与重试
 
-V2 TUI 向 application layer 请求计划预览，不会在本地推断证据复用、失效范围、TaskRevision 变化、quota 或外部副作用。确认表单必须填写原因，操作员从本机 OS 账户派生，并在表单打开时生成 UUIDv7 幂等键；失败重试保留同一键。TUI 只通过 application service 提交已确认动作，不直接访问 SQLite、受管 snapshot、worker 或 provider。没有已确认服务契约的动作会保持禁用并显示原因。
+详情只对恰好一个 open review 显示可执行操作。按 `a` 或 `r` 后必须填写审核原因并按 `Enter`，服务会根据 review 类型走 AuthoringSession 或 TaskRevision 的正确审核契约。
 
-## Run Control
+每个创建和审核命令都使用 TUI 生成的 UUIDv7 幂等键。请求已经持久化但 worker 激活暂时失败时，保留原表单或审核原因并重试，会复用同一键和原始 durable 回执，而不是创建第二个 Task 或第二个 decision。多个 open review 会显示为不可直接操作，请使用 CLI 选择明确的审核请求。
 
-`Ctrl+X` 或 `x k` 为选中的 Run 打开 Run Control。初始选择为 `返回并保持运行`，因此 `Esc` 与默认路径没有副作用。`P`、`K`、`S` 分别选择暂停、取消选中 Stage 和终止 Run；第一次 `Enter` 请求影响预览，第二次 `Enter` 打开确认表单。仅当 application service 声明完整的控制提交契约时，确认后才创建 `ControlOperation`。
+TUI 在刷新或 mutation 仍在进行时拒绝退出，避免关闭控制面数据库后仍有在途命令访问它。退出前的 queued Run 激活失败时，`q` 会重试；确认没有在途 mutation 后再次按 `Ctrl+C` 可强制退出。成功 mutation 的 durable 摘要会显示在看板中。
 
-overlay 会展示选中 run/stage、最近 checkpoint、durable control 状态、runtime receipt 数量、quota settlement 引用及任何不确定的外部结果。生命周期服务禁用的控制动作会保持禁用并显示原因。
-
-## 鼠标与可访问性
-
-V2 Task Hub 的选择和生命周期命名空间以键盘为权威交互路径。指针输入绝不会从邻近文本推断或执行生命周期 mutation；它只作用于明确渲染且已启用的控件。当投影行或操作没有显式鼠标目标时，请使用上述键盘序列。
-
-## 旧路径切换
-
-以下 V1 路径已明确不可用：manual retry、workspace clone rerun、repair overlay、直接删除 workspace、直接编辑 workspace、`run retry-stage`、`run rerun` 与 `repair start`。历史 workspace UI 材料只作为归档文档保留，不能作为操作指南。
+其他生命周期操作，例如导入、归档、恢复、run control、package、删除和终止性拒绝，继续通过显式 CLI 命令执行。

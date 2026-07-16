@@ -37,16 +37,20 @@ type LifecycleServices struct {
 	// AuthoringReviews owns source/session-bound review gates that exist
 	// before a generated task has its first TaskRevision. It is deliberately
 	// separate from Reviews, whose contract is restricted to TaskRevision.
-	AuthoringReviews   *AuthoringReviewService
-	Releases           *ReleaseService
-	Deletion           *DeletionService
-	Control            *ExecutionControlService
-	Budgets            *BudgetGrantService
-	Continuations      *TaskContinuationService
-	Changes            *ChangeProviderService
-	Repairs            *RepairLoopService
-	Candidates         *CandidateRetentionService
-	Inspection         *LifecycleInspectionService
+	AuthoringReviews *AuthoringReviewService
+	Releases         *ReleaseService
+	Deletion         *DeletionService
+	Control          *ExecutionControlService
+	Budgets          *BudgetGrantService
+	Continuations    *TaskContinuationService
+	Changes          *ChangeProviderService
+	Repairs          *RepairLoopService
+	Candidates       *CandidateRetentionService
+	Inspection       *LifecycleInspectionService
+	// TaskBoard is the compact application boundary consumed by the terminal
+	// task board. It projects durable state and delegates its mutations to the
+	// existing authoring, review, and activation services.
+	TaskBoard          *TaskBoardService
 	CodeEdgeCompliance *CodeEdgeComplianceService
 	LocalRuntime       *LocalRuntimeService
 	WorkerHandoffs     *RunWorkerHandoffService
@@ -243,12 +247,16 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	repairs := newRepairLoopService(core)
 	core.repairs = repairs
 	mutations := newLifecycleMutationService(core)
+	inspection := &LifecycleInspectionService{core: core}
+	authoringReviews := &AuthoringReviewService{core: core}
+	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
+	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations)
 	return &LifecycleServices{
 		Tasks:                     &TaskService{core: core},
 		Revisions:                 &RevisionService{core: core},
 		Runs:                      &RunService{core: core},
 		Reviews:                   &ReviewService{core: core},
-		AuthoringReviews:          &AuthoringReviewService{core: core},
+		AuthoringReviews:          authoringReviews,
 		Releases:                  &ReleaseService{core: core},
 		Deletion:                  &DeletionService{core: core},
 		Control:                   &ExecutionControlService{core: core},
@@ -257,14 +265,15 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		Changes:                   changes,
 		Repairs:                   repairs,
 		Candidates:                &CandidateRetentionService{core: core},
-		Inspection:                &LifecycleInspectionService{core: core},
+		Inspection:                inspection,
+		TaskBoard:                 taskBoard,
 		CodeEdgeCompliance:        &CodeEdgeComplianceService{core: core},
 		LocalRuntime:              &LocalRuntimeService{core: core},
 		WorkerHandoffs:            &RunWorkerHandoffService{core: core},
 		RunActivations:            activations,
 		Mutations:                 mutations,
 		EvaluatorLaunches:         &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider},
-		AuthoringLaunches:         newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider),
+		AuthoringLaunches:         authoringLaunches,
 		StandardAuthoringHandoffs: &StandardAuthoringHandoffService{core: core, definitions: options.CodeEdgePhase1RunDefinitionProvider},
 		EvaluatorEvidenceHandoffs: &CodeEdgeEvaluatorEvidenceHandoffService{core: core},
 		core:                      core,

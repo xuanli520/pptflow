@@ -1,12 +1,16 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
-const taskCardMinHeight = 5
+const (
+	taskCardHeight = 6
+	taskCardGap    = 1
+)
 
 // TaskBoardModel holds the three-column task board state.
 type TaskBoardModel struct {
@@ -15,7 +19,6 @@ type TaskBoardModel struct {
 	completed []TaskItem
 	cursor    int // 0=pending, 1=running, 2=completed
 	selected  int // selected index within current column
-	scroll    [3]int
 }
 
 func NewTaskBoardModel() TaskBoardModel {
@@ -97,9 +100,9 @@ func (m *TaskBoardModel) viewColumns(width, height int) string {
 	runningTitle := formatColTitle("运行中", len(m.running), m.cursor == 1)
 	completedTitle := formatColTitle("已完成", len(m.completed), m.cursor == 2)
 
-	pendingCol := renderColumn(m.pending, colWidth, bodyHeight, m.cursor == 0, m.selected, m.scroll[0])
-	runningCol := renderColumn(m.running, colWidth, bodyHeight, m.cursor == 1, m.selected, m.scroll[1])
-	completedCol := renderColumn(m.completed, colWidth, bodyHeight, m.cursor == 2, m.selected, m.scroll[2])
+	pendingCol := renderColumn(m.pending, colWidth, bodyHeight, m.cursor == 0, m.selected)
+	runningCol := renderColumn(m.running, colWidth, bodyHeight, m.cursor == 1, m.selected)
+	completedCol := renderColumn(m.completed, colWidth, bodyHeight, m.cursor == 2, m.selected)
 
 	separator := mutedStyle.Render("│")
 
@@ -143,52 +146,44 @@ func (m *TaskBoardModel) viewSingle(width, height int) string {
 	}
 	return lipgloss.JoinVertical(lipgloss.Top,
 		lipgloss.JoinHorizontal(lipgloss.Top, titles...),
-		renderColumn(col, width, bodyHeight, true, sel, m.scroll[m.cursor]),
+		renderColumn(col, width, bodyHeight, true, sel),
 	)
 }
 
 func formatColTitle(title string, count int, active bool) string {
-	text := "── " + title + " (" + strings.ReplaceAll(strings.ReplaceAll(
-		strings.ReplaceAll(strings.ReplaceAll(
-			string(rune(count+'0')), "0", "0"), "1", "1"), "2", "2"), "3", "3") + ") ──"
+	text := "── " + title + " (" + strconv.Itoa(count) + ") ──"
 	if active {
 		return columnTitleStyle.Render(text)
 	}
 	return columnTitleMutedStyle.Render(text)
 }
 
-func renderColumn(items []TaskItem, width, bodyHeight int, active bool, selected int, scroll int) string {
+func renderColumn(items []TaskItem, width, bodyHeight int, active bool, selected int) string {
 	if len(items) == 0 {
-		return mutedStyle.Render(strings.Repeat("\n", bodyHeight) + "  暂无题目")
+		return mutedStyle.Render("  暂无题目" + strings.Repeat("\n", max(0, bodyHeight-1)))
 	}
 
-	// Calculate visible range
-	cardsPerScreen := bodyHeight / taskCardMinHeight
+	cardsPerScreen := (bodyHeight + taskCardGap) / (taskCardHeight + taskCardGap)
 	if cardsPerScreen < 1 {
 		cardsPerScreen = 1
 	}
 
-	start := scroll
-	if selected < start {
-		start = selected
-	}
-	if selected >= start+cardsPerScreen {
+	start := 0
+	if active && selected >= cardsPerScreen {
 		start = selected - cardsPerScreen + 1
 	}
 	if start > len(items)-cardsPerScreen {
 		start = max(0, len(items)-cardsPerScreen)
 	}
 
-	var lines []string
-	for i := start; i < len(items) && len(lines) < bodyHeight; i++ {
-		card := renderTaskCard(items[i], width-2, active && i == selected)
-		lines = append(lines, card)
+	cards := make([]string, 0, cardsPerScreen)
+	for i := start; i < len(items) && i < start+cardsPerScreen; i++ {
+		cards = append(cards, renderTaskCard(items[i], max(4, width-2), active && i == selected))
 	}
-
-	// Pad to body height
-	for len(lines) < bodyHeight {
-		lines = append(lines, "")
+	content := strings.Join(cards, "\n")
+	usedHeight := len(cards)*taskCardHeight + max(0, len(cards)-1)*taskCardGap
+	if usedHeight < bodyHeight {
+		content += strings.Repeat("\n", bodyHeight-usedHeight)
 	}
-
-	return strings.Join(lines, "\n")
+	return content
 }

@@ -646,9 +646,18 @@ func TestLifecycleMutationReviewUsesFullCheckpointAndRecoversAfterDecisionCommit
 	if err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := services.Mutations.DecideReview(ctx, crashCommand)
-	if err != nil {
-		t.Fatal(err)
+	recovered, resumed, err := services.Mutations.ResumeReview(ctx, LifecycleMutationCommandBase{
+		IdempotencyKey: crashCommand.IdempotencyKey,
+		Actor:          crashCommand.Actor,
+		Reason:         crashCommand.Reason,
+		Expected: LifecycleMutationCheckpoint{
+			TaskID:          task.ID,
+			RevisionID:      revision.ID,
+			ReviewRequestID: crashReview.ID,
+		},
+	}, crashCommand.Decision)
+	if err != nil || !resumed {
+		t.Fatalf("resume closed review decision = %+v resumed=%t err=%v", recovered, resumed, err)
 	}
 	if recovered.OperationID != op.ID || recovered.ReviewRequestID != crashReview.ID || recovered.ReviewDecisionID != durableDecision.ID || recovered.ReviewDecision != string(crashCommand.Decision) {
 		t.Fatalf("recovered review receipt = %+v, operation=%+v decision=%+v", recovered, op, durableDecision)
@@ -684,6 +693,48 @@ func TestLifecycleMutationReviewUsesFullCheckpointAndRecoversAfterDecisionCommit
 	staleDecisions, err := services.Store().ListReviewDecisionsForRequest(ctx, staleReview.ID)
 	if err != nil || len(staleDecisions) != 1 {
 		t.Fatalf("stale review mutation created another decision: %+v, %v", staleDecisions, err)
+	}
+}
+
+func TestLifecycleMutationResumeReviewRejectsMismatchedTargetBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	_, services := newLifecycleMutationTestServices(t)
+	task, revision := createPackageableLifecycleMutationTask(t, ctx, services)
+	review, err := services.Reviews.Request(ctx, revision.ID, revision.ValidationEvidenceManifest, "tester", "request target mismatch review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := services.Mutations.CaptureReviewCheckpoint(ctx, task.ID, revision.ID, review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DecideReviewLifecycleCommand{
+		LifecycleMutationCommandBase: LifecycleMutationCommandBase{
+			IdempotencyKey: mustLifecycleMutationUUID(t), Actor: "tester", Reason: "resume target mismatch", Expected: checkpoint,
+		},
+		Decision: store.ReviewDecisionApprove,
+	}
+	if _, replay, err := services.Mutations.begin(ctx, LifecycleMutationReview, command.LifecycleMutationCommandBase, command, lifecycleOperationTargets{
+		TaskID: task.ID, RevisionID: revision.ID,
+	}); err != nil || replay != nil {
+		t.Fatalf("prepare review operation: replay=%+v err=%v", replay, err)
+	}
+	_, resumed, err := services.Mutations.ResumeReview(ctx, LifecycleMutationCommandBase{
+		IdempotencyKey: command.IdempotencyKey,
+		Actor:          command.Actor,
+		Reason:         command.Reason,
+		Expected: LifecycleMutationCheckpoint{
+			TaskID:          mustLifecycleMutationUUID(t),
+			RevisionID:      mustLifecycleMutationUUID(t),
+			ReviewRequestID: review.ID,
+		},
+	}, command.Decision)
+	if resumed || !errors.Is(err, store.ErrIdempotencyConflict) {
+		t.Fatalf("resume mismatched target = resumed:%t err:%v", resumed, err)
+	}
+	decisions, err := services.Store().ListReviewDecisionsForRequest(ctx, review.ID)
+	if err != nil || len(decisions) != 0 {
+		t.Fatalf("mismatched resume wrote a review decision: %+v err=%v", decisions, err)
 	}
 }
 

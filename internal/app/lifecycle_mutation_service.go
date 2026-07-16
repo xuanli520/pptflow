@@ -757,6 +757,61 @@ func (service *LifecycleMutationService) DecideReview(ctx context.Context, comma
 	return service.complete(ctx, op, receiptForReviewDecision(op, decision))
 }
 
+// ResumeReview reuses the durable review command identified by base rather
+// than rebuilding its checkpoint from mutable current state. It is the retry
+// path for a caller that lost the response after a review decision committed.
+// The caller must still name the original Task, TaskRevision, and ReviewRequest
+// so a command key can never resume a different review target.
+func (service *LifecycleMutationService) ResumeReview(ctx context.Context, base LifecycleMutationCommandBase, decision store.ReviewDecisionAction) (LifecycleMutationReceipt, bool, error) {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return LifecycleMutationReceipt{}, false, fmt.Errorf("lifecycle mutation service is not configured")
+	}
+	base.IdempotencyKey = strings.TrimSpace(base.IdempotencyKey)
+	base.Actor = strings.TrimSpace(base.Actor)
+	base.Reason = strings.TrimSpace(base.Reason)
+	if err := store.ValidateUUIDv7(base.IdempotencyKey); err != nil {
+		return LifecycleMutationReceipt{}, false, err
+	}
+	if base.Actor == "" || base.Reason == "" {
+		return LifecycleMutationReceipt{}, false, fmt.Errorf("lifecycle mutation actor and reason are required")
+	}
+	switch decision {
+	case store.ReviewDecisionApprove, store.ReviewDecisionRequestChanges, store.ReviewDecisionRejectTerminal:
+	default:
+		return LifecycleMutationReceipt{}, false, fmt.Errorf("invalid review decision action %q", decision)
+	}
+	operation, err := service.core.store.GetLifecycleOperationByIdempotencyKey(ctx, base.IdempotencyKey)
+	if err != nil {
+		return LifecycleMutationReceipt{}, false, err
+	}
+	if operation == nil {
+		return LifecycleMutationReceipt{}, false, nil
+	}
+	if operation.Action != string(LifecycleMutationReview) || operation.Actor != base.Actor || operation.Reason != base.Reason {
+		return LifecycleMutationReceipt{}, false, fmt.Errorf("%w: lifecycle review operation key %s", store.ErrIdempotencyConflict, base.IdempotencyKey)
+	}
+	expected := base.Expected
+	if expected.TaskID == "" || expected.RevisionID == "" || expected.ReviewRequestID == "" {
+		return LifecycleMutationReceipt{}, false, fmt.Errorf("review resume requires Task, TaskRevision, and ReviewRequest identities")
+	}
+	if operation.TaskID != expected.TaskID || operation.RevisionID != expected.RevisionID || operation.ReviewRequestID != expected.ReviewRequestID {
+		return LifecycleMutationReceipt{}, false, fmt.Errorf("%w: lifecycle review operation target does not match retry", store.ErrIdempotencyConflict)
+	}
+	if operation.State == store.LifecycleOperationCompleted {
+		receipt, err := decodeLifecycleMutationReceipt(*operation)
+		return receipt, true, err
+	}
+	if operation.State != store.LifecycleOperationPrepared {
+		return LifecycleMutationReceipt{}, false, fmt.Errorf("%w: lifecycle review operation %s", store.ErrImmutable, operation.ID)
+	}
+	base.Expected = lifecycleCheckpointForOperation(*operation)
+	receipt, err := service.DecideReview(ctx, DecideReviewLifecycleCommand{
+		LifecycleMutationCommandBase: base,
+		Decision:                     decision,
+	})
+	return receipt, true, err
+}
+
 func (service *LifecycleMutationService) PrepareManualPatch(ctx context.Context, command EditLifecycleCommand) (LifecycleMutationReceipt, error) {
 	if command.Expected.TaskID == "" || command.Expected.RevisionID == "" || command.Expected.RunID == "" {
 		return LifecycleMutationReceipt{}, fmt.Errorf("edit requires an explicit Task, revision, and Run checkpoint")
@@ -927,6 +982,28 @@ func (service *LifecycleMutationService) completedOperationReplay(ctx context.Co
 		return LifecycleMutationReceipt{}, false, err
 	}
 	return receipt, true, nil
+}
+
+func lifecycleCheckpointForOperation(operation store.LifecycleOperation) LifecycleMutationCheckpoint {
+	return LifecycleMutationCheckpoint{
+		TaskID:                           operation.ExpectedTaskID,
+		TaskVersion:                      operation.ExpectedTaskVersion,
+		RevisionID:                       operation.ExpectedRevisionID,
+		RevisionStateVersion:             operation.ExpectedRevisionStateVersion,
+		RevisionDigest:                   operation.ExpectedRevisionDigest,
+		RunID:                            operation.ExpectedRunID,
+		RunVersion:                       operation.ExpectedRunVersion,
+		RunExecutionEpoch:                operation.ExpectedRunExecutionEpoch,
+		RunDefinitionHash:                operation.ExpectedRunDefinitionHash,
+		CodeEdgeComplianceRecordID:       operation.ExpectedCodeEdgeComplianceRecordID,
+		CodeEdgeAuthorizationFingerprint: operation.ExpectedCodeEdgeAuthorizationFingerprint,
+		ReleaseID:                        operation.ExpectedReleaseID,
+		ReleaseRecordVersion:             operation.ExpectedReleaseRecordVersion,
+		ReviewRequestID:                  operation.ExpectedReviewRequestID,
+		ReviewRevisionID:                 operation.ExpectedReviewRevisionID,
+		ReviewState:                      operation.ExpectedReviewState,
+		ReviewEvidenceDigest:             operation.ExpectedReviewEvidenceDigest,
+	}
 }
 
 // ReplayCompleted returns an immutable V12 receipt without rereading a

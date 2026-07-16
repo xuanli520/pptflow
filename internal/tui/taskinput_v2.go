@@ -9,14 +9,22 @@ import (
 type TaskSubmitMsg struct {
 	RepoURL   string
 	CommitSHA string
+	Slug      string
+	Title     string
+	Reason    string
 }
 
-// TaskInputModel handles the repo URL and commit SHA input bar.
+// TaskInputModel collects the caller-selected immutable source coordinate and
+// task identity required by the Standard authoring lifecycle command.
 type TaskInputModel struct {
-	repoInput   textinput.Model
-	commitInput textinput.Model
-	focusIndex  int // 0=repo, 1=commit
-	visible     bool
+	repoInput     textinput.Model
+	commitInput   textinput.Model
+	slugInput     textinput.Model
+	titleInput    textinput.Model
+	reasonInput   textinput.Model
+	focusIndex    int
+	visible       bool
+	validationErr string
 }
 
 func NewTaskInputModel() TaskInputModel {
@@ -29,45 +37,94 @@ func NewTaskInputModel() TaskInputModel {
 	commit := textinput.New()
 	commit.Prompt = "SHA "
 	commit.Placeholder = "abc1234..."
-	commit.CharLimit = 40
+	commit.CharLimit = 64
 	commit.Width = 20
 
-	repo.Focus()
+	slug := textinput.New()
+	slug.Prompt = "Slug "
+	slug.Placeholder = "my-task"
+	slug.CharLimit = 80
+	slug.Width = 28
+
+	title := textinput.New()
+	title.Prompt = "Title "
+	title.Placeholder = "Task title"
+	title.CharLimit = 160
+	title.Width = 44
+
+	reason := textinput.New()
+	reason.Prompt = "Reason "
+	reason.Placeholder = "Why this task is being created"
+	reason.CharLimit = 240
+	reason.Width = 44
+
 	return TaskInputModel{
 		repoInput:   repo,
 		commitInput: commit,
-		focusIndex:  0,
-		visible:     true,
+		slugInput:   slug,
+		titleInput:  title,
+		reasonInput: reason,
 	}
 }
 
 func (m *TaskInputModel) Show() {
 	m.visible = true
+	m.validationErr = ""
 	m.repoInput.Focus()
 	m.focusIndex = 0
 	m.commitInput.Blur()
+	m.slugInput.Blur()
+	m.titleInput.Blur()
+	m.reasonInput.Blur()
 }
 
 func (m *TaskInputModel) Hide() {
 	m.visible = false
 	m.repoInput.Blur()
 	m.commitInput.Blur()
+	m.slugInput.Blur()
+	m.titleInput.Blur()
+	m.reasonInput.Blur()
 }
 
-func (m *TaskInputModel) Focused() bool {
-	return m.visible && (m.repoInput.Focused() || m.commitInput.Focused())
+func (m *TaskInputModel) Visible() bool {
+	return m.visible
 }
 
 func (m *TaskInputModel) toggleFocus() {
-	if m.focusIndex == 0 {
+	switch m.focusIndex {
+	case 0:
 		m.repoInput.Blur()
 		m.commitInput.Focus()
 		m.focusIndex = 1
-	} else {
+	case 1:
 		m.commitInput.Blur()
+		m.slugInput.Focus()
+		m.focusIndex = 2
+	case 2:
+		m.slugInput.Blur()
+		m.titleInput.Focus()
+		m.focusIndex = 3
+	case 3:
+		m.titleInput.Blur()
+		m.reasonInput.Focus()
+		m.focusIndex = 4
+	default:
+		m.reasonInput.Blur()
 		m.repoInput.Focus()
 		m.focusIndex = 0
 	}
+}
+
+// Reset clears a successfully submitted form. A failed submission retains all
+// inputs so retrying does not manufacture a second user command.
+func (m *TaskInputModel) Reset() {
+	m.repoInput.SetValue("")
+	m.commitInput.SetValue("")
+	m.slugInput.SetValue("")
+	m.titleInput.SetValue("")
+	m.reasonInput.SetValue("")
+	m.validationErr = ""
 }
 
 func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
@@ -77,46 +134,66 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
-		// Forward non-key messages to both inputs for cursor blink etc.
-		var repoCmd, commitCmd tea.Cmd
+		// Forward non-key messages to every input for cursor blink events.
+		var repoCmd, commitCmd, slugCmd, titleCmd, reasonCmd tea.Cmd
 		m.repoInput, repoCmd = m.repoInput.Update(msg)
 		m.commitInput, commitCmd = m.commitInput.Update(msg)
-		return tea.Batch(repoCmd, commitCmd), false
+		m.slugInput, slugCmd = m.slugInput.Update(msg)
+		m.titleInput, titleCmd = m.titleInput.Update(msg)
+		m.reasonInput, reasonCmd = m.reasonInput.Update(msg)
+		return tea.Batch(repoCmd, commitCmd, slugCmd, titleCmd, reasonCmd), false
 	}
 
 	switch keyMsg.String() {
 	case "enter":
-		repoURL := m.repoInput.Value()
-		commitSHA := m.commitInput.Value()
-		if repoURL != "" && commitSHA != "" {
-			m.repoInput.SetValue("")
-			m.commitInput.SetValue("")
-			return func() tea.Msg { return TaskSubmitMsg{RepoURL: repoURL, CommitSHA: commitSHA} }, true
+		request := TaskSubmitMsg{
+			RepoURL:   m.repoInput.Value(),
+			CommitSHA: m.commitInput.Value(),
+			Slug:      m.slugInput.Value(),
+			Title:     m.titleInput.Value(),
+			Reason:    m.reasonInput.Value(),
 		}
-		return nil, false
+		if request.RepoURL != "" && request.CommitSHA != "" && request.Slug != "" && request.Title != "" && request.Reason != "" {
+			m.validationErr = ""
+			return func() tea.Msg { return request }, true
+		}
+		m.validationErr = "URL, SHA, slug, title, and reason are required"
+		return nil, true
 
 	case "tab":
 		m.toggleFocus()
-		return nil, false
+		return nil, true
 
 	case "esc":
 		m.Hide()
-		return nil, false
+		return nil, true
 	}
 
 	// Forward to focused input
 	var cmd tea.Cmd
 	if m.focusIndex == 0 {
 		m.repoInput, cmd = m.repoInput.Update(msg)
-	} else {
+	} else if m.focusIndex == 1 {
 		m.commitInput, cmd = m.commitInput.Update(msg)
+	} else if m.focusIndex == 2 {
+		m.slugInput, cmd = m.slugInput.Update(msg)
+	} else if m.focusIndex == 3 {
+		m.titleInput, cmd = m.titleInput.Update(msg)
+	} else {
+		m.reasonInput, cmd = m.reasonInput.Update(msg)
 	}
-	return cmd, false
+	return cmd, true
 }
 
 func (m TaskInputModel) View(width int) string {
 	if !m.visible {
 		return ""
 	}
-	return inputStyle.Width(width).Render(m.repoInput.View() + "  " + m.commitInput.View())
+	content := m.repoInput.View() + "  " + m.commitInput.View() + "\n" +
+		m.slugInput.View() + "  " + m.titleInput.View() + "\n" +
+		m.reasonInput.View()
+	if m.validationErr != "" {
+		content += "\n" + failStyleV2.Render(m.validationErr)
+	}
+	return inputStyle.Width(max(1, width)).Render(content)
 }
