@@ -167,6 +167,8 @@ func (prompt *runActionPrompt) View(width int) string {
 	case taskBoardRetryAction:
 		if prompt.strategy == app.TaskBoardRetryStrategyAuthoringRecovery {
 			label = "恢复/重试创题 Run"
+		} else if prompt.strategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
+			label = "修复并继续创题 Run"
 		}
 	case taskBoardCancelAction:
 		label = "取消当前 Run"
@@ -795,6 +797,7 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 		for _, run := range task.Runs {
 			item.Runs = append(item.Runs, TaskRunItem{
 				ID:            run.ID,
+				ParentRunID:   run.ParentRunID,
 				Status:        run.Status,
 				CurrentStage:  run.CurrentStage,
 				FailureStage:  run.FailureStage,

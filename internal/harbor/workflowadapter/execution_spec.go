@@ -375,6 +375,7 @@ const (
 	StageBindingSolveGen                 StageBindingType = "solve_generate"
 	StageBindingTestGen                  StageBindingType = "test_generate"
 	StageBindingTestsAnalysis            StageBindingType = "tests_analysis"
+	StageBindingCodeEdgePackageAdmission StageBindingType = "codeedge_package_admission"
 	StageBindingSolutionReview           StageBindingType = "solution_review"
 	StageBindingMaterializeTask          StageBindingType = "materialize_task"
 	StageBindingTaskRepair               StageBindingType = "task_repair"
@@ -773,12 +774,12 @@ func (spec RunExecutionSpec) validateTemplateExtension() error {
 	if err != nil {
 		return err
 	}
-	if spec.Template.Equal(StandardAuthoringTemplateReference()) {
+	if IsStandardAuthoringWorkflowTemplate(spec.Template) {
 		if selectionKind != RunSelectionAuthoringSession {
 			return fmt.Errorf("%w: Standard authoring execution specification requires an authoring-session selection", errInvalidExecutionSpec)
 		}
 	} else if selectionKind == RunSelectionAuthoringSession {
-		return fmt.Errorf("%w: authoring-session selection is only accepted by Standard authoring template %s@%s", errInvalidExecutionSpec, StandardAuthoringWorkflowTemplateID, StandardAuthoringWorkflowTemplateVersion)
+		return fmt.Errorf("%w: authoring-session selection is only accepted by Standard authoring template versions registered in this binary", errInvalidExecutionSpec)
 	}
 	if spec.Template.Equal(CodeEdgePhase1TemplateReference()) {
 		if spec.CodeEdgeFinalCompliancePolicy == nil {
@@ -919,6 +920,7 @@ var knownStageBindingTypes = map[StageBindingType]bool{
 	StageBindingSolveGen:                 true,
 	StageBindingTestGen:                  true,
 	StageBindingTestsAnalysis:            true,
+	StageBindingCodeEdgePackageAdmission: true,
 	StageBindingSolutionReview:           true,
 	StageBindingMaterializeTask:          true,
 	StageBindingTaskRepair:               true,

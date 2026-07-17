@@ -187,20 +187,6 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 		return nil, err
 	}
 
-	standard, err := newStandardAuthoringProductionComposition(standardAuthoringProductionCompositionConfig{
-		CatalogPath:               config.Paths.StandardCatalog,
-		LockPath:                  config.Paths.StandardLock,
-		ContractRoot:              config.Paths.StandardContractRoot,
-		ManagedRoot:               root,
-		Store:                     dataStore,
-		HarborFlowBuild:           config.StandardBinding.HarborFlowBuild,
-		CatalogReceiptFingerprint: config.StandardBinding.CatalogReceiptFingerprint,
-		LockIdentity:              config.StandardBinding.LockIdentity,
-		LookupEnvironment:         config.LookupEnvironment,
-	})
-	if err != nil {
-		return nil, err
-	}
 	parent, err := newCodeEdgePhase1ProductionComposition(codeEdgePhase1ProductionCompositionConfig{
 		CatalogPath:               config.Paths.ParentCatalog,
 		LockPath:                  config.Paths.ParentLock,
@@ -208,6 +194,15 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 		HarborFlowBuild:           config.CodeEdgePhase1Binding.HarborFlowBuild,
 		CatalogReceiptFingerprint: config.CodeEdgePhase1Binding.CatalogReceiptFingerprint,
 		LockIdentity:              config.CodeEdgePhase1Binding.LockIdentity,
+	})
+	if err != nil {
+		return nil, err
+	}
+	standard, err := newStandardAuthoringProductionComposition(standardAuthoringProductionCompositionConfig{
+		CatalogPath: config.Paths.StandardCatalog, LockPath: config.Paths.StandardLock, ContractRoot: config.Paths.StandardContractRoot,
+		ManagedRoot: root, Store: dataStore, HarborFlowBuild: config.StandardBinding.HarborFlowBuild,
+		CatalogReceiptFingerprint: config.StandardBinding.CatalogReceiptFingerprint, LockIdentity: config.StandardBinding.LockIdentity,
+		LookupEnvironment: config.LookupEnvironment, AdmissionContract: &parent.Admission,
 	})
 	if err != nil {
 		return nil, err
@@ -225,7 +220,7 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 	}
 
 	router, err := stageprovider.NewTemplateWorkflowkitProviderOperationResolver([]stageprovider.TemplateWorkflowkitProviderRegistration{
-		{Template: workflowadapter.StandardAuthoringTemplateReference(), Resolver: standard.Resolver},
+		{Template: standard.CatalogBinding.Template, Resolver: standard.Resolver},
 		{Template: workflowadapter.CodeEdgePhase1TemplateReference(), Resolver: parent.Resolver},
 		{Template: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(), Resolver: evaluator.Resolver},
 	})

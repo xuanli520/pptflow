@@ -134,7 +134,7 @@ func newCommandAuthoringRecoveryFixture(t *testing.T, ctx context.Context) (stri
 		return app.NewLifecycleServicesWithOptions(factoryRoot, dataStore, app.LifecycleServicesOptions{
 			OperationResolver: testsupport.AcceptAllStageOperationResolver(),
 			DeploymentCatalogResolvers: []app.TemplateDeploymentCatalogResolver{{
-				Template: workflowadapter.StandardAuthoringTemplateReference(), Resolver: catalog,
+				Template: catalog.Template(), Resolver: catalog,
 			}},
 			StandardAuthoringSourceCapturer:        capturer,
 			StandardAuthoringRunDefinitionProvider: definitions,

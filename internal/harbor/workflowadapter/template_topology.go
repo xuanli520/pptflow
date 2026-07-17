@@ -59,6 +59,21 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 				return validateStandardAuthoringEnvironmentPolicyContract(stages)
 			},
 		}, nil
+	case reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:                   standardAuthoringCatalogID,
+			catalogVersion:              StandardAuthoringTaskAdmissionTemplateVersion,
+			stageOrder:                  StandardAuthoringTaskAdmissionStageOrder(),
+			groups:                      standardAuthoringStageGroups(),
+			requiresOperatorOnlyPackage: false,
+			gates: []workflowkit.StageKey{
+				workflowkit.StageKey(TaskReview),
+				workflowkit.StageKey(ContentReview),
+				workflowkit.StageKey(SolutionReview),
+			},
+			dependencies:   standardAuthoringTaskAdmissionDependencies(),
+			validateStages: validateStandardAuthoringTaskAdmissionContract,
+		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
 			catalogID:                   codeEdgePhase1CatalogID,
@@ -183,6 +198,37 @@ func validateStandardAuthoringEnvironmentPolicyContract(stages map[workflowkit.S
 		}
 	}
 	return nil
+}
+
+func validateStandardAuthoringTaskAdmissionContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	if err := validateStandardAuthoringEnvironmentPolicyContract(stages); err != nil {
+		return err
+	}
+	admission, present := stages[workflowkit.StageKey(CodeEdgePackageAdmission)]
+	if !present {
+		return fmt.Errorf("%w: task-admission stage is missing", errInvalidCatalog)
+	}
+	if inputs, exact := stageCatalogEnvironmentPolicyInputCounts(admission.Inputs); inputs != 1 || exact != 1 || stageCatalogResourceCount(admission.ReadSet, resourceAuthoringEnvironmentPolicy) != 1 {
+		return fmt.Errorf("%w: task-admission stage must consume the frozen environment policy", errInvalidCatalog)
+	}
+	if !stageHasArtifact(admission.Outputs, "codeedge_package_admission_report", "harbor.standard-authoring-task-package-admission.v1") {
+		return fmt.Errorf("%w: task-admission stage must emit the admission report", errInvalidCatalog)
+	}
+	for _, key := range []workflowkit.StageKey{workflowkit.StageKey(SolutionReview), workflowkit.StageKey(MaterializeTask)} {
+		if !stageHasArtifact(stages[key].Inputs, "codeedge_package_admission_report", "harbor.standard-authoring-task-package-admission.v1") {
+			return fmt.Errorf("%w: stage %q must consume the admission report", errInvalidCatalog, key)
+		}
+	}
+	return nil
+}
+
+func stageHasArtifact(artifacts []workflowkit.ArtifactSpec, name, schemaVersion string) bool {
+	for _, artifact := range artifacts {
+		if artifact.Name == name && artifact.SchemaVersion == schemaVersion && artifact.Required {
+			return true
+		}
+	}
+	return false
 }
 
 func stageCatalogEnvironmentPolicyInputCounts(inputs []workflowkit.ArtifactSpec) (total, exact int) {

@@ -8,13 +8,13 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-// isCurrentStandardAuthoringRun is the sole app-level execution admission
-// predicate for source/session authoring. Historical records can remain
-// inspectable, but a new consolidated-V2 root has no legacy provider lock and
-// must never execute their stage or handoff contracts.
+// isCurrentStandardAuthoringRun admits only source/session template versions
+// compiled into this binary. Historical records remain inspectable but are
+// never executed through an ambient "latest" authoring contract.
 func isCurrentStandardAuthoringRun(run store.WorkflowRun) bool {
-	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
-		run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringWorkflowTemplateVersion
+	return workflowadapter.IsStandardAuthoringWorkflowTemplate(workflowadapter.TemplateReference{
+		ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion,
+	})
 }
 
 // validateCurrentStandardAuthoringFrozenContract proves that an executable
@@ -22,9 +22,9 @@ func isCurrentStandardAuthoringRun(run store.WorkflowRun) bool {
 // template. It rejects a historical descriptor before any provider, artifact,
 // or handoff path can reinterpret it under the current contract.
 func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manifest runManifest, specification workflowadapter.RunExecutionSpec) error {
-	templateReference := workflowadapter.StandardAuthoringTemplateReference()
+	templateReference := workflowadapter.TemplateReference{ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion}
 	if !isCurrentStandardAuthoringRun(run) {
-		return fmt.Errorf("Standard authoring Run %s requires current template %s@%s", run.ID, templateReference.ID, templateReference.Version)
+		return fmt.Errorf("Standard authoring Run %s requires a registered source/session template", run.ID)
 	}
 	if !manifest.Resolved.Template.Equal(templateReference) || manifest.Resolved.TemplateID != templateReference.ID ||
 		manifest.Resolved.TemplateVersion != templateReference.Version || !specification.Template.Equal(templateReference) ||

@@ -55,9 +55,9 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if request.ExecutionEpoch < 0 {
 		return store.WorkflowRun{}, fmt.Errorf("execution epoch cannot be negative")
 	}
-	if !request.Profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) ||
-		!request.ExecutionSpec.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return store.WorkflowRun{}, fmt.Errorf("authoring Run requires %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(request.Profile.Template) ||
+		!request.ExecutionSpec.Template.Equal(request.Profile.Template) {
+		return store.WorkflowRun{}, fmt.Errorf("authoring Run requires one installed Standard authoring template")
 	}
 	if _, err := resolveFrozenRunTemplate(request.Profile, request.ExecutionSpec); err != nil {
 		return store.WorkflowRun{}, err
@@ -79,7 +79,7 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if source == nil {
 		return store.WorkflowRun{}, fmt.Errorf("%w: authoring source %s", ErrLifecycleNotFound, session.SourceID)
 	}
-	if session.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID || session.WorkflowTemplateVersion != workflowadapter.StandardAuthoringWorkflowTemplateVersion {
+	if session.WorkflowTemplateID != request.Profile.Template.ID || session.WorkflowTemplateVersion != request.Profile.Template.Version {
 		return store.WorkflowRun{}, fmt.Errorf("authoring session template does not match the closed Standard authoring template")
 	}
 	if err := validateAuthoringRunExecutionSpec(request.ExecutionSpec, *source, *session, service.core.operationResolver, service.core); err != nil {

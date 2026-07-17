@@ -19,6 +19,7 @@ const (
 	SolveGen                 = "solve_generate"
 	TestGen                  = "test_generate"
 	TestsAnalysis            = "tests_analysis"
+	CodeEdgePackageAdmission = "codeedge_package_admission"
 	SolutionReview           = "solution_review"
 	MaterializeTask          = "materialize_task"
 	TaskRepair               = "task_repair"

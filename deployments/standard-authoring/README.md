@@ -1,7 +1,7 @@
 # Standard Authoring Deployment Contract
 
 This directory is the source-controlled deployment input for the closed
-`harbor.standard-authoring@1.2.0` workflow. It creates a first task from an
+`harbor.standard-authoring@1.3.0` workflow. It creates a first task from an
 immutable `AuthoringSource` / `AuthoringSession`; it does not pretend that the
 source session is already a `TaskRevision`.
 
@@ -40,6 +40,14 @@ or rotations require a reviewed `ssh/known_hosts` change, a new Standard lock,
 and a new package; `accept-new`, wildcard, hashed, and ambient host-key entries
 are not supported.
 
+`codeedge_package_admission` compiles the six generated artifacts into the
+canonical task layout, derives provenance from the immutable source, renders
+the typed tests analysis as required Markdown, and applies the lock-pinned
+CodeEdge validation profile. A deterministic content violation becomes
+`completed/needs_repair` before final review; it cannot materialize a task or
+launch a child Run. `materialize_task` repeats the same admission check before
+its atomic commit boundary.
+
 `materialize_task` is the sole Go-controlled operation allowed to atomically
 create the first Task and TaskRevision. It emits
 `authoring_task_handoff` (`harbor.authoring-task-handoff.v1`) and terminates
@@ -51,7 +59,7 @@ handoff, compliance, and local packaging.
 
 The required frozen environment policy and the bounded 30-turn `task_design`
 program are execution-contract changes, so they belong to
-`harbor.standard-authoring@1.2.0`, not to a reinterpretation of a historical
+`harbor.standard-authoring@1.3.0`, not to a reinterpretation of a historical
 `@1.0.0` or `@1.1.0` Run. The consolidated V2 store intentionally does not
 migrate its physical schema in place; install this release with a new managed
 control-plane root. Existing records remain immutable audit history and must
@@ -83,9 +91,10 @@ may choose another validated digest without changing a historical Run.
 
 ## Source-controlled inputs
 
-- `operation-catalog.v1.json` is the exact 14-stage allow-list. It contains
+- `operation-catalog.v1.json` is the exact 15-stage allow-list. It contains
   only generic Git snapshot preparation, locked Codex App Server turns,
-  durable review gates, and the `materialize_task` Harbor built-in.
+  durable review gates, and the `codeedge_package_admission` and
+  `materialize_task` Harbor built-ins.
 - `contract-assets.v1.json` maps every closed stage to a canonical prompt and
   schema path. It has exact stage coverage and no path-discovery convention.
 - `prompts/` and `schemas/` contain immutable handler contracts. Codex prompt

@@ -3,7 +3,7 @@
   "version": "1",
   "template": {
     "id": "harbor.standard-authoring",
-    "version": "1.2.0"
+    "version": "1.3.0"
   },
   "operations": [
     {
@@ -38,12 +38,12 @@
     },
     {
       "stage_key": "task_toml_generate",
-      "prompt": {"id": "standard-authoring.task-toml-generate.prompt", "version": "1.0.0", "relative_path": "prompts/task-toml-generate.json"},
+      "prompt": {"id": "standard-authoring.task-toml-generate.prompt", "version": "1.1.0", "relative_path": "prompts/task-toml-generate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "dockerfile_generate",
-      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "1.3.0", "relative_path": "prompts/dockerfile-generate.json"},
+      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "1.4.0", "relative_path": "prompts/dockerfile-generate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
@@ -63,8 +63,13 @@
     },
     {
       "stage_key": "tests_analysis",
-      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "1.0.0", "relative_path": "prompts/tests-analysis.json"},
+      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "1.1.0", "relative_path": "prompts/tests-analysis.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
+    },
+    {
+      "stage_key": "codeedge_package_admission",
+      "prompt": {"id": "standard-authoring.codeedge-package-admission.prompt", "version": "1.0.0", "relative_path": "prompts/codeedge-package-admission.md"},
+      "schema": {"id": "standard-authoring.codeedge-package-admission-report-schema", "version": "1.0.0", "relative_path": "schemas/codeedge-package-admission-report.json"}
     },
     {
       "stage_key": "solution_review",

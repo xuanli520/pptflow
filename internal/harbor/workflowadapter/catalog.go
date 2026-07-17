@@ -784,6 +784,7 @@ const (
 	// its immutable receipt; it must never keep executing under the source
 	// session subject after this write.
 	resourceAuthoringTaskHandoff         workflowkit.ResourceKey = "authoring/task-handoff"
+	resourceAuthoringTaskAdmission       workflowkit.ResourceKey = "authoring/task-admission"
 	resourceTaskWildcard                 workflowkit.ResourceKey = "task/**"
 	resourceFindingWildcard              workflowkit.ResourceKey = "finding/**"
 	resourceReviewTaskDirection          workflowkit.ResourceKey = "review/task-direction"

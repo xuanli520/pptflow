@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 // TaskBoardColumn is the coarse workflow state exposed to an operator-facing
@@ -66,6 +67,7 @@ type TaskBoardTask struct {
 // filesystem capability to the terminal adapter.
 type TaskBoardRun struct {
 	ID            string
+	ParentRunID   string
 	Status        string
 	CurrentStage  string
 	FailureStage  string
@@ -87,9 +89,10 @@ type TaskBoardRun struct {
 type TaskBoardRetryStrategy string
 
 const (
-	TaskBoardRetryStrategyNone              TaskBoardRetryStrategy = ""
-	TaskBoardRetryStrategyTaskContinuation  TaskBoardRetryStrategy = "task_continuation"
-	TaskBoardRetryStrategyAuthoringRecovery TaskBoardRetryStrategy = "authoring_recovery"
+	TaskBoardRetryStrategyNone                     TaskBoardRetryStrategy = ""
+	TaskBoardRetryStrategyTaskContinuation         TaskBoardRetryStrategy = "task_continuation"
+	TaskBoardRetryStrategyAuthoringRecovery        TaskBoardRetryStrategy = "authoring_recovery"
+	TaskBoardRetryStrategyAuthoringAdmissionRepair TaskBoardRetryStrategy = "authoring_admission_repair"
 )
 
 // TaskBoardLog is a bounded read of a worker log selected through a Run's
@@ -728,6 +731,7 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 	logPath := taskBoardLogPath(handoffs)
 	run := TaskBoardRun{
 		ID:           inspected.Run.ID,
+		ParentRunID:  inspected.Run.ParentRunID,
 		Status:       string(inspected.Run.Status),
 		CurrentStage: taskBoardCurrentStage(inspected.Stages),
 		CreatedAt:    inspected.Run.CreatedAt,
@@ -741,7 +745,13 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 		run.FailureReason = taskBoardHandoffFailure(handoffs)
 	}
 	run.RetryStrategy = taskBoardRetryStrategy(inspected.Run)
-	if run.RetryStrategy == TaskBoardRetryStrategyAuthoringRecovery {
+	if inspected.Run.SubjectKind == store.WorkflowRunSubjectTaskRevision && inspected.Run.Status == store.WorkflowRunWaitingContinuation && taskBoardHasNeedsRepair(inspected.Stages) {
+		run.RetryStrategy = TaskBoardRetryStrategyNone
+		run.CanRetry = false
+		run.RetryReason = "不可变 CodeEdge 子 Run 存在确定性内容问题；请创建修复 revision"
+		return run
+	}
+	if run.RetryStrategy == TaskBoardRetryStrategyAuthoringRecovery || run.RetryStrategy == TaskBoardRetryStrategyAuthoringAdmissionRepair {
 		if service == nil || service.authoringRecovery == nil {
 			run.RetryReason = "Standard 创题恢复服务未配置"
 			return run
@@ -758,11 +768,23 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 	return run
 }
 
+func taskBoardHasNeedsRepair(stages []store.StageAttempt) bool {
+	for _, stage := range stages {
+		if stage.ExecutionStatus == store.StageExecutionCompleted && stage.Verdict == store.VerdictNeedsRepair {
+			return true
+		}
+	}
+	return false
+}
+
 func taskBoardRetryStrategy(run store.WorkflowRun) TaskBoardRetryStrategy {
 	switch run.SubjectKind {
 	case store.WorkflowRunSubjectTaskRevision:
 		return TaskBoardRetryStrategyTaskContinuation
 	case store.WorkflowRunSubjectAuthoringSession:
+		if run.Status == store.WorkflowRunWaitingContinuation && run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion {
+			return TaskBoardRetryStrategyAuthoringAdmissionRepair
+		}
 		return TaskBoardRetryStrategyAuthoringRecovery
 	default:
 		return TaskBoardRetryStrategyNone

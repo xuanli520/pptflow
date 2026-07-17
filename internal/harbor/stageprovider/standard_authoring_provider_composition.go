@@ -72,8 +72,8 @@ func NewStandardAuthoringProviderComposition(config StandardAuthoringProviderCom
 	if err := config.Template.Validate(); err != nil {
 		return nil, fmt.Errorf("validate Standard authoring template: %w", err)
 	}
-	if !config.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return nil, fmt.Errorf("%w: Standard authoring composition requires template %s@%s", ErrDeploymentOperationCatalogDrift, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(config.Template) {
+		return nil, fmt.Errorf("%w: Standard authoring composition requires an installed Standard authoring template", ErrDeploymentOperationCatalogDrift)
 	}
 	if config.Catalog == nil {
 		return nil, ErrDeploymentOperationCatalogUnavailable

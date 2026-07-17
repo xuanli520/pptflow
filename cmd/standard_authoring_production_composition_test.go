@@ -50,7 +50,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 		t.Fatalf("construct Standard authoring production composition: %v", err)
 	}
 	if composition == nil || composition.Resolver == nil || composition.SourceCapturer == nil || composition.Definitions == nil ||
-		!composition.CatalogBinding.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+		!composition.CatalogBinding.Template.Equal(catalog.Template()) {
 		t.Fatalf("incomplete Standard authoring composition: %+v", composition)
 	}
 	if composition.CatalogBinding.Resolver != composition.Resolver {
@@ -91,7 +91,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	if definitionProfileFingerprint != lockedProfileFingerprint {
 		t.Fatal("Standard authoring definition did not use the execution profile frozen in the deployment lock")
 	}
-	for _, stageKey := range workflowadapter.StandardAuthoringStageOrder() {
+	for _, stageKey := range workflowadapter.StandardAuthoringTaskAdmissionStageOrder() {
 		resolution, err := definition.ExecutionSpec.ResolveStageOperation(stageKey)
 		if err != nil {
 			t.Fatal(err)
@@ -100,7 +100,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 			t.Fatalf("locked Standard stage %q is not resolved by its composition: %v", stageKey, err)
 		}
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTaskAdmissionTemplateReference()) {
 		t.Fatalf("test catalog template = %+v", catalog.Template())
 	}
 }
@@ -181,7 +181,7 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 		Format: stageprovider.DeploymentOperationCatalogLockFormat, Version: stageprovider.DeploymentOperationCatalogLockVersion,
 		LockID: "standard-authoring-composition-test", LockVersion: "1.0.0", CatalogReceipt: catalog.Receipt(),
 		HarborFlowBuild:                   stageprovider.HarborFlowBuildIdentity{Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("standard-authoring-composition-test"))},
-		StandardAuthoringExecutionProfile: &stageprovider.StandardAuthoringExecutionProfileLock{Profile: standardAuthoringProductionTestProfile(t)},
+		StandardAuthoringExecutionProfile: &stageprovider.StandardAuthoringExecutionProfileLock{Profile: standardAuthoringProductionTestProfile(t, catalog.Template())},
 		StandardAuthoringSSHTransport:     standardAuthoringProductionTestSSHTransport(t, deploymentRoot),
 		Operations:                        operations,
 	}
@@ -195,9 +195,12 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 	return deploymentRoot, catalog, lock
 }
 
-func standardAuthoringProductionTestProfile(t *testing.T) workflowadapter.ExecutionProfile {
+func standardAuthoringProductionTestProfile(t *testing.T, reference workflowadapter.TemplateReference) workflowadapter.ExecutionProfile {
 	t.Helper()
-	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	template, err := workflowadapter.ResolveWorkflowTemplate(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
 	profile := workflowadapter.ExecutionProfile{
 		Template: template.Reference(), ID: "standard-authoring-composition-test", Version: "1.0.0",
 		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ControlGracePeriod: 30 * time.Second,

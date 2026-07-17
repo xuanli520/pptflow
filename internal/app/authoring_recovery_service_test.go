@@ -270,6 +270,30 @@ func TestAuthoringRecoveryRevalidatesTargetsAfterCommandPersistence(t *testing.T
 	}
 }
 
+func TestAuthoringAdmissionRecoveryRegeneratesOnlyIndependentPackageProducers(t *testing.T) {
+	template := workflowadapter.StandardAuthoringTaskAdmissionWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
+		workflowkit.NodeID(workflowadapter.CodeEdgePackageAdmission): {
+			ID: "admission-attempt", StageKey: workflowadapter.CodeEdgePackageAdmission,
+			ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair,
+		},
+	}}
+	targets, failures, err := authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []workflowkit.NodeID{
+		workflowkit.NodeID(workflowadapter.TaskTOMLGen), workflowkit.NodeID(workflowadapter.DockerfileGen), workflowkit.NodeID(workflowadapter.TestsAnalysis),
+	}
+	if !reflect.DeepEqual(targets, want) || !reflect.DeepEqual(failures, []string{"admission-attempt"}) {
+		t.Fatalf("admission recovery targets=%+v failures=%+v", targets, failures)
+	}
+}
+
 func TestAuthoringRecoveryReusesVerifiedSourceSessionArtifacts(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)

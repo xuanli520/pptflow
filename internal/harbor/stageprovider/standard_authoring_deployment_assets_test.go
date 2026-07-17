@@ -24,7 +24,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("resolve Standard authoring catalog: %v", err)
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTaskAdmissionTemplateReference()) {
 		t.Fatalf("catalog template = %s@%s, want Standard authoring", catalog.Template().ID, catalog.Template().Version)
 	}
 	profileRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "execution-profile.v1.json"))
@@ -35,7 +35,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("parse Standard authoring execution profile: %v", err)
 	}
-	compiled, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	compiled, err := workflowadapter.StandardAuthoringTaskAdmissionWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatalf("compile Standard authoring execution profile: %v", err)
 	}
@@ -48,8 +48,8 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("parse Standard authoring asset manifest: %v", err)
 	}
-	if len(catalog.Catalog().Operations) != len(manifest.Operations) || len(manifest.Operations) != len(workflowadapter.StandardAuthoringStageOrder()) {
-		t.Fatalf("catalog/manifest operation coverage = %d/%d, want %d", len(catalog.Catalog().Operations), len(manifest.Operations), len(workflowadapter.StandardAuthoringStageOrder()))
+	if len(catalog.Catalog().Operations) != len(manifest.Operations) || len(manifest.Operations) != len(workflowadapter.StandardAuthoringTaskAdmissionStageOrder()) {
+		t.Fatalf("catalog/manifest operation coverage = %d/%d, want %d", len(catalog.Catalog().Operations), len(manifest.Operations), len(workflowadapter.StandardAuthoringTaskAdmissionStageOrder()))
 	}
 
 	byStage := make(map[string]StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))

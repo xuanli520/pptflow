@@ -214,7 +214,7 @@ func (attestor *StandardAuthoringRuntimeAttestor) validateBase(ctx context.Conte
 // attestation entry point too, so a handler cannot bypass drift detection by
 // using the secret-free invocation helper rather than the generic wrapper.
 func (attestor *StandardAuthoringRuntimeAttestor) attestStandardAuthoringContract(ctx context.Context, attestation DeploymentOperationRuntimeAttestation) error {
-	if !attestation.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(attestation.CatalogReceipt.Template) {
 		if attestation.Record.StandardAuthoringContract != nil {
 			return fmt.Errorf("%w: Standard authoring contract is bound to a different template", ErrDeploymentOperationRuntimeAttestationFailed)
 		}
@@ -265,7 +265,7 @@ func (attestor *StandardAuthoringRuntimeAttestor) ReadStandardAuthoringContractA
 	if err := attestor.validateBase(ctx, attestation); err != nil {
 		return StandardAuthoringContractAssets{}, err
 	}
-	if !attestation.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(attestation.CatalogReceipt.Template) {
 		return StandardAuthoringContractAssets{}, fmt.Errorf("%w: operation is not bound to the Standard authoring template", ErrDeploymentOperationRuntimeAttestationUnavailable)
 	}
 	if attestation.Record.StandardAuthoringContract == nil {

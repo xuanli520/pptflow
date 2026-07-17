@@ -352,6 +352,10 @@ func validateCodeEdgePhase1HandoffDefinition(definition CodeEdgePhase1RunDefinit
 // particular, a caller cannot pass JSON copied from a mutable workspace or a
 // similarly named artifact from another Run/attempt.
 func (service *StandardAuthoringHandoffService) readPersistedHandoff(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, request StandardAuthoringHandoffRequest) (workflowadapter.StandardAuthoringTaskHandoff, workflowadapter.ArtifactReference, error) {
+	expectedSchema, err := workflowadapter.StandardAuthoringTaskHandoffSchemaForTemplate(workflowadapter.TemplateReference{ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion})
+	if err != nil {
+		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
 	attempt, err := service.core.store.GetStageAttempt(ctx, request.StageAttemptID)
 	if err != nil {
 		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
@@ -367,8 +371,7 @@ func (service *StandardAuthoringHandoffService) readPersistedHandoff(ctx context
 	}
 	if reference == nil || reference.ManifestID != attempt.ArtifactManifestID || reference.RunID != run.ID ||
 		reference.StageKey != workflowadapter.MaterializeTask || reference.AttemptID != attempt.ID ||
-		reference.ArtifactKey != workflowadapter.StandardAuthoringTaskHandoffArtifact ||
-		reference.SchemaVersion != workflowadapter.StandardAuthoringTaskHandoffSchemaVersion {
+		reference.ArtifactKey != workflowadapter.StandardAuthoringTaskHandoffArtifact || reference.SchemaVersion != expectedSchema {
 		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("Standard authoring handoff artifact does not match frozen materialize_task lineage")
 	}
 	index, err := loadStageArtifactManifestIndex(ctx, service.core.store, reference.ManifestID)
@@ -390,6 +393,13 @@ func (service *StandardAuthoringHandoffService) readPersistedHandoff(ctx context
 	handoff, err := workflowadapter.ParseStandardAuthoringTaskHandoffJSON(raw)
 	if err != nil {
 		return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, err
+	}
+	if handoff.AdmissionReceipt != nil {
+		admission, admissionErr := service.core.store.GetArtifactRef(ctx, string(handoff.AdmissionReceipt.ID))
+		if admissionErr != nil || admission == nil || admission.RunID != run.ID || admission.StageKey != workflowadapter.CodeEdgePackageAdmission ||
+			admission.ContentDigest != string(handoff.AdmissionReceipt.ContentDigest) || admission.SchemaVersion != handoff.AdmissionReceipt.SchemaVersion {
+			return workflowadapter.StandardAuthoringTaskHandoff{}, workflowadapter.ArtifactReference{}, fmt.Errorf("Standard authoring handoff admission receipt is not persisted")
+		}
 	}
 
 	references, err := service.core.store.ListArtifactRefs(ctx, reference.ManifestID)

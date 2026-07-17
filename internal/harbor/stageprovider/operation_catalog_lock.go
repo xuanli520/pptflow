@@ -240,8 +240,8 @@ func (profile StandardAuthoringExecutionProfileLock) Clone() StandardAuthoringEx
 // Validate proves that the profile is complete for exactly the closed Standard
 // authoring template.
 func (profile StandardAuthoringExecutionProfileLock) Validate() error {
-	if !profile.Profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return fmt.Errorf("%w: Standard authoring execution profile must bind %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(profile.Profile.Template) {
+		return fmt.Errorf("%w: Standard authoring execution profile must bind an installed Standard authoring template", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	if err := profile.Profile.Validate(); err != nil {
 		return fmt.Errorf("%w: Standard authoring execution profile: %v", ErrInvalidDeploymentOperationCatalogLock, err)
@@ -946,7 +946,7 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 	if err := lock.HarborFlowBuild.Validate(); err != nil {
 		return err
 	}
-	if lock.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template) {
 		if lock.StandardAuthoringExecutionProfile == nil {
 			return fmt.Errorf("%w: Standard authoring execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
 		}
@@ -960,7 +960,7 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 			return err
 		}
 	} else if lock.StandardAuthoringExecutionProfile != nil || lock.StandardAuthoringSSHTransport != nil {
-		return fmt.Errorf("%w: Standard authoring execution profile and SSH transport are only valid for %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+		return fmt.Errorf("%w: Standard authoring execution profile and SSH transport are only valid for installed Standard authoring templates", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	if lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
 		if !lock.CatalogReceipt.Template.Equal(workflowadapter.CodeEdgeEvaluatorChildTemplateReference()) {
@@ -1013,7 +1013,7 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 // execution envelope. A missing value is a hard deployment error: no CLI,
 // handoff, or production composition may provide a substitute budget policy.
 func (lock DeploymentOperationCatalogLock) StandardAuthoringProfile() (workflowadapter.ExecutionProfile, error) {
-	if !lock.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template) {
 		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: Standard authoring profile requires the Standard authoring template", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	if lock.StandardAuthoringExecutionProfile == nil {
@@ -1026,7 +1026,7 @@ func (lock DeploymentOperationCatalogLock) StandardAuthoringProfile() (workflowa
 // capability. It is intentionally distinct from stage operation locks because
 // Git source acquisition occurs before a Run has a stage attempt.
 func (lock DeploymentOperationCatalogLock) StandardAuthoringSSHTransportLock() (StandardAuthoringSSHTransportLock, error) {
-	if !lock.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template) {
 		return StandardAuthoringSSHTransportLock{}, fmt.Errorf("%w: Standard authoring SSH transport requires the Standard authoring template", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	if lock.StandardAuthoringSSHTransport == nil {

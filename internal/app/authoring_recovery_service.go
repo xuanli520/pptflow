@@ -441,6 +441,10 @@ func (service *AuthoringRecoveryService) ensureRecoverableBinding(ctx context.Co
 	}
 	switch binding.run.Status {
 	case store.WorkflowRunFailedRecoverable, store.WorkflowRunPaused:
+	case store.WorkflowRunWaitingContinuation:
+		if binding.run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion {
+			return fmt.Errorf("%w: legacy authoring admission failures require an explicit new task revision", ErrAuthoringRecoveryUnavailable)
+		}
 	default:
 		return fmt.Errorf("%w: workflow run %s is %s", ErrAuthoringRecoveryUnavailable, binding.run.ID, binding.run.Status)
 	}
@@ -589,6 +593,21 @@ func matchAuthoringRecoveryIntent(request normalizedAuthoringRecoveryCommand, pe
 }
 
 func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState) ([]workflowkit.NodeID, []string, error) {
+	if run.Status == store.WorkflowRunWaitingContinuation {
+		admission := workflowkit.NodeID(workflowadapter.CodeEdgePackageAdmission)
+		latest, present := state.Latest[admission]
+		if !present || latest.ExecutionStatus != store.StageExecutionCompleted || latest.Verdict != store.VerdictNeedsRepair {
+			return nil, nil, fmt.Errorf("%w: waiting authoring Run has no admission needs_repair result", ErrAuthoringRecoveryUnavailable)
+		}
+		// These are the only independent producers of the deterministic admission
+		// findings. Their descendants, including admission and review, are
+		// invalidated by the normal frozen DAG planner.
+		return []workflowkit.NodeID{
+			workflowkit.NodeID(workflowadapter.TaskTOMLGen),
+			workflowkit.NodeID(workflowadapter.DockerfileGen),
+			workflowkit.NodeID(workflowadapter.TestsAnalysis),
+		}, []string{latest.ID}, nil
+	}
 	order, err := workflow.TopologicalStages()
 	if err != nil {
 		return nil, nil, err

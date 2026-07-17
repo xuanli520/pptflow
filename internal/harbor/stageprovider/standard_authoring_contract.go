@@ -125,14 +125,18 @@ func (manifest StandardAuthoringContractAssetManifest) Validate() error {
 	if err := manifest.Template.Validate(); err != nil {
 		return fmt.Errorf("%w: Standard authoring contract asset manifest template: %v", ErrInvalidDeploymentOperationCatalogLock, err)
 	}
-	if !manifest.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return fmt.Errorf("%w: Standard authoring contract asset manifest must bind %s@%s", ErrInvalidDeploymentOperationCatalogLock, workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(manifest.Template) {
+		return fmt.Errorf("%w: Standard authoring contract asset manifest must bind an installed Standard authoring template", ErrInvalidDeploymentOperationCatalogLock)
 	}
 	if manifest.Operations == nil {
 		return fmt.Errorf("%w: Standard authoring contract asset manifest operations must be an explicit array", ErrInvalidDeploymentOperationCatalogLock)
 	}
-	expected := make(map[workflowkit.StageKey]struct{}, len(workflowadapter.StandardAuthoringStageOrder()))
-	for _, stageKey := range workflowadapter.StandardAuthoringStageOrder() {
+	stageOrder, err := workflowadapter.StandardAuthoringStageOrderForTemplate(manifest.Template)
+	if err != nil {
+		return fmt.Errorf("%w: Standard authoring contract asset manifest template: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	expected := make(map[workflowkit.StageKey]struct{}, len(stageOrder))
+	for _, stageKey := range stageOrder {
 		expected[stageKey] = struct{}{}
 	}
 	if len(manifest.Operations) != len(expected) {
@@ -274,7 +278,7 @@ type standardAuthoringContractAssetBinding struct {
 // extension, so a generic lock cannot accidentally gain Standard's execution
 // semantics.
 func validateStandardAuthoringLockContract(lock DeploymentOperationCatalogLock) error {
-	isStandardAuthoring := lock.CatalogReceipt.Template.Equal(workflowadapter.StandardAuthoringTemplateReference())
+	isStandardAuthoring := workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template)
 	if !isStandardAuthoring {
 		for index, record := range lock.Operations {
 			if record.StandardAuthoringContract != nil {
@@ -334,7 +338,10 @@ func validateStandardAuthoringLockedTurnBudgets(lock DeploymentOperationCatalogL
 	if err != nil {
 		return err
 	}
-	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	template, err := workflowadapter.ResolveWorkflowTemplate(profile.Template)
+	if err != nil {
+		return fmt.Errorf("%w: resolve Standard authoring template for turn budget: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
 	compiled, err := template.Compile(profile)
 	if err != nil {
 		return fmt.Errorf("%w: compile Standard authoring profile for turn budget: %v", ErrInvalidDeploymentOperationCatalogLock, err)

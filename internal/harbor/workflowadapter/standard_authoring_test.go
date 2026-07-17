@@ -44,6 +44,55 @@ func TestStandardAuthoringTemplateIsClosedPreMaterializationWorkflow(t *testing.
 	}
 }
 
+func TestStandardAuthoringTaskAdmissionTemplateGatesReviewAndMaterialization(t *testing.T) {
+	template := StandardAuthoringTaskAdmissionWorkflowTemplate()
+	if err := template.Validate(); err != nil {
+		t.Fatalf("validate task-admission template: %v", err)
+	}
+	if !template.Reference().Equal(StandardAuthoringTaskAdmissionTemplateReference()) {
+		t.Fatalf("template reference = %+v", template.Reference())
+	}
+	if !IsStandardAuthoringWorkflowTemplate(template.Reference()) {
+		t.Fatal("task-admission template was not recognized as an authoring workflow")
+	}
+
+	admission, present := template.Catalog.Stage(workflowkit.StageKey(CodeEdgePackageAdmission))
+	if !present {
+		t.Fatal("task-admission template lacks codeedge_package_admission")
+	}
+	if len(admission.Outputs) != 1 || admission.Outputs[0].Name != "codeedge_package_admission_report" || admission.Outputs[0].SchemaVersion != "harbor.standard-authoring-task-package-admission.v1" {
+		t.Fatalf("admission outputs = %+v", admission.Outputs)
+	}
+	for _, stageKey := range []workflowkit.StageKey{workflowkit.StageKey(SolutionReview), workflowkit.StageKey(MaterializeTask)} {
+		stage, found := template.Catalog.Stage(stageKey)
+		if !found {
+			t.Fatalf("template lacks %s", stageKey)
+		}
+		foundReceipt := false
+		for _, input := range stage.Inputs {
+			if input.Name == "codeedge_package_admission_report" && input.SchemaVersion == "harbor.standard-authoring-task-package-admission.v1" {
+				foundReceipt = true
+			}
+		}
+		if !foundReceipt {
+			t.Fatalf("%s inputs omit the admission report: %+v", stageKey, stage.Inputs)
+		}
+	}
+	solution, _ := template.Catalog.Stage(workflowkit.StageKey(SolutionReview))
+	if !containsStageKey(solution.Dependencies, workflowkit.StageKey(CodeEdgePackageAdmission)) {
+		t.Fatalf("solution review dependencies = %+v, want admission stage", solution.Dependencies)
+	}
+}
+
+func containsStageKey(values []workflowkit.StageKey, want workflowkit.StageKey) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestStandardAuthoringTaskDesignTurnBudgetIsScopedToAuthoring(t *testing.T) {
 	authoring, found := StandardAuthoringStageCatalog().Stage(workflowkit.StageKey(TaskDesign))
 	if !found || authoring.RequiredTurns != StandardAuthoringTaskDesignMaxTurns {

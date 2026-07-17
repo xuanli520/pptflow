@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -60,6 +61,7 @@ type standardAuthoringProductionCompositionConfig struct {
 	CatalogReceiptFingerprint workflowkit.Fingerprint
 	LockIdentity              stageprovider.DeploymentOperationCatalogLockIdentity
 	LookupEnvironment         func(string) (string, bool)
+	AdmissionContract         *codeedge.TaskAdmissionContract
 }
 
 // standardAuthoringProductionComposition is a template-keyed capability
@@ -131,12 +133,12 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring repo_prepare executor: %w", err)
 	}
-	materializer, err := app.NewStandardAuthoringMaterializeExecutor(app.StandardAuthoringMaterializeExecutorConfig{ManagedRoot: config.ManagedRoot, Store: config.Store})
+	materializer, err := app.NewStandardAuthoringMaterializeExecutor(app.StandardAuthoringMaterializeExecutorConfig{ManagedRoot: config.ManagedRoot, Store: config.Store, Admission: config.AdmissionContract})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring materializer: %w", err)
 	}
 	providers, err := stageprovider.NewStandardAuthoringProviderComposition(stageprovider.StandardAuthoringProviderCompositionConfig{
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: bundle.Catalog, Lock: bundle.Lock, Attestor: attestor,
+		Template: bundle.Catalog.Template(), Catalog: bundle.Catalog, Lock: bundle.Lock, Attestor: attestor,
 		Handlers:           stageprovider.StandardAuthoringOperationHandlers{HostCommand: repoPrepare, HarborBuiltin: materializer},
 		CodexWorkspaceRoot: workspaceRoot,
 		CodexWorkspaceMode: stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
@@ -151,7 +153,7 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	return &standardAuthoringProductionComposition{
 		Resolver: providers.Resolver,
 		CatalogBinding: app.TemplateDeploymentCatalogResolver{
-			Template: workflowadapter.StandardAuthoringTemplateReference(), Resolver: providers.Resolver,
+			Template: bundle.Catalog.Template(), Resolver: providers.Resolver,
 		},
 		SourceCapturer: capturer,
 		Definitions:    definitions,

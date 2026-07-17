@@ -121,8 +121,8 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	if err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("resolve catalog: %w", err)
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("catalog must bind %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(catalog.Template()) {
+		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("catalog must bind an installed Standard authoring template")
 	}
 	profile, err := readStandardAuthoringExecutionProfile(config.profilePath)
 	if err != nil {
@@ -242,8 +242,8 @@ func readStandardAuthoringExecutionProfile(path string) (workflowadapter.Executi
 	if err != nil {
 		return workflowadapter.ExecutionProfile{}, fmt.Errorf("parse Standard authoring execution profile: %w", err)
 	}
-	if !profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
-		return workflowadapter.ExecutionProfile{}, fmt.Errorf("execution profile must bind %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringWorkflowTemplateVersion)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(profile.Template) {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("execution profile must bind an installed Standard authoring template")
 	}
 	return profile.Clone(), nil
 }

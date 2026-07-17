@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -34,6 +35,7 @@ type codeEdgePhase1ProductionComposition struct {
 	Resolver       *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
 	CatalogBinding app.TemplateDeploymentCatalogResolver
 	Definitions    app.CodeEdgePhase1RunDefinitionProvider
+	Admission      codeedge.TaskAdmissionContract
 }
 
 func newCodeEdgePhase1ProductionComposition(config codeEdgePhase1ProductionCompositionConfig) (*codeEdgePhase1ProductionComposition, error) {
@@ -116,6 +118,10 @@ func codeEdgePhase1CompositionFromVerifiedAssets(managedRoot string, binding cod
 	if err != nil {
 		return nil, fmt.Errorf("load lock-owned CodeEdge Phase-1 preflight profile: %w", err)
 	}
+	admission := codeedge.TaskAdmissionContract{ID: verifier.LockIdentity().LockID, Version: verifier.LockIdentity().LockVersion, Profile: preflight}
+	if err := admission.Validate(); err != nil {
+		return nil, fmt.Errorf("construct lock-owned CodeEdge task admission contract: %w", err)
+	}
 	commands, err := codeEdgePhase1ParentCommandLocks(locked)
 	if err != nil {
 		return nil, err
@@ -155,6 +161,7 @@ func codeEdgePhase1CompositionFromVerifiedAssets(managedRoot string, binding cod
 			Template: workflowadapter.CodeEdgePhase1TemplateReference(), Resolver: providers.Resolver,
 		},
 		Definitions: definitions,
+		Admission:   admission,
 	}, nil
 }
 

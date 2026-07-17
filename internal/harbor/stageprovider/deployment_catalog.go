@@ -994,6 +994,8 @@ func deploymentStageBindingType(key workflowkit.StageKey) (workflowadapter.Stage
 		return workflowadapter.StageBindingTestGen, true
 	case workflowadapter.TestsAnalysis:
 		return workflowadapter.StageBindingTestsAnalysis, true
+	case workflowadapter.CodeEdgePackageAdmission:
+		return workflowadapter.StageBindingCodeEdgePackageAdmission, true
 	case workflowadapter.SolutionReview:
 		return workflowadapter.StageBindingSolutionReview, true
 	case workflowadapter.MaterializeTask:

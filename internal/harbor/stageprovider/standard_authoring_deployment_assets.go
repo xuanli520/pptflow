@@ -58,7 +58,7 @@ func LoadStandardAuthoringDeploymentAssetBundle(catalogPath, lockPath, contractR
 	if err != nil {
 		return nil, fmt.Errorf("resolve Standard authoring catalog: %w", err)
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(catalog.Template()) {
 		return nil, fmt.Errorf("%w: deployment catalog must bind Standard authoring template", ErrDeploymentOperationCatalogDrift)
 	}
 
@@ -84,7 +84,7 @@ func LoadStandardAuthoringDeploymentAssetBundle(catalogPath, lockPath, contractR
 	if err != nil {
 		return nil, fmt.Errorf("bind Standard authoring catalog lock: %w", err)
 	}
-	if !verifier.CatalogReceipt().Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(verifier.CatalogReceipt().Template) {
 		return nil, fmt.Errorf("%w: deployment lock receipt must bind Standard authoring template", ErrDeploymentOperationCatalogLockDrift)
 	}
 

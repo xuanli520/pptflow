@@ -13,6 +13,7 @@ func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T
 	for _, reference := range []TemplateReference{
 		StandardTemplateReference(),
 		StandardAuthoringTemplateReference(),
+		StandardAuthoringTaskAdmissionTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	} {

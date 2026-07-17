@@ -120,7 +120,7 @@ func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T
 	if err != nil {
 		t.Fatalf("read production Standard authoring execution profile asset: %v", err)
 	}
-	if !profile.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !profile.Template.Equal(workflowadapter.StandardAuthoringTaskAdmissionTemplateReference()) {
 		t.Fatalf("production execution profile template = %s@%s", profile.Template.ID, profile.Template.Version)
 	}
 }

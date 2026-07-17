@@ -79,13 +79,15 @@ func templateKey(reference TemplateReference) templateReferenceKey {
 func DefaultTemplateRegistry() TemplateRegistry {
 	standard := StandardWorkflowTemplate()
 	standardAuthoring := StandardAuthoringWorkflowTemplate()
+	standardAuthoringAdmission := StandardAuthoringTaskAdmissionWorkflowTemplate()
 	codeEdge := CodeEdgePhase1WorkflowTemplate()
 	codeEdgeEvaluator := CodeEdgeEvaluatorChildWorkflowTemplate()
 	return TemplateRegistry{templates: map[templateReferenceKey]WorkflowTemplate{
-		templateKey(standard.Reference()):          standard,
-		templateKey(standardAuthoring.Reference()): standardAuthoring,
-		templateKey(codeEdge.Reference()):          codeEdge,
-		templateKey(codeEdgeEvaluator.Reference()): codeEdgeEvaluator,
+		templateKey(standard.Reference()):                   standard,
+		templateKey(standardAuthoring.Reference()):          standardAuthoring,
+		templateKey(standardAuthoringAdmission.Reference()): standardAuthoringAdmission,
+		templateKey(codeEdge.Reference()):                   codeEdge,
+		templateKey(codeEdgeEvaluator.Reference()):          codeEdgeEvaluator,
 	}}
 }
 
@@ -114,6 +116,7 @@ func BuiltinTemplateReferences() []TemplateReference {
 	references := []TemplateReference{
 		StandardTemplateReference(),
 		StandardAuthoringTemplateReference(),
+		StandardAuthoringTaskAdmissionTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	}
@@ -129,6 +132,7 @@ func BuiltinTemplateReferences() []TemplateReference {
 func isBuiltinTemplateReference(reference TemplateReference) bool {
 	return reference.Equal(StandardTemplateReference()) ||
 		reference.Equal(StandardAuthoringTemplateReference()) ||
+		reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()) ||
 		reference.Equal(CodeEdgePhase1TemplateReference()) ||
 		reference.Equal(CodeEdgeEvaluatorChildTemplateReference())
 }

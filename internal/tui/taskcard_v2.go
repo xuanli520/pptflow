@@ -38,6 +38,7 @@ type TaskItem struct {
 // populated only from the task-board application projection.
 type TaskRunItem struct {
 	ID            string
+	ParentRunID   string
 	Status        string
 	CurrentStage  string
 	FailureStage  string

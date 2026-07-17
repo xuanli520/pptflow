@@ -10,8 +10,9 @@ import (
 const (
 	// StandardAuthoringTaskHandoffFormat identifies the immutable receipt
 	// emitted by the final source-session materialize_task operation.
-	StandardAuthoringTaskHandoffFormat  = "harbor.standard-authoring-task-handoff.v1"
-	StandardAuthoringTaskHandoffVersion = "1"
+	StandardAuthoringTaskHandoffFormat           = "harbor.standard-authoring-task-handoff.v1"
+	StandardAuthoringTaskHandoffVersion          = "1"
+	StandardAuthoringTaskAdmissionHandoffVersion = "2"
 
 	standardAuthoringTaskHandoffFingerprintDomain = "harbor.workflowadapter.standard-authoring-task-handoff.v1"
 )
@@ -34,6 +35,7 @@ type StandardAuthoringTaskHandoff struct {
 	RevisionID            string                    `json:"revision_id"`
 	RevisionDigest        workflowkit.SubjectDigest `json:"revision_digest"`
 	TaskSnapshot          ArtifactReference         `json:"task_snapshot"`
+	AdmissionReceipt      *ArtifactReference        `json:"admission_receipt,omitempty"`
 	ChildTemplate         TemplateReference         `json:"child_template"`
 }
 
@@ -44,7 +46,7 @@ func (handoff StandardAuthoringTaskHandoff) Validate() error {
 	if handoff.Format != StandardAuthoringTaskHandoffFormat {
 		return fmt.Errorf("%w: unsupported Standard authoring handoff format %q", errInvalidExecutionSpec, handoff.Format)
 	}
-	if handoff.Version != StandardAuthoringTaskHandoffVersion {
+	if handoff.Version != StandardAuthoringTaskHandoffVersion && handoff.Version != StandardAuthoringTaskAdmissionHandoffVersion {
 		return fmt.Errorf("%w: unsupported Standard authoring handoff version %q", errInvalidExecutionSpec, handoff.Version)
 	}
 	for _, field := range []struct {
@@ -78,6 +80,16 @@ func (handoff StandardAuthoringTaskHandoff) Validate() error {
 	}
 	if err := handoff.ChildTemplate.Validate(); err != nil {
 		return fmt.Errorf("%w: authoring handoff child template: %v", errInvalidExecutionSpec, err)
+	}
+	if handoff.Version == StandardAuthoringTaskAdmissionHandoffVersion {
+		if handoff.AdmissionReceipt == nil || handoff.AdmissionReceipt.SchemaVersion != "harbor.standard-authoring-task-package-admission.v1" {
+			return fmt.Errorf("%w: Standard authoring admission handoff requires its receipt artifact", errInvalidExecutionSpec)
+		}
+		if err := handoff.AdmissionReceipt.validate(); err != nil {
+			return err
+		}
+	} else if handoff.AdmissionReceipt != nil {
+		return fmt.Errorf("%w: legacy Standard authoring handoff cannot carry an admission receipt", errInvalidExecutionSpec)
 	}
 	return nil
 }

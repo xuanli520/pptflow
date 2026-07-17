@@ -2265,12 +2265,16 @@ func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringHandoff(ctx conte
 		return err
 	}
 	handoffArtifactID := ""
+	expectedHandoffSchema, err := workflowadapter.StandardAuthoringTaskHandoffSchemaForTemplate(workflowadapter.TemplateReference{ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion})
+	if err != nil {
+		return err
+	}
 	for _, reference := range references {
 		if reference.ArtifactKey != workflowadapter.StandardAuthoringTaskHandoffArtifact {
 			continue
 		}
 		if handoffArtifactID != "" || reference.RunID != run.ID || reference.AttemptID != attempt.ID ||
-			reference.StageKey != workflowadapter.MaterializeTask || reference.SchemaVersion != workflowadapter.StandardAuthoringTaskHandoffSchemaVersion {
+			reference.StageKey != workflowadapter.MaterializeTask || reference.SchemaVersion != expectedHandoffSchema {
 			return fmt.Errorf("materialize_task has an invalid Standard authoring handoff artifact")
 		}
 		handoffArtifactID = reference.ID
