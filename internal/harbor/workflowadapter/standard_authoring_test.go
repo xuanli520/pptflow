@@ -44,6 +44,49 @@ func TestStandardAuthoringTemplateIsClosedPreMaterializationWorkflow(t *testing.
 	}
 }
 
+func TestStandardAuthoringTaskDesignTurnBudgetIsScopedToAuthoring(t *testing.T) {
+	authoring, found := StandardAuthoringStageCatalog().Stage(workflowkit.StageKey(TaskDesign))
+	if !found || authoring.RequiredTurns != StandardAuthoringTaskDesignMaxTurns {
+		t.Fatalf("authoring task_design turns = %+v, found=%t; want %d", authoring, found, StandardAuthoringTaskDesignMaxTurns)
+	}
+	standard, found := StandardStageCatalog().Stage(workflowkit.StageKey(TaskDesign))
+	if !found || standard.RequiredTurns != 3 {
+		t.Fatalf("task-bound Standard task_design turns = %+v, found=%t; want 3", standard, found)
+	}
+	policy := StandardAuthoringQuotaPolicy()
+	var claims []workflowkit.QuotaClaim
+	found = false
+	for _, stage := range policy.Stages {
+		if stage.StageKey != workflowkit.StageKey(TaskDesign) {
+			continue
+		}
+		claims = append([]workflowkit.QuotaClaim(nil), stage.Claims...)
+		found = true
+		break
+	}
+	if !found || !hasQuotaClaim(claims, "agent_turn", int64(StandardAuthoringTaskDesignMaxTurns)) {
+		t.Fatalf("authoring task_design quota claims = %+v, found=%t", claims, found)
+	}
+	var totalAgentTurns int64
+	for _, stage := range policy.Stages {
+		for _, claim := range stage.Claims {
+			if claim.Dimension == "agent_turn" {
+				totalAgentTurns += claim.Units
+			}
+		}
+	}
+	var taskLimit int64
+	for _, limit := range policy.AccountLimits {
+		if limit.Dimension == "agent_turn" {
+			taskLimit = limit.TaskLimitUnits
+			break
+		}
+	}
+	if totalAgentTurns != 42 || taskLimit != 64 || totalAgentTurns > taskLimit {
+		t.Fatalf("authoring agent-turn reservation = %d/%d, want 42/64", totalAgentTurns, taskLimit)
+	}
+}
+
 func TestStandardAuthoringTaskHandoffStrictlyBindsCodeEdgeChild(t *testing.T) {
 	handoff := standardAuthoringTaskHandoffFixture()
 	if err := handoff.Validate(); err != nil {

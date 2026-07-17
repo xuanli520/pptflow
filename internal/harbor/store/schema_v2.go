@@ -3564,7 +3564,7 @@ WHEN NOT EXISTS (
     WHERE run.id = NEW.authoring_run_id
       AND run.subject_kind = 'authoring_session'
       AND run.workflow_template_id = 'harbor.standard-authoring'
-      AND run.workflow_template_version = '1.1.0'
+      AND run.workflow_template_version = '1.2.0'
       AND run.authoring_session_id = NEW.authoring_session_id
       AND run.subject_id = NEW.authoring_source_id
       AND run.subject_revision_id = NEW.authoring_session_id

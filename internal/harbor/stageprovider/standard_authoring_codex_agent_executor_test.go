@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +110,44 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 	}
 	if agentTurns != 2 || outputSubmissions != 1 {
 		t.Fatalf("usage dimensions = agent_turn:%d output_submission:%d, want 2 and 1", agentTurns, outputSubmissions)
+	}
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorAcceptsSubmissionOnThirtiethTurn(t *testing.T) {
+	t.Parallel()
+	const turns = 30
+	now := time.Date(2026, 7, 17, 8, 0, 0, 0, time.UTC)
+	stage := standardAuthoringCodexTestStage(turns)
+	results := make([]agent.TurnResult, turns)
+	submissions := make([][]json.RawMessage, turns)
+	for index := range results {
+		results[index] = agent.TurnResult{Model: CodexAppServerProductionModelID, Text: `{"progress":"continue"}`}
+	}
+	submissions[turns-1] = []json.RawMessage{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("thirtieth-turn-analysis"))}
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{results: results, submissions: submissions}}
+	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, turns)
+	request, checkpoints, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts))},
+		},
+	}, standardAuthoringCodexTestPayload(turns))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome.Status != workflowkit.StatusCompleted || len(result.Artifacts) != 1 || result.Artifacts[0].TurnOrdinal != turns {
+		t.Fatalf("thirtieth-turn result = %+v", result)
+	}
+	if len(runtime.conversation.requests) != turns || runtime.conversation.closed != 1 {
+		t.Fatalf("conversation requests=%d closes=%d, want %d/1", len(runtime.conversation.requests), runtime.conversation.closed, turns)
+	}
+	if len(*checkpoints) != 2*turns {
+		t.Fatalf("checkpoints = %d, want %d", len(*checkpoints), 2*turns)
+	}
+	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != turns || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 1 {
+		t.Fatalf("usage records = %+v, want %d agent turns and one output submission", *usages, turns)
 	}
 }
 
@@ -403,7 +442,7 @@ func standardAuthoringCodexTestExecutor(t *testing.T, runtime agent.Runtime, now
 func standardAuthoringCodexTestPrompts(turns int) []string {
 	prompts := make([]string, 0, turns)
 	for index := 1; index <= turns; index++ {
-		prompts = append(prompts, "perform frozen authoring turn "+string(rune('0'+index)))
+		prompts = append(prompts, "perform frozen authoring turn "+strconv.Itoa(index))
 	}
 	return prompts
 }

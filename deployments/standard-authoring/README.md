@@ -1,7 +1,7 @@
 # Standard Authoring Deployment Contract
 
 This directory is the source-controlled deployment input for the closed
-`harbor.standard-authoring@1.1.0` workflow. It creates a first task from an
+`harbor.standard-authoring@1.2.0` workflow. It creates a first task from an
 immutable `AuthoringSource` / `AuthoringSession`; it does not pretend that the
 source session is already a `TaskRevision`.
 
@@ -49,12 +49,13 @@ handoff, compliance, and local packaging.
 
 ## Version boundary
 
-The required frozen environment policy is an execution-contract change, so it
-belongs to `harbor.standard-authoring@1.1.0`, not to a reinterpretation of a
-historical `@1.0.0` Run. The consolidated V2 store intentionally does not
+The required frozen environment policy and the bounded 30-turn `task_design`
+program are execution-contract changes, so they belong to
+`harbor.standard-authoring@1.2.0`, not to a reinterpretation of a historical
+`@1.0.0` or `@1.1.0` Run. The consolidated V2 store intentionally does not
 migrate its physical schema in place; install this release with a new managed
-control-plane root. Existing `@1.0.0` records remain immutable audit history
-and must be handled by the release that owns their frozen deployment contract.
+control-plane root. Existing records remain immutable audit history and must
+be handled by the release that owns their frozen deployment contract.
 
 ## Frozen task environment policy
 

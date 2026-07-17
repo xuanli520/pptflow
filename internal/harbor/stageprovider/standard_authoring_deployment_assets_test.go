@@ -27,6 +27,18 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) {
 		t.Fatalf("catalog template = %s@%s, want Standard authoring", catalog.Template().ID, catalog.Template().Version)
 	}
+	profileRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "execution-profile.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := workflowadapter.ParseExecutionProfileJSON(profileRaw)
+	if err != nil {
+		t.Fatalf("parse Standard authoring execution profile: %v", err)
+	}
+	compiled, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	if err != nil {
+		t.Fatalf("compile Standard authoring execution profile: %v", err)
+	}
 
 	manifestRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "contract-assets.v1.json"))
 	if err != nil {
@@ -65,6 +77,17 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		agentStages++
 		if !IsCodexAppServerProductionPayload(payload) {
 			t.Fatalf("agent stage %q payload = %+v, want frozen %s/%s", registration.Stage.Key, payload, CodexAppServerProductionModelID, CodexAppServerProductionReasoningEffort)
+		}
+		stage, found := compiled.Descriptor.Stage(registration.Stage.Key)
+		if !found {
+			t.Fatalf("compiled descriptor omits agent stage %q", registration.Stage.Key)
+		}
+		claimedTurns, hasClaim := standardAuthoringLockedAgentTurnClaim(stage)
+		if !hasClaim || payload.MaxTurns != stage.Budget.MaxTurns || int64(payload.MaxTurns) != claimedTurns {
+			t.Fatalf("agent stage %q turn contract payload=%d budget=%d quota=%d present=%t", registration.Stage.Key, payload.MaxTurns, stage.Budget.MaxTurns, claimedTurns, hasClaim)
+		}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskDesign) && payload.MaxTurns != workflowadapter.StandardAuthoringTaskDesignMaxTurns {
+			t.Fatalf("task_design max turns = %d, want %d", payload.MaxTurns, workflowadapter.StandardAuthoringTaskDesignMaxTurns)
 		}
 		promptRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", filepath.FromSlash(entry.Prompt.RelativePath)))
 		if err != nil {

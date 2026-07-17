@@ -21,7 +21,7 @@ const workflowRunSelect = `
 // handoff artifact verification.
 const (
 	standardAuthoringParentTemplateID      = "harbor.standard-authoring"
-	standardAuthoringParentTemplateVersion = "1.1.0"
+	standardAuthoringParentTemplateVersion = "1.2.0"
 	codeEdgePhase1ChildTemplateID          = "harbor.codeedge-phase1"
 	codeEdgePhase1ChildTemplateVersion     = "2.2.0"
 	standardAuthoringChildTrigger          = "standard-authoring.materialized"

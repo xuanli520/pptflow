@@ -9,10 +9,16 @@ const (
 	// materialize_task stage atomically creates the first task revision and
 	// emits an explicit handoff for a separate task-bound CodeEdge Phase-1 Run.
 	StandardAuthoringWorkflowTemplateID      = "harbor.standard-authoring"
-	StandardAuthoringWorkflowTemplateVersion = "1.1.0"
+	StandardAuthoringWorkflowTemplateVersion = "1.2.0"
 
 	standardAuthoringCatalogID      = "harbor.standard-authoring-stage-catalog"
-	standardAuthoringCatalogVersion = "1.1.0"
+	standardAuthoringCatalogVersion = "1.2.0"
+
+	// StandardAuthoringTaskDesignMaxTurns bounds the task-design Codex
+	// conversation in this source-session template. It intentionally does not
+	// alter the task-bound Standard catalog, whose task_design stage remains a
+	// separate workflow contract.
+	StandardAuthoringTaskDesignMaxTurns = 30
 
 	// StandardAuthoringTaskHandoffArtifact is emitted only by materialize_task.
 	// It is a receipt for a newly sealed task revision, not a mutable workspace
@@ -112,6 +118,9 @@ func StandardAuthoringStageCatalog() StageCatalog {
 	stages := make([]StageDefinition, 0, len(canonical.Stages))
 	for _, definition := range canonical.Stages[:13] {
 		definition = definition.Clone()
+		if definition.Key == workflowkit.StageKey(TaskDesign) {
+			definition.RequiredTurns = StandardAuthoringTaskDesignMaxTurns
+		}
 		if standardAuthoringStageUsesEnvironmentPolicy(definition.Key) {
 			definition.Inputs = append(definition.Inputs, standardAuthoringEnvironmentPolicyInput().spec)
 			definition.ReadSet = append(definition.ReadSet, resourceAuthoringEnvironmentPolicy)

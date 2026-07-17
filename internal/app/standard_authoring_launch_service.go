@@ -1476,7 +1476,7 @@ type standardAuthoringLaunchRequest struct {
 // CatalogStandardAuthoringRunDefinitionProvider derives the full source-session
 // execution spec from a static deployment catalog and an already explicit
 // profile. It is intentionally not a generic catalog compiler: it only emits
-// harbor.standard-authoring@1.1.0 and has no caller-selectable operation,
+// harbor.standard-authoring@1.2.0 and has no caller-selectable operation,
 // checkout, runtime, secret, or model fields.
 type CatalogStandardAuthoringRunDefinitionProvider struct {
 	catalog *stageprovider.DeploymentOperationCatalogResolver

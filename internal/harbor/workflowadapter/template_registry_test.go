@@ -50,9 +50,9 @@ func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T
 	}
 }
 
-func TestStandardAuthoringV2BaselineAcceptsOnlyVersionOneDotOneDotZero(t *testing.T) {
+func TestStandardAuthoringV2BaselineAcceptsOnlyVersionOneDotTwoDotZero(t *testing.T) {
 	current := StandardAuthoringWorkflowTemplate()
-	if current.Version != "1.1.0" || current.Catalog.Version != "1.1.0" || !current.Reference().Equal(StandardAuthoringTemplateReference()) {
+	if current.Version != "1.2.0" || current.Catalog.Version != "1.2.0" || !current.Reference().Equal(StandardAuthoringTemplateReference()) {
 		t.Fatalf("current Standard authoring template = %s@%s catalog %s@%s", current.ID, current.Version, current.Catalog.ID, current.Catalog.Version)
 	}
 	if err := current.Validate(); err != nil {

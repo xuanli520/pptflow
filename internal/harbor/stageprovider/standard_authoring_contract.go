@@ -283,6 +283,9 @@ func validateStandardAuthoringLockContract(lock DeploymentOperationCatalogLock) 
 		}
 		return nil
 	}
+	if err := validateStandardAuthoringLockedTurnBudgets(lock); err != nil {
+		return err
+	}
 
 	identities := make(map[standardAuthoringContractAssetIdentity]standardAuthoringContractAssetBinding, len(lock.Operations)*2)
 	paths := make(map[string]standardAuthoringContractAssetIdentity, len(lock.Operations)*2)
@@ -319,6 +322,58 @@ func validateStandardAuthoringLockContract(lock DeploymentOperationCatalogLock) 
 		}
 	}
 	return nil
+}
+
+// validateStandardAuthoringLockedTurnBudgets keeps the deployment's three
+// independent turn declarations from drifting: the catalog operation payload,
+// the lock-owned profile, and the compiled template quota must all agree.
+// The executor can then treat the program length as the exact bounded work,
+// rather than silently running fewer turns than a newly enlarged profile.
+func validateStandardAuthoringLockedTurnBudgets(lock DeploymentOperationCatalogLock) error {
+	profile, err := lock.StandardAuthoringProfile()
+	if err != nil {
+		return err
+	}
+	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	compiled, err := template.Compile(profile)
+	if err != nil {
+		return fmt.Errorf("%w: compile Standard authoring profile for turn budget: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	for _, record := range lock.Operations {
+		payload, isAgentTurn := record.Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
+		if !isAgentTurn {
+			continue
+		}
+		definition, found := template.Catalog.Stage(record.Stage.Key)
+		if !found {
+			return fmt.Errorf("%w: Standard authoring agent stage %q is absent from the template", ErrInvalidDeploymentOperationCatalogLock, record.Stage.Key)
+		}
+		stage, found := compiled.Descriptor.Stage(record.Stage.Key)
+		if !found {
+			return fmt.Errorf("%w: Standard authoring agent stage %q is absent from the compiled descriptor", ErrInvalidDeploymentOperationCatalogLock, record.Stage.Key)
+		}
+		claimedTurns, hasClaim := standardAuthoringLockedAgentTurnClaim(stage)
+		if !hasClaim || payload.MaxTurns != definition.RequiredTurns || payload.MaxTurns != stage.Budget.MaxTurns || int64(payload.MaxTurns) != claimedTurns {
+			return fmt.Errorf("%w: Standard authoring agent stage %q turn declarations disagree", ErrInvalidDeploymentOperationCatalogLock, record.Stage.Key)
+		}
+	}
+	return nil
+}
+
+func standardAuthoringLockedAgentTurnClaim(stage workflowkit.StageDescriptor) (int64, bool) {
+	var units int64
+	found := false
+	for _, claim := range stage.QuotaClaims {
+		if claim.Dimension != "agent_turn" {
+			continue
+		}
+		if found || claim.Units <= 0 {
+			return 0, false
+		}
+		units = claim.Units
+		found = true
+	}
+	return units, found
 }
 
 func validateStandardAuthoringContractAssetID(value string) error {

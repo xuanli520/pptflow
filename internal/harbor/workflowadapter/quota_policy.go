@@ -24,7 +24,7 @@ const (
 	// handoff. output_submission separately bounds model tool retries so they
 	// cannot bypass agent-turn accounting.
 	StandardAuthoringQuotaPolicyID      = "harbor.standard-authoring.local.operator"
-	StandardAuthoringQuotaPolicyVersion = "1.1.0"
+	StandardAuthoringQuotaPolicyVersion = "1.2.0"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
 	// stage. It is versioned with the policy rather than supplied by a Run.

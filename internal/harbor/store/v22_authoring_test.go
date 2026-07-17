@@ -108,7 +108,7 @@ func TestListAuthoringWorkflowRunsForTargetTaskUsesSessionOwnership(t *testing.T
 		t.Fatal(err)
 	}
 	session, err := s.CreateAuthoringSession(ctx, CreateAuthoringSessionRequest{
-		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.1.0",
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.2.0",
 		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "list-authoring-runs-session", Actor: "author", Reason: "freeze authoring session",
 	})
 	if err != nil {

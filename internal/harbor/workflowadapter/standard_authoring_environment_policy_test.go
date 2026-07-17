@@ -149,8 +149,8 @@ func TestValidateDockerfileBaseImage(t *testing.T) {
 
 func TestStandardAuthoringCatalogConsumesEnvironmentPolicyOnlyWhereRequired(t *testing.T) {
 	template := StandardAuthoringWorkflowTemplate()
-	if template.Version != "1.1.0" || template.Catalog.Version != "1.1.0" {
-		t.Fatalf("authoring template/catalog version = %s/%s, want 1.1.0/1.1.0", template.Version, template.Catalog.Version)
+	if template.Version != "1.2.0" || template.Catalog.Version != "1.2.0" {
+		t.Fatalf("authoring template/catalog version = %s/%s, want 1.2.0/1.2.0", template.Version, template.Catalog.Version)
 	}
 	if err := template.Validate(); err != nil {
 		t.Fatalf("validate authoring template: %v", err)
