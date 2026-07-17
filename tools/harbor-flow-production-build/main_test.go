@@ -221,10 +221,10 @@ func writeProductionBuildFixtureBundle(t *testing.T, root, name string, template
 	}
 	profile := fixtureExecutionProfile(t, template, "production-build-"+name+"-profile")
 	switch {
-	case template.Catalog.Template.Equal(workflowadapter.StandardAuthoringTemplateReference()):
+	case workflowadapter.IsStandardAuthoringWorkflowTemplate(template.Catalog.Template):
 		lock.StandardAuthoringExecutionProfile = &stageprovider.StandardAuthoringExecutionProfileLock{Profile: profile}
-			lock.StandardAuthoringSSHTransport = fixtureStandardAuthoringSSHTransport()
-		case template.Catalog.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()):
+		lock.StandardAuthoringSSHTransport = fixtureStandardAuthoringSSHTransport()
+	case template.Catalog.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()):
 		lock.CodeEdgePhase1ExecutionProfile = &stageprovider.CodeEdgePhase1ExecutionProfileLock{Profile: profile}
 		lock.CodeEdgePhase1PreflightProfile = &stageprovider.CodeEdgePhase1PreflightProfileLock{Profile: fixtureCodeEdgePhase1PreflightProfile()}
 		lock.CodeEdgePhase1FinalCompliancePolicy = &stageprovider.CodeEdgePhase1FinalCompliancePolicyLock{Policy: fixtureFinalCompliancePolicy()}
@@ -355,9 +355,9 @@ func fixtureStandardAuthoringSSHTransport() *stageprovider.StandardAuthoringSSHT
 			CommandID: stageprovider.StandardAuthoringSSHWrapperShellCommandID, AbsolutePath: "/opt/standard-authoring/dash", Version: string(shellContent), ContentSHA256: shellContent,
 		},
 		KnownHosts: stageprovider.StandardAuthoringSSHKnownHostsLock{
-			Format:       stageprovider.StandardAuthoringSSHKnownHostsLockFormat,
-			Version:      stageprovider.StandardAuthoringSSHKnownHostsLockVersion,
-			RelativePath: stageprovider.StandardAuthoringSSHKnownHostsRelativePath,
+			Format:        stageprovider.StandardAuthoringSSHKnownHostsLockFormat,
+			Version:       stageprovider.StandardAuthoringSSHKnownHostsLockVersion,
+			RelativePath:  stageprovider.StandardAuthoringSSHKnownHostsRelativePath,
 			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("test known hosts")),
 		},
 		AgentSocketEnvironmentName: stageprovider.StandardAuthoringSSHAgentSocketEnvironment,

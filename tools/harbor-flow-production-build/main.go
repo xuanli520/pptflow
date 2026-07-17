@@ -56,13 +56,14 @@ type productionBuildConfig struct {
 }
 
 type bundleInput struct {
-	name             string
-	catalogLabel     string
-	lockLabel        string
-	catalogPath      string
-	lockPath         string
-	expectedTemplate workflowadapter.TemplateReference
-	variables        buildVariables
+	name              string
+	catalogLabel      string
+	lockLabel         string
+	catalogPath       string
+	lockPath          string
+	expectedTemplate  workflowadapter.TemplateReference
+	standardAuthoring bool
+	variables         buildVariables
 }
 
 type buildVariables struct {
@@ -117,7 +118,7 @@ func productionBuildLDFlags(config productionBuildConfig) (string, error) {
 		{
 			name: "Standard authoring", catalogLabel: "standard authoring catalog", lockLabel: "standard authoring lock",
 			catalogPath: config.StandardAuthoringCatalog, lockPath: config.StandardAuthoringLock,
-			expectedTemplate: workflowadapter.StandardAuthoringTemplateReference(),
+			standardAuthoring: true,
 			variables: buildVariables{
 				module: standardAuthoringBuildModuleVariable, version: standardAuthoringBuildVersionVariable,
 				commit: standardAuthoringBuildCommitVariable, digest: standardAuthoringBuildDigestVariable,
@@ -249,7 +250,11 @@ func verifyBundle(input bundleInput) (verifiedBundle, error) {
 	if err != nil {
 		return verifiedBundle{}, fmt.Errorf("resolve %s: %w", input.catalogLabel, err)
 	}
-	if !catalog.Template().Equal(input.expectedTemplate) {
+	if (input.standardAuthoring && !workflowadapter.IsStandardAuthoringWorkflowTemplate(catalog.Template())) ||
+		(!input.standardAuthoring && !catalog.Template().Equal(input.expectedTemplate)) {
+		if input.standardAuthoring {
+			return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want an installed Standard authoring template", input.catalogLabel, catalog.Template().ID, catalog.Template().Version)
+		}
 		return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want %s@%s", input.catalogLabel, catalog.Template().ID, catalog.Template().Version, input.expectedTemplate.ID, input.expectedTemplate.Version)
 	}
 
@@ -261,7 +266,11 @@ func verifyBundle(input bundleInput) (verifiedBundle, error) {
 	if err != nil {
 		return verifiedBundle{}, fmt.Errorf("parse %s: %w", input.lockLabel, err)
 	}
-	if !lock.CatalogReceipt.Template.Equal(input.expectedTemplate) {
+	if (input.standardAuthoring && !workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template)) ||
+		(!input.standardAuthoring && !lock.CatalogReceipt.Template.Equal(input.expectedTemplate)) {
+		if input.standardAuthoring {
+			return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want an installed Standard authoring template", input.lockLabel, lock.CatalogReceipt.Template.ID, lock.CatalogReceipt.Template.Version)
+		}
 		return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want %s@%s", input.lockLabel, lock.CatalogReceipt.Template.ID, lock.CatalogReceipt.Template.Version, input.expectedTemplate.ID, input.expectedTemplate.Version)
 	}
 	verifier, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock)
