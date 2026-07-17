@@ -48,9 +48,10 @@ func TestCodeEdgeEvaluatorRuntimePreallocatesTrialsBeforeInvocationAndReconciles
 	}))
 	claim := claimCodeEdgeRuntimeStageJob(t, ctx, fixture.database, run.ID, job.ID)
 
-	state, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
-	if err != nil || state != store.JobInterrupted || !invoked || !trialsWereReady {
-		t.Fatalf("CodeEdge evaluator interrupted invocation = state=%s err=%v invoked=%t trialsWereReady=%t", state, err, invoked, trialsWereReady)
+	result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+	state := result.State
+	if err != nil || state != store.JobInDoubt || result.Failure == nil || !invoked || !trialsWereReady {
+		t.Fatalf("CodeEdge evaluator in_doubt invocation = result=%+v err=%v invoked=%t trialsWereReady=%t", result, err, invoked, trialsWereReady)
 	}
 	assertCodeEdgeEvaluatorInDoubt(t, ctx, fixture.database, run.ID, stage, payload.StageKey)
 	reconciliationJob := requireCodeEdgeEvaluatorReconciliationJob(t, ctx, fixture.database, job, run, stage, payload.StageKey)
@@ -82,9 +83,10 @@ func TestCodeEdgeEvaluatorRecoveryProjectsObservedCompletionWithoutAnotherModelI
 		}, nil
 	}))
 	claim := claimCodeEdgeRuntimeStageJob(t, ctx, fixture.database, run.ID, job.ID)
-	state, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
-	if err != nil || state != store.JobInterrupted || providerCalls != 1 {
-		t.Fatalf("initial CodeEdge evaluator interruption = state=%s err=%v providerCalls=%d", state, err, providerCalls)
+	result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+	state := result.State
+	if err != nil || state != store.JobInDoubt || result.Failure == nil || providerCalls != 1 {
+		t.Fatalf("initial CodeEdge evaluator in_doubt result = %+v err=%v providerCalls=%d", result, err, providerCalls)
 	}
 
 	admission, err := fixture.database.GetDurableAdmissionDecisionByIdempotencyKey(ctx, "stage-admission:"+job.ID)
@@ -109,9 +111,9 @@ func TestCodeEdgeEvaluatorRecoveryProjectsObservedCompletionWithoutAnotherModelI
 	}
 	reconciliationJob := requireCodeEdgeEvaluatorReconciliationJob(t, ctx, fixture.database, job, run, stage, payload.StageKey)
 	worker := newFrozenRuntimeWorker(t, fixture.database, runtime, "codeedge-evaluator-reconciliation-worker")
-	result, workerErr := worker.RunOnce(ctx)
-	if workerErr != nil || result.Job == nil || result.Job.ID != reconciliationJob.ID || result.FinalState != store.JobSucceeded {
-		t.Fatalf("execute CodeEdge evaluator reconciliation job = %+v, %v", result, workerErr)
+	workerResult, workerErr := worker.RunOnce(ctx)
+	if workerErr != nil || workerResult.Job == nil || workerResult.Job.ID != reconciliationJob.ID || workerResult.FinalState != store.JobSucceeded {
+		t.Fatalf("execute CodeEdge evaluator reconciliation job = %+v, %v", workerResult, workerErr)
 	}
 	if observer.calls != 1 || providerCalls != 1 {
 		t.Fatalf("CodeEdge completion reconciliation calls observer=%d provider=%d; want observer once and no second provider call", observer.calls, providerCalls)
@@ -197,14 +199,15 @@ func TestCodeEdgeEvaluatorExpiredReconciliationLeaseRestoresCommittedReceiptWith
 	if err != nil || claim.Job == nil || claim.Job.ID != scenario.reconciliationJob.ID {
 		t.Fatalf("claim CodeEdge evaluator reconciliation job = %+v, %v", claim, err)
 	}
-	interrupted, err := scenario.fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
-		JobID: claim.Job.ID, ExpectedVersion: claim.Job.Version, State: store.JobInterrupted,
-		Actor: runtimeFixtureActor, Reason: "simulate expired CodeEdge evaluator reconciliation dispatch lease",
+	recovered, err := scenario.fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: claim.Job.ID, ExpectedVersion: claim.Job.Version, State: store.JobInDoubt,
+		Failure: &store.DurableJobFailure{Code: "job.lease_lost", Message: "The worker lease expired before the job outcome was recorded.", DetailsJSON: `{}`},
+		Actor:   runtimeFixtureActor, Reason: "simulate expired CodeEdge evaluator reconciliation dispatch lease",
 	})
-	if err != nil || interrupted.State != store.JobInterrupted {
-		t.Fatalf("interrupt expired CodeEdge evaluator reconciliation job = %+v, %v", interrupted, err)
+	if err != nil || recovered.State != store.JobInDoubt || recovered.Failure == nil || recovered.Failure.Code != "job.lease_lost" {
+		t.Fatalf("recover expired CodeEdge evaluator reconciliation job = %+v, %v", recovered, err)
 	}
-	if err := scenario.runtime.ReconcileDurableJobRecoveries(ctx, []store.ExpiredDurableJobRecovery{{Job: interrupted}}); err != nil {
+	if err := scenario.runtime.ReconcileDurableJobRecoveries(ctx, []store.ExpiredDurableJobRecovery{{Job: recovered}}); err != nil {
 		t.Fatalf("reconcile expired CodeEdge evaluator reconciliation job = %v", err)
 	}
 	if scenario.observer.calls != 0 || *scenario.providerCalls != 1 {
@@ -254,9 +257,10 @@ func TestCodeEdgeEvaluatorRecoveryLeavesMissingOrMalformedObservationInDoubt(t *
 				return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInterrupted}, ErrorText: "simulate missing observer evidence"}, nil
 			}))
 			claim := claimCodeEdgeRuntimeStageJob(t, ctx, fixture.database, run.ID, job.ID)
-			state, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
-			if err != nil || state != store.JobInterrupted || providerCalls != 1 {
-				t.Fatalf("initial CodeEdge evaluator interruption = state=%s err=%v providerCalls=%d", state, err, providerCalls)
+			result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+			state := result.State
+			if err != nil || state != store.JobInDoubt || result.Failure == nil || providerCalls != 1 {
+				t.Fatalf("initial CodeEdge evaluator in_doubt result = %+v err=%v providerCalls=%d", result, err, providerCalls)
 			}
 			fixture.services.core.evaluatorObserver = &test.observer
 			if err := runtime.reconcileRecoveredStageJob(ctx, job); err != nil {
@@ -267,9 +271,9 @@ func TestCodeEdgeEvaluatorRecoveryLeavesMissingOrMalformedObservationInDoubt(t *
 			}
 			reconciliationJob := requireCodeEdgeEvaluatorReconciliationJob(t, ctx, fixture.database, job, run, stage, payload.StageKey)
 			worker := newFrozenRuntimeWorker(t, fixture.database, runtime, "codeedge-evaluator-"+test.name+"-reconciliation-worker")
-			result, workerErr := worker.RunOnce(ctx)
-			if workerErr != nil || result.Job == nil || result.Job.ID != reconciliationJob.ID || result.FinalState != store.JobSucceeded {
-				t.Fatalf("execute %s CodeEdge evaluator reconciliation job = %+v, %v", test.name, result, workerErr)
+			workerResult, workerErr := worker.RunOnce(ctx)
+			if workerErr != nil || workerResult.Job == nil || workerResult.Job.ID != reconciliationJob.ID || workerResult.FinalState != store.JobSucceeded {
+				t.Fatalf("execute %s CodeEdge evaluator reconciliation job = %+v, %v", test.name, workerResult, workerErr)
 			}
 			if test.observer.calls != 1 || providerCalls != 1 {
 				t.Fatalf("%s observation calls observer=%d provider=%d", test.name, test.observer.calls, providerCalls)
@@ -301,7 +305,8 @@ func TestCodeEdgeEvaluatorRuntimeHandlesQueuedTerminationBeforeTrialAllocation(t
 	}))
 	claim := claimCodeEdgeRuntimeStageJob(t, ctx, fixture.database, run.ID, job.ID)
 
-	state, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+	result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+	state := result.State
 	if err != nil || state != store.JobCanceled {
 		t.Fatalf("queued CodeEdge evaluator termination = state=%s err=%v", state, err)
 	}
@@ -331,7 +336,8 @@ func TestCodeEdgeEvaluatorRuntimeCompletesTrustedTrialsAfterDirectSuccessAndRepl
 	}))
 	claim := claimCodeEdgeRuntimeStageJob(t, ctx, fixture.database, run.ID, job.ID)
 
-	state, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+	result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+	state := result.State
 	if err != nil || state != store.JobSucceeded || providerCalls != 1 {
 		t.Fatalf("successful CodeEdge evaluator invocation = state=%s err=%v providerCalls=%d", state, err, providerCalls)
 	}
@@ -614,9 +620,10 @@ func newCodeEdgeEvaluatorCommittedReceiptCrashScenario(t *testing.T, ctx context
 		return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInterrupted}, ErrorText: "simulate evaluator interruption before durable projection"}, nil
 	}))
 	claim := claimCodeEdgeRuntimeStageJob(t, ctx, fixture.database, run.ID, sourceJob.ID)
-	state, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
-	if err != nil || state != store.JobInterrupted || providerCalls != 1 {
-		t.Fatalf("initial CodeEdge evaluator interruption = state=%s err=%v providerCalls=%d", state, err, providerCalls)
+	result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim})
+	state := result.State
+	if err != nil || state != store.JobInDoubt || result.Failure == nil || providerCalls != 1 {
+		t.Fatalf("initial CodeEdge evaluator in_doubt result = %+v err=%v providerCalls=%d", result, err, providerCalls)
 	}
 	assertCodeEdgeEvaluatorInDoubt(t, ctx, fixture.database, run.ID, stage, payload.StageKey)
 

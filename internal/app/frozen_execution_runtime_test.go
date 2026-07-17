@@ -337,7 +337,7 @@ func TestFrozenExecutionRuntimeRecoveryRestoresMissingStageHandoffAfterExpiredLe
 	if err != nil {
 		t.Fatalf("recovery worker result = %+v, %v", result, err)
 	}
-	if len(result.Recoveries) != 1 || result.Recoveries[0].Job.ID != sourceJob.ID || result.Recoveries[0].Job.State != store.JobInterrupted {
+	if len(result.Recoveries) != 1 || result.Recoveries[0].Job.ID != sourceJob.ID || result.Recoveries[0].Job.State != store.JobInDoubt || result.Recoveries[0].Job.Failure == nil || result.Recoveries[0].Job.Failure.Code != "job.lease_lost" {
 		t.Fatalf("recovery facts = %+v", result.Recoveries)
 	}
 	if result.FinalState != store.JobSucceeded || result.Job == nil || result.Job.CommandType != "workflow_run.execute" {
@@ -429,7 +429,7 @@ func TestFrozenExecutionRuntimeRecoveryProjectsNonProgressingTerminalStageOutcom
 			if err != nil {
 				t.Fatalf("outcome recovery result = %+v, %v", result, err)
 			}
-			if len(result.Recoveries) != 1 || result.Recoveries[0].Job.ID != sourceJob.ID || result.Empty != scenario.wantEmpty {
+			if len(result.Recoveries) != 1 || result.Recoveries[0].Job.ID != sourceJob.ID || result.Recoveries[0].Job.State != store.JobInDoubt || result.Recoveries[0].Job.Failure == nil || result.Recoveries[0].Job.Failure.Code != "job.lease_lost" || result.Empty != scenario.wantEmpty {
 				t.Fatalf("outcome recovery facts = %+v", result)
 			}
 			run, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
@@ -495,7 +495,7 @@ func TestFrozenExecutionRuntimeRejectsFrozenPluginVersionDrift(t *testing.T) {
 	}
 }
 
-func TestFrozenExecutionRuntimeMalformedPayloadProjectsRunInDoubt(t *testing.T) {
+func TestFrozenExecutionRuntimeMalformedPayloadRecordsFailureWithoutPreemptiveRunTransition(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFrozenRuntimeFixture(t)
 	defer fixture.store.Close()
@@ -509,12 +509,12 @@ func TestFrozenExecutionRuntimeMalformedPayloadProjectsRunInDoubt(t *testing.T) 
 	}
 	worker := newFrozenRuntimeWorker(t, fixture.store, runtime, "runtime-malformed-worker")
 	result, err := worker.RunOnce(ctx)
-	if err == nil || result.FinalState != store.JobFailed || result.Job == nil || result.Job.ID != malformed.ID {
+	if err == nil || result.FinalState != store.JobFailed || result.Job == nil || result.Job.ID != malformed.ID || result.Job.Failure == nil || result.Job.Failure.Code != "job.payload_invalid" {
 		t.Fatalf("malformed job result = %+v, %v", result, err)
 	}
 	run, getErr := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
-	if getErr != nil || run == nil || run.Status != store.WorkflowRunInDoubt {
-		t.Fatalf("malformed job run projection = %+v, %v", run, getErr)
+	if getErr != nil || run == nil || run.Status != store.WorkflowRunQueued {
+		t.Fatalf("malformed job unexpectedly changed Run before a matching projection = %+v, %v", run, getErr)
 	}
 }
 
@@ -545,8 +545,8 @@ func TestFrozenExecutionRuntimeRejectsMismatchedWorkflowPayloadExecutionSpecFing
 		t.Fatalf("mismatched execution specification payload result = %+v, %v", result, err)
 	}
 	run, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
-	if err != nil || run == nil || run.Status != store.WorkflowRunInDoubt {
-		t.Fatalf("mismatched execution specification run projection = %+v, %v", run, err)
+	if err != nil || run == nil || run.Status != store.WorkflowRunQueued {
+		t.Fatalf("mismatched execution specification unexpectedly changed Run = %+v, %v", run, err)
 	}
 }
 
@@ -592,9 +592,10 @@ func TestFrozenExecutionRuntimeTreatsLostStageFenceAsInDoubt(t *testing.T) {
 	}
 	lost := make(chan struct{})
 	close(lost)
-	state, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim, LeaseLost: lost})
-	if err != nil || state != store.JobInterrupted {
-		t.Fatalf("stale-fence runtime result = %s, %v", state, err)
+	result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim, LeaseLost: lost})
+	state := result.State
+	if err != nil || state != store.JobInDoubt || result.Failure == nil {
+		t.Fatalf("stale-fence runtime result = %+v, %v", result, err)
 	}
 	attempt, err := fixture.store.GetStageAttempt(ctx, sourcePayload.StageAttemptID)
 	if err != nil || attempt == nil || attempt.ExecutionStatus != store.StageExecutionInDoubt {

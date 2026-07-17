@@ -528,13 +528,21 @@ CREATE TABLE jobs (
                     CHECK (state IN ('queued', 'running', 'pause_requested', 'cancel_requested', 'stop_requested', 'paused', 'canceled', 'succeeded', 'failed', 'interrupted', 'in_doubt')),
     priority        INTEGER NOT NULL DEFAULT 0,
     payload_json    TEXT NOT NULL DEFAULT '{}',
+    failure_code         TEXT NOT NULL DEFAULT '',
+    failure_message      TEXT NOT NULL DEFAULT '',
+    failure_details_json TEXT NOT NULL DEFAULT '{}',
     idempotency_key TEXT NOT NULL UNIQUE,
     created_by      TEXT NOT NULL,
     created_at      DATETIME NOT NULL,
     updated_at      DATETIME NOT NULL,
     started_at      DATETIME,
     finished_at     DATETIME,
-    version         INTEGER NOT NULL DEFAULT 1 CHECK (version > 0)
+    version         INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    CHECK (
+        (state IN ('failed', 'in_doubt') AND failure_code <> '' AND failure_message <> '' AND failure_details_json <> '')
+        OR
+        (state NOT IN ('failed', 'in_doubt') AND failure_code = '' AND failure_message = '' AND failure_details_json = '{}')
+    )
 );
 
 -- table leases
@@ -2424,6 +2432,17 @@ BEFORE UPDATE OF id ON jobs
 WHEN NEW.id <> OLD.id
 BEGIN
     SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger jobs_failure_record_immutable
+-- A transition writes state and its first failure record together. Once a
+-- failure exists, neither a retrying worker nor an administrative SQL path can
+-- replace the diagnostic that explains the original terminal delivery fact.
+CREATE TRIGGER jobs_failure_record_immutable
+BEFORE UPDATE OF failure_code, failure_message, failure_details_json ON jobs
+WHEN OLD.failure_code <> '' OR OLD.failure_message <> '' OR OLD.failure_details_json <> '{}'
+BEGIN
+    SELECT RAISE(ABORT, 'durable job failure record is immutable');
 END;
 
 -- trigger entity_id_registry_jobs_insert

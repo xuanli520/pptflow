@@ -72,7 +72,7 @@ func (runtime *FrozenExecutionRuntime) executeWorkflowkitReviewGate(ctx context.
 		stage: stage.Clone(), attempt: attempt, inputs: append([]workflowkit.ArtifactBinding(nil), inputs...), review: &review,
 	}
 	if _, err := runtime.handleWorkflowkitStageClaim(ctx, backend); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if backend.rejected != nil {
 		return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, attempt, inputs, stageQuotaReservation{}, StageExecutionResult{
@@ -82,7 +82,7 @@ func (runtime *FrozenExecutionRuntime) executeWorkflowkitReviewGate(ctx context.
 		}, execution.LeaseLost, nil)
 	}
 	if backend.reviewResult == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: public Engine review gate did not commit an external-decision wait", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: public Engine review gate did not commit an external-decision wait", ErrFrozenExecutionPayload))
 	}
 	return *backend.reviewResult, nil
 }
@@ -519,7 +519,7 @@ func workflowkitJobTerminalState(state store.JobState) workflowkit.JobTerminalSt
 	switch state {
 	case store.JobSucceeded:
 		return workflowkit.JobCompleted
-	case store.JobInterrupted:
+	case store.JobInterrupted, store.JobInDoubt:
 		return workflowkit.JobReconcileRequired
 	default:
 		return workflowkit.JobCompleted

@@ -23,16 +23,17 @@ var (
 
 // DurableJobHandler is the only extension point used by DurableWorker after a
 // job is atomically claimed. The handler must perform its domain projection
-// through application/store APIs and return the terminal job state it proved.
-// It never receives a mutable scheduler root context or raw SQLite handle.
+// through application/store APIs and return the terminal delivery fact it
+// proved. It never receives a mutable scheduler root context or raw SQLite
+// handle.
 type DurableJobHandler interface {
-	HandleDurableJob(context.Context, DurableJobExecution) (store.JobState, error)
+	HandleDurableJob(context.Context, DurableJobExecution) (DurableJobResult, error)
 }
 
 // DurableJobRecoveryHandler is an optional domain reconciliation hook. The
 // store has already fenced and projected every recovered job before this hook
 // runs. Implementations may therefore restore only durable follow-up work
-// that is provably missing; they must not resume the interrupted job itself.
+// that is provably missing; they must not resume the in_doubt job itself.
 //
 // It is deliberately separate from DurableJobHandler: recovery is not a
 // second attempt at an unknown side effect. In particular, a stage runtime may
@@ -43,10 +44,12 @@ type DurableJobRecoveryHandler interface {
 	ReconcileDurableJobRecoveries(context.Context, []store.ExpiredDurableJobRecovery) error
 }
 
-// DurableJobHandlerFunc adapts local functions and focused integration fakes.
-type DurableJobHandlerFunc func(context.Context, DurableJobExecution) (store.JobState, error)
+// DurableJobHandlerFunc adapts result-returning handlers and focused
+// integration fakes. Failure semantics are part of DurableJobResult; callers
+// must not return an error and expect DurableWorker to classify it.
+type DurableJobHandlerFunc func(context.Context, DurableJobExecution) (DurableJobResult, error)
 
-func (function DurableJobHandlerFunc) HandleDurableJob(ctx context.Context, execution DurableJobExecution) (store.JobState, error) {
+func (function DurableJobHandlerFunc) HandleDurableJob(ctx context.Context, execution DurableJobExecution) (DurableJobResult, error) {
 	return function(ctx, execution)
 }
 
@@ -158,8 +161,8 @@ type DurableWorkerResult struct {
 // RunOnce first reconciles expired worker fences, then atomically claims and
 // executes one queued job. A claimed job always receives a delivery-final
 // durable projection unless a lease is lost, in which case recovery owns the
-// later interrupted/reconcile projection instead of a stale worker guessing
-// it. JobInDoubt is delivery-final; a new explicit redrive job owns any later
+// later in_doubt/reconcile projection instead of a stale worker guessing it.
+// JobInDoubt is delivery-final; a new explicit redrive job owns any later
 // attempt.
 func (worker *DurableWorker) RunOnce(ctx context.Context) (DurableWorkerResult, error) {
 	return worker.RunOnceForCommandTypes(ctx, nil)
@@ -221,20 +224,43 @@ func (worker *DurableWorker) RunOnceForCommandTypes(ctx context.Context, command
 	heartbeats.start()
 	defer heartbeats.stop()
 
-	state, handlerErr := worker.handler.HandleDurableJob(leaseContext, DurableJobExecution{Claim: claim, LeaseLost: heartbeats.lost})
-	if handlerErr != nil && state == "" {
-		state = stateForHandlerError(handlerErr)
-	}
-	if state == "" {
-		state = store.JobFailed
+	handlerResult, handlerErr := worker.handler.HandleDurableJob(leaseContext, DurableJobExecution{Claim: claim, LeaseLost: heartbeats.lost})
+	if handlerResult.State == "" {
 		if handlerErr == nil {
-			handlerErr = fmt.Errorf("%w: handler returned no terminal job state", ErrDurableJobHandlerUnavailable)
+			handlerErr = fmt.Errorf("%w: handler returned no terminal job result", ErrDurableJobHandlerUnavailable)
+		}
+		handlerResult = DurableJobResult{
+			State:   store.JobFailed,
+			Failure: newDurableJobFailure("worker.handler_result_missing", "The durable worker handler did not return a terminal result.", durableJobFailureDetails(job, "handler_result")),
 		}
 	}
-	if !isWorkerTerminalJobState(state) {
-		handlerErr = fmt.Errorf("%w: handler returned non-terminal state %q", ErrDurableWorkerConfiguration, state)
-		state = store.JobFailed
+	if !isWorkerTerminalJobState(handlerResult.State) {
+		handlerErr = fmt.Errorf("%w: handler returned non-terminal state %q", ErrDurableWorkerConfiguration, handlerResult.State)
+		handlerResult = DurableJobResult{
+			State:   store.JobFailed,
+			Failure: newDurableJobFailure("worker.handler_result_invalid", "The durable worker handler returned an invalid terminal result.", durableJobFailureDetails(job, "handler_result")),
+		}
 	}
+	if (handlerResult.State == store.JobFailed || handlerResult.State == store.JobInDoubt) && handlerResult.Failure == nil {
+		handlerErr = fmt.Errorf("%w: handler returned %s without a failure record", ErrDurableWorkerConfiguration, handlerResult.State)
+		handlerResult.Failure = newDurableJobFailure("worker.failure_record_missing", "The durable worker handler omitted its required failure record.", durableJobFailureDetails(job, "failure_record"))
+	}
+	if handlerResult.State != store.JobFailed && handlerResult.State != store.JobInDoubt && handlerResult.Failure != nil {
+		handlerErr = fmt.Errorf("%w: handler returned a failure record for %s", ErrDurableWorkerConfiguration, handlerResult.State)
+		handlerResult = DurableJobResult{
+			State:   store.JobFailed,
+			Failure: newDurableJobFailure("worker.handler_result_invalid", "The durable worker handler returned an invalid terminal result.", durableJobFailureDetails(job, "failure_record")),
+		}
+	}
+	if !validWorkerRunProjection(job, handlerResult) {
+		handlerErr = fmt.Errorf("%w: handler returned an invalid Run projection for terminal state %s", ErrDurableWorkerConfiguration, handlerResult.State)
+		handlerResult = DurableJobResult{
+			State:   store.JobFailed,
+			Failure: newDurableJobFailure("worker.handler_result_invalid", "The durable worker handler returned an invalid terminal result.", durableJobFailureDetails(job, "run_projection")),
+		}
+	}
+	handlerErr = durableJobHandlerError(handlerResult, handlerErr)
+	state := handlerResult.State
 	if heartbeats.wasLost() {
 		// The active fence may have been reclaimed. Never use a stale writer to
 		// overwrite the conservative interrupted/reconcile projection.
@@ -252,6 +278,7 @@ func (worker *DurableWorker) RunOnceForCommandTypes(ctx context.Context, command
 		return result, fmt.Errorf("%w: claimed job %s disappeared", store.ErrNotFound, job.ID)
 	}
 	if current.State == state {
+		result.Job = current
 		result.FinalState = state
 		return result, handlerErr
 	}
@@ -262,6 +289,8 @@ func (worker *DurableWorker) RunOnceForCommandTypes(ctx context.Context, command
 		JobID:           current.ID,
 		ExpectedVersion: current.Version,
 		State:           state,
+		Failure:         handlerResult.Failure,
+		RunProjection:   handlerResult.RunProjection,
 		Actor:           worker.actor,
 		Reason:          worker.reasonFor("complete durable job"),
 	})
@@ -332,11 +361,23 @@ func isWorkerTerminalJobState(state store.JobState) bool {
 	}
 }
 
-func stateForHandlerError(err error) store.JobState {
-	if errors.Is(err, context.Canceled) {
-		return store.JobInterrupted
+func validWorkerRunProjection(job store.DurableJob, result DurableJobResult) bool {
+	if result.RunProjection == nil {
+		return true
 	}
-	return store.JobFailed
+	if store.ValidateUUIDv7(job.RunID) != nil {
+		return false
+	}
+	switch result.State {
+	case store.JobSucceeded:
+		return result.RunProjection.Status == store.WorkflowRunRunning
+	case store.JobInDoubt:
+		return result.RunProjection.Status == store.WorkflowRunInDoubt
+	case store.JobFailed:
+		return result.RunProjection.Status == store.WorkflowRunFailedTerminal
+	default:
+		return false
+	}
 }
 
 type dispatchLeaseHeartbeats struct {

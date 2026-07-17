@@ -71,6 +71,27 @@ func TestLocalRuntimeAttachRunProjectsOnlyValidLocalLeaseFacts(t *testing.T) {
 	}
 }
 
+func TestLocalRuntimeAttachProjectsDurableFailureRecordFields(t *testing.T) {
+	recordedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
+	attached := AttachedDurableJob{Job: store.DurableJob{
+		ID:             "job-handoff",
+		CommandType:    standardAuthoringHandoffCommandType,
+		EntityType:     "artifact_ref",
+		EntityID:       "artifact-handoff",
+		StageAttemptID: "attempt-materialize",
+		State:          store.JobInDoubt,
+		FinishedAt:     &recordedAt,
+		Failure: &store.DurableJobFailure{
+			Code: "handoff.definition_unavailable", Message: "The controlled child definition is unavailable.",
+			DetailsJSON: `{"stage_key":"materialize_task","artifact_id":"artifact-handoff"}`,
+		},
+	}}
+	(&LocalRuntimeService{}).populateAttachedDurableJobFailure(&attached, nil)
+	if attached.FailureStage != "materialize_task" || attached.FailureCode != "handoff.definition_unavailable" || attached.FailureSummary != "The controlled child definition is unavailable." || attached.FailureArtifactID != "artifact-handoff" || attached.FailureRecordedAt == nil || !attached.FailureRecordedAt.Equal(recordedAt) || attached.FailureRecoveryAction != "redrive" {
+		t.Fatalf("attached durable failure projection = %+v", attached)
+	}
+}
+
 func TestLocalRuntimeReconcileRunRecoversOnlyLocalDurableFacts(t *testing.T) {
 	ctx := context.Background()
 	_, services, task, _, run := newLocalRuntimeServiceFixture(t, "runtime-reconciler")
@@ -122,7 +143,7 @@ func TestLocalRuntimeReconcileRunRecoversOnlyLocalDurableFacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.RecoveredJobs) != 1 || result.RecoveredJobs[0].Job.ID != claim.Job.ID || result.RecoveredJobs[0].Job.State != store.JobInterrupted {
+	if len(result.RecoveredJobs) != 1 || result.RecoveredJobs[0].Job.ID != claim.Job.ID || result.RecoveredJobs[0].Job.State != store.JobInDoubt || result.RecoveredJobs[0].Job.Failure == nil || result.RecoveredJobs[0].Job.Failure.Code != "job.lease_lost" {
 		t.Fatalf("local job recovery = %+v", result.RecoveredJobs)
 	}
 	if result.ExpiredTaskQuotas != 1 || result.ExpiredActorQuotas != 1 {
@@ -139,7 +160,7 @@ func TestLocalRuntimeReconcileRunRecoversOnlyLocalDurableFacts(t *testing.T) {
 	}
 
 	job, err := services.Store().GetDurableJob(ctx, claim.Job.ID)
-	if err != nil || job == nil || job.State != store.JobInterrupted {
+	if err != nil || job == nil || job.State != store.JobInDoubt || job.Failure == nil || job.Failure.Code != "job.lease_lost" {
 		t.Fatalf("reconciled job = %+v, %v", job, err)
 	}
 	dispatchLease, err := services.Store().GetLease(ctx, claim.DispatchLease.ID)
@@ -226,12 +247,13 @@ func TestLocalRuntimeReconcileRunDrainsEveryExpiredJobBatch(t *testing.T) {
 	if len(result.RecoveredJobs) != expectedJobs {
 		t.Fatalf("recovered %d jobs, want all %d", len(result.RecoveredJobs), expectedJobs)
 	}
-	recovered := make(map[string]store.JobState, len(result.RecoveredJobs))
+	recovered := make(map[string]store.DurableJob, len(result.RecoveredJobs))
 	for _, recovery := range result.RecoveredJobs {
-		recovered[recovery.Job.ID] = recovery.Job.State
+		recovered[recovery.Job.ID] = recovery.Job
 	}
 	for _, claim := range claims {
-		if recovered[claim.Job.ID] != store.JobInterrupted {
+		job, found := recovered[claim.Job.ID]
+		if !found || job.State != store.JobInDoubt || job.Failure == nil || job.Failure.Code != "job.lease_lost" {
 			t.Fatalf("batch job %s was not recovered: %+v", claim.Job.ID, recovered)
 		}
 	}

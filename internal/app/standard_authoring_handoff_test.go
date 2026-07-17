@@ -178,6 +178,51 @@ func TestStandardAuthoringHandoffFailsClosedWithoutPhase1Definition(t *testing.T
 	}
 }
 
+func TestStandardAuthoringHandoffClassifiesInvalidArtifactLineageAsFailed(t *testing.T) {
+	ctx := context.Background()
+	fixture := newStandardAuthoringHandoffFixture(t)
+	services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingArtifactID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRunID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = services.StandardAuthoringHandoffs.Consume(ctx, StandardAuthoringHandoffRequest{
+		AuthoringRunID: fixture.run.ID, StageAttemptID: fixture.stageAttempt.ID,
+		HandoffArtifactID: missingArtifactID, ChildRunID: childRunID, Actor: "worker", Reason: "verify invalid artifact lineage",
+	})
+	var diagnostic *standardAuthoringHandoffFailure
+	if !errors.As(err, &diagnostic) || diagnostic == nil || diagnostic.state != store.JobFailed || diagnostic.code != handoffArtifactLineageInvalidCode {
+		t.Fatalf("invalid artifact lineage diagnosis = %#v, err=%v", diagnostic, err)
+	}
+	if diagnostic.message == "" || strings.Contains(strings.ToLower(diagnostic.message), "path") {
+		t.Fatalf("invalid artifact lineage summary = %q", diagnostic.message)
+	}
+}
+
+func TestHandoffDeterministicStoreConflictClassification(t *testing.T) {
+	for _, err := range []error{
+		store.ErrIdempotencyConflict,
+		store.ErrIdentityCollision,
+		store.ErrImmutable,
+		store.ErrInvalidTransition,
+		store.ErrInvalidUUIDv7Identity,
+	} {
+		if !handoffDeterministicStoreConflict(err) {
+			t.Fatalf("deterministic Store conflict %v was classified as retryable storage", err)
+		}
+	}
+	if handoffDeterministicStoreConflict(errors.New("temporary database unavailable")) {
+		t.Fatal("temporary storage error was classified as deterministic conflict")
+	}
+}
+
 func TestFrozenRuntimeEnqueuesAndConsumesOneStandardAuthoringHandoffJob(t *testing.T) {
 	ctx := context.Background()
 	fixture := newStandardAuthoringHandoffFixture(t)
@@ -297,7 +342,9 @@ func TestStandardAuthoringHandoffBlocksReverseCoordinatorCompletionUntilChildIsB
 		t.Fatalf("consume Standard handoff = %s, %v", state, err)
 	}
 	handoffDelivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
-		JobID: handoffDelivery.ID, ExpectedVersion: handoffDelivery.Version, State: state, Actor: "worker", Reason: "record Standard handoff delivery",
+		JobID: handoffDelivery.ID, ExpectedVersion: handoffDelivery.Version, State: state,
+		RunProjection: standardAuthoringHandoffRunProjection(handoffDelivery, state),
+		Actor:         "worker", Reason: "record Standard handoff delivery",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -358,7 +405,9 @@ func TestStandardAuthoringHandoffCompletionResumesMaterializedContinuation(t *te
 		t.Fatalf("consume continuation materialization handoff = %s, %v", state, err)
 	}
 	if _, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
-		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: state, Actor: "worker", Reason: "record continuation materialization handoff",
+		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: state,
+		RunProjection: standardAuthoringHandoffRunProjection(delivery, state),
+		Actor:         "worker", Reason: "record continuation materialization handoff",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -441,13 +490,23 @@ func TestStandardAuthoringHandoffDefinitionHoldRequiresExplicitRedriveAndReusesC
 	if state != store.JobInDoubt || !errors.Is(holdErr, ErrCodeEdgePhase1DefinitionUnavailable) {
 		t.Fatalf("definition hold = state %s err %v; want in_doubt/unavailable", state, holdErr)
 	}
+	failure := durableJobFailureFromError(holdErr)
+	if failure == nil || failure.Code != handoffDefinitionUnavailableCode {
+		t.Fatalf("definition hold failure = %+v; want %s", failure, handoffDefinitionUnavailableCode)
+	}
 	originalDelivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
-		JobID: originalDelivery.ID, ExpectedVersion: originalDelivery.Version, State: state, Actor: "worker", Reason: "record unavailable Standard handoff hold",
+		JobID: originalDelivery.ID, ExpectedVersion: originalDelivery.Version, State: state, Failure: failure,
+		RunProjection: standardAuthoringHandoffRunProjection(originalDelivery, state),
+		Actor:         "worker", Reason: "record unavailable Standard handoff hold",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if originalDelivery.FinishedAt == nil {
+	parent, err := fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parent == nil || parent.Status != store.WorkflowRunInDoubt {
+		t.Fatalf("definition hold parent Run = %+v, %v; want in_doubt", parent, err)
+	}
+	if originalDelivery.FinishedAt == nil || originalDelivery.Failure == nil || originalDelivery.Failure.Code != handoffDefinitionUnavailableCode {
 		t.Fatalf("in_doubt handoff must finish its current delivery: %+v", originalDelivery)
 	}
 	payload, err := standardAuthoringHandoffJobPayload(originalDelivery)
@@ -492,21 +551,67 @@ func TestStandardAuthoringHandoffDefinitionHoldRequiresExplicitRedriveAndReusesC
 		t.Fatalf("redrive handoff delivery = %s, %v", state, err)
 	}
 	if _, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
-		JobID: redrive.ID, ExpectedVersion: redrive.Version, State: state, Actor: "worker", Reason: "record explicit Standard handoff redrive",
+		JobID: redrive.ID, ExpectedVersion: redrive.Version, State: state,
+		RunProjection: standardAuthoringHandoffRunProjection(redrive, state),
+		Actor:         "worker", Reason: "record explicit Standard handoff redrive",
 	}); err != nil {
 		t.Fatal(err)
 	}
+	parent, err = fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parent == nil || parent.Status != store.WorkflowRunRunning {
+		t.Fatalf("successful redrive parent Run = %+v, %v; want running", parent, err)
+	}
+	parentVersion := parent.Version
 	child, err := fixture.database.GetWorkflowRun(ctx, payload.ChildRunID)
 	if err != nil || child == nil || child.ID != payload.ChildRunID || child.ParentRunID != fixture.run.ID {
 		t.Fatalf("redriven child = %+v, %v; want original child identity %s", child, err, payload.ChildRunID)
 	}
-	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+original.ID)
-	if err != nil || completion == nil || completion.CommandType != "workflow_run.execute" {
-		t.Fatalf("redrive completion coordinator = %+v, %v", completion, err)
+	replayedAfterSuccess, err := withDefinition.StandardAuthoringHandoffs.Redrive(ctx, command)
+	if err != nil || replayedAfterSuccess.ID != redrive.ID || replayedAfterSuccess.State != store.JobSucceeded {
+		t.Fatalf("same redrive command after success = %+v, %v; want succeeded recovery replay", replayedAfterSuccess, err)
+	}
+	jobsBeforeRecoveryRejection, err := fixture.database.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResolvedRecoveryRejected := func(action string, invoke func() (store.DurableJob, error)) {
+		t.Helper()
+		if _, err := invoke(); err == nil || !strings.Contains(err.Error(), "already recovered successfully") {
+			t.Fatalf("new-key %s after successful recovery = %v; want resolved handoff rejection", action, err)
+		}
+	}
+	newRedriveKey, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResolvedRecoveryRejected("redrive", func() (store.DurableJob, error) {
+		return withDefinition.StandardAuthoringHandoffs.Redrive(ctx, RedriveStandardAuthoringHandoffCommand{
+			AuthoringRunID: fixture.run.ID, IdempotencyKey: newRedriveKey, Actor: "operator", Reason: "attempt duplicate successful handoff redrive",
+		})
+	})
+	newReconcileKey, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResolvedRecoveryRejected("reconcile", func() (store.DurableJob, error) {
+		return withDefinition.StandardAuthoringHandoffs.Reconcile(ctx, ReconcileStandardAuthoringHandoffCommand{
+			AuthoringRunID: fixture.run.ID, IdempotencyKey: newReconcileKey, Actor: "operator", Reason: "attempt duplicate successful handoff reconcile",
+		})
+	})
+	parentAfterRecoveryRejection, err := fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || parentAfterRecoveryRejection == nil || parentAfterRecoveryRejection.Status != store.WorkflowRunRunning || parentAfterRecoveryRejection.Version != parentVersion {
+		t.Fatalf("rejected recovery changed successful parent Run = %+v, %v", parentAfterRecoveryRejection, err)
 	}
 	jobs, err := fixture.database.ListDurableJobsForRun(ctx, fixture.run.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(jobs) != len(jobsBeforeRecoveryRejection) {
+		t.Fatalf("rejected recovery created durable jobs: before=%d after=%d", len(jobsBeforeRecoveryRejection), len(jobs))
+	}
+	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+original.ID)
+	if err != nil || completion == nil || completion.CommandType != "workflow_run.execute" {
+		t.Fatalf("redrive completion coordinator = %+v, %v", completion, err)
 	}
 	completionCount := 0
 	for _, job := range jobs {
@@ -519,10 +624,62 @@ func TestStandardAuthoringHandoffDefinitionHoldRequiresExplicitRedriveAndReusesC
 	}
 }
 
-func TestRecoveredStandardAuthoringHandoffCreatesCompletionAfterChildWasPersisted(t *testing.T) {
+func TestStandardAuthoringHandoffWorkerPersistsTypedDefinitionFailureForRedrive(t *testing.T) {
 	ctx := context.Background()
 	fixture := newStandardAuthoringHandoffFixture(t)
-	initial := queueStandardAuthoringInitialCoordinator(t, ctx, fixture)
+	withoutDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &FrozenExecutionRuntime{core: withoutDefinition.core, services: withoutDefinition}
+	if err := runtime.enqueueStandardAuthoringHandoff(ctx, store.DurableJob{CreatedBy: "worker"}, fixture.run, fixture.stageAttempt); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewDurableWorker(DurableWorkerConfig{
+		Store: fixture.database, Owner: "handoff-failure-worker", Actor: "worker", Reason: "persist typed handoff failure",
+		Handler: DurableJobHandlerFunc(func(handlerCtx context.Context, execution DurableJobExecution) (DurableJobResult, error) {
+			if execution.Claim.Job == nil {
+				return DurableJobResult{State: store.JobFailed, Failure: newDurableJobFailure("worker.claim_missing", "The durable handoff worker claim is missing its job.", map[string]string{"check": "claim"})}, ErrDurableJobHandlerUnavailable
+			}
+			state, cause := runtime.handleStandardAuthoringHandoff(handlerCtx, *execution.Claim.Job)
+			outcome := durableJobResultForOutcome(*execution.Claim.Job, state, cause)
+			outcome.RunProjection = standardAuthoringHandoffRunProjection(*execution.Claim.Job, outcome.State)
+			return outcome, cause
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, workerErr := worker.RunOnce(ctx)
+	if !errors.Is(workerErr, ErrCodeEdgePhase1DefinitionUnavailable) || result.FinalState != store.JobInDoubt || result.Job == nil || result.Job.Failure == nil || result.Job.Failure.Code != handoffDefinitionUnavailableCode {
+		t.Fatalf("typed handoff worker result = %+v, %v", result, workerErr)
+	}
+	persisted, err := fixture.database.GetDurableJob(ctx, result.Job.ID)
+	if err != nil || persisted == nil || persisted.Failure == nil || persisted.Failure.Code != handoffDefinitionUnavailableCode || persisted.Failure.Message == "" {
+		t.Fatalf("persisted handoff failure = %+v, %v", persisted, err)
+	}
+	withDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+		OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
+		CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	redrive, err := withDefinition.StandardAuthoringHandoffs.Redrive(ctx, RedriveStandardAuthoringHandoffCommand{
+		AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "install controlled definition",
+	})
+	if err != nil || redrive.CommandType != standardAuthoringHandoffRedriveCommandType || redrive.State != store.JobQueued {
+		t.Fatalf("typed failure redrive = %+v, %v", redrive, err)
+	}
+}
+
+func TestRecoveredStandardAuthoringHandoffDoesNotReplayWithoutExplicitRecovery(t *testing.T) {
+	ctx := context.Background()
+	fixture := newStandardAuthoringHandoffFixture(t)
 	withDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
 		OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
 		CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
@@ -559,10 +716,12 @@ func TestRecoveredStandardAuthoringHandoffCreatesCompletionAfterChildWasPersiste
 		t.Fatal(err)
 	}
 	delivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
-		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: store.JobInterrupted, Actor: "recovery", Reason: "simulate expired worker lease",
+		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: store.JobInDoubt,
+		Failure: &store.DurableJobFailure{Code: "job.lease_lost", Message: "The worker lease expired before the job outcome was recorded.", DetailsJSON: `{}`},
+		Actor:   "recovery", Reason: "simulate expired worker lease",
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || delivery.Failure == nil || delivery.Failure.Code != "job.lease_lost" {
+		t.Fatalf("recover expired handoff delivery = %+v, %v", delivery, err)
 	}
 	withoutDefinition, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
 	if err != nil {
@@ -573,30 +732,147 @@ func TestRecoveredStandardAuthoringHandoffCreatesCompletionAfterChildWasPersiste
 		t.Fatalf("recover child-persisted Standard handoff without provider = %v", err)
 	}
 	completion, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-completion:"+original.ID)
-	if err != nil || completion == nil || completion.State != store.JobQueued {
-		t.Fatalf("recovered completion coordinator = %+v, %v", completion, err)
+	if err != nil || completion != nil {
+		t.Fatalf("automatic recovered completion coordinator = %+v, %v; want none until explicit recovery", completion, err)
 	}
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
-	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	persisted, err := fixture.database.GetDurableJob(ctx, delivery.ID)
+	if err != nil || persisted == nil || persisted.State != store.JobInDoubt || persisted.Failure == nil || persisted.Failure.Code != "job.lease_lost" {
+		t.Fatalf("recovered handoff failure record = %+v, %v", persisted, err)
+	}
+}
+
+func TestStandardAuthoringHandoffReconcileRepublishesLeaseLostDeliveryWithoutRewritingOriginal(t *testing.T) {
+	ctx := context.Background()
+	fixture := newStandardAuthoringHandoffFixture(t)
+	services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	frozen := frozenRunDefinition{Workflow: resolved.Descriptor}
-	plan := runtimeExecutionPlan{
-		Workflow: resolved.Descriptor,
-		Transitions: map[workflowkit.StageKey]workflowkit.NodeTransition{
-			workflowkit.StageKey(workflowadapter.MaterializeTask): {
-				NodeID: workflowkit.StageKey(workflowadapter.MaterializeTask), FromGeneration: 0, ToGeneration: 0,
-				Disposition: workflowkit.DispositionSchedule,
-			},
-		},
+	runtime := &FrozenExecutionRuntime{core: services.core, services: services}
+	if err := runtime.enqueueStandardAuthoringHandoff(ctx, store.DurableJob{CreatedBy: "worker", Priority: 7}, fixture.run, fixture.stageAttempt); err != nil {
+		t.Fatal(err)
 	}
-	if err := runtime.completeExecutionIfSatisfied(ctx, initial, fixture.run, frozen, plan); err != nil {
-		t.Fatalf("recovered handoff completion barrier = %v", err)
+	original, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-handoff:"+fixture.stageAttempt.ID)
+	if err != nil || original == nil {
+		t.Fatalf("original lease-lost handoff job = %+v, %v", original, err)
 	}
-	parent, err := fixture.database.GetWorkflowRun(ctx, fixture.run.ID)
-	if err != nil || parent == nil || parent.Status != store.WorkflowRunSucceeded {
-		t.Fatalf("parent after recovered child handoff = %+v, %v; want succeeded", parent, err)
+	delivery, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: original.ID, ExpectedVersion: original.Version, State: store.JobRunning, Actor: "worker", Reason: "claim handoff before simulated lease loss",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: store.JobInDoubt,
+		Failure: newDurableJobFailure("job.lease_lost", "The worker lease expired before the job outcome was recorded.", durableJobFailureDetails(delivery, "lease")),
+		Actor:   "recovery", Reason: "record simulated handoff lease loss",
+	})
+	if err != nil || delivery.Failure == nil || delivery.Failure.Code != "job.lease_lost" {
+		t.Fatalf("lease-lost original handoff = %+v, %v", delivery, err)
+	}
+	originalFailure := *delivery.Failure
+
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := ReconcileStandardAuthoringHandoffCommand{
+		AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "reconcile lost Standard authoring handoff lease",
+	}
+	reconcile, err := services.StandardAuthoringHandoffs.Reconcile(ctx, command)
+	if err != nil {
+		t.Fatalf("reconcile lease-lost handoff: %v", err)
+	}
+	if reconcile.CommandType != standardAuthoringHandoffReconcileCommandType || reconcile.State != store.JobQueued ||
+		reconcile.ID == delivery.ID || reconcile.PayloadJSON != delivery.PayloadJSON || reconcile.RunID != delivery.RunID ||
+		reconcile.StageAttemptID != delivery.StageAttemptID || reconcile.EntityID != delivery.EntityID {
+		t.Fatalf("lease-lost handoff reconcile job = %+v; want separate queued immutable delivery", reconcile)
+	}
+	if _, err := standardAuthoringHandoffJobPayload(reconcile); err != nil {
+		t.Fatalf("reconcile job is not a valid immutable handoff delivery: %v", err)
+	}
+	if !runWorkerJobIsEligible(store.WorkflowRunInDoubt, reconcile) {
+		t.Fatalf("lease-lost reconcile job is not eligible while its parent Run is in_doubt: %+v", reconcile)
+	}
+	replayed, err := services.StandardAuthoringHandoffs.Reconcile(ctx, command)
+	if err != nil || replayed.ID != reconcile.ID || replayed.Version != reconcile.Version {
+		t.Fatalf("same reconcile command did not replay its durable job: %+v, %v; first=%+v", replayed, err, reconcile)
+	}
+
+	persistedOriginal, err := fixture.database.GetDurableJob(ctx, delivery.ID)
+	if err != nil || persistedOriginal == nil || persistedOriginal.State != store.JobInDoubt || persistedOriginal.Version != delivery.Version ||
+		persistedOriginal.Failure == nil || *persistedOriginal.Failure != originalFailure {
+		t.Fatalf("original handoff was rewritten by reconcile = %+v, %v; want immutable in_doubt failure %+v", persistedOriginal, err, originalFailure)
+	}
+	jobs, err := fixture.database.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, job := range jobs {
+		if job.CommandType == standardAuthoringHandoffReconcileCommandType {
+			count++
+			if job.ID != reconcile.ID || job.IdempotencyKey != "standard-authoring-handoff-reconcile:"+delivery.ID+":"+key {
+				t.Fatalf("unexpected lease-lost reconcile delivery = %+v", job)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("lease-lost handoff reconcile jobs = %d; want exactly one", count)
+	}
+}
+
+func TestStandardAuthoringHandoffReconcileRejectsDeterministicFailedDelivery(t *testing.T) {
+	ctx := context.Background()
+	fixture := newStandardAuthoringHandoffFixture(t)
+	services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &FrozenExecutionRuntime{core: services.core, services: services}
+	if err := runtime.enqueueStandardAuthoringHandoff(ctx, store.DurableJob{CreatedBy: "worker"}, fixture.run, fixture.stageAttempt); err != nil {
+		t.Fatal(err)
+	}
+	original, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-handoff:"+fixture.stageAttempt.ID)
+	if err != nil || original == nil {
+		t.Fatalf("original deterministic handoff job = %+v, %v", original, err)
+	}
+	delivery, err := fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: original.ID, ExpectedVersion: original.Version, State: store.JobRunning, Actor: "worker", Reason: "claim deterministic handoff failure",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: delivery.ID, ExpectedVersion: delivery.Version, State: store.JobFailed,
+		Failure: newDurableJobFailure(handoffArtifactLineageInvalidCode, "The handoff artifact lineage is invalid.", durableJobFailureDetails(delivery, "artifact_lineage")),
+		Actor:   "worker", Reason: "record deterministic handoff failure",
+	})
+	if err != nil || delivery.Failure == nil || delivery.Failure.Code != handoffArtifactLineageInvalidCode {
+		t.Fatalf("deterministic handoff delivery = %+v, %v", delivery, err)
+	}
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = services.StandardAuthoringHandoffs.Reconcile(ctx, ReconcileStandardAuthoringHandoffCommand{
+		AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "attempt deterministic handoff reconcile",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not eligible") {
+		t.Fatalf("reconcile deterministic failed handoff = %v; want not eligible", err)
+	}
+	jobs, err := fixture.database.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range jobs {
+		if job.CommandType == standardAuthoringHandoffReconcileCommandType {
+			t.Fatalf("deterministic failed handoff created reconcile job: %+v", job)
+		}
 	}
 }
 
@@ -637,6 +913,46 @@ func TestStandardAuthoringHandoffRedriveRejectsUnavailableDefinitionAndNonInDoub
 		_, err = services.StandardAuthoringHandoffs.Redrive(ctx, RedriveStandardAuthoringHandoffCommand{AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "reject queued original redrive"})
 		if err == nil || !strings.Contains(err.Error(), "not eligible") {
 			t.Fatalf("redrive queued original = %v; want not eligible", err)
+		}
+	})
+	t.Run("deterministic handoff failure is not redrivable", func(t *testing.T) {
+		fixture := newStandardAuthoringHandoffFixture(t)
+		services, err := NewLifecycleServicesWithOptions(fixture.root, fixture.database, LifecycleServicesOptions{
+			OperationResolver:                   testsupport.AcceptAllStageOperationResolver(),
+			CodeEdgePhase1RunDefinitionProvider: standardAuthoringHandoffDefinitionProvider(t),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime := &FrozenExecutionRuntime{core: services.core, services: services}
+		if err := runtime.enqueueStandardAuthoringHandoff(ctx, store.DurableJob{CreatedBy: "worker"}, fixture.run, fixture.stageAttempt); err != nil {
+			t.Fatal(err)
+		}
+		original, err := fixture.database.GetDurableJobByIdempotency(ctx, "standard-authoring-handoff:"+fixture.stageAttempt.ID)
+		if err != nil || original == nil {
+			t.Fatalf("deterministic failure original handoff = %+v, %v", original, err)
+		}
+		delivery := *original
+		delivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+			JobID: delivery.ID, ExpectedVersion: delivery.Version, State: store.JobRunning, Actor: "worker", Reason: "claim deterministic handoff failure",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		delivery, err = fixture.database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+			JobID: delivery.ID, ExpectedVersion: delivery.Version, State: store.JobFailed, Actor: "worker", Reason: "record artifact lineage failure",
+			Failure: newDurableJobFailure(handoffArtifactLineageInvalidCode, "The handoff artifact lineage is invalid.", durableJobFailureDetails(delivery, "artifact_lineage")),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := store.NewUUIDv7()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = services.StandardAuthoringHandoffs.Redrive(ctx, RedriveStandardAuthoringHandoffCommand{AuthoringRunID: fixture.run.ID, IdempotencyKey: key, Actor: "operator", Reason: "reject deterministic handoff failure"})
+		if err == nil || !strings.Contains(err.Error(), "not eligible") {
+			t.Fatalf("redrive deterministic handoff failure = %v; want not eligible", err)
 		}
 	})
 }

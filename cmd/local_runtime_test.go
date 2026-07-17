@@ -122,14 +122,14 @@ func TestRunReconcileCommandRequiresReasonAndScopesRecoveryToNamedRun(t *testing
 	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		t.Fatalf("decode run reconcile output: %v\n%s", err, output.String())
 	}
-	if len(result.RecoveredJobs) != 1 || result.RecoveredJobs[0].Job.ID != claimA.Job.ID || result.RecoveredJobs[0].Job.State != store.JobInterrupted {
+	if len(result.RecoveredJobs) != 1 || result.RecoveredJobs[0].Job.ID != claimA.Job.ID || result.RecoveredJobs[0].Job.State != store.JobInDoubt || result.RecoveredJobs[0].Job.Failure == nil || result.RecoveredJobs[0].Job.Failure.Code != "job.lease_lost" {
 		t.Fatalf("run reconcile output = %+v", result)
 	}
 
 	check := openCommandLifecycle(t, root)
 	defer check.Store().Close()
 	selected, err := check.Store().GetDurableJob(ctx, claimA.Job.ID)
-	if err != nil || selected == nil || selected.State != store.JobInterrupted {
+	if err != nil || selected == nil || selected.State != store.JobInDoubt || selected.Failure == nil || selected.Failure.Code != "job.lease_lost" {
 		t.Fatalf("selected Run job after reconcile = %+v, %v", selected, err)
 	}
 	unselected, err := check.Store().GetDurableJob(ctx, claimB.Job.ID)
@@ -328,7 +328,7 @@ func TestRunReconcileCommandLeavesCodeEdgeEvaluatorInDoubtLocalOnly(t *testing.T
 	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		t.Fatalf("decode CodeEdge evaluator local reconcile output: %v\n%s", err, output.String())
 	}
-	if len(result.RecoveredJobs) != 1 || result.RecoveredJobs[0].Job.ID != claim.Job.ID || result.RecoveredJobs[0].Job.State != store.JobInterrupted {
+	if len(result.RecoveredJobs) != 1 || result.RecoveredJobs[0].Job.ID != claim.Job.ID || result.RecoveredJobs[0].Job.State != store.JobInDoubt || result.RecoveredJobs[0].Job.Failure == nil || result.RecoveredJobs[0].Job.Failure.Code != "job.lease_lost" {
 		t.Fatalf("CodeEdge evaluator local reconcile result = %+v", result)
 	}
 	if probe.observerCalls != 0 || probe.providerCalls != 0 {
@@ -363,7 +363,7 @@ func TestRunReconcileCommandLeavesCodeEdgeEvaluatorInDoubtLocalOnly(t *testing.T
 		t.Fatalf("local run reconcile created a CodeEdge evaluator provider receipt = %+v, %v", afterReceipt, err)
 	}
 	afterJob, err := check.Store().GetDurableJob(ctx, claim.Job.ID)
-	if err != nil || afterJob == nil || afterJob.State != store.JobInterrupted {
+	if err != nil || afterJob == nil || afterJob.State != store.JobInDoubt || afterJob.Failure == nil || afterJob.Failure.Code != "job.lease_lost" {
 		t.Fatalf("local evaluator worker job after reconcile = %+v, %v", afterJob, err)
 	}
 }

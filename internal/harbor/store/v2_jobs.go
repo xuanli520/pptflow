@@ -19,7 +19,7 @@ const (
 
 const durableJobSelect = `
 	SELECT id, command_type, entity_type, entity_id, run_id, stage_attempt_id,
-	       state, priority, payload_json, idempotency_key, created_by,
+	       state, priority, payload_json, failure_code, failure_message, failure_details_json, idempotency_key, created_by,
 	       created_at, updated_at, started_at, finished_at, version
 	FROM jobs`
 
@@ -96,11 +96,11 @@ func (s *Store) CreateDurableJob(ctx context.Context, request CreateDurableJobRe
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO jobs (
 			id, command_type, entity_type, entity_id, run_id, stage_attempt_id, state,
-			priority, payload_json, idempotency_key, created_by, created_at, updated_at,
+			priority, payload_json, failure_code, failure_message, failure_details_json, idempotency_key, created_by, created_at, updated_at,
 			started_at, finished_at, version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
 	`, job.ID, job.CommandType, job.EntityType, job.EntityID, nullableString(job.RunID), nullableString(job.StageAttemptID),
-		job.State, job.Priority, job.PayloadJSON, job.IdempotencyKey, job.CreatedBy, job.CreatedAt, job.UpdatedAt, job.Version)
+		job.State, job.Priority, job.PayloadJSON, "", "", "{}", job.IdempotencyKey, job.CreatedBy, job.CreatedAt, job.UpdatedAt, job.Version)
 	if err != nil {
 		if isGlobalIdentityCollision(err) {
 			return DurableJob{}, fmt.Errorf("%w: durable job %s", ErrIdentityCollision, job.ID)
@@ -219,6 +219,10 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 	if !validJobState(request.State) {
 		return DurableJob{}, fmt.Errorf("invalid job state %q", request.State)
 	}
+	failure, err := prepareDurableJobTransitionFailure(request.State, request.Failure)
+	if err != nil {
+		return DurableJob{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return DurableJob{}, err
@@ -234,8 +238,16 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 	if !validJobTransition(job.State, request.State) {
 		return DurableJob{}, fmt.Errorf("%w: job %s from %s to %s", ErrInvalidTransition, job.ID, job.State, request.State)
 	}
+	if job.Failure != nil {
+		return DurableJob{}, fmt.Errorf("%w: durable job %s failure cannot be overwritten", ErrImmutable, job.ID)
+	}
+	projection, err := prepareDurableJobRunProjection(job, request.State, request.RunProjection)
+	if err != nil {
+		return DurableJob{}, err
+	}
 	now := s.now().UTC()
 	job.State = request.State
+	job.Failure = failure
 	job.UpdatedAt = now
 	if job.State == JobRunning && job.StartedAt == nil {
 		job.StartedAt = &now
@@ -244,10 +256,14 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 		job.FinishedAt = &now
 	}
 	job.Version++
+	failureCode, failureMessage, failureDetailsJSON := durableJobFailureColumns(job.Failure)
 	result, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET state = ?, updated_at = ?, started_at = ?, finished_at = ?, version = ?
+		UPDATE jobs SET state = ?, failure_code = ?, failure_message = ?, failure_details_json = ?,
+			updated_at = ?, started_at = ?, finished_at = ?, version = ?
 		WHERE id = ? AND version = ?
-	`, job.State, job.UpdatedAt, job.StartedAt, job.FinishedAt, job.Version, job.ID, request.ExpectedVersion)
+			AND failure_code = '' AND failure_message = '' AND failure_details_json = '{}'
+	`, job.State, failureCode, failureMessage, failureDetailsJSON,
+		job.UpdatedAt, job.StartedAt, job.FinishedAt, job.Version, job.ID, request.ExpectedVersion)
 	if err != nil {
 		return DurableJob{}, err
 	}
@@ -266,13 +282,22 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 			return DurableJob{}, err
 		}
 	}
+	if projection != nil {
+		if err := s.projectDurableJobRunTx(ctx, tx, job, *projection, resolveActor(request.Actor), request.Reason, now); err != nil {
+			return DurableJob{}, err
+		}
+	}
+	auditDetails := map[string]any{"state": job.State, "version": job.Version}
+	if job.Failure != nil {
+		auditDetails["failure_code"] = job.Failure.Code
+	}
 	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
 		Actor:       request.Actor,
 		EntityType:  "job",
 		EntityID:    job.ID,
 		Action:      "job.transitioned",
 		Reason:      request.Reason,
-		PayloadJSON: auditPayload(map[string]any{"state": job.State, "version": job.Version}),
+		PayloadJSON: auditPayload(auditDetails),
 		CreatedAt:   now,
 	}); err != nil {
 		return DurableJob{}, err
@@ -281,6 +306,88 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 		return DurableJob{}, err
 	}
 	return job, nil
+}
+
+func prepareDurableJobRunProjection(job DurableJob, state JobState, projection *DurableJobRunProjection) (*DurableJobRunProjection, error) {
+	if projection == nil {
+		return nil, nil
+	}
+	expectedStatus, projectsRun := durableJobRunProjectionStatus(state)
+	if !projectsRun {
+		return nil, fmt.Errorf("%w: durable job Run projection is not defined for terminal state %s", ErrInvalidTransition, state)
+	}
+	if job.RunID == "" || !isUUIDv7(job.RunID) {
+		return nil, fmt.Errorf("%w: durable job %s has no valid workflow Run for projection", ErrInvalidTransition, job.ID)
+	}
+	if projection.Status != expectedStatus {
+		return nil, fmt.Errorf("%w: durable job %s state %s requires workflow Run projection %s, got %s", ErrInvalidTransition, job.ID, state, expectedStatus, projection.Status)
+	}
+	return &DurableJobRunProjection{Status: expectedStatus}, nil
+}
+
+// durableJobRunProjectionStatus is the only Store-level mapping from a
+// durable delivery outcome to its optional workflow Run projection. The Run
+// is a read model of the immutable failure fact, so callers cannot choose a
+// conflicting status while completing the job.
+func durableJobRunProjectionStatus(state JobState) (WorkflowRunStatus, bool) {
+	switch state {
+	case JobSucceeded:
+		return WorkflowRunRunning, true
+	case JobInDoubt:
+		return WorkflowRunInDoubt, true
+	case JobFailed:
+		return WorkflowRunFailedTerminal, true
+	default:
+		return "", false
+	}
+}
+
+// projectDurableJobRunTx mirrors TransitionWorkflowRun inside the terminal
+// job transaction. It deliberately accepts an already-matching status: a
+// handoff can complete while its parent Run is already running, and no second
+// Run audit event is needed for that idempotent projection.
+func (s *Store) projectDurableJobRunTx(ctx context.Context, tx *sql.Tx, job DurableJob, projection DurableJobRunProjection, actor, reason string, now time.Time) error {
+	run, err := getWorkflowRunTx(ctx, tx, job.RunID)
+	if err != nil {
+		return err
+	}
+	if run.Status == projection.Status || isTerminalWorkflowRunStatus(run.Status) {
+		return nil
+	}
+	if !validWorkflowRunTransition(run.Status, projection.Status) {
+		return fmt.Errorf("%w: workflow run %s from %s to %s", ErrInvalidTransition, run.ID, run.Status, projection.Status)
+	}
+	run.Status = projection.Status
+	if (run.Status == WorkflowRunRunning || run.Status == WorkflowRunWaitingReview) && run.StartedAt == nil {
+		run.StartedAt = &now
+	}
+	if marksWorkflowRunFinished(run.Status) {
+		run.FinishedAt = &now
+	} else if run.Status == WorkflowRunRunning || run.Status == WorkflowRunQueued || run.Status == WorkflowRunResumeRequested {
+		run.FinishedAt = nil
+	}
+	run.Version++
+	result, err := tx.ExecContext(ctx, `
+		UPDATE workflow_runs SET status = ?, started_at = ?, finished_at = ?, version = ?
+		WHERE id = ? AND version = ?
+	`, run.Status, run.StartedAt, run.FinishedAt, run.Version, run.ID, run.Version-1)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: workflow run %s", ErrOptimisticLock, run.ID)
+	}
+	_, err = s.appendAuditTx(ctx, tx, AuditEvent{
+		Actor: actor, EntityType: "workflow_run", EntityID: run.ID,
+		Action: "workflow_run.transitioned", Reason: reason,
+		PayloadJSON: auditPayload(map[string]any{"status": run.Status, "version": run.Version, "source_job_id": job.ID}),
+		CreatedAt:   now,
+	})
+	return err
 }
 
 const leaseSelect = `
@@ -803,13 +910,25 @@ func scanDurableJob(scanner rowScanner) (DurableJob, error) {
 	var job DurableJob
 	var runID, stageAttemptID sql.NullString
 	var startedAt, finishedAt sql.NullTime
+	var failureCode, failureMessage, failureDetailsJSON string
 	if err := scanner.Scan(
 		&job.ID, &job.CommandType, &job.EntityType, &job.EntityID, &runID, &stageAttemptID,
-		&job.State, &job.Priority, &job.PayloadJSON, &job.IdempotencyKey, &job.CreatedBy,
+		&job.State, &job.Priority, &job.PayloadJSON, &failureCode, &failureMessage, &failureDetailsJSON, &job.IdempotencyKey, &job.CreatedBy,
 		&job.CreatedAt, &job.UpdatedAt, &startedAt, &finishedAt, &job.Version,
 	); err != nil {
 		return DurableJob{}, err
 	}
+	failure, err := durableJobFailureFromColumns(failureCode, failureMessage, failureDetailsJSON)
+	if err != nil {
+		return DurableJob{}, fmt.Errorf("%w: persisted durable job %s: %v", ErrInvalidJobFailure, job.ID, err)
+	}
+	if durableJobStateRequiresFailure(job.State) && failure == nil {
+		return DurableJob{}, fmt.Errorf("%w: persisted durable job %s is %s without a failure record", ErrInvalidJobFailure, job.ID, job.State)
+	}
+	if !durableJobStateRequiresFailure(job.State) && failure != nil {
+		return DurableJob{}, fmt.Errorf("%w: persisted durable job %s is %s with a failure record", ErrInvalidJobFailure, job.ID, job.State)
+	}
+	job.Failure = failure
 	job.RunID = nullableStringValue(runID)
 	job.StageAttemptID = nullableStringValue(stageAttemptID)
 	job.CreatedAt = job.CreatedAt.UTC()
@@ -817,6 +936,23 @@ func scanDurableJob(scanner rowScanner) (DurableJob, error) {
 	job.StartedAt = nullableTimePtr(startedAt)
 	job.FinishedAt = nullableTimePtr(finishedAt)
 	return job, nil
+}
+
+func prepareDurableJobTransitionFailure(state JobState, failure *DurableJobFailure) (*DurableJobFailure, error) {
+	if durableJobStateRequiresFailure(state) {
+		if failure == nil {
+			return nil, fmt.Errorf("%w: transition to %s requires a failure record", ErrInvalidJobFailure, state)
+		}
+		return normalizeDurableJobFailure(failure)
+	}
+	if failure != nil {
+		return nil, fmt.Errorf("%w: failure record is only valid for failed or in_doubt jobs", ErrInvalidJobFailure)
+	}
+	return nil, nil
+}
+
+func durableJobStateRequiresFailure(state JobState) bool {
+	return state == JobFailed || state == JobInDoubt
 }
 
 func scanLease(scanner rowScanner) (Lease, error) {

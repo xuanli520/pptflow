@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -249,8 +250,39 @@ func TestV5DurableDispatcherClaimsAndRecoversExpiredWorkers(t *testing.T) {
 	}
 	clock = clock.Add(2 * time.Second)
 	recoveries, err := s.ScanExpiredDurableJobsForReconcile(ctx, ScanExpiredDurableJobsRequest{Actor: "recovery", Reason: "worker lease expired"})
-	if err != nil || len(recoveries) != 1 || recoveries[0].Job.ID != job.ID || recoveries[0].Job.State != JobInterrupted {
+	if err != nil || len(recoveries) != 1 || recoveries[0].Job.ID != job.ID || recoveries[0].Job.State != JobInDoubt || recoveries[0].Job.Failure == nil || recoveries[0].Job.Failure.Code != "job.lease_lost" || recoveries[0].Job.FinishedAt == nil {
 		t.Fatalf("expired dispatch recovery = %+v, %v", recoveries, err)
+	}
+	var failureDetails map[string]string
+	if err := json.Unmarshal([]byte(recoveries[0].Job.Failure.DetailsJSON), &failureDetails); err != nil || failureDetails["job_id"] != job.ID || failureDetails["check"] != "dispatch_lease" {
+		t.Fatalf("expired dispatch failure details = %q, %v", recoveries[0].Job.Failure.DetailsJSON, err)
+	}
+	persisted, err := s.GetDurableJob(ctx, job.ID)
+	if err != nil || persisted == nil || persisted.State != JobInDoubt || persisted.Failure == nil || *persisted.Failure != *recoveries[0].Job.Failure {
+		t.Fatalf("persisted expired dispatch recovery = %+v, %v", persisted, err)
+	}
+	events, err := s.ListAuditEvents(ctx, ListAuditEventsRequest{EntityType: "job", EntityID: job.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundRecoveryAudit := false
+	for _, event := range events {
+		if event.Action != "job.transitioned" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["state"] == string(JobInDoubt) {
+			foundRecoveryAudit = payload["failure_code"] == "job.lease_lost" && payload["cause"] == "expired_dispatch_lease"
+		}
+	}
+	if !foundRecoveryAudit {
+		t.Fatalf("missing durable lease-loss recovery audit: %+v", events)
+	}
+	if followUp, err := s.ClaimNextDurableJob(ctx, ClaimNextDurableJobRequest{IdempotencyKey: "claim-after-lease-loss", Owner: "worker-three", LeaseTTL: time.Minute, CapacityPoolKey: pool.PoolKey, Actor: "tester"}); err != nil || followUp.State != "empty" || followUp.Job != nil {
+		t.Fatalf("lease-lost job was ordinarily retried: %+v, %v", followUp, err)
 	}
 	capacityLease, err = s.GetLease(ctx, expiring.CapacityLease.ID)
 	if err != nil || capacityLease == nil || capacityLease.State != LeaseReleased {
@@ -395,7 +427,7 @@ func TestV5ScopedExpiredJobReconciliationLeavesOtherRunUntouched(t *testing.T) {
 	recoveries, err := s.ScanExpiredDurableJobsForReconcile(ctx, ScanExpiredDurableJobsRequest{
 		RunID: runA.ID, Actor: "recovery", Reason: "recover only selected Run",
 	})
-	if err != nil || len(recoveries) != 1 || recoveries[0].Job.ID != jobA.ID || recoveries[0].Job.State != JobInterrupted {
+	if err != nil || len(recoveries) != 1 || recoveries[0].Job.ID != jobA.ID || recoveries[0].Job.State != JobInDoubt || recoveries[0].Job.Failure == nil || recoveries[0].Job.Failure.Code != "job.lease_lost" {
 		t.Fatalf("scoped recovery = %+v, %v", recoveries, err)
 	}
 	otherJob, err := s.GetDurableJob(ctx, jobB.ID)
@@ -405,6 +437,54 @@ func TestV5ScopedExpiredJobReconciliationLeavesOtherRunUntouched(t *testing.T) {
 	otherLease, err := s.GetLease(ctx, claimB.DispatchLease.ID)
 	if err != nil || otherLease == nil || otherLease.State != LeaseActive {
 		t.Fatalf("unselected Run dispatch lease changed by scoped recovery: %+v, %v", otherLease, err)
+	}
+}
+
+func TestV5ExpiredDispatchRecoveryPreservesExistingFailure(t *testing.T) {
+	ctx := context.Background()
+	s := tempV5DB(t)
+	clock := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	job, err := s.CreateDurableJob(ctx, CreateDurableJobRequest{
+		CommandType: "execute", EntityType: "fixture", EntityID: "preserve-failure", PayloadJSON: `{}`,
+		IdempotencyKey: "preserve-failure-job", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := s.ClaimNextDurableJob(ctx, ClaimNextDurableJobRequest{
+		IdempotencyKey: "preserve-failure-claim", Owner: "worker", LeaseTTL: time.Minute, Actor: "tester", Reason: "fixture",
+	})
+	if err != nil || claim.Job == nil || claim.DispatchLease == nil {
+		t.Fatalf("claim fixture job = %+v, %v", claim, err)
+	}
+	originalFailure := &DurableJobFailure{
+		Code:        "handoff.definition_unavailable",
+		Message:     "The deployment definition is temporarily unavailable.",
+		DetailsJSON: `{"check":"definition"}`,
+	}
+	inDoubt, err := s.TransitionDurableJob(ctx, TransitionDurableJobRequest{
+		JobID: claim.Job.ID, ExpectedVersion: claim.Job.Version, State: JobInDoubt, Failure: originalFailure, Actor: "worker", Reason: "known hold",
+	})
+	if err != nil || inDoubt.Failure == nil {
+		t.Fatalf("record original failure = %+v, %v", inDoubt, err)
+	}
+
+	// Simulate a historical claim that remained indexed after its terminal job
+	// projection. Recovery must clean it up without replacing the diagnosis.
+	if _, err := s.db.Exec(`UPDATE leases SET state = 'active', expires_at = ?, version = version + 1 WHERE id = ?`, clock.Add(-time.Second), claim.DispatchLease.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE job_dispatch_claims_v5 SET state = 'active', updated_at = ? WHERE id = ?`, clock, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	recoveries, err := s.ScanExpiredDurableJobsForReconcile(ctx, ScanExpiredDurableJobsRequest{Actor: "recovery", Reason: "clean historical claim"})
+	if err != nil || len(recoveries) != 1 || recoveries[0].Job.State != JobInDoubt || recoveries[0].Job.Failure == nil || *recoveries[0].Job.Failure != *inDoubt.Failure {
+		t.Fatalf("historical claim recovery = %+v, %v", recoveries, err)
+	}
+	persisted, err := s.GetDurableJob(ctx, job.ID)
+	if err != nil || persisted == nil || persisted.Failure == nil || *persisted.Failure != *inDoubt.Failure {
+		t.Fatalf("historical recovery replaced failure = %+v, %v", persisted, err)
 	}
 }
 

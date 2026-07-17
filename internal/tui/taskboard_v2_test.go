@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -60,17 +61,65 @@ func TestDetailGroupsCurrentRunHistoryFailureAndLogPath(t *testing.T) {
 		Runs: []TaskRunItem{
 			{
 				ID: "run-current", Status: "failed_recoverable", CurrentStage: "repo_prepare",
-				FailureStage: "repo_prepare", FailureClass: "network", FailureReason: "network timeout while fetching source",
+				FailureStage: "repo_prepare", FailureCode: "stage.source_unavailable", FailureSummary: "The source could not be read safely.",
 				LogPath: "/managed/logs/run-current.log", HasLog: true,
 			},
 			{ID: "run-previous", Status: "succeeded"},
 		},
 	})
 	rendered := ansi.Strip(detail.View(132, 40))
-	for _, expected := range []string{"来源", "当前运行", "失败原因", "运行记录", "/managed/logs/run-current.log", "network timeout"} {
+	for _, expected := range []string{"来源", "当前运行", "失败原因", "运行记录", "/managed/logs/run-current.log", "stage.source_unavailable", "The source could not be read safely."} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("detail missing %q:\n%s", expected, rendered)
 		}
+	}
+}
+
+func TestDetailShowsDurableFailureRecordAndOnlyEligibleRedrive(t *testing.T) {
+	recordedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
+	detail := newDetailModel(&TaskItem{
+		Name: "Task one", Slug: "task-one", RunID: "run-current",
+		Runs: []TaskRunItem{{
+			ID:                    "run-current",
+			Status:                "in_doubt",
+			FailureStage:          "materialize_task",
+			FailureCode:           "handoff.definition_unavailable",
+			FailureSummary:        "The approved child definition is unavailable.",
+			FailureJobID:          "job-handoff",
+			FailureArtifactID:     "artifact-handoff",
+			FailureRecordedAt:     &recordedAt,
+			FailureRecoveryAction: app.TaskBoardFailureRecoveryRedriveAuthoringHandoff,
+			CanRedrive:            true,
+		}},
+	})
+	rendered := ansi.Strip(detail.View(132, 40))
+	for _, expected := range []string{"失败阶段", "错误码", "handoff.definition_unavailable", "Job ID", "job-handoff", "Artifact ID", "artifact-handoff", "记录时间", "恢复操作", "显式 redrive"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("durable failure detail missing %q:\n%s", expected, rendered)
+		}
+	}
+
+	detail.task.Runs[0].Status = "failed_terminal"
+	detail.task.Runs[0].FailureCode = "handoff.artifact_lineage_invalid"
+	detail.task.Runs[0].FailureRecoveryAction = app.TaskBoardFailureRecoveryRepairOrNewRun
+	detail.task.Runs[0].CanRedrive = false
+	rendered = ansi.Strip(detail.View(132, 40))
+	if strings.Contains(rendered, "redrive") || !strings.Contains(rendered, "修复或新建运行") {
+		t.Fatalf("terminal failure recovery detail =\n%s", rendered)
+	}
+}
+
+func TestDetailDoesNotRenderLegacyRawFailureReason(t *testing.T) {
+	detail := newDetailModel(&TaskItem{
+		Name: "Task one", Slug: "task-one", RunID: "run-current",
+		Runs: []TaskRunItem{{
+			ID: "run-current", Status: "in_doubt", FailureStage: "materialize_task",
+			FailureReason: "provider output from /private/handoff with sk-sensitive-token",
+		}},
+	})
+	rendered := ansi.Strip(detail.View(100, 28))
+	if strings.Contains(rendered, "private/handoff") || strings.Contains(rendered, "sk-sensitive-token") {
+		t.Fatalf("detail rendered legacy raw failure reason:\n%s", rendered)
 	}
 }
 
@@ -116,7 +165,7 @@ func TestDetailAndLogRespectTerminalWidths(t *testing.T) {
 		CommitSHA: "abcdef0123456789abcdef0123456789abcdef0123456789", RunID: "run-current",
 		Runs: []TaskRunItem{{
 			ID: "run-current", Status: "failed_recoverable", CurrentStage: "repository_preparation",
-			FailureReason: "a failure message that should wrap instead of stretching the terminal layout", LogPath: "/managed/logs/run-current.log",
+			FailureCode: "stage.input_invalid", FailureSummary: "A durable failure summary that should wrap instead of stretching the terminal layout.", LogPath: "/managed/logs/run-current.log",
 		}},
 	})
 	for _, width := range []int{80, 120} {

@@ -37,21 +37,28 @@ type TaskItem struct {
 // TaskRunItem is the terminal-facing copy of one durable Run record. It is
 // populated only from the task-board application projection.
 type TaskRunItem struct {
-	ID            string
-	ParentRunID   string
-	Status        string
-	CurrentStage  string
-	FailureStage  string
-	FailureClass  string
-	FailureReason string
-	CreatedAt     time.Time
-	StartedAt     *time.Time
-	FinishedAt    *time.Time
-	LogPath       string
-	HasLog        bool
-	CanRetry      bool
-	RetryReason   string
-	RetryStrategy app.TaskBoardRetryStrategy
+	ID                    string
+	ParentRunID           string
+	Status                string
+	CurrentStage          string
+	FailureStage          string
+	FailureClass          string
+	FailureReason         string
+	FailureCode           string
+	FailureSummary        string
+	FailureJobID          string
+	FailureArtifactID     string
+	FailureRecordedAt     *time.Time
+	FailureRecoveryAction app.TaskBoardFailureRecoveryAction
+	CanRedrive            bool
+	CreatedAt             time.Time
+	StartedAt             *time.Time
+	FinishedAt            *time.Time
+	LogPath               string
+	HasLog                bool
+	CanRetry              bool
+	RetryReason           string
+	RetryStrategy         app.TaskBoardRetryStrategy
 }
 
 func truncate(s string, maxLen int) string {

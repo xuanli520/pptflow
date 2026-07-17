@@ -130,6 +130,30 @@ func TestAppModelRoutesBoardCommandsThroughGateway(t *testing.T) {
 	}
 }
 
+func TestTaskItemsForSnapshotPreservesDurableFailureProjection(t *testing.T) {
+	pending, _, _ := taskItemsForSnapshot(app.TaskBoardSnapshot{Tasks: []app.TaskBoardTask{{
+		ID: "task-1", Title: "Task one", Column: app.TaskBoardPending, RunID: "run-1",
+		Runs: []app.TaskBoardRun{{
+			ID:                    "run-1",
+			FailureCode:           "handoff.definition_invalid",
+			FailureSummary:        "The approved child definition is invalid.",
+			FailureJobID:          "job-1",
+			FailureArtifactID:     "artifact-1",
+			FailureRecoveryAction: app.TaskBoardFailureRecoveryRedriveAuthoringHandoff,
+			CanRedrive:            true,
+		}},
+	}}})
+	if len(pending) != 1 || len(pending[0].Runs) != 1 {
+		t.Fatalf("task items = %+v", pending)
+	}
+	run := pending[0].Runs[0]
+	if run.FailureCode != "handoff.definition_invalid" || run.FailureSummary != "The approved child definition is invalid." ||
+		run.FailureJobID != "job-1" || run.FailureArtifactID != "artifact-1" ||
+		run.FailureRecoveryAction != app.TaskBoardFailureRecoveryRedriveAuthoringHandoff || !run.CanRedrive {
+		t.Fatalf("durable failure item = %+v", run)
+	}
+}
+
 func TestVisibleTaskInputConsumesBoardAndReviewKeys(t *testing.T) {
 	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
 	model := loadedTaskBoardModel(t, stub)

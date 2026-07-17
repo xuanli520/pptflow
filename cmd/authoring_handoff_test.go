@@ -95,6 +95,90 @@ func TestAuthoringHandoffRedriveCommandRepublishesOnlyInDoubtDeliveryIdempotentl
 	}
 }
 
+func TestAuthoringHandoffReconcileCommandRepublishesLeaseLostDeliveryIdempotently(t *testing.T) {
+	ctx := context.Background()
+	if defaultLifecycleActor() == "" {
+		t.Skip("local OS actor is unavailable in this test environment")
+	}
+	root := t.TempDir()
+	database, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, original := commandInDoubtLeaseLostAuthoringHandoffFixture(t, ctx, database)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	config := &lifecycleCLIConfig{
+		root: root,
+		newLifecycleService: func(factoryRoot string, dataStore *store.Store) (*app.LifecycleServices, error) {
+			// Publishing a lease-loss reconciliation does not require a
+			// currently installed Phase-1 definition.
+			return app.NewLifecycleServicesWithOptions(factoryRoot, dataStore, app.LifecycleServicesOptions{
+				OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+			})
+		},
+	}
+	key := commandLifecycleUUID(t)
+	args := []string{"handoff", "reconcile", "--authoring-run", run.ID, "--idempotency-key", key, "--reason", "reconcile lost Standard authoring handoff lease"}
+	output, err := executeAuthoringCommand(t, ctx, config, args)
+	if err != nil {
+		t.Fatalf("authoring handoff reconcile: %v\n%s", err, output)
+	}
+	var result struct {
+		JobID          string `json:"job_id"`
+		CommandType    string `json:"command_type"`
+		State          string `json:"state"`
+		AuthoringRunID string `json:"authoring_run_id"`
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("decode handoff reconcile output: %v\n%s", err, output)
+	}
+	if result.JobID == "" || result.CommandType != "standard_authoring.handoff.reconcile" || result.State != string(store.JobQueued) || result.AuthoringRunID != run.ID {
+		t.Fatalf("handoff reconcile output = %+v", result)
+	}
+	if strings.Contains(output, "payload") || strings.Contains(output, original.PayloadJSON) {
+		t.Fatalf("handoff reconcile CLI exposed durable payload: %s", output)
+	}
+	replayOutput, err := executeAuthoringCommand(t, ctx, config, args)
+	if err != nil {
+		t.Fatalf("authoring handoff reconcile replay: %v\n%s", err, replayOutput)
+	}
+	var replay struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal([]byte(replayOutput), &replay); err != nil || replay.JobID != result.JobID {
+		t.Fatalf("handoff reconcile replay = %+v err=%v; first=%+v", replay, err, result)
+	}
+
+	check, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	persistedOriginal, err := check.GetDurableJob(ctx, original.ID)
+	if err != nil || persistedOriginal == nil || persistedOriginal.State != store.JobInDoubt || persistedOriginal.Failure == nil ||
+		*persistedOriginal.Failure != *original.Failure {
+		t.Fatalf("original handoff after CLI reconcile = %+v, %v; want immutable lease-lost in_doubt record", persistedOriginal, err)
+	}
+	jobs, err := check.ListDurableJobsForRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileCount := 0
+	for _, job := range jobs {
+		if job.CommandType == "standard_authoring.handoff.reconcile" {
+			reconcileCount++
+			if job.ID != result.JobID || job.PayloadJSON != original.PayloadJSON || job.State != store.JobQueued {
+				t.Fatalf("reconcile job did not preserve original immutable payload: %+v", job)
+			}
+		}
+	}
+	if reconcileCount != 1 {
+		t.Fatalf("reconcile jobs = %d; want exactly one", reconcileCount)
+	}
+}
+
 func TestAuthoringHandoffRedriveCommandExposesOnlyOperatorInputs(t *testing.T) {
 	command, _, err := newAuthoringCommand(&lifecycleCLIConfig{root: t.TempDir()}).Find([]string{"handoff", "redrive"})
 	if err != nil || command == nil || command.Name() != "redrive" {
@@ -112,7 +196,57 @@ func TestAuthoringHandoffRedriveCommandExposesOnlyOperatorInputs(t *testing.T) {
 	}
 }
 
+func TestAuthoringHandoffReconcileCommandExposesAndValidatesOnlyOperatorInputs(t *testing.T) {
+	command, _, err := newAuthoringCommand(&lifecycleCLIConfig{root: t.TempDir()}).Find([]string{"handoff", "reconcile"})
+	if err != nil || command == nil || command.Name() != "reconcile" {
+		t.Fatalf("find authoring handoff reconcile command: command=%v err=%v", command, err)
+	}
+	for _, required := range []string{"authoring-run", "idempotency-key", "reason"} {
+		if command.Flags().Lookup(required) == nil {
+			t.Fatalf("authoring handoff reconcile is missing --%s", required)
+		}
+	}
+	for _, forbidden := range []string{"child-run", "profile", "execution-spec", "provider", "model", "agent", "secret", "payload", "catalog", "lock"} {
+		if command.Flags().Lookup(forbidden) != nil {
+			t.Fatalf("authoring handoff reconcile exposes deployment-owned override --%s", forbidden)
+		}
+	}
+	if defaultLifecycleActor() == "" {
+		t.Skip("local OS actor is unavailable in this test environment")
+	}
+	validRunID := commandLifecycleUUID(t)
+	validKey := commandLifecycleUUID(t)
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing authoring run", args: []string{"handoff", "reconcile", "--reason", "validate reconcile flags"}, want: "authoring-run is required"},
+		{name: "invalid authoring run", args: []string{"handoff", "reconcile", "--authoring-run", "not-a-uuid", "--reason", "validate reconcile flags"}, want: "authoring-run must be a UUIDv7"},
+		{name: "missing idempotency key", args: []string{"handoff", "reconcile", "--authoring-run", validRunID, "--reason", "validate reconcile flags"}, want: "idempotency-key is required"},
+		{name: "invalid idempotency key", args: []string{"handoff", "reconcile", "--authoring-run", validRunID, "--idempotency-key", "not-a-uuid", "--reason", "validate reconcile flags"}, want: "idempotency-key must be a UUIDv7"},
+		{name: "missing reason", args: []string{"handoff", "reconcile", "--authoring-run", validRunID, "--idempotency-key", validKey}, want: "reason is required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := executeAuthoringCommand(t, context.Background(), &lifecycleCLIConfig{root: t.TempDir()}, test.args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("authoring handoff reconcile flags %q error = %v; want %q", test.name, err, test.want)
+			}
+		})
+	}
+}
+
 func commandInDoubtAuthoringHandoffFixture(t *testing.T, ctx context.Context, database *store.Store) (store.WorkflowRun, store.DurableJob) {
+	t.Helper()
+	return commandInDoubtAuthoringHandoffFixtureWithFailure(t, ctx, database, "handoff.definition_unavailable", "CodeEdge Phase-1 run definition is unavailable.")
+}
+
+func commandInDoubtLeaseLostAuthoringHandoffFixture(t *testing.T, ctx context.Context, database *store.Store) (store.WorkflowRun, store.DurableJob) {
+	t.Helper()
+	return commandInDoubtAuthoringHandoffFixtureWithFailure(t, ctx, database, "job.lease_lost", "The worker lease expired before the job outcome was recorded.")
+}
+
+func commandInDoubtAuthoringHandoffFixtureWithFailure(t *testing.T, ctx context.Context, database *store.Store, failureCode, failureMessage string) (store.WorkflowRun, store.DurableJob) {
 	t.Helper()
 	sourceDigest := "sha256:" + strings.Repeat("a", 64)
 	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
@@ -180,7 +314,11 @@ func commandInDoubtAuthoringHandoffFixture(t *testing.T, ctx context.Context, da
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err = database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{JobID: job.ID, ExpectedVersion: job.Version, State: store.JobInDoubt, Actor: "worker", Reason: "hold command handoff for approved definition"})
+	job, err = database.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: job.ID, ExpectedVersion: job.Version, State: store.JobInDoubt,
+		Failure: &store.DurableJobFailure{Code: failureCode, Message: failureMessage, DetailsJSON: `{}`},
+		Actor:   "worker", Reason: "hold command handoff for approved definition",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

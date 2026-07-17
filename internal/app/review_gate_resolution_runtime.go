@@ -36,70 +36,70 @@ type reviewGateDecisionArtifact struct {
 func (runtime *FrozenExecutionRuntime) handleReviewGateResolution(ctx context.Context, _ DurableJobExecution, job store.DurableJob) (store.JobState, error) {
 	var payload reviewGateResolutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("decode review gate resolution payload: %w", err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: decode review gate resolution payload: %w", ErrFrozenExecutionPayload, err))
 	}
 	if err := payload.validate(); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if job.CommandType != store.ReviewGateResolutionCommandType || job.EntityType != "stage_attempt" ||
 		job.EntityID != payload.StageAttemptID || job.RunID != payload.RunID || job.StageAttemptID != payload.StageAttemptID {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate resolution job does not bind its payload", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate resolution job does not bind its payload", ErrFrozenExecutionPayload))
 	}
 	binding, err := runtime.core.store.GetReviewGateBindingByReviewRequest(ctx, payload.ReviewRequestID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if binding == nil || binding.RunID != payload.RunID || binding.StageAttemptID != payload.StageAttemptID {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate resolution payload does not match a frozen gate", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate resolution payload does not match a frozen gate", ErrFrozenExecutionPayload))
 	}
 	decision, err := runtime.reviewGateDecision(ctx, binding.ReviewRequestID, payload.ReviewDecisionID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	run, err := runtime.core.store.GetWorkflowRun(ctx, binding.RunID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if run == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate run %s", ErrLifecycleNotFound, binding.RunID))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate run %s", ErrLifecycleNotFound, binding.RunID))
 	}
 	frozen, err := decodeFrozenRunDefinition(*run)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	stage, found := frozen.Workflow.Stage(workflowkit.StageKey(binding.StageKey))
 	if !found {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen workflow omits review gate stage %q", ErrFrozenExecutionPayload, binding.StageKey))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: frozen workflow omits review gate stage %q", ErrFrozenExecutionPayload, binding.StageKey))
 	}
 	review, found := frozen.ReviewStage(stage.Key)
 	if !found || string(review.ReviewKind) != binding.ReviewKind {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen review metadata differs from durable gate binding", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: frozen review metadata differs from durable gate binding", ErrFrozenExecutionPayload))
 	}
 	revision, err := runtime.core.store.GetTaskRevision(ctx, binding.RevisionID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if revision == nil || revision.TaskID != run.TaskID || revision.TaskDigest != binding.RevisionDigest {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate revision is unavailable or changed", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate revision is unavailable or changed", ErrFrozenExecutionPayload))
 	}
 	attempt, err := runtime.core.store.GetStageAttempt(ctx, binding.StageAttemptID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if attempt == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate stage attempt %s", ErrLifecycleNotFound, binding.StageAttemptID))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate stage attempt %s", ErrLifecycleNotFound, binding.StageAttemptID))
 	}
 	node, err := runtime.reviewGateNodeAttempt(ctx, binding.StageAttemptID, binding.NodeAttemptID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	inputs, err := decodeReviewGateInputs(binding)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	handoffBinding, err := runtime.core.verifyCodeEdgeEvaluatorEvidenceHandoffGate(ctx, *binding)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if attempt.ExecutionStatus == store.StageExecutionWaiting {
 		artifact, err := json.Marshal(reviewGateDecisionArtifact{
@@ -110,13 +110,13 @@ func (runtime *FrozenExecutionRuntime) handleReviewGateResolution(ctx context.Co
 			EvaluatorEvidenceHandoffID: string(handoffBinding.ID), EvaluatorEvidenceHandoffFingerprint: string(handoffBinding.Fingerprint),
 		})
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, fmt.Errorf("encode review gate decision evidence: %w", err))
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("encode review gate decision evidence: %w", err))
 		}
 		manifest, _, err := persistStageArtifacts(ctx, runtime.core, *run, *revision, *attempt, node, stage, inputs, []StageArtifact{{
 			Key: review.DecisionArtifact.Name, SchemaVersion: review.DecisionArtifact.SchemaVersion, Content: artifact,
 		}}, job.CreatedBy, "persist immutable review gate decision")
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, err)
+			return runtime.failRuntimeJob(ctx, job, err)
 		}
 		resolved, err := runtime.core.store.CompleteReviewGateResolution(ctx, store.CompleteReviewGateResolutionRequest{
 			ReviewRequestID: binding.ReviewRequestID, ReviewDecisionID: decision.ID, RunID: run.ID, StageAttemptID: attempt.ID,
@@ -124,16 +124,16 @@ func (runtime *FrozenExecutionRuntime) handleReviewGateResolution(ctx context.Co
 			ArtifactManifestID: manifest.ID, Actor: job.CreatedBy, Reason: "materialize frozen review gate decision",
 		})
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, err)
+			return runtime.failRuntimeJob(ctx, job, err)
 		}
 		attempt = &resolved.StageAttempt
 	}
 	if attempt.ExecutionStatus != store.StageExecutionCompleted {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate resolution did not complete stage %s", ErrFrozenExecutionPayload, attempt.ID))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate resolution did not complete stage %s", ErrFrozenExecutionPayload, attempt.ID))
 	}
 	sourceJob, sourcePayload, err := runtime.reviewGateSourceStageJob(ctx, binding)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	return runtime.projectResolvedReviewGate(ctx, job, *run, frozen, sourceJob, sourcePayload, *attempt, decision)
 }
@@ -206,10 +206,10 @@ func (runtime *FrozenExecutionRuntime) projectResolvedReviewGate(ctx context.Con
 	switch decision.Action {
 	case store.ReviewDecisionApprove:
 		if err := runtime.transitionRunToRunning(ctx, run, resolutionJob.CreatedBy, "approved durable review gate"); err != nil {
-			return runtime.failMalformedJob(ctx, resolutionJob, err)
+			return runtime.failRuntimeJob(ctx, resolutionJob, err)
 		}
 		if err := runtime.enqueueNextCoordinator(ctx, sourceJob, run, frozen, sourcePayload); err != nil {
-			return runtime.failMalformedJob(ctx, resolutionJob, err)
+			return runtime.failRuntimeJob(ctx, resolutionJob, err)
 		}
 		return store.JobSucceeded, nil
 	case store.ReviewDecisionRequestChanges:
@@ -223,7 +223,7 @@ func (runtime *FrozenExecutionRuntime) projectResolvedReviewGate(ctx context.Con
 		}
 		return runtime.finishContinuationForRunOutcome(ctx, sourcePayload.ContinuationExecutionID, store.ContinuationExecutionFailed, resolutionJob.CreatedBy, "review gate rejected task")
 	default:
-		return runtime.failMalformedJob(ctx, resolutionJob, fmt.Errorf("%w: unsupported review gate action %q", ErrFrozenExecutionPayload, decision.Action))
+		return runtime.failRuntimeJob(ctx, resolutionJob, fmt.Errorf("%w: unsupported review gate action %q", ErrFrozenExecutionPayload, decision.Action))
 	}
 }
 

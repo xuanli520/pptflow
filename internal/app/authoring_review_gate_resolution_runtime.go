@@ -31,69 +31,69 @@ type authoringReviewGateDecisionArtifact struct {
 
 func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx context.Context, _ DurableJobExecution, job store.DurableJob) (store.JobState, error) {
 	if job.CommandType != store.AuthoringReviewGateResolutionCommandType || job.RunID == "" || job.StageAttemptID == "" {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review resolution job does not bind a Run and StageAttempt", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review resolution job does not bind a Run and StageAttempt", ErrFrozenExecutionPayload))
 	}
 	binding, err := runtime.core.store.GetAuthoringReviewGateBindingByStageAttempt(ctx, job.StageAttemptID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if binding == nil || binding.RunID != job.RunID || binding.StageAttemptID != job.StageAttemptID {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review resolution job does not match a frozen gate", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review resolution job does not match a frozen gate", ErrFrozenExecutionPayload))
 	}
 	decisions, err := runtime.core.store.ListAuthoringReviewDecisionsForRequest(ctx, binding.ReviewRequestID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if len(decisions) != 1 {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review gate has %d decisions", ErrFrozenExecutionPayload, len(decisions)))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review gate has %d decisions", ErrFrozenExecutionPayload, len(decisions)))
 	}
 	decision := decisions[0]
 	run, err := runtime.core.store.GetWorkflowRun(ctx, binding.RunID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if run == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review Run %s", ErrLifecycleNotFound, binding.RunID))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review Run %s", ErrLifecycleNotFound, binding.RunID))
 	}
 	if !isCurrentStandardAuthoringRun(*run) {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review Run is not bound to the current Standard authoring template", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review Run is not bound to the current Standard authoring template", ErrFrozenExecutionPayload))
 	}
 	if err := runtime.core.verifyRunDeploymentCatalogReceipt(*run); err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: verify authoring review Run deployment catalog receipt: %v", ErrFrozenExecutionPayload, err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: verify authoring review Run deployment catalog receipt: %v", ErrFrozenExecutionPayload, err))
 	}
 	subject, err := runtime.core.resolveWorkflowRunSubject(ctx, *run)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if !subject.isAuthoringSession() || subject.AuthoringSession.ID != binding.AuthoringSessionID || subject.AuthoringSource.ID != binding.AuthoringSourceID || subject.subjectDigest() != binding.SourceSnapshotDigest {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review binding differs from frozen Run subject", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review binding differs from frozen Run subject", ErrFrozenExecutionPayload))
 	}
 	frozen, err := decodeFrozenRunDefinition(*run)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	stage, found := frozen.Workflow.Stage(workflowkit.StageKey(binding.StageKey))
 	if !found {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen authoring workflow omits gate %q", ErrFrozenExecutionPayload, binding.StageKey))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: frozen authoring workflow omits gate %q", ErrFrozenExecutionPayload, binding.StageKey))
 	}
 	review, found := frozen.ReviewStage(stage.Key)
 	if !found || string(review.ReviewKind) != binding.ReviewKind {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen authoring review metadata differs from durable binding", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: frozen authoring review metadata differs from durable binding", ErrFrozenExecutionPayload))
 	}
 	attempt, err := runtime.core.store.GetStageAttempt(ctx, binding.StageAttemptID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if attempt == nil || attempt.RunID != run.ID || attempt.StageKey != binding.StageKey {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review StageAttempt is unavailable", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review StageAttempt is unavailable", ErrFrozenExecutionPayload))
 	}
 	node, err := runtime.reviewGateNodeAttempt(ctx, binding.StageAttemptID, binding.NodeAttemptID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	inputs, err := decodeAuthoringReviewGateInputs(binding)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if attempt.ExecutionStatus == store.StageExecutionWaiting {
 		artifact, err := json.Marshal(authoringReviewGateDecisionArtifact{
@@ -104,13 +104,13 @@ func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx c
 			DecisionActor: decision.Actor, DecisionReason: decision.Reason,
 		})
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, fmt.Errorf("encode authoring review decision evidence: %w", err))
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("encode authoring review decision evidence: %w", err))
 		}
 		manifest, _, err := persistStageArtifactsForSubject(ctx, runtime.core, *run, subject, *attempt, node, stage, inputs, []StageArtifact{{
 			Key: review.DecisionArtifact.Name, SchemaVersion: review.DecisionArtifact.SchemaVersion, Content: artifact,
 		}}, job.CreatedBy, "persist immutable authoring review gate decision")
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, err)
+			return runtime.failRuntimeJob(ctx, job, err)
 		}
 		completed, err := runtime.core.store.CompleteAuthoringReviewGateResolution(ctx, store.CompleteAuthoringReviewGateResolutionRequest{
 			IdempotencyKey:  "complete-authoring-review-gate:" + binding.ID + ":" + decision.ID,
@@ -126,17 +126,17 @@ func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx c
 			Actor:                    job.CreatedBy, Reason: "materialize frozen authoring review decision",
 		})
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, err)
+			return runtime.failRuntimeJob(ctx, job, err)
 		}
 		attempt = &completed.StageAttempt
 		*run = completed.Run
 	}
 	if attempt.ExecutionStatus != store.StageExecutionCompleted {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review resolution did not complete stage %s", ErrFrozenExecutionPayload, attempt.ID))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review resolution did not complete stage %s", ErrFrozenExecutionPayload, attempt.ID))
 	}
 	sourceJob, sourcePayload, err := runtime.authoringReviewGateSourceStageJob(ctx, *binding)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	return runtime.projectResolvedAuthoringReviewGate(ctx, job, *run, frozen, sourceJob, sourcePayload, decision)
 }
@@ -183,10 +183,10 @@ func (runtime *FrozenExecutionRuntime) projectResolvedAuthoringReviewGate(ctx co
 	switch decision.Action {
 	case store.ReviewDecisionApprove:
 		if err := runtime.transitionRunToRunning(ctx, run, resolutionJob.CreatedBy, "approved durable authoring review gate"); err != nil {
-			return runtime.failMalformedJob(ctx, resolutionJob, err)
+			return runtime.failRuntimeJob(ctx, resolutionJob, err)
 		}
 		if err := runtime.enqueueNextCoordinator(ctx, sourceJob, run, frozen, sourcePayload); err != nil {
-			return runtime.failMalformedJob(ctx, resolutionJob, err)
+			return runtime.failRuntimeJob(ctx, resolutionJob, err)
 		}
 		return store.JobSucceeded, nil
 	case store.ReviewDecisionRequestChanges:
@@ -200,7 +200,7 @@ func (runtime *FrozenExecutionRuntime) projectResolvedAuthoringReviewGate(ctx co
 		}
 		return runtime.finishContinuationForRunOutcome(ctx, sourcePayload.ContinuationExecutionID, store.ContinuationExecutionFailed, resolutionJob.CreatedBy, "authoring review gate rejected task")
 	default:
-		return runtime.failMalformedJob(ctx, resolutionJob, fmt.Errorf("%w: unsupported authoring review action %q", ErrFrozenExecutionPayload, decision.Action))
+		return runtime.failRuntimeJob(ctx, resolutionJob, fmt.Errorf("%w: unsupported authoring review action %q", ErrFrozenExecutionPayload, decision.Action))
 	}
 }
 

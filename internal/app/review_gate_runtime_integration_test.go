@@ -220,7 +220,7 @@ func TestFrozenExecutionRuntimeRecoversExpiredReviewGateResolution(t *testing.T)
 			if err != nil {
 				t.Fatalf("recover expired review gate resolution = %+v, %v", recovered, err)
 			}
-			if len(recovered.Recoveries) != 1 || recovered.Recoveries[0].Job.ID != resolutionJob.ID || recovered.Recoveries[0].Job.State != store.JobInterrupted {
+			if len(recovered.Recoveries) != 1 || recovered.Recoveries[0].Job.ID != resolutionJob.ID || recovered.Recoveries[0].Job.State != store.JobInDoubt || recovered.Recoveries[0].Job.Failure == nil || recovered.Recoveries[0].Job.Failure.Code != "job.lease_lost" {
 				t.Fatalf("review gate recovery facts = %+v", recovered.Recoveries)
 			}
 			gateAttempt, err := fixture.store.GetStageAttempt(ctx, binding.StageAttemptID)
@@ -241,7 +241,7 @@ func TestFrozenExecutionRuntimeRecoversExpiredReviewGateResolution(t *testing.T)
 				t.Fatalf("recovery did not enqueue successor stage: %+v", successor)
 			}
 			persistedResolution, err := fixture.store.GetDurableJob(ctx, resolutionJob.ID)
-			if err != nil || persistedResolution == nil || persistedResolution.State != store.JobInterrupted {
+			if err != nil || persistedResolution == nil || persistedResolution.State != store.JobInDoubt || persistedResolution.Failure == nil || persistedResolution.Failure.Code != "job.lease_lost" {
 				t.Fatalf("expired resolution job projection = %+v, %v", persistedResolution, err)
 			}
 		})

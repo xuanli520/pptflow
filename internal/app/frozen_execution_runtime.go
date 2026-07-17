@@ -84,13 +84,26 @@ func NewFrozenExecutionRuntime(config FrozenExecutionRuntimeConfig) (*FrozenExec
 var _ DurableJobHandler = (*FrozenExecutionRuntime)(nil)
 var _ DurableJobRecoveryHandler = (*FrozenExecutionRuntime)(nil)
 
-// HandleDurableJob dispatches immutable V2 execution payloads and the narrow,
-// read-only CodeEdge evaluator reconciliation handoff.
-// Domain failures are projected into the run/stage state machine and return a
-// successful worker delivery so unrelated queued jobs continue. Payload or
-// storage integrity failures return JobFailed after conservatively marking the
-// affected run in_doubt where possible.
-func (runtime *FrozenExecutionRuntime) HandleDurableJob(ctx context.Context, execution DurableJobExecution) (store.JobState, error) {
+// HandleDurableJob dispatches immutable V2 execution payloads and returns the
+// terminal durable delivery fact. The handler, rather than DurableWorker,
+// owns the diagnostic classification for every failed or in-doubt result.
+func (runtime *FrozenExecutionRuntime) HandleDurableJob(ctx context.Context, execution DurableJobExecution) (DurableJobResult, error) {
+	state, err := runtime.handleDurableJobState(ctx, execution)
+	job := store.DurableJob{}
+	if execution.Claim.Job != nil {
+		job = *execution.Claim.Job
+	}
+	result := durableJobResultForOutcome(job, state, err)
+	if isStandardAuthoringHandoffCommand(job.CommandType) {
+		result.RunProjection = standardAuthoringHandoffRunProjection(job, result.State)
+	}
+	return result, durableJobHandlerError(result, err)
+}
+
+// handleDurableJobState retains the execution dispatch boundary for the
+// individual runtime handlers. Its result is converted into an explicit
+// DurableJobResult by HandleDurableJob above.
+func (runtime *FrozenExecutionRuntime) handleDurableJobState(ctx context.Context, execution DurableJobExecution) (store.JobState, error) {
 	if err := runtime.validate(); err != nil {
 		return store.JobFailed, err
 	}
@@ -113,7 +126,7 @@ func (runtime *FrozenExecutionRuntime) HandleDurableJob(ctx context.Context, exe
 		return runtime.handleReviewGateResolution(ctx, execution, job)
 	case store.AuthoringReviewGateResolutionCommandType:
 		return runtime.handleAuthoringReviewGateResolution(ctx, execution, job)
-	case standardAuthoringHandoffCommandType, standardAuthoringHandoffRedriveCommandType:
+	case standardAuthoringHandoffCommandType, standardAuthoringHandoffRedriveCommandType, standardAuthoringHandoffReconcileCommandType:
 		return runtime.handleStandardAuthoringHandoff(ctx, job)
 	default:
 		return store.JobFailed, fmt.Errorf("%w: unsupported command type %q", ErrFrozenExecutionPayload, job.CommandType)
@@ -170,7 +183,7 @@ func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context
 			if err := runtime.reconcileRecoveredAuthoringReviewGateResolution(ctx, job); err != nil {
 				return err
 			}
-		case standardAuthoringHandoffCommandType, standardAuthoringHandoffRedriveCommandType:
+		case standardAuthoringHandoffCommandType, standardAuthoringHandoffRedriveCommandType, standardAuthoringHandoffReconcileCommandType:
 			if err := runtime.reconcileRecoveredStandardAuthoringHandoff(ctx, job); err != nil {
 				return err
 			}
@@ -182,25 +195,25 @@ func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context
 func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Context, job store.DurableJob) error {
 	var payload frozenStageExecutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("decode recovered stage execution payload: %w", err))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: decode recovered stage execution payload: %w", ErrFrozenExecutionPayload, err))
 		return projected
 	}
 	if payload.Format != frozenStageExecutionPayloadFormat || payload.RunID != job.RunID || payload.StageAttemptID != job.StageAttemptID || payload.StageAttemptID != job.EntityID || payload.Generation < 0 {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered stage job does not bind its payload", ErrFrozenExecutionPayload))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered stage job does not bind its payload", ErrFrozenExecutionPayload))
 		return projected
 	}
 	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, "", payload.QuotaPolicy)
 	if err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, err)
+		_, projected := runtime.failRuntimeJob(ctx, job, err)
 		return projected
 	}
 	stage, found := frozen.Workflow.Stage(payload.StageKey)
 	if !found {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen workflow omits recovered stage %q", ErrFrozenExecutionPayload, payload.StageKey))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: frozen workflow omits recovered stage %q", ErrFrozenExecutionPayload, payload.StageKey))
 		return projected
 	}
 	if !stage.AutomaticallyDispatchable() {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered job targets operator-only stage %q", ErrFrozenExecutionPayload, stage.Key))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered job targets operator-only stage %q", ErrFrozenExecutionPayload, stage.Key))
 		return projected
 	}
 	attempt, err := runtime.core.store.GetStageAttempt(ctx, payload.StageAttemptID)
@@ -208,11 +221,11 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 		return err
 	}
 	if attempt == nil || attempt.RunID != run.ID || attempt.StageKey != string(stage.Key) {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered stage attempt does not match durable job", ErrFrozenExecutionPayload))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered stage attempt does not match durable job", ErrFrozenExecutionPayload))
 		return projected
 	}
 	if err := runtime.validateStageAttemptPlanBinding(*attempt, payload); err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, err)
+		_, projected := runtime.failRuntimeJob(ctx, job, err)
 		return projected
 	}
 	if isCodeEdgeEvaluatorStage(run, stage) {
@@ -225,7 +238,7 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 			return currentRunErr
 		}
 		if currentRun == nil {
-			_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered CodeEdge evaluator Run disappeared", ErrLifecycleNotFound))
+			_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered CodeEdge evaluator Run disappeared", ErrLifecycleNotFound))
 			return projected
 		}
 		run = *currentRun
@@ -240,7 +253,7 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 		return nil
 	}
 	if _, err := runtime.afterStageTerminal(ctx, job, run, frozen, payload, stage, *attempt, nil, "", nil); err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("restore terminal projection after recovered stage %s: %w", attempt.ID, err))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("restore terminal projection after recovered stage %s: %w", attempt.ID, err))
 		return projected
 	}
 	return nil
@@ -258,16 +271,16 @@ func recoverableStageTerminalStatus(status store.StageExecutionStatus) bool {
 func (runtime *FrozenExecutionRuntime) reconcileRecoveredWorkflowCoordinator(ctx context.Context, job store.DurableJob) error {
 	var payload workflowRunExecutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("decode recovered workflow coordinator payload: %w", err))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: decode recovered workflow coordinator payload: %w", ErrFrozenExecutionPayload, err))
 		return projected
 	}
 	if err := validateWorkflowRunExecutionPayload(payload, job); err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered workflow coordinator does not bind its payload", ErrFrozenExecutionPayload))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered workflow coordinator does not bind its payload", ErrFrozenExecutionPayload))
 		return projected
 	}
 	run, _, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.ExecutionSpecFingerprint, payload.QuotaPolicy)
 	if err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, err)
+		_, projected := runtime.failRuntimeJob(ctx, job, err)
 		return projected
 	}
 	if !requeueableCoordinatorRunStatus(run.Status) {
@@ -284,11 +297,11 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredWorkflowCoordinator(ctx
 func (runtime *FrozenExecutionRuntime) reconcileRecoveredContinuationCoordinator(ctx context.Context, job store.DurableJob) error {
 	var payload continuationExecutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("decode recovered continuation coordinator payload: %w", err))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: decode recovered continuation coordinator payload: %w", ErrFrozenExecutionPayload, err))
 		return projected
 	}
 	if payload.Format != continuationExecutionFormat || payload.RunID != job.RunID || job.EntityType != "continuation_execution" || payload.PlanID == "" {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered continuation coordinator does not bind its payload", ErrFrozenExecutionPayload))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered continuation coordinator does not bind its payload", ErrFrozenExecutionPayload))
 		return projected
 	}
 	execution, err := runtime.core.store.GetContinuationExecution(ctx, job.EntityID)
@@ -296,12 +309,12 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredContinuationCoordinator
 		return err
 	}
 	if execution == nil || execution.RunID != job.RunID || execution.PlanID != payload.PlanID || execution.PayloadJSON != job.PayloadJSON {
-		_, projected := runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: recovered continuation execution does not match durable job", ErrFrozenExecutionPayload))
+		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered continuation execution does not match durable job", ErrFrozenExecutionPayload))
 		return projected
 	}
 	run, _, err := runtime.loadFrozenRun(ctx, payload.RunID, "", "", payload.QuotaPolicy)
 	if err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, err)
+		_, projected := runtime.failRuntimeJob(ctx, job, err)
 		return projected
 	}
 	if !requeueableCoordinatorRunStatus(run.Status) || (execution.State != store.ContinuationExecutionQueued && execution.State != store.ContinuationExecutionRunning) {
@@ -415,31 +428,31 @@ func validateWorkflowRunExecutionPayload(payload workflowRunExecutionPayload, jo
 func (runtime *FrozenExecutionRuntime) handleWorkflowRun(ctx context.Context, execution DurableJobExecution, job store.DurableJob) (store.JobState, error) {
 	var payload workflowRunExecutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("decode workflow run payload: %w", err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: decode workflow run payload: %w", ErrFrozenExecutionPayload, err))
 	}
 	if err := validateWorkflowRunExecutionPayload(payload, job); err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: workflow run job does not bind its payload", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: workflow run job does not bind its payload", ErrFrozenExecutionPayload))
 	}
 	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.ExecutionSpecFingerprint, payload.QuotaPolicy)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if state, handled, err := runtime.handlePreExecutionControl(ctx, job, run); handled || err != nil {
 		return state, err
 	}
 	if err := runtime.transitionRunToRunning(ctx, run, job.CreatedBy, "begin frozen workflow run"); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	plan, err := initialRuntimeExecutionPlan(frozen)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if err := runtime.ensureRunAttempt(ctx, run.ID, plan.ExecutionKey, job.CreatedBy, "begin workflow run attempt"); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	state, coordinatorErr := runtime.executeWorkflowkitCoordinator(ctx, execution, job, run, frozen, plan)
 	if coordinatorErr != nil {
-		return runtime.failMalformedJob(ctx, job, coordinatorErr)
+		return runtime.failRuntimeJob(ctx, job, coordinatorErr)
 	}
 	return state, nil
 }
@@ -447,65 +460,65 @@ func (runtime *FrozenExecutionRuntime) handleWorkflowRun(ctx context.Context, ex
 func (runtime *FrozenExecutionRuntime) handleContinuation(ctx context.Context, execution DurableJobExecution, job store.DurableJob) (store.JobState, error) {
 	var payload continuationExecutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("decode continuation execution payload: %w", err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: decode continuation execution payload: %w", ErrFrozenExecutionPayload, err))
 	}
 	if payload.Format != continuationExecutionFormat || payload.RunID != job.RunID || job.EntityType != "continuation_execution" || payload.PlanID == "" {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: continuation job does not bind its payload", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: continuation job does not bind its payload", ErrFrozenExecutionPayload))
 	}
 	continuation, err := runtime.core.store.GetContinuationExecution(ctx, job.EntityID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if continuation == nil || continuation.RunID != job.RunID || continuation.PlanID != payload.PlanID || continuation.PayloadJSON != job.PayloadJSON {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: continuation execution does not match durable job", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: continuation execution does not match durable job", ErrFrozenExecutionPayload))
 	}
 	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, "", "", payload.QuotaPolicy)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	plan, err := runtime.services.Continuations.GetTaskContinuationPlan(ctx, payload.PlanID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if payload.PlanFingerprint != plan.Fingerprint() {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: continuation plan fingerprint mismatch", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: continuation plan fingerprint mismatch", ErrFrozenExecutionPayload))
 	}
 	snapshot := plan.Snapshot()
 	if snapshot.TargetRunRelation == workflowkit.RelationSameRunAttempt && snapshot.SourceRunID != run.ID {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: same-run continuation source does not match job run", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: same-run continuation source does not match job run", ErrFrozenExecutionPayload))
 	}
 	if err := runtime.transitionContinuationToRunning(ctx, *continuation, job.CreatedBy); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if state, handled, err := runtime.handlePreExecutionControl(ctx, job, run); handled || err != nil {
 		return state, err
 	}
 	if err := runtime.transitionRunToRunning(ctx, run, job.CreatedBy, "begin frozen continuation"); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if payload.SourceRunID != snapshot.SourceRunID {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: continuation source run mismatch", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: continuation source run mismatch", ErrFrozenExecutionPayload))
 	}
 	runtimePlan, err := continuationRuntimeExecutionPlan(plan, frozen.Workflow, frozen.QuotaPolicy, continuation.ID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if err := runtime.ensureRunAttempt(ctx, run.ID, runtimePlan.ExecutionKey, job.CreatedBy, "begin continuation attempt"); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	state, coordinatorErr := runtime.executeWorkflowkitCoordinator(ctx, execution, job, run, frozen, runtimePlan)
 	if coordinatorErr != nil {
-		return runtime.failMalformedJob(ctx, job, coordinatorErr)
+		return runtime.failRuntimeJob(ctx, job, coordinatorErr)
 	}
 	return state, nil
 }
 
 func (runtime *FrozenExecutionRuntime) handleRepairSessionAdvance(ctx context.Context, job store.DurableJob) (store.JobState, error) {
 	if runtime.core.repairs == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("repair loop service is not configured"))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("repair loop service is not configured"))
 	}
 	if _, err := runtime.core.repairs.HandleDurableJob(ctx, job); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	return store.JobSucceeded, nil
 }
@@ -610,17 +623,28 @@ func continuationRuntimeExecutionPlan(plan workflowkit.ContinuationPlan, workflo
 	return result, nil
 }
 
-func (runtime *FrozenExecutionRuntime) failMalformedJob(ctx context.Context, job store.DurableJob, cause error) (store.JobState, error) {
-	if job.RunID != "" {
-		if run, err := runtime.core.store.GetWorkflowRun(context.Background(), job.RunID); err == nil && run != nil {
-			_, _ = runtime.core.store.TransitionWorkflowRun(context.Background(), store.TransitionWorkflowRunRequest{
-				RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunInDoubt,
-				Actor: job.CreatedBy, Reason: "durable execution payload requires reconciliation",
-			})
-			_ = runtime.enqueueAutomaticRepairOutcome(context.Background(), run.ID, job.CreatedBy, "durable execution payload requires repair reconciliation")
-		}
+// failRuntimeJob is the common controlled-runtime failure boundary. Domain
+// handlers may preserve their own typed errors, while an unclassified error
+// receives one bounded execution diagnosis instead of leaking its raw text to
+// a durable job, CLI, or TUI surface.
+func (runtime *FrozenExecutionRuntime) failRuntimeJob(ctx context.Context, job store.DurableJob, cause error) (store.JobState, error) {
+	if errors.Is(cause, ErrFrozenExecutionPayload) {
+		return runtime.failMalformedJob(ctx, job, cause)
 	}
-	return store.JobFailed, cause
+	failure := newDurableJobFailure("job.execution_failed", "The durable job could not complete its controlled execution.", durableJobFailureDetails(job, "execution"))
+	return store.JobFailed, newDurableJobFailureError(*failure, cause)
+}
+
+// failMalformedJob handles only invalid frozen payloads and persisted
+// execution-integrity facts. Ordinary handler failures go through
+// failRuntimeJob so they retain a distinct, operator-safe diagnosis.
+func (runtime *FrozenExecutionRuntime) failMalformedJob(ctx context.Context, job store.DurableJob, cause error) (store.JobState, error) {
+	code, message := "job.storage_integrity_invalid", "The durable job could not verify its persisted execution data."
+	if errors.Is(cause, ErrFrozenExecutionPayload) {
+		code, message = "job.payload_invalid", "The durable job payload is malformed or does not match its frozen execution record."
+	}
+	failure := newDurableJobFailure(code, message, durableJobFailureDetails(job, "payload_or_storage"))
+	return store.JobFailed, newDurableJobFailureError(*failure, cause)
 }
 
 func (runtime *FrozenExecutionRuntime) transitionRunToRunning(ctx context.Context, run store.WorkflowRun, actor, reason string) error {
@@ -1088,37 +1112,37 @@ func (runtime *FrozenExecutionRuntime) completeExecutionIfSatisfied(ctx context.
 func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, execution DurableJobExecution, job store.DurableJob) (store.JobState, error) {
 	var payload frozenStageExecutionPayload
 	if err := decodeStrictJSON(job.PayloadJSON, &payload); err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("decode stage execution payload: %w", err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: decode stage execution payload: %w", ErrFrozenExecutionPayload, err))
 	}
 	if payload.Format != frozenStageExecutionPayloadFormat || payload.RunID != job.RunID || payload.StageAttemptID != job.StageAttemptID || payload.StageAttemptID != job.EntityID || payload.Generation < 0 {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: stage job does not bind its payload", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: stage job does not bind its payload", ErrFrozenExecutionPayload))
 	}
 	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, "", payload.QuotaPolicy)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	stage, found := frozen.Workflow.Stage(payload.StageKey)
 	if !found {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: frozen workflow omits stage %q", ErrFrozenExecutionPayload, payload.StageKey))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: frozen workflow omits stage %q", ErrFrozenExecutionPayload, payload.StageKey))
 	}
 	if !stage.AutomaticallyDispatchable() {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: operator-only stage %q cannot execute from a durable worker job", ErrFrozenExecutionPayload, stage.Key))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: operator-only stage %q cannot execute from a durable worker job", ErrFrozenExecutionPayload, stage.Key))
 	}
 	loadedStageAttempt, err := runtime.core.store.GetStageAttempt(ctx, payload.StageAttemptID)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if loadedStageAttempt == nil || loadedStageAttempt.RunID != run.ID || loadedStageAttempt.StageKey != string(stage.Key) {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: stage attempt does not match durable job", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: stage attempt does not match durable job", ErrFrozenExecutionPayload))
 	}
 	if err := runtime.validateStageAttemptPlanBinding(*loadedStageAttempt, payload); err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	isCodeEdgeEvaluator := isCodeEdgeEvaluatorStage(run, stage)
 	if isCodeEdgeEvaluator {
 		effect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, *loadedStageAttempt, stage)
 		if effectErr != nil {
-			return runtime.failMalformedJob(ctx, job, effectErr)
+			return runtime.failRuntimeJob(ctx, job, effectErr)
 		}
 		if effect != nil && !(effect.State == store.SideEffectSucceeded && loadedStageAttempt.ExecutionStatus == store.StageExecutionCompleted) {
 			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, *loadedStageAttempt, stage, stageQuotaReservation{}, *effect, nil, "CodeEdge evaluator invocation fence was already started")
@@ -1136,14 +1160,14 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	stageAttempt := *loadedStageAttempt
 	subject, err := runtime.core.resolveWorkflowRunSubject(ctx, run)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if state, handled, controlErr := runtime.handlePreStageControl(ctx, job, run, stageAttempt); handled || controlErr != nil {
 		return state, controlErr
 	}
 	if isCodeEdgeEvaluator {
 		if err := validateCodeEdgeEvaluatorBudget(stage); err != nil {
-			return runtime.failMalformedJob(ctx, job, err)
+			return runtime.failRuntimeJob(ctx, job, err)
 		}
 	}
 	if stageAttempt.ExecutionStatus == store.StageExecutionQueued {
@@ -1152,11 +1176,11 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 			Actor: job.CreatedBy, Reason: "durable stage worker started",
 		})
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, err)
+			return runtime.failRuntimeJob(ctx, job, err)
 		}
 	}
 	if stageAttempt.ExecutionStatus != store.StageExecutionRunning {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: stage attempt %s is %s", ErrFrozenExecutionPayload, stageAttempt.ID, stageAttempt.ExecutionStatus))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: stage attempt %s is %s", ErrFrozenExecutionPayload, stageAttempt.ID, stageAttempt.ExecutionStatus))
 	}
 
 	if review, isReviewGate := frozen.ReviewStage(stage.Key); isReviewGate {
@@ -1168,10 +1192,10 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		}
 		inputFingerprint, inputErr := workflowkit.FingerprintArtifactBindings(inputs)
 		if inputErr != nil {
-			return runtime.failMalformedJob(ctx, job, inputErr)
+			return runtime.failRuntimeJob(ctx, job, inputErr)
 		}
 		if string(inputFingerprint) != stageAttempt.InputFingerprint {
-			return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate input fingerprint drift", ErrFrozenExecutionPayload))
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate input fingerprint drift", ErrFrozenExecutionPayload))
 		}
 		return runtime.executeWorkflowkitReviewGate(ctx, execution, job, run, subject, frozen, payload, stageAttempt, stage, inputs, review)
 	}
@@ -1284,7 +1308,7 @@ func (runtime *FrozenExecutionRuntime) failAdmittedStageIntegrity(ctx context.Co
 	if settlementErr != nil {
 		cause = fmt.Errorf("%w: settle admitted stage integrity failure: %v", cause, settlementErr)
 	}
-	return runtime.failMalformedJob(ctx, job, cause)
+	return runtime.failRuntimeJob(ctx, job, cause)
 }
 
 func (runtime *FrozenExecutionRuntime) validateStageAttemptPlanBinding(attempt store.StageAttempt, payload frozenStageExecutionPayload) error {
@@ -1479,7 +1503,7 @@ func (reservation stageQuotaReservation) recordDimension(ctx context.Context, ru
 
 func (runtime *FrozenExecutionRuntime) projectAdmissionFailure(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, subject workflowRunSubject, stage workflowkit.StageDescriptor, attempt *store.StageAttempt, admissionErr error) (store.JobState, error) {
 	if attempt == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: stage attempt is required for admission projection", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: stage attempt is required for admission projection", ErrFrozenExecutionPayload))
 	}
 	result := StageExecutionResult{
 		Outcome:      workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePolicy},
@@ -1937,7 +1961,7 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 				return store.JobFailed, err
 			}
 		}
-		return store.JobInterrupted, nil
+		return store.JobInDoubt, nil
 	}
 
 	if operation != nil && operation.Action == store.ControlActionCancelStage && result.Outcome.Status != workflowkit.StatusCompleted {
@@ -1984,10 +2008,10 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 		}
 		completedEffect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, attempt, stage)
 		if effectErr != nil {
-			return runtime.failMalformedJob(ctx, job, effectErr)
+			return runtime.failRuntimeJob(ctx, job, effectErr)
 		}
 		if completedEffect == nil || completedEffect.State != store.SideEffectSucceeded {
-			return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: completed CodeEdge evaluator has no succeeded side effect", ErrFrozenExecutionPayload))
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: completed CodeEdge evaluator has no succeeded side effect", ErrFrozenExecutionPayload))
 		}
 		codeEdgeEffect = completedEffect
 		if err := runtime.completeTrustedCodeEdgeEvaluatorTrials(ctx, run, attempt, job.CreatedBy, "project direct completed CodeEdge evaluator trials"); err != nil {
@@ -2000,7 +2024,7 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 	}
 	settlementID, settlementErr := runtime.settleStageQuota(ctx, reservation, settlementOutcome, job.CreatedBy, "settle frozen stage quota")
 	if settlementErr != nil {
-		return runtime.failMalformedJob(ctx, job, settlementErr)
+		return runtime.failRuntimeJob(ctx, job, settlementErr)
 	}
 	updated, err := runtime.core.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
 		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: stageStatus, Verdict: verdict,
@@ -2008,7 +2032,7 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 		Actor: job.CreatedBy, Reason: "frozen stage terminal outcome",
 	})
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	return runtime.afterStageTerminal(ctx, job, run, frozen, payload, stage, updated, operation, settlementID, monitor)
 }
@@ -2123,7 +2147,7 @@ func (runtime *FrozenExecutionRuntime) afterStageTerminal(ctx context.Context, j
 		case store.VerdictPass, store.VerdictAdvisory:
 			if isCurrentStandardAuthoringRun(run) && stage.Key == workflowkit.StageKey(workflowadapter.MaterializeTask) {
 				if err := runtime.enqueueStandardAuthoringHandoff(ctx, job, run, attempt); err != nil {
-					return runtime.failMalformedJob(ctx, job, fmt.Errorf("enqueue Standard authoring task handoff: %w", err))
+					return runtime.failRuntimeJob(ctx, job, fmt.Errorf("enqueue Standard authoring task handoff: %w", err))
 				}
 				// materialize_task is the last Standard authoring stage, but the
 				// parent cannot complete until its persisted receipt has created
@@ -2136,7 +2160,7 @@ func (runtime *FrozenExecutionRuntime) afterStageTerminal(ctx context.Context, j
 			// gates on that state, rather than waiting for this worker's later
 			// JobSucceeded delivery projection.
 			if err := runtime.enqueueNextCoordinator(ctx, job, run, frozen, payload); err != nil {
-				return runtime.failMalformedJob(ctx, job, err)
+				return runtime.failRuntimeJob(ctx, job, err)
 			}
 			return store.JobSucceeded, nil
 		case store.VerdictNeedsRepair:
@@ -2305,30 +2329,99 @@ func (runtime *FrozenExecutionRuntime) enqueueStandardAuthoringHandoff(ctx conte
 func (runtime *FrozenExecutionRuntime) handleStandardAuthoringHandoff(ctx context.Context, job store.DurableJob) (store.JobState, error) {
 	payload, err := standardAuthoringHandoffJobPayload(job)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
-	if runtime.services == nil || runtime.services.StandardAuthoringHandoffs == nil {
-		return store.JobInDoubt, ErrCodeEdgePhase1DefinitionUnavailable
-	}
-	_, err = runtime.services.StandardAuthoringHandoffs.Consume(ctx, StandardAuthoringHandoffRequest{
+	request := StandardAuthoringHandoffRequest{
 		AuthoringRunID: payload.AuthoringRunID, StageAttemptID: payload.StageAttemptID,
 		HandoffArtifactID: payload.HandoffArtifactID, ChildRunID: payload.ChildRunID,
 		Actor: job.CreatedBy, Reason: "consume persisted Standard authoring task handoff",
-	})
+	}
+	if runtime.services == nil || runtime.services.StandardAuthoringHandoffs == nil {
+		cause := newStandardAuthoringHandoffFailure(
+			store.JobInDoubt,
+			handoffDefinitionUnavailableCode,
+			"CodeEdge Phase-1 run definition is unavailable.",
+			handoffFailureDetails(request, "definition"),
+			ErrCodeEdgePhase1DefinitionUnavailable,
+		)
+		state, diagnostic, _ := handoffFailureErrorForWorker(job, cause)
+		return state, diagnostic
+	}
+	_, err = runtime.services.StandardAuthoringHandoffs.Consume(ctx, request)
 	if err == nil {
 		if err := runtime.enqueueStandardAuthoringCompletionCoordinator(ctx, job, payload); err != nil {
-			return runtime.failMalformedJob(ctx, job, fmt.Errorf("enqueue Standard authoring completion coordinator: %w", err))
+			cause := handoffStorageFailure(request, "completion_coordinator", fmt.Errorf("enqueue Standard authoring completion coordinator: %w", err))
+			state, diagnostic, _ := handoffFailureErrorForWorker(job, cause)
+			return state, diagnostic
 		}
 		return store.JobSucceeded, nil
 	}
-	if errors.Is(err, ErrCodeEdgePhase1DefinitionUnavailable) || errors.Is(err, ErrCodeEdgePhase1DefinitionInvalid) {
-		// The immutable handoff artifact and preallocated child identity remain
-		// intact. This is a deployment hold, not a malformed workflow result:
-		// leave the delivery explicitly in_doubt until an operator republishes
-		// it through StandardAuthoringHandoffService.Redrive.
-		return store.JobInDoubt, err
+	if state, diagnostic, ok := handoffFailureErrorForWorker(job, err); ok {
+		return state, diagnostic
 	}
-	return runtime.failMalformedJob(ctx, job, fmt.Errorf("consume Standard authoring handoff: %w", err))
+	cause := handoffStorageFailure(request, "consume", fmt.Errorf("consume Standard authoring handoff: %w", err))
+	state, diagnostic, _ := handoffFailureErrorForWorker(job, cause)
+	return state, diagnostic
+}
+
+func isStandardAuthoringHandoffCommand(commandType string) bool {
+	switch commandType {
+	case standardAuthoringHandoffCommandType, standardAuthoringHandoffRedriveCommandType, standardAuthoringHandoffReconcileCommandType:
+		return true
+	default:
+		return false
+	}
+}
+
+func standardAuthoringHandoffRunProjection(job store.DurableJob, state store.JobState) *store.DurableJobRunProjection {
+	if job.RunID == "" {
+		return nil
+	}
+	target, ok := standardAuthoringHandoffRunStatus(state)
+	if !ok {
+		return nil
+	}
+	return &store.DurableJobRunProjection{Status: target}
+}
+
+func standardAuthoringHandoffRunStatus(state store.JobState) (store.WorkflowRunStatus, bool) {
+	switch state {
+	case store.JobSucceeded:
+		return store.WorkflowRunRunning, true
+	case store.JobInDoubt:
+		return store.WorkflowRunInDoubt, true
+	case store.JobFailed:
+		return store.WorkflowRunFailedTerminal, true
+	default:
+		return "", false
+	}
+}
+
+func (runtime *FrozenExecutionRuntime) projectStandardAuthoringHandoffRunState(ctx context.Context, job store.DurableJob, state store.JobState, actor, reason string) error {
+	if runtime == nil || runtime.core == nil || runtime.core.store == nil {
+		return fmt.Errorf("Standard authoring handoff runtime is not configured")
+	}
+	if job.RunID == "" {
+		return fmt.Errorf("Standard authoring handoff job has no parent Run")
+	}
+	target, ok := standardAuthoringHandoffRunStatus(state)
+	if !ok {
+		return fmt.Errorf("Standard authoring handoff has unsupported terminal job state %q", state)
+	}
+	run, err := runtime.core.store.GetWorkflowRun(ctx, job.RunID)
+	if err != nil {
+		return err
+	}
+	if run == nil {
+		return fmt.Errorf("%w: Standard authoring handoff parent Run %s", ErrLifecycleNotFound, job.RunID)
+	}
+	if run.Status == target || terminalWorkflowRunStatus(run.Status) {
+		return nil
+	}
+	_, err = runtime.core.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: target, Actor: actor, Reason: reason,
+	})
+	return err
 }
 
 // enqueueStandardAuthoringCompletionCoordinator publishes the parent-side
@@ -2468,31 +2561,15 @@ func (runtime *FrozenExecutionRuntime) continuationForMaterializedAuthoringStage
 	return execution, nil
 }
 
-// reconcileRecoveredStandardAuthoringHandoff is safe because the child Run is
-// a local durable mutation guarded by the handoff job's preallocated ID. It
-// never re-executes an external operation; StartRun either replays the exact
-// frozen child or creates it once.
+// reconcileRecoveredStandardAuthoringHandoff intentionally does not consume a
+// recovered handoff. It only projects the durable lease-loss fact onto the
+// parent Run so ordinary work is fenced. An explicit operator reconcile or
+// redrive must publish any later handoff delivery.
 func (runtime *FrozenExecutionRuntime) reconcileRecoveredStandardAuthoringHandoff(ctx context.Context, job store.DurableJob) error {
-	payload, err := standardAuthoringHandoffJobPayload(job)
-	if err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, err)
-		return projected
+	if _, err := standardAuthoringHandoffJobPayload(job); err != nil {
+		return fmt.Errorf("validate recovered Standard authoring handoff %s: %w", job.ID, err)
 	}
-	if runtime.services == nil || runtime.services.StandardAuthoringHandoffs == nil {
-		return nil
-	}
-	_, err = runtime.services.StandardAuthoringHandoffs.Consume(ctx, StandardAuthoringHandoffRequest{
-		AuthoringRunID: payload.AuthoringRunID, StageAttemptID: payload.StageAttemptID,
-		HandoffArtifactID: payload.HandoffArtifactID, ChildRunID: payload.ChildRunID,
-		Actor: job.CreatedBy, Reason: "recover persisted Standard authoring task handoff",
-	})
-	if errors.Is(err, ErrCodeEdgePhase1DefinitionUnavailable) || errors.Is(err, ErrCodeEdgePhase1DefinitionInvalid) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return runtime.enqueueStandardAuthoringCompletionCoordinator(ctx, job, payload)
+	return runtime.projectStandardAuthoringHandoffRunState(ctx, job, store.JobInDoubt, job.CreatedBy, "expired Standard authoring handoff delivery requires explicit recovery")
 }
 
 func (runtime *FrozenExecutionRuntime) completeRunIfSatisfied(ctx context.Context, run store.WorkflowRun, frozen frozenRunDefinition, plan runtimeExecutionPlan, actor string) (bool, error) {

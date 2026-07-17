@@ -16,6 +16,8 @@ import (
 
 const stageArtifactManifestFormat = "harbor.v2.stage-artifact-manifest.v1"
 
+var errStageArtifactStorageUnavailable = errors.New("stage artifact storage is temporarily unavailable")
+
 type stageArtifactCandidate struct {
 	attempt store.StageAttempt
 	ref     store.ArtifactRef
@@ -383,6 +385,9 @@ func loadStageArtifactManifestIndex(ctx context.Context, dataStore *store.Store,
 	}
 	manifest, err := dataStore.GetArtifactManifest(ctx, manifestID)
 	if err != nil {
+		if !errors.Is(err, store.ErrInvalidUUIDv7Identity) && !errors.Is(err, store.ErrInvalidJobFailure) {
+			return stageArtifactManifestIndex{}, fmt.Errorf("%w: load artifact manifest %s: %v", errStageArtifactStorageUnavailable, manifestID, err)
+		}
 		return stageArtifactManifestIndex{}, fmt.Errorf("load artifact manifest %s: %w", manifestID, err)
 	}
 	if manifest == nil {
@@ -474,7 +479,13 @@ func verifyStageArtifactCandidateWithManifestForSubject(ctx context.Context, obj
 	if err != nil {
 		return err
 	}
-	return VerifyStageArtifactObject(ctx, objects, object)
+	if err := VerifyStageArtifactObject(ctx, objects, object); err != nil {
+		if !artifactObjectUnavailable(err) {
+			return fmt.Errorf("%w: verify artifact ref %s: %v", errStageArtifactStorageUnavailable, candidate.ref.ID, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // persistStageArtifacts publishes real executor bytes into the managed object

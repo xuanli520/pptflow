@@ -17,12 +17,12 @@ import (
 func (runtime *FrozenExecutionRuntime) openReviewGate(ctx context.Context, job store.DurableJob, run store.WorkflowRun, subject workflowRunSubject, frozen frozenRunDefinition, payload frozenStageExecutionPayload, stage workflowkit.StageDescriptor, attempt store.StageAttempt, inputs []workflowkit.ArtifactBinding, review workflowadapter.ReviewStage) (store.JobState, error) {
 	frozenReview, found := frozen.ReviewStage(stage.Key)
 	if !found || frozenReview.ReviewKind != review.ReviewKind || frozenReview.DecisionArtifact != review.DecisionArtifact {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate %q does not match its frozen review metadata", ErrFrozenExecutionPayload, stage.Key))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate %q does not match its frozen review metadata", ErrFrozenExecutionPayload, stage.Key))
 	}
 
 	encodedInputs, err := json.Marshal(inputs)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("encode frozen review gate inputs: %w", err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("encode frozen review gate inputs: %w", err))
 	}
 	evidenceDigest, err := workflowkit.FingerprintParts("harbor.review-gate-evidence.v1", []workflowkit.FingerprintPart{
 		{Name: "definition", Value: []byte(run.DefinitionHash)},
@@ -33,7 +33,7 @@ func (runtime *FrozenExecutionRuntime) openReviewGate(ctx context.Context, job s
 		{Name: "stage", Value: []byte(stage.Key)},
 	})
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("fingerprint frozen review gate evidence: %w", err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("fingerprint frozen review gate evidence: %w", err))
 	}
 	if subject.isAuthoringSession() {
 		opened, err := runtime.core.store.OpenAuthoringReviewGate(ctx, store.OpenAuthoringReviewGateRequest{
@@ -46,15 +46,15 @@ func (runtime *FrozenExecutionRuntime) openReviewGate(ctx context.Context, job s
 			Actor: job.CreatedBy, Reason: "activate frozen authoring review gate",
 		})
 		if err != nil {
-			return runtime.failMalformedJob(ctx, job, fmt.Errorf("open durable authoring review gate: %w", err))
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("open durable authoring review gate: %w", err))
 		}
 		if opened.Binding.RunID != run.ID || opened.Binding.StageAttemptID != attempt.ID || opened.StageAttempt.ExecutionStatus != store.StageExecutionWaiting || opened.Run.Status != store.WorkflowRunWaitingReview {
-			return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: authoring review gate open returned inconsistent waiting state", ErrFrozenExecutionPayload))
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review gate open returned inconsistent waiting state", ErrFrozenExecutionPayload))
 		}
 		return store.JobSucceeded, nil
 	}
 	if !subject.isTaskRevision() || subject.Revision == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: unsupported review-gate subject", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: unsupported review-gate subject", ErrFrozenExecutionPayload))
 	}
 	opened, err := runtime.core.store.OpenReviewGate(ctx, store.OpenReviewGateRequest{
 		RunID: run.ID, ExpectedRunVersion: run.Version, RevisionID: subject.Revision.ID, RevisionDigest: subject.Revision.TaskDigest,
@@ -64,10 +64,10 @@ func (runtime *FrozenExecutionRuntime) openReviewGate(ctx context.Context, job s
 		Actor: job.CreatedBy, Reason: "activate frozen durable review gate",
 	})
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("open durable review gate: %w", err))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("open durable review gate: %w", err))
 	}
 	if opened.Binding.RunID != run.ID || opened.Binding.StageAttemptID != attempt.ID || opened.StageAttempt.ExecutionStatus != store.StageExecutionWaiting || opened.Run.Status != store.WorkflowRunWaitingReview {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: review gate open returned inconsistent waiting state", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: review gate open returned inconsistent waiting state", ErrFrozenExecutionPayload))
 	}
 	return store.JobSucceeded, nil
 }

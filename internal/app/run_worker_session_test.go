@@ -18,8 +18,8 @@ const (
 func TestRunWorkerSessionFencesOneRunAndReleasesItsSupervisorLease(t *testing.T) {
 	ctx := context.Background()
 	_, services, _, _, run := newLocalRuntimeServiceFixture(t, "run-worker-owner")
-	handler := DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) {
-		return store.JobSucceeded, nil
+	handler := DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (DurableJobResult, error) {
+		return DurableJobResult{State: store.JobSucceeded}, nil
 	})
 	first, err := NewRunWorkerSession(RunWorkerSessionConfig{
 		Services: services, RunID: run.ID, Owner: "run-worker-a", Actor: "run-worker-owner", Reason: "test controlled child worker",
@@ -95,7 +95,9 @@ func TestRunWorkerSessionConsumesReservedHandoffLeaseAndReleasesIt(t *testing.T)
 	session, err := NewRunWorkerSession(RunWorkerSessionConfig{
 		Services: services, RunID: run.ID, Owner: "handoff-child", Actor: "run-worker-handoff", Reason: "handoff child worker",
 		HandoffOperationID: operationID, HandoffProcessID: 4242, HandoffLogPath: "/managed/worker.log",
-		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) { return store.JobSucceeded, nil }),
+		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (DurableJobResult, error) {
+			return DurableJobResult{State: store.JobSucceeded}, nil
+		}),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +150,9 @@ func TestRunWorkerSessionSignalControlsAreDurableIdempotentAndTerminateWins(t *t
 	keys := []string{}
 	session, err := NewRunWorkerSession(RunWorkerSessionConfig{
 		Services: services, RunID: run.ID, Owner: "run-worker-signal-owner", Actor: "run-worker-signal", Reason: "test signal control",
-		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) { return store.JobSucceeded, nil }),
+		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (DurableJobResult, error) {
+			return DurableJobResult{State: store.JobSucceeded}, nil
+		}),
 		NewOperationKey: func() (string, error) {
 			key, err := store.NewUUIDv7()
 			if err == nil {
@@ -201,7 +205,9 @@ func TestRunWorkerSessionSignalControlsReplayAcrossControlledChildRestarts(t *te
 		t.Helper()
 		session, err := NewRunWorkerSession(RunWorkerSessionConfig{
 			Services: services, RunID: run.ID, Owner: owner, Actor: "run-worker-signal-restart", Reason: "test restarted child signal control",
-			Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) { return store.JobSucceeded, nil }),
+			Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (DurableJobResult, error) {
+				return DurableJobResult{State: store.JobSucceeded}, nil
+			}),
 			NewOperationKey: func() (string, error) {
 				*calls++
 				return store.NewUUIDv7()

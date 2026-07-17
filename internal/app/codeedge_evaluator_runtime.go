@@ -409,7 +409,7 @@ func (runtime *FrozenExecutionRuntime) projectCodeEdgeEvaluatorInDoubt(ctx conte
 	if len(failures) != 0 {
 		return store.JobFailed, fmt.Errorf("CodeEdge evaluator reconciliation projection: %w", errors.Join(failures...))
 	}
-	return store.JobInterrupted, nil
+	return store.JobInDoubt, nil
 }
 
 func (runtime *FrozenExecutionRuntime) markCodeEdgeEvaluatorTrialsInDoubt(ctx context.Context, run store.WorkflowRun, stageAttempt store.StageAttempt, actor, detail string) error {

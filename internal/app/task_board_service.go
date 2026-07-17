@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -66,22 +67,41 @@ type TaskBoardTask struct {
 // task detail. It contains durable facts only and never exposes a direct
 // filesystem capability to the terminal adapter.
 type TaskBoardRun struct {
-	ID            string
-	ParentRunID   string
-	Status        string
-	CurrentStage  string
-	FailureStage  string
-	FailureClass  string
-	FailureReason string
-	CreatedAt     time.Time
-	StartedAt     *time.Time
-	FinishedAt    *time.Time
-	LogPath       string
-	HasLog        bool
-	CanRetry      bool
-	RetryReason   string
-	RetryStrategy TaskBoardRetryStrategy
+	ID                    string
+	ParentRunID           string
+	Status                string
+	CurrentStage          string
+	FailureStage          string
+	FailureClass          string
+	FailureReason         string
+	FailureCode           string
+	FailureSummary        string
+	FailureJobID          string
+	FailureArtifactID     string
+	FailureRecordedAt     *time.Time
+	FailureRecoveryAction TaskBoardFailureRecoveryAction
+	CanRedrive            bool
+	CreatedAt             time.Time
+	StartedAt             *time.Time
+	FinishedAt            *time.Time
+	LogPath               string
+	HasLog                bool
+	CanRetry              bool
+	RetryReason           string
+	RetryStrategy         TaskBoardRetryStrategy
 }
+
+// TaskBoardFailureRecoveryAction is the explicitly supported next operation
+// for a durable job failure. It is a display projection, not a capability:
+// the receiving service revalidates the job state and failure code.
+type TaskBoardFailureRecoveryAction string
+
+const (
+	TaskBoardFailureRecoveryNone                    TaskBoardFailureRecoveryAction = ""
+	TaskBoardFailureRecoveryReconcile               TaskBoardFailureRecoveryAction = "reconcile"
+	TaskBoardFailureRecoveryRedriveAuthoringHandoff TaskBoardFailureRecoveryAction = "redrive_standard_authoring_handoff"
+	TaskBoardFailureRecoveryRepairOrNewRun          TaskBoardFailureRecoveryAction = "repair_or_new_run"
+)
 
 // TaskBoardRetryStrategy identifies the durable recovery contract selected for
 // a Run. The terminal adapter uses it only to route an already-confirmed
@@ -740,9 +760,18 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 		LogPath:      logPath,
 		HasLog:       logPath != "",
 	}
-	run.FailureStage, run.FailureClass, run.FailureReason = taskBoardFailure(inspected.Stages)
-	if run.FailureReason == "" {
-		run.FailureReason = taskBoardHandoffFailure(handoffs)
+	if failure := taskBoardDurableJobFailure(inspected.Jobs, inspected.Stages); failure != nil {
+		run.FailureStage = failure.Stage
+		run.FailureCode = failure.Code
+		run.FailureSummary = failure.Summary
+		// Keep the legacy reason populated for presentation clients that have
+		// not yet adopted FailureSummary. The durable record remains the source.
+		run.FailureReason = failure.Summary
+		run.FailureJobID = failure.JobID
+		run.FailureArtifactID = failure.ArtifactID
+		run.FailureRecordedAt = failure.RecordedAt
+		run.FailureRecoveryAction = failure.RecoveryAction
+		run.CanRedrive = failure.CanRedrive
 	}
 	run.RetryStrategy = taskBoardRetryStrategy(inspected.Run)
 	if inspected.Run.SubjectKind == store.WorkflowRunSubjectTaskRevision && inspected.Run.Status == store.WorkflowRunWaitingContinuation && taskBoardHasNeedsRepair(inspected.Stages) {
@@ -804,24 +833,126 @@ func taskBoardRetryAvailability(run store.WorkflowRun) (bool, string) {
 	}
 }
 
-func taskBoardFailure(stages []store.StageAttempt) (stageKey, failureClass, reason string) {
-	for index := len(stages) - 1; index >= 0; index-- {
-		stage := stages[index]
-		if strings.TrimSpace(stage.ErrorText) == "" && strings.TrimSpace(stage.FailureClass) == "" {
-			continue
-		}
-		return stage.StageKey, stage.FailureClass, stage.ErrorText
-	}
-	return "", "", ""
+type taskBoardDurableFailure struct {
+	Stage          string
+	Code           string
+	Summary        string
+	JobID          string
+	ArtifactID     string
+	RecordedAt     *time.Time
+	RecoveryAction TaskBoardFailureRecoveryAction
+	CanRedrive     bool
 }
 
-func taskBoardHandoffFailure(handoffs []store.RunWorkerHandoff) string {
-	for index := len(handoffs) - 1; index >= 0; index-- {
-		if reason := strings.TrimSpace(handoffs[index].FailureReason); reason != "" {
-			return reason
+type taskBoardDurableFailureDetails struct {
+	ArtifactID string `json:"artifact_id"`
+	Stage      string `json:"stage"`
+	StageKey   string `json:"stage_key"`
+}
+
+// taskBoardDurableJobFailure selects the newest durable failure record rather
+// than reconstructing failure semantics from a Run status or worker log.
+func taskBoardDurableJobFailure(jobs []DurableJobInspection, stages []store.StageAttempt) *taskBoardDurableFailure {
+	durableJobs := make([]store.DurableJob, 0, len(jobs))
+	for _, inspected := range jobs {
+		durableJobs = append(durableJobs, inspected.Job)
+	}
+	var selected *store.DurableJob
+	for index := range jobs {
+		job := jobs[index].Job
+		if job.Failure == nil || (job.State != store.JobFailed && job.State != store.JobInDoubt) {
+			continue
+		}
+		if standardAuthoringHandoffFailureResolved(job, durableJobs) {
+			continue
+		}
+		if selected == nil || taskBoardDurableFailureTime(job).After(taskBoardDurableFailureTime(*selected)) ||
+			(taskBoardDurableFailureTime(job).Equal(taskBoardDurableFailureTime(*selected)) && job.ID > selected.ID) {
+			candidate := job
+			selected = &candidate
 		}
 	}
-	return ""
+	if selected == nil || selected.Failure == nil {
+		return nil
+	}
+
+	details := taskBoardFailureDetails(selected.Failure.DetailsJSON)
+	recordedAt := taskBoardDurableFailureTime(*selected)
+	result := &taskBoardDurableFailure{
+		Stage:          taskBoardFailureStage(*selected, stages, details),
+		Code:           selected.Failure.Code,
+		Summary:        selected.Failure.Message,
+		JobID:          selected.ID,
+		ArtifactID:     taskBoardFailureArtifactID(*selected, details),
+		RecordedAt:     &recordedAt,
+		RecoveryAction: taskBoardFailureRecoveryAction(*selected),
+		CanRedrive:     taskBoardCanRedriveAuthoringHandoff(*selected),
+	}
+	return result
+}
+
+func taskBoardDurableFailureTime(job store.DurableJob) time.Time {
+	if job.FinishedAt != nil {
+		return job.FinishedAt.UTC()
+	}
+	return job.UpdatedAt.UTC()
+}
+
+func taskBoardFailureDetails(raw string) taskBoardDurableFailureDetails {
+	var details taskBoardDurableFailureDetails
+	if err := json.Unmarshal([]byte(raw), &details); err != nil {
+		return taskBoardDurableFailureDetails{}
+	}
+	details.ArtifactID = strings.TrimSpace(details.ArtifactID)
+	details.Stage = strings.TrimSpace(details.Stage)
+	details.StageKey = strings.TrimSpace(details.StageKey)
+	return details
+}
+
+func taskBoardFailureStage(job store.DurableJob, stages []store.StageAttempt, details taskBoardDurableFailureDetails) string {
+	for _, stage := range stages {
+		if stage.ID == job.StageAttemptID && strings.TrimSpace(stage.StageKey) != "" {
+			return stage.StageKey
+		}
+	}
+	if details.StageKey != "" {
+		return details.StageKey
+	}
+	return details.Stage
+}
+
+func taskBoardFailureArtifactID(job store.DurableJob, details taskBoardDurableFailureDetails) string {
+	if job.EntityType == "artifact_ref" && strings.TrimSpace(job.EntityID) != "" {
+		return job.EntityID
+	}
+	return details.ArtifactID
+}
+
+func taskBoardFailureRecoveryAction(job store.DurableJob) TaskBoardFailureRecoveryAction {
+	switch job.State {
+	case store.JobFailed:
+		return TaskBoardFailureRecoveryRepairOrNewRun
+	case store.JobInDoubt:
+		if taskBoardCanRedriveAuthoringHandoff(job) {
+			return TaskBoardFailureRecoveryRedriveAuthoringHandoff
+		}
+		return TaskBoardFailureRecoveryReconcile
+	default:
+		return TaskBoardFailureRecoveryNone
+	}
+}
+
+func taskBoardCanRedriveAuthoringHandoff(job store.DurableJob) bool {
+	if job.State != store.JobInDoubt || job.Failure == nil ||
+		(job.CommandType != standardAuthoringHandoffCommandType && job.CommandType != standardAuthoringHandoffRedriveCommandType && job.CommandType != standardAuthoringHandoffReconcileCommandType) {
+		return false
+	}
+	switch job.Failure.Code {
+	case handoffDefinitionUnavailableCode, handoffDefinitionInvalidCode, handoffStorageUnavailableCode:
+		return true
+	default:
+		return false
+	}
 }
 
 func taskBoardLogPath(handoffs []store.RunWorkerHandoff) string {

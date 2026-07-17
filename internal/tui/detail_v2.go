@@ -147,27 +147,53 @@ func (d *detailModel) currentRunFields(width int) string {
 
 func (d *detailModel) failureFields(width int) string {
 	run := d.currentRun()
-	if run == nil || (strings.TrimSpace(run.FailureReason) == "" && strings.TrimSpace(run.FailureClass) == "") {
+	if run == nil || (strings.TrimSpace(run.FailureSummary) == "" && strings.TrimSpace(run.FailureCode) == "") {
 		return ""
 	}
 	stage := run.FailureStage
 	if stage == "" {
 		stage = "当前 Run"
 	}
-	classification := run.FailureClass
-	if classification == "" {
-		classification = "未分类"
+	summary := strings.TrimSpace(run.FailureSummary)
+	if summary == "" {
+		summary = "未提供错误摘要"
 	}
-	reason := strings.TrimSpace(run.FailureReason)
-	if reason == "" {
-		reason = "未提供错误摘要"
+	fields := []string{detailField("失败阶段", stage, width)}
+	if code := strings.TrimSpace(run.FailureCode); code != "" {
+		fields = append(fields, detailField("错误码", code, width))
 	}
-	wrapped := ansi.WrapWc(ansi.Strip(reason), max(1, width-6), "")
-	return detailFields(width,
-		detailField("失败阶段", stage, width),
-		detailField("失败分类", classification, width),
-		failStyleV2.Render(wrapped),
-	)
+	if jobID := strings.TrimSpace(run.FailureJobID); jobID != "" {
+		fields = append(fields, detailField("Job ID", jobID, width))
+	}
+	if artifactID := strings.TrimSpace(run.FailureArtifactID); artifactID != "" {
+		fields = append(fields, detailField("Artifact ID", artifactID, width))
+	}
+	if run.FailureRecordedAt != nil {
+		fields = append(fields, detailField("记录时间", formatDetailTime(run.FailureRecordedAt), width))
+	}
+	if recovery := detailFailureRecoveryAction(run); recovery != "" {
+		fields = append(fields, detailField("恢复操作", recovery, width))
+	}
+	wrapped := ansi.WrapWc(ansi.Strip(summary), max(1, width-6), "")
+	fields = append(fields, failStyleV2.Render(wrapped))
+	return detailFields(width, fields...)
+}
+
+func detailFailureRecoveryAction(run *TaskRunItem) string {
+	if run == nil {
+		return ""
+	}
+	switch run.FailureRecoveryAction {
+	case app.TaskBoardFailureRecoveryRedriveAuthoringHandoff:
+		if run.CanRedrive {
+			return "显式 redrive"
+		}
+	case app.TaskBoardFailureRecoveryReconcile:
+		return "显式 reconcile"
+	case app.TaskBoardFailureRecoveryRepairOrNewRun:
+		return "修复或新建运行"
+	}
+	return ""
 }
 
 func (d *detailModel) historyFields(width, height int) string {

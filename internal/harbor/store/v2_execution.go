@@ -759,7 +759,7 @@ func validWorkflowRunTransition(from, to WorkflowRunStatus) bool {
 	case WorkflowRunCanceling:
 		return to == WorkflowRunCanceled || to == WorkflowRunInDoubt || to == WorkflowRunInterrupted
 	case WorkflowRunInDoubt:
-		return to == WorkflowRunRunning || to == WorkflowRunSucceeded || to == WorkflowRunFailedRecoverable || to == WorkflowRunCanceled || to == WorkflowRunInterrupted
+		return to == WorkflowRunRunning || to == WorkflowRunSucceeded || to == WorkflowRunFailedRecoverable || to == WorkflowRunFailedTerminal || to == WorkflowRunCanceled || to == WorkflowRunInterrupted
 	case WorkflowRunFailedRecoverable:
 		return to == WorkflowRunRunning || to == WorkflowRunResumeRequested || to == WorkflowRunCanceled || to == WorkflowRunInDoubt
 	default:

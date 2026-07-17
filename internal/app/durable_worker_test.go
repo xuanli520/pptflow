@@ -3,12 +3,26 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
+
+func TestDurableJobFailureErrorRedactsRawCause(t *testing.T) {
+	cause := errors.New("provider returned model output from /private/run with sk-sensitive-token")
+	err := newDurableJobFailureError(store.DurableJobFailure{
+		Code: "handoff.storage_unavailable", Message: "The persisted handoff could not be read safely.", DetailsJSON: `{}`,
+	}, cause)
+	if got := err.Error(); got != "handoff.storage_unavailable" || strings.Contains(got, "private") || strings.Contains(got, "sk-") {
+		t.Fatalf("durable failure error exposed raw cause: %q", got)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("durable failure error no longer unwraps its cause for internal classification")
+	}
+}
 
 func TestDurableWorkerClaimsProjectsAndReleasesOneJob(t *testing.T) {
 	ctx := context.Background()
@@ -27,9 +41,9 @@ func TestDurableWorkerClaimsProjectsAndReleasesOneJob(t *testing.T) {
 	handled := make(chan DurableJobExecution, 1)
 	worker, err := NewDurableWorker(DurableWorkerConfig{
 		Store: dataStore, Owner: "worker-success", Actor: "tester", Reason: "test worker",
-		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (store.JobState, error) {
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
 			handled <- execution
-			return store.JobSucceeded, nil
+			return DurableJobResult{State: store.JobSucceeded}, nil
 		}),
 	})
 	if err != nil {
@@ -90,8 +104,11 @@ func TestDurableWorkerProjectsHandlerFailureWithoutFalseSuccess(t *testing.T) {
 	want := errors.New("real executor failure")
 	worker, err := NewDurableWorker(DurableWorkerConfig{
 		Store: dataStore, Owner: "worker-failure", Actor: "tester",
-		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) {
-			return "", want
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
+			return DurableJobResult{
+				State:   store.JobFailed,
+				Failure: newDurableJobFailure("test.executor_failed", "The test executor reported a deterministic failure.", durableJobFailureDetails(*execution.Claim.Job, "executor")),
+			}, want
 		}),
 	})
 	if err != nil {
@@ -101,6 +118,9 @@ func TestDurableWorkerProjectsHandlerFailureWithoutFalseSuccess(t *testing.T) {
 	if !errors.Is(err, want) {
 		t.Fatalf("worker failure = %v, want wrapped handler failure", err)
 	}
+	if strings.Contains(err.Error(), want.Error()) {
+		t.Fatalf("worker failure exposed raw handler error: %v", err)
+	}
 	if result.FinalState != store.JobFailed {
 		t.Fatalf("worker final state = %q, want failed", result.FinalState)
 	}
@@ -108,8 +128,45 @@ func TestDurableWorkerProjectsHandlerFailureWithoutFalseSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted == nil || persisted.State != store.JobFailed {
+	if persisted == nil || persisted.State != store.JobFailed || persisted.Failure == nil || persisted.Failure.Code != "test.executor_failed" {
 		t.Fatalf("handler failure was projected as %+v, want failed", persisted)
+	}
+}
+
+func TestDurableWorkerRejectsInvalidRunProjectionBeforeTransition(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := store.OpenForTest(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	job, err := dataStore.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "test.execute", EntityType: "test", EntityID: "subject", PayloadJSON: `{}`,
+		IdempotencyKey: "durable-worker-invalid-projection", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewDurableWorker(DurableWorkerConfig{
+		Store: dataStore, Owner: "worker-invalid-projection", Actor: "tester",
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
+			return DurableJobResult{
+				State:         store.JobFailed,
+				Failure:       newDurableJobFailure("test.executor_failed", "The test executor reported a deterministic failure.", durableJobFailureDetails(*execution.Claim.Job, "executor")),
+				RunProjection: &store.DurableJobRunProjection{Status: store.WorkflowRunFailedTerminal},
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := worker.RunOnce(ctx)
+	if !errors.Is(err, ErrDurableWorkerConfiguration) || result.FinalState != store.JobFailed {
+		t.Fatalf("invalid projection worker result = %+v, %v", result, err)
+	}
+	persisted, err := dataStore.GetDurableJob(ctx, job.ID)
+	if err != nil || persisted == nil || persisted.State != store.JobFailed || persisted.Failure == nil || persisted.Failure.Code != "worker.handler_result_invalid" {
+		t.Fatalf("invalid projection durable job = %+v, %v", persisted, err)
 	}
 }
 
@@ -136,8 +193,11 @@ func TestDurableWorkerProjectsInDoubtAsDeliveryFinalWithoutAutoRetry(t *testing.
 	hold := errors.New("controlled definition is unavailable")
 	worker, err := NewDurableWorker(DurableWorkerConfig{
 		Store: dataStore, Owner: "worker-in-doubt", Actor: "tester", Reason: "test in_doubt delivery", CapacityPoolKey: pool.PoolKey,
-		Handler: DurableJobHandlerFunc(func(context.Context, DurableJobExecution) (store.JobState, error) {
-			return store.JobInDoubt, hold
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
+			return DurableJobResult{
+				State:   store.JobInDoubt,
+				Failure: newDurableJobFailure("handoff.definition_unavailable", "The controlled definition is unavailable.", durableJobFailureDetails(*execution.Claim.Job, "definition")),
+			}, hold
 		}),
 	})
 	if err != nil {
@@ -148,7 +208,7 @@ func TestDurableWorkerProjectsInDoubtAsDeliveryFinalWithoutAutoRetry(t *testing.
 		t.Fatalf("in_doubt worker result = %+v, %v", result, err)
 	}
 	persisted, err := dataStore.GetDurableJob(ctx, job.ID)
-	if err != nil || persisted == nil || persisted.State != store.JobInDoubt || persisted.FinishedAt == nil {
+	if err != nil || persisted == nil || persisted.State != store.JobInDoubt || persisted.FinishedAt == nil || persisted.Failure == nil || persisted.Failure.Code != "handoff.definition_unavailable" {
 		t.Fatalf("in_doubt durable job = %+v, %v", persisted, err)
 	}
 	if _, err := dataStore.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
@@ -192,7 +252,7 @@ func TestDurableWorkerHeartbeatsDispatchFenceDuringActiveHandler(t *testing.T) {
 	heartbeated := make(chan heartbeatObservation, 1)
 	worker, err := NewDurableWorker(DurableWorkerConfig{
 		Store: dataStore, Owner: "worker-heartbeat", Actor: "tester", LeaseTTL: 5 * time.Second, HeartbeatEvery: 20 * time.Millisecond,
-		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (store.JobState, error) {
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
 			deadline := time.NewTimer(3 * time.Second)
 			defer deadline.Stop()
 			ticker := time.NewTicker(25 * time.Millisecond)
@@ -201,16 +261,16 @@ func TestDurableWorkerHeartbeatsDispatchFenceDuringActiveHandler(t *testing.T) {
 				lease, lookupErr := dataStore.GetLease(context.Background(), execution.Claim.DispatchLease.ID)
 				if lookupErr != nil {
 					heartbeated <- heartbeatObservation{lease: lease, err: lookupErr}
-					return "", lookupErr
+					return DurableJobResult{State: store.JobFailed, Failure: newDurableJobFailure("test.lease_lookup_failed", "The test could not read its dispatch lease.", durableJobFailureDetails(*execution.Claim.Job, "dispatch_lease"))}, lookupErr
 				}
 				if lease != nil && lease.State == store.LeaseActive && lease.Version > execution.Claim.DispatchLease.Version {
 					heartbeated <- heartbeatObservation{lease: lease}
-					return store.JobSucceeded, nil
+					return DurableJobResult{State: store.JobSucceeded}, nil
 				}
 				select {
 				case <-deadline.C:
 					heartbeated <- heartbeatObservation{lease: lease}
-					return store.JobFailed, errors.New("dispatch heartbeat was not observed before deadline")
+					return DurableJobResult{State: store.JobFailed, Failure: newDurableJobFailure("test.heartbeat_missing", "The dispatch heartbeat was not observed.", durableJobFailureDetails(*execution.Claim.Job, "dispatch_lease"))}, errors.New("dispatch heartbeat was not observed before deadline")
 				case <-ticker.C:
 				}
 			}
@@ -258,12 +318,12 @@ func TestDurableWorkerRunContinuesAfterProjectedJobFailure(t *testing.T) {
 	var calls atomic.Int32
 	worker, err := NewDurableWorker(DurableWorkerConfig{
 		Store: dataStore, Owner: "worker-run", Actor: "tester", PollInterval: time.Millisecond,
-		Handler: DurableJobHandlerFunc(func(_ context.Context, _ DurableJobExecution) (store.JobState, error) {
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
 			if calls.Add(1) == 1 {
-				return "", errors.New("first job failed")
+				return DurableJobResult{State: store.JobFailed, Failure: newDurableJobFailure("test.first_job_failed", "The first test job failed.", durableJobFailureDetails(*execution.Claim.Job, "executor"))}, errors.New("first job failed")
 			}
 			cancel()
-			return store.JobSucceeded, nil
+			return DurableJobResult{State: store.JobSucceeded}, nil
 		}),
 	})
 	if err != nil {

@@ -13,6 +13,7 @@ var (
 	ErrOptimisticLock        = errors.New("store: optimistic version conflict")
 	ErrImmutable             = errors.New("store: immutable record")
 	ErrInvalidTransition     = errors.New("store: invalid state transition")
+	ErrInvalidJobFailure     = errors.New("store: invalid durable job failure")
 	ErrLeaseHeld             = errors.New("store: resource lease is held")
 	ErrFencingToken          = errors.New("store: invalid lease fencing token")
 	ErrIdempotencyConflict   = errors.New("store: idempotency key conflicts with an existing job")
@@ -433,6 +434,7 @@ type DurableJob struct {
 	State          JobState
 	Priority       int
 	PayloadJSON    string
+	Failure        *DurableJobFailure
 	IdempotencyKey string
 	CreatedBy      string
 	CreatedAt      time.Time
@@ -440,6 +442,27 @@ type DurableJob struct {
 	StartedAt      *time.Time
 	FinishedAt     *time.Time
 	Version        int64
+}
+
+// DurableJobFailure is the stable, operator-safe diagnostic retained with a
+// failed or in-doubt durable job. DetailsJSON is deliberately restricted to
+// compact identifiers and validation facts by TransitionDurableJob.
+type DurableJobFailure struct {
+	Code        string
+	Message     string
+	DetailsJSON string
+}
+
+// DurableJobRunProjection requests the optional workflow Run state that must
+// be committed with a terminal durable delivery. The Store always derives the
+// target Run from DurableJob.RunID, so a caller cannot project an unrelated
+// Run while completing a job.
+//
+// It is intentionally a status-only projection. The immutable durable job
+// failure remains the diagnostic source of truth; this field only keeps the
+// operator-facing Run lifecycle in sync with that fact.
+type DurableJobRunProjection struct {
+	Status WorkflowRunStatus
 }
 
 type CreateDurableJobRequest struct {
@@ -460,6 +483,8 @@ type TransitionDurableJobRequest struct {
 	JobID           string
 	ExpectedVersion int64
 	State           JobState
+	Failure         *DurableJobFailure
+	RunProjection   *DurableJobRunProjection
 	Actor           string
 	Reason          string
 }

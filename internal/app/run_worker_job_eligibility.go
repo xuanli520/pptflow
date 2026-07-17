@@ -24,7 +24,7 @@ func runWorkerEligibleCommandTypes(status store.WorkflowRunStatus) ([]string, bo
 	case store.WorkflowRunPaused, store.WorkflowRunFailedRecoverable:
 		return []string{"task_continuation.execute"}, true
 	case store.WorkflowRunInDoubt:
-		return []string{codeEdgeEvaluatorReconciliationCommandType, repairSessionAdvanceCommandType, standardAuthoringHandoffRedriveCommandType}, true
+		return []string{codeEdgeEvaluatorReconciliationCommandType, repairSessionAdvanceCommandType, standardAuthoringHandoffRedriveCommandType, standardAuthoringHandoffReconcileCommandType}, true
 	case store.WorkflowRunSucceeded, store.WorkflowRunFailedTerminal:
 		return []string{repairSessionAdvanceCommandType}, true
 	default:

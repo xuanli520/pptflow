@@ -141,14 +141,14 @@ func (runtime *FrozenExecutionRuntime) enqueueCodeEdgeEvaluatorReconciliation(ct
 func (runtime *FrozenExecutionRuntime) handleCodeEdgeEvaluatorReconciliation(ctx context.Context, _ DurableJobExecution, job store.DurableJob) (store.JobState, error) {
 	binding, err := runtime.loadCodeEdgeEvaluatorReconciliationBinding(ctx, job)
 	if err != nil {
-		return runtime.failMalformedJob(ctx, job, err)
+		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	currentRun, err := runtime.core.store.GetWorkflowRun(ctx, binding.run.ID)
 	if err != nil {
 		return store.JobFailed, err
 	}
 	if currentRun == nil {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: CodeEdge evaluator reconciliation Run", ErrLifecycleNotFound))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: CodeEdge evaluator reconciliation Run", ErrLifecycleNotFound))
 	}
 	if binding.effect.State == store.SideEffectSucceeded && binding.stageAttempt.ExecutionStatus == store.StageExecutionCompleted {
 		// A crash can occur after the stage/effect receipt commits but before
@@ -157,7 +157,7 @@ func (runtime *FrozenExecutionRuntime) handleCodeEdgeEvaluatorReconciliation(ctx
 		return runtime.resumeObservedCodeEdgeEvaluatorCompletion(ctx, binding.sourceJob, binding.run, binding.frozen, binding.sourcePayload, binding.stage, binding.stageAttempt, binding.effect)
 	}
 	if currentRun.Status != store.WorkflowRunInDoubt || (binding.stageAttempt.ExecutionStatus != store.StageExecutionInDoubt && binding.stageAttempt.ExecutionStatus != store.StageExecutionReconciling) || binding.effect.State != store.SideEffectUnknown {
-		return runtime.failMalformedJob(ctx, job, fmt.Errorf("%w: CodeEdge evaluator reconciliation state is not in_doubt", ErrFrozenExecutionPayload))
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: CodeEdge evaluator reconciliation state is not in_doubt", ErrFrozenExecutionPayload))
 	}
 	if _, err := runtime.reconcileObservedCodeEdgeEvaluator(ctx, binding.sourceJob, *currentRun, binding.frozen, binding.sourcePayload, binding.stageAttempt, binding.stage, binding.effect); err != nil {
 		if errors.Is(err, errCodeEdgeEvaluatorObservationUnavailable) {
@@ -275,7 +275,7 @@ func (runtime *FrozenExecutionRuntime) loadCodeEdgeEvaluatorReconciliationBindin
 func (runtime *FrozenExecutionRuntime) reconcileRecoveredCodeEdgeEvaluatorReconciliation(ctx context.Context, job store.DurableJob) error {
 	binding, err := runtime.loadCodeEdgeEvaluatorReconciliationBinding(ctx, job)
 	if err != nil {
-		_, projected := runtime.failMalformedJob(ctx, job, err)
+		_, projected := runtime.failRuntimeJob(ctx, job, err)
 		return projected
 	}
 	if binding.effect.State != store.SideEffectSucceeded || binding.stageAttempt.ExecutionStatus != store.StageExecutionCompleted {

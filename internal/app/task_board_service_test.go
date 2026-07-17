@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -481,6 +482,124 @@ func TestTaskBoardColumnKeepsRecoverableRunsOutOfCompleted(t *testing.T) {
 		if column := taskBoardColumnForRun(status); column != TaskBoardPending {
 			t.Fatalf("status %s column = %s, want %s", status, column, TaskBoardPending)
 		}
+	}
+}
+
+func TestTaskBoardProjectsDurableHandoffFailureRecord(t *testing.T) {
+	finishedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
+	projected := (&TaskBoardService{}).projectTaskBoardRun(context.Background(), RunInspection{
+		Run: store.WorkflowRun{
+			ID:          "run-handoff",
+			SubjectKind: store.WorkflowRunSubjectTaskRevision,
+			Status:      store.WorkflowRunInDoubt,
+		},
+		Stages: []store.StageAttempt{{ID: "attempt-materialize", StageKey: workflowadapter.MaterializeTask}},
+		Jobs: []DurableJobInspection{{Job: store.DurableJob{
+			ID:             "job-handoff",
+			CommandType:    standardAuthoringHandoffCommandType,
+			EntityType:     "artifact_ref",
+			EntityID:       "artifact-handoff",
+			StageAttemptID: "attempt-materialize",
+			State:          store.JobInDoubt,
+			UpdatedAt:      finishedAt.Add(-time.Minute),
+			FinishedAt:     &finishedAt,
+			Failure: &store.DurableJobFailure{
+				Code:        "handoff.definition_unavailable",
+				Message:     "The approved child definition is unavailable.",
+				DetailsJSON: `{"artifact_id":"artifact-handoff","stage":"materialize_task"}`,
+			},
+		}}},
+	}, nil)
+
+	if projected.FailureStage != string(workflowadapter.MaterializeTask) ||
+		projected.FailureCode != "handoff.definition_unavailable" ||
+		projected.FailureSummary != "The approved child definition is unavailable." ||
+		projected.FailureJobID != "job-handoff" || projected.FailureArtifactID != "artifact-handoff" ||
+		projected.FailureRecordedAt == nil || !projected.FailureRecordedAt.Equal(finishedAt) {
+		t.Fatalf("durable handoff failure projection = %+v", projected)
+	}
+	if !projected.CanRedrive || projected.FailureRecoveryAction != TaskBoardFailureRecoveryRedriveAuthoringHandoff {
+		t.Fatalf("recoverable handoff action = can_redrive:%t action:%q", projected.CanRedrive, projected.FailureRecoveryAction)
+	}
+}
+
+func TestTaskBoardHidesResolvedOriginalHandoffFailure(t *testing.T) {
+	runID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageAttemptID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRunID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(standardAuthoringHandoffPayload{
+		Format: standardAuthoringHandoffPayloadFormat, AuthoringRunID: runID, StageAttemptID: stageAttemptID,
+		HandoffArtifactID: artifactID, ChildRunID: childRunID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
+	original := store.DurableJob{
+		ID: originalID, CommandType: standardAuthoringHandoffCommandType, EntityType: "artifact_ref", EntityID: artifactID,
+		RunID: runID, StageAttemptID: stageAttemptID, PayloadJSON: string(payload), State: store.JobInDoubt, FinishedAt: &finishedAt,
+		Failure: &store.DurableJobFailure{Code: handoffDefinitionUnavailableCode, Message: "The approved child definition is unavailable.", DetailsJSON: `{}`},
+	}
+	recovery := store.DurableJob{
+		ID: recoveryID, CommandType: standardAuthoringHandoffRedriveCommandType, EntityType: "artifact_ref", EntityID: artifactID,
+		RunID: runID, StageAttemptID: stageAttemptID, PayloadJSON: string(payload), State: store.JobSucceeded,
+	}
+	projected := (&TaskBoardService{}).projectTaskBoardRun(context.Background(), RunInspection{
+		Run:  store.WorkflowRun{ID: runID, Status: store.WorkflowRunRunning},
+		Jobs: []DurableJobInspection{{Job: original}, {Job: recovery}},
+	}, nil)
+	if projected.FailureCode != "" || projected.FailureRecoveryAction != TaskBoardFailureRecoveryNone || projected.CanRedrive {
+		t.Fatalf("resolved handoff continued to advertise recovery: %+v", projected)
+	}
+}
+
+func TestTaskBoardDoesNotOfferRedriveForFailedDurableJob(t *testing.T) {
+	projected := (&TaskBoardService{}).projectTaskBoardRun(context.Background(), RunInspection{
+		Run: store.WorkflowRun{ID: "run-failed", SubjectKind: store.WorkflowRunSubjectTaskRevision, Status: store.WorkflowRunFailedTerminal},
+		Jobs: []DurableJobInspection{{Job: store.DurableJob{
+			ID: "job-failed", CommandType: standardAuthoringHandoffCommandType, EntityType: "artifact_ref", EntityID: "artifact-failed",
+			State: store.JobFailed, Failure: &store.DurableJobFailure{
+				Code: "handoff.artifact_lineage_invalid", Message: "The handoff artifact lineage is invalid.", DetailsJSON: `{}`,
+			},
+		}}},
+	}, nil)
+
+	if projected.CanRedrive || projected.FailureRecoveryAction != TaskBoardFailureRecoveryRepairOrNewRun {
+		t.Fatalf("terminal failed job exposed redrive = can_redrive:%t action:%q", projected.CanRedrive, projected.FailureRecoveryAction)
+	}
+}
+
+func TestTaskBoardDoesNotExposeRawStageOrWorkerFailureTextWithoutDurableRecord(t *testing.T) {
+	projected := (&TaskBoardService{}).projectTaskBoardRun(context.Background(), RunInspection{
+		Run: store.WorkflowRun{ID: "run-no-durable-failure", Status: store.WorkflowRunInDoubt},
+		Stages: []store.StageAttempt{{
+			ID: "attempt-no-durable-failure", StageKey: "materialize_task",
+			ErrorText: "provider output from /private/handoff with sk-sensitive-token", FailureClass: "provider",
+		}},
+	}, []store.RunWorkerHandoff{{FailureReason: "worker output from /private/log"}})
+	if projected.FailureSummary != "" || projected.FailureReason != "" || projected.FailureCode != "" || projected.FailureClass != "" {
+		t.Fatalf("raw failure text leaked without durable record: %+v", projected)
 	}
 }
 

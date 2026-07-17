@@ -109,10 +109,10 @@ func TestRunWorkerSessionWithSignalsPersistsSIGINTBeforeStopping(t *testing.T) {
 	var startOnce sync.Once
 	session, err := app.NewRunWorkerSession(app.RunWorkerSessionConfig{
 		Services: services, RunID: run.ID, Owner: "signal-worker", Actor: actor, Reason: "test controlled signal handoff",
-		Handler: app.DurableJobHandlerFunc(func(context.Context, app.DurableJobExecution) (store.JobState, error) {
+		Handler: app.DurableJobHandlerFunc(func(context.Context, app.DurableJobExecution) (app.DurableJobResult, error) {
 			startOnce.Do(func() { close(handlerStarted) })
 			<-releaseHandler
-			return store.JobSucceeded, nil
+			return app.DurableJobResult{State: store.JobSucceeded}, nil
 		}),
 		LeaseTTL: time.Second, HeartbeatEvery: 50 * time.Millisecond, PollInterval: time.Millisecond,
 	})

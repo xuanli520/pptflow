@@ -548,9 +548,10 @@ type DurableJobDispatchClaim struct {
 }
 
 // ExpiredDurableJobRecovery is emitted after a worker dispatch lease expires.
-// The job is projected to interrupted, all active job leases are released or
-// expired, and the listed unfinished control operations are marked for
-// reconcile instead of being blindly retried.
+// The job is projected to in_doubt with its immutable lease-loss failure,
+// all active job leases are released or expired, and the listed unfinished
+// control operations are marked for reconcile instead of being blindly
+// retried.
 type ExpiredDurableJobRecovery struct {
 	Claim      DurableJobDispatchClaim
 	Job        DurableJob

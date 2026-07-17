@@ -22,11 +22,57 @@ type authoringHandoffRedriveOutput struct {
 func newAuthoringHandoffCommand(config *lifecycleCLIConfig) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "handoff",
-		Short: "Inspect and explicitly redrive Standard authoring handoffs",
+		Short: "Inspect and explicitly reconcile or redrive Standard authoring handoffs",
 		Args:  cobra.NoArgs,
 		RunE:  showCommandGroupHelp,
 	}
-	command.AddCommand(newAuthoringHandoffRedriveCommand(config))
+	command.AddCommand(newAuthoringHandoffReconcileCommand(config), newAuthoringHandoffRedriveCommand(config))
+	return command
+}
+
+// newAuthoringHandoffReconcileCommand authorizes a fact-backed replay after
+// an unknown handoff delivery such as a lost worker fence. The lifecycle
+// service reuses the immutable original payload and preallocated child Run;
+// it never turns the original in_doubt record back into a running job.
+func newAuthoringHandoffReconcileCommand(config *lifecycleCLIConfig) *cobra.Command {
+	var authoringRunID, idempotencyKey, reason string
+	command := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Explicitly reconcile an in_doubt Standard-to-Phase-1 handoff",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			actor, reason, err := lifecycleActorAndReason(config, reason)
+			if err != nil {
+				return err
+			}
+			authoringRunID, err = requiredText("authoring-run", authoringRunID)
+			if err != nil {
+				return err
+			}
+			if err := store.ValidateUUIDv7(authoringRunID); err != nil {
+				return fmt.Errorf("authoring-run must be a UUIDv7: %w", err)
+			}
+			idempotencyKey, err = requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
+			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+				if services == nil || services.StandardAuthoringHandoffs == nil {
+					return nil, fmt.Errorf("Standard authoring handoff service is not configured")
+				}
+				job, err := services.StandardAuthoringHandoffs.Reconcile(ctx, app.ReconcileStandardAuthoringHandoffCommand{
+					AuthoringRunID: authoringRunID, IdempotencyKey: idempotencyKey, Actor: actor, Reason: reason,
+				})
+				if err != nil {
+					return nil, err
+				}
+				return authoringHandoffRedriveOutput{JobID: job.ID, CommandType: job.CommandType, State: string(job.State), AuthoringRunID: job.RunID}, nil
+			})
+		},
+	}
+	command.Flags().StringVar(&authoringRunID, "authoring-run", "", "Standard authoring Run UUIDv7")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 reconcile idempotency key")
+	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
 }
 

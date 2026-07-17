@@ -237,9 +237,11 @@ func (s *Store) ClaimNextDurableJob(ctx context.Context, request ClaimNextDurabl
 }
 
 // ScanExpiredDurableJobsForReconcile detects a lost worker fence. It never
-// restarts work: it marks the job interrupted, releases any still-active job
-// leases (including capacity slots), and makes unfinished control commands
-// explicitly reconcile-required for the application service.
+// restarts work: an expired dispatch lease means the external outcome is
+// unknown, so it atomically projects the job to in_doubt with a stable failure
+// record, releases any still-active job leases (including capacity slots), and
+// makes unfinished control commands explicitly reconcile-required for the
+// application service.
 func (s *Store) ScanExpiredDurableJobsForReconcile(ctx context.Context, request ScanExpiredDurableJobsRequest) ([]ExpiredDurableJobRecovery, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return nil, err
@@ -307,23 +309,9 @@ func (s *Store) ScanExpiredDurableJobsForReconcile(ctx context.Context, request 
 		// concurrently.
 		job := *claim.Job
 		if !isJobDeliveryFinalState(job.State) {
-			job.State = JobInterrupted
-			job.UpdatedAt = now
-			job.FinishedAt = &now
-			job.Version++
-			result, err := tx.ExecContext(ctx, `
-				UPDATE jobs SET state = ?, updated_at = ?, finished_at = ?, version = ?
-				WHERE id = ? AND version = ?
-			`, job.State, job.UpdatedAt, job.FinishedAt, job.Version, job.ID, job.Version-1)
+			job, err = s.projectExpiredDurableJobInDoubtTx(ctx, tx, job, resolveActor(request.Actor), request.Reason, now)
 			if err != nil {
 				return nil, err
-			}
-			changed, err := result.RowsAffected()
-			if err != nil {
-				return nil, err
-			}
-			if changed != 1 {
-				return nil, fmt.Errorf("%w: durable job %s", ErrOptimisticLock, job.ID)
 			}
 		}
 		// New delivery-final transitions release leases synchronously. Keep this
@@ -348,6 +336,82 @@ func (s *Store) ScanExpiredDurableJobsForReconcile(ctx context.Context, request 
 		return nil, err
 	}
 	return recoveries, nil
+}
+
+// projectExpiredDurableJobInDoubtTx is the transaction-local counterpart to
+// a durable terminal transition for a worker whose dispatch lease was lost.
+// The result of any external work is unknown, so this is deliberately not a
+// retryable interrupted state. The failure-column predicate prevents a stale
+// recovery path from replacing an already-recorded diagnostic.
+func (s *Store) projectExpiredDurableJobInDoubtTx(ctx context.Context, tx *sql.Tx, job DurableJob, actor, reason string, now time.Time) (DurableJob, error) {
+	if isJobDeliveryFinalState(job.State) {
+		return job, nil
+	}
+	failure, err := prepareDurableJobTransitionFailure(JobInDoubt, durableJobLeaseLostFailure(job))
+	if err != nil {
+		return DurableJob{}, err
+	}
+	previousState := job.State
+	job.State = JobInDoubt
+	job.Failure = failure
+	job.UpdatedAt = now
+	job.FinishedAt = &now
+	job.Version++
+	failureCode, failureMessage, failureDetailsJSON := durableJobFailureColumns(job.Failure)
+	result, err := tx.ExecContext(ctx, `
+		UPDATE jobs
+		SET state = ?, failure_code = ?, failure_message = ?, failure_details_json = ?,
+		    updated_at = ?, finished_at = ?, version = ?
+		WHERE id = ? AND state = ? AND version = ?
+		  AND failure_code = '' AND failure_message = '' AND failure_details_json = '{}'
+	`, job.State, failureCode, failureMessage, failureDetailsJSON,
+		job.UpdatedAt, job.FinishedAt, job.Version, job.ID, previousState, job.Version-1)
+	if err != nil {
+		return DurableJob{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return DurableJob{}, err
+	}
+	if changed != 1 {
+		return DurableJob{}, fmt.Errorf("%w: durable job %s", ErrOptimisticLock, job.ID)
+	}
+	auditDetails := map[string]any{
+		"cause":        "expired_dispatch_lease",
+		"failure_code": job.Failure.Code,
+		"state":        job.State,
+		"version":      job.Version,
+	}
+	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
+		Actor:       actor,
+		EntityType:  "job",
+		EntityID:    job.ID,
+		Action:      "job.transitioned",
+		Reason:      reason,
+		PayloadJSON: auditPayload(auditDetails),
+		CreatedAt:   now,
+	}); err != nil {
+		return DurableJob{}, err
+	}
+	return job, nil
+}
+
+func durableJobLeaseLostFailure(job DurableJob) *DurableJobFailure {
+	details := map[string]any{
+		"check":  "dispatch_lease",
+		"job_id": job.ID,
+	}
+	if job.RunID != "" {
+		details["run_id"] = job.RunID
+	}
+	if job.StageAttemptID != "" {
+		details["stage_attempt_id"] = job.StageAttemptID
+	}
+	return &DurableJobFailure{
+		Code:        "job.lease_lost",
+		Message:     "The worker lease expired before the job outcome was recorded.",
+		DetailsJSON: auditPayload(details),
+	}
 }
 
 type preparedDurableJobClaim struct {
