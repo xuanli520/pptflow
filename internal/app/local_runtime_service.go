@@ -15,7 +15,10 @@ import (
 // recovery boundary. It deliberately has no provider, process-runtime, or
 // filesystem mutation dependency: external effects are reconciled by their
 // own domain services, never by `run reconcile`.
-type LocalRuntimeService struct{ core *lifecycleServiceCore }
+type LocalRuntimeService struct {
+	core     *lifecycleServiceCore
+	services *LifecycleServices
+}
 
 const localRuntimeReconcileBatchSize = 100
 
@@ -293,6 +296,18 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 		if len(batch) < localRuntimeReconcileBatchSize {
 			break
 		}
+	}
+	recoveryRuntime := &FrozenExecutionRuntime{
+		core: service.core, services: service.services, quotaLeaseTTL: store.DefaultLeaseTTL, controlPollInterval: 100 * time.Millisecond,
+	}
+	stageRecoveries := make([]store.ExpiredDurableJobRecovery, 0, len(recovered))
+	for _, recovery := range recovered {
+		if recovery.Job.CommandType == "stage_attempt.execute" {
+			stageRecoveries = append(stageRecoveries, recovery)
+		}
+	}
+	if err := recoveryRuntime.ReconcileDurableJobRecoveries(ctx, DurableJobRecoveryRequest{RunID: run.ID, Recoveries: stageRecoveries}); err != nil {
+		return RunReconciliationResult{}, fmt.Errorf("apply durable job semantic recovery for run %s: %w", run.ID, err)
 	}
 	if err := service.projectRecoveredStandardAuthoringHandoffRuns(ctx, recovered, actor, reason); err != nil {
 		return RunReconciliationResult{}, err

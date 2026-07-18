@@ -350,7 +350,7 @@ func TestFrozenExecutionRuntimeRecoveryRestoresMissingStageHandoffAfterExpiredLe
 
 	// The same recovery facts are safe to replay. The handoff idempotency key
 	// is tied to the recovered predecessor job and cannot make a second stage.
-	if err := runtime.ReconcileDurableJobRecoveries(ctx, result.Recoveries); err != nil {
+	if err := runtime.ReconcileDurableJobRecoveries(ctx, DurableJobRecoveryRequest{Recoveries: result.Recoveries}); err != nil {
 		t.Fatal(err)
 	}
 	jobs, err := fixture.store.ListDurableJobsForRun(ctx, fixture.run.ID)
@@ -365,6 +365,96 @@ func TestFrozenExecutionRuntimeRecoveryRestoresMissingStageHandoffAfterExpiredLe
 	}
 	if matching != 1 {
 		t.Fatalf("recovered handoff jobs = %d, want 1", matching)
+	}
+}
+
+func TestFrozenExecutionRuntimeRebuildsContentStageLeaseLossRecoveryFromDurableFacts(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, completedFixtureStage))
+	initial := newFrozenRuntimeWorker(t, fixture.store, runtime, "runtime-content-recovery-initial")
+	if result, err := initial.RunOnce(ctx); err != nil || result.FinalState != store.JobSucceeded {
+		t.Fatalf("initial coordinator result = %+v, %v", result, err)
+	}
+	job, payload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
+	claim := claimRuntimeStageForLeaseLoss(t, ctx, fixture, job, "runtime-content-recovery-claim")
+	node, quotas := prepareRuntimeLeaseLostStage(t, ctx, fixture, claim, payload, false)
+	time.Sleep(40 * time.Millisecond)
+	recoveries, err := fixture.store.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{
+		RunID: fixture.run.ID, Actor: runtimeFixtureActor, Reason: "consume scanner facts before semantic recovery",
+	})
+	if err != nil || len(recoveries) != 1 || recoveries[0].Job.ID != job.ID {
+		t.Fatalf("structural recovery = %+v, %v", recoveries, err)
+	}
+	if err := runtime.ReconcileDurableJobRecoveries(ctx, DurableJobRecoveryRequest{RunID: fixture.run.ID}); err != nil {
+		t.Fatal(err)
+	}
+	persistedJob, err := fixture.store.GetDurableJob(ctx, job.ID)
+	if err != nil || persistedJob == nil || persistedJob.State != store.JobInDoubt || persistedJob.Failure == nil || persistedJob.Failure.Code != "job.lease_lost" {
+		t.Fatalf("recovered durable job = %+v, %v", persistedJob, err)
+	}
+	persistedNode, err := fixture.store.GetNodeAttempt(ctx, node.ID)
+	if err != nil || persistedNode == nil || persistedNode.Status != store.NodeAttemptInterrupted || persistedNode.FinishedAt == nil {
+		t.Fatalf("recovered node = %+v, %v", persistedNode, err)
+	}
+	persistedStage, err := fixture.store.GetStageAttempt(ctx, payload.StageAttemptID)
+	if err != nil || persistedStage == nil || persistedStage.ExecutionStatus != store.StageExecutionInterrupted || persistedStage.FinishedAt == nil {
+		t.Fatalf("recovered stage = %+v, %v", persistedStage, err)
+	}
+	persistedRun, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || persistedRun == nil || persistedRun.Status != store.WorkflowRunFailedRecoverable || persistedRun.FinishedAt == nil {
+		t.Fatalf("recovered run = %+v, %v", persistedRun, err)
+	}
+	for _, quota := range quotas {
+		lease, err := fixture.store.GetDurableQuotaLease(ctx, quota.ID)
+		if err != nil || lease == nil || lease.State != store.DurableQuotaLeaseSettled || lease.RemainingUnits() != 0 {
+			t.Fatalf("recovered quota %s = %+v, %v", quota.ID, lease, err)
+		}
+	}
+	if err := runtime.ReconcileDurableJobRecoveries(ctx, DurableJobRecoveryRequest{RunID: fixture.run.ID}); err != nil {
+		t.Fatalf("idempotent semantic recovery replay: %v", err)
+	}
+}
+
+func TestFrozenExecutionRuntimeKeepsUnknownExternalOutcomeInDoubt(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, completedFixtureStage))
+	initial := newFrozenRuntimeWorker(t, fixture.store, runtime, "runtime-unknown-effect-initial")
+	if result, err := initial.RunOnce(ctx); err != nil || result.FinalState != store.JobSucceeded {
+		t.Fatalf("initial coordinator result = %+v, %v", result, err)
+	}
+	job, payload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
+	claim := claimRuntimeStageForLeaseLoss(t, ctx, fixture, job, "runtime-unknown-effect-claim")
+	node, quotas := prepareRuntimeLeaseLostStage(t, ctx, fixture, claim, payload, true)
+	time.Sleep(40 * time.Millisecond)
+	if _, err := fixture.store.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{
+		RunID: fixture.run.ID, Actor: runtimeFixtureActor, Reason: "recover unknown external effect fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ReconcileDurableJobRecoveries(ctx, DurableJobRecoveryRequest{RunID: fixture.run.ID}); err != nil {
+		t.Fatal(err)
+	}
+	persistedNode, err := fixture.store.GetNodeAttempt(ctx, node.ID)
+	if err != nil || persistedNode == nil || persistedNode.Status != store.NodeAttemptInDoubt || persistedNode.FinishedAt != nil {
+		t.Fatalf("unknown-effect node = %+v, %v", persistedNode, err)
+	}
+	persistedStage, err := fixture.store.GetStageAttempt(ctx, payload.StageAttemptID)
+	if err != nil || persistedStage == nil || persistedStage.ExecutionStatus != store.StageExecutionInDoubt || persistedStage.FinishedAt != nil {
+		t.Fatalf("unknown-effect stage = %+v, %v", persistedStage, err)
+	}
+	persistedRun, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || persistedRun == nil || persistedRun.Status != store.WorkflowRunInDoubt {
+		t.Fatalf("unknown-effect run = %+v, %v", persistedRun, err)
+	}
+	for _, quota := range quotas {
+		lease, err := fixture.store.GetDurableQuotaLease(ctx, quota.ID)
+		if err != nil || lease == nil || lease.State != store.DurableQuotaLeaseUncertain {
+			t.Fatalf("unknown-effect quota %s = %+v, %v", quota.ID, lease, err)
+		}
 	}
 }
 
@@ -594,15 +684,15 @@ func TestFrozenExecutionRuntimeTreatsLostStageFenceAsInDoubt(t *testing.T) {
 	close(lost)
 	result, err := runtime.HandleDurableJob(ctx, DurableJobExecution{Claim: claim, LeaseLost: lost})
 	state := result.State
-	if err != nil || state != store.JobInDoubt || result.Failure == nil {
+	if !errors.Is(err, ErrDurableJobLeaseLost) || state != store.JobInDoubt || result.Failure == nil {
 		t.Fatalf("stale-fence runtime result = %+v, %v", result, err)
 	}
 	attempt, err := fixture.store.GetStageAttempt(ctx, sourcePayload.StageAttemptID)
-	if err != nil || attempt == nil || attempt.ExecutionStatus != store.StageExecutionInDoubt {
+	if err != nil || attempt == nil || attempt.ExecutionStatus != store.StageExecutionQueued {
 		t.Fatalf("stale-fence stage projection = %+v, %v", attempt, err)
 	}
 	run, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
-	if err != nil || run == nil || run.Status != store.WorkflowRunInDoubt {
+	if err != nil || run == nil || run.Status != store.WorkflowRunRunning {
 		t.Fatalf("stale-fence run projection = %+v, %v", run, err)
 	}
 }
@@ -964,6 +1054,97 @@ func markRuntimeStageTerminal(t *testing.T, ctx context.Context, dataStore *stor
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func claimRuntimeStageForLeaseLoss(t *testing.T, ctx context.Context, fixture frozenRuntimeFixture, job store.DurableJob, key string) store.DurableJobDispatchClaim {
+	t.Helper()
+	claim, err := fixture.store.ClaimNextDurableJob(ctx, store.ClaimNextDurableJobRequest{
+		IdempotencyKey: key, Owner: key + "-owner", RunID: fixture.run.ID, LeaseTTL: 10 * time.Millisecond,
+		Actor: runtimeFixtureActor, Reason: "claim stage for lease-loss recovery fixture",
+	})
+	if err != nil || claim.Job == nil || claim.DispatchLease == nil || claim.Job.ID != job.ID {
+		t.Fatalf("claim lease-loss stage = %+v, %v", claim, err)
+	}
+	return claim
+}
+
+func prepareRuntimeLeaseLostStage(t *testing.T, ctx context.Context, fixture frozenRuntimeFixture, claim store.DurableJobDispatchClaim, payload frozenStageExecutionPayload, unknownEffect bool) (store.NodeAttempt, []store.DurableQuotaLease) {
+	t.Helper()
+	attempt, err := fixture.store.GetStageAttempt(ctx, payload.StageAttemptID)
+	if err != nil || attempt == nil {
+		t.Fatalf("read lease-loss stage = %+v, %v", attempt, err)
+	}
+	started, err := fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionRunning,
+		Actor: runtimeFixtureActor, Reason: "start lease-loss stage fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := fixture.store.CreateNodeAttempt(ctx, store.CreateNodeAttemptRequest{
+		StageAttemptID: started.ID, NodeID: started.StageKey, Generation: payload.Generation, Attempt: 1,
+		IdempotencyKey: "lease-loss-node:" + claim.Job.ID, Actor: runtimeFixtureActor, Reason: "create lease-loss node fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err = fixture.store.TransitionNodeAttempt(ctx, store.TransitionNodeAttemptRequest{
+		NodeAttemptID: node.ID, ExpectedVersion: node.Version, Status: store.NodeAttemptRunning,
+		Actor: runtimeFixtureActor, Reason: "start lease-loss node fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, found := fixture.frozen.Workflow.Stage(payload.StageKey)
+	if !found {
+		t.Fatalf("frozen workflow omitted stage %s", payload.StageKey)
+	}
+	frozenAdmission, err := BuildFrozenStageQuotaAdmission(fixture.frozen.QuotaPolicy, stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := fixture.store.AdmitTaskActorQuota(ctx, store.AdmitTaskActorQuotaRequest{
+		IdempotencyKey: "stage-admission:" + claim.Job.ID, TaskID: fixture.task.ID, Actor: claim.Job.CreatedBy,
+		LeaseOwner: claim.Owner, LeaseTTL: time.Minute, Policy: frozenAdmission.Policy,
+		BootstrapAccounts: frozenAdmission.BootstrapAccounts, Claims: frozenAdmission.Claims,
+		Reason: "admit lease-loss stage fixture",
+	})
+	if err != nil || !decision.Accepted {
+		t.Fatalf("lease-loss quota admission = %+v, %v", decision, err)
+	}
+	for _, lease := range decision.Leases {
+		if _, err := fixture.store.SettleQuotaLease(ctx, store.SettleQuotaLeaseRequest{
+			IdempotencyKey: "lease-loss-uncertain:" + lease.ID, LeaseID: lease.ID, Owner: lease.Owner,
+			FencingToken: lease.FencingToken, Outcome: store.QuotaSettlementUncertain,
+			Actor: runtimeFixtureActor, Reason: "simulate uncertain quota after worker loss",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if unknownEffect {
+		effect, err := fixture.store.CreateSideEffectOperation(ctx, store.CreateSideEffectOperationRequest{
+			OperationKey: "lease-loss-effect:" + claim.Job.ID, RunID: fixture.run.ID, StageAttemptID: started.ID,
+			EffectKind: "test.external", IdempotencyKey: "lease-loss-effect-key:" + claim.Job.ID,
+			SourceDigest: "sha256:lease-loss-fixture", PayloadJSON: `{}`, Actor: runtimeFixtureActor, Reason: "prepare unknown effect fixture",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		effect, err = fixture.store.TransitionSideEffectOperation(ctx, store.TransitionSideEffectOperationRequest{
+			OperationID: effect.ID, ExpectedVersion: effect.Version, State: store.SideEffectStarted,
+			Actor: runtimeFixtureActor, Reason: "start unknown effect fixture",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.store.TransitionSideEffectOperation(ctx, store.TransitionSideEffectOperationRequest{
+			OperationID: effect.ID, ExpectedVersion: effect.Version, State: store.SideEffectUnknown,
+			Actor: runtimeFixtureActor, Reason: "lose unknown effect receipt",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return node, decision.Leases
 }
 
 func assertRuntimeQuotaAccount(t *testing.T, ctx context.Context, dataStore *store.Store, kind store.QuotaScopeKind, scopeID, dimension string, consumed, reserved int64) {

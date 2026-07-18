@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 const (
@@ -237,6 +238,56 @@ func TestRunWorkerSessionSignalControlsReplayAcrossControlledChildRestarts(t *te
 	postTerminatePause, err := newSession("run-worker-third", &thirdCalls).RequestSignalControl(ctx, store.ControlActionPause)
 	if err != nil || postTerminatePause.ID != terminate.ID || thirdCalls != 0 {
 		t.Fatalf("restarted child pause after terminate = %+v, %v, key calls=%d; want terminate %s", postTerminatePause, err, thirdCalls, terminate.ID)
+	}
+}
+
+func TestRunWorkerSessionKeepsSupervisorThroughDispatchLeaseLossRecovery(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	stageStarted := make(chan struct{})
+	var stageStartedOnce sync.Once
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, func(ctx context.Context, _ workflowkit.StageExecutionRequest) (workflowkit.StageExecutionResult, error) {
+		stageStartedOnce.Do(func() { close(stageStarted) })
+		<-ctx.Done()
+		return workflowkit.StageExecutionResult{}, ctx.Err()
+	}))
+	session, err := NewRunWorkerSession(RunWorkerSessionConfig{
+		Services: fixture.services, RunID: fixture.run.ID, Owner: "run-worker-lease-loss", Actor: runtimeFixtureActor,
+		Reason: "test automatic dispatch lease-loss recovery", Handler: runtime,
+		LeaseTTL: 750 * time.Millisecond, HeartbeatEvery: 25 * time.Millisecond, PollInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualHeartbeat := session.worker.heartbeatLease
+	session.worker.heartbeatLease = func(ctx context.Context, request store.HeartbeatLeaseRequest) (store.Lease, error) {
+		select {
+		case <-stageStarted:
+			return store.Lease{}, errors.New("test transient store outage")
+		default:
+			return actualHeartbeat(ctx, request)
+		}
+	}
+	result, err := session.Run(ctx)
+	if err != nil {
+		t.Fatalf("lease-loss session result = %+v, %v", result, err)
+	}
+	if result.StoppedFor != store.WorkflowRunFailedRecoverable || result.Run.Status != store.WorkflowRunFailedRecoverable {
+		t.Fatalf("lease-loss session did not converge = %+v", result)
+	}
+	job, payload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
+	persistedJob, err := fixture.store.GetDurableJob(ctx, job.ID)
+	if err != nil || persistedJob == nil || persistedJob.State != store.JobInDoubt || persistedJob.Failure == nil || persistedJob.Failure.Code != "job.lease_lost" {
+		t.Fatalf("lease-loss session job = %+v, %v", persistedJob, err)
+	}
+	stage, err := fixture.store.GetStageAttempt(ctx, payload.StageAttemptID)
+	if err != nil || stage == nil || stage.ExecutionStatus != store.StageExecutionInterrupted {
+		t.Fatalf("lease-loss session stage = %+v, %v", stage, err)
+	}
+	nodes, err := fixture.store.ListNodeAttempts(ctx, payload.StageAttemptID)
+	if err != nil || len(nodes) != 1 || nodes[0].Status != store.NodeAttemptInterrupted {
+		t.Fatalf("lease-loss session nodes = %+v, %v", nodes, err)
 	}
 }
 

@@ -986,7 +986,7 @@ func taskBoardOpenReview(detail TaskInspectionSnapshot) (*TaskBoardReview, int) 
 func taskBoardCurrentStage(stages []store.StageAttempt) string {
 	for _, stage := range stages {
 		switch stage.ExecutionStatus {
-		case store.StageExecutionRunning, store.StageExecutionWaiting, store.StageExecutionQueued, store.StageExecutionReconciling:
+		case store.StageExecutionRunning, store.StageExecutionWaiting, store.StageExecutionQueued, store.StageExecutionInDoubt, store.StageExecutionReconciling:
 			return stage.StageKey
 		}
 	}

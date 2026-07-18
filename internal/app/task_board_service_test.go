@@ -485,6 +485,20 @@ func TestTaskBoardColumnKeepsRecoverableRunsOutOfCompleted(t *testing.T) {
 	}
 }
 
+func TestTaskBoardShowsInDoubtStageAndLeaseLossReconcileAction(t *testing.T) {
+	projected := (&TaskBoardService{}).projectTaskBoardRun(context.Background(), RunInspection{
+		Run:    store.WorkflowRun{ID: "run-lease-lost", SubjectKind: store.WorkflowRunSubjectTaskRevision, Status: store.WorkflowRunInDoubt},
+		Stages: []store.StageAttempt{{ID: "attempt-lease-lost", StageKey: "generate_task_files", ExecutionStatus: store.StageExecutionInDoubt}},
+		Jobs: []DurableJobInspection{{Job: store.DurableJob{
+			ID: "job-lease-lost", CommandType: "stage_attempt.execute", StageAttemptID: "attempt-lease-lost", State: store.JobInDoubt,
+			Failure: &store.DurableJobFailure{Code: "job.lease_lost", Message: "The worker lease expired before the job outcome was recorded.", DetailsJSON: `{}`},
+		}}},
+	}, nil)
+	if projected.CurrentStage != "generate_task_files" || projected.FailureCode != "job.lease_lost" || projected.FailureRecoveryAction != TaskBoardFailureRecoveryReconcile {
+		t.Fatalf("lease-loss task board projection = %+v", projected)
+	}
+}
+
 func TestTaskBoardProjectsDurableHandoffFailureRecord(t *testing.T) {
 	finishedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
 	projected := (&TaskBoardService{}).projectTaskBoardRun(context.Background(), RunInspection{

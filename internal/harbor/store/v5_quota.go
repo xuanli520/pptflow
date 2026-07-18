@@ -278,11 +278,12 @@ func (s *Store) RecordQuotaUsage(ctx context.Context, request RecordQuotaUsageRe
 		return QuotaAccount{}, fmt.Errorf("%w: usage requires fencing token, positive units, and occurrence time", ErrInvalidQuota)
 	}
 	request.OccurredAt = request.OccurredAt.UTC()
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return QuotaAccount{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	lease, err := getDurableQuotaLeaseTx(ctx, tx, request.LeaseID)
 	if err != nil {
 		return QuotaAccount{}, err
@@ -585,11 +586,12 @@ func (s *Store) settleDurableQuotaLease(ctx context.Context, input quotaSettleme
 	if input.Kind == QuotaSettlementReconcile && input.Outcome == QuotaSettlementUncertain {
 		return DurableQuotaSettlement{}, fmt.Errorf("%w: reconciliation requires a known outcome", ErrInvalidQuota)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return DurableQuotaSettlement{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if existing, err := getDurableQuotaSettlementByKeyTx(ctx, tx, key); err != nil {
 		return DurableQuotaSettlement{}, err
 	} else if existing != nil {
@@ -612,6 +614,9 @@ func (s *Store) settleDurableQuotaLease(ctx context.Context, input quotaSettleme
 	now := s.now().UTC()
 	if input.Kind == QuotaSettlementDirect && lease.State == DurableQuotaLeaseActive && !lease.ExpiresAt.After(now) {
 		if err := s.expireQuotaLeaseTx(ctx, tx, lease, resolveActor(input.Actor), now, "settlement observed expired quota lease"); err != nil {
+			return DurableQuotaSettlement{}, err
+		}
+		if err := tx.Commit(); err != nil {
 			return DurableQuotaSettlement{}, err
 		}
 		return DurableQuotaSettlement{}, fmt.Errorf("%w: quota lease %s", ErrQuotaLeaseExpired, lease.ID)
@@ -829,11 +834,12 @@ func (s *Store) AdmitTaskActorQuota(ctx context.Context, request AdmitTaskActorQ
 	if err != nil {
 		return DurableAdmissionDecision{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return DurableAdmissionDecision{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if existing, err := getDurableAdmissionDecisionByKeyTx(ctx, tx, key); err != nil {
 		return DurableAdmissionDecision{}, err
 	} else if existing != nil {

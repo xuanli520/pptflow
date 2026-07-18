@@ -40,11 +40,12 @@ func (s *Store) CreateRunAttempt(ctx context.Context, request CreateRunAttemptRe
 		CreatedAt:  now,
 		Version:    1,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return RunAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if _, err := getWorkflowRunTx(ctx, tx, attempt.RunID); err != nil {
 		return RunAttempt{}, err
 	}
@@ -122,11 +123,12 @@ func (s *Store) TransitionRunAttempt(ctx context.Context, request TransitionRunA
 	if !validRunAttemptStatus(request.Status) {
 		return RunAttempt{}, fmt.Errorf("invalid run attempt status %q", request.Status)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return RunAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	attempt, err := getRunAttemptTx(ctx, tx, request.RunAttemptID)
 	if err != nil {
 		return RunAttempt{}, err
@@ -212,11 +214,12 @@ func (s *Store) CreateNodeAttempt(ctx context.Context, request CreateNodeAttempt
 		CreatedAt:      now,
 		Version:        1,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return NodeAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if _, err := getStageAttemptTx(ctx, tx, attempt.StageAttemptID); err != nil {
 		return NodeAttempt{}, err
 	}
@@ -297,11 +300,12 @@ func (s *Store) TransitionNodeAttempt(ctx context.Context, request TransitionNod
 	if !validNodeAttemptStatus(request.Status) {
 		return NodeAttempt{}, fmt.Errorf("invalid node attempt status %q", request.Status)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return NodeAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	attempt, err := getNodeAttemptTx(ctx, tx, request.NodeAttemptID)
 	if err != nil {
 		return NodeAttempt{}, err
@@ -399,11 +403,12 @@ func (s *Store) CreateTurnCheckpoint(ctx context.Context, request CreateTurnChec
 		CreatedAt:     now,
 		Version:       1,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return TurnCheckpoint{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if _, err := getNodeAttemptTx(ctx, tx, checkpoint.NodeAttemptID); err != nil {
 		return TurnCheckpoint{}, err
 	}
@@ -483,11 +488,12 @@ func (s *Store) TransitionTurnCheckpoint(ctx context.Context, request Transition
 	if !validTurnCheckpointStatus(request.Status) {
 		return TurnCheckpoint{}, fmt.Errorf("invalid checkpoint status %q", request.Status)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return TurnCheckpoint{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	checkpoint, err := getTurnCheckpointTx(ctx, tx, request.CheckpointID)
 	if err != nil {
 		return TurnCheckpoint{}, err
@@ -650,7 +656,7 @@ func validNodeAttemptTransition(from, to NodeAttemptStatus) bool {
 	}
 	switch from {
 	case NodeAttemptQueued:
-		return to == NodeAttemptRunning || to == NodeAttemptWaiting || to == NodeAttemptCanceled
+		return to == NodeAttemptRunning || to == NodeAttemptWaiting || to == NodeAttemptInterrupted || to == NodeAttemptInDoubt || to == NodeAttemptCanceled
 	case NodeAttemptRunning:
 		return to == NodeAttemptWaiting || to == NodeAttemptCompleted || to == NodeAttemptInfraFailed || to == NodeAttemptInterrupted || to == NodeAttemptInDoubt || to == NodeAttemptCanceled
 	case NodeAttemptWaiting:

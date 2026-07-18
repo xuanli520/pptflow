@@ -399,11 +399,12 @@ func (s *Store) CompleteReviewGateResolution(ctx context.Context, request Comple
 	if err != nil {
 		return ReviewGateResolutionResult{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return ReviewGateResolutionResult{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	state, err := loadReviewGateStateTx(ctx, tx, prepared.reviewRequestID)
 	if err != nil {
 		return ReviewGateResolutionResult{}, err

@@ -445,11 +445,12 @@ func (s *Store) CompleteAuthoringReviewGateResolution(ctx context.Context, reque
 	if err != nil {
 		return AuthoringReviewGateResolutionResult{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return AuthoringReviewGateResolutionResult{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	state, err := loadAuthoringReviewGateStateTx(ctx, tx, prepared.reviewRequestID)
 	if err != nil {
 		return AuthoringReviewGateResolutionResult{}, err

@@ -27,6 +27,9 @@ var (
 	// fence. The current worker stops claiming further jobs and leaves any
 	// in-flight dispatch lease to its normal recovery protocol.
 	ErrRunWorkerLeaseLost = errors.New("v2 executor: run worker supervision lease lost")
+	// ErrRunWorkerInconsistentState means a Run claims to be active without any
+	// queued job, valid dispatch lease, or durable lease-loss recovery fact.
+	ErrRunWorkerInconsistentState = errors.New("v2 executor: running workflow has no eligible durable work")
 )
 
 // RunWorkerSessionConfig binds one controlled local worker to one durable Run.
@@ -165,7 +168,7 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 	}
 	if _, ready, readyErr := session.eligibleQueuedRunWork(ctx, run); readyErr != nil {
 		return RunWorkerSessionResult{}, fmt.Errorf("inspect eligible queued Run work: %w", readyErr)
-	} else if !ready {
+	} else if !ready && run.Status != store.WorkflowRunRunning {
 		return RunWorkerSessionResult{Run: run, StoppedFor: run.Status}, nil
 	}
 	var lease store.Lease
@@ -226,6 +229,26 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 			return result, fmt.Errorf("inspect eligible queued Run work: %w", readyErr)
 		}
 		if !ready {
+			if run.Status == store.WorkflowRunRunning {
+				cycle, cycleErr := session.worker.RunOnceForCommandTypes(ctx, commandTypes)
+				result.LastCycle = cycle
+				if cycleErr != nil {
+					return result, cycleErr
+				}
+				current, err := session.services.Runs.Get(ctx, session.runID)
+				if err != nil {
+					return result, err
+				}
+				result.Run = current
+				run = current
+				if current.Status == store.WorkflowRunRunning && cycle.Empty {
+					if err := waitRunWorkerPoll(ctx, session.pollInterval); err != nil {
+						return result, err
+					}
+					return result, fmt.Errorf("%w: run %s", ErrRunWorkerInconsistentState, current.ID)
+				}
+				continue
+			}
 			result.StoppedFor = run.Status
 			return result, nil
 		}
@@ -237,6 +260,15 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 			// preserve the Run contract at the process boundary.
 			if contextErr := ctx.Err(); contextErr != nil {
 				return result, contextErr
+			}
+			if errors.Is(cycleErr, ErrDurableJobLeaseLost) {
+				var leaseLoss *DurableJobLeaseLostError
+				if errors.As(cycleErr, &leaseLoss) && leaseLoss.FinalErrorClass != DurableJobHeartbeatFenceInvalid {
+					if err := waitRunWorkerDispatchRecovery(ctx, heartbeats, leaseLoss.DispatchExpiresAt, session.pollInterval); err != nil {
+						return result, err
+					}
+				}
+				continue
 			}
 			return result, cycleErr
 		}
@@ -264,6 +296,29 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 			}
 		}
 	}
+}
+
+func waitRunWorkerDispatchRecovery(ctx context.Context, supervisor *runWorkerLeaseHeartbeats, expiresAt time.Time, pollInterval time.Duration) error {
+	for time.Now().UTC().Before(expiresAt) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := supervisor.err(); err != nil {
+			return fmt.Errorf("%w: %v", ErrRunWorkerLeaseLost, err)
+		}
+		remaining := time.Until(expiresAt)
+		delay := pollInterval
+		if delay <= 0 || delay > remaining {
+			delay = remaining
+		}
+		if delay <= 0 {
+			break
+		}
+		if err := waitRunWorkerPoll(ctx, delay); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RequestSignalControl maps one process signal to a durable run-scoped control

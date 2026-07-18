@@ -256,7 +256,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	authoringReviews := &AuthoringReviewService{core: core}
 	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
 	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control, authoringRecovery)
-	return &LifecycleServices{
+	services := &LifecycleServices{
 		Tasks:                     &TaskService{core: core},
 		Revisions:                 &RevisionService{core: core},
 		Runs:                      &RunService{core: core},
@@ -283,7 +283,9 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		StandardAuthoringHandoffs: &StandardAuthoringHandoffService{core: core, definitions: options.CodeEdgePhase1RunDefinitionProvider},
 		EvaluatorEvidenceHandoffs: &CodeEdgeEvaluatorEvidenceHandoffService{core: core},
 		core:                      core,
-	}, nil
+	}
+	services.LocalRuntime.services = services
+	return services, nil
 }
 
 // unavailableStageOperationResolver makes missing execution wiring explicit.

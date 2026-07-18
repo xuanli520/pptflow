@@ -207,7 +207,7 @@ func TestCodeEdgeEvaluatorExpiredReconciliationLeaseRestoresCommittedReceiptWith
 	if err != nil || recovered.State != store.JobInDoubt || recovered.Failure == nil || recovered.Failure.Code != "job.lease_lost" {
 		t.Fatalf("recover expired CodeEdge evaluator reconciliation job = %+v, %v", recovered, err)
 	}
-	if err := scenario.runtime.ReconcileDurableJobRecoveries(ctx, []store.ExpiredDurableJobRecovery{{Job: recovered}}); err != nil {
+	if err := scenario.runtime.ReconcileDurableJobRecoveries(ctx, DurableJobRecoveryRequest{Recoveries: []store.ExpiredDurableJobRecovery{{Job: recovered}}}); err != nil {
 		t.Fatalf("reconcile expired CodeEdge evaluator reconciliation job = %v", err)
 	}
 	if scenario.observer.calls != 0 || *scenario.providerCalls != 1 {

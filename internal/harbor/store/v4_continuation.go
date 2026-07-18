@@ -977,11 +977,12 @@ func (s *Store) TransitionContinuationExecution(ctx context.Context, request Tra
 	if !validContinuationExecutionState(request.State) {
 		return ContinuationExecution{}, fmt.Errorf("invalid continuation execution state %q", request.State)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return ContinuationExecution{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	execution, err := getContinuationExecutionTx(ctx, tx, executionID)
 	if err != nil {
 		return ContinuationExecution{}, err

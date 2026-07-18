@@ -24,7 +24,7 @@ func isCurrentStandardAuthoringRun(run store.WorkflowRun) bool {
 func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manifest runManifest, specification workflowadapter.RunExecutionSpec) error {
 	templateReference := workflowadapter.TemplateReference{ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion}
 	if !isCurrentStandardAuthoringRun(run) {
-		return fmt.Errorf("Standard authoring Run %s requires a registered source/session template", run.ID)
+		return fmt.Errorf("Standard authoring Run %s requires current template registration for source/session execution", run.ID)
 	}
 	if !manifest.Resolved.Template.Equal(templateReference) || manifest.Resolved.TemplateID != templateReference.ID ||
 		manifest.Resolved.TemplateVersion != templateReference.Version || !specification.Template.Equal(templateReference) ||

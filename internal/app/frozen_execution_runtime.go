@@ -27,6 +27,9 @@ var (
 	// from a provider failure: callers must reconcile a tampered payload rather
 	// than retry it as useful work.
 	ErrFrozenExecutionPayload = errors.New("v2 executor: invalid frozen execution payload")
+	// errFrozenRunIntegrity distinguishes persisted Run integrity failures from
+	// a durable Job payload that merely fails to bind the Run it names.
+	errFrozenRunIntegrity = errors.New("v2 executor: frozen run integrity failure")
 )
 
 // FrozenExecutionRuntimeConfig supplies the controlled implementations that
@@ -110,6 +113,9 @@ func (runtime *FrozenExecutionRuntime) handleDurableJobState(ctx context.Context
 	if execution.Claim.Job == nil {
 		return store.JobFailed, fmt.Errorf("%w: durable claim has no job", ErrFrozenExecutionPayload)
 	}
+	if channelClosed(execution.LeaseLost) {
+		return store.JobInDoubt, ErrDurableJobLeaseLost
+	}
 	job := *execution.Claim.Job
 	switch job.CommandType {
 	case "workflow_run.execute":
@@ -142,8 +148,12 @@ func (runtime *FrozenExecutionRuntime) handleDurableJobState(ctx context.Context
 // coordinator. The generic dispatcher correctly fences that job as interrupted
 // on lease expiry; this method uses the final StageAttempt, not the interrupted
 // delivery job, to restore the missing deterministic terminal projection.
-func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context.Context, recoveries []store.ExpiredDurableJobRecovery) error {
-	if err := runtime.validate(); err != nil {
+func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context.Context, request DurableJobRecoveryRequest) error {
+	if err := runtime.validateRecovery(); err != nil {
+		return err
+	}
+	recoveries, err := runtime.rebuildDurableJobRecoveries(ctx, request)
+	if err != nil {
 		return err
 	}
 	for _, recovery := range recoveries {
@@ -190,6 +200,41 @@ func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context
 		}
 	}
 	return nil
+}
+
+func (runtime *FrozenExecutionRuntime) validateRecovery() error {
+	if runtime == nil || runtime.core == nil || runtime.core.store == nil || runtime.services == nil {
+		return ErrFrozenExecutionRuntimeConfiguration
+	}
+	return nil
+}
+
+func (runtime *FrozenExecutionRuntime) rebuildDurableJobRecoveries(ctx context.Context, request DurableJobRecoveryRequest) ([]store.ExpiredDurableJobRecovery, error) {
+	jobs, err := runtime.core.store.ListLeaseLostDurableJobsForRecovery(ctx, request.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("list durable lease-loss recovery facts: %w", err)
+	}
+	byJob := make(map[string]store.ExpiredDurableJobRecovery, len(request.Recoveries)+len(jobs))
+	for _, recovery := range request.Recoveries {
+		byJob[recovery.Job.ID] = recovery
+	}
+	for _, job := range jobs {
+		if _, exists := byJob[job.ID]; exists {
+			continue
+		}
+		byJob[job.ID] = store.ExpiredDurableJobRecovery{Job: job}
+	}
+	recoveries := make([]store.ExpiredDurableJobRecovery, 0, len(byJob))
+	for _, recovery := range byJob {
+		recoveries = append(recoveries, recovery)
+	}
+	sort.Slice(recoveries, func(left, right int) bool {
+		if !recoveries[left].Job.UpdatedAt.Equal(recoveries[right].Job.UpdatedAt) {
+			return recoveries[left].Job.UpdatedAt.Before(recoveries[right].Job.UpdatedAt)
+		}
+		return recoveries[left].Job.ID < recoveries[right].Job.ID
+	})
+	return recoveries, nil
 }
 
 func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Context, job store.DurableJob) error {
@@ -246,6 +291,12 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 			return nil
 		}
 	}
+	if attempt.ExecutionStatus == store.StageExecutionRunning || attempt.ExecutionStatus == store.StageExecutionInDoubt || attempt.ExecutionStatus == store.StageExecutionReconciling {
+		return runtime.reconcileLeaseLostStageAttempt(ctx, job, run, payload, *attempt)
+	}
+	if attempt.ExecutionStatus == store.StageExecutionInterrupted && run.Status == store.WorkflowRunFailedRecoverable && job.Failure != nil && job.Failure.Code == "job.lease_lost" {
+		return nil
+	}
 	if run.Status != store.WorkflowRunRunning {
 		return runtime.enqueueAutomaticRepairOutcome(ctx, run.ID, job.CreatedBy, "recover repair-loop handoff after terminal stage projection")
 	}
@@ -255,6 +306,201 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 	if _, err := runtime.afterStageTerminal(ctx, job, run, frozen, payload, stage, *attempt, nil, "", nil); err != nil {
 		_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("restore terminal projection after recovered stage %s: %w", attempt.ID, err))
 		return projected
+	}
+	return nil
+}
+
+func (runtime *FrozenExecutionRuntime) reconcileLeaseLostStageAttempt(ctx context.Context, job store.DurableJob, run store.WorkflowRun, payload frozenStageExecutionPayload, attempt store.StageAttempt) error {
+	if job.State != store.JobInDoubt || job.Failure == nil || job.Failure.Code != "job.lease_lost" {
+		return nil
+	}
+	controls, err := runtime.core.store.ListExecutionControlOperationsForRun(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	for _, operation := range controls {
+		if operation.Status == store.ControlOperationReconcileRequired {
+			return nil
+		}
+	}
+	references, err := runtime.core.store.ListArtifactRefsForAttempt(ctx, attempt.ID)
+	if err != nil {
+		return err
+	}
+	effects, err := runtime.core.store.ListSideEffectOperationsForStageAttempt(ctx, attempt.ID)
+	if err != nil {
+		return err
+	}
+	unknownOutcome := attempt.ArtifactManifestID != "" || len(references) != 0 || leaseLostStageHasUnknownEffect(effects)
+	if err := runtime.reconcileLeaseLostStageQuota(ctx, job, !unknownOutcome); err != nil {
+		return err
+	}
+	if unknownOutcome {
+		return runtime.projectLeaseLostStageInDoubt(ctx, job, attempt)
+	}
+	leaseExpiredAt := job.UpdatedAt
+	if job.FinishedAt != nil {
+		leaseExpiredAt = job.FinishedAt.UTC()
+	}
+	decision, err := workflowkit.DecideRecovery(workflowkit.RecoverySubject{
+		SubjectID: attempt.ID, Status: workflowkit.StatusRunning, LeaseExpiresAt: leaseExpiredAt,
+		ObservedAt: runtime.core.now().UTC(), InputsUnchanged: true, DefinitionUnchanged: true,
+	})
+	if err != nil {
+		return err
+	}
+	if decision.Action != workflowkit.RecoveryMarkInterrupted {
+		return nil
+	}
+	if err := runtime.interruptLeaseLostNodes(ctx, job, attempt.ID); err != nil {
+		return err
+	}
+	current, err := runtime.core.store.GetStageAttempt(ctx, attempt.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return fmt.Errorf("%w: recovered stage attempt %s", ErrLifecycleNotFound, attempt.ID)
+	}
+	if current.ExecutionStatus == store.StageExecutionRunning {
+		transitioned, err := runtime.core.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+			StageAttemptID: current.ID, ExpectedVersion: current.Version, ExecutionStatus: store.StageExecutionInDoubt,
+			ErrorText: "dispatch lease expired before the stage outcome was recorded", FailureClass: string(workflowkit.FailureUnknown),
+			Actor: job.CreatedBy, Reason: "reconcile expired durable stage dispatch",
+		})
+		if err != nil {
+			return err
+		}
+		current = &transitioned
+	}
+	if current.ExecutionStatus == store.StageExecutionInDoubt {
+		transitioned, err := runtime.core.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+			StageAttemptID: current.ID, ExpectedVersion: current.Version, ExecutionStatus: store.StageExecutionReconciling,
+			Actor: job.CreatedBy, Reason: "apply durable stage lease-loss recovery",
+		})
+		if err != nil {
+			return err
+		}
+		current = &transitioned
+	}
+	if current.ExecutionStatus == store.StageExecutionReconciling {
+		if _, err := runtime.core.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+			StageAttemptID: current.ID, ExpectedVersion: current.Version, ExecutionStatus: store.StageExecutionInterrupted,
+			ErrorText: "dispatch lease expired before the stage outcome was recorded",
+			Actor:     job.CreatedBy, Reason: "complete durable stage lease-loss recovery",
+		}); err != nil {
+			return err
+		}
+	}
+	if err := runtime.finishRunWithStatus(ctx, run.ID, store.WorkflowRunFailedRecoverable, job.CreatedBy, "stage dispatch lease loss is recoverable"); err != nil {
+		return err
+	}
+	_, err = runtime.finishContinuationForRunOutcome(ctx, payload.ContinuationExecutionID, store.ContinuationExecutionFailed, job.CreatedBy, "continuation stage dispatch lease was lost")
+	return err
+}
+
+func leaseLostStageHasUnknownEffect(operations []store.SideEffectOperation) bool {
+	for _, operation := range operations {
+		switch operation.State {
+		case store.SideEffectStarted, store.SideEffectUnknown, store.SideEffectSucceeded:
+			return true
+		}
+	}
+	return false
+}
+
+func (runtime *FrozenExecutionRuntime) reconcileLeaseLostStageQuota(ctx context.Context, job store.DurableJob, canceled bool) error {
+	decision, err := runtime.core.store.GetDurableAdmissionDecisionByIdempotencyKey(ctx, "stage-admission:"+job.ID)
+	if err != nil || decision == nil {
+		return err
+	}
+	leases := append([]store.DurableQuotaLease(nil), decision.Leases...)
+	sort.Slice(leases, func(left, right int) bool { return leases[left].ID < leases[right].ID })
+	for _, lease := range leases {
+		current, err := runtime.core.store.GetDurableQuotaLease(ctx, lease.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("%w: quota lease %s", ErrLifecycleNotFound, lease.ID)
+		}
+		if current.State == store.DurableQuotaLeaseActive {
+			_, settleErr := runtime.core.store.SettleQuotaLease(ctx, store.SettleQuotaLeaseRequest{
+				IdempotencyKey: "stage-lease-loss-uncertain:" + job.ID + ":" + current.ID, LeaseID: current.ID,
+				Owner: current.Owner, FencingToken: current.FencingToken, Outcome: store.QuotaSettlementUncertain,
+				Actor: job.CreatedBy, Reason: "dispatch lease loss requires stage quota reconciliation",
+			})
+			if settleErr != nil && !errors.Is(settleErr, store.ErrQuotaLeaseExpired) {
+				return settleErr
+			}
+			current, err = runtime.core.store.GetDurableQuotaLease(ctx, current.ID)
+			if err != nil {
+				return err
+			}
+		}
+		if !canceled || current == nil || (current.State != store.DurableQuotaLeaseUncertain && current.State != store.DurableQuotaLeaseExpired) {
+			continue
+		}
+		if _, err := runtime.core.store.ReconcileQuotaLease(ctx, store.ReconcileQuotaLeaseRequest{
+			IdempotencyKey: "stage-lease-loss-canceled:" + job.ID + ":" + current.ID, LeaseID: current.ID,
+			Owner: current.Owner, FencingToken: current.FencingToken, Outcome: store.QuotaSettlementCanceled,
+			Actor: job.CreatedBy, Reason: "cancel incomplete stage quota after dispatch lease loss",
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (runtime *FrozenExecutionRuntime) projectLeaseLostStageInDoubt(ctx context.Context, job store.DurableJob, attempt store.StageAttempt) error {
+	if err := runtime.markLeaseLostNodesInDoubt(ctx, job, attempt.ID); err != nil {
+		return err
+	}
+	current, err := runtime.core.store.GetStageAttempt(ctx, attempt.ID)
+	if err != nil || current == nil {
+		return err
+	}
+	if current.ExecutionStatus == store.StageExecutionRunning {
+		if _, err = runtime.core.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+			StageAttemptID: current.ID, ExpectedVersion: current.Version, ExecutionStatus: store.StageExecutionInDoubt,
+			ErrorText: "dispatch lease expired with an unconfirmed durable outcome", FailureClass: string(workflowkit.FailureUnknown),
+			Actor: job.CreatedBy, Reason: "retain unknown stage outcome for domain reconciliation",
+		}); err != nil {
+			return err
+		}
+	}
+	return runtime.finishRunWithStatus(ctx, attempt.RunID, store.WorkflowRunInDoubt, job.CreatedBy, "stage dispatch lease loss has an unconfirmed durable outcome")
+}
+
+func (runtime *FrozenExecutionRuntime) interruptLeaseLostNodes(ctx context.Context, job store.DurableJob, stageAttemptID string) error {
+	return runtime.transitionLeaseLostNodes(ctx, job, stageAttemptID, store.NodeAttemptInterrupted)
+}
+
+func (runtime *FrozenExecutionRuntime) markLeaseLostNodesInDoubt(ctx context.Context, job store.DurableJob, stageAttemptID string) error {
+	return runtime.transitionLeaseLostNodes(ctx, job, stageAttemptID, store.NodeAttemptInDoubt)
+}
+
+func (runtime *FrozenExecutionRuntime) transitionLeaseLostNodes(ctx context.Context, job store.DurableJob, stageAttemptID string, target store.NodeAttemptStatus) error {
+	nodes, err := runtime.core.store.ListNodeAttempts(ctx, stageAttemptID)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		switch node.Status {
+		case store.NodeAttemptQueued, store.NodeAttemptRunning, store.NodeAttemptWaiting, store.NodeAttemptInDoubt:
+		default:
+			continue
+		}
+		if node.Status == target {
+			continue
+		}
+		if _, err := runtime.core.store.TransitionNodeAttempt(ctx, store.TransitionNodeAttemptRequest{
+			NodeAttemptID: node.ID, ExpectedVersion: node.Version, Status: target,
+			ErrorText: "dispatch lease expired before the node outcome was recorded",
+			Actor:     job.CreatedBy, Reason: "reconcile durable node dispatch lease loss",
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -435,6 +681,11 @@ func (runtime *FrozenExecutionRuntime) handleWorkflowRun(ctx context.Context, ex
 	}
 	run, frozen, err := runtime.loadFrozenRun(ctx, payload.RunID, payload.DefinitionHash, payload.ExecutionSpecFingerprint, payload.QuotaPolicy)
 	if err != nil {
+		if errors.Is(err, errFrozenRunIntegrity) {
+			if projectionErr := runtime.finishRunWithStatus(ctx, payload.RunID, store.WorkflowRunInDoubt, job.CreatedBy, "frozen workflow Run integrity requires reconciliation"); projectionErr != nil {
+				err = fmt.Errorf("%w: project frozen workflow Run integrity failure: %v", err, projectionErr)
+			}
+		}
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	if state, handled, err := runtime.handlePreExecutionControl(ctx, job, run); handled || err != nil {
@@ -541,13 +792,13 @@ func (runtime *FrozenExecutionRuntime) loadFrozenRun(ctx context.Context, runID,
 	}
 	frozen, err := decodeFrozenRunDefinition(*run)
 	if err != nil {
-		return store.WorkflowRun{}, frozenRunDefinition{}, err
+		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: %w: decode frozen Run definition: %v", ErrFrozenExecutionPayload, errFrozenRunIntegrity, err)
 	}
 	if _, _, err := runtime.core.verifyRunManagedExecutionInputs(ctx, *run); err != nil {
-		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: verify frozen managed execution inputs: %w", ErrFrozenExecutionPayload, err)
+		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: %w: verify frozen managed execution inputs: %w", ErrFrozenExecutionPayload, errFrozenRunIntegrity, err)
 	}
 	if err := runtime.core.verifyRunDeploymentCatalogReceipt(*run); err != nil {
-		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: verify frozen deployment catalog receipt: %w", ErrFrozenExecutionPayload, err)
+		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: %w: verify frozen deployment catalog receipt: %w", ErrFrozenExecutionPayload, errFrozenRunIntegrity, err)
 	}
 	if definitionHash != "" && definitionHash != run.DefinitionHash {
 		return store.WorkflowRun{}, frozenRunDefinition{}, fmt.Errorf("%w: workflow definition hash mismatch", ErrFrozenExecutionPayload)
@@ -1219,16 +1470,16 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	}
 	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(inputs)
 	if err != nil {
-		return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, err)
+		return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, err)
 	}
 	if string(inputFingerprint) != stageAttempt.InputFingerprint {
-		return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, fmt.Errorf("%w: stage attempt input fingerprint drift", ErrFrozenExecutionPayload))
+		return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, fmt.Errorf("%w: stage attempt input fingerprint drift", ErrFrozenExecutionPayload))
 	}
 	var codeEdgeEffect *store.SideEffectOperation
 	if isCodeEdgeEvaluator {
 		fence, fenceErr := runtime.prepareCodeEdgeEvaluatorEffect(ctx, job, run, stageAttempt, stage)
 		if fenceErr != nil {
-			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, fenceErr)
+			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, fenceErr)
 		}
 		codeEdgeEffect = &fence.Operation
 		if !fence.Invoke {
@@ -1242,13 +1493,16 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 			if codeEdgeEffect != nil {
 				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, nodeErr.Error())
 			}
-			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, nodeErr)
+			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, nodeErr)
 		}
 		attemptContext, attemptCancel := context.WithTimeout(stageContext, stage.Budget.AttemptTimeout)
 		result, nodeErr = runtime.executeWorkflowkitStage(attemptContext, execution, job, run, subject, frozen, payload, stageAttempt, nodeAttempt, stage, inputs, reservation, monitor)
 		attemptContextErr := attemptContext.Err()
 		attemptCancel()
 		result = normalizeStageExecutionResult(result, nodeErr, attemptContextErr)
+		if channelClosed(execution.LeaseLost) {
+			return store.JobInDoubt, ErrDurableJobLeaseLost
+		}
 		if err := result.Outcome.Validate(); err != nil {
 			result = StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePolicy}, ErrorText: err.Error(), FailureClass: string(workflowkit.FailurePolicy)}
 		}
@@ -1263,14 +1517,14 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 			if codeEdgeEffect != nil {
 				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, err.Error())
 			}
-			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, err)
+			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, err)
 		}
 		retry, retryErr := workflowkit.DecideStageRetry(stage, ordinal, result.Outcome)
 		if retryErr != nil {
 			if codeEdgeEffect != nil {
 				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, retryErr.Error())
 			}
-			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, retryErr)
+			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, retryErr)
 		}
 		if retry.Retry && stageContext.Err() == nil {
 			if err := waitStageRetry(stageContext, retry.Delay); err != nil {
@@ -1289,21 +1543,28 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 // before a normal terminal projection can run. The actual amount consumed is
 // no longer knowable, so each reservation remains fenced as uncertain rather
 // than silently releasing quota or leaving an active lease to expire.
-func (runtime *FrozenExecutionRuntime) failAdmittedStageIntegrity(ctx context.Context, job store.DurableJob, attempt store.StageAttempt, reservation stageQuotaReservation, cause error) (store.JobState, error) {
+func (runtime *FrozenExecutionRuntime) failAdmittedStageIntegrity(ctx context.Context, job store.DurableJob, attempt store.StageAttempt, reservation stageQuotaReservation, leaseLost <-chan struct{}, cause error) (store.JobState, error) {
 	reservation.stop()
+	if channelClosed(leaseLost) || errors.Is(cause, store.ErrDispatchFenceLost) {
+		return store.JobInDoubt, ErrDurableJobLeaseLost
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
 	var settlementErr error
-	if _, err := runtime.settleStageQuota(context.Background(), reservation, store.QuotaSettlementUncertain, job.CreatedBy, "frozen stage integrity failure requires quota reconciliation"); err != nil {
+	if _, err := runtime.settleStageQuota(cleanupCtx, reservation, store.QuotaSettlementUncertain, job.CreatedBy, "frozen stage integrity failure requires quota reconciliation"); err != nil {
 		settlementErr = err
 	}
-	current, lookupErr := runtime.core.store.GetStageAttempt(context.Background(), attempt.ID)
+	current, lookupErr := runtime.core.store.GetStageAttempt(cleanupCtx, attempt.ID)
 	if lookupErr != nil {
 		if settlementErr == nil {
 			settlementErr = lookupErr
 		}
 	} else if current != nil && current.ExecutionStatus == store.StageExecutionRunning {
-		if err := runtime.transitionStageInDoubt(context.Background(), *current, job.CreatedBy, cause.Error()); err != nil && settlementErr == nil {
+		if err := runtime.transitionStageInDoubt(cleanupCtx, *current, job.CreatedBy, cause.Error()); err != nil && settlementErr == nil {
 			settlementErr = err
 		}
+	}
+	if runErr := runtime.finishRunWithStatus(cleanupCtx, attempt.RunID, store.WorkflowRunInDoubt, job.CreatedBy, "admitted stage integrity requires reconciliation"); runErr != nil && settlementErr == nil {
+		settlementErr = runErr
 	}
 	if settlementErr != nil {
 		cause = fmt.Errorf("%w: settle admitted stage integrity failure: %v", cause, settlementErr)
@@ -1923,6 +2184,9 @@ func (runtime *FrozenExecutionRuntime) handlePreStageControl(ctx context.Context
 }
 
 func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, subject workflowRunSubject, stage workflowkit.StageDescriptor, attempt store.StageAttempt, inputs []workflowkit.ArtifactBinding, reservation stageQuotaReservation, result StageExecutionResult, workerLeaseLost <-chan struct{}, monitor *stageControlMonitor) (store.JobState, error) {
+	if channelClosed(workerLeaseLost) {
+		return store.JobInDoubt, ErrDurableJobLeaseLost
+	}
 	reservation.stop()
 	var operation *store.DurableControlOperation
 	if monitor != nil {

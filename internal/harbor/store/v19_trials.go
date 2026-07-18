@@ -51,11 +51,12 @@ func (s *Store) CreateTrialExecution(ctx context.Context, request CreateTrialExe
 		UpdatedAt:      now,
 		Version:        1,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return TrialExecution{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if _, err := getWorkflowRunTx(ctx, tx, execution.RunID); err != nil {
 		return TrialExecution{}, err
 	}
@@ -170,11 +171,12 @@ func (s *Store) TransitionTrialExecution(ctx context.Context, request Transition
 	if !validTrialExecutionStatus(request.Status) {
 		return TrialExecution{}, fmt.Errorf("invalid trial execution status %q", request.Status)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return TrialExecution{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	execution, err := getTrialExecutionTx(ctx, tx, request.TrialExecutionID)
 	if err != nil {
 		return TrialExecution{}, err
@@ -264,11 +266,12 @@ func (s *Store) CreateTrialAttempt(ctx context.Context, request CreateTrialAttem
 		UpdatedAt:             now,
 		Version:               1,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return TrialAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	execution, err := getTrialExecutionTx(ctx, tx, attempt.TrialExecutionID)
 	if err != nil {
 		return TrialAttempt{}, err
@@ -356,11 +359,12 @@ func (s *Store) TransitionTrialAttempt(ctx context.Context, request TransitionTr
 	if !validTrialAttemptStatus(request.Status) {
 		return TrialAttempt{}, fmt.Errorf("invalid trial attempt status %q", request.Status)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return TrialAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	attempt, err := getTrialAttemptTx(ctx, tx, request.TrialAttemptID)
 	if err != nil {
 		return TrialAttempt{}, err

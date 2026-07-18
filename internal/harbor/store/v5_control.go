@@ -173,11 +173,12 @@ func (s *Store) TransitionExecutionControlOperation(ctx context.Context, request
 	if err != nil {
 		return DurableControlOperation{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return DurableControlOperation{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if existing, err := getControlTransitionTx(ctx, tx, prepared.ID); err != nil {
 		return DurableControlOperation{}, err
 	} else if existing != nil {

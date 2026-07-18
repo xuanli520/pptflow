@@ -74,11 +74,12 @@ func (s *Store) CreateDurableJob(ctx context.Context, request CreateDurableJobRe
 		UpdatedAt:      now,
 		Version:        1,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return DurableJob{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if job.RunID != "" {
 		if _, err := getWorkflowRunTx(ctx, tx, job.RunID); err != nil {
 			return DurableJob{}, err
@@ -206,6 +207,39 @@ func (s *Store) ListDurableJobsForRun(ctx context.Context, runID string) ([]Dura
 	return jobs, rows.Err()
 }
 
+// ListLeaseLostDurableJobsForRecovery rebuilds semantic recovery work from
+// durable facts after a scanner result has already been consumed. An empty
+// runID is reserved for a deployment-wide worker activation.
+func (s *Store) ListLeaseLostDurableJobsForRecovery(ctx context.Context, runID string) ([]DurableJob, error) {
+	runID = strings.TrimSpace(runID)
+	if runID != "" && !isUUIDv7(runID) {
+		return nil, ErrInvalidUUIDv7Identity
+	}
+	query := durableJobSelect + `
+		WHERE state = 'in_doubt' AND failure_code = 'job.lease_lost'
+		  AND stage_attempt_id IS NOT NULL AND stage_attempt_id != ''`
+	args := make([]any, 0, 1)
+	if runID != "" {
+		query += " AND run_id = ?"
+		args = append(args, runID)
+	}
+	query += " ORDER BY updated_at ASC, id ASC"
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := make([]DurableJob, 0)
+	for rows.Next() {
+		job, err := scanDurableJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDurableJobRequest) (DurableJob, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return DurableJob{}, err
@@ -223,11 +257,12 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 	if err != nil {
 		return DurableJob{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return DurableJob{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	job, err := getDurableJobTx(ctx, tx, request.JobID)
 	if err != nil {
 		return DurableJob{}, err

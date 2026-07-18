@@ -28,11 +28,12 @@ func (s *Store) CreateSideEffectOperation(ctx context.Context, request CreateSid
 	if err != nil {
 		return SideEffectOperation{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return SideEffectOperation{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if existing, err := getSideEffectByOperationKeyTx(ctx, tx, prepared.OperationKey); err != nil {
 		return SideEffectOperation{}, err
 	} else if existing != nil {
@@ -128,6 +129,29 @@ func (s *Store) GetSideEffectOperationByOperationKey(ctx context.Context, operat
 	return &operation, nil
 }
 
+// ListSideEffectOperationsForStageAttempt returns the durable effect fences for
+// one exact stage attempt. Recovery uses it only to decide whether generic
+// interruption is safe; it never invokes or observes an external provider.
+func (s *Store) ListSideEffectOperationsForStageAttempt(ctx context.Context, stageAttemptID string) ([]SideEffectOperation, error) {
+	if !isUUIDv7(stageAttemptID) {
+		return nil, ErrInvalidUUIDv7Identity
+	}
+	rows, err := s.db.QueryContext(ctx, sideEffectOperationV5Select+" WHERE stage_attempt_id = ? ORDER BY created_at ASC, id ASC", stageAttemptID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	operations := make([]SideEffectOperation, 0)
+	for rows.Next() {
+		operation, err := scanSideEffectOperation(rows)
+		if err != nil {
+			return nil, err
+		}
+		operations = append(operations, operation)
+	}
+	return operations, rows.Err()
+}
+
 func (s *Store) TransitionSideEffectOperation(ctx context.Context, request TransitionSideEffectOperationRequest) (SideEffectOperation, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
 		return SideEffectOperation{}, err
@@ -136,11 +160,12 @@ func (s *Store) TransitionSideEffectOperation(ctx context.Context, request Trans
 	if err != nil {
 		return SideEffectOperation{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return SideEffectOperation{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	operation, err := getSideEffectOperationTx(ctx, tx, prepared.OperationID)
 	if err != nil {
 		return SideEffectOperation{}, err
@@ -265,11 +290,12 @@ func (s *Store) CompleteReconciliationAttempt(ctx context.Context, request Compl
 	if err != nil {
 		return ReconciliationAttempt{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return ReconciliationAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	attempt, err := getReconciliationAttemptTx(ctx, tx, request.AttemptID)
 	if err != nil {
 		return ReconciliationAttempt{}, err

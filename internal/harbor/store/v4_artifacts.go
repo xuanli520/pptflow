@@ -65,11 +65,12 @@ func (s *Store) CreateArtifactManifest(ctx context.Context, request CreateArtifa
 		CreatedBy:           resolveActor(request.Actor),
 		CreatedAt:           now,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return ArtifactManifest{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO artifact_manifests_v4 (
 			id, subject_revision_id, subject_digest, workflow_fingerprint,
@@ -238,11 +239,12 @@ func (s *Store) CreateArtifactRef(ctx context.Context, request CreateArtifactRef
 		IdempotencyKey:      key,
 		CreatedAt:           now,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return ArtifactRef{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if _, err := getArtifactManifestTx(ctx, tx, reference.ManifestID); err != nil {
 		return ArtifactRef{}, err
 	}
@@ -317,6 +319,29 @@ func (s *Store) ListArtifactRefs(ctx context.Context, manifestID string) ([]Arti
 	}
 	defer rows.Close()
 	var references []ArtifactRef
+	for rows.Next() {
+		reference, err := scanArtifactRef(rows)
+		if err != nil {
+			return nil, err
+		}
+		references = append(references, reference)
+	}
+	return references, rows.Err()
+}
+
+// ListArtifactRefsForAttempt exposes immutable output/evidence lineage for one
+// StageAttempt, including manifests that were persisted before a worker lost
+// its dispatch fence and could update the StageAttempt projection.
+func (s *Store) ListArtifactRefsForAttempt(ctx context.Context, stageAttemptID string) ([]ArtifactRef, error) {
+	if _, err := requireV4ID(stageAttemptID, "artifact ref attempt ID"); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, artifactRefV4Select+" WHERE attempt_id = ? ORDER BY created_at ASC, id ASC", stageAttemptID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	references := make([]ArtifactRef, 0)
 	for rows.Next() {
 		reference, err := scanArtifactRef(rows)
 		if err != nil {

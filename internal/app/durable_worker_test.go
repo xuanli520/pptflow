@@ -292,6 +292,102 @@ func TestDurableWorkerHeartbeatsDispatchFenceDuringActiveHandler(t *testing.T) {
 	}
 }
 
+func TestDurableWorkerRetriesTransientHeartbeatWithinSafeWindow(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := store.OpenForTest(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	if _, err := dataStore.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "test.execute", EntityType: "test", EntityID: "transient-heartbeat", PayloadJSON: `{}`,
+		IdempotencyKey: "durable-worker-transient-heartbeat", Actor: "tester", Reason: "fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewDurableWorker(DurableWorkerConfig{
+		Store: dataStore, Owner: "worker-transient-heartbeat", Actor: "tester", LeaseTTL: 500 * time.Millisecond, HeartbeatEvery: 10 * time.Millisecond,
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
+			deadline := time.NewTimer(time.Second)
+			defer deadline.Stop()
+			for {
+				lease, err := dataStore.GetLease(context.Background(), execution.DispatchFence.LeaseID)
+				if err != nil {
+					return DurableJobResult{State: store.JobFailed, Failure: newDurableJobFailure("test.lease_read_failed", "The test lease could not be read.", durableJobFailureDetails(*execution.Claim.Job, "lease"))}, err
+				}
+				if lease != nil && lease.Version > execution.Claim.DispatchLease.Version {
+					return DurableJobResult{State: store.JobSucceeded}, nil
+				}
+				select {
+				case <-deadline.C:
+					return DurableJobResult{State: store.JobFailed, Failure: newDurableJobFailure("test.heartbeat_timeout", "The transient heartbeat did not recover.", durableJobFailureDetails(*execution.Claim.Job, "lease"))}, errors.New("heartbeat retry timed out")
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualHeartbeat := worker.heartbeatLease
+	var calls atomic.Int32
+	worker.heartbeatLease = func(ctx context.Context, request store.HeartbeatLeaseRequest) (store.Lease, error) {
+		if calls.Add(1) == 1 {
+			return store.Lease{}, store.ErrOptimisticLock
+		}
+		return actualHeartbeat(ctx, request)
+	}
+	result, err := worker.RunOnce(ctx)
+	if err != nil || result.FinalState != store.JobSucceeded {
+		t.Fatalf("transient heartbeat result = %+v, %v", result, err)
+	}
+	if result.HeartbeatFirstErrorClass != DurableJobHeartbeatStoreTransient || result.HeartbeatFinalErrorClass != DurableJobHeartbeatRecovered {
+		t.Fatalf("transient heartbeat classes = %q/%q", result.HeartbeatFirstErrorClass, result.HeartbeatFinalErrorClass)
+	}
+}
+
+func TestDurableWorkerLeaseLossLeavesJobForScannerRecovery(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := store.OpenForTest(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	job, err := dataStore.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "test.execute", EntityType: "test", EntityID: "lost-heartbeat", PayloadJSON: `{}`,
+		IdempotencyKey: "durable-worker-lost-heartbeat", Actor: "tester", Reason: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewDurableWorker(DurableWorkerConfig{
+		Store: dataStore, Owner: "worker-lost-heartbeat", Actor: "tester", LeaseTTL: 80 * time.Millisecond, HeartbeatEvery: 10 * time.Millisecond,
+		Handler: DurableJobHandlerFunc(func(_ context.Context, execution DurableJobExecution) (DurableJobResult, error) {
+			<-execution.LeaseLost
+			return DurableJobResult{State: store.JobSucceeded}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.heartbeatLease = func(context.Context, store.HeartbeatLeaseRequest) (store.Lease, error) {
+		return store.Lease{}, store.ErrFencingToken
+	}
+	result, err := worker.RunOnce(ctx)
+	if !errors.Is(err, ErrDurableJobLeaseLost) || result.FinalState != "" || result.HeartbeatFinalErrorClass != DurableJobHeartbeatFenceInvalid {
+		t.Fatalf("lost heartbeat result = %+v, %v", result, err)
+	}
+	persisted, err := dataStore.GetDurableJob(ctx, job.ID)
+	if err != nil || persisted == nil || persisted.State != store.JobRunning || persisted.FinishedAt != nil {
+		t.Fatalf("stale worker projected terminal job state = %+v, %v", persisted, err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	recoveries, err := dataStore.ScanExpiredDurableJobsForReconcile(ctx, store.ScanExpiredDurableJobsRequest{Actor: "tester", Reason: "recover lost heartbeat fixture"})
+	if err != nil || len(recoveries) != 1 || recoveries[0].Job.ID != job.ID || recoveries[0].Job.State != store.JobInDoubt {
+		t.Fatalf("scanner recovery = %+v, %v", recoveries, err)
+	}
+}
+
 func TestDurableWorkerRunContinuesAfterProjectedJobFailure(t *testing.T) {
 	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {

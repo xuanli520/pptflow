@@ -264,7 +264,7 @@ func (s *Store) ScanExpiredDurableJobsForReconcile(ctx context.Context, request 
 	defer tx.Rollback()
 	query := durableJobDispatchClaimV5Select + `
 		WHERE state = 'active' AND dispatch_lease_id IN (
-			SELECT id FROM leases WHERE state = 'active' AND expires_at <= ?
+			SELECT id FROM leases WHERE state != 'active' OR expires_at <= ?
 		)`
 	args := []any{now}
 	if runID := strings.TrimSpace(request.RunID); runID != "" {
@@ -297,11 +297,13 @@ func (s *Store) ScanExpiredDurableJobsForReconcile(ctx context.Context, request 
 		if claim.Job == nil || claim.DispatchLease == nil {
 			return nil, fmt.Errorf("%w: active dispatch claim %s is incomplete", ErrInvalidDispatch, claim.ID)
 		}
-		if claim.DispatchLease.State != LeaseActive || claim.DispatchLease.ExpiresAt.After(now) {
+		if claim.DispatchLease.State == LeaseActive && claim.DispatchLease.ExpiresAt.After(now) {
 			continue
 		}
-		if err := s.expireLeaseTx(ctx, tx, *claim.DispatchLease, resolveActor(request.Actor), now, "recovery observed expired job dispatch lease"); err != nil {
-			return nil, err
+		if claim.DispatchLease.State == LeaseActive {
+			if err := s.expireLeaseTx(ctx, tx, *claim.DispatchLease, resolveActor(request.Actor), now, "recovery observed expired job dispatch lease"); err != nil {
+				return nil, err
+			}
 		}
 		// The dispatch fence is the loss signal. Keep a paired capacity lease
 		// active until the delivery-final job projection below releases every

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 )
@@ -75,11 +76,33 @@ func (session *RunWorkerSession) eligibleQueuedRunWork(ctx context.Context, run 
 	if !runnable {
 		return nil, false, nil
 	}
-	// Ordinary running states retain the existing worker-poll behavior. Special
-	// wait/terminal states require a matching queued coordinator before the
-	// child stays alive.
 	if len(allowed) == 0 {
-		return nil, true, nil
+		jobs, err := session.services.core.store.ListDurableJobsForRun(ctx, run.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		observedAt := time.Now().UTC()
+		for _, job := range jobs {
+			if runWorkerJobIsEligible(run.Status, job) {
+				return nil, true, nil
+			}
+			if job.State == store.JobInDoubt && job.Failure != nil && job.Failure.Code == "job.lease_lost" {
+				return nil, true, nil
+			}
+			if job.State != store.JobRunning {
+				continue
+			}
+			leases, err := session.services.core.store.ListLeasesForJob(ctx, job.ID)
+			if err != nil {
+				return nil, false, err
+			}
+			for _, lease := range leases {
+				if lease.ResourceType == "job_dispatch" && lease.ResourceID == job.ID && lease.State == store.LeaseActive && lease.ExpiresAt.After(observedAt) {
+					return nil, true, nil
+				}
+			}
+		}
+		return nil, false, nil
 	}
 	hasQueued, err := session.hasEligibleQueuedDurableJob(ctx, run.ID, run.Status)
 	if err != nil {

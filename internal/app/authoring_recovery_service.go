@@ -443,7 +443,7 @@ func (service *AuthoringRecoveryService) ensureRecoverableBinding(ctx context.Co
 	case store.WorkflowRunFailedRecoverable, store.WorkflowRunPaused:
 	case store.WorkflowRunWaitingContinuation:
 		if binding.run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion {
-			return fmt.Errorf("%w: legacy authoring admission failures require an explicit new task revision", ErrAuthoringRecoveryUnavailable)
+			return fmt.Errorf("%w: workflow run %s is %s; legacy authoring admission failures require an explicit new task revision", ErrAuthoringRecoveryUnavailable, binding.run.ID, binding.run.Status)
 		}
 	default:
 		return fmt.Errorf("%w: workflow run %s is %s", ErrAuthoringRecoveryUnavailable, binding.run.ID, binding.run.Status)

@@ -365,11 +365,12 @@ func (s *Store) TransitionWorkflowRun(ctx context.Context, request TransitionWor
 	if !validWorkflowRunStatus(request.Status) {
 		return WorkflowRun{}, fmt.Errorf("invalid workflow run status %q", request.Status)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return WorkflowRun{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	run, err := getWorkflowRunTx(ctx, tx, request.RunID)
 	if err != nil {
 		return WorkflowRun{}, err
@@ -485,11 +486,12 @@ func (s *Store) CreateStageAttempt(ctx context.Context, request CreateStageAttem
 		CreatedAt:             now,
 		Version:               1,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return StageAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	if _, err := getWorkflowRunTx(ctx, tx, attempt.RunID); err != nil {
 		return StageAttempt{}, err
 	}
@@ -588,11 +590,12 @@ func (s *Store) TransitionStageAttempt(ctx context.Context, request TransitionSt
 	} else if request.Verdict != "" {
 		return StageAttempt{}, fmt.Errorf("only completed stage attempts may carry a verdict")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
 	if err != nil {
 		return StageAttempt{}, err
 	}
 	defer tx.Rollback()
+	defer releaseFence()
 	attempt, err := getStageAttemptTx(ctx, tx, request.StageAttemptID)
 	if err != nil {
 		return StageAttempt{}, err
