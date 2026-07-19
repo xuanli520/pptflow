@@ -164,6 +164,17 @@ func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testi
 		if err := validateCodexStageAssets(deploymentRoot, entry, payload); err != nil {
 			t.Fatalf("validate production Codex stage %q: %v", registration.Stage.Key, err)
 		}
+		promptRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Prompt.RelativePath)))
+		if err != nil {
+			t.Fatalf("read production Codex prompt %q: %v", registration.Stage.Key, err)
+		}
+		program, err := stageprovider.ParseStandardAuthoringCodexTurnProgramAsset(promptRaw)
+		if err != nil {
+			t.Fatalf("parse production Codex prompt %q: %v", registration.Stage.Key, err)
+		}
+		if payload.MaxTurns == 1 && !strings.Contains(strings.Join(program.TurnPrompts, "\n"), "harbor_submit_stage_output") {
+			t.Fatalf("production Codex prompt %q does not require the stage output submission tool", registration.Stage.Key)
+		}
 		for name, mutate := range map[string]func(*workflowadapter.AgentTurnOperationPayload){
 			"model drift": func(candidate *workflowadapter.AgentTurnOperationPayload) { candidate.ModelID = "other-model" },
 			"reasoning effort drift": func(candidate *workflowadapter.AgentTurnOperationPayload) {
