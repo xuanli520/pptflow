@@ -517,6 +517,58 @@ func TestStandardAuthoringCodexAgentTurnExecutorUsesFrozenDockerfileEnvironmentP
 	}
 }
 
+func TestStandardAuthoringCodexAgentTurnExecutorRetriesWrappedTaskTOMLWithinTurn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	stage := standardAuthoringCodexTestArtifactStage(1, workflowkit.StageKey(workflowadapter.TaskTOMLGen), "task_toml")
+	wrapped := []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"feature","application":"backend"},"task_toml":"[metadata]\ntask_type = \"feature\"\napplication = \"backend\"\n"}`)
+	raw := []byte("[metadata]\ntask_type = \"feature\"\napplication = \"backend\"\n")
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
+		results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
+		submissions: [][]json.RawMessage{{
+			standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, wrapped),
+			standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, raw),
+		}},
+	}}
+	program, err := NewStandardAuthoringCodexTurnProgram("standard-authoring.task-toml-generate", "1", standardAuthoringCodexTestPrompts(1), 64*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: standardAuthoringCodexReadOnlyTestWorkspace(t),
+		RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program},
+		Now:            func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome.Status != workflowkit.StatusCompleted || result.Outcome.Verdict != workflowkit.VerdictPass || len(result.Artifacts) != 1 || string(result.Artifacts[0].Content) != string(raw) {
+		t.Fatalf("task TOML result = %+v", result)
+	}
+	if len(runtime.conversation.submissionResponses) != 2 {
+		t.Fatalf("submission responses = %+v", runtime.conversation.submissionResponses)
+	}
+	first := standardAuthoringCodexTestSubmissionReceipt(t, runtime.conversation.submissionResponses[0])
+	second := standardAuthoringCodexTestSubmissionReceipt(t, runtime.conversation.submissionResponses[1])
+	if first.Accepted || len(first.Errors) != 1 || first.Errors[0] != "task_toml_invalid" || !second.Accepted || len(second.Errors) != 0 {
+		t.Fatalf("task TOML receipts = first:%+v second:%+v", first, second)
+	}
+	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != 1 || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 2 {
+		t.Fatalf("usage records = %+v, want one turn and two submissions", *usages)
+	}
+}
+
 func TestStandardAuthoringCodexAgentTurnExecutorRejectsMissingDockerfileEnvironmentPolicyBeforeOpeningConversation(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
@@ -689,6 +741,14 @@ func standardAuthoringCodexTestDockerfileStage(turns int) workflowkit.StageDescr
 		{Name: "task_proposal", SchemaVersion: "harbor.artifact.v1", Required: true},
 		{Name: workflowadapter.StandardAuthoringEnvironmentPolicyArtifact, SchemaVersion: workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion, Required: true},
 	}
+	return stage
+}
+
+func standardAuthoringCodexTestArtifactStage(turns int, stageKey workflowkit.StageKey, outputName string) workflowkit.StageDescriptor {
+	stage := standardAuthoringCodexTestStage(turns)
+	stage.Key = stageKey
+	stage.Plugin = workflowkit.PluginBinding{ID: "harborfactory." + string(stageKey), Version: "1"}
+	stage.Outputs = []workflowkit.ArtifactSpec{{Name: outputName, SchemaVersion: "harbor.artifact.v1", Required: true}}
 	return stage
 }
 

@@ -10,9 +10,12 @@ import (
 	"io"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/pelletier/go-toml/v2"
 	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -144,9 +147,22 @@ func (submission *standardAuthoringCodexOutputSubmission) beginTurn(turn int) er
 func (submission *standardAuthoringCodexOutputSubmission) dynamicTool() agent.DynamicTool {
 	return agent.DynamicTool{
 		Name:        standardAuthoringCodexSubmitToolName,
-		Description: "Validate and submit this stage's frozen output candidate. Submit only the allowed verdict and one base64 content value for each declared output, in declared order.",
+		Description: standardAuthoringCodexSubmitToolDescription(submission.stage.Key),
 		InputSchema: standardAuthoringCodexSubmissionSchema(submission.stage),
 		Handler:     submission.handle,
+	}
+}
+
+func standardAuthoringCodexSubmitToolDescription(stageKey workflowkit.StageKey) string {
+	base := "Validate and submit this stage's frozen output candidate. Submit only the allowed verdict and one base64 content value for each declared output, in declared order."
+	switch stageKey {
+	case workflowkit.StageKey(workflowadapter.InstructionGen), workflowkit.StageKey(workflowadapter.TaskTOMLGen),
+		workflowkit.StageKey(workflowadapter.DockerfileGen), workflowkit.StageKey(workflowadapter.SolveGen), workflowkit.StageKey(workflowadapter.TestGen):
+		return base + " The content_base64 value must encode the final raw file bytes themselves, never an extra JSON object, artifact-name, format/version, or content-field wrapper."
+	case workflowkit.StageKey(workflowadapter.TestsAnalysis):
+		return base + " The content_base64 value must encode exactly one JSON object with the non-empty string fields provided_information, theoretical_path, and passing_evidence, with no wrapper fields."
+	default:
+		return base
 	}
 }
 
@@ -369,12 +385,17 @@ func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflo
 			Name: specification.Name, SchemaVersion: specification.SchemaVersion, Content: append([]byte(nil), content...), TurnOrdinal: turnOrdinal,
 		})
 	}
-	if stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) {
-		if environmentPolicy == nil || len(artifacts) != 1 || artifacts[0].Name != "dockerfile" {
-			return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+	if *candidate.Verdict == workflowkit.VerdictPass {
+		if stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) {
+			if environmentPolicy == nil || len(artifacts) != 1 || artifacts[0].Name != "dockerfile" {
+				return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+			}
+			if err := workflowadapter.ValidateDockerfileBaseImage(artifacts[0].Content, *environmentPolicy); err != nil {
+				return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+			}
 		}
-		if err := workflowadapter.ValidateDockerfileBaseImage(artifacts[0].Content, *environmentPolicy); err != nil {
-			return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+		if diagnostic := standardAuthoringCodexArtifactContentDiagnostic(stage.Key, artifacts); diagnostic != "" {
+			return workflowkit.StageExecutionResult{}, "", diagnostic
 		}
 	}
 	canonicalBytes, err := json.Marshal(canonical)
@@ -384,6 +405,102 @@ func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflo
 	return workflowkit.StageExecutionResult{
 		Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: *candidate.Verdict}, Artifacts: artifacts,
 	}, workflowkit.SHA256Fingerprint(canonicalBytes), ""
+}
+
+func standardAuthoringCodexArtifactContentDiagnostic(stageKey workflowkit.StageKey, artifacts []workflowkit.StageArtifact) string {
+	if len(artifacts) != 1 {
+		return ""
+	}
+	content := artifacts[0].Content
+	switch stageKey {
+	case workflowkit.StageKey(workflowadapter.InstructionGen):
+		if artifacts[0].Name != "instruction" || !standardAuthoringCodexRawInstruction(content) {
+			return "instruction_invalid"
+		}
+	case workflowkit.StageKey(workflowadapter.TaskTOMLGen):
+		if artifacts[0].Name != "task_toml" || !standardAuthoringCodexTaskTOML(content) {
+			return "task_toml_invalid"
+		}
+	case workflowkit.StageKey(workflowadapter.SolveGen):
+		if artifacts[0].Name != "solve_script" || !standardAuthoringCodexShellScript(content) {
+			return "solve_script_invalid"
+		}
+	case workflowkit.StageKey(workflowadapter.TestGen):
+		if artifacts[0].Name != "test_script" || !standardAuthoringCodexShellScript(content) {
+			return "test_script_invalid"
+		}
+	case workflowkit.StageKey(workflowadapter.TestsAnalysis):
+		if artifacts[0].Name != "tests_analysis" || !standardAuthoringCodexTestsAnalysis(content) {
+			return "tests_analysis_invalid"
+		}
+	}
+	return ""
+}
+
+func standardAuthoringCodexRawInstruction(content []byte) bool {
+	if !standardAuthoringCodexText(content) {
+		return false
+	}
+	trimmed := bytes.TrimSpace(content)
+	if trimmed[0] == '{' || bytes.HasPrefix(trimmed, []byte("```")) {
+		return false
+	}
+	return trimmed[0] != '[' || !json.Valid(trimmed)
+}
+
+func standardAuthoringCodexTaskTOML(content []byte) bool {
+	if !standardAuthoringCodexText(content) {
+		return false
+	}
+	var document map[string]any
+	if err := toml.NewDecoder(bytes.NewReader(content)).Decode(&document); err != nil {
+		return false
+	}
+	return len(document) != 0
+}
+
+func standardAuthoringCodexShellScript(content []byte) bool {
+	if !standardAuthoringCodexText(content) || !bytes.HasPrefix(content, []byte("#!")) {
+		return false
+	}
+	lineEnd := bytes.IndexByte(content, '\n')
+	if lineEnd < 3 || bytes.IndexByte(content[:lineEnd], '\r') >= 0 {
+		return false
+	}
+	return strings.TrimSpace(string(content[lineEnd+1:])) != ""
+}
+
+type standardAuthoringCodexTestsAnalysisCandidate struct {
+	ProvidedInformation *string `json:"provided_information"`
+	TheoreticalPath     *string `json:"theoretical_path"`
+	PassingEvidence     *string `json:"passing_evidence"`
+}
+
+func standardAuthoringCodexTestsAnalysis(content []byte) bool {
+	if len(content) == 0 || !utf8.Valid(content) || bytes.IndexByte(content, 0) >= 0 || rejectDuplicateDeploymentCatalogJSONKeys(content) != nil {
+		return false
+	}
+	var candidate standardAuthoringCodexTestsAnalysisCandidate
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&candidate); err != nil {
+		return false
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return false
+	}
+	return candidate.ProvidedInformation != nil && standardAuthoringCodexNonEmptyText(*candidate.ProvidedInformation) &&
+		candidate.TheoreticalPath != nil && standardAuthoringCodexNonEmptyText(*candidate.TheoreticalPath) &&
+		candidate.PassingEvidence != nil && standardAuthoringCodexNonEmptyText(*candidate.PassingEvidence)
+}
+
+func standardAuthoringCodexText(content []byte) bool {
+	return len(bytes.TrimSpace(content)) != 0 && utf8.Valid(content) && bytes.IndexByte(content, 0) < 0
+}
+
+func standardAuthoringCodexNonEmptyText(content string) bool {
+	return strings.TrimSpace(content) != "" && utf8.ValidString(content) && !strings.ContainsRune(content, '\x00')
 }
 
 // canonicalStandardAuthoringCodexBase64 accepts the line-oriented output that

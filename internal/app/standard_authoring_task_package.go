@@ -8,11 +8,18 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+)
+
+const (
+	standardAuthoringInstructionArtifactFormat = "harbor.standard-authoring-instruction.v1"
+	standardAuthoringTaskTOMLArtifactFormat    = "harbor.artifact.v1"
+	standardAuthoringModelArtifactVersion      = "1"
 )
 
 // StandardAuthoringTaskPackageInput contains frozen Authoring outputs only.
@@ -61,39 +68,308 @@ func CompileStandardAuthoringTaskPackage(input StandardAuthoringTaskPackageInput
 	if err != nil {
 		return StandardAuthoringTaskPackageResult{}, fmt.Errorf("validate frozen Authoring source commit: %w", err)
 	}
+	contentViolations := make([]codeedge.Violation, 0)
 	if err := input.Environment.ValidateDockerfile(input.Dockerfile); err != nil {
-		return StandardAuthoringTaskPackageResult{}, fmt.Errorf("validate frozen Standard authoring Dockerfile base image: %w", err)
+		contentViolations = append(contentViolations, invalidStandardAuthoringDockerfileViolation())
 	}
-
-	taskTOML, canonicalizationViolations, err := canonicalizeStandardAuthoringTaskTOML(input.TaskTOMLDraft, input.Admission.Profile.Metadata, repositoryURL, commitSHA, input.Brief)
+	instruction, err := decodeStandardAuthoringInstructionArtifact(input.Instruction)
+	if err != nil || !standardAuthoringModelBytes(instruction) {
+		instruction = clonePackageBytes(input.Instruction)
+		contentViolations = append(contentViolations, invalidStandardAuthoringInstructionViolation())
+	}
+	taskTOMLDraft, wrapperMetadata, err := decodeStandardAuthoringTaskTOMLArtifactWithMetadata(input.TaskTOMLDraft)
+	taskTOML := clonePackageBytes(taskTOMLDraft)
 	if err != nil {
-		return StandardAuthoringTaskPackageResult{}, err
+		taskTOMLDraft = clonePackageBytes(input.TaskTOMLDraft)
+		taskTOML = clonePackageBytes(input.TaskTOMLDraft)
+		contentViolations = append(contentViolations, invalidStandardAuthoringTaskTOMLViolation())
+	} else {
+		if wrapperMetadata != nil && input.Brief != nil {
+			contentViolations = append(contentViolations, standardAuthoringTaskTOMLWrapperBriefViolations(*wrapperMetadata, *input.Brief)...)
+		}
+		var canonicalizationViolations []codeedge.Violation
+		taskTOML, canonicalizationViolations, err = canonicalizeStandardAuthoringTaskTOML(taskTOMLDraft, input.Admission.Profile.Metadata, repositoryURL, commitSHA, input.Brief)
+		if err != nil {
+			taskTOML = clonePackageBytes(taskTOMLDraft)
+			canonicalizationViolations = []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation()}
+		}
+		contentViolations = append(contentViolations, canonicalizationViolations...)
 	}
 	testsAnalysis, err := renderStandardAuthoringTestsAnalysis(input.TestsAnalysis)
 	if err != nil {
-		return StandardAuthoringTaskPackageResult{}, err
+		testsAnalysis = clonePackageBytes(input.TestsAnalysis)
+		contentViolations = append(contentViolations, invalidStandardAuthoringTestsAnalysisViolation())
+	}
+	if !standardAuthoringShellScript(input.SolveScript) {
+		contentViolations = append(contentViolations, invalidStandardAuthoringSolveScriptViolation())
+	}
+	if !standardAuthoringShellScript(input.TestScript) {
+		contentViolations = append(contentViolations, invalidStandardAuthoringTestScriptViolation())
 	}
 	files := []codeedge.TaskPackageFile{
-		{Path: "instruction.md", Mode: 0o644, Data: clonePackageBytes(input.Instruction)},
+		{Path: "instruction.md", Mode: 0o644, Data: instruction},
 		{Path: "task.toml", Mode: 0o644, Data: taskTOML},
 		{Path: "tests_analysis.md", Mode: 0o644, Data: testsAnalysis},
 		{Path: "environment/Dockerfile", Mode: 0o644, Data: clonePackageBytes(input.Dockerfile)},
 		{Path: "solution/solve.sh", Mode: 0o755, Data: clonePackageBytes(input.SolveScript)},
 		{Path: "tests/test.sh", Mode: 0o755, Data: clonePackageBytes(input.TestScript)},
 	}
-	report, err := codeedge.ValidateTaskPackage(input.Admission, files)
+	report, err := codeedge.ValidateTaskPackage(input.Admission, standardAuthoringAdmissionValidationFiles(files, contentViolations))
 	if err != nil {
 		return StandardAuthoringTaskPackageResult{}, err
 	}
-	if len(canonicalizationViolations) != 0 {
+	if len(contentViolations) != 0 {
 		report.Passed = false
-		report.Violations = append(report.Violations, canonicalizationViolations...)
+		report.Violations = append(report.Violations, contentViolations...)
 		sortViolations(report.Violations)
 	}
 	return StandardAuthoringTaskPackageResult{CanonicalFiles: files, Report: report}, nil
 }
 
 func clonePackageBytes(value []byte) []byte { return append([]byte(nil), value...) }
+
+type standardAuthoringInstructionArtifact struct {
+	Format  string `json:"format"`
+	Version string `json:"version"`
+	Content string `json:"content"`
+}
+
+type standardAuthoringTaskTOMLArtifactMetadata struct {
+	TaskType    string `json:"task_type"`
+	Application string `json:"application"`
+	Objective   string `json:"objective"`
+}
+
+type standardAuthoringTaskTOMLArtifact struct {
+	Format   string                                    `json:"format"`
+	Version  string                                    `json:"version"`
+	Metadata standardAuthoringTaskTOMLArtifactMetadata `json:"metadata"`
+	TaskTOML string                                    `json:"task_toml"`
+}
+
+func decodeStandardAuthoringInstructionArtifact(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("generated instruction is empty")
+	}
+	if !standardAuthoringJSONArtifactCandidate(raw) {
+		return clonePackageBytes(raw), nil
+	}
+	var artifact standardAuthoringInstructionArtifact
+	if err := decodeStrictStandardAuthoringJSONArtifact(raw, &artifact); err != nil {
+		return nil, err
+	}
+	if artifact.Format != standardAuthoringInstructionArtifactFormat || artifact.Version != standardAuthoringModelArtifactVersion || !standardAuthoringModelText(artifact.Content) {
+		return nil, fmt.Errorf("generated instruction wrapper does not match the supported contract")
+	}
+	if standardAuthoringJSONArtifactCandidate([]byte(artifact.Content)) {
+		return nil, fmt.Errorf("generated instruction wrapper payload must be raw final-file content")
+	}
+	return []byte(artifact.Content), nil
+}
+
+func decodeStandardAuthoringTaskTOMLArtifact(raw []byte) ([]byte, error) {
+	payload, _, err := decodeStandardAuthoringTaskTOMLArtifactWithMetadata(raw)
+	return payload, err
+}
+
+func decodeStandardAuthoringTaskTOMLArtifactWithMetadata(raw []byte) ([]byte, *standardAuthoringTaskTOMLArtifactMetadata, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return clonePackageBytes(raw), nil, nil
+	}
+	var artifact standardAuthoringTaskTOMLArtifact
+	if err := decodeStrictStandardAuthoringJSONArtifact(raw, &artifact); err != nil {
+		return nil, nil, err
+	}
+	if artifact.Format != standardAuthoringTaskTOMLArtifactFormat || artifact.Version != standardAuthoringModelArtifactVersion ||
+		!standardAuthoringWrapperText(artifact.Metadata.TaskType) || !standardAuthoringWrapperText(artifact.Metadata.Application) ||
+		!standardAuthoringWrapperText(artifact.Metadata.Objective) || !standardAuthoringModelText(artifact.TaskTOML) {
+		return nil, nil, fmt.Errorf("generated task.toml wrapper does not match the supported contract")
+	}
+	if trimmedPayload := bytes.TrimSpace([]byte(artifact.TaskTOML)); len(trimmedPayload) != 0 && trimmedPayload[0] == '{' {
+		return nil, nil, fmt.Errorf("generated task.toml wrapper payload must be raw final-file content")
+	}
+	metadata := artifact.Metadata
+	return []byte(artifact.TaskTOML), &metadata, nil
+}
+
+func standardAuthoringWrapperText(value string) bool {
+	return standardAuthoringModelText(value) && value == strings.TrimSpace(value)
+}
+
+// A raw instruction may itself be JSON. Reserve only a top-level format field
+// as the discriminator for the observed structured artifact form.
+func standardAuthoringJSONArtifactCandidate(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&fields); err != nil {
+		return bytes.Contains(trimmed, []byte(`"format"`))
+	}
+	_, found := fields["format"]
+	return found
+}
+
+func decodeStrictStandardAuthoringJSONArtifact(raw []byte, destination any) error {
+	if !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
+		return fmt.Errorf("generated JSON artifact is not valid UTF-8 text")
+	}
+	if err := rejectDuplicateStandardAuthoringJSONKeys(raw); err != nil {
+		return err
+	}
+	if err := decodeStrictJSON(string(raw), destination); err != nil {
+		return err
+	}
+	return nil
+}
+
+func rejectDuplicateStandardAuthoringJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := walkStandardAuthoringJSONValue(decoder, "$"); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func walkStandardAuthoringJSONValue(decoder *json.Decoder, location string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, compound := token.(json.Delim)
+	if !compound {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("object key at %s is not a string", location)
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate object key %q at %s", key, location)
+			}
+			seen[key] = struct{}{}
+			if err := walkStandardAuthoringJSONValue(decoder, location+"."+key); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if end != json.Delim('}') {
+			return fmt.Errorf("object at %s is not closed", location)
+		}
+	case '[':
+		index := 0
+		for decoder.More() {
+			if err := walkStandardAuthoringJSONValue(decoder, fmt.Sprintf("%s[%d]", location, index)); err != nil {
+				return err
+			}
+			index++
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if end != json.Delim(']') {
+			return fmt.Errorf("array at %s is not closed", location)
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q at %s", delimiter, location)
+	}
+	return nil
+}
+
+func invalidStandardAuthoringInstructionViolation() codeedge.Violation {
+	return codeedge.Violation{Code: "task_instruction", Path: "instruction.md", Message: "generated instruction must be raw content or a strict harbor.standard-authoring-instruction.v1 wrapper with non-empty content"}
+}
+
+func invalidStandardAuthoringDockerfileViolation() codeedge.Violation {
+	return codeedge.Violation{Code: "environment_isolation", Path: "environment/Dockerfile", Message: "generated Dockerfile does not match the frozen environment policy"}
+}
+
+func invalidStandardAuthoringTaskTOMLViolation() codeedge.Violation {
+	return codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated task.toml must be valid TOML or a strict harbor.artifact.v1 task_toml wrapper"}
+}
+
+func invalidStandardAuthoringTestsAnalysisViolation() codeedge.Violation {
+	return codeedge.Violation{Code: "tests_analysis", Path: "tests_analysis.md", Message: "generated tests analysis must be a strict JSON object with exactly provided_information, theoretical_path, and passing_evidence"}
+}
+
+func invalidStandardAuthoringSolveScriptViolation() codeedge.Violation {
+	return codeedge.Violation{Code: "task_layout", Path: "solution/solve.sh", Message: "generated solution must be a non-empty executable shell script with a shebang"}
+}
+
+func invalidStandardAuthoringTestScriptViolation() codeedge.Violation {
+	return codeedge.Violation{Code: "task_layout", Path: "tests/test.sh", Message: "generated tests must be a non-empty executable shell script with a shebang"}
+}
+
+func standardAuthoringModelBytes(value []byte) bool {
+	return len(bytes.TrimSpace(value)) != 0 && utf8.Valid(value) && bytes.IndexByte(value, 0) < 0
+}
+
+func standardAuthoringModelText(value string) bool {
+	return strings.TrimSpace(value) != "" && utf8.ValidString(value) && !strings.ContainsRune(value, '\x00')
+}
+
+func standardAuthoringShellScript(content []byte) bool {
+	if !standardAuthoringModelBytes(content) || !bytes.HasPrefix(content, []byte("#!")) {
+		return false
+	}
+	lineEnd := bytes.IndexByte(content, '\n')
+	return lineEnd >= 3 && bytes.IndexByte(content[:lineEnd], '\r') < 0 && strings.TrimSpace(string(content[lineEnd+1:])) != ""
+}
+
+func standardAuthoringTaskTOMLWrapperBriefViolations(metadata standardAuthoringTaskTOMLArtifactMetadata, brief workflowadapter.StandardAuthoringBrief) []codeedge.Violation {
+	values := []struct {
+		name, got, want string
+	}{
+		{name: "metadata.task_type", got: metadata.TaskType, want: brief.TaskType},
+		{name: "metadata.application", got: metadata.Application, want: brief.Application},
+		{name: "metadata.objective", got: metadata.Objective, want: brief.Objective},
+	}
+	violations := make([]codeedge.Violation, 0)
+	for _, value := range values {
+		if value.got != value.want {
+			violations = append(violations, codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated wrapper value does not exactly match frozen authoring brief at " + value.name})
+		}
+	}
+	return violations
+}
+
+func standardAuthoringAdmissionValidationFiles(files []codeedge.TaskPackageFile, violations []codeedge.Violation) []codeedge.TaskPackageFile {
+	validationFiles := make([]codeedge.TaskPackageFile, len(files))
+	copy(validationFiles, files)
+	invalidPaths := make(map[string]struct{}, len(violations))
+	for _, violation := range violations {
+		invalidPaths[violation.Path] = struct{}{}
+	}
+	for index := range validationFiles {
+		validationFiles[index].Data = clonePackageBytes(validationFiles[index].Data)
+		if len(validationFiles[index].Data) == 0 {
+			if _, invalid := invalidPaths[validationFiles[index].Path]; invalid {
+				validationFiles[index].Data = []byte("\n")
+			}
+		}
+	}
+	return validationFiles
+}
 
 type standardAuthoringTaskTOMLFact struct {
 	name  string
@@ -102,7 +378,7 @@ type standardAuthoringTaskTOMLFact struct {
 }
 
 func canonicalizeStandardAuthoringTaskTOML(raw []byte, mapping codeedge.MetadataFieldMapping, repositoryURL, commitSHA string, brief *workflowadapter.StandardAuthoringBrief) ([]byte, []codeedge.Violation, error) {
-	document, err := parseStandardAuthoringTaskTOML(raw)
+	document, err := parseStandardAuthoringTaskTOMLPayload(raw)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -144,8 +420,16 @@ func canonicalizeStandardAuthoringTaskTOML(raw []byte, mapping codeedge.Metadata
 }
 
 func parseStandardAuthoringTaskTOML(raw []byte) (map[string]any, error) {
+	payload, err := decodeStandardAuthoringTaskTOMLArtifact(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse generated task.toml wrapper: %w", err)
+	}
+	return parseStandardAuthoringTaskTOMLPayload(payload)
+}
+
+func parseStandardAuthoringTaskTOMLPayload(payload []byte) (map[string]any, error) {
 	var document map[string]any
-	decoder := toml.NewDecoder(bytes.NewReader(raw))
+	decoder := toml.NewDecoder(bytes.NewReader(payload))
 	if err := decoder.Decode(&document); err != nil {
 		return nil, fmt.Errorf("parse generated task.toml: %w", err)
 	}
@@ -156,11 +440,23 @@ func parseStandardAuthoringTaskTOML(raw []byte) (map[string]any, error) {
 }
 
 func validateStandardAuthoringTaskTOMLBrief(raw []byte, mapping codeedge.MetadataFieldMapping, brief workflowadapter.StandardAuthoringBrief) ([]codeedge.Violation, error) {
-	document, err := parseStandardAuthoringTaskTOML(raw)
+	payload, wrapperMetadata, err := decodeStandardAuthoringTaskTOMLArtifactWithMetadata(raw)
+	if err != nil {
+		return []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation()}, nil
+	}
+	document, err := parseStandardAuthoringTaskTOMLPayload(payload)
+	if err != nil {
+		return []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation()}, nil
+	}
+	violations := make([]codeedge.Violation, 0)
+	if wrapperMetadata != nil {
+		violations = append(violations, standardAuthoringTaskTOMLWrapperBriefViolations(*wrapperMetadata, brief)...)
+	}
+	inner, err := standardAuthoringBriefMetadataViolations(document, mapping, brief)
 	if err != nil {
 		return nil, err
 	}
-	return standardAuthoringBriefMetadataViolations(document, mapping, brief)
+	return append(violations, inner...), nil
 }
 
 func standardAuthoringBriefMetadataViolations(document map[string]any, mapping codeedge.MetadataFieldMapping, brief workflowadapter.StandardAuthoringBrief) ([]codeedge.Violation, error) {
@@ -239,6 +535,12 @@ type standardAuthoringTestsAnalysis struct {
 }
 
 func renderStandardAuthoringTestsAnalysis(raw []byte) ([]byte, error) {
+	if !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
+		return nil, fmt.Errorf("decode typed tests analysis: document is not valid UTF-8 text")
+	}
+	if err := rejectDuplicateStandardAuthoringJSONKeys(raw); err != nil {
+		return nil, fmt.Errorf("decode typed tests analysis: %w", err)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var analysis standardAuthoringTestsAnalysis
@@ -256,10 +558,10 @@ func renderStandardAuthoringTestsAnalysis(raw []byte) ([]byte, error) {
 	}
 	var output strings.Builder
 	for index, section := range sections {
-		body := strings.TrimSpace(section.body)
-		if body == "" {
+		if !standardAuthoringModelText(section.body) {
 			return nil, fmt.Errorf("typed tests analysis section %q is required", section.title)
 		}
+		body := strings.TrimSpace(section.body)
 		if index > 0 {
 			output.WriteByte('\n')
 		}

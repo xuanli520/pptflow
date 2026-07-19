@@ -311,6 +311,73 @@ func TestStandardAuthoringPackageAdmissionReadsBriefAndReportsMetadataMismatch(t
 	assertAdmissionViolationMessage(t, compiled.Report, "task_metadata", "metadata.task_type")
 }
 
+func TestStandardAuthoringPackageAdmissionReturnsNeedsRepairForMalformedModelContent(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string][]byte)
+		code   string
+	}{
+		{
+			name: "instruction",
+			mutate: func(contents map[string][]byte) {
+				contents["instruction"] = nil
+			},
+			code: "task_instruction",
+		},
+		{
+			name: "task TOML",
+			mutate: func(contents map[string][]byte) {
+				contents["task_toml"] = []byte("{not valid TOML or a wrapper")
+			},
+			code: "task_metadata",
+		},
+		{
+			name: "Dockerfile",
+			mutate: func(contents map[string][]byte) {
+				contents["dockerfile"] = []byte("FROM docker.io/library/alpine:3.20\n")
+			},
+			code: "environment_isolation",
+		},
+		{
+			name: "solution script",
+			mutate: func(contents map[string][]byte) {
+				contents["solve_script"] = nil
+			},
+			code: "task_layout",
+		},
+		{
+			name: "test script",
+			mutate: func(contents map[string][]byte) {
+				contents["test_script"] = []byte("exit 0\n")
+			},
+			code: "task_layout",
+		},
+		{
+			name: "tests analysis",
+			mutate: func(contents map[string][]byte) {
+				contents["tests_analysis"] = []byte(`{"provided_information":"\u0000","theoretical_path":"path","passing_evidence":"evidence"}`)
+			},
+			code: "tests_analysis",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := executeStandardAuthoringPackageAdmissionFixture(t, test.mutate)
+			if result.Outcome.Status != workflowkit.StatusCompleted || result.Outcome.Verdict != workflowkit.VerdictNeedsRepair || len(result.Artifacts) != 1 {
+				t.Fatalf("package admission result = %+v", result)
+			}
+			var receipt standardAuthoringAdmissionReceipt
+			if err := json.Unmarshal(result.Artifacts[0].Content, &receipt); err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Report.Passed {
+				t.Fatalf("malformed model content unexpectedly passed: %+v", receipt.Report)
+			}
+			assertAdmissionCode(t, receipt.Report, test.code)
+		})
+	}
+}
+
 func TestStandardAuthoringPackageAdmissionStrictlyParsesBrief(t *testing.T) {
 	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
 	fixture.contents[workflowadapter.StandardAuthoringBriefArtifact] = []byte(`{"format":"harbor.standard-authoring-brief.v1","version":"1","task_type":"bugfix","application":"widget","objective":"Repair the widget","unexpected":true}`)
@@ -318,6 +385,106 @@ func TestStandardAuthoringPackageAdmissionStrictlyParsesBrief(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "decode frozen Standard authoring brief") {
 		t.Fatalf("malformed package admission brief error = %v", err)
 	}
+}
+
+func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(map[string][]byte)) workflowkit.StageExecutionResult {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	packageInput := standardAuthoringTaskPackageFixture(t)
+	executor, err := NewStandardAuthoringMaterializeExecutor(StandardAuthoringMaterializeExecutorConfig{ManagedRoot: root, Store: database, Admission: &packageInput.Admission})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceDigest := "sha256:" + strings.Repeat("a", 64)
+	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: packageInput.Source.RepositoryURL, CommitSHA: packageInput.Source.CommitSHA,
+		SnapshotArtifactRef: sourceDigest, SnapshotContentDigest: sourceDigest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
+		IdempotencyKey: "package-admission-source", Actor: "author", Reason: "freeze source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := database.CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: "package-admission-task", Title: "Package admission task", MetadataJSON: `{}`,
+		SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA, Actor: "author", Reason: "reserve draft task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringBriefTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		IdempotencyKey: "package-admission-session", Actor: "author", Reason: "freeze session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID, WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:package-admission-profile", DefinitionHash: "sha256:package-admission-definition", RunManifestJSON: `{}`,
+		Trigger: "task.generate", Actor: "author", Reason: "start package admission fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning, Actor: "author", Reason: "run package admission",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := workflowadapter.StandardAuthoringBriefWorkflowTemplate()
+	profile := lifecycleCompleteProfileForTemplate(t, template)
+	resolved, err := template.Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, found := resolved.Descriptor.Stage(workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
+	if !found {
+		t.Fatal("compiled authoring workflow omitted codeedge_package_admission")
+	}
+	policyRaw, err := packageInput.Environment.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	briefRaw, err := packageInput.Brief.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string][]byte{
+		"instruction": append([]byte(nil), packageInput.Instruction...), "task_toml": append([]byte(nil), packageInput.TaskTOMLDraft...),
+		"dockerfile": append([]byte(nil), packageInput.Dockerfile...), "solve_script": append([]byte(nil), packageInput.SolveScript...),
+		"test_script": append([]byte(nil), packageInput.TestScript...), "tests_analysis": append([]byte(nil), packageInput.TestsAnalysis...),
+		workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: policyRaw, workflowadapter.StandardAuthoringBriefArtifact: briefRaw,
+	}
+	mutate(contents)
+	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
+	subject := workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(source.SnapshotContentDigest)}
+	request := workflowkit.StageExecutionRequest{
+		Execution: workflowkit.FrozenExecution{ID: run.ID, Subject: subject, Actor: "worker"},
+		Claim:     workflowkit.JobClaim{Stage: &workflowkit.StageClaim{StageAttempt: workflowkit.AttemptIdentity{ID: "package-admission-attempt"}, Stage: stage}},
+		Stage:     stage, Inputs: inputs,
+		ReadInput: func(_ context.Context, binding workflowkit.ArtifactBinding) ([]byte, error) {
+			return append([]byte(nil), contents[binding.Name]...), nil
+		},
+	}
+	payload := workflowadapter.HarborBuiltinOperationPayload{HandlerID: standardAuthoringPackageAdmissionHandlerID}
+	result, err := executor.ExecuteHarborBuiltin(ctx, stageprovider.StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: payload},
+		},
+	}, payload)
+	if err != nil {
+		t.Fatalf("package admission returned infrastructure error: %v", err)
+	}
+	return result
 }
 
 func TestStandardAuthoringMaterializerRejectsBriefMetadataMismatch(t *testing.T) {
@@ -338,6 +505,40 @@ func TestStandardAuthoringMaterializerRejectsBriefMetadataMismatch(t *testing.T)
 				t.Fatalf("mismatched materializer brief metadata error = %v", err)
 			}
 		})
+	}
+}
+
+func TestStandardAuthoringMaterializerBriefValidationAcceptsWrappedTaskTOML(t *testing.T) {
+	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
+	fixture.contents["task_toml"] = standardAuthoringTaskTOMLWrapperFixture(t, fixture.contents["task_toml"], *fixture.packageInput.Brief)
+	inputs, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(inputs.taskTOML) != string(fixture.contents["task_toml"]) {
+		t.Fatal("materializer changed the frozen task_toml artifact before package compilation")
+	}
+}
+
+func TestStandardAuthoringMaterializerBriefValidationRejectsWrappedScopeMismatch(t *testing.T) {
+	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
+	fixture.contents["task_toml"] = standardAuthoringTaskTOMLWrapperFixture(t, fixture.contents["task_toml"], *fixture.packageInput.Brief)
+	fixture.contents["task_toml"] = []byte(strings.Replace(string(fixture.contents["task_toml"]), fixture.packageInput.Brief.Objective, "Different objective", 1))
+	_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
+	if err == nil || !strings.Contains(err.Error(), "metadata.objective") || !strings.Contains(err.Error(), "CodeEdge task admission rejected materialization") {
+		t.Fatalf("mismatched wrapped scope error = %v", err)
+	}
+}
+
+func TestStandardAuthoringMaterializerReportsInvalidTaskTOMLAsAdmissionRejection(t *testing.T) {
+	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
+	fixture.contents["task_toml"] = []byte(`{"format":"harbor.artifact.v1","version":"2","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"[metadata]\n"}`)
+	_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
+	if err == nil || !strings.Contains(err.Error(), "CodeEdge task admission rejected materialization") || !strings.Contains(err.Error(), "task_metadata") {
+		t.Fatalf("invalid wrapped task TOML error = %v", err)
+	}
+	if strings.Contains(err.Error(), "parse generated task.toml") {
+		t.Fatalf("model-owned invalid task TOML leaked as parser infrastructure error: %v", err)
 	}
 }
 

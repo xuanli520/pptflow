@@ -122,12 +122,12 @@ func TestStandardAuthoringBriefPromptsFreezeScopeWithoutElevatingData(t *testing
 	for _, test := range []struct {
 		path    string
 		version string
-		extra   string
+		extras  []string
 	}{
 		{path: "repo-analyze.json", version: "1.2.0"},
 		{path: "task-design.json", version: "1.3.0"},
 		{path: "generate-task-files.json", version: "1.2.0"},
-		{path: "task-toml-generate.json", version: "1.3.0", extra: "metadata.task_type"},
+		{path: "task-toml-generate.json", version: "1.5.0", extras: []string{"metadata.task_type", "metadata.code_lang", "metadata.is_0_to_1", "false"}},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -143,8 +143,46 @@ func TestStandardAuthoringBriefPromptsFreezeScopeWithoutElevatingData(t *testing
 				t.Fatalf("prompt %s omits frozen brief boundary %q", test.path, required)
 			}
 		}
-		if program.Version != test.version || (test.extra != "" && !strings.Contains(joined, test.extra)) {
-			t.Fatalf("prompt %s version/content = %s/%q", test.path, program.Version, test.extra)
+		if program.Version != test.version {
+			t.Fatalf("prompt %s version = %s, want %s", test.path, program.Version, test.version)
+		}
+		for _, extra := range test.extras {
+			if !strings.Contains(joined, extra) {
+				t.Fatalf("prompt %s omits required metadata rule %q", test.path, extra)
+			}
+		}
+	}
+}
+
+func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	for _, test := range []struct {
+		path    string
+		version string
+		file    string
+	}{
+		{path: "instruction-generate.json", version: "1.2.0", file: "instruction.md"},
+		{path: "task-toml-generate.json", version: "1.5.0", file: "task.toml"},
+		{path: "dockerfile-generate.json", version: "1.7.0", file: "environment/Dockerfile"},
+		{path: "solve-generate.json", version: "1.2.0", file: "solution/solve.sh"},
+		{path: "test-generate.json", version: "1.3.0", file: "tests/test.sh"},
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", test.path, err)
+		}
+		joined := strings.Join(program.TurnPrompts, "\n")
+		for _, required := range []string{"content_base64", test.file, "bytes themselves", "not a JSON object"} {
+			if !strings.Contains(joined, required) {
+				t.Fatalf("prompt %s omits direct payload rule %q", test.path, required)
+			}
+		}
+		if program.Version != test.version {
+			t.Fatalf("prompt %s version = %s, want %s", test.path, program.Version, test.version)
 		}
 	}
 }

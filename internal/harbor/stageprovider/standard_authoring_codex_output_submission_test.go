@@ -334,6 +334,178 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesFrozenDockerfileEnvironme
 	}
 }
 
+func TestStandardAuthoringCodexOutputSubmissionEnforcesStagePayloadContracts(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		stageKey   workflowkit.StageKey
+		outputName string
+		valid      [][]byte
+		invalid    [][]byte
+		diagnostic string
+	}{
+		{
+			name: "instruction", stageKey: workflowkit.StageKey(workflowadapter.InstructionGen), outputName: "instruction",
+			valid: [][]byte{[]byte("# Implement the feature\n\nKeep the behavior local.\n"), []byte("[Public API](https://example.test) must remain compatible.\n")},
+			invalid: [][]byte{
+				[]byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"# Wrapped"}`),
+				[]byte(`["wrapped instruction"]`), []byte("```markdown\n# Wrapped\n```\n"),
+			},
+			diagnostic: "instruction_invalid",
+		},
+		{
+			name: "task TOML", stageKey: workflowkit.StageKey(workflowadapter.TaskTOMLGen), outputName: "task_toml",
+			valid: [][]byte{[]byte("[metadata]\ntask_type = \"feature\"\napplication = \"backend\"\n")},
+			invalid: [][]byte{
+				[]byte(`{"format":"harbor.artifact.v1","version":"1","task_toml":"[metadata]"}`),
+				[]byte("[metadata]\ntask_type = \"feature\"\n[metadata]\napplication = \"backend\"\n"),
+			},
+			diagnostic: "task_toml_invalid",
+		},
+		{
+			name: "solve script", stageKey: workflowkit.StageKey(workflowadapter.SolveGen), outputName: "solve_script",
+			valid: [][]byte{[]byte("#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n")},
+			invalid: [][]byte{
+				[]byte(`{"format":"harbor.artifact.v1","version":"1","solve_script":"#!/bin/sh\\nexit 0\\n"}`),
+				[]byte("set -e\nexit 0\n"), []byte("#!/bin/sh\r\nexit 0\n"),
+			},
+			diagnostic: "solve_script_invalid",
+		},
+		{
+			name: "test script", stageKey: workflowkit.StageKey(workflowadapter.TestGen), outputName: "test_script",
+			valid: [][]byte{[]byte("#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n")},
+			invalid: [][]byte{
+				[]byte(`{"format":"harbor.artifact.v1","version":"1","test_script":"#!/bin/sh\\nexit 0\\n"}`),
+				[]byte("#!/bin/sh\n"),
+			},
+			diagnostic: "test_script_invalid",
+		},
+		{
+			name: "tests analysis", stageKey: workflowkit.StageKey(workflowadapter.TestsAnalysis), outputName: "tests_analysis",
+			valid: [][]byte{[]byte(`{"provided_information":"Visible inputs","theoretical_path":"Implement and test","passing_evidence":"Assertions cover the contract"}`)},
+			invalid: [][]byte{
+				[]byte(`{"format":"harbor.artifact.v1","provided_information":"Visible inputs","theoretical_path":"Implement and test","passing_evidence":"Assertions cover the contract"}`),
+				[]byte(`{"provided_information":"first","provided_information":"second","theoretical_path":"path","passing_evidence":"evidence"}`),
+				[]byte(`{"provided_information":"info","theoretical_path":"path","passing_evidence":"evidence"} {}`),
+				[]byte(`{"provided_information":"info","theoretical_path":"path","passing_evidence":" "}`),
+				[]byte(`{"provided_information":"\u0000","theoretical_path":"path","passing_evidence":"evidence"}`),
+			},
+			diagnostic: "tests_analysis_invalid",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			stage := standardAuthoringCodexTestArtifactStage(1, testCase.stageKey, testCase.outputName)
+			for index, content := range testCase.valid {
+				request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+				submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now }, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := submission.beginTurn(1); err != nil {
+					t.Fatal(err)
+				}
+				response, err := submission.dynamicTool().Handler(context.Background(), standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, content))
+				if err != nil {
+					t.Fatal(err)
+				}
+				receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+				if !receipt.Accepted || len(receipt.Errors) != 0 {
+					t.Fatalf("valid candidate %d receipt = %+v", index, receipt)
+				}
+			}
+			for index, content := range testCase.invalid {
+				request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+				submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now }, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := submission.beginTurn(1); err != nil {
+					t.Fatal(err)
+				}
+				response, err := submission.dynamicTool().Handler(context.Background(), standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, content))
+				if err != nil {
+					t.Fatal(err)
+				}
+				receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+				if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != testCase.diagnostic {
+					t.Fatalf("invalid candidate %d receipt = %+v, want %q", index, receipt, testCase.diagnostic)
+				}
+				if _, accepted := submission.acceptedResult(); accepted || len(*usages) != 1 {
+					t.Fatalf("invalid candidate %d accepted=%t usages=%+v", index, accepted, *usages)
+				}
+			}
+		})
+	}
+}
+
+func TestStandardAuthoringCodexOutputSubmissionAllowsDiagnosticContentForNonPassVerdicts(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name              string
+		stage             workflowkit.StageDescriptor
+		content           []byte
+		environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy
+	}{
+		{
+			name:    "task TOML needs repair",
+			stage:   standardAuthoringCodexTestArtifactStage(1, workflowkit.StageKey(workflowadapter.TaskTOMLGen), "task_toml"),
+			content: []byte("unable to produce valid TOML because the approved design is inconsistent"),
+		},
+		{
+			name:    "Dockerfile needs repair",
+			stage:   standardAuthoringCodexTestDockerfileStage(1),
+			content: []byte("the frozen environment policy conflicts with the approved task design"),
+			environmentPolicy: func() *workflowadapter.StandardAuthoringEnvironmentPolicy {
+				policy := standardAuthoringCodexTestEnvironmentPolicy(t)
+				return &policy
+			}(),
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			request, _, _ := standardAuthoringCodexTestRequest(testCase.stage, []byte("frozen input"), now)
+			submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now }, testCase.environmentPolicy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := submission.beginTurn(1); err != nil {
+				t.Fatal(err)
+			}
+			response, err := submission.dynamicTool().Handler(context.Background(), standardAuthoringCodexTestCandidate(t, workflowkit.VerdictNeedsRepair, testCase.content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if !receipt.Accepted || len(receipt.Errors) != 0 {
+				t.Fatalf("needs-repair receipt = %+v", receipt)
+			}
+			accepted, found := submission.acceptedResult()
+			if !found || accepted.Outcome.Verdict != workflowkit.VerdictNeedsRepair || len(accepted.Artifacts) != 1 || string(accepted.Artifacts[0].Content) != string(testCase.content) {
+				t.Fatalf("accepted needs-repair result = %+v", accepted)
+			}
+		})
+	}
+}
+
+func TestStandardAuthoringCodexSubmitToolDescriptionsMatchPayloadKind(t *testing.T) {
+	raw := standardAuthoringCodexSubmitToolDescription(workflowkit.StageKey(workflowadapter.TaskTOMLGen))
+	analysis := standardAuthoringCodexSubmitToolDescription(workflowkit.StageKey(workflowadapter.TestsAnalysis))
+	structured := standardAuthoringCodexSubmitToolDescription(workflowkit.StageKey(workflowadapter.TaskDesign))
+	if !strings.Contains(raw, "final raw file bytes") || !strings.Contains(raw, "never an extra JSON object") {
+		t.Fatalf("raw-file tool description = %q", raw)
+	}
+	if !strings.Contains(analysis, "exactly one JSON object") || !strings.Contains(analysis, "provided_information") {
+		t.Fatalf("tests-analysis tool description = %q", analysis)
+	}
+	if strings.Contains(structured, "final raw file bytes") || strings.Contains(structured, "exactly one JSON object") {
+		t.Fatalf("generic structured-stage tool description = %q", structured)
+	}
+}
+
 func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *testing.T) {
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
 	valid := standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("accepted artifact"))

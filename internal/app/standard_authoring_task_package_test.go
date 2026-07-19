@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -71,6 +72,162 @@ func TestCompileStandardAuthoringTaskPackageReportsFrozenBriefMetadataMismatch(t
 	}
 }
 
+func TestCompileStandardAuthoringTaskPackageAcceptsObservedArtifactWrappers(t *testing.T) {
+	input := standardAuthoringTaskPackageFixture(t)
+	wantInstruction := append([]byte(nil), input.Instruction...)
+	input.Instruction = standardAuthoringInstructionWrapperFixture(t, input.Instruction)
+	input.TaskTOMLDraft = standardAuthoringTaskTOMLWrapperFixture(t, input.TaskTOMLDraft, *input.Brief)
+
+	result, err := CompileStandardAuthoringTaskPackage(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Report.Passed {
+		t.Fatalf("wrapped package admission report = %+v", result.Report)
+	}
+	files := taskPackageFilesByPath(result.CanonicalFiles)
+	if string(files["instruction.md"].Data) != string(wantInstruction) {
+		t.Fatalf("materialized instruction = %q, want decoded content %q", files["instruction.md"].Data, wantInstruction)
+	}
+	if !strings.Contains(string(files["task.toml"].Data), `task_type = 'bugfix'`) || strings.Contains(string(files["task.toml"].Data), `"task_toml"`) {
+		t.Fatalf("materialized task.toml was not decoded and canonicalized:\n%s", files["task.toml"].Data)
+	}
+}
+
+func TestCompileStandardAuthoringTaskPackageRejectsWrapperScopeMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*standardAuthoringTaskTOMLArtifactMetadata)
+		field  string
+	}{
+		{name: "task type", mutate: func(metadata *standardAuthoringTaskTOMLArtifactMetadata) { metadata.TaskType = "feature" }, field: "metadata.task_type"},
+		{name: "application", mutate: func(metadata *standardAuthoringTaskTOMLArtifactMetadata) { metadata.Application = "backend" }, field: "metadata.application"},
+		{name: "objective", mutate: func(metadata *standardAuthoringTaskTOMLArtifactMetadata) { metadata.Objective = "Different objective" }, field: "metadata.objective"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := standardAuthoringTaskPackageFixture(t)
+			metadata := standardAuthoringTaskTOMLArtifactMetadata{TaskType: input.Brief.TaskType, Application: input.Brief.Application, Objective: input.Brief.Objective}
+			test.mutate(&metadata)
+			encoded, err := json.Marshal(standardAuthoringTaskTOMLArtifact{
+				Format: standardAuthoringTaskTOMLArtifactFormat, Version: standardAuthoringModelArtifactVersion,
+				Metadata: metadata, TaskTOML: string(input.TaskTOMLDraft),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			input.TaskTOMLDraft = encoded
+			result, err := CompileStandardAuthoringTaskPackage(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Report.Passed {
+				t.Fatalf("mismatched wrapper scope unexpectedly passed: %+v", result.Report)
+			}
+			assertAdmissionViolationMessage(t, result.Report, "task_metadata", test.field)
+		})
+	}
+}
+
+func TestCompileStandardAuthoringTaskPackageReportsMalformedModelContent(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*StandardAuthoringTaskPackageInput)
+		code        string
+		messagePart string
+	}{
+		{
+			name: "empty instruction",
+			mutate: func(input *StandardAuthoringTaskPackageInput) {
+				input.Instruction = nil
+			},
+			code: "task_instruction", messagePart: "generated instruction",
+		},
+		{
+			name: "invalid task TOML",
+			mutate: func(input *StandardAuthoringTaskPackageInput) {
+				input.TaskTOMLDraft = []byte("{not valid TOML or a wrapper")
+			},
+			code: "task_metadata", messagePart: "valid TOML",
+		},
+		{
+			name: "invalid Dockerfile",
+			mutate: func(input *StandardAuthoringTaskPackageInput) {
+				input.Dockerfile = []byte("FROM docker.io/library/alpine:3.20\n")
+			},
+			code: "environment_isolation", messagePart: "frozen environment policy",
+		},
+		{
+			name: "invalid solution script",
+			mutate: func(input *StandardAuthoringTaskPackageInput) {
+				input.SolveScript = nil
+			},
+			code: "task_layout", messagePart: "generated solution",
+		},
+		{
+			name: "invalid test script",
+			mutate: func(input *StandardAuthoringTaskPackageInput) {
+				input.TestScript = []byte("exit 0\n")
+			},
+			code: "task_layout", messagePart: "generated tests",
+		},
+		{
+			name: "invalid tests analysis",
+			mutate: func(input *StandardAuthoringTaskPackageInput) {
+				input.TestsAnalysis = []byte(`{"provided_information":"\u0000","theoretical_path":"path","passing_evidence":"evidence"}`)
+			},
+			code: "tests_analysis", messagePart: "strict JSON object",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := standardAuthoringTaskPackageFixture(t)
+			test.mutate(&input)
+			result, err := CompileStandardAuthoringTaskPackage(input)
+			if err != nil {
+				t.Fatalf("model-owned content returned infrastructure error: %v", err)
+			}
+			if result.Report.Passed || len(result.CanonicalFiles) != 6 {
+				t.Fatalf("malformed model content result = %+v", result)
+			}
+			assertAdmissionViolationMessage(t, result.Report, test.code, test.messagePart)
+		})
+	}
+}
+
+func TestStandardAuthoringObservedArtifactWrappersAreStrict(t *testing.T) {
+	validTaskTOML := standardAuthoringTaskPackageFixture(t).TaskTOMLDraft
+	tests := []struct {
+		name string
+		raw  []byte
+		read func([]byte) ([]byte, error)
+	}{
+		{name: "instruction unknown field", raw: []byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"task","extra":true}`), read: decodeStandardAuthoringInstructionArtifact},
+		{name: "instruction duplicate field", raw: []byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"first","content":"second"}`), read: decodeStandardAuthoringInstructionArtifact},
+		{name: "instruction trailing value", raw: []byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"task"}{}`), read: decodeStandardAuthoringInstructionArtifact},
+		{name: "instruction empty payload", raw: []byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"  "}`), read: decodeStandardAuthoringInstructionArtifact},
+		{name: "instruction invalid UTF-8", raw: append([]byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"`), 0xff, '"', '}'), read: decodeStandardAuthoringInstructionArtifact},
+		{name: "instruction nested wrapper", raw: []byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"{\"format\":\"harbor.standard-authoring-instruction.v1\",\"version\":\"1\",\"content\":\"task\"}"}`), read: decodeStandardAuthoringInstructionArtifact},
+		{name: "task wrong version", raw: []byte(`{"format":"harbor.artifact.v1","version":"2","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"[metadata]\\n"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
+		{name: "task unknown metadata field", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair","extra":true},"task_toml":"[metadata]\\n"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
+		{name: "task duplicate payload", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"[metadata]\\n","task_toml":"[other]\\n"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
+		{name: "task empty payload", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":""}`), read: decodeStandardAuthoringTaskTOMLArtifact},
+		{name: "task nested wrapper", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"{\"format\":\"harbor.artifact.v1\",\"version\":\"1\",\"metadata\":{\"task_type\":\"feature\",\"application\":\"backend\",\"objective\":\"Other\"},\"task_toml\":\"[metadata]\\ntask_type = \\\"bugfix\\\"\\napplication = \\\"widget\\\"\\n\"}"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := test.read(test.raw); err == nil {
+				t.Fatal("malformed wrapper unexpectedly accepted")
+			}
+		})
+	}
+	if content, err := decodeStandardAuthoringInstructionArtifact([]byte(`{"requirement":"raw JSON instructions remain raw"}`)); err != nil || string(content) != `{"requirement":"raw JSON instructions remain raw"}` {
+		t.Fatalf("raw JSON instruction = %q, %v", content, err)
+	}
+	if content, err := decodeStandardAuthoringTaskTOMLArtifact(validTaskTOML); err != nil || string(content) != string(validTaskTOML) {
+		t.Fatalf("raw task TOML = %q, %v", content, err)
+	}
+}
+
 func standardAuthoringTaskPackageFixture(t *testing.T) StandardAuthoringTaskPackageInput {
 	t.Helper()
 	base, err := workflowadapter.NewStandardAuthoringEnvironmentPolicy("docker.io/library/alpine:3.21@sha256:" + strings.Repeat("a", 64))
@@ -95,6 +252,30 @@ func standardAuthoringTaskPackageFixture(t *testing.T) StandardAuthoringTaskPack
 			ProtectedEnvironmentVariables: []string{"ANTHROPIC_AUTH_TOKEN"},
 		}},
 	}
+}
+
+func standardAuthoringInstructionWrapperFixture(t *testing.T, content []byte) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(standardAuthoringInstructionArtifact{
+		Format: standardAuthoringInstructionArtifactFormat, Version: standardAuthoringModelArtifactVersion, Content: string(content),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func standardAuthoringTaskTOMLWrapperFixture(t *testing.T, content []byte, brief workflowadapter.StandardAuthoringBrief) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(standardAuthoringTaskTOMLArtifact{
+		Format: standardAuthoringTaskTOMLArtifactFormat, Version: standardAuthoringModelArtifactVersion,
+		Metadata: standardAuthoringTaskTOMLArtifactMetadata{TaskType: brief.TaskType, Application: brief.Application, Objective: brief.Objective},
+		TaskTOML: string(content),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func assertAdmissionViolationMessage(t *testing.T, report codeedge.AdmissionReport, code, messagePart string) {
