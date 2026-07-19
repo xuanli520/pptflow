@@ -211,6 +211,78 @@ func TestStandardAuthoringCodexOutputSubmissionCanonicalizesSemanticEquivalentCa
 	}
 }
 
+func TestStandardAuthoringCodexOutputSubmissionCanonicalizesASCIIWhitespaceInBase64(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	content := []byte("artifact bytes that are long enough to wrap")
+	encoded := base64.StdEncoding.EncodeToString(content)
+	spaced := encoded[:5] + " \t\r\n\v\f" + encoded[5:]
+	raw := standardAuthoringCodexTestCandidateWithBase64(t, workflowkit.VerdictPass, spaced)
+
+	stage := standardAuthoringCodexTestStage(1)
+	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+	submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 1, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := submission.beginTurn(1); err != nil {
+		t.Fatal(err)
+	}
+	response, err := submission.dynamicTool().Handler(context.Background(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+	if !receipt.Accepted || len(receipt.Errors) != 0 {
+		t.Fatalf("receipt = %+v, want accepted candidate", receipt)
+	}
+	accepted, found := submission.acceptedResult()
+	if !found || len(accepted.Artifacts) != 1 || string(accepted.Artifacts[0].Content) != string(content) {
+		t.Fatalf("accepted result = %+v, want decoded artifact", accepted)
+	}
+	wantCanonical := standardAuthoringCodexCanonicalSubmission{
+		Format: standardAuthoringCodexCanonicalSubmissionFormat, Version: standardAuthoringCodexCanonicalSubmissionVersion,
+		StageKey: stage.Key, StageVersion: stage.Version, Verdict: workflowkit.VerdictPass,
+		Artifacts: []standardAuthoringCodexCanonicalSubmissionArtifact{{Name: stage.Outputs[0].Name, SchemaVersion: stage.Outputs[0].SchemaVersion, ContentBase64: encoded}},
+	}
+	wantCanonicalBytes, err := json.Marshal(wantCanonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Digest != workflowkit.SHA256Fingerprint(wantCanonicalBytes) {
+		t.Fatalf("digest = %q, want canonical digest %q", receipt.Digest, workflowkit.SHA256Fingerprint(wantCanonicalBytes))
+	}
+}
+
+func TestCanonicalStandardAuthoringCodexBase64RejectsNonCanonicalSpelling(t *testing.T) {
+	t.Parallel()
+	for _, input := range []string{"Zg", "Zh==", "-w==", "Zg==\u00a0"} {
+		if canonical, _, err := canonicalStandardAuthoringCodexBase64(input); err == nil {
+			t.Fatalf("input %q unexpectedly accepted as %q", input, canonical)
+		}
+	}
+}
+
+func standardAuthoringCodexTestCandidateWithBase64(t *testing.T, verdict workflowkit.Verdict, contentBase64 string) json.RawMessage {
+	t.Helper()
+	candidate := struct {
+		Verdict   workflowkit.Verdict `json:"verdict"`
+		Artifacts []struct {
+			ContentBase64 string `json:"content_base64"`
+		} `json:"artifacts"`
+	}{
+		Verdict: verdict,
+		Artifacts: []struct {
+			ContentBase64 string `json:"content_base64"`
+		}{{ContentBase64: contentBase64}},
+	}
+	encoded, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return json.RawMessage(encoded)
+}
+
 func TestStandardAuthoringCodexOutputSubmissionEnforcesFrozenDockerfileEnvironmentPolicy(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)

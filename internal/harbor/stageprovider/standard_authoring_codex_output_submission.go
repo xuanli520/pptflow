@@ -357,13 +357,13 @@ func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflo
 		if part.ContentBase64 == nil {
 			return workflowkit.StageExecutionResult{}, "", "invalid_content_encoding"
 		}
-		content, err := base64.StdEncoding.DecodeString(*part.ContentBase64)
-		if err != nil || base64.StdEncoding.EncodeToString(content) != *part.ContentBase64 {
+		canonicalContentBase64, content, err := canonicalStandardAuthoringCodexBase64(*part.ContentBase64)
+		if err != nil {
 			return workflowkit.StageExecutionResult{}, "", "invalid_content_encoding"
 		}
 		specification := stage.Outputs[index]
 		canonical.Artifacts = append(canonical.Artifacts, standardAuthoringCodexCanonicalSubmissionArtifact{
-			Name: specification.Name, SchemaVersion: specification.SchemaVersion, ContentBase64: *part.ContentBase64,
+			Name: specification.Name, SchemaVersion: specification.SchemaVersion, ContentBase64: canonicalContentBase64,
 		})
 		artifacts = append(artifacts, workflowkit.StageArtifact{
 			Name: specification.Name, SchemaVersion: specification.SchemaVersion, Content: append([]byte(nil), content...), TurnOrdinal: turnOrdinal,
@@ -384,6 +384,32 @@ func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflo
 	return workflowkit.StageExecutionResult{
 		Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: *candidate.Verdict}, Artifacts: artifacts,
 	}, workflowkit.SHA256Fingerprint(canonicalBytes), ""
+}
+
+// canonicalStandardAuthoringCodexBase64 accepts the line-oriented output that
+// common shell tooling emits while keeping the stored identity strict. ASCII
+// whitespace is transport framing, so it is removed before decoding; the
+// decoded bytes must still round-trip to the standard, padded base64 spelling.
+func canonicalStandardAuthoringCodexBase64(input string) (string, []byte, error) {
+	normalized := make([]byte, 0, len(input))
+	for index := 0; index < len(input); index++ {
+		switch input[index] {
+		case ' ', '\t', '\r', '\n', '\v', '\f':
+			continue
+		default:
+			normalized = append(normalized, input[index])
+		}
+	}
+
+	content, err := base64.StdEncoding.DecodeString(string(normalized))
+	if err != nil {
+		return "", nil, err
+	}
+	canonical := base64.StdEncoding.EncodeToString(content)
+	if canonical != string(normalized) {
+		return "", nil, errors.New("base64 content is not canonical")
+	}
+	return canonical, content, nil
 }
 
 func cloneStandardAuthoringCodexStageResult(result workflowkit.StageExecutionResult) workflowkit.StageExecutionResult {
