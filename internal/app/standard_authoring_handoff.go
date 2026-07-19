@@ -345,7 +345,7 @@ func (service *StandardAuthoringHandoffService) Consume(ctx context.Context, req
 		TaskSnapshot:       handoff.TaskSnapshot,
 	})
 	if err != nil {
-		return store.WorkflowRun{}, handoffDefinitionFailure(request, handoffDefinitionInvalidCode, "The controlled CodeEdge Phase-1 definition is invalid.", ErrCodeEdgePhase1DefinitionInvalid)
+		return store.WorkflowRun{}, handoffDefinitionFailure(request, handoffDefinitionInvalidCode, "The controlled CodeEdge Phase-1 definition is invalid.", fmt.Errorf("%w: %v", ErrCodeEdgePhase1DefinitionInvalid, err))
 	}
 	if err := validateCodeEdgePhase1HandoffDefinition(definition, handoff); err != nil {
 		return store.WorkflowRun{}, handoffDefinitionFailure(request, handoffDefinitionInvalidCode, "The controlled CodeEdge Phase-1 definition is invalid.", err)
@@ -409,7 +409,7 @@ func validateExistingAuthoringPhase1Child(child store.WorkflowRun, record store.
 func validateCodeEdgePhase1HandoffDefinition(definition CodeEdgePhase1RunDefinition, handoff workflowadapter.StandardAuthoringTaskHandoff) error {
 	if !definition.Profile.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) ||
 		!definition.ExecutionSpec.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
-		return ErrCodeEdgePhase1DefinitionInvalid
+		return fmt.Errorf("%w: definition templates do not bind the CodeEdge Phase-1 template", ErrCodeEdgePhase1DefinitionInvalid)
 	}
 	selection, err := handoff.ChildSelection()
 	if err != nil {
@@ -417,13 +417,16 @@ func validateCodeEdgePhase1HandoffDefinition(definition CodeEdgePhase1RunDefinit
 	}
 	actualSelection, err := definition.ExecutionSpec.Selection.Canonical()
 	if err != nil || actualSelection != selection {
-		return ErrCodeEdgePhase1DefinitionInvalid
+		if err != nil {
+			return fmt.Errorf("%w: canonicalize definition selection: %v", ErrCodeEdgePhase1DefinitionInvalid, err)
+		}
+		return fmt.Errorf("%w: definition selection differs from the immutable handoff", ErrCodeEdgePhase1DefinitionInvalid)
 	}
 	if err := definition.Profile.Validate(); err != nil {
-		return ErrCodeEdgePhase1DefinitionInvalid
+		return fmt.Errorf("%w: validate definition profile: %v", ErrCodeEdgePhase1DefinitionInvalid, err)
 	}
 	if err := definition.ExecutionSpec.Validate(); err != nil {
-		return ErrCodeEdgePhase1DefinitionInvalid
+		return fmt.Errorf("%w: validate definition execution specification: %v", ErrCodeEdgePhase1DefinitionInvalid, err)
 	}
 	return nil
 }
