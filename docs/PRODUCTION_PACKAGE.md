@@ -35,12 +35,12 @@ sha256sum -c SHA256SUMS
 便于后续人工审计：
 
 ```text
-release_root=/opt/harbor-factory
+release_root=/opt/harbor-factory/2026.07.19.2
 install -d -m 0755 "$release_root"
 tar -xzf harbor-factory-harbor-flow-production.tar.gz -C "$release_root"
 install -m 0644 SHA256SUMS "$release_root/SHA256SUMS"
 cd "$release_root"
-./harbor-factory --root /var/lib/harbor-factory tui
+./harbor-factory --root /var/lib/harbor-factory/2026.07.19.2 tui
 ```
 
 `--root` 指向可变的本地控制面数据目录；它不是部署目录，不能用它替代
@@ -58,8 +58,10 @@ cd "$release_root"
 - 将新二进制与旧 `deployments/` 混用，或只替换其中一部分阶段材料。
 - 通过复制、绑定挂载或符号链接让多个版本共享同一部署树。
 
-升级时，请先退出使用旧版本的进程，在独立目录中完成新包校验，再将新包作为
-完整单元部署。保留旧完整目录用于回退；不要跨版本复用二进制或部署文件。
+升级时，请在独立目录中完成新包校验，并为任何改变 catalog、lock schema、lock
+identity 或 frozen runtime 的包使用新的控制面 `--root`。旧包和旧 root 必须保留到
+其中冻结的 Run 已完成或由原版本明确终止；不得让新包接管 active 旧 Run。只有经
+版本化兼容测试明确允许的发布才可复用既有 root。不要跨版本复用二进制或部署文件。
 
 生产预检故意采用 fail-closed 行为：实际包根缺少完整真实的 `deployments/`、
 部署文件不是普通文件、部署目录不是实际目录，或任何 catalog/lock 绑定不一致
@@ -71,11 +73,12 @@ cd "$release_root"
 从部署根目录启动 TUI：
 
 ```text
-./harbor-factory --root /var/lib/harbor-factory tui
+./harbor-factory --root /var/lib/harbor-factory/2026.07.19.2 tui
 ```
 
 创建标准题目时，在任务看板按 `n`，填写 HTTPS/SSH Git 仓库 URL、完整 40/64 位
-commit、slug、标题与原因。已入队的 Run 会由本地受控 outbox 激活器立即交接给 child
+commit、digest 固定的基础镜像、slug、标题、task type、application、objective 与
+原因。已入队的 Run 会由本地受控 outbox 激活器立即交接给 child
 worker；打开看板、轮询和退出前都会补发尚未启动的 queued Run。外部 provider 的凭据
 只应通过受批准的环境变量和 secret reference 提供，不能写入此生产包或其部署文件。
 

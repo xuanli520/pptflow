@@ -46,6 +46,9 @@ func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
 		BaseImage:      taskBoardAuthoringTestBaseImage,
 		Slug:           "task-board-authoring",
 		Title:          "Task board authoring",
+		TaskType:       "feature",
+		Application:    "backend",
+		Objective:      "Add a bounded task board authoring feature",
 		MetadataJSON:   `{}`,
 		Reason:         "exercise task board authoring launch",
 	})
@@ -114,6 +117,9 @@ func TestTaskBoardServiceRecoversAuthoringRunThroughDedicatedPath(t *testing.T) 
 		BaseImage:                    taskBoardAuthoringTestBaseImage,
 		Slug:                         "task-board-authoring-recovery",
 		Title:                        "Task board authoring recovery",
+		TaskType:                     "feature",
+		Application:                  "backend",
+		Objective:                    "Recover a bounded task board authoring run",
 		MetadataJSON:                 `{}`,
 	})
 	if err != nil {
@@ -315,6 +321,9 @@ func TestTaskBoardServiceReplaysAuthoringLaunchAfterActivationFailure(t *testing
 		BaseImage:      taskBoardAuthoringTestBaseImage,
 		Slug:           "task-board-activation-retry",
 		Title:          "Task board activation retry",
+		TaskType:       "feature",
+		Application:    "backend",
+		Objective:      "Retry a bounded task board authoring launch",
 		MetadataJSON:   `{}`,
 		Reason:         "exercise task board retry",
 	}

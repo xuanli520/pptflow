@@ -135,7 +135,7 @@ func (executor *StandardAuthoringMaterializeExecutor) ExecuteHarborBuiltin(ctx c
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring materializer stage attempt does not match the active frozen Run")
 	}
 
-	inputs, err := standardAuthoringMaterializeInputs(ctx, invocation.Request, *run, subject)
+	inputs, err := standardAuthoringMaterializeInputs(ctx, invocation.Request, *run, subject, executor.admission)
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
@@ -217,7 +217,7 @@ func (executor *StandardAuthoringMaterializeExecutor) executePackageAdmission(ct
 	compiled, err := CompileStandardAuthoringTaskPackage(StandardAuthoringTaskPackageInput{
 		Instruction: inputs.instruction, TaskTOMLDraft: inputs.taskTOML, Dockerfile: inputs.dockerfile,
 		SolveScript: inputs.solveScript, TestScript: inputs.testScript, TestsAnalysis: inputs.testsAnalysis,
-		Source: *subject.AuthoringSource, Environment: inputs.environment, Admission: *executor.admission,
+		Source: *subject.AuthoringSource, Environment: inputs.environment, Brief: inputs.brief, Admission: *executor.admission,
 	})
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("compile Standard authoring task package admission: %w", err)
@@ -243,6 +243,7 @@ func (executor *StandardAuthoringMaterializeExecutor) executePackageAdmission(ct
 type standardAuthoringPackageAdmissionInputSet struct {
 	instruction, taskTOML, dockerfile, solveScript, testScript, testsAnalysis []byte
 	environment                                                               workflowadapter.StandardAuthoringEnvironmentPolicy
+	brief                                                                     *workflowadapter.StandardAuthoringBrief
 }
 
 func standardAuthoringPackageAdmissionInputs(ctx context.Context, request workflowkit.StageExecutionRequest, run store.WorkflowRun) (standardAuthoringPackageAdmissionInputSet, error) {
@@ -298,6 +299,21 @@ func standardAuthoringPackageAdmissionInputs(ctx context.Context, request workfl
 	if err != nil {
 		return result, fmt.Errorf("decode frozen Standard authoring environment policy: %w", err)
 	}
+	if isBriefAwareStandardAuthoringRun(run) {
+		binding, found := bindings[workflowadapter.StandardAuthoringBriefArtifact]
+		if !found || binding.SchemaVersion != workflowadapter.StandardAuthoringBriefSchemaVersion {
+			return result, fmt.Errorf("Standard authoring package admission brief does not match the frozen contract")
+		}
+		briefRaw, readErr := read(workflowadapter.StandardAuthoringBriefArtifact)
+		if readErr != nil {
+			return result, readErr
+		}
+		brief, parseErr := workflowadapter.ParseStandardAuthoringBriefJSON(briefRaw)
+		if parseErr != nil {
+			return result, fmt.Errorf("decode frozen Standard authoring brief: %w", parseErr)
+		}
+		result.brief = &brief
+	}
 	return result, nil
 }
 
@@ -310,10 +326,11 @@ type standardAuthoringMaterializeInputSet struct {
 	testsAnalysis    []byte
 	admissionReceipt []byte
 	environment      workflowadapter.StandardAuthoringEnvironmentPolicy
+	brief            *workflowadapter.StandardAuthoringBrief
 	proposalHash     string
 }
 
-func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit.StageExecutionRequest, run store.WorkflowRun, subject workflowRunSubject) (standardAuthoringMaterializeInputSet, error) {
+func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit.StageExecutionRequest, run store.WorkflowRun, subject workflowRunSubject, admission *codeedge.TaskAdmissionContract) (standardAuthoringMaterializeInputSet, error) {
 	if !isCurrentStandardAuthoringRun(run) {
 		return standardAuthoringMaterializeInputSet{}, fmt.Errorf("Standard authoring materializer Run is not bound to the current template")
 	}
@@ -368,6 +385,27 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 		return result, fmt.Errorf("validate frozen Standard authoring Dockerfile base image: %w", err)
 	}
 	result.environment = environmentPolicy
+	if isBriefAwareStandardAuthoringRun(run) {
+		if admission == nil {
+			return result, fmt.Errorf("Standard authoring admission contract is unavailable for the frozen brief template")
+		}
+		briefRaw, readErr := read(workflowadapter.StandardAuthoringBriefArtifact)
+		if readErr != nil {
+			return result, readErr
+		}
+		brief, parseErr := workflowadapter.ParseStandardAuthoringBriefJSON(briefRaw)
+		if parseErr != nil {
+			return result, fmt.Errorf("decode frozen Standard authoring brief: %w", parseErr)
+		}
+		violations, validateErr := validateStandardAuthoringTaskTOMLBrief(result.taskTOML, admission.Profile.Metadata, brief)
+		if validateErr != nil {
+			return result, fmt.Errorf("validate generated task.toml against frozen Standard authoring brief: %w", validateErr)
+		}
+		if len(violations) != 0 {
+			return result, fmt.Errorf("CodeEdge task admission rejected materialization: %s", admissionViolationSummary(violations))
+		}
+		result.brief = &brief
+	}
 	if result.solveScript, err = read("solve_script"); err != nil {
 		return result, err
 	}
@@ -437,6 +475,9 @@ func standardAuthoringMaterializeInputContract(stage workflowkit.StageDescriptor
 	if expected[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] != workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion {
 		return nil, fmt.Errorf("current Standard authoring environment policy schema is invalid")
 	}
+	if isBriefAwareStandardAuthoringRun(run) && expected[workflowadapter.StandardAuthoringBriefArtifact] != workflowadapter.StandardAuthoringBriefSchemaVersion {
+		return nil, fmt.Errorf("current Standard authoring brief schema is invalid")
+	}
 	return expected, nil
 }
 
@@ -469,7 +510,7 @@ func (executor *StandardAuthoringMaterializeExecutor) materializeNewAuthoringTas
 		compiled, err := CompileStandardAuthoringTaskPackage(StandardAuthoringTaskPackageInput{
 			Instruction: inputs.instruction, TaskTOMLDraft: inputs.taskTOML, Dockerfile: inputs.dockerfile,
 			SolveScript: inputs.solveScript, TestScript: inputs.testScript, TestsAnalysis: inputs.testsAnalysis,
-			Source: *subject.AuthoringSource, Environment: inputs.environment, Admission: *executor.admission,
+			Source: *subject.AuthoringSource, Environment: inputs.environment, Brief: inputs.brief, Admission: *executor.admission,
 		})
 		if err != nil {
 			return store.TaskRevision{}, fmt.Errorf("compile Standard authoring task package: %w", err)
@@ -540,10 +581,13 @@ func verifyStandardAuthoringAdmissionReceipt(request workflowkit.StageExecutionR
 		!receipt.Report.Passed || !reflect.DeepEqual(receipt.Report, report) {
 		return fmt.Errorf("Standard authoring admission receipt does not bind the frozen package")
 	}
-	bindings := make([]workflowkit.ArtifactBinding, 0, 7)
+	bindings := make([]workflowkit.ArtifactBinding, 0, 8)
 	allowed := map[string]struct{}{
 		"instruction": {}, "task_toml": {}, "dockerfile": {}, workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: {},
 		"solve_script": {}, "test_script": {}, "tests_analysis": {},
+	}
+	if isBriefAwareStandardAuthoringRun(run) {
+		allowed[workflowadapter.StandardAuthoringBriefArtifact] = struct{}{}
 	}
 	for _, binding := range request.Inputs {
 		if _, keep := allowed[binding.Name]; keep {
@@ -560,13 +604,19 @@ func verifyStandardAuthoringAdmissionReceipt(request workflowkit.StageExecutionR
 	return nil
 }
 
-// isAdmissionAwareStandardAuthoringRun keeps the materializer's second fence
-// version-scoped. Historical source-session Runs retain the exact frozen 1.2
-// semantics even when a newer production root has also loaded an admission
-// contract for new sessions.
+// isAdmissionAwareStandardAuthoringRun keeps package interpretation
+// version-scoped for fixtures and historical inspection. This release executes
+// only the current 1.4 template; older Runs remain owned by their original
+// deployment and control-plane root.
 func isAdmissionAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
-		run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion
+		(run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion)
+}
+
+func isBriefAwareStandardAuthoringRun(run store.WorkflowRun) bool {
+	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
+		run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion
 }
 
 func materializeInputsFromCanonicalPackage(inputs standardAuthoringMaterializeInputSet, files []codeedge.TaskPackageFile) standardAuthoringMaterializeInputSet {

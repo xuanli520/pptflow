@@ -42,6 +42,15 @@ func TestStandardAuthoringRepoPrepareExecutesLockedGitAndMaterializesFrozenRunSo
 	if err != nil {
 		t.Fatal(err)
 	}
+	preparedRoot := filepath.Join(workspaceRoot, run.ID, stageprovider.StandardAuthoringCodexRunSourceDirectory)
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(preparedRoot, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o755)
+			}
+			return nil
+		})
+	})
 	executor, err := NewStandardAuthoringRepoPrepareExecutor(StandardAuthoringRepoPrepareExecutorConfig{
 		ManagedRoot: root, Store: database, LockedGit: lockedGit, WorkspaceRoot: workspaceRoot,
 	})
@@ -89,7 +98,6 @@ func TestStandardAuthoringRepoPrepareExecutesLockedGitAndMaterializesFrozenRunSo
 		evidence.SourceCommit != source.CommitSHA || evidence.SnapshotDigest != source.SnapshotContentDigest || evidence.GitVersion != "git version "+lockedGit.Version {
 		t.Fatalf("repo_prepare evidence = %+v", evidence)
 	}
-	preparedRoot := filepath.Join(workspaceRoot, run.ID, stageprovider.StandardAuthoringCodexRunSourceDirectory)
 	for name, want := range map[string]string{
 		"Cargo.toml":     "[package]\nname = \"tower-http\"\n",
 		"src/lib.rs":     "pub fn source_fixture() {}\n",
@@ -112,15 +120,49 @@ func TestStandardAuthoringRepoPrepareExecutesLockedGitAndMaterializesFrozenRunSo
 	if err != nil || !bytes.Equal(replayed.Artifacts[0].Content, artifact.Content) {
 		t.Fatalf("repo_prepare replay = %+v, %v", replayed, err)
 	}
+	identity, err := executor.VerifyStandardAuthoringCodexFrozenSource(ctx, request.Execution, preparedRoot)
+	if err != nil || identity != workflowkit.Fingerprint(source.SnapshotContentDigest) {
+		t.Fatalf("verify prepared frozen source identity = %q, %v", identity, err)
+	}
+	for _, modeTamper := range []struct {
+		name string
+		path string
+	}{
+		{name: "source root", path: preparedRoot},
+		{name: "source directory", path: filepath.Join(preparedRoot, "src")},
+		{name: "source file", path: filepath.Join(preparedRoot, "Cargo.toml")},
+	} {
+		info, statErr := os.Stat(modeTamper.path)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		originalMode := info.Mode().Perm()
+		if err := os.Chmod(modeTamper.path, originalMode|0o200); err != nil {
+			t.Fatal(err)
+		}
+		_, replayErr := executor.ExecuteLocalCommand(ctx, invocation, workflowadapter.LocalCommandOperationPayload{CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, Arguments: []string{}})
+		if err := os.Chmod(modeTamper.path, originalMode); err != nil {
+			t.Fatal(err)
+		}
+		if replayErr == nil {
+			t.Fatalf("Standard authoring workspace replay accepted mode-only tampering of %s", modeTamper.name)
+		}
+	}
 
-	// An existing workspace is evidence, not a mutable cache. Tampering is
-	// detected and never silently repaired or reused.
+	// An existing workspace is evidence, not a mutable cache. Restoring only
+	// the read-only mode after writing different bytes must not hide tampering.
 	tampered := filepath.Join(preparedRoot, "src", "lib.rs")
 	if err := os.Chmod(tampered, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(tampered, []byte("tampered\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Chmod(tampered, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executor.VerifyStandardAuthoringCodexFrozenSource(ctx, request.Execution, preparedRoot); err == nil {
+		t.Fatal("frozen source verifier accepted content tampering after mode restoration")
 	}
 	if _, err := executor.ExecuteLocalCommand(ctx, invocation, workflowadapter.LocalCommandOperationPayload{CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, Arguments: []string{}}); err == nil {
 		t.Fatal("tampered Standard authoring workspace was accepted")
@@ -150,6 +192,104 @@ func TestStandardAuthoringRepoPrepareRejectsCommandOrSubjectDriftBeforeSideEffec
 	}
 }
 
+func TestVerifyStandardAuthoringExtractedSnapshotRejectsPathTypeModeAndContentDrift(t *testing.T) {
+	ctx := context.Background()
+	snapshot := standardAuthoringRepoPrepareArchive(t)
+	prepare := func(t *testing.T) string {
+		t.Helper()
+		workspace := t.TempDir()
+		if err := extractStandardAuthoringSourceSnapshot(ctx, snapshot, workspace, standardAuthoringLaunchTestCoordinate); err != nil {
+			t.Fatal(err)
+		}
+		sourceRoot := filepath.Join(workspace, stageprovider.StandardAuthoringCodexRunSourceDirectory)
+		t.Cleanup(func() {
+			_ = filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+				if walkErr == nil && entry.IsDir() {
+					_ = os.Chmod(path, 0o755)
+				}
+				return nil
+			})
+		})
+		if err := markStandardAuthoringSourceReadOnly(sourceRoot); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyStandardAuthoringExtractedSnapshot(ctx, snapshot, sourceRoot, standardAuthoringLaunchTestCoordinate); err != nil {
+			t.Fatalf("verify normal extracted snapshot: %v", err)
+		}
+		return sourceRoot
+	}
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{
+			name: "unexpected path",
+			mutate: func(t *testing.T, root string) {
+				if err := os.Chmod(root, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "unexpected.txt"), []byte("unexpected\n"), 0o444); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(root, 0o555); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "file replaced by directory",
+			mutate: func(t *testing.T, root string) {
+				parent := filepath.Join(root, "src")
+				target := filepath.Join(parent, "lib.rs")
+				if err := os.Chmod(parent, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(target); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(target, 0o555); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(parent, 0o555); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "mode changed",
+			mutate: func(t *testing.T, root string) {
+				if err := os.Chmod(filepath.Join(root, "Cargo.toml"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "content changed with mode restored",
+			mutate: func(t *testing.T, root string) {
+				target := filepath.Join(root, "Cargo.toml")
+				if err := os.Chmod(target, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target, []byte("tampered\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(target, 0o444); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			sourceRoot := prepare(t)
+			testCase.mutate(t, sourceRoot)
+			if err := verifyStandardAuthoringExtractedSnapshot(ctx, snapshot, sourceRoot, standardAuthoringLaunchTestCoordinate); err == nil {
+				t.Fatal("mutated extracted snapshot was accepted")
+			}
+		})
+	}
+}
+
 func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, database *store.Store, object workflowruntime.ObjectRef) (store.AuthoringSource, store.TaskV2, store.AuthoringSession, store.WorkflowRun, store.StageAttempt) {
 	t.Helper()
 	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
@@ -169,7 +309,7 @@ func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, data
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringWorkflowTemplateVersion, SessionManifestJSON: `{"format":"fixture"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringBriefTemplateVersion, SessionManifestJSON: `{"format":"fixture"}`,
 		IdempotencyKey: "repo-prepare-session", Actor: "author", Reason: "freeze source session",
 	})
 	if err != nil {

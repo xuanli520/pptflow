@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"image"
 	"os"
 	"path/filepath"
@@ -51,7 +52,8 @@ func TestHarborEvaluatorLocalCommandExecutorRunsFrozenQwenAndReturnsTrustedEvide
 		t.Fatal("fake Harbor runner was not called")
 	}
 	assertFixedEvaluatorArgs(t, runner.command.Args, "qwen3.7-max", "2.1.207")
-	if got := runner.command.Env; len(got) != 3 || !contains(got, "LANG=C.UTF-8") || !containsPrefix(got, "HOME=") || !containsPrefix(got, "PATH=") {
+	wantDockerPATH := executor.invocations[stageprovider.HarborEvaluatorQwenCommandID].DockerPATH
+	if got := runner.command.Env; len(got) != 4 || !contains(got, "LANG=C.UTF-8") || !containsPrefix(got, "HOME=") || !containsPrefix(got, "DOCKER_CONFIG=") || !contains(got, "PATH="+wantDockerPATH) {
 		t.Fatalf("Harbor process environment = %#v, want only isolated non-secret base keys", got)
 	}
 	if strings.Contains(strings.Join(runner.command.Args, " "), "--agent-env") || strings.Contains(strings.Join(runner.command.Args, " "), "ANTHROPIC_AUTH_TOKEN") {
@@ -321,6 +323,74 @@ func TestHarborEvaluatorLocalCommandExecutorRejectsObservedAgentVersionDrift(t *
 	}
 }
 
+func TestHarborEvaluatorLocalCommandExecutorRejectsPrelaunchDriftBeforeCredentialLookup(t *testing.T) {
+	taskRoot := evaluatorTestTask(t)
+	digest, err := taskpolicy.ComputeManagedTaskDigestV2(taskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := evaluatorTestSnapshotZIP(t, taskRoot)
+	environment := map[string]string{
+		"ANTHROPIC_AUTH_TOKEN": "unit-token",
+		"QWEN_HARBOR_BASE_URL": "https://qwen.example.test/anthropic",
+		"OPUS_HARBOR_BASE_URL": "https://opus.example.test/anthropic",
+	}
+	runner := &evaluatorFakeRunner{t: t}
+	executor := evaluatorTestExecutor(t, environment, runner)
+	prelaunch := &evaluatorFakePrelaunchAttestor{t: t, runner: runner, err: errors.New("runtime drift")}
+	executor.prelaunchAttestor = prelaunch
+	credentialLookups := 0
+	lookup := executor.lookupEnv
+	executor.lookupEnv = func(key string) (string, bool) {
+		credentialLookups++
+		return lookup(key)
+	}
+	request := evaluatorTestRequest(snapshot, workflowkit.SubjectDigest(digest), workflowadapter.HarborRunQwen, "run-prelaunch-drift", "attempt-prelaunch-drift")
+	_, err = executor.ExecuteLocalCommand(context.Background(), stageprovider.StageOperationInvocation{Request: request}, workflowadapter.LocalCommandOperationPayload{CommandID: stageprovider.HarborEvaluatorQwenCommandID})
+	if err == nil || !strings.Contains(err.Error(), "immediately before launch") {
+		t.Fatalf("prelaunch drift error = %v, want launch-time attestation rejection", err)
+	}
+	if prelaunch.calls != 1 || runner.ran || credentialLookups != 0 {
+		t.Fatalf("prelaunch rejection calls=%d runner=%t credential_lookups=%d", prelaunch.calls, runner.ran, credentialLookups)
+	}
+}
+
+func TestHarborEvaluatorLocalCommandExecutorRejectsDriftAfterCredentialMaterializationBeforeRunner(t *testing.T) {
+	taskRoot := evaluatorTestTask(t)
+	digest, err := taskpolicy.ComputeManagedTaskDigestV2(taskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := evaluatorTestSnapshotZIP(t, taskRoot)
+	environment := map[string]string{
+		"ANTHROPIC_AUTH_TOKEN": "unit-token",
+		"QWEN_HARBOR_BASE_URL": "https://qwen.example.test/anthropic",
+		"OPUS_HARBOR_BASE_URL": "https://opus.example.test/anthropic",
+	}
+	runner := &evaluatorFakeRunner{t: t}
+	executor := evaluatorTestExecutor(t, environment, runner)
+	prelaunch := &evaluatorFakePrelaunchAttestor{t: t, runner: runner, err: errors.New("late runtime drift"), failOnCall: 2}
+	executor.prelaunchAttestor = prelaunch
+	credentialLookups := 0
+	lookup := executor.lookupEnv
+	executor.lookupEnv = func(key string) (string, bool) {
+		credentialLookups++
+		return lookup(key)
+	}
+	request := evaluatorTestRequest(snapshot, workflowkit.SubjectDigest(digest), workflowadapter.HarborRunQwen, "run-late-prelaunch-drift", "attempt-late-prelaunch-drift")
+	_, err = executor.ExecuteLocalCommand(context.Background(), stageprovider.StageOperationInvocation{Request: request}, workflowadapter.LocalCommandOperationPayload{CommandID: stageprovider.HarborEvaluatorQwenCommandID})
+	if err == nil || !strings.Contains(err.Error(), "immediately before process start") {
+		t.Fatalf("late prelaunch drift error = %v, want final launch-time attestation rejection", err)
+	}
+	if prelaunch.calls != 2 || runner.ran || credentialLookups == 0 {
+		t.Fatalf("late prelaunch rejection calls=%d runner=%t credential_lookups=%d", prelaunch.calls, runner.ran, credentialLookups)
+	}
+	workspace := filepath.Join(executor.root, request.Execution.ID, "external-evaluators", string(request.Claim.Stage.StageAttempt.ID), "initial")
+	if _, statErr := os.Stat(filepath.Join(workspace, "harbor.env")); !os.IsNotExist(statErr) {
+		t.Fatalf("temporary credential file remains after final prelaunch rejection: %v", statErr)
+	}
+}
+
 func TestHarborEvaluatorLocalCommandExecutorObservesCompletedJobWithoutRerun(t *testing.T) {
 	taskRoot := evaluatorTestTask(t)
 	digest, err := taskpolicy.ComputeManagedTaskDigestV2(taskRoot)
@@ -386,6 +456,72 @@ func TestHarborEvaluatorLocalCommandExecutorRejectsHubCredentialMapping(t *testi
 	}
 }
 
+func TestHarborEvaluatorLocalCommandExecutorRejectsUnboundDockerCLI(t *testing.T) {
+	environment := map[string]string{
+		"ANTHROPIC_AUTH_TOKEN": "unit-token",
+		"QWEN_HARBOR_BASE_URL": "https://qwen.example.test/anthropic",
+		"OPUS_HARBOR_BASE_URL": "https://opus.example.test/anthropic",
+	}
+	executor := evaluatorTestExecutor(t, environment, &evaluatorFakeRunner{t: t})
+	invocation := executor.invocations[stageprovider.HarborEvaluatorQwenCommandID].Clone()
+
+	invocation.DockerCLIPath = "docker"
+	if err := validateInvocation(invocation); err == nil {
+		t.Fatal("relative Docker CLI path was accepted")
+	}
+
+	invocation.DockerCLIPath = "/locked/docker/bin/docker"
+	invocation.DockerVersion = "29.4.1"
+	if err := validateInvocation(invocation); err == nil {
+		t.Fatal("drifted Docker CLI version was accepted")
+	}
+
+	invocation.DockerCLIPath = "/locked/docker/bin/not-docker"
+	invocation.DockerVersion = stageprovider.HarborEvaluatorDockerVersion
+	if err := validateInvocation(invocation); err == nil {
+		t.Fatal("Docker CLI with a non-docker basename was accepted")
+	}
+
+	invocation.DockerCLIPath = "/locked/docker:shadow/bin/docker"
+	invocation.DockerVersion = stageprovider.HarborEvaluatorDockerVersion
+	if err := validateInvocation(invocation); err == nil {
+		t.Fatal("Docker CLI path containing a PATH separator was accepted")
+	}
+
+	invocation = executor.invocations[stageprovider.HarborEvaluatorQwenCommandID].Clone()
+	invocation.DockerPATH = "/usr/bin:/bin"
+	if err := validateInvocation(invocation); err == nil {
+		t.Fatal("Docker PATH not derived from the locked CLI was accepted")
+	}
+
+	invocation = executor.invocations[stageprovider.HarborEvaluatorQwenCommandID].Clone()
+	invocation.DockerComposePluginPath = "/locked/docker/cli-plugins/compose"
+	if err := validateInvocation(invocation); err == nil {
+		t.Fatal("Compose plugin with a non-docker-compose basename was accepted")
+	}
+
+	for name, mutate := range map[string]func(*stageprovider.HarborEvaluatorInvocation){
+		"missing launcher version":           func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.LauncherVersion = "" },
+		"relative Python interpreter":        func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.PythonInterpreterPath = "python" },
+		"missing Python interpreter version": func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.PythonInterpreterVersion = "" },
+		"missing Python interpreter digest": func(candidate *stageprovider.HarborEvaluatorInvocation) {
+			candidate.PythonInterpreterContentSHA256 = ""
+		},
+		"relative Python source tree": func(candidate *stageprovider.HarborEvaluatorInvocation) {
+			candidate.PythonSourceTreePath = "site-packages/harbor"
+		},
+		"missing Python source digest": func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.PythonSourceFilesSHA256 = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := executor.invocations[stageprovider.HarborEvaluatorQwenCommandID].Clone()
+			mutate(&candidate)
+			if err := validateInvocation(candidate); err == nil {
+				t.Fatalf("invalid Python/launcher runtime identity was accepted: %+v", candidate)
+			}
+		})
+	}
+}
+
 type evaluatorFakeRunner struct {
 	t              *testing.T
 	expectedDigest workflowkit.SubjectDigest
@@ -399,6 +535,37 @@ type evaluatorFakeRunner struct {
 	envFile        string
 	jobsRoot       string
 	stdout         []byte
+}
+
+type evaluatorFakePrelaunchAttestor struct {
+	t          *testing.T
+	runner     CommandRunner
+	err        error
+	failOnCall int
+	calls      int
+}
+
+func (attestor *evaluatorFakePrelaunchAttestor) AttestHarborEvaluatorInvocationBeforeLaunch(_ context.Context, invocation stageprovider.HarborEvaluatorInvocation, home string) ([]string, error) {
+	attestor.t.Helper()
+	attestor.calls++
+	if fake, ok := attestor.runner.(*evaluatorFakeRunner); ok && fake.ran {
+		attestor.t.Fatal("prelaunch attestation ran after the Harbor command")
+	}
+	if attestor.err != nil && (attestor.failOnCall == 0 || attestor.calls == attestor.failOnCall) {
+		return nil, attestor.err
+	}
+	for _, directory := range []string{home, filepath.Join(home, ".docker")} {
+		info, err := os.Lstat(directory)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			attestor.t.Fatalf("prelaunch directory %q is invalid: %v", directory, err)
+		}
+	}
+	return []string{
+		"DOCKER_CONFIG=" + filepath.Join(home, ".docker"),
+		"HOME=" + home,
+		"LANG=C.UTF-8",
+		"PATH=" + invocation.DockerPATH,
+	}, nil
 }
 
 func (runner *evaluatorFakeRunner) Run(_ context.Context, command Command) (CommandResult, error) {
@@ -436,9 +603,47 @@ func evaluatorTestExecutor(t *testing.T, environment map[string]string, runner C
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	launcherPath := filepath.Join(runtimeRoot, "bin", "harbor")
+	pythonPath := filepath.Join(runtimeRoot, "bin", "python")
+	sourceTreePath := filepath.Join(runtimeRoot, "site-packages", "harbor")
+	dockerPath := filepath.Join(runtimeRoot, "bin", "docker")
+	composePath := filepath.Join(runtimeRoot, "libexec", "docker", "cli-plugins", "docker-compose")
+	buildxPath := filepath.Join(runtimeRoot, "libexec", "docker", "cli-plugins", "docker-buildx")
+	launcherContents := []byte("#!/bin/sh\nexit 0\n# locked Harbor launcher fixture\n")
+	pythonContents := []byte("#!/bin/sh\nexit 0\n# locked Python fixture\n")
+	sourceContents := []byte("VERSION = '0.18.0'\n")
+	dockerContents := []byte("#!/bin/sh\nexit 0\n# locked Docker CLI fixture\n")
+	composeContents := []byte("#!/bin/sh\nexit 0\n# locked Docker Compose fixture\n")
+	buildxContents := []byte("#!/bin/sh\nexit 0\n# locked Docker Buildx fixture\n")
+	for path, contents := range map[string][]byte{
+		launcherPath: launcherContents,
+		pythonPath:   pythonContents,
+		filepath.Join(sourceTreePath, "__init__.py"): sourceContents,
+		dockerPath:  dockerContents,
+		composePath: composeContents,
+		buildxPath:  buildxContents,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, contents, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	makeInvocation := func(commandID, model, endpointName string, fingerprint workflowkit.Fingerprint) stageprovider.HarborEvaluatorInvocation {
+		dockerPATH, err := stageprovider.HarborEvaluatorDockerPATH(dockerPath)
+		if err != nil {
+			t.Fatal(err)
+		}
 		return stageprovider.HarborEvaluatorInvocation{
-			CommandID: commandID, LauncherPath: "/locked/harbor", LauncherContentSHA256: workflowkit.SHA256Fingerprint([]byte("locked-harbor")),
+			CommandID: commandID, LauncherPath: launcherPath, LauncherVersion: "0.18.0-test", LauncherContentSHA256: workflowkit.SHA256Fingerprint(launcherContents),
+			PythonInterpreterPath: pythonPath, PythonInterpreterVersion: "3.13.5", PythonInterpreterContentSHA256: workflowkit.SHA256Fingerprint(pythonContents),
+			PythonSourceTreePath: sourceTreePath, PythonSourceFilesSHA256: workflowkit.SHA256Fingerprint(sourceContents),
+			DockerCLIPath: dockerPath, DockerCLIContentSHA256: workflowkit.SHA256Fingerprint(dockerContents), DockerPATH: dockerPATH,
+			DockerVersion: stageprovider.HarborEvaluatorDockerVersion, DockerServerVersion: stageprovider.HarborEvaluatorDockerServerVersion,
+			DockerComposePluginPath: composePath, DockerComposeContentSHA256: workflowkit.SHA256Fingerprint(composeContents), DockerComposeVersion: stageprovider.HarborEvaluatorDockerComposeVersion, DockerComposeVersionOutput: stageprovider.HarborEvaluatorDockerComposeVersionOutput,
+			DockerBuildxPluginPath: buildxPath, DockerBuildxContentSHA256: workflowkit.SHA256Fingerprint(buildxContents), DockerBuildxVersion: stageprovider.HarborEvaluatorDockerBuildxVersion, DockerBuildxVersionOutput: stageprovider.HarborEvaluatorDockerBuildxVersionOutput,
 			HarborVersion: stageprovider.HarborEvaluatorHarborVersion, ResultABIFormat: stageprovider.HarborEvaluatorResultABIFormat, ResultABIVersion: stageprovider.HarborEvaluatorResultABIVersion,
 			TaskArtifactPort: stageprovider.HarborEvaluatorTaskArtifactPort, TaskArtifactSchema: stageprovider.HarborEvaluatorTaskArtifactSchema,
 			AgentID: "claude-code", AgentVersion: "2.1.207", ModelID: model, ModelVersion: "frozen",
@@ -454,8 +659,9 @@ func evaluatorTestExecutor(t *testing.T, environment map[string]string, runner C
 			makeInvocation(stageprovider.HarborEvaluatorQwenCommandID, "qwen3.7-max", "QWEN_HARBOR_BASE_URL", qwenEndpoint),
 			makeInvocation(stageprovider.HarborEvaluatorOpusCommandID, "claude-opus-4-6", "OPUS_HARBOR_BASE_URL", opusEndpoint),
 		},
-		LookupEnv: func(key string) (string, bool) { value, found := environment[key]; return value, found },
-		Runner:    runner,
+		LookupEnv:         func(key string) (string, bool) { value, found := environment[key]; return value, found },
+		PrelaunchAttestor: &evaluatorFakePrelaunchAttestor{t: t, runner: runner},
+		Runner:            runner,
 	})
 	if err != nil {
 		t.Fatal(err)

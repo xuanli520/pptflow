@@ -20,6 +20,11 @@ const (
 	// prevents a new production binary from reinterpreting a frozen legacy Run.
 	StandardAuthoringTaskAdmissionTemplateVersion = "1.3.0"
 
+	// StandardAuthoringBriefTemplateVersion adds the immutable authoring_brief
+	// input while preserving the exact 1.2.0 and 1.3.0 templates for historical
+	// parsing and recovery.
+	StandardAuthoringBriefTemplateVersion = "1.4.0"
+
 	standardAuthoringCatalogID      = "harbor.standard-authoring-stage-catalog"
 	standardAuthoringCatalogVersion = "1.2.0"
 
@@ -73,11 +78,16 @@ func StandardAuthoringTaskAdmissionTemplateReference() TemplateReference {
 	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringTaskAdmissionTemplateVersion}
 }
 
+func StandardAuthoringBriefTemplateReference() TemplateReference {
+	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringBriefTemplateVersion}
+}
+
 // IsStandardAuthoringWorkflowTemplate reports whether a Run is bound to the
 // immutable-source authoring half of the lifecycle.
 func IsStandardAuthoringWorkflowTemplate(reference TemplateReference) bool {
 	return reference.Equal(StandardAuthoringTemplateReference()) ||
-		reference.Equal(StandardAuthoringTaskAdmissionTemplateReference())
+		reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()) ||
+		reference.Equal(StandardAuthoringBriefTemplateReference())
 }
 
 // StandardAuthoringStageOrder returns the dependency-aware closed stage list.
@@ -105,6 +115,8 @@ func StandardAuthoringStageOrderForTemplate(reference TemplateReference) ([]work
 	case reference.Equal(StandardAuthoringTemplateReference()):
 		return StandardAuthoringStageOrder(), nil
 	case reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()):
+		return StandardAuthoringTaskAdmissionStageOrder(), nil
+	case reference.Equal(StandardAuthoringBriefTemplateReference()):
 		return StandardAuthoringTaskAdmissionStageOrder(), nil
 	default:
 		return nil, fmt.Errorf("Standard authoring template %s@%s is not installed", reference.ID, reference.Version)
@@ -166,6 +178,26 @@ func StandardAuthoringTaskAdmissionWorkflowTemplate() WorkflowTemplate {
 	return WorkflowTemplate{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringTaskAdmissionTemplateVersion, Catalog: StandardAuthoringTaskAdmissionStageCatalog(), QuotaPolicy: StandardAuthoringTaskAdmissionQuotaPolicy()}
 }
 
+// StandardAuthoringBriefWorkflowTemplate is the production authoring contract.
+// It keeps the 1.3.0 admission topology and adds only the frozen brief input.
+func StandardAuthoringBriefWorkflowTemplate() WorkflowTemplate {
+	return WorkflowTemplate{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringBriefTemplateVersion, Catalog: StandardAuthoringBriefStageCatalog(), QuotaPolicy: StandardAuthoringBriefQuotaPolicy()}
+}
+
+func StandardAuthoringBriefStageCatalog() StageCatalog {
+	base := StandardAuthoringTaskAdmissionStageCatalog()
+	stages := make([]StageDefinition, 0, len(base.Stages))
+	for _, definition := range base.Stages {
+		definition = definition.Clone()
+		if standardAuthoringStageUsesBrief(definition.Key) {
+			definition.Inputs = append(definition.Inputs, standardAuthoringBriefInput().spec)
+			definition.ReadSet = append(definition.ReadSet, resourceAuthoringBrief)
+		}
+		stages = append(stages, definition)
+	}
+	return StageCatalog{Template: StandardAuthoringBriefTemplateReference(), ID: standardAuthoringCatalogID, Version: StandardAuthoringBriefTemplateVersion, Stages: stages}
+}
+
 func StandardAuthoringTaskAdmissionStageCatalog() StageCatalog {
 	base := StandardAuthoringStageCatalog()
 	stages := make([]StageDefinition, 0, len(base.Stages)+1)
@@ -196,6 +228,8 @@ func StandardAuthoringTaskHandoffSchemaForTemplate(reference TemplateReference) 
 	case reference.Equal(StandardAuthoringTemplateReference()):
 		return StandardAuthoringTaskHandoffSchemaVersion, nil
 	case reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()):
+		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
+	case reference.Equal(StandardAuthoringBriefTemplateReference()):
 		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
 	default:
 		return "", fmt.Errorf("Standard authoring handoff schema has no template %s@%s", reference.ID, reference.Version)
@@ -250,4 +284,19 @@ func standardAuthoringStageUsesEnvironmentPolicy(key workflowkit.StageKey) bool 
 
 func standardAuthoringEnvironmentPolicyInput() stageArtifact {
 	return artifactInputWithSchema(StandardAuthoringEnvironmentPolicyArtifact, StandardAuthoringEnvironmentPolicySchemaVersion)
+}
+
+func standardAuthoringStageUsesBrief(key workflowkit.StageKey) bool {
+	switch key {
+	case workflowkit.StageKey(RepoAnalyze), workflowkit.StageKey(TaskDesign), workflowkit.StageKey(GenerateTaskFiles),
+		workflowkit.StageKey(TaskTOMLGen), workflowkit.StageKey(ContentReview), workflowkit.StageKey(CodeEdgePackageAdmission),
+		workflowkit.StageKey(MaterializeTask):
+		return true
+	default:
+		return false
+	}
+}
+
+func standardAuthoringBriefInput() stageArtifact {
+	return artifactInputWithSchema(StandardAuthoringBriefArtifact, StandardAuthoringBriefSchemaVersion)
 }

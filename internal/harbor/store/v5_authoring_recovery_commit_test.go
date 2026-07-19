@@ -116,6 +116,22 @@ func TestAuthoringPhase1HandoffRequiresCurrentAuthoringParent(t *testing.T) {
 	}
 }
 
+func TestAuthoringPhase1HandoffAcceptsBriefTemplateParent(t *testing.T) {
+	ctx := context.Background()
+	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringBriefParentTemplateVersion)
+	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
+	if err != nil {
+		t.Fatalf("prepare brief-template authoring handoff: %v", err)
+	}
+	child, err := createAuthoringPhase1ChildRun(t, ctx, fixture, handoff, codeEdgePhase1ChildTemplateVersion, standardAuthoringChildTrigger)
+	if err != nil {
+		t.Fatalf("create CodeEdge child for brief-template authoring parent: %v", err)
+	}
+	if child.ParentRunID != fixture.run.ID || child.WorkflowTemplateID != codeEdgePhase1ChildTemplateID || child.WorkflowTemplateVersion != codeEdgePhase1ChildTemplateVersion {
+		t.Fatalf("created child = %+v", child)
+	}
+}
+
 func TestAuthoringPhase1HandoffRejectsRetiredAuthoringParent(t *testing.T) {
 	ctx := context.Background()
 	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, "1.0.0")
@@ -204,6 +220,10 @@ func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fi
 
 func prepareAuthoringRecoveryPhase1HandoffResult(t *testing.T, ctx context.Context, fixture authoringRecoveryCommitFixture) (AuthoringPhase1Handoff, error) {
 	t.Helper()
+	handoffSchemaVersion := "harbor.authoring-task-handoff.v1"
+	if fixture.run.WorkflowTemplateVersion == standardAuthoringTaskAdmissionParentTemplateVersion || fixture.run.WorkflowTemplateVersion == standardAuthoringBriefParentTemplateVersion {
+		handoffSchemaVersion = "harbor.authoring-task-handoff.v2"
+	}
 	inputFingerprint := string(workflowkit.SHA256Fingerprint([]byte("authoring recovery handoff inputs")))
 	attempt, err := fixture.store.CreateStageAttempt(ctx, CreateStageAttemptRequest{
 		RunID: fixture.run.ID, StageKey: "materialize_task", StageGroup: "task_generation", Ordinal: 1,
@@ -232,7 +252,7 @@ func prepareAuthoringRecoveryPhase1HandoffResult(t *testing.T, ctx context.Conte
 	}
 	artifact, err := fixture.store.CreateArtifactRef(ctx, CreateArtifactRefRequest{
 		ManifestID: manifest.ID, ArtifactKey: "authoring_task_handoff", ContentDigest: string(workflowkit.SHA256Fingerprint([]byte("authoring recovery handoff artifact"))),
-		SchemaVersion: "harbor.authoring-task-handoff.v1", RunID: fixture.run.ID, StageKey: "materialize_task", AttemptID: attempt.ID, TurnOrdinal: 0,
+		SchemaVersion: handoffSchemaVersion, RunID: fixture.run.ID, StageKey: "materialize_task", AttemptID: attempt.ID, TurnOrdinal: 0,
 		SubjectRevisionID: fixture.session.ID, SubjectDigest: fixture.source.SnapshotContentDigest, WorkflowFingerprint: fixture.run.DefinitionHash,
 		InputBindingsJSON: `[]`, InputFingerprint: inputFingerprint, ProducerVersion: "test",
 		IdempotencyKey: "authoring-recovery-handoff-artifact-" + fixture.run.ID,

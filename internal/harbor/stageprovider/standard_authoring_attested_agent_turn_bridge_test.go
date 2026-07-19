@@ -46,7 +46,7 @@ func TestStandardAuthoringAttestedAgentTurnBridgeFromDeploymentLoadsFrozenAssets
 	runtimes := []agent.Runtime{firstRuntime, secondRuntime}
 	runtimeFactoryCalls := 0
 	bridge, err := NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(StandardAuthoringAttestedAgentTurnBridgeDeploymentConfig{
-		Verifier: verifier, Attestor: attestor, WorkspaceRoot: t.TempDir(),
+		Verifier: verifier, Attestor: attestor, WorkspaceRoot: standardAuthoringCodexReadOnlyTestWorkspace(t),
 		RuntimeFactory: func(received CodexAppServerInvocation) agent.Runtime {
 			if received != attestor.invocations[runtimeFactoryCalls] {
 				t.Fatalf("runtime invocation = %+v, want attested invocation %+v", received, attestor.invocations[runtimeFactoryCalls])
@@ -190,7 +190,7 @@ func TestStandardAuthoringAttestedAgentTurnBridgeReattestsAndRebuildsRuntimePerE
 	runtimes := []agent.Runtime{firstRuntime, secondRuntime}
 	createdFor := []CodexAppServerInvocation{}
 	bridge, err := NewStandardAuthoringAttestedAgentTurnBridge(StandardAuthoringAttestedAgentTurnBridgeConfig{
-		Verifier: verifier, Attestor: attestor, WorkspaceRoot: t.TempDir(),
+		Verifier: verifier, Attestor: attestor, WorkspaceRoot: standardAuthoringCodexReadOnlyTestWorkspace(t),
 		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program},
 		RuntimeFactory: func(invocation CodexAppServerInvocation) agent.Runtime {
 			createdFor = append(createdFor, invocation)

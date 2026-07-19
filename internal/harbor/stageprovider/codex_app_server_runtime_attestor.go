@@ -21,8 +21,8 @@ const (
 	// attestation used when a generic agent.turn is deliberately implemented
 	// by the local Codex App Server. It is a deployment-lock extension, not a
 	// generic agent payload or a mutable provider configuration map.
-	CodexAppServerOperationLockFormat  = "harbor.codex-app-server-operation.v1"
-	CodexAppServerOperationLockVersion = "1"
+	CodexAppServerOperationLockFormat  = "harbor.codex-app-server-operation.v2"
+	CodexAppServerOperationLockVersion = "2"
 
 	// The command IDs distinguish the two independently pinned filesystem
 	// objects. The Codex npm shim may be a symbolic link; production locks
@@ -39,11 +39,12 @@ const (
 	CodexAppServerProductionModelID         = "gpt-5.6-terra"
 	CodexAppServerProductionReasoningEffort = workflowadapter.AgentReasoningEffortXHigh
 
-	// The selected production profile permits edits only inside the controlled
-	// workspace and never gives the App Server network access. A future policy
-	// needs a new typed lock revision rather than a permissive string value.
-	CodexAppServerSandboxModeWorkspaceWrite   = "workspace-write"
-	CodexAppServerSandboxPolicyWorkspaceWrite = "workspaceWrite"
+	// Standard Authoring produces artifacts only through its private dynamic
+	// submission tool. The source checkout is evidence, not an edit target, so
+	// the locked App Server policy exposes no writable filesystem root and no
+	// network access. A future writable policy needs a new typed lock revision.
+	CodexAppServerSandboxModeReadOnly   = "read-only"
+	CodexAppServerSandboxPolicyReadOnly = "readOnly"
 
 	codexAppServerProbeTimeout         = 15 * time.Second
 	codexAppServerProbeOutputLimit     = 64 * 1024
@@ -122,11 +123,11 @@ func (lock CodexAppServerOperationLock) Validate() error {
 	if err := validateCodexAppServerCLIVersionOutput(lock.CLIVersionOutput, lock.JavaScriptLauncher.Version); err != nil {
 		return err
 	}
-	if lock.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite {
-		return fmt.Errorf("%w: Codex sandbox mode must be %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerSandboxModeWorkspaceWrite)
+	if lock.SandboxMode != CodexAppServerSandboxModeReadOnly {
+		return fmt.Errorf("%w: Codex sandbox mode must be %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerSandboxModeReadOnly)
 	}
-	if lock.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite {
-		return fmt.Errorf("%w: Codex sandbox policy must be %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerSandboxPolicyWorkspaceWrite)
+	if lock.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly {
+		return fmt.Errorf("%w: Codex sandbox policy must be %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerSandboxPolicyReadOnly)
 	}
 	if lock.NetworkAccess {
 		return fmt.Errorf("%w: Codex App Server network access must be disabled", ErrInvalidDeploymentOperationCatalogLock)

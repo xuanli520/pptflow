@@ -26,12 +26,12 @@ const (
 	// DeploymentOperationCatalogLockVersion is deliberately strict. A schema
 	// change must use a new format/version instead of accepting a partial old
 	// document as though it were an attestation.
-	DeploymentOperationCatalogLockVersion = "2"
+	DeploymentOperationCatalogLockVersion = "3"
 
 	// DeploymentOperationCatalogLockFingerprintDomain separates a lock's
 	// content identity from both a catalog fingerprint and ordinary artifact
 	// content digests.
-	DeploymentOperationCatalogLockFingerprintDomain = "harbor.stageprovider.operation-catalog-lock.v2"
+	DeploymentOperationCatalogLockFingerprintDomain = "harbor.stageprovider.operation-catalog-lock.v3"
 
 	// StandardAuthoringSSHTransportLockFormat and Version identify the
 	// deployment-owned SSH acquisition contract used before a Standard

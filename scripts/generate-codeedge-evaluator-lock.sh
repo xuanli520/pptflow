@@ -21,6 +21,8 @@ fi
 : "${HARBOR_FACTORY_PYTHON_INTERPRETER:?set HARBOR_FACTORY_PYTHON_INTERPRETER to the absolute Harbor Python interpreter}"
 : "${HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE:?set HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE to the absolute Harbor Python package directory}"
 : "${HARBOR_FACTORY_DOCKER_EXECUTABLE:?set HARBOR_FACTORY_DOCKER_EXECUTABLE to the absolute Docker executable}"
+: "${HARBOR_FACTORY_DOCKER_COMPOSE_PLUGIN:?set HARBOR_FACTORY_DOCKER_COMPOSE_PLUGIN to the absolute Docker Compose CLI plugin}"
+: "${HARBOR_FACTORY_DOCKER_BUILDX_PLUGIN:?set HARBOR_FACTORY_DOCKER_BUILDX_PLUGIN to the absolute Docker Buildx CLI plugin}"
 : "${HARBOR_FACTORY_BUILD_VERSION:?set HARBOR_FACTORY_BUILD_VERSION to the immutable Harbor Factory build version}"
 : "${HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION:?set HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION to the immutable evaluator lock version}"
 : "${QWEN_HARBOR_BASE_URL:?set QWEN_HARBOR_BASE_URL in the environment}"
@@ -32,8 +34,10 @@ harbor_launcher="$HARBOR_FACTORY_HARBOR_LAUNCHER"
 python_interpreter="$HARBOR_FACTORY_PYTHON_INTERPRETER"
 python_source_tree="$HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE"
 docker_executable="$HARBOR_FACTORY_DOCKER_EXECUTABLE"
+docker_compose_plugin="$HARBOR_FACTORY_DOCKER_COMPOSE_PLUGIN"
+docker_buildx_plugin="$HARBOR_FACTORY_DOCKER_BUILDX_PLUGIN"
 
-for value in "$git_executable" "$harbor_launcher" "$python_interpreter" "$python_source_tree" "$docker_executable"; do
+for value in "$git_executable" "$harbor_launcher" "$python_interpreter" "$python_source_tree" "$docker_executable" "$docker_compose_plugin" "$docker_buildx_plugin"; do
   if [[ "$value" != /* ]]; then
     die "all runtime paths must be absolute"
   fi
@@ -77,4 +81,6 @@ exec env GOFLAGS= go run -mod=readonly ./tools/codeedge-evaluator-lock-build \
   --harbor-launcher "$harbor_launcher" \
   --python-interpreter "$python_interpreter" \
   --python-source-tree "$python_source_tree" \
-  --docker-cli "$docker_executable"
+	--docker-cli "$docker_executable" \
+	--docker-compose-plugin "$docker_compose_plugin" \
+	--docker-buildx-plugin "$docker_buildx_plugin"

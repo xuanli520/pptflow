@@ -271,7 +271,7 @@ func TestAuthoringRecoveryRevalidatesTargetsAfterCommandPersistence(t *testing.T
 }
 
 func TestAuthoringAdmissionRecoveryRegeneratesOnlyIndependentPackageProducers(t *testing.T) {
-	template := workflowadapter.StandardAuthoringTaskAdmissionWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringBriefWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
 		t.Fatal(err)
@@ -400,7 +400,7 @@ func TestAuthoringRecoveryFailsClosedOnDeploymentCatalogLockDrift(t *testing.T) 
 	driftedServices, err := NewLifecycleServicesWithOptions(fixture.root, fixture.store, LifecycleServicesOptions{
 		OperationResolver: driftedResolver,
 		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
-			Template: workflowadapter.StandardAuthoringTemplateReference(), Resolver: driftedResolver,
+			Template: workflowadapter.StandardAuthoringBriefTemplateReference(), Resolver: driftedResolver,
 		}},
 		RequireDeploymentCatalog: true,
 		RequireDeploymentLock:    true,
@@ -624,7 +624,7 @@ func newLockedAuthoringRecoveryLaunchFixture(t *testing.T) authoringRecoveryFixt
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
 		OperationResolver: resolver,
 		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
-			Template: workflowadapter.StandardAuthoringTemplateReference(), Resolver: resolver,
+			Template: workflowadapter.StandardAuthoringBriefTemplateReference(), Resolver: resolver,
 		}},
 		RequireDeploymentCatalog:               true,
 		RequireDeploymentLock:                  true,
@@ -643,7 +643,8 @@ func startAuthoringRecoveryLaunchFixture(t *testing.T, ctx context.Context, root
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: authoringRecoveryUUID(t), Actor: "author", Reason: "create authoring recovery fixture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "authoring-recovery-fixture", Title: "Authoring recovery fixture", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "authoring-recovery-fixture", Title: "Authoring recovery fixture", MetadataJSON: `{}`,
 	})
 	if err != nil {
 		t.Fatal(err)

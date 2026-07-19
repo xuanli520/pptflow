@@ -620,6 +620,9 @@ func (m appModel) beginAuthoring(message TaskSubmitMsg, inputCmd tea.Cmd) (tea.M
 	message.BaseImage = strings.TrimSpace(message.BaseImage)
 	message.Slug = strings.TrimSpace(message.Slug)
 	message.Title = strings.TrimSpace(message.Title)
+	message.TaskType = strings.TrimSpace(message.TaskType)
+	message.Application = strings.TrimSpace(message.Application)
+	message.Objective = strings.TrimSpace(message.Objective)
 	message.Reason = strings.TrimSpace(message.Reason)
 	if m.pendingStart == nil || m.pendingStart.message != message {
 		key, err := m.newIdempotencyKey()
@@ -645,6 +648,9 @@ func (m appModel) startAuthoring(pending pendingTaskBoardStart) tea.Cmd {
 			BaseImage:      pending.message.BaseImage,
 			Slug:           pending.message.Slug,
 			Title:          pending.message.Title,
+			TaskType:       pending.message.TaskType,
+			Application:    pending.message.Application,
+			Objective:      pending.message.Objective,
 			MetadataJSON:   "{}",
 			Reason:         pending.message.Reason,
 		})
@@ -877,10 +883,11 @@ func (m appModel) View() string {
 		))
 	}
 	status := m.statusView()
+	input := m.input.View(contentWidth)
 
 	boardHeight := m.height - 5
-	if m.input.Visible() {
-		boardHeight -= 5
+	if input != "" {
+		boardHeight -= lipgloss.Height(input)
 	}
 	if status != "" {
 		boardHeight--
@@ -892,7 +899,7 @@ func (m appModel) View() string {
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
 		headerStyle.Width(contentWidth).Render("Harbor Task Factory"),
 		m.board.View(contentWidth, max(1, boardHeight)),
-		m.input.View(contentWidth),
+		input,
 		status,
 		footerStyle.Render(footer),
 	))

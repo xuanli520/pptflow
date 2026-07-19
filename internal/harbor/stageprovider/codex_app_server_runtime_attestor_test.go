@@ -21,6 +21,18 @@ func TestCodexAppServerOperationLockValidatesTypedRuntimeContract(t *testing.T) 
 		mutate func(*CodexAppServerOperationLock)
 	}{
 		{
+			name: "legacy v1 format",
+			mutate: func(lock *CodexAppServerOperationLock) {
+				lock.Format = "harbor.codex-app-server-operation.v1"
+			},
+		},
+		{
+			name: "legacy v1 version",
+			mutate: func(lock *CodexAppServerOperationLock) {
+				lock.Version = "1"
+			},
+		},
+		{
 			name: "unversioned launcher",
 			mutate: func(lock *CodexAppServerOperationLock) {
 				lock.JavaScriptLauncher.Version = "latest"
@@ -57,9 +69,15 @@ func TestCodexAppServerOperationLockValidatesTypedRuntimeContract(t *testing.T) 
 			},
 		},
 		{
-			name: "read only sandbox",
+			name: "workspace write sandbox",
 			mutate: func(lock *CodexAppServerOperationLock) {
-				lock.SandboxMode = "read-only"
+				lock.SandboxMode = "workspace-write"
+			},
+		},
+		{
+			name: "workspace write policy",
+			mutate: func(lock *CodexAppServerOperationLock) {
+				lock.SandboxPolicy = "workspaceWrite"
 			},
 		},
 		{
@@ -143,8 +161,8 @@ func TestCodexAppServerRuntimeAttestorProvesPinnedRuntimeWithExplicitSecretFreeE
 	if invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.AgentID == "" || invocation.AgentVersion == "" || invocation.ModelVersion == "" {
 		t.Fatalf("invocation agent configuration = %+v, want frozen production identity", invocation)
 	}
-	if invocation.CLIVersionOutput != "codex-cli 0.133.0" || invocation.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || invocation.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || invocation.NetworkAccess {
-		t.Fatalf("invocation policy = %+v, want locked workspace-write/network-disabled Codex policy", invocation)
+	if invocation.CLIVersionOutput != "codex-cli 0.133.0" || invocation.SandboxMode != CodexAppServerSandboxModeReadOnly || invocation.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly || invocation.NetworkAccess {
+		t.Fatalf("invocation policy = %+v, want locked read-only/network-disabled Codex policy", invocation)
 	}
 	environment := invocation.Environment()
 	if len(environment) != 2 || environment["CODEX_HOME"] != fixture.home || !strings.HasPrefix(environment["PATH"], filepath.Dir(fixture.node)+string(os.PathListSeparator)) {
@@ -349,8 +367,8 @@ exit 94
 		},
 		CodexHomeDirectory: home,
 		CLIVersionOutput:   "codex-cli 0.133.0",
-		SandboxMode:        CodexAppServerSandboxModeWorkspaceWrite,
-		SandboxPolicy:      CodexAppServerSandboxPolicyWorkspaceWrite,
+		SandboxMode:        CodexAppServerSandboxModeReadOnly,
+		SandboxPolicy:      CodexAppServerSandboxPolicyReadOnly,
 		NetworkAccess:      false,
 	}
 	record := operationCatalogLockRecord(t, catalogDocument.Operations[0])

@@ -108,9 +108,9 @@ func (core *lifecycleServiceCore) verifyWorkflowRunSubjectInputs(ctx context.Con
 
 // verifyAuthoringSourceInput proves both intrinsic authoring-session inputs:
 // source_snapshot stays available only to the controlled repo adapter, while
-// environment_policy is exposed as a normal immutable artifact binding to the
-// stages that declare it. Neither path accepts a caller filesystem path or a
-// mutable run-input record.
+// environment_policy and authoring_brief are exposed as normal immutable
+// artifact bindings to the stages that declare them. Neither path accepts a
+// caller filesystem path or a mutable run-input record.
 func (core *lifecycleServiceCore) verifyAuthoringSourceInput(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, manifest runManifest, specification workflowadapter.RunExecutionSpec) error {
 	if core == nil || core.store == nil || core.objects == nil || !subject.isAuthoringSession() {
 		return fmt.Errorf("authoring source input verifier is not configured")
@@ -121,12 +121,15 @@ func (core *lifecycleServiceCore) verifyAuthoringSourceInput(ctx context.Context
 	if err := validateCurrentStandardAuthoringFrozenContract(run, manifest, specification); err != nil {
 		return err
 	}
-	environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(*subject.AuthoringSession)
+	environmentPolicy, brief, err := standardAuthoringSessionIntrinsicInputs(*subject.AuthoringSession)
 	if err != nil {
 		return fmt.Errorf("verify authoring session environment policy: %w", err)
 	}
 	if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
 		return fmt.Errorf("verify authoring execution environment policy binding: %w", err)
+	}
+	if err := validateStandardAuthoringBriefBindings(specification, brief); err != nil {
+		return fmt.Errorf("verify authoring execution brief binding: %w", err)
 	}
 	input, err := core.store.GetAuthoringRunInputArtifactForPort(ctx, run.ID, "source_snapshot")
 	if err != nil {

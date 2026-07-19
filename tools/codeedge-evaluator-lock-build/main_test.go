@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,6 +71,12 @@ func TestBuildCreatesAttestedEvaluatorLockFromAssetsAndControlledProbes(t *testi
 		if record.HarborEvaluator == nil || record.LocalExecutable == nil || record.HarborEvaluator.Launcher != *record.LocalExecutable {
 			t.Fatalf("record %q did not duplicate the frozen Harbor launcher", record.Stage.Key)
 		}
+		evaluator := record.HarborEvaluator
+		if evaluator.DockerCLI.AbsolutePath != fixture.dockerCLI || filepath.Base(evaluator.DockerCLI.AbsolutePath) != "docker" || evaluator.DockerServerVersion != stageprovider.HarborEvaluatorDockerServerVersion ||
+			evaluator.DockerComposePlugin.AbsolutePath != fixture.dockerComposePlugin || evaluator.DockerComposePlugin.Version != stageprovider.HarborEvaluatorDockerComposeVersion || evaluator.DockerComposeVersionOutput != stageprovider.HarborEvaluatorDockerComposeVersionOutput ||
+			evaluator.DockerBuildxPlugin.AbsolutePath != fixture.dockerBuildxPlugin || evaluator.DockerBuildxPlugin.Version != stageprovider.HarborEvaluatorDockerBuildxVersion || evaluator.DockerBuildxVersionOutput != stageprovider.HarborEvaluatorDockerBuildxVersionOutput {
+			t.Fatalf("record %q did not freeze the complete Docker runtime: %#v", record.Stage.Key, evaluator)
+		}
 		contract := record.HarborEvaluator.Contract
 		if contract.Attempts != 4 || contract.ConcurrentTrials != 1 || contract.MaxRetries != 3 || !contract.RequireTrajectory {
 			t.Fatalf("record %q lost the fixed pass@4/retry contract: %#v", record.Stage.Key, contract)
@@ -87,9 +94,163 @@ func TestBuildCreatesAttestedEvaluatorLockFromAssetsAndControlledProbes(t *testi
 	if _, err := os.Stat(fixture.nonVersionProbeMarker); !os.IsNotExist(err) {
 		t.Fatalf("lock generation invoked Harbor outside --version probing: %v", err)
 	}
+	for _, marker := range []string{
+		fixture.dockerServerProbeMarker,
+		fixture.dockerComposeInfoProbeMarker,
+		fixture.dockerBuildxInfoProbeMarker,
+		fixture.dockerComposeProbeMarker,
+		fixture.dockerBuildxProbeMarker,
+	} {
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("lock generation omitted a required controlled Docker probe: %v", err)
+		}
+	}
 	if got := fixture.lookedUpNames(); !sameStrings(got, []string{credentialEnvironment, opusEndpointEnvironment, qwenEndpointEnvironment}) {
 		t.Fatalf("environment names read = %v, want exactly approved names", got)
 	}
+}
+
+func TestValidateConfigRequiresDockerPluginBasenames(t *testing.T) {
+	fixture := newEvaluatorLockGeneratorFixture(t)
+	config := fixture.config()
+	config.dockerCLI = fixture.pythonInterpreter
+	if err := validateConfig(&config); err == nil || !strings.Contains(err.Error(), "Docker CLI basename") {
+		t.Fatalf("renamed Docker CLI error = %v, want fixed basename", err)
+	}
+
+	config = fixture.config()
+	config.dockerComposePlugin = fixture.pythonInterpreter
+	if err := validateConfig(&config); err == nil || !strings.Contains(err.Error(), "Docker Compose plugin basename") {
+		t.Fatalf("renamed Compose plugin error = %v, want fixed basename", err)
+	}
+
+	config = fixture.config()
+	config.dockerBuildxPlugin = fixture.pythonInterpreter
+	if err := validateConfig(&config); err == nil || !strings.Contains(err.Error(), "Docker Buildx plugin basename") {
+		t.Fatalf("renamed Buildx plugin error = %v, want fixed basename", err)
+	}
+}
+
+func TestDiscoverEvaluatorRuntimeRejectsPluginAndDaemonDrift(t *testing.T) {
+	t.Run("Compose version", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		config := fixture.dockerScriptConfig()
+		config.composeOutput = "Docker Compose version v5.1.2"
+		writeGeneratorFile(t, fixture.dockerCLI, evaluatorGeneratorDockerScript(config), 0o700)
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "Compose version") {
+			t.Fatalf("Compose version drift error = %v", err)
+		}
+	})
+
+	t.Run("Buildx exact output", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		config := fixture.dockerScriptConfig()
+		config.buildxOutput = "github.com/docker/buildx v0.33.0 " + strings.Repeat("0", 40)
+		writeGeneratorFile(t, fixture.dockerCLI, evaluatorGeneratorDockerScript(config), 0o700)
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "Buildx version") {
+			t.Fatalf("Buildx exact-output drift error = %v", err)
+		}
+	})
+
+	t.Run("server version", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		config := fixture.dockerScriptConfig()
+		config.serverVersion = "29.4.0"
+		writeGeneratorFile(t, fixture.dockerCLI, evaluatorGeneratorDockerScript(config), 0o700)
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "daemon version") {
+			t.Fatalf("Docker server version drift error = %v", err)
+		}
+	})
+
+	t.Run("daemon unavailable", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		config := fixture.dockerScriptConfig()
+		config.daemonAvailable = false
+		writeGeneratorFile(t, fixture.dockerCLI, evaluatorGeneratorDockerScript(config), 0o700)
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "daemon") {
+			t.Fatalf("daemon availability error = %v", err)
+		}
+	})
+}
+
+func TestDiscoverEvaluatorRuntimeRejectsCrossProbeHarborRuntimeReplacement(t *testing.T) {
+	t.Run("launcher cannot launder its shebang", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		alternateInterpreter := filepath.Join(filepath.Dir(fixture.pythonInterpreter), "alternate-python")
+		writeGeneratorFile(t, alternateInterpreter, "#!/bin/sh\nexec /bin/sh \"$@\"\n", 0o700)
+		replacement := fixture.harborLauncher + ".replacement"
+		writeGeneratorFile(t, replacement, "#!"+fixture.pythonInterpreter+"\nif [ \"${1:-}\" = \"--version\" ]; then printf '0.18.0\\n'; exit 0; fi\nexit 1\n", 0o700)
+		writeGeneratorFile(t, fixture.harborLauncher, "#!"+alternateInterpreter+"\nif [ \"${1:-}\" = \"--version\" ]; then /bin/mv "+fmt.Sprintf("%q", replacement)+" "+fmt.Sprintf("%q", fixture.harborLauncher)+"; printf '0.18.0\\n'; exit 0; fi\nexit 1\n", 0o700)
+
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "shebang does not resolve to the pinned Python interpreter") {
+			t.Fatalf("cross-identity shebang error = %v, want initial launcher shebang failure", err)
+		}
+		if _, err := os.Stat(replacement); err != nil {
+			t.Fatalf("launcher was executed before its frozen shebang was verified: %v", err)
+		}
+	})
+
+	t.Run("launcher replaces itself", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		replacement := fixture.harborLauncher + ".replacement"
+		writeGeneratorFile(t, replacement, "#!"+fixture.pythonInterpreter+"\nif [ \"${1:-}\" = \"--version\" ]; then printf '0.18.0\\n'; exit 0; fi\nexit 1\n", 0o700)
+		writeGeneratorFile(t, fixture.harborLauncher, "#!"+fixture.pythonInterpreter+"\nif [ \"${1:-}\" = \"--version\" ]; then /bin/mv "+fmt.Sprintf("%q", replacement)+" "+fmt.Sprintf("%q", fixture.harborLauncher)+"; printf '0.18.0\\n'; exit 0; fi\nexit 1\n", 0o700)
+
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "Harbor launcher identity changed") {
+			t.Fatalf("launcher replacement error = %v, want frozen launcher identity failure", err)
+		}
+	})
+
+	t.Run("interpreter replaces itself", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		replacement := fixture.pythonInterpreter + ".replacement"
+		writeGeneratorFile(t, replacement, "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'Python 3.13.5\\n'; exit 0; fi\nexec /bin/sh \"$@\"\n", 0o700)
+		writeGeneratorFile(t, fixture.pythonInterpreter, "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then /bin/mv "+fmt.Sprintf("%q", replacement)+" "+fmt.Sprintf("%q", fixture.pythonInterpreter)+"; printf 'Python 3.13.5\\n'; exit 0; fi\nexec /bin/sh \"$@\"\n", 0o700)
+
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "Python interpreter identity changed") {
+			t.Fatalf("interpreter replacement error = %v, want frozen interpreter identity failure", err)
+		}
+	})
+
+	t.Run("launcher mutates source tree", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		source := filepath.Join(fixture.pythonSourceTree, "__init__.py")
+		replacement := filepath.Join(filepath.Dir(fixture.pythonSourceTree), "replacement.txt")
+		writeGeneratorFile(t, replacement, "VERSION = 'mutated'\n", 0o600)
+		writeGeneratorFile(t, fixture.harborLauncher, "#!"+fixture.pythonInterpreter+"\nif [ \"${1:-}\" = \"--version\" ]; then /bin/mv "+fmt.Sprintf("%q", replacement)+" "+fmt.Sprintf("%q", source)+"; printf '0.18.0\\n'; exit 0; fi\nexit 1\n", 0o700)
+
+		if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "Harbor Python source tree identity changed") {
+			t.Fatalf("source-tree drift error = %v, want frozen source-tree identity failure", err)
+		}
+	})
+}
+
+func TestFinalEvaluatorRuntimeVerificationRejectsSameContentPathReplacement(t *testing.T) {
+	t.Run("launcher inode", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		runtime, err := discoverEvaluatorRuntime(fixture.config())
+		if err != nil {
+			t.Fatal(err)
+		}
+		replaceGeneratorFileWithSameContent(t, fixture.harborLauncher, 0o700)
+
+		if err := verifyEvaluatorRuntimeUnchanged(fixture.config(), runtime); err == nil || !strings.Contains(err.Error(), "Harbor launcher identity changed") {
+			t.Fatalf("same-content launcher replacement error = %v, want pathname/inode identity failure", err)
+		}
+	})
+
+	t.Run("source file inode", func(t *testing.T) {
+		fixture := newEvaluatorLockGeneratorFixture(t)
+		runtime, err := discoverEvaluatorRuntime(fixture.config())
+		if err != nil {
+			t.Fatal(err)
+		}
+		replaceGeneratorFileWithSameContent(t, filepath.Join(fixture.pythonSourceTree, "__init__.py"), 0o600)
+
+		if err := verifyEvaluatorRuntimeUnchanged(fixture.config(), runtime); err == nil || !strings.Contains(err.Error(), "Harbor Python source tree identity changed") {
+			t.Fatalf("same-content source replacement error = %v, want pathname/inode identity failure", err)
+		}
+	})
 }
 
 func TestBuildRejectsEndpointDriftWithoutReadingUnapprovedEnvironment(t *testing.T) {
@@ -233,20 +394,27 @@ func TestCloneEvaluatorSecretsPreservesExplicitEmptyArray(t *testing.T) {
 }
 
 type evaluatorLockGeneratorFixture struct {
-	root                  string
-	catalogPath           string
-	manifestPath          string
-	profilePath           string
-	contractRoot          string
-	outputPath            string
-	gitExecutable         string
-	harborLauncher        string
-	pythonInterpreter     string
-	pythonSourceTree      string
-	dockerCLI             string
-	nonVersionProbeMarker string
-	environment           map[string]string
-	looked                []string
+	root                         string
+	catalogPath                  string
+	manifestPath                 string
+	profilePath                  string
+	contractRoot                 string
+	outputPath                   string
+	gitExecutable                string
+	harborLauncher               string
+	pythonInterpreter            string
+	pythonSourceTree             string
+	dockerCLI                    string
+	dockerComposePlugin          string
+	dockerBuildxPlugin           string
+	dockerServerProbeMarker      string
+	dockerComposeInfoProbeMarker string
+	dockerBuildxInfoProbeMarker  string
+	dockerComposeProbeMarker     string
+	dockerBuildxProbeMarker      string
+	nonVersionProbeMarker        string
+	environment                  map[string]string
+	looked                       []string
 }
 
 func newEvaluatorLockGeneratorFixture(t *testing.T) *evaluatorLockGeneratorFixture {
@@ -291,7 +459,27 @@ func newEvaluatorLockGeneratorFixture(t *testing.T) *evaluatorLockGeneratorFixtu
 	harbor := filepath.Join(runtimeRoot, "harbor")
 	writeGeneratorFile(t, harbor, "#!"+python+"\nif [ \"${1:-}\" = \"--version\" ]; then printf '0.18.0\\n'; exit 0; fi\nprintf unexpected > "+marker+"\nexit 1\n", 0o700)
 	docker := filepath.Join(runtimeRoot, "docker")
-	writeGeneratorFile(t, docker, "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'Docker version 29.5.2, build controlled\\n'; exit 0; fi\nexit 1\n", 0o700)
+	dockerComposeDirectory := filepath.Join(runtimeRoot, "libexec", "docker", "cli-plugins")
+	if err := os.MkdirAll(dockerComposeDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dockerCompose := filepath.Join(dockerComposeDirectory, "docker-compose")
+	writeGeneratorFile(t, dockerCompose, "#!/bin/sh\nif [ \"${1:-}\" = \"version\" ]; then printf 'Docker Compose version v5.1.3\\n'; exit 0; fi\nexit 1\n", 0o700)
+	dockerBuildx := filepath.Join(dockerComposeDirectory, "docker-buildx")
+	writeGeneratorFile(t, dockerBuildx, "#!/bin/sh\nif [ \"${1:-}\" = \"version\" ]; then printf 'github.com/docker/buildx v0.33.0 f7897eba028583e0071642db3c011e860444f8cf\\n'; exit 0; fi\nexit 1\n", 0o700)
+	probeRoot := t.TempDir()
+	dockerServerProbeMarker := filepath.Join(probeRoot, "docker-server-probed")
+	dockerComposeInfoProbeMarker := filepath.Join(probeRoot, "docker-compose-info-probed")
+	dockerBuildxInfoProbeMarker := filepath.Join(probeRoot, "docker-buildx-info-probed")
+	dockerComposeProbeMarker := filepath.Join(probeRoot, "docker-compose-probed")
+	dockerBuildxProbeMarker := filepath.Join(probeRoot, "docker-buildx-probed")
+	writeGeneratorFile(t, docker, evaluatorGeneratorDockerScript(evaluatorGeneratorDockerScriptConfig{
+		composePath: dockerCompose, composeOutput: stageprovider.HarborEvaluatorDockerComposeVersionOutput,
+		buildxPath: dockerBuildx, buildxOutput: stageprovider.HarborEvaluatorDockerBuildxVersionOutput,
+		serverVersion: stageprovider.HarborEvaluatorDockerServerVersion, daemonAvailable: true,
+		serverMarker: dockerServerProbeMarker, composeInfoMarker: dockerComposeInfoProbeMarker, buildxInfoMarker: dockerBuildxInfoProbeMarker,
+		composeMarker: dockerComposeProbeMarker, buildxMarker: dockerBuildxProbeMarker,
+	}), 0o700)
 	writeGeneratorFile(t, filepath.Join(runtimeRoot, "site-packages", "harbor", "__init__.py"), "VERSION = '0.18.0'\n", 0o600)
 
 	git := testGitExecutable(t)
@@ -303,8 +491,9 @@ func newEvaluatorLockGeneratorFixture(t *testing.T) *evaluatorLockGeneratorFixtu
 	return &evaluatorLockGeneratorFixture{
 		root: root, catalogPath: catalogPath, manifestPath: filepath.Join(contractRoot, "contract-assets.v1.json"), profilePath: profilePath,
 		contractRoot: contractRoot, outputPath: filepath.Join(contractRoot, "operation-catalog.lock.json"), gitExecutable: git,
-		harborLauncher: harbor, pythonInterpreter: python, pythonSourceTree: filepath.Join(runtimeRoot, "site-packages", "harbor"), dockerCLI: docker,
-		nonVersionProbeMarker: marker, environment: environment,
+		harborLauncher: harbor, pythonInterpreter: python, pythonSourceTree: filepath.Join(runtimeRoot, "site-packages", "harbor"), dockerCLI: docker, dockerComposePlugin: dockerCompose, dockerBuildxPlugin: dockerBuildx,
+		dockerServerProbeMarker: dockerServerProbeMarker, dockerComposeInfoProbeMarker: dockerComposeInfoProbeMarker, dockerBuildxInfoProbeMarker: dockerBuildxInfoProbeMarker,
+		dockerComposeProbeMarker: dockerComposeProbeMarker, dockerBuildxProbeMarker: dockerBuildxProbeMarker, nonVersionProbeMarker: marker, environment: environment,
 	}
 }
 
@@ -313,13 +502,53 @@ func (fixture *evaluatorLockGeneratorFixture) config() buildConfig {
 		sourceRoot: fixture.root, catalogPath: fixture.catalogPath, assetManifest: fixture.manifestPath, profilePath: fixture.profilePath,
 		contractRoot: fixture.contractRoot, outputPath: fixture.outputPath, buildVersion: "v2.0.0",
 		lockID: "codeedge-evaluator-child-production-lock", lockVersion: "v2.0.0", gitExecutable: fixture.gitExecutable,
-		harborLauncher: fixture.harborLauncher, pythonInterpreter: fixture.pythonInterpreter, pythonSourceTree: fixture.pythonSourceTree, dockerCLI: fixture.dockerCLI,
+		harborLauncher: fixture.harborLauncher, pythonInterpreter: fixture.pythonInterpreter, pythonSourceTree: fixture.pythonSourceTree, dockerCLI: fixture.dockerCLI, dockerComposePlugin: fixture.dockerComposePlugin, dockerBuildxPlugin: fixture.dockerBuildxPlugin,
 		lookupEnvironment: func(name string) (string, bool) {
 			fixture.looked = append(fixture.looked, name)
 			value, present := fixture.environment[name]
 			return value, present
 		},
 	}
+}
+
+type evaluatorGeneratorDockerScriptConfig struct {
+	composePath       string
+	composeOutput     string
+	buildxPath        string
+	buildxOutput      string
+	serverVersion     string
+	daemonAvailable   bool
+	serverMarker      string
+	composeInfoMarker string
+	buildxInfoMarker  string
+	composeMarker     string
+	buildxMarker      string
+}
+
+func (fixture *evaluatorLockGeneratorFixture) dockerScriptConfig() evaluatorGeneratorDockerScriptConfig {
+	return evaluatorGeneratorDockerScriptConfig{
+		composePath: fixture.dockerComposePlugin, composeOutput: stageprovider.HarborEvaluatorDockerComposeVersionOutput,
+		buildxPath: fixture.dockerBuildxPlugin, buildxOutput: stageprovider.HarborEvaluatorDockerBuildxVersionOutput,
+		serverVersion: stageprovider.HarborEvaluatorDockerServerVersion, daemonAvailable: true,
+		serverMarker: fixture.dockerServerProbeMarker, composeInfoMarker: fixture.dockerComposeInfoProbeMarker, buildxInfoMarker: fixture.dockerBuildxInfoProbeMarker,
+		composeMarker: fixture.dockerComposeProbeMarker, buildxMarker: fixture.dockerBuildxProbeMarker,
+	}
+}
+
+func evaluatorGeneratorDockerScript(config evaluatorGeneratorDockerScriptConfig) string {
+	serverExit := "printf '%s\\n' " + fmt.Sprintf("%q", config.serverVersion) + "; exit 0"
+	if !config.daemonAvailable {
+		serverExit = "exit 1"
+	}
+	return "#!/bin/sh\n" +
+		"if [ -n \"${QWEN_HARBOR_BASE_URL:-}\" ] || [ -n \"${OPUS_HARBOR_BASE_URL:-}\" ] || [ -n \"${ANTHROPIC_AUTH_TOKEN:-}\" ] || [ -z \"${DOCKER_CONFIG:-}\" ] || [ ! -d \"$DOCKER_CONFIG\" ] || [ -z \"${HOME:-}\" ] || [ -z \"${PATH:-}\" ]; then exit 90; fi\n" +
+		"if [ \"${1:-}\" = \"--version\" ]; then printf 'Docker version 29.5.2, build controlled\\n'; exit 0; fi\n" +
+		"if [ \"${1:-}\" = \"version\" ] && [ \"${2:-}\" = \"--format\" ] && [ \"${3:-}\" = " + fmt.Sprintf("%q", dockerServerVersionFormat) + " ]; then : > " + fmt.Sprintf("%q", config.serverMarker) + "; " + serverExit + "; fi\n" +
+		"if [ \"${1:-}\" = \"info\" ] && [ \"${2:-}\" = \"--format\" ] && [ \"${3:-}\" = " + fmt.Sprintf("%q", dockerComposePathFormat) + " ]; then : > " + fmt.Sprintf("%q", config.composeInfoMarker) + "; printf '%s\\n' " + fmt.Sprintf("%q", config.composePath) + "; exit 0; fi\n" +
+		"if [ \"${1:-}\" = \"info\" ] && [ \"${2:-}\" = \"--format\" ] && [ \"${3:-}\" = " + fmt.Sprintf("%q", dockerBuildxPathFormat) + " ]; then : > " + fmt.Sprintf("%q", config.buildxInfoMarker) + "; printf '%s\\n' " + fmt.Sprintf("%q", config.buildxPath) + "; exit 0; fi\n" +
+		"if [ \"${1:-}\" = \"compose\" ] && [ \"${2:-}\" = \"version\" ]; then : > " + fmt.Sprintf("%q", config.composeMarker) + "; printf '%s\\n' " + fmt.Sprintf("%q", config.composeOutput) + "; exit 0; fi\n" +
+		"if [ \"${1:-}\" = \"buildx\" ] && [ \"${2:-}\" = \"version\" ]; then : > " + fmt.Sprintf("%q", config.buildxMarker) + "; printf '%s\\n' " + fmt.Sprintf("%q", config.buildxOutput) + "; exit 0; fi\n" +
+		"exit 1\n"
 }
 
 func (fixture *evaluatorLockGeneratorFixture) lookedUpNames() []string {
@@ -418,6 +647,19 @@ func writeGeneratorFile(t *testing.T, file, contents string, mode os.FileMode) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(file, []byte(contents), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceGeneratorFileWithSameContent(t *testing.T, file string, mode os.FileMode) {
+	t.Helper()
+	contents, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := file + ".same-content-replacement"
+	writeGeneratorFile(t, replacement, string(contents), mode)
+	if err := os.Rename(replacement, file); err != nil {
 		t.Fatal(err)
 	}
 }

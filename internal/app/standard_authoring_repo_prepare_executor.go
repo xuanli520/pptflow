@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -228,6 +230,61 @@ func (executor *StandardAuthoringRepoPrepareExecutor) readFrozenAuthoringSource(
 	return content, nil
 }
 
+// VerifyStandardAuthoringCodexFrozenSource re-proves the exact Run-scoped
+// source tree against the immutable source object before and after every Codex
+// turn. The caller supplies the agent-visible path only so this boundary can
+// prove it is the one repo_prepare derived for the frozen execution.
+func (executor *StandardAuthoringRepoPrepareExecutor) VerifyStandardAuthoringCodexFrozenSource(ctx context.Context, execution workflowkit.FrozenExecution, sourceRoot string) (workflowkit.Fingerprint, error) {
+	if executor == nil || executor.core == nil || executor.core.store == nil || executor.core.objects == nil {
+		return "", fmt.Errorf("Standard authoring frozen source verifier is not configured")
+	}
+	if ctx == nil {
+		return "", fmt.Errorf("Standard authoring frozen source verifier context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := store.ValidateUUIDv7(execution.ID); err != nil {
+		return "", fmt.Errorf("Standard authoring frozen source verifier Run identity: %w", err)
+	}
+	run, err := executor.core.store.GetWorkflowRun(ctx, execution.ID)
+	if err != nil {
+		return "", err
+	}
+	if run == nil || run.Status != store.WorkflowRunRunning || !isCurrentStandardAuthoringRun(*run) {
+		return "", fmt.Errorf("Standard authoring frozen source verifier Run is not active under the closed template")
+	}
+	subject, err := executor.core.resolveWorkflowRunSubject(ctx, *run)
+	if err != nil {
+		return "", err
+	}
+	if !subject.isAuthoringSession() || execution.Subject != subject.Binding || subject.AuthoringSource == nil {
+		return "", fmt.Errorf("Standard authoring frozen source verifier has an invalid source/session subject")
+	}
+	snapshot, err := executor.readFrozenAuthoringSource(ctx, *run, subject)
+	if err != nil {
+		return "", err
+	}
+	coordinate, err := standardAuthoringStoredSourceCoordinate(*subject.AuthoringSource)
+	if err != nil {
+		return "", fmt.Errorf("validate Standard authoring frozen source verifier coordinate: %w", err)
+	}
+	workspace := filepath.Join(executor.workspaceRoot, run.ID)
+	expectedSourceRoot := filepath.Join(workspace, stageprovider.StandardAuthoringCodexRunSourceDirectory)
+	absoluteSourceRoot, err := filepath.Abs(strings.TrimSpace(sourceRoot))
+	if err != nil || filepath.Clean(absoluteSourceRoot) != expectedSourceRoot || !standardAuthoringWorkspacePathWithin(executor.workspaceRoot, expectedSourceRoot) {
+		return "", fmt.Errorf("Standard authoring frozen source verifier path does not match the Run workspace")
+	}
+	if err := verifyStandardAuthoringPreparedWorkspace(ctx, workspace, expectedSourceRoot, subject, snapshot, coordinate); err != nil {
+		return "", err
+	}
+	identity := workflowkit.Fingerprint(subject.AuthoringSource.SnapshotContentDigest)
+	if err := identity.Validate(); err != nil {
+		return "", fmt.Errorf("Standard authoring frozen source verifier identity: %w", err)
+	}
+	return identity, nil
+}
+
 func (executor *StandardAuthoringRepoPrepareExecutor) lockedGitVersion(ctx context.Context) (string, error) {
 	if executor == nil {
 		return "", fmt.Errorf("Standard authoring repo_prepare executor is not configured")
@@ -435,7 +492,36 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 	if err := validateStandardAuthoringSourceArchive(snapshot, coordinate); err != nil {
 		return err
 	}
-	expected := make(map[string][]byte)
+	type expectedEntry struct {
+		directory bool
+		contents  []byte
+	}
+	expected := map[string]expectedEntry{".": {directory: true}}
+	addDirectory := func(name string) error {
+		if name == "" || name == "." {
+			return nil
+		}
+		if existing, found := expected[name]; found {
+			if !existing.directory {
+				return fmt.Errorf("Standard authoring source archive has conflicting paths")
+			}
+			return nil
+		}
+		expected[name] = expectedEntry{directory: true}
+		return nil
+	}
+	addParents := func(name string) error {
+		parents := []string{}
+		for parent := path.Dir(name); parent != "." && parent != ""; parent = path.Dir(parent) {
+			parents = append(parents, parent)
+		}
+		for index := len(parents) - 1; index >= 0; index-- {
+			if err := addDirectory(parents[index]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	reader := tar.NewReader(bytes.NewReader(snapshot))
 	for {
 		if err := ctx.Err(); err != nil {
@@ -457,54 +543,83 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 		if !standardAuthoringGitArchiveEntryMetadata(header) {
 			return fmt.Errorf("Standard authoring source archive has unsupported metadata")
 		}
-		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
-			continue
-		}
 		if !strings.HasPrefix(header.Name, stageprovider.StandardAuthoringCodexRunSourceDirectory+"/") {
 			return fmt.Errorf("Standard authoring source archive has unexpected root")
 		}
-		relative := strings.TrimPrefix(header.Name, stageprovider.StandardAuthoringCodexRunSourceDirectory+"/")
-		contents, readErr := io.ReadAll(io.LimitReader(reader, header.Size))
-		if readErr != nil || int64(len(contents)) != header.Size {
-			return fmt.Errorf("read Standard authoring source archive entry")
+		relative := strings.TrimSuffix(strings.TrimPrefix(header.Name, stageprovider.StandardAuthoringCodexRunSourceDirectory+"/"), "/")
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := addParents(relative); err != nil {
+				return err
+			}
+			if err := addDirectory(relative); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if relative == "" {
+				return fmt.Errorf("Standard authoring source archive has an invalid regular root")
+			}
+			if err := addParents(relative); err != nil {
+				return err
+			}
+			if existing, found := expected[relative]; found && existing.directory {
+				return fmt.Errorf("Standard authoring source archive has conflicting paths")
+			}
+			contents, readErr := io.ReadAll(io.LimitReader(reader, header.Size+1))
+			if readErr != nil || int64(len(contents)) != header.Size {
+				return fmt.Errorf("read Standard authoring source archive entry")
+			}
+			expected[relative] = expectedEntry{contents: contents}
+		default:
+			return fmt.Errorf("Standard authoring source archive has unsupported entry")
 		}
-		expected[filepath.ToSlash(relative)] = contents
 	}
-	actual := make(map[string][]byte, len(expected))
-	err := filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+	rootInfo, err := os.Lstat(sourceRoot)
+	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() || rootInfo.Mode().Perm() != 0o555 {
+		return fmt.Errorf("Standard authoring source workspace does not match its immutable snapshot")
+	}
+	root, err := os.OpenRoot(sourceRoot)
+	if err != nil {
+		return fmt.Errorf("Standard authoring source workspace does not match its immutable snapshot")
+	}
+	defer root.Close()
+	seen := make(map[string]struct{}, len(expected))
+	err = fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if path == sourceRoot {
-			return nil
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		info, err := entry.Info()
+		info, err := root.Lstat(name)
 		if err != nil || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("unsafe Standard authoring source workspace entry")
 		}
-		if entry.IsDir() {
-			return nil
+		wanted, found := expected[name]
+		if !found {
+			return fmt.Errorf("unexpected Standard authoring source workspace entry")
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("non-regular Standard authoring source workspace entry")
+		if wanted.directory {
+			if !info.IsDir() || info.Mode().Perm() != 0o555 {
+				return fmt.Errorf("Standard authoring source workspace directory identity changed")
+			}
+		} else {
+			if !info.Mode().IsRegular() || info.Mode().Perm() != 0o444 {
+				return fmt.Errorf("Standard authoring source workspace file identity changed")
+			}
+			contents, err := root.ReadFile(name)
+			if err != nil || !bytes.Equal(contents, wanted.contents) {
+				return fmt.Errorf("Standard authoring source workspace content changed")
+			}
 		}
-		relative, err := filepath.Rel(sourceRoot, path)
-		if err != nil || filepath.IsAbs(relative) {
-			return fmt.Errorf("Standard authoring source workspace path escapes root")
-		}
-		contents, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		actual[filepath.ToSlash(relative)] = contents
+		seen[name] = struct{}{}
 		return nil
 	})
-	if err != nil || len(actual) != len(expected) {
+	if err != nil || len(seen) != len(expected) {
 		return fmt.Errorf("Standard authoring source workspace does not match its immutable snapshot")
 	}
-	for path, wanted := range expected {
-		got, present := actual[path]
-		if !present || !bytes.Equal(got, wanted) {
+	for name := range expected {
+		if _, present := seen[name]; !present {
 			return fmt.Errorf("Standard authoring source workspace does not match its immutable snapshot")
 		}
 	}
@@ -570,3 +685,4 @@ func standardAuthoringRepoPreparedEvidence(subject workflowRunSubject, gitVersio
 }
 
 var _ stageprovider.LocalCommandOperationExecutor = (*StandardAuthoringRepoPrepareExecutor)(nil)
+var _ stageprovider.StandardAuthoringCodexFrozenSourceVerifier = (*StandardAuthoringRepoPrepareExecutor)(nil)

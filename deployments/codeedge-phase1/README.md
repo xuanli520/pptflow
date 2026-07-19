@@ -33,7 +33,7 @@ HARBOR_FACTORY_GIT_EXECUTABLE=/usr/bin/git \
 HARBOR_FACTORY_DOCKER_EXECUTABLE=/usr/bin/docker \
 ./scripts/generate-codeedge-phase1-lock.sh \
   --build-version v2.0.0 \
-  --lock-version 2026.07.15.1
+  --lock-version 2026.07.19.2
 ```
 
 The generator refuses a dirty or untracked worktree, substituted asset paths,

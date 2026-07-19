@@ -154,21 +154,29 @@ func managedRunInputBindingsForStageForSubject(ctx context.Context, dataStore *s
 		if err := validateCurrentStandardAuthoringFrozenContract(run, manifest, specification); err != nil {
 			return nil, err
 		}
-		environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(*subject.AuthoringSession)
+		environmentPolicy, brief, err := standardAuthoringSessionIntrinsicInputs(*subject.AuthoringSession)
 		if err != nil {
 			return nil, err
 		}
 		if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
 			return nil, err
 		}
+		if err := validateStandardAuthoringBriefBindings(specification, brief); err != nil {
+			return nil, err
+		}
 		result := make(map[string]workflowkit.ArtifactBinding)
 		for _, input := range stage.Inputs {
-			if input.Name != workflowadapter.StandardAuthoringEnvironmentPolicyArtifact {
+			var binding workflowkit.ArtifactBinding
+			switch input.Name {
+			case workflowadapter.StandardAuthoringEnvironmentPolicyArtifact:
+				binding = environmentPolicy.artifactBinding()
+			case workflowadapter.StandardAuthoringBriefArtifact:
+				binding = brief.artifactBinding()
+			default:
 				continue
 			}
-			binding := environmentPolicy.artifactBinding()
 			if input.SchemaVersion != binding.SchemaVersion {
-				return nil, fmt.Errorf("authoring stage %q environment policy schema %q, want %q", stage.Key, input.SchemaVersion, binding.SchemaVersion)
+				return nil, fmt.Errorf("authoring stage %q intrinsic input %q schema %q, want %q", stage.Key, input.Name, input.SchemaVersion, binding.SchemaVersion)
 			}
 			result[binding.Name] = binding
 		}
@@ -266,12 +274,15 @@ func newStageInputReaderForSubject(dataStore *store.Store, objects *workflowrunt
 			if !isCurrentStandardAuthoringRun(run) {
 				return nil, fmt.Errorf("%w: authoring Run is not bound to the current Standard authoring template", ErrInvalidStageExecution)
 			}
-			environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(*subject.AuthoringSession)
+			environmentPolicy, brief, err := standardAuthoringSessionIntrinsicInputs(*subject.AuthoringSession)
 			if err != nil {
-				return nil, fmt.Errorf("%w: authoring session environment policy: %v", ErrInvalidStageExecution, err)
+				return nil, fmt.Errorf("%w: authoring session intrinsic inputs: %v", ErrInvalidStageExecution, err)
 			}
 			if requested == environmentPolicy.artifactBinding() {
 				return append([]byte(nil), environmentPolicy.CanonicalJSON...), nil
+			}
+			if requested == brief.artifactBinding() {
+				return append([]byte(nil), brief.CanonicalJSON...), nil
 			}
 		}
 		if subject.isTaskRevision() {

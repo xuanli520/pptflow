@@ -55,7 +55,7 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if request.ExecutionEpoch < 0 {
 		return store.WorkflowRun{}, fmt.Errorf("execution epoch cannot be negative")
 	}
-	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(request.Profile.Template) ||
+	if !request.Profile.Template.Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) ||
 		!request.ExecutionSpec.Template.Equal(request.Profile.Template) {
 		return store.WorkflowRun{}, fmt.Errorf("authoring Run requires one installed Standard authoring template")
 	}
@@ -259,6 +259,13 @@ func validateAuthoringRunExecutionSpec(specification workflowadapter.RunExecutio
 		return fmt.Errorf("authoring session environment policy: %w", err)
 	}
 	if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
+		return err
+	}
+	brief, err := standardAuthoringBriefInputFromSession(session)
+	if err != nil {
+		return fmt.Errorf("authoring session brief: %w", err)
+	}
+	if err := validateStandardAuthoringBriefBindings(specification, brief); err != nil {
 		return err
 	}
 	if core == nil {

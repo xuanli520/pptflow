@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -106,6 +107,7 @@ type HarborEvaluatorLocalCommandExecutor struct {
 	invocations                   map[string]stageprovider.HarborEvaluatorInvocation
 	protectedEnvironmentVariables []string
 	lookupEnv                     func(string) (string, bool)
+	prelaunchAttestor             stageprovider.HarborEvaluatorInvocationPrelaunchAttestor
 	runner                        CommandRunner
 }
 
@@ -113,10 +115,11 @@ type HarborEvaluatorLocalCommandExecutor struct {
 // facts. Invocations must be created from the exact approved lock during
 // composition; environment values are deliberately looked up only at launch.
 type HarborEvaluatorLocalCommandExecutorConfig struct {
-	WorkspaceRoot string
-	Invocations   []stageprovider.HarborEvaluatorInvocation
-	LookupEnv     func(string) (string, bool)
-	Runner        CommandRunner
+	WorkspaceRoot     string
+	Invocations       []stageprovider.HarborEvaluatorInvocation
+	LookupEnv         func(string) (string, bool)
+	PrelaunchAttestor stageprovider.HarborEvaluatorInvocationPrelaunchAttestor
+	Runner            CommandRunner
 }
 
 // NewHarborEvaluatorLocalCommandExecutor builds a closed command registry.
@@ -133,7 +136,10 @@ func NewHarborEvaluatorLocalCommandExecutor(config HarborEvaluatorLocalCommandEx
 	if runner == nil {
 		runner = DirectCommandRunner{}
 	}
-	executor := &HarborEvaluatorLocalCommandExecutor{root: root, invocations: make(map[string]stageprovider.HarborEvaluatorInvocation, len(config.Invocations)), lookupEnv: lookup, runner: runner}
+	if config.PrelaunchAttestor == nil {
+		return nil, errors.New("Harbor evaluator prelaunch runtime attestor is required")
+	}
+	executor := &HarborEvaluatorLocalCommandExecutor{root: root, invocations: make(map[string]stageprovider.HarborEvaluatorInvocation, len(config.Invocations)), lookupEnv: lookup, prelaunchAttestor: config.PrelaunchAttestor, runner: runner}
 	for _, invocation := range config.Invocations {
 		if err := validateInvocation(invocation); err != nil {
 			return nil, err
@@ -199,12 +205,20 @@ func (executor *HarborEvaluatorLocalCommandExecutor) ExecuteLocalCommand(ctx con
 	if err := os.Mkdir(jobsRoot, 0o700); err != nil {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("create Harbor evaluator jobs directory: %w", err)
 	}
-	if err := os.Mkdir(filepath.Join(workspace, "harbor-home"), 0o700); err != nil {
+	harborHome := filepath.Join(workspace, "harbor-home")
+	if err := os.Mkdir(harborHome, 0o700); err != nil {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("create isolated Harbor evaluator home: %w", err)
+	}
+	if err := os.Mkdir(filepath.Join(harborHome, ".docker"), 0o700); err != nil {
+		return workflowkit.StageExecutionResult{}, fmt.Errorf("create isolated Harbor evaluator Docker configuration: %w", err)
 	}
 	jobName := evaluatorJobName(invocation.Request, payload.CommandID)
 	if err := validateNoExistingJob(jobsRoot, jobName); err != nil {
 		return workflowkit.StageExecutionResult{}, err
+	}
+	processEnvironment, err := executor.prelaunchAttestor.AttestHarborEvaluatorInvocationBeforeLaunch(ctx, config, harborHome)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, fmt.Errorf("attest Harbor evaluator immediately before launch: %w", err)
 	}
 
 	envFile, sensitiveValues, err := executor.writeApprovedEnvFile(workspace, config)
@@ -212,7 +226,14 @@ func (executor *HarborEvaluatorLocalCommandExecutor) ExecuteLocalCommand(ctx con
 		return workflowkit.StageExecutionResult{}, err
 	}
 	defer os.Remove(envFile)
-	command := evaluatorCommand(config, taskRoot, jobsRoot, jobName, envFile)
+	launchEnvironment, err := executor.prelaunchAttestor.AttestHarborEvaluatorInvocationBeforeLaunch(ctx, config, harborHome)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, fmt.Errorf("re-attest Harbor evaluator immediately before process start: %w", err)
+	}
+	if !slices.Equal(processEnvironment, launchEnvironment) {
+		return workflowkit.StageExecutionResult{}, errors.New("Harbor evaluator launch environment changed between runtime attestations")
+	}
+	command := evaluatorCommand(config, taskRoot, jobsRoot, jobName, envFile, launchEnvironment)
 	result, runErr := executor.runner.Run(ctx, command)
 	rawOutputDigest, digestErr := evaluatorRawOutputFingerprint(result, runErr)
 	if digestErr != nil {
@@ -371,7 +392,15 @@ func validateInvocation(invocation stageprovider.HarborEvaluatorInvocation) erro
 	if invocation.CommandID != stageprovider.HarborEvaluatorQwenCommandID && invocation.CommandID != stageprovider.HarborEvaluatorOpusCommandID {
 		return fmt.Errorf("unsupported Harbor evaluator command %q", invocation.CommandID)
 	}
-	if invocation.LauncherPath == "" || invocation.HarborVersion != stageprovider.HarborEvaluatorHarborVersion || invocation.AgentID != "claude-code" || invocation.AgentVersion == "" || invocation.ModelID == "" ||
+	dockerPATH, err := stageprovider.HarborEvaluatorDockerPATH(invocation.DockerCLIPath)
+	if err != nil || invocation.DockerPATH != dockerPATH {
+		return errors.New("incomplete Harbor evaluator Docker PATH attestation")
+	}
+	if !filepath.IsAbs(invocation.LauncherPath) || invocation.LauncherVersion == "" || !filepath.IsAbs(invocation.PythonInterpreterPath) || invocation.PythonInterpreterVersion == "" || !filepath.IsAbs(invocation.PythonSourceTreePath) ||
+		invocation.HarborVersion != stageprovider.HarborEvaluatorHarborVersion || invocation.AgentID != "claude-code" || invocation.AgentVersion == "" || invocation.ModelID == "" ||
+		invocation.DockerVersion != stageprovider.HarborEvaluatorDockerVersion || invocation.DockerServerVersion != stageprovider.HarborEvaluatorDockerServerVersion ||
+		!filepath.IsAbs(invocation.DockerComposePluginPath) || filepath.Clean(invocation.DockerComposePluginPath) != invocation.DockerComposePluginPath || filepath.Base(invocation.DockerComposePluginPath) != "docker-compose" || invocation.DockerComposeVersion != stageprovider.HarborEvaluatorDockerComposeVersion || invocation.DockerComposeVersionOutput != stageprovider.HarborEvaluatorDockerComposeVersionOutput ||
+		!filepath.IsAbs(invocation.DockerBuildxPluginPath) || filepath.Clean(invocation.DockerBuildxPluginPath) != invocation.DockerBuildxPluginPath || filepath.Base(invocation.DockerBuildxPluginPath) != "docker-buildx" || invocation.DockerBuildxVersion != stageprovider.HarborEvaluatorDockerBuildxVersion || invocation.DockerBuildxVersionOutput != stageprovider.HarborEvaluatorDockerBuildxVersionOutput ||
 		invocation.TaskArtifactPort != stageprovider.HarborEvaluatorTaskArtifactPort || invocation.TaskArtifactSchema != stageprovider.HarborEvaluatorTaskArtifactSchema ||
 		invocation.Attempts != stageprovider.HarborEvaluatorTrialCount || invocation.ConcurrentTrials != stageprovider.HarborEvaluatorConcurrentTrials || invocation.MaxRetries != stageprovider.HarborEvaluatorMaxRetries || !invocation.RequireTrajectory ||
 		invocation.EndpointEnvName == "" || invocation.EndpointChildEnvKey == "" || len(invocation.SecretEnvTemplates) == 0 {
@@ -379,6 +408,21 @@ func validateInvocation(invocation stageprovider.HarborEvaluatorInvocation) erro
 	}
 	if err := invocation.LauncherContentSHA256.Validate(); err != nil {
 		return fmt.Errorf("Harbor evaluator launcher fingerprint: %w", err)
+	}
+	if err := invocation.PythonInterpreterContentSHA256.Validate(); err != nil {
+		return fmt.Errorf("Harbor evaluator Python interpreter fingerprint: %w", err)
+	}
+	if err := invocation.PythonSourceFilesSHA256.Validate(); err != nil {
+		return fmt.Errorf("Harbor evaluator Python source tree fingerprint: %w", err)
+	}
+	for label, fingerprint := range map[string]workflowkit.Fingerprint{
+		"Docker CLI":            invocation.DockerCLIContentSHA256,
+		"Docker Compose plugin": invocation.DockerComposeContentSHA256,
+		"Docker Buildx plugin":  invocation.DockerBuildxContentSHA256,
+	} {
+		if err := fingerprint.Validate(); err != nil {
+			return fmt.Errorf("Harbor evaluator %s fingerprint: %w", label, err)
+		}
 	}
 	if err := invocation.EndpointFingerprint.Validate(); err != nil {
 		return fmt.Errorf("Harbor evaluator endpoint fingerprint: %w", err)
@@ -565,7 +609,7 @@ func (executor *HarborEvaluatorLocalCommandExecutor) writeApprovedEnvFile(worksp
 	return path, sensitiveValues, nil
 }
 
-func evaluatorCommand(config stageprovider.HarborEvaluatorInvocation, taskRoot, jobsRoot, jobName, envFile string) Command {
+func evaluatorCommand(config stageprovider.HarborEvaluatorInvocation, taskRoot, jobsRoot, jobName, envFile string, environment []string) Command {
 	return Command{
 		Path: config.LauncherPath,
 		Args: []string{
@@ -580,11 +624,7 @@ func evaluatorCommand(config stageprovider.HarborEvaluatorInvocation, taskRoot, 
 			"--quiet", "--yes",
 		},
 		Dir: filepath.Dir(taskRoot),
-		Env: []string{
-			"HOME=" + filepath.Join(filepath.Dir(taskRoot), "harbor-home"),
-			"LANG=C.UTF-8",
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		},
+		Env: append([]string(nil), environment...),
 	}
 }
 

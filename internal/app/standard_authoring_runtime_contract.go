@@ -12,7 +12,7 @@ import (
 // compiled into this binary. Historical records remain inspectable but are
 // never executed through an ambient "latest" authoring contract.
 func isCurrentStandardAuthoringRun(run store.WorkflowRun) bool {
-	return workflowadapter.IsStandardAuthoringWorkflowTemplate(workflowadapter.TemplateReference{
+	return workflowadapter.StandardAuthoringBriefTemplateReference().Equal(workflowadapter.TemplateReference{
 		ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion,
 	})
 }
@@ -50,6 +50,14 @@ func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manif
 		}
 		if expectedUsesPolicy && (expectedPolicy != actualPolicy || !actualPolicy.Required || actualPolicy.SchemaVersion != workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion) {
 			return fmt.Errorf("Standard authoring Run %s frozen descriptor has an invalid environment policy contract for stage %q", run.ID, expectedStage.Key)
+		}
+		expectedBrief, expectedUsesBrief := standardAuthoringArtifactSpec(expectedStage.Inputs, workflowadapter.StandardAuthoringBriefArtifact)
+		actualBrief, actualUsesBrief := standardAuthoringArtifactSpec(actualStage.Inputs, workflowadapter.StandardAuthoringBriefArtifact)
+		if expectedUsesBrief != actualUsesBrief {
+			return fmt.Errorf("Standard authoring Run %s frozen descriptor changes brief contract for stage %q", run.ID, expectedStage.Key)
+		}
+		if expectedUsesBrief && (expectedBrief != actualBrief || !actualBrief.Required || actualBrief.SchemaVersion != workflowadapter.StandardAuthoringBriefSchemaVersion) {
+			return fmt.Errorf("Standard authoring Run %s frozen descriptor has an invalid brief contract for stage %q", run.ID, expectedStage.Key)
 		}
 	}
 	return nil

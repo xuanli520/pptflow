@@ -46,6 +46,11 @@ func TestDeploymentOperationCatalogLockCanonicalStrictJSONAndFingerprint(t *test
 	if parsed.LockID != lock.LockID || len(parsed.Operations) != len(lock.Operations) {
 		t.Fatalf("parsed lock = %+v, want %q with %d operations", parsed, lock.LockID, len(lock.Operations))
 	}
+	legacy := lock.Clone()
+	legacy.Version = "2"
+	if err := legacy.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("legacy v2 lock validation error = %v, want invalid lock", err)
+	}
 	var direct DeploymentOperationCatalogLock
 	if err := json.Unmarshal(baselineJSON, &direct); err != nil {
 		t.Fatalf("direct unmarshal must remain strict and valid: %v", err)

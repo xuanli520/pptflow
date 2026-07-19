@@ -26,7 +26,12 @@ var standardAuthoringLaunchTestCoordinate = StandardAuthoringSourceCoordinate{
 	CommitSHA:     "0123456789abcdef0123456789abcdef01234567",
 }
 
-const standardAuthoringLaunchTestBaseImage = "docker.io/library/rust:1.65@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const (
+	standardAuthoringLaunchTestBaseImage   = "docker.io/library/rust:1.65@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	standardAuthoringLaunchTestTaskType    = "feature"
+	standardAuthoringLaunchTestApplication = "tower-http"
+	standardAuthoringLaunchTestObjective   = "Add a focused Tower HTTP backend feature with deterministic tests."
+)
 
 func mustStandardAuthoringEnvironmentPolicyInput(t *testing.T, artifactID string) standardAuthoringEnvironmentPolicyInput {
 	t.Helper()
@@ -35,6 +40,19 @@ func mustStandardAuthoringEnvironmentPolicyInput(t *testing.T, artifactID string
 		t.Fatal(err)
 	}
 	input, err := newStandardAuthoringEnvironmentPolicyInput(artifactID, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return input
+}
+
+func mustStandardAuthoringBriefInput(t *testing.T, artifactID string) standardAuthoringBriefInput {
+	t.Helper()
+	brief, err := workflowadapter.NewStandardAuthoringBrief(standardAuthoringLaunchTestTaskType, standardAuthoringLaunchTestApplication, standardAuthoringLaunchTestObjective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := newStandardAuthoringBriefInput(artifactID, brief)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +100,8 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage:                    standardAuthoringLaunchTestBaseImage,
-		Slug:                         "fixture-authoring", Title: "Fixture authoring", MetadataJSON: `{"difficulty":"hard"}`,
+		TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "fixture-authoring", Title: "Fixture authoring", MetadataJSON: `{"difficulty":"hard"}`,
 	}
 	receipt, err := services.AuthoringLaunches.Start(ctx, command)
 	if err != nil {
@@ -146,7 +165,21 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 	if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, policyInput); err != nil {
 		t.Fatalf("validate frozen session environment policy bindings: %v", err)
 	}
-	resolvedWorkflow, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(standardAuthoringLaunchTestProfile())
+	briefInput, err := standardAuthoringBriefInputFromSession(*session)
+	if err != nil {
+		t.Fatalf("read frozen session brief: %v", err)
+	}
+	if briefInput.Brief.TaskType != command.TaskType || briefInput.Brief.Application != command.Application || briefInput.Brief.Objective != command.Objective {
+		t.Fatalf("session brief = %+v, want command brief", briefInput.Brief)
+	}
+	ids, err := standardAuthoringLaunchIdentities(command.IdempotencyKey)
+	if err != nil || briefInput.ArtifactID != workflowkit.ArtifactID(ids.BriefArtifactID) {
+		t.Fatalf("brief artifact ID = %q, want deterministic %q, err=%v", briefInput.ArtifactID, ids.BriefArtifactID, err)
+	}
+	if err := validateStandardAuthoringBriefBindings(specification, briefInput); err != nil {
+		t.Fatalf("validate frozen session brief bindings: %v", err)
+	}
+	resolvedWorkflow, err := workflowadapter.StandardAuthoringBriefWorkflowTemplate().Compile(standardAuthoringLaunchTestProfile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +203,22 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 	policyBytes, err := readInput(ctx, binding)
 	if err != nil || !bytes.Equal(policyBytes, policyInput.CanonicalJSON) {
 		t.Fatalf("read dockerfile environment policy = %q err=%v", policyBytes, err)
+	}
+	repoAnalyzeStage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.RepoAnalyze))
+	if !found {
+		t.Fatal("Standard authoring catalog omitted repo_analyze")
+	}
+	briefBindings, err := managedRunInputBindingsForStageForSubject(ctx, database, services.core.objects, *run, subject, repoAnalyzeStage)
+	if err != nil {
+		t.Fatalf("resolve repo_analyze brief binding: %v", err)
+	}
+	briefBinding, found := briefBindings[workflowadapter.StandardAuthoringBriefArtifact]
+	if !found || briefBinding != briefInput.artifactBinding() {
+		t.Fatalf("repo_analyze brief binding = %+v, want %+v", briefBinding, briefInput.artifactBinding())
+	}
+	briefBytes, err := newStageInputReaderForSubject(database, services.core.objects, *run, subject, []workflowkit.ArtifactBinding{briefBinding})(ctx, briefBinding)
+	if err != nil || !bytes.Equal(briefBytes, briefInput.CanonicalJSON) {
+		t.Fatalf("read repo_analyze brief = %q err=%v", briefBytes, err)
 	}
 
 	replayed, err := services.AuthoringLaunches.Start(ctx, command)
@@ -205,8 +254,9 @@ func TestStandardAuthoringLaunchRejectsInvalidBaseImageBeforeAnyMutation(t *test
 			RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 			CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 			BaseImage:                    image,
-			Slug:                         "invalid-environment-policy",
-			Title:                        "Invalid environment policy",
+			TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+			Slug:  "invalid-environment-policy",
+			Title: "Invalid environment policy",
 		})
 		if startErr == nil {
 			t.Fatalf("base image %q unexpectedly started", image)
@@ -251,9 +301,10 @@ func TestStandardAuthoringLaunchReusesMatchingImmutableSourceForDistinctTasks(t 
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage:                    standardAuthoringLaunchTestBaseImage,
-		Slug:                         "first-source-reuse-task",
-		Title:                        "First source reuse task",
-		MetadataJSON:                 `{"ordinal":1}`,
+		TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug:         "first-source-reuse-task",
+		Title:        "First source reuse task",
+		MetadataJSON: `{"ordinal":1}`,
 	})
 	if err != nil {
 		t.Fatalf("start first Standard authoring task: %v", err)
@@ -267,9 +318,10 @@ func TestStandardAuthoringLaunchReusesMatchingImmutableSourceForDistinctTasks(t 
 		RepositoryURL:                "https://GitHub.com/example/fixture-repository.git/",
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage:                    standardAuthoringLaunchTestBaseImage,
-		Slug:                         "second-source-reuse-task",
-		Title:                        "Second source reuse task",
-		MetadataJSON:                 `{"ordinal":2}`,
+		TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug:         "second-source-reuse-task",
+		Title:        "Second source reuse task",
+		MetadataJSON: `{"ordinal":2}`,
 	})
 	if err != nil {
 		t.Fatalf("start second Standard authoring task: %v", err)
@@ -375,9 +427,10 @@ func TestStandardAuthoringLaunchPreservesSourceUUIDCollisionWhenNoMatchingSnapsh
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage:                    standardAuthoringLaunchTestBaseImage,
-		Slug:                         "new-task-with-colliding-source-id",
-		Title:                        "New task with colliding source ID",
-		MetadataJSON:                 `{}`,
+		TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug:         "new-task-with-colliding-source-id",
+		Title:        "New task with colliding source ID",
+		MetadataJSON: `{}`,
 	})
 	if !errors.Is(err, store.ErrIdentityCollision) {
 		t.Fatalf("source UUID collision error = %v, want ErrIdentityCollision", err)
@@ -414,7 +467,8 @@ func TestStandardAuthoringLaunchRejectsChangedInputForCompletedKeyWithoutRecaptu
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage:                    standardAuthoringLaunchTestBaseImage,
-		Slug:                         "fixture-source", Title: "Fixture source", MetadataJSON: `{}`,
+		TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "fixture-source", Title: "Fixture source", MetadataJSON: `{}`,
 	}
 	first, err := services.AuthoringLaunches.Start(ctx, base)
 	if err != nil {
@@ -439,6 +493,11 @@ func TestStandardAuthoringLaunchRejectsChangedInputForCompletedKeyWithoutRecaptu
 	changed.BaseImage = "docker.io/library/rust:1.66@sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 	if _, err := services.AuthoringLaunches.Start(ctx, changed); !errors.Is(err, store.ErrIdempotencyConflict) || capturer.calls != 1 {
 		t.Fatalf("changed completed base image = %v; want idempotency conflict and one capture", err)
+	}
+	changed = base
+	changed.Objective = "Create a different backend feature."
+	if _, err := services.AuthoringLaunches.Start(ctx, changed); !errors.Is(err, store.ErrIdempotencyConflict) || capturer.calls != 1 {
+		t.Fatalf("changed completed brief = %v; want idempotency conflict and one capture", err)
 	}
 	replayed, err := services.AuthoringLaunches.Start(ctx, base)
 	if err != nil || replayed != first || capturer.calls != 1 {
@@ -473,7 +532,8 @@ func TestStandardAuthoringLaunchRejectsChangedSourceForPreparedKeyBeforeRecaptur
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage:                    standardAuthoringLaunchTestBaseImage,
-		Slug:                         "prepared-source", Title: "Prepared source", MetadataJSON: `{}`,
+		TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "prepared-source", Title: "Prepared source", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil || capturer.calls != 1 {
 		t.Fatalf("first source capture = %v; calls=%d", err, capturer.calls)
@@ -522,7 +582,8 @@ func TestStandardAuthoringLaunchRejectsDeploymentDriftBeforeRetryCapture(t *test
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
 		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage:                    standardAuthoringLaunchTestBaseImage,
-		Slug:                         "deployment-drift-fence", Title: "Deployment drift fence", MetadataJSON: `{}`,
+		TaskType:                     standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "deployment-drift-fence", Title: "Deployment drift fence", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil || capturer.calls != 1 {
 		t.Fatalf("initial capture failure = %v; calls=%d", err, capturer.calls)
@@ -581,7 +642,7 @@ func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileId
 		CatalogSchemaVersion: stageprovider.DeploymentOperationCatalogVersion,
 		CatalogID:            "standard-authoring-test-catalog",
 		CatalogVersion:       "1",
-		Template:             workflowadapter.StandardAuthoringTemplateReference(),
+		Template:             workflowadapter.StandardAuthoringBriefTemplateReference(),
 		CatalogFingerprint:   workflowkit.SHA256Fingerprint([]byte("catalog")),
 	}
 	receiptCanonical, err := receipt.CanonicalJSON()
@@ -595,9 +656,12 @@ func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileId
 	if err != nil {
 		t.Fatal(err)
 	}
-	preparation := newStandardAuthoringLaunchPreparation(store.LifecycleOperation{
+	preparation, err := newStandardAuthoringLaunchPreparation(store.LifecycleOperation{
 		ID: operationID, Action: string(standardAuthoringLaunchAction), TaskID: ids.TaskID, RunID: ids.RunID, State: store.LifecycleOperationPrepared,
-	}, ids, definition, mustStandardAuthoringEnvironmentPolicyInput(t, ids.EnvironmentPolicyArtifactID))
+	}, ids, definition, mustStandardAuthoringEnvironmentPolicyInput(t, ids.EnvironmentPolicyArtifactID), mustStandardAuthoringBriefInput(t, ids.BriefArtifactID))
+	if err != nil {
+		t.Fatal(err)
+	}
 	directory, err := os.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -621,8 +685,18 @@ func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileId
 	if !sameStandardAuthoringLaunchDeploymentDefinition(storedDefinition, definition) ||
 		!bytes.Equal(stored.DeploymentCatalogReceipt, receiptCanonical) ||
 		!sameDeploymentCatalogLockIdentity(stored.DeploymentCatalogLockIdentity, lockIdentity) ||
-		stored.ProfileFingerprint != definition.ProfileFingerprint || stored.PreparationFingerprint != definition.Fingerprint {
+		stored.ProfileFingerprint != definition.ProfileFingerprint || stored.PreparationFingerprint == definition.Fingerprint {
 		t.Fatalf("persisted static deployment identity = %+v, want %+v", stored, definition)
+	}
+	tampered := stored
+	tampered.BriefDigest = workflowkit.SHA256Fingerprint([]byte("different brief"))
+	if err := verifyStandardAuthoringLaunchPreparation(tampered, preparation); err == nil {
+		t.Fatal("tampered brief digest was accepted on preparation replay")
+	}
+	legacy := stored
+	legacy.Version = "3"
+	if _, err := legacy.CanonicalJSON(); err == nil {
+		t.Fatal("historical preparation version was reinterpreted as the 1.4.0 contract")
 	}
 }
 
@@ -655,7 +729,8 @@ func TestStandardAuthoringLaunchCompletedReplayIgnoresLaterDeploymentAvailabilit
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "prove completed replay is deployment independent"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "completed-replay-deployment", Title: "Completed replay deployment", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "completed-replay-deployment", Title: "Completed replay deployment", MetadataJSON: `{}`,
 	}
 	firstReceipt, err := services.AuthoringLaunches.Start(ctx, command)
 	if err != nil {
@@ -721,7 +796,8 @@ func standardAuthoringAssertStaticCatalogPreflightFailure(t *testing.T, ctx cont
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "prove static catalog preflight"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "static-catalog-preflight", Title: "Static catalog preflight", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "static-catalog-preflight", Title: "Static catalog preflight", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil {
 		t.Fatal("static catalog proof unexpectedly started capture")
@@ -757,7 +833,8 @@ func TestStandardAuthoringLaunchPreparedOperationWithoutPreparationFailsClosed(t
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "simulate crash before preparation"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "missing-preparation", Title: "Missing preparation", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "missing-preparation", Title: "Missing preparation", MetadataJSON: `{}`,
 	}
 	coordinate, err := standardAuthoringLaunchCoordinate(command)
 	if err != nil {
@@ -772,7 +849,8 @@ func TestStandardAuthoringLaunchPreparedOperationWithoutPreparationFailsClosed(t
 		t.Fatal(err)
 	}
 	if _, replay, err := (&LifecycleMutationService{core: services.core}).begin(ctx, standardAuthoringLaunchAction, command.LifecycleMutationCommandBase, standardAuthoringLaunchRequest{
-		RepositoryURL: coordinate.RepositoryURL, CommitSHA: coordinate.CommitSHA, BaseImage: command.BaseImage, Slug: command.Slug, Title: command.Title, MetadataJSON: metadata,
+		RepositoryURL: coordinate.RepositoryURL, CommitSHA: coordinate.CommitSHA, BaseImage: command.BaseImage,
+		TaskType: command.TaskType, Application: command.Application, Objective: command.Objective, Slug: command.Slug, Title: command.Title, MetadataJSON: metadata,
 	}, lifecycleOperationTargets{TaskID: ids.TaskID, RunID: ids.RunID}); err != nil || replay != nil {
 		t.Fatalf("prepare operation without filesystem definition: replay=%+v err=%v", replay, err)
 	}
@@ -808,7 +886,8 @@ func TestStandardAuthoringLaunchRejectsSymlinkedManagedRecordsWithoutRecapture(t
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "reject malformed capture receipt"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "symlinked-capture-record", Title: "Symlinked capture record", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "symlinked-capture-record", Title: "Symlinked capture record", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); err == nil || capturer.calls != 1 {
 		t.Fatalf("initial transient capture failure = %v calls=%d", err, capturer.calls)
@@ -874,7 +953,8 @@ func TestStandardAuthoringLaunchRecoveryUsesCaptureReceiptWithoutRecapture(t *te
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "recover durable capture receipt"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "expected-different-task", Title: "Expected different task", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "expected-different-task", Title: "Expected different task", MetadataJSON: `{}`,
 	}
 	if _, err := services.AuthoringLaunches.Start(ctx, command); !errors.Is(err, store.ErrIdempotencyConflict) || capturer.calls != 1 {
 		t.Fatalf("first post-receipt failure = %v calls=%d", err, capturer.calls)
@@ -922,7 +1002,8 @@ func TestStandardAuthoringLaunchSerializesCaptureAndCancellationDoesNotPublishAn
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "serialize same operation capture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "serialized-capture", Title: "Serialized capture", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "serialized-capture", Title: "Serialized capture", MetadataJSON: `{}`,
 	}
 	firstResult := make(chan struct {
 		receipt LifecycleMutationReceipt
@@ -1001,7 +1082,8 @@ func TestStandardAuthoringLaunchConcurrentSuccessfulCallsShareOneCaptureReceipt(
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "concurrent successful source capture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		Slug:      "concurrent-success-capture", Title: "Concurrent success capture", MetadataJSON: `{}`,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		Slug: "concurrent-success-capture", Title: "Concurrent success capture", MetadataJSON: `{}`,
 	}
 	type outcome struct {
 		receipt LifecycleMutationReceipt
@@ -1105,7 +1187,7 @@ func standardAuthoringLaunchTestOptions(capturer StandardAuthoringSourceCapturer
 	return LifecycleServicesOptions{
 		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
 		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
-			Template: workflowadapter.StandardAuthoringTemplateReference(), Resolver: catalog,
+			Template: workflowadapter.StandardAuthoringBriefTemplateReference(), Resolver: catalog,
 		}},
 		StandardAuthoringSourceCapturer:        capturer,
 		StandardAuthoringRunDefinitionProvider: definitions,
@@ -1170,16 +1252,16 @@ func standardAuthoringLaunchTestDefinitionProvider(t *testing.T) *CatalogStandar
 	t.Helper()
 	catalogDocument := stageprovider.DeploymentOperationCatalog{
 		Format: stageprovider.DeploymentOperationCatalogFormat, Version: stageprovider.DeploymentOperationCatalogVersion,
-		CatalogID: "standard-authoring-test", CatalogVersion: "1", Template: workflowadapter.StandardAuthoringTemplateReference(), Operations: []stageprovider.DeploymentOperationRegistration{},
+		CatalogID: "standard-authoring-test", CatalogVersion: "1", Template: workflowadapter.StandardAuthoringBriefTemplateReference(), Operations: []stageprovider.DeploymentOperationRegistration{},
 	}
-	for _, stage := range workflowadapter.StandardAuthoringStageCatalog().Stages {
+	for _, stage := range workflowadapter.StandardAuthoringBriefStageCatalog().Stages {
 		operation := workflowadapter.StageOperationBinding{ProviderID: "standard-authoring-test-provider", OperationID: "test." + string(stage.Key), Version: "1"}
 		switch stage.Key {
 		case workflowkit.StageKey(workflowadapter.RepoPrepare):
 			operation.Payload = workflowadapter.LocalCommandOperationPayload{CommandID: "test-source-capture", Arguments: []string{}}
 		case workflowkit.StageKey(workflowadapter.TaskReview), workflowkit.StageKey(workflowadapter.ContentReview), workflowkit.StageKey(workflowadapter.SolutionReview):
 			operation.Payload = workflowadapter.DurableReviewOperationPayload{PolicyID: "test-review"}
-		case workflowkit.StageKey(workflowadapter.MaterializeTask):
+		case workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission), workflowkit.StageKey(workflowadapter.MaterializeTask):
 			operation.Payload = workflowadapter.HarborBuiltinOperationPayload{HandlerID: "test-materialize"}
 		default:
 			operation.Payload = workflowadapter.AgentTurnOperationPayload{AgentID: "test-agent", ModelID: "test-model", ReasoningEffort: workflowadapter.AgentReasoningEffortHigh, MaxTurns: stage.RequiredTurns}
@@ -1231,6 +1313,8 @@ func standardAuthoringLaunchTestStageType(t *testing.T, key workflowkit.StageKey
 		return workflowadapter.StageBindingTestsAnalysis
 	case workflowkit.StageKey(workflowadapter.SolutionReview):
 		return workflowadapter.StageBindingSolutionReview
+	case workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission):
+		return workflowadapter.StageBindingCodeEdgePackageAdmission
 	case workflowkit.StageKey(workflowadapter.MaterializeTask):
 		return workflowadapter.StageBindingMaterializeTask
 	default:
@@ -1240,7 +1324,7 @@ func standardAuthoringLaunchTestStageType(t *testing.T, key workflowkit.StageKey
 }
 
 func standardAuthoringLaunchTestProfile() workflowadapter.ExecutionProfile {
-	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringBriefWorkflowTemplate()
 	profile := workflowadapter.ExecutionProfile{
 		Template: template.Reference(), ID: "standard-authoring-test", Version: "1", ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL,
 		ControlGracePeriod: 30 * time.Second, CandidateProviderBudget: workflowadapter.CandidateProviderBudget{AttemptTimeout: time.Minute},

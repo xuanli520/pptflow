@@ -409,7 +409,7 @@ func discoverCodexLock(config buildConfig) (stageprovider.CodexAppServerOperatio
 		JavaScriptLauncher: stageprovider.LocalExecutableLock{CommandID: stageprovider.CodexAppServerJavaScriptLauncherCommandID, AbsolutePath: config.codexLauncher, Version: launcherVersion, ContentSHA256: launcherHash},
 		NodeExecutable:     stageprovider.LocalExecutableLock{CommandID: stageprovider.CodexAppServerNodeExecutableCommandID, AbsolutePath: config.codexNode, Version: nodeVersion, ContentSHA256: nodeHash},
 		CodexHomeDirectory: config.codexHome, CLIVersionOutput: cliVersionOutput,
-		SandboxMode: stageprovider.CodexAppServerSandboxModeWorkspaceWrite, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyWorkspaceWrite,
+		SandboxMode: stageprovider.CodexAppServerSandboxModeReadOnly, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyReadOnly,
 		NetworkAccess: false,
 	}, nil
 }

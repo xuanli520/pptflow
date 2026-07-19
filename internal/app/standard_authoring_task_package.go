@@ -26,6 +26,7 @@ type StandardAuthoringTaskPackageInput struct {
 	TestsAnalysis []byte
 	Source        store.AuthoringSource
 	Environment   workflowadapter.StandardAuthoringEnvironmentPolicy
+	Brief         *workflowadapter.StandardAuthoringBrief
 	Admission     codeedge.TaskAdmissionContract
 }
 
@@ -47,6 +48,11 @@ func CompileStandardAuthoringTaskPackage(input StandardAuthoringTaskPackageInput
 	if err := input.Admission.Validate(); err != nil {
 		return StandardAuthoringTaskPackageResult{}, fmt.Errorf("validate frozen CodeEdge admission contract: %w", err)
 	}
+	if input.Brief != nil {
+		if err := input.Brief.Validate(); err != nil {
+			return StandardAuthoringTaskPackageResult{}, fmt.Errorf("validate frozen Standard authoring brief: %w", err)
+		}
+	}
 	repositoryURL, err := store.NormalizeAuthoringRepositoryURL(input.Source.RepositoryURL)
 	if err != nil {
 		return StandardAuthoringTaskPackageResult{}, fmt.Errorf("validate frozen Authoring source repository: %w", err)
@@ -59,7 +65,7 @@ func CompileStandardAuthoringTaskPackage(input StandardAuthoringTaskPackageInput
 		return StandardAuthoringTaskPackageResult{}, fmt.Errorf("validate frozen Standard authoring Dockerfile base image: %w", err)
 	}
 
-	taskTOML, canonicalizationViolations, err := canonicalizeStandardAuthoringTaskTOML(input.TaskTOMLDraft, input.Admission.Profile.Metadata, repositoryURL, commitSHA)
+	taskTOML, canonicalizationViolations, err := canonicalizeStandardAuthoringTaskTOML(input.TaskTOMLDraft, input.Admission.Profile.Metadata, repositoryURL, commitSHA, input.Brief)
 	if err != nil {
 		return StandardAuthoringTaskPackageResult{}, err
 	}
@@ -89,27 +95,25 @@ func CompileStandardAuthoringTaskPackage(input StandardAuthoringTaskPackageInput
 
 func clonePackageBytes(value []byte) []byte { return append([]byte(nil), value...) }
 
-func canonicalizeStandardAuthoringTaskTOML(raw []byte, mapping codeedge.MetadataFieldMapping, repositoryURL, commitSHA string) ([]byte, []codeedge.Violation, error) {
-	var document map[string]any
-	decoder := toml.NewDecoder(bytes.NewReader(raw))
-	if err := decoder.Decode(&document); err != nil {
-		return nil, nil, fmt.Errorf("parse generated task.toml: %w", err)
+type standardAuthoringTaskTOMLFact struct {
+	name  string
+	path  codeedge.TOMLPath
+	value string
+}
+
+func canonicalizeStandardAuthoringTaskTOML(raw []byte, mapping codeedge.MetadataFieldMapping, repositoryURL, commitSHA string, brief *workflowadapter.StandardAuthoringBrief) ([]byte, []codeedge.Violation, error) {
+	document, err := parseStandardAuthoringTaskTOML(raw)
+	if err != nil {
+		return nil, nil, err
 	}
-	if document == nil {
-		return nil, nil, fmt.Errorf("parse generated task.toml: document is required")
-	}
-	paths := []struct {
-		name  string
-		path  codeedge.TOMLPath
-		value string
-	}{
+	violations := make([]codeedge.Violation, 0)
+	sourceFacts := []standardAuthoringTaskTOMLFact{
 		{"metadata.github_url", mapping.GitHubURL, repositoryURL},
 		{"metadata.commit_id", mapping.CommitID, commitSHA},
 		{"source.repository_url", codeedge.TOMLPath{"source", "repository_url"}, repositoryURL},
 		{"source.commit_sha", codeedge.TOMLPath{"source", "commit_sha"}, commitSHA},
 	}
-	violations := make([]codeedge.Violation, 0)
-	for _, item := range paths {
+	for _, item := range sourceFacts {
 		if len(item.path) == 0 {
 			return nil, nil, fmt.Errorf("CodeEdge task admission contract omits %s mapping", item.name)
 		}
@@ -120,11 +124,77 @@ func canonicalizeStandardAuthoringTaskTOML(raw []byte, mapping codeedge.Metadata
 			return nil, nil, fmt.Errorf("canonicalize generated task.toml %s: %w", item.name, err)
 		}
 	}
+	if brief != nil {
+		briefFacts, err := standardAuthoringBriefMetadataFacts(mapping, *brief)
+		if err != nil {
+			return nil, nil, err
+		}
+		violations = append(violations, standardAuthoringBriefFactViolations(document, briefFacts)...)
+		for _, fact := range briefFacts {
+			if err := setTaskTOMLString(document, fact.path, fact.value); err != nil {
+				return nil, nil, fmt.Errorf("canonicalize generated task.toml %s: %w", fact.name, err)
+			}
+		}
+	}
 	encoded, err := toml.Marshal(document)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode canonical task.toml: %w", err)
 	}
 	return encoded, violations, nil
+}
+
+func parseStandardAuthoringTaskTOML(raw []byte) (map[string]any, error) {
+	var document map[string]any
+	decoder := toml.NewDecoder(bytes.NewReader(raw))
+	if err := decoder.Decode(&document); err != nil {
+		return nil, fmt.Errorf("parse generated task.toml: %w", err)
+	}
+	if document == nil {
+		return nil, fmt.Errorf("parse generated task.toml: document is required")
+	}
+	return document, nil
+}
+
+func validateStandardAuthoringTaskTOMLBrief(raw []byte, mapping codeedge.MetadataFieldMapping, brief workflowadapter.StandardAuthoringBrief) ([]codeedge.Violation, error) {
+	document, err := parseStandardAuthoringTaskTOML(raw)
+	if err != nil {
+		return nil, err
+	}
+	return standardAuthoringBriefMetadataViolations(document, mapping, brief)
+}
+
+func standardAuthoringBriefMetadataViolations(document map[string]any, mapping codeedge.MetadataFieldMapping, brief workflowadapter.StandardAuthoringBrief) ([]codeedge.Violation, error) {
+	facts, err := standardAuthoringBriefMetadataFacts(mapping, brief)
+	if err != nil {
+		return nil, err
+	}
+	return standardAuthoringBriefFactViolations(document, facts), nil
+}
+
+func standardAuthoringBriefMetadataFacts(mapping codeedge.MetadataFieldMapping, brief workflowadapter.StandardAuthoringBrief) ([]standardAuthoringTaskTOMLFact, error) {
+	if err := brief.Validate(); err != nil {
+		return nil, fmt.Errorf("validate frozen Standard authoring brief: %w", err)
+	}
+	facts := []standardAuthoringTaskTOMLFact{
+		{"metadata.task_type", mapping.TaskType, brief.TaskType},
+		{"metadata.application", mapping.Application, brief.Application},
+	}
+	for _, fact := range facts {
+		if len(fact.path) == 0 {
+			return nil, fmt.Errorf("CodeEdge task admission contract omits %s mapping", fact.name)
+		}
+	}
+	return facts, nil
+}
+
+func standardAuthoringBriefFactViolations(document map[string]any, facts []standardAuthoringTaskTOMLFact) []codeedge.Violation {
+	violations := make([]codeedge.Violation, 0)
+	for _, fact := range facts {
+		if existing, present := readTaskTOMLString(document, fact.path); !present || existing != fact.value {
+			violations = append(violations, codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated value does not exactly match frozen authoring brief at " + fact.name})
+		}
+	}
+	return violations
 }
 
 func readTaskTOMLString(document map[string]any, path codeedge.TOMLPath) (string, bool) {

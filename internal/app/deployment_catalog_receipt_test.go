@@ -1014,7 +1014,17 @@ func catalogLockFixtureRecord(t *testing.T, registration stageprovider.Deploymen
 					CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: "/opt/harbor/bin/docker", Version: stageprovider.HarborEvaluatorDockerVersion,
 					ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-docker-fixture")),
 				},
-				HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion,
+				DockerServerVersion: stageprovider.HarborEvaluatorDockerServerVersion,
+				DockerComposePlugin: stageprovider.LocalExecutableLock{
+					CommandID: stageprovider.HarborEvaluatorDockerComposeCommandID, AbsolutePath: "/opt/harbor/libexec/docker/cli-plugins/docker-compose", Version: stageprovider.HarborEvaluatorDockerComposeVersion,
+					ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-docker-compose-fixture")),
+				},
+				DockerBuildxPlugin: stageprovider.LocalExecutableLock{
+					CommandID: stageprovider.HarborEvaluatorDockerBuildxCommandID, AbsolutePath: "/opt/harbor/libexec/docker/cli-plugins/docker-buildx", Version: stageprovider.HarborEvaluatorDockerBuildxVersion,
+					ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-docker-buildx-fixture")),
+				},
+				HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion, DockerComposeVersionOutput: stageprovider.HarborEvaluatorDockerComposeVersionOutput,
+				DockerBuildxVersionOutput: stageprovider.HarborEvaluatorDockerBuildxVersionOutput,
 			}
 		}
 	case workflowadapter.ContainerCommandOperationPayload:

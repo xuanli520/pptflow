@@ -55,7 +55,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 		t.Fatalf("open requests = %d, want one", len(runtime.openRequests))
 	}
 	open := runtime.openRequests[0]
-	if open.Model != CodexAppServerProductionModelID || open.ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || open.NetworkAccess || open.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || open.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || open.LogPath != os.DevNull {
+	if open.Model != CodexAppServerProductionModelID || open.ReasoningEffort != string(CodexAppServerProductionReasoningEffort) || open.NetworkAccess || open.SandboxMode != CodexAppServerSandboxModeReadOnly || open.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly || open.LogPath != os.DevNull {
 		t.Fatalf("controlled conversation request = %+v", open)
 	}
 	if len(open.DynamicTools) != 1 || open.DynamicTools[0].Name != standardAuthoringCodexSubmitToolName || open.DynamicTools[0].Handler == nil || !json.Valid(open.DynamicTools[0].InputSchema) {
@@ -295,9 +295,17 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPrepar
 	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{results: []agent.TurnResult{{
 		Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`,
 	}}, submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("analysis"))}}}}
-	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+	_, err = NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
 		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: root,
 		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
+	})
+	if !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
+		t.Fatalf("RunScoped executor without frozen source verifier error = %v", err)
+	}
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: root,
+		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, SourceVerifier: standardAuthoringCodexTestFrozenSourceVerifier{}, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
 		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
 	})
 	if err != nil {
@@ -313,15 +321,139 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPrepar
 		t.Fatalf("unprepared RunScoped workspace result=%+v err=%v opens=%d", result, err, len(runtime.openRequests))
 	}
 	workspace := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
-	if err := os.MkdirAll(workspace, 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Join(workspace, "src"), 0o750); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(workspace, "src", "lib.rs"), []byte("pub fn fixture() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringCodexSealTestSourceTree(t, workspace)
 	result, err = executor.ExecuteAgentTurn(context.Background(), invocation, standardAuthoringCodexTestPayload(1))
 	if err != nil || result.Outcome.Status != workflowkit.StatusCompleted || len(runtime.openRequests) != 1 {
 		t.Fatalf("prepared RunScoped workspace result=%+v err=%v opens=%d", result, err, len(runtime.openRequests))
 	}
 	if runtime.openRequests[0].ProjectPath != workspace || len(runtime.openRequests[0].WorkspaceRoots) != 1 || runtime.openRequests[0].WorkspaceRoots[0] != workspace {
 		t.Fatalf("RunScoped Codex workspace = %+v, want %q", runtime.openRequests[0], workspace)
+	}
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorRejectsWritableSourceEntryBeforeOpeningConversation(t *testing.T) {
+	stage := standardAuthoringCodexTestStage(1)
+	now := time.Date(2026, 7, 15, 8, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	runID := "018f0a73-3b49-7000-8000-0000000000d2"
+	workspace := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
+	if err := os.MkdirAll(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	writable := filepath.Join(workspace, "Cargo.toml")
+	if err := os.WriteFile(writable, []byte("[package]\nname = \"fixture\"\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringCodexSealTestSourceTree(t, workspace)
+	if err := os.Chmod(writable, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	program, err := NewStandardAuthoringCodexTurnProgram("standard-authoring.repo-analysis", "1", standardAuthoringCodexTestPrompts(1), 64*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{}}
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: root,
+		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, SourceVerifier: standardAuthoringCodexTestFrozenSourceVerifier{}, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	request.Execution.ID = runID
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request, Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil || result.ErrorText != standardAuthoringCodexFailureSource || len(runtime.openRequests) != 0 {
+		t.Fatalf("writable RunScoped source result=%+v err=%v opens=%d", result, err, len(runtime.openRequests))
+	}
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorRejectsSubmittedOutputAfterTurnMutatesFrozenSourceAndRestoresMode(t *testing.T) {
+	stage := standardAuthoringCodexTestStage(1)
+	now := time.Date(2026, 7, 19, 8, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	runID := "018f0a73-3b49-7000-8000-0000000000d3"
+	workspace := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
+	if err := os.MkdirAll(filepath.Join(workspace, "src"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(workspace, "src", "lib.rs")
+	if err := os.WriteFile(target, []byte("pub fn frozen() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringCodexSealTestSourceTree(t, workspace)
+	baseline, err := standardAuthoringCodexSourceTreeIdentity(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifications := 0
+	verifier := standardAuthoringCodexFrozenSourceVerifierFunc(func(_ context.Context, _ workflowkit.FrozenExecution, sourceRoot string) (workflowkit.Fingerprint, error) {
+		verifications++
+		identity, verifyErr := standardAuthoringCodexSourceTreeIdentity(sourceRoot)
+		if verifyErr != nil {
+			return "", verifyErr
+		}
+		if identity != baseline {
+			return "", errors.New("source differs from frozen snapshot")
+		}
+		return identity, nil
+	})
+	conversation := &standardAuthoringCodexConversationStub{
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("must-not-be-accepted"))}},
+		afterSubmissions: func(int) error {
+			if err := os.Chmod(target, 0o644); err != nil {
+				return err
+			}
+			if err := os.WriteFile(target, []byte("pub fn attacker_controlled() {}\n"), 0o644); err != nil {
+				return err
+			}
+			return os.Chmod(target, 0o444)
+		},
+	}
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: conversation}
+	program, err := NewStandardAuthoringCodexTurnProgram("standard-authoring.repo-analysis", "1", standardAuthoringCodexTestPrompts(1), 64*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: root,
+		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, SourceVerifier: verifier, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	request.Execution.ID = runID
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request, Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome.Status != workflowkit.StatusInfraFailed || result.Outcome.Failure != workflowkit.FailurePolicy || result.ErrorText != standardAuthoringCodexFailureSource || len(result.Artifacts) != 0 {
+		t.Fatalf("source mutation result = %+v, want rejected source-integrity failure", result)
+	}
+	if len(runtime.openRequests) != 1 || runtime.openRequests[0].SandboxMode != CodexAppServerSandboxModeReadOnly || runtime.openRequests[0].SandboxPolicy != CodexAppServerSandboxPolicyReadOnly {
+		t.Fatalf("source mutation runtime policy = %+v, want one read-only turn", runtime.openRequests)
+	}
+	if verifications != 3 || len(conversation.submissionResponses) != 1 || conversation.closed != 1 {
+		t.Fatalf("source mutation proof calls=%d submissions=%d closes=%d, want 3/1/1", verifications, len(conversation.submissionResponses), conversation.closed)
 	}
 }
 
@@ -344,7 +476,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorUsesFrozenDockerfileEnvironmentP
 		t.Fatal(err)
 	}
 	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
-		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: t.TempDir(),
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: standardAuthoringCodexReadOnlyTestWorkspace(t),
 		RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
 		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program},
 		Now:            func() time.Time { return now },
@@ -395,7 +527,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorRejectsMissingDockerfileEnvironm
 		t.Fatal(err)
 	}
 	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
-		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: t.TempDir(),
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: standardAuthoringCodexReadOnlyTestWorkspace(t),
 		RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
 		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program},
 		Now:            func() time.Time { return now },
@@ -428,7 +560,7 @@ func standardAuthoringCodexTestExecutor(t *testing.T, runtime agent.Runtime, now
 		t.Fatal(err)
 	}
 	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
-		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: t.TempDir(),
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(standardAuthoringCodexTestInvocation(t)), WorkspaceRoot: standardAuthoringCodexReadOnlyTestWorkspace(t),
 		RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
 		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{"repo_analyze": program},
 		Now:            func() time.Time { return now },
@@ -437,6 +569,42 @@ func standardAuthoringCodexTestExecutor(t *testing.T, runtime agent.Runtime, now
 		t.Fatal(err)
 	}
 	return executor, program
+}
+
+func standardAuthoringCodexReadOnlyTestWorkspace(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "src"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "lib.rs"), []byte("pub fn fixture() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringCodexSealTestSourceTree(t, root)
+	return root
+}
+
+func standardAuthoringCodexSealTestSourceTree(t *testing.T, root string) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o755)
+			}
+			return nil
+		})
+	})
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0o555)
+		}
+		return os.Chmod(path, 0o444)
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func standardAuthoringCodexTestPrompts(turns int) []string {
@@ -461,8 +629,8 @@ func standardAuthoringCodexTestInvocation(t *testing.T) CodexAppServerInvocation
 		AgentID: CodexAppServerProductionAgentID, AgentVersion: "1.0.0", ModelID: CodexAppServerProductionModelID, ModelVersion: "2026-07-15",
 		ReasoningEffort:        CodexAppServerProductionReasoningEffort,
 		JavaScriptLauncherPath: root + "/codex", NodeExecutablePath: root + "/node", CodexHomeDirectory: root,
-		CLIVersionOutput: "codex-cli 0.133.0", SandboxMode: CodexAppServerSandboxModeWorkspaceWrite,
-		SandboxPolicy: CodexAppServerSandboxPolicyWorkspaceWrite, NetworkAccess: false,
+		CLIVersionOutput: "codex-cli 0.133.0", SandboxMode: CodexAppServerSandboxModeReadOnly,
+		SandboxPolicy: CodexAppServerSandboxPolicyReadOnly, NetworkAccess: false,
 	}
 }
 
@@ -474,6 +642,18 @@ func standardAuthoringCodexTestInvocationFactory(invocation CodexAppServerInvoca
 
 func standardAuthoringCodexTestRuntimeFactory(runtime agent.Runtime) StandardAuthoringCodexRuntimeFactory {
 	return func(CodexAppServerInvocation) agent.Runtime { return runtime }
+}
+
+type standardAuthoringCodexTestFrozenSourceVerifier struct{}
+
+func (standardAuthoringCodexTestFrozenSourceVerifier) VerifyStandardAuthoringCodexFrozenSource(_ context.Context, _ workflowkit.FrozenExecution, root string) (workflowkit.Fingerprint, error) {
+	return standardAuthoringCodexSourceTreeIdentity(root)
+}
+
+type standardAuthoringCodexFrozenSourceVerifierFunc func(context.Context, workflowkit.FrozenExecution, string) (workflowkit.Fingerprint, error)
+
+func (verify standardAuthoringCodexFrozenSourceVerifierFunc) VerifyStandardAuthoringCodexFrozenSource(ctx context.Context, execution workflowkit.FrozenExecution, root string) (workflowkit.Fingerprint, error) {
+	return verify(ctx, execution, root)
 }
 
 func standardAuthoringCodexTestStage(turns int) workflowkit.StageDescriptor {
@@ -640,6 +820,7 @@ type standardAuthoringCodexConversationStub struct {
 	dynamicTools        []agent.DynamicTool
 	submissionResponses []json.RawMessage
 	submissionErrors    []error
+	afterSubmissions    func(int) error
 	closed              int
 	closeErr            error
 }
@@ -662,6 +843,11 @@ func (conversation *standardAuthoringCodexConversationStub) Turn(ctx context.Con
 			if err != nil {
 				return agent.TurnResult{}, err
 			}
+		}
+	}
+	if conversation.afterSubmissions != nil {
+		if err := conversation.afterSubmissions(index); err != nil {
+			return agent.TurnResult{}, err
 		}
 	}
 	if index >= len(conversation.results) {

@@ -130,6 +130,22 @@ func TestCodeEdgeEvaluatorProviderDefinitionBindsOnlyApprovedEnvironmentNames(t 
 		if invocation.AgentID != "claude-code" || invocation.AgentVersion != "2.1.207" || invocation.ModelID != model || invocation.EndpointEnvName != endpoint || invocation.EndpointChildEnvKey != "ANTHROPIC_BASE_URL" || invocation.Attempts != 4 || invocation.ConcurrentTrials != 1 || invocation.MaxRetries != stageprovider.HarborEvaluatorMaxRetries {
 			t.Fatalf("invocation %q is not the frozen evaluator contract", commandID)
 		}
+		if invocation.LauncherPath != "/usr/bin/true" || invocation.LauncherVersion != "0.18.0-test" || invocation.LauncherContentSHA256 != workflowkit.SHA256Fingerprint([]byte(commandID+" launcher")) ||
+			invocation.PythonInterpreterPath != "/usr/bin/true" || invocation.PythonInterpreterVersion != "3.13.0" || invocation.PythonInterpreterContentSHA256 != workflowkit.SHA256Fingerprint([]byte("python")) ||
+			invocation.PythonSourceTreePath != "/tmp/harbor-evaluator-test-source" || invocation.PythonSourceFilesSHA256 != workflowkit.SHA256Fingerprint([]byte("harbor source")) {
+			t.Fatalf("invocation %q did not retain the frozen Harbor/Python runtime: %+v", commandID, invocation)
+		}
+		if invocation.DockerServerVersion != stageprovider.HarborEvaluatorDockerServerVersion ||
+			invocation.DockerComposePluginPath != "/opt/harbor-factory-test/libexec/docker/cli-plugins/docker-compose" ||
+			invocation.DockerComposeContentSHA256 != workflowkit.SHA256Fingerprint([]byte("docker-compose")) ||
+			invocation.DockerComposeVersion != stageprovider.HarborEvaluatorDockerComposeVersion ||
+			invocation.DockerComposeVersionOutput != stageprovider.HarborEvaluatorDockerComposeVersionOutput ||
+			invocation.DockerBuildxPluginPath != "/opt/harbor-factory-test/libexec/docker/cli-plugins/docker-buildx" ||
+			invocation.DockerBuildxContentSHA256 != workflowkit.SHA256Fingerprint([]byte("docker-buildx")) ||
+			invocation.DockerBuildxVersion != stageprovider.HarborEvaluatorDockerBuildxVersion ||
+			invocation.DockerBuildxVersionOutput != stageprovider.HarborEvaluatorDockerBuildxVersionOutput {
+			t.Fatalf("invocation %q did not retain the frozen Docker runtime: %+v", commandID, invocation)
+		}
 		if len(invocation.SecretEnvTemplates) != 1 || invocation.SecretEnvTemplates[0].HostEnvKey != "ANTHROPIC_AUTH_TOKEN" || invocation.SecretEnvTemplates[0].ChildEnvKey != "ANTHROPIC_AUTH_TOKEN" || invocation.SecretEnvTemplates[0].Template != stageprovider.HarborEvaluatorSecretValueTemplate {
 			t.Fatalf("invocation %q secret mapping is not the approved private env-file mapping", commandID)
 		}
@@ -574,7 +590,9 @@ func testCodeEdgeEvaluatorDeploymentLock(t *testing.T, catalog *stageprovider.De
 		}
 		launcher := stageprovider.LocalExecutableLock{CommandID: payload.CommandID, AbsolutePath: "/usr/bin/true", Version: "0.18.0-test", ContentSHA256: workflowkit.SHA256Fingerprint([]byte(payload.CommandID + " launcher"))}
 		python := stageprovider.LocalExecutableLock{CommandID: stageprovider.HarborEvaluatorPythonCommandID, AbsolutePath: "/usr/bin/true", Version: "3.13.0", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("python"))}
-		docker := stageprovider.LocalExecutableLock{CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: "/usr/bin/true", Version: stageprovider.HarborEvaluatorDockerVersion, ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker"))}
+		docker := stageprovider.LocalExecutableLock{CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: "/opt/harbor-factory-test/bin/docker", Version: stageprovider.HarborEvaluatorDockerVersion, ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker"))}
+		compose := stageprovider.LocalExecutableLock{CommandID: stageprovider.HarborEvaluatorDockerComposeCommandID, AbsolutePath: "/opt/harbor-factory-test/libexec/docker/cli-plugins/docker-compose", Version: stageprovider.HarborEvaluatorDockerComposeVersion, ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-compose"))}
+		buildx := stageprovider.LocalExecutableLock{CommandID: stageprovider.HarborEvaluatorDockerBuildxCommandID, AbsolutePath: "/opt/harbor-factory-test/libexec/docker/cli-plugins/docker-buildx", Version: stageprovider.HarborEvaluatorDockerBuildxVersion, ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-buildx"))}
 		contract := registration.HarborEvaluator.Clone()
 		operations = append(operations, stageprovider.DeploymentOperationCatalogLockRecord{
 			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
@@ -585,7 +603,10 @@ func testCodeEdgeEvaluatorDeploymentLock(t *testing.T, catalog *stageprovider.De
 			HarborEvaluator: &stageprovider.HarborEvaluatorOperationLock{
 				Contract: contract, Launcher: launcher, PythonInterpreter: python,
 				PythonSourceTree: stageprovider.HarborPythonSourceTreeLock{AbsolutePath: "/tmp/harbor-evaluator-test-source", PythonFilesSHA256: workflowkit.SHA256Fingerprint([]byte("harbor source"))},
-				DockerCLI:        docker, HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion,
+				DockerCLI:        docker, DockerServerVersion: stageprovider.HarborEvaluatorDockerServerVersion,
+				DockerComposePlugin: compose, DockerBuildxPlugin: buildx, HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion,
+				DockerComposeVersionOutput: stageprovider.HarborEvaluatorDockerComposeVersionOutput,
+				DockerBuildxVersionOutput:  stageprovider.HarborEvaluatorDockerBuildxVersionOutput,
 			},
 		})
 	}

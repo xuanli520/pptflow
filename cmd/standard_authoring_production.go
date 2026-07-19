@@ -139,9 +139,10 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	}
 	providers, err := stageprovider.NewStandardAuthoringProviderComposition(stageprovider.StandardAuthoringProviderCompositionConfig{
 		Template: bundle.Catalog.Template(), Catalog: bundle.Catalog, Lock: bundle.Lock, Attestor: attestor,
-		Handlers:           stageprovider.StandardAuthoringOperationHandlers{HostCommand: repoPrepare, HarborBuiltin: materializer},
-		CodexWorkspaceRoot: workspaceRoot,
-		CodexWorkspaceMode: stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
+		Handlers:            stageprovider.StandardAuthoringOperationHandlers{HostCommand: repoPrepare, HarborBuiltin: materializer},
+		CodexWorkspaceRoot:  workspaceRoot,
+		CodexWorkspaceMode:  stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
+		CodexSourceVerifier: repoPrepare,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring provider composition: %w", err)

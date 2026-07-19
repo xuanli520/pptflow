@@ -74,6 +74,21 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 			dependencies:   standardAuthoringTaskAdmissionDependencies(),
 			validateStages: validateStandardAuthoringTaskAdmissionContract,
 		}, nil
+	case reference.Equal(StandardAuthoringBriefTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:                   standardAuthoringCatalogID,
+			catalogVersion:              StandardAuthoringBriefTemplateVersion,
+			stageOrder:                  StandardAuthoringTaskAdmissionStageOrder(),
+			groups:                      standardAuthoringStageGroups(),
+			requiresOperatorOnlyPackage: false,
+			gates: []workflowkit.StageKey{
+				workflowkit.StageKey(TaskReview),
+				workflowkit.StageKey(ContentReview),
+				workflowkit.StageKey(SolutionReview),
+			},
+			dependencies:   standardAuthoringTaskAdmissionDependencies(),
+			validateStages: validateStandardAuthoringBriefContract,
+		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
 			catalogID:                   codeEdgePhase1CatalogID,
@@ -222,6 +237,26 @@ func validateStandardAuthoringTaskAdmissionContract(stages map[workflowkit.Stage
 	return nil
 }
 
+func validateStandardAuthoringBriefContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	if err := validateStandardAuthoringTaskAdmissionContract(stages); err != nil {
+		return err
+	}
+	for _, key := range StandardAuthoringTaskAdmissionStageOrder() {
+		stage, present := stages[key]
+		if !present {
+			return fmt.Errorf("%w: required Standard authoring brief stage %q is missing", errInvalidCatalog, key)
+		}
+		wantsBrief := standardAuthoringStageUsesBrief(key)
+		inputCount, exactInputCount := stageCatalogBriefInputCounts(stage.Inputs)
+		resourceCount := stageCatalogResourceCount(stage.ReadSet, resourceAuthoringBrief)
+		if (wantsBrief && (inputCount != 1 || exactInputCount != 1 || resourceCount != 1)) ||
+			(!wantsBrief && (inputCount != 0 || resourceCount != 0)) {
+			return fmt.Errorf("%w: Standard authoring brief template stage %q brief contract does not match its version", errInvalidCatalog, key)
+		}
+	}
+	return nil
+}
+
 func stageHasArtifact(artifacts []workflowkit.ArtifactSpec, name, schemaVersion string) bool {
 	for _, artifact := range artifacts {
 		if artifact.Name == name && artifact.SchemaVersion == schemaVersion && artifact.Required {
@@ -238,6 +273,19 @@ func stageCatalogEnvironmentPolicyInputCounts(inputs []workflowkit.ArtifactSpec)
 		}
 		total++
 		if input.SchemaVersion == StandardAuthoringEnvironmentPolicySchemaVersion && input.Required {
+			exact++
+		}
+	}
+	return total, exact
+}
+
+func stageCatalogBriefInputCounts(inputs []workflowkit.ArtifactSpec) (total, exact int) {
+	for _, input := range inputs {
+		if input.Name != StandardAuthoringBriefArtifact {
+			continue
+		}
+		total++
+		if input.SchemaVersion == StandardAuthoringBriefSchemaVersion && input.Required {
 			exact++
 		}
 	}

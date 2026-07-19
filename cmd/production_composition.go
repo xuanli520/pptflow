@@ -242,7 +242,7 @@ func newCodeEdgeEvaluatorProductionCompositionWithConfig(root string, dataStore 
 		workspaceRoot = filepath.Join(root, "external-evaluators")
 	}
 	executor, err := evaluator.NewHarborEvaluatorLocalCommandExecutor(evaluator.HarborEvaluatorLocalCommandExecutorConfig{
-		WorkspaceRoot: workspaceRoot, Invocations: invocations, LookupEnv: config.LookupEnvironment,
+		WorkspaceRoot: workspaceRoot, Invocations: invocations, LookupEnv: config.LookupEnvironment, PrelaunchAttestor: attestor,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct CodeEdge Harbor evaluator executor: %w", err)
@@ -504,18 +504,11 @@ func codeEdgeEvaluatorProviderDefinition(lock stageprovider.DeploymentOperationC
 			return nil, nil, workflowadapter.ProviderReference{}, fmt.Errorf("CodeEdge production lock has more than one evaluator provider")
 		}
 		evaluatorLock := record.HarborEvaluator.Clone()
-		contract := evaluatorLock.Contract
-		invocations = append(invocations, stageprovider.HarborEvaluatorInvocation{
-			CommandID: payload.CommandID, LauncherPath: evaluatorLock.Launcher.AbsolutePath, LauncherContentSHA256: evaluatorLock.Launcher.ContentSHA256,
-			PythonInterpreterPath: evaluatorLock.PythonInterpreter.AbsolutePath, PythonSourceTreePath: evaluatorLock.PythonSourceTree.AbsolutePath,
-			DockerCLIPath: evaluatorLock.DockerCLI.AbsolutePath, DockerVersion: evaluatorLock.DockerCLI.Version,
-			HarborVersion: contract.HarborVersion, ResultABIFormat: contract.ResultABIFormat, ResultABIVersion: contract.ResultABIVersion,
-			TaskArtifactPort: contract.TaskArtifactPort, TaskArtifactSchema: contract.TaskArtifactSchema,
-			AgentID: contract.AgentID, AgentVersion: contract.AgentVersion, ModelID: contract.ModelID, ModelVersion: contract.ModelVersion,
-			EndpointEnvName: contract.EndpointEnvName, EndpointChildEnvKey: contract.EndpointChildEnvKey, EndpointFingerprint: contract.EndpointFingerprint,
-			SecretEnvTemplates: append([]stageprovider.HarborEvaluatorSecretEnvTemplate(nil), contract.SecretEnvTemplates...),
-			Attempts:           contract.Attempts, ConcurrentTrials: contract.ConcurrentTrials, MaxRetries: contract.MaxRetries, RequireTrajectory: contract.RequireTrajectory, ScreenshotRenderer: contract.ScreenshotRenderer,
-		})
+		invocation, err := stageprovider.NewHarborEvaluatorInvocation(payload.CommandID, evaluatorLock)
+		if err != nil {
+			return nil, nil, workflowadapter.ProviderReference{}, fmt.Errorf("CodeEdge production evaluator invocation is invalid: %w", err)
+		}
+		invocations = append(invocations, invocation)
 		registrations = append(registrations, stageprovider.TypedWorkflowkitStageOperationRegistration{StageKey: record.Stage.Key, Operation: record.Operation.Clone()})
 	}
 	if provider.Kind != "evaluation" || len(seenCommands) != 2 {

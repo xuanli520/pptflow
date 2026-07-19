@@ -48,9 +48,12 @@ const (
 	evaluatorResultSchemaAssetFormat      = "harbor.codeedge-evaluator-result-schema.v1"
 	evaluatorResultSchemaAssetVersion     = "1"
 
-	qwenEndpointEnvironment = "QWEN_HARBOR_BASE_URL"
-	opusEndpointEnvironment = "OPUS_HARBOR_BASE_URL"
-	credentialEnvironment   = "ANTHROPIC_AUTH_TOKEN"
+	qwenEndpointEnvironment   = "QWEN_HARBOR_BASE_URL"
+	opusEndpointEnvironment   = "OPUS_HARBOR_BASE_URL"
+	credentialEnvironment     = "ANTHROPIC_AUTH_TOKEN"
+	dockerServerVersionFormat = `{{.Server.Version}}`
+	dockerComposePathFormat   = `{{range .ClientInfo.Plugins}}{{if eq .Name "compose"}}{{.Path}}{{end}}{{end}}`
+	dockerBuildxPathFormat    = `{{range .ClientInfo.Plugins}}{{if eq .Name "buildx"}}{{.Path}}{{end}}{{end}}`
 )
 
 // generatedProductionLocks are omitted from the source manifest signed by
@@ -63,21 +66,23 @@ var generatedProductionLocks = map[string]struct{}{
 }
 
 type buildConfig struct {
-	sourceRoot        string
-	catalogPath       string
-	assetManifest     string
-	profilePath       string
-	contractRoot      string
-	outputPath        string
-	buildVersion      string
-	lockID            string
-	lockVersion       string
-	gitExecutable     string
-	harborLauncher    string
-	pythonInterpreter string
-	pythonSourceTree  string
-	dockerCLI         string
-	lookupEnvironment func(string) (string, bool)
+	sourceRoot          string
+	catalogPath         string
+	assetManifest       string
+	profilePath         string
+	contractRoot        string
+	outputPath          string
+	buildVersion        string
+	lockID              string
+	lockVersion         string
+	gitExecutable       string
+	harborLauncher      string
+	pythonInterpreter   string
+	pythonSourceTree    string
+	dockerCLI           string
+	dockerComposePlugin string
+	dockerBuildxPlugin  string
+	lookupEnvironment   func(string) (string, bool)
 }
 
 type evaluatorAssetReference struct {
@@ -157,13 +162,26 @@ type evaluatorResultSchemaTrialContract struct {
 }
 
 type evaluatorRuntime struct {
-	LauncherFingerprint workflowkit.Fingerprint
-	HarborVersion       string
-	PythonFingerprint   workflowkit.Fingerprint
-	PythonVersion       string
-	SourceFingerprint   workflowkit.Fingerprint
-	DockerFingerprint   workflowkit.Fingerprint
-	DockerVersion       string
+	LauncherFingerprint        workflowkit.Fingerprint
+	HarborVersion              string
+	PythonFingerprint          workflowkit.Fingerprint
+	PythonVersion              string
+	SourceFingerprint          workflowkit.Fingerprint
+	DockerFingerprint          workflowkit.Fingerprint
+	DockerVersion              string
+	DockerServerVersion        string
+	DockerComposeFingerprint   workflowkit.Fingerprint
+	DockerComposeVersion       string
+	DockerComposeVersionOutput string
+	DockerBuildxFingerprint    workflowkit.Fingerprint
+	DockerBuildxVersion        string
+	DockerBuildxVersionOutput  string
+	launcherSnapshot           evaluatorExecutableSnapshot
+	pythonSnapshot             evaluatorExecutableSnapshot
+	sourceSnapshot             evaluatorSourceTreeSnapshot
+	dockerSnapshot             evaluatorExecutableSnapshot
+	dockerComposeSnapshot      evaluatorExecutableSnapshot
+	dockerBuildxSnapshot       evaluatorExecutableSnapshot
 }
 
 func main() {
@@ -182,17 +200,23 @@ func main() {
 	flag.StringVar(&config.pythonInterpreter, "python-interpreter", "", "absolute frozen Python interpreter named by the Harbor launcher")
 	flag.StringVar(&config.pythonSourceTree, "python-source-tree", "", "absolute Harbor Python package root")
 	flag.StringVar(&config.dockerCLI, "docker-cli", "", "absolute frozen Docker CLI")
+	flag.StringVar(&config.dockerComposePlugin, "docker-compose-plugin", "", "absolute frozen Docker Compose CLI plugin")
+	flag.StringVar(&config.dockerBuildxPlugin, "docker-buildx-plugin", "", "absolute frozen Docker Buildx CLI plugin")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		fail("unexpected positional arguments")
 	}
-	lock, err := build(config)
+	var runtime evaluatorRuntime
+	lock, err := buildLock(config, &runtime)
 	if err != nil {
 		fail(err.Error())
 	}
 	canonical, err := lock.CanonicalJSON()
 	if err != nil {
 		fail("canonicalize generated lock: " + err.Error())
+	}
+	if err := verifyEvaluatorRuntimeUnchanged(config, runtime); err != nil {
+		fail("final evaluator runtime identity verification: " + err.Error())
 	}
 	if err := writeNewRegularFile(config.outputPath, canonical); err != nil {
 		fail(err.Error())
@@ -205,6 +229,10 @@ func main() {
 }
 
 func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, error) {
+	return buildLock(config, nil)
+}
+
+func buildLock(config buildConfig, observedRuntime *evaluatorRuntime) (stageprovider.DeploymentOperationCatalogLock, error) {
 	if err := validateConfig(&config); err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, err
 	}
@@ -291,7 +319,18 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 				CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: config.dockerCLI,
 				Version: runtime.DockerVersion, ContentSHA256: runtime.DockerFingerprint,
 			},
-			HarborVersionOutput: runtime.HarborVersion,
+			DockerServerVersion: runtime.DockerServerVersion,
+			DockerComposePlugin: stageprovider.LocalExecutableLock{
+				CommandID: stageprovider.HarborEvaluatorDockerComposeCommandID, AbsolutePath: config.dockerComposePlugin,
+				Version: runtime.DockerComposeVersion, ContentSHA256: runtime.DockerComposeFingerprint,
+			},
+			DockerComposeVersionOutput: runtime.DockerComposeVersionOutput,
+			DockerBuildxPlugin: stageprovider.LocalExecutableLock{
+				CommandID: stageprovider.HarborEvaluatorDockerBuildxCommandID, AbsolutePath: config.dockerBuildxPlugin,
+				Version: runtime.DockerBuildxVersion, ContentSHA256: runtime.DockerBuildxFingerprint,
+			},
+			DockerBuildxVersionOutput: runtime.DockerBuildxVersionOutput,
+			HarborVersionOutput:       runtime.HarborVersion,
 		}
 		operations = append(operations, stageprovider.DeploymentOperationCatalogLockRecord{
 			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(),
@@ -314,6 +353,12 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	}
 	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("validate generated catalog lock: %w", err)
+	}
+	if err := verifyEvaluatorRuntimeUnchanged(config, runtime); err != nil {
+		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("final evaluator runtime identity verification: %w", err)
+	}
+	if observedRuntime != nil {
+		*observedRuntime = runtime
 	}
 	return lock, nil
 }
@@ -599,17 +644,27 @@ func discoverEvaluatorRuntime(config buildConfig) (evaluatorRuntime, error) {
 	if _, err := fingerprintRegularFile(config.gitExecutable); err != nil {
 		return evaluatorRuntime{}, fmt.Errorf("Git executable: %w", err)
 	}
-	launcherFingerprint, err := fingerprintRegularFile(config.harborLauncher)
+	launcherSnapshot, err := snapshotEvaluatorExecutableWithContents(config.harborLauncher)
 	if err != nil {
 		return evaluatorRuntime{}, fmt.Errorf("Harbor launcher: %w", err)
+	}
+	pythonSnapshot, err := snapshotEvaluatorExecutable(config.pythonInterpreter)
+	if err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("Python interpreter: %w", err)
+	}
+	sourceSnapshot, err := snapshotEvaluatorSourceTree(config.pythonSourceTree)
+	if err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("Harbor Python source tree: %w", err)
+	}
+	if err := verifyHarborLauncherInterpreter(launcherSnapshot, config.pythonInterpreter, pythonSnapshot); err != nil {
+		return evaluatorRuntime{}, err
 	}
 	harborVersion, err := probe(config.harborLauncher, nil, "--version")
 	if err != nil || harborVersion != stageprovider.HarborEvaluatorHarborVersion {
 		return evaluatorRuntime{}, errors.New("locked Harbor launcher --version probe does not match the approved release")
 	}
-	pythonFingerprint, err := fingerprintRegularFile(config.pythonInterpreter)
-	if err != nil {
-		return evaluatorRuntime{}, fmt.Errorf("Python interpreter: %w", err)
+	if err := verifyHarborRuntimeInputsUnchanged(config, launcherSnapshot, pythonSnapshot, sourceSnapshot); err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("locked Harbor runtime changed during launcher version probing: %w", err)
 	}
 	pythonVersionOutput, err := probe(config.pythonInterpreter, nil, "--version")
 	if err != nil || !strings.HasPrefix(pythonVersionOutput, "Python ") {
@@ -619,32 +674,306 @@ func discoverEvaluatorRuntime(config buildConfig) (evaluatorRuntime, error) {
 	if pythonVersion == "" || strings.ContainsAny(pythonVersion, " \t\r\n") {
 		return evaluatorRuntime{}, errors.New("locked Python interpreter version is invalid")
 	}
-	if err := verifyHarborLauncherInterpreter(config.harborLauncher, config.pythonInterpreter); err != nil {
-		return evaluatorRuntime{}, err
+	if err := verifyHarborRuntimeInputsUnchanged(config, launcherSnapshot, pythonSnapshot, sourceSnapshot); err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("locked Harbor runtime changed during interpreter version probing: %w", err)
 	}
-	sourceFingerprint, err := stageprovider.ComputeHarborPythonSourceTreeFingerprint(context.Background(), config.pythonSourceTree)
-	if err != nil {
-		return evaluatorRuntime{}, fmt.Errorf("Harbor Python source tree: %w", err)
-	}
-	dockerFingerprint, err := fingerprintRegularFile(config.dockerCLI)
+	dockerSnapshot, err := snapshotEvaluatorExecutable(config.dockerCLI)
 	if err != nil {
 		return evaluatorRuntime{}, fmt.Errorf("Docker CLI: %w", err)
 	}
-	dockerOutput, err := probe(config.dockerCLI, nil, "--version")
+	dockerComposeSnapshot, err := snapshotEvaluatorExecutable(config.dockerComposePlugin)
+	if err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("Docker Compose plugin: %w", err)
+	}
+	dockerBuildxSnapshot, err := snapshotEvaluatorExecutable(config.dockerBuildxPlugin)
+	if err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("Docker Buildx plugin: %w", err)
+	}
+	dockerPATH, err := stageprovider.HarborEvaluatorDockerPATH(config.dockerCLI)
+	if err != nil {
+		return evaluatorRuntime{}, errors.New("locked Docker CLI cannot define the controlled Harbor PATH")
+	}
+	resolvedDocker, resolvedDockerInfo, err := resolveGeneratorPATHExecutable(dockerPATH, "docker")
+	if err != nil || resolvedDocker != config.dockerCLI || !os.SameFile(resolvedDockerInfo, dockerSnapshot.info) {
+		return evaluatorRuntime{}, errors.New("controlled Harbor PATH does not resolve the locked Docker CLI")
+	}
+	dockerEnvironment, cleanupDockerEnvironment, err := evaluatorDockerProbeEnvironment(dockerPATH)
+	if err != nil {
+		return evaluatorRuntime{}, err
+	}
+	defer cleanupDockerEnvironment()
+	dockerOutput, err := probe(config.dockerCLI, dockerEnvironment, "--version")
 	dockerVersion, parsed := dockerVersion(dockerOutput)
 	if err != nil || !parsed || dockerVersion != stageprovider.HarborEvaluatorDockerVersion {
 		return evaluatorRuntime{}, errors.New("locked Docker CLI --version probe does not match the approved release")
 	}
-	return evaluatorRuntime{
-		LauncherFingerprint: launcherFingerprint, HarborVersion: harborVersion,
-		PythonFingerprint: pythonFingerprint, PythonVersion: pythonVersion, SourceFingerprint: sourceFingerprint,
-		DockerFingerprint: dockerFingerprint, DockerVersion: dockerVersion,
-	}, nil
+	dockerServerVersion, err := probe(config.dockerCLI, dockerEnvironment, "version", "--format", dockerServerVersionFormat)
+	if err != nil || dockerServerVersion != stageprovider.HarborEvaluatorDockerServerVersion {
+		return evaluatorRuntime{}, errors.New("locked Docker daemon version probe does not match the approved release")
+	}
+	composePath, err := probe(config.dockerCLI, dockerEnvironment, "info", "--format", dockerComposePathFormat)
+	if err != nil {
+		return evaluatorRuntime{}, errors.New("locked Docker Compose plugin resolution probe failed")
+	}
+	resolvedComposeInfo, resolvedComposeErr := inspectNoSymlinkPath(composePath)
+	if resolvedComposeErr != nil || composePath != config.dockerComposePlugin || !resolvedComposeInfo.Mode().IsRegular() || resolvedComposeInfo.Mode()&0o111 == 0 || !os.SameFile(resolvedComposeInfo, dockerComposeSnapshot.info) {
+		return evaluatorRuntime{}, errors.New("Docker does not resolve the frozen Compose plugin")
+	}
+	buildxPath, err := probe(config.dockerCLI, dockerEnvironment, "info", "--format", dockerBuildxPathFormat)
+	if err != nil {
+		return evaluatorRuntime{}, errors.New("locked Docker Buildx plugin resolution probe failed")
+	}
+	resolvedBuildxInfo, resolvedBuildxErr := inspectNoSymlinkPath(buildxPath)
+	if resolvedBuildxErr != nil || buildxPath != config.dockerBuildxPlugin || !resolvedBuildxInfo.Mode().IsRegular() || resolvedBuildxInfo.Mode()&0o111 == 0 || !os.SameFile(resolvedBuildxInfo, dockerBuildxSnapshot.info) {
+		return evaluatorRuntime{}, errors.New("Docker does not resolve the frozen Buildx plugin")
+	}
+	dockerComposeOutput, err := probe(config.dockerCLI, dockerEnvironment, "compose", "version")
+	dockerComposeVersion, parsed := dockerComposeVersion(dockerComposeOutput)
+	if err != nil || !parsed || dockerComposeVersion != stageprovider.HarborEvaluatorDockerComposeVersion || dockerComposeOutput != stageprovider.HarborEvaluatorDockerComposeVersionOutput {
+		return evaluatorRuntime{}, errors.New("locked Docker Compose version probe does not match the approved release")
+	}
+	dockerBuildxOutput, err := probe(config.dockerCLI, dockerEnvironment, "buildx", "version")
+	dockerBuildxVersion, parsed := dockerBuildxVersion(dockerBuildxOutput)
+	if err != nil || !parsed || dockerBuildxVersion != stageprovider.HarborEvaluatorDockerBuildxVersion || dockerBuildxOutput != stageprovider.HarborEvaluatorDockerBuildxVersionOutput {
+		return evaluatorRuntime{}, errors.New("locked Docker Buildx version probe does not match the approved release")
+	}
+	runtime := evaluatorRuntime{
+		LauncherFingerprint: launcherSnapshot.fingerprint, HarborVersion: harborVersion,
+		PythonFingerprint: pythonSnapshot.fingerprint, PythonVersion: pythonVersion, SourceFingerprint: sourceSnapshot.fingerprint,
+		DockerFingerprint: dockerSnapshot.fingerprint, DockerVersion: dockerVersion, DockerServerVersion: dockerServerVersion,
+		DockerComposeFingerprint: dockerComposeSnapshot.fingerprint, DockerComposeVersion: dockerComposeVersion, DockerComposeVersionOutput: dockerComposeOutput,
+		DockerBuildxFingerprint: dockerBuildxSnapshot.fingerprint, DockerBuildxVersion: dockerBuildxVersion, DockerBuildxVersionOutput: dockerBuildxOutput,
+		launcherSnapshot: launcherSnapshot, pythonSnapshot: pythonSnapshot, sourceSnapshot: sourceSnapshot,
+		dockerSnapshot: dockerSnapshot, dockerComposeSnapshot: dockerComposeSnapshot, dockerBuildxSnapshot: dockerBuildxSnapshot,
+	}
+	if err := verifyEvaluatorRuntimeUnchanged(config, runtime); err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("locked evaluator runtime changed during controlled probing: %w", err)
+	}
+	return runtime, nil
 }
 
-func verifyHarborLauncherInterpreter(launcher, interpreter string) error {
-	raw, err := readRegularFile(launcher, maxShebangBytes)
+type evaluatorExecutableSnapshot struct {
+	info        os.FileInfo
+	fingerprint workflowkit.Fingerprint
+	contents    []byte
+}
+
+func snapshotEvaluatorExecutable(path string) (evaluatorExecutableSnapshot, error) {
+	snapshot, err := snapshotEvaluatorExecutableWithContents(path)
 	if err != nil {
+		return evaluatorExecutableSnapshot{}, err
+	}
+	snapshot.contents = nil
+	return snapshot, nil
+}
+
+func snapshotEvaluatorExecutableWithContents(path string) (evaluatorExecutableSnapshot, error) {
+	initial, err := inspectNoSymlinkPath(path)
+	if err != nil || !initial.Mode().IsRegular() || initial.Mode()&0o111 == 0 {
+		return evaluatorExecutableSnapshot{}, errors.New("executable path cannot be inspected")
+	}
+	contents, err := readRegularFile(path, -1)
+	if err != nil {
+		return evaluatorExecutableSnapshot{}, err
+	}
+	final, err := inspectNoSymlinkPath(path)
+	if err != nil || !final.Mode().IsRegular() || !os.SameFile(initial, final) {
+		return evaluatorExecutableSnapshot{}, errors.New("executable changed while being fingerprinted")
+	}
+	return evaluatorExecutableSnapshot{info: final, fingerprint: workflowkit.SHA256Fingerprint(contents), contents: contents}, nil
+}
+
+func verifyEvaluatorExecutableUnchanged(path string, initial evaluatorExecutableSnapshot) error {
+	final, err := snapshotEvaluatorExecutable(path)
+	if err != nil || !os.SameFile(initial.info, final.info) || initial.fingerprint != final.fingerprint {
+		return errors.New("executable identity changed")
+	}
+	return nil
+}
+
+type evaluatorSourceTreeSnapshot struct {
+	rootInfo    os.FileInfo
+	fingerprint workflowkit.Fingerprint
+	identities  map[string]os.FileInfo
+}
+
+func snapshotEvaluatorSourceTree(root string) (evaluatorSourceTreeSnapshot, error) {
+	initialRoot, err := inspectNoSymlinkPath(root)
+	if err != nil || !initialRoot.IsDir() {
+		return evaluatorSourceTreeSnapshot{}, errors.New("source tree path cannot be inspected")
+	}
+	initialIdentities, err := inspectEvaluatorSourceTreeIdentities(root)
+	if err != nil {
+		return evaluatorSourceTreeSnapshot{}, err
+	}
+	fingerprint, err := stageprovider.ComputeHarborPythonSourceTreeFingerprint(context.Background(), root)
+	if err != nil {
+		return evaluatorSourceTreeSnapshot{}, err
+	}
+	finalIdentities, err := inspectEvaluatorSourceTreeIdentities(root)
+	if err != nil {
+		return evaluatorSourceTreeSnapshot{}, err
+	}
+	finalRoot, err := inspectNoSymlinkPath(root)
+	if err != nil || !finalRoot.IsDir() || !os.SameFile(initialRoot, finalRoot) || !sameEvaluatorSourceTreeIdentities(initialIdentities, finalIdentities) {
+		return evaluatorSourceTreeSnapshot{}, errors.New("source tree identity changed while being fingerprinted")
+	}
+	return evaluatorSourceTreeSnapshot{rootInfo: finalRoot, fingerprint: fingerprint, identities: finalIdentities}, nil
+}
+
+func inspectEvaluatorSourceTreeIdentities(root string) (map[string]os.FileInfo, error) {
+	identities := make(map[string]os.FileInfo)
+	pythonFiles := 0
+	err := filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry == nil || entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("source tree entry cannot be inspected")
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return errors.New("source tree entry cannot be inspected")
+		}
+		pathInfo, err := inspectNoSymlinkPath(current)
+		if err != nil || !os.SameFile(info, pathInfo) {
+			return errors.New("source tree entry changed while being inspected")
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return errors.New("source tree contains a non-regular file")
+		}
+		if !strings.HasSuffix(entry.Name(), ".py") {
+			return nil
+		}
+		if strings.ContainsAny(current, "\r\n\x00") {
+			return errors.New("source tree contains a noncanonical Python path")
+		}
+		pythonFiles++
+		for candidate := current; ; candidate = filepath.Dir(candidate) {
+			candidateInfo, err := inspectNoSymlinkPath(candidate)
+			if err != nil {
+				return errors.New("source tree entry path cannot be inspected")
+			}
+			if previous, found := identities[candidate]; found && !os.SameFile(previous, candidateInfo) {
+				return errors.New("source tree entry path changed while being inspected")
+			}
+			identities[candidate] = candidateInfo
+			if candidate == root {
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if pythonFiles == 0 {
+		return nil, errors.New("source tree contains no Python files")
+	}
+	return identities, nil
+}
+
+func sameEvaluatorSourceTreeIdentities(left, right map[string]os.FileInfo) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for path, leftInfo := range left {
+		rightInfo, found := right[path]
+		if !found || !os.SameFile(leftInfo, rightInfo) {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyEvaluatorSourceTreeUnchanged(root string, initial evaluatorSourceTreeSnapshot) error {
+	final, err := snapshotEvaluatorSourceTree(root)
+	if err != nil || !os.SameFile(initial.rootInfo, final.rootInfo) || initial.fingerprint != final.fingerprint || !sameEvaluatorSourceTreeIdentities(initial.identities, final.identities) {
+		return errors.New("source tree identity changed")
+	}
+	return nil
+}
+
+func verifyHarborRuntimeInputsUnchanged(config buildConfig, launcher, interpreter evaluatorExecutableSnapshot, source evaluatorSourceTreeSnapshot) error {
+	if err := verifyEvaluatorExecutableUnchanged(config.harborLauncher, launcher); err != nil {
+		return errors.New("Harbor launcher identity changed")
+	}
+	if err := verifyEvaluatorExecutableUnchanged(config.pythonInterpreter, interpreter); err != nil {
+		return errors.New("Python interpreter identity changed")
+	}
+	if err := verifyEvaluatorSourceTreeUnchanged(config.pythonSourceTree, source); err != nil {
+		return errors.New("Harbor Python source tree identity changed")
+	}
+	return nil
+}
+
+func verifyEvaluatorRuntimeUnchanged(config buildConfig, runtime evaluatorRuntime) error {
+	if err := verifyHarborRuntimeInputsUnchanged(config, runtime.launcherSnapshot, runtime.pythonSnapshot, runtime.sourceSnapshot); err != nil {
+		return err
+	}
+	for _, executable := range []struct {
+		label    string
+		path     string
+		snapshot evaluatorExecutableSnapshot
+	}{
+		{label: "Docker CLI", path: config.dockerCLI, snapshot: runtime.dockerSnapshot},
+		{label: "Docker Compose plugin", path: config.dockerComposePlugin, snapshot: runtime.dockerComposeSnapshot},
+		{label: "Docker Buildx plugin", path: config.dockerBuildxPlugin, snapshot: runtime.dockerBuildxSnapshot},
+	} {
+		if err := verifyEvaluatorExecutableUnchanged(executable.path, executable.snapshot); err != nil {
+			return fmt.Errorf("%s identity changed", executable.label)
+		}
+	}
+	return nil
+}
+
+func evaluatorDockerProbeEnvironment(dockerPATH string) ([]string, func(), error) {
+	root, err := os.MkdirTemp("", "harbor-evaluator-lock-docker-probe-")
+	if err != nil {
+		return nil, nil, errors.New("create isolated Docker probe environment")
+	}
+	cleanup := func() { _ = os.RemoveAll(root) }
+	configDirectory := filepath.Join(root, "config")
+	if err := os.Mkdir(configDirectory, 0o700); err != nil {
+		cleanup()
+		return nil, nil, errors.New("create isolated Docker probe environment")
+	}
+	return []string{
+		"DOCKER_CONFIG=" + configDirectory,
+		"HOME=" + root,
+		"LANG=C.UTF-8",
+		"PATH=" + dockerPATH,
+	}, cleanup, nil
+}
+
+func resolveGeneratorPATHExecutable(searchPath, basename string) (string, os.FileInfo, error) {
+	for _, directory := range filepath.SplitList(searchPath) {
+		if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+			return "", nil, errors.New("noncanonical executable search directory")
+		}
+		candidate := filepath.Join(directory, basename)
+		leaf, err := os.Lstat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || leaf.Mode()&os.ModeSymlink != 0 {
+			return "", nil, errors.New("invalid executable search result")
+		}
+		if !leaf.Mode().IsRegular() || leaf.Mode()&0o111 == 0 {
+			continue
+		}
+		info, err := inspectNoSymlinkPath(candidate)
+		if err != nil {
+			return "", nil, err
+		}
+		return candidate, info, nil
+	}
+	return "", nil, errors.New("executable is unavailable")
+}
+
+func verifyHarborLauncherInterpreter(launcher evaluatorExecutableSnapshot, interpreterPath string, interpreter evaluatorExecutableSnapshot) error {
+	raw := launcher.contents
+	if len(raw) == 0 || int64(len(raw)) > maxShebangBytes {
 		return errors.New("locked Harbor launcher cannot be read for interpreter verification")
 	}
 	first, _, found := bytes.Cut(raw, []byte{'\n'})
@@ -657,7 +986,11 @@ func verifyHarborLauncherInterpreter(launcher, interpreter string) error {
 		return errors.New("locked Harbor launcher shebang is not an absolute interpreter path")
 	}
 	resolved, err := filepath.EvalSymlinks(shebang)
-	if err != nil || resolved != interpreter {
+	if err != nil || resolved != interpreterPath {
+		return errors.New("locked Harbor launcher shebang does not resolve to the pinned Python interpreter")
+	}
+	resolvedInfo, err := inspectNoSymlinkPath(resolved)
+	if err != nil || !os.SameFile(resolvedInfo, interpreter.info) {
 		return errors.New("locked Harbor launcher shebang does not resolve to the pinned Python interpreter")
 	}
 	return nil
@@ -672,6 +1005,23 @@ func dockerVersion(value string) (string, bool) {
 	return version, version != "" && version == strings.TrimSpace(version)
 }
 
+func dockerComposeVersion(value string) (string, bool) {
+	const prefix = "Docker Compose version "
+	if !strings.HasPrefix(value, prefix) {
+		return "", false
+	}
+	version := strings.TrimPrefix(value, prefix)
+	return version, version != "" && version == strings.TrimSpace(version) && !strings.ContainsAny(version, " \t\r\n")
+}
+
+func dockerBuildxVersion(value string) (string, bool) {
+	fields := strings.Fields(value)
+	if len(fields) != 3 || fields[0] != "github.com/docker/buildx" || !strings.HasPrefix(fields[1], "v") || len(fields[2]) != 40 || !isLowerHex(fields[2]) {
+		return "", false
+	}
+	return fields[1], true
+}
+
 func validateConfig(config *buildConfig) error {
 	if config == nil {
 		return errors.New("build configuration is required")
@@ -679,7 +1029,7 @@ func validateConfig(config *buildConfig) error {
 	var err error
 	for _, field := range []*string{
 		&config.sourceRoot, &config.catalogPath, &config.assetManifest, &config.profilePath, &config.contractRoot,
-		&config.outputPath, &config.gitExecutable, &config.harborLauncher, &config.pythonInterpreter, &config.pythonSourceTree, &config.dockerCLI,
+		&config.outputPath, &config.gitExecutable, &config.harborLauncher, &config.pythonInterpreter, &config.pythonSourceTree, &config.dockerCLI, &config.dockerComposePlugin, &config.dockerBuildxPlugin,
 	} {
 		*field, err = cleanAbsolutePath(*field)
 		if err != nil {
@@ -690,14 +1040,25 @@ func validateConfig(config *buildConfig) error {
 		return fmt.Errorf("source root: %w", err)
 	}
 	for label, executable := range map[string]string{
-		"Git executable":     config.gitExecutable,
-		"Harbor launcher":    config.harborLauncher,
-		"Python interpreter": config.pythonInterpreter,
-		"Docker CLI":         config.dockerCLI,
+		"Git executable":        config.gitExecutable,
+		"Harbor launcher":       config.harborLauncher,
+		"Python interpreter":    config.pythonInterpreter,
+		"Docker CLI":            config.dockerCLI,
+		"Docker Compose plugin": config.dockerComposePlugin,
+		"Docker Buildx plugin":  config.dockerBuildxPlugin,
 	} {
 		if err := requireExecutableRegularFile(executable); err != nil {
 			return fmt.Errorf("%s: %w", label, err)
 		}
+	}
+	if filepath.Base(config.dockerCLI) != "docker" {
+		return errors.New("Docker CLI basename must be docker")
+	}
+	if filepath.Base(config.dockerComposePlugin) != "docker-compose" {
+		return errors.New("Docker Compose plugin basename must be docker-compose")
+	}
+	if filepath.Base(config.dockerBuildxPlugin) != "docker-buildx" {
+		return errors.New("Docker Buildx plugin basename must be docker-buildx")
 	}
 	for label, value := range map[string]string{"build version": config.buildVersion, "lock id": config.lockID, "lock version": config.lockVersion} {
 		if err := validateVersionedText(label, value); err != nil {

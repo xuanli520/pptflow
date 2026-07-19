@@ -1,18 +1,20 @@
 # Standard Authoring Environment Attestation Observation
 
-Observed on 2026-07-15 for the pending Standard-authoring deployment.  This
-is a non-secret inventory only: it is not an operation catalog, lock, or
-authorization to run a provider.  Values were obtained from explicit absolute
-paths and version commands; no credential or endpoint value was read or
-printed.
+Observed on 2026-07-15 for the pending Standard-authoring deployment, with the
+Docker runtime re-probed on 2026-07-19. This is a non-secret inventory only: it
+is not an operation catalog, lock, or authorization to run a provider. Values
+were obtained from explicit absolute paths and version commands; no credential
+or endpoint value was read or printed.
 
 | Component | Absolute path | Observed version/output | SHA-256 |
 | --- | --- | --- | --- |
 | Git | `/usr/bin/git` | `git version 2.47.3` | `356db14e102d68a1a37d8a1ac577dfd678d45d46e92f468bef8b7154e7bfdc60` |
 | OpenSSH client | `/usr/bin/ssh` | `OpenSSH_10.0p2` | `af3b04ec5653755032fc18ad02445e4e51170e75d8bac4265647d423caa9a83e` |
 | SSH wrapper shell | `/usr/bin/dash` | content-derived identity | `a6f559e00b69a4aa4d8cb607be18d9386c5aee55c509e2c075549dcf00e00fc7` |
-| Docker client | `/usr/bin/docker` | `Docker version 29.5.2, build 79eb04c` | `abb24795f58721581130a7d4cca53e80a64099ae40a11bebd02cc2f45b9136b8` |
-| Docker server | daemon queried by `docker version` | `29.5.2` | not a regular executable; must be dynamically checked at execution time |
+| Docker client | `/home/purplevoid/.local/lib/harbor-factory/docker-ce-cli-29.5.2/usr/bin/docker` | `Docker version 29.5.2, build 79eb04c` | `c508e43e66ab846ef2e6a39e6440e3d86a6611a50dc003553aa7eeb267b8c123` |
+| Docker server | daemon queried by `docker version --format '{{.Server.Version}}'` | `29.4.1` | not a regular executable; must be dynamically checked at execution time |
+| Docker Compose plugin | `/usr/libexec/docker/cli-plugins/docker-compose` | `Docker Compose version v5.1.3` | `a0298760c9772d2c06888fc8703a487c94c3c3b0134adeef830742a2fc7647b4` |
+| Docker Buildx plugin | `/usr/libexec/docker/cli-plugins/docker-buildx` | `github.com/docker/buildx v0.33.0 f7897eba028583e0071642db3c011e860444f8cf` | `5f42ff0a165e3834c4fd73a91b8d41c37a3c0a3475d0101cc13cfcf880ce5978` |
 | Node | `/root/.nvm/versions/node/v26.2.0/bin/node` | `v26.2.0` | `030a5e93e4f7a022b12a3ec80fecd22af9614356904a05ece6b1b2dbf4c1f588` |
 | Codex JavaScript launcher | `/root/.nvm/versions/node/v26.2.0/lib/node_modules/@openai/codex/bin/codex.js` | `codex-cli 0.133.0` | `aa3c64b122c9d06bf48eaf988f5970aa69556d69506c3118cf07d10b2401b48a` |
 | Harbor launcher | `/root/.local/share/uv/tools/harbor/bin/harbor` | `0.18.0` | `9b0852df4c749ab9431b7aff6b2f1b1de8b7365ee6a513cdbd7573a1678d4f97` |
@@ -58,10 +60,12 @@ A future lock-backed attestor must, immediately before each operation:
    SHA-256;
 2. execute only the locked binary's bounded version probe under a controlled
    environment, without inheriting arbitrary model/provider configuration;
-3. verify the Docker daemon is reachable and reports the locked protocol
-   version before Docker-dependent stages; and
+3. verify the Docker daemon is reachable and reports the independently locked
+   server version, Docker resolves the exact Compose and Buildx plugin files,
+   and both complete plugin version outputs match before Docker-dependent
+   stages; and
 4. verify the Codex App Server launcher, Node, `CODEX_HOME`, model
-   `gpt-5.6-terra` with `xhigh` reasoning effort, workspace-write sandbox,
+   `gpt-5.6-terra` with `xhigh` reasoning effort, read-only sandbox,
    and disabled network policy through the existing typed Codex attestor
    before an `agent.turn`.
 

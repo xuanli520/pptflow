@@ -37,6 +37,7 @@ const (
 	standardAuthoringCodexFailureCheckpoint    = "standard_authoring_codex_agent_turn.checkpoint"
 	standardAuthoringCodexFailureQuota         = "standard_authoring_codex_agent_turn.quota"
 	standardAuthoringCodexFailureRuntime       = "standard_authoring_codex_agent_turn.runtime"
+	standardAuthoringCodexFailureSource        = "standard_authoring_codex_agent_turn.source_integrity"
 	standardAuthoringCodexFailureOutput        = "standard_authoring_codex_agent_turn.output"
 	standardAuthoringCodexFailureInterrupted   = "standard_authoring_codex_agent_turn.interrupted"
 
@@ -228,6 +229,15 @@ type StandardAuthoringCodexInvocationFactory func(context.Context, StageOperatio
 // receives a new controlled codexruntime.Runtime per external effect.
 type StandardAuthoringCodexRuntimeFactory func(CodexAppServerInvocation) agent.Runtime
 
+// StandardAuthoringCodexFrozenSourceVerifier re-proves the exact source tree
+// visible to a RunScoped turn against the Store-bound immutable source object.
+// The returned identity must name that frozen object, not a fresh digest of an
+// otherwise untrusted workspace. Production wires the repo_prepare executor,
+// which owns both the object store and the materialized checkout contract.
+type StandardAuthoringCodexFrozenSourceVerifier interface {
+	VerifyStandardAuthoringCodexFrozenSource(context.Context, workflowkit.FrozenExecution, string) (workflowkit.Fingerprint, error)
+}
+
 // StandardAuthoringCodexWorkspaceMode determines how a composition-owned
 // workspace root is projected into an individual Codex turn. Static remains a
 // focused test/embed seam. Production Standard authoring uses RunScoped, so a
@@ -254,6 +264,7 @@ type StandardAuthoringCodexAgentTurnExecutorConfig struct {
 	InvocationFactory StandardAuthoringCodexInvocationFactory
 	WorkspaceRoot     string
 	WorkspaceMode     StandardAuthoringCodexWorkspaceMode
+	SourceVerifier    StandardAuthoringCodexFrozenSourceVerifier
 	ProgramByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
 	RuntimeFactory    StandardAuthoringCodexRuntimeFactory
 	Now               func() time.Time
@@ -266,6 +277,7 @@ type StandardAuthoringCodexAgentTurnExecutor struct {
 	invocationFactory StandardAuthoringCodexInvocationFactory
 	workspaceRoot     string
 	workspaceMode     StandardAuthoringCodexWorkspaceMode
+	sourceVerifier    StandardAuthoringCodexFrozenSourceVerifier
 	programByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
 	runtimeFactory    StandardAuthoringCodexRuntimeFactory
 	now               func() time.Time
@@ -289,6 +301,9 @@ func NewStandardAuthoringCodexAgentTurnExecutor(config StandardAuthoringCodexAge
 	if err != nil {
 		return nil, err
 	}
+	if workspaceMode == StandardAuthoringCodexWorkspaceRunScoped && isNilInterface(config.SourceVerifier) {
+		return nil, fmt.Errorf("%w: RunScoped frozen source verifier is required", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
 	if len(config.ProgramByStage) == 0 {
 		return nil, fmt.Errorf("%w: at least one stage prompt program is required", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
@@ -310,7 +325,7 @@ func NewStandardAuthoringCodexAgentTurnExecutor(config StandardAuthoringCodexAge
 		now = time.Now
 	}
 	return &StandardAuthoringCodexAgentTurnExecutor{
-		invocationFactory: config.InvocationFactory, workspaceRoot: workspaceRoot, workspaceMode: workspaceMode, programByStage: programs,
+		invocationFactory: config.InvocationFactory, workspaceRoot: workspaceRoot, workspaceMode: workspaceMode, sourceVerifier: config.SourceVerifier, programByStage: programs,
 		runtimeFactory: config.RuntimeFactory, now: now,
 	}, nil
 }
@@ -363,6 +378,13 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		}
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failure), nil
 	}
+	sourceIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+	if err != nil {
+		if contextError(ctx) != nil {
+			return standardAuthoringCodexInterrupted(), nil
+		}
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+	}
 	conversation, err := runtime.OpenConversation(ctx, agent.ConversationRequest{
 		ProjectPath:       workspace,
 		Model:             attestedInvocation.ModelID,
@@ -407,6 +429,14 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			}
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureQuota), nil
 		}
+		beforeTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+		if verifyErr != nil || beforeTurnIdentity != sourceIdentity {
+			_ = conversation.Close()
+			if contextError(ctx) != nil {
+				return standardAuthoringCodexInterrupted(), nil
+			}
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+		}
 		turnRequest := agent.TurnRequest{
 			ProjectPath:       workspace,
 			Prompt:            prompt,
@@ -426,6 +456,14 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			turnRequest.Input = []agent.InputPart{{Type: "text", Text: string(requestDocument)}}
 		}
 		result, turnErr := conversation.Turn(ctx, turnRequest)
+		afterTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+		if verifyErr != nil || afterTurnIdentity != sourceIdentity {
+			_ = conversation.Close()
+			if contextError(ctx) != nil {
+				return standardAuthoringCodexInterrupted(), nil
+			}
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+		}
 		if turnErr != nil {
 			_ = conversation.Close()
 			if contextError(ctx) != nil {
@@ -450,13 +488,29 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
 		}
 		if accepted, ok := submission.acceptedResult(); ok {
-			if err := conversation.Close(); err != nil {
+			closeErr := conversation.Close()
+			closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+			if verifyErr != nil || closedIdentity != sourceIdentity {
+				if contextError(ctx) != nil {
+					return standardAuthoringCodexInterrupted(), nil
+				}
+				return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+			}
+			if closeErr != nil {
 				return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 			}
 			return accepted, nil
 		}
 	}
-	if err := conversation.Close(); err != nil {
+	closeErr := conversation.Close()
+	closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+	if verifyErr != nil || closedIdentity != sourceIdentity {
+		if contextError(ctx) != nil {
+			return standardAuthoringCodexInterrupted(), nil
+		}
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+	}
+	if closeErr != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 	}
 	if submission.failure() != "" {
@@ -702,7 +756,7 @@ func validateStandardAuthoringCodexInvocation(invocation CodexAppServerInvocatio
 			return err
 		}
 	}
-	if invocation.AgentID != CodexAppServerProductionAgentID || invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || invocation.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || invocation.NetworkAccess || !filepath.IsAbs(invocation.JavaScriptLauncherPath) || !filepath.IsAbs(invocation.NodeExecutablePath) || !filepath.IsAbs(invocation.CodexHomeDirectory) {
+	if invocation.AgentID != CodexAppServerProductionAgentID || invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.SandboxMode != CodexAppServerSandboxModeReadOnly || invocation.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly || invocation.NetworkAccess || !filepath.IsAbs(invocation.JavaScriptLauncherPath) || !filepath.IsAbs(invocation.NodeExecutablePath) || !filepath.IsAbs(invocation.CodexHomeDirectory) {
 		return fmt.Errorf("%w: invocation does not satisfy the locked Codex production policy", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return nil
@@ -764,6 +818,80 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) workspaceForExecution(e
 		}
 	}
 	return workspace, nil
+}
+
+func (executor *StandardAuthoringCodexAgentTurnExecutor) verifyFrozenSource(ctx context.Context, execution workflowkit.FrozenExecution, root string) (workflowkit.Fingerprint, error) {
+	if err := contextError(ctx); err != nil {
+		return "", err
+	}
+	if executor != nil && executor.workspaceMode == StandardAuthoringCodexWorkspaceRunScoped {
+		if isNilInterface(executor.sourceVerifier) {
+			return "", fmt.Errorf("%w: RunScoped frozen source verifier is unavailable", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		identity, err := executor.sourceVerifier.VerifyStandardAuthoringCodexFrozenSource(ctx, execution, root)
+		if err != nil {
+			return "", err
+		}
+		if err := identity.Validate(); err != nil {
+			return "", fmt.Errorf("%w: frozen source verifier returned an invalid identity", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		return identity, nil
+	}
+	return standardAuthoringCodexSourceTreeIdentity(root)
+}
+
+func standardAuthoringCodexSourceTreeIdentity(root string) (workflowkit.Fingerprint, error) {
+	type sourceEntry struct {
+		Path          string                  `json:"path"`
+		Type          string                  `json:"type"`
+		Mode          uint32                  `json:"mode"`
+		ContentSHA256 workflowkit.Fingerprint `json:"content_sha256,omitempty"`
+	}
+	entries := []sourceEntry{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("unsafe source workspace entry")
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return fmt.Errorf("non-regular source workspace entry")
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("source workspace entry escapes root")
+		}
+		identity := sourceEntry{Path: filepath.ToSlash(relative), Mode: uint32(info.Mode().Perm())}
+		if info.IsDir() {
+			identity.Type = "directory"
+			if info.Mode().Perm() != 0o555 {
+				return fmt.Errorf("source workspace directory mode changed")
+			}
+		} else {
+			identity.Type = "regular"
+			if info.Mode().Perm() != 0o444 {
+				return fmt.Errorf("source workspace file mode changed")
+			}
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			identity.ContentSHA256 = workflowkit.SHA256Fingerprint(contents)
+		}
+		entries = append(entries, identity)
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("%w: source workspace is unavailable or unsafe", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	sort.Slice(entries, func(left, right int) bool { return entries[left].Path < entries[right].Path })
+	encoded, err := json.Marshal(entries)
+	if err != nil {
+		return "", fmt.Errorf("%w: encode source workspace identity", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	return workflowkit.FingerprintBytes("harbor.standard-authoring-codex-source-tree.v1", encoded)
 }
 
 func standardAuthoringPathWithin(root, candidate string) bool {

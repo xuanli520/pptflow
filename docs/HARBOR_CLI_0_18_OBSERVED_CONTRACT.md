@@ -3,8 +3,9 @@
 ## Purpose And Scope
 
 This document records the locally observed behavior of the Harbor CLI installed
-on 2026-07-14. It is a version-pinned Harbor Flow adapter reference, not a
-CodeEdge submission rule and not an upstream compatibility promise.
+on 2026-07-14, with its Docker runtime identity re-probed on 2026-07-19. It is a
+version-pinned Harbor Flow adapter reference, not a CodeEdge submission rule and
+not an upstream compatibility promise.
 
 It exists to prevent two unsafe assumptions:
 
@@ -14,8 +15,9 @@ It exists to prevent two unsafe assumptions:
    newer Harbor release without re-probing it.
 
 Only the facts in the `Observed Facts` sections are adapter authority. A change
-to the Harbor version, launcher fingerprint, or installed Python source tree
-invalidates this observation and requires a new versioned probe.
+to the Harbor version, launcher fingerprint, installed Python source tree,
+Docker client/server version, or Compose/Buildx plugin identity invalidates this
+observation and requires a new versioned probe.
 
 ## Observed Installation Identity
 
@@ -31,7 +33,10 @@ invalidates this observation and requires a new versioned probe.
 | Python interpreter SHA-256 | `4703a3d15898c0b5d81c3f939e93bdd8ca6116342093fb160ab1e01860dd7d8b` |
 | Harbor Python package root | `/root/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor` |
 | Python source-tree SHA-256 | `f9b6817d8f749563ac4a68ea0453d9b9363a730d61b6b4d1bcd81b6d57474cbe` |
-| Docker Engine used by the probe | `29.5.2` |
+| Docker client used by the probe | `29.5.2` (`Docker version 29.5.2, build 79eb04c`) |
+| Docker server used by the probe | `29.4.1`, queried independently with `docker version --format '{{.Server.Version}}'` |
+| Docker Compose plugin | `/usr/libexec/docker/cli-plugins/docker-compose`; exact output `Docker Compose version v5.1.3`; SHA-256 `a0298760c9772d2c06888fc8703a487c94c3c3b0134adeef830742a2fc7647b4` |
+| Docker Buildx plugin | `/usr/libexec/docker/cli-plugins/docker-buildx`; exact output `github.com/docker/buildx v0.33.0 f7897eba028583e0071642db3c011e860444f8cf`; SHA-256 `5f42ff0a165e3834c4fd73a91b8d41c37a3c0a3475d0101cc13cfcf880ce5978` |
 
 The source-tree digest is the SHA-256 of the sorted `sha256sum` output for all
 `*.py` files below the package root:
@@ -53,6 +58,17 @@ above. On 2026-07-14 Harbor Flow downloaded that wheel, verified its SHA-256,
 then installed it with `uv tool install --reinstall <verified-wheel>`. The
 post-install command reported `0.18.0`; its launcher, interpreter, and Python
 source-tree identities are the values in the preceding table.
+
+The evaluator's Docker runtime is locked separately from the Harbor wheel. The
+client and daemon versions are independent facts. Immediately before an
+evaluator effect, Harbor Flow re-proves the launcher, interpreter, Python source
+manifest, Docker, Compose, and Buildx identities. Docker discovery runs under
+the exact isolated `HOME`, `DOCKER_CONFIG`, and `PATH` later passed to Harbor;
+it checks the daemon reports `29.4.1`, resolves both locked plugin paths, and
+matches both complete plugin version outputs. All runtime files are re-hashed
+again after the subprocess probes. The proof runs before credentials are read
+and repeats after the private env-file is written; both passes must derive the
+same environment before Harbor starts.
 
 This is intentionally a fail-closed local installation lock rather than a
 floating `harbor@latest` request. A future upstream release must be separately
@@ -320,7 +336,9 @@ version.
 
 After the exact wheel installation above, Harbor Flow repeated the isolated
 Docker/Oracle probe on 2026-07-14 with the same four-trial command shape. The
-job wrote four distinct Trial directories, reported `n_total_trials: 4`,
+Docker runtime was re-probed on 2026-07-19 with client `29.5.2`, server `29.4.1`,
+Compose `v5.1.3`, and Buildx `v0.33.0` using the exact identities above. The job
+wrote four distinct Trial directories, reported `n_total_trials: 4`,
 `n_running_trials: 0`, `n_pending_trials: 0`, and `Pass@4: 1.0`; every Trial
 `config.job_id` matched the job result ID. The job-level `result.json` again
 omitted `trial_results`, while each Trial result carried its own reward and
@@ -362,7 +380,10 @@ behavior after an interrupted command is:
 The Harbor Flow `harbor-cli@0.18.0` adapter must be version/identity gated and
 must fail closed when any of these conditions is false:
 
-- CLI version and installation fingerprint match this contract;
+- CLI launcher, interpreter, Python source manifest, version, and installation
+  fingerprints match this contract immediately before launch;
+- Docker client and server versions, Compose/Buildx plugin paths and
+  fingerprints, and complete plugin version outputs match this contract;
 - the expected job directory is contained within the managed execution root;
 - `finished_at` is present, `n_running_trials == 0`,
   `n_pending_trials == 0`, and `n_total_trials` equals the frozen number of
@@ -389,9 +410,11 @@ Before enabling the adapter for another Harbor build:
 
 1. Record `harbor --version`, resolved launcher, launcher digest, interpreter
    digest, and source-tree digest.
-2. Run an isolated Oracle task with `--n-attempts 4` and record the raw
+2. Record the Docker client and server versions, resolved Compose and Buildx
+   plugin paths and digests, and both complete plugin version outputs.
+3. Run an isolated Oracle task with `--n-attempts 4` and record the raw
    command, output, job result, lock, and all four Trial results.
-3. Verify the command flags, output layout, job summary schema, Trial schema,
+4. Verify the command flags, output layout, job summary schema, Trial schema,
    pass@4 calculation, and resume behavior again.
-4. Update this document and add a new adapter/parser version with fixture-based
+5. Update this document and add a new adapter/parser version with fixture-based
    tests before accepting production evidence from the new build.

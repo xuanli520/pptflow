@@ -308,8 +308,8 @@ func TestStandardAuthoringHandoffBlocksReverseCoordinatorCompletionUntilChildIsB
 	// This call models the old reverse scheduling order: a coordinator that
 	// was already queued reaches its completion branch before the handoff job
 	// has created the Phase-1 child. It must complete harmlessly, not terminally.
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
-	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringBriefWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringBriefWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,8 +417,8 @@ func TestStandardAuthoringHandoffCompletionResumesMaterializedContinuation(t *te
 		t.Fatalf("continuation completion coordinator = %+v, %v", completion, err)
 	}
 
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
-	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringBriefWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringBriefWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1017,13 +1017,14 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	executor, err := NewStandardAuthoringMaterializeExecutor(StandardAuthoringMaterializeExecutorConfig{ManagedRoot: root, Store: database})
+	packageInput := standardAuthoringTaskPackageFixture(t)
+	executor, err := NewStandardAuthoringMaterializeExecutor(StandardAuthoringMaterializeExecutorConfig{ManagedRoot: root, Store: database, Admission: &packageInput.Admission})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sourceDigest := "sha256:" + strings.Repeat("a", 64)
 	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
-		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
+		RepositoryURL: packageInput.Source.RepositoryURL, CommitSHA: packageInput.Source.CommitSHA,
 		SnapshotArtifactRef: sourceDigest, SnapshotContentDigest: sourceDigest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
 		IdempotencyKey: "handoff-source", Actor: "author", Reason: "freeze source",
 	})
@@ -1039,7 +1040,7 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringWorkflowTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringBriefTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "handoff-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -1076,8 +1077,8 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringWorkflowTemplate())
-	resolved, err := workflowadapter.StandardAuthoringWorkflowTemplate().Compile(profile)
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringBriefWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringBriefWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1085,17 +1086,108 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	if !found {
 		t.Fatal("compiled authoring workflow omitted materialize_task")
 	}
+	policyRaw, err := packageInput.Environment.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	briefRaw, err := packageInput.Brief.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
 	contents := map[string][]byte{
-		"instruction":              []byte("# Task\n\nImplement the requested behavior.\n"),
-		"task_toml":                []byte("[task]\nid = \"handoff-task\"\n"),
-		"dockerfile":               standardAuthoringLaunchTestDockerfile(),
-		"environment_policy":       standardAuthoringLaunchTestEnvironmentPolicyJSON(t),
-		"solve_script":             []byte("#!/bin/sh\nexit 0\n"),
-		"test_script":              []byte("#!/bin/sh\nexit 0\n"),
-		"tests_analysis":           []byte("The tests validate the requested behavior.\n"),
-		"solution_review_decision": approvedAuthoringSolutionDecision(t, source, session, run),
+		"instruction": append([]byte(nil), packageInput.Instruction...),
+		"task_toml":   append([]byte(nil), packageInput.TaskTOMLDraft...),
+		"dockerfile":  append([]byte(nil), packageInput.Dockerfile...),
+		workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: policyRaw,
+		workflowadapter.StandardAuthoringBriefArtifact:             briefRaw,
+		"solve_script":                      append([]byte(nil), packageInput.SolveScript...),
+		"test_script":                       append([]byte(nil), packageInput.TestScript...),
+		"tests_analysis":                    append([]byte(nil), packageInput.TestsAnalysis...),
+		"solution_review_decision":          approvedAuthoringSolutionDecision(t, source, session, run),
+		"codeedge_package_admission_report": []byte(`{}`),
 	}
 	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
+	compiled, err := CompileStandardAuthoringTaskPackage(packageInput)
+	if err != nil || !compiled.Report.Passed {
+		t.Fatalf("compile handoff fixture package: report=%+v err=%v", compiled.Report, err)
+	}
+	admissionInputs := make([]workflowkit.ArtifactBinding, 0, 8)
+	for _, binding := range inputs {
+		switch binding.Name {
+		case "instruction", "task_toml", "dockerfile", workflowadapter.StandardAuthoringEnvironmentPolicyArtifact,
+			workflowadapter.StandardAuthoringBriefArtifact, "solve_script", "test_script", "tests_analysis":
+			admissionInputs = append(admissionInputs, binding)
+		}
+	}
+	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(admissionInputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionReceipt, err := json.Marshal(standardAuthoringAdmissionReceipt{
+		Format: standardAuthoringAdmissionReceiptFormat, Version: standardAuthoringAdmissionReceiptVersion,
+		RunID: run.ID, AuthoringSourceID: source.ID, AuthoringSessionID: session.ID,
+		InputFingerprint: inputFingerprint, Report: compiled.Report,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents["codeedge_package_admission_report"] = admissionReceipt
+	var admissionBinding workflowkit.ArtifactBinding
+	for index := range inputs {
+		if inputs[index].Name == "codeedge_package_admission_report" {
+			inputs[index].ContentDigest = workflowkit.SHA256Fingerprint(admissionReceipt)
+			admissionBinding = inputs[index]
+		}
+	}
+	if admissionBinding.Name == "" {
+		t.Fatal("materializer fixture omitted admission receipt binding")
+	}
+	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedSubject, err := services.core.resolveWorkflowRunSubject(ctx, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionStage, found := resolved.Descriptor.Stage(workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
+	if !found {
+		t.Fatal("compiled authoring workflow omitted codeedge_package_admission")
+	}
+	admissionAttempt, err := database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: run.ID, StageKey: workflowadapter.CodeEdgePackageAdmission, StageGroup: string(workflowadapter.StageTaskGeneration), Ordinal: 1,
+		InputFingerprint: string(inputFingerprint), BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		Actor: "worker", Reason: "create package admission stage fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionAttempt, err = database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: admissionAttempt.ID, ExpectedVersion: admissionAttempt.Version, ExecutionStatus: store.StageExecutionRunning,
+		Actor: "worker", Reason: "execute package admission stage fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionNode, err := database.CreateNodeAttempt(ctx, store.CreateNodeAttemptRequest{
+		StageAttemptID: admissionAttempt.ID, NodeID: workflowadapter.CodeEdgePackageAdmission, Generation: 0, Attempt: 1,
+		IdempotencyKey: "handoff-admission-node", Actor: "worker", Reason: "persist package admission receipt fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionManifest, _, err := persistStageArtifactsForSubject(ctx, services.core, run, resolvedSubject, admissionAttempt, admissionNode, admissionStage, admissionInputs, []StageArtifact{{
+		ID: string(admissionBinding.ArtifactID), Key: admissionBinding.Name, SchemaVersion: admissionBinding.SchemaVersion, Content: admissionReceipt,
+	}}, "worker", "persist package admission receipt fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: admissionAttempt.ID, ExpectedVersion: admissionAttempt.Version, ExecutionStatus: store.StageExecutionCompleted,
+		Verdict: store.VerdictPass, ArtifactManifestID: admissionManifest.ID, Actor: "worker", Reason: "complete package admission stage fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	subject := workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(source.SnapshotContentDigest)}
 	result, err := executor.ExecuteHarborBuiltin(ctx, stageprovider.StageOperationInvocation{
 		Request: workflowkit.StageExecutionRequest{
@@ -1113,14 +1205,6 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	}
 	handoff := parseMaterializerHandoff(t, result)
 	node, err := database.CreateNodeAttempt(ctx, store.CreateNodeAttemptRequest{StageAttemptID: stageAttempt.ID, NodeID: workflowadapter.MaterializeTask, Generation: 0, Attempt: 1, IdempotencyKey: "handoff-node", Actor: "worker", Reason: "persist materialized outputs"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolvedSubject, err := services.core.resolveWorkflowRunSubject(ctx, run)
 	if err != nil {
 		t.Fatal(err)
 	}

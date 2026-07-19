@@ -32,11 +32,13 @@ const (
 	baselineV2SchemaContractMetadataKey = "schema_contract_fingerprint"
 	baselineV2SchemaContractDomain      = "harbor.store.consolidated-v2-schema-contract.v1"
 
-	// This is the one previously published consolidated V2 schema whose
-	// Standard authoring handoff trigger still bound 1.2/v1. It is admitted only
-	// for the atomic upgrade below; unknown fingerprints remain rejected.
-	legacyConsolidatedV2SchemaContractFingerprint = "sha256:db935bd40f92f0d7a9ae4d432b568f5987aebe4d41a5d66f90c55d3fafc53f0b"
-	authoringPhase1HandoffTriggerName             = "authoring_phase1_handoffs_v2_binding_insert"
+	// These are the two previously published consolidated V2 schemas whose
+	// Standard authoring handoff trigger bound only 1.2/v1 or 1.2/v1+1.3/v2.
+	// They are admitted only for the atomic upgrade below; unknown fingerprints
+	// remain rejected.
+	legacyV12ConsolidatedV2SchemaContractFingerprint = "sha256:db935bd40f92f0d7a9ae4d432b568f5987aebe4d41a5d66f90c55d3fafc53f0b"
+	legacyV13ConsolidatedV2SchemaContractFingerprint = "sha256:dcb8391fa99e349def515fbeec9e4b193f4b1875898a9c61806230a767e5f2bc"
+	authoringPhase1HandoffTriggerName                = "authoring_phase1_handoffs_v2_binding_insert"
 )
 
 type sqliteSchemaContractObject struct {
@@ -618,7 +620,7 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) e
 	if recordedContract == expectedContract && actualContract == expectedContract {
 		return nil
 	}
-	if allowKnownLegacy && recordedContract == legacyConsolidatedV2SchemaContractFingerprint && actualContract == legacyConsolidatedV2SchemaContractFingerprint {
+	if allowKnownLegacy && recordedContract == actualContract && isKnownLegacyConsolidatedV2SchemaContract(recordedContract) {
 		return nil
 	}
 	if recordedContract != expectedContract {
@@ -630,8 +632,8 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) e
 	return nil
 }
 
-// upgradeLegacyConsolidatedV2Schema repairs the one published V2 contract that
-// predates the 1.3/v2 Standard authoring handoff. The trigger replacement and
+// upgradeLegacyConsolidatedV2Schema repairs the published V2 contracts that
+// predate the 1.4/v2 Standard authoring handoff. The trigger replacement and
 // contract marker update are one transaction, so an interrupted startup leaves
 // the old, internally consistent schema for the next attempt. No unknown
 // schema is admitted here.
@@ -644,7 +646,7 @@ func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 	if err != nil {
 		return fmt.Errorf("derive persisted legacy V2 schema contract: %w", err)
 	}
-	if recordedContract != legacyConsolidatedV2SchemaContractFingerprint || actualContract != legacyConsolidatedV2SchemaContractFingerprint {
+	if recordedContract != actualContract || !isKnownLegacyConsolidatedV2SchemaContract(recordedContract) {
 		return nil
 	}
 	triggerSQL, err := currentAuthoringPhase1HandoffTriggerSQL()
@@ -673,6 +675,15 @@ func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 		return fmt.Errorf("commit legacy V2 schema upgrade: %w", err)
 	}
 	return nil
+}
+
+func isKnownLegacyConsolidatedV2SchemaContract(fingerprint string) bool {
+	switch fingerprint {
+	case legacyV12ConsolidatedV2SchemaContractFingerprint, legacyV13ConsolidatedV2SchemaContractFingerprint:
+		return true
+	default:
+		return false
+	}
 }
 
 func currentAuthoringPhase1HandoffTriggerSQL() (string, error) {

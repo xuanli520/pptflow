@@ -15,8 +15,10 @@ The catalog permits exactly two serial `local.command` operations:
   retries per logical Trial.
 
 The lock freezes the Harbor `0.18.0` launcher, Python interpreter and source
-tree, Docker CLI, CodeEdge renderer/schema fingerprints, model identities,
-canonical endpoint fingerprints, and a complete child-owned execution profile:
+tree, Docker CLI `29.5.2`, Docker server `29.4.1`, the exact `docker-compose`
+and `docker-buildx` plugins and their complete version outputs, CodeEdge
+renderer/schema fingerprints, model identities, canonical endpoint
+fingerprints, and a complete child-owned execution profile:
 both 110-minute single-turn evaluator budgets, a 120-minute single attempt,
 24-hour continuation TTL, one-minute control grace, and bounded generic
 candidate-provider timing. It deliberately contains no endpoint, credential,
@@ -36,6 +38,19 @@ invocation. Hub credentials are neither read nor written. Values never enter
 argv, catalog/lock JSON, run manifests, artifacts, screenshots, or command
 logs.
 
+Before each evaluator effect, and before reading model credentials, it re-proves
+the Harbor launcher, its shebang-bound Python interpreter, and the complete
+locked Python source manifest. It then uses the exact `HOME`, `DOCKER_CONFIG`,
+and `PATH` that will be passed to Harbor to prove bare `docker` resolves to the
+locked CLI, verify the independently locked server version, resolve the exact
+Compose and Buildx plugin files, and match both plugin version outputs
+byte-for-byte. After every subprocess probe it re-hashes every executable and
+plugin and re-computes the Python source manifest. A missing daemon, substituted
+runtime file, or version/output drift
+fails before Harbor can allocate a Trial. The complete proof runs once before
+credential lookup and again after the temporary env-file is materialized; both
+passes must derive the same process environment before the runner is called.
+
 The evaluator is strictly local-only: it writes its four-trial job under the
 managed `--jobs-dir`, never passes Harbor upload or sharing flags, and rebuilds
 evidence only from the completed local job's `result.json`, Trial results,
@@ -53,8 +68,10 @@ export HARBOR_FACTORY_HARBOR_LAUNCHER=/absolute/path/to/harbor
 export HARBOR_FACTORY_PYTHON_INTERPRETER=/absolute/path/to/python
 export HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE=/absolute/path/to/site-packages/harbor
 export HARBOR_FACTORY_DOCKER_EXECUTABLE=/absolute/path/to/docker
+export HARBOR_FACTORY_DOCKER_COMPOSE_PLUGIN=/absolute/path/to/docker-compose
+export HARBOR_FACTORY_DOCKER_BUILDX_PLUGIN=/absolute/path/to/docker-buildx
 export HARBOR_FACTORY_BUILD_VERSION=v2.0.0
-export HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION=2026.07.15.1
+export HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION=2026.07.19.2
 scripts/generate-codeedge-evaluator-lock.sh
 ```
 

@@ -931,6 +931,7 @@ func openCommandLifecycle(t *testing.T, root string) *app.LifecycleServices {
 func commandOpenAuthoringReviewGate(t *testing.T, ctx context.Context, database *store.Store) store.AuthoringReviewGateOpenResult {
 	t.Helper()
 	digest := "sha256:" + strings.Repeat("a", 64)
+	template := workflowadapter.StandardAuthoringBriefTemplateReference()
 	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
 		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
 		SnapshotArtifactRef: digest, SnapshotContentDigest: digest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
@@ -947,7 +948,7 @@ func commandOpenAuthoringReviewGate(t *testing.T, ctx context.Context, database 
 		t.Fatal(err)
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
-		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringWorkflowTemplateVersion,
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: template.ID, WorkflowTemplateVersion: template.Version,
 		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "command-authoring-session-" + t.Name(), Actor: "author", Reason: "freeze authoring session",
 	})
 	if err != nil {

@@ -14,7 +14,7 @@ import (
 // catalog, provider, model, prompt, secret, and execution settings remain
 // deployment-owned.
 func newAuthoringStartCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var repositoryURL, commitSHA, baseImage, slug, title, metadataJSON, idempotencyKey, reason string
+	var repositoryURL, commitSHA, baseImage, slug, title, taskType, application, objective, metadataJSON, idempotencyKey, reason string
 	command := &cobra.Command{
 		Use:   "start",
 		Short: "Capture an immutable Git source and start Standard authoring",
@@ -46,6 +46,18 @@ into the AuthoringSession task contract.`,
 			if err != nil {
 				return err
 			}
+			taskType, err = requiredText("task-type", taskType)
+			if err != nil {
+				return err
+			}
+			application, err = requiredText("application", application)
+			if err != nil {
+				return err
+			}
+			objective, err = requiredText("objective", objective)
+			if err != nil {
+				return err
+			}
 			idempotencyKey, err = requiredLifecycleIdempotencyKey(idempotencyKey)
 			if err != nil {
 				return err
@@ -61,6 +73,9 @@ into the AuthoringSession task contract.`,
 					BaseImage:                    baseImage,
 					Slug:                         slug,
 					Title:                        title,
+					TaskType:                     taskType,
+					Application:                  application,
+					Objective:                    objective,
 					MetadataJSON:                 metadataJSON,
 				})
 				if err != nil {
@@ -80,6 +95,9 @@ into the AuthoringSession task contract.`,
 	command.Flags().StringVar(&baseImage, "base-image", "", "Immutable OCI base image pinned by a SHA-256 digest")
 	command.Flags().StringVar(&slug, "slug", "", "Human-readable task slug")
 	command.Flags().StringVar(&title, "title", "", "Task title")
+	command.Flags().StringVar(&taskType, "task-type", "", "Frozen task type used by authoring and generated metadata")
+	command.Flags().StringVar(&application, "application", "", "Frozen application name used by authoring and generated metadata")
+	command.Flags().StringVar(&objective, "objective", "", "Frozen authoring objective")
 	command.Flags().StringVar(&metadataJSON, "metadata-json", "{}", "Draft task metadata JSON")
 	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 idempotency key")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")

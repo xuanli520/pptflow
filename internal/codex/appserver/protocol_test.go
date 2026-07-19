@@ -55,6 +55,25 @@ func TestAppServerTurnStartParamsUsesMultimodalInput(t *testing.T) {
 	}
 }
 
+func TestAppServerReadOnlyPolicyDoesNotProjectRuntimeWorkspaceRootsAsWritable(t *testing.T) {
+	params := appServerTurnStartParams(Request{
+		ProjectPath:    "/managed/run/source",
+		SandboxPolicy:  "readOnly",
+		WorkspaceRoots: []string{"/managed/run/source"},
+	}, "thread-read-only")
+	policy, ok := params["sandboxPolicy"].(map[string]any)
+	if !ok || policy["type"] != "readOnly" || policy["networkAccess"] != false {
+		t.Fatalf("read-only sandbox policy = %#v", params["sandboxPolicy"])
+	}
+	if _, writable := policy["writableRoots"]; writable {
+		t.Fatalf("read-only sandbox unexpectedly projected writable roots: %#v", policy)
+	}
+	runtimeRoots, ok := params["runtimeWorkspaceRoots"].([]string)
+	if !ok || len(runtimeRoots) != 1 || runtimeRoots[0] != "/managed/run/source" {
+		t.Fatalf("read-only runtime roots = %#v", params["runtimeWorkspaceRoots"])
+	}
+}
+
 func TestAppServerClientInfoIsGenericAndConfigurable(t *testing.T) {
 	defaults := appServerClientInfo(Request{})
 	if defaults["name"] != "agent-runtime" || defaults["version"] != "1" {

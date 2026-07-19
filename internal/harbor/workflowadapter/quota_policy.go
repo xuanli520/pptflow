@@ -27,6 +27,7 @@ const (
 	StandardAuthoringQuotaPolicyVersion = "1.2.0"
 
 	StandardAuthoringTaskAdmissionQuotaPolicyVersion = "1.3.0"
+	StandardAuthoringBriefQuotaPolicyVersion         = "1.4.0"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
 	// stage. It is versioned with the policy rather than supplied by a Run.
@@ -423,6 +424,30 @@ func StandardAuthoringTaskAdmissionQuotaPolicy() QuotaPolicy {
 	return QuotaPolicy{
 		ID:      StandardAuthoringQuotaPolicyID,
 		Version: StandardAuthoringTaskAdmissionQuotaPolicyVersion,
+		AccountLimits: []QuotaAccountLimit{
+			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
+			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
+			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
+		},
+		Stages: stages,
+	}
+}
+
+// StandardAuthoringBriefQuotaPolicy is the additive 1.4.0 policy. The brief
+// changes immutable inputs, not the bounded work allowed to any stage.
+func StandardAuthoringBriefQuotaPolicy() QuotaPolicy {
+	catalog := StandardAuthoringBriefStageCatalog()
+	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
+	for _, stage := range catalog.Stages {
+		claims := standardClaimsForStage(stage)
+		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
+			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
+		}
+		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
+	}
+	return QuotaPolicy{
+		ID:      StandardAuthoringQuotaPolicyID,
+		Version: StandardAuthoringBriefQuotaPolicyVersion,
 		AccountLimits: []QuotaAccountLimit{
 			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
 			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},

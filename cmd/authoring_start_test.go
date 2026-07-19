@@ -15,7 +15,7 @@ func TestAuthoringStartCommandExposesSourceCoordinateAndClosedExecutionInputs(t 
 	if err != nil || command == nil || command.Name() != "start" {
 		t.Fatalf("find authoring start command: command=%v err=%v", command, err)
 	}
-	for _, required := range []string{"repository-url", "commit-sha", "base-image", "slug", "title", "metadata-json", "idempotency-key", "reason"} {
+	for _, required := range []string{"repository-url", "commit-sha", "base-image", "slug", "title", "task-type", "application", "objective", "metadata-json", "idempotency-key", "reason"} {
 		if command.Flags().Lookup(required) == nil {
 			t.Fatalf("authoring start is missing --%s", required)
 		}
@@ -71,6 +71,9 @@ func TestAuthoringStartCommandFailsClosedWithoutDeploymentCapabilityAndCreatesNo
 		"--base-image", "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"--slug", "fixture-authoring",
 		"--title", "Fixture authoring",
+		"--task-type", "feature",
+		"--application", "backend",
+		"--objective", "Add a bounded backend feature",
 		"--metadata-json", `{"difficulty":"hard"}`,
 		"--idempotency-key", key,
 		"--reason", "verify closed deployment boundary",
@@ -113,5 +116,39 @@ func TestAuthoringStartCommandRequiresBaseImage(t *testing.T) {
 	})
 	if err := command.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "base-image is required") {
 		t.Fatalf("missing base-image error = %v", err)
+	}
+}
+
+func TestAuthoringStartCommandRequiresCompleteAuthoringBrief(t *testing.T) {
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseArgs := []string{
+		"start",
+		"--repository-url", "https://github.com/example/fixture-repository.git",
+		"--commit-sha", "0123456789abcdef0123456789abcdef01234567",
+		"--base-image", "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"--slug", "fixture-authoring",
+		"--title", "Fixture authoring",
+		"--idempotency-key", key,
+		"--reason", "verify immutable authoring brief is required",
+	}
+	for _, test := range []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{name: "task type", want: "task-type is required"},
+		{name: "application", extra: []string{"--task-type", "feature"}, want: "application is required"},
+		{name: "objective", extra: []string{"--task-type", "feature", "--application", "backend"}, want: "objective is required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := newAuthoringCommand(&lifecycleCLIConfig{root: t.TempDir()})
+			command.SetArgs(append(append([]string(nil), baseArgs...), test.extra...))
+			if err := command.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("incomplete authoring brief error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -57,6 +58,19 @@ const (
 	// to build and run the isolated task environment.
 	HarborEvaluatorDockerCommandID = "harbor.docker.cli"
 	HarborEvaluatorDockerVersion   = "29.5.2"
+	// HarborEvaluatorDockerServerVersion pins the daemon API endpoint used by
+	// the evaluator. The CLI and daemon are independently versioned identities.
+	HarborEvaluatorDockerServerVersion = "29.4.1"
+	// HarborEvaluatorDockerComposeCommandID independently identifies the exact
+	// Docker CLI plugin used by Harbor 0.18 for Compose-backed task execution.
+	HarborEvaluatorDockerComposeCommandID     = "harbor.docker.compose.plugin"
+	HarborEvaluatorDockerComposeVersion       = "v5.1.3"
+	HarborEvaluatorDockerComposeVersionOutput = "Docker Compose version v5.1.3"
+	// HarborEvaluatorDockerBuildxCommandID independently identifies the exact
+	// Docker CLI plugin used by Docker when Harbor builds task environments.
+	HarborEvaluatorDockerBuildxCommandID     = "harbor.docker.buildx.plugin"
+	HarborEvaluatorDockerBuildxVersion       = "v0.33.0"
+	HarborEvaluatorDockerBuildxVersionOutput = "github.com/docker/buildx v0.33.0 f7897eba028583e0071642db3c011e860444f8cf"
 )
 
 const harborEvaluatorEndpointFingerprintDomain = "harbor.stageprovider.harbor-evaluator-endpoint.v1"
@@ -127,12 +141,17 @@ type HarborPythonSourceTreeLock struct {
 // deliberately: this makes the evaluator's direct invocation identity explicit
 // and makes any mismatch fail before a process can start.
 type HarborEvaluatorOperationLock struct {
-	Contract            HarborEvaluatorOperationContract `json:"contract"`
-	Launcher            LocalExecutableLock              `json:"launcher"`
-	PythonInterpreter   LocalExecutableLock              `json:"python_interpreter"`
-	PythonSourceTree    HarborPythonSourceTreeLock       `json:"python_source_tree"`
-	DockerCLI           LocalExecutableLock              `json:"docker_cli"`
-	HarborVersionOutput string                           `json:"harbor_version_output"`
+	Contract                   HarborEvaluatorOperationContract `json:"contract"`
+	Launcher                   LocalExecutableLock              `json:"launcher"`
+	PythonInterpreter          LocalExecutableLock              `json:"python_interpreter"`
+	PythonSourceTree           HarborPythonSourceTreeLock       `json:"python_source_tree"`
+	DockerCLI                  LocalExecutableLock              `json:"docker_cli"`
+	DockerServerVersion        string                           `json:"docker_server_version"`
+	DockerComposePlugin        LocalExecutableLock              `json:"docker_compose_plugin"`
+	DockerComposeVersionOutput string                           `json:"docker_compose_version_output"`
+	DockerBuildxPlugin         LocalExecutableLock              `json:"docker_buildx_plugin"`
+	DockerBuildxVersionOutput  string                           `json:"docker_buildx_version_output"`
+	HarborVersionOutput        string                           `json:"harbor_version_output"`
 }
 
 // Clone returns a defensively owned evaluator lock.
@@ -290,13 +309,63 @@ func (lock HarborEvaluatorOperationLock) Validate() error {
 	if lock.DockerCLI.CommandID != HarborEvaluatorDockerCommandID || lock.DockerCLI.Version != HarborEvaluatorDockerVersion {
 		return fmt.Errorf("%w: Harbor evaluator Docker CLI must be %s@%s", ErrInvalidDeploymentOperationCatalogLock, HarborEvaluatorDockerCommandID, HarborEvaluatorDockerVersion)
 	}
+	if _, err := HarborEvaluatorDockerPATH(lock.DockerCLI.AbsolutePath); err != nil {
+		return err
+	}
+	if lock.DockerServerVersion != HarborEvaluatorDockerServerVersion {
+		return fmt.Errorf("%w: Harbor evaluator Docker server version must be %q", ErrInvalidDeploymentOperationCatalogLock, HarborEvaluatorDockerServerVersion)
+	}
+	if err := validateLocalExecutableLock(lock.DockerComposePlugin); err != nil {
+		return err
+	}
+	if lock.DockerComposePlugin.CommandID != HarborEvaluatorDockerComposeCommandID || lock.DockerComposePlugin.Version != HarborEvaluatorDockerComposeVersion || filepath.Base(lock.DockerComposePlugin.AbsolutePath) != "docker-compose" {
+		return fmt.Errorf("%w: Harbor evaluator Docker Compose plugin must be %s@%s at a docker-compose basename", ErrInvalidDeploymentOperationCatalogLock, HarborEvaluatorDockerComposeCommandID, HarborEvaluatorDockerComposeVersion)
+	}
+	if err := validateLocalExecutableLock(lock.DockerBuildxPlugin); err != nil {
+		return err
+	}
+	if lock.DockerBuildxPlugin.CommandID != HarborEvaluatorDockerBuildxCommandID || lock.DockerBuildxPlugin.Version != HarborEvaluatorDockerBuildxVersion || filepath.Base(lock.DockerBuildxPlugin.AbsolutePath) != "docker-buildx" {
+		return fmt.Errorf("%w: Harbor evaluator Docker Buildx plugin must be %s@%s at a docker-buildx basename", ErrInvalidDeploymentOperationCatalogLock, HarborEvaluatorDockerBuildxCommandID, HarborEvaluatorDockerBuildxVersion)
+	}
 	if err := lock.PythonSourceTree.Validate(); err != nil {
 		return err
 	}
 	if strings.TrimSpace(lock.HarborVersionOutput) != lock.HarborVersionOutput || lock.HarborVersionOutput != lock.Contract.HarborVersion {
 		return fmt.Errorf("%w: Harbor evaluator --version output must exactly equal locked Harbor version", ErrInvalidDeploymentOperationCatalogLock)
 	}
+	if lock.DockerComposeVersionOutput != HarborEvaluatorDockerComposeVersionOutput {
+		return fmt.Errorf("%w: Harbor evaluator Docker Compose version output must exactly equal %q", ErrInvalidDeploymentOperationCatalogLock, HarborEvaluatorDockerComposeVersionOutput)
+	}
+	if lock.DockerBuildxVersionOutput != HarborEvaluatorDockerBuildxVersionOutput {
+		return fmt.Errorf("%w: Harbor evaluator Docker Buildx version output must exactly equal %q", ErrInvalidDeploymentOperationCatalogLock, HarborEvaluatorDockerBuildxVersionOutput)
+	}
 	return nil
+}
+
+// HarborEvaluatorDockerPATH returns the exact executable search path supplied
+// to Harbor and its Docker child processes. Requiring the locked CLI basename
+// to be docker makes the first PATH resolution deterministic and prevents a
+// differently named lock from authorizing an unrelated bare `docker` command.
+func HarborEvaluatorDockerPATH(dockerCLIPath string) (string, error) {
+	if err := validateHarborEvaluatorAbsolutePath("Harbor evaluator Docker CLI", dockerCLIPath); err != nil {
+		return "", err
+	}
+	if filepath.Base(dockerCLIPath) != "docker" {
+		return "", fmt.Errorf("%w: Harbor evaluator Docker CLI basename must be docker", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	dockerDirectory := filepath.Dir(dockerCLIPath)
+	if strings.ContainsRune(dockerDirectory, os.PathListSeparator) {
+		return "", fmt.Errorf("%w: Harbor evaluator Docker CLI directory cannot contain a PATH separator", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return strings.Join([]string{
+		dockerDirectory,
+		"/usr/local/sbin",
+		"/usr/local/bin",
+		"/usr/sbin",
+		"/usr/bin",
+		"/sbin",
+		"/bin",
+	}, string(os.PathListSeparator)), nil
 }
 
 // Validate proves the source-tree location and observed Python-file digest are

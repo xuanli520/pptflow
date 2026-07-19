@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
-	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 // TaskBoardColumn is the coarse workflow state exposed to an operator-facing
@@ -142,6 +141,9 @@ type TaskBoardStartAuthoringRequest struct {
 	BaseImage      string
 	Slug           string
 	Title          string
+	TaskType       string
+	Application    string
+	Objective      string
 	MetadataJSON   string
 	Reason         string
 }
@@ -326,6 +328,9 @@ func (service *TaskBoardService) StartAuthoring(ctx context.Context, request Tas
 		BaseImage:     request.BaseImage,
 		Slug:          request.Slug,
 		Title:         request.Title,
+		TaskType:      request.TaskType,
+		Application:   request.Application,
+		Objective:     request.Objective,
 		MetadataJSON:  request.MetadataJSON,
 	})
 	if err != nil {
@@ -811,7 +816,7 @@ func taskBoardRetryStrategy(run store.WorkflowRun) TaskBoardRetryStrategy {
 	case store.WorkflowRunSubjectTaskRevision:
 		return TaskBoardRetryStrategyTaskContinuation
 	case store.WorkflowRunSubjectAuthoringSession:
-		if run.Status == store.WorkflowRunWaitingContinuation && run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion {
+		if run.Status == store.WorkflowRunWaitingContinuation && isCurrentStandardAuthoringRun(run) {
 			return TaskBoardRetryStrategyAuthoringAdmissionRepair
 		}
 		return TaskBoardRetryStrategyAuthoringRecovery

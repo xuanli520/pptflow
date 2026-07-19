@@ -20,12 +20,25 @@ const workflowRunSelect = `
 // would let a direct Store caller bypass the application-level persisted
 // handoff artifact verification.
 const (
-	standardAuthoringParentTemplateID      = "harbor.standard-authoring"
-	standardAuthoringParentTemplateVersion = "1.2.0"
-	codeEdgePhase1ChildTemplateID          = "harbor.codeedge-phase1"
-	codeEdgePhase1ChildTemplateVersion     = "2.2.0"
-	standardAuthoringChildTrigger          = "standard-authoring.materialized"
+	standardAuthoringParentTemplateID                   = "harbor.standard-authoring"
+	standardAuthoringParentTemplateVersion              = "1.2.0"
+	standardAuthoringTaskAdmissionParentTemplateVersion = "1.3.0"
+	standardAuthoringBriefParentTemplateVersion         = "1.4.0"
+	codeEdgePhase1ChildTemplateID                       = "harbor.codeedge-phase1"
+	codeEdgePhase1ChildTemplateVersion                  = "2.2.0"
+	standardAuthoringChildTrigger                       = "standard-authoring.materialized"
 )
+
+func isStandardAuthoringParentTemplateVersion(version string) bool {
+	switch version {
+	case standardAuthoringParentTemplateVersion,
+		standardAuthoringTaskAdmissionParentTemplateVersion,
+		standardAuthoringBriefParentTemplateVersion:
+		return true
+	default:
+		return false
+	}
+}
 
 func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRunRequest) (WorkflowRun, error) {
 	if err := s.mutationPreflight(ctx); err != nil {
@@ -139,7 +152,7 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRun
 			if parent.SubjectKind != WorkflowRunSubjectAuthoringSession || parent.TaskID != "" || parent.RevisionID != "" || parent.AuthoringSessionID == "" {
 				return WorkflowRun{}, fmt.Errorf("parent workflow run belongs to another task")
 			}
-			if parent.WorkflowTemplateID != standardAuthoringParentTemplateID || parent.WorkflowTemplateVersion != standardAuthoringParentTemplateVersion ||
+			if parent.WorkflowTemplateID != standardAuthoringParentTemplateID || !isStandardAuthoringParentTemplateVersion(parent.WorkflowTemplateVersion) ||
 				run.WorkflowTemplateID != codeEdgePhase1ChildTemplateID || run.WorkflowTemplateVersion != codeEdgePhase1ChildTemplateVersion ||
 				run.Trigger != standardAuthoringChildTrigger {
 				return WorkflowRun{}, fmt.Errorf("authoring parent may create only its closed CodeEdge Phase-1 child")

@@ -244,6 +244,9 @@ func TestCodeEdgeComplianceFailsClosedOnFrozenEvidenceDrift(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if err := os.Chmod(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
 				if err := os.WriteFile(path, []byte("forged evaluator result"), 0o600); err != nil {
 					t.Fatal(err)
 				}

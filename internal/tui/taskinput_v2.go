@@ -1,33 +1,42 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 // TaskSubmitMsg is emitted when the user submits a new task.
 type TaskSubmitMsg struct {
-	RepoURL   string
-	CommitSHA string
-	BaseImage string
-	Slug      string
-	Title     string
-	Reason    string
+	RepoURL     string
+	CommitSHA   string
+	BaseImage   string
+	Slug        string
+	Title       string
+	TaskType    string
+	Application string
+	Objective   string
+	Reason      string
 }
 
 // TaskInputModel collects the caller-selected immutable source coordinate and
 // task identity and environment required by the Standard authoring lifecycle
 // command.
 type TaskInputModel struct {
-	repoInput      textinput.Model
-	commitInput    textinput.Model
-	baseImageInput textinput.Model
-	slugInput      textinput.Model
-	titleInput     textinput.Model
-	reasonInput    textinput.Model
-	focusIndex     int
-	visible        bool
-	validationErr  string
+	repoInput        textinput.Model
+	commitInput      textinput.Model
+	baseImageInput   textinput.Model
+	slugInput        textinput.Model
+	titleInput       textinput.Model
+	taskTypeInput    textinput.Model
+	applicationInput textinput.Model
+	objectiveInput   textinput.Model
+	reasonInput      textinput.Model
+	focusIndex       int
+	visible          bool
+	validationErr    string
 }
 
 func NewTaskInputModel() TaskInputModel {
@@ -61,6 +70,24 @@ func NewTaskInputModel() TaskInputModel {
 	title.CharLimit = 160
 	title.Width = 44
 
+	taskType := textinput.New()
+	taskType.Prompt = "Task type "
+	taskType.Placeholder = "feature"
+	taskType.CharLimit = 64
+	taskType.Width = 24
+
+	application := textinput.New()
+	application.Prompt = "Application "
+	application.Placeholder = "backend"
+	application.CharLimit = 64
+	application.Width = 36
+
+	objective := textinput.New()
+	objective.Prompt = "Objective "
+	objective.Placeholder = "Add the requested bounded behavior"
+	objective.CharLimit = 512
+	objective.Width = 64
+
 	reason := textinput.New()
 	reason.Prompt = "Reason "
 	reason.Placeholder = "Why this task is being created"
@@ -68,12 +95,15 @@ func NewTaskInputModel() TaskInputModel {
 	reason.Width = 44
 
 	return TaskInputModel{
-		repoInput:      repo,
-		commitInput:    commit,
-		baseImageInput: baseImage,
-		slugInput:      slug,
-		titleInput:     title,
-		reasonInput:    reason,
+		repoInput:        repo,
+		commitInput:      commit,
+		baseImageInput:   baseImage,
+		slugInput:        slug,
+		titleInput:       title,
+		taskTypeInput:    taskType,
+		applicationInput: application,
+		objectiveInput:   objective,
+		reasonInput:      reason,
 	}
 }
 
@@ -86,6 +116,9 @@ func (m *TaskInputModel) Show() {
 	m.baseImageInput.Blur()
 	m.slugInput.Blur()
 	m.titleInput.Blur()
+	m.taskTypeInput.Blur()
+	m.applicationInput.Blur()
+	m.objectiveInput.Blur()
 	m.reasonInput.Blur()
 }
 
@@ -96,6 +129,9 @@ func (m *TaskInputModel) Hide() {
 	m.baseImageInput.Blur()
 	m.slugInput.Blur()
 	m.titleInput.Blur()
+	m.taskTypeInput.Blur()
+	m.applicationInput.Blur()
+	m.objectiveInput.Blur()
 	m.reasonInput.Blur()
 }
 
@@ -123,8 +159,20 @@ func (m *TaskInputModel) toggleFocus() {
 		m.focusIndex = 4
 	case 4:
 		m.titleInput.Blur()
-		m.reasonInput.Focus()
+		m.taskTypeInput.Focus()
 		m.focusIndex = 5
+	case 5:
+		m.taskTypeInput.Blur()
+		m.applicationInput.Focus()
+		m.focusIndex = 6
+	case 6:
+		m.applicationInput.Blur()
+		m.objectiveInput.Focus()
+		m.focusIndex = 7
+	case 7:
+		m.objectiveInput.Blur()
+		m.reasonInput.Focus()
+		m.focusIndex = 8
 	default:
 		m.reasonInput.Blur()
 		m.repoInput.Focus()
@@ -140,6 +188,9 @@ func (m *TaskInputModel) Reset() {
 	m.baseImageInput.SetValue("")
 	m.slugInput.SetValue("")
 	m.titleInput.SetValue("")
+	m.taskTypeInput.SetValue("")
+	m.applicationInput.SetValue("")
+	m.objectiveInput.SetValue("")
 	m.reasonInput.SetValue("")
 	m.validationErr = ""
 }
@@ -152,31 +203,41 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
 		// Forward non-key messages to every input for cursor blink events.
-		var repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, reasonCmd tea.Cmd
+		var repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, objectiveCmd, reasonCmd tea.Cmd
 		m.repoInput, repoCmd = m.repoInput.Update(msg)
 		m.commitInput, commitCmd = m.commitInput.Update(msg)
 		m.baseImageInput, baseImageCmd = m.baseImageInput.Update(msg)
 		m.slugInput, slugCmd = m.slugInput.Update(msg)
 		m.titleInput, titleCmd = m.titleInput.Update(msg)
+		m.taskTypeInput, taskTypeCmd = m.taskTypeInput.Update(msg)
+		m.applicationInput, applicationCmd = m.applicationInput.Update(msg)
+		m.objectiveInput, objectiveCmd = m.objectiveInput.Update(msg)
 		m.reasonInput, reasonCmd = m.reasonInput.Update(msg)
-		return tea.Batch(repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, reasonCmd), false
+		return tea.Batch(repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, objectiveCmd, reasonCmd), false
 	}
 
 	switch keyMsg.String() {
 	case "enter":
 		request := TaskSubmitMsg{
-			RepoURL:   m.repoInput.Value(),
-			CommitSHA: m.commitInput.Value(),
-			BaseImage: m.baseImageInput.Value(),
-			Slug:      m.slugInput.Value(),
-			Title:     m.titleInput.Value(),
-			Reason:    m.reasonInput.Value(),
+			RepoURL:     strings.TrimSpace(m.repoInput.Value()),
+			CommitSHA:   strings.TrimSpace(m.commitInput.Value()),
+			BaseImage:   strings.TrimSpace(m.baseImageInput.Value()),
+			Slug:        strings.TrimSpace(m.slugInput.Value()),
+			Title:       strings.TrimSpace(m.titleInput.Value()),
+			TaskType:    strings.TrimSpace(m.taskTypeInput.Value()),
+			Application: strings.TrimSpace(m.applicationInput.Value()),
+			Objective:   strings.TrimSpace(m.objectiveInput.Value()),
+			Reason:      strings.TrimSpace(m.reasonInput.Value()),
 		}
-		if request.RepoURL != "" && request.CommitSHA != "" && request.BaseImage != "" && request.Slug != "" && request.Title != "" && request.Reason != "" {
+		if request.RepoURL != "" && request.CommitSHA != "" && request.BaseImage != "" && request.Slug != "" && request.Title != "" && request.TaskType != "" && request.Application != "" && request.Objective != "" && request.Reason != "" {
+			if len(request.Objective) > workflowadapter.StandardAuthoringBriefObjectiveMaxBytes {
+				m.validationErr = "Objective must be at most 512 UTF-8 bytes"
+				return nil, true
+			}
 			m.validationErr = ""
 			return func() tea.Msg { return request }, true
 		}
-		m.validationErr = "URL, SHA, base image, slug, title, and reason are required"
+		m.validationErr = "URL, SHA, base image, slug, title, task type, application, objective, and reason are required"
 		return nil, true
 
 	case "tab":
@@ -200,6 +261,12 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 		m.slugInput, cmd = m.slugInput.Update(msg)
 	} else if m.focusIndex == 4 {
 		m.titleInput, cmd = m.titleInput.Update(msg)
+	} else if m.focusIndex == 5 {
+		m.taskTypeInput, cmd = m.taskTypeInput.Update(msg)
+	} else if m.focusIndex == 6 {
+		m.applicationInput, cmd = m.applicationInput.Update(msg)
+	} else if m.focusIndex == 7 {
+		m.objectiveInput, cmd = m.objectiveInput.Update(msg)
 	} else {
 		m.reasonInput, cmd = m.reasonInput.Update(msg)
 	}
@@ -213,9 +280,11 @@ func (m TaskInputModel) View(width int) string {
 	content := m.repoInput.View() + "  " + m.commitInput.View() + "\n" +
 		m.baseImageInput.View() + "\n" +
 		m.slugInput.View() + "  " + m.titleInput.View() + "\n" +
+		m.taskTypeInput.View() + "  " + m.applicationInput.View() + "\n" +
+		m.objectiveInput.View() + "\n" +
 		m.reasonInput.View()
 	if m.validationErr != "" {
 		content += "\n" + failStyleV2.Render(m.validationErr)
 	}
-	return inputStyle.Width(max(1, width)).Render(content)
+	return inputStyle.Width(max(1, width-inputStyle.GetHorizontalFrameSize())).Render(content)
 }

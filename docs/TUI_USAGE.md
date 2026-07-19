@@ -29,7 +29,7 @@ harbor-factory --root .harbor-factory tui
 
 ## 创建任务
 
-按 `n` 后填写 HTTPS/SSH Git URL、完整 40 或 64 位 commit SHA、slug、标题和原因。TUI 将这些事实交给 Standard authoring application service；它负责冻结源码、创建 draft Task、AuthoringSession 和 queued Run。
+按 `n` 后填写 HTTPS/SSH Git URL、完整 40 或 64 位 commit SHA、digest 固定的基础镜像、slug、标题、task type、application、单行 objective 和原因。TUI 将这些事实交给 Standard authoring application service；它负责冻结源码和 authoring brief，创建 draft Task、AuthoringSession 和 queued Run。
 
 表单可见时，所有键都只属于表单。输入 `d`、`a`、`r`、方向键或 `Tab` 不会在后台打开详情、移动选择或提交审核。
 

@@ -54,7 +54,7 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 	wantTemplates := []workflowadapter.TemplateReference{
 		workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
 		workflowadapter.CodeEdgePhase1TemplateReference(),
-		workflowadapter.StandardAuthoringTaskAdmissionTemplateReference(),
+		workflowadapter.StandardAuthoringBriefTemplateReference(),
 	}
 	if got := router.Templates(); !reflect.DeepEqual(got, wantTemplates) {
 		t.Fatalf("installed production template bundles = %#v, want %#v", got, wantTemplates)
@@ -84,7 +84,7 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 	}{
 		{
 			name:     "Standard authoring",
-			template: workflowadapter.StandardAuthoringTaskAdmissionTemplateReference(),
+			template: workflowadapter.StandardAuthoringBriefTemplateReference(),
 			record:   fixture.standardLock.Operations[0],
 			wrong:    workflowadapter.CodeEdgePhase1TemplateReference(),
 		},
@@ -198,7 +198,7 @@ func TestPreflightHarborFlowProductionDeploymentBundlesRejectsStaleLockWithoutMa
 	if err != nil {
 		t.Fatal(err)
 	}
-	stale := strings.Replace(string(raw), `"version":"2"`, `"version":"1"`, 1)
+	stale := strings.Replace(string(raw), `"version":"3"`, `"version":"2"`, 1)
 	if stale == string(raw) {
 		t.Fatal("could not produce stale Standard authoring lock fixture")
 	}
@@ -350,7 +350,17 @@ func rootCompositionEvaluatorLock(t *testing.T, catalogPath string, build stagep
 				CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: "/opt/harbor-factory-test/docker", Version: stageprovider.HarborEvaluatorDockerVersion,
 				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-docker")),
 			},
-			HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion,
+			DockerServerVersion: stageprovider.HarborEvaluatorDockerServerVersion,
+			DockerComposePlugin: stageprovider.LocalExecutableLock{
+				CommandID: stageprovider.HarborEvaluatorDockerComposeCommandID, AbsolutePath: "/opt/harbor-factory-test/cli-plugins/docker-compose", Version: stageprovider.HarborEvaluatorDockerComposeVersion,
+				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-docker-compose")),
+			},
+			DockerBuildxPlugin: stageprovider.LocalExecutableLock{
+				CommandID: stageprovider.HarborEvaluatorDockerBuildxCommandID, AbsolutePath: "/opt/harbor-factory-test/cli-plugins/docker-buildx", Version: stageprovider.HarborEvaluatorDockerBuildxVersion,
+				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-docker-buildx")),
+			},
+			HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion, DockerComposeVersionOutput: stageprovider.HarborEvaluatorDockerComposeVersionOutput,
+			DockerBuildxVersionOutput: stageprovider.HarborEvaluatorDockerBuildxVersionOutput,
 		}
 		lock.Operations = append(lock.Operations, record)
 	}

@@ -408,7 +408,19 @@ func TestValidateStandardAuthoringSourceArchiveAcceptsAndProjectsRealGitPAXLongP
 	if err != nil || !bytes.Equal(projected, content) {
 		t.Fatalf("projected long Git archive path = %q, %v; want %q", projected, err, content)
 	}
-	if err := verifyStandardAuthoringExtractedSnapshot(context.Background(), archive, filepath.Join(workspace, filepath.FromSlash(standardAuthoringSourceArchiveRoot)), coordinate); err != nil {
+	sourceRoot := filepath.Join(workspace, filepath.FromSlash(standardAuthoringSourceArchiveRoot))
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o755)
+			}
+			return nil
+		})
+	})
+	if err := markStandardAuthoringSourceReadOnly(sourceRoot); err != nil {
+		t.Fatalf("seal real Git long-path workspace: %v", err)
+	}
+	if err := verifyStandardAuthoringExtractedSnapshot(context.Background(), archive, sourceRoot, coordinate); err != nil {
 		t.Fatalf("verify real Git long-path archive: %v", err)
 	}
 }

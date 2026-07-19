@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -24,7 +25,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("resolve Standard authoring catalog: %v", err)
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringTaskAdmissionTemplateReference()) {
+	if !catalog.Template().Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
 		t.Fatalf("catalog template = %s@%s, want Standard authoring", catalog.Template().ID, catalog.Template().Version)
 	}
 	profileRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "execution-profile.v1.json"))
@@ -35,7 +36,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("parse Standard authoring execution profile: %v", err)
 	}
-	compiled, err := workflowadapter.StandardAuthoringTaskAdmissionWorkflowTemplate().Compile(profile)
+	compiled, err := workflowadapter.StandardAuthoringBriefWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatalf("compile Standard authoring execution profile: %v", err)
 	}
@@ -113,6 +114,38 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	}
 	if agentStages != 9 {
 		t.Fatalf("catalog Codex agent stages = %d, want 9", agentStages)
+	}
+}
+
+func TestStandardAuthoringBriefPromptsFreezeScopeWithoutElevatingData(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	for _, test := range []struct {
+		path    string
+		version string
+		extra   string
+	}{
+		{path: "repo-analyze.json", version: "1.2.0"},
+		{path: "task-design.json", version: "1.3.0"},
+		{path: "generate-task-files.json", version: "1.2.0"},
+		{path: "task-toml-generate.json", version: "1.3.0", extra: "metadata.task_type"},
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", test.path, err)
+		}
+		joined := strings.Join(program.TurnPrompts, "\n")
+		for _, required := range []string{"authoring_brief", "task_type", "application", "objective", "system", "instructions"} {
+			if !strings.Contains(joined, required) {
+				t.Fatalf("prompt %s omits frozen brief boundary %q", test.path, required)
+			}
+		}
+		if program.Version != test.version || (test.extra != "" && !strings.Contains(joined, test.extra)) {
+			t.Fatalf("prompt %s version/content = %s/%q", test.path, program.Version, test.extra)
+		}
 	}
 }
 
@@ -303,7 +336,7 @@ func standardAuthoringDeploymentTestLock(t *testing.T, catalog *DeploymentOperat
 				JavaScriptLauncher: LocalExecutableLock{CommandID: CodexAppServerJavaScriptLauncherCommandID, AbsolutePath: "/opt/standard-authoring/codex.js", Version: "0.133.0", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("locked launcher"))},
 				NodeExecutable:     LocalExecutableLock{CommandID: CodexAppServerNodeExecutableCommandID, AbsolutePath: "/opt/standard-authoring/node", Version: "v26.2.0", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("locked node"))},
 				CodexHomeDirectory: "/opt/standard-authoring/codex-home", CLIVersionOutput: "codex-cli 0.133.0",
-				SandboxMode: CodexAppServerSandboxModeWorkspaceWrite, SandboxPolicy: CodexAppServerSandboxPolicyWorkspaceWrite,
+				SandboxMode: CodexAppServerSandboxModeReadOnly, SandboxPolicy: CodexAppServerSandboxPolicyReadOnly,
 			}
 			record.AgentModel = &AgentModelLock{
 				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
