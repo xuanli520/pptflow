@@ -291,6 +291,113 @@ func TestRunWorkerSessionKeepsSupervisorThroughDispatchLeaseLossRecovery(t *test
 	}
 }
 
+func TestRunWorkerSupervisorRetriesTransientHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := store.OpenForTest(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	lease, err := dataStore.AcquireLease(ctx, store.AcquireLeaseRequest{
+		ResourceType: RunWorkerLeaseResourceType, ResourceID: "heartbeat-retry", Owner: "worker", TTL: time.Second, Actor: "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &RunWorkerSession{
+		owner: "worker", actor: "tester", reason: "heartbeat retry", leaseTTL: time.Second, heartbeatEvery: 20 * time.Millisecond,
+		heartbeatLease: dataStore.HeartbeatLease, getLease: dataStore.GetLease,
+	}
+	actualHeartbeat := session.heartbeatLease
+	calls := 0
+	session.heartbeatLease = func(ctx context.Context, request store.HeartbeatLeaseRequest) (store.Lease, error) {
+		calls++
+		if calls == 1 {
+			return store.Lease{}, transientSQLiteFixtureError{code: 5}
+		}
+		return actualHeartbeat(ctx, request)
+	}
+	heartbeats := newRunWorkerLeaseHeartbeats(session, lease)
+	if err := heartbeats.heartbeat(); err != nil || calls != 2 || heartbeats.latest().Version != lease.Version+1 {
+		t.Fatalf("supervisor heartbeat retry calls=%d lease=%+v err=%v", calls, heartbeats.latest(), err)
+	}
+}
+
+func TestRunWorkerSupervisorFenceLossCancelsActiveExecution(t *testing.T) {
+	id, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := store.Lease{ID: id, Owner: "worker", FencingToken: 1, State: store.LeaseActive, Version: 1, ExpiresAt: time.Now().Add(time.Second)}
+	canceled := make(chan struct{})
+	var cancelOnce sync.Once
+	worker := &DurableWorker{}
+	worker.setActiveExecutionCancel(func() { cancelOnce.Do(func() { close(canceled) }) })
+	session := &RunWorkerSession{
+		owner: "worker", actor: "tester", reason: "fence loss", worker: worker,
+		leaseTTL: 30 * time.Millisecond, heartbeatEvery: 10 * time.Millisecond,
+		heartbeatLease: func(context.Context, store.HeartbeatLeaseRequest) (store.Lease, error) {
+			return store.Lease{}, store.ErrFencingToken
+		},
+		getLease: func(context.Context, string) (*store.Lease, error) { return &lease, nil },
+	}
+	heartbeats := newRunWorkerLeaseHeartbeats(session, lease)
+	heartbeats.start()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("supervisor fence loss did not cancel active execution")
+	}
+	heartbeats.stop()
+	var heartbeatErr *LeaseHeartbeatError
+	if !errors.As(heartbeats.err(), &heartbeatErr) || heartbeatErr.Class != LeaseHeartbeatFenceInvalid {
+		t.Fatalf("supervisor heartbeat error = %v", heartbeats.err())
+	}
+}
+
+func TestRunWorkerSupervisorFenceLossStopsLongStage(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	stageStarted := make(chan struct{})
+	var stageOnce sync.Once
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, func(ctx context.Context, _ workflowkit.StageExecutionRequest) (workflowkit.StageExecutionResult, error) {
+		stageOnce.Do(func() { close(stageStarted) })
+		<-ctx.Done()
+		return workflowkit.StageExecutionResult{}, ctx.Err()
+	}))
+	session, err := NewRunWorkerSession(RunWorkerSessionConfig{
+		Services: fixture.services, RunID: fixture.run.ID, Owner: "supervisor-fence-loss", Actor: runtimeFixtureActor,
+		Reason: "test supervisor fence loss cancellation", Handler: runtime,
+		LeaseTTL: 500 * time.Millisecond, HeartbeatEvery: 20 * time.Millisecond, PollInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualHeartbeat := session.heartbeatLease
+	session.heartbeatLease = func(ctx context.Context, request store.HeartbeatLeaseRequest) (store.Lease, error) {
+		select {
+		case <-stageStarted:
+			return store.Lease{}, store.ErrFencingToken
+		default:
+			return actualHeartbeat(ctx, request)
+		}
+	}
+	startedAt := time.Now()
+	_, err = session.Run(ctx)
+	if !errors.Is(err, ErrRunWorkerLeaseLost) {
+		t.Fatalf("supervisor fence loss result = %v, want lease lost", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= time.Second {
+		t.Fatalf("supervisor fence loss took %s to stop long stage", elapsed)
+	}
+	_, payload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
+	stage, err := fixture.store.GetStageAttempt(ctx, payload.StageAttemptID)
+	if err != nil || stage == nil || (stage.ExecutionStatus != store.StageExecutionInterrupted && stage.ExecutionStatus != store.StageExecutionInfraFailed) {
+		t.Fatalf("stage after supervisor fence loss = %+v, %v", stage, err)
+	}
+}
+
 func TestLocalRuntimeAttachAndReconcileIncludeControlledWorkerLease(t *testing.T) {
 	ctx := context.Background()
 	_, services, _, _, run := newLocalRuntimeServiceFixture(t, "run-worker-reconcile")

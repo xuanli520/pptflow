@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -56,6 +57,60 @@ func TestBackupIfDueAndCriticalOperation(t *testing.T) {
 	}
 	if len(after) != len(before)+1 || !foundCritical {
 		t.Fatalf("critical operation backup missing: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestBackupIfDueSerializesAcrossStoreProcesses(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	first, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	before, err := first.ListVerifiedBackups()
+	if err != nil || len(before) == 0 {
+		t.Fatalf("initial backups = %+v, %v", before, err)
+	}
+	clock := before[0].CreatedAt.Add(verifiedBackupInterval + time.Second)
+	first.now = func() time.Time { return clock }
+	second.now = func() time.Time { return clock }
+	type result struct {
+		record *BackupRecord
+		err    error
+	}
+	results := make(chan result, 2)
+	var group sync.WaitGroup
+	for _, dataStore := range []*Store{first, second} {
+		group.Add(1)
+		go func(dataStore *Store) {
+			defer group.Done()
+			record, err := dataStore.BackupIfDue(ctx)
+			results <- result{record: record, err: err}
+		}(dataStore)
+	}
+	group.Wait()
+	close(results)
+	created := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.record != nil {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("concurrent interval backups created = %d, want 1", created)
+	}
+	after, err := first.ListVerifiedBackups()
+	if err != nil || len(after) != len(before)+1 {
+		t.Fatalf("backups after concurrent interval = %d, %v; before=%d", len(after), err, len(before))
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -963,6 +964,81 @@ func newFrozenRuntime(t *testing.T, services *LifecycleServices, registry *workf
 		t.Fatal(err)
 	}
 	return runtime
+}
+
+func TestQuotaHeartbeatRetriesTransientBatchError(t *testing.T) {
+	leaseID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := store.DurableQuotaLease{
+		ID: leaseID, Owner: "quota-worker", FencingToken: 1, State: store.DurableQuotaLeaseActive,
+		ExpiresAt: time.Now().Add(time.Second),
+	}
+	calls := 0
+	runtime := &FrozenExecutionRuntime{quotaLeaseTTL: 300 * time.Millisecond}
+	runtime.heartbeatQuotaLeases = func(_ context.Context, _ []store.HeartbeatQuotaLeaseRequest) ([]store.DurableQuotaLease, error) {
+		calls++
+		if calls == 1 {
+			return nil, transientSQLiteFixtureError{code: 5}
+		}
+		updated := lease
+		updated.ExpiresAt = time.Now().Add(runtime.quotaLeaseTTL)
+		return []store.DurableQuotaLease{updated}, nil
+	}
+	heartbeats := newQuotaLeaseHeartbeats(runtime, lease.Owner, "tester", []store.DurableQuotaLease{lease}, nil)
+	if err := heartbeats.heartbeat(); err != nil || calls != 2 {
+		t.Fatalf("quota heartbeat retry calls=%d err=%v", calls, err)
+	}
+}
+
+func TestQuotaHeartbeatConfirmedFenceLossCancelsStage(t *testing.T) {
+	leaseID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := store.DurableQuotaLease{
+		ID: leaseID, Owner: "quota-worker", FencingToken: 1, State: store.DurableQuotaLeaseActive,
+		ExpiresAt: time.Now().Add(time.Second),
+	}
+	runtime := &FrozenExecutionRuntime{quotaLeaseTTL: 30 * time.Millisecond}
+	runtime.heartbeatQuotaLeases = func(context.Context, []store.HeartbeatQuotaLeaseRequest) ([]store.DurableQuotaLease, error) {
+		return nil, store.ErrFencingToken
+	}
+	canceled := make(chan struct{})
+	var cancelOnce sync.Once
+	heartbeats := newQuotaLeaseHeartbeats(runtime, lease.Owner, "tester", []store.DurableQuotaLease{lease}, func() {
+		cancelOnce.Do(func() { close(canceled) })
+	})
+	heartbeats.start()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("quota fence loss did not cancel the stage")
+	}
+	heartbeats.stop()
+	var heartbeatErr *LeaseHeartbeatError
+	if !heartbeats.lostLease() || !errors.As(heartbeats.failureError(), &heartbeatErr) || heartbeatErr.Class != LeaseHeartbeatFenceInvalid {
+		t.Fatalf("quota heartbeat loss = lost:%t err:%v", heartbeats.lostLease(), heartbeats.failureError())
+	}
+}
+
+func TestStageControlMonitorRetainsUnrecoveredPollFailure(t *testing.T) {
+	want := errors.New("control store unavailable")
+	monitor := &stageControlMonitor{
+		runID: "run", listForRun: func(context.Context, string) ([]store.DurableControlOperation, error) {
+			return nil, want
+		},
+	}
+	monitor.poll()
+	if !errors.Is(monitor.failureError(), want) {
+		t.Fatalf("control poll failure = %v, want %v", monitor.failureError(), want)
+	}
+	monitor.listForRun = func(context.Context, string) ([]store.DurableControlOperation, error) { return nil, nil }
+	monitor.poll()
+	if monitor.failureError() != nil {
+		t.Fatalf("recovered control poll retained error: %v", monitor.failureError())
+	}
 }
 
 func newFrozenRuntimeWorker(t *testing.T, dataStore *store.Store, runtime *FrozenExecutionRuntime, owner string) *DurableWorker {

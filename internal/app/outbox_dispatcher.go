@@ -67,6 +67,7 @@ type OutboxDispatcher struct {
 	retryDelay     time.Duration
 	pollInterval   time.Duration
 	handler        OutboxDeliveryHandler
+	heartbeatEvent func(context.Context, store.HeartbeatOutboxEventRequest) (store.OutboxEvent, error)
 }
 
 // NewOutboxDispatcher validates one explicit local worker profile.
@@ -104,6 +105,7 @@ func NewOutboxDispatcher(config OutboxDispatcherConfig) (*OutboxDispatcher, erro
 		retryDelay:     config.RetryDelay,
 		pollInterval:   config.PollInterval,
 		handler:        config.Handler,
+		heartbeatEvent: config.Store.HeartbeatOutboxEvent,
 	}, nil
 }
 
@@ -336,7 +338,7 @@ func (heartbeats *outboxLeaseHeartbeats) heartbeat(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	updated, err := heartbeats.dispatcher.store.HeartbeatOutboxEvent(ctx, store.HeartbeatOutboxEventRequest{
+	request := store.HeartbeatOutboxEventRequest{
 		IdempotencyKey:    "outbox-dispatcher-heartbeat:" + key,
 		OutboxEventID:     heartbeats.event.ID,
 		Owner:             heartbeats.dispatcher.owner,
@@ -345,7 +347,14 @@ func (heartbeats *outboxLeaseHeartbeats) heartbeat(ctx context.Context) error {
 		LeaseTTL:          heartbeats.dispatcher.leaseTTL,
 		Actor:             heartbeats.dispatcher.actor,
 		Reason:            heartbeats.dispatcher.reasonFor("heartbeat outbox event"),
-	})
+	}
+	if heartbeats.event.LeaseExpiresAt == nil {
+		return &LeaseHeartbeatError{Class: LeaseHeartbeatFenceInvalid, Cause: store.ErrFencingToken}
+	}
+	updated, err := retryIdempotentLeaseHeartbeat(ctx, heartbeats.stopCh, heartbeats.dispatcher.heartbeatEvery, *heartbeats.event.LeaseExpiresAt,
+		func(callCtx context.Context) (store.OutboxEvent, error) {
+			return heartbeats.dispatcher.heartbeatEvent(callCtx, request)
+		})
 	if err != nil {
 		return err
 	}

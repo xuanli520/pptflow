@@ -53,6 +53,36 @@ func TestChangeProviderServiceDoesNotInstallAmbientAgentRepair(t *testing.T) {
 	}
 }
 
+func TestCandidateProviderRetriesTransientStartHeartbeat(t *testing.T) {
+	id, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := store.Lease{ID: id, Owner: "candidate-worker", FencingToken: 3, State: store.LeaseActive, Version: 1, ExpiresAt: time.Now().Add(time.Second)}
+	service := &ChangeProviderService{}
+	calls := 0
+	service.heartbeatLease = func(_ context.Context, request store.HeartbeatLeaseRequest) (store.Lease, error) {
+		calls++
+		if calls == 1 {
+			return store.Lease{}, transientSQLiteFixtureError{code: 5}
+		}
+		lease.Version = request.ExpectedVersion + 1
+		lease.ExpiresAt = time.Now().Add(request.TTL)
+		return lease, nil
+	}
+	service.getLease = func(context.Context, string) (*store.Lease, error) {
+		copyLease := lease
+		copyLease.Version = 1
+		return &copyLease, nil
+	}
+	receipt, updated, err := service.applyWithCandidateLeaseHeartbeat(context.Background(), sleepingChangeProvider{}, ChangeProviderRequest{
+		Actor: "tester", Timeout: 200 * time.Millisecond,
+	}, lease, time.Second)
+	if err != nil || calls != 2 || updated.Version != 2 || receipt.ProviderID != (sleepingChangeProvider{}).ID() {
+		t.Fatalf("candidate heartbeat retry receipt=%+v lease=%+v calls=%d err=%v", receipt, updated, calls, err)
+	}
+}
+
 func (testChangeProvider) ID() string { return "test_change" }
 
 func (testChangeProvider) ValidatePayload(raw json.RawMessage) (json.RawMessage, error) {

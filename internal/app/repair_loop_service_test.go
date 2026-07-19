@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -218,6 +219,58 @@ func TestRepairLoopQueuesBoundSecondRoundAndReplaysIdempotently(t *testing.T) {
 	}
 	if fixture.agent.Calls() != 2 {
 		t.Fatalf("repair coordinator replay invoked agent again: %d calls", fixture.agent.Calls())
+	}
+}
+
+func TestRepairLoopIgnoresAuthoringRunWithoutRevision(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	services, err := newLifecycleServicesForTest(root, database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("a", 64)
+	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
+		SnapshotArtifactRef: digest, SnapshotContentDigest: digest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
+		IdempotencyKey: "repair-authoring-source", Actor: "author",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := database.CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: "repair-authoring-noop", SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA, Actor: "author",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "1.2.0",
+		SessionManifestJSON: `{}`, IdempotencyKey: "repair-authoring-session", Actor: "author",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID, WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:profile", DefinitionHash: "sha256:definition", RunManifestJSON: `{}`,
+		Trigger: "task.generate", Actor: "author",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, queued, err := services.Repairs.EnqueueRunOutcome(ctx, run.ID, "worker", "ignore unrelated authoring run")
+	if err != nil || queued || job.ID != "" {
+		t.Fatalf("authoring repair enqueue = %+v queued=%t err=%v", job, queued, err)
+	}
+	result, err := services.Repairs.RecoverRunOutcome(ctx, run.ID)
+	if err != nil || result.Action != "" {
+		t.Fatalf("authoring repair recovery = %+v, %v", result, err)
 	}
 }
 

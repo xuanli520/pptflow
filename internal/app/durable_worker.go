@@ -101,6 +101,9 @@ type DurableJobExecution struct {
 	Claim         store.DurableJobDispatchClaim
 	DispatchFence store.DispatchFence
 	LeaseLost     <-chan struct{}
+	// ExecutionAbort asks a still-fenced handler to stop expensive work while
+	// preserving its dispatch-authorized cleanup/projection context.
+	ExecutionAbort <-chan struct{}
 }
 
 // DurableWorkerConfig controls one local process worker. Lease defaults are
@@ -137,6 +140,9 @@ type DurableWorker struct {
 	pollInterval    time.Duration
 	handler         DurableJobHandler
 	heartbeatLease  func(context.Context, store.HeartbeatLeaseRequest) (store.Lease, error)
+	activeMu        sync.Mutex
+	activeCancel    func()
+	executionAbort  <-chan struct{}
 }
 
 // NewDurableWorker validates an explicit local worker profile.
@@ -269,6 +275,16 @@ func (worker *DurableWorker) RunOnceForCommandTypes(ctx context.Context, command
 	}
 	leaseContext, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	executionAbort := make(chan struct{})
+	var abortOnce sync.Once
+	abortExecution := func() { abortOnce.Do(func() { close(executionAbort) }) }
+	worker.setActiveExecutionCancel(abortExecution)
+	defer worker.clearActiveExecutionCancel()
+	select {
+	case <-worker.executionAbort:
+		abortExecution()
+	default:
+	}
 	fence := store.DispatchFence{LeaseID: claim.DispatchLease.ID, Owner: claim.Owner, FencingToken: claim.DispatchLease.FencingToken}
 	guard := newDispatchFenceGuard(cancel)
 	leaseContext = store.WithDispatchFence(leaseContext, fence, guard)
@@ -276,7 +292,7 @@ func (worker *DurableWorker) RunOnceForCommandTypes(ctx context.Context, command
 	heartbeats.start()
 	defer heartbeats.stop()
 
-	handlerResult, handlerErr := worker.handler.HandleDurableJob(leaseContext, DurableJobExecution{Claim: claim, DispatchFence: fence, LeaseLost: guard.lost})
+	handlerResult, handlerErr := worker.handler.HandleDurableJob(leaseContext, DurableJobExecution{Claim: claim, DispatchFence: fence, LeaseLost: guard.lost, ExecutionAbort: executionAbort})
 	heartbeats.stop()
 	result.HeartbeatFirstErrorClass, result.HeartbeatFinalErrorClass = heartbeats.errorClasses()
 	if handlerResult.State == "" {
@@ -355,6 +371,27 @@ func (worker *DurableWorker) RunOnceForCommandTypes(ctx context.Context, command
 	result.Job = &transitioned
 	result.FinalState = transitioned.State
 	return result, handlerErr
+}
+
+func (worker *DurableWorker) setActiveExecutionCancel(cancel func()) {
+	worker.activeMu.Lock()
+	defer worker.activeMu.Unlock()
+	worker.activeCancel = cancel
+}
+
+func (worker *DurableWorker) clearActiveExecutionCancel() {
+	worker.activeMu.Lock()
+	defer worker.activeMu.Unlock()
+	worker.activeCancel = nil
+}
+
+func (worker *DurableWorker) cancelActiveExecution() {
+	worker.activeMu.Lock()
+	cancel := worker.activeCancel
+	worker.activeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // Run keeps consuming jobs until the supplied process context ends. The
@@ -580,9 +617,17 @@ func (heartbeats *dispatchLeaseHeartbeats) heartbeat(ctx context.Context) error 
 
 func (heartbeats *dispatchLeaseHeartbeats) heartbeatWithinSafeWindow() bool {
 	for {
+		deadline := heartbeats.dispatchExpiresAt()
+		callCtx, cancel, contextErr := leaseHeartbeatCallContext(context.Background(), deadline)
+		if contextErr != nil {
+			heartbeats.recordHeartbeatClass(DurableJobHeartbeatRetryExhausted, false)
+			heartbeats.guard.lose(DurableJobHeartbeatRetryExhausted)
+			return false
+		}
 		err := heartbeats.guard.withHeartbeat(func() error {
-			return heartbeats.heartbeat(context.Background())
+			return heartbeats.heartbeat(callCtx)
 		})
+		cancel()
 		if err == nil {
 			heartbeats.recordHeartbeatClass(DurableJobHeartbeatRecovered, true)
 			return true
@@ -594,7 +639,15 @@ func (heartbeats *dispatchLeaseHeartbeats) heartbeatWithinSafeWindow() bool {
 			return false
 		}
 		if errors.Is(err, store.ErrOptimisticLock) {
-			if refreshErr := heartbeats.refreshLeases(context.Background()); refreshErr != nil {
+			refreshCtx, refreshCancel, refreshContextErr := leaseHeartbeatCallContext(context.Background(), deadline)
+			if refreshContextErr != nil {
+				heartbeats.recordHeartbeatClass(DurableJobHeartbeatRetryExhausted, false)
+				heartbeats.guard.lose(DurableJobHeartbeatRetryExhausted)
+				return false
+			}
+			refreshErr := heartbeats.refreshLeases(refreshCtx)
+			refreshCancel()
+			if refreshErr != nil {
 				refreshClass := classifyDispatchHeartbeatError(refreshErr)
 				heartbeats.recordHeartbeatClass(refreshClass, false)
 				if refreshClass != DurableJobHeartbeatStoreTransient {
@@ -603,7 +656,7 @@ func (heartbeats *dispatchLeaseHeartbeats) heartbeatWithinSafeWindow() bool {
 				}
 			}
 		}
-		deadline := heartbeats.dispatchExpiresAt()
+		deadline = heartbeats.dispatchExpiresAt()
 		delay := heartbeats.retryDelay(deadline)
 		if delay <= 0 {
 			heartbeats.recordHeartbeatClass(DurableJobHeartbeatRetryExhausted, false)
@@ -708,25 +761,14 @@ func (heartbeats *dispatchLeaseHeartbeats) leaseLostError(jobID string) error {
 }
 
 func classifyDispatchHeartbeatError(err error) DurableJobHeartbeatErrorClass {
-	if errors.Is(err, store.ErrDispatchFenceLost) || errors.Is(err, store.ErrFencingToken) || errors.Is(err, store.ErrImmutable) || errors.Is(err, store.ErrLeaseHeld) || errors.Is(err, store.ErrNotFound) {
+	switch classifyLeaseHeartbeatError(err) {
+	case LeaseHeartbeatFenceInvalid:
 		return DurableJobHeartbeatFenceInvalid
-	}
-	if errors.Is(err, store.ErrOptimisticLock) || transientSQLiteError(err) {
+	case LeaseHeartbeatStoreTransient:
 		return DurableJobHeartbeatStoreTransient
-	}
-	return DurableJobHeartbeatStoreFailure
-}
-
-func transientSQLiteError(err error) bool {
-	type sqliteCoder interface{ Code() int }
-	var coded sqliteCoder
-	if !errors.As(err, &coded) {
-		return false
-	}
-	switch coded.Code() & 0xff {
-	case 5, 6, 10: // SQLITE_BUSY, SQLITE_LOCKED, SQLITE_IOERR
-		return true
+	case LeaseHeartbeatRetryExhausted:
+		return DurableJobHeartbeatRetryExhausted
 	default:
-		return false
+		return DurableJobHeartbeatStoreFailure
 	}
 }

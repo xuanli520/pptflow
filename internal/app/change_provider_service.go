@@ -44,13 +44,19 @@ type ChangePlanResult struct {
 // provider writes, supplies only a candidate checkout, and hands execution to
 // the same frozen-plan/worker model used by no-content continuation.
 type ChangeProviderService struct {
-	core      *lifecycleServiceCore
-	providers map[string]ChangeProvider
-	observer  continuationStateObserver
+	core           *lifecycleServiceCore
+	providers      map[string]ChangeProvider
+	observer       continuationStateObserver
+	heartbeatLease func(context.Context, store.HeartbeatLeaseRequest) (store.Lease, error)
+	getLease       func(context.Context, string) (*store.Lease, error)
 }
 
 func newChangeProviderService(core *lifecycleServiceCore) *ChangeProviderService {
 	service := &ChangeProviderService{core: core, providers: make(map[string]ChangeProvider)}
+	if core != nil && core.store != nil {
+		service.heartbeatLease = core.store.HeartbeatLease
+		service.getLease = core.store.GetLease
+	}
 	service.observer = storeContinuationStateObserver{dataStore: core.store, objects: core.objects}
 	service.Register(LocalPatchProvider{})
 	// An automated repair agent is an external side effect. It is deliberately
@@ -566,10 +572,20 @@ func (service *ChangeProviderService) applyWithCandidateLeaseHeartbeat(ctx conte
 	// Candidate checkout materialization can consume most of an initially
 	// acquired lease. Renew before handing write access to a provider so the
 	// first delayed ticker cannot leave a live provider without a current fence.
-	renewed, err := service.core.store.HeartbeatLease(ctx, store.HeartbeatLeaseRequest{
-		LeaseID: lease.ID, Owner: lease.Owner, FencingToken: lease.FencingToken, ExpectedVersion: lease.Version,
-		TTL: ttl, Actor: request.Actor, Reason: "candidate provider start heartbeat",
-	})
+	interval := 20 * time.Second
+	if candidateInterval := ttl / 3; candidateInterval > 0 && candidateInterval < interval {
+		interval = candidateInterval
+	}
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	renewed, err := retryVersionedLeaseHeartbeat(ctx, nil, interval, lease,
+		func(callCtx context.Context, current store.Lease) (store.Lease, error) {
+			return service.heartbeatLease(callCtx, store.HeartbeatLeaseRequest{
+				LeaseID: current.ID, Owner: current.Owner, FencingToken: current.FencingToken, ExpectedVersion: current.Version,
+				TTL: ttl, Actor: request.Actor, Reason: "candidate provider start heartbeat",
+			})
+		}, service.getLease)
 	if err != nil {
 		return ChangeProviderReceipt{}, lease, fmt.Errorf("start candidate lease heartbeat: %w", err)
 	}
@@ -584,10 +600,6 @@ func (service *ChangeProviderService) applyWithCandidateLeaseHeartbeat(ctx conte
 	// whose caller has gone away.
 	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
-	interval := 20 * time.Second
-	if candidateInterval := ttl / 3; candidateInterval > 0 && candidateInterval < interval {
-		interval = candidateInterval
-	}
 	// A short deployment lease must still receive at least three renewal
 	// opportunities before expiry. Keeping the old 100ms floor could turn a
 	// valid 150ms lease into a single-race-window fence under scheduler load.
@@ -619,10 +631,13 @@ func (service *ChangeProviderService) applyWithCandidateLeaseHeartbeat(ctx conte
 					return
 				default:
 				}
-				next, err := service.core.store.HeartbeatLease(heartbeatContext, store.HeartbeatLeaseRequest{
-					LeaseID: current.ID, Owner: current.Owner, FencingToken: current.FencingToken, ExpectedVersion: current.Version,
-					TTL: ttl, Actor: request.Actor, Reason: "candidate provider heartbeat",
-				})
+				next, err := retryVersionedLeaseHeartbeat(heartbeatContext, stopHeartbeats, interval, current,
+					func(callCtx context.Context, lease store.Lease) (store.Lease, error) {
+						return service.heartbeatLease(callCtx, store.HeartbeatLeaseRequest{
+							LeaseID: lease.ID, Owner: lease.Owner, FencingToken: lease.FencingToken, ExpectedVersion: lease.Version,
+							TTL: ttl, Actor: request.Actor, Reason: "candidate provider heartbeat",
+						})
+					}, service.getLease)
 				if err != nil {
 					// Parent cancellation and a provider budget expiry are normal
 					// terminal paths for this loop, not a lost write fence.

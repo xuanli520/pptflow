@@ -51,11 +51,12 @@ type FrozenExecutionRuntimeConfig struct {
 // handler. Coordinator jobs expand only their immutable schedule. Each actual
 // execution belongs to a separately claimed stage_attempt.execute job.
 type FrozenExecutionRuntime struct {
-	core                *lifecycleServiceCore
-	services            *LifecycleServices
-	workflowkitRegistry *workflowkit.ControlledPluginRegistry[workflowkit.StageExecutor]
-	quotaLeaseTTL       time.Duration
-	controlPollInterval time.Duration
+	core                 *lifecycleServiceCore
+	services             *LifecycleServices
+	workflowkitRegistry  *workflowkit.ControlledPluginRegistry[workflowkit.StageExecutor]
+	quotaLeaseTTL        time.Duration
+	controlPollInterval  time.Duration
+	heartbeatQuotaLeases func(context.Context, []store.HeartbeatQuotaLeaseRequest) ([]store.DurableQuotaLease, error)
 }
 
 // NewFrozenExecutionRuntime constructs the V2-only durable job handler.
@@ -76,11 +77,12 @@ func NewFrozenExecutionRuntime(config FrozenExecutionRuntimeConfig) (*FrozenExec
 		return nil, fmt.Errorf("%w: quota lease TTL and control poll interval must be positive", ErrFrozenExecutionRuntimeConfiguration)
 	}
 	return &FrozenExecutionRuntime{
-		core:                config.Services.core,
-		services:            config.Services,
-		workflowkitRegistry: config.WorkflowkitRegistry,
-		quotaLeaseTTL:       config.QuotaLeaseTTL,
-		controlPollInterval: config.ControlPollInterval,
+		core:                 config.Services.core,
+		services:             config.Services,
+		workflowkitRegistry:  config.WorkflowkitRegistry,
+		quotaLeaseTTL:        config.QuotaLeaseTTL,
+		controlPollInterval:  config.ControlPollInterval,
+		heartbeatQuotaLeases: config.Services.core.store.HeartbeatQuotaLeases,
 	}, nil
 }
 
@@ -416,6 +418,35 @@ func (runtime *FrozenExecutionRuntime) reconcileLeaseLostStageQuota(ctx context.
 	}
 	leases := append([]store.DurableQuotaLease(nil), decision.Leases...)
 	sort.Slice(leases, func(left, right int) bool { return leases[left].ID < leases[right].ID })
+	for pass := 0; pass <= len(leases); pass++ {
+		active := make([]store.SettleQuotaLeaseRequest, 0, len(leases))
+		for _, lease := range leases {
+			current, err := runtime.core.store.GetDurableQuotaLease(ctx, lease.ID)
+			if err != nil {
+				return err
+			}
+			if current == nil {
+				return fmt.Errorf("%w: quota lease %s", ErrLifecycleNotFound, lease.ID)
+			}
+			if current.State == store.DurableQuotaLeaseActive {
+				active = append(active, store.SettleQuotaLeaseRequest{
+					IdempotencyKey: "stage-lease-loss-uncertain:" + job.ID + ":" + current.ID, LeaseID: current.ID,
+					Owner: current.Owner, FencingToken: current.FencingToken, Outcome: store.QuotaSettlementUncertain,
+					Actor: job.CreatedBy, Reason: "dispatch lease loss requires stage quota reconciliation",
+				})
+			}
+		}
+		if len(active) == 0 {
+			break
+		}
+		if _, err := runtime.core.store.SettleQuotaLeases(ctx, active); err != nil && !errors.Is(err, store.ErrQuotaLeaseExpired) {
+			return err
+		}
+	}
+	if !canceled {
+		return nil
+	}
+	reconciliations := make([]store.ReconcileQuotaLeaseRequest, 0, len(leases))
 	for _, lease := range leases {
 		current, err := runtime.core.store.GetDurableQuotaLease(ctx, lease.ID)
 		if err != nil {
@@ -424,32 +455,18 @@ func (runtime *FrozenExecutionRuntime) reconcileLeaseLostStageQuota(ctx context.
 		if current == nil {
 			return fmt.Errorf("%w: quota lease %s", ErrLifecycleNotFound, lease.ID)
 		}
-		if current.State == store.DurableQuotaLeaseActive {
-			_, settleErr := runtime.core.store.SettleQuotaLease(ctx, store.SettleQuotaLeaseRequest{
-				IdempotencyKey: "stage-lease-loss-uncertain:" + job.ID + ":" + current.ID, LeaseID: current.ID,
-				Owner: current.Owner, FencingToken: current.FencingToken, Outcome: store.QuotaSettlementUncertain,
-				Actor: job.CreatedBy, Reason: "dispatch lease loss requires stage quota reconciliation",
+		if current.State == store.DurableQuotaLeaseUncertain || current.State == store.DurableQuotaLeaseExpired {
+			reconciliations = append(reconciliations, store.ReconcileQuotaLeaseRequest{
+				IdempotencyKey: "stage-lease-loss-canceled:" + job.ID + ":" + current.ID, LeaseID: current.ID,
+				Owner: current.Owner, FencingToken: current.FencingToken, Outcome: store.QuotaSettlementCanceled,
+				Actor: job.CreatedBy, Reason: "cancel incomplete stage quota after dispatch lease loss",
 			})
-			if settleErr != nil && !errors.Is(settleErr, store.ErrQuotaLeaseExpired) {
-				return settleErr
-			}
-			current, err = runtime.core.store.GetDurableQuotaLease(ctx, current.ID)
-			if err != nil {
-				return err
-			}
-		}
-		if !canceled || current == nil || (current.State != store.DurableQuotaLeaseUncertain && current.State != store.DurableQuotaLeaseExpired) {
-			continue
-		}
-		if _, err := runtime.core.store.ReconcileQuotaLease(ctx, store.ReconcileQuotaLeaseRequest{
-			IdempotencyKey: "stage-lease-loss-canceled:" + job.ID + ":" + current.ID, LeaseID: current.ID,
-			Owner: current.Owner, FencingToken: current.FencingToken, Outcome: store.QuotaSettlementCanceled,
-			Actor: job.CreatedBy, Reason: "cancel incomplete stage quota after dispatch lease loss",
-		}); err != nil {
-			return err
 		}
 	}
-	return nil
+	if len(reconciliations) != 0 {
+		_, err = runtime.core.store.ReconcileQuotaLeases(ctx, reconciliations)
+	}
+	return err
 }
 
 func (runtime *FrozenExecutionRuntime) projectLeaseLostStageInDoubt(ctx context.Context, job store.DurableJob, attempt store.StageAttempt) error {
@@ -1451,14 +1468,24 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		return runtime.executeWorkflowkitReviewGate(ctx, execution, job, run, subject, frozen, payload, stageAttempt, stage, inputs, review)
 	}
 
-	reservation, admissionErr := runtime.admitStageQuota(ctx, execution, job, run, subject, frozen.QuotaPolicy, stage)
+	stageContext, cancel := context.WithTimeout(ctx, stage.Budget.MaxElapsed)
+	defer cancel()
+	if execution.ExecutionAbort != nil {
+		go func() {
+			select {
+			case <-execution.ExecutionAbort:
+				cancel()
+			case <-stageContext.Done():
+			}
+		}()
+	}
+	reservation, admissionErr := runtime.admitStageQuota(ctx, execution, job, run, subject, frozen.QuotaPolicy, stage, cancel)
 	if admissionErr != nil {
+		cancel()
 		return runtime.projectAdmissionFailure(ctx, job, run, frozen, payload, subject, stage, &stageAttempt, admissionErr)
 	}
 	defer reservation.stop()
 
-	stageContext, cancel := context.WithTimeout(ctx, stage.Budget.MaxElapsed)
-	defer cancel()
 	monitor := runtime.startStageControlMonitor(stageContext, cancel, run.ID, stageAttempt.ID, job.CreatedBy)
 	defer monitor.stop()
 
@@ -1678,7 +1705,29 @@ func (reservation stageQuotaReservation) lost() bool {
 	return reservation.heartbeats != nil && reservation.heartbeats.lostLease()
 }
 
-func (runtime *FrozenExecutionRuntime) admitStageQuota(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, subject workflowRunSubject, policy workflowadapter.ResolvedQuotaPolicy, stage workflowkit.StageDescriptor) (stageQuotaReservation, error) {
+func (reservation stageQuotaReservation) currentLeases() []store.DurableQuotaLease {
+	if reservation.heartbeats != nil {
+		if leases := reservation.heartbeats.currentLeases(); len(leases) != 0 {
+			return leases
+		}
+	}
+	return append([]store.DurableQuotaLease(nil), reservation.leases...)
+}
+
+func quotaLeaseDeadline(leases []store.DurableQuotaLease) time.Time {
+	if len(leases) == 0 {
+		return time.Time{}
+	}
+	deadline := leases[0].ExpiresAt
+	for _, lease := range leases[1:] {
+		if lease.ExpiresAt.Before(deadline) {
+			deadline = lease.ExpiresAt
+		}
+	}
+	return deadline
+}
+
+func (runtime *FrozenExecutionRuntime) admitStageQuota(ctx context.Context, execution DurableJobExecution, job store.DurableJob, run store.WorkflowRun, subject workflowRunSubject, policy workflowadapter.ResolvedQuotaPolicy, stage workflowkit.StageDescriptor, cancel context.CancelFunc) (stageQuotaReservation, error) {
 	if len(stage.QuotaClaims) == 0 {
 		return stageQuotaReservation{}, nil
 	}
@@ -1714,7 +1763,7 @@ func (runtime *FrozenExecutionRuntime) admitStageQuota(ctx context.Context, exec
 		leases: append([]store.DurableQuotaLease(nil), decision.Leases...),
 		actor:  job.CreatedBy,
 	}
-	reservation.heartbeats = newQuotaLeaseHeartbeats(runtime, execution.Claim.Owner, job.CreatedBy, reservation.leases)
+	reservation.heartbeats = newQuotaLeaseHeartbeats(runtime, execution.Claim.Owner, job.CreatedBy, reservation.leases, cancel)
 	reservation.heartbeats.start()
 	for _, claim := range frozenAdmission.Claims {
 		if claim.Dimension != "stage_attempt" {
@@ -1739,27 +1788,28 @@ func (reservation stageQuotaReservation) chargeWriter(runtime *FrozenExecutionRu
 }
 
 func (reservation stageQuotaReservation) recordDimension(ctx context.Context, runtime *FrozenExecutionRuntime, dimension string, units int64, operationKey string, occurredAt time.Time, actor, reason string) error {
-	matched := false
+	requests := make([]store.RecordQuotaUsageRequest, 0, 2)
 	for _, lease := range reservation.leases {
 		if lease.Dimension != dimension {
 			continue
 		}
-		matched = true
 		when := occurredAt
 		if when.IsZero() {
 			when = lease.CreatedAt
 		}
-		if _, err := runtime.core.store.RecordQuotaUsage(ctx, store.RecordQuotaUsageRequest{
+		requests = append(requests, store.RecordQuotaUsageRequest{
 			OperationKey: operationKey + ":" + lease.ID, LeaseID: lease.ID, FencingToken: lease.FencingToken,
 			Units: units, OccurredAt: when.UTC(), Actor: actor, Reason: reason,
-		}); err != nil {
-			return err
-		}
+		})
 	}
-	if !matched {
+	if len(requests) == 0 {
 		return fmt.Errorf("%w: stage emitted usage for unreserved dimension %q", ErrFrozenQuotaAdmission, dimension)
 	}
-	return nil
+	_, err := retryIdempotentLeaseHeartbeat(ctx, nil, runtime.quotaLeaseTTL/3, quotaLeaseDeadline(reservation.currentLeases()),
+		func(callCtx context.Context) ([]store.QuotaAccount, error) {
+			return runtime.core.store.RecordQuotaUsages(callCtx, requests)
+		})
+	return err
 }
 
 func (runtime *FrozenExecutionRuntime) projectAdmissionFailure(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, subject workflowRunSubject, stage workflowkit.StageDescriptor, attempt *store.StageAttempt, admissionErr error) (store.JobState, error) {
@@ -1782,18 +1832,20 @@ type quotaLeaseHeartbeats struct {
 	owner   string
 	actor   string
 	leases  []store.DurableQuotaLease
+	cancel  context.CancelFunc
 
-	mu     sync.Mutex
-	lost   bool
-	once   sync.Once
-	stopCh chan struct{}
-	doneCh chan struct{}
-	count  uint64
+	mu      sync.Mutex
+	lost    bool
+	failure error
+	once    sync.Once
+	stopCh  chan struct{}
+	doneCh  chan struct{}
+	count   uint64
 }
 
-func newQuotaLeaseHeartbeats(runtime *FrozenExecutionRuntime, owner, actor string, leases []store.DurableQuotaLease) *quotaLeaseHeartbeats {
+func newQuotaLeaseHeartbeats(runtime *FrozenExecutionRuntime, owner, actor string, leases []store.DurableQuotaLease, cancel context.CancelFunc) *quotaLeaseHeartbeats {
 	return &quotaLeaseHeartbeats{
-		runtime: runtime, owner: owner, actor: actor, leases: append([]store.DurableQuotaLease(nil), leases...),
+		runtime: runtime, owner: owner, actor: actor, leases: append([]store.DurableQuotaLease(nil), leases...), cancel: cancel,
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
 }
@@ -1822,6 +1874,24 @@ func (heartbeats *quotaLeaseHeartbeats) lostLease() bool {
 	return heartbeats.lost
 }
 
+func (heartbeats *quotaLeaseHeartbeats) failureError() error {
+	if heartbeats == nil {
+		return nil
+	}
+	heartbeats.mu.Lock()
+	defer heartbeats.mu.Unlock()
+	return heartbeats.failure
+}
+
+func (heartbeats *quotaLeaseHeartbeats) currentLeases() []store.DurableQuotaLease {
+	if heartbeats == nil {
+		return nil
+	}
+	heartbeats.mu.Lock()
+	defer heartbeats.mu.Unlock()
+	return append([]store.DurableQuotaLease(nil), heartbeats.leases...)
+}
+
 func (heartbeats *quotaLeaseHeartbeats) run() {
 	defer close(heartbeats.doneCh)
 	interval := heartbeats.runtime.quotaLeaseTTL / 3
@@ -1838,7 +1908,11 @@ func (heartbeats *quotaLeaseHeartbeats) run() {
 			if err := heartbeats.heartbeat(); err != nil {
 				heartbeats.mu.Lock()
 				heartbeats.lost = true
+				heartbeats.failure = err
 				heartbeats.mu.Unlock()
+				if heartbeats.cancel != nil {
+					heartbeats.cancel()
+				}
 				return
 			}
 		}
@@ -1846,19 +1920,33 @@ func (heartbeats *quotaLeaseHeartbeats) run() {
 }
 
 func (heartbeats *quotaLeaseHeartbeats) heartbeat() error {
-	for _, lease := range heartbeats.leases {
-		heartbeats.mu.Lock()
-		heartbeats.count++
-		ordinal := heartbeats.count
-		heartbeats.mu.Unlock()
-		if _, err := heartbeats.runtime.core.store.HeartbeatQuotaLease(context.Background(), store.HeartbeatQuotaLeaseRequest{
+	heartbeats.mu.Lock()
+	heartbeats.count++
+	ordinal := heartbeats.count
+	leases := append([]store.DurableQuotaLease(nil), heartbeats.leases...)
+	heartbeats.mu.Unlock()
+	requests := make([]store.HeartbeatQuotaLeaseRequest, len(leases))
+	deadline := leases[0].ExpiresAt
+	for index, lease := range leases {
+		if lease.ExpiresAt.Before(deadline) {
+			deadline = lease.ExpiresAt
+		}
+		requests[index] = store.HeartbeatQuotaLeaseRequest{
 			IdempotencyKey: fmt.Sprintf("stage-quota-heartbeat:%s:%d", lease.ID, ordinal), LeaseID: lease.ID,
 			Owner: heartbeats.owner, FencingToken: lease.FencingToken, TTL: heartbeats.runtime.quotaLeaseTTL,
 			Actor: heartbeats.actor, Reason: "durable stage quota lease heartbeat",
-		}); err != nil {
-			return err
 		}
 	}
+	updated, err := retryIdempotentLeaseHeartbeat(context.Background(), heartbeats.stopCh, heartbeats.runtime.quotaLeaseTTL/3, deadline,
+		func(ctx context.Context) ([]store.DurableQuotaLease, error) {
+			return heartbeats.runtime.heartbeatQuotaLeases(ctx, requests)
+		})
+	if err != nil {
+		return err
+	}
+	heartbeats.mu.Lock()
+	heartbeats.leases = append([]store.DurableQuotaLease(nil), updated...)
+	heartbeats.mu.Unlock()
 	return nil
 }
 
@@ -1873,9 +1961,11 @@ type stageControlMonitor struct {
 	actor          string
 	cancel         context.CancelFunc
 	signals        chan StageControlSignal
+	listForRun     func(context.Context, string) ([]store.DurableControlOperation, error)
 
 	mu           sync.Mutex
 	operation    *store.DurableControlOperation
+	pollErr      error
 	checkpointID string
 	checkpointOK bool
 	forced       bool
@@ -1887,7 +1977,8 @@ type stageControlMonitor struct {
 func (runtime *FrozenExecutionRuntime) startStageControlMonitor(ctx context.Context, cancel context.CancelFunc, runID, stageAttemptID, actor string) *stageControlMonitor {
 	monitor := &stageControlMonitor{
 		runtime: runtime, runID: runID, stageAttemptID: stageAttemptID, actor: actor, cancel: cancel,
-		signals: make(chan StageControlSignal, 1), stopCh: make(chan struct{}), doneCh: make(chan struct{}),
+		signals: make(chan StageControlSignal, 1), listForRun: runtime.services.Control.ListForRun,
+		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 	}
 	go monitor.run(ctx)
 	return monitor
@@ -1919,10 +2010,12 @@ func (monitor *stageControlMonitor) stop() {
 }
 
 func (monitor *stageControlMonitor) poll() {
-	operations, err := monitor.runtime.services.Control.ListForRun(context.Background(), monitor.runID)
+	operations, err := monitor.listForRun(context.Background(), monitor.runID)
 	if err != nil {
+		monitor.recordPollError(err)
 		return
 	}
+	monitor.recordPollError(nil)
 	for _, operation := range operations {
 		if operation.Status != store.ControlOperationRequested && operation.Status != store.ControlOperationPropagating {
 			continue
@@ -1933,9 +2026,26 @@ func (monitor *stageControlMonitor) poll() {
 		if operation.Action != store.ControlActionCancelStage && operation.StageAttemptID != "" {
 			continue
 		}
-		monitor.accept(operation)
+		if err := monitor.accept(operation); err != nil {
+			monitor.recordPollError(err)
+		}
 		return
 	}
+}
+
+func (monitor *stageControlMonitor) recordPollError(err error) {
+	monitor.mu.Lock()
+	defer monitor.mu.Unlock()
+	monitor.pollErr = err
+}
+
+func (monitor *stageControlMonitor) failureError() error {
+	if monitor == nil {
+		return nil
+	}
+	monitor.mu.Lock()
+	defer monitor.mu.Unlock()
+	return monitor.pollErr
 }
 
 func controlPriority(action store.ControlAction) int {
@@ -1951,24 +2061,24 @@ func controlPriority(action store.ControlAction) int {
 	}
 }
 
-func (monitor *stageControlMonitor) accept(operation store.DurableControlOperation) {
+func (monitor *stageControlMonitor) accept(operation store.DurableControlOperation) error {
 	if operation.Status == store.ControlOperationRequested {
 		transitioned, err := monitor.runtime.services.Control.Transition(context.Background(), TransitionExecutionControlRequest{
 			OperationID: operation.ID, ExpectedVersion: operation.Version, Status: store.ControlOperationPropagating,
 			Actor: monitor.actor, Reason: "durable stage runtime received control request",
 		})
 		if err != nil {
-			return
+			return err
 		}
 		operation = transitioned
 	}
 	if operation.Status != store.ControlOperationPropagating {
-		return
+		return nil
 	}
 	monitor.mu.Lock()
 	if monitor.operation != nil && controlPriority(monitor.operation.Action) >= controlPriority(operation.Action) {
 		monitor.mu.Unlock()
-		return
+		return nil
 	}
 	copyOperation := operation
 	monitor.operation = &copyOperation
@@ -1992,6 +2102,7 @@ func (monitor *stageControlMonitor) accept(operation store.DurableControlOperati
 		monitor.mu.Unlock()
 		monitor.cancel()
 	}(operation.GracePeriod)
+	return nil
 }
 
 func (monitor *stageControlMonitor) current() *store.DurableControlOperation {
@@ -2188,6 +2299,7 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 		return store.JobInDoubt, ErrDurableJobLeaseLost
 	}
 	reservation.stop()
+	monitor.stop()
 	var operation *store.DurableControlOperation
 	if monitor != nil {
 		operation = monitor.current()
@@ -2205,13 +2317,23 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 			}
 		}
 	}
-	unknownOutcome := reservation.lost() || channelClosed(workerLeaseLost) || result.Outcome.Status == workflowkit.StatusInDoubt
+	unknownOutcome := reservation.lost() || channelClosed(workerLeaseLost) || result.Outcome.Status == workflowkit.StatusInDoubt || monitor.failureError() != nil
 	if operation != nil && operation.Action == store.ControlActionTerminate && stage.Effect == workflowkit.EffectExternalSideEffect && result.Outcome.Status != workflowkit.StatusCompleted {
 		unknownOutcome = true
 	}
 	if unknownOutcome {
-		settlementID, _ := runtime.settleStageQuota(ctx, reservation, store.QuotaSettlementUncertain, job.CreatedBy, "stage outcome requires reconciliation")
-		if err := runtime.transitionStageInDoubt(ctx, attempt, job.CreatedBy, result.ErrorText); err != nil {
+		settlementID, settlementErr := runtime.settleStageQuota(ctx, reservation, store.QuotaSettlementUncertain, job.CreatedBy, "stage outcome requires reconciliation")
+		detail := result.ErrorText
+		if heartbeatErr := reservation.heartbeats.failureError(); heartbeatErr != nil {
+			detail = strings.TrimSpace(detail + "; quota heartbeat: " + heartbeatErr.Error())
+		}
+		if controlErr := monitor.failureError(); controlErr != nil {
+			detail = strings.TrimSpace(detail + "; control monitor: " + controlErr.Error())
+		}
+		if settlementErr != nil {
+			detail = strings.TrimSpace(detail + "; quota settlement requires reconciliation: " + settlementErr.Error())
+		}
+		if err := runtime.transitionStageInDoubt(ctx, attempt, job.CreatedBy, detail); err != nil {
 			return store.JobFailed, err
 		}
 		if err := runtime.finishRunWithStatus(ctx, run.ID, store.WorkflowRunInDoubt, job.CreatedBy, "durable stage outcome is unknown"); err != nil {
@@ -2345,22 +2467,26 @@ func channelClosed(signal <-chan struct{}) bool {
 }
 
 func (runtime *FrozenExecutionRuntime) settleStageQuota(ctx context.Context, reservation stageQuotaReservation, outcome store.QuotaSettlementOutcome, actor, reason string) (string, error) {
-	leases := append([]store.DurableQuotaLease(nil), reservation.leases...)
+	leases := reservation.currentLeases()
+	if len(leases) == 0 {
+		return "", nil
+	}
 	sort.Slice(leases, func(left, right int) bool { return leases[left].ID < leases[right].ID })
-	settlementID := ""
-	for _, lease := range leases {
-		settlement, err := runtime.core.store.SettleQuotaLease(ctx, store.SettleQuotaLeaseRequest{
+	requests := make([]store.SettleQuotaLeaseRequest, len(leases))
+	for index, lease := range leases {
+		requests[index] = store.SettleQuotaLeaseRequest{
 			IdempotencyKey: "stage-settlement:" + lease.ID + ":" + string(outcome), LeaseID: lease.ID,
 			Owner: lease.Owner, FencingToken: lease.FencingToken, Outcome: outcome, Actor: actor, Reason: reason,
-		})
-		if err != nil {
-			return settlementID, err
-		}
-		if settlementID == "" {
-			settlementID = settlement.ID
 		}
 	}
-	return settlementID, nil
+	settlements, err := retryIdempotentLeaseHeartbeat(ctx, nil, runtime.quotaLeaseTTL/3, quotaLeaseDeadline(leases),
+		func(callCtx context.Context) ([]store.DurableQuotaSettlement, error) {
+			return runtime.core.store.SettleQuotaLeases(callCtx, requests)
+		})
+	if err != nil || len(settlements) == 0 {
+		return "", err
+	}
+	return settlements[0].ID, nil
 }
 
 func (runtime *FrozenExecutionRuntime) afterStageTerminal(ctx context.Context, job store.DurableJob, run store.WorkflowRun, frozen frozenRunDefinition, payload frozenStageExecutionPayload, stage workflowkit.StageDescriptor, attempt store.StageAttempt, operation *store.DurableControlOperation, settlementID string, monitor *stageControlMonitor) (store.JobState, error) {

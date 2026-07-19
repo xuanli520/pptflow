@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestV2TaskRevisionReviewPromotionAndAudit(t *testing.T) {
@@ -260,6 +261,30 @@ func TestDurableJobCanCancelFromRunningForAcknowledgedRuntimeControl(t *testing.
 	}
 	if job.State != JobCanceled || job.FinishedAt == nil {
 		t.Fatalf("running job cancellation = %+v", job)
+	}
+}
+
+func TestHeartbeatLeasePersistsObservedExpiration(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	clock := time.Date(2026, 7, 18, 8, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	lease, err := s.AcquireLease(ctx, AcquireLeaseRequest{
+		ResourceType: "fixture", ResourceID: "expired-heartbeat", Owner: "worker", TTL: time.Minute, Actor: "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(time.Minute)
+	if _, err := s.HeartbeatLease(ctx, HeartbeatLeaseRequest{
+		LeaseID: lease.ID, Owner: lease.Owner, FencingToken: lease.FencingToken, ExpectedVersion: lease.Version,
+		TTL: time.Minute, Actor: "tester",
+	}); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("expired heartbeat error = %v, want lease held", err)
+	}
+	persisted, err := s.GetLease(ctx, lease.ID)
+	if err != nil || persisted == nil || persisted.State != LeaseExpired {
+		t.Fatalf("persisted expired lease = %+v, %v", persisted, err)
 	}
 }
 

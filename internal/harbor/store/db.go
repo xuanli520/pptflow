@@ -385,7 +385,11 @@ func openAndMigrate(rootDir, dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("construct store SQLite URI: %w", err)
 	}
-	dsn += "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	// Every writable Store transaction is a mutation boundary. BEGIN IMMEDIATE
+	// acquires SQLite's writer reservation before the first read, preventing a
+	// deferred read snapshot from later failing its write upgrade with
+	// SQLITE_BUSY_SNAPSHOT under multi-process heartbeat/outbox concurrency.
+	dsn += "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)

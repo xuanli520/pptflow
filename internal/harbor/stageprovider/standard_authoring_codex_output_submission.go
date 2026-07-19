@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/agent"
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -22,6 +23,8 @@ const (
 	standardAuthoringCodexSubmitToolName                 = "harbor_submit_stage_output"
 	standardAuthoringCodexOutputSubmissionQuotaDimension = "output_submission"
 	standardAuthoringCodexSubmissionFailureQuota         = "standard_authoring_codex_agent_turn.output_submission_quota"
+	standardAuthoringCodexSubmissionFailureLease         = "standard_authoring_codex_agent_turn.output_submission_lease_lost"
+	standardAuthoringCodexSubmissionFailureAccounting    = "standard_authoring_codex_agent_turn.output_submission_accounting"
 	standardAuthoringCodexSubmissionFailureAbsent        = "standard_authoring_codex_agent_turn.output_submission_missing"
 
 	// This host-only representation is the stable input to the receipt digest.
@@ -229,10 +232,20 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 		if contextError(ctx) != nil {
 			return standardAuthoringCodexSubmissionResponse(false, []string{"submission_timeout"}, remaining, digest)
 		}
+		failureCode := standardAuthoringCodexSubmissionFailureAccounting
+		diagnostic := "submission_accounting_unavailable"
+		switch {
+		case errors.Is(err, store.ErrQuotaExhausted):
+			failureCode = standardAuthoringCodexSubmissionFailureQuota
+			diagnostic = "submission_quota_exhausted"
+		case errors.Is(err, store.ErrQuotaLeaseExpired), errors.Is(err, store.ErrFencingToken), errors.Is(err, store.ErrLeaseHeld), errors.Is(err, store.ErrImmutable):
+			failureCode = standardAuthoringCodexSubmissionFailureLease
+			diagnostic = "submission_lease_lost"
+		}
 		submission.mu.Lock()
-		submission.failureCode = standardAuthoringCodexSubmissionFailureQuota
+		submission.failureCode = failureCode
 		submission.mu.Unlock()
-		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_quota_exhausted"}, remaining, digest)
+		return standardAuthoringCodexSubmissionResponse(false, []string{diagnostic}, remaining, digest)
 	}
 	// invokeDynamicTool returns as soon as the App Server turn context expires,
 	// while a handler that was already scheduled may still be unwinding. Do not

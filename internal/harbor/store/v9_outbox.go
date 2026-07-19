@@ -82,14 +82,26 @@ type preparedOutboxNack struct {
 }
 
 // ClaimOutboxEvents reclaims expired records and leases the next ready batch
-// in stable availability/creation/identity order. The persisted claim result
-// is returned verbatim on idempotent replay, including the original fence.
+// in stable availability/creation/identity order. Non-empty claim results are
+// persisted for exact replay, including the original fence. Empty polls remain
+// read-mostly and deliberately do not grow the durable operation table.
 func (s *Store) ClaimOutboxEvents(ctx context.Context, request ClaimOutboxEventsRequest) (OutboxDispatchClaim, error) {
-	if err := s.mutationPreflight(ctx); err != nil {
-		return OutboxDispatchClaim{}, err
-	}
 	prepared, err := prepareOutboxClaim(s, request)
 	if err != nil {
+		return OutboxDispatchClaim{}, err
+	}
+	if err := s.requireWritable(); err != nil {
+		return OutboxDispatchClaim{}, err
+	}
+	now := s.now().UTC()
+	needsTransaction, err := s.outboxClaimNeedsTransaction(ctx, prepared, now)
+	if err != nil {
+		return OutboxDispatchClaim{}, err
+	}
+	if !needsTransaction {
+		return emptyOutboxDispatchClaim(prepared, now), nil
+	}
+	if err := s.mutationPreflight(ctx); err != nil {
 		return OutboxDispatchClaim{}, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -106,7 +118,7 @@ func (s *Store) ClaimOutboxEvents(ctx context.Context, request ClaimOutboxEvents
 		return replay, nil
 	}
 
-	now := s.now().UTC()
+	now = s.now().UTC()
 	if err := s.requeueExpiredOutboxEventsTx(ctx, tx, now); err != nil {
 		return OutboxDispatchClaim{}, err
 	}
@@ -146,14 +158,17 @@ func (s *Store) ClaimOutboxEvents(ctx context.Context, request ClaimOutboxEvents
 		return OutboxDispatchClaim{}, err
 	}
 
-	claim := OutboxDispatchClaim{
-		ID:             prepared.ID,
-		IdempotencyKey: prepared.IdempotencyKey,
-		Owner:          prepared.Owner,
-		Limit:          prepared.Limit,
-		LeaseTTL:       prepared.LeaseTTL,
-		Events:         make([]OutboxEvent, 0, len(candidates)),
-		ClaimedAt:      now,
+	claim := emptyOutboxDispatchClaim(prepared, now)
+	claim.Events = make([]OutboxEvent, 0, len(candidates))
+	if len(candidates) == 0 {
+		// requeueExpiredOutboxEventsTx may have performed real recovery writes, so
+		// commit the transaction even though the poll itself has no durable replay
+		// record. A later retry with the same key may therefore claim newly-ready
+		// work, which is the intended behavior for an empty polling cycle.
+		if err := tx.Commit(); err != nil {
+			return OutboxDispatchClaim{}, err
+		}
+		return claim, nil
 	}
 	for _, candidate := range candidates {
 		if candidate.LeaseFencingToken >= uint64(maxStoreInt64) {
@@ -209,6 +224,48 @@ func (s *Store) ClaimOutboxEvents(ctx context.Context, request ClaimOutboxEvents
 		return OutboxDispatchClaim{}, err
 	}
 	return claim, nil
+}
+
+func emptyOutboxDispatchClaim(prepared preparedOutboxClaim, now time.Time) OutboxDispatchClaim {
+	return OutboxDispatchClaim{
+		ID: prepared.ID, IdempotencyKey: prepared.IdempotencyKey, Owner: prepared.Owner,
+		Limit: prepared.Limit, LeaseTTL: prepared.LeaseTTL, Events: []OutboxEvent{}, ClaimedAt: now,
+	}
+}
+
+func (s *Store) outboxClaimNeedsTransaction(ctx context.Context, prepared preparedOutboxClaim, now time.Time) (bool, error) {
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM outbox_delivery_operations_v9 WHERE idempotency_key = ?)
+	`, prepared.IdempotencyKey).Scan(&exists); err != nil {
+		return false, err
+	}
+	if exists != 0 {
+		return true, nil
+	}
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM outbox_events WHERE state = 'leased' AND lease_expires_at <= ?)
+	`, now).Scan(&exists); err != nil {
+		return false, err
+	}
+	if exists != 0 {
+		return true, nil
+	}
+	query := `SELECT EXISTS(SELECT 1 FROM outbox_events WHERE state = 'pending' AND available_at <= ?`
+	arguments := []any{now}
+	if len(prepared.Topics) > 0 {
+		placeholders := make([]string, len(prepared.Topics))
+		for index, topic := range prepared.Topics {
+			placeholders[index] = "?"
+			arguments = append(arguments, topic)
+		}
+		query += " AND topic IN (" + strings.Join(placeholders, ", ") + ")"
+	}
+	query += ")"
+	if err := s.db.QueryRowContext(ctx, query, arguments...).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists != 0, nil
 }
 
 // HeartbeatOutboxEvent extends only the exact record lease carried by a

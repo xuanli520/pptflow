@@ -215,6 +215,9 @@ func (service *RepairLoopService) repairRunBinding(ctx context.Context, runID st
 	if run == nil {
 		return store.WorkflowRun{}, store.RevisionCandidate{}, store.RepairSession{}, false, fmt.Errorf("%w: workflow run %s", ErrLifecycleNotFound, runID)
 	}
+	if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+		return *run, store.RevisionCandidate{}, store.RepairSession{}, false, nil
+	}
 	candidate, err := service.core.store.GetRevisionCandidateByTargetRevision(ctx, run.RevisionID)
 	if err != nil {
 		return store.WorkflowRun{}, store.RevisionCandidate{}, store.RepairSession{}, false, err

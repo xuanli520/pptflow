@@ -491,28 +491,55 @@ func (runtime *FrozenExecutionRuntime) reconcileObservedCodeEdgeEvaluatorQuota(c
 	}
 	leases := append([]store.DurableQuotaLease(nil), decision.Leases...)
 	sort.Slice(leases, func(left, right int) bool { return leases[left].ID < leases[right].ID })
+	for pass := 0; pass <= len(leases); pass++ {
+		active := make([]store.SettleQuotaLeaseRequest, 0, len(leases))
+		for _, lease := range leases {
+			current, err := runtime.core.store.GetDurableQuotaLease(ctx, lease.ID)
+			if err != nil || current == nil {
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("%w: quota lease %s", ErrLifecycleNotFound, lease.ID)
+			}
+			if current.State == store.DurableQuotaLeaseActive {
+				active = append(active, store.SettleQuotaLeaseRequest{
+					IdempotencyKey: "codeedge-evaluator-observe-settle:" + current.ID,
+					LeaseID:        current.ID, Owner: current.Owner, FencingToken: current.FencingToken,
+					Outcome: store.QuotaSettlementCompleted, Actor: actor, Reason: "completed CodeEdge evaluator local evidence observed",
+				})
+			}
+		}
+		if len(active) == 0 {
+			break
+		}
+		if _, err := runtime.core.store.SettleQuotaLeases(ctx, active); err != nil && !errors.Is(err, store.ErrQuotaLeaseExpired) {
+			return err
+		}
+	}
+	reconciliations := make([]store.ReconcileQuotaLeaseRequest, 0, len(leases))
 	for _, lease := range leases {
-		var settleErr error
-		switch lease.State {
-		case store.DurableQuotaLeaseActive:
-			_, settleErr = runtime.core.store.SettleQuotaLease(ctx, store.SettleQuotaLeaseRequest{
-				IdempotencyKey: "codeedge-evaluator-observe-settle:" + lease.ID,
-				LeaseID:        lease.ID, Owner: lease.Owner, FencingToken: lease.FencingToken,
-				Outcome: store.QuotaSettlementCompleted, Actor: actor, Reason: "completed CodeEdge evaluator local evidence observed",
-			})
+		current, err := runtime.core.store.GetDurableQuotaLease(ctx, lease.ID)
+		if err != nil || current == nil {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: quota lease %s", ErrLifecycleNotFound, lease.ID)
+		}
+		switch current.State {
 		case store.DurableQuotaLeaseUncertain, store.DurableQuotaLeaseExpired:
-			_, settleErr = runtime.core.store.ReconcileQuotaLease(ctx, store.ReconcileQuotaLeaseRequest{
-				IdempotencyKey: "codeedge-evaluator-observe-reconcile:" + lease.ID,
-				LeaseID:        lease.ID, Owner: lease.Owner, FencingToken: lease.FencingToken,
+			reconciliations = append(reconciliations, store.ReconcileQuotaLeaseRequest{
+				IdempotencyKey: "codeedge-evaluator-observe-reconcile:" + current.ID,
+				LeaseID:        current.ID, Owner: current.Owner, FencingToken: current.FencingToken,
 				Outcome: store.QuotaSettlementCompleted, Actor: actor, Reason: "completed CodeEdge evaluator local evidence reconciled",
 			})
 		case store.DurableQuotaLeaseSettled:
-			continue
 		default:
-			settleErr = fmt.Errorf("unsupported quota lease state %s", lease.State)
+			return fmt.Errorf("unsupported quota lease state %s", current.State)
 		}
-		if settleErr != nil {
-			return settleErr
+	}
+	if len(reconciliations) != 0 {
+		if _, err := runtime.core.store.ReconcileQuotaLeases(ctx, reconciliations); err != nil {
+			return err
 		}
 	}
 	return nil

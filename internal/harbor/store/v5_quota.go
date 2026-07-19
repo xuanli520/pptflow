@@ -308,6 +308,9 @@ func (s *Store) RecordQuotaUsage(ctx context.Context, request RecordQuotaUsageRe
 		if err := s.expireQuotaLeaseTx(ctx, tx, lease, resolveActor(request.Actor), now, "usage observed expired quota lease"); err != nil {
 			return QuotaAccount{}, err
 		}
+		if err := tx.Commit(); err != nil {
+			return QuotaAccount{}, err
+		}
 		return QuotaAccount{}, fmt.Errorf("%w: quota lease %s", ErrQuotaLeaseExpired, lease.ID)
 	}
 	if lease.State == DurableQuotaLeaseExpired {
@@ -425,6 +428,9 @@ func (s *Store) HeartbeatQuotaLease(ctx context.Context, request HeartbeatQuotaL
 	now := s.now().UTC()
 	if lease.State == DurableQuotaLeaseActive && !lease.ExpiresAt.After(now) {
 		if err := s.expireQuotaLeaseTx(ctx, tx, lease, resolveActor(request.Actor), now, "heartbeat observed expired quota lease"); err != nil {
+			return DurableQuotaLease{}, err
+		}
+		if err := tx.Commit(); err != nil {
 			return DurableQuotaLease{}, err
 		}
 		return DurableQuotaLease{}, fmt.Errorf("%w: quota lease %s", ErrQuotaLeaseExpired, lease.ID)

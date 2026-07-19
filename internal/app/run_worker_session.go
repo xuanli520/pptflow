@@ -71,6 +71,8 @@ type RunWorkerSession struct {
 	heartbeatEvery  time.Duration
 	pollInterval    time.Duration
 	newOperationKey func() (string, error)
+	heartbeatLease  func(context.Context, store.HeartbeatLeaseRequest) (store.Lease, error)
+	getLease        func(context.Context, string) (*store.Lease, error)
 
 	mu                 sync.Mutex
 	pauseOperation     *store.DurableControlOperation
@@ -142,7 +144,7 @@ func NewRunWorkerSession(config RunWorkerSessionConfig) (*RunWorkerSession, erro
 		services: config.Services, runID: runID, owner: owner, actor: actor, reason: reason, worker: worker,
 		handoffOperationID: handoffOperationID, handoffProcessID: config.HandoffProcessID, handoffLogPath: strings.TrimSpace(config.HandoffLogPath),
 		leaseTTL: config.LeaseTTL, heartbeatEvery: config.HeartbeatEvery, pollInterval: config.PollInterval,
-		newOperationKey: config.NewOperationKey,
+		newOperationKey: config.NewOperationKey, heartbeatLease: config.Services.core.store.HeartbeatLease, getLease: config.Services.core.store.GetLease,
 	}, nil
 }
 
@@ -200,6 +202,7 @@ func (session *RunWorkerSession) Run(ctx context.Context) (RunWorkerSessionResul
 	}
 	result := RunWorkerSessionResult{Run: run, WorkerLease: lease, Handoff: handoff}
 	heartbeats := newRunWorkerLeaseHeartbeats(session, lease)
+	session.worker.executionAbort = heartbeats.lostC
 	heartbeats.start()
 	defer func() {
 		heartbeats.stop()
@@ -445,16 +448,18 @@ func waitRunWorkerPoll(ctx context.Context, interval time.Duration) error {
 type runWorkerLeaseHeartbeats struct {
 	session *RunWorkerSession
 
-	mu    sync.Mutex
-	lease store.Lease
-	fail  error
-	stopC chan struct{}
-	doneC chan struct{}
-	once  sync.Once
+	mu       sync.Mutex
+	lease    store.Lease
+	fail     error
+	stopC    chan struct{}
+	doneC    chan struct{}
+	lostC    chan struct{}
+	once     sync.Once
+	lostOnce sync.Once
 }
 
 func newRunWorkerLeaseHeartbeats(session *RunWorkerSession, lease store.Lease) *runWorkerLeaseHeartbeats {
-	return &runWorkerLeaseHeartbeats{session: session, lease: lease, stopC: make(chan struct{}), doneC: make(chan struct{})}
+	return &runWorkerLeaseHeartbeats{session: session, lease: lease, stopC: make(chan struct{}), doneC: make(chan struct{}), lostC: make(chan struct{})}
 }
 
 func (heartbeats *runWorkerLeaseHeartbeats) start() {
@@ -471,6 +476,8 @@ func (heartbeats *runWorkerLeaseHeartbeats) start() {
 					heartbeats.mu.Lock()
 					heartbeats.fail = err
 					heartbeats.mu.Unlock()
+					heartbeats.lostOnce.Do(func() { close(heartbeats.lostC) })
+					heartbeats.session.worker.cancelActiveExecution()
 					return
 				}
 			}
@@ -487,10 +494,13 @@ func (heartbeats *runWorkerLeaseHeartbeats) heartbeat() error {
 	heartbeats.mu.Lock()
 	lease := heartbeats.lease
 	heartbeats.mu.Unlock()
-	updated, err := heartbeats.session.services.core.store.HeartbeatLease(context.Background(), store.HeartbeatLeaseRequest{
-		LeaseID: lease.ID, Owner: heartbeats.session.owner, FencingToken: lease.FencingToken, ExpectedVersion: lease.Version,
-		TTL: heartbeats.session.leaseTTL, Actor: heartbeats.session.actor, Reason: heartbeats.session.reason + ": heartbeat controlled run worker",
-	})
+	updated, err := retryVersionedLeaseHeartbeat(context.Background(), heartbeats.stopC, heartbeats.session.heartbeatEvery, lease,
+		func(ctx context.Context, current store.Lease) (store.Lease, error) {
+			return heartbeats.session.heartbeatLease(ctx, store.HeartbeatLeaseRequest{
+				LeaseID: current.ID, Owner: heartbeats.session.owner, FencingToken: current.FencingToken, ExpectedVersion: current.Version,
+				TTL: heartbeats.session.leaseTTL, Actor: heartbeats.session.actor, Reason: heartbeats.session.reason + ": heartbeat controlled run worker",
+			})
+		}, heartbeats.session.getLease)
 	if err != nil {
 		return err
 	}

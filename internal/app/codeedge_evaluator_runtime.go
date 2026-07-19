@@ -357,7 +357,7 @@ func (runtime *FrozenExecutionRuntime) codeEdgeEvaluatorEffectAlreadyStarted(ctx
 }
 
 func codeEdgeEvaluatorOutcomeIsUncertain(result StageExecutionResult, reservation stageQuotaReservation, workerLeaseLost <-chan struct{}, monitor *stageControlMonitor) bool {
-	if reservation.lost() || channelClosed(workerLeaseLost) || result.Outcome.Status != workflowkit.StatusCompleted {
+	if reservation.lost() || channelClosed(workerLeaseLost) || result.Outcome.Status != workflowkit.StatusCompleted || monitor.failureError() != nil {
 		return true
 	}
 	return monitor != nil && monitor.current() != nil

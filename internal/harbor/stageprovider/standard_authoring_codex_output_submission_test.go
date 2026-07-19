@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/agent"
+	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -323,7 +323,7 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *
 	t.Run("quota failure disables future submissions", func(t *testing.T) {
 		stage := standardAuthoringCodexTestStage(1)
 		request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
-		request.Charge = func(context.Context, workflowkit.StageUsage) error { return errors.New("quota unavailable") }
+		request.Charge = func(context.Context, workflowkit.StageUsage) error { return store.ErrQuotaExhausted }
 		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now }, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -346,6 +346,27 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *
 		receipt = standardAuthoringCodexTestSubmissionReceipt(t, response)
 		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "submission_unavailable" {
 			t.Fatalf("post-quota receipt = %+v", receipt)
+		}
+	})
+
+	t.Run("expired lease is not reported as quota exhaustion", func(t *testing.T) {
+		stage := standardAuthoringCodexTestStage(1)
+		request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+		request.Charge = func(context.Context, workflowkit.StageUsage) error { return store.ErrQuotaLeaseExpired }
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 2, func() time.Time { return now }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		response, err := submission.dynamicTool().Handler(context.Background(), valid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "submission_lease_lost" || submission.failure() != standardAuthoringCodexSubmissionFailureLease {
+			t.Fatalf("expired lease receipt = %+v failure=%q", receipt, submission.failure())
 		}
 	})
 

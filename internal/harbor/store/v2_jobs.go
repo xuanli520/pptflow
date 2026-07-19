@@ -645,6 +645,9 @@ func (s *Store) HeartbeatLease(ctx context.Context, request HeartbeatLeaseReques
 		if err := s.expireLeaseTx(ctx, tx, lease, resolveActor(request.Actor), now, "heartbeat observed expired lease"); err != nil {
 			return Lease{}, err
 		}
+		if err := tx.Commit(); err != nil {
+			return Lease{}, err
+		}
 		return Lease{}, fmt.Errorf("%w: lease %s expired", ErrLeaseHeld, lease.ID)
 	}
 	lease.ExpiresAt = now.Add(ttl)

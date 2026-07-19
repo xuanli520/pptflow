@@ -85,6 +85,51 @@ func TestOutboxDispatcherClaimHeartbeatAckAndExactReplay(t *testing.T) {
 	}
 }
 
+func TestClaimOutboxEventsEmptyPollDoesNotPersistOperation(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	var before int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM outbox_delivery_operations_v9`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	var changesBefore int64
+	if err := s.db.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&changesBefore); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "empty-poll", Owner: "dispatcher", Limit: 1, LeaseTTL: time.Minute, Actor: "tester",
+	})
+	if err != nil || len(empty.Events) != 0 {
+		t.Fatalf("empty claim = %+v, %v", empty, err)
+	}
+	var after int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM outbox_delivery_operations_v9`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("empty poll operation count = %d, want %d", after, before)
+	}
+	var changesAfter int64
+	if err := s.db.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&changesAfter); err != nil {
+		t.Fatal(err)
+	}
+	if changesAfter != changesBefore {
+		t.Fatalf("empty poll SQLite changes = %d, want %d", changesAfter, changesBefore)
+	}
+	if _, err := s.CreateOutboxEvent(ctx, CreateOutboxEventRequest{
+		Topic: "fixture", EntityType: "workflow_run", EntityID: "run-after-empty", PayloadJSON: `{}`,
+		IdempotencyKey: "event-after-empty", Actor: "tester",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimOutboxEvents(ctx, ClaimOutboxEventsRequest{
+		IdempotencyKey: "empty-poll", Owner: "dispatcher", Limit: 1, LeaseTTL: time.Minute, Actor: "tester",
+	})
+	if err != nil || len(claimed.Events) != 1 {
+		t.Fatalf("claim after empty poll = %+v, %v", claimed, err)
+	}
+}
+
 func TestClaimOutboxEventsFiltersCanonicalTopicsAndFencesReplay(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)

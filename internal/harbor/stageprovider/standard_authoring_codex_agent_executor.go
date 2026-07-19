@@ -437,7 +437,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		}
 		if submission.failure() != "" {
 			_ = conversation.Close()
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, submission.failure()), nil
+			return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(submission.failure()), submission.failure()), nil
 		}
 		responseDigest := workflowkit.SHA256Fingerprint([]byte(result.Text))
 		if err := executor.checkpoint(ctx, request, program, inputFingerprint, turn, "turn_completed", string(responseDigest)); err != nil {
@@ -458,9 +458,16 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 	}
 	if submission.failure() != "" {
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, submission.failure()), nil
+		return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(submission.failure()), submission.failure()), nil
 	}
 	return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexSubmissionFailureAbsent), nil
+}
+
+func standardAuthoringCodexSubmissionFailureClass(code string) workflowkit.FailureClass {
+	if code == standardAuthoringCodexSubmissionFailureQuota {
+		return workflowkit.FailurePolicy
+	}
+	return workflowkit.FailureUnknown
 }
 
 func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionRequest(invocation StageOperationInvocation, payload workflowadapter.AgentTurnOperationPayload) (StandardAuthoringCodexTurnProgram, string) {

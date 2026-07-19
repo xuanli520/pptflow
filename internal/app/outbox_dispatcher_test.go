@@ -228,6 +228,50 @@ func TestOutboxDispatcherHeartbeatsBeforeAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestOutboxDispatcherRetriesTransientHeartbeatInsideLeaseWindow(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := store.OpenForTest(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	if _, err := dataStore.CreateOutboxEvent(ctx, store.CreateOutboxEventRequest{
+		Topic: "fixture", EntityType: "workflow_run", EntityID: "transient-heartbeat", PayloadJSON: `{}`,
+		IdempotencyKey: "transient-heartbeat-event", Actor: "tester",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, err := NewOutboxDispatcher(OutboxDispatcherConfig{
+		Store: dataStore, Owner: "transient-heartbeat-worker", LeaseTTL: 500 * time.Millisecond, HeartbeatEvery: 20 * time.Millisecond,
+		RetryDelay: time.Second, Handler: OutboxDeliveryHandlerFunc(func(ctx context.Context, _ store.OutboxEvent) error {
+			timer := time.NewTimer(80 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualHeartbeat := dispatcher.heartbeatEvent
+	calls := 0
+	dispatcher.heartbeatEvent = func(ctx context.Context, request store.HeartbeatOutboxEventRequest) (store.OutboxEvent, error) {
+		calls++
+		if calls == 1 {
+			return store.OutboxEvent{}, transientSQLiteFixtureError{code: 5}
+		}
+		return actualHeartbeat(ctx, request)
+	}
+	result, err := dispatcher.RunOnce(ctx)
+	if err != nil || !result.Delivered || calls < 2 {
+		t.Fatalf("transient outbox heartbeat result = %+v calls=%d err=%v", result, calls, err)
+	}
+}
+
 func TestOutboxDispatcherRequiresExplicitRetryDelay(t *testing.T) {
 	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {

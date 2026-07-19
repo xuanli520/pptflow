@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,9 +14,12 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const verifiedBackupInterval = 15 * time.Minute
+const intervalBackupLockFile = ".interval-backup.lock"
 
 // BackupRecord describes a SQLite snapshot that passed both checksum and
 // SQLite integrity verification. Path is local to this installation.
@@ -44,22 +48,57 @@ func (s *Store) BackupIfDue(ctx context.Context) (*BackupRecord, error) {
 	if s.backupTestMode {
 		return nil, nil
 	}
-	// Only a backup that this binary may restore can suppress the periodic V2
-	// snapshot. A recent V1 or pre-consolidation artifact can still be useful
-	// for manual forensics, but it must not make a new V2 control plane appear
-	// protected.
-	latest, err := s.latestEligibleBackup()
+	var created *BackupRecord
+	err := s.withIntervalBackupLock(ctx, func() error {
+		// Re-scan after taking the process-shared lock. Another Harbor process may
+		// have published a verified interval snapshot while this Store waited.
+		latest, err := s.latestEligibleBackupFresh()
+		if err != nil {
+			return err
+		}
+		if latest != nil && s.now().UTC().Sub(latest.CreatedAt) < verifiedBackupInterval {
+			return nil
+		}
+		record, err := s.BackupNow(ctx, "interval")
+		if err != nil {
+			return err
+		}
+		created = &record
+		return nil
+	})
+	return created, err
+}
+
+func (s *Store) withIntervalBackupLock(ctx context.Context, action func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := os.MkdirAll(s.backupDir, 0o700); err != nil {
+		return fmt.Errorf("create backup directory: %w", err)
+	}
+	lock, err := os.OpenFile(filepath.Join(s.backupDir, intervalBackupLockFile), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("open interval backup lock: %w", err)
 	}
-	if latest != nil && s.now().UTC().Sub(latest.CreatedAt) < verifiedBackupInterval {
-		return nil, nil
+	defer lock.Close()
+	for {
+		err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			return fmt.Errorf("lock interval backup: %w", err)
+		}
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	record, err := s.BackupNow(ctx, "interval")
-	if err != nil {
-		return nil, err
-	}
-	return &record, nil
+	defer func() { _ = unix.Flock(int(lock.Fd()), unix.LOCK_UN) }()
+	return action()
 }
 
 // BackupNow always writes a new verified SQLite snapshot. It is safe to call
@@ -159,6 +198,17 @@ func (s *Store) latestEligibleBackup() (*BackupRecord, error) {
 		s.verifiedBackup = nil
 	}
 
+	return s.latestEligibleBackupFromDiskLocked()
+}
+
+func (s *Store) latestEligibleBackupFresh() (*BackupRecord, error) {
+	s.backupVerifyMu.Lock()
+	defer s.backupVerifyMu.Unlock()
+	s.verifiedBackup = nil
+	return s.latestEligibleBackupFromDiskLocked()
+}
+
+func (s *Store) latestEligibleBackupFromDiskLocked() (*BackupRecord, error) {
 	backups, _, err := listEligibleConsolidatedV2Backups(s.backupDir)
 	if err != nil {
 		return nil, err

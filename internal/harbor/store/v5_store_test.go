@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -119,6 +121,238 @@ func TestV5QuotaLedgerAdmissionAndReconcile(t *testing.T) {
 	})
 	if err != nil || replayed.ID != admission.ID || len(replayed.Leases) != 2 {
 		t.Fatalf("idempotent admission = %+v, %v", replayed, err)
+	}
+}
+
+func TestQuotaUsageAndHeartbeatPersistObservedExpiration(t *testing.T) {
+	ctx := context.Background()
+	s := tempV5DB(t)
+	task, _ := createValidatedTaskAndRevision(t, s)
+	clock := time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	if _, err := s.CreateQuotaAccount(ctx, CreateQuotaAccountRequest{
+		ScopeKind: QuotaScopeTask, ScopeID: task.ID, Dimension: "expired", LimitUnits: 4, Actor: "tester",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reserve := func(key string) DurableQuotaLease {
+		lease, err := s.ReserveQuota(ctx, QuotaLeaseRequest{
+			IdempotencyKey: key, Owner: "worker", ScopeKind: QuotaScopeTask, ScopeID: task.ID,
+			Dimension: "expired", Units: 1, ReclaimPolicy: QuotaReclaimUnused, TTL: time.Minute, Actor: "tester",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lease
+	}
+	usageLease := reserve("expired-usage")
+	clock = clock.Add(time.Minute)
+	if _, err := s.RecordQuotaUsage(ctx, RecordQuotaUsageRequest{
+		OperationKey: "expired-usage-event", LeaseID: usageLease.ID, FencingToken: usageLease.FencingToken,
+		Units: 1, OccurredAt: clock, Actor: "tester",
+	}); !errors.Is(err, ErrQuotaLeaseExpired) {
+		t.Fatalf("expired usage error = %v, want quota lease expired", err)
+	}
+	persistedUsage, err := s.GetDurableQuotaLease(ctx, usageLease.ID)
+	if err != nil || persistedUsage == nil || persistedUsage.State != DurableQuotaLeaseExpired {
+		t.Fatalf("usage-observed expiration = %+v, %v", persistedUsage, err)
+	}
+	heartbeatLease := reserve("expired-quota-heartbeat")
+	clock = clock.Add(time.Minute)
+	if _, err := s.HeartbeatQuotaLease(ctx, HeartbeatQuotaLeaseRequest{
+		IdempotencyKey: "expired-quota-heartbeat-event", LeaseID: heartbeatLease.ID, Owner: heartbeatLease.Owner,
+		FencingToken: heartbeatLease.FencingToken, TTL: time.Minute, Actor: "tester",
+	}); !errors.Is(err, ErrQuotaLeaseExpired) {
+		t.Fatalf("expired quota heartbeat error = %v, want quota lease expired", err)
+	}
+	persistedHeartbeat, err := s.GetDurableQuotaLease(ctx, heartbeatLease.ID)
+	if err != nil || persistedHeartbeat == nil || persistedHeartbeat.State != DurableQuotaLeaseExpired {
+		t.Fatalf("heartbeat-observed expiration = %+v, %v", persistedHeartbeat, err)
+	}
+}
+
+func TestV5QuotaBatchOperationsRollbackWholeStage(t *testing.T) {
+	setup := func(t *testing.T) (*Store, TaskV2, []DurableQuotaLease) {
+		t.Helper()
+		ctx := context.Background()
+		s := tempV5DB(t)
+		task, _ := createValidatedTaskAndRevision(t, s)
+		decision, err := s.AdmitTaskActorQuota(ctx, AdmitTaskActorQuotaRequest{
+			IdempotencyKey: "batch-admission-" + t.Name(), TaskID: task.ID, Actor: "batch-actor", LeaseOwner: "batch-worker", LeaseTTL: time.Hour,
+			Policy:            QuotaPolicyBinding{PolicyID: "batch", PolicyVersion: "1", PolicyFingerprint: "sha256:batch"},
+			BootstrapAccounts: []QuotaAccountBootstrap{{Dimension: "turn", TaskLimitUnits: 5, ActorLimitUnits: 5}},
+			Claims:            []TaskActorQuotaClaim{{Dimension: "turn", Units: 2, ReclaimPolicy: QuotaReclaimUnused}}, Reason: "batch fixture",
+		})
+		if err != nil || !decision.Accepted || len(decision.Leases) != 2 {
+			t.Fatalf("batch admission = %+v, %v", decision, err)
+		}
+		return s, task, decision.Leases
+	}
+	newID := func(t *testing.T) string {
+		t.Helper()
+		id, err := NewUUIDv7()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	assertActiveUnchanged := func(t *testing.T, s *Store, originals []DurableQuotaLease) {
+		t.Helper()
+		for _, original := range originals {
+			lease, err := s.GetDurableQuotaLease(context.Background(), original.ID)
+			if err != nil || lease == nil || lease.State != DurableQuotaLeaseActive || lease.Version != original.Version ||
+				lease.ConsumedUnits != original.ConsumedUnits || lease.ReleasedUnits != original.ReleasedUnits || !lease.ExpiresAt.Equal(original.ExpiresAt) {
+				t.Fatalf("quota batch left partial lease mutation: original=%+v current=%+v err=%v", original, lease, err)
+			}
+		}
+	}
+
+	t.Run("usage", func(t *testing.T) {
+		s, task, leases := setup(t)
+		_, err := s.RecordQuotaUsages(context.Background(), []RecordQuotaUsageRequest{
+			{ID: newID(t), OperationKey: "batch-usage-task", LeaseID: leases[0].ID, FencingToken: leases[0].FencingToken, Units: 1, OccurredAt: time.Now().UTC(), Actor: "batch-actor"},
+			{ID: task.ID, OperationKey: "batch-usage-actor", LeaseID: leases[1].ID, FencingToken: leases[1].FencingToken, Units: 1, OccurredAt: time.Now().UTC(), Actor: "batch-actor"},
+		})
+		if !errors.Is(err, ErrIdentityCollision) {
+			t.Fatalf("atomic usage error = %v, want identity collision", err)
+		}
+		assertActiveUnchanged(t, s, leases)
+		var events int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM quota_usage_events_v5 WHERE operation_key LIKE 'batch-usage-%'`).Scan(&events); err != nil || events != 0 {
+			t.Fatalf("partial usage events = %d, %v", events, err)
+		}
+	})
+
+	t.Run("heartbeat", func(t *testing.T) {
+		s, task, leases := setup(t)
+		_, err := s.HeartbeatQuotaLeases(context.Background(), []HeartbeatQuotaLeaseRequest{
+			{ID: newID(t), IdempotencyKey: "batch-heartbeat-task", LeaseID: leases[0].ID, Owner: leases[0].Owner, FencingToken: leases[0].FencingToken, TTL: 2 * time.Hour, Actor: "batch-actor"},
+			{ID: task.ID, IdempotencyKey: "batch-heartbeat-actor", LeaseID: leases[1].ID, Owner: leases[1].Owner, FencingToken: leases[1].FencingToken, TTL: 2 * time.Hour, Actor: "batch-actor"},
+		})
+		if !errors.Is(err, ErrIdentityCollision) {
+			t.Fatalf("atomic heartbeat error = %v, want identity collision", err)
+		}
+		assertActiveUnchanged(t, s, leases)
+		var events int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM quota_heartbeats_v5 WHERE idempotency_key LIKE 'batch-heartbeat-%'`).Scan(&events); err != nil || events != 0 {
+			t.Fatalf("partial heartbeat events = %d, %v", events, err)
+		}
+	})
+
+	t.Run("settlement", func(t *testing.T) {
+		s, task, leases := setup(t)
+		_, err := s.SettleQuotaLeases(context.Background(), []SettleQuotaLeaseRequest{
+			{ID: newID(t), IdempotencyKey: "batch-settlement-task", LeaseID: leases[0].ID, Owner: leases[0].Owner, FencingToken: leases[0].FencingToken, Outcome: QuotaSettlementCompleted, Actor: "batch-actor"},
+			{ID: task.ID, IdempotencyKey: "batch-settlement-actor", LeaseID: leases[1].ID, Owner: leases[1].Owner, FencingToken: leases[1].FencingToken, Outcome: QuotaSettlementCompleted, Actor: "batch-actor"},
+		})
+		if !errors.Is(err, ErrIdentityCollision) {
+			t.Fatalf("atomic settlement error = %v, want identity collision", err)
+		}
+		assertActiveUnchanged(t, s, leases)
+		var events int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM quota_settlements_v5 WHERE idempotency_key LIKE 'batch-settlement-%'`).Scan(&events); err != nil || events != 0 {
+			t.Fatalf("partial settlement events = %d, %v", events, err)
+		}
+	})
+
+	t.Run("reconciliation", func(t *testing.T) {
+		s, task, leases := setup(t)
+		uncertainRequests := make([]SettleQuotaLeaseRequest, len(leases))
+		for index, lease := range leases {
+			uncertainRequests[index] = SettleQuotaLeaseRequest{
+				ID: newID(t), IdempotencyKey: fmt.Sprintf("batch-uncertain-%d", index), LeaseID: lease.ID,
+				Owner: lease.Owner, FencingToken: lease.FencingToken, Outcome: QuotaSettlementUncertain, Actor: "batch-actor",
+			}
+		}
+		uncertain, err := s.SettleQuotaLeases(context.Background(), uncertainRequests)
+		if err != nil || len(uncertain) != 2 {
+			t.Fatalf("prepare uncertain batch = %+v, %v", uncertain, err)
+		}
+		_, err = s.ReconcileQuotaLeases(context.Background(), []ReconcileQuotaLeaseRequest{
+			{ID: newID(t), IdempotencyKey: "batch-reconcile-task", LeaseID: leases[0].ID, Owner: leases[0].Owner, FencingToken: leases[0].FencingToken, Outcome: QuotaSettlementCanceled, Actor: "batch-actor"},
+			{ID: task.ID, IdempotencyKey: "batch-reconcile-actor", LeaseID: leases[1].ID, Owner: leases[1].Owner, FencingToken: leases[1].FencingToken, Outcome: QuotaSettlementCanceled, Actor: "batch-actor"},
+		})
+		if !errors.Is(err, ErrIdentityCollision) {
+			t.Fatalf("atomic reconciliation error = %v, want identity collision", err)
+		}
+		for _, original := range uncertain {
+			lease, err := s.GetDurableQuotaLease(context.Background(), original.LeaseID)
+			if err != nil || lease == nil || lease.State != DurableQuotaLeaseUncertain || lease.Version != original.Lease.Version {
+				t.Fatalf("reconciliation left partial lease mutation: original=%+v current=%+v err=%v", original.Lease, lease, err)
+			}
+		}
+		var events int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM quota_settlements_v5 WHERE idempotency_key LIKE 'batch-reconcile-%'`).Scan(&events); err != nil || events != 0 {
+			t.Fatalf("partial reconciliation events = %d, %v", events, err)
+		}
+	})
+}
+
+func TestQuotaHeartbeatSurvivesConcurrentSQLiteWriters(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	first, err := OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	task, _ := createValidatedTaskAndRevision(t, first)
+	decision, err := first.AdmitTaskActorQuota(ctx, AdmitTaskActorQuotaRequest{
+		IdempotencyKey: "concurrent-heartbeat-admission", TaskID: task.ID, Actor: "concurrent-actor", LeaseOwner: "concurrent-worker", LeaseTTL: 5 * time.Second,
+		Policy:            QuotaPolicyBinding{PolicyID: "concurrent", PolicyVersion: "1", PolicyFingerprint: "sha256:concurrent"},
+		BootstrapAccounts: []QuotaAccountBootstrap{{Dimension: "turn", TaskLimitUnits: 10, ActorLimitUnits: 10}},
+		Claims:            []TaskActorQuotaClaim{{Dimension: "turn", Units: 1, ReclaimPolicy: QuotaReclaimUnused}}, Reason: "concurrency fixture",
+	})
+	if err != nil || !decision.Accepted || len(decision.Leases) != 2 {
+		t.Fatalf("concurrent admission = %+v, %v", decision, err)
+	}
+	errorsCh := make(chan error, 80)
+	var group sync.WaitGroup
+	group.Add(2)
+	go func() {
+		defer group.Done()
+		for ordinal := 0; ordinal < 40; ordinal++ {
+			requests := make([]HeartbeatQuotaLeaseRequest, len(decision.Leases))
+			for index, lease := range decision.Leases {
+				requests[index] = HeartbeatQuotaLeaseRequest{
+					IdempotencyKey: fmt.Sprintf("concurrent-heartbeat:%d:%s", ordinal, lease.ID), LeaseID: lease.ID,
+					Owner: lease.Owner, FencingToken: lease.FencingToken, TTL: 5 * time.Second, Actor: "concurrent-actor",
+				}
+			}
+			if _, err := first.HeartbeatQuotaLeases(context.Background(), requests); err != nil {
+				errorsCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer group.Done()
+		for ordinal := 0; ordinal < 40; ordinal++ {
+			key := fmt.Sprintf("concurrent-outbox:%d", ordinal)
+			if _, err := second.CreateOutboxEvent(context.Background(), CreateOutboxEventRequest{
+				Topic: "concurrent.fixture", EntityType: "workflow_run", EntityID: task.ID, PayloadJSON: `{}`,
+				IdempotencyKey: key, Actor: "concurrent-actor",
+			}); err != nil {
+				errorsCh <- err
+				return
+			}
+		}
+	}()
+	group.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Fatalf("concurrent SQLite writer error: %v", err)
+	}
+	for _, original := range decision.Leases {
+		lease, err := first.GetDurableQuotaLease(ctx, original.ID)
+		if err != nil || lease == nil || lease.State != DurableQuotaLeaseActive || lease.Version != original.Version+40 {
+			t.Fatalf("concurrent heartbeat lease = %+v, %v", lease, err)
+		}
 	}
 }
 
