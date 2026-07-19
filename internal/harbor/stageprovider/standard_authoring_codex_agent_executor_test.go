@@ -369,8 +369,8 @@ func TestStandardAuthoringCodexAgentTurnExecutorUsesFrozenDockerfileEnvironmentP
 		t.Fatalf("turn requests = %+v", runtime.conversation.requests)
 	}
 	firstInput := runtime.conversation.requests[0].Input[0].Text
-	if !strings.Contains(firstInput, `"name":"environment_policy"`) || !strings.Contains(firstInput, base64.StdEncoding.EncodeToString(policyBytes)) || strings.Contains(firstInput, policy.BaseImage) {
-		t.Fatalf("first request did not contain base64-only frozen environment policy: %q", firstInput)
+	if !strings.Contains(firstInput, `"name":"environment_policy"`) || !strings.Contains(firstInput, base64.StdEncoding.EncodeToString(policyBytes)) || !strings.Contains(firstInput, `"frozen_environment_policy"`) || !strings.Contains(firstInput, policy.BaseImage) {
+		t.Fatalf("first request did not contain the frozen environment policy and its validated base image: %q", firstInput)
 	}
 	if len(runtime.conversation.submissionResponses) != 2 {
 		t.Fatalf("submission responses = %+v", runtime.conversation.submissionResponses)

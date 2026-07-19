@@ -24,7 +24,9 @@ import (
 const (
 	// StandardAuthoringCodexTurnRequestFormat is the sole structured document
 	// sent to a Codex authoring turn. It carries frozen artifact bytes only as
-	// standard base64 and deliberately contains no environment or credential.
+	// standard base64. Dockerfile turns additionally receive the already validated
+	// non-secret base-image coordinate as host-derived metadata so the model does
+	// not have to guess a value that the submission authority will reject.
 	StandardAuthoringCodexTurnRequestFormat  = "harbor.standard-authoring-codex-turn-request.v1"
 	StandardAuthoringCodexTurnRequestVersion = "1"
 
@@ -338,7 +340,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
 	}
-	requestDocument, err := standardAuthoringCodexRequestDocument(request, program, inputs, inputFingerprint)
+	requestDocument, err := standardAuthoringCodexRequestDocument(request, program, inputs, inputFingerprint, environmentPolicy)
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
@@ -648,7 +650,7 @@ func standardAuthoringCodexDockerfileEnvironmentPolicy(stage workflowkit.StageDe
 	return policy, nil
 }
 
-func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint) ([]byte, error) {
+func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) ([]byte, error) {
 	outputs := make([]struct {
 		Name          string `json:"name"`
 		SchemaVersion string `json:"schema_version"`
@@ -659,16 +661,25 @@ func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionReq
 			SchemaVersion string `json:"schema_version"`
 		}{Name: output.Name, SchemaVersion: output.SchemaVersion})
 	}
+	var frozenEnvironmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy
+	if request.Stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) {
+		if environmentPolicy == nil || environmentPolicy.Validate() != nil {
+			return nil, errors.New("frozen Dockerfile environment policy is unavailable")
+		}
+		policyCopy := *environmentPolicy
+		frozenEnvironmentPolicy = &policyCopy
+	}
 	return json.Marshal(struct {
-		Format                  string                        `json:"format"`
-		Version                 string                        `json:"version"`
-		ProgramID               string                        `json:"program_id"`
-		ProgramVersion          string                        `json:"program_version"`
-		ProgramFingerprint      workflowkit.Fingerprint       `json:"program_fingerprint"`
-		OutputSchemaFingerprint workflowkit.Fingerprint       `json:"output_schema_fingerprint"`
-		StageKey                workflowkit.StageKey          `json:"stage_key"`
-		InputFingerprint        workflowkit.Fingerprint       `json:"input_fingerprint"`
-		Inputs                  []standardAuthoringCodexInput `json:"inputs"`
+		Format                  string                                              `json:"format"`
+		Version                 string                                              `json:"version"`
+		ProgramID               string                                              `json:"program_id"`
+		ProgramVersion          string                                              `json:"program_version"`
+		ProgramFingerprint      workflowkit.Fingerprint                             `json:"program_fingerprint"`
+		OutputSchemaFingerprint workflowkit.Fingerprint                             `json:"output_schema_fingerprint"`
+		StageKey                workflowkit.StageKey                                `json:"stage_key"`
+		InputFingerprint        workflowkit.Fingerprint                             `json:"input_fingerprint"`
+		Inputs                  []standardAuthoringCodexInput                       `json:"inputs"`
+		FrozenEnvironmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy `json:"frozen_environment_policy,omitempty"`
 		Outputs                 []struct {
 			Name          string `json:"name"`
 			SchemaVersion string `json:"schema_version"`
@@ -677,7 +688,7 @@ func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionReq
 		Format: StandardAuthoringCodexTurnRequestFormat, Version: StandardAuthoringCodexTurnRequestVersion,
 		ProgramID: program.ID, ProgramVersion: program.Version, ProgramFingerprint: program.Fingerprint,
 		OutputSchemaFingerprint: StandardAuthoringCodexOutputSchemaFingerprint(), StageKey: request.Stage.Key,
-		InputFingerprint: inputFingerprint, Inputs: inputs, Outputs: outputs,
+		InputFingerprint: inputFingerprint, Inputs: inputs, FrozenEnvironmentPolicy: frozenEnvironmentPolicy, Outputs: outputs,
 	})
 }
 
