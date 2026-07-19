@@ -43,6 +43,23 @@ func TestCommitAuthoringRecoveryExecutionUsesDedicatedAtomicBarrier(t *testing.T
 	}
 }
 
+func TestCommitAuthoringRecoveryExecutionAllowsWaitingContinuation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryCommitFixture(t, ctx)
+	running := transitionAuthoringRecoveryCommitRun(t, ctx, fixture.store, fixture.run, WorkflowRunRunning)
+	fixture.run = transitionAuthoringRecoveryCommitRun(t, ctx, fixture.store, running, WorkflowRunWaitingContinuation)
+	plan, checkpoint := createAuthoringRecoveryCommitPlan(t, ctx, fixture)
+	request := authoringRecoveryCommitRequest(fixture, plan, checkpoint, "authoring-recovery-waiting-continuation")
+
+	committed, err := fixture.store.CommitAuthoringRecoveryExecution(ctx, request)
+	if err != nil {
+		t.Fatalf("commit waiting-continuation authoring recovery: %v", err)
+	}
+	if committed.Run.Status != WorkflowRunWaitingContinuation || committed.Run.ExecutionEpoch != fixture.run.ExecutionEpoch+1 {
+		t.Fatalf("committed waiting-continuation recovery run = %+v", committed.Run)
+	}
+}
+
 func TestCommitAuthoringRecoveryExecutionRejectsMaterializationAndInDoubt(t *testing.T) {
 	ctx := context.Background()
 	t.Run("materialized run", func(t *testing.T) {

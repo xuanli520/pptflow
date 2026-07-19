@@ -372,7 +372,7 @@ func verifyAuthoringRecoveryCommitBarrierTx(ctx context.Context, tx *sql.Tx, run
 		return fmt.Errorf("%w: authoring Run source/session binding changed", ErrAuthoringRecoveryBarrier)
 	}
 	switch run.Status {
-	case WorkflowRunFailedRecoverable, WorkflowRunPaused:
+	case WorkflowRunFailedRecoverable, WorkflowRunPaused, WorkflowRunWaitingContinuation:
 	default:
 		if run.Status == WorkflowRunInDoubt {
 			return fmt.Errorf("%w: authoring Run %s", ErrContinuationReconciliationRequired, run.ID)
