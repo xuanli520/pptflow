@@ -78,6 +78,50 @@ func TestCodeEdgeComplianceRecordsTrustedEvidenceAndReconcilesTechnicalRetry(t *
 	}
 }
 
+func TestResultReviewComplianceRecordsAndValidatesRevisionIdempotently(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{})
+	runtime := &FrozenExecutionRuntime{core: fixture.services.core}
+	reviewBinding := store.ReviewGateBinding{RevisionID: fixture.revision.ID, RevisionDigest: fixture.revision.TaskDigest}
+	recordID := newCodeEdgeComplianceUUID(t)
+
+	first, err := runtime.recordResultReviewCompliance(ctx, fixture.run, fixture.revision, reviewBinding,
+		[]workflowkit.ArtifactBinding{fixture.submission.Report}, recordID, "codeedge-test", "approve complete evaluator result")
+	if err != nil {
+		t.Fatalf("record ResultReview final compliance: %v", err)
+	}
+	if first.Record.ID != recordID || first.Record.Status != store.CodeEdgeComplianceApproved || first.Authorization == nil {
+		t.Fatalf("ResultReview compliance = %+v, want approved record %s", first, recordID)
+	}
+	revision, err := fixture.database.GetTaskRevision(ctx, fixture.revision.ID)
+	if err != nil || revision == nil || revision.State != store.RevisionStateValidated || revision.ValidationEvidenceManifest == "" {
+		t.Fatalf("validated revision after ResultReview compliance = %+v, %v", revision, err)
+	}
+	if !strings.HasPrefix(revision.ValidationEvidenceManifest, "sha256:") {
+		t.Fatalf("revision validation evidence = %q, want fingerprint", revision.ValidationEvidenceManifest)
+	}
+
+	replayed, err := runtime.recordResultReviewCompliance(ctx, fixture.run, fixture.revision, reviewBinding,
+		[]workflowkit.ArtifactBinding{fixture.submission.Report}, recordID, "codeedge-test", "replay ResultReview compliance")
+	if err != nil || replayed.Record.ID != first.Record.ID || replayed.Record.DecisionFingerprint != first.Record.DecisionFingerprint {
+		t.Fatalf("ResultReview compliance replay = %+v, %v", replayed, err)
+	}
+	revisionReplay, err := fixture.database.GetTaskRevision(ctx, fixture.revision.ID)
+	if err != nil || revisionReplay == nil || revisionReplay.StateVersion != revision.StateVersion || revisionReplay.ValidationEvidenceManifest != revision.ValidationEvidenceManifest {
+		t.Fatalf("ResultReview compliance replay changed revision = %+v, %v; first=%+v", revisionReplay, err, revision)
+	}
+}
+
+func TestCodeEdgeComplianceRejectsSubmissionReceiptVerdictDrift(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{})
+	request := fixture.complianceRequest(t)
+	request.Submission.Status = codeedge.SubmissionCheckRejected
+	if _, err := fixture.services.CodeEdgeCompliance.RecordFinalCompliance(ctx, request); err == nil || !strings.Contains(err.Error(), "does not match frozen submission report verdict") {
+		t.Fatalf("submission receipt verdict drift = %v, want fail-closed mismatch", err)
+	}
+}
+
 func TestCodeEdgeEvaluatorEvidenceGateRequiresVerifiedAdoptedHandoff(t *testing.T) {
 	ctx := context.Background()
 	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{stopBeforeHandoff: true})
@@ -797,7 +841,15 @@ func seedCodeEdgeSubmissionStage(t *testing.T, ctx context.Context, services *Li
 	if err != nil {
 		t.Fatal(err)
 	}
-	content := []byte(`{"status":"passed","findings":[]}`)
+	content, err := json.Marshal(codeEdgePhase1StageReport{
+		Format: codeEdgePhase1ReportFormat, Version: codeEdgePhase1ReportVersion,
+		Stage: string(workflowadapter.SubmissionLint), RunID: run.ID, StageAttemptID: stage.ID,
+		TaskSnapshotDigest: string(frozen.Binding.TaskSnapshotDigest), Verdict: workflowkit.VerdictPass,
+		Findings: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(descriptor.Outputs) != 1 || descriptor.Outputs[0].Name != "submission_lint_report" {
 		t.Fatalf("frozen submission_lint descriptor = %+v", descriptor)
 	}

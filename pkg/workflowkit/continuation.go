@@ -461,10 +461,12 @@ func validateTransitionBindings(transition NodeTransition, stage StageDescriptor
 		bound[binding.Name] = struct{}{}
 	}
 	// A preserved stage must prove every required input is still bound to an
-	// immutable artifact. Scheduled and invalidated stages intentionally may
-	// have unresolved downstream inputs: their producer is part of this frozen
-	// plan, so fabricating a stale binding would be less safe than recording no
-	// binding and letting runtime materialize it after its dependency completes.
+	// immutable artifact. A scheduled stage may freeze only the known mandatory
+	// input subset, such as durable repair feedback; runtime must require that
+	// exact subset while resolving the complete input set. Other scheduled and
+	// invalidated inputs may remain unresolved because their producer is part of
+	// this frozen plan, so fabricating stale bindings would be less safe than
+	// letting runtime materialize them after their dependencies complete.
 	if transition.Disposition == DispositionPreserve {
 		for _, specification := range stage.Inputs {
 			if specification.Required {

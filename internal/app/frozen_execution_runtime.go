@@ -30,6 +30,9 @@ var (
 	// errFrozenRunIntegrity distinguishes persisted Run integrity failures from
 	// a durable Job payload that merely fails to bind the Run it names.
 	errFrozenRunIntegrity = errors.New("v2 executor: frozen run integrity failure")
+	// errRequiredContinuationInputDrift identifies an input that was frozen into
+	// a committed continuation plan but can no longer be proved at execution.
+	errRequiredContinuationInputDrift = errors.New("v2 executor: required continuation input drift")
 )
 
 // FrozenExecutionRuntimeConfig supplies the controlled implementations that
@@ -755,6 +758,16 @@ func (runtime *FrozenExecutionRuntime) handleContinuation(ctx context.Context, e
 	if snapshot.TargetRunRelation == workflowkit.RelationSameRunAttempt && snapshot.SourceRunID != run.ID {
 		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: same-run continuation source does not match job run", ErrFrozenExecutionPayload))
 	}
+	if payload.SourceRunID != snapshot.SourceRunID {
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: continuation source run mismatch", ErrFrozenExecutionPayload))
+	}
+	runtimePlan, err := continuationRuntimeExecutionPlan(plan, frozen.Workflow, frozen.QuotaPolicy, continuation.ID)
+	if err != nil {
+		return runtime.failRuntimeJob(ctx, job, err)
+	}
+	if err := validateRequiredContinuationInputs(ctx, runtime.core, run, runtimePlan); err != nil {
+		return runtime.reconcileContinuationInputDrift(ctx, job, *continuation, err)
+	}
 	if err := runtime.transitionContinuationToRunning(ctx, *continuation, job.CreatedBy); err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
@@ -764,18 +777,14 @@ func (runtime *FrozenExecutionRuntime) handleContinuation(ctx context.Context, e
 	if err := runtime.transitionRunToRunning(ctx, run, job.CreatedBy, "begin frozen continuation"); err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
-	if payload.SourceRunID != snapshot.SourceRunID {
-		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: continuation source run mismatch", ErrFrozenExecutionPayload))
-	}
-	runtimePlan, err := continuationRuntimeExecutionPlan(plan, frozen.Workflow, frozen.QuotaPolicy, continuation.ID)
-	if err != nil {
-		return runtime.failRuntimeJob(ctx, job, err)
-	}
 	if err := runtime.ensureRunAttempt(ctx, run.ID, runtimePlan.ExecutionKey, job.CreatedBy, "begin continuation attempt"); err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	state, coordinatorErr := runtime.executeWorkflowkitCoordinator(ctx, execution, job, run, frozen, runtimePlan)
 	if coordinatorErr != nil {
+		if errors.Is(coordinatorErr, errRequiredContinuationInputDrift) {
+			return runtime.reconcileContinuationInputDrift(ctx, job, *continuation, coordinatorErr)
+		}
 		return runtime.failRuntimeJob(ctx, job, coordinatorErr)
 	}
 	return state, nil
@@ -953,6 +962,44 @@ func (runtime *FrozenExecutionRuntime) transitionContinuationToRunning(ctx conte
 		Actor: actor, Reason: "durable continuation worker started",
 	})
 	return err
+}
+
+func validateRequiredContinuationInputs(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, plan runtimeExecutionPlan) error {
+	if core == nil || core.store == nil || core.objects == nil {
+		return fmt.Errorf("%w: %w: continuation input validator is not configured", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift)
+	}
+	subject, err := core.resolveWorkflowRunSubject(ctx, run)
+	if err != nil {
+		return fmt.Errorf("%w: %w: resolve continuation subject: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, err)
+	}
+	for _, stageKey := range mustTopologicalStageKeys(plan.Workflow) {
+		transition, found := plan.stageTransition(stageKey)
+		if !found || transition.Disposition != workflowkit.DispositionSchedule || len(transition.InputBindings) == 0 {
+			continue
+		}
+		stage, found := plan.Workflow.Stage(stageKey)
+		if !found || !stage.AutomaticallyDispatchable() {
+			return fmt.Errorf("%w: required continuation inputs refer to unavailable stage %q", ErrFrozenExecutionPayload, stageKey)
+		}
+		inputs, err := resolveStageInputsForSubject(ctx, core.store, core.objects, run, subject, stage)
+		if err != nil {
+			return fmt.Errorf("%w: %w: resolve required continuation inputs for stage %q: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stageKey, err)
+		}
+		if err := requirePlannedStageInputs(transition, inputs); err != nil {
+			return fmt.Errorf("%w: %w: stage %q required continuation inputs: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stageKey, err)
+		}
+	}
+	return nil
+}
+
+func (runtime *FrozenExecutionRuntime) reconcileContinuationInputDrift(ctx context.Context, job store.DurableJob, execution store.ContinuationExecution, cause error) (store.JobState, error) {
+	if _, err := runtime.core.store.MarkContinuationExecutionReconcileRequired(ctx, store.MarkContinuationExecutionReconcileRequiredRequest{
+		ContinuationExecutionID: execution.ID, RunID: execution.RunID, Actor: job.CreatedBy,
+		Reason: "required frozen continuation inputs changed after execution commit",
+	}); err != nil {
+		cause = fmt.Errorf("%w: project continuation input drift for reconciliation: %v", cause, err)
+	}
+	return runtime.failRuntimeJob(ctx, job, cause)
 }
 
 func (runtime *FrozenExecutionRuntime) ensureRunAttempt(ctx context.Context, runID, executionKey, actor, reason string) error {
@@ -1241,7 +1288,13 @@ func (runtime *FrozenExecutionRuntime) enqueueStageAttempt(ctx context.Context, 
 	}
 	inputs, err := resolveStageInputsForSubject(ctx, runtime.core.store, runtime.core.objects, run, subject, stage)
 	if err != nil {
+		if len(transition.InputBindings) != 0 {
+			return fmt.Errorf("%w: %w: resolve required continuation inputs for stage %q: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stage.Key, err)
+		}
 		return fmt.Errorf("resolve immutable inputs for stage %q: %w", stage.Key, err)
+	}
+	if err := requirePlannedStageInputs(transition, inputs); err != nil {
+		return fmt.Errorf("%w: %w: stage %q required continuation inputs: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stage.Key, err)
 	}
 	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(inputs)
 	if err != nil {
@@ -1273,6 +1326,29 @@ func (runtime *FrozenExecutionRuntime) enqueueStageAttempt(ctx context.Context, 
 		Actor: parentJob.CreatedBy, Reason: "enqueue frozen stage attempt " + string(stage.Key),
 	})
 	return err
+}
+
+func requirePlannedStageInputs(transition workflowkit.NodeTransition, actual []workflowkit.ArtifactBinding) error {
+	if transition.Disposition != workflowkit.DispositionSchedule || len(transition.InputBindings) == 0 {
+		return nil
+	}
+	byName := make(map[string]workflowkit.ArtifactBinding, len(actual))
+	for _, binding := range actual {
+		if _, duplicate := byName[binding.Name]; duplicate {
+			return fmt.Errorf("resolved duplicate input %q", binding.Name)
+		}
+		byName[binding.Name] = binding
+	}
+	for _, required := range transition.InputBindings {
+		binding, present := byName[required.Name]
+		if !present {
+			return fmt.Errorf("missing frozen input %q", required.Name)
+		}
+		if binding != required {
+			return fmt.Errorf("frozen input %q changed after continuation planning", required.Name)
+		}
+	}
+	return nil
 }
 
 func (runtime *FrozenExecutionRuntime) findOrCreatePlannedStageAttempt(ctx context.Context, run store.WorkflowRun, plan runtimeExecutionPlan, stage workflowkit.StageDescriptor, transition workflowkit.NodeTransition, inputFingerprint workflowkit.Fingerprint, actor string) (store.StageAttempt, error) {

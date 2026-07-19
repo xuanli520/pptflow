@@ -123,7 +123,7 @@ func newProductionBuildFixture(t *testing.T) productionBuildFixture {
 		Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0",
 		Commit: strings.Repeat("a", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("frozen-source-manifest")),
 	}
-	standard := writeProductionBuildFixtureBundle(t, root, "standard", workflowadapter.StandardAuthoringBriefWorkflowTemplate(), build)
+	standard := writeProductionBuildFixtureBundle(t, root, "standard", workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate(), build)
 	parent := writeProductionBuildFixtureBundle(t, root, "parent", workflowadapter.CodeEdgePhase1WorkflowTemplate(), build)
 	evaluator := writeProductionBuildFixtureBundle(t, root, "evaluator", workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplate(), build)
 	return productionBuildFixture{

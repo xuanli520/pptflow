@@ -943,7 +943,7 @@ func (service *StandardAuthoringLaunchService) freezeStandardAuthoringLaunchDepl
 }
 
 func (service *StandardAuthoringLaunchService) newStandardAuthoringLaunchDeploymentDefinition(profile workflowadapter.ExecutionProfile, receipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) (standardAuthoringLaunchDeploymentDefinition, error) {
-	if !profile.Template.Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if !profile.Template.Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		return standardAuthoringLaunchDeploymentDefinition{}, fmt.Errorf("Standard authoring static deployment definition has the wrong workflow template")
 	}
 	profileCanonical, err := profile.CanonicalJSON()
@@ -1068,7 +1068,7 @@ func (preparation standardAuthoringLaunchPreparation) BriefInput() (standardAuth
 
 func (preparation standardAuthoringLaunchPreparation) DeploymentDefinition() (standardAuthoringLaunchDeploymentDefinition, error) {
 	if preparation.Format != standardAuthoringLaunchPreparationFormat || preparation.Version != standardAuthoringLaunchPreparationVersion ||
-		preparation.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID || !workflowadapter.StandardAuthoringBriefTemplateReference().Equal(workflowadapter.TemplateReference{ID: preparation.WorkflowTemplateID, Version: preparation.WorkflowTemplateVersion}) ||
+		preparation.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID || !workflowadapter.StandardAuthoringRepairFeedbackTemplateReference().Equal(workflowadapter.TemplateReference{ID: preparation.WorkflowTemplateID, Version: preparation.WorkflowTemplateVersion}) ||
 		preparation.SourceSnapshotSchemaVersion != StandardAuthoringSourceSnapshotSchemaVersion {
 		return standardAuthoringLaunchDeploymentDefinition{}, fmt.Errorf("invalid Standard authoring launch preparation format or template")
 	}
@@ -1122,7 +1122,7 @@ func (preparation standardAuthoringLaunchPreparation) DeploymentDefinition() (st
 // only while reading the immutable preparation record; retry admission then
 // compares this result to a separately resolved current deployment tuple.
 func newStandardAuthoringLaunchDeploymentDefinitionWithoutResolver(profile workflowadapter.ExecutionProfile, receipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) (standardAuthoringLaunchDeploymentDefinition, error) {
-	if !profile.Template.Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if !profile.Template.Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		return standardAuthoringLaunchDeploymentDefinition{}, fmt.Errorf("Standard authoring launch preparation profile has the wrong workflow template")
 	}
 	profileCanonical, err := profile.CanonicalJSON()
@@ -1272,7 +1272,7 @@ func (service *StandardAuthoringLaunchService) freezeStandardAuthoringDefinition
 	if err != nil {
 		return standardAuthoringFrozenDefinition{}, fmt.Errorf("resolve Standard authoring deployment definition: %w", err)
 	}
-	if !definition.Profile.Template.Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) || !definition.ExecutionSpec.Template.Equal(definition.Profile.Template) || !definition.Profile.Template.Equal(expectedDefinition.Profile.Template) {
+	if !definition.Profile.Template.Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) || !definition.ExecutionSpec.Template.Equal(definition.Profile.Template) || !definition.Profile.Template.Equal(expectedDefinition.Profile.Template) {
 		return standardAuthoringFrozenDefinition{}, fmt.Errorf("Standard authoring deployment definition has the wrong workflow template")
 	}
 	selection := definition.ExecutionSpec.Selection
@@ -1434,7 +1434,7 @@ func standardAuthoringSessionIntrinsicInputs(session store.AuthoringSession) (st
 	if manifest.Format != standardAuthoringLaunchSessionManifestFormat || manifest.Version != standardAuthoringLaunchSessionManifestVersion ||
 		manifest.AuthoringSessionID != session.ID || manifest.SourceID != session.SourceID || manifest.TargetTaskID != session.TargetTaskID ||
 		manifest.SourceSnapshotSchemaVersion != StandardAuthoringSourceSnapshotSchemaVersion ||
-		!workflowadapter.StandardAuthoringBriefTemplateReference().Equal(workflowadapter.TemplateReference{ID: session.WorkflowTemplateID, Version: session.WorkflowTemplateVersion}) {
+		!workflowadapter.StandardAuthoringRepairFeedbackTemplateReference().Equal(workflowadapter.TemplateReference{ID: session.WorkflowTemplateID, Version: session.WorkflowTemplateVersion}) {
 		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, fmt.Errorf("Standard authoring session manifest is not the current immutable authoring contract")
 	}
 	policy, err := workflowadapter.ParseStandardAuthoringEnvironmentPolicyJSON(manifest.EnvironmentPolicy)
@@ -1542,7 +1542,7 @@ func validateStandardAuthoringEnvironmentPolicyBindings(specification workflowad
 	return nil
 }
 
-// validateStandardAuthoringBriefBindings proves that every 1.4.0 stage which
+// validateStandardAuthoringBriefBindings proves that every current stage which
 // declares authoring_brief is bound to the exact canonical session artifact.
 func validateStandardAuthoringBriefBindings(specification workflowadapter.RunExecutionSpec, brief standardAuthoringBriefInput) error {
 	if err := specification.Validate(); err != nil {
@@ -1552,8 +1552,8 @@ func validateStandardAuthoringBriefBindings(specification workflowadapter.RunExe
 	if err != nil {
 		return err
 	}
-	if !template.Reference().Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
-		return fmt.Errorf("brief binding requires the Standard authoring 1.4.0 template")
+	if !template.Reference().Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
+		return fmt.Errorf("brief binding requires the Standard authoring %s template", workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion)
 	}
 	briefReference := brief.artifactReference()
 	matchedReference := false
@@ -1684,10 +1684,10 @@ type CatalogStandardAuthoringRunDefinitionProvider struct {
 }
 
 func NewCatalogStandardAuthoringRunDefinitionProvider(catalog *stageprovider.DeploymentOperationCatalogResolver, profile workflowadapter.ExecutionProfile) (*CatalogStandardAuthoringRunDefinitionProvider, error) {
-	if catalog == nil || !catalog.Template().Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if catalog == nil || !catalog.Template().Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		return nil, fmt.Errorf("Standard authoring deployment catalog is required")
 	}
-	if !profile.Template.Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) || !profile.Template.Equal(catalog.Template()) {
+	if !profile.Template.Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) || !profile.Template.Equal(catalog.Template()) {
 		return nil, fmt.Errorf("Standard authoring execution profile is required")
 	}
 	if err := profile.Validate(); err != nil {
@@ -1701,7 +1701,7 @@ func NewCatalogStandardAuthoringRunDefinitionProvider(catalog *stageprovider.Dep
 // the template-scoped catalog receipt and lock around this profile before it
 // permits a Git remote contact.
 func (provider *CatalogStandardAuthoringRunDefinitionProvider) StandardAuthoringStaticRunDefinition(context.Context) (StandardAuthoringStaticRunDefinition, error) {
-	if provider == nil || provider.catalog == nil || !provider.catalog.Template().Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if provider == nil || provider.catalog == nil || !provider.catalog.Template().Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		return StandardAuthoringStaticRunDefinition{}, ErrStandardAuthoringLaunchUnavailable
 	}
 	receipt, err := provider.catalog.CanonicalReceiptJSON()
@@ -1712,7 +1712,7 @@ func (provider *CatalogStandardAuthoringRunDefinitionProvider) StandardAuthoring
 }
 
 func (provider *CatalogStandardAuthoringRunDefinitionProvider) StandardAuthoringRunDefinition(_ context.Context, subject StandardAuthoringRunDefinitionSubject) (StandardAuthoringRunDefinition, error) {
-	if provider == nil || provider.catalog == nil || !provider.catalog.Template().Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if provider == nil || provider.catalog == nil || !provider.catalog.Template().Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		return StandardAuthoringRunDefinition{}, ErrStandardAuthoringLaunchUnavailable
 	}
 	if err := store.ValidateUUIDv7(subject.SourceID); err != nil {
@@ -1744,7 +1744,7 @@ func (provider *CatalogStandardAuthoringRunDefinitionProvider) StandardAuthoring
 }
 
 func buildCatalogStandardAuthoringExecutionSpec(catalog stageprovider.DeploymentOperationCatalog, subject StandardAuthoringRunDefinitionSubject) (workflowadapter.RunExecutionSpec, error) {
-	if !catalog.Template.Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if !catalog.Template.Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		return workflowadapter.RunExecutionSpec{}, fmt.Errorf("catalog does not bind Standard authoring")
 	}
 	specification := workflowadapter.RunExecutionSpec{

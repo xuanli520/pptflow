@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 const reviewGateResolutionPayloadFormat = "harbor.review-gate-resolution.v1"
@@ -20,6 +21,10 @@ type reviewGateResolutionPayload struct {
 	ReviewDecisionID string `json:"review_decision_id"`
 	RunID            string `json:"run_id"`
 	StageAttemptID   string `json:"stage_attempt_id"`
+	// CodeEdgeComplianceRecordID is allocated before the immutable decision
+	// and resolution job commit. A crash replay therefore cannot mint a second
+	// final compliance record or package authorization.
+	CodeEdgeComplianceRecordID string `json:"codeedge_compliance_record_id,omitempty"`
 }
 
 func (payload reviewGateResolutionPayload) validate() error {
@@ -39,13 +44,19 @@ func (payload reviewGateResolutionPayload) validate() error {
 			return fmt.Errorf("%w: %s ID: %v", ErrFrozenExecutionPayload, identity.name, err)
 		}
 	}
+	if payload.CodeEdgeComplianceRecordID != "" {
+		if err := store.ValidateUUIDv7(payload.CodeEdgeComplianceRecordID); err != nil {
+			return fmt.Errorf("%w: CodeEdge compliance record ID: %v", ErrFrozenExecutionPayload, err)
+		}
+	}
 	return nil
 }
 
-func newReviewGateResolutionPayload(binding store.ReviewGateBinding, decisionID string) (string, error) {
+func newReviewGateResolutionPayload(binding store.ReviewGateBinding, decisionID, codeEdgeComplianceRecordID string) (string, error) {
 	payload := reviewGateResolutionPayload{
 		Format: reviewGateResolutionPayloadFormat, ReviewRequestID: binding.ReviewRequestID,
 		ReviewDecisionID: decisionID, RunID: binding.RunID, StageAttemptID: binding.StageAttemptID,
+		CodeEdgeComplianceRecordID: codeEdgeComplianceRecordID,
 	}
 	if err := payload.validate(); err != nil {
 		return "", err
@@ -114,16 +125,23 @@ func (service *ReviewService) decideReviewGate(ctx context.Context, binding stor
 	if err != nil {
 		return store.ReviewDecision{}, fmt.Errorf("allocate review gate resolution job identity: %w", err)
 	}
-	payload, err := newReviewGateResolutionPayload(binding, decisionID)
-	if err != nil {
-		return store.ReviewDecision{}, err
-	}
 	run, err := service.core.store.GetWorkflowRun(ctx, binding.RunID)
 	if err != nil {
 		return store.ReviewDecision{}, err
 	}
 	if run == nil {
 		return store.ReviewDecision{}, fmt.Errorf("%w: workflow run %s", ErrLifecycleNotFound, binding.RunID)
+	}
+	codeEdgeComplianceRecordID := ""
+	if isCodeEdgePhase1Run(*run) && binding.StageKey == workflowadapter.ResultReview && binding.ReviewKind == string(workflowadapter.ReviewModelResult) && request.Action == store.ReviewDecisionApprove {
+		codeEdgeComplianceRecordID, err = store.NewUUIDv7()
+		if err != nil {
+			return store.ReviewDecision{}, fmt.Errorf("allocate CodeEdge final compliance identity: %w", err)
+		}
+	}
+	payload, err := newReviewGateResolutionPayload(binding, decisionID, codeEdgeComplianceRecordID)
+	if err != nil {
+		return store.ReviewDecision{}, err
 	}
 	stage, err := service.core.store.GetStageAttempt(ctx, binding.StageAttemptID)
 	if err != nil {

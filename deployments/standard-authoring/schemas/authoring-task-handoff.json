@@ -1,1 +1,61 @@
-{"format":"harbor.authoring-task-handoff.v1","version":"1","fields":["authoring_source_id","authoring_session_id","authoring_run_id","authoring_source_digest","task_id","task_revision_id","task_revision_digest","task_snapshot_artifact","child_template"]}
+{
+  "$id": "harbor.standard-authoring-task-handoff.v2",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "format", "version", "authoring_source_id", "authoring_session_id",
+    "authoring_run_id", "authoring_source_digest", "task_id", "revision_id",
+    "revision_digest", "task_snapshot", "admission_receipt", "child_template"
+  ],
+  "properties": {
+    "format": {"const": "harbor.standard-authoring-task-handoff.v1"},
+    "version": {"const": "2"},
+    "authoring_source_id": {"$ref": "#/$defs/uuidv7"},
+    "authoring_session_id": {"$ref": "#/$defs/uuidv7"},
+    "authoring_run_id": {"$ref": "#/$defs/uuidv7"},
+    "authoring_source_digest": {"$ref": "#/$defs/subjectDigest"},
+    "task_id": {"$ref": "#/$defs/uuidv7"},
+    "revision_id": {"$ref": "#/$defs/uuidv7"},
+    "revision_digest": {"$ref": "#/$defs/subjectDigest"},
+    "task_snapshot": {"$ref": "#/$defs/taskSnapshot"},
+    "admission_receipt": {"$ref": "#/$defs/admissionReceipt"},
+    "child_template": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"const": "harbor.codeedge-phase1"},
+        "version": {"const": "2.2.0"}
+      }
+    }
+  },
+  "$defs": {
+    "uuidv7": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "subjectDigest": {
+      "pattern": "^(?:[a-z0-9._-]+:)?sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "artifactReference": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": ["id", "content_digest", "schema_version"],
+      "properties": {
+        "id": {"$ref": "#/$defs/uuidv7"},
+        "content_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+        "schema_version": {"minLength": 1, "type": "string"}
+      }
+    },
+    "taskSnapshot": {
+      "$ref": "#/$defs/artifactReference",
+      "properties": {"schema_version": {"const": "harbor.artifact.v1"}}
+    },
+    "admissionReceipt": {
+      "$ref": "#/$defs/artifactReference",
+      "properties": {"schema_version": {"const": "harbor.standard-authoring-task-package-admission.v1"}}
+    }
+  }
+}

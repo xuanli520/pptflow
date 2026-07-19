@@ -915,8 +915,11 @@ func detailFooterText(detail *detailModel) string {
 		actions = append(actions, "[l] 日志")
 		if detail.canRetryCurrentRun() {
 			label := "重试"
-			if detail.currentRun().RetryStrategy == app.TaskBoardRetryStrategyAuthoringRecovery {
+			switch detail.currentRun().RetryStrategy {
+			case app.TaskBoardRetryStrategyAuthoringRecovery:
 				label = "恢复/重试"
+			case app.TaskBoardRetryStrategyAuthoringAdmissionRepair:
+				label = "修复并继续"
 			}
 			actions = append(actions, "[t] "+label)
 		}

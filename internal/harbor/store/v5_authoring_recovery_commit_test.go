@@ -132,6 +132,22 @@ func TestAuthoringPhase1HandoffAcceptsBriefTemplateParent(t *testing.T) {
 	}
 }
 
+func TestAuthoringPhase1HandoffAcceptsRepairFeedbackTemplateParent(t *testing.T) {
+	ctx := context.Background()
+	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringRepairFeedbackParentTemplateVersion)
+	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
+	if err != nil {
+		t.Fatalf("prepare repair-feedback-template authoring handoff: %v", err)
+	}
+	child, err := createAuthoringPhase1ChildRun(t, ctx, fixture, handoff, codeEdgePhase1ChildTemplateVersion, standardAuthoringChildTrigger)
+	if err != nil {
+		t.Fatalf("create CodeEdge child for repair-feedback-template authoring parent: %v", err)
+	}
+	if child.ParentRunID != fixture.run.ID || child.WorkflowTemplateID != codeEdgePhase1ChildTemplateID || child.WorkflowTemplateVersion != codeEdgePhase1ChildTemplateVersion {
+		t.Fatalf("created child = %+v", child)
+	}
+}
+
 func TestAuthoringPhase1HandoffRejectsRetiredAuthoringParent(t *testing.T) {
 	ctx := context.Background()
 	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, "1.0.0")
@@ -221,7 +237,9 @@ func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fi
 func prepareAuthoringRecoveryPhase1HandoffResult(t *testing.T, ctx context.Context, fixture authoringRecoveryCommitFixture) (AuthoringPhase1Handoff, error) {
 	t.Helper()
 	handoffSchemaVersion := "harbor.authoring-task-handoff.v1"
-	if fixture.run.WorkflowTemplateVersion == standardAuthoringTaskAdmissionParentTemplateVersion || fixture.run.WorkflowTemplateVersion == standardAuthoringBriefParentTemplateVersion {
+	if fixture.run.WorkflowTemplateVersion == standardAuthoringTaskAdmissionParentTemplateVersion ||
+		fixture.run.WorkflowTemplateVersion == standardAuthoringBriefParentTemplateVersion ||
+		fixture.run.WorkflowTemplateVersion == standardAuthoringRepairFeedbackParentTemplateVersion {
 		handoffSchemaVersion = "harbor.authoring-task-handoff.v2"
 	}
 	inputFingerprint := string(workflowkit.SHA256Fingerprint([]byte("authoring recovery handoff inputs")))

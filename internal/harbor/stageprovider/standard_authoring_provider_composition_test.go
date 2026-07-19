@@ -332,8 +332,15 @@ func builtinStageContract(t *testing.T, resolution workflowadapter.StageOperatio
 }
 
 func standardAuthoringTestExecutionProfile(t *testing.T) workflowadapter.ExecutionProfile {
+	return standardAuthoringTestExecutionProfileForTemplate(t, workflowadapter.StandardAuthoringTemplateReference())
+}
+
+func standardAuthoringTestExecutionProfileForTemplate(t *testing.T, reference workflowadapter.TemplateReference) workflowadapter.ExecutionProfile {
 	t.Helper()
-	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	template, err := workflowadapter.ResolveWorkflowTemplate(reference)
+	if err != nil {
+		t.Fatalf("resolve Standard authoring test template %s@%s: %v", reference.ID, reference.Version, err)
+	}
 	profile := workflowadapter.ExecutionProfile{
 		Template:                template.Reference(),
 		ID:                      "standard-authoring-lock-test",

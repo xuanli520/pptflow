@@ -136,6 +136,9 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 	if err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("parse asset manifest: %w", err)
 	}
+	if err := validateStandardAuthoringTemplateBundle(catalog.Template(), profile.Template, manifest.Template); err != nil {
+		return stageprovider.DeploymentOperationCatalogLock{}, err
+	}
 	assets := make(map[workflowkit.StageKey]stageprovider.StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))
 	for _, entry := range manifest.Operations {
 		assets[entry.StageKey] = entry.Clone()
@@ -231,6 +234,16 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 		return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("validate generated catalog lock: %w", err)
 	}
 	return lock, nil
+}
+
+func validateStandardAuthoringTemplateBundle(catalog, profile, manifest workflowadapter.TemplateReference) error {
+	if !profile.Equal(catalog) {
+		return fmt.Errorf("execution profile template %s@%s does not match catalog template %s@%s", profile.ID, profile.Version, catalog.ID, catalog.Version)
+	}
+	if !manifest.Equal(catalog) {
+		return fmt.Errorf("asset manifest template %s@%s does not match catalog template %s@%s", manifest.ID, manifest.Version, catalog.ID, catalog.Version)
+	}
+	return nil
 }
 
 func readStandardAuthoringExecutionProfile(path string) (workflowadapter.ExecutionProfile, error) {

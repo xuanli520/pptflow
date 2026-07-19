@@ -956,6 +956,9 @@ func (lock DeploymentOperationCatalogLock) Validate() error {
 		if err := lock.StandardAuthoringExecutionProfile.Validate(); err != nil {
 			return err
 		}
+		if !lock.StandardAuthoringExecutionProfile.Profile.Template.Equal(lock.CatalogReceipt.Template) {
+			return fmt.Errorf("%w: Standard authoring execution profile template does not match catalog receipt template", ErrInvalidDeploymentOperationCatalogLock)
+		}
 		if err := lock.StandardAuthoringSSHTransport.Validate(); err != nil {
 			return err
 		}
@@ -1019,7 +1022,14 @@ func (lock DeploymentOperationCatalogLock) StandardAuthoringProfile() (workflowa
 	if lock.StandardAuthoringExecutionProfile == nil {
 		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: Standard authoring execution profile is required", ErrInvalidDeploymentOperationCatalogLock)
 	}
-	return lock.StandardAuthoringExecutionProfile.ExecutionProfile()
+	profile, err := lock.StandardAuthoringExecutionProfile.ExecutionProfile()
+	if err != nil {
+		return workflowadapter.ExecutionProfile{}, err
+	}
+	if !profile.Template.Equal(lock.CatalogReceipt.Template) {
+		return workflowadapter.ExecutionProfile{}, fmt.Errorf("%w: Standard authoring execution profile template does not match catalog receipt template", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return profile, nil
 }
 
 // StandardAuthoringSSHTransportLock returns the required pre-session SSH capture

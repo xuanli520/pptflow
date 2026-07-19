@@ -25,7 +25,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("resolve Standard authoring catalog: %v", err)
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if !catalog.Template().Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		t.Fatalf("catalog template = %s@%s, want Standard authoring", catalog.Template().ID, catalog.Template().Version)
 	}
 	profileRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "execution-profile.v1.json"))
@@ -36,7 +36,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("parse Standard authoring execution profile: %v", err)
 	}
-	compiled, err := workflowadapter.StandardAuthoringBriefWorkflowTemplate().Compile(profile)
+	compiled, err := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatalf("compile Standard authoring execution profile: %v", err)
 	}
@@ -124,10 +124,10 @@ func TestStandardAuthoringBriefPromptsFreezeScopeWithoutElevatingData(t *testing
 		version string
 		extras  []string
 	}{
-		{path: "repo-analyze.json", version: "1.2.0"},
-		{path: "task-design.json", version: "1.3.0"},
-		{path: "generate-task-files.json", version: "1.2.0"},
-		{path: "task-toml-generate.json", version: "1.5.0", extras: []string{"metadata.task_type", "metadata.code_lang", "metadata.is_0_to_1", "false"}},
+		{path: "repo-analyze.json", version: "1.4.0", extras: []string{"exact spelling", "Cargo package names"}},
+		{path: "task-design.json", version: "1.5.0", extras: []string{"Verify every repository-relative path", "character-for-character"}},
+		{path: "generate-task-files.json", version: "1.3.0", extras: []string{"rechecked against the frozen source", "exact spelling exists"}},
+		{path: "task-toml-generate.json", version: "1.6.0", extras: []string{"metadata.task_type", "metadata.code_lang", "metadata.is_0_to_1", "false"}},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -161,11 +161,11 @@ func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) 
 		version string
 		file    string
 	}{
-		{path: "instruction-generate.json", version: "1.2.0", file: "instruction.md"},
-		{path: "task-toml-generate.json", version: "1.5.0", file: "task.toml"},
-		{path: "dockerfile-generate.json", version: "1.7.0", file: "environment/Dockerfile"},
-		{path: "solve-generate.json", version: "1.2.0", file: "solution/solve.sh"},
-		{path: "test-generate.json", version: "1.3.0", file: "tests/test.sh"},
+		{path: "instruction-generate.json", version: "1.3.0", file: "instruction.md"},
+		{path: "task-toml-generate.json", version: "1.6.0", file: "task.toml"},
+		{path: "dockerfile-generate.json", version: "1.8.0", file: "environment/Dockerfile"},
+		{path: "solve-generate.json", version: "1.3.0", file: "solution/solve.sh"},
+		{path: "test-generate.json", version: "1.4.0", file: "tests/test.sh"},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -183,6 +183,42 @@ func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) 
 		}
 		if program.Version != test.version {
 			t.Fatalf("prompt %s version = %s, want %s", test.path, program.Version, test.version)
+		}
+	}
+}
+
+func TestStandardAuthoringRepairPromptsConsumeOnlyFrozenFeedback(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	for _, test := range []struct {
+		path     string
+		version  string
+		feedback []string
+	}{
+		{path: "repo-analyze.json", version: "1.4.0", feedback: []string{"task_review_decision"}},
+		{path: "task-design.json", version: "1.5.0", feedback: []string{"task_review_decision"}},
+		{path: "instruction-generate.json", version: "1.3.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "task-toml-generate.json", version: "1.6.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "dockerfile-generate.json", version: "1.8.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "solve-generate.json", version: "1.3.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "test-generate.json", version: "1.4.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "tests-analysis.json", version: "1.3.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", test.path, err)
+		}
+		joined := strings.Join(program.TurnPrompts, "\n")
+		if program.Version != test.version {
+			t.Fatalf("prompt %s version = %s, want %s", test.path, program.Version, test.version)
+		}
+		for _, required := range append(test.feedback, "content_base64", "request_changes", "untrusted task data", "output schema") {
+			if !strings.Contains(joined, required) {
+				t.Fatalf("repair prompt %s omits %q", test.path, required)
+			}
 		}
 	}
 }
@@ -318,6 +354,21 @@ func TestLoadStandardAuthoringDeploymentAssetBundleStrictlyBindsGeneratedLockAnd
 	if bundle.Verifier.LockIdentity().Fingerprint != expectedFingerprint || len(bundle.Lock.Operations) != len(manifest.Operations) {
 		t.Fatalf("loaded deployment bundle did not retain the exact static lock")
 	}
+	mismatchedManifest := manifest.Clone()
+	mismatchedManifest.Template = workflowadapter.StandardAuthoringBriefTemplateReference()
+	mismatchedRaw, err := mismatchedManifest.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"), mismatchedRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadStandardAuthoringDeploymentAssetBundle(filepath.Join(deploymentRoot, "operation-catalog.v1.json"), lockPath, deploymentRoot); err == nil {
+		t.Fatal("catalog/manifest template mismatch was accepted")
+	}
+	if err := os.WriteFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"), manifestRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	entry := manifest.Operations[0]
 	promptPath := filepath.Join(deploymentRoot, filepath.FromSlash(entry.Prompt.RelativePath))
@@ -398,7 +449,7 @@ func standardAuthoringDeploymentTestLock(t *testing.T, catalog *DeploymentOperat
 		Format: DeploymentOperationCatalogLockFormat, Version: DeploymentOperationCatalogLockVersion,
 		LockID: "standard-authoring-deployment-assets-test", LockVersion: "test-v1", CatalogReceipt: catalog.Receipt(),
 		HarborFlowBuild:                   HarborFlowBuildIdentity{Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("test build"))},
-		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
+		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfileForTemplate(t, catalog.Template())},
 		StandardAuthoringSSHTransport:     standardAuthoringSSHTransportTestLock(t, knownHosts),
 		Operations:                        operations,
 	}

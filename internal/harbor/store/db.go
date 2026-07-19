@@ -32,12 +32,14 @@ const (
 	baselineV2SchemaContractMetadataKey = "schema_contract_fingerprint"
 	baselineV2SchemaContractDomain      = "harbor.store.consolidated-v2-schema-contract.v1"
 
-	// These are the two previously published consolidated V2 schemas whose
-	// Standard authoring handoff trigger bound only 1.2/v1 or 1.2/v1+1.3/v2.
+	// These are the previously published consolidated V2 schemas whose Standard
+	// authoring handoff trigger predates one or more currently accepted template
+	// versions.
 	// They are admitted only for the atomic upgrade below; unknown fingerprints
 	// remain rejected.
 	legacyV12ConsolidatedV2SchemaContractFingerprint = "sha256:db935bd40f92f0d7a9ae4d432b568f5987aebe4d41a5d66f90c55d3fafc53f0b"
 	legacyV13ConsolidatedV2SchemaContractFingerprint = "sha256:dcb8391fa99e349def515fbeec9e4b193f4b1875898a9c61806230a767e5f2bc"
+	legacyV14ConsolidatedV2SchemaContractFingerprint = "sha256:5d795149bc1950bacf0bb8b4d284902f677ec8a9a5f48a8a967ac3b0209306af"
 	authoringPhase1HandoffTriggerName                = "authoring_phase1_handoffs_v2_binding_insert"
 )
 
@@ -633,7 +635,7 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) e
 }
 
 // upgradeLegacyConsolidatedV2Schema repairs the published V2 contracts that
-// predate the 1.4/v2 Standard authoring handoff. The trigger replacement and
+// predate the current Standard authoring handoff. The trigger replacement and
 // contract marker update are one transaction, so an interrupted startup leaves
 // the old, internally consistent schema for the next attempt. No unknown
 // schema is admitted here.
@@ -679,7 +681,8 @@ func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 
 func isKnownLegacyConsolidatedV2SchemaContract(fingerprint string) bool {
 	switch fingerprint {
-	case legacyV12ConsolidatedV2SchemaContractFingerprint, legacyV13ConsolidatedV2SchemaContractFingerprint:
+	case legacyV12ConsolidatedV2SchemaContractFingerprint, legacyV13ConsolidatedV2SchemaContractFingerprint,
+		legacyV14ConsolidatedV2SchemaContractFingerprint:
 		return true
 	default:
 		return false

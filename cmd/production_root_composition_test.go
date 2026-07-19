@@ -54,7 +54,7 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 	wantTemplates := []workflowadapter.TemplateReference{
 		workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
 		workflowadapter.CodeEdgePhase1TemplateReference(),
-		workflowadapter.StandardAuthoringBriefTemplateReference(),
+		workflowadapter.StandardAuthoringRepairFeedbackTemplateReference(),
 	}
 	if got := router.Templates(); !reflect.DeepEqual(got, wantTemplates) {
 		t.Fatalf("installed production template bundles = %#v, want %#v", got, wantTemplates)
@@ -84,7 +84,7 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 	}{
 		{
 			name:     "Standard authoring",
-			template: workflowadapter.StandardAuthoringBriefTemplateReference(),
+			template: workflowadapter.StandardAuthoringRepairFeedbackTemplateReference(),
 			record:   fixture.standardLock.Operations[0],
 			wrong:    workflowadapter.CodeEdgePhase1TemplateReference(),
 		},

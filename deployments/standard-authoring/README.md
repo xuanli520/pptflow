@@ -1,7 +1,7 @@
 # Standard Authoring Deployment Contract
 
 This directory is the source-controlled deployment input for the closed
-`harbor.standard-authoring@1.4.0` workflow. It creates a first task from an
+`harbor.standard-authoring@1.5.0` workflow. It creates a first task from an
 immutable `AuthoringSource` / `AuthoringSession`; it does not pretend that the
 source session is already a `TaskRevision`.
 
@@ -63,21 +63,23 @@ its atomic commit boundary.
 
 `materialize_task` is the sole Go-controlled operation allowed to atomically
 create the first Task and TaskRevision. It emits
-`authoring_task_handoff` (`harbor.authoring-task-handoff.v1`) and terminates
+`authoring_task_handoff` (`harbor.authoring-task-handoff.v1`, document version
+`2`) with the immutable `admission_receipt` artifact reference and terminates
 the source-bound Run. A separate task-bound
 `harbor.codeedge-phase1@2.2.0` Run owns subsequent verification, evaluator
 handoff, compliance, and local packaging.
 
 ## Version boundary
 
-The immutable authoring brief is an execution-contract change, so the current
-workflow is `harbor.standard-authoring@1.4.0`. The `@1.2.0` environment-policy
-contract and `@1.3.0` task-admission contract remain registered only for
-strict historical identity and parsing; neither may be executed or
-reinterpreted as a 1.4 Run by this release.
+Durable review-feedback inputs are an execution-contract change, so the current
+workflow is `harbor.standard-authoring@1.5.0`. The `@1.2.0` environment-policy,
+`@1.3.0` task-admission, and `@1.4.0` immutable-brief contracts remain
+registered only for strict historical identity and parsing; none may be
+executed or reinterpreted as a 1.5 Run by this release.
 Existing records remain immutable audit history and must be handled by the
-release that owns their frozen deployment contract. Install 1.4 with a fresh
-managed control-plane root rather than upgrading an active 1.2 or 1.3 root.
+release that owns their frozen deployment contract. Install 1.5 with a fresh
+managed control-plane root rather than upgrading an active 1.2, 1.3, or 1.4
+root.
 
 ## Frozen task environment policy
 

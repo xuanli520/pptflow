@@ -120,8 +120,33 @@ func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T
 	if err != nil {
 		t.Fatalf("read production Standard authoring execution profile asset: %v", err)
 	}
-	if !profile.Template.Equal(workflowadapter.StandardAuthoringBriefTemplateReference()) {
+	if !profile.Template.Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
 		t.Fatalf("production execution profile template = %s@%s", profile.Template.ID, profile.Template.Version)
+	}
+}
+
+func TestValidateStandardAuthoringTemplateBundleRequiresExactVersion(t *testing.T) {
+	catalog := workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()
+	profile := catalog
+	manifest := catalog
+	if err := validateStandardAuthoringTemplateBundle(catalog, profile, manifest); err != nil {
+		t.Fatalf("matching Standard authoring template bundle rejected: %v", err)
+	}
+	for name, candidate := range map[string]workflowadapter.TemplateReference{
+		"profile":  workflowadapter.StandardAuthoringBriefTemplateReference(),
+		"manifest": workflowadapter.StandardAuthoringBriefTemplateReference(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidateProfile, candidateManifest := profile, manifest
+			if name == "profile" {
+				candidateProfile = candidate
+			} else {
+				candidateManifest = candidate
+			}
+			if err := validateStandardAuthoringTemplateBundle(catalog, candidateProfile, candidateManifest); err == nil {
+				t.Fatalf("template mismatch for %s was accepted", name)
+			}
+		})
 	}
 }
 

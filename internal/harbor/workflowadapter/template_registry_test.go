@@ -15,6 +15,7 @@ func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T
 		StandardAuthoringTemplateReference(),
 		StandardAuthoringTaskAdmissionTemplateReference(),
 		StandardAuthoringBriefTemplateReference(),
+		StandardAuthoringRepairFeedbackTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	} {

@@ -504,6 +504,72 @@ func TestAppModelRoutesAuthoringRecoveryThroughRetryAndRetainsItsIdempotencyKey(
 	}
 }
 
+func TestAppModelRequestsAuthoringChangesThenDispatchesRepairContinuation(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].RunStatus = "waiting_review"
+	snapshot.Tasks[0].Runs[0].Status = "waiting_review"
+	snapshot.Tasks[0].Runs[0].CurrentStage = "task_review"
+	snapshot.Tasks[0].Runs[0].CanRetry = false
+	stub := &taskBoardGatewayStub{snapshot: snapshot}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	updated, _ := model.handleKey(keyRune('r'), nil)
+	model = updated.(appModel)
+	if model.review == nil || model.review.decision != app.TaskBoardRequestChanges {
+		t.Fatalf("request-changes prompt = %+v", model.review)
+	}
+	model.review.reasonInput.SetValue("correct the generated tower-http paths")
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardReviewMutation || command == nil {
+		t.Fatalf("request-changes start = active:%q command:%v", model.activeMutation, command)
+	}
+	decision := command().(taskBoardMutationMsg)
+	if len(stub.decisionRequests) != 1 || stub.decisionRequests[0].Decision != app.TaskBoardRequestChanges ||
+		stub.decisionRequests[0].Reason != "correct the generated tower-http paths" {
+		t.Fatalf("request-changes dispatch = %+v", stub.decisionRequests)
+	}
+	updated, _ = model.Update(decision)
+	model = updated.(appModel)
+
+	stub.snapshot.Tasks[0].Review = nil
+	stub.snapshot.Tasks[0].Column = app.TaskBoardRunning
+	stub.snapshot.Tasks[0].RunStatus = "waiting_continuation"
+	stub.snapshot.Tasks[0].Runs[0].Status = "waiting_continuation"
+	stub.snapshot.Tasks[0].Runs[0].CanRetry = true
+	stub.snapshot.Tasks[0].Runs[0].RetryReason = ""
+	stub.snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringAdmissionRepair
+	updated, _ = model.Update(taskBoardLoadedMsg{snapshot: stub.snapshot, epoch: model.refreshEpoch})
+	model = updated.(appModel)
+	model.board.MoveRight()
+	selected := model.board.SelectedTask()
+	if selected == nil {
+		t.Fatal("waiting-continuation task was not projected into the running column")
+	}
+	model.detail = newDetailModel(selected)
+	if footer := detailFooterText(model.detail); !strings.Contains(footer, "[t] 修复并继续") {
+		t.Fatalf("repair continuation footer = %q", footer)
+	}
+
+	updated, _ = model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	if model.action == nil || model.action.kind != taskBoardRetryAction || model.action.strategy != app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
+		t.Fatalf("repair continuation prompt = %+v", model.action)
+	}
+	model.action.reasonInput.SetValue("regenerate with the review feedback")
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardRetryMutation || command == nil {
+		t.Fatalf("repair continuation start = active:%q command:%v", model.activeMutation, command)
+	}
+	_ = command().(taskBoardMutationMsg)
+	if len(stub.retryRequests) != 1 || stub.retryRequests[0].TaskID != "task-1" || stub.retryRequests[0].RunID != "run-1" ||
+		stub.retryRequests[0].Reason != "regenerate with the review feedback" {
+		t.Fatalf("repair continuation dispatch = %+v", stub.retryRequests)
+	}
+}
+
 func TestAppDetailAndLogViewsFitTheWindow(t *testing.T) {
 	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
 	model := loadedTaskBoardModel(t, stub)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -94,10 +95,24 @@ type authoringRecoveryBinding struct {
 // derive retry targets. A command is first prepared from one assessment, then
 // assessed again after persistence before its plan can be frozen.
 type authoringRecoveryAssessment struct {
-	binding                authoringRecoveryBinding
-	state                  continuationRunState
+	binding                 authoringRecoveryBinding
+	state                   continuationRunState
+	targetNodeIDs           []workflowkit.NodeID
+	failureStageAttemptIDs  []string
+	requiredScheduledInputs map[workflowkit.NodeID][]workflowkit.ArtifactBinding
+}
+
+type authoringRecoverySelection struct {
 	targetNodeIDs          []workflowkit.NodeID
 	failureStageAttemptIDs []string
+	feedback               []authoringRecoveryFeedback
+}
+
+type authoringRecoveryFeedback struct {
+	artifactName    string
+	reviewKind      string
+	attemptID       string
+	consumerNodeIDs []workflowkit.NodeID
 }
 
 // CurrentCheckpoint returns the source/session checkpoint required to resume
@@ -259,6 +274,16 @@ func (service *AuthoringRecoveryService) ExecuteAuthoringRecovery(ctx context.Co
 	if err := matchAuthoringRecoveryCommandBinding(persisted, binding); err != nil {
 		return store.ContinuationExecution{}, err
 	}
+	runtimePlan, err := continuationRuntimeExecutionPlan(plan, binding.frozen.Workflow, binding.frozen.QuotaPolicy, "")
+	if err != nil {
+		return store.ContinuationExecution{}, err
+	}
+	// The plan may outlive an object-store entry. Re-prove every binding frozen
+	// specifically for this continuation immediately before advancing the Run
+	// epoch and publishing its durable execution job.
+	if err := validateRequiredContinuationInputs(ctx, service.core, binding.run, runtimePlan); err != nil {
+		return store.ContinuationExecution{}, fmt.Errorf("%w: frozen recovery inputs changed after planning: %v", ErrAuthoringRecoveryUnavailable, err)
+	}
 	commit, err := service.core.store.CommitAuthoringRecoveryExecution(ctx, store.CommitAuthoringRecoveryExecutionRequest{
 		CommitContinuationExecutionRequest: store.CommitContinuationExecutionRequest{
 			PlanID: snapshot.PlanID, RunID: snapshot.SourceRunID, IdempotencyKey: executionKey,
@@ -324,15 +349,20 @@ func (service *AuthoringRecoveryService) assessRecoverableBinding(ctx context.Co
 	if state.InDoubt {
 		return authoringRecoveryAssessment{}, fmt.Errorf("%w: workflow run %s has unresolved stage or node evidence", store.ErrContinuationReconciliationRequired, binding.run.ID)
 	}
-	targets, failures, err := authoringRecoveryTargets(binding.run, binding.frozen.Workflow, state)
+	selection, err := authoringRecoveryTargets(binding.run, binding.frozen.Workflow, state)
+	if err != nil {
+		return authoringRecoveryAssessment{}, err
+	}
+	requiredScheduledInputs, err := service.authoringRecoveryRequiredScheduledInputs(ctx, binding, selection)
 	if err != nil {
 		return authoringRecoveryAssessment{}, err
 	}
 	return authoringRecoveryAssessment{
-		binding:                binding,
-		state:                  state,
-		targetNodeIDs:          targets,
-		failureStageAttemptIDs: failures,
+		binding:                 binding,
+		state:                   state,
+		targetNodeIDs:           selection.targetNodeIDs,
+		failureStageAttemptIDs:  selection.failureStageAttemptIDs,
+		requiredScheduledInputs: requiredScheduledInputs,
 	}, nil
 }
 
@@ -347,7 +377,7 @@ func (service *AuthoringRecoveryService) buildPlan(command normalizedAuthoringRe
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, fmt.Errorf("allocate authoring recovery plan ID: %w", err)
 	}
-	snapshot, err := buildAuthoringRecoveryPlan(planID, commandID, command, assessment.binding.run, assessment.binding.subject, assessment.binding.frozen.Workflow, assessment.state, invalidation, service.core.now().UTC().Add(assessment.binding.frozen.ContinuationPlanTTL))
+	snapshot, err := buildAuthoringRecoveryPlan(planID, commandID, command, assessment.binding.run, assessment.binding.subject, assessment.binding.frozen.Workflow, assessment.state, invalidation, assessment.requiredScheduledInputs, service.core.now().UTC().Add(assessment.binding.frozen.ContinuationPlanTTL))
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, err
 	}
@@ -442,7 +472,7 @@ func (service *AuthoringRecoveryService) ensureRecoverableBinding(ctx context.Co
 	switch binding.run.Status {
 	case store.WorkflowRunFailedRecoverable, store.WorkflowRunPaused:
 	case store.WorkflowRunWaitingContinuation:
-		if binding.run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringBriefTemplateVersion {
+		if binding.run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion {
 			return fmt.Errorf("%w: workflow run %s is %s; legacy authoring admission failures require an explicit new task revision", ErrAuthoringRecoveryUnavailable, binding.run.ID, binding.run.Status)
 		}
 	default:
@@ -592,28 +622,26 @@ func matchAuthoringRecoveryIntent(request normalizedAuthoringRecoveryCommand, pe
 	return nil
 }
 
-func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState) ([]workflowkit.NodeID, []string, error) {
+func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState) (authoringRecoverySelection, error) {
+	repairSelection, err := activeAuthoringRepairSelection(workflow, state)
+	if err != nil {
+		return authoringRecoverySelection{}, err
+	}
 	if run.Status == store.WorkflowRunWaitingContinuation {
-		admission := workflowkit.NodeID(workflowadapter.CodeEdgePackageAdmission)
-		latest, present := state.Latest[admission]
-		if !present || latest.ExecutionStatus != store.StageExecutionCompleted || latest.Verdict != store.VerdictNeedsRepair {
-			return nil, nil, fmt.Errorf("%w: waiting authoring Run is %s and has no admission needs_repair result", ErrAuthoringRecoveryUnavailable, run.Status)
+		if len(repairSelection.feedback) == 0 {
+			return authoringRecoverySelection{}, fmt.Errorf("%w: waiting authoring Run is %s and has no supported needs_repair result", ErrAuthoringRecoveryUnavailable, run.Status)
 		}
-		// These are the only independent producers of the deterministic admission
-		// findings. Their descendants, including admission and review, are
-		// invalidated by the normal frozen DAG planner.
-		return []workflowkit.NodeID{
-			workflowkit.NodeID(workflowadapter.TaskTOMLGen),
-			workflowkit.NodeID(workflowadapter.DockerfileGen),
-			workflowkit.NodeID(workflowadapter.TestsAnalysis),
-		}, []string{latest.ID}, nil
+		return repairSelection, nil
 	}
 	order, err := workflow.TopologicalStages()
 	if err != nil {
-		return nil, nil, err
+		return authoringRecoverySelection{}, err
 	}
-	targets := make([]workflowkit.NodeID, 0)
-	failures := make([]string, 0)
+	targetSet := make(map[workflowkit.NodeID]struct{}, len(repairSelection.targetNodeIDs))
+	for _, target := range repairSelection.targetNodeIDs {
+		targetSet[target] = struct{}{}
+	}
+	failures := append([]string(nil), repairSelection.failureStageAttemptIDs...)
 	for _, nodeID := range order {
 		latest, exists := state.Latest[nodeID]
 		if !exists {
@@ -623,38 +651,232 @@ func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.Workfl
 		case store.StageExecutionInfraFailed:
 			stage, found := workflow.Stage(nodeID)
 			if !found || !stage.Retry.Allows(workflowkit.FailureClass(latest.FailureClass)) {
-				return nil, nil, fmt.Errorf("%w: frozen retry policy does not allow %s failure for stage %q", ErrAuthoringRecoveryUnavailable, latest.FailureClass, nodeID)
+				return authoringRecoverySelection{}, fmt.Errorf("%w: frozen retry policy does not allow %s failure for stage %q", ErrAuthoringRecoveryUnavailable, latest.FailureClass, nodeID)
 			}
-			targets = append(targets, nodeID)
+			targetSet[nodeID] = struct{}{}
 			failures = append(failures, latest.ID)
 		case store.StageExecutionInterrupted, store.StageExecutionCanceled:
-			targets = append(targets, nodeID)
+			targetSet[nodeID] = struct{}{}
 			failures = append(failures, latest.ID)
 		case store.StageExecutionQueued, store.StageExecutionRunning:
 			if run.Status == store.WorkflowRunPaused {
-				targets = append(targets, nodeID)
+				targetSet[nodeID] = struct{}{}
 				failures = append(failures, latest.ID)
 			}
 		}
 	}
-	if len(targets) == 0 && (run.Status == store.WorkflowRunFailedRecoverable || run.Status == store.WorkflowRunPaused) {
+	if len(targetSet) == 0 && (run.Status == store.WorkflowRunFailedRecoverable || run.Status == store.WorkflowRunPaused) {
 		// A failure or pause can occur before a StageAttempt is persisted. The
 		// source root is the only deterministic safe restart point.
 		if len(order) == 0 {
-			return nil, nil, fmt.Errorf("%w: frozen authoring workflow has no stages", ErrAuthoringRecoveryUnavailable)
+			return authoringRecoverySelection{}, fmt.Errorf("%w: frozen authoring workflow has no stages", ErrAuthoringRecoveryUnavailable)
 		}
-		targets = append(targets, order[0])
+		targetSet[order[0]] = struct{}{}
 	}
-	if len(targets) == 0 {
-		return nil, nil, fmt.Errorf("%w: no failed or paused authoring stage", ErrAuthoringRecoveryUnavailable)
+	if len(targetSet) == 0 {
+		return authoringRecoverySelection{}, fmt.Errorf("%w: no failed or paused authoring stage", ErrAuthoringRecoveryUnavailable)
+	}
+	targets := make([]workflowkit.NodeID, 0, len(targetSet))
+	for _, nodeID := range order {
+		if _, selected := targetSet[nodeID]; selected {
+			targets = append(targets, nodeID)
+		}
 	}
 	for _, nodeID := range targets {
 		stage, found := workflow.Stage(nodeID)
 		if !found || stage.OperatorOnly() {
-			return nil, nil, fmt.Errorf("%w: authoring recovery target %q is not automatically dispatchable", ErrAuthoringRecoveryUnavailable, nodeID)
+			return authoringRecoverySelection{}, fmt.Errorf("%w: authoring recovery target %q is not automatically dispatchable", ErrAuthoringRecoveryUnavailable, nodeID)
 		}
 	}
-	return targets, failures, nil
+	repairSelection.targetNodeIDs = targets
+	repairSelection.failureStageAttemptIDs = failures
+	return repairSelection, nil
+}
+
+func activeAuthoringRepairSelection(workflow workflowkit.WorkflowDescriptor, state continuationRunState) (authoringRecoverySelection, error) {
+	producers := []workflowkit.NodeID{
+		workflowkit.NodeID(workflowadapter.InstructionGen),
+		workflowkit.NodeID(workflowadapter.TaskTOMLGen),
+		workflowkit.NodeID(workflowadapter.DockerfileGen),
+		workflowkit.NodeID(workflowadapter.SolveGen),
+		workflowkit.NodeID(workflowadapter.TestGen),
+		workflowkit.NodeID(workflowadapter.TestsAnalysis),
+	}
+	repairs := []struct {
+		blocker      workflowkit.NodeID
+		reviewKind   workflowadapter.ReviewKind
+		artifactName string
+		targets      []workflowkit.NodeID
+	}{
+		{
+			blocker: workflowkit.NodeID(workflowadapter.TaskReview), reviewKind: workflowadapter.ReviewTaskDirection, artifactName: "task_review_decision",
+			targets: []workflowkit.NodeID{workflowkit.NodeID(workflowadapter.RepoAnalyze), workflowkit.NodeID(workflowadapter.TaskDesign)},
+		},
+		{
+			blocker: workflowkit.NodeID(workflowadapter.ContentReview), reviewKind: workflowadapter.ReviewContent, artifactName: "content_review_decision",
+			targets: []workflowkit.NodeID{
+				workflowkit.NodeID(workflowadapter.InstructionGen),
+				workflowkit.NodeID(workflowadapter.TaskTOMLGen),
+				workflowkit.NodeID(workflowadapter.DockerfileGen),
+			},
+		},
+		{
+			blocker: workflowkit.NodeID(workflowadapter.CodeEdgePackageAdmission), artifactName: "codeedge_package_admission_report",
+			targets: append([]workflowkit.NodeID(nil), producers...),
+		},
+		{
+			blocker: workflowkit.NodeID(workflowadapter.SolutionReview), reviewKind: workflowadapter.ReviewSolutionVerifier, artifactName: "solution_review_decision",
+			targets: append([]workflowkit.NodeID(nil), producers...),
+		},
+	}
+	targetSet := make(map[workflowkit.NodeID]struct{})
+	selection := authoringRecoverySelection{}
+	for _, repair := range repairs {
+		latest, present := state.Latest[repair.blocker]
+		if present && latest.ExecutionStatus == store.StageExecutionCompleted && latest.Verdict == store.VerdictNeedsRepair {
+			selection.failureStageAttemptIDs = append(selection.failureStageAttemptIDs, latest.ID)
+			selection.feedback = append(selection.feedback, authoringRecoveryFeedback{
+				artifactName: repair.artifactName, reviewKind: string(repair.reviewKind), attemptID: latest.ID,
+				consumerNodeIDs: append([]workflowkit.NodeID(nil), repair.targets...),
+			})
+			for _, target := range repair.targets {
+				targetSet[target] = struct{}{}
+			}
+		}
+	}
+	order, err := workflow.TopologicalStages()
+	if err != nil {
+		return authoringRecoverySelection{}, err
+	}
+	for _, nodeID := range order {
+		if _, selected := targetSet[nodeID]; selected {
+			selection.targetNodeIDs = append(selection.targetNodeIDs, nodeID)
+		}
+	}
+	return selection, nil
+}
+
+func (service *AuthoringRecoveryService) authoringRecoveryRequiredScheduledInputs(ctx context.Context, binding authoringRecoveryBinding, selection authoringRecoverySelection) (map[workflowkit.NodeID][]workflowkit.ArtifactBinding, error) {
+	if len(selection.feedback) == 0 {
+		return nil, nil
+	}
+	required := make(map[workflowkit.NodeID][]workflowkit.ArtifactBinding)
+	for _, repair := range selection.feedback {
+		if repair.artifactName == "" || repair.attemptID == "" || len(repair.consumerNodeIDs) == 0 {
+			return nil, fmt.Errorf("%w: repair feedback selection is incomplete", ErrAuthoringRecoveryUnavailable)
+		}
+		var frozenFeedback workflowkit.ArtifactBinding
+		for _, nodeID := range repair.consumerNodeIDs {
+			stage, found := binding.frozen.Workflow.Stage(nodeID)
+			if !found || stage.OperatorOnly() {
+				return nil, fmt.Errorf("%w: repair feedback consumer %q is unavailable", ErrAuthoringRecoveryUnavailable, nodeID)
+			}
+			declared := false
+			for _, input := range stage.Inputs {
+				if input.Name == repair.artifactName {
+					if input.Required {
+						return nil, fmt.Errorf("%w: repair feedback input %q on stage %q is not optional", ErrAuthoringRecoveryUnavailable, input.Name, nodeID)
+					}
+					declared = true
+					break
+				}
+			}
+			if !declared {
+				return nil, fmt.Errorf("%w: stage %q does not declare repair feedback input %q", ErrAuthoringRecoveryUnavailable, nodeID, repair.artifactName)
+			}
+			inputs, err := resolveStageInputsForSubject(ctx, service.core.store, service.core.objects, binding.run, binding.subject, stage)
+			if err != nil {
+				return nil, fmt.Errorf("%w: resolve repair feedback for stage %q: %v", ErrAuthoringRecoveryUnavailable, nodeID, err)
+			}
+			var feedback workflowkit.ArtifactBinding
+			for _, input := range inputs {
+				if input.Name == repair.artifactName {
+					feedback = input
+					break
+				}
+			}
+			if feedback.Name == "" {
+				return nil, fmt.Errorf("%w: stage %q lacks immutable repair feedback %q", ErrAuthoringRecoveryUnavailable, nodeID, repair.artifactName)
+			}
+			reference, err := service.core.store.GetArtifactRef(ctx, string(feedback.ArtifactID))
+			if err != nil {
+				return nil, err
+			}
+			if reference == nil || reference.AttemptID != repair.attemptID || reference.ArtifactKey != repair.artifactName {
+				return nil, fmt.Errorf("%w: repair feedback %q does not come from the selected needs_repair attempt", ErrAuthoringRecoveryUnavailable, repair.artifactName)
+			}
+			if frozenFeedback.Name == "" {
+				reader := newStageInputReaderForSubject(service.core.store, service.core.objects, binding.run, binding.subject, []workflowkit.ArtifactBinding{feedback})
+				raw, err := reader(ctx, feedback)
+				if err != nil {
+					return nil, fmt.Errorf("%w: read repair feedback %q: %v", ErrAuthoringRecoveryUnavailable, repair.artifactName, err)
+				}
+				if err := service.validateAuthoringRecoveryFeedback(ctx, binding, repair, raw); err != nil {
+					return nil, err
+				}
+				frozenFeedback = feedback
+			} else if feedback != frozenFeedback {
+				return nil, fmt.Errorf("%w: repair feedback binding differs across scheduled consumers", ErrAuthoringRecoveryUnavailable)
+			}
+			required[nodeID] = append(required[nodeID], feedback)
+		}
+	}
+	for nodeID := range required {
+		sort.Slice(required[nodeID], func(left, right int) bool { return required[nodeID][left].Name < required[nodeID][right].Name })
+	}
+	return required, nil
+}
+
+func (service *AuthoringRecoveryService) validateAuthoringRecoveryFeedback(ctx context.Context, binding authoringRecoveryBinding, repair authoringRecoveryFeedback, raw []byte) error {
+	if repair.artifactName == "codeedge_package_admission_report" {
+		var receipt standardAuthoringAdmissionReceipt
+		if err := decodeStrictJSON(string(raw), &receipt); err != nil {
+			return fmt.Errorf("%w: decode package-admission repair feedback: %v", ErrAuthoringRecoveryUnavailable, err)
+		}
+		attempt, err := service.core.store.GetStageAttempt(ctx, repair.attemptID)
+		if err != nil {
+			return err
+		}
+		if receipt.Format != standardAuthoringAdmissionReceiptFormat || receipt.Version != standardAuthoringAdmissionReceiptVersion ||
+			receipt.RunID != binding.run.ID || binding.subject.AuthoringSource == nil || binding.subject.AuthoringSession == nil ||
+			receipt.AuthoringSourceID != binding.subject.AuthoringSource.ID || receipt.AuthoringSessionID != binding.subject.AuthoringSession.ID ||
+			receipt.Report.Passed || len(receipt.Report.Violations) == 0 || attempt == nil || attempt.RunID != binding.run.ID ||
+			attempt.StageKey != workflowadapter.CodeEdgePackageAdmission || attempt.ExecutionStatus != store.StageExecutionCompleted ||
+			attempt.Verdict != store.VerdictNeedsRepair || attempt.InputFingerprint != string(receipt.InputFingerprint) {
+			return fmt.Errorf("%w: package-admission repair feedback is not a bound failed report", ErrAuthoringRecoveryUnavailable)
+		}
+		return nil
+	}
+	var decision authoringReviewGateDecisionArtifact
+	if err := decodeStrictJSON(string(raw), &decision); err != nil {
+		return fmt.Errorf("%w: decode review repair feedback: %v", ErrAuthoringRecoveryUnavailable, err)
+	}
+	if decision.Format != authoringReviewGateDecisionArtifactFormat || decision.Action != store.ReviewDecisionRequestChanges ||
+		binding.subject.AuthoringSource == nil || binding.subject.AuthoringSession == nil ||
+		decision.AuthoringSourceID != binding.subject.AuthoringSource.ID || decision.AuthoringSessionID != binding.subject.AuthoringSession.ID ||
+		decision.SourceSnapshotDigest != binding.subject.subjectDigest() || decision.ReviewKind != repair.reviewKind ||
+		strings.TrimSpace(decision.DecisionReason) == "" {
+		return fmt.Errorf("%w: review repair feedback is not a bound request_changes decision", ErrAuthoringRecoveryUnavailable)
+	}
+	gate, err := service.core.store.GetAuthoringReviewGateBindingByStageAttempt(ctx, repair.attemptID)
+	if err != nil {
+		return err
+	}
+	if gate == nil || gate.RunID != binding.run.ID || gate.StageAttemptID != repair.attemptID || gate.ReviewKind != repair.reviewKind ||
+		gate.ReviewRequestID != decision.ReviewRequestID || gate.AuthoringSourceID != decision.AuthoringSourceID ||
+		gate.AuthoringSessionID != decision.AuthoringSessionID || gate.SourceSnapshotDigest != decision.SourceSnapshotDigest ||
+		gate.EvidenceManifestDigest != decision.EvidenceManifestDigest || gate.InputFingerprint != decision.InputFingerprint {
+		return fmt.Errorf("%w: review repair feedback differs from its durable gate binding", ErrAuthoringRecoveryUnavailable)
+	}
+	decisions, err := service.core.store.ListAuthoringReviewDecisionsForRequest(ctx, gate.ReviewRequestID)
+	if err != nil {
+		return err
+	}
+	if len(decisions) != 1 || decisions[0].ID != decision.ReviewDecisionID || decisions[0].BindingID != gate.ID ||
+		decisions[0].Action != decision.Action || decisions[0].Actor != decision.DecisionActor || decisions[0].Reason != decision.DecisionReason {
+		return fmt.Errorf("%w: review repair feedback differs from its durable operator decision", ErrAuthoringRecoveryUnavailable)
+	}
+	return nil
 }
 
 func validatePersistedAuthoringRecoveryTargets(command normalizedAuthoringRecoveryCommand, assessment authoringRecoveryAssessment) error {
@@ -674,6 +896,6 @@ func validatePersistedAuthoringRecoveryTargets(command normalizedAuthoringRecove
 	return nil
 }
 
-func buildAuthoringRecoveryPlan(planID, commandID string, command normalizedAuthoringRecoveryCommand, run store.WorkflowRun, subject workflowRunSubject, workflow workflowkit.WorkflowDescriptor, state continuationRunState, invalidation workflowkit.InvalidationPlan, expiresAt time.Time) (workflowkit.ContinuationPlanSnapshot, error) {
-	return buildSameRunContinuationPlan(planID, commandID, continuationPlanInput{Expected: command.Expected}, run, subject.subjectRevisionID(), workflowkit.SubjectDigest(subject.subjectDigest()), workflow, state, invalidation, command.TargetNodeIDs, workflowkit.StrategyRetryAttempt, expiresAt, true)
+func buildAuthoringRecoveryPlan(planID, commandID string, command normalizedAuthoringRecoveryCommand, run store.WorkflowRun, subject workflowRunSubject, workflow workflowkit.WorkflowDescriptor, state continuationRunState, invalidation workflowkit.InvalidationPlan, requiredScheduledInputs map[workflowkit.NodeID][]workflowkit.ArtifactBinding, expiresAt time.Time) (workflowkit.ContinuationPlanSnapshot, error) {
+	return buildSameRunContinuationPlan(planID, commandID, continuationPlanInput{Expected: command.Expected, RequiredScheduledInputs: requiredScheduledInputs}, run, subject.subjectRevisionID(), workflowkit.SubjectDigest(subject.subjectDigest()), workflow, state, invalidation, command.TargetNodeIDs, workflowkit.StrategyRetryAttempt, expiresAt, true)
 }

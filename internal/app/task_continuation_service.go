@@ -1042,6 +1042,7 @@ func isContentChangingStage(stage workflowkit.StageDescriptor) bool {
 type continuationPlanInput struct {
 	Expected                    workflowkit.CheckpointRef
 	ExternalEffectConfirmations []workflowkit.ExternalEffectConfirmation
+	RequiredScheduledInputs     map[workflowkit.NodeID][]workflowkit.ArtifactBinding
 }
 
 func buildNoChangeContinuationPlan(planID, commandID string, command normalizedContinuationCommand, run store.WorkflowRun, revision store.TaskRevision, workflow workflowkit.WorkflowDescriptor, state continuationRunState, invalidation workflowkit.InvalidationPlan, targets []workflowkit.NodeID, strategy workflowkit.ContinuationStrategy, expiresAt time.Time) (workflowkit.ContinuationPlanSnapshot, error) {
@@ -1071,6 +1072,18 @@ func buildSameRunContinuationPlan(planID, commandID string, input continuationPl
 	confirmations := make(map[workflowkit.NodeID]workflowkit.ExternalEffectConfirmation, len(input.ExternalEffectConfirmations))
 	for _, confirmation := range input.ExternalEffectConfirmations {
 		confirmations[confirmation.NodeID] = confirmation
+	}
+	requiredScheduledInputs := make(map[workflowkit.NodeID][]workflowkit.ArtifactBinding, len(input.RequiredScheduledInputs))
+	for nodeID, bindings := range input.RequiredScheduledInputs {
+		stage, found := workflow.Stage(nodeID)
+		if !found || stage.OperatorOnly() {
+			return workflowkit.ContinuationPlanSnapshot{}, fmt.Errorf("required scheduled inputs refer to unavailable stage %q", nodeID)
+		}
+		copyBindings := append([]workflowkit.ArtifactBinding(nil), bindings...)
+		if _, err := workflowkit.FingerprintArtifactBindings(copyBindings); err != nil {
+			return workflowkit.ContinuationPlanSnapshot{}, fmt.Errorf("required scheduled inputs for stage %q: %w", nodeID, err)
+		}
+		requiredScheduledInputs[nodeID] = copyBindings
 	}
 	emptyInputs, err := workflowkit.FingerprintArtifactBindings(nil)
 	if err != nil {
@@ -1116,6 +1129,14 @@ func buildSameRunContinuationPlan(planID, commandID string, input continuationPl
 			}
 			transition.Disposition = workflowkit.DispositionSchedule
 			transition.ReasonCodes = continuationReasons(entry, targetSet, strategy)
+			if required, present := requiredScheduledInputs[stage.Key]; present {
+				transition.InputBindings = append([]workflowkit.ArtifactBinding(nil), required...)
+				transition.ExpectedInputFingerprint, err = workflowkit.FingerprintArtifactBindings(transition.InputBindings)
+				if err != nil {
+					return workflowkit.ContinuationPlanSnapshot{}, err
+				}
+				delete(requiredScheduledInputs, stage.Key)
+			}
 			if strategy == workflowkit.StrategyRecompute {
 				transition.ToGeneration++
 			}
@@ -1125,6 +1146,14 @@ func buildSameRunContinuationPlan(planID, commandID string, input continuationPl
 			if confirmed {
 				transition.Disposition = workflowkit.DispositionSchedule
 				transition.ReasonCodes = continuationReasons(entry, targetSet, strategy)
+				if required, present := requiredScheduledInputs[stage.Key]; present {
+					transition.InputBindings = append([]workflowkit.ArtifactBinding(nil), required...)
+					transition.ExpectedInputFingerprint, err = workflowkit.FingerprintArtifactBindings(transition.InputBindings)
+					if err != nil {
+						return workflowkit.ContinuationPlanSnapshot{}, err
+					}
+					delete(requiredScheduledInputs, stage.Key)
+				}
 				if strategy == workflowkit.StrategyRecompute {
 					transition.ToGeneration++
 				}
@@ -1140,6 +1169,11 @@ func buildSameRunContinuationPlan(planID, commandID string, input continuationPl
 			return workflowkit.ContinuationPlanSnapshot{}, fmt.Errorf("unsupported invalidation impact %q", entry.Impact)
 		}
 		transitions = append(transitions, transition)
+	}
+	if len(requiredScheduledInputs) != 0 {
+		for nodeID := range requiredScheduledInputs {
+			return workflowkit.ContinuationPlanSnapshot{}, fmt.Errorf("required repair input stage %q is not scheduled", nodeID)
+		}
 	}
 	for nodeID := range confirmations {
 		found := false

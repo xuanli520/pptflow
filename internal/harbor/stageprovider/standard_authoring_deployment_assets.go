@@ -71,6 +71,9 @@ func LoadStandardAuthoringDeploymentAssetBundle(catalogPath, lockPath, contractR
 	if err != nil {
 		return nil, fmt.Errorf("parse Standard authoring asset manifest: %w", err)
 	}
+	if !manifest.Template.Equal(catalog.Template()) {
+		return nil, fmt.Errorf("%w: Standard authoring asset manifest template %s@%s does not match catalog template %s@%s", ErrDeploymentOperationCatalogDrift, manifest.Template.ID, manifest.Template.Version, catalog.Template().ID, catalog.Template().Version)
+	}
 
 	lockRaw, err := readStandardAuthoringDeploymentFile(lockPath)
 	if err != nil {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -12,7 +13,7 @@ import (
 // compiled into this binary. Historical records remain inspectable but are
 // never executed through an ambient "latest" authoring contract.
 func isCurrentStandardAuthoringRun(run store.WorkflowRun) bool {
-	return workflowadapter.StandardAuthoringBriefTemplateReference().Equal(workflowadapter.TemplateReference{
+	return workflowadapter.StandardAuthoringRepairFeedbackTemplateReference().Equal(workflowadapter.TemplateReference{
 		ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion,
 	})
 }
@@ -58,6 +59,9 @@ func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manif
 		}
 		if expectedUsesBrief && (expectedBrief != actualBrief || !actualBrief.Required || actualBrief.SchemaVersion != workflowadapter.StandardAuthoringBriefSchemaVersion) {
 			return fmt.Errorf("Standard authoring Run %s frozen descriptor has an invalid brief contract for stage %q", run.ID, expectedStage.Key)
+		}
+		if !reflect.DeepEqual(expectedStage.Inputs, actualStage.Inputs) || !reflect.DeepEqual(expectedStage.ReadSet, actualStage.ReadSet) {
+			return fmt.Errorf("Standard authoring Run %s frozen descriptor changes the versioned input contract for stage %q", run.ID, expectedStage.Key)
 		}
 	}
 	return nil

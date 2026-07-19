@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -135,7 +137,93 @@ func (runtime *FrozenExecutionRuntime) handleReviewGateResolution(ctx context.Co
 	if err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
+	if isCodeEdgePhase1Run(*run) && binding.StageKey == string(workflowadapter.ResultReview) &&
+		binding.ReviewKind == string(workflowadapter.ReviewModelResult) && decision.Action == store.ReviewDecisionApprove {
+		if payload.CodeEdgeComplianceRecordID == "" {
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: approved CodeEdge result review has no frozen compliance record identity", ErrFrozenExecutionPayload))
+		}
+		compliance, err := runtime.recordResultReviewCompliance(ctx, *run, *revision, *binding, inputs, payload.CodeEdgeComplianceRecordID, job.CreatedBy, decision.Reason)
+		if err != nil {
+			return runtime.failRuntimeJob(ctx, job, err)
+		}
+		if compliance.Record.ID != payload.CodeEdgeComplianceRecordID {
+			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: final compliance record identity drifted", ErrFrozenExecutionPayload))
+		}
+		if compliance.Record.Status != store.CodeEdgeComplianceApproved {
+			if err := runtime.finishRunWithStatus(ctx, run.ID, store.WorkflowRunFailedTerminal, job.CreatedBy, "CodeEdge final compliance rejected the approved result review"); err != nil {
+				return runtime.failRuntimeJob(ctx, job, err)
+			}
+			return runtime.finishContinuationForRunOutcome(ctx, sourcePayload.ContinuationExecutionID, store.ContinuationExecutionFailed, job.CreatedBy, "CodeEdge final compliance rejected the approved result review")
+		}
+	}
 	return runtime.projectResolvedReviewGate(ctx, job, *run, frozen, sourceJob, sourcePayload, *attempt, decision)
+}
+
+// recordResultReviewCompliance reconstructs the typed submission receipt from
+// the immutable submission_lint_report artifact and records final compliance
+// only after the result-review decision artifact has completed. The report is
+// a stage report, not a caller-supplied receipt; all lineage and binding facts
+// are re-read from the frozen parent Run.
+func (runtime *FrozenExecutionRuntime) recordResultReviewCompliance(ctx context.Context, run store.WorkflowRun, revision store.TaskRevision, binding store.ReviewGateBinding, inputs []workflowkit.ArtifactBinding, recordID, actor, reason string) (CodeEdgeFinalComplianceResult, error) {
+	frozen, err := runtime.core.loadFrozenCodeEdgeRun(ctx, run.ID)
+	if err != nil {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("load frozen CodeEdge Run for result review compliance: %w", err)
+	}
+	if frozen.Revision.ID != revision.ID || frozen.Revision.TaskDigest != revision.TaskDigest || binding.RevisionID != revision.ID || binding.RevisionDigest != revision.TaskDigest {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("%w: result review compliance revision binding drifted", ErrFrozenExecutionPayload)
+	}
+	var reportBinding *workflowkit.ArtifactBinding
+	for index := range inputs {
+		if inputs[index].Name != "submission_lint_report" {
+			continue
+		}
+		if reportBinding != nil {
+			return CodeEdgeFinalComplianceResult{}, fmt.Errorf("%w: result review has duplicate submission_lint_report inputs", ErrFrozenExecutionPayload)
+		}
+		copy := inputs[index].Clone()
+		reportBinding = &copy
+	}
+	if reportBinding == nil || reportBinding.SchemaVersion != workflowadapter.CodeEdgeSubmissionReportSchemaVersion {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("%w: result review lacks its frozen submission_lint_report input", ErrFrozenExecutionPayload)
+	}
+	checker := &CodeEdgeComplianceService{core: runtime.core}
+	stage, raw, err := checker.readCodeEdgeArtifactBinding(ctx, frozen, *reportBinding, workflowadapter.SubmissionLint, "submission_lint_report")
+	if err != nil {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("read frozen submission_lint_report for result review compliance: %w", err)
+	}
+	var report codeEdgePhase1StageReport
+	if err := decodeStrictJSON(string(raw), &report); err != nil {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("decode frozen submission_lint_report: %w", err)
+	}
+	if report.Format != codeEdgePhase1ReportFormat || report.Version != codeEdgePhase1ReportVersion ||
+		report.Stage != string(workflowadapter.SubmissionLint) || report.RunID != run.ID || report.StageAttemptID != stage.ID ||
+		report.TaskSnapshotDigest != string(frozen.Binding.TaskSnapshotDigest) || report.Findings == nil || string(stage.Verdict) != string(report.Verdict) {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("%w: submission_lint_report is not bound to the completed frozen stage", ErrFrozenExecutionPayload)
+	}
+	status := codeedge.SubmissionCheckRejected
+	if report.Verdict == workflowkit.VerdictPass {
+		status = codeedge.SubmissionCheckPassed
+	}
+	receipt := codeedge.SubmissionCheckReceipt{
+		Format: codeedge.SubmissionCheckReceiptFormat, Version: codeedge.SubmissionCheckReceiptVersion,
+		Status: status, CheckerID: frozen.Policy.SubmissionCheckerID, CheckerVersion: frozen.Policy.SubmissionCheckerVersion,
+		Binding: frozen.Binding, Report: *reportBinding, Findings: append([]string{}, report.Findings...),
+	}
+	if err := receipt.Validate(); err != nil {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("validate reconstructed submission receipt: %w", err)
+	}
+	handoff, err := runtime.core.store.GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, run.ID)
+	if err != nil {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("load adopted evaluator evidence handoff for result review compliance: %w", err)
+	}
+	if handoff == nil {
+		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("%w: adopted evaluator evidence handoff for Run %s", ErrLifecycleNotFound, run.ID)
+	}
+	return checker.recordFinalComplianceForResultReview(ctx, RecordCodeEdgeFinalComplianceRequest{
+		ID: recordID, IdempotencyKey: recordID, RunID: run.ID,
+		EvaluatorEvidenceHandoffID: handoff.ID, Submission: receipt,
+		Actor: actor, Reason: reason,
+	})
 }
 
 func (runtime *FrozenExecutionRuntime) reviewGateDecision(ctx context.Context, reviewRequestID, decisionID string) (store.ReviewDecision, error) {

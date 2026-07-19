@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
@@ -55,6 +56,18 @@ type frozenCodeEdgeRun struct {
 // four logical trial samples for both evaluators, and persists a write-once
 // authorization only when final compliance approves the frozen Run.
 func (service *CodeEdgeComplianceService) RecordFinalCompliance(ctx context.Context, request RecordCodeEdgeFinalComplianceRequest) (CodeEdgeFinalComplianceResult, error) {
+	return service.recordFinalCompliance(ctx, request, false)
+}
+
+// recordFinalComplianceForResultReview is the production ResultReview
+// boundary. An approved compliance record and the sealed-to-validated
+// revision transition commit together; a rejected compliance result remains
+// immutable evidence but cannot validate the revision.
+func (service *CodeEdgeComplianceService) recordFinalComplianceForResultReview(ctx context.Context, request RecordCodeEdgeFinalComplianceRequest) (CodeEdgeFinalComplianceResult, error) {
+	return service.recordFinalCompliance(ctx, request, true)
+}
+
+func (service *CodeEdgeComplianceService) recordFinalCompliance(ctx context.Context, request RecordCodeEdgeFinalComplianceRequest, validateApprovedRevision bool) (CodeEdgeFinalComplianceResult, error) {
 	if service == nil || service.core == nil || service.core.store == nil {
 		return CodeEdgeFinalComplianceResult{}, fmt.Errorf("CodeEdge compliance service is not configured")
 	}
@@ -127,7 +140,7 @@ func (service *CodeEdgeComplianceService) RecordFinalCompliance(ctx context.Cont
 			return CodeEdgeFinalComplianceResult{}, authorizationErr
 		}
 	}
-	record, err := service.core.store.CreateCodeEdgeComplianceRecord(ctx, store.CreateCodeEdgeComplianceRecordRequest{
+	storeRequest := store.CreateCodeEdgeComplianceRecordRequest{
 		ID:                                  strings.TrimSpace(request.ID),
 		RunID:                               frozen.Run.ID,
 		TaskID:                              frozen.Run.TaskID,
@@ -146,7 +159,13 @@ func (service *CodeEdgeComplianceService) RecordFinalCompliance(ctx context.Cont
 		IdempotencyKey:                      strings.TrimSpace(request.IdempotencyKey),
 		Actor:                               request.Actor,
 		Reason:                              request.Reason,
-	})
+	}
+	var record store.CodeEdgeComplianceRecord
+	if validateApprovedRevision && status == store.CodeEdgeComplianceApproved {
+		record, _, err = service.core.store.CreateApprovedCodeEdgeComplianceRecordAndValidateRevision(ctx, storeRequest, frozen.Revision.StateVersion)
+	} else {
+		record, err = service.core.store.CreateCodeEdgeComplianceRecord(ctx, storeRequest)
+	}
 	if err != nil {
 		return CodeEdgeFinalComplianceResult{}, err
 	}
@@ -349,9 +368,6 @@ func (service *CodeEdgeComplianceService) verifyCodeEdgeSubmissionReceipt(ctx co
 	if err := receipt.Validate(); err != nil {
 		return err
 	}
-	if receipt.Status != codeedge.SubmissionCheckPassed {
-		return fmt.Errorf("CodeEdge submission checks must be passed before final compliance")
-	}
 	if receipt.CheckerID != frozen.Policy.SubmissionCheckerID || receipt.CheckerVersion != frozen.Policy.SubmissionCheckerVersion || receipt.Report.SchemaVersion != frozen.Policy.SubmissionReportSchemaVersion {
 		return fmt.Errorf("CodeEdge submission receipt does not match frozen policy")
 	}
@@ -363,8 +379,39 @@ func (service *CodeEdgeComplianceService) verifyCodeEdgeSubmissionReceipt(ctx co
 	}
 	// The report binding names an ArtifactRef, not a stage attempt. Its owner
 	// is resolved and verified by readCodeEdgeArtifactBinding below.
-	_, _, err := service.readCodeEdgeArtifactBinding(ctx, frozen, receipt.Report, workflowadapter.SubmissionLint, "submission_lint_report")
-	return err
+	stage, raw, err := service.readCodeEdgeArtifactBinding(ctx, frozen, receipt.Report, workflowadapter.SubmissionLint, "submission_lint_report")
+	if err != nil {
+		return err
+	}
+	var report codeEdgePhase1StageReport
+	if err := decodeStrictJSON(string(raw), &report); err != nil {
+		return fmt.Errorf("decode CodeEdge submission report: %w", err)
+	}
+	if report.Format != codeEdgePhase1ReportFormat || report.Version != codeEdgePhase1ReportVersion ||
+		report.Stage != string(workflowadapter.SubmissionLint) || report.RunID != frozen.Run.ID || report.StageAttemptID != stage.ID ||
+		report.TaskSnapshotDigest != string(frozen.Binding.TaskSnapshotDigest) || report.Findings == nil || string(stage.Verdict) != string(report.Verdict) {
+		return fmt.Errorf("CodeEdge submission report is not bound to the completed frozen stage")
+	}
+	expectedStatus := codeedge.SubmissionCheckRejected
+	if report.Verdict == workflowkit.VerdictPass {
+		expectedStatus = codeedge.SubmissionCheckPassed
+	}
+	if receipt.Status != expectedStatus {
+		return fmt.Errorf("CodeEdge submission receipt status %q does not match frozen submission report verdict %q", receipt.Status, report.Verdict)
+	}
+	wantFindings := append([]string{}, report.Findings...)
+	gotFindings := append([]string{}, receipt.Findings...)
+	sort.Strings(wantFindings)
+	sort.Strings(gotFindings)
+	if len(wantFindings) != len(gotFindings) {
+		return fmt.Errorf("CodeEdge submission receipt findings do not match frozen submission report")
+	}
+	for index := range wantFindings {
+		if wantFindings[index] != gotFindings[index] {
+			return fmt.Errorf("CodeEdge submission receipt findings do not match frozen submission report")
+		}
+	}
+	return nil
 }
 
 func (service *CodeEdgeComplianceService) readCodeEdgeArtifactBinding(ctx context.Context, frozen frozenCodeEdgeRun, binding workflowkit.ArtifactBinding, stageKey, artifactKey string) (store.StageAttempt, []byte, error) {

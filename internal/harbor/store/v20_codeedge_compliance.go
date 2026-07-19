@@ -28,73 +28,247 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 	if err := s.mutationPreflight(ctx); err != nil {
 		return CodeEdgeComplianceRecord{}, err
 	}
+	prepared, err := s.prepareCodeEdgeComplianceRecord(request)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, err
+	}
+	defer tx.Rollback()
+	record, created, _, _, err := s.createCodeEdgeComplianceRecordTx(ctx, tx, prepared.record)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, err
+	}
+	if created {
+		if err := s.appendCodeEdgeComplianceRecordAuditTx(ctx, tx, record, prepared.reason); err != nil {
+			return CodeEdgeComplianceRecord{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return CodeEdgeComplianceRecord{}, err
+	}
+	return record, nil
+}
+
+// CreateApprovedCodeEdgeComplianceRecordAndValidateRevision commits the one
+// approved final-compliance record and the sealed-to-validated revision
+// transition atomically. The validation evidence is derived from, and thus
+// cryptographically binds, both the final decision and package authorization
+// fingerprints. Replaying the same immutable record accepts only that exact
+// validated revision state.
+func (s *Store) CreateApprovedCodeEdgeComplianceRecordAndValidateRevision(ctx context.Context, request CreateCodeEdgeComplianceRecordRequest, expectedRevisionStateVersion int64) (CodeEdgeComplianceRecord, TaskRevision, error) {
+	if err := s.mutationPreflight(ctx); err != nil {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+	}
+	if expectedRevisionStateVersion <= 0 {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, fmt.Errorf("expected revision state version must be positive")
+	}
+	prepared, err := s.prepareCodeEdgeComplianceRecord(request)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+	}
+	if prepared.record.Status != CodeEdgeComplianceApproved {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, fmt.Errorf("only approved CodeEdge compliance can validate a revision")
+	}
+	evidence, err := CodeEdgeRevisionValidationEvidenceFingerprint(prepared.record)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+	}
+	defer tx.Rollback()
+	record, created, revision, task, err := s.createCodeEdgeComplianceRecordTx(ctx, tx, prepared.record)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+	}
+	if record.Status != CodeEdgeComplianceApproved {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, fmt.Errorf("%w: replayed CodeEdge compliance is not approved", ErrIdempotencyConflict)
+	}
+	evidence, err = CodeEdgeRevisionValidationEvidenceFingerprint(record)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+	}
+	now := s.now().UTC()
+	switch revision.State {
+	case RevisionStateSealed:
+		if revision.StateVersion != expectedRevisionStateVersion {
+			return CodeEdgeComplianceRecord{}, TaskRevision{}, fmt.Errorf("%w: revision %s", ErrOptimisticLock, revision.ID)
+		}
+		if err := s.guardTaskPurgeMutationTx(ctx, tx, task.ID, record.CreatedBy, now); err != nil {
+			return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+		}
+		revision.State = RevisionStateValidated
+		revision.ValidationEvidenceManifest = evidence
+		revision.StateVersion++
+		revision.StateUpdatedBy = record.CreatedBy
+		revision.StateUpdatedAt = now
+		result, updateErr := tx.ExecContext(ctx, `
+			UPDATE task_revisions
+			SET state = ?, validation_evidence_manifest = ?, state_version = ?, state_updated_by = ?, state_updated_at = ?
+			WHERE id = ? AND state_version = ?
+		`, revision.State, revision.ValidationEvidenceManifest, revision.StateVersion, revision.StateUpdatedBy, revision.StateUpdatedAt,
+			revision.ID, expectedRevisionStateVersion)
+		if updateErr != nil {
+			return CodeEdgeComplianceRecord{}, TaskRevision{}, updateErr
+		}
+		if err := requireOneRow(result, "revision", revision.ID); err != nil {
+			return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+		}
+		if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
+			Actor: record.CreatedBy, EntityType: "task_revision", EntityID: revision.ID,
+			Action: "task_revision.state_transitioned", Reason: prepared.reason,
+			PayloadJSON: auditPayload(map[string]any{
+				"state": revision.State, "state_version": revision.StateVersion,
+				"validation_evidence_manifest":  revision.ValidationEvidenceManifest,
+				"codeedge_compliance_record_id": record.ID,
+				"decision_fingerprint":          record.DecisionFingerprint,
+				"authorization_fingerprint":     record.AuthorizationFingerprint,
+			}),
+			CreatedAt: now,
+		}); err != nil {
+			return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+		}
+	case RevisionStateValidated:
+		if revision.ValidationEvidenceManifest != evidence {
+			return CodeEdgeComplianceRecord{}, TaskRevision{}, fmt.Errorf("%w: revision %s was validated by different evidence", ErrIdempotencyConflict, revision.ID)
+		}
+	default:
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, fmt.Errorf("%w: revision %s cannot be validated from %s", ErrInvalidTransition, revision.ID, revision.State)
+	}
+	if created {
+		if err := s.appendCodeEdgeComplianceRecordAuditTx(ctx, tx, record, prepared.reason); err != nil {
+			return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return CodeEdgeComplianceRecord{}, TaskRevision{}, err
+	}
+	return record, revision, nil
+}
+
+type preparedCodeEdgeComplianceRecord struct {
+	record CodeEdgeComplianceRecord
+	reason string
+}
+
+// CodeEdgeRevisionValidationEvidenceFingerprint is the immutable evidence
+// reference written onto a TaskRevision when final compliance approves it.
+// It binds the revision transition to the exact compliance record and both
+// cryptographic authorization inputs, rather than to a mutable status field.
+func CodeEdgeRevisionValidationEvidenceFingerprint(record CodeEdgeComplianceRecord) (string, error) {
+	if record.Status != CodeEdgeComplianceApproved {
+		return "", fmt.Errorf("CodeEdge revision validation evidence requires an approved compliance record")
+	}
+	for label, value := range map[string]string{
+		"compliance record ID":      record.ID,
+		"decision fingerprint":      record.DecisionFingerprint,
+		"authorization fingerprint": record.AuthorizationFingerprint,
+		"run ID":                    record.RunID,
+		"revision ID":               record.RevisionID,
+		"task digest":               record.TaskDigest,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("CodeEdge revision validation evidence is missing %s", label)
+		}
+	}
+	document := struct {
+		Format                   string `json:"format"`
+		Version                  string `json:"version"`
+		ComplianceRecordID       string `json:"compliance_record_id"`
+		RunID                    string `json:"run_id"`
+		RevisionID               string `json:"revision_id"`
+		TaskDigest               string `json:"task_digest"`
+		DecisionFingerprint      string `json:"decision_fingerprint"`
+		AuthorizationFingerprint string `json:"authorization_fingerprint"`
+	}{
+		Format: "harbor.codeedge.revision-validation-evidence.v1", Version: "1",
+		ComplianceRecordID: record.ID, RunID: record.RunID, RevisionID: record.RevisionID,
+		TaskDigest: record.TaskDigest, DecisionFingerprint: record.DecisionFingerprint,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+	}
+	canonical, err := json.Marshal(document)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize CodeEdge revision validation evidence: %w", err)
+	}
+	fingerprint, err := workflowkit.FingerprintBytes(document.Format, canonical)
+	if err != nil {
+		return "", fmt.Errorf("fingerprint CodeEdge revision validation evidence: %w", err)
+	}
+	return string(fingerprint), nil
+}
+
+func (s *Store) prepareCodeEdgeComplianceRecord(request CreateCodeEdgeComplianceRecordRequest) (preparedCodeEdgeComplianceRecord, error) {
 	if !isUUIDv7(request.RunID) || !isUUIDv7(request.TaskID) || !isUUIDv7(request.RevisionID) {
-		return CodeEdgeComplianceRecord{}, ErrInvalidUUIDv7Identity
+		return preparedCodeEdgeComplianceRecord{}, ErrInvalidUUIDv7Identity
 	}
 	if err := ValidateTaskDigestV2(request.TaskDigest); err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	key := strings.TrimSpace(request.IdempotencyKey)
 	if !isUUIDv7(key) {
-		return CodeEdgeComplianceRecord{}, ErrInvalidUUIDv7Identity
+		return preparedCodeEdgeComplianceRecord{}, ErrInvalidUUIDv7Identity
 	}
 	requestedID := strings.TrimSpace(request.ID)
 	if requestedID != "" && requestedID != key {
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("%w: CodeEdge compliance identity differs from idempotency key", ErrIdempotencyConflict)
+		return preparedCodeEdgeComplianceRecord{}, fmt.Errorf("%w: CodeEdge compliance identity differs from idempotency key", ErrIdempotencyConflict)
 	}
 	id, err := s.newV2ID(key)
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	if !validCodeEdgeComplianceStatus(request.Status) {
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("invalid CodeEdge compliance status %q", request.Status)
+		return preparedCodeEdgeComplianceRecord{}, fmt.Errorf("invalid CodeEdge compliance status %q", request.Status)
 	}
 	if !isUUIDv7(strings.TrimSpace(request.EvaluatorEvidenceHandoffID)) {
-		return CodeEdgeComplianceRecord{}, ErrInvalidUUIDv7Identity
+		return preparedCodeEdgeComplianceRecord{}, ErrInvalidUUIDv7Identity
 	}
 	handoffFingerprint, err := normalizeRequired(request.EvaluatorEvidenceHandoffFingerprint, "CodeEdge evaluator evidence handoff fingerprint")
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	qwen, err := normalizeV4JSON(request.QwenReceiptJSON, "CodeEdge Qwen receipt")
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	opus, err := normalizeV4JSON(request.OpusReceiptJSON, "CodeEdge Opus receipt")
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	submission, err := normalizeV4JSON(request.SubmissionReceiptJSON, "CodeEdge submission receipt")
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	decision, err := normalizeV4JSON(request.DecisionJSON, "CodeEdge final compliance decision")
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	decisionFingerprint, err := normalizeRequired(request.DecisionFingerprint, "CodeEdge final compliance decision fingerprint")
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	authorization := strings.TrimSpace(request.AuthorizationJSON)
 	authorizationFingerprint := strings.TrimSpace(request.AuthorizationFingerprint)
 	if request.Status == CodeEdgeComplianceApproved {
 		authorization, err = normalizeV4JSON(authorization, "CodeEdge local package authorization")
 		if err != nil {
-			return CodeEdgeComplianceRecord{}, err
+			return preparedCodeEdgeComplianceRecord{}, err
 		}
 		authorizationFingerprint, err = normalizeRequired(authorizationFingerprint, "CodeEdge local package authorization fingerprint")
 		if err != nil {
-			return CodeEdgeComplianceRecord{}, err
+			return preparedCodeEdgeComplianceRecord{}, err
 		}
 	} else if authorization != "" || authorizationFingerprint != "" {
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("rejected CodeEdge compliance record cannot contain a package authorization")
+		return preparedCodeEdgeComplianceRecord{}, fmt.Errorf("rejected CodeEdge compliance record cannot contain a package authorization")
 	}
 	if err := validateCanonicalCodeEdgeComplianceDocuments(
 		request.TaskDigest, request.Status, request.EvaluatorEvidenceHandoffID, handoffFingerprint,
 		qwen, opus, submission, decision, decisionFingerprint, authorization, authorizationFingerprint,
 	); err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return preparedCodeEdgeComplianceRecord{}, err
 	}
 	now := s.now().UTC()
 	record := CodeEdgeComplianceRecord{
@@ -106,40 +280,40 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 		AuthorizationJSON: authorization, AuthorizationFingerprint: authorizationFingerprint,
 		IdempotencyKey: key, CreatedBy: resolveActor(request.Actor), CreatedAt: now,
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
-	}
-	defer tx.Rollback()
+	return preparedCodeEdgeComplianceRecord{record: record, reason: strings.TrimSpace(request.Reason)}, nil
+}
+
+func (s *Store) createCodeEdgeComplianceRecordTx(ctx context.Context, tx *sql.Tx, record CodeEdgeComplianceRecord) (CodeEdgeComplianceRecord, bool, TaskRevision, TaskV2, error) {
 	run, err := getWorkflowRunTx(ctx, tx, record.RunID)
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, err
 	}
 	if run.TaskID != record.TaskID || run.RevisionID != record.RevisionID {
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("CodeEdge compliance Run does not match task/revision")
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, fmt.Errorf("CodeEdge compliance Run does not match task/revision")
 	}
 	revision, err := getTaskRevisionTx(ctx, tx, record.RevisionID)
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, err
 	}
 	if revision.TaskID != record.TaskID || revision.TaskDigest != record.TaskDigest {
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("CodeEdge compliance task/revision/digest binding does not match durable revision")
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, fmt.Errorf("CodeEdge compliance task/revision/digest binding does not match durable revision")
 	}
-	if _, err := getTaskV2Tx(ctx, tx, record.TaskID); err != nil {
-		return CodeEdgeComplianceRecord{}, err
+	task, err := getTaskV2Tx(ctx, tx, record.TaskID)
+	if err != nil {
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, err
 	}
 	handoff, err := scanCodeEdgeEvaluatorEvidenceHandoff(tx.QueryRowContext(ctx, codeEdgeEvaluatorEvidenceHandoffSelect+" WHERE id = ?", record.EvaluatorEvidenceHandoffID))
 	if err == sql.ErrNoRows {
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("%w: CodeEdge evaluator evidence handoff %s", ErrNotFound, record.EvaluatorEvidenceHandoffID)
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, fmt.Errorf("%w: CodeEdge evaluator evidence handoff %s", ErrNotFound, record.EvaluatorEvidenceHandoffID)
 	}
 	if err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, err
 	}
 	if handoff.ParentRunID != record.RunID || handoff.TaskID != record.TaskID || handoff.RevisionID != record.RevisionID || handoff.TaskDigest != record.TaskDigest || handoff.HandoffFingerprint != record.EvaluatorEvidenceHandoffFingerprint {
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("CodeEdge compliance handoff does not match parent Run or frozen task")
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, fmt.Errorf("CodeEdge compliance handoff does not match parent Run or frozen task")
 	}
 	if err := validateCodeEdgeComplianceHandoffReceiptBinding(handoff, record); err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, err
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO codeedge_compliance_records_v20 (
@@ -156,48 +330,43 @@ func (s *Store) CreateCodeEdgeComplianceRecord(ctx context.Context, request Crea
 		record.AuthorizationFingerprint, record.IdempotencyKey, record.CreatedBy, record.CreatedAt)
 	if err != nil {
 		if !isUniqueConstraint(err) && !isGlobalIdentityCollision(err) {
-			return CodeEdgeComplianceRecord{}, err
+			return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, err
 		}
 		if existing, existingErr := getCodeEdgeComplianceRecordByKeyTx(ctx, tx, record.IdempotencyKey); existingErr == nil {
 			if sameCodeEdgeComplianceRecord(existing, record) {
-				if err := tx.Commit(); err != nil {
-					return CodeEdgeComplianceRecord{}, err
-				}
-				return existing, nil
+				return existing, false, revision, task, nil
 			}
-			return CodeEdgeComplianceRecord{}, fmt.Errorf("%w: CodeEdge compliance key %s", ErrIdempotencyConflict, record.IdempotencyKey)
+			return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, fmt.Errorf("%w: CodeEdge compliance key %s", ErrIdempotencyConflict, record.IdempotencyKey)
 		} else if !isNotFound(existingErr) {
-			return CodeEdgeComplianceRecord{}, existingErr
+			return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, existingErr
 		}
 		if existing, existingErr := getCodeEdgeComplianceRecordByRunTx(ctx, tx, record.RunID); existingErr == nil {
 			if sameCodeEdgeComplianceRecord(existing, record) {
-				if err := tx.Commit(); err != nil {
-					return CodeEdgeComplianceRecord{}, err
-				}
-				return existing, nil
+				return existing, false, revision, task, nil
 			}
-			return CodeEdgeComplianceRecord{}, fmt.Errorf("%w: CodeEdge compliance Run %s", ErrIdempotencyConflict, record.RunID)
+			return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, fmt.Errorf("%w: CodeEdge compliance Run %s", ErrIdempotencyConflict, record.RunID)
 		} else if !isNotFound(existingErr) {
-			return CodeEdgeComplianceRecord{}, existingErr
+			return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, existingErr
 		}
-		return CodeEdgeComplianceRecord{}, fmt.Errorf("%w: CodeEdge compliance record %s", ErrIdentityCollision, record.ID)
+		return CodeEdgeComplianceRecord{}, false, TaskRevision{}, TaskV2{}, fmt.Errorf("%w: CodeEdge compliance record %s", ErrIdentityCollision, record.ID)
 	}
+	return record, true, revision, task, nil
+}
+
+func (s *Store) appendCodeEdgeComplianceRecordAuditTx(ctx context.Context, tx *sql.Tx, record CodeEdgeComplianceRecord, reason string) error {
 	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
 		Actor: record.CreatedBy, EntityType: "codeedge_compliance_record", EntityID: record.ID,
-		Action: "codeedge_compliance.recorded", Reason: request.Reason,
+		Action: "codeedge_compliance.recorded", Reason: reason,
 		PayloadJSON: auditPayload(map[string]any{
 			"run_id": record.RunID, "revision_id": record.RevisionID, "status": record.Status,
 			"evaluator_evidence_handoff_id": record.EvaluatorEvidenceHandoffID, "evaluator_evidence_handoff_fingerprint": record.EvaluatorEvidenceHandoffFingerprint,
 			"decision_fingerprint": record.DecisionFingerprint, "authorization_fingerprint": record.AuthorizationFingerprint,
 		}),
-		CreatedAt: now,
+		CreatedAt: record.CreatedAt,
 	}); err != nil {
-		return CodeEdgeComplianceRecord{}, err
+		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return CodeEdgeComplianceRecord{}, err
-	}
-	return record, nil
+	return nil
 }
 
 // GetCodeEdgeComplianceRecordForRun returns the one immutable final

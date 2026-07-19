@@ -89,6 +89,21 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 			dependencies:   standardAuthoringTaskAdmissionDependencies(),
 			validateStages: validateStandardAuthoringBriefContract,
 		}, nil
+	case reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:                   standardAuthoringCatalogID,
+			catalogVersion:              StandardAuthoringRepairFeedbackTemplateVersion,
+			stageOrder:                  StandardAuthoringTaskAdmissionStageOrder(),
+			groups:                      standardAuthoringStageGroups(),
+			requiresOperatorOnlyPackage: false,
+			gates: []workflowkit.StageKey{
+				workflowkit.StageKey(TaskReview),
+				workflowkit.StageKey(ContentReview),
+				workflowkit.StageKey(SolutionReview),
+			},
+			dependencies:   standardAuthoringTaskAdmissionDependencies(),
+			validateStages: validateStandardAuthoringRepairFeedbackContract,
+		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
 			catalogID:                   codeEdgePhase1CatalogID,
@@ -238,6 +253,13 @@ func validateStandardAuthoringTaskAdmissionContract(stages map[workflowkit.Stage
 }
 
 func validateStandardAuthoringBriefContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	if err := validateStandardAuthoringBriefIntrinsicContract(stages); err != nil {
+		return err
+	}
+	return validateStandardAuthoringFeedbackShape(stages, StandardAuthoringBriefStageCatalog())
+}
+
+func validateStandardAuthoringBriefIntrinsicContract(stages map[workflowkit.StageKey]StageDefinition) error {
 	if err := validateStandardAuthoringTaskAdmissionContract(stages); err != nil {
 		return err
 	}
@@ -255,6 +277,62 @@ func validateStandardAuthoringBriefContract(stages map[workflowkit.StageKey]Stag
 		}
 	}
 	return nil
+}
+
+func validateStandardAuthoringRepairFeedbackContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	if err := validateStandardAuthoringBriefIntrinsicContract(stages); err != nil {
+		return err
+	}
+	return validateStandardAuthoringFeedbackShape(stages, StandardAuthoringRepairFeedbackStageCatalog())
+}
+
+func validateStandardAuthoringFeedbackShape(stages map[workflowkit.StageKey]StageDefinition, expectedCatalog StageCatalog) error {
+	expectedStages := make(map[workflowkit.StageKey]StageDefinition, len(expectedCatalog.Stages))
+	for _, stage := range expectedCatalog.Stages {
+		expectedStages[stage.Key] = stage
+	}
+	for _, key := range StandardAuthoringTaskAdmissionStageOrder() {
+		stage, present := stages[key]
+		if !present {
+			return fmt.Errorf("%w: required Standard authoring feedback stage %q is missing", errInvalidCatalog, key)
+		}
+		expectedStage := expectedStages[key]
+		for _, contract := range standardAuthoringRepairFeedbackArtifactContracts() {
+			expected, expectsFeedback := stageArtifactSpec(expectedStage.Inputs, contract.name)
+			actual, present := stageArtifactSpec(stage.Inputs, contract.name)
+			if present != expectsFeedback || (present && actual != expected) {
+				return fmt.Errorf("%w: Standard authoring feedback stage %q input %q does not match its version", errInvalidCatalog, key, contract.name)
+			}
+			expectedResource := stageCatalogResourceCount(expectedStage.ReadSet, contract.resource)
+			if stageCatalogResourceCount(stage.ReadSet, contract.resource) != expectedResource {
+				return fmt.Errorf("%w: Standard authoring feedback stage %q resource %q does not match its input", errInvalidCatalog, key, contract.resource)
+			}
+		}
+	}
+	return nil
+}
+
+type standardAuthoringRepairFeedbackArtifactContract struct {
+	name     string
+	resource workflowkit.ResourceKey
+}
+
+func standardAuthoringRepairFeedbackArtifactContracts() []standardAuthoringRepairFeedbackArtifactContract {
+	return []standardAuthoringRepairFeedbackArtifactContract{
+		{name: "task_review_decision", resource: resourceReviewTaskDirection},
+		{name: "content_review_decision", resource: resourceReviewContent},
+		{name: "solution_review_decision", resource: resourceReviewSolutionVerifier},
+		{name: "codeedge_package_admission_report", resource: resourceAuthoringTaskAdmission},
+	}
+}
+
+func stageArtifactSpec(artifacts []workflowkit.ArtifactSpec, name string) (workflowkit.ArtifactSpec, bool) {
+	for _, artifact := range artifacts {
+		if artifact.Name == name {
+			return artifact, true
+		}
+	}
+	return workflowkit.ArtifactSpec{}, false
 }
 
 func stageHasArtifact(artifacts []workflowkit.ArtifactSpec, name, schemaVersion string) bool {

@@ -312,8 +312,16 @@ func artifactInputWithSchema(name, schemaVersion string) stageArtifact {
 	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion, Required: true}, input: true}
 }
 
+func optionalArtifactInputWithSchema(name, schemaVersion string) stageArtifact {
+	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion}, input: true}
+}
+
 func reviewDecisionInput(name string) stageArtifact {
 	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: "harbor.review-decision.v1", Required: true}, input: true}
+}
+
+func optionalReviewDecisionInput(name string) stageArtifact {
+	return optionalArtifactInputWithSchema(name, "harbor.review-decision.v1")
 }
 
 func artifactOutput(name string) stageArtifact {

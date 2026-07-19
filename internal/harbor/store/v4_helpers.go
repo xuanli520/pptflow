@@ -93,7 +93,7 @@ func validContinuationExecutionTransition(from, to ContinuationExecutionState) b
 	}
 	switch from {
 	case ContinuationExecutionQueued:
-		return to == ContinuationExecutionRunning || to == ContinuationExecutionCanceled
+		return to == ContinuationExecutionRunning || to == ContinuationExecutionCanceled || to == ContinuationExecutionReconcileRequired
 	case ContinuationExecutionRunning:
 		return to == ContinuationExecutionCompleted || to == ContinuationExecutionFailed ||
 			to == ContinuationExecutionCanceled || to == ContinuationExecutionReconcileRequired

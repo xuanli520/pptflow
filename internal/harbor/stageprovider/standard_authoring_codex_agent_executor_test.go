@@ -113,6 +113,59 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 	}
 }
 
+func TestStandardAuthoringCodexAgentTurnRequestCarriesFrozenReviewFeedback(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 19, 8, 0, 0, 0, time.UTC)
+	stage := standardAuthoringCodexTestStage(1)
+	stage.Inputs = []workflowkit.ArtifactSpec{
+		{Name: "repo_prepared", SchemaVersion: "harbor.artifact.v1", Required: true},
+		{Name: "task_review_decision", SchemaVersion: "harbor.review-decision.v1"},
+	}
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"submitted":true}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("repaired analysis"))}},
+	}}
+	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, 1)
+	source := []byte("prepared source")
+	reason := "Correct the misspelled tower-http path."
+	feedback := []byte(`{"format":"harbor.authoring-review-gate-decision.v1","action":"request_changes","decision_reason":"` + reason + `"}`)
+	sourceBinding := workflowkit.ArtifactBinding{
+		Name: "repo_prepared", ArtifactID: "source-input", ContentDigest: workflowkit.SHA256Fingerprint(source), SchemaVersion: "harbor.artifact.v1",
+	}
+	feedbackBinding := workflowkit.ArtifactBinding{
+		Name: "task_review_decision", ArtifactID: "feedback-input", ContentDigest: workflowkit.SHA256Fingerprint(feedback), SchemaVersion: "harbor.review-decision.v1",
+	}
+	request, _, _ := standardAuthoringCodexTestRequest(stage, source, now)
+	request.Inputs = []workflowkit.ArtifactBinding{sourceBinding, feedbackBinding}
+	request.ReadInput = func(_ context.Context, binding workflowkit.ArtifactBinding) ([]byte, error) {
+		switch binding {
+		case sourceBinding:
+			return append([]byte(nil), source...), nil
+		case feedbackBinding:
+			return append([]byte(nil), feedback...), nil
+		default:
+			return nil, errors.New("unexpected frozen input")
+		}
+	}
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts))},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil || result.Outcome.Verdict != workflowkit.VerdictPass {
+		t.Fatalf("execute repair feedback turn = %+v, %v", result, err)
+	}
+	if len(runtime.conversation.requests) != 1 || len(runtime.conversation.requests[0].Input) != 1 {
+		t.Fatalf("repair feedback requests = %+v", runtime.conversation.requests)
+	}
+	document := runtime.conversation.requests[0].Input[0].Text
+	if strings.Contains(document, reason) || !strings.Contains(document, "task_review_decision") ||
+		!strings.Contains(document, base64.StdEncoding.EncodeToString(feedback)) || !strings.Contains(document, string(feedbackBinding.ContentDigest)) {
+		t.Fatalf("frozen repair feedback request document = %s", document)
+	}
+}
+
 func TestStandardAuthoringCodexAgentTurnExecutorAcceptsSubmissionOnThirtiethTurn(t *testing.T) {
 	t.Parallel()
 	const turns = 30

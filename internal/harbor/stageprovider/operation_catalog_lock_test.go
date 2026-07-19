@@ -169,6 +169,11 @@ func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile
 	if err := wrongProfile.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
 		t.Fatalf("Standard authoring lock with another template's profile error = %v, want invalid lock", err)
 	}
+	mismatchedProfile := lock.Clone()
+	mismatchedProfile.StandardAuthoringExecutionProfile = &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfileForTemplate(t, workflowadapter.StandardAuthoringBriefTemplateReference())}
+	if err := mismatchedProfile.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+		t.Fatalf("Standard authoring lock with another installed profile version error = %v, want invalid lock", err)
+	}
 	_, wrongTurns, _ := standardAuthoringAgentOnlyCompositionFixture(t)
 	if err := wrongTurns.Validate(); err != nil {
 		t.Fatalf("valid Standard authoring agent lock was rejected: %v", err)

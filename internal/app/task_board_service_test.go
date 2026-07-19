@@ -414,6 +414,159 @@ func TestTaskBoardServiceDecidesAuthoringAndRevisionReviewsThroughTheirOwnContra
 	}
 }
 
+func TestTaskBoardAuthoringRequestChangesRunsRepairAndReturnsToReview(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryLaunchFixture(t)
+	fixture.services.TaskBoard.actor = func() (string, error) { return "task-board-reviewer", nil }
+	runtime := newFrozenRuntime(t, fixture.services, taskBoardAuthoringRuntimeRegistry(t, fixture.workflow))
+	worker := newFrozenRuntimeWorker(t, fixture.store, runtime, "task-board-authoring-repair-worker")
+
+	firstReview := driveTaskBoardAuthoringToReview(t, ctx, fixture.services, worker, fixture.task.ID, fixture.run.ID, "")
+	decisionKey, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.TaskBoard.DecideReview(ctx, TaskBoardDecideReviewRequest{
+		IdempotencyKey: decisionKey, TaskID: fixture.task.ID, Review: firstReview,
+		Decision: TaskBoardRequestChanges, Reason: "Correct the misspelled tower-http path.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	driveTaskBoardRunToStatus(t, ctx, worker, fixture.store, fixture.run.ID, store.WorkflowRunWaitingContinuation)
+
+	waiting, err := fixture.services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitingTask := taskBoardTaskByID(t, waiting, fixture.task.ID)
+	if len(waitingTask.Runs) != 1 || !waitingTask.Runs[0].CanRetry || waitingTask.Runs[0].RetryStrategy != TaskBoardRetryStrategyAuthoringAdmissionRepair {
+		t.Fatalf("waiting authoring repair projection = %+v", waitingTask.Runs)
+	}
+	retryKey, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
+		IdempotencyKey: retryKey, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "apply requested authoring changes",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondReview := driveTaskBoardAuthoringToReview(t, ctx, fixture.services, worker, fixture.task.ID, fixture.run.ID, firstReview.RequestID)
+	if secondReview.RequestID == firstReview.RequestID {
+		t.Fatalf("repair reused task review request %s", firstReview.RequestID)
+	}
+
+	attempts, err := fixture.store.ListStageAttemptsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var latestRepoAnalysis store.StageAttempt
+	repoAnalysisAttempts := 0
+	for _, attempt := range attempts {
+		if attempt.StageKey != workflowadapter.RepoAnalyze {
+			continue
+		}
+		repoAnalysisAttempts++
+		latestRepoAnalysis = attempt
+	}
+	if repoAnalysisAttempts != 2 || latestRepoAnalysis.ExecutionStatus != store.StageExecutionCompleted {
+		t.Fatalf("repo_analyze repair attempts = %d latest=%+v", repoAnalysisAttempts, latestRepoAnalysis)
+	}
+	references, err := fixture.store.ListArtifactRefs(ctx, latestRepoAnalysis.ArtifactManifestID)
+	if err != nil || len(references) != 1 {
+		t.Fatalf("repaired repo_analysis refs = %+v, %v", references, err)
+	}
+	var bindings []workflowkit.ArtifactBinding
+	if err := decodeStrictJSON(references[0].InputBindingsJSON, &bindings); err != nil {
+		t.Fatal(err)
+	}
+	foundFeedback := false
+	for _, binding := range bindings {
+		if binding.Name == "task_review_decision" && binding.SchemaVersion == "harbor.review-decision.v1" {
+			foundFeedback = true
+		}
+	}
+	if !foundFeedback {
+		t.Fatalf("repaired repo_analysis lineage omitted task review feedback: %+v", bindings)
+	}
+}
+
+func taskBoardAuthoringRuntimeRegistry(t *testing.T, workflow workflowkit.WorkflowDescriptor) *workflowkit.ControlledPluginRegistry[workflowkit.StageExecutor] {
+	t.Helper()
+	executor := workflowkit.StageExecutorFunc(func(ctx context.Context, request workflowkit.StageExecutionRequest) (workflowkit.StageExecutionResult, error) {
+		switch request.Stage.Key {
+		case workflowkit.StageKey(workflowadapter.TaskReview), workflowkit.StageKey(workflowadapter.ContentReview), workflowkit.StageKey(workflowadapter.SolutionReview):
+			binding, err := workflowkit.NewOpaqueExecutionBinding("task-board.authoring-review.wait", "1", []byte(`{"kind":"authoring-review"}`))
+			if err != nil {
+				return workflowkit.StageExecutionResult{}, err
+			}
+			return workflowkit.StageExecutionResult{Wait: &workflowkit.StageWait{
+				Kind: workflowkit.StageWaitExternalDecision, OperationKey: "task-board-review:" + request.Execution.ID + ":" + string(request.Stage.Key), DecisionBinding: binding,
+			}}, nil
+		default:
+			return completedFixtureStage(ctx, request)
+		}
+	})
+	seen := make(map[workflowkit.PluginBinding]struct{})
+	registrations := make([]workflowkit.PluginRegistration[workflowkit.StageExecutor], 0, len(workflow.Stages))
+	for _, stage := range workflow.Stages {
+		if _, present := seen[stage.Plugin]; present {
+			continue
+		}
+		seen[stage.Plugin] = struct{}{}
+		registrations = append(registrations, workflowkit.PluginRegistration[workflowkit.StageExecutor]{Binding: stage.Plugin, Implementation: executor})
+	}
+	registry, err := workflowkit.NewControlledPluginRegistry(registrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}
+
+func driveTaskBoardAuthoringToReview(t *testing.T, ctx context.Context, services *LifecycleServices, worker *DurableWorker, taskID, runID, previousRequestID string) TaskBoardReview {
+	t.Helper()
+	for cycle := 0; cycle < 24; cycle++ {
+		snapshot, err := services.TaskBoard.List(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		task := taskBoardTaskByID(t, snapshot, taskID)
+		if task.Review != nil && task.Review.RequestID != "" && task.Review.RequestID != previousRequestID {
+			return *task.Review
+		}
+		result, err := worker.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("drive authoring review cycle %d: %+v, %v", cycle, result, err)
+		}
+		if result.Empty {
+			t.Fatalf("authoring worker became empty before Run %s reached review", runID)
+		}
+	}
+	t.Fatalf("Run %s did not reach authoring review", runID)
+	return TaskBoardReview{}
+}
+
+func driveTaskBoardRunToStatus(t *testing.T, ctx context.Context, worker *DurableWorker, dataStore *store.Store, runID string, status store.WorkflowRunStatus) {
+	t.Helper()
+	for cycle := 0; cycle < 12; cycle++ {
+		run, err := dataStore.GetWorkflowRun(ctx, runID)
+		if err != nil || run == nil {
+			t.Fatalf("load authoring Run %s: %+v, %v", runID, run, err)
+		}
+		if run.Status == status {
+			return
+		}
+		result, err := worker.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("drive authoring Run %s cycle %d: %+v, %v", runID, cycle, result, err)
+		}
+		if result.Empty {
+			t.Fatalf("authoring worker became empty before Run %s reached %s", runID, status)
+		}
+	}
+	t.Fatalf("Run %s did not reach %s", runID, status)
+}
+
 func TestTaskBoardServiceReplaysAuthoringReviewAfterActivationFailure(t *testing.T) {
 	ctx := context.Background()
 	services, database := newAuthoringReviewServiceFixture(t)

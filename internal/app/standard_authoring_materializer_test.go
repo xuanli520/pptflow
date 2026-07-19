@@ -46,7 +46,7 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringBriefTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "materializer-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -85,7 +85,7 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 		t.Fatal(err)
 	}
 
-	template := workflowadapter.StandardAuthoringBriefWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -226,7 +226,7 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 }
 
 func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvironmentPolicy(t *testing.T) {
-	template := workflowadapter.StandardAuthoringBriefWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -252,7 +252,7 @@ func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvi
 	session := store.AuthoringSession{ID: sessionID}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringBriefTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
 	}
 	packageInput := standardAuthoringTaskPackageFixture(t)
 	briefRaw, err := packageInput.Brief.CanonicalJSON()
@@ -419,7 +419,7 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringBriefTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "package-admission-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -439,7 +439,7 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	if err != nil {
 		t.Fatal(err)
 	}
-	template := workflowadapter.StandardAuthoringBriefWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -561,7 +561,7 @@ type standardAuthoringBriefStageInputFixture struct {
 
 func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowkit.StageKey) standardAuthoringBriefStageInputFixture {
 	t.Helper()
-	template := workflowadapter.StandardAuthoringBriefWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -592,7 +592,7 @@ func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowk
 	session := store.AuthoringSession{ID: sessionID}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringBriefTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
 	}
 	policyRaw, err := packageInput.Environment.CanonicalJSON()
 	if err != nil {
