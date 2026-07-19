@@ -3583,7 +3583,11 @@ WHEN NOT EXISTS (
     WHERE run.id = NEW.authoring_run_id
       AND run.subject_kind = 'authoring_session'
       AND run.workflow_template_id = 'harbor.standard-authoring'
-      AND run.workflow_template_version = '1.2.0'
+      AND (
+          (run.workflow_template_version = '1.2.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v1')
+          OR
+          (run.workflow_template_version = '1.3.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')
+      )
       AND run.authoring_session_id = NEW.authoring_session_id
       AND run.subject_id = NEW.authoring_source_id
       AND run.subject_revision_id = NEW.authoring_session_id
@@ -3601,7 +3605,6 @@ WHEN NOT EXISTS (
       AND artifact.run_id = run.id
       AND artifact.stage_key = 'materialize_task'
       AND artifact.artifact_key = 'authoring_task_handoff'
-      AND artifact.schema_version = 'harbor.authoring-task-handoff.v1'
       AND artifact.subject_revision_id = NEW.authoring_session_id
       AND artifact.subject_digest = source.snapshot_content_digest
       AND attempt.run_id = run.id

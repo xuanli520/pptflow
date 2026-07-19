@@ -140,6 +140,9 @@ func (s *Store) PrepareAuthoringPhase1Handoff(ctx context.Context, request Prepa
 		if isGlobalIdentityCollision(err) || isUniqueConstraint(err) {
 			return AuthoringPhase1Handoff{}, fmt.Errorf("%w: Standard authoring Phase-1 handoff %s", ErrIdentityCollision, handoff.ID)
 		}
+		if isAuthoringPhase1HandoffLineageConstraint(err) {
+			return AuthoringPhase1Handoff{}, fmt.Errorf("%w: %v", ErrImmutable, err)
+		}
 		return AuthoringPhase1Handoff{}, err
 	}
 	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
@@ -154,6 +157,13 @@ func (s *Store) PrepareAuthoringPhase1Handoff(ctx context.Context, request Prepa
 		return AuthoringPhase1Handoff{}, err
 	}
 	return handoff, nil
+}
+
+func isAuthoringPhase1HandoffLineageConstraint(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "authoring phase-1 handoff does not match persisted materialization lineage")
 }
 
 func prepareAuthoringPhase1Handoff(request PrepareAuthoringPhase1HandoffRequest) (preparedAuthoringPhase1Handoff, error) {

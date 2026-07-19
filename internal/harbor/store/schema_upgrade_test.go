@@ -1,0 +1,89 @@
+package store
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
+	store := tempDB(t)
+	root := store.rootDir
+
+	currentTrigger, err := currentAuthoringPhase1HandoffTriggerSQL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyTrigger := strings.Replace(currentTrigger,
+		"      AND (\n          (run.workflow_template_version = '1.2.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v1')\n          OR\n          (run.workflow_template_version = '1.3.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n      )",
+		"      AND run.workflow_template_version = '1.2.0'",
+		1,
+	)
+	legacyTrigger = strings.Replace(legacyTrigger,
+		"      AND artifact.artifact_key = 'authoring_task_handoff'\n",
+		"      AND artifact.artifact_key = 'authoring_task_handoff'\n      AND artifact.schema_version = 'harbor.authoring-task-handoff.v1'\n",
+		1,
+	)
+	if legacyTrigger == currentTrigger {
+		t.Fatal("legacy trigger fixture was not changed")
+	}
+	if _, err := store.db.Exec(`DROP TRIGGER ` + authoringPhase1HandoffTriggerName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(legacyTrigger); err != nil {
+		t.Fatal(err)
+	}
+	legacyFingerprint, err := sqliteSchemaContract(store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyFingerprint != legacyConsolidatedV2SchemaContractFingerprint {
+		t.Fatalf("legacy fixture fingerprint = %s, want %s", legacyFingerprint, legacyConsolidatedV2SchemaContractFingerprint)
+	}
+	if _, err := store.db.Exec(`UPDATE store_metadata SET value = ? WHERE key = ?`, legacyFingerprint, baselineV2SchemaContractMetadataKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := Open(root)
+	if err != nil {
+		t.Fatalf("open legacy V2 store for atomic upgrade: %v", err)
+	}
+	defer upgraded.Close()
+	if err := upgraded.validateConsolidatedV2Baseline(); err != nil {
+		t.Fatalf("upgraded store failed current schema admission: %v", err)
+	}
+	expected, err := consolidatedV2SchemaContract()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := sqliteSchemaContract(upgraded.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual != expected {
+		t.Fatalf("upgraded schema fingerprint = %s, want %s", actual, expected)
+	}
+	var recorded string
+	if err := upgraded.db.QueryRowContext(context.Background(), `SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded != expected {
+		t.Fatalf("upgraded schema marker = %s, want %s", recorded, expected)
+	}
+}
+
+func TestAuthoringPhase1HandoffLineageConstraintIsDetected(t *testing.T) {
+	if !isAuthoringPhase1HandoffLineageConstraint(assertionError("constraint failed: authoring Phase-1 handoff does not match persisted materialization lineage (1811)")) {
+		t.Fatal("SQLite authoring handoff lineage trigger was not recognized")
+	}
+	if isAuthoringPhase1HandoffLineageConstraint(assertionError("database is temporarily unavailable")) {
+		t.Fatal("generic storage failure was classified as a lineage constraint")
+	}
+}
+
+type assertionError string
+
+func (err assertionError) Error() string { return string(err) }

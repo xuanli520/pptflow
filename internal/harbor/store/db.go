@@ -31,6 +31,12 @@ const (
 	// database whose tables, constraints, indexes, or triggers have drifted.
 	baselineV2SchemaContractMetadataKey = "schema_contract_fingerprint"
 	baselineV2SchemaContractDomain      = "harbor.store.consolidated-v2-schema-contract.v1"
+
+	// This is the one previously published consolidated V2 schema whose
+	// Standard authoring handoff trigger still bound 1.2/v1. It is admitted only
+	// for the atomic upgrade below; unknown fingerprints remain rejected.
+	legacyConsolidatedV2SchemaContractFingerprint = "sha256:db935bd40f92f0d7a9ae4d432b568f5987aebe4d41a5d66f90c55d3fafc53f0b"
+	authoringPhase1HandoffTriggerName             = "authoring_phase1_handoffs_v2_binding_insert"
 )
 
 type sqliteSchemaContractObject struct {
@@ -293,7 +299,7 @@ func preflightWritableStoreAdmission(dbPath string) error {
 		return preConsolidationStoreError("database has tables but no V2 baseline marker")
 	}
 
-	if err := validateConsolidatedV2BaselineDatabase(db); err != nil {
+	if err := validateConsolidatedV2BaselineDatabase(db, true); err != nil {
 		if errors.Is(err, ErrPreConsolidationStore) {
 			return err
 		}
@@ -444,7 +450,13 @@ func (s *Store) migrate() error {
 		}
 		return s.bootstrapV2()
 	}
-	return s.validateConsolidatedV2Baseline()
+	if err := validateConsolidatedV2BaselineDatabase(s.db, true); err != nil {
+		return err
+	}
+	if err := s.upgradeLegacyConsolidatedV2Schema(); err != nil {
+		return err
+	}
+	return validateConsolidatedV2BaselineDatabase(s.db, false)
 }
 
 // rejectLegacyV1Store recognizes only schema markers. It never reads V1 rows,
@@ -543,14 +555,14 @@ func (s *Store) hasUserTables() (bool, error) {
 // was the first step of the retired incremental chain and has a different
 // physical schema. This check is deliberately read-only.
 func (s *Store) validateConsolidatedV2Baseline() error {
-	return validateConsolidatedV2BaselineDatabase(s.db)
+	return validateConsolidatedV2BaselineDatabase(s.db, false)
 }
 
 // validateConsolidatedV2BaselineDatabase is the shared read-only admission
 // check for a control-plane SQLite database. It is used for normal store opens
 // and recovery candidates so a backup cannot restore a database that this
 // binary would immediately reject.
-func validateConsolidatedV2BaselineDatabase(db *sql.DB) error {
+func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) error {
 	hasTable, err := hasSchemaVersionTableDatabase(db)
 	if err != nil {
 		return err
@@ -599,17 +611,82 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB) error {
 		}
 		return preConsolidationStoreError(fmt.Sprintf("read V2 schema contract marker: %v", err))
 	}
-	if recordedContract != expectedContract {
-		return preConsolidationStoreError("V2 schema contract marker does not match this control plane")
-	}
 	actualContract, err := sqliteSchemaContract(db)
 	if err != nil {
 		return fmt.Errorf("derive persisted V2 schema contract: %w", err)
+	}
+	if recordedContract == expectedContract && actualContract == expectedContract {
+		return nil
+	}
+	if allowKnownLegacy && recordedContract == legacyConsolidatedV2SchemaContractFingerprint && actualContract == legacyConsolidatedV2SchemaContractFingerprint {
+		return nil
+	}
+	if recordedContract != expectedContract {
+		return preConsolidationStoreError("V2 schema contract marker does not match this control plane")
 	}
 	if actualContract != expectedContract {
 		return preConsolidationStoreError("V2 physical schema does not match the consolidated baseline")
 	}
 	return nil
+}
+
+// upgradeLegacyConsolidatedV2Schema repairs the one published V2 contract that
+// predates the 1.3/v2 Standard authoring handoff. The trigger replacement and
+// contract marker update are one transaction, so an interrupted startup leaves
+// the old, internally consistent schema for the next attempt. No unknown
+// schema is admitted here.
+func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
+	var recordedContract string
+	if err := s.db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
+		return err
+	}
+	actualContract, err := sqliteSchemaContract(s.db)
+	if err != nil {
+		return fmt.Errorf("derive persisted legacy V2 schema contract: %w", err)
+	}
+	if recordedContract != legacyConsolidatedV2SchemaContractFingerprint || actualContract != legacyConsolidatedV2SchemaContractFingerprint {
+		return nil
+	}
+	triggerSQL, err := currentAuthoringPhase1HandoffTriggerSQL()
+	if err != nil {
+		return err
+	}
+	expectedContract, err := consolidatedV2SchemaContract()
+	if err != nil {
+		return fmt.Errorf("derive upgraded V2 schema contract: %w", err)
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("begin legacy V2 schema upgrade: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS ` + authoringPhase1HandoffTriggerName); err != nil {
+		return fmt.Errorf("drop legacy Standard authoring handoff trigger: %w", err)
+	}
+	if _, err := tx.Exec(triggerSQL); err != nil {
+		return fmt.Errorf("install upgraded Standard authoring handoff trigger: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE store_metadata SET value = ?, updated_at = ? WHERE key = ?`, expectedContract, s.now().UTC(), baselineV2SchemaContractMetadataKey); err != nil {
+		return fmt.Errorf("record upgraded V2 schema contract: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit legacy V2 schema upgrade: %w", err)
+	}
+	return nil
+}
+
+func currentAuthoringPhase1HandoffTriggerSQL() (string, error) {
+	startMarker := "CREATE TRIGGER " + authoringPhase1HandoffTriggerName
+	start := strings.Index(migrationV2, startMarker)
+	if start < 0 {
+		return "", fmt.Errorf("current Standard authoring handoff trigger is missing from V2 migration")
+	}
+	endMarker := "\n\n-- trigger workflow_runs_content_immutable"
+	relativeEnd := strings.Index(migrationV2[start:], endMarker)
+	if relativeEnd < 0 {
+		return "", fmt.Errorf("current Standard authoring handoff trigger boundary is missing from V2 migration")
+	}
+	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
 }
 
 // consolidatedV2SchemaContract derives the canonical DDL fingerprint from a
