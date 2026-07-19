@@ -58,7 +58,7 @@
     },
     {
       "stage_key": "test_generate",
-      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.1.0", "relative_path": "prompts/test-generate.json"},
+      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.2.0", "relative_path": "prompts/test-generate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
