@@ -296,6 +296,32 @@ func TestAuthoringAdmissionRecoveryRegeneratesEveryPackageProducer(t *testing.T)
 	}
 }
 
+func TestAuthoringGeneratedFilesRecoveryRegeneratesProducerAndConsumers(t *testing.T) {
+	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
+		workflowkit.NodeID(workflowadapter.GenerateTaskFiles): {
+			ID: "generated-files-attempt", StageKey: workflowadapter.GenerateTaskFiles,
+			ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair,
+		},
+	}}
+	selection, err := authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTargets := []workflowkit.NodeID{
+		workflowkit.NodeID(workflowadapter.GenerateTaskFiles),
+		workflowkit.NodeID(workflowadapter.InstructionGen), workflowkit.NodeID(workflowadapter.TaskTOMLGen), workflowkit.NodeID(workflowadapter.DockerfileGen),
+		workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen), workflowkit.NodeID(workflowadapter.TestsAnalysis),
+	}
+	if !reflect.DeepEqual(selection.targetNodeIDs, wantTargets) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{"generated-files-attempt"}) || len(selection.feedback) != 0 {
+		t.Fatalf("generated-files recovery selection=%+v", selection)
+	}
+}
+
 func TestAuthoringReviewRecoveryRegeneratesReviewedProducers(t *testing.T) {
 	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))

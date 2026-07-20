@@ -628,7 +628,7 @@ func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.Workfl
 		return authoringRecoverySelection{}, err
 	}
 	if run.Status == store.WorkflowRunWaitingContinuation {
-		if len(repairSelection.feedback) == 0 {
+		if len(repairSelection.feedback) == 0 && len(repairSelection.targetNodeIDs) == 0 {
 			return authoringRecoverySelection{}, fmt.Errorf("%w: waiting authoring Run is %s and has no supported needs_repair result", ErrAuthoringRecoveryUnavailable, run.Status)
 		}
 		return repairSelection, nil
@@ -694,6 +694,10 @@ func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.Workfl
 }
 
 func activeAuthoringRepairSelection(workflow workflowkit.WorkflowDescriptor, state continuationRunState) (authoringRecoverySelection, error) {
+	// A generated-task-files needs_repair result has no downstream review
+	// decision to bind. Re-run the producer and every content consumer with the
+	// same frozen inputs; the failed attempt itself is the durable checkpoint.
+	generatedFiles := workflowkit.NodeID(workflowadapter.GenerateTaskFiles)
 	producers := []workflowkit.NodeID{
 		workflowkit.NodeID(workflowadapter.InstructionGen),
 		workflowkit.NodeID(workflowadapter.TaskTOMLGen),
@@ -743,6 +747,13 @@ func activeAuthoringRepairSelection(workflow workflowkit.WorkflowDescriptor, sta
 				targetSet[target] = struct{}{}
 			}
 		}
+	}
+	if latest, present := state.Latest[generatedFiles]; present && latest.ExecutionStatus == store.StageExecutionCompleted && latest.Verdict == store.VerdictNeedsRepair {
+		repairTargets := append([]workflowkit.NodeID{generatedFiles}, producers...)
+		for _, target := range repairTargets {
+			targetSet[target] = struct{}{}
+		}
+		selection.failureStageAttemptIDs = append(selection.failureStageAttemptIDs, latest.ID)
 	}
 	order, err := workflow.TopologicalStages()
 	if err != nil {
