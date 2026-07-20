@@ -694,10 +694,10 @@ func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.Workfl
 }
 
 func activeAuthoringRepairSelection(workflow workflowkit.WorkflowDescriptor, state continuationRunState) (authoringRecoverySelection, error) {
-	// A generated-task-files needs_repair result has no downstream review
-	// decision to bind. Re-run the producer and every content consumer with the
-	// same frozen inputs; the failed attempt itself is the durable checkpoint.
-	generatedFiles := workflowkit.NodeID(workflowadapter.GenerateTaskFiles)
+	// A direct content-producer needs_repair result has no downstream review
+	// decision to bind. Re-run that producer with the same frozen inputs; the
+	// failed attempt itself is the durable checkpoint. Invalidation will also
+	// invalidate its dependent stages while preserving operator-only gates.
 	producers := []workflowkit.NodeID{
 		workflowkit.NodeID(workflowadapter.InstructionGen),
 		workflowkit.NodeID(workflowadapter.TaskTOMLGen),
@@ -748,12 +748,15 @@ func activeAuthoringRepairSelection(workflow workflowkit.WorkflowDescriptor, sta
 			}
 		}
 	}
-	if latest, present := state.Latest[generatedFiles]; present && latest.ExecutionStatus == store.StageExecutionCompleted && latest.Verdict == store.VerdictNeedsRepair {
-		repairTargets := append([]workflowkit.NodeID{generatedFiles}, producers...)
-		for _, target := range repairTargets {
-			targetSet[target] = struct{}{}
+	for _, stage := range workflow.Stages {
+		if stage.OperatorOnly() || stage.Effect != workflowkit.EffectContentProducer {
+			continue
 		}
-		selection.failureStageAttemptIDs = append(selection.failureStageAttemptIDs, latest.ID)
+		latest, present := state.Latest[stage.Key]
+		if present && latest.ExecutionStatus == store.StageExecutionCompleted && latest.Verdict == store.VerdictNeedsRepair {
+			targetSet[stage.Key] = struct{}{}
+			selection.failureStageAttemptIDs = append(selection.failureStageAttemptIDs, latest.ID)
+		}
 	}
 	order, err := workflow.TopologicalStages()
 	if err != nil {

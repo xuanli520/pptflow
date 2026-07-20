@@ -296,7 +296,7 @@ func TestAuthoringAdmissionRecoveryRegeneratesEveryPackageProducer(t *testing.T)
 	}
 }
 
-func TestAuthoringGeneratedFilesRecoveryRegeneratesProducerAndConsumers(t *testing.T) {
+func TestAuthoringGeneratedFilesRecoveryRegeneratesProducer(t *testing.T) {
 	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
@@ -312,13 +312,36 @@ func TestAuthoringGeneratedFilesRecoveryRegeneratesProducerAndConsumers(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTargets := []workflowkit.NodeID{
-		workflowkit.NodeID(workflowadapter.GenerateTaskFiles),
-		workflowkit.NodeID(workflowadapter.InstructionGen), workflowkit.NodeID(workflowadapter.TaskTOMLGen), workflowkit.NodeID(workflowadapter.DockerfileGen),
-		workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen), workflowkit.NodeID(workflowadapter.TestsAnalysis),
-	}
+	wantTargets := []workflowkit.NodeID{workflowkit.NodeID(workflowadapter.GenerateTaskFiles)}
 	if !reflect.DeepEqual(selection.targetNodeIDs, wantTargets) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{"generated-files-attempt"}) || len(selection.feedback) != 0 {
 		t.Fatalf("generated-files recovery selection=%+v", selection)
+	}
+}
+
+func TestAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) {
+	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []workflowkit.NodeID{
+		workflowkit.NodeID(workflowadapter.TaskDesign), workflowkit.NodeID(workflowadapter.GenerateTaskFiles),
+		workflowkit.NodeID(workflowadapter.InstructionGen), workflowkit.NodeID(workflowadapter.TaskTOMLGen), workflowkit.NodeID(workflowadapter.DockerfileGen),
+		workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen), workflowkit.NodeID(workflowadapter.TestsAnalysis),
+	} {
+		t.Run(string(key), func(t *testing.T) {
+			attemptID := "direct-needs-repair-" + string(key)
+			state := continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
+				key: {ID: attemptID, StageKey: string(key), ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair},
+			}}
+			selection, err := authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(selection.targetNodeIDs, []workflowkit.NodeID{key}) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{attemptID}) || len(selection.feedback) != 0 {
+				t.Fatalf("direct content-producer recovery selection=%+v", selection)
+			}
+		})
 	}
 }
 
