@@ -722,7 +722,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorFailsWithoutToolSubmission(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outcome.Status != workflowkit.StatusInfraFailed || result.ErrorText != standardAuthoringCodexSubmissionFailureAbsent || len(result.Artifacts) != 0 {
+	if result.Outcome.Status != workflowkit.StatusInfraFailed || result.Outcome.Failure != workflowkit.FailureProcess || result.ErrorText != standardAuthoringCodexSubmissionFailureAbsent || len(result.Artifacts) != 0 {
 		t.Fatalf("free-text result = %+v, want missing output submission failure", result)
 	}
 	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != 1 || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 0 {

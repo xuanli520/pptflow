@@ -123,17 +123,21 @@ func TestDetailDoesNotRenderLegacyRawFailureReason(t *testing.T) {
 	}
 }
 
-func TestDetailLabelsAuthoringRecoveryWithoutCallingItGenericRetry(t *testing.T) {
+func TestDetailOffersAuthoringRecoveryForMissingOutputSubmission(t *testing.T) {
 	detail := newDetailModel(&TaskItem{
 		Name: "Task one", Slug: "task-one", RunID: "run-current",
 		Runs: []TaskRunItem{{
 			ID: "run-current", Status: "failed_recoverable", CanRetry: true,
 			RetryStrategy: app.TaskBoardRetryStrategyAuthoringRecovery,
+			FailureCode:   "standard_authoring_codex_agent_turn.output_submission_missing",
 		}},
 	})
 	rendered := ansi.Strip(detail.View(100, 28))
 	if !strings.Contains(rendered, "恢复/重试") {
 		t.Fatalf("authoring recovery label missing:\n%s", rendered)
+	}
+	if footer := detailFooterText(detail); !strings.Contains(footer, "[t] 恢复/重试") {
+		t.Fatalf("authoring recovery action missing from footer: %q", footer)
 	}
 }
 

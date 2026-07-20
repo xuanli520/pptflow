@@ -88,7 +88,7 @@ func TestTaskBoardServiceRetriesTheSelectedTaskRevisionRun(t *testing.T) {
 	}
 }
 
-func TestTaskBoardServiceRecoversAuthoringRunThroughDedicatedPath(t *testing.T) {
+func TestTaskBoardServiceRecoversMissingOutputSubmissionProcessFailureThroughDedicatedPath(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.OpenForTest(root)
@@ -153,7 +153,7 @@ func TestTaskBoardServiceRecoversAuthoringRunThroughDedicatedPath(t *testing.T) 
 	}
 	if _, err := database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
 		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionInfraFailed,
-		ErrorText: "transient provider network failure", FailureClass: string(workflowkit.FailureNetwork), Actor: "worker", Reason: "record recoverable authoring failure",
+		ErrorText: "standard_authoring_codex_agent_turn.output_submission_missing", FailureClass: string(workflowkit.FailureProcess), Actor: "worker", Reason: "record missing-output process failure",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestTaskBoardServiceRecoversAuthoringRunThroughDedicatedPath(t *testing.T) 
 		t.Fatal(err)
 	}
 	recoveryRequest := TaskBoardRetryRunRequest{
-		IdempotencyKey: recoveryKey, TaskID: receipt.TaskID, RunID: run.ID, Reason: "recover transient provider failure",
+		IdempotencyKey: recoveryKey, TaskID: receipt.TaskID, RunID: run.ID, Reason: "recover missing structured output submission",
 	}
 	services.TaskBoard.activations = &RunActivationService{core: services.core, launcher: failingTaskBoardActivationLauncher{}}
 	if _, err := services.TaskBoard.RetryRun(ctx, recoveryRequest); err == nil {

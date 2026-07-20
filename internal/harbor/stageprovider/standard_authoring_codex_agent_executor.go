@@ -516,7 +516,9 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if submission.failure() != "" {
 		return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(submission.failure()), submission.failure()), nil
 	}
-	return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexSubmissionFailureAbsent), nil
+	// The frozen inputs and output contract remain valid; this particular agent
+	// process simply ended without delivering the required structured result.
+	return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexSubmissionFailureAbsent), nil
 }
 
 func standardAuthoringCodexSubmissionFailureClass(code string) workflowkit.FailureClass {

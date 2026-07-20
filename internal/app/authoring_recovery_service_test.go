@@ -131,6 +131,28 @@ func TestAuthoringRecoveryFreezesRetryPlanAndQueuesOneExecution(t *testing.T) {
 	}
 }
 
+func TestAuthoringRecoveryAllowsMissingOutputSubmissionProcessFailure(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureProcess)
+
+	available, reason, err := fixture.services.AuthoringRecovery.CanRecover(ctx, fixture.run.ID)
+	if err != nil || !available || reason != "" {
+		t.Fatalf("missing-output recovery availability = %t, %q, %v", available, reason, err)
+	}
+	checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := fixture.services.AuthoringRecovery.PreviewAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+		CommandKey: authoringRecoveryUUID(t), RunID: fixture.run.ID, Expected: checkpoint,
+		Actor: "operator", Reason: "retry missing structured output submission",
+	})
+	if err != nil {
+		t.Fatalf("preview missing-output authoring recovery: %v", err)
+	}
+	assertAuthoringRecoveryPlan(t, plan, fixture)
+}
+
 func TestAuthoringRecoveryRejectsWaitingContinuationWithoutWritingRecoveryState(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
