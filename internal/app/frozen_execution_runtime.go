@@ -1044,6 +1044,9 @@ func (runtime *FrozenExecutionRuntime) scheduledContinuationStages(ctx context.C
 			snapshot.Generation != transition.ToGeneration {
 			continue
 		}
+		if _, duplicate := admitted[stageKey]; duplicate {
+			return nil, fmt.Errorf("%w: continuation plan has multiple matching StageAttempts for stage %q", ErrFrozenExecutionPayload, stageKey)
+		}
 		admitted[stageKey] = struct{}{}
 	}
 	return admitted, nil

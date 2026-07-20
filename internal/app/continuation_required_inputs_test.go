@@ -163,43 +163,57 @@ func TestContinuationValidationSkipsStagesAlreadyAdmittedByThisPlan(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	admitted := 0
+	type scheduledStage struct {
+		stage      workflowkit.StageDescriptor
+		transition workflowkit.NodeTransition
+	}
+	var scheduled []scheduledStage
 	for _, stage := range runtimePlan.Workflow.Stages {
 		transition, found := runtimePlan.stageTransition(stage.Key)
 		if !found || transition.Disposition != workflowkit.DispositionSchedule || len(transition.InputBindings) == 0 {
 			continue
 		}
-		fingerprint, err := workflowkit.FingerprintArtifactBindings(transition.InputBindings)
+		scheduled = append(scheduled, scheduledStage{stage: stage, transition: transition})
+	}
+	if len(scheduled) < 2 {
+		t.Fatalf("fixture continuation has %d required scheduled stages; need a pending stage", len(scheduled))
+	}
+	admit := func(candidate scheduledStage) {
+		t.Helper()
+		fingerprint, err := workflowkit.FingerprintArtifactBindings(candidate.transition.InputBindings)
 		if err != nil {
 			t.Fatal(err)
 		}
-		attempt, err := runtime.findOrCreatePlannedStageAttempt(ctx, *run, runtimePlan, stage, transition, fingerprint, "operator")
+		attempt, err := runtime.findOrCreatePlannedStageAttempt(ctx, *run, runtimePlan, candidate.stage, candidate.transition, fingerprint, "operator")
 		if err != nil {
-			t.Fatalf("admit %q: %v", stage.Key, err)
+			t.Fatalf("admit %q: %v", candidate.stage.Key, err)
 		}
 		attempt, err = fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
 			StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionRunning,
 			Actor: "operator", Reason: "mark frozen stage as running",
 		})
 		if err != nil {
-			t.Fatalf("start %q: %v", stage.Key, err)
+			t.Fatalf("start %q: %v", candidate.stage.Key, err)
 		}
 		if _, err := fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
 			StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionCompleted,
 			Verdict: store.VerdictPass, Actor: "operator", Reason: "mark frozen stage as completed",
 		}); err != nil {
-			t.Fatalf("complete %q: %v", stage.Key, err)
+			t.Fatalf("complete %q: %v", candidate.stage.Key, err)
 		}
-		admitted++
 	}
-	if admitted == 0 {
-		t.Fatal("fixture continuation did not contain a required scheduled stage")
-	}
+	admit(scheduled[0])
 	removeAuthoringRecoveryArtifactObject(t, ctx, fixture, decisionRef)
 	if err := validateRequiredContinuationInputs(ctx, fixture.services.core, *run, runtimePlan); err == nil {
 		t.Fatal("strict pre-commit validation unexpectedly ignored changed input")
 	}
+	if err := runtime.validateRemainingRequiredContinuationInputs(ctx, *run, runtimePlan); err == nil {
+		t.Fatal("continuation re-entry ignored drift for a stage that was not admitted")
+	}
+	for _, candidate := range scheduled[1:] {
+		admit(candidate)
+	}
 	if err := runtime.validateRemainingRequiredContinuationInputs(ctx, *run, runtimePlan); err != nil {
-		t.Fatalf("continuation re-entry rejected an already admitted stage: %v", err)
+		t.Fatalf("continuation re-entry rejected only already admitted stages: %v", err)
 	}
 }
