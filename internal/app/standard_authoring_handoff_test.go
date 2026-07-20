@@ -308,8 +308,8 @@ func TestStandardAuthoringHandoffBlocksReverseCoordinatorCompletionUntilChildIsB
 	// This call models the old reverse scheduling order: a coordinator that
 	// was already queued reaches its completion branch before the handoff job
 	// has created the Phase-1 child. It must complete harmlessly, not terminally.
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate())
-	resolved, err := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate().Compile(profile)
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringCurrentWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,8 +417,8 @@ func TestStandardAuthoringHandoffCompletionResumesMaterializedContinuation(t *te
 		t.Fatalf("continuation completion coordinator = %+v, %v", completion, err)
 	}
 
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate())
-	resolved, err := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate().Compile(profile)
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringCurrentWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1040,7 +1040,7 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "handoff-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -1077,8 +1077,8 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate())
-	resolved, err := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate().Compile(profile)
+	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.StandardAuthoringCurrentWorkflowTemplate())
+	resolved, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}

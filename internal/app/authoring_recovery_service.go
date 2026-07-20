@@ -472,7 +472,7 @@ func (service *AuthoringRecoveryService) ensureRecoverableBinding(ctx context.Co
 	switch binding.run.Status {
 	case store.WorkflowRunFailedRecoverable, store.WorkflowRunPaused:
 	case store.WorkflowRunWaitingContinuation:
-		if binding.run.WorkflowTemplateVersion != workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion {
+		if !isCurrentStandardAuthoringRun(binding.run) {
 			return fmt.Errorf("%w: workflow run %s is %s; legacy authoring admission failures require an explicit new task revision", ErrAuthoringRecoveryUnavailable, binding.run.ID, binding.run.Status)
 		}
 	default:
@@ -754,6 +754,9 @@ func activeAuthoringRepairSelection(workflow workflowkit.WorkflowDescriptor, sta
 		}
 		latest, present := state.Latest[stage.Key]
 		if present && latest.ExecutionStatus == store.StageExecutionCompleted && latest.Verdict == store.VerdictNeedsRepair {
+			if !stage.Verdicts.Allows(workflowkit.VerdictNeedsRepair) {
+				return authoringRecoverySelection{}, fmt.Errorf("%w: stage %q persisted needs_repair outside its frozen verdict policy", ErrAuthoringRecoveryUnavailable, stage.Key)
+			}
 			targetSet[stage.Key] = struct{}{}
 			selection.failureStageAttemptIDs = append(selection.failureStageAttemptIDs, latest.ID)
 		}

@@ -55,7 +55,7 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if request.ExecutionEpoch < 0 {
 		return store.WorkflowRun{}, fmt.Errorf("execution epoch cannot be negative")
 	}
-	if !request.Profile.Template.Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) ||
+	if !request.Profile.Template.Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) ||
 		!request.ExecutionSpec.Template.Equal(request.Profile.Template) {
 		return store.WorkflowRun{}, fmt.Errorf("authoring Run requires one installed Standard authoring template")
 	}

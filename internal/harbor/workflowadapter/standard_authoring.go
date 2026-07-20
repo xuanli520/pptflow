@@ -31,6 +31,13 @@ const (
 	// registered unchanged for historical Run parsing and recovery.
 	StandardAuthoringRepairFeedbackTemplateVersion = "1.5.0"
 
+	// StandardAuthoringTestsAnalysisInputTemplateVersion binds generators to the
+	// current reviewed Dockerfile and orders tests_analysis after test_generate so
+	// repair feedback can be evaluated against the regenerated test script. The
+	// 1.5.0 repair-feedback template remains registered unchanged for historical
+	// Run parsing.
+	StandardAuthoringTestsAnalysisInputTemplateVersion = "1.6.0"
+
 	standardAuthoringCatalogID      = "harbor.standard-authoring-stage-catalog"
 	standardAuthoringCatalogVersion = "1.2.0"
 
@@ -92,13 +99,25 @@ func StandardAuthoringRepairFeedbackTemplateReference() TemplateReference {
 	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringRepairFeedbackTemplateVersion}
 }
 
+func StandardAuthoringTestsAnalysisInputTemplateReference() TemplateReference {
+	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringTestsAnalysisInputTemplateVersion}
+}
+
+// StandardAuthoringCurrentTemplateReference returns the only authoring
+// template new production Runs may select. Historical constructors remain
+// explicit and independently resolvable.
+func StandardAuthoringCurrentTemplateReference() TemplateReference {
+	return StandardAuthoringTestsAnalysisInputTemplateReference()
+}
+
 // IsStandardAuthoringWorkflowTemplate reports whether a Run is bound to the
 // immutable-source authoring half of the lifecycle.
 func IsStandardAuthoringWorkflowTemplate(reference TemplateReference) bool {
 	return reference.Equal(StandardAuthoringTemplateReference()) ||
 		reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()) ||
 		reference.Equal(StandardAuthoringBriefTemplateReference()) ||
-		reference.Equal(StandardAuthoringRepairFeedbackTemplateReference())
+		reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()) ||
+		reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference())
 }
 
 // StandardAuthoringStageOrder returns the dependency-aware closed stage list.
@@ -130,6 +149,8 @@ func StandardAuthoringStageOrderForTemplate(reference TemplateReference) ([]work
 	case reference.Equal(StandardAuthoringBriefTemplateReference()):
 		return StandardAuthoringTaskAdmissionStageOrder(), nil
 	case reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()):
+		return StandardAuthoringTaskAdmissionStageOrder(), nil
+	case reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()):
 		return StandardAuthoringTaskAdmissionStageOrder(), nil
 	default:
 		return nil, fmt.Errorf("Standard authoring template %s@%s is not installed", reference.ID, reference.Version)
@@ -174,6 +195,12 @@ func standardAuthoringTaskAdmissionDependencies() map[workflowkit.StageKey][]wor
 	return dependencies
 }
 
+func standardAuthoringTestsAnalysisInputDependencies() map[workflowkit.StageKey][]workflowkit.StageKey {
+	dependencies := standardAuthoringTaskAdmissionDependencies()
+	dependencies[workflowkit.StageKey(TestsAnalysis)] = []workflowkit.StageKey{workflowkit.StageKey(TestGen)}
+	return dependencies
+}
+
 // StandardAuthoringWorkflowTemplate returns the source-session half of task
 // creation. It intentionally ends at materialize_task: verification, model
 // evaluation, compliance, and packaging must run in a fresh task-bound child
@@ -207,6 +234,48 @@ func StandardAuthoringRepairFeedbackWorkflowTemplate() WorkflowTemplate {
 		Version:     StandardAuthoringRepairFeedbackTemplateVersion,
 		Catalog:     StandardAuthoringRepairFeedbackStageCatalog(),
 		QuotaPolicy: StandardAuthoringRepairFeedbackQuotaPolicy(),
+	}
+}
+
+// StandardAuthoringTestsAnalysisInputWorkflowTemplate is the 1.6.0 authoring
+// contract. It preserves the 1.5.0 repair-feedback matrix while binding the
+// solution and test generators to the reviewed Dockerfile and tests_analysis to
+// the regenerated test script.
+func StandardAuthoringTestsAnalysisInputWorkflowTemplate() WorkflowTemplate {
+	return WorkflowTemplate{
+		ID:          StandardAuthoringWorkflowTemplateID,
+		Version:     StandardAuthoringTestsAnalysisInputTemplateVersion,
+		Catalog:     StandardAuthoringTestsAnalysisInputStageCatalog(),
+		QuotaPolicy: StandardAuthoringTestsAnalysisInputQuotaPolicy(),
+	}
+}
+
+func StandardAuthoringCurrentWorkflowTemplate() WorkflowTemplate {
+	return StandardAuthoringTestsAnalysisInputWorkflowTemplate()
+}
+
+func StandardAuthoringTestsAnalysisInputStageCatalog() StageCatalog {
+	base := StandardAuthoringRepairFeedbackStageCatalog()
+	stages := make([]StageDefinition, 0, len(base.Stages))
+	for _, definition := range base.Stages {
+		definition = definition.Clone()
+		switch definition.Key {
+		case workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen):
+			definition.Inputs = append(definition.Inputs, artifactInput("dockerfile").spec)
+			definition.ReadSet = append(definition.ReadSet, resourceTaskEnvironment)
+		case workflowkit.StageKey(TestsAnalysis):
+			definition.Dependencies = []workflowkit.StageKey{workflowkit.StageKey(TestGen)}
+			definition.Inputs = append(definition.Inputs, artifactInput("test_script").spec)
+			definition.ReadSet = append(definition.ReadSet, resourceTaskTests)
+			definition.Verdicts = passOnly()
+		}
+		stages = append(stages, definition)
+	}
+	return StageCatalog{
+		Template: StandardAuthoringTestsAnalysisInputTemplateReference(),
+		ID:       standardAuthoringCatalogID,
+		Version:  StandardAuthoringTestsAnalysisInputTemplateVersion,
+		Stages:   stages,
 	}
 }
 
@@ -277,6 +346,8 @@ func StandardAuthoringTaskHandoffSchemaForTemplate(reference TemplateReference) 
 	case reference.Equal(StandardAuthoringBriefTemplateReference()):
 		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
 	case reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()):
+		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
+	case reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()):
 		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
 	default:
 		return "", fmt.Errorf("Standard authoring handoff schema has no template %s@%s", reference.ID, reference.Version)

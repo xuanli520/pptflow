@@ -25,6 +25,7 @@ const (
 	standardAuthoringTaskAdmissionParentTemplateVersion  = "1.3.0"
 	standardAuthoringBriefParentTemplateVersion          = "1.4.0"
 	standardAuthoringRepairFeedbackParentTemplateVersion = "1.5.0"
+	standardAuthoringTestsAnalysisInputTemplateVersion   = "1.6.0"
 	codeEdgePhase1ChildTemplateID                        = "harbor.codeedge-phase1"
 	codeEdgePhase1ChildTemplateVersion                   = "2.2.0"
 	standardAuthoringChildTrigger                        = "standard-authoring.materialized"
@@ -35,7 +36,8 @@ func isStandardAuthoringParentTemplateVersion(version string) bool {
 	case standardAuthoringParentTemplateVersion,
 		standardAuthoringTaskAdmissionParentTemplateVersion,
 		standardAuthoringBriefParentTemplateVersion,
-		standardAuthoringRepairFeedbackParentTemplateVersion:
+		standardAuthoringRepairFeedbackParentTemplateVersion,
+		standardAuthoringTestsAnalysisInputTemplateVersion:
 		return true
 	default:
 		return false

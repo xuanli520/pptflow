@@ -179,7 +179,7 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 	if err := validateStandardAuthoringBriefBindings(specification, briefInput); err != nil {
 		t.Fatalf("validate frozen session brief bindings: %v", err)
 	}
-	resolvedWorkflow, err := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate().Compile(standardAuthoringLaunchTestProfile())
+	resolvedWorkflow, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(standardAuthoringLaunchTestProfile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +642,7 @@ func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileId
 		CatalogSchemaVersion: stageprovider.DeploymentOperationCatalogVersion,
 		CatalogID:            "standard-authoring-test-catalog",
 		CatalogVersion:       "1",
-		Template:             workflowadapter.StandardAuthoringRepairFeedbackTemplateReference(),
+		Template:             workflowadapter.StandardAuthoringCurrentTemplateReference(),
 		CatalogFingerprint:   workflowkit.SHA256Fingerprint([]byte("catalog")),
 	}
 	receiptCanonical, err := receipt.CanonicalJSON()
@@ -1187,7 +1187,7 @@ func standardAuthoringLaunchTestOptions(capturer StandardAuthoringSourceCapturer
 	return LifecycleServicesOptions{
 		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
 		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
-			Template: workflowadapter.StandardAuthoringRepairFeedbackTemplateReference(), Resolver: catalog,
+			Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Resolver: catalog,
 		}},
 		StandardAuthoringSourceCapturer:        capturer,
 		StandardAuthoringRunDefinitionProvider: definitions,
@@ -1252,9 +1252,9 @@ func standardAuthoringLaunchTestDefinitionProvider(t *testing.T) *CatalogStandar
 	t.Helper()
 	catalogDocument := stageprovider.DeploymentOperationCatalog{
 		Format: stageprovider.DeploymentOperationCatalogFormat, Version: stageprovider.DeploymentOperationCatalogVersion,
-		CatalogID: "standard-authoring-test", CatalogVersion: "1", Template: workflowadapter.StandardAuthoringRepairFeedbackTemplateReference(), Operations: []stageprovider.DeploymentOperationRegistration{},
+		CatalogID: "standard-authoring-test", CatalogVersion: "1", Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Operations: []stageprovider.DeploymentOperationRegistration{},
 	}
-	for _, stage := range workflowadapter.StandardAuthoringRepairFeedbackStageCatalog().Stages {
+	for _, stage := range workflowadapter.StandardAuthoringTestsAnalysisInputStageCatalog().Stages {
 		operation := workflowadapter.StageOperationBinding{ProviderID: "standard-authoring-test-provider", OperationID: "test." + string(stage.Key), Version: "1"}
 		switch stage.Key {
 		case workflowkit.StageKey(workflowadapter.RepoPrepare):
@@ -1324,7 +1324,7 @@ func standardAuthoringLaunchTestStageType(t *testing.T, key workflowkit.StageKey
 }
 
 func standardAuthoringLaunchTestProfile() workflowadapter.ExecutionProfile {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := workflowadapter.ExecutionProfile{
 		Template: template.Reference(), ID: "standard-authoring-test", Version: "1", ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL,
 		ControlGracePeriod: 30 * time.Second, CandidateProviderBudget: workflowadapter.CandidateProviderBudget{AttemptTimeout: time.Minute},

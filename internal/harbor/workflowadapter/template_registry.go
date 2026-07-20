@@ -82,16 +82,18 @@ func DefaultTemplateRegistry() TemplateRegistry {
 	standardAuthoringAdmission := StandardAuthoringTaskAdmissionWorkflowTemplate()
 	standardAuthoringBrief := StandardAuthoringBriefWorkflowTemplate()
 	standardAuthoringRepairFeedback := StandardAuthoringRepairFeedbackWorkflowTemplate()
+	standardAuthoringTestsAnalysisInput := StandardAuthoringTestsAnalysisInputWorkflowTemplate()
 	codeEdge := CodeEdgePhase1WorkflowTemplate()
 	codeEdgeEvaluator := CodeEdgeEvaluatorChildWorkflowTemplate()
 	return TemplateRegistry{templates: map[templateReferenceKey]WorkflowTemplate{
-		templateKey(standard.Reference()):                        standard,
-		templateKey(standardAuthoring.Reference()):               standardAuthoring,
-		templateKey(standardAuthoringAdmission.Reference()):      standardAuthoringAdmission,
-		templateKey(standardAuthoringBrief.Reference()):          standardAuthoringBrief,
-		templateKey(standardAuthoringRepairFeedback.Reference()): standardAuthoringRepairFeedback,
-		templateKey(codeEdge.Reference()):                        codeEdge,
-		templateKey(codeEdgeEvaluator.Reference()):               codeEdgeEvaluator,
+		templateKey(standard.Reference()):                            standard,
+		templateKey(standardAuthoring.Reference()):                   standardAuthoring,
+		templateKey(standardAuthoringAdmission.Reference()):          standardAuthoringAdmission,
+		templateKey(standardAuthoringBrief.Reference()):              standardAuthoringBrief,
+		templateKey(standardAuthoringRepairFeedback.Reference()):     standardAuthoringRepairFeedback,
+		templateKey(standardAuthoringTestsAnalysisInput.Reference()): standardAuthoringTestsAnalysisInput,
+		templateKey(codeEdge.Reference()):                            codeEdge,
+		templateKey(codeEdgeEvaluator.Reference()):                   codeEdgeEvaluator,
 	}}
 }
 
@@ -123,6 +125,7 @@ func BuiltinTemplateReferences() []TemplateReference {
 		StandardAuthoringTaskAdmissionTemplateReference(),
 		StandardAuthoringBriefTemplateReference(),
 		StandardAuthoringRepairFeedbackTemplateReference(),
+		StandardAuthoringTestsAnalysisInputTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	}
@@ -141,6 +144,7 @@ func isBuiltinTemplateReference(reference TemplateReference) bool {
 		reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()) ||
 		reference.Equal(StandardAuthoringBriefTemplateReference()) ||
 		reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()) ||
+		reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()) ||
 		reference.Equal(CodeEdgePhase1TemplateReference()) ||
 		reference.Equal(CodeEdgeEvaluatorChildTemplateReference())
 }

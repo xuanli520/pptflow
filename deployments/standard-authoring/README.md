@@ -1,7 +1,7 @@
 # Standard Authoring Deployment Contract
 
 This directory is the source-controlled deployment input for the closed
-`harbor.standard-authoring@1.5.0` workflow. It creates a first task from an
+`harbor.standard-authoring@1.6.0` workflow. It creates a first task from an
 immutable `AuthoringSource` / `AuthoringSession`; it does not pretend that the
 source session is already a `TaskRevision`.
 
@@ -71,15 +71,17 @@ handoff, compliance, and local packaging.
 
 ## Version boundary
 
-Durable review-feedback inputs are an execution-contract change, so the current
-workflow is `harbor.standard-authoring@1.5.0`. The `@1.2.0` environment-policy,
-`@1.3.0` task-admission, and `@1.4.0` immutable-brief contracts remain
-registered only for strict historical identity and parsing; none may be
-executed or reinterpreted as a 1.5 Run by this release.
+Binding `solve_generate` and `test_generate` to the reviewed Dockerfile and
+binding `tests_analysis` to the current generated test script are execution-
+contract changes, so the current workflow is `harbor.standard-authoring@1.6.0`.
+The `@1.2.0` environment-policy, `@1.3.0` task-admission, `@1.4.0`
+immutable-brief, and `@1.5.0` repair-feedback contracts remain registered only
+for strict historical identity and parsing; none may be executed or
+reinterpreted as a 1.6 Run by this release.
 Existing records remain immutable audit history and must be handled by the
-release that owns their frozen deployment contract. Install 1.5 with a fresh
-managed control-plane root rather than upgrading an active 1.2, 1.3, or 1.4
-root.
+release that owns their frozen deployment contract. Install 1.6 with a fresh
+managed control-plane root rather than upgrading an active 1.2, 1.3, 1.4, or
+1.5 root.
 
 ## Frozen task environment policy
 
@@ -102,6 +104,13 @@ numeric index; `RUN --mount=from` may use only an earlier local alias because
 BuildKit does not treat a numeric mount source as a stage index.
 `materialize_task` repeats the same validation before a Dockerfile can become
 part of the sealed task.
+The Docker build context is only `task/environment`, so the generated
+Dockerfile must clone the frozen source into `/workspace/source`; it cannot
+copy `tests/`, `solution/`, or another task-root artifact into the image.
+CodeEdge Phase-1 mounts only its controlled scripts at writable `/oracle` and
+runs them with POSIX `sh` in a read-only-root container. The solution creates
+`/oracle/worktree` from the pristine image source, and the test script creates
+that worktree for initial verification or reuses it after the Oracle repair.
 This is a task constraint, not an ambient host-image selection: a new session
 may choose another validated digest without changing a historical Run.
 

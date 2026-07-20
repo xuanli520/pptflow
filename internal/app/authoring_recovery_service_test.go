@@ -293,7 +293,7 @@ func TestAuthoringRecoveryRevalidatesTargetsAfterCommandPersistence(t *testing.T
 }
 
 func TestAuthoringAdmissionRecoveryRegeneratesEveryPackageProducer(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
 		t.Fatal(err)
@@ -319,7 +319,7 @@ func TestAuthoringAdmissionRecoveryRegeneratesEveryPackageProducer(t *testing.T)
 }
 
 func TestAuthoringGeneratedFilesRecoveryRegeneratesProducer(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
 		t.Fatal(err)
@@ -341,7 +341,7 @@ func TestAuthoringGeneratedFilesRecoveryRegeneratesProducer(t *testing.T) {
 }
 
 func TestAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +349,7 @@ func TestAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) 
 	for _, key := range []workflowkit.NodeID{
 		workflowkit.NodeID(workflowadapter.TaskDesign), workflowkit.NodeID(workflowadapter.GenerateTaskFiles),
 		workflowkit.NodeID(workflowadapter.InstructionGen), workflowkit.NodeID(workflowadapter.TaskTOMLGen), workflowkit.NodeID(workflowadapter.DockerfileGen),
-		workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen), workflowkit.NodeID(workflowadapter.TestsAnalysis),
+		workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen),
 	} {
 		t.Run(string(key), func(t *testing.T) {
 			attemptID := "direct-needs-repair-" + string(key)
@@ -367,8 +367,49 @@ func TestAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) 
 	}
 }
 
-func TestAuthoringReviewRecoveryRegeneratesReviewedProducers(t *testing.T) {
+func TestAuthoringContentProducerRecoveryRejectsVerdictOutsideFrozenPolicy(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := workflowkit.NodeID(workflowadapter.TestsAnalysis)
+	state := continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
+		key: {
+			ID: "invalid-analysis-needs-repair", StageKey: string(key),
+			ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair,
+		},
+	}}
+	_, err = authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
+	if !errors.Is(err, ErrAuthoringRecoveryUnavailable) || !strings.Contains(err.Error(), "outside its frozen verdict policy") {
+		t.Fatalf("pass-only analysis recovery error = %v, want frozen-policy rejection", err)
+	}
+}
+
+func TestHistoricalAuthoringAnalysisRecoveryRetainsNeedsRepairPolicy(t *testing.T) {
 	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := workflowkit.NodeID(workflowadapter.TestsAnalysis)
+	state := continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
+		key: {
+			ID: "historical-analysis-needs-repair", StageKey: string(key),
+			ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair,
+		},
+	}}
+	selection, err := authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(selection.targetNodeIDs, []workflowkit.NodeID{key}) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{"historical-analysis-needs-repair"}) {
+		t.Fatalf("historical tests_analysis recovery selection = %+v", selection)
+	}
+}
+
+func TestAuthoringReviewRecoveryRegeneratesReviewedProducers(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
 		t.Fatal(err)
@@ -416,7 +457,7 @@ func TestAuthoringReviewRecoveryRegeneratesReviewedProducers(t *testing.T) {
 }
 
 func TestAuthoringReviewRecoveryUnionsNestedNeedsRepairFeedback(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
 		t.Fatal(err)
@@ -443,7 +484,7 @@ func TestAuthoringReviewRecoveryUnionsNestedNeedsRepairFeedback(t *testing.T) {
 }
 
 func TestAuthoringInfrastructureRetryRetainsActiveReviewFeedback(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
 		t.Fatal(err)
@@ -772,7 +813,7 @@ func TestAuthoringRecoveryFailsClosedOnDeploymentCatalogLockDrift(t *testing.T) 
 	driftedServices, err := NewLifecycleServicesWithOptions(fixture.root, fixture.store, LifecycleServicesOptions{
 		OperationResolver: driftedResolver,
 		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
-			Template: workflowadapter.StandardAuthoringRepairFeedbackTemplateReference(), Resolver: driftedResolver,
+			Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Resolver: driftedResolver,
 		}},
 		RequireDeploymentCatalog: true,
 		RequireDeploymentLock:    true,
@@ -1160,7 +1201,7 @@ func newLockedAuthoringRecoveryLaunchFixture(t *testing.T) authoringRecoveryFixt
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
 		OperationResolver: resolver,
 		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
-			Template: workflowadapter.StandardAuthoringRepairFeedbackTemplateReference(), Resolver: resolver,
+			Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Resolver: resolver,
 		}},
 		RequireDeploymentCatalog:               true,
 		RequireDeploymentLock:                  true,

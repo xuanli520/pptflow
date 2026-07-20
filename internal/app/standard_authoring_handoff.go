@@ -273,7 +273,7 @@ func (service *StandardAuthoringHandoffService) Consume(ctx context.Context, req
 		return store.WorkflowRun{}, handoffDeterministicFailure(request, handoffArtifactLineageInvalidCode, "The Standard authoring handoff does not name its persisted authoring run.", "authoring_run", fmt.Errorf("%w: Standard authoring Run %s", ErrLifecycleNotFound, request.AuthoringRunID))
 	}
 	if !isCurrentStandardAuthoringRun(*run) || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
-		return store.WorkflowRun{}, handoffDeterministicFailure(request, handoffArtifactLineageInvalidCode, "The Standard authoring handoff run does not match its frozen source lineage.", "authoring_run", fmt.Errorf("Standard authoring handoff Run is not %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion))
+		return store.WorkflowRun{}, handoffDeterministicFailure(request, handoffArtifactLineageInvalidCode, "The Standard authoring handoff run does not match its frozen source lineage.", "authoring_run", fmt.Errorf("Standard authoring handoff Run is not %s@%s", workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion))
 	}
 	if err := service.core.verifyRunDeploymentCatalogReceipt(*run); err != nil {
 		return store.WorkflowRun{}, handoffDefinitionFailure(request, handoffDefinitionInvalidCode, "The controlled CodeEdge Phase-1 definition is invalid.", fmt.Errorf("verify frozen Standard authoring deployment catalog receipt: %w", err))

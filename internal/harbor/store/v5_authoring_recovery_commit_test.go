@@ -102,7 +102,7 @@ func TestCommitAuthoringRecoveryExecutionRejectsMaterializationAndInDoubt(t *tes
 
 func TestAuthoringPhase1HandoffRequiresCurrentAuthoringParent(t *testing.T) {
 	ctx := context.Background()
-	fixture := materializedAuthoringRecoveryCommitFixture(t, ctx)
+	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringTestsAnalysisInputTemplateVersion)
 	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
 	if err != nil {
 		t.Fatalf("prepare current authoring parent handoff: %v", err)
@@ -239,7 +239,8 @@ func prepareAuthoringRecoveryPhase1HandoffResult(t *testing.T, ctx context.Conte
 	handoffSchemaVersion := "harbor.authoring-task-handoff.v1"
 	if fixture.run.WorkflowTemplateVersion == standardAuthoringTaskAdmissionParentTemplateVersion ||
 		fixture.run.WorkflowTemplateVersion == standardAuthoringBriefParentTemplateVersion ||
-		fixture.run.WorkflowTemplateVersion == standardAuthoringRepairFeedbackParentTemplateVersion {
+		fixture.run.WorkflowTemplateVersion == standardAuthoringRepairFeedbackParentTemplateVersion ||
+		fixture.run.WorkflowTemplateVersion == standardAuthoringTestsAnalysisInputTemplateVersion {
 		handoffSchemaVersion = "harbor.authoring-task-handoff.v2"
 	}
 	inputFingerprint := string(workflowkit.SHA256Fingerprint([]byte("authoring recovery handoff inputs")))

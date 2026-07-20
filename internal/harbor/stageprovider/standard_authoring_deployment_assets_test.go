@@ -25,7 +25,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("resolve Standard authoring catalog: %v", err)
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
+	if !catalog.Template().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
 		t.Fatalf("catalog template = %s@%s, want Standard authoring", catalog.Template().ID, catalog.Template().Version)
 	}
 	profileRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "execution-profile.v1.json"))
@@ -36,7 +36,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("parse Standard authoring execution profile: %v", err)
 	}
-	compiled, err := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate().Compile(profile)
+	compiled, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(profile)
 	if err != nil {
 		t.Fatalf("compile Standard authoring execution profile: %v", err)
 	}
@@ -163,9 +163,9 @@ func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) 
 	}{
 		{path: "instruction-generate.json", version: "1.3.0", file: "instruction.md"},
 		{path: "task-toml-generate.json", version: "1.6.0", file: "task.toml"},
-		{path: "dockerfile-generate.json", version: "1.8.0", file: "environment/Dockerfile"},
-		{path: "solve-generate.json", version: "1.3.0", file: "solution/solve.sh"},
-		{path: "test-generate.json", version: "1.4.0", file: "tests/test.sh"},
+		{path: "dockerfile-generate.json", version: "1.9.0", file: "environment/Dockerfile"},
+		{path: "solve-generate.json", version: "1.4.0", file: "solution/solve.sh"},
+		{path: "test-generate.json", version: "1.5.0", file: "tests/test.sh"},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -187,6 +187,114 @@ func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) 
 	}
 }
 
+func TestStandardAuthoringPhase1PromptsMatchControlledRuntime(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	for _, test := range []struct {
+		path     string
+		version  string
+		required []string
+	}{
+		{
+			path:    "dockerfile-generate.json",
+			version: "1.9.0",
+			required: []string{
+				"build context is exactly task/environment",
+				"Never COPY or ADD tests/",
+				"solution/",
+				"exactly /workspace/source",
+				"strictly decodable as standard Base64",
+			},
+		},
+		{
+			path:    "solve-generate.json",
+			version: "1.4.0",
+			required: []string{
+				"currently bound dockerfile",
+				"sh ./solution/solve.sh",
+				"working directory /oracle",
+				"root filesystem is read-only",
+				"/oracle bind mount",
+				"/tmp tmpfs",
+				"/workspace/source",
+				"/oracle/worktree",
+				"portable POSIX sh",
+				"Bash-only syntax",
+				"strictly decodable as standard Base64",
+			},
+		},
+		{
+			path:    "test-generate.json",
+			version: "1.5.0",
+			required: []string{
+				"currently bound dockerfile",
+				"sh ./tests/test.sh",
+				"again after sh ./solution/solve.sh",
+				"working directory /oracle",
+				"root filesystem is read-only",
+				"/oracle bind mount",
+				"/tmp tmpfs",
+				"reuse /oracle/worktree",
+				"fresh recursive copy of /workspace/source",
+				"portable POSIX sh",
+				"Bash-only syntax",
+				"strictly decodable as standard Base64",
+			},
+		},
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", test.path, err)
+		}
+		if program.Version != test.version {
+			t.Fatalf("prompt %s version = %s, want %s", test.path, program.Version, test.version)
+		}
+		joined := strings.Join(program.TurnPrompts, "\n")
+		for _, required := range test.required {
+			if !strings.Contains(joined, required) {
+				t.Fatalf("prompt %s omits controlled runtime rule %q", test.path, required)
+			}
+		}
+	}
+}
+
+func TestStandardAuthoringTestsAnalysisReevaluatesFeedbackAgainstCurrentScript(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", "tests-analysis.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if program.Version != "1.5.0" {
+		t.Fatalf("tests-analysis prompt version = %s, want 1.5.0", program.Version)
+	}
+	joined := strings.Join(program.TurnPrompts, "\n")
+	for _, required := range []string{
+		"currently bound test_script",
+		"exact current tests/test.sh bytes",
+		"re-evaluate against the current test_script bytes",
+		"historical finding that the current test_script has fixed is resolved",
+		"verdict=pass",
+		"Do not submit needs_repair, reject, or advisory",
+		"downstream solution_review",
+		"current test_script defect",
+		"normal tool or executor failure path",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("tests-analysis prompt omits current-script rule %q", required)
+		}
+	}
+	if strings.Contains(joined, "do not discard an earlier unresolved requirement") {
+		t.Fatal("tests-analysis prompt still treats historical feedback as automatically unresolved")
+	}
+}
+
 func TestStandardAuthoringRepairPromptsConsumeOnlyFrozenFeedback(t *testing.T) {
 	root := standardAuthoringDeploymentRepositoryRoot(t)
 	for _, test := range []struct {
@@ -198,10 +306,10 @@ func TestStandardAuthoringRepairPromptsConsumeOnlyFrozenFeedback(t *testing.T) {
 		{path: "task-design.json", version: "1.5.0", feedback: []string{"task_review_decision"}},
 		{path: "instruction-generate.json", version: "1.3.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
 		{path: "task-toml-generate.json", version: "1.6.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "dockerfile-generate.json", version: "1.8.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "solve-generate.json", version: "1.3.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "test-generate.json", version: "1.4.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "tests-analysis.json", version: "1.3.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "dockerfile-generate.json", version: "1.9.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "solve-generate.json", version: "1.4.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "test-generate.json", version: "1.5.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "tests-analysis.json", version: "1.5.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {

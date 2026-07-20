@@ -26,9 +26,10 @@ const (
 	StandardAuthoringQuotaPolicyID      = "harbor.standard-authoring.local.operator"
 	StandardAuthoringQuotaPolicyVersion = "1.2.0"
 
-	StandardAuthoringTaskAdmissionQuotaPolicyVersion  = "1.3.0"
-	StandardAuthoringBriefQuotaPolicyVersion          = "1.4.0"
-	StandardAuthoringRepairFeedbackQuotaPolicyVersion = "1.5.0"
+	StandardAuthoringTaskAdmissionQuotaPolicyVersion      = "1.3.0"
+	StandardAuthoringBriefQuotaPolicyVersion              = "1.4.0"
+	StandardAuthoringRepairFeedbackQuotaPolicyVersion     = "1.5.0"
+	StandardAuthoringTestsAnalysisInputQuotaPolicyVersion = "1.6.0"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
 	// stage. It is versioned with the policy rather than supplied by a Run.
@@ -474,6 +475,31 @@ func StandardAuthoringRepairFeedbackQuotaPolicy() QuotaPolicy {
 	return QuotaPolicy{
 		ID:      StandardAuthoringQuotaPolicyID,
 		Version: StandardAuthoringRepairFeedbackQuotaPolicyVersion,
+		AccountLimits: []QuotaAccountLimit{
+			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
+			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
+			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
+		},
+		Stages: stages,
+	}
+}
+
+// StandardAuthoringTestsAnalysisInputQuotaPolicy is the additive 1.6.0 policy.
+// The new artifact dependencies change frozen inputs and ordering, not the
+// bounded work or per-stage claims inherited from the 1.5.0 contract.
+func StandardAuthoringTestsAnalysisInputQuotaPolicy() QuotaPolicy {
+	catalog := StandardAuthoringTestsAnalysisInputStageCatalog()
+	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
+	for _, stage := range catalog.Stages {
+		claims := standardClaimsForStage(stage)
+		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
+			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
+		}
+		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
+	}
+	return QuotaPolicy{
+		ID:      StandardAuthoringQuotaPolicyID,
+		Version: StandardAuthoringTestsAnalysisInputQuotaPolicyVersion,
 		AccountLimits: []QuotaAccountLimit{
 			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
 			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},

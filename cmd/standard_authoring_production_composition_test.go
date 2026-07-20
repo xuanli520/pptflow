@@ -100,7 +100,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 			t.Fatalf("locked Standard stage %q is not resolved by its composition: %v", stageKey, err)
 		}
 	}
-	if !catalog.Template().Equal(workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()) {
+	if !catalog.Template().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
 		t.Fatalf("test catalog template = %+v", catalog.Template())
 	}
 }

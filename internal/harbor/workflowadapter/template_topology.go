@@ -104,6 +104,21 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 			dependencies:   standardAuthoringTaskAdmissionDependencies(),
 			validateStages: validateStandardAuthoringRepairFeedbackContract,
 		}, nil
+	case reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:                   standardAuthoringCatalogID,
+			catalogVersion:              StandardAuthoringTestsAnalysisInputTemplateVersion,
+			stageOrder:                  StandardAuthoringTaskAdmissionStageOrder(),
+			groups:                      standardAuthoringStageGroups(),
+			requiresOperatorOnlyPackage: false,
+			gates: []workflowkit.StageKey{
+				workflowkit.StageKey(TaskReview),
+				workflowkit.StageKey(ContentReview),
+				workflowkit.StageKey(SolutionReview),
+			},
+			dependencies:   standardAuthoringTestsAnalysisInputDependencies(),
+			validateStages: validateStandardAuthoringTestsAnalysisInputContract,
+		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
 			catalogID:                   codeEdgePhase1CatalogID,
@@ -284,6 +299,31 @@ func validateStandardAuthoringRepairFeedbackContract(stages map[workflowkit.Stag
 		return err
 	}
 	return validateStandardAuthoringFeedbackShape(stages, StandardAuthoringRepairFeedbackStageCatalog())
+}
+
+func validateStandardAuthoringTestsAnalysisInputContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	if err := validateStandardAuthoringRepairFeedbackContract(stages); err != nil {
+		return err
+	}
+	for _, contract := range []struct {
+		stage    workflowkit.StageKey
+		artifact string
+		resource workflowkit.ResourceKey
+	}{
+		{stage: workflowkit.StageKey(SolveGen), artifact: "dockerfile", resource: resourceTaskEnvironment},
+		{stage: workflowkit.StageKey(TestGen), artifact: "dockerfile", resource: resourceTaskEnvironment},
+		{stage: workflowkit.StageKey(TestsAnalysis), artifact: "test_script", resource: resourceTaskTests},
+	} {
+		stage, present := stages[contract.stage]
+		if !present || !stageHasArtifact(stage.Inputs, contract.artifact, "harbor.artifact.v1") || stageCatalogResourceCount(stage.ReadSet, contract.resource) != 1 {
+			return fmt.Errorf("%w: Standard authoring 1.6.0 stage %q must consume current %q", errInvalidCatalog, contract.stage, contract.artifact)
+		}
+	}
+	analysis, present := stages[workflowkit.StageKey(TestsAnalysis)]
+	if !present || !reflect.DeepEqual(analysis.Verdicts, passOnly()) {
+		return fmt.Errorf("%w: Standard authoring 1.6.0 tests_analysis must submit pass-only evidence", errInvalidCatalog)
+	}
+	return nil
 }
 
 func validateStandardAuthoringFeedbackShape(stages map[workflowkit.StageKey]StageDefinition, expectedCatalog StageCatalog) error {

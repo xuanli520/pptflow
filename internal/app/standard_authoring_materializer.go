@@ -606,19 +606,21 @@ func verifyStandardAuthoringAdmissionReceipt(request workflowkit.StageExecutionR
 
 // isAdmissionAwareStandardAuthoringRun keeps package interpretation
 // version-scoped for fixtures and historical inspection. This release executes
-// only the current 1.5 template; older Runs remain owned by their original
+// only the current 1.6 template; older Runs remain owned by their original
 // deployment and control-plane root.
 func isAdmissionAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
 		(run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion ||
-			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion)
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion)
 }
 
 func isBriefAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
 		(run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion ||
-			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion)
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion)
 }
 
 func materializeInputsFromCanonicalPackage(inputs standardAuthoringMaterializeInputSet, files []codeedge.TaskPackageFile) standardAuthoringMaterializeInputSet {

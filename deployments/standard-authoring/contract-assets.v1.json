@@ -3,7 +3,7 @@
   "version": "1",
   "template": {
     "id": "harbor.standard-authoring",
-    "version": "1.5.0"
+    "version": "1.6.0"
   },
   "operations": [
     {
@@ -43,7 +43,7 @@
     },
     {
       "stage_key": "dockerfile_generate",
-      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "1.8.0", "relative_path": "prompts/dockerfile-generate.json"},
+      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "1.9.0", "relative_path": "prompts/dockerfile-generate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
@@ -53,17 +53,17 @@
     },
     {
       "stage_key": "solve_generate",
-      "prompt": {"id": "standard-authoring.solve-generate.prompt", "version": "1.3.0", "relative_path": "prompts/solve-generate.json"},
+      "prompt": {"id": "standard-authoring.solve-generate.prompt", "version": "1.4.0", "relative_path": "prompts/solve-generate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "test_generate",
-      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.4.0", "relative_path": "prompts/test-generate.json"},
+      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.5.0", "relative_path": "prompts/test-generate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "tests_analysis",
-      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "1.3.0", "relative_path": "prompts/tests-analysis.json"},
+      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "1.5.0", "relative_path": "prompts/tests-analysis.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {

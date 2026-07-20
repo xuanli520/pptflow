@@ -13,7 +13,7 @@ import (
 // compiled into this binary. Historical records remain inspectable but are
 // never executed through an ambient "latest" authoring contract.
 func isCurrentStandardAuthoringRun(run store.WorkflowRun) bool {
-	return workflowadapter.StandardAuthoringRepairFeedbackTemplateReference().Equal(workflowadapter.TemplateReference{
+	return workflowadapter.StandardAuthoringCurrentTemplateReference().Equal(workflowadapter.TemplateReference{
 		ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion,
 	})
 }

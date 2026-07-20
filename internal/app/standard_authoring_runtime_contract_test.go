@@ -31,7 +31,7 @@ func TestCurrentStandardAuthoringRuntimeContractRejectsLegacyRun(t *testing.T) {
 }
 
 func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutPolicy(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -53,7 +53,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutPolicy(t
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "environment policy contract") {
@@ -62,7 +62,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutPolicy(t
 }
 
 func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutBrief(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutBrief(t 
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "brief contract") {
@@ -93,7 +93,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutBrief(t 
 }
 
 func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFeedback(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -118,7 +118,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFe
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "versioned input contract") {
@@ -127,7 +127,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFe
 }
 
 func TestCurrentStandardAuthoringRunRejectsNonCurrentVersions(t *testing.T) {
-	current := store.WorkflowRun{WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion}
+	current := store.WorkflowRun{WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion}
 	if !isCurrentStandardAuthoringRun(current) {
 		t.Fatal("current Standard authoring version was rejected")
 	}
@@ -135,6 +135,7 @@ func TestCurrentStandardAuthoringRunRejectsNonCurrentVersions(t *testing.T) {
 		workflowadapter.StandardAuthoringWorkflowTemplateVersion,
 		workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion,
 		workflowadapter.StandardAuthoringBriefTemplateVersion,
+		workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
 		"9.9.9",
 	} {
 		run := current
