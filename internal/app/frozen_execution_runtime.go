@@ -765,7 +765,7 @@ func (runtime *FrozenExecutionRuntime) handleContinuation(ctx context.Context, e
 	if err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
-	if err := validateRequiredContinuationInputs(ctx, runtime.core, run, runtimePlan); err != nil {
+	if err := runtime.validateRemainingRequiredContinuationInputs(ctx, run, runtimePlan); err != nil {
 		return runtime.reconcileContinuationInputDrift(ctx, job, *continuation, err)
 	}
 	if err := runtime.transitionContinuationToRunning(ctx, *continuation, job.CreatedBy); err != nil {
@@ -965,6 +965,26 @@ func (runtime *FrozenExecutionRuntime) transitionContinuationToRunning(ctx conte
 }
 
 func validateRequiredContinuationInputs(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, plan runtimeExecutionPlan) error {
+	return validateRequiredContinuationInputsExcept(ctx, core, run, plan, nil)
+}
+
+// validateRemainingRequiredContinuationInputs proves only inputs for stages
+// that have not been admitted by this continuation yet. Once a StageAttempt
+// exists, its immutable input fingerprint and retry snapshot are the source of
+// truth; resolving the subject again would incorrectly treat a later review
+// decision as drift in an already-completed stage.
+func (runtime *FrozenExecutionRuntime) validateRemainingRequiredContinuationInputs(ctx context.Context, run store.WorkflowRun, plan runtimeExecutionPlan) error {
+	if runtime == nil || runtime.core == nil || runtime.core.store == nil {
+		return fmt.Errorf("%w: continuation input validator is not configured", ErrFrozenExecutionPayload)
+	}
+	scheduled, err := runtime.scheduledContinuationStages(ctx, run.ID, plan)
+	if err != nil {
+		return err
+	}
+	return validateRequiredContinuationInputsExcept(ctx, runtime.core, run, plan, scheduled)
+}
+
+func validateRequiredContinuationInputsExcept(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, plan runtimeExecutionPlan, admitted map[workflowkit.StageKey]struct{}) error {
 	if core == nil || core.store == nil || core.objects == nil {
 		return fmt.Errorf("%w: %w: continuation input validator is not configured", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift)
 	}
@@ -975,6 +995,9 @@ func validateRequiredContinuationInputs(ctx context.Context, core *lifecycleServ
 	for _, stageKey := range mustTopologicalStageKeys(plan.Workflow) {
 		transition, found := plan.stageTransition(stageKey)
 		if !found || transition.Disposition != workflowkit.DispositionSchedule || len(transition.InputBindings) == 0 {
+			continue
+		}
+		if _, present := admitted[stageKey]; present {
 			continue
 		}
 		stage, found := plan.Workflow.Stage(stageKey)
@@ -990,6 +1013,40 @@ func validateRequiredContinuationInputs(ctx context.Context, core *lifecycleServ
 		}
 	}
 	return nil
+}
+
+// scheduledContinuationStages returns only StageAttempts created by this
+// exact continuation execution. A prior retry or another continuation must
+// never suppress validation for the current frozen plan.
+func (runtime *FrozenExecutionRuntime) scheduledContinuationStages(ctx context.Context, runID string, plan runtimeExecutionPlan) (map[workflowkit.StageKey]struct{}, error) {
+	admitted := make(map[workflowkit.StageKey]struct{})
+	if plan.ContinuationPlanID == "" || plan.ContinuationExecutionID == "" {
+		return admitted, nil
+	}
+	attempts, err := runtime.core.store.ListStageAttemptsForRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	for _, attempt := range attempts {
+		stageKey := workflowkit.StageKey(attempt.StageKey)
+		transition, found := plan.stageTransition(stageKey)
+		if !found || transition.Disposition != workflowkit.DispositionSchedule || transition.ToGeneration < 0 {
+			continue
+		}
+		var snapshot runtimeStageAttemptSnapshot
+		if err := decodeStrictJSON(attempt.RetrySnapshotJSON, &snapshot); err != nil {
+			continue
+		}
+		if snapshot.Format != runtimeStageAttemptSnapshotFormat ||
+			snapshot.ExecutionKey != plan.ExecutionKey ||
+			snapshot.ContinuationPlanID != plan.ContinuationPlanID ||
+			snapshot.ContinuationExecutionID != plan.ContinuationExecutionID ||
+			snapshot.Generation != transition.ToGeneration {
+			continue
+		}
+		admitted[stageKey] = struct{}{}
+	}
+	return admitted, nil
 }
 
 func (runtime *FrozenExecutionRuntime) reconcileContinuationInputDrift(ctx context.Context, job store.DurableJob, execution store.ContinuationExecution, cause error) (store.JobState, error) {
