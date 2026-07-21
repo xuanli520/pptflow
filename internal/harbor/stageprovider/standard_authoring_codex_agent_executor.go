@@ -999,7 +999,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) prepareAttemptWorkspace
 	published := false
 	defer func() {
 		if !published {
-			_ = os.RemoveAll(staging)
+			standardAuthoringCodexRemoveTree(staging)
 		}
 	}()
 	stagedWorkRoot := filepath.Join(staging, StandardAuthoringCodexAttemptWorkDirectory)
@@ -1012,11 +1012,17 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) prepareAttemptWorkspace
 	if err := os.Mkdir(filepath.Join(stagedWorkRoot, StandardAuthoringCodexAttemptTaskDirectory), 0o750); err != nil {
 		return "", fmt.Errorf("%w: create staged task root", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
+	// The agent needs to edit only task/, never the copied frozen source. Seal
+	// work itself after both fixed children exist so the agent cannot replace
+	// source/ or task/ at the work-root level; task/ remains owner-writable.
+	if err := os.Chmod(stagedWorkRoot, 0o550); err != nil {
+		return "", fmt.Errorf("%w: seal staged work root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
 	if err := os.Rename(staging, attemptRoot); err != nil {
 		return "", fmt.Errorf("%w: publish attempt workspace", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	if err := ValidateStandardAuthoringAttemptWorkspacePath(executor.workspaceRoot, request.Execution.ID, request.Stage.Key, string(request.Claim.Stage.StageAttempt.ID), workRoot); err != nil {
-		_ = os.RemoveAll(attemptRoot)
+		standardAuthoringCodexRemoveTree(attemptRoot)
 		return "", err
 	}
 	published = true
@@ -1027,7 +1033,7 @@ func standardAuthoringCodexCopySourceTree(ctx context.Context, sourceRoot, desti
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	return filepath.WalkDir(sourceRoot, func(sourcePath string, entry os.DirEntry, walkErr error) error {
+	if err := filepath.WalkDir(sourceRoot, func(sourcePath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -1056,7 +1062,45 @@ func standardAuthoringCodexCopySourceTree(ctx context.Context, sourceRoot, desti
 			return fmt.Errorf("%w: source copy encountered a non-regular entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
 		}
 		return standardAuthoringCodexCopyRegularFile(ctx, sourcePath, destinationPath, info)
+	}); err != nil {
+		return err
+	}
+	return standardAuthoringCodexSealSourceCopy(destinationRoot)
+}
+
+func standardAuthoringCodexSealSourceCopy(root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("%w: inspect source-copy entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: source-copy entry is unsafe", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if info.IsDir() {
+			if err := os.Chmod(path, 0o550); err != nil {
+				return fmt.Errorf("%w: seal source-copy directory", ErrStandardAuthoringCodexAgentTurnConfiguration)
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%w: source-copy entry is non-regular", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if err := os.Chmod(path, 0o440); err != nil {
+			return fmt.Errorf("%w: seal source-copy file", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		return nil
 	})
+}
+
+func standardAuthoringCodexRemoveTree(root string) {
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr == nil && entry.IsDir() {
+			_ = os.Chmod(path, 0o700)
+		}
+		return nil
+	})
+	_ = os.RemoveAll(root)
 }
 
 func standardAuthoringCodexCopyRegularFile(ctx context.Context, sourcePath, destinationPath string, expected os.FileInfo) error {
@@ -1081,9 +1125,6 @@ func standardAuthoringCodexCopyRegularFile(ctx context.Context, sourcePath, dest
 	finalSourceInfo, err := source.Stat()
 	if err != nil || !os.SameFile(openedInfo, finalSourceInfo) {
 		return fmt.Errorf("%w: source-copy file changed while reading", ErrStandardAuthoringCodexAgentTurnConfiguration)
-	}
-	if err := os.Chmod(destinationPath, 0o640); err != nil {
-		return fmt.Errorf("%w: make source-copy file writable", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return nil
 }

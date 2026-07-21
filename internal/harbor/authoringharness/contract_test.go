@@ -89,6 +89,31 @@ func TestFinalizeBindsCanonicalReportJSON(t *testing.T) {
 	}
 }
 
+func TestValidateReportJSONRejectsSummaryThatDisagreesWithFinalStep(t *testing.T) {
+	fingerprint := workflowkit.SHA256Fingerprint([]byte("candidate"))
+	result, err := Finalize(Result{
+		Mode: ModeDockerfileBuild, RunID: "run", StageKey: "dockerfile_build_validate", StageAttemptID: "attempt",
+		Passed: true, Step: "docker_build", ExitCode: 0, CandidateDigest: fingerprint, EnvironmentDigest: fingerprint,
+		Steps: []StepResult{{Step: "docker_build", Passed: true, ExitCode: 0, Findings: []string{}, OutputFingerprint: fingerprint}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mismatched := result
+	mismatched.Passed = false
+	mismatched.Findings = []string{"forced summary failure"}
+	mismatched.ReportJSON = nil
+	report, err := canonicalReportJSON(mismatched)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatched.ReportJSON = report
+	if err := mismatched.ValidateReportJSON(); err == nil {
+		t.Fatal("report with a final-step/summary mismatch was accepted")
+	}
+}
+
 func writeCandidateFixture(t *testing.T) string {
 	t.Helper()
 	taskRoot := filepath.Join(t.TempDir(), "task")

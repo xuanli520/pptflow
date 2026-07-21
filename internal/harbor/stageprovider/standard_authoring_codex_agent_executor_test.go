@@ -394,6 +394,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteUsesIsolatedAttemp
 	stage := standardAuthoringCodexTestStage(1)
 	now := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
 	root := t.TempDir()
+	t.Cleanup(func() { standardAuthoringCodexRemoveTree(root) })
 	runID := "019f8397-7a65-7000-8000-0000000000a1"
 	sourceRoot := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
 	if err := os.MkdirAll(filepath.Join(sourceRoot, "src"), 0o750); err != nil {
@@ -418,9 +419,6 @@ func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteUsesIsolatedAttemp
 		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
 		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("analysis"))}},
 		afterSubmissions: func(int) error {
-			if err := os.WriteFile(workSourceFile, []byte("pub fn edited() {}\n"), 0o640); err != nil {
-				return err
-			}
 			if err := os.MkdirAll(filepath.Dir(workTaskFile), 0o750); err != nil {
 				return err
 			}
@@ -470,12 +468,26 @@ func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteUsesIsolatedAttemp
 		t.Fatalf("immutable source mode = %v, %v", frozenInfo, err)
 	}
 	workContent, err := os.ReadFile(workSourceFile)
-	if err != nil || string(workContent) != "pub fn edited() {}\n" {
-		t.Fatalf("writable source copy content = %q, %v", workContent, err)
+	if err != nil || string(workContent) != "pub fn frozen() {}\n" {
+		t.Fatalf("read-only source copy content = %q, %v", workContent, err)
 	}
 	workInfo, err := os.Lstat(workSourceFile)
-	if err != nil || !workInfo.Mode().IsRegular() || os.SameFile(frozenInfo, workInfo) {
-		t.Fatalf("source copy reused frozen inode: frozen=%v work=%v err=%v", frozenInfo, workInfo, err)
+	if err != nil || !workInfo.Mode().IsRegular() || workInfo.Mode().Perm()&0o222 != 0 || os.SameFile(frozenInfo, workInfo) {
+		t.Fatalf("source copy is not an independent read-only file: frozen=%v work=%v err=%v", frozenInfo, workInfo, err)
+	}
+	for _, path := range []string{
+		workRoot,
+		filepath.Join(workRoot, StandardAuthoringCodexAttemptSourceDirectory),
+		filepath.Join(workRoot, StandardAuthoringCodexAttemptSourceDirectory, "src"),
+	} {
+		info, statErr := os.Lstat(path)
+		if statErr != nil || !info.IsDir() || info.Mode().Perm()&0o222 != 0 {
+			t.Fatalf("read-only attempt source path %q = %v, %v", path, info, statErr)
+		}
+	}
+	taskInfo, err := os.Lstat(filepath.Join(workRoot, StandardAuthoringCodexAttemptTaskDirectory))
+	if err != nil || !taskInfo.IsDir() || taskInfo.Mode().Perm()&0o200 == 0 {
+		t.Fatalf("writable task root = %v, %v", taskInfo, err)
 	}
 	if taskContent, err := os.ReadFile(workTaskFile); err != nil || string(taskContent) != "FROM scratch\n" {
 		t.Fatalf("fixed task candidate = %q, %v", taskContent, err)
@@ -700,6 +712,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteStillRejectsFrozen
 	stage := standardAuthoringCodexTestStage(1)
 	now := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
 	root := t.TempDir()
+	t.Cleanup(func() { standardAuthoringCodexRemoveTree(root) })
 	runID := "019f8397-7a65-7000-8000-0000000000a3"
 	sourceRoot := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
 	if err := os.MkdirAll(filepath.Join(sourceRoot, "src"), 0o750); err != nil {

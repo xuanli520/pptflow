@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -166,7 +167,7 @@ func (result Result) validate(requireReport bool) error {
 		return errors.New("Standard authoring harness report requires at least one step")
 	}
 	last := result.Steps[len(result.Steps)-1]
-	if last.Step != result.Step || last.ExitCode != result.ExitCode || last.StdoutTail != result.StdoutTail || last.StderrTail != result.StderrTail {
+	if last.Step != result.Step || last.Passed != result.Passed || last.ExitCode != result.ExitCode || !slices.Equal(last.Findings, result.Findings) || last.StdoutTail != result.StdoutTail || last.StderrTail != result.StderrTail {
 		return errors.New("Standard authoring harness summary does not match its final step")
 	}
 	for _, step := range result.Steps {
