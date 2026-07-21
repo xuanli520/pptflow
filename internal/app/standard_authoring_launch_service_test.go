@@ -31,6 +31,7 @@ const (
 	standardAuthoringLaunchTestTaskType    = "feature"
 	standardAuthoringLaunchTestApplication = "tower-http"
 	standardAuthoringLaunchTestObjective   = "Add a focused Tower HTTP backend feature with deterministic tests."
+	standardAuthoringLaunchAsyncTimeout    = 5 * time.Second
 )
 
 func mustStandardAuthoringEnvironmentPolicyInput(t *testing.T, artifactID string) standardAuthoringEnvironmentPolicyInput {
@@ -1018,7 +1019,7 @@ func TestStandardAuthoringLaunchSerializesCaptureAndCancellationDoesNotPublishAn
 	}()
 	select {
 	case <-capturer.started:
-	case <-time.After(time.Second):
+	case <-time.After(standardAuthoringLaunchAsyncTimeout):
 		t.Fatal("first source capture did not start")
 	}
 	secondContext, cancel := context.WithCancel(ctx)
@@ -1034,7 +1035,7 @@ func TestStandardAuthoringLaunchSerializesCaptureAndCancellationDoesNotPublishAn
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled peer launch error = %v, want context cancellation", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(standardAuthoringLaunchAsyncTimeout):
 		t.Fatal("cancelled peer launch did not return")
 	}
 	if capturer.CallCount() != 1 {
@@ -1048,7 +1049,7 @@ func TestStandardAuthoringLaunchSerializesCaptureAndCancellationDoesNotPublishAn
 			t.Fatalf("first serialized launch: %v", result.err)
 		}
 		firstReceipt = result.receipt
-	case <-time.After(time.Second):
+	case <-time.After(standardAuthoringLaunchAsyncTimeout):
 		t.Fatal("first serialized launch did not complete")
 	}
 	replayed, err := services.AuthoringLaunches.Start(ctx, command)
@@ -1097,7 +1098,7 @@ func TestStandardAuthoringLaunchConcurrentSuccessfulCallsShareOneCaptureReceipt(
 	go launch()
 	select {
 	case <-capturer.started:
-	case <-time.After(time.Second):
+	case <-time.After(standardAuthoringLaunchAsyncTimeout):
 		t.Fatal("first concurrent capture did not start")
 	}
 	go launch()
@@ -1110,7 +1111,7 @@ func TestStandardAuthoringLaunchConcurrentSuccessfulCallsShareOneCaptureReceipt(
 	for index := range outcomes {
 		select {
 		case outcomes[index] = <-results:
-		case <-time.After(time.Second):
+		case <-time.After(standardAuthoringLaunchAsyncTimeout):
 			t.Fatal("concurrent successful launch did not complete")
 		}
 	}
@@ -1254,7 +1255,7 @@ func standardAuthoringLaunchTestDefinitionProvider(t *testing.T) *CatalogStandar
 		Format: stageprovider.DeploymentOperationCatalogFormat, Version: stageprovider.DeploymentOperationCatalogVersion,
 		CatalogID: "standard-authoring-test", CatalogVersion: "1", Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Operations: []stageprovider.DeploymentOperationRegistration{},
 	}
-	for _, stage := range workflowadapter.StandardAuthoringTestsAnalysisInputStageCatalog().Stages {
+	for _, stage := range workflowadapter.StandardAuthoringHarnessStageCatalog().Stages {
 		operation := workflowadapter.StageOperationBinding{ProviderID: "standard-authoring-test-provider", OperationID: "test." + string(stage.Key), Version: "1"}
 		switch stage.Key {
 		case workflowkit.StageKey(workflowadapter.RepoPrepare):
@@ -1303,12 +1304,16 @@ func standardAuthoringLaunchTestStageType(t *testing.T, key workflowkit.StageKey
 		return workflowadapter.StageBindingTaskTOMLGen
 	case workflowkit.StageKey(workflowadapter.DockerfileGen):
 		return workflowadapter.StageBindingDockerfileGen
+	case workflowkit.StageKey(workflowadapter.DockerfileBuildValidate):
+		return workflowadapter.StageBindingDockerfileBuildValidate
 	case workflowkit.StageKey(workflowadapter.ContentReview):
 		return workflowadapter.StageBindingContentReview
 	case workflowkit.StageKey(workflowadapter.SolveGen):
 		return workflowadapter.StageBindingSolveGen
 	case workflowkit.StageKey(workflowadapter.TestGen):
 		return workflowadapter.StageBindingTestGen
+	case workflowkit.StageKey(workflowadapter.AuthoringHarness):
+		return workflowadapter.StageBindingAuthoringHarness
 	case workflowkit.StageKey(workflowadapter.TestsAnalysis):
 		return workflowadapter.StageBindingTestsAnalysis
 	case workflowkit.StageKey(workflowadapter.SolutionReview):

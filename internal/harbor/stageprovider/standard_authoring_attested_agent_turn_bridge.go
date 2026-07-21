@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -40,14 +41,15 @@ type StandardAuthoringCodexDeploymentAttestor interface {
 // resolution, avoiding any need to fabricate checkout revision facts at
 // process startup.
 type StandardAuthoringAttestedAgentTurnBridgeConfig struct {
-	Verifier       DeploymentOperationCatalogLockVerifier
-	Attestor       StandardAuthoringCodexAppServerOperationAttestor
-	WorkspaceRoot  string
-	WorkspaceMode  StandardAuthoringCodexWorkspaceMode
-	SourceVerifier StandardAuthoringCodexFrozenSourceVerifier
-	ProgramByStage map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
-	RuntimeFactory StandardAuthoringCodexRuntimeFactory
-	Now            func() time.Time
+	Verifier         DeploymentOperationCatalogLockVerifier
+	Attestor         StandardAuthoringCodexAppServerOperationAttestor
+	WorkspaceRoot    string
+	WorkspaceMode    StandardAuthoringCodexWorkspaceMode
+	SourceVerifier   StandardAuthoringCodexFrozenSourceVerifier
+	HarnessValidator authoringharness.Validator
+	ProgramByStage   map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
+	RuntimeFactory   StandardAuthoringCodexRuntimeFactory
+	Now              func() time.Time
 }
 
 // StandardAuthoringAttestedAgentTurnBridgeDeploymentConfig is the production
@@ -56,13 +58,14 @@ type StandardAuthoringAttestedAgentTurnBridgeConfig struct {
 // obtains all dynamic facts from the frozen StageOperationInvocation at effect
 // time and reads the lock-bound assets through Attestor.
 type StandardAuthoringAttestedAgentTurnBridgeDeploymentConfig struct {
-	Verifier       DeploymentOperationCatalogLockVerifier
-	Attestor       StandardAuthoringCodexDeploymentAttestor
-	WorkspaceRoot  string
-	WorkspaceMode  StandardAuthoringCodexWorkspaceMode
-	SourceVerifier StandardAuthoringCodexFrozenSourceVerifier
-	RuntimeFactory StandardAuthoringCodexRuntimeFactory
-	Now            func() time.Time
+	Verifier         DeploymentOperationCatalogLockVerifier
+	Attestor         StandardAuthoringCodexDeploymentAttestor
+	WorkspaceRoot    string
+	WorkspaceMode    StandardAuthoringCodexWorkspaceMode
+	SourceVerifier   StandardAuthoringCodexFrozenSourceVerifier
+	HarnessValidator authoringharness.Validator
+	RuntimeFactory   StandardAuthoringCodexRuntimeFactory
+	Now              func() time.Time
 }
 
 type standardAuthoringCodexProgramFactory func(context.Context, StageOperationInvocation, workflowadapter.AgentTurnOperationPayload) (StandardAuthoringCodexTurnProgram, error)
@@ -78,6 +81,7 @@ type StandardAuthoringAttestedAgentTurnBridge struct {
 	workspaceRoot    string
 	workspaceMode    StandardAuthoringCodexWorkspaceMode
 	sourceVerifier   StandardAuthoringCodexFrozenSourceVerifier
+	harnessValidator authoringharness.Validator
 	runtimeFactory   StandardAuthoringCodexRuntimeFactory
 	now              func() time.Time
 	programForEffect standardAuthoringCodexProgramFactory
@@ -101,7 +105,7 @@ func NewStandardAuthoringAttestedAgentTurnBridge(config StandardAuthoringAtteste
 		}
 		programs[stageKey] = program.clone()
 	}
-	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.WorkspaceMode, config.SourceVerifier, config.RuntimeFactory, config.Now)
+	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.WorkspaceMode, config.SourceVerifier, config.HarnessValidator, config.RuntimeFactory, config.Now)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +128,7 @@ func NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(config StandardAu
 	if isNilInterface(config.Attestor) {
 		return nil, ErrDeploymentOperationRuntimeAttestationUnavailable
 	}
-	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.WorkspaceMode, config.SourceVerifier, config.RuntimeFactory, config.Now)
+	bridge, err := newStandardAuthoringAttestedAgentTurnBridge(config.Verifier, config.Attestor, config.WorkspaceRoot, config.WorkspaceMode, config.SourceVerifier, config.HarnessValidator, config.RuntimeFactory, config.Now)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +138,7 @@ func NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(config StandardAu
 	return bridge, nil
 }
 
-func newStandardAuthoringAttestedAgentTurnBridge(verifier DeploymentOperationCatalogLockVerifier, attestor StandardAuthoringCodexAppServerOperationAttestor, workspaceRoot string, workspaceMode StandardAuthoringCodexWorkspaceMode, sourceVerifier StandardAuthoringCodexFrozenSourceVerifier, runtimeFactory StandardAuthoringCodexRuntimeFactory, now func() time.Time) (*StandardAuthoringAttestedAgentTurnBridge, error) {
+func newStandardAuthoringAttestedAgentTurnBridge(verifier DeploymentOperationCatalogLockVerifier, attestor StandardAuthoringCodexAppServerOperationAttestor, workspaceRoot string, workspaceMode StandardAuthoringCodexWorkspaceMode, sourceVerifier StandardAuthoringCodexFrozenSourceVerifier, harnessValidator authoringharness.Validator, runtimeFactory StandardAuthoringCodexRuntimeFactory, now func() time.Time) (*StandardAuthoringAttestedAgentTurnBridge, error) {
 	if isNilDeploymentOperationCatalogLockVerifier(verifier) {
 		return nil, ErrDeploymentOperationCatalogLockUnavailable
 	}
@@ -156,7 +160,7 @@ func newStandardAuthoringAttestedAgentTurnBridge(verifier DeploymentOperationCat
 		return nil, fmt.Errorf("%w: RunScoped frozen source verifier is required", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return &StandardAuthoringAttestedAgentTurnBridge{
-		verifier: verifier, attestor: attestor, workspaceRoot: root, workspaceMode: mode, sourceVerifier: sourceVerifier, runtimeFactory: runtimeFactory, now: now,
+		verifier: verifier, attestor: attestor, workspaceRoot: root, workspaceMode: mode, sourceVerifier: sourceVerifier, harnessValidator: harnessValidator, runtimeFactory: runtimeFactory, now: now,
 	}, nil
 }
 
@@ -179,12 +183,13 @@ func (bridge *StandardAuthoringAttestedAgentTurnBridge) ExecuteAgentTurn(ctx con
 		InvocationFactory: func(factoryCtx context.Context, factoryInvocation StageOperationInvocation, factoryPayload workflowadapter.AgentTurnOperationPayload) (CodexAppServerInvocation, error) {
 			return bridge.attestInvocationForEffect(factoryCtx, factoryInvocation, factoryPayload, program)
 		},
-		WorkspaceRoot:  bridge.workspaceRoot,
-		WorkspaceMode:  bridge.workspaceMode,
-		SourceVerifier: bridge.sourceVerifier,
-		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{invocation.Request.Stage.Key: program},
-		RuntimeFactory: bridge.runtimeFactory,
-		Now:            bridge.now,
+		WorkspaceRoot:    bridge.workspaceRoot,
+		WorkspaceMode:    bridge.workspaceMode,
+		SourceVerifier:   bridge.sourceVerifier,
+		HarnessValidator: bridge.harnessValidator,
+		ProgramByStage:   map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{invocation.Request.Stage.Key: program},
+		RuntimeFactory:   bridge.runtimeFactory,
+		Now:              bridge.now,
 	})
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil

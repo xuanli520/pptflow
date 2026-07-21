@@ -127,8 +127,7 @@ type CodeEdgePhase1ParentExecutor struct {
 	workspaceRoot string
 	profile       codeedge.Profile
 	commands      map[string]stageprovider.LocalExecutableLock
-	runner        CodeEdgePhase1CommandRunner
-	timeout       time.Duration
+	docker        *lockedDockerRuntime
 }
 
 // CodeEdgePhase1ParentWorkspaceRoot returns the one fixed run-scoped parent
@@ -177,12 +176,15 @@ func NewCodeEdgePhase1ParentExecutor(config CodeEdgePhase1ParentExecutorConfig) 
 	if timeout <= 0 {
 		timeout = 20 * time.Minute
 	}
+	docker, err := newLockedDockerRuntime(commands, runner, timeout, nil)
+	if err != nil {
+		return nil, err
+	}
 	return &CodeEdgePhase1ParentExecutor{
 		workspaceRoot: workspaceRoot,
 		profile:       config.PreflightProfile,
 		commands:      commands,
-		runner:        runner,
-		timeout:       timeout,
+		docker:        docker,
 	}, nil
 }
 
@@ -258,10 +260,10 @@ func (executor *CodeEdgePhase1ParentExecutor) ExecuteHarborBuiltin(ctx context.C
 	verdict := workflowkit.VerdictPass
 	findings := []string{}
 	switch payload.HandlerID {
-		case stageprovider.CodeEdgePhase1QualityCheckHandlerID:
-			verdict, findings = executor.runQualityChecks(taskRoot)
-		case stageprovider.CodeEdgePhase1SimilarityCheckHandlerID:
-			verdict, findings = executor.runSimilarityChecks(taskRoot)
+	case stageprovider.CodeEdgePhase1QualityCheckHandlerID:
+		verdict, findings = executor.runQualityChecks(taskRoot)
+	case stageprovider.CodeEdgePhase1SimilarityCheckHandlerID:
+		verdict, findings = executor.runSimilarityChecks(taskRoot)
 	case stageprovider.CodeEdgePhase1SubmissionLintHandlerID:
 		artifactID, reserveErr := executor.reserveSubmissionArtifactID(workspace, invocation.Request)
 		if reserveErr != nil {
@@ -316,7 +318,7 @@ func (executor *CodeEdgePhase1ParentExecutor) ExecuteLocalCommand(ctx context.Co
 }
 
 func (executor *CodeEdgePhase1ParentExecutor) validateBuiltinInvocation(ctx context.Context, invocation stageprovider.StageOperationInvocation, payload workflowadapter.HarborBuiltinOperationPayload) error {
-	if executor == nil || executor.runner == nil {
+	if executor == nil || executor.docker == nil {
 		return errors.New("CodeEdge Phase-1 parent executor is not configured")
 	}
 	if ctx == nil {
@@ -343,7 +345,7 @@ func (executor *CodeEdgePhase1ParentExecutor) validateBuiltinInvocation(ctx cont
 }
 
 func (executor *CodeEdgePhase1ParentExecutor) validateLocalInvocation(ctx context.Context, invocation stageprovider.StageOperationInvocation, payload workflowadapter.LocalCommandOperationPayload) error {
-	if executor == nil || executor.runner == nil {
+	if executor == nil || executor.docker == nil {
 		return errors.New("CodeEdge Phase-1 parent executor is not configured")
 	}
 	if ctx == nil {
@@ -882,20 +884,15 @@ func (executor *CodeEdgePhase1ParentExecutor) executeDockerBuild(ctx context.Con
 	}
 	lock := executor.commands[stageprovider.CodeEdgePhase1DockerBuildCommandID]
 	imageTag := codeEdgePhase1ImageTag(request.Execution.ID)
-	command := CodeEdgePhase1Command{
-		Path: lock.AbsolutePath,
-		Args: []string{
-			"build", "--pull=false", "--network=default",
-			"--label", "io.harbor-factory.codeedge.run_id=" + request.Execution.ID,
-			"--label", "io.harbor-factory.codeedge.task_digest=" + string(request.Execution.Subject.Digest),
-			"--tag", imageTag,
-			"--file", filepath.Join(taskRoot, "environment", "Dockerfile"),
-			filepath.Join(taskRoot, "environment"),
-		},
-		Dir: workspace,
-		Env: executor.commandEnvironment(workspace),
+	args := []string{
+		"build", "--pull=false", "--network=default",
+		"--label", "io.harbor-factory.codeedge.run_id=" + request.Execution.ID,
+		"--label", "io.harbor-factory.codeedge.task_digest=" + string(request.Execution.Subject.Digest),
+		"--tag", imageTag,
+		"--file", filepath.Join(taskRoot, "environment", "Dockerfile"),
+		filepath.Join(taskRoot, "environment"),
 	}
-	result, outputFingerprint, runErr := executor.runLockedCommand(ctx, command)
+	result, outputFingerprint, runErr := executor.docker.run(ctx, lock.CommandID, args, workspace)
 	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
 	if runErr != nil {
 		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Docker build could not start", report, codeEdgePhase1FailureClass(runErr))
@@ -937,13 +934,8 @@ func (executor *CodeEdgePhase1ParentExecutor) executeInitialVerify(ctx context.C
 		return workflowkit.StageExecutionResult{}, err
 	}
 	lock := executor.commands[stageprovider.CodeEdgePhase1InitialVerifyCommandID]
-	command := CodeEdgePhase1Command{
-		Path: lock.AbsolutePath,
-		Args: codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "initial"), "sh ./tests/test.sh"),
-		Dir:  workspace,
-		Env:  executor.commandEnvironment(workspace),
-	}
-	result, outputFingerprint, runErr := executor.runLockedCommand(ctx, command)
+	result, outputFingerprint, runErr := executor.docker.run(ctx, lock.CommandID,
+		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "initial"), "sh ./tests/test.sh"), workspace)
 	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
 	if runErr != nil {
 		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled initial verification could not start", report, codeEdgePhase1FailureClass(runErr))
@@ -977,13 +969,8 @@ func (executor *CodeEdgePhase1ParentExecutor) executeOracleVerify(ctx context.Co
 		return workflowkit.StageExecutionResult{}, err
 	}
 	lock := executor.commands[stageprovider.CodeEdgePhase1OracleVerifyCommandID]
-	command := CodeEdgePhase1Command{
-		Path: lock.AbsolutePath,
-		Args: codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "oracle"), "sh ./solution/solve.sh && sh ./tests/test.sh"),
-		Dir:  workspace,
-		Env:  executor.commandEnvironment(workspace),
-	}
-	result, outputFingerprint, runErr := executor.runLockedCommand(ctx, command)
+	result, outputFingerprint, runErr := executor.docker.run(ctx, lock.CommandID,
+		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "oracle"), "sh ./solution/solve.sh && sh ./tests/test.sh"), workspace)
 	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
 	if runErr != nil {
 		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Oracle verification could not start", report, codeEdgePhase1FailureClass(runErr))
@@ -999,39 +986,6 @@ func (executor *CodeEdgePhase1ParentExecutor) executeOracleVerify(ctx context.Co
 		return codeEdgePhase1ReportStageResult(report, outputName, schema)
 	}
 	return codeEdgePhase1ReportStageResult(report, outputName, schema)
-}
-
-func (executor *CodeEdgePhase1ParentExecutor) commandEnvironment(workspace string) []string {
-	return []string{
-		"HOME=" + filepath.Join(workspace, "command-home"),
-		"TMPDIR=" + filepath.Join(workspace, "command-tmp"),
-		"LANG=C.UTF-8",
-		"PATH=/nonexistent",
-	}
-}
-
-func (executor *CodeEdgePhase1ParentExecutor) runLockedCommand(ctx context.Context, command CodeEdgePhase1Command) (CodeEdgePhase1CommandResult, workflowkit.Fingerprint, error) {
-	if err := os.MkdirAll(filepath.Join(command.Dir, "command-home"), 0o700); err != nil {
-		return CodeEdgePhase1CommandResult{}, "", err
-	}
-	if err := os.MkdirAll(filepath.Join(command.Dir, "command-tmp"), 0o700); err != nil {
-		return CodeEdgePhase1CommandResult{}, "", err
-	}
-	commandCtx, cancel := context.WithTimeout(ctx, executor.timeout)
-	defer cancel()
-	result, err := executor.runner.Run(commandCtx, command)
-	if commandCtx.Err() != nil && err == nil {
-		err = commandCtx.Err()
-	}
-	fingerprint, fingerprintErr := workflowkit.FingerprintParts("harbor.codeedge-phase1.command-output.v1", []workflowkit.FingerprintPart{
-		{Name: "exit_code", Value: []byte(fmt.Sprintf("%d", result.ExitCode))},
-		{Name: "stdout", Value: result.Stdout},
-		{Name: "stderr", Value: result.Stderr},
-	})
-	if fingerprintErr != nil {
-		return CodeEdgePhase1CommandResult{}, "", fingerprintErr
-	}
-	return result, fingerprint, err
 }
 
 func codeEdgePhase1FailureClass(err error) workflowkit.FailureClass {
@@ -1126,28 +1080,8 @@ func (executor *CodeEdgePhase1ParentExecutor) verifyDockerBuildImage(ctx context
 }
 
 func (executor *CodeEdgePhase1ParentExecutor) inspectDockerImage(ctx context.Context, workspace, commandID, imageTag string) (string, error) {
-	lock, found := executor.commands[commandID]
-	if !found {
-		return "", errors.New("CodeEdge Phase-1 Docker image verifier is not installed")
-	}
-	command := CodeEdgePhase1Command{
-		Path: lock.AbsolutePath,
-		Args: []string{"image", "inspect", "--format", "{{.Id}}", imageTag},
-		Dir:  workspace,
-		Env:  executor.commandEnvironment(workspace),
-	}
-	result, _, err := executor.runLockedCommand(ctx, command)
-	if err != nil {
-		return "", err
-	}
-	if result.ExitCode != 0 {
-		return "", errors.New("controlled Docker image inspection failed")
-	}
-	imageID, err := codeEdgePhase1DockerImageID(result.Stdout)
-	if err != nil {
-		return "", err
-	}
-	return imageID, nil
+	imageID, _, _, err := executor.docker.inspectImage(ctx, workspace, commandID, imageTag)
+	return imageID, err
 }
 
 func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) []string {

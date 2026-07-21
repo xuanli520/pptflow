@@ -83,6 +83,7 @@ func DefaultTemplateRegistry() TemplateRegistry {
 	standardAuthoringBrief := StandardAuthoringBriefWorkflowTemplate()
 	standardAuthoringRepairFeedback := StandardAuthoringRepairFeedbackWorkflowTemplate()
 	standardAuthoringTestsAnalysisInput := StandardAuthoringTestsAnalysisInputWorkflowTemplate()
+	standardAuthoringHarness := StandardAuthoringHarnessWorkflowTemplate()
 	codeEdge := CodeEdgePhase1WorkflowTemplate()
 	codeEdgeEvaluator := CodeEdgeEvaluatorChildWorkflowTemplate()
 	return TemplateRegistry{templates: map[templateReferenceKey]WorkflowTemplate{
@@ -92,6 +93,7 @@ func DefaultTemplateRegistry() TemplateRegistry {
 		templateKey(standardAuthoringBrief.Reference()):              standardAuthoringBrief,
 		templateKey(standardAuthoringRepairFeedback.Reference()):     standardAuthoringRepairFeedback,
 		templateKey(standardAuthoringTestsAnalysisInput.Reference()): standardAuthoringTestsAnalysisInput,
+		templateKey(standardAuthoringHarness.Reference()):            standardAuthoringHarness,
 		templateKey(codeEdge.Reference()):                            codeEdge,
 		templateKey(codeEdgeEvaluator.Reference()):                   codeEdgeEvaluator,
 	}}
@@ -126,6 +128,7 @@ func BuiltinTemplateReferences() []TemplateReference {
 		StandardAuthoringBriefTemplateReference(),
 		StandardAuthoringRepairFeedbackTemplateReference(),
 		StandardAuthoringTestsAnalysisInputTemplateReference(),
+		StandardAuthoringHarnessTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	}
@@ -145,6 +148,7 @@ func isBuiltinTemplateReference(reference TemplateReference) bool {
 		reference.Equal(StandardAuthoringBriefTemplateReference()) ||
 		reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()) ||
 		reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()) ||
+		reference.Equal(StandardAuthoringHarnessTemplateReference()) ||
 		reference.Equal(CodeEdgePhase1TemplateReference()) ||
 		reference.Equal(CodeEdgeEvaluatorChildTemplateReference())
 }

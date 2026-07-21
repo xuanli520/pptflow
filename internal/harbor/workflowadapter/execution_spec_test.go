@@ -633,11 +633,15 @@ func bindingForTest(t *testing.T, base StageBindingBase) StageExecutionBinding {
 		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingDockerfileGen:
 		return UniversalStageBinding{StageBindingBase: base}
+	case StageBindingDockerfileBuildValidate:
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingContentReview:
 		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingSolveGen:
 		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTestGen:
+		return UniversalStageBinding{StageBindingBase: base}
+	case StageBindingAuthoringHarness:
 		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTestsAnalysis:
 		return UniversalStageBinding{StageBindingBase: base}
@@ -701,12 +705,16 @@ func bindingTypeForTest(key workflowkit.StageKey) StageBindingType {
 		return StageBindingTaskTOMLGen
 	case "dockerfile_generate":
 		return StageBindingDockerfileGen
+	case "dockerfile_build_validate":
+		return StageBindingDockerfileBuildValidate
 	case "content_review":
 		return StageBindingContentReview
 	case "solve_generate":
 		return StageBindingSolveGen
 	case "test_generate":
 		return StageBindingTestGen
+	case "authoring_harness":
+		return StageBindingAuthoringHarness
 	case "tests_analysis":
 		return StageBindingTestsAnalysis
 	case "solution_review":

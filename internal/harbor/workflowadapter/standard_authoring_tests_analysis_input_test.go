@@ -13,11 +13,12 @@ func TestStandardAuthoringTestsAnalysisInputTemplateBindsCurrentGeneratedArtifac
 		t.Fatalf("validate 1.6.0 template: %v", err)
 	}
 	if !template.Reference().Equal(StandardAuthoringTestsAnalysisInputTemplateReference()) ||
-		!StandardAuthoringCurrentTemplateReference().Equal(template.Reference()) ||
-		!StandardAuthoringCurrentWorkflowTemplate().Reference().Equal(template.Reference()) ||
 		template.Catalog.Version != StandardAuthoringTestsAnalysisInputTemplateVersion ||
 		template.QuotaPolicy.Version != StandardAuthoringTestsAnalysisInputQuotaPolicyVersion {
 		t.Fatalf("tests-analysis-input identities = template %s catalog %s quota %s", template.Version, template.Catalog.Version, template.QuotaPolicy.Version)
+	}
+	if StandardAuthoringCurrentTemplateReference().Equal(template.Reference()) || StandardAuthoringCurrentWorkflowTemplate().Reference().Equal(template.Reference()) {
+		t.Fatal("historical 1.6.0 template remained the current authoring contract")
 	}
 
 	for _, contract := range []struct {

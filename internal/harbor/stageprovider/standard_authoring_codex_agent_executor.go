@@ -7,15 +7,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/purplevoid/harbor-factory/internal/agent"
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/runtime/codexruntime"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -38,6 +41,7 @@ const (
 	standardAuthoringCodexFailureQuota         = "standard_authoring_codex_agent_turn.quota"
 	standardAuthoringCodexFailureRuntime       = "standard_authoring_codex_agent_turn.runtime"
 	standardAuthoringCodexFailureSource        = "standard_authoring_codex_agent_turn.source_integrity"
+	standardAuthoringCodexFailureWorkspace     = "standard_authoring_codex_agent_turn.workspace"
 	standardAuthoringCodexFailureOutput        = "standard_authoring_codex_agent_turn.output"
 	standardAuthoringCodexFailureInterrupted   = "standard_authoring_codex_agent_turn.interrupted"
 
@@ -253,6 +257,14 @@ const (
 	// does not derive from a caller-selected repository URL, keeping workspace
 	// layout stable and path-safe for every supported source.
 	StandardAuthoringCodexRunSourceDirectory = "source"
+	// A workspace-write turn receives only its stage-attempt-owned work root.
+	// The frozen source remains outside that writable root and is copied by
+	// value into work/source. Host-owned authoring tools use work/task for fixed
+	// candidate paths, so repository files cannot collide with task artifacts.
+	StandardAuthoringCodexRunAttemptsDirectory   = "attempts"
+	StandardAuthoringCodexAttemptWorkDirectory   = "work"
+	StandardAuthoringCodexAttemptSourceDirectory = "source"
+	StandardAuthoringCodexAttemptTaskDirectory   = "task"
 )
 
 // StandardAuthoringCodexAgentTurnExecutorConfig contains only composition-owned
@@ -265,6 +277,7 @@ type StandardAuthoringCodexAgentTurnExecutorConfig struct {
 	WorkspaceRoot     string
 	WorkspaceMode     StandardAuthoringCodexWorkspaceMode
 	SourceVerifier    StandardAuthoringCodexFrozenSourceVerifier
+	HarnessValidator  authoringharness.Validator
 	ProgramByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
 	RuntimeFactory    StandardAuthoringCodexRuntimeFactory
 	Now               func() time.Time
@@ -278,6 +291,7 @@ type StandardAuthoringCodexAgentTurnExecutor struct {
 	workspaceRoot     string
 	workspaceMode     StandardAuthoringCodexWorkspaceMode
 	sourceVerifier    StandardAuthoringCodexFrozenSourceVerifier
+	harnessValidator  authoringharness.Validator
 	programByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
 	runtimeFactory    StandardAuthoringCodexRuntimeFactory
 	now               func() time.Time
@@ -326,8 +340,16 @@ func NewStandardAuthoringCodexAgentTurnExecutor(config StandardAuthoringCodexAge
 	}
 	return &StandardAuthoringCodexAgentTurnExecutor{
 		invocationFactory: config.InvocationFactory, workspaceRoot: workspaceRoot, workspaceMode: workspaceMode, sourceVerifier: config.SourceVerifier, programByStage: programs,
-		runtimeFactory: config.RuntimeFactory, now: now,
+		harnessValidator: config.HarnessValidator, runtimeFactory: config.RuntimeFactory, now: now,
 	}, nil
+}
+
+type standardAuthoringCodexSubmissionAuthority interface {
+	beginTurn(int) error
+	dynamicTool() agent.DynamicTool
+	outputSchema() json.RawMessage
+	acceptedResult() (workflowkit.StageExecutionResult, bool)
+	failure() string
 }
 
 // ExecuteAgentTurn implements AgentTurnOperationExecutor. It consumes every
@@ -359,16 +381,12 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
-	workspace, err := executor.workspaceForExecution(request.Execution.ID)
+	sourceWorkspace, err := executor.workspaceForExecution(request.Execution.ID)
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
 	maxSubmissions, hasSubmissionQuota := standardAuthoringCodexOutputSubmissionQuota(request.Stage)
 	if !hasSubmissionQuota {
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-	}
-	submission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now, environmentPolicy)
-	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
 	attestedInvocation, runtime, failure := executor.runtimeForEffect(ctx, invocation, payload)
@@ -378,12 +396,58 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		}
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failure), nil
 	}
-	sourceIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+	sourceIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
 	if err != nil {
 		if contextError(ctx) != nil {
 			return standardAuthoringCodexInterrupted(), nil
 		}
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+	}
+	workspace := sourceWorkspace
+	if standardAuthoringCodexInvocationWorkspaceWrite(attestedInvocation) {
+		if executor.workspaceMode != StandardAuthoringCodexWorkspaceRunScoped {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		workspace, err = executor.prepareAttemptWorkspace(ctx, request, sourceWorkspace)
+		if err != nil {
+			if contextError(ctx) != nil {
+				return standardAuthoringCodexInterrupted(), nil
+			}
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureWorkspace), nil
+		}
+		copiedSourceIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
+		if verifyErr != nil || copiedSourceIdentity != sourceIdentity {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+		}
+	}
+	var submission standardAuthoringCodexSubmissionAuthority
+	if standardAuthoringCodexUsesWorkspaceHarness(request.Stage.Key) {
+		if !standardAuthoringCodexInvocationWorkspaceWrite(attestedInvocation) || isNilInterface(executor.harnessValidator) {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		taskRoot := filepath.Join(workspace, StandardAuthoringCodexAttemptTaskDirectory)
+		if err := standardAuthoringCodexPrepareWorkspaceCandidate(request.Stage, taskRoot, inputs); err != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureWorkspace), nil
+		}
+		validationAttempts, ok := standardAuthoringCodexValidationQuota(request.Stage)
+		if !ok || validationAttempts <= 0 {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		attempts := maxSubmissions
+		if validationAttempts < attempts {
+			attempts = validationAttempts
+		}
+		workspaceSubmission, err := newStandardAuthoringCodexWorkspaceSubmission(request, taskRoot, int(attempts), executor.now, executor.harnessValidator, environmentPolicy)
+		if err != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		submission = workspaceSubmission
+	} else {
+		outputSubmission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now, environmentPolicy)
+		if err != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		submission = outputSubmission
 	}
 	conversation, err := runtime.OpenConversation(ctx, agent.ConversationRequest{
 		ProjectPath:       workspace,
@@ -429,7 +493,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			}
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureQuota), nil
 		}
-		beforeTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+		beforeTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
 		if verifyErr != nil || beforeTurnIdentity != sourceIdentity {
 			_ = conversation.Close()
 			if contextError(ctx) != nil {
@@ -456,7 +520,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			turnRequest.Input = []agent.InputPart{{Type: "text", Text: string(requestDocument)}}
 		}
 		result, turnErr := conversation.Turn(ctx, turnRequest)
-		afterTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+		afterTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
 		if verifyErr != nil || afterTurnIdentity != sourceIdentity {
 			_ = conversation.Close()
 			if contextError(ctx) != nil {
@@ -489,7 +553,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		}
 		if accepted, ok := submission.acceptedResult(); ok {
 			closeErr := conversation.Close()
-			closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+			closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
 			if verifyErr != nil || closedIdentity != sourceIdentity {
 				if contextError(ctx) != nil {
 					return standardAuthoringCodexInterrupted(), nil
@@ -503,7 +567,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		}
 	}
 	closeErr := conversation.Close()
-	closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, workspace)
+	closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
 	if verifyErr != nil || closedIdentity != sourceIdentity {
 		if contextError(ctx) != nil {
 			return standardAuthoringCodexInterrupted(), nil
@@ -525,6 +589,9 @@ func standardAuthoringCodexSubmissionFailureClass(code string) workflowkit.Failu
 	if code == standardAuthoringCodexSubmissionFailureQuota {
 		return workflowkit.FailurePolicy
 	}
+	if code == standardAuthoringCodexSubmissionFailureValidation {
+		return workflowkit.FailureProcess
+	}
 	return workflowkit.FailureUnknown
 }
 
@@ -540,7 +607,15 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionReques
 	}
 	expectedAgentTurns, hasAgentTurnQuota := standardAuthoringCodexAgentTurnQuota(request.Stage)
 	expectedSubmissions, hasSubmissionQuota := standardAuthoringCodexOutputSubmissionQuota(request.Stage)
-	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns || !hasSubmissionQuota || expectedSubmissions != workflowadapter.StandardAuthoringOutputSubmissionClaimUnits {
+	expectedSubmissionUnits := workflowadapter.StandardAuthoringOutputSubmissionClaimUnits
+	if standardAuthoringCodexUsesWorkspaceHarness(request.Stage.Key) {
+		expectedSubmissionUnits = workflowadapter.StandardAuthoringHarnessSubmissionClaimUnits
+		validationUnits, hasValidationQuota := standardAuthoringCodexValidationQuota(request.Stage)
+		if !hasValidationQuota || validationUnits != workflowadapter.StandardAuthoringValidationClaimUnits {
+			return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
+		}
+	}
+	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns || !hasSubmissionQuota || expectedSubmissions != expectedSubmissionUnits {
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	if request.Claim.Stage == nil || strings.TrimSpace(string(request.Claim.Stage.StageAttempt.ID)) == "" || request.Checkpoint == nil || request.Charge == nil {
@@ -589,6 +664,14 @@ func standardAuthoringCodexAgentTurnQuota(stage workflowkit.StageDescriptor) (in
 
 func standardAuthoringCodexOutputSubmissionQuota(stage workflowkit.StageDescriptor) (int64, bool) {
 	return standardAuthoringCodexQuotaClaim(stage, standardAuthoringCodexOutputSubmissionQuotaDimension)
+}
+
+func standardAuthoringCodexValidationQuota(stage workflowkit.StageDescriptor) (int64, bool) {
+	return standardAuthoringCodexQuotaClaim(stage, workflowadapter.StandardAuthoringValidationQuotaDimension)
+}
+
+func standardAuthoringCodexUsesWorkspaceHarness(stageKey workflowkit.StageKey) bool {
+	return stageKey == workflowkit.StageKey(workflowadapter.DockerfileBuildValidate) || stageKey == workflowkit.StageKey(workflowadapter.AuthoringHarness)
 }
 
 func standardAuthoringCodexQuotaClaim(stage workflowkit.StageDescriptor, dimension string) (int64, bool) {
@@ -674,7 +757,7 @@ func standardAuthoringCodexReadInputs(ctx context.Context, request workflowkit.S
 // standardAuthoringCodexReadInputs; requiring canonical bytes here prevents an
 // equivalent-but-unfrozen JSON spelling from becoming an output authority.
 func standardAuthoringCodexDockerfileEnvironmentPolicy(stage workflowkit.StageDescriptor, inputs []standardAuthoringCodexInput) (*workflowadapter.StandardAuthoringEnvironmentPolicy, error) {
-	if stage.Key != workflowkit.StageKey(workflowadapter.DockerfileGen) {
+	if stage.Key != workflowkit.StageKey(workflowadapter.DockerfileGen) && !standardAuthoringCodexUsesWorkspaceHarness(stage.Key) {
 		return nil, nil
 	}
 
@@ -718,7 +801,7 @@ func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionReq
 		}{Name: output.Name, SchemaVersion: output.SchemaVersion})
 	}
 	var frozenEnvironmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy
-	if request.Stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) {
+	if request.Stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) || standardAuthoringCodexUsesWorkspaceHarness(request.Stage.Key) {
 		if environmentPolicy == nil || environmentPolicy.Validate() != nil {
 			return nil, errors.New("frozen Dockerfile environment policy is unavailable")
 		}
@@ -758,10 +841,14 @@ func validateStandardAuthoringCodexInvocation(invocation CodexAppServerInvocatio
 			return err
 		}
 	}
-	if invocation.AgentID != CodexAppServerProductionAgentID || invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.SandboxMode != CodexAppServerSandboxModeReadOnly || invocation.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly || invocation.NetworkAccess || !filepath.IsAbs(invocation.JavaScriptLauncherPath) || !filepath.IsAbs(invocation.NodeExecutablePath) || !filepath.IsAbs(invocation.CodexHomeDirectory) {
+	if invocation.AgentID != CodexAppServerProductionAgentID || invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.ApprovalPolicy != CodexAppServerApprovalPolicyNever || !validCodexAppServerSandbox(invocation.SandboxMode, invocation.SandboxPolicy) || invocation.NetworkAccess || !filepath.IsAbs(invocation.JavaScriptLauncherPath) || !filepath.IsAbs(invocation.NodeExecutablePath) || !filepath.IsAbs(invocation.CodexHomeDirectory) {
 		return fmt.Errorf("%w: invocation does not satisfy the locked Codex production policy", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return nil
+}
+
+func standardAuthoringCodexInvocationWorkspaceWrite(invocation CodexAppServerInvocation) bool {
+	return invocation.SandboxMode == CodexAppServerSandboxModeWorkspaceWrite && invocation.SandboxPolicy == CodexAppServerSandboxPolicyWorkspaceWrite
 }
 
 func standardAuthoringCodexWorkspaceRoot(value string) (string, error) {
@@ -820,6 +907,270 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) workspaceForExecution(e
 		}
 	}
 	return workspace, nil
+}
+
+// StandardAuthoringAttemptWorkspacePath derives the only writable root for a
+// Standard Authoring stage attempt. authoringWorkspaceRoot is the value
+// returned by app.StandardAuthoringCodexWorkspaceRoot, not the broader managed
+// root. Missing attempt descendants are allowed so the executor can create the
+// path atomically; every ancestor that already exists is required to be a real
+// directory rather than a symbolic link.
+func StandardAuthoringAttemptWorkspacePath(authoringWorkspaceRoot, runID string, stageKey workflowkit.StageKey, stageAttemptID string) (string, error) {
+	root, err := standardAuthoringCodexWorkspaceRoot(authoringWorkspaceRoot)
+	if err != nil {
+		return "", err
+	}
+	rootInfo, err := inspectLockedLocalExecutablePath(root)
+	if err != nil || !rootInfo.IsDir() {
+		return "", fmt.Errorf("%w: authoring workspace root has an unsafe path component", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	parsed, err := uuid.Parse(strings.TrimSpace(runID))
+	if err != nil || parsed.Version() != 7 {
+		return "", fmt.Errorf("%w: attempt workspace requires a UUIDv7 execution ID", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	stageComponent := strings.TrimSpace(string(stageKey))
+	attemptComponent := strings.TrimSpace(stageAttemptID)
+	if !standardAuthoringCodexSafePathComponent(stageComponent) || !standardAuthoringCodexSafePathComponent(attemptComponent) {
+		return "", fmt.Errorf("%w: attempt workspace identity is not a safe path component", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	workspace := filepath.Join(root, parsed.String(), StandardAuthoringCodexRunAttemptsDirectory, stageComponent, attemptComponent, StandardAuthoringCodexAttemptWorkDirectory)
+	if !standardAuthoringPathWithin(root, workspace) {
+		return "", fmt.Errorf("%w: attempt workspace escapes its managed root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := standardAuthoringCodexVerifyExistingDirectoryChain(root, workspace, false); err != nil {
+		return "", err
+	}
+	return workspace, nil
+}
+
+// ValidateStandardAuthoringAttemptWorkspacePath proves that candidate is the
+// exact, already materialized work root for the supplied durable identities.
+// It also checks the fixed source and task roots used by the agent and host
+// harness. Callers never accept a model-selected path.
+func ValidateStandardAuthoringAttemptWorkspacePath(authoringWorkspaceRoot, runID string, stageKey workflowkit.StageKey, stageAttemptID, candidate string) error {
+	expected, err := StandardAuthoringAttemptWorkspacePath(authoringWorkspaceRoot, runID, stageKey, stageAttemptID)
+	if err != nil {
+		return err
+	}
+	root, err := standardAuthoringCodexWorkspaceRoot(authoringWorkspaceRoot)
+	if err != nil {
+		return err
+	}
+	candidateAbs, err := filepath.Abs(strings.TrimSpace(candidate))
+	if err != nil || filepath.Clean(candidateAbs) != candidateAbs || candidateAbs != expected {
+		return fmt.Errorf("%w: attempt workspace path does not match its durable identity", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := standardAuthoringCodexVerifyExistingDirectoryChain(root, expected, true); err != nil {
+		return err
+	}
+	for _, directory := range []string{StandardAuthoringCodexAttemptSourceDirectory, StandardAuthoringCodexAttemptTaskDirectory} {
+		path := filepath.Join(expected, directory)
+		info, inspectErr := inspectLockedLocalExecutablePath(path)
+		if inspectErr != nil || !info.IsDir() {
+			return fmt.Errorf("%w: attempt workspace fixed directory is unavailable or unsafe", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+	}
+	return standardAuthoringCodexValidateWorkTree(expected)
+}
+
+func (executor *StandardAuthoringCodexAgentTurnExecutor) prepareAttemptWorkspace(ctx context.Context, request workflowkit.StageExecutionRequest, sourceRoot string) (string, error) {
+	if executor == nil || request.Claim.Stage == nil {
+		return "", fmt.Errorf("%w: attempt workspace request is incomplete", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	workRoot, err := StandardAuthoringAttemptWorkspacePath(executor.workspaceRoot, request.Execution.ID, request.Stage.Key, string(request.Claim.Stage.StageAttempt.ID))
+	if err != nil {
+		return "", err
+	}
+	attemptRoot := filepath.Dir(workRoot)
+	stageRoot := filepath.Dir(attemptRoot)
+	if err := standardAuthoringCodexEnsureDirectory(filepath.Dir(stageRoot), 0o750); err != nil {
+		return "", err
+	}
+	if err := standardAuthoringCodexEnsureDirectory(stageRoot, 0o750); err != nil {
+		return "", err
+	}
+	if _, err := os.Lstat(attemptRoot); !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("%w: attempt workspace already exists", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	staging, err := os.MkdirTemp(stageRoot, ".attempt-")
+	if err != nil {
+		return "", fmt.Errorf("%w: create attempt workspace staging directory", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+	stagedWorkRoot := filepath.Join(staging, StandardAuthoringCodexAttemptWorkDirectory)
+	if err := os.Mkdir(stagedWorkRoot, 0o750); err != nil {
+		return "", fmt.Errorf("%w: create staged work root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := standardAuthoringCodexCopySourceTree(ctx, sourceRoot, filepath.Join(stagedWorkRoot, StandardAuthoringCodexAttemptSourceDirectory)); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(filepath.Join(stagedWorkRoot, StandardAuthoringCodexAttemptTaskDirectory), 0o750); err != nil {
+		return "", fmt.Errorf("%w: create staged task root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := os.Rename(staging, attemptRoot); err != nil {
+		return "", fmt.Errorf("%w: publish attempt workspace", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := ValidateStandardAuthoringAttemptWorkspacePath(executor.workspaceRoot, request.Execution.ID, request.Stage.Key, string(request.Claim.Stage.StageAttempt.ID), workRoot); err != nil {
+		_ = os.RemoveAll(attemptRoot)
+		return "", err
+	}
+	published = true
+	return workRoot, nil
+}
+
+func standardAuthoringCodexCopySourceTree(ctx context.Context, sourceRoot, destinationRoot string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	return filepath.WalkDir(sourceRoot, func(sourcePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := contextError(ctx); err != nil {
+			return err
+		}
+		info, err := os.Lstat(sourcePath)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: source copy encountered an unsafe entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		relative, err := filepath.Rel(sourceRoot, sourcePath)
+		if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%w: source copy entry escapes its root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		destinationPath := filepath.Join(destinationRoot, relative)
+		if !standardAuthoringPathWithin(filepath.Dir(destinationRoot), destinationPath) {
+			return fmt.Errorf("%w: destination copy entry escapes its work root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if info.IsDir() {
+			if err := os.Mkdir(destinationPath, 0o750); err != nil {
+				return fmt.Errorf("%w: create source-copy directory", ErrStandardAuthoringCodexAgentTurnConfiguration)
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%w: source copy encountered a non-regular entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		return standardAuthoringCodexCopyRegularFile(ctx, sourcePath, destinationPath, info)
+	})
+}
+
+func standardAuthoringCodexCopyRegularFile(ctx context.Context, sourcePath, destinationPath string, expected os.FileInfo) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("%w: open source-copy file", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	defer source.Close()
+	openedInfo, err := source.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(expected, openedInfo) {
+		return fmt.Errorf("%w: source-copy file changed while opening", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	destination, err := os.OpenFile(destinationPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("%w: create source-copy file", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	_, copyErr := io.Copy(destination, &standardAuthoringCodexContextReader{ctx: ctx, reader: source})
+	closeErr := destination.Close()
+	if copyErr != nil || closeErr != nil {
+		return fmt.Errorf("%w: copy source file", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	finalSourceInfo, err := source.Stat()
+	if err != nil || !os.SameFile(openedInfo, finalSourceInfo) {
+		return fmt.Errorf("%w: source-copy file changed while reading", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := os.Chmod(destinationPath, 0o640); err != nil {
+		return fmt.Errorf("%w: make source-copy file writable", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	return nil
+}
+
+type standardAuthoringCodexContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (reader *standardAuthoringCodexContextReader) Read(buffer []byte) (int, error) {
+	if err := contextError(reader.ctx); err != nil {
+		return 0, err
+	}
+	return reader.reader.Read(buffer)
+}
+
+func standardAuthoringCodexEnsureDirectory(path string, mode os.FileMode) error {
+	if err := os.Mkdir(path, mode); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("%w: create attempt workspace directory", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%w: attempt workspace directory is unavailable or unsafe", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	return nil
+}
+
+func standardAuthoringCodexVerifyExistingDirectoryChain(root, candidate string, requireCandidate bool) error {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(candidate))
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return fmt.Errorf("%w: attempt workspace path escapes its root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	current := filepath.Clean(root)
+	components := strings.Split(relative, string(filepath.Separator))
+	for index, component := range components {
+		current = filepath.Join(current, component)
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, os.ErrNotExist) {
+			if requireCandidate {
+				return fmt.Errorf("%w: attempt workspace path is unavailable", ErrStandardAuthoringCodexAgentTurnConfiguration)
+			}
+			return nil
+		}
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("%w: attempt workspace path contains an unsafe component", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if index == len(components)-1 {
+			return nil
+		}
+	}
+	return nil
+}
+
+func standardAuthoringCodexSafePathComponent(value string) bool {
+	if value == "" || value == "." || value == ".." || len(value) > 255 {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func standardAuthoringCodexValidateWorkTree(root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("%w: inspect attempt workspace entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: attempt workspace contains a symbolic link", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%w: attempt workspace contains a non-regular entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Nlink != 1 {
+			return fmt.Errorf("%w: attempt workspace contains a hard-linked file", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		return nil
+	})
 }
 
 func (executor *StandardAuthoringCodexAgentTurnExecutor) verifyFrozenSource(ctx context.Context, execution workflowkit.FrozenExecution, root string) (workflowkit.Fingerprint, error) {

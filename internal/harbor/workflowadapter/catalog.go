@@ -770,26 +770,29 @@ func canonicalizeStage(stage *StageDefinition) {
 }
 
 const (
-	resourceSourceRepository   workflowkit.ResourceKey = "source/repository"
-	resourceSourceSnapshot     workflowkit.ResourceKey = "source/snapshot"
-	resourceAnalysisRepository workflowkit.ResourceKey = "analysis/repository"
-	resourceTaskDesign         workflowkit.ResourceKey = "task/design"
-	resourceTaskGeneratedFiles workflowkit.ResourceKey = "task/generated-files"
-	resourceTaskInstruction    workflowkit.ResourceKey = "task/instruction"
-	resourceTaskMetadata       workflowkit.ResourceKey = "task/metadata"
-	resourceTaskEnvironment    workflowkit.ResourceKey = "task/environment"
+	resourceSourceRepository         workflowkit.ResourceKey = "source/repository"
+	resourceSourceSnapshot           workflowkit.ResourceKey = "source/snapshot"
+	resourceAnalysisRepository       workflowkit.ResourceKey = "analysis/repository"
+	resourceTaskDesign               workflowkit.ResourceKey = "task/design"
+	resourceTaskGeneratedFiles       workflowkit.ResourceKey = "task/generated-files"
+	resourceTaskInstruction          workflowkit.ResourceKey = "task/instruction"
+	resourceTaskMetadata             workflowkit.ResourceKey = "task/metadata"
+	resourceTaskEnvironment          workflowkit.ResourceKey = "task/environment"
+	resourceTaskValidatedEnvironment workflowkit.ResourceKey = "task/environment-validated"
 	// resourceAuthoringEnvironmentPolicy is the immutable per-session base
 	// image contract. It belongs only to the pre-materialization authoring
 	// graph; no task-revision workflow may infer it from a Dockerfile.
 	resourceAuthoringEnvironmentPolicy workflowkit.ResourceKey = "authoring/environment-policy"
 	// resourceAuthoringBrief is the immutable caller-selected task direction.
 	// It is separate from task/design because no authoring stage may rewrite it.
-	resourceAuthoringBrief    workflowkit.ResourceKey = "authoring/brief"
-	resourceTaskSolution      workflowkit.ResourceKey = "task/solution"
-	resourceTaskTests         workflowkit.ResourceKey = "task/tests"
-	resourceTaskTestsAnalysis workflowkit.ResourceKey = "task/tests-analysis"
-	resourceTaskSnapshot      workflowkit.ResourceKey = "task/snapshot"
-	resourceTaskDigest        workflowkit.ResourceKey = "task/digest"
+	resourceAuthoringBrief        workflowkit.ResourceKey = "authoring/brief"
+	resourceTaskSolution          workflowkit.ResourceKey = "task/solution"
+	resourceTaskTests             workflowkit.ResourceKey = "task/tests"
+	resourceTaskValidatedSolution workflowkit.ResourceKey = "task/solution-validated"
+	resourceTaskValidatedTests    workflowkit.ResourceKey = "task/tests-validated"
+	resourceTaskTestsAnalysis     workflowkit.ResourceKey = "task/tests-analysis"
+	resourceTaskSnapshot          workflowkit.ResourceKey = "task/snapshot"
+	resourceTaskDigest            workflowkit.ResourceKey = "task/digest"
 	// resourceAuthoringTaskHandoff is written exactly once by the closed
 	// AuthoringSession materialize_task stage. A task-bound child Run consumes
 	// its immutable receipt; it must never keep executing under the source
@@ -805,6 +808,8 @@ const (
 	resourceReviewEvaluatorEvidence      workflowkit.ResourceKey = "review/evaluator-evidence-handoff"
 	resourceReviewModelResult            workflowkit.ResourceKey = "review/model-result"
 	resourceEvidenceRepoPrepare          workflowkit.ResourceKey = "evidence/repo-prepare"
+	resourceEvidenceAuthoringDockerBuild workflowkit.ResourceKey = "evidence/authoring/dockerfile-build"
+	resourceEvidenceAuthoringHarness     workflowkit.ResourceKey = "evidence/authoring/harness"
 	resourceEvidenceTaskLayout           workflowkit.ResourceKey = "evidence/codeedge/task-layout"
 	resourceEvidenceRepoProvenance       workflowkit.ResourceKey = "evidence/codeedge/repo-provenance"
 	resourceEvidenceEnvironmentIsolation workflowkit.ResourceKey = "evidence/codeedge/environment-isolation"

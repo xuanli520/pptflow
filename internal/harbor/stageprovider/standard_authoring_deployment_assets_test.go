@@ -1,6 +1,7 @@
 package stageprovider
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -49,8 +50,8 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("parse Standard authoring asset manifest: %v", err)
 	}
-	if len(catalog.Catalog().Operations) != len(manifest.Operations) || len(manifest.Operations) != len(workflowadapter.StandardAuthoringTaskAdmissionStageOrder()) {
-		t.Fatalf("catalog/manifest operation coverage = %d/%d, want %d", len(catalog.Catalog().Operations), len(manifest.Operations), len(workflowadapter.StandardAuthoringTaskAdmissionStageOrder()))
+	if len(catalog.Catalog().Operations) != len(manifest.Operations) || len(manifest.Operations) != len(workflowadapter.StandardAuthoringHarnessStageOrder()) {
+		t.Fatalf("catalog/manifest operation coverage = %d/%d, want %d", len(catalog.Catalog().Operations), len(manifest.Operations), len(workflowadapter.StandardAuthoringHarnessStageOrder()))
 	}
 
 	byStage := make(map[string]StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))
@@ -112,8 +113,8 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 			t.Fatalf("validate canonical Codex schema asset for %q: %v", registration.Stage.Key, err)
 		}
 	}
-	if agentStages != 9 {
-		t.Fatalf("catalog Codex agent stages = %d, want 9", agentStages)
+	if agentStages != 11 {
+		t.Fatalf("catalog Codex agent stages = %d, want 11", agentStages)
 	}
 }
 
@@ -124,10 +125,10 @@ func TestStandardAuthoringBriefPromptsFreezeScopeWithoutElevatingData(t *testing
 		version string
 		extras  []string
 	}{
-		{path: "repo-analyze.json", version: "1.4.0", extras: []string{"exact spelling", "Cargo package names"}},
-		{path: "task-design.json", version: "1.5.0", extras: []string{"Verify every repository-relative path", "character-for-character"}},
-		{path: "generate-task-files.json", version: "1.3.0", extras: []string{"rechecked against the frozen source", "exact spelling exists"}},
-		{path: "task-toml-generate.json", version: "1.6.0", extras: []string{"metadata.task_type", "metadata.code_lang", "metadata.is_0_to_1", "false"}},
+		{path: "repo-analyze.json", version: "1.5.0", extras: []string{"exact spelling", "Cargo package names"}},
+		{path: "task-design.json", version: "1.6.0", extras: []string{"Verify every repository-relative path", "character-for-character"}},
+		{path: "generate-task-files.json", version: "1.4.0", extras: []string{"rechecked against the frozen source", "exact spelling exists"}},
+		{path: "task-toml-generate.json", version: "1.7.0", extras: []string{"metadata.task_type", "metadata.code_lang", "metadata.is_0_to_1", "false"}},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -161,11 +162,11 @@ func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) 
 		version string
 		file    string
 	}{
-		{path: "instruction-generate.json", version: "1.3.0", file: "instruction.md"},
-		{path: "task-toml-generate.json", version: "1.6.0", file: "task.toml"},
-		{path: "dockerfile-generate.json", version: "1.9.0", file: "environment/Dockerfile"},
-		{path: "solve-generate.json", version: "1.4.0", file: "solution/solve.sh"},
-		{path: "test-generate.json", version: "1.5.0", file: "tests/test.sh"},
+		{path: "instruction-generate.json", version: "1.4.0", file: "instruction.md"},
+		{path: "task-toml-generate.json", version: "1.7.0", file: "task.toml"},
+		{path: "dockerfile-generate.json", version: "2.0.0", file: "environment/Dockerfile"},
+		{path: "solve-generate.json", version: "1.5.0", file: "solution/solve.sh"},
+		{path: "test-generate.json", version: "1.6.0", file: "tests/test.sh"},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -196,7 +197,7 @@ func TestStandardAuthoringPhase1PromptsMatchControlledRuntime(t *testing.T) {
 	}{
 		{
 			path:    "dockerfile-generate.json",
-			version: "1.9.0",
+			version: "2.0.0",
 			required: []string{
 				"build context is exactly task/environment",
 				"Never COPY or ADD tests/",
@@ -207,9 +208,9 @@ func TestStandardAuthoringPhase1PromptsMatchControlledRuntime(t *testing.T) {
 		},
 		{
 			path:    "solve-generate.json",
-			version: "1.4.0",
+			version: "1.5.0",
 			required: []string{
-				"currently bound dockerfile",
+				"currently bound validated_dockerfile",
 				"sh ./solution/solve.sh",
 				"working directory /oracle",
 				"root filesystem is read-only",
@@ -224,9 +225,9 @@ func TestStandardAuthoringPhase1PromptsMatchControlledRuntime(t *testing.T) {
 		},
 		{
 			path:    "test-generate.json",
-			version: "1.5.0",
+			version: "1.6.0",
 			required: []string{
-				"currently bound dockerfile",
+				"currently bound validated_dockerfile",
 				"sh ./tests/test.sh",
 				"again after sh ./solution/solve.sh",
 				"working directory /oracle",
@@ -261,6 +262,83 @@ func TestStandardAuthoringPhase1PromptsMatchControlledRuntime(t *testing.T) {
 	}
 }
 
+func TestStandardAuthoringAgentPromptsBindAttemptWorkspace(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	for _, name := range []string{
+		"repo-analyze.json", "task-design.json", "generate-task-files.json",
+		"instruction-generate.json", "task-toml-generate.json", "dockerfile-generate.json",
+		"dockerfile-build-validate.json", "solve-generate.json", "test-generate.json",
+		"authoring-harness.json", "tests-analysis.json",
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		joined := strings.Join(program.TurnPrompts, "\n")
+		for _, required := range []string{
+			"current working directory is the disposable attempt `work` root",
+			"under `source/`",
+			"never edit",
+		} {
+			if !strings.Contains(joined, required) {
+				t.Fatalf("prompt %s omits attempt-workspace rule %q", name, required)
+			}
+		}
+	}
+}
+
+func TestStandardAuthoringHarnessPromptsRequireInTurnEditValidateLoop(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	for _, test := range []struct {
+		path     string
+		required []string
+	}{
+		{
+			path: "dockerfile-build-validate.json",
+			required: []string{
+				"task/environment/dockerfile", "host-owned locked docker build",
+				"stdout_tail", "do not run docker directly", "do not return base64",
+			},
+		},
+		{
+			path: "authoring-harness.json",
+			required: []string{
+				"task/environment/dockerfile", "task/solution/solve.sh", "task/tests/test.sh",
+				"initial verification", "oracle verification", "validated_dockerfile_changed",
+			},
+		},
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", test.path, err)
+		}
+		if program.Version != "1.0.0" || len(program.TurnPrompts) != 1 {
+			t.Fatalf("harness prompt %s = version %s turns %d, want 1.0.0/1", test.path, program.Version, len(program.TurnPrompts))
+		}
+		joined := strings.ToLower(program.TurnPrompts[0])
+		for _, required := range append(test.required,
+			"harbor_submit_stage_output", "sole `verdict` field set to `pass`",
+			"accepted=false", "remaining", "same turn", "accepted=true",
+			"do not finish with prose",
+		) {
+			if !strings.Contains(joined, required) {
+				t.Fatalf("harness prompt %s omits ReAct rule %q", test.path, required)
+			}
+		}
+		if strings.Contains(joined, "sole artifact content_base64") {
+			t.Fatalf("harness prompt %s still asks the model to submit artifact bytes", test.path)
+		}
+	}
+}
+
 func TestStandardAuthoringTestsAnalysisReevaluatesFeedbackAgainstCurrentScript(t *testing.T) {
 	root := standardAuthoringDeploymentRepositoryRoot(t)
 	raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", "tests-analysis.json"))
@@ -271,19 +349,21 @@ func TestStandardAuthoringTestsAnalysisReevaluatesFeedbackAgainstCurrentScript(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if program.Version != "1.5.0" {
-		t.Fatalf("tests-analysis prompt version = %s, want 1.5.0", program.Version)
+	if program.Version != "1.6.0" {
+		t.Fatalf("tests-analysis prompt version = %s, want 1.6.0", program.Version)
 	}
 	joined := strings.Join(program.TurnPrompts, "\n")
 	for _, required := range []string{
-		"currently bound test_script",
+		"currently bound validated_test_script",
 		"exact current tests/test.sh bytes",
-		"re-evaluate against the current test_script bytes",
-		"historical finding that the current test_script has fixed is resolved",
+		"authoring_harness_report",
+		"initial verification failed",
+		"Oracle verification passed",
+		"current validated_test_script has fixed is resolved",
 		"verdict=pass",
 		"Do not submit needs_repair, reject, or advisory",
 		"downstream solution_review",
-		"current test_script defect",
+		"current validated_test_script defect",
 		"normal tool or executor failure path",
 	} {
 		if !strings.Contains(joined, required) {
@@ -302,14 +382,14 @@ func TestStandardAuthoringRepairPromptsConsumeOnlyFrozenFeedback(t *testing.T) {
 		version  string
 		feedback []string
 	}{
-		{path: "repo-analyze.json", version: "1.4.0", feedback: []string{"task_review_decision"}},
-		{path: "task-design.json", version: "1.5.0", feedback: []string{"task_review_decision"}},
-		{path: "instruction-generate.json", version: "1.3.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "task-toml-generate.json", version: "1.6.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "dockerfile-generate.json", version: "1.9.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "solve-generate.json", version: "1.4.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "test-generate.json", version: "1.5.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "tests-analysis.json", version: "1.5.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "repo-analyze.json", version: "1.5.0", feedback: []string{"task_review_decision"}},
+		{path: "task-design.json", version: "1.6.0", feedback: []string{"task_review_decision"}},
+		{path: "instruction-generate.json", version: "1.4.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "task-toml-generate.json", version: "1.7.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "dockerfile-generate.json", version: "2.0.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "solve-generate.json", version: "1.5.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "test-generate.json", version: "1.6.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "tests-analysis.json", version: "1.6.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -464,7 +544,7 @@ func TestLoadStandardAuthoringDeploymentAssetBundleStrictlyBindsGeneratedLockAnd
 	}
 	mismatchedManifest := manifest.Clone()
 	mismatchedManifest.Template = workflowadapter.StandardAuthoringBriefTemplateReference()
-	mismatchedRaw, err := mismatchedManifest.CanonicalJSON()
+	mismatchedRaw, err := json.Marshal(mismatchedManifest)
 	if err != nil {
 		t.Fatal(err)
 	}

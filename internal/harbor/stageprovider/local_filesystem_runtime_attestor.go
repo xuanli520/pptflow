@@ -191,6 +191,15 @@ func attestLockedRegularFile(ctx context.Context, locked LocalExecutableLock) er
 	return nil
 }
 
+// AttestLockedLocalExecutable proves that a lock-selected executable still
+// names the exact regular file bytes pinned by the deployment lock. It is
+// exposed for host-owned composite capabilities, such as the Standard
+// authoring Docker harness, that execute a lock entry outside a standalone
+// local.command provider invocation.
+func AttestLockedLocalExecutable(ctx context.Context, locked LocalExecutableLock) error {
+	return attestLockedRegularFile(ctx, locked)
+}
+
 // inspectLockedLocalExecutablePath walks from the filesystem root to the
 // final path with Lstat. Checking only the leaf would allow a mutable release
 // directory symlink to redirect an otherwise regular executable. The lock

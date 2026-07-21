@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -242,6 +243,7 @@ func (executor *StandardAuthoringMaterializeExecutor) executePackageAdmission(ct
 
 type standardAuthoringPackageAdmissionInputSet struct {
 	instruction, taskTOML, dockerfile, solveScript, testScript, testsAnalysis []byte
+	dockerBuildReport, harnessReport                                          []byte
 	environment                                                               workflowadapter.StandardAuthoringEnvironmentPolicy
 	brief                                                                     *workflowadapter.StandardAuthoringBrief
 }
@@ -279,13 +281,14 @@ func standardAuthoringPackageAdmissionInputs(ctx context.Context, request workfl
 	if result.taskTOML, err = read("task_toml"); err != nil {
 		return result, err
 	}
-	if result.dockerfile, err = read("dockerfile"); err != nil {
+	dockerfileName, solveName, testName := standardAuthoringPackageArtifactNames(run)
+	if result.dockerfile, err = read(dockerfileName); err != nil {
 		return result, err
 	}
-	if result.solveScript, err = read("solve_script"); err != nil {
+	if result.solveScript, err = read(solveName); err != nil {
 		return result, err
 	}
-	if result.testScript, err = read("test_script"); err != nil {
+	if result.testScript, err = read(testName); err != nil {
 		return result, err
 	}
 	if result.testsAnalysis, err = read("tests_analysis"); err != nil {
@@ -314,20 +317,33 @@ func standardAuthoringPackageAdmissionInputs(ctx context.Context, request workfl
 		}
 		result.brief = &brief
 	}
+	if isHarnessAwareStandardAuthoringRun(run) {
+		if result.dockerBuildReport, err = read(workflowadapter.StandardAuthoringDockerfileBuildReportArtifact); err != nil {
+			return result, err
+		}
+		if result.harnessReport, err = read(workflowadapter.StandardAuthoringHarnessReportArtifact); err != nil {
+			return result, err
+		}
+		if err := validateStandardAuthoringHarnessEvidence(run.ID, result.dockerfile, result.solveScript, result.testScript, result.dockerBuildReport, result.harnessReport); err != nil {
+			return result, err
+		}
+	}
 	return result, nil
 }
 
 type standardAuthoringMaterializeInputSet struct {
-	instruction      []byte
-	taskTOML         []byte
-	dockerfile       []byte
-	solveScript      []byte
-	testScript       []byte
-	testsAnalysis    []byte
-	admissionReceipt []byte
-	environment      workflowadapter.StandardAuthoringEnvironmentPolicy
-	brief            *workflowadapter.StandardAuthoringBrief
-	proposalHash     string
+	instruction       []byte
+	taskTOML          []byte
+	dockerfile        []byte
+	solveScript       []byte
+	testScript        []byte
+	testsAnalysis     []byte
+	admissionReceipt  []byte
+	dockerBuildReport []byte
+	harnessReport     []byte
+	environment       workflowadapter.StandardAuthoringEnvironmentPolicy
+	brief             *workflowadapter.StandardAuthoringBrief
+	proposalHash      string
 }
 
 func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit.StageExecutionRequest, run store.WorkflowRun, subject workflowRunSubject, admission *codeedge.TaskAdmissionContract) (standardAuthoringMaterializeInputSet, error) {
@@ -370,7 +386,8 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 	if result.taskTOML, err = read("task_toml"); err != nil {
 		return result, err
 	}
-	if result.dockerfile, err = read("dockerfile"); err != nil {
+	dockerfileName, solveName, testName := standardAuthoringPackageArtifactNames(run)
+	if result.dockerfile, err = read(dockerfileName); err != nil {
 		return result, err
 	}
 	policyRaw, err := read(workflowadapter.StandardAuthoringEnvironmentPolicyArtifact)
@@ -406,14 +423,25 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 		}
 		result.brief = &brief
 	}
-	if result.solveScript, err = read("solve_script"); err != nil {
+	if result.solveScript, err = read(solveName); err != nil {
 		return result, err
 	}
-	if result.testScript, err = read("test_script"); err != nil {
+	if result.testScript, err = read(testName); err != nil {
 		return result, err
 	}
 	if result.testsAnalysis, err = read("tests_analysis"); err != nil {
 		return result, err
+	}
+	if isHarnessAwareStandardAuthoringRun(run) {
+		if result.dockerBuildReport, err = read(workflowadapter.StandardAuthoringDockerfileBuildReportArtifact); err != nil {
+			return result, err
+		}
+		if result.harnessReport, err = read(workflowadapter.StandardAuthoringHarnessReportArtifact); err != nil {
+			return result, err
+		}
+		if err := validateStandardAuthoringHarnessEvidence(run.ID, result.dockerfile, result.solveScript, result.testScript, result.dockerBuildReport, result.harnessReport); err != nil {
+			return result, err
+		}
 	}
 	decision, err := read("solution_review_decision")
 	if err != nil {
@@ -583,8 +611,15 @@ func verifyStandardAuthoringAdmissionReceipt(request workflowkit.StageExecutionR
 	}
 	bindings := make([]workflowkit.ArtifactBinding, 0, 8)
 	allowed := map[string]struct{}{
-		"instruction": {}, "task_toml": {}, "dockerfile": {}, workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: {},
-		"solve_script": {}, "test_script": {}, "tests_analysis": {},
+		"instruction": {}, "task_toml": {}, workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: {}, "tests_analysis": {},
+	}
+	dockerfileName, solveName, testName := standardAuthoringPackageArtifactNames(run)
+	allowed[dockerfileName] = struct{}{}
+	allowed[solveName] = struct{}{}
+	allowed[testName] = struct{}{}
+	if isHarnessAwareStandardAuthoringRun(run) {
+		allowed[workflowadapter.StandardAuthoringDockerfileBuildReportArtifact] = struct{}{}
+		allowed[workflowadapter.StandardAuthoringHarnessReportArtifact] = struct{}{}
 	}
 	if isBriefAwareStandardAuthoringRun(run) {
 		allowed[workflowadapter.StandardAuthoringBriefArtifact] = struct{}{}
@@ -613,14 +648,58 @@ func isAdmissionAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 		(run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion ||
-			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion)
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion)
 }
 
 func isBriefAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
 		(run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion ||
-			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion)
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion)
+}
+
+func isHarnessAwareStandardAuthoringRun(run store.WorkflowRun) bool {
+	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID && run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion
+}
+
+func standardAuthoringPackageArtifactNames(run store.WorkflowRun) (dockerfile, solve, test string) {
+	if isHarnessAwareStandardAuthoringRun(run) {
+		return workflowadapter.StandardAuthoringValidatedDockerfileArtifact, workflowadapter.StandardAuthoringValidatedSolveScriptArtifact, workflowadapter.StandardAuthoringValidatedTestScriptArtifact
+	}
+	return "dockerfile", "solve_script", "test_script"
+}
+
+func validateStandardAuthoringHarnessEvidence(runID string, dockerfile, solveScript, testScript, dockerBuildReport, harnessReport []byte) error {
+	buildCandidate, err := authoringharness.CandidateFromBytes(authoringharness.ModeDockerfileBuild, dockerfile, nil, nil)
+	if err != nil {
+		return fmt.Errorf("reconstruct Standard authoring Docker candidate: %w", err)
+	}
+	fullCandidate, err := authoringharness.CandidateFromBytes(authoringharness.ModeInitialOracle, dockerfile, solveScript, testScript)
+	if err != nil {
+		return fmt.Errorf("reconstruct Standard authoring full candidate: %w", err)
+	}
+	checks := []struct {
+		raw       []byte
+		mode      authoringharness.Mode
+		stage     workflowkit.StageKey
+		candidate authoringharness.Candidate
+	}{
+		{raw: dockerBuildReport, mode: authoringharness.ModeDockerfileBuild, stage: workflowkit.StageKey(workflowadapter.DockerfileBuildValidate), candidate: buildCandidate},
+		{raw: harnessReport, mode: authoringharness.ModeInitialOracle, stage: workflowkit.StageKey(workflowadapter.AuthoringHarness), candidate: fullCandidate},
+	}
+	for _, check := range checks {
+		var report authoringharness.Result
+		if err := decodeStrictJSON(string(check.raw), &report); err != nil {
+			return fmt.Errorf("decode Standard authoring harness evidence: %w", err)
+		}
+		report.ReportJSON = append([]byte(nil), check.raw...)
+		if err := report.ValidateReportJSON(); err != nil || !report.Passed || report.Mode != check.mode || report.StageKey != check.stage || report.RunID != runID || report.CandidateDigest != check.candidate.CandidateDigest || report.EnvironmentDigest != check.candidate.EnvironmentDigest {
+			return fmt.Errorf("Standard authoring harness evidence does not bind the frozen package")
+		}
+	}
+	return nil
 }
 
 func materializeInputsFromCanonicalPackage(inputs standardAuthoringMaterializeInputSet, files []codeedge.TaskPackageFile) standardAuthoringMaterializeInputSet {

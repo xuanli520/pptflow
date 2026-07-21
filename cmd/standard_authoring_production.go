@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -62,6 +63,7 @@ type standardAuthoringProductionCompositionConfig struct {
 	LockIdentity              stageprovider.DeploymentOperationCatalogLockIdentity
 	LookupEnvironment         func(string) (string, bool)
 	AdmissionContract         *codeedge.TaskAdmissionContract
+	HarnessValidator          authoringharness.Validator
 }
 
 // standardAuthoringProductionComposition is a template-keyed capability
@@ -139,10 +141,11 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	}
 	providers, err := stageprovider.NewStandardAuthoringProviderComposition(stageprovider.StandardAuthoringProviderCompositionConfig{
 		Template: bundle.Catalog.Template(), Catalog: bundle.Catalog, Lock: bundle.Lock, Attestor: attestor,
-		Handlers:            stageprovider.StandardAuthoringOperationHandlers{HostCommand: repoPrepare, HarborBuiltin: materializer},
-		CodexWorkspaceRoot:  workspaceRoot,
-		CodexWorkspaceMode:  stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
-		CodexSourceVerifier: repoPrepare,
+		Handlers:              stageprovider.StandardAuthoringOperationHandlers{HostCommand: repoPrepare, HarborBuiltin: materializer},
+		CodexWorkspaceRoot:    workspaceRoot,
+		CodexWorkspaceMode:    stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
+		CodexSourceVerifier:   repoPrepare,
+		CodexHarnessValidator: config.HarnessValidator,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring provider composition: %w", err)

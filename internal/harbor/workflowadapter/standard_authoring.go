@@ -38,6 +38,13 @@ const (
 	// Run parsing.
 	StandardAuthoringTestsAnalysisInputTemplateVersion = "1.6.0"
 
+	// StandardAuthoringHarnessTemplateVersion adds two bounded ReAct validation
+	// stages. dockerfile_build_validate produces the exact Dockerfile reviewed by
+	// content_review, while authoring_harness repairs and proves the final solve
+	// and test scripts with initial-fail plus oracle-pass execution. The 1.6.0
+	// template remains registered unchanged for historical Run parsing.
+	StandardAuthoringHarnessTemplateVersion = "1.7.0"
+
 	standardAuthoringCatalogID      = "harbor.standard-authoring-stage-catalog"
 	standardAuthoringCatalogVersion = "1.2.0"
 
@@ -54,6 +61,14 @@ const (
 	StandardAuthoringTaskHandoffArtifact               = "authoring_task_handoff"
 	StandardAuthoringTaskHandoffSchemaVersion          = "harbor.authoring-task-handoff.v1"
 	StandardAuthoringTaskAdmissionHandoffSchemaVersion = "harbor.authoring-task-handoff.v2"
+
+	StandardAuthoringValidatedDockerfileArtifact        = "validated_dockerfile"
+	StandardAuthoringDockerfileBuildReportArtifact      = "dockerfile_build_report"
+	StandardAuthoringDockerfileBuildReportSchemaVersion = "harbor.standard-authoring-dockerfile-build-report.v1"
+	StandardAuthoringValidatedSolveScriptArtifact       = "validated_solve_script"
+	StandardAuthoringValidatedTestScriptArtifact        = "validated_test_script"
+	StandardAuthoringHarnessReportArtifact              = "authoring_harness_report"
+	StandardAuthoringHarnessReportSchemaVersion         = "harbor.standard-authoring-harness-report.v1"
 )
 
 var standardAuthoringStageOrder = []workflowkit.StageKey{
@@ -103,11 +118,15 @@ func StandardAuthoringTestsAnalysisInputTemplateReference() TemplateReference {
 	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringTestsAnalysisInputTemplateVersion}
 }
 
+func StandardAuthoringHarnessTemplateReference() TemplateReference {
+	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringHarnessTemplateVersion}
+}
+
 // StandardAuthoringCurrentTemplateReference returns the only authoring
 // template new production Runs may select. Historical constructors remain
 // explicit and independently resolvable.
 func StandardAuthoringCurrentTemplateReference() TemplateReference {
-	return StandardAuthoringTestsAnalysisInputTemplateReference()
+	return StandardAuthoringHarnessTemplateReference()
 }
 
 // IsStandardAuthoringWorkflowTemplate reports whether a Run is bound to the
@@ -117,7 +136,8 @@ func IsStandardAuthoringWorkflowTemplate(reference TemplateReference) bool {
 		reference.Equal(StandardAuthoringTaskAdmissionTemplateReference()) ||
 		reference.Equal(StandardAuthoringBriefTemplateReference()) ||
 		reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()) ||
-		reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference())
+		reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()) ||
+		reference.Equal(StandardAuthoringHarnessTemplateReference())
 }
 
 // StandardAuthoringStageOrder returns the dependency-aware closed stage list.
@@ -138,6 +158,32 @@ func StandardAuthoringTaskAdmissionStageOrder() []workflowkit.StageKey {
 	panic("Standard authoring stage order omits solution_review")
 }
 
+// StandardAuthoringHarnessStageOrder is the 1.7.0 topology. The build
+// validator runs before content review so reviewers see the exact admitted
+// Dockerfile. The full harness runs only after independent solution and test
+// generation, and tests_analysis consumes its validated test artifact.
+func StandardAuthoringHarnessStageOrder() []workflowkit.StageKey {
+	return []workflowkit.StageKey{
+		workflowkit.StageKey(RepoPrepare),
+		workflowkit.StageKey(RepoAnalyze),
+		workflowkit.StageKey(TaskDesign),
+		workflowkit.StageKey(TaskReview),
+		workflowkit.StageKey(GenerateTaskFiles),
+		workflowkit.StageKey(InstructionGen),
+		workflowkit.StageKey(TaskTOMLGen),
+		workflowkit.StageKey(DockerfileGen),
+		workflowkit.StageKey(DockerfileBuildValidate),
+		workflowkit.StageKey(ContentReview),
+		workflowkit.StageKey(SolveGen),
+		workflowkit.StageKey(TestGen),
+		workflowkit.StageKey(AuthoringHarness),
+		workflowkit.StageKey(TestsAnalysis),
+		workflowkit.StageKey(CodeEdgePackageAdmission),
+		workflowkit.StageKey(SolutionReview),
+		workflowkit.StageKey(MaterializeTask),
+	}
+}
+
 // StandardAuthoringStageOrderForTemplate exposes the exact closed operation
 // set for each installed Authoring template version.
 func StandardAuthoringStageOrderForTemplate(reference TemplateReference) ([]workflowkit.StageKey, error) {
@@ -152,6 +198,8 @@ func StandardAuthoringStageOrderForTemplate(reference TemplateReference) ([]work
 		return StandardAuthoringTaskAdmissionStageOrder(), nil
 	case reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()):
 		return StandardAuthoringTaskAdmissionStageOrder(), nil
+	case reference.Equal(StandardAuthoringHarnessTemplateReference()):
+		return StandardAuthoringHarnessStageOrder(), nil
 	default:
 		return nil, fmt.Errorf("Standard authoring template %s@%s is not installed", reference.ID, reference.Version)
 	}
@@ -198,6 +246,25 @@ func standardAuthoringTaskAdmissionDependencies() map[workflowkit.StageKey][]wor
 func standardAuthoringTestsAnalysisInputDependencies() map[workflowkit.StageKey][]workflowkit.StageKey {
 	dependencies := standardAuthoringTaskAdmissionDependencies()
 	dependencies[workflowkit.StageKey(TestsAnalysis)] = []workflowkit.StageKey{workflowkit.StageKey(TestGen)}
+	return dependencies
+}
+
+func standardAuthoringHarnessDependencies() map[workflowkit.StageKey][]workflowkit.StageKey {
+	dependencies := standardAuthoringTaskAdmissionDependencies()
+	dependencies[workflowkit.StageKey(DockerfileBuildValidate)] = []workflowkit.StageKey{workflowkit.StageKey(DockerfileGen)}
+	dependencies[workflowkit.StageKey(ContentReview)] = []workflowkit.StageKey{
+		workflowkit.StageKey(InstructionGen), workflowkit.StageKey(TaskTOMLGen), workflowkit.StageKey(DockerfileBuildValidate),
+	}
+	dependencies[workflowkit.StageKey(AuthoringHarness)] = []workflowkit.StageKey{
+		workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen),
+	}
+	dependencies[workflowkit.StageKey(TestsAnalysis)] = []workflowkit.StageKey{workflowkit.StageKey(AuthoringHarness)}
+	dependencies[workflowkit.StageKey(CodeEdgePackageAdmission)] = []workflowkit.StageKey{
+		workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TestsAnalysis),
+	}
+	dependencies[workflowkit.StageKey(SolutionReview)] = []workflowkit.StageKey{
+		workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TestsAnalysis), workflowkit.StageKey(CodeEdgePackageAdmission),
+	}
 	return dependencies
 }
 
@@ -250,8 +317,20 @@ func StandardAuthoringTestsAnalysisInputWorkflowTemplate() WorkflowTemplate {
 	}
 }
 
+// StandardAuthoringHarnessWorkflowTemplate is the 1.7.0 authoring contract.
+// Its two ReAct stages operate on disposable workspaces while durable lineage
+// continues to carry only immutable validated artifacts and bounded reports.
+func StandardAuthoringHarnessWorkflowTemplate() WorkflowTemplate {
+	return WorkflowTemplate{
+		ID:          StandardAuthoringWorkflowTemplateID,
+		Version:     StandardAuthoringHarnessTemplateVersion,
+		Catalog:     StandardAuthoringHarnessStageCatalog(),
+		QuotaPolicy: StandardAuthoringHarnessQuotaPolicy(),
+	}
+}
+
 func StandardAuthoringCurrentWorkflowTemplate() WorkflowTemplate {
-	return StandardAuthoringTestsAnalysisInputWorkflowTemplate()
+	return StandardAuthoringHarnessWorkflowTemplate()
 }
 
 func StandardAuthoringTestsAnalysisInputStageCatalog() StageCatalog {
@@ -277,6 +356,169 @@ func StandardAuthoringTestsAnalysisInputStageCatalog() StageCatalog {
 		Version:  StandardAuthoringTestsAnalysisInputTemplateVersion,
 		Stages:   stages,
 	}
+}
+
+// StandardAuthoringHarnessStageCatalog adds two independent validation
+// producers without reusing the upstream artifact keys. Distinct validated_*
+// ports are required because StageAttempt ordinals are scoped to a producer;
+// selecting the "latest" same-named artifact across different stages would be
+// ambiguous after an upstream repair creates ordinal 2 while a downstream
+// validator is still at ordinal 1.
+func StandardAuthoringHarnessStageCatalog() StageCatalog {
+	base := StandardAuthoringTestsAnalysisInputStageCatalog()
+	stages := make([]StageDefinition, 0, len(base.Stages)+2)
+	for _, definition := range base.Stages {
+		definition = definition.Clone()
+		if definition.Key == workflowkit.StageKey(ContentReview) {
+			validator := stage(
+				DockerfileBuildValidate,
+				StageTaskGeneration,
+				[]string{DockerfileGen},
+				"harborfactory.dockerfile_build_validate",
+				[]workflowkit.ResourceKey{
+					resourceSourceSnapshot, resourceTaskDesign, resourceTaskEnvironment,
+					resourceAuthoringEnvironmentPolicy, resourceAuthoringBrief,
+				},
+				[]workflowkit.ResourceKey{resourceTaskValidatedEnvironment, resourceEvidenceAuthoringDockerBuild},
+				workflowkit.EffectContentMutator,
+				1,
+				passOnly(),
+				artifactInput("repo_prepared"),
+				artifactInput("task_proposal"),
+				artifactInput("dockerfile"),
+				standardAuthoringEnvironmentPolicyInput(),
+				standardAuthoringBriefInput(),
+				artifactOutput(StandardAuthoringValidatedDockerfileArtifact),
+				artifactOutputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion),
+			)
+			validator = addStandardAuthoringRepairFeedback(validator)
+			stages = append(stages, validator)
+		}
+
+		switch definition.Key {
+		case workflowkit.StageKey(ContentReview):
+			definition.Dependencies = []workflowkit.StageKey{
+				workflowkit.StageKey(InstructionGen), workflowkit.StageKey(TaskTOMLGen), workflowkit.StageKey(DockerfileBuildValidate),
+			}
+			replaceStandardAuthoringArtifactInput(&definition, "dockerfile", artifactInput(StandardAuthoringValidatedDockerfileArtifact).spec)
+			replaceStandardAuthoringReadResource(&definition, resourceTaskEnvironment, resourceTaskValidatedEnvironment)
+			definition.Inputs = append(definition.Inputs, artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion).spec)
+			definition.ReadSet = append(definition.ReadSet, resourceEvidenceAuthoringDockerBuild)
+		case workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen):
+			replaceStandardAuthoringArtifactInput(&definition, "dockerfile", artifactInput(StandardAuthoringValidatedDockerfileArtifact).spec)
+			replaceStandardAuthoringReadResource(&definition, resourceTaskEnvironment, resourceTaskValidatedEnvironment)
+			definition.Inputs = append(definition.Inputs, artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion).spec)
+			definition.ReadSet = append(definition.ReadSet, resourceEvidenceAuthoringDockerBuild)
+		case workflowkit.StageKey(TestsAnalysis):
+			harness := stage(
+				AuthoringHarness,
+				StageTaskGeneration,
+				[]string{SolveGen, TestGen},
+				"harborfactory.authoring_harness",
+				[]workflowkit.ResourceKey{
+					resourceSourceSnapshot, resourceTaskGeneratedFiles, resourceTaskDesign,
+					resourceTaskInstruction, resourceTaskMetadata, resourceTaskValidatedEnvironment,
+					resourceTaskSolution, resourceTaskTests, resourceEvidenceAuthoringDockerBuild,
+					resourceAuthoringEnvironmentPolicy, resourceAuthoringBrief,
+				},
+				[]workflowkit.ResourceKey{resourceTaskValidatedSolution, resourceTaskValidatedTests, resourceEvidenceAuthoringHarness},
+				workflowkit.EffectContentMutator,
+				1,
+				passOnly(),
+				artifactInput("repo_prepared"),
+				artifactInput("generated_task_files"),
+				artifactInput("task_proposal"),
+				artifactInput("instruction"),
+				artifactInput("task_toml"),
+				artifactInput(StandardAuthoringValidatedDockerfileArtifact),
+				artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion),
+				artifactInput("solve_script"),
+				artifactInput("test_script"),
+				standardAuthoringEnvironmentPolicyInput(),
+				standardAuthoringBriefInput(),
+				artifactOutput(StandardAuthoringValidatedSolveScriptArtifact),
+				artifactOutput(StandardAuthoringValidatedTestScriptArtifact),
+				artifactOutputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion),
+			)
+			harness = addStandardAuthoringRepairFeedback(harness)
+			stages = append(stages, harness)
+
+			definition.Dependencies = []workflowkit.StageKey{workflowkit.StageKey(AuthoringHarness)}
+			replaceStandardAuthoringArtifactInput(&definition, "test_script", artifactInput(StandardAuthoringValidatedTestScriptArtifact).spec)
+			replaceStandardAuthoringReadResource(&definition, resourceTaskTests, resourceTaskValidatedTests)
+			definition.Inputs = append(definition.Inputs, artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion).spec)
+			definition.ReadSet = append(definition.ReadSet, resourceEvidenceAuthoringHarness)
+		case workflowkit.StageKey(CodeEdgePackageAdmission):
+			definition.Dependencies = []workflowkit.StageKey{workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TestsAnalysis)}
+			replaceStandardAuthoringPackageInputs(&definition)
+			definition.Inputs = append(definition.Inputs,
+				artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion).spec,
+				artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion).spec,
+			)
+			definition.ReadSet = append(definition.ReadSet, resourceEvidenceAuthoringDockerBuild, resourceEvidenceAuthoringHarness)
+		case workflowkit.StageKey(SolutionReview):
+			definition.Dependencies = []workflowkit.StageKey{
+				workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TestsAnalysis), workflowkit.StageKey(CodeEdgePackageAdmission),
+			}
+			replaceStandardAuthoringArtifactInput(&definition, "solve_script", artifactInput(StandardAuthoringValidatedSolveScriptArtifact).spec)
+			replaceStandardAuthoringArtifactInput(&definition, "test_script", artifactInput(StandardAuthoringValidatedTestScriptArtifact).spec)
+			replaceStandardAuthoringReadResource(&definition, resourceTaskSolution, resourceTaskValidatedSolution)
+			replaceStandardAuthoringReadResource(&definition, resourceTaskTests, resourceTaskValidatedTests)
+			definition.Inputs = append(definition.Inputs, artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion).spec)
+			definition.ReadSet = append(definition.ReadSet, resourceEvidenceAuthoringHarness)
+		case workflowkit.StageKey(MaterializeTask):
+			replaceStandardAuthoringPackageInputs(&definition)
+			definition.Inputs = append(definition.Inputs,
+				artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion).spec,
+				artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion).spec,
+			)
+			definition.ReadSet = append(definition.ReadSet, resourceEvidenceAuthoringDockerBuild, resourceEvidenceAuthoringHarness)
+		}
+		stages = append(stages, definition)
+	}
+	return StageCatalog{
+		Template: StandardAuthoringHarnessTemplateReference(),
+		ID:       standardAuthoringCatalogID,
+		Version:  StandardAuthoringHarnessTemplateVersion,
+		Stages:   stages,
+	}
+}
+
+func addStandardAuthoringRepairFeedback(definition StageDefinition) StageDefinition {
+	for _, feedback := range standardAuthoringRepairFeedbackForStage(definition.Key) {
+		definition.Inputs = append(definition.Inputs, feedback.input)
+		definition.ReadSet = append(definition.ReadSet, feedback.resource)
+	}
+	return definition
+}
+
+func replaceStandardAuthoringPackageInputs(definition *StageDefinition) {
+	replaceStandardAuthoringArtifactInput(definition, "dockerfile", artifactInput(StandardAuthoringValidatedDockerfileArtifact).spec)
+	replaceStandardAuthoringArtifactInput(definition, "solve_script", artifactInput(StandardAuthoringValidatedSolveScriptArtifact).spec)
+	replaceStandardAuthoringArtifactInput(definition, "test_script", artifactInput(StandardAuthoringValidatedTestScriptArtifact).spec)
+	replaceStandardAuthoringReadResource(definition, resourceTaskEnvironment, resourceTaskValidatedEnvironment)
+	replaceStandardAuthoringReadResource(definition, resourceTaskSolution, resourceTaskValidatedSolution)
+	replaceStandardAuthoringReadResource(definition, resourceTaskTests, resourceTaskValidatedTests)
+}
+
+func replaceStandardAuthoringArtifactInput(definition *StageDefinition, name string, replacement workflowkit.ArtifactSpec) {
+	for index := range definition.Inputs {
+		if definition.Inputs[index].Name == name {
+			definition.Inputs[index] = replacement
+			return
+		}
+	}
+	panic("Standard authoring catalog is missing required artifact input " + name)
+}
+
+func replaceStandardAuthoringReadResource(definition *StageDefinition, current, replacement workflowkit.ResourceKey) {
+	for index := range definition.ReadSet {
+		if definition.ReadSet[index] == current {
+			definition.ReadSet[index] = replacement
+			return
+		}
+	}
+	panic("Standard authoring catalog is missing required read resource " + string(current))
 }
 
 func StandardAuthoringRepairFeedbackStageCatalog() StageCatalog {
@@ -349,6 +591,8 @@ func StandardAuthoringTaskHandoffSchemaForTemplate(reference TemplateReference) 
 		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
 	case reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()):
 		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
+	case reference.Equal(StandardAuthoringHarnessTemplateReference()):
+		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
 	default:
 		return "", fmt.Errorf("Standard authoring handoff schema has no template %s@%s", reference.ID, reference.Version)
 	}
@@ -393,7 +637,8 @@ func StandardAuthoringStageCatalog() StageCatalog {
 
 func standardAuthoringStageUsesEnvironmentPolicy(key workflowkit.StageKey) bool {
 	switch key {
-	case workflowkit.StageKey(TaskDesign), workflowkit.StageKey(GenerateTaskFiles), workflowkit.StageKey(DockerfileGen), workflowkit.StageKey(ContentReview):
+	case workflowkit.StageKey(TaskDesign), workflowkit.StageKey(GenerateTaskFiles), workflowkit.StageKey(DockerfileGen),
+		workflowkit.StageKey(DockerfileBuildValidate), workflowkit.StageKey(ContentReview), workflowkit.StageKey(AuthoringHarness):
 		return true
 	default:
 		return false
@@ -407,7 +652,8 @@ func standardAuthoringEnvironmentPolicyInput() stageArtifact {
 func standardAuthoringStageUsesBrief(key workflowkit.StageKey) bool {
 	switch key {
 	case workflowkit.StageKey(RepoAnalyze), workflowkit.StageKey(TaskDesign), workflowkit.StageKey(GenerateTaskFiles),
-		workflowkit.StageKey(TaskTOMLGen), workflowkit.StageKey(ContentReview), workflowkit.StageKey(CodeEdgePackageAdmission),
+		workflowkit.StageKey(TaskTOMLGen), workflowkit.StageKey(DockerfileBuildValidate), workflowkit.StageKey(ContentReview),
+		workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(CodeEdgePackageAdmission),
 		workflowkit.StageKey(MaterializeTask):
 		return true
 	default:
@@ -432,7 +678,7 @@ func standardAuthoringRepairFeedbackForStage(key workflowkit.StageKey) []standar
 			resource: resourceReviewTaskDirection,
 		})
 	}
-	if key == workflowkit.StageKey(InstructionGen) || key == workflowkit.StageKey(TaskTOMLGen) || key == workflowkit.StageKey(DockerfileGen) {
+	if key == workflowkit.StageKey(InstructionGen) || key == workflowkit.StageKey(TaskTOMLGen) || key == workflowkit.StageKey(DockerfileGen) || key == workflowkit.StageKey(DockerfileBuildValidate) {
 		feedback = append(feedback, standardAuthoringRepairFeedback{
 			input:    optionalReviewDecisionInput("content_review_decision").spec,
 			resource: resourceReviewContent,
@@ -456,7 +702,8 @@ func standardAuthoringRepairFeedbackForStage(key workflowkit.StageKey) []standar
 func standardAuthoringStageRepairsPackageContent(key workflowkit.StageKey) bool {
 	switch key {
 	case workflowkit.StageKey(InstructionGen), workflowkit.StageKey(TaskTOMLGen), workflowkit.StageKey(DockerfileGen),
-		workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen), workflowkit.StageKey(TestsAnalysis):
+		workflowkit.StageKey(DockerfileBuildValidate), workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen),
+		workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TestsAnalysis):
 		return true
 	default:
 		return false

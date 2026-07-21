@@ -23,6 +23,11 @@ const (
 	// generic agent payload or a mutable provider configuration map.
 	CodexAppServerOperationLockFormat  = "harbor.codex-app-server-operation.v2"
 	CodexAppServerOperationLockVersion = "2"
+	// CodexAppServerOperationLockFormatV3 is the writable-workspace revision.
+	// Unlike the historical v2 read-only record, v3 explicitly binds the App
+	// Server approval policy and may select the bounded workspace-write sandbox.
+	CodexAppServerOperationLockFormatV3  = "harbor.codex-app-server-operation.v3"
+	CodexAppServerOperationLockVersionV3 = "3"
 
 	// The command IDs distinguish the two independently pinned filesystem
 	// objects. The Codex npm shim may be a symbolic link; production locks
@@ -39,12 +44,11 @@ const (
 	CodexAppServerProductionModelID         = "gpt-5.6-terra"
 	CodexAppServerProductionReasoningEffort = workflowadapter.AgentReasoningEffortXHigh
 
-	// Standard Authoring produces artifacts only through its private dynamic
-	// submission tool. The source checkout is evidence, not an edit target, so
-	// the locked App Server policy exposes no writable filesystem root and no
-	// network access. A future writable policy needs a new typed lock revision.
-	CodexAppServerSandboxModeReadOnly   = "read-only"
-	CodexAppServerSandboxPolicyReadOnly = "readOnly"
+	CodexAppServerApprovalPolicyNever         = "never"
+	CodexAppServerSandboxModeReadOnly         = "read-only"
+	CodexAppServerSandboxPolicyReadOnly       = "readOnly"
+	CodexAppServerSandboxModeWorkspaceWrite   = "workspace-write"
+	CodexAppServerSandboxPolicyWorkspaceWrite = "workspaceWrite"
 
 	codexAppServerProbeTimeout         = 15 * time.Second
 	codexAppServerProbeOutputLimit     = 64 * 1024
@@ -68,6 +72,7 @@ type CodexAppServerOperationLock struct {
 	NodeExecutable     LocalExecutableLock `json:"node_executable"`
 	CodexHomeDirectory string              `json:"codex_home_directory"`
 	CLIVersionOutput   string              `json:"cli_version_output"`
+	ApprovalPolicy     string              `json:"approval_policy,omitempty"`
 	SandboxMode        string              `json:"sandbox_mode"`
 	SandboxPolicy      string              `json:"sandbox_policy"`
 	NetworkAccess      bool                `json:"network_access"`
@@ -84,11 +89,10 @@ func (lock CodexAppServerOperationLock) Clone() CodexAppServerOperationLock {
 // attestation. It intentionally accepts neither a launcher discovered on
 // PATH nor a policy that enables unrestricted network or host access.
 func (lock CodexAppServerOperationLock) Validate() error {
-	if lock.Format != CodexAppServerOperationLockFormat {
-		return fmt.Errorf("%w: unsupported Codex App Server lock format %q", ErrInvalidDeploymentOperationCatalogLock, lock.Format)
-	}
-	if lock.Version != CodexAppServerOperationLockVersion {
-		return fmt.Errorf("%w: unsupported Codex App Server lock version %q", ErrInvalidDeploymentOperationCatalogLock, lock.Version)
+	legacyReadOnly := lock.Format == CodexAppServerOperationLockFormat && lock.Version == CodexAppServerOperationLockVersion
+	current := lock.Format == CodexAppServerOperationLockFormatV3 && lock.Version == CodexAppServerOperationLockVersionV3
+	if !legacyReadOnly && !current {
+		return fmt.Errorf("%w: unsupported Codex App Server lock revision %q@%q", ErrInvalidDeploymentOperationCatalogLock, lock.Format, lock.Version)
 	}
 	if err := validateLocalExecutableLock(lock.JavaScriptLauncher); err != nil {
 		return err
@@ -123,11 +127,20 @@ func (lock CodexAppServerOperationLock) Validate() error {
 	if err := validateCodexAppServerCLIVersionOutput(lock.CLIVersionOutput, lock.JavaScriptLauncher.Version); err != nil {
 		return err
 	}
-	if lock.SandboxMode != CodexAppServerSandboxModeReadOnly {
-		return fmt.Errorf("%w: Codex sandbox mode must be %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerSandboxModeReadOnly)
-	}
-	if lock.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly {
-		return fmt.Errorf("%w: Codex sandbox policy must be %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerSandboxPolicyReadOnly)
+	if legacyReadOnly {
+		if lock.ApprovalPolicy != "" && lock.ApprovalPolicy != CodexAppServerApprovalPolicyNever {
+			return fmt.Errorf("%w: legacy Codex approval policy must be empty or %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerApprovalPolicyNever)
+		}
+		if lock.SandboxMode != CodexAppServerSandboxModeReadOnly || lock.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly {
+			return fmt.Errorf("%w: legacy Codex sandbox must remain read-only", ErrInvalidDeploymentOperationCatalogLock)
+		}
+	} else {
+		if lock.ApprovalPolicy != CodexAppServerApprovalPolicyNever {
+			return fmt.Errorf("%w: Codex approval policy must be %q", ErrInvalidDeploymentOperationCatalogLock, CodexAppServerApprovalPolicyNever)
+		}
+		if !validCodexAppServerSandbox(lock.SandboxMode, lock.SandboxPolicy) {
+			return fmt.Errorf("%w: Codex sandbox mode and policy are not an approved pair", ErrInvalidDeploymentOperationCatalogLock)
+		}
 	}
 	if lock.NetworkAccess {
 		return fmt.Errorf("%w: Codex App Server network access must be disabled", ErrInvalidDeploymentOperationCatalogLock)
@@ -164,6 +177,7 @@ type CodexAppServerInvocation struct {
 	NodeExecutablePath     string                               `json:"node_executable_path"`
 	CodexHomeDirectory     string                               `json:"codex_home_directory"`
 	CLIVersionOutput       string                               `json:"cli_version_output"`
+	ApprovalPolicy         string                               `json:"approval_policy"`
 	SandboxMode            string                               `json:"sandbox_mode"`
 	SandboxPolicy          string                               `json:"sandbox_policy"`
 	NetworkAccess          bool                                 `json:"network_access"`
@@ -278,10 +292,23 @@ func codexAppServerInvocationFromLock(lock CodexAppServerOperationLock, agent Ag
 		NodeExecutablePath:     lock.NodeExecutable.AbsolutePath,
 		CodexHomeDirectory:     lock.CodexHomeDirectory,
 		CLIVersionOutput:       lock.CLIVersionOutput,
+		ApprovalPolicy:         codexAppServerEffectiveApprovalPolicy(lock),
 		SandboxMode:            lock.SandboxMode,
 		SandboxPolicy:          lock.SandboxPolicy,
 		NetworkAccess:          lock.NetworkAccess,
 	}
+}
+
+func codexAppServerEffectiveApprovalPolicy(lock CodexAppServerOperationLock) string {
+	if lock.ApprovalPolicy == "" && lock.Format == CodexAppServerOperationLockFormat && lock.Version == CodexAppServerOperationLockVersion {
+		return CodexAppServerApprovalPolicyNever
+	}
+	return lock.ApprovalPolicy
+}
+
+func validCodexAppServerSandbox(mode, policy string) bool {
+	return mode == CodexAppServerSandboxModeReadOnly && policy == CodexAppServerSandboxPolicyReadOnly ||
+		mode == CodexAppServerSandboxModeWorkspaceWrite && policy == CodexAppServerSandboxPolicyWorkspaceWrite
 }
 
 // IsCodexAppServerProductionPayload verifies the one approved Standard

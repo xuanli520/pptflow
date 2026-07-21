@@ -20,6 +20,7 @@ func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
 		{name: "1.2 and 1.3", trigger: legacyV13AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV13ConsolidatedV2SchemaContractFingerprint},
 		{name: "through 1.4", trigger: legacyV14AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV14ConsolidatedV2SchemaContractFingerprint},
 		{name: "through 1.5", trigger: legacyV15AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV15ConsolidatedV2SchemaContractFingerprint},
+		{name: "through 1.6", trigger: legacyV16AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV16ConsolidatedV2SchemaContractFingerprint},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -79,7 +80,7 @@ func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
 }
 
 func legacyV12AuthoringPhase1HandoffTrigger(current string) string {
-	legacy := strings.Replace(current,
+	legacy := strings.Replace(legacyV16AuthoringPhase1HandoffTrigger(current),
 		"      AND (\n          (run.workflow_template_version = '1.2.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v1')\n          OR\n          (run.workflow_template_version = '1.3.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.4.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.5.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.6.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n      )",
 		"      AND run.workflow_template_version = '1.2.0'",
 		1,
@@ -92,7 +93,7 @@ func legacyV12AuthoringPhase1HandoffTrigger(current string) string {
 }
 
 func legacyV13AuthoringPhase1HandoffTrigger(current string) string {
-	legacy := strings.Replace(current,
+	legacy := strings.Replace(legacyV16AuthoringPhase1HandoffTrigger(current),
 		"          OR\n          (run.workflow_template_version = '1.4.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n",
 		"",
 		1,
@@ -110,7 +111,7 @@ func legacyV13AuthoringPhase1HandoffTrigger(current string) string {
 }
 
 func legacyV14AuthoringPhase1HandoffTrigger(current string) string {
-	legacy := strings.Replace(current,
+	legacy := strings.Replace(legacyV16AuthoringPhase1HandoffTrigger(current),
 		"          OR\n          (run.workflow_template_version = '1.5.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n",
 		"",
 		1,
@@ -123,8 +124,16 @@ func legacyV14AuthoringPhase1HandoffTrigger(current string) string {
 }
 
 func legacyV15AuthoringPhase1HandoffTrigger(current string) string {
-	return strings.Replace(current,
+	return strings.Replace(legacyV16AuthoringPhase1HandoffTrigger(current),
 		"          OR\n          (run.workflow_template_version = '1.6.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n",
+		"",
+		1,
+	)
+}
+
+func legacyV16AuthoringPhase1HandoffTrigger(current string) string {
+	return strings.Replace(current,
+		"          OR\n          (run.workflow_template_version = '1.7.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n",
 		"",
 		1,
 	)

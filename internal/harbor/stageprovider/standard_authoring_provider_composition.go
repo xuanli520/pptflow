@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -41,16 +42,17 @@ type StandardAuthoringOperationHandlers struct {
 // exact Template field prevents a future closed authoring template from
 // accidentally reusing a Standard or CodeEdge resolver as a fallback.
 type StandardAuthoringProviderCompositionConfig struct {
-	Template            workflowadapter.TemplateReference
-	Catalog             *DeploymentOperationCatalogResolver
-	Lock                DeploymentOperationCatalogLock
-	Attestor            *StandardAuthoringRuntimeAttestor
-	Handlers            StandardAuthoringOperationHandlers
-	CodexWorkspaceRoot  string
-	CodexWorkspaceMode  StandardAuthoringCodexWorkspaceMode
-	CodexSourceVerifier StandardAuthoringCodexFrozenSourceVerifier
-	CodexRuntimeFactory StandardAuthoringCodexRuntimeFactory
-	CodexNow            func() time.Time
+	Template              workflowadapter.TemplateReference
+	Catalog               *DeploymentOperationCatalogResolver
+	Lock                  DeploymentOperationCatalogLock
+	Attestor              *StandardAuthoringRuntimeAttestor
+	Handlers              StandardAuthoringOperationHandlers
+	CodexWorkspaceRoot    string
+	CodexWorkspaceMode    StandardAuthoringCodexWorkspaceMode
+	CodexSourceVerifier   StandardAuthoringCodexFrozenSourceVerifier
+	CodexHarnessValidator authoringharness.Validator
+	CodexRuntimeFactory   StandardAuthoringCodexRuntimeFactory
+	CodexNow              func() time.Time
 }
 
 // StandardAuthoringProviderComposition is the immutable provider/resolver
@@ -139,7 +141,8 @@ func NewStandardAuthoringProviderComposition(config StandardAuthoringProviderCom
 		bridge, err := NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(StandardAuthoringAttestedAgentTurnBridgeDeploymentConfig{
 			Verifier: verifier, Attestor: config.Attestor, WorkspaceRoot: config.CodexWorkspaceRoot,
 			WorkspaceMode: config.CodexWorkspaceMode, SourceVerifier: config.CodexSourceVerifier,
-			RuntimeFactory: config.CodexRuntimeFactory, Now: config.CodexNow,
+			HarnessValidator: config.CodexHarnessValidator,
+			RuntimeFactory:   config.CodexRuntimeFactory, Now: config.CodexNow,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("construct Standard authoring attested Codex agent-turn bridge: %w", err)

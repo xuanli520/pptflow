@@ -32,10 +32,11 @@ type codeEdgePhase1ProductionCompositionConfig struct {
 // the evaluator child through the template router; it cannot operate as a
 // substitute for either bundle.
 type codeEdgePhase1ProductionComposition struct {
-	Resolver       *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
-	CatalogBinding app.TemplateDeploymentCatalogResolver
-	Definitions    app.CodeEdgePhase1RunDefinitionProvider
-	Admission      codeedge.TaskAdmissionContract
+	Resolver         *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
+	CatalogBinding   app.TemplateDeploymentCatalogResolver
+	Definitions      app.CodeEdgePhase1RunDefinitionProvider
+	Admission        codeedge.TaskAdmissionContract
+	AuthoringHarness *app.StandardAuthoringDockerHarness
 }
 
 func newCodeEdgePhase1ProductionComposition(config codeEdgePhase1ProductionCompositionConfig) (*codeEdgePhase1ProductionComposition, error) {
@@ -140,6 +141,12 @@ func codeEdgePhase1CompositionFromVerifiedAssets(managedRoot string, binding cod
 	if err != nil {
 		return nil, fmt.Errorf("construct CodeEdge Phase-1 parent executor: %w", err)
 	}
+	authoringHarness, err := app.NewStandardAuthoringDockerHarness(app.StandardAuthoringDockerHarnessConfig{
+		ManagedRoot: managedRoot, LockedCommands: commands, CommandTimeout: commandTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("construct Standard authoring Docker harness: %w", err)
+	}
 	attestor, err := stageprovider.NewCodeEdgePhase1RuntimeAttestor(stageprovider.CodeEdgePhase1RuntimeAttestorConfig{HarborFlowBuild: binding.HarborFlowBuild})
 	if err != nil {
 		return nil, fmt.Errorf("construct CodeEdge Phase-1 runtime attestor: %w", err)
@@ -160,8 +167,9 @@ func codeEdgePhase1CompositionFromVerifiedAssets(managedRoot string, binding cod
 		CatalogBinding: app.TemplateDeploymentCatalogResolver{
 			Template: workflowadapter.CodeEdgePhase1TemplateReference(), Resolver: providers.Resolver,
 		},
-		Definitions: definitions,
-		Admission:   admission,
+		Definitions:      definitions,
+		Admission:        admission,
+		AuthoringHarness: authoringHarness,
 	}, nil
 }
 

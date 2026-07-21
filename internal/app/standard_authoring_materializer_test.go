@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
@@ -46,7 +47,7 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "materializer-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -103,18 +104,14 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	if err != nil {
 		t.Fatal(err)
 	}
-	contents := map[string][]byte{
-		"instruction": append([]byte(nil), packageInput.Instruction...),
-		"task_toml":   append([]byte(nil), packageInput.TaskTOMLDraft...),
-		"dockerfile":  append([]byte(nil), packageInput.Dockerfile...),
-		workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: policyRaw,
-		workflowadapter.StandardAuthoringBriefArtifact:             briefRaw,
-		"solve_script":                      append([]byte(nil), packageInput.SolveScript...),
-		"test_script":                       append([]byte(nil), packageInput.TestScript...),
-		"tests_analysis":                    append([]byte(nil), packageInput.TestsAnalysis...),
-		"solution_review_decision":          approvedAuthoringSolutionDecision(t, source, session, run),
-		"codeedge_package_admission_report": []byte(`{}`),
-	}
+	contents := standardAuthoringValidatedPackageContents(t, run.ID, packageInput)
+	contents["instruction"] = append([]byte(nil), packageInput.Instruction...)
+	contents["task_toml"] = append([]byte(nil), packageInput.TaskTOMLDraft...)
+	contents[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] = policyRaw
+	contents[workflowadapter.StandardAuthoringBriefArtifact] = briefRaw
+	contents["tests_analysis"] = append([]byte(nil), packageInput.TestsAnalysis...)
+	contents["solution_review_decision"] = approvedAuthoringSolutionDecision(t, source, session, run)
+	contents["codeedge_package_admission_report"] = []byte(`{}`)
 	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
 	compiled, err := CompileStandardAuthoringTaskPackage(packageInput)
 	if err != nil || !compiled.Report.Passed {
@@ -123,8 +120,10 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	admissionInputs := make([]workflowkit.ArtifactBinding, 0, 8)
 	for _, binding := range inputs {
 		switch binding.Name {
-		case "instruction", "task_toml", "dockerfile", workflowadapter.StandardAuthoringEnvironmentPolicyArtifact,
-			workflowadapter.StandardAuthoringBriefArtifact, "solve_script", "test_script", "tests_analysis":
+		case "instruction", "task_toml", workflowadapter.StandardAuthoringValidatedDockerfileArtifact, workflowadapter.StandardAuthoringEnvironmentPolicyArtifact,
+			workflowadapter.StandardAuthoringBriefArtifact, workflowadapter.StandardAuthoringValidatedSolveScriptArtifact,
+			workflowadapter.StandardAuthoringValidatedTestScriptArtifact, workflowadapter.StandardAuthoringDockerfileBuildReportArtifact,
+			workflowadapter.StandardAuthoringHarnessReportArtifact, "tests_analysis":
 			admissionInputs = append(admissionInputs, binding)
 		}
 	}
@@ -252,25 +251,24 @@ func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvi
 	session := store.AuthoringSession{ID: sessionID}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion,
 	}
 	packageInput := standardAuthoringTaskPackageFixture(t)
 	briefRaw, err := packageInput.Brief.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
-	contents := map[string][]byte{
-		"instruction":                       []byte("# Task\n"),
-		"task_toml":                         []byte("[task]\nid = \"fixture\"\n"),
-		"dockerfile":                        []byte("FROM docker.io/library/debian:bookworm@sha256:" + strings.Repeat("b", 64) + "\n"),
-		"environment_policy":                standardAuthoringLaunchTestEnvironmentPolicyJSON(t),
-		"authoring_brief":                   briefRaw,
-		"solve_script":                      []byte("#!/bin/sh\nexit 0\n"),
-		"test_script":                       []byte("#!/bin/sh\nexit 0\n"),
-		"tests_analysis":                    []byte("tests\n"),
-		"solution_review_decision":          approvedAuthoringSolutionDecision(t, source, session, run),
-		"codeedge_package_admission_report": []byte(`{}`),
-	}
+	contents := standardAuthoringValidatedPackageContents(t, run.ID, packageInput)
+	contents["instruction"] = []byte("# Task\n")
+	contents["task_toml"] = []byte("[task]\nid = \"fixture\"\n")
+	contents[workflowadapter.StandardAuthoringValidatedDockerfileArtifact] = []byte("FROM docker.io/library/debian:bookworm@sha256:" + strings.Repeat("b", 64) + "\n")
+	contents["environment_policy"] = standardAuthoringLaunchTestEnvironmentPolicyJSON(t)
+	contents["authoring_brief"] = briefRaw
+	contents[workflowadapter.StandardAuthoringValidatedSolveScriptArtifact] = []byte("#!/bin/sh\nexit 0\n")
+	contents[workflowadapter.StandardAuthoringValidatedTestScriptArtifact] = []byte("#!/bin/sh\nexit 0\n")
+	contents["tests_analysis"] = []byte("tests\n")
+	contents["solution_review_decision"] = approvedAuthoringSolutionDecision(t, source, session, run)
+	contents["codeedge_package_admission_report"] = []byte(`{}`)
 	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
 	_, err = standardAuthoringMaterializeInputs(context.Background(), workflowkit.StageExecutionRequest{
 		Stage: stage, Inputs: inputs,
@@ -332,27 +330,6 @@ func TestStandardAuthoringPackageAdmissionReturnsNeedsRepairForMalformedModelCon
 			code: "task_metadata",
 		},
 		{
-			name: "Dockerfile",
-			mutate: func(contents map[string][]byte) {
-				contents["dockerfile"] = []byte("FROM docker.io/library/alpine:3.20\n")
-			},
-			code: "environment_isolation",
-		},
-		{
-			name: "solution script",
-			mutate: func(contents map[string][]byte) {
-				contents["solve_script"] = nil
-			},
-			code: "task_layout",
-		},
-		{
-			name: "test script",
-			mutate: func(contents map[string][]byte) {
-				contents["test_script"] = []byte("exit 0\n")
-			},
-			code: "task_layout",
-		},
-		{
 			name: "tests analysis",
 			mutate: func(contents map[string][]byte) {
 				contents["tests_analysis"] = []byte(`{"provided_information":"\u0000","theoretical_path":"path","passing_evidence":"evidence"}`)
@@ -384,6 +361,36 @@ func TestStandardAuthoringPackageAdmissionStrictlyParsesBrief(t *testing.T) {
 	_, err := standardAuthoringPackageAdmissionInputs(context.Background(), fixture.request(t), fixture.run)
 	if err == nil || !strings.Contains(err.Error(), "decode frozen Standard authoring brief") {
 		t.Fatalf("malformed package admission brief error = %v", err)
+	}
+}
+
+func TestStandardAuthoringPackageAdmissionRejectsArtifactsThatDoNotMatchHarnessEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string][]byte)
+	}{
+		{
+			name: "validated script changed",
+			mutate: func(contents map[string][]byte) {
+				contents[workflowadapter.StandardAuthoringValidatedSolveScriptArtifact] = []byte("#!/bin/sh\necho tampered\n")
+			},
+		},
+		{
+			name: "harness report changed",
+			mutate: func(contents map[string][]byte) {
+				report := append([]byte(nil), contents[workflowadapter.StandardAuthoringHarnessReportArtifact]...)
+				contents[workflowadapter.StandardAuthoringHarnessReportArtifact] = append(report, ' ')
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
+			test.mutate(fixture.contents)
+			_, err := standardAuthoringPackageAdmissionInputs(context.Background(), fixture.request(t), fixture.run)
+			if err == nil || !strings.Contains(err.Error(), "harness evidence") {
+				t.Fatalf("mismatched harness evidence error = %v", err)
+			}
+		})
 	}
 }
 
@@ -419,7 +426,7 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "package-admission-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -457,12 +464,12 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	if err != nil {
 		t.Fatal(err)
 	}
-	contents := map[string][]byte{
-		"instruction": append([]byte(nil), packageInput.Instruction...), "task_toml": append([]byte(nil), packageInput.TaskTOMLDraft...),
-		"dockerfile": append([]byte(nil), packageInput.Dockerfile...), "solve_script": append([]byte(nil), packageInput.SolveScript...),
-		"test_script": append([]byte(nil), packageInput.TestScript...), "tests_analysis": append([]byte(nil), packageInput.TestsAnalysis...),
-		workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: policyRaw, workflowadapter.StandardAuthoringBriefArtifact: briefRaw,
-	}
+	contents := standardAuthoringValidatedPackageContents(t, run.ID, packageInput)
+	contents["instruction"] = append([]byte(nil), packageInput.Instruction...)
+	contents["task_toml"] = append([]byte(nil), packageInput.TaskTOMLDraft...)
+	contents["tests_analysis"] = append([]byte(nil), packageInput.TestsAnalysis...)
+	contents[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] = policyRaw
+	contents[workflowadapter.StandardAuthoringBriefArtifact] = briefRaw
 	mutate(contents)
 	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
 	subject := workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(source.SnapshotContentDigest)}
@@ -592,7 +599,7 @@ func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowk
 	session := store.AuthoringSession{ID: sessionID}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion,
 	}
 	policyRaw, err := packageInput.Environment.CanonicalJSON()
 	if err != nil {
@@ -602,18 +609,14 @@ func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowk
 	if err != nil {
 		t.Fatal(err)
 	}
-	contents := map[string][]byte{
-		"instruction": append([]byte(nil), packageInput.Instruction...),
-		"task_toml":   append([]byte(nil), packageInput.TaskTOMLDraft...),
-		"dockerfile":  append([]byte(nil), packageInput.Dockerfile...),
-		workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: policyRaw,
-		workflowadapter.StandardAuthoringBriefArtifact:             briefRaw,
-		"solve_script":                      append([]byte(nil), packageInput.SolveScript...),
-		"test_script":                       append([]byte(nil), packageInput.TestScript...),
-		"tests_analysis":                    append([]byte(nil), packageInput.TestsAnalysis...),
-		"solution_review_decision":          approvedAuthoringSolutionDecision(t, source, session, run),
-		"codeedge_package_admission_report": []byte(`{"format":"fixture"}`),
-	}
+	contents := standardAuthoringValidatedPackageContents(t, run.ID, packageInput)
+	contents["instruction"] = append([]byte(nil), packageInput.Instruction...)
+	contents["task_toml"] = append([]byte(nil), packageInput.TaskTOMLDraft...)
+	contents[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] = policyRaw
+	contents[workflowadapter.StandardAuthoringBriefArtifact] = briefRaw
+	contents["tests_analysis"] = append([]byte(nil), packageInput.TestsAnalysis...)
+	contents["solution_review_decision"] = approvedAuthoringSolutionDecision(t, source, session, run)
+	contents["codeedge_package_admission_report"] = []byte(`{"format":"fixture"}`)
 	subject := workflowRunSubject{
 		Binding: workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(sourceDigest)},
 		Kind:    store.WorkflowRunSubjectAuthoringSession, AuthoringSource: &source, AuthoringSession: &session,
@@ -669,6 +672,53 @@ func approvedAuthoringSolutionDecision(t *testing.T, source store.AuthoringSourc
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func standardAuthoringValidatedPackageContents(t *testing.T, runID string, input StandardAuthoringTaskPackageInput) map[string][]byte {
+	t.Helper()
+	buildCandidate, err := authoringharness.CandidateFromBytes(authoringharness.ModeDockerfileBuild, input.Dockerfile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullCandidate, err := authoringharness.CandidateFromBytes(authoringharness.ModeInitialOracle, input.Dockerfile, input.SolveScript, input.TestScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildAttempt, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	harnessAttempt, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, err := authoringharness.Finalize(authoringharness.Result{
+		Mode: authoringharness.ModeDockerfileBuild, RunID: runID, StageKey: workflowkit.StageKey(workflowadapter.DockerfileBuildValidate), StageAttemptID: buildAttempt,
+		Passed: true, Step: "docker_build", ExitCode: 0, Findings: []string{}, CandidateDigest: buildCandidate.CandidateDigest, EnvironmentDigest: buildCandidate.EnvironmentDigest,
+		Steps: []authoringharness.StepResult{{Step: "docker_build", Passed: true, ExitCode: 0, Findings: []string{}, OutputFingerprint: workflowkit.SHA256Fingerprint([]byte("build"))}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, err := authoringharness.Finalize(authoringharness.Result{
+		Mode: authoringharness.ModeInitialOracle, RunID: runID, StageKey: workflowkit.StageKey(workflowadapter.AuthoringHarness), StageAttemptID: harnessAttempt,
+		Passed: true, Step: "oracle_verify", ExitCode: 0, Findings: []string{}, CandidateDigest: fullCandidate.CandidateDigest, EnvironmentDigest: fullCandidate.EnvironmentDigest,
+		Steps: []authoringharness.StepResult{
+			{Step: "docker_build", Passed: true, ExitCode: 0, Findings: []string{}, OutputFingerprint: workflowkit.SHA256Fingerprint([]byte("build"))},
+			{Step: "initial_verify", Passed: true, ExitCode: 1, Findings: []string{}, OutputFingerprint: workflowkit.SHA256Fingerprint([]byte("initial"))},
+			{Step: "oracle_verify", Passed: true, ExitCode: 0, Findings: []string{}, OutputFingerprint: workflowkit.SHA256Fingerprint([]byte("oracle"))},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string][]byte{
+		workflowadapter.StandardAuthoringValidatedDockerfileArtifact:   append([]byte(nil), input.Dockerfile...),
+		workflowadapter.StandardAuthoringValidatedSolveScriptArtifact:  append([]byte(nil), input.SolveScript...),
+		workflowadapter.StandardAuthoringValidatedTestScriptArtifact:   append([]byte(nil), input.TestScript...),
+		workflowadapter.StandardAuthoringDockerfileBuildReportArtifact: append([]byte(nil), build.ReportJSON...),
+		workflowadapter.StandardAuthoringHarnessReportArtifact:         append([]byte(nil), harness.ReportJSON...),
+	}
 }
 
 func parseMaterializerHandoff(t *testing.T, result workflowkit.StageExecutionResult) workflowadapter.StandardAuthoringTaskHandoff {

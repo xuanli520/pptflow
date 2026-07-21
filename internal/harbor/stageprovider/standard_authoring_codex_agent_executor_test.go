@@ -390,6 +390,192 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunScopedWorkspaceRequiresPrepar
 	}
 }
 
+func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteUsesIsolatedAttemptCopy(t *testing.T) {
+	stage := standardAuthoringCodexTestStage(1)
+	now := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	runID := "019f8397-7a65-7000-8000-0000000000a1"
+	sourceRoot := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
+	if err := os.MkdirAll(filepath.Join(sourceRoot, "src"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sourceFile := filepath.Join(sourceRoot, "src", "lib.rs")
+	if err := os.WriteFile(sourceFile, []byte("pub fn frozen() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringCodexSealTestSourceTree(t, sourceRoot)
+
+	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	request.Execution.ID = runID
+	request.Claim.Stage.StageAttempt.ID = "stage-attempt-write-1"
+	workRoot, err := StandardAuthoringAttemptWorkspacePath(root, runID, stage.Key, string(request.Claim.Stage.StageAttempt.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workSourceFile := filepath.Join(workRoot, StandardAuthoringCodexAttemptSourceDirectory, "src", "lib.rs")
+	workTaskFile := filepath.Join(workRoot, StandardAuthoringCodexAttemptTaskDirectory, "environment", "Dockerfile")
+	conversation := &standardAuthoringCodexConversationStub{
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("analysis"))}},
+		afterSubmissions: func(int) error {
+			if err := os.WriteFile(workSourceFile, []byte("pub fn edited() {}\n"), 0o640); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(workTaskFile), 0o750); err != nil {
+				return err
+			}
+			return os.WriteFile(workTaskFile, []byte("FROM scratch\n"), 0o640)
+		},
+	}
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: conversation}
+	invocation := standardAuthoringCodexTestInvocation(t)
+	invocation.SandboxMode = CodexAppServerSandboxModeWorkspaceWrite
+	invocation.SandboxPolicy = CodexAppServerSandboxPolicyWorkspaceWrite
+	program, err := NewStandardAuthoringCodexTurnProgram("standard-authoring.repo-analysis", "1", standardAuthoringCodexTestPrompts(1), 64*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(invocation), WorkspaceRoot: root,
+		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, SourceVerifier: standardAuthoringCodexTestFrozenSourceVerifier{}, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request, Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil || result.Outcome.Status != workflowkit.StatusCompleted || result.Outcome.Verdict != workflowkit.VerdictPass {
+		t.Fatalf("workspace-write result=%+v err=%v", result, err)
+	}
+	if len(runtime.openRequests) != 1 {
+		t.Fatalf("workspace-write opens=%d, want one", len(runtime.openRequests))
+	}
+	open := runtime.openRequests[0]
+	if open.ProjectPath != workRoot || len(open.WorkspaceRoots) != 1 || open.WorkspaceRoots[0] != workRoot || open.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || open.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || open.NetworkAccess {
+		t.Fatalf("workspace-write request = %+v, want isolated %q", open, workRoot)
+	}
+	if err := ValidateStandardAuthoringAttemptWorkspacePath(root, runID, stage.Key, string(request.Claim.Stage.StageAttempt.ID), workRoot); err != nil {
+		t.Fatalf("validate published attempt workspace: %v", err)
+	}
+	frozenContent, err := os.ReadFile(sourceFile)
+	if err != nil || string(frozenContent) != "pub fn frozen() {}\n" {
+		t.Fatalf("immutable source content = %q, %v", frozenContent, err)
+	}
+	frozenInfo, err := os.Lstat(sourceFile)
+	if err != nil || frozenInfo.Mode().Perm() != 0o444 {
+		t.Fatalf("immutable source mode = %v, %v", frozenInfo, err)
+	}
+	workContent, err := os.ReadFile(workSourceFile)
+	if err != nil || string(workContent) != "pub fn edited() {}\n" {
+		t.Fatalf("writable source copy content = %q, %v", workContent, err)
+	}
+	workInfo, err := os.Lstat(workSourceFile)
+	if err != nil || !workInfo.Mode().IsRegular() || os.SameFile(frozenInfo, workInfo) {
+		t.Fatalf("source copy reused frozen inode: frozen=%v work=%v err=%v", frozenInfo, workInfo, err)
+	}
+	if taskContent, err := os.ReadFile(workTaskFile); err != nil || string(taskContent) != "FROM scratch\n" {
+		t.Fatalf("fixed task candidate = %q, %v", taskContent, err)
+	}
+	replayed, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request, Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil || replayed.ErrorText != standardAuthoringCodexFailureWorkspace || len(runtime.openRequests) != 1 {
+		t.Fatalf("same-attempt replay result=%+v err=%v opens=%d, want fenced workspace failure", replayed, err, len(runtime.openRequests))
+	}
+
+	request2, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	request2.Execution.ID = runID
+	request2.Claim.Stage.StageAttempt.ID = "stage-attempt-write-2"
+	workRoot2, err := StandardAuthoringAttemptWorkspacePath(root, runID, stage.Key, string(request2.Claim.Stage.StageAttempt.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime2 := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("analysis-2"))}},
+	}}
+	executor2, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(invocation), WorkspaceRoot: root,
+		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, SourceVerifier: standardAuthoringCodexTestFrozenSourceVerifier{}, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime2),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result2, err := executor2.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request2, Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil || result2.Outcome.Status != workflowkit.StatusCompleted || workRoot2 == workRoot || len(runtime2.openRequests) != 1 || runtime2.openRequests[0].ProjectPath != workRoot2 {
+		t.Fatalf("second attempt result=%+v err=%v root=%q opens=%+v", result2, err, workRoot2, runtime2.openRequests)
+	}
+	workSourceFile2 := filepath.Join(workRoot2, StandardAuthoringCodexAttemptSourceDirectory, "src", "lib.rs")
+	workContent2, err := os.ReadFile(workSourceFile2)
+	if err != nil || string(workContent2) != "pub fn frozen() {}\n" {
+		t.Fatalf("second attempt did not receive a fresh baseline copy: %q, %v", workContent2, err)
+	}
+	workInfo2, err := os.Lstat(workSourceFile2)
+	if err != nil || os.SameFile(workInfo, workInfo2) {
+		t.Fatalf("attempt workspaces share a source-copy inode: first=%v second=%v err=%v", workInfo, workInfo2, err)
+	}
+
+	hardlink := filepath.Join(workRoot, StandardAuthoringCodexAttemptTaskDirectory, "linked-source")
+	if err := os.Link(workSourceFile, hardlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateStandardAuthoringAttemptWorkspacePath(root, runID, stage.Key, string(request.Claim.Stage.StageAttempt.ID), workRoot); !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
+		t.Fatalf("hard-linked work entry validation error = %v", err)
+	}
+	if err := os.Remove(hardlink); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(workRoot, StandardAuthoringCodexAttemptTaskDirectory, "linked-outside")
+	if err := os.Symlink(t.TempDir(), symlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateStandardAuthoringAttemptWorkspacePath(root, runID, stage.Key, string(request.Claim.Stage.StageAttempt.ID), workRoot); !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
+		t.Fatalf("symlinked work entry validation error = %v", err)
+	}
+}
+
+func TestStandardAuthoringAttemptWorkspacePathRejectsUnsafeIdentityAndSymlinkAncestor(t *testing.T) {
+	root := t.TempDir()
+	runID := "019f8397-7a65-7000-8000-0000000000a2"
+	runRoot := filepath.Join(root, runID)
+	if err := os.Mkdir(runRoot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for name, test := range map[string]struct {
+		stage   workflowkit.StageKey
+		attempt string
+	}{
+		"stage traversal":   {stage: "../repo_analyze", attempt: "attempt-1"},
+		"attempt traversal": {stage: "repo_analyze", attempt: "../attempt-1"},
+		"attempt separator": {stage: "repo_analyze", attempt: "nested/attempt"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := StandardAuthoringAttemptWorkspacePath(root, runID, test.stage, test.attempt); !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
+				t.Fatalf("unsafe identity error = %v", err)
+			}
+		})
+	}
+
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(runRoot, StandardAuthoringCodexRunAttemptsDirectory)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StandardAuthoringAttemptWorkspacePath(root, runID, "repo_analyze", "attempt-1"); !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
+		t.Fatalf("symlinked attempt ancestor error = %v", err)
+	}
+}
+
 func TestStandardAuthoringCodexAgentTurnExecutorRejectsWritableSourceEntryBeforeOpeningConversation(t *testing.T) {
 	stage := standardAuthoringCodexTestStage(1)
 	now := time.Date(2026, 7, 15, 8, 0, 0, 0, time.UTC)
@@ -507,6 +693,84 @@ func TestStandardAuthoringCodexAgentTurnExecutorRejectsSubmittedOutputAfterTurnM
 	}
 	if verifications != 3 || len(conversation.submissionResponses) != 1 || conversation.closed != 1 {
 		t.Fatalf("source mutation proof calls=%d submissions=%d closes=%d, want 3/1/1", verifications, len(conversation.submissionResponses), conversation.closed)
+	}
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteStillRejectsFrozenSourceMutation(t *testing.T) {
+	stage := standardAuthoringCodexTestStage(1)
+	now := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	runID := "019f8397-7a65-7000-8000-0000000000a3"
+	sourceRoot := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
+	if err := os.MkdirAll(filepath.Join(sourceRoot, "src"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(sourceRoot, "src", "lib.rs")
+	if err := os.WriteFile(target, []byte("pub fn frozen() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringCodexSealTestSourceTree(t, sourceRoot)
+	baseline, err := standardAuthoringCodexSourceTreeIdentity(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifications := 0
+	verifier := standardAuthoringCodexFrozenSourceVerifierFunc(func(_ context.Context, _ workflowkit.FrozenExecution, checkedRoot string) (workflowkit.Fingerprint, error) {
+		verifications++
+		identity, verifyErr := standardAuthoringCodexSourceTreeIdentity(checkedRoot)
+		if verifyErr != nil {
+			return "", verifyErr
+		}
+		if identity != baseline {
+			return "", errors.New("source differs from frozen snapshot")
+		}
+		return identity, nil
+	})
+	conversation := &standardAuthoringCodexConversationStub{
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
+		submissions: [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("must-not-pass"))}},
+		afterSubmissions: func(int) error {
+			if err := os.Chmod(target, 0o644); err != nil {
+				return err
+			}
+			if err := os.WriteFile(target, []byte("pub fn changed() {}\n"), 0o644); err != nil {
+				return err
+			}
+			return os.Chmod(target, 0o444)
+		},
+	}
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: conversation}
+	invocation := standardAuthoringCodexTestInvocation(t)
+	invocation.SandboxMode = CodexAppServerSandboxModeWorkspaceWrite
+	invocation.SandboxPolicy = CodexAppServerSandboxPolicyWorkspaceWrite
+	program, err := NewStandardAuthoringCodexTurnProgram("standard-authoring.repo-analysis", "1", standardAuthoringCodexTestPrompts(1), 64*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: standardAuthoringCodexTestInvocationFactory(invocation), WorkspaceRoot: root,
+		WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, SourceVerifier: verifier, RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program}, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	request.Execution.ID = runID
+	request.Claim.Stage.StageAttempt.ID = "stage-attempt-mutation"
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request, Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)},
+		},
+	}, standardAuthoringCodexTestPayload(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome.Status != workflowkit.StatusInfraFailed || result.Outcome.Failure != workflowkit.FailurePolicy || result.ErrorText != standardAuthoringCodexFailureSource || len(result.Artifacts) != 0 {
+		t.Fatalf("workspace-write source mutation result = %+v", result)
+	}
+	if verifications != 4 || len(runtime.openRequests) != 1 || runtime.openRequests[0].ProjectPath == sourceRoot || conversation.closed != 1 {
+		t.Fatalf("workspace-write mutation proof calls=%d opens=%+v closes=%d", verifications, runtime.openRequests, conversation.closed)
 	}
 }
 
@@ -734,7 +998,7 @@ func standardAuthoringCodexTestInvocation(t *testing.T) CodexAppServerInvocation
 		AgentID: CodexAppServerProductionAgentID, AgentVersion: "1.0.0", ModelID: CodexAppServerProductionModelID, ModelVersion: "2026-07-15",
 		ReasoningEffort:        CodexAppServerProductionReasoningEffort,
 		JavaScriptLauncherPath: root + "/codex", NodeExecutablePath: root + "/node", CodexHomeDirectory: root,
-		CLIVersionOutput: "codex-cli 0.133.0", SandboxMode: CodexAppServerSandboxModeReadOnly,
+		CLIVersionOutput: "codex-cli 0.133.0", ApprovalPolicy: CodexAppServerApprovalPolicyNever, SandboxMode: CodexAppServerSandboxModeReadOnly,
 		SandboxPolicy: CodexAppServerSandboxPolicyReadOnly, NetworkAccess: false,
 	}
 }

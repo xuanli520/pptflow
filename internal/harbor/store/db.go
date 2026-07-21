@@ -41,6 +41,7 @@ const (
 	legacyV13ConsolidatedV2SchemaContractFingerprint = "sha256:dcb8391fa99e349def515fbeec9e4b193f4b1875898a9c61806230a767e5f2bc"
 	legacyV14ConsolidatedV2SchemaContractFingerprint = "sha256:5d795149bc1950bacf0bb8b4d284902f677ec8a9a5f48a8a967ac3b0209306af"
 	legacyV15ConsolidatedV2SchemaContractFingerprint = "sha256:606157ed9098dc3c5e5006599f560cc01200a053ec5dae8f32e0ec40ebc33a7f"
+	legacyV16ConsolidatedV2SchemaContractFingerprint = "sha256:2bafc3dec0fae16478ad404afb0a1c25bf419267d977faaebe63afbe08a0beb6"
 	authoringPhase1HandoffTriggerName                = "authoring_phase1_handoffs_v2_binding_insert"
 )
 
@@ -683,7 +684,8 @@ func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 func isKnownLegacyConsolidatedV2SchemaContract(fingerprint string) bool {
 	switch fingerprint {
 	case legacyV12ConsolidatedV2SchemaContractFingerprint, legacyV13ConsolidatedV2SchemaContractFingerprint,
-		legacyV14ConsolidatedV2SchemaContractFingerprint, legacyV15ConsolidatedV2SchemaContractFingerprint:
+		legacyV14ConsolidatedV2SchemaContractFingerprint, legacyV15ConsolidatedV2SchemaContractFingerprint,
+		legacyV16ConsolidatedV2SchemaContractFingerprint:
 		return true
 	default:
 		return false

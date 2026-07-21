@@ -986,12 +986,16 @@ func deploymentStageBindingType(key workflowkit.StageKey) (workflowadapter.Stage
 		return workflowadapter.StageBindingTaskTOMLGen, true
 	case workflowadapter.DockerfileGen:
 		return workflowadapter.StageBindingDockerfileGen, true
+	case workflowadapter.DockerfileBuildValidate:
+		return workflowadapter.StageBindingDockerfileBuildValidate, true
 	case workflowadapter.ContentReview:
 		return workflowadapter.StageBindingContentReview, true
 	case workflowadapter.SolveGen:
 		return workflowadapter.StageBindingSolveGen, true
 	case workflowadapter.TestGen:
 		return workflowadapter.StageBindingTestGen, true
+	case workflowadapter.AuthoringHarness:
+		return workflowadapter.StageBindingAuthoringHarness, true
 	case workflowadapter.TestsAnalysis:
 		return workflowadapter.StageBindingTestsAnalysis, true
 	case workflowadapter.CodeEdgePackageAdmission:

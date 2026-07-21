@@ -202,7 +202,7 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 		CatalogPath: config.Paths.StandardCatalog, LockPath: config.Paths.StandardLock, ContractRoot: config.Paths.StandardContractRoot,
 		ManagedRoot: root, Store: dataStore, HarborFlowBuild: config.StandardBinding.HarborFlowBuild,
 		CatalogReceiptFingerprint: config.StandardBinding.CatalogReceiptFingerprint, LockIdentity: config.StandardBinding.LockIdentity,
-		LookupEnvironment: config.LookupEnvironment, AdmissionContract: &parent.Admission,
+		LookupEnvironment: config.LookupEnvironment, AdmissionContract: &parent.Admission, HarnessValidator: parent.AuthoringHarness,
 	})
 	if err != nil {
 		return nil, err

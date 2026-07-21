@@ -371,9 +371,11 @@ const (
 	StageBindingInstructionGen           StageBindingType = "instruction_generate"
 	StageBindingTaskTOMLGen              StageBindingType = "task_toml_generate"
 	StageBindingDockerfileGen            StageBindingType = "dockerfile_generate"
+	StageBindingDockerfileBuildValidate  StageBindingType = "dockerfile_build_validate"
 	StageBindingContentReview            StageBindingType = "content_review"
 	StageBindingSolveGen                 StageBindingType = "solve_generate"
 	StageBindingTestGen                  StageBindingType = "test_generate"
+	StageBindingAuthoringHarness         StageBindingType = "authoring_harness"
 	StageBindingTestsAnalysis            StageBindingType = "tests_analysis"
 	StageBindingCodeEdgePackageAdmission StageBindingType = "codeedge_package_admission"
 	StageBindingSolutionReview           StageBindingType = "solution_review"
@@ -916,9 +918,11 @@ var knownStageBindingTypes = map[StageBindingType]bool{
 	StageBindingInstructionGen:           true,
 	StageBindingTaskTOMLGen:              true,
 	StageBindingDockerfileGen:            true,
+	StageBindingDockerfileBuildValidate:  true,
 	StageBindingContentReview:            true,
 	StageBindingSolveGen:                 true,
 	StageBindingTestGen:                  true,
+	StageBindingAuthoringHarness:         true,
 	StageBindingTestsAnalysis:            true,
 	StageBindingCodeEdgePackageAdmission: true,
 	StageBindingSolutionReview:           true,

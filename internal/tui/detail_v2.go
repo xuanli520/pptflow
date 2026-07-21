@@ -112,6 +112,8 @@ func (d *detailModel) currentRunFields(width int) string {
 	stage := run.CurrentStage
 	if stage == "" {
 		stage = "-"
+	} else {
+		stage = displayStageName(stage)
 	}
 	logPath := run.LogPath
 	if logPath == "" {
@@ -153,6 +155,8 @@ func (d *detailModel) failureFields(width int) string {
 	stage := run.FailureStage
 	if stage == "" {
 		stage = "当前 Run"
+	} else {
+		stage = displayStageName(stage)
 	}
 	summary := strings.TrimSpace(run.FailureSummary)
 	if summary == "" {

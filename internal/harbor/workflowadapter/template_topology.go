@@ -119,6 +119,21 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 			dependencies:   standardAuthoringTestsAnalysisInputDependencies(),
 			validateStages: validateStandardAuthoringTestsAnalysisInputContract,
 		}, nil
+	case reference.Equal(StandardAuthoringHarnessTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:                   standardAuthoringCatalogID,
+			catalogVersion:              StandardAuthoringHarnessTemplateVersion,
+			stageOrder:                  StandardAuthoringHarnessStageOrder(),
+			groups:                      standardAuthoringStageGroups(),
+			requiresOperatorOnlyPackage: false,
+			gates: []workflowkit.StageKey{
+				workflowkit.StageKey(TaskReview),
+				workflowkit.StageKey(ContentReview),
+				workflowkit.StageKey(SolutionReview),
+			},
+			dependencies:   standardAuthoringHarnessDependencies(),
+			validateStages: validateStandardAuthoringHarnessContract,
+		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
 			catalogID:                   codeEdgePhase1CatalogID,
@@ -322,6 +337,110 @@ func validateStandardAuthoringTestsAnalysisInputContract(stages map[workflowkit.
 	analysis, present := stages[workflowkit.StageKey(TestsAnalysis)]
 	if !present || !reflect.DeepEqual(analysis.Verdicts, passOnly()) {
 		return fmt.Errorf("%w: Standard authoring 1.6.0 tests_analysis must submit pass-only evidence", errInvalidCatalog)
+	}
+	return nil
+}
+
+func validateStandardAuthoringHarnessContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	if err := validateStandardAuthoringRepairFeedbackContract(stages); err != nil {
+		return err
+	}
+
+	build, present := stages[workflowkit.StageKey(DockerfileBuildValidate)]
+	if !present || build.Effect != workflowkit.EffectContentMutator || !reflect.DeepEqual(build.Verdicts, passOnly()) ||
+		!stageHasArtifact(build.Inputs, "dockerfile", "harbor.artifact.v1") ||
+		!stageHasArtifact(build.Outputs, StandardAuthoringValidatedDockerfileArtifact, "harbor.artifact.v1") ||
+		!stageHasArtifact(build.Outputs, StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion) ||
+		stageCatalogResourceCount(build.ReadSet, resourceTaskEnvironment) != 1 ||
+		stageCatalogResourceCount(build.WriteSet, resourceTaskValidatedEnvironment) != 1 ||
+		stageCatalogResourceCount(build.WriteSet, resourceEvidenceAuthoringDockerBuild) != 1 {
+		return fmt.Errorf("%w: Standard authoring 1.7.0 Dockerfile build validator contract is invalid", errInvalidCatalog)
+	}
+	if inputs, exact := stageCatalogEnvironmentPolicyInputCounts(build.Inputs); inputs != 1 || exact != 1 || stageCatalogResourceCount(build.ReadSet, resourceAuthoringEnvironmentPolicy) != 1 {
+		return fmt.Errorf("%w: Standard authoring 1.7.0 Dockerfile build validator must consume the frozen environment policy", errInvalidCatalog)
+	}
+	if inputs, exact := stageCatalogBriefInputCounts(build.Inputs); inputs != 1 || exact != 1 || stageCatalogResourceCount(build.ReadSet, resourceAuthoringBrief) != 1 {
+		return fmt.Errorf("%w: Standard authoring 1.7.0 Dockerfile build validator must consume the frozen brief", errInvalidCatalog)
+	}
+
+	harness, present := stages[workflowkit.StageKey(AuthoringHarness)]
+	if !present || harness.Effect != workflowkit.EffectContentMutator || !reflect.DeepEqual(harness.Verdicts, passOnly()) ||
+		!stageHasArtifact(harness.Inputs, StandardAuthoringValidatedDockerfileArtifact, "harbor.artifact.v1") ||
+		!stageHasArtifact(harness.Inputs, "solve_script", "harbor.artifact.v1") ||
+		!stageHasArtifact(harness.Inputs, "test_script", "harbor.artifact.v1") ||
+		!stageHasArtifact(harness.Inputs, StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion) ||
+		!stageHasArtifact(harness.Outputs, StandardAuthoringValidatedSolveScriptArtifact, "harbor.artifact.v1") ||
+		!stageHasArtifact(harness.Outputs, StandardAuthoringValidatedTestScriptArtifact, "harbor.artifact.v1") ||
+		!stageHasArtifact(harness.Outputs, StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion) ||
+		stageCatalogResourceCount(harness.WriteSet, resourceTaskValidatedSolution) != 1 ||
+		stageCatalogResourceCount(harness.WriteSet, resourceTaskValidatedTests) != 1 ||
+		stageCatalogResourceCount(harness.WriteSet, resourceEvidenceAuthoringHarness) != 1 {
+		return fmt.Errorf("%w: Standard authoring 1.7.0 authoring harness contract is invalid", errInvalidCatalog)
+	}
+	if inputs, exact := stageCatalogEnvironmentPolicyInputCounts(harness.Inputs); inputs != 1 || exact != 1 || stageCatalogResourceCount(harness.ReadSet, resourceAuthoringEnvironmentPolicy) != 1 {
+		return fmt.Errorf("%w: Standard authoring 1.7.0 authoring harness must consume the frozen environment policy", errInvalidCatalog)
+	}
+	if inputs, exact := stageCatalogBriefInputCounts(harness.Inputs); inputs != 1 || exact != 1 || stageCatalogResourceCount(harness.ReadSet, resourceAuthoringBrief) != 1 {
+		return fmt.Errorf("%w: Standard authoring 1.7.0 authoring harness must consume the frozen brief", errInvalidCatalog)
+	}
+
+	for _, stageKey := range []workflowkit.StageKey{workflowkit.StageKey(DockerfileBuildValidate), workflowkit.StageKey(AuthoringHarness)} {
+		stage := stages[stageKey]
+		for _, feedback := range standardAuthoringRepairFeedbackForStage(stageKey) {
+			actual, found := stageArtifactSpec(stage.Inputs, feedback.input.Name)
+			if !found || actual != feedback.input || stageCatalogResourceCount(stage.ReadSet, feedback.resource) != 1 {
+				return fmt.Errorf("%w: Standard authoring 1.7.0 stage %q repair feedback is incomplete", errInvalidCatalog, stageKey)
+			}
+		}
+	}
+
+	for _, contract := range []struct {
+		stage    workflowkit.StageKey
+		artifact string
+		resource workflowkit.ResourceKey
+	}{
+		{stage: workflowkit.StageKey(ContentReview), artifact: StandardAuthoringValidatedDockerfileArtifact, resource: resourceTaskValidatedEnvironment},
+		{stage: workflowkit.StageKey(SolveGen), artifact: StandardAuthoringValidatedDockerfileArtifact, resource: resourceTaskValidatedEnvironment},
+		{stage: workflowkit.StageKey(TestGen), artifact: StandardAuthoringValidatedDockerfileArtifact, resource: resourceTaskValidatedEnvironment},
+		{stage: workflowkit.StageKey(TestsAnalysis), artifact: StandardAuthoringValidatedTestScriptArtifact, resource: resourceTaskValidatedTests},
+		{stage: workflowkit.StageKey(CodeEdgePackageAdmission), artifact: StandardAuthoringValidatedDockerfileArtifact, resource: resourceTaskValidatedEnvironment},
+		{stage: workflowkit.StageKey(CodeEdgePackageAdmission), artifact: StandardAuthoringValidatedSolveScriptArtifact, resource: resourceTaskValidatedSolution},
+		{stage: workflowkit.StageKey(CodeEdgePackageAdmission), artifact: StandardAuthoringValidatedTestScriptArtifact, resource: resourceTaskValidatedTests},
+		{stage: workflowkit.StageKey(SolutionReview), artifact: StandardAuthoringValidatedSolveScriptArtifact, resource: resourceTaskValidatedSolution},
+		{stage: workflowkit.StageKey(SolutionReview), artifact: StandardAuthoringValidatedTestScriptArtifact, resource: resourceTaskValidatedTests},
+		{stage: workflowkit.StageKey(MaterializeTask), artifact: StandardAuthoringValidatedDockerfileArtifact, resource: resourceTaskValidatedEnvironment},
+		{stage: workflowkit.StageKey(MaterializeTask), artifact: StandardAuthoringValidatedSolveScriptArtifact, resource: resourceTaskValidatedSolution},
+		{stage: workflowkit.StageKey(MaterializeTask), artifact: StandardAuthoringValidatedTestScriptArtifact, resource: resourceTaskValidatedTests},
+	} {
+		stage, found := stages[contract.stage]
+		if !found || !stageHasArtifact(stage.Inputs, contract.artifact, "harbor.artifact.v1") || stageCatalogResourceCount(stage.ReadSet, contract.resource) != 1 {
+			return fmt.Errorf("%w: Standard authoring 1.7.0 stage %q must consume %q", errInvalidCatalog, contract.stage, contract.artifact)
+		}
+	}
+
+	for _, key := range []workflowkit.StageKey{
+		workflowkit.StageKey(ContentReview), workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen),
+		workflowkit.StageKey(TestsAnalysis), workflowkit.StageKey(CodeEdgePackageAdmission),
+		workflowkit.StageKey(SolutionReview), workflowkit.StageKey(MaterializeTask),
+	} {
+		stage := stages[key]
+		for _, legacy := range []string{"dockerfile", "solve_script", "test_script"} {
+			if _, found := stageArtifactSpec(stage.Inputs, legacy); found {
+				return fmt.Errorf("%w: Standard authoring 1.7.0 stage %q retained ambiguous legacy input %q", errInvalidCatalog, key, legacy)
+			}
+		}
+	}
+
+	analysis := stages[workflowkit.StageKey(TestsAnalysis)]
+	if !reflect.DeepEqual(analysis.Verdicts, passOnly()) || !stageHasArtifact(analysis.Inputs, StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion) || stageCatalogResourceCount(analysis.ReadSet, resourceEvidenceAuthoringHarness) != 1 {
+		return fmt.Errorf("%w: Standard authoring 1.7.0 tests_analysis must consume pass-only harness evidence", errInvalidCatalog)
+	}
+	for _, key := range []workflowkit.StageKey{workflowkit.StageKey(CodeEdgePackageAdmission), workflowkit.StageKey(MaterializeTask)} {
+		stage := stages[key]
+		if !stageHasArtifact(stage.Inputs, StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion) ||
+			!stageHasArtifact(stage.Inputs, StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion) {
+			return fmt.Errorf("%w: Standard authoring 1.7.0 stage %q must bind both validation reports", errInvalidCatalog, key)
+		}
 	}
 	return nil
 }

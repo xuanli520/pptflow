@@ -127,6 +127,8 @@ func renderTaskCard(item TaskItem, width int, selected bool) string {
 		stage := item.CurrentStage
 		if stage == "" {
 			stage = item.RunStatus
+		} else {
+			stage = displayStageName(stage)
 		}
 		stageLine := statusRunningStyle.Render("●") + " " + stage
 		lines = append(lines, truncate(stageLine, width-4))

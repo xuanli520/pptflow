@@ -1,14 +1,16 @@
 {
-  "template": {"id": "harbor.standard-authoring", "version": "1.6.0"},
+  "template": {"id": "harbor.standard-authoring", "version": "1.7.0"},
   "id": "standard-authoring-production",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "continuation_plan_ttl": "24h0m0s",
   "control_grace_period": "2m0s",
   "candidate_provider_budget": {"attempt_timeout": "30m0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s"},
   "stages": [
+    {"stage_key": "authoring_harness", "budget": {"turn_timeout": "2h0m0s", "max_turns": 1, "attempt_timeout": "2h10m0s", "max_attempts": 1, "max_elapsed": "2h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
     {"stage_key": "content_review", "budget": {"turn_timeout": "1m0s", "max_turns": 1, "attempt_timeout": "1m0s", "max_attempts": 1, "max_elapsed": "1m0s", "idle_timeout": "0s", "startup_grace": "0s", "shutdown_grace": "0s", "backoff": {"retry_delays": []}}},
     {"stage_key": "codeedge_package_admission", "budget": {"turn_timeout": "1m0s", "max_turns": 1, "attempt_timeout": "1m0s", "max_attempts": 1, "max_elapsed": "1m0s", "idle_timeout": "0s", "startup_grace": "0s", "shutdown_grace": "0s", "backoff": {"retry_delays": []}}},
     {"stage_key": "dockerfile_generate", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
+    {"stage_key": "dockerfile_build_validate", "budget": {"turn_timeout": "1h0m0s", "max_turns": 1, "attempt_timeout": "1h10m0s", "max_attempts": 1, "max_elapsed": "1h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
     {"stage_key": "generate_task_files", "budget": {"turn_timeout": "20m0s", "max_turns": 3, "attempt_timeout": "1h10m0s", "max_attempts": 1, "max_elapsed": "1h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
     {"stage_key": "instruction_generate", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
     {"stage_key": "materialize_task", "budget": {"turn_timeout": "10m0s", "max_turns": 1, "attempt_timeout": "12m0s", "max_attempts": 1, "max_elapsed": "12m0s", "idle_timeout": "0s", "startup_grace": "1m0s", "shutdown_grace": "1m0s", "backoff": {"retry_delays": []}}},

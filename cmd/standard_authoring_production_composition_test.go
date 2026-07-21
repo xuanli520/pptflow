@@ -91,7 +91,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	if definitionProfileFingerprint != lockedProfileFingerprint {
 		t.Fatal("Standard authoring definition did not use the execution profile frozen in the deployment lock")
 	}
-	for _, stageKey := range workflowadapter.StandardAuthoringTaskAdmissionStageOrder() {
+	for _, stageKey := range workflowadapter.StandardAuthoringHarnessStageOrder() {
 		resolution, err := definition.ExecutionSpec.ResolveStageOperation(stageKey)
 		if err != nil {
 			t.Fatal(err)

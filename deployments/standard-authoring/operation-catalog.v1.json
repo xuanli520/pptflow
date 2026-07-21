@@ -2,8 +2,8 @@
   "format": "harbor.deployment-operation-catalog.v1",
   "version": "1",
   "catalog_id": "standard-authoring-production",
-  "catalog_version": "2026.07.20.1",
-  "template": {"id": "harbor.standard-authoring", "version": "1.6.0"},
+  "catalog_version": "2026.07.21.1",
+  "template": {"id": "harbor.standard-authoring", "version": "1.7.0"},
   "operations": [
     {
       "stage": {"key": "repo_prepare", "type": "repo_prepare", "group": "source_prepare", "plugin": {"id": "harborfactory.repo_prepare", "version": "1.0.0"}},
@@ -70,6 +70,14 @@
       "secrets": []
     },
     {
+      "stage": {"key": "dockerfile_build_validate", "type": "dockerfile_build_validate", "group": "task_generation", "plugin": {"id": "harborfactory.dockerfile_build_validate", "version": "1.0.0"}},
+      "provider": {"id": "harbor-standard-authoring", "kind": "authoring", "version": "1.0.0"},
+      "operation": {"provider_id": "harbor-standard-authoring", "operation_id": "standard-authoring.codex.dockerfile-build-validate", "version": "1.0.0", "payload": {"kind": "agent.turn", "agent_id": "codex-app-server", "model_id": "gpt-5.6-terra", "reasoning_effort": "xhigh", "max_turns": 1}},
+      "runtime": {"id": "standard-authoring-controlled", "kind": "controlled", "version": "1.0.0"},
+      "checkout": {"id": "authoring-source-snapshot", "purpose": "authoring-source-snapshot"},
+      "secrets": []
+    },
+    {
       "stage": {"key": "content_review", "type": "content_review", "group": "task_generation", "plugin": {"id": "harborfactory.human_gate", "version": "1.0.0"}},
       "provider": {"id": "harbor-standard-authoring", "kind": "authoring", "version": "1.0.0"},
       "operation": {"provider_id": "harbor-standard-authoring", "operation_id": "standard-authoring.review.content", "version": "1.0.0", "payload": {"kind": "durable.review", "policy_id": "standard-authoring.content-review.v1"}},
@@ -89,6 +97,14 @@
       "stage": {"key": "test_generate", "type": "test_generate", "group": "task_generation", "plugin": {"id": "harborfactory.test_generate", "version": "1.0.0"}},
       "provider": {"id": "harbor-standard-authoring", "kind": "authoring", "version": "1.0.0"},
       "operation": {"provider_id": "harbor-standard-authoring", "operation_id": "standard-authoring.codex.test-generate", "version": "1.0.0", "payload": {"kind": "agent.turn", "agent_id": "codex-app-server", "model_id": "gpt-5.6-terra", "reasoning_effort": "xhigh", "max_turns": 1}},
+      "runtime": {"id": "standard-authoring-controlled", "kind": "controlled", "version": "1.0.0"},
+      "checkout": {"id": "authoring-source-snapshot", "purpose": "authoring-source-snapshot"},
+      "secrets": []
+    },
+    {
+      "stage": {"key": "authoring_harness", "type": "authoring_harness", "group": "task_generation", "plugin": {"id": "harborfactory.authoring_harness", "version": "1.0.0"}},
+      "provider": {"id": "harbor-standard-authoring", "kind": "authoring", "version": "1.0.0"},
+      "operation": {"provider_id": "harbor-standard-authoring", "operation_id": "standard-authoring.codex.authoring-harness", "version": "1.0.0", "payload": {"kind": "agent.turn", "agent_id": "codex-app-server", "model_id": "gpt-5.6-terra", "reasoning_effort": "xhigh", "max_turns": 1}},
       "runtime": {"id": "standard-authoring-controlled", "kind": "controlled", "version": "1.0.0"},
       "checkout": {"id": "authoring-source-snapshot", "purpose": "authoring-source-snapshot"},
       "secrets": []

@@ -418,11 +418,12 @@ func discoverCodexLock(config buildConfig) (stageprovider.CodexAppServerOperatio
 		return stageprovider.CodexAppServerOperationLock{}, errors.New("locked Codex CLI lacks app-server capability")
 	}
 	return stageprovider.CodexAppServerOperationLock{
-		Format: stageprovider.CodexAppServerOperationLockFormat, Version: stageprovider.CodexAppServerOperationLockVersion,
+		Format: stageprovider.CodexAppServerOperationLockFormatV3, Version: stageprovider.CodexAppServerOperationLockVersionV3,
 		JavaScriptLauncher: stageprovider.LocalExecutableLock{CommandID: stageprovider.CodexAppServerJavaScriptLauncherCommandID, AbsolutePath: config.codexLauncher, Version: launcherVersion, ContentSHA256: launcherHash},
 		NodeExecutable:     stageprovider.LocalExecutableLock{CommandID: stageprovider.CodexAppServerNodeExecutableCommandID, AbsolutePath: config.codexNode, Version: nodeVersion, ContentSHA256: nodeHash},
 		CodexHomeDirectory: config.codexHome, CLIVersionOutput: cliVersionOutput,
-		SandboxMode: stageprovider.CodexAppServerSandboxModeReadOnly, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyReadOnly,
+		ApprovalPolicy: stageprovider.CodexAppServerApprovalPolicyNever,
+		SandboxMode: stageprovider.CodexAppServerSandboxModeWorkspaceWrite, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyWorkspaceWrite,
 		NetworkAccess: false,
 	}, nil
 }

@@ -139,6 +139,72 @@ func TestCodexAppServerOperationLockValidatesTypedRuntimeContract(t *testing.T) 
 	})
 }
 
+func TestCodexAppServerOperationLockV3AllowsOnlyApprovalNeverWorkspaceWrite(t *testing.T) {
+	fixture := newCodexAppServerAttestationFixture(t)
+	writable := fixture.lock.Clone()
+	writable.Format = CodexAppServerOperationLockFormatV3
+	writable.Version = CodexAppServerOperationLockVersionV3
+	writable.ApprovalPolicy = CodexAppServerApprovalPolicyNever
+	writable.SandboxMode = CodexAppServerSandboxModeWorkspaceWrite
+	writable.SandboxPolicy = CodexAppServerSandboxPolicyWorkspaceWrite
+	if err := writable.Validate(); err != nil {
+		t.Fatalf("validate v3 workspace-write lock: %v", err)
+	}
+
+	invocation := codexAppServerInvocationFromLock(writable, *fixture.attestation.Record.AgentModel, CodexAppServerProductionReasoningEffort)
+	if invocation.ApprovalPolicy != CodexAppServerApprovalPolicyNever || invocation.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || invocation.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || invocation.NetworkAccess {
+		t.Fatalf("workspace-write invocation policy = %+v", invocation)
+	}
+	writableFixture := newCodexAppServerAttestationFixtureWithLock(t, func(lock *CodexAppServerOperationLock) {
+		lock.Format = CodexAppServerOperationLockFormatV3
+		lock.Version = CodexAppServerOperationLockVersionV3
+		lock.ApprovalPolicy = CodexAppServerApprovalPolicyNever
+		lock.SandboxMode = CodexAppServerSandboxModeWorkspaceWrite
+		lock.SandboxPolicy = CodexAppServerSandboxPolicyWorkspaceWrite
+	})
+	attestor, err := NewCodexAppServerRuntimeAttestor(CodexAppServerRuntimeAttestorConfig{HarborFlowBuild: writableFixture.attestation.HarborFlowBuild})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attested, err := attestor.AttestCodexAppServerOperation(context.Background(), writableFixture.attestation)
+	if err != nil {
+		t.Fatalf("attest v3 workspace-write runtime: %v", err)
+	}
+	if attested.ApprovalPolicy != CodexAppServerApprovalPolicyNever || attested.SandboxMode != CodexAppServerSandboxModeWorkspaceWrite || attested.SandboxPolicy != CodexAppServerSandboxPolicyWorkspaceWrite || attested.NetworkAccess {
+		t.Fatalf("attested v3 workspace-write policy = %+v", attested)
+	}
+
+	for name, mutate := range map[string]func(*CodexAppServerOperationLock){
+		"missing approval policy": func(lock *CodexAppServerOperationLock) { lock.ApprovalPolicy = "" },
+		"interactive approval":    func(lock *CodexAppServerOperationLock) { lock.ApprovalPolicy = "on-request" },
+		"mismatched read-only mode": func(lock *CodexAppServerOperationLock) {
+			lock.SandboxMode = CodexAppServerSandboxModeReadOnly
+		},
+		"mismatched read-only policy": func(lock *CodexAppServerOperationLock) {
+			lock.SandboxPolicy = CodexAppServerSandboxPolicyReadOnly
+		},
+		"network enabled": func(lock *CodexAppServerOperationLock) { lock.NetworkAccess = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := writable.Clone()
+			mutate(&candidate)
+			if err := candidate.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+				t.Fatalf("v3 lock validation error = %v, want invalid deployment lock", err)
+			}
+		})
+	}
+
+	legacy := fixture.lock.Clone()
+	legacy.ApprovalPolicy = ""
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("historical v2 read-only lock no longer validates: %v", err)
+	}
+	legacyInvocation := codexAppServerInvocationFromLock(legacy, *fixture.attestation.Record.AgentModel, CodexAppServerProductionReasoningEffort)
+	if legacyInvocation.ApprovalPolicy != CodexAppServerApprovalPolicyNever || legacyInvocation.SandboxMode != CodexAppServerSandboxModeReadOnly || legacyInvocation.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly {
+		t.Fatalf("historical v2 invocation policy = %+v", legacyInvocation)
+	}
+}
+
 func TestCodexAppServerRuntimeAttestorProvesPinnedRuntimeWithExplicitSecretFreeEnvironment(t *testing.T) {
 	fixture := newCodexAppServerAttestationFixture(t)
 	// These values intentionally exist in the parent process. The fake Node
@@ -161,7 +227,7 @@ func TestCodexAppServerRuntimeAttestorProvesPinnedRuntimeWithExplicitSecretFreeE
 	if invocation.ModelID != CodexAppServerProductionModelID || invocation.ReasoningEffort != CodexAppServerProductionReasoningEffort || invocation.AgentID == "" || invocation.AgentVersion == "" || invocation.ModelVersion == "" {
 		t.Fatalf("invocation agent configuration = %+v, want frozen production identity", invocation)
 	}
-	if invocation.CLIVersionOutput != "codex-cli 0.133.0" || invocation.SandboxMode != CodexAppServerSandboxModeReadOnly || invocation.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly || invocation.NetworkAccess {
+	if invocation.CLIVersionOutput != "codex-cli 0.133.0" || invocation.ApprovalPolicy != CodexAppServerApprovalPolicyNever || invocation.SandboxMode != CodexAppServerSandboxModeReadOnly || invocation.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly || invocation.NetworkAccess {
 		t.Fatalf("invocation policy = %+v, want locked read-only/network-disabled Codex policy", invocation)
 	}
 	environment := invocation.Environment()
@@ -313,6 +379,10 @@ type codexAppServerAttestationFixture struct {
 }
 
 func newCodexAppServerAttestationFixture(t *testing.T) *codexAppServerAttestationFixture {
+	return newCodexAppServerAttestationFixtureWithLock(t, nil)
+}
+
+func newCodexAppServerAttestationFixtureWithLock(t *testing.T, mutate func(*CodexAppServerOperationLock)) *codexAppServerAttestationFixture {
 	t.Helper()
 	root := t.TempDir()
 	home := filepath.Join(root, "codex-home")
@@ -370,6 +440,9 @@ exit 94
 		SandboxMode:        CodexAppServerSandboxModeReadOnly,
 		SandboxPolicy:      CodexAppServerSandboxPolicyReadOnly,
 		NetworkAccess:      false,
+	}
+	if mutate != nil {
+		mutate(&codexLock)
 	}
 	record := operationCatalogLockRecord(t, catalogDocument.Operations[0])
 	record.CodexAppServer = &codexLock

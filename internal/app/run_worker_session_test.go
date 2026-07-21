@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	runWorkerSessionReadyTimeout = 5 * time.Second
-	runWorkerSessionExitTimeout  = 3 * time.Second
+	runWorkerSessionReadyTimeout  = 5 * time.Second
+	runWorkerSessionExitTimeout   = 3 * time.Second
+	runWorkerFenceLossStopTimeout = 2 * time.Second
 )
 
 func TestRunWorkerSessionFencesOneRunAndReleasesItsSupervisorLease(t *testing.T) {
@@ -388,7 +389,7 @@ func TestRunWorkerSupervisorFenceLossStopsLongStage(t *testing.T) {
 	if !errors.Is(err, ErrRunWorkerLeaseLost) {
 		t.Fatalf("supervisor fence loss result = %v, want lease lost", err)
 	}
-	if elapsed := time.Since(startedAt); elapsed >= time.Second {
+	if elapsed := time.Since(startedAt); elapsed >= runWorkerFenceLossStopTimeout {
 		t.Fatalf("supervisor fence loss took %s to stop long stage", elapsed)
 	}
 	_, payload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)

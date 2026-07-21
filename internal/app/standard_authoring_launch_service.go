@@ -1553,7 +1553,7 @@ func validateStandardAuthoringBriefBindings(specification workflowadapter.RunExe
 		return err
 	}
 	if !template.Reference().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
-		return fmt.Errorf("brief binding requires the Standard authoring %s template", workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion)
+		return fmt.Errorf("brief binding requires the Standard authoring %s template", workflowadapter.StandardAuthoringCurrentTemplateReference().Version)
 	}
 	briefReference := brief.artifactReference()
 	matchedReference := false
@@ -1857,11 +1857,15 @@ func standardAuthoringCatalogStageBinding(registration stageprovider.DeploymentO
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingDockerfileGen:
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
+	case workflowadapter.StageBindingDockerfileBuildValidate:
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingContentReview:
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingSolveGen:
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTestGen:
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
+	case workflowadapter.StageBindingAuthoringHarness:
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingTestsAnalysis:
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil

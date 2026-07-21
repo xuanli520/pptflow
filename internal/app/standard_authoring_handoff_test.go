@@ -1040,7 +1040,7 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "handoff-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -1097,14 +1097,14 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	contents := map[string][]byte{
 		"instruction": append([]byte(nil), packageInput.Instruction...),
 		"task_toml":   append([]byte(nil), packageInput.TaskTOMLDraft...),
-		"dockerfile":  append([]byte(nil), packageInput.Dockerfile...),
 		workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: policyRaw,
 		workflowadapter.StandardAuthoringBriefArtifact:             briefRaw,
-		"solve_script":                      append([]byte(nil), packageInput.SolveScript...),
-		"test_script":                       append([]byte(nil), packageInput.TestScript...),
 		"tests_analysis":                    append([]byte(nil), packageInput.TestsAnalysis...),
 		"solution_review_decision":          approvedAuthoringSolutionDecision(t, source, session, run),
 		"codeedge_package_admission_report": []byte(`{}`),
+	}
+	for name, content := range standardAuthoringValidatedPackageContents(t, run.ID, packageInput) {
+		contents[name] = content
 	}
 	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
 	compiled, err := CompileStandardAuthoringTaskPackage(packageInput)
@@ -1114,8 +1114,10 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	admissionInputs := make([]workflowkit.ArtifactBinding, 0, 8)
 	for _, binding := range inputs {
 		switch binding.Name {
-		case "instruction", "task_toml", "dockerfile", workflowadapter.StandardAuthoringEnvironmentPolicyArtifact,
-			workflowadapter.StandardAuthoringBriefArtifact, "solve_script", "test_script", "tests_analysis":
+		case "instruction", "task_toml", workflowadapter.StandardAuthoringValidatedDockerfileArtifact,
+			workflowadapter.StandardAuthoringEnvironmentPolicyArtifact, workflowadapter.StandardAuthoringBriefArtifact,
+			workflowadapter.StandardAuthoringValidatedSolveScriptArtifact, workflowadapter.StandardAuthoringValidatedTestScriptArtifact,
+			workflowadapter.StandardAuthoringDockerfileBuildReportArtifact, workflowadapter.StandardAuthoringHarnessReportArtifact, "tests_analysis":
 			admissionInputs = append(admissionInputs, binding)
 		}
 	}

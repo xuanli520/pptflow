@@ -30,10 +30,20 @@ const (
 	StandardAuthoringBriefQuotaPolicyVersion              = "1.4.0"
 	StandardAuthoringRepairFeedbackQuotaPolicyVersion     = "1.5.0"
 	StandardAuthoringTestsAnalysisInputQuotaPolicyVersion = "1.6.0"
+	StandardAuthoringHarnessQuotaPolicyVersion            = "1.7.0"
+	StandardAuthoringValidationQuotaDimension             = "authoring_validation"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
 	// stage. It is versioned with the policy rather than supplied by a Run.
 	StandardAuthoringOutputSubmissionClaimUnits int64 = 3
+	// StandardAuthoringHarnessSubmissionClaimUnits matches the number of real
+	// validate-and-submit iterations available to each writable ReAct stage.
+	// Every call is also charged to authoring_validation.
+	StandardAuthoringHarnessSubmissionClaimUnits int64 = 8
+	// StandardAuthoringValidationClaimUnits bounds ReAct validation calls made
+	// by each 1.7.0 workspace stage independently of model turns and final output
+	// submissions.
+	StandardAuthoringValidationClaimUnits int64 = 8
 
 	// CodeEdgePhase1QuotaPolicyID and Version identify the explicit quota
 	// policy for the closed Phase-1 compliance descriptor. It is separate from
@@ -49,16 +59,18 @@ const (
 	CodeEdgeEvaluatorChildQuotaPolicyID      = "harbor.codeedge-evaluator.local.operator"
 	CodeEdgeEvaluatorChildQuotaPolicyVersion = "1.0.0"
 
-	standardTaskStageAttemptLimit      int64 = 120
-	standardActorStageAttemptLimit     int64 = 1200
-	standardTaskAgentTurnLimit         int64 = 64
-	standardActorAgentTurnLimit        int64 = 640
-	standardTaskOutputSubmissionLimit  int64 = 64
-	standardActorOutputSubmissionLimit int64 = 640
-	standardTaskTrialLimit             int64 = 32
-	standardActorTrialLimit            int64 = 320
-	standardTaskRepairRoundLimit       int64 = 3
-	standardActorRepairRoundLimit      int64 = 30
+	standardTaskStageAttemptLimit         int64 = 120
+	standardActorStageAttemptLimit        int64 = 1200
+	standardTaskAgentTurnLimit            int64 = 64
+	standardActorAgentTurnLimit           int64 = 640
+	standardTaskOutputSubmissionLimit     int64 = 64
+	standardActorOutputSubmissionLimit    int64 = 640
+	standardTaskAuthoringValidationLimit  int64 = 64
+	standardActorAuthoringValidationLimit int64 = 640
+	standardTaskTrialLimit                int64 = 32
+	standardActorTrialLimit               int64 = 320
+	standardTaskRepairRoundLimit          int64 = 3
+	standardActorRepairRoundLimit         int64 = 30
 
 	standardStageAttemptClaimUnits int64 = 1
 	standardEvaluationTrialClaims  int64 = 4
@@ -509,6 +521,39 @@ func StandardAuthoringTestsAnalysisInputQuotaPolicy() QuotaPolicy {
 	}
 }
 
+// StandardAuthoringHarnessQuotaPolicy is the additive 1.7.0 policy. Each
+// writable ReAct stage receives eight validate-and-submit calls, each charged
+// independently to both output_submission and authoring_validation.
+func StandardAuthoringHarnessQuotaPolicy() QuotaPolicy {
+	catalog := StandardAuthoringHarnessStageCatalog()
+	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
+	for _, stage := range catalog.Stages {
+		claims := standardClaimsForStage(stage)
+		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
+			submissionUnits := StandardAuthoringOutputSubmissionClaimUnits
+			if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
+				submissionUnits = StandardAuthoringHarnessSubmissionClaimUnits
+			}
+			claims = append(claims, standardQuotaClaim("output_submission", submissionUnits))
+		}
+		if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
+			claims = append(claims, standardQuotaClaim(StandardAuthoringValidationQuotaDimension, StandardAuthoringValidationClaimUnits))
+		}
+		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
+	}
+	return QuotaPolicy{
+		ID:      StandardAuthoringQuotaPolicyID,
+		Version: StandardAuthoringHarnessQuotaPolicyVersion,
+		AccountLimits: []QuotaAccountLimit{
+			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
+			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
+			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
+			{Dimension: StandardAuthoringValidationQuotaDimension, TaskLimitUnits: standardTaskAuthoringValidationLimit, ActorLimitUnits: standardActorAuthoringValidationLimit},
+		},
+		Stages: stages,
+	}
+}
+
 // CodeEdgePhase1QuotaPolicy returns the explicit resource policy for the
 // closed CodeEdge Phase-1 template. It intentionally contains no agent-turn
 // repair-round or trial account: this descriptor validates an already frozen
@@ -584,14 +629,16 @@ func standardQuotaClaim(dimension string, units int64) workflowkit.QuotaClaim {
 }
 
 var standardAgentQuotaStages = map[workflowkit.StageKey]struct{}{
-	workflowkit.StageKey(RepoAnalyze):       {},
-	workflowkit.StageKey(TaskDesign):        {},
-	workflowkit.StageKey(GenerateTaskFiles): {},
-	workflowkit.StageKey(InstructionGen):    {},
-	workflowkit.StageKey(TaskTOMLGen):       {},
-	workflowkit.StageKey(DockerfileGen):     {},
-	workflowkit.StageKey(SolveGen):          {},
-	workflowkit.StageKey(TestGen):           {},
-	workflowkit.StageKey(TestsAnalysis):     {},
-	workflowkit.StageKey(TaskRepair):        {},
+	workflowkit.StageKey(RepoAnalyze):             {},
+	workflowkit.StageKey(TaskDesign):              {},
+	workflowkit.StageKey(GenerateTaskFiles):       {},
+	workflowkit.StageKey(InstructionGen):          {},
+	workflowkit.StageKey(TaskTOMLGen):             {},
+	workflowkit.StageKey(DockerfileGen):           {},
+	workflowkit.StageKey(DockerfileBuildValidate): {},
+	workflowkit.StageKey(SolveGen):                {},
+	workflowkit.StageKey(TestGen):                 {},
+	workflowkit.StageKey(AuthoringHarness):        {},
+	workflowkit.StageKey(TestsAnalysis):           {},
+	workflowkit.StageKey(TaskRepair):              {},
 }
