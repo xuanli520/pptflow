@@ -1088,7 +1088,10 @@ func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) 
 	return []string{
 		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-		"--mount", "type=bind,src=" + checkout + ",dst=/oracle,rw",
+		// Docker's --mount grammar treats a bare "rw" field as invalid. Bind
+		// mounts are writable unless readonly is set, so omitting it preserves the
+		// controlled Oracle worktree's required write access.
+		"--mount", "type=bind,src=" + checkout + ",dst=/oracle",
 		"--workdir", "/oracle", "--name", "harbor-codeedge-" + name,
 		"--entrypoint", "/bin/sh", imageTag, "-ec", shellProgram,
 	}

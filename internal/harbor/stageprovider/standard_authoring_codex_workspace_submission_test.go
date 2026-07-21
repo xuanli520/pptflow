@@ -173,6 +173,57 @@ func TestStandardAuthoringWorkspaceSubmissionRejectsDockerfileDriftAndTOCTOU(t *
 	}
 }
 
+func TestStandardAuthoringWorkspaceSubmissionReportsValidationExhaustion(t *testing.T) {
+	now := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+	policy := standardAuthoringCodexTestEnvironmentPolicy(t)
+	taskRoot := standardAuthoringWorkspaceSubmissionTaskRoot(t, policy, authoringharness.ModeInitialOracle)
+	stage := standardAuthoringWorkspaceSubmissionStage(workflowadapter.AuthoringHarness)
+	request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	validator := standardAuthoringHarnessValidatorFunc(func(_ context.Context, validationRequest authoringharness.Request) (authoringharness.Result, error) {
+		candidate, err := authoringharness.ReadCandidate(taskRoot, authoringharness.ModeInitialOracle)
+		if err != nil {
+			return authoringharness.Result{}, err
+		}
+		return authoringharness.Finalize(authoringharness.Result{
+			Mode: validationRequest.Mode, RunID: validationRequest.RunID, StageKey: validationRequest.StageKey, StageAttemptID: validationRequest.StageAttemptID,
+			Passed: false, Step: "oracle_verify", ExitCode: 125, Findings: []string{"controlled Oracle verifier did not pass"},
+			CandidateDigest: candidate.CandidateDigest, EnvironmentDigest: candidate.EnvironmentDigest,
+			Steps: []authoringharness.StepResult{{
+				Step: "oracle_verify", Passed: false, ExitCode: 125, Findings: []string{"controlled Oracle verifier did not pass"}, OutputFingerprint: workflowkit.SHA256Fingerprint([]byte("oracle failure")),
+			}},
+		})
+	})
+	submission, err := newStandardAuthoringCodexWorkspaceSubmission(request, taskRoot, 2, func() time.Time { return now }, validator, &policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := submission.beginTurn(1); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		response, err := submission.handle(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var receipt standardAuthoringCodexWorkspaceSubmissionReceipt
+		if err := json.Unmarshal(response, &receipt); err != nil {
+			t.Fatal(err)
+		}
+		if receipt.Accepted || receipt.Remaining != 2-attempt || len(receipt.Errors) != 1 || receipt.Errors[0] != "controlled Oracle verifier did not pass" {
+			t.Fatalf("attempt %d receipt = %+v", attempt, receipt)
+		}
+	}
+	if got := submission.failure(); got != standardAuthoringCodexSubmissionFailureValidationExhausted {
+		t.Fatalf("submission failure = %q, want validation exhaustion", got)
+	}
+	if standardAuthoringCodexSubmissionFailureClass(submission.failure()) != workflowkit.FailureProcess {
+		t.Fatalf("validation exhaustion failure class = %q, want process", standardAuthoringCodexSubmissionFailureClass(submission.failure()))
+	}
+	if len(*usages) != 4 {
+		t.Fatalf("validation exhaustion usage = %+v, want two charges per attempt", *usages)
+	}
+}
+
 func standardAuthoringWorkspaceSubmissionStage(stageKey string) workflowkit.StageDescriptor {
 	stage := standardAuthoringCodexTestStage(1)
 	stage.Key = workflowkit.StageKey(stageKey)

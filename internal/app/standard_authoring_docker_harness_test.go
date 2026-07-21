@@ -118,8 +118,8 @@ func TestStandardAuthoringDockerHarnessReturnsRepairFeedbackThenReusesImageAfter
 }
 
 type standardAuthoringHarnessRunner struct {
-	t       *testing.T
-	imageID string
+	t        *testing.T
+	imageID  string
 	commands []CodeEdgePhase1Command
 }
 
@@ -139,7 +139,7 @@ func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command Cod
 		return CodeEdgePhase1CommandResult{Stdout: []byte(runner.imageID + "\n")}, nil
 	case "run":
 		mount := standardAuthoringHarnessArgAfter(command.Args, "--mount")
-		checkout := strings.TrimPrefix(strings.Split(mount, ",dst=/oracle,rw")[0], "type=bind,src=")
+		checkout := strings.TrimPrefix(strings.Split(mount, ",dst=/oracle")[0], "type=bind,src=")
 		program := command.Args[len(command.Args)-1]
 		if program == "sh ./tests/test.sh" {
 			testBytes, err := os.ReadFile(filepath.Join(checkout, "tests", "test.sh"))
@@ -205,7 +205,7 @@ func writeStandardAuthoringHarnessCandidate(t *testing.T, taskRoot, dockerfile, 
 		}
 	}
 	for relative, content := range map[string]string{
-		authoringharness.DockerfileRelativePath: dockerfile,
+		authoringharness.DockerfileRelativePath:  dockerfile,
 		authoringharness.SolveScriptRelativePath: solve,
 		authoringharness.TestScriptRelativePath:  test,
 	} {

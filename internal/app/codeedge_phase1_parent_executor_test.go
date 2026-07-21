@@ -156,7 +156,20 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 		if !containsParentArg(command.Args, "--network") || !containsParentArg(command.Args, "none") || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "--entrypoint") || !containsParentArg(command.Args, "/bin/sh") {
 			t.Fatalf("verification command missed isolation flag: %#v", command.Args)
 		}
+		mount := codeEdgePhase1TestArgAfter(command.Args, "--mount")
+		if !strings.HasPrefix(mount, "type=bind,src=") || !strings.HasSuffix(mount, ",dst=/oracle") || strings.Contains(mount, ",rw") {
+			t.Fatalf("verification mount = %q, want writable Docker --mount syntax", mount)
+		}
 	}
+}
+
+func codeEdgePhase1TestArgAfter(args []string, key string) string {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == key {
+			return args[index+1]
+		}
+	}
+	return ""
 }
 
 func TestCodeEdgePhase1ParentRejectsImageIdentityDriftBeforeInitialVerifier(t *testing.T) {

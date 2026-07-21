@@ -25,6 +25,9 @@ import (
 const (
 	standardAuthoringCodexValidationQuotaDimension    = "authoring_validation"
 	standardAuthoringCodexSubmissionFailureValidation = "standard_authoring_codex_agent_turn.validation"
+	// validation_exhausted distinguishes a completed ReAct loop whose host
+	// checks kept rejecting the candidate from an agent that never submitted.
+	standardAuthoringCodexSubmissionFailureValidationExhausted = "standard_authoring_codex_agent_turn.validation_exhausted"
 )
 
 // standardAuthoringCodexWorkspaceSubmission is the output authority for the
@@ -327,6 +330,11 @@ func (submission *standardAuthoringCodexWorkspaceSubmission) handle(ctx context.
 		diagnostics := append([]string(nil), result.Findings...)
 		if len(diagnostics) == 0 {
 			diagnostics = []string{"validation_failed"}
+		}
+		if remaining == 0 {
+			submission.mu.Lock()
+			submission.failureCode = standardAuthoringCodexSubmissionFailureValidationExhausted
+			submission.mu.Unlock()
 		}
 		return standardAuthoringCodexWorkspaceSubmissionResponse(false, diagnostics, remaining, result.CandidateDigest, result)
 	}
