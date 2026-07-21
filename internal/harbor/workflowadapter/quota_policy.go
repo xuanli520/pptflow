@@ -31,6 +31,7 @@ const (
 	StandardAuthoringRepairFeedbackQuotaPolicyVersion     = "1.5.0"
 	StandardAuthoringTestsAnalysisInputQuotaPolicyVersion = "1.6.0"
 	StandardAuthoringHarnessQuotaPolicyVersion            = "1.7.0"
+	StandardAuthoringFixedFileQuotaPolicyVersion          = "1.8.0"
 	StandardAuthoringValidationQuotaDimension             = "authoring_validation"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
@@ -544,6 +545,39 @@ func StandardAuthoringHarnessQuotaPolicy() QuotaPolicy {
 	return QuotaPolicy{
 		ID:      StandardAuthoringQuotaPolicyID,
 		Version: StandardAuthoringHarnessQuotaPolicyVersion,
+		AccountLimits: []QuotaAccountLimit{
+			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
+			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
+			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
+			{Dimension: StandardAuthoringValidationQuotaDimension, TaskLimitUnits: standardTaskAuthoringValidationLimit, ActorLimitUnits: standardActorAuthoringValidationLimit},
+		},
+		Stages: stages,
+	}
+}
+
+// StandardAuthoringFixedFileQuotaPolicy is the additive 1.8.0 policy. The
+// fixed-file solve/test handoff retains the ordinary bounded submission quota;
+// only the two Docker ReAct stages reserve the larger validation quota.
+func StandardAuthoringFixedFileQuotaPolicy() QuotaPolicy {
+	catalog := StandardAuthoringFixedFileStageCatalog()
+	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
+	for _, stage := range catalog.Stages {
+		claims := standardClaimsForStage(stage)
+		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
+			submissionUnits := StandardAuthoringOutputSubmissionClaimUnits
+			if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
+				submissionUnits = StandardAuthoringHarnessSubmissionClaimUnits
+			}
+			claims = append(claims, standardQuotaClaim("output_submission", submissionUnits))
+		}
+		if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
+			claims = append(claims, standardQuotaClaim(StandardAuthoringValidationQuotaDimension, StandardAuthoringValidationClaimUnits))
+		}
+		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
+	}
+	return QuotaPolicy{
+		ID:      StandardAuthoringQuotaPolicyID,
+		Version: StandardAuthoringFixedFileQuotaPolicyVersion,
 		AccountLimits: []QuotaAccountLimit{
 			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
 			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},

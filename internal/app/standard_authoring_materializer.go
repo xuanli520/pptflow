@@ -641,7 +641,7 @@ func verifyStandardAuthoringAdmissionReceipt(request workflowkit.StageExecutionR
 
 // isAdmissionAwareStandardAuthoringRun keeps package interpretation
 // version-scoped for fixtures and historical inspection. This release executes
-// only the current 1.6 template; older Runs remain owned by their original
+// only the current fixed-file template; older Runs remain owned by their original
 // deployment and control-plane root.
 func isAdmissionAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
@@ -649,7 +649,8 @@ func isAdmissionAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion ||
-			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion)
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringFixedFileTemplateVersion)
 }
 
 func isBriefAwareStandardAuthoringRun(run store.WorkflowRun) bool {
@@ -657,11 +658,14 @@ func isBriefAwareStandardAuthoringRun(run store.WorkflowRun) bool {
 		(run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringBriefTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion ||
 			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion ||
-			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion)
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringFixedFileTemplateVersion)
 }
 
 func isHarnessAwareStandardAuthoringRun(run store.WorkflowRun) bool {
-	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID && run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion
+	return run.WorkflowTemplateID == workflowadapter.StandardAuthoringWorkflowTemplateID &&
+		(run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringHarnessTemplateVersion ||
+			run.WorkflowTemplateVersion == workflowadapter.StandardAuthoringFixedFileTemplateVersion)
 }
 
 func standardAuthoringPackageArtifactNames(run store.WorkflowRun) (dockerfile, solve, test string) {

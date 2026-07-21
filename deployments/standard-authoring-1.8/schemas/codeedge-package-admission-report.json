@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["format", "version", "run_id", "authoring_source_id", "authoring_session_id", "input_fingerprint", "report"],
+  "additionalProperties": false,
+  "properties": {
+    "format": {"const": "harbor.standard-authoring-task-package-admission.v1"},
+    "version": {"const": "1"},
+    "run_id": {"type": "string"},
+    "authoring_source_id": {"type": "string"},
+    "authoring_session_id": {"type": "string"},
+    "input_fingerprint": {"type": "string"},
+    "report": {"type": "object"}
+  }
+}

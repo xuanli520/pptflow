@@ -2,6 +2,7 @@ package authoringharness
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,6 +65,55 @@ func TestReadCandidateRejectsSymlinkAndHardlink(t *testing.T) {
 		}
 		if _, err := ReadCandidate(taskRoot, ModeDockerfileBuild); err == nil {
 			t.Fatal("hardlinked Dockerfile was accepted")
+		}
+	})
+}
+
+func TestReadFixedFileWithLimitRejectsUnsafeOrOversizedFixedOutputs(t *testing.T) {
+	t.Run("valid fixed script", func(t *testing.T) {
+		taskRoot := writeCandidateFixture(t)
+		content, err := ReadFixedFileWithLimit(taskRoot, SolveScriptRelativePath, 1024)
+		if err != nil || string(content) != "#!/bin/sh\nexit 0\n" {
+			t.Fatalf("read fixed script = %q, %v", content, err)
+		}
+	})
+
+	t.Run("size ceiling is checked before allocation", func(t *testing.T) {
+		taskRoot := writeCandidateFixture(t)
+		if err := os.WriteFile(filepath.Join(taskRoot, filepath.FromSlash(SolveScriptRelativePath)), []byte("12345"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadFixedFileWithLimit(taskRoot, SolveScriptRelativePath, 4); !errors.Is(err, ErrFixedFileExceedsLimit) {
+			t.Fatalf("oversized fixed file error = %v, want ErrFixedFileExceedsLimit", err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		taskRoot := writeCandidateFixture(t)
+		path := filepath.Join(taskRoot, filepath.FromSlash(SolveScriptRelativePath))
+		target := filepath.Join(taskRoot, "outside-script")
+		if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, path); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if _, err := ReadFixedFile(taskRoot, SolveScriptRelativePath); err == nil {
+			t.Fatal("symlinked fixed file was accepted")
+		}
+	})
+
+	t.Run("hardlink", func(t *testing.T) {
+		taskRoot := writeCandidateFixture(t)
+		path := filepath.Join(taskRoot, filepath.FromSlash(SolveScriptRelativePath))
+		if err := os.Link(path, filepath.Join(taskRoot, "solve-script-link")); err != nil {
+			t.Skipf("hardlinks unavailable: %v", err)
+		}
+		if _, err := ReadFixedFile(taskRoot, SolveScriptRelativePath); err == nil {
+			t.Fatal("hardlinked fixed file was accepted")
 		}
 	})
 }

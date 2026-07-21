@@ -45,6 +45,14 @@ const (
 	// template remains registered unchanged for historical Run parsing.
 	StandardAuthoringHarnessTemplateVersion = "1.7.0"
 
+	// StandardAuthoringFixedFileTemplateVersion preserves the 1.7.0 DAG and
+	// Docker ReAct evidence contract, while changing only solve_generate and
+	// test_generate's artifact handoff: each script is host-read from an
+	// attempt-scoped fixed workspace file after a pass-only receipt. Keeping it
+	// separate prevents a new executor from reinterpreting frozen 1.7.0 base64
+	// turn programs.
+	StandardAuthoringFixedFileTemplateVersion = "1.8.0"
+
 	standardAuthoringCatalogID      = "harbor.standard-authoring-stage-catalog"
 	standardAuthoringCatalogVersion = "1.2.0"
 
@@ -122,11 +130,15 @@ func StandardAuthoringHarnessTemplateReference() TemplateReference {
 	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringHarnessTemplateVersion}
 }
 
+func StandardAuthoringFixedFileTemplateReference() TemplateReference {
+	return TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: StandardAuthoringFixedFileTemplateVersion}
+}
+
 // StandardAuthoringCurrentTemplateReference returns the only authoring
 // template new production Runs may select. Historical constructors remain
 // explicit and independently resolvable.
 func StandardAuthoringCurrentTemplateReference() TemplateReference {
-	return StandardAuthoringHarnessTemplateReference()
+	return StandardAuthoringFixedFileTemplateReference()
 }
 
 // IsStandardAuthoringWorkflowTemplate reports whether a Run is bound to the
@@ -137,7 +149,8 @@ func IsStandardAuthoringWorkflowTemplate(reference TemplateReference) bool {
 		reference.Equal(StandardAuthoringBriefTemplateReference()) ||
 		reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()) ||
 		reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()) ||
-		reference.Equal(StandardAuthoringHarnessTemplateReference())
+		reference.Equal(StandardAuthoringHarnessTemplateReference()) ||
+		reference.Equal(StandardAuthoringFixedFileTemplateReference())
 }
 
 // StandardAuthoringStageOrder returns the dependency-aware closed stage list.
@@ -184,6 +197,12 @@ func StandardAuthoringHarnessStageOrder() []workflowkit.StageKey {
 	}
 }
 
+// StandardAuthoringFixedFileStageOrder is intentionally identical to 1.7.0:
+// only the pre-harness script submission medium changes in 1.8.0.
+func StandardAuthoringFixedFileStageOrder() []workflowkit.StageKey {
+	return StandardAuthoringHarnessStageOrder()
+}
+
 // StandardAuthoringStageOrderForTemplate exposes the exact closed operation
 // set for each installed Authoring template version.
 func StandardAuthoringStageOrderForTemplate(reference TemplateReference) ([]workflowkit.StageKey, error) {
@@ -200,6 +219,8 @@ func StandardAuthoringStageOrderForTemplate(reference TemplateReference) ([]work
 		return StandardAuthoringTaskAdmissionStageOrder(), nil
 	case reference.Equal(StandardAuthoringHarnessTemplateReference()):
 		return StandardAuthoringHarnessStageOrder(), nil
+	case reference.Equal(StandardAuthoringFixedFileTemplateReference()):
+		return StandardAuthoringFixedFileStageOrder(), nil
 	default:
 		return nil, fmt.Errorf("Standard authoring template %s@%s is not installed", reference.ID, reference.Version)
 	}
@@ -329,8 +350,22 @@ func StandardAuthoringHarnessWorkflowTemplate() WorkflowTemplate {
 	}
 }
 
+// StandardAuthoringFixedFileWorkflowTemplate is the 1.8.0 authoring
+// contract. Its topology is intentionally the same as 1.7.0: solve_generate
+// and test_generate still feed the writable Docker ReAct authoring_harness,
+// but their first artifacts are host-read fixed files rather than model-owned
+// base64 tool payloads.
+func StandardAuthoringFixedFileWorkflowTemplate() WorkflowTemplate {
+	return WorkflowTemplate{
+		ID:          StandardAuthoringWorkflowTemplateID,
+		Version:     StandardAuthoringFixedFileTemplateVersion,
+		Catalog:     StandardAuthoringFixedFileStageCatalog(),
+		QuotaPolicy: StandardAuthoringFixedFileQuotaPolicy(),
+	}
+}
+
 func StandardAuthoringCurrentWorkflowTemplate() WorkflowTemplate {
-	return StandardAuthoringHarnessWorkflowTemplate()
+	return StandardAuthoringFixedFileWorkflowTemplate()
 }
 
 func StandardAuthoringTestsAnalysisInputStageCatalog() StageCatalog {
@@ -484,6 +519,30 @@ func StandardAuthoringHarnessStageCatalog() StageCatalog {
 	}
 }
 
+// StandardAuthoringFixedFileStageCatalog is the additive 1.8.0 catalog. It
+// clones the closed 1.7.0 graph rather than re-deriving it, making a topology
+// change impossible here. The only descriptor-level semantic difference is
+// that fixed-file script producers can complete only with a host-validated
+// pass; needs_repair/reject bytes have no fixed-file representation.
+func StandardAuthoringFixedFileStageCatalog() StageCatalog {
+	base := StandardAuthoringHarnessStageCatalog()
+	stages := make([]StageDefinition, len(base.Stages))
+	for index, definition := range base.Stages {
+		definition = definition.Clone()
+		switch definition.Key {
+		case workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen):
+			definition.Verdicts = passOnly()
+		}
+		stages[index] = definition
+	}
+	return StageCatalog{
+		Template: StandardAuthoringFixedFileTemplateReference(),
+		ID:       standardAuthoringCatalogID,
+		Version:  StandardAuthoringFixedFileTemplateVersion,
+		Stages:   stages,
+	}
+}
+
 func addStandardAuthoringRepairFeedback(definition StageDefinition) StageDefinition {
 	for _, feedback := range standardAuthoringRepairFeedbackForStage(definition.Key) {
 		definition.Inputs = append(definition.Inputs, feedback.input)
@@ -592,6 +651,8 @@ func StandardAuthoringTaskHandoffSchemaForTemplate(reference TemplateReference) 
 	case reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()):
 		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
 	case reference.Equal(StandardAuthoringHarnessTemplateReference()):
+		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
+	case reference.Equal(StandardAuthoringFixedFileTemplateReference()):
 		return StandardAuthoringTaskAdmissionHandoffSchemaVersion, nil
 	default:
 		return "", fmt.Errorf("Standard authoring handoff schema has no template %s@%s", reference.ID, reference.Version)

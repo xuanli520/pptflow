@@ -28,7 +28,7 @@ const (
 	maxProbeBytes              = 64 * 1024
 	maxSourceTreeBytes         = 64 * 1024 * 1024
 	probeTimeout               = 30 * time.Second
-	standardLockRelative       = "deployments/standard-authoring/operation-catalog.lock.json"
+	standardLockRelative       = "deployments/standard-authoring-1.8/operation-catalog.lock.json"
 )
 
 // generatedProductionLocks are omitted from the source manifest signed by
@@ -37,6 +37,7 @@ const (
 // independent bundles sign different source identities.
 var generatedProductionLocks = map[string]struct{}{
 	"deployments/standard-authoring/operation-catalog.lock.json":       {},
+	"deployments/standard-authoring-1.8/operation-catalog.lock.json":   {},
 	"deployments/codeedge-phase1/operation-catalog.lock.json":          {},
 	"deployments/codeedge-evaluator-child/operation-catalog.lock.json": {},
 }
@@ -205,7 +206,7 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 			if !stageprovider.IsCodexAppServerProductionPayload(payload) {
 				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q must pin the approved Codex agent profile", registration.Stage.Key)
 			}
-			if err := validateCodexStageAssets(config.contractRoot, entry, payload); err != nil {
+			if err := validateCodexStageAssets(config.contractRoot, catalog.Template(), registration.Stage.Key, entry, payload); err != nil {
 				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q Codex assets: %w", registration.Stage.Key, err)
 			}
 			record.AgentModel = &stageprovider.AgentModelLock{
@@ -428,7 +429,7 @@ func discoverCodexLock(config buildConfig) (stageprovider.CodexAppServerOperatio
 	}, nil
 }
 
-func validateCodexStageAssets(root string, entry stageprovider.StandardAuthoringContractAssetManifestEntry, payload workflowadapter.AgentTurnOperationPayload) error {
+func validateCodexStageAssets(root string, template workflowadapter.TemplateReference, stageKey workflowkit.StageKey, entry stageprovider.StandardAuthoringContractAssetManifestEntry, payload workflowadapter.AgentTurnOperationPayload) error {
 	promptPath, err := contractAssetPath(root, entry.Prompt.RelativePath)
 	if err != nil {
 		return err
@@ -452,7 +453,7 @@ func validateCodexStageAssets(root string, entry stageprovider.StandardAuthoring
 	if err != nil {
 		return err
 	}
-	return stageprovider.ValidateStandardAuthoringCodexOutputSchemaAsset(schema)
+	return stageprovider.ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(template, stageKey, schema)
 }
 
 func fingerprintContractAsset(root string, reference stageprovider.StandardAuthoringContractAssetReference) (workflowkit.Fingerprint, error) {

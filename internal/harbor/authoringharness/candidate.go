@@ -19,6 +19,11 @@ const (
 	TestScriptRelativePath  = "tests/test.sh"
 )
 
+// ErrFixedFileExceedsLimit lets a caller distinguish an ordinary unsafe path
+// from a host-owned output ceiling violation without exposing a filesystem
+// path or content.
+var ErrFixedFileExceedsLimit = errors.New("Standard authoring harness fixed file exceeds limit")
+
 // Candidate is one safely read, immutable-in-memory view of the fixed files
 // used by a harness mode. The same reader is used by validation and final
 // artifact submission so digest semantics cannot drift between them.
@@ -75,6 +80,33 @@ func ReadCandidate(taskRoot string, mode Mode) (Candidate, error) {
 	return CandidateFromBytes(mode, dockerfile, solveScript, testScript)
 }
 
+// ReadFixedFile safely reads one host-selected file below an Authoring task
+// workspace. It has the same path, link, regular-file, size, and replacement
+// protections as ReadCandidate, but does not require the other files from a
+// complete harness candidate to exist. Callers must select relative from a
+// closed host-owned stage contract; it is never a model-supplied path.
+func ReadFixedFile(taskRoot, relative string) ([]byte, error) {
+	return ReadFixedFileWithLimit(taskRoot, relative, taskpolicy.ManagedSnapshotFileMaxBytes)
+}
+
+// ReadFixedFileWithLimit applies the same safe-open/re-read discipline as
+// ReadFixedFile while enforcing a caller-owned artifact ceiling before the
+// file is allocated. Pre-harness script submission uses this so a prompt
+// program's output ceiling cannot be bypassed through a much larger file.
+func ReadFixedFileWithLimit(taskRoot, relative string, maxBytes int64) ([]byte, error) {
+	absolute, err := filepath.Abs(strings.TrimSpace(taskRoot))
+	if err != nil || strings.TrimSpace(taskRoot) == "" || filepath.Clean(absolute) != taskRoot || absolute == string(os.PathSeparator) {
+		return nil, errors.New("Standard authoring harness task root is invalid")
+	}
+	if maxBytes <= 0 || maxBytes > taskpolicy.ManagedSnapshotFileMaxBytes {
+		return nil, errors.New("Standard authoring harness fixed-file limit is invalid")
+	}
+	if err := inspectCandidateDirectory(taskRoot); err != nil {
+		return nil, fmt.Errorf("inspect Standard authoring harness task root: %w", err)
+	}
+	return readCandidateFileWithLimit(taskRoot, relative, maxBytes)
+}
+
 // CandidateFromBytes applies the same digest contract to already frozen
 // artifact bytes. Downstream admission and materialization use it to prove
 // that a passing harness report names the exact artifacts they consume.
@@ -125,6 +157,10 @@ func CandidateFromBytes(mode Mode, dockerfile, solveScript, testScript []byte) (
 }
 
 func readCandidateFile(taskRoot, relative string) ([]byte, error) {
+	return readCandidateFileWithLimit(taskRoot, relative, taskpolicy.ManagedSnapshotFileMaxBytes)
+}
+
+func readCandidateFileWithLimit(taskRoot, relative string, maxBytes int64) ([]byte, error) {
 	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(relative)))
 	if clean != relative {
 		return nil, errors.New("Standard authoring harness candidate path is invalid")
@@ -135,7 +171,10 @@ func readCandidateFile(taskRoot, relative string) ([]byte, error) {
 	}
 	path := filepath.Join(taskRoot, filepath.FromSlash(relative))
 	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > taskpolicy.ManagedSnapshotFileMaxBytes || candidateHasMultipleLinks(info) {
+	if err == nil && info.Size() > maxBytes {
+		return nil, ErrFixedFileExceedsLimit
+	}
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || candidateHasMultipleLinks(info) {
 		return nil, fmt.Errorf("Standard authoring harness candidate file %s is unavailable or unsafe", relative)
 	}
 	file, err := os.Open(path)
@@ -147,7 +186,7 @@ func readCandidateFile(taskRoot, relative string) ([]byte, error) {
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) || candidateHasMultipleLinks(opened) {
 		return nil, fmt.Errorf("Standard authoring harness candidate file %s changed while opening", relative)
 	}
-	content, err := io.ReadAll(io.LimitReader(file, taskpolicy.ManagedSnapshotFileMaxBytes+1))
+	content, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil || int64(len(content)) != info.Size() {
 		return nil, fmt.Errorf("Standard authoring harness candidate file %s changed while reading", relative)
 	}

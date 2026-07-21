@@ -134,6 +134,21 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 			dependencies:   standardAuthoringHarnessDependencies(),
 			validateStages: validateStandardAuthoringHarnessContract,
 		}, nil
+	case reference.Equal(StandardAuthoringFixedFileTemplateReference()):
+		return catalogTemplatePolicy{
+			catalogID:                   standardAuthoringCatalogID,
+			catalogVersion:              StandardAuthoringFixedFileTemplateVersion,
+			stageOrder:                  StandardAuthoringFixedFileStageOrder(),
+			groups:                      standardAuthoringStageGroups(),
+			requiresOperatorOnlyPackage: false,
+			gates: []workflowkit.StageKey{
+				workflowkit.StageKey(TaskReview),
+				workflowkit.StageKey(ContentReview),
+				workflowkit.StageKey(SolutionReview),
+			},
+			dependencies:   standardAuthoringHarnessDependencies(),
+			validateStages: validateStandardAuthoringFixedFileContract,
+		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
 			catalogID:                   codeEdgePhase1CatalogID,
@@ -440,6 +455,31 @@ func validateStandardAuthoringHarnessContract(stages map[workflowkit.StageKey]St
 		if !stageHasArtifact(stage.Inputs, StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion) ||
 			!stageHasArtifact(stage.Inputs, StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion) {
 			return fmt.Errorf("%w: Standard authoring 1.7.0 stage %q must bind both validation reports", errInvalidCatalog, key)
+		}
+	}
+	return nil
+}
+
+// validateStandardAuthoringFixedFileContract deliberately layers the 1.8.0
+// submission boundary onto the unchanged 1.7.0 ReAct/Docker topology. Stage
+// descriptors do not carry a workspace path; the pass-only solve/test policy
+// is the catalog-level proof that their host-owned fixed-file submission has
+// no model-authored reject/repair payload variant.
+func validateStandardAuthoringFixedFileContract(stages map[workflowkit.StageKey]StageDefinition) error {
+	if err := validateStandardAuthoringHarnessContract(stages); err != nil {
+		return err
+	}
+	for _, contract := range []struct {
+		key    workflowkit.StageKey
+		output string
+	}{
+		{key: workflowkit.StageKey(SolveGen), output: "solve_script"},
+		{key: workflowkit.StageKey(TestGen), output: "test_script"},
+	} {
+		stage, present := stages[contract.key]
+		if !present || !reflect.DeepEqual(stage.Verdicts, passOnly()) || len(stage.Outputs) != 1 ||
+			stage.Outputs[0].Name != contract.output || !stage.Outputs[0].Required || stage.Outputs[0].SchemaVersion != "harbor.artifact.v1" {
+			return fmt.Errorf("%w: Standard authoring 1.8.0 fixed-file stage %q contract is invalid", errInvalidCatalog, contract.key)
 		}
 	}
 	return nil

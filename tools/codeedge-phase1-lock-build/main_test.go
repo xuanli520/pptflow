@@ -16,7 +16,21 @@ func TestSourceBuildIdentityExcludesAllGeneratedProductionLocks(t *testing.T) {
 	git := parentLockTestGitExecutable(t)
 	root := t.TempDir()
 	parentLockWriteFile(t, filepath.Join(root, "tracked.txt"), "stable\n")
-	for _, lock := range generatedLockRelatives {
+	generatedLocks := []string{
+		"deployments/standard-authoring/operation-catalog.lock.json",
+		"deployments/standard-authoring-1.8/operation-catalog.lock.json",
+		parentLockRelative,
+		"deployments/codeedge-evaluator-child/operation-catalog.lock.json",
+	}
+	if len(generatedLockRelatives) != len(generatedLocks) {
+		t.Fatalf("generated lock paths = %v, want %v", generatedLockRelatives, generatedLocks)
+	}
+	for index, want := range generatedLocks {
+		if got := generatedLockRelatives[index]; got != want {
+			t.Fatalf("generated lock path %d = %q, want %q", index, got, want)
+		}
+	}
+	for _, lock := range generatedLocks {
 		parentLockWriteFile(t, filepath.Join(root, lock), "first generated lock\n")
 	}
 	parentLockGit(t, root, git, "init")
@@ -29,7 +43,7 @@ func TestSourceBuildIdentityExcludesAllGeneratedProductionLocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first source build identity: %v", err)
 	}
-	for _, lock := range generatedLockRelatives {
+	for _, lock := range generatedLocks {
 		parentLockWriteFile(t, filepath.Join(root, lock), "second generated lock\n")
 	}
 	parentLockGit(t, root, git, "add", "deployments")

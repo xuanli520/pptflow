@@ -115,7 +115,7 @@ func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T
 	if !ok {
 		t.Fatal("locate Standard authoring lock generator test")
 	}
-	path := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "deployments", "standard-authoring", "execution-profile.v1.json"))
+	path := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "deployments", "standard-authoring-1.8", "execution-profile.v1.json"))
 	profile, err := readStandardAuthoringExecutionProfile(path)
 	if err != nil {
 		t.Fatalf("read production Standard authoring execution profile asset: %v", err)
@@ -156,7 +156,7 @@ func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testi
 		t.Fatal("locate Standard authoring lock generator test")
 	}
 	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
-	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring")
+	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring-1.8")
 	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +186,7 @@ func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testi
 		if !found {
 			t.Fatalf("agent stage %q has no contract assets", registration.Stage.Key)
 		}
-		if err := validateCodexStageAssets(deploymentRoot, entry, payload); err != nil {
+		if err := validateCodexStageAssets(deploymentRoot, catalog.Template, registration.Stage.Key, entry, payload); err != nil {
 			t.Fatalf("validate production Codex stage %q: %v", registration.Stage.Key, err)
 		}
 		promptRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Prompt.RelativePath)))
@@ -209,7 +209,7 @@ func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testi
 			t.Run(string(registration.Stage.Key)+"/"+name, func(t *testing.T) {
 				candidate := payload
 				mutate(&candidate)
-				if err := validateCodexStageAssets(deploymentRoot, entry, candidate); err == nil {
+				if err := validateCodexStageAssets(deploymentRoot, catalog.Template, registration.Stage.Key, entry, candidate); err == nil {
 					t.Fatalf("Codex stage assets accepted %s: %+v", name, candidate)
 				}
 			})

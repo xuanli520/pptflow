@@ -911,6 +911,299 @@ func TestStandardAuthoringCodexAgentTurnExecutorUsesFrozenDockerfileEnvironmentP
 	}
 }
 
+func TestStandardAuthoringCodexAgentTurnExecutorRoutesLegacyAndFixedFileScriptSubmissions(t *testing.T) {
+	now := time.Date(2026, 7, 21, 10, 30, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name          string
+		template      workflowadapter.TemplateReference
+		fixedFile     bool
+		wantSchema    workflowkit.Fingerprint
+		attemptSuffix string
+	}{
+		{
+			name: "1.7 keeps base64 artifact submission", template: workflowadapter.StandardAuthoringHarnessTemplateReference(),
+			wantSchema: StandardAuthoringCodexOutputSchemaFingerprint(), attemptSuffix: "legacy",
+		},
+		{
+			name: "1.8 reads host selected workspace file", template: workflowadapter.StandardAuthoringFixedFileTemplateReference(),
+			fixedFile: true, wantSchema: StandardAuthoringCodexFixedFileOutputSchemaFingerprint(), attemptSuffix: "fixed",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Cleanup(func() { standardAuthoringCodexRemoveTree(root) })
+			const runID = "019f8397-7a65-7000-8000-0000000000b1"
+			standardAuthoringCodexTestPrepareRunScopedSource(t, root, runID)
+			stage := standardAuthoringCodexTestAuthoringScriptStage(t, testCase.template, workflowkit.StageKey(workflowadapter.SolveGen))
+			program, err := NewStandardAuthoringCodexTurnProgram("standard-authoring.solve-generate", "test", standardAuthoringCodexTestPrompts(1), 64*1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			content := []byte("#!/bin/sh\nset -eu\nprintf 'generated script\\n'\n")
+			conversation := &standardAuthoringCodexConversationStub{
+				results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
+			}
+			if testCase.fixedFile {
+				conversation.submissions = [][]json.RawMessage{{json.RawMessage(`{"verdict":"pass"}`)}}
+				conversation.beforeSubmissions = func(int) error {
+					workRoot, pathErr := StandardAuthoringAttemptWorkspacePath(root, runID, stage.Key, "fixed-file-attempt")
+					if pathErr != nil {
+						return pathErr
+					}
+					path := filepath.Join(workRoot, StandardAuthoringCodexAttemptTaskDirectory, "solution", "solve.sh")
+					return os.WriteFile(path, content, 0o750)
+				}
+			} else {
+				conversation.submissions = [][]json.RawMessage{{standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, content)}}
+			}
+			runtime := &standardAuthoringCodexRuntimeStub{conversation: conversation}
+			invocation := standardAuthoringCodexTestInvocation(t)
+			invocation.SandboxMode = CodexAppServerSandboxModeWorkspaceWrite
+			invocation.SandboxPolicy = CodexAppServerSandboxPolicyWorkspaceWrite
+			executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+				InvocationFactory: standardAuthoringCodexTestInvocationFactory(invocation), WorkspaceRoot: root,
+				WorkspaceMode: StandardAuthoringCodexWorkspaceRunScoped, SourceVerifier: standardAuthoringCodexTestFrozenSourceVerifier{},
+				RuntimeFactory: standardAuthoringCodexTestRuntimeFactory(runtime),
+				ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{stage.Key: program},
+				Now:            func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+			request.Execution = standardAuthoringCodexTestSealedExecution(t, testCase.template, runID)
+			request.Claim.Stage.StageAttempt.ID = "fixed-file-attempt"
+			payload := standardAuthoringCodexTestPayload(1)
+			result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+				Request: request,
+				Resolution: workflowadapter.StageOperationResolution{
+					Template: testCase.template, StageKey: stage.Key,
+					Operation: workflowadapter.StageOperationBinding{Payload: payload},
+				},
+			}, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Outcome.Status != workflowkit.StatusCompleted || result.Outcome.Verdict != workflowkit.VerdictPass || len(result.Artifacts) != 1 || string(result.Artifacts[0].Content) != string(content) {
+				t.Fatalf("script route result = %+v", result)
+			}
+			if len(conversation.dynamicTools) != 1 || !json.Valid(conversation.dynamicTools[0].InputSchema) {
+				t.Fatalf("script route dynamic tools = %+v", conversation.dynamicTools)
+			}
+			var toolSchema map[string]any
+			if err := json.Unmarshal(conversation.dynamicTools[0].InputSchema, &toolSchema); err != nil {
+				t.Fatal(err)
+			}
+			properties, ok := toolSchema["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("script route tool schema = %#v", toolSchema)
+			}
+			_, hasArtifacts := properties["artifacts"]
+			if hasArtifacts == testCase.fixedFile {
+				t.Fatalf("script route schema fixed=%t artifacts=%t schema=%#v", testCase.fixedFile, hasArtifacts, toolSchema)
+			}
+			if len(conversation.requests) != 1 || len(conversation.requests[0].Input) != 1 {
+				t.Fatalf("script route turn requests = %+v", conversation.requests)
+			}
+			var document struct {
+				OutputSchemaFingerprint workflowkit.Fingerprint `json:"output_schema_fingerprint"`
+			}
+			if err := json.Unmarshal([]byte(conversation.requests[0].Input[0].Text), &document); err != nil {
+				t.Fatal(err)
+			}
+			if document.OutputSchemaFingerprint != testCase.wantSchema {
+				t.Fatalf("output schema fingerprint = %q, want %q", document.OutputSchemaFingerprint, testCase.wantSchema)
+			}
+		})
+	}
+}
+
+func TestStandardAuthoringCodexFixedFileInvocationRequiresSealedTemplateConsistency(t *testing.T) {
+	const runID = "019f8397-7a65-7000-8000-0000000000b2"
+	fixed := workflowadapter.StandardAuthoringFixedFileTemplateReference()
+	legacy := workflowadapter.StandardAuthoringHarnessTemplateReference()
+	stage := standardAuthoringCodexTestAuthoringScriptStage(t, fixed, workflowkit.StageKey(workflowadapter.SolveGen))
+	request, _, _ := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), time.Date(2026, 7, 21, 10, 30, 0, 0, time.UTC))
+	request.Execution = standardAuthoringCodexTestSealedExecution(t, fixed, runID)
+	invocation := StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{Template: fixed, StageKey: stage.Key,
+			Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(1)}},
+	}
+	sealed, usesFixedFile, err := standardAuthoringCodexFixedFileInvocation(invocation)
+	if err != nil || !sealed.Equal(fixed) || !usesFixedFile {
+		t.Fatalf("matching fixed template invocation = template:%+v fixed:%t err:%v", sealed, usesFixedFile, err)
+	}
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*StageOperationInvocation)
+	}{
+		{
+			name: "sealed spec says 1.8 but request says 1.7",
+			mutate: func(candidate *StageOperationInvocation) {
+				candidate.Request.Execution.Workflow.ID = legacy.ID
+				candidate.Request.Execution.Workflow.Version = legacy.Version
+				candidate.Resolution.Template = legacy
+			},
+		},
+		{
+			name: "resolution says 1.7",
+			mutate: func(candidate *StageOperationInvocation) {
+				candidate.Resolution.Template = legacy
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			candidate := invocation.clone()
+			testCase.mutate(&candidate)
+			if _, _, err := standardAuthoringCodexFixedFileInvocation(candidate); err == nil {
+				t.Fatal("fixed-file template mismatch was accepted")
+			}
+		})
+	}
+
+	legacyRequest := request
+	legacyRequest.Execution = standardAuthoringCodexTestSealedExecution(t, legacy, runID)
+	legacyRequest.Execution.Workflow.ID = fixed.ID
+	legacyRequest.Execution.Workflow.Version = fixed.Version
+	legacyInvocation := invocation
+	legacyInvocation.Request = legacyRequest
+	if _, _, err := standardAuthoringCodexFixedFileInvocation(legacyInvocation); err == nil {
+		t.Fatal("request-only fixed template declaration was accepted against a legacy sealed spec")
+	}
+
+	legacyRequest.Execution.Workflow.ID = legacy.ID
+	legacyRequest.Execution.Workflow.Version = legacy.Version
+	legacyInvocation.Request = legacyRequest
+	legacyInvocation.Resolution.Template = legacy
+	sealed, usesFixedFile, err = standardAuthoringCodexFixedFileInvocation(legacyInvocation)
+	if err != nil || !sealed.Equal(legacy) || usesFixedFile {
+		t.Fatalf("matching legacy invocation = template:%+v fixed:%t err:%v", sealed, usesFixedFile, err)
+	}
+}
+
+func standardAuthoringCodexTestPrepareRunScopedSource(t *testing.T, root, runID string) {
+	t.Helper()
+	sourceRoot := filepath.Join(root, runID, StandardAuthoringCodexRunSourceDirectory)
+	if err := os.MkdirAll(filepath.Join(sourceRoot, "src"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "src", "lib.rs"), []byte("pub fn frozen() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	standardAuthoringCodexSealTestSourceTree(t, sourceRoot)
+}
+
+func standardAuthoringCodexTestAuthoringScriptStage(t *testing.T, template workflowadapter.TemplateReference, key workflowkit.StageKey) workflowkit.StageDescriptor {
+	t.Helper()
+	workflow, err := workflowadapter.ResolveWorkflowTemplate(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, found := workflow.Catalog.Stage(key)
+	if !found || len(expected.Outputs) != 1 {
+		t.Fatalf("authoring script stage %q = %+v found=%t", key, expected, found)
+	}
+	stage := standardAuthoringCodexTestArtifactStage(1, key, expected.Outputs[0].Name)
+	stage.Version = expected.Version
+	stage.Plugin = workflowkit.PluginBinding{ID: expected.Plugin.ID, Version: expected.Plugin.Version}
+	stage.Outputs = append([]workflowkit.ArtifactSpec(nil), expected.Outputs...)
+	stage.Verdicts = expected.Verdicts.Clone()
+	return stage
+}
+
+func standardAuthoringCodexTestSealedExecution(t *testing.T, template workflowadapter.TemplateReference, runID string) workflowkit.FrozenExecution {
+	t.Helper()
+	workflow, err := workflowadapter.ResolveWorkflowTemplate(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := workflowadapter.RunSelectionReference{
+		Kind:                  workflowadapter.RunSelectionAuthoringSession,
+		AuthoringSourceID:     "019f8397-7a65-7000-8000-0000000000c1",
+		AuthoringSessionID:    "019f8397-7a65-7000-8000-0000000000c2",
+		AuthoringSourceDigest: workflowkit.SubjectDigest("sha256:" + strings.Repeat("c", 64)),
+	}
+	specification := workflowadapter.RunExecutionSpec{
+		Format: workflowadapter.RunExecutionSpecFormat, Version: workflowadapter.RunExecutionSpecVersion,
+		Template: template, Selection: selection,
+		References: workflowadapter.ExecutionReferenceSet{
+			Checkouts: []workflowadapter.CheckoutReference{{ID: "checkout-test", RevisionID: selection.AuthoringSessionID, RevisionDigest: selection.AuthoringSourceDigest}},
+			Runtimes:  []workflowadapter.RuntimeReference{{ID: "runtime-test", Kind: "test", Version: "1"}},
+			Providers: []workflowadapter.ProviderReference{{ID: "provider-test", Kind: "test", Version: "1"}},
+		},
+	}
+	for _, definition := range workflow.Catalog.Stages {
+		specification.Stages = append(specification.Stages, workflowadapter.UniversalStageBinding{StageBindingBase: workflowadapter.StageBindingBase{
+			Type: standardAuthoringCodexTestAuthoringStageBindingType(t, definition.Key), StageKey: definition.Key,
+			Plugin:         workflowkit.PluginBinding{ID: definition.Plugin.ID, Version: definition.Plugin.Version},
+			ArtifactInputs: []workflowadapter.ArtifactInputReference{}, CheckoutID: "checkout-test", RuntimeID: "runtime-test", SecretIDs: []string{},
+			Operation: workflowadapter.StageOperationBinding{
+				ProviderID: "provider-test", OperationID: "test." + string(definition.Key), Version: "1", Payload: standardAuthoringCodexTestPayload(1),
+			},
+		}})
+	}
+	canonical, err := specification.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonical %s@%s test execution spec: %v", template.ID, template.Version, err)
+	}
+	binding, err := workflowkit.NewOpaqueExecutionBinding(workflowadapter.RunExecutionSpecFormat, workflowadapter.RunExecutionSpecVersion, canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, err := selection.SubjectBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return workflowkit.FrozenExecution{
+		ID: runID, Subject: subject, Workflow: workflowkit.WorkflowDescriptor{ID: template.ID, Version: template.Version}, Binding: binding,
+	}
+}
+
+func standardAuthoringCodexTestAuthoringStageBindingType(t *testing.T, key workflowkit.StageKey) workflowadapter.StageBindingType {
+	t.Helper()
+	switch key {
+	case workflowkit.StageKey(workflowadapter.RepoPrepare):
+		return workflowadapter.StageBindingRepoPrepare
+	case workflowkit.StageKey(workflowadapter.RepoAnalyze):
+		return workflowadapter.StageBindingRepoAnalyze
+	case workflowkit.StageKey(workflowadapter.TaskDesign):
+		return workflowadapter.StageBindingTaskDesign
+	case workflowkit.StageKey(workflowadapter.TaskReview):
+		return workflowadapter.StageBindingTaskReview
+	case workflowkit.StageKey(workflowadapter.GenerateTaskFiles):
+		return workflowadapter.StageBindingGenerateTaskFiles
+	case workflowkit.StageKey(workflowadapter.InstructionGen):
+		return workflowadapter.StageBindingInstructionGen
+	case workflowkit.StageKey(workflowadapter.TaskTOMLGen):
+		return workflowadapter.StageBindingTaskTOMLGen
+	case workflowkit.StageKey(workflowadapter.DockerfileGen):
+		return workflowadapter.StageBindingDockerfileGen
+	case workflowkit.StageKey(workflowadapter.DockerfileBuildValidate):
+		return workflowadapter.StageBindingDockerfileBuildValidate
+	case workflowkit.StageKey(workflowadapter.ContentReview):
+		return workflowadapter.StageBindingContentReview
+	case workflowkit.StageKey(workflowadapter.SolveGen):
+		return workflowadapter.StageBindingSolveGen
+	case workflowkit.StageKey(workflowadapter.TestGen):
+		return workflowadapter.StageBindingTestGen
+	case workflowkit.StageKey(workflowadapter.AuthoringHarness):
+		return workflowadapter.StageBindingAuthoringHarness
+	case workflowkit.StageKey(workflowadapter.TestsAnalysis):
+		return workflowadapter.StageBindingTestsAnalysis
+	case workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission):
+		return workflowadapter.StageBindingCodeEdgePackageAdmission
+	case workflowkit.StageKey(workflowadapter.SolutionReview):
+		return workflowadapter.StageBindingSolutionReview
+	case workflowkit.StageKey(workflowadapter.MaterializeTask):
+		return workflowadapter.StageBindingMaterializeTask
+	default:
+		t.Fatalf("unsupported authoring test stage %q", key)
+		return ""
+	}
+}
+
 func TestStandardAuthoringCodexAgentTurnExecutorRetriesWrappedTaskTOMLWithinTurn(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
@@ -1274,6 +1567,7 @@ type standardAuthoringCodexConversationStub struct {
 	dynamicTools        []agent.DynamicTool
 	submissionResponses []json.RawMessage
 	submissionErrors    []error
+	beforeSubmissions   func(int) error
 	afterSubmissions    func(int) error
 	closed              int
 	closeErr            error
@@ -1284,6 +1578,11 @@ func (conversation *standardAuthoringCodexConversationStub) Turn(ctx context.Con
 	index := len(conversation.requests) - 1
 	if index < len(conversation.errors) && conversation.errors[index] != nil {
 		return agent.TurnResult{}, conversation.errors[index]
+	}
+	if conversation.beforeSubmissions != nil {
+		if err := conversation.beforeSubmissions(index); err != nil {
+			return agent.TurnResult{}, err
+		}
 	}
 	if index < len(conversation.submissions) {
 		tool, found := standardAuthoringCodexTestDynamicTool(conversation.dynamicTools, standardAuthoringCodexSubmitToolName)

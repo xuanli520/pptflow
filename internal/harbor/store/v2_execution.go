@@ -27,6 +27,7 @@ const (
 	standardAuthoringRepairFeedbackParentTemplateVersion = "1.5.0"
 	standardAuthoringTestsAnalysisInputTemplateVersion   = "1.6.0"
 	standardAuthoringHarnessParentTemplateVersion        = "1.7.0"
+	standardAuthoringFixedFileParentTemplateVersion      = "1.8.0"
 	codeEdgePhase1ChildTemplateID                        = "harbor.codeedge-phase1"
 	codeEdgePhase1ChildTemplateVersion                   = "2.2.0"
 	standardAuthoringChildTrigger                        = "standard-authoring.materialized"
@@ -39,7 +40,8 @@ func isStandardAuthoringParentTemplateVersion(version string) bool {
 		standardAuthoringBriefParentTemplateVersion,
 		standardAuthoringRepairFeedbackParentTemplateVersion,
 		standardAuthoringTestsAnalysisInputTemplateVersion,
-		standardAuthoringHarnessParentTemplateVersion:
+		standardAuthoringHarnessParentTemplateVersion,
+		standardAuthoringFixedFileParentTemplateVersion:
 		return true
 	default:
 		return false

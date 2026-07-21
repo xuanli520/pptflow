@@ -1,0 +1,1 @@
+{"format":"harbor.standard-authoring-durable-review-decision.v1","version":"1","fields":["review_kind","decision","reason","evidence_references","decided_at"]}

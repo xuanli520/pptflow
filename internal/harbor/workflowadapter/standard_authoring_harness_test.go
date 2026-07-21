@@ -13,11 +13,12 @@ func TestStandardAuthoringHarnessTemplateBindsValidatedArtifacts(t *testing.T) {
 		t.Fatalf("validate 1.7.0 template: %v", err)
 	}
 	if !template.Reference().Equal(StandardAuthoringHarnessTemplateReference()) ||
-		!StandardAuthoringCurrentTemplateReference().Equal(template.Reference()) ||
-		!StandardAuthoringCurrentWorkflowTemplate().Reference().Equal(template.Reference()) ||
 		template.Catalog.Version != StandardAuthoringHarnessTemplateVersion ||
 		template.QuotaPolicy.Version != StandardAuthoringHarnessQuotaPolicyVersion {
 		t.Fatalf("harness identities = template %s catalog %s quota %s", template.Version, template.Catalog.Version, template.QuotaPolicy.Version)
+	}
+	if StandardAuthoringCurrentTemplateReference().Equal(template.Reference()) || StandardAuthoringCurrentWorkflowTemplate().Reference().Equal(template.Reference()) {
+		t.Fatal("historical 1.7.0 harness template remained current after fixed-file release")
 	}
 	order, err := StandardAuthoringStageOrderForTemplate(template.Reference())
 	if err != nil || !reflect.DeepEqual(order, StandardAuthoringHarnessStageOrder()) || len(order) != len(template.Catalog.Stages) {
@@ -76,6 +77,41 @@ func TestStandardAuthoringHarnessTemplateBindsValidatedArtifacts(t *testing.T) {
 	for _, output := range materialize.Outputs {
 		if output.Name == StandardAuthoringDockerfileBuildReportArtifact || output.Name == StandardAuthoringHarnessReportArtifact {
 			t.Fatalf("materialize leaked validation report %q into task outputs", output.Name)
+		}
+	}
+}
+
+func TestStandardAuthoringFixedFileTemplateIsCurrentWithoutTopologyDrift(t *testing.T) {
+	template := StandardAuthoringFixedFileWorkflowTemplate()
+	if err := template.Validate(); err != nil {
+		t.Fatalf("validate 1.8.0 template: %v", err)
+	}
+	if !template.Reference().Equal(StandardAuthoringFixedFileTemplateReference()) ||
+		!StandardAuthoringCurrentTemplateReference().Equal(template.Reference()) ||
+		!StandardAuthoringCurrentWorkflowTemplate().Reference().Equal(template.Reference()) ||
+		template.Catalog.Version != StandardAuthoringFixedFileTemplateVersion ||
+		template.QuotaPolicy.Version != StandardAuthoringFixedFileQuotaPolicyVersion {
+		t.Fatalf("fixed-file identities = template %s catalog %s quota %s", template.Version, template.Catalog.Version, template.QuotaPolicy.Version)
+	}
+	order, err := StandardAuthoringStageOrderForTemplate(template.Reference())
+	if err != nil || !reflect.DeepEqual(order, StandardAuthoringHarnessStageOrder()) || len(order) != len(template.Catalog.Stages) {
+		t.Fatalf("1.8.0 stage order = %v catalog=%d err=%v", order, len(template.Catalog.Stages), err)
+	}
+	harness := StandardAuthoringHarnessStageCatalog()
+	for _, fixed := range template.Catalog.Stages {
+		legacy, found := harness.Stage(fixed.Key)
+		if !found {
+			t.Fatalf("1.8.0 stage %q was not present in 1.7.0", fixed.Key)
+		}
+		switch fixed.Key {
+		case workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen):
+			if !reflect.DeepEqual(fixed.Verdicts, passOnly()) || reflect.DeepEqual(legacy.Verdicts, fixed.Verdicts) {
+				t.Fatalf("fixed-file script verdicts = fixed:%+v legacy:%+v", fixed.Verdicts, legacy.Verdicts)
+			}
+			legacy.Verdicts = fixed.Verdicts.Clone()
+		}
+		if !reflect.DeepEqual(fixed, legacy) {
+			t.Fatalf("1.8.0 stage %q drifted beyond its fixed-file verdict contract", fixed.Key)
 		}
 	}
 }

@@ -125,9 +125,9 @@ func newProductionPackageFixture(t *testing.T) productionPackageFixture {
 	copyPackagingFixtureFile(t, filepath.Join("..", "..", "scripts", "build-codeedge-production.sh"), script, 0o755)
 	copyPackagingFixtureFile(t, filepath.Join("..", "..", "docs", "PRODUCTION_PACKAGE.md"), filepath.Join(root, "docs", "PRODUCTION_PACKAGE.md"), 0o644)
 
-	writeProductionBundleFixture(t, root, "standard-authoring", []string{
+	writeProductionBundleFixture(t, root, "standard-authoring-1.8", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json", "contract-assets.v1.json", "execution-profile.v1.json",
-		"prompts/task-design.json", "schemas/codex-stage-output.schema.json",
+		"prompts/task-design.json", "schemas/codex-fixed-file-submit.schema.json", "schemas/codex-stage-output.schema.json",
 	})
 	writeProductionBundleFixture(t, root, "codeedge-phase1", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json",
@@ -365,8 +365,25 @@ func assertUnifiedProductionPackage(t *testing.T, fixture productionPackageFixtu
 			t.Fatalf("archive contains forbidden non-production material %q:\n%s", forbidden, archiveContents)
 		}
 	}
+	if strings.Contains(archiveContents, "deployments/standard-authoring-1.8/") {
+		t.Fatalf("archive leaked the Standard authoring source directory:\n%s", archiveContents)
+	}
 	if _, err := os.Stat(filepath.Join(output, "deployments", "codeedge-evaluator-child", "candidates")); !os.IsNotExist(err) {
 		t.Fatalf("candidate discovery directory was packaged: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(output, "deployments", "standard-authoring-1.8")); !os.IsNotExist(err) {
+		t.Fatalf("Standard authoring source directory leaked into package: %v", err)
+	}
+	sourceFixedSchema, err := os.ReadFile(filepath.Join(fixture.root, "deployments", "standard-authoring-1.8", "schemas", "codex-fixed-file-submit.schema.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packagedFixedSchema, err := os.ReadFile(filepath.Join(output, "deployments", "standard-authoring", "schemas", "codex-fixed-file-submit.schema.json"))
+	if err != nil {
+		t.Fatalf("canonical Standard authoring package lacks fixed-file schema: %v", err)
+	}
+	if !bytes.Equal(packagedFixedSchema, sourceFixedSchema) {
+		t.Fatal("canonical packaged fixed-file schema does not match the 1.8 source asset")
 	}
 }
 
@@ -385,6 +402,7 @@ func productionPackagePayloads() []string {
 		"deployments/standard-authoring/operation-catalog.lock.json",
 		"deployments/standard-authoring/operation-catalog.v1.json",
 		"deployments/standard-authoring/prompts/task-design.json",
+		"deployments/standard-authoring/schemas/codex-fixed-file-submit.schema.json",
 		"deployments/standard-authoring/schemas/codex-stage-output.schema.json",
 		"harbor-factory",
 		productionPackageArchiveName,

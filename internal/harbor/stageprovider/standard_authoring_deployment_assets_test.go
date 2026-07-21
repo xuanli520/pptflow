@@ -14,7 +14,8 @@ import (
 
 func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testing.T) {
 	root := standardAuthoringDeploymentRepositoryRoot(t)
-	catalogRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "operation-catalog.v1.json"))
+	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring-1.8")
+	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +30,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if !catalog.Template().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
 		t.Fatalf("catalog template = %s@%s, want Standard authoring", catalog.Template().ID, catalog.Template().Version)
 	}
-	profileRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "execution-profile.v1.json"))
+	profileRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "execution-profile.v1.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +43,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		t.Fatalf("compile Standard authoring execution profile: %v", err)
 	}
 
-	manifestRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "contract-assets.v1.json"))
+	manifestRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,15 +51,15 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 	if err != nil {
 		t.Fatalf("parse Standard authoring asset manifest: %v", err)
 	}
-	if len(catalog.Catalog().Operations) != len(manifest.Operations) || len(manifest.Operations) != len(workflowadapter.StandardAuthoringHarnessStageOrder()) {
-		t.Fatalf("catalog/manifest operation coverage = %d/%d, want %d", len(catalog.Catalog().Operations), len(manifest.Operations), len(workflowadapter.StandardAuthoringHarnessStageOrder()))
+	if len(catalog.Catalog().Operations) != len(manifest.Operations) || len(manifest.Operations) != len(workflowadapter.StandardAuthoringFixedFileStageOrder()) {
+		t.Fatalf("catalog/manifest operation coverage = %d/%d, want %d", len(catalog.Catalog().Operations), len(manifest.Operations), len(workflowadapter.StandardAuthoringFixedFileStageOrder()))
 	}
 
 	byStage := make(map[string]StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))
 	for _, entry := range manifest.Operations {
 		byStage[string(entry.StageKey)] = entry
 		for _, asset := range []StandardAuthoringContractAssetReference{entry.Prompt, entry.Schema} {
-			assetPath := filepath.Join(root, "deployments", "standard-authoring", filepath.FromSlash(asset.RelativePath))
+			assetPath := filepath.Join(deploymentRoot, filepath.FromSlash(asset.RelativePath))
 			info, err := os.Lstat(assetPath)
 			if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 				t.Fatalf("asset %q is not a regular non-symlink file: info=%v error=%v", asset.RelativePath, info, err)
@@ -91,7 +92,7 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskDesign) && payload.MaxTurns != workflowadapter.StandardAuthoringTaskDesignMaxTurns {
 			t.Fatalf("task_design max turns = %d, want %d", payload.MaxTurns, workflowadapter.StandardAuthoringTaskDesignMaxTurns)
 		}
-		promptRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", filepath.FromSlash(entry.Prompt.RelativePath)))
+		promptRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Prompt.RelativePath)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -102,19 +103,78 @@ func TestStandardAuthoringDeploymentCatalogAndAssetsAreExactAndLoadable(t *testi
 		if program.ID != entry.Prompt.ID || program.Version != entry.Prompt.Version || len(program.TurnPrompts) != payload.MaxTurns {
 			t.Fatalf("prompt program for %q does not match frozen manifest/payload", registration.Stage.Key)
 		}
-		if entry.Schema.ID != "standard-authoring.codex-stage-output-schema" || entry.Schema.Version != "1.0.0" || entry.Schema.RelativePath != "schemas/codex-stage-output.schema.json" {
+		usesFixedFileSchema := standardAuthoringCodexUsesFixedFileOutputSchema(catalog.Template(), registration.Stage.Key)
+		if usesFixedFileSchema {
+			if entry.Schema.ID != "standard-authoring.codex-fixed-file-submit-schema" || entry.Schema.Version != "1.0.0" || entry.Schema.RelativePath != "schemas/codex-fixed-file-submit.schema.json" {
+				t.Fatalf("fixed-file agent stage %q schema = %q@%q path %q", registration.Stage.Key, entry.Schema.ID, entry.Schema.Version, entry.Schema.RelativePath)
+			}
+		} else if entry.Schema.ID != "standard-authoring.codex-stage-output-schema" || entry.Schema.Version != "1.0.0" || entry.Schema.RelativePath != "schemas/codex-stage-output.schema.json" {
 			t.Fatalf("agent stage %q has non-Codex schema asset %q@%q", registration.Stage.Key, entry.Schema.ID, entry.Schema.Version)
 		}
-		schemaRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", filepath.FromSlash(entry.Schema.RelativePath)))
+		schemaRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := ValidateStandardAuthoringCodexOutputSchemaAsset(schemaRaw); err != nil {
+		if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(catalog.Template(), registration.Stage.Key, schemaRaw); err != nil {
 			t.Fatalf("validate canonical Codex schema asset for %q: %v", registration.Stage.Key, err)
 		}
 	}
 	if agentStages != 11 {
 		t.Fatalf("catalog Codex agent stages = %d, want 11", agentStages)
+	}
+}
+
+func TestStandardAuthoringHarnessV17DeploymentAssetsRemainFrozen(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring")
+	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogDocument, err := ParseDeploymentOperationCatalogJSON(catalogRaw)
+	if err != nil {
+		t.Fatalf("parse frozen 1.7 catalog: %v", err)
+	}
+	catalog, err := NewDeploymentOperationCatalogResolver(catalogDocument)
+	if err != nil {
+		t.Fatalf("resolve frozen 1.7 catalog: %v", err)
+	}
+	if !catalog.Template().Equal(workflowadapter.StandardAuthoringHarnessTemplateReference()) {
+		t.Fatalf("frozen catalog template = %s@%s, want 1.7.0", catalog.Template().ID, catalog.Template().Version)
+	}
+	manifestRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := ParseStandardAuthoringContractAssetManifestJSON(manifestRaw)
+	if err != nil {
+		t.Fatalf("parse frozen 1.7 manifest: %v", err)
+	}
+	if !manifest.Template.Equal(workflowadapter.StandardAuthoringHarnessTemplateReference()) || len(manifest.Operations) != len(workflowadapter.StandardAuthoringHarnessStageOrder()) {
+		t.Fatalf("frozen manifest = template:%+v operations:%d", manifest.Template, len(manifest.Operations))
+	}
+	byStage := make(map[workflowkit.StageKey]StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))
+	for _, entry := range manifest.Operations {
+		byStage[entry.StageKey] = entry
+	}
+	for _, registration := range catalog.Catalog().Operations {
+		if _, isAgentTurn := registration.Operation.Payload.(workflowadapter.AgentTurnOperationPayload); !isAgentTurn {
+			continue
+		}
+		entry, found := byStage[registration.Stage.Key]
+		if !found {
+			t.Fatalf("frozen agent stage %q is absent from manifest", registration.Stage.Key)
+		}
+		if entry.Schema.ID != "standard-authoring.codex-stage-output-schema" || entry.Schema.Version != "1.0.0" || entry.Schema.RelativePath != "schemas/codex-stage-output.schema.json" {
+			t.Fatalf("frozen agent stage %q schema = %+v", registration.Stage.Key, entry.Schema)
+		}
+		raw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(catalog.Template(), registration.Stage.Key, raw); err != nil {
+			t.Fatalf("validate frozen agent schema %q: %v", registration.Stage.Key, err)
+		}
 	}
 }
 
@@ -184,6 +244,45 @@ func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) 
 		}
 		if program.Version != test.version {
 			t.Fatalf("prompt %s version = %s, want %s", test.path, program.Version, test.version)
+		}
+	}
+}
+
+func TestStandardAuthoringFixedFilePromptsRequireWorkspaceWriteAndPassReceipt(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring-1.8")
+	for _, test := range []struct {
+		path    string
+		version string
+		file    string
+	}{
+		{path: "solve-generate.json", version: "1.6.0", file: "task/solution/solve.sh"},
+		{path: "test-generate.json", version: "1.7.0", file: "task/tests/test.sh"},
+	} {
+		raw, err := os.ReadFile(filepath.Join(deploymentRoot, "prompts", test.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", test.path, err)
+		}
+		if program.Version != test.version || len(program.TurnPrompts) != 1 {
+			t.Fatalf("fixed-file prompt %s = version %s turns %d", test.path, program.Version, len(program.TurnPrompts))
+		}
+		joined := strings.ToLower(program.TurnPrompts[0])
+		for _, required := range []string{
+			strings.ToLower(test.file), "harbor_submit_stage_output", "sole verdict field set to pass",
+			"model never submits artifact bytes", "final action", "do not encode the script as base64", "do not finish with prose alone",
+		} {
+			if !strings.Contains(joined, required) {
+				t.Fatalf("fixed-file prompt %s omits %q", test.path, required)
+			}
+		}
+		for _, forbidden := range []string{"sole artifact content_base64", "strictly decodable as standard base64", "bytes themselves"} {
+			if strings.Contains(joined, forbidden) {
+				t.Fatalf("fixed-file prompt %s retains base64 output contract %q", test.path, forbidden)
+			}
 		}
 	}
 }

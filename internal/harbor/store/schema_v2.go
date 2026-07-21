@@ -3595,6 +3595,8 @@ WHEN NOT EXISTS (
           (run.workflow_template_version = '1.6.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')
           OR
           (run.workflow_template_version = '1.7.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')
+          OR
+          (run.workflow_template_version = '1.8.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')
       )
       AND run.authoring_session_id = NEW.authoring_session_id
       AND run.subject_id = NEW.authoring_source_id

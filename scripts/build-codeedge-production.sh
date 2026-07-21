@@ -118,8 +118,8 @@ case "$output" in
     ;;
 esac
 
-standard_catalog="$root/deployments/standard-authoring/operation-catalog.v1.json"
-standard_lock="$root/deployments/standard-authoring/operation-catalog.lock.json"
+standard_catalog="$root/deployments/standard-authoring-1.8/operation-catalog.v1.json"
+standard_lock="$root/deployments/standard-authoring-1.8/operation-catalog.lock.json"
 parent_catalog="$root/deployments/codeedge-phase1/operation-catalog.v1.json"
 parent_lock="$root/deployments/codeedge-phase1/operation-catalog.lock.json"
 evaluator_catalog="$root/deployments/codeedge-evaluator-child/operation-catalog.v1.json"
@@ -146,7 +146,7 @@ export SOURCE_DATE_EPOCH="$source_epoch"
 
 # Every generated lock is omitted from the tree manifest. A lock carries this
 # digest itself, so including any one of the three would create a hash cycle.
-source_manifest="sha256:$(git -C "$root" ls-tree -r --full-tree "$source_commit" | LC_ALL=C awk -F '\t' '$2 != "deployments/standard-authoring/operation-catalog.lock.json" && $2 != "deployments/codeedge-phase1/operation-catalog.lock.json" && $2 != "deployments/codeedge-evaluator-child/operation-catalog.lock.json" { print $0 }' | sha256sum | awk '{print $1}')"
+source_manifest="sha256:$(git -C "$root" ls-tree -r --full-tree "$source_commit" | LC_ALL=C awk -F '\t' '$2 != "deployments/standard-authoring/operation-catalog.lock.json" && $2 != "deployments/standard-authoring-1.8/operation-catalog.lock.json" && $2 != "deployments/codeedge-phase1/operation-catalog.lock.json" && $2 != "deployments/codeedge-evaluator-child/operation-catalog.lock.json" { print $0 }' | sha256sum | awk '{print $1}')"
 
 workdir="$(mktemp -d "$output_parent/.harbor-flow-production.XXXXXX")"
 inputs="$workdir/inputs"
@@ -159,7 +159,7 @@ trap cleanup EXIT
 # The evaluator's candidates/ subtree is retained in source only as a
 # non-authoritative discovery record. It is deliberately excluded here rather
 # than treated as an input or copied into the release package.
-copy_deployment_tree "Standard authoring" "$root/deployments/standard-authoring" "$inputs/deployments/standard-authoring" 0
+copy_deployment_tree "Standard authoring 1.8" "$root/deployments/standard-authoring-1.8" "$inputs/deployments/standard-authoring" 0
 copy_deployment_tree "CodeEdge Phase-1" "$root/deployments/codeedge-phase1" "$inputs/deployments/codeedge-phase1" 0
 copy_deployment_tree "CodeEdge evaluator child" "$root/deployments/codeedge-evaluator-child" "$inputs/deployments/codeedge-evaluator-child" 1
 reject_nonproduction_material "$inputs/deployments"

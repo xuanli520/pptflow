@@ -84,6 +84,7 @@ func DefaultTemplateRegistry() TemplateRegistry {
 	standardAuthoringRepairFeedback := StandardAuthoringRepairFeedbackWorkflowTemplate()
 	standardAuthoringTestsAnalysisInput := StandardAuthoringTestsAnalysisInputWorkflowTemplate()
 	standardAuthoringHarness := StandardAuthoringHarnessWorkflowTemplate()
+	standardAuthoringFixedFile := StandardAuthoringFixedFileWorkflowTemplate()
 	codeEdge := CodeEdgePhase1WorkflowTemplate()
 	codeEdgeEvaluator := CodeEdgeEvaluatorChildWorkflowTemplate()
 	return TemplateRegistry{templates: map[templateReferenceKey]WorkflowTemplate{
@@ -94,6 +95,7 @@ func DefaultTemplateRegistry() TemplateRegistry {
 		templateKey(standardAuthoringRepairFeedback.Reference()):     standardAuthoringRepairFeedback,
 		templateKey(standardAuthoringTestsAnalysisInput.Reference()): standardAuthoringTestsAnalysisInput,
 		templateKey(standardAuthoringHarness.Reference()):            standardAuthoringHarness,
+		templateKey(standardAuthoringFixedFile.Reference()):          standardAuthoringFixedFile,
 		templateKey(codeEdge.Reference()):                            codeEdge,
 		templateKey(codeEdgeEvaluator.Reference()):                   codeEdgeEvaluator,
 	}}
@@ -129,6 +131,7 @@ func BuiltinTemplateReferences() []TemplateReference {
 		StandardAuthoringRepairFeedbackTemplateReference(),
 		StandardAuthoringTestsAnalysisInputTemplateReference(),
 		StandardAuthoringHarnessTemplateReference(),
+		StandardAuthoringFixedFileTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	}
@@ -149,6 +152,7 @@ func isBuiltinTemplateReference(reference TemplateReference) bool {
 		reference.Equal(StandardAuthoringRepairFeedbackTemplateReference()) ||
 		reference.Equal(StandardAuthoringTestsAnalysisInputTemplateReference()) ||
 		reference.Equal(StandardAuthoringHarnessTemplateReference()) ||
+		reference.Equal(StandardAuthoringFixedFileTemplateReference()) ||
 		reference.Equal(CodeEdgePhase1TemplateReference()) ||
 		reference.Equal(CodeEdgeEvaluatorChildTemplateReference())
 }

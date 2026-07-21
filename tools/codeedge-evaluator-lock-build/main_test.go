@@ -266,11 +266,25 @@ func TestBuildRejectsEndpointDriftWithoutReadingUnapprovedEnvironment(t *testing
 	}
 }
 
-func TestSourceBuildIdentityExcludesAllThreeGeneratedLocks(t *testing.T) {
+func TestSourceBuildIdentityExcludesAllGeneratedProductionLocks(t *testing.T) {
 	git := testGitExecutable(t)
 	root := t.TempDir()
 	writeGeneratorFile(t, filepath.Join(root, "stable.txt"), "stable\n", 0o600)
-	for lock := range generatedProductionLocks {
+	generatedLocks := []string{
+		"deployments/standard-authoring/operation-catalog.lock.json",
+		"deployments/standard-authoring-1.8/operation-catalog.lock.json",
+		"deployments/codeedge-phase1/operation-catalog.lock.json",
+		"deployments/codeedge-evaluator-child/operation-catalog.lock.json",
+	}
+	if len(generatedProductionLocks) != len(generatedLocks) {
+		t.Fatalf("generated lock paths = %v, want %v", generatedProductionLocks, generatedLocks)
+	}
+	for _, want := range generatedLocks {
+		if _, found := generatedProductionLocks[want]; !found {
+			t.Fatalf("generated lock paths omit %q: %v", want, generatedProductionLocks)
+		}
+	}
+	for _, lock := range generatedLocks {
 		writeGeneratorFile(t, filepath.Join(root, lock), "first lock\n", 0o600)
 	}
 	testGit(t, root, git, "init")
@@ -282,7 +296,7 @@ func TestSourceBuildIdentityExcludesAllThreeGeneratedLocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for lock := range generatedProductionLocks {
+	for _, lock := range generatedLocks {
 		writeGeneratorFile(t, filepath.Join(root, lock), "second lock\n", 0o600)
 	}
 	testGit(t, root, git, "add", "deployments")

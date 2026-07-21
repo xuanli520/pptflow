@@ -109,7 +109,9 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 	t.Helper()
 	deploymentRoot := t.TempDir()
 	sourceRoot := standardAuthoringProductionRepositoryRoot(t)
-	copyStandardAuthoringDeploymentTree(t, filepath.Join(sourceRoot, "deployments", "standard-authoring"), deploymentRoot)
+	// The repository source is versioned separately from the canonical runtime
+	// package directory. Production packaging stages 1.8 into standard-authoring.
+	copyStandardAuthoringDeploymentTree(t, filepath.Join(sourceRoot, "deployments", "standard-authoring-1.8"), deploymentRoot)
 	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
 	if err != nil {
 		t.Fatal(err)

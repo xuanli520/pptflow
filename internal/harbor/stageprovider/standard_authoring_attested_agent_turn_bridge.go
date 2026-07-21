@@ -213,7 +213,7 @@ func (bridge *StandardAuthoringAttestedAgentTurnBridge) loadProgramFromFrozenAss
 	if err != nil {
 		return StandardAuthoringCodexTurnProgram{}, ErrDeploymentOperationRuntimeAttestationFailed
 	}
-	if err := ValidateStandardAuthoringCodexOutputSchemaAsset(assets.Schema.Content); err != nil {
+	if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(attestation.CatalogReceipt.Template, invocation.Request.Stage.Key, assets.Schema.Content); err != nil {
 		return StandardAuthoringCodexTurnProgram{}, ErrDeploymentOperationRuntimeAttestationFailed
 	}
 	if err := verifyStandardAuthoringLockedProgram(attestation.Record, invocation, payload, program); err != nil {

@@ -426,6 +426,10 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if failure != "" {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failure), nil
 	}
+	sealedTemplate, usesFixedFileOutput, err := standardAuthoringCodexFixedFileInvocation(invocation)
+	if err != nil {
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+	}
 	if err := contextError(ctx); err != nil {
 		return standardAuthoringCodexInterrupted(), nil
 	}
@@ -437,7 +441,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
 	}
-	requestDocument, err := standardAuthoringCodexRequestDocument(request, program, inputs, inputFingerprint, environmentPolicy)
+	requestDocument, err := standardAuthoringCodexRequestDocument(request, sealedTemplate, program, inputs, inputFingerprint, environmentPolicy)
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
@@ -502,6 +506,19 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 		}
 		submission = workspaceSubmission
+	} else if usesFixedFileOutput {
+		if !standardAuthoringCodexInvocationWorkspaceWrite(attestedInvocation) || executor.workspaceMode != StandardAuthoringCodexWorkspaceRunScoped {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		taskRoot := filepath.Join(workspace, StandardAuthoringCodexAttemptTaskDirectory)
+		if err := standardAuthoringCodexPrepareFixedFileWorkspace(taskRoot, request.Stage); err != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureWorkspace), nil
+		}
+		fixedFileSubmission, err := newStandardAuthoringCodexFixedFileSubmission(request, taskRoot, program.MaxOutputBytes, int(maxSubmissions), executor.now)
+		if err != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		submission = fixedFileSubmission
 	} else {
 		outputSubmission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now, environmentPolicy)
 		if err != nil {
@@ -751,6 +768,35 @@ func standardAuthoringCodexUsesWorkspaceHarness(stageKey workflowkit.StageKey) b
 	return stageKey == workflowkit.StageKey(workflowadapter.DockerfileBuildValidate) || stageKey == workflowkit.StageKey(workflowadapter.AuthoringHarness)
 }
 
+// standardAuthoringCodexFixedFileInvocation proves the fixed-file route from
+// all three frozen identities before any attempt workspace is created. A
+// stage key alone is never enough: 1.7.0 solve/test must retain their locked
+// base64 submission contract even when a newer binary is installed.
+func standardAuthoringCodexFixedFileInvocation(invocation StageOperationInvocation) (workflowadapter.TemplateReference, bool, error) {
+	request := invocation.Request
+	fixedTemplate := workflowadapter.StandardAuthoringFixedFileTemplateReference()
+	workflowTemplate := workflowadapter.TemplateReference{ID: request.Execution.Workflow.ID, Version: request.Execution.Workflow.Version}
+	specification, err := workflowkitRequestExecutionSpec(request)
+	if err != nil {
+		// Direct legacy unit fixtures predate the opaque execution-spec
+		// binding. They can retain the ordinary base64 route, but must never
+		// select 1.8.0 without a sealed, matching specification.
+		if invocation.Resolution.Template.Equal(fixedTemplate) || workflowTemplate.Equal(fixedTemplate) {
+			return workflowadapter.TemplateReference{}, false, err
+		}
+		return workflowTemplate, false, nil
+	}
+	sealedTemplate := specification.Template
+	declaresFixed := sealedTemplate.Equal(fixedTemplate) || invocation.Resolution.Template.Equal(fixedTemplate) || workflowTemplate.Equal(fixedTemplate)
+	if declaresFixed {
+		if !sealedTemplate.Equal(fixedTemplate) || !invocation.Resolution.Template.Equal(fixedTemplate) || !workflowTemplate.Equal(fixedTemplate) {
+			return workflowadapter.TemplateReference{}, false, errors.New("fixed-file invocation template does not match its sealed execution specification")
+		}
+		return sealedTemplate, standardAuthoringCodexFixedFileStageKey(request.Stage.Key), nil
+	}
+	return sealedTemplate, false, nil
+}
+
 func standardAuthoringCodexQuotaClaim(stage workflowkit.StageDescriptor, dimension string) (int64, bool) {
 	var units int64
 	found := false
@@ -866,7 +912,7 @@ func standardAuthoringCodexDockerfileEnvironmentPolicy(stage workflowkit.StageDe
 	return policy, nil
 }
 
-func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) ([]byte, error) {
+func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, template workflowadapter.TemplateReference, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) ([]byte, error) {
 	outputs := make([]struct {
 		Name          string `json:"name"`
 		SchemaVersion string `json:"schema_version"`
@@ -903,7 +949,7 @@ func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionReq
 	}{
 		Format: StandardAuthoringCodexTurnRequestFormat, Version: StandardAuthoringCodexTurnRequestVersion,
 		ProgramID: program.ID, ProgramVersion: program.Version, ProgramFingerprint: program.Fingerprint,
-		OutputSchemaFingerprint: StandardAuthoringCodexOutputSchemaFingerprint(), StageKey: request.Stage.Key,
+		OutputSchemaFingerprint: StandardAuthoringCodexOutputSchemaFingerprintForTemplateStage(template, request.Stage.Key), StageKey: request.Stage.Key,
 		InputFingerprint: inputFingerprint, Inputs: inputs, FrozenEnvironmentPolicy: frozenEnvironmentPolicy, Outputs: outputs,
 	})
 }

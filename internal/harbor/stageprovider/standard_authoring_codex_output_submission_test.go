@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/agent"
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -128,6 +131,296 @@ func TestStandardAuthoringCodexOutputSubmissionRejectsInvalidCandidatesWithoutPe
 			}
 		})
 	}
+}
+
+func TestStandardAuthoringCodexFixedFileSubmissionPublishesOnlyHostReadBytes(t *testing.T) {
+	now := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name     string
+		stageKey workflowkit.StageKey
+		content  []byte
+	}{
+		{name: "solve", stageKey: workflowkit.StageKey(workflowadapter.SolveGen), content: []byte("#!/bin/sh\nset -eu\nprintf 'solution\\n'\n")},
+		{name: "test", stageKey: workflowkit.StageKey(workflowadapter.TestGen), content: []byte("#!/bin/sh\nset -eu\nprintf 'tests\\n'\n")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stage := standardAuthoringCodexFixedFileTestStage(t, testCase.stageKey)
+			taskRoot := t.TempDir()
+			relative, outputName, _, ok := standardAuthoringCodexFixedFileStageContract(stage)
+			if !ok {
+				t.Fatalf("fixed-file stage contract missing for %q", stage.Key)
+			}
+			path := filepath.Join(taskRoot, filepath.FromSlash(relative))
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, testCase.content, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			request, _, usages := standardAuthoringCodexFixedFileTestRequest(t, stage, now)
+			submission, err := newStandardAuthoringCodexFixedFileSubmission(request, taskRoot, 1024, 1, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := submission.beginTurn(1); err != nil {
+				t.Fatal(err)
+			}
+			tool := submission.dynamicTool()
+			var schema map[string]any
+			if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
+				t.Fatal(err)
+			}
+			properties, ok := schema["properties"].(map[string]any)
+			if !ok || len(properties) != 1 || properties["verdict"] == nil || schema["additionalProperties"] != false {
+				t.Fatalf("fixed-file tool schema = %#v", schema)
+			}
+			response, err := tool.Handler(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if !receipt.Accepted || len(receipt.Errors) != 0 || receipt.Digest != workflowkit.SHA256Fingerprint(testCase.content) {
+				t.Fatalf("fixed-file receipt = %+v", receipt)
+			}
+			accepted, found := submission.acceptedResult()
+			if !found || accepted.Outcome.Verdict != workflowkit.VerdictPass || len(accepted.Artifacts) != 1 ||
+				accepted.Artifacts[0].Name != outputName || string(accepted.Artifacts[0].Content) != string(testCase.content) {
+				t.Fatalf("accepted fixed-file result = %+v", accepted)
+			}
+			if len(*usages) != 1 || (*usages)[0].Dimension != standardAuthoringCodexOutputSubmissionQuotaDimension {
+				t.Fatalf("fixed-file charges = %+v", *usages)
+			}
+		})
+	}
+}
+
+func TestStandardAuthoringCodexOutputSchemaAssetsArePinnedByTemplateAndStage(t *testing.T) {
+	fixedTemplate := workflowadapter.StandardAuthoringFixedFileTemplateReference()
+	legacyTemplate := workflowadapter.StandardAuthoringHarnessTemplateReference()
+	fixedSchema := standardAuthoringCodexFixedFileOutputSchemaTemplate()
+	legacySchema := standardAuthoringCodexOutputSchemaTemplate()
+	for _, key := range []workflowkit.StageKey{
+		workflowkit.StageKey(workflowadapter.SolveGen),
+		workflowkit.StageKey(workflowadapter.TestGen),
+	} {
+		if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(fixedTemplate, key, fixedSchema); err != nil {
+			t.Fatalf("validate fixed schema for %q: %v", key, err)
+		}
+		if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(fixedTemplate, key, legacySchema); err == nil {
+			t.Fatalf("accepted legacy base64 schema for fixed-file stage %q", key)
+		}
+		if got := StandardAuthoringCodexOutputSchemaFingerprintForTemplateStage(fixedTemplate, key); got != StandardAuthoringCodexFixedFileOutputSchemaFingerprint() {
+			t.Fatalf("fixed schema fingerprint for %q = %q", key, got)
+		}
+		if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(legacyTemplate, key, legacySchema); err != nil {
+			t.Fatalf("validate legacy schema for %q: %v", key, err)
+		}
+		if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(legacyTemplate, key, fixedSchema); err == nil {
+			t.Fatalf("accepted fixed-file schema for frozen 1.7 stage %q", key)
+		}
+	}
+	if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(fixedTemplate, workflowkit.StageKey(workflowadapter.RepoAnalyze), legacySchema); err != nil {
+		t.Fatalf("validate ordinary fixed-template stage schema: %v", err)
+	}
+}
+
+func TestStandardAuthoringCodexFixedFileSubmissionRejectsInvalidOrUnsafeCandidates(t *testing.T) {
+	now := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	newSubmission := func(t *testing.T, content []byte, maxBytes int) (*standardAuthoringCodexOutputSubmission, string, *[]workflowkit.StageUsage) {
+		t.Helper()
+		stage := standardAuthoringCodexFixedFileTestStage(t, workflowkit.StageKey(workflowadapter.SolveGen))
+		taskRoot := t.TempDir()
+		relative, _, _, ok := standardAuthoringCodexFixedFileStageContract(stage)
+		if !ok {
+			t.Fatal("solve stage is missing fixed-file contract")
+		}
+		path := filepath.Join(taskRoot, filepath.FromSlash(relative))
+		if content != nil {
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, content, 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}
+		request, _, usages := standardAuthoringCodexFixedFileTestRequest(t, stage, now)
+		submission, err := newStandardAuthoringCodexFixedFileSubmission(request, taskRoot, maxBytes, 1, func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		return submission, path, usages
+	}
+
+	for _, testCase := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "missing verdict", raw: json.RawMessage(`{}`)},
+		{name: "non-pass verdict", raw: json.RawMessage(`{"verdict":"needs_repair"}`)},
+		{name: "extra field", raw: json.RawMessage(`{"verdict":"pass","artifacts":[]}`)},
+		{name: "duplicate verdict", raw: json.RawMessage(`{"verdict":"pass","verdict":"pass"}`)},
+		{name: "trailing JSON", raw: json.RawMessage(`{"verdict":"pass"} {}`)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			submission, _, usages := newSubmission(t, []byte("#!/bin/sh\nexit 0\n"), 1024)
+			response, err := submission.dynamicTool().Handler(context.Background(), testCase.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "wrong_verdict" {
+				t.Fatalf("invalid fixed-file receipt = %+v", receipt)
+			}
+			if _, accepted := submission.acceptedResult(); accepted || len(*usages) != 1 {
+				t.Fatalf("invalid fixed-file submission accepted=%t charges=%+v", accepted, *usages)
+			}
+		})
+	}
+
+	t.Run("missing fixed file", func(t *testing.T) {
+		submission, _, _ := newSubmission(t, nil, 1024)
+		response, err := submission.dynamicTool().Handler(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "candidate_unavailable" {
+			t.Fatalf("missing fixed-file receipt = %+v", receipt)
+		}
+	})
+
+	t.Run("invalid shell script", func(t *testing.T) {
+		submission, _, _ := newSubmission(t, []byte("exit 0\n"), 1024)
+		response, err := submission.dynamicTool().Handler(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "solve_script_invalid" {
+			t.Fatalf("invalid fixed script receipt = %+v", receipt)
+		}
+	})
+
+	t.Run("oversized fixed file", func(t *testing.T) {
+		submission, _, _ := newSubmission(t, []byte("#!/bin/sh\n"+strings.Repeat("x", 64)), 32)
+		response, err := submission.dynamicTool().Handler(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "byte_limit_exceeded" {
+			t.Fatalf("oversized fixed script receipt = %+v", receipt)
+		}
+	})
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(t *testing.T, path string)
+	}{
+		{
+			name: "symlink",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				target := filepath.Join(filepath.Dir(filepath.Dir(path)), "outside-script")
+				if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			},
+		},
+		{
+			name: "hardlink",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				target := filepath.Join(filepath.Dir(filepath.Dir(path)), "outside-script")
+				if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(target, path); err != nil {
+					t.Skipf("hardlinks unavailable: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name+" is rejected before publication", func(t *testing.T) {
+			submission, path, _ := newSubmission(t, []byte("#!/bin/sh\nexit 0\n"), 1024)
+			testCase.mutate(t, path)
+			response, err := submission.dynamicTool().Handler(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "candidate_unavailable" {
+				t.Fatalf("unsafe fixed script receipt = %+v", receipt)
+			}
+		})
+	}
+
+	t.Run("replacement between validation and publication", func(t *testing.T) {
+		original := []byte("#!/bin/sh\nprintf 'original\\n'\n")
+		replacement := []byte("#!/bin/sh\nprintf 'replacement\\n'\n")
+		submission, path, _ := newSubmission(t, original, 1024)
+		reads := 0
+		submission.readFixedFile = func(taskRoot, relative string, maxBytes int64) ([]byte, error) {
+			reads++
+			content, err := authoringharness.ReadFixedFileWithLimit(taskRoot, relative, maxBytes)
+			if err != nil || reads != 1 {
+				return content, err
+			}
+			if err := os.Remove(path); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(path, replacement, 0o750); err != nil {
+				return nil, err
+			}
+			return content, nil
+		}
+		response, err := submission.dynamicTool().Handler(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+		if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "candidate_changed_after_validation" || reads != 2 {
+			t.Fatalf("replacement receipt = %+v reads=%d", receipt, reads)
+		}
+		if _, accepted := submission.acceptedResult(); accepted {
+			t.Fatal("replacement after validation was published")
+		}
+	})
+}
+
+func standardAuthoringCodexFixedFileTestStage(t *testing.T, key workflowkit.StageKey) workflowkit.StageDescriptor {
+	t.Helper()
+	expected, found := workflowadapter.StandardAuthoringFixedFileStageCatalog().Stage(key)
+	if !found || len(expected.Outputs) != 1 {
+		t.Fatalf("fixed-file catalog stage %q = %+v found=%t", key, expected, found)
+	}
+	stage := standardAuthoringCodexTestArtifactStage(1, key, expected.Outputs[0].Name)
+	stage.Version = expected.Version
+	stage.Plugin = workflowkit.PluginBinding{ID: expected.Plugin.ID, Version: expected.Plugin.Version}
+	stage.Outputs = append([]workflowkit.ArtifactSpec(nil), expected.Outputs...)
+	stage.Verdicts = expected.Verdicts.Clone()
+	return stage
+}
+
+func standardAuthoringCodexFixedFileTestRequest(t *testing.T, stage workflowkit.StageDescriptor, now time.Time) (workflowkit.StageExecutionRequest, *[]workflowkit.StageCheckpoint, *[]workflowkit.StageUsage) {
+	t.Helper()
+	request, checkpoints, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+	template := workflowadapter.StandardAuthoringFixedFileTemplateReference()
+	request.Execution.Workflow.ID = template.ID
+	request.Execution.Workflow.Version = template.Version
+	return request, checkpoints, usages
 }
 
 func TestStandardAuthoringCodexOutputSubmissionDerivesClosedSchemaFromFrozenStage(t *testing.T) {

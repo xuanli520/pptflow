@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +20,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/purplevoid/harbor-factory/internal/agent"
+	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -35,6 +39,11 @@ const (
 	// supplied it, rather than asking a model to repeat identity fields.
 	standardAuthoringCodexCanonicalSubmissionFormat  = "harbor.standard-authoring-codex-stage-submission.v1"
 	standardAuthoringCodexCanonicalSubmissionVersion = "1"
+
+	// This is a separate, deployment-pinned schema for 1.8.0 solve/test
+	// fixed-file receipts. It intentionally has no artifacts/content_base64
+	// field: the host reads the exact fixed file after verdict=pass.
+	standardAuthoringCodexFixedFileOutputSchemaCanonicalJSON = `{"$id":"harbor.standard-authoring-codex-fixed-file-submit.v1","$schema":"http://json-schema.org/draft-07/schema#","additionalProperties":false,"properties":{"verdict":{"enum":["pass"],"type":"string"}},"required":["verdict"],"type":"object"}`
 )
 
 // standardAuthoringCodexOutputSubmission owns the one in-memory authority for
@@ -56,6 +65,15 @@ type standardAuthoringCodexOutputSubmission struct {
 	// the submission authority prevents a model response from selecting its own
 	// image after it has seen the policy in the first-turn request.
 	environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy
+
+	// fixedFileRelativePath is set only for the 1.8.0 workspace-backed solve
+	// and test producers. It is selected from the frozen stage key by the
+	// host, never supplied by the model. Those stages retain the ordinary
+	// output-submission accounting and result ownership, but their tool carries
+	// only verdict=pass and their bytes are read from this fixed workspace file.
+	fixedFileRelativePath string
+	taskRoot              string
+	readFixedFile         func(string, string, int64) ([]byte, error)
 
 	currentTurn int
 	attempts    int
@@ -131,6 +149,73 @@ func newStandardAuthoringCodexOutputSubmission(request workflowkit.StageExecutio
 	}, nil
 }
 
+// newStandardAuthoringCodexFixedFileSubmission creates the submission
+// authority for the two pre-harness scripts. The resulting stage artifact is
+// read from an attempt-scoped fixed file rather than echoed back through the
+// model tool call. This keeps arbitrary model output out of the artifact data
+// plane while preserving the normal bounded output_submission quota.
+func newStandardAuthoringCodexFixedFileSubmission(request workflowkit.StageExecutionRequest, taskRoot string, maxBytes int, maxAttempts int, now func() time.Time) (*standardAuthoringCodexOutputSubmission, error) {
+	submission, err := newStandardAuthoringCodexOutputSubmission(request, maxBytes, maxAttempts, now, nil)
+	if err != nil {
+		return nil, err
+	}
+	if request.Execution.Workflow.ID != workflowadapter.StandardAuthoringWorkflowTemplateID || request.Execution.Workflow.Version != workflowadapter.StandardAuthoringFixedFileTemplateVersion {
+		return nil, errors.New("Standard authoring Codex fixed-file submission requires template 1.8.0")
+	}
+	relative, outputName, _, ok := standardAuthoringCodexFixedFileStageContract(submission.stage)
+	expected, found := workflowadapter.StandardAuthoringFixedFileStageCatalog().Stage(submission.stage.Key)
+	if !ok || !found || submission.stage.Version != expected.Version || submission.stage.Plugin.ID != expected.Plugin.ID || submission.stage.Plugin.Version != expected.Plugin.Version ||
+		!reflect.DeepEqual(submission.stage.Outputs, expected.Outputs) || !reflect.DeepEqual(submission.stage.Verdicts, expected.Verdicts) ||
+		len(submission.stage.Outputs) != 1 || !submission.stage.Outputs[0].Required || submission.stage.Outputs[0].Name != outputName ||
+		!reflect.DeepEqual(submission.stage.Verdicts, workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}) {
+		return nil, errors.New("invalid Standard authoring Codex fixed-file stage contract")
+	}
+	absoluteTaskRoot, err := filepath.Abs(strings.TrimSpace(taskRoot))
+	if err != nil || strings.TrimSpace(taskRoot) == "" || filepath.Clean(absoluteTaskRoot) != taskRoot {
+		return nil, errors.New("invalid Standard authoring Codex fixed-file task workspace")
+	}
+	submission.fixedFileRelativePath = relative
+	// Retain the trusted exact task root only after the constructor has proved
+	// it is a clean absolute path. ReadFixedFile re-proves its directory and
+	// individual file safety at every submission.
+	submission.taskRoot = taskRoot
+	submission.readFixedFile = authoringharness.ReadFixedFileWithLimit
+	return submission, nil
+}
+
+// standardAuthoringCodexPrepareFixedFileWorkspace creates the one parent
+// directory selected by the frozen solve/test stage before the model begins.
+// The file itself deliberately does not exist yet: a pass without a newly
+// authored regular file is rejected by the host reader rather than inheriting
+// a deceptively valid placeholder.
+func standardAuthoringCodexPrepareFixedFileWorkspace(taskRoot string, stage workflowkit.StageDescriptor) error {
+	relative, _, _, ok := standardAuthoringCodexFixedFileStageContract(stage)
+	if !ok {
+		return errors.New("Standard authoring stage has no fixed-file workspace contract")
+	}
+	absoluteTaskRoot, err := filepath.Abs(strings.TrimSpace(taskRoot))
+	if err != nil || strings.TrimSpace(taskRoot) == "" || filepath.Clean(absoluteTaskRoot) != taskRoot {
+		return errors.New("invalid Standard authoring Codex fixed-file task workspace")
+	}
+	rootInfo, err := os.Lstat(taskRoot)
+	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return errors.New("Standard authoring Codex fixed-file task root is unsafe")
+	}
+	directory := filepath.Join(taskRoot, filepath.Dir(filepath.FromSlash(relative)))
+	if err := os.Mkdir(directory, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create Standard authoring Codex fixed-file directory: %w", err)
+	}
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil || directoryInfo.Mode()&os.ModeSymlink != 0 || !directoryInfo.IsDir() {
+		return errors.New("Standard authoring Codex fixed-file directory is unsafe")
+	}
+	path := filepath.Join(taskRoot, filepath.FromSlash(relative))
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("Standard authoring Codex fixed-file candidate unexpectedly exists")
+	}
+	return nil
+}
+
 func (submission *standardAuthoringCodexOutputSubmission) beginTurn(turn int) error {
 	if submission == nil || turn < 1 {
 		return errors.New("Standard authoring Codex output submission turn is invalid")
@@ -145,10 +230,16 @@ func (submission *standardAuthoringCodexOutputSubmission) beginTurn(turn int) er
 }
 
 func (submission *standardAuthoringCodexOutputSubmission) dynamicTool() agent.DynamicTool {
+	description := standardAuthoringCodexSubmitToolDescription(submission.stage.Key)
+	schema := standardAuthoringCodexSubmissionSchema(submission.stage)
+	if submission != nil && submission.fixedFileRelativePath != "" {
+		description = "Submit the host-selected fixed workspace file only after writing its final raw bytes under task/" + submission.fixedFileRelativePath + ". The only accepted argument is verdict=pass; artifact bytes, names, paths, schema, and validation are host-owned."
+		schema = standardAuthoringCodexFixedFileSubmissionSchema()
+	}
 	return agent.DynamicTool{
 		Name:        standardAuthoringCodexSubmitToolName,
-		Description: standardAuthoringCodexSubmitToolDescription(submission.stage.Key),
-		InputSchema: standardAuthoringCodexSubmissionSchema(submission.stage),
+		Description: description,
+		InputSchema: schema,
 		Handler:     submission.handle,
 	}
 }
@@ -173,7 +264,66 @@ func (submission *standardAuthoringCodexOutputSubmission) outputSchema() json.Ra
 	if submission == nil {
 		return nil
 	}
+	if submission.fixedFileRelativePath != "" {
+		return standardAuthoringCodexFixedFileSubmissionSchema()
+	}
 	return standardAuthoringCodexSubmissionSchema(submission.stage)
+}
+
+func standardAuthoringCodexFixedFileSubmissionSchema() json.RawMessage {
+	return json.RawMessage(append([]byte(nil), standardAuthoringCodexFixedFileOutputSchemaTemplate()...))
+}
+
+func standardAuthoringCodexFixedFileOutputSchemaTemplate() []byte {
+	return []byte(standardAuthoringCodexFixedFileOutputSchemaCanonicalJSON)
+}
+
+// StandardAuthoringCodexFixedFileOutputSchemaFingerprint identifies the
+// exact JSON Schema asset that protects 1.8.0 fixed-file solve/test turns.
+func StandardAuthoringCodexFixedFileOutputSchemaFingerprint() workflowkit.Fingerprint {
+	fingerprint, err := workflowkit.FingerprintBytes("harbor.standard-authoring-codex-fixed-file-submit-schema.v1", standardAuthoringCodexFixedFileOutputSchemaTemplate())
+	if err != nil {
+		panic("fixed Standard authoring Codex file-submission schema fingerprint: " + err.Error())
+	}
+	return fingerprint
+}
+
+// ValidateStandardAuthoringCodexFixedFileOutputSchemaAsset accepts only the
+// exact 1.8.0 deployment schema. The optional one terminal LF follows the
+// same lock-bound POSIX text-file rule as the legacy Codex output schema.
+func ValidateStandardAuthoringCodexFixedFileOutputSchemaAsset(raw []byte) error {
+	if len(raw) == 0 || len(raw) > standardAuthoringCodexContractAssetLimit {
+		return fmt.Errorf("%w: fixed-file output schema asset has invalid size", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := rejectDuplicateDeploymentCatalogJSONKeys(raw); err != nil {
+		return fmt.Errorf("%w: fixed-file output schema asset has duplicate fields", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if !json.Valid(raw) || !bytes.Equal(standardAuthoringCodexCanonicalAssetBody(raw), standardAuthoringCodexFixedFileOutputSchemaTemplate()) {
+		return fmt.Errorf("%w: fixed-file output schema asset is not the locked JSON Schema template", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	return nil
+}
+
+// ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage selects the
+// one schema that may be used for a frozen template/stage pair. 1.7.0
+// solve/test remains pinned to the legacy base64 schema; only 1.8.0 maps
+// those two keys to the fixed-file schema.
+func ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(template workflowadapter.TemplateReference, stageKey workflowkit.StageKey, raw []byte) error {
+	if standardAuthoringCodexUsesFixedFileOutputSchema(template, stageKey) {
+		return ValidateStandardAuthoringCodexFixedFileOutputSchemaAsset(raw)
+	}
+	return ValidateStandardAuthoringCodexOutputSchemaAsset(raw)
+}
+
+func StandardAuthoringCodexOutputSchemaFingerprintForTemplateStage(template workflowadapter.TemplateReference, stageKey workflowkit.StageKey) workflowkit.Fingerprint {
+	if standardAuthoringCodexUsesFixedFileOutputSchema(template, stageKey) {
+		return StandardAuthoringCodexFixedFileOutputSchemaFingerprint()
+	}
+	return StandardAuthoringCodexOutputSchemaFingerprint()
+}
+
+func standardAuthoringCodexUsesFixedFileOutputSchema(template workflowadapter.TemplateReference, stageKey workflowkit.StageKey) bool {
+	return template.Equal(workflowadapter.StandardAuthoringFixedFileTemplateReference()) && standardAuthoringCodexFixedFileStageKey(stageKey)
 }
 
 func standardAuthoringCodexSubmissionSchema(stage workflowkit.StageDescriptor) json.RawMessage {
@@ -273,6 +423,9 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 	if len(raw) == 0 || len(raw) > submission.maxBytes {
 		return standardAuthoringCodexSubmissionResponse(false, []string{"byte_limit_exceeded"}, remaining, digest)
 	}
+	if submission.fixedFileRelativePath != "" {
+		return submission.handleFixedFileCandidate(ctx, raw, turn, remaining, digest)
+	}
 
 	result, canonicalDigest, diagnostic := standardAuthoringCodexValidateSubmissionCandidate(raw, submission.stage, turn, submission.environmentPolicy)
 	if diagnostic != "" {
@@ -292,6 +445,120 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 	}
 	submission.accepted = &standardAuthoringCodexAcceptedOutput{result: cloneStandardAuthoringCodexStageResult(result)}
 	return standardAuthoringCodexSubmissionResponse(true, nil, submission.remainingLocked(), canonicalDigest)
+}
+
+// handleFixedFileCandidate admits only a pass receipt for the host-selected
+// fixed file. The second safe read closes the gap between structural checking
+// and publishing the immutable StageArtifact: an edit after validation must
+// be submitted and checked again, never silently become the accepted bytes.
+func (submission *standardAuthoringCodexOutputSubmission) handleFixedFileCandidate(ctx context.Context, raw json.RawMessage, turn, remaining int, rawDigest workflowkit.Fingerprint) (json.RawMessage, error) {
+	if !standardAuthoringCodexFixedFilePassCandidate(raw) {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"wrong_verdict"}, remaining, rawDigest)
+	}
+	_, outputName, _, ok := standardAuthoringCodexFixedFileStageContract(submission.stage)
+	if !ok || submission.fixedFileRelativePath == "" || submission.taskRoot == "" {
+		submission.mu.Lock()
+		submission.failureCode = standardAuthoringCodexFailureConfiguration
+		submission.mu.Unlock()
+		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_unavailable"}, remaining, rawDigest)
+	}
+	if submission.readFixedFile == nil {
+		submission.mu.Lock()
+		submission.failureCode = standardAuthoringCodexFailureConfiguration
+		submission.mu.Unlock()
+		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_unavailable"}, remaining, rawDigest)
+	}
+	candidate, err := submission.readFixedFile(submission.taskRoot, submission.fixedFileRelativePath, int64(submission.maxBytes))
+	if err != nil {
+		if errors.Is(err, authoringharness.ErrFixedFileExceedsLimit) {
+			return standardAuthoringCodexSubmissionResponse(false, []string{"byte_limit_exceeded"}, remaining, rawDigest)
+		}
+		return standardAuthoringCodexSubmissionResponse(false, []string{"candidate_unavailable"}, remaining, rawDigest)
+	}
+	if len(candidate) > submission.maxBytes {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"byte_limit_exceeded"}, remaining, workflowkit.SHA256Fingerprint(candidate))
+	}
+	artifact := workflowkit.StageArtifact{
+		Name: outputName, SchemaVersion: submission.stage.Outputs[0].SchemaVersion, Content: append([]byte(nil), candidate...), TurnOrdinal: turn,
+	}
+	if contentDiagnostic := standardAuthoringCodexArtifactContentDiagnostic(submission.stage.Key, []workflowkit.StageArtifact{artifact}); contentDiagnostic != "" {
+		return standardAuthoringCodexSubmissionResponse(false, []string{contentDiagnostic}, remaining, workflowkit.SHA256Fingerprint(candidate))
+	}
+	if err := contextError(ctx); err != nil {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_timeout"}, remaining, workflowkit.SHA256Fingerprint(candidate))
+	}
+	acceptedContent, err := submission.readFixedFile(submission.taskRoot, submission.fixedFileRelativePath, int64(submission.maxBytes))
+	if errors.Is(err, authoringharness.ErrFixedFileExceedsLimit) {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"byte_limit_exceeded"}, remaining, workflowkit.SHA256Fingerprint(candidate))
+	}
+	if err != nil || !bytes.Equal(candidate, acceptedContent) {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"candidate_changed_after_validation"}, remaining, workflowkit.SHA256Fingerprint(candidate))
+	}
+	if len(acceptedContent) > submission.maxBytes {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"byte_limit_exceeded"}, remaining, workflowkit.SHA256Fingerprint(acceptedContent))
+	}
+	result := workflowkit.StageExecutionResult{
+		Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: workflowkit.VerdictPass},
+		Artifacts: []workflowkit.StageArtifact{{
+			Name: outputName, SchemaVersion: submission.stage.Outputs[0].SchemaVersion, Content: append([]byte(nil), acceptedContent...), TurnOrdinal: turn,
+		}},
+	}
+	candidateDigest := workflowkit.SHA256Fingerprint(acceptedContent)
+
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if submission.accepted != nil {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"already_accepted"}, submission.remainingLocked(), candidateDigest)
+	}
+	if err := contextError(ctx); err != nil {
+		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_timeout"}, submission.remainingLocked(), candidateDigest)
+	}
+	submission.accepted = &standardAuthoringCodexAcceptedOutput{result: cloneStandardAuthoringCodexStageResult(result)}
+	return standardAuthoringCodexSubmissionResponse(true, nil, submission.remainingLocked(), candidateDigest)
+}
+
+type standardAuthoringCodexFixedFileSubmissionCandidate struct {
+	Verdict *workflowkit.Verdict `json:"verdict"`
+}
+
+func standardAuthoringCodexFixedFilePassCandidate(raw []byte) bool {
+	if len(raw) == 0 || rejectDuplicateDeploymentCatalogJSONKeys(raw) != nil {
+		return false
+	}
+	var candidate standardAuthoringCodexFixedFileSubmissionCandidate
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&candidate); err != nil {
+		return false
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return false
+	}
+	return candidate.Verdict != nil && *candidate.Verdict == workflowkit.VerdictPass
+}
+
+// standardAuthoringCodexFixedFileStageContract is deliberately closed to the
+// two pre-harness script producers. It is the only path authority for the
+// fixed-file submission mechanism.
+func standardAuthoringCodexFixedFileStageContract(stage workflowkit.StageDescriptor) (relative, outputName, diagnostic string, ok bool) {
+	switch stage.Key {
+	case workflowkit.StageKey(workflowadapter.SolveGen):
+		return authoringharness.SolveScriptRelativePath, "solve_script", "solve_script_invalid", true
+	case workflowkit.StageKey(workflowadapter.TestGen):
+		return authoringharness.TestScriptRelativePath, "test_script", "test_script_invalid", true
+	default:
+		return "", "", "", false
+	}
+}
+
+func standardAuthoringCodexFixedFileStageKey(stageKey workflowkit.StageKey) bool {
+	switch stageKey {
+	case workflowkit.StageKey(workflowadapter.SolveGen), workflowkit.StageKey(workflowadapter.TestGen):
+		return true
+	default:
+		return false
+	}
 }
 
 func (submission *standardAuthoringCodexOutputSubmission) acceptedResult() (workflowkit.StageExecutionResult, bool) {
