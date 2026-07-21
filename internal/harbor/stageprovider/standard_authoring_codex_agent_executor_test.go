@@ -76,8 +76,8 @@ func TestStandardAuthoringCodexAgentTurnExecutorRunsOnlyFrozenProgram(t *testing
 	if runtime.conversation.closed != 1 {
 		t.Fatalf("conversation close count = %d, want one", runtime.conversation.closed)
 	}
-	if len(*checkpoints) != 4 {
-		t.Fatalf("checkpoints = %+v, want ready/completed for two turns", *checkpoints)
+	if len(*checkpoints) != 3 {
+		t.Fatalf("checkpoints = %+v, want a completed first turn and the accepted second-turn preflight", *checkpoints)
 	}
 	for _, checkpoint := range *checkpoints {
 		if checkpoint.Resumable || strings.Contains(string(checkpoint.Payload), secret) || checkpoint.TurnOrdinal < 1 || checkpoint.TurnOrdinal > 2 {
@@ -196,11 +196,75 @@ func TestStandardAuthoringCodexAgentTurnExecutorAcceptsSubmissionOnThirtiethTurn
 	if len(runtime.conversation.requests) != turns || runtime.conversation.closed != 1 {
 		t.Fatalf("conversation requests=%d closes=%d, want %d/1", len(runtime.conversation.requests), runtime.conversation.closed, turns)
 	}
-	if len(*checkpoints) != 2*turns {
-		t.Fatalf("checkpoints = %d, want %d", len(*checkpoints), 2*turns)
+	if len(*checkpoints) != 2*turns-1 {
+		t.Fatalf("checkpoints = %d, want %d before the accepted terminal turn short-circuits", len(*checkpoints), 2*turns-1)
 	}
 	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != turns || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 1 {
 		t.Fatalf("usage records = %+v, want %d agent turns and one output submission", *usages, turns)
+	}
+}
+
+func TestStandardAuthoringCodexAgentTurnExecutorShortCircuitsAcceptedSubmission(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+	stage := standardAuthoringCodexTestStage(1)
+	conversation := &standardAuthoringCodexAcceptanceBlockingConversation{
+		candidate:  standardAuthoringCodexTestCandidate(t, workflowkit.VerdictPass, []byte("accepted-before-provider-completion")),
+		turnExited: make(chan struct{}),
+	}
+	runtime := &standardAuthoringCodexAcceptanceBlockingRuntime{conversation: conversation}
+	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, 1)
+	request, checkpoints, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+	ctx, cancel := context.WithCancel(context.Background())
+	conversation.afterSubmission = cancel
+	t.Cleanup(cancel)
+
+	type executionOutcome struct {
+		result workflowkit.StageExecutionResult
+		err    error
+	}
+	completed := make(chan executionOutcome, 1)
+	go func() {
+		result, err := executor.ExecuteAgentTurn(ctx, StageOperationInvocation{
+			Request: request,
+			Resolution: workflowadapter.StageOperationResolution{
+				StageKey:  stage.Key,
+				Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts))},
+			},
+		}, standardAuthoringCodexTestPayload(1))
+		completed <- executionOutcome{result: result, err: err}
+	}()
+
+	var outcome executionOutcome
+	select {
+	case outcome = <-completed:
+	case <-time.After(time.Second):
+		cancel()
+		select {
+		case <-completed:
+		case <-time.After(time.Second):
+			t.Fatal("accepted submission left the provider turn running after cancellation")
+		}
+		t.Fatal("accepted submission did not short-circuit the provider turn")
+	}
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	if outcome.result.Outcome.Status != workflowkit.StatusCompleted || outcome.result.Outcome.Verdict != workflowkit.VerdictPass || len(outcome.result.Artifacts) != 1 || string(outcome.result.Artifacts[0].Content) != "accepted-before-provider-completion" {
+		t.Fatalf("short-circuit result = %+v", outcome.result)
+	}
+	if conversation.closed != 1 || !conversation.closedAfterTurn {
+		t.Fatalf("conversation closure = closes:%d after-turn:%t, want 1/true", conversation.closed, conversation.closedAfterTurn)
+	}
+	receipt := standardAuthoringCodexTestSubmissionReceipt(t, conversation.submissionResponse)
+	if !receipt.Accepted || conversation.submissionErr != nil {
+		t.Fatalf("submission receipt=%+v err=%v", receipt, conversation.submissionErr)
+	}
+	if len(*checkpoints) != 1 || (*checkpoints)[0].Substep != "turn_ready" {
+		t.Fatalf("checkpoints = %+v, want only the pre-turn checkpoint", *checkpoints)
+	}
+	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != 1 || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 1 {
+		t.Fatalf("usage records = %+v, want one turn and one accepted submission", *usages)
 	}
 }
 
@@ -1262,3 +1326,62 @@ func (conversation *standardAuthoringCodexConversationStub) Close() error {
 
 var _ agent.Runtime = (*standardAuthoringCodexRuntimeStub)(nil)
 var _ agent.Conversation = (*standardAuthoringCodexConversationStub)(nil)
+
+// standardAuthoringCodexAcceptanceBlockingConversation models the precise
+// App Server failure mode: the host-owned dynamic tool has accepted immutable
+// output, while the provider keeps its turn open until the host cancels it.
+// Close blocks until Turn has returned, matching the production conversation
+// contract and proving the executor waits for provider cleanup before
+// materializing.
+type standardAuthoringCodexAcceptanceBlockingRuntime struct {
+	conversation *standardAuthoringCodexAcceptanceBlockingConversation
+}
+
+func (runtime *standardAuthoringCodexAcceptanceBlockingRuntime) OpenConversation(_ context.Context, request agent.ConversationRequest) (agent.Conversation, error) {
+	if runtime == nil || runtime.conversation == nil {
+		return nil, errors.New("missing acceptance-blocking test conversation")
+	}
+	runtime.conversation.dynamicTools = append([]agent.DynamicTool(nil), request.DynamicTools...)
+	return runtime.conversation, nil
+}
+
+type standardAuthoringCodexAcceptanceBlockingConversation struct {
+	dynamicTools       []agent.DynamicTool
+	candidate          json.RawMessage
+	afterSubmission    func()
+	submissionResponse json.RawMessage
+	submissionErr      error
+	turnExited         chan struct{}
+	closed             int
+	closedAfterTurn    bool
+}
+
+func (conversation *standardAuthoringCodexAcceptanceBlockingConversation) Turn(ctx context.Context, _ agent.TurnRequest) (agent.TurnResult, error) {
+	tool, found := standardAuthoringCodexTestDynamicTool(conversation.dynamicTools, standardAuthoringCodexSubmitToolName)
+	if !found || tool.Handler == nil {
+		return agent.TurnResult{}, errors.New("missing acceptance-blocking test output submission tool")
+	}
+	response, err := tool.Handler(ctx, append(json.RawMessage(nil), conversation.candidate...))
+	conversation.submissionResponse = append(json.RawMessage(nil), response...)
+	conversation.submissionErr = err
+	if err != nil {
+		close(conversation.turnExited)
+		return agent.TurnResult{}, err
+	}
+	if conversation.afterSubmission != nil {
+		conversation.afterSubmission()
+	}
+	<-ctx.Done()
+	close(conversation.turnExited)
+	return agent.TurnResult{}, ctx.Err()
+}
+
+func (conversation *standardAuthoringCodexAcceptanceBlockingConversation) Close() error {
+	<-conversation.turnExited
+	conversation.closedAfterTurn = true
+	conversation.closed++
+	return nil
+}
+
+var _ agent.Runtime = (*standardAuthoringCodexAcceptanceBlockingRuntime)(nil)
+var _ agent.Conversation = (*standardAuthoringCodexAcceptanceBlockingConversation)(nil)

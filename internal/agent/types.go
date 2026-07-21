@@ -107,7 +107,11 @@ type TurnUpdate struct {
 type TurnUpdateHandler func(TurnUpdate)
 
 // Conversation owns one ephemeral provider session. Callers must close it
-// after their final Turn.
+// after their final Turn. Close may also be called concurrently with an active
+// Turn to interrupt a host-owned terminal condition; implementations must
+// cause that Turn to return promptly, release session resources, and tolerate
+// repeated Close calls. Callers that require a strict cleanup ordering must
+// still wait for their active Turn call to return.
 type Conversation interface {
 	Turn(context.Context, TurnRequest) (TurnResult, error)
 	Close() error

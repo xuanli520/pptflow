@@ -46,6 +46,11 @@ const (
 	standardAuthoringCodexFailureInterrupted   = "standard_authoring_codex_agent_turn.interrupted"
 
 	standardAuthoringCodexContractAssetLimit = 1 << 20
+	// A successful host-owned submission must not be discarded merely because
+	// the parent stage context is canceled while the App Server is stopping.
+	// This is deliberately independent of that parent cancellation, but remains
+	// bounded so terminal source re-attestation cannot hang indefinitely.
+	standardAuthoringCodexAcceptedCleanupTimeout = 30 * time.Second
 )
 
 var (
@@ -352,6 +357,61 @@ type standardAuthoringCodexSubmissionAuthority interface {
 	failure() string
 }
 
+// standardAuthoringCodexSubmissionTool wraps the private submission authority
+// with a one-way, in-memory completion signal. The signal is emitted only
+// after the authority has installed its immutable accepted result. It carries
+// that defensive result copy so the executor never has to treat free model
+// text as completion authority.
+func standardAuthoringCodexSubmissionTool(submission standardAuthoringCodexSubmissionAuthority, accepted chan<- workflowkit.StageExecutionResult) agent.DynamicTool {
+	tool := submission.dynamicTool()
+	handler := tool.Handler
+	tool.Handler = func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+		response, err := handler(ctx, raw)
+		if err != nil || accepted == nil {
+			return response, err
+		}
+		if result, ok := submission.acceptedResult(); ok {
+			select {
+			case accepted <- result:
+			default:
+			}
+		}
+		return response, nil
+	}
+	return tool
+}
+
+type standardAuthoringCodexTurnCompletion struct {
+	result agent.TurnResult
+	err    error
+}
+
+// standardAuthoringCodexRunTurnUntilAccepted gives a successful private tool
+// submission precedence over an App Server that continues sampling after the
+// tool receipt. The derived context is canceled only after the accepted result
+// is immutable. Close is then an active-turn termination barrier, and Turn is
+// awaited before handing control back for source re-attestation and
+// materialization.
+func standardAuthoringCodexRunTurnUntilAccepted(ctx context.Context, conversation agent.Conversation, request agent.TurnRequest, accepted <-chan workflowkit.StageExecutionResult) (agent.TurnResult, error, workflowkit.StageExecutionResult, bool, error) {
+	turnCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	completed := make(chan standardAuthoringCodexTurnCompletion, 1)
+	go func() {
+		result, err := conversation.Turn(turnCtx, request)
+		completed <- standardAuthoringCodexTurnCompletion{result: result, err: err}
+	}()
+
+	select {
+	case completion := <-completed:
+		return completion.result, completion.err, workflowkit.StageExecutionResult{}, false, nil
+	case result := <-accepted:
+		cancel()
+		closeErr := conversation.Close()
+		completion := <-completed
+		return completion.result, completion.err, result, true, closeErr
+	}
+}
+
 // ExecuteAgentTurn implements AgentTurnOperationExecutor. It consumes every
 // declared frozen input through ReadInput, records secret-free checkpoints and
 // quota events for every real App Server turn, and admits only an artifact
@@ -449,6 +509,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		}
 		submission = outputSubmission
 	}
+	acceptedSubmissions := make(chan workflowkit.StageExecutionResult, 1)
 	conversation, err := runtime.OpenConversation(ctx, agent.ConversationRequest{
 		ProjectPath:       workspace,
 		Model:             attestedInvocation.ModelID,
@@ -463,13 +524,34 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		// App Server protocol logs contain only hashes in the current runtime, but
 		// an operation must not leave even those records in a managed workspace.
 		LogPath:      os.DevNull,
-		DynamicTools: []agent.DynamicTool{submission.dynamicTool()},
+		DynamicTools: []agent.DynamicTool{standardAuthoringCodexSubmissionTool(submission, acceptedSubmissions)},
 	})
 	if err != nil {
 		if contextError(ctx) != nil {
 			return standardAuthoringCodexInterrupted(), nil
 		}
 		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
+	}
+	finishAccepted := func(accepted workflowkit.StageExecutionResult, alreadyClosed bool, earlyCloseErr error) (workflowkit.StageExecutionResult, error) {
+		// Once the host has accepted a candidate, it owns the terminal result
+		// even if the model keeps sampling. Start this bounded cleanup context
+		// at acceptance time (not conversation-open time) so a long valid turn
+		// still receives its full source re-attestation budget. It is independent
+		// of parent cancellation, which may race after immutable acceptance.
+		acceptedCleanupContext, acceptedCleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), standardAuthoringCodexAcceptedCleanupTimeout)
+		defer acceptedCleanupCancel()
+		closeErr := earlyCloseErr
+		if !alreadyClosed {
+			closeErr = conversation.Close()
+		}
+		closedIdentity, verifyErr := executor.verifyFrozenSource(acceptedCleanupContext, request.Execution, sourceWorkspace)
+		if verifyErr != nil || closedIdentity != sourceIdentity {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+		}
+		if closeErr != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
+		}
+		return accepted, nil
 	}
 	for ordinal, prompt := range program.TurnPrompts {
 		turn := ordinal + 1
@@ -519,7 +601,13 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		if turn == 1 {
 			turnRequest.Input = []agent.InputPart{{Type: "text", Text: string(requestDocument)}}
 		}
-		result, turnErr := conversation.Turn(ctx, turnRequest)
+		result, turnErr, accepted, acceptedDuringTurn, acceptedCloseErr := standardAuthoringCodexRunTurnUntilAccepted(ctx, conversation, turnRequest, acceptedSubmissions)
+		if acceptedDuringTurn {
+			return finishAccepted(accepted, true, acceptedCloseErr)
+		}
+		if accepted, ok := submission.acceptedResult(); ok {
+			return finishAccepted(accepted, false, nil)
+		}
 		afterTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
 		if verifyErr != nil || afterTurnIdentity != sourceIdentity {
 			_ = conversation.Close()
@@ -552,18 +640,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
 		}
 		if accepted, ok := submission.acceptedResult(); ok {
-			closeErr := conversation.Close()
-			closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
-			if verifyErr != nil || closedIdentity != sourceIdentity {
-				if contextError(ctx) != nil {
-					return standardAuthoringCodexInterrupted(), nil
-				}
-				return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
-			}
-			if closeErr != nil {
-				return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
-			}
-			return accepted, nil
+			return finishAccepted(accepted, false, nil)
 		}
 	}
 	closeErr := conversation.Close()
