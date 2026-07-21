@@ -62,6 +62,25 @@ type TaskBoardTask struct {
 	Runs            []TaskBoardRun
 }
 
+// TaskBoardAuthoringLaunch is a failed Standard source-capture operation that
+// has not created a Task yet. It stays distinct from TaskBoardTask so the TUI
+// never invents a Task or Run identity for a pre-materialization failure.
+type TaskBoardAuthoringLaunch struct {
+	OperationID    string
+	RepositoryURL  string
+	CommitSHA      string
+	Slug           string
+	Title          string
+	TaskType       string
+	Application    string
+	Objective      string
+	Status         string
+	FailureCode    string
+	FailureSummary string
+	CreatedAt      time.Time
+	CanRetry       bool
+}
+
 // TaskBoardRun is the compact, presentation-neutral run history shown from a
 // task detail. It contains durable facts only and never exposes a direct
 // filesystem capability to the terminal adapter.
@@ -126,8 +145,9 @@ type TaskBoardLog struct {
 
 // TaskBoardSnapshot is a read-only point-in-time board projection.
 type TaskBoardSnapshot struct {
-	Tasks              []TaskBoardTask
-	AuthoringAvailable bool
+	Tasks                    []TaskBoardTask
+	PendingAuthoringLaunches []TaskBoardAuthoringLaunch
+	AuthoringAvailable       bool
 }
 
 // TaskBoardStartAuthoringRequest contains the caller-selected immutable task
@@ -185,6 +205,13 @@ type TaskBoardRetryRunRequest struct {
 	Reason         string
 }
 
+// TaskBoardRetryAuthoringLaunchRequest targets a failed pre-Task source
+// capture. It intentionally accepts no new idempotency key, actor, or reason:
+// the service reconstructs and replays the immutable original launch command.
+type TaskBoardRetryAuthoringLaunchRequest struct {
+	OperationID string
+}
+
 // TaskBoardCancelRunRequest requests durable termination for the selected
 // Run. It never cancels a local process directly.
 type TaskBoardCancelRunRequest struct {
@@ -197,9 +224,10 @@ type TaskBoardCancelRunRequest struct {
 // TaskBoardMutation is the small success result a TUI needs to refresh its
 // projection and report the durable effect without interpreting raw records.
 type TaskBoardMutation struct {
-	TaskID  string
-	RunID   string
-	Summary string
+	OperationID string
+	TaskID      string
+	RunID       string
+	Summary     string
 }
 
 // TaskBoardGateway is the complete application boundary used by the TUI. It
@@ -211,6 +239,7 @@ type TaskBoardGateway interface {
 	DecideReview(context.Context, TaskBoardDecideReviewRequest) (TaskBoardMutation, error)
 	ReadRunLog(context.Context, TaskBoardReadRunLogRequest) (TaskBoardLog, error)
 	RetryRun(context.Context, TaskBoardRetryRunRequest) (TaskBoardMutation, error)
+	RetryAuthoringLaunch(context.Context, TaskBoardRetryAuthoringLaunchRequest) (TaskBoardMutation, error)
 	CancelRun(context.Context, TaskBoardCancelRunRequest) (TaskBoardMutation, error)
 	FlushQueuedRuns(context.Context) error
 }
@@ -263,8 +292,9 @@ func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspec
 	}
 }
 
-// List projects every non-deleted task through LifecycleInspectionService.
-// The TUI therefore never opens SQLite or reconstructs review/run ownership.
+// List projects every non-deleted Task through LifecycleInspectionService plus
+// durable failed pre-Task authoring launches. The TUI therefore never opens
+// SQLite or reconstructs review/run or launch-recovery ownership.
 func (service *TaskBoardService) List(ctx context.Context) (TaskBoardSnapshot, error) {
 	if service == nil || service.core == nil || service.core.store == nil || service.inspection == nil {
 		return TaskBoardSnapshot{}, fmt.Errorf("task board service is not configured")
@@ -283,8 +313,9 @@ func (service *TaskBoardService) List(ctx context.Context) (TaskBoardSnapshot, e
 		return tasks[left].ID < tasks[right].ID
 	})
 	snapshot := TaskBoardSnapshot{
-		Tasks:              make([]TaskBoardTask, 0, len(tasks)),
-		AuthoringAvailable: service.authoring != nil && service.authoring.Available(),
+		Tasks:                    make([]TaskBoardTask, 0, len(tasks)),
+		PendingAuthoringLaunches: make([]TaskBoardAuthoringLaunch, 0),
+		AuthoringAvailable:       service.authoring != nil && service.authoring.Available(),
 	}
 	for _, task := range tasks {
 		detail, err := service.inspection.ReadTaskDetail(ctx, TaskInspectionQuery{TaskID: task.ID})
@@ -296,6 +327,30 @@ func (service *TaskBoardService) List(ctx context.Context) (TaskBoardSnapshot, e
 			return TaskBoardSnapshot{}, fmt.Errorf("project task board task %s: %w", task.ID, err)
 		}
 		snapshot.Tasks = append(snapshot.Tasks, projected)
+	}
+	if service.authoring != nil {
+		canRetry := service.authoring.Available()
+		launches, err := service.authoring.listFailedPreTaskLaunches(ctx)
+		if err != nil {
+			return TaskBoardSnapshot{}, fmt.Errorf("list failed Standard authoring source captures: %w", err)
+		}
+		for _, launch := range launches {
+			snapshot.PendingAuthoringLaunches = append(snapshot.PendingAuthoringLaunches, TaskBoardAuthoringLaunch{
+				OperationID:    launch.Operation.ID,
+				RepositoryURL:  launch.Request.RepositoryURL,
+				CommitSHA:      launch.Request.CommitSHA,
+				Slug:           launch.Request.Slug,
+				Title:          launch.Request.Title,
+				TaskType:       launch.Request.TaskType,
+				Application:    launch.Request.Application,
+				Objective:      launch.Request.Objective,
+				Status:         "source_capture_failed",
+				FailureCode:    launch.Failure.Code,
+				FailureSummary: launch.Failure.Summary,
+				CreatedAt:      launch.Operation.CreatedAt,
+				CanRetry:       canRetry,
+			})
+		}
 	}
 	return snapshot, nil
 }
@@ -542,6 +597,28 @@ func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoard
 	default:
 		return TaskBoardMutation{}, fmt.Errorf("Run %s has no retry contract", prepared.RunID)
 	}
+}
+
+// RetryAuthoringLaunch replays the one immutable authoring.start command that
+// produced the selected durable source-capture failure. It never turns the
+// operation into a synthetic Task/Run retry and never accepts new mutable
+// launch input from the terminal.
+func (service *TaskBoardService) RetryAuthoringLaunch(ctx context.Context, request TaskBoardRetryAuthoringLaunchRequest) (TaskBoardMutation, error) {
+	if service == nil || service.authoring == nil || !service.authoring.Available() {
+		return TaskBoardMutation{}, ErrStandardAuthoringLaunchUnavailable
+	}
+	operationID := strings.TrimSpace(request.OperationID)
+	if err := store.ValidateUUIDv7(operationID); err != nil {
+		return TaskBoardMutation{}, fmt.Errorf("task board Standard authoring launch operation ID: %w", err)
+	}
+	receipt, err := service.authoring.retryFailedPreTaskLaunch(ctx, operationID)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	if err := service.FlushQueuedRuns(ctx); err != nil {
+		return TaskBoardMutation{}, err
+	}
+	return TaskBoardMutation{OperationID: receipt.OperationID, TaskID: receipt.TaskID, RunID: receipt.RunID, Summary: receipt.Summary}, nil
 }
 
 func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string) (TaskBoardMutation, error) {

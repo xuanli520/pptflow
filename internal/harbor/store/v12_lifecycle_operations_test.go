@@ -136,6 +136,44 @@ func TestLifecycleOperationRetainsExpectedIdentitySeparatelyFromTargetIdentity(t
 	}
 }
 
+func TestListPreparedLifecycleOperationsByActionExcludesCompletedAndOtherActions(t *testing.T) {
+	ctx := context.Background()
+	s := tempDB(t)
+	first, err := s.BeginLifecycleOperation(ctx, BeginLifecycleOperationRequest{
+		IdempotencyKey: mustUUIDv7(t), Action: "authoring.start", RequestFingerprint: "sha256:prepared-authoring",
+		TaskID: mustUUIDv7(t), RunID: mustUUIDv7(t), Actor: "tester", Reason: "project recoverable launch",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.BeginLifecycleOperation(ctx, BeginLifecycleOperationRequest{
+		IdempotencyKey: mustUUIDv7(t), Action: "authoring.start", RequestFingerprint: "sha256:completed-authoring",
+		TaskID: mustUUIDv7(t), RunID: mustUUIDv7(t), Actor: "tester", Reason: "complete another launch",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteLifecycleOperation(ctx, CompleteLifecycleOperationRequest{
+		OperationID: second.Operation.ID, ExpectedVersion: second.Operation.Version, ResultJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginLifecycleOperation(ctx, BeginLifecycleOperationRequest{
+		IdempotencyKey: mustUUIDv7(t), Action: "task.create", RequestFingerprint: "sha256:prepared-task",
+		TaskID: mustUUIDv7(t), Actor: "tester", Reason: "unrelated prepared operation",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	operations, err := s.ListPreparedLifecycleOperationsByAction(ctx, "authoring.start")
+	if err != nil || len(operations) != 1 || operations[0].ID != first.Operation.ID || operations[0].State != LifecycleOperationPrepared {
+		t.Fatalf("prepared authoring operations = %+v, %v", operations, err)
+	}
+	if _, err := s.ListPreparedLifecycleOperationsByAction(ctx, " "); err == nil {
+		t.Fatal("blank lifecycle action was accepted")
+	}
+}
+
 func TestLifecycleOperationIdentityParticipatesInGlobalUUIDv7Registry(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)

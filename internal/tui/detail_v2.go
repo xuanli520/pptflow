@@ -20,6 +20,22 @@ func newDetailModel(task *TaskItem) *detailModel {
 	return &detailModel{task: task}
 }
 
+func (d *detailModel) authoringLaunch() *app.TaskBoardAuthoringLaunch {
+	if d == nil || d.task == nil {
+		return nil
+	}
+	return d.task.AuthoringLaunch
+}
+
+func (d *detailModel) hasAuthoringLaunch() bool {
+	return d.authoringLaunch() != nil
+}
+
+func (d *detailModel) canRetryAuthoringLaunch() bool {
+	launch := d.authoringLaunch()
+	return launch != nil && launch.CanRetry
+}
+
 func (d *detailModel) currentRun() *TaskRunItem {
 	if d == nil || d.task == nil {
 		return nil
@@ -61,6 +77,9 @@ func (d *detailModel) View(width, height int) string {
 	if d == nil || d.task == nil {
 		return mutedStyle.Render("未选择题目")
 	}
+	if d.hasAuthoringLaunch() {
+		return d.authoringLaunchView(width)
+	}
 	contentWidth := max(24, width)
 	title := ansi.TruncateWc(d.task.Name, max(1, contentWidth-2), "...")
 	summary := ansi.TruncateWc("任务状态: "+d.task.Lifecycle+"  ·  标识: "+d.task.Slug, contentWidth, "...")
@@ -101,6 +120,38 @@ func (d *detailModel) View(width, height int) string {
 	} else if d.task.OpenReviews > 1 {
 		parts = append(parts, renderDetailSection("审核", failStyleV2.Render("存在多个待处理审核，请使用 CLI 选择明确的审核请求"), contentWidth))
 	}
+	return lipgloss.NewStyle().Width(contentWidth).Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
+}
+
+func (d *detailModel) authoringLaunchView(width int) string {
+	launch := d.authoringLaunch()
+	if launch == nil {
+		return mutedStyle.Render("未选择源码捕获启动")
+	}
+	contentWidth := max(24, width)
+	title := ansi.TruncateWc(launch.Title, max(1, contentWidth-2), "...")
+	parts := []string{
+		detailBreadcrumbStyle.Render("题目管理 / 启动恢复"),
+		detailTitleStyle.Width(max(1, contentWidth-2)).Render(title),
+		detailSubtitleStyle.Render("源码捕获失败，尚未创建 Task"),
+		renderDetailSection("来源", detailFields(contentWidth,
+			detailField("仓库", launch.RepositoryURL, contentWidth),
+			detailField("Commit SHA", launch.CommitSHA, contentWidth),
+		), contentWidth),
+		renderDetailSection("启动", detailFields(contentWidth,
+			detailField("标识", launch.Slug, contentWidth),
+			detailField("操作 ID", launch.OperationID, contentWidth),
+			detailField("状态", launch.Status, contentWidth),
+			detailField("创建时间", formatDetailTime(&launch.CreatedAt), contentWidth),
+		), contentWidth),
+	}
+	failure := []string{detailField("错误码", launch.FailureCode, contentWidth)}
+	summary := strings.TrimSpace(launch.FailureSummary)
+	if summary == "" {
+		summary = "未提供错误摘要"
+	}
+	failure = append(failure, failStyleV2.Render(ansi.WrapWc(ansi.Strip(summary), max(1, contentWidth-6), "")))
+	parts = append(parts, renderDetailSection("失败原因", detailFields(contentWidth, failure...), contentWidth))
 	return lipgloss.NewStyle().Width(contentWidth).Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
 }
 

@@ -69,6 +69,94 @@ func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
 	}
 }
 
+func TestTaskBoardProjectsAndRetriesFailedPreTaskSourceCaptureAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	capturer := &standardAuthoringSourceCapturerFixture{
+		coordinate: standardAuthoringLaunchTestCoordinate,
+		snapshot:   standardAuthoringLaunchTestSnapshot(t, standardAuthoringLaunchTestCoordinate),
+		failures:   1,
+	}
+	definitions := standardAuthoringLaunchTestDefinitionProvider(t)
+	services, err := NewLifecycleServicesWithOptions(root, database, standardAuthoringLaunchTestOptions(capturer, definitions, definitions.catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.TaskBoard.actor = func() (string, error) { return "task-board-capture-recovery", nil }
+	key, err := services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := TaskBoardStartAuthoringRequest{
+		IdempotencyKey: key,
+		RepositoryURL:  standardAuthoringLaunchTestCoordinate.RepositoryURL,
+		CommitSHA:      standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:      taskBoardAuthoringTestBaseImage,
+		Slug:           "pre-task-source-capture-recovery",
+		Title:          "Pre-Task source capture recovery",
+		TaskType:       "feature",
+		Application:    "backend",
+		Objective:      "Recover a failed source capture after the TUI restarts",
+		MetadataJSON:   `{}`,
+		Reason:         "exercise durable pre-Task source capture recovery",
+	}
+	if _, err := services.TaskBoard.StartAuthoring(ctx, request); err == nil {
+		t.Fatal("initial source capture unexpectedly succeeded")
+	}
+	operation, err := database.GetLifecycleOperationByIdempotencyKey(ctx, key)
+	if err != nil || operation == nil || operation.State != store.LifecycleOperationPrepared {
+		t.Fatalf("prepared source-capture operation = %+v, %v", operation, err)
+	}
+	if task, err := database.GetTaskV2(ctx, operation.TaskID); err != nil || task != nil {
+		t.Fatalf("failed pre-Task capture created Task = %+v, %v", task, err)
+	}
+
+	firstSnapshot, err := services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatalf("list failed pre-Task capture: %v", err)
+	}
+	if len(firstSnapshot.PendingAuthoringLaunches) != 1 {
+		t.Fatalf("pending authoring launches = %+v", firstSnapshot.PendingAuthoringLaunches)
+	}
+	launch := firstSnapshot.PendingAuthoringLaunches[0]
+	if launch.OperationID != operation.ID || launch.RepositoryURL != request.RepositoryURL || launch.CommitSHA != request.CommitSHA ||
+		launch.Slug != request.Slug || launch.Title != request.Title || !launch.CanRetry || launch.Status != "source_capture_failed" ||
+		launch.FailureCode != standardAuthoringLaunchCaptureFailureCode || launch.FailureSummary != standardAuthoringLaunchCaptureFailureSummary {
+		t.Fatalf("failed pre-Task launch projection = %+v", launch)
+	}
+
+	// Construct a fresh service graph over the same managed root and store. The
+	// retry must recover from durable records rather than the first TUI's form.
+	restarted, err := NewLifecycleServicesWithOptions(root, database, standardAuthoringLaunchTestOptions(capturer, definitions, definitions.catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.TaskBoard.actor = func() (string, error) { return "different-local-actor-must-not-change-launch", nil }
+	restartedSnapshot, err := restarted.TaskBoard.List(ctx)
+	if err != nil || len(restartedSnapshot.PendingAuthoringLaunches) != 1 || restartedSnapshot.PendingAuthoringLaunches[0].OperationID != operation.ID {
+		t.Fatalf("restarted failed launch projection = %+v, %v", restartedSnapshot.PendingAuthoringLaunches, err)
+	}
+	recovered, err := restarted.TaskBoard.RetryAuthoringLaunch(ctx, TaskBoardRetryAuthoringLaunchRequest{OperationID: operation.ID})
+	if err != nil {
+		t.Fatalf("retry failed pre-Task source capture: %v", err)
+	}
+	if recovered.OperationID != operation.ID || recovered.TaskID != operation.TaskID || recovered.RunID != operation.RunID || recovered.Summary == "" || capturer.calls != 2 {
+		t.Fatalf("recovered source capture = %+v, capture calls=%d", recovered, capturer.calls)
+	}
+	finalSnapshot, err := restarted.TaskBoard.List(ctx)
+	if err != nil || len(finalSnapshot.PendingAuthoringLaunches) != 0 {
+		t.Fatalf("resolved pre-Task launch remains visible = %+v, %v", finalSnapshot.PendingAuthoringLaunches, err)
+	}
+	if task, err := database.GetTaskV2(ctx, operation.TaskID); err != nil || task == nil {
+		t.Fatalf("recovered capture Task = %+v, %v", task, err)
+	}
+}
+
 func TestTaskBoardServiceRetriesTheSelectedTaskRevisionRun(t *testing.T) {
 	ctx := context.Background()
 	fixture := newContinuationFixture(t, store.WorkflowRunFailedRecoverable)

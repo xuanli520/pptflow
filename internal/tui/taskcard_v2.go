@@ -19,19 +19,20 @@ const (
 
 // TaskItem holds the data for one task card in the board.
 type TaskItem struct {
-	ID           string
-	Slug         string
-	Name         string
-	RepoURL      string
-	CommitSHA    string
-	State        TaskState
-	RunID        string
-	CurrentStage string
-	RunStatus    string
-	Lifecycle    string
-	Review       *app.TaskBoardReview
-	OpenReviews  int
-	Runs         []TaskRunItem
+	ID              string
+	Slug            string
+	Name            string
+	RepoURL         string
+	CommitSHA       string
+	State           TaskState
+	RunID           string
+	CurrentStage    string
+	RunStatus       string
+	Lifecycle       string
+	Review          *app.TaskBoardReview
+	OpenReviews     int
+	Runs            []TaskRunItem
+	AuthoringLaunch *app.TaskBoardAuthoringLaunch
 }
 
 // TaskRunItem is the terminal-facing copy of one durable Run record. It is
@@ -111,7 +112,9 @@ func renderTaskCard(item TaskItem, width int, selected bool) string {
 
 	switch item.State {
 	case TaskPending:
-		if item.Review != nil {
+		if item.AuthoringLaunch != nil {
+			lines = append(lines, failStyleV2.Render("源码捕获失败"))
+		} else if item.Review != nil {
 			lines = append(lines, statusRunningStyle.Render("等待审核"))
 		} else if item.OpenReviews > 1 {
 			lines = append(lines, failStyleV2.Render("多个审核待处理"))

@@ -86,17 +86,19 @@ type taskBoardExitMsg struct{ err error }
 type taskBoardMutationKind string
 
 const (
-	taskBoardStartMutation  taskBoardMutationKind = "start_authoring"
-	taskBoardReviewMutation taskBoardMutationKind = "review"
-	taskBoardRetryMutation  taskBoardMutationKind = "retry_run"
-	taskBoardCancelMutation taskBoardMutationKind = "cancel_run"
+	taskBoardStartMutation                taskBoardMutationKind = "start_authoring"
+	taskBoardReviewMutation               taskBoardMutationKind = "review"
+	taskBoardRetryMutation                taskBoardMutationKind = "retry_run"
+	taskBoardRetryAuthoringLaunchMutation taskBoardMutationKind = "retry_authoring_launch"
+	taskBoardCancelMutation               taskBoardMutationKind = "cancel_run"
 )
 
 type taskBoardRunActionKind string
 
 const (
-	taskBoardRetryAction  taskBoardRunActionKind = "retry"
-	taskBoardCancelAction taskBoardRunActionKind = "cancel"
+	taskBoardRetryAction                taskBoardRunActionKind = "retry"
+	taskBoardRetryAuthoringLaunchAction taskBoardRunActionKind = "retry_authoring_launch"
+	taskBoardCancelAction               taskBoardRunActionKind = "cancel"
 )
 
 type pendingTaskBoardStart struct {
@@ -113,11 +115,12 @@ type pendingTaskBoardReview struct {
 }
 
 type pendingTaskBoardRunAction struct {
-	kind   taskBoardRunActionKind
-	taskID string
-	runID  string
-	reason string
-	key    string
+	kind        taskBoardRunActionKind
+	operationID string
+	taskID      string
+	runID       string
+	reason      string
+	key         string
 }
 
 type reviewPrompt struct {
@@ -145,10 +148,11 @@ func (prompt *reviewPrompt) View(width int) string {
 }
 
 type runActionPrompt struct {
-	kind          taskBoardRunActionKind
-	strategy      app.TaskBoardRetryStrategy
-	reasonInput   textinput.Model
-	validationErr string
+	kind           taskBoardRunActionKind
+	strategy       app.TaskBoardRetryStrategy
+	reasonInput    textinput.Model
+	validationErr  string
+	requiresReason bool
 }
 
 func newRunActionPrompt(kind taskBoardRunActionKind, strategy app.TaskBoardRetryStrategy) *runActionPrompt {
@@ -158,7 +162,7 @@ func newRunActionPrompt(kind taskBoardRunActionKind, strategy app.TaskBoardRetry
 	input.CharLimit = 240
 	input.Width = 52
 	input.Focus()
-	return &runActionPrompt{kind: kind, strategy: strategy, reasonInput: input}
+	return &runActionPrompt{kind: kind, strategy: strategy, reasonInput: input, requiresReason: kind != taskBoardRetryAuthoringLaunchAction}
 }
 
 func (prompt *runActionPrompt) View(width int) string {
@@ -170,10 +174,15 @@ func (prompt *runActionPrompt) View(width int) string {
 		} else if prompt.strategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
 			label = "修复并继续创题 Run"
 		}
+	case taskBoardRetryAuthoringLaunchAction:
+		label = "重试源码捕获"
 	case taskBoardCancelAction:
 		label = "取消当前 Run"
 	}
-	content := detailSectionTitleStyle.Render(label) + "\n" + prompt.reasonInput.View()
+	content := detailSectionTitleStyle.Render(label)
+	if prompt.requiresReason {
+		content += "\n" + prompt.reasonInput.View()
+	}
 	if prompt.validationErr != "" {
 		content += "\n" + failStyleV2.Render(prompt.validationErr)
 	}
@@ -289,7 +298,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingReview = nil
 			m.review = nil
 			m.detail = nil
-		case taskBoardRetryMutation, taskBoardCancelMutation:
+		case taskBoardRetryMutation, taskBoardRetryAuthoringLaunchMutation, taskBoardCancelMutation:
 			m.pendingAction = nil
 			m.action = nil
 			m.logs = nil
@@ -429,6 +438,9 @@ func (m appModel) handleDetailKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, 
 	case "l":
 		return m.openLog(inputCmd)
 	case "t":
+		if m.detail != nil && m.detail.hasAuthoringLaunch() {
+			return m.openRunActionPrompt(taskBoardRetryAuthoringLaunchAction, inputCmd)
+		}
 		return m.openRunActionPrompt(taskBoardRetryAction, inputCmd)
 	case "x":
 		return m.openRunActionPrompt(taskBoardCancelAction, inputCmd)
@@ -515,6 +527,9 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 		m.action = nil
 		return m, inputCmd
 	case "enter":
+		if !m.action.requiresReason {
+			return m.beginRunAction(m.action.kind, "", inputCmd)
+		}
 		reason := strings.TrimSpace(m.action.reasonInput.Value())
 		if reason == "" {
 			m.action.validationErr = "操作原因不能为空"
@@ -528,7 +543,18 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 }
 
 func (m appModel) openRunActionPrompt(kind taskBoardRunActionKind, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
-	if m.mutationInFlight() || m.detail == nil || !m.detail.hasCurrentRun() {
+	if m.mutationInFlight() || m.detail == nil {
+		return m, inputCmd
+	}
+	if kind == taskBoardRetryAuthoringLaunchAction {
+		if !m.detail.canRetryAuthoringLaunch() {
+			m.notice = "当前源码捕获启动不可重试"
+			return m, inputCmd
+		}
+		m.action = newRunActionPrompt(kind, app.TaskBoardRetryStrategyNone)
+		return m, tea.Batch(inputCmd, textinput.Blink)
+	}
+	if !m.detail.hasCurrentRun() {
 		return m, inputCmd
 	}
 	if isRetryAction(kind) && !m.detail.canRetryCurrentRun() {
@@ -547,7 +573,7 @@ func (m appModel) openRunActionPrompt(kind taskBoardRunActionKind, inputCmd tea.
 }
 
 func isRetryAction(kind taskBoardRunActionKind) bool {
-	return kind == taskBoardRetryAction
+	return kind == taskBoardRetryAction || kind == taskBoardRetryAuthoringLaunchAction
 }
 
 func (m appModel) openLog(inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
@@ -694,7 +720,21 @@ func (m appModel) decideReview(pending pendingTaskBoardReview) tea.Cmd {
 }
 
 func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
-	if m.mutationInFlight() || m.refreshInFlight || m.detail == nil || !m.detail.hasCurrentRun() {
+	if m.mutationInFlight() || m.refreshInFlight || m.detail == nil {
+		m.notice = "请等待当前操作完成"
+		return m, inputCmd
+	}
+	if kind == taskBoardRetryAuthoringLaunchAction {
+		launch := m.detail.authoringLaunch()
+		if launch == nil || !launch.CanRetry {
+			m.notice = "当前源码捕获启动不可重试"
+			return m, inputCmd
+		}
+		m.pendingAction = &pendingTaskBoardRunAction{kind: kind, operationID: launch.OperationID}
+		m.activeMutation = taskBoardRetryAuthoringLaunchMutation
+		return m, tea.Batch(inputCmd, m.runAction(*m.pendingAction))
+	}
+	if !m.detail.hasCurrentRun() {
 		m.notice = "请等待当前操作完成"
 		return m, inputCmd
 	}
@@ -714,6 +754,8 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 	switch kind {
 	case taskBoardRetryAction:
 		m.activeMutation = taskBoardRetryMutation
+	case taskBoardRetryAuthoringLaunchAction:
+		m.activeMutation = taskBoardRetryAuthoringLaunchMutation
 	case taskBoardCancelAction:
 		m.activeMutation = taskBoardCancelMutation
 	default:
@@ -729,6 +771,8 @@ func (m appModel) runAction(pending pendingTaskBoardRunAction) tea.Cmd {
 			kind := taskBoardRetryMutation
 			if pending.kind == taskBoardCancelAction {
 				kind = taskBoardCancelMutation
+			} else if pending.kind == taskBoardRetryAuthoringLaunchAction {
+				kind = taskBoardRetryAuthoringLaunchMutation
 			}
 			return taskBoardMutationMsg{kind: kind, err: fmt.Errorf("task board service is not configured")}
 		}
@@ -738,6 +782,9 @@ func (m appModel) runAction(pending pendingTaskBoardRunAction) tea.Cmd {
 				IdempotencyKey: pending.key, TaskID: pending.taskID, RunID: pending.runID, Reason: pending.reason,
 			})
 			return taskBoardMutationMsg{kind: taskBoardRetryMutation, mutation: mutation, err: err}
+		case taskBoardRetryAuthoringLaunchAction:
+			mutation, err := m.gateway.RetryAuthoringLaunch(m.ctx, app.TaskBoardRetryAuthoringLaunchRequest{OperationID: pending.operationID})
+			return taskBoardMutationMsg{kind: taskBoardRetryAuthoringLaunchMutation, mutation: mutation, err: err}
 		case taskBoardCancelAction:
 			mutation, err := m.gateway.CancelRun(m.ctx, app.TaskBoardCancelRunRequest{
 				IdempotencyKey: pending.key, TaskID: pending.taskID, RunID: pending.runID, Reason: pending.reason,
@@ -785,6 +832,20 @@ func (m appModel) beginExit() (tea.Model, tea.Cmd) {
 }
 
 func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, completed []TaskItem) {
+	for _, launch := range snapshot.PendingAuthoringLaunches {
+		copy := launch
+		pending = append(pending, TaskItem{
+			ID:              launch.OperationID,
+			Slug:            launch.Slug,
+			Name:            launch.Title,
+			RepoURL:         launch.RepositoryURL,
+			CommitSHA:       launch.CommitSHA,
+			State:           TaskPending,
+			RunStatus:       launch.Status,
+			Lifecycle:       "source_capture_failed",
+			AuthoringLaunch: &copy,
+		})
+	}
 	for _, task := range snapshot.Tasks {
 		item := TaskItem{
 			ID:           task.ID,
@@ -911,6 +972,9 @@ func detailFooter(detail *detailModel) string {
 
 func detailFooterText(detail *detailModel) string {
 	actions := make([]string, 0, 4)
+	if detail != nil && detail.canRetryAuthoringLaunch() {
+		actions = append(actions, "[t] 重试源码捕获")
+	}
 	if detail != nil && detail.hasCurrentRun() {
 		actions = append(actions, "[l] 日志")
 		if detail.canRetryCurrentRun() {

@@ -411,6 +411,34 @@ func (s *Store) GetLifecycleOperationByIdempotencyKey(ctx context.Context, idemp
 	return &operation, nil
 }
 
+// ListPreparedLifecycleOperationsByAction returns the outstanding durable
+// receipt boundaries for one action. Callers use this only for recovery
+// projections; a prepared operation remains the authority for retrying its
+// original idempotency key.
+func (s *Store) ListPreparedLifecycleOperationsByAction(ctx context.Context, action string) ([]LifecycleOperation, error) {
+	action, err := normalizeRequired(action, "lifecycle operation action")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, lifecycleOperationV12Select+" WHERE action = ? AND state = ? ORDER BY updated_at DESC, id ASC", action, LifecycleOperationPrepared)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	operations := make([]LifecycleOperation, 0)
+	for rows.Next() {
+		operation, err := scanLifecycleOperation(rows)
+		if err != nil {
+			return nil, err
+		}
+		operations = append(operations, operation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return operations, nil
+}
+
 type preparedBeginLifecycleOperationRequest struct {
 	id                                       string
 	idempotencyKey                           string

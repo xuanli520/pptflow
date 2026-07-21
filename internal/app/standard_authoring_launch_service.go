@@ -43,6 +43,14 @@ const (
 	standardAuthoringLaunchCaptureReceiptVersion                                = "1"
 	standardAuthoringLaunchCaptureReceiptFileName                               = "capture-receipt.json"
 	standardAuthoringLaunchCaptureReceiptMaxBytes       int64                   = 1 << 20
+	standardAuthoringLaunchRequestRecordFormat                                  = "harbor.standard-authoring-launch-request.v1"
+	standardAuthoringLaunchRequestRecordVersion                                 = "1"
+	standardAuthoringLaunchRequestRecordFileName                                = "launch-request.json"
+	standardAuthoringLaunchRequestRecordMaxBytes        int64                   = 1 << 20
+	standardAuthoringLaunchCaptureFailureFormat                                 = "harbor.standard-authoring-launch-capture-failure.v1"
+	standardAuthoringLaunchCaptureFailureVersion                                = "1"
+	standardAuthoringLaunchCaptureFailureFileName                               = "capture-failure.json"
+	standardAuthoringLaunchCaptureFailureMaxBytes       int64                   = 1 << 20
 )
 
 var (
@@ -306,6 +314,9 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 		if err != nil {
 			return LifecycleMutationReceipt{}, err
 		}
+	}
+	if err := ensureStandardAuthoringLaunchRequestRecord(lease.directory, op, command, metadata); err != nil {
+		return LifecycleMutationReceipt{}, err
 	}
 	if err := admission.Close(); err != nil {
 		return LifecycleMutationReceipt{}, fmt.Errorf("release Standard authoring launch admission lock: %w", err)
@@ -739,24 +750,27 @@ func (service *StandardAuthoringLaunchService) ensureStandardAuthoringLaunchCapt
 		}
 		return existing, nil
 	}
+	captureFailure := func(cause error) error {
+		return service.durableCaptureFailure(directory, operation, preparation, cause)
+	}
 	if err := ctx.Err(); err != nil {
-		return standardAuthoringLaunchCaptureReceipt{}, err
+		return standardAuthoringLaunchCaptureReceipt{}, captureFailure(err)
 	}
 	captured, err := service.capturer.CaptureStandardAuthoringSource(ctx, coordinate)
 	if err != nil {
-		return standardAuthoringLaunchCaptureReceipt{}, fmt.Errorf("capture requested Standard authoring source: %w", err)
+		return standardAuthoringLaunchCaptureReceipt{}, captureFailure(fmt.Errorf("capture requested Standard authoring source: %w", err))
 	}
 	if err := validateStandardAuthoringSourceSnapshot(captured, coordinate); err != nil {
-		return standardAuthoringLaunchCaptureReceipt{}, err
+		return standardAuthoringLaunchCaptureReceipt{}, captureFailure(err)
 	}
 	object, err := service.core.objects.PutBytes(ctx, captured.Content)
 	if err != nil {
-		return standardAuthoringLaunchCaptureReceipt{}, fmt.Errorf("store Standard authoring source snapshot: %w", err)
+		return standardAuthoringLaunchCaptureReceipt{}, captureFailure(fmt.Errorf("store Standard authoring source snapshot: %w", err))
 	}
 	receipt := newStandardAuthoringLaunchCaptureReceipt(operation, ids, coordinate, preparation, object)
 	canonical, err := receipt.CanonicalJSON()
 	if err != nil {
-		return standardAuthoringLaunchCaptureReceipt{}, err
+		return standardAuthoringLaunchCaptureReceipt{}, captureFailure(err)
 	}
 	// There is intentionally no context check between object publication and
 	// receipt publication. Once the archive object exists, sealing its receipt
@@ -766,7 +780,7 @@ func (service *StandardAuthoringLaunchService) ensureStandardAuthoringLaunchCapt
 	// and never becomes an AuthoringSource without this validated receipt.
 	if err := standardAuthoringWriteNewImmutableFileAt(directory, standardAuthoringLaunchCaptureReceiptFileName, canonical, 0o640); err != nil {
 		if !errors.Is(err, os.ErrExist) {
-			return standardAuthoringLaunchCaptureReceipt{}, fmt.Errorf("write Standard authoring capture receipt: %w", err)
+			return standardAuthoringLaunchCaptureReceipt{}, captureFailure(fmt.Errorf("write Standard authoring capture receipt: %w", err))
 		}
 		stored, found, readErr := readStandardAuthoringLaunchCaptureReceiptAt(directory)
 		if readErr != nil || !found {

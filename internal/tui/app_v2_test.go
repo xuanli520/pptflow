@@ -21,21 +21,23 @@ const (
 )
 
 type taskBoardGatewayStub struct {
-	snapshot         app.TaskBoardSnapshot
-	startRequests    []app.TaskBoardStartAuthoringRequest
-	decisionRequests []app.TaskBoardDecideReviewRequest
-	retryRequests    []app.TaskBoardRetryRunRequest
-	cancelRequests   []app.TaskBoardCancelRunRequest
-	log              app.TaskBoardLog
-	startErr         error
-	decisionErr      error
-	retryErr         error
-	cancelErr        error
-	logErr           error
-	flushErr         error
-	listCalls        int
-	flushCalls       int
-	keys             int
+	snapshot            app.TaskBoardSnapshot
+	startRequests       []app.TaskBoardStartAuthoringRequest
+	decisionRequests    []app.TaskBoardDecideReviewRequest
+	retryRequests       []app.TaskBoardRetryRunRequest
+	launchRetryRequests []app.TaskBoardRetryAuthoringLaunchRequest
+	cancelRequests      []app.TaskBoardCancelRunRequest
+	log                 app.TaskBoardLog
+	startErr            error
+	decisionErr         error
+	retryErr            error
+	launchRetryErr      error
+	cancelErr           error
+	logErr              error
+	flushErr            error
+	listCalls           int
+	flushCalls          int
+	keys                int
 }
 
 func (stub *taskBoardGatewayStub) NewIdempotencyKey() (string, error) {
@@ -65,6 +67,11 @@ func (stub *taskBoardGatewayStub) ReadRunLog(context.Context, app.TaskBoardReadR
 func (stub *taskBoardGatewayStub) RetryRun(_ context.Context, request app.TaskBoardRetryRunRequest) (app.TaskBoardMutation, error) {
 	stub.retryRequests = append(stub.retryRequests, request)
 	return app.TaskBoardMutation{TaskID: request.TaskID, RunID: request.RunID, Summary: "retried"}, stub.retryErr
+}
+
+func (stub *taskBoardGatewayStub) RetryAuthoringLaunch(_ context.Context, request app.TaskBoardRetryAuthoringLaunchRequest) (app.TaskBoardMutation, error) {
+	stub.launchRetryRequests = append(stub.launchRetryRequests, request)
+	return app.TaskBoardMutation{OperationID: request.OperationID, TaskID: "task-recovered", RunID: "run-recovered", Summary: "retried source capture"}, stub.launchRetryErr
 }
 
 func (stub *taskBoardGatewayStub) CancelRun(_ context.Context, request app.TaskBoardCancelRunRequest) (app.TaskBoardMutation, error) {
@@ -461,6 +468,46 @@ func TestDetailRunActionsAndLogsTargetTheCurrentRun(t *testing.T) {
 	model = updated.(appModel)
 	if model.logs == nil || model.logs.path != "/managed/logs/run-1.log" || !strings.Contains(model.logs.content, "second line") {
 		t.Fatalf("loaded log = %+v", model.logs)
+	}
+}
+
+func TestAppModelRoutesDurablePreTaskCaptureRetryWithoutNewIdempotencyKey(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.PendingAuthoringLaunches = []app.TaskBoardAuthoringLaunch{{
+		OperationID:    "019f65fb-7270-74f8-8a04-1a50c12c7cae",
+		RepositoryURL:  "https://example.invalid/repo.git",
+		CommitSHA:      "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+		Slug:           "failed-source-capture",
+		Title:          "Failed source capture",
+		Status:         "source_capture_failed",
+		FailureCode:    "authoring.source_capture_failed",
+		FailureSummary: "Standard 创题源码捕获失败，尚未创建 Task。",
+		CanRetry:       true,
+	}}
+	stub := &taskBoardGatewayStub{snapshot: snapshot}
+	model := loadedTaskBoardModel(t, stub)
+	if selected := model.board.SelectedTask(); selected == nil || selected.AuthoringLaunch == nil {
+		t.Fatalf("pre-Task launch board selection = %+v", selected)
+	}
+	updated, _ := model.handleKey(keyRune('d'), nil)
+	model = updated.(appModel)
+	if model.detail == nil || !model.detail.hasAuthoringLaunch() || !strings.Contains(detailFooterText(model.detail), "[t] 重试源码捕获") {
+		t.Fatalf("pre-Task launch detail = %+v footer=%q", model.detail, detailFooterText(model.detail))
+	}
+	updated, _ = model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	if model.action == nil || model.action.kind != taskBoardRetryAuthoringLaunchAction || model.action.requiresReason {
+		t.Fatalf("pre-Task capture retry prompt = %+v", model.action)
+	}
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardRetryAuthoringLaunchMutation || command == nil {
+		t.Fatalf("pre-Task capture retry start = active:%q command:%v", model.activeMutation, command)
+	}
+	message := command().(taskBoardMutationMsg)
+	if message.kind != taskBoardRetryAuthoringLaunchMutation || len(stub.launchRetryRequests) != 1 ||
+		stub.launchRetryRequests[0].OperationID != snapshot.PendingAuthoringLaunches[0].OperationID || stub.keys != 0 {
+		t.Fatalf("pre-Task capture retry dispatch = message:%+v requests:%+v keys:%d", message, stub.launchRetryRequests, stub.keys)
 	}
 }
 

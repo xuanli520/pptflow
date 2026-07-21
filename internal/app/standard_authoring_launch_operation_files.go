@@ -83,6 +83,33 @@ func (service *StandardAuthoringLaunchService) openStandardAuthoringLaunchOperat
 	return operation, nil
 }
 
+// openExistingStandardAuthoringLaunchOperationDirectory is the read-only
+// counterpart used by recovery projections. It deliberately does not create a
+// missing root or operation directory while the task board is refreshing.
+func (service *StandardAuthoringLaunchService) openExistingStandardAuthoringLaunchOperationDirectory(operationID string) (*os.File, error) {
+	if service == nil || service.core == nil {
+		return nil, ErrStandardAuthoringLaunchUnavailable
+	}
+	if err := store.ValidateUUIDv7(operationID); err != nil {
+		return nil, fmt.Errorf("Standard authoring lifecycle operation ID: %w", err)
+	}
+	root, err := standardAuthoringOpenDirectory(service.core.layout.root)
+	if err != nil {
+		return nil, fmt.Errorf("open managed Standard authoring root: %w", err)
+	}
+	defer root.Close()
+	operations, err := standardAuthoringOpenExistingDirectoryAt(root, managedLifecycleOperationsDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("open managed Standard authoring operations directory: %w", err)
+	}
+	defer operations.Close()
+	operation, err := standardAuthoringOpenExistingDirectoryAt(operations, operationID)
+	if err != nil {
+		return nil, fmt.Errorf("open managed Standard authoring operation directory: %w", err)
+	}
+	return operation, nil
+}
+
 func (service *StandardAuthoringLaunchService) lockStandardAuthoringLaunchOperation(ctx context.Context, operationID string) (*standardAuthoringLaunchOperationLease, error) {
 	if ctx == nil {
 		return nil, errors.New("Standard authoring operation lock context is required")
@@ -155,6 +182,25 @@ func standardAuthoringOpenOrCreateDirectoryAt(parent *os.File, name string) (*os
 	if err := parent.Sync(); err != nil {
 		_ = child.Close()
 		return nil, err
+	}
+	return child, nil
+}
+
+func standardAuthoringOpenExistingDirectoryAt(parent *os.File, name string) (*os.File, error) {
+	if parent == nil || name == "" || name == "." || name == ".." {
+		return nil, errors.New("invalid managed directory")
+	}
+	childFD, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	child := os.NewFile(uintptr(childFD), name)
+	if info, err := child.Stat(); err != nil || !info.IsDir() {
+		_ = child.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("managed path is not a directory")
 	}
 	return child, nil
 }
