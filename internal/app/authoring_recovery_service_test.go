@@ -340,7 +340,7 @@ func TestAuthoringGeneratedFilesRecoveryRegeneratesProducer(t *testing.T) {
 	}
 }
 
-func TestAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) {
+func TestCurrentAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) {
 	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
 	if err != nil {
@@ -349,7 +349,6 @@ func TestAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) 
 	for _, key := range []workflowkit.NodeID{
 		workflowkit.NodeID(workflowadapter.TaskDesign), workflowkit.NodeID(workflowadapter.GenerateTaskFiles),
 		workflowkit.NodeID(workflowadapter.InstructionGen), workflowkit.NodeID(workflowadapter.TaskTOMLGen), workflowkit.NodeID(workflowadapter.DockerfileGen),
-		workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen),
 	} {
 		t.Run(string(key), func(t *testing.T) {
 			attemptID := "direct-needs-repair-" + string(key)
@@ -362,6 +361,47 @@ func TestAuthoringContentProducerRecoveryAcceptsDirectNeedsRepair(t *testing.T) 
 			}
 			if !reflect.DeepEqual(selection.targetNodeIDs, []workflowkit.NodeID{key}) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{attemptID}) || len(selection.feedback) != 0 {
 				t.Fatalf("direct content-producer recovery selection=%+v", selection)
+			}
+		})
+	}
+}
+
+func TestCurrentAuthoringFixedFileScriptsRejectDirectNeedsRepair(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []workflowkit.NodeID{workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen)} {
+		t.Run(string(key), func(t *testing.T) {
+			_, err := authoringRecoveryTargets(store.WorkflowRun{
+				Status: store.WorkflowRunWaitingContinuation, WorkflowTemplateID: template.ID, WorkflowTemplateVersion: template.Version,
+			}, workflow.Descriptor, continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
+				key: {ID: "fixed-file-needs-repair-" + string(key), StageKey: string(key), ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair},
+			}})
+			if !errors.Is(err, ErrAuthoringRecoveryUnavailable) || !strings.Contains(err.Error(), "outside its frozen verdict policy") {
+				t.Fatalf("fixed-file %q direct needs_repair error = %v", key, err)
+			}
+		})
+	}
+}
+
+func TestHistoricalAuthoringHarnessScriptsRetainDirectNeedsRepair(t *testing.T) {
+	template := workflowadapter.StandardAuthoringHarnessWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []workflowkit.NodeID{workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen)} {
+		t.Run(string(key), func(t *testing.T) {
+			attemptID := "historical-script-needs-repair-" + string(key)
+			selection, err := authoringRecoveryTargets(store.WorkflowRun{
+				Status: store.WorkflowRunWaitingContinuation, WorkflowTemplateID: template.ID, WorkflowTemplateVersion: template.Version,
+			}, workflow.Descriptor, continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
+				key: {ID: attemptID, StageKey: string(key), ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair},
+			}})
+			if err != nil || !reflect.DeepEqual(selection.targetNodeIDs, []workflowkit.NodeID{key}) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{attemptID}) {
+				t.Fatalf("historical 1.7 script recovery selection=%+v err=%v", selection, err)
 			}
 		})
 	}

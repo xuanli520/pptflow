@@ -309,7 +309,7 @@ func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, data
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion, SessionManifestJSON: `{"format":"fixture"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion, SessionManifestJSON: `{"format":"fixture"}`,
 		IdempotencyKey: "repo-prepare-session", Actor: "author", Reason: "freeze source session",
 	})
 	if err != nil {

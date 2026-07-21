@@ -1255,7 +1255,7 @@ func standardAuthoringLaunchTestDefinitionProvider(t *testing.T) *CatalogStandar
 		Format: stageprovider.DeploymentOperationCatalogFormat, Version: stageprovider.DeploymentOperationCatalogVersion,
 		CatalogID: "standard-authoring-test", CatalogVersion: "1", Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Operations: []stageprovider.DeploymentOperationRegistration{},
 	}
-	for _, stage := range workflowadapter.StandardAuthoringHarnessStageCatalog().Stages {
+	for _, stage := range workflowadapter.StandardAuthoringFixedFileStageCatalog().Stages {
 		operation := workflowadapter.StageOperationBinding{ProviderID: "standard-authoring-test-provider", OperationID: "test." + string(stage.Key), Version: "1"}
 		switch stage.Key {
 		case workflowkit.StageKey(workflowadapter.RepoPrepare):

@@ -47,7 +47,7 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "materializer-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -251,7 +251,7 @@ func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvi
 	session := store.AuthoringSession{ID: sessionID}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
 	}
 	packageInput := standardAuthoringTaskPackageFixture(t)
 	briefRaw, err := packageInput.Brief.CanonicalJSON()
@@ -426,7 +426,7 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "package-admission-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -599,7 +599,7 @@ func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowk
 	session := store.AuthoringSession{ID: sessionID}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
 	}
 	policyRaw, err := packageInput.Environment.CanonicalJSON()
 	if err != nil {

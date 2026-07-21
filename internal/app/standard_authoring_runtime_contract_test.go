@@ -53,7 +53,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutPolicy(t
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "environment policy contract") {
@@ -84,7 +84,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutBrief(t 
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "brief contract") {
@@ -118,7 +118,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFe
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "versioned input contract") {
@@ -127,7 +127,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFe
 }
 
 func TestCurrentStandardAuthoringRunRejectsNonCurrentVersions(t *testing.T) {
-	current := store.WorkflowRun{WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringHarnessTemplateVersion}
+	current := store.WorkflowRun{WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion}
 	if !isCurrentStandardAuthoringRun(current) {
 		t.Fatal("current Standard authoring version was rejected")
 	}
@@ -137,6 +137,7 @@ func TestCurrentStandardAuthoringRunRejectsNonCurrentVersions(t *testing.T) {
 		workflowadapter.StandardAuthoringBriefTemplateVersion,
 		workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
 		workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion,
+		workflowadapter.StandardAuthoringHarnessTemplateVersion,
 		"9.9.9",
 	} {
 		run := current
