@@ -7,6 +7,8 @@ package evaluator
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,15 @@ import (
 
 const (
 	maxTranscriptBytes = 24 << 10
+	// maxStagedClaudeCodeBytes bounds the deployment-owned executable copied
+	// into an attempt workspace. Claude Code's locked standalone binary is
+	// currently about 248 MiB, so this leaves deliberate headroom without
+	// allowing an unbounded host file to consume evaluator storage.
+	maxStagedClaudeCodeBytes int64 = 512 << 20
+
+	stagedClaudeCodeDirectory = "claude-runtime"
+	stagedClaudeCodeFilename  = "claude"
+	claudeCodeContainerPath   = "/usr/local/bin/claude"
 
 	// forbiddenLocalEvaluatorCredentialEnvironment is deliberately forbidden
 	// from this local-only evaluator. Model credentials have their separately
@@ -220,6 +231,10 @@ func (executor *HarborEvaluatorLocalCommandExecutor) ExecuteLocalCommand(ctx con
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("attest Harbor evaluator immediately before launch: %w", err)
 	}
+	stagedClaudeCode, err := stageLockedClaudeCodeExecutable(ctx, workspace, config)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, fmt.Errorf("stage locked Claude Code executable: %w", err)
+	}
 
 	envFile, sensitiveValues, err := executor.writeApprovedEnvFile(workspace, config)
 	if err != nil {
@@ -233,7 +248,10 @@ func (executor *HarborEvaluatorLocalCommandExecutor) ExecuteLocalCommand(ctx con
 	if !slices.Equal(processEnvironment, launchEnvironment) {
 		return workflowkit.StageExecutionResult{}, errors.New("Harbor evaluator launch environment changed between runtime attestations")
 	}
-	command := evaluatorCommand(config, taskRoot, jobsRoot, jobName, envFile, launchEnvironment)
+	command, err := evaluatorCommand(config, taskRoot, jobsRoot, jobName, envFile, stagedClaudeCode, launchEnvironment)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
 	result, runErr := executor.runner.Run(ctx, command)
 	rawOutputDigest, digestErr := evaluatorRawOutputFingerprint(result, runErr)
 	if digestErr != nil {
@@ -396,7 +414,7 @@ func validateInvocation(invocation stageprovider.HarborEvaluatorInvocation) erro
 	if err != nil || invocation.DockerPATH != dockerPATH {
 		return errors.New("incomplete Harbor evaluator Docker PATH attestation")
 	}
-	if !filepath.IsAbs(invocation.LauncherPath) || invocation.LauncherVersion == "" || !filepath.IsAbs(invocation.PythonInterpreterPath) || invocation.PythonInterpreterVersion == "" || !filepath.IsAbs(invocation.PythonSourceTreePath) ||
+	if !cleanNonRootAbsolutePath(invocation.LauncherPath) || invocation.LauncherVersion == "" || !cleanNonRootAbsolutePath(invocation.ClaudeCodeExecutablePath) || invocation.ClaudeCodeVersion == "" || !cleanNonRootAbsolutePath(invocation.PythonInterpreterPath) || invocation.PythonInterpreterVersion == "" || !cleanNonRootAbsolutePath(invocation.PythonSourceTreePath) ||
 		invocation.HarborVersion != stageprovider.HarborEvaluatorHarborVersion || invocation.AgentID != "claude-code" || invocation.AgentVersion == "" || invocation.ModelID == "" ||
 		invocation.DockerVersion != stageprovider.HarborEvaluatorDockerVersion || invocation.DockerServerVersion != stageprovider.HarborEvaluatorDockerServerVersion ||
 		!filepath.IsAbs(invocation.DockerComposePluginPath) || filepath.Clean(invocation.DockerComposePluginPath) != invocation.DockerComposePluginPath || filepath.Base(invocation.DockerComposePluginPath) != "docker-compose" || invocation.DockerComposeVersion != stageprovider.HarborEvaluatorDockerComposeVersion || invocation.DockerComposeVersionOutput != stageprovider.HarborEvaluatorDockerComposeVersionOutput ||
@@ -408,6 +426,12 @@ func validateInvocation(invocation stageprovider.HarborEvaluatorInvocation) erro
 	}
 	if err := invocation.LauncherContentSHA256.Validate(); err != nil {
 		return fmt.Errorf("Harbor evaluator launcher fingerprint: %w", err)
+	}
+	if invocation.ClaudeCodeVersion != invocation.AgentVersion {
+		return errors.New("Harbor evaluator Claude Code version does not match the frozen agent version")
+	}
+	if err := invocation.ClaudeCodeContentSHA256.Validate(); err != nil {
+		return fmt.Errorf("Harbor evaluator Claude Code fingerprint: %w", err)
 	}
 	if err := invocation.PythonInterpreterContentSHA256.Validate(); err != nil {
 		return fmt.Errorf("Harbor evaluator Python interpreter fingerprint: %w", err)
@@ -433,6 +457,10 @@ func validateInvocation(invocation stageprovider.HarborEvaluatorInvocation) erro
 		}
 	}
 	return nil
+}
+
+func cleanNonRootAbsolutePath(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != string(filepath.Separator)
 }
 
 func evaluatorInvocationEnvironmentNames(mappings []stageprovider.HarborEvaluatorSecretEnvTemplate) []string {
@@ -609,7 +637,11 @@ func (executor *HarborEvaluatorLocalCommandExecutor) writeApprovedEnvFile(worksp
 	return path, sensitiveValues, nil
 }
 
-func evaluatorCommand(config stageprovider.HarborEvaluatorInvocation, taskRoot, jobsRoot, jobName, envFile string, environment []string) Command {
+func evaluatorCommand(config stageprovider.HarborEvaluatorInvocation, taskRoot, jobsRoot, jobName, envFile, stagedClaudeCode string, environment []string) (Command, error) {
+	mounts, err := canonicalClaudeCodeMountJSON(stagedClaudeCode)
+	if err != nil {
+		return Command{}, fmt.Errorf("construct fixed Claude Code mount: %w", err)
+	}
 	return Command{
 		Path: config.LauncherPath,
 		Args: []string{
@@ -619,13 +651,268 @@ func evaluatorCommand(config stageprovider.HarborEvaluatorInvocation, taskRoot, 
 			"--n-attempts", fmt.Sprintf("%d", config.Attempts), "--n-concurrent", fmt.Sprintf("%d", config.ConcurrentTrials), "--max-retries", fmt.Sprintf("%d", config.MaxRetries),
 			"--job-name", jobName, "--jobs-dir", jobsRoot,
 			"--env-file", envFile,
+			"--mounts", mounts,
 			// This process owns only the managed local job directory. Upload and
 			// every sharing flag are omitted by construction.
 			"--quiet", "--yes",
 		},
 		Dir: filepath.Dir(taskRoot),
 		Env: append([]string(nil), environment...),
+	}, nil
+}
+
+// canonicalClaudeCodeMountJSON is the sole path by which this evaluator can
+// expose a host file to a Harbor task container. The source is a copy in the
+// controlled attempt workspace, never a deployment runtime pathname.
+func canonicalClaudeCodeMountJSON(stagedClaudeCode string) (string, error) {
+	if !cleanNonRootAbsolutePath(stagedClaudeCode) {
+		return "", errors.New("staged Claude Code executable path is unsafe")
 	}
+	mount := []map[string]any{{
+		"bind": map[string]any{
+			"create_host_path": false,
+		},
+		"read_only": true,
+		"source":    stagedClaudeCode,
+		"target":    claudeCodeContainerPath,
+		"type":      "bind",
+	}}
+	encoded, err := json.Marshal(mount)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+// stageLockedClaudeCodeExecutable copies the independently prelaunch-attested
+// binary into a fresh attempt-local directory. It re-proves the source and
+// destination bytes during the copy so the Docker bind mount never points at
+// a mutable deployment installation.
+func stageLockedClaudeCodeExecutable(ctx context.Context, workspace string, invocation stageprovider.HarborEvaluatorInvocation) (string, error) {
+	if ctx == nil {
+		return "", errors.New("command context is required")
+	}
+	if !cleanNonRootAbsolutePath(workspace) || !cleanNonRootAbsolutePath(invocation.ClaudeCodeExecutablePath) {
+		return "", errors.New("Claude Code staging path is unsafe")
+	}
+	if err := invocation.ClaudeCodeContentSHA256.Validate(); err != nil {
+		return "", fmt.Errorf("locked Claude Code fingerprint: %w", err)
+	}
+	workspaceInfo, err := os.Lstat(workspace)
+	if err != nil || !workspaceInfo.IsDir() || workspaceInfo.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("controlled Harbor evaluator workspace is invalid")
+	}
+	runtimeDirectory := filepath.Join(workspace, stagedClaudeCodeDirectory)
+	if err := os.Mkdir(runtimeDirectory, 0o700); err != nil {
+		return "", fmt.Errorf("create controlled Claude Code staging directory: %w", err)
+	}
+	runtimeInfo, err := os.Lstat(runtimeDirectory)
+	if err != nil || !runtimeInfo.IsDir() || runtimeInfo.Mode()&os.ModeSymlink != 0 || runtimeInfo.Mode().Perm() != 0o700 {
+		return "", errors.New("controlled Claude Code staging directory is invalid")
+	}
+	destination := filepath.Join(runtimeDirectory, stagedClaudeCodeFilename)
+	if err := copyLockedClaudeCodeExecutable(ctx, invocation.ClaudeCodeExecutablePath, destination, invocation.ClaudeCodeContentSHA256); err != nil {
+		return "", err
+	}
+	return destination, nil
+}
+
+func copyLockedClaudeCodeExecutable(ctx context.Context, sourcePath, destinationPath string, expected workflowkit.Fingerprint) (err error) {
+	sourceInfo, err := inspectRegularNonSymlinkFile(sourcePath)
+	if err != nil {
+		return fmt.Errorf("locked Claude Code source is invalid: %w", err)
+	}
+	if sourceInfo.Size() <= 0 || sourceInfo.Size() > maxStagedClaudeCodeBytes {
+		return errors.New("locked Claude Code source exceeds the staging size limit")
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("open locked Claude Code source: %w", err)
+	}
+	defer source.Close()
+	openedSourceInfo, err := source.Stat()
+	if err != nil || !openedSourceInfo.Mode().IsRegular() || !os.SameFile(sourceInfo, openedSourceInfo) {
+		return errors.New("locked Claude Code source changed while opening")
+	}
+	destination, err := os.OpenFile(destinationPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create staged Claude Code executable: %w", err)
+	}
+	completed := false
+	closed := false
+	defer func() {
+		if !closed {
+			if closeErr := destination.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}
+		if !completed {
+			_ = os.Remove(destinationPath)
+		}
+	}()
+
+	hasher := sha256.New()
+	buffer := make([]byte, 64*1024)
+	var copied int64
+	for {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+		count, readErr := source.Read(buffer)
+		if count > 0 {
+			copied += int64(count)
+			if copied > maxStagedClaudeCodeBytes {
+				return errors.New("locked Claude Code source exceeds the staging size limit")
+			}
+			if _, hashErr := hasher.Write(buffer[:count]); hashErr != nil {
+				return hashErr
+			}
+			written, writeErr := destination.Write(buffer[:count])
+			if writeErr != nil {
+				return fmt.Errorf("write staged Claude Code executable: %w", writeErr)
+			}
+			if written != count {
+				return io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read locked Claude Code source: %w", readErr)
+		}
+		if count == 0 {
+			return errors.New("locked Claude Code source read made no progress")
+		}
+	}
+	if copied != sourceInfo.Size() || copied != openedSourceInfo.Size() {
+		return errors.New("locked Claude Code source changed while reading")
+	}
+	if actual := workflowkit.Fingerprint("sha256:" + hex.EncodeToString(hasher.Sum(nil))); actual != expected {
+		return errors.New("locked Claude Code source fingerprint does not match")
+	}
+	finalSourceInfo, err := source.Stat()
+	if err != nil || !finalSourceInfo.Mode().IsRegular() || !os.SameFile(openedSourceInfo, finalSourceInfo) {
+		return errors.New("locked Claude Code source changed while reading")
+	}
+	finalSourcePathInfo, err := inspectRegularNonSymlinkFile(sourcePath)
+	if err != nil || !os.SameFile(openedSourceInfo, finalSourcePathInfo) {
+		return errors.New("locked Claude Code source path changed while reading")
+	}
+	if err := destination.Sync(); err != nil {
+		return fmt.Errorf("sync staged Claude Code executable: %w", err)
+	}
+	closeErr := destination.Close()
+	closed = true
+	if closeErr != nil {
+		return fmt.Errorf("close staged Claude Code executable: %w", closeErr)
+	}
+	if err := os.Chmod(destinationPath, 0o555); err != nil {
+		return fmt.Errorf("lock staged Claude Code executable mode: %w", err)
+	}
+	destinationInfo, err := inspectRegularNonSymlinkFile(destinationPath)
+	if err != nil || destinationInfo.Mode().Perm() != 0o555 || destinationInfo.Size() != copied {
+		return errors.New("staged Claude Code executable is invalid")
+	}
+	destinationFingerprint, err := fingerprintBoundedRegularFile(ctx, destinationPath, maxStagedClaudeCodeBytes)
+	if err != nil || destinationFingerprint != expected {
+		return errors.New("staged Claude Code executable fingerprint does not match")
+	}
+	completed = true
+	return nil
+}
+
+func inspectRegularNonSymlinkFile(path string) (os.FileInfo, error) {
+	if !cleanNonRootAbsolutePath(path) {
+		return nil, errors.New("path is not a clean non-root absolute path")
+	}
+	components := make([]string, 0, 8)
+	for current := path; ; {
+		components = append(components, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+	var result os.FileInfo
+	for index := len(components) - 1; index >= 0; index-- {
+		info, err := os.Lstat(components[index])
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New("symbolic link in path")
+		}
+		if index > 0 && !info.IsDir() {
+			return nil, errors.New("non-directory parent path component")
+		}
+		if index == 0 {
+			result = info
+		}
+	}
+	if result == nil || !result.Mode().IsRegular() {
+		return nil, errors.New("path is not a regular file")
+	}
+	return result, nil
+}
+
+func fingerprintBoundedRegularFile(ctx context.Context, path string, maximum int64) (workflowkit.Fingerprint, error) {
+	info, err := inspectRegularNonSymlinkFile(path)
+	if err != nil || info.Size() < 0 || info.Size() > maximum {
+		return "", errors.New("regular file is invalid or exceeds its size limit")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return "", errors.New("regular file changed while opening")
+	}
+	hasher := sha256.New()
+	buffer := make([]byte, 64*1024)
+	var read int64
+	for {
+		if ctx == nil {
+			return "", errors.New("command context is required")
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		count, readErr := file.Read(buffer)
+		if count > 0 {
+			read += int64(count)
+			if read > maximum {
+				return "", errors.New("regular file exceeds its size limit")
+			}
+			if _, err := hasher.Write(buffer[:count]); err != nil {
+				return "", err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return "", readErr
+		}
+		if count == 0 {
+			return "", errors.New("regular file read made no progress")
+		}
+	}
+	if read != info.Size() {
+		return "", errors.New("regular file changed while reading")
+	}
+	final, err := file.Stat()
+	if err != nil || !final.Mode().IsRegular() || !os.SameFile(opened, final) {
+		return "", errors.New("regular file changed while reading")
+	}
+	finalPath, err := inspectRegularNonSymlinkFile(path)
+	if err != nil || !os.SameFile(opened, finalPath) {
+		return "", errors.New("regular file path changed while reading")
+	}
+	return workflowkit.Fingerprint("sha256:" + hex.EncodeToString(hasher.Sum(nil))), nil
 }
 
 func evaluatorJobName(request workflowkit.StageExecutionRequest, commandID string) string {

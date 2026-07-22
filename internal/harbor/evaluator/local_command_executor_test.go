@@ -52,6 +52,7 @@ func TestHarborEvaluatorLocalCommandExecutorRunsFrozenQwenAndReturnsTrustedEvide
 		t.Fatal("fake Harbor runner was not called")
 	}
 	assertFixedEvaluatorArgs(t, runner.command.Args, "qwen3.7-max", "2.1.207")
+	assertStagedClaudeCodeMount(t, runner.command.Args)
 	wantDockerPATH := executor.invocations[stageprovider.HarborEvaluatorQwenCommandID].DockerPATH
 	if got := runner.command.Env; len(got) != 4 || !contains(got, "LANG=C.UTF-8") || !containsPrefix(got, "HOME=") || !containsPrefix(got, "DOCKER_CONFIG=") || !contains(got, "PATH="+wantDockerPATH) {
 		t.Fatalf("Harbor process environment = %#v, want only isolated non-secret base keys", got)
@@ -117,6 +118,7 @@ func TestHarborEvaluatorLocalCommandExecutorRunsFrozenOpusWithItsApprovedEndpoin
 		t.Fatalf("evaluator artifact names = %#v", result.Artifacts)
 	}
 	assertFixedEvaluatorArgs(t, runner.command.Args, "claude-opus-4-6", "2.1.207")
+	assertStagedClaudeCodeMount(t, runner.command.Args)
 	if strings.Contains(strings.Join(runner.command.Args, " "), "ANTHROPIC_AUTH_TOKEN") || strings.Contains(strings.Join(runner.command.Args, " "), "https://") {
 		t.Fatalf("Harbor argv exposed a credential or endpoint: %#v", runner.command.Args)
 	}
@@ -501,7 +503,13 @@ func TestHarborEvaluatorLocalCommandExecutorRejectsUnboundDockerCLI(t *testing.T
 	}
 
 	for name, mutate := range map[string]func(*stageprovider.HarborEvaluatorInvocation){
-		"missing launcher version":           func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.LauncherVersion = "" },
+		"missing launcher version": func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.LauncherVersion = "" },
+		"relative Claude Code executable": func(candidate *stageprovider.HarborEvaluatorInvocation) {
+			candidate.ClaudeCodeExecutablePath = "claude"
+		},
+		"missing Claude Code version":        func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.ClaudeCodeVersion = "" },
+		"Claude Code agent version drift":    func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.ClaudeCodeVersion = "2.1.206" },
+		"missing Claude Code digest":         func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.ClaudeCodeContentSHA256 = "" },
 		"relative Python interpreter":        func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.PythonInterpreterPath = "python" },
 		"missing Python interpreter version": func(candidate *stageprovider.HarborEvaluatorInvocation) { candidate.PythonInterpreterVersion = "" },
 		"missing Python interpreter digest": func(candidate *stageprovider.HarborEvaluatorInvocation) {
@@ -519,6 +527,27 @@ func TestHarborEvaluatorLocalCommandExecutorRejectsUnboundDockerCLI(t *testing.T
 				t.Fatalf("invalid Python/launcher runtime identity was accepted: %+v", candidate)
 			}
 		})
+	}
+}
+
+func TestHarborEvaluatorLocalCommandExecutorRejectsClaudeCodeStagingDrift(t *testing.T) {
+	taskRoot := evaluatorTestTask(t)
+	digest, err := taskpolicy.ComputeManagedTaskDigestV2(taskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := evaluatorTestSnapshotZIP(t, taskRoot)
+	environment := map[string]string{"ANTHROPIC_AUTH_TOKEN": "unit-token", "QWEN_HARBOR_BASE_URL": "https://qwen.example.test/anthropic", "OPUS_HARBOR_BASE_URL": "https://opus.example.test/anthropic"}
+	runner := &evaluatorFakeRunner{t: t}
+	executor := evaluatorTestExecutor(t, environment, runner)
+	config := executor.invocations[stageprovider.HarborEvaluatorQwenCommandID]
+	if err := os.WriteFile(config.ClaudeCodeExecutablePath, []byte("drifted Claude Code fixture\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	request := evaluatorTestRequest(snapshot, workflowkit.SubjectDigest(digest), workflowadapter.HarborRunQwen, "run-claude-drift", "attempt-claude-drift")
+	_, err = executor.ExecuteLocalCommand(context.Background(), stageprovider.StageOperationInvocation{Request: request}, workflowadapter.LocalCommandOperationPayload{CommandID: stageprovider.HarborEvaluatorQwenCommandID})
+	if err == nil || !strings.Contains(err.Error(), "stage locked Claude Code executable") || runner.ran {
+		t.Fatalf("Claude Code staging drift error = %v, runner=%t; want fail closed before Harbor", err, runner.ran)
 	}
 }
 
@@ -607,17 +636,20 @@ func evaluatorTestExecutor(t *testing.T, environment map[string]string, runner C
 	launcherPath := filepath.Join(runtimeRoot, "bin", "harbor")
 	pythonPath := filepath.Join(runtimeRoot, "bin", "python")
 	sourceTreePath := filepath.Join(runtimeRoot, "site-packages", "harbor")
+	claudePath := filepath.Join(runtimeRoot, "bin", "claude")
 	dockerPath := filepath.Join(runtimeRoot, "bin", "docker")
 	composePath := filepath.Join(runtimeRoot, "libexec", "docker", "cli-plugins", "docker-compose")
 	buildxPath := filepath.Join(runtimeRoot, "libexec", "docker", "cli-plugins", "docker-buildx")
 	launcherContents := []byte("#!/bin/sh\nexit 0\n# locked Harbor launcher fixture\n")
 	pythonContents := []byte("#!/bin/sh\nexit 0\n# locked Python fixture\n")
+	claudeContents := []byte("#!/bin/sh\necho '2.1.207 (Claude Code)'\n# locked Claude Code fixture\n")
 	sourceContents := []byte("VERSION = '0.18.0'\n")
 	dockerContents := []byte("#!/bin/sh\nexit 0\n# locked Docker CLI fixture\n")
 	composeContents := []byte("#!/bin/sh\nexit 0\n# locked Docker Compose fixture\n")
 	buildxContents := []byte("#!/bin/sh\nexit 0\n# locked Docker Buildx fixture\n")
 	for path, contents := range map[string][]byte{
 		launcherPath: launcherContents,
+		claudePath:   claudeContents,
 		pythonPath:   pythonContents,
 		filepath.Join(sourceTreePath, "__init__.py"): sourceContents,
 		dockerPath:  dockerContents,
@@ -638,6 +670,7 @@ func evaluatorTestExecutor(t *testing.T, environment map[string]string, runner C
 		}
 		return stageprovider.HarborEvaluatorInvocation{
 			CommandID: commandID, LauncherPath: launcherPath, LauncherVersion: "0.18.0-test", LauncherContentSHA256: workflowkit.SHA256Fingerprint(launcherContents),
+			ClaudeCodeExecutablePath: claudePath, ClaudeCodeVersion: "2.1.207", ClaudeCodeContentSHA256: workflowkit.SHA256Fingerprint(claudeContents),
 			PythonInterpreterPath: pythonPath, PythonInterpreterVersion: "3.13.5", PythonInterpreterContentSHA256: workflowkit.SHA256Fingerprint(pythonContents),
 			PythonSourceTreePath: sourceTreePath, PythonSourceFilesSHA256: workflowkit.SHA256Fingerprint(sourceContents),
 			DockerCLIPath: dockerPath, DockerCLIContentSHA256: workflowkit.SHA256Fingerprint(dockerContents), DockerPATH: dockerPATH,
@@ -812,6 +845,36 @@ func assertFixedEvaluatorArgs(t *testing.T, arguments []string, model, version s
 	}
 	if !containsPair(arguments, "--agent-kwarg", "version="+version) || contains(arguments, "--upload") || contains(arguments, "--private") || contains(arguments, "--public") || contains(arguments, "--share-org") || contains(arguments, "--share-user") || !contains(arguments, "--quiet") || !contains(arguments, "--yes") {
 		t.Fatalf("Harbor argv does not freeze the local-only evaluator command: %#v", arguments)
+	}
+}
+
+func assertStagedClaudeCodeMount(t *testing.T, arguments []string) {
+	t.Helper()
+	mountJSON := evaluatorArgs(arguments)["--mounts"]
+	var mounts []map[string]any
+	if err := json.Unmarshal([]byte(mountJSON), &mounts); err != nil {
+		t.Fatalf("Harbor --mounts JSON = %q: %v", mountJSON, err)
+	}
+	if len(mounts) != 1 || mounts[0]["type"] != "bind" || mounts[0]["target"] != claudeCodeContainerPath || mounts[0]["read_only"] != true {
+		t.Fatalf("Harbor --mounts = %#v, want one fixed read-only Claude Code mount", mounts)
+	}
+	bind, ok := mounts[0]["bind"].(map[string]any)
+	if !ok || bind["create_host_path"] != false {
+		t.Fatalf("Harbor --mounts bind policy = %#v, want create_host_path=false", mounts[0]["bind"])
+	}
+	source, ok := mounts[0]["source"].(string)
+	if !ok || filepath.Base(source) != stagedClaudeCodeFilename || filepath.Base(filepath.Dir(source)) != stagedClaudeCodeDirectory {
+		t.Fatalf("Harbor --mounts source = %q, want controlled attempt-local Claude binary", source)
+	}
+	info, err := os.Lstat(source)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o555 {
+		t.Fatalf("staged Claude Code executable %q is invalid: %v", source, err)
+	}
+	// encoding/json sorts map keys, so this exact value is stable evidence of
+	// the fixed compose mount ABI rather than merely a semantically similar map.
+	want := `[{"bind":{"create_host_path":false},"read_only":true,"source":"` + source + `","target":"/usr/local/bin/claude","type":"bind"}]`
+	if mountJSON != want {
+		t.Fatalf("canonical Harbor --mounts = %q, want %q", mountJSON, want)
 	}
 }
 

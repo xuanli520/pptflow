@@ -54,6 +54,10 @@ const (
 	// HarborEvaluatorPythonCommandID labels the independently pinned Python
 	// interpreter used by the immutable Harbor launcher shebang.
 	HarborEvaluatorPythonCommandID = "harbor.python.interpreter"
+	// HarborEvaluatorClaudeCodeCommandID identifies the exact Claude Code
+	// executable mounted into the evaluator task container. Its version must
+	// agree with the typed evaluator contract's agent version.
+	HarborEvaluatorClaudeCodeCommandID = "harbor.claude-code.executable"
 	// HarborEvaluatorDockerCommandID identifies the Docker CLI that Harbor uses
 	// to build and run the isolated task environment.
 	HarborEvaluatorDockerCommandID = "harbor.docker.cli"
@@ -143,6 +147,7 @@ type HarborPythonSourceTreeLock struct {
 type HarborEvaluatorOperationLock struct {
 	Contract                   HarborEvaluatorOperationContract `json:"contract"`
 	Launcher                   LocalExecutableLock              `json:"launcher"`
+	ClaudeCodeExecutable       LocalExecutableLock              `json:"claude_code_executable"`
 	PythonInterpreter          LocalExecutableLock              `json:"python_interpreter"`
 	PythonSourceTree           HarborPythonSourceTreeLock       `json:"python_source_tree"`
 	DockerCLI                  LocalExecutableLock              `json:"docker_cli"`
@@ -296,6 +301,12 @@ func (lock HarborEvaluatorOperationLock) Validate() error {
 	}
 	if err := validateLocalExecutableLock(lock.Launcher); err != nil {
 		return err
+	}
+	if err := validateLocalExecutableLock(lock.ClaudeCodeExecutable); err != nil {
+		return err
+	}
+	if lock.ClaudeCodeExecutable.CommandID != HarborEvaluatorClaudeCodeCommandID || lock.ClaudeCodeExecutable.Version != lock.Contract.AgentVersion {
+		return fmt.Errorf("%w: Harbor evaluator Claude Code executable must be %s@%s", ErrInvalidDeploymentOperationCatalogLock, HarborEvaluatorClaudeCodeCommandID, lock.Contract.AgentVersion)
 	}
 	if err := validateLocalExecutableLock(lock.PythonInterpreter); err != nil {
 		return err

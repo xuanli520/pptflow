@@ -339,6 +339,10 @@ func rootCompositionEvaluatorLock(t *testing.T, catalogPath string, build stagep
 		record.LocalExecutable = &launcher
 		record.HarborEvaluator = &stageprovider.HarborEvaluatorOperationLock{
 			Contract: registration.HarborEvaluator.Clone(), Launcher: launcher,
+			ClaudeCodeExecutable: stageprovider.LocalExecutableLock{
+				CommandID: stageprovider.HarborEvaluatorClaudeCodeCommandID, AbsolutePath: "/opt/harbor-factory-test/claude", Version: registration.HarborEvaluator.AgentVersion,
+				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-claude-code")),
+			},
 			PythonInterpreter: stageprovider.LocalExecutableLock{
 				CommandID: stageprovider.HarborEvaluatorPythonCommandID, AbsolutePath: "/opt/harbor-factory-test/python3", Version: "3.13.0",
 				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-python")),

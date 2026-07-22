@@ -1003,6 +1003,10 @@ func catalogLockFixtureRecord(t *testing.T, registration stageprovider.Deploymen
 			contract := registration.HarborEvaluator.Clone()
 			record.HarborEvaluator = &stageprovider.HarborEvaluatorOperationLock{
 				Contract: contract, Launcher: *record.LocalExecutable,
+				ClaudeCodeExecutable: stageprovider.LocalExecutableLock{
+					CommandID: stageprovider.HarborEvaluatorClaudeCodeCommandID, AbsolutePath: "/opt/harbor/bin/claude", Version: contract.AgentVersion,
+					ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-claude-code-fixture")),
+				},
 				PythonInterpreter: stageprovider.LocalExecutableLock{
 					CommandID: stageprovider.HarborEvaluatorPythonCommandID, AbsolutePath: "/opt/harbor/bin/python3", Version: "3.13.0",
 					ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-python-fixture")),

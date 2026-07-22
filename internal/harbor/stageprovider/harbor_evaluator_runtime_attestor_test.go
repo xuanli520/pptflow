@@ -129,6 +129,19 @@ func TestHarborEvaluatorCatalogAndLockRequireExactChildContract(t *testing.T) {
 		}
 	})
 
+	t.Run("Claude Code executable is contract-versioned", func(t *testing.T) {
+		candidate := fixture.lock.Clone()
+		candidate.Operations[0].HarborEvaluator.ClaudeCodeExecutable.CommandID = "other.claude"
+		if err := candidate.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+			t.Fatalf("Claude Code command id error = %v, want invalid lock", err)
+		}
+		candidate = fixture.lock.Clone()
+		candidate.Operations[0].HarborEvaluator.ClaudeCodeExecutable.Version = "2.1.206"
+		if err := candidate.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
+			t.Fatalf("Claude Code version error = %v, want invalid lock", err)
+		}
+	})
+
 	t.Run("Docker and Compose basenames are fixed", func(t *testing.T) {
 		candidate := fixture.lock.Clone()
 		candidate.Operations[0].HarborEvaluator.DockerCLI.AbsolutePath = filepath.Join(filepath.Dir(fixture.docker), "docker-real")
@@ -179,6 +192,7 @@ func TestHarborEvaluatorRuntimeAttestorProvesLocalInstallationWithoutSecretPersi
 	}
 	locked := fixture.attestation.Record.HarborEvaluator
 	if invocation.LauncherPath != fixture.launcher || invocation.LauncherVersion != locked.Launcher.Version || invocation.LauncherContentSHA256 != locked.Launcher.ContentSHA256 ||
+		invocation.ClaudeCodeExecutablePath != fixture.claude || invocation.ClaudeCodeVersion != locked.ClaudeCodeExecutable.Version || invocation.ClaudeCodeContentSHA256 != locked.ClaudeCodeExecutable.ContentSHA256 ||
 		invocation.PythonInterpreterPath != fixture.interpreter || invocation.PythonInterpreterVersion != locked.PythonInterpreter.Version || invocation.PythonInterpreterContentSHA256 != locked.PythonInterpreter.ContentSHA256 ||
 		invocation.PythonSourceTreePath != fixture.sourceTree || invocation.PythonSourceFilesSHA256 != locked.PythonSourceTree.PythonFilesSHA256 ||
 		invocation.DockerCLIPath != fixture.docker || invocation.DockerPATH != wantDockerPATH || invocation.DockerVersion != HarborEvaluatorDockerVersion || invocation.DockerServerVersion != HarborEvaluatorDockerServerVersion ||
@@ -206,6 +220,40 @@ func TestHarborEvaluatorRuntimeAttestorProvesLocalInstallationWithoutSecretPersi
 	}
 }
 
+func TestHarborEvaluatorClaudeCodeExecutableCloneAndInvocationRoundTrip(t *testing.T) {
+	fixture := newHarborEvaluatorAttestationFixture(t, HarborEvaluatorQwenCommandID)
+	original := fixture.attestation.Record.HarborEvaluator
+	cloned := original.Clone()
+	if cloned.ClaudeCodeExecutable != original.ClaudeCodeExecutable {
+		t.Fatalf("cloned Claude Code executable = %+v, want %+v", cloned.ClaudeCodeExecutable, original.ClaudeCodeExecutable)
+	}
+
+	canonical, err := fixture.lock.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseDeploymentOperationCatalogLockJSON(canonical)
+	if err != nil {
+		t.Fatalf("parse evaluator lock: %v", err)
+	}
+	parsedExecutable := parsed.Operations[0].HarborEvaluator.ClaudeCodeExecutable
+	if parsedExecutable != original.ClaudeCodeExecutable {
+		t.Fatalf("round-tripped Claude Code executable = %+v, want %+v", parsedExecutable, original.ClaudeCodeExecutable)
+	}
+
+	invocation, err := NewHarborEvaluatorInvocation(HarborEvaluatorQwenCommandID, cloned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeLock, err := harborEvaluatorRuntimeLockFromInvocation(invocation)
+	if err != nil {
+		t.Fatalf("reconstruct evaluator runtime lock: %v", err)
+	}
+	if runtimeLock.ClaudeCodeExecutable != original.ClaudeCodeExecutable {
+		t.Fatalf("invocation round-trip Claude Code executable = %+v, want %+v", runtimeLock.ClaudeCodeExecutable, original.ClaudeCodeExecutable)
+	}
+}
+
 func TestHarborEvaluatorPrelaunchAttestationRejectsPostCompositionRuntimeDrift(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -213,6 +261,9 @@ func TestHarborEvaluatorPrelaunchAttestationRejectsPostCompositionRuntimeDrift(t
 	}{
 		{name: "launcher", mutate: func(t *testing.T, fixture *harborEvaluatorAttestationFixture) {
 			writeHarborEvaluatorTestFile(t, fixture.launcher, "#!"+fixture.interpreter+"\nprintf 'changed\\n'\n", 0o700)
+		}},
+		{name: "Claude Code executable", mutate: func(t *testing.T, fixture *harborEvaluatorAttestationFixture) {
+			writeHarborEvaluatorTestFile(t, fixture.claude, "#!/bin/sh\nexit 99\n", 0o700)
 		}},
 		{name: "Python interpreter", mutate: func(t *testing.T, fixture *harborEvaluatorAttestationFixture) {
 			writeHarborEvaluatorTestFile(t, fixture.interpreter, "#!/bin/sh\nexit 99\n", 0o700)
@@ -251,6 +302,25 @@ func TestHarborEvaluatorPrelaunchAttestationRejectsPostCompositionRuntimeDrift(t
 				t.Fatalf("post-composition runtime drift error = %v, want runtime attestation failure", err)
 			}
 		})
+	}
+}
+
+func TestHarborEvaluatorPrelaunchAttestationRejectsClaudeCodeVersionDrift(t *testing.T) {
+	fixture := newHarborEvaluatorAttestationFixture(t, HarborEvaluatorQwenCommandID)
+	evaluator := fixture.attestation.Record.HarborEvaluator.Clone()
+	claudeContents := "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '2.1.206 (Claude Code)\\n'; exit 0; fi\nexit 1\n"
+	writeHarborEvaluatorTestFile(t, fixture.claude, claudeContents, 0o700)
+	evaluator.ClaudeCodeExecutable.ContentSHA256 = workflowkit.SHA256Fingerprint([]byte(claudeContents))
+	invocation, err := NewHarborEvaluatorInvocation(HarborEvaluatorQwenCommandID, evaluator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(t.TempDir(), "home")
+	if err := os.MkdirAll(filepath.Join(home, ".docker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AttestHarborEvaluatorInvocationBeforeLaunch(context.Background(), invocation, home); err == nil || !errors.Is(err, ErrDeploymentOperationRuntimeAttestationFailed) {
+		t.Fatalf("Claude Code version drift error = %v, want runtime attestation failure", err)
 	}
 }
 
@@ -452,6 +522,7 @@ type harborEvaluatorAttestationFixture struct {
 	endpoint            string
 	secretValue         string
 	launcher            string
+	claude              string
 	interpreter         string
 	sourceTree          string
 	docker              string
@@ -476,6 +547,9 @@ func newHarborEvaluatorAttestationFixture(t *testing.T, commandID string) *harbo
 	launcher := filepath.Join(root, "harbor")
 	launcherContents := "#!" + interpreter + "\nif [ \"$1\" = \"--version\" ]; then printf '0.18.0\\n'; exit 0; fi\nexit 1\n" + strings.Repeat("# controlled Harbor launcher padding\n", 128)
 	writeHarborEvaluatorTestFile(t, launcher, launcherContents, 0o700)
+	claude := filepath.Join(root, "claude")
+	claudeContents := "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '2.1.207 (Claude Code)\\n'; exit 0; fi\nexit 1\n"
+	writeHarborEvaluatorTestFile(t, claude, claudeContents, 0o700)
 	docker := filepath.Join(root, "docker")
 	pluginDirectory := filepath.Join(root, "libexec", "docker", "cli-plugins")
 	if err := os.MkdirAll(pluginDirectory, 0o700); err != nil {
@@ -537,6 +611,7 @@ func newHarborEvaluatorAttestationFixture(t *testing.T, commandID string) *harbo
 		t.Fatal(err)
 	}
 	launcherLock := LocalExecutableLock{CommandID: commandID, AbsolutePath: launcher, Version: "0.18.0-launcher", ContentSHA256: workflowkit.SHA256Fingerprint([]byte(launcherContents))}
+	claudeLock := LocalExecutableLock{CommandID: HarborEvaluatorClaudeCodeCommandID, AbsolutePath: claude, Version: contract.AgentVersion, ContentSHA256: workflowkit.SHA256Fingerprint([]byte(claudeContents))}
 	pythonContents := "#!/bin/sh\nexec /bin/sh \"$@\"\n"
 	pythonLock := LocalExecutableLock{CommandID: HarborEvaluatorPythonCommandID, AbsolutePath: interpreter, Version: "3.13.0", ContentSHA256: workflowkit.SHA256Fingerprint([]byte(pythonContents))}
 	dockerLock := LocalExecutableLock{CommandID: HarborEvaluatorDockerCommandID, AbsolutePath: docker, Version: HarborEvaluatorDockerVersion, ContentSHA256: workflowkit.SHA256Fingerprint([]byte(dockerContents))}
@@ -548,7 +623,7 @@ func newHarborEvaluatorAttestationFixture(t *testing.T, commandID string) *harbo
 		PromptContentFingerprint: workflowkit.SHA256Fingerprint([]byte("evaluator-prompt")), SchemaContentFingerprint: workflowkit.SHA256Fingerprint([]byte("evaluator-schema")),
 		ExecutionKind: workflowadapter.StageOperationPayloadLocalCommand, LocalExecutable: &launcherLock,
 		HarborEvaluator: &HarborEvaluatorOperationLock{
-			Contract: contract, Launcher: launcherLock, PythonInterpreter: pythonLock,
+			Contract: contract, Launcher: launcherLock, ClaudeCodeExecutable: claudeLock, PythonInterpreter: pythonLock,
 			PythonSourceTree: HarborPythonSourceTreeLock{AbsolutePath: sourceTree, PythonFilesSHA256: sourceFingerprint}, DockerCLI: dockerLock, DockerComposePlugin: composeLock,
 			DockerServerVersion: HarborEvaluatorDockerServerVersion, DockerBuildxPlugin: buildxLock,
 			HarborVersionOutput: HarborEvaluatorHarborVersion, DockerComposeVersionOutput: HarborEvaluatorDockerComposeVersionOutput, DockerBuildxVersionOutput: HarborEvaluatorDockerBuildxVersionOutput,
@@ -571,7 +646,7 @@ func newHarborEvaluatorAttestationFixture(t *testing.T, commandID string) *harbo
 	}
 	return &harborEvaluatorAttestationFixture{
 		catalog: catalogDocument.Clone(), lock: lock.Clone(), contract: contract.Clone(), endpoint: endpoint, secretValue: "super-secret-never-persisted",
-		launcher: launcher, interpreter: interpreter, sourceTree: sourceTree, docker: docker, compose: compose, buildx: buildx,
+		launcher: launcher, claude: claude, interpreter: interpreter, sourceTree: sourceTree, docker: docker, compose: compose, buildx: buildx,
 		dockerServerMarker: dockerServerMarker, dockerInfoMarker: dockerInfoMarker, dockerComposeMarker: dockerComposeMarker, dockerBuildxMarker: dockerBuildxMarker,
 		attestation: DeploymentOperationRuntimeAttestation{CatalogReceipt: verifier.CatalogReceipt(), LockIdentity: verifier.LockIdentity(), HarborFlowBuild: verifier.HarborFlowBuild(), Record: record.Clone(), Resolution: resolution},
 	}

@@ -18,6 +18,7 @@ fi
 
 : "${HARBOR_FACTORY_GIT_EXECUTABLE:?set HARBOR_FACTORY_GIT_EXECUTABLE to the absolute Git executable}"
 : "${HARBOR_FACTORY_HARBOR_LAUNCHER:?set HARBOR_FACTORY_HARBOR_LAUNCHER to the absolute Harbor launcher}"
+: "${HARBOR_FACTORY_CLAUDE_CODE_EXECUTABLE:?set HARBOR_FACTORY_CLAUDE_CODE_EXECUTABLE to the preinstalled absolute Claude Code 2.1.207 executable}"
 : "${HARBOR_FACTORY_PYTHON_INTERPRETER:?set HARBOR_FACTORY_PYTHON_INTERPRETER to the absolute Harbor Python interpreter}"
 : "${HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE:?set HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE to the absolute Harbor Python package directory}"
 : "${HARBOR_FACTORY_DOCKER_EXECUTABLE:?set HARBOR_FACTORY_DOCKER_EXECUTABLE to the absolute Docker executable}"
@@ -31,13 +32,14 @@ fi
 
 git_executable="$HARBOR_FACTORY_GIT_EXECUTABLE"
 harbor_launcher="$HARBOR_FACTORY_HARBOR_LAUNCHER"
+claude_code_executable="$HARBOR_FACTORY_CLAUDE_CODE_EXECUTABLE"
 python_interpreter="$HARBOR_FACTORY_PYTHON_INTERPRETER"
 python_source_tree="$HARBOR_FACTORY_HARBOR_PYTHON_SOURCE_TREE"
 docker_executable="$HARBOR_FACTORY_DOCKER_EXECUTABLE"
 docker_compose_plugin="$HARBOR_FACTORY_DOCKER_COMPOSE_PLUGIN"
 docker_buildx_plugin="$HARBOR_FACTORY_DOCKER_BUILDX_PLUGIN"
 
-for value in "$git_executable" "$harbor_launcher" "$python_interpreter" "$python_source_tree" "$docker_executable" "$docker_compose_plugin" "$docker_buildx_plugin"; do
+for value in "$git_executable" "$harbor_launcher" "$claude_code_executable" "$python_interpreter" "$python_source_tree" "$docker_executable" "$docker_compose_plugin" "$docker_buildx_plugin"; do
   if [[ "$value" != /* ]]; then
     die "all runtime paths must be absolute"
   fi
@@ -79,6 +81,7 @@ exec env GOFLAGS= go run -mod=readonly ./tools/codeedge-evaluator-lock-build \
   --lock-version "$HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION" \
   --git-executable "$git_executable" \
   --harbor-launcher "$harbor_launcher" \
+	--claude-code-executable "$claude_code_executable" \
   --python-interpreter "$python_interpreter" \
   --python-source-tree "$python_source_tree" \
 	--docker-cli "$docker_executable" \

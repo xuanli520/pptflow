@@ -63,6 +63,9 @@ type HarborEvaluatorInvocation struct {
 	LauncherPath                   string                             `json:"launcher_path"`
 	LauncherVersion                string                             `json:"launcher_version"`
 	LauncherContentSHA256          workflowkit.Fingerprint            `json:"launcher_content_sha256"`
+	ClaudeCodeExecutablePath       string                             `json:"claude_code_executable_path"`
+	ClaudeCodeVersion              string                             `json:"claude_code_version"`
+	ClaudeCodeContentSHA256        workflowkit.Fingerprint            `json:"claude_code_content_sha256"`
 	PythonInterpreterPath          string                             `json:"python_interpreter_path"`
 	PythonInterpreterVersion       string                             `json:"python_interpreter_version"`
 	PythonInterpreterContentSHA256 workflowkit.Fingerprint            `json:"python_interpreter_content_sha256"`
@@ -225,6 +228,7 @@ func harborEvaluatorInvocationFromLock(commandID string, evaluator HarborEvaluat
 	contract := evaluator.Contract.canonicalized()
 	return HarborEvaluatorInvocation{
 		CommandID: commandID, LauncherPath: evaluator.Launcher.AbsolutePath, LauncherVersion: evaluator.Launcher.Version, LauncherContentSHA256: evaluator.Launcher.ContentSHA256,
+		ClaudeCodeExecutablePath: evaluator.ClaudeCodeExecutable.AbsolutePath, ClaudeCodeVersion: evaluator.ClaudeCodeExecutable.Version, ClaudeCodeContentSHA256: evaluator.ClaudeCodeExecutable.ContentSHA256,
 		PythonInterpreterPath: evaluator.PythonInterpreter.AbsolutePath, PythonInterpreterVersion: evaluator.PythonInterpreter.Version, PythonInterpreterContentSHA256: evaluator.PythonInterpreter.ContentSHA256,
 		PythonSourceTreePath: evaluator.PythonSourceTree.AbsolutePath, PythonSourceFilesSHA256: evaluator.PythonSourceTree.PythonFilesSHA256,
 		DockerCLIPath: evaluator.DockerCLI.AbsolutePath, DockerCLIContentSHA256: evaluator.DockerCLI.ContentSHA256,
@@ -263,6 +267,9 @@ func AttestHarborEvaluatorInvocationBeforeLaunch(ctx context.Context, invocation
 	if err := attestLockedRegularFile(ctx, evaluator.Launcher); err != nil {
 		return nil, err
 	}
+	if err := attestLockedRegularFile(ctx, evaluator.ClaudeCodeExecutable); err != nil {
+		return nil, err
+	}
 	if err := attestLockedRegularFile(ctx, evaluator.PythonInterpreter); err != nil {
 		return nil, err
 	}
@@ -278,10 +285,13 @@ func AttestHarborEvaluatorInvocationBeforeLaunch(ctx context.Context, invocation
 	if err := attestHarborEvaluatorVersion(ctx, evaluator); err != nil {
 		return nil, err
 	}
+	if err := attestHarborEvaluatorClaudeCodeVersion(ctx, evaluator.ClaudeCodeExecutable); err != nil {
+		return nil, err
+	}
 	// Re-prove every executable after all subprocess probes. This closes the
 	// materialization-to-launch window and catches pathname replacement by a
 	// probe or concurrent local change before the caller executes Harbor.
-	for _, executable := range []LocalExecutableLock{evaluator.Launcher, evaluator.PythonInterpreter, evaluator.DockerCLI, evaluator.DockerComposePlugin, evaluator.DockerBuildxPlugin} {
+	for _, executable := range []LocalExecutableLock{evaluator.Launcher, evaluator.ClaudeCodeExecutable, evaluator.PythonInterpreter, evaluator.DockerCLI, evaluator.DockerComposePlugin, evaluator.DockerBuildxPlugin} {
 		if err := attestLockedRegularFile(ctx, executable); err != nil {
 			return nil, err
 		}
@@ -299,6 +309,9 @@ func harborEvaluatorRuntimeLockFromInvocation(invocation HarborEvaluatorInvocati
 	if !isHarborEvaluatorCommandID(invocation.CommandID) || invocation.HarborVersion != HarborEvaluatorHarborVersion {
 		return HarborEvaluatorOperationLock{}, fmt.Errorf("%w: Harbor evaluator invocation identity is invalid", ErrDeploymentOperationRuntimeAttestationFailed)
 	}
+	if invocation.ClaudeCodeVersion != invocation.AgentVersion {
+		return HarborEvaluatorOperationLock{}, fmt.Errorf("%w: Harbor evaluator Claude Code invocation version does not match its agent version", ErrDeploymentOperationRuntimeAttestationFailed)
+	}
 	if invocation.DockerVersion != HarborEvaluatorDockerVersion || invocation.DockerServerVersion != HarborEvaluatorDockerServerVersion ||
 		invocation.DockerComposeVersion != HarborEvaluatorDockerComposeVersion || invocation.DockerComposeVersionOutput != HarborEvaluatorDockerComposeVersionOutput ||
 		invocation.DockerBuildxVersion != HarborEvaluatorDockerBuildxVersion || invocation.DockerBuildxVersionOutput != HarborEvaluatorDockerBuildxVersionOutput {
@@ -311,6 +324,9 @@ func harborEvaluatorRuntimeLockFromInvocation(invocation HarborEvaluatorInvocati
 	evaluator := HarborEvaluatorOperationLock{
 		Launcher: LocalExecutableLock{
 			CommandID: invocation.CommandID, AbsolutePath: invocation.LauncherPath, Version: invocation.LauncherVersion, ContentSHA256: invocation.LauncherContentSHA256,
+		},
+		ClaudeCodeExecutable: LocalExecutableLock{
+			CommandID: HarborEvaluatorClaudeCodeCommandID, AbsolutePath: invocation.ClaudeCodeExecutablePath, Version: invocation.ClaudeCodeVersion, ContentSHA256: invocation.ClaudeCodeContentSHA256,
 		},
 		PythonInterpreter: LocalExecutableLock{
 			CommandID: HarborEvaluatorPythonCommandID, AbsolutePath: invocation.PythonInterpreterPath, Version: invocation.PythonInterpreterVersion, ContentSHA256: invocation.PythonInterpreterContentSHA256,
@@ -330,7 +346,7 @@ func harborEvaluatorRuntimeLockFromInvocation(invocation HarborEvaluatorInvocati
 		DockerBuildxVersionOutput: invocation.DockerBuildxVersionOutput,
 		HarborVersionOutput:       invocation.HarborVersion,
 	}
-	for _, executable := range []LocalExecutableLock{evaluator.Launcher, evaluator.PythonInterpreter, evaluator.DockerCLI, evaluator.DockerComposePlugin, evaluator.DockerBuildxPlugin} {
+	for _, executable := range []LocalExecutableLock{evaluator.Launcher, evaluator.ClaudeCodeExecutable, evaluator.PythonInterpreter, evaluator.DockerCLI, evaluator.DockerComposePlugin, evaluator.DockerBuildxPlugin} {
 		if err := validateLocalExecutableLock(executable); err != nil {
 			return HarborEvaluatorOperationLock{}, fmt.Errorf("%w: Harbor evaluator invocation executable identity is invalid", ErrDeploymentOperationRuntimeAttestationFailed)
 		}
@@ -416,6 +432,27 @@ func attestHarborEvaluatorVersion(ctx context.Context, evaluator HarborEvaluator
 	version, ok := normalizedHarborEvaluatorVersionOutput(output.Bytes())
 	if !ok || version != evaluator.HarborVersionOutput {
 		return fmt.Errorf("%w: locked Harbor --version output does not match the immutable lock", ErrDeploymentOperationRuntimeAttestationFailed)
+	}
+	return contextRuntimeAttestationError(ctx)
+}
+
+func attestHarborEvaluatorClaudeCodeVersion(ctx context.Context, claude LocalExecutableLock) error {
+	if err := contextRuntimeAttestationError(ctx); err != nil {
+		return err
+	}
+	command := exec.CommandContext(ctx, claude.AbsolutePath, "--version")
+	command.Dir = filepath.Dir(claude.AbsolutePath)
+	// The version probe must not inherit endpoint or credential variables.
+	command.Env = []string{}
+	output := &harborEvaluatorLimitedBuffer{limit: harborEvaluatorVersionOutputLimit}
+	command.Stdout = output
+	command.Stderr = io.Discard
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("%w: locked Claude Code --version probe failed", ErrDeploymentOperationRuntimeAttestationFailed)
+	}
+	versionOutput, ok := normalizedHarborEvaluatorVersionOutput(output.Bytes())
+	if !ok || versionOutput != claude.Version+" (Claude Code)" {
+		return fmt.Errorf("%w: locked Claude Code --version output does not match the immutable lock", ErrDeploymentOperationRuntimeAttestationFailed)
 	}
 	return contextRuntimeAttestationError(ctx)
 }

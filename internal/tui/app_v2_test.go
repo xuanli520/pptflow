@@ -551,6 +551,117 @@ func TestAppModelRoutesAuthoringRecoveryThroughRetryAndRetainsItsIdempotencyKey(
 	}
 }
 
+func TestAppModelQueuesConfirmedRunActionsUntilRefreshCompletes(t *testing.T) {
+	tests := []struct {
+		name         string
+		actionKey    rune
+		configureRun func(*app.TaskBoardRun)
+		wantMutation taskBoardMutationKind
+	}{
+		{
+			name:      "authoring admission repair",
+			actionKey: 't',
+			configureRun: func(run *app.TaskBoardRun) {
+				run.Status = "waiting_continuation"
+				run.CanRetry = true
+				run.RetryStrategy = app.TaskBoardRetryStrategyAuthoringAdmissionRepair
+			},
+			wantMutation: taskBoardRetryMutation,
+		},
+		{
+			name:      "cancel",
+			actionKey: 'x',
+			configureRun: func(run *app.TaskBoardRun) {
+				run.Status = "running"
+			},
+			wantMutation: taskBoardCancelMutation,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := taskBoardTestSnapshot(true)
+			test.configureRun(&snapshot.Tasks[0].Runs[0])
+			stub := &taskBoardGatewayStub{snapshot: snapshot}
+			model := loadedTaskBoardModel(t, stub)
+			model.detail = newDetailModel(model.board.SelectedTask())
+
+			updated, _ := model.handleKey(keyRune(test.actionKey), nil)
+			model = updated.(appModel)
+			if model.action == nil {
+				t.Fatal("run action prompt was not opened")
+			}
+			model.action.reasonInput.SetValue("confirm while the board is refreshing")
+			model.refreshInFlight = true
+
+			updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+			model = updated.(appModel)
+			if command != nil || model.activeMutation != "" || model.deferredAction == nil {
+				t.Fatalf("first confirmation was not deferred: command:%v active:%q deferred:%+v", command, model.activeMutation, model.deferredAction)
+			}
+			queuedKey := model.deferredAction.key
+			if queuedKey == "" || stub.keys != 1 {
+				t.Fatalf("first confirmation key = %q, generated keys=%d", queuedKey, stub.keys)
+			}
+
+			// Repeated Enter while the same refresh is in flight must not create a
+			// second action or a second idempotency key.
+			updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+			model = updated.(appModel)
+			if command != nil || model.deferredAction == nil || model.deferredAction.key != queuedKey || stub.keys != 1 {
+				t.Fatalf("repeat confirmation changed the queued action: command:%v deferred:%+v keys:%d", command, model.deferredAction, stub.keys)
+			}
+
+			updated, command = model.Update(taskBoardLoadedMsg{snapshot: snapshot, epoch: model.refreshEpoch})
+			model = updated.(appModel)
+			if command == nil || model.activeMutation != test.wantMutation || model.deferredAction != nil {
+				t.Fatalf("refresh completion did not dispatch the queued action: command:%v active:%q deferred:%+v", command, model.activeMutation, model.deferredAction)
+			}
+			message, ok := command().(taskBoardMutationMsg)
+			if !ok || message.kind != test.wantMutation {
+				t.Fatalf("queued action result = %#v, want %q", message, test.wantMutation)
+			}
+			switch test.wantMutation {
+			case taskBoardRetryMutation:
+				if len(stub.retryRequests) != 1 || stub.retryRequests[0].IdempotencyKey != queuedKey || stub.retryRequests[0].Reason != "confirm while the board is refreshing" {
+					t.Fatalf("deferred retry request = %+v, queued key=%q", stub.retryRequests, queuedKey)
+				}
+			case taskBoardCancelMutation:
+				if len(stub.cancelRequests) != 1 || stub.cancelRequests[0].IdempotencyKey != queuedKey || stub.cancelRequests[0].Reason != "confirm while the board is refreshing" {
+					t.Fatalf("deferred cancel request = %+v, queued key=%q", stub.cancelRequests, queuedKey)
+				}
+			}
+		})
+	}
+}
+
+func TestAppModelCancelsDeferredRunActionBeforeRefreshCompletes(t *testing.T) {
+	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	updated, _ := model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	model.action.reasonInput.SetValue("do not send this retry")
+	model.refreshInFlight = true
+	updated, _ = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.deferredAction == nil {
+		t.Fatal("retry confirmation was not deferred")
+	}
+
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, nil)
+	model = updated.(appModel)
+	if command != nil || model.action != nil || model.deferredAction != nil {
+		t.Fatalf("escape did not cancel the deferred action: command:%v action:%+v deferred:%+v", command, model.action, model.deferredAction)
+	}
+	updated, command = model.Update(taskBoardLoadedMsg{snapshot: stub.snapshot, epoch: model.refreshEpoch})
+	model = updated.(appModel)
+	if command != nil || model.activeMutation != "" || len(stub.retryRequests) != 0 {
+		t.Fatalf("canceled deferred action was dispatched: command:%v active:%q requests:%+v", command, model.activeMutation, stub.retryRequests)
+	}
+}
+
 func TestAppModelRequestsAuthoringChangesThenDispatchesRepairContinuation(t *testing.T) {
 	snapshot := taskBoardTestSnapshot(true)
 	snapshot.Tasks[0].RunStatus = "waiting_review"

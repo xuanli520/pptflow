@@ -135,7 +135,7 @@ func doctorToolSpecs() []toolSpec {
 		}},
 		{name: "harbor", binary: "harbor", required: true, probes: []probeSpec{
 			{name: "harbor version", args: []string{"--version"}, required: false, version: true},
-			{name: "harbor run capability", args: []string{"run", "--help"}, required: true, requireAll: []string{"--path", "--agent", "--model", "--n-attempts", "--n-concurrent", "--max-retries", "--env-file"}},
+			{name: "harbor run capability", args: []string{"run", "--help"}, required: true, requireAll: []string{"--path", "--agent", "--model", "--n-attempts", "--n-concurrent", "--max-retries", "--env-file", "--mounts"}},
 		}},
 		{name: "go", binary: "go", required: true, minVersion: "1.26", probes: []probeSpec{
 			{name: "go version", args: []string{"version"}, required: true, version: true, goMin: "1.26"},

@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -28,6 +29,7 @@ import (
 const (
 	modulePath               = "github.com/purplevoid/harbor-factory"
 	maxAssetBytes      int64 = 4 * 1024 * 1024
+	maxExecutableBytes int64 = 512 * 1024 * 1024
 	maxProbeBytes            = 64 * 1024
 	maxSourceTreeBytes       = 64 * 1024 * 1024
 	maxShebangBytes    int64 = 4 * 1024
@@ -67,23 +69,24 @@ var generatedProductionLocks = map[string]struct{}{
 }
 
 type buildConfig struct {
-	sourceRoot          string
-	catalogPath         string
-	assetManifest       string
-	profilePath         string
-	contractRoot        string
-	outputPath          string
-	buildVersion        string
-	lockID              string
-	lockVersion         string
-	gitExecutable       string
-	harborLauncher      string
-	pythonInterpreter   string
-	pythonSourceTree    string
-	dockerCLI           string
-	dockerComposePlugin string
-	dockerBuildxPlugin  string
-	lookupEnvironment   func(string) (string, bool)
+	sourceRoot           string
+	catalogPath          string
+	assetManifest        string
+	profilePath          string
+	contractRoot         string
+	outputPath           string
+	buildVersion         string
+	lockID               string
+	lockVersion          string
+	gitExecutable        string
+	harborLauncher       string
+	claudeCodeExecutable string
+	pythonInterpreter    string
+	pythonSourceTree     string
+	dockerCLI            string
+	dockerComposePlugin  string
+	dockerBuildxPlugin   string
+	lookupEnvironment    func(string) (string, bool)
 }
 
 type evaluatorAssetReference struct {
@@ -165,6 +168,8 @@ type evaluatorResultSchemaTrialContract struct {
 type evaluatorRuntime struct {
 	LauncherFingerprint        workflowkit.Fingerprint
 	HarborVersion              string
+	ClaudeCodeFingerprint      workflowkit.Fingerprint
+	ClaudeCodeVersion          string
 	PythonFingerprint          workflowkit.Fingerprint
 	PythonVersion              string
 	SourceFingerprint          workflowkit.Fingerprint
@@ -178,6 +183,7 @@ type evaluatorRuntime struct {
 	DockerBuildxVersion        string
 	DockerBuildxVersionOutput  string
 	launcherSnapshot           evaluatorExecutableSnapshot
+	claudeCodeSnapshot         evaluatorExecutableSnapshot
 	pythonSnapshot             evaluatorExecutableSnapshot
 	sourceSnapshot             evaluatorSourceTreeSnapshot
 	dockerSnapshot             evaluatorExecutableSnapshot
@@ -198,6 +204,7 @@ func main() {
 	flag.StringVar(&config.lockVersion, "lock-version", "", "immutable deployment lock version")
 	flag.StringVar(&config.gitExecutable, "git-executable", "", "absolute Git executable used to prove source identity")
 	flag.StringVar(&config.harborLauncher, "harbor-launcher", "", "absolute frozen Harbor launcher")
+	flag.StringVar(&config.claudeCodeExecutable, "claude-code-executable", "", "absolute frozen Claude Code executable mounted into evaluator containers")
 	flag.StringVar(&config.pythonInterpreter, "python-interpreter", "", "absolute frozen Python interpreter named by the Harbor launcher")
 	flag.StringVar(&config.pythonSourceTree, "python-source-tree", "", "absolute Harbor Python package root")
 	flag.StringVar(&config.dockerCLI, "docker-cli", "", "absolute frozen Docker CLI")
@@ -307,8 +314,15 @@ func buildLock(config buildConfig, observedRuntime *evaluatorRuntime) (stageprov
 			CommandID: payload.CommandID, AbsolutePath: config.harborLauncher,
 			Version: runtime.HarborVersion + "-launcher", ContentSHA256: runtime.LauncherFingerprint,
 		}
+		if runtime.ClaudeCodeVersion != contract.AgentVersion {
+			return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("locked Claude Code --version %q does not match evaluator agent version %q", runtime.ClaudeCodeVersion, contract.AgentVersion)
+		}
 		typedLock := stageprovider.HarborEvaluatorOperationLock{
 			Contract: contract, Launcher: launcher,
+			ClaudeCodeExecutable: stageprovider.LocalExecutableLock{
+				CommandID: stageprovider.HarborEvaluatorClaudeCodeCommandID, AbsolutePath: config.claudeCodeExecutable,
+				Version: runtime.ClaudeCodeVersion, ContentSHA256: runtime.ClaudeCodeFingerprint,
+			},
 			PythonInterpreter: stageprovider.LocalExecutableLock{
 				CommandID: stageprovider.HarborEvaluatorPythonCommandID, AbsolutePath: config.pythonInterpreter,
 				Version: runtime.PythonVersion, ContentSHA256: runtime.PythonFingerprint,
@@ -678,6 +692,18 @@ func discoverEvaluatorRuntime(config buildConfig) (evaluatorRuntime, error) {
 	if err := verifyHarborRuntimeInputsUnchanged(config, launcherSnapshot, pythonSnapshot, sourceSnapshot); err != nil {
 		return evaluatorRuntime{}, fmt.Errorf("locked Harbor runtime changed during interpreter version probing: %w", err)
 	}
+	claudeCodeSnapshot, err := snapshotEvaluatorExecutable(config.claudeCodeExecutable)
+	if err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("Claude Code executable: %w", err)
+	}
+	claudeCodeOutput, err := probe(config.claudeCodeExecutable, []string{}, "--version")
+	claudeCodeVersion, parsed := parseClaudeCodeVersion(claudeCodeOutput)
+	if err != nil || !parsed {
+		return evaluatorRuntime{}, errors.New("locked Claude Code --version probe did not produce the approved format")
+	}
+	if err := verifyEvaluatorExecutableUnchanged(config.claudeCodeExecutable, claudeCodeSnapshot); err != nil {
+		return evaluatorRuntime{}, fmt.Errorf("locked Claude Code changed during version probing: %w", err)
+	}
 	dockerSnapshot, err := snapshotEvaluatorExecutable(config.dockerCLI)
 	if err != nil {
 		return evaluatorRuntime{}, fmt.Errorf("Docker CLI: %w", err)
@@ -740,11 +766,12 @@ func discoverEvaluatorRuntime(config buildConfig) (evaluatorRuntime, error) {
 	}
 	runtime := evaluatorRuntime{
 		LauncherFingerprint: launcherSnapshot.fingerprint, HarborVersion: harborVersion,
+		ClaudeCodeFingerprint: claudeCodeSnapshot.fingerprint, ClaudeCodeVersion: claudeCodeVersion,
 		PythonFingerprint: pythonSnapshot.fingerprint, PythonVersion: pythonVersion, SourceFingerprint: sourceSnapshot.fingerprint,
 		DockerFingerprint: dockerSnapshot.fingerprint, DockerVersion: dockerVersion, DockerServerVersion: dockerServerVersion,
 		DockerComposeFingerprint: dockerComposeSnapshot.fingerprint, DockerComposeVersion: dockerComposeVersion, DockerComposeVersionOutput: dockerComposeOutput,
 		DockerBuildxFingerprint: dockerBuildxSnapshot.fingerprint, DockerBuildxVersion: dockerBuildxVersion, DockerBuildxVersionOutput: dockerBuildxOutput,
-		launcherSnapshot: launcherSnapshot, pythonSnapshot: pythonSnapshot, sourceSnapshot: sourceSnapshot,
+		launcherSnapshot: launcherSnapshot, claudeCodeSnapshot: claudeCodeSnapshot, pythonSnapshot: pythonSnapshot, sourceSnapshot: sourceSnapshot,
 		dockerSnapshot: dockerSnapshot, dockerComposeSnapshot: dockerComposeSnapshot, dockerBuildxSnapshot: dockerBuildxSnapshot,
 	}
 	if err := verifyEvaluatorRuntimeUnchanged(config, runtime); err != nil {
@@ -760,12 +787,19 @@ type evaluatorExecutableSnapshot struct {
 }
 
 func snapshotEvaluatorExecutable(path string) (evaluatorExecutableSnapshot, error) {
-	snapshot, err := snapshotEvaluatorExecutableWithContents(path)
+	initial, err := inspectNoSymlinkPath(path)
+	if err != nil || !initial.Mode().IsRegular() || initial.Mode()&0o111 == 0 {
+		return evaluatorExecutableSnapshot{}, errors.New("executable path cannot be inspected")
+	}
+	fingerprint, err := fingerprintRegularFile(path)
 	if err != nil {
 		return evaluatorExecutableSnapshot{}, err
 	}
-	snapshot.contents = nil
-	return snapshot, nil
+	final, err := inspectNoSymlinkPath(path)
+	if err != nil || !final.Mode().IsRegular() || !os.SameFile(initial, final) {
+		return evaluatorExecutableSnapshot{}, errors.New("executable changed while being fingerprinted")
+	}
+	return evaluatorExecutableSnapshot{info: final, fingerprint: fingerprint}, nil
 }
 
 func snapshotEvaluatorExecutableWithContents(path string) (evaluatorExecutableSnapshot, error) {
@@ -917,6 +951,7 @@ func verifyEvaluatorRuntimeUnchanged(config buildConfig, runtime evaluatorRuntim
 		path     string
 		snapshot evaluatorExecutableSnapshot
 	}{
+		{label: "Claude Code executable", path: config.claudeCodeExecutable, snapshot: runtime.claudeCodeSnapshot},
 		{label: "Docker CLI", path: config.dockerCLI, snapshot: runtime.dockerSnapshot},
 		{label: "Docker Compose plugin", path: config.dockerComposePlugin, snapshot: runtime.dockerComposeSnapshot},
 		{label: "Docker Buildx plugin", path: config.dockerBuildxPlugin, snapshot: runtime.dockerBuildxSnapshot},
@@ -1006,6 +1041,18 @@ func dockerVersion(value string) (string, bool) {
 	return version, version != "" && version == strings.TrimSpace(version)
 }
 
+func parseClaudeCodeVersion(value string) (string, bool) {
+	fields := strings.Fields(value)
+	if len(fields) != 3 || fields[1] != "(Claude" || fields[2] != "Code)" {
+		return "", false
+	}
+	version := fields[0]
+	if err := validateVersionedText("Claude Code version", version); err != nil {
+		return "", false
+	}
+	return version, value == version+" (Claude Code)"
+}
+
 func dockerComposeVersion(value string) (string, bool) {
 	const prefix = "Docker Compose version "
 	if !strings.HasPrefix(value, prefix) {
@@ -1030,7 +1077,7 @@ func validateConfig(config *buildConfig) error {
 	var err error
 	for _, field := range []*string{
 		&config.sourceRoot, &config.catalogPath, &config.assetManifest, &config.profilePath, &config.contractRoot,
-		&config.outputPath, &config.gitExecutable, &config.harborLauncher, &config.pythonInterpreter, &config.pythonSourceTree, &config.dockerCLI, &config.dockerComposePlugin, &config.dockerBuildxPlugin,
+		&config.outputPath, &config.gitExecutable, &config.harborLauncher, &config.claudeCodeExecutable, &config.pythonInterpreter, &config.pythonSourceTree, &config.dockerCLI, &config.dockerComposePlugin, &config.dockerBuildxPlugin,
 	} {
 		*field, err = cleanAbsolutePath(*field)
 		if err != nil {
@@ -1041,12 +1088,13 @@ func validateConfig(config *buildConfig) error {
 		return fmt.Errorf("source root: %w", err)
 	}
 	for label, executable := range map[string]string{
-		"Git executable":        config.gitExecutable,
-		"Harbor launcher":       config.harborLauncher,
-		"Python interpreter":    config.pythonInterpreter,
-		"Docker CLI":            config.dockerCLI,
-		"Docker Compose plugin": config.dockerComposePlugin,
-		"Docker Buildx plugin":  config.dockerBuildxPlugin,
+		"Git executable":         config.gitExecutable,
+		"Harbor launcher":        config.harborLauncher,
+		"Claude Code executable": config.claudeCodeExecutable,
+		"Python interpreter":     config.pythonInterpreter,
+		"Docker CLI":             config.dockerCLI,
+		"Docker Compose plugin":  config.dockerComposePlugin,
+		"Docker Buildx plugin":   config.dockerBuildxPlugin,
 	} {
 		if err := requireExecutableRegularFile(executable); err != nil {
 			return fmt.Errorf("%s: %w", label, err)
@@ -1175,14 +1223,30 @@ func requireExecutableRegularFile(file string) error {
 }
 
 func fingerprintRegularFile(file string) (workflowkit.Fingerprint, error) {
-	if err := requireExecutableRegularFile(file); err != nil {
-		return "", err
+	initial, err := inspectNoSymlinkPath(file)
+	if err != nil || !initial.Mode().IsRegular() || initial.Mode()&0o111 == 0 || initial.Size() > maxExecutableBytes {
+		return "", errors.New("must be a bounded executable regular file with no symlink path component")
 	}
-	contents, err := readRegularFile(file, -1)
+	handle, err := os.Open(file)
 	if err != nil {
-		return "", err
+		return "", errors.New("open executable regular file")
 	}
-	return workflowkit.SHA256Fingerprint(contents), nil
+	defer handle.Close()
+	opened, err := handle.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(initial, opened) {
+		return "", errors.New("executable changed while opening")
+	}
+	hash := sha256.New()
+	bytesRead, err := io.Copy(hash, io.LimitReader(handle, maxExecutableBytes+1))
+	if err != nil || bytesRead > maxExecutableBytes {
+		return "", errors.New("read executable regular file")
+	}
+	final, err := handle.Stat()
+	pathInfo, pathErr := inspectNoSymlinkPath(file)
+	if err != nil || pathErr != nil || !final.Mode().IsRegular() || !pathInfo.Mode().IsRegular() || !os.SameFile(opened, final) || !os.SameFile(opened, pathInfo) || final.Size() != opened.Size() || pathInfo.Size() != opened.Size() {
+		return "", errors.New("executable changed while reading")
+	}
+	return workflowkit.Fingerprint("sha256:" + fmt.Sprintf("%x", hash.Sum(nil))), nil
 }
 
 func isLowerHex(value string) bool {

@@ -72,12 +72,13 @@ func TestBuildCreatesAttestedEvaluatorLockFromAssetsAndControlledProbes(t *testi
 			t.Fatalf("record %q did not duplicate the frozen Harbor launcher", record.Stage.Key)
 		}
 		evaluator := record.HarborEvaluator
+		contract := evaluator.Contract
 		if evaluator.DockerCLI.AbsolutePath != fixture.dockerCLI || filepath.Base(evaluator.DockerCLI.AbsolutePath) != "docker" || evaluator.DockerServerVersion != stageprovider.HarborEvaluatorDockerServerVersion ||
+			evaluator.ClaudeCodeExecutable.AbsolutePath != fixture.claudeCodeExecutable || evaluator.ClaudeCodeExecutable.CommandID != stageprovider.HarborEvaluatorClaudeCodeCommandID || evaluator.ClaudeCodeExecutable.Version != contract.AgentVersion ||
 			evaluator.DockerComposePlugin.AbsolutePath != fixture.dockerComposePlugin || evaluator.DockerComposePlugin.Version != stageprovider.HarborEvaluatorDockerComposeVersion || evaluator.DockerComposeVersionOutput != stageprovider.HarborEvaluatorDockerComposeVersionOutput ||
 			evaluator.DockerBuildxPlugin.AbsolutePath != fixture.dockerBuildxPlugin || evaluator.DockerBuildxPlugin.Version != stageprovider.HarborEvaluatorDockerBuildxVersion || evaluator.DockerBuildxVersionOutput != stageprovider.HarborEvaluatorDockerBuildxVersionOutput {
 			t.Fatalf("record %q did not freeze the complete Docker runtime: %#v", record.Stage.Key, evaluator)
 		}
-		contract := record.HarborEvaluator.Contract
 		if contract.Attempts != 4 || contract.ConcurrentTrials != 1 || contract.MaxRetries != 3 || !contract.RequireTrajectory {
 			t.Fatalf("record %q lost the fixed pass@4/retry contract: %#v", record.Stage.Key, contract)
 		}
@@ -128,6 +129,24 @@ func TestValidateConfigRequiresDockerPluginBasenames(t *testing.T) {
 	config.dockerBuildxPlugin = fixture.pythonInterpreter
 	if err := validateConfig(&config); err == nil || !strings.Contains(err.Error(), "Docker Buildx plugin basename") {
 		t.Fatalf("renamed Buildx plugin error = %v, want fixed basename", err)
+	}
+}
+
+func TestBuildRequiresTheContractClaudeCodeVersion(t *testing.T) {
+	fixture := newEvaluatorLockGeneratorFixture(t)
+	writeGeneratorFile(t, fixture.claudeCodeExecutable, "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '2.1.206 (Claude Code)\\n'; exit 0; fi\nexit 1\n", 0o700)
+	testGit(t, fixture.root, fixture.gitExecutable, "add", "runtime/claude")
+	testGit(t, fixture.root, fixture.gitExecutable, "commit", "-m", "change Claude version")
+	if _, err := build(fixture.config()); err == nil || !strings.Contains(err.Error(), "does not match evaluator agent version") {
+		t.Fatalf("Claude Code version mismatch error = %v", err)
+	}
+}
+
+func TestDiscoverEvaluatorRuntimeRejectsMalformedClaudeCodeVersion(t *testing.T) {
+	fixture := newEvaluatorLockGeneratorFixture(t)
+	writeGeneratorFile(t, fixture.claudeCodeExecutable, "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'claude 2.1.207\\n'; exit 0; fi\nexit 1\n", 0o700)
+	if _, err := discoverEvaluatorRuntime(fixture.config()); err == nil || !strings.Contains(err.Error(), "Claude Code --version") {
+		t.Fatalf("malformed Claude Code version error = %v", err)
 	}
 }
 
@@ -416,6 +435,7 @@ type evaluatorLockGeneratorFixture struct {
 	outputPath                   string
 	gitExecutable                string
 	harborLauncher               string
+	claudeCodeExecutable         string
 	pythonInterpreter            string
 	pythonSourceTree             string
 	dockerCLI                    string
@@ -472,6 +492,8 @@ func newEvaluatorLockGeneratorFixture(t *testing.T) *evaluatorLockGeneratorFixtu
 	marker := filepath.Join(runtimeRoot, "unexpected-harbor-invocation")
 	harbor := filepath.Join(runtimeRoot, "harbor")
 	writeGeneratorFile(t, harbor, "#!"+python+"\nif [ \"${1:-}\" = \"--version\" ]; then printf '0.18.0\\n'; exit 0; fi\nprintf unexpected > "+marker+"\nexit 1\n", 0o700)
+	claude := filepath.Join(runtimeRoot, "claude")
+	writeGeneratorFile(t, claude, "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf '2.1.207 (Claude Code)\\n'; exit 0; fi\nexit 1\n", 0o700)
 	docker := filepath.Join(runtimeRoot, "docker")
 	dockerComposeDirectory := filepath.Join(runtimeRoot, "libexec", "docker", "cli-plugins")
 	if err := os.MkdirAll(dockerComposeDirectory, 0o700); err != nil {
@@ -505,7 +527,7 @@ func newEvaluatorLockGeneratorFixture(t *testing.T) *evaluatorLockGeneratorFixtu
 	return &evaluatorLockGeneratorFixture{
 		root: root, catalogPath: catalogPath, manifestPath: filepath.Join(contractRoot, "contract-assets.v1.json"), profilePath: profilePath,
 		contractRoot: contractRoot, outputPath: filepath.Join(contractRoot, "operation-catalog.lock.json"), gitExecutable: git,
-		harborLauncher: harbor, pythonInterpreter: python, pythonSourceTree: filepath.Join(runtimeRoot, "site-packages", "harbor"), dockerCLI: docker, dockerComposePlugin: dockerCompose, dockerBuildxPlugin: dockerBuildx,
+		harborLauncher: harbor, claudeCodeExecutable: claude, pythonInterpreter: python, pythonSourceTree: filepath.Join(runtimeRoot, "site-packages", "harbor"), dockerCLI: docker, dockerComposePlugin: dockerCompose, dockerBuildxPlugin: dockerBuildx,
 		dockerServerProbeMarker: dockerServerProbeMarker, dockerComposeInfoProbeMarker: dockerComposeInfoProbeMarker, dockerBuildxInfoProbeMarker: dockerBuildxInfoProbeMarker,
 		dockerComposeProbeMarker: dockerComposeProbeMarker, dockerBuildxProbeMarker: dockerBuildxProbeMarker, nonVersionProbeMarker: marker, environment: environment,
 	}
@@ -516,7 +538,7 @@ func (fixture *evaluatorLockGeneratorFixture) config() buildConfig {
 		sourceRoot: fixture.root, catalogPath: fixture.catalogPath, assetManifest: fixture.manifestPath, profilePath: fixture.profilePath,
 		contractRoot: fixture.contractRoot, outputPath: fixture.outputPath, buildVersion: "v2.0.0",
 		lockID: "codeedge-evaluator-child-production-lock", lockVersion: "v2.0.0", gitExecutable: fixture.gitExecutable,
-		harborLauncher: fixture.harborLauncher, pythonInterpreter: fixture.pythonInterpreter, pythonSourceTree: fixture.pythonSourceTree, dockerCLI: fixture.dockerCLI, dockerComposePlugin: fixture.dockerComposePlugin, dockerBuildxPlugin: fixture.dockerBuildxPlugin,
+		harborLauncher: fixture.harborLauncher, claudeCodeExecutable: fixture.claudeCodeExecutable, pythonInterpreter: fixture.pythonInterpreter, pythonSourceTree: fixture.pythonSourceTree, dockerCLI: fixture.dockerCLI, dockerComposePlugin: fixture.dockerComposePlugin, dockerBuildxPlugin: fixture.dockerBuildxPlugin,
 		lookupEnvironment: func(name string) (string, bool) {
 			fixture.looked = append(fixture.looked, name)
 			value, present := fixture.environment[name]

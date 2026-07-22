@@ -51,6 +51,7 @@ type appModel struct {
 	pendingStart   *pendingTaskBoardStart
 	pendingReview  *pendingTaskBoardReview
 	pendingAction  *pendingTaskBoardRunAction
+	deferredAction *pendingTaskBoardRunAction
 	activeMutation taskBoardMutationKind
 	logEpoch       uint64
 
@@ -273,6 +274,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = nil
 			}
 		}
+		if m.deferredAction != nil {
+			pending := *m.deferredAction
+			m.deferredAction = nil
+			// The mutation completion will request a fresh snapshot, so the
+			// coalesced periodic refresh is no longer needed.
+			m.refreshRequested = false
+			return m.dispatchRunAction(pending, inputCmd)
+		}
 		if m.refreshRequested && !m.exitInFlight {
 			m.refreshRequested = false
 			var refreshCmd tea.Cmd
@@ -300,6 +309,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail = nil
 		case taskBoardRetryMutation, taskBoardRetryAuthoringLaunchMutation, taskBoardCancelMutation:
 			m.pendingAction = nil
+			m.deferredAction = nil
 			m.action = nil
 			m.logs = nil
 			m.detail = nil
@@ -525,6 +535,7 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 	switch msg.String() {
 	case "esc":
 		m.action = nil
+		m.deferredAction = nil
 		return m, inputCmd
 	case "enter":
 		if !m.action.requiresReason {
@@ -720,7 +731,7 @@ func (m appModel) decideReview(pending pendingTaskBoardReview) tea.Cmd {
 }
 
 func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
-	if m.mutationInFlight() || m.refreshInFlight || m.detail == nil {
+	if m.mutationInFlight() || m.detail == nil {
 		m.notice = "请等待当前操作完成"
 		return m, inputCmd
 	}
@@ -731,8 +742,7 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 			return m, inputCmd
 		}
 		m.pendingAction = &pendingTaskBoardRunAction{kind: kind, operationID: launch.OperationID}
-		m.activeMutation = taskBoardRetryAuthoringLaunchMutation
-		return m, tea.Batch(inputCmd, m.runAction(*m.pendingAction))
+		return m.scheduleRunAction(*m.pendingAction, inputCmd)
 	}
 	if !m.detail.hasCurrentRun() {
 		m.notice = "请等待当前操作完成"
@@ -751,7 +761,20 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 		current.key = key
 		m.pendingAction = &current
 	}
-	switch kind {
+	return m.scheduleRunAction(*m.pendingAction, inputCmd)
+}
+
+func (m appModel) scheduleRunAction(pending pendingTaskBoardRunAction, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.refreshInFlight {
+		m.deferredAction = &pending
+		m.notice = "正在刷新任务状态，完成后将执行操作"
+		return m, inputCmd
+	}
+	return m.dispatchRunAction(pending, inputCmd)
+}
+
+func (m appModel) dispatchRunAction(pending pendingTaskBoardRunAction, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	switch pending.kind {
 	case taskBoardRetryAction:
 		m.activeMutation = taskBoardRetryMutation
 	case taskBoardRetryAuthoringLaunchAction:
@@ -759,10 +782,10 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 	case taskBoardCancelAction:
 		m.activeMutation = taskBoardCancelMutation
 	default:
-		m.err = fmt.Errorf("unsupported task board Run action %q", kind)
+		m.err = fmt.Errorf("unsupported task board Run action %q", pending.kind)
 		return m, inputCmd
 	}
-	return m, tea.Batch(inputCmd, m.runAction(*m.pendingAction))
+	return m, tea.Batch(inputCmd, m.runAction(pending))
 }
 
 func (m appModel) runAction(pending pendingTaskBoardRunAction) tea.Cmd {
