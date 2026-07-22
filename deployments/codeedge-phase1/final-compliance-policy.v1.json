@@ -1,9 +1,9 @@
 {
   "id": "codeedge.phase1.final-compliance",
-  "version": "2026.07.15.1",
+  "version": "2026.07.22.1",
   "qwen_policy": {
     "id": "codeedge.qwen.pass-at-four",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "harbor_evidence_format": "harbor.run-bundle.v0.18",
     "evaluator": {
       "profile_id": "codeedge-qwen-local",
@@ -23,13 +23,14 @@
     "infra_exception_types": [
       "DockerBuildError",
       "NetworkError",
+      "NetworkConnectionError",
       "PathError",
       "PermissionError"
     ]
   },
   "opus_policy": {
     "id": "codeedge.opus.reference",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "harbor_evidence_format": "harbor.run-bundle.v0.18",
     "evaluator": {
       "profile_id": "codeedge-opus-local",
@@ -48,6 +49,7 @@
     "infra_exception_types": [
       "DockerBuildError",
       "NetworkError",
+      "NetworkConnectionError",
       "PathError",
       "PermissionError"
     ]

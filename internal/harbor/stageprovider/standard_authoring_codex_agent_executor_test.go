@@ -1212,7 +1212,7 @@ func TestStandardAuthoringCodexAgentTurnExecutorRetriesWrappedTaskTOMLWithinTurn
 	now := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
 	stage := standardAuthoringCodexTestArtifactStage(1, workflowkit.StageKey(workflowadapter.TaskTOMLGen), "task_toml")
 	wrapped := []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"feature","application":"backend"},"task_toml":"[metadata]\ntask_type = \"feature\"\napplication = \"backend\"\n"}`)
-	raw := []byte("[metadata]\ntask_type = \"feature\"\napplication = \"backend\"\n")
+	raw := []byte("schema_version = \"1.0\"\n\n[metadata]\ncode_lang = \"rust\"\ntask_type = \"feature\"\napplication = \"backend\"\nis_0_to_1 = false\n\n[task]\nname = \"harbor/request-header-count-limit\"\ndescription = \"Add request header count limiting middleware.\"\n\n[environment]\nbuild_timeout_sec = 900.0\nnetwork_mode = \"no-network\"\nworkdir = \"/workspace/source\"\n\n[verifier]\ntimeout_sec = 1800.0\n")
 	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
 		results: []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"ignored":"free text"}`}},
 		submissions: [][]json.RawMessage{{

@@ -37,7 +37,7 @@ harbor-factory --root .harbor-factory tui
 
 详情页将来源、当前运行、失败原因和运行历史分区呈现。当前运行区会显示日志文件路径；按 `l` 后，TUI 只读取该 Run 的 durable worker handoff 已记录的本地日志，并展示最多 64 KiB 的尾部内容。它不会接受或打开任意用户提供的文件路径。
 
-`t` 和 `x` 都要求填写原因并按 `Enter` 确认。取消会写入 durable termination control，不会由 TUI 直接终止进程。任务修订 Run 使用既有 no-content continuation；Standard 创题 Run 在 `failed_recoverable` 或 `paused` 时显示“恢复/重试”，并通过冻结的 source/session checkpoint 重新排队失败阶段及其下游。恢复不会修改模型、推理强度、源码快照或 Run 定义；模型或推理强度变更不能原地恢复旧的冻结 Run，必须通过新部署新建创题 Task、Session 和 Run，可复用同一 immutable source snapshot，但不得复用旧 artifacts。已物化题目或已交接 Phase-1 的 Run 不会提供该操作。
+`t` 和 `x` 都要求填写原因。取消按一次 `Enter` 即确认，会写入 durable termination control，不会由 TUI 直接终止进程。任务修订 Run 使用既有 no-content continuation；Standard 创题 Run 在 `failed_recoverable` 或 `paused` 时显示“恢复/重试”：第一次按 `Enter` 会获取并展示不落库的断点恢复计划，列出复用与重新调度阶段、输入校验和计划原因；确认计划后第二次按 `Enter` 才提交恢复。提交会再次绑定 checkpoint 与语义计划指纹，过期预览必须重新核验。恢复通过冻结的 source/session checkpoint 重新排队失败阶段及其下游，不会修改模型、推理强度、源码快照或 Run 定义；模型或推理强度变更不能原地恢复旧的冻结 Run，必须通过新部署新建创题 Task、Session 和 Run，可复用同一 immutable source snapshot，但不得复用旧 artifacts。已物化题目或已交接 Phase-1 的 Run 不会提供该操作。
 
 CLI 可执行同一恢复路径：
 

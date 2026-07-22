@@ -13,6 +13,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
@@ -82,18 +83,23 @@ func CompileStandardAuthoringTaskPackage(input StandardAuthoringTaskPackageInput
 	if err != nil {
 		taskTOMLDraft = clonePackageBytes(input.TaskTOMLDraft)
 		taskTOML = clonePackageBytes(input.TaskTOMLDraft)
-		contentViolations = append(contentViolations, invalidStandardAuthoringTaskTOMLViolation())
+		contentViolations = append(contentViolations, invalidStandardAuthoringTaskTOMLViolation(nil))
 	} else {
 		if wrapperMetadata != nil && input.Brief != nil {
 			contentViolations = append(contentViolations, standardAuthoringTaskTOMLWrapperBriefViolations(*wrapperMetadata, *input.Brief)...)
 		}
-		var canonicalizationViolations []codeedge.Violation
-		taskTOML, canonicalizationViolations, err = canonicalizeStandardAuthoringTaskTOML(taskTOMLDraft, input.Admission.Profile.Metadata, repositoryURL, commitSHA, input.Brief)
-		if err != nil {
+		if err := taskpolicy.ValidateStandardAuthoringTaskTOML(taskTOMLDraft); err != nil {
 			taskTOML = clonePackageBytes(taskTOMLDraft)
-			canonicalizationViolations = []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation()}
+			contentViolations = append(contentViolations, invalidStandardAuthoringTaskTOMLViolation(err))
+		} else {
+			var canonicalizationViolations []codeedge.Violation
+			taskTOML, canonicalizationViolations, err = canonicalizeStandardAuthoringTaskTOML(taskTOMLDraft, input.Admission.Profile.Metadata, repositoryURL, commitSHA, input.Brief)
+			if err != nil {
+				taskTOML = clonePackageBytes(taskTOMLDraft)
+				canonicalizationViolations = []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation(nil)}
+			}
+			contentViolations = append(contentViolations, canonicalizationViolations...)
 		}
-		contentViolations = append(contentViolations, canonicalizationViolations...)
 	}
 	testsAnalysis, err := renderStandardAuthoringTestsAnalysis(input.TestsAnalysis)
 	if err != nil {
@@ -304,8 +310,12 @@ func invalidStandardAuthoringDockerfileViolation() codeedge.Violation {
 	return codeedge.Violation{Code: "environment_isolation", Path: "environment/Dockerfile", Message: "generated Dockerfile does not match the frozen environment policy"}
 }
 
-func invalidStandardAuthoringTaskTOMLViolation() codeedge.Violation {
-	return codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated task.toml must be valid TOML or a strict harbor.artifact.v1 task_toml wrapper"}
+func invalidStandardAuthoringTaskTOMLViolation(validationErr error) codeedge.Violation {
+	message := "generated task.toml must be valid TOML or a strict harbor.artifact.v1 task_toml wrapper, and must contain the complete Harbor TaskConfig contract: [metadata], [task], [environment], and [verifier]"
+	if validationErr != nil {
+		message += "; " + validationErr.Error()
+	}
+	return codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: message}
 }
 
 func invalidStandardAuthoringTestsAnalysisViolation() codeedge.Violation {
@@ -462,11 +472,11 @@ func parseStandardAuthoringTaskTOMLPayload(payload []byte) (map[string]any, erro
 func validateStandardAuthoringTaskTOMLBrief(raw []byte, mapping codeedge.MetadataFieldMapping, brief workflowadapter.StandardAuthoringBrief) ([]codeedge.Violation, error) {
 	payload, wrapperMetadata, err := decodeStandardAuthoringTaskTOMLArtifactWithMetadata(raw)
 	if err != nil {
-		return []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation()}, nil
+		return []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation(nil)}, nil
 	}
 	document, err := parseStandardAuthoringTaskTOMLPayload(payload)
 	if err != nil {
-		return []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation()}, nil
+		return []codeedge.Violation{invalidStandardAuthoringTaskTOMLViolation(nil)}, nil
 	}
 	violations := make([]codeedge.Violation, 0)
 	if wrapperMetadata != nil {

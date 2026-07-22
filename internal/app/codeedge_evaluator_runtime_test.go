@@ -184,9 +184,23 @@ func TestCodeEdgeEvaluatorReconciliationFinalizesCommittedReceiptAfterCrash(t *t
 	}
 }
 
-func TestCodeEdgeEvaluatorExpiredReconciliationLeaseRestoresCommittedReceiptWithoutObserver(t *testing.T) {
+func TestCodeEdgeEvaluatorExpiredReconciliationLeaseRestoresCompletedEvidenceWithoutProviderOrFifthTrial(t *testing.T) {
 	ctx := context.Background()
 	scenario := newCodeEdgeEvaluatorCommittedReceiptCrashScenario(t, ctx)
+	trialsBefore, err := scenario.fixture.database.ListTrialExecutionsForStageAttempt(ctx, scenario.effect.StageAttemptID)
+	if err != nil || len(trialsBefore) != codeEdgeEvaluatorTrialCount {
+		t.Fatalf("completed CodeEdge evaluator trials before reconciliation recovery = %+v, %v", trialsBefore, err)
+	}
+	trialIDs := make([]string, len(trialsBefore))
+	trialAttemptIDs := make([]string, len(trialsBefore))
+	for index, trial := range trialsBefore {
+		attempts, listErr := scenario.fixture.database.ListTrialAttemptsForTrialExecution(ctx, trial.ID)
+		if listErr != nil || trial.Status != store.TrialExecutionCompleted || len(attempts) != 1 || attempts[0].Status != store.TrialAttemptCompleted {
+			t.Fatalf("completed CodeEdge evaluator trial before reconciliation recovery = %+v attempts=%+v err=%v", trial, attempts, listErr)
+		}
+		trialIDs[index] = trial.ID
+		trialAttemptIDs[index] = attempts[0].ID
+	}
 
 	claim, err := scenario.fixture.database.ClaimNextDurableJob(ctx, store.ClaimNextDurableJobRequest{
 		IdempotencyKey: "claim-expired-codeedge-evaluator-reconciliation:" + scenario.reconciliationJob.ID,
@@ -212,6 +226,16 @@ func TestCodeEdgeEvaluatorExpiredReconciliationLeaseRestoresCommittedReceiptWith
 	}
 	if scenario.observer.calls != 0 || *scenario.providerCalls != 1 {
 		t.Fatalf("expired reconciliation recovery calls observer=%d provider=%d; want neither", scenario.observer.calls, *scenario.providerCalls)
+	}
+	trialsAfter, err := scenario.fixture.database.ListTrialExecutionsForStageAttempt(ctx, scenario.effect.StageAttemptID)
+	if err != nil || len(trialsAfter) != codeEdgeEvaluatorTrialCount {
+		t.Fatalf("completed CodeEdge evaluator trials after reconciliation recovery = %+v, %v; want no fifth logical trial", trialsAfter, err)
+	}
+	for index, trial := range trialsAfter {
+		attempts, listErr := scenario.fixture.database.ListTrialAttemptsForTrialExecution(ctx, trial.ID)
+		if listErr != nil || trial.ID != trialIDs[index] || trial.Status != store.TrialExecutionCompleted || len(attempts) != 1 || attempts[0].ID != trialAttemptIDs[index] || attempts[0].Status != store.TrialAttemptCompleted {
+			t.Fatalf("reconciliation recovery changed completed CodeEdge evaluator trial = %+v attempts=%+v err=%v", trial, attempts, listErr)
+		}
 	}
 	reconciliation, err := scenario.fixture.database.GetReconciliationAttemptByOperationKey(ctx, codeEdgeEvaluatorReconciliationKey(scenario.effect.OperationKey))
 	if err != nil || reconciliation == nil || reconciliation.State != store.ReconciliationCompleted {

@@ -129,6 +129,39 @@ func TestBuildEvaluationReceiptMarksClassifiedInfrastructureWithoutCountingItAsM
 	}
 }
 
+func TestBuildEvaluationReceiptClassifiesHarbor018NaiveTimestampNetworkConnectionFailures(t *testing.T) {
+	policy := validEvaluationPolicy()
+	policy.InfraExceptionTypes = append(policy.InfraExceptionTypes, "NetworkConnectionError")
+	fixture := newEvaluationBundleFixture(t, policy)
+	fixture.updateJob(t, func(job map[string]any) {
+		// Harbor 0.18 serializes completed job timestamps with Python's
+		// timezone-naive ISO-8601 representation.
+		job["finished_at"] = "2026-07-14T00:10:00"
+	})
+	for index := range fixture.harbor.trialDirectories {
+		fixture.updateTrial(t, index, func(trial map[string]any) {
+			trial["exception_info"] = map[string]any{"exception_type": "NetworkConnectionError"}
+			delete(trial, "verifier_result")
+		})
+	}
+
+	receipt, err := BuildEvaluationReceipt(fixture.input(t))
+	if err != nil {
+		t.Fatalf("BuildEvaluationReceipt() error = %v", err)
+	}
+	if receipt.Status != EvaluationInfraFailed || receipt.PassCount != 0 || receipt.PolicyCompliant {
+		t.Fatalf("receipt = %#v, want four classified Harbor network infrastructure failures", receipt)
+	}
+	if len(receipt.Trials) != 4 {
+		t.Fatalf("receipt trials = %#v, want four logical trials", receipt.Trials)
+	}
+	for _, trial := range receipt.Trials {
+		if trial.Status != EvaluationTrialInfraFailed || trial.Passed || trial.FailureType != "NetworkConnectionError" {
+			t.Fatalf("infra trial receipt = %#v, want NetworkConnectionError", trial)
+		}
+	}
+}
+
 func TestBuildEvaluationReceiptPreservesContentNonCompliance(t *testing.T) {
 	maximumPasses := 1
 	policy := validEvaluationPolicy()

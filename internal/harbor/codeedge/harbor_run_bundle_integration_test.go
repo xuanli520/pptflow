@@ -25,7 +25,7 @@ func TestHarborRunBundleV018TempFilesystemIntegration(t *testing.T) {
 		t.Fatalf("parse and inspect bundle: %v", err)
 	}
 	job := inspection.Job()
-	if job.ID != "job-1" || job.TotalTrials != 4 || job.RunningTrials != 0 || job.PendingTrials != 0 || job.FinishedAt.IsZero() {
+	if job.ID != "job-1" || job.TotalTrials != 4 || job.RunningTrials != 0 || job.PendingTrials != 0 || job.FinishedAt == "" {
 		t.Fatalf("job facts = %+v", job)
 	}
 	if got := job.PassAtK["claude-code__qwen__adhoc"]["4"]; got != 0.25 {

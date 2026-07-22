@@ -188,7 +188,7 @@ func TestStandardAuthoringBriefPromptsFreezeScopeWithoutElevatingData(t *testing
 		{path: "repo-analyze.json", version: "1.5.0", extras: []string{"exact spelling", "Cargo package names"}},
 		{path: "task-design.json", version: "1.6.0", extras: []string{"Verify every repository-relative path", "character-for-character"}},
 		{path: "generate-task-files.json", version: "1.4.0", extras: []string{"rechecked against the frozen source", "exact spelling exists"}},
-		{path: "task-toml-generate.json", version: "1.7.0", extras: []string{"metadata.task_type", "metadata.code_lang", "metadata.is_0_to_1", "false"}},
+		{path: "task-toml-generate.json", version: "1.9.0", extras: []string{"metadata.task_type", "metadata.code_lang", "metadata.is_0_to_1", "org/name", "build_timeout_sec", "network_mode", "[verifier]", "Never emit [verification]", "false"}},
 	} {
 		raw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "prompts", test.path))
 		if err != nil {
@@ -215,6 +215,60 @@ func TestStandardAuthoringBriefPromptsFreezeScopeWithoutElevatingData(t *testing
 	}
 }
 
+func TestStandardAuthoringTaskTOMLPromptsUseHarborTaskConfigContract(t *testing.T) {
+	root := standardAuthoringDeploymentRepositoryRoot(t)
+	for _, deployment := range []string{"standard-authoring", "standard-authoring-1.8"} {
+		t.Run(deployment, func(t *testing.T) {
+			deploymentRoot := filepath.Join(root, "deployments", deployment)
+			raw, err := os.ReadFile(filepath.Join(deploymentRoot, "prompts", "task-toml-generate.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+			if err != nil {
+				t.Fatalf("parse task TOML prompt: %v", err)
+			}
+			if program.Version != "1.9.0" {
+				t.Fatalf("task TOML prompt version = %s, want 1.9.0", program.Version)
+			}
+			joined := strings.Join(program.TurnPrompts, "\n")
+			for _, required := range []string{
+				"complete Harbor 0.18 task.toml", "runs before Dockerfile and test generation",
+				"build_timeout_sec", "network_mode = \"no-network\"", "workdir = \"/workspace/source\"",
+				"[verifier]", "timeout_sec", "Never emit [verification]", "environment.dockerfile",
+				"environment/Dockerfile", "tests/test.sh",
+			} {
+				if !strings.Contains(joined, required) {
+					t.Fatalf("task TOML prompt omits Harbor contract rule %q", required)
+				}
+			}
+			for _, stale := range []string{"[environment] with a non-empty dockerfile string", "[verification] with a non-empty commands array"} {
+				if strings.Contains(joined, stale) {
+					t.Fatalf("task TOML prompt retains stale factory-only contract %q", stale)
+				}
+			}
+
+			manifestRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := ParseStandardAuthoringContractAssetManifestJSON(manifestRaw)
+			if err != nil {
+				t.Fatalf("parse task TOML contract manifest: %v", err)
+			}
+			for _, entry := range manifest.Operations {
+				if entry.StageKey == workflowkit.StageKey(workflowadapter.TaskTOMLGen) {
+					if entry.Prompt.ID != "standard-authoring.task-toml-generate.prompt" || entry.Prompt.Version != "1.9.0" || entry.Prompt.RelativePath != "prompts/task-toml-generate.json" {
+						t.Fatalf("task TOML manifest prompt = %+v", entry.Prompt)
+					}
+					return
+				}
+			}
+			t.Fatal("task TOML manifest entry is missing")
+		})
+	}
+}
+
 func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) {
 	root := standardAuthoringDeploymentRepositoryRoot(t)
 	for _, test := range []struct {
@@ -223,7 +277,7 @@ func TestStandardAuthoringRawFilePromptsRequireDirectFilePayloads(t *testing.T) 
 		file    string
 	}{
 		{path: "instruction-generate.json", version: "1.4.0", file: "instruction.md"},
-		{path: "task-toml-generate.json", version: "1.7.0", file: "task.toml"},
+		{path: "task-toml-generate.json", version: "1.9.0", file: "task.toml"},
 		{path: "dockerfile-generate.json", version: "2.0.0", file: "environment/Dockerfile"},
 		{path: "solve-generate.json", version: "1.5.0", file: "solution/solve.sh"},
 		{path: "test-generate.json", version: "1.6.0", file: "tests/test.sh"},
@@ -484,7 +538,7 @@ func TestStandardAuthoringRepairPromptsConsumeOnlyFrozenFeedback(t *testing.T) {
 		{path: "repo-analyze.json", version: "1.5.0", feedback: []string{"task_review_decision"}},
 		{path: "task-design.json", version: "1.6.0", feedback: []string{"task_review_decision"}},
 		{path: "instruction-generate.json", version: "1.4.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
-		{path: "task-toml-generate.json", version: "1.7.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
+		{path: "task-toml-generate.json", version: "1.9.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
 		{path: "dockerfile-generate.json", version: "2.0.0", feedback: []string{"content_review_decision", "solution_review_decision", "codeedge_package_admission_report"}},
 		{path: "solve-generate.json", version: "1.5.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},
 		{path: "test-generate.json", version: "1.6.0", feedback: []string{"solution_review_decision", "codeedge_package_admission_report"}},

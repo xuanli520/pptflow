@@ -8,8 +8,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+)
+
+const (
+	productionParentCatalogVersion         = "2026.07.15.1"
+	productionFinalCompliancePolicyVersion = "2026.07.22.1"
+	productionQwenEvaluationPolicyVersion  = "1.1.0"
+	productionOpusEvaluationPolicyVersion  = "1.1.0"
 )
 
 func TestSourceBuildIdentityExcludesAllGeneratedProductionLocks(t *testing.T) {
@@ -68,6 +76,28 @@ func TestBuildCreatesClosedParentLock(t *testing.T) {
 	}
 	if lock.CodeEdgePhase1ExecutionProfile == nil || lock.CodeEdgePhase1PreflightProfile == nil || lock.CodeEdgePhase1FinalCompliancePolicy == nil {
 		t.Fatal("parent lock did not carry every required lock-owned parent policy")
+	}
+	assertProductionFinalCompliancePolicyIdentity(t, lock.CodeEdgePhase1FinalCompliancePolicy.Policy, "locked")
+	for _, evaluator := range []struct {
+		name           string
+		exceptionTypes []string
+	}{
+		{
+			name:           "qwen",
+			exceptionTypes: lock.CodeEdgePhase1FinalCompliancePolicy.Policy.QwenPolicy.InfraExceptionTypes,
+		},
+		{
+			name:           "opus",
+			exceptionTypes: lock.CodeEdgePhase1FinalCompliancePolicy.Policy.OpusPolicy.InfraExceptionTypes,
+		},
+	} {
+		found := false
+		for _, exceptionType := range evaluator.exceptionTypes {
+			found = found || exceptionType == "NetworkConnectionError"
+		}
+		if !found {
+			t.Fatalf("parent %s policy does not classify Harbor NetworkConnectionError: %v", evaluator.name, evaluator.exceptionTypes)
+		}
 	}
 	if lock.StandardAuthoringExecutionProfile != nil || lock.CodeEdgeEvaluatorChildExecutionProfile != nil {
 		t.Fatal("parent lock carried a profile belonging to another bundle")
@@ -179,6 +209,17 @@ func TestWriteNewRegularFileDoesNotReplaceExistingLock(t *testing.T) {
 
 func TestProductionParentAssetsAreAccepted(t *testing.T) {
 	root := parentLockProductionRoot(t)
+	catalogRaw, err := os.ReadFile(filepath.Join(root, parentCatalogRelative))
+	if err != nil {
+		t.Fatalf("read production parent catalog: %v", err)
+	}
+	catalog, err := stageprovider.ParseDeploymentOperationCatalogJSON(catalogRaw)
+	if err != nil {
+		t.Fatalf("parse production parent catalog: %v", err)
+	}
+	if catalog.CatalogVersion != productionParentCatalogVersion {
+		t.Fatalf("production parent catalog version = %q, want unchanged catalog version %q", catalog.CatalogVersion, productionParentCatalogVersion)
+	}
 	profile, _, err := readParentExecutionProfile(filepath.Join(root, parentProfileRelative))
 	if err != nil {
 		t.Fatalf("read production parent execution profile: %v", err)
@@ -199,6 +240,26 @@ func TestProductionParentAssetsAreAccepted(t *testing.T) {
 	}
 	if policy.QwenPolicy.LogicalTrialCount != 4 || policy.OpusPolicy.LogicalTrialCount != 4 {
 		t.Fatalf("production policy did not pin pass@4: qwen=%d opus=%d", policy.QwenPolicy.LogicalTrialCount, policy.OpusPolicy.LogicalTrialCount)
+	}
+	assertProductionFinalCompliancePolicyIdentity(t, policy, "production")
+}
+
+func assertProductionFinalCompliancePolicyIdentity(t *testing.T, policy codeedge.FinalCompliancePolicy, source string) {
+	t.Helper()
+	if policy.Version != productionFinalCompliancePolicyVersion {
+		t.Fatalf("%s final-compliance policy version = %q, want %q", source, policy.Version, productionFinalCompliancePolicyVersion)
+	}
+	for _, evaluator := range []struct {
+		name              string
+		policy            codeedge.EvaluationPolicy
+		wantPolicyVersion string
+	}{
+		{name: "qwen", policy: policy.QwenPolicy, wantPolicyVersion: productionQwenEvaluationPolicyVersion},
+		{name: "opus", policy: policy.OpusPolicy, wantPolicyVersion: productionOpusEvaluationPolicyVersion},
+	} {
+		if evaluator.policy.Version != evaluator.wantPolicyVersion {
+			t.Fatalf("%s %s evaluation policy version = %q, want %q", source, evaluator.name, evaluator.policy.Version, evaluator.wantPolicyVersion)
+		}
 	}
 }
 

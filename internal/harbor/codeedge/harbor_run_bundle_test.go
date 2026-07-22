@@ -137,6 +137,37 @@ func TestHarborRunBundleV018InspectionAuthenticatesStrictAggregateInternalRetryC
 	}
 }
 
+func TestHarborRunBundleV018InspectionPreservesHarborNaiveJobTimestamp(t *testing.T) {
+	t.Run("accepts Harbor 0.18 naive timestamp without inventing a timezone", func(t *testing.T) {
+		fixture := newHarborRunBundleFixture(t)
+		const finishedAt = "2026-07-22T14:32:28.056110"
+		updateHarborRunBundleJob(t, fixture, func(job map[string]any) {
+			job["finished_at"] = finishedAt
+		})
+		bundle, err := CaptureHarborRunBundleV018(fixture.request())
+		if err != nil {
+			t.Fatalf("capture Harbor 0.18 naive timestamp: %v", err)
+		}
+		inspection, err := InspectHarborRunBundleV018(bundle)
+		if err != nil {
+			t.Fatalf("inspect Harbor 0.18 naive timestamp: %v", err)
+		}
+		if got := inspection.Job().FinishedAt; got != finishedAt {
+			t.Fatalf("observed job finished_at = %q, want exact raw value %q", got, finishedAt)
+		}
+	})
+
+	t.Run("rejects malformed naive timestamp", func(t *testing.T) {
+		fixture := newHarborRunBundleFixture(t)
+		updateHarborRunBundleJob(t, fixture, func(job map[string]any) {
+			job["finished_at"] = "2026-07-22 14:32:28"
+		})
+		if _, err := CaptureHarborRunBundleV018(fixture.request()); !errors.Is(err, ErrInvalidHarborRunBundle) {
+			t.Fatalf("malformed naive timestamp error = %v, want ErrInvalidHarborRunBundle", err)
+		}
+	})
+}
+
 func updateHarborRunBundleJob(t *testing.T, fixture harborRunBundleFixture, mutate func(map[string]any)) {
 	t.Helper()
 	path := filepath.Join(fixture.jobRoot, "result.json")

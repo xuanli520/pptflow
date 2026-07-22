@@ -18,10 +18,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/pelletier/go-toml/v2"
 	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
@@ -716,14 +716,7 @@ func standardAuthoringCodexRawInstruction(content []byte) bool {
 }
 
 func standardAuthoringCodexTaskTOML(content []byte) bool {
-	if !standardAuthoringCodexText(content) {
-		return false
-	}
-	var document map[string]any
-	if err := toml.NewDecoder(bytes.NewReader(content)).Decode(&document); err != nil {
-		return false
-	}
-	return len(document) != 0
+	return taskpolicy.ValidateStandardAuthoringTaskTOML(content) == nil
 }
 
 func standardAuthoringCodexShellScript(content []byte) bool {

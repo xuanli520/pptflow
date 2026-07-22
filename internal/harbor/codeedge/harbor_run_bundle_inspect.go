@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +18,8 @@ import (
 
 const harborRunBundleExpectedTrialCount = 4
 
+var harborRunBundleNaiveJobTimestampV018 = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?$`)
+
 // HarborRunBundleJobFactsV018 is the minimal typed projection required by the
 // 0.18 evaluator adapter. PassAtK is grouped exactly as Harbor's job summary
 // writes it: evaluator group -> string k -> value. InternalRetryCount is
@@ -24,8 +27,11 @@ const harborRunBundleExpectedTrialCount = 4
 // not expose a verified mapping from that aggregate to an individual final
 // Trial result, so it must never be expanded into inferred TrialAttempt facts.
 type HarborRunBundleJobFactsV018 struct {
-	ID                 string                        `json:"id"`
-	FinishedAt         time.Time                     `json:"finished_at"`
+	ID string `json:"id"`
+	// FinishedAt is the exact job-level timestamp emitted by Harbor. Harbor
+	// 0.18 may emit a naive Python datetime here, so this field is deliberately
+	// not a time.Time and must not be treated as a UTC instant.
+	FinishedAt         string                        `json:"finished_at"`
 	TotalTrials        int                           `json:"n_total_trials"`
 	RunningTrials      int                           `json:"n_running_trials"`
 	PendingTrials      int                           `json:"n_pending_trials"`
@@ -400,7 +406,7 @@ func harborRunBundleParseJobFacts(raw []byte) (HarborRunBundleJobFactsV018, erro
 	if err != nil {
 		return HarborRunBundleJobFactsV018{}, err
 	}
-	finishedAt, err := harborRunBundleRequiredRFC3339Time(root, "finished_at", "Harbor job result")
+	finishedAt, err := harborRunBundleRequiredJobFinishedAtV018(root, "finished_at", "Harbor job result")
 	if err != nil {
 		return HarborRunBundleJobFactsV018{}, err
 	}
@@ -726,6 +732,27 @@ func harborRunBundleRequiredRFC3339Time(object map[string]json.RawMessage, key, 
 		return time.Time{}, fmt.Errorf("%w: %s.%s must be RFC3339: %v", ErrInvalidHarborRunBundle, label, key, err)
 	}
 	return parsed, nil
+}
+
+// harborRunBundleRequiredJobFinishedAtV018 accepts the two verified Harbor
+// 0.18 job-result encodings. Trial timestamps remain RFC3339-only because
+// they are actual cross-system instants. The job summary's naive datetime is
+// retained as text rather than assigned an invented timezone.
+func harborRunBundleRequiredJobFinishedAtV018(object map[string]json.RawMessage, key, label string) (string, error) {
+	value, err := harborRunBundleRequiredString(object, key, label)
+	if err != nil {
+		return "", err
+	}
+	if _, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+		return value, nil
+	}
+	if !harborRunBundleNaiveJobTimestampV018.MatchString(value) {
+		return "", fmt.Errorf("%w: %s.%s must be RFC3339 or Harbor 0.18 naive ISO-8601", ErrInvalidHarborRunBundle, label, key)
+	}
+	if _, parseErr := time.Parse("2006-01-02T15:04:05", value); parseErr != nil {
+		return "", fmt.Errorf("%w: %s.%s has an invalid Harbor 0.18 naive timestamp: %v", ErrInvalidHarborRunBundle, label, key, parseErr)
+	}
+	return value, nil
 }
 
 func harborRunBundleNumber(raw []byte, label string) (float64, error) {

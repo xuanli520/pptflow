@@ -178,6 +178,13 @@ func TestCompileStandardAuthoringTaskPackageReportsMalformedModelContent(t *test
 			code: "task_metadata", messagePart: "valid TOML",
 		},
 		{
+			name: "incomplete task TOML",
+			mutate: func(input *StandardAuthoringTaskPackageInput) {
+				input.TaskTOMLDraft = []byte("[metadata]\ncode_lang = \"go\"\ntask_type = \"bugfix\"\napplication = \"widget\"\nis_0_to_1 = false\n")
+			},
+			code: "task_metadata", messagePart: "complete Harbor TaskConfig contract",
+		},
+		{
 			name: "invalid Dockerfile",
 			mutate: func(input *StandardAuthoringTaskPackageInput) {
 				input.Dockerfile = []byte("FROM docker.io/library/alpine:3.20\n")
@@ -270,7 +277,7 @@ func standardAuthoringTaskPackageFixture(t *testing.T) StandardAuthoringTaskPack
 	}
 	return StandardAuthoringTaskPackageInput{
 		Instruction:   []byte("# Repair widget\n"),
-		TaskTOMLDraft: []byte("[metadata]\ncode_lang = \"go\"\ntask_type = \"bugfix\"\napplication = \"widget\"\nis_0_to_1 = false\ngithub_url = \"" + repository + "\"\ncommit_id = \"" + commit + "\"\n"),
+		TaskTOMLDraft: []byte("schema_version = \"1.0\"\n\n[metadata]\ncode_lang = \"go\"\ntask_type = \"bugfix\"\napplication = \"widget\"\nis_0_to_1 = false\ngithub_url = \"" + repository + "\"\ncommit_id = \"" + commit + "\"\n\n[task]\nname = \"harbor/repair-widget\"\ndescription = \"Repair the bounded widget behavior.\"\n\n[environment]\nbuild_timeout_sec = 900.0\nnetwork_mode = \"no-network\"\nworkdir = \"/workspace/source\"\n\n[verifier]\ntimeout_sec = 1800.0\n"),
 		Dockerfile:    []byte("FROM " + base.BaseImage + "\nRUN git clone " + repository + " /app/repo && cd /app/repo && git checkout " + commit + "\nCOPY package.json /tmp/package.json\n"),
 		SolveScript:   []byte("#!/bin/sh\nexit 0\n"), TestScript: []byte("#!/bin/sh\nexit 0\n"),
 		TestsAnalysis: []byte(`{"provided_information":"The instruction and pinned environment define the task.","theoretical_path":"Inspect the repository, implement the requested behavior, and run tests.","passing_evidence":"The visible contract and tests provide an objective pass condition."}`),
