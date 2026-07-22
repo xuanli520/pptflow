@@ -1135,11 +1135,11 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) prepareAttemptWorkspace
 	if err := os.Mkdir(filepath.Join(stagedWorkRoot, StandardAuthoringCodexAttemptTaskDirectory), 0o750); err != nil {
 		return "", fmt.Errorf("%w: create staged task root", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
-	// The agent needs to edit only task/, never the copied frozen source. Seal
-	// work itself after both fixed children exist so the agent cannot replace
-	// source/ or task/ at the work-root level; task/ remains owner-writable.
-	if err := os.Chmod(stagedWorkRoot, 0o550); err != nil {
-		return "", fmt.Errorf("%w: seal staged work root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	// Codex's Linux sandbox keeps its private bookkeeping under work/.codex.
+	// Keep the copied source sealed, but leave the attempt root owner-writable
+	// so that bookkeeping cannot fail before the model reaches task/.
+	if err := os.Chmod(stagedWorkRoot, 0o700); err != nil {
+		return "", fmt.Errorf("%w: prepare staged work root", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	if err := os.Rename(staging, attemptRoot); err != nil {
 		return "", fmt.Errorf("%w: publish attempt workspace", ErrStandardAuthoringCodexAgentTurnConfiguration)

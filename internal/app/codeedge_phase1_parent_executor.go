@@ -1115,12 +1115,8 @@ func codeEdgePhase1PrepareVerificationCheckout(workspace string, request workflo
 	if err := os.MkdirAll(filepath.Dir(checkout), 0o700); err != nil {
 		return "", nil, err
 	}
-	if info, err := os.Lstat(checkout); errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(checkout, 0o700); err != nil {
-			return "", nil, err
-		}
-	} else if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return "", nil, errors.New("CodeEdge Phase-1 verification checkout is unsafe")
+	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(checkout); err != nil {
+		return "", nil, err
 	}
 	before := make(map[string]workflowkit.Fingerprint, len(files))
 	for _, relative := range files {
@@ -1133,27 +1129,13 @@ func codeEdgePhase1PrepareVerificationCheckout(workspace string, request workflo
 			return "", nil, err
 		}
 		destination := filepath.Join(checkout, filepath.FromSlash(relative))
-		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		directory := filepath.Dir(destination)
+		if err := codeEdgePhase1PrepareVerificationScriptDirectory(directory); err != nil {
 			return "", nil, err
 		}
 		if info, statErr := os.Lstat(destination); errors.Is(statErr, os.ErrNotExist) {
-			file, createErr := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
-			if createErr != nil {
-				return "", nil, createErr
-			}
-			writeErr := func() error {
-				if _, err := file.Write(content); err != nil {
-					return err
-				}
-				return file.Sync()
-			}()
-			closeErr := file.Close()
-			if writeErr != nil {
-				_ = os.Remove(destination)
-				return "", nil, writeErr
-			}
-			if closeErr != nil {
-				return "", nil, closeErr
+			if err := writeNewBytesWithMode(destination, content, 0o444); err != nil {
+				return "", nil, err
 			}
 		} else if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return "", nil, errors.New("CodeEdge Phase-1 verification checkout script is unsafe")
@@ -1166,6 +1148,31 @@ func codeEdgePhase1PrepareVerificationCheckout(workspace string, request workflo
 		before[relative] = digest
 	}
 	return checkout, before, nil
+}
+
+// The image may select a non-root USER. The bind-mounted checkout must let
+// that user create /oracle/worktree while leaving the host-owned script bytes
+// readable; post-run digest verification remains the mutation authority.
+func codeEdgePhase1PrepareVerificationCheckoutRoot(path string) error {
+	if err := os.Mkdir(path, 0o777); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("CodeEdge Phase-1 verification checkout is unsafe")
+	}
+	return os.Chmod(path, 0o777|os.ModeSticky)
+}
+
+func codeEdgePhase1PrepareVerificationScriptDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("CodeEdge Phase-1 verification script directory is unsafe")
+	}
+	return os.Chmod(path, 0o755)
 }
 
 func codeEdgePhase1VerificationFile(relative string) bool {

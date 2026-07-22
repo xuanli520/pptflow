@@ -163,6 +163,47 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 	}
 }
 
+func TestCodeEdgePhase1VerificationCheckoutAllowsNonRootWorktreeAndSealsScripts(t *testing.T) {
+	workspace := t.TempDir()
+	taskRoot := filepath.Join(workspace, "task")
+	for _, relative := range []string{"solution", "tests"} {
+		if err := os.MkdirAll(filepath.Join(taskRoot, relative), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for relative, content := range map[string][]byte{
+		"solution/solve.sh": []byte("#!/bin/sh\nexit 0\n"),
+		"tests/test.sh":     []byte("#!/bin/sh\nexit 1\n"),
+	} {
+		if err := os.WriteFile(filepath.Join(taskRoot, filepath.FromSlash(relative)), content, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := workflowkit.StageExecutionRequest{Claim: workflowkit.JobClaim{Stage: &workflowkit.StageClaim{
+		StageAttempt: workflowkit.AttemptIdentity{ID: workflowkit.AttemptID("verification-attempt")},
+	}}}
+	checkout, _, err := codeEdgePhase1PrepareVerificationCheckout(workspace, request, taskRoot, "oracle", []string{"solution/solve.sh", "tests/test.sh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootInfo, err := os.Lstat(checkout)
+	if err != nil || rootInfo.Mode().Perm() != 0o777 || rootInfo.Mode()&os.ModeSticky == 0 {
+		t.Fatalf("verification checkout root mode = %v, %v; want sticky 1777", rootInfo, err)
+	}
+	for _, relative := range []string{"solution", "tests"} {
+		info, statErr := os.Lstat(filepath.Join(checkout, relative))
+		if statErr != nil || !info.IsDir() || info.Mode().Perm() != 0o755 {
+			t.Fatalf("verification script directory %q = %v, %v; want 0755", relative, info, statErr)
+		}
+	}
+	for _, relative := range []string{"solution/solve.sh", "tests/test.sh"} {
+		info, statErr := os.Lstat(filepath.Join(checkout, filepath.FromSlash(relative)))
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o444 {
+			t.Fatalf("verification script %q = %v, %v; want 0444", relative, info, statErr)
+		}
+	}
+}
+
 func codeEdgePhase1TestArgAfter(args []string, key string) string {
 	for index := 0; index+1 < len(args); index++ {
 		if args[index] == key {

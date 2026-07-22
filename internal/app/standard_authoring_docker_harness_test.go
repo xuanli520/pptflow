@@ -117,6 +117,46 @@ func TestStandardAuthoringDockerHarnessReturnsRepairFeedbackThenReusesImageAfter
 	}
 }
 
+func TestStandardAuthoringDockerHarnessCheckoutAllowsNonRootWorktreeAndSealsScripts(t *testing.T) {
+	candidate, err := authoringharness.CandidateFromBytes(
+		authoringharness.ModeInitialOracle,
+		[]byte("FROM scratch\n"),
+		[]byte("#!/bin/sh\nexit 0\n"),
+		[]byte("#!/bin/sh\nexit 1\n"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(t.TempDir(), "snapshot")
+	if err := writeStandardAuthoringHarnessSnapshot(snapshot, candidate); err != nil {
+		t.Fatal(err)
+	}
+	checkout := filepath.Join(t.TempDir(), "oracle")
+	if _, err := copyStandardAuthoringHarnessScripts(checkout, snapshot, []string{
+		authoringharness.SolveScriptRelativePath,
+		authoringharness.TestScriptRelativePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rootInfo, err := os.Lstat(checkout)
+	if err != nil || rootInfo.Mode().Perm() != 0o777 || rootInfo.Mode()&os.ModeSticky == 0 {
+		t.Fatalf("Oracle checkout root mode = %v, %v; want sticky 1777", rootInfo, err)
+	}
+	for _, relative := range []string{"solution", "tests"} {
+		info, statErr := os.Lstat(filepath.Join(checkout, relative))
+		if statErr != nil || !info.IsDir() || info.Mode().Perm() != 0o755 {
+			t.Fatalf("Oracle script directory %q = %v, %v; want 0755", relative, info, statErr)
+		}
+	}
+	for _, relative := range []string{authoringharness.SolveScriptRelativePath, authoringharness.TestScriptRelativePath} {
+		info, statErr := os.Lstat(filepath.Join(checkout, filepath.FromSlash(relative)))
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o444 {
+			t.Fatalf("Oracle script %q = %v, %v; want 0444", relative, info, statErr)
+		}
+	}
+}
+
 type standardAuthoringHarnessRunner struct {
 	t        *testing.T
 	imageID  string

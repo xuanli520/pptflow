@@ -540,7 +540,6 @@ func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteUsesIsolatedAttemp
 		t.Fatalf("source copy is not an independent read-only file: frozen=%v work=%v err=%v", frozenInfo, workInfo, err)
 	}
 	for _, path := range []string{
-		workRoot,
 		filepath.Join(workRoot, StandardAuthoringCodexAttemptSourceDirectory),
 		filepath.Join(workRoot, StandardAuthoringCodexAttemptSourceDirectory, "src"),
 	} {
@@ -548,6 +547,10 @@ func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteUsesIsolatedAttemp
 		if statErr != nil || !info.IsDir() || info.Mode().Perm()&0o222 != 0 {
 			t.Fatalf("read-only attempt source path %q = %v, %v", path, info, statErr)
 		}
+	}
+	workRootInfo, err := os.Lstat(workRoot)
+	if err != nil || !workRootInfo.IsDir() || workRootInfo.Mode().Perm()&0o200 == 0 {
+		t.Fatalf("owner-writable attempt root for Codex sandbox state = %v, %v", workRootInfo, err)
 	}
 	taskInfo, err := os.Lstat(filepath.Join(workRoot, StandardAuthoringCodexAttemptTaskDirectory))
 	if err != nil || !taskInfo.IsDir() || taskInfo.Mode().Perm()&0o200 == 0 {

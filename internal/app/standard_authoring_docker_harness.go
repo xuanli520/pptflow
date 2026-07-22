@@ -400,7 +400,7 @@ func writeStandardAuthoringHarnessSnapshot(root string, candidate authoringharne
 }
 
 func copyStandardAuthoringHarnessScripts(checkout, snapshotRoot string, relativeFiles []string) (map[string]workflowkit.Fingerprint, error) {
-	if err := os.MkdirAll(checkout, 0o700); err != nil {
+	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(checkout); err != nil {
 		return nil, err
 	}
 	expected := make(map[string]workflowkit.Fingerprint, len(relativeFiles))
@@ -410,10 +410,11 @@ func copyStandardAuthoringHarnessScripts(checkout, snapshotRoot string, relative
 			return nil, err
 		}
 		destination := filepath.Join(checkout, filepath.FromSlash(relative))
-		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		directory := filepath.Dir(destination)
+		if err := codeEdgePhase1PrepareVerificationScriptDirectory(directory); err != nil {
 			return nil, err
 		}
-		if err := writeNewBytesWithMode(destination, content, 0o700); err != nil {
+		if err := writeNewBytesWithMode(destination, content, 0o444); err != nil {
 			return nil, err
 		}
 		expected[relative] = digest
@@ -441,7 +442,10 @@ func writeNewBytesWithMode(path string, content []byte, mode os.FileMode) error 
 		_ = os.Remove(path)
 		return writeErr
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Chmod(path, mode)
 }
 
 func ensureStandardAuthoringHarnessDirectory(path string) error {
