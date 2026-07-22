@@ -24,11 +24,39 @@ func TestCompileStandardAuthoringTaskPackageCanonicalizesFrozenSourceAndAnalysis
 		!strings.Contains(string(files["task.toml"].Data), "github_url = '"+input.Source.RepositoryURL+"'") {
 		t.Fatalf("canonical task.toml did not use frozen provenance:\n%s", files["task.toml"].Data)
 	}
+	document, err := parseStandardAuthoringTaskTOMLPayload(files["task.toml"].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := document["source"].(string); !ok || got != input.Source.RepositoryURL+"@"+input.Source.CommitSHA {
+		t.Fatalf("canonical Harbor source = %#v, want string coordinate", document["source"])
+	}
 	analysis := string(files["tests_analysis.md"].Data)
 	for _, heading := range []string{"## 1. instruction 和 environment 已提供的信息", "## 2. 模型的理论通过路径", "## 3. 模型具备通过条件的依据"} {
 		if !strings.Contains(analysis, heading) {
 			t.Fatalf("rendered analysis omitted %q:\n%s", heading, analysis)
 		}
+	}
+}
+
+func TestCompileStandardAuthoringTaskPackageMigratesMatchingLegacySourceTable(t *testing.T) {
+	input := standardAuthoringTaskPackageFixture(t)
+	input.TaskTOMLDraft = append(input.TaskTOMLDraft, []byte("\n[source]\nrepository_url = \""+input.Source.RepositoryURL+"\"\ncommit_sha = \""+input.Source.CommitSHA+"\"\n")...)
+
+	result, err := CompileStandardAuthoringTaskPackage(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Report.Passed {
+		t.Fatalf("matching legacy source table should be migrated: %+v", result.Report)
+	}
+	files := taskPackageFilesByPath(result.CanonicalFiles)
+	document, err := parseStandardAuthoringTaskTOMLPayload(files["task.toml"].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := document["source"].(string); !ok || got != input.Source.RepositoryURL+"@"+input.Source.CommitSHA {
+		t.Fatalf("migrated Harbor source = %#v, want string coordinate", document["source"])
 	}
 }
 

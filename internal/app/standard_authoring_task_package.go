@@ -386,8 +386,6 @@ func canonicalizeStandardAuthoringTaskTOML(raw []byte, mapping codeedge.Metadata
 	sourceFacts := []standardAuthoringTaskTOMLFact{
 		{"metadata.github_url", mapping.GitHubURL, repositoryURL},
 		{"metadata.commit_id", mapping.CommitID, commitSHA},
-		{"source.repository_url", codeedge.TOMLPath{"source", "repository_url"}, repositoryURL},
-		{"source.commit_sha", codeedge.TOMLPath{"source", "commit_sha"}, commitSHA},
 	}
 	for _, item := range sourceFacts {
 		if len(item.path) == 0 {
@@ -400,6 +398,28 @@ func canonicalizeStandardAuthoringTaskTOML(raw []byte, mapping codeedge.Metadata
 			return nil, nil, fmt.Errorf("canonicalize generated task.toml %s: %w", item.name, err)
 		}
 	}
+	// Harbor v0.18 models source as a top-level string. The immutable URL and
+	// commit remain separately attested in metadata, while this coordinate keeps
+	// the package readable by the external evaluator's local task parser.
+	sourceCoordinate := repositoryURL + "@" + commitSHA
+	if source, present := document["source"]; present {
+		switch source := source.(type) {
+		case string:
+			if source != sourceCoordinate {
+				violations = append(violations, codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated value conflicts with frozen source at source"})
+			}
+		case map[string]any:
+			if repository, ok := readTaskTOMLString(map[string]any{"source": source}, codeedge.TOMLPath{"source", "repository_url"}); !ok || repository != repositoryURL {
+				violations = append(violations, codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated value conflicts with frozen source at source.repository_url"})
+			}
+			if commit, ok := readTaskTOMLString(map[string]any{"source": source}, codeedge.TOMLPath{"source", "commit_sha"}); !ok || commit != commitSHA {
+				violations = append(violations, codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated value conflicts with frozen source at source.commit_sha"})
+			}
+		default:
+			violations = append(violations, codeedge.Violation{Code: "task_metadata", Path: "task.toml", Message: "generated source must be a string or a frozen source table"})
+		}
+	}
+	document["source"] = sourceCoordinate
 	if brief != nil {
 		briefFacts, err := standardAuthoringBriefMetadataFacts(mapping, *brief)
 		if err != nil {
