@@ -28,6 +28,10 @@ const (
 	// validation_exhausted distinguishes a completed ReAct loop whose host
 	// checks kept rejecting the candidate from an agent that never submitted.
 	standardAuthoringCodexSubmissionFailureValidationExhausted = "standard_authoring_codex_agent_turn.validation_exhausted"
+	// validation_unavailable identifies host-validator faults that cannot be
+	// repaired by editing a candidate. Do not let a model spend its remaining
+	// ReAct budget retrying an unavailable host capability.
+	standardAuthoringCodexSubmissionFailureValidationUnavailable = "standard_authoring_codex_agent_turn.validation_unavailable"
 )
 
 // standardAuthoringCodexWorkspaceSubmission is the output authority for the
@@ -318,7 +322,10 @@ func (submission *standardAuthoringCodexWorkspaceSubmission) handle(ctx context.
 		StageAttemptID: string(submission.request.Claim.Stage.StageAttempt.ID),
 	})
 	if err != nil {
-		return standardAuthoringCodexWorkspaceSubmissionResponse(false, []string{"validation_unavailable"}, remaining, candidate.CandidateDigest, authoringharness.Result{})
+		submission.mu.Lock()
+		submission.failureCode = standardAuthoringCodexSubmissionFailureValidationUnavailable
+		submission.mu.Unlock()
+		return standardAuthoringCodexWorkspaceSubmissionResponse(false, []string{"validation_unavailable"}, 0, candidate.CandidateDigest, authoringharness.Result{})
 	}
 	if err := result.ValidateReportJSON(); err != nil || result.Mode != submission.mode || result.RunID != submission.request.Execution.ID || result.StageKey != submission.stage.Key || result.StageAttemptID != string(submission.request.Claim.Stage.StageAttempt.ID) {
 		submission.mu.Lock()

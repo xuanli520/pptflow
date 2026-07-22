@@ -683,7 +683,9 @@ func standardAuthoringCodexSubmissionFailureClass(code string) workflowkit.Failu
 	if code == standardAuthoringCodexSubmissionFailureQuota {
 		return workflowkit.FailurePolicy
 	}
-	if code == standardAuthoringCodexSubmissionFailureValidation || code == standardAuthoringCodexSubmissionFailureValidationExhausted {
+	if code == standardAuthoringCodexSubmissionFailureValidation ||
+		code == standardAuthoringCodexSubmissionFailureValidationExhausted ||
+		code == standardAuthoringCodexSubmissionFailureValidationUnavailable {
 		return workflowkit.FailureProcess
 	}
 	return workflowkit.FailureUnknown

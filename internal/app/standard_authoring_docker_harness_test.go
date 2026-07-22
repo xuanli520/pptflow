@@ -131,7 +131,7 @@ func TestStandardAuthoringDockerHarnessCheckoutAllowsNonRootWorktreeAndSealsScri
 	if err := writeStandardAuthoringHarnessSnapshot(snapshot, candidate); err != nil {
 		t.Fatal(err)
 	}
-	checkout := filepath.Join(t.TempDir(), "oracle")
+	checkout := filepath.Join(t.TempDir(), "verification", "oracle")
 	if _, err := copyStandardAuthoringHarnessScripts(checkout, snapshot, []string{
 		authoringharness.SolveScriptRelativePath,
 		authoringharness.TestScriptRelativePath,

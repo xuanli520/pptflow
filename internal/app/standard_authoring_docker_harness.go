@@ -400,6 +400,11 @@ func writeStandardAuthoringHarnessSnapshot(root string, candidate authoringharne
 }
 
 func copyStandardAuthoringHarnessScripts(checkout, snapshotRoot string, relativeFiles []string) (map[string]workflowkit.Fingerprint, error) {
+	// The checkout is nested below a per-invocation root. Keep its private
+	// parent host-owned before exposing the sticky /oracle mount root.
+	if err := ensureStandardAuthoringHarnessDirectory(filepath.Dir(checkout)); err != nil {
+		return nil, fmt.Errorf("prepare Standard authoring verification parent: %w", err)
+	}
 	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(checkout); err != nil {
 		return nil, err
 	}

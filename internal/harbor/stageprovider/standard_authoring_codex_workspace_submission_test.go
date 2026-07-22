@@ -3,6 +3,7 @@ package stageprovider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -221,6 +222,45 @@ func TestStandardAuthoringWorkspaceSubmissionReportsValidationExhaustion(t *test
 	}
 	if len(*usages) != 4 {
 		t.Fatalf("validation exhaustion usage = %+v, want two charges per attempt", *usages)
+	}
+}
+
+func TestStandardAuthoringWorkspaceSubmissionStopsOnUnavailableValidator(t *testing.T) {
+	now := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+	policy := standardAuthoringCodexTestEnvironmentPolicy(t)
+	taskRoot := standardAuthoringWorkspaceSubmissionTaskRoot(t, policy, authoringharness.ModeInitialOracle)
+	stage := standardAuthoringWorkspaceSubmissionStage(workflowadapter.AuthoringHarness)
+	request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("input"), now)
+	validator := standardAuthoringHarnessValidatorFunc(func(context.Context, authoringharness.Request) (authoringharness.Result, error) {
+		return authoringharness.Result{}, errors.New("host validator unavailable")
+	})
+	submission, err := newStandardAuthoringCodexWorkspaceSubmission(request, taskRoot, 8, func() time.Time { return now }, validator, &policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := submission.beginTurn(1); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := submission.handle(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt standardAuthoringCodexWorkspaceSubmissionReceipt
+	if err := json.Unmarshal(response, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Accepted || receipt.Remaining != 0 || len(receipt.Errors) != 1 || receipt.Errors[0] != "validation_unavailable" {
+		t.Fatalf("unavailable validator receipt = %+v", receipt)
+	}
+	if got := submission.failure(); got != standardAuthoringCodexSubmissionFailureValidationUnavailable {
+		t.Fatalf("submission failure = %q, want unavailable validator", got)
+	}
+	if got := standardAuthoringCodexSubmissionFailureClass(submission.failure()); got != workflowkit.FailureProcess {
+		t.Fatalf("unavailable validator failure class = %q, want process", got)
+	}
+	if len(*usages) != 2 {
+		t.Fatalf("unavailable validator usage = %+v, want one charged attempt", *usages)
 	}
 }
 
