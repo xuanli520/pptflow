@@ -242,6 +242,32 @@ func TestContinuationPlanFreezesCoverageTopologyAndExternalConfirmation(t *testi
 	if plan.ID() != "plan-1" || plan.Fingerprint() == "" || !plan.IsExpired(now.Add(2*time.Hour)) {
 		t.Fatalf("frozen plan accessors returned inconsistent values")
 	}
+	semantic, err := plan.SemanticFingerprint()
+	if err != nil || semantic == "" {
+		t.Fatalf("semantic fingerprint = %q, %v", semantic, err)
+	}
+	ephemeral := snapshot.Clone()
+	ephemeral.PlanID = "plan-2"
+	ephemeral.CommandID = "command-2"
+	ephemeral.ExpiresAt = snapshot.ExpiresAt.Add(time.Hour)
+	ephemeralPlan, err := FreezeContinuationPlan(ephemeral, workflow)
+	if err != nil {
+		t.Fatalf("freeze equivalent plan with new allocation: %v", err)
+	}
+	ephemeralSemantic, err := ephemeralPlan.SemanticFingerprint()
+	if err != nil || semantic != ephemeralSemantic || plan.Fingerprint() == ephemeralPlan.Fingerprint() {
+		t.Fatalf("semantic/full fingerprint distinction = semantic:%q/%q full:%q/%q err:%v", semantic, ephemeralSemantic, plan.Fingerprint(), ephemeralPlan.Fingerprint(), err)
+	}
+	changedMeaning := snapshot.Clone()
+	changedMeaning.Nodes[0].ReasonCodes = []PlanReason{"different_request"}
+	changedMeaningPlan, err := FreezeContinuationPlan(changedMeaning, workflow)
+	if err != nil {
+		t.Fatalf("freeze semantically changed plan: %v", err)
+	}
+	changedSemantic, err := changedMeaningPlan.SemanticFingerprint()
+	if err != nil || changedSemantic == semantic {
+		t.Fatalf("changed semantic fingerprint = %q, %v; want different from %q", changedSemantic, err, semantic)
+	}
 	mutated := plan.Snapshot()
 	mutated.Nodes[0].ReasonCodes[0] = "mutated"
 	if plan.Snapshot().Nodes[0].ReasonCodes[0] == "mutated" {

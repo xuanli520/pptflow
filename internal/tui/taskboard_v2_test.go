@@ -133,10 +133,10 @@ func TestDetailOffersAuthoringRecoveryForMissingOutputSubmission(t *testing.T) {
 		}},
 	})
 	rendered := ansi.Strip(detail.View(100, 28))
-	if !strings.Contains(rendered, "恢复/重试") {
+	if !strings.Contains(rendered, "断点恢复") {
 		t.Fatalf("authoring recovery label missing:\n%s", rendered)
 	}
-	if footer := detailFooterText(detail); !strings.Contains(footer, "[t] 恢复/重试") {
+	if footer := detailFooterText(detail); !strings.Contains(footer, "[t] 断点恢复") {
 		t.Fatalf("authoring recovery action missing from footer: %q", footer)
 	}
 }

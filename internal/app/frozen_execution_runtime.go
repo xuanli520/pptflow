@@ -992,6 +992,9 @@ func validateRequiredContinuationInputsExcept(ctx context.Context, core *lifecyc
 	if err != nil {
 		return fmt.Errorf("%w: %w: resolve continuation subject: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, err)
 	}
+	if err := validatePreservedContinuationArtifacts(ctx, core, run, subject, plan); err != nil {
+		return err
+	}
 	for _, stageKey := range mustTopologicalStageKeys(plan.Workflow) {
 		transition, found := plan.stageTransition(stageKey)
 		if !found || transition.Disposition != workflowkit.DispositionSchedule || len(transition.InputBindings) == 0 {
@@ -1010,6 +1013,37 @@ func validateRequiredContinuationInputsExcept(ctx context.Context, core *lifecyc
 		}
 		if err := requirePlannedStageInputs(transition, inputs); err != nil {
 			return fmt.Errorf("%w: %w: stage %q required continuation inputs: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stageKey, err)
+		}
+	}
+	return nil
+}
+
+// validatePreservedContinuationArtifacts re-observes every stage a frozen plan
+// intends to reuse. The plan can outlive an object-store entry, so its original
+// preserve assertion is not enough once execution is about to commit or resume.
+func validatePreservedContinuationArtifacts(ctx context.Context, core *lifecycleServiceCore, run store.WorkflowRun, subject workflowRunSubject, plan runtimeExecutionPlan) error {
+	observer := storeContinuationStateObserver{dataStore: core.store, objects: core.objects}
+	state, err := observer.ObserveSubject(ctx, run, subject, plan.Workflow)
+	if err != nil {
+		return fmt.Errorf("%w: %w: observe preserved continuation artifacts: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, err)
+	}
+	if state.InDoubt {
+		return fmt.Errorf("%w: %w: preserved continuation evidence is in doubt", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift)
+	}
+	reuseByStage := make(map[workflowkit.StageKey]workflowkit.StageReuseState, len(state.ReuseStates))
+	for _, reuse := range state.ReuseStates {
+		reuseByStage[workflowkit.StageKey(reuse.NodeID)] = reuse
+	}
+	for _, stageKey := range mustTopologicalStageKeys(plan.Workflow) {
+		transition, found := plan.stageTransition(stageKey)
+		if !found || transition.Disposition != workflowkit.DispositionPreserve {
+			continue
+		}
+		reuse, found := reuseByStage[stageKey]
+		if !found || !reuse.Present || !reuse.ArtifactsIntact ||
+			reuse.ExpectedInputFingerprint != transition.ExpectedInputFingerprint ||
+			!sameArtifactBindings(reuse.CurrentInputs, transition.InputBindings) {
+			return fmt.Errorf("%w: %w: preserved stage %q artifact is missing, damaged, or has input fingerprint drift", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stageKey)
 		}
 	}
 	return nil

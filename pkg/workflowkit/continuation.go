@@ -306,6 +306,14 @@ func (plan ContinuationPlan) ID() string { return plan.snapshot.PlanID }
 // Fingerprint returns the canonical fingerprint of the frozen plan.
 func (plan ContinuationPlan) Fingerprint() Fingerprint { return plan.fingerprint }
 
+// SemanticFingerprint identifies the executable meaning of a continuation
+// plan while excluding allocation and expiry details. It is suitable for a
+// preview/confirmation handshake; the full Fingerprint remains the durable
+// identity of one specific frozen plan.
+func (plan ContinuationPlan) SemanticFingerprint() (Fingerprint, error) {
+	return semanticFingerprintContinuationPlan(plan.snapshot)
+}
+
 // IsExpired reports whether a plan may no longer be executed at now.
 func (plan ContinuationPlan) IsExpired(now time.Time) bool {
 	return !plan.snapshot.ExpiresAt.After(now)
@@ -597,6 +605,27 @@ func validateSchedule(batches []ScheduleBatch, workflow WorkflowDescriptor, tran
 }
 
 func fingerprintContinuationPlan(snapshot ContinuationPlanSnapshot) (Fingerprint, error) {
+	canonical := canonicalContinuationPlanSnapshot(snapshot)
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("%w: encode frozen continuation plan: %v", ErrInvalidContinuationPlan, err)
+	}
+	return FingerprintBytes("workflowkit.continuation-plan.v1", encoded)
+}
+
+func semanticFingerprintContinuationPlan(snapshot ContinuationPlanSnapshot) (Fingerprint, error) {
+	canonical := canonicalContinuationPlanSnapshot(snapshot)
+	canonical.PlanID = ""
+	canonical.CommandID = ""
+	canonical.ExpiresAt = time.Time{}
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("%w: encode continuation plan semantics: %v", ErrInvalidContinuationPlan, err)
+	}
+	return FingerprintBytes("workflowkit.continuation-plan-semantics.v1", encoded)
+}
+
+func canonicalContinuationPlanSnapshot(snapshot ContinuationPlanSnapshot) ContinuationPlanSnapshot {
 	canonical := snapshot.Clone()
 	canonical.ExpiresAt = canonical.ExpiresAt.UTC()
 	sort.Slice(canonical.Nodes, func(left, right int) bool { return canonical.Nodes[left].NodeID < canonical.Nodes[right].NodeID })
@@ -622,9 +651,5 @@ func fingerprintContinuationPlan(snapshot ContinuationPlanSnapshot) (Fingerprint
 	sort.Slice(canonical.ExternalEffectConfirmations, func(left, right int) bool {
 		return canonical.ExternalEffectConfirmations[left].NodeID < canonical.ExternalEffectConfirmations[right].NodeID
 	})
-	encoded, err := json.Marshal(canonical)
-	if err != nil {
-		return "", fmt.Errorf("%w: encode frozen continuation plan: %v", ErrInvalidContinuationPlan, err)
-	}
-	return FingerprintBytes("workflowkit.continuation-plan.v1", encoded)
+	return canonical
 }

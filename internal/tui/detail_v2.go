@@ -173,7 +173,7 @@ func (d *detailModel) currentRunFields(width int) string {
 	retry := "可用"
 	retryLabel := "重试"
 	if run.RetryStrategy == app.TaskBoardRetryStrategyAuthoringRecovery {
-		retryLabel = "恢复/重试"
+		retryLabel = "断点恢复"
 	} else if run.RetryStrategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
 		retryLabel = "修复并继续"
 	}

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 // TaskBoardColumn is the coarse workflow state exposed to an operator-facing
@@ -23,6 +25,15 @@ const (
 	TaskBoardPending   TaskBoardColumn = "pending"
 	TaskBoardRunning   TaskBoardColumn = "running"
 	TaskBoardCompleted TaskBoardColumn = "completed"
+)
+
+var (
+	// ErrTaskBoardRecoveryPreviewRequired prevents a recovery confirmation from
+	// silently constructing a plan the operator never inspected.
+	ErrTaskBoardRecoveryPreviewRequired = errors.New("task board recovery preview is required")
+	// ErrTaskBoardRecoveryPreviewStale marks a preview whose checkpoint or
+	// executable semantics changed before the operator confirmed it.
+	ErrTaskBoardRecoveryPreviewStale = errors.New("task board recovery preview is stale")
 )
 
 // TaskBoardReviewKind keeps the two durable review contracts distinct. An
@@ -199,10 +210,43 @@ type TaskBoardReadRunLogRequest struct {
 // Its key is retained by the TUI if a request needs to be retried after an
 // infrastructure failure.
 type TaskBoardRetryRunRequest struct {
-	IdempotencyKey string
-	TaskID         string
-	RunID          string
-	Reason         string
+	IdempotencyKey                  string
+	TaskID                          string
+	RunID                           string
+	Reason                          string
+	ExpectedRecoveryCheckpoint      *workflowkit.CheckpointRef
+	ExpectedRecoveryPlanFingerprint workflowkit.Fingerprint
+}
+
+// TaskBoardPreviewRunRecoveryRequest identifies a read-only recovery-plan
+// preview. It intentionally has no idempotency key because it creates no
+// durable command, plan, execution, job, or audit record.
+type TaskBoardPreviewRunRecoveryRequest struct {
+	TaskID string
+	RunID  string
+	Reason string
+}
+
+// TaskBoardRecoveryPreview is the small, presentation-neutral explanation of
+// a freshly validated continuation plan. The preview cannot be executed: the
+// confirmation path creates and revalidates its own durable frozen plan.
+type TaskBoardRecoveryPreview struct {
+	TaskID                  string
+	RunID                   string
+	Strategy                TaskBoardRetryStrategy
+	CheckpointSequence      uint64
+	CurrentExecutionEpoch   int
+	NextExecutionEpoch      int
+	SubjectDigest           string
+	WorkflowFingerprint     string
+	Checkpoint              workflowkit.CheckpointRef
+	SemanticPlanFingerprint workflowkit.Fingerprint
+	TargetStages            []string
+	ReusedStages            []string
+	ScheduledStages         []string
+	InvalidatedStages       []string
+	OperatorOnlyStages      []string
+	StageReasons            map[string][]string
 }
 
 // TaskBoardRetryAuthoringLaunchRequest targets a failed pre-Task source
@@ -238,6 +282,7 @@ type TaskBoardGateway interface {
 	StartAuthoring(context.Context, TaskBoardStartAuthoringRequest) (TaskBoardMutation, error)
 	DecideReview(context.Context, TaskBoardDecideReviewRequest) (TaskBoardMutation, error)
 	ReadRunLog(context.Context, TaskBoardReadRunLogRequest) (TaskBoardLog, error)
+	PreviewRunRecovery(context.Context, TaskBoardPreviewRunRecoveryRequest) (TaskBoardRecoveryPreview, error)
 	RetryRun(context.Context, TaskBoardRetryRunRequest) (TaskBoardMutation, error)
 	RetryAuthoringLaunch(context.Context, TaskBoardRetryAuthoringLaunchRequest) (TaskBoardMutation, error)
 	CancelRun(context.Context, TaskBoardCancelRunRequest) (TaskBoardMutation, error)
@@ -593,10 +638,134 @@ func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoard
 	case store.WorkflowRunSubjectTaskRevision:
 		return service.retryTaskRevisionRun(ctx, prepared, actor)
 	case store.WorkflowRunSubjectAuthoringSession:
-		return service.recoverAuthoringRun(ctx, prepared, actor)
+		return service.recoverAuthoringRun(ctx, prepared, actor, request)
 	default:
 		return TaskBoardMutation{}, fmt.Errorf("Run %s has no retry contract", prepared.RunID)
 	}
+}
+
+// PreviewRunRecovery proves the current Run can resume from a verified
+// checkpoint and summarizes exactly which frozen stages would be reused or
+// scheduled. It deliberately uses the same preview planners as the CLI, but
+// it never persists the ephemeral plan that it receives.
+func (service *TaskBoardService) PreviewRunRecovery(ctx context.Context, request TaskBoardPreviewRunRecoveryRequest) (TaskBoardRecoveryPreview, error) {
+	if service == nil {
+		return TaskBoardRecoveryPreview{}, fmt.Errorf("task board service is not configured")
+	}
+	request.TaskID = strings.TrimSpace(request.TaskID)
+	request.RunID = strings.TrimSpace(request.RunID)
+	request.Reason = strings.TrimSpace(request.Reason)
+	if request.Reason == "" {
+		return TaskBoardRecoveryPreview{}, fmt.Errorf("task board recovery preview reason is required")
+	}
+	if _, err := service.taskBoardRun(ctx, request.TaskID, request.RunID); err != nil {
+		return TaskBoardRecoveryPreview{}, err
+	}
+	actor, err := service.currentActor()
+	if err != nil {
+		return TaskBoardRecoveryPreview{}, err
+	}
+	run, err := service.taskBoardWorkflowRun(ctx, request.RunID)
+	if err != nil {
+		return TaskBoardRecoveryPreview{}, err
+	}
+	commandKey, err := store.NewUUIDv7()
+	if err != nil {
+		return TaskBoardRecoveryPreview{}, fmt.Errorf("allocate task board recovery preview key: %w", err)
+	}
+
+	var plan workflowkit.ContinuationPlan
+	strategy := taskBoardRetryStrategy(run)
+	switch run.SubjectKind {
+	case store.WorkflowRunSubjectTaskRevision:
+		if service.continuations == nil {
+			return TaskBoardRecoveryPreview{}, fmt.Errorf("task board continuation service is not configured")
+		}
+		checkpoint, err := service.continuations.CurrentCheckpoint(ctx, request.RunID)
+		if err != nil {
+			return TaskBoardRecoveryPreview{}, err
+		}
+		plan, err = service.continuations.PreviewTaskContinuation(ctx, ContinueTaskCommand{
+			CommandKey: commandKey,
+			TaskID:     request.TaskID,
+			RunID:      request.RunID,
+			Expected:   checkpoint,
+			Actor:      actor,
+			Reason:     request.Reason,
+		})
+		if err != nil {
+			return TaskBoardRecoveryPreview{}, err
+		}
+	case store.WorkflowRunSubjectAuthoringSession:
+		if service.authoringRecovery == nil {
+			return TaskBoardRecoveryPreview{}, fmt.Errorf("task board authoring recovery service is not configured")
+		}
+		checkpoint, err := service.authoringRecovery.CurrentCheckpoint(ctx, request.RunID)
+		if err != nil {
+			return TaskBoardRecoveryPreview{}, err
+		}
+		plan, err = service.authoringRecovery.PreviewAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+			CommandKey: commandKey,
+			RunID:      request.RunID,
+			Expected:   checkpoint,
+			Actor:      actor,
+			Reason:     request.Reason,
+		})
+		if err != nil {
+			return TaskBoardRecoveryPreview{}, err
+		}
+	default:
+		return TaskBoardRecoveryPreview{}, fmt.Errorf("Run %s has no recovery preview contract", request.RunID)
+	}
+	return taskBoardRecoveryPreview(request.TaskID, request.RunID, strategy, plan)
+}
+
+func taskBoardRecoveryPreview(taskID, runID string, strategy TaskBoardRetryStrategy, plan workflowkit.ContinuationPlan) (TaskBoardRecoveryPreview, error) {
+	snapshot := plan.Snapshot()
+	semanticFingerprint, err := plan.SemanticFingerprint()
+	if err != nil {
+		return TaskBoardRecoveryPreview{}, fmt.Errorf("fingerprint task board recovery preview: %w", err)
+	}
+	preview := TaskBoardRecoveryPreview{
+		TaskID:                  taskID,
+		RunID:                   runID,
+		Strategy:                strategy,
+		CheckpointSequence:      snapshot.BaseCheckpoint.Sequence,
+		CurrentExecutionEpoch:   snapshot.BaseCheckpoint.ExecutionEpoch,
+		NextExecutionEpoch:      snapshot.NextExecutionEpoch,
+		SubjectDigest:           string(snapshot.BaseCheckpoint.SubjectDigest),
+		WorkflowFingerprint:     string(snapshot.BaseCheckpoint.WorkflowFingerprint),
+		Checkpoint:              snapshot.BaseCheckpoint,
+		SemanticPlanFingerprint: semanticFingerprint,
+		StageReasons:            make(map[string][]string, len(snapshot.Nodes)),
+	}
+	for _, transition := range snapshot.Nodes {
+		nodeID := string(transition.NodeID)
+		if len(transition.ReasonCodes) > 0 {
+			reasons := make([]string, 0, len(transition.ReasonCodes))
+			for _, reason := range transition.ReasonCodes {
+				reasons = append(reasons, string(reason))
+			}
+			preview.StageReasons[nodeID] = reasons
+		}
+		switch transition.Disposition {
+		case workflowkit.DispositionPreserve:
+			preview.ReusedStages = append(preview.ReusedStages, nodeID)
+		case workflowkit.DispositionSchedule:
+			preview.ScheduledStages = append(preview.ScheduledStages, nodeID)
+		case workflowkit.DispositionInvalidate:
+			preview.InvalidatedStages = append(preview.InvalidatedStages, nodeID)
+		case workflowkit.DispositionOperatorOnly:
+			preview.OperatorOnlyStages = append(preview.OperatorOnlyStages, nodeID)
+		}
+		for _, reason := range transition.ReasonCodes {
+			if reason == workflowkit.PlanReason("retry_requested") || reason == workflowkit.PlanReason("force_recompute") {
+				preview.TargetStages = append(preview.TargetStages, nodeID)
+				break
+			}
+		}
+	}
+	return preview, nil
 }
 
 // RetryAuthoringLaunch replays the one immutable authoring.start command that
@@ -649,14 +818,14 @@ func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepa
 	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Run 排队重试"}, nil
 }
 
-func (service *TaskBoardService) recoverAuthoringRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string) (TaskBoardMutation, error) {
+func (service *TaskBoardService) recoverAuthoringRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string, request TaskBoardRetryRunRequest) (TaskBoardMutation, error) {
 	if service.authoringRecovery == nil {
 		return TaskBoardMutation{}, fmt.Errorf("task board authoring recovery service is not configured")
 	}
-	checkpoint, err := service.authoringRecovery.CurrentCheckpoint(ctx, prepared.RunID)
-	if err != nil {
-		return TaskBoardMutation{}, err
+	if request.ExpectedRecoveryCheckpoint == nil || request.ExpectedRecoveryPlanFingerprint == "" {
+		return TaskBoardMutation{}, ErrTaskBoardRecoveryPreviewRequired
 	}
+	checkpoint := *request.ExpectedRecoveryCheckpoint
 	plan, err := service.authoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
 		CommandKey: prepared.IdempotencyKey,
 		RunID:      prepared.RunID,
@@ -665,7 +834,17 @@ func (service *TaskBoardService) recoverAuthoringRun(ctx context.Context, prepar
 		Reason:     prepared.Reason,
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrOptimisticLock) {
+			return TaskBoardMutation{}, fmt.Errorf("%w: %v", ErrTaskBoardRecoveryPreviewStale, err)
+		}
 		return TaskBoardMutation{}, err
+	}
+	semanticFingerprint, err := plan.SemanticFingerprint()
+	if err != nil {
+		return TaskBoardMutation{}, fmt.Errorf("fingerprint confirmed authoring recovery plan: %w", err)
+	}
+	if semanticFingerprint != request.ExpectedRecoveryPlanFingerprint {
+		return TaskBoardMutation{}, fmt.Errorf("%w: recovery plan changed after preview", ErrTaskBoardRecoveryPreviewStale)
 	}
 	if _, err := service.authoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID()); err != nil {
 		return TaskBoardMutation{}, err

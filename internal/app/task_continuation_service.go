@@ -881,6 +881,23 @@ func (observer storeContinuationStateObserver) reuseStateForSubject(ctx context.
 		if err != nil || fingerprint != workflowkit.Fingerprint(reference.InputFingerprint) {
 			return missing
 		}
+		attemptInputs := workflowkit.Fingerprint(latest.InputFingerprint)
+		if attemptInputs != fingerprint {
+			if err := attemptInputs.Validate(); err != nil {
+				return missing
+			}
+			// The artifact bytes and manifest are intact, but the completed
+			// attempt no longer claims the inputs that produced them. Preserve
+			// this observation so invalidation can surface fingerprint drift
+			// instead of treating it as an unexplained missing artifact.
+			return workflowkit.StageReuseState{
+				NodeID:                   stage.Key,
+				Present:                  true,
+				ArtifactsIntact:          true,
+				ExpectedInputFingerprint: attemptInputs,
+				CurrentInputs:            append([]workflowkit.ArtifactBinding(nil), bindings...),
+			}
+		}
 		if expectedInputs == "" {
 			expectedInputs = fingerprint
 			currentInputs = append([]workflowkit.ArtifactBinding(nil), bindings...)

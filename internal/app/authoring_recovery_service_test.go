@@ -747,6 +747,208 @@ func removeAuthoringRecoveryArtifactObject(t *testing.T, ctx context.Context, fi
 	}
 }
 
+func TestAuthoringRecoveryRejectsExecutionWhenPreservedArtifactDriftsBeforeCommit(t *testing.T) {
+	ctx := context.Background()
+	for _, scenario := range []struct {
+		name   string
+		mutate func(*testing.T, authoringRecoveryFixture, store.ArtifactRef)
+	}{
+		{
+			name: "missing object",
+			mutate: func(t *testing.T, fixture authoringRecoveryFixture, reference store.ArtifactRef) {
+				removeAuthoringRecoveryArtifactObject(t, ctx, fixture, reference)
+			},
+		},
+		{
+			name: "corrupt object",
+			mutate: func(t *testing.T, fixture authoringRecoveryFixture, reference store.ArtifactRef) {
+				path := authoringRecoveryArtifactObjectPath(t, ctx, fixture, reference)
+				if err := os.Chmod(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("corrupted preserved artifact"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
+			seedAuthoringRecoveryRepoPrepare(t, ctx, fixture)
+			checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, fixture.run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := fixture.services.AuthoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+				CommandKey: authoringRecoveryUUID(t), RunID: fixture.run.ID, Expected: checkpoint,
+				Actor: "operator", Reason: "reject drift in a preserved source artifact",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reference := authoringRecoveryStageArtifactRef(t, ctx, fixture, workflowadapter.RepoPrepare)
+			scenario.mutate(t, fixture, reference)
+
+			_, err = fixture.services.AuthoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID())
+			if !errors.Is(err, ErrAuthoringRecoveryUnavailable) || !strings.Contains(err.Error(), "preserved stage") {
+				t.Fatalf("preserved artifact drift execution error = %v", err)
+			}
+			executionKey := "authoring-recovery-execution:" + plan.ID()
+			if execution, lookupErr := fixture.store.GetContinuationExecutionByIdempotency(ctx, executionKey); lookupErr != nil || execution != nil {
+				t.Fatalf("preserved artifact drift execution = %+v, %v; want none", execution, lookupErr)
+			}
+			updated, lookupErr := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
+			if lookupErr != nil || updated == nil || updated.Status != fixture.run.Status || updated.ExecutionEpoch != fixture.run.ExecutionEpoch || updated.Version != fixture.run.Version {
+				t.Fatalf("preserved artifact drift Run = %+v, %v; want unchanged %+v", updated, lookupErr, fixture.run)
+			}
+		})
+	}
+}
+
+func TestAuthoringRecoveryReconcilesWhenPreservedArtifactDriftsAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
+	seedAuthoringRecoveryRepoPrepare(t, ctx, fixture)
+	checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := fixture.services.AuthoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+		CommandKey: authoringRecoveryUUID(t), RunID: fixture.run.ID, Expected: checkpoint,
+		Actor: "operator", Reason: "reconcile drift after recovery commit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := fixture.services.AuthoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := authoringRecoveryStageArtifactRef(t, ctx, fixture, workflowadapter.RepoPrepare)
+	removeAuthoringRecoveryArtifactObject(t, ctx, fixture, reference)
+	attemptsBefore, err := fixture.store.ListStageAttemptsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := authoringRecoveryExecutionJob(t, ctx, fixture, execution.ID)
+	runtime := &FrozenExecutionRuntime{core: fixture.services.core, services: fixture.services}
+	state, err := runtime.handleContinuation(ctx, DurableJobExecution{}, job)
+	if err == nil || state != store.JobFailed || !errors.Is(err, ErrFrozenExecutionPayload) {
+		t.Fatalf("preserved artifact runtime drift = %s, %v", state, err)
+	}
+	updatedExecution, err := fixture.store.GetContinuationExecution(ctx, execution.ID)
+	if err != nil || updatedExecution == nil || updatedExecution.State != store.ContinuationExecutionReconcileRequired {
+		t.Fatalf("preserved artifact reconciliation = %+v, %v", updatedExecution, err)
+	}
+	attemptsAfter, err := fixture.store.ListStageAttemptsForRun(ctx, fixture.run.ID)
+	if err != nil || len(attemptsAfter) != len(attemptsBefore) {
+		t.Fatalf("preserved artifact drift StageAttempts = %d, %v; want %d", len(attemptsAfter), err, len(attemptsBefore))
+	}
+}
+
+func TestAuthoringRecoverySchedulesUpstreamStageWhenInputFingerprintDrifts(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
+	seedAuthoringRecoveryRepoPrepare(t, ctx, fixture)
+	baseObserver := fixture.services.AuthoringRecovery.observer
+	fixture.services.AuthoringRecovery.observer = authoringRecoverySubjectObserverFunc(func(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, workflow workflowkit.WorkflowDescriptor) (continuationRunState, error) {
+		state, err := baseObserver.ObserveSubject(ctx, run, subject, workflow)
+		if err != nil {
+			return continuationRunState{}, err
+		}
+		for index := range state.ReuseStates {
+			if state.ReuseStates[index].NodeID == workflowkit.NodeID(workflowadapter.RepoPrepare) {
+				state.ReuseStates[index].ExpectedInputFingerprint = workflowkit.SHA256Fingerprint([]byte("drifted repo_prepare inputs"))
+			}
+		}
+		return state, nil
+	})
+	checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := fixture.services.AuthoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+		CommandKey: authoringRecoveryUUID(t), RunID: fixture.run.ID, Expected: checkpoint,
+		Actor: "operator", Reason: "rebuild source preparation after input fingerprint drift",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transition := range plan.Snapshot().Nodes {
+		if transition.NodeID != workflowkit.NodeID(workflowadapter.RepoPrepare) {
+			continue
+		}
+		if transition.Disposition != workflowkit.DispositionSchedule || !containsAuthoringRecoveryPlanReason(transition.ReasonCodes, workflowkit.PlanReason(workflowkit.InvalidationInputFingerprintDrift)) {
+			t.Fatalf("input-drifted repo_prepare transition = %+v", transition)
+		}
+		return
+	}
+	t.Fatal("input-drifted recovery plan omitted repo_prepare")
+}
+
+func containsAuthoringRecoveryPlanReason(reasons []workflowkit.PlanReason, want workflowkit.PlanReason) bool {
+	for _, reason := range reasons {
+		if reason == want {
+			return true
+		}
+	}
+	return false
+}
+
+func authoringRecoveryExecutionJob(t *testing.T, ctx context.Context, fixture authoringRecoveryFixture, executionID string) store.DurableJob {
+	t.Helper()
+	jobs, err := fixture.store.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range jobs {
+		if job.CommandType == "task_continuation.execute" && job.EntityID == executionID {
+			return job
+		}
+	}
+	t.Fatalf("authoring recovery execution %s has no durable job", executionID)
+	return store.DurableJob{}
+}
+
+func authoringRecoveryStageArtifactRef(t *testing.T, ctx context.Context, fixture authoringRecoveryFixture, stageKey string) store.ArtifactRef {
+	t.Helper()
+	attempts, err := fixture.store.ListStageAttemptsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, attempt := range attempts {
+		if attempt.StageKey != stageKey || attempt.ExecutionStatus != store.StageExecutionCompleted || attempt.ArtifactManifestID == "" {
+			continue
+		}
+		references, listErr := fixture.store.ListArtifactRefs(ctx, attempt.ArtifactManifestID)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(references) > 0 {
+			return references[0]
+		}
+	}
+	t.Fatalf("stage %q has no completed artifact reference", stageKey)
+	return store.ArtifactRef{}
+}
+
+func authoringRecoveryArtifactObjectPath(t *testing.T, ctx context.Context, fixture authoringRecoveryFixture, reference store.ArtifactRef) string {
+	t.Helper()
+	manifest, err := loadStageArtifactManifestIndex(ctx, fixture.store, reference.ManifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := manifest.objectFor(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := fixture.services.core.objects.ObjectPath(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestAuthoringRecoveryReusesVerifiedSourceSessionArtifacts(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)

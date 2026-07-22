@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -264,8 +265,15 @@ func TestTaskBoardServiceRecoversMissingOutputSubmissionProcessFailureThroughDed
 	if err != nil {
 		t.Fatal(err)
 	}
+	preview, err := services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{
+		TaskID: receipt.TaskID, RunID: run.ID, Reason: "inspect missing output recovery boundary",
+	})
+	if err != nil {
+		t.Fatalf("preview missing-output authoring recovery: %v", err)
+	}
 	recoveryRequest := TaskBoardRetryRunRequest{
 		IdempotencyKey: recoveryKey, TaskID: receipt.TaskID, RunID: run.ID, Reason: "recover missing structured output submission",
+		ExpectedRecoveryCheckpoint: &preview.Checkpoint, ExpectedRecoveryPlanFingerprint: preview.SemanticPlanFingerprint,
 	}
 	services.TaskBoard.activations = &RunActivationService{core: services.core, launcher: failingTaskBoardActivationLauncher{}}
 	if _, err := services.TaskBoard.RetryRun(ctx, recoveryRequest); err == nil {
@@ -296,6 +304,139 @@ func TestTaskBoardServiceRecoversMissingOutputSubmissionProcessFailureThroughDed
 	if recoveries != 1 {
 		t.Fatalf("authoring recovery jobs = %+v", jobs)
 	}
+}
+
+func TestTaskBoardServicePreviewsAuthoringRecoveryFromVerifiedCheckpointWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
+	seedAuthoringRecoveryRepoPrepare(t, ctx, fixture)
+	fixture.services.TaskBoard.actor = func() (string, error) { return "task-board-preview", nil }
+
+	before := snapshotAuthoringRecoveryManagedFiles(t, fixture.root)
+	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{
+		TaskID: fixture.task.ID,
+		RunID:  fixture.run.ID,
+		Reason: "verify the authoring checkpoint before recovering it",
+	})
+	if err != nil {
+		t.Fatalf("preview authoring recovery through task board: %v", err)
+	}
+	if preview.TaskID != fixture.task.ID || preview.RunID != fixture.run.ID ||
+		preview.Strategy != TaskBoardRetryStrategyAuthoringRecovery ||
+		preview.CurrentExecutionEpoch != fixture.run.ExecutionEpoch || preview.NextExecutionEpoch != fixture.run.ExecutionEpoch+1 ||
+		preview.SubjectDigest == "" || preview.WorkflowFingerprint == "" || preview.Checkpoint.Sequence == 0 || preview.SemanticPlanFingerprint == "" {
+		t.Fatalf("authoring recovery preview = %+v", preview)
+	}
+	if !containsTaskBoardPreviewStage(preview.TargetStages, workflowadapter.RepoAnalyze) ||
+		!containsTaskBoardPreviewStage(preview.ScheduledStages, workflowadapter.RepoAnalyze) ||
+		!containsTaskBoardPreviewStage(preview.ReusedStages, workflowadapter.RepoPrepare) {
+		t.Fatalf("authoring recovery preview did not retain checkpoint boundary: %+v", preview)
+	}
+	if after := snapshotAuthoringRecoveryManagedFiles(t, fixture.root); !reflect.DeepEqual(after, before) {
+		t.Fatal("task board recovery preview changed managed state")
+	}
+
+	other, err := fixture.store.CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: "unrelated-recovery-preview", Title: "Unrelated recovery preview", Actor: "fixture", Reason: "exercise task ownership check",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{
+		TaskID: other.ID, RunID: fixture.run.ID, Reason: "must not preview another task's Run",
+	}); err == nil {
+		t.Fatal("cross-task recovery preview unexpectedly succeeded")
+	}
+}
+
+func TestTaskBoardServiceRejectsStaleAuthoringRecoveryPreviewBeforePlanning(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
+	seedAuthoringRecoveryRepoPrepare(t, ctx, fixture)
+	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{
+		TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "inspect authoring recovery before confirmation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "must require preview binding",
+	}); !errors.Is(err, ErrTaskBoardRecoveryPreviewRequired) {
+		t.Fatalf("missing authoring recovery preview error = %v", err)
+	}
+
+	advanced := transitionAuthoringRecoveryRun(t, ctx, fixture.store, fixture.run, store.WorkflowRunRunning)
+	_ = transitionAuthoringRecoveryRun(t, ctx, fixture.store, advanced, store.WorkflowRunFailedRecoverable)
+	_, err = fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "reject stale preview checkpoint",
+		ExpectedRecoveryCheckpoint: &preview.Checkpoint, ExpectedRecoveryPlanFingerprint: preview.SemanticPlanFingerprint,
+	})
+	if !errors.Is(err, ErrTaskBoardRecoveryPreviewStale) {
+		t.Fatalf("stale authoring recovery preview error = %v", err)
+	}
+	if command, lookupErr := fixture.store.GetContinuationCommandByKey(ctx, key); lookupErr != nil || command != nil {
+		t.Fatalf("stale preview wrote recovery command = %+v, %v", command, lookupErr)
+	}
+}
+
+func TestTaskBoardServiceRejectsAuthoringRecoveryWhenPreviewSemanticsChange(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
+	seedAuthoringRecoveryRepoPrepare(t, ctx, fixture)
+	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{
+		TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "inspect reusable source before confirmation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := authoringRecoveryStageArtifactRef(t, ctx, fixture, workflowadapter.RepoPrepare)
+	removeAuthoringRecoveryArtifactObject(t, ctx, fixture, reference)
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "reject changed recovery semantics",
+		ExpectedRecoveryCheckpoint: &preview.Checkpoint, ExpectedRecoveryPlanFingerprint: preview.SemanticPlanFingerprint,
+	})
+	if !errors.Is(err, ErrTaskBoardRecoveryPreviewStale) {
+		t.Fatalf("changed authoring recovery semantics error = %v", err)
+	}
+	command, err := fixture.store.GetContinuationCommandByKey(ctx, key)
+	if err != nil || command == nil {
+		t.Fatalf("semantic-drift command = %+v, %v", command, err)
+	}
+	frozen, err := fixture.store.GetFrozenPlanByCommand(ctx, command.ID)
+	if err != nil || frozen == nil {
+		t.Fatalf("semantic-drift plan = %+v, %v", frozen, err)
+	}
+	plan, err := decodeFrozenContinuationPlan(ctx, fixture.services.core, *frozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transition := range plan.Snapshot().Nodes {
+		if transition.NodeID != workflowkit.NodeID(workflowadapter.RepoPrepare) {
+			continue
+		}
+		if transition.Disposition != workflowkit.DispositionSchedule {
+			t.Fatalf("semantic-drift repo_prepare transition = %+v", transition)
+		}
+		return
+	}
+	t.Fatal("semantic-drift plan omitted repo_prepare")
+}
+
+func containsTaskBoardPreviewStage(stages []string, want string) bool {
+	for _, stage := range stages {
+		if stage == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestTaskBoardServiceCancelsTheSelectedRun(t *testing.T) {
@@ -534,8 +675,15 @@ func TestTaskBoardAuthoringRequestChangesRunsRepairAndReturnsToReview(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{
+		TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "inspect requested authoring changes",
+	})
+	if err != nil {
+		t.Fatalf("preview authoring repair: %v", err)
+	}
 	if _, err := fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
 		IdempotencyKey: retryKey, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "apply requested authoring changes",
+		ExpectedRecoveryCheckpoint: &preview.Checkpoint, ExpectedRecoveryPlanFingerprint: preview.SemanticPlanFingerprint,
 	}); err != nil {
 		t.Fatal(err)
 	}

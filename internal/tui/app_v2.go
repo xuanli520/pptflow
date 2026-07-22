@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -55,11 +56,13 @@ type appModel struct {
 	activeMutation taskBoardMutationKind
 	logEpoch       uint64
 
-	refreshInFlight  bool
-	refreshRequested bool
-	refreshEpoch     uint64
-	exitInFlight     bool
-	exitFlushFailed  bool
+	refreshInFlight         bool
+	refreshRequested        bool
+	refreshEpoch            uint64
+	recoveryPreviewInFlight bool
+	recoveryPreviewEpoch    uint64
+	exitInFlight            bool
+	exitFlushFailed         bool
 }
 
 type taskBoardGateway = app.TaskBoardGateway
@@ -74,6 +77,15 @@ type taskBoardMutationMsg struct {
 	kind     taskBoardMutationKind
 	mutation app.TaskBoardMutation
 	err      error
+}
+
+type taskBoardRecoveryPreviewMsg struct {
+	preview app.TaskBoardRecoveryPreview
+	epoch   uint64
+	taskID  string
+	runID   string
+	reason  string
+	err     error
 }
 
 type taskBoardLogMsg struct {
@@ -100,6 +112,7 @@ const (
 	taskBoardRetryAction                taskBoardRunActionKind = "retry"
 	taskBoardRetryAuthoringLaunchAction taskBoardRunActionKind = "retry_authoring_launch"
 	taskBoardCancelAction               taskBoardRunActionKind = "cancel"
+	recoveryPreviewTimeout                                     = 15 * time.Second
 )
 
 type pendingTaskBoardStart struct {
@@ -116,12 +129,13 @@ type pendingTaskBoardReview struct {
 }
 
 type pendingTaskBoardRunAction struct {
-	kind        taskBoardRunActionKind
-	operationID string
-	taskID      string
-	runID       string
-	reason      string
-	key         string
+	kind            taskBoardRunActionKind
+	operationID     string
+	taskID          string
+	runID           string
+	reason          string
+	key             string
+	recoveryPreview *app.TaskBoardRecoveryPreview
 }
 
 type reviewPrompt struct {
@@ -149,11 +163,12 @@ func (prompt *reviewPrompt) View(width int) string {
 }
 
 type runActionPrompt struct {
-	kind           taskBoardRunActionKind
-	strategy       app.TaskBoardRetryStrategy
-	reasonInput    textinput.Model
-	validationErr  string
-	requiresReason bool
+	kind            taskBoardRunActionKind
+	strategy        app.TaskBoardRetryStrategy
+	reasonInput     textinput.Model
+	validationErr   string
+	requiresReason  bool
+	recoveryPreview *app.TaskBoardRecoveryPreview
 }
 
 func newRunActionPrompt(kind taskBoardRunActionKind, strategy app.TaskBoardRetryStrategy) *runActionPrompt {
@@ -171,7 +186,7 @@ func (prompt *runActionPrompt) View(width int) string {
 	switch prompt.kind {
 	case taskBoardRetryAction:
 		if prompt.strategy == app.TaskBoardRetryStrategyAuthoringRecovery {
-			label = "恢复/重试创题 Run"
+			label = "断点恢复创题 Run"
 		} else if prompt.strategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
 			label = "修复并继续创题 Run"
 		}
@@ -181,13 +196,92 @@ func (prompt *runActionPrompt) View(width int) string {
 		label = "取消当前 Run"
 	}
 	content := detailSectionTitleStyle.Render(label)
-	if prompt.requiresReason {
+	if prompt.recoveryPreview != nil {
+		content += "\n" + recoveryPreviewView(*prompt.recoveryPreview, max(1, width-4))
+	} else if prompt.requiresReason {
 		content += "\n" + prompt.reasonInput.View()
 	}
 	if prompt.validationErr != "" {
 		content += "\n" + failStyleV2.Render(prompt.validationErr)
 	}
 	return inputStyle.Width(max(1, width)).Render(content)
+}
+
+func recoveryPreviewView(preview app.TaskBoardRecoveryPreview, width int) string {
+	fields := []string{
+		detailField("目标阶段", recoveryPreviewStageList(preview.TargetStages), width),
+		detailField("复用阶段", recoveryPreviewStageList(preview.ReusedStages), width),
+		detailField("重新调度", recoveryPreviewStageList(preview.ScheduledStages), width),
+		detailField("执行 Epoch", fmt.Sprintf("%d -> %d", preview.CurrentExecutionEpoch, preview.NextExecutionEpoch), width),
+		detailField("断点序列", fmt.Sprintf("%d", preview.CheckpointSequence), width),
+		detailField("输入校验", "复用阶段的产物与输入指纹已核验", width),
+		detailField("工作流指纹", preview.WorkflowFingerprint, width),
+	}
+	if reasons := recoveryPreviewReasonList(preview); reasons != "" {
+		fields = append(fields, detailField("计划原因", reasons, width))
+	}
+	if len(preview.InvalidatedStages) > 0 {
+		fields = append(fields, detailField("未调度阶段", recoveryPreviewStageList(preview.InvalidatedStages), width))
+	}
+	if len(preview.OperatorOnlyStages) > 0 {
+		fields = append(fields, detailField("人工阶段", recoveryPreviewStageList(preview.OperatorOnlyStages), width))
+	}
+	return renderDetailSection("断点恢复计划", detailFields(width, fields...), width)
+}
+
+func recoveryPreviewStageList(stages []string) string {
+	if len(stages) == 0 {
+		return "无"
+	}
+	names := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		names = append(names, displayStageName(stage))
+	}
+	return strings.Join(names, ", ")
+}
+
+func recoveryPreviewReasonList(preview app.TaskBoardRecoveryPreview) string {
+	seen := make(map[string]struct{})
+	stages := make([]string, 0, len(preview.TargetStages)+len(preview.ReusedStages)+len(preview.ScheduledStages)+len(preview.InvalidatedStages)+len(preview.OperatorOnlyStages))
+	stages = append(stages, preview.TargetStages...)
+	stages = append(stages, preview.ReusedStages...)
+	stages = append(stages, preview.ScheduledStages...)
+	stages = append(stages, preview.InvalidatedStages...)
+	stages = append(stages, preview.OperatorOnlyStages...)
+	parts := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		if _, duplicate := seen[stage]; duplicate {
+			continue
+		}
+		seen[stage] = struct{}{}
+		reasons := preview.StageReasons[stage]
+		if len(reasons) == 0 {
+			continue
+		}
+		labels := make([]string, 0, len(reasons))
+		for _, reason := range reasons {
+			labels = append(labels, recoveryPreviewReasonLabel(reason))
+		}
+		parts = append(parts, displayStageName(stage)+": "+strings.Join(labels, ", "))
+	}
+	return strings.Join(parts, "；")
+}
+
+func recoveryPreviewReasonLabel(reason string) string {
+	switch reason {
+	case "artifact_unavailable":
+		return "上游产物缺失或损坏"
+	case "input_fingerprint_drift":
+		return "输入指纹不一致"
+	case "dependency_invalidated":
+		return "依赖阶段需重跑"
+	case "retry_requested":
+		return "失败阶段重试"
+	case "force_recompute":
+		return "请求重新生成"
+	default:
+		return reason
+	}
 }
 
 func newAppModel(ctx context.Context, services *app.LifecycleServices) appModel {
@@ -293,6 +387,16 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case taskBoardMutationMsg:
 		m.activeMutation = ""
 		if msg.err != nil {
+			if msg.kind == taskBoardRetryMutation && errors.Is(msg.err, app.ErrTaskBoardRecoveryPreviewStale) {
+				m.err = nil
+				m.pendingAction = nil
+				m.deferredAction = nil
+				if m.action != nil {
+					m.action.recoveryPreview = nil
+					m.action.validationErr = "断点恢复计划已变化，请重新核验"
+				}
+				return m, inputCmd
+			}
 			m.err = msg.err
 			return m, inputCmd
 		}
@@ -317,6 +421,38 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var refreshCmd tea.Cmd
 		m, refreshCmd = m.requestRefresh()
 		return m, tea.Batch(inputCmd, refreshCmd)
+
+	case taskBoardRecoveryPreviewMsg:
+		if msg.epoch != m.recoveryPreviewEpoch {
+			return m, inputCmd
+		}
+		m.recoveryPreviewInFlight = false
+		if m.action == nil ||
+			m.action.kind != taskBoardRetryAction || m.detail == nil || !m.detail.hasCurrentRun() ||
+			m.detail.task.ID != msg.taskID || m.detail.currentRun().ID != msg.runID ||
+			strings.TrimSpace(m.action.reasonInput.Value()) != msg.reason {
+			if m.action != nil {
+				m.action.validationErr = "断点恢复计划已过期，请重新核验"
+			} else {
+				m.notice = "断点恢复计划已过期，请重新核验"
+			}
+			return m, inputCmd
+		}
+		if msg.err != nil {
+			m.action.validationErr = "无法生成断点恢复计划: " + msg.err.Error()
+			return m, inputCmd
+		}
+		if msg.preview.TaskID != msg.taskID || msg.preview.RunID != msg.runID ||
+			msg.preview.Strategy != m.action.strategy || msg.preview.Checkpoint.Sequence == 0 ||
+			msg.preview.SemanticPlanFingerprint == "" {
+			m.action.validationErr = "断点恢复计划无效，请重新核验"
+			return m, inputCmd
+		}
+		m.err = nil
+		m.notice = ""
+		m.action.validationErr = ""
+		m.action.recoveryPreview = &msg.preview
+		return m, inputCmd
 
 	case taskBoardLogMsg:
 		if msg.epoch != m.logEpoch || m.logs == nil {
@@ -529,15 +665,24 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 		return m, inputCmd
 	}
 	if m.mutationInFlight() {
-		m.notice = "操作仍在提交，请等待结果"
+		if m.recoveryPreviewInFlight {
+			m.notice = "正在核验断点恢复计划，请等待结果"
+		} else {
+			m.notice = "操作仍在提交，请等待结果"
+		}
 		return m, inputCmd
 	}
 	switch msg.String() {
 	case "esc":
 		m.action = nil
 		m.deferredAction = nil
+		m.recoveryPreviewEpoch++
+		m.recoveryPreviewInFlight = false
 		return m, inputCmd
 	case "enter":
+		if m.action.recoveryPreview != nil {
+			return m.beginRunAction(m.action.kind, strings.TrimSpace(m.action.reasonInput.Value()), inputCmd)
+		}
 		if !m.action.requiresReason {
 			return m.beginRunAction(m.action.kind, "", inputCmd)
 		}
@@ -545,6 +690,9 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 		if reason == "" {
 			m.action.validationErr = "操作原因不能为空"
 			return m, inputCmd
+		}
+		if m.action.kind == taskBoardRetryAction && isAuthoringRecoveryStrategy(m.action.strategy) {
+			return m.beginRecoveryPreview(reason, inputCmd)
 		}
 		return m.beginRunAction(m.action.kind, reason, inputCmd)
 	}
@@ -618,7 +766,7 @@ func (m appModel) contentWidth() int {
 }
 
 func (m appModel) mutationInFlight() bool {
-	return m.activeMutation != ""
+	return m.activeMutation != "" || m.recoveryPreviewInFlight
 }
 
 func (m appModel) requestRefresh() (appModel, tea.Cmd) {
@@ -752,16 +900,74 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 	current := pendingTaskBoardRunAction{
 		kind: kind, taskID: m.detail.task.ID, runID: run.ID, reason: strings.TrimSpace(reason),
 	}
-	if m.pendingAction == nil || m.pendingAction.kind != current.kind || m.pendingAction.taskID != current.taskID || m.pendingAction.runID != current.runID || m.pendingAction.reason != current.reason {
+	if kind == taskBoardRetryAction && m.action != nil && isAuthoringRecoveryStrategy(m.action.strategy) && m.action.recoveryPreview != nil {
+		preview := *m.action.recoveryPreview
+		if preview.TaskID != current.taskID || preview.RunID != current.runID || preview.Strategy != m.action.strategy ||
+			preview.Checkpoint.Sequence == 0 || preview.SemanticPlanFingerprint == "" {
+			m.action.recoveryPreview = nil
+			m.action.validationErr = "断点恢复计划已过期，请重新核验"
+			return m, inputCmd
+		}
+		current.recoveryPreview = &preview
+	}
+	if m.pendingAction != nil && m.pendingAction.kind == current.kind && m.pendingAction.taskID == current.taskID && m.pendingAction.runID == current.runID && m.pendingAction.reason == current.reason {
+		current.key = m.pendingAction.key
+	} else {
 		key, err := m.newIdempotencyKey()
 		if err != nil {
 			m.err = err
 			return m, inputCmd
 		}
 		current.key = key
-		m.pendingAction = &current
 	}
+	m.pendingAction = &current
 	return m.scheduleRunAction(*m.pendingAction, inputCmd)
+}
+
+// beginRecoveryPreview obtains a non-durable plan before an Authoring recovery
+// can be confirmed. The later RetryRun call still builds and commits a fresh
+// plan, so this preview is explanatory rather than an execution capability.
+func (m appModel) beginRecoveryPreview(reason string, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.mutationInFlight() || m.detail == nil || m.action == nil || !m.detail.hasCurrentRun() {
+		m.notice = "请等待当前操作完成"
+		return m, inputCmd
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		m.action.validationErr = "操作原因不能为空"
+		return m, inputCmd
+	}
+	run := m.detail.currentRun()
+	m.action.validationErr = ""
+	m.action.recoveryPreview = nil
+	m.recoveryPreviewEpoch++
+	m.recoveryPreviewInFlight = true
+	return m, tea.Batch(inputCmd, m.previewRunRecovery(m.detail.task.ID, run.ID, reason, m.recoveryPreviewEpoch))
+}
+
+func (m appModel) previewRunRecovery(taskID, runID, reason string, epoch uint64) tea.Cmd {
+	return func() tea.Msg {
+		if m.gateway == nil {
+			return taskBoardRecoveryPreviewMsg{epoch: epoch, taskID: taskID, runID: runID, reason: reason, err: fmt.Errorf("task board service is not configured")}
+		}
+		ctx := m.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(ctx, recoveryPreviewTimeout)
+		defer cancel()
+		preview, err := m.gateway.PreviewRunRecovery(ctx, app.TaskBoardPreviewRunRecoveryRequest{
+			TaskID: taskID,
+			RunID:  runID,
+			Reason: reason,
+		})
+		return taskBoardRecoveryPreviewMsg{preview: preview, epoch: epoch, taskID: taskID, runID: runID, reason: reason, err: err}
+	}
+}
+
+func isAuthoringRecoveryStrategy(strategy app.TaskBoardRetryStrategy) bool {
+	return strategy == app.TaskBoardRetryStrategyAuthoringRecovery ||
+		strategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair
 }
 
 func (m appModel) scheduleRunAction(pending pendingTaskBoardRunAction, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
@@ -801,9 +1007,15 @@ func (m appModel) runAction(pending pendingTaskBoardRunAction) tea.Cmd {
 		}
 		switch pending.kind {
 		case taskBoardRetryAction:
-			mutation, err := m.gateway.RetryRun(m.ctx, app.TaskBoardRetryRunRequest{
+			request := app.TaskBoardRetryRunRequest{
 				IdempotencyKey: pending.key, TaskID: pending.taskID, RunID: pending.runID, Reason: pending.reason,
-			})
+			}
+			if pending.recoveryPreview != nil {
+				checkpoint := pending.recoveryPreview.Checkpoint
+				request.ExpectedRecoveryCheckpoint = &checkpoint
+				request.ExpectedRecoveryPlanFingerprint = pending.recoveryPreview.SemanticPlanFingerprint
+			}
+			mutation, err := m.gateway.RetryRun(m.ctx, request)
 			return taskBoardMutationMsg{kind: taskBoardRetryMutation, mutation: mutation, err: err}
 		case taskBoardRetryAuthoringLaunchAction:
 			mutation, err := m.gateway.RetryAuthoringLaunch(m.ctx, app.TaskBoardRetryAuthoringLaunchRequest{OperationID: pending.operationID})
@@ -955,8 +1167,16 @@ func (m appModel) View() string {
 		}
 		if m.action != nil {
 			prompt = m.action.View(contentWidth)
-			detailHeight -= 5
-			footer = footerStyle.Render("[enter] 确认操作  [esc] 取消")
+			detailHeight -= lipgloss.Height(prompt) + 1
+			footerText := "[enter] 确认操作  [esc] 取消"
+			if m.recoveryPreviewInFlight {
+				footerText = "正在核验断点恢复计划..."
+			} else if m.action.recoveryPreview != nil {
+				footerText = "[enter] 确认从此断点恢复  [esc] 取消"
+			} else if m.action.kind == taskBoardRetryAction && isAuthoringRecoveryStrategy(m.action.strategy) {
+				footerText = "[enter] 查看断点恢复计划  [esc] 取消"
+			}
+			footer = footerStyle.Render(footerText)
 		}
 		return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
 			headerStyle.Width(contentWidth).Render("Harbor Task Factory"),
@@ -1004,7 +1224,7 @@ func detailFooterText(detail *detailModel) string {
 			label := "重试"
 			switch detail.currentRun().RetryStrategy {
 			case app.TaskBoardRetryStrategyAuthoringRecovery:
-				label = "恢复/重试"
+				label = "断点恢复"
 			case app.TaskBoardRetryStrategyAuthoringAdmissionRepair:
 				label = "修复并继续"
 			}

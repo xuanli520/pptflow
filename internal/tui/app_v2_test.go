@@ -3,13 +3,16 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 const taskBoardTestBaseImage = "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -21,23 +24,27 @@ const (
 )
 
 type taskBoardGatewayStub struct {
-	snapshot            app.TaskBoardSnapshot
-	startRequests       []app.TaskBoardStartAuthoringRequest
-	decisionRequests    []app.TaskBoardDecideReviewRequest
-	retryRequests       []app.TaskBoardRetryRunRequest
-	launchRetryRequests []app.TaskBoardRetryAuthoringLaunchRequest
-	cancelRequests      []app.TaskBoardCancelRunRequest
-	log                 app.TaskBoardLog
-	startErr            error
-	decisionErr         error
-	retryErr            error
-	launchRetryErr      error
-	cancelErr           error
-	logErr              error
-	flushErr            error
-	listCalls           int
-	flushCalls          int
-	keys                int
+	snapshot                app.TaskBoardSnapshot
+	startRequests           []app.TaskBoardStartAuthoringRequest
+	decisionRequests        []app.TaskBoardDecideReviewRequest
+	recoveryPreviews        []app.TaskBoardPreviewRunRecoveryRequest
+	retryRequests           []app.TaskBoardRetryRunRequest
+	launchRetryRequests     []app.TaskBoardRetryAuthoringLaunchRequest
+	cancelRequests          []app.TaskBoardCancelRunRequest
+	log                     app.TaskBoardLog
+	startErr                error
+	decisionErr             error
+	recoveryPreview         app.TaskBoardRecoveryPreview
+	recoveryPreviewErr      error
+	recoveryPreviewDeadline time.Time
+	retryErr                error
+	launchRetryErr          error
+	cancelErr               error
+	logErr                  error
+	flushErr                error
+	listCalls               int
+	flushCalls              int
+	keys                    int
 }
 
 func (stub *taskBoardGatewayStub) NewIdempotencyKey() (string, error) {
@@ -62,6 +69,37 @@ func (stub *taskBoardGatewayStub) DecideReview(_ context.Context, request app.Ta
 
 func (stub *taskBoardGatewayStub) ReadRunLog(context.Context, app.TaskBoardReadRunLogRequest) (app.TaskBoardLog, error) {
 	return stub.log, stub.logErr
+}
+
+func (stub *taskBoardGatewayStub) PreviewRunRecovery(ctx context.Context, request app.TaskBoardPreviewRunRecoveryRequest) (app.TaskBoardRecoveryPreview, error) {
+	stub.recoveryPreviews = append(stub.recoveryPreviews, request)
+	if deadline, ok := ctx.Deadline(); ok {
+		stub.recoveryPreviewDeadline = deadline
+	}
+	preview := stub.recoveryPreview
+	if preview.TaskID == "" {
+		preview.TaskID = request.TaskID
+	}
+	if preview.RunID == "" {
+		preview.RunID = request.RunID
+	}
+	if preview.Strategy == "" {
+		preview.Strategy = app.TaskBoardRetryStrategyAuthoringRecovery
+		for _, task := range stub.snapshot.Tasks {
+			for _, run := range task.Runs {
+				if run.ID == request.RunID && run.RetryStrategy != "" {
+					preview.Strategy = run.RetryStrategy
+				}
+			}
+		}
+	}
+	if preview.Checkpoint.Sequence == 0 {
+		preview.Checkpoint = workflowkit.CheckpointRef{Sequence: 1}
+	}
+	if preview.SemanticPlanFingerprint == "" {
+		preview.SemanticPlanFingerprint = workflowkit.SHA256Fingerprint([]byte("task-board-recovery-preview"))
+	}
+	return preview, stub.recoveryPreviewErr
 }
 
 func (stub *taskBoardGatewayStub) RetryRun(_ context.Context, request app.TaskBoardRetryRunRequest) (app.TaskBoardMutation, error) {
@@ -511,10 +549,19 @@ func TestAppModelRoutesDurablePreTaskCaptureRetryWithoutNewIdempotencyKey(t *tes
 	}
 }
 
-func TestAppModelRoutesAuthoringRecoveryThroughRetryAndRetainsItsIdempotencyKey(t *testing.T) {
+func TestAppModelPreviewsAuthoringRecoveryBeforeRetryAndRetainsItsIdempotencyKey(t *testing.T) {
 	snapshot := taskBoardTestSnapshot(true)
 	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringRecovery
-	stub := &taskBoardGatewayStub{snapshot: snapshot, retryErr: errors.New("activation unavailable")}
+	stub := &taskBoardGatewayStub{
+		snapshot: snapshot,
+		retryErr: errors.New("activation unavailable"),
+		recoveryPreview: app.TaskBoardRecoveryPreview{
+			CheckpointSequence: 9, CurrentExecutionEpoch: 1, NextExecutionEpoch: 2,
+			Checkpoint:   workflowkit.CheckpointRef{Sequence: 9},
+			TargetStages: []string{"authoring_harness"}, ReusedStages: []string{"repo_prepare", "repo_analyze"},
+			ScheduledStages: []string{"authoring_harness", "tests_analysis"}, WorkflowFingerprint: "sha256:preview",
+		},
+	}
 	model := loadedTaskBoardModel(t, stub)
 	model.detail = newDetailModel(model.board.SelectedTask())
 
@@ -526,8 +573,28 @@ func TestAppModelRoutesAuthoringRecoveryThroughRetryAndRetainsItsIdempotencyKey(
 	model.action.reasonInput.SetValue("recover transient provider failure")
 	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
 	model = updated.(appModel)
-	if model.activeMutation != taskBoardRetryMutation || command == nil {
-		t.Fatalf("authoring recovery start = active:%q command:%v", model.activeMutation, command)
+	if !model.recoveryPreviewInFlight || model.activeMutation != "" || command == nil {
+		t.Fatalf("authoring recovery preview start = preview:%t active:%q command:%v", model.recoveryPreviewInFlight, model.activeMutation, command)
+	}
+	preview := command().(taskBoardRecoveryPreviewMsg)
+	if len(stub.recoveryPreviews) != 1 || len(stub.retryRequests) != 0 || stub.recoveryPreviews[0].TaskID != "task-1" ||
+		stub.recoveryPreviews[0].RunID != "run-1" || stub.recoveryPreviews[0].Reason != "recover transient provider failure" || stub.keys != 0 {
+		t.Fatalf("authoring recovery preview dispatch = previews:%+v retries:%+v keys:%d", stub.recoveryPreviews, stub.retryRequests, stub.keys)
+	}
+	if stub.recoveryPreviewDeadline.IsZero() || time.Until(stub.recoveryPreviewDeadline) <= 0 || time.Until(stub.recoveryPreviewDeadline) > recoveryPreviewTimeout {
+		t.Fatalf("authoring recovery preview deadline = %s", stub.recoveryPreviewDeadline)
+	}
+	updated, _ = model.Update(preview)
+	model = updated.(appModel)
+	if model.recoveryPreviewInFlight || model.action == nil || model.action.recoveryPreview == nil ||
+		!strings.Contains(model.action.View(100), "断点恢复计划") || !strings.Contains(model.action.View(100), "Authoring harness 修复验证") {
+		t.Fatalf("authoring recovery preview result = action:%+v", model.action)
+	}
+
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardRetryMutation || command == nil || stub.keys != 1 {
+		t.Fatalf("authoring recovery confirmation = active:%q command:%v keys:%d", model.activeMutation, command, stub.keys)
 	}
 	first := command().(taskBoardMutationMsg)
 	if first.kind != taskBoardRetryMutation {
@@ -535,19 +602,135 @@ func TestAppModelRoutesAuthoringRecoveryThroughRetryAndRetainsItsIdempotencyKey(
 	}
 	updated, _ = model.Update(first)
 	model = updated.(appModel)
-	if model.action == nil || model.pendingAction == nil {
-		t.Fatalf("failed recovery did not preserve pending action: action=%+v pending=%+v", model.action, model.pendingAction)
+	if model.action == nil || model.action.recoveryPreview == nil || model.pendingAction == nil {
+		t.Fatalf("failed recovery did not preserve approved recovery action: action=%+v pending=%+v", model.action, model.pendingAction)
 	}
 
 	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
 	model = updated.(appModel)
-	_ = model
 	_ = command().(taskBoardMutationMsg)
 	if len(stub.retryRequests) != 2 {
 		t.Fatalf("authoring recovery dispatches = %+v", stub.retryRequests)
 	}
-	if first, replay := stub.retryRequests[0], stub.retryRequests[1]; first.IdempotencyKey == "" || first.IdempotencyKey != replay.IdempotencyKey || first.TaskID != "task-1" || first.RunID != "run-1" || first.Reason != "recover transient provider failure" {
+	if first, replay := stub.retryRequests[0], stub.retryRequests[1]; first.IdempotencyKey == "" || first.IdempotencyKey != replay.IdempotencyKey || first.TaskID != "task-1" || first.RunID != "run-1" || first.Reason != "recover transient provider failure" || first.ExpectedRecoveryCheckpoint == nil || first.ExpectedRecoveryCheckpoint.Sequence != 9 || first.ExpectedRecoveryPlanFingerprint == "" || replay.ExpectedRecoveryCheckpoint == nil || *first.ExpectedRecoveryCheckpoint != *replay.ExpectedRecoveryCheckpoint || first.ExpectedRecoveryPlanFingerprint != replay.ExpectedRecoveryPlanFingerprint {
 		t.Fatalf("authoring recovery idempotency/replay = first:%+v replay:%+v", first, replay)
+	}
+}
+
+func TestAppModelPreviewsAuthoringAdmissionRepairBeforeRetry(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].Runs[0].Status = "waiting_continuation"
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringAdmissionRepair
+	stub := &taskBoardGatewayStub{
+		snapshot: snapshot,
+		recoveryPreview: app.TaskBoardRecoveryPreview{
+			CheckpointSequence: 14, CurrentExecutionEpoch: 2, NextExecutionEpoch: 3,
+			Checkpoint:          workflowkit.CheckpointRef{Sequence: 14},
+			Strategy:            app.TaskBoardRetryStrategyAuthoringAdmissionRepair,
+			TargetStages:        []string{"instruction_generate", "task_toml_generate", "dockerfile_generate"},
+			ReusedStages:        []string{"repo_prepare", "repo_analyze", "task_design"},
+			ScheduledStages:     []string{"instruction_generate", "task_toml_generate", "dockerfile_generate", "content_review"},
+			WorkflowFingerprint: "sha256:preview",
+		},
+	}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	updated, _ := model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	if model.action == nil || model.action.strategy != app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
+		t.Fatalf("authoring admission repair prompt = %+v", model.action)
+	}
+	model.action.reasonInput.SetValue("apply content-review correction")
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if !model.recoveryPreviewInFlight || command == nil || len(stub.retryRequests) != 0 {
+		t.Fatalf("authoring admission repair preview start = preview:%t command:%v retries:%+v", model.recoveryPreviewInFlight, command, stub.retryRequests)
+	}
+	preview := command().(taskBoardRecoveryPreviewMsg)
+	if len(stub.recoveryPreviews) != 1 || stub.recoveryPreviews[0].Reason != "apply content-review correction" {
+		t.Fatalf("authoring admission repair preview request = %+v", stub.recoveryPreviews)
+	}
+	updated, _ = model.Update(preview)
+	model = updated.(appModel)
+	if model.recoveryPreviewInFlight || model.action == nil || model.action.recoveryPreview == nil {
+		t.Fatalf("authoring admission repair preview result = %+v", model.action)
+	}
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardRetryMutation || command == nil || stub.keys != 1 {
+		t.Fatalf("authoring admission repair confirmation = active:%q command:%v keys:%d", model.activeMutation, command, stub.keys)
+	}
+	_ = command().(taskBoardMutationMsg)
+	if len(stub.retryRequests) != 1 || stub.retryRequests[0].Reason != "apply content-review correction" || stub.retryRequests[0].ExpectedRecoveryCheckpoint == nil || stub.retryRequests[0].ExpectedRecoveryCheckpoint.Sequence != 14 || stub.retryRequests[0].ExpectedRecoveryPlanFingerprint == "" {
+		t.Fatalf("authoring admission repair retry request = %+v", stub.retryRequests)
+	}
+}
+
+func TestAppModelClearsInvalidRecoveryPreviewState(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringRecovery
+	stub := &taskBoardGatewayStub{snapshot: snapshot}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	updated, _ := model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	model.action.reasonInput.SetValue("recover after stale preview")
+	updated, _ = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if !model.recoveryPreviewInFlight {
+		t.Fatal("recovery preview was not started")
+	}
+
+	updated, _ = model.Update(taskBoardRecoveryPreviewMsg{
+		epoch: model.recoveryPreviewEpoch, taskID: "other-task", runID: "run-1", reason: "recover after stale preview",
+	})
+	model = updated.(appModel)
+	if model.recoveryPreviewInFlight || model.action == nil || !strings.Contains(model.action.validationErr, "已过期") {
+		t.Fatalf("invalid recovery preview left the action blocked: preview:%t action:%+v", model.recoveryPreviewInFlight, model.action)
+	}
+}
+
+func TestAppModelClearsStaleRecoveryPreviewBindingBeforeRetrying(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringRecovery
+	stub := &taskBoardGatewayStub{snapshot: snapshot}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	updated, _ := model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	model.action.reasonInput.SetValue("recover after a stale preview")
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	preview := command().(taskBoardRecoveryPreviewMsg)
+	updated, _ = model.Update(preview)
+	model = updated.(appModel)
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.pendingAction == nil || model.pendingAction.key == "" || command == nil {
+		t.Fatalf("confirmed recovery action = pending:%+v command:%v", model.pendingAction, command)
+	}
+	firstKey := model.pendingAction.key
+	updated, _ = model.Update(taskBoardMutationMsg{kind: taskBoardRetryMutation, err: fmt.Errorf("wrapped: %w", app.ErrTaskBoardRecoveryPreviewStale)})
+	model = updated.(appModel)
+	if model.pendingAction != nil || model.action == nil || model.action.recoveryPreview != nil || !strings.Contains(model.action.validationErr, "已变化") || model.err != nil {
+		t.Fatalf("stale recovery cleanup = pending:%+v action:%+v err:%v", model.pendingAction, model.action, model.err)
+	}
+
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if !model.recoveryPreviewInFlight || command == nil {
+		t.Fatalf("stale recovery did not require a new preview: preview:%t command:%v", model.recoveryPreviewInFlight, command)
+	}
+	preview = command().(taskBoardRecoveryPreviewMsg)
+	updated, _ = model.Update(preview)
+	model = updated.(appModel)
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.pendingAction == nil || stub.keys != 2 || command == nil {
+		t.Fatalf("stale recovery did not allocate a new confirmation key: pending:%+v first:%q keys:%d command:%v", model.pendingAction, firstKey, stub.keys, command)
 	}
 }
 
@@ -592,6 +775,19 @@ func TestAppModelQueuesConfirmedRunActionsUntilRefreshCompletes(t *testing.T) {
 				t.Fatal("run action prompt was not opened")
 			}
 			model.action.reasonInput.SetValue("confirm while the board is refreshing")
+			if test.wantMutation == taskBoardRetryMutation {
+				updated, previewCommand := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+				model = updated.(appModel)
+				if !model.recoveryPreviewInFlight || previewCommand == nil {
+					t.Fatalf("authoring repair preview was not started: preview:%t command:%v", model.recoveryPreviewInFlight, previewCommand)
+				}
+				preview := previewCommand().(taskBoardRecoveryPreviewMsg)
+				updated, _ = model.Update(preview)
+				model = updated.(appModel)
+				if model.action == nil || model.action.recoveryPreview == nil {
+					t.Fatalf("authoring repair preview was not accepted: %+v", model.action)
+				}
+			}
 			model.refreshInFlight = true
 
 			updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
@@ -718,8 +914,16 @@ func TestAppModelRequestsAuthoringChangesThenDispatchesRepairContinuation(t *tes
 	model.action.reasonInput.SetValue("regenerate with the review feedback")
 	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
 	model = updated.(appModel)
+	if !model.recoveryPreviewInFlight || command == nil {
+		t.Fatalf("repair continuation preview start = preview:%t command:%v", model.recoveryPreviewInFlight, command)
+	}
+	preview := command().(taskBoardRecoveryPreviewMsg)
+	updated, _ = model.Update(preview)
+	model = updated.(appModel)
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
 	if model.activeMutation != taskBoardRetryMutation || command == nil {
-		t.Fatalf("repair continuation start = active:%q command:%v", model.activeMutation, command)
+		t.Fatalf("repair continuation confirmation = active:%q command:%v", model.activeMutation, command)
 	}
 	_ = command().(taskBoardMutationMsg)
 	if len(stub.retryRequests) != 1 || stub.retryRequests[0].TaskID != "task-1" || stub.retryRequests[0].RunID != "run-1" ||

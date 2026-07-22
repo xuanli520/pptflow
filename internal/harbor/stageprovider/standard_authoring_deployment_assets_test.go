@@ -676,6 +676,48 @@ func TestLoadStandardAuthoringDeploymentAssetBundleFailsClosedWithoutGeneratedLo
 	}
 }
 
+func TestStandardAuthoringV18PromptsRequireRuntimeSourceAccess(t *testing.T) {
+	root := filepath.Join(standardAuthoringDeploymentRepositoryRoot(t), "deployments", "standard-authoring-1.8", "prompts")
+	for _, test := range []struct {
+		path     string
+		version  string
+		required []string
+	}{
+		{
+			path: "dockerfile-generate.json", version: "2.1.0",
+			required: []string{"chmod -R a+rX /workspace/source", "cp -R /workspace/source/. /oracle/worktree/", "drops all capabilities"},
+		},
+		{
+			path: "dockerfile-build-validate.json", version: "1.1.0",
+			required: []string{"read-only root", "all capabilities dropped", "cp -R /workspace/source/. /oracle/worktree/", "writable worktree"},
+		},
+		{
+			path: "authoring-harness.json", version: "1.1.0",
+			required: []string{"cp -R /workspace/source/. /oracle/worktree/", "Never serialize, embed, or unpack a replacement source archive"},
+		},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join(root, test.path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			program, err := ParseStandardAuthoringCodexTurnProgramAsset(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if program.Version != test.version {
+				t.Fatalf("prompt version = %q, want %q", program.Version, test.version)
+			}
+			joined := strings.Join(program.TurnPrompts, "\n")
+			for _, required := range test.required {
+				if !strings.Contains(joined, required) {
+					t.Fatalf("prompt omits runtime source contract %q", required)
+				}
+			}
+		})
+	}
+}
+
 func standardAuthoringDeploymentTestLock(t *testing.T, catalog *DeploymentOperationCatalogResolver, manifest StandardAuthoringContractAssetManifest, root string) DeploymentOperationCatalogLock {
 	t.Helper()
 	assets := make(map[workflowkit.StageKey]StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))

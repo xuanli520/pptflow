@@ -26,7 +26,7 @@ func TestStandardAuthoringDockerHarnessBuildsOnceReattestsAndCompletesFullValida
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !build.Passed || build.Step != "docker_build" || build.ImageReused || len(build.Steps) != 1 {
+	if !build.Passed || build.Step != "source_access" || build.ImageReused || len(build.Steps) != 2 {
 		t.Fatalf("build result = %+v", build)
 	}
 	if err := build.ValidateReportJSON(); err != nil {
@@ -75,8 +75,43 @@ func TestStandardAuthoringDockerHarnessBuildsOnceReattestsAndCompletesFullValida
 			t.Fatalf("command environment = %#v, want %#v", command.Env, wantEnv)
 		}
 	}
-	if buildCount != 1 || runCount != 2 || inspectCount != 4 {
+	if buildCount != 1 || runCount != 3 || inspectCount != 5 {
 		t.Fatalf("Docker command counts build=%d run=%d inspect=%d commands=%#v", buildCount, runCount, inspectCount, runner.commands)
+	}
+}
+
+func TestStandardAuthoringDockerHarnessRejectsInaccessibleRuntimeSource(t *testing.T) {
+	root := t.TempDir()
+	runner := &standardAuthoringHarnessRunner{t: t, imageID: "sha256:" + strings.Repeat("c", 64), sourceAccessExit: 1}
+	harness := newStandardAuthoringDockerHarnessForTest(t, root, runner)
+	runID := standardAuthoringHarnessUUID(t)
+	request, taskRoot := standardAuthoringHarnessAttempt(t, root, runID, workflowkit.StageKey("dockerfile_build_validate"), authoringharness.ModeDockerfileBuild)
+	writeStandardAuthoringHarnessCandidate(t, taskRoot, "FROM scratch\n", "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 1\n")
+
+	result, err := harness.Validate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Passed || result.Step != "source_access" || result.ExitCode != 1 || len(result.Steps) != 2 || len(result.Findings) != 1 || !strings.Contains(result.Findings[0], "writable Oracle worktree") {
+		t.Fatalf("source-access feedback = %+v", result)
+	}
+	foundProbe := false
+	for _, command := range runner.commands {
+		if len(command.Args) == 0 || command.Args[0] != "run" {
+			continue
+		}
+		program := command.Args[len(command.Args)-1]
+		if program != standardAuthoringDockerHarnessSourceAccessProgram {
+			continue
+		}
+		foundProbe = true
+		mount := standardAuthoringHarnessArgAfter(command.Args, "--mount")
+		if command.Path != "/opt/locked/docker-build" || !strings.Contains(program, "cp -R /workspace/source/. /oracle/worktree/") || !strings.Contains(mount, ",dst=/oracle") || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "ALL") {
+			t.Fatalf("source-access probe command = %#v", command.Args)
+		}
+	}
+	if !foundProbe {
+		t.Fatal("runtime source-access probe was not invoked")
 	}
 }
 
@@ -158,9 +193,10 @@ func TestStandardAuthoringDockerHarnessCheckoutAllowsNonRootWorktreeAndSealsScri
 }
 
 type standardAuthoringHarnessRunner struct {
-	t        *testing.T
-	imageID  string
-	commands []CodeEdgePhase1Command
+	t                *testing.T
+	imageID          string
+	sourceAccessExit int
+	commands         []CodeEdgePhase1Command
 }
 
 func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command CodeEdgePhase1Command) (CodeEdgePhase1CommandResult, error) {
@@ -181,6 +217,12 @@ func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command Cod
 		mount := standardAuthoringHarnessArgAfter(command.Args, "--mount")
 		checkout := strings.TrimPrefix(strings.Split(mount, ",dst=/oracle")[0], "type=bind,src=")
 		program := command.Args[len(command.Args)-1]
+		if program == standardAuthoringDockerHarnessSourceAccessProgram {
+			if runner.sourceAccessExit != 0 {
+				return CodeEdgePhase1CommandResult{ExitCode: runner.sourceAccessExit, Stderr: []byte("source is inaccessible\n")}, nil
+			}
+			return CodeEdgePhase1CommandResult{Stdout: []byte("source copied\n")}, nil
+		}
 		if program == "sh ./tests/test.sh" {
 			testBytes, err := os.ReadFile(filepath.Join(checkout, "tests", "test.sh"))
 			if err != nil {
