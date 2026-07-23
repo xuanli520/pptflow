@@ -142,12 +142,8 @@ func (runtime *FrozenExecutionRuntime) executeWorkflowkitCoordinator(ctx context
 }
 
 func (backend *workflowkitCoordinatorBackend) claim() (workflowkit.JobClaim, error) {
-	if backend == nil || backend.runtime == nil || backend.execution.Claim.Job == nil || backend.execution.Claim.Job.ID != backend.job.ID || backend.execution.Claim.DispatchLease == nil {
+	if backend == nil || backend.runtime == nil || backend.execution.Claim.Job == nil || backend.execution.Claim.Job.ID != backend.job.ID {
 		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine coordinator has no matching durable dispatch claim", ErrFrozenExecutionPayload)
-	}
-	lease := backend.execution.Claim.DispatchLease
-	if lease.FencingToken == 0 || lease.ExpiresAt.IsZero() || strings.TrimSpace(lease.Owner) == "" {
-		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine coordinator has an invalid durable dispatch lease", ErrFrozenExecutionPayload)
 	}
 	subject, err := backend.runtime.core.resolveWorkflowRunSubject(backend.callContext, backend.run)
 	if err != nil {
@@ -161,6 +157,10 @@ func (backend *workflowkitCoordinatorBackend) claim() (workflowkit.JobClaim, err
 		executionReason: "advance frozen workflow coordinator",
 	}
 	frozenExecution, err := proof.frozenExecution()
+	if err != nil {
+		return workflowkit.JobClaim{}, err
+	}
+	lease, err := currentWorkflowkitDispatchLease(backend.callContext, backend.runtime, backend.execution, backend.job)
 	if err != nil {
 		return workflowkit.JobClaim{}, err
 	}
@@ -270,14 +270,14 @@ func (backend *workflowkitStageBackend) claim() (workflowkit.JobClaim, error) {
 	if backend == nil || backend.runtime == nil {
 		return workflowkit.JobClaim{}, ErrFrozenExecutionRuntimeConfiguration
 	}
-	if backend.execution.Claim.Job == nil || backend.execution.Claim.Job.ID != backend.job.ID || backend.execution.Claim.DispatchLease == nil {
+	if backend.execution.Claim.Job == nil || backend.execution.Claim.Job.ID != backend.job.ID {
 		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine stage has no matching durable dispatch claim", ErrFrozenExecutionPayload)
 	}
-	lease := backend.execution.Claim.DispatchLease
-	if lease.FencingToken == 0 || lease.ExpiresAt.IsZero() || strings.TrimSpace(lease.Owner) == "" {
-		return workflowkit.JobClaim{}, fmt.Errorf("%w: public Engine stage has an invalid durable dispatch lease", ErrFrozenExecutionPayload)
-	}
 	execution, err := backend.frozenExecution()
+	if err != nil {
+		return workflowkit.JobClaim{}, err
+	}
+	lease, err := currentWorkflowkitDispatchLease(backend.callContext, backend.runtime, backend.execution, backend.job)
 	if err != nil {
 		return workflowkit.JobClaim{}, err
 	}
@@ -311,6 +311,30 @@ func (backend *workflowkitStageBackend) claim() (workflowkit.JobClaim, error) {
 		return workflowkit.JobClaim{}, fmt.Errorf("%w: construct public Engine stage claim: %v", ErrFrozenExecutionPayload, err)
 	}
 	return claim, nil
+}
+
+// currentWorkflowkitDispatchLease refreshes the durable lease snapshot after
+// any Harbor-side admission work but immediately before the generic Engine
+// checks it. Dispatch heartbeats update the Store record while a handler is
+// running; carrying only the original claim snapshot would make a healthy,
+// long-running worker appear expired to workflowkit.
+func currentWorkflowkitDispatchLease(ctx context.Context, runtime *FrozenExecutionRuntime, execution DurableJobExecution, job store.DurableJob) (store.Lease, error) {
+	if runtime == nil || runtime.core == nil || runtime.core.store == nil || execution.Claim.Job == nil || execution.Claim.Job.ID != job.ID || execution.Claim.DispatchLease == nil {
+		return store.Lease{}, fmt.Errorf("%w: public Engine has no matching durable dispatch claim", ErrFrozenExecutionPayload)
+	}
+	claimed := execution.Claim.DispatchLease
+	if claimed.FencingToken == 0 || claimed.ID == "" || strings.TrimSpace(claimed.Owner) == "" {
+		return store.Lease{}, fmt.Errorf("%w: public Engine has an invalid durable dispatch lease", ErrFrozenExecutionPayload)
+	}
+	current, err := runtime.core.store.GetLease(ctx, claimed.ID)
+	if err != nil {
+		return store.Lease{}, fmt.Errorf("read current public Engine dispatch lease: %w", err)
+	}
+	if current == nil || current.ResourceType != "job_dispatch" || current.ResourceID != job.ID || current.JobID != job.ID ||
+		current.Owner != claimed.Owner || current.FencingToken != claimed.FencingToken || current.State != store.LeaseActive || !current.ExpiresAt.After(time.Now().UTC()) {
+		return store.Lease{}, store.ErrDispatchFenceLost
+	}
+	return *current, nil
 }
 
 func (backend *workflowkitStageBackend) frozenExecution() (workflowkit.FrozenExecution, error) {

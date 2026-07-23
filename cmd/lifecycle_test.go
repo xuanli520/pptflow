@@ -20,6 +20,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/testsupport"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
+	"github.com/spf13/cobra"
 )
 
 const commandStageArtifactManifestFormat = "harbor.v2.stage-artifact-manifest.v1"
@@ -81,6 +82,47 @@ func TestLifecycleCLICommandUsesConfiguredServiceFactory(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("configured lifecycle service factory calls = %d, want 1", calls)
+	}
+}
+
+func TestLifecycleCLIReportsActiveRunSchemaUpgradeWithoutStoreInternals(t *testing.T) {
+	root := t.TempDir()
+	const runID = "019f8ce2-a0d6-774c-b50f-fcaac0797dae"
+	blocked := fmt.Errorf("%w: run %s is %s; finish it with the deployment package that froze its execution contract or initialize a new root", store.ErrActiveRunSchemaUpgrade, runID, store.WorkflowRunWaitingReview)
+	factoryCalled := false
+	actionCalled := false
+	config := &lifecycleCLIConfig{
+		root: root,
+		newLifecycleService: func(string, *store.Store) (*app.LifecycleServices, error) {
+			factoryCalled = true
+			return nil, nil
+		},
+	}
+	err := executeLifecycleCommandWithStore(&cobra.Command{}, config, func(openRoot string) (*store.Store, error) {
+		if openRoot != root {
+			t.Fatalf("store open root = %q, want %q", openRoot, root)
+		}
+		return nil, blocked
+	}, func(context.Context, *app.LifecycleServices) (any, error) {
+		actionCalled = true
+		return nil, nil
+	})
+	if !errors.Is(err, store.ErrActiveRunSchemaUpgrade) {
+		t.Fatalf("CLI active-run schema error = %v, want %v", err, store.ErrActiveRunSchemaUpgrade)
+	}
+	message := err.Error()
+	for _, want := range []string{"open lifecycle control plane", runID, "finish it with the deployment package"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("CLI active-run schema error = %q, missing %q", message, want)
+		}
+	}
+	for _, leaked := range []string{root, "harbor.db", "SELECT ", "sqlite:"} {
+		if strings.Contains(message, leaked) {
+			t.Fatalf("CLI active-run schema error leaked %q: %q", leaked, message)
+		}
+	}
+	if factoryCalled || actionCalled {
+		t.Fatalf("blocked CLI reached factory:%t action:%t", factoryCalled, actionCalled)
 	}
 }
 

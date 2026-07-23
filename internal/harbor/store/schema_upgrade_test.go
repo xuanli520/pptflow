@@ -91,6 +91,105 @@ func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
 	}
 }
 
+func TestUpgradeLegacySchemaRefusesUnfinishedWorkflowRunWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	store := tempDB(t)
+	root := store.rootDir
+	_, _, activeRun := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
+	if activeRun.Status != WorkflowRunQueued {
+		t.Fatalf("fixture Run status = %s, want %s", activeRun.Status, WorkflowRunQueued)
+	}
+	if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
+		t.Fatal(err)
+	}
+	legacyContract, err := sqliteSchemaContract(store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyContract != legacyV18ConsolidatedV2SchemaContractFingerprint {
+		t.Fatalf("legacy V18 contract = %s, want %s", legacyContract, legacyV18ConsolidatedV2SchemaContractFingerprint)
+	}
+	if _, err := store.db.Exec(`UPDATE store_metadata SET value = ? WHERE key = ?`, legacyContract, baselineV2SchemaContractMetadataKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(root); !errors.Is(err, ErrActiveRunSchemaUpgrade) || !strings.Contains(err.Error(), activeRun.ID) || !strings.Contains(err.Error(), "finish it with the deployment package") {
+		t.Fatalf("active legacy upgrade error = %v, want %v naming %s", err, ErrActiveRunSchemaUpgrade, activeRun.ID)
+	}
+	uri, err := sqliteFileURI(filepath.Join(root, dbFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", uri+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var recordedContract string
+	if err := database.QueryRowContext(ctx, `SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
+		t.Fatal(err)
+	}
+	if recordedContract != legacyContract {
+		t.Fatalf("blocked legacy upgrade rewrote schema marker = %s, want %s", recordedContract, legacyContract)
+	}
+	var indexCount int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, codeEdgeEvaluatorParentIndexName).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 0 {
+		t.Fatalf("blocked legacy upgrade installed evaluator index")
+	}
+}
+
+func TestCurrentSchemaAllowsUnfinishedWorkflowRun(t *testing.T) {
+	ctx := context.Background()
+	store := tempDB(t)
+	root := store.rootDir
+	_, _, activeRun := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(root)
+	if err != nil {
+		t.Fatalf("open current schema with unfinished Run %s: %v", activeRun.ID, err)
+	}
+	defer reopened.Close()
+}
+
+func TestLegacySchemaUpgradeTransactionRefusesUnfinishedWorkflowRun(t *testing.T) {
+	ctx := context.Background()
+	store := tempDB(t)
+	_, _, activeRun := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
+	if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
+		t.Fatal(err)
+	}
+	legacyContract, err := sqliteSchemaContract(store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyContract != legacyV18ConsolidatedV2SchemaContractFingerprint {
+		t.Fatalf("legacy V18 contract = %s, want %s", legacyContract, legacyV18ConsolidatedV2SchemaContractFingerprint)
+	}
+	if _, err := store.db.Exec(`UPDATE store_metadata SET value = ? WHERE key = ?`, legacyContract, baselineV2SchemaContractMetadataKey); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.upgradeLegacyConsolidatedV2Schema(); !errors.Is(err, ErrActiveRunSchemaUpgrade) || !strings.Contains(err.Error(), activeRun.ID) {
+		t.Fatalf("transactional active legacy upgrade error = %v, want %v naming %s", err, ErrActiveRunSchemaUpgrade, activeRun.ID)
+	}
+	actualContract, err := sqliteSchemaContract(store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actualContract != legacyContract {
+		t.Fatalf("transactional blocked upgrade rewrote schema = %s, want %s", actualContract, legacyContract)
+	}
+}
+
 func TestCodeEdgeEvaluatorChildParentIsDurablyUnique(t *testing.T) {
 	ctx := context.Background()
 	store := tempDB(t)
@@ -159,6 +258,12 @@ func TestUpgradeLegacyV18SchemaRejectsDuplicateEvaluatorChildrenWithoutPartialUp
 		t.Fatalf("legacy V18 contract = %s, want %s", legacyContract, legacyV18ConsolidatedV2SchemaContractFingerprint)
 	}
 	if _, err := store.db.Exec(`UPDATE store_metadata SET value = ? WHERE key = ?`, legacyContract, baselineV2SchemaContractMetadataKey); err != nil {
+		t.Fatal(err)
+	}
+	// This fixture verifies duplicate-child DDL failure independently from the
+	// active-Run protection. Mark all rows terminal so schema admission reaches
+	// the duplicate-index check.
+	if _, err := store.db.Exec(`UPDATE workflow_runs SET status = ?, finished_at = CURRENT_TIMESTAMP`, WorkflowRunSucceeded); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

@@ -22,12 +22,14 @@ type commandEvaluatorDefinitionProvider struct {
 	profile workflowadapter.ExecutionProfile
 	spec    workflowadapter.RunExecutionSpec
 	err     error
+	calls   int
 }
 
 func (provider *commandEvaluatorDefinitionProvider) DefinitionForEvaluatorRun(_ context.Context, _ app.EvaluatorRunDefinitionRequest) (app.EvaluatorRunDefinition, error) {
 	if provider == nil {
 		return app.EvaluatorRunDefinition{}, app.ErrCodeEdgeEvaluatorDefinitionUnavailable
 	}
+	provider.calls++
 	if provider.err != nil {
 		return app.EvaluatorRunDefinition{}, provider.err
 	}
@@ -94,6 +96,15 @@ func TestRunEvaluateCLIRequiresPreparedFrozenInputsAndReplaysOneWorkerHandoff(t 
 	}
 
 	config := &lifecycleCLIConfig{root: root, newLifecycleService: factory}
+	provider.err = errors.New("provider credential=command-test-secret must remain private")
+	safeErrorOutput, safeError := executeRunEvaluateCommand(t, ctx, newRunEvaluatePrepareCommand(config), []string{
+		"--parent-run", parent.ID, "--idempotency-key", commandLifecycleUUID(t), "--reason", "reject unsafe provider error text",
+	})
+	if !errors.Is(safeError, app.ErrCodeEdgeEvaluatorDefinitionInvalid) || strings.Contains(safeErrorOutput, "command-test-secret") || strings.Contains(safeError.Error(), "command-test-secret") {
+		t.Fatalf("CLI exposed a provider error instead of a safe definition failure: output=%q err=%v", safeErrorOutput, safeError)
+	}
+	provider.err = nil
+
 	key := commandLifecycleUUID(t)
 	prepareOutput, err := executeRunEvaluateCommand(t, ctx, newRunEvaluatePrepareCommand(config), []string{
 		"--parent-run", parent.ID, "--idempotency-key", key, "--reason", "freeze the approved CodeEdge evaluator",
@@ -157,12 +168,16 @@ func TestRunEvaluateCLIRequiresPreparedFrozenInputsAndReplaysOneWorkerHandoff(t 
 	if len(launcher.requests) != 1 {
 		t.Fatalf("confirm without prepare launched a worker: %+v", launcher.requests)
 	}
+	callsBeforeExistingChildPrepare := provider.calls
 	provider.err = errors.New("provider credential=command-test-secret must remain private")
-	safeErrorOutput, safeError := executeRunEvaluateCommand(t, ctx, newRunEvaluatePrepareCommand(config), []string{
-		"--parent-run", parent.ID, "--idempotency-key", commandLifecycleUUID(t), "--reason", "reject unsafe provider error text",
+	existingChildOutput, existingChildErr := executeRunEvaluateCommand(t, ctx, newRunEvaluatePrepareCommand(config), []string{
+		"--parent-run", parent.ID, "--idempotency-key", commandLifecycleUUID(t), "--reason", "reject competing evaluator launch",
 	})
-	if !errors.Is(safeError, app.ErrCodeEdgeEvaluatorDefinitionInvalid) || strings.Contains(safeErrorOutput, "command-test-secret") || strings.Contains(safeError.Error(), "command-test-secret") {
-		t.Fatalf("CLI exposed a provider error instead of a safe definition failure: output=%q err=%v", safeErrorOutput, safeError)
+	if !errors.Is(existingChildErr, app.ErrCodeEdgeEvaluatorChildAlreadyExists) || strings.Contains(existingChildOutput, "command-test-secret") || strings.Contains(existingChildErr.Error(), "command-test-secret") {
+		t.Fatalf("CLI existing-child rejection = output=%q err=%v", existingChildOutput, existingChildErr)
+	}
+	if provider.calls != callsBeforeExistingChildPrepare {
+		t.Fatalf("existing child prepare invoked provider: calls=%d want %d", provider.calls, callsBeforeExistingChildPrepare)
 	}
 	check = openCommandEvaluatorLifecycle(t, root, factory)
 	defer check.Store().Close()

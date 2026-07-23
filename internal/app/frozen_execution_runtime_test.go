@@ -199,6 +199,50 @@ func TestFrozenExecutionRuntimeUsesPublicWorkflowkitEngineAndRetainsFailedEviden
 	}
 }
 
+func TestFrozenExecutionRuntimeRefreshesPublicEngineClaimLeaseAfterHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+
+	var observed workflowkit.JobClaim
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, func(ctx context.Context, request workflowkit.StageExecutionRequest) (workflowkit.StageExecutionResult, error) {
+		observed = request.Claim.Clone()
+		return completedFixtureStage(ctx, request)
+	}))
+	worker := newFrozenRuntimeWorker(t, fixture.store, runtime, "runtime-live-claim-coordinator")
+	if result, err := worker.RunOnce(ctx); err != nil || result.FinalState != store.JobSucceeded {
+		t.Fatalf("initial coordinator result = %+v, %v", result, err)
+	}
+	stageJob, _ := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
+	claim, err := fixture.store.ClaimNextDurableJob(ctx, store.ClaimNextDurableJobRequest{
+		IdempotencyKey: "runtime-live-claim-stage", Owner: "runtime-live-claim-worker", RunID: fixture.run.ID,
+		LeaseTTL: time.Minute, Actor: runtimeFixtureActor, Reason: "claim stage before public Engine lease refresh",
+	})
+	if err != nil || claim.Job == nil || claim.Job.ID != stageJob.ID || claim.DispatchLease == nil {
+		t.Fatalf("claim stage = %+v, %v", claim, err)
+	}
+	renewed, err := fixture.store.HeartbeatLease(ctx, store.HeartbeatLeaseRequest{
+		LeaseID: claim.DispatchLease.ID, Owner: claim.Owner, FencingToken: claim.DispatchLease.FencingToken,
+		ExpectedVersion: claim.DispatchLease.Version, TTL: time.Minute, Actor: runtimeFixtureActor,
+		Reason: "extend dispatch lease before public Engine starts",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleExecution := DurableJobExecution{Claim: claim}
+	staleLease := *claim.DispatchLease
+	staleLease.ExpiresAt = time.Now().UTC().Add(-time.Second)
+	staleExecution.Claim.DispatchLease = &staleLease
+
+	result, err := runtime.HandleDurableJob(ctx, staleExecution)
+	if err != nil || result.State != store.JobSucceeded {
+		t.Fatalf("runtime with a heartbeated live lease = %+v, %v", result, err)
+	}
+	if observed.LeaseExpiresAt != renewed.ExpiresAt || !observed.LeaseExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("public Engine claim expiry = %s, want current heartbeated expiry %s", observed.LeaseExpiresAt, renewed.ExpiresAt)
+	}
+}
+
 func TestFrozenExecutionRuntimeMarksAdmittedQuotaUncertainOnPostAdmissionIntegrityFailure(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFrozenRuntimeFixture(t)

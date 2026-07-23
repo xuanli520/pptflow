@@ -79,6 +79,13 @@ var (
 	// operators must create a new control-plane root instead of asking this
 	// binary to reinterpret or rewrite prior data.
 	ErrPreConsolidationStore = errors.New("store: pre-consolidation database requires rebuild")
+
+	// ErrActiveRunSchemaUpgrade prevents a newer deployment package from
+	// changing the control-plane schema below unfinished frozen Runs. Those
+	// Runs are bound to a deployment catalog and lock identity. The Store has
+	// no deployment context in which to prove package compatibility, so it
+	// must leave that root for the original package or a fresh control plane.
+	ErrActiveRunSchemaUpgrade = errors.New("store: schema upgrade blocked by unfinished workflow run")
 )
 
 type Store struct {
@@ -313,6 +320,17 @@ func preflightWritableStoreAdmission(dbPath string) error {
 			return err
 		}
 		return nil
+	}
+	needsUpgrade, err := legacyConsolidatedV2SchemaUpgradeRequired(db)
+	if err != nil {
+		return fmt.Errorf("inspect legacy schema upgrade state: %w", err)
+	}
+	if needsUpgrade {
+		if runID, status, blocked, err := unfinishedLegacySchemaUpgradeRun(db); err != nil {
+			return fmt.Errorf("inspect unfinished workflow Runs before schema upgrade: %w", err)
+		} else if blocked {
+			return activeRunSchemaUpgradeError(runID, status)
+		}
 	}
 
 	// A current baseline that cannot pass a physical integrity scan is not
@@ -645,17 +663,52 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) e
 // so an interrupted startup leaves the old, internally consistent schema for
 // the next attempt. No unknown schema is admitted here.
 func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
-	var recordedContract string
-	if err := s.db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
-		return err
-	}
-	actualContract, err := sqliteSchemaContract(s.db)
+	needsUpgrade, err := legacyConsolidatedV2SchemaUpgradeRequired(s.db)
 	if err != nil {
-		return fmt.Errorf("derive persisted legacy V2 schema contract: %w", err)
+		return fmt.Errorf("inspect legacy schema upgrade state: %w", err)
 	}
-	if recordedContract != actualContract || !isKnownLegacyConsolidatedV2SchemaContract(recordedContract) {
+	if !needsUpgrade {
 		return nil
 	}
+	return s.applyLegacyConsolidatedV2SchemaUpgrade()
+}
+
+func legacyConsolidatedV2SchemaUpgradeRequired(db *sql.DB) (bool, error) {
+	var recordedContract string
+	if err := db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
+		return false, err
+	}
+	actualContract, err := sqliteSchemaContract(db)
+	if err != nil {
+		return false, fmt.Errorf("derive persisted legacy V2 schema contract: %w", err)
+	}
+	return recordedContract == actualContract && isKnownLegacyConsolidatedV2SchemaContract(recordedContract), nil
+}
+
+func unfinishedLegacySchemaUpgradeRun(db *sql.DB) (string, WorkflowRunStatus, bool, error) {
+	var activeRunID string
+	var activeRunStatus WorkflowRunStatus
+	err := db.QueryRow(`
+		SELECT id, status
+		FROM workflow_runs
+		WHERE status NOT IN (?, ?, ?, ?)
+		ORDER BY created_at, id
+		LIMIT 1
+	`, WorkflowRunSucceeded, WorkflowRunFailedTerminal, WorkflowRunCanceled, WorkflowRunInterrupted).Scan(&activeRunID, &activeRunStatus)
+	if err == nil {
+		return activeRunID, activeRunStatus, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, err
+	}
+	return "", "", false, nil
+}
+
+func activeRunSchemaUpgradeError(runID string, status WorkflowRunStatus) error {
+	return fmt.Errorf("%w: run %s is %s; finish it with the deployment package that froze its execution contract or initialize a new root", ErrActiveRunSchemaUpgrade, runID, status)
+}
+
+func (s *Store) applyLegacyConsolidatedV2SchemaUpgrade() error {
 	triggerSQL, err := currentAuthoringPhase1HandoffTriggerSQL()
 	if err != nil {
 		return err
@@ -669,6 +722,22 @@ func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 		return fmt.Errorf("begin legacy V2 schema upgrade: %w", err)
 	}
 	defer tx.Rollback()
+	var recordedContract string
+	if err := tx.QueryRowContext(context.Background(), `SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
+		return fmt.Errorf("read legacy V2 schema contract marker in upgrade transaction: %w", err)
+	}
+	if !isKnownLegacyConsolidatedV2SchemaContract(recordedContract) {
+		// Another writer completed the upgrade after the preflight but before
+		// this BEGIN IMMEDIATE transaction acquired its reservation.
+		return nil
+	}
+	runID, status, blocked, err := unfinishedLegacySchemaUpgradeRunTx(context.Background(), tx)
+	if err != nil {
+		return fmt.Errorf("inspect unfinished workflow Runs in schema upgrade transaction: %w", err)
+	}
+	if blocked {
+		return activeRunSchemaUpgradeError(runID, status)
+	}
 	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS ` + authoringPhase1HandoffTriggerName); err != nil {
 		return fmt.Errorf("drop legacy Standard authoring handoff trigger: %w", err)
 	}
@@ -706,6 +775,28 @@ func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 		return fmt.Errorf("commit legacy V2 schema upgrade: %w", err)
 	}
 	return nil
+}
+
+func unfinishedLegacySchemaUpgradeRunTx(ctx context.Context, tx *sql.Tx) (string, WorkflowRunStatus, bool, error) {
+	if tx == nil {
+		return "", "", false, fmt.Errorf("schema upgrade transaction is required")
+	}
+	var activeRunID string
+	var activeRunStatus WorkflowRunStatus
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, status
+		FROM workflow_runs
+		WHERE status NOT IN (?, ?, ?, ?)
+		ORDER BY created_at, id
+		LIMIT 1
+	`, WorkflowRunSucceeded, WorkflowRunFailedTerminal, WorkflowRunCanceled, WorkflowRunInterrupted).Scan(&activeRunID, &activeRunStatus)
+	if err == nil {
+		return activeRunID, activeRunStatus, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, err
+	}
+	return "", "", false, nil
 }
 
 func isKnownLegacyConsolidatedV2SchemaContract(fingerprint string) bool {

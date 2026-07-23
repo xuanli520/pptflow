@@ -553,7 +553,25 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 		run = seedApprovedCodeEdgeReviewGate(t, ctx, services, run, revision, workflowadapter.ResultReview, workflowadapter.ReviewModelResult)
 	}
 	fixture.run = run
-	fixture.runtimeRun, _ = startCodeEdgeEvaluatorFixtureRun(t, ctx, services, run, revision, childSpecification, "runtime evaluator exercise")
+	// Runtime tests need a clean evaluator child, while the completed evidence
+	// child above remains the one and only evaluator child of the compliance
+	// parent. Give the runtime child its own Phase-1 parent to preserve the
+	// production one-child-per-parent invariant.
+	runtimeParent, err := parentServices.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, Profile: codeEdgePhase1RuntimeProfile(t), ExecutionSpec: specification,
+		Trigger: "codeedge-runtime-evaluator-parent", Actor: "codeedge-test", Reason: "create independent evaluator runtime parent",
+	})
+	if err != nil {
+		t.Fatalf("start evaluator runtime parent fixture: %v", err)
+	}
+	runtimeParent, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: runtimeParent.ID, ExpectedVersion: runtimeParent.Version, Status: store.WorkflowRunRunning,
+		Actor: "codeedge-test", Reason: "run independent evaluator runtime parent",
+	})
+	if err != nil {
+		t.Fatalf("transition evaluator runtime parent fixture to running: %v", err)
+	}
+	fixture.runtimeRun, _ = startCodeEdgeEvaluatorFixtureRun(t, ctx, services, runtimeParent, revision, childSpecification, "runtime evaluator exercise")
 	if options.packageableRevision {
 		fixture.makeRevisionPackageable(t, ctx)
 	}

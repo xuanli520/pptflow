@@ -19,6 +19,10 @@ func newLifecycleTUICommand(config *lifecycleCLIConfig) *cobra.Command {
 type lifecycleTUIRunner func(context.Context, *app.LifecycleServices) error
 
 func newLifecycleTUICommandWithRunner(config *lifecycleCLIConfig, runner lifecycleTUIRunner) *cobra.Command {
+	return newLifecycleTUICommandWithDependencies(config, runner, store.Open)
+}
+
+func newLifecycleTUICommandWithDependencies(config *lifecycleCLIConfig, runner lifecycleTUIRunner, openStore func(string) (*store.Store, error)) *cobra.Command {
 	return &cobra.Command{
 		Use:   "tui",
 		Short: "Open the Harbor Task Factory TUI",
@@ -30,10 +34,13 @@ func newLifecycleTUICommandWithRunner(config *lifecycleCLIConfig, runner lifecyc
 			if runner == nil {
 				return fmt.Errorf("lifecycle TUI runner is required")
 			}
+			if openStore == nil {
+				return fmt.Errorf("lifecycle TUI store opener is required")
+			}
 			if err := config.preflightLifecycleServices(); err != nil {
 				return fmt.Errorf("preflight lifecycle deployment: %w", err)
 			}
-			dataStore, err := store.Open(config.root)
+			dataStore, err := openStore(config.root)
 			if err != nil {
 				return fmt.Errorf("open lifecycle control plane: %w", err)
 			}
