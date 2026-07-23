@@ -36,12 +36,13 @@ type appModel struct {
 	ctx     context.Context
 	gateway taskBoardGateway
 
-	board  TaskBoardModel
-	input  TaskInputModel
-	detail *detailModel
-	logs   *logModel
-	review *reviewPrompt
-	action *runActionPrompt
+	board           TaskBoardModel
+	input           TaskInputModel
+	detail          *detailModel
+	logs            *logModel
+	review          *reviewPrompt
+	action          *runActionPrompt
+	evaluatorAction *evaluatorActionPrompt
 
 	width              int
 	height             int
@@ -49,18 +50,20 @@ type appModel struct {
 	notice             string
 	authoringAvailable bool
 
-	pendingStart   *pendingTaskBoardStart
-	pendingReview  *pendingTaskBoardReview
-	pendingAction  *pendingTaskBoardRunAction
-	deferredAction *pendingTaskBoardRunAction
-	activeMutation taskBoardMutationKind
-	logEpoch       uint64
+	pendingStart           *pendingTaskBoardStart
+	pendingReview          *pendingTaskBoardReview
+	pendingAction          *pendingTaskBoardRunAction
+	deferredAction         *pendingTaskBoardRunAction
+	pendingEvaluatorAction *pendingTaskBoardEvaluatorAction
+	activeMutation         taskBoardMutationKind
+	logEpoch               uint64
 
 	refreshInFlight         bool
 	refreshRequested        bool
 	refreshEpoch            uint64
 	recoveryPreviewInFlight bool
 	recoveryPreviewEpoch    uint64
+	evaluatorActionEpoch    uint64
 	exitInFlight            bool
 	exitFlushFailed         bool
 }
@@ -104,6 +107,10 @@ const (
 	taskBoardRetryMutation                taskBoardMutationKind = "retry_run"
 	taskBoardRetryAuthoringLaunchMutation taskBoardMutationKind = "retry_authoring_launch"
 	taskBoardCancelMutation               taskBoardMutationKind = "cancel_run"
+	taskBoardEvaluatorPreviewMutation     taskBoardMutationKind = "evaluator_preview"
+	taskBoardEvaluatorPrepareMutation     taskBoardMutationKind = "evaluator_prepare"
+	taskBoardEvaluatorConfirmMutation     taskBoardMutationKind = "evaluator_confirm"
+	taskBoardEvaluatorAdoptMutation       taskBoardMutationKind = "evaluator_adopt"
 )
 
 type taskBoardRunActionKind string
@@ -331,6 +338,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.action.reasonInput, command = m.action.reasonInput.Update(msg)
 			commands = append(commands, command)
 		}
+		if m.evaluatorAction != nil {
+			var command tea.Cmd
+			m.evaluatorAction.reason, command = m.evaluatorAction.reason.Update(msg)
+			commands = append(commands, command)
+		}
 		inputCmd = tea.Batch(commands...)
 	}
 
@@ -364,7 +376,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.board.SetTasks(taskItemsForSnapshot(msg.snapshot))
 			m.authoringAvailable = msg.snapshot.AuthoringAvailable
-			if m.pendingStart == nil && m.pendingReview == nil && m.pendingAction == nil {
+			if m.pendingStart == nil && m.pendingReview == nil && m.pendingAction == nil && m.pendingEvaluatorAction == nil {
 				m.err = nil
 			}
 		}
@@ -387,6 +399,13 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case taskBoardMutationMsg:
 		m.activeMutation = ""
 		if msg.err != nil {
+			if msg.kind == taskBoardEvaluatorConfirmMutation || msg.kind == taskBoardEvaluatorAdoptMutation {
+				// Evaluator failures can originate in a deployment or evidence
+				// verifier. Keep their raw diagnostics in durable records rather
+				// than rendering them in the local terminal.
+				m.err = errors.New("CodeEdge 评测操作未完成；请刷新运行状态后重试")
+				return m, inputCmd
+			}
 			if msg.kind == taskBoardRetryMutation && errors.Is(msg.err, app.ErrTaskBoardRecoveryPreviewStale) {
 				m.err = nil
 				m.pendingAction = nil
@@ -415,6 +434,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingAction = nil
 			m.deferredAction = nil
 			m.action = nil
+			m.logs = nil
+			m.detail = nil
+		case taskBoardEvaluatorConfirmMutation, taskBoardEvaluatorAdoptMutation:
+			m.pendingEvaluatorAction = nil
+			m.evaluatorAction = nil
 			m.logs = nil
 			m.detail = nil
 		}
@@ -454,6 +478,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.action.recoveryPreview = &msg.preview
 		return m, inputCmd
 
+	case taskBoardEvaluatorPreviewMsg:
+		return m.applyEvaluatorPreview(msg, inputCmd)
+
+	case taskBoardEvaluatorPreparedMsg:
+		return m.applyEvaluatorPrepared(msg, inputCmd)
+
 	case taskBoardLogMsg:
 		if msg.epoch != m.logEpoch || m.logs == nil {
 			return m, inputCmd
@@ -487,6 +517,10 @@ func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cm
 
 	if m.logs != nil {
 		return m.handleLogKey(msg, inputCmd)
+	}
+
+	if m.evaluatorAction != nil {
+		return m.handleEvaluatorActionKey(msg, inputCmd)
 	}
 
 	if m.action != nil {
@@ -590,6 +624,10 @@ func (m appModel) handleDetailKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, 
 		return m.openRunActionPrompt(taskBoardRetryAction, inputCmd)
 	case "x":
 		return m.openRunActionPrompt(taskBoardCancelAction, inputCmd)
+	case "e":
+		return m.openEvaluatorAction(evaluatorLaunchAction, inputCmd)
+	case "v":
+		return m.openEvaluatorAction(evaluatorAdoptAction, inputCmd)
 	case "a":
 		if m.detail.task.Review != nil {
 			return m.openReviewPrompt(app.TaskBoardApprove, inputCmd)
@@ -1082,6 +1120,11 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 		})
 	}
 	for _, task := range snapshot.Tasks {
+		var evaluator *app.TaskBoardEvaluatorStatus
+		if task.Evaluator != nil {
+			copy := *task.Evaluator
+			evaluator = &copy
+		}
 		item := TaskItem{
 			ID:           task.ID,
 			Slug:         task.Slug,
@@ -1094,6 +1137,7 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 			Lifecycle:    task.LifecycleState,
 			Review:       task.Review,
 			OpenReviews:  task.OpenReviewCount,
+			Evaluator:    evaluator,
 			Runs:         make([]TaskRunItem, 0, len(task.Runs)),
 		}
 		for _, run := range task.Runs {
@@ -1178,6 +1222,11 @@ func (m appModel) View() string {
 			}
 			footer = footerStyle.Render(footerText)
 		}
+		if m.evaluatorAction != nil {
+			prompt = m.evaluatorAction.View(contentWidth)
+			detailHeight -= lipgloss.Height(prompt) + 1
+			footer = footerStyle.Render(evaluatorActionFooter(m.evaluatorAction))
+		}
 		return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
 			headerStyle.Width(contentWidth).Render("Harbor Task Factory"),
 			m.detail.View(contentWidth, max(1, detailHeight)),
@@ -1232,6 +1281,16 @@ func detailFooterText(detail *detailModel) string {
 		}
 		if detail.canCancelCurrentRun() {
 			actions = append(actions, "[x] 取消")
+		}
+	}
+	if detail != nil {
+		if evaluator := detail.evaluatorStatus(); evaluator != nil {
+			if evaluator.CanLaunch {
+				actions = append(actions, "[e] 启动评测")
+			}
+			if evaluator.CanAdopt {
+				actions = append(actions, "[v] 采用评测证据")
+			}
 		}
 	}
 	actions = append(actions, "[q] 返回")

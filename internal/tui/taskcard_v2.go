@@ -32,6 +32,7 @@ type TaskItem struct {
 	Review          *app.TaskBoardReview
 	OpenReviews     int
 	Runs            []TaskRunItem
+	Evaluator       *app.TaskBoardEvaluatorStatus
 	AuthoringLaunch *app.TaskBoardAuthoringLaunch
 }
 

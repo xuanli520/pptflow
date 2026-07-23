@@ -73,6 +73,13 @@ func (d *detailModel) canRetryCurrentRun() bool {
 	return run != nil && run.CanRetry
 }
 
+func (d *detailModel) evaluatorStatus() *app.TaskBoardEvaluatorStatus {
+	if d == nil || d.task == nil {
+		return nil
+	}
+	return d.task.Evaluator
+}
+
 func (d *detailModel) View(width, height int) string {
 	if d == nil || d.task == nil {
 		return mutedStyle.Render("未选择题目")
@@ -112,6 +119,19 @@ func (d *detailModel) View(width, height int) string {
 	if failure := d.failureFields(contentWidth); failure != "" {
 		parts = append(parts, renderDetailSection("失败原因", failure, contentWidth))
 	}
+	if evaluator := d.evaluatorStatus(); evaluator != nil {
+		fields := []string{
+			detailField("状态", displayEvaluatorState(evaluator.State), contentWidth),
+			detailField("Phase-1 Run", evaluator.ParentRunID, contentWidth),
+		}
+		if evaluator.ChildRunID != "" {
+			fields = append(fields, detailField("评测子 Run", evaluator.ChildRunID, contentWidth))
+		}
+		if evaluator.Reason != "" {
+			fields = append(fields, detailField("说明", evaluator.Reason, contentWidth))
+		}
+		parts = append(parts, renderDetailSection("外部评测", detailFields(contentWidth, fields...), contentWidth))
+	}
 	parts = append(parts, renderDetailSection("运行记录", d.historyFields(contentWidth, height), contentWidth))
 	if d.task.Review != nil {
 		parts = append(parts, renderDetailSection("审核", detailFields(contentWidth,
@@ -121,6 +141,23 @@ func (d *detailModel) View(width, height int) string {
 		parts = append(parts, renderDetailSection("审核", failStyleV2.Render("存在多个待处理审核，请使用 CLI 选择明确的审核请求"), contentWidth))
 	}
 	return lipgloss.NewStyle().Width(contentWidth).Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
+}
+
+func displayEvaluatorState(state app.TaskBoardEvaluatorState) string {
+	switch state {
+	case app.TaskBoardEvaluatorAwaitingFinalReview:
+		return "等待最终审核"
+	case app.TaskBoardEvaluatorReadyToLaunch:
+		return "可启动 Qwen/Opus 评测"
+	case app.TaskBoardEvaluatorChildActive:
+		return "评测子 Run 执行中"
+	case app.TaskBoardEvaluatorReadyToAdopt:
+		return "可采用评测证据"
+	case app.TaskBoardEvaluatorAdopted:
+		return "评测证据已采用"
+	default:
+		return "当前不可用"
+	}
 }
 
 func (d *detailModel) authoringLaunchView(width int) string {

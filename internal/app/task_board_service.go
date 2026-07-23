@@ -71,6 +71,35 @@ type TaskBoardTask struct {
 	Review          *TaskBoardReview
 	OpenReviewCount int
 	Runs            []TaskBoardRun
+	// Evaluator describes the one unambiguous CodeEdge Phase-1/evaluator-child
+	// action chain for this task. It is a projection only; every mutation below
+	// revalidates its immutable parent/child bindings.
+	Evaluator *TaskBoardEvaluatorStatus
+}
+
+// TaskBoardEvaluatorState names the narrow evaluator action state that can be
+// safely projected to the terminal board.
+type TaskBoardEvaluatorState string
+
+const (
+	TaskBoardEvaluatorAwaitingFinalReview TaskBoardEvaluatorState = "awaiting_final_review"
+	TaskBoardEvaluatorReadyToLaunch       TaskBoardEvaluatorState = "ready_to_launch"
+	TaskBoardEvaluatorChildActive         TaskBoardEvaluatorState = "child_active"
+	TaskBoardEvaluatorReadyToAdopt        TaskBoardEvaluatorState = "ready_to_adopt"
+	TaskBoardEvaluatorAdopted             TaskBoardEvaluatorState = "adopted"
+	TaskBoardEvaluatorUnavailable         TaskBoardEvaluatorState = "unavailable"
+)
+
+// TaskBoardEvaluatorStatus is the UI-safe summary of one parent/child chain.
+// It intentionally carries no profile, endpoint, credential, command, or
+// evidence payload bytes.
+type TaskBoardEvaluatorStatus struct {
+	ParentRunID string
+	ChildRunID  string
+	State       TaskBoardEvaluatorState
+	Reason      string
+	CanLaunch   bool
+	CanAdopt    bool
 }
 
 // TaskBoardAuthoringLaunch is a failed Standard source-capture operation that
@@ -265,6 +294,87 @@ type TaskBoardCancelRunRequest struct {
 	Reason         string
 }
 
+// TaskBoardEvaluatorLaunchPreviewRequest selects one approved CodeEdge
+// Phase-1 parent Run for a read-only evaluator launch preview.
+type TaskBoardEvaluatorLaunchPreviewRequest struct {
+	TaskID      string
+	ParentRunID string
+}
+
+// TaskBoardEvaluatorLaunchPreview is the UI-safe form of the immutable child
+// Run plan. The definition remains controlled by deployment composition.
+type TaskBoardEvaluatorLaunchPreview struct {
+	TaskID                      string
+	ParentRunID                 string
+	RevisionID                  string
+	TemplateID                  string
+	TemplateVersion             string
+	ExecutionProfileFingerprint string
+	ExecutionSpecFingerprint    string
+}
+
+// TaskBoardEvaluatorLaunchRequest is retained across the prepare/confirm
+// boundary. The caller never supplies a profile, model, provider, secret, or
+// execution specification.
+type TaskBoardEvaluatorLaunchRequest struct {
+	IdempotencyKey string
+	TaskID         string
+	ParentRunID    string
+	Reason         string
+}
+
+// TaskBoardPreparedEvaluatorLaunch records the first confirmation without
+// creating a child Run or invoking the evaluator.
+type TaskBoardPreparedEvaluatorLaunch struct {
+	TaskID                      string
+	ParentRunID                 string
+	InputBundleID               string
+	ExecutionProfileFingerprint string
+	ExecutionSpecFingerprint    string
+}
+
+// TaskBoardEvaluatorEvidenceHandoffPreviewRequest selects the immutable
+// parent/child pair for a read-only evidence-adoption preview.
+type TaskBoardEvaluatorEvidenceHandoffPreviewRequest struct {
+	TaskID      string
+	ParentRunID string
+	ChildRunID  string
+}
+
+// TaskBoardEvaluatorEvidenceHandoffPreview contains only durable identities
+// and verification fingerprints, never provider-produced payload bytes.
+type TaskBoardEvaluatorEvidenceHandoffPreview struct {
+	TaskID               string
+	ParentRunID          string
+	ChildRunID           string
+	RevisionID           string
+	HandoffFingerprint   string
+	QwenTrialFingerprint string
+	OpusTrialFingerprint string
+}
+
+// TaskBoardEvaluatorEvidenceHandoffRequest is retained across the
+// prepare/adopt boundary for one immutable parent/child pair.
+type TaskBoardEvaluatorEvidenceHandoffRequest struct {
+	IdempotencyKey string
+	TaskID         string
+	ParentRunID    string
+	ChildRunID     string
+	Reason         string
+}
+
+// TaskBoardPreparedEvaluatorEvidenceHandoff records the first adoption
+// confirmation before the durable evidence bridge is created.
+type TaskBoardPreparedEvaluatorEvidenceHandoff struct {
+	TaskID               string
+	OperationID          string
+	ParentRunID          string
+	ChildRunID           string
+	HandoffFingerprint   string
+	QwenTrialFingerprint string
+	OpusTrialFingerprint string
+}
+
 // TaskBoardMutation is the small success result a TUI needs to refresh its
 // projection and report the durable effect without interpreting raw records.
 type TaskBoardMutation struct {
@@ -286,6 +396,12 @@ type TaskBoardGateway interface {
 	RetryRun(context.Context, TaskBoardRetryRunRequest) (TaskBoardMutation, error)
 	RetryAuthoringLaunch(context.Context, TaskBoardRetryAuthoringLaunchRequest) (TaskBoardMutation, error)
 	CancelRun(context.Context, TaskBoardCancelRunRequest) (TaskBoardMutation, error)
+	PreviewEvaluatorLaunch(context.Context, TaskBoardEvaluatorLaunchPreviewRequest) (TaskBoardEvaluatorLaunchPreview, error)
+	PrepareEvaluatorLaunch(context.Context, TaskBoardEvaluatorLaunchRequest) (TaskBoardPreparedEvaluatorLaunch, error)
+	ConfirmEvaluatorLaunch(context.Context, TaskBoardEvaluatorLaunchRequest) (TaskBoardMutation, error)
+	PreviewEvaluatorEvidenceHandoff(context.Context, TaskBoardEvaluatorEvidenceHandoffPreviewRequest) (TaskBoardEvaluatorEvidenceHandoffPreview, error)
+	PrepareEvaluatorEvidenceHandoff(context.Context, TaskBoardEvaluatorEvidenceHandoffRequest) (TaskBoardPreparedEvaluatorEvidenceHandoff, error)
+	AdoptEvaluatorEvidenceHandoff(context.Context, TaskBoardEvaluatorEvidenceHandoffRequest) (TaskBoardMutation, error)
 	FlushQueuedRuns(context.Context) error
 }
 
@@ -319,10 +435,13 @@ type TaskBoardService struct {
 	continuations     *TaskContinuationService
 	authoringRecovery *AuthoringRecoveryService
 	control           *ExecutionControlService
+	evaluatorLaunches *CodeEdgeEvaluatorLaunchService
+	evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService
+	workerLauncher    RunWorkerHandoffLauncher
 	actor             func() (string, error)
 }
 
-func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService, authoringRecovery *AuthoringRecoveryService) *TaskBoardService {
+func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService, authoringRecovery *AuthoringRecoveryService, evaluatorLaunches *CodeEdgeEvaluatorLaunchService, evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService, workerLauncher RunWorkerHandoffLauncher) *TaskBoardService {
 	return &TaskBoardService{
 		core:              core,
 		inspection:        inspection,
@@ -333,6 +452,9 @@ func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspec
 		continuations:     continuations,
 		authoringRecovery: authoringRecovery,
 		control:           control,
+		evaluatorLaunches: evaluatorLaunches,
+		evaluatorEvidence: evaluatorEvidence,
+		workerLauncher:    workerLauncher,
 		actor:             localTaskBoardActor,
 	}
 }
@@ -1000,6 +1122,7 @@ func (service *TaskBoardService) projectTaskBoardTask(ctx context.Context, detai
 	task.RunID = latest.ID
 	task.RunStatus = latest.Status
 	task.CurrentStage = latest.CurrentStage
+	task.Evaluator = service.projectTaskBoardEvaluator(ctx, detail)
 	if task.Review != nil {
 		task.Column = TaskBoardPending
 		return task, nil

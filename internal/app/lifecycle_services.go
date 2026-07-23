@@ -255,7 +255,9 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	control := &ExecutionControlService{core: core}
 	authoringReviews := &AuthoringReviewService{core: core}
 	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
-	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control, authoringRecovery)
+	evaluatorLaunches := &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider}
+	evaluatorEvidenceHandoffs := &CodeEdgeEvaluatorEvidenceHandoffService{core: core}
+	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control, authoringRecovery, evaluatorLaunches, evaluatorEvidenceHandoffs, options.RunWorkerHandoffLauncher)
 	services := &LifecycleServices{
 		Tasks:                     &TaskService{core: core},
 		Revisions:                 &RevisionService{core: core},
@@ -278,10 +280,10 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		WorkerHandoffs:            &RunWorkerHandoffService{core: core},
 		RunActivations:            activations,
 		Mutations:                 mutations,
-		EvaluatorLaunches:         &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider},
+		EvaluatorLaunches:         evaluatorLaunches,
 		AuthoringLaunches:         authoringLaunches,
 		StandardAuthoringHandoffs: &StandardAuthoringHandoffService{core: core, definitions: options.CodeEdgePhase1RunDefinitionProvider},
-		EvaluatorEvidenceHandoffs: &CodeEdgeEvaluatorEvidenceHandoffService{core: core},
+		EvaluatorEvidenceHandoffs: evaluatorEvidenceHandoffs,
 		core:                      core,
 	}
 	services.LocalRuntime.services = services

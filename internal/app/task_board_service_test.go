@@ -12,6 +12,7 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/internal/testsupport"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -1013,6 +1014,234 @@ func TestTaskBoardDoesNotExposeRawStageOrWorkerFailureTextWithoutDurableRecord(t
 	if projected.FailureSummary != "" || projected.FailureReason != "" || projected.FailureCode != "" || projected.FailureClass != "" {
 		t.Fatalf("raw failure text leaked without durable record: %+v", projected)
 	}
+}
+
+func TestTaskBoardProjectsAndAdoptsVerifiedEvaluatorEvidence(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{stopBeforeHandoff: true})
+	fixture.services.TaskBoard.actor = func() (string, error) { return "task-board-evaluator", nil }
+
+	snapshot, err := fixture.services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatalf("list TaskBoard before evaluator evidence adoption: %v", err)
+	}
+	task := taskBoardTaskByID(t, snapshot, fixture.task.ID)
+	if task.Evaluator == nil || task.Evaluator.State != TaskBoardEvaluatorReadyToAdopt || !task.Evaluator.CanAdopt || task.Evaluator.CanLaunch ||
+		task.Evaluator.ParentRunID != fixture.run.ID || task.Evaluator.ChildRunID != fixture.childRun.ID {
+		t.Fatalf("evaluator projection before adoption = %+v", task.Evaluator)
+	}
+
+	preview, err := fixture.services.TaskBoard.PreviewEvaluatorEvidenceHandoff(ctx, TaskBoardEvaluatorEvidenceHandoffPreviewRequest{
+		TaskID: fixture.task.ID, ParentRunID: fixture.run.ID, ChildRunID: fixture.childRun.ID,
+	})
+	if err != nil {
+		t.Fatalf("preview evaluator evidence adoption: %v", err)
+	}
+	if preview.TaskID != fixture.task.ID || preview.ParentRunID != fixture.run.ID || preview.ChildRunID != fixture.childRun.ID ||
+		preview.RevisionID != fixture.revision.ID || preview.HandoffFingerprint == "" || preview.QwenTrialFingerprint == "" || preview.OpusTrialFingerprint == "" {
+		t.Fatalf("evaluator evidence preview = %+v", preview)
+	}
+
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := TaskBoardEvaluatorEvidenceHandoffRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, ParentRunID: fixture.run.ID, ChildRunID: fixture.childRun.ID,
+		Reason: "adopt verified canonical Qwen and Opus trial evidence",
+	}
+	prepared, err := fixture.services.TaskBoard.PrepareEvaluatorEvidenceHandoff(ctx, request)
+	if err != nil {
+		t.Fatalf("prepare evaluator evidence adoption: %v", err)
+	}
+	if prepared.TaskID != fixture.task.ID || prepared.ParentRunID != fixture.run.ID || prepared.ChildRunID != fixture.childRun.ID ||
+		prepared.OperationID == "" || prepared.HandoffFingerprint != preview.HandoffFingerprint ||
+		prepared.QwenTrialFingerprint != preview.QwenTrialFingerprint || prepared.OpusTrialFingerprint != preview.OpusTrialFingerprint {
+		t.Fatalf("prepared evaluator evidence adoption = %+v; preview=%+v", prepared, preview)
+	}
+	if handoff, lookupErr := fixture.database.GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, fixture.run.ID); lookupErr != nil || handoff != nil {
+		t.Fatalf("prepare created evaluator evidence handoff = %+v, %v", handoff, lookupErr)
+	}
+
+	adopted, err := fixture.services.TaskBoard.AdoptEvaluatorEvidenceHandoff(ctx, request)
+	if err != nil {
+		t.Fatalf("adopt evaluator evidence through TaskBoard: %v", err)
+	}
+	if adopted.TaskID != fixture.task.ID || adopted.RunID != fixture.run.ID || adopted.OperationID != prepared.OperationID || adopted.Summary == "" {
+		t.Fatalf("adopted evaluator evidence mutation = %+v", adopted)
+	}
+	handoff, err := fixture.database.GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, fixture.run.ID)
+	if err != nil || handoff == nil || handoff.ID != key || handoff.ChildRunID != fixture.childRun.ID {
+		t.Fatalf("persisted evaluator evidence handoff = %+v, %v", handoff, err)
+	}
+	replayed, err := fixture.services.TaskBoard.AdoptEvaluatorEvidenceHandoff(ctx, request)
+	if err != nil || replayed.OperationID != adopted.OperationID || replayed.RunID != adopted.RunID {
+		t.Fatalf("replayed TaskBoard evidence adoption = %+v, %v; first=%+v", replayed, err, adopted)
+	}
+
+	snapshot, err = fixture.services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatalf("list TaskBoard after evaluator evidence adoption: %v", err)
+	}
+	task = taskBoardTaskByID(t, snapshot, fixture.task.ID)
+	if task.Evaluator == nil || task.Evaluator.State != TaskBoardEvaluatorAdopted || task.Evaluator.CanLaunch || task.Evaluator.CanAdopt ||
+		task.Evaluator.ParentRunID != fixture.run.ID || task.Evaluator.ChildRunID != fixture.childRun.ID {
+		t.Fatalf("evaluator projection after adoption = %+v", task.Evaluator)
+	}
+}
+
+func TestTaskBoardLaunchesEvaluatorThroughControlledWorkerHandoff(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	provider := &taskBoardEvaluatorDefinitionProvider{profile: codeEdgeEvaluatorRuntimeProfile(t)}
+	launcher := &recordingTaskBoardEvaluatorWorkerLauncher{}
+	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+		OperationResolver:              testsupport.AcceptAllStageOperationResolver(),
+		EvaluatorRunDefinitionProvider: provider,
+		RunWorkerHandoffLauncher:       launcher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.TaskBoard.actor = func() (string, error) { return "task-board-evaluator", nil }
+	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
+		CreateDraftTaskRequest: CreateDraftTaskRequest{
+			Slug: "task-board-evaluator-launch", Title: "Task Board Evaluator Launch", Actor: "task-board-evaluator", Reason: "create evaluator launch fixture",
+		},
+		SourceDirectory: writeLifecycleSnapshot(t, "TaskBoard evaluator launch fixture\n"),
+		ChangeSummary:   "create immutable evaluator launch fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.spec = testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	parent, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID,
+		Profile:       codeEdgePhase1RuntimeProfile(t),
+		ExecutionSpec: testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
+		Trigger:       "task-board-evaluator-launch", Actor: "task-board-evaluator", Reason: "freeze evaluator parent fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
+		Actor: "task-board-evaluator", Reason: "open approved final review fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent = seedApprovedCodeEdgeReviewGate(t, ctx, services, parent, revision, workflowadapter.FinalReview, workflowadapter.ReviewFinalQuality)
+	parent, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
+		Actor: "task-board-evaluator", Reason: "continue after approved final review fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatalf("list TaskBoard before evaluator launch: %v", err)
+	}
+	projected := taskBoardTaskByID(t, snapshot, task.ID)
+	if projected.Evaluator == nil || projected.Evaluator.State != TaskBoardEvaluatorReadyToLaunch || !projected.Evaluator.CanLaunch || projected.Evaluator.CanAdopt ||
+		projected.Evaluator.ParentRunID != parent.ID || projected.Evaluator.ChildRunID != "" {
+		t.Fatalf("evaluator launch projection = %+v", projected.Evaluator)
+	}
+	preview, err := services.TaskBoard.PreviewEvaluatorLaunch(ctx, TaskBoardEvaluatorLaunchPreviewRequest{TaskID: task.ID, ParentRunID: parent.ID})
+	if err != nil {
+		t.Fatalf("preview TaskBoard evaluator launch: %v", err)
+	}
+	if preview.TaskID != task.ID || preview.ParentRunID != parent.ID || preview.RevisionID != revision.ID || preview.TemplateID != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID ||
+		preview.TemplateVersion != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion || preview.ExecutionProfileFingerprint == "" || preview.ExecutionSpecFingerprint == "" {
+		t.Fatalf("TaskBoard evaluator launch preview = %+v", preview)
+	}
+	missingPrepareKey, err := services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, confirmErr := services.TaskBoard.ConfirmEvaluatorLaunch(ctx, TaskBoardEvaluatorLaunchRequest{
+		IdempotencyKey: missingPrepareKey, TaskID: task.ID, ParentRunID: parent.ID,
+		Reason: "reject an evaluator launch without frozen inputs",
+	}); confirmErr == nil {
+		t.Fatal("TaskBoard evaluator confirm without prepare unexpectedly succeeded")
+	}
+	if len(launcher.requests) != 0 {
+		t.Fatalf("TaskBoard evaluator confirm without prepare launched workers: %+v", launcher.requests)
+	}
+
+	key, err := services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := TaskBoardEvaluatorLaunchRequest{
+		IdempotencyKey: key, TaskID: task.ID, ParentRunID: parent.ID,
+		Reason: "launch the approved Qwen and Opus evaluator child",
+	}
+	prepared, err := services.TaskBoard.PrepareEvaluatorLaunch(ctx, request)
+	if err != nil {
+		t.Fatalf("prepare TaskBoard evaluator launch: %v", err)
+	}
+	if prepared.TaskID != task.ID || prepared.ParentRunID != parent.ID || prepared.InputBundleID != key ||
+		prepared.ExecutionProfileFingerprint == "" || prepared.ExecutionSpecFingerprint == "" {
+		t.Fatalf("prepared TaskBoard evaluator launch = %+v", prepared)
+	}
+	runs, err := database.ListWorkflowRunsForTask(ctx, task.ID)
+	if err != nil || len(runs) != 1 || runs[0].ID != parent.ID {
+		t.Fatalf("prepare created evaluator child Run: %+v, %v", runs, err)
+	}
+
+	launched, err := services.TaskBoard.ConfirmEvaluatorLaunch(ctx, request)
+	if err != nil {
+		t.Fatalf("confirm TaskBoard evaluator launch: %v", err)
+	}
+	if launched.TaskID != task.ID || launched.RunID == "" || launched.RunID == parent.ID || launched.OperationID == "" {
+		t.Fatalf("TaskBoard evaluator launch mutation = %+v", launched)
+	}
+	if len(launcher.requests) != 1 || launcher.requests[0].RunID != launched.RunID {
+		t.Fatalf("TaskBoard evaluator worker launch = %+v", launcher.requests)
+	}
+	replayed, err := services.TaskBoard.ConfirmEvaluatorLaunch(ctx, request)
+	if err != nil || replayed.RunID != launched.RunID || replayed.OperationID != launched.OperationID || len(launcher.requests) != 1 {
+		t.Fatalf("replayed TaskBoard evaluator launch = %+v, %v; first=%+v workers=%+v", replayed, err, launched, launcher.requests)
+	}
+
+	snapshot, err = services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatalf("list TaskBoard after evaluator launch: %v", err)
+	}
+	projected = taskBoardTaskByID(t, snapshot, task.ID)
+	if projected.Evaluator == nil || projected.Evaluator.State != TaskBoardEvaluatorChildActive || projected.Evaluator.CanLaunch || projected.Evaluator.CanAdopt ||
+		projected.Evaluator.ParentRunID != parent.ID || projected.Evaluator.ChildRunID != launched.RunID {
+		t.Fatalf("evaluator child-active projection = %+v", projected.Evaluator)
+	}
+}
+
+type taskBoardEvaluatorDefinitionProvider struct {
+	profile workflowadapter.ExecutionProfile
+	spec    workflowadapter.RunExecutionSpec
+}
+
+func (provider *taskBoardEvaluatorDefinitionProvider) DefinitionForEvaluatorRun(context.Context, EvaluatorRunDefinitionRequest) (EvaluatorRunDefinition, error) {
+	return EvaluatorRunDefinition{Profile: provider.profile.Clone(), ExecutionSpec: provider.spec.Clone()}, nil
+}
+
+type recordingTaskBoardEvaluatorWorkerLauncher struct {
+	requests []RunWorkerHandoffLaunchRequest
+}
+
+func (launcher *recordingTaskBoardEvaluatorWorkerLauncher) LaunchRunWorker(_ context.Context, request RunWorkerHandoffLaunchRequest) (RunWorkerHandoffLaunchReceipt, error) {
+	launcher.requests = append(launcher.requests, request)
+	return RunWorkerHandoffLaunchReceipt{
+		RunID: request.RunID, Owner: request.Owner, ProcessID: 9900 + len(launcher.requests),
+		LogPath: filepath.Join("/tmp", "task-board-evaluator-"+request.HandoffOperationID+".log"),
+	}, nil
 }
 
 func taskBoardTaskByID(t *testing.T, snapshot TaskBoardSnapshot, id string) TaskBoardTask {

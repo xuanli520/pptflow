@@ -24,27 +24,37 @@ const (
 )
 
 type taskBoardGatewayStub struct {
-	snapshot                app.TaskBoardSnapshot
-	startRequests           []app.TaskBoardStartAuthoringRequest
-	decisionRequests        []app.TaskBoardDecideReviewRequest
-	recoveryPreviews        []app.TaskBoardPreviewRunRecoveryRequest
-	retryRequests           []app.TaskBoardRetryRunRequest
-	launchRetryRequests     []app.TaskBoardRetryAuthoringLaunchRequest
-	cancelRequests          []app.TaskBoardCancelRunRequest
-	log                     app.TaskBoardLog
-	startErr                error
-	decisionErr             error
-	recoveryPreview         app.TaskBoardRecoveryPreview
-	recoveryPreviewErr      error
-	recoveryPreviewDeadline time.Time
-	retryErr                error
-	launchRetryErr          error
-	cancelErr               error
-	logErr                  error
-	flushErr                error
-	listCalls               int
-	flushCalls              int
-	keys                    int
+	snapshot                    app.TaskBoardSnapshot
+	startRequests               []app.TaskBoardStartAuthoringRequest
+	decisionRequests            []app.TaskBoardDecideReviewRequest
+	recoveryPreviews            []app.TaskBoardPreviewRunRecoveryRequest
+	retryRequests               []app.TaskBoardRetryRunRequest
+	launchRetryRequests         []app.TaskBoardRetryAuthoringLaunchRequest
+	cancelRequests              []app.TaskBoardCancelRunRequest
+	evaluatorLaunchPreviews     []app.TaskBoardEvaluatorLaunchPreviewRequest
+	evaluatorLaunchRequests     []app.TaskBoardEvaluatorLaunchRequest
+	evaluatorEvidencePreviews   []app.TaskBoardEvaluatorEvidenceHandoffPreviewRequest
+	evaluatorEvidenceRequests   []app.TaskBoardEvaluatorEvidenceHandoffRequest
+	log                         app.TaskBoardLog
+	startErr                    error
+	decisionErr                 error
+	recoveryPreview             app.TaskBoardRecoveryPreview
+	recoveryPreviewErr          error
+	recoveryPreviewDeadline     time.Time
+	retryErr                    error
+	launchRetryErr              error
+	cancelErr                   error
+	logErr                      error
+	evaluatorLaunchPreviewErr   error
+	evaluatorLaunchPrepareErr   error
+	evaluatorLaunchConfirmErr   error
+	evaluatorEvidencePreviewErr error
+	evaluatorEvidencePrepareErr error
+	evaluatorEvidenceAdoptErr   error
+	flushErr                    error
+	listCalls                   int
+	flushCalls                  int
+	keys                        int
 }
 
 func (stub *taskBoardGatewayStub) NewIdempotencyKey() (string, error) {
@@ -115,6 +125,36 @@ func (stub *taskBoardGatewayStub) RetryAuthoringLaunch(_ context.Context, reques
 func (stub *taskBoardGatewayStub) CancelRun(_ context.Context, request app.TaskBoardCancelRunRequest) (app.TaskBoardMutation, error) {
 	stub.cancelRequests = append(stub.cancelRequests, request)
 	return app.TaskBoardMutation{TaskID: request.TaskID, RunID: request.RunID, Summary: "canceled"}, stub.cancelErr
+}
+
+func (stub *taskBoardGatewayStub) PreviewEvaluatorLaunch(_ context.Context, request app.TaskBoardEvaluatorLaunchPreviewRequest) (app.TaskBoardEvaluatorLaunchPreview, error) {
+	stub.evaluatorLaunchPreviews = append(stub.evaluatorLaunchPreviews, request)
+	return app.TaskBoardEvaluatorLaunchPreview{TaskID: request.TaskID, ParentRunID: request.ParentRunID, RevisionID: "revision-1", TemplateID: "harbor.codeedge-evaluator", TemplateVersion: "1.0.0", ExecutionProfileFingerprint: "sha256:profile", ExecutionSpecFingerprint: "sha256:spec"}, stub.evaluatorLaunchPreviewErr
+}
+
+func (stub *taskBoardGatewayStub) PrepareEvaluatorLaunch(_ context.Context, request app.TaskBoardEvaluatorLaunchRequest) (app.TaskBoardPreparedEvaluatorLaunch, error) {
+	stub.evaluatorLaunchRequests = append(stub.evaluatorLaunchRequests, request)
+	return app.TaskBoardPreparedEvaluatorLaunch{TaskID: request.TaskID, ParentRunID: request.ParentRunID, InputBundleID: "bundle-1", ExecutionProfileFingerprint: "sha256:profile", ExecutionSpecFingerprint: "sha256:spec"}, stub.evaluatorLaunchPrepareErr
+}
+
+func (stub *taskBoardGatewayStub) ConfirmEvaluatorLaunch(_ context.Context, request app.TaskBoardEvaluatorLaunchRequest) (app.TaskBoardMutation, error) {
+	stub.evaluatorLaunchRequests = append(stub.evaluatorLaunchRequests, request)
+	return app.TaskBoardMutation{TaskID: request.TaskID, RunID: "child-run", Summary: "evaluator started"}, stub.evaluatorLaunchConfirmErr
+}
+
+func (stub *taskBoardGatewayStub) PreviewEvaluatorEvidenceHandoff(_ context.Context, request app.TaskBoardEvaluatorEvidenceHandoffPreviewRequest) (app.TaskBoardEvaluatorEvidenceHandoffPreview, error) {
+	stub.evaluatorEvidencePreviews = append(stub.evaluatorEvidencePreviews, request)
+	return app.TaskBoardEvaluatorEvidenceHandoffPreview{TaskID: request.TaskID, ParentRunID: request.ParentRunID, ChildRunID: request.ChildRunID, RevisionID: "revision-1", HandoffFingerprint: "sha256:handoff", QwenTrialFingerprint: "sha256:qwen", OpusTrialFingerprint: "sha256:opus"}, stub.evaluatorEvidencePreviewErr
+}
+
+func (stub *taskBoardGatewayStub) PrepareEvaluatorEvidenceHandoff(_ context.Context, request app.TaskBoardEvaluatorEvidenceHandoffRequest) (app.TaskBoardPreparedEvaluatorEvidenceHandoff, error) {
+	stub.evaluatorEvidenceRequests = append(stub.evaluatorEvidenceRequests, request)
+	return app.TaskBoardPreparedEvaluatorEvidenceHandoff{TaskID: request.TaskID, OperationID: "operation-1", ParentRunID: request.ParentRunID, ChildRunID: request.ChildRunID, HandoffFingerprint: "sha256:handoff", QwenTrialFingerprint: "sha256:qwen", OpusTrialFingerprint: "sha256:opus"}, stub.evaluatorEvidencePrepareErr
+}
+
+func (stub *taskBoardGatewayStub) AdoptEvaluatorEvidenceHandoff(_ context.Context, request app.TaskBoardEvaluatorEvidenceHandoffRequest) (app.TaskBoardMutation, error) {
+	stub.evaluatorEvidenceRequests = append(stub.evaluatorEvidenceRequests, request)
+	return app.TaskBoardMutation{TaskID: request.TaskID, RunID: request.ParentRunID, Summary: "evidence adopted"}, stub.evaluatorEvidenceAdoptErr
 }
 
 func (stub *taskBoardGatewayStub) FlushQueuedRuns(context.Context) error {
@@ -506,6 +546,166 @@ func TestDetailRunActionsAndLogsTargetTheCurrentRun(t *testing.T) {
 	model = updated.(appModel)
 	if model.logs == nil || model.logs.path != "/managed/logs/run-1.log" || !strings.Contains(model.logs.content, "second line") {
 		t.Fatalf("loaded log = %+v", model.logs)
+	}
+}
+
+func TestAppModelLaunchesEvaluatorThroughPreviewPrepareConfirmAndRetriesWithOneKey(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].Evaluator = &app.TaskBoardEvaluatorStatus{
+		ParentRunID: "parent-run", State: app.TaskBoardEvaluatorReadyToLaunch, CanLaunch: true,
+	}
+	stub := &taskBoardGatewayStub{
+		snapshot:                  snapshot,
+		evaluatorLaunchConfirmErr: errors.New("worker handoff credential=secret-must-not-render"),
+	}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	if footer := detailFooterText(model.detail); !strings.Contains(footer, "[e] 启动评测") {
+		t.Fatalf("evaluator launch footer = %q", footer)
+	}
+	updated, _ := model.handleKey(keyRune('e'), nil)
+	model = updated.(appModel)
+	if model.evaluatorAction == nil || model.evaluatorAction.kind != evaluatorLaunchAction || model.evaluatorAction.phase != evaluatorActionInput {
+		t.Fatalf("evaluator launch prompt = %+v", model.evaluatorAction)
+	}
+	model.evaluatorAction.reason.SetValue("run the frozen Qwen and Opus evaluator")
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if command == nil || model.activeMutation != taskBoardEvaluatorPreviewMutation {
+		t.Fatalf("evaluator preview start = command:%v active:%q", command, model.activeMutation)
+	}
+	preview := command().(taskBoardEvaluatorPreviewMsg)
+	updated, _ = model.Update(preview)
+	model = updated.(appModel)
+	if len(stub.evaluatorLaunchPreviews) != 1 || stub.evaluatorLaunchPreviews[0].TaskID != "task-1" || stub.evaluatorLaunchPreviews[0].ParentRunID != "parent-run" ||
+		model.evaluatorAction.phase != evaluatorActionPreview || model.activeMutation != "" {
+		t.Fatalf("evaluator launch preview = requests:%+v prompt:%+v active:%q", stub.evaluatorLaunchPreviews, model.evaluatorAction, model.activeMutation)
+	}
+
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if command == nil || model.activeMutation != taskBoardEvaluatorPrepareMutation {
+		t.Fatalf("evaluator prepare start = command:%v active:%q", command, model.activeMutation)
+	}
+	prepared := command().(taskBoardEvaluatorPreparedMsg)
+	updated, _ = model.Update(prepared)
+	model = updated.(appModel)
+	if len(stub.evaluatorLaunchRequests) != 1 || model.evaluatorAction.phase != evaluatorActionPrepared || model.pendingEvaluatorAction == nil {
+		t.Fatalf("evaluator prepare = requests:%+v prompt:%+v pending:%+v", stub.evaluatorLaunchRequests, model.evaluatorAction, model.pendingEvaluatorAction)
+	}
+	key := stub.evaluatorLaunchRequests[0].IdempotencyKey
+	if key == "" || stub.evaluatorLaunchRequests[0].Reason != "run the frozen Qwen and Opus evaluator" {
+		t.Fatalf("evaluator prepare request = %+v", stub.evaluatorLaunchRequests[0])
+	}
+
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	failed := command().(taskBoardMutationMsg)
+	if failed.kind != taskBoardEvaluatorConfirmMutation || len(stub.evaluatorLaunchRequests) != 2 || stub.evaluatorLaunchRequests[1].IdempotencyKey != key {
+		t.Fatalf("evaluator first confirm = message:%+v requests:%+v", failed, stub.evaluatorLaunchRequests)
+	}
+	updated, _ = model.Update(failed)
+	model = updated.(appModel)
+	if model.evaluatorAction == nil || model.evaluatorAction.phase != evaluatorActionPrepared || model.pendingEvaluatorAction == nil || model.pendingEvaluatorAction.key != key {
+		t.Fatalf("failed evaluator confirm lost prepared state: prompt:%+v pending:%+v", model.evaluatorAction, model.pendingEvaluatorAction)
+	}
+	if model.err == nil || strings.Contains(model.err.Error(), "secret-must-not-render") {
+		t.Fatalf("evaluator confirm exposed provider diagnostic: %v", model.err)
+	}
+
+	stub.evaluatorLaunchConfirmErr = nil
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	succeeded := command().(taskBoardMutationMsg)
+	if succeeded.kind != taskBoardEvaluatorConfirmMutation || len(stub.evaluatorLaunchRequests) != 3 || stub.evaluatorLaunchRequests[2].IdempotencyKey != key {
+		t.Fatalf("evaluator retry confirm = message:%+v requests:%+v", succeeded, stub.evaluatorLaunchRequests)
+	}
+	updated, _ = model.Update(succeeded)
+	model = updated.(appModel)
+	if model.evaluatorAction != nil || model.pendingEvaluatorAction != nil || model.detail != nil || model.activeMutation != "" {
+		t.Fatalf("successful evaluator confirm did not close prompt: prompt:%+v pending:%+v detail:%+v active:%q", model.evaluatorAction, model.pendingEvaluatorAction, model.detail, model.activeMutation)
+	}
+}
+
+func TestAppModelAdoptsEvaluatorEvidenceThroughPreviewPrepareAndConfirm(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].Evaluator = &app.TaskBoardEvaluatorStatus{
+		ParentRunID: "parent-run", ChildRunID: "child-run", State: app.TaskBoardEvaluatorReadyToAdopt, CanAdopt: true,
+	}
+	stub := &taskBoardGatewayStub{snapshot: snapshot}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+
+	if footer := detailFooterText(model.detail); !strings.Contains(footer, "[v] 采用评测证据") {
+		t.Fatalf("evaluator evidence footer = %q", footer)
+	}
+	updated, _ := model.handleKey(keyRune('v'), nil)
+	model = updated.(appModel)
+	if model.evaluatorAction == nil || model.evaluatorAction.kind != evaluatorAdoptAction {
+		t.Fatalf("evaluator evidence prompt = %+v", model.evaluatorAction)
+	}
+	model.evaluatorAction.reason.SetValue("adopt verified four-trial Qwen and Opus evidence")
+
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	preview := command().(taskBoardEvaluatorPreviewMsg)
+	updated, _ = model.Update(preview)
+	model = updated.(appModel)
+	if len(stub.evaluatorEvidencePreviews) != 1 || stub.evaluatorEvidencePreviews[0].TaskID != "task-1" ||
+		stub.evaluatorEvidencePreviews[0].ParentRunID != "parent-run" || stub.evaluatorEvidencePreviews[0].ChildRunID != "child-run" ||
+		model.evaluatorAction.phase != evaluatorActionPreview {
+		t.Fatalf("evidence preview = requests:%+v prompt:%+v", stub.evaluatorEvidencePreviews, model.evaluatorAction)
+	}
+
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	prepared := command().(taskBoardEvaluatorPreparedMsg)
+	updated, _ = model.Update(prepared)
+	model = updated.(appModel)
+	if len(stub.evaluatorEvidenceRequests) != 1 || model.evaluatorAction.phase != evaluatorActionPrepared || model.pendingEvaluatorAction == nil {
+		t.Fatalf("evidence prepare = requests:%+v prompt:%+v pending:%+v", stub.evaluatorEvidenceRequests, model.evaluatorAction, model.pendingEvaluatorAction)
+	}
+	key := stub.evaluatorEvidenceRequests[0].IdempotencyKey
+	if key == "" || stub.evaluatorEvidenceRequests[0].Reason != "adopt verified four-trial Qwen and Opus evidence" {
+		t.Fatalf("evidence prepare request = %+v", stub.evaluatorEvidenceRequests[0])
+	}
+
+	updated, command = model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	adopted := command().(taskBoardMutationMsg)
+	if adopted.kind != taskBoardEvaluatorAdoptMutation || len(stub.evaluatorEvidenceRequests) != 2 || stub.evaluatorEvidenceRequests[1].IdempotencyKey != key ||
+		stub.evaluatorEvidenceRequests[1].ParentRunID != "parent-run" || stub.evaluatorEvidenceRequests[1].ChildRunID != "child-run" {
+		t.Fatalf("evidence adoption = message:%+v requests:%+v", adopted, stub.evaluatorEvidenceRequests)
+	}
+	updated, _ = model.Update(adopted)
+	model = updated.(appModel)
+	if model.evaluatorAction != nil || model.pendingEvaluatorAction != nil || model.detail != nil {
+		t.Fatalf("successful evidence adoption did not close prompt: prompt:%+v pending:%+v detail:%+v", model.evaluatorAction, model.pendingEvaluatorAction, model.detail)
+	}
+}
+
+func TestAppModelDoesNotRenderEvaluatorPreviewDiagnostics(t *testing.T) {
+	snapshot := taskBoardTestSnapshot(true)
+	snapshot.Tasks[0].Evaluator = &app.TaskBoardEvaluatorStatus{
+		ParentRunID: "parent-run", State: app.TaskBoardEvaluatorReadyToLaunch, CanLaunch: true,
+	}
+	stub := &taskBoardGatewayStub{
+		snapshot:                  snapshot,
+		evaluatorLaunchPreviewErr: errors.New("provider endpoint=https://private.example token=secret-must-not-render"),
+	}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+	updated, _ := model.handleKey(keyRune('e'), nil)
+	model = updated.(appModel)
+	model.evaluatorAction.reason.SetValue("preview evaluator launch")
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	if model.evaluatorAction == nil || strings.Contains(model.evaluatorAction.validationErr, "secret-must-not-render") ||
+		strings.Contains(model.evaluatorAction.validationErr, "private.example") {
+		t.Fatalf("evaluator preview exposed provider diagnostic: %+v", model.evaluatorAction)
 	}
 }
 
