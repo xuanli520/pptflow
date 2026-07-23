@@ -2,8 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 )
 
 func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
@@ -12,23 +18,28 @@ func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
 		t.Fatal(err)
 	}
 	testCases := []struct {
-		name        string
-		trigger     string
-		fingerprint string
+		name                 string
+		trigger              string
+		fingerprint          string
+		expectsLegacyTrigger bool
 	}{
-		{name: "1.2 only", trigger: legacyV12AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV12ConsolidatedV2SchemaContractFingerprint},
-		{name: "1.2 and 1.3", trigger: legacyV13AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV13ConsolidatedV2SchemaContractFingerprint},
-		{name: "through 1.4", trigger: legacyV14AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV14ConsolidatedV2SchemaContractFingerprint},
-		{name: "through 1.5", trigger: legacyV15AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV15ConsolidatedV2SchemaContractFingerprint},
-		{name: "through 1.6", trigger: legacyV16AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV16ConsolidatedV2SchemaContractFingerprint},
-		{name: "through 1.7", trigger: legacyV17AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV17ConsolidatedV2SchemaContractFingerprint},
+		{name: "1.2 only", trigger: legacyV12AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV12ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
+		{name: "1.2 and 1.3", trigger: legacyV13AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV13ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
+		{name: "through 1.4", trigger: legacyV14AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV14ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
+		{name: "through 1.5", trigger: legacyV15AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV15ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
+		{name: "through 1.6", trigger: legacyV16AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV16ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
+		{name: "through 1.7", trigger: legacyV17AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV17ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
+		{name: "through 1.8", trigger: currentTrigger, fingerprint: legacyV18ConsolidatedV2SchemaContractFingerprint},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			store := tempDB(t)
 			root := store.rootDir
-			if testCase.trigger == currentTrigger {
+			if testCase.expectsLegacyTrigger && testCase.trigger == currentTrigger {
 				t.Fatal("legacy trigger fixture was not changed")
+			}
+			if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
+				t.Fatal(err)
 			}
 			if _, err := store.db.Exec(`DROP TRIGGER ` + authoringPhase1HandoffTriggerName); err != nil {
 				t.Fatal(err)
@@ -78,6 +89,146 @@ func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCodeEdgeEvaluatorChildParentIsDurablyUnique(t *testing.T) {
+	ctx := context.Background()
+	store := tempDB(t)
+	task, revision, parent := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
+	_ = schemaUpgradeEvaluatorChildFixture(t, ctx, store, task, revision, parent, "first")
+	if _, err := schemaUpgradeEvaluatorChild(ctx, store, task, revision, parent, "second"); !errors.Is(err, ErrIdentityCollision) {
+		t.Fatalf("second evaluator child error = %v, want %v", err, ErrIdentityCollision)
+	}
+}
+
+func TestCodeEdgeEvaluatorChildParentUniquenessSurvivesConcurrentWriters(t *testing.T) {
+	ctx := context.Background()
+	store := tempDB(t)
+	task, revision, parent := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
+	const writers = 6
+	start := make(chan struct{})
+	results := make(chan error, writers)
+	var workers sync.WaitGroup
+	for index := 0; index < writers; index++ {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			<-start
+			_, err := schemaUpgradeEvaluatorChild(ctx, store, task, revision, parent, "concurrent-"+string(rune('a'+index)))
+			results <- err
+		}(index)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent evaluator child creations succeeded %d times, want one", successes)
+	}
+	runs, err := store.ListWorkflowRunsForTask(ctx, task.ID)
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("concurrent evaluator child creations persisted runs = %+v, %v", runs, err)
+	}
+	if _, err := schemaUpgradeEvaluatorChild(ctx, store, task, revision, parent, "after-concurrency"); !errors.Is(err, ErrIdentityCollision) {
+		t.Fatalf("post-concurrency evaluator child error = %v, want %v", err, ErrIdentityCollision)
+	}
+}
+
+func TestUpgradeLegacyV18SchemaRejectsDuplicateEvaluatorChildrenWithoutPartialUpgrade(t *testing.T) {
+	ctx := context.Background()
+	store := tempDB(t)
+	root := store.rootDir
+	task, revision, parent := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
+	_ = schemaUpgradeEvaluatorChildFixture(t, ctx, store, task, revision, parent, "first")
+	if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := schemaUpgradeEvaluatorChild(ctx, store, task, revision, parent, "legacy-duplicate"); err != nil {
+		t.Fatalf("create legacy duplicate evaluator child: %v", err)
+	}
+	legacyContract, err := sqliteSchemaContract(store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyContract != legacyV18ConsolidatedV2SchemaContractFingerprint {
+		t.Fatalf("legacy V18 contract = %s, want %s", legacyContract, legacyV18ConsolidatedV2SchemaContractFingerprint)
+	}
+	if _, err := store.db.Exec(`UPDATE store_metadata SET value = ? WHERE key = ?`, legacyContract, baselineV2SchemaContractMetadataKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(root); err == nil || !strings.Contains(err.Error(), "multiple CodeEdge evaluator child Runs") {
+		t.Fatalf("duplicate legacy evaluator children upgrade error = %v", err)
+	}
+	uri, err := sqliteFileURI(filepath.Join(root, dbFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", uri+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var recordedContract string
+	if err := database.QueryRowContext(ctx, `SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
+		t.Fatal(err)
+	}
+	if recordedContract != legacyContract {
+		t.Fatalf("failed legacy upgrade rewrote schema marker = %s, want %s", recordedContract, legacyContract)
+	}
+	var indexCount int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, codeEdgeEvaluatorParentIndexName).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 0 {
+		t.Fatalf("failed legacy upgrade installed evaluator index despite duplicate children")
+	}
+}
+
+func schemaUpgradeEvaluatorParentFixture(t *testing.T, ctx context.Context, store *Store) (TaskV2, TaskRevision, WorkflowRun) {
+	t.Helper()
+	task, revision := createValidatedTaskAndRevision(t, store)
+	parent, err := store.CreateWorkflowRun(ctx, CreateWorkflowRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID,
+		WorkflowTemplateID: workflowadapter.CodeEdgePhase1WorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.CodeEdgePhase1WorkflowTemplateVersion,
+		ResolvedProfileHash: "schema-upgrade-evaluator-parent-profile", DefinitionHash: "schema-upgrade-evaluator-parent-definition", RunManifestJSON: `{}`,
+		Trigger: "schema-upgrade-evaluator-parent", Actor: "tester", Reason: "create evaluator parent fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task, revision, parent
+}
+
+func schemaUpgradeEvaluatorChildFixture(t *testing.T, ctx context.Context, store *Store, task TaskV2, revision TaskRevision, parent WorkflowRun, suffix string) WorkflowRun {
+	t.Helper()
+	child, err := schemaUpgradeEvaluatorChild(ctx, store, task, revision, parent, suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return child
+}
+
+func schemaUpgradeEvaluatorChild(ctx context.Context, store *Store, task TaskV2, revision TaskRevision, parent WorkflowRun, suffix string) (WorkflowRun, error) {
+	return store.CreateWorkflowRun(ctx, CreateWorkflowRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID,
+		WorkflowTemplateID: workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateVersion,
+		ResolvedProfileHash: "schema-upgrade-evaluator-child-profile-" + suffix,
+		DefinitionHash:      "schema-upgrade-evaluator-child-definition-" + suffix,
+		RunManifestJSON:     `{}`,
+		ParentRunID:         parent.ID,
+		Trigger:             "schema-upgrade-evaluator-child",
+		Actor:               "tester",
+		Reason:              "create evaluator child fixture",
+	})
 }
 
 func legacyV12AuthoringPhase1HandoffTrigger(current string) string {

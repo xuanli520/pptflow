@@ -21,6 +21,10 @@ var (
 	// text must not cross into a CLI/TUI response, lifecycle receipt, or audit
 	// payload.
 	ErrCodeEdgeEvaluatorDefinitionInvalid = errors.New("CodeEdge evaluator launch definition did not pass controlled validation")
+	// ErrCodeEdgeEvaluatorChildAlreadyExists preserves the one-canonical-child
+	// boundary for a Phase-1 parent. Store-level uniqueness is the race
+	// authority; this error gives API callers a stable explanation.
+	ErrCodeEdgeEvaluatorChildAlreadyExists = errors.New("CodeEdge evaluator child already exists for the Phase-1 parent")
 )
 
 // EvaluatorRunDefinitionRequest identifies the immutable parent/subject facts
@@ -111,6 +115,11 @@ func (service *CodeEdgeEvaluatorLaunchService) Plan(ctx context.Context, parentR
 	if err != nil {
 		return CodeEdgeEvaluatorLaunchPlan{}, err
 	}
+	if existing, existingErr := service.codeEdgeEvaluatorChildForParent(ctx, parent); existingErr != nil {
+		return CodeEdgeEvaluatorLaunchPlan{}, existingErr
+	} else if existing != nil {
+		return CodeEdgeEvaluatorLaunchPlan{}, fmt.Errorf("%w: parent Run %s", ErrCodeEdgeEvaluatorChildAlreadyExists, parent.ID)
+	}
 	definition, err := service.definitionFor(ctx, parent, revision)
 	if err != nil {
 		return CodeEdgeEvaluatorLaunchPlan{}, err
@@ -144,6 +153,30 @@ func (service *CodeEdgeEvaluatorLaunchService) Prepare(ctx context.Context, comm
 	start, parent, revision, err := service.validateLaunchCommand(ctx, command)
 	if err != nil {
 		return PreparedCodeEdgeEvaluatorLaunch{}, err
+	}
+	// Preserve replay of the original frozen input bundle even after its child
+	// Run exists. A new idempotency key, however, must not freeze a competing
+	// evaluator launch for the same parent.
+	if directoryExists(service.core.layout.runStartInputDirectory(start.IdempotencyKey)) {
+		inputs, inputErr := service.mutations.readFrozenRunStartInputs(LifecycleMutationCodeEdgeEvaluator, start)
+		if inputErr != nil {
+			return PreparedCodeEdgeEvaluatorLaunch{}, inputErr
+		}
+		if inputErr := service.validateFrozenInputs(ctx, parent, revision, start, inputs); inputErr != nil {
+			return PreparedCodeEdgeEvaluatorLaunch{}, inputErr
+		}
+		prepared := preparedStartRunResult(inputs)
+		return PreparedCodeEdgeEvaluatorLaunch{
+			InputBundleID:            prepared.InputBundleID,
+			ParentRunID:              parent.ID,
+			ProfileFingerprint:       prepared.ProfileFingerprint,
+			ExecutionSpecFingerprint: prepared.ExecutionSpecFingerprint,
+		}, nil
+	}
+	if existing, existingErr := service.codeEdgeEvaluatorChildForParent(ctx, parent); existingErr != nil {
+		return PreparedCodeEdgeEvaluatorLaunch{}, existingErr
+	} else if existing != nil {
+		return PreparedCodeEdgeEvaluatorLaunch{}, fmt.Errorf("%w: parent Run %s", ErrCodeEdgeEvaluatorChildAlreadyExists, parent.ID)
 	}
 	inputs, err := service.mutations.prepareRunStartInputs(ctx, LifecycleMutationCodeEdgeEvaluator, start, func() (workflowadapter.ExecutionProfile, workflowadapter.RunExecutionSpec, error) {
 		definition, definitionErr := service.definitionFor(ctx, parent, revision)
@@ -208,6 +241,23 @@ func (service *CodeEdgeEvaluatorLaunchService) confirmRun(ctx context.Context, c
 	start, parent, revision, err := service.validateLaunchCommand(ctx, command)
 	if err != nil {
 		return LifecycleMutationReceipt{}, store.WorkflowRun{}, err
+	}
+	existingChild, err := service.codeEdgeEvaluatorChildForParent(ctx, parent)
+	if err != nil {
+		return LifecycleMutationReceipt{}, store.WorkflowRun{}, err
+	}
+	if existingChild != nil {
+		existingOperation, operationErr := service.core.store.GetLifecycleOperationByIdempotencyKey(ctx, command.IdempotencyKey)
+		if operationErr != nil {
+			return LifecycleMutationReceipt{}, store.WorkflowRun{}, operationErr
+		}
+		// A crash after creating the child but before completing the lifecycle
+		// receipt must be resumable by the same operation. Every other child is
+		// a competing evaluator invocation and is rejected before any worker
+		// launch can occur.
+		if existingOperation == nil || existingOperation.Action != string(LifecycleMutationCodeEdgeEvaluator) || existingOperation.RunID != existingChild.ID {
+			return LifecycleMutationReceipt{}, store.WorkflowRun{}, fmt.Errorf("%w: parent Run %s", ErrCodeEdgeEvaluatorChildAlreadyExists, parent.ID)
+		}
 	}
 	inputs, err := service.mutations.readFrozenRunStartInputs(LifecycleMutationCodeEdgeEvaluator, start)
 	if err != nil {
@@ -291,10 +341,39 @@ func (service *CodeEdgeEvaluatorLaunchService) confirmRun(ctx context.Context, c
 		Reason:                        op.Reason,
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrIdentityCollision) {
+			if child, childErr := service.codeEdgeEvaluatorChildForParent(ctx, parent); childErr != nil {
+				return LifecycleMutationReceipt{}, store.WorkflowRun{}, childErr
+			} else if child != nil {
+				return LifecycleMutationReceipt{}, store.WorkflowRun{}, fmt.Errorf("%w: parent Run %s", ErrCodeEdgeEvaluatorChildAlreadyExists, parent.ID)
+			}
+		}
 		return LifecycleMutationReceipt{}, store.WorkflowRun{}, err
 	}
 	receipt, completeErr := service.mutations.complete(ctx, op, codeEdgeEvaluatorRunReceipt(run))
 	return receipt, run, completeErr
+}
+
+func (service *CodeEdgeEvaluatorLaunchService) codeEdgeEvaluatorChildForParent(ctx context.Context, parent store.WorkflowRun) (*store.WorkflowRun, error) {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return nil, fmt.Errorf("CodeEdge evaluator launch service is not configured")
+	}
+	runs, err := service.core.store.ListWorkflowRunsForTask(ctx, parent.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	var child *store.WorkflowRun
+	for index := range runs {
+		run := runs[index]
+		if run.ParentRunID != parent.ID || run.WorkflowTemplateID != workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplateID {
+			continue
+		}
+		if child != nil {
+			return nil, fmt.Errorf("%w: parent Run %s has multiple persisted children", ErrCodeEdgeEvaluatorChildAlreadyExists, parent.ID)
+		}
+		child = &run
+	}
+	return child, nil
 }
 
 func (service *CodeEdgeEvaluatorLaunchService) launchWorker(ctx context.Context, run store.WorkflowRun, lifecycleOperationID string, launcher RunWorkerHandoffLauncher) (store.RunWorkerHandoff, error) {

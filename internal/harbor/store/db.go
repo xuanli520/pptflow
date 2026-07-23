@@ -43,7 +43,9 @@ const (
 	legacyV15ConsolidatedV2SchemaContractFingerprint = "sha256:606157ed9098dc3c5e5006599f560cc01200a053ec5dae8f32e0ec40ebc33a7f"
 	legacyV16ConsolidatedV2SchemaContractFingerprint = "sha256:2bafc3dec0fae16478ad404afb0a1c25bf419267d977faaebe63afbe08a0beb6"
 	legacyV17ConsolidatedV2SchemaContractFingerprint = "sha256:8fd4320d04b231bd700596d85827d0a9cdd787cd346bcf0cf5c9c79642283162"
+	legacyV18ConsolidatedV2SchemaContractFingerprint = "sha256:db5f4c05610a9905b43e981f1955d7c007867f508e6422fb762d7f847d744571"
 	authoringPhase1HandoffTriggerName                = "authoring_phase1_handoffs_v2_binding_insert"
+	codeEdgeEvaluatorParentIndexName                 = "idx_workflow_runs_codeedge_evaluator_parent"
 )
 
 type sqliteSchemaContractObject struct {
@@ -637,11 +639,11 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) e
 	return nil
 }
 
-// upgradeLegacyConsolidatedV2Schema repairs the published V2 contracts that
-// predate the current Standard authoring handoff. The trigger replacement and
-// contract marker update are one transaction, so an interrupted startup leaves
-// the old, internally consistent schema for the next attempt. No unknown
-// schema is admitted here.
+// upgradeLegacyConsolidatedV2Schema repairs published V2 contracts that
+// predate the current Standard authoring handoff or evaluator-child uniqueness
+// boundary. The DDL replacement and contract marker update are one transaction,
+// so an interrupted startup leaves the old, internally consistent schema for
+// the next attempt. No unknown schema is admitted here.
 func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 	var recordedContract string
 	if err := s.db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
@@ -673,6 +675,30 @@ func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
 	if _, err := tx.Exec(triggerSQL); err != nil {
 		return fmt.Errorf("install upgraded Standard authoring handoff trigger: %w", err)
 	}
+	var duplicateParentRunID string
+	err = tx.QueryRowContext(context.Background(), `
+		SELECT parent_run_id
+		FROM workflow_runs
+		WHERE parent_run_id IS NOT NULL
+		  AND workflow_template_id = 'harbor.codeedge-evaluator'
+		GROUP BY parent_run_id
+		HAVING COUNT(*) > 1
+		ORDER BY parent_run_id
+		LIMIT 1
+	`).Scan(&duplicateParentRunID)
+	if err == nil {
+		return fmt.Errorf("cannot upgrade V2 schema: Phase-1 parent %s has multiple CodeEdge evaluator child Runs", duplicateParentRunID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("check legacy CodeEdge evaluator child uniqueness: %w", err)
+	}
+	indexSQL, err := currentCodeEdgeEvaluatorParentIndexSQL()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(indexSQL); err != nil {
+		return fmt.Errorf("install CodeEdge evaluator child uniqueness index: %w", err)
+	}
 	if _, err := tx.Exec(`UPDATE store_metadata SET value = ?, updated_at = ? WHERE key = ?`, expectedContract, s.now().UTC(), baselineV2SchemaContractMetadataKey); err != nil {
 		return fmt.Errorf("record upgraded V2 schema contract: %w", err)
 	}
@@ -686,7 +712,8 @@ func isKnownLegacyConsolidatedV2SchemaContract(fingerprint string) bool {
 	switch fingerprint {
 	case legacyV12ConsolidatedV2SchemaContractFingerprint, legacyV13ConsolidatedV2SchemaContractFingerprint,
 		legacyV14ConsolidatedV2SchemaContractFingerprint, legacyV15ConsolidatedV2SchemaContractFingerprint,
-		legacyV16ConsolidatedV2SchemaContractFingerprint, legacyV17ConsolidatedV2SchemaContractFingerprint:
+		legacyV16ConsolidatedV2SchemaContractFingerprint, legacyV17ConsolidatedV2SchemaContractFingerprint,
+		legacyV18ConsolidatedV2SchemaContractFingerprint:
 		return true
 	default:
 		return false
@@ -703,6 +730,20 @@ func currentAuthoringPhase1HandoffTriggerSQL() (string, error) {
 	relativeEnd := strings.Index(migrationV2[start:], endMarker)
 	if relativeEnd < 0 {
 		return "", fmt.Errorf("current Standard authoring handoff trigger boundary is missing from V2 migration")
+	}
+	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
+}
+
+func currentCodeEdgeEvaluatorParentIndexSQL() (string, error) {
+	startMarker := "CREATE UNIQUE INDEX " + codeEdgeEvaluatorParentIndexName
+	start := strings.Index(migrationV2, startMarker)
+	if start < 0 {
+		return "", fmt.Errorf("current CodeEdge evaluator child uniqueness index is missing from V2 migration")
+	}
+	endMarker := "\n\n-- index idx_workflow_runs_status"
+	relativeEnd := strings.Index(migrationV2[start:], endMarker)
+	if relativeEnd < 0 {
+		return "", fmt.Errorf("current CodeEdge evaluator child uniqueness index boundary is missing from V2 migration")
 	}
 	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
 }

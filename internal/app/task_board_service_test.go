@@ -1090,60 +1090,47 @@ func TestTaskBoardProjectsAndAdoptsVerifiedEvaluatorEvidence(t *testing.T) {
 	}
 }
 
+func TestTaskBoardEvaluatorEvidenceAdoptionRejectsParentCheckpointDrift(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{stopBeforeHandoff: true})
+	fixture.services.TaskBoard.actor = func() (string, error) { return "task-board-evaluator-drift", nil }
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := TaskBoardEvaluatorEvidenceHandoffRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, ParentRunID: fixture.run.ID, ChildRunID: fixture.childRun.ID,
+		Reason: "reject stale evaluator evidence adoption after parent checkpoint drift",
+	}
+	if _, err := fixture.services.TaskBoard.PrepareEvaluatorEvidenceHandoff(ctx, request); err != nil {
+		t.Fatalf("prepare evaluator evidence adoption before parent drift: %v", err)
+	}
+	parent, err := fixture.database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: fixture.run.ID, ExpectedVersion: fixture.run.Version, Status: store.WorkflowRunWaitingContinuation,
+		Actor: "task-board-evaluator-drift", Reason: "advance parent checkpoint after evidence prepare",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
+		Actor: "task-board-evaluator-drift", Reason: "restore parent fixture after checkpoint drift",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.TaskBoard.AdoptEvaluatorEvidenceHandoff(ctx, request); !errors.Is(err, store.ErrOptimisticLock) {
+		t.Fatalf("stale evaluator evidence adoption error = %v, want %v", err, store.ErrOptimisticLock)
+	}
+	if handoff, lookupErr := fixture.database.GetCodeEdgeEvaluatorEvidenceHandoffForParentRun(ctx, fixture.run.ID); lookupErr != nil || handoff != nil {
+		t.Fatalf("stale evaluator evidence adoption persisted handoff = %+v, %v", handoff, lookupErr)
+	}
+}
+
 func TestTaskBoardLaunchesEvaluatorThroughControlledWorkerHandoff(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
-	database, err := store.OpenForTest(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	provider := &taskBoardEvaluatorDefinitionProvider{profile: codeEdgeEvaluatorRuntimeProfile(t)}
-	launcher := &recordingTaskBoardEvaluatorWorkerLauncher{}
-	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		OperationResolver:              testsupport.AcceptAllStageOperationResolver(),
-		EvaluatorRunDefinitionProvider: provider,
-		RunWorkerHandoffLauncher:       launcher,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	services.TaskBoard.actor = func() (string, error) { return "task-board-evaluator", nil }
-	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
-		CreateDraftTaskRequest: CreateDraftTaskRequest{
-			Slug: "task-board-evaluator-launch", Title: "Task Board Evaluator Launch", Actor: "task-board-evaluator", Reason: "create evaluator launch fixture",
-		},
-		SourceDirectory: writeLifecycleSnapshot(t, "TaskBoard evaluator launch fixture\n"),
-		ChangeSummary:   "create immutable evaluator launch fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	provider.spec = testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
-	parent, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID,
-		Profile:       codeEdgePhase1RuntimeProfile(t),
-		ExecutionSpec: testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
-		Trigger:       "task-board-evaluator-launch", Actor: "task-board-evaluator", Reason: "freeze evaluator parent fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	parent, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
-		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
-		Actor: "task-board-evaluator", Reason: "open approved final review fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	parent = seedApprovedCodeEdgeReviewGate(t, ctx, services, parent, revision, workflowadapter.FinalReview, workflowadapter.ReviewFinalQuality)
-	parent, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
-		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
-		Actor: "task-board-evaluator", Reason: "continue after approved final review fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := newTaskBoardEvaluatorLaunchFixture(t, ctx)
+	services, database := fixture.services, fixture.database
+	task, revision, parent, launcher := fixture.task, fixture.revision, fixture.parent, fixture.launcher
 
 	snapshot, err := services.TaskBoard.List(ctx)
 	if err != nil {
@@ -1196,6 +1183,17 @@ func TestTaskBoardLaunchesEvaluatorThroughControlledWorkerHandoff(t *testing.T) 
 	if err != nil || len(runs) != 1 || runs[0].ID != parent.ID {
 		t.Fatalf("prepare created evaluator child Run: %+v, %v", runs, err)
 	}
+	secondKey, err := services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := TaskBoardEvaluatorLaunchRequest{
+		IdempotencyKey: secondKey, TaskID: task.ID, ParentRunID: parent.ID,
+		Reason: "prepare a competing evaluator child before the first confirmation",
+	}
+	if _, prepareErr := services.TaskBoard.PrepareEvaluatorLaunch(ctx, secondRequest); prepareErr != nil {
+		t.Fatalf("prepare competing evaluator launch before first confirmation: %v", prepareErr)
+	}
 
 	launched, err := services.TaskBoard.ConfirmEvaluatorLaunch(ctx, request)
 	if err != nil {
@@ -1211,6 +1209,19 @@ func TestTaskBoardLaunchesEvaluatorThroughControlledWorkerHandoff(t *testing.T) 
 	if err != nil || replayed.RunID != launched.RunID || replayed.OperationID != launched.OperationID || len(launcher.requests) != 1 {
 		t.Fatalf("replayed TaskBoard evaluator launch = %+v, %v; first=%+v workers=%+v", replayed, err, launched, launcher.requests)
 	}
+	if _, secondErr := services.TaskBoard.ConfirmEvaluatorLaunch(ctx, secondRequest); !errors.Is(secondErr, ErrCodeEdgeEvaluatorChildAlreadyExists) {
+		t.Fatalf("competing evaluator confirmation error = %v, want %v", secondErr, ErrCodeEdgeEvaluatorChildAlreadyExists)
+	}
+	if len(launcher.requests) != 1 {
+		t.Fatalf("competing evaluator confirmation launched another worker: %+v", launcher.requests)
+	}
+	runs, err = database.ListWorkflowRunsForTask(ctx, task.ID)
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("competing evaluator confirmation changed child Run count: %+v, %v", runs, err)
+	}
+	if _, previewErr := services.TaskBoard.PreviewEvaluatorLaunch(ctx, TaskBoardEvaluatorLaunchPreviewRequest{TaskID: task.ID, ParentRunID: parent.ID}); !errors.Is(previewErr, ErrCodeEdgeEvaluatorChildAlreadyExists) {
+		t.Fatalf("second evaluator launch preview error = %v, want %v", previewErr, ErrCodeEdgeEvaluatorChildAlreadyExists)
+	}
 
 	snapshot, err = services.TaskBoard.List(ctx)
 	if err != nil {
@@ -1220,6 +1231,114 @@ func TestTaskBoardLaunchesEvaluatorThroughControlledWorkerHandoff(t *testing.T) 
 	if projected.Evaluator == nil || projected.Evaluator.State != TaskBoardEvaluatorChildActive || projected.Evaluator.CanLaunch || projected.Evaluator.CanAdopt ||
 		projected.Evaluator.ParentRunID != parent.ID || projected.Evaluator.ChildRunID != launched.RunID {
 		t.Fatalf("evaluator child-active projection = %+v", projected.Evaluator)
+	}
+}
+
+func TestTaskBoardEvaluatorLaunchRejectsParentCheckpointDriftAfterPrepare(t *testing.T) {
+	ctx := context.Background()
+	fixture := newTaskBoardEvaluatorLaunchFixture(t, ctx)
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := TaskBoardEvaluatorLaunchRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, ParentRunID: fixture.parent.ID,
+		Reason: "reject stale evaluator confirmation after parent checkpoint drift",
+	}
+	if _, err := fixture.services.TaskBoard.PrepareEvaluatorLaunch(ctx, request); err != nil {
+		t.Fatalf("prepare evaluator launch before parent drift: %v", err)
+	}
+	parent, err := fixture.database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: fixture.parent.ID, ExpectedVersion: fixture.parent.Version, Status: store.WorkflowRunWaitingContinuation,
+		Actor: "task-board-evaluator", Reason: "advance parent checkpoint after evaluator prepare",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err = fixture.database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
+		Actor: "task-board-evaluator", Reason: "restore parent fixture after checkpoint drift",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.TaskBoard.ConfirmEvaluatorLaunch(ctx, request); !errors.Is(err, store.ErrIdempotencyConflict) {
+		t.Fatalf("stale evaluator confirmation error = %v, want %v", err, store.ErrIdempotencyConflict)
+	}
+	if len(fixture.launcher.requests) != 0 {
+		t.Fatalf("stale evaluator confirmation launched a worker: %+v", fixture.launcher.requests)
+	}
+	runs, err := fixture.database.ListWorkflowRunsForTask(ctx, fixture.task.ID)
+	if err != nil || len(runs) != 1 || runs[0].ID != fixture.parent.ID {
+		t.Fatalf("stale evaluator confirmation created a child Run: %+v, %v", runs, err)
+	}
+}
+
+type taskBoardEvaluatorLaunchFixture struct {
+	database *store.Store
+	services *LifecycleServices
+	task     store.TaskV2
+	revision store.TaskRevision
+	parent   store.WorkflowRun
+	launcher *recordingTaskBoardEvaluatorWorkerLauncher
+}
+
+func newTaskBoardEvaluatorLaunchFixture(t *testing.T, ctx context.Context) taskBoardEvaluatorLaunchFixture {
+	t.Helper()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	provider := &taskBoardEvaluatorDefinitionProvider{profile: codeEdgeEvaluatorRuntimeProfile(t)}
+	launcher := &recordingTaskBoardEvaluatorWorkerLauncher{}
+	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+		OperationResolver:              testsupport.AcceptAllStageOperationResolver(),
+		EvaluatorRunDefinitionProvider: provider,
+		RunWorkerHandoffLauncher:       launcher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.TaskBoard.actor = func() (string, error) { return "task-board-evaluator", nil }
+	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
+		CreateDraftTaskRequest: CreateDraftTaskRequest{
+			Slug: "task-board-evaluator-launch", Title: "Task Board Evaluator Launch", Actor: "task-board-evaluator", Reason: "create evaluator launch fixture",
+		},
+		SourceDirectory: writeLifecycleSnapshot(t, "TaskBoard evaluator launch fixture\n"),
+		ChangeSummary:   "create immutable evaluator launch fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.spec = testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	parent, err := services.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID,
+		Profile:       codeEdgePhase1RuntimeProfile(t),
+		ExecutionSpec: testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
+		Trigger:       "task-board-evaluator-launch", Actor: "task-board-evaluator", Reason: "freeze evaluator parent fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
+		Actor: "task-board-evaluator", Reason: "open approved final review fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent = seedApprovedCodeEdgeReviewGate(t, ctx, services, parent, revision, workflowadapter.FinalReview, workflowadapter.ReviewFinalQuality)
+	parent, err = database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: parent.ID, ExpectedVersion: parent.Version, Status: store.WorkflowRunRunning,
+		Actor: "task-board-evaluator", Reason: "continue after approved final review fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return taskBoardEvaluatorLaunchFixture{
+		database: database, services: services, task: task, revision: revision, parent: parent, launcher: launcher,
 	}
 }
 

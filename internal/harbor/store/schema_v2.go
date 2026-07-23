@@ -1735,6 +1735,15 @@ CREATE UNIQUE INDEX idx_workflow_runs_authoring_session
     ON workflow_runs(authoring_session_id)
     WHERE authoring_session_id IS NOT NULL;
 
+-- index idx_workflow_runs_codeedge_evaluator_parent
+-- A Phase-1 parent has one canonical evaluator child. This durable boundary
+-- prevents a second Qwen/Opus trial set from being created by a concurrent or
+-- direct lifecycle caller with a different idempotency key.
+CREATE UNIQUE INDEX idx_workflow_runs_codeedge_evaluator_parent
+    ON workflow_runs(parent_run_id)
+    WHERE parent_run_id IS NOT NULL
+      AND workflow_template_id = 'harbor.codeedge-evaluator';
+
 -- index idx_workflow_runs_status
 CREATE INDEX idx_workflow_runs_status ON workflow_runs(status);
 
