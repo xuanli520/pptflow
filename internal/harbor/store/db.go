@@ -255,9 +255,25 @@ func openWritable(rootDir string, backupTestMode bool) (*Store, error) {
 	if backupTestMode {
 		return s, nil
 	}
-	if _, err := s.BackupIfDue(context.Background()); err != nil {
+	// A fresh control-plane root must not accept writes until it has a verified
+	// recovery snapshot. For an existing root, proving every historical backup
+	// can involve opening many SQLite files and must not block an interactive
+	// client before its first screen is rendered. The background loop performs
+	// that full admission immediately after Open returns.
+	hasCandidate, err := s.hasPublishedBackupCandidate()
+	if err != nil {
 		_ = s.db.Close()
-		return nil, fmt.Errorf("create initial verified backup: %w", err)
+		return nil, fmt.Errorf("inspect existing backup candidates: %w", err)
+	}
+	if !hasCandidate {
+		if _, err := s.BackupNow(context.Background(), "interval"); err != nil {
+			_ = s.db.Close()
+			return nil, fmt.Errorf("create initial verified backup: %w", err)
+		}
+	}
+	if !hasCandidate && s.verifiedBackup == nil {
+		_ = s.db.Close()
+		return nil, fmt.Errorf("create initial verified backup did not produce a recovery record")
 	}
 	s.startBackupLoop()
 	return s, nil

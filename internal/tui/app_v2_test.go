@@ -179,8 +179,16 @@ func loadedTaskBoardModel(t *testing.T, stub *taskBoardGatewayStub) appModel {
 	t.Helper()
 	model := newAppModelWithGateway(context.Background(), stub)
 	updated, command := model.Update(taskBoardLoadedMsg{snapshot: stub.snapshot, epoch: 1})
+	model = updated.(appModel)
+	if command == nil {
+		t.Fatal("load update did not schedule queued-run activation")
+	}
+	// The command runs concurrently in the real program. Mark it complete
+	// without executing the stub so focused interaction tests do not inherit
+	// an unrelated durable activation side effect.
+	updated, command = model.Update(taskBoardActivationMsg{})
 	if command != nil {
-		t.Fatal("load update unexpectedly returned a command")
+		t.Fatal("activation update unexpectedly returned a command")
 	}
 	return updated.(appModel)
 }
@@ -399,17 +407,24 @@ func TestAppModelRetainsBaseImageAfterFailedStartAndClearsItAfterSuccess(t *test
 	}
 }
 
-func TestAppModelRefreshesQueuedRunsAndGatesUnavailableAuthoring(t *testing.T) {
+func TestAppModelDisplaysBoardBeforeActivatingQueuedRuns(t *testing.T) {
 	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(false)}
 	model := newAppModelWithGateway(context.Background(), stub)
 	message := model.refreshTasks(1)()
 	loaded, ok := message.(taskBoardLoadedMsg)
-	if !ok || stub.flushCalls != 1 || stub.listCalls != 1 {
+	if !ok || stub.flushCalls != 0 || stub.listCalls != 1 {
 		t.Fatalf("startup refresh = %#v, flushes=%d lists=%d", message, stub.flushCalls, stub.listCalls)
 	}
-	updated, _ := model.Update(loaded)
+	updated, command := model.Update(loaded)
 	model = updated.(appModel)
-	updated, command := model.handleKey(keyRune('n'), nil)
+	if !model.activationInFlight || command == nil {
+		t.Fatalf("board load did not schedule deferred activation: inFlight=%t command=%v", model.activationInFlight, command)
+	}
+	activation, ok := command().(taskBoardActivationMsg)
+	if !ok || activation.err != nil || stub.flushCalls != 1 {
+		t.Fatalf("deferred activation = %#v, flushes=%d", activation, stub.flushCalls)
+	}
+	updated, command = model.handleKey(keyRune('n'), nil)
 	if command != nil {
 		t.Fatal("unavailable authoring unexpectedly opened a form command")
 	}
@@ -1053,8 +1068,11 @@ func TestAppModelCancelsDeferredRunActionBeforeRefreshCompletes(t *testing.T) {
 	}
 	updated, command = model.Update(taskBoardLoadedMsg{snapshot: stub.snapshot, epoch: model.refreshEpoch})
 	model = updated.(appModel)
-	if command != nil || model.activeMutation != "" || len(stub.retryRequests) != 0 {
+	if command == nil || model.activeMutation != "" || len(stub.retryRequests) != 0 {
 		t.Fatalf("canceled deferred action was dispatched: command:%v active:%q requests:%+v", command, model.activeMutation, stub.retryRequests)
+	}
+	if message, ok := command().(taskBoardActivationMsg); !ok || message.err != nil {
+		t.Fatalf("board refresh after cancellation = %#v", message)
 	}
 }
 
@@ -1129,6 +1147,33 @@ func TestAppModelRequestsAuthoringChangesThenDispatchesRepairContinuation(t *tes
 	if len(stub.retryRequests) != 1 || stub.retryRequests[0].TaskID != "task-1" || stub.retryRequests[0].RunID != "run-1" ||
 		stub.retryRequests[0].Reason != "regenerate with the review feedback" {
 		t.Fatalf("repair continuation dispatch = %+v", stub.retryRequests)
+	}
+}
+
+func TestAppModelSendsUntruncatedRequestChangesReasonThroughGateway(t *testing.T) {
+	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+	wantReason := strings.TrimSpace(strings.Repeat("correct the task-facing Tower HTTP public API contract; ", 8))
+	if len(wantReason) <= 240 {
+		t.Fatalf("test reason must exceed the former limit: %d", len(wantReason))
+	}
+
+	updated, _ := model.handleKey(keyRune('r'), nil)
+	model = updated.(appModel)
+	if model.review == nil || model.review.decision != app.TaskBoardRequestChanges {
+		t.Fatalf("request-changes prompt = %+v", model.review)
+	}
+	model.review.reasonInput.SetValue(wantReason)
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	if model.activeMutation != taskBoardReviewMutation || command == nil {
+		t.Fatalf("request-changes start = active:%q command:%v", model.activeMutation, command)
+	}
+	_ = command().(taskBoardMutationMsg)
+	if len(stub.decisionRequests) != 1 || stub.decisionRequests[0].Decision != app.TaskBoardRequestChanges ||
+		stub.decisionRequests[0].Reason != wantReason {
+		t.Fatalf("request-changes dispatch = %+v, want reason length %d", stub.decisionRequests, len(wantReason))
 	}
 }
 

@@ -69,6 +69,37 @@ func (s *Store) BackupIfDue(ctx context.Context) (*BackupRecord, error) {
 	return created, err
 }
 
+// hasPublishedBackupCandidate performs only the startup-safe portion of backup
+// discovery. Full SQLite integrity admission remains in BackupIfDue and
+// recovery paths; this prevents a large historical backup directory from
+// delaying an otherwise healthy interactive control-plane open.
+func (s *Store) hasPublishedBackupCandidate() (bool, error) {
+	if s == nil {
+		return false, errors.New("store is not configured")
+	}
+	entries, err := os.ReadDir(s.backupDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	manifests := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasSuffix(entry.Name(), ".sqlite.json") {
+			manifests[strings.TrimSuffix(entry.Name(), ".json")] = struct{}{}
+		}
+	}
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasSuffix(entry.Name(), ".sqlite") {
+			if _, ok := manifests[entry.Name()]; ok {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 func (s *Store) withIntervalBackupLock(ctx context.Context, action func() error) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -305,15 +336,19 @@ func (s *Store) startBackupLoop() {
 		ticker := time.NewTicker(verifiedBackupInterval)
 		defer ticker.Stop()
 		defer close(s.backupDone)
+		runBackup := func() {
+			_, err := s.BackupIfDue(context.Background())
+			s.backupErrMu.Lock()
+			s.lastBackupErr = err
+			s.backupErrMu.Unlock()
+		}
+		runBackup()
 		for {
 			select {
 			case <-s.backupStop:
 				return
 			case <-ticker.C:
-				_, err := s.BackupIfDue(context.Background())
-				s.backupErrMu.Lock()
-				s.lastBackupErr = err
-				s.backupErrMu.Unlock()
+				runBackup()
 			}
 		}
 	}()

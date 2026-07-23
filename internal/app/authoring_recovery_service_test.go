@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -151,6 +152,56 @@ func TestAuthoringRecoveryAllowsMissingOutputSubmissionProcessFailure(t *testing
 		t.Fatalf("preview missing-output authoring recovery: %v", err)
 	}
 	assertAuthoringRecoveryPlan(t, plan, fixture)
+}
+
+func TestAuthoringRecoveryAllowsQuotaAdmissionRetryOnlyAfterOwnerGrant(t *testing.T) {
+	ctx := context.Background()
+	fixture, outputAccount := newQuotaExhaustedAuthoringRecoveryFixture(t, ctx)
+
+	if available, reason, err := fixture.services.AuthoringRecovery.CanRecover(ctx, fixture.run.ID); err != nil || available || !strings.Contains(reason, "frozen retry policy") {
+		t.Fatalf("quota exhaustion without grant availability = %t, %q, %v", available, reason, err)
+	}
+	wrongOwnerGrant, err := fixture.store.GrantQuota(ctx, store.GrantBudgetRequest{
+		IdempotencyKey: authoringRecoveryUUID(t), ScopeKind: store.QuotaScopeTask, ScopeID: fixture.task.ID,
+		Dimension: "output_submission", DeltaUnits: 64, ExpectedVersion: outputAccount.Version,
+		Actor: "not-the-task-owner", Reason: "attempt non-owner quota recovery grant",
+	})
+	if err != nil {
+		t.Fatalf("record non-owner quota grant fixture: %v", err)
+	}
+	if available, reason, err := fixture.services.AuthoringRecovery.CanRecover(ctx, fixture.run.ID); err != nil || available || !strings.Contains(reason, "frozen retry policy") {
+		t.Fatalf("quota exhaustion after non-owner grant availability = %t, %q, %v", available, reason, err)
+	}
+	if _, err := fixture.services.Budgets.GrantRunBudget(ctx, GrantRunBudgetRequest{
+		RunID: fixture.run.ID, IdempotencyKey: authoringRecoveryUUID(t), Dimension: "output_submission", DeltaUnits: 64,
+		ExpectedVersion: wrongOwnerGrant.Version, Actor: "author", Reason: "owner approves quota recovery for rejected Docker validation",
+	}); err != nil {
+		t.Fatalf("grant owner quota for recoverable admission: %v", err)
+	}
+	if available, reason, err := fixture.services.AuthoringRecovery.CanRecover(ctx, fixture.run.ID); err != nil || !available || reason != "" {
+		t.Fatalf("quota exhaustion after owner grant availability = %t, %q, %v", available, reason, err)
+	}
+}
+
+func TestAuthoringRecoveryKeepsUnrelatedPolicyFailureNonRecoverableAfterOwnerGrant(t *testing.T) {
+	ctx := context.Background()
+	fixture := newUnrelatedPolicyAuthoringRecoveryFixture(t, ctx)
+	account, err := fixture.store.CreateQuotaAccount(ctx, store.CreateQuotaAccountRequest{
+		ScopeKind: store.QuotaScopeTask, ScopeID: fixture.task.ID, Dimension: "output_submission", LimitUnits: 64,
+		Actor: "author", Reason: "configure unrelated policy failure quota fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.Budgets.GrantRunBudget(ctx, GrantRunBudgetRequest{
+		RunID: fixture.run.ID, IdempotencyKey: authoringRecoveryUUID(t), Dimension: "output_submission", DeltaUnits: 64,
+		ExpectedVersion: account.Version, Actor: "author", Reason: "owner grants capacity unrelated to policy failure",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if available, reason, err := fixture.services.AuthoringRecovery.CanRecover(ctx, fixture.run.ID); err != nil || available || !strings.Contains(reason, "frozen retry policy") {
+		t.Fatalf("unrelated policy failure availability = %t, %q, %v", available, reason, err)
+	}
 }
 
 func TestAuthoringRecoveryRejectsWaitingContinuationWithoutWritingRecoveryState(t *testing.T) {
@@ -493,6 +544,92 @@ func TestAuthoringReviewRecoveryRegeneratesReviewedProducers(t *testing.T) {
 				t.Fatalf("review recovery selection=%+v", selection)
 			}
 		})
+	}
+}
+
+func TestAuthoringContentReviewRecoverySchedulesPackageClosure(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflowFingerprint, err := workflow.Descriptor.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyInputs, err := workflowkit.FingerprintArtifactBindings(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := continuationRunState{
+		Latest: map[workflowkit.NodeID]store.StageAttempt{
+			workflowkit.NodeID(workflowadapter.ContentReview): {
+				ID:              "content-repair",
+				StageKey:        workflowadapter.ContentReview,
+				ExecutionStatus: store.StageExecutionCompleted,
+				Verdict:         store.VerdictNeedsRepair,
+			},
+		},
+		ReuseStates: make([]workflowkit.StageReuseState, 0, len(workflow.Descriptor.Stages)),
+	}
+	for _, stage := range workflow.Descriptor.Stages {
+		state.ReuseStates = append(state.ReuseStates, workflowkit.StageReuseState{
+			NodeID:                   stage.Key,
+			Present:                  true,
+			ArtifactsIntact:          true,
+			ExpectedInputFingerprint: emptyInputs,
+		})
+	}
+	selection, err := authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidation, err := workflowkit.PlanInvalidation(workflow.Descriptor, workflowkit.InvalidationRequest{
+		RecomputeNodes: selection.targetNodeIDs,
+		ReuseStates:    state.ReuseStates,
+		Matcher:        workflowadapter.HarborResourceMatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subjectDigest := workflowkit.SubjectDigest(workflowkit.SHA256Fingerprint([]byte("authoring-source")))
+	checkpoint := workflowkit.CheckpointRef{
+		Sequence: 1, ExecutionEpoch: 1, SubjectID: "authoring-source", SubjectRevisionID: "authoring-session",
+		SubjectDigest: subjectDigest, WorkflowFingerprint: workflowFingerprint,
+	}
+	snapshot, err := buildAuthoringRecoveryPlan("plan", "command", normalizedAuthoringRecoveryCommand{
+		Expected: checkpoint, TargetNodeIDs: selection.targetNodeIDs,
+	}, store.WorkflowRun{ID: "run", ExecutionEpoch: 1, DefinitionHash: string(workflowFingerprint)}, workflowRunSubject{
+		Binding: workflowkit.SubjectBinding{
+			SubjectID: checkpoint.SubjectID, RevisionID: checkpoint.SubjectRevisionID, Digest: subjectDigest,
+		},
+		Kind:             store.WorkflowRunSubjectAuthoringSession,
+		AuthoringSource:  &store.AuthoringSource{ID: checkpoint.SubjectID, SnapshotContentDigest: string(subjectDigest)},
+		AuthoringSession: &store.AuthoringSession{ID: checkpoint.SubjectRevisionID},
+	}, workflow.Descriptor, state, invalidation, nil, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]workflowkit.NodeID, 0, len(snapshot.Schedule))
+	for _, batch := range snapshot.Schedule {
+		got = append(got, batch.NodeIDs...)
+	}
+	want := []workflowkit.NodeID{
+		workflowkit.NodeID(workflowadapter.InstructionGen),
+		workflowkit.NodeID(workflowadapter.TaskTOMLGen),
+		workflowkit.NodeID(workflowadapter.DockerfileGen),
+		workflowkit.NodeID(workflowadapter.DockerfileBuildValidate),
+		workflowkit.NodeID(workflowadapter.ContentReview),
+		workflowkit.NodeID(workflowadapter.SolveGen),
+		workflowkit.NodeID(workflowadapter.TestGen),
+		workflowkit.NodeID(workflowadapter.AuthoringHarness),
+		workflowkit.NodeID(workflowadapter.TestsAnalysis),
+		workflowkit.NodeID(workflowadapter.CodeEdgePackageAdmission),
+		workflowkit.NodeID(workflowadapter.SolutionReview),
+		workflowkit.NodeID(workflowadapter.MaterializeTask),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("content-review recovery schedule = %v, want %v", got, want)
 	}
 }
 
@@ -1342,6 +1479,152 @@ func newAuthoringRecoveryFixture(t *testing.T, failure workflowkit.FailureClass)
 	ctx := context.Background()
 	fixture := newAuthoringRecoveryLaunchFixture(t)
 	return failAuthoringRecoveryLaunchFixture(t, ctx, fixture, failure)
+}
+
+func newQuotaExhaustedAuthoringRecoveryFixture(t *testing.T, ctx context.Context) (authoringRecoveryFixture, store.QuotaAccount) {
+	t.Helper()
+	fixture := newAuthoringRecoveryLaunchFixture(t)
+	fixture.run = transitionAuthoringRecoveryRun(t, ctx, fixture.store, fixture.run, store.WorkflowRunRunning)
+	frozen, err := decodeFrozenRunDefinition(fixture.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, found := frozen.Workflow.Stage(workflowkit.NodeID(workflowadapter.DockerfileBuildValidate))
+	if !found {
+		t.Fatal("frozen authoring workflow has no dockerfile_build_validate")
+	}
+	admission, err := BuildFrozenStageQuotaAdmission(frozen.QuotaPolicy, stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outputClaim int64
+	for _, claim := range admission.Claims {
+		if claim.Dimension == "output_submission" {
+			outputClaim = claim.Units
+		}
+	}
+	if outputClaim <= 0 {
+		t.Fatalf("dockerfile_build_validate claims = %+v, want output_submission", admission.Claims)
+	}
+	for _, bootstrap := range admission.BootstrapAccounts {
+		for _, scope := range []struct {
+			kind  store.QuotaScopeKind
+			id    string
+			limit int64
+		}{
+			{kind: store.QuotaScopeTask, id: fixture.task.ID, limit: bootstrap.TaskLimitUnits},
+			{kind: store.QuotaScopeActor, id: "author", limit: bootstrap.ActorLimitUnits},
+		} {
+			if _, err := fixture.store.CreateQuotaAccount(ctx, store.CreateQuotaAccountRequest{
+				ScopeKind: scope.kind, ScopeID: scope.id, Dimension: bootstrap.Dimension, LimitUnits: scope.limit,
+				Actor: "author", Reason: "initialize frozen quota admission fixture",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	outputAccount, err := fixture.store.GetQuotaAccountForScope(ctx, store.QuotaScopeTask, fixture.task.ID, "output_submission")
+	if err != nil || outputAccount == nil {
+		t.Fatalf("load output_submission account = %+v, %v", outputAccount, err)
+	}
+	reserveUnits := outputAccount.LimitUnits - outputClaim + 1
+	if reserveUnits <= 0 {
+		t.Fatalf("output_submission account limit %d cannot force claim %d exhaustion", outputAccount.LimitUnits, outputClaim)
+	}
+	if _, err := fixture.store.ReserveQuota(ctx, store.QuotaLeaseRequest{
+		IdempotencyKey: authoringRecoveryUUID(t), Owner: "quota-fixture", ScopeKind: store.QuotaScopeTask, ScopeID: fixture.task.ID,
+		Dimension: "output_submission", Units: reserveUnits, ReclaimPolicy: store.QuotaReclaimNever, TTL: time.Hour,
+		Actor: "author", Reason: "exhaust output submission capacity before Docker validation",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := workflowkit.FingerprintArtifactBindings(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := fixture.store.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: fixture.run.ID, StageKey: string(stage.Key), StageGroup: stage.Group, Ordinal: 1, InputFingerprint: string(inputs),
+		BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`, Actor: "author", Reason: "create quota-rejected Docker validation fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err = fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: failed.ID, ExpectedVersion: failed.Version, ExecutionStatus: store.StageExecutionRunning,
+		Actor: "author", Reason: "start quota-rejected Docker validation fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := fixture.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "workflow_stage.execute", EntityType: "stage_attempt", EntityID: failed.ID, RunID: fixture.run.ID, StageAttemptID: failed.ID,
+		PayloadJSON: `{}`, IdempotencyKey: authoringRecoveryUUID(t), Actor: "author", Reason: "create quota-rejected Docker validation job",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := fixture.store.AdmitTaskActorQuota(ctx, store.AdmitTaskActorQuotaRequest{
+		IdempotencyKey: "stage-admission:" + job.ID, TaskID: fixture.task.ID, Actor: job.CreatedBy, LeaseOwner: "quota-fixture", LeaseTTL: time.Hour,
+		Policy: admission.Policy, BootstrapAccounts: admission.BootstrapAccounts, Claims: admission.Claims,
+		Reason: "reject Docker validation after frozen quota admission",
+	})
+	if err != nil || decision.Accepted || decision.Reason != store.AdmissionReasonQuotaExhausted {
+		t.Fatalf("quota admission decision = %+v, %v", decision, err)
+	}
+	failed, err = fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: failed.ID, ExpectedVersion: failed.Version, ExecutionStatus: store.StageExecutionInfraFailed,
+		FailureClass: string(workflowkit.FailurePolicy), ErrorText: "frozen stage quota admission rejected: quota_exhausted",
+		Actor: "author", Reason: "project quota-rejected Docker validation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.run = transitionAuthoringRecoveryRun(t, ctx, fixture.store, fixture.run, store.WorkflowRunFailedRecoverable)
+	outputAccount, err = fixture.store.GetQuotaAccountForScope(ctx, store.QuotaScopeTask, fixture.task.ID, "output_submission")
+	if err != nil || outputAccount == nil {
+		t.Fatalf("reload exhausted output_submission account = %+v, %v", outputAccount, err)
+	}
+	fixture.failed = failed
+	return fixture, *outputAccount
+}
+
+func newUnrelatedPolicyAuthoringRecoveryFixture(t *testing.T, ctx context.Context) authoringRecoveryFixture {
+	t.Helper()
+	fixture := newAuthoringRecoveryLaunchFixture(t)
+	fixture.run = transitionAuthoringRecoveryRun(t, ctx, fixture.store, fixture.run, store.WorkflowRunRunning)
+	stage, found := fixture.workflow.Stage(workflowkit.NodeID(workflowadapter.DockerfileBuildValidate))
+	if !found {
+		t.Fatal("frozen authoring workflow has no dockerfile_build_validate")
+	}
+	inputs, err := workflowkit.FingerprintArtifactBindings(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := fixture.store.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: fixture.run.ID, StageKey: string(stage.Key), StageGroup: stage.Group, Ordinal: 1, InputFingerprint: string(inputs),
+		BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`, Actor: "author", Reason: "create unrelated policy failure fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err = fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: failed.ID, ExpectedVersion: failed.Version, ExecutionStatus: store.StageExecutionRunning,
+		Actor: "author", Reason: "start unrelated policy failure fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err = fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: failed.ID, ExpectedVersion: failed.Version, ExecutionStatus: store.StageExecutionInfraFailed,
+		FailureClass: string(workflowkit.FailurePolicy), ErrorText: "unrelated immutable policy failure",
+		Actor: "author", Reason: "project unrelated policy failure fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.run = transitionAuthoringRecoveryRun(t, ctx, fixture.store, fixture.run, store.WorkflowRunFailedRecoverable)
+	fixture.failed = failed
+	return fixture
 }
 
 func newLockedAuthoringRecoveryFixture(t *testing.T, failure workflowkit.FailureClass) authoringRecoveryFixture {

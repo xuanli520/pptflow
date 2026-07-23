@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,6 +137,122 @@ func TestRunControlAndBudgetCommandsUseLifecycleServices(t *testing.T) {
 	}
 	if len(accounts) != 1 || accounts[0].ID != account.ID || accounts[0].LimitUnits != 14 {
 		t.Fatalf("budget show accounts = %+v", accounts)
+	}
+}
+
+func TestBudgetCommandsResolveAuthoringSessionRunQuotaTask(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	actor := defaultLifecycleActor()
+	if actor == "" {
+		t.Skip("local OS actor is unavailable in this test environment")
+	}
+	services := openCommandLifecycle(t, root)
+	digest := "sha256:" + strings.Repeat("b", 64)
+	template := workflowadapter.StandardAuthoringCurrentTemplateReference()
+	source, err := services.Store().CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: "https://github.com/tower-rs/tower-http.git", CommitSHA: "f066e10ebc07ea9050a2ce4576315abfa568edf4",
+		SnapshotArtifactRef: digest, SnapshotContentDigest: digest, SnapshotSchemaVersion: "harbor.source-snapshot.v1",
+		IdempotencyKey: "command-authoring-budget-source", Actor: actor, Reason: "freeze authoring budget source",
+	})
+	if err != nil {
+		services.Store().Close()
+		t.Fatal(err)
+	}
+	task, err := services.Store().CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: "command-authoring-budget", Title: "Command authoring budget", SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA,
+		Actor: actor, Reason: "reserve authoring budget task",
+	})
+	if err != nil {
+		services.Store().Close()
+		t.Fatal(err)
+	}
+	session, err := services.Store().CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: template.ID, WorkflowTemplateVersion: template.Version,
+		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "command-authoring-budget-session", Actor: actor, Reason: "freeze authoring budget session",
+	})
+	if err != nil {
+		services.Store().Close()
+		t.Fatal(err)
+	}
+	run, err := services.Store().CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID, WorkflowTemplateID: session.WorkflowTemplateID, WorkflowTemplateVersion: session.WorkflowTemplateVersion,
+		ResolvedProfileHash: "sha256:command-authoring-budget-profile", DefinitionHash: "sha256:command-authoring-budget-definition",
+		RunManifestJSON: `{}`, Trigger: "task.generate", Actor: actor, Reason: "start authoring budget run",
+	})
+	if err != nil {
+		services.Store().Close()
+		t.Fatal(err)
+	}
+	if run.TaskID != "" {
+		services.Store().Close()
+		t.Fatalf("authoring Run unexpectedly has task ID %q", run.TaskID)
+	}
+	account, err := services.Store().CreateQuotaAccount(ctx, store.CreateQuotaAccountRequest{
+		ScopeKind: store.QuotaScopeTask, ScopeID: task.ID, Dimension: "agent_tokens", LimitUnits: 10,
+		Actor: actor, Reason: "configure authoring CLI budget",
+	})
+	if err != nil {
+		services.Store().Close()
+		t.Fatal(err)
+	}
+	if err := services.Store().Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &lifecycleCLIConfig{root: root}
+	dryRun := newBudgetCommand(config)
+	var dryRunOutput bytes.Buffer
+	dryRun.SetOut(&dryRunOutput)
+	dryRun.SetErr(&dryRunOutput)
+	dryRun.SetArgs([]string{
+		"grant", "--run", run.ID, "--dimension", "agent_tokens", "--delta", "4",
+		"--expected-version", "1", "--idempotency-key", "authoring-budget-cli-dry", "--reason", "inspect authoring budget", "--dry-run",
+	})
+	if err := dryRun.ExecuteContext(ctx); err != nil {
+		t.Fatalf("authoring budget grant dry-run: %v\n%s", err, dryRunOutput.String())
+	}
+	var preview budgetGrantPreview
+	if err := json.Unmarshal(dryRunOutput.Bytes(), &preview); err != nil {
+		t.Fatalf("decode authoring budget dry-run: %v\n%s", err, dryRunOutput.String())
+	}
+	if preview.TaskID != task.ID || preview.RunID != run.ID || preview.WillMutate {
+		t.Fatalf("authoring budget grant preview = %+v", preview)
+	}
+
+	show := newBudgetCommand(config)
+	var showOutput bytes.Buffer
+	show.SetOut(&showOutput)
+	show.SetErr(&showOutput)
+	show.SetArgs([]string{"show", "--run", run.ID})
+	if err := show.ExecuteContext(ctx); err != nil {
+		t.Fatalf("authoring budget show: %v\n%s", err, showOutput.String())
+	}
+	var accounts []store.QuotaAccount
+	if err := json.Unmarshal(showOutput.Bytes(), &accounts); err != nil {
+		t.Fatalf("decode authoring budget show: %v\n%s", err, showOutput.String())
+	}
+	if len(accounts) != 1 || accounts[0].ID != account.ID || accounts[0].ScopeID != task.ID || accounts[0].LimitUnits != 10 {
+		t.Fatalf("authoring budget show accounts = %+v", accounts)
+	}
+
+	grant := newBudgetCommand(config)
+	var grantOutput bytes.Buffer
+	grant.SetOut(&grantOutput)
+	grant.SetErr(&grantOutput)
+	grant.SetArgs([]string{
+		"grant", "--run", run.ID, "--dimension", "agent_tokens", "--delta", "4",
+		"--expected-version", "1", "--idempotency-key", "authoring-budget-cli-real", "--reason", "grant authoring budget",
+	})
+	if err := grant.ExecuteContext(ctx); err != nil {
+		t.Fatalf("authoring budget grant: %v\n%s", err, grantOutput.String())
+	}
+	var budgetGrant store.DurableBudgetGrant
+	if err := json.Unmarshal(grantOutput.Bytes(), &budgetGrant); err != nil {
+		t.Fatalf("decode authoring budget grant: %v\n%s", err, grantOutput.String())
+	}
+	if budgetGrant.AccountID != account.ID || budgetGrant.ScopeID != task.ID || budgetGrant.LimitUnits != 14 || budgetGrant.Actor != actor {
+		t.Fatalf("authoring budget grant = %+v", budgetGrant)
 	}
 }
 

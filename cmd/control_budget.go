@@ -123,11 +123,7 @@ func newBudgetShowCommand(config *lifecycleCLIConfig) *cobra.Command {
 				return err
 			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				run, err := services.Runs.Get(ctx, runID)
-				if err != nil {
-					return nil, err
-				}
-				return services.Budgets.ListTaskBudgets(ctx, run.TaskID)
+				return services.Budgets.ListRunBudgets(ctx, runID)
 			})
 		},
 	}
@@ -174,19 +170,19 @@ func newBudgetGrantCommand(config *lifecycleCLIConfig) *cobra.Command {
 				return err
 			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				run, err := services.Runs.Get(ctx, runID)
-				if err != nil {
-					return nil, err
-				}
-				preview := budgetGrantPreview{
-					TaskID: run.TaskID, RunID: run.ID, Dimension: dimension, DeltaUnits: delta,
-					ExpectedVersion: expectedVersion, IdempotencyKey: idempotencyKey, WillMutate: !dryRun,
-				}
 				if dryRun {
+					taskID, err := services.Budgets.QuotaTaskIDForRun(ctx, runID)
+					if err != nil {
+						return nil, err
+					}
+					preview := budgetGrantPreview{
+						TaskID: taskID, RunID: runID, Dimension: dimension, DeltaUnits: delta,
+						ExpectedVersion: expectedVersion, IdempotencyKey: idempotencyKey,
+					}
 					return preview, nil
 				}
-				return services.Budgets.GrantTaskBudget(ctx, app.GrantBudgetRequest{
-					TaskID: run.TaskID, Dimension: dimension, DeltaUnits: delta, ExpectedVersion: expectedVersion,
+				return services.Budgets.GrantRunBudget(ctx, app.GrantRunBudgetRequest{
+					RunID: runID, Dimension: dimension, DeltaUnits: delta, ExpectedVersion: expectedVersion,
 					IdempotencyKey: idempotencyKey, Actor: actor, Reason: reason,
 				})
 			})

@@ -61,6 +61,7 @@ type appModel struct {
 	refreshInFlight         bool
 	refreshRequested        bool
 	refreshEpoch            uint64
+	activationInFlight      bool
 	recoveryPreviewInFlight bool
 	recoveryPreviewEpoch    uint64
 	evaluatorActionEpoch    uint64
@@ -74,6 +75,13 @@ type taskBoardLoadedMsg struct {
 	snapshot app.TaskBoardSnapshot
 	epoch    uint64
 	err      error
+}
+
+// taskBoardActivationMsg keeps queued-run activation off the board refresh
+// path so a busy durable outbox cannot prevent the operator from seeing or
+// deciding an already-open review.
+type taskBoardActivationMsg struct {
+	err error
 }
 
 type taskBoardMutationMsg struct {
@@ -155,7 +163,6 @@ func newReviewPrompt(decision app.TaskBoardReviewDecision) *reviewPrompt {
 	input := textinput.New()
 	input.Prompt = "原因 "
 	input.Placeholder = "说明审核决定的原因"
-	input.CharLimit = 240
 	input.Width = 52
 	input.Focus()
 	return &reviewPrompt{decision: decision, reasonInput: input}
@@ -393,6 +400,21 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var refreshCmd tea.Cmd
 			m, refreshCmd = m.requestRefresh()
 			return m, tea.Batch(inputCmd, refreshCmd)
+		}
+		// A queued-run activation can acquire the same durable write lock as a
+		// board projection. Start it only after the projection has rendered so
+		// the TUI never remains on its loading screen behind that activation.
+		var activationCmd tea.Cmd
+		if !m.exitInFlight && !m.activationInFlight {
+			m.activationInFlight = true
+			activationCmd = m.activateQueuedRuns()
+		}
+		return m, tea.Batch(inputCmd, activationCmd)
+
+	case taskBoardActivationMsg:
+		m.activationInFlight = false
+		if msg.err != nil {
+			m.notice = "queued Run 交接暂未完成；看板将在下次刷新重试"
 		}
 		return m, inputCmd
 
@@ -825,11 +847,17 @@ func (m appModel) refreshTasks(epoch uint64) tea.Cmd {
 		if m.gateway == nil {
 			return taskBoardLoadedMsg{epoch: epoch, err: fmt.Errorf("task board service is not configured")}
 		}
-		if err := m.gateway.FlushQueuedRuns(m.ctx); err != nil {
-			return taskBoardLoadedMsg{epoch: epoch, err: err}
-		}
 		snapshot, err := m.gateway.List(m.ctx)
 		return taskBoardLoadedMsg{snapshot: snapshot, epoch: epoch, err: err}
+	}
+}
+
+func (m appModel) activateQueuedRuns() tea.Cmd {
+	return func() tea.Msg {
+		if m.gateway == nil {
+			return taskBoardActivationMsg{err: fmt.Errorf("task board service is not configured")}
+		}
+		return taskBoardActivationMsg{err: m.gateway.FlushQueuedRuns(m.ctx)}
 	}
 }
 

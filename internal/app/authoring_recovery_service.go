@@ -115,6 +115,12 @@ type authoringRecoveryFeedback struct {
 	consumerNodeIDs []workflowkit.NodeID
 }
 
+// authoringRecoveryInfraFailureOverride is deliberately narrower than a
+// generic retry-policy override. It exists only for recovery facts that are
+// independently durable and can be revalidated at preview and execution-plan
+// time.
+type authoringRecoveryInfraFailureOverride func(workflowkit.StageDescriptor, store.StageAttempt) (bool, error)
+
 // CurrentCheckpoint returns the source/session checkpoint required to resume
 // this exact frozen authoring Run. The AuthoringSession is immutable, so its
 // stable subject version is zero rather than the mutable draft Task version.
@@ -349,7 +355,10 @@ func (service *AuthoringRecoveryService) assessRecoverableBinding(ctx context.Co
 	if state.InDoubt {
 		return authoringRecoveryAssessment{}, fmt.Errorf("%w: workflow run %s has unresolved stage or node evidence", store.ErrContinuationReconciliationRequired, binding.run.ID)
 	}
-	selection, err := authoringRecoveryTargets(binding.run, binding.frozen.Workflow, state)
+	selection, err := authoringRecoveryTargetsWithInfraFailureOverride(binding.run, binding.frozen.Workflow, state,
+		func(stage workflowkit.StageDescriptor, failed store.StageAttempt) (bool, error) {
+			return service.ownerGrantedQuotaAdmissionRecoveryAllowed(ctx, binding, stage, failed)
+		})
 	if err != nil {
 		return authoringRecoveryAssessment{}, err
 	}
@@ -622,7 +631,97 @@ func matchAuthoringRecoveryIntent(request normalizedAuthoringRecoveryCommand, pe
 	return nil
 }
 
+// ownerGrantedQuotaAdmissionRecoveryAllowed permits one otherwise
+// non-retryable policy failure only when durable state proves all of the
+// following: the exact StageAttempt was rejected for quota exhaustion, the
+// frozen claims are now affordable, and the Task owner explicitly granted
+// capacity after that failure. Other policy failures remain unavailable.
+func (service *AuthoringRecoveryService) ownerGrantedQuotaAdmissionRecoveryAllowed(ctx context.Context, binding authoringRecoveryBinding, stage workflowkit.StageDescriptor, failed store.StageAttempt) (bool, error) {
+	if failed.RunID != binding.run.ID || failed.StageKey != string(stage.Key) ||
+		failed.FailureClass != string(workflowkit.FailurePolicy) || failed.FinishedAt == nil {
+		return false, nil
+	}
+	taskID, err := binding.subject.quotaTaskID()
+	if err != nil {
+		return false, fmt.Errorf("%w: resolve quota-owning Task for policy recovery: %v", ErrAuthoringRecoveryUnavailable, err)
+	}
+	jobs, err := service.core.store.ListDurableJobsForRun(ctx, binding.run.ID)
+	if err != nil {
+		return false, err
+	}
+	var rejected *store.DurableAdmissionDecision
+	for _, job := range jobs {
+		if job.StageAttemptID != failed.ID {
+			continue
+		}
+		decision, lookupErr := service.core.store.GetDurableAdmissionDecisionByIdempotencyKey(ctx, "stage-admission:"+job.ID)
+		if lookupErr != nil {
+			return false, lookupErr
+		}
+		if decision == nil || decision.Accepted || decision.Reason != store.AdmissionReasonQuotaExhausted ||
+			decision.TaskID != taskID || decision.Actor != job.CreatedBy {
+			continue
+		}
+		if rejected != nil {
+			return false, fmt.Errorf("%w: StageAttempt %s has multiple quota-exhausted admissions", ErrAuthoringRecoveryUnavailable, failed.ID)
+		}
+		copyDecision := *decision
+		rejected = &copyDecision
+	}
+	if rejected == nil {
+		return false, nil
+	}
+
+	admission, err := BuildFrozenStageQuotaAdmission(binding.frozen.QuotaPolicy, stage)
+	if err != nil {
+		return false, fmt.Errorf("%w: validate frozen quota admission for stage %q: %v", ErrAuthoringRecoveryUnavailable, stage.Key, err)
+	}
+	if len(admission.Claims) == 0 {
+		return false, nil
+	}
+	owner, err := taskOwnerFromAudit(ctx, service.core.store, taskID)
+	if err != nil {
+		return false, fmt.Errorf("%w: resolve quota-owning Task owner: %v", ErrAuthoringRecoveryUnavailable, err)
+	}
+	grantNotBefore := rejected.DecidedAt
+	if failed.FinishedAt.After(grantNotBefore) {
+		grantNotBefore = *failed.FinishedAt
+	}
+	ownerGrantedRequiredCapacity := false
+	for _, claim := range admission.Claims {
+		taskAccount, lookupErr := service.core.store.GetQuotaAccountForScope(ctx, store.QuotaScopeTask, taskID, claim.Dimension)
+		if lookupErr != nil {
+			return false, fmt.Errorf("%w: inspect task quota account %q: %v", ErrAuthoringRecoveryUnavailable, claim.Dimension, lookupErr)
+		}
+		actorAccount, lookupErr := service.core.store.GetQuotaAccountForScope(ctx, store.QuotaScopeActor, rejected.Actor, claim.Dimension)
+		if lookupErr != nil {
+			return false, fmt.Errorf("%w: inspect actor quota account %q: %v", ErrAuthoringRecoveryUnavailable, claim.Dimension, lookupErr)
+		}
+		if taskAccount == nil || actorAccount == nil || taskAccount.AvailableUnits() < claim.Units || actorAccount.AvailableUnits() < claim.Units {
+			return false, nil
+		}
+		events, lookupErr := service.core.store.ListAuditEvents(ctx, store.ListAuditEventsRequest{
+			EntityType: "quota_account",
+			EntityID:   taskAccount.ID,
+		})
+		if lookupErr != nil {
+			return false, fmt.Errorf("%w: inspect task quota grant audit: %v", ErrAuthoringRecoveryUnavailable, lookupErr)
+		}
+		for _, event := range events {
+			if event.Action == "quota_account.granted" && event.Actor == owner && !event.CreatedAt.Before(grantNotBefore) {
+				ownerGrantedRequiredCapacity = true
+				break
+			}
+		}
+	}
+	return ownerGrantedRequiredCapacity, nil
+}
+
 func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState) (authoringRecoverySelection, error) {
+	return authoringRecoveryTargetsWithInfraFailureOverride(run, workflow, state, nil)
+}
+
+func authoringRecoveryTargetsWithInfraFailureOverride(run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState, failureOverride authoringRecoveryInfraFailureOverride) (authoringRecoverySelection, error) {
 	repairSelection, err := activeAuthoringRepairSelection(workflow, state)
 	if err != nil {
 		return authoringRecoverySelection{}, err
@@ -650,7 +749,18 @@ func authoringRecoveryTargets(run store.WorkflowRun, workflow workflowkit.Workfl
 		switch latest.ExecutionStatus {
 		case store.StageExecutionInfraFailed:
 			stage, found := workflow.Stage(nodeID)
-			if !found || !stage.Retry.Allows(workflowkit.FailureClass(latest.FailureClass)) {
+			if !found {
+				return authoringRecoverySelection{}, fmt.Errorf("%w: frozen retry policy does not allow %s failure for stage %q", ErrAuthoringRecoveryUnavailable, latest.FailureClass, nodeID)
+			}
+			retryAllowed := stage.Retry.Allows(workflowkit.FailureClass(latest.FailureClass))
+			if !retryAllowed && failureOverride != nil {
+				var overrideErr error
+				retryAllowed, overrideErr = failureOverride(stage, latest)
+				if overrideErr != nil {
+					return authoringRecoverySelection{}, overrideErr
+				}
+			}
+			if !retryAllowed {
 				return authoringRecoverySelection{}, fmt.Errorf("%w: frozen retry policy does not allow %s failure for stage %q", ErrAuthoringRecoveryUnavailable, latest.FailureClass, nodeID)
 			}
 			targetSet[nodeID] = struct{}{}

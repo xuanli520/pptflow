@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -65,5 +66,71 @@ func TestBudgetGrantServiceRequiresTaskOwnerAndPreservesGrantIdempotency(t *test
 	}
 	if len(accounts) != 1 || accounts[0].ID != account.ID || accounts[0].Version != grant.Version {
 		t.Fatalf("listed task budgets = %+v, want updated task account", accounts)
+	}
+}
+
+func TestBudgetGrantServiceResolvesTaskAndAuthoringRunQuotaOwners(t *testing.T) {
+	ctx := context.Background()
+
+	taskServices, task, revision := newControlLifecycleFixture(t, "task-budget-owner")
+	taskRun, err := taskServices.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, Profile: lifecycleCompleteProfile(t), ExecutionSpec: lifecycleExecutionSpec(task.ID, revision.ID, revision.TaskDigest),
+		Trigger: "budget-test", Actor: "task-budget-owner", Reason: "start task-bound budget fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskAccount, err := taskServices.Store().CreateQuotaAccount(ctx, store.CreateQuotaAccountRequest{
+		ScopeKind: store.QuotaScopeTask, ScopeID: task.ID, Dimension: "agent_tokens", LimitUnits: 10,
+		Actor: "task-budget-owner", Reason: "configure task-bound budget fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskID, err := taskServices.Budgets.QuotaTaskIDForRun(ctx, taskRun.ID); err != nil || taskID != task.ID {
+		t.Fatalf("task-bound quota Task = %q, %v; want %q", taskID, err, task.ID)
+	}
+	accounts, err := taskServices.Budgets.ListRunBudgets(ctx, taskRun.ID)
+	if err != nil || len(accounts) != 1 || accounts[0].ID != taskAccount.ID {
+		t.Fatalf("task-bound run budgets = %+v, %v", accounts, err)
+	}
+	taskGrant, err := taskServices.Budgets.GrantRunBudget(ctx, GrantRunBudgetRequest{
+		RunID: taskRun.ID, IdempotencyKey: "task-run-budget-grant", Dimension: "agent_tokens", DeltaUnits: 2,
+		ExpectedVersion: taskAccount.Version, Actor: "task-budget-owner", Reason: "grant task-bound run budget",
+	})
+	if err != nil || taskGrant.ScopeID != task.ID || taskGrant.LimitUnits != 12 {
+		t.Fatalf("task-bound run grant = %+v, %v", taskGrant, err)
+	}
+
+	authoringServices, _, _, authoringTask, authoringRun := newAuthoringSessionRuntimeFixture(t, "authoring-budget-owner")
+	if authoringRun.TaskID != "" {
+		t.Fatalf("authoring Run unexpectedly has task ID %q", authoringRun.TaskID)
+	}
+	authoringAccount, err := authoringServices.Store().CreateQuotaAccount(ctx, store.CreateQuotaAccountRequest{
+		ScopeKind: store.QuotaScopeTask, ScopeID: authoringTask.ID, Dimension: "agent_tokens", LimitUnits: 20,
+		Actor: "authoring-budget-owner", Reason: "configure authoring budget fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskID, err := authoringServices.Budgets.QuotaTaskIDForRun(ctx, authoringRun.ID); err != nil || taskID != authoringTask.ID {
+		t.Fatalf("authoring quota Task = %q, %v; want %q", taskID, err, authoringTask.ID)
+	}
+	accounts, err = authoringServices.Budgets.ListRunBudgets(ctx, authoringRun.ID)
+	if err != nil || len(accounts) != 1 || accounts[0].ID != authoringAccount.ID {
+		t.Fatalf("authoring run budgets = %+v, %v", accounts, err)
+	}
+	authoringGrant, err := authoringServices.Budgets.GrantRunBudget(ctx, GrantRunBudgetRequest{
+		RunID: authoringRun.ID, IdempotencyKey: "authoring-run-budget-grant", Dimension: "agent_tokens", DeltaUnits: 5,
+		ExpectedVersion: authoringAccount.Version, Actor: "authoring-budget-owner", Reason: "grant authoring run budget",
+	})
+	if err != nil || authoringGrant.ScopeID != authoringTask.ID || authoringGrant.LimitUnits != 25 {
+		t.Fatalf("authoring run grant = %+v, %v", authoringGrant, err)
+	}
+	if _, err := authoringServices.Budgets.GrantRunBudget(ctx, GrantRunBudgetRequest{
+		RunID: authoringRun.ID, IdempotencyKey: "authoring-run-budget-non-owner", Dimension: "agent_tokens", DeltaUnits: 1,
+		ExpectedVersion: authoringGrant.Version, Actor: "another-local-user", Reason: "unauthorized authoring budget grant",
+	}); err == nil || !strings.Contains(err.Error(), "only task owner") {
+		t.Fatalf("authoring non-owner budget grant error = %v", err)
 	}
 }
