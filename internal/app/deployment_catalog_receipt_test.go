@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -479,6 +480,82 @@ func TestCatalogLockDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *test
 	}
 }
 
+func TestCatalogLockBuildOnlyCompatibilityAcceptsOnlyReviewedPredecessor(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	bootstrap, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, revision := importCatalogReceiptFixture(t, ctx, bootstrap, "catalog-lock-build-compatibility")
+	profile := catalogReceiptProfile(t)
+	specification := catalogReceiptExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	oldResolver := catalogLockAttestedResolverForSpecWithBuild(t, specification, "catalog-lock-build-compatibility", "v1", "lock-v1", stageprovider.HarborFlowBuildIdentity{
+		Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40),
+		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("catalog-lock-old-build")),
+	})
+	currentResolver := catalogLockAttestedResolverForSpecWithBuild(t, specification, "catalog-lock-build-compatibility", "v1", "lock-v2", stageprovider.HarborFlowBuildIdentity{
+		Module: "github.com/purplevoid/harbor-factory", Version: "v2.1.0", Commit: strings.Repeat("b", 40),
+		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("catalog-lock-current-build")),
+	})
+	contract, err := currentResolver.ExecutionContractFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := stageprovider.DeploymentOperationCatalogLockCompatibilityProof{
+		Predecessor: oldResolver.LockIdentity(), ExecutionContractFingerprint: contract,
+	}
+	servicesOld := catalogLockLifecycleServices(t, root, database, oldResolver)
+	run, err := servicesOld.Runs.StartRun(ctx, StartRunRequest{
+		TaskID: task.ID, RevisionID: revision.ID, Profile: profile, ExecutionSpec: specification,
+		Trigger: "catalog lock build compatibility", Actor: "tester", Reason: "freeze predecessor lock",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := decodeFrozenRunDefinition(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	withoutProof := catalogLockLifecycleServices(t, root, database, currentResolver)
+	rejectedRuntime := newFrozenRuntime(t, withoutProof, catalogReceiptRuntimeRegistry(t, frozen.Workflow, completedFixtureStage))
+	if _, _, err := rejectedRuntime.loadFrozenRun(ctx, run.ID, run.DefinitionHash, frozen.ExecutionSpecFingerprint, frozen.QuotaPolicy); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) || !errors.Is(err, ErrFrozenExecutionPayload) {
+		t.Fatalf("unapproved predecessor lock load = %v, want frozen payload + lock drift", err)
+	}
+
+	withProof := catalogLockLifecycleServicesWithProofs(t, root, database, currentResolver, []stageprovider.DeploymentOperationCatalogLockCompatibilityProof{proof})
+	compatibleRuntime := newFrozenRuntime(t, withProof, catalogReceiptRuntimeRegistry(t, frozen.Workflow, completedFixtureStage))
+	if _, _, err := compatibleRuntime.loadFrozenRun(ctx, run.ID, run.DefinitionHash, frozen.ExecutionSpecFingerprint, frozen.QuotaPolicy); err != nil {
+		t.Fatalf("reviewed predecessor lock load = %v", err)
+	}
+
+	var manifest runManifest
+	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	tampered := oldResolver.LockIdentity()
+	tampered.Fingerprint = workflowkit.SHA256Fingerprint([]byte("unreviewed-predecessor-lock"))
+	manifest.DeploymentCatalogLockIdentity = &tampered
+	manifestRaw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedRun := run
+	tamperedRun.RunManifestJSON = string(manifestRaw)
+	if err := withProof.core.verifyRunDeploymentCatalogReceipt(tamperedRun); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
+		t.Fatalf("unreviewed predecessor identity verification = %v, want lock drift", err)
+	}
+}
+
 func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -890,8 +967,17 @@ func catalogReceiptResolverForSpec(t *testing.T, specification workflowadapter.R
 
 func catalogLockLifecycleServices(t *testing.T, root string, database *store.Store, resolver *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver) *LifecycleServices {
 	t.Helper()
+	return catalogLockLifecycleServicesWithProofs(t, root, database, resolver, nil)
+}
+
+func catalogLockLifecycleServicesWithProofs(t *testing.T, root string, database *store.Store, resolver *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver, proofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof) *LifecycleServices {
+	t.Helper()
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		OperationResolver: resolver, DeploymentCatalogResolver: resolver,
+		OperationResolver: resolver,
+		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
+			Template: resolver.Receipt().Template, Resolver: resolver,
+			CompatibleLockProofs: append([]stageprovider.DeploymentOperationCatalogLockCompatibilityProof(nil), proofs...),
+		}},
 		RequireDeploymentCatalog: true, RequireDeploymentLock: true,
 	})
 	if err != nil {
@@ -901,6 +987,13 @@ func catalogLockLifecycleServices(t *testing.T, root string, database *store.Sto
 }
 
 func catalogLockAttestedResolverForSpec(t *testing.T, specification workflowadapter.RunExecutionSpec, catalogID, catalogVersion, lockVersion string) *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver {
+	return catalogLockAttestedResolverForSpecWithBuild(t, specification, catalogID, catalogVersion, lockVersion, stageprovider.HarborFlowBuildIdentity{
+		Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40),
+		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("app-catalog-lock-build:" + catalogID)),
+	})
+}
+
+func catalogLockAttestedResolverForSpecWithBuild(t *testing.T, specification workflowadapter.RunExecutionSpec, catalogID, catalogVersion, lockVersion string, build stageprovider.HarborFlowBuildIdentity) *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver {
 	t.Helper()
 	template, err := workflowadapter.ResolveWorkflowTemplate(specification.Template)
 	if err != nil {
@@ -936,11 +1029,8 @@ func catalogLockAttestedResolverForSpec(t *testing.T, specification workflowadap
 	lock := stageprovider.DeploymentOperationCatalogLock{
 		Format: stageprovider.DeploymentOperationCatalogLockFormat, Version: stageprovider.DeploymentOperationCatalogLockVersion,
 		LockID: "app-catalog-lock-" + catalogID, LockVersion: lockVersion, CatalogReceipt: catalog.Receipt(),
-		HarborFlowBuild: stageprovider.HarborFlowBuildIdentity{
-			Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40),
-			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("app-catalog-lock-build:" + catalogID)),
-		},
-		Operations: make([]stageprovider.DeploymentOperationCatalogLockRecord, 0, len(registrations)),
+		HarborFlowBuild: build,
+		Operations:      make([]stageprovider.DeploymentOperationCatalogLockRecord, 0, len(registrations)),
 	}
 	if specification.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
 		profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())

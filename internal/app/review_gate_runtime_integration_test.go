@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/internal/testsupport"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -19,14 +23,21 @@ const (
 )
 
 type reviewGateRuntimeFixture struct {
-	store    *store.Store
-	services *LifecycleServices
-	task     store.TaskV2
-	revision store.TaskRevision
-	run      store.WorkflowRun
-	frozen   frozenRunDefinition
-	runtime  *FrozenExecutionRuntime
-	worker   *DurableWorker
+	store       *store.Store
+	services    *LifecycleServices
+	task        store.TaskV2
+	revision    store.TaskRevision
+	run         store.WorkflowRun
+	frozen      frozenRunDefinition
+	runtime     *FrozenExecutionRuntime
+	worker      *DurableWorker
+	reviewStage workflowkit.StageKey
+}
+
+type reviewGateRuntimeFixtureOptions struct {
+	newServices       func(string, *store.Store) (*LifecycleServices, error)
+	freezeCatalogLock bool
+	reviewStage       workflowkit.StageKey
 }
 
 func TestFrozenExecutionRuntimeReviewGateWaitsWithoutQuotaAdmission(t *testing.T) {
@@ -55,7 +66,7 @@ func TestFrozenExecutionRuntimeReviewGateWaitsWithoutQuotaAdmission(t *testing.T
 		t.Fatalf("review gate run projection = %+v, %v", run, err)
 	}
 	binding, err := fixture.store.GetReviewGateBindingByStageAttempt(ctx, gateAttempt.ID)
-	if err != nil || binding == nil || binding.RunID != fixture.run.ID || binding.RevisionID != fixture.revision.ID || binding.StageKey != string(runtimeReviewGateStage) {
+	if err != nil || binding == nil || binding.RunID != fixture.run.ID || binding.RevisionID != fixture.revision.ID || binding.StageKey != string(fixture.reviewStage) {
 		t.Fatalf("review gate binding = %+v, %v", binding, err)
 	}
 	nodes, err := fixture.store.ListNodeAttempts(ctx, gateAttempt.ID)
@@ -145,6 +156,77 @@ func TestFrozenExecutionRuntimeApprovedReviewGateMaterializesArtifactAndSchedule
 	successorJob, _ := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeReviewSuccessorStage)
 	if successorJob.State != store.JobQueued {
 		t.Fatalf("approved gate successor stage job = %+v", successorJob)
+	}
+}
+
+// This follows the same durable path as a CodeEdge final_review approval:
+// ResolveReview -> projectResolvedReviewGate -> enqueueNextCoordinator ->
+// workflow_run.execute. The predecessor Run is frozen under an older lock,
+// while the resolution and successor coordinator run under a new build-only
+// lock revision.
+func TestFrozenExecutionRuntimeApprovedFinalReviewAcceptsReviewedBuildOnlyLockPredecessor(t *testing.T) {
+	ctx := context.Background()
+	selection := testsupport.CompleteRunExecutionSpec(
+		"018f0a73-3b49-7000-8000-000000000071",
+		"018f0a73-3b49-7000-8000-000000000072",
+		"harbor.task.v2:sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+	)
+	selection.Template = workflowadapter.StandardTemplateReference()
+	oldResolver := catalogLockAttestedResolverForSpecWithBuild(t, selection, "review-gate-build-compat", "v1", "lock-v1", stageprovider.HarborFlowBuildIdentity{
+		Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40),
+		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("review-gate-old-build")),
+	})
+	currentResolver := catalogLockAttestedResolverForSpecWithBuild(t, selection, "review-gate-build-compat", "v1", "lock-v2", stageprovider.HarborFlowBuildIdentity{
+		Module: "github.com/purplevoid/harbor-factory", Version: "v2.1.0", Commit: strings.Repeat("b", 40),
+		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("review-gate-current-build")),
+	})
+	contract, err := currentResolver.ExecutionContractFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := stageprovider.DeploymentOperationCatalogLockCompatibilityProof{
+		Predecessor: oldResolver.LockIdentity(), ExecutionContractFingerprint: contract,
+	}
+	fixture := newReviewGateRuntimeFixtureWithOptions(t, reviewGateRuntimeFixtureOptions{
+		freezeCatalogLock: true,
+		reviewStage:       workflowkit.StageKey(workflowadapter.FinalReview),
+		newServices: func(root string, database *store.Store) (*LifecycleServices, error) {
+			return NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+				OperationResolver: oldResolver,
+				DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
+					Template: oldResolver.Receipt().Template, Resolver: oldResolver,
+				}},
+				RequireDeploymentCatalog: true, RequireDeploymentLock: true,
+			})
+		},
+	})
+	defer fixture.store.Close()
+
+	gateJob := queueRuntimeReviewGate(t, ctx, fixture)
+	openRuntimeReviewGate(t, ctx, fixture, gateJob)
+	binding := requireRuntimeReviewGateBinding(t, ctx, fixture.store, gateJob.StageAttemptID)
+	decideRuntimeReviewGate(t, ctx, fixture, binding, store.ReviewDecisionApprove)
+
+	withoutProof := catalogLockLifecycleServices(t, fixture.services.core.layout.root, fixture.store, currentResolver)
+	rejectedRuntime := newFrozenRuntime(t, withoutProof, fixture.runtime.workflowkitRegistry)
+	if _, _, err := rejectedRuntime.loadFrozenRun(ctx, fixture.run.ID, fixture.run.DefinitionHash, fixture.frozen.ExecutionSpecFingerprint, fixture.frozen.QuotaPolicy); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) || !errors.Is(err, ErrFrozenExecutionPayload) {
+		t.Fatalf("unapproved final_review predecessor load = %v, want frozen payload + lock drift", err)
+	}
+
+	withProof := catalogLockLifecycleServicesWithProofs(t, fixture.services.core.layout.root, fixture.store, currentResolver, []stageprovider.DeploymentOperationCatalogLockCompatibilityProof{proof})
+	currentRuntime := newFrozenRuntime(t, withProof, fixture.runtime.workflowkitRegistry)
+	currentWorker := newFrozenRuntimeWorker(t, fixture.store, currentRuntime, "review-gate-build-compatible-worker")
+	resolution, err := currentWorker.RunOnce(ctx)
+	if err != nil || resolution.FinalState != store.JobSucceeded || resolution.Job == nil || resolution.Job.CommandType != store.ReviewGateResolutionCommandType {
+		t.Fatalf("approved final_review resolution under compatible build = %+v, %v", resolution, err)
+	}
+	successor, err := currentWorker.RunOnce(ctx)
+	if err != nil || successor.FinalState != store.JobSucceeded || successor.Job == nil || successor.Job.CommandType != "workflow_run.execute" {
+		t.Fatalf("approved final_review successor coordinator under compatible build = %+v, %v", successor, err)
+	}
+	stageJob, _ := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeReviewSuccessorStage)
+	if stageJob.State != store.JobQueued {
+		t.Fatalf("compatible final_review successor stage = %+v, want queued", stageJob)
 	}
 }
 
@@ -276,6 +358,10 @@ func TestLifecycleMutationGateApprovalCannotPromoteCurrentRevision(t *testing.T)
 }
 
 func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
+	return newReviewGateRuntimeFixtureWithOptions(t, reviewGateRuntimeFixtureOptions{})
+}
+
+func newReviewGateRuntimeFixtureWithOptions(t *testing.T, options reviewGateRuntimeFixtureOptions) reviewGateRuntimeFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -283,7 +369,11 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	services, err := newLifecycleServicesForTest(root, dataStore)
+	newServices := options.newServices
+	if newServices == nil {
+		newServices = newLifecycleServicesForTest
+	}
+	services, err := newServices(root, dataStore)
 	if err != nil {
 		_ = dataStore.Close()
 		t.Fatal(err)
@@ -319,8 +409,12 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 		_ = dataStore.Close()
 		t.Fatal(err)
 	}
-	workflow := runtimeReviewGateWorkflow()
-	policy := runtimeReviewGateQuotaPolicy(t)
+	reviewStage := options.reviewStage
+	if reviewStage == "" {
+		reviewStage = runtimeReviewGateStage
+	}
+	workflow := runtimeReviewGateWorkflow(reviewStage)
+	policy := runtimeReviewGateQuotaPolicy(t, reviewStage)
 	definition, err := workflow.Fingerprint()
 	if err != nil {
 		_ = dataStore.Close()
@@ -337,12 +431,44 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 		t.Fatal(err)
 	}
 	writeFrozenRuntimeFixtureManagedInputs(t, services, runID, profileCanonical, specificationCanonical)
+	var catalogReceipt []byte
+	var lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
+	if options.freezeCatalogLock {
+		catalogReceipt, err = services.core.frozenDeploymentCatalogReceipt(specification.Template)
+		if err != nil {
+			_ = dataStore.Close()
+			t.Fatal(err)
+		}
+		lockIdentity, err = services.core.frozenDeploymentCatalogLockIdentity(specification.Template)
+		if err != nil {
+			_ = dataStore.Close()
+			t.Fatal(err)
+		}
+		if err := writeNewBytes(filepath.Join(services.core.layout.runDirectory(runID), deploymentCatalogReceiptFileName), catalogReceipt); err != nil {
+			_ = dataStore.Close()
+			t.Fatal(err)
+		}
+		canonicalLockIdentity, err := canonicalDeploymentCatalogLockIdentity(*lockIdentity)
+		if err != nil {
+			_ = dataStore.Close()
+			t.Fatal(err)
+		}
+		if err := writeNewBytes(filepath.Join(services.core.layout.runDirectory(runID), deploymentCatalogLockIdentityFileName), canonicalLockIdentity); err != nil {
+			_ = dataStore.Close()
+			t.Fatal(err)
+		}
+	}
 	decisionArtifact := workflowkit.ArtifactSpec{Name: runtimeReviewDecisionKey, SchemaVersion: "harbor.review-decision.v1", Required: true}
 	resolved := workflowadapter.ResolvedWorkflow{
 		TemplateID: "runtime-review-gate", TemplateVersion: "1", ExecutionProfileID: "runtime-review-gate", ExecutionProfileVersion: "1",
 		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, CandidateProviderBudget: profile.CandidateProviderBudget, ExecutionProfileFingerprint: profileFingerprint, DefinitionFingerprint: definition,
 		Descriptor: workflow, QuotaPolicy: policy,
-		ReviewStages: []workflowadapter.ReviewStage{{StageKey: runtimeReviewGateStage, ReviewKind: workflowadapter.ReviewTaskDirection, DecisionArtifact: decisionArtifact}},
+		ReviewStages: []workflowadapter.ReviewStage{{StageKey: reviewStage, ReviewKind: workflowadapter.ReviewTaskDirection, DecisionArtifact: decisionArtifact}},
+	}
+	if options.freezeCatalogLock {
+		resolved.Template = specification.Template
+		resolved.TemplateID = specification.Template.ID
+		resolved.TemplateVersion = specification.Template.Version
 	}
 	manifest, err := json.Marshal(runManifest{
 		Format: "harbor.workflow-run-manifest.v2", RunID: runID, TaskID: task.ID, Revision: revision.ID, Resolved: resolved, InitialExecutionPlan: initialExecutionPlan,
@@ -351,7 +477,9 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 			ProfileFingerprint:       profileFingerprint,
 			ExecutionSpecFingerprint: specificationFingerprint,
 		},
-		ExecutionSpec: append(json.RawMessage(nil), specificationCanonical...),
+		ExecutionSpec:                 append(json.RawMessage(nil), specificationCanonical...),
+		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
+		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
 	})
 	if err != nil {
 		_ = dataStore.Close()
@@ -402,10 +530,10 @@ func newReviewGateRuntimeFixture(t *testing.T) reviewGateRuntimeFixture {
 	}
 	runtime := newFrozenRuntime(t, services, registry)
 	worker := newFrozenRuntimeWorker(t, dataStore, runtime, "runtime-review-gate-worker")
-	return reviewGateRuntimeFixture{store: dataStore, services: services, task: task, revision: revision, run: run, frozen: frozen, runtime: runtime, worker: worker}
+	return reviewGateRuntimeFixture{store: dataStore, services: services, task: task, revision: revision, run: run, frozen: frozen, runtime: runtime, worker: worker, reviewStage: reviewStage}
 }
 
-func runtimeReviewGateWorkflow() workflowkit.WorkflowDescriptor {
+func runtimeReviewGateWorkflow(reviewStage workflowkit.StageKey) workflowkit.WorkflowDescriptor {
 	budget := workflowkit.ExecutionBudget{
 		TurnTimeout: time.Second, MaxTurns: 1, AttemptTimeout: time.Second, MaxAttempts: 1, MaxElapsed: time.Second,
 	}
@@ -423,7 +551,7 @@ func runtimeReviewGateWorkflow() workflowkit.WorkflowDescriptor {
 				Capabilities: workflowkit.CapabilitySet{workflowkit.CapabilityCancel, workflowkit.CapabilityContinue},
 			},
 			{
-				Key: runtimeReviewGateStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.review-gate", Version: "1"}, Group: "runtime",
+				Key: reviewStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.review-gate", Version: "1"}, Group: "runtime",
 				Dependencies: []workflowkit.StageKey{runtimeFixtureSourceStage}, Inputs: []workflowkit.ArtifactSpec{{Name: "source_report", SchemaVersion: "runtime.v1", Required: true}}, Outputs: []workflowkit.ArtifactSpec{decisionArtifact}, Effect: workflowkit.EffectEvidenceOnly,
 				Dispatch: workflowkit.StageDispatchAutomatic,
 				Budget:   budget, QuotaClaims: []workflowkit.QuotaClaim{}, Retry: workflowkit.RetryPolicy{},
@@ -432,7 +560,7 @@ func runtimeReviewGateWorkflow() workflowkit.WorkflowDescriptor {
 			},
 			{
 				Key: runtimeReviewSuccessorStage, Version: "1", Plugin: workflowkit.PluginBinding{ID: "runtime.review-successor", Version: "1"}, Group: "runtime",
-				Dependencies: []workflowkit.StageKey{runtimeReviewGateStage}, Inputs: []workflowkit.ArtifactSpec{decisionArtifact}, Outputs: []workflowkit.ArtifactSpec{{Name: "successor_report", SchemaVersion: "runtime.v1", Required: true}}, Effect: workflowkit.EffectEvidenceOnly,
+				Dependencies: []workflowkit.StageKey{reviewStage}, Inputs: []workflowkit.ArtifactSpec{decisionArtifact}, Outputs: []workflowkit.ArtifactSpec{{Name: "successor_report", SchemaVersion: "runtime.v1", Required: true}}, Effect: workflowkit.EffectEvidenceOnly,
 				Dispatch: workflowkit.StageDispatchAutomatic,
 				Budget:   budget, QuotaClaims: []workflowkit.QuotaClaim{claim}, Retry: workflowkit.RetryPolicy{},
 				Verdicts: workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}, Reuse: workflowkit.ReuseWhenInputsMatch,
@@ -442,14 +570,14 @@ func runtimeReviewGateWorkflow() workflowkit.WorkflowDescriptor {
 	}
 }
 
-func runtimeReviewGateQuotaPolicy(t *testing.T) workflowadapter.ResolvedQuotaPolicy {
+func runtimeReviewGateQuotaPolicy(t *testing.T, reviewStage workflowkit.StageKey) workflowadapter.ResolvedQuotaPolicy {
 	t.Helper()
 	policy := workflowadapter.QuotaPolicy{
 		ID: "runtime-review-gate-policy", Version: "1",
 		AccountLimits: []workflowadapter.QuotaAccountLimit{{Dimension: "stage_attempt", TaskLimitUnits: 10, ActorLimitUnits: 10}},
 		Stages: []workflowadapter.StageQuotaPolicy{
 			{StageKey: runtimeFixtureSourceStage, Claims: []workflowkit.QuotaClaim{{Dimension: "stage_attempt", Units: 1, ReclaimPolicy: workflowkit.ReclaimUnused}}},
-			{StageKey: runtimeReviewGateStage, Claims: []workflowkit.QuotaClaim{}},
+			{StageKey: reviewStage, Claims: []workflowkit.QuotaClaim{}},
 			{StageKey: runtimeReviewSuccessorStage, Claims: []workflowkit.QuotaClaim{{Dimension: "stage_attempt", Units: 1, ReclaimPolicy: workflowkit.ReclaimUnused}}},
 		},
 	}
@@ -468,7 +596,7 @@ func queueRuntimeReviewGate(t *testing.T, ctx context.Context, fixture reviewGat
 			t.Fatalf("queue review gate cycle %d = %+v, %v", cycle, result, err)
 		}
 	}
-	gateJob, _ := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeReviewGateStage)
+	gateJob, _ := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, fixture.reviewStage)
 	if gateJob.State != store.JobQueued {
 		t.Fatalf("queued review gate job = %+v", gateJob)
 	}
@@ -605,9 +733,9 @@ func materializeRuntimeReviewGateForRecovery(t *testing.T, ctx context.Context, 
 	if err != nil || len(decisions) != 1 || decisions[0].ID != decisionID {
 		t.Fatalf("read review decision to materialize = %+v, %v", decisions, err)
 	}
-	stage, found := fixture.frozen.Workflow.Stage(runtimeReviewGateStage)
+	stage, found := fixture.frozen.Workflow.Stage(fixture.reviewStage)
 	if !found {
-		t.Fatalf("frozen review stage %q is missing", runtimeReviewGateStage)
+		t.Fatalf("frozen review stage %q is missing", fixture.reviewStage)
 	}
 	inputs, err := decodeReviewGateInputs(binding)
 	if err != nil {

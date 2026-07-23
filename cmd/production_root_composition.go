@@ -20,8 +20,11 @@ type harborFlowProductionCompositionConfig struct {
 	Paths                 productionDeploymentPaths
 	StandardBinding       standardAuthoringProductionBuildBinding
 	CodeEdgePhase1Binding codeEdgePhase1ProductionBuildBinding
-	EvaluatorBinding      codeEdgeProductionBuildBinding
-	LookupEnvironment     func(string) (string, bool)
+	// CodeEdgePhase1CompatibleLockProofs are package-owned predecessor aliases
+	// validated against the installed parent lock while composing services.
+	CodeEdgePhase1CompatibleLockProofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof
+	EvaluatorBinding                   codeEdgeProductionBuildBinding
+	LookupEnvironment                  func(string) (string, bool)
 }
 
 // newHarborFlowProductionLifecycleServices is the sole production factory
@@ -49,11 +52,12 @@ func newHarborFlowProductionLifecycleServices(root string, dataStore *store.Stor
 		return nil, err
 	}
 	return newHarborFlowProductionLifecycleServicesWithConfig(root, dataStore, harborFlowProductionCompositionConfig{
-		Paths:                 paths,
-		StandardBinding:       standardBinding,
-		CodeEdgePhase1Binding: parentBinding,
-		EvaluatorBinding:      evaluatorBinding,
-		LookupEnvironment:     os.LookupEnv,
+		Paths:                              paths,
+		StandardBinding:                    standardBinding,
+		CodeEdgePhase1Binding:              parentBinding,
+		CodeEdgePhase1CompatibleLockProofs: append([]stageprovider.DeploymentOperationCatalogLockCompatibilityProof(nil), codeEdgePhase1CompatibleLockProofs...),
+		EvaluatorBinding:                   evaluatorBinding,
+		LookupEnvironment:                  os.LookupEnv,
 	})
 }
 
@@ -85,7 +89,7 @@ func preflightHarborFlowProductionLifecycleServices(root string) error {
 	if err != nil {
 		return err
 	}
-	return preflightHarborFlowProductionDeploymentBundles(paths, standardBinding, parentBinding, evaluatorBinding)
+	return preflightHarborFlowProductionDeploymentBundlesWithCompatibility(paths, standardBinding, parentBinding, evaluatorBinding, codeEdgePhase1CompatibleLockProofs)
 }
 
 // preflightHarborFlowProductionDeploymentBundles verifies every static catalog,
@@ -94,6 +98,10 @@ func preflightHarborFlowProductionLifecycleServices(root string) error {
 // lifecycle service, so a stale package is rejected without control-plane
 // filesystem side effects.
 func preflightHarborFlowProductionDeploymentBundles(paths productionDeploymentPaths, standardBinding standardAuthoringProductionBuildBinding, parentBinding codeEdgePhase1ProductionBuildBinding, evaluatorBinding codeEdgeProductionBuildBinding) error {
+	return preflightHarborFlowProductionDeploymentBundlesWithCompatibility(paths, standardBinding, parentBinding, evaluatorBinding, nil)
+}
+
+func preflightHarborFlowProductionDeploymentBundlesWithCompatibility(paths productionDeploymentPaths, standardBinding standardAuthoringProductionBuildBinding, parentBinding codeEdgePhase1ProductionBuildBinding, evaluatorBinding codeEdgeProductionBuildBinding, parentCompatibleLockProofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof) error {
 	if err := standardBinding.Validate(); err != nil {
 		return fmt.Errorf("Standard authoring production binding: %w", err)
 	}
@@ -113,13 +121,13 @@ func preflightHarborFlowProductionDeploymentBundles(paths productionDeploymentPa
 	if err := verifyHarborFlowProductionBundleBinding("Standard authoring", standard.Verifier, standardBinding.HarborFlowBuild, standardBinding.CatalogReceiptFingerprint, standardBinding.LockIdentity); err != nil {
 		return err
 	}
-	if err := preflightCatalogLockBundle("CodeEdge Phase-1", paths.ParentCatalog, paths.ParentLock, workflowadapter.CodeEdgePhase1TemplateReference(), parentBinding.HarborFlowBuild, parentBinding.CatalogReceiptFingerprint, parentBinding.LockIdentity); err != nil {
+	if err := preflightCatalogLockBundle("CodeEdge Phase-1", paths.ParentCatalog, paths.ParentLock, workflowadapter.CodeEdgePhase1TemplateReference(), parentBinding.HarborFlowBuild, parentBinding.CatalogReceiptFingerprint, parentBinding.LockIdentity, parentCompatibleLockProofs); err != nil {
 		return err
 	}
-	return preflightCatalogLockBundle("CodeEdge evaluator child", paths.EvaluatorCatalog, paths.EvaluatorLock, workflowadapter.CodeEdgeEvaluatorChildTemplateReference(), evaluatorBinding.HarborFlowBuild, evaluatorBinding.CatalogReceiptFingerprint, evaluatorBinding.LockIdentity)
+	return preflightCatalogLockBundle("CodeEdge evaluator child", paths.EvaluatorCatalog, paths.EvaluatorLock, workflowadapter.CodeEdgeEvaluatorChildTemplateReference(), evaluatorBinding.HarborFlowBuild, evaluatorBinding.CatalogReceiptFingerprint, evaluatorBinding.LockIdentity, nil)
 }
 
-func preflightCatalogLockBundle(label, catalogPath, lockPath string, template workflowadapter.TemplateReference, build stageprovider.HarborFlowBuildIdentity, receiptFingerprint workflowkit.Fingerprint, lockIdentity stageprovider.DeploymentOperationCatalogLockIdentity) error {
+func preflightCatalogLockBundle(label, catalogPath, lockPath string, template workflowadapter.TemplateReference, build stageprovider.HarborFlowBuildIdentity, receiptFingerprint workflowkit.Fingerprint, lockIdentity stageprovider.DeploymentOperationCatalogLockIdentity, compatibleLockProofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof) error {
 	catalogRaw, err := readCodeEdgeProductionFile(catalogPath)
 	if err != nil {
 		return fmt.Errorf("read %s catalog: %w", label, err)
@@ -147,7 +155,13 @@ func preflightCatalogLockBundle(label, catalogPath, lockPath string, template wo
 	if err != nil {
 		return fmt.Errorf("bind %s catalog and lock: %w", label, err)
 	}
-	return verifyHarborFlowProductionBundleBinding(label, verifier, build, receiptFingerprint, lockIdentity)
+	if err := verifyHarborFlowProductionBundleBinding(label, verifier, build, receiptFingerprint, lockIdentity); err != nil {
+		return err
+	}
+	if err := stageprovider.VerifyDeploymentOperationCatalogLockCompatibilityProofs(verifier, compatibleLockProofs); err != nil {
+		return fmt.Errorf("verify %s deployment lock compatibility proofs: %w", label, err)
+	}
+	return nil
 }
 
 func verifyHarborFlowProductionBundleBinding(label string, verifier stageprovider.DeploymentOperationCatalogLockVerifier, build stageprovider.HarborFlowBuildIdentity, expectedReceipt workflowkit.Fingerprint, expectedLock stageprovider.DeploymentOperationCatalogLockIdentity) error {
@@ -194,6 +208,7 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 		HarborFlowBuild:           config.CodeEdgePhase1Binding.HarborFlowBuild,
 		CatalogReceiptFingerprint: config.CodeEdgePhase1Binding.CatalogReceiptFingerprint,
 		LockIdentity:              config.CodeEdgePhase1Binding.LockIdentity,
+		CompatibleLockProofs:      config.CodeEdgePhase1CompatibleLockProofs,
 	})
 	if err != nil {
 		return nil, err

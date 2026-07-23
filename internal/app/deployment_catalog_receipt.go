@@ -63,6 +63,10 @@ type DeploymentCatalogLockIdentityResolver interface {
 type TemplateDeploymentCatalogResolver struct {
 	Template workflowadapter.TemplateReference
 	Resolver DeploymentCatalogReceiptResolver
+	// CompatibleLockProofs names exact prior lock identities that this package
+	// has reviewed as having the same execution contract as Resolver's current
+	// lock. They are composition-owned static inputs, never Run data.
+	CompatibleLockProofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof
 }
 
 type deploymentCatalogBinding struct {
@@ -72,6 +76,7 @@ type deploymentCatalogBinding struct {
 	lockResolver          DeploymentCatalogLockIdentityResolver
 	lockIdentity          *stageprovider.DeploymentOperationCatalogLockIdentity
 	canonicalLockIdentity []byte
+	compatibleLockIDs     map[stageprovider.DeploymentOperationCatalogLockIdentity]struct{}
 }
 
 // deploymentCatalogRegistry is an immutable, template-keyed deployment
@@ -99,7 +104,7 @@ func newDeploymentCatalogRegistry(configured []TemplateDeploymentCatalogResolver
 		if _, duplicate := registry.bindings[entry.Template]; duplicate {
 			return nil, fmt.Errorf("%w: duplicate deployment catalog binding for workflow template %s@%s", stageprovider.ErrDeploymentOperationCatalogDrift, entry.Template.ID, entry.Template.Version)
 		}
-		binding, err := newDeploymentCatalogBinding(entry.Resolver)
+		binding, err := newDeploymentCatalogBinding(entry.Resolver, entry.CompatibleLockProofs)
 		if err != nil {
 			return nil, fmt.Errorf("configure deployment catalog binding %s@%s: %w", entry.Template.ID, entry.Template.Version, err)
 		}
@@ -145,7 +150,7 @@ func (registry *deploymentCatalogRegistry) soleBinding() (*deploymentCatalogBind
 	return nil, false
 }
 
-func newDeploymentCatalogBinding(resolver DeploymentCatalogReceiptResolver) (*deploymentCatalogBinding, error) {
+func newDeploymentCatalogBinding(resolver DeploymentCatalogReceiptResolver, compatibleProofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof) (*deploymentCatalogBinding, error) {
 	if resolver == nil {
 		return nil, nil
 	}
@@ -189,6 +194,21 @@ func newDeploymentCatalogBinding(resolver DeploymentCatalogReceiptResolver) (*de
 		binding.lockResolver = lockResolver
 		binding.lockIdentity = &identity
 		binding.canonicalLockIdentity = canonicalIdentity
+		if len(compatibleProofs) != 0 {
+			compatibilityVerifier, ok := resolver.(stageprovider.DeploymentOperationCatalogLockCompatibilityVerifier)
+			if !ok {
+				return nil, fmt.Errorf("%w: deployment catalog lock resolver cannot verify compatibility proofs", stageprovider.ErrDeploymentOperationCatalogLockUnavailable)
+			}
+			if err := stageprovider.VerifyDeploymentOperationCatalogLockCompatibilityProofs(compatibilityVerifier, compatibleProofs); err != nil {
+				return nil, err
+			}
+			binding.compatibleLockIDs = make(map[stageprovider.DeploymentOperationCatalogLockIdentity]struct{}, len(compatibleProofs))
+			for _, proof := range compatibleProofs {
+				binding.compatibleLockIDs[proof.Predecessor] = struct{}{}
+			}
+		}
+	} else if len(compatibleProofs) != 0 {
+		return nil, fmt.Errorf("%w: deployment catalog compatibility proofs require a lock-aware resolver", stageprovider.ErrDeploymentOperationCatalogLockUnavailable)
 	}
 	return binding, nil
 }
@@ -404,14 +424,24 @@ func (core *lifecycleServiceCore) verifyDeploymentCatalogLockIdentity(template w
 	if err != nil {
 		return fmt.Errorf("canonicalize frozen deployment catalog lock identity: %w", err)
 	}
-	if !bytes.Equal(canonical, binding.canonicalLockIdentity) {
-		return fmt.Errorf("%w: frozen deployment catalog lock identity is not this deployment's canonical identity", stageprovider.ErrDeploymentOperationCatalogLockDrift)
+	if *identity == *binding.lockIdentity {
+		if !bytes.Equal(canonical, binding.canonicalLockIdentity) {
+			return fmt.Errorf("%w: frozen deployment catalog lock identity is not this deployment's canonical identity", stageprovider.ErrDeploymentOperationCatalogLockDrift)
+		}
+		if err := binding.lockResolver.VerifyLockIdentity(*identity); err != nil {
+			return fmt.Errorf("verify frozen deployment catalog lock identity: %w", err)
+		}
+		return nil
 	}
-	if *identity != *binding.lockIdentity {
+	if _, compatible := binding.compatibleLockIDs[*identity]; !compatible {
 		return fmt.Errorf("%w: frozen deployment catalog lock identity differs from this deployment", stageprovider.ErrDeploymentOperationCatalogLockDrift)
 	}
-	if err := binding.lockResolver.VerifyLockIdentity(*identity); err != nil {
-		return fmt.Errorf("verify frozen deployment catalog lock identity: %w", err)
+	// A predecessor alias never bypasses verification of the currently
+	// installed static lock. The compatibility proof was checked at composition
+	// time against this exact contract; this repeat check protects every worker
+	// admission from a mutated resolver implementation.
+	if err := binding.lockResolver.VerifyLockIdentity(*binding.lockIdentity); err != nil {
+		return fmt.Errorf("verify installed deployment catalog lock identity for compatible predecessor: %w", err)
 	}
 	return nil
 }

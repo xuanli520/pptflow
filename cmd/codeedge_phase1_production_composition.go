@@ -25,6 +25,7 @@ type codeEdgePhase1ProductionCompositionConfig struct {
 	HarborFlowBuild           stageprovider.HarborFlowBuildIdentity
 	CatalogReceiptFingerprint workflowkit.Fingerprint
 	LockIdentity              stageprovider.DeploymentOperationCatalogLockIdentity
+	CompatibleLockProofs      []stageprovider.DeploymentOperationCatalogLockCompatibilityProof
 }
 
 // codeEdgePhase1ProductionComposition is the independently attested parent
@@ -86,6 +87,7 @@ func newCodeEdgePhase1ProductionComposition(config codeEdgePhase1ProductionCompo
 	if err != nil {
 		return nil, err
 	}
+	composition.CatalogBinding.CompatibleLockProofs = append([]stageprovider.DeploymentOperationCatalogLockCompatibilityProof(nil), config.CompatibleLockProofs...)
 	return composition, nil
 }
 

@@ -21,6 +21,22 @@ var (
 	codeEdgePhase1ProductionBuildLockFingerprint           string
 )
 
+// codeEdgePhase1CompatibleLockProofs is a deliberately narrow bridge for
+// Phase-1 Runs frozen by the 2026.07.22.8 package. Its predecessor identity is
+// complete, and the execution-contract fingerprint was calculated from that
+// package's lock after excluding only the release build provenance and lock
+// version. A later package whose catalog, operation records, executable
+// hashes, profiles, or compliance policy differs will fail composition rather
+// than silently retaining this alias.
+var codeEdgePhase1CompatibleLockProofs = []stageprovider.DeploymentOperationCatalogLockCompatibilityProof{{
+	Predecessor: stageprovider.DeploymentOperationCatalogLockIdentity{
+		LockID:      "codeedge-phase1-parent-production-lock",
+		LockVersion: "2026.07.22.8",
+		Fingerprint: workflowkitFingerprint("sha256:a6d29e05b80770ed960ae9d8f076b0f01bd5a941e9178f49b977b8de514d143c"),
+	},
+	ExecutionContractFingerprint: workflowkitFingerprint("sha256:e82e2c2d863c446f728618c2c51b439a369df38f1f3add0c274831bb68c852d3"),
+}}
+
 // codeEdgePhase1ProductionBuildBinding is the complete linker-bound identity
 // of the parent deployment materials.  Root composition compares it with the
 // independently bound Standard and evaluator identities before it creates a
