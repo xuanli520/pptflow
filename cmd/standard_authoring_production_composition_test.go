@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
+	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -36,6 +37,12 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	lockIdentity := stageprovider.DeploymentOperationCatalogLockIdentity{
 		LockID: lock.LockID, LockVersion: lock.LockVersion, Fingerprint: lockFingerprint,
 	}
+	admission := codeedge.TaskAdmissionContract{
+		ID: "codeedge-phase1-composition-test", Version: "1.0.0", Profile: codeEdgePhase1DefinitionProviderPreflightProfile(t),
+	}
+	if err := admission.Validate(); err != nil {
+		t.Fatalf("construct CodeEdge admission fixture: %v", err)
+	}
 	composition, err := newStandardAuthoringProductionComposition(standardAuthoringProductionCompositionConfig{
 		CatalogPath:               filepath.Join(deploymentRoot, "operation-catalog.v1.json"),
 		LockPath:                  filepath.Join(deploymentRoot, "operation-catalog.lock.json"),
@@ -45,6 +52,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 		HarborFlowBuild:           lock.HarborFlowBuild,
 		CatalogReceiptFingerprint: receiptFingerprint,
 		LockIdentity:              lockIdentity,
+		AdmissionContract:         &admission,
 	})
 	if err != nil {
 		t.Fatalf("construct Standard authoring production composition: %v", err)
