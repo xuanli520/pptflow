@@ -1088,6 +1088,9 @@ func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) 
 	return []string{
 		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+		// CodeEdge verifiers publish their binary reward under /logs. Keep that
+		// protocol path ephemeral and constrained while the image root stays read-only.
+		"--tmpfs", "/logs:rw,noexec,nosuid,size=8m",
 		// Docker's --mount grammar treats a bare "rw" field as invalid. Bind
 		// mounts are writable unless readonly is set, so omitting it preserves the
 		// controlled Oracle worktree's required write access.

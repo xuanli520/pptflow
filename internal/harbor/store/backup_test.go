@@ -15,6 +15,7 @@ import (
 func TestBackupIfDueAndCriticalOperation(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)
+	stopBackupLoopForTest(t, s)
 	initial, err := s.ListVerifiedBackups()
 	if err != nil {
 		t.Fatal(err)
@@ -73,6 +74,8 @@ func TestBackupIfDueSerializesAcrossStoreProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
+	stopBackupLoopForTest(t, first)
+	stopBackupLoopForTest(t, second)
 	before, err := first.ListVerifiedBackups()
 	if err != nil || len(before) == 0 {
 		t.Fatalf("initial backups = %+v, %v", before, err)
@@ -117,6 +120,7 @@ func TestBackupIfDueSerializesAcrossStoreProcesses(t *testing.T) {
 func TestBackupIfDueDoesNotTreatIneligibleSchemaBackupAsProtection(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)
+	stopBackupLoopForTest(t, s)
 	if err := os.RemoveAll(s.backupDir); err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +152,7 @@ func TestBackupIfDueDoesNotTreatIneligibleSchemaBackupAsProtection(t *testing.T)
 func TestBackupIfDueDoesNotTrustCachedBackupAfterChecksumDrift(t *testing.T) {
 	ctx := context.Background()
 	s := tempDB(t)
+	stopBackupLoopForTest(t, s)
 
 	// Open creates the first backup. The first explicit interval preflight
 	// fully admits it and installs the in-process eligibility cache.
@@ -184,6 +189,7 @@ func TestOpenRestoresLatestVerifiedBackupAfterCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stopBackupLoopForTest(t, s)
 	task, err := s.CreateTaskV2(ctx, CreateTaskV2Request{Slug: "recoverable", Actor: "tester"})
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +234,7 @@ func TestRestoreSkipsBackupWithInvalidChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stopBackupLoopForTest(t, s)
 	first, err := s.CreateTaskV2(ctx, CreateTaskV2Request{Slug: "first", Actor: "tester"})
 	if err != nil {
 		t.Fatal(err)
@@ -415,6 +422,19 @@ func writeConsolidatedV2RecoveryBackup(t *testing.T, root, name string, createdA
 	}
 	writeRecoveryBackupManifest(t, path, createdAt)
 	return path
+}
+
+// stopBackupLoopForTest removes the production background scheduler before a
+// test substitutes Store.now. Without this synchronization, the scheduler can
+// observe the test's synthetic clock and publish an unintended future backup.
+func stopBackupLoopForTest(t *testing.T, s *Store) {
+	t.Helper()
+	if s == nil || !s.backupLoopStarted {
+		return
+	}
+	close(s.backupStop)
+	<-s.backupDone
+	s.backupLoopStarted = false
 }
 
 func mutateRecoveryBackup(t *testing.T, path string, mutate func(*sql.DB) error) {

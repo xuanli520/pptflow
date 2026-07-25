@@ -153,7 +153,7 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 		t.Fatalf("controlled verifier programs = initial=%#v oracle=%#v", initialCommand.Args, oracleCommand.Args)
 	}
 	for _, command := range []CodeEdgePhase1Command{initialCommand, oracleCommand} {
-		if !containsParentArg(command.Args, "--network") || !containsParentArg(command.Args, "none") || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "--entrypoint") || !containsParentArg(command.Args, "/bin/sh") {
+		if !containsParentArg(command.Args, "--network") || !containsParentArg(command.Args, "none") || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "/tmp:rw,noexec,nosuid,size=64m") || !containsParentArg(command.Args, "/logs:rw,noexec,nosuid,size=8m") || !containsParentArg(command.Args, "--entrypoint") || !containsParentArg(command.Args, "/bin/sh") {
 			t.Fatalf("verification command missed isolation flag: %#v", command.Args)
 		}
 		mount := codeEdgePhase1TestArgAfter(command.Args, "--mount")

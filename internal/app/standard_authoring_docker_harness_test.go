@@ -62,7 +62,7 @@ func TestStandardAuthoringDockerHarnessBuildsOnceReattestsAndCompletesFullValida
 			}
 		case "run":
 			runCount++
-			for _, required := range []string{"--network", "none", "--read-only", "--cap-drop", "ALL", "no-new-privileges", "/tmp:rw,noexec,nosuid,size=64m", "--entrypoint", "/bin/sh"} {
+			for _, required := range []string{"--network", "none", "--read-only", "--cap-drop", "ALL", "no-new-privileges", "/tmp:rw,noexec,nosuid,size=64m", "/logs:rw,noexec,nosuid,size=8m", "--entrypoint", "/bin/sh"} {
 				if !containsParentArg(command.Args, required) {
 					t.Fatalf("verification command missing %q: %#v", required, command.Args)
 				}
