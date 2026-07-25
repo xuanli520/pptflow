@@ -266,7 +266,7 @@ func commandInDoubtAuthoringHandoffFixtureWithFailure(t *testing.T, ctx context.
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringWorkflowTemplateVersion, SessionManifestJSON: `{"mode":"standard"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version, SessionManifestJSON: `{"mode":"standard"}`,
 		IdempotencyKey: "command-handoff-session-" + t.Name(), Actor: "author", Reason: "freeze command handoff session",
 	})
 	if err != nil {

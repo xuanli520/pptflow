@@ -3,7 +3,7 @@
   "version": "1",
   "template": {
     "id": "harbor.standard-authoring",
-    "version": "1.7.0"
+    "version": "2.0.0"
   },
   "operations": [
     {
@@ -43,12 +43,12 @@
     },
     {
       "stage_key": "dockerfile_generate",
-      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "2.0.0", "relative_path": "prompts/dockerfile-generate.json"},
+      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "2.1.0", "relative_path": "prompts/dockerfile-generate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "dockerfile_build_validate",
-      "prompt": {"id": "standard-authoring.dockerfile-build-validate.prompt", "version": "1.0.0", "relative_path": "prompts/dockerfile-build-validate.json"},
+      "prompt": {"id": "standard-authoring.dockerfile-build-validate.prompt", "version": "1.1.0", "relative_path": "prompts/dockerfile-build-validate.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
@@ -58,22 +58,22 @@
     },
     {
       "stage_key": "solve_generate",
-      "prompt": {"id": "standard-authoring.solve-generate.prompt", "version": "1.5.0", "relative_path": "prompts/solve-generate.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
+      "prompt": {"id": "standard-authoring.solve-generate.prompt", "version": "1.6.0", "relative_path": "prompts/solve-generate.json"},
+      "schema": {"id": "standard-authoring.codex-fixed-file-submit-schema", "version": "1.0.0", "relative_path": "schemas/codex-fixed-file-submit.schema.json"}
     },
     {
       "stage_key": "test_generate",
-      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.6.0", "relative_path": "prompts/test-generate.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
+      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.7.0", "relative_path": "prompts/test-generate.json"},
+      "schema": {"id": "standard-authoring.codex-fixed-file-submit-schema", "version": "1.0.0", "relative_path": "schemas/codex-fixed-file-submit.schema.json"}
     },
     {
       "stage_key": "authoring_harness",
-      "prompt": {"id": "standard-authoring.authoring-harness.prompt", "version": "1.0.0", "relative_path": "prompts/authoring-harness.json"},
+      "prompt": {"id": "standard-authoring.authoring-harness.prompt", "version": "1.1.0", "relative_path": "prompts/authoring-harness.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {
       "stage_key": "tests_analysis",
-      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "1.6.0", "relative_path": "prompts/tests-analysis.json"},
+      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "2.0.0", "relative_path": "prompts/tests-analysis.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {

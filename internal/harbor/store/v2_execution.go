@@ -20,32 +20,15 @@ const workflowRunSelect = `
 // would let a direct Store caller bypass the application-level persisted
 // handoff artifact verification.
 const (
-	standardAuthoringParentTemplateID                    = "harbor.standard-authoring"
-	standardAuthoringParentTemplateVersion               = "1.2.0"
-	standardAuthoringTaskAdmissionParentTemplateVersion  = "1.3.0"
-	standardAuthoringBriefParentTemplateVersion          = "1.4.0"
-	standardAuthoringRepairFeedbackParentTemplateVersion = "1.5.0"
-	standardAuthoringTestsAnalysisInputTemplateVersion   = "1.6.0"
-	standardAuthoringHarnessParentTemplateVersion        = "1.7.0"
-	standardAuthoringFixedFileParentTemplateVersion      = "1.8.0"
-	codeEdgePhase1ChildTemplateID                        = "harbor.codeedge-phase1"
-	codeEdgePhase1ChildTemplateVersion                   = "2.2.0"
-	standardAuthoringChildTrigger                        = "standard-authoring.materialized"
+	standardAuthoringParentTemplateID      = "harbor.standard-authoring"
+	standardAuthoringParentTemplateVersion = "2.0.0"
+	codeEdgePhase1ChildTemplateID          = "harbor.codeedge-phase1"
+	codeEdgePhase1ChildTemplateVersion     = "2.2.0"
+	standardAuthoringChildTrigger          = "standard-authoring.materialized"
 )
 
 func isStandardAuthoringParentTemplateVersion(version string) bool {
-	switch version {
-	case standardAuthoringParentTemplateVersion,
-		standardAuthoringTaskAdmissionParentTemplateVersion,
-		standardAuthoringBriefParentTemplateVersion,
-		standardAuthoringRepairFeedbackParentTemplateVersion,
-		standardAuthoringTestsAnalysisInputTemplateVersion,
-		standardAuthoringHarnessParentTemplateVersion,
-		standardAuthoringFixedFileParentTemplateVersion:
-		return true
-	default:
-		return false
-	}
+	return version == standardAuthoringParentTemplateVersion
 }
 
 func (s *Store) CreateWorkflowRun(ctx context.Context, request CreateWorkflowRunRequest) (WorkflowRun, error) {

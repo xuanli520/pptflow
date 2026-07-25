@@ -1,7 +1,6 @@
 package workflowadapter
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -9,41 +8,6 @@ import (
 )
 
 const standardAuthoringPolicyTestImage = "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
-func TestStandardAuthoringEnvironmentPolicyCanonicalJSONAndContentDigest(t *testing.T) {
-	policy, err := NewStandardAuthoringEnvironmentPolicy(standardAuthoringPolicyTestImage)
-	if err != nil {
-		t.Fatalf("create environment policy: %v", err)
-	}
-	canonical, err := policy.CanonicalJSON()
-	if err != nil {
-		t.Fatalf("canonicalize environment policy: %v", err)
-	}
-	want := `{"format":"harbor.standard-authoring-environment-policy.v1","version":"1","base_image":"` + standardAuthoringPolicyTestImage + `"}`
-	if string(canonical) != want {
-		t.Fatalf("canonical policy = %s, want %s", canonical, want)
-	}
-	digest, err := policy.ContentDigest()
-	if err != nil {
-		t.Fatalf("environment policy digest: %v", err)
-	}
-	if digest != workflowkit.SHA256Fingerprint(canonical) {
-		t.Fatalf("environment policy digest = %q, want plain canonical SHA-256", digest)
-	}
-	fingerprint, err := policy.Fingerprint()
-	if err != nil || fingerprint != digest {
-		t.Fatalf("environment policy fingerprint = %q, %v; want %q", fingerprint, err, digest)
-	}
-
-	parsed, err := ParseStandardAuthoringEnvironmentPolicyJSON(canonical)
-	if err != nil || parsed != policy {
-		t.Fatalf("parse canonical policy = %+v, %v; want %+v", parsed, err, policy)
-	}
-	var direct StandardAuthoringEnvironmentPolicy
-	if err := json.Unmarshal(canonical, &direct); err != nil || direct != policy {
-		t.Fatalf("direct strict policy decode = %+v, %v; want %+v", direct, err, policy)
-	}
-}
 
 func TestStandardAuthoringEnvironmentPolicyRejectsMutableOrAmbiguousImages(t *testing.T) {
 	digest := strings.Repeat("a", 64)
@@ -70,21 +34,6 @@ func TestStandardAuthoringEnvironmentPolicyRejectsMutableOrAmbiguousImages(t *te
 	} {
 		if _, err := NewStandardAuthoringEnvironmentPolicy(image); err != nil {
 			t.Fatalf("NewStandardAuthoringEnvironmentPolicy(%q) = %v, want success", image, err)
-		}
-	}
-}
-
-func TestParseStandardAuthoringEnvironmentPolicyJSONIsStrict(t *testing.T) {
-	valid := `{"format":"harbor.standard-authoring-environment-policy.v1","version":"1","base_image":"` + standardAuthoringPolicyTestImage + `"}`
-	invalid := []string{
-		`{"format":"harbor.standard-authoring-environment-policy.v1","version":"1","base_image":"` + standardAuthoringPolicyTestImage + `","unexpected":true}`,
-		`{"format":"harbor.standard-authoring-environment-policy.v1","version":"1","base_image":"` + standardAuthoringPolicyTestImage + `","base_image":"` + standardAuthoringPolicyTestImage + `"}`,
-		valid + ` {}`,
-		`null`,
-	}
-	for _, raw := range invalid {
-		if _, err := ParseStandardAuthoringEnvironmentPolicyJSON([]byte(raw)); err == nil {
-			t.Fatalf("ParseStandardAuthoringEnvironmentPolicyJSON(%s) succeeded, want failure", raw)
 		}
 	}
 }
@@ -148,10 +97,7 @@ func TestValidateDockerfileBaseImage(t *testing.T) {
 }
 
 func TestStandardAuthoringCatalogConsumesEnvironmentPolicyOnlyWhereRequired(t *testing.T) {
-	template := StandardAuthoringWorkflowTemplate()
-	if template.Version != "1.2.0" || template.Catalog.Version != "1.2.0" {
-		t.Fatalf("authoring template/catalog version = %s/%s, want 1.2.0/1.2.0", template.Version, template.Catalog.Version)
-	}
+	template := StandardAuthoringCurrentWorkflowTemplate()
 	if err := template.Validate(); err != nil {
 		t.Fatalf("validate authoring template: %v", err)
 	}
@@ -161,31 +107,17 @@ func TestStandardAuthoringCatalogConsumesEnvironmentPolicyOnlyWhereRequired(t *t
 		t.Fatalf("compile authoring template: %v", err)
 	}
 
-	consumers := map[workflowkit.StageKey]bool{
-		workflowkit.StageKey(TaskDesign):        true,
-		workflowkit.StageKey(GenerateTaskFiles): true,
-		workflowkit.StageKey(DockerfileGen):     true,
-		workflowkit.StageKey(ContentReview):     true,
-		workflowkit.StageKey(MaterializeTask):   true,
-		workflowkit.StageKey(InstructionGen):    false,
-		workflowkit.StageKey(TaskTOMLGen):       false,
-		workflowkit.StageKey(SolveGen):          false,
-		workflowkit.StageKey(SolutionReview):    false,
-	}
-	for key, wantsInput := range consumers {
+	for _, key := range StandardAuthoringStageOrder() {
 		stage, found := resolved.Descriptor.Stage(key)
 		if !found {
 			t.Fatalf("compiled authoring descriptor is missing stage %q", key)
 		}
-		input, hasInput := artifactSpecNamed(stage.Inputs, StandardAuthoringEnvironmentPolicyArtifact)
-		if hasInput != wantsInput {
-			t.Fatalf("stage %q environment policy input presence = %t, want %t", key, hasInput, wantsInput)
+		if _, present := artifactSpecNamed(stage.Inputs, "environment_policy"); present {
+			t.Fatalf("stage %q retains a second environment policy input", key)
 		}
-		if hasInput && (!input.Required || input.SchemaVersion != StandardAuthoringEnvironmentPolicySchemaVersion) {
-			t.Fatalf("stage %q environment policy input = %+v", key, input)
-		}
-		if resourcePresent(stage.ReadSet, resourceAuthoringEnvironmentPolicy) != wantsInput {
-			t.Fatalf("stage %q environment policy read-set membership differs from input contract", key)
+		contract, present := artifactSpecNamed(stage.Inputs, AuthoringContractArtifact)
+		if !present || !contract.Required || contract.SchemaVersion != AuthoringContractSchemaVersion {
+			t.Fatalf("stage %q root contract = %+v", key, contract)
 		}
 	}
 
@@ -193,7 +125,7 @@ func TestStandardAuthoringCatalogConsumesEnvironmentPolicyOnlyWhereRequired(t *t
 	if !found {
 		t.Fatal("Standard task workflow lacks dockerfile_generate")
 	}
-	if _, present := artifactSpecNamed(standardDockerfile.Inputs, StandardAuthoringEnvironmentPolicyArtifact); present {
+	if _, present := artifactSpecNamed(standardDockerfile.Inputs, "environment_policy"); present {
 		t.Fatal("task-revision Standard workflow unexpectedly consumes the AuthoringSession environment policy")
 	}
 }

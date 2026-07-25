@@ -254,22 +254,15 @@ func validateAuthoringRunExecutionSpec(specification workflowadapter.RunExecutio
 	if err := validateRunExecutionSpecOperationResolver(specification, resolver); err != nil {
 		return err
 	}
-	environmentPolicy, err := standardAuthoringEnvironmentPolicyInputFromSession(session)
-	if err != nil {
-		return fmt.Errorf("authoring session environment policy: %w", err)
-	}
-	if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
-		return err
-	}
-	brief, err := standardAuthoringBriefInputFromSession(session)
-	if err != nil {
-		return fmt.Errorf("authoring session brief: %w", err)
-	}
-	if err := validateStandardAuthoringBriefBindings(specification, brief); err != nil {
-		return err
-	}
 	if core == nil {
 		return fmt.Errorf("authoring execution specification deployment catalog is not configured")
+	}
+	contract, err := standardAuthoringContractInputFromSession(context.Background(), core.objects, session)
+	if err != nil {
+		return fmt.Errorf("authoring session root contract: %w", err)
+	}
+	if err := validateStandardAuthoringContractBindings(specification, contract); err != nil {
+		return err
 	}
 	if err := core.validateDeploymentCatalogExecutionSpec(specification); err != nil {
 		return err

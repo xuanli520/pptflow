@@ -29,14 +29,14 @@ const (
 
 	standardAuthoringLaunchAction                       LifecycleMutationAction = "authoring.start"
 	standardAuthoringLaunchSessionManifestFormat                                = "harbor.standard-authoring-session.v1"
-	standardAuthoringLaunchSessionManifestVersion                               = "3"
+	standardAuthoringLaunchSessionManifestVersion                               = "4"
 	standardAuthoringLaunchTrigger                                              = "authoring.standard.create"
 	standardAuthoringLaunchIdentityDomain                                       = "harbor.standard-authoring.launch.identity.v1"
 	standardAuthoringLaunchDefinitionDomain                                     = "harbor.standard-authoring.launch-definition.v1"
 	standardAuthoringLaunchStaticDefinitionDomain                               = "harbor.standard-authoring.launch-static-definition.v1"
 	standardAuthoringLaunchPreparationFingerprintDomain                         = "harbor.standard-authoring.launch-preparation.v1"
 	standardAuthoringLaunchPreparationFormat                                    = "harbor.standard-authoring-launch-preparation.v1"
-	standardAuthoringLaunchPreparationVersion                                   = "4"
+	standardAuthoringLaunchPreparationVersion                                   = "5"
 	standardAuthoringLaunchPreparationFileName                                  = "deployment-definition.json"
 	standardAuthoringLaunchPreparationMaxBytes          int64                   = 1 << 20
 	standardAuthoringLaunchCaptureReceiptFormat                                 = "harbor.standard-authoring-launch-capture-receipt.v1"
@@ -44,7 +44,7 @@ const (
 	standardAuthoringLaunchCaptureReceiptFileName                               = "capture-receipt.json"
 	standardAuthoringLaunchCaptureReceiptMaxBytes       int64                   = 1 << 20
 	standardAuthoringLaunchRequestRecordFormat                                  = "harbor.standard-authoring-launch-request.v1"
-	standardAuthoringLaunchRequestRecordVersion                                 = "1"
+	standardAuthoringLaunchRequestRecordVersion                                 = "2"
 	standardAuthoringLaunchRequestRecordFileName                                = "launch-request.json"
 	standardAuthoringLaunchRequestRecordMaxBytes        int64                   = 1 << 20
 	standardAuthoringLaunchCaptureFailureFormat                                 = "harbor.standard-authoring-launch-capture-failure.v1"
@@ -148,6 +148,8 @@ type StandardAuthoringLaunchCommand struct {
 	BaseImage     string
 	TaskType      string
 	Application   string
+	CodeLang      string
+	Is0To1        bool
 	Objective     string
 	Slug          string
 	Title         string
@@ -197,16 +199,7 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 		return LifecycleMutationReceipt{}, err
 	}
 	command.RepositoryURL, command.CommitSHA = coordinate.RepositoryURL, coordinate.CommitSHA
-	environmentPolicy, err := workflowadapter.NewStandardAuthoringEnvironmentPolicy(command.BaseImage)
-	if err != nil {
-		return LifecycleMutationReceipt{}, fmt.Errorf("Standard authoring base image: %w", err)
-	}
-	command.BaseImage = environmentPolicy.BaseImage
-	brief, err := workflowadapter.NewStandardAuthoringBrief(command.TaskType, command.Application, command.Objective)
-	if err != nil {
-		return LifecycleMutationReceipt{}, fmt.Errorf("Standard authoring brief: %w", err)
-	}
-	command.TaskType, command.Application, command.Objective = brief.TaskType, brief.Application, brief.Objective
+	command.CodeLang = strings.TrimSpace(command.CodeLang)
 	if err := validateStandardAuthoringLaunchCommand(command); err != nil {
 		return LifecycleMutationReceipt{}, err
 	}
@@ -216,14 +209,6 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 		return LifecycleMutationReceipt{}, err
 	}
 	ids, err := standardAuthoringLaunchIdentities(command.IdempotencyKey)
-	if err != nil {
-		return LifecycleMutationReceipt{}, err
-	}
-	environmentPolicyInput, err := newStandardAuthoringEnvironmentPolicyInput(ids.EnvironmentPolicyArtifactID, environmentPolicy)
-	if err != nil {
-		return LifecycleMutationReceipt{}, err
-	}
-	briefInput, err := newStandardAuthoringBriefInput(ids.BriefArtifactID, brief)
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
 	}
@@ -261,6 +246,8 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 		BaseImage:     command.BaseImage,
 		TaskType:      command.TaskType,
 		Application:   command.Application,
+		CodeLang:      command.CodeLang,
+		Is0To1:        command.Is0To1,
 		Objective:     command.Objective,
 		Slug:          strings.TrimSpace(command.Slug),
 		Title:         strings.TrimSpace(command.Title),
@@ -301,7 +288,7 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 		if definitionErr != nil {
 			return LifecycleMutationReceipt{}, definitionErr
 		}
-		expected, preparationErr := newStandardAuthoringLaunchPreparation(op, ids, deploymentDefinition, environmentPolicyInput, briefInput)
+		expected, preparationErr := newStandardAuthoringLaunchPreparation(op, ids, deploymentDefinition)
 		if preparationErr != nil {
 			return LifecycleMutationReceipt{}, preparationErr
 		}
@@ -310,7 +297,7 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 		}
 		preparation = stored
 	} else {
-		preparation, err = service.ensureStandardAuthoringLaunchPreparation(ctx, lease.directory, op, ids, freshDeploymentDefinition, environmentPolicyInput, briefInput)
+		preparation, err = service.ensureStandardAuthoringLaunchPreparation(ctx, lease.directory, op, ids, freshDeploymentDefinition)
 		if err != nil {
 			return LifecycleMutationReceipt{}, err
 		}
@@ -345,11 +332,22 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 		RepositoryURL:        source.RepositoryURL,
 		CommitSHA:            source.CommitSHA,
 	}
-	frozen, err := service.freezeStandardAuthoringDefinition(ctx, subject, preparation)
+	contract, err := newStandardAuthoringLaunchContract(ids.ContractArtifactID, task, source, command, preparation.ProfileFingerprint)
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
 	}
-	sessionManifest, err := standardAuthoringSessionManifestJSON(source, task, subject.AuthoringSessionID, op.ID, preparation, frozen)
+	object, err := service.core.objects.PutBytes(ctx, contract.CanonicalJSON)
+	if err != nil {
+		return LifecycleMutationReceipt{}, fmt.Errorf("store Standard authoring contract: %w", err)
+	}
+	if object.Digest != contract.ContentDigest || object.SizeBytes != int64(len(contract.CanonicalJSON)) {
+		return LifecycleMutationReceipt{}, fmt.Errorf("stored Standard authoring contract does not match its canonical binding")
+	}
+	frozen, err := service.freezeStandardAuthoringDefinition(ctx, subject, preparation, contract)
+	if err != nil {
+		return LifecycleMutationReceipt{}, err
+	}
+	sessionManifest, err := standardAuthoringSessionManifestJSON(source, task, subject.AuthoringSessionID, op.ID, preparation, frozen, contract)
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
 	}
@@ -367,7 +365,7 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
 	}
-	if err := verifyStandardAuthoringLaunchSession(session, source, task, op.ID, preparation, frozen); err != nil {
+	if err := verifyStandardAuthoringLaunchSession(session, source, task, op.ID, preparation, frozen, contract); err != nil {
 		return LifecycleMutationReceipt{}, err
 	}
 
@@ -401,22 +399,20 @@ func (service *StandardAuthoringLaunchService) Start(ctx context.Context, comman
 }
 
 type standardAuthoringLaunchIDs struct {
-	SourceID                    string
-	TaskID                      string
-	SessionID                   string
-	RunID                       string
-	EnvironmentPolicyArtifactID string
-	BriefArtifactID             string
+	SourceID           string
+	TaskID             string
+	SessionID          string
+	RunID              string
+	ContractArtifactID string
 }
 
 func standardAuthoringLaunchIdentities(idempotencyKey string) (standardAuthoringLaunchIDs, error) {
 	return standardAuthoringLaunchIDs{
-		SourceID:                    standardAuthoringLaunchIdentity(idempotencyKey, "source"),
-		TaskID:                      standardAuthoringLaunchIdentity(idempotencyKey, "task"),
-		SessionID:                   standardAuthoringLaunchIdentity(idempotencyKey, "session"),
-		RunID:                       standardAuthoringLaunchIdentity(idempotencyKey, "run"),
-		EnvironmentPolicyArtifactID: standardAuthoringLaunchIdentity(idempotencyKey, "environment-policy"),
-		BriefArtifactID:             standardAuthoringLaunchIdentity(idempotencyKey, "authoring-brief"),
+		SourceID:           standardAuthoringLaunchIdentity(idempotencyKey, "source"),
+		TaskID:             standardAuthoringLaunchIdentity(idempotencyKey, "task"),
+		SessionID:          standardAuthoringLaunchIdentity(idempotencyKey, "session"),
+		RunID:              standardAuthoringLaunchIdentity(idempotencyKey, "run"),
+		ContractArtifactID: standardAuthoringLaunchIdentity(idempotencyKey, "authoring-contract"),
 	}, nil
 }
 
@@ -431,46 +427,26 @@ func standardAuthoringLaunchIdentity(idempotencyKey, entity string) string {
 	return derived.String()
 }
 
-// standardAuthoringEnvironmentPolicyInput is the small immutable bridge from
-// a session manifest to a normal workflow artifact binding.  The policy bytes
-// are already canonical and content-addressed, so they do not need a second
-// mutable database row or a synthetic stage attempt merely to be visible to
-// the frozen execution contract.
-type standardAuthoringEnvironmentPolicyInput struct {
-	ArtifactID    workflowkit.ArtifactID
-	Policy        workflowadapter.StandardAuthoringEnvironmentPolicy
-	CanonicalJSON []byte
-	ContentDigest workflowkit.Fingerprint
-}
-
-func newStandardAuthoringEnvironmentPolicyInput(artifactID string, policy workflowadapter.StandardAuthoringEnvironmentPolicy) (standardAuthoringEnvironmentPolicyInput, error) {
-	if err := store.ValidateUUIDv7(artifactID); err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, fmt.Errorf("Standard authoring environment policy artifact ID: %w", err)
+func newStandardAuthoringLaunchContract(artifactID string, task store.TaskV2, source store.AuthoringSource, command StandardAuthoringLaunchCommand, profileFingerprint workflowkit.Fingerprint) (standardAuthoringContractInput, error) {
+	if task.ID == "" || task.Slug != strings.TrimSpace(command.Slug) || task.Title != strings.TrimSpace(command.Title) ||
+		source.RepositoryURL != command.RepositoryURL || source.CommitSHA != command.CommitSHA {
+		return standardAuthoringContractInput{}, fmt.Errorf("Standard authoring contract facts differ from the frozen task or source")
 	}
-	canonical, err := policy.CanonicalJSON()
+	contract, err := workflowadapter.NewAuthoringContract(
+		workflowadapter.AuthoringContractTask{
+			ID: task.ID, Slug: task.Slug, Title: task.Title, CodeLang: command.CodeLang,
+			TaskType: command.TaskType, Application: command.Application, Is0To1: command.Is0To1,
+		},
+		workflowadapter.AuthoringContractSource{
+			RepositoryURL: source.RepositoryURL, CommitSHA: source.CommitSHA,
+			SnapshotDigest: source.SnapshotContentDigest, CheckoutRoot: "source",
+		},
+		command.BaseImage, command.Objective, string(profileFingerprint),
+	)
 	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, fmt.Errorf("canonicalize Standard authoring environment policy: %w", err)
+		return standardAuthoringContractInput{}, fmt.Errorf("create Standard authoring contract: %w", err)
 	}
-	digest, err := policy.ContentDigest()
-	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, fmt.Errorf("fingerprint Standard authoring environment policy: %w", err)
-	}
-	return standardAuthoringEnvironmentPolicyInput{
-		ArtifactID: workflowkit.ArtifactID(artifactID), Policy: policy, CanonicalJSON: canonical, ContentDigest: digest,
-	}, nil
-}
-
-func (input standardAuthoringEnvironmentPolicyInput) artifactReference() workflowadapter.ArtifactReference {
-	return workflowadapter.ArtifactReference{
-		ID: input.ArtifactID, ContentDigest: input.ContentDigest, SchemaVersion: workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion,
-	}
-}
-
-func (input standardAuthoringEnvironmentPolicyInput) artifactBinding() workflowkit.ArtifactBinding {
-	return workflowkit.ArtifactBinding{
-		Name: workflowadapter.StandardAuthoringEnvironmentPolicyArtifact, ArtifactID: input.ArtifactID,
-		ContentDigest: input.ContentDigest, SchemaVersion: workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion,
-	}
+	return newStandardAuthoringContractInput(artifactID, contract)
 }
 
 // standardAuthoringLaunchAdmissionOperationID is a deterministic lock-only
@@ -503,17 +479,31 @@ func validateStandardAuthoringLaunchCommand(command StandardAuthoringLaunchComma
 	if strings.TrimSpace(command.Title) == "" {
 		return fmt.Errorf("title is required")
 	}
+	if strings.TrimSpace(command.BaseImage) != command.BaseImage || strings.TrimSpace(command.TaskType) != command.TaskType ||
+		strings.TrimSpace(command.Application) != command.Application || strings.TrimSpace(command.Objective) != command.Objective ||
+		command.BaseImage == "" || command.TaskType == "" || command.Application == "" || command.Objective == "" {
+		return fmt.Errorf("Standard authoring contract facts must be non-empty and canonical")
+	}
 	if _, err := workflowadapter.NewStandardAuthoringEnvironmentPolicy(command.BaseImage); err != nil {
 		return fmt.Errorf("Standard authoring base image: %w", err)
 	}
-	brief, err := workflowadapter.NewStandardAuthoringBrief(command.TaskType, command.Application, command.Objective)
-	if err != nil || brief.TaskType != command.TaskType || brief.Application != command.Application || brief.Objective != command.Objective {
-		if err != nil {
-			return fmt.Errorf("Standard authoring brief: %w", err)
-		}
-		return fmt.Errorf("Standard authoring brief is not canonical")
+	if !standardAuthoringLaunchToken(strings.TrimSpace(command.CodeLang)) {
+		return fmt.Errorf("Standard authoring code language must match [a-z][a-z0-9-]{0,63}")
 	}
 	return nil
+}
+
+func standardAuthoringLaunchToken(value string) bool {
+	if len(value) == 0 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func standardAuthoringLaunchCoordinate(command StandardAuthoringLaunchCommand) (StandardAuthoringSourceCoordinate, error) {
@@ -931,12 +921,6 @@ type standardAuthoringLaunchPreparation struct {
 	WorkflowTemplateID            string                                                `json:"workflow_template_id"`
 	WorkflowTemplateVersion       string                                                `json:"workflow_template_version"`
 	SourceSnapshotSchemaVersion   string                                                `json:"source_snapshot_schema_version"`
-	EnvironmentPolicyArtifactID   string                                                `json:"environment_policy_artifact_id"`
-	EnvironmentPolicy             json.RawMessage                                       `json:"environment_policy"`
-	EnvironmentPolicyDigest       workflowkit.Fingerprint                               `json:"environment_policy_digest"`
-	BriefArtifactID               string                                                `json:"brief_artifact_id"`
-	Brief                         json.RawMessage                                       `json:"brief"`
-	BriefDigest                   workflowkit.Fingerprint                               `json:"brief_digest"`
 	ExecutionProfile              json.RawMessage                                       `json:"execution_profile"`
 	ProfileFingerprint            workflowkit.Fingerprint                               `json:"profile_fingerprint"`
 	DeploymentCatalogReceipt      json.RawMessage                                       `json:"deployment_catalog_receipt,omitempty"`
@@ -1009,8 +993,8 @@ func standardAuthoringStaticDefinitionFingerprint(profile, receipt []byte, lock 
 	})
 }
 
-func newStandardAuthoringLaunchPreparation(operation store.LifecycleOperation, ids standardAuthoringLaunchIDs, definition standardAuthoringLaunchDeploymentDefinition, environmentPolicy standardAuthoringEnvironmentPolicyInput, brief standardAuthoringBriefInput) (standardAuthoringLaunchPreparation, error) {
-	preparationFingerprint, err := standardAuthoringLaunchPreparationFingerprint(definition.Fingerprint, environmentPolicy, brief)
+func newStandardAuthoringLaunchPreparation(operation store.LifecycleOperation, ids standardAuthoringLaunchIDs, definition standardAuthoringLaunchDeploymentDefinition) (standardAuthoringLaunchPreparation, error) {
+	preparationFingerprint, err := standardAuthoringLaunchPreparationFingerprint(definition.Fingerprint)
 	if err != nil {
 		return standardAuthoringLaunchPreparation{}, err
 	}
@@ -1025,12 +1009,6 @@ func newStandardAuthoringLaunchPreparation(operation store.LifecycleOperation, i
 		WorkflowTemplateID:            definition.Profile.Template.ID,
 		WorkflowTemplateVersion:       definition.Profile.Template.Version,
 		SourceSnapshotSchemaVersion:   StandardAuthoringSourceSnapshotSchemaVersion,
-		EnvironmentPolicyArtifactID:   string(environmentPolicy.ArtifactID),
-		EnvironmentPolicy:             append(json.RawMessage(nil), environmentPolicy.CanonicalJSON...),
-		EnvironmentPolicyDigest:       environmentPolicy.ContentDigest,
-		BriefArtifactID:               string(brief.ArtifactID),
-		Brief:                         append(json.RawMessage(nil), brief.CanonicalJSON...),
-		BriefDigest:                   brief.ContentDigest,
 		ExecutionProfile:              append(json.RawMessage(nil), definition.ProfileCanonical...),
 		ProfileFingerprint:            definition.ProfileFingerprint,
 		DeploymentCatalogReceipt:      append(json.RawMessage(nil), definition.DeploymentCatalogReceipt...),
@@ -1039,45 +1017,13 @@ func newStandardAuthoringLaunchPreparation(operation store.LifecycleOperation, i
 	}, nil
 }
 
-func standardAuthoringLaunchPreparationFingerprint(definition workflowkit.Fingerprint, environmentPolicy standardAuthoringEnvironmentPolicyInput, brief standardAuthoringBriefInput) (workflowkit.Fingerprint, error) {
+func standardAuthoringLaunchPreparationFingerprint(definition workflowkit.Fingerprint) (workflowkit.Fingerprint, error) {
 	if err := definition.Validate(); err != nil {
 		return "", fmt.Errorf("Standard authoring static definition fingerprint: %w", err)
 	}
 	return workflowkit.FingerprintParts(standardAuthoringLaunchPreparationFingerprintDomain, []workflowkit.FingerprintPart{
-		{Name: "authoring_brief", Value: append([]byte(nil), brief.CanonicalJSON...)},
-		{Name: "environment_policy", Value: append([]byte(nil), environmentPolicy.CanonicalJSON...)},
 		{Name: "static_definition_fingerprint", Value: []byte(definition)},
 	})
-}
-
-func (preparation standardAuthoringLaunchPreparation) EnvironmentPolicyInput() (standardAuthoringEnvironmentPolicyInput, error) {
-	policy, err := workflowadapter.ParseStandardAuthoringEnvironmentPolicyJSON(preparation.EnvironmentPolicy)
-	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, fmt.Errorf("decode Standard authoring launch preparation environment policy: %w", err)
-	}
-	input, err := newStandardAuthoringEnvironmentPolicyInput(preparation.EnvironmentPolicyArtifactID, policy)
-	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, err
-	}
-	if !bytes.Equal(preparation.EnvironmentPolicy, input.CanonicalJSON) || preparation.EnvironmentPolicyDigest != input.ContentDigest {
-		return standardAuthoringEnvironmentPolicyInput{}, fmt.Errorf("Standard authoring launch preparation environment policy is not canonical")
-	}
-	return input, nil
-}
-
-func (preparation standardAuthoringLaunchPreparation) BriefInput() (standardAuthoringBriefInput, error) {
-	brief, err := workflowadapter.ParseStandardAuthoringBriefJSON(preparation.Brief)
-	if err != nil {
-		return standardAuthoringBriefInput{}, fmt.Errorf("decode Standard authoring launch preparation brief: %w", err)
-	}
-	input, err := newStandardAuthoringBriefInput(preparation.BriefArtifactID, brief)
-	if err != nil {
-		return standardAuthoringBriefInput{}, err
-	}
-	if !bytes.Equal(preparation.Brief, input.CanonicalJSON) || preparation.BriefDigest != input.ContentDigest {
-		return standardAuthoringBriefInput{}, fmt.Errorf("Standard authoring launch preparation brief is not canonical")
-	}
-	return input, nil
 }
 
 func (preparation standardAuthoringLaunchPreparation) DeploymentDefinition() (standardAuthoringLaunchDeploymentDefinition, error) {
@@ -1091,18 +1037,11 @@ func (preparation standardAuthoringLaunchPreparation) DeploymentDefinition() (st
 		value string
 	}{
 		{"lifecycle operation", preparation.LifecycleOperationID}, {"requested source", preparation.RequestedSourceID}, {"Task", preparation.TargetTaskID},
-		{"authoring session", preparation.AuthoringSessionID}, {"Run", preparation.RunID}, {"environment policy artifact", preparation.EnvironmentPolicyArtifactID}, {"brief artifact", preparation.BriefArtifactID},
+		{"authoring session", preparation.AuthoringSessionID}, {"Run", preparation.RunID},
 	} {
 		if err := store.ValidateUUIDv7(identity.value); err != nil {
 			return standardAuthoringLaunchDeploymentDefinition{}, fmt.Errorf("Standard authoring launch preparation %s ID: %w", identity.name, err)
 		}
-	}
-	if _, err := preparation.EnvironmentPolicyInput(); err != nil {
-		return standardAuthoringLaunchDeploymentDefinition{}, err
-	}
-	brief, err := preparation.BriefInput()
-	if err != nil {
-		return standardAuthoringLaunchDeploymentDefinition{}, err
 	}
 	profile, err := workflowadapter.ParseExecutionProfileJSON(preparation.ExecutionProfile)
 	if err != nil {
@@ -1115,11 +1054,7 @@ func (preparation standardAuthoringLaunchPreparation) DeploymentDefinition() (st
 	if definition.Profile.Template.ID != preparation.WorkflowTemplateID || definition.Profile.Template.Version != preparation.WorkflowTemplateVersion {
 		return standardAuthoringLaunchDeploymentDefinition{}, fmt.Errorf("Standard authoring launch preparation profile differs from its template identity")
 	}
-	environmentPolicy, err := preparation.EnvironmentPolicyInput()
-	if err != nil {
-		return standardAuthoringLaunchDeploymentDefinition{}, err
-	}
-	preparationFingerprint, err := standardAuthoringLaunchPreparationFingerprint(definition.Fingerprint, environmentPolicy, brief)
+	preparationFingerprint, err := standardAuthoringLaunchPreparationFingerprint(definition.Fingerprint)
 	if err != nil {
 		return standardAuthoringLaunchDeploymentDefinition{}, err
 	}
@@ -1188,14 +1123,14 @@ func (preparation standardAuthoringLaunchPreparation) CanonicalJSON() ([]byte, e
 	return json.Marshal(preparation)
 }
 
-func (service *StandardAuthoringLaunchService) ensureStandardAuthoringLaunchPreparation(ctx context.Context, directory *os.File, operation store.LifecycleOperation, ids standardAuthoringLaunchIDs, definition standardAuthoringLaunchDeploymentDefinition, environmentPolicy standardAuthoringEnvironmentPolicyInput, brief standardAuthoringBriefInput) (standardAuthoringLaunchPreparation, error) {
+func (service *StandardAuthoringLaunchService) ensureStandardAuthoringLaunchPreparation(ctx context.Context, directory *os.File, operation store.LifecycleOperation, ids standardAuthoringLaunchIDs, definition standardAuthoringLaunchDeploymentDefinition) (standardAuthoringLaunchPreparation, error) {
 	if err := ctx.Err(); err != nil {
 		return standardAuthoringLaunchPreparation{}, err
 	}
 	if operation.Action != string(standardAuthoringLaunchAction) || operation.State != store.LifecycleOperationPrepared || operation.TaskID != ids.TaskID || operation.RunID != ids.RunID {
 		return standardAuthoringLaunchPreparation{}, fmt.Errorf("%w: Standard authoring lifecycle operation %s", store.ErrIdempotencyConflict, operation.ID)
 	}
-	expected, err := newStandardAuthoringLaunchPreparation(operation, ids, definition, environmentPolicy, brief)
+	expected, err := newStandardAuthoringLaunchPreparation(operation, ids, definition)
 	if err != nil {
 		return standardAuthoringLaunchPreparation{}, err
 	}
@@ -1261,26 +1196,16 @@ func verifyStandardAuthoringLaunchPreparation(stored, expected standardAuthoring
 	if stored.Format != expected.Format || stored.Version != expected.Version || stored.LifecycleOperationID != expected.LifecycleOperationID ||
 		stored.RequestedSourceID != expected.RequestedSourceID || stored.TargetTaskID != expected.TargetTaskID || stored.AuthoringSessionID != expected.AuthoringSessionID || stored.RunID != expected.RunID ||
 		stored.WorkflowTemplateID != expected.WorkflowTemplateID || stored.WorkflowTemplateVersion != expected.WorkflowTemplateVersion || stored.SourceSnapshotSchemaVersion != expected.SourceSnapshotSchemaVersion ||
-		stored.EnvironmentPolicyArtifactID != expected.EnvironmentPolicyArtifactID || !bytes.Equal(stored.EnvironmentPolicy, expected.EnvironmentPolicy) || stored.EnvironmentPolicyDigest != expected.EnvironmentPolicyDigest ||
-		stored.BriefArtifactID != expected.BriefArtifactID || !bytes.Equal(stored.Brief, expected.Brief) || stored.BriefDigest != expected.BriefDigest ||
 		!sameStandardAuthoringLaunchDeploymentDefinition(storedDefinition, expectedDefinition) {
 		return fmt.Errorf("%w: Standard authoring deployment definition changed for prepared lifecycle operation %s", store.ErrIdempotencyConflict, expected.LifecycleOperationID)
 	}
 	return nil
 }
 
-func (service *StandardAuthoringLaunchService) freezeStandardAuthoringDefinition(ctx context.Context, subject StandardAuthoringRunDefinitionSubject, expected standardAuthoringLaunchPreparation) (standardAuthoringFrozenDefinition, error) {
+func (service *StandardAuthoringLaunchService) freezeStandardAuthoringDefinition(ctx context.Context, subject StandardAuthoringRunDefinitionSubject, expected standardAuthoringLaunchPreparation, contract standardAuthoringContractInput) (standardAuthoringFrozenDefinition, error) {
 	expectedDefinition, err := expected.DeploymentDefinition()
 	if err != nil {
 		return standardAuthoringFrozenDefinition{}, fmt.Errorf("read Standard authoring prepared deployment definition: %w", err)
-	}
-	environmentPolicy, err := expected.EnvironmentPolicyInput()
-	if err != nil {
-		return standardAuthoringFrozenDefinition{}, fmt.Errorf("read Standard authoring prepared environment policy: %w", err)
-	}
-	brief, err := expected.BriefInput()
-	if err != nil {
-		return standardAuthoringFrozenDefinition{}, fmt.Errorf("read Standard authoring prepared brief: %w", err)
 	}
 	definition, err := service.definitions.StandardAuthoringRunDefinition(ctx, subject)
 	if err != nil {
@@ -1293,13 +1218,9 @@ func (service *StandardAuthoringLaunchService) freezeStandardAuthoringDefinition
 	if selection.Kind != workflowadapter.RunSelectionAuthoringSession || selection.AuthoringSourceID != subject.SourceID || selection.AuthoringSessionID != subject.AuthoringSessionID || selection.AuthoringSourceDigest != subject.SourceSnapshotDigest {
 		return standardAuthoringFrozenDefinition{}, fmt.Errorf("Standard authoring deployment definition does not bind the frozen source/session subject")
 	}
-	definition.ExecutionSpec, err = definition.ExecutionSpec.BindManagedArtifactInput(workflowadapter.StandardAuthoringEnvironmentPolicyArtifact, environmentPolicy.artifactReference())
+	definition.ExecutionSpec, err = definition.ExecutionSpec.BindManagedArtifactInput(workflowadapter.AuthoringContractArtifact, contract.artifactReference())
 	if err != nil {
-		return standardAuthoringFrozenDefinition{}, fmt.Errorf("bind Standard authoring environment policy to frozen execution specification: %w", err)
-	}
-	definition.ExecutionSpec, err = definition.ExecutionSpec.BindManagedArtifactInput(workflowadapter.StandardAuthoringBriefArtifact, brief.artifactReference())
-	if err != nil {
-		return standardAuthoringFrozenDefinition{}, fmt.Errorf("bind Standard authoring brief to frozen execution specification: %w", err)
+		return standardAuthoringFrozenDefinition{}, fmt.Errorf("bind Standard authoring contract to frozen execution specification: %w", err)
 	}
 	if err := definition.ExecutionSpec.ValidateWithOperationResolver(service.core.operationResolver); err != nil {
 		return standardAuthoringFrozenDefinition{}, fmt.Errorf("validate Standard authoring deployment execution specification: %w", err)
@@ -1386,12 +1307,9 @@ type standardAuthoringSessionManifest struct {
 	TargetTaskID                  string                                                `json:"target_task_id"`
 	SourceSnapshotDigest          string                                                `json:"source_snapshot_digest"`
 	SourceSnapshotSchemaVersion   string                                                `json:"source_snapshot_schema_version"`
-	EnvironmentPolicyArtifactID   string                                                `json:"environment_policy_artifact_id"`
-	EnvironmentPolicy             json.RawMessage                                       `json:"environment_policy"`
-	EnvironmentPolicyDigest       workflowkit.Fingerprint                               `json:"environment_policy_digest"`
-	BriefArtifactID               string                                                `json:"brief_artifact_id"`
-	Brief                         json.RawMessage                                       `json:"brief"`
-	BriefDigest                   workflowkit.Fingerprint                               `json:"brief_digest"`
+	ContractArtifactID            string                                                `json:"contract_artifact_id"`
+	ContractDigest                workflowkit.Fingerprint                               `json:"contract_digest"`
+	ContractSizeBytes             int64                                                 `json:"contract_size_bytes"`
 	ProfileFingerprint            workflowkit.Fingerprint                               `json:"profile_fingerprint"`
 	ExecutionSpecFingerprint      workflowkit.Fingerprint                               `json:"execution_spec_fingerprint"`
 	DefinitionFingerprint         workflowkit.Fingerprint                               `json:"definition_fingerprint"`
@@ -1399,15 +1317,7 @@ type standardAuthoringSessionManifest struct {
 	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity `json:"deployment_catalog_lock_identity,omitempty"`
 }
 
-func standardAuthoringSessionManifestJSON(source store.AuthoringSource, task store.TaskV2, sessionID, operationID string, preparation standardAuthoringLaunchPreparation, frozen standardAuthoringFrozenDefinition) (string, error) {
-	environmentPolicy, err := preparation.EnvironmentPolicyInput()
-	if err != nil {
-		return "", fmt.Errorf("read Standard authoring session environment policy: %w", err)
-	}
-	brief, err := preparation.BriefInput()
-	if err != nil {
-		return "", fmt.Errorf("read Standard authoring session brief: %w", err)
-	}
+func standardAuthoringSessionManifestJSON(source store.AuthoringSource, task store.TaskV2, sessionID, operationID string, preparation standardAuthoringLaunchPreparation, frozen standardAuthoringFrozenDefinition, contract standardAuthoringContractInput) (string, error) {
 	manifest := standardAuthoringSessionManifest{
 		Format:                        standardAuthoringLaunchSessionManifestFormat,
 		Version:                       standardAuthoringLaunchSessionManifestVersion,
@@ -1421,12 +1331,9 @@ func standardAuthoringSessionManifestJSON(source store.AuthoringSource, task sto
 		TargetTaskID:                  task.ID,
 		SourceSnapshotDigest:          source.SnapshotContentDigest,
 		SourceSnapshotSchemaVersion:   source.SnapshotSchemaVersion,
-		EnvironmentPolicyArtifactID:   string(environmentPolicy.ArtifactID),
-		EnvironmentPolicy:             append(json.RawMessage(nil), environmentPolicy.CanonicalJSON...),
-		EnvironmentPolicyDigest:       environmentPolicy.ContentDigest,
-		BriefArtifactID:               string(brief.ArtifactID),
-		Brief:                         append(json.RawMessage(nil), brief.CanonicalJSON...),
-		BriefDigest:                   brief.ContentDigest,
+		ContractArtifactID:            string(contract.ArtifactID),
+		ContractDigest:                contract.ContentDigest,
+		ContractSizeBytes:             int64(len(contract.CanonicalJSON)),
 		ProfileFingerprint:            frozen.ProfileFingerprint,
 		ExecutionSpecFingerprint:      frozen.ExecutionSpecFingerprint,
 		DefinitionFingerprint:         frozen.Fingerprint,
@@ -1440,189 +1347,7 @@ func standardAuthoringSessionManifestJSON(source store.AuthoringSource, task sto
 	return string(encoded), nil
 }
 
-func standardAuthoringSessionIntrinsicInputs(session store.AuthoringSession) (standardAuthoringEnvironmentPolicyInput, standardAuthoringBriefInput, error) {
-	var manifest standardAuthoringSessionManifest
-	if err := decodeStrictJSON(session.SessionManifestJSON, &manifest); err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, fmt.Errorf("decode Standard authoring session manifest: %w", err)
-	}
-	if manifest.Format != standardAuthoringLaunchSessionManifestFormat || manifest.Version != standardAuthoringLaunchSessionManifestVersion ||
-		manifest.AuthoringSessionID != session.ID || manifest.SourceID != session.SourceID || manifest.TargetTaskID != session.TargetTaskID ||
-		manifest.SourceSnapshotSchemaVersion != StandardAuthoringSourceSnapshotSchemaVersion ||
-		!workflowadapter.StandardAuthoringCurrentTemplateReference().Equal(workflowadapter.TemplateReference{ID: session.WorkflowTemplateID, Version: session.WorkflowTemplateVersion}) {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, fmt.Errorf("Standard authoring session manifest is not the current immutable authoring contract")
-	}
-	policy, err := workflowadapter.ParseStandardAuthoringEnvironmentPolicyJSON(manifest.EnvironmentPolicy)
-	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, fmt.Errorf("decode Standard authoring session environment policy: %w", err)
-	}
-	input, err := newStandardAuthoringEnvironmentPolicyInput(manifest.EnvironmentPolicyArtifactID, policy)
-	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, err
-	}
-	if !bytes.Equal(manifest.EnvironmentPolicy, input.CanonicalJSON) || manifest.EnvironmentPolicyDigest != input.ContentDigest {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, fmt.Errorf("Standard authoring session environment policy is not canonical")
-	}
-	brief, err := workflowadapter.ParseStandardAuthoringBriefJSON(manifest.Brief)
-	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, fmt.Errorf("decode Standard authoring session brief: %w", err)
-	}
-	briefInput, err := newStandardAuthoringBriefInput(manifest.BriefArtifactID, brief)
-	if err != nil {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, err
-	}
-	if !bytes.Equal(manifest.Brief, briefInput.CanonicalJSON) || manifest.BriefDigest != briefInput.ContentDigest {
-		return standardAuthoringEnvironmentPolicyInput{}, standardAuthoringBriefInput{}, fmt.Errorf("Standard authoring session brief is not canonical")
-	}
-	return input, briefInput, nil
-}
-
-func standardAuthoringEnvironmentPolicyInputFromSession(session store.AuthoringSession) (standardAuthoringEnvironmentPolicyInput, error) {
-	policy, _, err := standardAuthoringSessionIntrinsicInputs(session)
-	return policy, err
-}
-
-func standardAuthoringBriefInputFromSession(session store.AuthoringSession) (standardAuthoringBriefInput, error) {
-	_, brief, err := standardAuthoringSessionIntrinsicInputs(session)
-	return brief, err
-}
-
-// validateStandardAuthoringEnvironmentPolicyBindings proves the policy is not
-// merely recorded in a session manifest: every catalog stage that declares
-// the intrinsic port is bound to the exact canonical policy artifact in the
-// frozen execution spec.  This is deliberately shared by launch admission and
-// worker-time verification so an alternate StartAuthoringRun caller cannot
-// omit or substitute the policy after the session exists.
-func validateStandardAuthoringEnvironmentPolicyBindings(specification workflowadapter.RunExecutionSpec, policy standardAuthoringEnvironmentPolicyInput) error {
-	if err := specification.Validate(); err != nil {
-		return fmt.Errorf("validate Standard authoring execution specification: %w", err)
-	}
-	template, err := workflowadapter.ResolveWorkflowTemplate(specification.Template)
-	if err != nil {
-		return err
-	}
-	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(template.Reference()) {
-		return fmt.Errorf("environment policy binding requires the Standard authoring template")
-	}
-	policyReference := policy.artifactReference()
-	matchedReference := false
-	for _, reference := range specification.References.Artifacts {
-		if reference.ID != policyReference.ID {
-			continue
-		}
-		if reference != policyReference {
-			return fmt.Errorf("Standard authoring environment policy artifact reference differs from the session contract")
-		}
-		matchedReference = true
-	}
-	if !matchedReference {
-		return fmt.Errorf("Standard authoring execution specification does not reference the session environment policy")
-	}
-	consumers := 0
-	for _, stage := range template.Catalog.Stages {
-		usesPolicy := false
-		for _, input := range stage.Inputs {
-			if input.Name == workflowadapter.StandardAuthoringEnvironmentPolicyArtifact {
-				if input.SchemaVersion != workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion || !input.Required {
-					return fmt.Errorf("Standard authoring stage %q has an invalid environment policy contract", stage.Key)
-				}
-				usesPolicy = true
-			}
-		}
-		if !usesPolicy {
-			continue
-		}
-		consumers++
-		resolution, err := specification.ResolveStageOperation(stage.Key)
-		if err != nil {
-			return err
-		}
-		found := false
-		for _, binding := range resolution.ArtifactInputs {
-			if binding.Port != workflowadapter.StandardAuthoringEnvironmentPolicyArtifact {
-				continue
-			}
-			if found || binding.ArtifactID != policyReference.ID {
-				return fmt.Errorf("Standard authoring stage %q environment policy binding differs from the session contract", stage.Key)
-			}
-			found = true
-		}
-		if !found {
-			return fmt.Errorf("Standard authoring stage %q does not bind the session environment policy", stage.Key)
-		}
-	}
-	if consumers == 0 {
-		return fmt.Errorf("Standard authoring template has no environment policy consumers")
-	}
-	return nil
-}
-
-// validateStandardAuthoringBriefBindings proves that every current stage which
-// declares authoring_brief is bound to the exact canonical session artifact.
-func validateStandardAuthoringBriefBindings(specification workflowadapter.RunExecutionSpec, brief standardAuthoringBriefInput) error {
-	if err := specification.Validate(); err != nil {
-		return fmt.Errorf("validate Standard authoring execution specification: %w", err)
-	}
-	template, err := workflowadapter.ResolveWorkflowTemplate(specification.Template)
-	if err != nil {
-		return err
-	}
-	if !template.Reference().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
-		return fmt.Errorf("brief binding requires the Standard authoring %s template", workflowadapter.StandardAuthoringCurrentTemplateReference().Version)
-	}
-	briefReference := brief.artifactReference()
-	matchedReference := false
-	for _, reference := range specification.References.Artifacts {
-		if reference.ID != briefReference.ID {
-			continue
-		}
-		if reference != briefReference {
-			return fmt.Errorf("Standard authoring brief artifact reference differs from the session contract")
-		}
-		matchedReference = true
-	}
-	if !matchedReference {
-		return fmt.Errorf("Standard authoring execution specification does not reference the session brief")
-	}
-	consumers := 0
-	for _, stage := range template.Catalog.Stages {
-		usesBrief := false
-		for _, input := range stage.Inputs {
-			if input.Name == workflowadapter.StandardAuthoringBriefArtifact {
-				if input.SchemaVersion != workflowadapter.StandardAuthoringBriefSchemaVersion || !input.Required {
-					return fmt.Errorf("Standard authoring stage %q has an invalid brief contract", stage.Key)
-				}
-				usesBrief = true
-			}
-		}
-		if !usesBrief {
-			continue
-		}
-		consumers++
-		resolution, err := specification.ResolveStageOperation(stage.Key)
-		if err != nil {
-			return err
-		}
-		found := false
-		for _, binding := range resolution.ArtifactInputs {
-			if binding.Port != workflowadapter.StandardAuthoringBriefArtifact {
-				continue
-			}
-			if found || binding.ArtifactID != briefReference.ID {
-				return fmt.Errorf("Standard authoring stage %q brief binding differs from the session contract", stage.Key)
-			}
-			found = true
-		}
-		if !found {
-			return fmt.Errorf("Standard authoring stage %q does not bind the session brief", stage.Key)
-		}
-	}
-	if consumers == 0 {
-		return fmt.Errorf("Standard authoring template has no brief consumers")
-	}
-	return nil
-}
-
-func verifyStandardAuthoringLaunchSession(session store.AuthoringSession, source store.AuthoringSource, task store.TaskV2, operationID string, preparation standardAuthoringLaunchPreparation, frozen standardAuthoringFrozenDefinition) error {
+func verifyStandardAuthoringLaunchSession(session store.AuthoringSession, source store.AuthoringSource, task store.TaskV2, operationID string, preparation standardAuthoringLaunchPreparation, frozen standardAuthoringFrozenDefinition, contract standardAuthoringContractInput) error {
 	if session.SourceID != source.ID || session.TargetTaskID != task.ID || session.WorkflowTemplateID != preparation.WorkflowTemplateID || session.WorkflowTemplateVersion != preparation.WorkflowTemplateVersion {
 		return fmt.Errorf("%w: persisted Standard authoring session binding", store.ErrIdempotencyConflict)
 	}
@@ -1630,34 +1355,19 @@ func verifyStandardAuthoringLaunchSession(session store.AuthoringSession, source
 	if err := decodeStrictJSON(session.SessionManifestJSON, &manifest); err != nil {
 		return fmt.Errorf("decode persisted Standard authoring session manifest: %w", err)
 	}
-	environmentPolicy, err := preparation.EnvironmentPolicyInput()
-	if err != nil {
-		return err
-	}
-	brief, err := preparation.BriefInput()
-	if err != nil {
-		return err
-	}
 	if manifest.Format != standardAuthoringLaunchSessionManifestFormat || manifest.Version != standardAuthoringLaunchSessionManifestVersion ||
 		manifest.LifecycleOperationID != operationID || manifest.PreparationFingerprint != preparation.PreparationFingerprint ||
 		manifest.RepositoryURL != source.RepositoryURL || manifest.CommitSHA != source.CommitSHA || manifest.RequestedSourceID != preparation.RequestedSourceID || manifest.SourceID != source.ID ||
 		manifest.AuthoringSessionID != session.ID || manifest.TargetTaskID != task.ID || manifest.SourceSnapshotDigest != source.SnapshotContentDigest ||
 		manifest.SourceSnapshotSchemaVersion != source.SnapshotSchemaVersion || manifest.ProfileFingerprint != frozen.ProfileFingerprint ||
-		manifest.EnvironmentPolicyArtifactID != string(environmentPolicy.ArtifactID) || !bytes.Equal(manifest.EnvironmentPolicy, environmentPolicy.CanonicalJSON) || manifest.EnvironmentPolicyDigest != environmentPolicy.ContentDigest ||
-		manifest.BriefArtifactID != string(brief.ArtifactID) || !bytes.Equal(manifest.Brief, brief.CanonicalJSON) || manifest.BriefDigest != brief.ContentDigest ||
+		manifest.ContractArtifactID != string(contract.ArtifactID) || manifest.ContractDigest != contract.ContentDigest || manifest.ContractSizeBytes != int64(len(contract.CanonicalJSON)) ||
 		manifest.ExecutionSpecFingerprint != frozen.ExecutionSpecFingerprint || manifest.DefinitionFingerprint != frozen.Fingerprint ||
 		string(manifest.DeploymentCatalogReceipt) != string(frozen.DeploymentCatalogReceipt) ||
 		!sameDeploymentCatalogLockIdentity(manifest.DeploymentCatalogLockIdentity, frozen.DeploymentCatalogLockIdentity) {
 		return fmt.Errorf("%w: persisted Standard authoring session definition", store.ErrIdempotencyConflict)
 	}
-	if _, _, err := standardAuthoringSessionIntrinsicInputs(session); err != nil {
-		return fmt.Errorf("%w: persisted Standard authoring session intrinsic inputs: %v", store.ErrIdempotencyConflict, err)
-	}
-	if err := validateStandardAuthoringEnvironmentPolicyBindings(frozen.ExecutionSpec, environmentPolicy); err != nil {
-		return fmt.Errorf("%w: persisted Standard authoring session execution policy binding: %v", store.ErrIdempotencyConflict, err)
-	}
-	if err := validateStandardAuthoringBriefBindings(frozen.ExecutionSpec, brief); err != nil {
-		return fmt.Errorf("%w: persisted Standard authoring session execution brief binding: %v", store.ErrIdempotencyConflict, err)
+	if err := validateStandardAuthoringContractBindings(frozen.ExecutionSpec, contract); err != nil {
+		return fmt.Errorf("%w: persisted Standard authoring session execution contract binding: %v", store.ErrIdempotencyConflict, err)
 	}
 	return nil
 }
@@ -1681,6 +1391,8 @@ type standardAuthoringLaunchRequest struct {
 	BaseImage     string `json:"base_image"`
 	TaskType      string `json:"task_type"`
 	Application   string `json:"application"`
+	CodeLang      string `json:"code_lang"`
+	Is0To1        bool   `json:"is_0_to_1"`
 	Objective     string `json:"objective"`
 	Slug          string `json:"slug"`
 	Title         string `json:"title"`

@@ -98,7 +98,7 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 			name:     "CodeEdge evaluator child",
 			template: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
 			record:   fixture.evaluatorLock.Operations[0],
-			wrong:    workflowadapter.StandardAuthoringTemplateReference(),
+			wrong:    workflowadapter.StandardAuthoringCurrentTemplateReference(),
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

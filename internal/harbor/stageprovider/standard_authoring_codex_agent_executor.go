@@ -437,11 +437,15 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
 	}
-	environmentPolicy, err := standardAuthoringCodexDockerfileEnvironmentPolicy(request.Stage, inputs)
+	contract, err := standardAuthoringCodexRootContract(inputs)
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
 	}
-	requestDocument, err := standardAuthoringCodexRequestDocument(request, sealedTemplate, program, inputs, inputFingerprint, environmentPolicy)
+	environmentPolicy, err := standardAuthoringCodexDockerfileEnvironmentPolicy(request.Stage, contract)
+	if err != nil {
+		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
+	}
+	requestDocument, err := standardAuthoringCodexRequestDocument(request, sealedTemplate, program, inputs, inputFingerprint, contract)
 	if err != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
@@ -523,6 +527,12 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 		outputSubmission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now, environmentPolicy)
 		if err != nil {
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		if err := outputSubmission.setStructuredClaimValidation(contract, sourceWorkspace); err != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+		}
+		if err := outputSubmission.setTestsAnalysisRequirementValidation(inputs); err != nil {
+			return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
 		}
 		submission = outputSubmission
 	}
@@ -703,15 +713,13 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionReques
 	}
 	expectedAgentTurns, hasAgentTurnQuota := standardAuthoringCodexAgentTurnQuota(request.Stage)
 	expectedSubmissions, hasSubmissionQuota := standardAuthoringCodexOutputSubmissionQuota(request.Stage)
-	expectedSubmissionUnits := workflowadapter.StandardAuthoringOutputSubmissionClaimUnits
 	if standardAuthoringCodexUsesWorkspaceHarness(request.Stage.Key) {
-		expectedSubmissionUnits = workflowadapter.StandardAuthoringHarnessSubmissionClaimUnits
 		validationUnits, hasValidationQuota := standardAuthoringCodexValidationQuota(request.Stage)
 		if !hasValidationQuota || validationUnits != workflowadapter.StandardAuthoringValidationClaimUnits {
 			return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 		}
 	}
-	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns || !hasSubmissionQuota || expectedSubmissions != expectedSubmissionUnits {
+	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns || !hasSubmissionQuota || expectedSubmissions <= 0 {
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	if request.Claim.Stage == nil || strings.TrimSpace(string(request.Claim.Stage.StageAttempt.ID)) == "" || request.Checkpoint == nil || request.Charge == nil {
@@ -770,19 +778,16 @@ func standardAuthoringCodexUsesWorkspaceHarness(stageKey workflowkit.StageKey) b
 	return stageKey == workflowkit.StageKey(workflowadapter.DockerfileBuildValidate) || stageKey == workflowkit.StageKey(workflowadapter.AuthoringHarness)
 }
 
-// standardAuthoringCodexFixedFileInvocation proves the fixed-file route from
-// all three frozen identities before any attempt workspace is created. A
-// stage key alone is never enough: 1.7.0 solve/test must retain their locked
-// base64 submission contract even when a newer binary is installed.
+// standardAuthoringCodexFixedFileInvocation proves the v2 fixed-file route
+// from all three frozen identities before any attempt workspace is created.
 func standardAuthoringCodexFixedFileInvocation(invocation StageOperationInvocation) (workflowadapter.TemplateReference, bool, error) {
 	request := invocation.Request
-	fixedTemplate := workflowadapter.StandardAuthoringFixedFileTemplateReference()
+	fixedTemplate := workflowadapter.StandardAuthoringCurrentTemplateReference()
 	workflowTemplate := workflowadapter.TemplateReference{ID: request.Execution.Workflow.ID, Version: request.Execution.Workflow.Version}
 	specification, err := workflowkitRequestExecutionSpec(request)
 	if err != nil {
-		// Direct legacy unit fixtures predate the opaque execution-spec
-		// binding. They can retain the ordinary base64 route, but must never
-		// select 1.8.0 without a sealed, matching specification.
+		// Direct unit fixtures without a sealed specification retain the ordinary
+		// base64 route and cannot opt into the v2 fixed-file authority.
 		if invocation.Resolution.Template.Equal(fixedTemplate) || workflowTemplate.Equal(fixedTemplate) {
 			return workflowadapter.TemplateReference{}, false, err
 		}
@@ -847,19 +852,39 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) checkpoint(ctx context.
 
 type standardAuthoringCodexInput struct {
 	Name          string                  `json:"name"`
+	ArtifactID    string                  `json:"artifact_id"`
 	SchemaVersion string                  `json:"schema_version"`
 	ContentDigest workflowkit.Fingerprint `json:"content_digest"`
 	ContentBase64 string                  `json:"content_base64"`
 }
 
+const (
+	// standardAuthoringCodexContextMaxInlineBytes caps all immutable bytes sent
+	// to one model turn. Stage inputs remain available to host validators, but a
+	// deployment cannot accidentally turn a growing report/log artifact into an
+	// unbounded conversational memory channel.
+	standardAuthoringCodexContextMaxInlineBytes = 2 * 1024 * 1024
+	// The catalog currently declares materially fewer ports than this. Keep a
+	// separate cap so a malformed direct invocation cannot make envelope
+	// construction scale with an untrusted binding list.
+	standardAuthoringCodexContextMaxInputs = 32
+	// Base64 and JSON add overhead to the bounded raw input payload. This cap
+	// applies to the exact document passed to the model runtime.
+	standardAuthoringCodexContextMaxDocumentBytes = 3 * 1024 * 1024
+)
+
 func standardAuthoringCodexReadInputs(ctx context.Context, request workflowkit.StageExecutionRequest) ([]standardAuthoringCodexInput, workflowkit.Fingerprint, error) {
 	bindings := append([]workflowkit.ArtifactBinding(nil), request.Inputs...)
 	sort.Slice(bindings, func(left, right int) bool { return bindings[left].Name < bindings[right].Name })
+	if err := validateStandardAuthoringCodexDeclaredInputs(request.Stage, bindings); err != nil {
+		return nil, "", err
+	}
 	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(bindings)
 	if err != nil {
 		return nil, "", err
 	}
 	inputs := make([]standardAuthoringCodexInput, 0, len(bindings))
+	inlineBytes := 0
 	for _, binding := range bindings {
 		if err := binding.Validate(); err != nil {
 			return nil, "", err
@@ -868,53 +893,106 @@ func standardAuthoringCodexReadInputs(ctx context.Context, request workflowkit.S
 		if err != nil || workflowkit.SHA256Fingerprint(content) != binding.ContentDigest {
 			return nil, "", errors.New("frozen stage input is unavailable or changed")
 		}
+		if len(content) > standardAuthoringCodexContextMaxInlineBytes-inlineBytes {
+			return nil, "", errors.New("frozen stage inputs exceed the model context limit")
+		}
+		inlineBytes += len(content)
 		inputs = append(inputs, standardAuthoringCodexInput{
-			Name: binding.Name, SchemaVersion: binding.SchemaVersion, ContentDigest: binding.ContentDigest,
+			Name: binding.Name, ArtifactID: string(binding.ArtifactID), SchemaVersion: binding.SchemaVersion, ContentDigest: binding.ContentDigest,
 			ContentBase64: base64.StdEncoding.EncodeToString(content),
 		})
 	}
 	return inputs, inputFingerprint, nil
 }
 
-// standardAuthoringCodexDockerfileEnvironmentPolicy extracts the intrinsic
-// session policy only for the Dockerfile producer. Its bytes have already been
-// read through the frozen binding and digest-checked by
-// standardAuthoringCodexReadInputs; requiring canonical bytes here prevents an
-// equivalent-but-unfrozen JSON spelling from becoming an output authority.
-func standardAuthoringCodexDockerfileEnvironmentPolicy(stage workflowkit.StageDescriptor, inputs []standardAuthoringCodexInput) (*workflowadapter.StandardAuthoringEnvironmentPolicy, error) {
+// validateStandardAuthoringCodexDeclaredInputs repeats the frozen-port check
+// at the model-context boundary. The generic workflow engine also performs
+// this validation, but an executor must fail closed when called directly by a
+// test adapter or future bridge that bypasses the engine.
+func validateStandardAuthoringCodexDeclaredInputs(stage workflowkit.StageDescriptor, bindings []workflowkit.ArtifactBinding) error {
+	if err := stage.Validate(); err != nil {
+		return fmt.Errorf("model context stage is invalid: %w", err)
+	}
+	if len(stage.Inputs) == 0 || len(stage.Inputs) > standardAuthoringCodexContextMaxInputs || len(bindings) > standardAuthoringCodexContextMaxInputs {
+		return errors.New("model context has an invalid number of declared inputs")
+	}
+	declared := make(map[string]workflowkit.ArtifactSpec, len(stage.Inputs))
+	for _, input := range stage.Inputs {
+		if _, duplicate := declared[input.Name]; duplicate {
+			return errors.New("model context stage has duplicate declared inputs")
+		}
+		declared[input.Name] = input
+	}
+	seen := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		if err := binding.Validate(); err != nil {
+			return err
+		}
+		input, found := declared[binding.Name]
+		if !found || input.SchemaVersion != binding.SchemaVersion {
+			return errors.New("model context includes an undeclared input")
+		}
+		if _, duplicate := seen[binding.Name]; duplicate {
+			return errors.New("model context includes a duplicate input")
+		}
+		seen[binding.Name] = struct{}{}
+	}
+	for _, input := range stage.Inputs {
+		if input.Required {
+			if _, found := seen[input.Name]; !found {
+				return errors.New("model context omits a required input")
+			}
+		}
+	}
+	contract, found := declared[workflowadapter.AuthoringContractArtifact]
+	if !found || !contract.Required || contract.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
+		return errors.New("model context stage does not declare the required root contract")
+	}
+	if _, found := seen[workflowadapter.AuthoringContractArtifact]; !found {
+		return errors.New("model context omits the root contract")
+	}
+	return nil
+}
+
+func standardAuthoringCodexRootContract(inputs []standardAuthoringCodexInput) (workflowadapter.AuthoringContract, error) {
+	for _, input := range inputs {
+		if input.Name != workflowadapter.AuthoringContractArtifact {
+			continue
+		}
+		if input.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
+			return workflowadapter.AuthoringContract{}, errors.New("root contract schema is invalid")
+		}
+		raw, err := base64.StdEncoding.DecodeString(input.ContentBase64)
+		if err != nil || workflowkit.SHA256Fingerprint(raw) != input.ContentDigest {
+			return workflowadapter.AuthoringContract{}, errors.New("root contract content is invalid")
+		}
+		contract, err := workflowadapter.ParseAuthoringContractJSON(raw)
+		if err != nil {
+			return workflowadapter.AuthoringContract{}, errors.New("root contract is invalid")
+		}
+		canonical, err := contract.CanonicalJSON()
+		if err != nil || !bytes.Equal(canonical, raw) {
+			return workflowadapter.AuthoringContract{}, errors.New("root contract is not canonical")
+		}
+		return contract, nil
+	}
+	return workflowadapter.AuthoringContract{}, errors.New("root contract is missing")
+}
+
+// standardAuthoringCodexDockerfileEnvironmentPolicy derives the sole Docker
+// authority from the root contract rather than accepting a second policy input.
+func standardAuthoringCodexDockerfileEnvironmentPolicy(stage workflowkit.StageDescriptor, contract workflowadapter.AuthoringContract) (*workflowadapter.StandardAuthoringEnvironmentPolicy, error) {
 	if stage.Key != workflowkit.StageKey(workflowadapter.DockerfileGen) && !standardAuthoringCodexUsesWorkspaceHarness(stage.Key) {
 		return nil, nil
 	}
-
-	var policy *workflowadapter.StandardAuthoringEnvironmentPolicy
-	for _, input := range inputs {
-		if input.Name != workflowadapter.StandardAuthoringEnvironmentPolicyArtifact {
-			continue
-		}
-		if policy != nil || input.SchemaVersion != workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion {
-			return nil, errors.New("frozen Dockerfile environment policy binding is invalid")
-		}
-		content, err := base64.StdEncoding.DecodeString(input.ContentBase64)
-		if err != nil || workflowkit.SHA256Fingerprint(content) != input.ContentDigest {
-			return nil, errors.New("frozen Dockerfile environment policy content is invalid")
-		}
-		parsed, err := workflowadapter.ParseStandardAuthoringEnvironmentPolicyJSON(content)
-		if err != nil {
-			return nil, errors.New("frozen Dockerfile environment policy is invalid")
-		}
-		canonical, err := parsed.CanonicalJSON()
-		if err != nil || !bytes.Equal(canonical, content) {
-			return nil, errors.New("frozen Dockerfile environment policy is not canonical")
-		}
-		policy = &parsed
+	policy, err := contract.EnvironmentPolicy()
+	if err != nil {
+		return nil, errors.New("root contract environment is invalid")
 	}
-	if policy == nil {
-		return nil, errors.New("frozen Dockerfile environment policy is missing")
-	}
-	return policy, nil
+	return &policy, nil
 }
 
-func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, template workflowadapter.TemplateReference, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) ([]byte, error) {
+func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, template workflowadapter.TemplateReference, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint, contract workflowadapter.AuthoringContract) ([]byte, error) {
 	outputs := make([]struct {
 		Name          string `json:"name"`
 		SchemaVersion string `json:"schema_version"`
@@ -925,25 +1003,52 @@ func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionReq
 			SchemaVersion string `json:"schema_version"`
 		}{Name: output.Name, SchemaVersion: output.SchemaVersion})
 	}
-	var frozenEnvironmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy
-	if request.Stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) || standardAuthoringCodexUsesWorkspaceHarness(request.Stage.Key) {
-		if environmentPolicy == nil || environmentPolicy.Validate() != nil {
-			return nil, errors.New("frozen Dockerfile environment policy is unavailable")
+	var root standardAuthoringCodexInput
+	envelopeInputs := make([]workflowadapter.AuthoringContextInput, 0, len(inputs)-1)
+	repairs := make([]workflowadapter.AuthoringContextRepair, 0)
+	artifacts := make([]standardAuthoringCodexInput, 0, len(inputs)-1)
+	for _, input := range inputs {
+		if input.Name == workflowadapter.AuthoringContractArtifact {
+			if root.Name != "" {
+				return nil, errors.New("multiple root contract inputs")
+			}
+			root = input
+			continue
 		}
-		policyCopy := *environmentPolicy
-		frozenEnvironmentPolicy = &policyCopy
+		envelopeInputs = append(envelopeInputs, workflowadapter.AuthoringContextInput{Name: input.Name, ArtifactID: input.ArtifactID, Digest: string(input.ContentDigest)})
+		artifacts = append(artifacts, input)
+		if standardAuthoringCodexRepairInput(request.Stage, input) {
+			repairs = append(repairs, workflowadapter.AuthoringContextRepair{ID: input.ArtifactID, Target: string(request.Stage.Key), Reason: "untrusted repair feedback", State: "open", EvidenceDigest: string(input.ContentDigest)})
+		}
 	}
-	return json.Marshal(struct {
-		Format                  string                                              `json:"format"`
-		Version                 string                                              `json:"version"`
-		ProgramID               string                                              `json:"program_id"`
-		ProgramVersion          string                                              `json:"program_version"`
-		ProgramFingerprint      workflowkit.Fingerprint                             `json:"program_fingerprint"`
-		OutputSchemaFingerprint workflowkit.Fingerprint                             `json:"output_schema_fingerprint"`
-		StageKey                workflowkit.StageKey                                `json:"stage_key"`
-		InputFingerprint        workflowkit.Fingerprint                             `json:"input_fingerprint"`
-		Inputs                  []standardAuthoringCodexInput                       `json:"inputs"`
-		FrozenEnvironmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy `json:"frozen_environment_policy,omitempty"`
+	if root.Name == "" || root.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
+		return nil, errors.New("root contract input is missing")
+	}
+	canonical, err := contract.CanonicalJSON()
+	if err != nil || workflowkit.SHA256Fingerprint(canonical) != root.ContentDigest {
+		return nil, errors.New("root contract input does not match canonical contract")
+	}
+	attempt := 1
+	if request.Claim.Stage != nil {
+		attempt = request.Claim.Stage.StageAttempt.Ordinal
+	}
+	envelope := workflowadapter.AuthoringContextEnvelope{
+		Format: workflowadapter.AuthoringContextEnvelopeFormat, Version: workflowadapter.AuthoringContextEnvelopeVersion,
+		Contract: workflowadapter.AuthoringContextContract{ArtifactID: root.ArtifactID, Digest: string(root.ContentDigest), Content: canonical},
+		Stage:    workflowadapter.AuthoringContextStage{Key: string(request.Stage.Key), Attempt: attempt},
+		Inputs:   envelopeInputs, Repairs: repairs,
+	}
+	document := struct {
+		Format                  string                                   `json:"format"`
+		Version                 string                                   `json:"version"`
+		ProgramID               string                                   `json:"program_id"`
+		ProgramVersion          string                                   `json:"program_version"`
+		ProgramFingerprint      workflowkit.Fingerprint                  `json:"program_fingerprint"`
+		OutputSchemaFingerprint workflowkit.Fingerprint                  `json:"output_schema_fingerprint"`
+		StageKey                workflowkit.StageKey                     `json:"stage_key"`
+		InputFingerprint        workflowkit.Fingerprint                  `json:"input_fingerprint"`
+		Context                 workflowadapter.AuthoringContextEnvelope `json:"context"`
+		Artifacts               []standardAuthoringCodexInput            `json:"artifacts"`
 		Outputs                 []struct {
 			Name          string `json:"name"`
 			SchemaVersion string `json:"schema_version"`
@@ -952,8 +1057,36 @@ func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionReq
 		Format: StandardAuthoringCodexTurnRequestFormat, Version: StandardAuthoringCodexTurnRequestVersion,
 		ProgramID: program.ID, ProgramVersion: program.Version, ProgramFingerprint: program.Fingerprint,
 		OutputSchemaFingerprint: StandardAuthoringCodexOutputSchemaFingerprintForTemplateStage(template, request.Stage.Key), StageKey: request.Stage.Key,
-		InputFingerprint: inputFingerprint, Inputs: inputs, FrozenEnvironmentPolicy: frozenEnvironmentPolicy, Outputs: outputs,
-	})
+		InputFingerprint: inputFingerprint, Context: envelope, Artifacts: artifacts, Outputs: outputs,
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > standardAuthoringCodexContextMaxDocumentBytes {
+		return nil, errors.New("model context document exceeds the size limit")
+	}
+	return encoded, nil
+}
+
+// standardAuthoringCodexRepairInput recognizes only continuation-only,
+// optional evidence ports from the v2 catalog. A normal required gate
+// decision is an upstream claim, not an unresolved repair instruction.
+func standardAuthoringCodexRepairInput(stage workflowkit.StageDescriptor, candidate standardAuthoringCodexInput) bool {
+	for _, input := range stage.Inputs {
+		if input.Name != candidate.Name || input.Required || input.SchemaVersion != candidate.SchemaVersion {
+			continue
+		}
+		switch candidate.Name {
+		case "task_review_decision", "content_review_decision", "solution_review_decision":
+			return candidate.SchemaVersion == "harbor.review-decision.v1"
+		case "codeedge_package_admission_report":
+			return candidate.SchemaVersion == "harbor.standard-authoring-task-package-admission.v1"
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func validateStandardAuthoringCodexInvocation(invocation CodexAppServerInvocation) error {

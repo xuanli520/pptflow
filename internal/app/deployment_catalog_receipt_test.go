@@ -612,7 +612,7 @@ func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(
 	// A router has no implicit Standard/current/default bundle. Even a valid
 	// stage operation is rejected if its enclosing frozen template is not one
 	// of the explicitly installed production bundles.
-	standardOperation.Template = workflowadapter.StandardAuthoringTemplateReference()
+	standardOperation.Template = workflowadapter.StandardAuthoringCurrentTemplateReference()
 	if err := router.ValidateStageOperation(standardOperation); !errors.Is(err, stageprovider.ErrProviderUnavailable) {
 		t.Fatalf("multi-template router fell back for an uninstalled template: %v", err)
 	}

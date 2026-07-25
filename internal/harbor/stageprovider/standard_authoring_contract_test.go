@@ -89,7 +89,7 @@ func TestStandardAuthoringRuntimeAttestorReattestsLockedAssetsBeforeEveryEffect(
 
 	calls := 0
 	composition, err := NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
 		Handlers: StandardAuthoringOperationHandlers{
 			HarborBuiltin: HarborBuiltinOperationExecutorFunc(func(context.Context, StageOperationInvocation, workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error) {
 				calls++

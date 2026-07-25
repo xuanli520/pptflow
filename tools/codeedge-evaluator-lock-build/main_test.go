@@ -291,7 +291,6 @@ func TestSourceBuildIdentityExcludesAllGeneratedProductionLocks(t *testing.T) {
 	writeGeneratorFile(t, filepath.Join(root, "stable.txt"), "stable\n", 0o600)
 	generatedLocks := []string{
 		"deployments/standard-authoring/operation-catalog.lock.json",
-		"deployments/standard-authoring-1.8/operation-catalog.lock.json",
 		"deployments/codeedge-phase1/operation-catalog.lock.json",
 		"deployments/codeedge-evaluator-child/operation-catalog.lock.json",
 	}

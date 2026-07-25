@@ -23,7 +23,7 @@ func TestStandardAuthoringProviderCompositionBindsBuiltinAndReviewWithoutFallbac
 	}
 	called := false
 	composition, err := NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
 		Handlers: StandardAuthoringOperationHandlers{
 			HarborBuiltin: HarborBuiltinOperationExecutorFunc(func(_ context.Context, invocation StageOperationInvocation, payload workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error) {
 				called = invocation.Resolution.StageKey == workflowadapter.MaterializeTask && payload.HandlerID == "standard-authoring.materialize-task"
@@ -34,7 +34,7 @@ func TestStandardAuthoringProviderCompositionBindsBuiltinAndReviewWithoutFallbac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !composition.Catalog.Template().Equal(workflowadapter.StandardAuthoringTemplateReference()) || !composition.Verifier.CatalogReceipt().Template.Equal(workflowadapter.StandardAuthoringTemplateReference()) {
+	if !composition.Catalog.Template().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) || !composition.Verifier.CatalogReceipt().Template.Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
 		t.Fatalf("composition did not retain exact Standard authoring template")
 	}
 	for _, resolution := range resolutions {
@@ -88,7 +88,7 @@ func TestStandardAuthoringProviderCompositionInjectsAttestedCodexBridgeWhenNoAge
 		t.Fatal(err)
 	}
 	composition, err := NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
 		CodexWorkspaceRoot: t.TempDir(),
 	})
 	if err != nil {
@@ -102,7 +102,7 @@ func TestStandardAuthoringProviderCompositionInjectsAttestedCodexBridgeWhenNoAge
 	// presence must prevent composition from requiring a Codex workspace for
 	// the automatic bridge, rather than silently constructing two handlers.
 	_, err = NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
 		Handlers: StandardAuthoringOperationHandlers{AgentTurn: AgentTurnOperationExecutorFunc(func(context.Context, StageOperationInvocation, workflowadapter.AgentTurnOperationPayload) (workflowkit.StageExecutionResult, error) {
 			return workflowkit.StageExecutionResult{}, nil
 		})},
@@ -112,7 +112,7 @@ func TestStandardAuthoringProviderCompositionInjectsAttestedCodexBridgeWhenNoAge
 	}
 }
 
-func TestStandardAuthoringProviderCompositionRejectsLegacyCodexConfigurationAfterAuditLoad(t *testing.T) {
+func TestStandardAuthoringProviderCompositionRejectsDriftingCodexConfigurationAfterAuditLoad(t *testing.T) {
 	catalog, lock, _ := standardAuthoringAgentOnlyCompositionFixture(t)
 	legacyDocument := catalog.Catalog()
 	legacyPayload := legacyDocument.Operations[0].Operation.Payload.(workflowadapter.AgentTurnOperationPayload)
@@ -138,7 +138,7 @@ func TestStandardAuthoringProviderCompositionRejectsLegacyCodexConfigurationAfte
 		t.Fatal(err)
 	}
 	_, err = NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Catalog: legacyCatalog, Lock: legacyLock, Attestor: attestor,
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Catalog: legacyCatalog, Lock: legacyLock, Attestor: attestor,
 		Handlers: StandardAuthoringOperationHandlers{AgentTurn: AgentTurnOperationExecutorFunc(func(context.Context, StageOperationInvocation, workflowadapter.AgentTurnOperationPayload) (workflowkit.StageExecutionResult, error) {
 			return workflowkit.StageExecutionResult{}, nil
 		})},
@@ -160,7 +160,7 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 	if err != nil {
 		t.Fatal(err)
 	}
-	definition, found := workflowadapter.StandardAuthoringStageCatalog().Stage(workflowadapter.RepoAnalyze)
+	definition, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowadapter.RepoAnalyze)
 	if !found {
 		t.Fatal("missing Standard authoring repo_analyze stage")
 	}
@@ -179,7 +179,7 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 	catalog, err := NewDeploymentOperationCatalogResolver(DeploymentOperationCatalog{
 		Format: DeploymentOperationCatalogFormat, Version: DeploymentOperationCatalogVersion,
 		CatalogID: "standard-authoring-agent-only-composition-test", CatalogVersion: "test-v1",
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Operations: []DeploymentOperationRegistration{registration},
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Operations: []DeploymentOperationRegistration{registration},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func standardAuthoringProviderCompositionFixture(t *testing.T) (*DeploymentOpera
 	builtin.Operation.ProviderID, review.Operation.ProviderID = provider.ID, provider.ID
 	builtin.Operation.Payload = workflowadapter.HarborBuiltinOperationPayload{HandlerID: "standard-authoring.materialize-task"}
 
-	standard := workflowadapter.StandardAuthoringStageCatalog()
+	standard := workflowadapter.StandardAuthoringContractStageCatalog()
 	registrations := make([]DeploymentOperationRegistration, 0, 2)
 	for _, resolution := range []workflowadapter.StageOperationResolution{builtin, review} {
 		definition, found := standard.Stage(resolution.StageKey)
@@ -245,7 +245,7 @@ func standardAuthoringProviderCompositionFixture(t *testing.T) (*DeploymentOpera
 	document := DeploymentOperationCatalog{
 		Format: DeploymentOperationCatalogFormat, Version: DeploymentOperationCatalogVersion,
 		CatalogID: "standard-authoring-provider-composition-test", CatalogVersion: "test-v1",
-		Template: workflowadapter.StandardAuthoringTemplateReference(), Operations: registrations,
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Operations: registrations,
 	}
 	catalog, err := NewDeploymentOperationCatalogResolver(document)
 	if err != nil {
@@ -324,7 +324,7 @@ func writeStandardAuthoringContractAssets(t *testing.T, root string, lock Deploy
 
 func builtinStageContract(t *testing.T, resolution workflowadapter.StageOperationResolution) DeploymentStageContract {
 	t.Helper()
-	definition, found := workflowadapter.StandardAuthoringStageCatalog().Stage(resolution.StageKey)
+	definition, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(resolution.StageKey)
 	if !found {
 		t.Fatalf("stage %q is missing", resolution.StageKey)
 	}
@@ -332,7 +332,7 @@ func builtinStageContract(t *testing.T, resolution workflowadapter.StageOperatio
 }
 
 func standardAuthoringTestExecutionProfile(t *testing.T) workflowadapter.ExecutionProfile {
-	return standardAuthoringTestExecutionProfileForTemplate(t, workflowadapter.StandardAuthoringTemplateReference())
+	return standardAuthoringTestExecutionProfileForTemplate(t, workflowadapter.StandardAuthoringCurrentTemplateReference())
 }
 
 func standardAuthoringTestExecutionProfileForTemplate(t *testing.T, reference workflowadapter.TemplateReference) workflowadapter.ExecutionProfile {

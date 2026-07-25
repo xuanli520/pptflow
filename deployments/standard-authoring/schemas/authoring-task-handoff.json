@@ -9,7 +9,7 @@
     "revision_digest", "task_snapshot", "admission_receipt", "child_template"
   ],
   "properties": {
-    "format": {"const": "harbor.standard-authoring-task-handoff.v1"},
+    "format": {"const": "harbor.standard-authoring-task-handoff.v2"},
     "version": {"const": "2"},
     "authoring_source_id": {"$ref": "#/$defs/uuidv7"},
     "authoring_session_id": {"$ref": "#/$defs/uuidv7"},

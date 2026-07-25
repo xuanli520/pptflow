@@ -47,7 +47,7 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "materializer-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -96,19 +96,15 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	if !found {
 		t.Fatal("compiled authoring workflow omitted materialize_task")
 	}
-	policyRaw, err := packageInput.Environment.CanonicalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	briefRaw, err := packageInput.Brief.CanonicalJSON()
+	packageInput.Contract = standardAuthoringTaskPackageContractForSubject(t, packageInput, task.ID, task.Slug, task.Title, source)
+	contractRaw, err := packageInput.Contract.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
 	contents := standardAuthoringValidatedPackageContents(t, run.ID, packageInput)
 	contents["instruction"] = append([]byte(nil), packageInput.Instruction...)
 	contents["task_toml"] = append([]byte(nil), packageInput.TaskTOMLDraft...)
-	contents[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] = policyRaw
-	contents[workflowadapter.StandardAuthoringBriefArtifact] = briefRaw
+	contents[workflowadapter.AuthoringContractArtifact] = contractRaw
 	contents["tests_analysis"] = append([]byte(nil), packageInput.TestsAnalysis...)
 	contents["solution_review_decision"] = approvedAuthoringSolutionDecision(t, source, session, run)
 	contents["codeedge_package_admission_report"] = []byte(`{}`)
@@ -120,8 +116,8 @@ func TestStandardAuthoringMaterializerSealsFirstRevisionAndBindsHandoffToStageAr
 	admissionInputs := make([]workflowkit.ArtifactBinding, 0, 8)
 	for _, binding := range inputs {
 		switch binding.Name {
-		case "instruction", "task_toml", workflowadapter.StandardAuthoringValidatedDockerfileArtifact, workflowadapter.StandardAuthoringEnvironmentPolicyArtifact,
-			workflowadapter.StandardAuthoringBriefArtifact, workflowadapter.StandardAuthoringValidatedSolveScriptArtifact,
+		case "instruction", "task_toml", workflowadapter.StandardAuthoringValidatedDockerfileArtifact, workflowadapter.AuthoringContractArtifact,
+			workflowadapter.StandardAuthoringValidatedSolveScriptArtifact,
 			workflowadapter.StandardAuthoringValidatedTestScriptArtifact, workflowadapter.StandardAuthoringDockerfileBuildReportArtifact,
 			workflowadapter.StandardAuthoringHarnessReportArtifact, "tests_analysis":
 			admissionInputs = append(admissionInputs, binding)
@@ -247,14 +243,19 @@ func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvi
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := store.AuthoringSource{ID: sourceID, SnapshotContentDigest: "sha256:" + strings.Repeat("a", 64)}
-	session := store.AuthoringSession{ID: sessionID}
+	packageInput := standardAuthoringTaskPackageFixture(t)
+	source := store.AuthoringSource{ID: sourceID, RepositoryURL: packageInput.Source.RepositoryURL, CommitSHA: packageInput.Source.CommitSHA, SnapshotContentDigest: "sha256:" + strings.Repeat("a", 64)}
+	targetTaskID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := store.AuthoringSession{ID: sessionID, TargetTaskID: targetTaskID}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version,
 	}
-	packageInput := standardAuthoringTaskPackageFixture(t)
-	briefRaw, err := packageInput.Brief.CanonicalJSON()
+	packageInput.Contract = standardAuthoringTaskPackageContractForSubject(t, packageInput, targetTaskID, "fixture", "Fixture", source)
+	contractRaw, err := packageInput.Contract.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,8 +263,7 @@ func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvi
 	contents["instruction"] = []byte("# Task\n")
 	contents["task_toml"] = []byte("[task]\nid = \"fixture\"\n")
 	contents[workflowadapter.StandardAuthoringValidatedDockerfileArtifact] = []byte("FROM docker.io/library/debian:bookworm@sha256:" + strings.Repeat("b", 64) + "\n")
-	contents["environment_policy"] = standardAuthoringLaunchTestEnvironmentPolicyJSON(t)
-	contents["authoring_brief"] = briefRaw
+	contents[workflowadapter.AuthoringContractArtifact] = contractRaw
 	contents[workflowadapter.StandardAuthoringValidatedSolveScriptArtifact] = []byte("#!/bin/sh\nexit 0\n")
 	contents[workflowadapter.StandardAuthoringValidatedTestScriptArtifact] = []byte("#!/bin/sh\nexit 0\n")
 	contents["tests_analysis"] = []byte("tests\n")
@@ -278,27 +278,27 @@ func TestStandardAuthoringMaterializerRejectsDockerfileThatDiffersFromFrozenEnvi
 	}, run, workflowRunSubject{
 		Binding: workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(source.SnapshotContentDigest)},
 		Kind:    store.WorkflowRunSubjectAuthoringSession, AuthoringSource: &source, AuthoringSession: &session,
-	}, &packageInput.Admission)
+	})
 	if err == nil || !strings.Contains(err.Error(), "Dockerfile base image") {
 		t.Fatalf("mismatched frozen Dockerfile policy error = %v", err)
 	}
 }
 
-func TestStandardAuthoringPackageAdmissionReadsBriefAndReportsMetadataMismatch(t *testing.T) {
-	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
+func TestStandardAuthoringPackageAdmissionReadsRootContractAndReportsMetadataMismatch(t *testing.T) {
+	fixture := newStandardAuthoringContractStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
 	fixture.contents["task_toml"] = []byte(strings.Replace(string(fixture.contents["task_toml"]), `task_type = "bugfix"`, `task_type = "feature"`, 1))
 	request := fixture.request(t)
 	inputs, err := standardAuthoringPackageAdmissionInputs(context.Background(), request, fixture.run)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inputs.brief == nil || inputs.brief.TaskType != fixture.packageInput.Brief.TaskType || inputs.brief.Application != fixture.packageInput.Brief.Application {
-		t.Fatalf("package admission brief = %+v, want %+v", inputs.brief, fixture.packageInput.Brief)
+	if inputs.contract != fixture.packageInput.Contract {
+		t.Fatalf("package admission root contract = %+v, want %+v", inputs.contract, fixture.packageInput.Contract)
 	}
 	compiled, err := CompileStandardAuthoringTaskPackage(StandardAuthoringTaskPackageInput{
 		Instruction: inputs.instruction, TaskTOMLDraft: inputs.taskTOML, Dockerfile: inputs.dockerfile,
 		SolveScript: inputs.solveScript, TestScript: inputs.testScript, TestsAnalysis: inputs.testsAnalysis,
-		Source: fixture.packageInput.Source, Environment: inputs.environment, Brief: inputs.brief, Admission: fixture.packageInput.Admission,
+		Source: *fixture.subject.AuthoringSource, Contract: inputs.contract, Admission: fixture.packageInput.Admission,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -355,12 +355,12 @@ func TestStandardAuthoringPackageAdmissionReturnsNeedsRepairForMalformedModelCon
 	}
 }
 
-func TestStandardAuthoringPackageAdmissionStrictlyParsesBrief(t *testing.T) {
-	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
-	fixture.contents[workflowadapter.StandardAuthoringBriefArtifact] = []byte(`{"format":"harbor.standard-authoring-brief.v1","version":"1","task_type":"bugfix","application":"widget","objective":"Repair the widget","unexpected":true}`)
+func TestStandardAuthoringPackageAdmissionStrictlyParsesRootContract(t *testing.T) {
+	fixture := newStandardAuthoringContractStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
+	fixture.contents[workflowadapter.AuthoringContractArtifact] = []byte(`{"format":"harbor.standard-authoring-contract.v2","version":"2","unexpected":true}`)
 	_, err := standardAuthoringPackageAdmissionInputs(context.Background(), fixture.request(t), fixture.run)
-	if err == nil || !strings.Contains(err.Error(), "decode frozen Standard authoring brief") {
-		t.Fatalf("malformed package admission brief error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "decode frozen Standard authoring root contract") {
+		t.Fatalf("malformed package admission root contract error = %v", err)
 	}
 }
 
@@ -384,7 +384,7 @@ func TestStandardAuthoringPackageAdmissionRejectsArtifactsThatDoNotMatchHarnessE
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
+			fixture := newStandardAuthoringContractStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
 			test.mutate(fixture.contents)
 			_, err := standardAuthoringPackageAdmissionInputs(context.Background(), fixture.request(t), fixture.run)
 			if err == nil || !strings.Contains(err.Error(), "harness evidence") {
@@ -426,7 +426,7 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "package-admission-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -456,11 +456,8 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	if !found {
 		t.Fatal("compiled authoring workflow omitted codeedge_package_admission")
 	}
-	policyRaw, err := packageInput.Environment.CanonicalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	briefRaw, err := packageInput.Brief.CanonicalJSON()
+	packageInput.Contract = standardAuthoringTaskPackageContractForSubject(t, packageInput, task.ID, task.Slug, task.Title, source)
+	contractRaw, err := packageInput.Contract.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,8 +465,7 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	contents["instruction"] = append([]byte(nil), packageInput.Instruction...)
 	contents["task_toml"] = append([]byte(nil), packageInput.TaskTOMLDraft...)
 	contents["tests_analysis"] = append([]byte(nil), packageInput.TestsAnalysis...)
-	contents[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] = policyRaw
-	contents[workflowadapter.StandardAuthoringBriefArtifact] = briefRaw
+	contents[workflowadapter.AuthoringContractArtifact] = contractRaw
 	mutate(contents)
 	inputs := standardAuthoringMaterializerBindings(t, stage, contents)
 	subject := workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(source.SnapshotContentDigest)}
@@ -494,7 +490,7 @@ func executeStandardAuthoringPackageAdmissionFixture(t *testing.T, mutate func(m
 	return result
 }
 
-func TestStandardAuthoringMaterializerRejectsBriefMetadataMismatch(t *testing.T) {
+func TestStandardAuthoringMaterializerRejectsRootContractMetadataMismatch(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		old         string
@@ -505,42 +501,20 @@ func TestStandardAuthoringMaterializerRejectsBriefMetadataMismatch(t *testing.T)
 		{name: "application", old: `application = "widget"`, replacement: `application = "backend"`, want: "metadata.application"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
+			fixture := newStandardAuthoringContractStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
 			fixture.contents["task_toml"] = []byte(strings.Replace(string(fixture.contents["task_toml"]), test.old, test.replacement, 1))
-			_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
+			_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject)
 			if err == nil || !strings.Contains(err.Error(), "rejected materialization") || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("mismatched materializer brief metadata error = %v", err)
+				t.Fatalf("mismatched materializer root-contract metadata error = %v", err)
 			}
 		})
 	}
 }
 
-func TestStandardAuthoringMaterializerBriefValidationAcceptsWrappedTaskTOML(t *testing.T) {
-	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
-	fixture.contents["task_toml"] = standardAuthoringTaskTOMLWrapperFixture(t, fixture.contents["task_toml"], *fixture.packageInput.Brief)
-	inputs, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(inputs.taskTOML) != string(fixture.contents["task_toml"]) {
-		t.Fatal("materializer changed the frozen task_toml artifact before package compilation")
-	}
-}
-
-func TestStandardAuthoringMaterializerBriefValidationRejectsWrappedScopeMismatch(t *testing.T) {
-	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
-	fixture.contents["task_toml"] = standardAuthoringTaskTOMLWrapperFixture(t, fixture.contents["task_toml"], *fixture.packageInput.Brief)
-	fixture.contents["task_toml"] = []byte(strings.Replace(string(fixture.contents["task_toml"]), fixture.packageInput.Brief.Objective, "Different objective", 1))
-	_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
-	if err == nil || !strings.Contains(err.Error(), "metadata.objective") || !strings.Contains(err.Error(), "CodeEdge task admission rejected materialization") {
-		t.Fatalf("mismatched wrapped scope error = %v", err)
-	}
-}
-
 func TestStandardAuthoringMaterializerReportsInvalidTaskTOMLAsAdmissionRejection(t *testing.T) {
-	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
-	fixture.contents["task_toml"] = []byte(`{"format":"harbor.artifact.v1","version":"2","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"[metadata]\n"}`)
-	_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
+	fixture := newStandardAuthoringContractStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
+	fixture.contents["task_toml"] = []byte(`{not valid TOML`)
+	_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject)
 	if err == nil || !strings.Contains(err.Error(), "CodeEdge task admission rejected materialization") || !strings.Contains(err.Error(), "task_metadata") {
 		t.Fatalf("invalid wrapped task TOML error = %v", err)
 	}
@@ -549,16 +523,16 @@ func TestStandardAuthoringMaterializerReportsInvalidTaskTOMLAsAdmissionRejection
 	}
 }
 
-func TestStandardAuthoringMaterializerStrictlyParsesBrief(t *testing.T) {
-	fixture := newStandardAuthoringBriefStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
-	fixture.contents[workflowadapter.StandardAuthoringBriefArtifact] = []byte(`{"format":"harbor.standard-authoring-brief.v1","version":"1","task_type":"bugfix","application":"widget","objective":"Repair the widget"} trailing`)
-	_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject, &fixture.packageInput.Admission)
-	if err == nil || !strings.Contains(err.Error(), "decode frozen Standard authoring brief") {
-		t.Fatalf("malformed materializer brief error = %v", err)
+func TestStandardAuthoringMaterializerStrictlyParsesRootContract(t *testing.T) {
+	fixture := newStandardAuthoringContractStageInputFixture(t, workflowkit.StageKey(workflowadapter.MaterializeTask))
+	fixture.contents[workflowadapter.AuthoringContractArtifact] = []byte(`{"format":"harbor.standard-authoring-contract.v2","version":"2"} trailing`)
+	_, err := standardAuthoringMaterializeInputs(context.Background(), fixture.request(t), fixture.run, fixture.subject)
+	if err == nil || !strings.Contains(err.Error(), "decode frozen Standard authoring root contract") {
+		t.Fatalf("malformed materializer root contract error = %v", err)
 	}
 }
 
-type standardAuthoringBriefStageInputFixture struct {
+type standardAuthoringContractStageInputFixture struct {
 	stage        workflowkit.StageDescriptor
 	run          store.WorkflowRun
 	subject      workflowRunSubject
@@ -566,7 +540,7 @@ type standardAuthoringBriefStageInputFixture struct {
 	packageInput StandardAuthoringTaskPackageInput
 }
 
-func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowkit.StageKey) standardAuthoringBriefStageInputFixture {
+func newStandardAuthoringContractStageInputFixture(t *testing.T, stageKey workflowkit.StageKey) standardAuthoringContractStageInputFixture {
 	t.Helper()
 	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
@@ -576,7 +550,7 @@ func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowk
 	}
 	stage, found := resolved.Descriptor.Stage(stageKey)
 	if !found {
-		t.Fatalf("compiled brief authoring workflow omitted %s", stageKey)
+		t.Fatalf("compiled root-contract authoring workflow omitted %s", stageKey)
 	}
 	sourceID, err := store.NewUUIDv7()
 	if err != nil {
@@ -596,24 +570,24 @@ func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowk
 		ID: sourceID, RepositoryURL: packageInput.Source.RepositoryURL, CommitSHA: packageInput.Source.CommitSHA,
 		SnapshotContentDigest: sourceDigest,
 	}
-	session := store.AuthoringSession{ID: sessionID}
-	run := store.WorkflowRun{
-		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
-	}
-	policyRaw, err := packageInput.Environment.CanonicalJSON()
+	targetTaskID, err := store.NewUUIDv7()
 	if err != nil {
 		t.Fatal(err)
 	}
-	briefRaw, err := packageInput.Brief.CanonicalJSON()
+	session := store.AuthoringSession{ID: sessionID, TargetTaskID: targetTaskID}
+	run := store.WorkflowRun{
+		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version,
+	}
+	packageInput.Contract = standardAuthoringTaskPackageContractForSubject(t, packageInput, targetTaskID, "fixture", "Fixture", source)
+	contractRaw, err := packageInput.Contract.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
 	contents := standardAuthoringValidatedPackageContents(t, run.ID, packageInput)
 	contents["instruction"] = append([]byte(nil), packageInput.Instruction...)
 	contents["task_toml"] = append([]byte(nil), packageInput.TaskTOMLDraft...)
-	contents[workflowadapter.StandardAuthoringEnvironmentPolicyArtifact] = policyRaw
-	contents[workflowadapter.StandardAuthoringBriefArtifact] = briefRaw
+	contents[workflowadapter.AuthoringContractArtifact] = contractRaw
 	contents["tests_analysis"] = append([]byte(nil), packageInput.TestsAnalysis...)
 	contents["solution_review_decision"] = approvedAuthoringSolutionDecision(t, source, session, run)
 	contents["codeedge_package_admission_report"] = []byte(`{"format":"fixture"}`)
@@ -621,10 +595,10 @@ func newStandardAuthoringBriefStageInputFixture(t *testing.T, stageKey workflowk
 		Binding: workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(sourceDigest)},
 		Kind:    store.WorkflowRunSubjectAuthoringSession, AuthoringSource: &source, AuthoringSession: &session,
 	}
-	return standardAuthoringBriefStageInputFixture{stage: stage, run: run, subject: subject, contents: contents, packageInput: packageInput}
+	return standardAuthoringContractStageInputFixture{stage: stage, run: run, subject: subject, contents: contents, packageInput: packageInput}
 }
 
-func (fixture standardAuthoringBriefStageInputFixture) request(t *testing.T) workflowkit.StageExecutionRequest {
+func (fixture standardAuthoringContractStageInputFixture) request(t *testing.T) workflowkit.StageExecutionRequest {
 	t.Helper()
 	return workflowkit.StageExecutionRequest{
 		Stage: fixture.stage, Inputs: standardAuthoringMaterializerBindings(t, fixture.stage, fixture.contents),

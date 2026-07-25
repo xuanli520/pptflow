@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -113,6 +114,8 @@ type TaskBoardAuthoringLaunch struct {
 	Title          string
 	TaskType       string
 	Application    string
+	CodeLang       string
+	Is0To1         bool
 	Objective      string
 	Status         string
 	FailureCode    string
@@ -127,6 +130,7 @@ type TaskBoardAuthoringLaunch struct {
 type TaskBoardRun struct {
 	ID                    string
 	ParentRunID           string
+	AuthoringEvidence     *TaskBoardAuthoringEvidence
 	Status                string
 	CurrentStage          string
 	FailureStage          string
@@ -147,6 +151,67 @@ type TaskBoardRun struct {
 	CanRetry              bool
 	RetryReason           string
 	RetryStrategy         TaskBoardRetryStrategy
+}
+
+// TaskBoardAuthoringEvidence is a bounded, read-only projection of the
+// immutable evidence that governs a Standard Authoring run. It deliberately
+// omits model transcripts, source archives, repair prose, credentials, and
+// worker logs.
+type TaskBoardAuthoringEvidence struct {
+	Contract TaskBoardAuthoringContract
+	Repairs  []TaskBoardAuthoringRepair
+	Claims   []TaskBoardAuthoringClaim
+	Lineage  []TaskBoardAuthoringArtifact
+}
+
+// TaskBoardAuthoringContract contains the host-owned facts an operator needs
+// to identify the task. Its digest remains the identity of the complete
+// canonical contract stored in the object store.
+type TaskBoardAuthoringContract struct {
+	Digest             string
+	TaskID             string
+	Slug               string
+	Title              string
+	CodeLang           string
+	TaskType           string
+	Application        string
+	Is0To1             bool
+	RepositoryURL      string
+	CommitSHA          string
+	SnapshotDigest     string
+	CheckoutRoot       string
+	BaseImage          string
+	Objective          string
+	ProfileFingerprint string
+	PackageFormat      string
+}
+
+// TaskBoardAuthoringRepair exposes typed ledger state and its planned
+// invalidation target without rendering untrusted review feedback.
+type TaskBoardAuthoringRepair struct {
+	ID             string
+	TargetProducer string
+	FindingKind    string
+	State          string
+	EvidenceDigest string
+}
+
+// TaskBoardAuthoringClaim records the host's result for an allowlisted
+// structured artifact. A match means the artifact was accepted only after
+// its canonical claims matched the root contract; claim values are never
+// echoed back into the terminal surface.
+type TaskBoardAuthoringClaim struct {
+	ArtifactKey string
+	State       string
+}
+
+// TaskBoardAuthoringArtifact is immutable final-package evidence metadata.
+// It identifies the Docker, harness, admission, and final package artifacts
+// without reading their potentially large bodies.
+type TaskBoardAuthoringArtifact struct {
+	ArtifactKey string
+	ArtifactID  string
+	Digest      string
 }
 
 // TaskBoardFailureRecoveryAction is the explicitly supported next operation
@@ -203,6 +268,8 @@ type TaskBoardStartAuthoringRequest struct {
 	Title          string
 	TaskType       string
 	Application    string
+	CodeLang       string
+	Is0To1         bool
 	Objective      string
 	MetadataJSON   string
 	Reason         string
@@ -552,6 +619,8 @@ func (service *TaskBoardService) StartAuthoring(ctx context.Context, request Tas
 		Title:         request.Title,
 		TaskType:      request.TaskType,
 		Application:   request.Application,
+		CodeLang:      request.CodeLang,
+		Is0To1:        request.Is0To1,
 		Objective:     request.Objective,
 		MetadataJSON:  request.MetadataJSON,
 	})
@@ -1158,6 +1227,7 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 		run.CanRedrive = failure.CanRedrive
 	}
 	run.RetryStrategy = taskBoardRetryStrategy(inspected.Run)
+	service.projectTaskBoardAuthoringContext(ctx, inspected.Run, &run)
 	if inspected.Run.SubjectKind == store.WorkflowRunSubjectTaskRevision && inspected.Run.Status == store.WorkflowRunWaitingContinuation && taskBoardHasNeedsRepair(inspected.Stages) {
 		run.RetryStrategy = TaskBoardRetryStrategyNone
 		run.CanRetry = false
@@ -1179,6 +1249,94 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 	}
 	run.CanRetry, run.RetryReason = taskBoardRetryAvailability(inspected.Run)
 	return run
+}
+
+// projectTaskBoardAuthoringContext exposes the contract-safe evidence view
+// required to operate a v2 authoring Run. All values are derived from the
+// immutable root contract, repair ledger, and artifact references; it does
+// not create a second mutable task state.
+func (service *TaskBoardService) projectTaskBoardAuthoringContext(ctx context.Context, source store.WorkflowRun, destination *TaskBoardRun) {
+	if service == nil || service.core == nil || service.core.store == nil || destination == nil ||
+		source.SubjectKind != store.WorkflowRunSubjectAuthoringSession || source.AuthoringSessionID == "" {
+		return
+	}
+	session, err := service.core.store.GetAuthoringSession(ctx, source.AuthoringSessionID)
+	if err != nil || session == nil {
+		return
+	}
+	input, err := standardAuthoringContractInputFromSession(ctx, service.core.objects, *session)
+	if err != nil {
+		return
+	}
+	contract := input.Contract
+	evidence := &TaskBoardAuthoringEvidence{Contract: TaskBoardAuthoringContract{
+		Digest: string(input.ContentDigest), TaskID: contract.Task.ID, Slug: contract.Task.Slug, Title: contract.Task.Title,
+		CodeLang: contract.Task.CodeLang, TaskType: contract.Task.TaskType, Application: contract.Task.Application, Is0To1: contract.Task.Is0To1,
+		RepositoryURL: contract.Source.RepositoryURL, CommitSHA: contract.Source.CommitSHA, SnapshotDigest: contract.Source.SnapshotDigest,
+		CheckoutRoot: contract.Source.CheckoutRoot, BaseImage: contract.Environment.BaseImage, Objective: contract.Objective,
+		ProfileFingerprint: contract.Delivery.ProfileFingerprint, PackageFormat: contract.Delivery.PackageFormat,
+	}}
+	if entries, err := service.core.store.ListAuthoringRepairLedgerEntries(ctx, source.ID); err == nil {
+		evidence.Repairs = make([]TaskBoardAuthoringRepair, 0, len(entries))
+		for _, entry := range entries {
+			evidence.Repairs = append(evidence.Repairs, TaskBoardAuthoringRepair{
+				ID: entry.ID, TargetProducer: entry.TargetProducer, FindingKind: string(entry.FindingKind),
+				State: string(entry.State), EvidenceDigest: entry.EvidenceDigest,
+			})
+		}
+	}
+	evidence.Claims, evidence.Lineage = service.projectTaskBoardAuthoringArtifacts(ctx, source)
+	destination.AuthoringEvidence = evidence
+}
+
+func (service *TaskBoardService) projectTaskBoardAuthoringArtifacts(ctx context.Context, run store.WorkflowRun) ([]TaskBoardAuthoringClaim, []TaskBoardAuthoringArtifact) {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return nil, nil
+	}
+	attempts, err := service.core.store.ListStageAttemptsForRun(ctx, run.ID)
+	if err != nil {
+		return nil, nil
+	}
+	latest := make(map[string]stageArtifactCandidate)
+	for _, attempt := range attempts {
+		if attempt.ExecutionStatus != store.StageExecutionCompleted {
+			continue
+		}
+		references, refsErr := service.core.store.ListArtifactRefsForAttempt(ctx, attempt.ID)
+		if refsErr != nil {
+			return nil, nil
+		}
+		for _, reference := range references {
+			if reference.RunID != run.ID || reference.StageKey != attempt.StageKey || reference.AttemptID != attempt.ID {
+				return nil, nil
+			}
+			current, found := latest[reference.ArtifactKey]
+			if !found || laterArtifactCandidate(attempt, reference, current) {
+				latest[reference.ArtifactKey] = stageArtifactCandidate{attempt: attempt, ref: reference}
+			}
+		}
+	}
+	claims := make([]TaskBoardAuthoringClaim, 0, 2)
+	for _, key := range []string{"task_proposal", "generated_task_files"} {
+		if _, found := latest[key]; found {
+			claims = append(claims, TaskBoardAuthoringClaim{ArtifactKey: key, State: "match"})
+		}
+	}
+	lineageKeys := []string{
+		"instruction", "task_toml", workflowadapter.StandardAuthoringValidatedDockerfileArtifact,
+		workflowadapter.StandardAuthoringValidatedSolveScriptArtifact, workflowadapter.StandardAuthoringValidatedTestScriptArtifact,
+		"tests_analysis", workflowadapter.StandardAuthoringDockerfileBuildReportArtifact,
+		workflowadapter.StandardAuthoringHarnessReportArtifact, "codeedge_package_admission_report",
+	}
+	lineage := make([]TaskBoardAuthoringArtifact, 0, len(lineageKeys))
+	for _, key := range lineageKeys {
+		candidate, found := latest[key]
+		if !found {
+			continue
+		}
+		lineage = append(lineage, TaskBoardAuthoringArtifact{ArtifactKey: key, ArtifactID: candidate.ref.ID, Digest: candidate.ref.ContentDigest})
+	}
+	return claims, lineage
 }
 
 func taskBoardHasNeedsRepair(stages []store.StageAttempt) bool {

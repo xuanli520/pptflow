@@ -17,32 +17,22 @@ const (
 	StandardQuotaPolicyID      = "harbor.local.operator"
 	StandardQuotaPolicyVersion = "1.0.0"
 
-	// StandardAuthoringQuotaPolicyID and Version identify the bounded source
-	// session authoring policy. It carries stage-attempt, agent-turn, and
-	// output-submission accounts: task-bound trial, repair, verification, and
-	// packaging quota begins only in the explicit child Run after materialization
-	// handoff. output_submission separately bounds model tool retries so they
-	// cannot bypass agent-turn accounting.
-	StandardAuthoringQuotaPolicyID      = "harbor.standard-authoring.local.operator"
-	StandardAuthoringQuotaPolicyVersion = "1.2.0"
-
-	StandardAuthoringTaskAdmissionQuotaPolicyVersion      = "1.3.0"
-	StandardAuthoringBriefQuotaPolicyVersion              = "1.4.0"
-	StandardAuthoringRepairFeedbackQuotaPolicyVersion     = "1.5.0"
-	StandardAuthoringTestsAnalysisInputQuotaPolicyVersion = "1.6.0"
-	StandardAuthoringHarnessQuotaPolicyVersion            = "1.7.0"
-	StandardAuthoringFixedFileQuotaPolicyVersion          = "1.8.0"
-	StandardAuthoringValidationQuotaDimension             = "authoring_validation"
+	// StandardAuthoringQuotaPolicyID and Version identify the bounded v2
+	// source-session authoring policy. Task-bound verification and packaging
+	// quota begins only in the child CodeEdge Run after materialization.
+	StandardAuthoringQuotaPolicyID              = "harbor.standard-authoring.local.operator"
+	StandardAuthoringContractQuotaPolicyVersion = "2.0.0"
+	StandardAuthoringValidationQuotaDimension   = "authoring_validation"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
 	// stage. It is versioned with the policy rather than supplied by a Run.
 	StandardAuthoringOutputSubmissionClaimUnits int64 = 3
-	// StandardAuthoringHarnessSubmissionClaimUnits matches the number of real
-	// validate-and-submit iterations available to each writable ReAct stage.
-	// Every call is also charged to authoring_validation.
-	StandardAuthoringHarnessSubmissionClaimUnits int64 = 8
+	// StandardAuthoringWorkspaceSubmissionClaimUnits bounds real
+	// validate-and-submit iterations for v2 writable workspace stages. Every
+	// call is also charged to authoring_validation.
+	StandardAuthoringWorkspaceSubmissionClaimUnits int64 = 8
 	// StandardAuthoringValidationClaimUnits bounds ReAct validation calls made
-	// by each 1.7.0 workspace stage independently of model turns and final output
+	// by each workspace stage independently of model turns and final output
 	// submissions.
 	StandardAuthoringValidationClaimUnits int64 = 8
 
@@ -398,142 +388,18 @@ func StandardQuotaPolicy() QuotaPolicy {
 	}
 }
 
-// StandardAuthoringQuotaPolicy returns the explicit pre-materialization quota
-// policy. It has no trial or repair-round account because this closed template
-// cannot invoke Qwen/Opus, repair a task revision, or package a task. The
-// child CodeEdge Phase-1 Run owns those task-bound capabilities separately.
-func StandardAuthoringQuotaPolicy() QuotaPolicy {
-	catalog := StandardAuthoringStageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		claims := standardClaimsForStage(stage)
-		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
-			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
-		}
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
-	}
-	return QuotaPolicy{
-		ID:      StandardAuthoringQuotaPolicyID,
-		Version: StandardAuthoringQuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{
-			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
-			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
-			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
-		},
-		Stages: stages,
-	}
-}
-
-// StandardAuthoringTaskAdmissionQuotaPolicy is the additive 1.3.0 policy.
-// Admission consumes a normal bounded stage attempt but no model turn.
-func StandardAuthoringTaskAdmissionQuotaPolicy() QuotaPolicy {
-	catalog := StandardAuthoringTaskAdmissionStageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		claims := standardClaimsForStage(stage)
-		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
-			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
-		}
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
-	}
-	return QuotaPolicy{
-		ID:      StandardAuthoringQuotaPolicyID,
-		Version: StandardAuthoringTaskAdmissionQuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{
-			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
-			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
-			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
-		},
-		Stages: stages,
-	}
-}
-
-// StandardAuthoringBriefQuotaPolicy is the additive 1.4.0 policy. The brief
-// changes immutable inputs, not the bounded work allowed to any stage.
-func StandardAuthoringBriefQuotaPolicy() QuotaPolicy {
-	catalog := StandardAuthoringBriefStageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		claims := standardClaimsForStage(stage)
-		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
-			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
-		}
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
-	}
-	return QuotaPolicy{
-		ID:      StandardAuthoringQuotaPolicyID,
-		Version: StandardAuthoringBriefQuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{
-			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
-			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
-			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
-		},
-		Stages: stages,
-	}
-}
-
-// StandardAuthoringRepairFeedbackQuotaPolicy is the additive 1.5.0 policy.
-// Optional repair evidence changes frozen inputs, not the bounded work or
-// per-stage claims inherited from the 1.4.0 authoring contract.
-func StandardAuthoringRepairFeedbackQuotaPolicy() QuotaPolicy {
-	catalog := StandardAuthoringRepairFeedbackStageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		claims := standardClaimsForStage(stage)
-		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
-			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
-		}
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
-	}
-	return QuotaPolicy{
-		ID:      StandardAuthoringQuotaPolicyID,
-		Version: StandardAuthoringRepairFeedbackQuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{
-			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
-			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
-			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
-		},
-		Stages: stages,
-	}
-}
-
-// StandardAuthoringTestsAnalysisInputQuotaPolicy is the additive 1.6.0 policy.
-// The new artifact dependencies change frozen inputs and ordering, not the
-// bounded work or per-stage claims inherited from the 1.5.0 contract.
-func StandardAuthoringTestsAnalysisInputQuotaPolicy() QuotaPolicy {
-	catalog := StandardAuthoringTestsAnalysisInputStageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		claims := standardClaimsForStage(stage)
-		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
-			claims = append(claims, standardQuotaClaim("output_submission", StandardAuthoringOutputSubmissionClaimUnits))
-		}
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
-	}
-	return QuotaPolicy{
-		ID:      StandardAuthoringQuotaPolicyID,
-		Version: StandardAuthoringTestsAnalysisInputQuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{
-			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
-			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
-			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
-		},
-		Stages: stages,
-	}
-}
-
-// StandardAuthoringHarnessQuotaPolicy is the additive 1.7.0 policy. Each
-// writable ReAct stage receives eight validate-and-submit calls, each charged
-// independently to both output_submission and authoring_validation.
-func StandardAuthoringHarnessQuotaPolicy() QuotaPolicy {
-	catalog := StandardAuthoringHarnessStageCatalog()
+// StandardAuthoringContractQuotaPolicy returns the sole v2 source-session
+// policy. It separately bounds model output submissions and Docker/harness
+// validation work without opening task-bound trial or repair accounts.
+func StandardAuthoringContractQuotaPolicy() QuotaPolicy {
+	catalog := StandardAuthoringContractStageCatalog()
 	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
 	for _, stage := range catalog.Stages {
 		claims := standardClaimsForStage(stage)
 		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
 			submissionUnits := StandardAuthoringOutputSubmissionClaimUnits
 			if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
-				submissionUnits = StandardAuthoringHarnessSubmissionClaimUnits
+				submissionUnits = StandardAuthoringWorkspaceSubmissionClaimUnits
 			}
 			claims = append(claims, standardQuotaClaim("output_submission", submissionUnits))
 		}
@@ -544,40 +410,7 @@ func StandardAuthoringHarnessQuotaPolicy() QuotaPolicy {
 	}
 	return QuotaPolicy{
 		ID:      StandardAuthoringQuotaPolicyID,
-		Version: StandardAuthoringHarnessQuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{
-			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
-			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
-			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
-			{Dimension: StandardAuthoringValidationQuotaDimension, TaskLimitUnits: standardTaskAuthoringValidationLimit, ActorLimitUnits: standardActorAuthoringValidationLimit},
-		},
-		Stages: stages,
-	}
-}
-
-// StandardAuthoringFixedFileQuotaPolicy is the additive 1.8.0 policy. The
-// fixed-file solve/test handoff retains the ordinary bounded submission quota;
-// only the two Docker ReAct stages reserve the larger validation quota.
-func StandardAuthoringFixedFileQuotaPolicy() QuotaPolicy {
-	catalog := StandardAuthoringFixedFileStageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		claims := standardClaimsForStage(stage)
-		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
-			submissionUnits := StandardAuthoringOutputSubmissionClaimUnits
-			if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
-				submissionUnits = StandardAuthoringHarnessSubmissionClaimUnits
-			}
-			claims = append(claims, standardQuotaClaim("output_submission", submissionUnits))
-		}
-		if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
-			claims = append(claims, standardQuotaClaim(StandardAuthoringValidationQuotaDimension, StandardAuthoringValidationClaimUnits))
-		}
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
-	}
-	return QuotaPolicy{
-		ID:      StandardAuthoringQuotaPolicyID,
-		Version: StandardAuthoringFixedFileQuotaPolicyVersion,
+		Version: StandardAuthoringContractQuotaPolicyVersion,
 		AccountLimits: []QuotaAccountLimit{
 			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
 			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},

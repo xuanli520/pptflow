@@ -63,7 +63,6 @@ const (
 // bundles sign different source identities or create a hash cycle.
 var generatedProductionLocks = map[string]struct{}{
 	"deployments/standard-authoring/operation-catalog.lock.json":       {},
-	"deployments/standard-authoring-1.8/operation-catalog.lock.json":   {},
 	"deployments/codeedge-phase1/operation-catalog.lock.json":          {},
 	"deployments/codeedge-evaluator-child/operation-catalog.lock.json": {},
 }

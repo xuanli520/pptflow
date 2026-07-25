@@ -12,12 +12,7 @@ func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T
 	registry := DefaultTemplateRegistry()
 	for _, reference := range []TemplateReference{
 		StandardTemplateReference(),
-		StandardAuthoringTemplateReference(),
-		StandardAuthoringTaskAdmissionTemplateReference(),
-		StandardAuthoringBriefTemplateReference(),
-		StandardAuthoringRepairFeedbackTemplateReference(),
-		StandardAuthoringTestsAnalysisInputTemplateReference(),
-		StandardAuthoringHarnessTemplateReference(),
+		StandardAuthoringCurrentTemplateReference(),
 		CodeEdgePhase1TemplateReference(),
 		CodeEdgeEvaluatorChildTemplateReference(),
 	} {
@@ -55,27 +50,26 @@ func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T
 	}
 }
 
-func TestStandardAuthoringV2BaselineAcceptsOnlyVersionOneDotTwoDotZero(t *testing.T) {
-	current := StandardAuthoringWorkflowTemplate()
-	if current.Version != "1.2.0" || current.Catalog.Version != "1.2.0" || !current.Reference().Equal(StandardAuthoringTemplateReference()) {
+func TestStandardAuthoringV2RegistryRejectsAllLegacyVersions(t *testing.T) {
+	current := StandardAuthoringCurrentWorkflowTemplate()
+	if current.Version != StandardAuthoringContractTemplateVersion || current.Catalog.Version != StandardAuthoringContractTemplateVersion || !current.Reference().Equal(StandardAuthoringCurrentTemplateReference()) {
 		t.Fatalf("current Standard authoring template = %s@%s catalog %s@%s", current.ID, current.Version, current.Catalog.ID, current.Catalog.Version)
 	}
 	if err := current.Validate(); err != nil {
 		t.Fatalf("validate current Standard authoring template: %v", err)
 	}
 
-	retired := TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: "1.0.0"}
-	if err := retired.Validate(); err == nil {
-		t.Fatal("retired Standard authoring template reference was accepted")
-	}
-	if _, err := ResolveWorkflowTemplate(retired); err == nil {
-		t.Fatal("retired Standard authoring template resolved from the default registry")
-	}
-	if IsStandardAuthoringWorkflowTemplate(retired) {
-		t.Fatal("retired Standard authoring template was recognized as executable")
-	}
-	if _, err := catalogPolicyFor(retired); err == nil {
-		t.Fatal("retired Standard authoring template received a catalog policy")
+	for _, version := range []string{"1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"} {
+		retired := TemplateReference{ID: StandardAuthoringWorkflowTemplateID, Version: version}
+		if err := retired.Validate(); err == nil {
+			t.Fatalf("legacy template %s was accepted", version)
+		}
+		if _, err := ResolveWorkflowTemplate(retired); err == nil {
+			t.Fatalf("legacy template %s resolved from the default registry", version)
+		}
+		if IsStandardAuthoringWorkflowTemplate(retired) {
+			t.Fatalf("legacy template %s was recognized as executable", version)
+		}
 	}
 }
 

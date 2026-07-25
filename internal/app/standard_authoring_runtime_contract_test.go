@@ -10,7 +10,7 @@ import (
 )
 
 func TestCurrentStandardAuthoringRuntimeContractRejectsLegacyRun(t *testing.T) {
-	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
 	if err != nil {
@@ -30,7 +30,7 @@ func TestCurrentStandardAuthoringRuntimeContractRejectsLegacyRun(t *testing.T) {
 	}
 }
 
-func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutPolicy(t *testing.T) {
+func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRootContract(t *testing.T) {
 	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
@@ -41,7 +41,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutPolicy(t
 		inputs := resolved.Descriptor.Stages[index].Inputs
 		filtered := inputs[:0]
 		for _, input := range inputs {
-			if input.Name != workflowadapter.StandardAuthoringEnvironmentPolicyArtifact {
+			if input.Name != workflowadapter.AuthoringContractArtifact {
 				filtered = append(filtered, input)
 			}
 		}
@@ -53,15 +53,15 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutPolicy(t
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringContractTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
-	if err == nil || !strings.Contains(err.Error(), "environment policy contract") {
-		t.Fatalf("current descriptor without environment policy = %v, want policy-contract rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid root contract") {
+		t.Fatalf("current descriptor without root contract = %v, want root-contract rejection", err)
 	}
 }
 
-func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutBrief(t *testing.T) {
+func TestStandardAuthoringRuntimeContractRejectsRootContractSchemaDrift(t *testing.T) {
 	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
@@ -72,9 +72,10 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutBrief(t 
 		inputs := resolved.Descriptor.Stages[index].Inputs
 		filtered := inputs[:0]
 		for _, input := range inputs {
-			if input.Name != workflowadapter.StandardAuthoringBriefArtifact {
-				filtered = append(filtered, input)
+			if input.Name == workflowadapter.AuthoringContractArtifact {
+				input.SchemaVersion = "harbor.standard-authoring-contract.v1"
 			}
+			filtered = append(filtered, input)
 		}
 		resolved.Descriptor.Stages[index].Inputs = filtered
 	}
@@ -84,15 +85,15 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutBrief(t 
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringContractTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
-	if err == nil || !strings.Contains(err.Error(), "brief contract") {
-		t.Fatalf("current descriptor without brief = %v, want brief-contract rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid root contract") {
+		t.Fatalf("current descriptor with root-contract schema drift = %v, want root-contract rejection", err)
 	}
 }
 
-func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFeedback(t *testing.T) {
+func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorInputDrift(t *testing.T) {
 	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := lifecycleCompleteProfileForTemplate(t, template)
 	resolved, err := template.Compile(profile)
@@ -100,13 +101,13 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFe
 		t.Fatal(err)
 	}
 	for index := range resolved.Descriptor.Stages {
-		if resolved.Descriptor.Stages[index].Key != workflowkit.StageKey(workflowadapter.RepoAnalyze) {
+		if resolved.Descriptor.Stages[index].Key != workflowkit.StageKey(workflowadapter.TaskDesign) {
 			continue
 		}
 		inputs := resolved.Descriptor.Stages[index].Inputs
 		filtered := inputs[:0]
 		for _, input := range inputs {
-			if input.Name != "task_review_decision" {
+			if input.Name != "repo_analysis" {
 				filtered = append(filtered, input)
 			}
 		}
@@ -118,26 +119,28 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRepairFe
 	}
 	run := store.WorkflowRun{
 		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringContractTemplateVersion,
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "versioned input contract") {
-		t.Fatalf("current descriptor without repair feedback = %v, want input-contract rejection", err)
+		t.Fatalf("current descriptor without repo analysis = %v, want input-contract rejection", err)
 	}
 }
 
 func TestCurrentStandardAuthoringRunRejectsNonCurrentVersions(t *testing.T) {
-	current := store.WorkflowRun{WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion}
+	current := store.WorkflowRun{WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringContractTemplateVersion}
 	if !isCurrentStandardAuthoringRun(current) {
 		t.Fatal("current Standard authoring version was rejected")
 	}
 	for _, version := range []string{
-		workflowadapter.StandardAuthoringWorkflowTemplateVersion,
-		workflowadapter.StandardAuthoringTaskAdmissionTemplateVersion,
-		workflowadapter.StandardAuthoringBriefTemplateVersion,
-		workflowadapter.StandardAuthoringRepairFeedbackTemplateVersion,
-		workflowadapter.StandardAuthoringTestsAnalysisInputTemplateVersion,
-		workflowadapter.StandardAuthoringHarnessTemplateVersion,
+		"1.0.0",
+		"1.2.0",
+		"1.3.0",
+		"1.4.0",
+		"1.5.0",
+		"1.6.0",
+		"1.7.0",
+		"1.8.0",
 		"9.9.9",
 	} {
 		run := current

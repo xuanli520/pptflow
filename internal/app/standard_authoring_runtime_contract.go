@@ -44,21 +44,10 @@ func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manif
 		if !found {
 			return fmt.Errorf("Standard authoring Run %s frozen descriptor omits stage %q", run.ID, expectedStage.Key)
 		}
-		expectedPolicy, expectedUsesPolicy := standardAuthoringArtifactSpec(expectedStage.Inputs, workflowadapter.StandardAuthoringEnvironmentPolicyArtifact)
-		actualPolicy, actualUsesPolicy := standardAuthoringArtifactSpec(actualStage.Inputs, workflowadapter.StandardAuthoringEnvironmentPolicyArtifact)
-		if expectedUsesPolicy != actualUsesPolicy {
-			return fmt.Errorf("Standard authoring Run %s frozen descriptor changes environment policy contract for stage %q", run.ID, expectedStage.Key)
-		}
-		if expectedUsesPolicy && (expectedPolicy != actualPolicy || !actualPolicy.Required || actualPolicy.SchemaVersion != workflowadapter.StandardAuthoringEnvironmentPolicySchemaVersion) {
-			return fmt.Errorf("Standard authoring Run %s frozen descriptor has an invalid environment policy contract for stage %q", run.ID, expectedStage.Key)
-		}
-		expectedBrief, expectedUsesBrief := standardAuthoringArtifactSpec(expectedStage.Inputs, workflowadapter.StandardAuthoringBriefArtifact)
-		actualBrief, actualUsesBrief := standardAuthoringArtifactSpec(actualStage.Inputs, workflowadapter.StandardAuthoringBriefArtifact)
-		if expectedUsesBrief != actualUsesBrief {
-			return fmt.Errorf("Standard authoring Run %s frozen descriptor changes brief contract for stage %q", run.ID, expectedStage.Key)
-		}
-		if expectedUsesBrief && (expectedBrief != actualBrief || !actualBrief.Required || actualBrief.SchemaVersion != workflowadapter.StandardAuthoringBriefSchemaVersion) {
-			return fmt.Errorf("Standard authoring Run %s frozen descriptor has an invalid brief contract for stage %q", run.ID, expectedStage.Key)
+		expectedContract, expectedUsesContract := standardAuthoringArtifactSpec(expectedStage.Inputs, workflowadapter.AuthoringContractArtifact)
+		actualContract, actualUsesContract := standardAuthoringArtifactSpec(actualStage.Inputs, workflowadapter.AuthoringContractArtifact)
+		if !expectedUsesContract || !actualUsesContract || expectedContract != actualContract || !actualContract.Required || actualContract.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
+			return fmt.Errorf("Standard authoring Run %s frozen descriptor has an invalid root contract for stage %q", run.ID, expectedStage.Key)
 		}
 		if !reflect.DeepEqual(expectedStage.Inputs, actualStage.Inputs) || !reflect.DeepEqual(expectedStage.ReadSet, actualStage.ReadSet) {
 			return fmt.Errorf("Standard authoring Run %s frozen descriptor changes the versioned input contract for stage %q", run.ID, expectedStage.Key)

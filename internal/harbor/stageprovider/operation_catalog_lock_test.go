@@ -324,7 +324,7 @@ func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile
 		t.Fatalf("Standard authoring lock with another template's profile error = %v, want invalid lock", err)
 	}
 	mismatchedProfile := lock.Clone()
-	mismatchedProfile.StandardAuthoringExecutionProfile = &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfileForTemplate(t, workflowadapter.StandardAuthoringBriefTemplateReference())}
+	mismatchedProfile.StandardAuthoringExecutionProfile.Profile.Template = workflowadapter.TemplateReference{ID: workflowadapter.StandardAuthoringWorkflowTemplateID, Version: "1.9.9"}
 	if err := mismatchedProfile.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
 		t.Fatalf("Standard authoring lock with another installed profile version error = %v, want invalid lock", err)
 	}

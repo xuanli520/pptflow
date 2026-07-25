@@ -271,7 +271,7 @@ func standardAuthoringWorkspaceSubmissionStage(stageKey string) workflowkit.Stag
 	stage.Verdicts = workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass}}
 	stage.QuotaClaims = []workflowkit.QuotaClaim{
 		{Dimension: "agent_turn", Units: 1, ReclaimPolicy: workflowkit.ReclaimUnused},
-		{Dimension: standardAuthoringCodexOutputSubmissionQuotaDimension, Units: workflowadapter.StandardAuthoringHarnessSubmissionClaimUnits, ReclaimPolicy: workflowkit.ReclaimUnused},
+		{Dimension: standardAuthoringCodexOutputSubmissionQuotaDimension, Units: 1, ReclaimPolicy: workflowkit.ReclaimUnused},
 		{Dimension: workflowadapter.StandardAuthoringValidationQuotaDimension, Units: workflowadapter.StandardAuthoringValidationClaimUnits, ReclaimPolicy: workflowkit.ReclaimUnused},
 	}
 	if stageKey == workflowadapter.DockerfileBuildValidate {

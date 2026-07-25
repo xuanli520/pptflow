@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,7 +42,7 @@ const (
 	standardAuthoringCodexCanonicalSubmissionFormat  = "harbor.standard-authoring-codex-stage-submission.v1"
 	standardAuthoringCodexCanonicalSubmissionVersion = "1"
 
-	// This is a separate, deployment-pinned schema for 1.8.0 solve/test
+	// This is a separate, deployment-pinned schema for v2 solve/test
 	// fixed-file receipts. It intentionally has no artifacts/content_base64
 	// field: the host reads the exact fixed file after verdict=pass.
 	standardAuthoringCodexFixedFileOutputSchemaCanonicalJSON = `{"$id":"harbor.standard-authoring-codex-fixed-file-submit.v1","$schema":"http://json-schema.org/draft-07/schema#","additionalProperties":false,"properties":{"verdict":{"enum":["pass"],"type":"string"}},"required":["verdict"],"type":"object"}`
@@ -60,13 +62,25 @@ type standardAuthoringCodexOutputSubmission struct {
 	maxAttempts int
 	now         func() time.Time
 
-	// environmentPolicy is set only for dockerfile_generate after the executor
-	// has verified the canonical frozen environment_policy input. Keeping it on
-	// the submission authority prevents a model response from selecting its own
-	// image after it has seen the policy in the first-turn request.
+	// environmentPolicy is derived only from the canonical root contract for
+	// dockerfile_generate. Keeping that host-owned image constraint on the
+	// submission authority prevents a model response from selecting its own
+	// base image after it has seen the root contract in the first-turn request.
 	environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy
+	contractDigest    workflowkit.Fingerprint
 
-	// fixedFileRelativePath is set only for the 1.8.0 workspace-backed solve
+	// structuredClaimContract and frozenSourceRoot are populated only by the
+	// executor after it has parsed the canonical root contract and re-attested
+	// the immutable source workspace. They apply solely to the two structured
+	// planning artifacts below; no model-owned workspace is consulted here.
+	structuredClaimContract *workflowadapter.AuthoringContract
+	frozenSourceRoot        string
+	// testsAnalysisRequirementIDs is the exact, host-derived requirement set
+	// from the validated proposal and generated plan. It prevents a later
+	// analysis from silently dropping or inventing requirement identifiers.
+	testsAnalysisRequirementIDs map[string]struct{}
+
+	// fixedFileRelativePath is set only for the v2 workspace-backed solve
 	// and test producers. It is selected from the frozen stage key by the
 	// host, never supplied by the model. Those stages retain the ordinary
 	// output-submission accounting and result ownership, but their tool carries
@@ -90,8 +104,9 @@ type standardAuthoringCodexSubmissionCandidate struct {
 	// and an explicit empty value. json.Decoder alone otherwise turns both into
 	// zero values, which could accidentally make an absent base64 field look
 	// like a valid empty artifact.
-	Verdict   *workflowkit.Verdict                             `json:"verdict"`
-	Artifacts *[]standardAuthoringCodexSubmissionCandidatePart `json:"artifacts"`
+	Verdict        *workflowkit.Verdict                             `json:"verdict"`
+	ContractDigest *string                                          `json:"contract_digest"`
+	Artifacts      *[]standardAuthoringCodexSubmissionCandidatePart `json:"artifacts"`
 }
 
 // The model deliberately cannot name an artifact, schema, stage, or path.
@@ -101,13 +116,64 @@ type standardAuthoringCodexSubmissionCandidatePart struct {
 	ContentBase64 *string `json:"content_base64"`
 }
 
+const (
+	standardAuthoringCodexTaskProposalFormat      = "harbor.standard-authoring-task-proposal.v2"
+	standardAuthoringCodexGeneratedTaskPlanFormat = "harbor.standard-authoring-generated-task-plan.v2"
+	standardAuthoringCodexTestsAnalysisFormat     = "harbor.standard-authoring-tests-analysis.v2"
+	standardAuthoringCodexStructuredClaimsVersion = "2"
+)
+
+var standardAuthoringCodexRequirementIDPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_-]{0,63}$`)
+
+// standardAuthoringCodexStructuredClaimDocument is intentionally a narrow
+// validation shape. It validates the two planning artifacts that make claims
+// about the immutable authoring contract and frozen checkout without creating
+// a second generic configuration language for other stage outputs.
+type standardAuthoringCodexStructuredClaimDocument struct {
+	Format         *string                                    `json:"format"`
+	Version        *string                                    `json:"version"`
+	ContractClaims *standardAuthoringCodexContractClaims      `json:"contract_claims"`
+	Requirements   *[]standardAuthoringCodexRequirement       `json:"requirements"`
+	SourcePaths    *[]string                                  `json:"source_paths"`
+	Packages       *[]standardAuthoringCodexPackage           `json:"packages"`
+	Commands       *[]standardAuthoringCodexStructuredCommand `json:"commands"`
+}
+
+type standardAuthoringCodexContractClaims struct {
+	Title         *string `json:"title"`
+	Slug          *string `json:"slug"`
+	RepositoryURL *string `json:"repository_url"`
+	CommitSHA     *string `json:"commit_sha"`
+	BaseImage     *string `json:"base_image"`
+	CodeLang      *string `json:"code_lang"`
+	TaskType      *string `json:"task_type"`
+	Application   *string `json:"application"`
+	Is0To1        *bool   `json:"is_0_to_1"`
+	SourceRoot    *string `json:"source_root"`
+}
+
+type standardAuthoringCodexRequirement struct {
+	ID   *string `json:"id"`
+	Text *string `json:"text"`
+}
+
+type standardAuthoringCodexPackage struct {
+	ManifestPath *string `json:"manifest_path"`
+}
+
+type standardAuthoringCodexStructuredCommand struct {
+	WorkingDirectory *string   `json:"working_directory"`
+	Argv             *[]string `json:"argv"`
+}
+
 type standardAuthoringCodexCanonicalSubmission struct {
-	Format       string                                              `json:"format"`
-	Version      string                                              `json:"version"`
-	StageKey     workflowkit.StageKey                                `json:"stage_key"`
-	StageVersion string                                              `json:"stage_version"`
-	Verdict      workflowkit.Verdict                                 `json:"verdict"`
-	Artifacts    []standardAuthoringCodexCanonicalSubmissionArtifact `json:"artifacts"`
+	Format         string                                              `json:"format"`
+	Version        string                                              `json:"version"`
+	StageKey       workflowkit.StageKey                                `json:"stage_key"`
+	StageVersion   string                                              `json:"stage_version"`
+	Verdict        workflowkit.Verdict                                 `json:"verdict"`
+	ContractDigest string                                              `json:"contract_digest,omitempty"`
+	Artifacts      []standardAuthoringCodexCanonicalSubmissionArtifact `json:"artifacts"`
 }
 
 type standardAuthoringCodexCanonicalSubmissionArtifact struct {
@@ -117,10 +183,11 @@ type standardAuthoringCodexCanonicalSubmissionArtifact struct {
 }
 
 type standardAuthoringCodexSubmissionReceipt struct {
-	Accepted  bool                    `json:"accepted"`
-	Errors    []string                `json:"errors"`
-	Remaining int                     `json:"remaining"`
-	Digest    workflowkit.Fingerprint `json:"digest"`
+	Accepted       bool                    `json:"accepted"`
+	Errors         []string                `json:"errors"`
+	Remaining      int                     `json:"remaining"`
+	Digest         workflowkit.Fingerprint `json:"digest"`
+	ContractDigest workflowkit.Fingerprint `json:"contract_digest,omitempty"`
 }
 
 func newStandardAuthoringCodexOutputSubmission(request workflowkit.StageExecutionRequest, maxBytes int, maxAttempts int, now func() time.Time, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) (*standardAuthoringCodexOutputSubmission, error) {
@@ -142,11 +209,125 @@ func newStandardAuthoringCodexOutputSubmission(request workflowkit.StageExecutio
 	} else {
 		environmentPolicy = nil
 	}
+	contractDigest, err := standardAuthoringCodexBoundContractDigest(request)
+	if err != nil {
+		return nil, err
+	}
 	return &standardAuthoringCodexOutputSubmission{
-		request:  request,
-		stage:    request.Stage.Clone(),
+		request: request,
+		stage:   request.Stage.Clone(), contractDigest: contractDigest,
 		maxBytes: maxBytes, maxAttempts: maxAttempts, now: now, environmentPolicy: environmentPolicy,
 	}, nil
+}
+
+// setStructuredClaimValidation attaches the canonical root contract and exact
+// frozen source root to the two structured planning producers. The caller must
+// invoke it only after verifyFrozenSource has succeeded for sourceRoot.
+func (submission *standardAuthoringCodexOutputSubmission) setStructuredClaimValidation(contract workflowadapter.AuthoringContract, sourceRoot string) error {
+	if submission == nil {
+		return errors.New("structured claim submission is unavailable")
+	}
+	if _, ok := standardAuthoringCodexStructuredClaimFormat(submission.stage); !ok {
+		return nil
+	}
+	canonical, err := contract.Canonical()
+	if err != nil || canonical != contract {
+		return errors.New("structured claim root contract is invalid")
+	}
+	root, err := standardAuthoringCodexFrozenSourceRoot(sourceRoot)
+	if err != nil {
+		return err
+	}
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if submission.accepted != nil || submission.attempts != 0 {
+		return errors.New("structured claim validation must be configured before submission")
+	}
+	contractCopy := canonical
+	submission.structuredClaimContract = &contractCopy
+	submission.frozenSourceRoot = root
+	return nil
+}
+
+// setTestsAnalysisRequirementValidation binds tests analysis to the same stable
+// requirement IDs asserted by both upstream planning artifacts.
+func (submission *standardAuthoringCodexOutputSubmission) setTestsAnalysisRequirementValidation(inputs []standardAuthoringCodexInput) error {
+	if submission == nil || submission.stage.Key != workflowkit.StageKey(workflowadapter.TestsAnalysis) {
+		return nil
+	}
+	var proposalIDs, planIDs map[string]struct{}
+	for _, input := range inputs {
+		if input.Name != "task_proposal" && input.Name != "generated_task_files" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(input.ContentBase64)
+		if err != nil || workflowkit.SHA256Fingerprint(raw) != input.ContentDigest {
+			return errors.New("tests-analysis requirement input is invalid")
+		}
+		format := standardAuthoringCodexTaskProposalFormat
+		if input.Name == "generated_task_files" {
+			format = standardAuthoringCodexGeneratedTaskPlanFormat
+		}
+		ids, err := standardAuthoringCodexStructuredRequirementIDs(raw, format)
+		if err != nil {
+			return err
+		}
+		if input.Name == "task_proposal" {
+			proposalIDs = ids
+		} else {
+			planIDs = ids
+		}
+	}
+	if len(proposalIDs) == 0 || len(planIDs) == 0 || !standardAuthoringCodexSameRequirementIDs(proposalIDs, planIDs) {
+		return errors.New("tests-analysis requirements do not match the validated planning artifacts")
+	}
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if submission.accepted != nil || submission.attempts != 0 {
+		return errors.New("tests-analysis validation must be configured before submission")
+	}
+	submission.testsAnalysisRequirementIDs = proposalIDs
+	return nil
+}
+
+func standardAuthoringCodexStructuredRequirementIDs(content []byte, expectedFormat string) (map[string]struct{}, error) {
+	if len(content) == 0 || !utf8.Valid(content) || bytes.IndexByte(content, 0) >= 0 || rejectDuplicateDeploymentCatalogJSONKeys(content) != nil {
+		return nil, errors.New("structured requirement input is invalid")
+	}
+	var document standardAuthoringCodexStructuredClaimDocument
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
+		return nil, errors.New("structured requirement input is invalid")
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) || document.Format == nil || *document.Format != expectedFormat ||
+		document.Version == nil || *document.Version != standardAuthoringCodexStructuredClaimsVersion || document.Requirements == nil || len(*document.Requirements) == 0 {
+		return nil, errors.New("structured requirement input is invalid")
+	}
+	ids := make(map[string]struct{}, len(*document.Requirements))
+	for _, requirement := range *document.Requirements {
+		if requirement.ID == nil || !standardAuthoringCodexRequirementIDPattern.MatchString(*requirement.ID) || requirement.Text == nil || !standardAuthoringCodexNonEmptyText(*requirement.Text) {
+			return nil, errors.New("structured requirement input is invalid")
+		}
+		if _, duplicate := ids[*requirement.ID]; duplicate {
+			return nil, errors.New("structured requirement input is invalid")
+		}
+		ids[*requirement.ID] = struct{}{}
+	}
+	return ids, nil
+}
+
+func standardAuthoringCodexSameRequirementIDs(left, right map[string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for id := range left {
+		if _, found := right[id]; !found {
+			return false
+		}
+	}
+	return true
 }
 
 // newStandardAuthoringCodexFixedFileSubmission creates the submission
@@ -159,11 +340,11 @@ func newStandardAuthoringCodexFixedFileSubmission(request workflowkit.StageExecu
 	if err != nil {
 		return nil, err
 	}
-	if request.Execution.Workflow.ID != workflowadapter.StandardAuthoringWorkflowTemplateID || request.Execution.Workflow.Version != workflowadapter.StandardAuthoringFixedFileTemplateVersion {
-		return nil, errors.New("Standard authoring Codex fixed-file submission requires template 1.8.0")
+	if request.Execution.Workflow.ID != workflowadapter.StandardAuthoringWorkflowTemplateID || request.Execution.Workflow.Version != workflowadapter.StandardAuthoringCurrentTemplateReference().Version {
+		return nil, errors.New("Standard authoring Codex fixed-file submission requires the v2 template")
 	}
 	relative, outputName, _, ok := standardAuthoringCodexFixedFileStageContract(submission.stage)
-	expected, found := workflowadapter.StandardAuthoringFixedFileStageCatalog().Stage(submission.stage.Key)
+	expected, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(submission.stage.Key)
 	if !ok || !found || submission.stage.Version != expected.Version || submission.stage.Plugin.ID != expected.Plugin.ID || submission.stage.Plugin.Version != expected.Plugin.Version ||
 		!reflect.DeepEqual(submission.stage.Outputs, expected.Outputs) || !reflect.DeepEqual(submission.stage.Verdicts, expected.Verdicts) ||
 		len(submission.stage.Outputs) != 1 || !submission.stage.Outputs[0].Required || submission.stage.Outputs[0].Name != outputName ||
@@ -231,10 +412,10 @@ func (submission *standardAuthoringCodexOutputSubmission) beginTurn(turn int) er
 
 func (submission *standardAuthoringCodexOutputSubmission) dynamicTool() agent.DynamicTool {
 	description := standardAuthoringCodexSubmitToolDescription(submission.stage.Key)
-	schema := standardAuthoringCodexSubmissionSchema(submission.stage)
+	schema := standardAuthoringCodexSubmissionSchemaForContract(submission.stage, submission.contractDigest != "")
 	if submission != nil && submission.fixedFileRelativePath != "" {
 		description = "Submit the host-selected fixed workspace file only after writing its final raw bytes under task/" + submission.fixedFileRelativePath + ". The only accepted argument is verdict=pass; artifact bytes, names, paths, schema, and validation are host-owned."
-		schema = standardAuthoringCodexFixedFileSubmissionSchema()
+		schema = standardAuthoringCodexFixedFileSubmissionSchemaForContract(submission.contractDigest != "")
 	}
 	return agent.DynamicTool{
 		Name:        standardAuthoringCodexSubmitToolName,
@@ -251,7 +432,7 @@ func standardAuthoringCodexSubmitToolDescription(stageKey workflowkit.StageKey) 
 		workflowkit.StageKey(workflowadapter.DockerfileGen), workflowkit.StageKey(workflowadapter.SolveGen), workflowkit.StageKey(workflowadapter.TestGen):
 		return base + " The content_base64 value must encode the final raw file bytes themselves, never an extra JSON object, artifact-name, format/version, or content-field wrapper."
 	case workflowkit.StageKey(workflowadapter.TestsAnalysis):
-		return base + " The content_base64 value must encode exactly one JSON object with the non-empty string fields provided_information, theoretical_path, and passing_evidence, with no wrapper fields."
+		return base + " The content_base64 value must encode exactly one harbor.standard-authoring-tests-analysis.v2 JSON object with version 2, the exact requirement_ids from the validated proposal and plan, and non-empty provided_information, theoretical_path, and passing_evidence fields."
 	default:
 		return base
 	}
@@ -265,13 +446,31 @@ func (submission *standardAuthoringCodexOutputSubmission) outputSchema() json.Ra
 		return nil
 	}
 	if submission.fixedFileRelativePath != "" {
-		return standardAuthoringCodexFixedFileSubmissionSchema()
+		return standardAuthoringCodexFixedFileSubmissionSchemaForContract(submission.contractDigest != "")
 	}
-	return standardAuthoringCodexSubmissionSchema(submission.stage)
+	return standardAuthoringCodexSubmissionSchemaForContract(submission.stage, submission.contractDigest != "")
 }
 
 func standardAuthoringCodexFixedFileSubmissionSchema() json.RawMessage {
 	return json.RawMessage(append([]byte(nil), standardAuthoringCodexFixedFileOutputSchemaTemplate()...))
+}
+
+func standardAuthoringCodexFixedFileSubmissionSchemaForContract(requireContract bool) json.RawMessage {
+	if !requireContract {
+		return standardAuthoringCodexFixedFileSubmissionSchema()
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(standardAuthoringCodexFixedFileOutputSchemaTemplate(), &schema); err != nil {
+		panic("decode fixed Standard authoring Codex output schema: " + err.Error())
+	}
+	properties := schema["properties"].(map[string]any)
+	properties["contract_digest"] = map[string]any{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+	schema["required"] = []string{"verdict", "contract_digest"}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		panic("marshal fixed Standard authoring contract submission schema: " + err.Error())
+	}
+	return encoded
 }
 
 func standardAuthoringCodexFixedFileOutputSchemaTemplate() []byte {
@@ -279,7 +478,7 @@ func standardAuthoringCodexFixedFileOutputSchemaTemplate() []byte {
 }
 
 // StandardAuthoringCodexFixedFileOutputSchemaFingerprint identifies the
-// exact JSON Schema asset that protects 1.8.0 fixed-file solve/test turns.
+// exact JSON Schema asset that protects v2 fixed-file solve/test turns.
 func StandardAuthoringCodexFixedFileOutputSchemaFingerprint() workflowkit.Fingerprint {
 	fingerprint, err := workflowkit.FingerprintBytes("harbor.standard-authoring-codex-fixed-file-submit-schema.v1", standardAuthoringCodexFixedFileOutputSchemaTemplate())
 	if err != nil {
@@ -289,7 +488,7 @@ func StandardAuthoringCodexFixedFileOutputSchemaFingerprint() workflowkit.Finger
 }
 
 // ValidateStandardAuthoringCodexFixedFileOutputSchemaAsset accepts only the
-// exact 1.8.0 deployment schema. The optional one terminal LF follows the
+// exact v2 deployment schema. The optional one terminal LF follows the
 // same lock-bound POSIX text-file rule as the legacy Codex output schema.
 func ValidateStandardAuthoringCodexFixedFileOutputSchemaAsset(raw []byte) error {
 	if len(raw) == 0 || len(raw) > standardAuthoringCodexContractAssetLimit {
@@ -305,9 +504,7 @@ func ValidateStandardAuthoringCodexFixedFileOutputSchemaAsset(raw []byte) error 
 }
 
 // ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage selects the
-// one schema that may be used for a frozen template/stage pair. 1.7.0
-// solve/test remains pinned to the legacy base64 schema; only 1.8.0 maps
-// those two keys to the fixed-file schema.
+// one schema that may be used for a frozen v2 template/stage pair.
 func ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(template workflowadapter.TemplateReference, stageKey workflowkit.StageKey, raw []byte) error {
 	if standardAuthoringCodexUsesFixedFileOutputSchema(template, stageKey) {
 		return ValidateStandardAuthoringCodexFixedFileOutputSchemaAsset(raw)
@@ -323,10 +520,14 @@ func StandardAuthoringCodexOutputSchemaFingerprintForTemplateStage(template work
 }
 
 func standardAuthoringCodexUsesFixedFileOutputSchema(template workflowadapter.TemplateReference, stageKey workflowkit.StageKey) bool {
-	return template.Equal(workflowadapter.StandardAuthoringFixedFileTemplateReference()) && standardAuthoringCodexFixedFileStageKey(stageKey)
+	return template.Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) && standardAuthoringCodexFixedFileStageKey(stageKey)
 }
 
 func standardAuthoringCodexSubmissionSchema(stage workflowkit.StageDescriptor) json.RawMessage {
+	return standardAuthoringCodexSubmissionSchemaForContract(stage, false)
+}
+
+func standardAuthoringCodexSubmissionSchemaForContract(stage workflowkit.StageDescriptor, requireContract bool) json.RawMessage {
 	verdicts := append([]workflowkit.Verdict(nil), stage.Verdicts.Allowed...)
 	sort.Slice(verdicts, func(left, right int) bool { return verdicts[left] < verdicts[right] })
 	values := make([]string, 0, len(verdicts))
@@ -349,6 +550,14 @@ func standardAuthoringCodexSubmissionSchema(stage workflowkit.StageDescriptor) j
 	verdict["enum"] = values
 	artifacts["minItems"] = len(stage.Outputs)
 	artifacts["maxItems"] = len(stage.Outputs)
+	if requireContract {
+		properties["contract_digest"] = map[string]any{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+		required, ok := schema["required"].([]any)
+		if !ok {
+			panic("fixed Standard authoring Codex output schema has no required fields")
+		}
+		schema["required"] = append(required, "contract_digest")
+	}
 	encoded, err := json.Marshal(schema)
 	if err != nil {
 		panic("marshal fixed Standard authoring Codex submission schema: " + err.Error())
@@ -427,9 +636,17 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 		return submission.handleFixedFileCandidate(ctx, raw, turn, remaining, digest)
 	}
 
-	result, canonicalDigest, diagnostic := standardAuthoringCodexValidateSubmissionCandidate(raw, submission.stage, turn, submission.environmentPolicy)
+	result, canonicalDigest, diagnostic := standardAuthoringCodexValidateSubmissionCandidate(raw, submission.stage, turn, submission.environmentPolicy, submission.contractDigest)
 	if diagnostic != "" {
-		return standardAuthoringCodexSubmissionResponse(false, []string{diagnostic}, remaining, digest)
+		return standardAuthoringCodexSubmissionResponseWithContract(false, []string{diagnostic}, remaining, digest, submission.contractDigest)
+	}
+	if result.Outcome.Verdict == workflowkit.VerdictPass {
+		if diagnostic := submission.structuredClaimDiagnostic(result); diagnostic != "" {
+			return standardAuthoringCodexSubmissionResponseWithContract(false, []string{diagnostic}, remaining, digest, submission.contractDigest)
+		}
+		if diagnostic := submission.testsAnalysisDiagnostic(result); diagnostic != "" {
+			return standardAuthoringCodexSubmissionResponseWithContract(false, []string{diagnostic}, remaining, digest, submission.contractDigest)
+		}
 	}
 
 	submission.mu.Lock()
@@ -444,7 +661,7 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_timeout"}, submission.remainingLocked(), digest)
 	}
 	submission.accepted = &standardAuthoringCodexAcceptedOutput{result: cloneStandardAuthoringCodexStageResult(result)}
-	return standardAuthoringCodexSubmissionResponse(true, nil, submission.remainingLocked(), canonicalDigest)
+	return standardAuthoringCodexSubmissionResponseWithContract(true, nil, submission.remainingLocked(), canonicalDigest, submission.contractDigest)
 }
 
 // handleFixedFileCandidate admits only a pass receipt for the host-selected
@@ -452,7 +669,7 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 // and publishing the immutable StageArtifact: an edit after validation must
 // be submitted and checked again, never silently become the accepted bytes.
 func (submission *standardAuthoringCodexOutputSubmission) handleFixedFileCandidate(ctx context.Context, raw json.RawMessage, turn, remaining int, rawDigest workflowkit.Fingerprint) (json.RawMessage, error) {
-	if !standardAuthoringCodexFixedFilePassCandidate(raw) {
+	if !standardAuthoringCodexFixedFilePassCandidate(raw, submission.contractDigest) {
 		return standardAuthoringCodexSubmissionResponse(false, []string{"wrong_verdict"}, remaining, rawDigest)
 	}
 	_, outputName, _, ok := standardAuthoringCodexFixedFileStageContract(submission.stage)
@@ -514,14 +731,15 @@ func (submission *standardAuthoringCodexOutputSubmission) handleFixedFileCandida
 		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_timeout"}, submission.remainingLocked(), candidateDigest)
 	}
 	submission.accepted = &standardAuthoringCodexAcceptedOutput{result: cloneStandardAuthoringCodexStageResult(result)}
-	return standardAuthoringCodexSubmissionResponse(true, nil, submission.remainingLocked(), candidateDigest)
+	return standardAuthoringCodexSubmissionResponseWithContract(true, nil, submission.remainingLocked(), candidateDigest, submission.contractDigest)
 }
 
 type standardAuthoringCodexFixedFileSubmissionCandidate struct {
-	Verdict *workflowkit.Verdict `json:"verdict"`
+	Verdict        *workflowkit.Verdict `json:"verdict"`
+	ContractDigest *string              `json:"contract_digest"`
 }
 
-func standardAuthoringCodexFixedFilePassCandidate(raw []byte) bool {
+func standardAuthoringCodexFixedFilePassCandidate(raw []byte, expectedContract workflowkit.Fingerprint) bool {
 	if len(raw) == 0 || rejectDuplicateDeploymentCatalogJSONKeys(raw) != nil {
 		return false
 	}
@@ -535,7 +753,10 @@ func standardAuthoringCodexFixedFilePassCandidate(raw []byte) bool {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return false
 	}
-	return candidate.Verdict != nil && *candidate.Verdict == workflowkit.VerdictPass
+	if candidate.Verdict == nil || *candidate.Verdict != workflowkit.VerdictPass {
+		return false
+	}
+	return expectedContract == "" || (candidate.ContractDigest != nil && *candidate.ContractDigest == string(expectedContract))
 }
 
 // standardAuthoringCodexFixedFileStageContract is deliberately closed to the
@@ -591,11 +812,15 @@ func (submission *standardAuthoringCodexOutputSubmission) remainingLocked() int 
 }
 
 func standardAuthoringCodexSubmissionResponse(accepted bool, diagnostics []string, remaining int, digest workflowkit.Fingerprint) (json.RawMessage, error) {
+	return standardAuthoringCodexSubmissionResponseWithContract(accepted, diagnostics, remaining, digest, "")
+}
+
+func standardAuthoringCodexSubmissionResponseWithContract(accepted bool, diagnostics []string, remaining int, digest, contractDigest workflowkit.Fingerprint) (json.RawMessage, error) {
 	if diagnostics == nil {
 		diagnostics = []string{}
 	}
 	encoded, err := json.Marshal(standardAuthoringCodexSubmissionReceipt{
-		Accepted: accepted, Errors: diagnostics, Remaining: remaining, Digest: digest,
+		Accepted: accepted, Errors: diagnostics, Remaining: remaining, Digest: digest, ContractDigest: contractDigest,
 	})
 	if err != nil {
 		return nil, err
@@ -603,7 +828,7 @@ func standardAuthoringCodexSubmissionResponse(accepted bool, diagnostics []strin
 	return json.RawMessage(encoded), nil
 }
 
-func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflowkit.StageDescriptor, turnOrdinal int, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy) (workflowkit.StageExecutionResult, workflowkit.Fingerprint, string) {
+func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflowkit.StageDescriptor, turnOrdinal int, environmentPolicy *workflowadapter.StandardAuthoringEnvironmentPolicy, expectedContract workflowkit.Fingerprint) (workflowkit.StageExecutionResult, workflowkit.Fingerprint, string) {
 	if turnOrdinal < 1 {
 		return workflowkit.StageExecutionResult{}, "", "submission_unavailable"
 	}
@@ -623,17 +848,21 @@ func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflo
 	if candidate.Verdict == nil || !stage.Verdicts.Allows(*candidate.Verdict) {
 		return workflowkit.StageExecutionResult{}, "", "wrong_verdict"
 	}
+	if expectedContract != "" && (candidate.ContractDigest == nil || *candidate.ContractDigest != string(expectedContract)) {
+		return workflowkit.StageExecutionResult{}, "", "contract_digest_mismatch"
+	}
 	if candidate.Artifacts == nil || len(*candidate.Artifacts) != len(stage.Outputs) {
 		return workflowkit.StageExecutionResult{}, "", "artifact_identity_mismatch"
 	}
 
 	canonical := standardAuthoringCodexCanonicalSubmission{
-		Format:       standardAuthoringCodexCanonicalSubmissionFormat,
-		Version:      standardAuthoringCodexCanonicalSubmissionVersion,
-		StageKey:     stage.Key,
-		StageVersion: stage.Version,
-		Verdict:      *candidate.Verdict,
-		Artifacts:    make([]standardAuthoringCodexCanonicalSubmissionArtifact, 0, len(*candidate.Artifacts)),
+		Format:         standardAuthoringCodexCanonicalSubmissionFormat,
+		Version:        standardAuthoringCodexCanonicalSubmissionVersion,
+		StageKey:       stage.Key,
+		StageVersion:   stage.Version,
+		Verdict:        *candidate.Verdict,
+		ContractDigest: string(expectedContract),
+		Artifacts:      make([]standardAuthoringCodexCanonicalSubmissionArtifact, 0, len(*candidate.Artifacts)),
 	}
 	artifacts := make([]workflowkit.StageArtifact, 0, len(*candidate.Artifacts))
 	for index, part := range *candidate.Artifacts {
@@ -655,10 +884,10 @@ func standardAuthoringCodexValidateSubmissionCandidate(raw []byte, stage workflo
 	if *candidate.Verdict == workflowkit.VerdictPass {
 		if stage.Key == workflowkit.StageKey(workflowadapter.DockerfileGen) {
 			if environmentPolicy == nil || len(artifacts) != 1 || artifacts[0].Name != "dockerfile" {
-				return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+				return workflowkit.StageExecutionResult{}, "", "dockerfile_contract_base_image_mismatch"
 			}
 			if err := workflowadapter.ValidateDockerfileBaseImage(artifacts[0].Content, *environmentPolicy); err != nil {
-				return workflowkit.StageExecutionResult{}, "", "dockerfile_environment_policy_mismatch"
+				return workflowkit.StageExecutionResult{}, "", "dockerfile_contract_base_image_mismatch"
 			}
 		}
 		if diagnostic := standardAuthoringCodexArtifactContentDiagnostic(stage.Key, artifacts); diagnostic != "" {
@@ -697,7 +926,7 @@ func standardAuthoringCodexArtifactContentDiagnostic(stageKey workflowkit.StageK
 			return "test_script_invalid"
 		}
 	case workflowkit.StageKey(workflowadapter.TestsAnalysis):
-		if artifacts[0].Name != "tests_analysis" || !standardAuthoringCodexTestsAnalysis(content) {
+		if artifacts[0].Name != "tests_analysis" || !standardAuthoringCodexTestsAnalysis(content, nil) {
 			return "tests_analysis_invalid"
 		}
 	}
@@ -731,12 +960,15 @@ func standardAuthoringCodexShellScript(content []byte) bool {
 }
 
 type standardAuthoringCodexTestsAnalysisCandidate struct {
-	ProvidedInformation *string `json:"provided_information"`
-	TheoreticalPath     *string `json:"theoretical_path"`
-	PassingEvidence     *string `json:"passing_evidence"`
+	Format              *string   `json:"format"`
+	Version             *string   `json:"version"`
+	RequirementIDs      *[]string `json:"requirement_ids"`
+	ProvidedInformation *string   `json:"provided_information"`
+	TheoreticalPath     *string   `json:"theoretical_path"`
+	PassingEvidence     *string   `json:"passing_evidence"`
 }
 
-func standardAuthoringCodexTestsAnalysis(content []byte) bool {
+func standardAuthoringCodexTestsAnalysis(content []byte, expectedRequirementIDs map[string]struct{}) bool {
 	if len(content) == 0 || !utf8.Valid(content) || bytes.IndexByte(content, 0) >= 0 || rejectDuplicateDeploymentCatalogJSONKeys(content) != nil {
 		return false
 	}
@@ -750,9 +982,248 @@ func standardAuthoringCodexTestsAnalysis(content []byte) bool {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return false
 	}
-	return candidate.ProvidedInformation != nil && standardAuthoringCodexNonEmptyText(*candidate.ProvidedInformation) &&
+	if candidate.Format == nil || *candidate.Format != standardAuthoringCodexTestsAnalysisFormat || candidate.Version == nil || *candidate.Version != standardAuthoringCodexStructuredClaimsVersion ||
+		candidate.RequirementIDs == nil || len(*candidate.RequirementIDs) == 0 {
+		return false
+	}
+	requirementIDs := make(map[string]struct{}, len(*candidate.RequirementIDs))
+	for _, id := range *candidate.RequirementIDs {
+		if !standardAuthoringCodexRequirementIDPattern.MatchString(id) {
+			return false
+		}
+		if _, duplicate := requirementIDs[id]; duplicate {
+			return false
+		}
+		requirementIDs[id] = struct{}{}
+	}
+	return (expectedRequirementIDs == nil || standardAuthoringCodexSameRequirementIDs(requirementIDs, expectedRequirementIDs)) &&
+		candidate.ProvidedInformation != nil && standardAuthoringCodexNonEmptyText(*candidate.ProvidedInformation) &&
 		candidate.TheoreticalPath != nil && standardAuthoringCodexNonEmptyText(*candidate.TheoreticalPath) &&
 		candidate.PassingEvidence != nil && standardAuthoringCodexNonEmptyText(*candidate.PassingEvidence)
+}
+
+func (submission *standardAuthoringCodexOutputSubmission) testsAnalysisDiagnostic(result workflowkit.StageExecutionResult) string {
+	if submission == nil || submission.stage.Key != workflowkit.StageKey(workflowadapter.TestsAnalysis) || len(result.Artifacts) != 1 {
+		return ""
+	}
+	submission.mu.Lock()
+	expected := make(map[string]struct{}, len(submission.testsAnalysisRequirementIDs))
+	for id := range submission.testsAnalysisRequirementIDs {
+		expected[id] = struct{}{}
+	}
+	contractDigest := submission.contractDigest
+	submission.mu.Unlock()
+	if contractDigest == "" {
+		return ""
+	}
+	if len(expected) == 0 || !standardAuthoringCodexTestsAnalysis(result.Artifacts[0].Content, expected) {
+		return "requirement_ids_invalid"
+	}
+	return ""
+}
+
+func (submission *standardAuthoringCodexOutputSubmission) structuredClaimDiagnostic(result workflowkit.StageExecutionResult) string {
+	if submission == nil {
+		return "structured_claim_validation_unavailable"
+	}
+	format, structured := standardAuthoringCodexStructuredClaimFormat(submission.stage)
+	if !structured {
+		return ""
+	}
+
+	submission.mu.Lock()
+	var contract *workflowadapter.AuthoringContract
+	if submission.structuredClaimContract != nil {
+		contractCopy := *submission.structuredClaimContract
+		contract = &contractCopy
+	}
+	sourceRoot := submission.frozenSourceRoot
+	contractDigest := submission.contractDigest
+	submission.mu.Unlock()
+	if contractDigest == "" {
+		// A direct legacy fixture can use the generic output route. The v2
+		// template always binds a root contract, so it must not take this path.
+		return ""
+	}
+	if contract == nil || sourceRoot == "" {
+		return "structured_claim_validation_unavailable"
+	}
+	if len(result.Artifacts) != 1 || result.Artifacts[0].Name != standardAuthoringCodexStructuredClaimOutput(submission.stage.Key) {
+		return "structured_claims_invalid"
+	}
+	return standardAuthoringCodexValidateStructuredClaimDocument(result.Artifacts[0].Content, format, *contract, sourceRoot)
+}
+
+func standardAuthoringCodexStructuredClaimFormat(stage workflowkit.StageDescriptor) (string, bool) {
+	switch stage.Key {
+	case workflowkit.StageKey(workflowadapter.TaskDesign):
+		return standardAuthoringCodexTaskProposalFormat, true
+	case workflowkit.StageKey(workflowadapter.GenerateTaskFiles):
+		return standardAuthoringCodexGeneratedTaskPlanFormat, true
+	default:
+		return "", false
+	}
+}
+
+func standardAuthoringCodexStructuredClaimOutput(stageKey workflowkit.StageKey) string {
+	switch stageKey {
+	case workflowkit.StageKey(workflowadapter.TaskDesign):
+		return "task_proposal"
+	case workflowkit.StageKey(workflowadapter.GenerateTaskFiles):
+		return "generated_task_files"
+	default:
+		return ""
+	}
+}
+
+func standardAuthoringCodexValidateStructuredClaimDocument(content []byte, expectedFormat string, contract workflowadapter.AuthoringContract, sourceRoot string) string {
+	if len(content) == 0 || !utf8.Valid(content) || bytes.IndexByte(content, 0) >= 0 || rejectDuplicateDeploymentCatalogJSONKeys(content) != nil {
+		return "structured_claims_invalid"
+	}
+	var document standardAuthoringCodexStructuredClaimDocument
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
+		return "structured_claims_invalid"
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "structured_claims_invalid"
+	}
+	if document.Format == nil || *document.Format != expectedFormat || document.Version == nil || *document.Version != standardAuthoringCodexStructuredClaimsVersion {
+		return "structured_claims_invalid"
+	}
+	if !standardAuthoringCodexContractClaimsMatch(document.ContractClaims, contract) {
+		return "contract_claims_mismatch"
+	}
+	if document.Requirements == nil || len(*document.Requirements) == 0 {
+		return "requirement_ids_invalid"
+	}
+	requirementIDs := make(map[string]struct{}, len(*document.Requirements))
+	for _, requirement := range *document.Requirements {
+		if requirement.ID == nil || !standardAuthoringCodexRequirementIDPattern.MatchString(*requirement.ID) {
+			return "requirement_ids_invalid"
+		}
+		if _, duplicate := requirementIDs[*requirement.ID]; duplicate {
+			return "requirement_ids_invalid"
+		}
+		requirementIDs[*requirement.ID] = struct{}{}
+		if requirement.Text == nil || !standardAuthoringCodexNonEmptyText(*requirement.Text) {
+			return "structured_claims_invalid"
+		}
+	}
+	if document.SourcePaths == nil {
+		return "source_paths_invalid"
+	}
+	for _, sourcePath := range *document.SourcePaths {
+		relative, ok := standardAuthoringCodexSafePOSIXRelativePath(sourcePath, false)
+		if !ok || !standardAuthoringCodexFrozenSourcePathExists(sourceRoot, relative, false) {
+			return "source_paths_invalid"
+		}
+	}
+	if document.Packages == nil {
+		return "packages_invalid"
+	}
+	for _, packageClaim := range *document.Packages {
+		if packageClaim.ManifestPath == nil {
+			return "packages_invalid"
+		}
+		relative, ok := standardAuthoringCodexSafePOSIXRelativePath(*packageClaim.ManifestPath, false)
+		if !ok || !standardAuthoringCodexFrozenSourcePathExists(sourceRoot, relative, false) {
+			return "packages_invalid"
+		}
+	}
+	if document.Commands == nil {
+		return "commands_invalid"
+	}
+	for _, command := range *document.Commands {
+		if command.WorkingDirectory == nil || command.Argv == nil || len(*command.Argv) == 0 {
+			return "commands_invalid"
+		}
+		workingDirectory, ok := standardAuthoringCodexSafePOSIXRelativePath(*command.WorkingDirectory, true)
+		if !ok || !standardAuthoringCodexFrozenSourcePathExists(sourceRoot, workingDirectory, true) {
+			return "commands_invalid"
+		}
+		workingDirectoryPath := filepath.Join(sourceRoot, filepath.FromSlash(workingDirectory))
+		for _, argument := range *command.Argv {
+			if !standardAuthoringCodexNonEmptyCommandArgument(argument) {
+				return "commands_invalid"
+			}
+			if !strings.ContainsAny(argument, "/\\") {
+				continue
+			}
+			relative, ok := standardAuthoringCodexSafePOSIXRelativePath(argument, true)
+			if !ok || !standardAuthoringCodexFrozenSourcePathExists(workingDirectoryPath, relative, false) || !standardAuthoringCodexPathAtOrBelow(sourceRoot, filepath.Join(workingDirectoryPath, filepath.FromSlash(relative))) {
+				return "commands_invalid"
+			}
+		}
+	}
+	return ""
+}
+
+func standardAuthoringCodexContractClaimsMatch(claims *standardAuthoringCodexContractClaims, contract workflowadapter.AuthoringContract) bool {
+	return claims != nil && claims.Title != nil && *claims.Title == contract.Task.Title &&
+		claims.Slug != nil && *claims.Slug == contract.Task.Slug &&
+		claims.RepositoryURL != nil && *claims.RepositoryURL == contract.Source.RepositoryURL &&
+		claims.CommitSHA != nil && *claims.CommitSHA == contract.Source.CommitSHA &&
+		claims.BaseImage != nil && *claims.BaseImage == contract.Environment.BaseImage &&
+		claims.CodeLang != nil && *claims.CodeLang == contract.Task.CodeLang &&
+		claims.TaskType != nil && *claims.TaskType == contract.Task.TaskType &&
+		claims.Application != nil && *claims.Application == contract.Task.Application &&
+		claims.Is0To1 != nil && *claims.Is0To1 == contract.Task.Is0To1 &&
+		claims.SourceRoot != nil && *claims.SourceRoot == contract.Source.CheckoutRoot
+}
+
+func standardAuthoringCodexFrozenSourceRoot(sourceRoot string) (string, error) {
+	if strings.TrimSpace(sourceRoot) == "" || sourceRoot != strings.TrimSpace(sourceRoot) {
+		return "", errors.New("frozen source root is invalid")
+	}
+	absolute, err := filepath.Abs(sourceRoot)
+	if err != nil || absolute != sourceRoot || filepath.Clean(absolute) != absolute {
+		return "", errors.New("frozen source root is invalid")
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("frozen source root is unavailable or unsafe")
+	}
+	return absolute, nil
+}
+
+func standardAuthoringCodexSafePOSIXRelativePath(value string, allowCurrentDirectory bool) (string, bool) {
+	if value == "" || value != strings.TrimSpace(value) || !utf8.ValidString(value) || strings.ContainsAny(value, "\\\x00") || path.IsAbs(value) {
+		return "", false
+	}
+	for index, component := range strings.Split(value, "/") {
+		if component == "" || component == ".." || (component == "." && (!allowCurrentDirectory || index != 0)) {
+			return "", false
+		}
+	}
+	cleaned := path.Clean(value)
+	if cleaned == "." {
+		return ".", allowCurrentDirectory && value == "."
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || (!strings.HasPrefix(value, "./") && cleaned != value) {
+		return "", false
+	}
+	return cleaned, true
+}
+
+func standardAuthoringCodexFrozenSourcePathExists(root, relative string, requireDirectory bool) bool {
+	candidate := filepath.Join(root, filepath.FromSlash(relative))
+	if !standardAuthoringCodexPathAtOrBelow(root, candidate) {
+		return false
+	}
+	info, err := os.Lstat(candidate)
+	return err == nil && info.Mode()&os.ModeSymlink == 0 && (!requireDirectory || info.IsDir())
+}
+
+func standardAuthoringCodexPathAtOrBelow(root, candidate string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(candidate))
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
+func standardAuthoringCodexNonEmptyCommandArgument(value string) bool {
+	return strings.TrimSpace(value) != "" && utf8.ValidString(value) && !strings.ContainsAny(value, "\r\n\x00")
 }
 
 func standardAuthoringCodexText(content []byte) bool {
@@ -797,6 +1268,27 @@ func cloneStandardAuthoringCodexStageResult(result workflowkit.StageExecutionRes
 		copyResult.Artifacts[index].Content = append([]byte(nil), artifact.Content...)
 	}
 	return copyResult
+}
+
+func standardAuthoringCodexBoundContractDigest(request workflowkit.StageExecutionRequest) (workflowkit.Fingerprint, error) {
+	template := workflowadapter.TemplateReference{ID: request.Execution.Workflow.ID, Version: request.Execution.Workflow.Version}
+	if !template.Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
+		return "", nil
+	}
+	var digest workflowkit.Fingerprint
+	for _, input := range request.Inputs {
+		if input.Name != workflowadapter.AuthoringContractArtifact {
+			continue
+		}
+		if digest != "" || input.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion || input.ContentDigest.Validate() != nil {
+			return "", errors.New("invalid root contract submission binding")
+		}
+		digest = input.ContentDigest
+	}
+	if digest == "" {
+		return "", errors.New("missing root contract submission binding")
+	}
+	return digest, nil
 }
 
 func standardAuthoringCodexSubmissionUsageKey(request workflowkit.StageExecutionRequest, turn, attempt int) string {

@@ -43,7 +43,6 @@ const (
 
 var generatedLockRelatives = []string{
 	"deployments/standard-authoring/operation-catalog.lock.json",
-	"deployments/standard-authoring-1.8/operation-catalog.lock.json",
 	parentLockRelative,
 	"deployments/codeedge-evaluator-child/operation-catalog.lock.json",
 }

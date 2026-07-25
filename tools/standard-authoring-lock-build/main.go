@@ -28,7 +28,7 @@ const (
 	maxProbeBytes              = 64 * 1024
 	maxSourceTreeBytes         = 64 * 1024 * 1024
 	probeTimeout               = 30 * time.Second
-	standardLockRelative       = "deployments/standard-authoring-1.8/operation-catalog.lock.json"
+	standardLockRelative       = "deployments/standard-authoring/operation-catalog.lock.json"
 )
 
 // generatedProductionLocks are omitted from the source manifest signed by
@@ -37,7 +37,6 @@ const (
 // independent bundles sign different source identities.
 var generatedProductionLocks = map[string]struct{}{
 	"deployments/standard-authoring/operation-catalog.lock.json":       {},
-	"deployments/standard-authoring-1.8/operation-catalog.lock.json":   {},
 	"deployments/codeedge-phase1/operation-catalog.lock.json":          {},
 	"deployments/codeedge-evaluator-child/operation-catalog.lock.json": {},
 }

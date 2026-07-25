@@ -873,6 +873,7 @@ func (m appModel) beginAuthoring(message TaskSubmitMsg, inputCmd tea.Cmd) (tea.M
 	message.Title = strings.TrimSpace(message.Title)
 	message.TaskType = strings.TrimSpace(message.TaskType)
 	message.Application = strings.TrimSpace(message.Application)
+	message.CodeLang = strings.TrimSpace(message.CodeLang)
 	message.Objective = strings.TrimSpace(message.Objective)
 	message.Reason = strings.TrimSpace(message.Reason)
 	if m.pendingStart == nil || m.pendingStart.message != message {
@@ -901,6 +902,8 @@ func (m appModel) startAuthoring(pending pendingTaskBoardStart) tea.Cmd {
 			Title:          pending.message.Title,
 			TaskType:       pending.message.TaskType,
 			Application:    pending.message.Application,
+			CodeLang:       pending.message.CodeLang,
+			Is0To1:         pending.message.Is0To1,
 			Objective:      pending.message.Objective,
 			MetadataJSON:   "{}",
 			Reason:         pending.message.Reason,
@@ -1169,9 +1172,18 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 			Runs:         make([]TaskRunItem, 0, len(task.Runs)),
 		}
 		for _, run := range task.Runs {
+			var authoringEvidence *app.TaskBoardAuthoringEvidence
+			if run.AuthoringEvidence != nil {
+				copy := *run.AuthoringEvidence
+				copy.Repairs = append([]app.TaskBoardAuthoringRepair(nil), run.AuthoringEvidence.Repairs...)
+				copy.Claims = append([]app.TaskBoardAuthoringClaim(nil), run.AuthoringEvidence.Claims...)
+				copy.Lineage = append([]app.TaskBoardAuthoringArtifact(nil), run.AuthoringEvidence.Lineage...)
+				authoringEvidence = &copy
+			}
 			item.Runs = append(item.Runs, TaskRunItem{
 				ID:                    run.ID,
 				ParentRunID:           run.ParentRunID,
+				AuthoringEvidence:     authoringEvidence,
 				Status:                run.Status,
 				CurrentStage:          run.CurrentStage,
 				FailureStage:          run.FailureStage,

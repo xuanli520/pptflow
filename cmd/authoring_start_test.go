@@ -15,7 +15,7 @@ func TestAuthoringStartCommandExposesSourceCoordinateAndClosedExecutionInputs(t 
 	if err != nil || command == nil || command.Name() != "start" {
 		t.Fatalf("find authoring start command: command=%v err=%v", command, err)
 	}
-	for _, required := range []string{"repository-url", "commit-sha", "base-image", "slug", "title", "task-type", "application", "objective", "metadata-json", "idempotency-key", "reason"} {
+	for _, required := range []string{"repository-url", "commit-sha", "base-image", "code-lang", "slug", "title", "task-type", "application", "objective", "metadata-json", "idempotency-key", "reason"} {
 		if command.Flags().Lookup(required) == nil {
 			t.Fatalf("authoring start is missing --%s", required)
 		}
@@ -69,6 +69,7 @@ func TestAuthoringStartCommandFailsClosedWithoutDeploymentCapabilityAndCreatesNo
 		"--repository-url", "https://github.com/example/fixture-repository.git",
 		"--commit-sha", "0123456789abcdef0123456789abcdef01234567",
 		"--base-image", "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"--code-lang", "rust",
 		"--slug", "fixture-authoring",
 		"--title", "Fixture authoring",
 		"--task-type", "feature",
@@ -119,7 +120,7 @@ func TestAuthoringStartCommandRequiresBaseImage(t *testing.T) {
 	}
 }
 
-func TestAuthoringStartCommandRequiresCompleteAuthoringBrief(t *testing.T) {
+func TestAuthoringStartCommandRequiresCompleteRootContract(t *testing.T) {
 	key, err := store.NewUUIDv7()
 	if err != nil {
 		t.Fatal(err)
@@ -129,10 +130,11 @@ func TestAuthoringStartCommandRequiresCompleteAuthoringBrief(t *testing.T) {
 		"--repository-url", "https://github.com/example/fixture-repository.git",
 		"--commit-sha", "0123456789abcdef0123456789abcdef01234567",
 		"--base-image", "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"--code-lang", "rust",
 		"--slug", "fixture-authoring",
 		"--title", "Fixture authoring",
 		"--idempotency-key", key,
-		"--reason", "verify immutable authoring brief is required",
+		"--reason", "verify immutable authoring contract is required",
 	}
 	for _, test := range []struct {
 		name  string
@@ -147,7 +149,7 @@ func TestAuthoringStartCommandRequiresCompleteAuthoringBrief(t *testing.T) {
 			command := newAuthoringCommand(&lifecycleCLIConfig{root: t.TempDir()})
 			command.SetArgs(append(append([]string(nil), baseArgs...), test.extra...))
 			if err := command.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("incomplete authoring brief error = %v, want %q", err, test.want)
+				t.Fatalf("incomplete authoring contract error = %v, want %q", err, test.want)
 			}
 		})
 	}

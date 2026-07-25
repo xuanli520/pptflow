@@ -20,6 +20,7 @@ const taskBoardTestBaseImage = "docker.io/library/rust:1.65.0-bullseye@sha256:aa
 const (
 	taskBoardTestTaskType    = "feature"
 	taskBoardTestApplication = "backend"
+	taskBoardTestCodeLang    = "rust"
 	taskBoardTestObjective   = "Add a bounded Tower HTTP backend feature"
 )
 
@@ -204,7 +205,7 @@ func TestAppModelRoutesBoardCommandsThroughGateway(t *testing.T) {
 		t.Fatalf("loaded board selection = %+v", selected)
 	}
 
-	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, Objective: taskBoardTestObjective, Reason: "create task"}
+	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, CodeLang: taskBoardTestCodeLang, Objective: taskBoardTestObjective, Reason: "create task"}
 	_, startCommand := model.beginAuthoring(message, nil)
 	mutationMessage := startCommand()
 	if _, ok := mutationMessage.(taskBoardMutationMsg); !ok || len(stub.startRequests) != 1 || stub.startRequests[0].Reason != message.Reason || stub.startRequests[0].BaseImage != message.BaseImage || stub.startRequests[0].Slug != message.Slug || stub.startRequests[0].TaskType != message.TaskType || stub.startRequests[0].Application != message.Application || stub.startRequests[0].Objective != message.Objective || stub.startRequests[0].IdempotencyKey == "" {
@@ -307,7 +308,15 @@ func TestTaskInputRequiresFrozenInputsAndIncludesThemInTabOrder(t *testing.T) {
 		t.Fatalf("application focus = index:%d focused:%t", input.focusIndex, input.applicationInput.Focused())
 	}
 	input.Update(tea.KeyMsg{Type: tea.KeyTab})
-	if input.focusIndex != 7 || !input.objectiveInput.Focused() {
+	if input.focusIndex != 7 || !input.codeLangInput.Focused() {
+		t.Fatalf("code language focus = index:%d focused:%t", input.focusIndex, input.codeLangInput.Focused())
+	}
+	input.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if input.focusIndex != 8 {
+		t.Fatalf("0-to-1 focus = index:%d", input.focusIndex)
+	}
+	input.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if input.focusIndex != 9 || !input.objectiveInput.Focused() {
 		t.Fatalf("objective focus = index:%d focused:%t", input.focusIndex, input.objectiveInput.Focused())
 	}
 	command, handled = input.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -322,7 +331,7 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 		startErr:    errors.New("activation unavailable"),
 		decisionErr: errors.New("activation unavailable"),
 	}
-	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, Objective: taskBoardTestObjective, Reason: "create task"}
+	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, CodeLang: taskBoardTestCodeLang, Objective: taskBoardTestObjective, Reason: "create task"}
 
 	model := loadedTaskBoardModel(t, stub)
 	updated, command := model.beginAuthoring(message, nil)
@@ -332,7 +341,7 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	model = updated.(appModel)
 	updated, command = model.beginAuthoring(TaskSubmitMsg{
 		RepoURL: "  " + message.RepoURL + "  ", CommitSHA: "  " + message.CommitSHA + "  ", BaseImage: "  " + message.BaseImage + "  ", Slug: "  " + message.Slug + "  ",
-		Title: "  " + message.Title + "  ", TaskType: "  " + message.TaskType + "  ", Application: "  " + message.Application + "  ", Objective: "  " + message.Objective + "  ", Reason: "  " + message.Reason + "  ",
+		Title: "  " + message.Title + "  ", TaskType: "  " + message.TaskType + "  ", Application: "  " + message.Application + "  ", CodeLang: "  " + message.CodeLang + "  ", Objective: "  " + message.Objective + "  ", Reason: "  " + message.Reason + "  ",
 	}, nil)
 	model = updated.(appModel)
 	_ = model
@@ -340,7 +349,7 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	if len(stub.startRequests) != 2 || stub.startRequests[0].IdempotencyKey != stub.startRequests[1].IdempotencyKey {
 		t.Fatalf("authoring retry keys = %+v", stub.startRequests)
 	}
-	if stub.startRequests[1].RepositoryURL != message.RepoURL || stub.startRequests[1].CommitSHA != message.CommitSHA || stub.startRequests[1].BaseImage != message.BaseImage || stub.startRequests[1].Slug != message.Slug || stub.startRequests[1].Title != message.Title || stub.startRequests[1].TaskType != message.TaskType || stub.startRequests[1].Application != message.Application || stub.startRequests[1].Objective != message.Objective || stub.startRequests[1].Reason != message.Reason {
+	if stub.startRequests[1].RepositoryURL != message.RepoURL || stub.startRequests[1].CommitSHA != message.CommitSHA || stub.startRequests[1].BaseImage != message.BaseImage || stub.startRequests[1].Slug != message.Slug || stub.startRequests[1].Title != message.Title || stub.startRequests[1].TaskType != message.TaskType || stub.startRequests[1].Application != message.Application || stub.startRequests[1].CodeLang != message.CodeLang || stub.startRequests[1].Objective != message.Objective || stub.startRequests[1].Reason != message.Reason {
 		t.Fatalf("authoring retry request = %+v, want normalized %+v", stub.startRequests[1], message)
 	}
 
@@ -381,10 +390,11 @@ func TestAppModelRetainsBaseImageAfterFailedStartAndClearsItAfterSuccess(t *test
 	model.input.baseImageInput.SetValue(taskBoardTestBaseImage)
 	model.input.taskTypeInput.SetValue(taskBoardTestTaskType)
 	model.input.applicationInput.SetValue(taskBoardTestApplication)
+	model.input.codeLangInput.SetValue(taskBoardTestCodeLang)
 	model.input.objectiveInput.SetValue(taskBoardTestObjective)
 	message := TaskSubmitMsg{
 		RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage,
-		Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, Objective: taskBoardTestObjective, Reason: "create task",
+		Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, CodeLang: taskBoardTestCodeLang, Objective: taskBoardTestObjective, Reason: "create task",
 	}
 
 	updated, command := model.beginAuthoring(message, nil)
@@ -392,8 +402,8 @@ func TestAppModelRetainsBaseImageAfterFailedStartAndClearsItAfterSuccess(t *test
 	failed := command().(taskBoardMutationMsg)
 	updated, _ = model.Update(failed)
 	model = updated.(appModel)
-	if !model.input.Visible() || model.input.baseImageInput.Value() != taskBoardTestBaseImage || model.input.taskTypeInput.Value() != taskBoardTestTaskType || model.input.applicationInput.Value() != taskBoardTestApplication || model.input.objectiveInput.Value() != taskBoardTestObjective {
-		t.Fatalf("failed start cleared task contract input: visible:%t baseImage:%q type:%q application:%q objective:%q", model.input.Visible(), model.input.baseImageInput.Value(), model.input.taskTypeInput.Value(), model.input.applicationInput.Value(), model.input.objectiveInput.Value())
+	if !model.input.Visible() || model.input.baseImageInput.Value() != taskBoardTestBaseImage || model.input.taskTypeInput.Value() != taskBoardTestTaskType || model.input.applicationInput.Value() != taskBoardTestApplication || model.input.codeLangInput.Value() != taskBoardTestCodeLang || model.input.objectiveInput.Value() != taskBoardTestObjective {
+		t.Fatalf("failed start cleared task contract input: visible:%t baseImage:%q type:%q application:%q codeLang:%q objective:%q", model.input.Visible(), model.input.baseImageInput.Value(), model.input.taskTypeInput.Value(), model.input.applicationInput.Value(), model.input.codeLangInput.Value(), model.input.objectiveInput.Value())
 	}
 
 	stub.startErr = nil
@@ -402,8 +412,8 @@ func TestAppModelRetainsBaseImageAfterFailedStartAndClearsItAfterSuccess(t *test
 	succeeded := command().(taskBoardMutationMsg)
 	updated, _ = model.Update(succeeded)
 	model = updated.(appModel)
-	if model.input.Visible() || model.input.baseImageInput.Value() != "" || model.input.taskTypeInput.Value() != "" || model.input.applicationInput.Value() != "" || model.input.objectiveInput.Value() != "" {
-		t.Fatalf("successful start retained task contract input: visible:%t baseImage:%q type:%q application:%q objective:%q", model.input.Visible(), model.input.baseImageInput.Value(), model.input.taskTypeInput.Value(), model.input.applicationInput.Value(), model.input.objectiveInput.Value())
+	if model.input.Visible() || model.input.baseImageInput.Value() != "" || model.input.taskTypeInput.Value() != "" || model.input.applicationInput.Value() != "" || model.input.codeLangInput.Value() != "" || model.input.objectiveInput.Value() != "" {
+		t.Fatalf("successful start retained task contract input: visible:%t baseImage:%q type:%q application:%q codeLang:%q objective:%q", model.input.Visible(), model.input.baseImageInput.Value(), model.input.taskTypeInput.Value(), model.input.applicationInput.Value(), model.input.codeLangInput.Value(), model.input.objectiveInput.Value())
 	}
 }
 
@@ -437,7 +447,7 @@ func TestAppModelDisplaysBoardBeforeActivatingQueuedRuns(t *testing.T) {
 func TestAppModelDoesNotExitWhileAMutationIsInFlight(t *testing.T) {
 	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
 	model := loadedTaskBoardModel(t, stub)
-	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, Objective: taskBoardTestObjective, Reason: "create task"}
+	message := TaskSubmitMsg{RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage, Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication, CodeLang: taskBoardTestCodeLang, Objective: taskBoardTestObjective, Reason: "create task"}
 	updated, _ := model.beginAuthoring(message, nil)
 	model = updated.(appModel)
 	updated, exitCommand := model.handleKey(keyRune('q'), nil)
@@ -487,6 +497,7 @@ func TestTaskInputSubmissionRetainsValuesUntilTheBackendSucceeds(t *testing.T) {
 	input.titleInput.SetValue("Retained task")
 	input.taskTypeInput.SetValue("  " + taskBoardTestTaskType + "  ")
 	input.applicationInput.SetValue("  " + taskBoardTestApplication + "  ")
+	input.codeLangInput.SetValue("  " + taskBoardTestCodeLang + "  ")
 	input.objectiveInput.SetValue("  " + taskBoardTestObjective + "  ")
 	input.reasonInput.SetValue("test retry")
 	command, handled := input.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -494,7 +505,7 @@ func TestTaskInputSubmissionRetainsValuesUntilTheBackendSucceeds(t *testing.T) {
 		t.Fatal("complete form did not emit a submit message")
 	}
 	message, ok := command().(TaskSubmitMsg)
-	if !ok || message.RepoURL != "https://example.invalid/repo.git" || message.BaseImage != taskBoardTestBaseImage || message.Slug != "retained-task" || message.TaskType != taskBoardTestTaskType || message.Application != taskBoardTestApplication || message.Objective != taskBoardTestObjective || message.Reason != "test retry" || len(message.CommitSHA) != 64 {
+	if !ok || message.RepoURL != "https://example.invalid/repo.git" || message.BaseImage != taskBoardTestBaseImage || message.Slug != "retained-task" || message.TaskType != taskBoardTestTaskType || message.Application != taskBoardTestApplication || message.CodeLang != taskBoardTestCodeLang || message.Objective != taskBoardTestObjective || message.Reason != "test retry" || len(message.CommitSHA) != 64 {
 		t.Fatalf("submit message = %#v", message)
 	}
 	if input.repoInput.Value() == "" || input.baseImageInput.Value() == "" || input.taskTypeInput.Value() == "" || input.applicationInput.Value() == "" || input.objectiveInput.Value() == "" || input.reasonInput.Value() == "" {
@@ -516,6 +527,7 @@ func TestTaskInputRejectsObjectiveOverUTF8ByteLimit(t *testing.T) {
 	input.titleInput.SetValue("Byte limited task")
 	input.taskTypeInput.SetValue(taskBoardTestTaskType)
 	input.applicationInput.SetValue(taskBoardTestApplication)
+	input.codeLangInput.SetValue(taskBoardTestCodeLang)
 	input.objectiveInput.SetValue(strings.Repeat("界", 200))
 	input.reasonInput.SetValue("verify byte limit")
 	command, handled := input.Update(tea.KeyMsg{Type: tea.KeyEnter})

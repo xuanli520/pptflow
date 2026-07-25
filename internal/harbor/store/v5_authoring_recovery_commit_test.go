@@ -102,7 +102,7 @@ func TestCommitAuthoringRecoveryExecutionRejectsMaterializationAndInDoubt(t *tes
 
 func TestAuthoringPhase1HandoffRequiresCurrentAuthoringParent(t *testing.T) {
 	ctx := context.Background()
-	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringTestsAnalysisInputTemplateVersion)
+	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringParentTemplateVersion)
 	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
 	if err != nil {
 		t.Fatalf("prepare current authoring parent handoff: %v", err)
@@ -116,47 +116,19 @@ func TestAuthoringPhase1HandoffRequiresCurrentAuthoringParent(t *testing.T) {
 	}
 }
 
-func TestAuthoringPhase1HandoffAcceptsBriefTemplateParent(t *testing.T) {
+func TestAuthoringPhase1HandoffRejectsLegacyAuthoringParents(t *testing.T) {
 	ctx := context.Background()
-	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringBriefParentTemplateVersion)
-	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
-	if err != nil {
-		t.Fatalf("prepare brief-template authoring handoff: %v", err)
-	}
-	child, err := createAuthoringPhase1ChildRun(t, ctx, fixture, handoff, codeEdgePhase1ChildTemplateVersion, standardAuthoringChildTrigger)
-	if err != nil {
-		t.Fatalf("create CodeEdge child for brief-template authoring parent: %v", err)
-	}
-	if child.ParentRunID != fixture.run.ID || child.WorkflowTemplateID != codeEdgePhase1ChildTemplateID || child.WorkflowTemplateVersion != codeEdgePhase1ChildTemplateVersion {
-		t.Fatalf("created child = %+v", child)
-	}
-}
-
-func TestAuthoringPhase1HandoffAcceptsRepairFeedbackTemplateParent(t *testing.T) {
-	ctx := context.Background()
-	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, standardAuthoringRepairFeedbackParentTemplateVersion)
-	handoff, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture)
-	if err != nil {
-		t.Fatalf("prepare repair-feedback-template authoring handoff: %v", err)
-	}
-	child, err := createAuthoringPhase1ChildRun(t, ctx, fixture, handoff, codeEdgePhase1ChildTemplateVersion, standardAuthoringChildTrigger)
-	if err != nil {
-		t.Fatalf("create CodeEdge child for repair-feedback-template authoring parent: %v", err)
-	}
-	if child.ParentRunID != fixture.run.ID || child.WorkflowTemplateID != codeEdgePhase1ChildTemplateID || child.WorkflowTemplateVersion != codeEdgePhase1ChildTemplateVersion {
-		t.Fatalf("created child = %+v", child)
-	}
-}
-
-func TestAuthoringPhase1HandoffRejectsRetiredAuthoringParent(t *testing.T) {
-	ctx := context.Background()
-	fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, "1.0.0")
-	if _, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture); err == nil {
-		t.Fatal("retired Standard authoring parent prepared a Phase-1 handoff")
-	}
-	prepared, err := fixture.store.GetAuthoringPhase1HandoffForAuthoringRun(ctx, fixture.run.ID)
-	if err != nil || prepared != nil {
-		t.Fatalf("retired Standard authoring parent handoff = %+v, %v", prepared, err)
+	for _, version := range []string{"1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"} {
+		t.Run(version, func(t *testing.T) {
+			fixture := materializedAuthoringRecoveryCommitFixtureForTemplateVersion(t, ctx, version)
+			if _, err := prepareAuthoringRecoveryPhase1HandoffResult(t, ctx, fixture); err == nil {
+				t.Fatal("legacy Standard authoring parent prepared a Phase-1 handoff")
+			}
+			prepared, err := fixture.store.GetAuthoringPhase1HandoffForAuthoringRun(ctx, fixture.run.ID)
+			if err != nil || prepared != nil {
+				t.Fatalf("legacy Standard authoring parent handoff = %+v, %v", prepared, err)
+			}
+		})
 	}
 }
 
@@ -236,13 +208,7 @@ func prepareAuthoringRecoveryPhase1Handoff(t *testing.T, ctx context.Context, fi
 
 func prepareAuthoringRecoveryPhase1HandoffResult(t *testing.T, ctx context.Context, fixture authoringRecoveryCommitFixture) (AuthoringPhase1Handoff, error) {
 	t.Helper()
-	handoffSchemaVersion := "harbor.authoring-task-handoff.v1"
-	if fixture.run.WorkflowTemplateVersion == standardAuthoringTaskAdmissionParentTemplateVersion ||
-		fixture.run.WorkflowTemplateVersion == standardAuthoringBriefParentTemplateVersion ||
-		fixture.run.WorkflowTemplateVersion == standardAuthoringRepairFeedbackParentTemplateVersion ||
-		fixture.run.WorkflowTemplateVersion == standardAuthoringTestsAnalysisInputTemplateVersion {
-		handoffSchemaVersion = "harbor.authoring-task-handoff.v2"
-	}
+	handoffSchemaVersion := "harbor.authoring-task-handoff.v2"
 	inputFingerprint := string(workflowkit.SHA256Fingerprint([]byte("authoring recovery handoff inputs")))
 	attempt, err := fixture.store.CreateStageAttempt(ctx, CreateStageAttemptRequest{
 		RunID: fixture.run.ID, StageKey: "materialize_task", StageGroup: "task_generation", Ordinal: 1,

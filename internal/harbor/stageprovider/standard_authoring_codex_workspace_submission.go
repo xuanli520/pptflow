@@ -311,7 +311,7 @@ func (submission *standardAuthoringCodexWorkspaceSubmission) handle(ctx context.
 		return standardAuthoringCodexWorkspaceSubmissionResponse(false, []string{"candidate_unavailable"}, remaining, rawDigest, authoringharness.Result{})
 	}
 	if err := submission.environment.ValidateDockerfile(candidate.Dockerfile); err != nil {
-		return standardAuthoringCodexWorkspaceSubmissionResponse(false, []string{"dockerfile_environment_policy_mismatch"}, remaining, candidate.CandidateDigest, authoringharness.Result{})
+		return standardAuthoringCodexWorkspaceSubmissionResponse(false, []string{"dockerfile_contract_base_image_mismatch"}, remaining, candidate.CandidateDigest, authoringharness.Result{})
 	}
 	if submission.frozenEnv != "" && candidate.EnvironmentDigest != submission.frozenEnv {
 		return standardAuthoringCodexWorkspaceSubmissionResponse(false, []string{"validated_dockerfile_changed"}, remaining, candidate.CandidateDigest, authoringharness.Result{})

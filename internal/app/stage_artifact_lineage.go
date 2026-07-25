@@ -81,6 +81,12 @@ func resolveStageInputsForSubject(ctx context.Context, dataStore *store.Store, o
 	}
 	bindings := make([]workflowkit.ArtifactBinding, 0, len(stage.Inputs))
 	for _, input := range stage.Inputs {
+		// Repair evidence is deliberately continuation-plan-only. Selecting a
+		// same-named historical decision here would let an unrelated retry claim
+		// to supersede an open repair merely because the artifact exists.
+		if isAuthoringRepairOnlyInput(run, subject, input) {
+			continue
+		}
 		if binding, declared := managed[input.Name]; declared {
 			if binding.SchemaVersion != input.SchemaVersion {
 				return nil, fmt.Errorf("%w: stage %q managed input %q has schema %q, want %q", ErrInvalidStageExecution, stage.Key, input.Name, binding.SchemaVersion, input.SchemaVersion)
@@ -119,6 +125,77 @@ func resolveStageInputsForSubject(ctx context.Context, dataStore *store.Store, o
 	return bindings, nil
 }
 
+// resolveStageInputsForSubjectWithExplicitInputs merges the immutable
+// continuation-plan inputs after ordinary lineage resolution. The caller can
+// only inject ports declared by the frozen stage descriptor, and every binding
+// is independently revalidated against the same Run and subject lineage.
+func resolveStageInputsForSubjectWithExplicitInputs(ctx context.Context, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore, run store.WorkflowRun, subject workflowRunSubject, stage workflowkit.StageDescriptor, explicit []workflowkit.ArtifactBinding) ([]workflowkit.ArtifactBinding, error) {
+	bindings, err := resolveStageInputsForSubject(ctx, dataStore, objects, run, subject, stage)
+	if err != nil {
+		return nil, err
+	}
+	if len(explicit) == 0 {
+		return bindings, nil
+	}
+	declared := make(map[string]workflowkit.ArtifactSpec, len(stage.Inputs))
+	for _, input := range stage.Inputs {
+		declared[input.Name] = input
+	}
+	resolved := make(map[string]workflowkit.ArtifactBinding, len(bindings)+len(explicit))
+	for _, binding := range bindings {
+		resolved[binding.Name] = binding
+	}
+	for _, binding := range explicit {
+		if err := binding.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: explicit input for stage %q: %v", ErrInvalidStageExecution, stage.Key, err)
+		}
+		input, found := declared[binding.Name]
+		if !found || input.SchemaVersion != binding.SchemaVersion {
+			return nil, fmt.Errorf("%w: explicit input %q is not declared by stage %q", ErrInvalidStageExecution, binding.Name, stage.Key)
+		}
+		if current, present := resolved[binding.Name]; present {
+			if current != binding {
+				return nil, fmt.Errorf("%w: explicit input %q differs from resolved stage lineage", ErrInvalidStageExecution, binding.Name)
+			}
+			continue
+		}
+		reference, err := dataStore.GetArtifactRef(ctx, string(binding.ArtifactID))
+		if err != nil {
+			return nil, err
+		}
+		if reference == nil || reference.ArtifactKey != binding.Name || reference.ContentDigest != string(binding.ContentDigest) || reference.SchemaVersion != binding.SchemaVersion ||
+			reference.RunID != run.ID || reference.SubjectRevisionID != subject.subjectRevisionID() || reference.SubjectDigest != subject.subjectDigest() || reference.WorkflowFingerprint != run.DefinitionHash {
+			return nil, fmt.Errorf("%w: explicit input %q no longer matches frozen lineage", ErrInvalidStageExecution, binding.Name)
+		}
+		attempt, err := dataStore.GetStageAttempt(ctx, reference.AttemptID)
+		if err != nil {
+			return nil, err
+		}
+		if attempt == nil || attempt.ExecutionStatus != store.StageExecutionCompleted {
+			return nil, fmt.Errorf("%w: explicit input %q has no completed producer attempt", ErrInvalidStageExecution, binding.Name)
+		}
+		if err := verifyStageArtifactCandidateForSubject(ctx, dataStore, objects, run, subject, stageArtifactCandidate{attempt: *attempt, ref: *reference}); err != nil {
+			return nil, fmt.Errorf("%w: explicit input %q is unavailable: %v", ErrInvalidStageExecution, binding.Name, err)
+		}
+		resolved[binding.Name] = binding
+		bindings = append(bindings, binding)
+	}
+	sort.Slice(bindings, func(left, right int) bool { return bindings[left].Name < bindings[right].Name })
+	return bindings, nil
+}
+
+func isAuthoringRepairOnlyInput(run store.WorkflowRun, subject workflowRunSubject, input workflowkit.ArtifactSpec) bool {
+	if input.Required || !subject.isAuthoringSession() || !isCurrentStandardAuthoringRun(run) {
+		return false
+	}
+	switch input.Name {
+	case "task_review_decision", "content_review_decision", "solution_review_decision", "codeedge_package_admission_report":
+		return true
+	default:
+		return false
+	}
+}
+
 func taskRevisionSubjectForLineage(run store.WorkflowRun, revision store.TaskRevision) workflowRunSubject {
 	subjectID := run.SubjectID
 	if subjectID == "" {
@@ -154,24 +231,19 @@ func managedRunInputBindingsForStageForSubject(ctx context.Context, dataStore *s
 		if err := validateCurrentStandardAuthoringFrozenContract(run, manifest, specification); err != nil {
 			return nil, err
 		}
-		environmentPolicy, brief, err := standardAuthoringSessionIntrinsicInputs(*subject.AuthoringSession)
+		contract, err := standardAuthoringContractInputFromSession(ctx, objects, *subject.AuthoringSession)
 		if err != nil {
 			return nil, err
 		}
-		if err := validateStandardAuthoringEnvironmentPolicyBindings(specification, environmentPolicy); err != nil {
-			return nil, err
-		}
-		if err := validateStandardAuthoringBriefBindings(specification, brief); err != nil {
+		if err := validateStandardAuthoringContractBindings(specification, contract); err != nil {
 			return nil, err
 		}
 		result := make(map[string]workflowkit.ArtifactBinding)
 		for _, input := range stage.Inputs {
 			var binding workflowkit.ArtifactBinding
 			switch input.Name {
-			case workflowadapter.StandardAuthoringEnvironmentPolicyArtifact:
-				binding = environmentPolicy.artifactBinding()
-			case workflowadapter.StandardAuthoringBriefArtifact:
-				binding = brief.artifactBinding()
+			case workflowadapter.AuthoringContractArtifact:
+				binding = contract.artifactBinding()
 			default:
 				continue
 			}
@@ -274,15 +346,12 @@ func newStageInputReaderForSubject(dataStore *store.Store, objects *workflowrunt
 			if !isCurrentStandardAuthoringRun(run) {
 				return nil, fmt.Errorf("%w: authoring Run is not bound to the current Standard authoring template", ErrInvalidStageExecution)
 			}
-			environmentPolicy, brief, err := standardAuthoringSessionIntrinsicInputs(*subject.AuthoringSession)
+			contract, err := standardAuthoringContractInputFromSession(ctx, objects, *subject.AuthoringSession)
 			if err != nil {
-				return nil, fmt.Errorf("%w: authoring session intrinsic inputs: %v", ErrInvalidStageExecution, err)
+				return nil, fmt.Errorf("%w: authoring session root contract: %v", ErrInvalidStageExecution, err)
 			}
-			if requested == environmentPolicy.artifactBinding() {
-				return append([]byte(nil), environmentPolicy.CanonicalJSON...), nil
-			}
-			if requested == brief.artifactBinding() {
-				return append([]byte(nil), brief.CanonicalJSON...), nil
+			if requested == contract.artifactBinding() {
+				return append([]byte(nil), contract.CanonicalJSON...), nil
 			}
 		}
 		if subject.isTaskRevision() {

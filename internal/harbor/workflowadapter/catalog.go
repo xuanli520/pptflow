@@ -779,13 +779,10 @@ const (
 	resourceTaskMetadata             workflowkit.ResourceKey = "task/metadata"
 	resourceTaskEnvironment          workflowkit.ResourceKey = "task/environment"
 	resourceTaskValidatedEnvironment workflowkit.ResourceKey = "task/environment-validated"
-	// resourceAuthoringEnvironmentPolicy is the immutable per-session base
-	// image contract. It belongs only to the pre-materialization authoring
-	// graph; no task-revision workflow may infer it from a Dockerfile.
-	resourceAuthoringEnvironmentPolicy workflowkit.ResourceKey = "authoring/environment-policy"
-	// resourceAuthoringBrief is the immutable caller-selected task direction.
-	// It is separate from task/design because no authoring stage may rewrite it.
-	resourceAuthoringBrief        workflowkit.ResourceKey = "authoring/brief"
+	// resourceAuthoringContract is the immutable root input for every v2
+	// source-session authoring stage. It replaces the retired brief and
+	// environment-policy resources as one auditable authority boundary.
+	resourceAuthoringContract     workflowkit.ResourceKey = "authoring/contract"
 	resourceTaskSolution          workflowkit.ResourceKey = "task/solution"
 	resourceTaskTests             workflowkit.ResourceKey = "task/tests"
 	resourceTaskValidatedSolution workflowkit.ResourceKey = "task/solution-validated"

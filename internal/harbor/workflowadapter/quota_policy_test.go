@@ -74,10 +74,10 @@ func TestStandardQuotaPolicyCompilesExplicitAccountLimitsAndStageClaims(t *testi
 }
 
 func TestStandardAuthoringQuotaPolicySeparatelyBoundsOutputSubmissions(t *testing.T) {
-	template := StandardAuthoringWorkflowTemplate()
+	template := StandardAuthoringCurrentWorkflowTemplate()
 	policy := template.QuotaPolicy
-	if policy.ID != StandardAuthoringQuotaPolicyID || policy.Version != StandardAuthoringQuotaPolicyVersion {
-		t.Fatalf("Standard authoring policy = %s@%s, want %s@%s", policy.ID, policy.Version, StandardAuthoringQuotaPolicyID, StandardAuthoringQuotaPolicyVersion)
+	if policy.ID != StandardAuthoringQuotaPolicyID || policy.Version != StandardAuthoringContractQuotaPolicyVersion {
+		t.Fatalf("Standard authoring policy = %s@%s, want %s@%s", policy.ID, policy.Version, StandardAuthoringQuotaPolicyID, StandardAuthoringContractQuotaPolicyVersion)
 	}
 	if err := policy.ValidateFor(template.Catalog); err != nil {
 		t.Fatalf("validate Standard authoring quota policy: %v", err)
@@ -102,8 +102,12 @@ func TestStandardAuthoringQuotaPolicySeparatelyBoundsOutputSubmissions(t *testin
 		}
 		_, isAgentStage := standardAgentQuotaStages[definition.Key]
 		if isAgentStage {
-			if !hasQuotaClaim(claims, "agent_turn", int64(definition.RequiredTurns)) || !hasQuotaClaim(claims, "output_submission", StandardAuthoringOutputSubmissionClaimUnits) {
-				t.Fatalf("agent stage %q claims = %+v, want independent agent_turn and three output_submission units", definition.Key, claims)
+			submissionUnits := StandardAuthoringOutputSubmissionClaimUnits
+			if definition.Key == workflowkit.StageKey(DockerfileBuildValidate) || definition.Key == workflowkit.StageKey(AuthoringHarness) {
+				submissionUnits = StandardAuthoringWorkspaceSubmissionClaimUnits
+			}
+			if !hasQuotaClaim(claims, "agent_turn", int64(definition.RequiredTurns)) || !hasQuotaClaim(claims, "output_submission", submissionUnits) {
+				t.Fatalf("agent stage %q claims = %+v", definition.Key, claims)
 			}
 			continue
 		}

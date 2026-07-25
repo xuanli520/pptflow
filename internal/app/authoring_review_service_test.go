@@ -139,7 +139,7 @@ func openAuthoringReviewServiceGate(t *testing.T, ctx context.Context, database 
 		t.Fatal(err)
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
-		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion,
+		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID, WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version,
 		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "authoring-review-session-" + t.Name(), Actor: "author", Reason: "freeze authoring session",
 	})
 	if err != nil {

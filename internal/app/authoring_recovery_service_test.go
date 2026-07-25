@@ -245,56 +245,6 @@ func TestAuthoringRecoveryRejectsWaitingContinuationWithoutWritingRecoveryState(
 	}
 }
 
-func TestAuthoringRecoveryResumesLegacyV1Command(t *testing.T) {
-	ctx := context.Background()
-	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
-	checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, fixture.run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := authoringRecoveryUUID(t)
-	legacy := authoringRecoveryCommandV1{
-		Format:                 authoringRecoveryCommandFormatV1,
-		CommandKey:             key,
-		RunID:                  fixture.run.ID,
-		AuthoringSourceID:      fixture.source.ID,
-		AuthoringSessionID:     fixture.session.ID,
-		TargetTaskID:           fixture.task.ID,
-		TargetTaskVersion:      fixture.task.Version,
-		SourceDigest:           workflowkit.SubjectDigest(fixture.source.SnapshotContentDigest),
-		DefinitionFingerprint:  workflowkit.Fingerprint(fixture.run.DefinitionHash),
-		Expected:               checkpoint,
-		FailureStageAttemptIDs: []string{fixture.failed.ID},
-		TargetNodeIDs:          []workflowkit.NodeID{workflowkit.NodeID(workflowadapter.RepoAnalyze)},
-	}
-	payload, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	record, err := fixture.store.CreateContinuationCommand(ctx, store.CreateContinuationCommandRequest{
-		CommandKey: key, SubjectID: fixture.source.ID, RunID: fixture.run.ID, PayloadJSON: string(payload),
-		Actor: "operator", Reason: "resume persisted v1 recovery command",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	plan, err := fixture.services.AuthoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
-		CommandKey: key, RunID: fixture.run.ID, Expected: checkpoint, Actor: "operator", Reason: "resume persisted v1 recovery command",
-	})
-	if err != nil {
-		t.Fatalf("resume legacy v1 authoring recovery command: %v", err)
-	}
-	assertAuthoringRecoveryPlan(t, plan, fixture)
-	decoded, err := decodeAuthoringRecoveryCommand(record)
-	if err != nil || decoded.Format != authoringRecoveryCommandFormat || decoded.Expected != checkpoint {
-		t.Fatalf("normalize legacy v1 command = %+v, %v", decoded, err)
-	}
-	if _, err := fixture.services.AuthoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID()); err != nil {
-		t.Fatalf("execute resumed legacy v1 authoring recovery: %v", err)
-	}
-}
-
 func TestAuthoringRecoveryRevalidatesTargetsAfterCommandPersistence(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAuthoringRecoveryFixture(t, workflowkit.FailureNetwork)
@@ -437,27 +387,6 @@ func TestCurrentAuthoringFixedFileScriptsRejectDirectNeedsRepair(t *testing.T) {
 	}
 }
 
-func TestHistoricalAuthoringHarnessScriptsRetainDirectNeedsRepair(t *testing.T) {
-	template := workflowadapter.StandardAuthoringHarnessWorkflowTemplate()
-	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []workflowkit.NodeID{workflowkit.NodeID(workflowadapter.SolveGen), workflowkit.NodeID(workflowadapter.TestGen)} {
-		t.Run(string(key), func(t *testing.T) {
-			attemptID := "historical-script-needs-repair-" + string(key)
-			selection, err := authoringRecoveryTargets(store.WorkflowRun{
-				Status: store.WorkflowRunWaitingContinuation, WorkflowTemplateID: template.ID, WorkflowTemplateVersion: template.Version,
-			}, workflow.Descriptor, continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
-				key: {ID: attemptID, StageKey: string(key), ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair},
-			}})
-			if err != nil || !reflect.DeepEqual(selection.targetNodeIDs, []workflowkit.NodeID{key}) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{attemptID}) {
-				t.Fatalf("historical 1.7 script recovery selection=%+v err=%v", selection, err)
-			}
-		})
-	}
-}
-
 func TestAuthoringContentProducerRecoveryRejectsVerdictOutsideFrozenPolicy(t *testing.T) {
 	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
@@ -474,28 +403,6 @@ func TestAuthoringContentProducerRecoveryRejectsVerdictOutsideFrozenPolicy(t *te
 	_, err = authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
 	if !errors.Is(err, ErrAuthoringRecoveryUnavailable) || !strings.Contains(err.Error(), "outside its frozen verdict policy") {
 		t.Fatalf("pass-only analysis recovery error = %v, want frozen-policy rejection", err)
-	}
-}
-
-func TestHistoricalAuthoringAnalysisRecoveryRetainsNeedsRepairPolicy(t *testing.T) {
-	template := workflowadapter.StandardAuthoringRepairFeedbackWorkflowTemplate()
-	workflow, err := template.Compile(lifecycleCompleteProfileForTemplate(t, template))
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := workflowkit.NodeID(workflowadapter.TestsAnalysis)
-	state := continuationRunState{Latest: map[workflowkit.NodeID]store.StageAttempt{
-		key: {
-			ID: "historical-analysis-needs-repair", StageKey: string(key),
-			ExecutionStatus: store.StageExecutionCompleted, Verdict: store.VerdictNeedsRepair,
-		},
-	}}
-	selection, err := authoringRecoveryTargets(store.WorkflowRun{Status: store.WorkflowRunWaitingContinuation}, workflow.Descriptor, state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(selection.targetNodeIDs, []workflowkit.NodeID{key}) || !reflect.DeepEqual(selection.failureStageAttemptIDs, []string{"historical-analysis-needs-repair"}) {
-		t.Fatalf("historical tests_analysis recovery selection = %+v", selection)
 	}
 }
 
@@ -713,7 +620,7 @@ func TestAuthoringReviewRecoveryFreezesDurableDecisionFeedback(t *testing.T) {
 	}
 	seen := 0
 	for _, transition := range plan.Snapshot().Nodes {
-		if transition.NodeID != workflowkit.NodeID(workflowadapter.RepoAnalyze) && transition.NodeID != workflowkit.NodeID(workflowadapter.TaskDesign) {
+		if transition.NodeID != workflowkit.NodeID(workflowadapter.TaskDesign) {
 			continue
 		}
 		seen++
@@ -725,8 +632,8 @@ func TestAuthoringReviewRecoveryFreezesDurableDecisionFeedback(t *testing.T) {
 			t.Fatalf("repair transition %q fingerprint = %q, %v; want %q", transition.NodeID, transition.ExpectedInputFingerprint, err, fingerprint)
 		}
 	}
-	if seen != 2 {
-		t.Fatalf("task-review repair bound feedback to %d producers, want 2", seen)
+	if seen != 1 {
+		t.Fatalf("task-review repair bound feedback to %d producers, want 1", seen)
 	}
 	subject, err := fixture.services.core.resolveWorkflowRunSubject(ctx, fixture.run)
 	if err != nil {
@@ -739,6 +646,153 @@ func TestAuthoringReviewRecoveryFreezesDurableDecisionFeedback(t *testing.T) {
 	}
 	if !strings.Contains(string(decisionRaw), reason) {
 		t.Fatalf("frozen repair feedback omitted decision reason: %s", decisionRaw)
+	}
+}
+
+func TestAuthoringReviewSourceAnalysisFindingRecomputesOnlyTypedAnalysis(t *testing.T) {
+	ctx := context.Background()
+	fixture, decisionRef, _ := newAuthoringTaskReviewRepairFixtureWithFinding(t, ctx, store.AuthoringRepairFindingSourceAnalysisInvalid)
+
+	contract, err := standardAuthoringContractInputFromSession(ctx, fixture.services.core.objects, fixture.session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := fixture.store.ListOpenAuthoringRepairLedgerEntries(ctx, fixture.run.ID)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("typed task-review repair ledger = %+v, %v", entries, err)
+	}
+	entry := entries[0]
+	if entry.FindingKind != store.AuthoringRepairFindingSourceAnalysisInvalid || entry.TargetProducer != workflowadapter.RepoAnalyze ||
+		entry.ContractDigest != string(contract.ContentDigest) || entry.EvidenceDigest != decisionRef.ContentDigest {
+		t.Fatalf("typed task-review repair entry = %+v", entry)
+	}
+
+	checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := fixture.services.AuthoringRecovery.PreviewAuthoringRecovery(ctx, AuthoringRecoveryCommand{
+		CommandKey: authoringRecoveryUUID(t), RunID: fixture.run.ID, Expected: checkpoint,
+		Actor: "operator", Reason: "recompute the typed source analysis finding",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled := make(map[workflowkit.NodeID]bool)
+	var repoAnalyzeTransition *workflowkit.NodeTransition
+	for _, transition := range plan.Snapshot().Nodes {
+		if transition.Disposition == workflowkit.DispositionSchedule {
+			scheduled[transition.NodeID] = true
+		}
+		if transition.NodeID == workflowkit.NodeID(workflowadapter.RepoAnalyze) {
+			copy := transition
+			repoAnalyzeTransition = &copy
+		}
+	}
+	if !scheduled[workflowkit.NodeID(workflowadapter.RepoAnalyze)] || !scheduled[workflowkit.NodeID(workflowadapter.TaskDesign)] {
+		t.Fatalf("typed source-analysis repair scheduled=%+v, want repo_analyze and task_design", scheduled)
+	}
+	wantEvidence := workflowkit.ArtifactBinding{Name: "task_review_decision", ArtifactID: workflowkit.ArtifactID(decisionRef.ID), ContentDigest: workflowkit.Fingerprint(decisionRef.ContentDigest), SchemaVersion: decisionRef.SchemaVersion}
+	if repoAnalyzeTransition == nil || len(repoAnalyzeTransition.InputBindings) != 1 || repoAnalyzeTransition.InputBindings[0] != wantEvidence {
+		t.Fatalf("source-analysis repair repo_analyze inputs = %+v, want decision evidence", repoAnalyzeTransition)
+	}
+}
+
+func TestAuthoringReviewRepairPlanCoversContentAndSolutionFindings(t *testing.T) {
+	tests := []struct {
+		stage    string
+		finding  store.AuthoringRepairFindingKind
+		evidence string
+		targets  []string
+	}{
+		{
+			stage: workflowadapter.ContentReview, finding: store.AuthoringRepairFindingArtifactInvalid, evidence: "content_review_decision",
+			targets: []string{workflowadapter.InstructionGen, workflowadapter.TaskTOMLGen, workflowadapter.DockerfileGen},
+		},
+		{
+			stage: workflowadapter.SolutionReview, finding: store.AuthoringRepairFindingPackageInvalid, evidence: "solution_review_decision",
+			targets: []string{workflowadapter.InstructionGen, workflowadapter.TaskTOMLGen, workflowadapter.DockerfileGen, workflowadapter.SolveGen, workflowadapter.TestGen, workflowadapter.TestsAnalysis},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.stage, func(t *testing.T) {
+			evidence, targets, err := authoringReviewRepairPlan(test.stage, test.finding)
+			if err != nil || evidence != test.evidence || !reflect.DeepEqual(targets, test.targets) {
+				t.Fatalf("review repair plan = evidence:%q targets:%+v err:%v", evidence, targets, err)
+			}
+		})
+	}
+}
+
+func TestValidatedProducerArtifactClosesExplicitAuthoringRepair(t *testing.T) {
+	ctx := context.Background()
+	fixture, decisionRef, _ := newAuthoringTaskReviewRepairFixture(t, ctx)
+	before, err := fixture.store.ListOpenAuthoringRepairLedgerEntries(ctx, fixture.run.ID)
+	if err != nil || len(before) != 1 || before[0].TargetProducer != workflowadapter.TaskDesign {
+		t.Fatalf("open default task-review repair = %+v, %v", before, err)
+	}
+
+	seedCompletedAuthoringRecoveryStage(t, ctx, fixture, workflowkit.NodeID(workflowadapter.TaskDesign), map[string][]byte{
+		"task_proposal": []byte(`{"feature":"corrected source-bound task proposal"}`),
+	})
+	attempts, err := fixture.store.ListStageAttemptsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repaired *store.StageAttempt
+	for index := range attempts {
+		if attempts[index].StageKey == workflowadapter.TaskDesign && attempts[index].Ordinal == 2 {
+			copy := attempts[index]
+			repaired = &copy
+		}
+	}
+	if repaired == nil || repaired.ExecutionStatus != store.StageExecutionCompleted || repaired.Verdict != store.VerdictPass {
+		t.Fatalf("unrelated task-design producer attempt = %+v", repaired)
+	}
+	subject, err := fixture.services.core.resolveWorkflowRunSubject(ctx, fixture.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &FrozenExecutionRuntime{core: fixture.services.core, services: fixture.services}
+	if err := runtime.resolveAuthoringRepairsForValidatedProducer(ctx, fixture.run, subject, *repaired, "worker"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := fixture.store.ListOpenAuthoringRepairLedgerEntries(ctx, fixture.run.ID)
+	if err != nil || len(after) != 1 || after[0].ID != before[0].ID {
+		t.Fatalf("unrelated task-design producer closed explicit repair = %+v, %v", after, err)
+	}
+
+	feedback := workflowkit.ArtifactBinding{
+		Name: "task_review_decision", ArtifactID: workflowkit.ArtifactID(decisionRef.ID),
+		ContentDigest: workflowkit.Fingerprint(decisionRef.ContentDigest), SchemaVersion: decisionRef.SchemaVersion,
+	}
+	seedCompletedAuthoringRecoveryStageWithInputs(t, ctx, fixture, workflowkit.NodeID(workflowadapter.TaskDesign), []workflowkit.ArtifactBinding{feedback}, map[string][]byte{
+		"task_proposal": []byte(`{"feature":"corrected source-bound task proposal"}`),
+	})
+	attempts, err = fixture.store.ListStageAttemptsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repaired = nil
+	for index := range attempts {
+		if attempts[index].StageKey == workflowadapter.TaskDesign && attempts[index].Ordinal == 3 {
+			copy := attempts[index]
+			repaired = &copy
+		}
+	}
+	if repaired == nil || repaired.ExecutionStatus != store.StageExecutionCompleted || repaired.Verdict != store.VerdictPass {
+		t.Fatalf("explicitly authorized task-design producer attempt = %+v", repaired)
+	}
+	if err := runtime.resolveAuthoringRepairsForValidatedProducer(ctx, fixture.run, subject, *repaired, "worker"); err != nil {
+		t.Fatal(err)
+	}
+	after, err = fixture.store.ListOpenAuthoringRepairLedgerEntries(ctx, fixture.run.ID)
+	if err != nil || len(after) != 0 {
+		t.Fatalf("open repair entries after explicit task_design correction = %+v, %v", after, err)
+	}
+	entries, err := fixture.store.ListAuthoringRepairLedgerEntries(ctx, fixture.run.ID)
+	if err != nil || len(entries) != 1 || entries[0].Resolution == nil || entries[0].Resolution.Producer != workflowadapter.TaskDesign || entries[0].Resolution.SupersedingAttemptID != repaired.ID {
+		t.Fatalf("resolved task-design repair entry = %+v, %v", entries, err)
 	}
 }
 
@@ -1311,6 +1365,10 @@ func TestAuthoringRecoveryRejectsMaterializedRunWithoutSecondRevision(t *testing
 }
 
 func newAuthoringTaskReviewRepairFixture(t *testing.T, ctx context.Context) (authoringRecoveryFixture, store.ArtifactRef, string) {
+	return newAuthoringTaskReviewRepairFixtureWithFinding(t, ctx, "")
+}
+
+func newAuthoringTaskReviewRepairFixtureWithFinding(t *testing.T, ctx context.Context, findingKind store.AuthoringRepairFindingKind) (authoringRecoveryFixture, store.ArtifactRef, string) {
 	t.Helper()
 	fixture := newAuthoringRecoveryLaunchFixture(t)
 	fixture.run = transitionAuthoringRecoveryRun(t, ctx, fixture.store, fixture.run, store.WorkflowRunRunning)
@@ -1385,7 +1443,7 @@ func newAuthoringTaskReviewRepairFixture(t *testing.T, ctx context.Context) (aut
 	reason := "Correct the misspelled tower-http path and re-check every cited command."
 	decision, err := fixture.services.AuthoringReviews.Decide(ctx, DecideAuthoringReviewRequest{
 		IdempotencyKey: authoringRecoveryUUID(t), Action: store.ReviewDecisionRequestChanges,
-		Actor: "operator", Reason: reason, Expected: checkpoint,
+		FindingKind: findingKind, Actor: "operator", Reason: reason, Expected: checkpoint,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1412,6 +1470,10 @@ func newAuthoringTaskReviewRepairFixture(t *testing.T, ctx context.Context) (aut
 }
 
 func seedCompletedAuthoringRecoveryStage(t *testing.T, ctx context.Context, fixture authoringRecoveryFixture, stageID workflowkit.NodeID, contents map[string][]byte) {
+	seedCompletedAuthoringRecoveryStageWithInputs(t, ctx, fixture, stageID, nil, contents)
+}
+
+func seedCompletedAuthoringRecoveryStageWithInputs(t *testing.T, ctx context.Context, fixture authoringRecoveryFixture, stageID workflowkit.NodeID, extraInputs []workflowkit.ArtifactBinding, contents map[string][]byte) {
 	t.Helper()
 	stage, found := fixture.workflow.Stage(stageID)
 	if !found {
@@ -1425,12 +1487,23 @@ func seedCompletedAuthoringRecoveryStage(t *testing.T, ctx context.Context, fixt
 	if err != nil {
 		t.Fatal(err)
 	}
+	inputs = append(inputs, extraInputs...)
 	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(inputs)
 	if err != nil {
 		t.Fatal(err)
 	}
+	attempts, err := fixture.store.ListStageAttemptsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinal := 1
+	for _, existing := range attempts {
+		if existing.StageKey == string(stage.Key) && existing.Ordinal >= ordinal {
+			ordinal = existing.Ordinal + 1
+		}
+	}
 	attempt, err := fixture.store.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
-		RunID: fixture.run.ID, StageKey: string(stage.Key), StageGroup: stage.Group, Ordinal: 1,
+		RunID: fixture.run.ID, StageKey: string(stage.Key), StageGroup: stage.Group, Ordinal: ordinal,
 		InputFingerprint: string(inputFingerprint), BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
 		Actor: "worker", Reason: "seed completed authoring stage",
 	})
@@ -1745,7 +1818,7 @@ func startAuthoringRecoveryLaunchFixture(t *testing.T, ctx context.Context, root
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: authoringRecoveryUUID(t), Actor: "author", Reason: "create authoring recovery fixture"},
 		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
 		BaseImage: standardAuthoringLaunchTestBaseImage,
-		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, Objective: standardAuthoringLaunchTestObjective,
+		TaskType:  standardAuthoringLaunchTestTaskType, Application: standardAuthoringLaunchTestApplication, CodeLang: "rust", Objective: standardAuthoringLaunchTestObjective,
 		Slug: "authoring-recovery-fixture", Title: "Authoring recovery fixture", MetadataJSON: `{}`,
 	})
 	if err != nil {
@@ -1803,12 +1876,20 @@ func seedAuthoringRecoveryRepoPrepare(t *testing.T, ctx context.Context, fixture
 	if !found || len(stage.Outputs) != 1 {
 		t.Fatalf("repo_prepare descriptor = %+v", stage)
 	}
-	emptyInputs, err := workflowkit.FingerprintArtifactBindings(nil)
+	subject, err := fixture.services.core.resolveWorkflowRunSubject(ctx, fixture.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := resolveStageInputsForSubject(ctx, fixture.store, fixture.services.core.objects, fixture.run, subject, stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(inputs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	attempt, err := fixture.store.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
-		RunID: fixture.run.ID, StageKey: string(stage.Key), StageGroup: stage.Group, Ordinal: 1, InputFingerprint: string(emptyInputs),
+		RunID: fixture.run.ID, StageKey: string(stage.Key), StageGroup: stage.Group, Ordinal: 1, InputFingerprint: string(inputFingerprint),
 		BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`, Actor: "worker", Reason: "seed reusable authoring source stage",
 	})
 	if err != nil {
@@ -1826,11 +1907,7 @@ func seedAuthoringRecoveryRepoPrepare(t *testing.T, ctx context.Context, fixture
 	if err != nil {
 		t.Fatal(err)
 	}
-	subject, err := fixture.services.core.resolveWorkflowRunSubject(ctx, fixture.run)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, _, err := persistStageArtifactsForSubject(ctx, fixture.services.core, fixture.run, subject, attempt, node, stage, nil, []StageArtifact{{
+	manifest, _, err := persistStageArtifactsForSubject(ctx, fixture.services.core, fixture.run, subject, attempt, node, stage, inputs, []StageArtifact{{
 		ID: authoringRecoveryUUID(t), Key: stage.Outputs[0].Name, SchemaVersion: stage.Outputs[0].SchemaVersion, Content: []byte("verified authoring repo preparation"), TurnOrdinal: 1,
 	}}, "worker", "persist reusable authoring source artifact")
 	if err != nil {

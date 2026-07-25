@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
-	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -33,6 +32,8 @@ type standardAuthoringLaunchRequestRecord struct {
 	BaseImage            string                  `json:"base_image"`
 	TaskType             string                  `json:"task_type"`
 	Application          string                  `json:"application"`
+	CodeLang             string                  `json:"code_lang"`
+	Is0To1               bool                    `json:"is_0_to_1"`
 	Objective            string                  `json:"objective"`
 	Slug                 string                  `json:"slug"`
 	Title                string                  `json:"title"`
@@ -50,6 +51,8 @@ func newStandardAuthoringLaunchRequestRecord(operation store.LifecycleOperation,
 		BaseImage:            command.BaseImage,
 		TaskType:             command.TaskType,
 		Application:          command.Application,
+		CodeLang:             command.CodeLang,
+		Is0To1:               command.Is0To1,
 		Objective:            command.Objective,
 		Slug:                 strings.TrimSpace(command.Slug),
 		Title:                strings.TrimSpace(command.Title),
@@ -68,6 +71,8 @@ func (record standardAuthoringLaunchRequestRecord) request() standardAuthoringLa
 		BaseImage:     record.BaseImage,
 		TaskType:      record.TaskType,
 		Application:   record.Application,
+		CodeLang:      record.CodeLang,
+		Is0To1:        record.Is0To1,
 		Objective:     record.Objective,
 		Slug:          record.Slug,
 		Title:         record.Title,
@@ -92,6 +97,8 @@ func (record standardAuthoringLaunchRequestRecord) Validate() error {
 		BaseImage:                    record.BaseImage,
 		TaskType:                     record.TaskType,
 		Application:                  record.Application,
+		CodeLang:                     record.CodeLang,
+		Is0To1:                       record.Is0To1,
 		Objective:                    record.Objective,
 		Slug:                         record.Slug,
 		Title:                        record.Title,
@@ -101,13 +108,12 @@ func (record standardAuthoringLaunchRequestRecord) Validate() error {
 	if err != nil || coordinate.RepositoryURL != command.RepositoryURL || coordinate.CommitSHA != command.CommitSHA {
 		return errors.New("Standard authoring launch request source coordinate is not canonical")
 	}
-	environment, err := workflowadapter.NewStandardAuthoringEnvironmentPolicy(command.BaseImage)
-	if err != nil || environment.BaseImage != command.BaseImage {
-		return errors.New("Standard authoring launch request base image is not canonical")
-	}
-	brief, err := workflowadapter.NewStandardAuthoringBrief(command.TaskType, command.Application, command.Objective)
-	if err != nil || brief.TaskType != command.TaskType || brief.Application != command.Application || brief.Objective != command.Objective {
-		return errors.New("Standard authoring launch request brief is not canonical")
+	if strings.TrimSpace(command.BaseImage) != command.BaseImage || command.BaseImage == "" ||
+		strings.TrimSpace(command.CodeLang) != command.CodeLang || command.CodeLang == "" ||
+		strings.TrimSpace(command.TaskType) != command.TaskType || command.TaskType == "" ||
+		strings.TrimSpace(command.Application) != command.Application || command.Application == "" ||
+		strings.TrimSpace(command.Objective) != command.Objective || command.Objective == "" {
+		return errors.New("Standard authoring launch request facts are not canonical")
 	}
 	metadata, err := canonicalStandardAuthoringMetadata(command.MetadataJSON)
 	if err != nil || metadata != command.MetadataJSON {
@@ -141,6 +147,8 @@ func (record standardAuthoringLaunchRequestRecord) Command(operation store.Lifec
 		BaseImage:     record.BaseImage,
 		TaskType:      record.TaskType,
 		Application:   record.Application,
+		CodeLang:      record.CodeLang,
+		Is0To1:        record.Is0To1,
 		Objective:     record.Objective,
 		Slug:          record.Slug,
 		Title:         record.Title,
@@ -366,8 +374,7 @@ func verifyStandardAuthoringPreparedLaunchEvidence(operation store.LifecycleOper
 	if operation.Action != string(standardAuthoringLaunchAction) || operation.State != store.LifecycleOperationPrepared ||
 		preparation.LifecycleOperationID != operation.ID || preparation.RequestedSourceID != ids.SourceID ||
 		preparation.TargetTaskID != operation.TaskID || preparation.TargetTaskID != ids.TaskID ||
-		preparation.AuthoringSessionID != ids.SessionID || preparation.RunID != operation.RunID || preparation.RunID != ids.RunID ||
-		preparation.EnvironmentPolicyArtifactID != ids.EnvironmentPolicyArtifactID || preparation.BriefArtifactID != ids.BriefArtifactID {
+		preparation.AuthoringSessionID != ids.SessionID || preparation.RunID != operation.RunID || preparation.RunID != ids.RunID {
 		return fmt.Errorf("%w: Standard authoring launch preparation does not match lifecycle operation", store.ErrIdempotencyConflict)
 	}
 	if _, err := preparation.DeploymentDefinition(); err != nil {

@@ -115,7 +115,7 @@ func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T
 	if !ok {
 		t.Fatal("locate Standard authoring lock generator test")
 	}
-	path := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "deployments", "standard-authoring-1.8", "execution-profile.v1.json"))
+	path := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "deployments", "standard-authoring", "execution-profile.v1.json"))
 	profile, err := readStandardAuthoringExecutionProfile(path)
 	if err != nil {
 		t.Fatalf("read production Standard authoring execution profile asset: %v", err)
@@ -126,15 +126,15 @@ func TestProductionStandardAuthoringExecutionProfileAssetIsAccepted(t *testing.T
 }
 
 func TestValidateStandardAuthoringTemplateBundleRequiresExactVersion(t *testing.T) {
-	catalog := workflowadapter.StandardAuthoringRepairFeedbackTemplateReference()
+	catalog := workflowadapter.StandardAuthoringCurrentTemplateReference()
 	profile := catalog
 	manifest := catalog
 	if err := validateStandardAuthoringTemplateBundle(catalog, profile, manifest); err != nil {
 		t.Fatalf("matching Standard authoring template bundle rejected: %v", err)
 	}
 	for name, candidate := range map[string]workflowadapter.TemplateReference{
-		"profile":  workflowadapter.StandardAuthoringBriefTemplateReference(),
-		"manifest": workflowadapter.StandardAuthoringBriefTemplateReference(),
+		"profile":  workflowadapter.TemplateReference{ID: catalog.ID, Version: "1.9.9"},
+		"manifest": workflowadapter.TemplateReference{ID: catalog.ID, Version: "1.9.9"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidateProfile, candidateManifest := profile, manifest
@@ -156,7 +156,7 @@ func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testi
 		t.Fatal("locate Standard authoring lock generator test")
 	}
 	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
-	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring-1.8")
+	deploymentRoot := filepath.Join(root, "deployments", "standard-authoring")
 	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -265,7 +265,7 @@ func TestDiscoverStandardAuthoringSSHTransportPinsClientShellAndKnownHosts(t *te
 
 func standardAuthoringGeneratorTestProfile(t *testing.T) workflowadapter.ExecutionProfile {
 	t.Helper()
-	template := workflowadapter.StandardAuthoringWorkflowTemplate()
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
 	profile := workflowadapter.ExecutionProfile{
 		Template:                template.Reference(),
 		ID:                      "standard-authoring-generator-test",

@@ -49,10 +49,10 @@ func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
 		Slug:           "task-board-authoring",
 		Title:          "Task board authoring",
 		TaskType:       "feature",
-		Application:    "backend",
-		Objective:      "Add a bounded task board authoring feature",
-		MetadataJSON:   `{}`,
-		Reason:         "exercise task board authoring launch",
+		Application:    "backend", CodeLang: "rust",
+		Objective:    "Add a bounded task board authoring feature",
+		MetadataJSON: `{}`,
+		Reason:       "exercise task board authoring launch",
 	})
 	if err != nil {
 		t.Fatalf("start task board authoring: %v", err)
@@ -68,6 +68,14 @@ func TestTaskBoardServiceStartsStandardAuthoringAndProjectsDraft(t *testing.T) {
 	task := taskBoardTaskByID(t, snapshot, created.TaskID)
 	if task.Column != TaskBoardPending || task.RunID != created.RunID || task.RunStatus != string(store.WorkflowRunQueued) || task.RepositoryURL != standardAuthoringLaunchTestCoordinate.RepositoryURL || len(task.Runs) != 1 || task.Runs[0].ID != created.RunID {
 		t.Fatalf("task board projection = %+v", task)
+	}
+	evidence := task.Runs[0].AuthoringEvidence
+	if evidence == nil || evidence.Contract.Digest == "" || evidence.Contract.TaskID != created.TaskID ||
+		evidence.Contract.RepositoryURL != standardAuthoringLaunchTestCoordinate.RepositoryURL ||
+		evidence.Contract.CommitSHA != standardAuthoringLaunchTestCoordinate.CommitSHA ||
+		evidence.Contract.BaseImage != taskBoardAuthoringTestBaseImage || evidence.Contract.Objective != "Add a bounded task board authoring feature" ||
+		len(evidence.Repairs) != 0 || len(evidence.Claims) != 0 || len(evidence.Lineage) != 0 {
+		t.Fatalf("authoring evidence projection = %+v", evidence)
 	}
 }
 
@@ -102,10 +110,10 @@ func TestTaskBoardProjectsAndRetriesFailedPreTaskSourceCaptureAfterRestart(t *te
 		Slug:           "pre-task-source-capture-recovery",
 		Title:          "Pre-Task source capture recovery",
 		TaskType:       "feature",
-		Application:    "backend",
-		Objective:      "Recover a failed source capture after the TUI restarts",
-		MetadataJSON:   `{}`,
-		Reason:         "exercise durable pre-Task source capture recovery",
+		Application:    "backend", CodeLang: "rust",
+		Objective:    "Recover a failed source capture after the TUI restarts",
+		MetadataJSON: `{}`,
+		Reason:       "exercise durable pre-Task source capture recovery",
 	}
 	if _, err := services.TaskBoard.StartAuthoring(ctx, request); err == nil {
 		t.Fatal("initial source capture unexpectedly succeeded")
@@ -208,9 +216,9 @@ func TestTaskBoardServiceRecoversMissingOutputSubmissionProcessFailureThroughDed
 		Slug:                         "task-board-authoring-recovery",
 		Title:                        "Task board authoring recovery",
 		TaskType:                     "feature",
-		Application:                  "backend",
-		Objective:                    "Recover a bounded task board authoring run",
-		MetadataJSON:                 `{}`,
+		Application:                  "backend", CodeLang: "rust",
+		Objective:    "Recover a bounded task board authoring run",
+		MetadataJSON: `{}`,
 	})
 	if err != nil {
 		t.Fatalf("launch authoring fixture: %v", err)
@@ -552,10 +560,10 @@ func TestTaskBoardServiceReplaysAuthoringLaunchAfterActivationFailure(t *testing
 		Slug:           "task-board-activation-retry",
 		Title:          "Task board activation retry",
 		TaskType:       "feature",
-		Application:    "backend",
-		Objective:      "Retry a bounded task board authoring launch",
-		MetadataJSON:   `{}`,
-		Reason:         "exercise task board retry",
+		Application:    "backend", CodeLang: "rust",
+		Objective:    "Retry a bounded task board authoring launch",
+		MetadataJSON: `{}`,
+		Reason:       "exercise task board retry",
 	}
 	if _, err := services.TaskBoard.StartAuthoring(ctx, request); err == nil {
 		t.Fatal("authoring launch unexpectedly succeeded while activation failed")

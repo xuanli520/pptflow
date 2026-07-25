@@ -75,6 +75,34 @@ func TestDetailGroupsCurrentRunHistoryFailureAndLogPath(t *testing.T) {
 	}
 }
 
+func TestDetailShowsBoundedAuthoringEvidence(t *testing.T) {
+	detail := newDetailModel(&TaskItem{
+		Name: "Task one", Slug: "task-one", RunID: "run-current",
+		Runs: []TaskRunItem{{
+			ID: "run-current", Status: "running",
+			AuthoringEvidence: &app.TaskBoardAuthoringEvidence{
+				Contract: app.TaskBoardAuthoringContract{
+					Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					Title:  "Task one", Slug: "task-one", CodeLang: "go", TaskType: "bugfix", Application: "backend",
+					RepositoryURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789",
+					SnapshotDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					BaseImage:      "docker.io/library/golang:1.26@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+					Objective:      "Repair the selected behavior.",
+				},
+				Claims:  []app.TaskBoardAuthoringClaim{{ArtifactKey: "task_proposal", State: "match"}},
+				Repairs: []app.TaskBoardAuthoringRepair{{TargetProducer: "task_design", FindingKind: "task_proposal_invalid", State: "open", EvidenceDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}},
+				Lineage: []app.TaskBoardAuthoringArtifact{{ArtifactKey: "authoring_harness_report", ArtifactID: "artifact-harness", Digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},
+			},
+		}},
+	})
+	rendered := ansi.Strip(detail.View(180, 60))
+	for _, expected := range []string{"根契约", "声明比对", "修复账本", "最终谱系", "Task one", "task_proposal_invalid"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("detail missing %q:\n%s", expected, rendered)
+		}
+	}
+}
+
 func TestDetailShowsDurableFailureRecordAndOnlyEligibleRedrive(t *testing.T) {
 	recordedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
 	detail := newDetailModel(&TaskItem{

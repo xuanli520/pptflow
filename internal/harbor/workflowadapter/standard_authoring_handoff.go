@@ -10,11 +10,10 @@ import (
 const (
 	// StandardAuthoringTaskHandoffFormat identifies the immutable receipt
 	// emitted by the final source-session materialize_task operation.
-	StandardAuthoringTaskHandoffFormat           = "harbor.standard-authoring-task-handoff.v1"
-	StandardAuthoringTaskHandoffVersion          = "1"
-	StandardAuthoringTaskAdmissionHandoffVersion = "2"
+	StandardAuthoringTaskHandoffFormat  = "harbor.standard-authoring-task-handoff.v2"
+	StandardAuthoringTaskHandoffVersion = "2"
 
-	standardAuthoringTaskHandoffFingerprintDomain = "harbor.workflowadapter.standard-authoring-task-handoff.v1"
+	standardAuthoringTaskHandoffFingerprintDomain = "harbor.workflowadapter.standard-authoring-task-handoff.v2"
 )
 
 // StandardAuthoringTaskHandoff is the only typed bridge from an
@@ -46,7 +45,7 @@ func (handoff StandardAuthoringTaskHandoff) Validate() error {
 	if handoff.Format != StandardAuthoringTaskHandoffFormat {
 		return fmt.Errorf("%w: unsupported Standard authoring handoff format %q", errInvalidExecutionSpec, handoff.Format)
 	}
-	if handoff.Version != StandardAuthoringTaskHandoffVersion && handoff.Version != StandardAuthoringTaskAdmissionHandoffVersion {
+	if handoff.Version != StandardAuthoringTaskHandoffVersion {
 		return fmt.Errorf("%w: unsupported Standard authoring handoff version %q", errInvalidExecutionSpec, handoff.Version)
 	}
 	for _, field := range []struct {
@@ -81,15 +80,11 @@ func (handoff StandardAuthoringTaskHandoff) Validate() error {
 	if err := handoff.ChildTemplate.Validate(); err != nil {
 		return fmt.Errorf("%w: authoring handoff child template: %v", errInvalidExecutionSpec, err)
 	}
-	if handoff.Version == StandardAuthoringTaskAdmissionHandoffVersion {
-		if handoff.AdmissionReceipt == nil || handoff.AdmissionReceipt.SchemaVersion != "harbor.standard-authoring-task-package-admission.v1" {
-			return fmt.Errorf("%w: Standard authoring admission handoff requires its receipt artifact", errInvalidExecutionSpec)
-		}
-		if err := handoff.AdmissionReceipt.validate(); err != nil {
-			return err
-		}
-	} else if handoff.AdmissionReceipt != nil {
-		return fmt.Errorf("%w: legacy Standard authoring handoff cannot carry an admission receipt", errInvalidExecutionSpec)
+	if handoff.AdmissionReceipt == nil || handoff.AdmissionReceipt.SchemaVersion != "harbor.standard-authoring-task-package-admission.v1" {
+		return fmt.Errorf("%w: Standard authoring v2 handoff requires its admission receipt artifact", errInvalidExecutionSpec)
+	}
+	if err := handoff.AdmissionReceipt.validate(); err != nil {
+		return err
 	}
 	return nil
 }

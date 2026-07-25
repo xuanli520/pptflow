@@ -41,6 +41,7 @@ type TaskItem struct {
 type TaskRunItem struct {
 	ID                    string
 	ParentRunID           string
+	AuthoringEvidence     *app.TaskBoardAuthoringEvidence
 	Status                string
 	CurrentStage          string
 	FailureStage          string

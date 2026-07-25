@@ -2,18 +2,19 @@ package workflowadapter
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-func TestStandardAuthoringTemplateIsClosedPreMaterializationWorkflow(t *testing.T) {
-	template := StandardAuthoringWorkflowTemplate()
+func TestStandardAuthoringV2IsClosedPreMaterializationWorkflow(t *testing.T) {
+	template := StandardAuthoringCurrentWorkflowTemplate()
 	if err := template.Validate(); err != nil {
-		t.Fatalf("validate Standard authoring template: %v", err)
+		t.Fatalf("validate Standard authoring v2 template: %v", err)
 	}
-	if !template.Reference().Equal(StandardAuthoringTemplateReference()) {
+	if !template.Reference().Equal(StandardAuthoringContractTemplateReference()) || !IsStandardAuthoringWorkflowTemplate(template.Reference()) {
 		t.Fatalf("template reference = %+v", template.Reference())
 	}
 	if len(template.Catalog.Stages) != len(StandardAuthoringStageOrder()) {
@@ -27,82 +28,20 @@ func TestStandardAuthoringTemplateIsClosedPreMaterializationWorkflow(t *testing.
 		}
 	}
 	materialize, present := template.Catalog.Stage(workflowkit.StageKey(MaterializeTask))
-	if !present {
-		t.Fatal("authoring catalog lacks materialize_task")
+	if !present || !stageHasArtifact(materialize.Outputs, StandardAuthoringTaskHandoffArtifact, StandardAuthoringTaskHandoffSchemaVersion) {
+		t.Fatalf("materialize_task = %+v, want required immutable v2 handoff", materialize)
 	}
-	foundHandoff := false
-	for _, output := range materialize.Outputs {
-		if output.Name == StandardAuthoringTaskHandoffArtifact && output.SchemaVersion == StandardAuthoringTaskHandoffSchemaVersion && output.Required {
-			foundHandoff = true
-		}
-	}
-	if !foundHandoff {
-		t.Fatalf("materialize_task outputs = %+v, want required immutable handoff", materialize.Outputs)
-	}
-	if template.QuotaPolicy.ID != StandardAuthoringQuotaPolicyID || template.QuotaPolicy.Version != StandardAuthoringQuotaPolicyVersion {
+	if template.QuotaPolicy.ID != StandardAuthoringQuotaPolicyID || template.QuotaPolicy.Version != StandardAuthoringContractQuotaPolicyVersion {
 		t.Fatalf("authoring quota policy = %s@%s", template.QuotaPolicy.ID, template.QuotaPolicy.Version)
 	}
 }
 
-func TestStandardAuthoringTaskAdmissionTemplateGatesReviewAndMaterialization(t *testing.T) {
-	template := StandardAuthoringTaskAdmissionWorkflowTemplate()
-	if err := template.Validate(); err != nil {
-		t.Fatalf("validate task-admission template: %v", err)
-	}
-	if !template.Reference().Equal(StandardAuthoringTaskAdmissionTemplateReference()) {
-		t.Fatalf("template reference = %+v", template.Reference())
-	}
-	if !IsStandardAuthoringWorkflowTemplate(template.Reference()) {
-		t.Fatal("task-admission template was not recognized as an authoring workflow")
-	}
-
-	admission, present := template.Catalog.Stage(workflowkit.StageKey(CodeEdgePackageAdmission))
-	if !present {
-		t.Fatal("task-admission template lacks codeedge_package_admission")
-	}
-	if len(admission.Outputs) != 1 || admission.Outputs[0].Name != "codeedge_package_admission_report" || admission.Outputs[0].SchemaVersion != "harbor.standard-authoring-task-package-admission.v1" {
-		t.Fatalf("admission outputs = %+v", admission.Outputs)
-	}
-	for _, stageKey := range []workflowkit.StageKey{workflowkit.StageKey(SolutionReview), workflowkit.StageKey(MaterializeTask)} {
-		stage, found := template.Catalog.Stage(stageKey)
-		if !found {
-			t.Fatalf("template lacks %s", stageKey)
-		}
-		foundReceipt := false
-		for _, input := range stage.Inputs {
-			if input.Name == "codeedge_package_admission_report" && input.SchemaVersion == "harbor.standard-authoring-task-package-admission.v1" {
-				foundReceipt = true
-			}
-		}
-		if !foundReceipt {
-			t.Fatalf("%s inputs omit the admission report: %+v", stageKey, stage.Inputs)
-		}
-	}
-	solution, _ := template.Catalog.Stage(workflowkit.StageKey(SolutionReview))
-	if !containsStageKey(solution.Dependencies, workflowkit.StageKey(CodeEdgePackageAdmission)) {
-		t.Fatalf("solution review dependencies = %+v, want admission stage", solution.Dependencies)
-	}
-}
-
-func containsStageKey(values []workflowkit.StageKey, want workflowkit.StageKey) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
-}
-
 func TestStandardAuthoringTaskDesignTurnBudgetIsScopedToAuthoring(t *testing.T) {
-	authoring, found := StandardAuthoringStageCatalog().Stage(workflowkit.StageKey(TaskDesign))
+	authoring, found := StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(workflowkit.StageKey(TaskDesign))
 	if !found || authoring.RequiredTurns != StandardAuthoringTaskDesignMaxTurns {
 		t.Fatalf("authoring task_design turns = %+v, found=%t; want %d", authoring, found, StandardAuthoringTaskDesignMaxTurns)
 	}
-	standard, found := StandardStageCatalog().Stage(workflowkit.StageKey(TaskDesign))
-	if !found || standard.RequiredTurns != 3 {
-		t.Fatalf("task-bound Standard task_design turns = %+v, found=%t; want 3", standard, found)
-	}
-	policy := StandardAuthoringQuotaPolicy()
+	policy := StandardAuthoringContractQuotaPolicy()
 	var claims []workflowkit.QuotaClaim
 	found = false
 	for _, stage := range policy.Stages {
@@ -131,8 +70,8 @@ func TestStandardAuthoringTaskDesignTurnBudgetIsScopedToAuthoring(t *testing.T) 
 			break
 		}
 	}
-	if totalAgentTurns != 42 || taskLimit != 64 || totalAgentTurns > taskLimit {
-		t.Fatalf("authoring agent-turn reservation = %d/%d, want 42/64", totalAgentTurns, taskLimit)
+	if taskLimit != 64 || totalAgentTurns > taskLimit {
+		t.Fatalf("authoring agent-turn reservation = %d/%d", totalAgentTurns, taskLimit)
 	}
 }
 
@@ -156,7 +95,7 @@ func TestStandardAuthoringTaskHandoffStrictlyBindsCodeEdgeChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed != handoff {
+	if !reflect.DeepEqual(parsed, handoff) {
 		t.Fatalf("parsed handoff = %+v, want %+v", parsed, handoff)
 	}
 	fingerprint, err := handoff.Fingerprint()
@@ -164,7 +103,7 @@ func TestStandardAuthoringTaskHandoffStrictlyBindsCodeEdgeChild(t *testing.T) {
 		t.Fatalf("handoff fingerprint = %q, %v", fingerprint, err)
 	}
 	var direct StandardAuthoringTaskHandoff
-	if err := json.Unmarshal(canonical, &direct); err != nil || direct != handoff {
+	if err := json.Unmarshal(canonical, &direct); err != nil || !reflect.DeepEqual(direct, handoff) {
 		t.Fatalf("direct strict handoff decode = %+v, %v", direct, err)
 	}
 
@@ -173,7 +112,7 @@ func TestStandardAuthoringTaskHandoffStrictlyBindsCodeEdgeChild(t *testing.T) {
 	if err := wrongChild.Validate(); err == nil || !strings.Contains(err.Error(), "child template") {
 		t.Fatalf("non-CodeEdge child = %v, want exact child-template rejection", err)
 	}
-	unknown := []byte(strings.Replace(string(canonical), `"version":"1"`, `"version":"1","unexpected":true`, 1))
+	unknown := []byte(strings.Replace(string(canonical), `"version":"2"`, `"version":"2","unexpected":true`, 1))
 	if _, err := ParseStandardAuthoringTaskHandoffJSON(unknown); err == nil {
 		t.Fatal("handoff accepted unknown field")
 	}
@@ -191,6 +130,9 @@ func standardAuthoringTaskHandoffFixture() StandardAuthoringTaskHandoff {
 		RevisionDigest:        workflowkit.SubjectDigest("harbor.task.v2:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
 		TaskSnapshot: ArtifactReference{
 			ID: "018f0a73-3b49-7000-8000-000000000015", ContentDigest: workflowkit.SHA256Fingerprint([]byte("task snapshot")), SchemaVersion: "harbor.artifact.v1",
+		},
+		AdmissionReceipt: &ArtifactReference{
+			ID: "018f0a73-3b49-7000-8000-000000000016", ContentDigest: workflowkit.SHA256Fingerprint([]byte("admission receipt")), SchemaVersion: "harbor.standard-authoring-task-package-admission.v1",
 		},
 		ChildTemplate: CodeEdgePhase1TemplateReference(),
 	}

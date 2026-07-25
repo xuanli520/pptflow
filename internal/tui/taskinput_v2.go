@@ -17,6 +17,8 @@ type TaskSubmitMsg struct {
 	Title       string
 	TaskType    string
 	Application string
+	CodeLang    string
+	Is0To1      bool
 	Objective   string
 	Reason      string
 }
@@ -32,6 +34,8 @@ type TaskInputModel struct {
 	titleInput       textinput.Model
 	taskTypeInput    textinput.Model
 	applicationInput textinput.Model
+	codeLangInput    textinput.Model
+	is0To1           bool
 	objectiveInput   textinput.Model
 	reasonInput      textinput.Model
 	focusIndex       int
@@ -82,6 +86,12 @@ func NewTaskInputModel() TaskInputModel {
 	application.CharLimit = 64
 	application.Width = 36
 
+	codeLang := textinput.New()
+	codeLang.Prompt = "Code language "
+	codeLang.Placeholder = "rust"
+	codeLang.CharLimit = 64
+	codeLang.Width = 24
+
 	objective := textinput.New()
 	objective.Prompt = "Objective "
 	objective.Placeholder = "Add the requested bounded behavior"
@@ -102,6 +112,7 @@ func NewTaskInputModel() TaskInputModel {
 		titleInput:       title,
 		taskTypeInput:    taskType,
 		applicationInput: application,
+		codeLangInput:    codeLang,
 		objectiveInput:   objective,
 		reasonInput:      reason,
 	}
@@ -118,6 +129,7 @@ func (m *TaskInputModel) Show() {
 	m.titleInput.Blur()
 	m.taskTypeInput.Blur()
 	m.applicationInput.Blur()
+	m.codeLangInput.Blur()
 	m.objectiveInput.Blur()
 	m.reasonInput.Blur()
 }
@@ -131,6 +143,7 @@ func (m *TaskInputModel) Hide() {
 	m.titleInput.Blur()
 	m.taskTypeInput.Blur()
 	m.applicationInput.Blur()
+	m.codeLangInput.Blur()
 	m.objectiveInput.Blur()
 	m.reasonInput.Blur()
 }
@@ -167,12 +180,18 @@ func (m *TaskInputModel) toggleFocus() {
 		m.focusIndex = 6
 	case 6:
 		m.applicationInput.Blur()
-		m.objectiveInput.Focus()
+		m.codeLangInput.Focus()
 		m.focusIndex = 7
 	case 7:
+		m.codeLangInput.Blur()
+		m.focusIndex = 8
+	case 8:
+		m.objectiveInput.Focus()
+		m.focusIndex = 9
+	case 9:
 		m.objectiveInput.Blur()
 		m.reasonInput.Focus()
-		m.focusIndex = 8
+		m.focusIndex = 10
 	default:
 		m.reasonInput.Blur()
 		m.repoInput.Focus()
@@ -190,6 +209,8 @@ func (m *TaskInputModel) Reset() {
 	m.titleInput.SetValue("")
 	m.taskTypeInput.SetValue("")
 	m.applicationInput.SetValue("")
+	m.codeLangInput.SetValue("")
+	m.is0To1 = false
 	m.objectiveInput.SetValue("")
 	m.reasonInput.SetValue("")
 	m.validationErr = ""
@@ -203,7 +224,7 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
 		// Forward non-key messages to every input for cursor blink events.
-		var repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, objectiveCmd, reasonCmd tea.Cmd
+		var repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, codeLangCmd, objectiveCmd, reasonCmd tea.Cmd
 		m.repoInput, repoCmd = m.repoInput.Update(msg)
 		m.commitInput, commitCmd = m.commitInput.Update(msg)
 		m.baseImageInput, baseImageCmd = m.baseImageInput.Update(msg)
@@ -211,9 +232,14 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 		m.titleInput, titleCmd = m.titleInput.Update(msg)
 		m.taskTypeInput, taskTypeCmd = m.taskTypeInput.Update(msg)
 		m.applicationInput, applicationCmd = m.applicationInput.Update(msg)
+		m.codeLangInput, codeLangCmd = m.codeLangInput.Update(msg)
 		m.objectiveInput, objectiveCmd = m.objectiveInput.Update(msg)
 		m.reasonInput, reasonCmd = m.reasonInput.Update(msg)
-		return tea.Batch(repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, objectiveCmd, reasonCmd), false
+		return tea.Batch(repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, codeLangCmd, objectiveCmd, reasonCmd), false
+	}
+	if keyMsg.String() == " " && m.focusIndex == 8 {
+		m.is0To1 = !m.is0To1
+		return nil, true
 	}
 
 	switch keyMsg.String() {
@@ -226,18 +252,20 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 			Title:       strings.TrimSpace(m.titleInput.Value()),
 			TaskType:    strings.TrimSpace(m.taskTypeInput.Value()),
 			Application: strings.TrimSpace(m.applicationInput.Value()),
+			CodeLang:    strings.TrimSpace(m.codeLangInput.Value()),
+			Is0To1:      m.is0To1,
 			Objective:   strings.TrimSpace(m.objectiveInput.Value()),
 			Reason:      strings.TrimSpace(m.reasonInput.Value()),
 		}
-		if request.RepoURL != "" && request.CommitSHA != "" && request.BaseImage != "" && request.Slug != "" && request.Title != "" && request.TaskType != "" && request.Application != "" && request.Objective != "" && request.Reason != "" {
-			if len(request.Objective) > workflowadapter.StandardAuthoringBriefObjectiveMaxBytes {
+		if request.RepoURL != "" && request.CommitSHA != "" && request.BaseImage != "" && request.Slug != "" && request.Title != "" && request.TaskType != "" && request.Application != "" && request.CodeLang != "" && request.Objective != "" && request.Reason != "" {
+			if len(request.Objective) > workflowadapter.AuthoringContractObjectiveMaxBytes {
 				m.validationErr = "Objective must be at most 512 UTF-8 bytes"
 				return nil, true
 			}
 			m.validationErr = ""
 			return func() tea.Msg { return request }, true
 		}
-		m.validationErr = "URL, SHA, base image, slug, title, task type, application, objective, and reason are required"
+		m.validationErr = "URL, SHA, base image, slug, title, task type, application, code language, objective, and reason are required"
 		return nil, true
 
 	case "tab":
@@ -266,6 +294,10 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 	} else if m.focusIndex == 6 {
 		m.applicationInput, cmd = m.applicationInput.Update(msg)
 	} else if m.focusIndex == 7 {
+		m.codeLangInput, cmd = m.codeLangInput.Update(msg)
+	} else if m.focusIndex == 8 {
+		return nil, true
+	} else if m.focusIndex == 9 {
 		m.objectiveInput, cmd = m.objectiveInput.Update(msg)
 	} else {
 		m.reasonInput, cmd = m.reasonInput.Update(msg)
@@ -281,6 +313,7 @@ func (m TaskInputModel) View(width int) string {
 		m.baseImageInput.View() + "\n" +
 		m.slugInput.View() + "  " + m.titleInput.View() + "\n" +
 		m.taskTypeInput.View() + "  " + m.applicationInput.View() + "\n" +
+		m.codeLangInput.View() + "  0-to-1 [" + map[bool]string{true: "x", false: " "}[m.is0To1] + "]" + "\n" +
 		m.objectiveInput.View() + "\n" +
 		m.reasonInput.View()
 	if m.validationErr != "" {

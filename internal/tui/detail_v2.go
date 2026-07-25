@@ -224,7 +224,7 @@ func (d *detailModel) currentRunFields(width int) string {
 	if !d.canCancelCurrentRun() {
 		cancel = "当前 Run 状态不可取消"
 	}
-	return detailFields(width,
+	fields := []string{
 		detailField("Run ID", run.ID, width),
 		detailField("状态", run.Status, width),
 		detailField("当前阶段", stage, width),
@@ -232,7 +232,42 @@ func (d *detailModel) currentRunFields(width int) string {
 		detailField("日志文件", logPath, width),
 		detailField(retryLabel, retry, width),
 		detailField("取消", cancel, width),
-	)
+	}
+	if evidence := run.AuthoringEvidence; evidence != nil {
+		contract := evidence.Contract
+		fields = append(fields,
+			detailField("根契约", contract.Digest, width),
+			detailField("任务", contract.Title+" ("+contract.Slug+")", width),
+			detailField("分类", contract.CodeLang+" / "+contract.TaskType+" / "+contract.Application, width),
+			detailField("0-to-1", fmt.Sprintf("%t", contract.Is0To1), width),
+			detailField("仓库", contract.RepositoryURL, width),
+			detailField("Commit", contract.CommitSHA, width),
+			detailField("快照", contract.SnapshotDigest, width),
+			detailField("源码根", contract.CheckoutRoot, width),
+			detailField("基础镜像", contract.BaseImage, width),
+			detailField("目标", contract.Objective, width),
+			detailField("交付格式", contract.PackageFormat, width),
+			detailField("Profile 摘要", contract.ProfileFingerprint, width),
+		)
+		for _, claim := range evidence.Claims {
+			fields = append(fields, detailField("声明比对", claim.ArtifactKey+" = "+claim.State, width))
+		}
+		for _, repair := range evidence.Repairs {
+			fields = append(fields,
+				detailField("修复账本", repair.TargetProducer+" / "+repair.State, width),
+				detailField("修复类型", repair.FindingKind, width),
+				detailField("修复证据", repair.EvidenceDigest, width),
+			)
+		}
+		for _, artifact := range evidence.Lineage {
+			fields = append(fields,
+				detailField("最终谱系", artifact.ArtifactKey, width),
+				detailField("Artifact ID", artifact.ArtifactID, width),
+				detailField("Artifact 摘要", artifact.Digest, width),
+			)
+		}
+	}
+	return detailFields(width, fields...)
 }
 
 func (d *detailModel) failureFields(width int) string {

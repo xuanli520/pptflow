@@ -3,135 +3,38 @@ package workflowadapter
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
-
-	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 const (
-	// StandardAuthoringEnvironmentPolicyFormat and Version identify the one
-	// task-specific environment contract accepted by Standard authoring. The
-	// policy deliberately contains only an immutable base-image reference; it
-	// is not a general container runtime configuration surface.
-	StandardAuthoringEnvironmentPolicyFormat  = "harbor.standard-authoring-environment-policy.v1"
-	StandardAuthoringEnvironmentPolicyVersion = "1"
-
-	// StandardAuthoringEnvironmentPolicyArtifact is the intrinsic immutable
-	// AuthoringSession input consumed by stages that need to design, review, or
-	// materialize a task environment.
-	StandardAuthoringEnvironmentPolicyArtifact      = "environment_policy"
-	StandardAuthoringEnvironmentPolicySchemaVersion = StandardAuthoringEnvironmentPolicyFormat
-
 	standardAuthoringDockerfileMaxBytes = 4 * 1024 * 1024
 )
 
-// StandardAuthoringEnvironmentPolicy freezes the exact base image selected
-// for one AuthoringSession. BaseImage must use a fully-qualified repository
-// and a sha256 digest. A tag may be included for readability, but the digest
-// is the immutable identity.
+// StandardAuthoringEnvironmentPolicy is the Docker-specific projection of the
+// root contract. It is not an independently stored or bound stage input.
 type StandardAuthoringEnvironmentPolicy struct {
-	Format    string `json:"format"`
-	Version   string `json:"version"`
-	BaseImage string `json:"base_image"`
+	BaseImage string
 }
 
-// NewStandardAuthoringEnvironmentPolicy validates a caller-selected immutable
-// base image and returns the complete canonical policy value to freeze into an
-// AuthoringSession manifest.
+// NewStandardAuthoringEnvironmentPolicy validates the immutable image selected
+// in the root contract.
 func NewStandardAuthoringEnvironmentPolicy(baseImage string) (StandardAuthoringEnvironmentPolicy, error) {
-	policy := StandardAuthoringEnvironmentPolicy{
-		Format: StandardAuthoringEnvironmentPolicyFormat, Version: StandardAuthoringEnvironmentPolicyVersion, BaseImage: baseImage,
-	}
+	policy := StandardAuthoringEnvironmentPolicy{BaseImage: baseImage}
 	if err := policy.Validate(); err != nil {
 		return StandardAuthoringEnvironmentPolicy{}, err
 	}
 	return policy, nil
 }
 
-// Validate proves that the policy has the one supported schema and a
-// canonical immutable image reference. It deliberately rejects image aliases,
-// unqualified Docker Hub names, variables, and mutable tags without a digest.
+// Validate rejects image aliases, unqualified Docker Hub names, variables, and
+// mutable tags without a digest.
 func (policy StandardAuthoringEnvironmentPolicy) Validate() error {
-	if policy.Format != StandardAuthoringEnvironmentPolicyFormat {
-		return fmt.Errorf("%w: unsupported Standard authoring environment policy format %q", errInvalidCatalog, policy.Format)
-	}
-	if policy.Version != StandardAuthoringEnvironmentPolicyVersion {
-		return fmt.Errorf("%w: unsupported Standard authoring environment policy version %q", errInvalidCatalog, policy.Version)
-	}
 	if err := validateStandardAuthoringImmutableImageReference(policy.BaseImage); err != nil {
 		return fmt.Errorf("%w: Standard authoring environment policy base image: %v", errInvalidCatalog, err)
 	}
-	return nil
-}
-
-// CanonicalJSON returns the stable immutable policy bytes stored in a session
-// manifest and exposed through the environment_policy artifact input.
-func (policy StandardAuthoringEnvironmentPolicy) CanonicalJSON() ([]byte, error) {
-	if err := policy.Validate(); err != nil {
-		return nil, err
-	}
-	encoded, err := json.Marshal(policy)
-	if err != nil {
-		return nil, fmt.Errorf("%w: encode Standard authoring environment policy: %v", errInvalidCatalog, err)
-	}
-	return encoded, nil
-}
-
-// ContentDigest returns the object-content identity used by frozen artifact
-// bindings. It is intentionally a plain SHA-256 of CanonicalJSON so it can be
-// compared directly with workflowkit ArtifactBinding.ContentDigest.
-func (policy StandardAuthoringEnvironmentPolicy) ContentDigest() (workflowkit.Fingerprint, error) {
-	canonical, err := policy.CanonicalJSON()
-	if err != nil {
-		return "", err
-	}
-	return workflowkit.SHA256Fingerprint(canonical), nil
-}
-
-// Fingerprint is retained as the compact policy identity used by launch and
-// session code. It is equivalent to ContentDigest rather than domain-separated
-// because policy bytes become a frozen artifact input.
-func (policy StandardAuthoringEnvironmentPolicy) Fingerprint() (workflowkit.Fingerprint, error) {
-	return policy.ContentDigest()
-}
-
-// ParseStandardAuthoringEnvironmentPolicyJSON strictly parses one policy
-// document. It rejects duplicate/unknown keys and trailing JSON, while callers
-// use CanonicalJSON to obtain the stable stored representation.
-func ParseStandardAuthoringEnvironmentPolicyJSON(raw []byte) (StandardAuthoringEnvironmentPolicy, error) {
-	if err := rejectDuplicateJSONKeys(raw); err != nil {
-		return StandardAuthoringEnvironmentPolicy{}, fmt.Errorf("decode Standard authoring environment policy: %w", err)
-	}
-	var document standardAuthoringEnvironmentPolicyDocument
-	if err := decodeExecutionSpecJSON(raw, &document); err != nil {
-		return StandardAuthoringEnvironmentPolicy{}, fmt.Errorf("decode Standard authoring environment policy: %w", err)
-	}
-	policy := StandardAuthoringEnvironmentPolicy(document)
-	if err := policy.Validate(); err != nil {
-		return StandardAuthoringEnvironmentPolicy{}, err
-	}
-	return policy, nil
-}
-
-// The alias prevents the strict parser from recursively invoking
-// StandardAuthoringEnvironmentPolicy.UnmarshalJSON.
-type standardAuthoringEnvironmentPolicyDocument StandardAuthoringEnvironmentPolicy
-
-// UnmarshalJSON keeps direct decoding at the same strict boundary as the
-// named parser, so no caller can bypass policy validation through json.Unmarshal.
-func (policy *StandardAuthoringEnvironmentPolicy) UnmarshalJSON(raw []byte) error {
-	if policy == nil {
-		return fmt.Errorf("%w: nil Standard authoring environment policy", errInvalidCatalog)
-	}
-	parsed, err := ParseStandardAuthoringEnvironmentPolicyJSON(raw)
-	if err != nil {
-		return err
-	}
-	*policy = parsed
 	return nil
 }
 

@@ -91,7 +91,7 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	if definitionProfileFingerprint != lockedProfileFingerprint {
 		t.Fatal("Standard authoring definition did not use the execution profile frozen in the deployment lock")
 	}
-	for _, stageKey := range workflowadapter.StandardAuthoringHarnessStageOrder() {
+	for _, stageKey := range workflowadapter.StandardAuthoringStageOrder() {
 		resolution, err := definition.ExecutionSpec.ResolveStageOperation(stageKey)
 		if err != nil {
 			t.Fatal(err)
@@ -109,9 +109,7 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 	t.Helper()
 	deploymentRoot := t.TempDir()
 	sourceRoot := standardAuthoringProductionRepositoryRoot(t)
-	// The repository source is versioned separately from the canonical runtime
-	// package directory. Production packaging stages 1.8 into standard-authoring.
-	copyStandardAuthoringDeploymentTree(t, filepath.Join(sourceRoot, "deployments", "standard-authoring-1.8"), deploymentRoot)
+	copyStandardAuthoringDeploymentTree(t, filepath.Join(sourceRoot, "deployments", "standard-authoring"), deploymentRoot)
 	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
 	if err != nil {
 		t.Fatal(err)

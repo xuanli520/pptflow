@@ -21,12 +21,12 @@ if [[ -n "$(git -C "$root" status --porcelain=v1 --untracked-files=all)" ]]; the
   die "a clean committed source tree is required"
 fi
 
-catalog="$root/deployments/standard-authoring-1.8/operation-catalog.v1.json"
-assets="$root/deployments/standard-authoring-1.8/contract-assets.v1.json"
-profile="$root/deployments/standard-authoring-1.8/execution-profile.v1.json"
-contract_root="$root/deployments/standard-authoring-1.8"
+catalog="$root/deployments/standard-authoring/operation-catalog.v1.json"
+assets="$root/deployments/standard-authoring/contract-assets.v1.json"
+profile="$root/deployments/standard-authoring/execution-profile.v1.json"
+contract_root="$root/deployments/standard-authoring"
 ssh_known_hosts="$contract_root/ssh/known_hosts"
-output="$root/deployments/standard-authoring-1.8/operation-catalog.lock.json"
+output="$root/deployments/standard-authoring/operation-catalog.lock.json"
 
 for file in "$catalog" "$assets" "$profile" "$ssh_known_hosts"; do
   if [[ ! -f "$file" || -L "$file" ]]; then

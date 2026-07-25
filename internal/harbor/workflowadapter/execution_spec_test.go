@@ -545,7 +545,7 @@ func testRunExecutionSpec(t *testing.T) RunExecutionSpec {
 func testStandardAuthoringExecutionSpec(t *testing.T) RunExecutionSpec {
 	t.Helper()
 	spec := testRunExecutionSpec(t)
-	spec.Template = StandardAuthoringTemplateReference()
+	spec.Template = StandardAuthoringCurrentTemplateReference()
 	spec.Selection = RunSelectionReference{
 		Kind:                  RunSelectionAuthoringSession,
 		AuthoringSourceID:     "018f0a73-3b49-7000-8000-000000000010",
@@ -568,6 +568,26 @@ func testStandardAuthoringExecutionSpec(t *testing.T) RunExecutionSpec {
 				stages = append(stages, binding)
 			}
 		}
+	}
+	present := make(map[workflowkit.StageKey]struct{}, len(stages))
+	for _, binding := range stages {
+		base, _ := stageBindingBaseOf(binding)
+		present[base.StageKey] = struct{}{}
+	}
+	for _, definition := range StandardAuthoringCurrentWorkflowTemplate().Catalog.Stages {
+		if _, exists := present[definition.Key]; exists {
+			continue
+		}
+		base := StageBindingBase{
+			Type: bindingTypeForTest(definition.Key), StageKey: definition.Key,
+			Plugin:     workflowkit.PluginBinding{ID: definition.Plugin.ID, Version: definition.Plugin.Version},
+			CheckoutID: "checkout-main", RuntimeID: "runtime-local", ArtifactInputs: []ArtifactInputReference{}, SecretIDs: []string{},
+			Operation: StageOperationBinding{
+				ProviderID: "provider-local", OperationID: string(definition.Key), Version: "1",
+				Payload: LocalCommandOperationPayload{CommandID: "harbor-stage", Arguments: []string{string(definition.Key)}},
+			},
+		}
+		stages = append(stages, bindingForTest(t, base))
 	}
 	spec.Stages = stages
 	spec.References.Checkouts = []CheckoutReference{spec.References.Checkouts[0]}
@@ -643,6 +663,8 @@ func bindingForTest(t *testing.T, base StageBindingBase) StageExecutionBinding {
 		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingAuthoringHarness:
 		return UniversalStageBinding{StageBindingBase: base}
+	case StageBindingCodeEdgePackageAdmission:
+		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingTestsAnalysis:
 		return UniversalStageBinding{StageBindingBase: base}
 	case StageBindingSolutionReview:
@@ -715,6 +737,8 @@ func bindingTypeForTest(key workflowkit.StageKey) StageBindingType {
 		return StageBindingTestGen
 	case "authoring_harness":
 		return StageBindingAuthoringHarness
+	case "codeedge_package_admission":
+		return StageBindingCodeEdgePackageAdmission
 	case "tests_analysis":
 		return StageBindingTestsAnalysis
 	case "solution_review":

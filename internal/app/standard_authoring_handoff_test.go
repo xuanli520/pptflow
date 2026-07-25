@@ -1040,7 +1040,7 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringFixedFileTemplateVersion, SessionManifestJSON: `{"format":"test"}`,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version, SessionManifestJSON: `{"format":"test"}`,
 		IdempotencyKey: "handoff-session", Actor: "author", Reason: "freeze session",
 	})
 	if err != nil {
@@ -1086,19 +1086,15 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	if !found {
 		t.Fatal("compiled authoring workflow omitted materialize_task")
 	}
-	policyRaw, err := packageInput.Environment.CanonicalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	briefRaw, err := packageInput.Brief.CanonicalJSON()
+	packageInput.Contract = standardAuthoringTaskPackageContractForSubject(t, packageInput, task.ID, task.Slug, task.Title, source)
+	contractRaw, err := packageInput.Contract.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
 	contents := map[string][]byte{
 		"instruction": append([]byte(nil), packageInput.Instruction...),
 		"task_toml":   append([]byte(nil), packageInput.TaskTOMLDraft...),
-		workflowadapter.StandardAuthoringEnvironmentPolicyArtifact: policyRaw,
-		workflowadapter.StandardAuthoringBriefArtifact:             briefRaw,
+		workflowadapter.AuthoringContractArtifact: contractRaw,
 		"tests_analysis":                    append([]byte(nil), packageInput.TestsAnalysis...),
 		"solution_review_decision":          approvedAuthoringSolutionDecision(t, source, session, run),
 		"codeedge_package_admission_report": []byte(`{}`),
@@ -1115,7 +1111,7 @@ func newStandardAuthoringHandoffFixtureWithRetrySnapshot(t *testing.T, retrySnap
 	for _, binding := range inputs {
 		switch binding.Name {
 		case "instruction", "task_toml", workflowadapter.StandardAuthoringValidatedDockerfileArtifact,
-			workflowadapter.StandardAuthoringEnvironmentPolicyArtifact, workflowadapter.StandardAuthoringBriefArtifact,
+			workflowadapter.AuthoringContractArtifact,
 			workflowadapter.StandardAuthoringValidatedSolveScriptArtifact, workflowadapter.StandardAuthoringValidatedTestScriptArtifact,
 			workflowadapter.StandardAuthoringDockerfileBuildReportArtifact, workflowadapter.StandardAuthoringHarnessReportArtifact, "tests_analysis":
 			admissionInputs = append(admissionInputs, binding)

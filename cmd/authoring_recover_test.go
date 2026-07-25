@@ -156,6 +156,7 @@ func newCommandAuthoringRecoveryFixture(t *testing.T, ctx context.Context) (stri
 		RepositoryURL: coordinate.RepositoryURL,
 		CommitSHA:     coordinate.CommitSHA,
 		BaseImage:     "docker.io/library/rust:1.65@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		CodeLang:      "rust",
 		TaskType:      "bug-fix",
 		Application:   "rust",
 		Objective:     "Repair the recoverable authoring fixture.",

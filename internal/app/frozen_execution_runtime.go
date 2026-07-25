@@ -1007,7 +1007,7 @@ func validateRequiredContinuationInputsExcept(ctx context.Context, core *lifecyc
 		if !found || !stage.AutomaticallyDispatchable() {
 			return fmt.Errorf("%w: required continuation inputs refer to unavailable stage %q", ErrFrozenExecutionPayload, stageKey)
 		}
-		inputs, err := resolveStageInputsForSubject(ctx, core.store, core.objects, run, subject, stage)
+		inputs, err := resolveStageInputsForSubjectWithExplicitInputs(ctx, core.store, core.objects, run, subject, stage, transition.InputBindings)
 		if err != nil {
 			return fmt.Errorf("%w: %w: resolve required continuation inputs for stage %q: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stageKey, err)
 		}
@@ -1380,7 +1380,7 @@ func (runtime *FrozenExecutionRuntime) enqueueStageAttempt(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	inputs, err := resolveStageInputsForSubject(ctx, runtime.core.store, runtime.core.objects, run, subject, stage)
+	inputs, err := resolveStageInputsForSubjectWithExplicitInputs(ctx, runtime.core.store, runtime.core.objects, run, subject, stage, transition.InputBindings)
 	if err != nil {
 		if len(transition.InputBindings) != 0 {
 			return fmt.Errorf("%w: %w: resolve required continuation inputs for stage %q: %v", ErrFrozenExecutionPayload, errRequiredContinuationInputDrift, stage.Key, err)
@@ -1576,6 +1576,14 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	if err := runtime.validateStageAttemptPlanBinding(*loadedStageAttempt, payload); err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
+	plan, err := runtime.runtimePlanForStagePayload(ctx, payload, frozen)
+	if err != nil {
+		return runtime.failRuntimeJob(ctx, job, err)
+	}
+	transition, found := plan.stageTransition(stage.Key)
+	if !found || transition.Disposition != workflowkit.DispositionSchedule {
+		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: stage attempt is not scheduled by its frozen execution plan", ErrFrozenExecutionPayload))
+	}
 	isCodeEdgeEvaluator := isCodeEdgeEvaluatorStage(run, stage)
 	if isCodeEdgeEvaluator {
 		effect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, *loadedStageAttempt, stage)
@@ -1587,6 +1595,19 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		}
 	}
 	if loadedStageAttempt.ExecutionStatus == store.StageExecutionCompleted || loadedStageAttempt.ExecutionStatus == store.StageExecutionInfraFailed || loadedStageAttempt.ExecutionStatus == store.StageExecutionInterrupted || loadedStageAttempt.ExecutionStatus == store.StageExecutionCanceled {
+		if loadedStageAttempt.ExecutionStatus == store.StageExecutionCompleted && (loadedStageAttempt.Verdict == store.VerdictPass || loadedStageAttempt.Verdict == store.VerdictNeedsRepair) {
+			subject, subjectErr := runtime.core.resolveWorkflowRunSubject(ctx, run)
+			if subjectErr != nil {
+				return runtime.failRuntimeJob(ctx, job, subjectErr)
+			}
+			if loadedStageAttempt.Verdict == store.VerdictPass {
+				if resolveErr := runtime.resolveAuthoringRepairsForValidatedProducer(ctx, run, subject, *loadedStageAttempt, job.CreatedBy); resolveErr != nil {
+					return runtime.failRuntimeJob(ctx, job, resolveErr)
+				}
+			} else if openErr := runtime.openAuthoringPackageAdmissionRepairLedger(ctx, run, subject, *loadedStageAttempt); openErr != nil {
+				return runtime.failRuntimeJob(ctx, job, openErr)
+			}
+		}
 		return store.JobSucceeded, nil
 	}
 	if loadedStageAttempt.ExecutionStatus == store.StageExecutionWaiting {
@@ -1622,7 +1643,7 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	}
 
 	if review, isReviewGate := frozen.ReviewStage(stage.Key); isReviewGate {
-		inputs, inputErr := resolveStageInputsForSubject(ctx, runtime.core.store, runtime.core.objects, run, subject, stage)
+		inputs, inputErr := resolveStageInputsForSubjectWithExplicitInputs(ctx, runtime.core.store, runtime.core.objects, run, subject, stage, transition.InputBindings)
 		if inputErr != nil {
 			return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, stageAttempt, nil, stageQuotaReservation{}, StageExecutionResult{
 				Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePermanent}, ErrorText: inputErr.Error(), FailureClass: string(workflowkit.FailurePermanent),
@@ -1659,7 +1680,7 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	monitor := runtime.startStageControlMonitor(stageContext, cancel, run.ID, stageAttempt.ID, job.CreatedBy)
 	defer monitor.stop()
 
-	inputs, err := resolveStageInputsForSubject(stageContext, runtime.core.store, runtime.core.objects, run, subject, stage)
+	inputs, err := resolveStageInputsForSubjectWithExplicitInputs(stageContext, runtime.core.store, runtime.core.objects, run, subject, stage, transition.InputBindings)
 	if err != nil {
 		return runtime.projectStageTerminal(ctx, job, run, frozen, payload, subject, stage, stageAttempt, nil, reservation, StageExecutionResult{
 			Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePermanent}, ErrorText: err.Error(), FailureClass: string(workflowkit.FailurePermanent),
@@ -2589,6 +2610,15 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 	})
 	if err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
+	}
+	if updated.ExecutionStatus == store.StageExecutionCompleted && updated.Verdict == store.VerdictPass {
+		if err := runtime.resolveAuthoringRepairsForValidatedProducer(ctx, run, subject, updated, job.CreatedBy); err != nil {
+			return runtime.failRuntimeJob(ctx, job, err)
+		}
+	} else if updated.ExecutionStatus == store.StageExecutionCompleted && updated.Verdict == store.VerdictNeedsRepair {
+		if err := runtime.openAuthoringPackageAdmissionRepairLedger(ctx, run, subject, updated); err != nil {
+			return runtime.failRuntimeJob(ctx, job, err)
+		}
 	}
 	return runtime.afterStageTerminal(ctx, job, run, frozen, payload, stage, updated, operation, settlementID, monitor)
 }

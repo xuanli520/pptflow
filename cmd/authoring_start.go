@@ -14,7 +14,8 @@ import (
 // catalog, provider, model, prompt, secret, and execution settings remain
 // deployment-owned.
 func newAuthoringStartCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var repositoryURL, commitSHA, baseImage, slug, title, taskType, application, objective, metadataJSON, idempotencyKey, reason string
+	var repositoryURL, commitSHA, baseImage, slug, title, taskType, application, codeLang, objective, metadataJSON, idempotencyKey, reason string
+	var is0To1 bool
 	command := &cobra.Command{
 		Use:   "start",
 		Short: "Capture an immutable Git source and start Standard authoring",
@@ -54,6 +55,10 @@ into the AuthoringSession task contract.`,
 			if err != nil {
 				return err
 			}
+			codeLang, err = requiredText("code-lang", codeLang)
+			if err != nil {
+				return err
+			}
 			objective, err = requiredText("objective", objective)
 			if err != nil {
 				return err
@@ -75,6 +80,8 @@ into the AuthoringSession task contract.`,
 					Title:                        title,
 					TaskType:                     taskType,
 					Application:                  application,
+					CodeLang:                     codeLang,
+					Is0To1:                       is0To1,
 					Objective:                    objective,
 					MetadataJSON:                 metadataJSON,
 				})
@@ -97,6 +104,8 @@ into the AuthoringSession task contract.`,
 	command.Flags().StringVar(&title, "title", "", "Task title")
 	command.Flags().StringVar(&taskType, "task-type", "", "Frozen task type used by authoring and generated metadata")
 	command.Flags().StringVar(&application, "application", "", "Frozen application name used by authoring and generated metadata")
+	command.Flags().StringVar(&codeLang, "code-lang", "", "Frozen implementation language used by authoring and generated metadata")
+	command.Flags().BoolVar(&is0To1, "is-0-to-1", false, "Declare that this task is a greenfield implementation")
 	command.Flags().StringVar(&objective, "objective", "", "Frozen authoring objective")
 	command.Flags().StringVar(&metadataJSON, "metadata-json", "{}", "Draft task metadata JSON")
 	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 idempotency key")

@@ -8,6 +8,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 func TestCompileStandardAuthoringTaskPackageCanonicalizesFrozenSourceAndAnalysis(t *testing.T) {
@@ -39,7 +40,7 @@ func TestCompileStandardAuthoringTaskPackageCanonicalizesFrozenSourceAndAnalysis
 	}
 }
 
-func TestCompileStandardAuthoringTaskPackageMigratesMatchingLegacySourceTable(t *testing.T) {
+func TestCompileStandardAuthoringTaskPackageRejectsNoncanonicalSourceTable(t *testing.T) {
 	input := standardAuthoringTaskPackageFixture(t)
 	input.TaskTOMLDraft = append(input.TaskTOMLDraft, []byte("\n[source]\nrepository_url = \""+input.Source.RepositoryURL+"\"\ncommit_sha = \""+input.Source.CommitSHA+"\"\n")...)
 
@@ -47,17 +48,10 @@ func TestCompileStandardAuthoringTaskPackageMigratesMatchingLegacySourceTable(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Report.Passed {
-		t.Fatalf("matching legacy source table should be migrated: %+v", result.Report)
+	if result.Report.Passed {
+		t.Fatalf("noncanonical source table unexpectedly passed: %+v", result.Report)
 	}
-	files := taskPackageFilesByPath(result.CanonicalFiles)
-	document, err := parseStandardAuthoringTaskTOMLPayload(files["task.toml"].Data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := document["source"].(string); !ok || got != input.Source.RepositoryURL+"@"+input.Source.CommitSHA {
-		t.Fatalf("migrated Harbor source = %#v, want string coordinate", document["source"])
-	}
+	assertAdmissionViolationMessage(t, result.Report, "task_metadata", "source")
 }
 
 func TestCompileStandardAuthoringTaskPackageReportsIncidentClasses(t *testing.T) {
@@ -94,62 +88,6 @@ func TestCompileStandardAuthoringTaskPackageReportsFrozenBriefMetadataMismatch(t
 			}
 			if result.Report.Passed {
 				t.Fatalf("mismatched frozen brief metadata unexpectedly passed: %+v", result.Report)
-			}
-			assertAdmissionViolationMessage(t, result.Report, "task_metadata", test.field)
-		})
-	}
-}
-
-func TestCompileStandardAuthoringTaskPackageAcceptsObservedArtifactWrappers(t *testing.T) {
-	input := standardAuthoringTaskPackageFixture(t)
-	wantInstruction := append([]byte(nil), input.Instruction...)
-	input.Instruction = standardAuthoringInstructionWrapperFixture(t, input.Instruction)
-	input.TaskTOMLDraft = standardAuthoringTaskTOMLWrapperFixture(t, input.TaskTOMLDraft, *input.Brief)
-
-	result, err := CompileStandardAuthoringTaskPackage(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Report.Passed {
-		t.Fatalf("wrapped package admission report = %+v", result.Report)
-	}
-	files := taskPackageFilesByPath(result.CanonicalFiles)
-	if string(files["instruction.md"].Data) != string(wantInstruction) {
-		t.Fatalf("materialized instruction = %q, want decoded content %q", files["instruction.md"].Data, wantInstruction)
-	}
-	if !strings.Contains(string(files["task.toml"].Data), `task_type = 'bugfix'`) || strings.Contains(string(files["task.toml"].Data), `"task_toml"`) {
-		t.Fatalf("materialized task.toml was not decoded and canonicalized:\n%s", files["task.toml"].Data)
-	}
-}
-
-func TestCompileStandardAuthoringTaskPackageRejectsWrapperScopeMismatch(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		mutate func(*standardAuthoringTaskTOMLArtifactMetadata)
-		field  string
-	}{
-		{name: "task type", mutate: func(metadata *standardAuthoringTaskTOMLArtifactMetadata) { metadata.TaskType = "feature" }, field: "metadata.task_type"},
-		{name: "application", mutate: func(metadata *standardAuthoringTaskTOMLArtifactMetadata) { metadata.Application = "backend" }, field: "metadata.application"},
-		{name: "objective", mutate: func(metadata *standardAuthoringTaskTOMLArtifactMetadata) { metadata.Objective = "Different objective" }, field: "metadata.objective"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			input := standardAuthoringTaskPackageFixture(t)
-			metadata := standardAuthoringTaskTOMLArtifactMetadata{TaskType: input.Brief.TaskType, Application: input.Brief.Application, Objective: input.Brief.Objective}
-			test.mutate(&metadata)
-			encoded, err := json.Marshal(standardAuthoringTaskTOMLArtifact{
-				Format: standardAuthoringTaskTOMLArtifactFormat, Version: standardAuthoringModelArtifactVersion,
-				Metadata: metadata, TaskTOML: string(input.TaskTOMLDraft),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			input.TaskTOMLDraft = encoded
-			result, err := CompileStandardAuthoringTaskPackage(input)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if result.Report.Passed {
-				t.Fatalf("mismatched wrapper scope unexpectedly passed: %+v", result.Report)
 			}
 			assertAdmissionViolationMessage(t, result.Report, "task_metadata", test.field)
 		})
@@ -208,9 +146,9 @@ func TestCompileStandardAuthoringTaskPackageReportsMalformedModelContent(t *test
 		{
 			name: "invalid tests analysis",
 			mutate: func(input *StandardAuthoringTaskPackageInput) {
-				input.TestsAnalysis = []byte(`{"provided_information":"\u0000","theoretical_path":"path","passing_evidence":"evidence"}`)
+				input.TestsAnalysis = []byte(`{"format":"harbor.standard-authoring-tests-analysis.v2","version":"2","requirement_ids":["REQ-1"],"provided_information":"\u0000","theoretical_path":"path","passing_evidence":"evidence"}`)
 			},
-			code: "tests_analysis", messagePart: "strict JSON object",
+			code: "tests_analysis", messagePart: "stable requirement IDs",
 		},
 	}
 	for _, test := range tests {
@@ -230,7 +168,6 @@ func TestCompileStandardAuthoringTaskPackageReportsMalformedModelContent(t *test
 }
 
 func TestStandardAuthoringObservedArtifactWrappersAreStrict(t *testing.T) {
-	validTaskTOML := standardAuthoringTaskPackageFixture(t).TaskTOMLDraft
 	tests := []struct {
 		name string
 		raw  []byte
@@ -242,11 +179,6 @@ func TestStandardAuthoringObservedArtifactWrappersAreStrict(t *testing.T) {
 		{name: "instruction empty payload", raw: []byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"  "}`), read: decodeStandardAuthoringInstructionArtifact},
 		{name: "instruction invalid UTF-8", raw: append([]byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"`), 0xff, '"', '}'), read: decodeStandardAuthoringInstructionArtifact},
 		{name: "instruction nested wrapper", raw: []byte(`{"format":"harbor.standard-authoring-instruction.v1","version":"1","content":"{\"format\":\"harbor.standard-authoring-instruction.v1\",\"version\":\"1\",\"content\":\"task\"}"}`), read: decodeStandardAuthoringInstructionArtifact},
-		{name: "task wrong version", raw: []byte(`{"format":"harbor.artifact.v1","version":"2","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"[metadata]\\n"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
-		{name: "task unknown metadata field", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair","extra":true},"task_toml":"[metadata]\\n"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
-		{name: "task duplicate payload", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"[metadata]\\n","task_toml":"[other]\\n"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
-		{name: "task empty payload", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":""}`), read: decodeStandardAuthoringTaskTOMLArtifact},
-		{name: "task nested wrapper", raw: []byte(`{"format":"harbor.artifact.v1","version":"1","metadata":{"task_type":"bugfix","application":"widget","objective":"Repair"},"task_toml":"{\"format\":\"harbor.artifact.v1\",\"version\":\"1\",\"metadata\":{\"task_type\":\"feature\",\"application\":\"backend\",\"objective\":\"Other\"},\"task_toml\":\"[metadata]\\ntask_type = \\\"bugfix\\\"\\napplication = \\\"widget\\\"\\n\"}"}`), read: decodeStandardAuthoringTaskTOMLArtifact},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -258,9 +190,6 @@ func TestStandardAuthoringObservedArtifactWrappersAreStrict(t *testing.T) {
 	if content, err := decodeStandardAuthoringInstructionArtifact([]byte(`{"requirement":"raw JSON instructions remain raw"}`)); err != nil || string(content) != `{"requirement":"raw JSON instructions remain raw"}` {
 		t.Fatalf("raw JSON instruction = %q, %v", content, err)
 	}
-	if content, err := decodeStandardAuthoringTaskTOMLArtifact(validTaskTOML); err != nil || string(content) != string(validTaskTOML) {
-		t.Fatalf("raw task TOML = %q, %v", content, err)
-	}
 }
 
 func standardAuthoringTaskPackageFixture(t *testing.T) StandardAuthoringTaskPackageInput {
@@ -271,7 +200,16 @@ func standardAuthoringTaskPackageFixture(t *testing.T) StandardAuthoringTaskPack
 	}
 	commit := strings.Repeat("b", 40)
 	repository := "https://github.com/acme/widget.git"
-	brief, err := workflowadapter.NewStandardAuthoringBrief("bugfix", "widget", "Repair the bounded widget behavior")
+	taskID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotDigest := string(workflowkit.SHA256Fingerprint([]byte("widget source snapshot")))
+	contract, err := workflowadapter.NewAuthoringContract(
+		workflowadapter.AuthoringContractTask{ID: taskID, Slug: "repair-widget", Title: "Repair widget", CodeLang: "go", TaskType: "bugfix", Application: "widget"},
+		workflowadapter.AuthoringContractSource{RepositoryURL: repository, CommitSHA: commit, SnapshotDigest: snapshotDigest, CheckoutRoot: "source"},
+		base.BaseImage, "Repair the bounded widget behavior", string(workflowkit.SHA256Fingerprint([]byte("task-package-profile"))),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,8 +218,8 @@ func standardAuthoringTaskPackageFixture(t *testing.T) StandardAuthoringTaskPack
 		TaskTOMLDraft: []byte("schema_version = \"1.0\"\n\n[metadata]\ncode_lang = \"go\"\ntask_type = \"bugfix\"\napplication = \"widget\"\nis_0_to_1 = false\ngithub_url = \"" + repository + "\"\ncommit_id = \"" + commit + "\"\n\n[task]\nname = \"harbor/repair-widget\"\ndescription = \"Repair the bounded widget behavior.\"\n\n[environment]\nbuild_timeout_sec = 900.0\nnetwork_mode = \"no-network\"\nworkdir = \"/workspace/source\"\n\n[verifier]\ntimeout_sec = 1800.0\n"),
 		Dockerfile:    []byte("FROM " + base.BaseImage + "\nRUN git clone " + repository + " /app/repo && cd /app/repo && git checkout " + commit + "\nCOPY package.json /tmp/package.json\n"),
 		SolveScript:   []byte("#!/bin/sh\nexit 0\n"), TestScript: []byte("#!/bin/sh\nexit 0\n"),
-		TestsAnalysis: []byte(`{"provided_information":"The instruction and pinned environment define the task.","theoretical_path":"Inspect the repository, implement the requested behavior, and run tests.","passing_evidence":"The visible contract and tests provide an objective pass condition."}`),
-		Source:        store.AuthoringSource{RepositoryURL: repository, CommitSHA: commit}, Environment: base, Brief: &brief,
+		TestsAnalysis: []byte(`{"format":"harbor.standard-authoring-tests-analysis.v2","version":"2","requirement_ids":["REQ-1"],"provided_information":"The instruction and pinned environment define the task.","theoretical_path":"Inspect the repository, implement the requested behavior, and run tests.","passing_evidence":"The visible contract and tests provide an objective pass condition."}`),
+		Source:        store.AuthoringSource{RepositoryURL: repository, CommitSHA: commit, SnapshotContentDigest: snapshotDigest}, Contract: contract,
 		Admission: codeedge.TaskAdmissionContract{ID: "codeedge.phase1.task-admission", Version: "1", Profile: codeedge.Profile{
 			Metadata:                      codeedge.MetadataFieldMapping{CodeLang: codeedge.TOMLPath{"metadata", "code_lang"}, TaskType: codeedge.TOMLPath{"metadata", "task_type"}, Application: codeedge.TOMLPath{"metadata", "application"}, IsZeroToOne: codeedge.TOMLPath{"metadata", "is_0_to_1"}, GitHubURL: codeedge.TOMLPath{"metadata", "github_url"}, CommitID: codeedge.TOMLPath{"metadata", "commit_id"}},
 			ProtectedEnvironmentVariables: []string{"ANTHROPIC_AUTH_TOKEN"},
@@ -289,23 +227,28 @@ func standardAuthoringTaskPackageFixture(t *testing.T) StandardAuthoringTaskPack
 	}
 }
 
+func standardAuthoringTaskPackageContractForSubject(t *testing.T, input StandardAuthoringTaskPackageInput, taskID, slug, title string, source store.AuthoringSource) workflowadapter.AuthoringContract {
+	t.Helper()
+	contract, err := workflowadapter.NewAuthoringContract(
+		workflowadapter.AuthoringContractTask{
+			ID: taskID, Slug: slug, Title: title, CodeLang: input.Contract.Task.CodeLang,
+			TaskType: input.Contract.Task.TaskType, Application: input.Contract.Task.Application, Is0To1: input.Contract.Task.Is0To1,
+		},
+		workflowadapter.AuthoringContractSource{
+			RepositoryURL: source.RepositoryURL, CommitSHA: source.CommitSHA, SnapshotDigest: source.SnapshotContentDigest, CheckoutRoot: "source",
+		},
+		input.Contract.Environment.BaseImage, input.Contract.Objective, input.Contract.Delivery.ProfileFingerprint,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contract
+}
+
 func standardAuthoringInstructionWrapperFixture(t *testing.T, content []byte) []byte {
 	t.Helper()
 	encoded, err := json.Marshal(standardAuthoringInstructionArtifact{
 		Format: standardAuthoringInstructionArtifactFormat, Version: standardAuthoringModelArtifactVersion, Content: string(content),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
-}
-
-func standardAuthoringTaskTOMLWrapperFixture(t *testing.T, content []byte, brief workflowadapter.StandardAuthoringBrief) []byte {
-	t.Helper()
-	encoded, err := json.Marshal(standardAuthoringTaskTOMLArtifact{
-		Format: standardAuthoringTaskTOMLArtifactFormat, Version: standardAuthoringModelArtifactVersion,
-		Metadata: standardAuthoringTaskTOMLArtifactMetadata{TaskType: brief.TaskType, Application: brief.Application, Objective: brief.Objective},
-		TaskTOML: string(content),
 	})
 	if err != nil {
 		t.Fatal(err)
