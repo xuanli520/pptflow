@@ -443,13 +443,10 @@ func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte
 			return fmt.Errorf("read Standard authoring source archive: %w", err)
 		}
 		if header.Typeflag == tar.TypeXGlobalHeader {
-			if !standardAuthoringGitPAXGlobalHeader(header, coordinate.CommitSHA) {
-				return fmt.Errorf("Standard authoring source archive has unsupported PAX metadata")
-			}
 			continue
 		}
-		if !standardAuthoringGitArchiveEntryMetadata(header) {
-			return fmt.Errorf("Standard authoring source archive has unsupported metadata")
+		if !standardAuthoringArchivePath(header.Name) {
+			return fmt.Errorf("Standard authoring source archive has an unsafe path")
 		}
 		name := filepath.FromSlash(header.Name)
 		path := filepath.Join(workspace, name)
@@ -535,13 +532,7 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 			return err
 		}
 		if header.Typeflag == tar.TypeXGlobalHeader {
-			if !standardAuthoringGitPAXGlobalHeader(header, coordinate.CommitSHA) {
-				return fmt.Errorf("Standard authoring source archive has unsupported PAX metadata")
-			}
 			continue
-		}
-		if !standardAuthoringGitArchiveEntryMetadata(header) {
-			return fmt.Errorf("Standard authoring source archive has unsupported metadata")
 		}
 		if !strings.HasPrefix(header.Name, stageprovider.StandardAuthoringCodexRunSourceDirectory+"/") {
 			return fmt.Errorf("Standard authoring source archive has unexpected root")

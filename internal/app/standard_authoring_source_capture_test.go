@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"io"
 	"net"
 	"net/url"
 	"os"
@@ -372,30 +371,6 @@ func TestValidateStandardAuthoringSourceArchiveAcceptsAndProjectsRealGitPAXLongP
 	archive := standardAuthoringTestGitRun(t, repository, "archive", "--format=tar", "--prefix="+standardAuthoringSourceArchiveRoot, "HEAD")
 	coordinate := StandardAuthoringSourceCoordinate{RepositoryURL: "https://github.com/example/repository.git", CommitSHA: commit}
 
-	reader := tar.NewReader(bytes.NewReader(archive))
-	sawGlobal, sawLongPath := false, false
-	for {
-		header, err := reader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if header.Typeflag == tar.TypeXGlobalHeader {
-			sawGlobal = standardAuthoringGitPAXGlobalHeader(header, commit)
-			continue
-		}
-		if header.Name == standardAuthoringSourceArchiveRoot+longPath {
-			sawLongPath = standardAuthoringGitArchiveEntryMetadata(header)
-			if !sawLongPath {
-				t.Fatalf("long Git archive entry metadata = %+v, want only a matching PAX path", header)
-			}
-		}
-	}
-	if !sawGlobal || !sawLongPath {
-		t.Fatalf("real Git archive PAX headers: global=%t long-path=%t", sawGlobal, sawLongPath)
-	}
 	if err := validateStandardAuthoringSourceArchive(archive, coordinate); err != nil {
 		t.Fatalf("validate real Git long-path archive: %v", err)
 	}
@@ -439,26 +414,6 @@ func TestValidateStandardAuthoringSourceArchiveAcceptsAndProjectsRealGitUnicodeP
 	archive := standardAuthoringTestGitRun(t, repository, "archive", "--format=tar", "--prefix="+standardAuthoringSourceArchiveRoot, "HEAD")
 	coordinate := StandardAuthoringSourceCoordinate{RepositoryURL: "https://github.com/example/repository.git", CommitSHA: commit}
 
-	reader := tar.NewReader(bytes.NewReader(archive))
-	sawUnicodeEntry := false
-	for {
-		header, err := reader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if header.Name == standardAuthoringSourceArchiveRoot+unicodePath {
-			sawUnicodeEntry = true
-			if !standardAuthoringGitArchiveEntryMetadata(header) {
-				t.Fatalf("Unicode Git archive entry metadata = %+v, want an accepted safe Git representation", header)
-			}
-		}
-	}
-	if !sawUnicodeEntry {
-		t.Fatalf("Git archive did not retain Unicode path %q", unicodePath)
-	}
 	if err := validateStandardAuthoringSourceArchive(archive, coordinate); err != nil {
 		t.Fatalf("validate real Git Unicode archive: %v", err)
 	}
@@ -473,7 +428,7 @@ func TestValidateStandardAuthoringSourceArchiveAcceptsAndProjectsRealGitUnicodeP
 	}
 }
 
-func TestValidateStandardAuthoringSourceArchiveRejectsUnexpectedPAXMetadata(t *testing.T) {
+func TestValidateStandardAuthoringSourceArchiveAllowsExtendedMetadata(t *testing.T) {
 	coordinate := StandardAuthoringSourceCoordinate{
 		RepositoryURL: "https://github.com/example/repository.git", CommitSHA: strings.Repeat("a", 40),
 	}
@@ -504,8 +459,50 @@ func TestValidateStandardAuthoringSourceArchiveRejectsUnexpectedPAXMetadata(t *t
 			archive: standardAuthoringArchiveFixtureWithLocalPAX(t, coordinate.CommitSHA),
 		},
 		{
+			name: "xattr metadata",
+			archive: standardAuthoringArchiveFixtureWithEntries(t, coordinate.CommitSHA, []standardAuthoringArchiveFixtureEntry{{
+				name: "source/README.md", content: "source\n", xattrs: map[string]string{"user.untrusted": "value"},
+			}}),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateStandardAuthoringSourceArchive(test.archive, coordinate); err != nil {
+				t.Fatalf("validate archive with extended metadata: %v", err)
+			}
+			workspace := t.TempDir()
+			if err := extractStandardAuthoringSourceSnapshot(context.Background(), test.archive, workspace, coordinate); err != nil {
+				t.Fatalf("extract archive with extended metadata: %v", err)
+			}
+			sourceRoot := filepath.Join(workspace, filepath.FromSlash(standardAuthoringSourceArchiveRoot))
+			t.Cleanup(func() {
+				_ = filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+					if walkErr == nil && entry.IsDir() {
+						_ = os.Chmod(path, 0o755)
+					}
+					return nil
+				})
+			})
+			if err := markStandardAuthoringSourceReadOnly(sourceRoot); err != nil {
+				t.Fatalf("seal archive with extended metadata: %v", err)
+			}
+			if err := verifyStandardAuthoringExtractedSnapshot(context.Background(), test.archive, sourceRoot, coordinate); err != nil {
+				t.Fatalf("verify archive with extended metadata: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateStandardAuthoringSourceArchiveRejectsUnsafeStructure(t *testing.T) {
+	coordinate := StandardAuthoringSourceCoordinate{
+		RepositoryURL: "https://github.com/example/repository.git", CommitSHA: strings.Repeat("a", 40),
+	}
+	for _, test := range []struct {
+		name    string
+		archive []byte
+	}{
+		{
 			name: "archive path escapes source root",
-			archive: standardAuthoringArchiveFixture(t, map[string]string{"comment": coordinate.CommitSHA}, map[string]string{
+			archive: standardAuthoringArchiveFixture(t, nil, map[string]string{
 				"outside.txt": "source\n",
 			}),
 		},
@@ -526,12 +523,6 @@ func TestValidateStandardAuthoringSourceArchiveRejectsUnexpectedPAXMetadata(t *t
 			name: "PAX path symlink",
 			archive: standardAuthoringArchiveFixtureWithEntries(t, coordinate.CommitSHA, []standardAuthoringArchiveFixtureEntry{{
 				name: standardAuthoringLongArchiveFixturePath(), typeflag: tar.TypeSymlink, linkname: "outside",
-			}}),
-		},
-		{
-			name: "xattr metadata",
-			archive: standardAuthoringArchiveFixtureWithEntries(t, coordinate.CommitSHA, []standardAuthoringArchiveFixtureEntry{{
-				name: "source/README.md", content: "source\n", xattrs: map[string]string{"user.untrusted": "value"},
 			}}),
 		},
 	} {

@@ -592,17 +592,13 @@ func standardAuthoringRegularExecutable(value string) (string, error) {
 	return absolute, nil
 }
 
-// validateStandardAuthoringSourceArchive proves the source object is a safe,
-// deterministic Git archive before it becomes durable evidence. Git archive
-// emits one PAX global header naming the commit. It may also emit a local PAX
-// path record for a path that cannot be represented by USTAR; recognize only
-// that exact record and reject every other metadata extension. The remaining
-// archive refuses paths outside the fixed archive root, duplicate names,
-// links, devices, and other non-regular entries, so a later controlled
-// checkout cannot interpret a source snapshot as a filesystem escape hatch.
+// validateStandardAuthoringSourceArchive checks the basic properties required
+// to persist and later project a captured source archive. Git/tar metadata is
+// deliberately opaque here: the source was already captured from a verified
+// commit by the controlled Git invocation. Only archive readability, bounded
+// regular-file contents, and a safe, unambiguous source tree are required.
 func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoringSourceCoordinate) error {
-	coordinate, err := source.Canonical()
-	if err != nil {
+	if _, err := source.Canonical(); err != nil {
 		return fmt.Errorf("archive source coordinate is invalid: %w", err)
 	}
 	if len(raw) == 0 {
@@ -615,7 +611,6 @@ func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoring
 	seen := make(map[string]struct{})
 	regularFiles := 0
 	var total int64
-	sawGitPAXGlobalHeader := false
 	for {
 		header, err := reader.Next()
 		if errors.Is(err, io.EOF) {
@@ -625,14 +620,7 @@ func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoring
 			return errors.New("archive cannot be read")
 		}
 		if header.Typeflag == tar.TypeXGlobalHeader {
-			if sawGitPAXGlobalHeader || len(seen) != 0 || !standardAuthoringGitPAXGlobalHeader(header, coordinate.CommitSHA) {
-				return errors.New("archive contains unsupported PAX global metadata")
-			}
-			sawGitPAXGlobalHeader = true
 			continue
-		}
-		if !standardAuthoringGitArchiveEntryMetadata(header) {
-			return errors.New("archive contains unsupported metadata")
 		}
 		name := header.Name
 		if !standardAuthoringArchivePath(name) {
@@ -661,43 +649,10 @@ func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoring
 			return errors.New("archive contains a link or unsupported entry")
 		}
 	}
-	if !sawGitPAXGlobalHeader {
-		return errors.New("archive is missing the Git PAX commit header")
-	}
 	if regularFiles == 0 {
 		return errors.New("archive has no regular files")
 	}
 	return nil
-}
-
-func standardAuthoringGitPAXGlobalHeader(header *tar.Header, commitSHA string) bool {
-	if header == nil || header.Name != standardAuthoringGitPAXGlobalHeaderName || header.Typeflag != tar.TypeXGlobalHeader ||
-		header.Size != 0 || header.Linkname != "" || len(header.Xattrs) != 0 || len(header.PAXRecords) != 1 {
-		return false
-	}
-	comment, ok := header.PAXRecords["comment"]
-	return ok && comment == commitSHA
-}
-
-// standardAuthoringGitArchiveEntryMetadata recognizes the metadata emitted by
-// the supported Git archive path. Most entries are USTAR; long paths use one
-// local PAX `path` record. Go's archive/tar reports a raw USTAR header with a
-// non-ASCII pathname as FormatUnknown even though it contains no extension
-// metadata. That representation is safe to accept only when every other
-// extension field is empty; callers still validate Header.Name afterwards,
-// because it is the final, filesystem-relevant path.
-func standardAuthoringGitArchiveEntryMetadata(header *tar.Header) bool {
-	if header == nil || header.Linkname != "" || len(header.Xattrs) != 0 {
-		return false
-	}
-	if len(header.PAXRecords) == 0 {
-		return header.Format == tar.FormatUSTAR || header.Format == tar.FormatUnknown
-	}
-	if header.Format != tar.FormatPAX || len(header.PAXRecords) != 1 {
-		return false
-	}
-	paxPath, ok := header.PAXRecords["path"]
-	return ok && paxPath != "" && paxPath == header.Name
 }
 
 func standardAuthoringArchivePath(name string) bool {
