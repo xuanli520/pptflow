@@ -59,21 +59,24 @@ canonicalizes it before producing a `StageExecutionResult`. A passing submit
 is the only output authority. Final assistant text is deliberately ignored
 and cannot overwrite an accepted artifact.
 
-### Task proposal shape
+### Structured planning shape
 
-The `task_design` prompt supplies the exact, closed shape of its
-`task_proposal` artifact. It contains only `format`, `version`,
+The `task_design` and `generate_task_files` prompts supply the exact, closed
+shape of their `task_proposal` and `generated_task_files` artifacts. They
+contain only `format`, `version`,
 `contract_claims`, `requirements`, `source_paths`, `packages`, and `commands`.
 `contract_claims` is a flat object with `title`, `slug`, `repository_url`,
 `commit_sha`, `base_image`, `code_lang`, `task_type`, `application`,
 `is_0_to_1`, and `source_root`. Each requirement is `{id, text}`, each package
 is `{manifest_path}`, and each command is `{working_directory, argv}`.
 
-Nested descriptive structures such as `task`, `source`, `environment`, scope,
-or acceptance-criteria objects are not part of this artifact and are rejected
-as unknown fields. The host still checks every claimed contract value and every
-repository-relative path against the frozen source; publishing the shape does
-not relax those checks.
+`task_proposal` uses `harbor.standard-authoring-task-proposal.v2` and
+`generated_task_files` uses `harbor.standard-authoring-generated-task-plan.v2`;
+both use version `2`. Nested descriptive structures such as `task`, `source`,
+`environment`, scope, or acceptance-criteria objects are not part of either
+artifact and are rejected as unknown fields. The host still checks every
+claimed contract value and every repository-relative path against the frozen
+source; publishing the shape does not relax those checks.
 
 ### Task TOML shape
 
