@@ -14,6 +14,12 @@ repository identity, source commit, source root, and base image. The matching
 artifacts, review feedback, and model output are untrusted data claims; they
 cannot override the root contract.
 
+`repo_prepare` also receives this required root-contract binding. It accepts
+exactly the frozen binding for the active AuthoringSession (port name, artifact
+ID, digest, and schema must match) and rejects missing, duplicate, or other
+stage inputs. The Git source itself is still read only from the immutable
+AuthoringSource snapshot, never from a caller-provided input.
+
 The source checkout is captured before execution and remains immutable. Codex
 may inspect only `source/`. It may not use raw sessions, credentials, archives,
 memory, unbounded logs, network access, or ambient host configuration. Claims

@@ -36,7 +36,7 @@ func TestStandardAuthoringRepoPrepareExecutesLockedGitAndMaterializesFrozenRunSo
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, task, session, run, attempt := standardAuthoringRepoPrepareFixture(t, ctx, database, object)
+	source, task, session, run, attempt, contract := standardAuthoringRepoPrepareFixture(t, ctx, database, objects, object)
 	lockedGit := standardAuthoringRepoPrepareLockedGit(t)
 	workspaceRoot, err := StandardAuthoringCodexWorkspaceRoot(root)
 	if err != nil {
@@ -57,7 +57,7 @@ func TestStandardAuthoringRepoPrepareExecutesLockedGitAndMaterializesFrozenRunSo
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := standardAuthoringRepoPrepareRequest(run, source, session, attempt)
+	request := standardAuthoringRepoPrepareRequest(run, source, session, attempt, contract)
 	invocation := stageprovider.StageOperationInvocation{
 		Request: request,
 		Resolution: workflowadapter.StageOperationResolution{
@@ -66,6 +66,13 @@ func TestStandardAuthoringRepoPrepareExecutesLockedGitAndMaterializesFrozenRunSo
 				CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, Arguments: []string{},
 			}},
 		},
+	}
+	missingContract := invocation
+	missingContract.Request.Inputs = nil
+	if _, err := executor.ExecuteLocalCommand(ctx, missingContract, workflowadapter.LocalCommandOperationPayload{
+		CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, Arguments: []string{},
+	}); err == nil || !strings.Contains(err.Error(), "frozen root contract") {
+		t.Fatalf("repo_prepare without its frozen root contract error = %v", err)
 	}
 	result, err := executor.ExecuteLocalCommand(ctx, invocation, workflowadapter.LocalCommandOperationPayload{
 		CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, Arguments: []string{},
@@ -290,7 +297,7 @@ func TestVerifyStandardAuthoringExtractedSnapshotRejectsPathTypeModeAndContentDr
 	}
 }
 
-func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, database *store.Store, object workflowruntime.ObjectRef) (store.AuthoringSource, store.TaskV2, store.AuthoringSession, store.WorkflowRun, store.StageAttempt) {
+func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, database *store.Store, objects *workflowruntime.ArtifactObjectStore, object workflowruntime.ObjectRef) (store.AuthoringSource, store.TaskV2, store.AuthoringSession, store.WorkflowRun, store.StageAttempt, standardAuthoringContractInput) {
 	t.Helper()
 	source, err := database.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
 		RepositoryURL: standardAuthoringLaunchTestCoordinate.RepositoryURL, CommitSHA: standardAuthoringLaunchTestCoordinate.CommitSHA,
@@ -307,9 +314,47 @@ func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, data
 	if err != nil {
 		t.Fatal(err)
 	}
+	sessionID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileFingerprint := workflowkit.SHA256Fingerprint([]byte("repo-prepare-profile"))
+	frozenContract, err := workflowadapter.NewAuthoringContract(
+		workflowadapter.AuthoringContractTask{
+			ID: task.ID, Slug: task.Slug, Title: task.Title, CodeLang: "rust", TaskType: standardAuthoringLaunchTestTaskType,
+			Application: standardAuthoringLaunchTestApplication,
+		},
+		workflowadapter.AuthoringContractSource{
+			RepositoryURL: source.RepositoryURL, CommitSHA: source.CommitSHA, SnapshotDigest: source.SnapshotContentDigest, CheckoutRoot: "source",
+		},
+		standardAuthoringLaunchTestBaseImage, standardAuthoringLaunchTestObjective, string(profileFingerprint),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := newStandardAuthoringContractInput(contractID, frozenContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedContract, err := objects.PutBytes(ctx, contract.CanonicalJSON)
+	if err != nil || storedContract.Digest != contract.ContentDigest || storedContract.SizeBytes != int64(len(contract.CanonicalJSON)) {
+		t.Fatalf("store repo_prepare contract = %+v, %v", storedContract, err)
+	}
+	sessionManifest, err := json.Marshal(standardAuthoringSessionManifest{
+		Format: standardAuthoringLaunchSessionManifestFormat, Version: standardAuthoringLaunchSessionManifestVersion,
+		SourceID: source.ID, AuthoringSessionID: sessionID, TargetTaskID: task.ID,
+		ContractArtifactID: string(contract.ArtifactID), ContractDigest: contract.ContentDigest, ContractSizeBytes: int64(len(contract.CanonicalJSON)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	session, err := database.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
-		SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
-		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version, SessionManifestJSON: `{"format":"fixture"}`,
+		ID: sessionID, SourceID: source.ID, TargetTaskID: task.ID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
+		WorkflowTemplateVersion: workflowadapter.StandardAuthoringCurrentTemplateReference().Version, SessionManifestJSON: string(sessionManifest),
 		IdempotencyKey: "repo-prepare-session", Actor: "author", Reason: "freeze source session",
 	})
 	if err != nil {
@@ -344,17 +389,19 @@ func standardAuthoringRepoPrepareFixture(t *testing.T, ctx context.Context, data
 	if err != nil {
 		t.Fatal(err)
 	}
-	return source, task, session, run, attempt
+	return source, task, session, run, attempt, contract
 }
 
-func standardAuthoringRepoPrepareRequest(run store.WorkflowRun, source store.AuthoringSource, session store.AuthoringSession, attempt store.StageAttempt) workflowkit.StageExecutionRequest {
+func standardAuthoringRepoPrepareRequest(run store.WorkflowRun, source store.AuthoringSource, session store.AuthoringSession, attempt store.StageAttempt, contract standardAuthoringContractInput) workflowkit.StageExecutionRequest {
 	return workflowkit.StageExecutionRequest{
 		Execution: workflowkit.FrozenExecution{ID: run.ID, Subject: workflowkit.SubjectBinding{SubjectID: source.ID, RevisionID: session.ID, Digest: workflowkit.SubjectDigest(source.SnapshotContentDigest)}},
 		Claim:     workflowkit.JobClaim{Stage: &workflowkit.StageClaim{StageAttempt: workflowkit.AttemptIdentity{ID: workflowkit.AttemptID(attempt.ID)}}},
 		Stage: workflowkit.StageDescriptor{
 			Key: workflowkit.StageKey(workflowadapter.RepoPrepare), Plugin: workflowkit.PluginBinding{ID: "harborfactory.repo_prepare", Version: "1.0.0"},
+			Inputs:  []workflowkit.ArtifactSpec{{Name: workflowadapter.AuthoringContractArtifact, SchemaVersion: workflowadapter.AuthoringContractSchemaVersion, Required: true}},
 			Outputs: []workflowkit.ArtifactSpec{{Name: "repo_prepared", SchemaVersion: "harbor.artifact.v1", Required: true}},
 		},
+		Inputs: []workflowkit.ArtifactBinding{contract.artifactBinding()},
 	}
 }
 

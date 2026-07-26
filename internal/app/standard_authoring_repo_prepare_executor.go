@@ -156,6 +156,10 @@ func (executor *StandardAuthoringRepoPrepareExecutor) ExecuteLocalCommand(ctx co
 	if !subject.isAuthoringSession() || request.Execution.Subject != subject.Binding {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring repo_prepare Run has an invalid source/session subject")
 	}
+	contract, err := standardAuthoringContractInputFromSession(ctx, executor.core.objects, *subject.AuthoringSession)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, fmt.Errorf("load Standard authoring repo_prepare root contract: %w", err)
+	}
 	attempt, err := executor.core.store.GetStageAttempt(ctx, string(request.Claim.Stage.StageAttempt.ID))
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
@@ -163,8 +167,8 @@ func (executor *StandardAuthoringRepoPrepareExecutor) ExecuteLocalCommand(ctx co
 	if attempt == nil || attempt.RunID != run.ID || attempt.StageKey != workflowadapter.RepoPrepare || attempt.ExecutionStatus != store.StageExecutionRunning {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring repo_prepare stage attempt is not active")
 	}
-	if len(request.Inputs) != 0 {
-		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring repo_prepare cannot accept caller stage inputs")
+	if err := validateStandardAuthoringRepoPrepareContractInput(request, contract); err != nil {
+		return workflowkit.StageExecutionResult{}, err
 	}
 
 	snapshot, err := executor.readFrozenAuthoringSource(ctx, *run, subject)
@@ -186,6 +190,22 @@ func (executor *StandardAuthoringRepoPrepareExecutor) ExecuteLocalCommand(ctx co
 		Outcome:   workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: workflowkit.VerdictPass},
 		Artifacts: []workflowkit.StageArtifact{{Name: "repo_prepared", SchemaVersion: "harbor.artifact.v1", Content: evidence}},
 	}, nil
+}
+
+// validateStandardAuthoringRepoPrepareContractInput keeps repo_prepare in the
+// v2 root-contract graph without allowing a caller-selected source input.
+func validateStandardAuthoringRepoPrepareContractInput(request workflowkit.StageExecutionRequest, contract standardAuthoringContractInput) error {
+	expectedSpec := workflowkit.ArtifactSpec{
+		Name: workflowadapter.AuthoringContractArtifact, SchemaVersion: workflowadapter.AuthoringContractSchemaVersion, Required: true,
+	}
+	if len(request.Stage.Inputs) != 1 || request.Stage.Inputs[0] != expectedSpec {
+		return fmt.Errorf("Standard authoring repo_prepare stage must require exactly the frozen root contract")
+	}
+	expectedBinding := contract.artifactBinding()
+	if len(request.Inputs) != 1 || request.Inputs[0] != expectedBinding {
+		return fmt.Errorf("Standard authoring repo_prepare requires exactly its frozen root contract input")
+	}
+	return nil
 }
 
 func (executor *StandardAuthoringRepoPrepareExecutor) readFrozenAuthoringSource(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject) ([]byte, error) {
