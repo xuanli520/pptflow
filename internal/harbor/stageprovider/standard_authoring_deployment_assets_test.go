@@ -117,6 +117,23 @@ func TestStandardAuthoringV2DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 				}
 			}
 		}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskTOMLGen) {
+			for promptIndex, prompt := range program.TurnPrompts {
+				for _, required := range []string{
+					"Produce one raw Harbor TaskConfig task.toml",
+					`name = "harbor/slug" (replace slug with the contract slug)`,
+					"[metadata] with code_lang, task_type, application, and is_0_to_1 exactly copied from context.contract.content",
+					`network_mode = "no-network"`,
+					`workdir = "/workspace/source"`,
+					"[verifier] with a positive timeout_sec",
+					"Do not add [verification] or environment.dockerfile",
+				} {
+					if !strings.Contains(prompt, required) {
+						t.Fatalf("task-toml prompt turn %d omits required TaskConfig shape %q", promptIndex+1, required)
+					}
+				}
+			}
+		}
 
 		schemaRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
 		if err != nil {

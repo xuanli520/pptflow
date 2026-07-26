@@ -75,6 +75,18 @@ as unknown fields. The host still checks every claimed contract value and every
 repository-relative path against the frozen source; publishing the shape does
 not relax those checks.
 
+### Task TOML shape
+
+The `task_toml_generate` prompt supplies the minimum Harbor TaskConfig shape
+accepted by the submission authority. The raw TOML must include `[task]` with
+a valid `harbor/<slug>` name and description, `[metadata]` with the exact
+contract `code_lang`, `task_type`, `application`, and `is_0_to_1` values,
+`[environment]` with a positive build timeout, `network_mode = "no-network"`,
+and `workdir = "/workspace/source"`, plus `[verifier]` with a positive
+timeout. It must not use the ignored `[verification]` table or an
+`environment.dockerfile` field. The host later canonicalizes frozen source
+provenance; publishing this minimum shape does not relax validation.
+
 `agent_turn` and `output_submission` are independently charged quota
 dimensions. The current Standard-authoring policy reserves three
 `output_submission` attempts for each agent stage, while its frozen turn
