@@ -519,18 +519,55 @@ func TestValidateStandardAuthoringSourceArchiveRejectsUnsafeStructure(t *testing
 				{name: standardAuthoringLongArchiveFixturePath(), content: "second\n"},
 			}),
 		},
-		{
-			name: "PAX path symlink",
-			archive: standardAuthoringArchiveFixtureWithEntries(t, coordinate.CommitSHA, []standardAuthoringArchiveFixtureEntry{{
-				name: standardAuthoringLongArchiveFixturePath(), typeflag: tar.TypeSymlink, linkname: "outside",
-			}}),
-		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := validateStandardAuthoringSourceArchive(test.archive, coordinate); err == nil {
 				t.Fatal("archive validation unexpectedly succeeded")
 			}
 		})
+	}
+}
+
+func TestStandardAuthoringSourceArchiveProjectsRepositoryLinks(t *testing.T) {
+	coordinate := StandardAuthoringSourceCoordinate{
+		RepositoryURL: "https://github.com/example/repository.git", CommitSHA: strings.Repeat("a", 40),
+	}
+	archive := standardAuthoringArchiveFixtureWithEntries(t, coordinate.CommitSHA, []standardAuthoringArchiveFixtureEntry{
+		{name: "source/README.md", content: "source\n"},
+		{name: "source/README-link", typeflag: tar.TypeSymlink, linkname: "README.md"},
+		{name: "source/README-copy", typeflag: tar.TypeLink, linkname: "source/README.md"},
+	})
+	if err := validateStandardAuthoringSourceArchive(archive, coordinate); err != nil {
+		t.Fatalf("validate archive with repository links: %v", err)
+	}
+	workspace := t.TempDir()
+	if err := extractStandardAuthoringSourceSnapshot(context.Background(), archive, workspace, coordinate); err != nil {
+		t.Fatalf("extract archive with repository links: %v", err)
+	}
+	sourceRoot := filepath.Join(workspace, filepath.FromSlash(standardAuthoringSourceArchiveRoot))
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o755)
+			}
+			return nil
+		})
+	})
+	if target, err := os.Readlink(filepath.Join(sourceRoot, "README-link")); err != nil || target != "README.md" {
+		t.Fatalf("repository symbolic link = %q, %v", target, err)
+	}
+	if err := markStandardAuthoringSourceReadOnly(sourceRoot); err != nil {
+		t.Fatalf("seal archive with repository links: %v", err)
+	}
+	if err := verifyStandardAuthoringExtractedSnapshot(context.Background(), archive, sourceRoot, coordinate); err != nil {
+		t.Fatalf("verify archive with repository links: %v", err)
+	}
+	unsafeArchive := standardAuthoringArchiveFixtureWithEntries(t, coordinate.CommitSHA, []standardAuthoringArchiveFixtureEntry{
+		{name: "source/README.md", content: "source\n"},
+		{name: "source/link", typeflag: tar.TypeSymlink, linkname: "../../outside"},
+	})
+	if err := extractStandardAuthoringSourceSnapshot(context.Background(), unsafeArchive, t.TempDir(), coordinate); err == nil {
+		t.Fatal("source-root escaping symbolic link was projected")
 	}
 }
 

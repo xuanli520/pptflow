@@ -478,8 +478,34 @@ func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte
 			if closeErr != nil {
 				return fmt.Errorf("close Standard authoring source file: %w", closeErr)
 			}
+		case tar.TypeSymlink:
+			if !standardAuthoringArchiveSymlinkTarget(header.Name, header.Linkname) {
+				return fmt.Errorf("Standard authoring source archive has an unsafe symbolic link")
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return fmt.Errorf("create Standard authoring source parent: %w", err)
+			}
+			if err := os.Symlink(header.Linkname, path); err != nil {
+				return fmt.Errorf("create Standard authoring source symbolic link: %w", err)
+			}
+		case tar.TypeLink:
+			if !standardAuthoringArchiveHardLinkTarget(header.Linkname) {
+				return fmt.Errorf("Standard authoring source archive has an unsafe hard link")
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return fmt.Errorf("create Standard authoring source parent: %w", err)
+			}
+			target := filepath.Join(workspace, filepath.FromSlash(header.Linkname))
+			if !standardAuthoringWorkspacePathWithin(workspace, target) {
+				return fmt.Errorf("Standard authoring source archive hard link escapes workspace")
+			}
+			if err := os.Link(target, path); err != nil {
+				return fmt.Errorf("create Standard authoring source hard link: %w", err)
+			}
 		default:
-			return fmt.Errorf("Standard authoring source archive has unsupported entry")
+			// Git repositories do not use device or FIFO entries. Preserve the
+			// archive but omit an entry the filesystem cannot project safely.
+			continue
 		}
 	}
 	return nil
@@ -492,6 +518,8 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 	type expectedEntry struct {
 		directory bool
 		contents  []byte
+		symlink   string
+		hardLink  string
 	}
 	expected := map[string]expectedEntry{".": {directory: true}}
 	addDirectory := func(name string) error {
@@ -561,8 +589,30 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 				return fmt.Errorf("read Standard authoring source archive entry")
 			}
 			expected[relative] = expectedEntry{contents: contents}
+		case tar.TypeSymlink:
+			if relative == "" || !standardAuthoringArchiveSymlinkTarget(header.Name, header.Linkname) {
+				return fmt.Errorf("Standard authoring source archive has an unsafe symbolic link")
+			}
+			if err := addParents(relative); err != nil {
+				return err
+			}
+			if _, found := expected[relative]; found {
+				return fmt.Errorf("Standard authoring source archive has conflicting paths")
+			}
+			expected[relative] = expectedEntry{symlink: header.Linkname}
+		case tar.TypeLink:
+			if relative == "" || !standardAuthoringArchiveHardLinkTarget(header.Linkname) {
+				return fmt.Errorf("Standard authoring source archive has an unsafe hard link")
+			}
+			if err := addParents(relative); err != nil {
+				return err
+			}
+			if _, found := expected[relative]; found {
+				return fmt.Errorf("Standard authoring source archive has conflicting paths")
+			}
+			expected[relative] = expectedEntry{hardLink: strings.TrimPrefix(header.Linkname, stageprovider.StandardAuthoringCodexRunSourceDirectory+"/")}
 		default:
-			return fmt.Errorf("Standard authoring source archive has unsupported entry")
+			continue
 		}
 	}
 	rootInfo, err := os.Lstat(sourceRoot)
@@ -583,7 +633,7 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 			return err
 		}
 		info, err := root.Lstat(name)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil {
 			return fmt.Errorf("unsafe Standard authoring source workspace entry")
 		}
 		wanted, found := expected[name]
@@ -594,12 +644,25 @@ func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []by
 			if !info.IsDir() || info.Mode().Perm() != 0o555 {
 				return fmt.Errorf("Standard authoring source workspace directory identity changed")
 			}
+		} else if wanted.symlink != "" {
+			if info.Mode()&os.ModeSymlink == 0 {
+				return fmt.Errorf("Standard authoring source workspace symbolic link identity changed")
+			}
+			target, err := root.Readlink(name)
+			if err != nil || target != wanted.symlink {
+				return fmt.Errorf("Standard authoring source workspace symbolic link target changed")
+			}
 		} else {
 			if !info.Mode().IsRegular() || info.Mode().Perm() != 0o444 {
 				return fmt.Errorf("Standard authoring source workspace file identity changed")
 			}
 			contents, err := root.ReadFile(name)
-			if err != nil || !bytes.Equal(contents, wanted.contents) {
+			if wanted.hardLink != "" {
+				targetContents, targetErr := root.ReadFile(wanted.hardLink)
+				if targetErr != nil || !bytes.Equal(contents, targetContents) {
+					return fmt.Errorf("Standard authoring source workspace hard link target changed")
+				}
+			} else if err != nil || !bytes.Equal(contents, wanted.contents) {
 				return fmt.Errorf("Standard authoring source workspace content changed")
 			}
 		}
@@ -623,8 +686,11 @@ func markStandardAuthoringSourceReadOnly(root string) error {
 			return walkErr
 		}
 		info, err := entry.Info()
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil {
 			return fmt.Errorf("unsafe Standard authoring source workspace entry")
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
 		}
 		if entry.IsDir() {
 			return os.Chmod(path, 0o555)

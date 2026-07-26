@@ -23,10 +23,32 @@ type TaskSubmitMsg struct {
 	Reason      string
 }
 
+// TaskConfigLoadRequestMsg asks the application model to read a task config
+// without coupling the form to filesystem access.
+type TaskConfigLoadRequestMsg struct {
+	Path string
+}
+
+// TaskConfigLoadedMsg returns a parsed config to the form. File reads run in
+// a Bubble Tea command so the terminal stays responsive.
+type TaskConfigLoadedMsg struct {
+	Path   string
+	Config taskInputConfig
+	Err    error
+}
+
+type taskInputMode uint8
+
+const (
+	taskInputEdit taskInputMode = iota
+	taskInputLoadConfig
+)
+
 // TaskInputModel collects the caller-selected immutable source coordinate and
 // task identity and environment required by the Standard authoring lifecycle
 // command.
 type TaskInputModel struct {
+	configPathInput  textinput.Model
 	repoInput        textinput.Model
 	commitInput      textinput.Model
 	baseImageInput   textinput.Model
@@ -40,10 +62,18 @@ type TaskInputModel struct {
 	reasonInput      textinput.Model
 	focusIndex       int
 	visible          bool
+	mode             taskInputMode
+	loadingConfig    bool
 	validationErr    string
 }
 
 func NewTaskInputModel() TaskInputModel {
+	configPath := textinput.New()
+	configPath.Prompt = "Config file "
+	configPath.Placeholder = "/path/to/task.json"
+	configPath.CharLimit = 1024
+	configPath.Width = 64
+
 	repo := textinput.New()
 	repo.Prompt = "URL "
 	repo.Placeholder = "https://github.com/owner/repo"
@@ -105,6 +135,7 @@ func NewTaskInputModel() TaskInputModel {
 	reason.Width = 44
 
 	return TaskInputModel{
+		configPathInput:  configPath,
 		repoInput:        repo,
 		commitInput:      commit,
 		baseImageInput:   baseImage,
@@ -120,7 +151,10 @@ func NewTaskInputModel() TaskInputModel {
 
 func (m *TaskInputModel) Show() {
 	m.visible = true
+	m.mode = taskInputEdit
+	m.loadingConfig = false
 	m.validationErr = ""
+	m.configPathInput.Blur()
 	m.repoInput.Focus()
 	m.focusIndex = 0
 	m.commitInput.Blur()
@@ -134,8 +168,60 @@ func (m *TaskInputModel) Show() {
 	m.reasonInput.Blur()
 }
 
+// BeginConfigLoad opens the file chooser state. Existing form values remain
+// untouched until a complete, valid configuration is loaded.
+func (m *TaskInputModel) BeginConfigLoad() {
+	m.visible = true
+	m.mode = taskInputLoadConfig
+	m.loadingConfig = false
+	m.validationErr = ""
+	m.configPathInput.Focus()
+	m.repoInput.Blur()
+	m.commitInput.Blur()
+	m.baseImageInput.Blur()
+	m.slugInput.Blur()
+	m.titleInput.Blur()
+	m.taskTypeInput.Blur()
+	m.applicationInput.Blur()
+	m.codeLangInput.Blur()
+	m.objectiveInput.Blur()
+	m.reasonInput.Blur()
+}
+
+// ApplyConfig switches from the loading state to the editable form.
+func (m *TaskInputModel) ApplyConfig(config taskInputConfig) {
+	m.repoInput.SetValue(config.RepositoryURL)
+	m.commitInput.SetValue(config.CommitSHA)
+	m.baseImageInput.SetValue(config.BaseImage)
+	m.slugInput.SetValue(config.Slug)
+	m.titleInput.SetValue(config.Title)
+	m.taskTypeInput.SetValue(config.TaskType)
+	m.applicationInput.SetValue(config.Application)
+	m.codeLangInput.SetValue(config.CodeLanguage)
+	m.is0To1 = config.Is0To1
+	m.objectiveInput.SetValue(config.Objective)
+	m.reasonInput.SetValue(config.Reason)
+	m.mode = taskInputEdit
+	m.loadingConfig = false
+	m.validationErr = ""
+	m.configPathInput.Blur()
+	m.repoInput.Focus()
+	m.focusIndex = 0
+}
+
+func (m *TaskInputModel) SetConfigLoadError(err error) {
+	m.loadingConfig = false
+	if err == nil {
+		m.validationErr = ""
+		return
+	}
+	m.validationErr = "加载配置失败: " + err.Error()
+}
+
 func (m *TaskInputModel) Hide() {
 	m.visible = false
+	m.loadingConfig = false
+	m.configPathInput.Blur()
 	m.repoInput.Blur()
 	m.commitInput.Blur()
 	m.baseImageInput.Blur()
@@ -202,6 +288,7 @@ func (m *TaskInputModel) toggleFocus() {
 // Reset clears a successfully submitted form. A failed submission retains all
 // inputs so retrying does not manufacture a second user command.
 func (m *TaskInputModel) Reset() {
+	m.configPathInput.SetValue("")
 	m.repoInput.SetValue("")
 	m.commitInput.SetValue("")
 	m.baseImageInput.SetValue("")
@@ -223,6 +310,11 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
+		if m.mode == taskInputLoadConfig {
+			var command tea.Cmd
+			m.configPathInput, command = m.configPathInput.Update(msg)
+			return command, false
+		}
 		// Forward non-key messages to every input for cursor blink events.
 		var repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, codeLangCmd, objectiveCmd, reasonCmd tea.Cmd
 		m.repoInput, repoCmd = m.repoInput.Update(msg)
@@ -236,6 +328,28 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 		m.objectiveInput, objectiveCmd = m.objectiveInput.Update(msg)
 		m.reasonInput, reasonCmd = m.reasonInput.Update(msg)
 		return tea.Batch(repoCmd, commitCmd, baseImageCmd, slugCmd, titleCmd, taskTypeCmd, applicationCmd, codeLangCmd, objectiveCmd, reasonCmd), false
+	}
+	if m.mode == taskInputLoadConfig {
+		switch keyMsg.String() {
+		case "enter":
+			path := strings.TrimSpace(m.configPathInput.Value())
+			if path == "" {
+				m.validationErr = "配置文件路径不能为空"
+				return nil, true
+			}
+			if m.loadingConfig {
+				return nil, true
+			}
+			m.loadingConfig = true
+			m.validationErr = ""
+			return func() tea.Msg { return TaskConfigLoadRequestMsg{Path: path} }, true
+		case "esc":
+			m.Hide()
+			return nil, true
+		}
+		var command tea.Cmd
+		m.configPathInput, command = m.configPathInput.Update(msg)
+		return command, true
 	}
 	if keyMsg.String() == " " && m.focusIndex == 8 {
 		m.is0To1 = !m.is0To1
@@ -308,6 +422,16 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 func (m TaskInputModel) View(width int) string {
 	if !m.visible {
 		return ""
+	}
+	if m.mode == taskInputLoadConfig {
+		content := "从配置文件加载新题\n" + m.configPathInput.View()
+		if m.loadingConfig {
+			content += "\n正在加载配置..."
+		}
+		if m.validationErr != "" {
+			content += "\n" + failStyleV2.Render(m.validationErr)
+		}
+		return inputStyle.Width(max(1, width-inputStyle.GetHorizontalFrameSize())).Render(content)
 	}
 	content := m.repoInput.View() + "  " + m.commitInput.View() + "\n" +
 		m.baseImageInput.View() + "\n" +

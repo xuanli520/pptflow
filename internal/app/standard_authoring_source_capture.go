@@ -592,11 +592,12 @@ func standardAuthoringRegularExecutable(value string) (string, error) {
 	return absolute, nil
 }
 
-// validateStandardAuthoringSourceArchive checks the basic properties required
-// to persist and later project a captured source archive. Git/tar metadata is
-// deliberately opaque here: the source was already captured from a verified
-// commit by the controlled Git invocation. Only archive readability, bounded
-// regular-file contents, and a safe, unambiguous source tree are required.
+// validateStandardAuthoringSourceArchive checks only the structural properties
+// required to retain a Git-produced archive. The source was already captured
+// from a verified commit by the controlled Git invocation, so archive metadata
+// and entry types are deliberately opaque at this boundary. Workspace
+// projection handles Git's regular files and links; unfamiliar tar entry types
+// are retained without blocking task creation.
 func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoringSourceCoordinate) error {
 	if _, err := source.Canonical(); err != nil {
 		return fmt.Errorf("archive source coordinate is invalid: %w", err)
@@ -630,11 +631,10 @@ func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoring
 			return errors.New("archive contains a duplicate path")
 		}
 		seen[name] = struct{}{}
+		if header.Size < 0 {
+			return errors.New("archive entry has an invalid size")
+		}
 		switch header.Typeflag {
-		case tar.TypeDir:
-			if header.Size != 0 {
-				return errors.New("archive directory has content")
-			}
 		case tar.TypeReg, tar.TypeRegA:
 			if header.Size < 0 || header.Size > standardAuthoringSourceArchiveMaxBytes-total {
 				return errStandardAuthoringSourceArchiveTooLarge
@@ -646,13 +646,29 @@ func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoring
 			total += copied
 			regularFiles++
 		default:
-			return errors.New("archive contains a link or unsupported entry")
+			if _, err := io.Copy(io.Discard, reader); err != nil {
+				return errors.New("archive entry cannot be read")
+			}
 		}
 	}
 	if regularFiles == 0 {
 		return errors.New("archive has no regular files")
 	}
 	return nil
+}
+
+// standardAuthoringArchiveSymlinkTarget permits a relative link only when its
+// lexical destination remains inside the archive root. The target may be
+// dangling because that is a valid Git source-tree state.
+func standardAuthoringArchiveSymlinkTarget(name, target string) bool {
+	if target == "" || strings.Contains(target, "\\") || strings.HasPrefix(target, "/") || strings.ContainsRune(target, '\x00') {
+		return false
+	}
+	return standardAuthoringArchivePath(path.Clean(path.Join(path.Dir(name), target)))
+}
+
+func standardAuthoringArchiveHardLinkTarget(target string) bool {
+	return standardAuthoringArchivePath(target)
 }
 
 func standardAuthoringArchivePath(name string) bool {

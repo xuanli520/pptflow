@@ -365,6 +365,19 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case TaskSubmitMsg:
 		return m.beginAuthoring(msg, inputCmd)
 
+	case TaskConfigLoadRequestMsg:
+		return m, tea.Batch(inputCmd, m.loadTaskConfig(msg.Path))
+
+	case TaskConfigLoadedMsg:
+		if msg.Err != nil {
+			m.input.SetConfigLoadError(msg.Err)
+			return m, inputCmd
+		}
+		m.input.ApplyConfig(msg.Config)
+		m.err = nil
+		m.notice = "配置已加载，可在提交前修改"
+		return m, tea.Batch(inputCmd, textinput.Blink)
+
 	case tickMsg:
 		if m.exitInFlight || m.mutationInFlight() {
 			return m, tea.Batch(inputCmd, m.pollTick())
@@ -594,7 +607,7 @@ func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cm
 			m.notice = "正在刷新任务状态"
 			return m, inputCmd
 		}
-		m.input.Show()
+		m.input.BeginConfigLoad()
 		return m, textinput.Blink
 
 	case "tab":
@@ -909,6 +922,13 @@ func (m appModel) startAuthoring(pending pendingTaskBoardStart) tea.Cmd {
 			Reason:         pending.message.Reason,
 		})
 		return taskBoardMutationMsg{kind: taskBoardStartMutation, mutation: mutation, err: err}
+	}
+}
+
+func (m appModel) loadTaskConfig(path string) tea.Cmd {
+	return func() tea.Msg {
+		config, err := readTaskInputConfigFile(path)
+		return TaskConfigLoadedMsg{Path: path, Config: config, Err: err}
 	}
 }
 
@@ -1287,7 +1307,7 @@ func (m appModel) View() string {
 	}
 	footer := "[tab] 切换面板  [hjkl/↑↓←→] 导航  [d] 详情  [q] 退出"
 	if m.authoringAvailable {
-		footer = "[n] 新任务  " + footer
+		footer = "[n] 从配置新建  " + footer
 	}
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
 		headerStyle.Width(contentWidth).Render("Harbor Task Factory"),

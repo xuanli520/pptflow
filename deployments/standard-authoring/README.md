@@ -21,6 +21,21 @@ about source paths, package manifests, command working directories, and
 slash-containing command arguments are checked against the verified frozen
 source tree.
 
+### Source archive compatibility
+
+Source capture performs only basic tar validation: the archive must be
+readable, remain within the `source/` root, avoid duplicate paths, contain at
+least one regular file, and remain within the fixed archive-size limit. It does
+not maintain a metadata or entry-type whitelist. Git-produced extended
+metadata, symbolic links, and hard links do not block task creation.
+
+During workspace preparation, relative links are projected only when their
+lexical targets remain inside `source/`; this preserves normal repository link
+semantics without allowing a workspace path to escape its frozen source root.
+Tar entry kinds without a safe filesystem projection are retained in the
+captured archive but omitted from the workspace rather than rejecting the
+creation request.
+
 `task_design` emits `harbor.standard-authoring-task-proposal.v2` and
 `generate_task_files` emits
 `harbor.standard-authoring-generated-task-plan.v2`. Both repeat exact
