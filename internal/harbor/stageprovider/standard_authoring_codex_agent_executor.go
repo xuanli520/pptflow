@@ -1359,7 +1359,10 @@ func standardAuthoringCodexSealSourceCopy(root string) error {
 			return nil
 		}
 		if info.IsDir() {
-			if err := os.Chmod(path, 0o550); err != nil {
+			// The sealed source is bind-mounted into a rootless verification
+			// container. Keep it immutable while allowing that container to
+			// traverse every source directory.
+			if err := os.Chmod(path, 0o555); err != nil {
 				return fmt.Errorf("%w: seal source-copy directory", ErrStandardAuthoringCodexAgentTurnConfiguration)
 			}
 			return nil
@@ -1367,7 +1370,7 @@ func standardAuthoringCodexSealSourceCopy(root string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("%w: source-copy entry is non-regular", ErrStandardAuthoringCodexAgentTurnConfiguration)
 		}
-		if err := os.Chmod(path, 0o440); err != nil {
+		if err := os.Chmod(path, 0o444); err != nil {
 			return fmt.Errorf("%w: seal source-copy file", ErrStandardAuthoringCodexAgentTurnConfiguration)
 		}
 		return nil
