@@ -1,0 +1,15 @@
+{
+  "format": "harbor.task-input.v1",
+  "version": "1",
+  "repository_url": "https://github.com/yewstack/yew.git",
+  "commit_sha": "4c3bcdc692b067907fb0e9402a3c08b9f872bc0f",
+  "base_image": "docker.io/library/rust:1.85.1-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4",
+  "slug": "yew-router-state-hard-bugfix",
+  "title": "Repair route state across nested navigation",
+  "task_type": "bugfix",
+  "application": "frontend",
+  "code_language": "rust",
+  "is_0_to_1": false,
+  "objective": "Create an expert-level Rust frontend bug-fix task in Yew Router. The defect must involve subtle route-state behavior across a basename or nested route transition and a browser-history or SSR/hydration boundary. Keep the fix bounded and observable; require deterministic regression tests using existing project tooling. Calibrate it as an approximately 90th-percentile challenge for Qwen 3.7 Max, with no undocumented requirements.",
+  "reason": "Exercise the complete Standard authoring workflow with a reproducible, high-difficulty Rust frontend bug-fix task."
+}

@@ -65,6 +65,17 @@ func TestReadTaskInputConfigFileAcceptsStrictValidConfig(t *testing.T) {
 	}
 }
 
+func TestYewFrontendHardBugfixConfigExampleLoads(t *testing.T) {
+	path := filepath.Join("..", "..", "docs", "examples", "yew-frontend-hard-bugfix.json")
+	config, err := readTaskInputConfigFile(path)
+	if err != nil {
+		t.Fatalf("read config example: %v", err)
+	}
+	if config.RepositoryURL != "https://github.com/yewstack/yew.git" || config.TaskType != "bugfix" || config.Application != "frontend" || config.CodeLanguage != "rust" || config.Is0To1 {
+		t.Fatalf("config example has unexpected task facts: %+v", config)
+	}
+}
+
 func TestReadTaskInputConfigFileRejectsInvalidInputs(t *testing.T) {
 	valid := taskInputConfigJSON(taskInputConfigFixture())
 	for _, test := range []struct {
