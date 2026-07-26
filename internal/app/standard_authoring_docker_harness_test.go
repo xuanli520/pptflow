@@ -67,6 +67,14 @@ func TestStandardAuthoringDockerHarnessBuildsOnceReattestsAndCompletesFullValida
 					t.Fatalf("verification command missing %q: %#v", required, command.Args)
 				}
 			}
+			taskRoot := fullTaskRoot
+			if command.Args[len(command.Args)-1] == standardAuthoringDockerHarnessSourceAccessProgram {
+				taskRoot = buildTaskRoot
+			}
+			wantSourceMount := "type=bind,src=" + filepath.Join(filepath.Dir(taskRoot), stageprovider.StandardAuthoringCodexAttemptSourceDirectory) + ",dst=/oracle/source,readonly"
+			if !containsParentArg(command.Args, wantSourceMount) {
+				t.Fatalf("verification command does not mount the frozen source: %#v", command.Args)
+			}
 		case "image":
 			inspectCount++
 		}
@@ -106,12 +114,33 @@ func TestStandardAuthoringDockerHarnessRejectsInaccessibleRuntimeSource(t *testi
 		}
 		foundProbe = true
 		mount := standardAuthoringHarnessArgAfter(command.Args, "--mount")
-		if command.Path != "/opt/locked/docker-build" || !strings.Contains(program, "cp -R /workspace/source/. /oracle/worktree/") || !strings.Contains(mount, ",dst=/oracle") || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "ALL") {
+		wantSourceMount := "type=bind,src=" + filepath.Join(filepath.Dir(taskRoot), stageprovider.StandardAuthoringCodexAttemptSourceDirectory) + ",dst=/oracle/source,readonly"
+		if command.Path != "/opt/locked/docker-build" || !strings.Contains(program, "cp -R /oracle/source/. /oracle/worktree/") || !strings.Contains(mount, ",dst=/oracle") || !containsParentArg(command.Args, wantSourceMount) || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "ALL") {
 			t.Fatalf("source-access probe command = %#v", command.Args)
 		}
 	}
 	if !foundProbe {
 		t.Fatal("runtime source-access probe was not invoked")
+	}
+}
+
+func TestStandardAuthoringDockerHarnessRejectsMissingFrozenSource(t *testing.T) {
+	root := t.TempDir()
+	runner := &standardAuthoringHarnessRunner{t: t, imageID: "sha256:" + strings.Repeat("d", 64)}
+	harness := newStandardAuthoringDockerHarnessForTest(t, root, runner)
+	runID := standardAuthoringHarnessUUID(t)
+	request, taskRoot := standardAuthoringHarnessAttempt(t, root, runID, workflowkit.StageKey("dockerfile_build_validate"), authoringharness.ModeDockerfileBuild)
+	writeStandardAuthoringHarnessCandidate(t, taskRoot, "FROM scratch\n", "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 1\n")
+	if err := os.RemoveAll(filepath.Join(filepath.Dir(taskRoot), stageprovider.StandardAuthoringCodexAttemptSourceDirectory)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := harness.Validate(context.Background(), request)
+	if err == nil || !strings.Contains(err.Error(), "attempt workspace fixed directory is unavailable or unsafe") {
+		t.Fatalf("Validate error = %v", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("missing frozen source invoked Docker: %#v", runner.commands)
 	}
 }
 

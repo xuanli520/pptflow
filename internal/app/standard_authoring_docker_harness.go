@@ -22,7 +22,7 @@ import (
 const (
 	standardAuthoringDockerHarnessStateDirectory      = "standard-authoring-docker-harness"
 	standardAuthoringDockerHarnessTailLimit           = 16 << 10
-	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /oracle/worktree && mkdir -p /oracle/worktree && cp -R /workspace/source/. /oracle/worktree/ && test -d /oracle/worktree && touch /oracle/worktree/.harbor-source-access && rm /oracle/worktree/.harbor-source-access"
+	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /oracle/worktree && mkdir -p /oracle/worktree && cp -R /oracle/source/. /oracle/worktree/ && test -d /oracle/worktree && touch /oracle/worktree/.harbor-source-access && rm /oracle/worktree/.harbor-source-access"
 
 	standardAuthoringDockerHarnessReceiptFormat  = "harbor.standard-authoring.docker-image.v1"
 	standardAuthoringDockerHarnessReceiptVersion = "1"
@@ -121,7 +121,15 @@ func (harness *StandardAuthoringDockerHarness) Validate(ctx context.Context, req
 	// the harness's point of view.
 	harness.mu.Lock()
 	defer harness.mu.Unlock()
-	return harness.validateCandidate(ctx, request, candidate)
+	sourceRoot := filepath.Join(workRoot, stageprovider.StandardAuthoringCodexAttemptSourceDirectory)
+	info, err := os.Stat(sourceRoot)
+	if err != nil {
+		return authoringharness.Result{}, fmt.Errorf("inspect Standard authoring frozen source: %w", err)
+	}
+	if !info.IsDir() {
+		return authoringharness.Result{}, errors.New("Standard authoring frozen source is not a directory")
+	}
+	return harness.validateCandidate(ctx, request, candidate, sourceRoot)
 }
 
 func validateStandardAuthoringHarnessRequest(request authoringharness.Request) error {
@@ -144,7 +152,7 @@ func validateStandardAuthoringHarnessRequest(request authoringharness.Request) e
 	return nil
 }
 
-func (harness *StandardAuthoringDockerHarness) validateCandidate(ctx context.Context, request authoringharness.Request, candidate authoringharness.Candidate) (authoringharness.Result, error) {
+func (harness *StandardAuthoringDockerHarness) validateCandidate(ctx context.Context, request authoringharness.Request, candidate authoringharness.Candidate, sourceRoot string) (authoringharness.Result, error) {
 	runState := filepath.Join(harness.stateRoot, request.RunID)
 	if err := ensureStandardAuthoringHarnessDirectory(runState); err != nil {
 		return authoringharness.Result{}, err
@@ -177,7 +185,7 @@ func (harness *StandardAuthoringDockerHarness) validateCandidate(ctx context.Con
 		return harness.finishResult(result)
 	}
 	if request.Mode == authoringharness.ModeDockerfileBuild {
-		sourceAccessStep, err := harness.runSourceAccess(ctx, image, invocationRoot)
+		sourceAccessStep, err := harness.runSourceAccess(ctx, image, invocationRoot, sourceRoot)
 		if err != nil {
 			return authoringharness.Result{}, err
 		}
@@ -189,7 +197,7 @@ func (harness *StandardAuthoringDockerHarness) validateCandidate(ctx context.Con
 		return harness.finishResult(result)
 	}
 
-	initialStep, err := harness.runInitial(ctx, request, image, invocationRoot, snapshotRoot)
+	initialStep, err := harness.runInitial(ctx, request, image, invocationRoot, snapshotRoot, sourceRoot)
 	if err != nil {
 		return authoringharness.Result{}, err
 	}
@@ -197,7 +205,7 @@ func (harness *StandardAuthoringDockerHarness) validateCandidate(ctx context.Con
 	if !initialStep.Passed {
 		return harness.finishResult(result)
 	}
-	oracleStep, err := harness.runOracle(ctx, request, image, invocationRoot, snapshotRoot)
+	oracleStep, err := harness.runOracle(ctx, request, image, invocationRoot, snapshotRoot, sourceRoot)
 	if err != nil {
 		return authoringharness.Result{}, err
 	}
@@ -275,8 +283,8 @@ func (harness *StandardAuthoringDockerHarness) ensureCandidateImage(ctx context.
 // runSourceAccess proves the Dockerfile exposes the frozen source to the
 // exact restricted runtime that will execute generated solution scripts. A
 // successful image build alone is insufficient because source archive modes
-// can make /workspace/source unreadable after capabilities are dropped.
-func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Context, image standardAuthoringHarnessImageReceipt, invocationRoot string) (authoringharness.StepResult, error) {
+// can make the read-only source mount unavailable after capabilities are dropped.
+func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Context, image standardAuthoringHarnessImageReceipt, invocationRoot, sourceRoot string) (authoringharness.StepResult, error) {
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1DockerBuildCommandID, image); err != nil || !ok {
 		return step, err
 	}
@@ -292,7 +300,7 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1DockerBuildCommandID,
-		codeEdgePhase1DockerRunArgs(image.ImageTag, checkout, "authoring-source-access-"+containerID, standardAuthoringDockerHarnessSourceAccessProgram), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-source-access-"+containerID, standardAuthoringDockerHarnessSourceAccessProgram), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -308,7 +316,7 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 	return harness.commandStep("source_access", result, fingerprint, passed, findings), nil
 }
 
-func (harness *StandardAuthoringDockerHarness) runInitial(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot string) (authoringharness.StepResult, error) {
+func (harness *StandardAuthoringDockerHarness) runInitial(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string) (authoringharness.StepResult, error) {
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1InitialVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
@@ -322,7 +330,7 @@ func (harness *StandardAuthoringDockerHarness) runInitial(ctx context.Context, r
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1InitialVerifyCommandID,
-		codeEdgePhase1DockerRunArgs(image.ImageTag, checkout, "authoring-initial-"+containerID, "sh ./tests/test.sh"), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-initial-"+containerID, "sh ./tests/test.sh"), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -341,7 +349,7 @@ func (harness *StandardAuthoringDockerHarness) runInitial(ctx context.Context, r
 	return harness.commandStep("initial_verify", result, fingerprint, passed, findings), nil
 }
 
-func (harness *StandardAuthoringDockerHarness) runOracle(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot string) (authoringharness.StepResult, error) {
+func (harness *StandardAuthoringDockerHarness) runOracle(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string) (authoringharness.StepResult, error) {
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1OracleVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
@@ -355,7 +363,7 @@ func (harness *StandardAuthoringDockerHarness) runOracle(ctx context.Context, re
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1OracleVerifyCommandID,
-		codeEdgePhase1DockerRunArgs(image.ImageTag, checkout, "authoring-oracle-"+containerID, "sh ./solution/solve.sh && sh ./tests/test.sh"), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-oracle-"+containerID, "sh ./solution/solve.sh && sh ./tests/test.sh"), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -372,6 +380,28 @@ func (harness *StandardAuthoringDockerHarness) runOracle(ctx context.Context, re
 		findings = append(findings, "Oracle repair followed by verifier did not pass")
 	}
 	return harness.commandStep("oracle_verify", result, fingerprint, passed, findings), nil
+}
+
+// standardAuthoringDockerRunArgs exposes the attempt's frozen source to the
+// authoring verifier at the path directly beside its immutable scripts. The
+// source mount is read-only; only the verifier checkout remains writable.
+func standardAuthoringDockerRunArgs(imageTag, checkout, sourceRoot, name, shellProgram string) []string {
+	args := codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram)
+	workdirIndex := -1
+	for index, argument := range args {
+		if argument == "--workdir" {
+			workdirIndex = index
+			break
+		}
+	}
+	if workdirIndex < 0 {
+		panic("CodeEdge Docker arguments are missing --workdir")
+	}
+	sourceMount := []string{"--mount", "type=bind,src=" + sourceRoot + ",dst=/oracle/source,readonly"}
+	result := make([]string, 0, len(args)+len(sourceMount))
+	result = append(result, args[:workdirIndex]...)
+	result = append(result, sourceMount...)
+	return append(result, args[workdirIndex:]...)
 }
 
 func (harness *StandardAuthoringDockerHarness) reattestImage(ctx context.Context, invocationRoot, commandID string, image standardAuthoringHarnessImageReceipt) (authoringharness.StepResult, bool, error) {
