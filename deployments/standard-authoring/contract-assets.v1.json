@@ -18,7 +18,7 @@
     },
     {
       "stage_key": "task_design",
-      "prompt": {"id": "standard-authoring.task-design.prompt", "version": "1.6.0", "relative_path": "prompts/task-design.json"},
+      "prompt": {"id": "standard-authoring.task-design.prompt", "version": "1.6.1", "relative_path": "prompts/task-design.json"},
       "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
     },
     {

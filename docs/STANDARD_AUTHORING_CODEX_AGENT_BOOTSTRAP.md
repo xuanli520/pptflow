@@ -59,6 +59,22 @@ canonicalizes it before producing a `StageExecutionResult`. A passing submit
 is the only output authority. Final assistant text is deliberately ignored
 and cannot overwrite an accepted artifact.
 
+### Task proposal shape
+
+The `task_design` prompt supplies the exact, closed shape of its
+`task_proposal` artifact. It contains only `format`, `version`,
+`contract_claims`, `requirements`, `source_paths`, `packages`, and `commands`.
+`contract_claims` is a flat object with `title`, `slug`, `repository_url`,
+`commit_sha`, `base_image`, `code_lang`, `task_type`, `application`,
+`is_0_to_1`, and `source_root`. Each requirement is `{id, text}`, each package
+is `{manifest_path}`, and each command is `{working_directory, argv}`.
+
+Nested descriptive structures such as `task`, `source`, `environment`, scope,
+or acceptance-criteria objects are not part of this artifact and are rejected
+as unknown fields. The host still checks every claimed contract value and every
+repository-relative path against the frozen source; publishing the shape does
+not relax those checks.
+
 `agent_turn` and `output_submission` are independently charged quota
 dimensions. The current Standard-authoring policy reserves three
 `output_submission` attempts for each agent stage, while its frozen turn

@@ -1187,6 +1187,41 @@ func TestStandardAuthoringCodexOutputSubmissionEnforcesLimitsAndCancellation(t *
 		}
 	})
 
+	t.Run("three rejected candidates report validation exhaustion without content", func(t *testing.T) {
+		const secret = "rejected-candidate-must-not-escape"
+		stage := standardAuthoringCodexTestStage(1)
+		request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+		submission, err := newStandardAuthoringCodexOutputSubmission(request, 64*1024, 3, func() time.Time { return now }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := submission.beginTurn(1); err != nil {
+			t.Fatal(err)
+		}
+		candidate := standardAuthoringCodexTestCandidate(t, workflowkit.Verdict("not-allowed"), []byte(secret))
+		for attempt := 1; attempt <= 3; attempt++ {
+			response, err := submission.dynamicTool().Handler(context.Background(), candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := standardAuthoringCodexTestSubmissionReceipt(t, response)
+			if receipt.Accepted || len(receipt.Errors) != 1 || receipt.Errors[0] != "wrong_verdict" || receipt.Remaining != 3-attempt {
+				t.Fatalf("attempt %d receipt = %+v", attempt, receipt)
+			}
+		}
+		if submission.failure() != standardAuthoringCodexSubmissionFailureOutputValidationExhausted {
+			t.Fatalf("submission failure = %q", submission.failure())
+		}
+		failureText := submission.failureText()
+		wantDiagnostics := "diagnostics=wrong_verdict,wrong_verdict,wrong_verdict"
+		if !strings.Contains(failureText, "attempts=3") || !strings.Contains(failureText, wantDiagnostics) || strings.Contains(failureText, secret) {
+			t.Fatalf("failure text = %q", failureText)
+		}
+		if len(*usages) != 3 || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 3 {
+			t.Fatalf("usage records = %+v, want three charged output submissions", *usages)
+		}
+	})
+
 	t.Run("byte limit rejects after charging the bounded submission attempt", func(t *testing.T) {
 		stage := standardAuthoringCodexTestStage(1)
 		request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)

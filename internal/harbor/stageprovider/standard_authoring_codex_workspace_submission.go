@@ -441,6 +441,10 @@ func (submission *standardAuthoringCodexWorkspaceSubmission) failure() string {
 	return submission.failureCode
 }
 
+func (submission *standardAuthoringCodexWorkspaceSubmission) failureText() string {
+	return submission.failure()
+}
+
 func (submission *standardAuthoringCodexWorkspaceSubmission) remainingLocked() int {
 	remaining := submission.maxAttempts - submission.attempts
 	if remaining < 0 {

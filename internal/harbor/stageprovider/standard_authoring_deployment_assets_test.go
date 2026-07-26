@@ -99,6 +99,24 @@ func TestStandardAuthoringV2DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 				t.Fatalf("v2 prompt %q omits root-contract boundary %q", registration.Stage.Key, required)
 			}
 		}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskDesign) {
+			for promptIndex, prompt := range program.TurnPrompts {
+				for _, required := range []string{
+					"no other keys",
+					`"format":"harbor.standard-authoring-task-proposal.v2"`,
+					`"version":"2"`,
+					`"contract_claims":{"title":"...","slug":"...","repository_url":"...","commit_sha":"...","base_image":"...","code_lang":"...","task_type":"...","application":"...","is_0_to_1":false,"source_root":"..."}`,
+					`"requirements":[{"id":"REQ-1","text":"..."}]`,
+					`"source_paths":["..."]`,
+					`"packages":[{"manifest_path":"..."}]`,
+					`"commands":[{"working_directory":".","argv":["..."]}]`,
+				} {
+					if !strings.Contains(prompt, required) {
+						t.Fatalf("task-design prompt turn %d omits strict proposal field shape %q", promptIndex+1, required)
+					}
+				}
+			}
+		}
 
 		schemaRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
 		if err != nil {

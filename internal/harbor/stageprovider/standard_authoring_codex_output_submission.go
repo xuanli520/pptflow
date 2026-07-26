@@ -29,12 +29,13 @@ import (
 )
 
 const (
-	standardAuthoringCodexSubmitToolName                 = "harbor_submit_stage_output"
-	standardAuthoringCodexOutputSubmissionQuotaDimension = "output_submission"
-	standardAuthoringCodexSubmissionFailureQuota         = "standard_authoring_codex_agent_turn.output_submission_quota"
-	standardAuthoringCodexSubmissionFailureLease         = "standard_authoring_codex_agent_turn.output_submission_lease_lost"
-	standardAuthoringCodexSubmissionFailureAccounting    = "standard_authoring_codex_agent_turn.output_submission_accounting"
-	standardAuthoringCodexSubmissionFailureAbsent        = "standard_authoring_codex_agent_turn.output_submission_missing"
+	standardAuthoringCodexSubmitToolName                             = "harbor_submit_stage_output"
+	standardAuthoringCodexOutputSubmissionQuotaDimension             = "output_submission"
+	standardAuthoringCodexSubmissionFailureQuota                     = "standard_authoring_codex_agent_turn.output_submission_quota"
+	standardAuthoringCodexSubmissionFailureLease                     = "standard_authoring_codex_agent_turn.output_submission_lease_lost"
+	standardAuthoringCodexSubmissionFailureAccounting                = "standard_authoring_codex_agent_turn.output_submission_accounting"
+	standardAuthoringCodexSubmissionFailureAbsent                    = "standard_authoring_codex_agent_turn.output_submission_missing"
+	standardAuthoringCodexSubmissionFailureOutputValidationExhausted = "standard_authoring_codex_agent_turn.output_submission_validation_exhausted"
 
 	// This host-only representation is the stable input to the receipt digest.
 	// It records artifact identity only after the frozen StageDescriptor has
@@ -50,9 +51,9 @@ const (
 
 // standardAuthoringCodexOutputSubmission owns the one in-memory authority for
 // a candidate accepted during an ephemeral App Server conversation. Invalid
-// candidates never leave this object: only their digest and stable diagnostic
-// are returned to Codex. The caller publishes its accepted StageExecutionResult
-// only after the App Server turn is over.
+// candidate contents never leave this object. Stable rejection diagnostics are
+// retained only to classify an exhausted submission budget; the caller publishes
+// an accepted StageExecutionResult only after the App Server turn is over.
 type standardAuthoringCodexOutputSubmission struct {
 	mu sync.Mutex
 
@@ -89,10 +90,11 @@ type standardAuthoringCodexOutputSubmission struct {
 	taskRoot              string
 	readFixedFile         func(string, string, int64) ([]byte, error)
 
-	currentTurn int
-	attempts    int
-	accepted    *standardAuthoringCodexAcceptedOutput
-	failureCode string
+	currentTurn          int
+	attempts             int
+	accepted             *standardAuthoringCodexAcceptedOutput
+	failureCode          string
+	rejectionDiagnostics []string
 }
 
 type standardAuthoringCodexAcceptedOutput struct {
@@ -578,6 +580,10 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 		return standardAuthoringCodexSubmissionResponse(false, []string{"already_accepted"}, remaining, digest)
 	}
 	if submission.failureCode != "" {
+		if submission.failureCode == standardAuthoringCodexSubmissionFailureOutputValidationExhausted && submission.attempts >= submission.maxAttempts {
+			submission.mu.Unlock()
+			return standardAuthoringCodexSubmissionResponse(false, []string{"submit_attempts_exhausted"}, 0, digest)
+		}
 		remaining := submission.remainingLocked()
 		submission.mu.Unlock()
 		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_unavailable"}, remaining, digest)
@@ -630,6 +636,7 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 		return standardAuthoringCodexSubmissionResponse(false, []string{"submission_timeout"}, remaining, digest)
 	}
 	if len(raw) == 0 || len(raw) > submission.maxBytes {
+		submission.recordCandidateRejection("byte_limit_exceeded", remaining)
 		return standardAuthoringCodexSubmissionResponse(false, []string{"byte_limit_exceeded"}, remaining, digest)
 	}
 	if submission.fixedFileRelativePath != "" {
@@ -638,13 +645,16 @@ func (submission *standardAuthoringCodexOutputSubmission) handle(ctx context.Con
 
 	result, canonicalDigest, diagnostic := standardAuthoringCodexValidateSubmissionCandidate(raw, submission.stage, turn, submission.environmentPolicy, submission.contractDigest)
 	if diagnostic != "" {
+		submission.recordCandidateRejection(diagnostic, remaining)
 		return standardAuthoringCodexSubmissionResponseWithContract(false, []string{diagnostic}, remaining, digest, submission.contractDigest)
 	}
 	if result.Outcome.Verdict == workflowkit.VerdictPass {
 		if diagnostic := submission.structuredClaimDiagnostic(result); diagnostic != "" {
+			submission.recordCandidateRejection(diagnostic, remaining)
 			return standardAuthoringCodexSubmissionResponseWithContract(false, []string{diagnostic}, remaining, digest, submission.contractDigest)
 		}
 		if diagnostic := submission.testsAnalysisDiagnostic(result); diagnostic != "" {
+			submission.recordCandidateRejection(diagnostic, remaining)
 			return standardAuthoringCodexSubmissionResponseWithContract(false, []string{diagnostic}, remaining, digest, submission.contractDigest)
 		}
 	}
@@ -801,6 +811,33 @@ func (submission *standardAuthoringCodexOutputSubmission) failure() string {
 	submission.mu.Lock()
 	defer submission.mu.Unlock()
 	return submission.failureCode
+}
+
+func (submission *standardAuthoringCodexOutputSubmission) failureText() string {
+	if submission == nil {
+		return ""
+	}
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if submission.failureCode != standardAuthoringCodexSubmissionFailureOutputValidationExhausted {
+		return submission.failureCode
+	}
+	return fmt.Sprintf("%s: attempts=%d; diagnostics=%s", submission.failureCode, submission.attempts, strings.Join(submission.rejectionDiagnostics, ","))
+}
+
+func (submission *standardAuthoringCodexOutputSubmission) recordCandidateRejection(diagnostic string, remaining int) {
+	if submission == nil || diagnostic == "" {
+		return
+	}
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if submission.fixedFileRelativePath != "" || submission.accepted != nil {
+		return
+	}
+	submission.rejectionDiagnostics = append(submission.rejectionDiagnostics, diagnostic)
+	if remaining == 0 && submission.attempts == submission.maxAttempts {
+		submission.failureCode = standardAuthoringCodexSubmissionFailureOutputValidationExhausted
+	}
 }
 
 func (submission *standardAuthoringCodexOutputSubmission) remainingLocked() int {

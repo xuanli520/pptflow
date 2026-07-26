@@ -355,6 +355,7 @@ type standardAuthoringCodexSubmissionAuthority interface {
 	outputSchema() json.RawMessage
 	acceptedResult() (workflowkit.StageExecutionResult, bool)
 	failure() string
+	failureText() string
 }
 
 // standardAuthoringCodexSubmissionTool wraps the private submission authority
@@ -654,9 +655,9 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 			_ = conversation.Close()
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureRuntime), nil
 		}
-		if submission.failure() != "" {
+		if failureCode := submission.failure(); failureCode != "" {
 			_ = conversation.Close()
-			return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(submission.failure()), submission.failure()), nil
+			return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(failureCode), submission.failureText()), nil
 		}
 		responseDigest := workflowkit.SHA256Fingerprint([]byte(result.Text))
 		if err := executor.checkpoint(ctx, request, program, inputFingerprint, turn, "turn_completed", string(responseDigest)); err != nil {
@@ -681,8 +682,8 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if closeErr != nil {
 		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 	}
-	if submission.failure() != "" {
-		return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(submission.failure()), submission.failure()), nil
+	if failureCode := submission.failure(); failureCode != "" {
+		return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(failureCode), submission.failureText()), nil
 	}
 	// The frozen inputs and output contract remain valid; this particular agent
 	// process simply ended without delivering the required structured result.
@@ -695,7 +696,8 @@ func standardAuthoringCodexSubmissionFailureClass(code string) workflowkit.Failu
 	}
 	if code == standardAuthoringCodexSubmissionFailureValidation ||
 		code == standardAuthoringCodexSubmissionFailureValidationExhausted ||
-		code == standardAuthoringCodexSubmissionFailureValidationUnavailable {
+		code == standardAuthoringCodexSubmissionFailureValidationUnavailable ||
+		code == standardAuthoringCodexSubmissionFailureOutputValidationExhausted {
 		return workflowkit.FailureProcess
 	}
 	return workflowkit.FailureUnknown

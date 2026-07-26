@@ -408,6 +408,40 @@ func TestStandardAuthoringCodexAgentTurnExecutorShortCircuitsAcceptedSubmission(
 	}
 }
 
+func TestStandardAuthoringCodexAgentTurnExecutorStopsAfterRejectedSubmissionsAreExhausted(t *testing.T) {
+	t.Parallel()
+	const secret = "rejected-candidate-must-not-reach-terminal-error"
+	now := time.Date(2026, 7, 26, 8, 0, 0, 0, time.UTC)
+	stage := standardAuthoringCodexTestStage(4)
+	invalid := standardAuthoringCodexTestCandidate(t, workflowkit.Verdict("not-allowed"), []byte(secret))
+	runtime := &standardAuthoringCodexRuntimeStub{conversation: &standardAuthoringCodexConversationStub{
+		results:     []agent.TurnResult{{Model: CodexAppServerProductionModelID, Text: `{"progress":"rejected"}`}},
+		submissions: [][]json.RawMessage{{invalid, invalid, invalid}},
+	}}
+	executor, program := standardAuthoringCodexTestExecutor(t, runtime, now, 4)
+	request, _, usages := standardAuthoringCodexTestRequest(stage, []byte("frozen input"), now)
+
+	result, err := executor.ExecuteAgentTurn(context.Background(), StageOperationInvocation{
+		Request: request,
+		Resolution: workflowadapter.StageOperationResolution{
+			StageKey: stage.Key, Operation: workflowadapter.StageOperationBinding{Payload: standardAuthoringCodexTestPayload(len(program.TurnPrompts))},
+		},
+	}, standardAuthoringCodexTestPayload(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCode := standardAuthoringCodexSubmissionFailureOutputValidationExhausted
+	if result.Outcome.Status != workflowkit.StatusInfraFailed || result.Outcome.Failure != workflowkit.FailureProcess || !strings.HasPrefix(result.ErrorText, wantCode+": attempts=3;") || !strings.Contains(result.ErrorText, "diagnostics=wrong_verdict,wrong_verdict,wrong_verdict") || strings.Contains(result.ErrorText, secret) {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(runtime.conversation.requests) != 1 || runtime.conversation.closed != 1 {
+		t.Fatalf("conversation requests=%d closes=%d, want 1/1", len(runtime.conversation.requests), runtime.conversation.closed)
+	}
+	if standardAuthoringCodexTestUsageCount(*usages, "agent_turn") != 1 || standardAuthoringCodexTestUsageCount(*usages, standardAuthoringCodexOutputSubmissionQuotaDimension) != 3 {
+		t.Fatalf("usage records = %+v, want one agent turn and three output submissions", *usages)
+	}
+}
+
 func TestStandardAuthoringCodexAgentTurnExecutorFailsClosedWithoutLeakingProviderOrInputData(t *testing.T) {
 	t.Parallel()
 	const secret = "do-not-include-this-secret"
