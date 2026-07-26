@@ -1299,7 +1299,7 @@ func standardAuthoringCodexCopySourceTree(ctx context.Context, sourceRoot, desti
 			return err
 		}
 		info, err := os.Lstat(sourcePath)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil {
 			return fmt.Errorf("%w: source copy encountered an unsafe entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
 		}
 		relative, err := filepath.Rel(sourceRoot, sourcePath)
@@ -1309,6 +1309,9 @@ func standardAuthoringCodexCopySourceTree(ctx context.Context, sourceRoot, desti
 		destinationPath := filepath.Join(destinationRoot, relative)
 		if !standardAuthoringPathWithin(filepath.Dir(destinationRoot), destinationPath) {
 			return fmt.Errorf("%w: destination copy entry escapes its work root", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return standardAuthoringCodexCopySourceLink(sourceRoot, sourcePath, destinationPath)
 		}
 		if info.IsDir() {
 			if err := os.Mkdir(destinationPath, 0o750); err != nil {
@@ -1326,14 +1329,32 @@ func standardAuthoringCodexCopySourceTree(ctx context.Context, sourceRoot, desti
 	return standardAuthoringCodexSealSourceCopy(destinationRoot)
 }
 
+func standardAuthoringCodexCopySourceLink(sourceRoot, sourcePath, destinationPath string) error {
+	target, err := os.Readlink(sourcePath)
+	if err != nil || !standardAuthoringCodexSafeSourceLink(sourceRoot, sourcePath, target) {
+		return fmt.Errorf("%w: source copy encountered an unsafe symbolic link", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	if err := os.Symlink(target, destinationPath); err != nil {
+		return fmt.Errorf("%w: create source-copy symbolic link", ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	return nil
+}
+
 func standardAuthoringCodexSealSourceCopy(root string) error {
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return fmt.Errorf("%w: inspect source-copy entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
 		}
 		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil {
 			return fmt.Errorf("%w: source-copy entry is unsafe", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, readErr := os.Readlink(path)
+			if readErr != nil || !standardAuthoringCodexSafeSourceLink(root, path, target) {
+				return fmt.Errorf("%w: source-copy symbolic link is unsafe", ErrStandardAuthoringCodexAgentTurnConfiguration)
+			}
+			return nil
 		}
 		if info.IsDir() {
 			if err := os.Chmod(path, 0o550); err != nil {
@@ -1450,13 +1471,21 @@ func standardAuthoringCodexSafePathComponent(value string) bool {
 }
 
 func standardAuthoringCodexValidateWorkTree(root string) error {
+	sourceRoot := filepath.Join(root, StandardAuthoringCodexAttemptSourceDirectory)
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return fmt.Errorf("%w: inspect attempt workspace entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
 		}
 		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: attempt workspace contains a symbolic link", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		if err != nil {
+			return fmt.Errorf("%w: inspect attempt workspace entry", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, readErr := os.Readlink(path)
+			if !standardAuthoringCodexPathWithinOrEqual(sourceRoot, path) || readErr != nil || !standardAuthoringCodexSafeSourceLink(sourceRoot, path, target) {
+				return fmt.Errorf("%w: attempt workspace contains an unsafe symbolic link", ErrStandardAuthoringCodexAgentTurnConfiguration)
+			}
+			return nil
 		}
 		if info.IsDir() {
 			return nil
@@ -1470,6 +1499,19 @@ func standardAuthoringCodexValidateWorkTree(root string) error {
 		}
 		return nil
 	})
+}
+
+func standardAuthoringCodexSafeSourceLink(sourceRoot, linkPath, target string) bool {
+	if target == "" || filepath.IsAbs(target) || !standardAuthoringCodexPathWithinOrEqual(sourceRoot, linkPath) {
+		return false
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(linkPath), target))
+	return standardAuthoringCodexPathWithinOrEqual(sourceRoot, resolved)
+}
+
+func standardAuthoringCodexPathWithinOrEqual(root, candidate string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(candidate))
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
 }
 
 func (executor *StandardAuthoringCodexAgentTurnExecutor) verifyFrozenSource(ctx context.Context, execution workflowkit.FrozenExecution, root string) (workflowkit.Fingerprint, error) {

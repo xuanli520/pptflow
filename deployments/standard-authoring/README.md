@@ -38,6 +38,9 @@ metadata, symbolic links, and hard links do not block task creation.
 During workspace preparation, relative links are projected only when their
 lexical targets remain inside `source/`; this preserves normal repository link
 semantics without allowing a workspace path to escape its frozen source root.
+The isolated read-only source copy used by workspace-write Codex stages applies
+the same rule, so a supported repository link does not later fail at
+`repo_analyze` after capture has succeeded.
 Tar entry kinds without a safe filesystem projection are retained in the
 captured archive but omitted from the workspace rather than rejecting the
 creation request.

@@ -764,6 +764,55 @@ func TestStandardAuthoringCodexAgentTurnExecutorWorkspaceWriteUsesIsolatedAttemp
 	}
 }
 
+func TestStandardAuthoringCodexCopySourceTreePreservesOnlyInRootLinks(t *testing.T) {
+	ctx := context.Background()
+	sourceRoot := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(filepath.Join(sourceRoot, "nested"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "nested", "target.txt"), []byte("frozen\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nested/target.txt", filepath.Join(sourceRoot, "file-link")); err != nil {
+		t.Skipf("create file link: %v", err)
+	}
+	if err := os.Symlink("nested", filepath.Join(sourceRoot, "directory-link")); err != nil {
+		t.Skipf("create directory link: %v", err)
+	}
+	workRoot := filepath.Join(t.TempDir(), "work")
+	if err := os.Mkdir(workRoot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { standardAuthoringCodexRemoveTree(workRoot) })
+	destinationRoot := filepath.Join(workRoot, StandardAuthoringCodexAttemptSourceDirectory)
+	if err := standardAuthoringCodexCopySourceTree(ctx, sourceRoot, destinationRoot); err != nil {
+		t.Fatalf("copy source tree with in-root links: %v", err)
+	}
+	for name, want := range map[string]string{"file-link": "nested/target.txt", "directory-link": "nested"} {
+		target, err := os.Readlink(filepath.Join(destinationRoot, name))
+		if err != nil || target != want {
+			t.Fatalf("copied link %q = %q, %v; want %q", name, target, err, want)
+		}
+	}
+	if content, err := os.ReadFile(filepath.Join(destinationRoot, "file-link")); err != nil || string(content) != "frozen\n" {
+		t.Fatalf("copied file link content = %q, %v", content, err)
+	}
+	if err := standardAuthoringCodexValidateWorkTree(workRoot); err != nil {
+		t.Fatalf("validate attempt tree with safe source links: %v", err)
+	}
+
+	unsafeRoot := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(unsafeRoot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../outside", filepath.Join(unsafeRoot, "escape")); err != nil {
+		t.Skipf("create unsafe link: %v", err)
+	}
+	if err := standardAuthoringCodexCopySourceTree(ctx, unsafeRoot, filepath.Join(t.TempDir(), "destination")); !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
+		t.Fatalf("copy source tree with escaping link error = %v", err)
+	}
+}
+
 func TestStandardAuthoringAttemptWorkspacePathRejectsUnsafeIdentityAndSymlinkAncestor(t *testing.T) {
 	root := t.TempDir()
 	runID := "019f8397-7a65-7000-8000-0000000000a2"
