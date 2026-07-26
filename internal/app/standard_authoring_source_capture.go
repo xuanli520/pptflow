@@ -272,6 +272,7 @@ func (capturer *StandardAuthoringGitArchiveSourceCapturer) runGitWithEnvironment
 	output := newStandardAuthoringLimitedBuffer(limit)
 	stderr := newStandardAuthoringLimitedBuffer(standardAuthoringGitCommandOutputMax)
 	command := exec.CommandContext(ctx, capturer.gitExecutable, arguments...)
+	standardAuthoringConfigureGitCommand(command)
 	command.Dir = workdir
 	command.Env = append([]string(nil), environment...)
 	command.Stdout = output

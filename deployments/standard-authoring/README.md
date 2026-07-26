@@ -36,6 +36,11 @@ Tar entry kinds without a safe filesystem projection are retained in the
 captured archive but omitted from the workspace rather than rejecting the
 creation request.
 
+Source capture has a fixed ten-minute transport budget. Git and its transport
+helpers run in one process group, so a timeout terminates the complete capture
+attempt and returns a retryable source-capture failure instead of leaving the
+TUI waiting on an orphaned remote helper.
+
 `task_design` emits `harbor.standard-authoring-task-proposal.v2` and
 `generate_task_files` emits
 `harbor.standard-authoring-generated-task-plan.v2`. Both repeat exact
