@@ -14,7 +14,7 @@ import (
 
 const (
 	// AuthoringContractFormat is the single host-owned immutable source of
-	// task direction and source identity for Standard Authoring v2.
+	// task direction and source identity for Standard Authoring source sessions.
 	AuthoringContractFormat  = "harbor.standard-authoring-contract.v2"
 	AuthoringContractVersion = "2"
 
