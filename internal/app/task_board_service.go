@@ -987,21 +987,92 @@ func (service *TaskBoardService) CancelRun(ctx context.Context, request TaskBoar
 	if err != nil {
 		return TaskBoardMutation{}, err
 	}
+	run, err := service.taskBoardWorkflowRun(ctx, prepared.RunID)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
 	checkpoint, err := service.control.CurrentCheckpoint(ctx, prepared.RunID)
 	if err != nil {
 		return TaskBoardMutation{}, err
 	}
-	if _, err := service.control.Request(ctx, RequestExecutionControlRequest{
+	operation, err := service.control.Request(ctx, RequestExecutionControlRequest{
 		OperationKey: prepared.IdempotencyKey,
 		Action:       store.ControlActionTerminate,
 		RunID:        prepared.RunID,
 		Expected:     checkpoint,
 		Actor:        actor,
 		Reason:       prepared.Reason,
-	}); err != nil {
+	})
+	if err != nil {
 		return TaskBoardMutation{}, err
 	}
+	if cancellationNeedsCoordinatorWakeup(run.Status) {
+		if err := service.enqueueCancellationCoordinator(ctx, run, operation, actor); err != nil {
+			return TaskBoardMutation{}, err
+		}
+		if err := service.FlushQueuedRuns(ctx); err != nil {
+			return TaskBoardMutation{}, err
+		}
+	}
 	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已请求取消当前 Run"}, nil
+}
+
+// cancellationNeedsCoordinatorWakeup identifies states in which a Run has no
+// executing coordinator to observe a newly-recorded termination request. The
+// normal running states deliberately remain excluded: their active worker is
+// responsible for preserving the current stage's termination semantics.
+func cancellationNeedsCoordinatorWakeup(status store.WorkflowRunStatus) bool {
+	switch status {
+	case store.WorkflowRunWaitingReview, store.WorkflowRunWaitingContinuation:
+		return true
+	default:
+		return false
+	}
+}
+
+// enqueueCancellationCoordinator makes a durable termination observable when
+// a reviewed or continuation-blocked Run has already consumed its previous
+// workflow coordinator job. Reusing the frozen payload is safe because the
+// runtime verifies it before handling the queued control operation; the new
+// idempotency key is bound to this exact termination request.
+func (service *TaskBoardService) enqueueCancellationCoordinator(ctx context.Context, run store.WorkflowRun, operation store.DurableControlOperation, actor string) error {
+	if service == nil || service.core == nil || service.core.store == nil {
+		return fmt.Errorf("task board service is not configured")
+	}
+	if operation.Action != store.ControlActionTerminate || operation.RunID != run.ID {
+		return fmt.Errorf("termination control operation does not match Run %s", run.ID)
+	}
+	jobs, err := service.core.store.ListDurableJobsForRun(ctx, run.ID)
+	if err != nil {
+		return fmt.Errorf("list workflow coordinator jobs for Run %s: %w", run.ID, err)
+	}
+	var payload string
+	for _, job := range jobs {
+		if job.CommandType == "workflow_run.execute" && job.EntityType == "workflow_run" && job.EntityID == run.ID && job.PayloadJSON != "" {
+			payload = job.PayloadJSON
+			break
+		}
+	}
+	if payload == "" {
+		return fmt.Errorf("Run %s has no frozen workflow coordinator payload for termination", run.ID)
+	}
+	job, err := service.core.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType:    "workflow_run.execute",
+		EntityType:     "workflow_run",
+		EntityID:       run.ID,
+		RunID:          run.ID,
+		PayloadJSON:    payload,
+		IdempotencyKey: "workflow-run-terminate:" + run.ID + ":" + operation.ID,
+		Actor:          actor,
+		Reason:         "acknowledge queued Run termination after operator review boundary",
+	})
+	if err != nil {
+		return fmt.Errorf("queue termination coordinator for Run %s: %w", run.ID, err)
+	}
+	if job.CommandType != "workflow_run.execute" || job.EntityType != "workflow_run" || job.EntityID != run.ID || job.RunID != run.ID || job.PayloadJSON != payload {
+		return fmt.Errorf("termination coordinator for Run %s does not match frozen workflow payload", run.ID)
+	}
+	return nil
 }
 
 type preparedTaskBoardRunAction struct {

@@ -204,6 +204,82 @@ func TestTaskBoardServiceCancelsTheSelectedRun(t *testing.T) {
 	if err != nil || len(controls) != 1 || controls[0].Action != store.ControlActionTerminate {
 		t.Fatalf("cancel controls = %+v, %v", controls, err)
 	}
+	jobs, err := fixture.dataStore.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("running Run cancellation unexpectedly queued a second coordinator: %+v", jobs)
+	}
+}
+
+func TestTaskBoardServiceCancellationWakesWaitingContinuation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newContinuationFixture(t, store.WorkflowRunRunning)
+	fixture.services.TaskBoard.actor = func() (string, error) { return "task-board-cancel", nil }
+
+	jobs, err := fixture.dataStore.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil || len(jobs) != 1 || jobs[0].CommandType != "workflow_run.execute" {
+		t.Fatalf("initial workflow coordinator = %+v, %v", jobs, err)
+	}
+	initial := jobs[0]
+	initial, err = fixture.dataStore.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: initial.ID, ExpectedVersion: initial.Version, State: store.JobRunning, Actor: "tester", Reason: "consume initial coordinator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.dataStore.TransitionDurableJob(ctx, store.TransitionDurableJobRequest{
+		JobID: initial.ID, ExpectedVersion: initial.Version, State: store.JobSucceeded, Actor: "tester", Reason: "complete initial coordinator",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := fixture.dataStore.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: fixture.run.ID, ExpectedVersion: fixture.run.Version, Status: store.WorkflowRunWaitingContinuation,
+		Actor: "tester", Reason: "fixture waits for operator continuation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.run = waiting
+	launcher := &recordingRunActivationLauncher{}
+	fixture.services.TaskBoard.activations = &RunActivationService{core: fixture.services.core, launcher: launcher}
+
+	key, err := fixture.services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.services.TaskBoard.CancelRun(ctx, TaskBoardCancelRunRequest{
+		IdempotencyKey: key, TaskID: fixture.task.ID, RunID: fixture.run.ID, Reason: "cancel waiting continuation",
+	}); err != nil {
+		t.Fatalf("cancel waiting continuation: %v", err)
+	}
+	controls, err := fixture.services.Control.ListForRun(ctx, fixture.run.ID)
+	if err != nil || len(controls) != 1 {
+		t.Fatalf("termination control = %+v, %v", controls, err)
+	}
+	jobs, err = fixture.dataStore.ListDurableJobsForRun(ctx, fixture.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("jobs after waiting-continuation cancellation = %+v", jobs)
+	}
+	wakeKey := "workflow-run-terminate:" + fixture.run.ID + ":" + controls[0].ID
+	var wake *store.DurableJob
+	for index := range jobs {
+		if jobs[index].IdempotencyKey == wakeKey {
+			wake = &jobs[index]
+			break
+		}
+	}
+	if wake == nil || wake.State != store.JobQueued || wake.CommandType != "workflow_run.execute" || wake.EntityType != "workflow_run" || wake.EntityID != fixture.run.ID || wake.PayloadJSON != initial.PayloadJSON {
+		t.Fatalf("waiting-continuation termination coordinator = %+v", wake)
+	}
+	launches := launcher.snapshot()
+	if len(launches) != 1 || launches[0].RunID != fixture.run.ID {
+		t.Fatalf("waiting-continuation cancellation did not launch controlled worker: %+v", launches)
+	}
 }
 
 func TestTaskBoardRetryAvailabilityDoesNotOfferUnsupportedAuthoringRetry(t *testing.T) {
