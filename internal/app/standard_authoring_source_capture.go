@@ -306,6 +306,16 @@ func standardAuthoringGitEnvironment(temporaryRoot string) []string {
 		"LC_ALL=C",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
+		// Keep HTTPS capture on the broadly compatible HTTP/1.1 transport and
+		// fail a stalled remote promptly enough for the TUI retry boundary. These
+		// are invocation-scoped Git config values, not ambient user settings.
+		"GIT_CONFIG_COUNT=3",
+		"GIT_CONFIG_KEY_0=http.version",
+		"GIT_CONFIG_VALUE_0=HTTP/1.1",
+		"GIT_CONFIG_KEY_1=http.lowSpeedLimit",
+		"GIT_CONFIG_VALUE_1=1",
+		"GIT_CONFIG_KEY_2=http.lowSpeedTime",
+		"GIT_CONFIG_VALUE_2=45",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ALLOW_PROTOCOL=https:ssh",
 		"GIT_PROTOCOL_FROM_USER=0",

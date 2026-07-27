@@ -103,6 +103,10 @@ func TestStandardAuthoringGitArchiveSourceCapturerExecutesControlledHTTPSCapture
 		"      printf 'git_allow_protocol=%s\\n' \"${GIT_ALLOW_PROTOCOL-}\"\n" +
 		"      printf 'git_protocol_from_user=%s\\n' \"${GIT_PROTOCOL_FROM_USER-}\"\n" +
 		"      printf 'git_config_global=%s\\n' \"${GIT_CONFIG_GLOBAL-}\"\n" +
+		"      printf 'git_config_count=%s\\n' \"${GIT_CONFIG_COUNT-}\"\n" +
+		"      printf 'git_http_version=%s\\n' \"${GIT_CONFIG_VALUE_0-}\"\n" +
+		"      printf 'git_http_low_speed_limit=%s\\n' \"${GIT_CONFIG_VALUE_1-}\"\n" +
+		"      printf 'git_http_low_speed_time=%s\\n' \"${GIT_CONFIG_VALUE_2-}\"\n" +
 		"      printf 'git_terminal_prompt=%s\\n' \"${GIT_TERMINAL_PROMPT-}\"\n" +
 		"      if [ \"${SSH_AUTH_SOCK+x}\" = x ]; then printf 'ssh_auth_sock=set\\n'; else printf 'ssh_auth_sock=unset\\n'; fi\n" +
 		"    } > \"$root/fetch-environment\"\n" +
@@ -147,7 +151,7 @@ func TestStandardAuthoringGitArchiveSourceCapturerExecutesControlledHTTPSCapture
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		"git_allow_protocol=https:ssh", "git_protocol_from_user=0", "git_config_global=/dev/null", "git_terminal_prompt=0", "ssh_auth_sock=unset",
+		"git_allow_protocol=https:ssh", "git_protocol_from_user=0", "git_config_global=/dev/null", "git_config_count=3", "git_http_version=HTTP/1.1", "git_http_low_speed_limit=1", "git_http_low_speed_time=45", "git_terminal_prompt=0", "ssh_auth_sock=unset",
 	} {
 		if !strings.Contains(string(environment), expected) {
 			t.Fatalf("controlled Git fetch environment omitted %q:\n%s", expected, environment)
