@@ -605,15 +605,22 @@ func (submission *standardAuthoringV3Submission) captureStructured(request stand
 }
 
 func standardAuthoringV3ValidateStructuredOutput(output workflowkit.ArtifactSpec, content []byte) error {
-	if output.SchemaVersion != workflowkit.WorkflowFindingFormat {
-		return nil
-	}
-	var finding workflowkit.WorkflowFinding
-	if err := standardAuthoringV3DecodeTypedInput(content, &finding); err != nil {
-		return fmt.Errorf("workflow finding output %q is invalid", output.Name)
-	}
-	if err := finding.Validate(); err != nil {
-		return fmt.Errorf("workflow finding output %q is invalid", output.Name)
+	switch output.SchemaVersion {
+	case workflowkit.WorkflowFindingFormat:
+		var finding workflowkit.WorkflowFinding
+		if err := standardAuthoringV3DecodeTypedInput(content, &finding); err != nil {
+			return fmt.Errorf("workflow finding output %q is invalid", output.Name)
+		}
+		if err := finding.Validate(); err != nil {
+			return fmt.Errorf("workflow finding output %q is invalid", output.Name)
+		}
+	case workflowadapter.StandardAuthoringVerificationContractFormat:
+		if output.Name != "verification_contract" {
+			return fmt.Errorf("verification contract output %q is invalid", output.Name)
+		}
+		if _, err := workflowadapter.ParseStandardAuthoringVerificationContractJSON(content); err != nil {
+			return fmt.Errorf("verification contract output %q is invalid", output.Name)
+		}
 	}
 	return nil
 }

@@ -87,6 +87,56 @@ func TestStandardAuthoringV3CriticSubmissionRejectsUnknownFindingFields(t *testi
 	}
 }
 
+func TestStandardAuthoringV3TaskSynthesisRejectsNonCanonicalVerificationContract(t *testing.T) {
+	stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.TaskSynthesis))
+	if !found || stage.AgentRole == nil {
+		t.Fatal("3.0 task synthesis stage is unavailable")
+	}
+	submission := func(verificationContract string) *standardAuthoringV3Submission {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{
+			"verdict": "pass",
+			"artifacts": []map[string]string{
+				{"name": "task_specification", "content": "Yew Router task specification"},
+				{"name": "verification_contract", "content": verificationContract},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleSynthesizer, "", 64<<10)
+		response, err := candidate.handle(context.Background(), payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(response) != `{"accepted":false,"reason":"structured_output_invalid"}` {
+			t.Fatalf("verification contract response = %s", response)
+		}
+		return candidate
+	}
+
+	if _, accepted := submission(`{"schema_version":"harbor.verification-contract.v1"}`).acceptedResult(); accepted {
+		t.Fatal("legacy task-level verification object produced a durable output")
+	}
+
+	canonical := `{"format":"harbor.verification-contract.v1","version":"1","command":["sh","/oracle/tests/test.sh","wasm32-unknown-unknown"],"workdir":".","coverage_mode":"browser_wasm","allowed_solution_paths":["packages/yew-router/src/router.rs"]}`
+	payload, err := json.Marshal(map[string]any{
+		"verdict": "pass",
+		"artifacts": []map[string]string{
+			{"name": "task_specification", "content": "Yew Router task specification"},
+			{"name": "verification_contract", "content": canonical},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedSubmission := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleSynthesizer, "", 64<<10)
+	response, err := acceptedSubmission.handle(context.Background(), payload)
+	if err != nil || string(response) != `{"accepted":true}` {
+		t.Fatalf("canonical verification contract was rejected: %s, %v", response, err)
+	}
+}
+
 func TestStandardAuthoringV3ContextDocumentDeclaresTerminalSubmission(t *testing.T) {
 	researchStage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.RepoStructureResearch))
 	if !found || researchStage.AgentRole == nil {
