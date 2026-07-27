@@ -104,6 +104,9 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if stage.AgentRole.RoleID != workflowkit.AgentRoleAuthor && (!strings.Contains(joined, "harbor_submit_output") || !strings.Contains(joined, `"verdict":"pass"`) || !strings.Contains(joined, "prose final answer")) {
 			t.Fatalf("non-author prompt for %q does not require the exact host submission protocol", registration.Stage.Key)
 		}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.VerifierThreatResearch) && (!strings.Contains(joined, "verifier_threat_evidence") || !strings.Contains(joined, "findings is empty")) {
+			t.Fatalf("verifier-threat prompt does not require an empty-finding terminal submission")
+		}
 
 		schemaRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
 		if err != nil {
