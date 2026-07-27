@@ -30,7 +30,11 @@ const (
 	// StandardAuthoringSourceCaptureTimeout bounds one non-interactive Git
 	// capture. The TUI renders this same deployment-independent bound while a
 	// launch is in flight, so operators are not given a misleading cancel hint.
-	StandardAuthoringSourceCaptureTimeout   = 10 * time.Minute
+	StandardAuthoringSourceCaptureTimeout = 10 * time.Minute
+	// StandardAuthoringSourceFetchTimeout bounds only the remote-facing Git
+	// fetch. A separate host context is required because Git's HTTP low-speed
+	// controls do not cover a stalled connection establishment phase.
+	StandardAuthoringSourceFetchTimeout     = 2 * time.Minute
 	standardAuthoringGitCommandOutputMax    = 64 * 1024
 	standardAuthoringGitPAXGlobalHeaderName = "pax_global_header"
 )
@@ -203,7 +207,9 @@ func (capturer *StandardAuthoringGitArchiveSourceCapturer) CaptureStandardAuthor
 	if err != nil {
 		return StandardAuthoringSourceSnapshot{}, err
 	}
-	if _, err := capturer.runGitWithEnvironment(captureContext, temporaryRoot, standardAuthoringGitCommandOutputMax, fetchEnvironment, "--git-dir", repository, "fetch", "--no-tags", "--depth=1", coordinate.RepositoryURL, coordinate.CommitSHA); err != nil {
+	fetchContext, fetchCancel := context.WithTimeout(captureContext, StandardAuthoringSourceFetchTimeout)
+	defer fetchCancel()
+	if _, err := capturer.runGitWithEnvironment(fetchContext, temporaryRoot, standardAuthoringGitCommandOutputMax, fetchEnvironment, "--git-dir", repository, "fetch", "--no-tags", "--depth=1", coordinate.RepositoryURL, coordinate.CommitSHA); err != nil {
 		return StandardAuthoringSourceSnapshot{}, fmt.Errorf("fetch requested Standard authoring Git commit: %w", err)
 	}
 	resolved, err := capturer.runGit(captureContext, temporaryRoot, "--git-dir", repository, "rev-parse", "--verify", coordinate.CommitSHA+"^{commit}")
