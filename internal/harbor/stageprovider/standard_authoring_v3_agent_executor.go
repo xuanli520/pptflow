@@ -285,6 +285,20 @@ type standardAuthoringV3Input struct {
 	Content       string                  `json:"content"`
 }
 
+// standardAuthoringV3TerminalSubmission makes the otherwise host-private
+// completion contract visible in the agent's frozen context. Without the
+// declared names, a structured-output agent cannot construct a valid tool
+// call even when its prompt requires one.
+type standardAuthoringV3TerminalSubmission struct {
+	Tool               string                     `json:"tool"`
+	Mode               string                     `json:"mode"`
+	Required           bool                       `json:"required"`
+	RequiredOutputs    []workflowkit.ArtifactSpec `json:"required_outputs,omitempty"`
+	CandidateDirectory string                     `json:"candidate_directory,omitempty"`
+	CandidateFiles     []string                   `json:"candidate_files,omitempty"`
+	Instructions       string                     `json:"instructions"`
+}
+
 func standardAuthoringV3ReadInputs(ctx context.Context, request workflowkit.StageExecutionRequest) (map[string][]byte, workflowkit.Fingerprint, error) {
 	if request.ReadInput == nil {
 		return nil, "", fmt.Errorf("missing frozen input reader")
@@ -321,15 +335,42 @@ func standardAuthoringV3ContextDocument(request workflowkit.StageExecutionReques
 	for _, key := range keys {
 		entries = append(entries, standardAuthoringV3Input{Name: key, Digest: workflowkit.SHA256Fingerprint(inputs[key]), Content: string(inputs[key])})
 	}
+	submission := standardAuthoringV3TerminalSubmission{
+		Tool:     standardAuthoringV3SubmitOutputTool,
+		Mode:     "structured_artifacts",
+		Required: true,
+		Instructions: "Call this tool exactly once with verdict pass and one raw content artifact for every required output. " +
+			"A prose final answer never completes this stage.",
+		RequiredOutputs: append([]workflowkit.ArtifactSpec(nil), request.Stage.Outputs...),
+	}
+	if candidateWriter {
+		submission = standardAuthoringV3TerminalSubmission{
+			Tool:               standardAuthoringV3ValidateTool,
+			Mode:               "candidate_workspace",
+			Required:           true,
+			CandidateDirectory: StandardAuthoringCodexAttemptTaskDirectory,
+			CandidateFiles: []string{
+				"instruction.md",
+				"task.toml",
+				authoringharness.DockerfileRelativePath,
+				authoringharness.SolveScriptRelativePath,
+				authoringharness.TestScriptRelativePath,
+				"tests_analysis.json",
+			},
+			Instructions: "Write only the listed candidate files below candidate_directory, then call this tool with {\"verdict\":\"pass\"} and no artifacts. " +
+				"If validation rejects the candidate, apply its bounded diagnostics and call again; a passing call completes this stage.",
+		}
+	}
 	document := struct {
-		Format             string                     `json:"format"`
-		Version            string                     `json:"version"`
-		Stage              string                     `json:"stage"`
-		Program            workflowkit.Fingerprint    `json:"program_fingerprint"`
-		Inputs             workflowkit.Fingerprint    `json:"inputs_fingerprint"`
-		CandidateWorkspace bool                       `json:"candidate_workspace"`
-		Artifacts          []standardAuthoringV3Input `json:"artifacts"`
-	}{Format: "harbor.standard-authoring-v3-context.v1", Version: "1", Stage: string(request.Stage.Key), Program: program.Fingerprint, Inputs: digest, CandidateWorkspace: candidateWriter, Artifacts: entries}
+		Format             string                                `json:"format"`
+		Version            string                                `json:"version"`
+		Stage              string                                `json:"stage"`
+		Program            workflowkit.Fingerprint               `json:"program_fingerprint"`
+		Inputs             workflowkit.Fingerprint               `json:"inputs_fingerprint"`
+		CandidateWorkspace bool                                  `json:"candidate_workspace"`
+		TerminalSubmission standardAuthoringV3TerminalSubmission `json:"terminal_submission"`
+		Artifacts          []standardAuthoringV3Input            `json:"artifacts"`
+	}{Format: "harbor.standard-authoring-v3-context.v1", Version: "1", Stage: string(request.Stage.Key), Program: program.Fingerprint, Inputs: digest, CandidateWorkspace: candidateWriter, TerminalSubmission: submission, Artifacts: entries}
 	raw, err := json.Marshal(document)
 	if err != nil || len(raw) > standardAuthoringV3ContextLimit {
 		return nil, fmt.Errorf("context document is invalid")
@@ -394,11 +435,19 @@ func newStandardAuthoringV3Submission(stage workflowkit.StageDescriptor, role wo
 func (submission *standardAuthoringV3Submission) dynamicTool() agent.DynamicTool {
 	name := standardAuthoringV3SubmitOutputTool
 	schema := json.RawMessage(standardAuthoringV3AgentOutputSchemaCanonicalJSON)
+	description := "Required terminal submission for this frozen stage. A prose response never completes the stage. Call exactly once with verdict pass and one raw content artifact for every declared output, using exact output names."
 	if submission.role == workflowkit.AgentRoleAuthor {
 		name = standardAuthoringV3ValidateTool
 		schema = json.RawMessage(`{"additionalProperties":false,"properties":{"verdict":{"const":"pass"}},"required":["verdict"],"type":"object"}`)
+		description = "Required candidate validation for this frozen stage. After writing the fixed candidate files in task/, call with {\"verdict\":\"pass\"} and no artifacts. A rejected validation returns bounded diagnostics; a passing validation completes the stage."
+	} else {
+		names := make([]string, 0, len(submission.stage.Outputs))
+		for _, output := range submission.stage.Outputs {
+			names = append(names, output.Name)
+		}
+		description = fmt.Sprintf("Required terminal submission for this frozen stage. A prose response never completes the stage. Call exactly once with verdict pass and one raw content artifact for every declared output. Required output names: %s.", strings.Join(names, ", "))
 	}
-	return agent.DynamicTool{Name: name, Description: "Required terminal submission for this frozen stage. A prose response never completes the stage. Call exactly once with verdict pass and one raw content artifact for every declared output, using exact output names.", InputSchema: schema, Handler: submission.handle}
+	return agent.DynamicTool{Name: name, Description: description, InputSchema: schema, Handler: submission.handle}
 }
 func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
 	if submission.accepted != nil {

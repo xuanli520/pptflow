@@ -36,6 +36,52 @@ func TestStandardAuthoringV3SubmissionUsesRawTypedContent(t *testing.T) {
 	}
 }
 
+func TestStandardAuthoringV3ContextDocumentDeclaresTerminalSubmission(t *testing.T) {
+	researchStage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.RepoStructureResearch))
+	if !found || researchStage.AgentRole == nil {
+		t.Fatal("3.0 research stage is unavailable")
+	}
+	researchContext, err := standardAuthoringV3ContextDocument(
+		workflowkit.StageExecutionRequest{Stage: standardAuthoringV3TestDescriptor(researchStage)},
+		StandardAuthoringCodexTurnProgram{Fingerprint: workflowkit.SHA256Fingerprint([]byte("research-program"))},
+		workflowkit.SHA256Fingerprint([]byte("research-inputs")), map[string][]byte{"authoring_contract": []byte(`{"format":"test"}`)}, false,
+	)
+	if err != nil {
+		t.Fatalf("research context: %v", err)
+	}
+	var researchDocument struct {
+		TerminalSubmission standardAuthoringV3TerminalSubmission `json:"terminal_submission"`
+	}
+	if err := json.Unmarshal(researchContext, &researchDocument); err != nil {
+		t.Fatalf("decode research context: %v", err)
+	}
+	if got := researchDocument.TerminalSubmission; got.Tool != standardAuthoringV3SubmitOutputTool || got.Mode != "structured_artifacts" || !got.Required || len(got.RequiredOutputs) != 1 || got.RequiredOutputs[0].Name != "repo_structure_evidence" {
+		t.Fatalf("research terminal submission = %+v", got)
+	}
+
+	authorStage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.AuthoringLoop))
+	if !found || authorStage.AgentRole == nil {
+		t.Fatal("3.0 author stage is unavailable")
+	}
+	authorContext, err := standardAuthoringV3ContextDocument(
+		workflowkit.StageExecutionRequest{Stage: standardAuthoringV3TestDescriptor(authorStage)},
+		StandardAuthoringCodexTurnProgram{Fingerprint: workflowkit.SHA256Fingerprint([]byte("author-program"))},
+		workflowkit.SHA256Fingerprint([]byte("author-inputs")), nil, true,
+	)
+	if err != nil {
+		t.Fatalf("author context: %v", err)
+	}
+	var authorDocument struct {
+		TerminalSubmission standardAuthoringV3TerminalSubmission `json:"terminal_submission"`
+	}
+	if err := json.Unmarshal(authorContext, &authorDocument); err != nil {
+		t.Fatalf("decode author context: %v", err)
+	}
+	if got := authorDocument.TerminalSubmission; got.Tool != standardAuthoringV3ValidateTool || got.Mode != "candidate_workspace" || got.CandidateDirectory != StandardAuthoringCodexAttemptTaskDirectory || len(got.RequiredOutputs) != 0 || len(got.CandidateFiles) != 6 {
+		t.Fatalf("author terminal submission = %+v", got)
+	}
+}
+
 func TestStandardAuthoringV3AuthorCapturesOnlyFixedWorkspaceFiles(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
