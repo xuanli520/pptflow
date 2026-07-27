@@ -595,11 +595,29 @@ func (submission *standardAuthoringV3Submission) captureStructured(request stand
 		if _, duplicate := seen[item.Name]; duplicate {
 			return workflowkit.StageExecutionResult{}, fmt.Errorf("duplicate output")
 		}
+		if err := standardAuthoringV3ValidateStructuredOutput(output, []byte(item.Content)); err != nil {
+			return workflowkit.StageExecutionResult{}, err
+		}
 		seen[item.Name] = struct{}{}
 		artifacts = append(artifacts, workflowkit.StageArtifact{Name: item.Name, SchemaVersion: output.SchemaVersion, Content: []byte(item.Content)})
 	}
 	return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: workflowkit.VerdictPass}, Artifacts: artifacts}, nil
 }
+
+func standardAuthoringV3ValidateStructuredOutput(output workflowkit.ArtifactSpec, content []byte) error {
+	if output.SchemaVersion != workflowkit.WorkflowFindingFormat {
+		return nil
+	}
+	var finding workflowkit.WorkflowFinding
+	if err := standardAuthoringV3DecodeTypedInput(content, &finding); err != nil {
+		return fmt.Errorf("workflow finding output %q is invalid", output.Name)
+	}
+	if err := finding.Validate(); err != nil {
+		return fmt.Errorf("workflow finding output %q is invalid", output.Name)
+	}
+	return nil
+}
+
 func (submission *standardAuthoringV3Submission) captureCandidate() (workflowkit.StageExecutionResult, workflowkit.CandidateSnapshot, map[string][]byte, error) {
 	if submission.taskRoot == "" {
 		return workflowkit.StageExecutionResult{}, workflowkit.CandidateSnapshot{}, nil, fmt.Errorf("missing candidate workspace")

@@ -36,6 +36,57 @@ func TestStandardAuthoringV3SubmissionUsesRawTypedContent(t *testing.T) {
 	}
 }
 
+func TestStandardAuthoringV3CriticSubmissionRejectsUnknownFindingFields(t *testing.T) {
+	stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.TestQualityCritic))
+	if !found || stage.AgentRole == nil {
+		t.Fatal("3.0 test quality critic stage is unavailable")
+	}
+	finding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
+		Code:             "test_quality_defect",
+		ProducingStage:   workflowkit.StageKey(workflowadapter.TestQualityCritic),
+		TargetWriter:     workflowkit.StageKey(workflowadapter.AuthoringRepair),
+		EvidenceDigest:   workflowkit.SHA256Fingerprint([]byte("evidence")),
+		CandidateDigest:  workflowkit.SHA256Fingerprint([]byte("candidate")),
+		DiagnosticDigest: workflowkit.SHA256Fingerprint([]byte("diagnostic")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := json.Marshal(finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withUnknownField := append(append([]byte(nil), canonical[:len(canonical)-1]...), []byte(`,"finding":{"severity":"critical"}}`)...)
+	invalidPayload, err := json.Marshal(map[string]any{
+		"verdict":   "pass",
+		"artifacts": []map[string]string{{"name": "test_quality_finding", "content": string(withUnknownField)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleCritic, "", 64<<10)
+	response, err := rejected.handle(context.Background(), invalidPayload)
+	if err != nil || string(response) != `{"accepted":false,"reason":"structured_output_invalid"}` {
+		t.Fatalf("critic accepted finding with unknown field: %s, %v", response, err)
+	}
+	if _, accepted := rejected.acceptedResult(); accepted {
+		t.Fatal("unknown finding field produced a durable output")
+	}
+
+	validPayload, err := json.Marshal(map[string]any{
+		"verdict":   "pass",
+		"artifacts": []map[string]string{{"name": "test_quality_finding", "content": string(canonical)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleCritic, "", 64<<10)
+	response, err = accepted.handle(context.Background(), validPayload)
+	if err != nil || string(response) != `{"accepted":true}` {
+		t.Fatalf("canonical critic finding was rejected: %s, %v", response, err)
+	}
+}
+
 func TestStandardAuthoringV3ContextDocumentDeclaresTerminalSubmission(t *testing.T) {
 	researchStage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.RepoStructureResearch))
 	if !found || researchStage.AgentRole == nil {
