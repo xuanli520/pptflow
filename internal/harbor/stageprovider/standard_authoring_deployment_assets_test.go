@@ -97,6 +97,9 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringLoop) && !strings.Contains(joined, "harbor_validate_candidate") {
 			t.Fatalf("3.0 author prompt does not bind the host validation tool")
 		}
+		if (registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringLoop) || registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair)) && (!strings.Contains(joined, "POSIX sh compatible") || !strings.Contains(joined, "set -o pipefail")) {
+			t.Fatalf("author prompt for %q does not make sh-invoked scripts POSIX compatible", registration.Stage.Key)
+		}
 		stage, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(registration.Stage.Key)
 		if !found || stage.AgentRole == nil {
 			t.Fatalf("agent stage %q has no frozen agent role", registration.Stage.Key)
