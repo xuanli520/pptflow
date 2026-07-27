@@ -271,6 +271,11 @@ func candidateRepairRound(finding WorkflowFinding, rule WorkflowRepairRule, ledg
 
 func workflowRepairClosure(workflow WorkflowDescriptor, target StageKey) []NodeID {
 	selected := map[StageKey]struct{}{target: {}}
+	order := mustTopologicalStages(workflow)
+	positions := make(map[StageKey]int, len(order))
+	for index, key := range order {
+		positions[key] = index
+	}
 	changed := true
 	for changed {
 		changed = false
@@ -281,13 +286,12 @@ func workflowRepairClosure(workflow WorkflowDescriptor, target StageKey) []NodeI
 			if _, exists := selected[stage.Key]; exists {
 				continue
 			}
-			if stageDependsOnSelected(stage, selected) || stageConsumesSelectedWrite(stage, selected, workflow) {
+			if stageDependsOnSelected(stage, selected) || stageConsumesSelectedWrite(stage, selected, workflow, positions) {
 				selected[stage.Key] = struct{}{}
 				changed = true
 			}
 		}
 	}
-	order := mustTopologicalStages(workflow)
 	result := make([]NodeID, 0, len(selected))
 	for _, key := range order {
 		if _, exists := selected[key]; exists {
@@ -306,9 +310,16 @@ func stageDependsOnSelected(stage StageDescriptor, selected map[StageKey]struct{
 	return false
 }
 
-func stageConsumesSelectedWrite(stage StageDescriptor, selected map[StageKey]struct{}, workflow WorkflowDescriptor) bool {
+func stageConsumesSelectedWrite(stage StageDescriptor, selected map[StageKey]struct{}, workflow WorkflowDescriptor, positions map[StageKey]int) bool {
 	for key := range selected {
 		producer, _ := workflow.Stage(key)
+		// A repair must only invalidate a resource consumer that observes the
+		// repaired output. A preceding verifier consumes the prior candidate;
+		// selecting it would introduce a backwards dependency into the repair
+		// schedule and can create a cycle.
+		if positions[producer.Key] >= positions[stage.Key] {
+			continue
+		}
 		if _, found := resourceOverlap(producer.WriteSet, stage.ReadSet); found {
 			return true
 		}
@@ -320,6 +331,11 @@ func workflowRepairSchedule(workflow WorkflowDescriptor, invalidated []NodeID) (
 	selected := make(map[NodeID]struct{}, len(invalidated))
 	for _, nodeID := range invalidated {
 		selected[nodeID] = struct{}{}
+	}
+	order := mustTopologicalStages(workflow)
+	positions := make(map[StageKey]int, len(order))
+	for index, key := range order {
+		positions[key] = index
 	}
 	repairWorkflow := WorkflowDescriptor{ID: workflow.ID + "-repair", Version: workflow.Version}
 	for _, original := range workflow.Stages {
@@ -341,6 +357,13 @@ func workflowRepairSchedule(workflow WorkflowDescriptor, invalidated []NodeID) (
 				continue
 			}
 			if _, included := selected[producer.Key]; !included {
+				continue
+			}
+			// The selected suffix can include a final materializer which rewrites
+			// a resource initially read by an earlier admission stage. That write
+			// does not precede the admission's input in the original run, so it
+			// cannot become a backwards repair dependency.
+			if positions[producer.Key] >= positions[original.Key] {
 				continue
 			}
 			if _, consumes := resourceOverlap(producer.WriteSet, original.ReadSet); consumes {

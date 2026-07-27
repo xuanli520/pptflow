@@ -29,6 +29,36 @@ func TestPlanWorkflowRepairInvalidatesOnlyTargetAndResourceDependencyClosure(t *
 	}
 }
 
+func TestPlanWorkflowRepairSkipsPreRepairCandidateVerifier(t *testing.T) {
+	workflow := WorkflowDescriptor{ID: "repair-order", Version: "1", Stages: []StageDescriptor{
+		testStage("author", nil, EffectContentProducer, nil, []ResourceKey{"candidate/main"}),
+		testStage("verify", []StageKey{"author"}, EffectEvidenceOnly, []ResourceKey{"candidate/main"}, []ResourceKey{"evidence/validation"}),
+		testStage("critic", []StageKey{"verify"}, EffectEvidenceOnly, []ResourceKey{"candidate/main"}, []ResourceKey{"finding/quality"}),
+		testStage("repair", []StageKey{"critic"}, EffectContentMutator, []ResourceKey{"candidate/main", "finding/quality"}, []ResourceKey{"candidate/main"}),
+		testStage("review", []StageKey{"repair"}, EffectEvidenceOnly, []ResourceKey{"candidate/main"}, []ResourceKey{"review/content"}),
+		testStage("admission", []StageKey{"review"}, EffectEvidenceOnly, []ResourceKey{"candidate/main", "task/metadata"}, []ResourceKey{"admission/report"}),
+		testStage("materialize", []StageKey{"admission"}, EffectContentMutator, []ResourceKey{"candidate/main", "admission/report"}, []ResourceKey{"task/metadata"}),
+	}}
+	finding, err := NewWorkflowFinding(WorkflowFinding{
+		Code: "candidate_integrity", ProducingStage: "critic", TargetWriter: "repair",
+		EvidenceDigest: SHA256Fingerprint([]byte("critic-evidence")), CandidateDigest: SHA256Fingerprint([]byte("candidate")),
+		DiagnosticDigest: SHA256Fingerprint([]byte("diagnostics")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanWorkflowRepair(workflow, finding, []WorkflowRepairRule{{
+		FindingCode: "candidate_integrity", ProducingStage: "critic", TargetWriter: "repair",
+		RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true,
+	}}, nil)
+	if err != nil {
+		t.Fatalf("plan repair after validation rejection: %v", err)
+	}
+	if got, want := plan.InvalidatedNodes, []NodeID{"repair", "review", "admission", "materialize"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("invalidated nodes = %#v, want %#v", got, want)
+	}
+}
+
 func TestPlanWorkflowRepairEnforcesRulesSnapshotAndBoundedCandidateRounds(t *testing.T) {
 	workflow := repairTestWorkflow()
 	finding := repairTestFinding(t)

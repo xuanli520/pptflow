@@ -229,8 +229,8 @@ func standardAuthoringV3RepairLedger(workflow workflowkit.WorkflowDescriptor, in
 		return nil, fmt.Errorf("candidate snapshot is invalid")
 	}
 	var receipt workflowkit.ValidationReceipt
-	if err := standardAuthoringV3DecodeTypedInput(inputs["validation_receipt"], &receipt); err != nil || receipt.Validate() != nil || receipt.Verdict != workflowkit.ValidationPass || receipt.SnapshotDigest != snapshot.Digest {
-		return nil, fmt.Errorf("validation receipt is not a passing receipt for the candidate")
+	if err := standardAuthoringV3DecodeTypedInput(inputs["validation_receipt"], &receipt); err != nil || receipt.Validate() != nil || (receipt.Verdict != workflowkit.ValidationPass && receipt.Verdict != workflowkit.ValidationReject) || receipt.SnapshotDigest != snapshot.Digest {
+		return nil, fmt.Errorf("validation receipt is not a current candidate receipt")
 	}
 	rules := []workflowkit.WorkflowRepairRule{
 		{FindingCode: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},

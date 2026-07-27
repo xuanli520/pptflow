@@ -110,11 +110,10 @@ func (executor *StandardAuthoringMaterializeExecutor) executeHostCandidateVerify
 		return workflowkit.StageExecutionResult{}, err
 	}
 	artifacts := []workflowkit.StageArtifact{{Name: "validation_receipt", SchemaVersion: workflowkit.ValidationReceiptFormat, Content: receiptJSON}}
-	verdict := workflowkit.VerdictNeedsRepair
-	if receipt.Verdict == workflowkit.ValidationPass {
-		verdict = workflowkit.VerdictPass
-	}
-	return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: verdict}, Artifacts: artifacts}, nil
+	// A rejected receipt is structured evidence for the two critic stages, not
+	// a terminal workflow verdict. They bind findings to it before authoring_repair
+	// produces and validates a replacement candidate.
+	return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: workflowkit.VerdictPass}, Artifacts: artifacts}, nil
 }
 
 func (executor *StandardAuthoringMaterializeExecutor) executeFinalAttestation(ctx context.Context, invocation stageprovider.StageOperationInvocation) (workflowkit.StageExecutionResult, error) {
