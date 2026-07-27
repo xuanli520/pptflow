@@ -113,7 +113,7 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if (registration.Stage.Key == workflowkit.StageKey(workflowadapter.TestQualityCritic) || registration.Stage.Key == workflowkit.StageKey(workflowadapter.SolutionIntegrityCritic)) && (!strings.Contains(joined, "validation receipt is rejected") || !strings.Contains(joined, "do not return an empty finding")) {
 			t.Fatalf("critic prompt for %q does not require a finding for a rejected host receipt", registration.Stage.Key)
 		}
-		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskSynthesis) && (!strings.Contains(joined, "harbor.verification-contract.v1") || !strings.Contains(joined, "MUST NOT contain schema_version")) {
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskSynthesis) && (!strings.Contains(joined, "harbor.verification-contract.v1") || !strings.Contains(joined, "exactly these six keys")) {
 			t.Fatalf("task-synthesis prompt does not require the canonical host verification contract")
 		}
 
