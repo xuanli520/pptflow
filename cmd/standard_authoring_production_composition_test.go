@@ -113,6 +113,26 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	}
 }
 
+func TestStandardAuthoringCandidateCommandTimeoutUsesHostCandidateVerifyAttemptBudget(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	profile := standardAuthoringProductionTestProfile(t, template.Reference())
+	for index := range profile.Stages {
+		if profile.Stages[index].StageKey == workflowkit.StageKey(workflowadapter.HostCandidateVerify) {
+			profile.Stages[index].Budget.AttemptTimeout = 2*time.Hour + 10*time.Minute
+			profile.Stages[index].Budget.MaxElapsed = 2*time.Hour + 10*time.Minute
+			break
+		}
+	}
+
+	got, err := standardAuthoringCandidateCommandTimeout(profile)
+	if err != nil {
+		t.Fatalf("derive Standard authoring candidate command timeout: %v", err)
+	}
+	if want := 2*time.Hour + 10*time.Minute; got != want {
+		t.Fatalf("candidate command timeout = %s, want %s", got, want)
+	}
+}
+
 func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprovider.DeploymentOperationCatalogResolver, stageprovider.DeploymentOperationCatalogLock) {
 	t.Helper()
 	deploymentRoot := t.TempDir()

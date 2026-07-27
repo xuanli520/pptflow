@@ -33,10 +33,10 @@ type codeEdgePhase1ProductionCompositionConfig struct {
 // the evaluator child through the template router; it cannot operate as a
 // substitute for either bundle.
 type codeEdgePhase1ProductionComposition struct {
-	Resolver         *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
-	CatalogBinding   app.TemplateDeploymentCatalogResolver
-	Admission        codeedge.TaskAdmissionContract
-	AuthoringHarness *app.StandardAuthoringDockerHarness
+	Resolver                *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
+	CatalogBinding          app.TemplateDeploymentCatalogResolver
+	Admission               codeedge.TaskAdmissionContract
+	AuthoringDockerCommands []stageprovider.LocalExecutableLock
 }
 
 func newCodeEdgePhase1ProductionComposition(config codeEdgePhase1ProductionCompositionConfig) (*codeEdgePhase1ProductionComposition, error) {
@@ -142,12 +142,6 @@ func codeEdgePhase1CompositionFromVerifiedAssets(managedRoot string, binding cod
 	if err != nil {
 		return nil, fmt.Errorf("construct CodeEdge Phase-1 parent executor: %w", err)
 	}
-	authoringHarness, err := app.NewStandardAuthoringDockerHarness(app.StandardAuthoringDockerHarnessConfig{
-		ManagedRoot: managedRoot, LockedCommands: commands, CommandTimeout: commandTimeout,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("construct Standard authoring Docker harness: %w", err)
-	}
 	attestor, err := stageprovider.NewCodeEdgePhase1RuntimeAttestor(stageprovider.CodeEdgePhase1RuntimeAttestorConfig{HarborFlowBuild: binding.HarborFlowBuild})
 	if err != nil {
 		return nil, fmt.Errorf("construct CodeEdge Phase-1 runtime attestor: %w", err)
@@ -164,8 +158,8 @@ func codeEdgePhase1CompositionFromVerifiedAssets(managedRoot string, binding cod
 		CatalogBinding: app.TemplateDeploymentCatalogResolver{
 			Template: workflowadapter.CodeEdgePhase1TemplateReference(), Resolver: providers.Resolver,
 		},
-		Admission:        admission,
-		AuthoringHarness: authoringHarness,
+		Admission:               admission,
+		AuthoringDockerCommands: append([]stageprovider.LocalExecutableLock(nil), commands...),
 	}, nil
 }
 
