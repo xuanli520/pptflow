@@ -224,13 +224,9 @@ func standardAuthoringV3ValidateRepairInputs(workflow workflowkit.WorkflowDescri
 }
 
 func standardAuthoringV3RepairLedger(workflow workflowkit.WorkflowDescriptor, inputs map[string][]byte) ([]byte, error) {
-	var snapshot workflowkit.CandidateSnapshot
-	if err := standardAuthoringV3DecodeTypedInput(inputs["candidate_snapshot"], &snapshot); err != nil || snapshot.Validate() != nil {
-		return nil, fmt.Errorf("candidate snapshot is invalid")
-	}
-	var receipt workflowkit.ValidationReceipt
-	if err := standardAuthoringV3DecodeTypedInput(inputs["validation_receipt"], &receipt); err != nil || receipt.Validate() != nil || (receipt.Verdict != workflowkit.ValidationPass && receipt.Verdict != workflowkit.ValidationReject) || receipt.SnapshotDigest != snapshot.Digest {
-		return nil, fmt.Errorf("validation receipt is not a current candidate receipt")
+	identity, found, err := standardAuthoringV3CandidateValidationIdentityFromInputs(inputs)
+	if err != nil || !found {
+		return nil, fmt.Errorf("candidate validation identity is unavailable")
 	}
 	rules := []workflowkit.WorkflowRepairRule{
 		{FindingCode: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
@@ -243,7 +239,7 @@ func standardAuthoringV3RepairLedger(workflow workflowkit.WorkflowDescriptor, in
 		if err := standardAuthoringV3DecodeTypedInput(inputs[name], &finding); err != nil || finding.Validate() != nil {
 			return nil, fmt.Errorf("finding %q is invalid", name)
 		}
-		if finding.CandidateDigest != snapshot.Digest || finding.EvidenceDigest != receipt.Digest || finding.DiagnosticDigest != receipt.Digest {
+		if finding.CandidateDigest != identity.CandidateSnapshotDigest || finding.EvidenceDigest != identity.ValidationReceiptDigest || finding.DiagnosticDigest != identity.ValidationReceiptDigest {
 			return nil, fmt.Errorf("finding %q is not bound to the reviewed candidate receipt", name)
 		}
 		plan, err := workflowkit.PlanWorkflowRepair(workflow, finding, rules, nil)
@@ -261,6 +257,26 @@ func standardAuthoringV3RepairLedger(workflow workflowkit.WorkflowDescriptor, in
 		return nil, err
 	}
 	return json.Marshal(ledger)
+}
+
+func standardAuthoringV3CandidateValidationIdentityFromInputs(inputs map[string][]byte) (standardAuthoringV3CandidateValidationIdentity, bool, error) {
+	rawSnapshot, hasSnapshot := inputs["candidate_snapshot"]
+	rawReceipt, hasReceipt := inputs["validation_receipt"]
+	if !hasSnapshot && !hasReceipt {
+		return standardAuthoringV3CandidateValidationIdentity{}, false, nil
+	}
+	if !hasSnapshot || !hasReceipt {
+		return standardAuthoringV3CandidateValidationIdentity{}, false, fmt.Errorf("candidate validation inputs are incomplete")
+	}
+	var snapshot workflowkit.CandidateSnapshot
+	if err := standardAuthoringV3DecodeTypedInput(rawSnapshot, &snapshot); err != nil || snapshot.Validate() != nil {
+		return standardAuthoringV3CandidateValidationIdentity{}, false, fmt.Errorf("candidate snapshot is invalid")
+	}
+	var receipt workflowkit.ValidationReceipt
+	if err := standardAuthoringV3DecodeTypedInput(rawReceipt, &receipt); err != nil || receipt.Validate() != nil || (receipt.Verdict != workflowkit.ValidationPass && receipt.Verdict != workflowkit.ValidationReject) || receipt.SnapshotDigest != snapshot.Digest {
+		return standardAuthoringV3CandidateValidationIdentity{}, false, fmt.Errorf("validation receipt is not a current candidate receipt")
+	}
+	return standardAuthoringV3CandidateValidationIdentity{CandidateSnapshotDigest: snapshot.Digest, ValidationReceiptDigest: receipt.Digest}, true, nil
 }
 
 func standardAuthoringV3DecodeTypedInput(raw []byte, destination any) error {
@@ -283,6 +299,14 @@ type standardAuthoringV3Input struct {
 	SchemaVersion string                  `json:"schema_version"`
 	Digest        workflowkit.Fingerprint `json:"digest"`
 	Content       string                  `json:"content"`
+}
+
+// standardAuthoringV3CandidateValidationIdentity makes the semantic identities
+// inside typed candidate artifacts explicit. Artifact digests attest raw JSON
+// containers; repair findings must bind the identities inside those containers.
+type standardAuthoringV3CandidateValidationIdentity struct {
+	CandidateSnapshotDigest workflowkit.Fingerprint `json:"candidate_snapshot_digest"`
+	ValidationReceiptDigest workflowkit.Fingerprint `json:"validation_receipt_digest"`
 }
 
 // standardAuthoringV3TerminalSubmission makes the otherwise host-private
@@ -361,16 +385,24 @@ func standardAuthoringV3ContextDocument(request workflowkit.StageExecutionReques
 				"If validation rejects the candidate, apply its bounded diagnostics and call again; a passing call completes this stage.",
 		}
 	}
+	candidateValidationIdentity, hasCandidateValidationIdentity, err := standardAuthoringV3CandidateValidationIdentityFromInputs(inputs)
+	if err != nil {
+		return nil, err
+	}
 	document := struct {
-		Format             string                                `json:"format"`
-		Version            string                                `json:"version"`
-		Stage              string                                `json:"stage"`
-		Program            workflowkit.Fingerprint               `json:"program_fingerprint"`
-		Inputs             workflowkit.Fingerprint               `json:"inputs_fingerprint"`
-		CandidateWorkspace bool                                  `json:"candidate_workspace"`
-		TerminalSubmission standardAuthoringV3TerminalSubmission `json:"terminal_submission"`
-		Artifacts          []standardAuthoringV3Input            `json:"artifacts"`
+		Format                      string                                          `json:"format"`
+		Version                     string                                          `json:"version"`
+		Stage                       string                                          `json:"stage"`
+		Program                     workflowkit.Fingerprint                         `json:"program_fingerprint"`
+		Inputs                      workflowkit.Fingerprint                         `json:"inputs_fingerprint"`
+		CandidateWorkspace          bool                                            `json:"candidate_workspace"`
+		CandidateValidationIdentity *standardAuthoringV3CandidateValidationIdentity `json:"candidate_validation_identity,omitempty"`
+		TerminalSubmission          standardAuthoringV3TerminalSubmission           `json:"terminal_submission"`
+		Artifacts                   []standardAuthoringV3Input                      `json:"artifacts"`
 	}{Format: "harbor.standard-authoring-v3-context.v1", Version: "1", Stage: string(request.Stage.Key), Program: program.Fingerprint, Inputs: digest, CandidateWorkspace: candidateWriter, TerminalSubmission: submission, Artifacts: entries}
+	if hasCandidateValidationIdentity {
+		document.CandidateValidationIdentity = &candidateValidationIdentity
+	}
 	raw, err := json.Marshal(document)
 	if err != nil || len(raw) > standardAuthoringV3ContextLimit {
 		return nil, fmt.Errorf("context document is invalid")

@@ -82,6 +82,56 @@ func TestStandardAuthoringV3ContextDocumentDeclaresTerminalSubmission(t *testing
 	}
 }
 
+func TestStandardAuthoringV3ContextDocumentProjectsCandidateValidationIdentity(t *testing.T) {
+	snapshot, err := workflowkit.NewCandidateSnapshot([]workflowkit.CandidateFile{{
+		Path: "instruction.md", SchemaVersion: "harbor.artifact.v1", ContentDigest: workflowkit.SHA256Fingerprint([]byte("candidate")), SizeBytes: int64(len("candidate")),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := workflowkit.NewCandidateValidationContract(workflowkit.SHA256Fingerprint([]byte("runtime")), workflowkit.SHA256Fingerprint([]byte("verification")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractDigest, err := contract.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	receipt, err := workflowkit.NewValidationReceipt(workflowkit.ValidationReceipt{
+		SnapshotDigest: snapshot.Digest, ContractDigest: contractDigest, Verdict: workflowkit.ValidationReject, FailureCode: workflowkit.AgentFailureValidatorReject,
+		Diagnostics: []workflowkit.AgentCommandReport{{CommandID: "environment_build", ExitCode: 1, TestStarted: false}}, IssuedAt: now, ExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRaw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRaw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextDocument, err := standardAuthoringV3ContextDocument(
+		workflowkit.StageExecutionRequest{Stage: workflowkit.StageDescriptor{Key: workflowkit.StageKey(workflowadapter.TestQualityCritic)}},
+		StandardAuthoringCodexTurnProgram{Fingerprint: workflowkit.SHA256Fingerprint([]byte("critic-program"))}, workflowkit.SHA256Fingerprint([]byte("critic-inputs")),
+		map[string][]byte{"candidate_snapshot": snapshotRaw, "validation_receipt": receiptRaw}, false,
+	)
+	if err != nil {
+		t.Fatalf("critic context: %v", err)
+	}
+	var document struct {
+		CandidateValidationIdentity *standardAuthoringV3CandidateValidationIdentity `json:"candidate_validation_identity"`
+	}
+	if err := json.Unmarshal(contextDocument, &document); err != nil {
+		t.Fatalf("decode critic context: %v", err)
+	}
+	if document.CandidateValidationIdentity == nil || document.CandidateValidationIdentity.CandidateSnapshotDigest != snapshot.Digest || document.CandidateValidationIdentity.ValidationReceiptDigest != receipt.Digest {
+		t.Fatalf("candidate validation identity = %+v, want snapshot=%s receipt=%s", document.CandidateValidationIdentity, snapshot.Digest, receipt.Digest)
+	}
+}
+
 func TestStandardAuthoringV3AuthorCapturesOnlyFixedWorkspaceFiles(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
