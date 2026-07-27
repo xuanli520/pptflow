@@ -97,6 +97,13 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringLoop) && !strings.Contains(joined, "harbor_validate_candidate") {
 			t.Fatalf("3.0 author prompt does not bind the host validation tool")
 		}
+		stage, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(registration.Stage.Key)
+		if !found || stage.AgentRole == nil {
+			t.Fatalf("agent stage %q has no frozen agent role", registration.Stage.Key)
+		}
+		if stage.AgentRole.RoleID != workflowkit.AgentRoleAuthor && (!strings.Contains(joined, "harbor_submit_output") || !strings.Contains(joined, `"verdict":"pass"`) || !strings.Contains(joined, "prose final answer")) {
+			t.Fatalf("non-author prompt for %q does not require the exact host submission protocol", registration.Stage.Key)
+		}
 
 		schemaRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
 		if err != nil {

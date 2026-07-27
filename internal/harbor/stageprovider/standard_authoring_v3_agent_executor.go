@@ -398,7 +398,7 @@ func (submission *standardAuthoringV3Submission) dynamicTool() agent.DynamicTool
 		name = standardAuthoringV3ValidateTool
 		schema = json.RawMessage(`{"additionalProperties":false,"properties":{"verdict":{"const":"pass"}},"required":["verdict"],"type":"object"}`)
 	}
-	return agent.DynamicTool{Name: name, Description: "Submit the host-validated typed result for this frozen stage.", InputSchema: schema, Handler: submission.handle}
+	return agent.DynamicTool{Name: name, Description: "Required terminal submission for this frozen stage. A prose response never completes the stage. Call exactly once with verdict pass and one raw content artifact for every declared output, using exact output names.", InputSchema: schema, Handler: submission.handle}
 }
 func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
 	if submission.accepted != nil {
