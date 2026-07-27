@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -200,6 +201,17 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 	if err := validateHarborFlowProductionBuildIdentity(config.StandardBinding.HarborFlowBuild, config.CodeEdgePhase1Binding.HarborFlowBuild, config.EvaluatorBinding.HarborFlowBuild); err != nil {
 		return nil, err
 	}
+	legacyRuns, err := dataStore.ListActiveLegacyTemplateRuns(context.Background(), workflowadapter.StandardAuthoringWorkflowTemplateID, workflowadapter.StandardAuthoringContractTemplateVersion)
+	if err != nil {
+		return nil, fmt.Errorf("preflight active retired Standard authoring runs: %w", err)
+	}
+	if len(legacyRuns) != 0 {
+		ids := make([]string, 0, len(legacyRuns))
+		for _, run := range legacyRuns {
+			ids = append(ids, run.ID)
+		}
+		return nil, fmt.Errorf("Standard authoring 3.0 deployment is blocked by active retired runs %s; an operator must explicitly terminate them", strings.Join(ids, ", "))
+	}
 
 	parent, err := newCodeEdgePhase1ProductionComposition(codeEdgePhase1ProductionCompositionConfig{
 		CatalogPath:               config.Paths.ParentCatalog,
@@ -217,7 +229,7 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 		CatalogPath: config.Paths.StandardCatalog, LockPath: config.Paths.StandardLock, ContractRoot: config.Paths.StandardContractRoot,
 		ManagedRoot: root, Store: dataStore, HarborFlowBuild: config.StandardBinding.HarborFlowBuild,
 		CatalogReceiptFingerprint: config.StandardBinding.CatalogReceiptFingerprint, LockIdentity: config.StandardBinding.LockIdentity,
-		LookupEnvironment: config.LookupEnvironment, AdmissionContract: &parent.Admission, HarnessValidator: parent.AuthoringHarness,
+		LookupEnvironment: config.LookupEnvironment, AdmissionContract: &parent.Admission, CandidateHarness: parent.AuthoringHarness,
 	})
 	if err != nil {
 		return nil, err
@@ -250,7 +262,6 @@ func newHarborFlowProductionLifecycleServicesWithConfig(root string, dataStore *
 		RequireDeploymentLock:                  true,
 		StandardAuthoringSourceCapturer:        standard.SourceCapturer,
 		StandardAuthoringRunDefinitionProvider: standard.Definitions,
-		CodeEdgePhase1RunDefinitionProvider:    parent.Definitions,
 		EvaluatorRunDefinitionProvider:         evaluator.Definitions,
 		CodeEdgeEvaluatorObserver:              evaluator.Observer,
 		RunWorkerHandoffLauncher:               executableRunWorkerLauncher{},

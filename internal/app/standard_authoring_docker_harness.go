@@ -2,10 +2,8 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,12 +18,8 @@ import (
 )
 
 const (
-	standardAuthoringDockerHarnessStateDirectory      = "standard-authoring-docker-harness"
 	standardAuthoringDockerHarnessTailLimit           = 16 << 10
 	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /oracle/worktree && mkdir -p /oracle/worktree && cp -R /oracle/source/. /oracle/worktree/ && test -d /oracle/worktree && touch /oracle/worktree/.harbor-source-access && rm /oracle/worktree/.harbor-source-access"
-
-	standardAuthoringDockerHarnessReceiptFormat  = "harbor.standard-authoring.docker-image.v1"
-	standardAuthoringDockerHarnessReceiptVersion = "1"
 )
 
 var standardAuthoringDockerHarnessTokenPattern = regexp.MustCompile(`(?i)\b(?:sk|key|token)-[a-z0-9_-]{16,}\b`)
@@ -47,7 +41,6 @@ type StandardAuthoringDockerHarnessConfig struct {
 // argv, image, environment or network control to the model.
 type StandardAuthoringDockerHarness struct {
 	authoringWorkspaceRoot string
-	stateRoot              string
 	docker                 *lockedDockerRuntime
 	mu                     sync.Mutex
 }
@@ -79,18 +72,17 @@ func NewStandardAuthoringDockerHarness(config StandardAuthoringDockerHarnessConf
 	if err != nil {
 		return nil, err
 	}
-	stateRoot := filepath.Join(layout.root, standardAuthoringDockerHarnessStateDirectory)
-	if err := ensureStandardAuthoringHarnessDirectory(stateRoot); err != nil {
-		return nil, err
-	}
 	return &StandardAuthoringDockerHarness{
 		authoringWorkspaceRoot: authoringWorkspaceRoot,
-		stateRoot:              stateRoot,
 		docker:                 docker,
 	}, nil
 }
 
-func (harness *StandardAuthoringDockerHarness) Validate(ctx context.Context, request authoringharness.Request) (authoringharness.Result, error) {
+// ValidateV3Candidate runs the sealed 3.0 verifier over bytes already read by
+// the host from frozen artifact bindings. The workspace used by an author is
+// never consulted: the verifier writes a fresh private projection and mounts
+// only the repo_prepare source snapshot into Docker.
+func (harness *StandardAuthoringDockerHarness) ValidateV3Candidate(ctx context.Context, runID, stageAttemptID string, snapshot workflowkit.CandidateSnapshot, files map[string][]byte, verification StandardAuthoringVerificationContract) (authoringharness.Result, error) {
 	if harness == nil || harness.docker == nil {
 		return authoringharness.Result{}, errors.New("Standard authoring Docker harness is not configured")
 	}
@@ -100,28 +92,27 @@ func (harness *StandardAuthoringDockerHarness) Validate(ctx context.Context, req
 	if err := ctx.Err(); err != nil {
 		return authoringharness.Result{}, err
 	}
-	if err := validateStandardAuthoringHarnessRequest(request); err != nil {
+	if err := store.ValidateUUIDv7(runID); err != nil {
+		return authoringharness.Result{}, fmt.Errorf("Standard authoring candidate Run identity: %w", err)
+	}
+	if err := store.ValidateUUIDv7(stageAttemptID); err != nil {
+		return authoringharness.Result{}, fmt.Errorf("Standard authoring candidate stage attempt identity: %w", err)
+	}
+	if err := snapshot.Validate(); err != nil {
+		return authoringharness.Result{}, fmt.Errorf("Standard authoring candidate snapshot: %w", err)
+	}
+	if err := validateStandardAuthoringV3CandidateFiles(snapshot, files); err != nil {
 		return authoringharness.Result{}, err
 	}
-	workRoot, err := stageprovider.StandardAuthoringAttemptWorkspacePath(harness.authoringWorkspaceRoot, request.RunID, request.StageKey, request.StageAttemptID)
+	if err := verification.Validate(); err != nil {
+		return authoringharness.Result{}, fmt.Errorf("Standard authoring verification contract: %w", err)
+	}
+	candidate, err := authoringharness.CandidateFromBytes(authoringharness.ModeInitialOracle,
+		files[standardAuthoringV3DockerfilePath], files[standardAuthoringV3SolveScriptPath], files[standardAuthoringV3TestScriptPath])
 	if err != nil {
-		return authoringharness.Result{}, fmt.Errorf("resolve Standard authoring harness attempt workspace: %w", err)
+		return authoringharness.Result{}, fmt.Errorf("construct Standard authoring candidate: %w", err)
 	}
-	if err := stageprovider.ValidateStandardAuthoringAttemptWorkspacePath(harness.authoringWorkspaceRoot, request.RunID, request.StageKey, request.StageAttemptID, workRoot); err != nil {
-		return authoringharness.Result{}, fmt.Errorf("validate Standard authoring harness attempt workspace: %w", err)
-	}
-	taskRoot := filepath.Join(workRoot, stageprovider.StandardAuthoringCodexAttemptTaskDirectory)
-	candidate, err := authoringharness.ReadCandidate(taskRoot, request.Mode)
-	if err != nil {
-		return authoringharness.Result{}, err
-	}
-
-	// Docker tags and host receipts are shared by environment digest. Serialize
-	// validation to keep tag replacement and receipt publication atomic from
-	// the harness's point of view.
-	harness.mu.Lock()
-	defer harness.mu.Unlock()
-	sourceRoot := filepath.Join(workRoot, stageprovider.StandardAuthoringCodexAttemptSourceDirectory)
+	sourceRoot := filepath.Join(harness.authoringWorkspaceRoot, runID, stageprovider.StandardAuthoringCodexRunSourceDirectory)
 	info, err := os.Stat(sourceRoot)
 	if err != nil {
 		return authoringharness.Result{}, fmt.Errorf("inspect Standard authoring frozen source: %w", err)
@@ -129,114 +120,154 @@ func (harness *StandardAuthoringDockerHarness) Validate(ctx context.Context, req
 	if !info.IsDir() {
 		return authoringharness.Result{}, errors.New("Standard authoring frozen source is not a directory")
 	}
-	return harness.validateCandidate(ctx, request, candidate, sourceRoot)
+
+	harness.mu.Lock()
+	defer harness.mu.Unlock()
+	return harness.validateV3Candidate(ctx, runID, stageAttemptID, snapshot, candidate, files, sourceRoot, verification.Canonical())
 }
 
-func validateStandardAuthoringHarnessRequest(request authoringharness.Request) error {
-	if err := request.Mode.Validate(); err != nil {
-		return err
+const (
+	standardAuthoringV3InstructionPath   = "instruction.md"
+	standardAuthoringV3TaskTOMLPath      = "task.toml"
+	standardAuthoringV3DockerfilePath    = authoringharness.DockerfileRelativePath
+	standardAuthoringV3SolveScriptPath   = authoringharness.SolveScriptRelativePath
+	standardAuthoringV3TestScriptPath    = authoringharness.TestScriptRelativePath
+	standardAuthoringV3TestsAnalysisPath = "tests_analysis.json"
+)
+
+func validateStandardAuthoringV3CandidateFiles(snapshot workflowkit.CandidateSnapshot, files map[string][]byte) error {
+	expected := map[string][]byte{
+		standardAuthoringV3InstructionPath:   files[standardAuthoringV3InstructionPath],
+		standardAuthoringV3TaskTOMLPath:      files[standardAuthoringV3TaskTOMLPath],
+		standardAuthoringV3DockerfilePath:    files[standardAuthoringV3DockerfilePath],
+		standardAuthoringV3SolveScriptPath:   files[standardAuthoringV3SolveScriptPath],
+		standardAuthoringV3TestScriptPath:    files[standardAuthoringV3TestScriptPath],
+		standardAuthoringV3TestsAnalysisPath: files[standardAuthoringV3TestsAnalysisPath],
 	}
-	if err := store.ValidateUUIDv7(request.RunID); err != nil {
-		return fmt.Errorf("Standard authoring harness Run identity: %w", err)
+	if len(files) != len(expected) || len(snapshot.Files) != len(expected) {
+		return errors.New("Standard authoring candidate snapshot does not contain the fixed 3.0 file set")
 	}
-	if err := store.ValidateUUIDv7(request.StageAttemptID); err != nil {
-		return fmt.Errorf("Standard authoring harness stage attempt identity: %w", err)
+	manifest := make(map[string]workflowkit.CandidateFile, len(snapshot.Files))
+	for _, file := range snapshot.Files {
+		manifest[file.Path] = file
 	}
-	expectedStage := workflowkit.StageKey("dockerfile_build_validate")
-	if request.Mode == authoringharness.ModeInitialOracle {
-		expectedStage = workflowkit.StageKey("authoring_harness")
-	}
-	if request.StageKey != expectedStage {
-		return fmt.Errorf("Standard authoring harness mode %q is not bound to stage %q", request.Mode, request.StageKey)
+	for path, content := range expected {
+		if len(content) == 0 {
+			return fmt.Errorf("Standard authoring candidate file %q is empty", path)
+		}
+		file, found := manifest[path]
+		if !found || file.SizeBytes != int64(len(content)) || file.ContentDigest != workflowkit.SHA256Fingerprint(content) {
+			return fmt.Errorf("Standard authoring candidate snapshot does not bind %q", path)
+		}
 	}
 	return nil
 }
 
-func (harness *StandardAuthoringDockerHarness) validateCandidate(ctx context.Context, request authoringharness.Request, candidate authoringharness.Candidate, sourceRoot string) (authoringharness.Result, error) {
-	runState := filepath.Join(harness.stateRoot, request.RunID)
-	if err := ensureStandardAuthoringHarnessDirectory(runState); err != nil {
-		return authoringharness.Result{}, err
-	}
-	invocationRoot, err := os.MkdirTemp(runState, ".validate-")
+func (harness *StandardAuthoringDockerHarness) validateV3Candidate(ctx context.Context, runID, stageAttemptID string, snapshot workflowkit.CandidateSnapshot, candidate authoringharness.Candidate, files map[string][]byte, sourceRoot string, verification StandardAuthoringVerificationContract) (authoringharness.Result, error) {
+	invocationRoot, err := os.MkdirTemp("", "harbor-authoring-v3-validate-")
 	if err != nil {
-		return authoringharness.Result{}, fmt.Errorf("create Standard authoring harness invocation: %w", err)
+		return authoringharness.Result{}, fmt.Errorf("create Standard authoring verifier invocation: %w", err)
 	}
 	defer os.RemoveAll(invocationRoot)
 	if err := os.Chmod(invocationRoot, 0o700); err != nil {
 		return authoringharness.Result{}, err
 	}
 	snapshotRoot := filepath.Join(invocationRoot, "candidate")
-	if err := writeStandardAuthoringHarnessSnapshot(snapshotRoot, candidate); err != nil {
+	if err := writeStandardAuthoringV3CandidateSnapshot(snapshotRoot, files); err != nil {
 		return authoringharness.Result{}, err
 	}
-
 	result := authoringharness.Result{
-		Mode: request.Mode, RunID: request.RunID, StageKey: request.StageKey, StageAttemptID: request.StageAttemptID,
+		Mode: authoringharness.ModeInitialOracle, RunID: runID, StageKey: workflowkit.StageKey("host_candidate_verify"), StageAttemptID: stageAttemptID,
 		CandidateDigest: candidate.CandidateDigest, EnvironmentDigest: candidate.EnvironmentDigest,
+		Steps: []authoringharness.StepResult{{Step: "layout_probe", Passed: true, Findings: []string{}, OutputFingerprint: snapshot.Digest}},
 	}
-	image, buildStep, reused, err := harness.ensureCandidateImage(ctx, request, candidate, invocationRoot, snapshotRoot)
+	image, buildStep, reused, err := harness.ensureCandidateImage(ctx, authoringharness.Request{Mode: authoringharness.ModeInitialOracle, RunID: runID, StageKey: workflowkit.StageKey("host_candidate_verify"), StageAttemptID: stageAttemptID}, candidate, invocationRoot, snapshotRoot)
 	if err != nil {
 		return authoringharness.Result{}, err
 	}
+	buildStep.Step = "environment_build"
 	result.ImageID = image.ImageID
 	result.ImageReused = reused
 	result.Steps = append(result.Steps, buildStep)
 	if !buildStep.Passed {
 		return harness.finishResult(result)
 	}
-	if request.Mode == authoringharness.ModeDockerfileBuild {
-		sourceAccessStep, err := harness.runSourceAccess(ctx, image, invocationRoot, sourceRoot)
-		if err != nil {
-			return authoringharness.Result{}, err
-		}
-		result.Steps = append(result.Steps, sourceAccessStep)
-		if !sourceAccessStep.Passed {
-			return harness.finishResult(result)
-		}
-		result.Passed = true
-		return harness.finishResult(result)
-	}
-
-	initialStep, err := harness.runInitial(ctx, request, image, invocationRoot, snapshotRoot, sourceRoot)
+	sourceAccess, err := harness.runSourceAccess(ctx, image, invocationRoot, sourceRoot)
 	if err != nil {
 		return authoringharness.Result{}, err
 	}
-	result.Steps = append(result.Steps, initialStep)
-	if !initialStep.Passed {
+	result.Steps = append(result.Steps, sourceAccess)
+	if !sourceAccess.Passed {
 		return harness.finishResult(result)
 	}
-	oracleStep, err := harness.runOracle(ctx, request, image, invocationRoot, snapshotRoot, sourceRoot)
+	baseline, err := harness.runV3Baseline(ctx, authoringharness.Request{Mode: authoringharness.ModeInitialOracle, RunID: runID, StageKey: workflowkit.StageKey("host_candidate_verify"), StageAttemptID: stageAttemptID}, image, invocationRoot, snapshotRoot, sourceRoot, verification)
 	if err != nil {
 		return authoringharness.Result{}, err
 	}
-	result.Steps = append(result.Steps, oracleStep)
-	result.Passed = oracleStep.Passed
+	baseline.Step = "baseline_verify"
+	result.Steps = append(result.Steps, baseline)
+	if !baseline.Passed {
+		return harness.finishResult(result)
+	}
+	oracle, err := harness.runV3Oracle(ctx, authoringharness.Request{Mode: authoringharness.ModeInitialOracle, RunID: runID, StageKey: workflowkit.StageKey("host_candidate_verify"), StageAttemptID: stageAttemptID}, image, invocationRoot, snapshotRoot, sourceRoot, verification, "oracle")
+	if err != nil {
+		return authoringharness.Result{}, err
+	}
+	result.Steps = append(result.Steps, oracle)
+	if !oracle.Passed {
+		return harness.finishResult(result)
+	}
+	coverage, err := harness.runV3Oracle(ctx, authoringharness.Request{Mode: authoringharness.ModeInitialOracle, RunID: runID, StageKey: workflowkit.StageKey("host_candidate_verify"), StageAttemptID: stageAttemptID}, image, invocationRoot, snapshotRoot, sourceRoot, verification, "coverage")
+	if err != nil {
+		return authoringharness.Result{}, err
+	}
+	coverage.Step = "coverage_verify"
+	result.Steps = append(result.Steps, coverage)
+	if !coverage.Passed {
+		return harness.finishResult(result)
+	}
+	integrity := authoringharness.StepResult{Step: "integrity_verify", Passed: true, Findings: []string{}, OutputFingerprint: snapshot.Digest}
+	if err := validateStandardAuthoringV3SolutionDiff(filepath.Join(invocationRoot, "verification", "oracle", "workspace"), sourceRoot, verification.AllowedSolutionPaths); err != nil {
+		integrity.Passed = false
+		integrity.Findings = []string{"Oracle modified a path outside the frozen verification contract"}
+	}
+	result.Steps = append(result.Steps, integrity)
+	if !integrity.Passed {
+		return harness.finishResult(result)
+	}
+	result.Passed = true
 	return harness.finishResult(result)
 }
 
+func writeStandardAuthoringV3CandidateSnapshot(root string, files map[string][]byte) error {
+	if err := os.Mkdir(root, 0o700); err != nil {
+		return err
+	}
+	for relative, content := range files {
+		if err := workflowkit.ValidateCandidateFilePath(relative); err != nil {
+			return err
+		}
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+		mode := os.FileMode(0o600)
+		if relative == standardAuthoringV3SolveScriptPath || relative == standardAuthoringV3TestScriptPath {
+			mode = 0o700
+		}
+		if err := writeNewBytesWithMode(path, content, mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type standardAuthoringHarnessImageReceipt struct {
-	Format            string                  `json:"format"`
-	Version           string                  `json:"version"`
-	RunID             string                  `json:"run_id"`
-	EnvironmentDigest workflowkit.Fingerprint `json:"environment_digest"`
-	ImageTag          string                  `json:"image_tag"`
-	ImageID           string                  `json:"image_id"`
+	ImageTag string `json:"image_tag"`
+	ImageID  string `json:"image_id"`
 }
 
 func (harness *StandardAuthoringDockerHarness) ensureCandidateImage(ctx context.Context, request authoringharness.Request, candidate authoringharness.Candidate, invocationRoot, snapshotRoot string) (standardAuthoringHarnessImageReceipt, authoringharness.StepResult, bool, error) {
-	receiptPath := harness.imageReceiptPath(request.RunID, candidate.EnvironmentDigest)
-	if receipt, found, err := readStandardAuthoringHarnessImageReceipt(receiptPath, request.RunID, candidate.EnvironmentDigest); err != nil {
-		return standardAuthoringHarnessImageReceipt{}, authoringharness.StepResult{}, false, err
-	} else if found {
-		imageID, inspected, fingerprint, inspectErr := harness.docker.inspectImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1DockerBuildCommandID, receipt.ImageTag)
-		if inspectErr == nil && imageID == receipt.ImageID {
-			return receipt, harness.commandStep("docker_build", inspected, fingerprint, true, nil), true, nil
-		}
-		if inspectErr != nil && isStandardAuthoringHarnessAttestationError(inspectErr) {
-			return standardAuthoringHarnessImageReceipt{}, authoringharness.StepResult{}, false, inspectErr
-		}
-	}
-
 	imageTag := standardAuthoringHarnessImageTag(request.RunID, candidate.EnvironmentDigest)
 	environmentRoot := filepath.Join(snapshotRoot, "environment")
 	args := []string{
@@ -271,11 +302,7 @@ func (harness *StandardAuthoringDockerHarness) ensureCandidateImage(ctx context.
 		return standardAuthoringHarnessImageReceipt{}, inspectStep, false, nil
 	}
 	receipt := standardAuthoringHarnessImageReceipt{
-		Format: standardAuthoringDockerHarnessReceiptFormat, Version: standardAuthoringDockerHarnessReceiptVersion,
-		RunID: request.RunID, EnvironmentDigest: candidate.EnvironmentDigest, ImageTag: imageTag, ImageID: imageID,
-	}
-	if err := writeStandardAuthoringHarnessImageReceipt(receiptPath, receipt); err != nil {
-		return standardAuthoringHarnessImageReceipt{}, authoringharness.StepResult{}, false, err
+		ImageTag: imageTag, ImageID: imageID,
 	}
 	return receipt, step, false, nil
 }
@@ -316,7 +343,11 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 	return harness.commandStep("source_access", result, fingerprint, passed, findings), nil
 }
 
-func (harness *StandardAuthoringDockerHarness) runInitial(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string) (authoringharness.StepResult, error) {
+// runV3Baseline executes the reviewed verification command against a fresh
+// copy of the frozen source. It does not delegate command selection to the
+// candidate's test script, although that script may be explicitly named by the
+// frozen command as a test harness input.
+func (harness *StandardAuthoringDockerHarness) runV3Baseline(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string, verification StandardAuthoringVerificationContract) (authoringharness.StepResult, error) {
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1InitialVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
@@ -330,7 +361,7 @@ func (harness *StandardAuthoringDockerHarness) runInitial(ctx context.Context, r
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1InitialVerifyCommandID,
-		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-initial-"+containerID, "sh ./tests/test.sh"), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-v3-initial-"+containerID, standardAuthoringV3VerificationProgram(verification, false)), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -338,22 +369,25 @@ func (harness *StandardAuthoringDockerHarness) runInitial(ctx context.Context, r
 	passed := true
 	if runErr != nil {
 		passed = false
-		findings = append(findings, "controlled initial verification could not complete: "+standardAuthoringHarnessSafeError(runErr))
+		findings = append(findings, "controlled baseline verification could not complete: "+standardAuthoringHarnessSafeError(runErr))
 	} else if err := verifyStandardAuthoringHarnessScripts(checkout, expected); err != nil {
 		passed = false
-		findings = append(findings, "initial verifier modified its immutable test script")
+		findings = append(findings, "baseline verifier modified its immutable test script")
 	} else if result.ExitCode == 0 {
 		passed = false
-		findings = append(findings, "initial verifier passed before the Oracle repair, so the task does not expose the intended problem")
+		findings = append(findings, "baseline command passed before the Oracle repair, so the task does not expose the intended problem")
 	}
-	return harness.commandStep("initial_verify", result, fingerprint, passed, findings), nil
+	return harness.commandStep("baseline_verify", result, fingerprint, passed, findings), nil
 }
 
-func (harness *StandardAuthoringDockerHarness) runOracle(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string) (authoringharness.StepResult, error) {
+// runV3Oracle executes the same frozen command after the candidate solution
+// has been applied. The checkout name is host-selected so coverage verification
+// cannot reuse or observe the Oracle checkout.
+func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string, verification StandardAuthoringVerificationContract, checkoutName string) (authoringharness.StepResult, error) {
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1OracleVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
-	checkout := filepath.Join(invocationRoot, "verification", "oracle")
+	checkout := filepath.Join(invocationRoot, "verification", checkoutName)
 	expected, err := copyStandardAuthoringHarnessScripts(checkout, snapshotRoot, []string{authoringharness.SolveScriptRelativePath, authoringharness.TestScriptRelativePath})
 	if err != nil {
 		return authoringharness.StepResult{}, err
@@ -363,7 +397,7 @@ func (harness *StandardAuthoringDockerHarness) runOracle(ctx context.Context, re
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1OracleVerifyCommandID,
-		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-oracle-"+containerID, "sh ./solution/solve.sh && sh ./tests/test.sh"), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-v3-"+checkoutName+"-"+containerID, standardAuthoringV3VerificationProgram(verification, true)), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -377,9 +411,102 @@ func (harness *StandardAuthoringDockerHarness) runOracle(ctx context.Context, re
 		findings = append(findings, "Oracle or verifier modified an immutable solution/test script")
 	} else if result.ExitCode != 0 {
 		passed = false
-		findings = append(findings, "Oracle repair followed by verifier did not pass")
+		findings = append(findings, "Oracle repair followed by the frozen verification command did not pass")
 	}
 	return harness.commandStep("oracle_verify", result, fingerprint, passed, findings), nil
+}
+
+func standardAuthoringV3VerificationProgram(verification StandardAuthoringVerificationContract, applySolution bool) string {
+	command := standardAuthoringShellJoin(verification.Command)
+	workdir := standardAuthoringShellQuote("/oracle/workspace/" + strings.TrimPrefix(verification.Workdir, "./"))
+	prepare := "rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /oracle/source/. /oracle/workspace/"
+	if applySolution {
+		return prepare + " && cd /oracle && sh ./solution/solve.sh && cd " + workdir + " && " + command
+	}
+	return prepare + " && cd " + workdir + " && " + command
+}
+
+func standardAuthoringShellJoin(arguments []string) string {
+	quoted := make([]string, 0, len(arguments))
+	for _, argument := range arguments {
+		quoted = append(quoted, standardAuthoringShellQuote(argument))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func standardAuthoringShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\\"'\\\"'") + "'"
+}
+
+func validateStandardAuthoringV3SolutionDiff(workspace, source string, allowed []string) error {
+	workspaceFiles, err := standardAuthoringV3RegularFiles(workspace)
+	if err != nil {
+		return err
+	}
+	sourceFiles, err := standardAuthoringV3RegularFiles(source)
+	if err != nil {
+		return err
+	}
+	paths := make(map[string]struct{}, len(workspaceFiles)+len(sourceFiles))
+	for path := range workspaceFiles {
+		paths[path] = struct{}{}
+	}
+	for path := range sourceFiles {
+		paths[path] = struct{}{}
+	}
+	for path := range paths {
+		if workspaceFiles[path] == sourceFiles[path] {
+			continue
+		}
+		permitted := false
+		for _, root := range allowed {
+			if path == root || strings.HasPrefix(path, root+"/") {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return fmt.Errorf("modified workspace path %q is not allowed", path)
+		}
+	}
+	return nil
+}
+
+func standardAuthoringV3RegularFiles(root string) (map[string]workflowkit.Fingerprint, error) {
+	result := make(map[string]workflowkit.Fingerprint)
+	info, err := os.Lstat(root)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("verification worktree is unavailable or unsafe")
+	}
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("verification worktree contains an unsafe path")
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("verification worktree contains a non-regular file")
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		result[filepath.ToSlash(relative)] = workflowkit.SHA256Fingerprint(content)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // standardAuthoringDockerRunArgs exposes the attempt's frozen source to the
@@ -444,34 +571,8 @@ func (harness *StandardAuthoringDockerHarness) outputTail(raw []byte) string {
 		raw = raw[len(raw)-standardAuthoringDockerHarnessTailLimit:]
 	}
 	value := strings.ToValidUTF8(string(raw), "\uFFFD")
-	value = strings.ReplaceAll(value, harness.stateRoot, "<harness-state>")
 	value = strings.ReplaceAll(value, harness.authoringWorkspaceRoot, "<authoring-workspace>")
 	return standardAuthoringDockerHarnessTokenPattern.ReplaceAllString(value, "<redacted-token>")
-}
-
-func writeStandardAuthoringHarnessSnapshot(root string, candidate authoringharness.Candidate) error {
-	files := map[string][]byte{authoringharness.DockerfileRelativePath: candidate.Dockerfile}
-	if candidate.Mode == authoringharness.ModeInitialOracle {
-		files[authoringharness.SolveScriptRelativePath] = candidate.SolveScript
-		files[authoringharness.TestScriptRelativePath] = candidate.TestScript
-	}
-	if err := os.Mkdir(root, 0o700); err != nil {
-		return err
-	}
-	for relative, content := range files {
-		path := filepath.Join(root, filepath.FromSlash(relative))
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return err
-		}
-		mode := os.FileMode(0o600)
-		if relative != authoringharness.DockerfileRelativePath {
-			mode = 0o700
-		}
-		if err := writeNewBytesWithMode(path, content, mode); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func copyStandardAuthoringHarnessScripts(checkout, snapshotRoot string, relativeFiles []string) (map[string]workflowkit.Fingerprint, error) {
@@ -506,6 +607,17 @@ func verifyStandardAuthoringHarnessScripts(checkout string, expected map[string]
 	return codeEdgePhase1VerifyCheckoutScripts(checkout, expected)
 }
 
+func ensureStandardAuthoringHarnessDirectory(path string) error {
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create Standard authoring verifier directory: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("Standard authoring verifier directory is unavailable or unsafe")
+	}
+	return nil
+}
+
 func writeNewBytesWithMode(path string, content []byte, mode os.FileMode) error {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
@@ -526,96 +638,6 @@ func writeNewBytesWithMode(path string, content []byte, mode os.FileMode) error 
 		return closeErr
 	}
 	return os.Chmod(path, mode)
-}
-
-func ensureStandardAuthoringHarnessDirectory(path string) error {
-	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("create Standard authoring harness state directory: %w", err)
-	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-		return errors.New("Standard authoring harness state directory is unavailable or unsafe")
-	}
-	return nil
-}
-
-func (harness *StandardAuthoringDockerHarness) imageReceiptPath(runID string, digest workflowkit.Fingerprint) string {
-	name := strings.TrimPrefix(string(digest), "sha256:") + ".json"
-	return filepath.Join(harness.stateRoot, runID, "images", name)
-}
-
-func readStandardAuthoringHarnessImageReceipt(path, runID string, digest workflowkit.Fingerprint) (standardAuthoringHarnessImageReceipt, bool, error) {
-	var receipt standardAuthoringHarnessImageReceipt
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return receipt, false, nil
-	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 1<<20 {
-		return receipt, false, errors.New("Standard authoring harness image receipt is unavailable or unsafe")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return receipt, false, err
-	}
-	defer file.Close()
-	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&receipt); err != nil {
-		return receipt, false, errors.New("Standard authoring harness image receipt is malformed")
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return receipt, false, errors.New("Standard authoring harness image receipt has trailing data")
-	}
-	if receipt.Format != standardAuthoringDockerHarnessReceiptFormat || receipt.Version != standardAuthoringDockerHarnessReceiptVersion ||
-		receipt.RunID != runID || receipt.EnvironmentDigest != digest || receipt.ImageTag != standardAuthoringHarnessImageTag(runID, digest) {
-		return receipt, false, errors.New("Standard authoring harness image receipt does not match the candidate")
-	}
-	if _, err := codeEdgePhase1DockerImageID([]byte(receipt.ImageID)); err != nil {
-		return receipt, false, err
-	}
-	return receipt, true, nil
-}
-
-func writeStandardAuthoringHarnessImageReceipt(path string, receipt standardAuthoringHarnessImageReceipt) error {
-	if receipt.Format != standardAuthoringDockerHarnessReceiptFormat || receipt.Version != standardAuthoringDockerHarnessReceiptVersion ||
-		receipt.RunID == "" || receipt.EnvironmentDigest.Validate() != nil || receipt.ImageTag == "" {
-		return errors.New("Standard authoring harness image receipt is invalid")
-	}
-	if _, err := codeEdgePhase1DockerImageID([]byte(receipt.ImageID)); err != nil {
-		return err
-	}
-	directory := filepath.Dir(path)
-	if err := ensureStandardAuthoringHarnessDirectory(filepath.Dir(directory)); err != nil {
-		return err
-	}
-	if err := ensureStandardAuthoringHarnessDirectory(directory); err != nil {
-		return err
-	}
-	encoded, err := json.Marshal(receipt)
-	if err != nil {
-		return err
-	}
-	temporary, err := os.CreateTemp(directory, ".image-receipt-")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if _, err := temporary.Write(encoded); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(temporaryPath, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
 }
 
 func standardAuthoringHarnessImageTag(runID string, digest workflowkit.Fingerprint) string {
@@ -640,5 +662,3 @@ func standardAuthoringHarnessSafeError(err error) string {
 	}
 	return "command process failed"
 }
-
-var _ authoringharness.Validator = (*StandardAuthoringDockerHarness)(nil)

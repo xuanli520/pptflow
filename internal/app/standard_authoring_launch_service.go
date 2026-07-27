@@ -158,8 +158,8 @@ type StandardAuthoringLaunchCommand struct {
 
 // StandardAuthoringLaunchService composes source capture, immutable source
 // persistence, draft Task ownership, session freezing, and generic Run
-// admission. It owns no provider side effect beyond source capture and never
-// starts the later CodeEdge Phase-1 child workflow.
+// admission. It owns no provider side effect beyond source capture; the 3.0
+// workflow terminates at task materialization and never starts a child Run.
 type StandardAuthoringLaunchService struct {
 	core        *lifecycleServiceCore
 	capturer    StandardAuthoringSourceCapturer
@@ -1600,6 +1600,17 @@ func standardAuthoringCatalogStageBinding(registration stageprovider.DeploymentO
 	case workflowadapter.StageBindingSolutionReview:
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	case workflowadapter.StageBindingMaterializeTask:
+		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
+	case workflowadapter.StageBindingRepoStructureResearch,
+		workflowadapter.StageBindingTestRuntimeResearch,
+		workflowadapter.StageBindingVerifierThreatResearch,
+		workflowadapter.StageBindingTaskSynthesis,
+		workflowadapter.StageBindingAuthoringLoop,
+		workflowadapter.StageBindingHostCandidateVerify,
+		workflowadapter.StageBindingTestQualityCritic,
+		workflowadapter.StageBindingSolutionIntegrityCritic,
+		workflowadapter.StageBindingAuthoringRepair,
+		workflowadapter.StageBindingFinalAttestation:
 		return workflowadapter.UniversalStageBinding{StageBindingBase: base}, nil
 	default:
 		return nil, fmt.Errorf("Standard authoring catalog has unsupported stage binding type %q", base.Type)

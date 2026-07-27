@@ -1,95 +1,18 @@
-{
-  "format": "harbor.standard-authoring-contract-assets.v1",
-  "version": "1",
-  "template": {
-    "id": "harbor.standard-authoring",
-    "version": "2.0.0"
-  },
-  "operations": [
-    {
-      "stage_key": "repo_prepare",
-      "prompt": {"id": "standard-authoring.repo-prepare.prompt", "version": "1.1.0", "relative_path": "prompts/repo-prepare.md"},
-      "schema": {"id": "standard-authoring.repo-prepare.output-schema", "version": "1.0.0", "relative_path": "schemas/repo-prepare-output.json"}
-    },
-    {
-      "stage_key": "repo_analyze",
-      "prompt": {"id": "standard-authoring.repo-analyze.prompt", "version": "1.5.0", "relative_path": "prompts/repo-analyze.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "task_design",
-      "prompt": {"id": "standard-authoring.task-design.prompt", "version": "1.6.1", "relative_path": "prompts/task-design.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "task_review",
-      "prompt": {"id": "standard-authoring.task-review.prompt", "version": "1.1.0", "relative_path": "prompts/task-review.md"},
-      "schema": {"id": "standard-authoring.durable-review-decision-schema", "version": "1.0.0", "relative_path": "schemas/durable-review-decision.json"}
-    },
-    {
-      "stage_key": "generate_task_files",
-      "prompt": {"id": "standard-authoring.generate-task-files.prompt", "version": "1.5.0", "relative_path": "prompts/generate-task-files.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "instruction_generate",
-      "prompt": {"id": "standard-authoring.instruction-generate.prompt", "version": "1.4.0", "relative_path": "prompts/instruction-generate.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "task_toml_generate",
-      "prompt": {"id": "standard-authoring.task-toml-generate.prompt", "version": "1.9.1", "relative_path": "prompts/task-toml-generate.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "dockerfile_generate",
-      "prompt": {"id": "standard-authoring.dockerfile-generate.prompt", "version": "2.1.0", "relative_path": "prompts/dockerfile-generate.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "dockerfile_build_validate",
-      "prompt": {"id": "standard-authoring.dockerfile-build-validate.prompt", "version": "1.1.0", "relative_path": "prompts/dockerfile-build-validate.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "content_review",
-      "prompt": {"id": "standard-authoring.content-review.prompt", "version": "1.1.0", "relative_path": "prompts/content-review.md"},
-      "schema": {"id": "standard-authoring.durable-review-decision-schema", "version": "1.0.0", "relative_path": "schemas/durable-review-decision.json"}
-    },
-    {
-      "stage_key": "solve_generate",
-      "prompt": {"id": "standard-authoring.solve-generate.prompt", "version": "1.6.0", "relative_path": "prompts/solve-generate.json"},
-      "schema": {"id": "standard-authoring.codex-fixed-file-submit-schema", "version": "1.0.0", "relative_path": "schemas/codex-fixed-file-submit.schema.json"}
-    },
-    {
-      "stage_key": "test_generate",
-      "prompt": {"id": "standard-authoring.test-generate.prompt", "version": "1.7.0", "relative_path": "prompts/test-generate.json"},
-      "schema": {"id": "standard-authoring.codex-fixed-file-submit-schema", "version": "1.0.0", "relative_path": "schemas/codex-fixed-file-submit.schema.json"}
-    },
-    {
-      "stage_key": "authoring_harness",
-      "prompt": {"id": "standard-authoring.authoring-harness.prompt", "version": "1.1.0", "relative_path": "prompts/authoring-harness.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "tests_analysis",
-      "prompt": {"id": "standard-authoring.tests-analysis.prompt", "version": "2.0.0", "relative_path": "prompts/tests-analysis.json"},
-      "schema": {"id": "standard-authoring.codex-stage-output-schema", "version": "1.0.0", "relative_path": "schemas/codex-stage-output.schema.json"}
-    },
-    {
-      "stage_key": "codeedge_package_admission",
-      "prompt": {"id": "standard-authoring.codeedge-package-admission.prompt", "version": "1.1.0", "relative_path": "prompts/codeedge-package-admission.md"},
-      "schema": {"id": "standard-authoring.codeedge-package-admission-report-schema", "version": "1.0.0", "relative_path": "schemas/codeedge-package-admission-report.json"}
-    },
-    {
-      "stage_key": "solution_review",
-      "prompt": {"id": "standard-authoring.solution-review.prompt", "version": "1.1.0", "relative_path": "prompts/solution-review.md"},
-      "schema": {"id": "standard-authoring.durable-review-decision-schema", "version": "1.0.0", "relative_path": "schemas/durable-review-decision.json"}
-    },
-    {
-      "stage_key": "materialize_task",
-      "prompt": {"id": "standard-authoring.materialize-task.prompt", "version": "1.2.0", "relative_path": "prompts/materialize-task.md"},
-      "schema": {"id": "standard-authoring.authoring-task-handoff-schema", "version": "2.0.0", "relative_path": "schemas/authoring-task-handoff.json"}
-    }
-  ]
-}
+{"format":"harbor.standard-authoring-contract-assets.v1","version":"1","template":{"id":"harbor.standard-authoring","version":"3.0.0"},"operations":[
+{"stage_key":"repo_prepare","prompt":{"id":"standard-authoring.v3.repo-prepare","version":"3.0.0","relative_path":"prompts/repo-prepare.md"},"schema":{"id":"standard-authoring.v3.repo-prepare","version":"1","relative_path":"schemas/repo-prepare-output.json"}},
+{"stage_key":"repo_structure_research","prompt":{"id":"standard-authoring.v3.repo-structure-research","version":"3.0.0","relative_path":"prompts/repo-structure-research.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"test_runtime_research","prompt":{"id":"standard-authoring.v3.test-runtime-research","version":"3.0.0","relative_path":"prompts/test-runtime-research.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"verifier_threat_research","prompt":{"id":"standard-authoring.v3.verifier-threat-research","version":"3.0.0","relative_path":"prompts/verifier-threat-research.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"task_synthesis","prompt":{"id":"standard-authoring.v3.task-synthesis","version":"3.0.0","relative_path":"prompts/task-synthesis.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"task_review","prompt":{"id":"standard-authoring.v3.task-review","version":"3.0.0","relative_path":"prompts/task-review.md"},"schema":{"id":"standard-authoring.v3.review","version":"1","relative_path":"schemas/durable-review-decision.json"}},
+{"stage_key":"authoring_loop","prompt":{"id":"standard-authoring.v3.authoring-loop","version":"3.0.0","relative_path":"prompts/authoring-loop.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"host_candidate_verify","prompt":{"id":"standard-authoring.v3.host-candidate-verify","version":"3.0.0","relative_path":"prompts/host-candidate-verify.md"},"schema":{"id":"standard-authoring.v3.validation-receipt","version":"1","relative_path":"schemas/validation-receipt.json"}},
+{"stage_key":"test_quality_critic","prompt":{"id":"standard-authoring.v3.test-quality-critic","version":"3.0.0","relative_path":"prompts/test-quality-critic.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"solution_integrity_critic","prompt":{"id":"standard-authoring.v3.solution-integrity-critic","version":"3.0.0","relative_path":"prompts/solution-integrity-critic.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"authoring_repair","prompt":{"id":"standard-authoring.v3.authoring-repair","version":"3.0.0","relative_path":"prompts/authoring-repair.json"},"schema":{"id":"standard-authoring.v3.agent-output","version":"1","relative_path":"schemas/v3-agent-output.schema.json"}},
+{"stage_key":"content_review","prompt":{"id":"standard-authoring.v3.content-review","version":"3.0.0","relative_path":"prompts/content-review.md"},"schema":{"id":"standard-authoring.v3.review","version":"1","relative_path":"schemas/durable-review-decision.json"}},
+{"stage_key":"solution_review","prompt":{"id":"standard-authoring.v3.solution-review","version":"3.0.0","relative_path":"prompts/solution-review.md"},"schema":{"id":"standard-authoring.v3.review","version":"1","relative_path":"schemas/durable-review-decision.json"}},
+{"stage_key":"final_attestation","prompt":{"id":"standard-authoring.v3.final-attestation","version":"3.0.0","relative_path":"prompts/final-attestation.md"},"schema":{"id":"standard-authoring.v3.final-attestation","version":"1","relative_path":"schemas/final-attestation.json"}},
+{"stage_key":"codeedge_package_admission","prompt":{"id":"standard-authoring.v3.codeedge-package-admission","version":"3.0.0","relative_path":"prompts/codeedge-package-admission.md"},"schema":{"id":"standard-authoring.v3.admission","version":"1","relative_path":"schemas/codeedge-package-admission-report.json"}},
+{"stage_key":"materialize_task","prompt":{"id":"standard-authoring.v3.materialize-task","version":"3.0.0","relative_path":"prompts/materialize-task.md"},"schema":{"id":"standard-authoring.v3.materialization-receipt","version":"1","relative_path":"schemas/materialization-receipt.json"}}
+]}

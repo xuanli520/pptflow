@@ -95,7 +95,7 @@ func (stub *taskBoardGatewayStub) PreviewRunRecovery(ctx context.Context, reques
 		preview.RunID = request.RunID
 	}
 	if preview.Strategy == "" {
-		preview.Strategy = app.TaskBoardRetryStrategyAuthoringRecovery
+		preview.Strategy = app.TaskBoardRetryStrategyTaskContinuation
 		for _, task := range stub.snapshot.Tasks {
 			for _, run := range task.Runs {
 				if run.ID == request.RunID && run.RetryStrategy != "" {
@@ -239,8 +239,7 @@ func TestTaskItemsForSnapshotPreservesDurableFailureProjection(t *testing.T) {
 			FailureSummary:        "The approved child definition is invalid.",
 			FailureJobID:          "job-1",
 			FailureArtifactID:     "artifact-1",
-			FailureRecoveryAction: app.TaskBoardFailureRecoveryRedriveAuthoringHandoff,
-			CanRedrive:            true,
+			FailureRecoveryAction: app.TaskBoardFailureRecoveryReconcile,
 		}},
 	}}})
 	if len(pending) != 1 || len(pending[0].Runs) != 1 {
@@ -249,7 +248,7 @@ func TestTaskItemsForSnapshotPreservesDurableFailureProjection(t *testing.T) {
 	run := pending[0].Runs[0]
 	if run.FailureCode != "handoff.definition_invalid" || run.FailureSummary != "The approved child definition is invalid." ||
 		run.FailureJobID != "job-1" || run.FailureArtifactID != "artifact-1" ||
-		run.FailureRecoveryAction != app.TaskBoardFailureRecoveryRedriveAuthoringHandoff || !run.CanRedrive {
+		run.FailureRecoveryAction != app.TaskBoardFailureRecoveryReconcile || run.CanRedrive {
 		t.Fatalf("durable failure item = %+v", run)
 	}
 }
@@ -776,9 +775,9 @@ func TestAppModelRoutesDurablePreTaskCaptureRetryWithoutNewIdempotencyKey(t *tes
 	}
 }
 
-func TestAppModelPreviewsAuthoringRecoveryBeforeRetryAndRetainsItsIdempotencyKey(t *testing.T) {
+func TestAppModelPreviewsTaskContinuationBeforeRetryAndRetainsItsIdempotencyKey(t *testing.T) {
 	snapshot := taskBoardTestSnapshot(true)
-	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringRecovery
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyTaskContinuation
 	stub := &taskBoardGatewayStub{
 		snapshot: snapshot,
 		retryErr: errors.New("activation unavailable"),
@@ -794,7 +793,7 @@ func TestAppModelPreviewsAuthoringRecoveryBeforeRetryAndRetainsItsIdempotencyKey
 
 	updated, _ := model.handleKey(keyRune('t'), nil)
 	model = updated.(appModel)
-	if model.action == nil || model.action.kind != taskBoardRetryAction || model.action.strategy != app.TaskBoardRetryStrategyAuthoringRecovery {
+	if model.action == nil || model.action.kind != taskBoardRetryAction || model.action.strategy != app.TaskBoardRetryStrategyTaskContinuation {
 		t.Fatalf("authoring recovery prompt = %+v", model.action)
 	}
 	model.action.reasonInput.SetValue("recover transient provider failure")
@@ -844,16 +843,16 @@ func TestAppModelPreviewsAuthoringRecoveryBeforeRetryAndRetainsItsIdempotencyKey
 	}
 }
 
-func TestAppModelPreviewsAuthoringAdmissionRepairBeforeRetry(t *testing.T) {
+func TestAppModelPreviewsTaskContinuationWithMultipleStagesBeforeRetry(t *testing.T) {
 	snapshot := taskBoardTestSnapshot(true)
 	snapshot.Tasks[0].Runs[0].Status = "waiting_continuation"
-	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringAdmissionRepair
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyTaskContinuation
 	stub := &taskBoardGatewayStub{
 		snapshot: snapshot,
 		recoveryPreview: app.TaskBoardRecoveryPreview{
 			CheckpointSequence: 14, CurrentExecutionEpoch: 2, NextExecutionEpoch: 3,
 			Checkpoint:          workflowkit.CheckpointRef{Sequence: 14},
-			Strategy:            app.TaskBoardRetryStrategyAuthoringAdmissionRepair,
+			Strategy:            app.TaskBoardRetryStrategyTaskContinuation,
 			TargetStages:        []string{"instruction_generate", "task_toml_generate", "dockerfile_generate"},
 			ReusedStages:        []string{"repo_prepare", "repo_analyze", "task_design"},
 			ScheduledStages:     []string{"instruction_generate", "task_toml_generate", "dockerfile_generate", "content_review"},
@@ -865,7 +864,7 @@ func TestAppModelPreviewsAuthoringAdmissionRepairBeforeRetry(t *testing.T) {
 
 	updated, _ := model.handleKey(keyRune('t'), nil)
 	model = updated.(appModel)
-	if model.action == nil || model.action.strategy != app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
+	if model.action == nil || model.action.strategy != app.TaskBoardRetryStrategyTaskContinuation {
 		t.Fatalf("authoring admission repair prompt = %+v", model.action)
 	}
 	model.action.reasonInput.SetValue("apply content-review correction")
@@ -896,7 +895,7 @@ func TestAppModelPreviewsAuthoringAdmissionRepairBeforeRetry(t *testing.T) {
 
 func TestAppModelClearsInvalidRecoveryPreviewState(t *testing.T) {
 	snapshot := taskBoardTestSnapshot(true)
-	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringRecovery
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyTaskContinuation
 	stub := &taskBoardGatewayStub{snapshot: snapshot}
 	model := loadedTaskBoardModel(t, stub)
 	model.detail = newDetailModel(model.board.SelectedTask())
@@ -921,7 +920,7 @@ func TestAppModelClearsInvalidRecoveryPreviewState(t *testing.T) {
 
 func TestAppModelClearsStaleRecoveryPreviewBindingBeforeRetrying(t *testing.T) {
 	snapshot := taskBoardTestSnapshot(true)
-	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringRecovery
+	snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyTaskContinuation
 	stub := &taskBoardGatewayStub{snapshot: snapshot}
 	model := loadedTaskBoardModel(t, stub)
 	model.detail = newDetailModel(model.board.SelectedTask())
@@ -969,12 +968,12 @@ func TestAppModelQueuesConfirmedRunActionsUntilRefreshCompletes(t *testing.T) {
 		wantMutation taskBoardMutationKind
 	}{
 		{
-			name:      "authoring admission repair",
+			name:      "task continuation",
 			actionKey: 't',
 			configureRun: func(run *app.TaskBoardRun) {
 				run.Status = "waiting_continuation"
 				run.CanRetry = true
-				run.RetryStrategy = app.TaskBoardRetryStrategyAuthoringAdmissionRepair
+				run.RetryStrategy = app.TaskBoardRetryStrategyTaskContinuation
 			},
 			wantMutation: taskBoardRetryMutation,
 		},
@@ -1123,7 +1122,7 @@ func TestAppModelRequestsAuthoringChangesThenDispatchesRepairContinuation(t *tes
 	stub.snapshot.Tasks[0].Runs[0].Status = "waiting_continuation"
 	stub.snapshot.Tasks[0].Runs[0].CanRetry = true
 	stub.snapshot.Tasks[0].Runs[0].RetryReason = ""
-	stub.snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyAuthoringAdmissionRepair
+	stub.snapshot.Tasks[0].Runs[0].RetryStrategy = app.TaskBoardRetryStrategyTaskContinuation
 	updated, _ = model.Update(taskBoardLoadedMsg{snapshot: stub.snapshot, epoch: model.refreshEpoch})
 	model = updated.(appModel)
 	model.board.MoveRight()
@@ -1132,13 +1131,13 @@ func TestAppModelRequestsAuthoringChangesThenDispatchesRepairContinuation(t *tes
 		t.Fatal("waiting-continuation task was not projected into the running column")
 	}
 	model.detail = newDetailModel(selected)
-	if footer := detailFooterText(model.detail); !strings.Contains(footer, "[t] 修复并继续") {
+	if footer := detailFooterText(model.detail); !strings.Contains(footer, "[t] 断点恢复") {
 		t.Fatalf("repair continuation footer = %q", footer)
 	}
 
 	updated, _ = model.handleKey(keyRune('t'), nil)
 	model = updated.(appModel)
-	if model.action == nil || model.action.kind != taskBoardRetryAction || model.action.strategy != app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
+	if model.action == nil || model.action.kind != taskBoardRetryAction || model.action.strategy != app.TaskBoardRetryStrategyTaskContinuation {
 		t.Fatalf("repair continuation prompt = %+v", model.action)
 	}
 	model.action.reasonInput.SetValue("regenerate with the review feedback")

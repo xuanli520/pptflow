@@ -53,7 +53,7 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 				workflowkit.StageKey(TaskReview), workflowkit.StageKey(ContentReview), workflowkit.StageKey(SolutionReview),
 			},
 			dependencies:   standardAuthoringDependencies(),
-			validateStages: validateStandardAuthoringV2CatalogStages,
+			validateStages: validateStandardAuthoringV3CatalogStages,
 		}, nil
 	case reference.Equal(CodeEdgePhase1TemplateReference()):
 		return catalogTemplatePolicy{
@@ -136,21 +136,21 @@ func sameStageKeySet(left, right []workflowkit.StageKey) bool {
 	return true
 }
 
-// validateStandardAuthoringV2CatalogStages compares the complete direct v2
-// descriptor, not only its graph. This freezes root-contract binding,
-// fixed-file producer policy, validation evidence, CodeEdge admission, and the
-// final integrated solution-review package as one immutable topology.
-func validateStandardAuthoringV2CatalogStages(stages map[workflowkit.StageKey]StageDefinition) error {
+// validateStandardAuthoringV3CatalogStages compares the complete direct 3.0
+// descriptor, not only its graph. This freezes role authority, workspace
+// isolation, candidate validation, finding repair, and package admission as
+// one immutable topology.
+func validateStandardAuthoringV3CatalogStages(stages map[workflowkit.StageKey]StageDefinition) error {
 	expected := StandardAuthoringContractStageCatalog()
 	if len(stages) != len(expected.Stages) {
-		return fmt.Errorf("%w: Standard authoring v2 stage count %d does not match frozen descriptor", errInvalidCatalog, len(stages))
+		return fmt.Errorf("%w: Standard authoring 3.0 stage count %d does not match frozen descriptor", errInvalidCatalog, len(stages))
 	}
 	for _, definition := range expected.Stages {
 		actual, present := stages[definition.Key]
 		actual = actual.Clone()
 		definition = definition.Clone()
 		if !present || !reflect.DeepEqual(actual, definition) {
-			return fmt.Errorf("%w: Standard authoring v2 stage %q does not match frozen descriptor", errInvalidCatalog, definition.Key)
+			return fmt.Errorf("%w: Standard authoring 3.0 stage %q does not match frozen descriptor", errInvalidCatalog, definition.Key)
 		}
 	}
 	return nil

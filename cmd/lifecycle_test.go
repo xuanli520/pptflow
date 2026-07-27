@@ -1192,26 +1192,6 @@ func TestTaskContinueCommandPlansPreviewsAndExecutesFrozenGroupPlan(t *testing.T
 	}
 }
 
-func TestAuthoringRecoverCommandDryRunRejectsTaskRevisionRunWithoutMutation(t *testing.T) {
-	ctx := context.Background()
-	if defaultLifecycleActor() == "" {
-		t.Skip("local OS actor is unavailable in this test environment")
-	}
-	root, run := newCommandContinuationFixture(t, ctx)
-	config := &lifecycleCLIConfig{root: root}
-	before := snapshotCommandControlPlane(t, root)
-	output, err := executeAuthoringCommand(t, ctx, config, []string{
-		"recover", "--run", run.ID, "--idempotency-key", commandLifecycleUUID(t),
-		"--reason", "must reject task-revision Run", "--dry-run",
-	})
-	if err == nil || !strings.Contains(err.Error(), "not a Standard authoring Run") {
-		t.Fatalf("authoring recover dry-run task-revision error = %v\n%s", err, output)
-	}
-	if after := snapshotCommandControlPlane(t, root); !reflect.DeepEqual(after, before) {
-		t.Fatal("authoring recover --dry-run changed durable control-plane state")
-	}
-}
-
 func executeTaskCommand(t *testing.T, ctx context.Context, config *lifecycleCLIConfig, args []string) (string, error) {
 	t.Helper()
 	command := newTaskCommand(config)

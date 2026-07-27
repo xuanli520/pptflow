@@ -380,6 +380,16 @@ const (
 	StageBindingCodeEdgePackageAdmission StageBindingType = "codeedge_package_admission"
 	StageBindingSolutionReview           StageBindingType = "solution_review"
 	StageBindingMaterializeTask          StageBindingType = "materialize_task"
+	StageBindingRepoStructureResearch    StageBindingType = "repo_structure_research"
+	StageBindingTestRuntimeResearch      StageBindingType = "test_runtime_research"
+	StageBindingVerifierThreatResearch   StageBindingType = "verifier_threat_research"
+	StageBindingTaskSynthesis            StageBindingType = "task_synthesis"
+	StageBindingAuthoringLoop            StageBindingType = "authoring_loop"
+	StageBindingHostCandidateVerify      StageBindingType = "host_candidate_verify"
+	StageBindingTestQualityCritic        StageBindingType = "test_quality_critic"
+	StageBindingSolutionIntegrityCritic  StageBindingType = "solution_integrity_critic"
+	StageBindingAuthoringRepair          StageBindingType = "authoring_repair"
+	StageBindingFinalAttestation         StageBindingType = "final_attestation"
 	StageBindingTaskRepair               StageBindingType = "task_repair"
 	StageBindingRuntimeSelfCheck         StageBindingType = "runtime_self_check"
 	StageBindingHarborVerify             StageBindingType = "harbor_verify"
@@ -927,6 +937,16 @@ var knownStageBindingTypes = map[StageBindingType]bool{
 	StageBindingCodeEdgePackageAdmission: true,
 	StageBindingSolutionReview:           true,
 	StageBindingMaterializeTask:          true,
+	StageBindingRepoStructureResearch:    true,
+	StageBindingTestRuntimeResearch:      true,
+	StageBindingVerifierThreatResearch:   true,
+	StageBindingTaskSynthesis:            true,
+	StageBindingAuthoringLoop:            true,
+	StageBindingHostCandidateVerify:      true,
+	StageBindingTestQualityCritic:        true,
+	StageBindingSolutionIntegrityCritic:  true,
+	StageBindingAuthoringRepair:          true,
+	StageBindingFinalAttestation:         true,
 	StageBindingTaskRepair:               true,
 	StageBindingRuntimeSelfCheck:         true,
 	StageBindingHarborVerify:             true,

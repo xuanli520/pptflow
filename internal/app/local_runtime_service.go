@@ -130,12 +130,6 @@ func (service *LocalRuntimeService) AttachRun(ctx context.Context, request Attac
 	if err != nil {
 		return RunAttachment{}, fmt.Errorf("list durable jobs for run %s: %w", run.ID, err)
 	}
-	resolvedHandoffFailures := make(map[string]struct{})
-	for _, job := range jobs {
-		if standardAuthoringHandoffFailureResolved(job, jobs) {
-			resolvedHandoffFailures[job.ID] = struct{}{}
-		}
-	}
 	attachedJobs := make([]AttachedDurableJob, 0, len(jobs))
 	attachableJobs := 0
 	for _, job := range jobs {
@@ -145,9 +139,6 @@ func (service *LocalRuntimeService) AttachRun(ctx context.Context, request Attac
 		}
 		attached := AttachedDurableJob{Job: job, Leases: make([]LocalLeaseAttachment, 0, len(leases))}
 		service.populateAttachedDurableJobFailure(&attached, stages)
-		if _, resolved := resolvedHandoffFailures[job.ID]; resolved {
-			attached.FailureRecoveryAction = ""
-		}
 		for _, lease := range leases {
 			valid := isValidLocalLease(lease, observedAt)
 			attached.Leases = append(attached.Leases, LocalLeaseAttachment{Lease: lease, Valid: valid})
@@ -225,11 +216,7 @@ func (service *LocalRuntimeService) populateAttachedDurableJobFailure(attached *
 	case store.JobFailed:
 		attached.FailureRecoveryAction = "repair_or_new_run"
 	case store.JobInDoubt:
-		if isStandardAuthoringHandoffCommand(attached.Job.CommandType) && isRecoverableHandoffFailure(attached.Job.Failure) {
-			attached.FailureRecoveryAction = "redrive"
-		} else {
-			attached.FailureRecoveryAction = "reconcile"
-		}
+		attached.FailureRecoveryAction = "reconcile"
 	}
 }
 
@@ -309,9 +296,6 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 	if err := recoveryRuntime.ReconcileDurableJobRecoveries(ctx, DurableJobRecoveryRequest{RunID: run.ID, Recoveries: stageRecoveries}); err != nil {
 		return RunReconciliationResult{}, fmt.Errorf("apply durable job semantic recovery for run %s: %w", run.ID, err)
 	}
-	if err := service.projectRecoveredStandardAuthoringHandoffRuns(ctx, recovered, actor, reason); err != nil {
-		return RunReconciliationResult{}, err
-	}
 	expiredJobLeases, err := service.core.store.ExpireLeasesForRun(ctx, run.ID, actor, reason)
 	if err != nil {
 		return RunReconciliationResult{}, fmt.Errorf("expire local job leases for run %s: %w", run.ID, err)
@@ -368,37 +352,6 @@ func (service *LocalRuntimeService) ReconcileRun(ctx context.Context, request Re
 		return result.UnresolvedQuotaLeases[left].ID < result.UnresolvedQuotaLeases[right].ID
 	})
 	return result, nil
-}
-
-// projectRecoveredStandardAuthoringHandoffRuns is deliberately narrow: a
-// lost handoff delivery can have already created its child Run, so the parent
-// must stop ordinary dispatch until an operator explicitly reconciles or
-// redrives it. Other recovered command types retain their own fact-backed
-// recovery handlers and must not be generically forced into in_doubt here.
-func (service *LocalRuntimeService) projectRecoveredStandardAuthoringHandoffRuns(ctx context.Context, recoveries []store.ExpiredDurableJobRecovery, actor, reason string) error {
-	for _, recovery := range recoveries {
-		job := recovery.Job
-		if job.State != store.JobInDoubt || (job.CommandType != standardAuthoringHandoffCommandType && job.CommandType != standardAuthoringHandoffRedriveCommandType && job.CommandType != standardAuthoringHandoffReconcileCommandType) {
-			continue
-		}
-		run, err := service.core.store.GetWorkflowRun(ctx, job.RunID)
-		if err != nil {
-			return fmt.Errorf("read recovered Standard authoring handoff Run %s: %w", job.RunID, err)
-		}
-		if run == nil {
-			return fmt.Errorf("%w: recovered Standard authoring handoff Run %s", ErrLifecycleNotFound, job.RunID)
-		}
-		if run.Status == store.WorkflowRunInDoubt || terminalWorkflowRunStatus(run.Status) {
-			continue
-		}
-		if _, err := service.core.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
-			RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunInDoubt,
-			Actor: actor, Reason: reason,
-		}); err != nil {
-			return fmt.Errorf("project recovered Standard authoring handoff Run %s: %w", run.ID, err)
-		}
-	}
-	return nil
 }
 
 func (service *LocalRuntimeService) readQuotaScope(ctx context.Context, kind store.QuotaScopeKind, scopeID string, observedAt time.Time) (LocalQuotaScopeAttachment, error) {

@@ -75,7 +75,7 @@ func TestLocalRuntimeAttachProjectsDurableFailureRecordFields(t *testing.T) {
 	recordedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
 	attached := AttachedDurableJob{Job: store.DurableJob{
 		ID:             "job-handoff",
-		CommandType:    standardAuthoringHandoffCommandType,
+		CommandType:    "stage_attempt.execute",
 		EntityType:     "artifact_ref",
 		EntityID:       "artifact-handoff",
 		StageAttemptID: "attempt-materialize",
@@ -87,7 +87,7 @@ func TestLocalRuntimeAttachProjectsDurableFailureRecordFields(t *testing.T) {
 		},
 	}}
 	(&LocalRuntimeService{}).populateAttachedDurableJobFailure(&attached, nil)
-	if attached.FailureStage != "materialize_task" || attached.FailureCode != "handoff.definition_unavailable" || attached.FailureSummary != "The controlled child definition is unavailable." || attached.FailureArtifactID != "artifact-handoff" || attached.FailureRecordedAt == nil || !attached.FailureRecordedAt.Equal(recordedAt) || attached.FailureRecoveryAction != "redrive" {
+	if attached.FailureStage != "materialize_task" || attached.FailureCode != "handoff.definition_unavailable" || attached.FailureSummary != "The controlled child definition is unavailable." || attached.FailureArtifactID != "artifact-handoff" || attached.FailureRecordedAt == nil || !attached.FailureRecordedAt.Equal(recordedAt) || attached.FailureRecoveryAction != "reconcile" {
 		t.Fatalf("attached durable failure projection = %+v", attached)
 	}
 }

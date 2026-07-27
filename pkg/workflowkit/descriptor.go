@@ -128,6 +128,121 @@ func (policy ReusePolicy) valid() bool {
 	return policy == ReuseNever || policy == ReuseWhenInputsMatch
 }
 
+// WorkspaceMode declares the host-controlled access a stage receives to a
+// logical workspace. Workspace keys are opaque scheduling identities, never
+// filesystem paths selected by a model or stage implementation.
+type WorkspaceMode string
+
+const (
+	// WorkspaceNone declares that a stage receives no shared workspace.
+	WorkspaceNone WorkspaceMode = "none"
+	// WorkspaceReadOnlySnapshot declares that a stage receives a host-projected
+	// read-only copy of its bound snapshot artifact.
+	WorkspaceReadOnlySnapshot WorkspaceMode = "read_only_snapshot"
+	// WorkspaceExclusiveWriter declares that a stage receives an isolated
+	// writable attempt workspace for its bound snapshot artifact.
+	WorkspaceExclusiveWriter WorkspaceMode = "exclusive_writer"
+)
+
+func (mode WorkspaceMode) valid() bool {
+	switch mode {
+	case WorkspaceNone, WorkspaceReadOnlySnapshot, WorkspaceExclusiveWriter:
+		return true
+	default:
+		return false
+	}
+}
+
+// WorkspaceKey is a domain-owned, logical identity for coordinating access to
+// one workspace. It deliberately has no filesystem-path meaning.
+type WorkspaceKey string
+
+// WorkspaceBinding fixes the workspace a stage may access. SnapshotArtifact
+// names a required input artifact declared by the same descriptor, so a
+// runtime can project only frozen host-owned content into the workspace.
+//
+// WorkspaceNone must not carry a key or snapshot. All other modes require
+// both fields. The descriptor has no model-provided path surface.
+type WorkspaceBinding struct {
+	Mode             WorkspaceMode `json:"mode,omitempty"`
+	Key              WorkspaceKey  `json:"key,omitempty"`
+	SnapshotArtifact string        `json:"snapshot_artifact,omitempty"`
+}
+
+// Clone returns an independently owned workspace binding.
+func (binding WorkspaceBinding) Clone() WorkspaceBinding { return binding }
+
+func (binding WorkspaceBinding) canonical() WorkspaceBinding {
+	if binding.Mode == "" {
+		binding.Mode = WorkspaceNone
+	}
+	return binding
+}
+
+// Canonical returns the normalized binding. An omitted mode is the explicit
+// WorkspaceNone value so frozen catalogs do not acquire two meanings for the
+// same no-workspace declaration.
+func (binding WorkspaceBinding) Canonical() WorkspaceBinding { return binding.canonical() }
+
+func (binding WorkspaceBinding) validate(inputs []ArtifactSpec) error {
+	binding = binding.canonical()
+	if !binding.Mode.valid() {
+		return fmt.Errorf("%w: unsupported workspace mode %q", ErrInvalidDescriptor, binding.Mode)
+	}
+	if binding.Mode == WorkspaceNone {
+		if binding.Key != "" || binding.SnapshotArtifact != "" {
+			return fmt.Errorf("%w: workspace mode %q cannot declare a key or snapshot artifact", ErrInvalidDescriptor, binding.Mode)
+		}
+		return nil
+	}
+	if err := validateRequired("workspace key", string(binding.Key), ErrInvalidDescriptor); err != nil {
+		return err
+	}
+	if err := validateRequired("workspace snapshot artifact", binding.SnapshotArtifact, ErrInvalidDescriptor); err != nil {
+		return err
+	}
+	for _, input := range inputs {
+		if input.Name == binding.SnapshotArtifact {
+			if !input.Required {
+				return fmt.Errorf("%w: workspace snapshot artifact %q must be a required input", ErrInvalidDescriptor, binding.SnapshotArtifact)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: workspace snapshot artifact %q is not a declared input", ErrInvalidDescriptor, binding.SnapshotArtifact)
+}
+
+// ConcurrencyPolicy collects the descriptor-level declarations the scheduler
+// and runtime use to isolate concurrent stages. More scheduling constraints
+// can be added here without turning StageDescriptor into an untyped map.
+type ConcurrencyPolicy struct {
+	Workspace WorkspaceBinding `json:"workspace,omitempty"`
+}
+
+// Clone returns an independently owned concurrency policy.
+func (policy ConcurrencyPolicy) Clone() ConcurrencyPolicy {
+	policy.Workspace = policy.Workspace.Clone()
+	return policy
+}
+
+func (policy ConcurrencyPolicy) canonical() ConcurrencyPolicy {
+	policy.Workspace = policy.Workspace.canonical()
+	return policy
+}
+
+// Canonical returns a normalized concurrency policy suitable for a frozen
+// catalog or descriptor.
+func (policy ConcurrencyPolicy) Canonical() ConcurrencyPolicy { return policy.canonical() }
+
+func (policy ConcurrencyPolicy) validate(inputs []ArtifactSpec) error {
+	return policy.Workspace.validate(inputs)
+}
+
+// Validate proves a policy is bound only to declared required input artifacts.
+func (policy ConcurrencyPolicy) Validate(inputs []ArtifactSpec) error {
+	return policy.validate(inputs)
+}
+
 // ArtifactSpec is a typed artifact contract. Names are local to one stage.
 type ArtifactSpec struct {
 	Name          string `json:"name"`
@@ -249,6 +364,8 @@ type StageDescriptor struct {
 	Outputs      []ArtifactSpec      `json:"outputs"`
 	ReadSet      []ResourceKey       `json:"read_set"`
 	WriteSet     []ResourceKey       `json:"write_set"`
+	Concurrency  *ConcurrencyPolicy  `json:"concurrency,omitempty"`
+	AgentRole    *AgentRoleSpec      `json:"agent_role,omitempty"`
 	Effect       StageEffect         `json:"effect"`
 	Dispatch     StageDispatchPolicy `json:"dispatch,omitempty"`
 	Budget       ExecutionBudget     `json:"budget"`
@@ -279,6 +396,14 @@ func (descriptor StageDescriptor) Clone() StageDescriptor {
 	descriptor.Outputs = append([]ArtifactSpec(nil), descriptor.Outputs...)
 	descriptor.ReadSet = append([]ResourceKey(nil), descriptor.ReadSet...)
 	descriptor.WriteSet = append([]ResourceKey(nil), descriptor.WriteSet...)
+	if descriptor.Concurrency != nil {
+		policy := descriptor.Concurrency.Clone()
+		descriptor.Concurrency = &policy
+	}
+	if descriptor.AgentRole != nil {
+		role := descriptor.AgentRole.Clone()
+		descriptor.AgentRole = &role
+	}
 	descriptor.Budget = descriptor.Budget.Clone()
 	descriptor.QuotaClaims = append([]QuotaClaim(nil), descriptor.QuotaClaims...)
 	descriptor.Retry = descriptor.Retry.Clone()
@@ -316,6 +441,23 @@ func (descriptor StageDescriptor) Validate() error {
 	if err := validateArtifactSpecs("output", descriptor.Outputs); err != nil {
 		return err
 	}
+	concurrency := descriptor.concurrencyPolicy()
+	if err := concurrency.validate(descriptor.Inputs); err != nil {
+		return err
+	}
+	if descriptor.AgentRole != nil {
+		if err := descriptor.AgentRole.Validate(); err != nil {
+			return fmt.Errorf("%w: stage %q agent role: %v", ErrInvalidDescriptor, descriptor.Key, err)
+		}
+		if descriptor.AgentRole.Workspace.canonical() != concurrency.Workspace.canonical() {
+			return fmt.Errorf("%w: stage %q agent role workspace must match concurrency workspace", ErrInvalidDescriptor, descriptor.Key)
+		}
+		for _, agentInput := range descriptor.AgentRole.InputSchemas {
+			if !stageDeclaresArtifactInput(descriptor.Inputs, agentInput) {
+				return fmt.Errorf("%w: stage %q agent input %q is not a declared stage input", ErrInvalidDescriptor, descriptor.Key, agentInput.Name)
+			}
+		}
+	}
 	if err := validateUniqueStrings("read resource", descriptor.ReadSet, ErrInvalidDescriptor); err != nil {
 		return err
 	}
@@ -350,6 +492,13 @@ func (descriptor StageDescriptor) Validate() error {
 		return fmt.Errorf("%w: stage %q capabilities: %v", ErrInvalidDescriptor, descriptor.Key, err)
 	}
 	return nil
+}
+
+func (descriptor StageDescriptor) concurrencyPolicy() ConcurrencyPolicy {
+	if descriptor.Concurrency == nil {
+		return ConcurrencyPolicy{Workspace: WorkspaceBinding{Mode: WorkspaceNone}}
+	}
+	return descriptor.Concurrency.Clone().canonical()
 }
 
 // WorkflowDescriptor is a versioned DAG of typed stage descriptors.
@@ -479,6 +628,18 @@ func (workflow WorkflowDescriptor) Fingerprint() (Fingerprint, error) {
 	})
 	for index := range canonical.Stages {
 		stage := &canonical.Stages[index]
+		if stage.Concurrency != nil {
+			policy := stage.Concurrency.canonical()
+			if policy.Workspace.Mode == WorkspaceNone {
+				stage.Concurrency = nil
+			} else {
+				stage.Concurrency = &policy
+			}
+		}
+		if stage.AgentRole != nil {
+			role := stage.AgentRole.canonical()
+			stage.AgentRole = &role
+		}
 		sort.Slice(stage.Dependencies, func(left, right int) bool { return stage.Dependencies[left] < stage.Dependencies[right] })
 		sort.Slice(stage.Inputs, func(left, right int) bool { return stage.Inputs[left].Name < stage.Inputs[right].Name })
 		sort.Slice(stage.Outputs, func(left, right int) bool { return stage.Outputs[left].Name < stage.Outputs[right].Name })
@@ -496,4 +657,13 @@ func (workflow WorkflowDescriptor) Fingerprint() (Fingerprint, error) {
 		return "", fmt.Errorf("%w: encode workflow descriptor: %v", ErrInvalidDescriptor, err)
 	}
 	return FingerprintBytes("workflowkit.workflow-descriptor.v1", encoded)
+}
+
+func stageDeclaresArtifactInput(inputs []ArtifactSpec, wanted ArtifactSpec) bool {
+	for _, input := range inputs {
+		if input == wanted {
+			return true
+		}
+	}
+	return false
 }

@@ -89,21 +89,20 @@ func TestDetailShowsBoundedAuthoringEvidence(t *testing.T) {
 					BaseImage:      "docker.io/library/golang:1.26@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 					Objective:      "Repair the selected behavior.",
 				},
-				Claims:  []app.TaskBoardAuthoringClaim{{ArtifactKey: "task_proposal", State: "match"}},
-				Repairs: []app.TaskBoardAuthoringRepair{{TargetProducer: "task_design", FindingKind: "task_proposal_invalid", State: "open", EvidenceDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}},
-				Lineage: []app.TaskBoardAuthoringArtifact{{ArtifactKey: "authoring_harness_report", ArtifactID: "artifact-harness", Digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},
+				Claims:  []app.TaskBoardAuthoringClaim{{ArtifactKey: "task_specification", State: "match"}},
+				Lineage: []app.TaskBoardAuthoringArtifact{{ArtifactKey: "candidate_snapshot", ArtifactID: "artifact-candidate", Digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},
 			},
 		}},
 	})
 	rendered := ansi.Strip(detail.View(180, 60))
-	for _, expected := range []string{"根契约", "声明比对", "修复账本", "最终谱系", "Task one", "task_proposal_invalid"} {
+	for _, expected := range []string{"根契约", "声明比对", "最终谱系", "Task one", "task_specification"} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("detail missing %q:\n%s", expected, rendered)
 		}
 	}
 }
 
-func TestDetailShowsDurableFailureRecordAndOnlyEligibleRedrive(t *testing.T) {
+func TestDetailShowsDurableFailureRecordAndRecoveryAction(t *testing.T) {
 	recordedAt := time.Date(2026, time.July, 17, 10, 20, 0, 0, time.UTC)
 	detail := newDetailModel(&TaskItem{
 		Name: "Task one", Slug: "task-one", RunID: "run-current",
@@ -116,12 +115,11 @@ func TestDetailShowsDurableFailureRecordAndOnlyEligibleRedrive(t *testing.T) {
 			FailureJobID:          "job-handoff",
 			FailureArtifactID:     "artifact-handoff",
 			FailureRecordedAt:     &recordedAt,
-			FailureRecoveryAction: app.TaskBoardFailureRecoveryRedriveAuthoringHandoff,
-			CanRedrive:            true,
+			FailureRecoveryAction: app.TaskBoardFailureRecoveryReconcile,
 		}},
 	})
 	rendered := ansi.Strip(detail.View(132, 40))
-	for _, expected := range []string{"失败阶段", "错误码", "handoff.definition_unavailable", "Job ID", "job-handoff", "Artifact ID", "artifact-handoff", "记录时间", "恢复操作", "显式 redrive"} {
+	for _, expected := range []string{"失败阶段", "错误码", "handoff.definition_unavailable", "Job ID", "job-handoff", "Artifact ID", "artifact-handoff", "记录时间", "恢复操作", "显式 reconcile"} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("durable failure detail missing %q:\n%s", expected, rendered)
 		}
@@ -151,21 +149,21 @@ func TestDetailDoesNotRenderLegacyRawFailureReason(t *testing.T) {
 	}
 }
 
-func TestDetailOffersAuthoringRecoveryForMissingOutputSubmission(t *testing.T) {
+func TestDetailOffersTaskContinuationRecovery(t *testing.T) {
 	detail := newDetailModel(&TaskItem{
 		Name: "Task one", Slug: "task-one", RunID: "run-current",
 		Runs: []TaskRunItem{{
 			ID: "run-current", Status: "failed_recoverable", CanRetry: true,
-			RetryStrategy: app.TaskBoardRetryStrategyAuthoringRecovery,
-			FailureCode:   "standard_authoring_codex_agent_turn.output_submission_missing",
+			RetryStrategy: app.TaskBoardRetryStrategyTaskContinuation,
+			FailureCode:   "stage.transient_failure",
 		}},
 	})
 	rendered := ansi.Strip(detail.View(100, 28))
 	if !strings.Contains(rendered, "断点恢复") {
-		t.Fatalf("authoring recovery label missing:\n%s", rendered)
+		t.Fatalf("task continuation label missing:\n%s", rendered)
 	}
 	if footer := detailFooterText(detail); !strings.Contains(footer, "[t] 断点恢复") {
-		t.Fatalf("authoring recovery action missing from footer: %q", footer)
+		t.Fatalf("task continuation action missing from footer: %q", footer)
 	}
 }
 

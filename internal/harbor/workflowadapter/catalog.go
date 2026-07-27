@@ -141,6 +141,8 @@ type StageDefinition struct {
 	Outputs       []workflowkit.ArtifactSpec      `json:"outputs"`
 	ReadSet       []workflowkit.ResourceKey       `json:"read_set"`
 	WriteSet      []workflowkit.ResourceKey       `json:"write_set"`
+	Concurrency   *workflowkit.ConcurrencyPolicy  `json:"concurrency,omitempty"`
+	AgentRole     *workflowkit.AgentRoleSpec      `json:"agent_role,omitempty"`
 	Effect        workflowkit.StageEffect         `json:"effect"`
 	Dispatch      workflowkit.StageDispatchPolicy `json:"dispatch,omitempty"`
 	RequiredTurns int                             `json:"required_turns"`
@@ -158,6 +160,14 @@ func (stage StageDefinition) Clone() StageDefinition {
 	stage.Outputs = append([]workflowkit.ArtifactSpec(nil), stage.Outputs...)
 	stage.ReadSet = append([]workflowkit.ResourceKey(nil), stage.ReadSet...)
 	stage.WriteSet = append([]workflowkit.ResourceKey(nil), stage.WriteSet...)
+	if stage.Concurrency != nil {
+		policy := stage.Concurrency.Clone()
+		stage.Concurrency = &policy
+	}
+	if stage.AgentRole != nil {
+		role := stage.AgentRole.Clone()
+		stage.AgentRole = &role
+	}
 	stage.Retry = stage.Retry.Clone()
 	stage.Verdicts = stage.Verdicts.Clone()
 	stage.Capabilities = stage.Capabilities.Clone()
@@ -330,6 +340,10 @@ func artifactOutput(name string) stageArtifact {
 
 func artifactOutputWithSchema(name, schemaVersion string) stageArtifact {
 	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion, Required: true}, output: true}
+}
+
+func optionalArtifactOutputWithSchema(name, schemaVersion string) stageArtifact {
+	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion}, output: true}
 }
 
 func reviewDecisionArtifact(kind ReviewKind) workflowkit.ArtifactSpec {
@@ -517,6 +531,26 @@ func (definition StageDefinition) validate() error {
 	if err := validateUniqueResources("write resource", definition.WriteSet); err != nil {
 		return fmt.Errorf("%w: stage %q: %v", errInvalidCatalog, definition.Key, err)
 	}
+	concurrency := workflowkit.ConcurrencyPolicy{Workspace: workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceNone}}
+	if definition.Concurrency != nil {
+		concurrency = definition.Concurrency.Canonical()
+		if err := concurrency.Validate(definition.Inputs); err != nil {
+			return fmt.Errorf("%w: stage %q concurrency: %v", errInvalidCatalog, definition.Key, err)
+		}
+	}
+	if definition.AgentRole != nil {
+		if err := definition.AgentRole.Validate(); err != nil {
+			return fmt.Errorf("%w: stage %q agent role: %v", errInvalidCatalog, definition.Key, err)
+		}
+		if definition.AgentRole.Workspace.Canonical() != concurrency.Workspace.Canonical() {
+			return fmt.Errorf("%w: stage %q agent role workspace must match stage concurrency", errInvalidCatalog, definition.Key)
+		}
+		for _, input := range definition.AgentRole.InputSchemas {
+			if !definitionDeclaresArtifactInput(definition.Inputs, input) {
+				return fmt.Errorf("%w: stage %q agent input %q is not declared", errInvalidCatalog, definition.Key, input.Name)
+			}
+		}
+	}
 	if !validEffect(definition.Effect) {
 		return fmt.Errorf("%w: stage %q has unsupported effect %q", errInvalidCatalog, definition.Key, definition.Effect)
 	}
@@ -664,6 +698,15 @@ func validateArtifactSpecs(label string, specs []workflowkit.ArtifactSpec) error
 	return nil
 }
 
+func definitionDeclaresArtifactInput(inputs []workflowkit.ArtifactSpec, wanted workflowkit.ArtifactSpec) bool {
+	for _, input := range inputs {
+		if input == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func validateUniqueResources(label string, resources []workflowkit.ResourceKey) error {
 	seen := make(map[workflowkit.ResourceKey]struct{}, len(resources))
 	for _, resource := range resources {
@@ -759,6 +802,20 @@ func (catalog StageCatalog) Fingerprint() (workflowkit.Fingerprint, error) {
 }
 
 func canonicalizeStage(stage *StageDefinition) {
+	if stage.Concurrency != nil {
+		policy := stage.Concurrency.Canonical()
+		if policy.Workspace.Mode == workflowkit.WorkspaceNone {
+			stage.Concurrency = nil
+		} else {
+			stage.Concurrency = &policy
+		}
+	}
+	if stage.AgentRole != nil {
+		role, err := stage.AgentRole.Canonical()
+		if err == nil {
+			stage.AgentRole = &role
+		}
+	}
 	sort.Slice(stage.Dependencies, func(left, right int) bool { return stage.Dependencies[left] < stage.Dependencies[right] })
 	sort.Slice(stage.Inputs, func(left, right int) bool { return stage.Inputs[left].Name < stage.Inputs[right].Name })
 	sort.Slice(stage.Outputs, func(left, right int) bool { return stage.Outputs[left].Name < stage.Outputs[right].Name })
@@ -790,40 +847,39 @@ const (
 	resourceTaskTestsAnalysis     workflowkit.ResourceKey = "task/tests-analysis"
 	resourceTaskSnapshot          workflowkit.ResourceKey = "task/snapshot"
 	resourceTaskDigest            workflowkit.ResourceKey = "task/digest"
-	// resourceAuthoringTaskHandoff is written exactly once by the closed
-	// AuthoringSession materialize_task stage. A task-bound child Run consumes
-	// its immutable receipt; it must never keep executing under the source
-	// session subject after this write.
-	resourceAuthoringTaskHandoff         workflowkit.ResourceKey = "authoring/task-handoff"
-	resourceAuthoringTaskAdmission       workflowkit.ResourceKey = "authoring/task-admission"
-	resourceTaskWildcard                 workflowkit.ResourceKey = "task/**"
-	resourceFindingWildcard              workflowkit.ResourceKey = "finding/**"
-	resourceReviewTaskDirection          workflowkit.ResourceKey = "review/task-direction"
-	resourceReviewContent                workflowkit.ResourceKey = "review/content"
-	resourceReviewSolutionVerifier       workflowkit.ResourceKey = "review/solution-verifier"
-	resourceReviewFinalQuality           workflowkit.ResourceKey = "review/final-quality"
-	resourceReviewEvaluatorEvidence      workflowkit.ResourceKey = "review/evaluator-evidence-handoff"
-	resourceReviewModelResult            workflowkit.ResourceKey = "review/model-result"
-	resourceEvidenceRepoPrepare          workflowkit.ResourceKey = "evidence/repo-prepare"
-	resourceEvidenceAuthoringDockerBuild workflowkit.ResourceKey = "evidence/authoring/dockerfile-build"
-	resourceEvidenceAuthoringHarness     workflowkit.ResourceKey = "evidence/authoring/harness"
-	resourceEvidenceTaskLayout           workflowkit.ResourceKey = "evidence/codeedge/task-layout"
-	resourceEvidenceRepoProvenance       workflowkit.ResourceKey = "evidence/codeedge/repo-provenance"
-	resourceEvidenceEnvironmentIsolation workflowkit.ResourceKey = "evidence/codeedge/environment-isolation"
-	resourceEvidenceTestsAnalysis        workflowkit.ResourceKey = "evidence/codeedge/tests-analysis"
-	resourceEvidenceRepair               workflowkit.ResourceKey = "evidence/repair"
-	resourceEvidenceRuntimeSelfCheck     workflowkit.ResourceKey = "evidence/runtime-self-check"
-	resourceEvidenceVerification         workflowkit.ResourceKey = "evidence/verification"
-	resourceEvidenceDockerBuild          workflowkit.ResourceKey = "evidence/docker-build"
-	resourceEvidenceInitialVerify        workflowkit.ResourceKey = "evidence/initial-verify"
-	resourceEvidenceOracleVerify         workflowkit.ResourceKey = "evidence/oracle-verify"
-	resourceEvidenceLint                 workflowkit.ResourceKey = "evidence/lint"
-	resourceEvidenceQuality              workflowkit.ResourceKey = "evidence/quality"
-	resourceEvidenceSimilarity           workflowkit.ResourceKey = "evidence/similarity"
-	resourceEvidenceEvaluationQwen       workflowkit.ResourceKey = "evidence/evaluation/qwen"
-	resourceEvidenceEvaluationOpus       workflowkit.ResourceKey = "evidence/evaluation/opus"
-	resourceEvidenceEvaluatorHandoff     workflowkit.ResourceKey = "evidence/evaluation/handoff"
-	resourceEvidenceSubmissionLint       workflowkit.ResourceKey = "evidence/submission-lint"
-	resourceDeliveryPublish              workflowkit.ResourceKey = "delivery/publish"
-	resourceDeliveryPackage              workflowkit.ResourceKey = "delivery/package"
+	// resourceAuthoringMaterializationReceipt records the terminal sealed task
+	// revision for the source-session workflow. It is audit evidence, not an
+	// authorization to start any child Run.
+	resourceAuthoringMaterializationReceipt workflowkit.ResourceKey = "authoring/materialization-receipt"
+	resourceAuthoringTaskAdmission          workflowkit.ResourceKey = "authoring/task-admission"
+	resourceTaskWildcard                    workflowkit.ResourceKey = "task/**"
+	resourceFindingWildcard                 workflowkit.ResourceKey = "finding/**"
+	resourceReviewTaskDirection             workflowkit.ResourceKey = "review/task-direction"
+	resourceReviewContent                   workflowkit.ResourceKey = "review/content"
+	resourceReviewSolutionVerifier          workflowkit.ResourceKey = "review/solution-verifier"
+	resourceReviewFinalQuality              workflowkit.ResourceKey = "review/final-quality"
+	resourceReviewEvaluatorEvidence         workflowkit.ResourceKey = "review/evaluator-evidence-handoff"
+	resourceReviewModelResult               workflowkit.ResourceKey = "review/model-result"
+	resourceEvidenceRepoPrepare             workflowkit.ResourceKey = "evidence/repo-prepare"
+	resourceEvidenceAuthoringDockerBuild    workflowkit.ResourceKey = "evidence/authoring/dockerfile-build"
+	resourceEvidenceAuthoringHarness        workflowkit.ResourceKey = "evidence/authoring/harness"
+	resourceEvidenceTaskLayout              workflowkit.ResourceKey = "evidence/codeedge/task-layout"
+	resourceEvidenceRepoProvenance          workflowkit.ResourceKey = "evidence/codeedge/repo-provenance"
+	resourceEvidenceEnvironmentIsolation    workflowkit.ResourceKey = "evidence/codeedge/environment-isolation"
+	resourceEvidenceTestsAnalysis           workflowkit.ResourceKey = "evidence/codeedge/tests-analysis"
+	resourceEvidenceRepair                  workflowkit.ResourceKey = "evidence/repair"
+	resourceEvidenceRuntimeSelfCheck        workflowkit.ResourceKey = "evidence/runtime-self-check"
+	resourceEvidenceVerification            workflowkit.ResourceKey = "evidence/verification"
+	resourceEvidenceDockerBuild             workflowkit.ResourceKey = "evidence/docker-build"
+	resourceEvidenceInitialVerify           workflowkit.ResourceKey = "evidence/initial-verify"
+	resourceEvidenceOracleVerify            workflowkit.ResourceKey = "evidence/oracle-verify"
+	resourceEvidenceLint                    workflowkit.ResourceKey = "evidence/lint"
+	resourceEvidenceQuality                 workflowkit.ResourceKey = "evidence/quality"
+	resourceEvidenceSimilarity              workflowkit.ResourceKey = "evidence/similarity"
+	resourceEvidenceEvaluationQwen          workflowkit.ResourceKey = "evidence/evaluation/qwen"
+	resourceEvidenceEvaluationOpus          workflowkit.ResourceKey = "evidence/evaluation/opus"
+	resourceEvidenceEvaluatorHandoff        workflowkit.ResourceKey = "evidence/evaluation/handoff"
+	resourceEvidenceSubmissionLint          workflowkit.ResourceKey = "evidence/submission-lint"
+	resourceDeliveryPublish                 workflowkit.ResourceKey = "delivery/publish"
+	resourceDeliveryPackage                 workflowkit.ResourceKey = "delivery/package"
 )

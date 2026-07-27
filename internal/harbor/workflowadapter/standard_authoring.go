@@ -7,59 +7,58 @@ import (
 )
 
 const (
-	// StandardAuthoringWorkflowTemplateID identifies the closed source-session
-	// workflow. It materializes one immutable task revision before handing off to
-	// the separate task-bound CodeEdge workflow.
+	// StandardAuthoringWorkflowTemplateID identifies the only source-session
+	// workflow. It creates exactly one sealed task revision and then ends.
 	StandardAuthoringWorkflowTemplateID = "harbor.standard-authoring"
 
-	// StandardAuthoringContractTemplateVersion is the only supported Standard
-	// Authoring template. The immutable root contract is the sole source of
-	// caller-selected task direction, source identity, and environment policy.
-	StandardAuthoringContractTemplateVersion = "2.0.0"
+	// StandardAuthoringContractTemplateVersion is a hard cutover. No 2.x
+	// catalog, profile, operation binding, or recovery route is executable.
+	StandardAuthoringContractTemplateVersion = "3.0.0"
 
 	standardAuthoringCatalogID      = "harbor.standard-authoring-stage-catalog"
 	standardAuthoringCatalogVersion = StandardAuthoringContractTemplateVersion
 
-	// StandardAuthoringTaskDesignMaxTurns bounds the task-design Codex
-	// conversation in the source-session workflow. It intentionally does not
-	// alter the task-bound Standard catalog.
-	StandardAuthoringTaskDesignMaxTurns = 30
+	StandardAuthoringAuthoringLoopMaxTurns = 3
+	StandardAuthoringRepairMaxTurns        = 2
+	// Kept as a source-compatible name for callers that only need the bounded
+	// authoring conversation limit. The retired task_design stage itself is not
+	// present in the 3.0 catalog.
+	StandardAuthoringTaskDesignMaxTurns = StandardAuthoringAuthoringLoopMaxTurns
 
-	// StandardAuthoringTaskHandoffArtifact is emitted only by materialize_task.
-	// It is a receipt for a sealed task revision, never a mutable workspace path
-	// or authority to continue task-bound work under the source session.
-	StandardAuthoringTaskHandoffArtifact      = "authoring_task_handoff"
-	StandardAuthoringTaskHandoffSchemaVersion = "harbor.authoring-task-handoff.v2"
-
-	StandardAuthoringValidatedDockerfileArtifact        = "validated_dockerfile"
-	StandardAuthoringDockerfileBuildReportArtifact      = "dockerfile_build_report"
-	StandardAuthoringDockerfileBuildReportSchemaVersion = "harbor.standard-authoring-dockerfile-build-report.v1"
-	StandardAuthoringValidatedSolveScriptArtifact       = "validated_solve_script"
-	StandardAuthoringValidatedTestScriptArtifact        = "validated_test_script"
-	StandardAuthoringHarnessReportArtifact              = "authoring_harness_report"
-	StandardAuthoringHarnessReportSchemaVersion         = "harbor.standard-authoring-harness-report.v1"
+	StandardAuthoringMaterializationReceiptArtifact      = "materialization_receipt"
+	StandardAuthoringMaterializationReceiptSchemaVersion = "harbor.standard-authoring-materialization-receipt.v1"
 
 	standardAuthoringPackageAdmissionReportArtifact      = "codeedge_package_admission_report"
 	standardAuthoringPackageAdmissionReportSchemaVersion = "harbor.standard-authoring-task-package-admission.v1"
+
+	standardAuthoringCandidateSnapshotArtifact         = "candidate_snapshot"
+	standardAuthoringCandidateSnapshotSchemaVersion    = workflowkit.CandidateSnapshotFormat
+	standardAuthoringVerificationContractArtifact      = "verification_contract"
+	standardAuthoringVerificationContractSchemaVersion = "harbor.verification-contract.v1"
+	standardAuthoringValidationReceiptArtifact         = "validation_receipt"
+	standardAuthoringValidationReceiptSchemaVersion    = workflowkit.ValidationReceiptFormat
+	standardAuthoringWorkflowRepairLedgerArtifact      = "workflow_repair_ledger"
+	standardAuthoringWorkflowRepairLedgerSchemaVersion = workflowkit.WorkflowRepairLedgerFormat
+	standardAuthoringFinalAttestationArtifact          = "final_attestation"
+	standardAuthoringFinalAttestationSchemaVersion     = "harbor.standard-authoring-final-attestation.v1"
 )
 
 var standardAuthoringStageOrder = []workflowkit.StageKey{
 	workflowkit.StageKey(RepoPrepare),
-	workflowkit.StageKey(RepoAnalyze),
-	workflowkit.StageKey(TaskDesign),
+	workflowkit.StageKey(RepoStructureResearch),
+	workflowkit.StageKey(TestRuntimeResearch),
+	workflowkit.StageKey(VerifierThreatResearch),
+	workflowkit.StageKey(TaskSynthesis),
 	workflowkit.StageKey(TaskReview),
-	workflowkit.StageKey(GenerateTaskFiles),
-	workflowkit.StageKey(InstructionGen),
-	workflowkit.StageKey(TaskTOMLGen),
-	workflowkit.StageKey(DockerfileGen),
-	workflowkit.StageKey(DockerfileBuildValidate),
+	workflowkit.StageKey(AuthoringLoop),
+	workflowkit.StageKey(HostCandidateVerify),
+	workflowkit.StageKey(TestQualityCritic),
+	workflowkit.StageKey(SolutionIntegrityCritic),
+	workflowkit.StageKey(AuthoringRepair),
 	workflowkit.StageKey(ContentReview),
-	workflowkit.StageKey(SolveGen),
-	workflowkit.StageKey(TestGen),
-	workflowkit.StageKey(AuthoringHarness),
-	workflowkit.StageKey(TestsAnalysis),
-	workflowkit.StageKey(CodeEdgePackageAdmission),
 	workflowkit.StageKey(SolutionReview),
+	workflowkit.StageKey(FinalAttestation),
+	workflowkit.StageKey(CodeEdgePackageAdmission),
 	workflowkit.StageKey(MaterializeTask),
 }
 
@@ -68,6 +67,9 @@ var standardAuthoringGroups = []StageGroup{
 	StageTaskAnalysis,
 	StageTaskDesign,
 	StageTaskGeneration,
+	StageRuntimeVerify,
+	StageQuality,
+	StageFinalReview,
 }
 
 func StandardAuthoringContractTemplateReference() TemplateReference {
@@ -75,24 +77,22 @@ func StandardAuthoringContractTemplateReference() TemplateReference {
 }
 
 // StandardAuthoringCurrentTemplateReference returns the only executable
-// Standard Authoring template.
+// Standard Authoring template in this binary.
 func StandardAuthoringCurrentTemplateReference() TemplateReference {
 	return StandardAuthoringContractTemplateReference()
 }
 
-// IsStandardAuthoringWorkflowTemplate reports whether a Run is bound to the
-// immutable-source authoring half of the lifecycle.
+// IsStandardAuthoringWorkflowTemplate admits only the current hard-cutover
+// descriptor. Completed legacy records remain audit data in storage, never an
+// executable template.
 func IsStandardAuthoringWorkflowTemplate(reference TemplateReference) bool {
 	return reference.Equal(StandardAuthoringContractTemplateReference())
 }
 
-// StandardAuthoringStageOrder returns the dependency-aware v2 stage list.
 func StandardAuthoringStageOrder() []workflowkit.StageKey {
 	return append([]workflowkit.StageKey(nil), standardAuthoringStageOrder...)
 }
 
-// StandardAuthoringStageOrderForTemplate exposes the exact closed operation
-// set for the single installed Authoring template.
 func StandardAuthoringStageOrderForTemplate(reference TemplateReference) ([]workflowkit.StageKey, error) {
 	if reference.Equal(StandardAuthoringContractTemplateReference()) {
 		return StandardAuthoringStageOrder(), nil
@@ -106,35 +106,28 @@ func standardAuthoringStageGroups() []StageGroup {
 
 func standardAuthoringDependencies() map[workflowkit.StageKey][]workflowkit.StageKey {
 	return map[workflowkit.StageKey][]workflowkit.StageKey{
-		workflowkit.StageKey(RepoPrepare):             nil,
-		workflowkit.StageKey(RepoAnalyze):             {workflowkit.StageKey(RepoPrepare)},
-		workflowkit.StageKey(TaskDesign):              {workflowkit.StageKey(RepoAnalyze)},
-		workflowkit.StageKey(TaskReview):              {workflowkit.StageKey(TaskDesign)},
-		workflowkit.StageKey(GenerateTaskFiles):       {workflowkit.StageKey(TaskReview)},
-		workflowkit.StageKey(InstructionGen):          {workflowkit.StageKey(GenerateTaskFiles)},
-		workflowkit.StageKey(TaskTOMLGen):             {workflowkit.StageKey(GenerateTaskFiles)},
-		workflowkit.StageKey(DockerfileGen):           {workflowkit.StageKey(GenerateTaskFiles)},
-		workflowkit.StageKey(DockerfileBuildValidate): {workflowkit.StageKey(DockerfileGen)},
-		workflowkit.StageKey(ContentReview): {
-			workflowkit.StageKey(InstructionGen), workflowkit.StageKey(TaskTOMLGen), workflowkit.StageKey(DockerfileBuildValidate),
-		},
-		workflowkit.StageKey(SolveGen):         {workflowkit.StageKey(ContentReview)},
-		workflowkit.StageKey(TestGen):          {workflowkit.StageKey(ContentReview)},
-		workflowkit.StageKey(AuthoringHarness): {workflowkit.StageKey(SolveGen), workflowkit.StageKey(TestGen)},
-		workflowkit.StageKey(TestsAnalysis):    {workflowkit.StageKey(AuthoringHarness)},
-		workflowkit.StageKey(CodeEdgePackageAdmission): {
-			workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TestsAnalysis),
-		},
-		workflowkit.StageKey(SolutionReview): {
-			workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TestsAnalysis), workflowkit.StageKey(CodeEdgePackageAdmission),
-		},
-		workflowkit.StageKey(MaterializeTask): {workflowkit.StageKey(SolutionReview)},
+		workflowkit.StageKey(RepoPrepare):              nil,
+		workflowkit.StageKey(RepoStructureResearch):    {workflowkit.StageKey(RepoPrepare)},
+		workflowkit.StageKey(TestRuntimeResearch):      {workflowkit.StageKey(RepoPrepare)},
+		workflowkit.StageKey(VerifierThreatResearch):   {workflowkit.StageKey(RepoPrepare)},
+		workflowkit.StageKey(TaskSynthesis):            {workflowkit.StageKey(RepoStructureResearch), workflowkit.StageKey(TestRuntimeResearch), workflowkit.StageKey(VerifierThreatResearch)},
+		workflowkit.StageKey(TaskReview):               {workflowkit.StageKey(TaskSynthesis)},
+		workflowkit.StageKey(AuthoringLoop):            {workflowkit.StageKey(TaskReview)},
+		workflowkit.StageKey(HostCandidateVerify):      {workflowkit.StageKey(AuthoringLoop)},
+		workflowkit.StageKey(TestQualityCritic):        {workflowkit.StageKey(HostCandidateVerify)},
+		workflowkit.StageKey(SolutionIntegrityCritic):  {workflowkit.StageKey(HostCandidateVerify)},
+		workflowkit.StageKey(AuthoringRepair):          {workflowkit.StageKey(TestQualityCritic), workflowkit.StageKey(SolutionIntegrityCritic)},
+		workflowkit.StageKey(ContentReview):            {workflowkit.StageKey(AuthoringRepair)},
+		workflowkit.StageKey(SolutionReview):           {workflowkit.StageKey(AuthoringRepair)},
+		workflowkit.StageKey(FinalAttestation):         {workflowkit.StageKey(ContentReview), workflowkit.StageKey(SolutionReview)},
+		workflowkit.StageKey(CodeEdgePackageAdmission): {workflowkit.StageKey(FinalAttestation)},
+		workflowkit.StageKey(MaterializeTask):          {workflowkit.StageKey(CodeEdgePackageAdmission)},
 	}
 }
 
-// StandardAuthoringContractWorkflowTemplate is the complete v2 source-session
-// workflow. It directly defines its topology rather than inheriting a retired
-// 1.x catalog, so a v2 change cannot reinterpret any historical descriptor.
+// StandardAuthoringContractWorkflowTemplate returns the complete 3.0
+// source-session descriptor. It is direct rather than adapted from 2.x, so
+// no old stage key, workspace protocol, or recovery branch can be reactivated.
 func StandardAuthoringContractWorkflowTemplate() WorkflowTemplate {
 	return WorkflowTemplate{
 		ID:          StandardAuthoringWorkflowTemplateID,
@@ -148,89 +141,133 @@ func StandardAuthoringCurrentWorkflowTemplate() WorkflowTemplate {
 	return StandardAuthoringContractWorkflowTemplate()
 }
 
-// StandardAuthoringContractStageCatalog directly declares the v2 descriptor.
-// Every stage receives the same required immutable root contract. Bounded,
-// optional repair evidence is declared only on producers that can be selected
-// for a continuation; it is absent during the ordinary happy path.
+// StandardAuthoringContractStageCatalog freezes a single 3.0 orchestration
+// path. Agent stages carry their role and host workspace binding in the
+// descriptor; deployment assets only choose the attested implementation.
 func StandardAuthoringContractStageCatalog() StageCatalog {
 	stages := []StageDefinition{
 		stage(RepoPrepare, StageSourcePrepare, nil, "harborfactory.repo_prepare",
 			[]workflowkit.ResourceKey{resourceSourceRepository},
 			[]workflowkit.ResourceKey{resourceSourceSnapshot, resourceEvidenceRepoPrepare},
 			workflowkit.EffectEvidenceOnly, 1, passOnly(), artifactOutput("repo_prepared")),
-		stage(RepoAnalyze, StageTaskAnalysis, []string{RepoPrepare}, "harborfactory.repo_analyze",
-			[]workflowkit.ResourceKey{resourceSourceSnapshot}, []workflowkit.ResourceKey{resourceAnalysisRepository},
-			workflowkit.EffectEvidenceOnly, 3, passOnly(), artifactInput("repo_prepared"), optionalReviewDecisionInput("task_review_decision"), artifactOutput("repo_analysis")),
-		stage(TaskDesign, StageTaskDesign, []string{RepoAnalyze}, "harborfactory.task_design",
-			[]workflowkit.ResourceKey{resourceSourceSnapshot, resourceAnalysisRepository}, []workflowkit.ResourceKey{resourceTaskDesign},
-			workflowkit.EffectContentProducer, StandardAuthoringTaskDesignMaxTurns, contentVerdicts(), artifactInput("repo_prepared"), artifactInput("repo_analysis"), optionalReviewDecisionInput("task_review_decision"), artifactOutput("task_proposal")),
-		gateStage(TaskReview, StageTaskDesign, []string{TaskDesign}, ReviewTaskDirection,
-			[]workflowkit.ResourceKey{resourceAnalysisRepository, resourceTaskDesign}, []workflowkit.ResourceKey{resourceReviewTaskDirection},
-			artifactInput("repo_analysis"), artifactInput("task_proposal")),
-		stage(GenerateTaskFiles, StageTaskGeneration, []string{TaskReview}, "harborfactory.generate_task_files",
-			[]workflowkit.ResourceKey{resourceSourceSnapshot, resourceAnalysisRepository, resourceTaskDesign, resourceReviewTaskDirection}, []workflowkit.ResourceKey{resourceTaskGeneratedFiles},
-			workflowkit.EffectContentProducer, 3, contentVerdicts(), artifactInput("repo_prepared"), artifactInput("repo_analysis"), artifactInput("task_proposal"), reviewDecisionInput("task_review_decision"), artifactOutput("generated_task_files")),
-		stage(InstructionGen, StageTaskGeneration, []string{GenerateTaskFiles}, "harborfactory.instruction_generate",
-			[]workflowkit.ResourceKey{resourceTaskGeneratedFiles}, []workflowkit.ResourceKey{resourceTaskInstruction},
-			workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("generated_task_files"), optionalReviewDecisionInput("content_review_decision"), optionalReviewDecisionInput("solution_review_decision"), optionalArtifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("instruction")),
-		stage(TaskTOMLGen, StageTaskGeneration, []string{GenerateTaskFiles}, "harborfactory.task_toml_generate",
-			[]workflowkit.ResourceKey{resourceTaskGeneratedFiles, resourceTaskDesign}, []workflowkit.ResourceKey{resourceTaskMetadata},
-			workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("generated_task_files"), artifactInput("task_proposal"), optionalReviewDecisionInput("content_review_decision"), optionalReviewDecisionInput("solution_review_decision"), optionalArtifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("task_toml")),
-		stage(DockerfileGen, StageTaskGeneration, []string{GenerateTaskFiles}, "harborfactory.dockerfile_generate",
-			[]workflowkit.ResourceKey{resourceSourceSnapshot, resourceTaskDesign}, []workflowkit.ResourceKey{resourceTaskEnvironment},
-			workflowkit.EffectContentProducer, 1, contentVerdicts(), artifactInput("repo_prepared"), artifactInput("task_proposal"), optionalReviewDecisionInput("content_review_decision"), optionalReviewDecisionInput("solution_review_decision"), optionalArtifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("dockerfile")),
-		stage(DockerfileBuildValidate, StageTaskGeneration, []string{DockerfileGen}, "harborfactory.dockerfile_build_validate",
-			[]workflowkit.ResourceKey{resourceSourceSnapshot, resourceTaskDesign, resourceTaskEnvironment},
-			[]workflowkit.ResourceKey{resourceTaskValidatedEnvironment, resourceEvidenceAuthoringDockerBuild},
-			workflowkit.EffectContentMutator, 1, passOnly(),
-			artifactInput("repo_prepared"), artifactInput("task_proposal"), artifactInput("dockerfile"),
-			artifactOutput(StandardAuthoringValidatedDockerfileArtifact), artifactOutputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion)),
-		gateStage(ContentReview, StageTaskGeneration, []string{InstructionGen, TaskTOMLGen, DockerfileBuildValidate}, ReviewContent,
-			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskValidatedEnvironment, resourceEvidenceAuthoringDockerBuild}, []workflowkit.ResourceKey{resourceReviewContent},
-			artifactInput("instruction"), artifactInput("task_toml"), artifactInput(StandardAuthoringValidatedDockerfileArtifact), artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion)),
-		stage(SolveGen, StageTaskGeneration, []string{ContentReview}, "harborfactory.solve_generate",
-			[]workflowkit.ResourceKey{resourceTaskGeneratedFiles, resourceTaskValidatedEnvironment, resourceEvidenceAuthoringDockerBuild}, []workflowkit.ResourceKey{resourceTaskSolution},
-			workflowkit.EffectContentProducer, 1, passOnly(), artifactInput("generated_task_files"), artifactInput(StandardAuthoringValidatedDockerfileArtifact), artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion), optionalReviewDecisionInput("solution_review_decision"), optionalArtifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("solve_script")),
-		stage(TestGen, StageTaskGeneration, []string{ContentReview}, "harborfactory.test_generate",
-			[]workflowkit.ResourceKey{resourceTaskGeneratedFiles, resourceTaskValidatedEnvironment, resourceEvidenceAuthoringDockerBuild}, []workflowkit.ResourceKey{resourceTaskTests},
-			workflowkit.EffectContentProducer, 1, passOnly(), artifactInput("generated_task_files"), artifactInput(StandardAuthoringValidatedDockerfileArtifact), artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion), optionalReviewDecisionInput("solution_review_decision"), optionalArtifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("test_script")),
-		stage(AuthoringHarness, StageTaskGeneration, []string{SolveGen, TestGen}, "harborfactory.authoring_harness",
-			[]workflowkit.ResourceKey{resourceSourceSnapshot, resourceTaskGeneratedFiles, resourceTaskDesign, resourceTaskInstruction, resourceTaskMetadata, resourceTaskValidatedEnvironment, resourceTaskSolution, resourceTaskTests, resourceEvidenceAuthoringDockerBuild},
-			[]workflowkit.ResourceKey{resourceTaskValidatedSolution, resourceTaskValidatedTests, resourceEvidenceAuthoringHarness},
-			workflowkit.EffectContentMutator, 1, passOnly(),
-			artifactInput("repo_prepared"), artifactInput("generated_task_files"), artifactInput("task_proposal"), artifactInput("instruction"), artifactInput("task_toml"), artifactInput(StandardAuthoringValidatedDockerfileArtifact), artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion), artifactInput("solve_script"), artifactInput("test_script"),
-			artifactOutput(StandardAuthoringValidatedSolveScriptArtifact), artifactOutput(StandardAuthoringValidatedTestScriptArtifact), artifactOutputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion)),
-		stage(TestsAnalysis, StageTaskGeneration, []string{AuthoringHarness}, "harborfactory.tests_analysis",
-			[]workflowkit.ResourceKey{resourceTaskGeneratedFiles, resourceTaskDesign, resourceTaskValidatedTests, resourceEvidenceAuthoringHarness}, []workflowkit.ResourceKey{resourceTaskTestsAnalysis},
-			workflowkit.EffectContentProducer, 1, passOnly(), artifactInput("generated_task_files"), artifactInput("task_proposal"), artifactInput(StandardAuthoringValidatedTestScriptArtifact), artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion), optionalReviewDecisionInput("solution_review_decision"), optionalArtifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("tests_analysis")),
-		stage(CodeEdgePackageAdmission, StageTaskGeneration, []string{AuthoringHarness, TestsAnalysis}, "harborfactory.codeedge_package_admission",
-			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskValidatedEnvironment, resourceTaskValidatedSolution, resourceTaskValidatedTests, resourceTaskTestsAnalysis, resourceEvidenceAuthoringDockerBuild, resourceEvidenceAuthoringHarness}, []workflowkit.ResourceKey{resourceAuthoringTaskAdmission},
-			workflowkit.EffectEvidenceOnly, 1, contentVerdicts(),
-			artifactInput("instruction"), artifactInput("task_toml"), artifactInput(StandardAuthoringValidatedDockerfileArtifact), artifactInput(StandardAuthoringValidatedSolveScriptArtifact), artifactInput(StandardAuthoringValidatedTestScriptArtifact), artifactInput("tests_analysis"), artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion), artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion), artifactOutputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion)),
-		gateStage(SolutionReview, StageTaskGeneration, []string{AuthoringHarness, TestsAnalysis, CodeEdgePackageAdmission}, ReviewSolutionVerifier,
-			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskValidatedEnvironment, resourceTaskValidatedSolution, resourceTaskValidatedTests, resourceTaskTestsAnalysis, resourceEvidenceAuthoringDockerBuild, resourceEvidenceAuthoringHarness, resourceAuthoringTaskAdmission}, []workflowkit.ResourceKey{resourceReviewSolutionVerifier},
-			artifactInput("instruction"), artifactInput("task_toml"), artifactInput(StandardAuthoringValidatedDockerfileArtifact), artifactInput(StandardAuthoringValidatedSolveScriptArtifact), artifactInput(StandardAuthoringValidatedTestScriptArtifact), artifactInput("tests_analysis"), artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion), artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion), artifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion)),
-		stage(MaterializeTask, StageTaskGeneration, []string{SolutionReview}, "harborfactory.materialize_task",
-			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskValidatedEnvironment, resourceTaskValidatedSolution, resourceTaskValidatedTests, resourceTaskTestsAnalysis, resourceReviewSolutionVerifier, resourceEvidenceAuthoringDockerBuild, resourceEvidenceAuthoringHarness, resourceAuthoringTaskAdmission},
-			[]workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceAuthoringTaskHandoff},
+		stage(RepoStructureResearch, StageTaskAnalysis, []string{RepoPrepare}, "harborfactory.repo_structure_research",
+			[]workflowkit.ResourceKey{resourceSourceSnapshot}, []workflowkit.ResourceKey{"evidence/research/repo-structure"},
+			workflowkit.EffectEvidenceOnly, 3, passOnly(), artifactInput("repo_prepared"), artifactOutputWithSchema("repo_structure_evidence", "workflowkit.workflow-evidence.v1")),
+		stage(TestRuntimeResearch, StageTaskAnalysis, []string{RepoPrepare}, "harborfactory.test_runtime_research",
+			[]workflowkit.ResourceKey{resourceSourceSnapshot}, []workflowkit.ResourceKey{"evidence/research/test-runtime"},
+			workflowkit.EffectEvidenceOnly, 3, passOnly(), artifactInput("repo_prepared"), artifactOutputWithSchema("test_runtime_evidence", "workflowkit.workflow-evidence.v1")),
+		stage(VerifierThreatResearch, StageTaskAnalysis, []string{RepoPrepare}, "harborfactory.verifier_threat_research",
+			[]workflowkit.ResourceKey{resourceSourceSnapshot}, []workflowkit.ResourceKey{"evidence/research/verifier-threat"},
+			workflowkit.EffectEvidenceOnly, 3, passOnly(), artifactInput("repo_prepared"), artifactOutputWithSchema("verifier_threat_evidence", "workflowkit.workflow-evidence.v1")),
+		stage(TaskSynthesis, StageTaskDesign, []string{RepoStructureResearch, TestRuntimeResearch, VerifierThreatResearch}, "harborfactory.task_synthesis",
+			[]workflowkit.ResourceKey{"evidence/research/repo-structure", "evidence/research/test-runtime", "evidence/research/verifier-threat"},
+			[]workflowkit.ResourceKey{resourceTaskDesign, "task/verification-contract"}, workflowkit.EffectContentProducer, 4, contentVerdicts(),
+			artifactInputWithSchema("repo_structure_evidence", "workflowkit.workflow-evidence.v1"), artifactInputWithSchema("test_runtime_evidence", "workflowkit.workflow-evidence.v1"), artifactInputWithSchema("verifier_threat_evidence", "workflowkit.workflow-evidence.v1"),
+			artifactOutputWithSchema("task_specification", "harbor.task-specification.v1"), artifactOutputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion)),
+		gateStage(TaskReview, StageTaskDesign, []string{TaskSynthesis}, ReviewTaskDirection,
+			[]workflowkit.ResourceKey{resourceTaskDesign, "task/verification-contract"}, []workflowkit.ResourceKey{resourceReviewTaskDirection},
+			artifactInputWithSchema("task_specification", "harbor.task-specification.v1"), artifactInputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion)),
+		stage(AuthoringLoop, StageTaskGeneration, []string{TaskReview}, "harborfactory.authoring_loop",
+			[]workflowkit.ResourceKey{resourceSourceSnapshot, resourceTaskDesign, "task/verification-contract", resourceReviewTaskDirection},
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, "task/candidate"},
+			workflowkit.EffectContentMutator, StandardAuthoringAuthoringLoopMaxTurns, contentVerdicts(),
+			artifactInput("repo_prepared"), artifactInputWithSchema("task_specification", "harbor.task-specification.v1"), artifactInputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion), reviewDecisionInput("task_review_decision"),
+			artifactOutput("instruction"), artifactOutput("task_toml"), artifactOutput("dockerfile"), artifactOutput("solve_script"), artifactOutput("test_script"), artifactOutput("tests_analysis"), artifactOutputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion)),
+		stage(HostCandidateVerify, StageRuntimeVerify, []string{AuthoringLoop}, "harborfactory.host_candidate_verify",
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, "task/candidate"},
+			[]workflowkit.ResourceKey{"evidence/candidate-validation"},
 			workflowkit.EffectContentMutator, 1, contentVerdicts(),
-			artifactInput("instruction"), artifactInput("task_toml"), artifactInput(StandardAuthoringValidatedDockerfileArtifact), artifactInput(StandardAuthoringValidatedSolveScriptArtifact), artifactInput(StandardAuthoringValidatedTestScriptArtifact), artifactInput("tests_analysis"), reviewDecisionInput("solution_review_decision"), artifactInputWithSchema(StandardAuthoringDockerfileBuildReportArtifact, StandardAuthoringDockerfileBuildReportSchemaVersion), artifactInputWithSchema(StandardAuthoringHarnessReportArtifact, StandardAuthoringHarnessReportSchemaVersion), artifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("task_snapshot"), artifactOutput("task_digest"), artifactOutputWithSchema(StandardAuthoringTaskHandoffArtifact, StandardAuthoringTaskHandoffSchemaVersion)),
+			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion),
+			artifactInputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion),
+			artifactOutputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion)),
+		stage(TestQualityCritic, StageQuality, []string{HostCandidateVerify}, "harborfactory.test_quality_critic",
+			[]workflowkit.ResourceKey{"task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{"finding/test-quality"},
+			workflowkit.EffectEvidenceOnly, 3, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema("test_quality_finding", workflowkit.WorkflowFindingFormat)),
+		stage(SolutionIntegrityCritic, StageQuality, []string{HostCandidateVerify}, "harborfactory.solution_integrity_critic",
+			[]workflowkit.ResourceKey{"task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{"finding/solution-integrity"},
+			workflowkit.EffectEvidenceOnly, 3, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema("solution_integrity_finding", workflowkit.WorkflowFindingFormat)),
+		stage(AuthoringRepair, StageTaskGeneration, []string{TestQualityCritic, SolutionIntegrityCritic}, "harborfactory.authoring_repair",
+			[]workflowkit.ResourceKey{"task/candidate", "finding/test-quality", "finding/solution-integrity"}, []workflowkit.ResourceKey{"task/candidate", resourceEvidenceRepair},
+			workflowkit.EffectContentMutator, StandardAuthoringRepairMaxTurns, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactInputWithSchema("test_quality_finding", workflowkit.WorkflowFindingFormat), artifactInputWithSchema("solution_integrity_finding", workflowkit.WorkflowFindingFormat), artifactOutput("instruction"), artifactOutput("task_toml"), artifactOutput("dockerfile"), artifactOutput("solve_script"), artifactOutput("test_script"), artifactOutput("tests_analysis"), artifactOutputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactOutputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema(standardAuthoringWorkflowRepairLedgerArtifact, standardAuthoringWorkflowRepairLedgerSchemaVersion)),
+		gateStage(ContentReview, StageFinalReview, []string{AuthoringRepair}, ReviewContent,
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, "task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{resourceReviewContent},
+			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion)),
+		gateStage(SolutionReview, StageFinalReview, []string{AuthoringRepair}, ReviewSolutionVerifier,
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, "task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{resourceReviewSolutionVerifier},
+			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion)),
+		stage(FinalAttestation, StageFinalReview, []string{ContentReview, SolutionReview}, "harborfactory.final_attestation",
+			[]workflowkit.ResourceKey{resourceReviewContent, resourceReviewSolutionVerifier, "evidence/candidate-validation"}, []workflowkit.ResourceKey{"evidence/final-attestation"},
+			workflowkit.EffectEvidenceOnly, 1, passOnly(), reviewDecisionInput("content_review_decision"), reviewDecisionInput("solution_review_decision"), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema(standardAuthoringFinalAttestationArtifact, standardAuthoringFinalAttestationSchemaVersion)),
+		stage(CodeEdgePackageAdmission, StageFinalReview, []string{FinalAttestation}, "harborfactory.codeedge_package_admission",
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, "task/candidate", "evidence/candidate-validation", "evidence/final-attestation"}, []workflowkit.ResourceKey{resourceAuthoringTaskAdmission},
+			workflowkit.EffectEvidenceOnly, 1, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactInputWithSchema(standardAuthoringFinalAttestationArtifact, standardAuthoringFinalAttestationSchemaVersion), artifactOutputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion)),
+		stage(MaterializeTask, StageFinalReview, []string{CodeEdgePackageAdmission}, "harborfactory.materialize_task",
+			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, "task/candidate", "evidence/candidate-validation", resourceReviewSolutionVerifier, "evidence/final-attestation", resourceAuthoringTaskAdmission},
+			[]workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, resourceTaskSolution, resourceTaskTests, resourceTaskTestsAnalysis, resourceAuthoringMaterializationReceipt},
+			workflowkit.EffectContentMutator, 1, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactInputWithSchema(standardAuthoringFinalAttestationArtifact, standardAuthoringFinalAttestationSchemaVersion), reviewDecisionInput("solution_review_decision"), artifactInputWithSchema(standardAuthoringPackageAdmissionReportArtifact, standardAuthoringPackageAdmissionReportSchemaVersion), artifactOutput("task_snapshot"), artifactOutput("task_digest"), artifactOutputWithSchema(StandardAuthoringMaterializationReceiptArtifact, StandardAuthoringMaterializationReceiptSchemaVersion)),
 	}
 	for index := range stages {
 		stages[index].Inputs = append(stages[index].Inputs, artifactInputWithSchema(AuthoringContractArtifact, AuthoringContractSchemaVersion).spec)
 		stages[index].ReadSet = append(stages[index].ReadSet, resourceAuthoringContract)
 	}
-	return StageCatalog{
-		Template: StandardAuthoringContractTemplateReference(),
-		ID:       standardAuthoringCatalogID,
-		Version:  standardAuthoringCatalogVersion,
-		Stages:   stages,
+	standardAuthoringAttachV3AgentRoles(stages)
+	return StageCatalog{Template: StandardAuthoringContractTemplateReference(), ID: standardAuthoringCatalogID, Version: standardAuthoringCatalogVersion, Stages: stages}
+}
+
+func standardAuthoringAttachV3AgentRoles(stages []StageDefinition) {
+	for index := range stages {
+		stage := &stages[index]
+		role, workspace, maxValidationAttempts, agent := standardAuthoringV3RoleForStage(stage.Key)
+		if !agent {
+			continue
+		}
+		inputs := append([]workflowkit.ArtifactSpec(nil), stage.Inputs...)
+		stage.Concurrency = &workflowkit.ConcurrencyPolicy{Workspace: workspace}
+		stage.AgentRole = &workflowkit.AgentRoleSpec{
+			RoleID: role, PromptAssetFingerprint: workflowkit.SHA256Fingerprint([]byte("harbor.standard-authoring@3.0.0:" + string(stage.Key))),
+			InputSchemas: inputs, Workspace: workspace, OutputMode: standardAuthoringV3RoleOutput(role), MaxTurns: stage.RequiredTurns, MaxValidationAttempts: maxValidationAttempts,
+			AllowedDynamicTools: standardAuthoringV3AllowedTools(role),
+		}
 	}
 }
 
-func StandardAuthoringTaskHandoffSchemaForTemplate(reference TemplateReference) (string, error) {
-	if reference.Equal(StandardAuthoringContractTemplateReference()) {
-		return StandardAuthoringTaskHandoffSchemaVersion, nil
+func standardAuthoringV3RoleForStage(key workflowkit.StageKey) (workflowkit.AgentRoleID, workflowkit.WorkspaceBinding, int, bool) {
+	readSource := workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceReadOnlySnapshot, Key: "authoring-source", SnapshotArtifact: "repo_prepared"}
+	readCandidate := workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceReadOnlySnapshot, Key: "authoring-candidate", SnapshotArtifact: standardAuthoringCandidateSnapshotArtifact}
+	writeCandidate := workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceExclusiveWriter, Key: "authoring-candidate", SnapshotArtifact: standardAuthoringCandidateSnapshotArtifact}
+	switch key {
+	case workflowkit.StageKey(RepoStructureResearch), workflowkit.StageKey(TestRuntimeResearch), workflowkit.StageKey(VerifierThreatResearch):
+		return workflowkit.AgentRoleResearcher, readSource, 0, true
+	case workflowkit.StageKey(TaskSynthesis):
+		return workflowkit.AgentRoleSynthesizer, workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceNone}, 0, true
+	case workflowkit.StageKey(AuthoringLoop):
+		writeCandidate.SnapshotArtifact = "task_specification"
+		return workflowkit.AgentRoleAuthor, writeCandidate, 8, true
+	case workflowkit.StageKey(TestQualityCritic), workflowkit.StageKey(SolutionIntegrityCritic):
+		return workflowkit.AgentRoleCritic, readCandidate, 0, true
+	case workflowkit.StageKey(AuthoringRepair):
+		return workflowkit.AgentRoleAuthor, writeCandidate, StandardAuthoringRepairMaxTurns, true
+	default:
+		return "", workflowkit.WorkspaceBinding{}, 0, false
 	}
-	return "", fmt.Errorf("Standard authoring handoff schema has no template %s@%s", reference.ID, reference.Version)
+}
+
+func standardAuthoringV3RoleOutput(role workflowkit.AgentRoleID) workflowkit.AgentOutputMode {
+	switch role {
+	case workflowkit.AgentRoleResearcher:
+		return workflowkit.AgentOutputEvidence
+	case workflowkit.AgentRoleSynthesizer:
+		return workflowkit.AgentOutputStructuredArtifact
+	case workflowkit.AgentRoleAuthor:
+		return workflowkit.AgentOutputCandidateSnapshot
+	default:
+		return workflowkit.AgentOutputFinding
+	}
+}
+
+func standardAuthoringV3AllowedTools(role workflowkit.AgentRoleID) []string {
+	if role == workflowkit.AgentRoleAuthor {
+		return []string{"harbor_validate_candidate"}
+	}
+	return []string{"harbor_submit_output"}
 }

@@ -66,9 +66,6 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 	if services.AuthoringLaunches == nil || !services.AuthoringLaunches.Available() {
 		t.Fatal("unified production composition omitted the Standard source capture and definition capability")
 	}
-	if services.StandardAuthoringHandoffs == nil || !services.StandardAuthoringHandoffs.Available() {
-		t.Fatal("unified production composition omitted the lock-owned CodeEdge Phase-1 definition capability")
-	}
 	if services.EvaluatorLaunches == nil || !services.EvaluatorLaunches.Available() {
 		t.Fatal("unified production composition omitted the lock-owned evaluator-child definition capability")
 	}

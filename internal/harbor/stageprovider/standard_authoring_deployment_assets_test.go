@@ -12,7 +12,7 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-func TestStandardAuthoringV2DeploymentCatalogAndAssetsAreExactAndLoadable(t *testing.T) {
+func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *testing.T) {
 	deploymentRoot := filepath.Join(standardAuthoringDeploymentRepositoryRoot(t), "deployments", "standard-authoring")
 	catalogRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "operation-catalog.v1.json"))
 	if err != nil {
@@ -20,14 +20,14 @@ func TestStandardAuthoringV2DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 	}
 	catalogDocument, err := ParseDeploymentOperationCatalogJSON(catalogRaw)
 	if err != nil {
-		t.Fatalf("parse v2 Standard authoring catalog: %v", err)
+		t.Fatalf("parse v3 Standard authoring catalog: %v", err)
 	}
 	catalog, err := NewDeploymentOperationCatalogResolver(catalogDocument)
 	if err != nil {
-		t.Fatalf("resolve v2 Standard authoring catalog: %v", err)
+		t.Fatalf("resolve v3 Standard authoring catalog: %v", err)
 	}
 	if !catalog.Template().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
-		t.Fatalf("catalog template = %s@%s, want current v2 template", catalog.Template().ID, catalog.Template().Version)
+		t.Fatalf("catalog template = %s@%s, want current v3 template", catalog.Template().ID, catalog.Template().Version)
 	}
 
 	profileRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "execution-profile.v1.json"))
@@ -39,7 +39,7 @@ func TestStandardAuthoringV2DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		t.Fatalf("parse v2 execution profile: %v", err)
 	}
 	if _, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(profile); err != nil {
-		t.Fatalf("compile v2 execution profile: %v", err)
+		t.Fatalf("compile v3 execution profile: %v", err)
 	}
 
 	manifestRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
@@ -48,7 +48,7 @@ func TestStandardAuthoringV2DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 	}
 	manifest, err := ParseStandardAuthoringContractAssetManifestJSON(manifestRaw)
 	if err != nil {
-		t.Fatalf("parse v2 contract asset manifest: %v", err)
+		t.Fatalf("parse v3 contract asset manifest: %v", err)
 	}
 	if !manifest.Template.Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
 		t.Fatalf("manifest template = %s@%s, want current v2 template", manifest.Template.ID, manifest.Template.Version)
@@ -94,74 +94,24 @@ func TestStandardAuthoringV2DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 			t.Fatalf("prompt program for %q does not match manifest/payload", registration.Stage.Key)
 		}
 		joined := strings.Join(program.TurnPrompts, "\n")
-		for _, required := range []string{"context.contract.content", "context.contract.digest", "harbor_submit_stage_output"} {
-			if !strings.Contains(joined, required) {
-				t.Fatalf("v2 prompt %q omits root-contract boundary %q", registration.Stage.Key, required)
-			}
-		}
-		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskDesign) || registration.Stage.Key == workflowkit.StageKey(workflowadapter.GenerateTaskFiles) {
-			format := "harbor.standard-authoring-task-proposal.v2"
-			artifact := "task-design"
-			if registration.Stage.Key == workflowkit.StageKey(workflowadapter.GenerateTaskFiles) {
-				format = "harbor.standard-authoring-generated-task-plan.v2"
-				artifact = "generate-task-files"
-			}
-			for promptIndex, prompt := range program.TurnPrompts {
-				for _, required := range []string{
-					"no other keys",
-					`"format":"` + format + `"`,
-					`"version":"2"`,
-					`"contract_claims":{"title":"...","slug":"...","repository_url":"...","commit_sha":"...","base_image":"...","code_lang":"...","task_type":"...","application":"...","is_0_to_1":false,"source_root":"..."}`,
-					`"requirements":[{"id":"REQ-1","text":"..."}]`,
-					`"source_paths":["..."]`,
-					`"packages":[{"manifest_path":"..."}]`,
-					`"commands":[{"working_directory":".","argv":["..."]}]`,
-				} {
-					if !strings.Contains(prompt, required) {
-						t.Fatalf("%s prompt turn %d omits strict structured-plan field shape %q", artifact, promptIndex+1, required)
-					}
-				}
-			}
-		}
-		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskTOMLGen) {
-			for promptIndex, prompt := range program.TurnPrompts {
-				for _, required := range []string{
-					"Produce one raw Harbor TaskConfig task.toml",
-					`name = "harbor/slug" (replace slug with the contract slug)`,
-					"[metadata] with code_lang, task_type, application, and is_0_to_1 exactly copied from context.contract.content",
-					`network_mode = "no-network"`,
-					`workdir = "/workspace/source"`,
-					"[verifier] with a positive timeout_sec",
-					"Do not add [verification] or environment.dockerfile",
-				} {
-					if !strings.Contains(prompt, required) {
-						t.Fatalf("task-toml prompt turn %d omits required TaskConfig shape %q", promptIndex+1, required)
-					}
-				}
-			}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringLoop) && !strings.Contains(joined, "harbor_validate_candidate") {
+			t.Fatalf("3.0 author prompt does not bind the host validation tool")
 		}
 
 		schemaRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(catalog.Template(), registration.Stage.Key, schemaRaw); err != nil {
+		if err := ValidateStandardAuthoringV3AgentOutputSchemaAsset(catalog.Template(), registration.Stage.Key, schemaRaw); err != nil {
 			t.Fatalf("validate schema for %q: %v", registration.Stage.Key, err)
 		}
-		usesFixedFile := registration.Stage.Key == workflowkit.StageKey(workflowadapter.SolveGen) || registration.Stage.Key == workflowkit.StageKey(workflowadapter.TestGen)
-		if usesFixedFile != standardAuthoringCodexUsesFixedFileOutputSchema(catalog.Template(), registration.Stage.Key) {
-			t.Fatalf("fixed-file selection for %q diverged from v2 contract", registration.Stage.Key)
-		}
-		if usesFixedFile && entry.Schema.RelativePath != "schemas/codex-fixed-file-submit.schema.json" {
-			t.Fatalf("fixed-file stage %q schema path = %q", registration.Stage.Key, entry.Schema.RelativePath)
-		}
 	}
-	if agentStages != 11 {
-		t.Fatalf("Codex agent stages = %d, want 11", agentStages)
+	if agentStages != 8 {
+		t.Fatalf("Codex agent stages = %d, want 8", agentStages)
 	}
 }
 
-func TestStandardAuthoringV2ManifestRejectsUninstalledTemplate(t *testing.T) {
+func TestStandardAuthoringV3ManifestRejectsUninstalledTemplate(t *testing.T) {
 	deploymentRoot := filepath.Join(standardAuthoringDeploymentRepositoryRoot(t), "deployments", "standard-authoring")
 	raw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
 	if err != nil {
@@ -177,9 +127,9 @@ func TestStandardAuthoringV2ManifestRejectsUninstalledTemplate(t *testing.T) {
 	}
 }
 
-func TestStandardAuthoringV2TaskHandoffSchemaMatchesRuntimeContract(t *testing.T) {
+func TestStandardAuthoringV3MaterializationReceiptSchemaMatchesRuntimeContract(t *testing.T) {
 	deploymentRoot := filepath.Join(standardAuthoringDeploymentRepositoryRoot(t), "deployments", "standard-authoring")
-	raw, err := os.ReadFile(filepath.Join(deploymentRoot, "schemas", "authoring-task-handoff.json"))
+	raw, err := os.ReadFile(filepath.Join(deploymentRoot, "schemas", "materialization-receipt.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,10 +144,10 @@ func TestStandardAuthoringV2TaskHandoffSchemaMatchesRuntimeContract(t *testing.T
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal(raw, &schema); err != nil {
-		t.Fatalf("decode task handoff schema: %v", err)
+		t.Fatalf("decode materialization receipt schema: %v", err)
 	}
-	if schema.Properties.Format.Const != workflowadapter.StandardAuthoringTaskHandoffFormat || schema.Properties.Version.Const != workflowadapter.StandardAuthoringTaskHandoffVersion {
-		t.Fatalf("task handoff schema contract = %q@%q, want %q@%q", schema.Properties.Format.Const, schema.Properties.Version.Const, workflowadapter.StandardAuthoringTaskHandoffFormat, workflowadapter.StandardAuthoringTaskHandoffVersion)
+	if schema.Properties.Format.Const != workflowadapter.StandardAuthoringMaterializationReceiptFormat || schema.Properties.Version.Const != workflowadapter.StandardAuthoringMaterializationReceiptVersion {
+		t.Fatalf("materialization receipt schema contract = %q@%q, want %q@%q", schema.Properties.Format.Const, schema.Properties.Version.Const, workflowadapter.StandardAuthoringMaterializationReceiptFormat, workflowadapter.StandardAuthoringMaterializationReceiptVersion)
 	}
 }
 

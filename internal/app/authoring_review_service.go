@@ -52,15 +52,9 @@ type DecideAuthoringReviewRequest struct {
 	ResolutionJobID string
 	IdempotencyKey  string
 	Action          store.ReviewDecisionAction
-	// FindingKind is a closed, host-validated classification for a
-	// request_changes decision. It is not free-form repair guidance. An empty
-	// task-review finding is task_proposal_invalid; the only classification
-	// that may invalidate repo_analyze is source_analysis_invalid. Content and
-	// solution gates use their deterministic default classifications.
-	FindingKind store.AuthoringRepairFindingKind
-	Actor       string
-	Reason      string
-	Expected    AuthoringReviewCheckpoint
+	Actor           string
+	Reason          string
+	Expected        AuthoringReviewCheckpoint
 }
 
 // AuthoringReviewService owns source/session review inspection and decisions.
@@ -173,10 +167,6 @@ func (service *AuthoringReviewService) Decide(ctx context.Context, request Decid
 	if err := request.Expected.matches(snapshot); err != nil {
 		return store.AuthoringReviewGateDecisionResult{}, err
 	}
-	findingKind, err := normalizeAuthoringReviewFinding(snapshot.Binding, request.Action, request.FindingKind)
-	if err != nil {
-		return store.AuthoringReviewGateDecisionResult{}, err
-	}
 	if snapshot.State == store.AuthoringReviewGateOpen && (snapshot.Run.Status != store.WorkflowRunWaitingReview ||
 		snapshot.StageAttempt.ExecutionStatus != store.StageExecutionWaiting) {
 		return store.AuthoringReviewGateDecisionResult{}, fmt.Errorf("%w: authoring review gate is not waiting for an operator decision", store.ErrInvalidTransition)
@@ -184,7 +174,7 @@ func (service *AuthoringReviewService) Decide(ctx context.Context, request Decid
 	if snapshot.State != store.AuthoringReviewGateOpen && len(snapshot.Decisions) != 1 {
 		return store.AuthoringReviewGateDecisionResult{}, fmt.Errorf("%w: authoring review gate state %s has no immutable decision", store.ErrImmutable, snapshot.State)
 	}
-	payload, err := newAuthoringReviewGateResolutionPayload(snapshot.Binding, request.Expected, findingKind)
+	payload, err := newAuthoringReviewGateResolutionPayload(snapshot.Binding, request.Expected)
 	if err != nil {
 		return store.AuthoringReviewGateDecisionResult{}, err
 	}
@@ -198,50 +188,6 @@ func (service *AuthoringReviewService) Decide(ctx context.Context, request Decid
 		ExpectedRunVersion: request.Expected.RunVersion, ExpectedStageAttemptVersion: request.Expected.StageAttemptVersion,
 		Action: request.Action, ResolutionPayloadJSON: payload, Actor: strings.TrimSpace(request.Actor), Reason: strings.TrimSpace(request.Reason),
 	})
-}
-
-func normalizeAuthoringReviewFinding(binding store.AuthoringReviewGateBinding, action store.ReviewDecisionAction, findingKind store.AuthoringRepairFindingKind) (store.AuthoringRepairFindingKind, error) {
-	if action != store.ReviewDecisionRequestChanges {
-		if findingKind != "" {
-			return "", fmt.Errorf("authoring repair finding kind is only valid for request_changes")
-		}
-		return "", nil
-	}
-	switch binding.StageKey {
-	case workflowadapter.TaskReview:
-		if binding.ReviewKind != string(workflowadapter.ReviewTaskDirection) {
-			return "", fmt.Errorf("task_review has invalid review kind %q", binding.ReviewKind)
-		}
-		switch findingKind {
-		case "", store.AuthoringRepairFindingTaskProposalInvalid:
-			return store.AuthoringRepairFindingTaskProposalInvalid, nil
-		case store.AuthoringRepairFindingSourceAnalysisInvalid:
-			return store.AuthoringRepairFindingSourceAnalysisInvalid, nil
-		default:
-			return "", fmt.Errorf("task_review repair finding kind %q is not supported", findingKind)
-		}
-	case workflowadapter.ContentReview:
-		if binding.ReviewKind != string(workflowadapter.ReviewContent) {
-			return "", fmt.Errorf("content_review has invalid review kind %q", binding.ReviewKind)
-		}
-		if findingKind != "" && findingKind != store.AuthoringRepairFindingArtifactInvalid {
-			return "", fmt.Errorf("content_review repair finding kind %q is not supported", findingKind)
-		}
-		return store.AuthoringRepairFindingArtifactInvalid, nil
-	case workflowadapter.SolutionReview:
-		if binding.ReviewKind != string(workflowadapter.ReviewSolutionVerifier) {
-			return "", fmt.Errorf("solution_review has invalid review kind %q", binding.ReviewKind)
-		}
-		if findingKind != "" && findingKind != store.AuthoringRepairFindingPackageInvalid {
-			return "", fmt.Errorf("solution_review repair finding kind %q is not supported", findingKind)
-		}
-		return store.AuthoringRepairFindingPackageInvalid, nil
-	default:
-		if findingKind != "" {
-			return "", fmt.Errorf("authoring repair finding kind is not valid for stage %q", binding.StageKey)
-		}
-		return "", nil
-	}
 }
 
 func authoringReviewCheckpoint(snapshot AuthoringReviewGateSnapshot) AuthoringReviewCheckpoint {
@@ -343,21 +289,20 @@ func (checkpoint AuthoringReviewCheckpoint) matches(snapshot AuthoringReviewGate
 }
 
 type authoringReviewGateResolutionPayload struct {
-	Format                 string                           `json:"format"`
-	ReviewRequestID        string                           `json:"review_request_id"`
-	BindingID              string                           `json:"binding_id"`
-	RunID                  string                           `json:"run_id"`
-	StageAttemptID         string                           `json:"stage_attempt_id"`
-	AuthoringSessionID     string                           `json:"authoring_session_id"`
-	AuthoringSourceID      string                           `json:"authoring_source_id"`
-	SourceSnapshotDigest   string                           `json:"source_snapshot_digest"`
-	DefinitionHash         string                           `json:"definition_hash"`
-	InputFingerprint       string                           `json:"input_fingerprint"`
-	EvidenceManifestDigest string                           `json:"evidence_manifest_digest"`
-	FindingKind            store.AuthoringRepairFindingKind `json:"finding_kind,omitempty"`
+	Format                 string `json:"format"`
+	ReviewRequestID        string `json:"review_request_id"`
+	BindingID              string `json:"binding_id"`
+	RunID                  string `json:"run_id"`
+	StageAttemptID         string `json:"stage_attempt_id"`
+	AuthoringSessionID     string `json:"authoring_session_id"`
+	AuthoringSourceID      string `json:"authoring_source_id"`
+	SourceSnapshotDigest   string `json:"source_snapshot_digest"`
+	DefinitionHash         string `json:"definition_hash"`
+	InputFingerprint       string `json:"input_fingerprint"`
+	EvidenceManifestDigest string `json:"evidence_manifest_digest"`
 }
 
-func newAuthoringReviewGateResolutionPayload(binding store.AuthoringReviewGateBinding, checkpoint AuthoringReviewCheckpoint, findingKind store.AuthoringRepairFindingKind) (string, error) {
+func newAuthoringReviewGateResolutionPayload(binding store.AuthoringReviewGateBinding, checkpoint AuthoringReviewCheckpoint) (string, error) {
 	if binding.ID != checkpoint.BindingID || binding.ReviewRequestID != checkpoint.ReviewRequestID || binding.RunID != checkpoint.RunID ||
 		binding.AuthoringSessionID != checkpoint.AuthoringSessionID || binding.AuthoringSourceID != checkpoint.AuthoringSourceID ||
 		binding.SourceSnapshotDigest != checkpoint.SourceSnapshotDigest || binding.DefinitionHash != checkpoint.DefinitionHash ||
@@ -370,7 +315,7 @@ func newAuthoringReviewGateResolutionPayload(binding store.AuthoringReviewGateBi
 		BindingID: checkpoint.BindingID, RunID: checkpoint.RunID, StageAttemptID: checkpoint.StageAttemptID,
 		AuthoringSessionID: checkpoint.AuthoringSessionID, AuthoringSourceID: checkpoint.AuthoringSourceID,
 		SourceSnapshotDigest: checkpoint.SourceSnapshotDigest, DefinitionHash: checkpoint.DefinitionHash,
-		InputFingerprint: checkpoint.InputFingerprint, EvidenceManifestDigest: checkpoint.EvidenceManifestDigest, FindingKind: findingKind,
+		InputFingerprint: checkpoint.InputFingerprint, EvidenceManifestDigest: checkpoint.EvidenceManifestDigest,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode authoring review resolution payload: %w", err)

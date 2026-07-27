@@ -46,6 +46,9 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorWithoutRootCont
 			}
 		}
 		resolved.Descriptor.Stages[index].Inputs = filtered
+		if resolved.Descriptor.Stages[index].AgentRole != nil {
+			resolved.Descriptor.Stages[index].AgentRole.InputSchemas = append([]workflowkit.ArtifactSpec(nil), filtered...)
+		}
 	}
 	runID, err := store.NewUUIDv7()
 	if err != nil {
@@ -78,6 +81,9 @@ func TestStandardAuthoringRuntimeContractRejectsRootContractSchemaDrift(t *testi
 			filtered = append(filtered, input)
 		}
 		resolved.Descriptor.Stages[index].Inputs = filtered
+		if resolved.Descriptor.Stages[index].AgentRole != nil {
+			resolved.Descriptor.Stages[index].AgentRole.InputSchemas = append([]workflowkit.ArtifactSpec(nil), filtered...)
+		}
 	}
 	runID, err := store.NewUUIDv7()
 	if err != nil {
@@ -101,17 +107,20 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorInputDrift(t *t
 		t.Fatal(err)
 	}
 	for index := range resolved.Descriptor.Stages {
-		if resolved.Descriptor.Stages[index].Key != workflowkit.StageKey(workflowadapter.TaskDesign) {
+		if resolved.Descriptor.Stages[index].Key != workflowkit.StageKey(workflowadapter.TaskSynthesis) {
 			continue
 		}
 		inputs := resolved.Descriptor.Stages[index].Inputs
 		filtered := inputs[:0]
 		for _, input := range inputs {
-			if input.Name != "repo_analysis" {
+			if input.Name != "repo_structure_evidence" {
 				filtered = append(filtered, input)
 			}
 		}
 		resolved.Descriptor.Stages[index].Inputs = filtered
+		if resolved.Descriptor.Stages[index].AgentRole != nil {
+			resolved.Descriptor.Stages[index].AgentRole.InputSchemas = append([]workflowkit.ArtifactSpec(nil), filtered...)
+		}
 	}
 	runID, err := store.NewUUIDv7()
 	if err != nil {
@@ -123,7 +132,7 @@ func TestStandardAuthoringRuntimeContractRejectsCurrentDescriptorInputDrift(t *t
 	}
 	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, workflowadapter.RunExecutionSpec{Template: template.Reference()})
 	if err == nil || !strings.Contains(err.Error(), "versioned input contract") {
-		t.Fatalf("current descriptor without repo analysis = %v, want input-contract rejection", err)
+		t.Fatalf("current descriptor without repository-structure evidence = %v, want input-contract rejection", err)
 	}
 }
 

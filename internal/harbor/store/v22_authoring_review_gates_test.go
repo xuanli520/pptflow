@@ -194,7 +194,7 @@ func createAuthoringReviewGateFixture(t *testing.T, ctx context.Context, s *Stor
 	}
 	session, err := s.CreateAuthoringSession(ctx, CreateAuthoringSessionRequest{
 		SourceID: source.ID, TargetTaskID: task.ID,
-		WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: standardAuthoringParentTemplateVersion,
+		WorkflowTemplateID: "harbor.standard-authoring", WorkflowTemplateVersion: "3.0.0",
 		SessionManifestJSON: `{"mode":"standard"}`, IdempotencyKey: "session-authoring-review-" + t.Name(), Actor: "author",
 	})
 	if err != nil {

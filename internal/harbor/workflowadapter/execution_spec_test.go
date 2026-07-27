@@ -594,6 +594,10 @@ func testStandardAuthoringExecutionSpec(t *testing.T) RunExecutionSpec {
 	spec.References.Runtimes = []RuntimeReference{spec.References.Runtimes[0]}
 	spec.References.Providers = []ProviderReference{spec.References.Providers[0], spec.References.Providers[2]}
 	spec.References.Secrets = []SecretReference{spec.References.Secrets[0]}
+	// The 3.0 source-session descriptor accepts its only root contract through
+	// managed binding at admission. No synthetic task-revision artifact is a
+	// reachable execution-spec input.
+	spec.References.Artifacts = []ArtifactReference{}
 	return spec
 }
 
@@ -636,77 +640,10 @@ func testCodeEdgeFinalCompliancePolicy() codeedge.FinalCompliancePolicy {
 
 func bindingForTest(t *testing.T, base StageBindingBase) StageExecutionBinding {
 	t.Helper()
-	switch base.Type {
-	case StageBindingRepoPrepare:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingRepoAnalyze:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingTaskDesign:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingTaskReview:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingGenerateTaskFiles:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingInstructionGen:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingTaskTOMLGen:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingDockerfileGen:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingDockerfileBuildValidate:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingContentReview:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingSolveGen:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingTestGen:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingAuthoringHarness:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingCodeEdgePackageAdmission:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingTestsAnalysis:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingSolutionReview:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingMaterializeTask:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingTaskRepair:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingRuntimeSelfCheck:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingHarborVerify:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingDockerBuild:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingInitialVerify:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingOracleVerify:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingCodeEdgeLint:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingQualityCheck:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingSimilarityCheck:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingFinalReview:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingHarborRunQwen:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingHarborRunOpus:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingEvaluatorEvidenceHandoff:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingResultReview:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingSubmissionLint:
-		return UniversalStageBinding{StageBindingBase: base}
-	case StageBindingPackage:
-		return UniversalStageBinding{StageBindingBase: base}
-	default:
+	if !isKnownStageBindingType(base.Type) {
 		t.Fatalf("unknown fixture binding type %q", base.Type)
-		return nil
 	}
+	return UniversalStageBinding{StageBindingBase: base}
 }
 
 func bindingTypeForTest(key workflowkit.StageKey) StageBindingType {
@@ -777,6 +714,26 @@ func bindingTypeForTest(key workflowkit.StageKey) StageBindingType {
 		return StageBindingSubmissionLint
 	case "package":
 		return StageBindingPackage
+	case "repo_structure_research":
+		return StageBindingRepoStructureResearch
+	case "test_runtime_research":
+		return StageBindingTestRuntimeResearch
+	case "verifier_threat_research":
+		return StageBindingVerifierThreatResearch
+	case "task_synthesis":
+		return StageBindingTaskSynthesis
+	case "authoring_loop":
+		return StageBindingAuthoringLoop
+	case "host_candidate_verify":
+		return StageBindingHostCandidateVerify
+	case "test_quality_critic":
+		return StageBindingTestQualityCritic
+	case "solution_integrity_critic":
+		return StageBindingSolutionIntegrityCritic
+	case "authoring_repair":
+		return StageBindingAuthoringRepair
+	case "final_attestation":
+		return StageBindingFinalAttestation
 	default:
 		return ""
 	}

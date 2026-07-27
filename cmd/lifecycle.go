@@ -1089,86 +1089,8 @@ func newAuthoringCommand(config *lifecycleCLIConfig) *cobra.Command {
 	command := &cobra.Command{Use: "authoring", Short: "Manage source/session authoring operations", Args: cobra.NoArgs, RunE: showCommandGroupHelp}
 	command.AddCommand(
 		newAuthoringStartCommand(config),
-		newAuthoringRecoverCommand(config),
 		newAuthoringReviewCommand(config),
-		newAuthoringHandoffCommand(config),
 	)
-	return command
-}
-
-// newAuthoringRecoverCommand resumes a failed pre-materialization Standard
-// authoring Run through its source/session recovery contract. It intentionally
-// owns no model, profile, or stage selector: all of those remain frozen in the
-// original Run definition.
-func newAuthoringRecoverCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var runID, idempotencyKey, reason string
-	var dryRun bool
-	command := &cobra.Command{
-		Use:   "recover",
-		Short: "Preview or recover one failed Standard authoring Run",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			actor, reason, err := lifecycleActorAndReason(config, reason)
-			if err != nil {
-				return err
-			}
-			runID, err = requiredText("run", runID)
-			if err != nil {
-				return err
-			}
-			if err := store.ValidateUUIDv7(runID); err != nil {
-				return fmt.Errorf("run must be a UUIDv7: %w", err)
-			}
-			idempotencyKey, err = requiredLifecycleIdempotencyKey(idempotencyKey)
-			if err != nil {
-				return err
-			}
-			action := func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				if services == nil || services.AuthoringRecovery == nil {
-					return nil, fmt.Errorf("authoring recovery service is not configured")
-				}
-				checkpoint, err := services.AuthoringRecovery.CurrentCheckpoint(ctx, runID)
-				if err != nil {
-					return nil, err
-				}
-				recovery := app.AuthoringRecoveryCommand{
-					CommandKey: idempotencyKey,
-					RunID:      runID,
-					Expected:   checkpoint,
-					Actor:      actor,
-					Reason:     reason,
-				}
-				if dryRun {
-					plan, err := services.AuthoringRecovery.PreviewAuthoringRecovery(ctx, recovery)
-					if err != nil {
-						return nil, err
-					}
-					return taskContinuationPlanResult(plan, false), nil
-				}
-				plan, err := services.AuthoringRecovery.PlanAuthoringRecovery(ctx, recovery)
-				if err != nil {
-					return nil, err
-				}
-				execution, err := services.AuthoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID())
-				if err != nil {
-					return nil, err
-				}
-				if err := drainQueuedRunActivations(ctx, services); err != nil {
-					return nil, err
-				}
-				return execution, nil
-			}
-			if dryRun {
-				return executeLifecycleReadOnlyCommand(cmd, config, action)
-			}
-			return executeLifecycleCommand(cmd, config, action)
-		},
-	}
-	command.Flags().StringVar(&runID, "run", "", "Standard authoring Run UUIDv7")
-	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 authoring recovery idempotency key")
-	command.Flags().StringVar(&reason, "reason", "", "Audit reason for recovery")
-	command.Flags().BoolVar(&dryRun, "dry-run", false, "Preview the frozen authoring recovery plan without creating durable state")
-	command.Flags().Bool("json", true, "Emit JSON output (the lifecycle CLI always emits JSON)")
 	return command
 }
 

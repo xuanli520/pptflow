@@ -388,6 +388,14 @@ func validateCoordinatorBatchDependencies(workflow WorkflowDescriptor, directive
 			}
 			batchByNode[nodeID] = batchIndex
 		}
+		stages := make([]StageDescriptor, 0, len(batch.NodeIDs))
+		for _, nodeID := range batch.NodeIDs {
+			stage, _ := workflow.Stage(StageKey(nodeID))
+			stages = append(stages, stage)
+		}
+		if err := ValidateConcurrentStages(stages); err != nil {
+			return fmt.Errorf("%w: coordinator schedule batch %q: %v", ErrInvalidCoordinatorInput, batch.ID, err)
+		}
 	}
 
 	for _, stage := range workflow.Stages {

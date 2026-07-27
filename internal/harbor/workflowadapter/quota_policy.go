@@ -17,11 +17,11 @@ const (
 	StandardQuotaPolicyID      = "harbor.local.operator"
 	StandardQuotaPolicyVersion = "1.0.0"
 
-	// StandardAuthoringQuotaPolicyID and Version identify the bounded v2
+	// StandardAuthoringQuotaPolicyID and Version identify the bounded 3.0
 	// source-session authoring policy. Task-bound verification and packaging
 	// quota begins only in the child CodeEdge Run after materialization.
 	StandardAuthoringQuotaPolicyID              = "harbor.standard-authoring.local.operator"
-	StandardAuthoringContractQuotaPolicyVersion = "2.0.0"
+	StandardAuthoringContractQuotaPolicyVersion = "3.0.0"
 	StandardAuthoringValidationQuotaDimension   = "authoring_validation"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
@@ -62,6 +62,7 @@ const (
 	standardActorTrialLimit               int64 = 320
 	standardTaskRepairRoundLimit          int64 = 3
 	standardActorRepairRoundLimit         int64 = 30
+	standardAuthoringCandidateRepairLimit int64 = 2
 
 	standardStageAttemptClaimUnits int64 = 1
 	standardEvaluationTrialClaims  int64 = 4
@@ -388,23 +389,26 @@ func StandardQuotaPolicy() QuotaPolicy {
 	}
 }
 
-// StandardAuthoringContractQuotaPolicy returns the sole v2 source-session
-// policy. It separately bounds model output submissions and Docker/harness
-// validation work without opening task-bound trial or repair accounts.
+// StandardAuthoringContractQuotaPolicy returns the sole 3.0 source-session
+// policy. Candidate corrections are explicitly capped at two rounds; host,
+// environment, and infrastructure faults do not reserve that account.
 func StandardAuthoringContractQuotaPolicy() QuotaPolicy {
 	catalog := StandardAuthoringContractStageCatalog()
 	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
 	for _, stage := range catalog.Stages {
 		claims := standardClaimsForStage(stage)
-		if _, agentStage := standardAgentQuotaStages[stage.Key]; agentStage {
+		if stage.AgentRole != nil {
 			submissionUnits := StandardAuthoringOutputSubmissionClaimUnits
-			if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
+			if stage.AgentRole.RoleID == workflowkit.AgentRoleAuthor {
 				submissionUnits = StandardAuthoringWorkspaceSubmissionClaimUnits
 			}
 			claims = append(claims, standardQuotaClaim("output_submission", submissionUnits))
 		}
-		if stage.Key == workflowkit.StageKey(DockerfileBuildValidate) || stage.Key == workflowkit.StageKey(AuthoringHarness) {
+		if stage.Key == workflowkit.StageKey(HostCandidateVerify) {
 			claims = append(claims, standardQuotaClaim(StandardAuthoringValidationQuotaDimension, StandardAuthoringValidationClaimUnits))
+		}
+		if stage.Key == workflowkit.StageKey(AuthoringRepair) {
+			claims = append(claims, standardQuotaClaim("repair_round", standardRepairRoundClaimUnits))
 		}
 		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
 	}
@@ -416,6 +420,7 @@ func StandardAuthoringContractQuotaPolicy() QuotaPolicy {
 			{Dimension: "agent_turn", TaskLimitUnits: standardTaskAgentTurnLimit, ActorLimitUnits: standardActorAgentTurnLimit},
 			{Dimension: "output_submission", TaskLimitUnits: standardTaskOutputSubmissionLimit, ActorLimitUnits: standardActorOutputSubmissionLimit},
 			{Dimension: StandardAuthoringValidationQuotaDimension, TaskLimitUnits: standardTaskAuthoringValidationLimit, ActorLimitUnits: standardActorAuthoringValidationLimit},
+			{Dimension: "repair_round", TaskLimitUnits: standardAuthoringCandidateRepairLimit, ActorLimitUnits: standardActorRepairRoundLimit},
 		},
 		Stages: stages,
 	}
@@ -508,4 +513,12 @@ var standardAgentQuotaStages = map[workflowkit.StageKey]struct{}{
 	workflowkit.StageKey(AuthoringHarness):        {},
 	workflowkit.StageKey(TestsAnalysis):           {},
 	workflowkit.StageKey(TaskRepair):              {},
+	workflowkit.StageKey(RepoStructureResearch):   {},
+	workflowkit.StageKey(TestRuntimeResearch):     {},
+	workflowkit.StageKey(VerifierThreatResearch):  {},
+	workflowkit.StageKey(TaskSynthesis):           {},
+	workflowkit.StageKey(AuthoringLoop):           {},
+	workflowkit.StageKey(TestQualityCritic):       {},
+	workflowkit.StageKey(SolutionIntegrityCritic): {},
+	workflowkit.StageKey(AuthoringRepair):         {},
 }

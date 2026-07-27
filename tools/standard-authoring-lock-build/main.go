@@ -423,7 +423,7 @@ func discoverCodexLock(config buildConfig) (stageprovider.CodexAppServerOperatio
 		NodeExecutable:     stageprovider.LocalExecutableLock{CommandID: stageprovider.CodexAppServerNodeExecutableCommandID, AbsolutePath: config.codexNode, Version: nodeVersion, ContentSHA256: nodeHash},
 		CodexHomeDirectory: config.codexHome, CLIVersionOutput: cliVersionOutput,
 		ApprovalPolicy: stageprovider.CodexAppServerApprovalPolicyNever,
-		SandboxMode: stageprovider.CodexAppServerSandboxModeWorkspaceWrite, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyWorkspaceWrite,
+		SandboxMode:    stageprovider.CodexAppServerSandboxModeWorkspaceWrite, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyWorkspaceWrite,
 		NetworkAccess: false,
 	}, nil
 }
@@ -452,7 +452,7 @@ func validateCodexStageAssets(root string, template workflowadapter.TemplateRefe
 	if err != nil {
 		return err
 	}
-	return stageprovider.ValidateStandardAuthoringCodexOutputSchemaAssetForTemplateStage(template, stageKey, schema)
+	return stageprovider.ValidateStandardAuthoringV3AgentOutputSchemaAsset(template, stageKey, schema)
 }
 
 func fingerprintContractAsset(root string, reference stageprovider.StandardAuthoringContractAssetReference) (workflowkit.Fingerprint, error) {

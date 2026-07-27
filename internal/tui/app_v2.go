@@ -199,10 +199,8 @@ func (prompt *runActionPrompt) View(width int) string {
 	label := "重试当前 Run"
 	switch prompt.kind {
 	case taskBoardRetryAction:
-		if prompt.strategy == app.TaskBoardRetryStrategyAuthoringRecovery {
+		if prompt.strategy == app.TaskBoardRetryStrategyTaskContinuation {
 			label = "断点恢复创题 Run"
-		} else if prompt.strategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
-			label = "修复并继续创题 Run"
 		}
 	case taskBoardRetryAuthoringLaunchAction:
 		label = "重试源码捕获"
@@ -764,7 +762,7 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 			m.action.validationErr = "操作原因不能为空"
 			return m, inputCmd
 		}
-		if m.action.kind == taskBoardRetryAction && isAuthoringRecoveryStrategy(m.action.strategy) {
+		if m.action.kind == taskBoardRetryAction && requiresRecoveryPreview(m.action.strategy) {
 			return m.beginRecoveryPreview(reason, inputCmd)
 		}
 		return m.beginRunAction(m.action.kind, reason, inputCmd)
@@ -989,7 +987,7 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 	current := pendingTaskBoardRunAction{
 		kind: kind, taskID: m.detail.task.ID, runID: run.ID, reason: strings.TrimSpace(reason),
 	}
-	if kind == taskBoardRetryAction && m.action != nil && isAuthoringRecoveryStrategy(m.action.strategy) && m.action.recoveryPreview != nil {
+	if kind == taskBoardRetryAction && m.action != nil && requiresRecoveryPreview(m.action.strategy) && m.action.recoveryPreview != nil {
 		preview := *m.action.recoveryPreview
 		if preview.TaskID != current.taskID || preview.RunID != current.runID || preview.Strategy != m.action.strategy ||
 			preview.Checkpoint.Sequence == 0 || preview.SemanticPlanFingerprint == "" {
@@ -1013,9 +1011,8 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 	return m.scheduleRunAction(*m.pendingAction, inputCmd)
 }
 
-// beginRecoveryPreview obtains a non-durable plan before an Authoring recovery
-// can be confirmed. The later RetryRun call still builds and commits a fresh
-// plan, so this preview is explanatory rather than an execution capability.
+// beginRecoveryPreview obtains a non-durable task-continuation plan before it
+// can be confirmed. RetryRun still builds and commits a fresh plan.
 func (m appModel) beginRecoveryPreview(reason string, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
 	if m.mutationInFlight() || m.detail == nil || m.action == nil || !m.detail.hasCurrentRun() {
 		m.notice = "请等待当前操作完成"
@@ -1054,9 +1051,8 @@ func (m appModel) previewRunRecovery(taskID, runID, reason string, epoch uint64)
 	}
 }
 
-func isAuthoringRecoveryStrategy(strategy app.TaskBoardRetryStrategy) bool {
-	return strategy == app.TaskBoardRetryStrategyAuthoringRecovery ||
-		strategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair
+func requiresRecoveryPreview(strategy app.TaskBoardRetryStrategy) bool {
+	return strategy == app.TaskBoardRetryStrategyTaskContinuation
 }
 
 func (m appModel) scheduleRunAction(pending pendingTaskBoardRunAction, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
@@ -1195,7 +1191,6 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 			var authoringEvidence *app.TaskBoardAuthoringEvidence
 			if run.AuthoringEvidence != nil {
 				copy := *run.AuthoringEvidence
-				copy.Repairs = append([]app.TaskBoardAuthoringRepair(nil), run.AuthoringEvidence.Repairs...)
 				copy.Claims = append([]app.TaskBoardAuthoringClaim(nil), run.AuthoringEvidence.Claims...)
 				copy.Lineage = append([]app.TaskBoardAuthoringArtifact(nil), run.AuthoringEvidence.Lineage...)
 				authoringEvidence = &copy
@@ -1277,7 +1272,7 @@ func (m appModel) View() string {
 				footerText = "正在核验断点恢复计划..."
 			} else if m.action.recoveryPreview != nil {
 				footerText = "[enter] 确认从此断点恢复  [esc] 取消"
-			} else if m.action.kind == taskBoardRetryAction && isAuthoringRecoveryStrategy(m.action.strategy) {
+			} else if m.action.kind == taskBoardRetryAction && requiresRecoveryPreview(m.action.strategy) {
 				footerText = "[enter] 查看断点恢复计划  [esc] 取消"
 			}
 			footer = footerStyle.Render(footerText)
@@ -1331,11 +1326,8 @@ func detailFooterText(detail *detailModel) string {
 		actions = append(actions, "[l] 日志")
 		if detail.canRetryCurrentRun() {
 			label := "重试"
-			switch detail.currentRun().RetryStrategy {
-			case app.TaskBoardRetryStrategyAuthoringRecovery:
+			if detail.currentRun().RetryStrategy == app.TaskBoardRetryStrategyTaskContinuation {
 				label = "断点恢复"
-			case app.TaskBoardRetryStrategyAuthoringAdmissionRepair:
-				label = "修复并继续"
 			}
 			actions = append(actions, "[t] "+label)
 		}

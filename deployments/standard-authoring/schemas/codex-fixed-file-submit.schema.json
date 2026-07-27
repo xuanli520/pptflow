@@ -1,1 +1,0 @@
-{"$id":"harbor.standard-authoring-codex-fixed-file-submit.v1","$schema":"http://json-schema.org/draft-07/schema#","additionalProperties":false,"properties":{"verdict":{"enum":["pass"],"type":"string"}},"required":["verdict"],"type":"object"}

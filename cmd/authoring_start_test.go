@@ -29,25 +29,6 @@ func TestAuthoringStartCommandExposesSourceCoordinateAndClosedExecutionInputs(t 
 	}
 }
 
-func TestAuthoringRecoverCommandExposesOnlyFrozenRecoveryInputs(t *testing.T) {
-	command, _, err := newAuthoringCommand(&lifecycleCLIConfig{root: t.TempDir()}).Find([]string{"recover"})
-	if err != nil || command == nil || command.Name() != "recover" {
-		t.Fatalf("find authoring recover command: command=%v err=%v", command, err)
-	}
-	for _, required := range []string{"run", "idempotency-key", "reason", "dry-run"} {
-		if command.Flags().Lookup(required) == nil {
-			t.Fatalf("authoring recover is missing --%s", required)
-		}
-	}
-	for _, forbidden := range []string{
-		"model", "reasoning-effort", "profile", "execution-spec", "from-stage", "source", "repo", "id", "parent-run", "execution-epoch",
-	} {
-		if command.Flags().Lookup(forbidden) != nil {
-			t.Fatalf("authoring recover exposes frozen-definition override --%s", forbidden)
-		}
-	}
-}
-
 func TestAuthoringStartCommandFailsClosedWithoutDeploymentCapabilityAndCreatesNoTask(t *testing.T) {
 	root := t.TempDir()
 	config := &lifecycleCLIConfig{

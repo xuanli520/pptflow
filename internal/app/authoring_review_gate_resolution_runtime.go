@@ -15,19 +15,18 @@ const authoringReviewGateDecisionArtifactFormat = "harbor.authoring-review-gate-
 // the task-revision decision evidence.  It deliberately records source and
 // session coordinates, never an invented TaskRevision.
 type authoringReviewGateDecisionArtifact struct {
-	Format                 string                           `json:"format"`
-	ReviewRequestID        string                           `json:"review_request_id"`
-	ReviewDecisionID       string                           `json:"review_decision_id"`
-	Action                 store.ReviewDecisionAction       `json:"action"`
-	AuthoringSourceID      string                           `json:"authoring_source_id"`
-	AuthoringSessionID     string                           `json:"authoring_session_id"`
-	SourceSnapshotDigest   string                           `json:"source_snapshot_digest"`
-	ReviewKind             string                           `json:"review_kind"`
-	EvidenceManifestDigest string                           `json:"evidence_manifest_digest"`
-	InputFingerprint       string                           `json:"input_fingerprint"`
-	DecisionActor          string                           `json:"decision_actor"`
-	DecisionReason         string                           `json:"decision_reason"`
-	FindingKind            store.AuthoringRepairFindingKind `json:"finding_kind,omitempty"`
+	Format                 string                     `json:"format"`
+	ReviewRequestID        string                     `json:"review_request_id"`
+	ReviewDecisionID       string                     `json:"review_decision_id"`
+	Action                 store.ReviewDecisionAction `json:"action"`
+	AuthoringSourceID      string                     `json:"authoring_source_id"`
+	AuthoringSessionID     string                     `json:"authoring_session_id"`
+	SourceSnapshotDigest   string                     `json:"source_snapshot_digest"`
+	ReviewKind             string                     `json:"review_kind"`
+	EvidenceManifestDigest string                     `json:"evidence_manifest_digest"`
+	InputFingerprint       string                     `json:"input_fingerprint"`
+	DecisionActor          string                     `json:"decision_actor"`
+	DecisionReason         string                     `json:"decision_reason"`
 }
 
 func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx context.Context, _ DurableJobExecution, job store.DurableJob) (store.JobState, error) {
@@ -41,8 +40,7 @@ func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx c
 	if binding == nil || binding.RunID != job.RunID || binding.StageAttemptID != job.StageAttemptID {
 		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review resolution job does not match a frozen gate", ErrFrozenExecutionPayload))
 	}
-	resolutionPayload, err := decodeAuthoringReviewGateResolutionPayload(job.PayloadJSON, *binding)
-	if err != nil {
+	if _, err := decodeAuthoringReviewGateResolutionPayload(job.PayloadJSON, *binding); err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	decisions, err := runtime.core.store.ListAuthoringReviewDecisionsForRequest(ctx, binding.ReviewRequestID)
@@ -53,10 +51,6 @@ func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx c
 		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review gate has %d decisions", ErrFrozenExecutionPayload, len(decisions)))
 	}
 	decision := decisions[0]
-	findingKind, err := normalizeAuthoringReviewFinding(*binding, decision.Action, resolutionPayload.FindingKind)
-	if err != nil {
-		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review repair finding: %v", ErrFrozenExecutionPayload, err))
-	}
 	run, err := runtime.core.store.GetWorkflowRun(ctx, binding.RunID)
 	if err != nil {
 		return runtime.failRuntimeJob(ctx, job, err)
@@ -110,7 +104,7 @@ func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx c
 			Action: decision.Action, AuthoringSourceID: binding.AuthoringSourceID, AuthoringSessionID: binding.AuthoringSessionID,
 			SourceSnapshotDigest: binding.SourceSnapshotDigest, ReviewKind: binding.ReviewKind,
 			EvidenceManifestDigest: binding.EvidenceManifestDigest, InputFingerprint: binding.InputFingerprint,
-			DecisionActor: decision.Actor, DecisionReason: decision.Reason, FindingKind: findingKind,
+			DecisionActor: decision.Actor, DecisionReason: decision.Reason,
 		})
 		if err != nil {
 			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("encode authoring review decision evidence: %w", err))
@@ -142,9 +136,6 @@ func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx c
 	}
 	if attempt.ExecutionStatus != store.StageExecutionCompleted {
 		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review resolution did not complete stage %s", ErrFrozenExecutionPayload, attempt.ID))
-	}
-	if err := runtime.openAuthoringReviewRepairLedger(ctx, *run, subject, *attempt, decision, findingKind); err != nil {
-		return runtime.failRuntimeJob(ctx, job, err)
 	}
 	sourceJob, sourcePayload, err := runtime.authoringReviewGateSourceStageJob(ctx, *binding)
 	if err != nil {

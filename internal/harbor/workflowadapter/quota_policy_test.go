@@ -100,10 +100,9 @@ func TestStandardAuthoringQuotaPolicySeparatelyBoundsOutputSubmissions(t *testin
 		if !present {
 			t.Fatalf("policy omitted stage %q", definition.Key)
 		}
-		_, isAgentStage := standardAgentQuotaStages[definition.Key]
-		if isAgentStage {
+		if definition.AgentRole != nil {
 			submissionUnits := StandardAuthoringOutputSubmissionClaimUnits
-			if definition.Key == workflowkit.StageKey(DockerfileBuildValidate) || definition.Key == workflowkit.StageKey(AuthoringHarness) {
+			if definition.AgentRole.RoleID == workflowkit.AgentRoleAuthor {
 				submissionUnits = StandardAuthoringWorkspaceSubmissionClaimUnits
 			}
 			if !hasQuotaClaim(claims, "agent_turn", int64(definition.RequiredTurns)) || !hasQuotaClaim(claims, "output_submission", submissionUnits) {

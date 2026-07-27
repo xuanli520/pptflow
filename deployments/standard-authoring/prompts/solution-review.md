@@ -2,10 +2,10 @@ Root authority: the host-supplied `context.contract.content` is the immutable Au
 
 # Solution and test review
 
-Review the exact `validated_solve_script`, `validated_test_script`, tests
-analysis, and host-owned `authoring_harness_report` for consistency with the
-approved task. Approve only when the report proves the pristine task failed and
-the Oracle repair passed for those exact script bytes, the reference solution
-is independent, and tests cover the claimed behavior and meaningful edge
-cases without hidden infrastructure. Record one durable decision using the
-locked review schema; draft solve/test artifacts are not review authority.
+Review the exact solution, tests, and tests analysis together with the
+`candidate_snapshot` and passing `validation_receipt`. Approve only when the
+receipt proves baseline failure and oracle success for those exact bytes, the
+reference solution is independent, and tests cover the claimed behavior and
+meaningful edge cases without hidden infrastructure. Record one durable
+decision using the locked review schema; draft artifacts are not review
+authority.

@@ -137,42 +137,42 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 	if err != nil {
 		t.Fatal(err)
 	}
-	dockerfileStage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.DockerfileGen))
+	authoringLoopStage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.AuthoringLoop))
 	if !found {
-		t.Fatal("Standard authoring catalog omitted dockerfile_generate")
+		t.Fatal("Standard authoring catalog omitted authoring_loop")
 	}
 	subject, err := services.core.resolveWorkflowRunSubject(ctx, *run)
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedBindings, err := managedRunInputBindingsForStageForSubject(ctx, database, services.core.objects, *run, subject, dockerfileStage)
+	managedBindings, err := managedRunInputBindingsForStageForSubject(ctx, database, services.core.objects, *run, subject, authoringLoopStage)
 	if err != nil {
-		t.Fatalf("resolve dockerfile root contract binding: %v", err)
+		t.Fatalf("resolve authoring-loop root contract binding: %v", err)
 	}
 	binding, found := managedBindings[workflowadapter.AuthoringContractArtifact]
 	if !found || binding != contractInput.artifactBinding() {
-		t.Fatalf("dockerfile root contract binding = %+v, want %+v", binding, contractInput.artifactBinding())
+		t.Fatalf("authoring-loop root contract binding = %+v, want %+v", binding, contractInput.artifactBinding())
 	}
 	readInput := newStageInputReaderForSubject(database, services.core.objects, *run, subject, []workflowkit.ArtifactBinding{binding})
 	contractBytes, err := readInput(ctx, binding)
 	if err != nil || !bytes.Equal(contractBytes, contractInput.CanonicalJSON) {
-		t.Fatalf("read dockerfile root contract = %q err=%v", contractBytes, err)
+		t.Fatalf("read authoring-loop root contract = %q err=%v", contractBytes, err)
 	}
-	repoAnalyzeStage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.RepoAnalyze))
+	repoStructureResearchStage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.RepoStructureResearch))
 	if !found {
-		t.Fatal("Standard authoring catalog omitted repo_analyze")
+		t.Fatal("Standard authoring catalog omitted repo_structure_research")
 	}
-	contractBindings, err := managedRunInputBindingsForStageForSubject(ctx, database, services.core.objects, *run, subject, repoAnalyzeStage)
+	contractBindings, err := managedRunInputBindingsForStageForSubject(ctx, database, services.core.objects, *run, subject, repoStructureResearchStage)
 	if err != nil {
-		t.Fatalf("resolve repo_analyze root contract binding: %v", err)
+		t.Fatalf("resolve repo-structure-research root contract binding: %v", err)
 	}
 	contractBinding, found := contractBindings[workflowadapter.AuthoringContractArtifact]
 	if !found || contractBinding != contractInput.artifactBinding() {
-		t.Fatalf("repo_analyze root contract binding = %+v, want %+v", contractBinding, contractInput.artifactBinding())
+		t.Fatalf("repo-structure-research root contract binding = %+v, want %+v", contractBinding, contractInput.artifactBinding())
 	}
 	contractBytes, err = newStageInputReaderForSubject(database, services.core.objects, *run, subject, []workflowkit.ArtifactBinding{contractBinding})(ctx, contractBinding)
 	if err != nil || !bytes.Equal(contractBytes, contractInput.CanonicalJSON) {
-		t.Fatalf("read repo_analyze root contract = %q err=%v", contractBytes, err)
+		t.Fatalf("read repo-structure-research root contract = %q err=%v", contractBytes, err)
 	}
 
 	replayed, err := services.AuthoringLaunches.Start(ctx, command)
@@ -1243,6 +1243,26 @@ func standardAuthoringLaunchTestStageType(t *testing.T, key workflowkit.StageKey
 	switch key {
 	case workflowkit.StageKey(workflowadapter.RepoPrepare):
 		return workflowadapter.StageBindingRepoPrepare
+	case workflowkit.StageKey(workflowadapter.RepoStructureResearch):
+		return workflowadapter.StageBindingRepoStructureResearch
+	case workflowkit.StageKey(workflowadapter.TestRuntimeResearch):
+		return workflowadapter.StageBindingTestRuntimeResearch
+	case workflowkit.StageKey(workflowadapter.VerifierThreatResearch):
+		return workflowadapter.StageBindingVerifierThreatResearch
+	case workflowkit.StageKey(workflowadapter.TaskSynthesis):
+		return workflowadapter.StageBindingTaskSynthesis
+	case workflowkit.StageKey(workflowadapter.AuthoringLoop):
+		return workflowadapter.StageBindingAuthoringLoop
+	case workflowkit.StageKey(workflowadapter.HostCandidateVerify):
+		return workflowadapter.StageBindingHostCandidateVerify
+	case workflowkit.StageKey(workflowadapter.TestQualityCritic):
+		return workflowadapter.StageBindingTestQualityCritic
+	case workflowkit.StageKey(workflowadapter.SolutionIntegrityCritic):
+		return workflowadapter.StageBindingSolutionIntegrityCritic
+	case workflowkit.StageKey(workflowadapter.AuthoringRepair):
+		return workflowadapter.StageBindingAuthoringRepair
+	case workflowkit.StageKey(workflowadapter.FinalAttestation):
+		return workflowadapter.StageBindingFinalAttestation
 	case workflowkit.StageKey(workflowadapter.RepoAnalyze):
 		return workflowadapter.StageBindingRepoAnalyze
 	case workflowkit.StageKey(workflowadapter.TaskDesign):

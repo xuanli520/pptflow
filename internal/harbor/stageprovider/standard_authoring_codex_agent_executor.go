@@ -3,7 +3,6 @@ package stageprovider
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,21 +17,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/purplevoid/harbor-factory/internal/agent"
-	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/runtime/codexruntime"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 const (
-	// StandardAuthoringCodexTurnRequestFormat is the sole structured document
-	// sent to a Codex authoring turn. It carries frozen artifact bytes only as
-	// standard base64. Dockerfile turns additionally receive the already validated
-	// non-secret base-image coordinate as host-derived metadata so the model does
-	// not have to guess a value that the submission authority will reject.
-	StandardAuthoringCodexTurnRequestFormat  = "harbor.standard-authoring-codex-turn-request.v1"
-	StandardAuthoringCodexTurnRequestVersion = "1"
-
 	standardAuthoringCodexCheckpointFormat = "harbor.standard-authoring-codex-turn-checkpoint.v1"
 
 	standardAuthoringCodexFailureConfiguration = "standard_authoring_codex_agent_turn.configuration"
@@ -42,15 +32,9 @@ const (
 	standardAuthoringCodexFailureRuntime       = "standard_authoring_codex_agent_turn.runtime"
 	standardAuthoringCodexFailureSource        = "standard_authoring_codex_agent_turn.source_integrity"
 	standardAuthoringCodexFailureWorkspace     = "standard_authoring_codex_agent_turn.workspace"
-	standardAuthoringCodexFailureOutput        = "standard_authoring_codex_agent_turn.output"
 	standardAuthoringCodexFailureInterrupted   = "standard_authoring_codex_agent_turn.interrupted"
 
 	standardAuthoringCodexContractAssetLimit = 1 << 20
-	// A successful host-owned submission must not be discarded merely because
-	// the parent stage context is canceled while the App Server is stopping.
-	// This is deliberately independent of that parent cancellation, but remains
-	// bounded so terminal source re-attestation cannot hang indefinitely.
-	standardAuthoringCodexAcceptedCleanupTimeout = 30 * time.Second
 )
 
 var (
@@ -146,24 +130,6 @@ func standardAuthoringCodexTurnProgramFingerprint(program StandardAuthoringCodex
 	return workflowkit.FingerprintBytes("harbor.standard-authoring-codex-turn-program.v1", encoded)
 }
 
-const standardAuthoringCodexOutputSchemaCanonicalJSON = `{"$id":"harbor.standard-authoring-codex-stage-output.v1","$schema":"http://json-schema.org/draft-07/schema#","additionalProperties":false,"properties":{"artifacts":{"items":{"additionalProperties":false,"properties":{"content_base64":{"type":"string"}},"required":["content_base64"],"type":"object"},"type":"array"},"verdict":{"type":"string"}},"required":["verdict","artifacts"],"type":"object"}`
-
-// StandardAuthoringCodexOutputSchemaFingerprint exposes the identity of the
-// real JSON Schema template pinned by deployment materials. The executor
-// derives a stricter per-stage schema from this closed template and the frozen
-// StageDescriptor immediately before opening its App Server conversation.
-func StandardAuthoringCodexOutputSchemaFingerprint() workflowkit.Fingerprint {
-	fingerprint, err := workflowkit.FingerprintBytes("harbor.standard-authoring-codex-stage-output-schema.v1", []byte(standardAuthoringCodexOutputSchemaCanonicalJSON))
-	if err != nil {
-		panic("fixed Standard Authoring Codex output schema fingerprint: " + err.Error())
-	}
-	return fingerprint
-}
-
-func standardAuthoringCodexOutputSchemaTemplate() []byte {
-	return []byte(standardAuthoringCodexOutputSchemaCanonicalJSON)
-}
-
 // ParseStandardAuthoringCodexTurnProgramAsset decodes the one supported
 // deployment prompt asset. The asset must be canonical JSON for
 // StandardAuthoringCodexTurnProgram, with at most one POSIX terminal LF, and
@@ -192,24 +158,6 @@ func ParseStandardAuthoringCodexTurnProgramAsset(raw []byte) (StandardAuthoringC
 		return StandardAuthoringCodexTurnProgram{}, fmt.Errorf("%w: prompt program asset is not canonical", ErrStandardAuthoringCodexAgentTurnConfiguration)
 	}
 	return program.clone(), nil
-}
-
-// ValidateStandardAuthoringCodexOutputSchemaAsset accepts only the exact
-// versioned JSON Schema template used to generate turn/start.outputSchema. It
-// accepts at most one POSIX terminal LF under the same raw-byte-locking rule as
-// the prompt asset. A field-list document is intentionally not accepted: the
-// App Server requires an actual JSON Schema value.
-func ValidateStandardAuthoringCodexOutputSchemaAsset(raw []byte) error {
-	if len(raw) == 0 || len(raw) > standardAuthoringCodexContractAssetLimit {
-		return fmt.Errorf("%w: output schema asset has invalid size", ErrStandardAuthoringCodexAgentTurnConfiguration)
-	}
-	if err := rejectDuplicateDeploymentCatalogJSONKeys(raw); err != nil {
-		return fmt.Errorf("%w: output schema asset has duplicate fields", ErrStandardAuthoringCodexAgentTurnConfiguration)
-	}
-	if !json.Valid(raw) || !bytes.Equal(standardAuthoringCodexCanonicalAssetBody(raw), standardAuthoringCodexOutputSchemaTemplate()) {
-		return fmt.Errorf("%w: output schema asset is not the locked JSON Schema template", ErrStandardAuthoringCodexAgentTurnConfiguration)
-	}
-	return nil
 }
 
 // standardAuthoringCodexCanonicalAssetBody permits exactly the final LF that
@@ -278,28 +226,44 @@ const (
 // surface: an operation can only use the prompt program registered for its
 // frozen stage key.
 type StandardAuthoringCodexAgentTurnExecutorConfig struct {
-	InvocationFactory StandardAuthoringCodexInvocationFactory
-	WorkspaceRoot     string
-	WorkspaceMode     StandardAuthoringCodexWorkspaceMode
-	SourceVerifier    StandardAuthoringCodexFrozenSourceVerifier
-	HarnessValidator  authoringharness.Validator
-	ProgramByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
-	RuntimeFactory    StandardAuthoringCodexRuntimeFactory
-	Now               func() time.Time
+	InvocationFactory  StandardAuthoringCodexInvocationFactory
+	WorkspaceRoot      string
+	WorkspaceMode      StandardAuthoringCodexWorkspaceMode
+	SourceVerifier     StandardAuthoringCodexFrozenSourceVerifier
+	ProgramByStage     map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
+	RuntimeFactory     StandardAuthoringCodexRuntimeFactory
+	CandidateValidator StandardAuthoringCandidateValidationTool
+	Now                func() time.Time
+}
+
+// StandardAuthoringCandidateValidationRequest carries only host-captured
+// candidate bytes and frozen identities into the verifier.
+type StandardAuthoringCandidateValidationRequest struct {
+	RunID                string
+	StageAttemptID       string
+	Snapshot             workflowkit.CandidateSnapshot
+	Files                map[string][]byte
+	VerificationContract []byte
+}
+
+// StandardAuthoringCandidateValidationTool validates a candidate without
+// exposing a workspace path, command, environment, or raw tool output.
+type StandardAuthoringCandidateValidationTool interface {
+	ValidateStandardAuthoringCandidate(context.Context, StandardAuthoringCandidateValidationRequest) (workflowkit.ValidationReceipt, error)
 }
 
 // StandardAuthoringCodexAgentTurnExecutor invokes only a locked Codex App
 // Server. It never reads os.Environ, accepts an ad-hoc prompt, logs a provider
 // response, or exposes a raw provider error to a durable StageExecutionResult.
 type StandardAuthoringCodexAgentTurnExecutor struct {
-	invocationFactory StandardAuthoringCodexInvocationFactory
-	workspaceRoot     string
-	workspaceMode     StandardAuthoringCodexWorkspaceMode
-	sourceVerifier    StandardAuthoringCodexFrozenSourceVerifier
-	harnessValidator  authoringharness.Validator
-	programByStage    map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
-	runtimeFactory    StandardAuthoringCodexRuntimeFactory
-	now               func() time.Time
+	invocationFactory  StandardAuthoringCodexInvocationFactory
+	workspaceRoot      string
+	workspaceMode      StandardAuthoringCodexWorkspaceMode
+	sourceVerifier     StandardAuthoringCodexFrozenSourceVerifier
+	programByStage     map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram
+	runtimeFactory     StandardAuthoringCodexRuntimeFactory
+	candidateValidator StandardAuthoringCandidateValidationTool
+	now                func() time.Time
 }
 
 // NewStandardAuthoringCodexAgentTurnExecutor constructs a controlled Codex
@@ -345,41 +309,8 @@ func NewStandardAuthoringCodexAgentTurnExecutor(config StandardAuthoringCodexAge
 	}
 	return &StandardAuthoringCodexAgentTurnExecutor{
 		invocationFactory: config.InvocationFactory, workspaceRoot: workspaceRoot, workspaceMode: workspaceMode, sourceVerifier: config.SourceVerifier, programByStage: programs,
-		harnessValidator: config.HarnessValidator, runtimeFactory: config.RuntimeFactory, now: now,
+		runtimeFactory: config.RuntimeFactory, candidateValidator: config.CandidateValidator, now: now,
 	}, nil
-}
-
-type standardAuthoringCodexSubmissionAuthority interface {
-	beginTurn(int) error
-	dynamicTool() agent.DynamicTool
-	outputSchema() json.RawMessage
-	acceptedResult() (workflowkit.StageExecutionResult, bool)
-	failure() string
-	failureText() string
-}
-
-// standardAuthoringCodexSubmissionTool wraps the private submission authority
-// with a one-way, in-memory completion signal. The signal is emitted only
-// after the authority has installed its immutable accepted result. It carries
-// that defensive result copy so the executor never has to treat free model
-// text as completion authority.
-func standardAuthoringCodexSubmissionTool(submission standardAuthoringCodexSubmissionAuthority, accepted chan<- workflowkit.StageExecutionResult) agent.DynamicTool {
-	tool := submission.dynamicTool()
-	handler := tool.Handler
-	tool.Handler = func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
-		response, err := handler(ctx, raw)
-		if err != nil || accepted == nil {
-			return response, err
-		}
-		if result, ok := submission.acceptedResult(); ok {
-			select {
-			case accepted <- result:
-			default:
-			}
-		}
-		return response, nil
-	}
-	return tool
 }
 
 type standardAuthoringCodexTurnCompletion struct {
@@ -427,280 +358,14 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) ExecuteAgentTurn(ctx co
 	if failure != "" {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failure), nil
 	}
-	sealedTemplate, usesFixedFileOutput, err := standardAuthoringCodexFixedFileInvocation(invocation)
-	if err != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
+	if request.Stage.AgentRole != nil {
+		return executor.executeV3AgentTurn(ctx, invocation, payload, program)
 	}
-	if err := contextError(ctx); err != nil {
-		return standardAuthoringCodexInterrupted(), nil
-	}
-	inputs, inputFingerprint, err := standardAuthoringCodexReadInputs(ctx, request)
-	if err != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
-	}
-	contract, err := standardAuthoringCodexRootContract(inputs)
-	if err != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
-	}
-	environmentPolicy, err := standardAuthoringCodexDockerfileEnvironmentPolicy(request.Stage, contract)
-	if err != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
-	}
-	requestDocument, err := standardAuthoringCodexRequestDocument(request, sealedTemplate, program, inputs, inputFingerprint, contract)
-	if err != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-	}
-	sourceWorkspace, err := executor.workspaceForExecution(request.Execution.ID)
-	if err != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-	}
-	maxSubmissions, hasSubmissionQuota := standardAuthoringCodexOutputSubmissionQuota(request.Stage)
-	if !hasSubmissionQuota {
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-	}
-	attestedInvocation, runtime, failure := executor.runtimeForEffect(ctx, invocation, payload)
-	if failure != "" {
-		if contextError(ctx) != nil {
-			return standardAuthoringCodexInterrupted(), nil
-		}
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failure), nil
-	}
-	sourceIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
-	if err != nil {
-		if contextError(ctx) != nil {
-			return standardAuthoringCodexInterrupted(), nil
-		}
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
-	}
-	workspace := sourceWorkspace
-	if standardAuthoringCodexInvocationWorkspaceWrite(attestedInvocation) {
-		if executor.workspaceMode != StandardAuthoringCodexWorkspaceRunScoped {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		workspace, err = executor.prepareAttemptWorkspace(ctx, request, sourceWorkspace)
-		if err != nil {
-			if contextError(ctx) != nil {
-				return standardAuthoringCodexInterrupted(), nil
-			}
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureWorkspace), nil
-		}
-		copiedSourceIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
-		if verifyErr != nil || copiedSourceIdentity != sourceIdentity {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
-		}
-	}
-	var submission standardAuthoringCodexSubmissionAuthority
-	if standardAuthoringCodexUsesWorkspaceHarness(request.Stage.Key) {
-		if !standardAuthoringCodexInvocationWorkspaceWrite(attestedInvocation) || isNilInterface(executor.harnessValidator) {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		taskRoot := filepath.Join(workspace, StandardAuthoringCodexAttemptTaskDirectory)
-		if err := standardAuthoringCodexPrepareWorkspaceCandidate(request.Stage, taskRoot, inputs); err != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureWorkspace), nil
-		}
-		validationAttempts, ok := standardAuthoringCodexValidationQuota(request.Stage)
-		if !ok || validationAttempts <= 0 {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		attempts := maxSubmissions
-		if validationAttempts < attempts {
-			attempts = validationAttempts
-		}
-		workspaceSubmission, err := newStandardAuthoringCodexWorkspaceSubmission(request, taskRoot, int(attempts), executor.now, executor.harnessValidator, environmentPolicy)
-		if err != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		submission = workspaceSubmission
-	} else if usesFixedFileOutput {
-		if !standardAuthoringCodexInvocationWorkspaceWrite(attestedInvocation) || executor.workspaceMode != StandardAuthoringCodexWorkspaceRunScoped {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		taskRoot := filepath.Join(workspace, StandardAuthoringCodexAttemptTaskDirectory)
-		if err := standardAuthoringCodexPrepareFixedFileWorkspace(taskRoot, request.Stage); err != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureWorkspace), nil
-		}
-		fixedFileSubmission, err := newStandardAuthoringCodexFixedFileSubmission(request, taskRoot, program.MaxOutputBytes, int(maxSubmissions), executor.now)
-		if err != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		submission = fixedFileSubmission
-	} else {
-		outputSubmission, err := newStandardAuthoringCodexOutputSubmission(request, program.MaxOutputBytes, int(maxSubmissions), executor.now, environmentPolicy)
-		if err != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		if err := outputSubmission.setStructuredClaimValidation(contract, sourceWorkspace); err != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		if err := outputSubmission.setTestsAnalysisRequirementValidation(inputs); err != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailurePermanent, standardAuthoringCodexFailureInput), nil
-		}
-		submission = outputSubmission
-	}
-	acceptedSubmissions := make(chan workflowkit.StageExecutionResult, 1)
-	conversation, err := runtime.OpenConversation(ctx, agent.ConversationRequest{
-		ProjectPath:       workspace,
-		Model:             attestedInvocation.ModelID,
-		ReasoningEffort:   string(attestedInvocation.ReasoningEffort),
-		SandboxMode:       attestedInvocation.SandboxMode,
-		SandboxPolicy:     attestedInvocation.SandboxPolicy,
-		NetworkAccess:     false,
-		WorkspaceRoots:    []string{workspace},
-		TimeoutSeconds:    standardAuthoringCodexTimeoutSeconds(request.Stage.Budget.TurnTimeout),
-		MaxOutputBytes:    program.MaxOutputBytes,
-		CapabilitySummary: attestedInvocation.CLIVersionOutput,
-		// App Server protocol logs contain only hashes in the current runtime, but
-		// an operation must not leave even those records in a managed workspace.
-		LogPath:      os.DevNull,
-		DynamicTools: []agent.DynamicTool{standardAuthoringCodexSubmissionTool(submission, acceptedSubmissions)},
-	})
-	if err != nil {
-		if contextError(ctx) != nil {
-			return standardAuthoringCodexInterrupted(), nil
-		}
-		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
-	}
-	finishAccepted := func(accepted workflowkit.StageExecutionResult, alreadyClosed bool, earlyCloseErr error) (workflowkit.StageExecutionResult, error) {
-		// Once the host has accepted a candidate, it owns the terminal result
-		// even if the model keeps sampling. Start this bounded cleanup context
-		// at acceptance time (not conversation-open time) so a long valid turn
-		// still receives its full source re-attestation budget. It is independent
-		// of parent cancellation, which may race after immutable acceptance.
-		acceptedCleanupContext, acceptedCleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), standardAuthoringCodexAcceptedCleanupTimeout)
-		defer acceptedCleanupCancel()
-		closeErr := earlyCloseErr
-		if !alreadyClosed {
-			closeErr = conversation.Close()
-		}
-		closedIdentity, verifyErr := executor.verifyFrozenSource(acceptedCleanupContext, request.Execution, sourceWorkspace)
-		if verifyErr != nil || closedIdentity != sourceIdentity {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
-		}
-		if closeErr != nil {
-			return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
-		}
-		return accepted, nil
-	}
-	for ordinal, prompt := range program.TurnPrompts {
-		turn := ordinal + 1
-		if err := submission.beginTurn(turn); err != nil {
-			_ = conversation.Close()
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-		if err := executor.checkpoint(ctx, request, program, inputFingerprint, turn, "turn_ready", ""); err != nil {
-			_ = conversation.Close()
-			if contextError(ctx) != nil {
-				return standardAuthoringCodexInterrupted(), nil
-			}
-			return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
-		}
-		if err := request.Charge(ctx, workflowkit.StageUsage{
-			OperationKey: standardAuthoringCodexUsageKey(request, turn), Dimension: "agent_turn", Units: 1, OccurredAt: executor.now().UTC(),
-		}); err != nil {
-			_ = conversation.Close()
-			if contextError(ctx) != nil {
-				return standardAuthoringCodexInterrupted(), nil
-			}
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureQuota), nil
-		}
-		beforeTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
-		if verifyErr != nil || beforeTurnIdentity != sourceIdentity {
-			_ = conversation.Close()
-			if contextError(ctx) != nil {
-				return standardAuthoringCodexInterrupted(), nil
-			}
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
-		}
-		turnRequest := agent.TurnRequest{
-			ProjectPath:       workspace,
-			Prompt:            prompt,
-			Model:             attestedInvocation.ModelID,
-			ReasoningEffort:   string(attestedInvocation.ReasoningEffort),
-			SandboxMode:       attestedInvocation.SandboxMode,
-			SandboxPolicy:     attestedInvocation.SandboxPolicy,
-			NetworkAccess:     false,
-			WorkspaceRoots:    []string{workspace},
-			TimeoutSeconds:    standardAuthoringCodexTimeoutSeconds(request.Stage.Budget.TurnTimeout),
-			MaxOutputBytes:    program.MaxOutputBytes,
-			CapabilitySummary: attestedInvocation.CLIVersionOutput,
-			LogPath:           os.DevNull,
-			OutputSchema:      submission.outputSchema(),
-		}
-		if turn == 1 {
-			turnRequest.Input = []agent.InputPart{{Type: "text", Text: string(requestDocument)}}
-		}
-		result, turnErr, accepted, acceptedDuringTurn, acceptedCloseErr := standardAuthoringCodexRunTurnUntilAccepted(ctx, conversation, turnRequest, acceptedSubmissions)
-		if acceptedDuringTurn {
-			return finishAccepted(accepted, true, acceptedCloseErr)
-		}
-		if accepted, ok := submission.acceptedResult(); ok {
-			return finishAccepted(accepted, false, nil)
-		}
-		afterTurnIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
-		if verifyErr != nil || afterTurnIdentity != sourceIdentity {
-			_ = conversation.Close()
-			if contextError(ctx) != nil {
-				return standardAuthoringCodexInterrupted(), nil
-			}
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
-		}
-		if turnErr != nil {
-			_ = conversation.Close()
-			if contextError(ctx) != nil {
-				return standardAuthoringCodexInterrupted(), nil
-			}
-			return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
-		}
-		if result.Model != attestedInvocation.ModelID {
-			_ = conversation.Close()
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureRuntime), nil
-		}
-		if failureCode := submission.failure(); failureCode != "" {
-			_ = conversation.Close()
-			return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(failureCode), submission.failureText()), nil
-		}
-		responseDigest := workflowkit.SHA256Fingerprint([]byte(result.Text))
-		if err := executor.checkpoint(ctx, request, program, inputFingerprint, turn, "turn_completed", string(responseDigest)); err != nil {
-			_ = conversation.Close()
-			if contextError(ctx) != nil {
-				return standardAuthoringCodexInterrupted(), nil
-			}
-			return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
-		}
-		if accepted, ok := submission.acceptedResult(); ok {
-			return finishAccepted(accepted, false, nil)
-		}
-	}
-	closeErr := conversation.Close()
-	closedIdentity, verifyErr := executor.verifyFrozenSource(ctx, request.Execution, sourceWorkspace)
-	if verifyErr != nil || closedIdentity != sourceIdentity {
-		if contextError(ctx) != nil {
-			return standardAuthoringCodexInterrupted(), nil
-		}
-		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
-	}
-	if closeErr != nil {
-		return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
-	}
-	if failureCode := submission.failure(); failureCode != "" {
-		return standardAuthoringCodexFailure(standardAuthoringCodexSubmissionFailureClass(failureCode), submission.failureText()), nil
-	}
-	// The frozen inputs and output contract remain valid; this particular agent
-	// process simply ended without delivering the required structured result.
-	return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexSubmissionFailureAbsent), nil
-}
-
-func standardAuthoringCodexSubmissionFailureClass(code string) workflowkit.FailureClass {
-	if code == standardAuthoringCodexSubmissionFailureQuota {
-		return workflowkit.FailurePolicy
-	}
-	if code == standardAuthoringCodexSubmissionFailureValidation ||
-		code == standardAuthoringCodexSubmissionFailureValidationExhausted ||
-		code == standardAuthoringCodexSubmissionFailureValidationUnavailable ||
-		code == standardAuthoringCodexSubmissionFailureOutputValidationExhausted {
-		return workflowkit.FailureProcess
-	}
-	return workflowkit.FailureUnknown
+	// No retired Standard Authoring stage is executable after the 3.0 cutover.
+	// The remaining branch is retained only until its source is removed with the
+	// historical test fixtures; it is deliberately unreachable from a frozen
+	// installed template.
+	return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 }
 
 func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionRequest(invocation StageOperationInvocation, payload workflowadapter.AgentTurnOperationPayload) (StandardAuthoringCodexTurnProgram, string) {
@@ -714,14 +379,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) validateExecutionReques
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	expectedAgentTurns, hasAgentTurnQuota := standardAuthoringCodexAgentTurnQuota(request.Stage)
-	expectedSubmissions, hasSubmissionQuota := standardAuthoringCodexOutputSubmissionQuota(request.Stage)
-	if standardAuthoringCodexUsesWorkspaceHarness(request.Stage.Key) {
-		validationUnits, hasValidationQuota := standardAuthoringCodexValidationQuota(request.Stage)
-		if !hasValidationQuota || validationUnits != workflowadapter.StandardAuthoringValidationClaimUnits {
-			return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
-		}
-	}
-	if !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns || !hasSubmissionQuota || expectedSubmissions <= 0 {
+	if request.Stage.AgentRole == nil || request.Stage.AgentRole.MaxTurns != payload.MaxTurns || !IsCodexAppServerProductionPayload(payload) || payload.MaxTurns != len(program.TurnPrompts) || payload.MaxTurns > request.Stage.Budget.MaxTurns || !hasAgentTurnQuota || int64(payload.MaxTurns) != expectedAgentTurns {
 		return StandardAuthoringCodexTurnProgram{}, standardAuthoringCodexFailureConfiguration
 	}
 	if request.Claim.Stage == nil || strings.TrimSpace(string(request.Claim.Stage.StageAttempt.ID)) == "" || request.Checkpoint == nil || request.Charge == nil {
@@ -768,44 +426,6 @@ func standardAuthoringCodexAgentTurnQuota(stage workflowkit.StageDescriptor) (in
 	return standardAuthoringCodexQuotaClaim(stage, "agent_turn")
 }
 
-func standardAuthoringCodexOutputSubmissionQuota(stage workflowkit.StageDescriptor) (int64, bool) {
-	return standardAuthoringCodexQuotaClaim(stage, standardAuthoringCodexOutputSubmissionQuotaDimension)
-}
-
-func standardAuthoringCodexValidationQuota(stage workflowkit.StageDescriptor) (int64, bool) {
-	return standardAuthoringCodexQuotaClaim(stage, workflowadapter.StandardAuthoringValidationQuotaDimension)
-}
-
-func standardAuthoringCodexUsesWorkspaceHarness(stageKey workflowkit.StageKey) bool {
-	return stageKey == workflowkit.StageKey(workflowadapter.DockerfileBuildValidate) || stageKey == workflowkit.StageKey(workflowadapter.AuthoringHarness)
-}
-
-// standardAuthoringCodexFixedFileInvocation proves the v2 fixed-file route
-// from all three frozen identities before any attempt workspace is created.
-func standardAuthoringCodexFixedFileInvocation(invocation StageOperationInvocation) (workflowadapter.TemplateReference, bool, error) {
-	request := invocation.Request
-	fixedTemplate := workflowadapter.StandardAuthoringCurrentTemplateReference()
-	workflowTemplate := workflowadapter.TemplateReference{ID: request.Execution.Workflow.ID, Version: request.Execution.Workflow.Version}
-	specification, err := workflowkitRequestExecutionSpec(request)
-	if err != nil {
-		// Direct unit fixtures without a sealed specification retain the ordinary
-		// base64 route and cannot opt into the v2 fixed-file authority.
-		if invocation.Resolution.Template.Equal(fixedTemplate) || workflowTemplate.Equal(fixedTemplate) {
-			return workflowadapter.TemplateReference{}, false, err
-		}
-		return workflowTemplate, false, nil
-	}
-	sealedTemplate := specification.Template
-	declaresFixed := sealedTemplate.Equal(fixedTemplate) || invocation.Resolution.Template.Equal(fixedTemplate) || workflowTemplate.Equal(fixedTemplate)
-	if declaresFixed {
-		if !sealedTemplate.Equal(fixedTemplate) || !invocation.Resolution.Template.Equal(fixedTemplate) || !workflowTemplate.Equal(fixedTemplate) {
-			return workflowadapter.TemplateReference{}, false, errors.New("fixed-file invocation template does not match its sealed execution specification")
-		}
-		return sealedTemplate, standardAuthoringCodexFixedFileStageKey(request.Stage.Key), nil
-	}
-	return sealedTemplate, false, nil
-}
-
 func standardAuthoringCodexQuotaClaim(stage workflowkit.StageDescriptor, dimension string) (int64, bool) {
 	var units int64
 	found := false
@@ -850,245 +470,6 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) checkpoint(ctx context.
 		OccurredAt: executor.now().UTC(),
 	})
 	return err
-}
-
-type standardAuthoringCodexInput struct {
-	Name          string                  `json:"name"`
-	ArtifactID    string                  `json:"artifact_id"`
-	SchemaVersion string                  `json:"schema_version"`
-	ContentDigest workflowkit.Fingerprint `json:"content_digest"`
-	ContentBase64 string                  `json:"content_base64"`
-}
-
-const (
-	// standardAuthoringCodexContextMaxInlineBytes caps all immutable bytes sent
-	// to one model turn. Stage inputs remain available to host validators, but a
-	// deployment cannot accidentally turn a growing report/log artifact into an
-	// unbounded conversational memory channel.
-	standardAuthoringCodexContextMaxInlineBytes = 2 * 1024 * 1024
-	// The catalog currently declares materially fewer ports than this. Keep a
-	// separate cap so a malformed direct invocation cannot make envelope
-	// construction scale with an untrusted binding list.
-	standardAuthoringCodexContextMaxInputs = 32
-	// Base64 and JSON add overhead to the bounded raw input payload. This cap
-	// applies to the exact document passed to the model runtime.
-	standardAuthoringCodexContextMaxDocumentBytes = 3 * 1024 * 1024
-)
-
-func standardAuthoringCodexReadInputs(ctx context.Context, request workflowkit.StageExecutionRequest) ([]standardAuthoringCodexInput, workflowkit.Fingerprint, error) {
-	bindings := append([]workflowkit.ArtifactBinding(nil), request.Inputs...)
-	sort.Slice(bindings, func(left, right int) bool { return bindings[left].Name < bindings[right].Name })
-	if err := validateStandardAuthoringCodexDeclaredInputs(request.Stage, bindings); err != nil {
-		return nil, "", err
-	}
-	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(bindings)
-	if err != nil {
-		return nil, "", err
-	}
-	inputs := make([]standardAuthoringCodexInput, 0, len(bindings))
-	inlineBytes := 0
-	for _, binding := range bindings {
-		if err := binding.Validate(); err != nil {
-			return nil, "", err
-		}
-		content, err := request.ReadInput(ctx, binding)
-		if err != nil || workflowkit.SHA256Fingerprint(content) != binding.ContentDigest {
-			return nil, "", errors.New("frozen stage input is unavailable or changed")
-		}
-		if len(content) > standardAuthoringCodexContextMaxInlineBytes-inlineBytes {
-			return nil, "", errors.New("frozen stage inputs exceed the model context limit")
-		}
-		inlineBytes += len(content)
-		inputs = append(inputs, standardAuthoringCodexInput{
-			Name: binding.Name, ArtifactID: string(binding.ArtifactID), SchemaVersion: binding.SchemaVersion, ContentDigest: binding.ContentDigest,
-			ContentBase64: base64.StdEncoding.EncodeToString(content),
-		})
-	}
-	return inputs, inputFingerprint, nil
-}
-
-// validateStandardAuthoringCodexDeclaredInputs repeats the frozen-port check
-// at the model-context boundary. The generic workflow engine also performs
-// this validation, but an executor must fail closed when called directly by a
-// test adapter or future bridge that bypasses the engine.
-func validateStandardAuthoringCodexDeclaredInputs(stage workflowkit.StageDescriptor, bindings []workflowkit.ArtifactBinding) error {
-	if err := stage.Validate(); err != nil {
-		return fmt.Errorf("model context stage is invalid: %w", err)
-	}
-	if len(stage.Inputs) == 0 || len(stage.Inputs) > standardAuthoringCodexContextMaxInputs || len(bindings) > standardAuthoringCodexContextMaxInputs {
-		return errors.New("model context has an invalid number of declared inputs")
-	}
-	declared := make(map[string]workflowkit.ArtifactSpec, len(stage.Inputs))
-	for _, input := range stage.Inputs {
-		if _, duplicate := declared[input.Name]; duplicate {
-			return errors.New("model context stage has duplicate declared inputs")
-		}
-		declared[input.Name] = input
-	}
-	seen := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		if err := binding.Validate(); err != nil {
-			return err
-		}
-		input, found := declared[binding.Name]
-		if !found || input.SchemaVersion != binding.SchemaVersion {
-			return errors.New("model context includes an undeclared input")
-		}
-		if _, duplicate := seen[binding.Name]; duplicate {
-			return errors.New("model context includes a duplicate input")
-		}
-		seen[binding.Name] = struct{}{}
-	}
-	for _, input := range stage.Inputs {
-		if input.Required {
-			if _, found := seen[input.Name]; !found {
-				return errors.New("model context omits a required input")
-			}
-		}
-	}
-	contract, found := declared[workflowadapter.AuthoringContractArtifact]
-	if !found || !contract.Required || contract.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
-		return errors.New("model context stage does not declare the required root contract")
-	}
-	if _, found := seen[workflowadapter.AuthoringContractArtifact]; !found {
-		return errors.New("model context omits the root contract")
-	}
-	return nil
-}
-
-func standardAuthoringCodexRootContract(inputs []standardAuthoringCodexInput) (workflowadapter.AuthoringContract, error) {
-	for _, input := range inputs {
-		if input.Name != workflowadapter.AuthoringContractArtifact {
-			continue
-		}
-		if input.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
-			return workflowadapter.AuthoringContract{}, errors.New("root contract schema is invalid")
-		}
-		raw, err := base64.StdEncoding.DecodeString(input.ContentBase64)
-		if err != nil || workflowkit.SHA256Fingerprint(raw) != input.ContentDigest {
-			return workflowadapter.AuthoringContract{}, errors.New("root contract content is invalid")
-		}
-		contract, err := workflowadapter.ParseAuthoringContractJSON(raw)
-		if err != nil {
-			return workflowadapter.AuthoringContract{}, errors.New("root contract is invalid")
-		}
-		canonical, err := contract.CanonicalJSON()
-		if err != nil || !bytes.Equal(canonical, raw) {
-			return workflowadapter.AuthoringContract{}, errors.New("root contract is not canonical")
-		}
-		return contract, nil
-	}
-	return workflowadapter.AuthoringContract{}, errors.New("root contract is missing")
-}
-
-// standardAuthoringCodexDockerfileEnvironmentPolicy derives the sole Docker
-// authority from the root contract rather than accepting a second policy input.
-func standardAuthoringCodexDockerfileEnvironmentPolicy(stage workflowkit.StageDescriptor, contract workflowadapter.AuthoringContract) (*workflowadapter.StandardAuthoringEnvironmentPolicy, error) {
-	if stage.Key != workflowkit.StageKey(workflowadapter.DockerfileGen) && !standardAuthoringCodexUsesWorkspaceHarness(stage.Key) {
-		return nil, nil
-	}
-	policy, err := contract.EnvironmentPolicy()
-	if err != nil {
-		return nil, errors.New("root contract environment is invalid")
-	}
-	return &policy, nil
-}
-
-func standardAuthoringCodexRequestDocument(request workflowkit.StageExecutionRequest, template workflowadapter.TemplateReference, program StandardAuthoringCodexTurnProgram, inputs []standardAuthoringCodexInput, inputFingerprint workflowkit.Fingerprint, contract workflowadapter.AuthoringContract) ([]byte, error) {
-	outputs := make([]struct {
-		Name          string `json:"name"`
-		SchemaVersion string `json:"schema_version"`
-	}, 0, len(request.Stage.Outputs))
-	for _, output := range request.Stage.Outputs {
-		outputs = append(outputs, struct {
-			Name          string `json:"name"`
-			SchemaVersion string `json:"schema_version"`
-		}{Name: output.Name, SchemaVersion: output.SchemaVersion})
-	}
-	var root standardAuthoringCodexInput
-	envelopeInputs := make([]workflowadapter.AuthoringContextInput, 0, len(inputs)-1)
-	repairs := make([]workflowadapter.AuthoringContextRepair, 0)
-	artifacts := make([]standardAuthoringCodexInput, 0, len(inputs)-1)
-	for _, input := range inputs {
-		if input.Name == workflowadapter.AuthoringContractArtifact {
-			if root.Name != "" {
-				return nil, errors.New("multiple root contract inputs")
-			}
-			root = input
-			continue
-		}
-		envelopeInputs = append(envelopeInputs, workflowadapter.AuthoringContextInput{Name: input.Name, ArtifactID: input.ArtifactID, Digest: string(input.ContentDigest)})
-		artifacts = append(artifacts, input)
-		if standardAuthoringCodexRepairInput(request.Stage, input) {
-			repairs = append(repairs, workflowadapter.AuthoringContextRepair{ID: input.ArtifactID, Target: string(request.Stage.Key), Reason: "untrusted repair feedback", State: "open", EvidenceDigest: string(input.ContentDigest)})
-		}
-	}
-	if root.Name == "" || root.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
-		return nil, errors.New("root contract input is missing")
-	}
-	canonical, err := contract.CanonicalJSON()
-	if err != nil || workflowkit.SHA256Fingerprint(canonical) != root.ContentDigest {
-		return nil, errors.New("root contract input does not match canonical contract")
-	}
-	attempt := 1
-	if request.Claim.Stage != nil {
-		attempt = request.Claim.Stage.StageAttempt.Ordinal
-	}
-	envelope := workflowadapter.AuthoringContextEnvelope{
-		Format: workflowadapter.AuthoringContextEnvelopeFormat, Version: workflowadapter.AuthoringContextEnvelopeVersion,
-		Contract: workflowadapter.AuthoringContextContract{ArtifactID: root.ArtifactID, Digest: string(root.ContentDigest), Content: canonical},
-		Stage:    workflowadapter.AuthoringContextStage{Key: string(request.Stage.Key), Attempt: attempt},
-		Inputs:   envelopeInputs, Repairs: repairs,
-	}
-	document := struct {
-		Format                  string                                   `json:"format"`
-		Version                 string                                   `json:"version"`
-		ProgramID               string                                   `json:"program_id"`
-		ProgramVersion          string                                   `json:"program_version"`
-		ProgramFingerprint      workflowkit.Fingerprint                  `json:"program_fingerprint"`
-		OutputSchemaFingerprint workflowkit.Fingerprint                  `json:"output_schema_fingerprint"`
-		StageKey                workflowkit.StageKey                     `json:"stage_key"`
-		InputFingerprint        workflowkit.Fingerprint                  `json:"input_fingerprint"`
-		Context                 workflowadapter.AuthoringContextEnvelope `json:"context"`
-		Artifacts               []standardAuthoringCodexInput            `json:"artifacts"`
-		Outputs                 []struct {
-			Name          string `json:"name"`
-			SchemaVersion string `json:"schema_version"`
-		} `json:"outputs"`
-	}{
-		Format: StandardAuthoringCodexTurnRequestFormat, Version: StandardAuthoringCodexTurnRequestVersion,
-		ProgramID: program.ID, ProgramVersion: program.Version, ProgramFingerprint: program.Fingerprint,
-		OutputSchemaFingerprint: StandardAuthoringCodexOutputSchemaFingerprintForTemplateStage(template, request.Stage.Key), StageKey: request.Stage.Key,
-		InputFingerprint: inputFingerprint, Context: envelope, Artifacts: artifacts, Outputs: outputs,
-	}
-	encoded, err := json.Marshal(document)
-	if err != nil {
-		return nil, err
-	}
-	if len(encoded) > standardAuthoringCodexContextMaxDocumentBytes {
-		return nil, errors.New("model context document exceeds the size limit")
-	}
-	return encoded, nil
-}
-
-// standardAuthoringCodexRepairInput recognizes only continuation-only,
-// optional evidence ports from the v2 catalog. A normal required gate
-// decision is an upstream claim, not an unresolved repair instruction.
-func standardAuthoringCodexRepairInput(stage workflowkit.StageDescriptor, candidate standardAuthoringCodexInput) bool {
-	for _, input := range stage.Inputs {
-		if input.Name != candidate.Name || input.Required || input.SchemaVersion != candidate.SchemaVersion {
-			continue
-		}
-		switch candidate.Name {
-		case "task_review_decision", "content_review_decision", "solution_review_decision":
-			return candidate.SchemaVersion == "harbor.review-decision.v1"
-		case "codeedge_package_admission_report":
-			return candidate.SchemaVersion == "harbor.standard-authoring-task-package-admission.v1"
-		default:
-			return false
-		}
-	}
-	return false
 }
 
 func validateStandardAuthoringCodexInvocation(invocation CodexAppServerInvocation) error {

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
-	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -159,7 +158,6 @@ type TaskBoardRun struct {
 // worker logs.
 type TaskBoardAuthoringEvidence struct {
 	Contract TaskBoardAuthoringContract
-	Repairs  []TaskBoardAuthoringRepair
 	Claims   []TaskBoardAuthoringClaim
 	Lineage  []TaskBoardAuthoringArtifact
 }
@@ -186,16 +184,6 @@ type TaskBoardAuthoringContract struct {
 	PackageFormat      string
 }
 
-// TaskBoardAuthoringRepair exposes typed ledger state and its planned
-// invalidation target without rendering untrusted review feedback.
-type TaskBoardAuthoringRepair struct {
-	ID             string
-	TargetProducer string
-	FindingKind    string
-	State          string
-	EvidenceDigest string
-}
-
 // TaskBoardAuthoringClaim records the host's result for an allowlisted
 // structured artifact. A match means the artifact was accepted only after
 // its canonical claims matched the root contract; claim values are never
@@ -220,10 +208,9 @@ type TaskBoardAuthoringArtifact struct {
 type TaskBoardFailureRecoveryAction string
 
 const (
-	TaskBoardFailureRecoveryNone                    TaskBoardFailureRecoveryAction = ""
-	TaskBoardFailureRecoveryReconcile               TaskBoardFailureRecoveryAction = "reconcile"
-	TaskBoardFailureRecoveryRedriveAuthoringHandoff TaskBoardFailureRecoveryAction = "redrive_standard_authoring_handoff"
-	TaskBoardFailureRecoveryRepairOrNewRun          TaskBoardFailureRecoveryAction = "repair_or_new_run"
+	TaskBoardFailureRecoveryNone           TaskBoardFailureRecoveryAction = ""
+	TaskBoardFailureRecoveryReconcile      TaskBoardFailureRecoveryAction = "reconcile"
+	TaskBoardFailureRecoveryRepairOrNewRun TaskBoardFailureRecoveryAction = "repair_or_new_run"
 )
 
 // TaskBoardRetryStrategy identifies the durable recovery contract selected for
@@ -232,10 +219,8 @@ const (
 type TaskBoardRetryStrategy string
 
 const (
-	TaskBoardRetryStrategyNone                     TaskBoardRetryStrategy = ""
-	TaskBoardRetryStrategyTaskContinuation         TaskBoardRetryStrategy = "task_continuation"
-	TaskBoardRetryStrategyAuthoringRecovery        TaskBoardRetryStrategy = "authoring_recovery"
-	TaskBoardRetryStrategyAuthoringAdmissionRepair TaskBoardRetryStrategy = "authoring_admission_repair"
+	TaskBoardRetryStrategyNone             TaskBoardRetryStrategy = ""
+	TaskBoardRetryStrategyTaskContinuation TaskBoardRetryStrategy = "task_continuation"
 )
 
 // TaskBoardLog is a bounded read of a worker log selected through a Run's
@@ -500,7 +485,6 @@ type TaskBoardService struct {
 	mutations         *LifecycleMutationService
 	activations       *RunActivationService
 	continuations     *TaskContinuationService
-	authoringRecovery *AuthoringRecoveryService
 	control           *ExecutionControlService
 	evaluatorLaunches *CodeEdgeEvaluatorLaunchService
 	evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService
@@ -508,7 +492,7 @@ type TaskBoardService struct {
 	actor             func() (string, error)
 }
 
-func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService, authoringRecovery *AuthoringRecoveryService, evaluatorLaunches *CodeEdgeEvaluatorLaunchService, evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService, workerLauncher RunWorkerHandoffLauncher) *TaskBoardService {
+func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService, evaluatorLaunches *CodeEdgeEvaluatorLaunchService, evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService, workerLauncher RunWorkerHandoffLauncher) *TaskBoardService {
 	return &TaskBoardService{
 		core:              core,
 		inspection:        inspection,
@@ -517,7 +501,6 @@ func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspec
 		mutations:         mutations,
 		activations:       activations,
 		continuations:     continuations,
-		authoringRecovery: authoringRecovery,
 		control:           control,
 		evaluatorLaunches: evaluatorLaunches,
 		evaluatorEvidence: evaluatorEvidence,
@@ -829,7 +812,7 @@ func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoard
 	case store.WorkflowRunSubjectTaskRevision:
 		return service.retryTaskRevisionRun(ctx, prepared, actor)
 	case store.WorkflowRunSubjectAuthoringSession:
-		return service.recoverAuthoringRun(ctx, prepared, actor, request)
+		return TaskBoardMutation{}, fmt.Errorf("Standard authoring 3.0 runs cannot be retried; start a new source/session run")
 	default:
 		return TaskBoardMutation{}, fmt.Errorf("Run %s has no retry contract", prepared.RunID)
 	}
@@ -888,23 +871,7 @@ func (service *TaskBoardService) PreviewRunRecovery(ctx context.Context, request
 			return TaskBoardRecoveryPreview{}, err
 		}
 	case store.WorkflowRunSubjectAuthoringSession:
-		if service.authoringRecovery == nil {
-			return TaskBoardRecoveryPreview{}, fmt.Errorf("task board authoring recovery service is not configured")
-		}
-		checkpoint, err := service.authoringRecovery.CurrentCheckpoint(ctx, request.RunID)
-		if err != nil {
-			return TaskBoardRecoveryPreview{}, err
-		}
-		plan, err = service.authoringRecovery.PreviewAuthoringRecovery(ctx, AuthoringRecoveryCommand{
-			CommandKey: commandKey,
-			RunID:      request.RunID,
-			Expected:   checkpoint,
-			Actor:      actor,
-			Reason:     request.Reason,
-		})
-		if err != nil {
-			return TaskBoardRecoveryPreview{}, err
-		}
+		return TaskBoardRecoveryPreview{}, fmt.Errorf("Standard authoring 3.0 runs have no recovery plan")
 	default:
 		return TaskBoardRecoveryPreview{}, fmt.Errorf("Run %s has no recovery preview contract", request.RunID)
 	}
@@ -1007,43 +974,6 @@ func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepa
 		return TaskBoardMutation{}, err
 	}
 	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Run 排队重试"}, nil
-}
-
-func (service *TaskBoardService) recoverAuthoringRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string, request TaskBoardRetryRunRequest) (TaskBoardMutation, error) {
-	if service.authoringRecovery == nil {
-		return TaskBoardMutation{}, fmt.Errorf("task board authoring recovery service is not configured")
-	}
-	if request.ExpectedRecoveryCheckpoint == nil || request.ExpectedRecoveryPlanFingerprint == "" {
-		return TaskBoardMutation{}, ErrTaskBoardRecoveryPreviewRequired
-	}
-	checkpoint := *request.ExpectedRecoveryCheckpoint
-	plan, err := service.authoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
-		CommandKey: prepared.IdempotencyKey,
-		RunID:      prepared.RunID,
-		Expected:   checkpoint,
-		Actor:      actor,
-		Reason:     prepared.Reason,
-	})
-	if err != nil {
-		if errors.Is(err, store.ErrOptimisticLock) {
-			return TaskBoardMutation{}, fmt.Errorf("%w: %v", ErrTaskBoardRecoveryPreviewStale, err)
-		}
-		return TaskBoardMutation{}, err
-	}
-	semanticFingerprint, err := plan.SemanticFingerprint()
-	if err != nil {
-		return TaskBoardMutation{}, fmt.Errorf("fingerprint confirmed authoring recovery plan: %w", err)
-	}
-	if semanticFingerprint != request.ExpectedRecoveryPlanFingerprint {
-		return TaskBoardMutation{}, fmt.Errorf("%w: recovery plan changed after preview", ErrTaskBoardRecoveryPreviewStale)
-	}
-	if _, err := service.authoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID()); err != nil {
-		return TaskBoardMutation{}, err
-	}
-	if err := service.FlushQueuedRuns(ctx); err != nil {
-		return TaskBoardMutation{}, err
-	}
-	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Standard 创题 Run 排队恢复"}, nil
 }
 
 // CancelRun records a durable termination request for the selected Run. A
@@ -1234,25 +1164,12 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 		run.RetryReason = "不可变 CodeEdge 子 Run 存在确定性内容问题；请创建修复 revision"
 		return run
 	}
-	if run.RetryStrategy == TaskBoardRetryStrategyAuthoringRecovery || run.RetryStrategy == TaskBoardRetryStrategyAuthoringAdmissionRepair {
-		if service == nil || service.authoringRecovery == nil {
-			run.RetryReason = "Standard 创题恢复服务未配置"
-			return run
-		}
-		canRecover, reason, err := service.authoringRecovery.CanRecover(ctx, inspected.Run.ID)
-		if err != nil {
-			run.RetryReason = "无法验证 Standard 创题恢复资格: " + err.Error()
-			return run
-		}
-		run.CanRetry, run.RetryReason = canRecover, reason
-		return run
-	}
 	run.CanRetry, run.RetryReason = taskBoardRetryAvailability(inspected.Run)
 	return run
 }
 
 // projectTaskBoardAuthoringContext exposes the contract-safe evidence view
-// required to operate a v2 authoring Run. All values are derived from the
+// required to inspect a 3.0 authoring Run. All values are derived from the
 // immutable root contract, repair ledger, and artifact references; it does
 // not create a second mutable task state.
 func (service *TaskBoardService) projectTaskBoardAuthoringContext(ctx context.Context, source store.WorkflowRun, destination *TaskBoardRun) {
@@ -1276,15 +1193,6 @@ func (service *TaskBoardService) projectTaskBoardAuthoringContext(ctx context.Co
 		CheckoutRoot: contract.Source.CheckoutRoot, BaseImage: contract.Environment.BaseImage, Objective: contract.Objective,
 		ProfileFingerprint: contract.Delivery.ProfileFingerprint, PackageFormat: contract.Delivery.PackageFormat,
 	}}
-	if entries, err := service.core.store.ListAuthoringRepairLedgerEntries(ctx, source.ID); err == nil {
-		evidence.Repairs = make([]TaskBoardAuthoringRepair, 0, len(entries))
-		for _, entry := range entries {
-			evidence.Repairs = append(evidence.Repairs, TaskBoardAuthoringRepair{
-				ID: entry.ID, TargetProducer: entry.TargetProducer, FindingKind: string(entry.FindingKind),
-				State: string(entry.State), EvidenceDigest: entry.EvidenceDigest,
-			})
-		}
-	}
 	evidence.Claims, evidence.Lineage = service.projectTaskBoardAuthoringArtifacts(ctx, source)
 	destination.AuthoringEvidence = evidence
 }
@@ -1317,16 +1225,14 @@ func (service *TaskBoardService) projectTaskBoardAuthoringArtifacts(ctx context.
 		}
 	}
 	claims := make([]TaskBoardAuthoringClaim, 0, 2)
-	for _, key := range []string{"task_proposal", "generated_task_files"} {
+	for _, key := range []string{"task_specification", "candidate_snapshot"} {
 		if _, found := latest[key]; found {
 			claims = append(claims, TaskBoardAuthoringClaim{ArtifactKey: key, State: "match"})
 		}
 	}
 	lineageKeys := []string{
-		"instruction", "task_toml", workflowadapter.StandardAuthoringValidatedDockerfileArtifact,
-		workflowadapter.StandardAuthoringValidatedSolveScriptArtifact, workflowadapter.StandardAuthoringValidatedTestScriptArtifact,
-		"tests_analysis", workflowadapter.StandardAuthoringDockerfileBuildReportArtifact,
-		workflowadapter.StandardAuthoringHarnessReportArtifact, "codeedge_package_admission_report",
+		"instruction", "task_toml", "dockerfile", "solve_script", "test_script", "tests_analysis",
+		"candidate_snapshot", "validation_receipt", "final_attestation", "codeedge_package_admission_report",
 	}
 	lineage := make([]TaskBoardAuthoringArtifact, 0, len(lineageKeys))
 	for _, key := range lineageKeys {
@@ -1352,11 +1258,6 @@ func taskBoardRetryStrategy(run store.WorkflowRun) TaskBoardRetryStrategy {
 	switch run.SubjectKind {
 	case store.WorkflowRunSubjectTaskRevision:
 		return TaskBoardRetryStrategyTaskContinuation
-	case store.WorkflowRunSubjectAuthoringSession:
-		if run.Status == store.WorkflowRunWaitingContinuation && isCurrentStandardAuthoringRun(run) {
-			return TaskBoardRetryStrategyAuthoringAdmissionRepair
-		}
-		return TaskBoardRetryStrategyAuthoringRecovery
 	default:
 		return TaskBoardRetryStrategyNone
 	}
@@ -1364,7 +1265,7 @@ func taskBoardRetryStrategy(run store.WorkflowRun) TaskBoardRetryStrategy {
 
 func taskBoardRetryAvailability(run store.WorkflowRun) (bool, string) {
 	if run.SubjectKind != store.WorkflowRunSubjectTaskRevision {
-		return false, "Standard 创题 Run 需要专用恢复流程"
+		return false, "Standard 创题 Run 不能恢复；请启动新的 source/session Run"
 	}
 	switch run.Status {
 	case store.WorkflowRunFailedRecoverable, store.WorkflowRunInterrupted, store.WorkflowRunCanceled,
@@ -1395,17 +1296,10 @@ type taskBoardDurableFailureDetails struct {
 // taskBoardDurableJobFailure selects the newest durable failure record rather
 // than reconstructing failure semantics from a Run status or worker log.
 func taskBoardDurableJobFailure(jobs []DurableJobInspection, stages []store.StageAttempt) *taskBoardDurableFailure {
-	durableJobs := make([]store.DurableJob, 0, len(jobs))
-	for _, inspected := range jobs {
-		durableJobs = append(durableJobs, inspected.Job)
-	}
 	var selected *store.DurableJob
 	for index := range jobs {
 		job := jobs[index].Job
 		if job.Failure == nil || (job.State != store.JobFailed && job.State != store.JobInDoubt) {
-			continue
-		}
-		if standardAuthoringHandoffFailureResolved(job, durableJobs) {
 			continue
 		}
 		if selected == nil || taskBoardDurableFailureTime(job).After(taskBoardDurableFailureTime(*selected)) ||
@@ -1428,7 +1322,7 @@ func taskBoardDurableJobFailure(jobs []DurableJobInspection, stages []store.Stag
 		ArtifactID:     taskBoardFailureArtifactID(*selected, details),
 		RecordedAt:     &recordedAt,
 		RecoveryAction: taskBoardFailureRecoveryAction(*selected),
-		CanRedrive:     taskBoardCanRedriveAuthoringHandoff(*selected),
+		CanRedrive:     false,
 	}
 	return result
 }
@@ -1475,25 +1369,9 @@ func taskBoardFailureRecoveryAction(job store.DurableJob) TaskBoardFailureRecove
 	case store.JobFailed:
 		return TaskBoardFailureRecoveryRepairOrNewRun
 	case store.JobInDoubt:
-		if taskBoardCanRedriveAuthoringHandoff(job) {
-			return TaskBoardFailureRecoveryRedriveAuthoringHandoff
-		}
 		return TaskBoardFailureRecoveryReconcile
 	default:
 		return TaskBoardFailureRecoveryNone
-	}
-}
-
-func taskBoardCanRedriveAuthoringHandoff(job store.DurableJob) bool {
-	if job.State != store.JobInDoubt || job.Failure == nil ||
-		(job.CommandType != standardAuthoringHandoffCommandType && job.CommandType != standardAuthoringHandoffRedriveCommandType && job.CommandType != standardAuthoringHandoffReconcileCommandType) {
-		return false
-	}
-	switch job.Failure.Code {
-	case handoffDefinitionUnavailableCode, handoffDefinitionInvalidCode, handoffStorageUnavailableCode:
-		return true
-	default:
-		return false
 	}
 }
 

@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -129,91 +128,5 @@ func TestRequirePlannedStageInputsMatchesExactSubset(t *testing.T) {
 	}
 	if err := requirePlannedStageInputs(transition, []workflowkit.ArtifactBinding{extra}); err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("missing planned input error = %v", err)
-	}
-}
-
-func TestContinuationValidationSkipsStagesAlreadyAdmittedByThisPlan(t *testing.T) {
-	ctx := context.Background()
-	fixture, decisionRef, _ := newAuthoringTaskReviewRepairFixture(t, ctx)
-	checkpoint, err := fixture.services.AuthoringRecovery.CurrentCheckpoint(ctx, fixture.run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := fixture.services.AuthoringRecovery.PlanAuthoringRecovery(ctx, AuthoringRecoveryCommand{
-		CommandKey: authoringRecoveryUUID(t), RunID: fixture.run.ID, Expected: checkpoint,
-		Actor: "operator", Reason: "freeze task review repair inputs",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	execution, err := fixture.services.AuthoringRecovery.ExecuteAuthoringRecovery(ctx, plan.ID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	run, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
-	if err != nil || run == nil {
-		t.Fatalf("read committed recovery run = %+v, %v", run, err)
-	}
-	frozen, err := decodeFrozenRunDefinition(*run)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime := &FrozenExecutionRuntime{core: fixture.services.core, services: fixture.services}
-	runtimePlan, err := continuationRuntimeExecutionPlan(plan, frozen.Workflow, frozen.QuotaPolicy, execution.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	type scheduledStage struct {
-		stage      workflowkit.StageDescriptor
-		transition workflowkit.NodeTransition
-	}
-	var scheduled []scheduledStage
-	for _, stage := range runtimePlan.Workflow.Stages {
-		transition, found := runtimePlan.stageTransition(stage.Key)
-		if !found || transition.Disposition != workflowkit.DispositionSchedule || len(transition.InputBindings) == 0 {
-			continue
-		}
-		scheduled = append(scheduled, scheduledStage{stage: stage, transition: transition})
-	}
-	if len(scheduled) < 2 {
-		t.Fatalf("fixture continuation has %d required scheduled stages; need a pending stage", len(scheduled))
-	}
-	admit := func(candidate scheduledStage) {
-		t.Helper()
-		fingerprint, err := workflowkit.FingerprintArtifactBindings(candidate.transition.InputBindings)
-		if err != nil {
-			t.Fatal(err)
-		}
-		attempt, err := runtime.findOrCreatePlannedStageAttempt(ctx, *run, runtimePlan, candidate.stage, candidate.transition, fingerprint, "operator")
-		if err != nil {
-			t.Fatalf("admit %q: %v", candidate.stage.Key, err)
-		}
-		attempt, err = fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
-			StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionRunning,
-			Actor: "operator", Reason: "mark frozen stage as running",
-		})
-		if err != nil {
-			t.Fatalf("start %q: %v", candidate.stage.Key, err)
-		}
-		if _, err := fixture.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
-			StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionCompleted,
-			Verdict: store.VerdictPass, Actor: "operator", Reason: "mark frozen stage as completed",
-		}); err != nil {
-			t.Fatalf("complete %q: %v", candidate.stage.Key, err)
-		}
-	}
-	admit(scheduled[0])
-	removeAuthoringRecoveryArtifactObject(t, ctx, fixture, decisionRef)
-	if err := validateRequiredContinuationInputs(ctx, fixture.services.core, *run, runtimePlan); err == nil {
-		t.Fatal("strict pre-commit validation unexpectedly ignored changed input")
-	}
-	if err := runtime.validateRemainingRequiredContinuationInputs(ctx, *run, runtimePlan); err == nil {
-		t.Fatal("continuation re-entry ignored drift for a stage that was not admitted")
-	}
-	for _, candidate := range scheduled[1:] {
-		admit(candidate)
-	}
-	if err := runtime.validateRemainingRequiredContinuationInputs(ctx, *run, runtimePlan); err != nil {
-		t.Fatalf("continuation re-entry rejected only already admitted stages: %v", err)
 	}
 }

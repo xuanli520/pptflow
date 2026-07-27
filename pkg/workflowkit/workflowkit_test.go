@@ -69,6 +69,116 @@ func TestWorkflowDescriptorFingerprintIsCanonicalAndDAGValidated(t *testing.T) {
 	}
 }
 
+func TestStageDescriptorWorkspaceBindingRequiresFrozenSnapshotInput(t *testing.T) {
+	stage := testStage("workspace", nil, EffectContentProducer, nil, []ResourceKey{"candidate/output"})
+	stage.Inputs = []ArtifactSpec{
+		{Name: "candidate_snapshot", SchemaVersion: "candidate/v1", Required: true},
+		{Name: "optional_snapshot", SchemaVersion: "candidate/v1", Required: false},
+	}
+
+	tests := []struct {
+		name    string
+		binding WorkspaceBinding
+		valid   bool
+	}{
+		{name: "implicit none", valid: true},
+		{name: "explicit none", binding: WorkspaceBinding{Mode: WorkspaceNone}, valid: true},
+		{
+			name: "read only snapshot",
+			binding: WorkspaceBinding{
+				Mode: WorkspaceReadOnlySnapshot, Key: "candidate/main", SnapshotArtifact: "candidate_snapshot",
+			},
+			valid: true,
+		},
+		{
+			name: "exclusive writer",
+			binding: WorkspaceBinding{
+				Mode: WorkspaceExclusiveWriter, Key: "candidate/main", SnapshotArtifact: "candidate_snapshot",
+			},
+			valid: true,
+		},
+		{
+			name: "unknown mode",
+			binding: WorkspaceBinding{
+				Mode: "shared_writer", Key: "candidate/main", SnapshotArtifact: "candidate_snapshot",
+			},
+		},
+		{
+			name:    "none with key",
+			binding: WorkspaceBinding{Mode: WorkspaceNone, Key: "candidate/main"},
+		},
+		{
+			name:    "snapshot mode missing key",
+			binding: WorkspaceBinding{Mode: WorkspaceReadOnlySnapshot, SnapshotArtifact: "candidate_snapshot"},
+		},
+		{
+			name:    "snapshot mode missing artifact",
+			binding: WorkspaceBinding{Mode: WorkspaceReadOnlySnapshot, Key: "candidate/main"},
+		},
+		{
+			name: "snapshot artifact not declared",
+			binding: WorkspaceBinding{
+				Mode: WorkspaceReadOnlySnapshot, Key: "candidate/main", SnapshotArtifact: "other_snapshot",
+			},
+		},
+		{
+			name: "snapshot artifact optional",
+			binding: WorkspaceBinding{
+				Mode: WorkspaceExclusiveWriter, Key: "candidate/main", SnapshotArtifact: "optional_snapshot",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := stage.Clone()
+			candidate.Concurrency = &ConcurrencyPolicy{Workspace: test.binding}
+			err := candidate.Validate()
+			if test.valid && err != nil {
+				t.Fatalf("validate workspace binding: %v", err)
+			}
+			if !test.valid && !errors.Is(err, ErrInvalidDescriptor) {
+				t.Fatalf("workspace binding error = %v, want ErrInvalidDescriptor", err)
+			}
+		})
+	}
+}
+
+func TestWorkflowDescriptorWorkspaceBindingCanonicalizesNoneAndChangesFingerprint(t *testing.T) {
+	implicitNone := testWorkflow(t)
+	explicitNone := implicitNone.Clone()
+	explicitNone.Stages[0].Concurrency = &ConcurrencyPolicy{Workspace: WorkspaceBinding{Mode: WorkspaceNone}}
+	implicitFingerprint, err := implicitNone.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint implicit workspace none: %v", err)
+	}
+	explicitFingerprint, err := explicitNone.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint explicit workspace none: %v", err)
+	}
+	if implicitFingerprint != explicitFingerprint {
+		t.Fatalf("implicit and explicit workspace none fingerprints differ: %q != %q", implicitFingerprint, explicitFingerprint)
+	}
+
+	withWorkspace := implicitNone.Clone()
+	withWorkspace.Stages[0].Inputs = []ArtifactSpec{{Name: "source_snapshot", SchemaVersion: "source/v1", Required: true}}
+	withWorkspace.Stages[0].Concurrency = &ConcurrencyPolicy{Workspace: WorkspaceBinding{
+		Mode: WorkspaceExclusiveWriter, Key: "source/main", SnapshotArtifact: "source_snapshot",
+	}}
+	workspaceFingerprint, err := withWorkspace.Fingerprint()
+	if err != nil {
+		t.Fatalf("fingerprint workspace-bound descriptor: %v", err)
+	}
+	if workspaceFingerprint == implicitFingerprint {
+		t.Fatal("workspace binding did not change the workflow fingerprint")
+	}
+
+	clone := withWorkspace.Clone()
+	if clone.Stages[0].Concurrency == nil || clone.Stages[0].Concurrency.Workspace != withWorkspace.Stages[0].Concurrency.Workspace {
+		t.Fatalf("descriptor clone lost workspace binding: %#v", clone.Stages[0].Concurrency)
+	}
+}
+
 func TestExecutionStateAndOutcomeSeparateMechanicsFromVerdict(t *testing.T) {
 	if !CanTransitionExecution(StatusRunning, StatusCompleted) {
 		t.Fatal("running -> completed should be legal")

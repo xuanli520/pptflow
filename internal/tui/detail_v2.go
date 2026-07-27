@@ -209,10 +209,8 @@ func (d *detailModel) currentRunFields(width int) string {
 	}
 	retry := "可用"
 	retryLabel := "重试"
-	if run.RetryStrategy == app.TaskBoardRetryStrategyAuthoringRecovery {
+	if run.RetryStrategy == app.TaskBoardRetryStrategyTaskContinuation {
 		retryLabel = "断点恢复"
-	} else if run.RetryStrategy == app.TaskBoardRetryStrategyAuthoringAdmissionRepair {
-		retryLabel = "修复并继续"
 	}
 	if !run.CanRetry {
 		retry = run.RetryReason
@@ -251,13 +249,6 @@ func (d *detailModel) currentRunFields(width int) string {
 		)
 		for _, claim := range evidence.Claims {
 			fields = append(fields, detailField("声明比对", claim.ArtifactKey+" = "+claim.State, width))
-		}
-		for _, repair := range evidence.Repairs {
-			fields = append(fields,
-				detailField("修复账本", repair.TargetProducer+" / "+repair.State, width),
-				detailField("修复类型", repair.FindingKind, width),
-				detailField("修复证据", repair.EvidenceDigest, width),
-			)
 		}
 		for _, artifact := range evidence.Lineage {
 			fields = append(fields,
@@ -311,10 +302,6 @@ func detailFailureRecoveryAction(run *TaskRunItem) string {
 		return ""
 	}
 	switch run.FailureRecoveryAction {
-	case app.TaskBoardFailureRecoveryRedriveAuthoringHandoff:
-		if run.CanRedrive {
-			return "显式 redrive"
-		}
 	case app.TaskBoardFailureRecoveryReconcile:
 		return "显式 reconcile"
 	case app.TaskBoardFailureRecoveryRepairOrNewRun:

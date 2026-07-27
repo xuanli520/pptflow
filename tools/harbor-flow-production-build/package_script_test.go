@@ -127,7 +127,7 @@ func newProductionPackageFixture(t *testing.T) productionPackageFixture {
 
 	writeProductionBundleFixture(t, root, "standard-authoring", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json", "contract-assets.v1.json", "execution-profile.v1.json",
-		"prompts/task-design.json", "schemas/codex-fixed-file-submit.schema.json", "schemas/codex-stage-output.schema.json",
+		"prompts/authoring-loop.json", "schemas/v3-agent-output.schema.json", "schemas/materialization-receipt.json",
 	})
 	writeProductionBundleFixture(t, root, "codeedge-phase1", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json",
@@ -368,16 +368,16 @@ func assertUnifiedProductionPackage(t *testing.T, fixture productionPackageFixtu
 	if _, err := os.Stat(filepath.Join(output, "deployments", "codeedge-evaluator-child", "candidates")); !os.IsNotExist(err) {
 		t.Fatalf("candidate discovery directory was packaged: %v", err)
 	}
-	sourceFixedSchema, err := os.ReadFile(filepath.Join(fixture.root, "deployments", "standard-authoring", "schemas", "codex-fixed-file-submit.schema.json"))
+	sourceAgentSchema, err := os.ReadFile(filepath.Join(fixture.root, "deployments", "standard-authoring", "schemas", "v3-agent-output.schema.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	packagedFixedSchema, err := os.ReadFile(filepath.Join(output, "deployments", "standard-authoring", "schemas", "codex-fixed-file-submit.schema.json"))
+	packagedAgentSchema, err := os.ReadFile(filepath.Join(output, "deployments", "standard-authoring", "schemas", "v3-agent-output.schema.json"))
 	if err != nil {
-		t.Fatalf("canonical Standard authoring package lacks fixed-file schema: %v", err)
+		t.Fatalf("canonical Standard authoring package lacks V3 agent schema: %v", err)
 	}
-	if !bytes.Equal(packagedFixedSchema, sourceFixedSchema) {
-		t.Fatal("canonical packaged fixed-file schema does not match the v2 source asset")
+	if !bytes.Equal(packagedAgentSchema, sourceAgentSchema) {
+		t.Fatal("canonical packaged V3 agent schema does not match the source asset")
 	}
 }
 
@@ -395,9 +395,9 @@ func productionPackagePayloads() []string {
 		"deployments/standard-authoring/execution-profile.v1.json",
 		"deployments/standard-authoring/operation-catalog.lock.json",
 		"deployments/standard-authoring/operation-catalog.v1.json",
-		"deployments/standard-authoring/prompts/task-design.json",
-		"deployments/standard-authoring/schemas/codex-fixed-file-submit.schema.json",
-		"deployments/standard-authoring/schemas/codex-stage-output.schema.json",
+		"deployments/standard-authoring/prompts/authoring-loop.json",
+		"deployments/standard-authoring/schemas/materialization-receipt.json",
+		"deployments/standard-authoring/schemas/v3-agent-output.schema.json",
 		"harbor-factory",
 		productionPackageArchiveName,
 	}

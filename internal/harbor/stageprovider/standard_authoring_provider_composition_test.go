@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
-	"github.com/purplevoid/harbor-factory/internal/testsupport"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -151,26 +150,16 @@ func TestStandardAuthoringProviderCompositionRejectsDriftingCodexConfigurationAf
 func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOperationCatalogResolver, DeploymentOperationCatalogLock, workflowadapter.StageOperationResolution) {
 	t.Helper()
 	fixture := newCodexAppServerAttestationFixture(t)
-	specification := testsupport.CompleteRunExecutionSpec(
-		"018f0a73-3b49-7000-8000-0000000000a1",
-		"018f0a73-3b49-7000-8000-0000000000a2",
-		"harbor.task.v2:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-	)
-	resolution, err := specification.ResolveStageOperation(workflowadapter.RepoAnalyze)
-	if err != nil {
-		t.Fatal(err)
-	}
-	definition, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowadapter.RepoAnalyze)
+	definition, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.RepoStructureResearch))
 	if !found {
-		t.Fatal("missing Standard authoring repo_analyze stage")
+		t.Fatal("missing Standard authoring repo_structure_research stage")
 	}
 	provider := workflowadapter.ProviderReference{ID: StandardAuthoringProviderID, Kind: StandardAuthoringProviderKind, Version: StandardAuthoringProviderVersion}
 	payload := workflowadapter.AgentTurnOperationPayload{
 		AgentID: "codex-app-server", ModelID: CodexAppServerProductionModelID,
 		ReasoningEffort: CodexAppServerProductionReasoningEffort, MaxTurns: 3,
 	}
-	resolution.Provider = provider
-	resolution.Operation = workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "standard-authoring.codex.repo-analyze", Version: "1.0.0", Payload: payload}
+	resolution := standardAuthoringCompositionResolution(definition, provider, workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "standard-authoring.codex.repo-structure-research", Version: "3.0.0", Payload: payload})
 	registration := DeploymentOperationRegistration{
 		Stage:    DeploymentStageContract{Key: resolution.StageKey, Type: resolution.StageType, Group: definition.Group, Plugin: resolution.Plugin},
 		Provider: resolution.Provider, Operation: resolution.Operation.Clone(), Runtime: resolution.Runtime,
@@ -201,8 +190,8 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 			},
 			CodexAppServer: &codex,
 			StandardAuthoringContract: &StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion,
-				Prompt: StandardAuthoringContractAssetReference{ID: "standard-authoring.repo-analyze.prompt", Version: "1.0.0", RelativePath: "prompts/repo-analyze.json"},
-				Schema: StandardAuthoringContractAssetReference{ID: "standard-authoring.codex-stage-output-schema", Version: "1.0.0", RelativePath: "schemas/codex-stage-output.schema.json"}},
+				Prompt: StandardAuthoringContractAssetReference{ID: "standard-authoring.repo-structure-research.prompt", Version: "3.0.0", RelativePath: "prompts/repo-structure-research.json"},
+				Schema: StandardAuthoringContractAssetReference{ID: "standard-authoring.v3-agent-output-schema", Version: "1.0.0", RelativePath: "schemas/v3-agent-output.schema.json"}},
 		}},
 	}
 	return catalog, lock, resolution
@@ -210,25 +199,18 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 
 func standardAuthoringProviderCompositionFixture(t *testing.T) (*DeploymentOperationCatalogResolver, DeploymentOperationCatalogLock, []workflowadapter.StageOperationResolution) {
 	t.Helper()
-	specification := testsupport.CompleteRunExecutionSpec(
-		"018f0a73-3b49-7000-8000-000000000091",
-		"018f0a73-3b49-7000-8000-000000000092",
-		"harbor.task.v2:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-	)
-	builtin, err := specification.ResolveStageOperation(workflowadapter.MaterializeTask)
-	if err != nil {
-		t.Fatal(err)
-	}
-	review, err := specification.ResolveStageOperation(workflowadapter.TaskReview)
-	if err != nil {
-		t.Fatal(err)
-	}
 	provider := workflowadapter.ProviderReference{ID: StandardAuthoringProviderID, Kind: StandardAuthoringProviderKind, Version: StandardAuthoringProviderVersion}
-	builtin.Provider, review.Provider = provider, provider
-	builtin.Operation.ProviderID, review.Operation.ProviderID = provider.ID, provider.ID
-	builtin.Operation.Payload = workflowadapter.HarborBuiltinOperationPayload{HandlerID: "standard-authoring.materialize-task"}
-
 	standard := workflowadapter.StandardAuthoringContractStageCatalog()
+	builtinDefinition, found := standard.Stage(workflowkit.StageKey(workflowadapter.MaterializeTask))
+	if !found {
+		t.Fatal("missing Standard authoring materialize_task stage")
+	}
+	reviewDefinition, found := standard.Stage(workflowkit.StageKey(workflowadapter.TaskReview))
+	if !found {
+		t.Fatal("missing Standard authoring task_review stage")
+	}
+	builtin := standardAuthoringCompositionResolution(builtinDefinition, provider, workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "standard-authoring.materialize-task", Version: "3.0.0", Payload: workflowadapter.HarborBuiltinOperationPayload{HandlerID: "standard-authoring.materialize-task"}})
+	review := standardAuthoringCompositionResolution(reviewDefinition, provider, workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "standard-authoring.review.task", Version: "3.0.0", Payload: workflowadapter.DurableReviewOperationPayload{PolicyID: "standard-authoring.task-review.v3"}})
 	registrations := make([]DeploymentOperationRegistration, 0, 2)
 	for _, resolution := range []workflowadapter.StageOperationResolution{builtin, review} {
 		definition, found := standard.Stage(resolution.StageKey)
@@ -288,6 +270,15 @@ func standardAuthoringProviderCompositionFixture(t *testing.T) (*DeploymentOpera
 		},
 	}
 	return catalog, lock, []workflowadapter.StageOperationResolution{builtin, review}
+}
+
+func standardAuthoringCompositionResolution(definition workflowadapter.StageDefinition, provider workflowadapter.ProviderReference, operation workflowadapter.StageOperationBinding) workflowadapter.StageOperationResolution {
+	return workflowadapter.StageOperationResolution{
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), StageKey: definition.Key, StageType: workflowadapter.StageBindingType(definition.Key),
+		Plugin: workflowkit.PluginBinding{ID: definition.Plugin.ID, Version: definition.Plugin.Version}, Provider: provider, Operation: operation,
+		Checkout: workflowadapter.CheckoutReference{ID: "authoring-source-snapshot", RevisionID: "018f0a73-3b49-7000-8000-000000000091", RevisionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		Runtime:  workflowadapter.RuntimeReference{ID: "standard-authoring-controlled", Kind: "controlled", Version: "3.0.0"},
+	}
 }
 
 func writeStandardAuthoringContractAssets(t *testing.T, root string, lock DeploymentOperationCatalogLock) {

@@ -121,47 +121,6 @@ type AuthoringTaskMaterialization struct {
 	CreatedAt          time.Time
 }
 
-// AuthoringPhase1Handoff is the immutable one-to-one bridge from a persisted
-// Standard materialize_task artifact to its task-bound CodeEdge Phase-1 Run.
-// ChildRunID is reserved by this durable record before the Run is created, so
-// a retry, replay, or competing caller cannot manufacture a second child for
-// the same authoring materialization.
-type AuthoringPhase1Handoff struct {
-	ID                 string
-	AuthoringRunID     string
-	AuthoringSessionID string
-	AuthoringSourceID  string
-	HandoffArtifactID  string
-	HandoffFingerprint string
-	TaskID             string
-	RevisionID         string
-	TaskDigest         string
-	ChildRunID         string
-	IdempotencyKey     string
-	CreatedBy          string
-	CreatedAt          time.Time
-}
-
-// PrepareAuthoringPhase1HandoffRequest writes the immutable bridge before
-// child Run creation. Its source facts are checked both by application code
-// and a Store binding trigger; callers cannot point a task-bound Run at an
-// arbitrary authoring artifact or a different session's materialization.
-type PrepareAuthoringPhase1HandoffRequest struct {
-	ID                 string
-	AuthoringRunID     string
-	AuthoringSessionID string
-	AuthoringSourceID  string
-	HandoffArtifactID  string
-	HandoffFingerprint string
-	TaskID             string
-	RevisionID         string
-	TaskDigest         string
-	ChildRunID         string
-	IdempotencyKey     string
-	Actor              string
-	Reason             string
-}
-
 // MaterializeAuthoringTaskRequest atomically creates the first sealed,
 // generated revision of the draft task pre-bound to AuthoringSession. The
 // caller cannot select another task, parent revision, origin, or state.

@@ -29,7 +29,7 @@ func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
 		{name: "through 1.5", trigger: legacyV15AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV15ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
 		{name: "through 1.6", trigger: legacyV16AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV16ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
 		{name: "through 1.7", trigger: legacyV17AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV17ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
-		{name: "through 1.8", trigger: currentTrigger, fingerprint: legacyV18ConsolidatedV2SchemaContractFingerprint},
+		{name: "through 1.8", trigger: legacyV18AuthoringPhase1HandoffTrigger(currentTrigger), fingerprint: legacyV18ConsolidatedV2SchemaContractFingerprint, expectsLegacyTrigger: true},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -99,9 +99,7 @@ func TestUpgradeLegacySchemaRefusesUnfinishedWorkflowRunWithoutMutation(t *testi
 	if activeRun.Status != WorkflowRunQueued {
 		t.Fatalf("fixture Run status = %s, want %s", activeRun.Status, WorkflowRunQueued)
 	}
-	if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
-		t.Fatal(err)
-	}
+	prepareLegacyV18SchemaUpgradeFixture(t, store)
 	legacyContract, err := sqliteSchemaContract(store.db)
 	if err != nil {
 		t.Fatal(err)
@@ -164,9 +162,7 @@ func TestLegacySchemaUpgradeTransactionRefusesUnfinishedWorkflowRun(t *testing.T
 	ctx := context.Background()
 	store := tempDB(t)
 	_, _, activeRun := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
-	if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
-		t.Fatal(err)
-	}
+	prepareLegacyV18SchemaUpgradeFixture(t, store)
 	legacyContract, err := sqliteSchemaContract(store.db)
 	if err != nil {
 		t.Fatal(err)
@@ -244,9 +240,7 @@ func TestUpgradeLegacyV18SchemaRejectsDuplicateEvaluatorChildrenWithoutPartialUp
 	root := store.rootDir
 	task, revision, parent := schemaUpgradeEvaluatorParentFixture(t, ctx, store)
 	_ = schemaUpgradeEvaluatorChildFixture(t, ctx, store, task, revision, parent, "first")
-	if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
-		t.Fatal(err)
-	}
+	prepareLegacyV18SchemaUpgradeFixture(t, store)
 	if _, err := schemaUpgradeEvaluatorChild(ctx, store, task, revision, parent, "legacy-duplicate"); err != nil {
 		t.Fatalf("create legacy duplicate evaluator child: %v", err)
 	}
@@ -397,22 +391,34 @@ func legacyV16AuthoringPhase1HandoffTrigger(current string) string {
 }
 
 func legacyV17AuthoringPhase1HandoffTrigger(current string) string {
-	return strings.Replace(current,
+	return strings.Replace(legacyV18AuthoringPhase1HandoffTrigger(current),
 		"          OR\n          (run.workflow_template_version = '1.8.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n",
 		"",
 		1,
 	)
 }
 
-func TestAuthoringPhase1HandoffLineageConstraintIsDetected(t *testing.T) {
-	if !isAuthoringPhase1HandoffLineageConstraint(assertionError("constraint failed: authoring Phase-1 handoff does not match persisted materialization lineage (1811)")) {
-		t.Fatal("SQLite authoring handoff lineage trigger was not recognized")
-	}
-	if isAuthoringPhase1HandoffLineageConstraint(assertionError("database is temporarily unavailable")) {
-		t.Fatal("generic storage failure was classified as a lineage constraint")
-	}
+func legacyV18AuthoringPhase1HandoffTrigger(current string) string {
+	return strings.Replace(current,
+		"      AND run.workflow_template_version = '2.0.0'\n      AND artifact.schema_version = 'harbor.authoring-task-handoff.v2'",
+		"      AND (\n          (run.workflow_template_version = '1.2.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v1')\n          OR\n          (run.workflow_template_version = '1.3.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.4.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.5.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.6.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.7.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n          OR\n          (run.workflow_template_version = '1.8.0' AND artifact.schema_version = 'harbor.authoring-task-handoff.v2')\n      )",
+		1,
+	)
 }
 
-type assertionError string
-
-func (err assertionError) Error() string { return string(err) }
+func prepareLegacyV18SchemaUpgradeFixture(t *testing.T, store *Store) {
+	t.Helper()
+	currentTrigger, err := currentAuthoringPhase1HandoffTriggerSQL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DROP INDEX ` + codeEdgeEvaluatorParentIndexName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DROP TRIGGER ` + authoringPhase1HandoffTriggerName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(legacyV18AuthoringPhase1HandoffTrigger(currentTrigger)); err != nil {
+		t.Fatal(err)
+	}
+}

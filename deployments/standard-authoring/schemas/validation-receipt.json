@@ -1,0 +1,1 @@
+{"format":"workflowkit.validation-receipt.v1","version":"1","fields":["candidate_digest","runtime_contract_digest","verification_contract_digest","verdict","diagnostics"]}

@@ -572,6 +572,13 @@ func validateSchedule(batches []ScheduleBatch, workflow WorkflowDescriptor, tran
 				}
 			}
 		}
+		stages := make([]StageDescriptor, 0, len(batch.NodeIDs))
+		for _, nodeID := range batch.NodeIDs {
+			stages = append(stages, stageByID[nodeID])
+		}
+		if err := ValidateConcurrentStages(stages); err != nil {
+			return fmt.Errorf("%w: schedule batch %q: %v", ErrInvalidContinuationPlan, batch.ID, err)
+		}
 	}
 	for nodeID, transition := range transitions {
 		_, scheduled := batchForNode[nodeID]

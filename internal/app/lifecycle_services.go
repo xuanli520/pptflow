@@ -43,13 +43,10 @@ type LifecycleServices struct {
 	Control          *ExecutionControlService
 	Budgets          *BudgetGrantService
 	Continuations    *TaskContinuationService
-	// AuthoringRecovery resumes a failed pre-materialization Standard
-	// authoring source/session Run with its frozen definition.
-	AuthoringRecovery *AuthoringRecoveryService
-	Changes           *ChangeProviderService
-	Repairs           *RepairLoopService
-	Candidates        *CandidateRetentionService
-	Inspection        *LifecycleInspectionService
+	Changes          *ChangeProviderService
+	Repairs          *RepairLoopService
+	Candidates       *CandidateRetentionService
+	Inspection       *LifecycleInspectionService
 	// TaskBoard is the compact application boundary consumed by the terminal
 	// task board. It projects durable state and delegates its mutations to the
 	// existing authoring, review, and activation services.
@@ -65,14 +62,8 @@ type LifecycleServices struct {
 	Mutations         *LifecycleMutationService
 	EvaluatorLaunches *CodeEdgeEvaluatorLaunchService
 	// AuthoringLaunches owns source capture and the source/session half of a
-	// Standard task creation. It is distinct from StandardAuthoringHandoffs:
-	// launch has no task revision yet, while handoff starts only after the
-	// materialize_task receipt has created one.
+	// Standard task creation.
 	AuthoringLaunches *StandardAuthoringLaunchService
-	// StandardAuthoringHandoffs owns the only durable bridge from a persisted
-	// pre-materialization authoring receipt to an independent CodeEdge Phase-1
-	// task-revision Run. It never accepts a caller-created profile or spec.
-	StandardAuthoringHandoffs *StandardAuthoringHandoffService
 	// EvaluatorEvidenceHandoffs records the immutable, verified bridge from a
 	// completed CodeEdge evaluator child Run to its approved Phase-1 parent.
 	// It is deliberately separate from launch and compliance: it never starts
@@ -163,11 +154,6 @@ type LifecycleServicesOptions struct {
 	// rest of the lifecycle control plane.
 	StandardAuthoringSourceCapturer        StandardAuthoringSourceCapturer
 	StandardAuthoringRunDefinitionProvider StandardAuthoringRunDefinitionProvider
-	// CodeEdgePhase1RunDefinitionProvider supplies the closed task-bound
-	// parent definition consumed after Standard authoring has persisted its
-	// materialization handoff. It is deliberately separate from the evaluator
-	// child provider: their templates and catalog/lock receipts are distinct.
-	CodeEdgePhase1RunDefinitionProvider CodeEdgePhase1RunDefinitionProvider
 	// CodeEdgeEvaluatorObserver is the deployment-owned, read-only recovery
 	// port for an already-started Qwen or Opus evaluator. It is optional for
 	// read/control-plane and test compositions; without it the runtime retains
@@ -242,7 +228,6 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	}
 	activations := &RunActivationService{core: core, launcher: options.RunWorkerHandoffLauncher}
 	continuations := newTaskContinuationService(core)
-	authoringRecovery := newAuthoringRecoveryService(core)
 	changes := newChangeProviderService(core)
 	for _, provider := range options.ChangeProviders {
 		changes.Register(provider)
@@ -257,7 +242,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
 	evaluatorLaunches := &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider}
 	evaluatorEvidenceHandoffs := &CodeEdgeEvaluatorEvidenceHandoffService{core: core}
-	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control, authoringRecovery, evaluatorLaunches, evaluatorEvidenceHandoffs, options.RunWorkerHandoffLauncher)
+	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control, evaluatorLaunches, evaluatorEvidenceHandoffs, options.RunWorkerHandoffLauncher)
 	services := &LifecycleServices{
 		Tasks:                     &TaskService{core: core},
 		Revisions:                 &RevisionService{core: core},
@@ -269,7 +254,6 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		Control:                   control,
 		Budgets:                   &BudgetGrantService{core: core},
 		Continuations:             continuations,
-		AuthoringRecovery:         authoringRecovery,
 		Changes:                   changes,
 		Repairs:                   repairs,
 		Candidates:                &CandidateRetentionService{core: core},
@@ -282,7 +266,6 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		Mutations:                 mutations,
 		EvaluatorLaunches:         evaluatorLaunches,
 		AuthoringLaunches:         authoringLaunches,
-		StandardAuthoringHandoffs: &StandardAuthoringHandoffService{core: core, definitions: options.CodeEdgePhase1RunDefinitionProvider},
 		EvaluatorEvidenceHandoffs: evaluatorEvidenceHandoffs,
 		core:                      core,
 	}
@@ -1065,15 +1048,10 @@ type StartRunRequest struct {
 	// the configured catalog-lock identity when the resolver provides one.
 	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
 	ParentRunID                   string
-	// authoringPhase1HandoffID is populated only by StandardAuthoringHandoffService
-	// after it has verified the persisted handoff artifact and prepared the
-	// unique Store bridge. It is deliberately not exported to CLI/TUI callers;
-	// generic StartRun rejects an AuthoringSession parent without it.
-	authoringPhase1HandoffID string
-	Trigger                  string
-	ExecutionEpoch           int
-	Actor                    string
-	Reason                   string
+	Trigger                       string
+	ExecutionEpoch                int
+	Actor                         string
+	Reason                        string
 }
 
 type runManifest struct {
@@ -1196,7 +1174,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if strings.TrimSpace(request.Trigger) == "" {
 		return store.WorkflowRun{}, fmt.Errorf("run trigger is required")
 	}
-	if err := service.validateAuthoringPhase1Parent(ctx, request); err != nil {
+	if err := service.validateRunParent(ctx, request); err != nil {
 		return store.WorkflowRun{}, err
 	}
 	template, err := resolveFrozenRunTemplate(request.Profile, request.ExecutionSpec)
@@ -1418,22 +1396,21 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		}
 	}
 	run, err := service.core.store.CreateWorkflowRun(ctx, store.CreateWorkflowRunRequest{
-		ID:                       runID,
-		TaskID:                   request.TaskID,
-		RevisionID:               request.RevisionID,
-		WorkflowTemplateID:       resolved.TemplateID,
-		WorkflowTemplateVersion:  resolved.TemplateVersion,
-		ResolvedProfileHash:      string(resolved.ExecutionProfileFingerprint),
-		DefinitionHash:           string(resolved.DefinitionFingerprint),
-		RunManifestJSON:          string(encoded),
-		ParentRunID:              request.ParentRunID,
-		AuthoringPhase1HandoffID: request.authoringPhase1HandoffID,
-		Trigger:                  request.Trigger,
-		ExecutionEpoch:           request.ExecutionEpoch,
-		Actor:                    request.Actor,
-		Reason:                   request.Reason,
-		InitialInputArtifacts:    initialInputs,
-		Dispatch:                 &dispatch,
+		ID:                      runID,
+		TaskID:                  request.TaskID,
+		RevisionID:              request.RevisionID,
+		WorkflowTemplateID:      resolved.TemplateID,
+		WorkflowTemplateVersion: resolved.TemplateVersion,
+		ResolvedProfileHash:     string(resolved.ExecutionProfileFingerprint),
+		DefinitionHash:          string(resolved.DefinitionFingerprint),
+		RunManifestJSON:         string(encoded),
+		ParentRunID:             request.ParentRunID,
+		Trigger:                 request.Trigger,
+		ExecutionEpoch:          request.ExecutionEpoch,
+		Actor:                   request.Actor,
+		Reason:                  request.Reason,
+		InitialInputArtifacts:   initialInputs,
+		Dispatch:                &dispatch,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrIdentityCollision) {
@@ -1599,20 +1576,15 @@ func (service *RunService) validateRunExecutionSpec(ctx context.Context, request
 	return canonical, fingerprint, nil
 }
 
-// validateAuthoringPhase1Parent prevents the generic StartRun surface from
-// turning a source/session Run into an arbitrary task-bound parent. Only the
-// private handoff service may supply the already-prepared Store bridge; the
-// Store repeats this proof atomically with workflow_runs insertion.
-func (service *RunService) validateAuthoringPhase1Parent(ctx context.Context, request StartRunRequest) error {
+// validateRunParent rejects any child Run rooted in a pre-materialization
+// authoring session. Standard Authoring 3.0 materializes a task but never
+// dispatches a child Run from that session.
+func (service *RunService) validateRunParent(ctx context.Context, request StartRunRequest) error {
 	if service == nil || service.core == nil || service.core.store == nil {
 		return fmt.Errorf("run service is not configured")
 	}
 	parentID := strings.TrimSpace(request.ParentRunID)
-	handoffID := strings.TrimSpace(request.authoringPhase1HandoffID)
 	if parentID == "" {
-		if handoffID != "" {
-			return fmt.Errorf("authoring Phase-1 handoff requires a parent Run")
-		}
 		return nil
 	}
 	parent, err := service.core.store.GetWorkflowRun(ctx, parentID)
@@ -1622,24 +1594,8 @@ func (service *RunService) validateAuthoringPhase1Parent(ctx context.Context, re
 	if parent == nil {
 		return fmt.Errorf("%w: parent workflow Run %s", ErrLifecycleNotFound, parentID)
 	}
-	if parent.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
-		if handoffID != "" {
-			return fmt.Errorf("authoring Phase-1 handoff requires an AuthoringSession parent")
-		}
-		return nil
-	}
-	if handoffID == "" {
-		return fmt.Errorf("authoring parent requires a persisted Phase-1 handoff")
-	}
-	handoff, err := service.core.store.GetAuthoringPhase1Handoff(ctx, handoffID)
-	if err != nil {
-		return err
-	}
-	if handoff == nil || handoff.AuthoringRunID != parent.ID || handoff.ChildRunID != strings.TrimSpace(request.ID) ||
-		handoff.TaskID != request.TaskID || handoff.RevisionID != request.RevisionID ||
-		request.ExecutionSpec.Template.ID != workflowadapter.CodeEdgePhase1WorkflowTemplateID || request.ExecutionSpec.Template.Version != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion ||
-		request.Trigger != standardAuthoringHandoffRunTrigger {
-		return fmt.Errorf("authoring Phase-1 handoff does not match requested child Run")
+	if parent.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+		return fmt.Errorf("Standard authoring 3.0 does not permit an automatic child Run")
 	}
 	return nil
 }

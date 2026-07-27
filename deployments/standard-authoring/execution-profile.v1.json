@@ -1,27 +1,18 @@
-{
-  "template": {"id": "harbor.standard-authoring", "version": "2.0.0"},
-  "id": "standard-authoring-production",
-  "version": "2.0.0",
-  "continuation_plan_ttl": "24h0m0s",
-  "control_grace_period": "2m0s",
-  "candidate_provider_budget": {"attempt_timeout": "30m0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s"},
-  "stages": [
-    {"stage_key": "authoring_harness", "budget": {"turn_timeout": "2h0m0s", "max_turns": 1, "attempt_timeout": "2h10m0s", "max_attempts": 1, "max_elapsed": "2h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "content_review", "budget": {"turn_timeout": "1m0s", "max_turns": 1, "attempt_timeout": "1m0s", "max_attempts": 1, "max_elapsed": "1m0s", "idle_timeout": "0s", "startup_grace": "0s", "shutdown_grace": "0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "codeedge_package_admission", "budget": {"turn_timeout": "1m0s", "max_turns": 1, "attempt_timeout": "1m0s", "max_attempts": 1, "max_elapsed": "1m0s", "idle_timeout": "0s", "startup_grace": "0s", "shutdown_grace": "0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "dockerfile_generate", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "dockerfile_build_validate", "budget": {"turn_timeout": "1h0m0s", "max_turns": 1, "attempt_timeout": "1h10m0s", "max_attempts": 1, "max_elapsed": "1h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "generate_task_files", "budget": {"turn_timeout": "20m0s", "max_turns": 3, "attempt_timeout": "1h10m0s", "max_attempts": 1, "max_elapsed": "1h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "instruction_generate", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "materialize_task", "budget": {"turn_timeout": "10m0s", "max_turns": 1, "attempt_timeout": "12m0s", "max_attempts": 1, "max_elapsed": "12m0s", "idle_timeout": "0s", "startup_grace": "1m0s", "shutdown_grace": "1m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "repo_analyze", "budget": {"turn_timeout": "20m0s", "max_turns": 3, "attempt_timeout": "1h10m0s", "max_attempts": 1, "max_elapsed": "1h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "repo_prepare", "budget": {"turn_timeout": "10m0s", "max_turns": 1, "attempt_timeout": "12m0s", "max_attempts": 1, "max_elapsed": "12m0s", "idle_timeout": "0s", "startup_grace": "1m0s", "shutdown_grace": "1m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "solution_review", "budget": {"turn_timeout": "1m0s", "max_turns": 1, "attempt_timeout": "1m0s", "max_attempts": 1, "max_elapsed": "1m0s", "idle_timeout": "0s", "startup_grace": "0s", "shutdown_grace": "0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "solve_generate", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "task_design", "budget": {"turn_timeout": "20m0s", "max_turns": 30, "attempt_timeout": "10h10m0s", "max_attempts": 1, "max_elapsed": "10h10m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "task_review", "budget": {"turn_timeout": "1m0s", "max_turns": 1, "attempt_timeout": "1m0s", "max_attempts": 1, "max_elapsed": "1m0s", "idle_timeout": "0s", "startup_grace": "0s", "shutdown_grace": "0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "task_toml_generate", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "test_generate", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}},
-    {"stage_key": "tests_analysis", "budget": {"turn_timeout": "20m0s", "max_turns": 1, "attempt_timeout": "30m0s", "max_attempts": 1, "max_elapsed": "30m0s", "idle_timeout": "0s", "startup_grace": "5m0s", "shutdown_grace": "5m0s", "backoff": {"retry_delays": []}}}
-  ]
-}
+{"template":{"id":"harbor.standard-authoring","version":"3.0.0"},"id":"standard-authoring-production","version":"3.0.0","continuation_plan_ttl":"24h0m0s","control_grace_period":"2m0s","candidate_provider_budget":{"attempt_timeout":"30m0s","startup_grace":"5m0s","shutdown_grace":"5m0s"},"stages":[
+{"stage_key":"repo_prepare","budget":{"turn_timeout":"10m0s","max_turns":1,"attempt_timeout":"12m0s","max_attempts":1,"max_elapsed":"12m0s","idle_timeout":"0s","startup_grace":"1m0s","shutdown_grace":"1m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"repo_structure_research","budget":{"turn_timeout":"20m0s","max_turns":3,"attempt_timeout":"1h5m0s","max_attempts":1,"max_elapsed":"1h5m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"test_runtime_research","budget":{"turn_timeout":"20m0s","max_turns":3,"attempt_timeout":"1h5m0s","max_attempts":1,"max_elapsed":"1h5m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"verifier_threat_research","budget":{"turn_timeout":"20m0s","max_turns":3,"attempt_timeout":"1h5m0s","max_attempts":1,"max_elapsed":"1h5m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"task_synthesis","budget":{"turn_timeout":"20m0s","max_turns":4,"attempt_timeout":"1h25m0s","max_attempts":1,"max_elapsed":"1h25m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"task_review","budget":{"turn_timeout":"1m0s","max_turns":1,"attempt_timeout":"1m0s","max_attempts":1,"max_elapsed":"1m0s","idle_timeout":"0s","startup_grace":"0s","shutdown_grace":"0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"authoring_loop","budget":{"turn_timeout":"20m0s","max_turns":3,"attempt_timeout":"1h5m0s","max_attempts":1,"max_elapsed":"1h5m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"host_candidate_verify","budget":{"turn_timeout":"2h0m0s","max_turns":1,"attempt_timeout":"2h10m0s","max_attempts":1,"max_elapsed":"2h10m0s","idle_timeout":"0s","startup_grace":"5m0s","shutdown_grace":"5m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"test_quality_critic","budget":{"turn_timeout":"20m0s","max_turns":3,"attempt_timeout":"1h5m0s","max_attempts":1,"max_elapsed":"1h5m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"solution_integrity_critic","budget":{"turn_timeout":"20m0s","max_turns":3,"attempt_timeout":"1h5m0s","max_attempts":1,"max_elapsed":"1h5m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"authoring_repair","budget":{"turn_timeout":"20m0s","max_turns":2,"attempt_timeout":"45m0s","max_attempts":1,"max_elapsed":"45m0s","idle_timeout":"0s","startup_grace":"2m0s","shutdown_grace":"2m0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"content_review","budget":{"turn_timeout":"1m0s","max_turns":1,"attempt_timeout":"1m0s","max_attempts":1,"max_elapsed":"1m0s","idle_timeout":"0s","startup_grace":"0s","shutdown_grace":"0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"solution_review","budget":{"turn_timeout":"1m0s","max_turns":1,"attempt_timeout":"1m0s","max_attempts":1,"max_elapsed":"1m0s","idle_timeout":"0s","startup_grace":"0s","shutdown_grace":"0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"final_attestation","budget":{"turn_timeout":"1m0s","max_turns":1,"attempt_timeout":"1m0s","max_attempts":1,"max_elapsed":"1m0s","idle_timeout":"0s","startup_grace":"0s","shutdown_grace":"0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"codeedge_package_admission","budget":{"turn_timeout":"1m0s","max_turns":1,"attempt_timeout":"1m0s","max_attempts":1,"max_elapsed":"1m0s","idle_timeout":"0s","startup_grace":"0s","shutdown_grace":"0s","backoff":{"retry_delays":[]}}},
+{"stage_key":"materialize_task","budget":{"turn_timeout":"10m0s","max_turns":1,"attempt_timeout":"12m0s","max_attempts":1,"max_elapsed":"12m0s","idle_timeout":"0s","startup_grace":"1m0s","shutdown_grace":"1m0s","backoff":{"retry_delays":[]}}}
+]}

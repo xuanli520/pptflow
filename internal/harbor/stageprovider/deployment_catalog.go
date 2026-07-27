@@ -972,6 +972,26 @@ func deploymentStageBindingType(key workflowkit.StageKey) (workflowadapter.Stage
 	switch key {
 	case workflowadapter.RepoPrepare:
 		return workflowadapter.StageBindingRepoPrepare, true
+	case workflowadapter.RepoStructureResearch:
+		return workflowadapter.StageBindingRepoStructureResearch, true
+	case workflowadapter.TestRuntimeResearch:
+		return workflowadapter.StageBindingTestRuntimeResearch, true
+	case workflowadapter.VerifierThreatResearch:
+		return workflowadapter.StageBindingVerifierThreatResearch, true
+	case workflowadapter.TaskSynthesis:
+		return workflowadapter.StageBindingTaskSynthesis, true
+	case workflowadapter.AuthoringLoop:
+		return workflowadapter.StageBindingAuthoringLoop, true
+	case workflowadapter.HostCandidateVerify:
+		return workflowadapter.StageBindingHostCandidateVerify, true
+	case workflowadapter.TestQualityCritic:
+		return workflowadapter.StageBindingTestQualityCritic, true
+	case workflowadapter.SolutionIntegrityCritic:
+		return workflowadapter.StageBindingSolutionIntegrityCritic, true
+	case workflowadapter.AuthoringRepair:
+		return workflowadapter.StageBindingAuthoringRepair, true
+	case workflowadapter.FinalAttestation:
+		return workflowadapter.StageBindingFinalAttestation, true
 	case workflowadapter.RepoAnalyze:
 		return workflowadapter.StageBindingRepoAnalyze, true
 	case workflowadapter.TaskDesign:

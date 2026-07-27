@@ -153,9 +153,11 @@ func (plan ExecutionPlan) Clone() ExecutionPlan {
 }
 
 // CompileDependencyExecutionPlan freezes the default initial scheduling
-// policy: every automatically dispatchable stage at the same DAG dependency
-// level is placed in one batch. Operator-only stages remain in the frozen DAG
-// as readiness contracts, but never become durable worker jobs.
+// policy. Automatically dispatchable stages at the same DAG dependency level
+// are partitioned by deterministic first-fit: a later stage joins the first
+// compatible batch in declaration order, or starts a new batch when its
+// resources or workspace binding conflict. Operator-only stages remain in the
+// frozen DAG as readiness contracts, but never become durable worker jobs.
 func CompileDependencyExecutionPlan(workflow WorkflowDescriptor) (ExecutionPlan, error) {
 	if err := workflow.Validate(); err != nil {
 		return ExecutionPlan{}, fmt.Errorf("%w: workflow: %v", ErrInvalidExecution, err)
@@ -179,13 +181,30 @@ func CompileDependencyExecutionPlan(workflow WorkflowDescriptor) (ExecutionPlan,
 	}
 	batches := make([]ScheduleBatch, 0, maxLevel+1)
 	for level := 0; level <= maxLevel; level++ {
-		batch := ScheduleBatch{ID: fmt.Sprintf("dependency-level-%03d", level+1)}
+		levelBatches := make([][]StageDescriptor, 0, 1)
 		for _, stage := range workflow.Stages {
-			if levels[stage.Key] == level && stage.AutomaticallyDispatchable() {
+			if levels[stage.Key] != level || !stage.AutomaticallyDispatchable() {
+				continue
+			}
+			for index := range levelBatches {
+				candidate := append(append([]StageDescriptor(nil), levelBatches[index]...), stage)
+				if err := ValidateConcurrentStages(candidate); err == nil {
+					levelBatches[index] = append(levelBatches[index], stage)
+					goto placed
+				}
+			}
+			levelBatches = append(levelBatches, []StageDescriptor{stage})
+		placed:
+		}
+		for index, stages := range levelBatches {
+			batchID := fmt.Sprintf("dependency-level-%03d", level+1)
+			if index != 0 {
+				batchID = fmt.Sprintf("dependency-level-%03d-part-%03d", level+1, index+1)
+			}
+			batch := ScheduleBatch{ID: batchID, NodeIDs: make([]NodeID, 0, len(stages))}
+			for _, stage := range stages {
 				batch.NodeIDs = append(batch.NodeIDs, NodeID(stage.Key))
 			}
-		}
-		if len(batch.NodeIDs) != 0 {
 			batches = append(batches, batch)
 		}
 	}
@@ -270,6 +289,14 @@ func (plan ExecutionPlan) validate(workflow WorkflowDescriptor) error {
 				return fmt.Errorf("%w: execution plan schedules operator-only stage %q", ErrInvalidExecution, key)
 			}
 			stageBatch[key] = index
+		}
+		stages := make([]StageDescriptor, 0, len(batch.NodeIDs))
+		for _, nodeID := range batch.NodeIDs {
+			stage, _ := workflow.Stage(StageKey(nodeID))
+			stages = append(stages, stage)
+		}
+		if err := ValidateConcurrentStages(stages); err != nil {
+			return fmt.Errorf("%w: execution batch %q: %v", ErrInvalidExecution, batch.ID, err)
 		}
 	}
 	if len(stageBatch) != automaticStages {

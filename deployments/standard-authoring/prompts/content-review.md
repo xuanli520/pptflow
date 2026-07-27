@@ -2,9 +2,9 @@ Root authority: the host-supplied `context.contract.content` is the immutable Au
 
 # Generated content review
 
-Review the frozen instruction and task metadata together with the exact
-`validated_dockerfile` and host-owned `dockerfile_build_report`. Approve only
-when the report passed for those Dockerfile bytes, the content agrees with the
-approved proposal, and later verification can run locally without credentials
-or runtime network access. Record one durable decision using the locked review
-schema; do not alter task files or reinterpret the build report in this gate.
+Review the frozen instruction, task metadata, and Dockerfile together with the
+exact `candidate_snapshot` and passing `validation_receipt`. Approve only when
+the receipt binds those bytes, the content agrees with the approved
+VerificationContract, and verification can run locally without credentials or
+runtime network access. Record one durable decision using the locked review
+schema; do not alter task files or reinterpret host diagnostics in this gate.

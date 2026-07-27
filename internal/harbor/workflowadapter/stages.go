@@ -39,6 +39,20 @@ const (
 	ResultReview             = "result_review"
 	FinalReview              = "final_review"
 	Package                  = "package"
+
+	// Standard Authoring 3.0 owns a closed source-session graph. These keys do
+	// not reuse retired 2.0 generation nodes, so a frozen legacy operation can
+	// never be interpreted as a 3.0 role binding.
+	RepoStructureResearch   = "repo_structure_research"
+	TestRuntimeResearch     = "test_runtime_research"
+	VerifierThreatResearch  = "verifier_threat_research"
+	TaskSynthesis           = "task_synthesis"
+	AuthoringLoop           = "authoring_loop"
+	HostCandidateVerify     = "host_candidate_verify"
+	TestQualityCritic       = "test_quality_critic"
+	SolutionIntegrityCritic = "solution_integrity_critic"
+	AuthoringRepair         = "authoring_repair"
+	FinalAttestation        = "final_attestation"
 )
 
 var standardStageOrder = []string{

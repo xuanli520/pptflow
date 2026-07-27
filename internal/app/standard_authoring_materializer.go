@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -20,10 +19,12 @@ import (
 )
 
 const (
-	standardAuthoringMaterializeHandlerID      = "standard-authoring.materialize-task"
-	standardAuthoringPackageAdmissionHandlerID = "standard-authoring.codeedge-package-admission"
-	standardAuthoringAdmissionReceiptFormat    = "harbor.standard-authoring-task-package-admission.v1"
-	standardAuthoringAdmissionReceiptVersion   = "1"
+	standardAuthoringMaterializeHandlerID         = "standard-authoring.materialize-task"
+	standardAuthoringPackageAdmissionHandlerID    = "standard-authoring.codeedge-package-admission"
+	standardAuthoringHostCandidateVerifyHandlerID = "standard-authoring.host-candidate-verify"
+	standardAuthoringFinalAttestationHandlerID    = "standard-authoring.final-attestation"
+	standardAuthoringAdmissionReceiptFormat       = "harbor.standard-authoring-task-package-admission.v1"
+	standardAuthoringAdmissionReceiptVersion      = "1"
 )
 
 // StandardAuthoringMaterializeExecutor is the one Harbor-built-in operation
@@ -36,12 +37,12 @@ const (
 // It is constructed from the same managed root and Store as the application
 // service, but independently of a RunService so a deployment composition can
 // install the handler before it admits the first Standard authoring Run.
-// Starting the separate CodeEdge Phase-1 Run is intentionally a later
-// durable handoff after this stage output has been persisted; the handler
-// never executes task-bound work under the source/session subject.
+// This terminal handler never starts task-bound work under the source/session
+// subject or authorizes a child Run.
 type StandardAuthoringMaterializeExecutor struct {
-	core      *lifecycleServiceCore
-	admission *codeedge.TaskAdmissionContract
+	core             *lifecycleServiceCore
+	admission        *codeedge.TaskAdmissionContract
+	candidateHarness *StandardAuthoringDockerHarness
 }
 
 // StandardAuthoringMaterializeExecutorConfig contains only local
@@ -51,9 +52,10 @@ type StandardAuthoringMaterializeExecutorConfig struct {
 	ManagedRoot string
 	Store       *store.Store
 	Now         func() time.Time
-	// Admission is mandatory for the sole supported Standard Authoring v2
+	// Admission is mandatory for the sole supported Standard Authoring 3.0
 	// template. Historical templates are not executable.
-	Admission *codeedge.TaskAdmissionContract
+	Admission        *codeedge.TaskAdmissionContract
+	CandidateHarness *StandardAuthoringDockerHarness
 }
 
 // NewStandardAuthoringMaterializeExecutor constructs the built-in materialize
@@ -82,13 +84,14 @@ func NewStandardAuthoringMaterializeExecutor(config StandardAuthoringMaterialize
 		return nil, fmt.Errorf("validate Standard authoring CodeEdge admission contract: %w", err)
 	}
 	admission := *config.Admission
-	return &StandardAuthoringMaterializeExecutor{core: &lifecycleServiceCore{store: config.Store, layout: layout, objects: objects, now: now}, admission: &admission}, nil
+	return &StandardAuthoringMaterializeExecutor{core: &lifecycleServiceCore{store: config.Store, layout: layout, objects: objects, now: now}, admission: &admission, candidateHarness: config.CandidateHarness}, nil
 }
 
 // ExecuteHarborBuiltin implements the sealed stageprovider built-in contract.
-// It reserves the task_snapshot artifact ID before it emits the handoff, so
-// the handoff can name the exact output which the durable stage projection
-// will later create.  All other output IDs remain backend-owned.
+// It reserves the task_snapshot artifact ID before it emits the immutable
+// materialization receipt, so the receipt names the exact output which the
+// durable stage projection will later create. All other output IDs remain
+// backend-owned.
 func (executor *StandardAuthoringMaterializeExecutor) ExecuteHarborBuiltin(ctx context.Context, invocation stageprovider.StageOperationInvocation, payload workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error) {
 	if executor == nil || executor.core == nil || executor.core.store == nil || executor.core.objects == nil {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring materializer is not configured")
@@ -101,6 +104,12 @@ func (executor *StandardAuthoringMaterializeExecutor) ExecuteHarborBuiltin(ctx c
 	}
 	if payload.HandlerID == standardAuthoringPackageAdmissionHandlerID {
 		return executor.executePackageAdmission(ctx, invocation)
+	}
+	if payload.HandlerID == standardAuthoringHostCandidateVerifyHandlerID {
+		return executor.executeHostCandidateVerify(ctx, invocation)
+	}
+	if payload.HandlerID == standardAuthoringFinalAttestationHandlerID {
+		return executor.executeFinalAttestation(ctx, invocation)
 	}
 	if payload.HandlerID != standardAuthoringMaterializeHandlerID || invocation.Resolution.StageKey != workflowkit.StageKey(workflowadapter.MaterializeTask) || invocation.Request.Stage.Key != workflowkit.StageKey(workflowadapter.MaterializeTask) {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring materializer received an unbound built-in operation")
@@ -141,10 +150,6 @@ func (executor *StandardAuthoringMaterializeExecutor) ExecuteHarborBuiltin(ctx c
 	if err := validateStandardAuthoringMaterializationContract(inputs.contract, subject); err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	if err := executor.requireClosedAuthoringRepairLedger(ctx, *run, inputs.contract); err != nil {
-		return workflowkit.StageExecutionResult{}, err
-	}
-
 	// A prior atomic materialization is authoritative after a crash.  Rebuild
 	// the deterministic stage outputs from that immutable revision instead of
 	// creating a second revision or trusting leftover temporary files.
@@ -178,30 +183,6 @@ func (executor *StandardAuthoringMaterializeExecutor) ExecuteHarborBuiltin(ctx c
 	return executor.materializationResult(ctx, *run, subject, revision, admissionReceipt)
 }
 
-func (executor *StandardAuthoringMaterializeExecutor) requireClosedAuthoringRepairLedger(ctx context.Context, run store.WorkflowRun, contract workflowadapter.AuthoringContract) error {
-	digest, err := contract.ContentDigest()
-	if err != nil {
-		return fmt.Errorf("fingerprint Standard authoring materialization root contract: %w", err)
-	}
-	entries, err := executor.core.store.ListOpenAuthoringRepairLedgerEntries(ctx, run.ID)
-	if err != nil {
-		return fmt.Errorf("read Standard authoring repair ledger: %w", err)
-	}
-	if len(entries) == 0 {
-		return nil
-	}
-	for _, entry := range entries {
-		if entry.ContractDigest != string(digest) {
-			return fmt.Errorf("Standard authoring repair ledger entry %s has a different root contract", entry.ID)
-		}
-	}
-	suffix := "ies"
-	if len(entries) == 1 {
-		suffix = "y"
-	}
-	return fmt.Errorf("Standard authoring materialization is blocked by %d unresolved repair ledger entr%s", len(entries), suffix)
-}
-
 type standardAuthoringAdmissionReceipt struct {
 	Format             string                   `json:"format"`
 	Version            string                   `json:"version"`
@@ -229,7 +210,7 @@ func (executor *StandardAuthoringMaterializeExecutor) executePackageAdmission(ct
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	if run == nil || !isAdmissionAwareStandardAuthoringRun(*run) || run.Status != store.WorkflowRunRunning {
+	if run == nil || !isCurrentStandardAuthoringRun(*run) || run.Status != store.WorkflowRunRunning {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring package admission Run is not active under the admission template")
 	}
 	subject, err := executor.core.resolveWorkflowRunSubject(ctx, *run)
@@ -274,7 +255,7 @@ func (executor *StandardAuthoringMaterializeExecutor) executePackageAdmission(ct
 
 type standardAuthoringPackageAdmissionInputSet struct {
 	instruction, taskTOML, dockerfile, solveScript, testScript, testsAnalysis []byte
-	dockerBuildReport, harnessReport                                          []byte
+	candidateSnapshot, validationReceipt, finalAttestation                    []byte
 	contract                                                                  workflowadapter.AuthoringContract
 }
 
@@ -311,17 +292,28 @@ func standardAuthoringPackageAdmissionInputs(ctx context.Context, request workfl
 	if result.taskTOML, err = read("task_toml"); err != nil {
 		return result, err
 	}
-	dockerfileName, solveName, testName := standardAuthoringPackageArtifactNames(run)
-	if result.dockerfile, err = read(dockerfileName); err != nil {
+	if result.dockerfile, err = read("dockerfile"); err != nil {
 		return result, err
 	}
-	if result.solveScript, err = read(solveName); err != nil {
+	if result.solveScript, err = read("solve_script"); err != nil {
 		return result, err
 	}
-	if result.testScript, err = read(testName); err != nil {
+	if result.testScript, err = read("test_script"); err != nil {
 		return result, err
 	}
 	if result.testsAnalysis, err = read("tests_analysis"); err != nil {
+		return result, err
+	}
+	if result.candidateSnapshot, err = read("candidate_snapshot"); err != nil {
+		return result, err
+	}
+	if result.validationReceipt, err = read("validation_receipt"); err != nil {
+		return result, err
+	}
+	if result.finalAttestation, err = read("final_attestation"); err != nil {
+		return result, err
+	}
+	if err := validateStandardAuthoringV3MaterializationEvidence(result.candidateSnapshot, result.validationReceipt, result.finalAttestation, standardAuthoringV3CandidateFiles(result.instruction, result.taskTOML, result.dockerfile, result.solveScript, result.testScript, result.testsAnalysis), time.Now); err != nil {
 		return result, err
 	}
 	contractRaw, err := read(workflowadapter.AuthoringContractArtifact)
@@ -331,17 +323,6 @@ func standardAuthoringPackageAdmissionInputs(ctx context.Context, request workfl
 	result.contract, err = workflowadapter.ParseAuthoringContractJSON(contractRaw)
 	if err != nil {
 		return result, fmt.Errorf("decode frozen Standard authoring root contract: %w", err)
-	}
-	if isHarnessAwareStandardAuthoringRun(run) {
-		if result.dockerBuildReport, err = read(workflowadapter.StandardAuthoringDockerfileBuildReportArtifact); err != nil {
-			return result, err
-		}
-		if result.harnessReport, err = read(workflowadapter.StandardAuthoringHarnessReportArtifact); err != nil {
-			return result, err
-		}
-		if err := validateStandardAuthoringHarnessEvidence(run.ID, result.dockerfile, result.solveScript, result.testScript, result.dockerBuildReport, result.harnessReport); err != nil {
-			return result, err
-		}
 	}
 	return result, nil
 }
@@ -354,8 +335,9 @@ type standardAuthoringMaterializeInputSet struct {
 	testScript        []byte
 	testsAnalysis     []byte
 	admissionReceipt  []byte
-	dockerBuildReport []byte
-	harnessReport     []byte
+	candidateSnapshot []byte
+	validationReceipt []byte
+	finalAttestation  []byte
 	contract          workflowadapter.AuthoringContract
 	proposalHash      string
 }
@@ -414,8 +396,7 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 	if result.taskTOML, err = read("task_toml"); err != nil {
 		return result, err
 	}
-	dockerfileName, solveName, testName := standardAuthoringPackageArtifactNames(run)
-	if result.dockerfile, err = read(dockerfileName); err != nil {
+	if result.dockerfile, err = read("dockerfile"); err != nil {
 		return result, err
 	}
 	contractRaw, err := read(workflowadapter.AuthoringContractArtifact)
@@ -427,25 +408,26 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 		return result, fmt.Errorf("decode frozen Standard authoring root contract: %w", err)
 	}
 	result.contract = contract
-	if result.solveScript, err = read(solveName); err != nil {
+	if result.solveScript, err = read("solve_script"); err != nil {
 		return result, err
 	}
-	if result.testScript, err = read(testName); err != nil {
+	if result.testScript, err = read("test_script"); err != nil {
 		return result, err
 	}
 	if result.testsAnalysis, err = read("tests_analysis"); err != nil {
 		return result, err
 	}
-	if isHarnessAwareStandardAuthoringRun(run) {
-		if result.dockerBuildReport, err = read(workflowadapter.StandardAuthoringDockerfileBuildReportArtifact); err != nil {
-			return result, err
-		}
-		if result.harnessReport, err = read(workflowadapter.StandardAuthoringHarnessReportArtifact); err != nil {
-			return result, err
-		}
-		if err := validateStandardAuthoringHarnessEvidence(run.ID, result.dockerfile, result.solveScript, result.testScript, result.dockerBuildReport, result.harnessReport); err != nil {
-			return result, err
-		}
+	if result.candidateSnapshot, err = read("candidate_snapshot"); err != nil {
+		return result, err
+	}
+	if result.validationReceipt, err = read("validation_receipt"); err != nil {
+		return result, err
+	}
+	if result.finalAttestation, err = read("final_attestation"); err != nil {
+		return result, err
+	}
+	if err := validateStandardAuthoringV3MaterializationEvidence(result.candidateSnapshot, result.validationReceipt, result.finalAttestation, standardAuthoringV3CandidateFiles(result.instruction, result.taskTOML, result.dockerfile, result.solveScript, result.testScript, result.testsAnalysis), time.Now); err != nil {
+		return result, err
 	}
 	decision, err := read("solution_review_decision")
 	if err != nil {
@@ -454,10 +436,8 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 	if err := validateApprovedAuthoringSolutionDecision(decision, run, subject); err != nil {
 		return result, err
 	}
-	if isAdmissionAwareStandardAuthoringRun(run) {
-		if result.admissionReceipt, err = read("codeedge_package_admission_report"); err != nil {
-			return result, err
-		}
+	if result.admissionReceipt, err = read("codeedge_package_admission_report"); err != nil {
+		return result, err
 	}
 	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(request.Inputs)
 	if err != nil {
@@ -532,26 +512,24 @@ func (executor *StandardAuthoringMaterializeExecutor) materializeNewAuthoringTas
 	if run.Status != store.WorkflowRunRunning {
 		return store.TaskRevision{}, fmt.Errorf("Standard authoring materializer Run is not running")
 	}
-	if isAdmissionAwareStandardAuthoringRun(run) {
-		if executor.admission == nil {
-			return store.TaskRevision{}, fmt.Errorf("Standard authoring admission contract is unavailable for the frozen template")
-		}
-		compiled, err := CompileStandardAuthoringTaskPackage(StandardAuthoringTaskPackageInput{
-			Instruction: inputs.instruction, TaskTOMLDraft: inputs.taskTOML, Dockerfile: inputs.dockerfile,
-			SolveScript: inputs.solveScript, TestScript: inputs.testScript, TestsAnalysis: inputs.testsAnalysis,
-			Source: *subject.AuthoringSource, Contract: inputs.contract, Admission: *executor.admission,
-		})
-		if err != nil {
-			return store.TaskRevision{}, fmt.Errorf("compile Standard authoring task package: %w", err)
-		}
-		if !compiled.Report.Passed {
-			return store.TaskRevision{}, fmt.Errorf("CodeEdge task admission rejected materialization: %s", admissionViolationSummary(compiled.Report.Violations))
-		}
-		if err := verifyStandardAuthoringAdmissionReceipt(request, run, subject, inputs.admissionReceipt, compiled.Report); err != nil {
-			return store.TaskRevision{}, err
-		}
-		inputs = materializeInputsFromCanonicalPackage(inputs, compiled.CanonicalFiles)
+	if executor.admission == nil {
+		return store.TaskRevision{}, fmt.Errorf("Standard authoring admission contract is unavailable for the frozen template")
 	}
+	compiled, err := CompileStandardAuthoringTaskPackage(StandardAuthoringTaskPackageInput{
+		Instruction: inputs.instruction, TaskTOMLDraft: inputs.taskTOML, Dockerfile: inputs.dockerfile,
+		SolveScript: inputs.solveScript, TestScript: inputs.testScript, TestsAnalysis: inputs.testsAnalysis,
+		Source: *subject.AuthoringSource, Contract: inputs.contract, Admission: *executor.admission,
+	})
+	if err != nil {
+		return store.TaskRevision{}, fmt.Errorf("compile Standard authoring task package: %w", err)
+	}
+	if !compiled.Report.Passed {
+		return store.TaskRevision{}, fmt.Errorf("CodeEdge task admission rejected materialization: %s", admissionViolationSummary(compiled.Report.Violations))
+	}
+	if err := verifyStandardAuthoringAdmissionReceipt(request, run, subject, inputs.admissionReceipt, compiled.Report); err != nil {
+		return store.TaskRevision{}, err
+	}
+	inputs = materializeInputsFromCanonicalPackage(inputs, compiled.CanonicalFiles)
 	revisionID, err := store.NewUUIDv7()
 	if err != nil {
 		return store.TaskRevision{}, fmt.Errorf("allocate Standard authoring TaskRevision ID: %w", err)
@@ -610,17 +588,10 @@ func verifyStandardAuthoringAdmissionReceipt(request workflowkit.StageExecutionR
 		!receipt.Report.Passed || !reflect.DeepEqual(receipt.Report, report) {
 		return fmt.Errorf("Standard authoring admission receipt does not bind the frozen package")
 	}
-	bindings := make([]workflowkit.ArtifactBinding, 0, 8)
+	bindings := make([]workflowkit.ArtifactBinding, 0, 10)
 	allowed := map[string]struct{}{
-		"instruction": {}, "task_toml": {}, workflowadapter.AuthoringContractArtifact: {}, "tests_analysis": {},
-	}
-	dockerfileName, solveName, testName := standardAuthoringPackageArtifactNames(run)
-	allowed[dockerfileName] = struct{}{}
-	allowed[solveName] = struct{}{}
-	allowed[testName] = struct{}{}
-	if isHarnessAwareStandardAuthoringRun(run) {
-		allowed[workflowadapter.StandardAuthoringDockerfileBuildReportArtifact] = struct{}{}
-		allowed[workflowadapter.StandardAuthoringHarnessReportArtifact] = struct{}{}
+		"instruction": {}, "task_toml": {}, "dockerfile": {}, "solve_script": {}, "test_script": {}, "tests_analysis": {},
+		"candidate_snapshot": {}, "validation_receipt": {}, "final_attestation": {}, workflowadapter.AuthoringContractArtifact: {},
 	}
 	for _, binding := range request.Inputs {
 		if _, keep := allowed[binding.Name]; keep {
@@ -633,54 +604,6 @@ func verifyStandardAuthoringAdmissionReceipt(request workflowkit.StageExecutionR
 	fingerprint, err := workflowkit.FingerprintArtifactBindings(bindings)
 	if err != nil || fingerprint != receipt.InputFingerprint {
 		return fmt.Errorf("Standard authoring admission receipt input fingerprint does not match materialization")
-	}
-	return nil
-}
-
-// isAdmissionAwareStandardAuthoringRun accepts the only executable authoring
-// template. Historical runs are never reinterpreted for package admission.
-func isAdmissionAwareStandardAuthoringRun(run store.WorkflowRun) bool {
-	return isCurrentStandardAuthoringRun(run)
-}
-
-func isHarnessAwareStandardAuthoringRun(run store.WorkflowRun) bool {
-	return isCurrentStandardAuthoringRun(run)
-}
-
-func standardAuthoringPackageArtifactNames(run store.WorkflowRun) (dockerfile, solve, test string) {
-	if isHarnessAwareStandardAuthoringRun(run) {
-		return workflowadapter.StandardAuthoringValidatedDockerfileArtifact, workflowadapter.StandardAuthoringValidatedSolveScriptArtifact, workflowadapter.StandardAuthoringValidatedTestScriptArtifact
-	}
-	return "dockerfile", "solve_script", "test_script"
-}
-
-func validateStandardAuthoringHarnessEvidence(runID string, dockerfile, solveScript, testScript, dockerBuildReport, harnessReport []byte) error {
-	buildCandidate, err := authoringharness.CandidateFromBytes(authoringharness.ModeDockerfileBuild, dockerfile, nil, nil)
-	if err != nil {
-		return fmt.Errorf("reconstruct Standard authoring Docker candidate: %w", err)
-	}
-	fullCandidate, err := authoringharness.CandidateFromBytes(authoringharness.ModeInitialOracle, dockerfile, solveScript, testScript)
-	if err != nil {
-		return fmt.Errorf("reconstruct Standard authoring full candidate: %w", err)
-	}
-	checks := []struct {
-		raw       []byte
-		mode      authoringharness.Mode
-		stage     workflowkit.StageKey
-		candidate authoringharness.Candidate
-	}{
-		{raw: dockerBuildReport, mode: authoringharness.ModeDockerfileBuild, stage: workflowkit.StageKey(workflowadapter.DockerfileBuildValidate), candidate: buildCandidate},
-		{raw: harnessReport, mode: authoringharness.ModeInitialOracle, stage: workflowkit.StageKey(workflowadapter.AuthoringHarness), candidate: fullCandidate},
-	}
-	for _, check := range checks {
-		var report authoringharness.Result
-		if err := decodeStrictJSON(string(check.raw), &report); err != nil {
-			return fmt.Errorf("decode Standard authoring harness evidence: %w", err)
-		}
-		report.ReportJSON = append([]byte(nil), check.raw...)
-		if err := report.ValidateReportJSON(); err != nil || !report.Passed || report.Mode != check.mode || report.StageKey != check.stage || report.RunID != runID || report.CandidateDigest != check.candidate.CandidateDigest || report.EnvironmentDigest != check.candidate.EnvironmentDigest {
-			return fmt.Errorf("Standard authoring harness evidence does not bind the frozen package")
-		}
 	}
 	return nil
 }
@@ -717,9 +640,6 @@ func admissionViolationSummary(violations []codeedge.Violation) string {
 }
 
 func standardAuthoringAdmissionReceiptReference(request workflowkit.StageExecutionRequest, run store.WorkflowRun) (*workflowadapter.ArtifactReference, error) {
-	if !isAdmissionAwareStandardAuthoringRun(run) {
-		return nil, nil
-	}
 	for _, binding := range request.Inputs {
 		if binding.Name == "codeedge_package_admission_report" {
 			if binding.SchemaVersion != standardAuthoringAdmissionReceiptFormat {
@@ -743,14 +663,9 @@ func (executor *StandardAuthoringMaterializeExecutor) materializationResult(ctx 
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("allocate Standard authoring task snapshot artifact ID: %w", err)
 	}
-	templateReference := workflowadapter.TemplateReference{ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion}
-	handoffSchema, err := workflowadapter.StandardAuthoringTaskHandoffSchemaForTemplate(templateReference)
-	if err != nil {
-		return workflowkit.StageExecutionResult{}, err
-	}
-	handoff := workflowadapter.StandardAuthoringTaskHandoff{
-		Format:                workflowadapter.StandardAuthoringTaskHandoffFormat,
-		Version:               workflowadapter.StandardAuthoringTaskHandoffVersion,
+	receipt := workflowadapter.StandardAuthoringMaterializationReceipt{
+		Format:                workflowadapter.StandardAuthoringMaterializationReceiptFormat,
+		Version:               workflowadapter.StandardAuthoringMaterializationReceiptVersion,
 		AuthoringSourceID:     subject.AuthoringSource.ID,
 		AuthoringSessionID:    subject.AuthoringSession.ID,
 		AuthoringRunID:        run.ID,
@@ -761,10 +676,9 @@ func (executor *StandardAuthoringMaterializeExecutor) materializationResult(ctx 
 		TaskSnapshot: workflowadapter.ArtifactReference{
 			ID: workflowkit.ArtifactID(snapshotArtifactID), ContentDigest: snapshot.Digest, SchemaVersion: "harbor.artifact.v1",
 		},
-		ChildTemplate:    workflowadapter.CodeEdgePhase1TemplateReference(),
-		AdmissionReceipt: admissionReceipt,
+		AdmissionReceipt: *admissionReceipt,
 	}
-	handoffBytes, err := handoff.CanonicalJSON()
+	receiptBytes, err := receipt.CanonicalJSON()
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
@@ -777,7 +691,7 @@ func (executor *StandardAuthoringMaterializeExecutor) materializationResult(ctx 
 		Artifacts: []workflowkit.StageArtifact{
 			{ID: workflowkit.ArtifactID(snapshotArtifactID), Name: "task_snapshot", SchemaVersion: "harbor.artifact.v1", Content: snapshotBytes},
 			{Name: "task_digest", SchemaVersion: "harbor.artifact.v1", Content: []byte(revision.TaskDigest)},
-			{Name: workflowadapter.StandardAuthoringTaskHandoffArtifact, SchemaVersion: handoffSchema, Content: handoffBytes},
+			{Name: workflowadapter.StandardAuthoringMaterializationReceiptArtifact, SchemaVersion: workflowadapter.StandardAuthoringMaterializationReceiptSchemaVersion, Content: receiptBytes},
 		},
 	}, nil
 }

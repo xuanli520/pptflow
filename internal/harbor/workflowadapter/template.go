@@ -380,6 +380,16 @@ func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWork
 		if !present {
 			return ResolvedWorkflow{}, fmt.Errorf("%w: quota policy for stage %q disappeared during compile", errInvalidCatalog, definition.Key)
 		}
+		var concurrency *workflowkit.ConcurrencyPolicy
+		if definition.Concurrency != nil {
+			policy := definition.Concurrency.Clone()
+			concurrency = &policy
+		}
+		var agentRole *workflowkit.AgentRoleSpec
+		if definition.AgentRole != nil {
+			role := definition.AgentRole.Clone()
+			agentRole = &role
+		}
 		descriptor.Stages = append(descriptor.Stages, workflowkit.StageDescriptor{
 			Key:          definition.Key,
 			Version:      definition.Version,
@@ -390,6 +400,8 @@ func (template WorkflowTemplate) Compile(profile ExecutionProfile) (ResolvedWork
 			Outputs:      append([]workflowkit.ArtifactSpec(nil), definition.Outputs...),
 			ReadSet:      append([]workflowkit.ResourceKey(nil), definition.ReadSet...),
 			WriteSet:     append([]workflowkit.ResourceKey(nil), definition.WriteSet...),
+			Concurrency:  concurrency,
+			AgentRole:    agentRole,
 			Effect:       definition.Effect,
 			Dispatch:     definition.Dispatch,
 			Budget:       budget,

@@ -35,7 +35,6 @@ type codeEdgePhase1ProductionCompositionConfig struct {
 type codeEdgePhase1ProductionComposition struct {
 	Resolver         *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
 	CatalogBinding   app.TemplateDeploymentCatalogResolver
-	Definitions      app.CodeEdgePhase1RunDefinitionProvider
 	Admission        codeedge.TaskAdmissionContract
 	AuthoringHarness *app.StandardAuthoringDockerHarness
 }
@@ -160,16 +159,11 @@ func codeEdgePhase1CompositionFromVerifiedAssets(managedRoot string, binding cod
 	if err != nil {
 		return nil, fmt.Errorf("construct CodeEdge Phase-1 provider composition: %w", err)
 	}
-	definitions, err := newCodeEdgePhase1RunDefinitionProvider(providers.Verifier)
-	if err != nil {
-		return nil, fmt.Errorf("construct lock-owned CodeEdge Phase-1 run definition provider: %w", err)
-	}
 	return &codeEdgePhase1ProductionComposition{
 		Resolver: providers.Resolver,
 		CatalogBinding: app.TemplateDeploymentCatalogResolver{
 			Template: workflowadapter.CodeEdgePhase1TemplateReference(), Resolver: providers.Resolver,
 		},
-		Definitions:      definitions,
 		Admission:        admission,
 		AuthoringHarness: authoringHarness,
 	}, nil

@@ -105,7 +105,6 @@ func TestV2CommandGroupsStillResolveKnownSubcommands(t *testing.T) {
 		{name: "revision list", new: newRevisionCommand, child: "list"},
 		{name: "review decide", new: newReviewCommand, child: "decide"},
 		{name: "authoring review", new: newAuthoringCommand, child: "review"},
-		{name: "authoring recover", new: newAuthoringCommand, child: "recover"},
 		{name: "run start", new: newRunCommandV2, child: "start"},
 		{name: "release package", new: newReleaseCommand, child: "package"},
 		{name: "workspace list", new: newWorkspaceCommand, child: "list"},
@@ -144,7 +143,6 @@ func TestTypedLifecycleMutationCommandsExposeUUIDv7KeysAndRetireUnownedIdentityF
 		{name: "run start", new: newRunCommandV2, path: []string{"start"}},
 		{name: "review decide", new: newReviewCommand, path: []string{"decide"}},
 		{name: "authoring review decide", new: newAuthoringCommand, path: []string{"review", "decide"}},
-		{name: "authoring recover", new: newAuthoringCommand, path: []string{"recover"}},
 		{name: "release package", new: newReleaseCommand, path: []string{"package"}},
 		{name: "release withdraw", new: newReleaseCommand, path: []string{"withdraw"}},
 	} {

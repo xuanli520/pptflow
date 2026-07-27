@@ -340,15 +340,10 @@ type CreateWorkflowRunRequest struct {
 	DefinitionHash          string
 	RunManifestJSON         string
 	ParentRunID             string
-	// AuthoringPhase1HandoffID is required only for the closed transition from
-	// a Standard AuthoringSession parent to its one CodeEdge Phase-1 child. A
-	// generic task-bound parent must leave it empty. The Store validates the
-	// referenced immutable handoff row before inserting the Run.
-	AuthoringPhase1HandoffID string
-	Trigger                  string
-	ExecutionEpoch           int
-	Actor                    string
-	Reason                   string
+	Trigger                 string
+	ExecutionEpoch          int
+	Actor                   string
+	Reason                  string
 	// InitialInputArtifacts are inserted before Dispatch in the same
 	// transaction. A worker can therefore never claim an initial job whose
 	// immutable run inputs are not yet durable.
