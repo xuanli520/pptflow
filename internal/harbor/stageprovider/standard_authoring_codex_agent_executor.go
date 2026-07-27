@@ -492,6 +492,21 @@ func standardAuthoringCodexInvocationWorkspaceWrite(invocation CodexAppServerInv
 	return invocation.SandboxMode == CodexAppServerSandboxModeWorkspaceWrite && invocation.SandboxPolicy == CodexAppServerSandboxPolicyWorkspaceWrite
 }
 
+// StandardAuthoringCodexSandboxForWorkspace maps the frozen workspace
+// capability to the only Codex App Server sandbox that may realize it. The
+// lock builder and executor share this mapping so a stage cannot be given a
+// broader sandbox than the descriptor permits.
+func StandardAuthoringCodexSandboxForWorkspace(mode workflowkit.WorkspaceMode) (string, string, error) {
+	switch mode {
+	case workflowkit.WorkspaceExclusiveWriter:
+		return CodexAppServerSandboxModeWorkspaceWrite, CodexAppServerSandboxPolicyWorkspaceWrite, nil
+	case workflowkit.WorkspaceNone, workflowkit.WorkspaceReadOnlySnapshot:
+		return CodexAppServerSandboxModeReadOnly, CodexAppServerSandboxPolicyReadOnly, nil
+	default:
+		return "", "", fmt.Errorf("%w: unsupported Standard authoring workspace mode %q", ErrStandardAuthoringCodexAgentTurnConfiguration, mode)
+	}
+}
+
 func standardAuthoringCodexWorkspaceRoot(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {

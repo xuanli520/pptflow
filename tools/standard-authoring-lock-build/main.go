@@ -208,11 +208,21 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 			if err := validateCodexStageAssets(config.contractRoot, catalog.Template(), registration.Stage.Key, entry, payload); err != nil {
 				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q Codex assets: %w", registration.Stage.Key, err)
 			}
+			stage, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(registration.Stage.Key)
+			if !found || stage.AgentRole == nil {
+				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q is not an installed Standard authoring Agent stage", registration.Stage.Key)
+			}
+			sandboxMode, sandboxPolicy, err := stageprovider.StandardAuthoringCodexSandboxForWorkspace(stage.AgentRole.Workspace.Mode)
+			if err != nil {
+				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q Codex sandbox: %w", registration.Stage.Key, err)
+			}
 			record.AgentModel = &stageprovider.AgentModelLock{
 				AgentID: payload.AgentID, AgentVersion: codex.JavaScriptLauncher.Version,
 				ModelID: payload.ModelID, ModelVersion: config.codexModelVersion,
 			}
 			copyCodex := codex
+			copyCodex.SandboxMode = sandboxMode
+			copyCodex.SandboxPolicy = sandboxPolicy
 			record.CodexAppServer = &copyCodex
 		case workflowadapter.DurableReviewOperationPayload:
 			record.DurableReviewPolicy = &stageprovider.DurableReviewPolicyLock{PolicyID: payload.PolicyID, Version: "1.0.0"}
@@ -423,7 +433,7 @@ func discoverCodexLock(config buildConfig) (stageprovider.CodexAppServerOperatio
 		NodeExecutable:     stageprovider.LocalExecutableLock{CommandID: stageprovider.CodexAppServerNodeExecutableCommandID, AbsolutePath: config.codexNode, Version: nodeVersion, ContentSHA256: nodeHash},
 		CodexHomeDirectory: config.codexHome, CLIVersionOutput: cliVersionOutput,
 		ApprovalPolicy: stageprovider.CodexAppServerApprovalPolicyNever,
-		SandboxMode:    stageprovider.CodexAppServerSandboxModeWorkspaceWrite, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyWorkspaceWrite,
+		SandboxMode:    stageprovider.CodexAppServerSandboxModeReadOnly, SandboxPolicy: stageprovider.CodexAppServerSandboxPolicyReadOnly,
 		NetworkAccess: false,
 	}, nil
 }

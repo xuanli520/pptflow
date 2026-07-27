@@ -217,6 +217,38 @@ func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testi
 	}
 }
 
+func TestProductionCodexLockSandboxMatchesStageWorkspace(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate Standard authoring lock generator test")
+	}
+	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	lockRaw, err := os.ReadFile(filepath.Join(root, "deployments", "standard-authoring", "operation-catalog.lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := stageprovider.ParseDeploymentOperationCatalogLockJSON(lockRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range lock.Operations {
+		if record.CodexAppServer == nil {
+			continue
+		}
+		stage, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(record.Stage.Key)
+		if !found || stage.AgentRole == nil {
+			t.Fatalf("Codex lock record %q is not an installed Agent stage", record.Stage.Key)
+		}
+		wantMode, wantPolicy, err := stageprovider.StandardAuthoringCodexSandboxForWorkspace(stage.AgentRole.Workspace.Mode)
+		if err != nil {
+			t.Fatalf("sandbox for %q: %v", record.Stage.Key, err)
+		}
+		if record.CodexAppServer.SandboxMode != wantMode || record.CodexAppServer.SandboxPolicy != wantPolicy {
+			t.Fatalf("Codex lock sandbox for %q = %q/%q, want %q/%q", record.Stage.Key, record.CodexAppServer.SandboxMode, record.CodexAppServer.SandboxPolicy, wantMode, wantPolicy)
+		}
+	}
+}
+
 func TestProbeMultilineAcceptsBoundedCodexStyleHelp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "codex-help")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' '--listen <URL>' '-c, --config <key=value>'\n"), 0o700); err != nil {

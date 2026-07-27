@@ -188,3 +188,26 @@ func TestStandardAuthoringV3AgentSchemaRejectsBase64AndNonAgentStages(t *testing
 		t.Fatal("accepted the Agent schema for a host-owned stage")
 	}
 }
+
+func TestStandardAuthoringCodexSandboxMatchesWorkspaceCapability(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mode       workflowkit.WorkspaceMode
+		wantMode   string
+		wantPolicy string
+	}{
+		{name: "no workspace", mode: workflowkit.WorkspaceNone, wantMode: CodexAppServerSandboxModeReadOnly, wantPolicy: CodexAppServerSandboxPolicyReadOnly},
+		{name: "read-only snapshot", mode: workflowkit.WorkspaceReadOnlySnapshot, wantMode: CodexAppServerSandboxModeReadOnly, wantPolicy: CodexAppServerSandboxPolicyReadOnly},
+		{name: "exclusive writer", mode: workflowkit.WorkspaceExclusiveWriter, wantMode: CodexAppServerSandboxModeWorkspaceWrite, wantPolicy: CodexAppServerSandboxPolicyWorkspaceWrite},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mode, policy, err := StandardAuthoringCodexSandboxForWorkspace(test.mode)
+			if err != nil || mode != test.wantMode || policy != test.wantPolicy {
+				t.Fatalf("sandbox for %q = %q/%q, %v; want %q/%q", test.mode, mode, policy, err, test.wantMode, test.wantPolicy)
+			}
+		})
+	}
+	if _, _, err := StandardAuthoringCodexSandboxForWorkspace("unsupported"); err == nil {
+		t.Fatal("unsupported workspace mode received a Codex sandbox")
+	}
+}

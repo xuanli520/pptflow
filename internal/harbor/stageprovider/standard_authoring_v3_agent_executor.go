@@ -114,11 +114,8 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) executeV3AgentTurn(ctx 
 	if failure != "" {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failure), nil
 	}
-	if role.Workspace.Mode == workflowkit.WorkspaceExclusiveWriter {
-		if !standardAuthoringCodexInvocationWorkspaceWrite(attested) {
-			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
-		}
-	} else if attested.SandboxMode != CodexAppServerSandboxModeReadOnly || attested.SandboxPolicy != CodexAppServerSandboxPolicyReadOnly {
+	requiredSandboxMode, requiredSandboxPolicy, err := StandardAuthoringCodexSandboxForWorkspace(role.Workspace.Mode)
+	if err != nil || attested.SandboxMode != requiredSandboxMode || attested.SandboxPolicy != requiredSandboxPolicy {
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
 	submission := newStandardAuthoringV3Submission(request.Stage, role.RoleID, taskRoot, program.MaxOutputBytes)
