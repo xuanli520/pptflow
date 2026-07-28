@@ -29,6 +29,8 @@ type taskBoardGatewayStub struct {
 	startRequests               []app.TaskBoardStartAuthoringRequest
 	decisionRequests            []app.TaskBoardDecideReviewRequest
 	recoveryPreviews            []app.TaskBoardPreviewRunRecoveryRequest
+	standardProtocolPreviews    []app.TaskBoardPreviewStandardProtocolRetryRequest
+	standardProtocolPrepares    []app.TaskBoardPrepareStandardProtocolRetryRequest
 	retryRequests               []app.TaskBoardRetryRunRequest
 	launchRetryRequests         []app.TaskBoardRetryAuthoringLaunchRequest
 	cancelRequests              []app.TaskBoardCancelRunRequest
@@ -40,7 +42,11 @@ type taskBoardGatewayStub struct {
 	startErr                    error
 	decisionErr                 error
 	recoveryPreview             app.TaskBoardRecoveryPreview
+	standardProtocolPreview     app.TaskBoardStandardProtocolRetryPreview
+	standardProtocolPrepared    app.TaskBoardPreparedStandardProtocolRetry
 	recoveryPreviewErr          error
+	standardProtocolPreviewErr  error
+	standardProtocolPrepareErr  error
 	recoveryPreviewDeadline     time.Time
 	retryErr                    error
 	launchRetryErr              error
@@ -111,6 +117,37 @@ func (stub *taskBoardGatewayStub) PreviewRunRecovery(ctx context.Context, reques
 		preview.SemanticPlanFingerprint = workflowkit.SHA256Fingerprint([]byte("task-board-recovery-preview"))
 	}
 	return preview, stub.recoveryPreviewErr
+}
+
+func (stub *taskBoardGatewayStub) PreviewStandardProtocolRetry(_ context.Context, request app.TaskBoardPreviewStandardProtocolRetryRequest) (app.TaskBoardStandardProtocolRetryPreview, error) {
+	stub.standardProtocolPreviews = append(stub.standardProtocolPreviews, request)
+	preview := stub.standardProtocolPreview
+	if preview.TaskID == "" {
+		preview.TaskID = request.TaskID
+	}
+	if preview.RunID == "" {
+		preview.RunID = request.RunID
+	}
+	if preview.Source.StageAttemptID == "" {
+		preview.Source.StageAttemptID = request.StageAttemptID
+	}
+	if preview.Checkpoint.RunID == "" {
+		preview.Checkpoint.RunID = request.RunID
+		preview.Checkpoint.StageAttemptID = request.StageAttemptID
+		preview.Checkpoint.RetryFingerprint = workflowkit.SHA256Fingerprint([]byte("standard-protocol-preview"))
+	}
+	return preview, stub.standardProtocolPreviewErr
+}
+
+func (stub *taskBoardGatewayStub) PrepareStandardProtocolRetry(_ context.Context, request app.TaskBoardPrepareStandardProtocolRetryRequest) (app.TaskBoardPreparedStandardProtocolRetry, error) {
+	stub.standardProtocolPrepares = append(stub.standardProtocolPrepares, request)
+	prepared := stub.standardProtocolPrepared
+	if prepared.RunID == "" {
+		preview, _ := stub.PreviewStandardProtocolRetry(context.Background(), request.TaskBoardPreviewStandardProtocolRetryRequest)
+		prepared.TaskBoardStandardProtocolRetryPreview = preview
+		prepared.Reason = request.Reason
+	}
+	return prepared, stub.standardProtocolPrepareErr
 }
 
 func (stub *taskBoardGatewayStub) RetryRun(_ context.Context, request app.TaskBoardRetryRunRequest) (app.TaskBoardMutation, error) {
@@ -250,6 +287,83 @@ func TestTaskItemsForSnapshotPreservesDurableFailureProjection(t *testing.T) {
 		run.FailureJobID != "job-1" || run.FailureArtifactID != "artifact-1" ||
 		run.FailureRecoveryAction != app.TaskBoardFailureRecoveryReconcile || run.CanRedrive {
 		t.Fatalf("durable failure item = %+v", run)
+	}
+}
+
+func TestAppModelShowsAgentTranscriptSummaryAndDetail(t *testing.T) {
+	now := time.Date(2026, time.July, 28, 10, 0, 0, 0, time.UTC)
+	expires := now.Add(30 * 24 * time.Hour)
+	stub := &taskBoardGatewayStub{snapshot: app.TaskBoardSnapshot{AuthoringAvailable: true, Tasks: []app.TaskBoardTask{{
+		ID: "task-1", Title: "Task one", Column: app.TaskBoardPending, RunID: "run-1", Runs: []app.TaskBoardRun{{
+			ID: "run-1", Status: "failed_recoverable", AgentTurnTranscripts: []app.TaskBoardAgentTranscript{{
+				ID: "transcript-1", StageKey: "repo_structure_research", StageAttemptID: "stage-1", NodeAttemptID: "node-1",
+				Turn: 1, ResponseText: "I inspected the source but did not submit an artifact.", ResponseSHA256: "sha256:abc", ResponseBytes: 52,
+				ModelID: "codex", SubmissionStatus: "not_submitted", ProtocolRejectionCode: "standard_authoring_v3_agent_protocol.missing_submission",
+				FailureCode: "standard_authoring_v3_agent_protocol.missing_submission", CreatedAt: now, ExpiresAt: expires,
+			}},
+		}},
+	}}}}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+	if view := model.detail.View(100, 40); !strings.Contains(view, "Agent 回合") || !strings.Contains(view, "missing_submission") {
+		t.Fatalf("transcript summary = %q", view)
+	}
+	updated, _ := model.handleKey(keyRune('p'), nil)
+	model = updated.(appModel)
+	if model.transcript == nil {
+		t.Fatal("agent transcript detail was not opened")
+	}
+	if view := model.transcript.View(100, 30); !strings.Contains(view, "I inspected the source") || !strings.Contains(view, "模型响应") {
+		t.Fatalf("transcript detail = %q", view)
+	}
+	updated, _ = model.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, nil)
+	if updated.(appModel).transcript != nil {
+		t.Fatal("agent transcript detail did not return to the task detail")
+	}
+}
+
+func TestAppModelConfirmsStandardProtocolRetryInThreeStages(t *testing.T) {
+	stub := &taskBoardGatewayStub{snapshot: app.TaskBoardSnapshot{AuthoringAvailable: true, Tasks: []app.TaskBoardTask{{
+		ID: "task-1", Title: "Task one", Column: app.TaskBoardPending, RunID: "run-1", Runs: []app.TaskBoardRun{{
+			ID: "run-1", Status: "failed_recoverable", CanRetry: true, RetryStrategy: app.TaskBoardRetryStrategyStandardProtocolStage,
+			StandardProtocolRetry: &app.TaskBoardStandardProtocolRetry{StageAttemptID: "stage-1", StageKey: "repo_structure_research", TranscriptID: "transcript-1", FailureCode: "standard_authoring_v3_agent_protocol.missing_submission"},
+		}},
+	}}}}
+	model := loadedTaskBoardModel(t, stub)
+	model.detail = newDetailModel(model.board.SelectedTask())
+	updated, _ := model.handleKey(keyRune('t'), nil)
+	model = updated.(appModel)
+	if model.action == nil || model.action.strategy != app.TaskBoardRetryStrategyStandardProtocolStage {
+		t.Fatalf("standard protocol retry prompt = %+v", model.action)
+	}
+	model.action.reasonInput.SetValue("retry the missing submission")
+	updated, previewCommand := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	previewMessage := previewCommand()
+	updated, _ = model.Update(previewMessage)
+	model = updated.(appModel)
+	if model.action == nil || model.action.protocolPreview == nil || len(stub.standardProtocolPreviews) != 1 {
+		t.Fatalf("protocol preview = action:%+v requests:%+v", model.action, stub.standardProtocolPreviews)
+	}
+	updated, prepareCommand := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	model = updated.(appModel)
+	prepareMessage := prepareCommand()
+	updated, _ = model.Update(prepareMessage)
+	model = updated.(appModel)
+	if model.action == nil || model.action.protocolPrepared == nil || len(stub.standardProtocolPrepares) != 1 {
+		t.Fatalf("protocol prepare = action:%+v requests:%+v", model.action, stub.standardProtocolPrepares)
+	}
+	updated, retryCommand := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	if updated.(appModel).activeMutation != taskBoardRetryMutation {
+		t.Fatal("protocol retry mutation was not marked in flight")
+	}
+	retryMessage := retryCommand()
+	if _, ok := retryMessage.(taskBoardMutationMsg); !ok || len(stub.retryRequests) != 1 {
+		t.Fatalf("protocol retry message = %#v requests=%+v", retryMessage, stub.retryRequests)
+	}
+	request := stub.retryRequests[0]
+	if request.Reason != "retry the missing submission" || request.ExpectedStandardProtocolRetry == nil || request.ExpectedStandardProtocolRetry.StageAttemptID != "stage-1" {
+		t.Fatalf("protocol retry request = %+v", request)
 	}
 }
 

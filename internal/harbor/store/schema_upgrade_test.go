@@ -35,6 +35,7 @@ func TestUpgradeKnownLegacyConsolidatedV2Schema(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			store := tempDB(t)
 			root := store.rootDir
+			removeAgentTurnTranscriptSchemaForLegacyTest(t, store)
 			if testCase.expectsLegacyTrigger && testCase.trigger == currentTrigger {
 				t.Fatal("legacy trigger fixture was not changed")
 			}
@@ -408,6 +409,7 @@ func legacyV18AuthoringPhase1HandoffTrigger(current string) string {
 
 func prepareLegacyV18SchemaUpgradeFixture(t *testing.T, store *Store) {
 	t.Helper()
+	removeAgentTurnTranscriptSchemaForLegacyTest(t, store)
 	currentTrigger, err := currentAuthoringPhase1HandoffTriggerSQL()
 	if err != nil {
 		t.Fatal(err)
@@ -420,5 +422,50 @@ func prepareLegacyV18SchemaUpgradeFixture(t *testing.T, store *Store) {
 	}
 	if _, err := store.db.Exec(legacyV18AuthoringPhase1HandoffTrigger(currentTrigger)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// removeAgentTurnTranscriptSchemaForLegacyTest makes an exact pre-transcript
+// V18 fixture. The published V18 contract predates all of these tables,
+// indexes, and triggers; retaining any one would make its fingerprint an
+// invented schema which Open must reject rather than upgrade.
+func removeAgentTurnTranscriptSchemaForLegacyTest(t *testing.T, store *Store) {
+	t.Helper()
+	for _, trigger := range []string{
+		"agent_turn_transcripts_no_delete",
+		"agent_turn_transcripts_expiry_only_update",
+		"agent_turn_transcript_submissions_no_delete",
+		"agent_turn_transcript_submissions_expiry_only_update",
+		"agent_turn_transcript_legal_holds_no_delete",
+		"agent_turn_transcript_legal_holds_release_only_update",
+		"entity_id_registry_agent_turn_transcripts_id_immutable",
+		"entity_id_registry_agent_turn_transcripts_insert",
+		"entity_id_registry_agent_turn_transcript_submissions_id_immutable",
+		"entity_id_registry_agent_turn_transcript_submissions_insert",
+		"entity_id_registry_agent_turn_transcript_legal_holds_id_immutable",
+		"entity_id_registry_agent_turn_transcript_legal_holds_insert",
+	} {
+		if _, err := store.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, index := range []string{
+		"idx_agent_turn_transcripts_expiry",
+		"idx_agent_turn_transcripts_node",
+		"idx_agent_turn_transcript_submissions_transcript",
+		"idx_agent_turn_transcript_legal_holds_active",
+	} {
+		if _, err := store.db.Exec(`DROP INDEX ` + index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, table := range []string{
+		"agent_turn_transcript_submissions",
+		"agent_turn_transcript_legal_holds",
+		"agent_turn_transcripts",
+	} {
+		if _, err := store.db.Exec(`DROP TABLE ` + table); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
@@ -21,7 +23,43 @@ const (
 	standardAuthoringV3SubmitOutputTool = "harbor_submit_output"
 	standardAuthoringV3ValidateTool     = "harbor_validate_candidate"
 	standardAuthoringV3ContextLimit     = 2 << 20
+
+	// A returned model turn is an audit fact even when the worker that made the
+	// call is being canceled. Keep the completion write bounded while preserving
+	// the caller's context values for the checkpoint boundary.
+	standardAuthoringV3TranscriptPersistTimeout = 10 * time.Second
+
+	standardAuthoringV3AgentProtocolPrefix = "standard_authoring_v3_agent_protocol."
+
+	// StandardAuthoringProtocolFailureMissingSubmission records a prose-only
+	// response: no terminal submission tool was called.
+	StandardAuthoringProtocolFailureMissingSubmission = standardAuthoringV3AgentProtocolPrefix + "missing_submission"
+	// StandardAuthoringProtocolFailureEmptySubmission records a terminal tool
+	// call without the required structured output.
+	StandardAuthoringProtocolFailureEmptySubmission = standardAuthoringV3AgentProtocolPrefix + "empty_submission"
+	// StandardAuthoringProtocolFailureUndeclaredOutput records output names or
+	// counts that do not match the frozen stage contract.
+	StandardAuthoringProtocolFailureUndeclaredOutput = standardAuthoringV3AgentProtocolPrefix + "undeclared_output"
+	// StandardAuthoringProtocolFailureTypedArtifactInvalid records a malformed
+	// structured submission or typed artifact validation failure.
+	StandardAuthoringProtocolFailureTypedArtifactInvalid = standardAuthoringV3AgentProtocolPrefix + "typed_artifact_invalid"
 )
+
+// IsStandardAuthoringProtocolFailure reports the narrow class of submission
+// failures that may be retried against the same frozen execution inputs. It
+// deliberately excludes runtime, source, policy, quota, and host-validation
+// failures.
+func IsStandardAuthoringProtocolFailure(code string) bool {
+	switch strings.TrimSpace(code) {
+	case StandardAuthoringProtocolFailureMissingSubmission,
+		StandardAuthoringProtocolFailureEmptySubmission,
+		StandardAuthoringProtocolFailureUndeclaredOutput,
+		StandardAuthoringProtocolFailureTypedArtifactInvalid:
+		return true
+	default:
+		return false
+	}
+}
 
 const standardAuthoringV3AgentOutputSchemaCanonicalJSON = `{"$id":"harbor.standard-authoring-v3-agent-output.v1","$schema":"http://json-schema.org/draft-07/schema#","oneOf":[{"additionalProperties":false,"properties":{"verdict":{"const":"pass"}},"required":["verdict"],"type":"object"},{"additionalProperties":false,"properties":{"artifacts":{"items":{"additionalProperties":false,"properties":{"content":{"type":"string"},"name":{"type":"string"}},"required":["name","content"],"type":"object"},"minItems":1,"type":"array"},"verdict":{"const":"pass"}},"required":["verdict","artifacts"],"type":"object"}]}`
 
@@ -156,11 +194,16 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) executeV3AgentTurn(ctx 
 		}
 		return response, err
 	}
+	logPath, cleanupLog, err := executor.controlledTurnLogPath(request, sourceRoot)
+	if err != nil {
+		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureWorkspace), nil
+	}
+	defer cleanupLog()
 	conversation, err := runtime.OpenConversation(ctx, agent.ConversationRequest{
 		ProjectPath: workspace, Model: attested.ModelID, ReasoningEffort: string(attested.ReasoningEffort),
 		SandboxMode: attested.SandboxMode, SandboxPolicy: attested.SandboxPolicy, NetworkAccess: false,
 		WorkspaceRoots: []string{workspace}, TimeoutSeconds: standardAuthoringCodexTimeoutSeconds(request.Stage.Budget.TurnTimeout),
-		MaxOutputBytes: program.MaxOutputBytes, CapabilitySummary: attested.CLIVersionOutput, LogPath: os.DevNull,
+		MaxOutputBytes: program.MaxOutputBytes, CapabilitySummary: attested.CLIVersionOutput, LogPath: logPath,
 		DynamicTools: []agent.DynamicTool{tool},
 	})
 	if err != nil {
@@ -173,7 +216,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) executeV3AgentTurn(ctx 
 	}
 	for ordinal, prompt := range program.TurnPrompts {
 		turn := ordinal + 1
-		if err := executor.checkpoint(ctx, request, program, inputDigest, turn, "turn_ready", ""); err != nil {
+		if err := executor.checkpoint(ctx, request, program, inputDigest, turn, "turn_ready", "", nil); err != nil {
 			if contextError(ctx) != nil {
 				return standardAuthoringCodexInterrupted(), nil
 			}
@@ -185,37 +228,113 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) executeV3AgentTurn(ctx 
 		if currentIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, sourceRoot); err != nil || currentIdentity != sourceIdentity {
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
 		}
-		turnRequest := agent.TurnRequest{ProjectPath: workspace, Prompt: prompt, Model: attested.ModelID, ReasoningEffort: string(attested.ReasoningEffort), SandboxMode: attested.SandboxMode, SandboxPolicy: attested.SandboxPolicy, NetworkAccess: false, WorkspaceRoots: []string{workspace}, TimeoutSeconds: standardAuthoringCodexTimeoutSeconds(request.Stage.Budget.TurnTimeout), MaxOutputBytes: program.MaxOutputBytes, CapabilitySummary: attested.CLIVersionOutput, LogPath: os.DevNull}
+		turnRequest := agent.TurnRequest{ProjectPath: workspace, Prompt: prompt, Model: attested.ModelID, ReasoningEffort: string(attested.ReasoningEffort), SandboxMode: attested.SandboxMode, SandboxPolicy: attested.SandboxPolicy, NetworkAccess: false, WorkspaceRoots: []string{workspace}, TimeoutSeconds: standardAuthoringCodexTimeoutSeconds(request.Stage.Budget.TurnTimeout), MaxOutputBytes: program.MaxOutputBytes, CapabilitySummary: attested.CLIVersionOutput, LogPath: logPath}
 		if turn == 1 {
 			turnRequest.Input = []agent.InputPart{{Type: "text", Text: string(contextDocument)}}
 		}
+		submissionStart := submission.submissionCount()
 		result, turnErr, acceptedResult, acceptedDuringTurn, closeErr := standardAuthoringCodexRunTurnUntilAccepted(ctx, conversation, turnRequest, accepted)
 		if acceptedDuringTurn {
+			failureCode := ""
 			if closeErr != nil {
-				return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
+				failureCode = standardAuthoringCodexFailureRuntime
 			}
-			if currentIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, sourceRoot); err != nil || currentIdentity != sourceIdentity {
-				return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+			if failureCode == "" {
+				if currentIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, sourceRoot); err != nil || currentIdentity != sourceIdentity {
+					failureCode = standardAuthoringCodexFailureSource
+				}
+			}
+			if err := executor.checkpointCompletedTurn(ctx, request, program, inputDigest, turn, result, attested.ModelID, submission, submissionStart, failureCode); err != nil {
+				if contextError(ctx) != nil {
+					return standardAuthoringCodexInterrupted(), nil
+				}
+				return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
+			}
+			if failureCode != "" {
+				if failureCode == standardAuthoringCodexFailureRuntime {
+					return standardAuthoringCodexFailure(workflowkit.FailureProcess, failureCode), nil
+				}
+				return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failureCode), nil
 			}
 			return acceptedResult, nil
 		}
 		if acceptedResult, ok := submission.acceptedResult(); ok {
+			failureCode := ""
 			if currentIdentity, err := executor.verifyFrozenSource(ctx, request.Execution, sourceRoot); err != nil || currentIdentity != sourceIdentity {
-				return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureSource), nil
+				failureCode = standardAuthoringCodexFailureSource
+			}
+			if err := executor.checkpointCompletedTurn(ctx, request, program, inputDigest, turn, result, attested.ModelID, submission, submissionStart, failureCode); err != nil {
+				if contextError(ctx) != nil {
+					return standardAuthoringCodexInterrupted(), nil
+				}
+				return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
+			}
+			if failureCode != "" {
+				return standardAuthoringCodexFailure(workflowkit.FailurePolicy, failureCode), nil
 			}
 			return acceptedResult, nil
 		}
 		if turnErr != nil || result.Model != attested.ModelID {
+			if err := executor.checkpointCompletedTurn(ctx, request, program, inputDigest, turn, result, attested.ModelID, submission, submissionStart, standardAuthoringCodexFailureRuntime); err != nil {
+				if contextError(ctx) != nil {
+					return standardAuthoringCodexInterrupted(), nil
+				}
+				return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
+			}
 			return standardAuthoringCodexFailure(workflowkit.FailureProcess, standardAuthoringCodexFailureRuntime), nil
 		}
-		if err := executor.checkpoint(ctx, request, program, inputDigest, turn, "turn_completed", string(workflowkit.SHA256Fingerprint([]byte(result.Text)))); err != nil {
+		failureCode := ""
+		if turn == len(program.TurnPrompts) {
+			failureCode = submission.terminalFailureCode()
+		}
+		if err := executor.checkpointCompletedTurn(ctx, request, program, inputDigest, turn, result, attested.ModelID, submission, submissionStart, failureCode); err != nil {
 			if contextError(ctx) != nil {
 				return standardAuthoringCodexInterrupted(), nil
 			}
 			return standardAuthoringCodexFailure(workflowkit.FailureUnknown, standardAuthoringCodexFailureCheckpoint), nil
 		}
+		if failureCode != "" {
+			return standardAuthoringCodexFailure(workflowkit.FailureProcess, failureCode), nil
+		}
 	}
-	return standardAuthoringCodexFailure(workflowkit.FailureProcess, "standard_authoring_v3_agent_protocol.missing_submission"), nil
+	return standardAuthoringCodexFailure(workflowkit.FailureProcess, StandardAuthoringProtocolFailureMissingSubmission), nil
+}
+
+func (executor *StandardAuthoringCodexAgentTurnExecutor) checkpointCompletedTurn(ctx context.Context, request workflowkit.StageExecutionRequest, program StandardAuthoringCodexTurnProgram, inputFingerprint workflowkit.Fingerprint, turn int, result agent.TurnResult, expectedModel string, submission *standardAuthoringV3Submission, submissionStart int, failureCode string) error {
+	if submission == nil {
+		return fmt.Errorf("missing V3 submission diagnostics")
+	}
+	transcript := submission.transcriptSince(submissionStart, result, expectedModel, failureCode)
+	durableCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), standardAuthoringV3TranscriptPersistTimeout)
+	defer cancel()
+	return executor.checkpoint(durableCtx, request, program, inputFingerprint, turn, "turn_completed", string(workflowkit.SHA256Fingerprint([]byte(result.Text))), &transcript)
+}
+
+// controlledTurnLogPath keeps App Server JSON-RPC diagnostics out of the
+// immutable source tree. Production RunScoped work writes beneath the managed
+// run root; the static test/embed seam uses a private temporary directory so a
+// log cannot alter the source identity that the executor re-attests.
+func (executor *StandardAuthoringCodexAgentTurnExecutor) controlledTurnLogPath(request workflowkit.StageExecutionRequest, sourceRoot string) (string, func(), error) {
+	key := standardAuthoringCodexExecutionKey(request, 0, "app_server_log")
+	if key == "invalid" {
+		return "", nil, fmt.Errorf("invalid controlled Agent log identity")
+	}
+	if executor.workspaceMode == StandardAuthoringCodexWorkspaceRunScoped {
+		runRoot := filepath.Dir(sourceRoot)
+		if !standardAuthoringPathWithin(executor.workspaceRoot, runRoot) {
+			return "", nil, fmt.Errorf("controlled Agent log root escapes managed workspace")
+		}
+		return filepath.Join(runRoot, "agent-turn-logs", key+".log"), func() {}, nil
+	}
+	directory, err := os.MkdirTemp("", "harbor-standard-authoring-agent-turn-log-")
+	if err != nil {
+		return "", nil, err
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		_ = os.RemoveAll(directory)
+		return "", nil, err
+	}
+	return filepath.Join(directory, key+".log"), func() { _ = os.RemoveAll(directory) }, nil
 }
 
 func standardAuthoringV3ValidateRepairInputs(workflow workflowkit.WorkflowDescriptor, inputs map[string][]byte) error {
@@ -443,6 +562,7 @@ func standardAuthoringV3ArtifactName(path string) string {
 }
 
 type standardAuthoringV3Submission struct {
+	mu                    sync.Mutex
 	stage                 workflowkit.StageDescriptor
 	role                  workflowkit.AgentRoleID
 	taskRoot              string
@@ -452,6 +572,8 @@ type standardAuthoringV3Submission struct {
 	candidateValidator    func(context.Context, workflowkit.CandidateSnapshot, map[string][]byte) (workflowkit.ValidationReceipt, error)
 	repairLedger          func() ([]byte, error)
 	accepted              *workflowkit.StageExecutionResult
+	submissions           []workflowkit.AgentTurnSubmissionAttempt
+	lastRejectionCode     string
 }
 type standardAuthoringV3SubmissionRequest struct {
 	Verdict   string `json:"verdict"`
@@ -479,46 +601,66 @@ func (submission *standardAuthoringV3Submission) dynamicTool() agent.DynamicTool
 		}
 		description = fmt.Sprintf("Required terminal submission for this frozen stage. A prose response never completes the stage. Call exactly once with verdict pass and one raw content artifact for every declared output. Required output names: %s.", strings.Join(names, ", "))
 	}
-	return agent.DynamicTool{Name: name, Description: description, InputSchema: schema, Handler: submission.handle}
+	return agent.DynamicTool{Name: name, Description: description, InputSchema: schema, Handler: submission.handleAndRecord}
 }
+
+func (submission *standardAuthoringV3Submission) handleAndRecord(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	response, err := submission.handle(ctx, raw)
+	submission.recordSubmission(raw, response, err)
+	return response, err
+}
+
 func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	submission.lastRejectionCode = ""
 	if submission.accepted != nil {
+		submission.lastRejectionCode = "already_accepted"
 		return json.RawMessage(`{"accepted":false,"reason":"already_accepted"}`), nil
 	}
 	if err := rejectDuplicateDeploymentCatalogJSONKeys(raw); err != nil {
+		submission.lastRejectionCode = "typed_artifact_invalid"
 		return json.RawMessage(`{"accepted":false,"reason":"invalid_payload"}`), nil
 	}
 	var request standardAuthoringV3SubmissionRequest
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil || request.Verdict != "pass" {
+		submission.lastRejectionCode = "typed_artifact_invalid"
 		return json.RawMessage(`{"accepted":false,"reason":"invalid_payload"}`), nil
 	}
 	if submission.role == workflowkit.AgentRoleAuthor {
 		if len(request.Artifacts) != 0 {
+			submission.lastRejectionCode = "typed_artifact_invalid"
 			return json.RawMessage(`{"accepted":false,"reason":"candidate_tool_does_not_accept_artifacts"}`), nil
 		}
 		result, snapshot, files, err := submission.captureCandidate()
 		if err != nil {
+			submission.lastRejectionCode = "typed_artifact_invalid"
 			return json.RawMessage(`{"accepted":false,"reason":"candidate_invalid"}`), nil
 		}
 		if submission.candidateValidator != nil {
 			if submission.maxValidationAttempts <= 0 || submission.validationAttempts >= submission.maxValidationAttempts {
+				submission.lastRejectionCode = "repair_budget_exhausted"
 				return json.RawMessage(`{"accepted":false,"reason":"repair_budget_exhausted"}`), nil
 			}
 			receipt, validationErr := submission.candidateValidator(ctx, snapshot, files)
 			if validationErr != nil {
+				submission.lastRejectionCode = "validator_unavailable"
 				return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`), nil
 			}
 			submission.validationAttempts++
 			if err := receipt.Validate(); err != nil || receipt.SnapshotDigest != snapshot.Digest {
+				submission.lastRejectionCode = "validator_unavailable"
 				return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`), nil
 			}
 			if receipt.Verdict != workflowkit.ValidationPass {
+				submission.lastRejectionCode = "candidate_rejected"
 				return standardAuthoringV3ValidationToolResponse(false, "candidate_rejected", snapshot.Digest, receipt), nil
 			}
 			receiptJSON, err := json.Marshal(receipt)
 			if err != nil {
+				submission.lastRejectionCode = "validator_unavailable"
 				return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`), nil
 			}
 			result.Artifacts = append(result.Artifacts, workflowkit.StageArtifact{Name: "validation_receipt", SchemaVersion: workflowkit.ValidationReceiptFormat, Content: receiptJSON})
@@ -526,6 +668,7 @@ func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw
 		if submission.repairLedger != nil {
 			ledger, err := submission.repairLedger()
 			if err != nil {
+				submission.lastRejectionCode = "repair_ledger_invalid"
 				return json.RawMessage(`{"accepted":false,"reason":"repair_ledger_invalid"}`), nil
 			}
 			result.Artifacts = append(result.Artifacts, workflowkit.StageArtifact{Name: "workflow_repair_ledger", SchemaVersion: workflowkit.WorkflowRepairLedgerFormat, Content: ledger})
@@ -539,14 +682,139 @@ func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw
 		return response, nil
 	}
 	if len(request.Artifacts) == 0 {
+		submission.lastRejectionCode = "empty_submission"
 		return json.RawMessage(`{"accepted":false,"reason":"structured_output_required"}`), nil
 	}
 	result, err := submission.captureStructured(request)
 	if err != nil {
+		submission.lastRejectionCode = standardAuthoringV3StructuredRejectionCode(err)
 		return json.RawMessage(`{"accepted":false,"reason":"structured_output_invalid"}`), nil
 	}
 	submission.accepted = &result
 	return json.RawMessage(`{"accepted":true}`), nil
+}
+
+func (submission *standardAuthoringV3Submission) recordSubmission(raw, receipt json.RawMessage, handlerErr error) {
+	attempt := workflowkit.AgentTurnSubmissionAttempt{
+		RawRequestJSON: string(append(json.RawMessage(nil), raw...)),
+		ReceiptJSON:    string(append(json.RawMessage(nil), receipt...)),
+	}
+	if handlerErr != nil {
+		attempt.Status = workflowkit.AgentTurnSubmissionRuntimeError
+		attempt.RejectionCode = "tool_error"
+	} else {
+		var response struct {
+			Accepted bool   `json:"accepted"`
+			Reason   string `json:"reason"`
+		}
+		if err := json.Unmarshal(receipt, &response); err != nil {
+			attempt.Status = workflowkit.AgentTurnSubmissionRuntimeError
+			attempt.RejectionCode = "tool_error"
+		} else if response.Accepted {
+			attempt.Status = workflowkit.AgentTurnSubmissionAccepted
+		} else {
+			attempt.Status = workflowkit.AgentTurnSubmissionRejected
+			attempt.RejectionCode = strings.TrimSpace(response.Reason)
+			if attempt.RejectionCode == "" {
+				attempt.RejectionCode = "tool_rejected"
+			}
+		}
+	}
+	validation, err := json.Marshal(struct {
+		Accepted      bool   `json:"accepted"`
+		RejectionCode string `json:"rejection_code,omitempty"`
+	}{Accepted: attempt.Status == workflowkit.AgentTurnSubmissionAccepted, RejectionCode: attempt.RejectionCode})
+	if err != nil {
+		validation = []byte(`{"accepted":false,"rejection_code":"tool_error"}`)
+	}
+	attempt.ValidationJSON = string(validation)
+
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if attempt.Status == workflowkit.AgentTurnSubmissionRejected && submission.lastRejectionCode != "" {
+		attempt.RejectionCode = submission.lastRejectionCode
+		if validation, err := json.Marshal(struct {
+			Accepted      bool   `json:"accepted"`
+			RejectionCode string `json:"rejection_code,omitempty"`
+		}{Accepted: false, RejectionCode: attempt.RejectionCode}); err == nil {
+			attempt.ValidationJSON = string(validation)
+		}
+	}
+	submission.lastRejectionCode = ""
+	submission.submissions = append(submission.submissions, attempt)
+}
+
+func (submission *standardAuthoringV3Submission) submissionCount() int {
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	return len(submission.submissions)
+}
+
+func (submission *standardAuthoringV3Submission) transcriptSince(start int, result agent.TurnResult, expectedModel, failureCode string) workflowkit.AgentTurnTranscript {
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if start < 0 || start > len(submission.submissions) {
+		start = len(submission.submissions)
+	}
+	attempts := append([]workflowkit.AgentTurnSubmissionAttempt(nil), submission.submissions[start:]...)
+	status := workflowkit.AgentTurnSubmissionNotSubmitted
+	if standardAuthoringV3RuntimeFailure(failureCode) {
+		status = workflowkit.AgentTurnSubmissionRuntimeError
+	} else if submission.accepted != nil {
+		status = workflowkit.AgentTurnSubmissionAccepted
+	} else if len(attempts) > 0 {
+		status = workflowkit.AgentTurnSubmissionRejected
+	}
+	modelID := strings.TrimSpace(result.Model)
+	if modelID == "" {
+		modelID = expectedModel
+	}
+	transcript := workflowkit.AgentTurnTranscript{
+		ResponseText: result.Text, ModelID: modelID, SubmissionStatus: status, Submissions: attempts, FailureCode: failureCode,
+	}
+	for index := len(attempts) - 1; index >= 0; index-- {
+		if attempts[index].RejectionCode != "" {
+			transcript.ProtocolRejectionCode = attempts[index].RejectionCode
+			break
+		}
+	}
+	if IsStandardAuthoringProtocolFailure(failureCode) {
+		transcript.ProtocolRejectionCode = failureCode
+	}
+	return transcript
+}
+
+func (submission *standardAuthoringV3Submission) terminalFailureCode() string {
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	if len(submission.submissions) == 0 {
+		return StandardAuthoringProtocolFailureMissingSubmission
+	}
+	for index := len(submission.submissions) - 1; index >= 0; index-- {
+		switch submission.submissions[index].RejectionCode {
+		case "empty_submission", "structured_output_required":
+			return StandardAuthoringProtocolFailureEmptySubmission
+		case "undeclared_output", "unexpected_output", "duplicate_output":
+			return StandardAuthoringProtocolFailureUndeclaredOutput
+		case "typed_artifact_invalid", "structured_output_invalid", "candidate_invalid", "candidate_tool_does_not_accept_artifacts", "invalid_payload":
+			return StandardAuthoringProtocolFailureTypedArtifactInvalid
+		case "validator_unavailable":
+			return standardAuthoringV3AgentProtocolPrefix + "validator_unavailable"
+		case "candidate_rejected":
+			return standardAuthoringV3AgentProtocolPrefix + "candidate_rejected"
+		case "repair_budget_exhausted":
+			return standardAuthoringV3AgentProtocolPrefix + "repair_budget_exhausted"
+		case "repair_ledger_invalid":
+			return standardAuthoringV3AgentProtocolPrefix + "repair_ledger_invalid"
+		case "tool_error":
+			return standardAuthoringCodexFailureRuntime
+		}
+	}
+	return StandardAuthoringProtocolFailureTypedArtifactInvalid
+}
+
+func standardAuthoringV3RuntimeFailure(code string) bool {
+	return strings.TrimSpace(code) == standardAuthoringCodexFailureRuntime
 }
 
 func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, snapshot workflowkit.Fingerprint, receipt workflowkit.ValidationReceipt) json.RawMessage {
@@ -577,9 +845,21 @@ func (submission *standardAuthoringV3Submission) acceptedResult() (workflowkit.S
 	}
 	return *submission.accepted, true
 }
+
+type standardAuthoringV3StructuredSubmissionError struct{ rejectionCode string }
+
+func (err standardAuthoringV3StructuredSubmissionError) Error() string { return err.rejectionCode }
+
+func standardAuthoringV3StructuredRejectionCode(err error) string {
+	if typed, ok := err.(standardAuthoringV3StructuredSubmissionError); ok {
+		return typed.rejectionCode
+	}
+	return "typed_artifact_invalid"
+}
+
 func (submission *standardAuthoringV3Submission) captureStructured(request standardAuthoringV3SubmissionRequest) (workflowkit.StageExecutionResult, error) {
 	if len(request.Artifacts) != len(submission.stage.Outputs) {
-		return workflowkit.StageExecutionResult{}, fmt.Errorf("unexpected output count")
+		return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: "undeclared_output"}
 	}
 	expected := make(map[string]workflowkit.ArtifactSpec, len(submission.stage.Outputs))
 	for _, output := range submission.stage.Outputs {
@@ -589,14 +869,17 @@ func (submission *standardAuthoringV3Submission) captureStructured(request stand
 	seen := map[string]struct{}{}
 	for _, item := range request.Artifacts {
 		output, found := expected[item.Name]
-		if !found || len(item.Content) == 0 || len(item.Content) > submission.limit {
-			return workflowkit.StageExecutionResult{}, fmt.Errorf("invalid structured output")
+		if !found {
+			return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: "undeclared_output"}
+		}
+		if len(item.Content) == 0 || len(item.Content) > submission.limit {
+			return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: "typed_artifact_invalid"}
 		}
 		if _, duplicate := seen[item.Name]; duplicate {
-			return workflowkit.StageExecutionResult{}, fmt.Errorf("duplicate output")
+			return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: "undeclared_output"}
 		}
 		if err := standardAuthoringV3ValidateStructuredOutput(output, []byte(item.Content)); err != nil {
-			return workflowkit.StageExecutionResult{}, err
+			return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: "typed_artifact_invalid"}
 		}
 		seen[item.Name] = struct{}{}
 		artifacts = append(artifacts, workflowkit.StageArtifact{Name: item.Name, SchemaVersion: output.SchemaVersion, Content: []byte(item.Content)})

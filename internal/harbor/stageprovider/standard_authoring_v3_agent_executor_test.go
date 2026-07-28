@@ -3,16 +3,248 @@ package stageprovider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/purplevoid/harbor-factory/internal/agent"
 	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
+
+func TestStandardAuthoringV3ExecutorPersistsProseOnlyTranscript(t *testing.T) {
+	executor, invocation, payload, checkpoints, opened := standardAuthoringV3TranscriptExecutor(t, standardAuthoringV3TranscriptRuntime{result: agent.TurnResult{Text: "I inspected the repository but will not submit.", Model: CodexAppServerProductionModelID}})
+	result, err := executor.ExecuteAgentTurn(context.Background(), invocation, payload)
+	if err != nil {
+		t.Fatalf("execute prose-only turn: %v", err)
+	}
+	if result.ErrorText != StandardAuthoringProtocolFailureMissingSubmission {
+		t.Fatalf("prose-only failure = %q, want %q", result.ErrorText, StandardAuthoringProtocolFailureMissingSubmission)
+	}
+	completed := standardAuthoringV3CompletedTranscript(t, checkpoints())
+	if completed.ResponseText != "I inspected the repository but will not submit." || completed.ModelID != CodexAppServerProductionModelID || completed.SubmissionStatus != workflowkit.AgentTurnSubmissionNotSubmitted || completed.FailureCode != StandardAuthoringProtocolFailureMissingSubmission || completed.ProtocolRejectionCode != StandardAuthoringProtocolFailureMissingSubmission || len(completed.Submissions) != 0 {
+		t.Fatalf("prose-only transcript = %+v", completed)
+	}
+	if logPath := opened().LogPath; logPath == "" || logPath == os.DevNull {
+		t.Fatalf("Agent turn log path = %q, want controlled non-null path", logPath)
+	}
+}
+
+func TestStandardAuthoringV3ExecutorPersistsRejectedSubmissionDiagnostics(t *testing.T) {
+	raw := json.RawMessage(`{"verdict":"pass","artifacts":[{"name":"unknown_output","content":"not allowed"}]}`)
+	executor, invocation, payload, checkpoints, _ := standardAuthoringV3TranscriptExecutor(t, standardAuthoringV3TranscriptRuntime{
+		result: agent.TurnResult{Text: "submitted an output", Model: CodexAppServerProductionModelID}, rawSubmission: raw,
+	})
+	result, err := executor.ExecuteAgentTurn(context.Background(), invocation, payload)
+	if err != nil {
+		t.Fatalf("execute rejected submission turn: %v", err)
+	}
+	if result.ErrorText != StandardAuthoringProtocolFailureUndeclaredOutput {
+		t.Fatalf("rejected submission failure = %q, want %q", result.ErrorText, StandardAuthoringProtocolFailureUndeclaredOutput)
+	}
+	completed := standardAuthoringV3CompletedTranscript(t, checkpoints())
+	if completed.SubmissionStatus != workflowkit.AgentTurnSubmissionRejected || completed.ResponseText != "submitted an output" || completed.FailureCode != StandardAuthoringProtocolFailureUndeclaredOutput || len(completed.Submissions) != 1 {
+		t.Fatalf("rejected submission transcript = %+v", completed)
+	}
+	submission := completed.Submissions[0]
+	if submission.Status != workflowkit.AgentTurnSubmissionRejected || submission.RawRequestJSON != string(raw) || submission.RejectionCode != "undeclared_output" || !json.Valid([]byte(submission.ValidationJSON)) || submission.ReceiptJSON != `{"accepted":false,"reason":"structured_output_invalid"}` {
+		t.Fatalf("rejected submission diagnostic = %+v", submission)
+	}
+	var validation struct {
+		Accepted      bool   `json:"accepted"`
+		RejectionCode string `json:"rejection_code"`
+	}
+	if err := json.Unmarshal([]byte(submission.ValidationJSON), &validation); err != nil || validation.Accepted || validation.RejectionCode != "undeclared_output" {
+		t.Fatalf("rejected submission validation = %+v, %v", validation, err)
+	}
+}
+
+func TestStandardAuthoringV3ExecutorPersistsRuntimeTurnFailure(t *testing.T) {
+	executor, invocation, payload, checkpoints, _ := standardAuthoringV3TranscriptExecutor(t, standardAuthoringV3TranscriptRuntime{turnErr: errors.New("runtime unavailable")})
+	result, err := executor.ExecuteAgentTurn(context.Background(), invocation, payload)
+	if err != nil {
+		t.Fatalf("execute failing turn: %v", err)
+	}
+	if result.ErrorText != standardAuthoringCodexFailureRuntime {
+		t.Fatalf("runtime failure = %q, want %q", result.ErrorText, standardAuthoringCodexFailureRuntime)
+	}
+	completed := standardAuthoringV3CompletedTranscript(t, checkpoints())
+	if completed.ResponseText != "" || completed.ModelID != CodexAppServerProductionModelID || completed.SubmissionStatus != workflowkit.AgentTurnSubmissionRuntimeError || completed.FailureCode != standardAuthoringCodexFailureRuntime || len(completed.Submissions) != 0 {
+		t.Fatalf("runtime transcript = %+v", completed)
+	}
+}
+
+func TestStandardAuthoringV3ExecutorPersistsCompletedTurnAfterExecutionContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runtime := standardAuthoringV3TranscriptRuntime{
+		result:    agent.TurnResult{Text: "the turn completed before cancellation", Model: CodexAppServerProductionModelID},
+		afterTurn: cancel,
+	}
+	executor, invocation, payload, checkpoints, _ := standardAuthoringV3TranscriptExecutor(t, runtime)
+	checkpointContextWasLive := false
+	originalCheckpoint := invocation.Request.Checkpoint
+	invocation.Request.Checkpoint = func(checkpointCtx context.Context, checkpoint workflowkit.StageCheckpoint) (workflowkit.CheckpointReceipt, error) {
+		if checkpoint.Substep == "turn_completed" {
+			checkpointContextWasLive = checkpointCtx.Err() == nil
+		}
+		return originalCheckpoint(checkpointCtx, checkpoint)
+	}
+
+	result, err := executor.ExecuteAgentTurn(ctx, invocation, payload)
+	if err != nil {
+		t.Fatalf("execute canceled-after-turn: %v", err)
+	}
+	if result.ErrorText != StandardAuthoringProtocolFailureMissingSubmission || !checkpointContextWasLive {
+		t.Fatalf("canceled-after-turn result=%+v checkpointContextWasLive=%t", result, checkpointContextWasLive)
+	}
+	completed := standardAuthoringV3CompletedTranscript(t, checkpoints())
+	if completed.ResponseText != "the turn completed before cancellation" || completed.FailureCode != StandardAuthoringProtocolFailureMissingSubmission {
+		t.Fatalf("canceled-after-turn transcript = %+v", completed)
+	}
+}
+
+func TestIsStandardAuthoringProtocolFailureIsNarrow(t *testing.T) {
+	for _, code := range []string{
+		StandardAuthoringProtocolFailureMissingSubmission,
+		StandardAuthoringProtocolFailureEmptySubmission,
+		StandardAuthoringProtocolFailureUndeclaredOutput,
+		StandardAuthoringProtocolFailureTypedArtifactInvalid,
+	} {
+		if !IsStandardAuthoringProtocolFailure(code) {
+			t.Fatalf("protocol failure %q was not eligible", code)
+		}
+	}
+	for _, code := range []string{
+		standardAuthoringCodexFailureRuntime,
+		standardAuthoringCodexFailureSource,
+		standardAuthoringCodexFailureQuota,
+		standardAuthoringV3AgentProtocolPrefix + "validator_unavailable",
+	} {
+		if IsStandardAuthoringProtocolFailure(code) {
+			t.Fatalf("non-protocol failure %q became eligible", code)
+		}
+	}
+}
+
+type standardAuthoringV3TranscriptRuntime struct {
+	result        agent.TurnResult
+	turnErr       error
+	rawSubmission json.RawMessage
+	openRequest   agent.ConversationRequest
+	afterTurn     func()
+}
+
+func (runtime *standardAuthoringV3TranscriptRuntime) OpenConversation(_ context.Context, request agent.ConversationRequest) (agent.Conversation, error) {
+	runtime.openRequest = request
+	return standardAuthoringV3TranscriptConversation{runtime: runtime}, nil
+}
+
+type standardAuthoringV3TranscriptConversation struct {
+	runtime *standardAuthoringV3TranscriptRuntime
+}
+
+func (conversation standardAuthoringV3TranscriptConversation) Turn(ctx context.Context, _ agent.TurnRequest) (agent.TurnResult, error) {
+	if len(conversation.runtime.rawSubmission) != 0 {
+		if len(conversation.runtime.openRequest.DynamicTools) != 1 {
+			return agent.TurnResult{}, errors.New("expected one dynamic tool")
+		}
+		if _, err := conversation.runtime.openRequest.DynamicTools[0].Handler(ctx, conversation.runtime.rawSubmission); err != nil {
+			return agent.TurnResult{}, err
+		}
+	}
+	if conversation.runtime.afterTurn != nil {
+		conversation.runtime.afterTurn()
+	}
+	return conversation.runtime.result, conversation.runtime.turnErr
+}
+
+func (standardAuthoringV3TranscriptConversation) Close() error { return nil }
+
+func standardAuthoringV3TranscriptExecutor(t *testing.T, runtime standardAuthoringV3TranscriptRuntime) (*StandardAuthoringCodexAgentTurnExecutor, StageOperationInvocation, workflowadapter.AgentTurnOperationPayload, func() []workflowkit.StageCheckpoint, func() agent.ConversationRequest) {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.RepoStructureResearch))
+	if !found || stage.AgentRole == nil {
+		t.Fatal("research Agent stage is unavailable")
+	}
+	descriptor := standardAuthoringV3TestDescriptor(stage)
+	role := descriptor.AgentRole.Clone()
+	role.MaxTurns = 1
+	descriptor.AgentRole = &role
+	descriptor.Budget = workflowkit.ExecutionBudget{TurnTimeout: time.Minute, MaxTurns: 1}
+	descriptor.QuotaClaims = []workflowkit.QuotaClaim{{Dimension: "agent_turn", Units: 1, ReclaimPolicy: workflowkit.ReclaimNever}}
+	payload := workflowadapter.AgentTurnOperationPayload{
+		AgentID: CodexAppServerProductionAgentID, ModelID: CodexAppServerProductionModelID, ReasoningEffort: CodexAppServerProductionReasoningEffort, MaxTurns: 1,
+	}
+	program, err := NewStandardAuthoringCodexTurnProgram("transcript-test", "1", []string{"complete the frozen task"}, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoints := make([]workflowkit.StageCheckpoint, 0, 2)
+	now := time.Date(2026, time.July, 28, 0, 0, 0, 0, time.UTC)
+	executor, err := NewStandardAuthoringCodexAgentTurnExecutor(StandardAuthoringCodexAgentTurnExecutorConfig{
+		InvocationFactory: func(context.Context, StageOperationInvocation, workflowadapter.AgentTurnOperationPayload) (CodexAppServerInvocation, error) {
+			return standardAuthoringV3TranscriptInvocation(), nil
+		},
+		WorkspaceRoot:  root,
+		ProgramByStage: map[workflowkit.StageKey]StandardAuthoringCodexTurnProgram{descriptor.Key: program},
+		RuntimeFactory: func(CodexAppServerInvocation) agent.Runtime { return &runtime },
+		Now:            func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation := StageOperationInvocation{
+		Request: workflowkit.StageExecutionRequest{
+			Execution: workflowkit.FrozenExecution{ID: "static-transcript-run"},
+			Claim: workflowkit.JobClaim{Stage: &workflowkit.StageClaim{
+				StageAttempt: workflowkit.AttemptIdentity{ID: "static-transcript-attempt", Kind: workflowkit.AttemptStage, ScopeID: "static", Ordinal: 1}, Stage: descriptor,
+			}},
+			Stage: descriptor,
+			ReadInput: func(context.Context, workflowkit.ArtifactBinding) ([]byte, error) {
+				return nil, errors.New("unexpected input")
+			},
+			Checkpoint: func(_ context.Context, checkpoint workflowkit.StageCheckpoint) (workflowkit.CheckpointReceipt, error) {
+				checkpoints = append(checkpoints, checkpoint.Clone())
+				return workflowkit.CheckpointReceipt{CheckpointID: checkpoint.CheckpointID}, nil
+			},
+			Charge: func(context.Context, workflowkit.StageUsage) error { return nil },
+		},
+		Resolution: workflowadapter.StageOperationResolution{StageKey: descriptor.Key, Operation: workflowadapter.StageOperationBinding{Payload: payload}},
+	}
+	return executor, invocation, payload,
+		func() []workflowkit.StageCheckpoint {
+			return append([]workflowkit.StageCheckpoint(nil), checkpoints...)
+		},
+		func() agent.ConversationRequest { return runtime.openRequest }
+}
+
+func standardAuthoringV3TranscriptInvocation() CodexAppServerInvocation {
+	return CodexAppServerInvocation{
+		AgentID: CodexAppServerProductionAgentID, AgentVersion: "1", ModelID: CodexAppServerProductionModelID, ModelVersion: "1", ReasoningEffort: CodexAppServerProductionReasoningEffort,
+		JavaScriptLauncherPath: "/controlled/codex.js", NodeExecutablePath: "/controlled/node", CodexHomeDirectory: "/controlled/home", CLIVersionOutput: "codex-cli 1",
+		ApprovalPolicy: CodexAppServerApprovalPolicyNever, SandboxMode: CodexAppServerSandboxModeReadOnly, SandboxPolicy: CodexAppServerSandboxPolicyReadOnly,
+	}
+}
+
+func standardAuthoringV3CompletedTranscript(t *testing.T, checkpoints []workflowkit.StageCheckpoint) workflowkit.AgentTurnTranscript {
+	t.Helper()
+	for _, checkpoint := range checkpoints {
+		if checkpoint.Substep == "turn_completed" && checkpoint.AgentTurnTranscript != nil {
+			return checkpoint.AgentTurnTranscript.Clone()
+		}
+	}
+	t.Fatalf("completed transcript checkpoint not found: %+v", checkpoints)
+	return workflowkit.AgentTurnTranscript{}
+}
 
 func TestStandardAuthoringV3SubmissionUsesRawTypedContent(t *testing.T) {
 	stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.RepoStructureResearch))

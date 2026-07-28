@@ -130,6 +130,7 @@ type TaskBoardRun struct {
 	ID                    string
 	ParentRunID           string
 	AuthoringEvidence     *TaskBoardAuthoringEvidence
+	AgentTurnTranscripts  []TaskBoardAgentTranscript
 	Status                string
 	CurrentStage          string
 	FailureStage          string
@@ -150,6 +151,40 @@ type TaskBoardRun struct {
 	CanRetry              bool
 	RetryReason           string
 	RetryStrategy         TaskBoardRetryStrategy
+	StandardProtocolRetry *TaskBoardStandardProtocolRetry
+}
+
+// TaskBoardStandardProtocolRetry identifies the one fenced Agent-stage retry
+// currently eligible for a Standard Authoring Run. It is a display projection;
+// Preview and confirmation revalidate every durable identity.
+type TaskBoardStandardProtocolRetry struct {
+	StageAttemptID string
+	StageKey       string
+	NodeAttemptID  string
+	TranscriptID   string
+	FailureCode    string
+}
+
+// TaskBoardAgentTranscript is the operator-facing, read-only projection of
+// one retained Agent turn. It never grants artifact authority: the executor's
+// separately validated stage result remains the only completion input.
+type TaskBoardAgentTranscript struct {
+	ID                    string
+	StageKey              string
+	StageAttemptID        string
+	NodeAttemptID         string
+	Turn                  int
+	ResponseText          string
+	ResponseSHA256        string
+	ResponseBytes         int64
+	ModelID               string
+	SubmissionStatus      string
+	SubmissionCount       int
+	ProtocolRejectionCode string
+	FailureCode           string
+	CreatedAt             time.Time
+	ExpiresAt             time.Time
+	ExpiredAt             *time.Time
 }
 
 // TaskBoardAuthoringEvidence is a bounded, read-only projection of the
@@ -219,8 +254,9 @@ const (
 type TaskBoardRetryStrategy string
 
 const (
-	TaskBoardRetryStrategyNone             TaskBoardRetryStrategy = ""
-	TaskBoardRetryStrategyTaskContinuation TaskBoardRetryStrategy = "task_continuation"
+	TaskBoardRetryStrategyNone                  TaskBoardRetryStrategy = ""
+	TaskBoardRetryStrategyTaskContinuation      TaskBoardRetryStrategy = "task_continuation"
+	TaskBoardRetryStrategyStandardProtocolStage TaskBoardRetryStrategy = "standard_protocol_stage"
 )
 
 // TaskBoardLog is a bounded read of a worker log selected through a Run's
@@ -297,6 +333,7 @@ type TaskBoardRetryRunRequest struct {
 	Reason                          string
 	ExpectedRecoveryCheckpoint      *workflowkit.CheckpointRef
 	ExpectedRecoveryPlanFingerprint workflowkit.Fingerprint
+	ExpectedStandardProtocolRetry   *StandardProtocolStageRetryCheckpoint
 }
 
 // TaskBoardPreviewRunRecoveryRequest identifies a read-only recovery-plan
@@ -328,6 +365,40 @@ type TaskBoardRecoveryPreview struct {
 	InvalidatedStages       []string
 	OperatorOnlyStages      []string
 	StageReasons            map[string][]string
+}
+
+// TaskBoardStandardProtocolRetryPreview is the reviewable retry source for a
+// failed Standard Agent stage. It intentionally exposes only transcript
+// metadata, never treating response text as an artifact or completion input.
+type TaskBoardStandardProtocolRetryPreview struct {
+	TaskID       string
+	RunID        string
+	StageKey     string
+	Source       TaskBoardStandardProtocolRetry
+	Checkpoint   StandardProtocolStageRetryCheckpoint
+	ResponseSHA  string
+	ResponseSize int64
+	ModelID      string
+	Status       string
+}
+
+type TaskBoardPreviewStandardProtocolRetryRequest struct {
+	TaskID         string
+	RunID          string
+	StageAttemptID string
+	Reason         string
+}
+
+type TaskBoardPrepareStandardProtocolRetryRequest struct {
+	TaskBoardPreviewStandardProtocolRetryRequest
+	Expected StandardProtocolStageRetryCheckpoint
+}
+
+// TaskBoardPreparedStandardProtocolRetry is the last read-only fence before
+// the operator confirms the Store-backed retry transaction.
+type TaskBoardPreparedStandardProtocolRetry struct {
+	TaskBoardStandardProtocolRetryPreview
+	Reason string
 }
 
 // TaskBoardRetryAuthoringLaunchRequest targets a failed pre-Task source
@@ -445,6 +516,8 @@ type TaskBoardGateway interface {
 	DecideReview(context.Context, TaskBoardDecideReviewRequest) (TaskBoardMutation, error)
 	ReadRunLog(context.Context, TaskBoardReadRunLogRequest) (TaskBoardLog, error)
 	PreviewRunRecovery(context.Context, TaskBoardPreviewRunRecoveryRequest) (TaskBoardRecoveryPreview, error)
+	PreviewStandardProtocolRetry(context.Context, TaskBoardPreviewStandardProtocolRetryRequest) (TaskBoardStandardProtocolRetryPreview, error)
+	PrepareStandardProtocolRetry(context.Context, TaskBoardPrepareStandardProtocolRetryRequest) (TaskBoardPreparedStandardProtocolRetry, error)
 	RetryRun(context.Context, TaskBoardRetryRunRequest) (TaskBoardMutation, error)
 	RetryAuthoringLaunch(context.Context, TaskBoardRetryAuthoringLaunchRequest) (TaskBoardMutation, error)
 	CancelRun(context.Context, TaskBoardCancelRunRequest) (TaskBoardMutation, error)
@@ -485,6 +558,7 @@ type TaskBoardService struct {
 	mutations         *LifecycleMutationService
 	activations       *RunActivationService
 	continuations     *TaskContinuationService
+	runs              *RunService
 	control           *ExecutionControlService
 	evaluatorLaunches *CodeEdgeEvaluatorLaunchService
 	evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService
@@ -492,7 +566,7 @@ type TaskBoardService struct {
 	actor             func() (string, error)
 }
 
-func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, control *ExecutionControlService, evaluatorLaunches *CodeEdgeEvaluatorLaunchService, evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService, workerLauncher RunWorkerHandoffLauncher) *TaskBoardService {
+func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspectionService, authoring *StandardAuthoringLaunchService, authoringReviews *AuthoringReviewService, mutations *LifecycleMutationService, activations *RunActivationService, continuations *TaskContinuationService, runs *RunService, control *ExecutionControlService, evaluatorLaunches *CodeEdgeEvaluatorLaunchService, evaluatorEvidence *CodeEdgeEvaluatorEvidenceHandoffService, workerLauncher RunWorkerHandoffLauncher) *TaskBoardService {
 	return &TaskBoardService{
 		core:              core,
 		inspection:        inspection,
@@ -501,6 +575,7 @@ func newTaskBoardService(core *lifecycleServiceCore, inspection *LifecycleInspec
 		mutations:         mutations,
 		activations:       activations,
 		continuations:     continuations,
+		runs:              runs,
 		control:           control,
 		evaluatorLaunches: evaluatorLaunches,
 		evaluatorEvidence: evaluatorEvidence,
@@ -812,9 +887,56 @@ func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoard
 	case store.WorkflowRunSubjectTaskRevision:
 		return service.retryTaskRevisionRun(ctx, prepared, actor)
 	case store.WorkflowRunSubjectAuthoringSession:
-		return TaskBoardMutation{}, fmt.Errorf("Standard authoring 3.0 runs cannot be retried; start a new source/session run")
+		return service.retryStandardProtocolStage(ctx, prepared, actor, request.ExpectedStandardProtocolRetry)
 	default:
 		return TaskBoardMutation{}, fmt.Errorf("Run %s has no retry contract", prepared.RunID)
+	}
+}
+
+// PreviewStandardProtocolRetry renders the source facts for an eligible
+// Standard Agent retry. It does not create a command, stage attempt, job, or
+// audit record; Prepare and RetryRun revalidate the same immutable checkpoint.
+func (service *TaskBoardService) PreviewStandardProtocolRetry(ctx context.Context, request TaskBoardPreviewStandardProtocolRetryRequest) (TaskBoardStandardProtocolRetryPreview, error) {
+	if service == nil || service.runs == nil {
+		return TaskBoardStandardProtocolRetryPreview{}, fmt.Errorf("task board Standard protocol retry service is not configured")
+	}
+	if strings.TrimSpace(request.Reason) == "" {
+		return TaskBoardStandardProtocolRetryPreview{}, fmt.Errorf("task board Standard protocol retry reason is required")
+	}
+	if _, err := service.taskBoardRun(ctx, strings.TrimSpace(request.TaskID), strings.TrimSpace(request.RunID)); err != nil {
+		return TaskBoardStandardProtocolRetryPreview{}, err
+	}
+	preview, err := service.runs.PreviewStandardProtocolStageRetry(ctx, request.RunID, request.StageAttemptID)
+	if err != nil {
+		return TaskBoardStandardProtocolRetryPreview{}, err
+	}
+	return taskBoardStandardProtocolRetryPreview(request.TaskID, preview), nil
+}
+
+// PrepareStandardProtocolRetry is the second, read-only confirmation fence.
+// It requires a reason and replays the preview against current durable facts
+// so the final mutation cannot silently retarget a newer failure.
+func (service *TaskBoardService) PrepareStandardProtocolRetry(ctx context.Context, request TaskBoardPrepareStandardProtocolRetryRequest) (TaskBoardPreparedStandardProtocolRetry, error) {
+	preview, err := service.PreviewStandardProtocolRetry(ctx, request.TaskBoardPreviewStandardProtocolRetryRequest)
+	if err != nil {
+		return TaskBoardPreparedStandardProtocolRetry{}, err
+	}
+	if preview.Checkpoint != request.Expected {
+		return TaskBoardPreparedStandardProtocolRetry{}, ErrStandardProtocolStageRetryStale
+	}
+	return TaskBoardPreparedStandardProtocolRetry{TaskBoardStandardProtocolRetryPreview: preview, Reason: strings.TrimSpace(request.Reason)}, nil
+}
+
+func taskBoardStandardProtocolRetryPreview(taskID string, preview StandardProtocolStageRetryPreview) TaskBoardStandardProtocolRetryPreview {
+	transcript := preview.Transcript
+	return TaskBoardStandardProtocolRetryPreview{
+		TaskID: taskID, RunID: preview.Run.ID, StageKey: string(preview.StageKey),
+		Source: TaskBoardStandardProtocolRetry{
+			StageAttemptID: preview.SourceStageAttempt.ID, StageKey: string(preview.StageKey), NodeAttemptID: preview.SourceNodeAttempt.ID,
+			TranscriptID: transcript.ID, FailureCode: preview.Checkpoint.FailureCode,
+		},
+		Checkpoint: preview.Checkpoint, ResponseSHA: transcript.ResponseSHA256, ResponseSize: transcript.ResponseBytes,
+		ModelID: transcript.ModelID, Status: string(transcript.SubmissionStatus),
 	}
 }
 
@@ -974,6 +1096,23 @@ func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepa
 		return TaskBoardMutation{}, err
 	}
 	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Run 排队重试"}, nil
+}
+
+func (service *TaskBoardService) retryStandardProtocolStage(ctx context.Context, prepared preparedTaskBoardRunAction, actor string, expected *StandardProtocolStageRetryCheckpoint) (TaskBoardMutation, error) {
+	if service.runs == nil || expected == nil {
+		return TaskBoardMutation{}, ErrStandardProtocolStageRetryStale
+	}
+	receipt, err := service.runs.RetryStandardProtocolStage(ctx, StandardProtocolStageRetryCommand{
+		IdempotencyKey: prepared.IdempotencyKey, Actor: actor, Reason: prepared.Reason, RunID: prepared.RunID,
+		SourceStageAttemptID: expected.StageAttemptID, Expected: *expected,
+	})
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	if err := service.FlushQueuedRuns(ctx); err != nil {
+		return TaskBoardMutation{}, err
+	}
+	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: receipt.Run.ID, Summary: "已为当前 Standard 阶段排队重试"}, nil
 }
 
 // CancelRun records a durable termination request for the selected Run. A
@@ -1229,6 +1368,13 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 	}
 	run.RetryStrategy = taskBoardRetryStrategy(inspected.Run)
 	service.projectTaskBoardAuthoringContext(ctx, inspected.Run, &run)
+	run.AgentTurnTranscripts = service.projectTaskBoardAgentTurnTranscripts(ctx, inspected.Run, inspected.Stages)
+	if protocolRetry := service.projectTaskBoardStandardProtocolRetry(ctx, inspected.Run, inspected.Stages); protocolRetry != nil {
+		run.RetryStrategy = TaskBoardRetryStrategyStandardProtocolStage
+		run.StandardProtocolRetry = protocolRetry
+		run.CanRetry = true
+		return run
+	}
 	if inspected.Run.SubjectKind == store.WorkflowRunSubjectTaskRevision && inspected.Run.Status == store.WorkflowRunWaitingContinuation && taskBoardHasNeedsRepair(inspected.Stages) {
 		run.RetryStrategy = TaskBoardRetryStrategyNone
 		run.CanRetry = false
@@ -1237,6 +1383,63 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 	}
 	run.CanRetry, run.RetryReason = taskBoardRetryAvailability(inspected.Run)
 	return run
+}
+
+func (service *TaskBoardService) projectTaskBoardStandardProtocolRetry(ctx context.Context, run store.WorkflowRun, attempts []store.StageAttempt) *TaskBoardStandardProtocolRetry {
+	if service == nil || service.runs == nil || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || run.Status != store.WorkflowRunFailedRecoverable {
+		return nil
+	}
+	for index := len(attempts) - 1; index >= 0; index-- {
+		attempt := attempts[index]
+		if attempt.ExecutionStatus != store.StageExecutionInfraFailed {
+			continue
+		}
+		preview, err := service.runs.PreviewStandardProtocolStageRetry(ctx, run.ID, attempt.ID)
+		if err != nil {
+			continue
+		}
+		return &TaskBoardStandardProtocolRetry{
+			StageAttemptID: preview.SourceStageAttempt.ID, StageKey: string(preview.StageKey), NodeAttemptID: preview.SourceNodeAttempt.ID,
+			TranscriptID: preview.Transcript.ID, FailureCode: preview.Checkpoint.FailureCode,
+		}
+	}
+	return nil
+}
+
+func (service *TaskBoardService) projectTaskBoardAgentTurnTranscripts(ctx context.Context, run store.WorkflowRun, attempts []store.StageAttempt) []TaskBoardAgentTranscript {
+	if service == nil || service.core == nil || service.core.store == nil || run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+		return nil
+	}
+	transcripts := make([]TaskBoardAgentTranscript, 0)
+	for _, attempt := range attempts {
+		items, err := service.core.store.ListAgentTurnTranscriptsForStageAttempt(ctx, attempt.ID)
+		if err != nil {
+			return nil
+		}
+		for _, item := range items {
+			submissions, err := service.core.store.ListAgentTurnTranscriptSubmissions(ctx, item.ID)
+			if err != nil {
+				return nil
+			}
+			transcripts = append(transcripts, TaskBoardAgentTranscript{
+				ID: item.ID, StageKey: attempt.StageKey, StageAttemptID: attempt.ID, NodeAttemptID: item.NodeAttemptID,
+				Turn: item.Turn, ResponseText: item.ResponseText, ResponseSHA256: item.ResponseSHA256, ResponseBytes: item.ResponseBytes,
+				ModelID: item.ModelID, SubmissionStatus: string(item.SubmissionStatus), SubmissionCount: len(submissions),
+				ProtocolRejectionCode: item.ProtocolRejectionCode, FailureCode: item.FailureCode, CreatedAt: item.CreatedAt,
+				ExpiresAt: item.ExpiresAt, ExpiredAt: item.ExpiredAt,
+			})
+		}
+	}
+	sort.SliceStable(transcripts, func(left, right int) bool {
+		if !transcripts[left].CreatedAt.Equal(transcripts[right].CreatedAt) {
+			return transcripts[left].CreatedAt.After(transcripts[right].CreatedAt)
+		}
+		if transcripts[left].StageAttemptID != transcripts[right].StageAttemptID {
+			return transcripts[left].StageAttemptID > transcripts[right].StageAttemptID
+		}
+		return transcripts[left].Turn > transcripts[right].Turn
+	})
+	return transcripts
 }
 
 // projectTaskBoardAuthoringContext exposes the contract-safe evidence view

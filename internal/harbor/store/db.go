@@ -729,6 +729,10 @@ func (s *Store) applyLegacyConsolidatedV2SchemaUpgrade() error {
 	if err != nil {
 		return err
 	}
+	agentTurnTranscriptSQL, err := currentAgentTurnTranscriptSchemaSQL()
+	if err != nil {
+		return err
+	}
 	expectedContract, err := consolidatedV2SchemaContract()
 	if err != nil {
 		return fmt.Errorf("derive upgraded V2 schema contract: %w", err)
@@ -759,6 +763,9 @@ func (s *Store) applyLegacyConsolidatedV2SchemaUpgrade() error {
 	}
 	if _, err := tx.Exec(triggerSQL); err != nil {
 		return fmt.Errorf("install upgraded Standard authoring handoff trigger: %w", err)
+	}
+	if _, err := tx.Exec(agentTurnTranscriptSQL); err != nil {
+		return fmt.Errorf("install agent turn transcript schema: %w", err)
 	}
 	var duplicateParentRunID string
 	err = tx.QueryRowContext(context.Background(), `
@@ -851,6 +858,40 @@ func currentCodeEdgeEvaluatorParentIndexSQL() (string, error) {
 	relativeEnd := strings.Index(migrationV2[start:], endMarker)
 	if relativeEnd < 0 {
 		return "", fmt.Errorf("current CodeEdge evaluator child uniqueness index boundary is missing from V2 migration")
+	}
+	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
+}
+
+// currentAgentTurnTranscriptSchemaSQL extracts every object that composes the
+// transcript retention boundary from the same frozen baseline used for fresh
+// control planes. Known legacy V2 roots receive these objects in the atomic
+// schema-contract upgrade, never through a second schema-version history.
+func currentAgentTurnTranscriptSchemaSQL() (string, error) {
+	sections := [][2]string{
+		{"-- table agent_turn_transcripts", "-- table outbox_delivery_operations_v9"},
+		{"-- index idx_agent_turn_transcripts_expiry", "-- index idx_turn_checkpoints_node"},
+		{"-- trigger agent_turn_transcripts_no_delete", "-- trigger audit_events_no_delete"},
+		{"-- trigger entity_id_registry_agent_turn_transcripts_id_immutable", "-- trigger entity_id_registry_budget_grants_id_immutable"},
+	}
+	result := make([]string, 0, len(sections))
+	for _, section := range sections {
+		value, err := migrationV2Section(section[0], section[1])
+		if err != nil {
+			return "", err
+		}
+		result = append(result, value)
+	}
+	return strings.Join(result, "\n\n"), nil
+}
+
+func migrationV2Section(startMarker, endMarker string) (string, error) {
+	start := strings.Index(migrationV2, startMarker)
+	if start < 0 {
+		return "", fmt.Errorf("V2 migration section %q is missing", startMarker)
+	}
+	relativeEnd := strings.Index(migrationV2[start:], endMarker)
+	if relativeEnd < 0 {
+		return "", fmt.Errorf("V2 migration section %q boundary is missing", startMarker)
 	}
 	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
 }

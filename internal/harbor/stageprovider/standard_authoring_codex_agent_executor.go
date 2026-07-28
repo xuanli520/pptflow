@@ -442,7 +442,7 @@ func standardAuthoringCodexQuotaClaim(stage workflowkit.StageDescriptor, dimensi
 	return units, found
 }
 
-func (executor *StandardAuthoringCodexAgentTurnExecutor) checkpoint(ctx context.Context, request workflowkit.StageExecutionRequest, program StandardAuthoringCodexTurnProgram, inputFingerprint workflowkit.Fingerprint, turn int, substep, responseDigest string) error {
+func (executor *StandardAuthoringCodexAgentTurnExecutor) checkpoint(ctx context.Context, request workflowkit.StageExecutionRequest, program StandardAuthoringCodexTurnProgram, inputFingerprint workflowkit.Fingerprint, turn int, substep, responseDigest string, transcript *workflowkit.AgentTurnTranscript) error {
 	payload, err := json.Marshal(struct {
 		Format             string                  `json:"format"`
 		ProgramFingerprint workflowkit.Fingerprint `json:"program_fingerprint"`
@@ -457,18 +457,23 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) checkpoint(ctx context.
 	if err != nil {
 		return err
 	}
-	_, err = request.Checkpoint(ctx, workflowkit.StageCheckpoint{
+	checkpoint := workflowkit.StageCheckpoint{
 		CheckpointID:   standardAuthoringCodexCheckpointKey(request, turn, substep),
 		IdempotencyKey: standardAuthoringCodexCheckpointKey(request, turn, substep),
 		TurnOrdinal:    turn,
 		Substep:        substep,
 		Payload:        payload,
-		// A Codex App Server conversation is intentionally ephemeral. Persisting
-		// its raw transcript to claim resumability would violate the no-secret-log
-		// rule, so recovery must create a new fenced stage attempt for now.
+		// A Codex App Server conversation is intentionally ephemeral. Its retained
+		// diagnostic transcript is not resumable conversation state, so recovery
+		// must create a new fenced stage attempt.
 		Resumable:  false,
 		OccurredAt: executor.now().UTC(),
-	})
+	}
+	if transcript != nil {
+		value := transcript.Clone()
+		checkpoint.AgentTurnTranscript = &value
+	}
+	_, err = request.Checkpoint(ctx, checkpoint)
 	return err
 }
 

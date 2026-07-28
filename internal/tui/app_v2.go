@@ -40,6 +40,7 @@ type appModel struct {
 	input           TaskInputModel
 	detail          *detailModel
 	logs            *logModel
+	transcript      *agentTranscriptModel
 	review          *reviewPrompt
 	action          *runActionPrompt
 	evaluatorAction *evaluatorActionPrompt
@@ -64,6 +65,10 @@ type appModel struct {
 	activationInFlight      bool
 	recoveryPreviewInFlight bool
 	recoveryPreviewEpoch    uint64
+	protocolPreviewInFlight bool
+	protocolPreviewEpoch    uint64
+	protocolPrepareInFlight bool
+	protocolPrepareEpoch    uint64
 	evaluatorActionEpoch    uint64
 	exitInFlight            bool
 	exitFlushFailed         bool
@@ -97,6 +102,26 @@ type taskBoardRecoveryPreviewMsg struct {
 	runID   string
 	reason  string
 	err     error
+}
+
+type taskBoardProtocolRetryPreviewMsg struct {
+	preview app.TaskBoardStandardProtocolRetryPreview
+	epoch   uint64
+	taskID  string
+	runID   string
+	stageID string
+	reason  string
+	err     error
+}
+
+type taskBoardProtocolRetryPreparedMsg struct {
+	prepared app.TaskBoardPreparedStandardProtocolRetry
+	epoch    uint64
+	taskID   string
+	runID    string
+	stageID  string
+	reason   string
+	err      error
 }
 
 type taskBoardLogMsg struct {
@@ -151,6 +176,7 @@ type pendingTaskBoardRunAction struct {
 	reason          string
 	key             string
 	recoveryPreview *app.TaskBoardRecoveryPreview
+	protocolRetry   *app.TaskBoardPreparedStandardProtocolRetry
 }
 
 type reviewPrompt struct {
@@ -177,12 +203,14 @@ func (prompt *reviewPrompt) View(width int) string {
 }
 
 type runActionPrompt struct {
-	kind            taskBoardRunActionKind
-	strategy        app.TaskBoardRetryStrategy
-	reasonInput     textinput.Model
-	validationErr   string
-	requiresReason  bool
-	recoveryPreview *app.TaskBoardRecoveryPreview
+	kind             taskBoardRunActionKind
+	strategy         app.TaskBoardRetryStrategy
+	reasonInput      textinput.Model
+	validationErr    string
+	requiresReason   bool
+	recoveryPreview  *app.TaskBoardRecoveryPreview
+	protocolPreview  *app.TaskBoardStandardProtocolRetryPreview
+	protocolPrepared *app.TaskBoardPreparedStandardProtocolRetry
 }
 
 func newRunActionPrompt(kind taskBoardRunActionKind, strategy app.TaskBoardRetryStrategy) *runActionPrompt {
@@ -201,6 +229,8 @@ func (prompt *runActionPrompt) View(width int) string {
 	case taskBoardRetryAction:
 		if prompt.strategy == app.TaskBoardRetryStrategyTaskContinuation {
 			label = "断点恢复创题 Run"
+		} else if prompt.strategy == app.TaskBoardRetryStrategyStandardProtocolStage {
+			label = "重试当前 Standard 阶段"
 		}
 	case taskBoardRetryAuthoringLaunchAction:
 		label = "重试源码捕获"
@@ -210,6 +240,10 @@ func (prompt *runActionPrompt) View(width int) string {
 	content := detailSectionTitleStyle.Render(label)
 	if prompt.recoveryPreview != nil {
 		content += "\n" + recoveryPreviewView(*prompt.recoveryPreview, max(1, width-4))
+	} else if prompt.protocolPrepared != nil {
+		content += "\n" + standardProtocolRetryPreviewView(prompt.protocolPrepared.TaskBoardStandardProtocolRetryPreview, "重试准备", max(1, width-4))
+	} else if prompt.protocolPreview != nil {
+		content += "\n" + standardProtocolRetryPreviewView(*prompt.protocolPreview, "协议重试预览", max(1, width-4))
 	} else if prompt.requiresReason {
 		content += "\n" + prompt.reasonInput.View()
 	}
@@ -217,6 +251,19 @@ func (prompt *runActionPrompt) View(width int) string {
 		content += "\n" + failStyleV2.Render(prompt.validationErr)
 	}
 	return inputStyle.Width(max(1, width)).Render(content)
+}
+
+func standardProtocolRetryPreviewView(preview app.TaskBoardStandardProtocolRetryPreview, title string, width int) string {
+	fields := []string{
+		detailField("目标阶段", displayStageName(preview.StageKey), width),
+		detailField("失败 attempt", preview.Source.StageAttemptID, width),
+		detailField("Transcript", preview.Source.TranscriptID, width),
+		detailField("协议状态", preview.Status, width),
+		detailField("失败码", preview.Source.FailureCode, width),
+		detailField("模型", preview.ModelID, width),
+		detailField("响应摘要", fmt.Sprintf("%d bytes · %s", preview.ResponseSize, preview.ResponseSHA), width),
+	}
+	return renderDetailSection(title, detailFields(width, fields...), width)
 }
 
 func recoveryPreviewView(preview app.TaskBoardRecoveryPreview, width int) string {
@@ -449,6 +496,17 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, inputCmd
 			}
+			if msg.kind == taskBoardRetryMutation && errors.Is(msg.err, app.ErrStandardProtocolStageRetryStale) {
+				m.err = nil
+				m.pendingAction = nil
+				m.deferredAction = nil
+				if m.action != nil {
+					m.action.protocolPreview = nil
+					m.action.protocolPrepared = nil
+					m.action.validationErr = "协议重试来源已变化，请重新核验"
+				}
+				return m, inputCmd
+			}
 			m.err = msg.err
 			return m, inputCmd
 		}
@@ -511,6 +569,55 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.action.recoveryPreview = &msg.preview
 		return m, inputCmd
 
+	case taskBoardProtocolRetryPreviewMsg:
+		if msg.epoch != m.protocolPreviewEpoch {
+			return m, inputCmd
+		}
+		m.protocolPreviewInFlight = false
+		if m.action == nil || m.action.kind != taskBoardRetryAction || m.detail == nil || !m.detail.hasCurrentRun() ||
+			m.detail.task.ID != msg.taskID || m.detail.currentRun().ID != msg.runID ||
+			strings.TrimSpace(m.action.reasonInput.Value()) != msg.reason {
+			m.notice = "协议重试预览已过期，请重新核验"
+			return m, inputCmd
+		}
+		if msg.err != nil {
+			m.action.validationErr = "无法生成协议重试预览: " + msg.err.Error()
+			return m, inputCmd
+		}
+		if msg.preview.TaskID != msg.taskID || msg.preview.RunID != msg.runID || msg.preview.Source.StageAttemptID != msg.stageID ||
+			msg.preview.Checkpoint.RunID != msg.runID || msg.preview.Checkpoint.StageAttemptID != msg.stageID || msg.preview.Checkpoint.RetryFingerprint == "" {
+			m.action.validationErr = "协议重试预览无效，请重新核验"
+			return m, inputCmd
+		}
+		m.action.validationErr = ""
+		m.action.protocolPreview = &msg.preview
+		m.action.protocolPrepared = nil
+		return m, inputCmd
+
+	case taskBoardProtocolRetryPreparedMsg:
+		if msg.epoch != m.protocolPrepareEpoch {
+			return m, inputCmd
+		}
+		m.protocolPrepareInFlight = false
+		if m.action == nil || m.action.protocolPreview == nil || m.detail == nil || !m.detail.hasCurrentRun() ||
+			m.detail.task.ID != msg.taskID || m.detail.currentRun().ID != msg.runID ||
+			strings.TrimSpace(m.action.reasonInput.Value()) != msg.reason {
+			m.notice = "协议重试准备已过期，请重新核验"
+			return m, inputCmd
+		}
+		if msg.err != nil {
+			m.action.validationErr = "无法准备协议重试: " + msg.err.Error()
+			return m, inputCmd
+		}
+		if msg.prepared.TaskID != msg.taskID || msg.prepared.RunID != msg.runID || msg.prepared.Source.StageAttemptID != msg.stageID ||
+			msg.prepared.Checkpoint != m.action.protocolPreview.Checkpoint || msg.prepared.Reason != msg.reason {
+			m.action.validationErr = "协议重试准备无效，请重新核验"
+			return m, inputCmd
+		}
+		m.action.validationErr = ""
+		m.action.protocolPrepared = &msg.prepared
+		return m, inputCmd
+
 	case taskBoardEvaluatorPreviewMsg:
 		return m.applyEvaluatorPreview(msg, inputCmd)
 
@@ -550,6 +657,9 @@ func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cm
 
 	if m.logs != nil {
 		return m.handleLogKey(msg, inputCmd)
+	}
+	if m.transcript != nil {
+		return m.handleAgentTranscriptKey(msg, inputCmd)
 	}
 
 	if m.evaluatorAction != nil {
@@ -653,6 +763,8 @@ func (m appModel) handleDetailKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, 
 		return m, inputCmd
 	case "l":
 		return m.openLog(inputCmd)
+	case "p":
+		return m.openAgentTranscript(inputCmd)
 	case "t":
 		if m.detail != nil && m.detail.hasAuthoringLaunch() {
 			return m.openRunActionPrompt(taskBoardRetryAuthoringLaunchAction, inputCmd)
@@ -704,6 +816,30 @@ func (m appModel) handleLogKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea
 	return m, inputCmd
 }
 
+func (m appModel) handleAgentTranscriptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.transcript == nil {
+		return m, inputCmd
+	}
+	width, height := m.logDimensions()
+	switch msg.String() {
+	case "esc", "q", "ctrl+c":
+		m.transcript = nil
+	case "up", "k":
+		m.transcript.MoveUp(width, height)
+	case "down", "j":
+		m.transcript.MoveDown(width, height)
+	case "pgup", "ctrl+u":
+		m.transcript.PageUp(width, height)
+	case "pgdown", "ctrl+d":
+		m.transcript.PageDown(width, height)
+	case "left", "h":
+		m.transcript.MovePrevious()
+	case "right", "l":
+		m.transcript.MoveNext()
+	}
+	return m, inputCmd
+}
+
 func (m appModel) handleReviewPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
 	if m.mutationInFlight() {
 		m.notice = "操作仍在提交，请等待结果"
@@ -739,7 +875,7 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 		return m, inputCmd
 	}
 	if m.mutationInFlight() {
-		if m.recoveryPreviewInFlight {
+		if m.recoveryPreviewInFlight || m.protocolPreviewInFlight || m.protocolPrepareInFlight {
 			m.notice = "正在核验断点恢复计划，请等待结果"
 		} else {
 			m.notice = "操作仍在提交，请等待结果"
@@ -752,8 +888,18 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 		m.deferredAction = nil
 		m.recoveryPreviewEpoch++
 		m.recoveryPreviewInFlight = false
+		m.protocolPreviewInFlight = false
+		m.protocolPrepareInFlight = false
+		m.protocolPreviewEpoch++
+		m.protocolPrepareEpoch++
 		return m, inputCmd
 	case "enter":
+		if m.action.protocolPrepared != nil {
+			return m.beginRunAction(m.action.kind, strings.TrimSpace(m.action.reasonInput.Value()), inputCmd)
+		}
+		if m.action.protocolPreview != nil {
+			return m.beginProtocolRetryPrepare(inputCmd)
+		}
 		if m.action.recoveryPreview != nil {
 			return m.beginRunAction(m.action.kind, strings.TrimSpace(m.action.reasonInput.Value()), inputCmd)
 		}
@@ -767,6 +913,9 @@ func (m appModel) handleRunActionPromptKey(msg tea.KeyMsg, inputCmd tea.Cmd) (te
 		}
 		if m.action.kind == taskBoardRetryAction && requiresRecoveryPreview(m.action.strategy) {
 			return m.beginRecoveryPreview(reason, inputCmd)
+		}
+		if m.action.kind == taskBoardRetryAction && requiresProtocolRetryPreview(m.action.strategy) {
+			return m.beginProtocolRetryPreview(reason, inputCmd)
 		}
 		return m.beginRunAction(m.action.kind, reason, inputCmd)
 	}
@@ -824,6 +973,15 @@ func (m appModel) openLog(inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(inputCmd, m.readRunLog(m.detail.task.ID, run.ID, m.logEpoch))
 }
 
+func (m appModel) openAgentTranscript(inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.detail == nil || !m.detail.hasAgentTurnTranscripts() {
+		m.notice = "当前 Run 没有可查看的 Agent 回合"
+		return m, inputCmd
+	}
+	m.transcript = newAgentTranscriptModel(m.detail.task)
+	return m, inputCmd
+}
+
 func (m appModel) detailTask() *TaskItem {
 	if m.detail == nil {
 		return nil
@@ -840,7 +998,7 @@ func (m appModel) contentWidth() int {
 }
 
 func (m appModel) mutationInFlight() bool {
-	return m.activeMutation != "" || m.recoveryPreviewInFlight
+	return m.activeMutation != "" || m.recoveryPreviewInFlight || m.protocolPreviewInFlight || m.protocolPrepareInFlight
 }
 
 func (m appModel) requestRefresh() (appModel, tea.Cmd) {
@@ -1000,6 +1158,15 @@ func (m appModel) beginRunAction(kind taskBoardRunActionKind, reason string, inp
 		}
 		current.recoveryPreview = &preview
 	}
+	if kind == taskBoardRetryAction && m.action != nil && requiresProtocolRetryPreview(m.action.strategy) && m.action.protocolPrepared != nil {
+		prepared := *m.action.protocolPrepared
+		if prepared.TaskID != current.taskID || prepared.RunID != current.runID || prepared.Checkpoint.RetryFingerprint == "" || prepared.Reason != current.reason {
+			m.action.protocolPrepared = nil
+			m.action.validationErr = "协议重试准备已过期，请重新核验"
+			return m, inputCmd
+		}
+		current.protocolRetry = &prepared
+	}
 	if m.pendingAction != nil && m.pendingAction.kind == current.kind && m.pendingAction.taskID == current.taskID && m.pendingAction.runID == current.runID && m.pendingAction.reason == current.reason {
 		current.key = m.pendingAction.key
 	} else {
@@ -1034,6 +1201,79 @@ func (m appModel) beginRecoveryPreview(reason string, inputCmd tea.Cmd) (tea.Mod
 	return m, tea.Batch(inputCmd, m.previewRunRecovery(m.detail.task.ID, run.ID, reason, m.recoveryPreviewEpoch))
 }
 
+func (m appModel) beginProtocolRetryPreview(reason string, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.mutationInFlight() || m.detail == nil || m.action == nil || !m.detail.hasCurrentRun() {
+		m.notice = "请等待当前操作完成"
+		return m, inputCmd
+	}
+	run := m.detail.currentRun()
+	if run.StandardProtocolRetry == nil || run.StandardProtocolRetry.StageAttemptID == "" {
+		m.action.validationErr = "当前 Run 没有可重试的协议失败阶段"
+		return m, inputCmd
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		m.action.validationErr = "操作原因不能为空"
+		return m, inputCmd
+	}
+	m.action.validationErr = ""
+	m.action.protocolPreview = nil
+	m.action.protocolPrepared = nil
+	m.protocolPreviewEpoch++
+	m.protocolPreviewInFlight = true
+	return m, tea.Batch(inputCmd, m.previewStandardProtocolRetry(m.detail.task.ID, run.ID, run.StandardProtocolRetry.StageAttemptID, reason, m.protocolPreviewEpoch))
+}
+
+func (m appModel) previewStandardProtocolRetry(taskID, runID, stageID, reason string, epoch uint64) tea.Cmd {
+	return func() tea.Msg {
+		if m.gateway == nil {
+			return taskBoardProtocolRetryPreviewMsg{epoch: epoch, taskID: taskID, runID: runID, stageID: stageID, reason: reason, err: fmt.Errorf("task board service is not configured")}
+		}
+		ctx := m.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(ctx, recoveryPreviewTimeout)
+		defer cancel()
+		preview, err := m.gateway.PreviewStandardProtocolRetry(ctx, app.TaskBoardPreviewStandardProtocolRetryRequest{
+			TaskID: taskID, RunID: runID, StageAttemptID: stageID, Reason: reason,
+		})
+		return taskBoardProtocolRetryPreviewMsg{preview: preview, epoch: epoch, taskID: taskID, runID: runID, stageID: stageID, reason: reason, err: err}
+	}
+}
+
+func (m appModel) beginProtocolRetryPrepare(inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.mutationInFlight() || m.detail == nil || m.action == nil || m.action.protocolPreview == nil || !m.detail.hasCurrentRun() {
+		m.notice = "请等待当前操作完成"
+		return m, inputCmd
+	}
+	reason := strings.TrimSpace(m.action.reasonInput.Value())
+	if reason == "" {
+		m.action.validationErr = "操作原因不能为空"
+		return m, inputCmd
+	}
+	preview := *m.action.protocolPreview
+	m.action.validationErr = ""
+	m.protocolPrepareEpoch++
+	m.protocolPrepareInFlight = true
+	return m, tea.Batch(inputCmd, m.prepareStandardProtocolRetry(preview, reason, m.protocolPrepareEpoch))
+}
+
+func (m appModel) prepareStandardProtocolRetry(preview app.TaskBoardStandardProtocolRetryPreview, reason string, epoch uint64) tea.Cmd {
+	return func() tea.Msg {
+		if m.gateway == nil {
+			return taskBoardProtocolRetryPreparedMsg{epoch: epoch, taskID: preview.TaskID, runID: preview.RunID, stageID: preview.Source.StageAttemptID, reason: reason, err: fmt.Errorf("task board service is not configured")}
+		}
+		prepared, err := m.gateway.PrepareStandardProtocolRetry(m.ctx, app.TaskBoardPrepareStandardProtocolRetryRequest{
+			TaskBoardPreviewStandardProtocolRetryRequest: app.TaskBoardPreviewStandardProtocolRetryRequest{
+				TaskID: preview.TaskID, RunID: preview.RunID, StageAttemptID: preview.Source.StageAttemptID, Reason: reason,
+			},
+			Expected: preview.Checkpoint,
+		})
+		return taskBoardProtocolRetryPreparedMsg{prepared: prepared, epoch: epoch, taskID: preview.TaskID, runID: preview.RunID, stageID: preview.Source.StageAttemptID, reason: reason, err: err}
+	}
+}
+
 func (m appModel) previewRunRecovery(taskID, runID, reason string, epoch uint64) tea.Cmd {
 	return func() tea.Msg {
 		if m.gateway == nil {
@@ -1056,6 +1296,10 @@ func (m appModel) previewRunRecovery(taskID, runID, reason string, epoch uint64)
 
 func requiresRecoveryPreview(strategy app.TaskBoardRetryStrategy) bool {
 	return strategy == app.TaskBoardRetryStrategyTaskContinuation
+}
+
+func requiresProtocolRetryPreview(strategy app.TaskBoardRetryStrategy) bool {
+	return strategy == app.TaskBoardRetryStrategyStandardProtocolStage
 }
 
 func (m appModel) scheduleRunAction(pending pendingTaskBoardRunAction, inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
@@ -1102,6 +1346,10 @@ func (m appModel) runAction(pending pendingTaskBoardRunAction) tea.Cmd {
 				checkpoint := pending.recoveryPreview.Checkpoint
 				request.ExpectedRecoveryCheckpoint = &checkpoint
 				request.ExpectedRecoveryPlanFingerprint = pending.recoveryPreview.SemanticPlanFingerprint
+			}
+			if pending.protocolRetry != nil {
+				checkpoint := pending.protocolRetry.Checkpoint
+				request.ExpectedStandardProtocolRetry = &checkpoint
 			}
 			mutation, err := m.gateway.RetryRun(m.ctx, request)
 			return taskBoardMutationMsg{kind: taskBoardRetryMutation, mutation: mutation, err: err}
@@ -1198,10 +1446,16 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 				copy.Lineage = append([]app.TaskBoardAuthoringArtifact(nil), run.AuthoringEvidence.Lineage...)
 				authoringEvidence = &copy
 			}
+			var standardProtocolRetry *app.TaskBoardStandardProtocolRetry
+			if run.StandardProtocolRetry != nil {
+				copy := *run.StandardProtocolRetry
+				standardProtocolRetry = &copy
+			}
 			item.Runs = append(item.Runs, TaskRunItem{
 				ID:                    run.ID,
 				ParentRunID:           run.ParentRunID,
 				AuthoringEvidence:     authoringEvidence,
+				AgentTurnTranscripts:  append([]app.TaskBoardAgentTranscript(nil), run.AgentTurnTranscripts...),
 				Status:                run.Status,
 				CurrentStage:          run.CurrentStage,
 				FailureStage:          run.FailureStage,
@@ -1222,6 +1476,7 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 				CanRetry:              run.CanRetry,
 				RetryReason:           run.RetryReason,
 				RetryStrategy:         run.RetryStrategy,
+				StandardProtocolRetry: standardProtocolRetry,
 			})
 		}
 		switch task.Column {
@@ -1244,6 +1499,15 @@ func (m appModel) View() string {
 		return "loading..."
 	}
 	contentWidth := m.contentWidth()
+	if m.transcript != nil {
+		width, height := m.logDimensions()
+		return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top,
+			headerStyle.Width(contentWidth).Render("Harbor Task Factory"),
+			m.transcript.View(width, height),
+			m.statusView(),
+			footerStyle.Render("[↑↓/jk] 滚动  [←→/hl] 切换回合  [PgUp/PgDn] 翻页  [q] 返回详情"),
+		))
+	}
 
 	if m.logs != nil {
 		width, height := m.logDimensions()
@@ -1273,10 +1537,20 @@ func (m appModel) View() string {
 			footerText := "[enter] 确认操作  [esc] 取消"
 			if m.recoveryPreviewInFlight {
 				footerText = "正在核验断点恢复计划..."
+			} else if m.protocolPreviewInFlight {
+				footerText = "正在核验协议重试来源..."
+			} else if m.protocolPrepareInFlight {
+				footerText = "正在准备协议重试..."
+			} else if m.action.protocolPrepared != nil {
+				footerText = "[enter] 确认重试当前阶段  [esc] 取消"
+			} else if m.action.protocolPreview != nil {
+				footerText = "[enter] 准备重试当前阶段  [esc] 取消"
 			} else if m.action.recoveryPreview != nil {
 				footerText = "[enter] 确认从此断点恢复  [esc] 取消"
 			} else if m.action.kind == taskBoardRetryAction && requiresRecoveryPreview(m.action.strategy) {
 				footerText = "[enter] 查看断点恢复计划  [esc] 取消"
+			} else if m.action.kind == taskBoardRetryAction && requiresProtocolRetryPreview(m.action.strategy) {
+				footerText = "[enter] 查看协议重试来源  [esc] 取消"
 			}
 			footer = footerStyle.Render(footerText)
 		}
@@ -1327,10 +1601,15 @@ func detailFooterText(detail *detailModel) string {
 	}
 	if detail != nil && detail.hasCurrentRun() {
 		actions = append(actions, "[l] 日志")
+		if detail.hasAgentTurnTranscripts() {
+			actions = append(actions, "[p] Agent 回合")
+		}
 		if detail.canRetryCurrentRun() {
 			label := "重试"
 			if detail.currentRun().RetryStrategy == app.TaskBoardRetryStrategyTaskContinuation {
 				label = "断点恢复"
+			} else if detail.currentRun().RetryStrategy == app.TaskBoardRetryStrategyStandardProtocolStage {
+				label = "重试当前阶段"
 			}
 			actions = append(actions, "[t] "+label)
 		}

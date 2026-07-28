@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -79,6 +80,144 @@ func TestFrozenExecutionRuntimeCoordinatorOnlyEnqueuesMissingPeerFromActiveBatch
 	rightAttempt, err := fixture.store.GetStageAttempt(ctx, right.Payload.StageAttemptID)
 	if err != nil || rightAttempt == nil || rightAttempt.ExecutionStatus != store.StageExecutionQueued {
 		t.Fatalf("right stage attempt = %+v, %v; want queued", rightAttempt, err)
+	}
+}
+
+func TestFrozenExecutionRuntimeCoordinatorUsesLatestLinearSameStageRetry(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, completedFixtureStage))
+	worker := newFrozenRuntimeWorker(t, fixture.store, runtime, "same-stage-retry-worker")
+
+	initial, err := worker.RunOnce(ctx)
+	if err != nil || initial.FinalState != store.JobSucceeded {
+		t.Fatalf("schedule initial source stage = %+v, %v", initial, err)
+	}
+	sourceJob, sourcePayload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
+	markRuntimeStageTerminal(t, ctx, fixture.store, sourcePayload.StageAttemptID, store.StageExecutionInfraFailed, "")
+	source, err := fixture.store.GetStageAttempt(ctx, sourcePayload.StageAttemptID)
+	if err != nil || source == nil {
+		t.Fatalf("load failed source stage = %+v, %v", source, err)
+	}
+	run, err := fixture.store.GetWorkflowRun(ctx, fixture.run.ID)
+	if err != nil || run == nil {
+		t.Fatalf("load running fixture run = %+v, %v", run, err)
+	}
+	runValue, err := fixture.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunFailedRecoverable,
+		Actor: runtimeFixtureActor, Reason: "simulate recoverable protocol failure",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot runtimeStageAttemptSnapshot
+	if err := json.Unmarshal([]byte(source.RetrySnapshotJSON), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Generation++
+	retrySnapshot, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := fixture.store.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: source.RunID, RetryOfStageAttemptID: source.ID, StageKey: source.StageKey, StageGroup: source.StageGroup,
+		Ordinal: source.Ordinal + 1, InputFingerprint: source.InputFingerprint, BudgetSnapshotJSON: source.BudgetSnapshotJSON,
+		RetrySnapshotJSON: string(retrySnapshot), Actor: runtimeFixtureActor, Reason: "create same-stage retry fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryPayload := sourcePayload
+	retryPayload.StageAttemptID = retry.ID
+	retryPayload.Generation = snapshot.Generation
+	retryPayloadJSON, err := json.Marshal(retryPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryJob, err := fixture.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "stage_attempt.execute", EntityType: "stage_attempt", EntityID: retry.ID, RunID: retry.RunID, StageAttemptID: retry.ID,
+		PayloadJSON: string(retryPayloadJSON), IdempotencyKey: "same-stage-retry:" + retry.ID, Actor: runtimeFixtureActor, Reason: "execute same-stage retry fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: runValue.ID, ExpectedVersion: runValue.Version, Status: store.WorkflowRunRunning,
+		Actor: runtimeFixtureActor, Reason: "resume same-stage retry fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The historic source job is still deliverable but terminal. It must not
+	// replace the successful retry in the coordinator's durable projection.
+	ignored, err := worker.RunOnce(ctx)
+	if err != nil || ignored.Job == nil || ignored.Job.ID != sourceJob.ID || ignored.FinalState != store.JobSucceeded {
+		t.Fatalf("settle historic source job = %+v, %v", ignored, err)
+	}
+	executed, err := worker.RunOnce(ctx)
+	if err != nil || executed.Job == nil || executed.Job.ID != retryJob.ID || executed.FinalState != store.JobSucceeded {
+		t.Fatalf("execute retry stage job = %+v, %v", executed, err)
+	}
+	jobs, err := runtime.stageJobsForPlan(ctx, fixture.run.ID, "initial")
+	if err != nil {
+		t.Fatalf("load retry-aware coordinator jobs: %v", err)
+	}
+	selected, found := jobs[runtimeFixtureSourceStage]
+	if !found || selected.Job.ID != retryJob.ID || selected.Payload.StageAttemptID != retry.ID {
+		t.Fatalf("coordinator selected source stage = %+v, want retry %s", selected, retryJob.ID)
+	}
+
+	advanced, err := worker.RunOnce(ctx)
+	if err != nil || advanced.FinalState != store.JobSucceeded {
+		t.Fatalf("advance coordinator after retry success = %+v, %v", advanced, err)
+	}
+	verifyJob, verifyPayload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureVerifyStage)
+	if verifyJob.State != store.JobQueued || verifyPayload.StageAttemptID == "" {
+		t.Fatalf("downstream stage was not scheduled after retry success: job=%+v payload=%+v", verifyJob, verifyPayload)
+	}
+}
+
+func TestFrozenExecutionRuntimeCoordinatorRejectsIndependentSameStageDuplicateJob(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFrozenRuntimeFixture(t)
+	defer fixture.store.Close()
+	runtime := newFrozenRuntime(t, fixture.services, frozenRuntimeRegistry(t, fixture.frozen.Workflow, completedFixtureStage))
+	worker := newFrozenRuntimeWorker(t, fixture.store, runtime, "duplicate-stage-job-worker")
+	if result, err := worker.RunOnce(ctx); err != nil || result.FinalState != store.JobSucceeded {
+		t.Fatalf("schedule initial source stage = %+v, %v", result, err)
+	}
+	sourceJob, sourcePayload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
+	source, err := fixture.store.GetStageAttempt(ctx, sourcePayload.StageAttemptID)
+	if err != nil || source == nil {
+		t.Fatalf("load source stage = %+v, %v", source, err)
+	}
+	duplicate, err := fixture.store.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: source.RunID, StageKey: source.StageKey, StageGroup: source.StageGroup, Ordinal: source.Ordinal + 1,
+		InputFingerprint: source.InputFingerprint, BudgetSnapshotJSON: source.BudgetSnapshotJSON, RetrySnapshotJSON: source.RetrySnapshotJSON,
+		Actor: runtimeFixtureActor, Reason: "construct independent duplicate stage job",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicatePayload := sourcePayload
+	duplicatePayload.StageAttemptID = duplicate.ID
+	duplicatePayloadJSON, err := json.Marshal(duplicatePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.CreateDurableJob(ctx, store.CreateDurableJobRequest{
+		CommandType: "stage_attempt.execute", EntityType: "stage_attempt", EntityID: duplicate.ID, RunID: duplicate.RunID, StageAttemptID: duplicate.ID,
+		PayloadJSON: string(duplicatePayloadJSON), IdempotencyKey: "independent-same-stage-job:" + duplicate.ID,
+		Actor: runtimeFixtureActor, Reason: "construct independent duplicate stage job",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.stageJobsForPlan(ctx, fixture.run.ID, "initial"); !errors.Is(err, ErrFrozenExecutionPayload) {
+		t.Fatalf("independent duplicate job error = %v, want invalid frozen payload", err)
+	}
+	if sourceJob.ID == "" {
+		t.Fatal("source stage job must remain present for duplicate check")
 	}
 }
 

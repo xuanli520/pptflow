@@ -119,6 +119,9 @@ func (d *detailModel) View(width, height int) string {
 	if failure := d.failureFields(contentWidth); failure != "" {
 		parts = append(parts, renderDetailSection("失败原因", failure, contentWidth))
 	}
+	if transcripts := d.agentTranscriptFields(contentWidth); transcripts != "" {
+		parts = append(parts, renderDetailSection("Agent 回合", transcripts, contentWidth))
+	}
 	if evaluator := d.evaluatorStatus(); evaluator != nil {
 		fields := []string{
 			detailField("状态", displayEvaluatorState(evaluator.State), contentWidth),
@@ -211,6 +214,8 @@ func (d *detailModel) currentRunFields(width int) string {
 	retryLabel := "重试"
 	if run.RetryStrategy == app.TaskBoardRetryStrategyTaskContinuation {
 		retryLabel = "断点恢复"
+	} else if run.RetryStrategy == app.TaskBoardRetryStrategyStandardProtocolStage {
+		retryLabel = "重试当前阶段"
 	}
 	if !run.CanRetry {
 		retry = run.RetryReason
@@ -294,6 +299,50 @@ func (d *detailModel) failureFields(width int) string {
 	}
 	wrapped := ansi.WrapWc(ansi.Strip(summary), max(1, width-6), "")
 	fields = append(fields, failStyleV2.Render(wrapped))
+	return detailFields(width, fields...)
+}
+
+func (d *detailModel) agentTurnTranscripts() []app.TaskBoardAgentTranscript {
+	run := d.currentRun()
+	if run == nil {
+		return nil
+	}
+	return run.AgentTurnTranscripts
+}
+
+func (d *detailModel) hasAgentTurnTranscripts() bool {
+	return len(d.agentTurnTranscripts()) > 0
+}
+
+func (d *detailModel) agentTranscriptFields(width int) string {
+	transcripts := d.agentTurnTranscripts()
+	if len(transcripts) == 0 {
+		return ""
+	}
+	limit := min(3, len(transcripts))
+	fields := make([]string, 0, limit*3+1)
+	for _, transcript := range transcripts[:limit] {
+		stage := displayStageName(transcript.StageKey)
+		status := transcript.SubmissionStatus
+		if transcript.ProtocolRejectionCode != "" {
+			status += " / " + transcript.ProtocolRejectionCode
+		}
+		if transcript.FailureCode != "" {
+			status += " / " + transcript.FailureCode
+		}
+		retention := formatDetailTime(&transcript.ExpiresAt)
+		if transcript.ExpiredAt != nil {
+			retention = "正文已清除"
+		}
+		fields = append(fields,
+			detailField("阶段", stage+fmt.Sprintf(" · 第 %d 回合", transcript.Turn), width),
+			detailField("提交", status, width),
+			detailField("保留至", retention, width),
+		)
+	}
+	if remaining := len(transcripts) - limit; remaining > 0 {
+		fields = append(fields, mutedStyle.Render(fmt.Sprintf("另有 %d 个较早回合", remaining)))
+	}
 	return detailFields(width, fields...)
 }
 
@@ -389,6 +438,129 @@ type logModel struct {
 	message   string
 	truncated bool
 	offset    int
+}
+
+// agentTranscriptModel presents retained model output without turning it into
+// a workflow input. It is intentionally read-only and operates solely on the
+// task-board projection already loaded by the TUI.
+type agentTranscriptModel struct {
+	taskName    string
+	transcripts []app.TaskBoardAgentTranscript
+	selected    int
+	offset      int
+}
+
+func newAgentTranscriptModel(task *TaskItem) *agentTranscriptModel {
+	name := "Agent 回合"
+	transcripts := make([]app.TaskBoardAgentTranscript, 0)
+	if task != nil {
+		if task.Name != "" {
+			name = task.Name
+		}
+		for _, run := range task.Runs {
+			if run.ID == task.RunID {
+				transcripts = append(transcripts, run.AgentTurnTranscripts...)
+				break
+			}
+		}
+		if len(transcripts) == 0 && len(task.Runs) > 0 {
+			transcripts = append(transcripts, task.Runs[0].AgentTurnTranscripts...)
+		}
+	}
+	return &agentTranscriptModel{taskName: name, transcripts: transcripts}
+}
+
+func (m *agentTranscriptModel) current() *app.TaskBoardAgentTranscript {
+	if m == nil || m.selected < 0 || m.selected >= len(m.transcripts) {
+		return nil
+	}
+	return &m.transcripts[m.selected]
+}
+
+func (m *agentTranscriptModel) MovePrevious() {
+	if m != nil && m.selected > 0 {
+		m.selected--
+		m.offset = 0
+	}
+}
+
+func (m *agentTranscriptModel) MoveNext() {
+	if m != nil && m.selected+1 < len(m.transcripts) {
+		m.selected++
+		m.offset = 0
+	}
+}
+
+func (m *agentTranscriptModel) lines(width int) []string {
+	transcript := m.current()
+	if transcript == nil {
+		return []string{"未保留 Agent 回合"}
+	}
+	fields := []string{
+		"阶段: " + displayStageName(transcript.StageKey),
+		fmt.Sprintf("回合: %d", transcript.Turn),
+		"模型: " + transcript.ModelID,
+		"提交: " + transcript.SubmissionStatus,
+		fmt.Sprintf("响应: %d bytes · %s", transcript.ResponseBytes, transcript.ResponseSHA256),
+		"创建时间: " + formatDetailTime(&transcript.CreatedAt),
+		"到期时间: " + formatDetailTime(&transcript.ExpiresAt),
+	}
+	if transcript.ProtocolRejectionCode != "" {
+		fields = append(fields, "协议拒绝: "+transcript.ProtocolRejectionCode)
+	}
+	if transcript.FailureCode != "" {
+		fields = append(fields, "失败码: "+transcript.FailureCode)
+	}
+	fields = append(fields, fmt.Sprintf("工具提交: %d", transcript.SubmissionCount), "", "模型响应:")
+	if transcript.ExpiredAt != nil {
+		fields = append(fields, "原文已按保留规则清除")
+	} else if strings.TrimSpace(transcript.ResponseText) == "" {
+		fields = append(fields, "此回合没有返回文本")
+	} else {
+		fields = append(fields, ansi.WrapWc(ansi.Strip(transcript.ResponseText), max(1, width), ""))
+	}
+	return strings.Split(strings.Join(fields, "\n"), "\n")
+}
+
+func (m *agentTranscriptModel) visibleHeight(height int) int {
+	return max(1, height-7)
+}
+
+func (m *agentTranscriptModel) clampOffset(width, height int) {
+	maximum := max(0, len(m.lines(width))-m.visibleHeight(height))
+	m.offset = min(max(0, m.offset), maximum)
+}
+
+func (m *agentTranscriptModel) MoveUp(width, height int) {
+	m.offset--
+	m.clampOffset(width, height)
+}
+
+func (m *agentTranscriptModel) MoveDown(width, height int) {
+	m.offset++
+	m.clampOffset(width, height)
+}
+
+func (m *agentTranscriptModel) PageUp(width, height int) {
+	m.offset -= m.visibleHeight(height)
+	m.clampOffset(width, height)
+}
+
+func (m *agentTranscriptModel) PageDown(width, height int) {
+	m.offset += m.visibleHeight(height)
+	m.clampOffset(width, height)
+}
+
+func (m *agentTranscriptModel) View(width, height int) string {
+	contentWidth := max(24, width)
+	lineWidth := max(1, contentWidth-4)
+	lines := m.lines(lineWidth)
+	m.clampOffset(lineWidth, height)
+	end := min(len(lines), m.offset+m.visibleHeight(height))
+	content := strings.Join(lines[m.offset:end], "\n")
+	position := fmt.Sprintf("%d / %d", m.selected+1, len(m.transcripts))
+	header := detailTitleStyle.Width(max(1, contentWidth-2)).Render(m.taskName + " · Agent 回合 " + position)
+	return lipgloss.JoinVertical(lipgloss.Left, header, inputStyle.Width(contentWidth).Render(content))
 }
 
 func newLogModel(task *TaskItem, log app.TaskBoardLog) *logModel {

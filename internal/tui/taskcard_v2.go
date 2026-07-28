@@ -42,6 +42,7 @@ type TaskRunItem struct {
 	ID                    string
 	ParentRunID           string
 	AuthoringEvidence     *app.TaskBoardAuthoringEvidence
+	AgentTurnTranscripts  []app.TaskBoardAgentTranscript
 	Status                string
 	CurrentStage          string
 	FailureStage          string
@@ -62,6 +63,7 @@ type TaskRunItem struct {
 	CanRetry              bool
 	RetryReason           string
 	RetryStrategy         app.TaskBoardRetryStrategy
+	StandardProtocolRetry *app.TaskBoardStandardProtocolRetry
 }
 
 func truncate(s string, maxLen int) string {

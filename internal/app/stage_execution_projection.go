@@ -34,12 +34,14 @@ type StageArtifact struct {
 // StageCheckpoint is a Harbor durable substep projection converted from a
 // public workflowkit checkpoint callback.
 type StageCheckpoint struct {
-	Turn        int
-	Substep     string
-	InputDigest string
-	PayloadJSON string
-	ArtifactID  string
-	Resumable   bool
+	Turn                int
+	Substep             string
+	InputDigest         string
+	PayloadJSON         string
+	ArtifactID          string
+	AgentTurnTranscript *workflowkit.AgentTurnTranscript
+	Resumable           bool
+	OccurredAt          time.Time
 }
 
 // StageControlSignal is a Harbor durable, target-scoped control projection.

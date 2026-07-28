@@ -46,6 +46,28 @@ func TestLifecycleServicesInstallsOnlyExplicitExternalChangeProviders(t *testing
 	}
 }
 
+func TestLifecycleServicesExposeAgentTranscriptRetentionSweep(t *testing.T) {
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	services, err := newLifecycleServicesForTest(root, database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if services.Transcripts == nil {
+		t.Fatal("agent transcript retention service is not configured")
+	}
+	result, err := services.Transcripts.SweepExpired(context.Background(), SweepExpiredAgentTranscriptsRequest{
+		Limit: 10, Actor: "tester", Reason: "exercise controlled transcript retention sweep",
+	})
+	if err != nil || len(result.Expired) != 0 || len(result.Blocked) != 0 {
+		t.Fatalf("empty transcript retention sweep = %+v, %v", result, err)
+	}
+}
+
 func TestLifecycleServicesExposesOnlyCatalogLockAttestedWorkerResolver(t *testing.T) {
 	root := t.TempDir()
 	database, err := store.OpenForTest(root)

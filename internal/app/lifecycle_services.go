@@ -46,7 +46,10 @@ type LifecycleServices struct {
 	Changes          *ChangeProviderService
 	Repairs          *RepairLoopService
 	Candidates       *CandidateRetentionService
-	Inspection       *LifecycleInspectionService
+	// Transcripts expires raw Agent response material while retaining its
+	// immutable diagnostic and audit metadata.
+	Transcripts *AgentTranscriptRetentionService
+	Inspection  *LifecycleInspectionService
 	// TaskBoard is the compact application boundary consumed by the terminal
 	// task board. It projects durable state and delegates its mutations to the
 	// existing authoring, review, and activation services.
@@ -242,11 +245,12 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
 	evaluatorLaunches := &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider}
 	evaluatorEvidenceHandoffs := &CodeEdgeEvaluatorEvidenceHandoffService{core: core}
-	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, control, evaluatorLaunches, evaluatorEvidenceHandoffs, options.RunWorkerHandoffLauncher)
+	runs := &RunService{core: core}
+	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, runs, control, evaluatorLaunches, evaluatorEvidenceHandoffs, options.RunWorkerHandoffLauncher)
 	services := &LifecycleServices{
 		Tasks:                     &TaskService{core: core},
 		Revisions:                 &RevisionService{core: core},
-		Runs:                      &RunService{core: core},
+		Runs:                      runs,
 		Reviews:                   &ReviewService{core: core},
 		AuthoringReviews:          authoringReviews,
 		Releases:                  &ReleaseService{core: core},
@@ -257,6 +261,7 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		Changes:                   changes,
 		Repairs:                   repairs,
 		Candidates:                &CandidateRetentionService{core: core},
+		Transcripts:               &AgentTranscriptRetentionService{core: core},
 		Inspection:                inspection,
 		TaskBoard:                 taskBoard,
 		CodeEdgeCompliance:        &CodeEdgeComplianceService{core: core},

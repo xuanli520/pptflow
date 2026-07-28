@@ -1239,12 +1239,17 @@ type runtimePlannedStageJob struct {
 	Payload frozenStageExecutionPayload
 }
 
+type runtimePlannedStageJobCandidate struct {
+	runtimePlannedStageJob
+	Attempt store.StageAttempt
+}
+
 func (runtime *FrozenExecutionRuntime) stageJobsForPlan(ctx context.Context, runID, executionKey string) (map[workflowkit.StageKey]runtimePlannedStageJob, error) {
 	jobs, err := runtime.core.store.ListDurableJobsForRun(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
-	result := make(map[workflowkit.StageKey]runtimePlannedStageJob)
+	candidates := make(map[workflowkit.StageKey][]runtimePlannedStageJobCandidate)
 	for _, job := range jobs {
 		if job.CommandType != "stage_attempt.execute" {
 			continue
@@ -1259,10 +1264,35 @@ func (runtime *FrozenExecutionRuntime) stageJobsForPlan(ctx context.Context, run
 		if stageExecutionKey(payload) != executionKey {
 			continue
 		}
-		if previous, exists := result[payload.StageKey]; exists && previous.Job.ID != job.ID {
-			return nil, fmt.Errorf("%w: execution %s has multiple jobs for stage %q", ErrFrozenExecutionPayload, executionKey, payload.StageKey)
+		attempt, err := runtime.core.store.GetStageAttempt(ctx, payload.StageAttemptID)
+		if err != nil {
+			return nil, err
 		}
-		result[payload.StageKey] = runtimePlannedStageJob{Job: job, Payload: payload}
+		if attempt == nil || attempt.RunID != runID || attempt.StageKey != string(payload.StageKey) {
+			return nil, fmt.Errorf("%w: stage job %s has no matching StageAttempt", ErrFrozenExecutionPayload, job.ID)
+		}
+		candidates[payload.StageKey] = append(candidates[payload.StageKey], runtimePlannedStageJobCandidate{
+			runtimePlannedStageJob: runtimePlannedStageJob{Job: job, Payload: payload},
+			Attempt:                *attempt,
+		})
+	}
+	result := make(map[workflowkit.StageKey]runtimePlannedStageJob, len(candidates))
+	for stageKey, stageCandidates := range candidates {
+		if len(stageCandidates) == 1 {
+			result[stageKey] = stageCandidates[0].runtimePlannedStageJob
+			continue
+		}
+		sort.Slice(stageCandidates, func(left, right int) bool {
+			return stageCandidates[left].Attempt.Ordinal < stageCandidates[right].Attempt.Ordinal
+		})
+		for index := 1; index < len(stageCandidates); index++ {
+			previous := stageCandidates[index-1]
+			current := stageCandidates[index]
+			if current.Attempt.Ordinal <= previous.Attempt.Ordinal || current.Attempt.RetryOfStageAttemptID != previous.Attempt.ID {
+				return nil, fmt.Errorf("%w: execution %s has non-linear duplicate jobs for stage %q", ErrFrozenExecutionPayload, executionKey, stageKey)
+			}
+		}
+		result[stageKey] = stageCandidates[len(stageCandidates)-1].runtimePlannedStageJob
 	}
 	return result, nil
 }
@@ -2347,6 +2377,22 @@ func (runtime *FrozenExecutionRuntime) stageCheckpointWriter(stageAttemptID, nod
 		if err != nil {
 			return store.TurnCheckpoint{}, err
 		}
+		if checkpoint.AgentTurnTranscript != nil {
+			transcript := stageAgentTurnTranscriptRequest(nodeAttemptID, checkpoint.Turn, *checkpoint.AgentTurnTranscript, checkpoint.OccurredAt)
+			persisted, err := runtime.core.store.RecordAgentTurnTranscriptWithCheckpoint(ctx, store.RecordAgentTurnTranscriptWithCheckpointRequest{
+				Transcript: transcript,
+				Checkpoint: store.AgentTurnTranscriptCheckpoint{
+					NodeAttemptID: nodeAttemptID, Turn: checkpoint.Turn, Substep: checkpoint.Substep, InputDigest: inputDigest,
+					ArtifactID: checkpoint.ArtifactID, PayloadJSON: string(encoded),
+				},
+				Actor: "runtime", Reason: "durable Agent turn transcript and checkpoint",
+			})
+			if err != nil {
+				return store.TurnCheckpoint{}, err
+			}
+			monitor.markCheckpoint(persisted.Checkpoint.ID, checkpoint.Resumable)
+			return persisted.Checkpoint, nil
+		}
 		created, err := runtime.core.store.CreateTurnCheckpoint(ctx, store.CreateTurnCheckpointRequest{
 			NodeAttemptID: nodeAttemptID, Turn: checkpoint.Turn, Substep: checkpoint.Substep, InputDigest: inputDigest,
 			ArtifactID: checkpoint.ArtifactID, PayloadJSON: string(encoded), Actor: "runtime", Reason: "durable executor checkpoint",
@@ -2364,6 +2410,29 @@ func (runtime *FrozenExecutionRuntime) stageCheckpointWriter(stageAttemptID, nod
 		monitor.markCheckpoint(completed.ID, checkpoint.Resumable)
 		return completed, nil
 	}
+}
+
+func stageAgentTurnTranscriptRequest(nodeAttemptID string, turn int, transcript workflowkit.AgentTurnTranscript, occurredAt time.Time) store.CreateAgentTurnTranscriptRequest {
+	request := store.CreateAgentTurnTranscriptRequest{
+		NodeAttemptID:         nodeAttemptID,
+		Turn:                  turn,
+		ResponseText:          transcript.ResponseText,
+		ModelID:               transcript.ModelID,
+		SubmissionStatus:      store.AgentTurnSubmissionStatus(transcript.SubmissionStatus),
+		ProtocolRejectionCode: transcript.ProtocolRejectionCode,
+		FailureCode:           transcript.FailureCode,
+		OccurredAt:            occurredAt,
+		Actor:                 "runtime",
+		Reason:                "durable Agent turn transcript",
+		Submissions:           make([]store.CreateAgentTurnTranscriptSubmissionRequest, 0, len(transcript.Submissions)),
+	}
+	for index, submission := range transcript.Submissions {
+		request.Submissions = append(request.Submissions, store.CreateAgentTurnTranscriptSubmissionRequest{
+			Ordinal: index + 1, Status: store.AgentTurnSubmissionStatus(submission.Status), RawRequestJSON: submission.RawRequestJSON,
+			ValidationJSON: submission.ValidationJSON, ReceiptJSON: submission.ReceiptJSON, RejectionCode: submission.RejectionCode,
+		})
+	}
+	return request
 }
 
 func (runtime *FrozenExecutionRuntime) pendingStageControl(ctx context.Context, runID, stageAttemptID, actor string) (*store.DurableControlOperation, error) {

@@ -15,3 +15,5 @@ artifacts
 workspace
 manual_eval/
 bin
+
+.ua

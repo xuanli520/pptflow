@@ -633,6 +633,62 @@ CREATE TABLE node_attempts (
     UNIQUE(stage_attempt_id, node_id, generation, attempt)
 );
 
+-- table agent_turn_transcripts
+-- Raw Agent response and dynamic-tool material is retention-limited. The
+-- immutable coordinate and diagnostic facts survive expiry for audit and
+-- operator summaries; the application is the only permitted expiry writer.
+CREATE TABLE agent_turn_transcripts (
+    id                      TEXT PRIMARY KEY,
+    node_attempt_id         TEXT NOT NULL REFERENCES node_attempts(id) ON DELETE RESTRICT,
+    turn                    INTEGER NOT NULL CHECK (turn > 0),
+    response_text           TEXT NOT NULL DEFAULT '',
+    response_sha256         TEXT NOT NULL,
+    response_bytes          INTEGER NOT NULL CHECK (response_bytes >= 0),
+    model_id                TEXT NOT NULL,
+    submission_status       TEXT NOT NULL CHECK (submission_status IN ('not_submitted', 'accepted', 'rejected', 'runtime_error')),
+    protocol_rejection_code TEXT NOT NULL DEFAULT '',
+    failure_code            TEXT NOT NULL DEFAULT '',
+    created_at              DATETIME NOT NULL,
+    expires_at              DATETIME NOT NULL,
+    expired_at              DATETIME,
+    version                 INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    UNIQUE(node_attempt_id, turn),
+    CHECK (length(response_sha256) = 71),
+    CHECK (substr(response_sha256, 1, 7) = 'sha256:'),
+    CHECK (substr(response_sha256, 8) NOT GLOB '*[^0-9a-f]*')
+);
+
+-- table agent_turn_transcript_submissions
+CREATE TABLE agent_turn_transcript_submissions (
+    id               TEXT PRIMARY KEY,
+    transcript_id    TEXT NOT NULL REFERENCES agent_turn_transcripts(id) ON DELETE RESTRICT,
+    ordinal          INTEGER NOT NULL CHECK (ordinal > 0),
+    status           TEXT NOT NULL CHECK (status IN ('accepted', 'rejected', 'runtime_error')),
+    raw_request_json TEXT NOT NULL DEFAULT '',
+    validation_json  TEXT NOT NULL DEFAULT '',
+    receipt_json     TEXT NOT NULL DEFAULT '',
+    rejection_code   TEXT NOT NULL DEFAULT '',
+    created_at       DATETIME NOT NULL,
+    expired_at       DATETIME,
+    version          INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    UNIQUE(transcript_id, ordinal)
+);
+
+-- table agent_turn_transcript_legal_holds
+CREATE TABLE agent_turn_transcript_legal_holds (
+    id             TEXT PRIMARY KEY,
+    transcript_id  TEXT NOT NULL REFERENCES agent_turn_transcripts(id) ON DELETE RESTRICT,
+    hold_key       TEXT NOT NULL,
+    reason         TEXT NOT NULL DEFAULT '',
+    created_by     TEXT NOT NULL,
+    created_at     DATETIME NOT NULL,
+    released_by    TEXT NOT NULL DEFAULT '',
+    release_reason TEXT NOT NULL DEFAULT '',
+    released_at    DATETIME,
+    version        INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    UNIQUE(transcript_id, hold_key)
+);
+
 -- table outbox_delivery_operations_v9
 CREATE TABLE outbox_delivery_operations_v9 (
     id                  TEXT PRIMARY KEY,
@@ -1724,6 +1780,24 @@ CREATE INDEX idx_trial_executions_v19_stage
 CREATE INDEX idx_trial_executions_v19_status
     ON trial_executions_v19(status, updated_at, id);
 
+-- index idx_agent_turn_transcripts_expiry
+CREATE INDEX idx_agent_turn_transcripts_expiry
+    ON agent_turn_transcripts(expires_at, id)
+    WHERE expired_at IS NULL;
+
+-- index idx_agent_turn_transcripts_node
+CREATE INDEX idx_agent_turn_transcripts_node
+    ON agent_turn_transcripts(node_attempt_id, turn);
+
+-- index idx_agent_turn_transcript_submissions_transcript
+CREATE INDEX idx_agent_turn_transcript_submissions_transcript
+    ON agent_turn_transcript_submissions(transcript_id, ordinal);
+
+-- index idx_agent_turn_transcript_legal_holds_active
+CREATE INDEX idx_agent_turn_transcript_legal_holds_active
+    ON agent_turn_transcript_legal_holds(transcript_id, id)
+    WHERE released_at IS NULL;
+
 -- index idx_turn_checkpoints_node
 CREATE INDEX idx_turn_checkpoints_node ON turn_checkpoints(node_attempt_id, turn);
 
@@ -1858,6 +1932,88 @@ CREATE TRIGGER run_input_artifacts_no_update
 BEFORE UPDATE ON run_input_artifacts
 BEGIN
     SELECT RAISE(ABORT, 'run input artifacts are immutable');
+END;
+
+-- trigger agent_turn_transcripts_no_delete
+CREATE TRIGGER agent_turn_transcripts_no_delete
+BEFORE DELETE ON agent_turn_transcripts
+BEGIN
+    SELECT RAISE(ABORT, 'agent turn transcripts are retained audit records');
+END;
+
+-- trigger agent_turn_transcripts_expiry_only_update
+CREATE TRIGGER agent_turn_transcripts_expiry_only_update
+BEFORE UPDATE ON agent_turn_transcripts
+WHEN NEW.id <> OLD.id
+  OR NEW.node_attempt_id <> OLD.node_attempt_id
+  OR NEW.turn <> OLD.turn
+  OR NEW.response_sha256 <> OLD.response_sha256
+  OR NEW.response_bytes <> OLD.response_bytes
+  OR NEW.model_id <> OLD.model_id
+  OR NEW.submission_status <> OLD.submission_status
+  OR NEW.protocol_rejection_code <> OLD.protocol_rejection_code
+  OR NEW.failure_code <> OLD.failure_code
+  OR NEW.created_at <> OLD.created_at
+  OR NEW.expires_at <> OLD.expires_at
+  OR NEW.response_text <> ''
+  OR OLD.expired_at IS NOT NULL
+  OR NEW.expired_at IS NULL
+  OR NEW.expired_at < OLD.expires_at
+  OR NEW.version <> OLD.version + 1
+BEGIN
+    SELECT RAISE(ABORT, 'agent turn transcript may only expire its raw response');
+END;
+
+-- trigger agent_turn_transcript_submissions_no_delete
+CREATE TRIGGER agent_turn_transcript_submissions_no_delete
+BEFORE DELETE ON agent_turn_transcript_submissions
+BEGIN
+    SELECT RAISE(ABORT, 'agent turn transcript submissions are retained audit records');
+END;
+
+-- trigger agent_turn_transcript_submissions_expiry_only_update
+CREATE TRIGGER agent_turn_transcript_submissions_expiry_only_update
+BEFORE UPDATE ON agent_turn_transcript_submissions
+WHEN NEW.id <> OLD.id
+  OR NEW.transcript_id <> OLD.transcript_id
+  OR NEW.ordinal <> OLD.ordinal
+  OR NEW.status <> OLD.status
+  OR NEW.rejection_code <> OLD.rejection_code
+  OR NEW.created_at <> OLD.created_at
+  OR NEW.raw_request_json <> ''
+  OR NEW.validation_json <> ''
+  OR NEW.receipt_json <> ''
+  OR OLD.expired_at IS NOT NULL
+  OR NEW.expired_at IS NULL
+  OR NEW.version <> OLD.version + 1
+BEGIN
+    SELECT RAISE(ABORT, 'agent turn transcript submission may only expire raw material');
+END;
+
+-- trigger agent_turn_transcript_legal_holds_no_delete
+CREATE TRIGGER agent_turn_transcript_legal_holds_no_delete
+BEFORE DELETE ON agent_turn_transcript_legal_holds
+BEGIN
+    SELECT RAISE(ABORT, 'agent turn transcript legal holds are retained audit records');
+END;
+
+-- trigger agent_turn_transcript_legal_holds_release_only_update
+CREATE TRIGGER agent_turn_transcript_legal_holds_release_only_update
+BEFORE UPDATE ON agent_turn_transcript_legal_holds
+WHEN NEW.id <> OLD.id
+  OR NEW.transcript_id <> OLD.transcript_id
+  OR NEW.hold_key <> OLD.hold_key
+  OR NEW.reason <> OLD.reason
+  OR NEW.created_by <> OLD.created_by
+  OR NEW.created_at <> OLD.created_at
+  OR OLD.released_at IS NOT NULL
+  OR NEW.released_by = ''
+  OR NEW.release_reason = ''
+  OR NEW.released_at IS NULL
+  OR NEW.released_at < OLD.created_at
+  OR NEW.version <> OLD.version + 1
+BEGIN
+    SELECT RAISE(ABORT, 'agent turn transcript legal hold may only be released');
 END;
 
 -- trigger audit_events_no_delete
@@ -2181,6 +2337,60 @@ BEGIN
         THEN RAISE(ABORT, 'global entity identity collision')
     END;
     INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'audit_event');
+END;
+
+-- trigger entity_id_registry_agent_turn_transcripts_id_immutable
+CREATE TRIGGER entity_id_registry_agent_turn_transcripts_id_immutable
+BEFORE UPDATE OF id ON agent_turn_transcripts
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_agent_turn_transcripts_insert
+CREATE TRIGGER entity_id_registry_agent_turn_transcripts_insert
+BEFORE INSERT ON agent_turn_transcripts
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'agent_turn_transcript');
+END;
+
+-- trigger entity_id_registry_agent_turn_transcript_submissions_id_immutable
+CREATE TRIGGER entity_id_registry_agent_turn_transcript_submissions_id_immutable
+BEFORE UPDATE OF id ON agent_turn_transcript_submissions
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_agent_turn_transcript_submissions_insert
+CREATE TRIGGER entity_id_registry_agent_turn_transcript_submissions_insert
+BEFORE INSERT ON agent_turn_transcript_submissions
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'agent_turn_transcript_submission');
+END;
+
+-- trigger entity_id_registry_agent_turn_transcript_legal_holds_id_immutable
+CREATE TRIGGER entity_id_registry_agent_turn_transcript_legal_holds_id_immutable
+BEFORE UPDATE OF id ON agent_turn_transcript_legal_holds
+WHEN NEW.id <> OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
+END;
+
+-- trigger entity_id_registry_agent_turn_transcript_legal_holds_insert
+CREATE TRIGGER entity_id_registry_agent_turn_transcript_legal_holds_insert
+BEFORE INSERT ON agent_turn_transcript_legal_holds
+BEGIN
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
+        THEN RAISE(ABORT, 'global entity identity collision')
+    END;
+    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'agent_turn_transcript_legal_hold');
 END;
 
 -- trigger entity_id_registry_budget_grants_id_immutable

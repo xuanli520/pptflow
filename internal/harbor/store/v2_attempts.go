@@ -382,6 +382,9 @@ func (s *Store) CreateTurnCheckpoint(ctx context.Context, request CreateTurnChec
 	if err != nil {
 		return TurnCheckpoint{}, err
 	}
+	if substep == agentTurnTranscriptCompletedSubstep {
+		return TurnCheckpoint{}, fmt.Errorf("completed Agent turn checkpoints must be recorded with their transcript")
+	}
 	inputDigest, err := normalizeRequired(request.InputDigest, "checkpoint input digest")
 	if err != nil {
 		return TurnCheckpoint{}, err
@@ -503,6 +506,9 @@ func (s *Store) TransitionTurnCheckpoint(ctx context.Context, request Transition
 	}
 	if !validTurnCheckpointTransition(checkpoint.Status, request.Status) {
 		return TurnCheckpoint{}, fmt.Errorf("%w: checkpoint %s from %s to %s", ErrInvalidTransition, checkpoint.ID, checkpoint.Status, request.Status)
+	}
+	if checkpoint.Substep == agentTurnTranscriptCompletedSubstep {
+		return TurnCheckpoint{}, fmt.Errorf("completed Agent turn checkpoints must be recorded with their transcript")
 	}
 	if value := strings.TrimSpace(request.ArtifactID); value != "" {
 		checkpoint.ArtifactID = value

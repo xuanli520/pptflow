@@ -452,9 +452,14 @@ func (backend *workflowkitStageBackend) RecordStageCheckpoint(ctx context.Contex
 	if err != nil {
 		return workflowkit.CheckpointReceipt{}, err
 	}
+	var transcript *workflowkit.AgentTurnTranscript
+	if checkpoint.AgentTurnTranscript != nil {
+		value := checkpoint.AgentTurnTranscript.Clone()
+		transcript = &value
+	}
 	writer := backend.runtime.stageCheckpointWriter(backend.attempt.ID, backend.node.ID, backend.attempt.InputFingerprint, backend.monitor)
 	persisted, err := writer(ctx, StageCheckpoint{
-		Turn: checkpoint.TurnOrdinal, Substep: checkpoint.Substep, PayloadJSON: string(payload), ArtifactID: string(checkpoint.ArtifactID), Resumable: checkpoint.Resumable,
+		Turn: checkpoint.TurnOrdinal, Substep: checkpoint.Substep, PayloadJSON: string(payload), ArtifactID: string(checkpoint.ArtifactID), AgentTurnTranscript: transcript, Resumable: checkpoint.Resumable, OccurredAt: checkpoint.OccurredAt,
 	})
 	if err != nil {
 		return workflowkit.CheckpointReceipt{}, err

@@ -731,14 +731,65 @@ type StageCheckpoint struct {
 	Substep        string     `json:"substep"`
 	Payload        []byte     `json:"payload,omitempty"`
 	ArtifactID     ArtifactID `json:"artifact_id,omitempty"`
-	Resumable      bool       `json:"resumable"`
-	OccurredAt     time.Time  `json:"occurred_at"`
+	// AgentTurnTranscript is present only for a completed controlled Agent
+	// turn. The durable backend writes it atomically with this checkpoint.
+	AgentTurnTranscript *AgentTurnTranscript `json:"agent_turn_transcript,omitempty"`
+	Resumable           bool                 `json:"resumable"`
+	OccurredAt          time.Time            `json:"occurred_at"`
+}
+
+// AgentTurnTranscript is the provider-neutral diagnostic record associated
+// with one completed Agent turn. It carries no persistence identity: the
+// enclosing checkpoint's claimed node attempt and turn ordinal provide that
+// scope to the durable backend.
+//
+// Raw dynamic-tool requests and receipts are intentionally diagnostic data,
+// never artifact authority. A successful stage still requires the executor's
+// independently validated typed artifact result.
+type AgentTurnTranscript struct {
+	ResponseText          string                       `json:"response_text,omitempty"`
+	ModelID               string                       `json:"model_id,omitempty"`
+	SubmissionStatus      AgentTurnSubmissionStatus    `json:"submission_status"`
+	Submissions           []AgentTurnSubmissionAttempt `json:"submissions,omitempty"`
+	ProtocolRejectionCode string                       `json:"protocol_rejection_code,omitempty"`
+	FailureCode           string                       `json:"failure_code,omitempty"`
+}
+
+// AgentTurnSubmissionStatus records whether a model turn made and passed its
+// terminal dynamic-tool submission protocol.
+type AgentTurnSubmissionStatus string
+
+const (
+	AgentTurnSubmissionNotSubmitted AgentTurnSubmissionStatus = "not_submitted"
+	AgentTurnSubmissionAccepted     AgentTurnSubmissionStatus = "accepted"
+	AgentTurnSubmissionRejected     AgentTurnSubmissionStatus = "rejected"
+	AgentTurnSubmissionRuntimeError AgentTurnSubmissionStatus = "runtime_error"
+)
+
+// AgentTurnSubmissionAttempt retains the exact tool request and the host's
+// validation/receipt data for a single invocation in turn order.
+type AgentTurnSubmissionAttempt struct {
+	Status         AgentTurnSubmissionStatus `json:"status"`
+	RawRequestJSON string                    `json:"raw_request_json,omitempty"`
+	ValidationJSON string                    `json:"validation_json,omitempty"`
+	ReceiptJSON    string                    `json:"receipt_json,omitempty"`
+	RejectionCode  string                    `json:"rejection_code,omitempty"`
 }
 
 // Clone returns independently owned checkpoint payload bytes.
 func (checkpoint StageCheckpoint) Clone() StageCheckpoint {
 	checkpoint.Payload = append([]byte(nil), checkpoint.Payload...)
+	if checkpoint.AgentTurnTranscript != nil {
+		transcript := checkpoint.AgentTurnTranscript.Clone()
+		checkpoint.AgentTurnTranscript = &transcript
+	}
 	return checkpoint
+}
+
+// Clone returns independently owned submission diagnostic values.
+func (transcript AgentTurnTranscript) Clone() AgentTurnTranscript {
+	transcript.Submissions = append([]AgentTurnSubmissionAttempt(nil), transcript.Submissions...)
+	return transcript
 }
 
 func (checkpoint StageCheckpoint) validate() error {
@@ -757,7 +808,32 @@ func (checkpoint StageCheckpoint) validate() error {
 	if checkpoint.OccurredAt.IsZero() {
 		return fmt.Errorf("%w: stage checkpoint time is required", ErrInvalidStageResult)
 	}
+	if checkpoint.AgentTurnTranscript != nil {
+		if checkpoint.TurnOrdinal <= 0 {
+			return fmt.Errorf("%w: agent transcript checkpoint turn must be positive", ErrInvalidStageResult)
+		}
+		if checkpoint.Substep != "turn_completed" {
+			return fmt.Errorf("%w: agent transcript requires a completed turn checkpoint", ErrInvalidStageResult)
+		}
+		if !checkpoint.AgentTurnTranscript.SubmissionStatus.valid() {
+			return fmt.Errorf("%w: agent transcript submission status is invalid", ErrInvalidStageResult)
+		}
+		for _, submission := range checkpoint.AgentTurnTranscript.Submissions {
+			if !submission.Status.valid() {
+				return fmt.Errorf("%w: agent transcript submission status is invalid", ErrInvalidStageResult)
+			}
+		}
+	}
 	return nil
+}
+
+func (status AgentTurnSubmissionStatus) valid() bool {
+	switch status {
+	case AgentTurnSubmissionNotSubmitted, AgentTurnSubmissionAccepted, AgentTurnSubmissionRejected, AgentTurnSubmissionRuntimeError:
+		return true
+	default:
+		return false
+	}
 }
 
 // CheckpointReceipt is the backend's durable acknowledgement of a checkpoint.
