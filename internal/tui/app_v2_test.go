@@ -271,6 +271,32 @@ func TestVisibleTaskInputConsumesBoardAndReviewKeys(t *testing.T) {
 	}
 }
 
+func TestNewConfigCommandClearsStaleAuthoringStartIdempotencyKey(t *testing.T) {
+	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
+	model := loadedTaskBoardModel(t, stub)
+	message := TaskSubmitMsg{
+		RepoURL: "https://example.invalid/repo.git", CommitSHA: "abcdef0123456789", BaseImage: taskBoardTestBaseImage,
+		Slug: "task-one", Title: "Task one", TaskType: taskBoardTestTaskType, Application: taskBoardTestApplication,
+		CodeLang: taskBoardTestCodeLang, Objective: taskBoardTestObjective, Reason: "start a replacement authoring run",
+	}
+	model.pendingStart = &pendingTaskBoardStart{message: message, key: "stale-idempotency-key"}
+
+	updated, _ := model.handleKey(keyRune('n'), nil)
+	model = updated.(appModel)
+	if model.pendingStart != nil || !model.input.Visible() || model.input.mode != taskInputLoadConfig {
+		t.Fatalf("new config state = pending:%+v visible:%t mode:%d", model.pendingStart, model.input.Visible(), model.input.mode)
+	}
+
+	_, startCommand := model.beginAuthoring(message, nil)
+	mutation, ok := startCommand().(taskBoardMutationMsg)
+	if !ok || mutation.err != nil || len(stub.startRequests) != 1 || stub.keys != 1 {
+		t.Fatalf("replacement start = %#v, requests=%+v, keys=%d", mutation, stub.startRequests, stub.keys)
+	}
+	if got := stub.startRequests[0].IdempotencyKey; got == "stale-idempotency-key" || got == "" {
+		t.Fatalf("replacement start retained stale key %q", got)
+	}
+}
+
 func TestTaskInputRequiresFrozenInputsAndIncludesThemInTabOrder(t *testing.T) {
 	input := NewTaskInputModel()
 	input.Show()

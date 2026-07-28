@@ -605,6 +605,9 @@ func (m appModel) handleKey(msg tea.KeyMsg, inputCmd tea.Cmd) (tea.Model, tea.Cm
 			m.notice = "正在刷新任务状态"
 			return m, inputCmd
 		}
+		// Returning to the config picker starts a new authoring command. A
+		// retained pending start is only valid for retrying the visible form.
+		m.pendingStart = nil
 		m.input.BeginConfigLoad()
 		return m, textinput.Blink
 
