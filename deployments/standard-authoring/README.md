@@ -12,7 +12,7 @@ that snapshot, `task_synthesis` creates the reviewable task specification, and
 `task_review` freezes the verification contract. `authoring_loop` is the first
 candidate writer. Host verification runs layout, baseline, oracle, coverage,
 and integrity checks. The two critic stages may emit structured findings, and
-`authoring_repair` may create a new candidate at most twice. Every repair uses
+`authoring_repair` may create a new candidate at most eight times. Every repair uses
 a new fenced conversation and must produce a new snapshot, validation receipt,
 and host-generated `workflow_repair_ledger` before final review can continue.
 

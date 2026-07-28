@@ -19,7 +19,7 @@ const (
 	standardAuthoringCatalogVersion = StandardAuthoringContractTemplateVersion
 
 	StandardAuthoringAuthoringLoopMaxTurns = 3
-	StandardAuthoringRepairMaxTurns        = 2
+	StandardAuthoringRepairMaxTurns        = 8
 	// Kept as a source-compatible name for callers that only need the bounded
 	// authoring conversation limit. The retired task_design stage itself is not
 	// present in the 3.0 catalog.

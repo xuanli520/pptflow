@@ -21,7 +21,7 @@ const (
 	// source-session authoring policy. Task-bound verification and packaging
 	// quota begins only in the child CodeEdge Run after materialization.
 	StandardAuthoringQuotaPolicyID              = "harbor.standard-authoring.local.operator"
-	StandardAuthoringContractQuotaPolicyVersion = "3.0.0"
+	StandardAuthoringContractQuotaPolicyVersion = "3.1.0"
 	StandardAuthoringValidationQuotaDimension   = "authoring_validation"
 	// StandardAuthoringOutputSubmissionClaimUnits is the fixed number of
 	// model-owned validate-and-submit calls reserved for every authoring agent
@@ -62,7 +62,7 @@ const (
 	standardActorTrialLimit               int64 = 320
 	standardTaskRepairRoundLimit          int64 = 3
 	standardActorRepairRoundLimit         int64 = 30
-	standardAuthoringCandidateRepairLimit int64 = 2
+	standardAuthoringCandidateRepairLimit int64 = 8
 
 	standardStageAttemptClaimUnits int64 = 1
 	standardEvaluationTrialClaims  int64 = 4
@@ -390,7 +390,7 @@ func StandardQuotaPolicy() QuotaPolicy {
 }
 
 // StandardAuthoringContractQuotaPolicy returns the sole 3.0 source-session
-// policy. Candidate corrections are explicitly capped at two rounds; host,
+// policy. Candidate corrections are explicitly capped at eight rounds; host,
 // environment, and infrastructure faults do not reserve that account.
 func StandardAuthoringContractQuotaPolicy() QuotaPolicy {
 	catalog := StandardAuthoringContractStageCatalog()

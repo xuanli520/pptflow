@@ -65,8 +65,8 @@ func TestStandardAuthoringV3TopologySchedulesParallelResearchAndCritics(t *testi
 	}
 	policy := template.QuotaPolicy
 	for _, limit := range policy.AccountLimits {
-		if limit.Dimension == "repair_round" && limit.TaskLimitUnits != 2 {
-			t.Fatalf("candidate repair limit = %+v, want two rounds", limit)
+		if limit.Dimension == "repair_round" && limit.TaskLimitUnits != 8 {
+			t.Fatalf("candidate repair limit = %+v, want eight rounds", limit)
 		}
 	}
 }
