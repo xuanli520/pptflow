@@ -108,6 +108,9 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if (registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringLoop) || registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair)) && (!strings.Contains(joined, "POSIX sh compatible") || !strings.Contains(joined, "set -o pipefail")) {
 			t.Fatalf("author prompt for %q does not make sh-invoked scripts POSIX compatible", registration.Stage.Key)
 		}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) && (!strings.Contains(joined, "exactly one candidate-validation opportunity") || !strings.Contains(joined, "do not call the tool again until the next prompt")) {
+			t.Fatal("repair prompt does not preserve one validation round per agent turn")
+		}
 		stage, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(registration.Stage.Key)
 		if !found || stage.AgentRole == nil {
 			t.Fatalf("agent stage %q has no frozen agent role", registration.Stage.Key)

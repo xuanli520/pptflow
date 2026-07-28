@@ -172,6 +172,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) executeV3AgentTurn(ctx 
 			return standardAuthoringV3RepairLedger(request.Execution.Workflow, inputs)
 		}
 		submission.maxValidationAttempts = role.MaxValidationAttempts
+		submission.oneValidationPerTurn = true
 		submission.candidateValidator = func(validationCtx context.Context, snapshot workflowkit.CandidateSnapshot, files map[string][]byte) (workflowkit.ValidationReceipt, error) {
 			return executor.candidateValidator.ValidateStandardAuthoringCandidate(validationCtx, StandardAuthoringCandidateValidationRequest{
 				RunID: request.Execution.ID, StageAttemptID: string(request.Claim.Stage.StageAttempt.ID), Snapshot: snapshot,
@@ -232,6 +233,7 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) executeV3AgentTurn(ctx 
 		if turn == 1 {
 			turnRequest.Input = []agent.InputPart{{Type: "text", Text: string(contextDocument)}}
 		}
+		submission.beginTurn()
 		submissionStart := submission.submissionCount()
 		result, turnErr, acceptedResult, acceptedDuringTurn, closeErr := standardAuthoringCodexRunTurnUntilAccepted(ctx, conversation, turnRequest, accepted)
 		if acceptedDuringTurn {
@@ -562,18 +564,20 @@ func standardAuthoringV3ArtifactName(path string) string {
 }
 
 type standardAuthoringV3Submission struct {
-	mu                    sync.Mutex
-	stage                 workflowkit.StageDescriptor
-	role                  workflowkit.AgentRoleID
-	taskRoot              string
-	limit                 int
-	maxValidationAttempts int
-	validationAttempts    int
-	candidateValidator    func(context.Context, workflowkit.CandidateSnapshot, map[string][]byte) (workflowkit.ValidationReceipt, error)
-	repairLedger          func() ([]byte, error)
-	accepted              *workflowkit.StageExecutionResult
-	submissions           []workflowkit.AgentTurnSubmissionAttempt
-	lastRejectionCode     string
+	mu                     sync.Mutex
+	stage                  workflowkit.StageDescriptor
+	role                   workflowkit.AgentRoleID
+	taskRoot               string
+	limit                  int
+	maxValidationAttempts  int
+	validationAttempts     int
+	oneValidationPerTurn   bool
+	turnValidationAttempts int
+	candidateValidator     func(context.Context, workflowkit.CandidateSnapshot, map[string][]byte) (workflowkit.ValidationReceipt, error)
+	repairLedger           func() ([]byte, error)
+	accepted               *workflowkit.StageExecutionResult
+	submissions            []workflowkit.AgentTurnSubmissionAttempt
+	lastRejectionCode      string
 }
 type standardAuthoringV3SubmissionRequest struct {
 	Verdict   string `json:"verdict"`
@@ -586,6 +590,13 @@ type standardAuthoringV3SubmissionRequest struct {
 func newStandardAuthoringV3Submission(stage workflowkit.StageDescriptor, role workflowkit.AgentRoleID, taskRoot string, limit int) *standardAuthoringV3Submission {
 	return &standardAuthoringV3Submission{stage: stage, role: role, taskRoot: taskRoot, limit: limit}
 }
+
+func (submission *standardAuthoringV3Submission) beginTurn() {
+	submission.mu.Lock()
+	defer submission.mu.Unlock()
+	submission.turnValidationAttempts = 0
+}
+
 func (submission *standardAuthoringV3Submission) dynamicTool() agent.DynamicTool {
 	name := standardAuthoringV3SubmitOutputTool
 	schema := json.RawMessage(standardAuthoringV3AgentOutputSchemaCanonicalJSON)
@@ -594,6 +605,9 @@ func (submission *standardAuthoringV3Submission) dynamicTool() agent.DynamicTool
 		name = standardAuthoringV3ValidateTool
 		schema = json.RawMessage(`{"additionalProperties":false,"properties":{"verdict":{"const":"pass"}},"required":["verdict"],"type":"object"}`)
 		description = "Required candidate validation for this frozen stage. After writing the fixed candidate files in task/, call with {\"verdict\":\"pass\"} and no artifacts. A rejected validation returns bounded diagnostics; a passing validation completes the stage."
+		if submission.oneValidationPerTurn {
+			description += " This repair stage permits one candidate validation per agent turn. After a rejected receipt, wait for the next prompt before validating another correction."
+		}
 	} else {
 		names := make([]string, 0, len(submission.stage.Outputs))
 		for _, output := range submission.stage.Outputs {
@@ -644,6 +658,11 @@ func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw
 				submission.lastRejectionCode = "repair_budget_exhausted"
 				return json.RawMessage(`{"accepted":false,"reason":"repair_budget_exhausted"}`), nil
 			}
+			if submission.oneValidationPerTurn && submission.turnValidationAttempts >= 1 {
+				submission.lastRejectionCode = "validation_turn_limit_reached"
+				return json.RawMessage(`{"accepted":false,"reason":"validation_turn_limit_reached"}`), nil
+			}
+			submission.turnValidationAttempts++
 			receipt, validationErr := submission.candidateValidator(ctx, snapshot, files)
 			if validationErr != nil {
 				submission.lastRejectionCode = "validator_unavailable"
@@ -804,6 +823,8 @@ func (submission *standardAuthoringV3Submission) terminalFailureCode() string {
 			return standardAuthoringV3AgentProtocolPrefix + "candidate_rejected"
 		case "repair_budget_exhausted":
 			return standardAuthoringV3AgentProtocolPrefix + "repair_budget_exhausted"
+		case "validation_turn_limit_reached":
+			return standardAuthoringV3AgentProtocolPrefix + "candidate_rejected"
 		case "repair_ledger_invalid":
 			return standardAuthoringV3AgentProtocolPrefix + "repair_ledger_invalid"
 		case "tool_error":

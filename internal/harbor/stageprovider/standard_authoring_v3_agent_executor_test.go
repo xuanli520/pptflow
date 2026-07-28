@@ -518,6 +518,7 @@ func TestStandardAuthoringV3RepairSubmissionRequiresPassingFreshValidationReceip
 	attempts := 0
 	submission := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleAuthor, root, 64<<10)
 	submission.maxValidationAttempts = workflowadapter.StandardAuthoringRepairMaxTurns
+	submission.oneValidationPerTurn = true
 	finding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
 		Code: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair),
 		EvidenceDigest: workflowkit.SHA256Fingerprint([]byte("evidence")), CandidateDigest: workflowkit.SHA256Fingerprint([]byte("candidate")), DiagnosticDigest: workflowkit.SHA256Fingerprint([]byte("diagnostic")),
@@ -561,6 +562,7 @@ func TestStandardAuthoringV3RepairSubmissionRequiresPassingFreshValidationReceip
 		})
 	}
 
+	submission.beginTurn()
 	first, err := submission.handle(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
 	if err != nil || !strings.Contains(string(first), `"reason":"candidate_rejected"`) || strings.Contains(string(first), "redacted") {
 		t.Fatalf("rejected repair validation response = %s, %v", first, err)
@@ -568,6 +570,11 @@ func TestStandardAuthoringV3RepairSubmissionRequiresPassingFreshValidationReceip
 	if _, accepted := submission.acceptedResult(); accepted {
 		t.Fatal("rejected repair candidate was accepted")
 	}
+	secondInSameTurn, err := submission.handle(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
+	if err != nil || string(secondInSameTurn) != `{"accepted":false,"reason":"validation_turn_limit_reached"}` || attempts != 1 {
+		t.Fatalf("second repair validation in one turn = %s, %v; attempts=%d", secondInSameTurn, err, attempts)
+	}
+	submission.beginTurn()
 	second, err := submission.handle(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
 	if err != nil || !strings.Contains(string(second), `"accepted":true`) {
 		t.Fatalf("passing repair validation response = %s, %v", second, err)
