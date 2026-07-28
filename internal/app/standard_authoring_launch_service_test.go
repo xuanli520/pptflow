@@ -229,6 +229,48 @@ func TestStandardAuthoringLaunchRejectsInvalidBaseImageBeforeAnyMutation(t *test
 	}
 }
 
+func TestStandardAuthoringLaunchRejectsInvalidContractTokenBeforeSourceCapture(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	capturer := &standardAuthoringSourceCapturerFixture{coordinate: standardAuthoringLaunchTestCoordinate, snapshot: standardAuthoringLaunchTestSnapshot(t, standardAuthoringLaunchTestCoordinate)}
+	definitions := standardAuthoringLaunchTestDefinitionProvider(t)
+	services, err := NewLifecycleServicesWithOptions(root, database, standardAuthoringLaunchTestOptions(capturer, definitions, definitions.catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, startErr := services.AuthoringLaunches.Start(ctx, StandardAuthoringLaunchCommand{
+		LifecycleMutationCommandBase: LifecycleMutationCommandBase{IdempotencyKey: key, Actor: "author", Reason: "reject invalid contract token"},
+		RepositoryURL:                standardAuthoringLaunchTestCoordinate.RepositoryURL,
+		CommitSHA:                    standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:                    standardAuthoringLaunchTestBaseImage,
+		TaskType:                     standardAuthoringLaunchTestTaskType,
+		Application:                  "browser_wasm",
+		CodeLang:                     "rust",
+		Objective:                    standardAuthoringLaunchTestObjective,
+		Slug:                         "invalid-contract-token",
+		Title:                        "Invalid contract token",
+	})
+	if startErr == nil || !strings.Contains(startErr.Error(), "application must match") {
+		t.Fatalf("invalid contract token start error = %v", startErr)
+	}
+	if capturer.calls != 0 {
+		t.Fatalf("invalid contract token reached source capture: %d calls", capturer.calls)
+	}
+	operation, operationErr := database.GetLifecycleOperationByIdempotencyKey(ctx, key)
+	if operationErr != nil || operation != nil {
+		t.Fatalf("invalid contract token created lifecycle operation=%+v err=%v", operation, operationErr)
+	}
+}
+
 func TestStandardAuthoringLaunchReusesMatchingImmutableSourceForDistinctTasks(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

@@ -53,3 +53,20 @@ func TestAuthoringContractRejectsDuplicateFieldsAndInvalidRoot(t *testing.T) {
 		t.Fatal("contract accepted incomplete root facts")
 	}
 }
+
+func TestValidStandardAuthoringContractToken(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		valid bool
+	}{
+		{value: "browser-wasm", valid: true},
+		{value: "rust", valid: true},
+		{value: "browser_wasm", valid: false},
+		{value: "Browser", valid: false},
+		{value: "", valid: false},
+	} {
+		if got := ValidStandardAuthoringContractToken(test.value); got != test.valid {
+			t.Errorf("ValidStandardAuthoringContractToken(%q) = %t, want %t", test.value, got, test.valid)
+		}
+	}
+}

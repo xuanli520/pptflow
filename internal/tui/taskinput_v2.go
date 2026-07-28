@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -65,6 +66,23 @@ type TaskInputModel struct {
 	mode             taskInputMode
 	loadingConfig    bool
 	validationErr    string
+}
+
+func validateTaskInputContractTokens(slug, codeLanguage, taskType, application string) error {
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "slug", value: slug},
+		{name: "code language", value: codeLanguage},
+		{name: "task type", value: taskType},
+		{name: "application", value: application},
+	} {
+		if !workflowadapter.ValidStandardAuthoringContractToken(strings.TrimSpace(field.value)) {
+			return fmt.Errorf("%s must match [a-z][a-z0-9-]{0,63}", field.name)
+		}
+	}
+	return nil
 }
 
 func NewTaskInputModel() TaskInputModel {
@@ -374,6 +392,10 @@ func (m *TaskInputModel) Update(msg tea.Msg) (tea.Cmd, bool) {
 		if request.RepoURL != "" && request.CommitSHA != "" && request.BaseImage != "" && request.Slug != "" && request.Title != "" && request.TaskType != "" && request.Application != "" && request.CodeLang != "" && request.Objective != "" && request.Reason != "" {
 			if len(request.Objective) > workflowadapter.AuthoringContractObjectiveMaxBytes {
 				m.validationErr = "Objective must be at most 512 UTF-8 bytes"
+				return nil, true
+			}
+			if err := validateTaskInputContractTokens(request.Slug, request.CodeLang, request.TaskType, request.Application); err != nil {
+				m.validationErr = err.Error()
 				return nil, true
 			}
 			m.validationErr = ""

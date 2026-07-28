@@ -675,6 +675,26 @@ func TestTaskInputRejectsObjectiveOverUTF8ByteLimit(t *testing.T) {
 	}
 }
 
+func TestTaskInputRejectsInvalidContractToken(t *testing.T) {
+	input := NewTaskInputModel()
+	input.Show()
+	input.repoInput.SetValue("https://example.invalid/repo.git")
+	input.commitInput.SetValue("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+	input.baseImageInput.SetValue(taskBoardTestBaseImage)
+	input.slugInput.SetValue("contract-token")
+	input.titleInput.SetValue("Contract token")
+	input.taskTypeInput.SetValue(taskBoardTestTaskType)
+	input.applicationInput.SetValue("browser_wasm")
+	input.codeLangInput.SetValue(taskBoardTestCodeLang)
+	input.objectiveInput.SetValue(taskBoardTestObjective)
+	input.reasonInput.SetValue("verify token validation")
+
+	command, handled := input.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !handled || command != nil || !strings.Contains(input.validationErr, "application must match") {
+		t.Fatalf("invalid contract token = handled:%t command:%v error:%q", handled, command, input.validationErr)
+	}
+}
+
 func TestDetailRunActionsAndLogsTargetTheCurrentRun(t *testing.T) {
 	stub := &taskBoardGatewayStub{
 		snapshot: taskBoardTestSnapshot(true),

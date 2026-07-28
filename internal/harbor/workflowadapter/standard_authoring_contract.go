@@ -101,8 +101,8 @@ func (contract AuthoringContract) Canonical() (AuthoringContract, error) {
 	if _, err := uuid.Parse(canonical.Task.ID); err != nil {
 		return AuthoringContract{}, fmt.Errorf("%w: Standard authoring contract task id: %v", errInvalidCatalog, err)
 	}
-	if !standardAuthoringContractToken(canonical.Task.Slug) || !standardAuthoringContractToken(canonical.Task.CodeLang) ||
-		!standardAuthoringContractToken(canonical.Task.TaskType) || !standardAuthoringContractToken(canonical.Task.Application) {
+	if !ValidStandardAuthoringContractToken(canonical.Task.Slug) || !ValidStandardAuthoringContractToken(canonical.Task.CodeLang) ||
+		!ValidStandardAuthoringContractToken(canonical.Task.TaskType) || !ValidStandardAuthoringContractToken(canonical.Task.Application) {
 		return AuthoringContract{}, fmt.Errorf("%w: Standard authoring contract task tokens must match [a-z][a-z0-9-]{0,63}", errInvalidCatalog)
 	}
 	if !utf8.ValidString(canonical.Task.Title) || len(canonical.Task.Title) == 0 || len(canonical.Task.Title) > AuthoringContractTitleMaxBytes || containsControl(canonical.Task.Title) {
@@ -238,7 +238,9 @@ func validAuthoringContractCommit(value string) bool {
 	return true
 }
 
-func standardAuthoringContractToken(value string) bool {
+// ValidStandardAuthoringContractToken reports whether a caller-selected task
+// token is accepted by the frozen Standard authoring contract.
+func ValidStandardAuthoringContractToken(value string) bool {
 	if len(value) == 0 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
 		return false
 	}

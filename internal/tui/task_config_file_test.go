@@ -86,6 +86,7 @@ func TestReadTaskInputConfigFileRejectsInvalidInputs(t *testing.T) {
 		{"duplicate key", strings.Replace(valid, "\n}", ",\n  \"slug\": \"duplicate\"\n}", 1)},
 		{"wrong format", strings.Replace(valid, taskInputConfigFormat, "harbor.task-input.v0", 1)},
 		{"wrong commit", strings.Replace(valid, taskInputConfigFixture().CommitSHA, "ABC", 1)},
+		{"invalid application token", strings.Replace(valid, `"application": "rustlings"`, `"application": "browser_wasm"`, 1)},
 		{"trailing document", valid + "\n{}"},
 		{"invalid JSON", "{invalid"},
 	} {

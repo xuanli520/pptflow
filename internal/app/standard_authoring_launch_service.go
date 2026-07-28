@@ -487,23 +487,20 @@ func validateStandardAuthoringLaunchCommand(command StandardAuthoringLaunchComma
 	if _, err := workflowadapter.NewStandardAuthoringEnvironmentPolicy(command.BaseImage); err != nil {
 		return fmt.Errorf("Standard authoring base image: %w", err)
 	}
-	if !standardAuthoringLaunchToken(strings.TrimSpace(command.CodeLang)) {
-		return fmt.Errorf("Standard authoring code language must match [a-z][a-z0-9-]{0,63}")
-	}
-	return nil
-}
-
-func standardAuthoringLaunchToken(value string) bool {
-	if len(value) == 0 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
-		return false
-	}
-	for index := 1; index < len(value); index++ {
-		character := value[index]
-		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
-			return false
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "slug", value: command.Slug},
+		{name: "code language", value: command.CodeLang},
+		{name: "task type", value: command.TaskType},
+		{name: "application", value: command.Application},
+	} {
+		if !workflowadapter.ValidStandardAuthoringContractToken(strings.TrimSpace(field.value)) {
+			return fmt.Errorf("Standard authoring %s must match [a-z][a-z0-9-]{0,63}", field.name)
 		}
 	}
-	return true
+	return nil
 }
 
 func standardAuthoringLaunchCoordinate(command StandardAuthoringLaunchCommand) (StandardAuthoringSourceCoordinate, error) {

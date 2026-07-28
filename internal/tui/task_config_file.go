@@ -116,6 +116,9 @@ func (config *taskInputConfig) validate() error {
 			return fmt.Errorf("配置字段 %s 不能超过 %d 个字符", field.name, field.limit)
 		}
 	}
+	if err := validateTaskInputContractTokens(config.Slug, config.CodeLanguage, config.TaskType, config.Application); err != nil {
+		return err
+	}
 	if len(config.CommitSHA) != 40 && len(config.CommitSHA) != 64 {
 		return errors.New("配置字段 commit_sha 必须是 40 或 64 位提交哈希")
 	}
