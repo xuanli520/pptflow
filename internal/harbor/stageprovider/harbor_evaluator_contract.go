@@ -64,17 +64,17 @@ const (
 	HarborEvaluatorDockerVersion   = "29.5.2"
 	// HarborEvaluatorDockerServerVersion pins the daemon API endpoint used by
 	// the evaluator. The CLI and daemon are independently versioned identities.
-	HarborEvaluatorDockerServerVersion = "29.4.1"
+	HarborEvaluatorDockerServerVersion = "29.5.2"
 	// HarborEvaluatorDockerComposeCommandID independently identifies the exact
 	// Docker CLI plugin used by Harbor 0.18 for Compose-backed task execution.
 	HarborEvaluatorDockerComposeCommandID     = "harbor.docker.compose.plugin"
-	HarborEvaluatorDockerComposeVersion       = "v5.1.3"
-	HarborEvaluatorDockerComposeVersionOutput = "Docker Compose version v5.1.3"
+	HarborEvaluatorDockerComposeVersion       = "v5.1.4"
+	HarborEvaluatorDockerComposeVersionOutput = "Docker Compose version v5.1.4"
 	// HarborEvaluatorDockerBuildxCommandID independently identifies the exact
 	// Docker CLI plugin used by Docker when Harbor builds task environments.
 	HarborEvaluatorDockerBuildxCommandID     = "harbor.docker.buildx.plugin"
-	HarborEvaluatorDockerBuildxVersion       = "v0.33.0"
-	HarborEvaluatorDockerBuildxVersionOutput = "github.com/docker/buildx v0.33.0 f7897eba028583e0071642db3c011e860444f8cf"
+	HarborEvaluatorDockerBuildxVersion       = "v0.34.0"
+	HarborEvaluatorDockerBuildxVersionOutput = "github.com/docker/buildx v0.34.0 3e73561e39785683b31b05eeab1ef645be44ca42"
 )
 
 const harborEvaluatorEndpointFingerprintDomain = "harbor.stageprovider.harbor-evaluator-endpoint.v1"

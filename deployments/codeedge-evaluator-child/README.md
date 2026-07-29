@@ -15,7 +15,7 @@ The catalog permits exactly two serial `local.command` operations:
   retries per logical Trial.
 
 The lock freezes the Harbor `0.18.0` launcher, Python interpreter and source
-tree, Docker CLI `29.5.2`, Docker server `29.4.1`, the exact `docker-compose`
+tree, Docker CLI `29.5.2`, Docker server `29.5.2`, the exact `docker-compose`
 and `docker-buildx` plugins and their complete version outputs, CodeEdge
 renderer/schema fingerprints, model identities, canonical endpoint
 fingerprints, and a complete child-owned execution profile:
