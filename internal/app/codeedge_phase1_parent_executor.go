@@ -34,6 +34,8 @@ const (
 
 	codeEdgePhase1CommandOutputLimit = 128 << 10
 	codeEdgePhase1ScriptLimit        = 16 << 20
+
+	codeEdgePhase1VerificationSetupFailureMarker = "harbor-codeedge-phase1: verification setup failed"
 )
 
 // CodeEdgePhase1Command is a direct, already-resolved process invocation.
@@ -935,10 +937,13 @@ func (executor *CodeEdgePhase1ParentExecutor) executeInitialVerify(ctx context.C
 	}
 	lock := executor.commands[stageprovider.CodeEdgePhase1InitialVerifyCommandID]
 	result, outputFingerprint, runErr := executor.docker.run(ctx, lock.CommandID,
-		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "initial"), "sh ./tests/test.sh"), workspace)
+		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "initial"), codeEdgePhase1VerificationProgram(false)), workspace)
 	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
 	if runErr != nil {
 		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled initial verification could not start", report, codeEdgePhase1FailureClass(runErr))
+	}
+	if codeEdgePhase1VerificationSetupFailed(result) {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled initial verification setup failed", report, workflowkit.FailureProcess)
 	}
 	if err := codeEdgePhase1VerifyCheckoutScripts(checkout, before); err != nil {
 		report.Verdict = workflowkit.VerdictNeedsRepair
@@ -970,10 +975,13 @@ func (executor *CodeEdgePhase1ParentExecutor) executeOracleVerify(ctx context.Co
 	}
 	lock := executor.commands[stageprovider.CodeEdgePhase1OracleVerifyCommandID]
 	result, outputFingerprint, runErr := executor.docker.run(ctx, lock.CommandID,
-		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "oracle"), "sh ./solution/solve.sh && sh ./tests/test.sh"), workspace)
+		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "oracle"), codeEdgePhase1VerificationProgram(true)), workspace)
 	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
 	if runErr != nil {
 		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Oracle verification could not start", report, codeEdgePhase1FailureClass(runErr))
+	}
+	if codeEdgePhase1VerificationSetupFailed(result) {
+		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Oracle verification setup failed", report, workflowkit.FailureProcess)
 	}
 	if err := codeEdgePhase1VerifyCheckoutScripts(checkout, before); err != nil {
 		report.Verdict = workflowkit.VerdictNeedsRepair
@@ -1098,6 +1106,19 @@ func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) 
 		"--workdir", "/oracle", "--name", "harbor-codeedge-" + name,
 		"--entrypoint", "/bin/sh", imageTag, "-ec", shellProgram,
 	}
+}
+
+func codeEdgePhase1VerificationProgram(applySolution bool) string {
+	prepare := "rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /workspace/source/. /oracle/workspace/ && cd /oracle/workspace"
+	command := "sh /oracle/tests/test.sh"
+	if applySolution {
+		command = "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh"
+	}
+	return prepare + " || { echo '" + codeEdgePhase1VerificationSetupFailureMarker + "' >&2; exit 125; }; " + command
+}
+
+func codeEdgePhase1VerificationSetupFailed(result CodeEdgePhase1CommandResult) bool {
+	return result.ExitCode == 125 && bytes.Contains(result.Stderr, []byte(codeEdgePhase1VerificationSetupFailureMarker))
 }
 
 func codeEdgePhase1ContainerName(request workflowkit.StageExecutionRequest, kind string) string {

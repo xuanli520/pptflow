@@ -149,7 +149,15 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 		t.Fatalf("image identity checks = %#v / %#v / %#v", runner.commands[1].Args, runner.commands[2].Args, runner.commands[4].Args)
 	}
 	initialCommand, oracleCommand := runner.commands[3], runner.commands[5]
-	if !containsParentArg(initialCommand.Args, "sh ./tests/test.sh") || containsParentArg(initialCommand.Args, "solution/solve.sh") || !containsParentArg(oracleCommand.Args, "sh ./solution/solve.sh && sh ./tests/test.sh") {
+	initialProgram := initialCommand.Args[len(initialCommand.Args)-1]
+	oracleProgram := oracleCommand.Args[len(oracleCommand.Args)-1]
+	if !strings.Contains(initialProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
+		!strings.Contains(initialProgram, "cd /oracle/workspace") ||
+		!strings.Contains(initialProgram, "sh /oracle/tests/test.sh") ||
+		strings.Contains(initialProgram, "/oracle/solution/solve.sh") ||
+		!strings.Contains(oracleProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
+		!strings.Contains(oracleProgram, "cd /oracle/workspace") ||
+		!strings.Contains(oracleProgram, "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh") {
 		t.Fatalf("controlled verifier programs = initial=%#v oracle=%#v", initialCommand.Args, oracleCommand.Args)
 	}
 	for _, command := range []CodeEdgePhase1Command{initialCommand, oracleCommand} {
@@ -160,6 +168,29 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 		if !strings.HasPrefix(mount, "type=bind,src=") || !strings.HasSuffix(mount, ",dst=/oracle") || strings.Contains(mount, ",rw") {
 			t.Fatalf("verification mount = %q, want writable Docker --mount syntax", mount)
 		}
+	}
+}
+
+func TestCodeEdgePhase1ParentInitialSetupFailureIsInfra(t *testing.T) {
+	root, snapshot, digest := codeEdgePhase1ParentTaskSnapshot(t, false)
+	runner := &codeEdgePhase1RecordingRunner{results: []CodeEdgePhase1CommandResult{
+		{Stdout: []byte("modern BuildKit output\n")},
+		{Stdout: []byte("sha256:" + strings.Repeat("c", 64) + "\n")},
+		{Stdout: []byte("sha256:" + strings.Repeat("c", 64) + "\n")},
+		{ExitCode: 125, Stderr: []byte(codeEdgePhase1VerificationSetupFailureMarker + "\n")},
+	}}
+	executor := newCodeEdgePhase1ParentExecutorForTest(t, root, runner)
+	_, buildInvocation := codeEdgePhase1ParentLocalInvocation(t, snapshot, digest, workflowadapter.DockerBuild, "docker_build_report", "harbor.artifact.v1", stageprovider.CodeEdgePhase1DockerBuildCommandID)
+	if _, err := executor.ExecuteLocalCommand(context.Background(), buildInvocation, workflowadapter.LocalCommandOperationPayload{CommandID: stageprovider.CodeEdgePhase1DockerBuildCommandID, Arguments: []string{}}); err != nil {
+		t.Fatal(err)
+	}
+	_, initialInvocation := codeEdgePhase1ParentLocalInvocationForRun(t, snapshot, digest, buildInvocation.Request.Execution.ID, workflowadapter.InitialVerify, "initial_verify_report", "harbor.artifact.v1", stageprovider.CodeEdgePhase1InitialVerifyCommandID)
+	result, err := executor.ExecuteLocalCommand(context.Background(), initialInvocation, workflowadapter.LocalCommandOperationPayload{CommandID: stageprovider.CodeEdgePhase1InitialVerifyCommandID, Arguments: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome.Status != workflowkit.StatusInfraFailed || result.Outcome.Failure != workflowkit.FailureProcess || !strings.Contains(result.ErrorText, "setup failed") {
+		t.Fatalf("setup failure result = %+v", result)
 	}
 }
 
