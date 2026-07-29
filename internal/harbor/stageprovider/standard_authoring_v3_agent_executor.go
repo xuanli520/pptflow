@@ -482,6 +482,62 @@ type standardAuthoringV3TerminalSubmission struct {
 	Instructions       string                     `json:"instructions"`
 }
 
+type standardAuthoringV3ValidationEnvironmentContract struct {
+	Format               string                                           `json:"format"`
+	Version              string                                           `json:"version"`
+	AuthoringWorkspace   standardAuthoringV3AuthoringWorkspaceContract    `json:"authoring_workspace"`
+	ValidatorRuntime     standardAuthoringV3ValidatorRuntimeContract      `json:"validator_runtime"`
+	RuntimeConstraints   standardAuthoringV3RuntimeConstraintsContract    `json:"runtime_constraints"`
+	ScriptProtocol       []string                                         `json:"script_protocol"`
+	RustCargoBrowserWASM *standardAuthoringV3RustCargoBrowserWASMContract `json:"rust_cargo_browser_wasm,omitempty"`
+}
+
+type standardAuthoringV3AuthoringWorkspaceContract struct {
+	Source standardAuthoringV3PathContract `json:"source"`
+	Task   standardAuthoringV3PathContract `json:"task"`
+}
+
+type standardAuthoringV3ValidatorRuntimeContract struct {
+	Source       standardAuthoringV3PathContract `json:"source"`
+	Task         standardAuthoringV3PathContract `json:"task"`
+	Work         standardAuthoringV3PathContract `json:"work"`
+	CopyProtocol string                          `json:"copy_protocol"`
+}
+
+type standardAuthoringV3RuntimeConstraintsContract struct {
+	Network            string                         `json:"network"`
+	RootFilesystem     string                         `json:"root_filesystem"`
+	Tmpfs              []standardAuthoringV3Tmpfs     `json:"tmpfs"`
+	Environment        []standardAuthoringV3NameValue `json:"environment"`
+	DockerBuildNetwork string                         `json:"docker_build_network"`
+}
+
+type standardAuthoringV3PathContract struct {
+	Path    string `json:"path"`
+	Access  string `json:"access"`
+	Purpose string `json:"purpose"`
+}
+
+type standardAuthoringV3Tmpfs struct {
+	Path    string `json:"path"`
+	Mode    string `json:"mode"`
+	Size    string `json:"size"`
+	Purpose string `json:"purpose"`
+}
+
+type standardAuthoringV3NameValue struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type standardAuthoringV3RustCargoBrowserWASMContract struct {
+	Applies               bool                           `json:"applies"`
+	ToolchainProvisioning string                         `json:"toolchain_provisioning"`
+	DependencySources     []string                       `json:"dependency_sources"`
+	RuntimeEnvironment    []standardAuthoringV3NameValue `json:"runtime_environment"`
+	CachePolicy           string                         `json:"cache_policy"`
+}
+
 func standardAuthoringV3ReadInputs(ctx context.Context, request workflowkit.StageExecutionRequest) (map[string][]byte, workflowkit.Fingerprint, error) {
 	if request.ReadInput == nil {
 		return nil, "", fmt.Errorf("missing frozen input reader")
@@ -557,18 +613,27 @@ func standardAuthoringV3ContextDocument(request workflowkit.StageExecutionReques
 		}
 		repairContext = &parsed
 	}
+	var validationEnvironmentContract *standardAuthoringV3ValidationEnvironmentContract
+	if candidateWriter {
+		contract, err := standardAuthoringV3ValidationEnvironmentContractForInputs(inputs)
+		if err != nil {
+			return nil, err
+		}
+		validationEnvironmentContract = &contract
+	}
 	document := struct {
-		Format                      string                                                    `json:"format"`
-		Version                     string                                                    `json:"version"`
-		Stage                       string                                                    `json:"stage"`
-		Program                     workflowkit.Fingerprint                                   `json:"program_fingerprint"`
-		Inputs                      workflowkit.Fingerprint                                   `json:"inputs_fingerprint"`
-		CandidateWorkspace          bool                                                      `json:"candidate_workspace"`
-		CandidateValidationIdentity *standardAuthoringV3CandidateValidationIdentity           `json:"candidate_validation_identity,omitempty"`
-		ValidationRepairContext     *workflowadapter.StandardAuthoringValidationRepairContext `json:"validation_repair_context,omitempty"`
-		TerminalSubmission          standardAuthoringV3TerminalSubmission                     `json:"terminal_submission"`
-		Artifacts                   []standardAuthoringV3Input                                `json:"artifacts"`
-	}{Format: "harbor.standard-authoring-v3-context.v1", Version: "1", Stage: string(request.Stage.Key), Program: program.Fingerprint, Inputs: digest, CandidateWorkspace: candidateWriter, ValidationRepairContext: repairContext, TerminalSubmission: submission, Artifacts: entries}
+		Format                        string                                                    `json:"format"`
+		Version                       string                                                    `json:"version"`
+		Stage                         string                                                    `json:"stage"`
+		Program                       workflowkit.Fingerprint                                   `json:"program_fingerprint"`
+		Inputs                        workflowkit.Fingerprint                                   `json:"inputs_fingerprint"`
+		CandidateWorkspace            bool                                                      `json:"candidate_workspace"`
+		CandidateValidationIdentity   *standardAuthoringV3CandidateValidationIdentity           `json:"candidate_validation_identity,omitempty"`
+		ValidationRepairContext       *workflowadapter.StandardAuthoringValidationRepairContext `json:"validation_repair_context,omitempty"`
+		ValidationEnvironmentContract *standardAuthoringV3ValidationEnvironmentContract         `json:"validation_environment_contract,omitempty"`
+		TerminalSubmission            standardAuthoringV3TerminalSubmission                     `json:"terminal_submission"`
+		Artifacts                     []standardAuthoringV3Input                                `json:"artifacts"`
+	}{Format: "harbor.standard-authoring-v3-context.v1", Version: "1", Stage: string(request.Stage.Key), Program: program.Fingerprint, Inputs: digest, CandidateWorkspace: candidateWriter, ValidationRepairContext: repairContext, ValidationEnvironmentContract: validationEnvironmentContract, TerminalSubmission: submission, Artifacts: entries}
 	if hasCandidateValidationIdentity {
 		document.CandidateValidationIdentity = &candidateValidationIdentity
 	}
@@ -577,6 +642,89 @@ func standardAuthoringV3ContextDocument(request workflowkit.StageExecutionReques
 		return nil, fmt.Errorf("context document is invalid")
 	}
 	return raw, nil
+}
+
+func standardAuthoringV3ValidationEnvironmentContractForInputs(inputs map[string][]byte) (standardAuthoringV3ValidationEnvironmentContract, error) {
+	contract := standardAuthoringV3ValidationEnvironmentContract{
+		Format:  "harbor.standard-authoring.validation-environment-contract.v1",
+		Version: "1",
+		AuthoringWorkspace: standardAuthoringV3AuthoringWorkspaceContract{
+			Source: standardAuthoringV3PathContract{Path: StandardAuthoringCodexAttemptSourceDirectory, Access: "read_only_reference", Purpose: "Frozen source copy for inspection only; do not edit this tree."},
+			Task:   standardAuthoringV3PathContract{Path: StandardAuthoringCodexAttemptTaskDirectory, Access: "writable_candidate_files_only", Purpose: "Write exactly the fixed candidate files captured by harbor_validate_candidate."},
+		},
+		ValidatorRuntime: standardAuthoringV3ValidatorRuntimeContract{
+			Source:       standardAuthoringV3PathContract{Path: "/source", Access: "read_only_frozen_source", Purpose: "Immutable source mount owned by the validator."},
+			Task:         standardAuthoringV3PathContract{Path: "/task", Access: "read_only_candidate_files", Purpose: "Immutable candidate scripts and metadata captured from task/."},
+			Work:         standardAuthoringV3PathContract{Path: "/work", Access: "read_write_source_copy", Purpose: "Fresh writable copy of /source used by tests and solution scripts."},
+			CopyProtocol: "Each validation starts by copying /source into /work and applying user-writable modes; solution and test commands run from the frozen VerificationContract workdir below /work.",
+		},
+		RuntimeConstraints: standardAuthoringV3RuntimeConstraintsContract{
+			Network:        "none",
+			RootFilesystem: "read_only",
+			Tmpfs: []standardAuthoringV3Tmpfs{
+				{Path: "/tmp", Mode: "rw,exec,nosuid", Size: "2g", Purpose: "Ephemeral writable runtime scratch; do not copy large registries or build caches here."},
+				{Path: "/logs", Mode: "rw,noexec,nosuid", Size: "8m", Purpose: "Validator-owned binary reward/log protocol output."},
+			},
+			Environment: []standardAuthoringV3NameValue{
+				{Name: "HOME", Value: "/tmp/harbor-home"},
+				{Name: "XDG_CACHE_HOME", Value: "/tmp/harbor-cache"},
+				{Name: "XDG_CONFIG_HOME", Value: "/tmp/harbor-config"},
+				{Name: "HARBOR_SOURCE", Value: "/source"},
+				{Name: "HARBOR_WORKSPACE", Value: "/work"},
+				{Name: "HARBOR_TASK_ROOT", Value: "/task"},
+			},
+			DockerBuildNetwork: "default; Debian APT provisioning must use HTTPS sources, and runtime validation still has no network.",
+		},
+		ScriptProtocol: []string{
+			"Authoring edits belong only under task/ fixed candidate files.",
+			"solution/solve.sh and tests/test.sh must operate on the writable /work source copy during validation.",
+			"Do not write authoring source/ or validator /source; those paths are immutable provenance inputs.",
+		},
+	}
+	if guidance, err := standardAuthoringV3RustCargoBrowserWASMContractForInputs(inputs); err != nil {
+		return standardAuthoringV3ValidationEnvironmentContract{}, err
+	} else if guidance != nil {
+		contract.RustCargoBrowserWASM = guidance
+	}
+	return contract, nil
+}
+
+func standardAuthoringV3RustCargoBrowserWASMContractForInputs(inputs map[string][]byte) (*standardAuthoringV3RustCargoBrowserWASMContract, error) {
+	raw, found := inputs["verification_contract"]
+	if !found {
+		return nil, nil
+	}
+	contract, err := workflowadapter.ParseStandardAuthoringVerificationContractJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	if contract.CoverageMode != workflowadapter.StandardAuthoringCoverageBrowserWASM || !standardAuthoringV3CommandMentionsRustCargoBrowserWASM(contract.Command) {
+		return nil, nil
+	}
+	return &standardAuthoringV3RustCargoBrowserWASMContract{
+		Applies:               true,
+		ToolchainProvisioning: "Install or prefetch generic Rust wasm/browser tools in environment/Dockerfile during Docker build. Docker build context is environment/, not the frozen source tree.",
+		DependencySources: []string{
+			"dependencies already present in the digest-pinned base image",
+			"repository-vendored dependencies committed in the frozen source",
+			"other explicitly frozen task inputs",
+		},
+		RuntimeEnvironment: []standardAuthoringV3NameValue{
+			{Name: "CARGO_HOME", Value: "/work/.cargo-home"},
+			{Name: "CARGO_TARGET_DIR", Value: "/work/.cargo-target"},
+		},
+		CachePolicy: "Runtime has no network and limited /tmp; keep Cargo target/cache data under /work and do not copy full registry or target caches into /tmp.",
+	}, nil
+}
+
+func standardAuthoringV3CommandMentionsRustCargoBrowserWASM(command []string) bool {
+	joined := strings.ToLower(strings.Join(command, " "))
+	for _, token := range []string{"cargo", "wasm", "wasm-pack", "wasm-bindgen", "trunk", "playwright", "browser"} {
+		if strings.Contains(joined, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func standardAuthoringV3PrepareCandidateWorkspace(root string, inputs map[string][]byte) error {
@@ -896,12 +1044,13 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 		StderrTail  string `json:"stderr_tail,omitempty"`
 	}
 	response := struct {
-		Accepted      bool                                                      `json:"accepted"`
-		Reason        string                                                    `json:"reason,omitempty"`
-		Snapshot      workflowkit.Fingerprint                                   `json:"snapshot_digest"`
-		FailureCode   workflowkit.AgentFailureCode                              `json:"failure_code,omitempty"`
-		Diagnostics   []diagnostic                                              `json:"diagnostics"`
-		RepairContext *workflowadapter.StandardAuthoringValidationRepairContext `json:"validation_repair_context,omitempty"`
+		Accepted       bool                                                      `json:"accepted"`
+		Reason         string                                                    `json:"reason,omitempty"`
+		Snapshot       workflowkit.Fingerprint                                   `json:"snapshot_digest"`
+		FailureCode    workflowkit.AgentFailureCode                              `json:"failure_code,omitempty"`
+		Diagnostics    []diagnostic                                              `json:"diagnostics"`
+		RepairGuidance []string                                                  `json:"repair_guidance,omitempty"`
+		RepairContext  *workflowadapter.StandardAuthoringValidationRepairContext `json:"validation_repair_context,omitempty"`
 	}{Accepted: accepted, Reason: reason, Snapshot: snapshot, FailureCode: receipt.FailureCode, Diagnostics: make([]diagnostic, 0, len(receipt.Diagnostics))}
 	for _, item := range receipt.Diagnostics {
 		response.Diagnostics = append(response.Diagnostics, diagnostic{
@@ -910,6 +1059,7 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 		})
 	}
 	if !accepted {
+		response.RepairGuidance = standardAuthoringV3RepairGuidance(receipt)
 		if repairContext, err := workflowadapter.NewStandardAuthoringValidationRepairContext(receipt, standardAuthoringV3EditableCandidatePaths()); err == nil {
 			response.RepairContext = &repairContext
 		}
@@ -919,6 +1069,74 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 		return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`)
 	}
 	return encoded
+}
+
+func standardAuthoringV3RepairGuidance(receipt workflowkit.ValidationReceipt) []string {
+	failed, found := standardAuthoringV3FailedDiagnostic(receipt.Diagnostics)
+	if !found {
+		return []string{"Read validation_repair_context and repair only the fixed candidate files under task/ before calling harbor_validate_candidate again."}
+	}
+	text := strings.ToLower(failed.CommandID + "\n" + failed.StdoutTail + "\n" + failed.StderrTail)
+	guidance := make([]string, 0, 4)
+	if strings.Contains(text, "permission denied") || strings.Contains(text, "read-only file system") {
+		if strings.Contains(text, "/source") || strings.Contains(text, "source") {
+			guidance = append(guidance, "Do not write frozen source/ or validator /source; write candidate files under task/ and have solution/test scripts modify the writable /work copy.")
+		} else {
+			guidance = append(guidance, "Use writable runtime paths such as /work or /tmp/harbor-*; the validator root filesystem and /task are read-only.")
+		}
+	}
+	if standardAuthoringV3LooksLikeNetworkFailure(text) {
+		guidance = append(guidance, "Runtime validation has --network none; prepare generic tools in environment/Dockerfile during Docker build and use only base-image, vendored, or frozen-input dependencies at runtime.")
+	}
+	if standardAuthoringV3LooksLikeRustCargoBrowserWASM(text) {
+		guidance = append(guidance, "For Rust/Cargo browser-wasm validation, set CARGO_HOME and CARGO_TARGET_DIR to writable executable paths such as /work/.cargo-home and /work/.cargo-target; do not copy full Cargo registries or target caches into limited /tmp.")
+	}
+	switch failed.CommandID {
+	case "environment_build":
+		guidance = append(guidance, "Fix provisioning in environment/Dockerfile. Its Docker build context is environment/, so it cannot read the frozen source tree.")
+	case "source_access":
+		guidance = append(guidance, "The validator must be able to copy /source into writable /work; avoid source archive modes or Dockerfile user changes that make /source unreadable after capabilities are dropped.")
+	case "baseline_verify", "oracle_verify", "coverage_verify":
+		guidance = append(guidance, "Keep the VerificationContract command unchanged; repair solution/solve.sh or tests/test.sh so they run against the writable /work checkout.")
+	}
+	if len(guidance) == 0 {
+		guidance = append(guidance, "Use validation_repair_context, stdout_tail, and stderr_tail to make one focused candidate-file correction before validating again.")
+	}
+	return guidance
+}
+
+func standardAuthoringV3FailedDiagnostic(diagnostics []workflowkit.AgentCommandReport) (workflowkit.AgentCommandReport, bool) {
+	if len(diagnostics) == 0 {
+		return workflowkit.AgentCommandReport{}, false
+	}
+	for _, diagnostic := range diagnostics {
+		if diagnostic.ExitCode != 0 {
+			return diagnostic, true
+		}
+	}
+	return diagnostics[len(diagnostics)-1], true
+}
+
+func standardAuthoringV3LooksLikeNetworkFailure(text string) bool {
+	for _, token := range []string{
+		"could not resolve", "temporary failure resolving", "network is unreachable", "no route to host",
+		"connection timed out", "failed to download", "unable to download", "download failed",
+		"crates.io", "git fetch", "npm error", "playwright install",
+	} {
+		if strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func standardAuthoringV3LooksLikeRustCargoBrowserWASM(text string) bool {
+	for _, token := range []string{"cargo", "rustc", "wasm", "wasm-pack", "wasm-bindgen", "trunk", "playwright"} {
+		if strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func standardAuthoringV3EditableCandidatePaths() []string {

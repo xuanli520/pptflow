@@ -427,6 +427,90 @@ func TestStandardAuthoringV3ContextDocumentDeclaresTerminalSubmission(t *testing
 	}
 }
 
+func TestStandardAuthoringV3WriterContextIncludesValidationEnvironmentContract(t *testing.T) {
+	verification := []byte(`{"format":"harbor.verification-contract.v1","version":"1","command":["sh","/task/tests/test.sh"],"workdir":".","coverage_mode":"integration","allowed_solution_paths":["src"]}`)
+	for _, stageKey := range []string{workflowadapter.AuthoringLoop, workflowadapter.AuthoringRepair} {
+		stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(stageKey))
+		if !found || stage.AgentRole == nil {
+			t.Fatalf("3.0 writer stage %q is unavailable", stageKey)
+		}
+		contextDocument, err := standardAuthoringV3ContextDocument(
+			workflowkit.StageExecutionRequest{Stage: standardAuthoringV3TestDescriptor(stage)},
+			StandardAuthoringCodexTurnProgram{Fingerprint: workflowkit.SHA256Fingerprint([]byte("writer-program-" + string(stageKey)))},
+			workflowkit.SHA256Fingerprint([]byte("writer-inputs-"+string(stageKey))),
+			map[string][]byte{"verification_contract": verification}, true,
+		)
+		if err != nil {
+			t.Fatalf("writer context for %q: %v", stageKey, err)
+		}
+		var document struct {
+			ValidationEnvironmentContract *standardAuthoringV3ValidationEnvironmentContract `json:"validation_environment_contract"`
+		}
+		if err := json.Unmarshal(contextDocument, &document); err != nil {
+			t.Fatalf("decode writer context for %q: %v", stageKey, err)
+		}
+		contract := document.ValidationEnvironmentContract
+		if contract == nil {
+			t.Fatalf("writer context for %q omitted validation_environment_contract", stageKey)
+		}
+		if contract.AuthoringWorkspace.Source.Path != StandardAuthoringCodexAttemptSourceDirectory || contract.AuthoringWorkspace.Source.Access != "read_only_reference" {
+			t.Fatalf("authoring source contract for %q = %+v", stageKey, contract.AuthoringWorkspace.Source)
+		}
+		if contract.AuthoringWorkspace.Task.Path != StandardAuthoringCodexAttemptTaskDirectory || contract.AuthoringWorkspace.Task.Access != "writable_candidate_files_only" {
+			t.Fatalf("authoring task contract for %q = %+v", stageKey, contract.AuthoringWorkspace.Task)
+		}
+		if contract.ValidatorRuntime.Source.Path != "/source" || contract.ValidatorRuntime.Source.Access != "read_only_frozen_source" ||
+			contract.ValidatorRuntime.Task.Path != "/task" || contract.ValidatorRuntime.Task.Access != "read_only_candidate_files" ||
+			contract.ValidatorRuntime.Work.Path != "/work" || contract.ValidatorRuntime.Work.Access != "read_write_source_copy" {
+			t.Fatalf("validator runtime contract for %q = %+v", stageKey, contract.ValidatorRuntime)
+		}
+		if contract.RuntimeConstraints.Network != "none" || contract.RuntimeConstraints.RootFilesystem != "read_only" {
+			t.Fatalf("runtime constraints for %q = %+v", stageKey, contract.RuntimeConstraints)
+		}
+		if !standardAuthoringV3NameValueContains(contract.RuntimeConstraints.Environment, "XDG_CACHE_HOME", "/tmp/harbor-cache") ||
+			!standardAuthoringV3NameValueContains(contract.RuntimeConstraints.Environment, "HARBOR_WORKSPACE", "/work") {
+			t.Fatalf("runtime env contract for %q = %+v", stageKey, contract.RuntimeConstraints.Environment)
+		}
+		if len(contract.ScriptProtocol) == 0 || !strings.Contains(strings.Join(contract.ScriptProtocol, "\n"), "Do not write") {
+			t.Fatalf("script protocol for %q = %+v", stageKey, contract.ScriptProtocol)
+		}
+	}
+}
+
+func TestStandardAuthoringV3ContextIncludesRustCargoBrowserWASMGuidance(t *testing.T) {
+	stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.AuthoringLoop))
+	if !found || stage.AgentRole == nil {
+		t.Fatal("3.0 author stage is unavailable")
+	}
+	verification := []byte(`{"format":"harbor.verification-contract.v1","version":"1","command":["wasm-pack","test","--headless","--firefox"],"workdir":".","coverage_mode":"browser_wasm","allowed_solution_paths":["src/lib.rs"]}`)
+	contextDocument, err := standardAuthoringV3ContextDocument(
+		workflowkit.StageExecutionRequest{Stage: standardAuthoringV3TestDescriptor(stage)},
+		StandardAuthoringCodexTurnProgram{Fingerprint: workflowkit.SHA256Fingerprint([]byte("browser-wasm-program"))},
+		workflowkit.SHA256Fingerprint([]byte("browser-wasm-inputs")),
+		map[string][]byte{"verification_contract": verification}, true,
+	)
+	if err != nil {
+		t.Fatalf("browser-wasm context: %v", err)
+	}
+	var document struct {
+		ValidationEnvironmentContract *standardAuthoringV3ValidationEnvironmentContract `json:"validation_environment_contract"`
+	}
+	if err := json.Unmarshal(contextDocument, &document); err != nil {
+		t.Fatalf("decode browser-wasm context: %v", err)
+	}
+	guidance := document.ValidationEnvironmentContract.RustCargoBrowserWASM
+	if guidance == nil || !guidance.Applies {
+		t.Fatalf("browser-wasm context omitted Rust/Cargo guidance: %+v", document.ValidationEnvironmentContract)
+	}
+	if !strings.Contains(guidance.ToolchainProvisioning, "environment/Dockerfile") ||
+		!strings.Contains(guidance.ToolchainProvisioning, "Docker build context is environment/") ||
+		!strings.Contains(guidance.CachePolicy, "limited /tmp") ||
+		!standardAuthoringV3NameValueContains(guidance.RuntimeEnvironment, "CARGO_TARGET_DIR", "/work/.cargo-target") ||
+		!standardAuthoringV3NameValueContains(guidance.RuntimeEnvironment, "CARGO_HOME", "/work/.cargo-home") {
+		t.Fatalf("browser-wasm guidance = %+v", guidance)
+	}
+}
+
 func TestStandardAuthoringV3ContextDocumentProjectsCandidateValidationIdentity(t *testing.T) {
 	snapshot, err := workflowkit.NewCandidateSnapshot([]workflowkit.CandidateFile{{
 		Path: "instruction.md", SchemaVersion: "harbor.artifact.v1", ContentDigest: workflowkit.SHA256Fingerprint([]byte("candidate")), SizeBytes: int64(len("candidate")),
@@ -477,6 +561,70 @@ func TestStandardAuthoringV3ContextDocumentProjectsCandidateValidationIdentity(t
 	}
 }
 
+func TestStandardAuthoringV3RejectedValidationResponseAddsNonDurableRepairGuidance(t *testing.T) {
+	tests := []struct {
+		name       string
+		commandID  string
+		stderrTail string
+		want       []string
+	}{
+		{
+			name:       "environment build network",
+			commandID:  "environment_build",
+			stderrTail: "apt-get update failed: Could not resolve deb.debian.org",
+			want:       []string{"Runtime validation has --network none", "Fix provisioning in environment/Dockerfile"},
+		},
+		{
+			name:       "source access permission",
+			commandID:  "source_access",
+			stderrTail: "touch: cannot touch '/source/.cargo/config.toml': Permission denied",
+			want:       []string{"Do not write frozen source", "copy /source into writable /work"},
+		},
+		{
+			name:       "oracle cargo wasm offline",
+			commandID:  "oracle_verify",
+			stderrTail: "cargo failed to download wasm-bindgen from crates.io",
+			want:       []string{"Runtime validation has --network none", "CARGO_TARGET_DIR", "writable /work checkout"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			receipt := standardAuthoringV3RejectedReceipt(t, test.commandID, test.stderrTail)
+			beforeDigest := receipt.Digest
+			response := standardAuthoringV3ValidationToolResponse(false, "candidate_rejected", receipt.SnapshotDigest, receipt)
+			if receipt.Digest != beforeDigest {
+				t.Fatal("repair guidance mutated the durable validation receipt identity")
+			}
+			var decoded struct {
+				Accepted       bool                                                      `json:"accepted"`
+				Reason         string                                                    `json:"reason"`
+				RepairGuidance []string                                                  `json:"repair_guidance"`
+				RepairContext  *workflowadapter.StandardAuthoringValidationRepairContext `json:"validation_repair_context"`
+			}
+			if err := json.Unmarshal(response, &decoded); err != nil {
+				t.Fatalf("decode validation response %s: %v", response, err)
+			}
+			joined := strings.Join(decoded.RepairGuidance, "\n")
+			if decoded.Accepted || decoded.Reason != "candidate_rejected" || decoded.RepairContext == nil {
+				t.Fatalf("validation response = %+v", decoded)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("repair guidance %q does not contain %q", joined, want)
+				}
+			}
+			expected, err := workflowadapter.NewStandardAuthoringValidationRepairContext(receipt, standardAuthoringV3EditableCandidatePaths())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded.RepairContext.CandidateDigest != expected.CandidateDigest || decoded.RepairContext.ReceiptDigest != expected.ReceiptDigest ||
+				decoded.RepairContext.FailedStep != expected.FailedStep {
+				t.Fatalf("repair context identity changed: got %+v want %+v", decoded.RepairContext, expected)
+			}
+		})
+	}
+}
+
 func TestStandardAuthoringV3AuthorCapturesOnlyFixedWorkspaceFiles(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
@@ -519,6 +667,38 @@ func TestStandardAuthoringV3AuthorCapturesOnlyFixedWorkspaceFiles(t *testing.T) 
 	if err != nil || string(response) != `{"accepted":false,"reason":"candidate_tool_does_not_accept_artifacts"}` {
 		t.Fatalf("author tool accepted direct artifacts: %s, %v", response, err)
 	}
+}
+
+func standardAuthoringV3NameValueContains(items []standardAuthoringV3NameValue, name, value string) bool {
+	for _, item := range items {
+		if item.Name == name && item.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func standardAuthoringV3RejectedReceipt(t *testing.T, commandID, stderrTail string) workflowkit.ValidationReceipt {
+	t.Helper()
+	contract, err := workflowkit.NewCandidateValidationContract(workflowkit.SHA256Fingerprint([]byte("runtime")), workflowkit.SHA256Fingerprint([]byte("verification")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractDigest, err := contract.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	receipt, err := workflowkit.NewValidationReceipt(workflowkit.ValidationReceipt{
+		SnapshotDigest: workflowkit.SHA256Fingerprint([]byte("candidate")), ContractDigest: contractDigest,
+		Verdict: workflowkit.ValidationReject, FailureCode: workflowkit.AgentFailureValidatorReject,
+		Diagnostics: []workflowkit.AgentCommandReport{{CommandID: commandID, ExitCode: 1, TestStarted: commandID != "environment_build", StderrTail: stderrTail}},
+		IssuedAt:    now, ExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
 }
 
 func TestStandardAuthoringV3RepairSubmissionRequiresPassingFreshValidationReceipt(t *testing.T) {

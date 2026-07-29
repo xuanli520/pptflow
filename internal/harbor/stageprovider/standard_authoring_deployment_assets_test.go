@@ -109,6 +109,17 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if (registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringLoop) || registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair)) && (!strings.Contains(joined, "POSIX sh compatible") || !strings.Contains(joined, "set -o pipefail")) {
 			t.Fatalf("author prompt for %q does not make sh-invoked scripts POSIX compatible", registration.Stage.Key)
 		}
+		if (registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringLoop) || registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair)) &&
+			(!strings.Contains(joined, "validation_environment_contract") ||
+				!strings.Contains(joined, "task/") ||
+				!strings.Contains(joined, "source/") ||
+				!strings.Contains(joined, "/work") ||
+				!(strings.Contains(joined, "--network none") || strings.Contains(joined, "no-network")) ||
+				!strings.Contains(joined, "CARGO_HOME") ||
+				!strings.Contains(joined, "CARGO_TARGET_DIR") ||
+				!strings.Contains(joined, "limited /tmp")) {
+			t.Fatalf("author prompt for %q does not expose the validation environment and Cargo/browser-wasm runtime contract", registration.Stage.Key)
+		}
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) && (!strings.Contains(joined, "exactly one candidate-validation opportunity") || !strings.Contains(joined, "do not call the tool again until the next prompt")) {
 			t.Fatal("repair prompt does not preserve one validation round per agent turn")
 		}
