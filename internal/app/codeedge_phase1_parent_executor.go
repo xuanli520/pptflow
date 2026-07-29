@@ -1116,7 +1116,7 @@ func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) 
 }
 
 func codeEdgePhase1VerificationProgram(applySolution bool) string {
-	prepare := "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config && rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /workspace/source/. /oracle/workspace/ && cd /oracle/workspace"
+	prepare := "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config && rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /workspace/source/. /oracle/workspace/ && chmod -R u+rwX /oracle/workspace && cd /oracle/workspace"
 	command := "sh /oracle/tests/test.sh"
 	if applySolution {
 		command = "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh"

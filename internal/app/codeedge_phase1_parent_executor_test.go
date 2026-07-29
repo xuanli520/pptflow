@@ -153,11 +153,13 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 	oracleProgram := oracleCommand.Args[len(oracleCommand.Args)-1]
 	if !strings.Contains(initialProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
 		!strings.Contains(initialProgram, "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config") ||
+		!strings.Contains(initialProgram, "chmod -R u+rwX /oracle/workspace") ||
 		!strings.Contains(initialProgram, "cd /oracle/workspace") ||
 		!strings.Contains(initialProgram, "sh /oracle/tests/test.sh") ||
 		strings.Contains(initialProgram, "/oracle/solution/solve.sh") ||
 		!strings.Contains(oracleProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
 		!strings.Contains(oracleProgram, "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config") ||
+		!strings.Contains(oracleProgram, "chmod -R u+rwX /oracle/workspace") ||
 		!strings.Contains(oracleProgram, "cd /oracle/workspace") ||
 		!strings.Contains(oracleProgram, "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh") {
 		t.Fatalf("controlled verifier programs = initial=%#v oracle=%#v", initialCommand.Args, oracleCommand.Args)

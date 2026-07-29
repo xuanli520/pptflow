@@ -59,6 +59,29 @@ func TestStandardAuthoringDockerHarnessValidatesOnlyV3SnapshotFiles(t *testing.T
 			t.Fatalf("v3 validation step %d = %q, want %q", index, result.Steps[index].Step, want)
 		}
 	}
+	sourceAccessProgram := ""
+	initialProgram := ""
+	oracleProgram := ""
+	for _, command := range runner.commands {
+		if len(command.Args) == 0 || command.Args[0] != "run" {
+			continue
+		}
+		program := command.Args[len(command.Args)-1]
+		switch {
+		case strings.Contains(program, "/oracle/worktree"):
+			sourceAccessProgram = program
+		case strings.Contains(program, "solution/solve.sh"):
+			oracleProgram = program
+		case strings.Contains(program, "/oracle/workspace"):
+			initialProgram = program
+		}
+	}
+	if !strings.Contains(sourceAccessProgram, "chmod -R u+rwX /oracle/worktree") ||
+		!strings.Contains(sourceAccessProgram, "test -w \"$probe\"") ||
+		!strings.Contains(initialProgram, "chmod -R u+rwX /oracle/workspace") ||
+		!strings.Contains(oracleProgram, "chmod -R u+rwX /oracle/workspace") {
+		t.Fatalf("v3 verifier programs do not restore copied source writability: source=%q initial=%q oracle=%q", sourceAccessProgram, initialProgram, oracleProgram)
+	}
 	if err := result.ValidateReportJSON(); err != nil {
 		t.Fatal(err)
 	}

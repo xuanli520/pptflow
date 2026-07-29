@@ -19,7 +19,7 @@ import (
 
 const (
 	standardAuthoringDockerHarnessTailLimit           = 16 << 10
-	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /oracle/worktree && mkdir -p /oracle/worktree && cp -R /oracle/source/. /oracle/worktree/ && test -d /oracle/worktree && touch /oracle/worktree/.harbor-source-access && rm /oracle/worktree/.harbor-source-access"
+	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /oracle/worktree && mkdir -p /oracle/worktree && cp -R /oracle/source/. /oracle/worktree/ && chmod -R u+rwX /oracle/worktree && test -d /oracle/worktree && probe=$(find /oracle/worktree -type f -print -quit) && test -n \"$probe\" && test -w \"$probe\" && touch /oracle/worktree/.harbor-source-access && rm /oracle/worktree/.harbor-source-access"
 )
 
 var standardAuthoringDockerHarnessTokenPattern = regexp.MustCompile(`(?i)\b(?:sk|key|token)-[a-z0-9_-]{16,}\b`)
@@ -419,7 +419,7 @@ func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, 
 func standardAuthoringV3VerificationProgram(verification StandardAuthoringVerificationContract, applySolution bool) string {
 	command := standardAuthoringShellJoin(verification.Command)
 	workdir := standardAuthoringShellQuote("/oracle/workspace/" + strings.TrimPrefix(verification.Workdir, "./"))
-	prepare := "rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /oracle/source/. /oracle/workspace/"
+	prepare := "rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /oracle/source/. /oracle/workspace/ && chmod -R u+rwX /oracle/workspace"
 	if applySolution {
 		return prepare + " && cd /oracle && sh ./solution/solve.sh && cd " + workdir + " && " + command
 	}

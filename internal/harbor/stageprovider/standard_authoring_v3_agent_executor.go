@@ -845,6 +845,8 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 		CommandID   string `json:"command_id"`
 		ExitCode    int    `json:"exit_code"`
 		TestStarted bool   `json:"test_started"`
+		StdoutTail  string `json:"stdout_tail,omitempty"`
+		StderrTail  string `json:"stderr_tail,omitempty"`
 	}
 	response := struct {
 		Accepted    bool                         `json:"accepted"`
@@ -854,7 +856,10 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 		Diagnostics []diagnostic                 `json:"diagnostics"`
 	}{Accepted: accepted, Reason: reason, Snapshot: snapshot, FailureCode: receipt.FailureCode, Diagnostics: make([]diagnostic, 0, len(receipt.Diagnostics))}
 	for _, item := range receipt.Diagnostics {
-		response.Diagnostics = append(response.Diagnostics, diagnostic{CommandID: item.CommandID, ExitCode: item.ExitCode, TestStarted: item.TestStarted})
+		response.Diagnostics = append(response.Diagnostics, diagnostic{
+			CommandID: item.CommandID, ExitCode: item.ExitCode, TestStarted: item.TestStarted,
+			StdoutTail: item.StdoutTail, StderrTail: item.StderrTail,
+		})
 	}
 	encoded, err := json.Marshal(response)
 	if err != nil {

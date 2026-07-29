@@ -569,14 +569,14 @@ func TestStandardAuthoringV3RepairSubmissionRequiresPassingFreshValidationReceip
 		return workflowkit.NewValidationReceipt(workflowkit.ValidationReceipt{
 			SnapshotDigest: snapshot.Digest, ContractDigest: contractDigest, Verdict: verdict,
 			FailureCode: failureCode,
-			Diagnostics: []workflowkit.AgentCommandReport{{CommandID: "baseline_verify", ExitCode: 1, TestStarted: true, StderrTail: "redacted"}},
+			Diagnostics: []workflowkit.AgentCommandReport{{CommandID: "baseline_verify", ExitCode: 1, TestStarted: true, StderrTail: "patch failed after redaction"}},
 			IssuedAt:    now, ExpiresAt: now.Add(time.Minute),
 		})
 	}
 
 	submission.beginTurn()
 	first, err := submission.handle(context.Background(), json.RawMessage(`{"verdict":"pass"}`))
-	if err != nil || !strings.Contains(string(first), `"reason":"candidate_rejected"`) || strings.Contains(string(first), "redacted") {
+	if err != nil || !strings.Contains(string(first), `"reason":"candidate_rejected"`) || !strings.Contains(string(first), `"stderr_tail":"patch failed after redaction"`) {
 		t.Fatalf("rejected repair validation response = %s, %v", first, err)
 	}
 	if _, accepted := submission.acceptedResult(); accepted {
