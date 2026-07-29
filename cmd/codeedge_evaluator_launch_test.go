@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,8 +14,10 @@ import (
 
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/testsupport"
+	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 	"github.com/spf13/cobra"
 )
@@ -71,14 +75,7 @@ func TestRunEvaluateCLIRequiresPreparedFrozenInputsAndReplaysOneWorkerHandoff(t 
 		_ = database.Close()
 		t.Fatal(err)
 	}
-	task, revision, err := services.Tasks.ImportTask(ctx, app.ImportTaskRequest{
-		CreateDraftTaskRequest: app.CreateDraftTaskRequest{Slug: "cli-codeedge-evaluator", Title: "CLI CodeEdge Evaluator", Actor: actor, Reason: "create evaluator CLI fixture"},
-		SourceDirectory:        writeCommandTaskSnapshot(t, "CodeEdge evaluator CLI fixture\n"),
-	})
-	if err != nil {
-		_ = database.Close()
-		t.Fatal(err)
-	}
+	task, revision := createCommandStandardMaterializedTask(t, ctx, root, services, "cli-codeedge-evaluator", "CLI CodeEdge Evaluator", "CodeEdge evaluator CLI fixture\n", actor)
 	provider.spec = testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	parent, err := services.Runs.StartRun(ctx, app.StartRunRequest{
 		TaskID: task.ID, RevisionID: revision.ID,
@@ -217,6 +214,199 @@ func openCommandEvaluatorLifecycle(t *testing.T, root string, factory func(strin
 		t.Fatal(err)
 	}
 	return services
+}
+
+func createCommandStandardMaterializedTask(t *testing.T, ctx context.Context, root string, services *app.LifecycleServices, slug, title, instruction, actor string) (store.TaskV2, store.TaskRevision) {
+	t.Helper()
+	task, session, run, objects := createCommandStandardAuthoringRun(t, ctx, root, services, slug, title, actor)
+	run, err := services.Store().TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning,
+		Actor: actor, Reason: "run Standard materialization fixture",
+	})
+	if err != nil {
+		t.Fatalf("transition Standard authoring Run fixture: %v", err)
+	}
+
+	revisionID := commandLifecycleUUID(t)
+	_, digest, manifestID := materializeCommandRevisionSnapshot(t, ctx, root, objects, task.ID, revisionID, instruction)
+	result, err := services.Store().MaterializeAuthoringTask(ctx, store.MaterializeAuthoringTaskRequest{
+		IdempotencyKey:      "command-standard-materialization:" + slug,
+		AuthoringSessionID:  session.ID,
+		AuthoringRunID:      run.ID,
+		ExpectedTaskVersion: task.Version,
+		ExpectedRunVersion:  run.Version,
+		RevisionID:          revisionID,
+		TaskDigest:          digest,
+		ProposalDigest:      string(workflowkit.SHA256Fingerprint([]byte("command-standard-proposal:" + slug))),
+		ManifestID:          manifestID,
+		ChangeSummary:       "materialize Standard fixture",
+		MetadataJSON:        `{}`,
+		Actor:               actor,
+		Reason:              "materialize Standard fixture task",
+	})
+	if err != nil {
+		t.Fatalf("materialize Standard fixture task: %v", err)
+	}
+	return result.Task, result.Revision
+}
+
+func createCommandStandardAuthoringRun(t *testing.T, ctx context.Context, root string, services *app.LifecycleServices, slug, title, actor string) (store.TaskV2, store.AuthoringSession, store.WorkflowRun, *workflowruntime.ArtifactObjectStore) {
+	t.Helper()
+	objects, err := workflowruntime.NewArtifactObjectStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceObject, err := objects.PutBytes(ctx, commandStandardSourceSnapshot(t))
+	if err != nil {
+		t.Fatalf("store source snapshot fixture: %v", err)
+	}
+	reference := workflowadapter.StandardAuthoringCurrentTemplateReference()
+	repositoryURL := "https://github.com/purplevoid/" + slug + ".git"
+	commitSHA := strings.Repeat("1", 40)
+	source, err := services.Store().CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: repositoryURL, CommitSHA: commitSHA,
+		SnapshotArtifactRef:   string(sourceObject.Digest),
+		SnapshotContentDigest: string(sourceObject.Digest),
+		SnapshotSchemaVersion: workflowadapter.CodeEdgeSourceSnapshotSchemaVersion,
+		IdempotencyKey:        "command-standard-source:" + slug,
+		Actor:                 actor,
+		Reason:                "freeze Standard source fixture",
+	})
+	if err != nil {
+		t.Fatalf("create Standard source fixture: %v", err)
+	}
+	task, err := services.Store().CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: slug, Title: title, SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA,
+		Actor: actor, Reason: "reserve Standard draft task fixture",
+	})
+	if err != nil {
+		t.Fatalf("create Standard draft task fixture: %v", err)
+	}
+	session, err := services.Store().CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID,
+		WorkflowTemplateID: reference.ID, WorkflowTemplateVersion: reference.Version,
+		SessionManifestJSON: `{"mode":"standard","fixture":true}`,
+		IdempotencyKey:      "command-standard-session:" + slug,
+		Actor:               actor,
+		Reason:              "freeze Standard session fixture",
+	})
+	if err != nil {
+		t.Fatalf("create Standard session fixture: %v", err)
+	}
+	run, err := services.Store().CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID,
+		WorkflowTemplateID: reference.ID, WorkflowTemplateVersion: reference.Version,
+		ResolvedProfileHash: string(workflowkit.SHA256Fingerprint([]byte("command-standard-profile:" + slug))),
+		DefinitionHash:      string(workflowkit.SHA256Fingerprint([]byte("command-standard-definition:" + slug))),
+		RunManifestJSON:     `{}`,
+		Trigger:             "command-standard-fixture",
+		Actor:               actor,
+		Reason:              "start Standard fixture Run",
+	})
+	if err != nil {
+		t.Fatalf("create Standard authoring Run fixture: %v", err)
+	}
+	return task, session, run, objects
+}
+
+func materializeCommandRevisionSnapshot(t *testing.T, ctx context.Context, root string, objects *workflowruntime.ArtifactObjectStore, taskID, revisionID, instruction string) (string, string, string) {
+	t.Helper()
+	source := writeCommandTaskSnapshot(t, instruction)
+	revisionDirectory := filepath.Join(root, "tasks", taskID, "revisions", revisionID)
+	snapshot := filepath.Join(revisionDirectory, "snapshot")
+	if err := os.MkdirAll(filepath.Dir(revisionDirectory), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range taskpolicy.CanonicalFiles() {
+		content, err := os.ReadFile(filepath.Join(source, filepath.FromSlash(file.Path)))
+		if os.IsNotExist(err) && file.Environment {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		destination := filepath.Join(snapshot, filepath.FromSlash(file.Path))
+		if err := os.MkdirAll(filepath.Dir(destination), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(destination, content, file.Mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := taskpolicy.ValidateManagedSnapshotV2(snapshot); err != nil {
+		t.Fatalf("validate materialized command snapshot: %v", err)
+	}
+	digest, err := taskpolicy.ComputeManagedTaskDigestV2(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := struct {
+		Format       string    `json:"format"`
+		TaskID       string    `json:"task_id"`
+		RevisionID   string    `json:"revision_id"`
+		TaskDigest   string    `json:"task_digest"`
+		SnapshotPath string    `json:"snapshot_path"`
+		CreatedAt    time.Time `json:"created_at"`
+	}{
+		Format: "harbor.task-revision-manifest.v2", TaskID: taskID, RevisionID: revisionID,
+		TaskDigest: digest, SnapshotPath: "snapshot", CreatedAt: time.Now().UTC(),
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := objects.PutBytes(ctx, manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestFile, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestFile = append(manifestFile, '\n')
+	if err := os.WriteFile(filepath.Join(revisionDirectory, "manifest.json"), manifestFile, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot, digest, string(object.Digest)
+}
+
+func commandStandardSourceSnapshot(t *testing.T) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	entries := []struct {
+		name    string
+		mode    int64
+		content []byte
+		dir     bool
+	}{
+		{name: "source/", mode: 0o755, dir: true},
+		{name: "source/README.md", mode: 0o644, content: []byte("fixture source tree\n")},
+	}
+	for _, entry := range entries {
+		header := &tar.Header{Name: entry.name, Mode: entry.mode}
+		if entry.dir {
+			header.Typeflag = tar.TypeDir
+		} else {
+			header.Typeflag = tar.TypeReg
+			header.Size = int64(len(entry.content))
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if !entry.dir {
+			if _, err := writer.Write(entry.content); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
 }
 
 func commandCodeEdgePhase1Profile(t *testing.T) workflowadapter.ExecutionProfile {

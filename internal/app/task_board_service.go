@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
+	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -54,6 +55,36 @@ type TaskBoardReview struct {
 	RevisionID string
 }
 
+// TaskBoardOperatorSummary is the business-facing readout for the current
+// authoring flow. It keeps validation semantics separate from StageAttempt
+// execution, where a host verifier can complete successfully while rejecting
+// the candidate it inspected.
+type TaskBoardOperatorSummary struct {
+	Status           string                     `json:"status"`
+	Cause            string                     `json:"cause,omitempty"`
+	NextAction       string                     `json:"next_action,omitempty"`
+	LatestValidation *TaskBoardLatestValidation `json:"latest_validation,omitempty"`
+}
+
+// TaskBoardLatestValidation describes the latest immutable host validation
+// receipt without exposing raw logs, paths, environment, or transcripts.
+type TaskBoardLatestValidation struct {
+	Status               string     `json:"status"`
+	Verdict              string     `json:"verdict"`
+	Stage                string     `json:"stage"`
+	StageAttemptID       string     `json:"stage_attempt_id"`
+	StageExecutionStatus string     `json:"stage_execution_status"`
+	StageVerdict         string     `json:"stage_verdict"`
+	FailureCode          string     `json:"failure_code,omitempty"`
+	FailedStep           string     `json:"failed_step,omitempty"`
+	ExitCode             int        `json:"exit_code,omitempty"`
+	TestStarted          bool       `json:"test_started"`
+	CandidateDigest      string     `json:"candidate_digest"`
+	ReceiptDigest        string     `json:"receipt_digest"`
+	ArtifactID           string     `json:"artifact_id"`
+	RecordedAt           *time.Time `json:"recorded_at,omitempty"`
+}
+
 // TaskBoardTask is the presentation-neutral task projection consumed by the
 // terminal board. It carries only durable identifiers and status facts; task
 // content remains behind the lifecycle inspection boundary.
@@ -68,6 +99,7 @@ type TaskBoardTask struct {
 	RunID           string
 	RunStatus       string
 	CurrentStage    string
+	OperatorSummary *TaskBoardOperatorSummary
 	Review          *TaskBoardReview
 	OpenReviewCount int
 	Runs            []TaskBoardRun
@@ -133,6 +165,7 @@ type TaskBoardRun struct {
 	AgentTurnTranscripts  []TaskBoardAgentTranscript
 	Status                string
 	CurrentStage          string
+	OperatorSummary       *TaskBoardOperatorSummary
 	FailureStage          string
 	FailureClass          string
 	FailureReason         string
@@ -321,6 +354,23 @@ type TaskBoardDecideReviewRequest struct {
 type TaskBoardReadRunLogRequest struct {
 	TaskID string
 	RunID  string
+}
+
+// TaskBoardRunSummaryRequest selects one Run for the operator-facing summary
+// CLI. Task ownership is derived from the durable Run when omitted by callers.
+type TaskBoardRunSummaryRequest struct {
+	RunID string
+}
+
+// TaskBoardRunSummary is a compact JSON surface for operators and scripts.
+type TaskBoardRunSummary struct {
+	TaskID          string                    `json:"task_id"`
+	TaskSlug        string                    `json:"task_slug"`
+	TaskTitle       string                    `json:"task_title"`
+	RunID           string                    `json:"run_id"`
+	RunStatus       string                    `json:"run_status"`
+	CurrentStage    string                    `json:"current_stage"`
+	OperatorSummary *TaskBoardOperatorSummary `json:"operator_summary,omitempty"`
 }
 
 // TaskBoardRetryRunRequest identifies one confirmed retry or recovery action.
@@ -868,6 +918,41 @@ func (service *TaskBoardService) ReadRunLog(ctx context.Context, request TaskBoa
 	return log, nil
 }
 
+// Summary returns the same operator-facing Run readout used by the TUI, but
+// shaped as a compact CLI response.
+func (service *TaskBoardService) Summary(ctx context.Context, request TaskBoardRunSummaryRequest) (TaskBoardRunSummary, error) {
+	if service == nil || service.inspection == nil {
+		return TaskBoardRunSummary{}, fmt.Errorf("task board service is not configured")
+	}
+	runID := strings.TrimSpace(request.RunID)
+	if err := store.ValidateUUIDv7(runID); err != nil {
+		return TaskBoardRunSummary{}, fmt.Errorf("task board summary run ID: %w", err)
+	}
+	detail, err := service.taskBoardRun(ctx, "", runID)
+	if err != nil {
+		return TaskBoardRunSummary{}, err
+	}
+	projected, err := service.projectTaskBoardTask(ctx, detail)
+	if err != nil {
+		return TaskBoardRunSummary{}, err
+	}
+	for _, run := range projected.Runs {
+		if run.ID != runID {
+			continue
+		}
+		return TaskBoardRunSummary{
+			TaskID:          projected.ID,
+			TaskSlug:        projected.Slug,
+			TaskTitle:       projected.Title,
+			RunID:           run.ID,
+			RunStatus:       run.Status,
+			CurrentStage:    run.CurrentStage,
+			OperatorSummary: cloneTaskBoardOperatorSummary(run.OperatorSummary),
+		}, nil
+	}
+	return TaskBoardRunSummary{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
+}
+
 // RetryRun selects the recovery contract from the durable Run subject. The
 // terminal UI submits one retry intent; task revisions and pre-materialization
 // authoring sessions keep their distinct checkpoint and commit contracts here.
@@ -1331,6 +1416,7 @@ func (service *TaskBoardService) projectTaskBoardTask(ctx context.Context, detai
 	task.RunID = latest.ID
 	task.RunStatus = latest.Status
 	task.CurrentStage = latest.CurrentStage
+	task.OperatorSummary = cloneTaskBoardOperatorSummary(latest.OperatorSummary)
 	task.Evaluator = service.projectTaskBoardEvaluator(ctx, detail)
 	if task.Review != nil {
 		task.Column = TaskBoardPending
@@ -1368,6 +1454,7 @@ func (service *TaskBoardService) projectTaskBoardRun(ctx context.Context, inspec
 	}
 	run.RetryStrategy = taskBoardRetryStrategy(inspected.Run)
 	service.projectTaskBoardAuthoringContext(ctx, inspected.Run, &run)
+	run.OperatorSummary = service.projectTaskBoardOperatorSummary(ctx, inspected)
 	run.AgentTurnTranscripts = service.projectTaskBoardAgentTurnTranscripts(ctx, inspected.Run, inspected.Stages)
 	if protocolRetry := service.projectTaskBoardStandardProtocolRetry(ctx, inspected.Run, inspected.Stages); protocolRetry != nil {
 		run.RetryStrategy = TaskBoardRetryStrategyStandardProtocolStage
@@ -1517,6 +1604,212 @@ func (service *TaskBoardService) projectTaskBoardAuthoringArtifacts(ctx context.
 		lineage = append(lineage, TaskBoardAuthoringArtifact{ArtifactKey: key, ArtifactID: candidate.ref.ID, Digest: candidate.ref.ContentDigest})
 	}
 	return claims, lineage
+}
+
+func (service *TaskBoardService) projectTaskBoardOperatorSummary(ctx context.Context, inspected RunInspection) *TaskBoardOperatorSummary {
+	run := inspected.Run
+	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || !isCurrentStandardAuthoringRun(run) {
+		return nil
+	}
+	candidate, found, err := service.latestTaskBoardValidationReceiptCandidate(ctx, run, inspected.Stages)
+	if err != nil {
+		return &TaskBoardOperatorSummary{
+			Status:     "validation_unavailable",
+			Cause:      taskBoardOperatorSummaryCause(err.Error()),
+			NextAction: "inspect validation artifact lineage",
+		}
+	}
+	if !found {
+		return &TaskBoardOperatorSummary{
+			Status:     "validation_pending",
+			Cause:      "host_candidate_verify has not produced validation_receipt",
+			NextAction: "continue authoring run",
+		}
+	}
+	validation, err := service.readTaskBoardLatestValidation(ctx, run, candidate)
+	if err != nil {
+		return &TaskBoardOperatorSummary{
+			Status:     "validation_unavailable",
+			Cause:      taskBoardOperatorSummaryCause(err.Error()),
+			NextAction: "inspect validation artifact lineage",
+		}
+	}
+	summary := &TaskBoardOperatorSummary{Status: validation.Status, LatestValidation: validation}
+	switch workflowkit.ValidationVerdict(validation.Verdict) {
+	case workflowkit.ValidationPass:
+		summary.Cause = "candidate passed host validation"
+		summary.NextAction = "continue final review"
+	case workflowkit.ValidationReject:
+		if validation.FailedStep != "" {
+			summary.Cause = "rejected at " + validation.FailedStep
+		} else {
+			summary.Cause = "candidate rejected by host validation"
+		}
+		summary.NextAction = "repair candidate"
+	default:
+		summary.Status = "validation_unavailable"
+		summary.Cause = "validation receipt has unsupported verdict"
+		summary.NextAction = "inspect validation artifact lineage"
+	}
+	return summary
+}
+
+func (service *TaskBoardService) latestTaskBoardValidationReceiptCandidate(ctx context.Context, run store.WorkflowRun, attempts []store.StageAttempt) (stageArtifactCandidate, bool, error) {
+	if service == nil || service.core == nil || service.core.store == nil || service.core.objects == nil {
+		return stageArtifactCandidate{}, false, fmt.Errorf("task board validation summary storage is not configured")
+	}
+	subject, err := service.core.resolveWorkflowRunSubject(ctx, run)
+	if err != nil {
+		return stageArtifactCandidate{}, false, err
+	}
+	var selected stageArtifactCandidate
+	found := false
+	for _, attempt := range attempts {
+		if attempt.ExecutionStatus != store.StageExecutionCompleted || strings.TrimSpace(attempt.ArtifactManifestID) == "" {
+			continue
+		}
+		if attempt.StageKey != workflowadapter.HostCandidateVerify && attempt.StageKey != workflowadapter.AuthoringRepair {
+			continue
+		}
+		references, err := service.core.store.ListArtifactRefsForAttempt(ctx, attempt.ID)
+		if err != nil {
+			return stageArtifactCandidate{}, false, fmt.Errorf("list validation artifact refs for stage attempt %s: %w", attempt.ID, err)
+		}
+		for _, reference := range references {
+			if reference.ArtifactKey != "validation_receipt" {
+				continue
+			}
+			if reference.SchemaVersion != workflowkit.ValidationReceiptFormat {
+				return stageArtifactCandidate{}, false, fmt.Errorf("validation_receipt artifact %s has schema %q", reference.ID, reference.SchemaVersion)
+			}
+			if reference.RunID != run.ID || reference.StageKey != attempt.StageKey || reference.AttemptID != attempt.ID ||
+				reference.SubjectRevisionID != subject.subjectRevisionID() || reference.SubjectDigest != subject.subjectDigest() ||
+				reference.WorkflowFingerprint != run.DefinitionHash {
+				return stageArtifactCandidate{}, false, fmt.Errorf("validation_receipt artifact %s does not match Run lineage", reference.ID)
+			}
+			candidate := stageArtifactCandidate{attempt: attempt, ref: reference}
+			if !found || laterArtifactCandidate(attempt, reference, selected) {
+				selected = candidate
+				found = true
+			}
+		}
+	}
+	return selected, found, nil
+}
+
+func (service *TaskBoardService) readTaskBoardLatestValidation(ctx context.Context, run store.WorkflowRun, candidate stageArtifactCandidate) (*TaskBoardLatestValidation, error) {
+	index, err := loadStageArtifactManifestIndex(ctx, service.core.store, candidate.ref.ManifestID)
+	if err != nil {
+		return nil, err
+	}
+	subject, err := service.core.resolveWorkflowRunSubject(ctx, run)
+	if err != nil {
+		return nil, err
+	}
+	if index.manifest.SubjectRevisionID != subject.subjectRevisionID() || index.manifest.SubjectDigest != subject.subjectDigest() ||
+		index.manifest.WorkflowFingerprint != run.DefinitionHash || index.payload.RunID != run.ID ||
+		index.payload.StageAttemptID != candidate.ref.AttemptID || string(index.payload.StageKey) != candidate.ref.StageKey {
+		return nil, fmt.Errorf("validation_receipt manifest does not match Run lineage")
+	}
+	object, err := index.objectFor(candidate.ref)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := service.core.objects.ReadAll(ctx, object)
+	if err != nil {
+		return nil, fmt.Errorf("read validation_receipt artifact %s: %w", candidate.ref.ID, err)
+	}
+	var receipt workflowkit.ValidationReceipt
+	if err := decodeStrictJSON(string(raw), &receipt); err != nil {
+		return nil, fmt.Errorf("decode validation_receipt artifact %s: %w", candidate.ref.ID, err)
+	}
+	if err := receipt.Validate(); err != nil {
+		return nil, fmt.Errorf("validate validation_receipt artifact %s: %w", candidate.ref.ID, err)
+	}
+	failedStep, exitCode, testStarted := taskBoardValidationDiagnostic(receipt)
+	recordedAt := candidate.ref.CreatedAt.UTC()
+	if candidate.attempt.FinishedAt != nil {
+		recordedAt = candidate.attempt.FinishedAt.UTC()
+	}
+	validation := &TaskBoardLatestValidation{
+		Status:               taskBoardValidationStatus(receipt.Verdict),
+		Verdict:              string(receipt.Verdict),
+		Stage:                candidate.attempt.StageKey,
+		StageAttemptID:       candidate.attempt.ID,
+		StageExecutionStatus: string(candidate.attempt.ExecutionStatus),
+		StageVerdict:         string(candidate.attempt.Verdict),
+		FailureCode:          string(receipt.FailureCode),
+		FailedStep:           failedStep,
+		ExitCode:             exitCode,
+		TestStarted:          testStarted,
+		CandidateDigest:      string(receipt.SnapshotDigest),
+		ReceiptDigest:        string(receipt.Digest),
+		ArtifactID:           candidate.ref.ID,
+		RecordedAt:           &recordedAt,
+	}
+	return validation, nil
+}
+
+func taskBoardValidationDiagnostic(receipt workflowkit.ValidationReceipt) (string, int, bool) {
+	if len(receipt.Diagnostics) == 0 {
+		return "", 0, false
+	}
+	selected := receipt.Diagnostics[0]
+	for _, diagnostic := range receipt.Diagnostics {
+		if diagnostic.ExitCode != 0 {
+			selected = diagnostic
+			break
+		}
+	}
+	return selected.CommandID, selected.ExitCode, selected.TestStarted
+}
+
+func taskBoardValidationStatus(verdict workflowkit.ValidationVerdict) string {
+	switch verdict {
+	case workflowkit.ValidationPass:
+		return "validation_passed"
+	case workflowkit.ValidationReject:
+		return "validation_rejected"
+	default:
+		return "validation_unavailable"
+	}
+}
+
+func taskBoardOperatorSummaryCause(cause string) string {
+	cause = strings.TrimSpace(cause)
+	if cause == "" {
+		return "validation summary is unavailable"
+	}
+	return taskBoardTruncate(cause, 240)
+}
+
+func cloneTaskBoardOperatorSummary(summary *TaskBoardOperatorSummary) *TaskBoardOperatorSummary {
+	if summary == nil {
+		return nil
+	}
+	copy := *summary
+	if summary.LatestValidation != nil {
+		validation := *summary.LatestValidation
+		if summary.LatestValidation.RecordedAt != nil {
+			recordedAt := summary.LatestValidation.RecordedAt.UTC()
+			validation.RecordedAt = &recordedAt
+		}
+		copy.LatestValidation = &validation
+	}
+	return &copy
+}
+
+func taskBoardTruncate(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return value[:limit]
+	}
+	return value[:limit-1] + "..."
 }
 
 func taskBoardHasNeedsRepair(stages []store.StageAttempt) bool {

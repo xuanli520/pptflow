@@ -68,18 +68,18 @@ func TestStandardAuthoringDockerHarnessValidatesOnlyV3SnapshotFiles(t *testing.T
 		}
 		program := command.Args[len(command.Args)-1]
 		switch {
-		case strings.Contains(program, "/oracle/worktree"):
+		case program == standardAuthoringDockerHarnessSourceAccessProgram:
 			sourceAccessProgram = program
-		case strings.Contains(program, "solution/solve.sh"):
+		case strings.Contains(program, "/task/solution/solve.sh"):
 			oracleProgram = program
-		case strings.Contains(program, "/oracle/workspace"):
+		case strings.Contains(program, "/task/tests/test.sh"):
 			initialProgram = program
 		}
 	}
-	if !strings.Contains(sourceAccessProgram, "chmod -R u+rwX /oracle/worktree") ||
+	if !strings.Contains(sourceAccessProgram, "chmod -R u+rwX /work") ||
 		!strings.Contains(sourceAccessProgram, "test -w \"$probe\"") ||
-		!strings.Contains(initialProgram, "chmod -R u+rwX /oracle/workspace") ||
-		!strings.Contains(oracleProgram, "chmod -R u+rwX /oracle/workspace") {
+		!strings.Contains(initialProgram, "chmod -R u+rwX /work") ||
+		!strings.Contains(oracleProgram, "chmod -R u+rwX /work") {
 		t.Fatalf("v3 verifier programs do not restore copied source writability: source=%q initial=%q oracle=%q", sourceAccessProgram, initialProgram, oracleProgram)
 	}
 	if err := result.ValidateReportJSON(); err != nil {
@@ -95,7 +95,7 @@ func TestStandardAuthoringDockerHarnessValidatesOnlyV3SnapshotFiles(t *testing.T
 
 func standardAuthoringV3TestVerificationContract(t *testing.T) StandardAuthoringVerificationContract {
 	t.Helper()
-	contract, err := ParseStandardAuthoringVerificationContractJSON([]byte(`{"format":"harbor.verification-contract.v1","version":"1","command":["sh","/oracle/tests/test.sh"],"workdir":".","coverage_mode":"integration","allowed_solution_paths":["src"]}`))
+	contract, err := ParseStandardAuthoringVerificationContractJSON([]byte(`{"format":"harbor.verification-contract.v1","version":"1","command":["sh","/task/tests/test.sh"],"workdir":".","coverage_mode":"integration","allowed_solution_paths":["src"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,8 +124,8 @@ func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command Cod
 	case "image":
 		return CodeEdgePhase1CommandResult{Stdout: []byte(runner.imageID + "\n")}, nil
 	case "run":
-		mount := standardAuthoringHarnessArgAfter(command.Args, "--mount")
-		checkout := strings.TrimPrefix(strings.Split(mount, ",dst=/oracle")[0], "type=bind,src=")
+		taskRoot := standardAuthoringHarnessMountSource(command.Args, "/task")
+		workRoot := standardAuthoringHarnessMountSource(command.Args, "/work")
 		program := command.Args[len(command.Args)-1]
 		if program == standardAuthoringDockerHarnessSourceAccessProgram {
 			if runner.sourceAccessExit != 0 {
@@ -133,8 +133,8 @@ func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command Cod
 			}
 			return CodeEdgePhase1CommandResult{Stdout: []byte("source copied\n")}, nil
 		}
-		if strings.Contains(program, "/oracle/workspace") {
-			if err := os.MkdirAll(filepath.Join(checkout, "workspace"), 0o755); err != nil {
+		if strings.Contains(program, "/work") && workRoot != "" {
+			if err := os.MkdirAll(workRoot, 0o755); err != nil {
 				runner.t.Fatal(err)
 			}
 		}
@@ -142,7 +142,7 @@ func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command Cod
 			if strings.Contains(program, "solution/solve.sh") {
 				return CodeEdgePhase1CommandResult{Stdout: []byte(command.Dir + " sk-abcdefghijklmnop\n")}, nil
 			}
-			testBytes, err := os.ReadFile(filepath.Join(checkout, "tests", "test.sh"))
+			testBytes, err := os.ReadFile(filepath.Join(taskRoot, "tests", "test.sh"))
 			if err != nil {
 				runner.t.Fatal(err)
 			}
@@ -155,6 +155,20 @@ func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command Cod
 	default:
 		return CodeEdgePhase1CommandResult{}, nil
 	}
+}
+
+func standardAuthoringHarnessMountSource(args []string, destination string) string {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] != "--mount" {
+			continue
+		}
+		mount := args[index+1]
+		if !strings.Contains(mount, ",dst="+destination) {
+			continue
+		}
+		return strings.TrimPrefix(strings.Split(mount, ",dst="+destination)[0], "type=bind,src=")
+	}
+	return ""
 }
 
 func newStandardAuthoringDockerHarnessForTest(t *testing.T, root string, runner CodeEdgePhase1CommandRunner) *StandardAuthoringDockerHarness {

@@ -25,13 +25,7 @@ func TestStartRunMaterializesManagedTaskSnapshotWithoutSyntheticStageLineage(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
-		CreateDraftTaskRequest: CreateDraftTaskRequest{Slug: "managed-input", Title: "Managed Input", Actor: "tester", Reason: "fixture"},
-		SourceDirectory:        writeLifecycleSnapshot(t, "managed run input\n"), ChangeSummary: "fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task, revision := createStandardMaterializedLifecycleTask(t, ctx, services, "managed-input", "Managed Input", "managed run input\n")
 	requested := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	request := StartRunRequest{
 		TaskID: task.ID, RevisionID: revision.ID, Profile: codeEdgePhase1RuntimeProfile(t), ExecutionSpec: requested,
@@ -48,23 +42,36 @@ func TestStartRunMaterializesManagedTaskSnapshotWithoutSyntheticStageLineage(t *
 	if manifest.Inputs.RequestedExecutionSpecFingerprint == "" || manifest.Inputs.ExecutionSpecFingerprint == "" || manifest.Inputs.RequestedExecutionSpecFingerprint == manifest.Inputs.ExecutionSpecFingerprint {
 		t.Fatalf("run manifest did not retain distinct requested/final specification fingerprints: %+v", manifest.Inputs)
 	}
-	if len(manifest.Inputs.ManagedInputs) != 1 {
-		t.Fatalf("managed inputs = %+v, want one task snapshot", manifest.Inputs.ManagedInputs)
+	if len(manifest.Inputs.ManagedInputs) != 2 {
+		t.Fatalf("managed inputs = %+v, want task and source snapshots", manifest.Inputs.ManagedInputs)
 	}
-	input := manifest.Inputs.ManagedInputs[0]
-	if input.Port != managedTaskSnapshotInputPort || input.RevisionDigest != workflowkit.SubjectDigest(revision.TaskDigest) {
-		t.Fatalf("managed task snapshot binding = %+v", input)
+	taskInput := managedInputByPort(t, manifest.Inputs.ManagedInputs, managedTaskSnapshotInputPort)
+	sourceInput := managedInputByPort(t, manifest.Inputs.ManagedInputs, workflowadapter.CodeEdgeSourceSnapshotArtifact)
+	if taskInput.RevisionDigest != workflowkit.SubjectDigest(revision.TaskDigest) || taskInput.SchemaVersion != "harbor.artifact.v1" {
+		t.Fatalf("managed task snapshot binding = %+v", taskInput)
 	}
-	persisted, err := database.GetRunInputArtifact(ctx, input.ID)
-	if err != nil || persisted == nil || persisted.RunID != run.ID || persisted.ContentDigest != string(input.ContentDigest) || persisted.SizeBytes != input.SizeBytes {
-		t.Fatalf("durable managed task snapshot = %+v, %v", persisted, err)
+	if sourceInput.RevisionDigest != workflowkit.SubjectDigest(revision.TaskDigest) || sourceInput.SchemaVersion != workflowadapter.CodeEdgeSourceSnapshotSchemaVersion {
+		t.Fatalf("managed source snapshot binding = %+v", sourceInput)
+	}
+	for _, input := range []runManifestManagedInput{taskInput, sourceInput} {
+		persisted, err := database.GetRunInputArtifact(ctx, input.ID)
+		if err != nil || persisted == nil || persisted.RunID != run.ID || persisted.Port != input.Port || persisted.ContentDigest != string(input.ContentDigest) || persisted.SizeBytes != input.SizeBytes {
+			t.Fatalf("durable managed %s = %+v, %v", input.Port, persisted, err)
+		}
 	}
 	object, err := materializeManagedTaskSnapshotObject(ctx, services.core, revision)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if object != input.objectRef() {
-		t.Fatalf("deterministic snapshot object = %+v, want %+v", object, input.objectRef())
+	if object != taskInput.objectRef() {
+		t.Fatalf("deterministic task snapshot object = %+v, want %+v", object, taskInput.objectRef())
+	}
+	sourceObject, err := materializeManagedSourceSnapshotObject(ctx, services.core, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceObject != sourceInput.objectRef() {
+		t.Fatalf("deterministic source snapshot object = %+v, want %+v", sourceObject, sourceInput.objectRef())
 	}
 	attempts, err := database.ListStageAttemptsForRun(ctx, run.ID)
 	if err != nil || len(attempts) != 0 {
@@ -78,12 +85,18 @@ func TestStartRunMaterializesManagedTaskSnapshotWithoutSyntheticStageLineage(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bindings) != 1 || bindings[0].Name != managedTaskSnapshotInputPort || bindings[0].ArtifactID != workflowkit.ArtifactID(input.ID) || bindings[0].ContentDigest != input.ContentDigest || bindings[0].SchemaVersion != input.SchemaVersion {
+	if len(bindings) != 2 {
 		t.Fatalf("resolved root managed input = %+v", bindings)
 	}
-	content, err := newStageInputReader(database, services.core.objects, run, revision, bindings)(ctx, bindings[0])
-	if err != nil || len(content) != int(input.SizeBytes) {
-		t.Fatalf("read managed task snapshot = %d bytes, %v", len(content), err)
+	for _, input := range []runManifestManagedInput{taskInput, sourceInput} {
+		binding := artifactBindingByName(t, bindings, input.Port)
+		if binding.ArtifactID != workflowkit.ArtifactID(input.ID) || binding.ContentDigest != input.ContentDigest || binding.SchemaVersion != input.SchemaVersion {
+			t.Fatalf("resolved %s binding = %+v, want %+v", input.Port, binding, input)
+		}
+		content, err := newStageInputReader(database, services.core.objects, run, revision, bindings)(ctx, binding)
+		if err != nil || len(content) != int(input.SizeBytes) {
+			t.Fatalf("read managed %s = %d bytes, %v", input.Port, len(content), err)
+		}
 	}
 
 	// Same caller request and Run identity reuses the immutable manifest/input
@@ -93,12 +106,14 @@ func TestStartRunMaterializesManagedTaskSnapshotWithoutSyntheticStageLineage(t *
 	if err != nil || replayed.ID != run.ID {
 		t.Fatalf("replayed managed StartRun = %+v, %v", replayed, err)
 	}
-	byPort, err := database.GetRunInputArtifactForPort(ctx, run.ID, managedTaskSnapshotInputPort)
-	if err != nil || byPort == nil || byPort.ID != input.ID {
-		t.Fatalf("replayed managed input = %+v, %v", byPort, err)
+	for _, input := range []runManifestManagedInput{taskInput, sourceInput} {
+		byPort, err := database.GetRunInputArtifactForPort(ctx, run.ID, input.Port)
+		if err != nil || byPort == nil || byPort.ID != input.ID {
+			t.Fatalf("replayed managed %s input = %+v, %v", input.Port, byPort, err)
+		}
 	}
 
-	path, err := services.core.objects.ObjectPath(input.objectRef())
+	path, err := services.core.objects.ObjectPath(taskInput.objectRef())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,4 +123,26 @@ func TestStartRunMaterializesManagedTaskSnapshotWithoutSyntheticStageLineage(t *
 	if _, err := resolveStageInputs(ctx, database, services.core.objects, run, revision, stage); !errors.Is(err, workflowruntime.ErrObjectNotFound) {
 		t.Fatalf("missing managed snapshot object error = %v, want object-not-found", err)
 	}
+}
+
+func managedInputByPort(t *testing.T, inputs []runManifestManagedInput, port string) runManifestManagedInput {
+	t.Helper()
+	for _, input := range inputs {
+		if input.Port == port {
+			return input
+		}
+	}
+	t.Fatalf("managed input %q not found in %+v", port, inputs)
+	return runManifestManagedInput{}
+}
+
+func artifactBindingByName(t *testing.T, bindings []workflowkit.ArtifactBinding, name string) workflowkit.ArtifactBinding {
+	t.Helper()
+	for _, binding := range bindings {
+		if binding.Name == name {
+			return binding
+		}
+	}
+	t.Fatalf("artifact binding %q not found in %+v", name, bindings)
+	return workflowkit.ArtifactBinding{}
 }

@@ -241,22 +241,30 @@ func (contents StandardAuthoringContractAssetContents) Clone() StandardAuthoring
 	return contents
 }
 
-// StandardAuthoringContractAssets is the pair of verified prompt and schema
-// assets for one frozen Standard authoring operation.
+// StandardAuthoringContractAssets is the verified prompt, primary schema, and
+// secondary schema assets for one frozen Standard authoring operation.
 type StandardAuthoringContractAssets struct {
-	Prompt StandardAuthoringContractAssetContents `json:"prompt"`
-	Schema StandardAuthoringContractAssetContents `json:"schema"`
+	Prompt            StandardAuthoringContractAssetContents   `json:"prompt"`
+	Schema            StandardAuthoringContractAssetContents   `json:"schema"`
+	AdditionalSchemas []StandardAuthoringContractAssetContents `json:"additional_schemas,omitempty"`
 }
 
 // Clone returns independently owned asset bytes.
 func (assets StandardAuthoringContractAssets) Clone() StandardAuthoringContractAssets {
 	assets.Prompt = assets.Prompt.Clone()
 	assets.Schema = assets.Schema.Clone()
+	if assets.AdditionalSchemas != nil {
+		copied := make([]StandardAuthoringContractAssetContents, len(assets.AdditionalSchemas))
+		for index, schema := range assets.AdditionalSchemas {
+			copied[index] = schema.Clone()
+		}
+		assets.AdditionalSchemas = copied
+	}
 	return assets
 }
 
 // ReadStandardAuthoringContractAssets safely opens, bounds, fingerprints, and
-// returns the two exact deployment assets for one frozen authoring operation.
+// returns the exact deployment assets for one frozen authoring operation.
 // It is intended for deployment composition to decode a prevalidated Codex
 // prompt program or another typed handler contract. It is not a Run-input
 // file API: the root and relative paths both remain lock-controlled, every
@@ -283,7 +291,15 @@ func (attestor *StandardAuthoringRuntimeAttestor) ReadStandardAuthoringContractA
 	if err != nil {
 		return StandardAuthoringContractAssets{}, err
 	}
-	return StandardAuthoringContractAssets{Prompt: prompt, Schema: schema}.Clone(), nil
+	additionalSchemas := make([]StandardAuthoringContractAssetContents, 0, len(contract.AdditionalSchemas))
+	for _, lockedSchema := range contract.AdditionalSchemas {
+		additional, err := readStandardAuthoringContractAsset(ctx, attestor.contractRoot, lockedSchema.StandardAuthoringContractAssetReference, lockedSchema.ContentSHA256)
+		if err != nil {
+			return StandardAuthoringContractAssets{}, err
+		}
+		additionalSchemas = append(additionalSchemas, additional)
+	}
+	return StandardAuthoringContractAssets{Prompt: prompt, Schema: schema, AdditionalSchemas: additionalSchemas}.Clone(), nil
 }
 
 func validateStandardAuthoringContractRoot(root string) error {

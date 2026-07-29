@@ -826,6 +826,39 @@ func TestTaskPurgeDryRunReportsBlockersWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestRunSummaryCommandShowsAuthoringValidationPending(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	services := openCommandLifecycle(t, root)
+	task, _, run, _ := createCommandStandardAuthoringRun(t, ctx, root, services, "run-summary-pending", "Run Summary Pending", "tester")
+	if err := services.Store().Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &lifecycleCLIConfig{root: root}
+	command := newRunCommandV2(config)
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetErr(&output)
+	command.SetArgs([]string{"summary", "--run", run.ID})
+	if err := command.ExecuteContext(ctx); err != nil {
+		t.Fatalf("run summary command: %v\n%s", err, output.String())
+	}
+	var summary app.TaskBoardRunSummary
+	if err := json.Unmarshal(output.Bytes(), &summary); err != nil {
+		t.Fatalf("decode run summary output: %v\n%s", err, output.String())
+	}
+	if summary.TaskID != task.ID || summary.TaskSlug != task.Slug || summary.TaskTitle != task.Title || summary.RunID != run.ID ||
+		summary.RunStatus != string(store.WorkflowRunQueued) {
+		t.Fatalf("run summary identity/status = %+v; task=%+v run=%+v", summary, task, run)
+	}
+	if summary.OperatorSummary == nil || summary.OperatorSummary.Status != "validation_pending" ||
+		summary.OperatorSummary.Cause != "host_candidate_verify has not produced validation_receipt" ||
+		summary.OperatorSummary.NextAction != "continue authoring run" || summary.OperatorSummary.LatestValidation != nil {
+		t.Fatalf("run summary operator summary = %+v", summary.OperatorSummary)
+	}
+}
+
 func TestTaskPurgeCommandExecutesWithCASConfirmationAndIdempotentReplay(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

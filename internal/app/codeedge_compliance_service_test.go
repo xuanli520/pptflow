@@ -466,14 +466,7 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, revision, err := bootstrap.Tasks.ImportTask(ctx, ImportTaskRequest{
-		CreateDraftTaskRequest: CreateDraftTaskRequest{Slug: "codeedge-compliance", Title: "CodeEdge Compliance", Actor: "codeedge-test", Reason: "create trusted fixture"},
-		SourceDirectory:        writeLifecycleSnapshot(t, "CodeEdge compliance fixture\n"),
-		ChangeSummary:          "create immutable CodeEdge compliance fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task, revision := createStandardMaterializedLifecycleTask(t, ctx, bootstrap, "codeedge-compliance", "CodeEdge Compliance", "CodeEdge compliance fixture\n")
 	specification := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	parentResolver := catalogLockAttestedResolverForSpec(t, specification, "codeedge-compliance-catalog", "v1", "lock-v1")
 	parentServices := catalogLockLifecycleServices(t, root, database, parentResolver)

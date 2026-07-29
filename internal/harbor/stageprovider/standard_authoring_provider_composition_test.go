@@ -310,6 +310,15 @@ func writeStandardAuthoringContractAssets(t *testing.T, root string, lock Deploy
 				t.Fatal(err)
 			}
 		}
+		for _, schema := range contract.AdditionalSchemas {
+			path := filepath.Join(root, filepath.FromSlash(schema.RelativePath))
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("additional-schema"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 

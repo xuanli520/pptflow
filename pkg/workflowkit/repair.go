@@ -91,7 +91,7 @@ func (rule WorkflowRepairRule) validate(workflow WorkflowDescriptor) error {
 	if !found {
 		return fmt.Errorf("%w: workflow repair producer %q is not a descriptor stage", ErrInvalidWorkflowFinding, rule.ProducingStage)
 	}
-	if producer.Effect != EffectEvidenceOnly && producer.Effect != EffectReadOnly && producer.Effect != EffectContentProducer {
+	if producer.Effect != EffectEvidenceOnly && producer.Effect != EffectReadOnly && producer.Effect != EffectContentProducer && producer.Effect != EffectContentMutator {
 		return fmt.Errorf("%w: workflow repair producer %q cannot emit findings", ErrInvalidWorkflowFinding, rule.ProducingStage)
 	}
 	target, found := workflow.Stage(rule.TargetWriter)

@@ -101,7 +101,7 @@ func LoadStandardAuthoringDeploymentAssetBundle(catalogPath, lockPath, contractR
 			return nil, fmt.Errorf("%w: generated Standard authoring lock has no manifest contract for stage %q", ErrDeploymentOperationCatalogLockDrift, record.Stage.Key)
 		}
 		contract := record.StandardAuthoringContract.Clone()
-		if contract.Prompt != entry.Prompt || contract.Schema != entry.Schema {
+		if contract.Prompt != entry.Prompt || contract.Schema != entry.Schema || !standardAuthoringContractAdditionalSchemasMatchManifest(contract.AdditionalSchemas, entry.AdditionalSchemas) {
 			return nil, fmt.Errorf("%w: generated Standard authoring lock contract differs from manifest for stage %q", ErrDeploymentOperationCatalogLockDrift, record.Stage.Key)
 		}
 		if _, err := readStandardAuthoringContractAsset(context.Background(), contractRoot, contract.Prompt, record.PromptContentFingerprint); err != nil {
@@ -109,6 +109,11 @@ func LoadStandardAuthoringDeploymentAssetBundle(catalogPath, lockPath, contractR
 		}
 		if _, err := readStandardAuthoringContractAsset(context.Background(), contractRoot, contract.Schema, record.SchemaContentFingerprint); err != nil {
 			return nil, fmt.Errorf("verify Standard authoring schema asset for stage %q: %w", record.Stage.Key, err)
+		}
+		for _, schema := range contract.AdditionalSchemas {
+			if _, err := readStandardAuthoringContractAsset(context.Background(), contractRoot, schema.StandardAuthoringContractAssetReference, schema.ContentSHA256); err != nil {
+				return nil, fmt.Errorf("verify Standard authoring additional schema asset for stage %q: %w", record.Stage.Key, err)
+			}
 		}
 	}
 	sshTransport, err := verifier.Lock().StandardAuthoringSSHTransportLock()
@@ -121,6 +126,18 @@ func LoadStandardAuthoringDeploymentAssetBundle(catalogPath, lockPath, contractR
 	return &StandardAuthoringDeploymentAssetBundle{
 		Catalog: catalog, Lock: verifier.Lock(), Verifier: verifier, Manifest: manifest.Clone(), ContractRoot: contractRoot,
 	}, nil
+}
+
+func standardAuthoringContractAdditionalSchemasMatchManifest(locked []StandardAuthoringContractAdditionalSchemaLock, manifest []StandardAuthoringContractAssetReference) bool {
+	if len(locked) != len(manifest) {
+		return false
+	}
+	for index := range locked {
+		if locked[index].StandardAuthoringContractAssetReference != manifest[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // ReadStandardAuthoringSSHKnownHostsAsset reads and validates the one

@@ -16,6 +16,10 @@ child-only material is rejected before a parent Run can start.
 
 The source-controlled parent assets are deliberately small and closed:
 
+- `operation-catalog.v1.json` declares one controlled checkout handle for the
+  frozen Phase-1 parent inputs: the immutable `source_snapshot` and
+  `task_snapshot` run artifacts. Parent verification must not clone source
+  from a candidate Dockerfile or write through either frozen input.
 - `execution-profile.v1.json` is the complete 15-stage timing and retry
   envelope. Parent stages use one logical attempt; no caller-supplied retry
   default is accepted.

@@ -323,7 +323,7 @@ func artifactInputWithSchema(name, schemaVersion string) stageArtifact {
 }
 
 func optionalArtifactInputWithSchema(name, schemaVersion string) stageArtifact {
-	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion}, input: true}
+	return stageArtifact{spec: workflowkit.ArtifactSpec{Name: name, SchemaVersion: schemaVersion, Required: false}, input: true}
 }
 
 func reviewDecisionInput(name string) stageArtifact {

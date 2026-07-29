@@ -1,6 +1,7 @@
 package app
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
@@ -151,17 +152,17 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 	initialCommand, oracleCommand := runner.commands[3], runner.commands[5]
 	initialProgram := initialCommand.Args[len(initialCommand.Args)-1]
 	oracleProgram := oracleCommand.Args[len(oracleCommand.Args)-1]
-	if !strings.Contains(initialProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
+	if !strings.Contains(initialProgram, "cp -R /source/. /work/") ||
 		!strings.Contains(initialProgram, "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config") ||
-		!strings.Contains(initialProgram, "chmod -R u+rwX /oracle/workspace") ||
-		!strings.Contains(initialProgram, "cd /oracle/workspace") ||
-		!strings.Contains(initialProgram, "sh /oracle/tests/test.sh") ||
-		strings.Contains(initialProgram, "/oracle/solution/solve.sh") ||
-		!strings.Contains(oracleProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
+		!strings.Contains(initialProgram, "chmod -R u+rwX /work") ||
+		!strings.Contains(initialProgram, "cd /work") ||
+		!strings.Contains(initialProgram, "sh /task/tests/test.sh") ||
+		strings.Contains(initialProgram, "/task/solution/solve.sh") ||
+		!strings.Contains(oracleProgram, "cp -R /source/. /work/") ||
 		!strings.Contains(oracleProgram, "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config") ||
-		!strings.Contains(oracleProgram, "chmod -R u+rwX /oracle/workspace") ||
-		!strings.Contains(oracleProgram, "cd /oracle/workspace") ||
-		!strings.Contains(oracleProgram, "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh") {
+		!strings.Contains(oracleProgram, "chmod -R u+rwX /work") ||
+		!strings.Contains(oracleProgram, "cd /work") ||
+		!strings.Contains(oracleProgram, "sh /task/solution/solve.sh && sh /task/tests/test.sh") {
 		t.Fatalf("controlled verifier programs = initial=%#v oracle=%#v", initialCommand.Args, oracleCommand.Args)
 	}
 	for _, command := range []CodeEdgePhase1Command{initialCommand, oracleCommand} {
@@ -171,9 +172,9 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 		if !containsParentArg(command.Args, "HOME=/tmp/harbor-home") || !containsParentArg(command.Args, "XDG_CACHE_HOME=/tmp/harbor-cache") || !containsParentArg(command.Args, "XDG_CONFIG_HOME=/tmp/harbor-config") {
 			t.Fatalf("verification command missed writable home/cache env: %#v", command.Args)
 		}
-		mount := codeEdgePhase1TestArgAfter(command.Args, "--mount")
-		if !strings.HasPrefix(mount, "type=bind,src=") || !strings.HasSuffix(mount, ",dst=/oracle") || strings.Contains(mount, ",rw") {
-			t.Fatalf("verification mount = %q, want writable Docker --mount syntax", mount)
+		argsText := strings.Join(command.Args, "\n")
+		if !strings.Contains(argsText, ",dst=/source,readonly") || !strings.Contains(argsText, ",dst=/task,readonly") || !strings.Contains(argsText, "/work:rw,exec,nosuid,size=4g") {
+			t.Fatalf("verification mounts = %#v", command.Args)
 		}
 	}
 }
@@ -309,6 +310,14 @@ func (runner *codeEdgePhase1RecordingRunner) Run(_ context.Context, command Code
 
 func newCodeEdgePhase1ParentExecutorForTest(t *testing.T, root string, runner CodeEdgePhase1CommandRunner) *CodeEdgePhase1ParentExecutor {
 	t.Helper()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+			if err == nil {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
 	executor, err := NewCodeEdgePhase1ParentExecutor(CodeEdgePhase1ParentExecutorConfig{
 		ManagedRoot:      root,
 		PreflightProfile: codeEdgePhase1ParentTestProfile(),
@@ -431,21 +440,75 @@ func codeEdgePhase1ParentInvocationWithRun(t *testing.T, snapshot []byte, digest
 	t.Helper()
 	attemptID := codeEdgePhase1TestUUID(t)
 	binding := workflowkit.ArtifactBinding{Name: "task_snapshot", ArtifactID: workflowkit.ArtifactID(codeEdgePhase1TestUUID(t)), ContentDigest: workflowkit.SHA256Fingerprint(snapshot), SchemaVersion: "harbor.artifact.v1"}
+	source := codeEdgePhase1ParentSourceSnapshot(t)
+	sourceBinding := workflowkit.ArtifactBinding{Name: workflowadapter.CodeEdgeSourceSnapshotArtifact, ArtifactID: workflowkit.ArtifactID(codeEdgePhase1TestUUID(t)), ContentDigest: workflowkit.SHA256Fingerprint(source), SchemaVersion: workflowadapter.CodeEdgeSourceSnapshotSchemaVersion}
 	plugin := workflowkit.PluginBinding{ID: "test.codeedge." + key, Version: "1"}
-	stage := workflowkit.StageDescriptor{Key: workflowkit.StageKey(key), Plugin: plugin, Outputs: []workflowkit.ArtifactSpec{{Name: outputName, SchemaVersion: schema, Required: true}}}
+	stage := workflowkit.StageDescriptor{
+		Key:    workflowkit.StageKey(key),
+		Plugin: plugin,
+		Inputs: []workflowkit.ArtifactSpec{
+			{Name: "task_snapshot", SchemaVersion: "harbor.artifact.v1", Required: true},
+			{Name: workflowadapter.CodeEdgeSourceSnapshotArtifact, SchemaVersion: workflowadapter.CodeEdgeSourceSnapshotSchemaVersion, Required: true},
+		},
+		Outputs: []workflowkit.ArtifactSpec{{Name: outputName, SchemaVersion: schema, Required: true}},
+	}
 	request := workflowkit.StageExecutionRequest{
 		Execution: workflowkit.FrozenExecution{ID: runID, Subject: workflowkit.SubjectBinding{SubjectID: codeEdgePhase1TestUUID(t), RevisionID: codeEdgePhase1TestUUID(t), Digest: digest}, Workflow: workflowkit.WorkflowDescriptor{ID: workflowadapter.CodeEdgePhase1WorkflowTemplateID, Version: workflowadapter.CodeEdgePhase1WorkflowTemplateVersion}},
 		Claim:     workflowkit.JobClaim{Stage: &workflowkit.StageClaim{StageAttempt: workflowkit.AttemptIdentity{ID: workflowkit.AttemptID(attemptID)}}},
 		Stage:     stage,
-		Inputs:    []workflowkit.ArtifactBinding{binding},
+		Inputs:    []workflowkit.ArtifactBinding{binding, sourceBinding},
 		ReadInput: func(_ context.Context, input workflowkit.ArtifactBinding) ([]byte, error) {
-			if input != binding {
+			switch input {
+			case binding:
+				return append([]byte(nil), snapshot...), nil
+			case sourceBinding:
+				return append([]byte(nil), source...), nil
+			default:
 				return nil, errors.New("unexpected stage input")
 			}
-			return append([]byte(nil), snapshot...), nil
 		},
 	}
 	return request, stageprovider.StageOperationInvocation{Request: request, Resolution: workflowadapter.StageOperationResolution{Template: workflowadapter.CodeEdgePhase1TemplateReference(), StageKey: stage.Key, Plugin: plugin}}
+}
+
+func codeEdgePhase1ParentSourceSnapshot(t *testing.T) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	entries := []struct {
+		name    string
+		mode    int64
+		content []byte
+		dir     bool
+	}{
+		{name: "source/", mode: 0o755, dir: true},
+		{name: "source/README.md", mode: 0o644, content: []byte("fixture source tree\n")},
+	}
+	for _, entry := range entries {
+		header := &tar.Header{Name: entry.name, Mode: entry.mode}
+		if entry.dir {
+			header.Typeflag = tar.TypeDir
+		} else {
+			header.Typeflag = tar.TypeReg
+			header.Size = int64(len(entry.content))
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if !entry.dir {
+			if _, err := writer.Write(entry.content); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	source := buffer.Bytes()
+	if err := validateStandardAuthoringSourceArchiveBytes(source); err != nil {
+		t.Fatalf("source snapshot fixture is invalid: %v", err)
+	}
+	return source
 }
 
 func codeEdgePhase1TestUUID(t *testing.T) string {

@@ -27,6 +27,7 @@ type TaskItem struct {
 	State           TaskState
 	RunID           string
 	CurrentStage    string
+	OperatorSummary *app.TaskBoardOperatorSummary
 	RunStatus       string
 	Lifecycle       string
 	Review          *app.TaskBoardReview
@@ -45,6 +46,7 @@ type TaskRunItem struct {
 	AgentTurnTranscripts  []app.TaskBoardAgentTranscript
 	Status                string
 	CurrentStage          string
+	OperatorSummary       *app.TaskBoardOperatorSummary
 	FailureStage          string
 	FailureClass          string
 	FailureReason         string
@@ -101,6 +103,27 @@ func truncateMiddle(s string, maxLen int) string {
 	return s[:front] + "..." + s[len(s)-back:]
 }
 
+func displayOperatorSummary(summary *app.TaskBoardOperatorSummary) string {
+	if summary == nil {
+		return ""
+	}
+	switch summary.Status {
+	case "validation_passed":
+		return "验证通过"
+	case "validation_rejected":
+		if summary.Cause != "" {
+			return "验证拒绝: " + summary.Cause
+		}
+		return "验证拒绝"
+	case "validation_pending":
+		return "等待验证"
+	case "validation_unavailable":
+		return "验证状态不可读"
+	default:
+		return summary.Status
+	}
+}
+
 // renderTaskCard renders a single task card. Width is the available column width.
 func renderTaskCard(item TaskItem, width int, selected bool) string {
 	style := cardStyle
@@ -122,6 +145,8 @@ func renderTaskCard(item TaskItem, width int, selected bool) string {
 			lines = append(lines, statusRunningStyle.Render("等待审核"))
 		} else if item.OpenReviews > 1 {
 			lines = append(lines, failStyleV2.Render("多个审核待处理"))
+		} else if summary := displayOperatorSummary(item.OperatorSummary); summary != "" {
+			lines = append(lines, mutedStyle.Render(truncateMiddle(summary, width-4)))
 		} else if item.RunStatus == "" {
 			lines = append(lines, mutedStyle.Render("等待启动"))
 		} else {
@@ -131,11 +156,14 @@ func renderTaskCard(item TaskItem, width int, selected bool) string {
 		lines = append(lines, mutedStyle.Render("sha:"+shortSHA(item.CommitSHA)))
 
 	case TaskRunning:
-		stage := item.CurrentStage
+		stage := displayOperatorSummary(item.OperatorSummary)
 		if stage == "" {
-			stage = item.RunStatus
-		} else {
-			stage = displayStageName(stage)
+			stage = item.CurrentStage
+			if stage == "" {
+				stage = item.RunStatus
+			} else {
+				stage = displayStageName(stage)
+			}
 		}
 		stageLine := statusRunningStyle.Render("●") + " " + stage
 		lines = append(lines, truncate(stageLine, width-4))
@@ -143,7 +171,11 @@ func renderTaskCard(item TaskItem, width int, selected bool) string {
 		lines = append(lines, mutedStyle.Render("sha:"+shortSHA(item.CommitSHA)))
 
 	case TaskCompleted:
-		lines = append(lines, mutedStyle.Render(item.RunStatus))
+		status := displayOperatorSummary(item.OperatorSummary)
+		if status == "" {
+			status = item.RunStatus
+		}
+		lines = append(lines, mutedStyle.Render(status))
 		lines = append(lines, mutedStyle.Render(truncateMiddle(item.RepoURL, width-4)))
 		lines = append(lines, mutedStyle.Render("sha:"+shortSHA(item.CommitSHA)))
 	}

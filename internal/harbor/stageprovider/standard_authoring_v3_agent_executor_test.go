@@ -351,7 +351,7 @@ func TestStandardAuthoringV3TaskSynthesisRejectsNonCanonicalVerificationContract
 		t.Fatal("legacy task-level verification object produced a durable output")
 	}
 
-	canonical := `{"format":"harbor.verification-contract.v1","version":"1","command":["sh","/oracle/tests/test.sh","wasm32-unknown-unknown"],"workdir":".","coverage_mode":"browser_wasm","allowed_solution_paths":["packages/yew-router/src/router.rs"]}`
+	canonical := `{"format":"harbor.verification-contract.v1","version":"1","command":["sh","/task/tests/test.sh","wasm32-unknown-unknown"],"workdir":".","coverage_mode":"browser_wasm","allowed_solution_paths":["packages/yew-router/src/router.rs"]}`
 	response, err = submission.handle(context.Background(), payloadFor(canonical))
 	if err != nil || string(response) != `{"accepted":true}` {
 		t.Fatalf("canonical verification contract was rejected: %s, %v", response, err)
@@ -637,7 +637,18 @@ func TestStandardAuthoringV3RepairLedgerAcceptsRejectedHostReceipt(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	inputs := map[string][]byte{"candidate_snapshot": snapshotRaw, "validation_receipt": receiptRaw}
+	repairContext, err := workflowadapter.NewStandardAuthoringValidationRepairContext(receipt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairContextRaw, err := json.Marshal(repairContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := map[string][]byte{
+		"candidate_snapshot": snapshotRaw, "validation_receipt": receiptRaw,
+		workflowadapter.StandardAuthoringValidationRepairContextArtifact: repairContextRaw,
+	}
 	rules := []workflowkit.WorkflowRepairRule{
 		{FindingCode: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
 		{FindingCode: "solution_integrity_defect", ProducingStage: workflowkit.StageKey(workflowadapter.SolutionIntegrityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
@@ -676,8 +687,9 @@ func TestStandardAuthoringV3RepairLedgerAcceptsRejectedHostReceipt(t *testing.T)
 	if err := ledger.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if len(ledger.Entries) != 2 || (ledger.Entries[0].ConsumedCandidateRound == ledger.Entries[1].ConsumedCandidateRound) {
-		t.Fatalf("repair ledger = %+v, want two findings with exactly one candidate repair charge", ledger)
+	if len(ledger.Entries) != 3 || ledger.Entries[0].Finding.Code != "host_validation_reject" || !ledger.Entries[0].ConsumedCandidateRound ||
+		ledger.Entries[1].ConsumedCandidateRound || ledger.Entries[2].ConsumedCandidateRound {
+		t.Fatalf("repair ledger = %+v, want host rejection plus optional critic findings with one candidate repair charge", ledger)
 	}
 }
 

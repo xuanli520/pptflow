@@ -852,14 +852,7 @@ func TestCatalogLockIdentityPropagatesToCandidateChildManifest(t *testing.T) {
 
 func importCatalogReceiptFixture(t *testing.T, ctx context.Context, services *LifecycleServices, slug string) (store.TaskV2, store.TaskRevision) {
 	t.Helper()
-	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
-		CreateDraftTaskRequest: CreateDraftTaskRequest{Slug: slug, Title: slug, Actor: "tester", Reason: "catalog receipt fixture"},
-		SourceDirectory:        writeLifecycleSnapshot(t, "catalog receipt fixture\n"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return task, revision
+	return createStandardMaterializedLifecycleTask(t, ctx, services, slug, slug, "catalog receipt fixture\n")
 }
 
 // These focused receipt tests freeze their own Standard-template fixtures so

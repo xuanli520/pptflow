@@ -239,11 +239,11 @@ func (executor *CodeEdgePhase1ParentExecutor) ExecuteHarborBuiltin(ctx context.C
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	snapshot, binding, err := codeEdgePhase1ReadTaskSnapshot(ctx, invocation.Request)
+	inputs, err := codeEdgePhase1ReadManagedInputs(ctx, invocation.Request)
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	workspace, taskRoot, err := executor.ensureTaskWorkspace(ctx, invocation.Request, binding, snapshot)
+	workspace, taskRoot, err := executor.ensureTaskWorkspace(ctx, invocation.Request, inputs)
 	if err != nil {
 		if findings, repairable := codeEdgePhase1WorkspaceFindings(err); repairable {
 			return executor.reportResult(invocation.Request, outputName, schema, workflowkit.VerdictNeedsRepair, findings, nil, "", workspace)
@@ -287,11 +287,11 @@ func (executor *CodeEdgePhase1ParentExecutor) ExecuteLocalCommand(ctx context.Co
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	snapshot, binding, err := codeEdgePhase1ReadTaskSnapshot(ctx, invocation.Request)
+	inputs, err := codeEdgePhase1ReadManagedInputs(ctx, invocation.Request)
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	workspace, taskRoot, err := executor.ensureTaskWorkspace(ctx, invocation.Request, binding, snapshot)
+	workspace, taskRoot, err := executor.ensureTaskWorkspace(ctx, invocation.Request, inputs)
 	if err != nil {
 		if findings, repairable := codeEdgePhase1WorkspaceFindings(err); repairable {
 			return executor.reportResult(invocation.Request, outputName, schema, workflowkit.VerdictNeedsRepair, findings, nil, "", workspace)
@@ -465,30 +465,58 @@ func codeEdgePhase1ExpectedOutput(stage workflowkit.StageDescriptor) (string, st
 	return expected, stage.Outputs[0].SchemaVersion, nil
 }
 
+type codeEdgePhase1ManagedInputs struct {
+	TaskSnapshot   []byte
+	TaskBinding    workflowkit.ArtifactBinding
+	SourceSnapshot []byte
+	SourceBinding  workflowkit.ArtifactBinding
+}
+
+func codeEdgePhase1ReadManagedInputs(ctx context.Context, request workflowkit.StageExecutionRequest) (codeEdgePhase1ManagedInputs, error) {
+	task, taskBinding, err := codeEdgePhase1ReadInput(ctx, request, managedTaskSnapshotInputPort, "harbor.artifact.v1")
+	if err != nil {
+		return codeEdgePhase1ManagedInputs{}, err
+	}
+	source, sourceBinding, err := codeEdgePhase1ReadInput(ctx, request, workflowadapter.CodeEdgeSourceSnapshotArtifact, workflowadapter.CodeEdgeSourceSnapshotSchemaVersion)
+	if err != nil {
+		return codeEdgePhase1ManagedInputs{}, err
+	}
+	return codeEdgePhase1ManagedInputs{
+		TaskSnapshot:   task,
+		TaskBinding:    taskBinding,
+		SourceSnapshot: source,
+		SourceBinding:  sourceBinding,
+	}, nil
+}
+
 func codeEdgePhase1ReadTaskSnapshot(ctx context.Context, request workflowkit.StageExecutionRequest) ([]byte, workflowkit.ArtifactBinding, error) {
+	return codeEdgePhase1ReadInput(ctx, request, managedTaskSnapshotInputPort, "harbor.artifact.v1")
+}
+
+func codeEdgePhase1ReadInput(ctx context.Context, request workflowkit.StageExecutionRequest, port, schemaVersion string) ([]byte, workflowkit.ArtifactBinding, error) {
 	if request.ReadInput == nil {
-		return nil, workflowkit.ArtifactBinding{}, errors.New("CodeEdge Phase-1 frozen task snapshot reader is unavailable")
+		return nil, workflowkit.ArtifactBinding{}, errors.New("CodeEdge Phase-1 frozen input reader is unavailable")
 	}
 	var selected *workflowkit.ArtifactBinding
 	for _, input := range request.Inputs {
-		if input.Name != "task_snapshot" {
+		if input.Name != port {
 			continue
 		}
 		if selected != nil {
-			return nil, workflowkit.ArtifactBinding{}, errors.New("CodeEdge Phase-1 stage has duplicate task_snapshot inputs")
+			return nil, workflowkit.ArtifactBinding{}, fmt.Errorf("CodeEdge Phase-1 stage has duplicate %s inputs", port)
 		}
 		copy := input.Clone()
 		selected = &copy
 	}
-	if selected == nil || selected.SchemaVersion != "harbor.artifact.v1" {
-		return nil, workflowkit.ArtifactBinding{}, errors.New("CodeEdge Phase-1 stage requires one managed task_snapshot input")
+	if selected == nil || selected.SchemaVersion != schemaVersion {
+		return nil, workflowkit.ArtifactBinding{}, fmt.Errorf("CodeEdge Phase-1 stage requires one managed %s input", port)
 	}
 	bytes, err := request.ReadInput(ctx, *selected)
 	if err != nil {
-		return nil, workflowkit.ArtifactBinding{}, fmt.Errorf("read frozen CodeEdge task snapshot: %w", err)
+		return nil, workflowkit.ArtifactBinding{}, fmt.Errorf("read frozen CodeEdge %s: %w", port, err)
 	}
 	if len(bytes) == 0 || workflowkit.SHA256Fingerprint(bytes) != selected.ContentDigest {
-		return nil, workflowkit.ArtifactBinding{}, errors.New("frozen CodeEdge task snapshot bytes do not match their binding")
+		return nil, workflowkit.ArtifactBinding{}, fmt.Errorf("frozen CodeEdge %s bytes do not match their binding", port)
 	}
 	return bytes, *selected, nil
 }
@@ -504,7 +532,7 @@ func ensureCodeEdgePhase1WorkspaceRoot(root string) error {
 	return nil
 }
 
-func (executor *CodeEdgePhase1ParentExecutor) ensureTaskWorkspace(ctx context.Context, request workflowkit.StageExecutionRequest, binding workflowkit.ArtifactBinding, snapshot []byte) (string, string, error) {
+func (executor *CodeEdgePhase1ParentExecutor) ensureTaskWorkspace(ctx context.Context, request workflowkit.StageExecutionRequest, inputs codeEdgePhase1ManagedInputs) (string, string, error) {
 	if executor == nil || executor.workspaceRoot == "" {
 		return "", "", errors.New("CodeEdge Phase-1 workspace is not configured")
 	}
@@ -517,11 +545,12 @@ func (executor *CodeEdgePhase1ParentExecutor) ensureTaskWorkspace(ctx context.Co
 	}
 	workspace := filepath.Join(executor.workspaceRoot, runID)
 	taskRoot := filepath.Join(workspace, "task")
-	if !codeEdgePhase1PathWithin(executor.workspaceRoot, workspace) || !codeEdgePhase1PathWithin(executor.workspaceRoot, taskRoot) {
+	sourceRoot := filepath.Join(workspace, "source")
+	if !codeEdgePhase1PathWithin(executor.workspaceRoot, workspace) || !codeEdgePhase1PathWithin(executor.workspaceRoot, taskRoot) || !codeEdgePhase1PathWithin(executor.workspaceRoot, sourceRoot) {
 		return "", "", errors.New("CodeEdge Phase-1 workspace path escapes its managed root")
 	}
 	if _, err := os.Lstat(workspace); err == nil {
-		if verifyErr := codeEdgePhase1VerifyWorkspace(workspace, taskRoot, request, binding); verifyErr != nil {
+		if verifyErr := codeEdgePhase1VerifyWorkspace(ctx, workspace, taskRoot, sourceRoot, request, inputs); verifyErr != nil {
 			return "", "", verifyErr
 		}
 		return workspace, taskRoot, nil
@@ -540,23 +569,32 @@ func (executor *CodeEdgePhase1ParentExecutor) ensureTaskWorkspace(ctx context.Co
 		}
 	}()
 	stagingTaskRoot := filepath.Join(staging, "task")
-	if err := taskpolicy.ExtractManagedSnapshotV2ZIP(ctx, snapshot, stagingTaskRoot, string(request.Execution.Subject.Digest)); err != nil {
+	stagingSourceRoot := filepath.Join(staging, "source")
+	if err := taskpolicy.ExtractManagedSnapshotV2ZIP(ctx, inputs.TaskSnapshot, stagingTaskRoot, string(request.Execution.Subject.Digest)); err != nil {
 		return "", "", fmt.Errorf("materialize frozen CodeEdge task snapshot: %w", err)
 	}
+	if err := extractStandardAuthoringSourceSnapshotArchive(ctx, inputs.SourceSnapshot, staging); err != nil {
+		return "", "", fmt.Errorf("materialize frozen CodeEdge source snapshot: %w", err)
+	}
+	if err := markStandardAuthoringSourceReadOnly(stagingSourceRoot); err != nil {
+		return "", "", fmt.Errorf("seal frozen CodeEdge source snapshot: %w", err)
+	}
 	receipt := codeEdgePhase1WorkspaceReceipt{
-		Format:             codeEdgePhase1WorkspaceReceiptFormat,
-		Version:            codeEdgePhase1WorkspaceReceiptVersion,
-		RunID:              runID,
-		TaskSnapshotDigest: string(request.Execution.Subject.Digest),
-		SnapshotZIPDigest:  string(binding.ContentDigest),
-		TaskSnapshotSchema: binding.SchemaVersion,
+		Format:               codeEdgePhase1WorkspaceReceiptFormat,
+		Version:              codeEdgePhase1WorkspaceReceiptVersion,
+		RunID:                runID,
+		TaskSnapshotDigest:   string(request.Execution.Subject.Digest),
+		SnapshotZIPDigest:    string(inputs.TaskBinding.ContentDigest),
+		TaskSnapshotSchema:   inputs.TaskBinding.SchemaVersion,
+		SourceSnapshotDigest: string(inputs.SourceBinding.ContentDigest),
+		SourceSnapshotSchema: inputs.SourceBinding.SchemaVersion,
 	}
 	if err := codeEdgePhase1WriteJSON(filepath.Join(staging, "workspace-receipt.json"), receipt); err != nil {
 		return "", "", err
 	}
 	if err := os.Rename(staging, workspace); err != nil {
 		if _, statErr := os.Lstat(workspace); statErr == nil {
-			if verifyErr := codeEdgePhase1VerifyWorkspace(workspace, taskRoot, request, binding); verifyErr != nil {
+			if verifyErr := codeEdgePhase1VerifyWorkspace(ctx, workspace, taskRoot, sourceRoot, request, inputs); verifyErr != nil {
 				return "", "", verifyErr
 			}
 			return workspace, taskRoot, nil
@@ -564,22 +602,24 @@ func (executor *CodeEdgePhase1ParentExecutor) ensureTaskWorkspace(ctx context.Co
 		return "", "", fmt.Errorf("publish CodeEdge Phase-1 workspace: %w", err)
 	}
 	removeStaging = false
-	if err := codeEdgePhase1VerifyWorkspace(workspace, taskRoot, request, binding); err != nil {
+	if err := codeEdgePhase1VerifyWorkspace(ctx, workspace, taskRoot, sourceRoot, request, inputs); err != nil {
 		return "", "", err
 	}
 	return workspace, taskRoot, nil
 }
 
 type codeEdgePhase1WorkspaceReceipt struct {
-	Format             string `json:"format"`
-	Version            string `json:"version"`
-	RunID              string `json:"run_id"`
-	TaskSnapshotDigest string `json:"task_snapshot_digest"`
-	SnapshotZIPDigest  string `json:"snapshot_zip_digest"`
-	TaskSnapshotSchema string `json:"task_snapshot_schema"`
+	Format               string `json:"format"`
+	Version              string `json:"version"`
+	RunID                string `json:"run_id"`
+	TaskSnapshotDigest   string `json:"task_snapshot_digest"`
+	SnapshotZIPDigest    string `json:"snapshot_zip_digest"`
+	TaskSnapshotSchema   string `json:"task_snapshot_schema"`
+	SourceSnapshotDigest string `json:"source_snapshot_digest"`
+	SourceSnapshotSchema string `json:"source_snapshot_schema"`
 }
 
-func codeEdgePhase1VerifyWorkspace(workspace, taskRoot string, request workflowkit.StageExecutionRequest, binding workflowkit.ArtifactBinding) error {
+func codeEdgePhase1VerifyWorkspace(ctx context.Context, workspace, taskRoot, sourceRoot string, request workflowkit.StageExecutionRequest, inputs codeEdgePhase1ManagedInputs) error {
 	info, err := os.Lstat(workspace)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return errors.New("CodeEdge Phase-1 workspace is not a real directory")
@@ -590,8 +630,9 @@ func codeEdgePhase1VerifyWorkspace(workspace, taskRoot string, request workflowk
 	}
 	if receipt.Format != codeEdgePhase1WorkspaceReceiptFormat || receipt.Version != codeEdgePhase1WorkspaceReceiptVersion ||
 		receipt.RunID != request.Execution.ID || receipt.TaskSnapshotDigest != string(request.Execution.Subject.Digest) ||
-		receipt.SnapshotZIPDigest != string(binding.ContentDigest) || receipt.TaskSnapshotSchema != binding.SchemaVersion {
-		return errors.New("CodeEdge Phase-1 workspace receipt does not match the frozen task input")
+		receipt.SnapshotZIPDigest != string(inputs.TaskBinding.ContentDigest) || receipt.TaskSnapshotSchema != inputs.TaskBinding.SchemaVersion ||
+		receipt.SourceSnapshotDigest != string(inputs.SourceBinding.ContentDigest) || receipt.SourceSnapshotSchema != inputs.SourceBinding.SchemaVersion {
+		return errors.New("CodeEdge Phase-1 workspace receipt does not match the frozen task/source inputs")
 	}
 	if err := taskpolicy.ValidateManagedSnapshotV2(taskRoot); err != nil {
 		return fmt.Errorf("validate CodeEdge Phase-1 materialized task workspace: %w", err)
@@ -602,6 +643,9 @@ func codeEdgePhase1VerifyWorkspace(workspace, taskRoot string, request workflowk
 	}
 	if digest != string(request.Execution.Subject.Digest) {
 		return errors.New("CodeEdge Phase-1 workspace task digest differs from the frozen Run")
+	}
+	if err := verifyStandardAuthoringExtractedSourceArchive(ctx, inputs.SourceSnapshot, sourceRoot); err != nil {
+		return fmt.Errorf("validate CodeEdge Phase-1 materialized source workspace: %w", err)
 	}
 	return nil
 }
@@ -704,17 +748,18 @@ type codeEdgePhase1CommandReceipt struct {
 // receipt. The latter can only be formed after artifact persistence assigns
 // the immutable content digest and lineage binding.
 type codeEdgePhase1StageReport struct {
-	Format             string                          `json:"format"`
-	Version            string                          `json:"version"`
-	Stage              string                          `json:"stage"`
-	RunID              string                          `json:"run_id"`
-	StageAttemptID     string                          `json:"stage_attempt_id"`
-	TaskSnapshotDigest string                          `json:"task_snapshot_digest"`
-	Verdict            workflowkit.Verdict             `json:"verdict"`
-	Findings           []string                        `json:"findings"`
-	Inspection         *codeEdgePhase1InspectionReport `json:"inspection,omitempty"`
-	Command            *codeEdgePhase1CommandReceipt   `json:"command,omitempty"`
-	ReservedArtifactID string                          `json:"reserved_artifact_id,omitempty"`
+	Format               string                          `json:"format"`
+	Version              string                          `json:"version"`
+	Stage                string                          `json:"stage"`
+	RunID                string                          `json:"run_id"`
+	StageAttemptID       string                          `json:"stage_attempt_id"`
+	TaskSnapshotDigest   string                          `json:"task_snapshot_digest"`
+	SourceSnapshotDigest string                          `json:"source_snapshot_digest,omitempty"`
+	Verdict              workflowkit.Verdict             `json:"verdict"`
+	Findings             []string                        `json:"findings"`
+	Inspection           *codeEdgePhase1InspectionReport `json:"inspection,omitempty"`
+	Command              *codeEdgePhase1CommandReceipt   `json:"command,omitempty"`
+	ReservedArtifactID   string                          `json:"reserved_artifact_id,omitempty"`
 }
 
 func codeEdgePhase1Inspection(report codeedge.Report) *codeEdgePhase1InspectionReport {
@@ -730,15 +775,16 @@ func codeEdgePhase1Inspection(report codeedge.Report) *codeEdgePhase1InspectionR
 
 func (executor *CodeEdgePhase1ParentExecutor) reportResult(request workflowkit.StageExecutionRequest, outputName, schema string, verdict workflowkit.Verdict, findings []string, inspection *codeedge.Report, reservedArtifactID, _ string) (workflowkit.StageExecutionResult, error) {
 	report := codeEdgePhase1StageReport{
-		Format:             codeEdgePhase1ReportFormat,
-		Version:            codeEdgePhase1ReportVersion,
-		Stage:              string(request.Stage.Key),
-		RunID:              request.Execution.ID,
-		StageAttemptID:     string(request.Claim.Stage.StageAttempt.ID),
-		TaskSnapshotDigest: string(request.Execution.Subject.Digest),
-		Verdict:            verdict,
-		Findings:           append([]string{}, findings...),
-		ReservedArtifactID: reservedArtifactID,
+		Format:               codeEdgePhase1ReportFormat,
+		Version:              codeEdgePhase1ReportVersion,
+		Stage:                string(request.Stage.Key),
+		RunID:                request.Execution.ID,
+		StageAttemptID:       string(request.Claim.Stage.StageAttempt.ID),
+		TaskSnapshotDigest:   string(request.Execution.Subject.Digest),
+		SourceSnapshotDigest: codeEdgePhase1InputDigest(request, workflowadapter.CodeEdgeSourceSnapshotArtifact),
+		Verdict:              verdict,
+		Findings:             append([]string{}, findings...),
+		ReservedArtifactID:   reservedArtifactID,
 	}
 	if inspection != nil {
 		report.Inspection = codeEdgePhase1Inspection(*inspection)
@@ -786,16 +832,26 @@ func codeEdgePhase1InfraResult(request workflowkit.StageExecutionRequest, output
 
 func (executor *CodeEdgePhase1ParentExecutor) reportFor(request workflowkit.StageExecutionRequest, verdict workflowkit.Verdict, findings []string, inspection codeedge.Report) codeEdgePhase1StageReport {
 	return codeEdgePhase1StageReport{
-		Format:             codeEdgePhase1ReportFormat,
-		Version:            codeEdgePhase1ReportVersion,
-		Stage:              string(request.Stage.Key),
-		RunID:              request.Execution.ID,
-		StageAttemptID:     string(request.Claim.Stage.StageAttempt.ID),
-		TaskSnapshotDigest: string(request.Execution.Subject.Digest),
-		Verdict:            verdict,
-		Findings:           append([]string{}, findings...),
-		Inspection:         codeEdgePhase1Inspection(inspection),
+		Format:               codeEdgePhase1ReportFormat,
+		Version:              codeEdgePhase1ReportVersion,
+		Stage:                string(request.Stage.Key),
+		RunID:                request.Execution.ID,
+		StageAttemptID:       string(request.Claim.Stage.StageAttempt.ID),
+		TaskSnapshotDigest:   string(request.Execution.Subject.Digest),
+		SourceSnapshotDigest: codeEdgePhase1InputDigest(request, workflowadapter.CodeEdgeSourceSnapshotArtifact),
+		Verdict:              verdict,
+		Findings:             append([]string{}, findings...),
+		Inspection:           codeEdgePhase1Inspection(inspection),
 	}
+}
+
+func codeEdgePhase1InputDigest(request workflowkit.StageExecutionRequest, name string) string {
+	for _, binding := range request.Inputs {
+		if binding.Name == name {
+			return string(binding.ContentDigest)
+		}
+	}
+	return ""
 }
 
 func (executor *CodeEdgePhase1ParentExecutor) reserveSubmissionArtifactID(workspace string, request workflowkit.StageExecutionRequest) (workflowkit.ArtifactID, error) {
@@ -936,8 +992,9 @@ func (executor *CodeEdgePhase1ParentExecutor) executeInitialVerify(ctx context.C
 		return workflowkit.StageExecutionResult{}, err
 	}
 	lock := executor.commands[stageprovider.CodeEdgePhase1InitialVerifyCommandID]
+	sourceRoot := filepath.Join(workspace, "source")
 	result, outputFingerprint, runErr := executor.docker.run(ctx, lock.CommandID,
-		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "initial"), codeEdgePhase1VerificationProgram(false)), workspace)
+		codeEdgePhase1DockerRunArgs(build.ImageTag, sourceRoot, checkout, "", codeEdgePhase1ContainerName(request, "initial"), codeEdgePhase1VerificationProgram(false)), workspace)
 	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
 	if runErr != nil {
 		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled initial verification could not start", report, codeEdgePhase1FailureClass(runErr))
@@ -974,8 +1031,9 @@ func (executor *CodeEdgePhase1ParentExecutor) executeOracleVerify(ctx context.Co
 		return workflowkit.StageExecutionResult{}, err
 	}
 	lock := executor.commands[stageprovider.CodeEdgePhase1OracleVerifyCommandID]
+	sourceRoot := filepath.Join(workspace, "source")
 	result, outputFingerprint, runErr := executor.docker.run(ctx, lock.CommandID,
-		codeEdgePhase1DockerRunArgs(build.ImageTag, checkout, codeEdgePhase1ContainerName(request, "oracle"), codeEdgePhase1VerificationProgram(true)), workspace)
+		codeEdgePhase1DockerRunArgs(build.ImageTag, sourceRoot, checkout, "", codeEdgePhase1ContainerName(request, "oracle"), codeEdgePhase1VerificationProgram(true)), workspace)
 	report.Command = &codeEdgePhase1CommandReceipt{CommandID: lock.CommandID, ExecutableVersion: lock.Version, ExitCode: result.ExitCode, OutputFingerprint: outputFingerprint}
 	if runErr != nil {
 		return codeEdgePhase1InfraResult(request, outputName, schema, "controlled Oracle verification could not start", report, codeEdgePhase1FailureClass(runErr))
@@ -1092,8 +1150,8 @@ func (executor *CodeEdgePhase1ParentExecutor) inspectDockerImage(ctx context.Con
 	return imageID, err
 }
 
-func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) []string {
-	return []string{
+func codeEdgePhase1DockerRunArgs(imageTag, sourceRoot, taskRoot, workRoot, name, shellProgram string) []string {
+	args := []string{
 		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
 		// Rust, Node, and similar build systems execute generated helper binaries
 		// from their temporary target/cache directories. Keep /tmp ephemeral and
@@ -1103,23 +1161,31 @@ func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) 
 		"--env", "HOME=/tmp/harbor-home",
 		"--env", "XDG_CACHE_HOME=/tmp/harbor-cache",
 		"--env", "XDG_CONFIG_HOME=/tmp/harbor-config",
+		"--env", "HARBOR_SOURCE=/source",
+		"--env", "HARBOR_WORKSPACE=/work",
+		"--env", "HARBOR_TASK_ROOT=/task",
 		// CodeEdge verifiers publish their binary reward under /logs. Keep that
 		// protocol path ephemeral and constrained while the image root stays read-only.
 		"--tmpfs", "/logs:rw,noexec,nosuid,size=8m",
-		// Docker's --mount grammar treats a bare "rw" field as invalid. Bind
-		// mounts are writable unless readonly is set, so omitting it preserves the
-		// controlled Oracle worktree's required write access.
-		"--mount", "type=bind,src=" + checkout + ",dst=/oracle",
-		"--workdir", "/oracle", "--name", "harbor-codeedge-" + name,
-		"--entrypoint", "/bin/sh", imageTag, "-ec", shellProgram,
+		"--mount", "type=bind,src=" + sourceRoot + ",dst=/source,readonly",
+		"--mount", "type=bind,src=" + taskRoot + ",dst=/task,readonly",
 	}
+	if strings.TrimSpace(workRoot) == "" {
+		args = append(args, "--tmpfs", "/work:rw,exec,nosuid,size=4g")
+	} else {
+		args = append(args, "--mount", "type=bind,src="+workRoot+",dst=/work")
+	}
+	return append(args,
+		"--workdir", "/work", "--name", "harbor-codeedge-"+name,
+		"--entrypoint", "/bin/sh", imageTag, "-ec", shellProgram,
+	)
 }
 
 func codeEdgePhase1VerificationProgram(applySolution bool) string {
-	prepare := "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config && rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /workspace/source/. /oracle/workspace/ && chmod -R u+rwX /oracle/workspace && cd /oracle/workspace"
-	command := "sh /oracle/tests/test.sh"
+	prepare := "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config && { rm -rf /work/* /work/.[!.]* /work/..?* 2>/dev/null || true; } && mkdir -p /work && cp -R /source/. /work/ && chmod -R u+rwX /work && cd /work"
+	command := "sh /task/tests/test.sh"
 	if applySolution {
-		command = "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh"
+		command = "sh /task/solution/solve.sh && sh /task/tests/test.sh"
 	}
 	return prepare + " || { echo '" + codeEdgePhase1VerificationSetupFailureMarker + "' >&2; exit 125; }; " + command
 }
@@ -1181,9 +1247,10 @@ func codeEdgePhase1PrepareVerificationCheckout(workspace string, request workflo
 	return checkout, before, nil
 }
 
-// The image may select a non-root USER. The bind-mounted checkout must let
-// that user create /oracle/worktree while leaving the host-owned script bytes
-// readable; post-run digest verification remains the mutation authority.
+// The image may select a non-root USER. The bind-mounted task checkout must
+// leave host-owned script bytes readable while /work carries the mutable
+// verification tree; post-run digest verification remains the mutation
+// authority.
 func codeEdgePhase1PrepareVerificationCheckoutRoot(path string) error {
 	if err := os.Mkdir(path, 0o777); err != nil && !errors.Is(err, os.ErrExist) {
 		return err

@@ -63,32 +63,44 @@ func (reference StandardAuthoringContractAssetReference) Validate() error {
 }
 
 // StandardAuthoringContractLock is the typed record extension named
-// standard_authoring_contract in a deployment operation lock. Prompt and
-// Schema map named deployment assets to the pre-existing
+// standard_authoring_contract in a deployment operation lock. Prompt and the
+// primary Schema map named deployment assets to the pre-existing
 // PromptContentFingerprint and SchemaContentFingerprint of the enclosing
-// record respectively. Duplicating hashes here would create two authorities;
-// the lock record remains the one authoritative content binding.
+// record respectively. AdditionalSchemas are secondary output contracts whose
+// content hashes live directly beside their deployment-relative identity.
 type StandardAuthoringContractLock struct {
-	Format  string                                  `json:"format"`
-	Version string                                  `json:"version"`
-	Prompt  StandardAuthoringContractAssetReference `json:"prompt"`
-	Schema  StandardAuthoringContractAssetReference `json:"schema"`
+	Format            string                                          `json:"format"`
+	Version           string                                          `json:"version"`
+	Prompt            StandardAuthoringContractAssetReference         `json:"prompt"`
+	Schema            StandardAuthoringContractAssetReference         `json:"schema"`
+	AdditionalSchemas []StandardAuthoringContractAdditionalSchemaLock `json:"additional_schemas,omitempty"`
+}
+
+// StandardAuthoringContractAdditionalSchemaLock pins a secondary schema asset
+// that is not represented by the generic lock record's single
+// SchemaContentFingerprint field.
+type StandardAuthoringContractAdditionalSchemaLock struct {
+	StandardAuthoringContractAssetReference
+	ContentSHA256 workflowkit.Fingerprint `json:"content_sha256"`
 }
 
 // StandardAuthoringContractAssetManifestEntry selects the two immutable
-// deployment assets for one exact Standard authoring stage. It contains no
-// arbitrary configuration and no workspace path; entries are expanded into
-// typed lock extensions only by the deterministic lock generator.
+// primary deployment assets for one exact Standard authoring stage, plus any
+// secondary schemas owned by built-in stage outputs. It contains no arbitrary
+// configuration and no workspace path; entries are expanded into typed lock
+// extensions only by the deterministic lock generator.
 type StandardAuthoringContractAssetManifestEntry struct {
-	StageKey workflowkit.StageKey                    `json:"stage_key"`
-	Prompt   StandardAuthoringContractAssetReference `json:"prompt"`
-	Schema   StandardAuthoringContractAssetReference `json:"schema"`
+	StageKey          workflowkit.StageKey                      `json:"stage_key"`
+	Prompt            StandardAuthoringContractAssetReference   `json:"prompt"`
+	Schema            StandardAuthoringContractAssetReference   `json:"schema"`
+	AdditionalSchemas []StandardAuthoringContractAssetReference `json:"additional_schemas,omitempty"`
 }
 
 // Clone returns independently owned manifest entry values.
 func (entry StandardAuthoringContractAssetManifestEntry) Clone() StandardAuthoringContractAssetManifestEntry {
 	entry.Prompt = entry.Prompt.Clone()
 	entry.Schema = entry.Schema.Clone()
+	entry.AdditionalSchemas = cloneStandardAuthoringContractAssetReferences(entry.AdditionalSchemas)
 	return entry
 }
 
@@ -143,8 +155,8 @@ func (manifest StandardAuthoringContractAssetManifest) Validate() error {
 		return fmt.Errorf("%w: Standard authoring contract asset manifest has %d operations, want %d", ErrInvalidDeploymentOperationCatalogLock, len(manifest.Operations), len(expected))
 	}
 	seenStages := make(map[workflowkit.StageKey]struct{}, len(manifest.Operations))
-	assetIdentities := make(map[standardAuthoringContractAssetIdentity]string, len(manifest.Operations)*2)
-	assetPaths := make(map[string]standardAuthoringContractAssetIdentity, len(manifest.Operations)*2)
+	assetIdentities := make(map[standardAuthoringContractAssetIdentity]string, len(manifest.Operations)*3)
+	assetPaths := make(map[string]standardAuthoringContractAssetIdentity, len(manifest.Operations)*3)
 	for index, entry := range manifest.Operations {
 		if _, present := expected[entry.StageKey]; !present {
 			return fmt.Errorf("%w: Standard authoring contract asset manifest operation %d has unknown stage %q", ErrInvalidDeploymentOperationCatalogLock, index, entry.StageKey)
@@ -153,11 +165,29 @@ func (manifest StandardAuthoringContractAssetManifest) Validate() error {
 			return fmt.Errorf("%w: Standard authoring contract asset manifest has duplicate stage %q", ErrInvalidDeploymentOperationCatalogLock, entry.StageKey)
 		}
 		seenStages[entry.StageKey] = struct{}{}
-		contract := StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion, Prompt: entry.Prompt, Schema: entry.Schema}
-		if err := contract.Validate(); err != nil {
+		if err := validateStandardAuthoringPrimaryContractAssets(entry.Prompt, entry.Schema); err != nil {
 			return fmt.Errorf("%w: Standard authoring contract asset manifest stage %q: %v", ErrInvalidDeploymentOperationCatalogLock, entry.StageKey, err)
 		}
-		for _, reference := range []StandardAuthoringContractAssetReference{entry.Prompt, entry.Schema} {
+		stageReferences := []StandardAuthoringContractAssetReference{entry.Prompt, entry.Schema}
+		seenAdditional := make(map[standardAuthoringContractAssetIdentity]struct{}, len(entry.AdditionalSchemas))
+		for additionalIndex, reference := range entry.AdditionalSchemas {
+			if err := reference.Validate(); err != nil {
+				return fmt.Errorf("%w: Standard authoring contract asset manifest stage %q additional schema %d: %v", ErrInvalidDeploymentOperationCatalogLock, entry.StageKey, additionalIndex, err)
+			}
+			identity := standardAuthoringContractAssetIdentity{id: reference.ID, version: reference.Version}
+			if identity == (standardAuthoringContractAssetIdentity{id: entry.Prompt.ID, version: entry.Prompt.Version}) || identity == (standardAuthoringContractAssetIdentity{id: entry.Schema.ID, version: entry.Schema.Version}) {
+				return fmt.Errorf("%w: Standard authoring contract asset manifest stage %q repeats an additional schema identity", ErrInvalidDeploymentOperationCatalogLock, entry.StageKey)
+			}
+			if _, duplicate := seenAdditional[identity]; duplicate {
+				return fmt.Errorf("%w: Standard authoring contract asset manifest stage %q repeats an additional schema identity", ErrInvalidDeploymentOperationCatalogLock, entry.StageKey)
+			}
+			seenAdditional[identity] = struct{}{}
+			if reference.RelativePath == entry.Prompt.RelativePath || reference.RelativePath == entry.Schema.RelativePath {
+				return fmt.Errorf("%w: Standard authoring contract asset manifest stage %q repeats an additional schema path", ErrInvalidDeploymentOperationCatalogLock, entry.StageKey)
+			}
+			stageReferences = append(stageReferences, reference)
+		}
+		for _, reference := range stageReferences {
 			identity := standardAuthoringContractAssetIdentity{id: reference.ID, version: reference.Version}
 			if existing, present := assetIdentities[identity]; present && existing != reference.RelativePath {
 				return fmt.Errorf("%w: Standard authoring asset %q@%q maps to conflicting paths", ErrInvalidDeploymentOperationCatalogLock, reference.ID, reference.Version)
@@ -183,6 +213,11 @@ func (manifest StandardAuthoringContractAssetManifest) CanonicalJSON() ([]byte, 
 	sort.Slice(canonical.Operations, func(left, right int) bool {
 		return canonical.Operations[left].StageKey < canonical.Operations[right].StageKey
 	})
+	for index := range canonical.Operations {
+		sort.Slice(canonical.Operations[index].AdditionalSchemas, func(left, right int) bool {
+			return standardAuthoringContractAssetReferenceLess(canonical.Operations[index].AdditionalSchemas[left], canonical.Operations[index].AdditionalSchemas[right])
+		})
+	}
 	encoded, err := json.Marshal(canonical)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode Standard authoring contract asset manifest: %v", ErrInvalidDeploymentOperationCatalogLock, err)
@@ -232,6 +267,13 @@ type standardAuthoringContractAssetManifestDocument struct {
 func (lock StandardAuthoringContractLock) Clone() StandardAuthoringContractLock {
 	lock.Prompt = lock.Prompt.Clone()
 	lock.Schema = lock.Schema.Clone()
+	lock.AdditionalSchemas = cloneStandardAuthoringContractAdditionalSchemaLocks(lock.AdditionalSchemas)
+	return lock
+}
+
+// Clone returns independently owned additional-schema lock values.
+func (lock StandardAuthoringContractAdditionalSchemaLock) Clone() StandardAuthoringContractAdditionalSchemaLock {
+	lock.StandardAuthoringContractAssetReference = lock.StandardAuthoringContractAssetReference.Clone()
 	return lock
 }
 
@@ -245,17 +287,42 @@ func (lock StandardAuthoringContractLock) Validate() error {
 	if lock.Version != StandardAuthoringContractLockVersion {
 		return fmt.Errorf("%w: unsupported Standard authoring contract lock version %q", ErrInvalidDeploymentOperationCatalogLock, lock.Version)
 	}
-	if err := lock.Prompt.Validate(); err != nil {
-		return fmt.Errorf("%w: Standard authoring prompt asset: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	if err := validateStandardAuthoringPrimaryContractAssets(lock.Prompt, lock.Schema); err != nil {
+		return err
 	}
-	if err := lock.Schema.Validate(); err != nil {
-		return fmt.Errorf("%w: Standard authoring schema asset: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	seenAdditional := make(map[standardAuthoringContractAssetIdentity]struct{}, len(lock.AdditionalSchemas))
+	seenAdditionalPaths := make(map[string]struct{}, len(lock.AdditionalSchemas))
+	for index, schema := range lock.AdditionalSchemas {
+		if err := schema.Validate(); err != nil {
+			return fmt.Errorf("%w: Standard authoring additional schema asset %d: %v", ErrInvalidDeploymentOperationCatalogLock, index, err)
+		}
+		identity := standardAuthoringContractAssetIdentity{id: schema.ID, version: schema.Version}
+		if identity == (standardAuthoringContractAssetIdentity{id: lock.Prompt.ID, version: lock.Prompt.Version}) || identity == (standardAuthoringContractAssetIdentity{id: lock.Schema.ID, version: lock.Schema.Version}) {
+			return fmt.Errorf("%w: Standard authoring additional schema must use a distinct asset identity", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		if _, duplicate := seenAdditional[identity]; duplicate {
+			return fmt.Errorf("%w: Standard authoring additional schema must not repeat an asset identity", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		seenAdditional[identity] = struct{}{}
+		if schema.RelativePath == lock.Prompt.RelativePath || schema.RelativePath == lock.Schema.RelativePath {
+			return fmt.Errorf("%w: Standard authoring additional schema must use a distinct asset path", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		if _, duplicate := seenAdditionalPaths[schema.RelativePath]; duplicate {
+			return fmt.Errorf("%w: Standard authoring additional schema must not repeat an asset path", ErrInvalidDeploymentOperationCatalogLock)
+		}
+		seenAdditionalPaths[schema.RelativePath] = struct{}{}
 	}
-	if lock.Prompt.ID == lock.Schema.ID && lock.Prompt.Version == lock.Schema.Version {
-		return fmt.Errorf("%w: Standard authoring prompt and schema must use distinct asset identities", ErrInvalidDeploymentOperationCatalogLock)
+	return nil
+}
+
+// Validate proves an additional schema asset reference and its content hash
+// are fully pinned.
+func (lock StandardAuthoringContractAdditionalSchemaLock) Validate() error {
+	if err := lock.StandardAuthoringContractAssetReference.Validate(); err != nil {
+		return err
 	}
-	if lock.Prompt.RelativePath == lock.Schema.RelativePath {
-		return fmt.Errorf("%w: Standard authoring prompt and schema must use distinct asset paths", ErrInvalidDeploymentOperationCatalogLock)
+	if err := lock.ContentSHA256.Validate(); err != nil {
+		return fmt.Errorf("%w: Standard authoring additional schema content SHA-256: %v", ErrInvalidDeploymentOperationCatalogLock, err)
 	}
 	return nil
 }
@@ -263,6 +330,54 @@ func (lock StandardAuthoringContractLock) Validate() error {
 type standardAuthoringContractAssetIdentity struct {
 	id      string
 	version string
+}
+
+func cloneStandardAuthoringContractAssetReferences(references []StandardAuthoringContractAssetReference) []StandardAuthoringContractAssetReference {
+	if references == nil {
+		return nil
+	}
+	copied := make([]StandardAuthoringContractAssetReference, len(references))
+	for index, reference := range references {
+		copied[index] = reference.Clone()
+	}
+	return copied
+}
+
+func cloneStandardAuthoringContractAdditionalSchemaLocks(locks []StandardAuthoringContractAdditionalSchemaLock) []StandardAuthoringContractAdditionalSchemaLock {
+	if locks == nil {
+		return nil
+	}
+	copied := make([]StandardAuthoringContractAdditionalSchemaLock, len(locks))
+	for index, lock := range locks {
+		copied[index] = lock.Clone()
+	}
+	return copied
+}
+
+func standardAuthoringContractAssetReferenceLess(left, right StandardAuthoringContractAssetReference) bool {
+	if left.ID != right.ID {
+		return left.ID < right.ID
+	}
+	if left.Version != right.Version {
+		return left.Version < right.Version
+	}
+	return left.RelativePath < right.RelativePath
+}
+
+func validateStandardAuthoringPrimaryContractAssets(prompt, schema StandardAuthoringContractAssetReference) error {
+	if err := prompt.Validate(); err != nil {
+		return fmt.Errorf("%w: Standard authoring prompt asset: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	if err := schema.Validate(); err != nil {
+		return fmt.Errorf("%w: Standard authoring schema asset: %v", ErrInvalidDeploymentOperationCatalogLock, err)
+	}
+	if prompt.ID == schema.ID && prompt.Version == schema.Version {
+		return fmt.Errorf("%w: Standard authoring prompt and schema must use distinct asset identities", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if prompt.RelativePath == schema.RelativePath {
+		return fmt.Errorf("%w: Standard authoring prompt and schema must use distinct asset paths", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	return nil
 }
 
 type standardAuthoringContractAssetBinding struct {
@@ -309,22 +424,34 @@ func validateStandardAuthoringLockContract(lock DeploymentOperationCatalogLock) 
 			{kind: "prompt", reference: contract.Prompt, fingerprint: record.PromptContentFingerprint},
 			{kind: "schema", reference: contract.Schema, fingerprint: record.SchemaContentFingerprint},
 		} {
-			identity := standardAuthoringContractAssetIdentity{id: asset.reference.ID, version: asset.reference.Version}
-			binding := standardAuthoringContractAssetBinding{kind: asset.kind, relativePath: asset.reference.RelativePath, fingerprint: asset.fingerprint}
-			if existing, present := identities[identity]; present {
-				if existing != binding {
-					return fmt.Errorf("%w: Standard authoring %s asset %q@%q has conflicting path or SHA-256 binding", ErrInvalidDeploymentOperationCatalogLock, asset.kind, asset.reference.ID, asset.reference.Version)
-				}
-			} else {
-				identities[identity] = binding
+			if err := recordStandardAuthoringContractAssetBinding(identities, paths, asset.kind, asset.reference, asset.fingerprint); err != nil {
+				return err
 			}
-			pathKey := asset.kind + ":" + asset.reference.RelativePath
-			if existing, present := paths[pathKey]; present && existing != identity {
-				return fmt.Errorf("%w: Standard authoring %s asset path has conflicting identity", ErrInvalidDeploymentOperationCatalogLock, asset.kind)
+		}
+		for _, asset := range contract.AdditionalSchemas {
+			if err := recordStandardAuthoringContractAssetBinding(identities, paths, "schema", asset.StandardAuthoringContractAssetReference, asset.ContentSHA256); err != nil {
+				return err
 			}
-			paths[pathKey] = identity
 		}
 	}
+	return nil
+}
+
+func recordStandardAuthoringContractAssetBinding(identities map[standardAuthoringContractAssetIdentity]standardAuthoringContractAssetBinding, paths map[string]standardAuthoringContractAssetIdentity, kind string, reference StandardAuthoringContractAssetReference, fingerprint workflowkit.Fingerprint) error {
+	identity := standardAuthoringContractAssetIdentity{id: reference.ID, version: reference.Version}
+	binding := standardAuthoringContractAssetBinding{kind: kind, relativePath: reference.RelativePath, fingerprint: fingerprint}
+	if existing, present := identities[identity]; present {
+		if existing != binding {
+			return fmt.Errorf("%w: Standard authoring %s asset %q@%q has conflicting path or SHA-256 binding", ErrInvalidDeploymentOperationCatalogLock, kind, reference.ID, reference.Version)
+		}
+	} else {
+		identities[identity] = binding
+	}
+	pathKey := kind + ":" + reference.RelativePath
+	if existing, present := paths[pathKey]; present && existing != identity {
+		return fmt.Errorf("%w: Standard authoring %s asset path has conflicting identity", ErrInvalidDeploymentOperationCatalogLock, kind)
+	}
+	paths[pathKey] = identity
 	return nil
 }
 

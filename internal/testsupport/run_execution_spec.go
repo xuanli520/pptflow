@@ -133,11 +133,13 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 		"harbor.artifact.v1":                                  "018f0a73-3b49-7000-8000-000000000006",
 		"harbor.review-decision.v1":                           "018f0a73-3b49-7000-8000-000000000007",
 		workflowadapter.CodeEdgeSubmissionReportSchemaVersion: "018f0a73-3b49-7000-8000-000000000008",
+		workflowadapter.CodeEdgeSourceSnapshotSchemaVersion:   "018f0a73-3b49-7000-8000-00000000000a",
 	}
 	artifactDigests := map[string]workflowkit.Fingerprint{
 		"harbor.artifact.v1":                                  fixtureFingerprint('d'),
 		"harbor.review-decision.v1":                           fixtureFingerprint('e'),
 		workflowadapter.CodeEdgeSubmissionReportSchemaVersion: fixtureFingerprint('f'),
+		workflowadapter.CodeEdgeSourceSnapshotSchemaVersion:   fixtureFingerprint('7'),
 	}
 	usedSchemas := make(map[string]struct{})
 	for _, definition := range catalog.Stages {
@@ -149,7 +151,7 @@ func CompleteCodeEdgePhase1RunExecutionSpec(taskID, revisionID, revisionDigest s
 		}
 	}
 	artifacts := make([]workflowadapter.ArtifactReference, 0, len(usedSchemas))
-	for _, schema := range []string{"harbor.artifact.v1", "harbor.review-decision.v1", workflowadapter.CodeEdgeSubmissionReportSchemaVersion} {
+	for _, schema := range []string{"harbor.artifact.v1", "harbor.review-decision.v1", workflowadapter.CodeEdgeSubmissionReportSchemaVersion, workflowadapter.CodeEdgeSourceSnapshotSchemaVersion} {
 		if _, used := usedSchemas[schema]; !used {
 			continue
 		}

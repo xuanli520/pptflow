@@ -38,7 +38,7 @@ func TestStandardAuthoringV3CatalogFreezesRoleAndWorkspaceAuthority(t *testing.T
 	for _, key := range []workflowkit.StageKey{workflowkit.StageKey(TestQualityCritic), workflowkit.StageKey(SolutionIntegrityCritic)} {
 		critic, _ := template.Catalog.Stage(key)
 		if critic.AgentRole.RoleID != workflowkit.AgentRoleCritic || critic.AgentRole.OutputMode != workflowkit.AgentOutputFinding ||
-			critic.Concurrency.Workspace.Mode != workflowkit.WorkspaceReadOnlySnapshot || critic.Concurrency.Workspace.Key != "authoring-candidate" {
+			critic.Concurrency.Workspace.Mode != workflowkit.WorkspaceReadOnlySnapshot || critic.Concurrency.Workspace.Key != "authoring-candidate-critic" {
 			t.Fatalf("critic stage %q authority = %+v", key, critic.AgentRole)
 		}
 	}
@@ -60,8 +60,8 @@ func TestStandardAuthoringV3TopologySchedulesParallelResearchAndCritics(t *testi
 	if !scheduleContainsBatch(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(RepoStructureResearch), workflowkit.NodeID(TestRuntimeResearch), workflowkit.NodeID(VerifierThreatResearch)}) {
 		t.Fatalf("schedule omitted concurrent research batch: %#v", plan.Batches)
 	}
-	if !scheduleContainsBatch(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(TestQualityCritic), workflowkit.NodeID(SolutionIntegrityCritic)}) {
-		t.Fatalf("schedule omitted concurrent critic batch: %#v", plan.Batches)
+	if !scheduleContainsBatch(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(TestQualityCritic), workflowkit.NodeID(SolutionIntegrityCritic), workflowkit.NodeID(AuthoringRepair)}) {
+		t.Fatalf("schedule omitted concurrent critic/repair batch: %#v", plan.Batches)
 	}
 	policy := template.QuotaPolicy
 	for _, limit := range policy.AccountLimits {

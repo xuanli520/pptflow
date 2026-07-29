@@ -2,7 +2,7 @@ package app
 
 import "testing"
 
-func TestStandardAuthoringRuntimeContractV1IsClosedAndFingerprinted(t *testing.T) {
+func TestStandardAuthoringRuntimeContractV1IsLegacyClosedAndFingerprinted(t *testing.T) {
 	contract, err := NewStandardAuthoringRuntimeContractV1()
 	if err != nil {
 		t.Fatal(err)
@@ -23,5 +23,32 @@ func TestStandardAuthoringRuntimeContractV1IsClosedAndFingerprinted(t *testing.T
 	missing.PathVariables = missing.PathVariables[:2]
 	if err := missing.Validate(); err == nil {
 		t.Fatal("runtime contract accepted an incomplete path variable allowlist")
+	}
+}
+
+func TestStandardAuthoringRuntimeContractV2IsCurrentValidationABI(t *testing.T) {
+	contract, err := NewStandardAuthoringRuntimeContractV2()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := contract.Validate(); err != nil {
+		t.Fatalf("validate current runtime contract: %v", err)
+	}
+	if contract.TaskRoot != "/task" || contract.SourceRoot != "/source" || contract.WorkspaceRoot != "/work" {
+		t.Fatalf("current runtime paths = %+v", contract)
+	}
+	want := map[string]string{
+		"HARBOR_TASK_ROOT": "/task",
+		"HARBOR_SOURCE":    "/source",
+		"HARBOR_WORKSPACE": "/work",
+	}
+	for _, variable := range contract.PathVariables {
+		if want[variable.Name] != variable.Value {
+			t.Fatalf("current runtime variable %q = %q", variable.Name, variable.Value)
+		}
+		delete(want, variable.Name)
+	}
+	if len(want) != 0 {
+		t.Fatalf("current runtime variables missing: %+v", want)
 	}
 }

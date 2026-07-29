@@ -450,6 +450,13 @@ func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte
 	if err := validateStandardAuthoringSourceArchive(snapshot, coordinate); err != nil {
 		return fmt.Errorf("validate Standard authoring workspace source snapshot: %w", err)
 	}
+	return extractStandardAuthoringSourceSnapshotArchive(ctx, snapshot, workspace)
+}
+
+func extractStandardAuthoringSourceSnapshotArchive(ctx context.Context, snapshot []byte, workspace string) error {
+	if err := validateStandardAuthoringSourceArchiveBytes(snapshot); err != nil {
+		return fmt.Errorf("validate Standard authoring workspace source snapshot: %w", err)
+	}
 	reader := tar.NewReader(bytes.NewReader(snapshot))
 	for {
 		if err := ctx.Err(); err != nil {
@@ -533,6 +540,13 @@ func extractStandardAuthoringSourceSnapshot(ctx context.Context, snapshot []byte
 
 func verifyStandardAuthoringExtractedSnapshot(ctx context.Context, snapshot []byte, sourceRoot string, coordinate StandardAuthoringSourceCoordinate) error {
 	if err := validateStandardAuthoringSourceArchive(snapshot, coordinate); err != nil {
+		return err
+	}
+	return verifyStandardAuthoringExtractedSourceArchive(ctx, snapshot, sourceRoot)
+}
+
+func verifyStandardAuthoringExtractedSourceArchive(ctx context.Context, snapshot []byte, sourceRoot string) error {
+	if err := validateStandardAuthoringSourceArchiveBytes(snapshot); err != nil {
 		return err
 	}
 	type expectedEntry struct {

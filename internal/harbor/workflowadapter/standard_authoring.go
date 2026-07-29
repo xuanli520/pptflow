@@ -31,16 +31,18 @@ const (
 	standardAuthoringPackageAdmissionReportArtifact      = "codeedge_package_admission_report"
 	standardAuthoringPackageAdmissionReportSchemaVersion = "harbor.standard-authoring-task-package-admission.v1"
 
-	standardAuthoringCandidateSnapshotArtifact         = "candidate_snapshot"
-	standardAuthoringCandidateSnapshotSchemaVersion    = workflowkit.CandidateSnapshotFormat
-	standardAuthoringVerificationContractArtifact      = "verification_contract"
-	standardAuthoringVerificationContractSchemaVersion = "harbor.verification-contract.v1"
-	standardAuthoringValidationReceiptArtifact         = "validation_receipt"
-	standardAuthoringValidationReceiptSchemaVersion    = workflowkit.ValidationReceiptFormat
-	standardAuthoringWorkflowRepairLedgerArtifact      = "workflow_repair_ledger"
-	standardAuthoringWorkflowRepairLedgerSchemaVersion = workflowkit.WorkflowRepairLedgerFormat
-	standardAuthoringFinalAttestationArtifact          = "final_attestation"
-	standardAuthoringFinalAttestationSchemaVersion     = "harbor.standard-authoring-final-attestation.v1"
+	standardAuthoringCandidateSnapshotArtifact            = "candidate_snapshot"
+	standardAuthoringCandidateSnapshotSchemaVersion       = workflowkit.CandidateSnapshotFormat
+	standardAuthoringVerificationContractArtifact         = "verification_contract"
+	standardAuthoringVerificationContractSchemaVersion    = "harbor.verification-contract.v1"
+	standardAuthoringValidationReceiptArtifact            = "validation_receipt"
+	standardAuthoringValidationReceiptSchemaVersion       = workflowkit.ValidationReceiptFormat
+	standardAuthoringValidationRepairContextArtifact      = StandardAuthoringValidationRepairContextArtifact
+	standardAuthoringValidationRepairContextSchemaVersion = StandardAuthoringValidationRepairContextSchemaVersion
+	standardAuthoringWorkflowRepairLedgerArtifact         = "workflow_repair_ledger"
+	standardAuthoringWorkflowRepairLedgerSchemaVersion    = workflowkit.WorkflowRepairLedgerFormat
+	standardAuthoringFinalAttestationArtifact             = "final_attestation"
+	standardAuthoringFinalAttestationSchemaVersion        = "harbor.standard-authoring-final-attestation.v1"
 )
 
 var standardAuthoringStageOrder = []workflowkit.StageKey{
@@ -116,7 +118,7 @@ func standardAuthoringDependencies() map[workflowkit.StageKey][]workflowkit.Stag
 		workflowkit.StageKey(HostCandidateVerify):      {workflowkit.StageKey(AuthoringLoop)},
 		workflowkit.StageKey(TestQualityCritic):        {workflowkit.StageKey(HostCandidateVerify)},
 		workflowkit.StageKey(SolutionIntegrityCritic):  {workflowkit.StageKey(HostCandidateVerify)},
-		workflowkit.StageKey(AuthoringRepair):          {workflowkit.StageKey(TestQualityCritic), workflowkit.StageKey(SolutionIntegrityCritic)},
+		workflowkit.StageKey(AuthoringRepair):          {workflowkit.StageKey(HostCandidateVerify)},
 		workflowkit.StageKey(ContentReview):            {workflowkit.StageKey(AuthoringRepair)},
 		workflowkit.StageKey(SolutionReview):           {workflowkit.StageKey(AuthoringRepair)},
 		workflowkit.StageKey(FinalAttestation):         {workflowkit.StageKey(ContentReview), workflowkit.StageKey(SolutionReview)},
@@ -179,16 +181,17 @@ func StandardAuthoringContractStageCatalog() StageCatalog {
 			workflowkit.EffectContentMutator, 1, contentVerdicts(),
 			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion),
 			artifactInputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion),
-			artifactOutputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion)),
+			artifactOutputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion),
+			artifactOutputWithSchema(standardAuthoringValidationRepairContextArtifact, standardAuthoringValidationRepairContextSchemaVersion)),
 		stage(TestQualityCritic, StageQuality, []string{HostCandidateVerify}, "harborfactory.test_quality_critic",
-			[]workflowkit.ResourceKey{"task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{"finding/test-quality"},
+			[]workflowkit.ResourceKey{"evidence/candidate-validation"}, []workflowkit.ResourceKey{"finding/test-quality"},
 			workflowkit.EffectEvidenceOnly, 3, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema("test_quality_finding", workflowkit.WorkflowFindingFormat)),
 		stage(SolutionIntegrityCritic, StageQuality, []string{HostCandidateVerify}, "harborfactory.solution_integrity_critic",
-			[]workflowkit.ResourceKey{"task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{"finding/solution-integrity"},
+			[]workflowkit.ResourceKey{"evidence/candidate-validation"}, []workflowkit.ResourceKey{"finding/solution-integrity"},
 			workflowkit.EffectEvidenceOnly, 3, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema("solution_integrity_finding", workflowkit.WorkflowFindingFormat)),
-		stage(AuthoringRepair, StageTaskGeneration, []string{TestQualityCritic, SolutionIntegrityCritic}, "harborfactory.authoring_repair",
-			[]workflowkit.ResourceKey{"task/candidate", "finding/test-quality", "finding/solution-integrity"}, []workflowkit.ResourceKey{"task/candidate", resourceEvidenceRepair},
-			workflowkit.EffectContentMutator, StandardAuthoringRepairMaxTurns, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactInputWithSchema("test_quality_finding", workflowkit.WorkflowFindingFormat), artifactInputWithSchema("solution_integrity_finding", workflowkit.WorkflowFindingFormat), artifactOutput("instruction"), artifactOutput("task_toml"), artifactOutput("dockerfile"), artifactOutput("solve_script"), artifactOutput("test_script"), artifactOutput("tests_analysis"), artifactOutputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactOutputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema(standardAuthoringWorkflowRepairLedgerArtifact, standardAuthoringWorkflowRepairLedgerSchemaVersion)),
+		stage(AuthoringRepair, StageTaskGeneration, []string{HostCandidateVerify}, "harborfactory.authoring_repair",
+			[]workflowkit.ResourceKey{"task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{"task/candidate", resourceEvidenceRepair},
+			workflowkit.EffectContentMutator, StandardAuthoringRepairMaxTurns, contentVerdicts(), artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringVerificationContractArtifact, standardAuthoringVerificationContractSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactInputWithSchema(standardAuthoringValidationRepairContextArtifact, standardAuthoringValidationRepairContextSchemaVersion), optionalArtifactInputWithSchema("test_quality_finding", workflowkit.WorkflowFindingFormat), optionalArtifactInputWithSchema("solution_integrity_finding", workflowkit.WorkflowFindingFormat), artifactOutput("instruction"), artifactOutput("task_toml"), artifactOutput("dockerfile"), artifactOutput("solve_script"), artifactOutput("test_script"), artifactOutput("tests_analysis"), artifactOutputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactOutputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion), artifactOutputWithSchema(standardAuthoringWorkflowRepairLedgerArtifact, standardAuthoringWorkflowRepairLedgerSchemaVersion)),
 		gateStage(ContentReview, StageFinalReview, []string{AuthoringRepair}, ReviewContent,
 			[]workflowkit.ResourceKey{resourceTaskInstruction, resourceTaskMetadata, resourceTaskEnvironment, "task/candidate", "evidence/candidate-validation"}, []workflowkit.ResourceKey{resourceReviewContent},
 			artifactInput("instruction"), artifactInput("task_toml"), artifactInput("dockerfile"), artifactInput("solve_script"), artifactInput("test_script"), artifactInput("tests_analysis"), artifactInputWithSchema(standardAuthoringCandidateSnapshotArtifact, standardAuthoringCandidateSnapshotSchemaVersion), artifactInputWithSchema(standardAuthoringValidationReceiptArtifact, standardAuthoringValidationReceiptSchemaVersion)),
@@ -233,7 +236,7 @@ func standardAuthoringAttachV3AgentRoles(stages []StageDefinition) {
 
 func standardAuthoringV3RoleForStage(key workflowkit.StageKey) (workflowkit.AgentRoleID, workflowkit.WorkspaceBinding, int, bool) {
 	readSource := workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceReadOnlySnapshot, Key: "authoring-source", SnapshotArtifact: "repo_prepared"}
-	readCandidate := workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceReadOnlySnapshot, Key: "authoring-candidate", SnapshotArtifact: standardAuthoringCandidateSnapshotArtifact}
+	readCandidate := workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceReadOnlySnapshot, Key: "authoring-candidate-critic", SnapshotArtifact: standardAuthoringCandidateSnapshotArtifact}
 	writeCandidate := workflowkit.WorkspaceBinding{Mode: workflowkit.WorkspaceExclusiveWriter, Key: "authoring-candidate", SnapshotArtifact: standardAuthoringCandidateSnapshotArtifact}
 	switch key {
 	case workflowkit.StageKey(RepoStructureResearch), workflowkit.StageKey(TestRuntimeResearch), workflowkit.StageKey(VerifierThreatResearch):

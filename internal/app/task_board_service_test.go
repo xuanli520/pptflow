@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/testsupport"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 const taskBoardAuthoringTestBaseImage = "docker.io/library/rust:1.65.0-bullseye@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -570,6 +572,172 @@ func TestTaskBoardDoesNotExposeRawStageOrWorkerFailureTextWithoutDurableRecord(t
 	}
 }
 
+func TestTaskBoardOperatorSummarySeparatesValidationVerdictFromStagePass(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	capturer := &standardAuthoringSourceCapturerFixture{
+		coordinate: standardAuthoringLaunchTestCoordinate,
+		snapshot:   standardAuthoringLaunchTestSnapshot(t, standardAuthoringLaunchTestCoordinate),
+	}
+	definitions := standardAuthoringLaunchTestDefinitionProvider(t)
+	services, err := NewLifecycleServicesWithOptions(root, database, standardAuthoringLaunchTestOptions(capturer, definitions, definitions.catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.TaskBoard.actor = func() (string, error) { return "task-board-summary", nil }
+	key, err := services.TaskBoard.NewIdempotencyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := services.TaskBoard.StartAuthoring(ctx, TaskBoardStartAuthoringRequest{
+		IdempotencyKey: key,
+		RepositoryURL:  standardAuthoringLaunchTestCoordinate.RepositoryURL,
+		CommitSHA:      standardAuthoringLaunchTestCoordinate.CommitSHA,
+		BaseImage:      taskBoardAuthoringTestBaseImage,
+		Slug:           "task-board-validation-summary",
+		Title:          "Task board validation summary",
+		TaskType:       "feature",
+		Application:    "backend",
+		CodeLang:       "rust",
+		Objective:      "Exercise validation summary projection",
+		MetadataJSON:   `{}`,
+		Reason:         "start validation summary fixture",
+	})
+	if err != nil {
+		t.Fatalf("start authoring fixture: %v", err)
+	}
+	run, err := database.GetWorkflowRun(ctx, created.RunID)
+	if err != nil || run == nil {
+		t.Fatalf("load authoring run fixture = %+v, %v", run, err)
+	}
+	runValue, err := database.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning,
+		Actor: "task-board-summary", Reason: "run validation summary fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = &runValue
+	resolvedWorkflow, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(standardAuthoringLaunchTestProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.HostCandidateVerify))
+	if !found {
+		t.Fatal("Standard authoring catalog lacks host_candidate_verify")
+	}
+	inputFingerprint, err := workflowkit.FingerprintArtifactBindings(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := database.CreateStageAttempt(ctx, store.CreateStageAttemptRequest{
+		RunID: run.ID, StageKey: workflowadapter.HostCandidateVerify, StageGroup: stage.Group, Ordinal: 1,
+		InputFingerprint: string(inputFingerprint), BudgetSnapshotJSON: `{}`, RetrySnapshotJSON: `{}`,
+		Actor: "task-board-summary", Reason: "create validation summary stage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err = database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionRunning,
+		Actor: "task-board-summary", Reason: "run validation summary stage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := database.CreateNodeAttempt(ctx, store.CreateNodeAttemptRequest{
+		StageAttemptID: attempt.ID, NodeID: string(stage.Key), Generation: 0, Attempt: 1,
+		IdempotencyKey: "task-board-validation-summary-node", Actor: "task-board-summary", Reason: "create validation summary node",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err = database.TransitionNodeAttempt(ctx, store.TransitionNodeAttemptRequest{
+		NodeAttemptID: node.ID, ExpectedVersion: node.Version, Status: store.NodeAttemptRunning,
+		Actor: "task-board-summary", Reason: "run validation summary node",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err = database.TransitionNodeAttempt(ctx, store.TransitionNodeAttemptRequest{
+		NodeAttemptID: node.ID, ExpectedVersion: node.Version, Status: store.NodeAttemptCompleted,
+		Actor: "task-board-summary", Reason: "finish validation summary node",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, err := services.core.resolveWorkflowRunSubject(ctx, *run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	receipt, err := workflowkit.NewValidationReceipt(workflowkit.ValidationReceipt{
+		SnapshotDigest: workflowkit.SHA256Fingerprint([]byte("candidate rejected by tests")),
+		ContractDigest: workflowkit.SHA256Fingerprint([]byte("verification contract")),
+		Verdict:        workflowkit.ValidationReject,
+		FailureCode:    workflowkit.AgentFailureValidatorReject,
+		Diagnostics: []workflowkit.AgentCommandReport{{
+			CommandID: "oracle_verify", ExitCode: 2, TestStarted: true,
+			StdoutTail: "redacted stdout", StderrTail: "redacted stderr",
+		}},
+		IssuedAt:  now,
+		ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRaw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, _, err := persistStageEvidenceForSubject(ctx, services.core, *run, subject, attempt, node, stage, nil, []StageArtifact{{
+		Key: "validation_receipt", SchemaVersion: workflowkit.ValidationReceiptFormat,
+		Content: receiptRaw, TurnOrdinal: 1,
+	}}, "task-board-summary", "persist rejected validation receipt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err = database.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
+		StageAttemptID: attempt.ID, ExpectedVersion: attempt.Version, ExecutionStatus: store.StageExecutionCompleted,
+		Verdict: store.VerdictPass, ArtifactManifestID: manifest.ID,
+		Actor: "task-board-summary", Reason: "complete validation summary stage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := services.TaskBoard.Summary(ctx, TaskBoardRunSummaryRequest{RunID: run.ID})
+	if err != nil {
+		t.Fatalf("read TaskBoard summary: %v", err)
+	}
+	if summary.OperatorSummary == nil || summary.OperatorSummary.Status != "validation_rejected" ||
+		summary.OperatorSummary.Cause != "rejected at oracle_verify" || summary.OperatorSummary.NextAction != "repair candidate" {
+		t.Fatalf("operator summary = %+v", summary.OperatorSummary)
+	}
+	latest := summary.OperatorSummary.LatestValidation
+	if latest == nil || latest.Verdict != string(workflowkit.ValidationReject) || latest.Stage != workflowadapter.HostCandidateVerify ||
+		latest.StageAttemptID != attempt.ID || latest.StageExecutionStatus != string(store.StageExecutionCompleted) ||
+		latest.StageVerdict != string(store.VerdictPass) || latest.FailureCode != string(workflowkit.AgentFailureValidatorReject) ||
+		latest.FailedStep != "oracle_verify" || latest.ExitCode != 2 || !latest.TestStarted {
+		t.Fatalf("latest validation summary = %+v", latest)
+	}
+	snapshot, err := services.TaskBoard.List(ctx)
+	if err != nil {
+		t.Fatalf("list TaskBoard with validation summary: %v", err)
+	}
+	task := taskBoardTaskByID(t, snapshot, created.TaskID)
+	if task.OperatorSummary == nil || task.OperatorSummary.Status != "validation_rejected" || task.OperatorSummary.LatestValidation == nil ||
+		task.OperatorSummary.LatestValidation.StageExecutionStatus != string(store.StageExecutionCompleted) ||
+		task.OperatorSummary.LatestValidation.StageVerdict != string(store.VerdictPass) {
+		t.Fatalf("task operator summary = %+v", task.OperatorSummary)
+	}
+}
+
 func TestTaskBoardProjectsAndAdoptsVerifiedEvaluatorEvidence(t *testing.T) {
 	ctx := context.Background()
 	fixture := newCodeEdgeComplianceFixture(t, codeEdgeComplianceFixtureOptions{stopBeforeHandoff: true})
@@ -856,16 +1024,7 @@ func newTaskBoardEvaluatorLaunchFixture(t *testing.T, ctx context.Context) taskB
 		t.Fatal(err)
 	}
 	services.TaskBoard.actor = func() (string, error) { return "task-board-evaluator", nil }
-	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
-		CreateDraftTaskRequest: CreateDraftTaskRequest{
-			Slug: "task-board-evaluator-launch", Title: "Task Board Evaluator Launch", Actor: "task-board-evaluator", Reason: "create evaluator launch fixture",
-		},
-		SourceDirectory: writeLifecycleSnapshot(t, "TaskBoard evaluator launch fixture\n"),
-		ChangeSummary:   "create immutable evaluator launch fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task, revision := createStandardMaterializedLifecycleTask(t, ctx, services, "task-board-evaluator-launch", "Task Board Evaluator Launch", "TaskBoard evaluator launch fixture\n")
 	provider.spec = testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	parent, err := services.Runs.StartRun(ctx, StartRunRequest{
 		TaskID: task.ID, RevisionID: revision.ID,

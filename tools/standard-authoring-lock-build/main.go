@@ -177,6 +177,17 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 		if err != nil {
 			return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q schema asset: %w", registration.Stage.Key, err)
 		}
+		additionalSchemas := make([]stageprovider.StandardAuthoringContractAdditionalSchemaLock, 0, len(entry.AdditionalSchemas))
+		for _, reference := range entry.AdditionalSchemas {
+			fingerprint, err := fingerprintContractAsset(config.contractRoot, reference)
+			if err != nil {
+				return stageprovider.DeploymentOperationCatalogLock{}, fmt.Errorf("stage %q additional schema asset: %w", registration.Stage.Key, err)
+			}
+			additionalSchemas = append(additionalSchemas, stageprovider.StandardAuthoringContractAdditionalSchemaLock{
+				StandardAuthoringContractAssetReference: reference,
+				ContentSHA256:                           fingerprint,
+			})
+		}
 		secrets := make([]workflowadapter.SecretReference, len(registration.Secrets))
 		copy(secrets, registration.Secrets)
 		record := stageprovider.DeploymentOperationCatalogLockRecord{
@@ -191,7 +202,7 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 			ExecutionKind:            registration.Operation.Payload.Kind(),
 			StandardAuthoringContract: &stageprovider.StandardAuthoringContractLock{
 				Format: stageprovider.StandardAuthoringContractLockFormat, Version: stageprovider.StandardAuthoringContractLockVersion,
-				Prompt: entry.Prompt, Schema: entry.Schema,
+				Prompt: entry.Prompt, Schema: entry.Schema, AdditionalSchemas: additionalSchemas,
 			},
 		}
 		switch payload := registration.Operation.Payload.(type) {

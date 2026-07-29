@@ -100,6 +100,9 @@ func (contract StandardAuthoringVerificationContract) Validate() error {
 		if strings.TrimSpace(argument) == "" || len(argument) > 1024 || strings.IndexByte(argument, '\x00') >= 0 || strings.ContainsAny(argument, "\r\n") {
 			return fmt.Errorf("Standard authoring verification contract command is invalid")
 		}
+		if strings.Contains(argument, "/oracle") || strings.Contains(argument, "/workspace/source") {
+			return fmt.Errorf("Standard authoring verification contract command uses a retired runtime path")
+		}
 	}
 	if !standardAuthoringVerificationRelativePath(contract.Workdir, true) {
 		return fmt.Errorf("Standard authoring verification contract workdir is invalid")

@@ -35,6 +35,16 @@ func TestStandardAuthoringContractLockStrictlyMapsAssetsToExistingFingerprints(t
 		t.Fatalf("direct strict parse: %v", err)
 	}
 
+	withAdditional := lock.Clone()
+	additional := StandardAuthoringContractAdditionalSchemaLock{
+		StandardAuthoringContractAssetReference: StandardAuthoringContractAssetReference{ID: "standard-authoring.additional-schema", Version: "1.0.0", RelativePath: "schemas/additional-schema.json"},
+		ContentSHA256:                           workflowkit.SHA256Fingerprint([]byte("additional schema")),
+	}
+	withAdditional.Operations[0].StandardAuthoringContract.AdditionalSchemas = []StandardAuthoringContractAdditionalSchemaLock{additional}
+	if err := withAdditional.Validate(); err != nil {
+		t.Fatalf("valid additional schema contract lock: %v", err)
+	}
+
 	unknownNested := []byte(strings.Replace(string(canonical), `"relative_path":"prompts/materialize-task.md"`, `"relative_path":"prompts/materialize-task.md","unexpected":true`, 1))
 	if _, err := ParseDeploymentOperationCatalogLockJSON(unknownNested); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
 		t.Fatalf("unknown Standard authoring contract field = %v, want invalid lock", err)
@@ -56,6 +66,12 @@ func TestStandardAuthoringContractLockStrictlyMapsAssetsToExistingFingerprints(t
 		"same asset conflicts with hash": func(candidate *DeploymentOperationCatalogLock) {
 			candidate.Operations[1].StandardAuthoringContract.Prompt = candidate.Operations[0].StandardAuthoringContract.Prompt.Clone()
 			candidate.Operations[1].PromptContentFingerprint = workflowkit.SHA256Fingerprint([]byte("different prompt bytes"))
+		},
+		"additional schema conflicts with hash": func(candidate *DeploymentOperationCatalogLock) {
+			candidate.Operations[0].StandardAuthoringContract.AdditionalSchemas = []StandardAuthoringContractAdditionalSchemaLock{additional}
+			conflict := additional.Clone()
+			conflict.ContentSHA256 = workflowkit.SHA256Fingerprint([]byte("different additional schema"))
+			candidate.Operations[1].StandardAuthoringContract.AdditionalSchemas = []StandardAuthoringContractAdditionalSchemaLock{conflict}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -1166,6 +1166,7 @@ func newRunCommandV2(config *lifecycleCLIConfig) *cobra.Command {
 		newRunStartCommand(config),
 		newRunEvaluateCommand(config),
 		newRunShowCommand(config),
+		newRunSummaryCommand(config),
 		newRunListCommand(config),
 		newRunPauseCommand(config),
 		newRunCancelStageCommand(config),
@@ -1561,6 +1562,32 @@ func newRunShowCommand(config *lifecycleCLIConfig) *cobra.Command {
 			}
 			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
 				return services.Runs.Get(ctx, id)
+			})
+		},
+	}
+	command.Flags().StringVar(&runID, "run", "", "Run UUIDv7")
+	return command
+}
+
+func newRunSummaryCommand(config *lifecycleCLIConfig) *cobra.Command {
+	var runID string
+	command := &cobra.Command{
+		Use:   "summary",
+		Short: "Show the operator-facing summary for one workflow run",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			id, err := requiredText("run", runID)
+			if err != nil {
+				return err
+			}
+			if err := store.ValidateUUIDv7(id); err != nil {
+				return fmt.Errorf("run must be a UUIDv7: %w", err)
+			}
+			return executeLifecycleReadOnlyCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+				if services.TaskBoard == nil {
+					return nil, fmt.Errorf("task board summary service is not configured")
+				}
+				return services.TaskBoard.Summary(ctx, app.TaskBoardRunSummaryRequest{RunID: id})
 			})
 		},
 	}

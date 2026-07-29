@@ -68,7 +68,8 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 	assets := make(map[workflowkit.StageKey]StandardAuthoringContractAssetManifestEntry, len(manifest.Operations))
 	for _, entry := range manifest.Operations {
 		assets[entry.StageKey] = entry
-		for _, asset := range []StandardAuthoringContractAssetReference{entry.Prompt, entry.Schema} {
+		stageAssets := append([]StandardAuthoringContractAssetReference{entry.Prompt, entry.Schema}, entry.AdditionalSchemas...)
+		for _, asset := range stageAssets {
 			info, err := os.Lstat(filepath.Join(deploymentRoot, filepath.FromSlash(asset.RelativePath)))
 			if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 				t.Fatalf("asset %q is not a regular non-symlink file: info=%v error=%v", asset.RelativePath, info, err)
@@ -111,6 +112,9 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) && (!strings.Contains(joined, "exactly one candidate-validation opportunity") || !strings.Contains(joined, "do not call the tool again until the next prompt")) {
 			t.Fatal("repair prompt does not preserve one validation round per agent turn")
 		}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) && (!strings.Contains(joined, "validation_repair_context") || !strings.Contains(joined, "critic findings are optional")) {
+			t.Fatal("repair prompt does not make validation_repair_context the primary repair input")
+		}
 		stage, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(registration.Stage.Key)
 		if !found || stage.AgentRole == nil {
 			t.Fatalf("agent stage %q has no frozen agent role", registration.Stage.Key)
@@ -126,6 +130,9 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		}
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskSynthesis) && (!strings.Contains(joined, "harbor.verification-contract.v1") || !strings.Contains(joined, "exactly these six keys") || !strings.Contains(joined, "never `schema_version`")) {
 			t.Fatalf("task-synthesis prompt does not require the canonical host verification contract")
+		}
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.TaskSynthesis) && (strings.Contains(joined, "/oracle/") || strings.Contains(joined, "/workspace/source") || !strings.Contains(joined, "/task/tests/test.sh")) {
+			t.Fatalf("task-synthesis prompt does not use the current validation ABI")
 		}
 
 		schemaRaw, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(entry.Schema.RelativePath)))
@@ -178,6 +185,30 @@ func TestStandardAuthoringV3MaterializationReceiptSchemaMatchesRuntimeContract(t
 	}
 	if schema.Properties.Format.Const != workflowadapter.StandardAuthoringMaterializationReceiptFormat || schema.Properties.Version.Const != workflowadapter.StandardAuthoringMaterializationReceiptVersion {
 		t.Fatalf("materialization receipt schema contract = %q@%q, want %q@%q", schema.Properties.Format.Const, schema.Properties.Version.Const, workflowadapter.StandardAuthoringMaterializationReceiptFormat, workflowadapter.StandardAuthoringMaterializationReceiptVersion)
+	}
+}
+
+func TestStandardAuthoringV3ValidationRepairContextSchemaMatchesRuntimeContract(t *testing.T) {
+	deploymentRoot := filepath.Join(standardAuthoringDeploymentRepositoryRoot(t), "deployments", "standard-authoring")
+	raw, err := os.ReadFile(filepath.Join(deploymentRoot, "schemas", "validation-repair-context.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties struct {
+			Format struct {
+				Const string `json:"const"`
+			} `json:"format"`
+			Version struct {
+				Const string `json:"const"`
+			} `json:"version"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("decode validation repair context schema: %v", err)
+	}
+	if schema.Properties.Format.Const != workflowadapter.StandardAuthoringValidationRepairContextFormat || schema.Properties.Version.Const != workflowadapter.StandardAuthoringValidationRepairContextVersion {
+		t.Fatalf("validation repair context schema contract = %q@%q, want %q@%q", schema.Properties.Format.Const, schema.Properties.Version.Const, workflowadapter.StandardAuthoringValidationRepairContextFormat, workflowadapter.StandardAuthoringValidationRepairContextVersion)
 	}
 }
 

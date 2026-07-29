@@ -1431,12 +1431,15 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 			CommitSHA:    task.CommitSHA,
 			RunID:        task.RunID,
 			CurrentStage: task.CurrentStage,
-			RunStatus:    task.RunStatus,
-			Lifecycle:    task.LifecycleState,
-			Review:       task.Review,
-			OpenReviews:  task.OpenReviewCount,
-			Evaluator:    evaluator,
-			Runs:         make([]TaskRunItem, 0, len(task.Runs)),
+			OperatorSummary: cloneTaskBoardOperatorSummaryForTUI(
+				task.OperatorSummary,
+			),
+			RunStatus:   task.RunStatus,
+			Lifecycle:   task.LifecycleState,
+			Review:      task.Review,
+			OpenReviews: task.OpenReviewCount,
+			Evaluator:   evaluator,
+			Runs:        make([]TaskRunItem, 0, len(task.Runs)),
 		}
 		for _, run := range task.Runs {
 			var authoringEvidence *app.TaskBoardAuthoringEvidence
@@ -1458,6 +1461,7 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 				AgentTurnTranscripts:  append([]app.TaskBoardAgentTranscript(nil), run.AgentTurnTranscripts...),
 				Status:                run.Status,
 				CurrentStage:          run.CurrentStage,
+				OperatorSummary:       cloneTaskBoardOperatorSummaryForTUI(run.OperatorSummary),
 				FailureStage:          run.FailureStage,
 				FailureClass:          run.FailureClass,
 				FailureReason:         run.FailureReason,
@@ -1492,6 +1496,22 @@ func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, com
 		}
 	}
 	return pending, running, completed
+}
+
+func cloneTaskBoardOperatorSummaryForTUI(summary *app.TaskBoardOperatorSummary) *app.TaskBoardOperatorSummary {
+	if summary == nil {
+		return nil
+	}
+	copy := *summary
+	if summary.LatestValidation != nil {
+		validation := *summary.LatestValidation
+		if summary.LatestValidation.RecordedAt != nil {
+			recordedAt := summary.LatestValidation.RecordedAt.UTC()
+			validation.RecordedAt = &recordedAt
+		}
+		copy.LatestValidation = &validation
+	}
+	return &copy
 }
 
 func (m appModel) View() string {

@@ -4,10 +4,14 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +23,11 @@ import (
 )
 
 const managedTaskSnapshotInputPort = "task_snapshot"
+
+type managedRunInputMaterialization struct {
+	input  runManifestManagedInput
+	object workflowruntime.ObjectRef
+}
 
 // runManifestManagedInput is the immutable input proof embedded alongside the
 // final execution spec. The durable run_input_artifacts row repeats these
@@ -85,77 +94,156 @@ func (service *RunService) prepareManagedInitialRunInputsAt(ctx context.Context,
 	if archiveTimestamp.IsZero() {
 		return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("managed task snapshot archive timestamp is required")
 	}
-	requiresSnapshot, err := intrinsicTemplateInputPort(specification, managedTaskSnapshotInputPort)
+	requiredPorts, err := intrinsicTemplateInputPorts(specification, []string{managedTaskSnapshotInputPort, workflowadapter.CodeEdgeSourceSnapshotArtifact})
 	if err != nil {
 		return workflowadapter.RunExecutionSpec{}, nil, err
 	}
-	if !requiresSnapshot {
+	if len(requiredPorts) == 0 {
 		if len(recovered) != 0 {
 			return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("recovered run manifest declares unsupported managed inputs")
 		}
 		return specification.Clone(), nil, nil
 	}
 
-	var input runManifestManagedInput
-	if len(recovered) != 0 {
-		if len(recovered) != 1 || recovered[0].Port != managedTaskSnapshotInputPort {
-			return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("recovered run manifest has invalid managed input set")
-		}
-		input = recovered[0]
-		if err := input.validate(); err != nil {
-			return workflowadapter.RunExecutionSpec{}, nil, err
-		}
-		if input.RevisionDigest != workflowkit.SubjectDigest(revision.TaskDigest) {
-			return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("recovered managed task snapshot does not match selected TaskRevision")
-		}
-	} else {
-		id, err := store.NewUUIDv7()
-		if err != nil {
-			return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("allocate managed task snapshot input ID: %w", err)
-		}
-		input = runManifestManagedInput{
-			ID: id, Port: managedTaskSnapshotInputPort, SchemaVersion: "harbor.artifact.v1",
-			RevisionDigest: workflowkit.SubjectDigest(revision.TaskDigest),
-		}
-	}
-	object, err := materializeManagedTaskSnapshotObjectAt(ctx, service.core, revision, archiveTimestamp)
+	recoveredByPort, err := recoveredManagedInputsByPort(recovered, requiredPorts, revision)
 	if err != nil {
 		return workflowadapter.RunExecutionSpec{}, nil, err
 	}
-	if len(recovered) != 0 {
-		if input.ContentDigest != object.Digest || input.SizeBytes != object.SizeBytes {
-			return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("recovered managed task snapshot object does not match deterministic revision archive")
+	materialized := make([]managedRunInputMaterialization, 0, len(requiredPorts))
+	for _, port := range requiredPorts {
+		input, found := recoveredByPort[port]
+		if !found {
+			id, err := store.NewUUIDv7()
+			if err != nil {
+				return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("allocate managed %s input ID: %w", port, err)
+			}
+			input = runManifestManagedInput{
+				ID: id, Port: port, SchemaVersion: managedRunInputSchemaVersion(port),
+				RevisionDigest: workflowkit.SubjectDigest(revision.TaskDigest),
+			}
 		}
-	} else {
-		input.ContentDigest = object.Digest
-		input.SizeBytes = object.SizeBytes
+		object, err := materializeManagedRunInputObjectAt(ctx, service.core, revision, archiveTimestamp, port)
+		if err != nil {
+			return workflowadapter.RunExecutionSpec{}, nil, err
+		}
+		if found {
+			if input.ContentDigest != object.Digest || input.SizeBytes != object.SizeBytes || input.SchemaVersion != managedRunInputSchemaVersion(port) {
+				return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("recovered managed %s object does not match deterministic revision input", port)
+			}
+		} else {
+			input.ContentDigest = object.Digest
+			input.SizeBytes = object.SizeBytes
+		}
+		materialized = append(materialized, managedRunInputMaterialization{input: input, object: object})
 	}
-	bound, err := specification.BindManagedArtifactInput(input.Port, input.artifactReference())
-	if err != nil {
-		return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("bind managed task snapshot input: %w", err)
+	bound := specification.Clone()
+	inputs := make([]runManifestManagedInput, 0, len(materialized))
+	for _, item := range materialized {
+		next, err := bound.BindManagedArtifactInput(item.input.Port, item.input.artifactReference())
+		if err != nil {
+			return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("bind managed %s input: %w", item.input.Port, err)
+		}
+		bound = next
+		inputs = append(inputs, item.input)
 	}
-	return bound, []runManifestManagedInput{input}, nil
+	sort.Slice(inputs, func(left, right int) bool { return inputs[left].Port < inputs[right].Port })
+	return bound, inputs, nil
 }
 
 func intrinsicTemplateInputPort(specification workflowadapter.RunExecutionSpec, port string) (bool, error) {
-	template, err := workflowadapter.ResolveWorkflowTemplate(specification.Template)
+	ports, err := intrinsicTemplateInputPorts(specification, []string{port})
 	if err != nil {
 		return false, err
 	}
-	consumer := false
+	return len(ports) == 1, nil
+}
+
+func intrinsicTemplateInputPorts(specification workflowadapter.RunExecutionSpec, candidates []string) ([]string, error) {
+	template, err := workflowadapter.ResolveWorkflowTemplate(specification.Template)
+	if err != nil {
+		return nil, err
+	}
+	candidateSet := make(map[string]struct{}, len(candidates))
+	for _, port := range candidates {
+		candidateSet[port] = struct{}{}
+	}
+	consumers := make(map[string]struct{}, len(candidates))
 	for _, stage := range template.Catalog.Stages {
 		for _, output := range stage.Outputs {
-			if output.Name == port {
-				return false, nil
+			if _, tracked := candidateSet[output.Name]; tracked {
+				delete(consumers, output.Name)
+				delete(candidateSet, output.Name)
 			}
 		}
 		for _, input := range stage.Inputs {
-			if input.Name == port {
-				consumer = true
+			if _, tracked := candidateSet[input.Name]; tracked {
+				consumers[input.Name] = struct{}{}
 			}
 		}
 	}
-	return consumer, nil
+	result := make([]string, 0, len(consumers))
+	for port := range consumers {
+		result = append(result, port)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func recoveredManagedInputsByPort(recovered []runManifestManagedInput, requiredPorts []string, revision store.TaskRevision) (map[string]runManifestManagedInput, error) {
+	required := make(map[string]struct{}, len(requiredPorts))
+	for _, port := range requiredPorts {
+		required[port] = struct{}{}
+	}
+	if len(recovered) == 0 {
+		return nil, nil
+	}
+	if len(recovered) != len(required) {
+		return nil, fmt.Errorf("recovered run manifest has invalid managed input set")
+	}
+	result := make(map[string]runManifestManagedInput, len(recovered))
+	for _, input := range recovered {
+		if err := input.validate(); err != nil {
+			return nil, err
+		}
+		if _, wanted := required[input.Port]; !wanted {
+			return nil, fmt.Errorf("recovered run manifest declares unsupported managed input %q", input.Port)
+		}
+		if _, duplicate := result[input.Port]; duplicate {
+			return nil, fmt.Errorf("recovered run manifest has duplicate managed input port %q", input.Port)
+		}
+		if input.RevisionDigest != workflowkit.SubjectDigest(revision.TaskDigest) {
+			return nil, fmt.Errorf("recovered managed %s does not match selected TaskRevision", input.Port)
+		}
+		result[input.Port] = input
+	}
+	for port := range required {
+		if _, found := result[port]; !found {
+			return nil, fmt.Errorf("recovered run manifest is missing managed input %q", port)
+		}
+	}
+	return result, nil
+}
+
+func managedRunInputSchemaVersion(port string) string {
+	switch port {
+	case managedTaskSnapshotInputPort:
+		return "harbor.artifact.v1"
+	case workflowadapter.CodeEdgeSourceSnapshotArtifact:
+		return workflowadapter.CodeEdgeSourceSnapshotSchemaVersion
+	default:
+		return ""
+	}
+}
+
+func materializeManagedRunInputObjectAt(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision, archiveTimestamp time.Time, port string) (workflowruntime.ObjectRef, error) {
+	switch port {
+	case managedTaskSnapshotInputPort:
+		return materializeManagedTaskSnapshotObjectAt(ctx, core, revision, archiveTimestamp)
+	case workflowadapter.CodeEdgeSourceSnapshotArtifact:
+		return materializeManagedSourceSnapshotObject(ctx, core, revision)
+	default:
+		return workflowruntime.ObjectRef{}, fmt.Errorf("unsupported managed input port %q", port)
+	}
 }
 
 // materializeManagedTaskSnapshotObject writes the sealed revision snapshot as
@@ -221,6 +309,83 @@ func materializeManagedTaskSnapshotObjectAt(ctx context.Context, core *lifecycle
 		return workflowruntime.ObjectRef{}, fmt.Errorf("store sealed task snapshot archive: %w", err)
 	}
 	return object, nil
+}
+
+func materializeManagedSourceSnapshotObject(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision) (workflowruntime.ObjectRef, error) {
+	if core == nil || core.store == nil || core.objects == nil {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source snapshot object store is not configured")
+	}
+	source, err := managedSourceSnapshotAuthoringSource(ctx, core, revision)
+	if err != nil {
+		return workflowruntime.ObjectRef{}, err
+	}
+	if source == nil ||
+		source.SnapshotArtifactRef != source.SnapshotContentDigest || source.SnapshotSchemaVersion != workflowadapter.CodeEdgeSourceSnapshotSchemaVersion {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot source record does not match the materialized TaskRevision")
+	}
+	if _, err := standardAuthoringStoredSourceCoordinate(*source); err != nil {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot source coordinate: %w", err)
+	}
+	reference := workflowruntime.ObjectRef{Digest: workflowkit.Fingerprint(source.SnapshotContentDigest)}
+	if err := reference.Digest.Validate(); err != nil {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot digest: %w", err)
+	}
+	file, err := core.objects.Open(ctx, reference)
+	if err != nil {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("open managed source_snapshot object: %w", err)
+	}
+	defer file.Close()
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("read managed source_snapshot object: %w", err)
+	}
+	if actual := workflowkit.Fingerprint("sha256:" + hex.EncodeToString(hash.Sum(nil))); actual != reference.Digest {
+		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot object digest differs from AuthoringSource")
+	}
+	return workflowruntime.ObjectRef{Digest: reference.Digest, SizeBytes: size}, nil
+}
+
+func managedSourceSnapshotAuthoringSource(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision) (*store.AuthoringSource, error) {
+	if revision.ID == "" || revision.TaskID == "" || revision.TaskDigest == "" {
+		return nil, fmt.Errorf("managed source_snapshot requires a complete TaskRevision subject")
+	}
+	originRevision := revision
+	visited := map[string]struct{}{}
+	for {
+		if _, duplicate := visited[revision.ID]; duplicate {
+			return nil, fmt.Errorf("managed source_snapshot revision lineage contains a cycle at %s", revision.ID)
+		}
+		visited[revision.ID] = struct{}{}
+		materialization, err := core.store.GetAuthoringTaskMaterializationForRevision(ctx, revision.ID)
+		if err != nil {
+			return nil, err
+		}
+		if materialization != nil {
+			if materialization.RevisionID != revision.ID || materialization.TaskID != revision.TaskID || materialization.TaskDigest != revision.TaskDigest {
+				return nil, fmt.Errorf("managed source_snapshot materialization does not match TaskRevision %s", revision.ID)
+			}
+			source, err := core.store.GetAuthoringSource(ctx, materialization.SourceID)
+			if err != nil {
+				return nil, err
+			}
+			if source == nil || source.ID != materialization.SourceID || source.SourceFingerprint != materialization.SourceFingerprint {
+				return nil, fmt.Errorf("managed source_snapshot source record does not match the materialized TaskRevision")
+			}
+			return source, nil
+		}
+		if revision.ParentRevisionID == "" {
+			return nil, fmt.Errorf("managed source_snapshot requires a Standard authoring materialization for TaskRevision %s", originRevision.ID)
+		}
+		parent, err := core.store.GetTaskRevision(ctx, revision.ParentRevisionID)
+		if err != nil {
+			return nil, err
+		}
+		if parent == nil || parent.TaskID != originRevision.TaskID {
+			return nil, fmt.Errorf("managed source_snapshot parent revision is missing for TaskRevision %s", revision.ID)
+		}
+		revision = *parent
+	}
 }
 
 func (service *RunService) ensureRunInputArtifacts(ctx context.Context, run store.WorkflowRun, manifest runManifest) error {

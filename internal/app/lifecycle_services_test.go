@@ -383,14 +383,7 @@ func TestRunServiceResolvesOnlyTheTemplateFrozenByProfileAndExecutionSpec(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
-		CreateDraftTaskRequest: CreateDraftTaskRequest{Slug: "codeedge-template", Actor: "tester", Reason: "import fixture"},
-		SourceDirectory:        writeLifecycleSnapshot(t, "CodeEdge template selection\n"),
-		ChangeSummary:          "template selection fixture",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task, revision := createStandardMaterializedLifecycleTask(t, ctx, services, "codeedge-template", "CodeEdge Template", "CodeEdge template selection\n")
 
 	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
 	specification := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
@@ -439,6 +432,94 @@ func writeLifecycleSnapshot(t *testing.T, instruction string) string {
 	writeLifecycleFile(t, filepath.Join(root, "solution", "solve.sh"), "#!/bin/sh\nexit 0\n", 0o755)
 	writeLifecycleFile(t, filepath.Join(root, "tests", "test.sh"), "#!/bin/sh\nexit 0\n", 0o755)
 	return root
+}
+
+func createStandardMaterializedLifecycleTask(t *testing.T, ctx context.Context, services *LifecycleServices, slug, title, instruction string) (store.TaskV2, store.TaskRevision) {
+	t.Helper()
+	if services == nil || services.core == nil || services.core.store == nil || services.core.objects == nil {
+		t.Fatal("lifecycle services fixture is not configured")
+	}
+	if title == "" {
+		title = slug
+	}
+	actor := "standard-materialized-fixture"
+	sourceArchive := codeEdgePhase1ParentSourceSnapshot(t)
+	sourceObject, err := services.core.objects.PutBytes(ctx, sourceArchive)
+	if err != nil {
+		t.Fatalf("store source snapshot fixture: %v", err)
+	}
+	repositoryURL := "https://github.com/purplevoid/" + slug + ".git"
+	commitSHA := strings.Repeat("1", 40)
+	source, err := services.core.store.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
+		RepositoryURL: repositoryURL, CommitSHA: commitSHA,
+		SnapshotArtifactRef: string(sourceObject.Digest), SnapshotContentDigest: string(sourceObject.Digest),
+		SnapshotSchemaVersion: workflowadapter.CodeEdgeSourceSnapshotSchemaVersion,
+		IdempotencyKey:        "standard-source:" + slug, Actor: actor, Reason: "freeze Standard source fixture",
+	})
+	if err != nil {
+		t.Fatalf("create Standard source fixture: %v", err)
+	}
+	task, err := services.core.store.CreateTaskV2(ctx, store.CreateTaskV2Request{
+		Slug: slug, Title: title, SourceRepo: source.RepositoryURL, SourceCommit: source.CommitSHA,
+		Actor: actor, Reason: "reserve Standard draft task fixture",
+	})
+	if err != nil {
+		t.Fatalf("create Standard draft task fixture: %v", err)
+	}
+	reference := workflowadapter.StandardAuthoringCurrentTemplateReference()
+	session, err := services.core.store.CreateAuthoringSession(ctx, store.CreateAuthoringSessionRequest{
+		SourceID: source.ID, TargetTaskID: task.ID,
+		WorkflowTemplateID: reference.ID, WorkflowTemplateVersion: reference.Version,
+		SessionManifestJSON: `{"mode":"standard","fixture":true}`,
+		IdempotencyKey:      "standard-session:" + slug, Actor: actor, Reason: "freeze Standard session fixture",
+	})
+	if err != nil {
+		t.Fatalf("create Standard session fixture: %v", err)
+	}
+	run, err := services.core.store.CreateAuthoringWorkflowRun(ctx, store.CreateAuthoringWorkflowRunRequest{
+		AuthoringSessionID: session.ID,
+		WorkflowTemplateID: reference.ID, WorkflowTemplateVersion: reference.Version,
+		ResolvedProfileHash: string(workflowkit.SHA256Fingerprint([]byte("standard-profile:" + slug))),
+		DefinitionHash:      string(workflowkit.SHA256Fingerprint([]byte("standard-definition:" + slug))),
+		RunManifestJSON:     `{}`, Trigger: "standard-materialized-fixture", Actor: actor, Reason: "start Standard fixture Run",
+	})
+	if err != nil {
+		t.Fatalf("create Standard authoring Run fixture: %v", err)
+	}
+	run, err = services.core.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{
+		RunID: run.ID, ExpectedVersion: run.Version, Status: store.WorkflowRunRunning,
+		Actor: actor, Reason: "run Standard materialization fixture",
+	})
+	if err != nil {
+		t.Fatalf("transition Standard authoring Run fixture: %v", err)
+	}
+	revisionID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatalf("allocate Standard materialized revision ID: %v", err)
+	}
+	sourceDirectory := writeLifecycleSnapshot(t, instruction)
+	prepared, cleanup, err := (&RevisionService{core: services.core}).prepareSnapshot(ctx, task.ID, revisionID, sourceDirectory)
+	if err != nil {
+		t.Fatalf("prepare Standard materialized snapshot: %v", err)
+	}
+	cleanupPrepared := true
+	defer func() {
+		if cleanupPrepared {
+			cleanup()
+		}
+	}()
+	result, err := services.core.store.MaterializeAuthoringTask(ctx, store.MaterializeAuthoringTaskRequest{
+		IdempotencyKey: "standard-materialization:" + slug, AuthoringSessionID: session.ID, AuthoringRunID: run.ID,
+		ExpectedTaskVersion: task.Version, ExpectedRunVersion: run.Version,
+		RevisionID: revisionID, TaskDigest: prepared.TaskDigest, ProposalDigest: string(workflowkit.SHA256Fingerprint([]byte("standard-proposal:" + slug))),
+		ManifestID: prepared.ManifestObjectID, ChangeSummary: "materialize Standard fixture", MetadataJSON: `{}`,
+		Actor: actor, Reason: "materialize Standard fixture task",
+	})
+	if err != nil {
+		t.Fatalf("materialize Standard fixture task: %v", err)
+	}
+	cleanupPrepared = false
+	return result.Task, result.Revision
 }
 
 func writeLifecycleFile(t *testing.T, path, content string, mode os.FileMode) {

@@ -349,15 +349,53 @@ func standardAuthoringV3RepairLedger(workflow workflowkit.WorkflowDescriptor, in
 	if err != nil || !found {
 		return nil, fmt.Errorf("candidate validation identity is unavailable")
 	}
+	rawRepairContext, found := inputs[workflowadapter.StandardAuthoringValidationRepairContextArtifact]
+	if !found {
+		return nil, fmt.Errorf("validation repair context is unavailable")
+	}
+	repairContext, err := workflowadapter.ParseStandardAuthoringValidationRepairContextJSON(rawRepairContext)
+	if err != nil {
+		return nil, fmt.Errorf("validation repair context is invalid")
+	}
+	repairContextDigest := workflowkit.SHA256Fingerprint(rawRepairContext)
+	if repairContext.CandidateDigest != identity.CandidateSnapshotDigest || repairContext.ReceiptDigest != identity.ValidationReceiptDigest {
+		return nil, fmt.Errorf("validation repair context is not bound to the reviewed candidate receipt")
+	}
 	rules := []workflowkit.WorkflowRepairRule{
+		{FindingCode: "host_validation_reject", ProducingStage: workflowkit.StageKey(workflowadapter.HostCandidateVerify), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
+		{FindingCode: "host_validation_pass", ProducingStage: workflowkit.StageKey(workflowadapter.HostCandidateVerify), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: false, ConsumesCandidateRepair: false},
 		{FindingCode: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
 		{FindingCode: "solution_integrity_defect", ProducingStage: workflowkit.StageKey(workflowadapter.SolutionIntegrityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
 	}
-	entries := make([]workflowkit.WorkflowRepairLedgerEntry, 0, 2)
+	entries := make([]workflowkit.WorkflowRepairLedgerEntry, 0, 3)
 	chargedTargets := make(map[workflowkit.StageKey]struct{})
+	hostCode := "host_validation_pass"
+	if repairContext.ValidationVerdict == workflowkit.ValidationReject {
+		hostCode = "host_validation_reject"
+	}
+	hostFinding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
+		Code: hostCode, ProducingStage: workflowkit.StageKey(workflowadapter.HostCandidateVerify),
+		TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), EvidenceDigest: identity.ValidationReceiptDigest,
+		CandidateDigest: identity.CandidateSnapshotDigest, DiagnosticDigest: repairContextDigest,
+	})
+	if err != nil {
+		return nil, err
+	}
+	hostPlan, err := workflowkit.PlanWorkflowRepair(workflow, hostFinding, rules, nil)
+	if err != nil {
+		return nil, fmt.Errorf("validation repair context is not an allowed fenced repair")
+	}
+	entries = append(entries, workflowkit.WorkflowRepairLedgerEntry{Finding: hostFinding, ConsumedCandidateRound: hostPlan.CandidateRepairRound > 0})
+	if hostPlan.CandidateRepairRound > 0 {
+		chargedTargets[hostFinding.TargetWriter] = struct{}{}
+	}
 	for _, name := range []string{"test_quality_finding", "solution_integrity_finding"} {
+		rawFinding, found := inputs[name]
+		if !found {
+			continue
+		}
 		var finding workflowkit.WorkflowFinding
-		if err := standardAuthoringV3DecodeTypedInput(inputs[name], &finding); err != nil || finding.Validate() != nil {
+		if err := standardAuthoringV3DecodeTypedInput(rawFinding, &finding); err != nil || finding.Validate() != nil {
 			return nil, fmt.Errorf("finding %q is invalid", name)
 		}
 		if finding.CandidateDigest != identity.CandidateSnapshotDigest || finding.EvidenceDigest != identity.ValidationReceiptDigest || finding.DiagnosticDigest != identity.ValidationReceiptDigest {
@@ -511,17 +549,26 @@ func standardAuthoringV3ContextDocument(request workflowkit.StageExecutionReques
 	if err != nil {
 		return nil, err
 	}
+	var repairContext *workflowadapter.StandardAuthoringValidationRepairContext
+	if raw, found := inputs[workflowadapter.StandardAuthoringValidationRepairContextArtifact]; found {
+		parsed, err := workflowadapter.ParseStandardAuthoringValidationRepairContextJSON(raw)
+		if err != nil {
+			return nil, err
+		}
+		repairContext = &parsed
+	}
 	document := struct {
-		Format                      string                                          `json:"format"`
-		Version                     string                                          `json:"version"`
-		Stage                       string                                          `json:"stage"`
-		Program                     workflowkit.Fingerprint                         `json:"program_fingerprint"`
-		Inputs                      workflowkit.Fingerprint                         `json:"inputs_fingerprint"`
-		CandidateWorkspace          bool                                            `json:"candidate_workspace"`
-		CandidateValidationIdentity *standardAuthoringV3CandidateValidationIdentity `json:"candidate_validation_identity,omitempty"`
-		TerminalSubmission          standardAuthoringV3TerminalSubmission           `json:"terminal_submission"`
-		Artifacts                   []standardAuthoringV3Input                      `json:"artifacts"`
-	}{Format: "harbor.standard-authoring-v3-context.v1", Version: "1", Stage: string(request.Stage.Key), Program: program.Fingerprint, Inputs: digest, CandidateWorkspace: candidateWriter, TerminalSubmission: submission, Artifacts: entries}
+		Format                      string                                                    `json:"format"`
+		Version                     string                                                    `json:"version"`
+		Stage                       string                                                    `json:"stage"`
+		Program                     workflowkit.Fingerprint                                   `json:"program_fingerprint"`
+		Inputs                      workflowkit.Fingerprint                                   `json:"inputs_fingerprint"`
+		CandidateWorkspace          bool                                                      `json:"candidate_workspace"`
+		CandidateValidationIdentity *standardAuthoringV3CandidateValidationIdentity           `json:"candidate_validation_identity,omitempty"`
+		ValidationRepairContext     *workflowadapter.StandardAuthoringValidationRepairContext `json:"validation_repair_context,omitempty"`
+		TerminalSubmission          standardAuthoringV3TerminalSubmission                     `json:"terminal_submission"`
+		Artifacts                   []standardAuthoringV3Input                                `json:"artifacts"`
+	}{Format: "harbor.standard-authoring-v3-context.v1", Version: "1", Stage: string(request.Stage.Key), Program: program.Fingerprint, Inputs: digest, CandidateWorkspace: candidateWriter, ValidationRepairContext: repairContext, TerminalSubmission: submission, Artifacts: entries}
 	if hasCandidateValidationIdentity {
 		document.CandidateValidationIdentity = &candidateValidationIdentity
 	}
@@ -849,11 +896,12 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 		StderrTail  string `json:"stderr_tail,omitempty"`
 	}
 	response := struct {
-		Accepted    bool                         `json:"accepted"`
-		Reason      string                       `json:"reason,omitempty"`
-		Snapshot    workflowkit.Fingerprint      `json:"snapshot_digest"`
-		FailureCode workflowkit.AgentFailureCode `json:"failure_code,omitempty"`
-		Diagnostics []diagnostic                 `json:"diagnostics"`
+		Accepted      bool                                                      `json:"accepted"`
+		Reason        string                                                    `json:"reason,omitempty"`
+		Snapshot      workflowkit.Fingerprint                                   `json:"snapshot_digest"`
+		FailureCode   workflowkit.AgentFailureCode                              `json:"failure_code,omitempty"`
+		Diagnostics   []diagnostic                                              `json:"diagnostics"`
+		RepairContext *workflowadapter.StandardAuthoringValidationRepairContext `json:"validation_repair_context,omitempty"`
 	}{Accepted: accepted, Reason: reason, Snapshot: snapshot, FailureCode: receipt.FailureCode, Diagnostics: make([]diagnostic, 0, len(receipt.Diagnostics))}
 	for _, item := range receipt.Diagnostics {
 		response.Diagnostics = append(response.Diagnostics, diagnostic{
@@ -861,11 +909,27 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 			StdoutTail: item.StdoutTail, StderrTail: item.StderrTail,
 		})
 	}
+	if !accepted {
+		if repairContext, err := workflowadapter.NewStandardAuthoringValidationRepairContext(receipt, standardAuthoringV3EditableCandidatePaths()); err == nil {
+			response.RepairContext = &repairContext
+		}
+	}
 	encoded, err := json.Marshal(response)
 	if err != nil {
 		return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`)
 	}
 	return encoded
+}
+
+func standardAuthoringV3EditableCandidatePaths() []string {
+	return []string{
+		"instruction.md",
+		"task.toml",
+		authoringharness.DockerfileRelativePath,
+		authoringharness.SolveScriptRelativePath,
+		authoringharness.TestScriptRelativePath,
+		"tests_analysis.json",
+	}
 }
 
 func standardAuthoringV3StructuredToolResponse(accepted bool, reason, rejectionCode string) json.RawMessage {

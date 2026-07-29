@@ -177,6 +177,17 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 		if err != nil {
 			t.Fatal(err)
 		}
+		additionalSchemas := make([]stageprovider.StandardAuthoringContractAdditionalSchemaLock, 0, len(asset.AdditionalSchemas))
+		for _, reference := range asset.AdditionalSchemas {
+			contents, err := os.ReadFile(filepath.Join(deploymentRoot, filepath.FromSlash(reference.RelativePath)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			additionalSchemas = append(additionalSchemas, stageprovider.StandardAuthoringContractAdditionalSchemaLock{
+				StandardAuthoringContractAssetReference: reference,
+				ContentSHA256:                           workflowkit.SHA256Fingerprint(contents),
+			})
+		}
 		record := stageprovider.DeploymentOperationCatalogLockRecord{
 			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
 			Checkout: registration.Checkout, Secrets: append([]workflowadapter.SecretReference{}, registration.Secrets...),
@@ -184,7 +195,7 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 			ExecutionKind: registration.Operation.Payload.Kind(),
 			StandardAuthoringContract: &stageprovider.StandardAuthoringContractLock{
 				Format: stageprovider.StandardAuthoringContractLockFormat, Version: stageprovider.StandardAuthoringContractLockVersion,
-				Prompt: asset.Prompt, Schema: asset.Schema,
+				Prompt: asset.Prompt, Schema: asset.Schema, AdditionalSchemas: additionalSchemas,
 			},
 		}
 		switch payload := registration.Operation.Payload.(type) {

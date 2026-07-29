@@ -227,15 +227,38 @@ func (d *detailModel) currentRunFields(width int) string {
 	if !d.canCancelCurrentRun() {
 		cancel = "当前 Run 状态不可取消"
 	}
-	fields := []string{
-		detailField("Run ID", run.ID, width),
+	fields := []string{detailField("Run ID", run.ID, width)}
+	if summary := run.OperatorSummary; summary != nil {
+		fields = append(fields, detailField("业务状态", displayOperatorSummary(summary), width))
+		if validation := summary.LatestValidation; validation != nil {
+			validationStage := validation.Stage
+			if validationStage != "" {
+				validationStage = displayStageName(validationStage)
+			}
+			fields = append(fields,
+				detailField("验证结论", validation.Verdict, width),
+				detailField("验证阶段", validationStage, width),
+				detailField("阶段结果", validation.StageExecutionStatus+" / "+validation.StageVerdict, width),
+			)
+			if validation.FailureCode != "" {
+				fields = append(fields, detailField("失败码", validation.FailureCode, width))
+			}
+		}
+		if summary.Cause != "" {
+			fields = append(fields, detailField("原因", summary.Cause, width))
+		}
+		if summary.NextAction != "" {
+			fields = append(fields, detailField("下一步", summary.NextAction, width))
+		}
+	}
+	fields = append(fields,
 		detailField("状态", run.Status, width),
 		detailField("当前阶段", stage, width),
 		detailField("开始时间", formatDetailTime(run.StartedAt, &run.CreatedAt), width),
 		detailField("日志文件", logPath, width),
 		detailField(retryLabel, retry, width),
 		detailField("取消", cancel, width),
-	}
+	)
 	if evidence := run.AuthoringEvidence; evidence != nil {
 		contract := evidence.Contract
 		fields = append(fields,

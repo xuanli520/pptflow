@@ -86,7 +86,7 @@ func (executor *StandardAuthoringMaterializeExecutor) executeHostCandidateVerify
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	runtimeContract, err := NewStandardAuthoringRuntimeContractV1()
+	runtimeContract, err := NewStandardAuthoringRuntimeContractV2()
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
@@ -109,10 +109,21 @@ func (executor *StandardAuthoringMaterializeExecutor) executeHostCandidateVerify
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	artifacts := []workflowkit.StageArtifact{{Name: "validation_receipt", SchemaVersion: workflowkit.ValidationReceiptFormat, Content: receiptJSON}}
-	// A rejected receipt is structured evidence for the two critic stages, not
-	// a terminal workflow verdict. They bind findings to it before authoring_repair
-	// produces and validates a replacement candidate.
+	repairContext, err := workflowadapter.NewStandardAuthoringValidationRepairContext(receipt, standardAuthoringV3EditableFiles())
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	repairContextJSON, err := json.Marshal(repairContext)
+	if err != nil {
+		return workflowkit.StageExecutionResult{}, err
+	}
+	artifacts := []workflowkit.StageArtifact{
+		{Name: "validation_receipt", SchemaVersion: workflowkit.ValidationReceiptFormat, Content: receiptJSON},
+		{Name: workflowadapter.StandardAuthoringValidationRepairContextArtifact, SchemaVersion: workflowadapter.StandardAuthoringValidationRepairContextSchemaVersion, Content: repairContextJSON},
+	}
+	// A rejected receipt is structured evidence for repair, not a terminal
+	// workflow verdict. authoring_repair binds its next candidate to this
+	// receipt through validation_repair_context and its repair ledger.
 	return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: workflowkit.VerdictPass}, Artifacts: artifacts}, nil
 }
 

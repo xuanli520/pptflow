@@ -618,6 +618,10 @@ func validateStandardAuthoringSourceArchive(raw []byte, source StandardAuthoring
 	if _, err := source.Canonical(); err != nil {
 		return fmt.Errorf("archive source coordinate is invalid: %w", err)
 	}
+	return validateStandardAuthoringSourceArchiveBytes(raw)
+}
+
+func validateStandardAuthoringSourceArchiveBytes(raw []byte) error {
 	if len(raw) == 0 {
 		return errors.New("archive is empty")
 	}

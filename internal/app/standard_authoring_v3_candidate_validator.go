@@ -95,7 +95,7 @@ func (harness *StandardAuthoringDockerHarness) ValidateStandardAuthoringCandidat
 	if err != nil {
 		return workflowkit.ValidationReceipt{}, err
 	}
-	runtimeContract, err := NewStandardAuthoringRuntimeContractV1()
+	runtimeContract, err := NewStandardAuthoringRuntimeContractV2()
 	if err != nil {
 		return workflowkit.ValidationReceipt{}, err
 	}

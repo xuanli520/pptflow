@@ -1,0 +1,59 @@
+{
+  "$id": "harbor.standard-authoring.validation-repair-context.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "format",
+    "version",
+    "candidate_digest",
+    "receipt_digest",
+    "validation_verdict",
+    "exit_code",
+    "test_started",
+    "editable_files"
+  ],
+  "properties": {
+    "format": {"const": "harbor.standard-authoring.validation-repair-context.v1"},
+    "version": {"const": "1"},
+    "candidate_digest": {"$ref": "#/$defs/fingerprint"},
+    "receipt_digest": {"$ref": "#/$defs/fingerprint"},
+    "validation_verdict": {"enum": ["pass", "reject"], "type": "string"},
+    "failure_code": {
+      "enum": [
+        "candidate_invalid",
+        "agent_protocol",
+        "validator_reject",
+        "workspace_contract",
+        "environment_fault",
+        "infrastructure_fault",
+        "quota_exhausted"
+      ],
+      "type": "string"
+    },
+    "failed_step": {"maxLength": 128, "pattern": "^[a-z0-9_.-]+$", "type": "string"},
+    "exit_code": {"type": "integer"},
+    "test_started": {"type": "boolean"},
+    "stdout_tail": {"maxLength": 4096, "type": "string"},
+    "stderr_tail": {"maxLength": 4096, "type": "string"},
+    "editable_files": {
+      "items": {"pattern": "^(?:[^/\\\\\\u0000.][^/\\\\\\u0000]*/)*[^/\\\\\\u0000.][^/\\\\\\u0000]*$", "type": "string"},
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "fingerprint": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"validation_verdict": {"const": "pass"}}, "required": ["validation_verdict"]},
+      "then": {"not": {"required": ["failure_code"]}}
+    },
+    {
+      "if": {"properties": {"validation_verdict": {"const": "reject"}}, "required": ["validation_verdict"]},
+      "then": {"required": ["failure_code"]}
+    }
+  ]
+}

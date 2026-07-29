@@ -985,7 +985,7 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(ctx contex
 	if err != nil {
 		return "", err
 	}
-	targetRevision := store.TaskRevision{ID: candidate.TargetRevisionID, TaskID: candidate.TaskID, TaskDigest: candidate.AfterDigest, CreatedAt: archiveTimestamp}
+	targetRevision := store.TaskRevision{ID: candidate.TargetRevisionID, TaskID: candidate.TaskID, ParentRevisionID: candidate.BaseRevisionID, TaskDigest: candidate.AfterDigest, CreatedAt: archiveTimestamp}
 	finalSpecification, managedInputs, err := (&RunService{core: service.core}).prepareManagedInitialRunInputsAt(ctx, candidate.TargetRunID, targetRevision, childSpecification, recoveredInputs, archiveTimestamp)
 	if err != nil {
 		return "", err

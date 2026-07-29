@@ -19,7 +19,7 @@ import (
 
 const (
 	standardAuthoringDockerHarnessTailLimit           = 16 << 10
-	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /oracle/worktree && mkdir -p /oracle/worktree && cp -R /oracle/source/. /oracle/worktree/ && chmod -R u+rwX /oracle/worktree && test -d /oracle/worktree && probe=$(find /oracle/worktree -type f -print -quit) && test -n \"$probe\" && test -w \"$probe\" && touch /oracle/worktree/.harbor-source-access && rm /oracle/worktree/.harbor-source-access"
+	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /work/* /work/.[!.]* /work/..?* 2>/dev/null || true; mkdir -p /work && cp -R /source/. /work/ && chmod -R u+rwX /work && test -d /work && probe=$(find /work -type f -print -quit) && test -n \"$probe\" && test -w \"$probe\" && touch /work/.harbor-source-access && rm /work/.harbor-source-access && if touch /source/.harbor-source-access 2>/dev/null; then rm -f /source/.harbor-source-access; exit 126; fi"
 )
 
 var standardAuthoringDockerHarnessTokenPattern = regexp.MustCompile(`(?i)\b(?:sk|key|token)-[a-z0-9_-]{16,}\b`)
@@ -135,6 +135,17 @@ const (
 	standardAuthoringV3TestsAnalysisPath = "tests_analysis.json"
 )
 
+func standardAuthoringV3EditableFiles() []string {
+	return []string{
+		standardAuthoringV3InstructionPath,
+		standardAuthoringV3TaskTOMLPath,
+		standardAuthoringV3DockerfilePath,
+		standardAuthoringV3SolveScriptPath,
+		standardAuthoringV3TestScriptPath,
+		standardAuthoringV3TestsAnalysisPath,
+	}
+}
+
 func validateStandardAuthoringV3CandidateFiles(snapshot workflowkit.CandidateSnapshot, files map[string][]byte) error {
 	expected := map[string][]byte{
 		standardAuthoringV3InstructionPath:   files[standardAuthoringV3InstructionPath],
@@ -227,7 +238,7 @@ func (harness *StandardAuthoringDockerHarness) validateV3Candidate(ctx context.C
 		return harness.finishResult(result)
 	}
 	integrity := authoringharness.StepResult{Step: "integrity_verify", Passed: true, Findings: []string{}, OutputFingerprint: snapshot.Digest}
-	if err := validateStandardAuthoringV3SolutionDiff(filepath.Join(invocationRoot, "verification", "oracle", "workspace"), sourceRoot, verification.AllowedSolutionPaths); err != nil {
+	if err := validateStandardAuthoringV3SolutionDiff(filepath.Join(invocationRoot, "verification", "oracle", "work"), sourceRoot, verification.AllowedSolutionPaths); err != nil {
 		integrity.Passed = false
 		integrity.Findings = []string{"Oracle modified a path outside the frozen verification contract"}
 	}
@@ -315,11 +326,19 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1DockerBuildCommandID, image); err != nil || !ok {
 		return step, err
 	}
-	checkout := filepath.Join(invocationRoot, "verification", "source-access")
-	if err := ensureStandardAuthoringHarnessDirectory(filepath.Dir(checkout)); err != nil {
+	stageRoot := filepath.Join(invocationRoot, "verification", "source-access")
+	taskRoot := filepath.Join(stageRoot, "task")
+	workRoot := filepath.Join(stageRoot, "work")
+	if err := ensureStandardAuthoringHarnessDirectory(filepath.Dir(stageRoot)); err != nil {
 		return authoringharness.StepResult{}, fmt.Errorf("prepare Standard authoring source-access verification parent: %w", err)
 	}
-	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(checkout); err != nil {
+	if err := ensureStandardAuthoringHarnessDirectory(stageRoot); err != nil {
+		return authoringharness.StepResult{}, fmt.Errorf("prepare Standard authoring source-access verification root: %w", err)
+	}
+	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(taskRoot); err != nil {
+		return authoringharness.StepResult{}, err
+	}
+	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(workRoot); err != nil {
 		return authoringharness.StepResult{}, err
 	}
 	containerID, err := store.NewUUIDv7()
@@ -327,7 +346,7 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1DockerBuildCommandID,
-		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-source-access-"+containerID, standardAuthoringDockerHarnessSourceAccessProgram), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, taskRoot, sourceRoot, workRoot, "authoring-source-access-"+containerID, standardAuthoringDockerHarnessSourceAccessProgram), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -338,7 +357,7 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 		findings = append(findings, "controlled runtime source-access verification could not complete: "+standardAuthoringHarnessSafeError(runErr))
 	} else if result.ExitCode != 0 {
 		passed = false
-		findings = append(findings, "runtime cannot materialize a writable Oracle worktree from /workspace/source")
+		findings = append(findings, "runtime cannot materialize a writable worktree from /source")
 	}
 	return harness.commandStep("source_access", result, fingerprint, passed, findings), nil
 }
@@ -351,9 +370,14 @@ func (harness *StandardAuthoringDockerHarness) runV3Baseline(ctx context.Context
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1InitialVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
-	checkout := filepath.Join(invocationRoot, "verification", "initial")
-	expected, err := copyStandardAuthoringHarnessScripts(checkout, snapshotRoot, []string{authoringharness.TestScriptRelativePath})
+	stageRoot := filepath.Join(invocationRoot, "verification", "initial")
+	taskRoot := filepath.Join(stageRoot, "task")
+	workRoot := filepath.Join(stageRoot, "work")
+	expected, err := copyStandardAuthoringHarnessScripts(taskRoot, snapshotRoot, []string{authoringharness.TestScriptRelativePath})
 	if err != nil {
+		return authoringharness.StepResult{}, err
+	}
+	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(workRoot); err != nil {
 		return authoringharness.StepResult{}, err
 	}
 	containerID, err := store.NewUUIDv7()
@@ -361,7 +385,7 @@ func (harness *StandardAuthoringDockerHarness) runV3Baseline(ctx context.Context
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1InitialVerifyCommandID,
-		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-v3-initial-"+containerID, standardAuthoringV3VerificationProgram(verification, false)), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, taskRoot, sourceRoot, workRoot, "authoring-v3-initial-"+containerID, standardAuthoringV3VerificationProgram(verification, false)), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -370,7 +394,7 @@ func (harness *StandardAuthoringDockerHarness) runV3Baseline(ctx context.Context
 	if runErr != nil {
 		passed = false
 		findings = append(findings, "controlled baseline verification could not complete: "+standardAuthoringHarnessSafeError(runErr))
-	} else if err := verifyStandardAuthoringHarnessScripts(checkout, expected); err != nil {
+	} else if err := verifyStandardAuthoringHarnessScripts(taskRoot, expected); err != nil {
 		passed = false
 		findings = append(findings, "baseline verifier modified its immutable test script")
 	} else if result.ExitCode == 0 {
@@ -387,9 +411,14 @@ func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, 
 	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1OracleVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
-	checkout := filepath.Join(invocationRoot, "verification", checkoutName)
-	expected, err := copyStandardAuthoringHarnessScripts(checkout, snapshotRoot, []string{authoringharness.SolveScriptRelativePath, authoringharness.TestScriptRelativePath})
+	stageRoot := filepath.Join(invocationRoot, "verification", checkoutName)
+	taskRoot := filepath.Join(stageRoot, "task")
+	workRoot := filepath.Join(stageRoot, "work")
+	expected, err := copyStandardAuthoringHarnessScripts(taskRoot, snapshotRoot, []string{authoringharness.SolveScriptRelativePath, authoringharness.TestScriptRelativePath})
 	if err != nil {
+		return authoringharness.StepResult{}, err
+	}
+	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(workRoot); err != nil {
 		return authoringharness.StepResult{}, err
 	}
 	containerID, err := store.NewUUIDv7()
@@ -397,7 +426,7 @@ func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, 
 		return authoringharness.StepResult{}, err
 	}
 	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1OracleVerifyCommandID,
-		standardAuthoringDockerRunArgs(image.ImageTag, checkout, sourceRoot, "authoring-v3-"+checkoutName+"-"+containerID, standardAuthoringV3VerificationProgram(verification, true)), invocationRoot)
+		standardAuthoringDockerRunArgs(image.ImageTag, taskRoot, sourceRoot, workRoot, "authoring-v3-"+checkoutName+"-"+containerID, standardAuthoringV3VerificationProgram(verification, true)), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
 	}
@@ -406,7 +435,7 @@ func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, 
 	if runErr != nil {
 		passed = false
 		findings = append(findings, "controlled Oracle verification could not complete: "+standardAuthoringHarnessSafeError(runErr))
-	} else if err := verifyStandardAuthoringHarnessScripts(checkout, expected); err != nil {
+	} else if err := verifyStandardAuthoringHarnessScripts(taskRoot, expected); err != nil {
 		passed = false
 		findings = append(findings, "Oracle or verifier modified an immutable solution/test script")
 	} else if result.ExitCode != 0 {
@@ -418,10 +447,10 @@ func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, 
 
 func standardAuthoringV3VerificationProgram(verification StandardAuthoringVerificationContract, applySolution bool) string {
 	command := standardAuthoringShellJoin(verification.Command)
-	workdir := standardAuthoringShellQuote("/oracle/workspace/" + strings.TrimPrefix(verification.Workdir, "./"))
-	prepare := "rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /oracle/source/. /oracle/workspace/ && chmod -R u+rwX /oracle/workspace"
+	workdir := standardAuthoringShellQuote("/work/" + strings.TrimPrefix(verification.Workdir, "./"))
+	prepare := "rm -rf /work/* /work/.[!.]* /work/..?* 2>/dev/null || true; mkdir -p /work && cp -R /source/. /work/ && chmod -R u+rwX /work"
 	if applySolution {
-		return prepare + " && cd /oracle && sh ./solution/solve.sh && cd " + workdir + " && " + command
+		return prepare + " && cd /work && sh /task/solution/solve.sh && cd " + workdir + " && " + command
 	}
 	return prepare + " && cd " + workdir + " && " + command
 }
@@ -509,26 +538,11 @@ func standardAuthoringV3RegularFiles(root string) (map[string]workflowkit.Finger
 	return result, nil
 }
 
-// standardAuthoringDockerRunArgs exposes the attempt's frozen source to the
-// authoring verifier at the path directly beside its immutable scripts. The
-// source mount is read-only; only the verifier checkout remains writable.
-func standardAuthoringDockerRunArgs(imageTag, checkout, sourceRoot, name, shellProgram string) []string {
-	args := codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram)
-	workdirIndex := -1
-	for index, argument := range args {
-		if argument == "--workdir" {
-			workdirIndex = index
-			break
-		}
-	}
-	if workdirIndex < 0 {
-		panic("CodeEdge Docker arguments are missing --workdir")
-	}
-	sourceMount := []string{"--mount", "type=bind,src=" + sourceRoot + ",dst=/oracle/source,readonly"}
-	result := make([]string, 0, len(args)+len(sourceMount))
-	result = append(result, args[:workdirIndex]...)
-	result = append(result, sourceMount...)
-	return append(result, args[workdirIndex:]...)
+// standardAuthoringDockerRunArgs exposes immutable source and task mounts
+// through the current validation ABI. The host-owned work mount remains the
+// only writable tree so integrity checks can inspect it after Docker exits.
+func standardAuthoringDockerRunArgs(imageTag, taskRoot, sourceRoot, workRoot, name, shellProgram string) []string {
+	return codeEdgePhase1DockerRunArgs(imageTag, sourceRoot, taskRoot, workRoot, name, shellProgram)
 }
 
 func (harness *StandardAuthoringDockerHarness) reattestImage(ctx context.Context, invocationRoot, commandID string, image standardAuthoringHarnessImageReceipt) (authoringharness.StepResult, bool, error) {
@@ -577,7 +591,7 @@ func (harness *StandardAuthoringDockerHarness) outputTail(raw []byte) string {
 
 func copyStandardAuthoringHarnessScripts(checkout, snapshotRoot string, relativeFiles []string) (map[string]workflowkit.Fingerprint, error) {
 	// The checkout is nested below a per-invocation root. Keep its private
-	// parent host-owned before exposing the sticky /oracle mount root.
+	// parent host-owned before exposing the sticky task mount root.
 	if err := ensureStandardAuthoringHarnessDirectory(filepath.Dir(checkout)); err != nil {
 		return nil, fmt.Errorf("prepare Standard authoring verification parent: %w", err)
 	}

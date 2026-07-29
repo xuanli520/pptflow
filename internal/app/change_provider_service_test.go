@@ -463,14 +463,7 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	}
 	services.Changes.Register(testChangeProvider{})
 
-	task, revision, err := services.Tasks.ImportTask(ctx, ImportTaskRequest{
-		CreateDraftTaskRequest: CreateDraftTaskRequest{Slug: "codeedge-candidate-input", Actor: "tester", Reason: "import CodeEdge candidate fixture"},
-		SourceDirectory:        writeLifecycleSnapshot(t, "CodeEdge candidate source instruction\n"),
-		ChangeSummary:          "create CodeEdge candidate source revision",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task, revision := createStandardMaterializedLifecycleTask(t, ctx, services, "codeedge-candidate-input", "CodeEdge Candidate Input", "CodeEdge candidate source instruction\n")
 	profile := codeEdgePhase1RuntimeProfile(t)
 	profile.CandidateProviderBudget = workflowadapter.CandidateProviderBudget{
 		AttemptTimeout: 15 * time.Second,
@@ -489,10 +482,11 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	if err := decodeStrictJSON(run.RunManifestJSON, &sourceManifest); err != nil {
 		t.Fatal(err)
 	}
-	if sourceManifest.Inputs == nil || len(sourceManifest.Inputs.ManagedInputs) != 1 {
-		t.Fatalf("source managed inputs = %+v, want one task snapshot", sourceManifest.Inputs)
+	if sourceManifest.Inputs == nil || len(sourceManifest.Inputs.ManagedInputs) != 2 {
+		t.Fatalf("source managed inputs = %+v, want task and source snapshots", sourceManifest.Inputs)
 	}
-	sourceInput := sourceManifest.Inputs.ManagedInputs[0]
+	sourceTaskInput := managedInputByPort(t, sourceManifest.Inputs.ManagedInputs, managedTaskSnapshotInputPort)
+	sourceSourceInput := managedInputByPort(t, sourceManifest.Inputs.ManagedInputs, workflowadapter.CodeEdgeSourceSnapshotArtifact)
 
 	checkpoint, err := services.Continuations.CurrentCheckpoint(ctx, run.ID)
 	if err != nil {
@@ -536,8 +530,10 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	if err != nil || candidate == nil {
 		t.Fatalf("load prepared CodeEdge candidate = %+v, %v", candidate, err)
 	}
-	if preCommitInput, err := database.GetRunInputArtifactForPort(ctx, candidate.TargetRunID, managedTaskSnapshotInputPort); err != nil || preCommitInput != nil {
-		t.Fatalf("candidate child input became durable before candidate commit: %+v, %v", preCommitInput, err)
+	for _, port := range []string{managedTaskSnapshotInputPort, workflowadapter.CodeEdgeSourceSnapshotArtifact} {
+		if preCommitInput, err := database.GetRunInputArtifactForPort(ctx, candidate.TargetRunID, port); err != nil || preCommitInput != nil {
+			t.Fatalf("candidate child %s input became durable before candidate commit: %+v, %v", port, preCommitInput, err)
+		}
 	}
 
 	execution, err := services.Continuations.ExecuteTaskContinuation(ctx, plan.ID())
@@ -559,19 +555,25 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	if err := decodeStrictJSON(childRun.RunManifestJSON, &childManifest); err != nil {
 		t.Fatal(err)
 	}
-	if childManifest.Inputs == nil || len(childManifest.Inputs.ManagedInputs) != 1 {
-		t.Fatalf("child managed inputs = %+v, want one task snapshot", childManifest.Inputs)
+	if childManifest.Inputs == nil || len(childManifest.Inputs.ManagedInputs) != 2 {
+		t.Fatalf("child managed inputs = %+v, want task and source snapshots", childManifest.Inputs)
 	}
-	childInput := childManifest.Inputs.ManagedInputs[0]
-	if childInput.Port != managedTaskSnapshotInputPort || childInput.ID == sourceInput.ID || childInput.ContentDigest == sourceInput.ContentDigest || childInput.RevisionDigest != workflowkit.SubjectDigest(childRevision.TaskDigest) {
-		t.Fatalf("child task snapshot did not receive fresh candidate identity/object: child=%+v source=%+v", childInput, sourceInput)
+	childTaskInput := managedInputByPort(t, childManifest.Inputs.ManagedInputs, managedTaskSnapshotInputPort)
+	childSourceInput := managedInputByPort(t, childManifest.Inputs.ManagedInputs, workflowadapter.CodeEdgeSourceSnapshotArtifact)
+	if childTaskInput.ID == sourceTaskInput.ID || childTaskInput.ContentDigest == sourceTaskInput.ContentDigest || childTaskInput.RevisionDigest != workflowkit.SubjectDigest(childRevision.TaskDigest) {
+		t.Fatalf("child task snapshot did not receive fresh candidate identity/object: child=%+v source=%+v", childTaskInput, sourceTaskInput)
 	}
-	if bytes.Contains(childManifest.ExecutionSpec, []byte(sourceInput.ID)) || bytes.Contains(childManifest.ExecutionSpec, []byte(sourceInput.ContentDigest)) {
+	if childSourceInput.ID == sourceSourceInput.ID || childSourceInput.ContentDigest != sourceSourceInput.ContentDigest || childSourceInput.RevisionDigest != workflowkit.SubjectDigest(childRevision.TaskDigest) {
+		t.Fatalf("child source snapshot did not reuse the frozen source object under a child input identity: child=%+v source=%+v", childSourceInput, sourceSourceInput)
+	}
+	if bytes.Contains(childManifest.ExecutionSpec, []byte(sourceTaskInput.ID)) || bytes.Contains(childManifest.ExecutionSpec, []byte(sourceTaskInput.ContentDigest)) {
 		t.Fatalf("child final execution spec retained a source task_snapshot binding: %s", childManifest.ExecutionSpec)
 	}
-	persisted, err := database.GetRunInputArtifactForPort(ctx, childRun.ID, managedTaskSnapshotInputPort)
-	if err != nil || persisted == nil || persisted.ID != childInput.ID || persisted.RevisionID != childRevision.ID || persisted.RevisionDigest != childRevision.TaskDigest || persisted.ContentDigest != string(childInput.ContentDigest) {
-		t.Fatalf("candidate child durable managed input = %+v, %v", persisted, err)
+	for _, input := range []runManifestManagedInput{childTaskInput, childSourceInput} {
+		persisted, err := database.GetRunInputArtifactForPort(ctx, childRun.ID, input.Port)
+		if err != nil || persisted == nil || persisted.ID != input.ID || persisted.RevisionID != childRevision.ID || persisted.RevisionDigest != childRevision.TaskDigest || persisted.ContentDigest != string(input.ContentDigest) {
+			t.Fatalf("candidate child durable managed %s input = %+v, %v", input.Port, persisted, err)
+		}
 	}
 	stage, found := childManifest.Resolved.Descriptor.Stage(workflowkit.StageKey(workflowadapter.RepoPrepare))
 	if !found {
@@ -581,12 +583,18 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	if err != nil {
 		t.Fatalf("resolve CodeEdge child root inputs: %v", err)
 	}
-	if len(bindings) != 1 || bindings[0].Name != managedTaskSnapshotInputPort || bindings[0].ArtifactID != workflowkit.ArtifactID(childInput.ID) {
+	if len(bindings) != 2 {
 		t.Fatalf("CodeEdge child root bindings = %+v", bindings)
 	}
-	content, err := newStageInputReader(database, services.core.objects, childRun, childRevision, bindings)(ctx, bindings[0])
-	if err != nil || len(content) != int(childInput.SizeBytes) {
-		t.Fatalf("read CodeEdge child task snapshot = %d bytes, %v", len(content), err)
+	for _, input := range []runManifestManagedInput{childTaskInput, childSourceInput} {
+		binding := artifactBindingByName(t, bindings, input.Port)
+		if binding.ArtifactID != workflowkit.ArtifactID(input.ID) {
+			t.Fatalf("CodeEdge child %s binding = %+v, want input %+v", input.Port, binding, input)
+		}
+		content, err := newStageInputReader(database, services.core.objects, childRun, childRevision, bindings)(ctx, binding)
+		if err != nil || len(content) != int(input.SizeBytes) {
+			t.Fatalf("read CodeEdge child %s = %d bytes, %v", input.Port, len(content), err)
+		}
 	}
 	attempts, err := database.ListStageAttemptsForRun(ctx, childRun.ID)
 	if err != nil || len(attempts) != 0 {
@@ -597,9 +605,11 @@ func TestCodeEdgeCandidateChildRunMaterializesFreshManagedTaskSnapshotAtomically
 	if err != nil || replayed.ID != execution.ID {
 		t.Fatalf("candidate child continuation replay = %+v, %v", replayed, err)
 	}
-	replayedInput, err := database.GetRunInputArtifactForPort(ctx, childRun.ID, managedTaskSnapshotInputPort)
-	if err != nil || replayedInput == nil || replayedInput.ID != childInput.ID || replayedInput.ContentDigest != string(childInput.ContentDigest) {
-		t.Fatalf("candidate child managed input replay = %+v, %v", replayedInput, err)
+	for _, input := range []runManifestManagedInput{childTaskInput, childSourceInput} {
+		replayedInput, err := database.GetRunInputArtifactForPort(ctx, childRun.ID, input.Port)
+		if err != nil || replayedInput == nil || replayedInput.ID != input.ID || replayedInput.ContentDigest != string(input.ContentDigest) {
+			t.Fatalf("candidate child managed %s input replay = %+v, %v", input.Port, replayedInput, err)
+		}
 	}
 }
 

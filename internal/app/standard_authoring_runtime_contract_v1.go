@@ -12,10 +12,16 @@ import (
 const (
 	StandardAuthoringRuntimeContractV1Format  = "harbor.standard-authoring-runtime-contract.v1"
 	StandardAuthoringRuntimeContractV1Version = "1"
+	StandardAuthoringRuntimeContractV2Format  = "harbor.standard-authoring-runtime-contract.v2"
+	StandardAuthoringRuntimeContractV2Version = "2"
 
 	standardAuthoringOracleRoot      = "/oracle"
 	standardAuthoringOracleSource    = "/oracle/source"
 	standardAuthoringOracleWorkspace = "/oracle/workspace"
+
+	standardAuthoringTaskRoot      = "/task"
+	standardAuthoringSourceRoot    = "/source"
+	standardAuthoringWorkspaceRoot = "/work"
 )
 
 // StandardAuthoringRuntimePathVariable is one of the only path variables a
@@ -26,9 +32,9 @@ type StandardAuthoringRuntimePathVariable struct {
 	Value string `json:"value"`
 }
 
-// StandardAuthoringRuntimeContractV1 fixes the controlled authoring
-// filesystem projection. Source is read-only and workspace is a fresh,
-// stage-scoped writable worktree; only the host binds either path.
+// StandardAuthoringRuntimeContractV1 is the retired /oracle validation ABI
+// kept so historical receipts can still be parsed and fingerprinted. New
+// Standard Authoring validation uses StandardAuthoringRuntimeContractV2.
 type StandardAuthoringRuntimeContractV1 struct {
 	Format        string                                 `json:"format"`
 	Version       string                                 `json:"version"`
@@ -39,8 +45,8 @@ type StandardAuthoringRuntimeContractV1 struct {
 	Fingerprint   workflowkit.Fingerprint                `json:"fingerprint"`
 }
 
-// NewStandardAuthoringRuntimeContractV1 creates the sole accepted filesystem
-// contract. There are no caller-selected path, mount, or environment fields.
+// NewStandardAuthoringRuntimeContractV1 creates the legacy filesystem
+// contract. It must not be used for new validation execution.
 func NewStandardAuthoringRuntimeContractV1() (StandardAuthoringRuntimeContractV1, error) {
 	contract := StandardAuthoringRuntimeContractV1{
 		Format: StandardAuthoringRuntimeContractV1Format, Version: StandardAuthoringRuntimeContractV1Version,
@@ -62,14 +68,95 @@ func NewStandardAuthoringRuntimeContractV1() (StandardAuthoringRuntimeContractV1
 	return contract, nil
 }
 
+// StandardAuthoringRuntimeContractV2 fixes the current validation container
+// ABI. /source and /task are immutable mounts; /work is the only writable
+// candidate worktree.
+type StandardAuthoringRuntimeContractV2 struct {
+	Format        string                                 `json:"format"`
+	Version       string                                 `json:"version"`
+	TaskRoot      string                                 `json:"task_root"`
+	SourceRoot    string                                 `json:"source_root"`
+	WorkspaceRoot string                                 `json:"workspace_root"`
+	PathVariables []StandardAuthoringRuntimePathVariable `json:"path_variables"`
+	Fingerprint   workflowkit.Fingerprint                `json:"fingerprint"`
+}
+
+// NewStandardAuthoringRuntimeContractV2 creates the only accepted filesystem
+// contract for new Standard Authoring validation.
+func NewStandardAuthoringRuntimeContractV2() (StandardAuthoringRuntimeContractV2, error) {
+	contract := StandardAuthoringRuntimeContractV2{
+		Format: StandardAuthoringRuntimeContractV2Format, Version: StandardAuthoringRuntimeContractV2Version,
+		TaskRoot: standardAuthoringTaskRoot, SourceRoot: standardAuthoringSourceRoot, WorkspaceRoot: standardAuthoringWorkspaceRoot,
+		PathVariables: []StandardAuthoringRuntimePathVariable{
+			{Name: "HARBOR_TASK_ROOT", Value: standardAuthoringTaskRoot},
+			{Name: "HARBOR_SOURCE", Value: standardAuthoringSourceRoot},
+			{Name: "HARBOR_WORKSPACE", Value: standardAuthoringWorkspaceRoot},
+		},
+	}
+	fingerprint, err := standardAuthoringRuntimeContractV2Fingerprint(contract)
+	if err != nil {
+		return StandardAuthoringRuntimeContractV2{}, err
+	}
+	contract.Fingerprint = fingerprint
+	if err := contract.Validate(); err != nil {
+		return StandardAuthoringRuntimeContractV2{}, err
+	}
+	return contract, nil
+}
+
+// Clone returns an independently owned contract.
+func (contract StandardAuthoringRuntimeContractV2) Clone() StandardAuthoringRuntimeContractV2 {
+	contract.PathVariables = append([]StandardAuthoringRuntimePathVariable(nil), contract.PathVariables...)
+	return contract
+}
+
+// Validate rejects an altered mount, unapproved HARBOR_* variable, or stale
+// fingerprint before a candidate snapshot reaches the current container ABI.
+func (contract StandardAuthoringRuntimeContractV2) Validate() error {
+	if contract.Format != StandardAuthoringRuntimeContractV2Format || contract.Version != StandardAuthoringRuntimeContractV2Version {
+		return fmt.Errorf("invalid Standard authoring runtime contract identity")
+	}
+	if contract.TaskRoot != standardAuthoringTaskRoot || contract.SourceRoot != standardAuthoringSourceRoot || contract.WorkspaceRoot != standardAuthoringWorkspaceRoot {
+		return fmt.Errorf("invalid Standard authoring runtime mount layout")
+	}
+	expected := map[string]string{
+		"HARBOR_TASK_ROOT": standardAuthoringTaskRoot,
+		"HARBOR_SOURCE":    standardAuthoringSourceRoot,
+		"HARBOR_WORKSPACE": standardAuthoringWorkspaceRoot,
+	}
+	if len(contract.PathVariables) != len(expected) {
+		return fmt.Errorf("invalid Standard authoring runtime path variable count")
+	}
+	for _, variable := range contract.PathVariables {
+		if expected[variable.Name] != variable.Value {
+			return fmt.Errorf("invalid Standard authoring runtime path variable %q", variable.Name)
+		}
+		delete(expected, variable.Name)
+	}
+	if len(expected) != 0 {
+		return fmt.Errorf("incomplete Standard authoring runtime path variables")
+	}
+	if err := contract.Fingerprint.Validate(); err != nil {
+		return fmt.Errorf("invalid Standard authoring runtime contract fingerprint: %w", err)
+	}
+	want, err := standardAuthoringRuntimeContractV2Fingerprint(contract)
+	if err != nil {
+		return err
+	}
+	if contract.Fingerprint != want {
+		return fmt.Errorf("Standard authoring runtime contract fingerprint does not match content")
+	}
+	return nil
+}
+
 // Clone returns an independently owned contract.
 func (contract StandardAuthoringRuntimeContractV1) Clone() StandardAuthoringRuntimeContractV1 {
 	contract.PathVariables = append([]StandardAuthoringRuntimePathVariable(nil), contract.PathVariables...)
 	return contract
 }
 
-// Validate rejects an altered mount, an unapproved HARBOR_* variable, or a
-// stale fingerprint before a candidate snapshot reaches a container.
+// Validate rejects an altered legacy mount, an unapproved HARBOR_* variable,
+// or a stale fingerprint before a historical receipt is trusted.
 func (contract StandardAuthoringRuntimeContractV1) Validate() error {
 	if contract.Format != StandardAuthoringRuntimeContractV1Format || contract.Version != StandardAuthoringRuntimeContractV1Version {
 		return fmt.Errorf("invalid Standard authoring runtime contract identity")
@@ -123,4 +210,22 @@ func standardAuthoringRuntimeContractV1Fingerprint(contract StandardAuthoringRun
 		return "", fmt.Errorf("encode Standard authoring runtime contract: %w", err)
 	}
 	return workflowkit.FingerprintBytes("harbor.standard-authoring-runtime-contract.v1", encoded)
+}
+
+func standardAuthoringRuntimeContractV2Fingerprint(contract StandardAuthoringRuntimeContractV2) (workflowkit.Fingerprint, error) {
+	canonical := contract.Clone()
+	canonical.Fingerprint = ""
+	sort.Slice(canonical.PathVariables, func(left, right int) bool {
+		return canonical.PathVariables[left].Name < canonical.PathVariables[right].Name
+	})
+	for _, variable := range canonical.PathVariables {
+		if strings.TrimSpace(variable.Name) == "" || strings.TrimSpace(variable.Value) == "" {
+			return "", fmt.Errorf("invalid Standard authoring runtime contract path variable")
+		}
+	}
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("encode Standard authoring runtime contract: %w", err)
+	}
+	return workflowkit.FingerprintBytes("harbor.standard-authoring-runtime-contract.v2", encoded)
 }
