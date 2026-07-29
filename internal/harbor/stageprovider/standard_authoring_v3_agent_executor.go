@@ -484,8 +484,9 @@ func standardAuthoringV3ContextDocument(request workflowkit.StageExecutionReques
 		Tool:     standardAuthoringV3SubmitOutputTool,
 		Mode:     "structured_artifacts",
 		Required: true,
-		Instructions: "Call this tool exactly once with verdict pass and one raw content artifact for every required output. " +
-			"A prose final answer never completes this stage.",
+		Instructions: "Call this tool with verdict pass and one raw content artifact for every required output. " +
+			"If the tool returns accepted:false, correct the rejected payload and call it again in the same or a later turn. " +
+			"Only an accepted:true receipt completes this stage; a prose final answer never completes it.",
 		RequiredOutputs: append([]workflowkit.ArtifactSpec(nil), request.Stage.Outputs...),
 	}
 	if candidateWriter {
@@ -600,7 +601,7 @@ func (submission *standardAuthoringV3Submission) beginTurn() {
 func (submission *standardAuthoringV3Submission) dynamicTool() agent.DynamicTool {
 	name := standardAuthoringV3SubmitOutputTool
 	schema := json.RawMessage(standardAuthoringV3AgentOutputSchemaCanonicalJSON)
-	description := "Required terminal submission for this frozen stage. A prose response never completes the stage. Call exactly once with verdict pass and one raw content artifact for every declared output, using exact output names."
+	description := "Required terminal submission for this frozen stage. A prose response never completes the stage. Call with verdict pass and one raw content artifact for every declared output, using exact output names. If accepted:false is returned, correct the payload and call again in the same or a later turn."
 	if submission.role == workflowkit.AgentRoleAuthor {
 		name = standardAuthoringV3ValidateTool
 		schema = json.RawMessage(`{"additionalProperties":false,"properties":{"verdict":{"const":"pass"}},"required":["verdict"],"type":"object"}`)
@@ -613,7 +614,7 @@ func (submission *standardAuthoringV3Submission) dynamicTool() agent.DynamicTool
 		for _, output := range submission.stage.Outputs {
 			names = append(names, output.Name)
 		}
-		description = fmt.Sprintf("Required terminal submission for this frozen stage. A prose response never completes the stage. Call exactly once with verdict pass and one raw content artifact for every declared output. Required output names: %s.", strings.Join(names, ", "))
+		description = fmt.Sprintf("Required terminal submission for this frozen stage. A prose response never completes the stage. Call with verdict pass and one raw content artifact for every declared output. If accepted:false is returned, correct the payload and call again in the same or a later turn. Required output names: %s.", strings.Join(names, ", "))
 	}
 	return agent.DynamicTool{Name: name, Description: description, InputSchema: schema, Handler: submission.handleAndRecord}
 }
@@ -706,8 +707,9 @@ func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw
 	}
 	result, err := submission.captureStructured(request)
 	if err != nil {
-		submission.lastRejectionCode = standardAuthoringV3StructuredRejectionCode(err)
-		return json.RawMessage(`{"accepted":false,"reason":"structured_output_invalid"}`), nil
+		rejectionCode := standardAuthoringV3StructuredRejectionCode(err)
+		submission.lastRejectionCode = rejectionCode
+		return standardAuthoringV3StructuredToolResponse(false, "structured_output_invalid", rejectionCode), nil
 	}
 	submission.accepted = &result
 	return json.RawMessage(`{"accepted":true}`), nil
@@ -857,6 +859,27 @@ func standardAuthoringV3ValidationToolResponse(accepted bool, reason string, sna
 	encoded, err := json.Marshal(response)
 	if err != nil {
 		return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`)
+	}
+	return encoded
+}
+
+func standardAuthoringV3StructuredToolResponse(accepted bool, reason, rejectionCode string) json.RawMessage {
+	response := struct {
+		Accepted      bool   `json:"accepted"`
+		Reason        string `json:"reason,omitempty"`
+		RejectionCode string `json:"rejection_code,omitempty"`
+		Instruction   string `json:"instruction,omitempty"`
+	}{
+		Accepted:      accepted,
+		Reason:        reason,
+		RejectionCode: rejectionCode,
+	}
+	if !accepted {
+		response.Instruction = "Correct the structured artifact payload and call harbor_submit_output again in the same or a later turn. Only an accepted:true receipt completes the stage."
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return json.RawMessage(`{"accepted":false,"reason":"structured_output_invalid"}`)
 	}
 	return encoded
 }

@@ -115,7 +115,7 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 		if !found || stage.AgentRole == nil {
 			t.Fatalf("agent stage %q has no frozen agent role", registration.Stage.Key)
 		}
-		if stage.AgentRole.RoleID != workflowkit.AgentRoleAuthor && (!strings.Contains(joined, "harbor_submit_output") || !strings.Contains(joined, `"verdict":"pass"`) || !strings.Contains(joined, "prose final answer")) {
+		if stage.AgentRole.RoleID != workflowkit.AgentRoleAuthor && (!strings.Contains(joined, "harbor_submit_output") || !strings.Contains(joined, `"verdict":"pass"`) || !strings.Contains(joined, "prose final answer") || !strings.Contains(joined, "accepted:false") || !strings.Contains(joined, "accepted:true")) {
 			t.Fatalf("non-author prompt for %q does not require the exact host submission protocol", registration.Stage.Key)
 		}
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.VerifierThreatResearch) && (!strings.Contains(joined, "verifier_threat_evidence") || !strings.Contains(joined, "findings is empty")) {

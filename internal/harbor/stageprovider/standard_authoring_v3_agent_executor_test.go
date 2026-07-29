@@ -51,9 +51,10 @@ func TestStandardAuthoringV3ExecutorPersistsRejectedSubmissionDiagnostics(t *tes
 		t.Fatalf("rejected submission transcript = %+v", completed)
 	}
 	submission := completed.Submissions[0]
-	if submission.Status != workflowkit.AgentTurnSubmissionRejected || submission.RawRequestJSON != string(raw) || submission.RejectionCode != "undeclared_output" || !json.Valid([]byte(submission.ValidationJSON)) || submission.ReceiptJSON != `{"accepted":false,"reason":"structured_output_invalid"}` {
+	if submission.Status != workflowkit.AgentTurnSubmissionRejected || submission.RawRequestJSON != string(raw) || submission.RejectionCode != "undeclared_output" || !json.Valid([]byte(submission.ValidationJSON)) {
 		t.Fatalf("rejected submission diagnostic = %+v", submission)
 	}
+	assertStandardAuthoringV3StructuredRejected(t, json.RawMessage(submission.ReceiptJSON), "structured_output_invalid", "undeclared_output")
 	var validation struct {
 		Accepted      bool   `json:"accepted"`
 		RejectionCode string `json:"rejection_code"`
@@ -298,9 +299,10 @@ func TestStandardAuthoringV3CriticSubmissionRejectsUnknownFindingFields(t *testi
 	}
 	rejected := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleCritic, "", 64<<10)
 	response, err := rejected.handle(context.Background(), invalidPayload)
-	if err != nil || string(response) != `{"accepted":false,"reason":"structured_output_invalid"}` {
+	if err != nil {
 		t.Fatalf("critic accepted finding with unknown field: %s, %v", response, err)
 	}
+	assertStandardAuthoringV3StructuredRejected(t, response, "structured_output_invalid", "typed_artifact_invalid")
 	if _, accepted := rejected.acceptedResult(); accepted {
 		t.Fatal("unknown finding field produced a durable output")
 	}
@@ -319,12 +321,12 @@ func TestStandardAuthoringV3CriticSubmissionRejectsUnknownFindingFields(t *testi
 	}
 }
 
-func TestStandardAuthoringV3TaskSynthesisRejectsNonCanonicalVerificationContract(t *testing.T) {
+func TestStandardAuthoringV3TaskSynthesisRejectsNonCanonicalVerificationContractThenAcceptsCorrection(t *testing.T) {
 	stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.TaskSynthesis))
 	if !found || stage.AgentRole == nil {
 		t.Fatal("3.0 task synthesis stage is unavailable")
 	}
-	submission := func(verificationContract string) *standardAuthoringV3Submission {
+	payloadFor := func(verificationContract string) json.RawMessage {
 		t.Helper()
 		payload, err := json.Marshal(map[string]any{
 			"verdict": "pass",
@@ -336,36 +338,46 @@ func TestStandardAuthoringV3TaskSynthesisRejectsNonCanonicalVerificationContract
 		if err != nil {
 			t.Fatal(err)
 		}
-		candidate := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleSynthesizer, "", 64<<10)
-		response, err := candidate.handle(context.Background(), payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(response) != `{"accepted":false,"reason":"structured_output_invalid"}` {
-			t.Fatalf("verification contract response = %s", response)
-		}
-		return candidate
+		return payload
 	}
 
-	if _, accepted := submission(`{"schema_version":"harbor.verification-contract.v1"}`).acceptedResult(); accepted {
+	submission := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleSynthesizer, "", 64<<10)
+	response, err := submission.handle(context.Background(), payloadFor(`{"schema_version":"harbor.verification-contract.v1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStandardAuthoringV3StructuredRejected(t, response, "structured_output_invalid", "typed_artifact_invalid")
+	if _, accepted := submission.acceptedResult(); accepted {
 		t.Fatal("legacy task-level verification object produced a durable output")
 	}
 
 	canonical := `{"format":"harbor.verification-contract.v1","version":"1","command":["sh","/oracle/tests/test.sh","wasm32-unknown-unknown"],"workdir":".","coverage_mode":"browser_wasm","allowed_solution_paths":["packages/yew-router/src/router.rs"]}`
-	payload, err := json.Marshal(map[string]any{
-		"verdict": "pass",
-		"artifacts": []map[string]string{
-			{"name": "task_specification", "content": "Yew Router task specification"},
-			{"name": "verification_contract", "content": canonical},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	acceptedSubmission := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleSynthesizer, "", 64<<10)
-	response, err := acceptedSubmission.handle(context.Background(), payload)
+	response, err = submission.handle(context.Background(), payloadFor(canonical))
 	if err != nil || string(response) != `{"accepted":true}` {
 		t.Fatalf("canonical verification contract was rejected: %s, %v", response, err)
+	}
+	if result, accepted := submission.acceptedResult(); !accepted || len(result.Artifacts) != 2 {
+		t.Fatalf("corrected verification contract did not produce a durable result: %+v accepted=%t", result, accepted)
+	}
+	response, err = submission.handle(context.Background(), payloadFor(canonical))
+	if err != nil || string(response) != `{"accepted":false,"reason":"already_accepted"}` {
+		t.Fatalf("accepted submission did not remain immutable: %s, %v", response, err)
+	}
+}
+
+func assertStandardAuthoringV3StructuredRejected(t *testing.T, response json.RawMessage, reason, rejectionCode string) {
+	t.Helper()
+	var receipt struct {
+		Accepted      bool   `json:"accepted"`
+		Reason        string `json:"reason"`
+		RejectionCode string `json:"rejection_code"`
+		Instruction   string `json:"instruction"`
+	}
+	if err := json.Unmarshal(response, &receipt); err != nil {
+		t.Fatalf("decode structured rejection response %s: %v", response, err)
+	}
+	if receipt.Accepted || receipt.Reason != reason || receipt.RejectionCode != rejectionCode || !strings.Contains(receipt.Instruction, "accepted:true") || !strings.Contains(receipt.Instruction, "same or a later turn") {
+		t.Fatalf("structured rejection response = %+v, want reason=%q rejection=%q with correction instruction", receipt, reason, rejectionCode)
 	}
 }
 
