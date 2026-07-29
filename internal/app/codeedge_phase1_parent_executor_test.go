@@ -152,17 +152,22 @@ func TestCodeEdgePhase1ParentInitialAndOracleUseSeparateControlledMounts(t *test
 	initialProgram := initialCommand.Args[len(initialCommand.Args)-1]
 	oracleProgram := oracleCommand.Args[len(oracleCommand.Args)-1]
 	if !strings.Contains(initialProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
+		!strings.Contains(initialProgram, "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config") ||
 		!strings.Contains(initialProgram, "cd /oracle/workspace") ||
 		!strings.Contains(initialProgram, "sh /oracle/tests/test.sh") ||
 		strings.Contains(initialProgram, "/oracle/solution/solve.sh") ||
 		!strings.Contains(oracleProgram, "cp -R /workspace/source/. /oracle/workspace/") ||
+		!strings.Contains(oracleProgram, "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config") ||
 		!strings.Contains(oracleProgram, "cd /oracle/workspace") ||
 		!strings.Contains(oracleProgram, "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh") {
 		t.Fatalf("controlled verifier programs = initial=%#v oracle=%#v", initialCommand.Args, oracleCommand.Args)
 	}
 	for _, command := range []CodeEdgePhase1Command{initialCommand, oracleCommand} {
-		if !containsParentArg(command.Args, "--network") || !containsParentArg(command.Args, "none") || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "/tmp:rw,noexec,nosuid,size=64m") || !containsParentArg(command.Args, "/logs:rw,noexec,nosuid,size=8m") || !containsParentArg(command.Args, "--entrypoint") || !containsParentArg(command.Args, "/bin/sh") {
+		if !containsParentArg(command.Args, "--network") || !containsParentArg(command.Args, "none") || !containsParentArg(command.Args, "--read-only") || !containsParentArg(command.Args, "/tmp:rw,exec,nosuid,size=2g") || !containsParentArg(command.Args, "/logs:rw,noexec,nosuid,size=8m") || !containsParentArg(command.Args, "--entrypoint") || !containsParentArg(command.Args, "/bin/sh") {
 			t.Fatalf("verification command missed isolation flag: %#v", command.Args)
+		}
+		if !containsParentArg(command.Args, "HOME=/tmp/harbor-home") || !containsParentArg(command.Args, "XDG_CACHE_HOME=/tmp/harbor-cache") || !containsParentArg(command.Args, "XDG_CONFIG_HOME=/tmp/harbor-config") {
+			t.Fatalf("verification command missed writable home/cache env: %#v", command.Args)
 		}
 		mount := codeEdgePhase1TestArgAfter(command.Args, "--mount")
 		if !strings.HasPrefix(mount, "type=bind,src=") || !strings.HasSuffix(mount, ",dst=/oracle") || strings.Contains(mount, ",rw") {

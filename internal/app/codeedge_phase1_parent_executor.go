@@ -1095,7 +1095,14 @@ func (executor *CodeEdgePhase1ParentExecutor) inspectDockerImage(ctx context.Con
 func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) []string {
 	return []string{
 		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+		// Rust, Node, and similar build systems execute generated helper binaries
+		// from their temporary target/cache directories. Keep /tmp ephemeral and
+		// nosuid, but allow execution so verifier failures reflect task behavior
+		// rather than the container mount policy.
+		"--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,exec,nosuid,size=2g",
+		"--env", "HOME=/tmp/harbor-home",
+		"--env", "XDG_CACHE_HOME=/tmp/harbor-cache",
+		"--env", "XDG_CONFIG_HOME=/tmp/harbor-config",
 		// CodeEdge verifiers publish their binary reward under /logs. Keep that
 		// protocol path ephemeral and constrained while the image root stays read-only.
 		"--tmpfs", "/logs:rw,noexec,nosuid,size=8m",
@@ -1109,7 +1116,7 @@ func codeEdgePhase1DockerRunArgs(imageTag, checkout, name, shellProgram string) 
 }
 
 func codeEdgePhase1VerificationProgram(applySolution bool) string {
-	prepare := "rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /workspace/source/. /oracle/workspace/ && cd /oracle/workspace"
+	prepare := "mkdir -p /tmp/harbor-home /tmp/harbor-cache /tmp/harbor-config && rm -rf /oracle/workspace && mkdir -p /oracle/workspace && cp -R /workspace/source/. /oracle/workspace/ && cd /oracle/workspace"
 	command := "sh /oracle/tests/test.sh"
 	if applySolution {
 		command = "sh /oracle/solution/solve.sh && sh /oracle/tests/test.sh"
