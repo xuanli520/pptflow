@@ -186,7 +186,7 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 			ExecutionKind: workflowadapter.StageOperationPayloadAgentTurn,
 			AgentModel: &AgentModelLock{
 				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
-				ModelVersion: "gpt-5.6-terra",
+				ModelVersion: "deepseek-v4-flash",
 			},
 			CodexAppServer: &codex,
 			StandardAuthoringContract: &StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion,

@@ -74,6 +74,7 @@ const (
 	AgentReasoningEffortMedium  AgentReasoningEffort = "medium"
 	AgentReasoningEffortHigh    AgentReasoningEffort = "high"
 	AgentReasoningEffortXHigh   AgentReasoningEffort = "xhigh"
+	AgentReasoningEffortMax     AgentReasoningEffort = "max"
 )
 
 // Validate accepts an empty value only for decoding historical frozen
@@ -81,7 +82,7 @@ const (
 // compositions must require a concrete effort before they can execute.
 func (effort AgentReasoningEffort) Validate() error {
 	switch effort {
-	case "", AgentReasoningEffortMinimal, AgentReasoningEffortLow, AgentReasoningEffortMedium, AgentReasoningEffortHigh, AgentReasoningEffortXHigh:
+	case "", AgentReasoningEffortMinimal, AgentReasoningEffortLow, AgentReasoningEffortMedium, AgentReasoningEffortHigh, AgentReasoningEffortXHigh, AgentReasoningEffortMax:
 		return nil
 	default:
 		return fmt.Errorf("%w: agent reasoning effort %q is unsupported", errInvalidExecutionSpec, effort)

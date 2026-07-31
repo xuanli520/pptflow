@@ -65,7 +65,7 @@ A future lock-backed attestor must, immediately before each operation:
    and both complete plugin version outputs match before Docker-dependent
    stages; and
 4. verify the Codex App Server launcher, Node, `CODEX_HOME`, model
-   `gpt-5.6-terra` with `xhigh` reasoning effort, read-only sandbox,
+   `deepseek-v4-flash` with `max` reasoning effort, read-only sandbox,
    and disabled network policy through the existing typed Codex attestor
    before an `agent.turn`.
 
