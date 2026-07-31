@@ -61,7 +61,7 @@ func IsStandardAuthoringProtocolFailure(code string) bool {
 	}
 }
 
-const standardAuthoringV3AgentOutputSchemaCanonicalJSON = `{"$id":"harbor.standard-authoring-v3-agent-output.v1","$schema":"http://json-schema.org/draft-07/schema#","oneOf":[{"additionalProperties":false,"properties":{"verdict":{"const":"pass"}},"required":["verdict"],"type":"object"},{"additionalProperties":false,"properties":{"artifacts":{"items":{"additionalProperties":false,"properties":{"content":{"type":"string"},"name":{"type":"string"}},"required":["name","content"],"type":"object"},"minItems":1,"type":"array"},"verdict":{"const":"pass"}},"required":["verdict","artifacts"],"type":"object"}]}`
+const standardAuthoringV3AgentOutputSchemaCanonicalJSON = `{"$id":"harbor.standard-authoring-v3-agent-output.v1","$schema":"http://json-schema.org/draft-07/schema#","type":"object","oneOf":[{"additionalProperties":false,"properties":{"verdict":{"const":"pass"}},"required":["verdict"],"type":"object"},{"additionalProperties":false,"properties":{"artifacts":{"items":{"additionalProperties":false,"properties":{"content":{"type":"string"},"name":{"type":"string"}},"required":["name","content"],"type":"object"},"minItems":1,"type":"array"},"verdict":{"const":"pass"}},"required":["verdict","artifacts"],"type":"object"}]}`
 
 // ValidateStandardAuthoringV3AgentOutputSchemaAsset accepts the single
 // raw-content schema pinned for 3.0 Agent submissions. It deliberately has
