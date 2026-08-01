@@ -54,14 +54,20 @@ func TestStandardAuthoringV3TopologySchedulesParallelResearchAndCritics(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Batches) < 5 {
+	if len(plan.Batches) < 6 {
 		t.Fatalf("3.0 schedule = %#v", plan.Batches)
 	}
 	if !scheduleContainsBatch(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(RepoStructureResearch), workflowkit.NodeID(TestRuntimeResearch), workflowkit.NodeID(VerifierThreatResearch)}) {
 		t.Fatalf("schedule omitted concurrent research batch: %#v", plan.Batches)
 	}
-	if !scheduleContainsBatch(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(TestQualityCritic), workflowkit.NodeID(SolutionIntegrityCritic), workflowkit.NodeID(AuthoringRepair)}) {
-		t.Fatalf("schedule omitted concurrent critic/repair batch: %#v", plan.Batches)
+	if !scheduleContainsBatch(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(TestQualityCritic), workflowkit.NodeID(SolutionIntegrityCritic)}) {
+		t.Fatalf("schedule omitted concurrent critic batch: %#v", plan.Batches)
+	}
+	if !scheduleContainsBatch(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(AuthoringRepair)}) {
+		t.Fatalf("schedule omitted repair batch after critics: %#v", plan.Batches)
+	}
+	if !batchAfter(plan.Batches, []workflowkit.NodeID{workflowkit.NodeID(TestQualityCritic), workflowkit.NodeID(SolutionIntegrityCritic)}, []workflowkit.NodeID{workflowkit.NodeID(AuthoringRepair)}) {
+		t.Fatalf("repair batch must follow critic batch so findings are frozen into its input fingerprint: %#v", plan.Batches)
 	}
 	policy := template.QuotaPolicy
 	for _, limit := range policy.AccountLimits {
@@ -78,4 +84,17 @@ func scheduleContainsBatch(batches []workflowkit.ScheduleBatch, wanted []workflo
 		}
 	}
 	return false
+}
+
+func batchAfter(batches []workflowkit.ScheduleBatch, earlier, later []workflowkit.NodeID) bool {
+	earlierIndex, laterIndex := -1, -1
+	for index, batch := range batches {
+		if reflect.DeepEqual(batch.NodeIDs, earlier) {
+			earlierIndex = index
+		}
+		if reflect.DeepEqual(batch.NodeIDs, later) {
+			laterIndex = index
+		}
+	}
+	return earlierIndex >= 0 && laterIndex > earlierIndex
 }
