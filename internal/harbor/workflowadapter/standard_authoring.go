@@ -19,12 +19,12 @@ const (
 	standardAuthoringCatalogVersion = StandardAuthoringContractTemplateVersion
 
 	StandardAuthoringAuthoringLoopMaxTurns = 3
-	// StandardAuthoringRepairMaxTurns bounds the repair conversation. The
-	// authoring repair agent has repeatedly demonstrated one-validation-per-turn
-	// turn burn (calling harbor_validate_candidate again inside a rejected
-	// turn), so the bound must leave room for several real validation rounds
-	// after the protocol rejects the redundant in-turn attempts.
-	StandardAuthoringRepairMaxTurns        = 12
+	// StandardAuthoringRepairMaxTurns bounds the repair conversation and its
+	// total candidate-validation budget. The repair agent may validate again
+	// within the same turn after a rejected receipt, so one turn can carry
+	// several validation rounds; the bound is a hard ceiling on both turns and
+	// total validation attempts.
+	StandardAuthoringRepairMaxTurns = 8
 	// Kept as a source-compatible name for callers that only need the bounded
 	// authoring conversation limit. The retired task_design stage itself is not
 	// present in the 3.0 catalog.

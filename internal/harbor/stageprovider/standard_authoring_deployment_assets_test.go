@@ -46,8 +46,8 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 	if !found {
 		t.Fatal("production execution profile omits authoring_repair budget")
 	}
-	if repairBudget.MaxTurns != 12 || repairBudget.TurnTimeout != 90*time.Minute || repairBudget.AttemptTimeout != 18*time.Hour+30*time.Minute || repairBudget.MaxElapsed != 18*time.Hour+30*time.Minute {
-		t.Fatalf("authoring_repair budget = %+v, want twelve 90-minute turns with an 18h30m attempt window", repairBudget)
+	if repairBudget.MaxTurns != 8 || repairBudget.TurnTimeout != 90*time.Minute || repairBudget.AttemptTimeout != 12*time.Hour+30*time.Minute || repairBudget.MaxElapsed != 12*time.Hour+30*time.Minute {
+		t.Fatalf("authoring_repair budget = %+v, want eight 90-minute turns with a 12h30m attempt window", repairBudget)
 	}
 
 	manifestRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
@@ -120,8 +120,8 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 				!strings.Contains(joined, "limited /tmp")) {
 			t.Fatalf("author prompt for %q does not expose the validation environment and Cargo/browser-wasm runtime contract", registration.Stage.Key)
 		}
-		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) && (!strings.Contains(joined, "exactly one candidate-validation opportunity") || !strings.Contains(joined, "do not call the tool again until the next prompt")) {
-			t.Fatal("repair prompt does not preserve one validation round per agent turn")
+		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) && (!strings.Contains(joined, "same turn") || strings.Contains(joined, "until the next prompt") || strings.Contains(joined, "at most once in this turn")) {
+			t.Fatal("repair prompt does not permit same-turn validation retries")
 		}
 		if registration.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) && (!strings.Contains(joined, "validation_repair_context") || !strings.Contains(joined, "critic findings are optional")) {
 			t.Fatal("repair prompt does not make validation_repair_context the primary repair input")
