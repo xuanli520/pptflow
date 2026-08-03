@@ -11,6 +11,13 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
+// standardAuthoringValidationReceiptTTL bounds how long a host validation
+// receipt remains current after it is issued. The final attestation admits a
+// receipt only while it is still current, and that boundary is reached after
+// the human content and solution review gates, so the TTL must comfortably
+// cover the operator review window rather than only the validator run.
+const standardAuthoringValidationReceiptTTL = 2 * time.Hour
+
 // standardAuthoringV3CandidateValidator is created by the host after it has
 // read frozen artifact bindings. Its file bytes and Run identity are not tool
 // inputs, so CandidateValidator retains its narrow snapshot-and-contract API.
@@ -45,7 +52,7 @@ func (validator standardAuthoringV3CandidateValidator) ValidateCandidate(ctx con
 	receipt := workflowkit.ValidationReceipt{
 		SnapshotDigest: snapshot.Digest, ContractDigest: contractDigest,
 		Verdict: workflowkit.ValidationPass, Diagnostics: standardAuthoringV3ReceiptDiagnostics(result),
-		IssuedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		IssuedAt: now, ExpiresAt: now.Add(standardAuthoringValidationReceiptTTL),
 	}
 	if !result.Passed {
 		receipt.Verdict = workflowkit.ValidationReject
