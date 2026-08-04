@@ -130,8 +130,13 @@ func TestDetailShowsDurableFailureRecordAndRecoveryAction(t *testing.T) {
 	detail.task.Runs[0].FailureRecoveryAction = app.TaskBoardFailureRecoveryRepairOrNewRun
 	detail.task.Runs[0].CanRedrive = false
 	rendered = ansi.Strip(detail.View(132, 40))
-	if strings.Contains(rendered, "redrive") || !strings.Contains(rendered, "修复或新建运行") {
+	if strings.Contains(rendered, "redrive") || !strings.Contains(rendered, "run restart 重跑") {
 		t.Fatalf("terminal failure recovery detail =\n%s", rendered)
+	}
+	detail.task.Runs[0].CanRetry = true
+	rendered = ansi.Strip(detail.View(132, 40))
+	if !strings.Contains(rendered, "按 t 断点恢复") {
+		t.Fatalf("recoverable failure recovery detail =\n%s", rendered)
 	}
 }
 

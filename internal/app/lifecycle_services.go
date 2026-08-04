@@ -1078,6 +1078,7 @@ type runManifest struct {
 	ExecutionSpec                 json.RawMessage                                       `json:"execution_spec,omitempty"`
 	DeploymentCatalogReceipt      json.RawMessage                                       `json:"deployment_catalog_receipt,omitempty"`
 	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity `json:"deployment_catalog_lock_identity,omitempty"`
+	RestartOfRunID                string                                                `json:"restart_of_run_id,omitempty"`
 	Created                       time.Time                                             `json:"created_at"`
 }
 

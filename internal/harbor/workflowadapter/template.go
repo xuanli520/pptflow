@@ -132,11 +132,18 @@ func (budget CandidateProviderBudget) LeaseTTL() (time.Duration, error) {
 	return budget.AttemptTimeout, nil
 }
 
-// RequiredContinuationPlanTTL is the confirmed lifetime of a frozen
+// RequiredContinuationPlanTTL is the default lifetime of a frozen
 // continuation plan. It is intentionally a versioned ExecutionProfile field
 // rather than a service default, so every Run manifest preserves the policy
 // used when its plan was created.
 const RequiredContinuationPlanTTL = 24 * time.Hour
+
+// MaxContinuationPlanTTL bounds how long a frozen continuation plan may stay
+// executable. Authoring recovery plans default to a seven-day window so an
+// operator-paced review or infra outage does not turn the plan stale; the
+// bound keeps a misconfigured profile from freezing an unbounded recovery
+// capability.
+const MaxContinuationPlanTTL = 7 * 24 * time.Hour
 
 // Clone returns an independent stage budget.
 func (budget StageBudget) Clone() StageBudget {
@@ -195,8 +202,8 @@ func (profile ExecutionProfile) validateLocal() error {
 	if strings.TrimSpace(profile.Version) == "" {
 		return fmt.Errorf("%w: execution profile version is required", errInvalidCatalog)
 	}
-	if profile.ContinuationPlanTTL != RequiredContinuationPlanTTL {
-		return fmt.Errorf("%w: continuation plan TTL must be exactly %s", errInvalidCatalog, RequiredContinuationPlanTTL)
+	if profile.ContinuationPlanTTL <= 0 || profile.ContinuationPlanTTL > MaxContinuationPlanTTL {
+		return fmt.Errorf("%w: continuation plan TTL must be within (0, %s]", errInvalidCatalog, MaxContinuationPlanTTL)
 	}
 	if profile.ControlGracePeriod < 0 {
 		return fmt.Errorf("%w: control grace period cannot be negative", errInvalidCatalog)

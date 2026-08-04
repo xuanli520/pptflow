@@ -185,7 +185,7 @@ func resolveStageInputsForSubjectWithExplicitInputs(ctx context.Context, dataSto
 }
 
 func isAuthoringRepairOnlyInput(run store.WorkflowRun, subject workflowRunSubject, input workflowkit.ArtifactSpec) bool {
-	if input.Required || !subject.isAuthoringSession() || !isCurrentStandardAuthoringRun(run) {
+	if input.Required || !subject.isAuthoringSession() || !isAdmissibleStandardAuthoringRun(run) {
 		return false
 	}
 	switch input.Name {
@@ -235,7 +235,7 @@ func managedRunInputBindingsForStageForSubject(ctx context.Context, dataStore *s
 		if err != nil {
 			return nil, err
 		}
-		if err := validateStandardAuthoringContractBindings(specification, contract); err != nil {
+		if err := validateStandardAuthoringContractBindings(manifest.Resolved.Descriptor, specification, contract); err != nil {
 			return nil, err
 		}
 		result := make(map[string]workflowkit.ArtifactBinding)
@@ -343,7 +343,7 @@ func newStageInputReaderForSubject(dataStore *store.Store, objects *workflowrunt
 			return nil, fmt.Errorf("%w: stage input reader is not configured", ErrInvalidStageExecution)
 		}
 		if subject.isAuthoringSession() {
-			if !isCurrentStandardAuthoringRun(run) {
+			if !isAdmissibleStandardAuthoringRun(run) {
 				return nil, fmt.Errorf("%w: authoring Run is not bound to the current Standard authoring template", ErrInvalidStageExecution)
 			}
 			contract, err := standardAuthoringContractInputFromSession(ctx, objects, *subject.AuthoringSession)

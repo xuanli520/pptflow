@@ -58,7 +58,7 @@ func (runtime *FrozenExecutionRuntime) handleAuthoringReviewGateResolution(ctx c
 	if run == nil {
 		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review Run %s", ErrLifecycleNotFound, binding.RunID))
 	}
-	if !isCurrentStandardAuthoringRun(*run) {
+	if !isAdmissibleStandardAuthoringRun(*run) {
 		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: authoring review Run is not bound to the current Standard authoring template", ErrFrozenExecutionPayload))
 	}
 	if err := runtime.core.verifyRunDeploymentCatalogReceipt(*run); err != nil {

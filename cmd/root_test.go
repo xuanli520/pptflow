@@ -37,9 +37,23 @@ func TestRunCommandDoesNotExposeLegacyRetryOrCloneMutations(t *testing.T) {
 	for _, command := range run.Commands() {
 		available[command.Name()] = true
 	}
+	for _, name := range []string{"recover", "restart"} {
+		if !available[name] {
+			t.Fatalf("V2 run mutation %q is not registered: %v", name, available)
+		}
+	}
 	for _, legacy := range []string{"retry-stage", "rerun", "resume"} {
 		if available[legacy] {
 			t.Fatalf("legacy run mutation %q remained registered: %v", legacy, available)
+		}
+	}
+	recover := run.Commands()
+	for _, command := range recover {
+		if command.Name() != "recover" {
+			continue
+		}
+		if command.Flags().Lookup("idempotency-key") == nil {
+			t.Fatal("run recover is missing the --idempotency-key confirmation flag")
 		}
 	}
 }

@@ -970,9 +970,12 @@ func (service *TaskBoardService) RetryRun(ctx context.Context, request TaskBoard
 	}
 	switch run.SubjectKind {
 	case store.WorkflowRunSubjectTaskRevision:
-		return service.retryTaskRevisionRun(ctx, prepared, actor)
+		return service.retryTaskRevisionRun(ctx, prepared, actor, request.ExpectedRecoveryCheckpoint, request.ExpectedRecoveryPlanFingerprint)
 	case store.WorkflowRunSubjectAuthoringSession:
-		return service.retryStandardProtocolStage(ctx, prepared, actor, request.ExpectedStandardProtocolRetry)
+		if request.ExpectedStandardProtocolRetry != nil {
+			return service.retryStandardProtocolStage(ctx, prepared, actor, request.ExpectedStandardProtocolRetry)
+		}
+		return service.retryAuthoringRun(ctx, prepared, actor, request.ExpectedRecoveryCheckpoint, request.ExpectedRecoveryPlanFingerprint)
 	default:
 		return TaskBoardMutation{}, fmt.Errorf("Run %s has no retry contract", prepared.RunID)
 	}
@@ -1058,7 +1061,7 @@ func (service *TaskBoardService) PreviewRunRecovery(ctx context.Context, request
 	var plan workflowkit.ContinuationPlan
 	strategy := taskBoardRetryStrategy(run)
 	switch run.SubjectKind {
-	case store.WorkflowRunSubjectTaskRevision:
+	case store.WorkflowRunSubjectTaskRevision, store.WorkflowRunSubjectAuthoringSession:
 		if service.continuations == nil {
 			return TaskBoardRecoveryPreview{}, fmt.Errorf("task board continuation service is not configured")
 		}
@@ -1077,8 +1080,6 @@ func (service *TaskBoardService) PreviewRunRecovery(ctx context.Context, request
 		if err != nil {
 			return TaskBoardRecoveryPreview{}, err
 		}
-	case store.WorkflowRunSubjectAuthoringSession:
-		return TaskBoardRecoveryPreview{}, fmt.Errorf("Standard authoring 3.0 runs have no recovery plan")
 	default:
 		return TaskBoardRecoveryPreview{}, fmt.Errorf("Run %s has no recovery preview contract", request.RunID)
 	}
@@ -1155,13 +1156,33 @@ func (service *TaskBoardService) RetryAuthoringLaunch(ctx context.Context, reque
 	return TaskBoardMutation{OperationID: receipt.OperationID, TaskID: receipt.TaskID, RunID: receipt.RunID, Summary: receipt.Summary}, nil
 }
 
-func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string) (TaskBoardMutation, error) {
+func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string, expectedCheckpoint *workflowkit.CheckpointRef, expectedPlanFingerprint workflowkit.Fingerprint) (TaskBoardMutation, error) {
+	return service.continueRunRecovery(ctx, prepared, actor, expectedCheckpoint, expectedPlanFingerprint)
+}
+
+// retryAuthoringRun resumes a pre-materialization authoring Run from its
+// frozen source/session checkpoint. The confirmation replays the preview
+// fence: the durable plan must still match the checkpoint and semantic plan
+// fingerprint the operator saw, otherwise the run changed underneath the
+// action and the retry is rejected instead of silently rebinding.
+func (service *TaskBoardService) retryAuthoringRun(ctx context.Context, prepared preparedTaskBoardRunAction, actor string, expectedCheckpoint *workflowkit.CheckpointRef, expectedPlanFingerprint workflowkit.Fingerprint) (TaskBoardMutation, error) {
+	return service.continueRunRecovery(ctx, prepared, actor, expectedCheckpoint, expectedPlanFingerprint)
+}
+
+// continueRunRecovery is the subject-neutral confirmation path shared by task
+// revisions and authoring sessions. It revalidates the previewed checkpoint
+// and semantic plan fingerprint, freezes a durable continuation command, and
+// re-queues the failed stage plus any unfinished downstream stages.
+func (service *TaskBoardService) continueRunRecovery(ctx context.Context, prepared preparedTaskBoardRunAction, actor string, expectedCheckpoint *workflowkit.CheckpointRef, expectedPlanFingerprint workflowkit.Fingerprint) (TaskBoardMutation, error) {
 	if service.continuations == nil {
 		return TaskBoardMutation{}, fmt.Errorf("task board continuation service is not configured")
 	}
 	checkpoint, err := service.continuations.CurrentCheckpoint(ctx, prepared.RunID)
 	if err != nil {
 		return TaskBoardMutation{}, err
+	}
+	if expectedCheckpoint != nil && *expectedCheckpoint != checkpoint {
+		return TaskBoardMutation{}, fmt.Errorf("%w: recovery checkpoint is stale", store.ErrOptimisticLock)
 	}
 	plan, err := service.continuations.PlanTaskContinuation(ctx, ContinueTaskCommand{
 		CommandKey: prepared.IdempotencyKey,
@@ -1174,13 +1195,22 @@ func (service *TaskBoardService) retryTaskRevisionRun(ctx context.Context, prepa
 	if err != nil {
 		return TaskBoardMutation{}, err
 	}
+	if expectedPlanFingerprint != "" {
+		semantic, err := plan.SemanticFingerprint()
+		if err != nil {
+			return TaskBoardMutation{}, fmt.Errorf("fingerprint recovery plan: %w", err)
+		}
+		if semantic != expectedPlanFingerprint {
+			return TaskBoardMutation{}, fmt.Errorf("%w: recovery plan changed since preview", store.ErrOptimisticLock)
+		}
+	}
 	if _, err := service.continuations.ExecuteTaskContinuation(ctx, plan.ID()); err != nil {
 		return TaskBoardMutation{}, err
 	}
 	if err := service.FlushQueuedRuns(ctx); err != nil {
 		return TaskBoardMutation{}, err
 	}
-	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Run 排队重试"}, nil
+	return TaskBoardMutation{TaskID: prepared.TaskID, RunID: prepared.RunID, Summary: "已为当前 Run 排队恢复"}, nil
 }
 
 func (service *TaskBoardService) retryStandardProtocolStage(ctx context.Context, prepared preparedTaskBoardRunAction, actor string, expected *StandardProtocolStageRetryCheckpoint) (TaskBoardMutation, error) {
@@ -1608,7 +1638,7 @@ func (service *TaskBoardService) projectTaskBoardAuthoringArtifacts(ctx context.
 
 func (service *TaskBoardService) projectTaskBoardOperatorSummary(ctx context.Context, inspected RunInspection) *TaskBoardOperatorSummary {
 	run := inspected.Run
-	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || !isCurrentStandardAuthoringRun(run) {
+	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || !isAdmissibleStandardAuthoringRun(run) {
 		return nil
 	}
 	candidate, found, err := service.latestTaskBoardValidationReceiptCandidate(ctx, run, inspected.Stages)
@@ -1823,17 +1853,18 @@ func taskBoardHasNeedsRepair(stages []store.StageAttempt) bool {
 
 func taskBoardRetryStrategy(run store.WorkflowRun) TaskBoardRetryStrategy {
 	switch run.SubjectKind {
-	case store.WorkflowRunSubjectTaskRevision:
+	case store.WorkflowRunSubjectTaskRevision, store.WorkflowRunSubjectAuthoringSession:
 		return TaskBoardRetryStrategyTaskContinuation
 	default:
 		return TaskBoardRetryStrategyNone
 	}
 }
 
+// taskBoardRetryAvailability gates the operator-facing retry entry. Both
+// task revisions and pre-materialization authoring sessions share the same
+// recoverable status set; terminal outcomes (including content rejections)
+// are not retryable in place and are handled by restart/new-run flows instead.
 func taskBoardRetryAvailability(run store.WorkflowRun) (bool, string) {
-	if run.SubjectKind != store.WorkflowRunSubjectTaskRevision {
-		return false, "Standard 创题 Run 不能恢复；请启动新的 source/session Run"
-	}
 	switch run.Status {
 	case store.WorkflowRunFailedRecoverable, store.WorkflowRunInterrupted, store.WorkflowRunCanceled,
 		store.WorkflowRunPaused, store.WorkflowRunWaitingContinuation:

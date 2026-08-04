@@ -846,7 +846,13 @@ func (submission *standardAuthoringV3Submission) handle(ctx context.Context, raw
 				submission.lastRejectionCode = "validator_unavailable"
 				return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`), nil
 			}
-			submission.validationAttempts++
+			// Host/environment failures never consume a repair opportunity:
+			// only candidate defects charged by the classified failure code
+			// advance the budget, so a missing base image or flaky sandbox
+			// cannot exhaust the authoring repair turns.
+			if receipt.FailureCode.ConsumesCandidateRepairBudget() {
+				submission.validationAttempts++
+			}
 			if err := receipt.Validate(); err != nil || receipt.SnapshotDigest != snapshot.Digest {
 				submission.lastRejectionCode = "validator_unavailable"
 				return json.RawMessage(`{"accepted":false,"reason":"validator_unavailable"}`), nil

@@ -93,7 +93,7 @@ max_elapsed     = 70m
 - checkpoint 不可恢复；
 - output submission quota 未消费。
 
-因此旧 attempt 不能继续执行，但可以在 reconciliation 后标记为 `interrupted`，将 Run 置为 `failed_recoverable`，再由现有 authoring recovery 创建新的 retry attempt。旧 Job 继续保留为 `in_doubt` 审计事实。
+因此旧 attempt 不能继续执行，但可以在 reconciliation 后标记为 `interrupted`，将 Run 置为 `failed_recoverable`，再由 `run recover` 断点恢复创建新的 retry attempt。旧 Job 继续保留为 `in_doubt` 审计事实。
 
 ## 3. 五个主要原因
 
@@ -317,8 +317,8 @@ Task Board 的当前阶段候选增加 `in_doubt`，并显示稳定的 `job.leas
 3. 验证 Job `in_doubt`、claim/lease expired；
 4. 验证 Node/Stage `interrupted`、Run `failed_recoverable`；
 5. 验证 6 条 quota lease 已以 canceled outcome 对账；
-6. 执行 `authoring recover --dry-run`，确认起点为 `generate_task_files`；
-7. 使用新 idempotency key 执行 authoring recovery；
+6. 执行 `run recover --run <run-id> --dry-run`，确认起点为 `generate_task_files`；
+7. 使用新 idempotency key 执行 `run recover` 确认恢复；
 8. 验证新 StageAttempt 的 `RetryOfStageAttemptID` 指向旧 attempt。
 
 ## 8. 实施顺序
@@ -373,7 +373,7 @@ Task Board 的当前阶段候选增加 `in_doubt`，并显示稳定的 `job.leas
 1. **Store 校验执行权**：终态写入必须携带并验证 dispatch fence；
 2. **session 保持恢复触发**：发现 lease loss 后等待到期并进入下一 cycle；
 3. **应用层统一对账**：结构扫描后按 Stage/副作用事实收敛，且可幂等重放；
-4. **复用现有恢复出口**：本次 content stage 回到 `failed_recoverable -> authoring recover`。
+4. **复用现有恢复出口**：本次 content stage 回到 `failed_recoverable -> run recover`。
 
 这能修复当前卡死，同时保持现有 Store、worker、workflowkit 和 authoring continuation 边界，不增加新的系统层。
 

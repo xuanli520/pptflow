@@ -38,7 +38,7 @@ const (
 // is available; callers cannot accidentally mutate a sealed revision here.
 type TaskContinuationService struct {
 	core     *lifecycleServiceCore
-	observer continuationStateObserver
+	observer continuationSubjectStateObserver
 }
 
 func newTaskContinuationService(core *lifecycleServiceCore) *TaskContinuationService {
@@ -105,9 +105,20 @@ func (service *TaskContinuationService) PlanTaskContinuation(ctx context.Context
 	if err != nil {
 		return workflowkit.ContinuationPlan{}, fmt.Errorf("encode continuation command: %w", err)
 	}
+	// A task-revision continuation binds its command to the durable Task; a
+	// pre-materialization authoring continuation carries no Task identity, so
+	// its command subject is the frozen source the run is already bound to.
+	commandSubjectID := payload.TaskID
+	if commandSubjectID == "" {
+		_, subject, err := loadContinuationSubjectBinding(ctx, service.core, payload.RunID)
+		if err != nil {
+			return workflowkit.ContinuationPlan{}, err
+		}
+		commandSubjectID = subject.Binding.SubjectID
+	}
 	commandRecord, err := service.core.store.CreateContinuationCommand(ctx, store.CreateContinuationCommandRequest{
 		CommandKey:  payload.CommandKey,
-		SubjectID:   payload.TaskID,
+		SubjectID:   commandSubjectID,
 		RunID:       payload.RunID,
 		PayloadJSON: string(encodedCommand),
 		Actor:       command.Actor,
@@ -138,9 +149,9 @@ func (service *TaskContinuationService) PlanTaskContinuation(ctx context.Context
 	stored, err := service.core.store.CreateFrozenPlan(ctx, store.CreateFrozenPlanRequest{
 		ID:                  plan.ID(),
 		CommandID:           commandRecord.ID,
-		SubjectID:           compiled.Task.ID,
-		SubjectRevisionID:   compiled.Revision.ID,
-		SubjectDigest:       compiled.Revision.TaskDigest,
+		SubjectID:           compiled.Subject.Binding.SubjectID,
+		SubjectRevisionID:   compiled.Subject.Binding.RevisionID,
+		SubjectDigest:       string(compiled.Subject.Binding.Digest),
 		WorkflowFingerprint: compiled.Run.DefinitionHash,
 		PlanFingerprint:     string(plan.Fingerprint()),
 		PayloadJSON:         string(encodedPlan),
@@ -186,21 +197,20 @@ func (service *TaskContinuationService) PreviewTaskContinuation(ctx context.Cont
 }
 
 type compiledContinuationPlan struct {
-	Plan     workflowkit.ContinuationPlan
-	Run      store.WorkflowRun
-	Task     store.TaskV2
-	Revision store.TaskRevision
+	Plan    workflowkit.ContinuationPlan
+	Run     store.WorkflowRun
+	Subject workflowRunSubject
 }
 
 // compileContinuationPlan performs only pure reads plus UUID allocation. It
 // is shared by durable planning and dry-run preview so their frozen workflow,
 // invalidation, target, and TTL semantics cannot drift.
 func (service *TaskContinuationService) compileContinuationPlan(ctx context.Context, payload normalizedContinuationCommand, commandID string) (compiledContinuationPlan, error) {
-	run, task, revision, err := loadContinuationRunBinding(ctx, service.core, payload.RunID)
+	run, subject, err := loadContinuationSubjectBinding(ctx, service.core, payload.RunID)
 	if err != nil {
 		return compiledContinuationPlan{}, err
 	}
-	if err := matchContinuationCheckpoint(payload.Expected, run, task, revision); err != nil {
+	if err := matchContinuationCheckpointSubject(payload.Expected, run, subject); err != nil {
 		return compiledContinuationPlan{}, err
 	}
 	if run.Status == store.WorkflowRunInDoubt {
@@ -216,14 +226,14 @@ func (service *TaskContinuationService) compileContinuationPlan(ctx context.Cont
 		return compiledContinuationPlan{}, err
 	}
 	expiresAt := service.core.now().UTC().Add(frozen.ContinuationPlanTTL)
-	state, err := service.observer.Observe(ctx, run, revision, workflow)
+	state, err := service.observer.ObserveSubject(ctx, run, subject, workflow)
 	if err != nil {
 		return compiledContinuationPlan{}, err
 	}
 	if state.InDoubt {
 		return compiledContinuationPlan{}, fmt.Errorf("%w: workflow run %s has unresolved stage or node evidence", store.ErrContinuationReconciliationRequired, run.ID)
 	}
-	targets, strategy, err := continuationTargets(payload, run, workflow, state)
+	targets, strategy, err := continuationTargets(payload, run, workflow, state, subject.isAuthoringSession())
 	if err != nil {
 		return compiledContinuationPlan{}, err
 	}
@@ -243,7 +253,10 @@ func (service *TaskContinuationService) compileContinuationPlan(ctx context.Cont
 	if err != nil {
 		return compiledContinuationPlan{}, fmt.Errorf("allocate continuation plan ID: %w", err)
 	}
-	snapshot, err := buildNoChangeContinuationPlan(planID, commandID, payload, run, revision, workflow, state, invalidation, targets, strategy, expiresAt)
+	snapshot, err := buildSameRunContinuationPlan(planID, commandID, continuationPlanInput{
+		Expected:                    payload.Expected,
+		ExternalEffectConfirmations: payload.ExternalEffectConfirmations,
+	}, run, subject.Binding.RevisionID, subject.Binding.Digest, workflow, state, invalidation, targets, strategy, expiresAt, subject.isAuthoringSession())
 	if err != nil {
 		return compiledContinuationPlan{}, err
 	}
@@ -251,7 +264,7 @@ func (service *TaskContinuationService) compileContinuationPlan(ctx context.Cont
 	if err != nil {
 		return compiledContinuationPlan{}, fmt.Errorf("freeze continuation plan: %w", err)
 	}
-	return compiledContinuationPlan{Plan: plan, Run: run, Task: task, Revision: revision}, nil
+	return compiledContinuationPlan{Plan: plan, Run: run, Subject: subject}, nil
 }
 
 // GetTaskContinuationPlan reads and verifies a stored immutable plan against
@@ -393,8 +406,18 @@ func normalizeContinuationCommand(command ContinueTaskCommand) (normalizedContin
 	if strings.TrimSpace(command.CommandKey) == "" {
 		return normalizedContinuationCommand{}, fmt.Errorf("continuation command key is required")
 	}
-	if err := store.ValidateUUIDv7(command.TaskID); err != nil {
-		return normalizedContinuationCommand{}, err
+	if strings.TrimSpace(command.TaskID) != "" {
+		// A task-revision continuation carries the durable Task as its command
+		// subject and checkpoint subject. A pre-materialization authoring
+		// recovery carries no Task identity: its checkpoint subject is the
+		// frozen source/session instead, so the equality check is deferred to
+		// the subject-aware planner.
+		if err := store.ValidateUUIDv7(command.TaskID); err != nil {
+			return normalizedContinuationCommand{}, err
+		}
+		if command.Expected.SubjectID != command.TaskID {
+			return normalizedContinuationCommand{}, fmt.Errorf("continuation checkpoint task does not match command task")
+		}
 	}
 	if err := store.ValidateUUIDv7(command.RunID); err != nil {
 		return normalizedContinuationCommand{}, err
@@ -404,9 +427,6 @@ func normalizeContinuationCommand(command ContinueTaskCommand) (normalizedContin
 	}
 	if err := validateContinuationCheckpoint(command.Expected); err != nil {
 		return normalizedContinuationCommand{}, err
-	}
-	if command.Expected.SubjectID != command.TaskID {
-		return normalizedContinuationCommand{}, fmt.Errorf("continuation checkpoint task does not match command task")
 	}
 	targets := append([]workflowkit.NodeID(nil), command.TargetNodeIDs...)
 	sort.Slice(targets, func(left, right int) bool { return targets[left] < targets[right] })
@@ -459,19 +479,48 @@ func normalizeContinuationCommand(command ContinueTaskCommand) (normalizedContin
 }
 
 func currentContinuationCheckpoint(ctx context.Context, core *lifecycleServiceCore, runID string) (workflowkit.CheckpointRef, error) {
-	run, task, revision, err := loadContinuationRunBinding(ctx, core, runID)
+	run, subject, err := loadContinuationSubjectBinding(ctx, core, runID)
 	if err != nil {
 		return workflowkit.CheckpointRef{}, err
 	}
-	return workflowkit.CheckpointRef{
+	checkpoint := workflowkit.CheckpointRef{
 		Sequence:            uint64(run.Version),
 		ExecutionEpoch:      run.ExecutionEpoch,
-		SubjectVersion:      task.Version,
-		SubjectID:           task.ID,
-		SubjectRevisionID:   revision.ID,
-		SubjectDigest:       workflowkit.SubjectDigest(revision.TaskDigest),
+		SubjectID:           subject.Binding.SubjectID,
+		SubjectRevisionID:   subject.Binding.RevisionID,
+		SubjectDigest:       subject.Binding.Digest,
 		WorkflowFingerprint: workflowkit.Fingerprint(run.DefinitionHash),
-	}, nil
+	}
+	switch {
+	case subject.isTaskRevision() && subject.Task != nil:
+		checkpoint.SubjectVersion = subject.Task.Version
+	case subject.isAuthoringSession():
+		checkpoint.SubjectVersion = store.AuthoringSessionControlSubjectVersion
+	default:
+		return workflowkit.CheckpointRef{}, fmt.Errorf("workflow Run %s has no supported continuation subject", run.ID)
+	}
+	return checkpoint, nil
+}
+
+// loadContinuationSubjectBinding resolves the exact durable subject of any
+// continuation target. A task-revision Run resolves its Task/TaskRevision;
+// a pre-materialization authoring Run resolves its immutable source/session.
+func loadContinuationSubjectBinding(ctx context.Context, core *lifecycleServiceCore, runID string) (store.WorkflowRun, workflowRunSubject, error) {
+	if core == nil || core.store == nil {
+		return store.WorkflowRun{}, workflowRunSubject{}, fmt.Errorf("task continuation service is not configured")
+	}
+	run, err := core.store.GetWorkflowRun(ctx, runID)
+	if err != nil {
+		return store.WorkflowRun{}, workflowRunSubject{}, err
+	}
+	if run == nil {
+		return store.WorkflowRun{}, workflowRunSubject{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
+	}
+	subject, err := core.resolveWorkflowRunSubject(ctx, *run)
+	if err != nil {
+		return store.WorkflowRun{}, workflowRunSubject{}, err
+	}
+	return *run, subject, nil
 }
 
 // loadContinuationRunBinding resolves the exact task-revision lineage used
@@ -579,8 +628,8 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	if err != nil {
 		return frozenRunDefinition{}, fmt.Errorf("validate frozen run manifest %s deployment catalog lock identity: %w", run.ID, err)
 	}
-	if manifest.Resolved.ContinuationPlanTTL != workflowadapter.RequiredContinuationPlanTTL {
-		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s continuation plan TTL must be exactly %s", run.ID, workflowadapter.RequiredContinuationPlanTTL)
+	if manifest.Resolved.ContinuationPlanTTL <= 0 || manifest.Resolved.ContinuationPlanTTL > workflowadapter.MaxContinuationPlanTTL {
+		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s continuation plan TTL must be within (0, %s]", run.ID, workflowadapter.MaxContinuationPlanTTL)
 	}
 	workflow := manifest.Resolved.Descriptor.Clone()
 	fingerprint, err := workflow.Fingerprint()
@@ -710,8 +759,34 @@ func matchContinuationCheckpoint(expected workflowkit.CheckpointRef, run store.W
 	return nil
 }
 
+// matchContinuationCheckpointSubject is the subject-neutral counterpart of
+// matchContinuationCheckpoint. The authoring-session checkpoint uses the
+// stable AuthoringSessionControlSubjectVersion, mirroring execution-control
+// and store-side continuation commits so a stale recovery can never silently
+// rebind to newer source/session facts.
+func matchContinuationCheckpointSubject(expected workflowkit.CheckpointRef, run store.WorkflowRun, subject workflowRunSubject) error {
+	if expected.Sequence != uint64(run.Version) || expected.ExecutionEpoch != run.ExecutionEpoch ||
+		expected.SubjectID != subject.Binding.SubjectID || expected.SubjectRevisionID != subject.Binding.RevisionID ||
+		expected.SubjectDigest != subject.Binding.Digest || expected.WorkflowFingerprint != workflowkit.Fingerprint(run.DefinitionHash) {
+		return fmt.Errorf("%w: continuation checkpoint is stale", store.ErrOptimisticLock)
+	}
+	switch {
+	case subject.isTaskRevision() && subject.Task != nil:
+		if expected.SubjectVersion != subject.Task.Version {
+			return fmt.Errorf("%w: continuation checkpoint is stale", store.ErrOptimisticLock)
+		}
+	case subject.isAuthoringSession():
+		if expected.SubjectVersion != store.AuthoringSessionControlSubjectVersion {
+			return fmt.Errorf("%w: continuation checkpoint is stale", store.ErrOptimisticLock)
+		}
+	default:
+		return fmt.Errorf("workflow Run %s has no supported continuation subject", run.ID)
+	}
+	return nil
+}
+
 func validateContinuationCheckpoint(checkpoint workflowkit.CheckpointRef) error {
-	if checkpoint.Sequence == 0 || checkpoint.ExecutionEpoch < 0 || checkpoint.SubjectVersion <= 0 {
+	if checkpoint.Sequence == 0 || checkpoint.ExecutionEpoch < 0 || checkpoint.SubjectVersion < 0 {
 		return fmt.Errorf("invalid continuation checkpoint versions")
 	}
 	if err := store.ValidateUUIDv7(checkpoint.SubjectID); err != nil {
@@ -970,7 +1045,29 @@ func expandContinuationStageGroups(command normalizedContinuationCommand, workfl
 	return command, nil
 }
 
-func continuationTargets(command normalizedContinuationCommand, run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState) ([]workflowkit.NodeID, workflowkit.ContinuationStrategy, error) {
+func continuationTargets(command normalizedContinuationCommand, run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState, allowContentStages bool) ([]workflowkit.NodeID, workflowkit.ContinuationStrategy, error) {
+	rejectContent := func(targets []workflowkit.NodeID) error {
+		if !allowContentStages {
+			return rejectContentContinuationTargets(workflow, targets)
+		}
+		// A pre-materialization authoring recovery may re-schedule content
+		// stages inside the same frozen source/session subject, but CodeEdge
+		// evaluator and operator-only stages still require their dedicated
+		// lifecycle operations.
+		for _, nodeID := range targets {
+			stage, exists := workflow.Stage(nodeID)
+			if !exists {
+				return fmt.Errorf("%w: unknown frozen stage %q", ErrTaskContinuationTarget, nodeID)
+			}
+			if isCodeEdgeEvaluatorNode(workflow, nodeID) {
+				return fmt.Errorf("%w: CodeEdge evaluator stage %q requires TrialExecution reconciliation and cannot use an ordinary stage retry", ErrTaskContinuationTarget, nodeID)
+			}
+			if stage.OperatorOnly() {
+				return fmt.Errorf("%w: stage %q is operator-only and requires its explicit lifecycle operation", ErrTaskContinuationTarget, nodeID)
+			}
+		}
+		return nil
+	}
 	if len(command.TargetNodeIDs) > 0 {
 		for _, nodeID := range command.TargetNodeIDs {
 			stage, exists := workflow.Stage(nodeID)
@@ -984,7 +1081,7 @@ func continuationTargets(command normalizedContinuationCommand, run store.Workfl
 				return nil, "", fmt.Errorf("%w: successful stage %q requires force_selected", ErrTaskContinuationTarget, nodeID)
 			}
 		}
-		if err := rejectContentContinuationTargets(workflow, command.TargetNodeIDs); err != nil {
+		if err := rejectContent(command.TargetNodeIDs); err != nil {
 			return nil, "", err
 		}
 		if command.ForceSelected {
@@ -998,6 +1095,26 @@ func continuationTargets(command normalizedContinuationCommand, run store.Workfl
 	order, err := workflow.TopologicalStages()
 	if err != nil {
 		return nil, "", err
+	}
+	if allowContentStages {
+		// A completed content stage with a needs_repair verdict must be
+		// recomputed inside the same immutable source/session subject. This is
+		// the sanctioned way for an authoring run to open a fresh repair
+		// conversation from its durable repair ledger/context artifacts.
+		repairTargets := make([]workflowkit.NodeID, 0)
+		for _, nodeID := range order {
+			latest, exists := state.Latest[nodeID]
+			if !exists || latest.ExecutionStatus != store.StageExecutionCompleted || latest.Verdict != store.VerdictNeedsRepair {
+				continue
+			}
+			repairTargets = append(repairTargets, nodeID)
+		}
+		if len(repairTargets) > 0 {
+			if err := rejectContent(repairTargets); err != nil {
+				return nil, "", err
+			}
+			return repairTargets, workflowkit.StrategyRecompute, nil
+		}
 	}
 	targets := make([]workflowkit.NodeID, 0)
 	for _, nodeID := range order {
@@ -1015,17 +1132,17 @@ func continuationTargets(command normalizedContinuationCommand, run store.Workfl
 		}
 	}
 	if len(targets) > 0 {
-		if err := rejectContentContinuationTargets(workflow, targets); err != nil {
+		if err := rejectContent(targets); err != nil {
 			return nil, "", err
 		}
 		return targets, workflowkit.StrategyRetryAttempt, nil
 	}
-	if run.Status == store.WorkflowRunCanceled || run.Status == store.WorkflowRunPaused || run.Status == store.WorkflowRunFailedRecoverable || run.Status == store.WorkflowRunWaitingContinuation {
+	if run.Status == store.WorkflowRunCanceled || run.Status == store.WorkflowRunPaused || run.Status == store.WorkflowRunFailedRecoverable || run.Status == store.WorkflowRunWaitingContinuation || run.Status == store.WorkflowRunInterrupted {
 		// No stage attempt may exist when a run is canceled before a worker
 		// starts. Selecting the source root is deterministic; missing lineage
 		// then conservatively expands the complete affected closure.
 		targets := []workflowkit.NodeID{order[0]}
-		if err := rejectContentContinuationTargets(workflow, targets); err != nil {
+		if err := rejectContent(targets); err != nil {
 			return nil, "", err
 		}
 		return targets, workflowkit.StrategyRetryAttempt, nil
@@ -1060,13 +1177,6 @@ type continuationPlanInput struct {
 	Expected                    workflowkit.CheckpointRef
 	ExternalEffectConfirmations []workflowkit.ExternalEffectConfirmation
 	RequiredScheduledInputs     map[workflowkit.NodeID][]workflowkit.ArtifactBinding
-}
-
-func buildNoChangeContinuationPlan(planID, commandID string, command normalizedContinuationCommand, run store.WorkflowRun, revision store.TaskRevision, workflow workflowkit.WorkflowDescriptor, state continuationRunState, invalidation workflowkit.InvalidationPlan, targets []workflowkit.NodeID, strategy workflowkit.ContinuationStrategy, expiresAt time.Time) (workflowkit.ContinuationPlanSnapshot, error) {
-	return buildSameRunContinuationPlan(planID, commandID, continuationPlanInput{
-		Expected:                    command.Expected,
-		ExternalEffectConfirmations: command.ExternalEffectConfirmations,
-	}, run, revision.ID, workflowkit.SubjectDigest(revision.TaskDigest), workflow, state, invalidation, targets, strategy, expiresAt, false)
 }
 
 // buildSameRunContinuationPlan owns the common immutable transition shape for

@@ -130,12 +130,12 @@ func TestStandardAuthoringLaunchCapturesSourceCreatesRevisionFreeTaskAndQueuesRu
 	if err != nil || contractInput.ArtifactID != workflowkit.ArtifactID(ids.ContractArtifactID) {
 		t.Fatalf("contract artifact ID = %q, want deterministic %q, err=%v", contractInput.ArtifactID, ids.ContractArtifactID, err)
 	}
-	if err := validateStandardAuthoringContractBindings(specification, contractInput); err != nil {
-		t.Fatalf("validate frozen session root contract bindings: %v", err)
-	}
 	resolvedWorkflow, err := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Compile(standardAuthoringLaunchTestProfile())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := validateStandardAuthoringContractBindings(resolvedWorkflow.Descriptor, specification, contractInput); err != nil {
+		t.Fatalf("validate frozen session root contract bindings: %v", err)
 	}
 	authoringLoopStage, found := resolvedWorkflow.Descriptor.Stage(workflowkit.StageKey(workflowadapter.AuthoringLoop))
 	if !found {

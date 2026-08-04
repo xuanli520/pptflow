@@ -926,7 +926,7 @@ func (runtime *FrozenExecutionRuntime) transitionRunToRunning(ctx context.Contex
 	switch current.Status {
 	case store.WorkflowRunRunning:
 		return nil
-	case store.WorkflowRunQueued, store.WorkflowRunResumeRequested, store.WorkflowRunWaitingReview, store.WorkflowRunWaitingContinuation, store.WorkflowRunFailedRecoverable:
+	case store.WorkflowRunQueued, store.WorkflowRunResumeRequested, store.WorkflowRunWaitingReview, store.WorkflowRunWaitingContinuation, store.WorkflowRunFailedRecoverable, store.WorkflowRunInterrupted, store.WorkflowRunCanceled:
 		_, err = runtime.core.store.TransitionWorkflowRun(ctx, store.TransitionWorkflowRunRequest{RunID: current.ID, ExpectedVersion: current.Version, Status: store.WorkflowRunRunning, Actor: actor, Reason: reason})
 		return err
 	case store.WorkflowRunPaused:

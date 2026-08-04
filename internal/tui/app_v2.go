@@ -439,8 +439,17 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.err = msg.err
 		} else {
-			m.board.SetTasks(taskItemsForSnapshot(msg.snapshot))
+			pending, running, completed := taskItemsForSnapshot(msg.snapshot)
+			m.board.SetTasks(pending, running, completed)
 			m.authoringAvailable = msg.snapshot.AuthoringAvailable
+			// The detail pane is a projection of the same snapshot: refresh
+			// its TaskItem so a failed Run's status, failure record, and
+			// recovery hint stay live without closing and reopening the view.
+			if m.detail != nil {
+				if updated := taskItemForID(pending, running, completed, m.detail.task.ID); updated != nil {
+					m.detail.task = updated
+				}
+			}
 			if m.pendingStart == nil && m.pendingReview == nil && m.pendingAction == nil && m.pendingEvaluatorAction == nil {
 				m.err = nil
 			}
@@ -1400,6 +1409,20 @@ func (m appModel) beginExit() (tea.Model, tea.Cmd) {
 	m.exitInFlight = true
 	m.exitFlushFailed = false
 	return m, m.flushBeforeExit()
+}
+
+// taskItemForID finds the board projection of one Task across all columns.
+// It is used to refresh the open detail pane in place after a snapshot load.
+func taskItemForID(pending, running, completed []TaskItem, id string) *TaskItem {
+	for _, column := range [][]TaskItem{pending, running, completed} {
+		for index := range column {
+			if column[index].ID == id {
+				item := column[index]
+				return &item
+			}
+		}
+	}
+	return nil
 }
 
 func taskItemsForSnapshot(snapshot app.TaskBoardSnapshot) (pending, running, completed []TaskItem) {

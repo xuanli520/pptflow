@@ -28,10 +28,13 @@ const (
 	StandardAuthoringSourceSnapshotSchemaVersion = "harbor.source-snapshot.v1"
 
 	standardAuthoringLaunchAction                       LifecycleMutationAction = "authoring.start"
+	standardAuthoringRestartAction                      LifecycleMutationAction = "authoring.restart"
 	standardAuthoringLaunchSessionManifestFormat                                = "harbor.standard-authoring-session.v1"
 	standardAuthoringLaunchSessionManifestVersion                               = "4"
 	standardAuthoringLaunchTrigger                                              = "authoring.standard.create"
+	standardAuthoringRestartTrigger                                             = "authoring.standard.restart"
 	standardAuthoringLaunchIdentityDomain                                       = "harbor.standard-authoring.launch.identity.v1"
+	standardAuthoringRestartIdentityDomain                                      = "harbor.standard-authoring.restart.identity.v1"
 	standardAuthoringLaunchDefinitionDomain                                     = "harbor.standard-authoring.launch-definition.v1"
 	standardAuthoringLaunchStaticDefinitionDomain                               = "harbor.standard-authoring.launch-static-definition.v1"
 	standardAuthoringLaunchPreparationFingerprintDomain                         = "harbor.standard-authoring.launch-preparation.v1"
@@ -417,8 +420,20 @@ func standardAuthoringLaunchIdentities(idempotencyKey string) (standardAuthoring
 }
 
 func standardAuthoringLaunchIdentity(idempotencyKey, entity string) string {
+	return standardAuthoringDerivedIdentity(standardAuthoringLaunchIdentityDomain, idempotencyKey, entity)
+}
+
+func standardAuthoringRestartIdentity(idempotencyKey, entity string) string {
+	return standardAuthoringDerivedIdentity(standardAuthoringRestartIdentityDomain, idempotencyKey, entity)
+}
+
+// standardAuthoringDerivedIdentity derives a deterministic UUIDv7 for one
+// entity of one lifecycle key. The domain label keeps launch and restart
+// identities disjoint so the same caller key can never alias a session or Run
+// across the two operations.
+func standardAuthoringDerivedIdentity(domain, idempotencyKey, entity string) string {
 	parsed := uuid.MustParse(strings.TrimSpace(idempotencyKey))
-	digest := sha256.Sum256([]byte(standardAuthoringLaunchIdentityDomain + "\x00" + entity + "\x00" + parsed.String()))
+	digest := sha256.Sum256([]byte(domain + "\x00" + entity + "\x00" + parsed.String()))
 	derived := parsed
 	derived[6] = 0x70 | (digest[0] & 0x0f)
 	derived[7] = digest[1]
@@ -461,6 +476,10 @@ func standardAuthoringLaunchAdmissionOperationID(idempotencyKey string) string {
 
 func standardAuthoringLaunchChildKey(idempotencyKey, child string) string {
 	return "standard-authoring-launch:" + strings.TrimSpace(idempotencyKey) + ":" + child
+}
+
+func standardAuthoringRestartChildKey(idempotencyKey, child string) string {
+	return "standard-authoring-restart:" + strings.TrimSpace(idempotencyKey) + ":" + child
 }
 
 func validateStandardAuthoringLaunchCommand(command StandardAuthoringLaunchCommand) error {
@@ -1312,6 +1331,7 @@ type standardAuthoringSessionManifest struct {
 	DefinitionFingerprint         workflowkit.Fingerprint                               `json:"definition_fingerprint"`
 	DeploymentCatalogReceipt      json.RawMessage                                       `json:"deployment_catalog_receipt,omitempty"`
 	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity `json:"deployment_catalog_lock_identity,omitempty"`
+	RestartOfRunID                string                                                `json:"restart_of_run_id,omitempty"`
 }
 
 func standardAuthoringSessionManifestJSON(source store.AuthoringSource, task store.TaskV2, sessionID, operationID string, preparation standardAuthoringLaunchPreparation, frozen standardAuthoringFrozenDefinition, contract standardAuthoringContractInput) (string, error) {
@@ -1363,7 +1383,15 @@ func verifyStandardAuthoringLaunchSession(session store.AuthoringSession, source
 		!sameDeploymentCatalogLockIdentity(manifest.DeploymentCatalogLockIdentity, frozen.DeploymentCatalogLockIdentity) {
 		return fmt.Errorf("%w: persisted Standard authoring session definition", store.ErrIdempotencyConflict)
 	}
-	if err := validateStandardAuthoringContractBindings(frozen.ExecutionSpec, contract); err != nil {
+	template, err := workflowadapter.ResolveWorkflowTemplate(frozen.ExecutionSpec.Template)
+	if err != nil {
+		return fmt.Errorf("%w: persisted Standard authoring session template: %v", store.ErrIdempotencyConflict, err)
+	}
+	resolved, err := template.Compile(frozen.Profile)
+	if err != nil {
+		return fmt.Errorf("%w: persisted Standard authoring session profile: %v", store.ErrIdempotencyConflict, err)
+	}
+	if err := validateStandardAuthoringContractBindings(resolved.Descriptor, frozen.ExecutionSpec, contract); err != nil {
 		return fmt.Errorf("%w: persisted Standard authoring session execution contract binding: %v", store.ErrIdempotencyConflict, err)
 	}
 	return nil

@@ -169,9 +169,14 @@ func TestExplicitProfileIsRequiredAndPreservesTurnContract(t *testing.T) {
 	}
 
 	wrongContinuationTTL := profile.Clone()
-	wrongContinuationTTL.ContinuationPlanTTL = 23 * time.Hour
+	wrongContinuationTTL.ContinuationPlanTTL = MaxContinuationPlanTTL + time.Hour
 	if _, err := template.Compile(wrongContinuationTTL); err == nil || !strings.Contains(err.Error(), "continuation plan TTL") {
-		t.Fatalf("compile profile with a non-24h continuation TTL error = %v, want TTL failure", err)
+		t.Fatalf("compile profile with an over-limit continuation TTL error = %v, want TTL failure", err)
+	}
+	withinContinuationTTL := profile.Clone()
+	withinContinuationTTL.ContinuationPlanTTL = 7 * 24 * time.Hour
+	if _, err := template.Compile(withinContinuationTTL); err != nil {
+		t.Fatalf("compile profile with an admissible continuation TTL: %v", err)
 	}
 }
 

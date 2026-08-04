@@ -281,8 +281,11 @@ type standardAuthoringHarnessImageReceipt struct {
 func (harness *StandardAuthoringDockerHarness) ensureCandidateImage(ctx context.Context, request authoringharness.Request, candidate authoringharness.Candidate, invocationRoot, snapshotRoot string) (standardAuthoringHarnessImageReceipt, authoringharness.StepResult, bool, error) {
 	imageTag := standardAuthoringHarnessImageTag(request.RunID, candidate.EnvironmentDigest)
 	environmentRoot := filepath.Join(snapshotRoot, "environment")
+	// --pull is safe because the launch environment policy pins every FROM to
+	// a content-addressed digest; the ImageID re-attestation below still
+	// proves the built image matches the frozen candidate environment.
 	args := []string{
-		"build", "--pull=false", "--network=default",
+		"build", "--pull", "--network=default",
 		"--label", "io.harbor-factory.authoring.run_id=" + request.RunID,
 		"--label", "io.harbor-factory.authoring.environment_digest=" + string(candidate.EnvironmentDigest),
 		"--tag", imageTag,

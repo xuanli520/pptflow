@@ -32,6 +32,7 @@ type StartAuthoringRunRequest struct {
 	ExecutionSpecFingerprint      workflowkit.Fingerprint
 	DeploymentCatalogReceipt      []byte
 	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
+	RestartOfRunID                string
 	Trigger                       string
 	ExecutionEpoch                int
 	Actor                         string
@@ -82,10 +83,6 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if session.WorkflowTemplateID != request.Profile.Template.ID || session.WorkflowTemplateVersion != request.Profile.Template.Version {
 		return store.WorkflowRun{}, fmt.Errorf("authoring session template does not match the closed Standard authoring template")
 	}
-	if err := validateAuthoringRunExecutionSpec(request.ExecutionSpec, *source, *session, service.core.operationResolver, service.core); err != nil {
-		return store.WorkflowRun{}, err
-	}
-
 	requestedCanonical, requestedFingerprint, err := canonicalExecutionSpec(request.ExecutionSpec)
 	if err != nil {
 		return store.WorkflowRun{}, err
@@ -108,6 +105,9 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	resolved, err := template.Compile(request.Profile)
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("compile explicit authoring execution profile: %w", err)
+	}
+	if err := validateAuthoringRunExecutionSpec(request.ExecutionSpec, *source, *session, resolved.Descriptor, service.core.operationResolver, service.core); err != nil {
+		return store.WorkflowRun{}, err
 	}
 	profileCanonical, err := request.Profile.CanonicalJSON()
 	if err != nil {
@@ -188,6 +188,7 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 		ExecutionSpec:                 append(json.RawMessage(nil), requestedCanonical...),
 		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
 		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
+		RestartOfRunID:                strings.TrimSpace(request.RestartOfRunID),
 		Created:                       service.core.now().UTC(),
 	}
 	encoded, err := json.Marshal(manifest)
@@ -246,7 +247,7 @@ func canonicalExecutionSpec(specification workflowadapter.RunExecutionSpec) ([]b
 	return canonical, fingerprint, nil
 }
 
-func validateAuthoringRunExecutionSpec(specification workflowadapter.RunExecutionSpec, source store.AuthoringSource, session store.AuthoringSession, resolver workflowadapter.StageOperationResolver, core *lifecycleServiceCore) error {
+func validateAuthoringRunExecutionSpec(specification workflowadapter.RunExecutionSpec, source store.AuthoringSource, session store.AuthoringSession, workflow workflowkit.WorkflowDescriptor, resolver workflowadapter.StageOperationResolver, core *lifecycleServiceCore) error {
 	selection := specification.Selection
 	if selection.Kind != workflowadapter.RunSelectionAuthoringSession || selection.AuthoringSourceID != source.ID || selection.AuthoringSessionID != session.ID || string(selection.AuthoringSourceDigest) != source.SnapshotContentDigest {
 		return fmt.Errorf("%w: authoring execution specification selection does not match AuthoringSource/AuthoringSession", store.ErrOptimisticLock)
@@ -261,7 +262,7 @@ func validateAuthoringRunExecutionSpec(specification workflowadapter.RunExecutio
 	if err != nil {
 		return fmt.Errorf("authoring session root contract: %w", err)
 	}
-	if err := validateStandardAuthoringContractBindings(specification, contract); err != nil {
+	if err := validateStandardAuthoringContractBindings(workflow, specification, contract); err != nil {
 		return err
 	}
 	if err := core.validateDeploymentCatalogExecutionSpec(specification); err != nil {
@@ -279,6 +280,9 @@ func (service *RunService) validateReplayedAuthoringWorkflowRun(ctx context.Cont
 	if err != nil || !manifestMatchesAuthoringExecutionSpec(manifest, specificationCanonical, specificationFingerprint) ||
 		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, plan) || !manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) || !manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
 		return fmt.Errorf("%w: authoring workflow Run %s execution specification", store.ErrIdempotencyConflict, run.ID)
+	}
+	if manifest.RestartOfRunID != strings.TrimSpace(request.RestartOfRunID) {
+		return fmt.Errorf("%w: authoring workflow Run %s restart lineage", store.ErrIdempotencyConflict, run.ID)
 	}
 	profile, _, err := service.core.verifyRunManagedExecutionInputs(ctx, run)
 	if err != nil {

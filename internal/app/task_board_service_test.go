@@ -284,20 +284,25 @@ func TestTaskBoardServiceCancellationWakesWaitingContinuation(t *testing.T) {
 	}
 }
 
-func TestTaskBoardRetryAvailabilityDoesNotOfferUnsupportedAuthoringRetry(t *testing.T) {
+func TestTaskBoardRetryAvailabilitySharesRecoveryContractAcrossSubjects(t *testing.T) {
+	for _, status := range []store.WorkflowRunStatus{
+		store.WorkflowRunFailedRecoverable, store.WorkflowRunInterrupted, store.WorkflowRunCanceled,
+		store.WorkflowRunPaused, store.WorkflowRunWaitingContinuation,
+	} {
+		for _, subject := range []store.WorkflowRunSubjectKind{store.WorkflowRunSubjectAuthoringSession, store.WorkflowRunSubjectTaskRevision} {
+			available, reason := taskBoardRetryAvailability(store.WorkflowRun{SubjectKind: subject, Status: status})
+			if !available || reason != "" {
+				t.Fatalf("subject %s status %s retry availability = available:%t reason:%q", subject, status, available, reason)
+			}
+		}
+	}
 	available, reason := taskBoardRetryAvailability(store.WorkflowRun{
-		SubjectKind: store.WorkflowRunSubjectAuthoringSession, Status: store.WorkflowRunFailedRecoverable,
+		SubjectKind: store.WorkflowRunSubjectAuthoringSession, Status: store.WorkflowRunFailedTerminal,
 	})
 	if available || reason == "" {
-		t.Fatalf("authoring retry availability = available:%t reason:%q", available, reason)
+		t.Fatalf("terminal authoring retry availability = available:%t reason:%q", available, reason)
 	}
-	available, reason = taskBoardRetryAvailability(store.WorkflowRun{
-		SubjectKind: store.WorkflowRunSubjectTaskRevision, Status: store.WorkflowRunFailedRecoverable,
-	})
-	if !available || reason != "" {
-		t.Fatalf("task revision retry availability = available:%t reason:%q", available, reason)
-	}
-	if strategy := taskBoardRetryStrategy(store.WorkflowRun{SubjectKind: store.WorkflowRunSubjectAuthoringSession}); strategy != TaskBoardRetryStrategyNone {
+	if strategy := taskBoardRetryStrategy(store.WorkflowRun{SubjectKind: store.WorkflowRunSubjectAuthoringSession}); strategy != TaskBoardRetryStrategyTaskContinuation {
 		t.Fatalf("authoring retry strategy = %q", strategy)
 	}
 	if strategy := taskBoardRetryStrategy(store.WorkflowRun{SubjectKind: store.WorkflowRunSubjectTaskRevision}); strategy != TaskBoardRetryStrategyTaskContinuation {

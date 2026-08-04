@@ -8,6 +8,7 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
+	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 // standardAuthoringContractInputFromSession reads the sole root contract from
@@ -23,8 +24,7 @@ func standardAuthoringContractInputFromSession(ctx context.Context, objects *wor
 	}
 	if manifest.Format != standardAuthoringLaunchSessionManifestFormat || manifest.Version != standardAuthoringLaunchSessionManifestVersion ||
 		manifest.AuthoringSessionID != session.ID || manifest.SourceID != session.SourceID || manifest.TargetTaskID != session.TargetTaskID ||
-		!workflowadapter.StandardAuthoringCurrentTemplateReference().Equal(workflowadapter.TemplateReference{ID: session.WorkflowTemplateID, Version: session.WorkflowTemplateVersion}) ||
-		manifest.ContractSizeBytes <= 0 {
+		!isAdmissibleStandardAuthoringSession(session) || manifest.ContractSizeBytes <= 0 {
 		return standardAuthoringContractInput{}, fmt.Errorf("Standard authoring session manifest has no valid root contract binding")
 	}
 	if err := manifest.ContractDigest.Validate(); err != nil {
@@ -48,16 +48,38 @@ func standardAuthoringContractInputFromSession(ctx context.Context, objects *wor
 	return input, nil
 }
 
-func validateStandardAuthoringContractBindings(specification workflowadapter.RunExecutionSpec, contract standardAuthoringContractInput) error {
+// isAdmissibleStandardAuthoringSession admits the current Standard authoring
+// template family (same major version). The root contract is content
+// addressed and digest-bound by the session manifest, so an exact version
+// equality is not a security boundary; the family check prevents legacy
+// major contracts from being re-executed under the current policy.
+func isAdmissibleStandardAuthoringSession(session store.AuthoringSession) bool {
+	if session.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID {
+		return false
+	}
+	current, ok := standardAuthoringTemplateFamilyVersion(workflowadapter.StandardAuthoringCurrentTemplateReference().Version)
+	if !ok {
+		return false
+	}
+	actual, ok := standardAuthoringTemplateFamilyVersion(session.WorkflowTemplateVersion)
+	return ok && actual == current
+}
+
+// validateStandardAuthoringContractBindings proves the frozen execution
+// specification references the session root contract on every contract-bound
+// stage. The descriptor is the caller's frozen source of truth (the current
+// catalog for new Runs, the frozen run manifest for continuation/restart), so
+// an upgraded binary can still admit same-major Runs whose stage input shapes
+// were already verified against the current catalog.
+func validateStandardAuthoringContractBindings(workflow workflowkit.WorkflowDescriptor, specification workflowadapter.RunExecutionSpec, contract standardAuthoringContractInput) error {
 	if err := specification.Validate(); err != nil {
 		return fmt.Errorf("validate Standard authoring execution specification: %w", err)
 	}
-	template, err := workflowadapter.ResolveWorkflowTemplate(specification.Template)
-	if err != nil {
-		return err
+	if workflow.ID != specification.Template.ID || workflow.Version != specification.Template.Version {
+		return fmt.Errorf("root contract binding descriptor does not match the execution specification template")
 	}
-	if !template.Reference().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
-		return fmt.Errorf("root contract binding requires the current Standard authoring template")
+	if err := workflow.Validate(); err != nil {
+		return fmt.Errorf("validate Standard authoring descriptor: %w", err)
 	}
 	reference := contract.artifactReference()
 	foundReference := false
@@ -73,7 +95,7 @@ func validateStandardAuthoringContractBindings(specification workflowadapter.Run
 	if !foundReference {
 		return fmt.Errorf("Standard authoring execution specification does not reference the root contract")
 	}
-	for _, stage := range template.Catalog.Stages {
+	for _, stage := range workflow.Stages {
 		resolution, err := specification.ResolveStageOperation(stage.Key)
 		if err != nil {
 			return err

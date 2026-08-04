@@ -377,7 +377,13 @@ func detailFailureRecoveryAction(run *TaskRunItem) string {
 	case app.TaskBoardFailureRecoveryReconcile:
 		return "显式 reconcile"
 	case app.TaskBoardFailureRecoveryRepairOrNewRun:
-		return "修复或新建运行"
+		if run.CanRetry {
+			return "按 t 断点恢复（同 Run 继续）"
+		}
+		if run.Status == "failed_terminal" {
+			return "内容已判死：run restart 重跑（同一输入）"
+		}
+		return "不可恢复：run restart 重跑或新建创题"
 	}
 	return ""
 }

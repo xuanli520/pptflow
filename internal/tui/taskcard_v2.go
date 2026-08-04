@@ -103,6 +103,25 @@ func truncateMiddle(s string, maxLen int) string {
 	return s[:front] + "..." + s[len(s)-back:]
 }
 
+// taskCardFailureLabel maps failed Run statuses to the short operator-facing
+// label shown on the board card. Recoverable failures advertise the recovery
+// entry; terminal outcomes advertise restart instead of pretending the Run
+// can still move.
+func taskCardFailureLabel(status string) (string, bool) {
+	switch status {
+	case "failed_recoverable":
+		return "可恢复 · 按 t 断点恢复", true
+	case "interrupted":
+		return "中断 · 按 t 断点恢复", true
+	case "failed_terminal":
+		return "已终局 · run restart 重跑", true
+	case "in_doubt":
+		return "存疑 · 先 run reconcile", true
+	default:
+		return "", false
+	}
+}
+
 func displayOperatorSummary(summary *app.TaskBoardOperatorSummary) string {
 	if summary == nil {
 		return ""
@@ -149,6 +168,8 @@ func renderTaskCard(item TaskItem, width int, selected bool) string {
 			lines = append(lines, mutedStyle.Render(truncateMiddle(summary, width-4)))
 		} else if item.RunStatus == "" {
 			lines = append(lines, mutedStyle.Render("等待启动"))
+		} else if label, failed := taskCardFailureLabel(item.RunStatus); failed {
+			lines = append(lines, failStyleV2.Render("失败："+label))
 		} else {
 			lines = append(lines, mutedStyle.Render(item.RunStatus))
 		}

@@ -56,7 +56,7 @@ func (validator standardAuthoringV3CandidateValidator) ValidateCandidate(ctx con
 	}
 	if !result.Passed {
 		receipt.Verdict = workflowkit.ValidationReject
-		receipt.FailureCode = workflowkit.AgentFailureValidatorReject
+		receipt.FailureCode = standardAuthoringV3FailureCode(result)
 	}
 	return workflowkit.NewValidationReceipt(receipt)
 }
@@ -67,6 +67,26 @@ func cloneStandardAuthoringCandidateFiles(files map[string][]byte) map[string][]
 		clone[path] = append([]byte(nil), content...)
 	}
 	return clone
+}
+
+// standardAuthoringV3FailureCode classifies a failed host validation by its
+// first failing step. Candidate defects stay validator_reject (and consume a
+// repair opportunity), while environment-build and source-access failures are
+// host/environment problems that must never eat into the authoring repair
+// budget: the frozen source cannot be edited, so a read-only /source mount or
+// an image whose USER drops access to it is fixed in environment/Dockerfile,
+// not by a candidate repair.
+func standardAuthoringV3FailureCode(result authoringharness.Result) workflowkit.AgentFailureCode {
+	for _, step := range result.Steps {
+		if step.Passed {
+			continue
+		}
+		if step.Step == "environment_build" || step.Step == "source_access" {
+			return workflowkit.AgentFailureEnvironmentFault
+		}
+		return workflowkit.AgentFailureValidatorReject
+	}
+	return workflowkit.AgentFailureValidatorReject
 }
 
 func standardAuthoringV3ReceiptDiagnostics(result authoringharness.Result) []workflowkit.AgentCommandReport {

@@ -176,9 +176,6 @@ func (s *Store) commitContinuationExecution(ctx context.Context, request CommitC
 	if err := verifyControlCheckpointTx(ctx, tx, run, prepared.Expected); err != nil {
 		return ContinuationExecutionCommit{}, err
 	}
-	if run.SubjectKind == WorkflowRunSubjectAuthoringSession {
-		return ContinuationExecutionCommit{}, fmt.Errorf("%w: continuations cannot target an authoring_session Run", ErrInvalidTransition)
-	}
 	if run.Status == WorkflowRunInDoubt {
 		return ContinuationExecutionCommit{}, fmt.Errorf("%w: workflow run %s is in_doubt", ErrContinuationReconciliationRequired, run.ID)
 	}
@@ -228,16 +225,43 @@ func (s *Store) commitContinuationExecution(ctx context.Context, request CommitC
 		Version:        1,
 	}
 
-	// Advancing the epoch is the CAS that prevents another frozen plan bound to
-	// this checkpoint from being committed after this transaction succeeds.
+	// Resuming the Run is part of the same CAS as advancing the epoch: once a
+	// continuation is durably queued the Run is running again, so any worker
+	// may claim its job. A paused Run takes the explicit resume-requested step
+	// first; the transition table rejects any status that must not reopen
+	// (terminal outcomes belong to 重跑/new-run flows, never this commit).
 	previousVersion := run.Version
+	switch run.Status {
+	case WorkflowRunPaused:
+		step, stepErr := tx.ExecContext(ctx, `
+			UPDATE workflow_runs SET status = ?
+			WHERE id = ? AND version = ?
+		`, WorkflowRunResumeRequested, run.ID, previousVersion)
+		if stepErr != nil {
+			return ContinuationExecutionCommit{}, stepErr
+		}
+		if stepped, stepErr := step.RowsAffected(); stepErr != nil || stepped != 1 {
+			return ContinuationExecutionCommit{}, fmt.Errorf("%w: workflow run %s", ErrOptimisticLock, run.ID)
+		}
+	case WorkflowRunRunning:
+		// already active; only the epoch/version CAS applies
+	default:
+		if !validWorkflowRunTransition(run.Status, WorkflowRunRunning) {
+			return ContinuationExecutionCommit{}, fmt.Errorf("%w: workflow run %s cannot resume from %s", ErrOptimisticLock, run.ID, run.Status)
+		}
+	}
 	run.ExecutionEpoch = snapshot.NextExecutionEpoch
 	run.Version++
+	run.Status = WorkflowRunRunning
+	if run.StartedAt == nil {
+		run.StartedAt = &now
+	}
+	run.FinishedAt = nil
 	result, err := tx.ExecContext(ctx, `
 		UPDATE workflow_runs
-		SET execution_epoch = ?, version = ?
+		SET execution_epoch = ?, version = ?, status = ?, started_at = ?, finished_at = ?
 		WHERE id = ? AND version = ? AND execution_epoch = ?
-	`, run.ExecutionEpoch, run.Version, run.ID, previousVersion, prepared.Expected.ExecutionEpoch)
+	`, run.ExecutionEpoch, run.Version, run.Status, run.StartedAt, run.FinishedAt, run.ID, previousVersion, prepared.Expected.ExecutionEpoch)
 	if err != nil {
 		return ContinuationExecutionCommit{}, err
 	}

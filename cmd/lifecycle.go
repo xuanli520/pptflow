@@ -1173,6 +1173,8 @@ func newRunCommandV2(config *lifecycleCLIConfig) *cobra.Command {
 		newRunTerminateCommand(config),
 		newRunControlShowCommand(config),
 		newRunAttachCommand(config),
+		newRunRecoverCommand(config),
+		newRunRestartCommand(config),
 		newRunReconcileCommand(config),
 		newRunDetachCommand(config),
 		newRunWorkerCommand(config),
@@ -1899,4 +1901,218 @@ func newWorkspaceTransitionCommand(config *lifecycleCLIConfig, use string, state
 	command.Flags().Int64Var(&expectedVersion, "expected-version", 0, "Current workspace version")
 	command.Flags().StringVar(&reason, "reason", "", "Audit reason")
 	return command
+}
+
+// runRecoveryPreviewOutput is the CLI-shaped read-only summary of a frozen
+// continuation plan for one Run (task revision or authoring session). The app
+// preview structs carry no JSON tags; this wrapper owns the wire contract.
+type runRecoveryPreviewOutput struct {
+	TaskID                  string                     `json:"task_id"`
+	RunID                   string                     `json:"run_id"`
+	Strategy                app.TaskBoardRetryStrategy `json:"strategy"`
+	CheckpointSequence      uint64                     `json:"checkpoint_sequence"`
+	CurrentExecutionEpoch   int                        `json:"current_execution_epoch"`
+	NextExecutionEpoch      int                        `json:"next_execution_epoch"`
+	SubjectDigest           string                     `json:"subject_digest"`
+	WorkflowFingerprint     string                     `json:"workflow_fingerprint"`
+	SemanticPlanFingerprint workflowkit.Fingerprint    `json:"semantic_plan_fingerprint"`
+	TargetStages            []string                   `json:"target_stages,omitempty"`
+	ReusedStages            []string                   `json:"reused_stages,omitempty"`
+	ScheduledStages         []string                   `json:"scheduled_stages,omitempty"`
+	InvalidatedStages       []string                   `json:"invalidated_stages,omitempty"`
+	OperatorOnlyStages      []string                   `json:"operator_only_stages,omitempty"`
+}
+
+func runRecoveryPreviewOutputFromPreview(preview app.TaskBoardRecoveryPreview) runRecoveryPreviewOutput {
+	return runRecoveryPreviewOutput{
+		TaskID: preview.TaskID, RunID: preview.RunID, Strategy: preview.Strategy,
+		CheckpointSequence: preview.CheckpointSequence, CurrentExecutionEpoch: preview.CurrentExecutionEpoch,
+		NextExecutionEpoch: preview.NextExecutionEpoch, SubjectDigest: preview.SubjectDigest,
+		WorkflowFingerprint: preview.WorkflowFingerprint, SemanticPlanFingerprint: preview.SemanticPlanFingerprint,
+		TargetStages: append([]string(nil), preview.TargetStages...), ReusedStages: append([]string(nil), preview.ReusedStages...),
+		ScheduledStages: append([]string(nil), preview.ScheduledStages...), InvalidatedStages: append([]string(nil), preview.InvalidatedStages...),
+		OperatorOnlyStages: append([]string(nil), preview.OperatorOnlyStages...),
+	}
+}
+
+func newRunRecoverCommand(config *lifecycleCLIConfig) *cobra.Command {
+	var runID, taskID, idempotencyKey, reason string
+	var dryRun bool
+	command := &cobra.Command{
+		Use:   "recover",
+		Short: "Resume one failed Run from its frozen checkpoint",
+		Long: "Preview or confirm a durable continuation plan for a recoverable Run " +
+			"(task revision or Standard authoring session). The confirmation replays the " +
+			"previewed checkpoint and semantic plan fingerprint, so a Run that moved between " +
+			"the two steps is rejected instead of silently rebinding.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			id, err := requiredText("run", runID)
+			if err != nil {
+				return err
+			}
+			if err := store.ValidateUUIDv7(id); err != nil {
+				return fmt.Errorf("run must be a UUIDv7: %w", err)
+			}
+			task := strings.TrimSpace(taskID)
+			if task != "" {
+				if err := store.ValidateUUIDv7(task); err != nil {
+					return fmt.Errorf("task must be a UUIDv7: %w", err)
+				}
+			}
+			if dryRun {
+				if _, _, err := lifecycleActorAndReason(config, reason); err != nil {
+					return err
+				}
+				return executeLifecycleReadOnlyCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+					if services.TaskBoard == nil {
+						return nil, fmt.Errorf("task board recovery service is not configured")
+					}
+					preview, err := services.TaskBoard.PreviewRunRecovery(ctx, app.TaskBoardPreviewRunRecoveryRequest{TaskID: task, RunID: id, Reason: reason})
+					if err != nil {
+						return nil, err
+					}
+					return runRecoveryPreviewOutputFromPreview(preview), nil
+				})
+			}
+			_, reason, err := lifecycleActorAndReason(config, reason)
+			if err != nil {
+				return err
+			}
+			key, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
+			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+				if services.TaskBoard == nil {
+					return nil, fmt.Errorf("task board recovery service is not configured")
+				}
+				preview, err := services.TaskBoard.PreviewRunRecovery(ctx, app.TaskBoardPreviewRunRecoveryRequest{TaskID: task, RunID: id, Reason: reason})
+				if err != nil {
+					return nil, err
+				}
+				checkpoint := preview.Checkpoint
+				mutation, err := services.TaskBoard.RetryRun(ctx, app.TaskBoardRetryRunRequest{
+					IdempotencyKey:                  key,
+					TaskID:                          task,
+					RunID:                           id,
+					Reason:                          reason,
+					ExpectedRecoveryCheckpoint:      &checkpoint,
+					ExpectedRecoveryPlanFingerprint: preview.SemanticPlanFingerprint,
+				})
+				if err != nil {
+					return nil, err
+				}
+				return struct {
+					TaskID  string `json:"task_id"`
+					RunID   string `json:"run_id"`
+					Summary string `json:"summary"`
+				}{TaskID: mutation.TaskID, RunID: mutation.RunID, Summary: mutation.Summary}, nil
+			})
+		},
+	}
+	command.Flags().StringVar(&runID, "run", "", "Recoverable Run UUIDv7")
+	command.Flags().StringVar(&taskID, "task", "", "Owning Task UUIDv7 (optional; authoring Runs have no Task)")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated recovery idempotency key (required to confirm)")
+	command.Flags().StringVar(&reason, "reason", "", "Audit reason for the recovery")
+	command.Flags().BoolVar(&dryRun, "dry-run", false, "Preview the recovery plan without persisting command, plan, or audit state")
+	command.Flags().Bool("json", true, "Emit JSON output (the lifecycle CLI always emits JSON)")
+	return command
+}
+
+func newRunRestartCommand(config *lifecycleCLIConfig) *cobra.Command {
+	var runID, idempotencyKey, reason string
+	var dryRun bool
+	command := &cobra.Command{
+		Use:   "restart",
+		Short: "Re-run one terminal Standard authoring Run with the same frozen inputs",
+		Long: "Restart clones the frozen source snapshot, draft Task, profile, and deployment " +
+			"catalog of a terminal authoring Run into a fresh session and Run. It never " +
+			"re-captures Git; the new Run records restart_of_run_id lineage on both its " +
+			"session manifest and run manifest.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			id, err := requiredText("run", runID)
+			if err != nil {
+				return err
+			}
+			if err := store.ValidateUUIDv7(id); err != nil {
+				return fmt.Errorf("run must be a UUIDv7: %w", err)
+			}
+			if dryRun {
+				if _, _, err := lifecycleActorAndReason(config, reason); err != nil {
+					return err
+				}
+				return executeLifecycleReadOnlyCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+					if services.AuthoringLaunches == nil {
+						return nil, fmt.Errorf("Standard authoring restart service is not configured")
+					}
+					run, err := services.Runs.Get(ctx, id)
+					if err != nil {
+						return nil, err
+					}
+					restartable, reason := restartableAuthoringRunForCLI(run)
+					return struct {
+						RunID       string `json:"run_id"`
+						Status      string `json:"status"`
+						Subject     string `json:"subject_kind"`
+						Restartable bool   `json:"restartable"`
+						Reason      string `json:"reason,omitempty"`
+					}{RunID: run.ID, Status: string(run.Status), Subject: string(run.SubjectKind), Restartable: restartable, Reason: reason}, nil
+				})
+			}
+			actor, reason, err := lifecycleActorAndReason(config, reason)
+			if err != nil {
+				return err
+			}
+			key, err := requiredLifecycleIdempotencyKey(idempotencyKey)
+			if err != nil {
+				return err
+			}
+			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
+				if services.AuthoringLaunches == nil {
+					return nil, fmt.Errorf("Standard authoring restart service is not configured")
+				}
+				receipt, err := services.AuthoringLaunches.RestartAuthoringRun(ctx, app.RestartAuthoringRunCommand{
+					LifecycleMutationCommandBase: app.LifecycleMutationCommandBase{IdempotencyKey: key, Actor: actor, Reason: reason},
+					SourceRunID:                  id,
+				})
+				if err != nil {
+					return nil, err
+				}
+				return struct {
+					Action               string `json:"action"`
+					TaskID               string `json:"task_id"`
+					RunID                string `json:"run_id"`
+					AuthoringSessionID   string `json:"authoring_session_id"`
+					AuthoringSourceID    string `json:"authoring_source_id"`
+					SourceSnapshotDigest string `json:"source_snapshot_digest"`
+					Summary              string `json:"summary"`
+				}{Action: string(receipt.Action), TaskID: receipt.TaskID, RunID: receipt.RunID,
+					AuthoringSessionID: receipt.AuthoringSessionID, AuthoringSourceID: receipt.AuthoringSourceID,
+					SourceSnapshotDigest: receipt.SourceSnapshotDigest, Summary: receipt.Summary}, nil
+			})
+		},
+	}
+	command.Flags().StringVar(&runID, "run", "", "Terminal authoring Run UUIDv7 to restart")
+	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated restart idempotency key (required to confirm)")
+	command.Flags().StringVar(&reason, "reason", "", "Audit reason for the restart")
+	command.Flags().BoolVar(&dryRun, "dry-run", false, "Preview restart eligibility without creating a session or Run")
+	command.Flags().Bool("json", true, "Emit JSON output (the lifecycle CLI always emits JSON)")
+	return command
+}
+
+// restartableAuthoringRunForCLI mirrors the app-side terminal-state contract
+// for the read-only preview. The confirmation path revalidates every fact
+// inside RestartAuthoringRun, so this projection is presentation only.
+func restartableAuthoringRunForCLI(run store.WorkflowRun) (bool, string) {
+	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession {
+		return false, "Run is not a Standard authoring Run"
+	}
+	switch run.Status {
+	case store.WorkflowRunSucceeded, store.WorkflowRunFailedTerminal, store.WorkflowRunCanceled:
+		return true, ""
+	default:
+		return false, "Run is not terminal; recoverable failures use run recover"
+	}
 }

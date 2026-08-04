@@ -129,7 +129,7 @@ func (executor *StandardAuthoringMaterializeExecutor) ExecuteHarborBuiltin(ctx c
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	if !isCurrentStandardAuthoringRun(*run) || !subject.isAuthoringSession() || subject.Binding != invocation.Request.Execution.Subject {
+	if !isAdmissibleStandardAuthoringRun(*run) || !subject.isAuthoringSession() || subject.Binding != invocation.Request.Execution.Subject {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring materializer Run is not a frozen source/session subject")
 	}
 	if invocation.Request.Claim.Stage.StageAttempt.ID == "" {
@@ -210,7 +210,7 @@ func (executor *StandardAuthoringMaterializeExecutor) executePackageAdmission(ct
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
-	if run == nil || !isCurrentStandardAuthoringRun(*run) || run.Status != store.WorkflowRunRunning {
+	if run == nil || !isAdmissibleStandardAuthoringRun(*run) || run.Status != store.WorkflowRunRunning {
 		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring package admission Run is not active under the admission template")
 	}
 	subject, err := executor.core.resolveWorkflowRunSubject(ctx, *run)
@@ -313,7 +313,7 @@ func standardAuthoringPackageAdmissionInputs(ctx context.Context, request workfl
 	if result.finalAttestation, err = read("final_attestation"); err != nil {
 		return result, err
 	}
-	if err := validateStandardAuthoringV3MaterializationEvidence(result.candidateSnapshot, result.validationReceipt, result.finalAttestation, standardAuthoringV3CandidateFiles(result.instruction, result.taskTOML, result.dockerfile, result.solveScript, result.testScript, result.testsAnalysis), time.Now); err != nil {
+	if err := validateStandardAuthoringV3MaterializationEvidence(result.candidateSnapshot, result.validationReceipt, result.finalAttestation, standardAuthoringV3CandidateFiles(result.instruction, result.taskTOML, result.dockerfile, result.solveScript, result.testScript, result.testsAnalysis)); err != nil {
 		return result, err
 	}
 	contractRaw, err := read(workflowadapter.AuthoringContractArtifact)
@@ -357,7 +357,7 @@ func validateStandardAuthoringMaterializationContract(contract workflowadapter.A
 }
 
 func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit.StageExecutionRequest, run store.WorkflowRun, subject workflowRunSubject) (standardAuthoringMaterializeInputSet, error) {
-	if !isCurrentStandardAuthoringRun(run) {
+	if !isAdmissibleStandardAuthoringRun(run) {
 		return standardAuthoringMaterializeInputSet{}, fmt.Errorf("Standard authoring materializer Run is not bound to the current template")
 	}
 	if request.ReadInput == nil {
@@ -426,7 +426,7 @@ func standardAuthoringMaterializeInputs(ctx context.Context, request workflowkit
 	if result.finalAttestation, err = read("final_attestation"); err != nil {
 		return result, err
 	}
-	if err := validateStandardAuthoringV3MaterializationEvidence(result.candidateSnapshot, result.validationReceipt, result.finalAttestation, standardAuthoringV3CandidateFiles(result.instruction, result.taskTOML, result.dockerfile, result.solveScript, result.testScript, result.testsAnalysis), time.Now); err != nil {
+	if err := validateStandardAuthoringV3MaterializationEvidence(result.candidateSnapshot, result.validationReceipt, result.finalAttestation, standardAuthoringV3CandidateFiles(result.instruction, result.taskTOML, result.dockerfile, result.solveScript, result.testScript, result.testsAnalysis)); err != nil {
 		return result, err
 	}
 	decision, err := read("solution_review_decision")

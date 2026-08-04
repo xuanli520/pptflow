@@ -649,14 +649,21 @@ func (observer continuationStateObserverFunc) Observe(ctx context.Context, run s
 	return observer(ctx, run, revision, workflow)
 }
 
-func controlledNoContentFixtureObserver(t *testing.T) continuationStateObserver {
+func (observer continuationStateObserverFunc) ObserveSubject(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, workflow workflowkit.WorkflowDescriptor) (continuationRunState, error) {
+	if !subject.isTaskRevision() || subject.Revision == nil {
+		return continuationRunState{}, fmt.Errorf("fixture observer only supports task-revision subjects")
+	}
+	return observer(ctx, run, *subject.Revision, workflow)
+}
+
+func controlledNoContentFixtureObserver(t *testing.T) continuationSubjectStateObserver {
 	t.Helper()
 	return continuationStateObserverFunc(func(_ context.Context, _ store.WorkflowRun, _ store.TaskRevision, workflow workflowkit.WorkflowDescriptor) (continuationRunState, error) {
 		return controlledNoContentFixtureState(workflow)
 	})
 }
 
-func hybridNoContentFixtureObserver(t *testing.T, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore) continuationStateObserver {
+func hybridNoContentFixtureObserver(t *testing.T, dataStore *store.Store, objects *workflowruntime.ArtifactObjectStore) continuationSubjectStateObserver {
 	t.Helper()
 	return continuationStateObserverFunc(func(ctx context.Context, run store.WorkflowRun, revision store.TaskRevision, workflow workflowkit.WorkflowDescriptor) (continuationRunState, error) {
 		state, err := controlledNoContentFixtureState(workflow)

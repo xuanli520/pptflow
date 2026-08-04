@@ -123,7 +123,7 @@ func (core *lifecycleServiceCore) verifyAuthoringSourceInput(ctx context.Context
 	if err != nil {
 		return fmt.Errorf("verify authoring session root contract: %w", err)
 	}
-	if err := validateStandardAuthoringContractBindings(specification, contract); err != nil {
+	if err := validateStandardAuthoringContractBindings(manifest.Resolved.Descriptor, specification, contract); err != nil {
 		return fmt.Errorf("verify authoring execution root contract binding: %w", err)
 	}
 	if contract.Contract.Source.RepositoryURL != subject.AuthoringSource.RepositoryURL || contract.Contract.Source.CommitSHA != subject.AuthoringSource.CommitSHA ||

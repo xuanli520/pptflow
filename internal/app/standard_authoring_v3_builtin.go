@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -23,10 +22,7 @@ func standardAuthoringV3CandidateFiles(instruction, taskTOML, dockerfile, solveS
 // boundary before package admission and materialization. A passed package
 // report is insufficient when its candidate or final review evidence names a
 // different snapshot.
-func validateStandardAuthoringV3MaterializationEvidence(snapshotRaw, receiptRaw, attestationRaw []byte, files map[string][]byte, now func() time.Time) error {
-	if now == nil {
-		return fmt.Errorf("Standard authoring V3 evidence clock is unavailable")
-	}
+func validateStandardAuthoringV3MaterializationEvidence(snapshotRaw, receiptRaw, attestationRaw []byte, files map[string][]byte) error {
 	var snapshot workflowkit.CandidateSnapshot
 	if err := decodeStrictJSON(string(snapshotRaw), &snapshot); err != nil || snapshot.Validate() != nil {
 		return fmt.Errorf("Standard authoring V3 candidate snapshot is invalid")
@@ -34,9 +30,13 @@ func validateStandardAuthoringV3MaterializationEvidence(snapshotRaw, receiptRaw,
 	if err := validateStandardAuthoringV3CandidateFiles(snapshot, files); err != nil {
 		return err
 	}
+	// The receipt is admitted by structural and digest binding, not by wall
+	// clock freshness: materialization is an operator-paced flow that can
+	// legitimately resume hours after HostCandidateVerify, and every stage
+	// artifact below still proves the receipt names this exact candidate.
 	var receipt workflowkit.ValidationReceipt
-	if err := decodeStrictJSON(string(receiptRaw), &receipt); err != nil || receipt.ValidateAt(now()) != nil || receipt.Verdict != workflowkit.ValidationPass || receipt.SnapshotDigest != snapshot.Digest {
-		return fmt.Errorf("Standard authoring V3 validation receipt is not a current passing receipt for the candidate")
+	if err := decodeStrictJSON(string(receiptRaw), &receipt); err != nil || receipt.Validate() != nil || receipt.Verdict != workflowkit.ValidationPass || receipt.SnapshotDigest != snapshot.Digest {
+		return fmt.Errorf("Standard authoring V3 validation receipt is not a passing receipt for the candidate")
 	}
 	var attestation standardAuthoringFinalAttestation
 	if err := decodeStrictJSON(string(attestationRaw), &attestation); err != nil ||
@@ -135,9 +135,13 @@ func (executor *StandardAuthoringMaterializeExecutor) executeFinalAttestation(ct
 	if err != nil {
 		return workflowkit.StageExecutionResult{}, err
 	}
+	// See validateStandardAuthoringV3MaterializationEvidence: a stale receipt
+	// is still cryptographically bound to the candidate and contract; the
+	// recovery path re-runs HostCandidateVerify when a fresh receipt is
+	// needed instead of rejecting an operator-paced review.
 	var receipt workflowkit.ValidationReceipt
-	if err := decodeStrictJSON(string(inputs["validation_receipt"]), &receipt); err != nil || receipt.ValidateAt(executor.core.now()) != nil || receipt.Verdict != workflowkit.ValidationPass {
-		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring final attestation requires a current passing validation receipt")
+	if err := decodeStrictJSON(string(inputs["validation_receipt"]), &receipt); err != nil || receipt.Validate() != nil || receipt.Verdict != workflowkit.ValidationPass {
+		return workflowkit.StageExecutionResult{}, fmt.Errorf("Standard authoring final attestation requires a passing validation receipt")
 	}
 	attestation := standardAuthoringFinalAttestation{
 		Format: "harbor.standard-authoring-final-attestation.v1", Version: "1", SnapshotDigest: receipt.SnapshotDigest,

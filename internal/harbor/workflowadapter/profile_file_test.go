@@ -76,8 +76,8 @@ func TestParseExecutionProfileJSONRejectsAmbiguousOrMalformedInput(t *testing.T)
 			errorMatch: "unexpected trailing JSON value",
 		},
 		{
-			name:       "wrong continuation TTL",
-			mutate:     func(document map[string]any) { document["continuation_plan_ttl"] = "23h" },
+			name:       "continuation TTL over limit",
+			mutate:     func(document map[string]any) { document["continuation_plan_ttl"] = "168h1m0s" },
 			errorMatch: "continuation plan TTL",
 		},
 		{

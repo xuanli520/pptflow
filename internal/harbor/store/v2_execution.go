@@ -698,10 +698,19 @@ func validWorkflowRunStatus(status WorkflowRunStatus) bool {
 }
 
 func validWorkflowRunTransition(from, to WorkflowRunStatus) bool {
-	if from == to || isTerminalWorkflowRunStatus(from) {
+	// interrupted and canceled are the terminal-looking statuses a committed
+	// continuation may reopen: the runtime only writes them after it has proven
+	// there is no unknown external side effect, so resuming schedules a new
+	// attempt instead of guessing an outcome. Succeeded and failed_terminal
+	// never reopen; their only recovery is a new Run (authoring 重跑).
+	if from == to || (from != WorkflowRunInterrupted && from != WorkflowRunCanceled && isTerminalWorkflowRunStatus(from)) {
 		return false
 	}
 	switch from {
+	case WorkflowRunInterrupted:
+		return to == WorkflowRunRunning
+	case WorkflowRunCanceled:
+		return to == WorkflowRunRunning
 	case WorkflowRunQueued:
 		// A durable coordinator can discover a malformed frozen payload before
 		// it has begun execution. Preserve that integrity fact as in_doubt

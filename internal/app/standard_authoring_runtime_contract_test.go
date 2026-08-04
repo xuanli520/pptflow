@@ -159,3 +159,74 @@ func TestCurrentStandardAuthoringRunRejectsNonCurrentVersions(t *testing.T) {
 		}
 	}
 }
+
+func TestStandardAuthoringRuntimeContractAdmitsSameMajorFamilyRun(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	profile := lifecycleCompleteProfileForTemplate(t, template)
+	resolved, err := template.Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved = resolved.Clone()
+	resolved.Template.Version = "3.0.1"
+	resolved.TemplateID = workflowadapter.StandardAuthoringWorkflowTemplateID
+	resolved.TemplateVersion = "3.0.1"
+	resolved.Descriptor.Version = "3.0.1"
+	runID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := store.WorkflowRun{
+		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
+		WorkflowTemplateVersion: "3.0.1",
+	}
+	if !isAdmissibleStandardAuthoringRun(run) {
+		t.Fatalf("same-major Standard authoring Run was rejected")
+	}
+	spec := workflowadapter.RunExecutionSpec{Template: workflowadapter.TemplateReference{ID: workflowadapter.StandardAuthoringWorkflowTemplateID, Version: "3.0.1"}}
+	if err := validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, spec); err != nil {
+		t.Fatalf("same-major Standard authoring Run with matching shapes = %v, want admission", err)
+	}
+}
+
+func TestStandardAuthoringRuntimeContractRejectsSameMajorInputDrift(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	profile := lifecycleCompleteProfileForTemplate(t, template)
+	resolved, err := template.Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range resolved.Descriptor.Stages {
+		if resolved.Descriptor.Stages[index].Key != workflowkit.StageKey(workflowadapter.TaskSynthesis) {
+			continue
+		}
+		inputs := resolved.Descriptor.Stages[index].Inputs
+		filtered := inputs[:0]
+		for _, input := range inputs {
+			if input.Name != "repo_structure_evidence" {
+				filtered = append(filtered, input)
+			}
+		}
+		resolved.Descriptor.Stages[index].Inputs = filtered
+		if resolved.Descriptor.Stages[index].AgentRole != nil {
+			resolved.Descriptor.Stages[index].AgentRole.InputSchemas = append([]workflowkit.ArtifactSpec(nil), filtered...)
+		}
+	}
+	resolved.Template.Version = "3.0.1"
+	resolved.TemplateID = workflowadapter.StandardAuthoringWorkflowTemplateID
+	resolved.TemplateVersion = "3.0.1"
+	resolved.Descriptor.Version = "3.0.1"
+	runID, err := store.NewUUIDv7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := store.WorkflowRun{
+		ID: runID, WorkflowTemplateID: workflowadapter.StandardAuthoringWorkflowTemplateID,
+		WorkflowTemplateVersion: "3.0.1",
+	}
+	spec := workflowadapter.RunExecutionSpec{Template: workflowadapter.TemplateReference{ID: workflowadapter.StandardAuthoringWorkflowTemplateID, Version: "3.0.1"}}
+	err = validateCurrentStandardAuthoringFrozenContract(run, runManifest{Resolved: resolved}, spec)
+	if err == nil || !strings.Contains(err.Error(), "versioned input contract") {
+		t.Fatalf("same-major Run with drifted input shape = %v, want input-contract rejection", err)
+	}
+}

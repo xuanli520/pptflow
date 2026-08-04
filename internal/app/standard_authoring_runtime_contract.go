@@ -3,28 +3,69 @@ package app
 import (
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-// isCurrentStandardAuthoringRun admits only source/session template versions
-// compiled into this binary. Historical records remain inspectable but are
-// never executed through an ambient "latest" authoring contract.
+// isCurrentStandardAuthoringRun admits exactly the template version compiled
+// into this binary. It is the strict identity used by new-run creation and
+// launch flows, which must always bind the current contract.
 func isCurrentStandardAuthoringRun(run store.WorkflowRun) bool {
 	return workflowadapter.StandardAuthoringCurrentTemplateReference().Equal(workflowadapter.TemplateReference{
 		ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion,
 	})
 }
 
+// isAdmissibleStandardAuthoringRun admits the current template plus same-major
+// family versions. A small version upgrade (for example 3.0.0 to 3.0.1) must
+// not orphan Runs that are already queued, running, or waiting for review:
+// their frozen manifests are self-describing, and
+// validateCurrentStandardAuthoringFrozenContract still proves the frozen
+// stage input shapes match the current catalog before any execution. Legacy
+// major families (for example the 2.x pre-materialization contract) remain a
+// hard cutover.
+func isAdmissibleStandardAuthoringRun(run store.WorkflowRun) bool {
+	if run.WorkflowTemplateID != workflowadapter.StandardAuthoringWorkflowTemplateID {
+		return false
+	}
+	current, ok := standardAuthoringTemplateFamilyVersion(workflowadapter.StandardAuthoringCurrentTemplateReference().Version)
+	if !ok {
+		return false
+	}
+	actual, ok := standardAuthoringTemplateFamilyVersion(run.WorkflowTemplateVersion)
+	return ok && actual == current
+}
+
+// standardAuthoringTemplateFamilyVersion parses the leading major component of
+// a semantic template version ("3.0.0" -> 3). Non-semantic versions are not
+// admissible because there is no principled compatibility boundary for them.
+func standardAuthoringTemplateFamilyVersion(version string) (int, bool) {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return 0, false
+	}
+	majorText, _, _ := strings.Cut(version, ".")
+	major, err := strconv.Atoi(majorText)
+	if err != nil || major < 0 {
+		return 0, false
+	}
+	return major, true
+}
+
 // validateCurrentStandardAuthoringFrozenContract proves that an executable
 // AuthoringSession Run is consistently bound to the current policy-bearing
-// template. It rejects a historical descriptor before any provider, artifact,
-// or handoff path can reinterpret it under the current contract.
+// template family. It admits the current version and same-major versions whose
+// frozen descriptor still matches the current catalog's versioned input
+// contract; a historical or drifted descriptor is rejected before any
+// provider, artifact, or handoff path can reinterpret it under the current
+// contract.
 func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manifest runManifest, specification workflowadapter.RunExecutionSpec) error {
 	templateReference := workflowadapter.TemplateReference{ID: run.WorkflowTemplateID, Version: run.WorkflowTemplateVersion}
-	if !isCurrentStandardAuthoringRun(run) {
+	if !isCurrentStandardAuthoringRun(run) && !isAdmissibleStandardAuthoringRun(run) {
 		return fmt.Errorf("Standard authoring Run %s requires current template registration for source/session execution", run.ID)
 	}
 	if !manifest.Resolved.Template.Equal(templateReference) || manifest.Resolved.TemplateID != templateReference.ID ||
@@ -35,9 +76,9 @@ func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manif
 	if err := manifest.Resolved.Descriptor.Validate(); err != nil {
 		return fmt.Errorf("validate Standard authoring Run %s frozen descriptor: %w", run.ID, err)
 	}
-	template, err := workflowadapter.ResolveWorkflowTemplate(templateReference)
+	template, err := workflowadapter.ResolveWorkflowTemplate(workflowadapter.StandardAuthoringCurrentTemplateReference())
 	if err != nil {
-		return fmt.Errorf("resolve Standard authoring Run %s frozen template: %w", run.ID, err)
+		return fmt.Errorf("resolve current Standard authoring template: %w", err)
 	}
 	for _, expectedStage := range template.Catalog.Stages {
 		actualStage, found := manifest.Resolved.Descriptor.Stage(expectedStage.Key)

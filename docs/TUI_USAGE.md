@@ -42,13 +42,30 @@ harbor-factory --root .harbor-factory tui
 CLI 可执行同一恢复路径：
 
 ```text
-harbor-factory --root .harbor-factory authoring recover \
-  --run <authoring-run-uuidv7> \
+harbor-factory --root .harbor-factory run recover \
+  --run <run-uuidv7> \
+  --reason "recover transient provider failure" \
+  --dry-run          # 先预览恢复计划（只读，不落库）
+harbor-factory --root .harbor-factory run recover \
+  --run <run-uuidv7> \
   --idempotency-key <uuidv7> \
-  --reason "recover transient provider failure"
+  --reason "recover transient provider failure"   # 确认执行
 ```
 
-附加 `--dry-run` 只返回恢复计划，不写入 command、plan、execution 或 worker job。网络响应丢失后，使用相同的幂等键重试；服务会重放原计划或执行回执，而不是重新解释较新的 Run 状态。
+`run recover` 同时适用于任务修订 Run 与 Standard 创题 Run：预览返回复用/重排阶段与语义计划指纹，确认时服务端重新绑定 checkpoint 与指纹，过期预览会被拒绝而不是静默重定向。网络响应丢失后使用相同幂等键重试，服务会重放原计划或执行回执。
+
+内容被判死（`failed_terminal`、审核拒绝）或希望以同一冻结输入另起一轮时，使用重跑：
+
+```text
+harbor-factory --root .harbor-factory run restart \
+  --run <authoring-run-uuidv7> --dry-run          # 只读预览可重跑性
+harbor-factory --root .harbor-factory run restart \
+  --run <authoring-run-uuidv7> \
+  --idempotency-key <uuidv7> \
+  --reason "restart after terminal rejection"
+```
+
+`run restart` 只接受终态的创题 Run：它复用冻结源码快照、draft Task、profile 与部署目录，新建 Session 和 Run，并在新旧 Run 的 manifest 上记录 `restart_of_run_id` 血缘；不会重新拉取 Git。已物化题目的任务不再是无 revision 的 draft，无法以同一输入重跑，请新建创题。
 
 ## 审核
 
