@@ -1008,7 +1008,11 @@ func gitSubcommandIndex(tokens []string, gitIndex int) int {
 			index += 2
 			continue
 		}
-		if strings.HasPrefix(value, "--git-dir=") || strings.HasPrefix(value, "--work-tree=") {
+		if value == "-c" || value == "--config" {
+			index += 2
+			continue
+		}
+		if strings.HasPrefix(value, "--git-dir=") || strings.HasPrefix(value, "--work-tree=") || strings.HasPrefix(value, "--config=") {
 			index++
 			continue
 		}
