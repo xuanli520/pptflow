@@ -229,6 +229,17 @@ func PlanWorkflowRepair(workflow WorkflowDescriptor, finding WorkflowFinding, ru
 	}, nil
 }
 
+// HasWorkflowRepairRule reports whether any frozen rule targets the finding
+// code, so a bound pass finding never needs a repair plan at all.
+func HasWorkflowRepairRule(rules []WorkflowRepairRule, code string) bool {
+	for _, rule := range rules {
+		if rule.FindingCode == code {
+			return true
+		}
+	}
+	return false
+}
+
 func matchingWorkflowRepairRule(workflow WorkflowDescriptor, finding WorkflowFinding, rules []WorkflowRepairRule) (WorkflowRepairRule, error) {
 	var match *WorkflowRepairRule
 	for index := range rules {

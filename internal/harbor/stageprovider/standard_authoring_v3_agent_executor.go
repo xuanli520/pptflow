@@ -402,6 +402,12 @@ func standardAuthoringV3RepairLedger(workflow workflowkit.WorkflowDescriptor, in
 		if finding.CandidateDigest != identity.CandidateSnapshotDigest || finding.EvidenceDigest != identity.ValidationReceiptDigest || finding.DiagnosticDigest != identity.ValidationReceiptDigest {
 			continue
 		}
+		// A bound pass finding (e.g. solution_integrity_pass) records that the
+		// critic reviewed the current candidate without a defect; it has no
+		// repair rule and must not be planned as a fenced repair.
+		if !workflowkit.HasWorkflowRepairRule(rules, finding.Code) {
+			continue
+		}
 		plan, err := workflowkit.PlanWorkflowRepair(workflow, finding, rules, nil)
 		if err != nil {
 			return nil, fmt.Errorf("finding %q is not an allowed fenced repair", name)

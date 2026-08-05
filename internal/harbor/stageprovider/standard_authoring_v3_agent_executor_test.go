@@ -1121,3 +1121,110 @@ func TestStandardAuthoringCodexSandboxMatchesWorkspaceCapability(t *testing.T) {
 		t.Fatal("unsupported workspace mode received a Codex sandbox")
 	}
 }
+
+func TestStandardAuthoringV3RepairLedgerSkipsBoundPassFindings(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	resolved, err := template.Compile(standardAuthoringTestExecutionProfile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := workflowkit.NewCandidateSnapshot([]workflowkit.CandidateFile{{
+		Path: "candidate.txt", SchemaVersion: "harbor.artifact.v1", ContentDigest: workflowkit.SHA256Fingerprint([]byte("candidate")), SizeBytes: int64(len("candidate")),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := workflowkit.NewCandidateValidationContract(workflowkit.SHA256Fingerprint([]byte("runtime")), workflowkit.SHA256Fingerprint([]byte("verification")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractDigest, err := contract.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	receipt, err := workflowkit.NewValidationReceipt(workflowkit.ValidationReceipt{
+		SnapshotDigest: snapshot.Digest, ContractDigest: contractDigest, Verdict: workflowkit.ValidationReject, FailureCode: workflowkit.AgentFailureValidatorReject,
+		IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRaw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRaw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairContext, err := workflowadapter.NewStandardAuthoringValidationRepairContext(receipt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairContextRaw, err := json.Marshal(repairContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := map[string][]byte{
+		"candidate_snapshot": snapshotRaw, "validation_receipt": receiptRaw,
+		workflowadapter.StandardAuthoringValidationRepairContextArtifact: repairContextRaw,
+	}
+	// A critic that passed the current candidate writes a pass finding that is
+	// digest-bound to the same receipt. It has no repair rule and must be
+	// skipped, not planned as a fenced repair (regression: repair input turned
+	// into a permanent standard_authoring_codex_agent_turn.input failure).
+	passFinding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
+		Code: "solution_integrity_pass", ProducingStage: workflowkit.StageKey(workflowadapter.SolutionIntegrityCritic),
+		TargetWriter:   workflowkit.StageKey(workflowadapter.AuthoringRepair),
+		EvidenceDigest: receipt.Digest, CandidateDigest: snapshot.Digest, DiagnosticDigest: receipt.Digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	passFindingRaw, err := json.Marshal(passFinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs["solution_integrity_finding"] = passFindingRaw
+	defectFinding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
+		Code: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic),
+		TargetWriter:   workflowkit.StageKey(workflowadapter.AuthoringRepair),
+		EvidenceDigest: receipt.Digest, CandidateDigest: snapshot.Digest, DiagnosticDigest: receipt.Digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defectFindingRaw, err := json.Marshal(defectFinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs["test_quality_finding"] = defectFindingRaw
+	ledgerRaw, err := standardAuthoringV3RepairLedger(resolved.Descriptor, inputs)
+	if err != nil {
+		t.Fatalf("repair ledger rejected bound pass findings: %v", err)
+	}
+	var ledger workflowkit.WorkflowRepairLedger
+	if err := json.Unmarshal(ledgerRaw, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	hasPass := false
+	hasDefect := false
+	for _, entry := range ledger.Entries {
+		switch entry.Finding.Code {
+		case "solution_integrity_pass":
+			hasPass = true
+		case "test_quality_defect":
+			hasDefect = true
+		}
+	}
+	if hasPass {
+		t.Fatalf("repair ledger included the pass finding: %+v", ledger)
+	}
+	if !hasDefect {
+		t.Fatalf("repair ledger dropped the bound defect finding: %+v", ledger)
+	}
+}
