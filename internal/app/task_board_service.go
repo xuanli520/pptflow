@@ -1060,6 +1060,14 @@ func (service *TaskBoardService) PreviewRunRecovery(ctx context.Context, request
 
 	var plan workflowkit.ContinuationPlan
 	strategy := taskBoardRetryStrategy(run)
+	continuationTaskID := request.TaskID
+	if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+		// A pre-materialization authoring run binds its checkpoint to the
+		// frozen source/session, not to a durable Task; passing the board
+		// Task ID would fail the continuation checkpoint subject equality
+		// check that task-revision recoveries rely on.
+		continuationTaskID = ""
+	}
 	switch run.SubjectKind {
 	case store.WorkflowRunSubjectTaskRevision, store.WorkflowRunSubjectAuthoringSession:
 		if service.continuations == nil {
@@ -1071,7 +1079,7 @@ func (service *TaskBoardService) PreviewRunRecovery(ctx context.Context, request
 		}
 		plan, err = service.continuations.PreviewTaskContinuation(ctx, ContinueTaskCommand{
 			CommandKey: commandKey,
-			TaskID:     request.TaskID,
+			TaskID:     continuationTaskID,
 			RunID:      request.RunID,
 			Expected:   checkpoint,
 			Actor:      actor,
@@ -1184,9 +1192,21 @@ func (service *TaskBoardService) continueRunRecovery(ctx context.Context, prepar
 	if expectedCheckpoint != nil && *expectedCheckpoint != checkpoint {
 		return TaskBoardMutation{}, fmt.Errorf("%w: recovery checkpoint is stale", store.ErrOptimisticLock)
 	}
+	run, err := service.taskBoardWorkflowRun(ctx, prepared.RunID)
+	if err != nil {
+		return TaskBoardMutation{}, err
+	}
+	continuationTaskID := prepared.TaskID
+	if run.SubjectKind == store.WorkflowRunSubjectAuthoringSession {
+		// A pre-materialization authoring run binds its checkpoint to the
+		// frozen source/session, not to a durable Task; passing the board
+		// Task ID would fail the continuation checkpoint subject equality
+		// check that task-revision recoveries rely on.
+		continuationTaskID = ""
+	}
 	plan, err := service.continuations.PlanTaskContinuation(ctx, ContinueTaskCommand{
 		CommandKey: prepared.IdempotencyKey,
-		TaskID:     prepared.TaskID,
+		TaskID:     continuationTaskID,
 		RunID:      prepared.RunID,
 		Expected:   checkpoint,
 		Actor:      actor,

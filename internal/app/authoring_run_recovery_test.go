@@ -77,7 +77,7 @@ func TestTaskBoardRecoversStandardAuthoringRunFromFrozenCheckpoint(t *testing.T)
 	fixture := newAuthoringRunFixture(t, ctx)
 	run := fixture.recoverableRun(t, ctx)
 
-	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{RunID: run.ID, Reason: "preview authoring recovery"})
+	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{TaskID: fixture.taskID, RunID: run.ID, Reason: "preview authoring recovery"})
 	if err != nil {
 		t.Fatalf("preview authoring recovery: %v", err)
 	}
@@ -97,6 +97,7 @@ func TestTaskBoardRecoversStandardAuthoringRunFromFrozenCheckpoint(t *testing.T)
 	checkpoint := preview.Checkpoint
 	mutation, err := fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
 		IdempotencyKey:                  key,
+		TaskID:                          fixture.taskID,
 		RunID:                           run.ID,
 		Reason:                          "confirm authoring recovery",
 		ExpectedRecoveryCheckpoint:      &checkpoint,
@@ -105,7 +106,7 @@ func TestTaskBoardRecoversStandardAuthoringRunFromFrozenCheckpoint(t *testing.T)
 	if err != nil {
 		t.Fatalf("confirm authoring recovery: %v", err)
 	}
-	if mutation.RunID != run.ID || mutation.TaskID != "" {
+	if mutation.RunID != run.ID || mutation.TaskID != fixture.taskID {
 		t.Fatalf("authoring recovery mutation = %+v", mutation)
 	}
 	recovered, err := fixture.store.GetWorkflowRun(ctx, run.ID)
@@ -154,7 +155,7 @@ func TestTaskBoardRecoversInterruptedAuthoringRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("interrupt authoring Run: %v", err)
 	}
-	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{RunID: interrupted.ID, Reason: "preview interrupted recovery"})
+	preview, err := fixture.services.TaskBoard.PreviewRunRecovery(ctx, TaskBoardPreviewRunRecoveryRequest{TaskID: fixture.taskID, RunID: interrupted.ID, Reason: "preview interrupted recovery"})
 	if err != nil {
 		t.Fatalf("preview interrupted authoring recovery: %v", err)
 	}
@@ -165,6 +166,7 @@ func TestTaskBoardRecoversInterruptedAuthoringRun(t *testing.T) {
 	checkpoint := preview.Checkpoint
 	if _, err := fixture.services.TaskBoard.RetryRun(ctx, TaskBoardRetryRunRequest{
 		IdempotencyKey:                  key,
+		TaskID:                          fixture.taskID,
 		RunID:                           interrupted.ID,
 		Reason:                          "confirm interrupted recovery",
 		ExpectedRecoveryCheckpoint:      &checkpoint,
