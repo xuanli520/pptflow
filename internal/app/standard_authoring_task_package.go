@@ -270,7 +270,7 @@ func invalidStandardAuthoringTaskTOMLViolation(validationErr error) codeedge.Vio
 }
 
 func invalidStandardAuthoringTestsAnalysisViolation() codeedge.Violation {
-	return codeedge.Violation{Code: "tests_analysis", Path: "tests_analysis.md", Message: "generated tests analysis must be a strict harbor.standard-authoring-tests-analysis.v2 JSON object with stable requirement IDs"}
+	return codeedge.Violation{Code: "tests_analysis", Path: "tests_analysis.md", Message: "tests_analysis.md is rendered from tests_analysis.json; generated tests analysis must be a strict harbor.standard-authoring-tests-analysis.v2 JSON object (requirement_ids plus provided_information, theoretical_path, and passing_evidence sections) with stable requirement IDs"}
 }
 
 func invalidStandardAuthoringSolveScriptViolation() codeedge.Violation {
@@ -537,6 +537,23 @@ type standardAuthoringTestsAnalysis struct {
 	PassingEvidence     string   `json:"passing_evidence"`
 }
 
+// standardAuthoringTestsAnalysisRequirement is one entry of the
+// requirements-array shape some authoring agents emit. The package compiler
+// accepts that shape as a v2-compatible equivalent and renders the same
+// tests_analysis.md sections from it.
+type standardAuthoringTestsAnalysisRequirement struct {
+	RequirementID       string `json:"requirement_id"`
+	ProvidedInformation string `json:"provided_information"`
+	TheoreticalPath     string `json:"theoretical_path"`
+	PassingEvidence     string `json:"passing_evidence"`
+}
+
+type standardAuthoringTestsAnalysisRequirementsShape struct {
+	Format       string                                      `json:"format"`
+	Version      string                                      `json:"version"`
+	Requirements []standardAuthoringTestsAnalysisRequirement `json:"requirements"`
+}
+
 func renderStandardAuthoringTestsAnalysis(raw []byte) ([]byte, error) {
 	if !utf8.Valid(raw) || bytes.IndexByte(raw, 0) >= 0 {
 		return nil, fmt.Errorf("decode typed tests analysis: document is not valid UTF-8 text")
@@ -544,28 +561,9 @@ func renderStandardAuthoringTestsAnalysis(raw []byte) ([]byte, error) {
 	if err := rejectDuplicateStandardAuthoringJSONKeys(raw); err != nil {
 		return nil, fmt.Errorf("decode typed tests analysis: %w", err)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	var analysis standardAuthoringTestsAnalysis
-	if err := decoder.Decode(&analysis); err != nil {
+	analysis, err := decodeStandardAuthoringTestsAnalysis(raw)
+	if err != nil {
 		return nil, fmt.Errorf("decode typed tests analysis: %w", err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("decode typed tests analysis: trailing JSON value")
-	}
-	if analysis.Format != "harbor.standard-authoring-tests-analysis.v2" || analysis.Version != "2" || len(analysis.RequirementIDs) == 0 {
-		return nil, fmt.Errorf("decode typed tests analysis: format, version, and requirement IDs are required")
-	}
-	requirementIDs := make(map[string]struct{}, len(analysis.RequirementIDs))
-	for _, id := range analysis.RequirementIDs {
-		if !standardAuthoringRequirementID(id) {
-			return nil, fmt.Errorf("decode typed tests analysis: requirement ID is invalid")
-		}
-		if _, duplicate := requirementIDs[id]; duplicate {
-			return nil, fmt.Errorf("decode typed tests analysis: requirement IDs must be unique")
-		}
-		requirementIDs[id] = struct{}{}
 	}
 	sections := []struct{ title, body string }{
 		{"0. Requirement IDs", strings.Join(analysis.RequirementIDs, ", ")},
@@ -589,6 +587,87 @@ func renderStandardAuthoringTestsAnalysis(raw []byte) ([]byte, error) {
 		output.WriteString("\n")
 	}
 	return []byte(output.String()), nil
+}
+
+// decodeStandardAuthoringTestsAnalysis accepts both the canonical flat
+// harbor.standard-authoring-tests-analysis.v2 shape (requirement_ids plus one
+// section per requirement family) and the requirements-array shape emitted by
+// some authoring agents (one entry per requirement with the same section
+// fields). Both decode strictly: duplicate JSON keys, unknown fields, invalid
+// or duplicate requirement IDs, and missing section bodies are rejected.
+func decodeStandardAuthoringTestsAnalysis(raw []byte) (standardAuthoringTestsAnalysis, error) {
+	if analysis, err := decodeStandardAuthoringTestsAnalysisFlat(raw); err == nil {
+		return analysis, nil
+	}
+	return decodeStandardAuthoringTestsAnalysisRequirementsShape(raw)
+}
+
+func decodeStandardAuthoringTestsAnalysisFlat(raw []byte) (standardAuthoringTestsAnalysis, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var analysis standardAuthoringTestsAnalysis
+	if err := decoder.Decode(&analysis); err != nil {
+		return standardAuthoringTestsAnalysis{}, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return standardAuthoringTestsAnalysis{}, fmt.Errorf("trailing JSON value")
+	}
+	if analysis.Format != "harbor.standard-authoring-tests-analysis.v2" || analysis.Version != "2" || len(analysis.RequirementIDs) == 0 {
+		return standardAuthoringTestsAnalysis{}, fmt.Errorf("format, version, and requirement IDs are required")
+	}
+	requirementIDs := make(map[string]struct{}, len(analysis.RequirementIDs))
+	for _, id := range analysis.RequirementIDs {
+		if !standardAuthoringRequirementID(id) {
+			return standardAuthoringTestsAnalysis{}, fmt.Errorf("requirement ID is invalid")
+		}
+		if _, duplicate := requirementIDs[id]; duplicate {
+			return standardAuthoringTestsAnalysis{}, fmt.Errorf("requirement IDs must be unique")
+		}
+		requirementIDs[id] = struct{}{}
+	}
+	return analysis, nil
+}
+
+func decodeStandardAuthoringTestsAnalysisRequirementsShape(raw []byte) (standardAuthoringTestsAnalysis, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var shape standardAuthoringTestsAnalysisRequirementsShape
+	if err := decoder.Decode(&shape); err != nil {
+		return standardAuthoringTestsAnalysis{}, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return standardAuthoringTestsAnalysis{}, fmt.Errorf("trailing JSON value")
+	}
+	if shape.Format != "harbor.standard-authoring-tests-analysis.v2" || shape.Version != "2" || len(shape.Requirements) == 0 {
+		return standardAuthoringTestsAnalysis{}, fmt.Errorf("format, version, and requirements are required")
+	}
+	analysis := standardAuthoringTestsAnalysis{
+		Format: shape.Format, Version: shape.Version,
+		RequirementIDs: make([]string, 0, len(shape.Requirements)),
+	}
+	requirementIDs := make(map[string]struct{}, len(shape.Requirements))
+	provided := make([]string, 0, len(shape.Requirements))
+	theoretical := make([]string, 0, len(shape.Requirements))
+	evidence := make([]string, 0, len(shape.Requirements))
+	for _, requirement := range shape.Requirements {
+		if !standardAuthoringRequirementID(requirement.RequirementID) {
+			return standardAuthoringTestsAnalysis{}, fmt.Errorf("requirement ID is invalid")
+		}
+		if _, duplicate := requirementIDs[requirement.RequirementID]; duplicate {
+			return standardAuthoringTestsAnalysis{}, fmt.Errorf("requirement IDs must be unique")
+		}
+		requirementIDs[requirement.RequirementID] = struct{}{}
+		analysis.RequirementIDs = append(analysis.RequirementIDs, requirement.RequirementID)
+		provided = append(provided, strings.TrimSpace(requirement.ProvidedInformation))
+		theoretical = append(theoretical, strings.TrimSpace(requirement.TheoreticalPath))
+		evidence = append(evidence, strings.TrimSpace(requirement.PassingEvidence))
+	}
+	analysis.ProvidedInformation = strings.Join(provided, "\n\n")
+	analysis.TheoreticalPath = strings.Join(theoretical, "\n\n")
+	analysis.PassingEvidence = strings.Join(evidence, "\n\n")
+	return analysis, nil
 }
 
 func standardAuthoringRequirementID(value string) bool {

@@ -283,3 +283,50 @@ func assertAdmissionCode(t *testing.T, report codeedge.AdmissionReport, want str
 	}
 	t.Fatalf("report %+v omitted %q", report, want)
 }
+
+func TestCompileStandardAuthoringTaskPackageAcceptsRequirementsArrayAnalysisShape(t *testing.T) {
+	input := standardAuthoringTaskPackageFixture(t)
+	input.TestsAnalysis = []byte(`{"format":"harbor.standard-authoring-tests-analysis.v2","version":"2","requirements":[{"requirement_id":"FIX_ROOT_CAUSE","provided_information":"The instruction and pinned environment define the defect location.","theoretical_path":"Inspect the repository, implement the requested behavior, and run tests.","passing_evidence":"The visible contract and tests provide an objective pass condition."},{"requirement_id":"REGRESSION_COVERAGE","provided_information":"The tests directory pins the deterministic regression suite.","theoretical_path":"Add the missing browser-history boundary cases to the regression suite.","passing_evidence":"The full regression suite passes on the fixed tree."}]}`)
+	result, err := CompileStandardAuthoringTaskPackage(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Report.Passed || len(result.Report.Violations) != 0 {
+		t.Fatalf("requirements-array analysis shape unexpectedly failed admission: %+v", result.Report)
+	}
+	files := taskPackageFilesByPath(result.CanonicalFiles)
+	analysis := string(files["tests_analysis.md"].Data)
+	for _, heading := range []string{"## 0. Requirement IDs", "## 1. instruction 和 environment 已提供的信息", "## 2. 模型的理论通过路径", "## 3. 模型具备通过条件的依据"} {
+		if !strings.Contains(analysis, heading) {
+			t.Fatalf("rendered analysis omitted %q:\n%s", heading, analysis)
+		}
+	}
+	if !strings.Contains(analysis, "FIX_ROOT_CAUSE, REGRESSION_COVERAGE") {
+		t.Fatalf("rendered analysis omitted merged requirement IDs:\n%s", analysis)
+	}
+}
+
+func TestCompileStandardAuthoringTaskPackageRejectsRequirementsArrayAnalysisWithInvalidIDs(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		analysis    string
+		messagePart string
+	}{
+		{name: "duplicate requirement ids", analysis: `{"format":"harbor.standard-authoring-tests-analysis.v2","version":"2","requirements":[{"requirement_id":"REQ_1","provided_information":"a","theoretical_path":"b","passing_evidence":"c"},{"requirement_id":"REQ_1","provided_information":"d","theoretical_path":"e","passing_evidence":"f"}]}`, messagePart: "generated tests analysis"},
+		{name: "lowercase requirement id", analysis: `{"format":"harbor.standard-authoring-tests-analysis.v2","version":"2","requirements":[{"requirement_id":"req_1","provided_information":"a","theoretical_path":"b","passing_evidence":"c"}]}`, messagePart: "generated tests analysis"},
+		{name: "empty passing evidence", analysis: `{"format":"harbor.standard-authoring-tests-analysis.v2","version":"2","requirements":[{"requirement_id":"REQ_1","provided_information":"a","theoretical_path":"b","passing_evidence":""}]}`, messagePart: "generated tests analysis"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := standardAuthoringTaskPackageFixture(t)
+			input.TestsAnalysis = []byte(test.analysis)
+			result, err := CompileStandardAuthoringTaskPackage(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Report.Passed {
+				t.Fatalf("invalid requirements-array analysis unexpectedly passed: %+v", result.Report)
+			}
+			assertAdmissionViolationMessage(t, result.Report, "tests_analysis", test.messagePart)
+		})
+	}
+}
