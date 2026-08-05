@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -24,25 +23,25 @@ import (
 // execution specification is rejected rather than silently using the draft
 // Task as a fabricated revision.
 type StartAuthoringRunRequest struct {
-	ID                            string
-	AuthoringSessionID            string
-	Profile                       workflowadapter.ExecutionProfile
-	ExecutionSpec                 workflowadapter.RunExecutionSpec
-	ProfileFingerprint            workflowkit.Fingerprint
-	ExecutionSpecFingerprint      workflowkit.Fingerprint
-	DeploymentCatalogReceipt      []byte
-	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
-	RestartOfRunID                string
-	Trigger                       string
-	ExecutionEpoch                int
-	Actor                         string
-	Reason                        string
+	ID                       string
+	AuthoringSessionID       string
+	Profile                  workflowadapter.ExecutionProfile
+	ExecutionSpec            workflowadapter.RunExecutionSpec
+	ProfileFingerprint       workflowkit.Fingerprint
+	ExecutionSpecFingerprint workflowkit.Fingerprint
+	DeploymentCatalogReceipt []byte
+	RestartOfRunID           string
+	Trigger                  string
+	ExecutionEpoch           int
+	Actor                    string
+	Reason                   string
 }
 
-// StartAuthoringRun freezes the same profile/spec/catalog/lock/worker
-// contract as StartRun, but stores an AuthoringSource/AuthoringSession subject
-// and no synthetic TaskRevision.  The generic FrozenExecutionRuntime is the
-// only executor for both paths.
+// StartAuthoringRun freezes the same profile/spec/catalog/worker contract as
+// StartRun, but stores an AuthoringSource/AuthoringSession subject and no
+// synthetic TaskRevision. The deployment lock is resolved by the worker at
+// runtime against the currently installed deployment. The generic
+// FrozenExecutionRuntime is the only executor for both paths.
 func (service *RunService) StartAuthoringRun(ctx context.Context, request StartAuthoringRunRequest) (store.WorkflowRun, error) {
 	if service == nil || service.core == nil {
 		return store.WorkflowRun{}, fmt.Errorf("run service is not configured")
@@ -94,10 +93,6 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("freeze deployment catalog receipt for authoring Run: %w", err)
 	}
-	lockIdentity, err := service.core.resolveStartRunDeploymentCatalogLockIdentity(request.ExecutionSpec.Template, request.DeploymentCatalogLockIdentity)
-	if err != nil {
-		return store.WorkflowRun{}, fmt.Errorf("freeze deployment catalog lock identity for authoring Run: %w", err)
-	}
 	template, err := workflowadapter.ResolveWorkflowTemplate(request.Profile.Template)
 	if err != nil {
 		return store.WorkflowRun{}, err
@@ -138,7 +133,7 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if existing, err := service.core.store.GetWorkflowRun(ctx, runID); err != nil {
 		return store.WorkflowRun{}, err
 	} else if existing != nil {
-		if err := service.validateReplayedAuthoringWorkflowRun(ctx, *existing, request, *source, *session, resolved, profileCanonical, requestedCanonical, requestedFingerprint, plan, catalogReceipt, lockIdentity); err != nil {
+		if err := service.validateReplayedAuthoringWorkflowRun(ctx, *existing, request, *source, *session, resolved, profileCanonical, requestedCanonical, requestedFingerprint, plan, catalogReceipt); err != nil {
 			return store.WorkflowRun{}, err
 		}
 		manifest, err := decodeRunManifest(*existing)
@@ -185,11 +180,10 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 			RequestedExecutionSpecFingerprint: requestedFingerprint,
 			ExecutionSpecFingerprint:          requestedFingerprint,
 		},
-		ExecutionSpec:                 append(json.RawMessage(nil), requestedCanonical...),
-		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
-		RestartOfRunID:                strings.TrimSpace(request.RestartOfRunID),
-		Created:                       service.core.now().UTC(),
+		ExecutionSpec:            append(json.RawMessage(nil), requestedCanonical...),
+		DeploymentCatalogReceipt: append(json.RawMessage(nil), catalogReceipt...),
+		RestartOfRunID:           strings.TrimSpace(request.RestartOfRunID),
+		Created:                  service.core.now().UTC(),
 	}
 	encoded, err := json.Marshal(manifest)
 	if err != nil {
@@ -208,15 +202,6 @@ func (service *RunService) StartAuthoringRun(ctx context.Context, request StartA
 	if len(catalogReceipt) != 0 {
 		if err := writeNewBytes(filepath.Join(runDirectory, deploymentCatalogReceiptFileName), catalogReceipt); err != nil {
 			return store.WorkflowRun{}, fmt.Errorf("write authoring deployment catalog receipt: %w", err)
-		}
-	}
-	if lockIdentity != nil {
-		canonicalLock, err := canonicalDeploymentCatalogLockIdentity(*lockIdentity)
-		if err != nil {
-			return store.WorkflowRun{}, err
-		}
-		if err := writeNewBytes(filepath.Join(runDirectory, deploymentCatalogLockIdentityFileName), canonicalLock); err != nil {
-			return store.WorkflowRun{}, fmt.Errorf("write authoring deployment catalog lock identity: %w", err)
 		}
 	}
 	if err := writeNewJSON(filepath.Join(runDirectory, "run-manifest.json"), manifest); err != nil {
@@ -271,14 +256,14 @@ func validateAuthoringRunExecutionSpec(specification workflowadapter.RunExecutio
 	return nil
 }
 
-func (service *RunService) validateReplayedAuthoringWorkflowRun(ctx context.Context, run store.WorkflowRun, request StartAuthoringRunRequest, source store.AuthoringSource, session store.AuthoringSession, resolved workflowadapter.ResolvedWorkflow, profileCanonical, specificationCanonical []byte, specificationFingerprint workflowkit.Fingerprint, plan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
+func (service *RunService) validateReplayedAuthoringWorkflowRun(ctx context.Context, run store.WorkflowRun, request StartAuthoringRunRequest, source store.AuthoringSource, session store.AuthoringSession, resolved workflowadapter.ResolvedWorkflow, profileCanonical, specificationCanonical []byte, specificationFingerprint workflowkit.Fingerprint, plan workflowkit.ExecutionPlan, catalogReceipt []byte) error {
 	if run.SubjectKind != store.WorkflowRunSubjectAuthoringSession || run.SubjectID != source.ID || run.SubjectRevisionID != session.ID || run.SubjectDigest != source.SnapshotContentDigest || run.AuthoringSessionID != session.ID ||
 		run.WorkflowTemplateID != resolved.TemplateID || run.WorkflowTemplateVersion != resolved.TemplateVersion || run.ResolvedProfileHash != string(resolved.ExecutionProfileFingerprint) || run.DefinitionHash != string(resolved.DefinitionFingerprint) || run.Trigger != request.Trigger || run.ExecutionEpoch != request.ExecutionEpoch {
 		return fmt.Errorf("%w: authoring workflow Run %s does not match requested immutable definition", store.ErrIdempotencyConflict, run.ID)
 	}
 	manifest, err := decodeRunManifest(run)
 	if err != nil || !manifestMatchesAuthoringExecutionSpec(manifest, specificationCanonical, specificationFingerprint) ||
-		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, plan) || !manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) || !manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
+		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, plan) || !manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) {
 		return fmt.Errorf("%w: authoring workflow Run %s execution specification", store.ErrIdempotencyConflict, run.ID)
 	}
 	if manifest.RestartOfRunID != strings.TrimSpace(request.RestartOfRunID) {

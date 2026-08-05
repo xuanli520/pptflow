@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -36,29 +35,31 @@ type PreparedStartRun struct {
 }
 
 type runStartInputBundle struct {
-	Format                        string                                                `json:"format"`
-	Action                        LifecycleMutationAction                               `json:"action"`
-	IdempotencyKey                string                                                `json:"idempotency_key"`
-	Actor                         string                                                `json:"actor"`
-	Reason                        string                                                `json:"reason"`
-	Trigger                       string                                                `json:"trigger"`
-	ParentRunID                   string                                                `json:"parent_run_id,omitempty"`
-	Expected                      LifecycleMutationCheckpoint                           `json:"expected"`
-	ProfileFingerprint            workflowkit.Fingerprint                               `json:"profile_fingerprint"`
-	ExecutionSpecFingerprint      workflowkit.Fingerprint                               `json:"execution_spec_fingerprint"`
-	DeploymentCatalogReceipt      json.RawMessage                                       `json:"deployment_catalog_receipt,omitempty"`
-	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity `json:"deployment_catalog_lock_identity,omitempty"`
-	CreatedAt                     time.Time                                             `json:"created_at"`
+	Format                   string                      `json:"format"`
+	Action                   LifecycleMutationAction     `json:"action"`
+	IdempotencyKey           string                      `json:"idempotency_key"`
+	Actor                    string                      `json:"actor"`
+	Reason                   string                      `json:"reason"`
+	Trigger                  string                      `json:"trigger"`
+	ParentRunID              string                      `json:"parent_run_id,omitempty"`
+	Expected                 LifecycleMutationCheckpoint `json:"expected"`
+	ProfileFingerprint       workflowkit.Fingerprint     `json:"profile_fingerprint"`
+	ExecutionSpecFingerprint workflowkit.Fingerprint     `json:"execution_spec_fingerprint"`
+	DeploymentCatalogReceipt json.RawMessage             `json:"deployment_catalog_receipt,omitempty"`
+	// LegacyDeploymentCatalogLockIdentity tolerates the lock identity field
+	// written by binaries from before runtime lock resolution. It is never
+	// read or re-persisted.
+	LegacyDeploymentCatalogLockIdentity json.RawMessage `json:"deployment_catalog_lock_identity,omitempty"`
+	CreatedAt                           time.Time       `json:"created_at"`
 }
 
 type frozenRunStartInputs struct {
-	Bundle                        runStartInputBundle
-	Profile                       workflowadapter.ExecutionProfile
-	ExecutionSpec                 workflowadapter.RunExecutionSpec
-	ProfileCanonicalJSON          []byte
-	ExecutionSpecCanonicalJSON    []byte
-	DeploymentCatalogReceipt      []byte
-	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
+	Bundle                     runStartInputBundle
+	Profile                    workflowadapter.ExecutionProfile
+	ExecutionSpec              workflowadapter.RunExecutionSpec
+	ProfileCanonicalJSON       []byte
+	ExecutionSpecCanonicalJSON []byte
+	DeploymentCatalogReceipt   []byte
 }
 
 func (layout managedLayout) runStartInputsRoot() string {
@@ -195,33 +196,27 @@ func (service *LifecycleMutationService) freezeRunStartInputs(ctx context.Contex
 	if err := service.core.verifyDeploymentCatalogReceipt(specification.Template, catalogReceipt); err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("verify deployment catalog receipt before freezing StartRun inputs: %w", err)
 	}
-	lockIdentity, err := service.core.frozenDeploymentCatalogLockIdentity(specification.Template)
-	if err != nil {
-		return frozenRunStartInputs{}, fmt.Errorf("freeze deployment catalog lock identity: %w", err)
-	}
 	bundle := runStartInputBundle{
-		Format:                        runStartInputBundleFormat,
-		Action:                        action,
-		IdempotencyKey:                strings.TrimSpace(command.IdempotencyKey),
-		Actor:                         strings.TrimSpace(command.Actor),
-		Reason:                        strings.TrimSpace(command.Reason),
-		Trigger:                       strings.TrimSpace(command.Trigger),
-		ParentRunID:                   strings.TrimSpace(command.ParentRunID),
-		Expected:                      command.Expected,
-		ProfileFingerprint:            profileFingerprint,
-		ExecutionSpecFingerprint:      specificationFingerprint,
-		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
-		CreatedAt:                     service.core.now().UTC(),
+		Format:                   runStartInputBundleFormat,
+		Action:                   action,
+		IdempotencyKey:           strings.TrimSpace(command.IdempotencyKey),
+		Actor:                    strings.TrimSpace(command.Actor),
+		Reason:                   strings.TrimSpace(command.Reason),
+		Trigger:                  strings.TrimSpace(command.Trigger),
+		ParentRunID:              strings.TrimSpace(command.ParentRunID),
+		Expected:                 command.Expected,
+		ProfileFingerprint:       profileFingerprint,
+		ExecutionSpecFingerprint: specificationFingerprint,
+		DeploymentCatalogReceipt: append(json.RawMessage(nil), catalogReceipt...),
+		CreatedAt:                service.core.now().UTC(),
 	}
 	inputs := frozenRunStartInputs{
-		Bundle:                        bundle,
-		Profile:                       profile,
-		ExecutionSpec:                 specification,
-		ProfileCanonicalJSON:          profileCanonical,
-		ExecutionSpecCanonicalJSON:    specificationCanonical,
-		DeploymentCatalogReceipt:      append([]byte(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
+		Bundle:                     bundle,
+		Profile:                    profile,
+		ExecutionSpec:              specification,
+		ProfileCanonicalJSON:       profileCanonical,
+		ExecutionSpecCanonicalJSON: specificationCanonical,
+		DeploymentCatalogReceipt:   append([]byte(nil), catalogReceipt...),
 	}
 	if err := service.publishFrozenRunStartInputs(ctx, inputs); err != nil {
 		if !errors.Is(err, os.ErrExist) {
@@ -266,15 +261,6 @@ func (service *LifecycleMutationService) publishFrozenRunStartInputs(ctx context
 	if len(inputs.DeploymentCatalogReceipt) != 0 {
 		if err := writeNewBytes(filepath.Join(stagingDirectory, deploymentCatalogReceiptFileName), inputs.DeploymentCatalogReceipt); err != nil {
 			return fmt.Errorf("write frozen deployment catalog receipt: %w", err)
-		}
-	}
-	if inputs.DeploymentCatalogLockIdentity != nil {
-		canonicalLockIdentity, err := canonicalDeploymentCatalogLockIdentity(*inputs.DeploymentCatalogLockIdentity)
-		if err != nil {
-			return fmt.Errorf("canonicalize frozen deployment catalog lock identity: %w", err)
-		}
-		if err := writeNewBytes(filepath.Join(stagingDirectory, deploymentCatalogLockIdentityFileName), canonicalLockIdentity); err != nil {
-			return fmt.Errorf("write frozen deployment catalog lock identity: %w", err)
 		}
 	}
 	if err := writeNewJSON(filepath.Join(stagingDirectory, runStartInputManifestFileName), inputs.Bundle); err != nil {
@@ -367,13 +353,6 @@ func (service *LifecycleMutationService) readFrozenRunStartInputs(action Lifecyc
 	if err := service.core.verifyDeploymentCatalogReceipt(specification.Template, catalogReceipt); err != nil {
 		return frozenRunStartInputs{}, fmt.Errorf("verify frozen deployment catalog receipt: %w", err)
 	}
-	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(runManifest{DeploymentCatalogLockIdentity: bundle.DeploymentCatalogLockIdentity})
-	if err != nil {
-		return frozenRunStartInputs{}, fmt.Errorf("parse frozen deployment catalog lock identity: %w", err)
-	}
-	if err := service.core.verifyDeploymentCatalogLockIdentity(specification.Template, lockIdentity); err != nil {
-		return frozenRunStartInputs{}, fmt.Errorf("verify frozen deployment catalog lock identity: %w", err)
-	}
 	if len(catalogReceipt) != 0 {
 		receiptRaw, readErr := readManagedRunStartInputFile(directory, deploymentCatalogReceiptFileName)
 		if readErr != nil {
@@ -386,30 +365,16 @@ func (service *LifecycleMutationService) readFrozenRunStartInputs(action Lifecyc
 			return frozenRunStartInputs{}, fmt.Errorf("frozen StartRun input manifest and deployment catalog receipt differ")
 		}
 	}
-	if lockIdentity != nil {
-		lockRaw, readErr := readManagedRunStartInputFile(directory, deploymentCatalogLockIdentityFileName)
-		if readErr != nil {
-			return frozenRunStartInputs{}, readErr
-		}
-		storedLockIdentity, canonicalLockIdentity, lockErr := parseDeploymentCatalogLockIdentityJSON(lockRaw)
-		if lockErr != nil {
-			return frozenRunStartInputs{}, fmt.Errorf("parse managed frozen deployment catalog lock identity: %w", lockErr)
-		}
-		if !bytes.Equal(lockRaw, canonicalLockIdentity) || storedLockIdentity != *lockIdentity {
-			return frozenRunStartInputs{}, fmt.Errorf("frozen StartRun input manifest and deployment catalog lock identity differ")
-		}
-	}
 	if err := validateRunExecutionSpecSelection(specification, command.Expected); err != nil {
 		return frozenRunStartInputs{}, err
 	}
 	return frozenRunStartInputs{
-		Bundle:                        bundle,
-		Profile:                       profile,
-		ExecutionSpec:                 specification,
-		ProfileCanonicalJSON:          profileCanonical,
-		ExecutionSpecCanonicalJSON:    specificationCanonical,
-		DeploymentCatalogReceipt:      append([]byte(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
+		Bundle:                     bundle,
+		Profile:                    profile,
+		ExecutionSpec:              specification,
+		ProfileCanonicalJSON:       profileCanonical,
+		ExecutionSpecCanonicalJSON: specificationCanonical,
+		DeploymentCatalogReceipt:   append([]byte(nil), catalogReceipt...),
 	}, nil
 }
 

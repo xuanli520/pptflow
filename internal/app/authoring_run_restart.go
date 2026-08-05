@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -143,21 +142,20 @@ func (service *StandardAuthoringLaunchService) RestartAuthoringRun(ctx context.C
 		return LifecycleMutationReceipt{}, fmt.Errorf("decode source authoring session manifest: %w", err)
 	}
 	preparation := standardAuthoringLaunchPreparation{
-		Format:                        standardAuthoringLaunchPreparationFormat,
-		Version:                       standardAuthoringLaunchPreparationVersion,
-		LifecycleOperationID:          op.ID,
-		RequestedSourceID:             oldSessionManifest.RequestedSourceID,
-		TargetTaskID:                  newTask.ID,
-		AuthoringSessionID:            ids.SessionID,
-		RunID:                         ids.RunID,
-		WorkflowTemplateID:            session.WorkflowTemplateID,
-		WorkflowTemplateVersion:       session.WorkflowTemplateVersion,
-		SourceSnapshotSchemaVersion:   source.SnapshotSchemaVersion,
-		ExecutionProfile:              append(json.RawMessage(nil), frozen.ProfileCanonical...),
-		ProfileFingerprint:            frozen.ProfileFingerprint,
-		DeploymentCatalogReceipt:      append(json.RawMessage(nil), frozen.DeploymentCatalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(frozen.DeploymentCatalogLockIdentity),
-		PreparationFingerprint:        oldSessionManifest.PreparationFingerprint,
+		Format:                      standardAuthoringLaunchPreparationFormat,
+		Version:                     standardAuthoringLaunchPreparationVersion,
+		LifecycleOperationID:        op.ID,
+		RequestedSourceID:           oldSessionManifest.RequestedSourceID,
+		TargetTaskID:                newTask.ID,
+		AuthoringSessionID:          ids.SessionID,
+		RunID:                       ids.RunID,
+		WorkflowTemplateID:          session.WorkflowTemplateID,
+		WorkflowTemplateVersion:     session.WorkflowTemplateVersion,
+		SourceSnapshotSchemaVersion: source.SnapshotSchemaVersion,
+		ExecutionProfile:            append(json.RawMessage(nil), frozen.ProfileCanonical...),
+		ProfileFingerprint:          frozen.ProfileFingerprint,
+		DeploymentCatalogReceipt:    append(json.RawMessage(nil), frozen.DeploymentCatalogReceipt...),
+		PreparationFingerprint:      oldSessionManifest.PreparationFingerprint,
 	}
 	sessionManifestJSON, err := standardAuthoringSessionManifestJSON(*source, newTask, ids.SessionID, op.ID, preparation, frozen.frozenDefinition(), *newContract)
 	if err != nil {
@@ -191,18 +189,17 @@ func (service *StandardAuthoringLaunchService) RestartAuthoringRun(ctx context.C
 	}
 
 	run, err := (&RunService{core: service.core}).StartAuthoringRun(ctx, StartAuthoringRunRequest{
-		ID:                            ids.RunID,
-		AuthoringSessionID:            newSession.ID,
-		Profile:                       frozen.Profile,
-		ExecutionSpec:                 frozen.ExecutionSpec,
-		ProfileFingerprint:            frozen.ProfileFingerprint,
-		ExecutionSpecFingerprint:      frozen.ExecutionSpecFingerprint,
-		DeploymentCatalogReceipt:      append([]byte(nil), frozen.DeploymentCatalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(frozen.DeploymentCatalogLockIdentity),
-		RestartOfRunID:                oldRun.ID,
-		Trigger:                       standardAuthoringRestartTrigger,
-		Actor:                         command.Actor,
-		Reason:                        command.Reason,
+		ID:                       ids.RunID,
+		AuthoringSessionID:       newSession.ID,
+		Profile:                  frozen.Profile,
+		ExecutionSpec:            frozen.ExecutionSpec,
+		ProfileFingerprint:       frozen.ProfileFingerprint,
+		ExecutionSpecFingerprint: frozen.ExecutionSpecFingerprint,
+		DeploymentCatalogReceipt: append([]byte(nil), frozen.DeploymentCatalogReceipt...),
+		RestartOfRunID:           oldRun.ID,
+		Trigger:                  standardAuthoringRestartTrigger,
+		Actor:                    command.Actor,
+		Reason:                   command.Reason,
 	})
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
@@ -319,9 +316,9 @@ func (service *StandardAuthoringLaunchService) createRestartAuthoringContract(ct
 // restartStandardAuthoringFrozenDefinition freezes the new attempt's inputs:
 // the canonical profile bytes are copied from the source Run's managed
 // directory, the execution specification is rebound to the fresh session and
-// contract artifact, and the deployment catalog receipt/lock identity are
-// reused byte-for-byte. The new definition fingerprint is derived from these
-// exact inputs, never guessed.
+// contract artifact, and the deployment catalog receipt is reused
+// byte-for-byte. The new definition fingerprint is derived from these exact
+// inputs, never guessed.
 func (service *StandardAuthoringLaunchService) restartStandardAuthoringFrozenDefinition(ctx context.Context, oldRun store.WorkflowRun, oldSession store.AuthoringSession, oldManifest runManifest, contract standardAuthoringContractInput, newSessionID string) (*restartAuthoringFrozenDefinition, error) {
 	profileRaw, err := readManagedRunExecutionInputFile(filepath.Join(service.core.layout.runDirectory(oldRun.ID), runExecutionProfileFileName), "source authoring execution profile")
 	if err != nil {
@@ -365,36 +362,33 @@ func (service *StandardAuthoringLaunchService) restartStandardAuthoringFrozenDef
 		return nil, fmt.Errorf("restart execution specification deployment catalog: %w", err)
 	}
 	receipt := append([]byte(nil), oldManifest.DeploymentCatalogReceipt...)
-	lockIdentity := cloneDeploymentCatalogLockIdentity(oldManifest.DeploymentCatalogLockIdentity)
-	definitionFingerprint, err := standardAuthoringDefinitionFingerprint(profileCanonical, specCanonical, receipt, lockIdentity)
+	definitionFingerprint, err := standardAuthoringDefinitionFingerprint(profileCanonical, specCanonical, receipt)
 	if err != nil {
 		return nil, err
 	}
 	return &restartAuthoringFrozenDefinition{
 		Profile: profile, ProfileCanonical: profileCanonical, ProfileFingerprint: profileFingerprint,
 		ExecutionSpec: specification, ExecutionSpecFingerprint: specFingerprint,
-		DeploymentCatalogReceipt: receipt, DeploymentCatalogLockIdentity: lockIdentity,
-		Fingerprint: definitionFingerprint,
+		DeploymentCatalogReceipt: receipt,
+		Fingerprint:              definitionFingerprint,
 	}, nil
 }
 
 type restartAuthoringFrozenDefinition struct {
-	Profile                       workflowadapter.ExecutionProfile
-	ProfileCanonical              []byte
-	ProfileFingerprint            workflowkit.Fingerprint
-	ExecutionSpec                 workflowadapter.RunExecutionSpec
-	ExecutionSpecFingerprint      workflowkit.Fingerprint
-	DeploymentCatalogReceipt      []byte
-	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
-	Fingerprint                   workflowkit.Fingerprint
+	Profile                  workflowadapter.ExecutionProfile
+	ProfileCanonical         []byte
+	ProfileFingerprint       workflowkit.Fingerprint
+	ExecutionSpec            workflowadapter.RunExecutionSpec
+	ExecutionSpecFingerprint workflowkit.Fingerprint
+	DeploymentCatalogReceipt []byte
+	Fingerprint              workflowkit.Fingerprint
 }
 
 func (definition *restartAuthoringFrozenDefinition) frozenDefinition() standardAuthoringFrozenDefinition {
 	return standardAuthoringFrozenDefinition{
 		Profile: definition.Profile, ExecutionSpec: definition.ExecutionSpec,
 		ProfileFingerprint: definition.ProfileFingerprint, ExecutionSpecFingerprint: definition.ExecutionSpecFingerprint,
-		DeploymentCatalogReceipt:      definition.DeploymentCatalogReceipt,
-		DeploymentCatalogLockIdentity: definition.DeploymentCatalogLockIdentity,
-		Fingerprint:                   definition.Fingerprint,
+		DeploymentCatalogReceipt: definition.DeploymentCatalogReceipt,
+		Fingerprint:              definition.Fingerprint,
 	}
 }

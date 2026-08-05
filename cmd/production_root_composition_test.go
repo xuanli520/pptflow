@@ -127,36 +127,6 @@ func TestHarborFlowProductionCompositionRejectsMismatchedBundleBuildIdentity(t *
 	}
 }
 
-func TestHarborFlowProductionCompositionAcceptsReviewedStandardAuthoringPredecessorLock(t *testing.T) {
-	fixture := newHarborFlowProductionCompositionFixture(t)
-	dataStore, err := store.OpenForTest(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dataStore.Close()
-
-	predecessor := fixture.standardLock.Clone()
-	predecessor.LockVersion = "v2.0.0-reviewed-predecessor"
-	predecessorFingerprint, err := predecessor.Fingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	contract, err := predecessor.ExecutionContractFingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	config := fixture.config
-	config.StandardAuthoringCompatibleLockProofs = []stageprovider.DeploymentOperationCatalogLockCompatibilityProof{{
-		Predecessor: stageprovider.DeploymentOperationCatalogLockIdentity{
-			LockID: predecessor.LockID, LockVersion: predecessor.LockVersion, Fingerprint: predecessorFingerprint,
-		},
-		ExecutionContractFingerprint: contract,
-	}}
-	if _, err := newHarborFlowProductionLifecycleServicesWithConfig(t.TempDir(), dataStore, config); err != nil {
-		t.Fatalf("compose with reviewed Standard authoring predecessor lock: %v", err)
-	}
-}
-
 func TestProductionDeploymentPathsBesideExecutableRequiresAllThreeBundlesAndStandardContractManifest(t *testing.T) {
 	packageRoot := t.TempDir()
 	executable := filepath.Join(packageRoot, "harbor-factory")

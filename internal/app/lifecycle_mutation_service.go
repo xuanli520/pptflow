@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
@@ -516,17 +515,15 @@ func (service *LifecycleMutationService) StartRun(ctx context.Context, command S
 		return LifecycleMutationReceipt{}, err
 	}
 	payload := struct {
-		InputBundleID                 string                                                `json:"input_bundle_id"`
-		ProfileFingerprint            string                                                `json:"profile_fingerprint"`
-		ExecutionSpecFingerprint      string                                                `json:"execution_spec_fingerprint"`
-		DeploymentCatalogReceipt      []byte                                                `json:"deployment_catalog_receipt,omitempty"`
-		DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity `json:"deployment_catalog_lock_identity,omitempty"`
+		InputBundleID            string `json:"input_bundle_id"`
+		ProfileFingerprint       string `json:"profile_fingerprint"`
+		ExecutionSpecFingerprint string `json:"execution_spec_fingerprint"`
+		DeploymentCatalogReceipt []byte `json:"deployment_catalog_receipt,omitempty"`
 	}{
-		InputBundleID:                 inputs.Bundle.IdempotencyKey,
-		ProfileFingerprint:            string(inputs.Bundle.ProfileFingerprint),
-		ExecutionSpecFingerprint:      string(inputs.Bundle.ExecutionSpecFingerprint),
-		DeploymentCatalogReceipt:      append([]byte(nil), inputs.DeploymentCatalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(inputs.DeploymentCatalogLockIdentity),
+		InputBundleID:            inputs.Bundle.IdempotencyKey,
+		ProfileFingerprint:       string(inputs.Bundle.ProfileFingerprint),
+		ExecutionSpecFingerprint: string(inputs.Bundle.ExecutionSpecFingerprint),
+		DeploymentCatalogReceipt: append([]byte(nil), inputs.DeploymentCatalogReceipt...),
 	}
 	op, replay, err := service.begin(ctx, LifecycleMutationStartRun, command.LifecycleMutationCommandBase, payload, lifecycleOperationTargets{TaskID: command.Expected.TaskID, RevisionID: command.Expected.RevisionID, RunID: runID})
 	if err != nil || replay != nil {
@@ -549,13 +546,12 @@ func (service *LifecycleMutationService) StartRun(ctx context.Context, command S
 	run, err := (&RunService{core: service.core}).StartRun(ctx, StartRunRequest{
 		ID: op.RunID, TaskID: op.TaskID, RevisionID: op.RevisionID,
 		Profile: inputs.Profile, ExecutionSpec: inputs.ExecutionSpec,
-		InputBundleID:                 inputs.Bundle.IdempotencyKey,
-		ProfileFingerprint:            inputs.Bundle.ProfileFingerprint,
-		ExecutionSpecFingerprint:      inputs.Bundle.ExecutionSpecFingerprint,
-		DeploymentCatalogReceipt:      append([]byte(nil), inputs.DeploymentCatalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(inputs.DeploymentCatalogLockIdentity),
-		ParentRunID:                   inputs.Bundle.ParentRunID,
-		Trigger:                       inputs.Bundle.Trigger, Actor: op.Actor, Reason: op.Reason,
+		InputBundleID:            inputs.Bundle.IdempotencyKey,
+		ProfileFingerprint:       inputs.Bundle.ProfileFingerprint,
+		ExecutionSpecFingerprint: inputs.Bundle.ExecutionSpecFingerprint,
+		DeploymentCatalogReceipt: append([]byte(nil), inputs.DeploymentCatalogReceipt...),
+		ParentRunID:              inputs.Bundle.ParentRunID,
+		Trigger:                  inputs.Bundle.Trigger, Actor: op.Actor, Reason: op.Reason,
 	})
 	if err != nil {
 		return LifecycleMutationReceipt{}, err

@@ -325,20 +325,19 @@ func (service *CodeEdgeEvaluatorLaunchService) confirmRun(ctx context.Context, c
 		return LifecycleMutationReceipt{}, store.WorkflowRun{}, fmt.Errorf("%w: CodeEdge evaluator parent no longer matches frozen lifecycle target", store.ErrOptimisticLock)
 	}
 	run, err := (&RunService{core: service.core}).StartRun(ctx, StartRunRequest{
-		ID:                            op.RunID,
-		TaskID:                        op.TaskID,
-		RevisionID:                    op.RevisionID,
-		Profile:                       inputs.Profile,
-		ExecutionSpec:                 inputs.ExecutionSpec,
-		InputBundleID:                 inputs.Bundle.IdempotencyKey,
-		ProfileFingerprint:            inputs.Bundle.ProfileFingerprint,
-		ExecutionSpecFingerprint:      inputs.Bundle.ExecutionSpecFingerprint,
-		DeploymentCatalogReceipt:      append([]byte(nil), inputs.DeploymentCatalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(inputs.DeploymentCatalogLockIdentity),
-		ParentRunID:                   parent.ID,
-		Trigger:                       inputs.Bundle.Trigger,
-		Actor:                         op.Actor,
-		Reason:                        op.Reason,
+		ID:                       op.RunID,
+		TaskID:                   op.TaskID,
+		RevisionID:               op.RevisionID,
+		Profile:                  inputs.Profile,
+		ExecutionSpec:            inputs.ExecutionSpec,
+		InputBundleID:            inputs.Bundle.IdempotencyKey,
+		ProfileFingerprint:       inputs.Bundle.ProfileFingerprint,
+		ExecutionSpecFingerprint: inputs.Bundle.ExecutionSpecFingerprint,
+		DeploymentCatalogReceipt: append([]byte(nil), inputs.DeploymentCatalogReceipt...),
+		ParentRunID:              parent.ID,
+		Trigger:                  inputs.Bundle.Trigger,
+		Actor:                    op.Actor,
+		Reason:                   op.Reason,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrIdentityCollision) {

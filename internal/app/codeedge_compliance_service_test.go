@@ -235,16 +235,6 @@ func TestCodeEdgeComplianceFailsClosedOnFrozenEvidenceDrift(t *testing.T) {
 			want: stageprovider.ErrDeploymentOperationCatalogDrift,
 		},
 		{
-			name: "lock",
-			verify: func(t *testing.T, fixture *codeEdgeComplianceFixture) error {
-				resolver := catalogLockAttestedResolverForSpec(t, fixture.specification, "codeedge-compliance-catalog", "v1", "lock-v2")
-				services := catalogLockLifecycleServices(t, fixture.root, fixture.database, resolver)
-				_, err := services.core.loadFrozenCodeEdgeRun(context.Background(), fixture.run.ID)
-				return err
-			},
-			want: stageprovider.ErrDeploymentOperationCatalogLockDrift,
-		},
-		{
 			name: "managed manifest",
 			verify: func(t *testing.T, fixture *codeEdgeComplianceFixture) error {
 				path := filepath.Join(fixture.root, managedRunsDirectory, fixture.run.ID, "run-manifest.json")
@@ -494,7 +484,10 @@ func newCodeEdgeComplianceFixture(t *testing.T, options codeEdgeComplianceFixtur
 
 	childSpecification := testsupport.CompleteCodeEdgeEvaluatorChildRunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	childResolver := catalogLockAttestedResolverForSpec(t, childSpecification, "codeedge-evaluator-child-catalog", "v1", "lock-v1")
-	services := catalogLockLifecycleServices(t, root, database, childResolver)
+	// The compliance service resolves the parent Run's deployment lock at
+	// runtime from the installed template binding, so the shared fixture must
+	// install both the Phase-1 parent and the evaluator-child template.
+	services := catalogLockLifecycleServicesWithTemplateResolvers(t, root, database, parentResolver, childResolver)
 	childRun, childFrozen := startCodeEdgeEvaluatorFixtureRun(t, ctx, services, run, revision, childSpecification, "complete evaluator evidence")
 	qwenStage, qwen := seedCodeEdgeEvaluationStage(t, ctx, services, childRun, revision, childFrozen, workflowadapter.HarborRunQwen, frozen.Policy.QwenPolicy)
 	opusStage, opus := seedCodeEdgeEvaluationStage(t, ctx, services, childRun, revision, childFrozen, workflowadapter.HarborRunOpus, frozen.Policy.OpusPolicy)
@@ -672,13 +665,14 @@ func startCodeEdgeEvaluatorFixtureRun(t *testing.T, ctx context.Context, service
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-	if err != nil || lock == nil {
-		t.Fatalf("read evaluator child catalog lock = %+v, %v", lock, err)
+	templateBinding, ok := services.core.configuredDeploymentCatalogBindingForTemplate(workflowadapter.CodeEdgeEvaluatorChildTemplateReference())
+	if !ok || templateBinding.lockResolver == nil {
+		t.Fatal("evaluator child services have no configured deployment catalog lock resolver")
 	}
+	identity := templateBinding.lockResolver.LockIdentity()
 	binding := codeedge.FrozenRunBinding{
 		TaskSnapshotDigest: workflowkit.SubjectDigest(revision.TaskDigest), CatalogFingerprint: receipt.CatalogFingerprint,
-		LockFingerprint: lock.Fingerprint, ManifestFingerprint: manifestFingerprint,
+		LockFingerprint: identity.Fingerprint, ManifestFingerprint: manifestFingerprint,
 	}
 	if err := binding.Validate(); err != nil {
 		t.Fatal(err)

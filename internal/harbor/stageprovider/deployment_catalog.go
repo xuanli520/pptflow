@@ -479,15 +479,6 @@ func (resolver *DeploymentOperationCatalogResolver) Catalog() DeploymentOperatio
 	return resolver.catalog.Clone()
 }
 
-// CatalogFingerprint returns the fingerprint of the catalog that was frozen
-// when this resolver was created.
-func (resolver *DeploymentOperationCatalogResolver) CatalogFingerprint() workflowkit.Fingerprint {
-	if resolver == nil {
-		return ""
-	}
-	return resolver.fingerprint
-}
-
 // Template returns the exact closed Harbor workflow template installed with
 // this catalog. It is a value copy and never falls back to Standard.
 func (resolver *DeploymentOperationCatalogResolver) Template() workflowadapter.TemplateReference {

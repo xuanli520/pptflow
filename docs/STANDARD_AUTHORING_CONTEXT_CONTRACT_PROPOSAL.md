@@ -87,7 +87,8 @@ inputs.
    package whose selected artifacts all bind to the current contract.
 7. The CodeEdge consumer still performs its independent admission/preflight
    validation. Upstream admission is defense in depth, never an exemption.
-8. Only the v2 template/catalog/profile/lock identity is executable. A
+8. Only the v2 template/catalog/profile identity is executable; the deployment
+   lock is resolved at runtime against the currently installed deployment. A
    historical template reference is rejected rather than reinterpreted.
 
 ## Root Contract

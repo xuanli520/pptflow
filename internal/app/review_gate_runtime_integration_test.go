@@ -161,10 +161,10 @@ func TestFrozenExecutionRuntimeApprovedReviewGateMaterializesArtifactAndSchedule
 
 // This follows the same durable path as a CodeEdge final_review approval:
 // ResolveReview -> projectResolvedReviewGate -> enqueueNextCoordinator ->
-// workflow_run.execute. The predecessor Run is frozen under an older lock,
-// while the resolution and successor coordinator run under a new build-only
-// lock revision.
-func TestFrozenExecutionRuntimeApprovedFinalReviewAcceptsReviewedBuildOnlyLockPredecessor(t *testing.T) {
+// workflow_run.execute. The predecessor Run is frozen under an older catalog
+// lock version, and the resolution and successor coordinator continue under a
+// new lock version bound to the same catalog receipt.
+func TestFrozenExecutionRuntimeApprovedFinalReviewContinuesAfterCatalogLockVersionChange(t *testing.T) {
 	ctx := context.Background()
 	selection := testsupport.CompleteRunExecutionSpec(
 		"018f0a73-3b49-7000-8000-000000000071",
@@ -180,13 +180,6 @@ func TestFrozenExecutionRuntimeApprovedFinalReviewAcceptsReviewedBuildOnlyLockPr
 		Module: "github.com/purplevoid/harbor-factory", Version: "v2.1.0", Commit: strings.Repeat("b", 40),
 		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("review-gate-current-build")),
 	})
-	contract, err := currentResolver.ExecutionContractFingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	proof := stageprovider.DeploymentOperationCatalogLockCompatibilityProof{
-		Predecessor: oldResolver.LockIdentity(), ExecutionContractFingerprint: contract,
-	}
 	fixture := newReviewGateRuntimeFixtureWithOptions(t, reviewGateRuntimeFixtureOptions{
 		freezeCatalogLock: true,
 		reviewStage:       workflowkit.StageKey(workflowadapter.FinalReview),
@@ -196,7 +189,7 @@ func TestFrozenExecutionRuntimeApprovedFinalReviewAcceptsReviewedBuildOnlyLockPr
 				DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
 					Template: oldResolver.Receipt().Template, Resolver: oldResolver,
 				}},
-				RequireDeploymentCatalog: true, RequireDeploymentLock: true,
+				RequireDeploymentCatalog: true,
 			})
 		},
 	})
@@ -207,26 +200,23 @@ func TestFrozenExecutionRuntimeApprovedFinalReviewAcceptsReviewedBuildOnlyLockPr
 	binding := requireRuntimeReviewGateBinding(t, ctx, fixture.store, gateJob.StageAttemptID)
 	decideRuntimeReviewGate(t, ctx, fixture, binding, store.ReviewDecisionApprove)
 
-	withoutProof := catalogLockLifecycleServices(t, fixture.services.core.layout.root, fixture.store, currentResolver)
-	rejectedRuntime := newFrozenRuntime(t, withoutProof, fixture.runtime.workflowkitRegistry)
-	if _, _, err := rejectedRuntime.loadFrozenRun(ctx, fixture.run.ID, fixture.run.DefinitionHash, fixture.frozen.ExecutionSpecFingerprint, fixture.frozen.QuotaPolicy); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) || !errors.Is(err, ErrFrozenExecutionPayload) {
-		t.Fatalf("unapproved final_review predecessor load = %v, want frozen payload + lock drift", err)
+	currentServices := catalogLockLifecycleServices(t, fixture.services.core.layout.root, fixture.store, currentResolver)
+	currentRuntime := newFrozenRuntime(t, currentServices, fixture.runtime.workflowkitRegistry)
+	if _, _, err := currentRuntime.loadFrozenRun(ctx, fixture.run.ID, fixture.run.DefinitionHash, fixture.frozen.ExecutionSpecFingerprint, fixture.frozen.QuotaPolicy); err != nil {
+		t.Fatalf("frozen final_review predecessor load after lock version change = %v", err)
 	}
-
-	withProof := catalogLockLifecycleServicesWithProofs(t, fixture.services.core.layout.root, fixture.store, currentResolver, []stageprovider.DeploymentOperationCatalogLockCompatibilityProof{proof})
-	currentRuntime := newFrozenRuntime(t, withProof, fixture.runtime.workflowkitRegistry)
 	currentWorker := newFrozenRuntimeWorker(t, fixture.store, currentRuntime, "review-gate-build-compatible-worker")
 	resolution, err := currentWorker.RunOnce(ctx)
 	if err != nil || resolution.FinalState != store.JobSucceeded || resolution.Job == nil || resolution.Job.CommandType != store.ReviewGateResolutionCommandType {
-		t.Fatalf("approved final_review resolution under compatible build = %+v, %v", resolution, err)
+		t.Fatalf("approved final_review resolution under changed lock version = %+v, %v", resolution, err)
 	}
 	successor, err := currentWorker.RunOnce(ctx)
 	if err != nil || successor.FinalState != store.JobSucceeded || successor.Job == nil || successor.Job.CommandType != "workflow_run.execute" {
-		t.Fatalf("approved final_review successor coordinator under compatible build = %+v, %v", successor, err)
+		t.Fatalf("approved final_review successor coordinator under changed lock version = %+v, %v", successor, err)
 	}
 	stageJob, _ := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeReviewSuccessorStage)
 	if stageJob.State != store.JobQueued {
-		t.Fatalf("compatible final_review successor stage = %+v, want queued", stageJob)
+		t.Fatalf("final_review successor stage after lock version change = %+v, want queued", stageJob)
 	}
 }
 
@@ -432,28 +422,13 @@ func newReviewGateRuntimeFixtureWithOptions(t *testing.T, options reviewGateRunt
 	}
 	writeFrozenRuntimeFixtureManagedInputs(t, services, runID, profileCanonical, specificationCanonical)
 	var catalogReceipt []byte
-	var lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
 	if options.freezeCatalogLock {
 		catalogReceipt, err = services.core.frozenDeploymentCatalogReceipt(specification.Template)
 		if err != nil {
 			_ = dataStore.Close()
 			t.Fatal(err)
 		}
-		lockIdentity, err = services.core.frozenDeploymentCatalogLockIdentity(specification.Template)
-		if err != nil {
-			_ = dataStore.Close()
-			t.Fatal(err)
-		}
 		if err := writeNewBytes(filepath.Join(services.core.layout.runDirectory(runID), deploymentCatalogReceiptFileName), catalogReceipt); err != nil {
-			_ = dataStore.Close()
-			t.Fatal(err)
-		}
-		canonicalLockIdentity, err := canonicalDeploymentCatalogLockIdentity(*lockIdentity)
-		if err != nil {
-			_ = dataStore.Close()
-			t.Fatal(err)
-		}
-		if err := writeNewBytes(filepath.Join(services.core.layout.runDirectory(runID), deploymentCatalogLockIdentityFileName), canonicalLockIdentity); err != nil {
 			_ = dataStore.Close()
 			t.Fatal(err)
 		}
@@ -477,9 +452,8 @@ func newReviewGateRuntimeFixtureWithOptions(t *testing.T, options reviewGateRunt
 			ProfileFingerprint:       profileFingerprint,
 			ExecutionSpecFingerprint: specificationFingerprint,
 		},
-		ExecutionSpec:                 append(json.RawMessage(nil), specificationCanonical...),
-		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
+		ExecutionSpec:            append(json.RawMessage(nil), specificationCanonical...),
+		DeploymentCatalogReceipt: append(json.RawMessage(nil), catalogReceipt...),
 	})
 	if err != nil {
 		_ = dataStore.Close()

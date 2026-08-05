@@ -95,160 +95,6 @@ func TestDeploymentOperationCatalogLockCanonicalStrictJSONAndFingerprint(t *test
 	}
 }
 
-func TestDeploymentOperationCatalogLockExecutionContractFingerprintExcludesOnlyReleaseProvenance(t *testing.T) {
-	_, lock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare, workflowadapter.HarborRunQwen)
-	baseline, err := lock.ExecutionContractFingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	buildOnly := lock.Clone()
-	buildOnly.LockVersion = "test-v2"
-	buildOnly.HarborFlowBuild = HarborFlowBuildIdentity{
-		Module: "github.com/purplevoid/harbor-factory", Version: "v2.1.0",
-		Commit: strings.Repeat("b", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("different-build-provenance")),
-	}
-	compatible, err := buildOnly.ExecutionContractFingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if compatible != baseline {
-		t.Fatalf("build-only lock revision contract = %s, want %s", compatible, baseline)
-	}
-
-	mutations := []struct {
-		name   string
-		mutate func(*DeploymentOperationCatalogLock)
-	}{
-		{
-			name: "catalog receipt",
-			mutate: func(candidate *DeploymentOperationCatalogLock) {
-				candidate.CatalogReceipt.CatalogVersion = "test-v2"
-			},
-		},
-		{
-			name: "operation prompt hash",
-			mutate: func(candidate *DeploymentOperationCatalogLock) {
-				candidate.Operations[0].PromptContentFingerprint = workflowkit.SHA256Fingerprint([]byte("changed-prompt"))
-			},
-		},
-		{
-			name: "runtime executable hash",
-			mutate: func(candidate *DeploymentOperationCatalogLock) {
-				for index := range candidate.Operations {
-					if candidate.Operations[index].LocalExecutable != nil {
-						candidate.Operations[index].LocalExecutable.ContentSHA256 = workflowkit.SHA256Fingerprint([]byte("changed-executable"))
-						return
-					}
-				}
-				t.Fatal("fixture has no local executable lock")
-			},
-		},
-	}
-	for _, test := range mutations {
-		t.Run(test.name, func(t *testing.T) {
-			candidate := buildOnly.Clone()
-			test.mutate(&candidate)
-			fingerprint, err := candidate.ExecutionContractFingerprint()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if fingerprint == baseline {
-				t.Fatalf("%s changed without changing execution contract fingerprint", test.name)
-			}
-		})
-	}
-
-	_, phase1Lock := codeEdgePhase1DefinitionLockFixture(t)
-	phase1Baseline, err := phase1Lock.ExecutionContractFingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	phase1Mutations := []struct {
-		name   string
-		mutate func(*DeploymentOperationCatalogLock)
-	}{
-		{
-			name: "phase-1 execution profile",
-			mutate: func(candidate *DeploymentOperationCatalogLock) {
-				candidate.CodeEdgePhase1ExecutionProfile.Profile.ControlGracePeriod++
-			},
-		},
-		{
-			name: "phase-1 preflight profile",
-			mutate: func(candidate *DeploymentOperationCatalogLock) {
-				candidate.CodeEdgePhase1PreflightProfile.Profile.ProtectedEnvironmentVariables = append(candidate.CodeEdgePhase1PreflightProfile.Profile.ProtectedEnvironmentVariables, "HARBOR_CONTROL_TOKEN")
-			},
-		},
-		{
-			name: "phase-1 compliance policy",
-			mutate: func(candidate *DeploymentOperationCatalogLock) {
-				candidate.CodeEdgePhase1FinalCompliancePolicy.Policy.Version = "2"
-			},
-		},
-	}
-	for _, test := range phase1Mutations {
-		t.Run(test.name, func(t *testing.T) {
-			candidate := phase1Lock.Clone()
-			test.mutate(&candidate)
-			fingerprint, err := candidate.ExecutionContractFingerprint()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if fingerprint == phase1Baseline {
-				t.Fatalf("%s changed without changing execution contract fingerprint", test.name)
-			}
-		})
-	}
-}
-
-func TestDeploymentOperationCatalogLockCompatibilityProofsRequireExactReviewedContract(t *testing.T) {
-	catalog, current, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare, workflowadapter.HarborRunQwen)
-	currentResolver, err := NewDeploymentOperationCatalogLockResolver(catalog, current)
-	if err != nil {
-		t.Fatal(err)
-	}
-	predecessor := current.Clone()
-	predecessor.LockVersion = "test-v0"
-	predecessor.HarborFlowBuild = HarborFlowBuildIdentity{
-		Module: "github.com/purplevoid/harbor-factory", Version: "v1.9.0",
-		Commit: strings.Repeat("b", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("prior-build")),
-	}
-	predecessorFingerprint, err := predecessor.Fingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	contract, err := currentResolver.ExecutionContractFingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	proof := DeploymentOperationCatalogLockCompatibilityProof{
-		Predecessor: DeploymentOperationCatalogLockIdentity{
-			LockID: predecessor.LockID, LockVersion: predecessor.LockVersion, Fingerprint: predecessorFingerprint,
-		},
-		ExecutionContractFingerprint: contract,
-	}
-	if err := VerifyDeploymentOperationCatalogLockCompatibilityProofs(currentResolver, []DeploymentOperationCatalogLockCompatibilityProof{proof}); err != nil {
-		t.Fatalf("reviewed build-only predecessor proof = %v", err)
-	}
-
-	changed := current.Clone()
-	changed.Operations[0].PromptContentFingerprint = workflowkit.SHA256Fingerprint([]byte("changed-operation-contract"))
-	changedResolver, err := NewDeploymentOperationCatalogLockResolver(catalog, changed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := VerifyDeploymentOperationCatalogLockCompatibilityProofs(changedResolver, []DeploymentOperationCatalogLockCompatibilityProof{proof}); !errors.Is(err, ErrDeploymentOperationCatalogLockDrift) {
-		t.Fatalf("operation-changed compatibility proof = %v, want lock drift", err)
-	}
-
-	wrongFamily := proof
-	wrongFamily.Predecessor.LockID = "another-deployment-lock"
-	if err := VerifyDeploymentOperationCatalogLockCompatibilityProofs(currentResolver, []DeploymentOperationCatalogLockCompatibilityProof{wrongFamily}); !errors.Is(err, ErrDeploymentOperationCatalogLockDrift) {
-		t.Fatalf("cross-family compatibility proof = %v, want lock drift", err)
-	}
-}
-
 func TestDeploymentOperationCatalogLockRequiresLockOwnedStandardAuthoringProfile(t *testing.T) {
 	catalog, lock, _ := standardAuthoringProviderCompositionFixture(t)
 	if _, err := NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
@@ -587,7 +433,7 @@ func TestCatalogLockAttestedResolverRejectsStaticDriftAndMissingOrFailedAttestat
 	}
 	resolution := resolutions[0]
 
-	t.Run("forwards frozen lock identity verification", func(t *testing.T) {
+	t.Run("forwards installed lock identity verification", func(t *testing.T) {
 		resolver, err := NewCatalogLockAttestedWorkflowkitProviderOperationResolver(verifier, &countingOperationCatalogLockDelegate{executor: &countingOperationCatalogLockExecutor{}}, &countingOperationCatalogLockAttestor{})
 		if err != nil {
 			t.Fatal(err)
@@ -850,10 +696,6 @@ func (verifier *flipOperationCatalogLockVerifier) LockIdentity() DeploymentOpera
 
 func (verifier *flipOperationCatalogLockVerifier) HarborFlowBuild() HarborFlowBuildIdentity {
 	return verifier.base.HarborFlowBuild()
-}
-
-func (verifier *flipOperationCatalogLockVerifier) CanonicalLockJSON() []byte {
-	return verifier.base.CanonicalLockJSON()
 }
 
 func (verifier *flipOperationCatalogLockVerifier) VerifyCatalogReceipt(receipt DeploymentOperationCatalogReceipt) error {

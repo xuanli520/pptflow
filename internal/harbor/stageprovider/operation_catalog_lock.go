@@ -32,13 +32,6 @@ const (
 	// content identity from both a catalog fingerprint and ordinary artifact
 	// content digests.
 	DeploymentOperationCatalogLockFingerprintDomain = "harbor.stageprovider.operation-catalog-lock.v3"
-	// DeploymentOperationCatalogLockExecutionContractFingerprintDomain
-	// identifies the subset of a lock that controls execution. It deliberately
-	// excludes only the release provenance and lock revision so a package can
-	// make an explicit, auditable compatibility decision for a prior build
-	// without accepting a changed catalog, executable, profile, or policy.
-	DeploymentOperationCatalogLockExecutionContractFingerprintDomain = "harbor.stageprovider.operation-catalog-execution-contract.v1"
-
 	// StandardAuthoringSSHTransportLockFormat and Version identify the
 	// deployment-owned SSH acquisition contract used before a Standard
 	// AuthoringSession exists. It is intentionally a top-level template lock:
@@ -1141,36 +1134,6 @@ func (lock DeploymentOperationCatalogLock) Fingerprint() (workflowkit.Fingerprin
 	return workflowkit.FingerprintBytes(DeploymentOperationCatalogLockFingerprintDomain, canonical)
 }
 
-// ExecutionContractFingerprint returns the stable identity of every lock
-// field that can affect an admitted Run's execution. LockVersion and the
-// HarborFlowBuild provenance identify a release, rather than the frozen
-// execution contract, so they are normalized before canonicalization. LockID
-// remains significant: a compatibility proof never crosses deployment lock
-// families.
-//
-// This method is intentionally narrower than Fingerprint. A caller still has
-// to name an exact predecessor DeploymentOperationCatalogLockIdentity in a
-// package-owned compatibility proof; this value only proves that predecessor
-// was reviewed as executing the same contract as the installed lock.
-func (lock DeploymentOperationCatalogLock) ExecutionContractFingerprint() (workflowkit.Fingerprint, error) {
-	if err := lock.Validate(); err != nil {
-		return "", err
-	}
-	canonical := lock.Clone()
-	canonical.LockVersion = "execution-contract"
-	canonical.HarborFlowBuild = HarborFlowBuildIdentity{
-		Module:        "harbor-factory.execution-contract",
-		Version:       "1",
-		Commit:        strings.Repeat("0", 40),
-		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("harbor-factory.execution-contract.v1")),
-	}
-	encoded, err := canonical.CanonicalJSON()
-	if err != nil {
-		return "", err
-	}
-	return workflowkit.FingerprintBytes(DeploymentOperationCatalogLockExecutionContractFingerprintDomain, encoded)
-}
-
 // ParseDeploymentOperationCatalogLockJSON strictly decodes a lock document.
 // It rejects unknown fields and duplicate keys at every nesting level, null
 // operations, trailing JSON values, and all invalid/unversioned records.
@@ -1231,35 +1194,13 @@ type deploymentOperationCatalogLockDocument struct {
 	Operations                             []DeploymentOperationCatalogLockRecord      `json:"operations"`
 }
 
-// DeploymentOperationCatalogLockIdentity is the small immutable tuple that a
-// Run manifest can freeze independently of the full lock bytes.
+// DeploymentOperationCatalogLockIdentity is the compact immutable identity of
+// an installed deployment lock. Runtime code resolves it against the currently
+// deployed lock; it is never frozen into a Run manifest.
 type DeploymentOperationCatalogLockIdentity struct {
 	LockID      string                  `json:"lock_id"`
 	LockVersion string                  `json:"lock_version"`
 	Fingerprint workflowkit.Fingerprint `json:"fingerprint"`
-}
-
-// DeploymentOperationCatalogLockCompatibilityProof is a package-owned
-// approval for exactly one predecessor lock identity. It is not persisted in
-// a Run and never comes from a caller or worker payload. Construction verifies
-// that ExecutionContractFingerprint equals the installed lock's corresponding
-// value before the predecessor is allowed during replay.
-type DeploymentOperationCatalogLockCompatibilityProof struct {
-	Predecessor                  DeploymentOperationCatalogLockIdentity `json:"predecessor"`
-	ExecutionContractFingerprint workflowkit.Fingerprint                `json:"execution_contract_fingerprint"`
-}
-
-// Validate rejects partial aliases before a production composition can make
-// them reachable. The binding layer additionally verifies this proof against
-// its installed static lock and requires the same LockID family.
-func (proof DeploymentOperationCatalogLockCompatibilityProof) Validate() error {
-	if err := proof.Predecessor.Validate(); err != nil {
-		return fmt.Errorf("%w: predecessor lock identity: %v", ErrInvalidDeploymentOperationCatalogLock, err)
-	}
-	if err := proof.ExecutionContractFingerprint.Validate(); err != nil {
-		return fmt.Errorf("%w: execution contract fingerprint: %v", ErrInvalidDeploymentOperationCatalogLock, err)
-	}
-	return nil
 }
 
 // Validate proves the lock identity is safe to compare with an installed
@@ -1285,20 +1226,9 @@ type DeploymentOperationCatalogLockVerifier interface {
 	CatalogReceipt() DeploymentOperationCatalogReceipt
 	LockIdentity() DeploymentOperationCatalogLockIdentity
 	HarborFlowBuild() HarborFlowBuildIdentity
-	CanonicalLockJSON() []byte
 	VerifyCatalogReceipt(DeploymentOperationCatalogReceipt) error
 	VerifyLockIdentity(DeploymentOperationCatalogLockIdentity) error
 	VerifyStageOperation(workflowadapter.StageOperationResolution) (DeploymentOperationCatalogLockRecord, error)
-}
-
-// DeploymentOperationCatalogLockCompatibilityVerifier is the intentionally
-// narrow read-only surface used to validate package-owned predecessor proofs.
-// It does not add an alternate execution path: callers still use the current
-// lock verifier for every real operation.
-type DeploymentOperationCatalogLockCompatibilityVerifier interface {
-	LockIdentity() DeploymentOperationCatalogLockIdentity
-	VerifyLockIdentity(DeploymentOperationCatalogLockIdentity) error
-	ExecutionContractFingerprint() (workflowkit.Fingerprint, error)
 }
 
 // DeploymentOperationCatalogLockResolver freezes one complete catalog plus
@@ -1405,33 +1335,6 @@ func (resolver *DeploymentOperationCatalogLockResolver) HarborFlowBuild() Harbor
 	return resolver.lock.HarborFlowBuild
 }
 
-// CanonicalLockJSON returns a defensive copy of the exact canonical lock
-// bytes frozen at construction time.
-func (resolver *DeploymentOperationCatalogLockResolver) CanonicalLockJSON() []byte {
-	if resolver == nil {
-		return nil
-	}
-	return append([]byte(nil), resolver.canonical...)
-}
-
-// ExecutionContractFingerprint exposes the installed lock's canonical
-// execution contract for package-owned predecessor compatibility proofs. It
-// first repeats the normal static-lock verification, so a compatibility check
-// cannot become a weaker path around catalog or lock integrity.
-func (resolver *DeploymentOperationCatalogLockResolver) ExecutionContractFingerprint() (workflowkit.Fingerprint, error) {
-	if resolver == nil {
-		return "", ErrDeploymentOperationCatalogLockUnavailable
-	}
-	if err := resolver.verifyStaticLock(); err != nil {
-		return "", err
-	}
-	fingerprint, err := resolver.lock.ExecutionContractFingerprint()
-	if err != nil {
-		return "", fmt.Errorf("%w: fingerprint installed execution contract: %v", ErrDeploymentOperationCatalogLockDrift, err)
-	}
-	return fingerprint, nil
-}
-
 // VerifyCatalogReceipt proves a frozen Run catalog receipt belongs to this
 // exact catalog/lock pair.
 func (resolver *DeploymentOperationCatalogLockResolver) VerifyCatalogReceipt(receipt DeploymentOperationCatalogReceipt) error {
@@ -1450,8 +1353,8 @@ func (resolver *DeploymentOperationCatalogLockResolver) VerifyCatalogReceipt(rec
 	return nil
 }
 
-// VerifyLockIdentity proves a compact frozen lock binding belongs to this
-// resolver before a worker trusts the installed runtime configuration.
+// VerifyLockIdentity proves a compact lock binding belongs to this resolver
+// before a worker trusts the installed runtime configuration.
 func (resolver *DeploymentOperationCatalogLockResolver) VerifyLockIdentity(identity DeploymentOperationCatalogLockIdentity) error {
 	if resolver == nil {
 		return ErrDeploymentOperationCatalogLockUnavailable
@@ -1463,52 +1366,7 @@ func (resolver *DeploymentOperationCatalogLockResolver) VerifyLockIdentity(ident
 		return err
 	}
 	if identity != resolver.LockIdentity() {
-		return fmt.Errorf("%w: frozen lock %q@%q fingerprint %q does not match loaded lock", ErrDeploymentOperationCatalogLockDrift, identity.LockID, identity.LockVersion, identity.Fingerprint)
-	}
-	return nil
-}
-
-// VerifyDeploymentOperationCatalogLockCompatibilityProofs proves that every
-// package-owned predecessor alias refers to the installed lock family and to
-// its exact execution contract. The proof intentionally does not accept a
-// Run-supplied lock document: the caller must separately match the frozen
-// compact identity exactly against one of these verified predecessor entries.
-func VerifyDeploymentOperationCatalogLockCompatibilityProofs(verifier DeploymentOperationCatalogLockCompatibilityVerifier, proofs []DeploymentOperationCatalogLockCompatibilityProof) error {
-	if verifier == nil {
-		return ErrDeploymentOperationCatalogLockUnavailable
-	}
-	current := verifier.LockIdentity()
-	if err := current.Validate(); err != nil {
-		return fmt.Errorf("validate installed deployment catalog lock identity: %w", err)
-	}
-	if err := verifier.VerifyLockIdentity(current); err != nil {
-		return fmt.Errorf("verify installed deployment catalog lock identity: %w", err)
-	}
-	contract, err := verifier.ExecutionContractFingerprint()
-	if err != nil {
-		return fmt.Errorf("verify installed deployment catalog execution contract: %w", err)
-	}
-	if err := contract.Validate(); err != nil {
-		return fmt.Errorf("validate installed deployment catalog execution contract: %w", err)
-	}
-	seen := make(map[DeploymentOperationCatalogLockIdentity]struct{}, len(proofs))
-	for index, proof := range proofs {
-		if err := proof.Validate(); err != nil {
-			return fmt.Errorf("validate deployment catalog compatibility proof %d: %w", index, err)
-		}
-		if proof.Predecessor == current {
-			return fmt.Errorf("%w: deployment catalog compatibility proof %d aliases the installed lock identity", ErrDeploymentOperationCatalogLockDrift, index)
-		}
-		if proof.Predecessor.LockID != current.LockID {
-			return fmt.Errorf("%w: deployment catalog compatibility proof %d crosses lock identity families", ErrDeploymentOperationCatalogLockDrift, index)
-		}
-		if proof.ExecutionContractFingerprint != contract {
-			return fmt.Errorf("%w: deployment catalog compatibility proof %d execution contract differs from the installed lock", ErrDeploymentOperationCatalogLockDrift, index)
-		}
-		if _, duplicate := seen[proof.Predecessor]; duplicate {
-			return fmt.Errorf("%w: duplicate deployment catalog compatibility proof for predecessor lock %s@%s", ErrDeploymentOperationCatalogLockDrift, proof.Predecessor.LockID, proof.Predecessor.LockVersion)
-		}
-		seen[proof.Predecessor] = struct{}{}
+		return fmt.Errorf("%w: installed lock %q@%q fingerprint %q does not match loaded lock", ErrDeploymentOperationCatalogLockDrift, identity.LockID, identity.LockVersion, identity.Fingerprint)
 	}
 	return nil
 }
@@ -1615,15 +1473,6 @@ func NewCatalogLockAttestedWorkflowkitProviderOperationResolver(verifier Deploym
 	return &CatalogLockAttestedWorkflowkitProviderOperationResolver{verifier: verifier, delegate: delegate, attestor: attestor}, nil
 }
 
-// CatalogIdentity forwards the immutable catalog identity for future
-// lifecycle composition without exposing mutable lock state.
-func (resolver *CatalogLockAttestedWorkflowkitProviderOperationResolver) CatalogIdentity() DeploymentOperationCatalogIdentity {
-	if resolver == nil || resolver.verifier == nil {
-		return DeploymentOperationCatalogIdentity{}
-	}
-	return resolver.verifier.CatalogIdentity()
-}
-
 // Receipt forwards the catalog receipt in the shape expected by existing
 // catalog-aware lifecycle composition. It does not make this package depend on
 // app or cmd code.
@@ -1651,8 +1500,8 @@ func (resolver *CatalogLockAttestedWorkflowkitProviderOperationResolver) VerifyR
 	return resolver.verifier.VerifyCatalogReceipt(receipt)
 }
 
-// LockIdentity exposes the static immutable lock identity for a worker that
-// also freezes a lock receipt in its Run manifest.
+// LockIdentity exposes the static immutable lock identity for runtime
+// evidence binding alongside the frozen catalog receipt.
 func (resolver *CatalogLockAttestedWorkflowkitProviderOperationResolver) LockIdentity() DeploymentOperationCatalogLockIdentity {
 	if resolver == nil || resolver.verifier == nil {
 		return DeploymentOperationCatalogLockIdentity{}
@@ -1660,30 +1509,14 @@ func (resolver *CatalogLockAttestedWorkflowkitProviderOperationResolver) LockIde
 	return resolver.verifier.LockIdentity()
 }
 
-// VerifyLockIdentity forwards frozen lock-identity verification without
-// exposing the private static verifier. Lifecycle code can therefore freeze a
-// lock identity at Run admission and re-verify it in every worker mode.
+// VerifyLockIdentity forwards installed lock-identity verification without
+// exposing the private static verifier. Lifecycle and worker code re-verify
+// the currently deployed lock identity at every worker boundary.
 func (resolver *CatalogLockAttestedWorkflowkitProviderOperationResolver) VerifyLockIdentity(identity DeploymentOperationCatalogLockIdentity) error {
 	if resolver == nil || resolver.verifier == nil {
 		return ErrDeploymentOperationCatalogLockUnavailable
 	}
 	return resolver.verifier.VerifyLockIdentity(identity)
-}
-
-// ExecutionContractFingerprint forwards the installed lock's execution
-// contract proof when the underlying verifier supports it. The wrapper keeps
-// the app boundary independent of the resolver's concrete static verifier.
-func (resolver *CatalogLockAttestedWorkflowkitProviderOperationResolver) ExecutionContractFingerprint() (workflowkit.Fingerprint, error) {
-	if resolver == nil || resolver.verifier == nil {
-		return "", ErrDeploymentOperationCatalogLockUnavailable
-	}
-	contractVerifier, ok := resolver.verifier.(interface {
-		ExecutionContractFingerprint() (workflowkit.Fingerprint, error)
-	})
-	if !ok {
-		return "", fmt.Errorf("%w: static lock verifier has no execution contract proof", ErrDeploymentOperationCatalogLockUnavailable)
-	}
-	return contractVerifier.ExecutionContractFingerprint()
 }
 
 // ValidateStageOperation proves a frozen operation is accepted by both the

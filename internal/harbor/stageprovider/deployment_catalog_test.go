@@ -441,9 +441,6 @@ func TestCatalogBoundWorkflowkitResolverRequiresInstalledHandlerAfterCatalogAdmi
 	if err := specification.ValidateWithOperationResolver(resolver); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("catalog-admitted spec without handler = %v, want provider unavailable", err)
 	}
-	if resolver.CatalogIdentity() != catalog.CatalogIdentity() {
-		t.Fatalf("bound resolver identity = %+v, want %+v", resolver.CatalogIdentity(), catalog.CatalogIdentity())
-	}
 
 	wrongVersion := resolution.Provider
 	wrongVersion.Version = "2"

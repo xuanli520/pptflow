@@ -29,22 +29,6 @@ var (
 	standardAuthoringProductionBuildLockFingerprint           string
 )
 
-// standardAuthoringCompatibleLockProofs names the reviewed predecessor whose
-// Standard authoring execution contract matches the installed lock: the
-// v1.8 package at 9ac6a2c that froze the active authoring Run. Its catalog,
-// profile, and operation records are identical to the current lock; only the
-// Harbor Flow source commit differs (the in_doubt recovery semantics fix).
-// The explicit set lets the package continue Runs frozen by that predecessor
-// while still rejecting every other lock identity.
-var standardAuthoringCompatibleLockProofs = []stageprovider.DeploymentOperationCatalogLockCompatibilityProof{{
-	Predecessor: stageprovider.DeploymentOperationCatalogLockIdentity{
-		LockID:      "standard-authoring-production-lock",
-		LockVersion: "v1.8-9ac6a2c-codex146",
-		Fingerprint: "sha256:ec4072ef21d92ca5cc0237bc170662e37ef49fbfafe9fc4f95191cc9436742eb",
-	},
-	ExecutionContractFingerprint: "sha256:046717de20da541d39aaf8ebc0c5c4027f6d03ca75822fd9f66db0223f23c062",
-}}
-
 type standardAuthoringProductionBuildBinding struct {
 	HarborFlowBuild           stageprovider.HarborFlowBuildIdentity
 	CatalogReceiptFingerprint workflowkit.Fingerprint
@@ -77,7 +61,6 @@ type standardAuthoringProductionCompositionConfig struct {
 	HarborFlowBuild           stageprovider.HarborFlowBuildIdentity
 	CatalogReceiptFingerprint workflowkit.Fingerprint
 	LockIdentity              stageprovider.DeploymentOperationCatalogLockIdentity
-	CompatibleLockProofs      []stageprovider.DeploymentOperationCatalogLockCompatibilityProof
 	LookupEnvironment         func(string) (string, bool)
 	AdmissionContract         *codeedge.TaskAdmissionContract
 	CandidateHarness          *app.StandardAuthoringDockerHarness
@@ -193,7 +176,6 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 		SourceCapturer: capturer,
 		Definitions:    definitions,
 	}
-	composition.CatalogBinding.CompatibleLockProofs = append([]stageprovider.DeploymentOperationCatalogLockCompatibilityProof(nil), config.CompatibleLockProofs...)
 	return composition, nil
 }
 

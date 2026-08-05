@@ -82,9 +82,9 @@ var (
 
 	// ErrActiveRunSchemaUpgrade prevents a newer deployment package from
 	// changing the control-plane schema below unfinished frozen Runs. Those
-	// Runs are bound to a deployment catalog and lock identity. The Store has
-	// no deployment context in which to prove package compatibility, so it
-	// must leave that root for the original package or a fresh control plane.
+	// Runs are bound to a deployment catalog receipt. The Store has no
+	// deployment context in which to prove package compatibility, so it must
+	// leave that root for the original package or a fresh control plane.
 	ErrActiveRunSchemaUpgrade = errors.New("store: schema upgrade blocked by unfinished workflow run")
 )
 

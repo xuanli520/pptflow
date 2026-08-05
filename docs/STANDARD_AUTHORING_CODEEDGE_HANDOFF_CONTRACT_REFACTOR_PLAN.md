@@ -216,7 +216,7 @@ that Standard Authoring must satisfy before handoff:
 ```text
 contract identity
   + CodeEdge preflight profile fingerprint
-  + CodeEdge parent template/catalog receipt and lock identity
+  + CodeEdge parent template and catalog receipt
   + required task layout version
   + tests-analysis rendering template version
   + environment isolation rule version
@@ -224,9 +224,10 @@ contract identity
 ```
 
 The Standard Authoring deployment lock records the exact contract identity and
-fingerprint. Its Run manifest freezes that identity with the existing template,
-profile, prompt, and schema identities. The implementation must not look up
-the active CodeEdge production deployment at materialization time.
+fingerprint. The Run manifest freezes the catalog receipt with the existing
+template, profile, prompt, and schema identities, while the deployment lock is
+resolved at runtime against the currently installed CodeEdge production
+deployment. Lock version changes therefore stay compatible with frozen Runs.
 
 The CodeEdge package remains the owner of syntax and semantic validation. The
 Authoring package may orchestrate its use, but must not duplicate a second
@@ -655,7 +656,7 @@ The implementation is complete only when all statements below are true:
 7. Retrying an immutable failed child cannot be presented as content repair;
    the UI/CLI exposes an explicit new revision repair flow.
 8. Old frozen Runs/revisions are unchanged, and new Runs are isolated by the
-   new template/catalog/lock identity.
+   new template/catalog identity.
 9. Unit, integration, E2E, race, lock-build, and production package tests pass.
 
 Emit durable/auditable telemetry or inspection fields for:

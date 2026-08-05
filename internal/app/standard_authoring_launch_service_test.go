@@ -618,7 +618,7 @@ func TestStandardAuthoringLaunchRejectsDeploymentDriftBeforeRetryCapture(t *test
 	}
 }
 
-func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileIdentity(t *testing.T) {
+func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogAndProfileIdentity(t *testing.T) {
 	key, err := store.NewUUIDv7()
 	if err != nil {
 		t.Fatal(err)
@@ -645,10 +645,7 @@ func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileId
 	if err != nil {
 		t.Fatal(err)
 	}
-	lockIdentity := &stageprovider.DeploymentOperationCatalogLockIdentity{
-		LockID: "standard-authoring-test-lock", LockVersion: "1", Fingerprint: workflowkit.SHA256Fingerprint([]byte("lock")),
-	}
-	definition, err := newStandardAuthoringLaunchDeploymentDefinitionWithoutResolver(standardAuthoringLaunchTestProfile(), receiptCanonical, lockIdentity)
+	definition, err := newStandardAuthoringLaunchDeploymentDefinitionWithoutResolver(standardAuthoringLaunchTestProfile(), receiptCanonical)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +677,6 @@ func TestStandardAuthoringLaunchPreparationPersistsStaticCatalogLockAndProfileId
 	}
 	if !sameStandardAuthoringLaunchDeploymentDefinition(storedDefinition, definition) ||
 		!bytes.Equal(stored.DeploymentCatalogReceipt, receiptCanonical) ||
-		!sameDeploymentCatalogLockIdentity(stored.DeploymentCatalogLockIdentity, lockIdentity) ||
 		stored.ProfileFingerprint != definition.ProfileFingerprint || stored.PreparationFingerprint == definition.Fingerprint {
 		t.Fatalf("persisted static deployment identity = %+v, want %+v", stored, definition)
 	}

@@ -130,12 +130,6 @@ type LifecycleServicesOptions struct {
 	// into a construction error. Production CLI/worker composition should set
 	// this; non-production tests can retain the default false value.
 	RequireDeploymentCatalog bool
-	// RequireDeploymentLock additionally requires a catalog resolver that
-	// exposes and verifies an immutable operation-catalog lock identity. It is
-	// intentionally opt-in so catalog-only and non-production compositions
-	// remain backward-safe while production composition can require both
-	// allow-list layers.
-	RequireDeploymentLock bool
 	// DeploymentCatalogResolvers installs immutable deployment catalog/lock
 	// verifiers keyed by their exact closed workflow template. It is the
 	// multi-template successor to DeploymentCatalogResolver: a StartRun,
@@ -215,9 +209,6 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	catalogRegistry, err := newDeploymentCatalogRegistry(catalogResolvers)
 	if err != nil {
 		return nil, err
-	}
-	if options.RequireDeploymentLock && (catalogRegistry == nil || !catalogRegistry.allBindingsHaveLocks()) {
-		return nil, fmt.Errorf("%w: a catalog-lock-attested operation resolver is required", stageprovider.ErrDeploymentOperationCatalogLockUnavailable)
 	}
 	core := &lifecycleServiceCore{
 		store:                dataStore,
@@ -1048,15 +1039,11 @@ type StartRunRequest struct {
 	// StartRun input bundle. Direct callers leave it empty and StartRun freezes
 	// the receipt from the explicitly configured catalog-aware resolver.
 	DeploymentCatalogReceipt []byte
-	// DeploymentCatalogLockIdentity is supplied only by a previously frozen
-	// StartRun input bundle. Direct callers leave it nil and StartRun freezes
-	// the configured catalog-lock identity when the resolver provides one.
-	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
-	ParentRunID                   string
-	Trigger                       string
-	ExecutionEpoch                int
-	Actor                         string
-	Reason                        string
+	ParentRunID              string
+	Trigger                  string
+	ExecutionEpoch           int
+	Actor                    string
+	Reason                   string
 }
 
 type runManifest struct {
@@ -1065,21 +1052,25 @@ type runManifest struct {
 	// Subject* is the generic, kernel-facing immutable subject identity.  The
 	// task/revision fields below remain the task-lifecycle projection and are
 	// intentionally empty for an AuthoringSession Run.
-	SubjectKind                   store.WorkflowRunSubjectKind                          `json:"subject_kind,omitempty"`
-	SubjectID                     string                                                `json:"subject_id,omitempty"`
-	SubjectRevisionID             string                                                `json:"subject_revision_id,omitempty"`
-	SubjectDigest                 string                                                `json:"subject_digest,omitempty"`
-	AuthoringSessionID            string                                                `json:"authoring_session_id,omitempty"`
-	TaskID                        string                                                `json:"task_id"`
-	Revision                      string                                                `json:"revision_id"`
-	Resolved                      workflowadapter.ResolvedWorkflow                      `json:"resolved_workflow"`
-	InitialExecutionPlan          workflowkit.ExecutionPlan                             `json:"initial_execution_plan"`
-	Inputs                        *runManifestInputs                                    `json:"inputs,omitempty"`
-	ExecutionSpec                 json.RawMessage                                       `json:"execution_spec,omitempty"`
-	DeploymentCatalogReceipt      json.RawMessage                                       `json:"deployment_catalog_receipt,omitempty"`
-	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity `json:"deployment_catalog_lock_identity,omitempty"`
-	RestartOfRunID                string                                                `json:"restart_of_run_id,omitempty"`
-	Created                       time.Time                                             `json:"created_at"`
+	SubjectKind              store.WorkflowRunSubjectKind     `json:"subject_kind,omitempty"`
+	SubjectID                string                           `json:"subject_id,omitempty"`
+	SubjectRevisionID        string                           `json:"subject_revision_id,omitempty"`
+	SubjectDigest            string                           `json:"subject_digest,omitempty"`
+	AuthoringSessionID       string                           `json:"authoring_session_id,omitempty"`
+	TaskID                   string                           `json:"task_id"`
+	Revision                 string                           `json:"revision_id"`
+	Resolved                 workflowadapter.ResolvedWorkflow `json:"resolved_workflow"`
+	InitialExecutionPlan     workflowkit.ExecutionPlan        `json:"initial_execution_plan"`
+	Inputs                   *runManifestInputs               `json:"inputs,omitempty"`
+	ExecutionSpec            json.RawMessage                  `json:"execution_spec,omitempty"`
+	DeploymentCatalogReceipt json.RawMessage                  `json:"deployment_catalog_receipt,omitempty"`
+	// LegacyDeploymentCatalogLockIdentity tolerates the lock identity field
+	// written by binaries from before runtime lock resolution. It is never
+	// read or re-persisted; deployment lock identity is resolved at runtime
+	// against the currently installed deployment.
+	LegacyDeploymentCatalogLockIdentity json.RawMessage `json:"deployment_catalog_lock_identity,omitempty"`
+	RestartOfRunID                      string          `json:"restart_of_run_id,omitempty"`
+	Created                             time.Time       `json:"created_at"`
 }
 
 type runManifestInputs struct {
@@ -1195,10 +1186,6 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("freeze deployment catalog receipt for run: %w", err)
 	}
-	lockIdentity, err := service.core.resolveStartRunDeploymentCatalogLockIdentity(request.ExecutionSpec.Template, request.DeploymentCatalogLockIdentity)
-	if err != nil {
-		return store.WorkflowRun{}, fmt.Errorf("freeze deployment catalog lock identity for run: %w", err)
-	}
 	resolved, err := template.Compile(request.Profile)
 	if err != nil {
 		return store.WorkflowRun{}, fmt.Errorf("compile explicit execution profile: %w", err)
@@ -1261,7 +1248,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		if err != nil {
 			return store.WorkflowRun{}, err
 		}
-		if err := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); err != nil {
+		if err := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt); err != nil {
 			return store.WorkflowRun{}, err
 		}
 		if err := service.ensureRunInputArtifacts(ctx, *existing, manifest); err != nil {
@@ -1326,7 +1313,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		return store.WorkflowRun{}, err
 	}
 	if !createdRunDirectory {
-		storedManifest, err := readRecoverableRunManifest(manifestPath, runID, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity)
+		storedManifest, err := readRecoverableRunManifest(manifestPath, runID, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt)
 		if err != nil || !storedManifest {
 			if err == nil {
 				err = fmt.Errorf("run directory already exists without a recoverable frozen manifest: %s", runDirectory)
@@ -1359,10 +1346,9 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 			ExecutionSpecFingerprint:          finalSpecificationFingerprint,
 			ManagedInputs:                     append([]runManifestManagedInput(nil), managedInputs...),
 		},
-		ExecutionSpec:                 append(json.RawMessage(nil), finalSpecificationCanonical...),
-		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
-		Created:                       service.core.now().UTC(),
+		ExecutionSpec:            append(json.RawMessage(nil), finalSpecificationCanonical...),
+		DeploymentCatalogReceipt: append(json.RawMessage(nil), catalogReceipt...),
+		Created:                  service.core.now().UTC(),
 	}
 	encoded, err := json.Marshal(manifest)
 	if err != nil {
@@ -1386,15 +1372,6 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 		if len(catalogReceipt) != 0 {
 			if err := writeNewBytes(filepath.Join(runDirectory, deploymentCatalogReceiptFileName), catalogReceipt); err != nil {
 				return store.WorkflowRun{}, fmt.Errorf("write frozen deployment catalog receipt: %w", err)
-			}
-		}
-		if lockIdentity != nil {
-			canonicalLockIdentity, lockErr := canonicalDeploymentCatalogLockIdentity(*lockIdentity)
-			if lockErr != nil {
-				return store.WorkflowRun{}, fmt.Errorf("canonicalize frozen deployment catalog lock identity: %w", lockErr)
-			}
-			if lockErr := writeNewBytes(filepath.Join(runDirectory, deploymentCatalogLockIdentityFileName), canonicalLockIdentity); lockErr != nil {
-				return store.WorkflowRun{}, fmt.Errorf("write frozen deployment catalog lock identity: %w", lockErr)
 			}
 		}
 		if err := writeNewJSON(manifestPath, manifest); err != nil {
@@ -1421,7 +1398,7 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 	if err != nil {
 		if errors.Is(err, store.ErrIdentityCollision) {
 			if existing, lookupErr := service.core.store.GetWorkflowRun(ctx, runID); lookupErr == nil && existing != nil {
-				if validateErr := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt, lockIdentity); validateErr == nil {
+				if validateErr := service.validateReplayedWorkflowRun(*existing, request, resolved, profileCanonical, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint, initialExecutionPlan, catalogReceipt); validateErr == nil {
 					existingManifest, manifestErr := decodeRunManifest(*existing)
 					if manifestErr == nil && service.ensureRunInputArtifacts(ctx, *existing, existingManifest) == nil && service.ensureInitialWorkflowRunDispatch(ctx, *existing, existingManifest) == nil {
 						return *existing, nil
@@ -1459,7 +1436,7 @@ func resolveFrozenRunTemplate(profile workflowadapter.ExecutionProfile, specific
 	return profileTemplate, nil
 }
 
-func readRecoverableRunManifest(path, runID string, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical []byte, requestedSpecificationFingerprint workflowkit.Fingerprint, finalSpecificationCanonical []byte, finalSpecificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) (bool, error) {
+func readRecoverableRunManifest(path, runID string, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical []byte, requestedSpecificationFingerprint workflowkit.Fingerprint, finalSpecificationCanonical []byte, finalSpecificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1476,8 +1453,7 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 		manifest.Resolved.ExecutionProfileFingerprint != resolved.ExecutionProfileFingerprint || manifest.Resolved.DefinitionFingerprint != resolved.DefinitionFingerprint ||
 		!manifestMatchesExecutionSpec(manifest, request, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint) ||
 		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, initialExecutionPlan) ||
-		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) ||
-		!manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
+		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) {
 		return false, fmt.Errorf("existing run manifest does not match the requested frozen profile")
 	}
 	if len(catalogReceipt) != 0 {
@@ -1504,24 +1480,10 @@ func readRecoverableRunManifest(path, runID string, request StartRunRequest, res
 	if !bytes.Equal(specificationRaw, finalSpecificationCanonical) {
 		return false, fmt.Errorf("existing managed execution specification does not match the requested frozen profile")
 	}
-	if lockIdentity != nil {
-		lockPath := filepath.Join(filepath.Dir(path), deploymentCatalogLockIdentityFileName)
-		lockRaw, lockErr := readManagedRunLockIdentityFile(lockPath)
-		if lockErr != nil {
-			return false, lockErr
-		}
-		storedLockIdentity, canonicalLockIdentity, lockErr := parseDeploymentCatalogLockIdentityJSON(lockRaw)
-		if lockErr != nil {
-			return false, lockErr
-		}
-		if !bytes.Equal(lockRaw, canonicalLockIdentity) || storedLockIdentity != *lockIdentity {
-			return false, fmt.Errorf("existing managed deployment catalog lock identity does not match the requested frozen profile")
-		}
-	}
 	return true, nil
 }
 
-func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical []byte, requestedSpecificationFingerprint workflowkit.Fingerprint, finalSpecificationCanonical []byte, finalSpecificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte, lockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity) error {
+func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, request StartRunRequest, resolved workflowadapter.ResolvedWorkflow, profileCanonical []byte, requestedSpecificationFingerprint workflowkit.Fingerprint, finalSpecificationCanonical []byte, finalSpecificationFingerprint workflowkit.Fingerprint, initialExecutionPlan workflowkit.ExecutionPlan, catalogReceipt []byte) error {
 	if run.TaskID != request.TaskID || run.RevisionID != request.RevisionID || run.WorkflowTemplateID != resolved.TemplateID ||
 		run.WorkflowTemplateVersion != resolved.TemplateVersion || run.ResolvedProfileHash != string(resolved.ExecutionProfileFingerprint) ||
 		run.DefinitionHash != string(resolved.DefinitionFingerprint) || run.ParentRunID != request.ParentRunID ||
@@ -1532,8 +1494,7 @@ func (service *RunService) validateReplayedWorkflowRun(run store.WorkflowRun, re
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil ||
 		!manifestMatchesExecutionSpec(manifest, request, requestedSpecificationFingerprint, finalSpecificationCanonical, finalSpecificationFingerprint) ||
 		!manifestMatchesInitialExecutionPlan(manifest, resolved.Descriptor, initialExecutionPlan) ||
-		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) ||
-		!manifestMatchesDeploymentCatalogLockIdentity(manifest, lockIdentity) {
+		!manifestMatchesDeploymentCatalogReceipt(manifest, catalogReceipt) {
 		return fmt.Errorf("%w: workflow run %s execution specification", store.ErrIdempotencyConflict, run.ID)
 	}
 	if service == nil || service.core == nil {
@@ -1654,17 +1615,6 @@ func manifestMatchesDeploymentCatalogReceipt(manifest runManifest, expected []by
 		return false
 	}
 	return bytes.Equal(canonical, expected)
-}
-
-func manifestMatchesDeploymentCatalogLockIdentity(manifest runManifest, expected *stageprovider.DeploymentOperationCatalogLockIdentity) bool {
-	actual, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-	if err != nil {
-		return false
-	}
-	if actual == nil || expected == nil {
-		return actual == nil && expected == nil
-	}
-	return *actual == *expected
 }
 
 func readManagedRunReceiptFile(path string) ([]byte, error) {

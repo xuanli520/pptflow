@@ -105,7 +105,8 @@ runs/<run-id>/
 `run-manifest.json` 除现有 task/revision、workflow、profile、quota、计划、
 execution spec digest 外，必须冻结：
 
-- `deployment_catalog_id`、版本、fingerprint 与 lock fingerprint；
+- `deployment_catalog_id`、版本与 fingerprint；lock fingerprint 不冻结，
+  在运行时按当前部署的 lock 解析；
 - 每个 stage 的 provider、operation、payload、runtime、checkout 与 secret
   reference **身份**；
 - 已解析的 executable/image/model/prompt/schema fingerprints；

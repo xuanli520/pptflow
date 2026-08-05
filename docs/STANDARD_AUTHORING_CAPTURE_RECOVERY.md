@@ -5,7 +5,8 @@ operation directory before it creates the draft Task, AuthoringSession, or
 Run.
 
 1. `deployment-definition.json` binds the prepared operation to its approved
-   Standard execution profile, catalog receipt, and lock identity.
+   Standard execution profile and catalog receipt. The deployment lock is
+   resolved at runtime against the currently installed deployment.
 2. `capture-receipt.json` is published only after the requested Git archive
    has passed archive validation and its bytes have been written to the
    content-addressed object store.

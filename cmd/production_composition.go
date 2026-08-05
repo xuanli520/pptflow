@@ -143,7 +143,6 @@ func newCodeEdgeProductionLifecycleServicesWithConfig(root string, dataStore *st
 		OperationResolver:              composition.Resolver,
 		DeploymentCatalogResolver:      composition.Resolver,
 		RequireDeploymentCatalog:       true,
-		RequireDeploymentLock:          true,
 		EvaluatorRunDefinitionProvider: composition.Definitions,
 		CodeEdgeEvaluatorObserver:      composition.Observer,
 		RunWorkerHandoffLauncher:       executableRunWorkerLauncher{},

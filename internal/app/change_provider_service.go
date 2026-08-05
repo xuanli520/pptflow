@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/taskpolicy"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -946,10 +945,6 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(ctx contex
 	if err != nil {
 		return "", fmt.Errorf("decode source run deployment catalog receipt: %w", err)
 	}
-	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(original)
-	if err != nil {
-		return "", fmt.Errorf("decode source run deployment catalog lock identity: %w", err)
-	}
 	if err := service.core.verifyRunDeploymentCatalogReceipt(source); err != nil {
 		return "", fmt.Errorf("verify source run deployment catalog receipt: %w", err)
 	}
@@ -1014,8 +1009,7 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(ctx contex
 	manifest := runManifest{Format: "harbor.workflow-run-manifest.v2", RunID: candidate.TargetRunID, TaskID: candidate.TaskID,
 		Revision: candidate.TargetRevisionID, Resolved: original.Resolved.Clone(), InitialExecutionPlan: initialExecutionPlan,
 		Inputs: childInputs, ExecutionSpec: append(json.RawMessage(nil), childSpecificationCanonical...),
-		DeploymentCatalogReceipt:      append(json.RawMessage(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity), Created: service.core.now().UTC()}
+		DeploymentCatalogReceipt: append(json.RawMessage(nil), catalogReceipt...), Created: service.core.now().UTC()}
 	if manifestAlreadyExists {
 		if err := validateCandidateChildManagedExecutionInputs(filepath.Dir(path), profileCanonical, childSpecificationCanonical); err != nil {
 			return "", err
@@ -1043,26 +1037,6 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(ctx contex
 			}
 		}
 	}
-	if lockIdentity != nil {
-		canonicalLockIdentity, lockErr := canonicalDeploymentCatalogLockIdentity(*lockIdentity)
-		if lockErr != nil {
-			return "", fmt.Errorf("canonicalize candidate child deployment catalog lock identity: %w", lockErr)
-		}
-		lockPath := filepath.Join(filepath.Dir(path), deploymentCatalogLockIdentityFileName)
-		if lockErr := writeNewBytes(lockPath, canonicalLockIdentity); lockErr != nil {
-			if !os.IsExist(lockErr) {
-				return "", fmt.Errorf("write candidate child deployment catalog lock identity: %w", lockErr)
-			}
-			existingLockIdentityRaw, readErr := readManagedRunLockIdentityFile(lockPath)
-			if readErr != nil {
-				return "", readErr
-			}
-			existingLockIdentity, existingCanonicalLockIdentity, parseErr := parseDeploymentCatalogLockIdentityJSON(existingLockIdentityRaw)
-			if parseErr != nil || !bytes.Equal(existingLockIdentityRaw, existingCanonicalLockIdentity) || existingLockIdentity != *lockIdentity {
-				return "", fmt.Errorf("%w: existing candidate child deployment catalog lock identity conflicts: %v", stageprovider.ErrDeploymentOperationCatalogLockDrift, parseErr)
-			}
-		}
-	}
 	if err := writeNewJSON(path, manifest); err != nil {
 		if !os.IsExist(err) {
 			return "", err
@@ -1072,7 +1046,7 @@ func (service *ChangeProviderService) ensureCandidateChildRunManifest(ctx contex
 			return "", readErr
 		}
 		var existing runManifest
-		if decodeErr := decodeStrictJSON(string(raw), &existing); decodeErr != nil || existing.RunID != manifest.RunID || existing.TaskID != manifest.TaskID || existing.Revision != manifest.Revision || !reflect.DeepEqual(existing.Resolved, manifest.Resolved) || !manifestMatchesInitialExecutionPlan(existing, frozen.Workflow, initialExecutionPlan) || !manifestMatchesCandidateChildExecutionSpec(existing, childInputs, childSpecificationCanonical, childSpecificationFingerprint) || !manifestMatchesDeploymentCatalogReceipt(existing, catalogReceipt) || !manifestMatchesDeploymentCatalogLockIdentity(existing, lockIdentity) {
+		if decodeErr := decodeStrictJSON(string(raw), &existing); decodeErr != nil || existing.RunID != manifest.RunID || existing.TaskID != manifest.TaskID || existing.Revision != manifest.Revision || !reflect.DeepEqual(existing.Resolved, manifest.Resolved) || !manifestMatchesInitialExecutionPlan(existing, frozen.Workflow, initialExecutionPlan) || !manifestMatchesCandidateChildExecutionSpec(existing, childInputs, childSpecificationCanonical, childSpecificationFingerprint) || !manifestMatchesDeploymentCatalogReceipt(existing, catalogReceipt) {
 			return "", fmt.Errorf("existing candidate child run manifest conflicts: %v", decodeErr)
 		}
 		return canonicalCandidateChildRunManifestJSON(raw)

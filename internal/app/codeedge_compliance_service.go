@@ -182,9 +182,11 @@ func cloneCodeEdgeAuthorization(value *codeedge.LocalPackageAuthorization) *code
 }
 
 // loadFrozenCodeEdgeRun verifies that every binding used by final compliance
-// is present in both managed storage and the durable Run record. CodeEdge has
-// no non-production fallback because a package authorization without an
-// independently verified catalog and lock would be unverifiable on replay.
+// is present in both managed storage and the durable Run record. The catalog
+// receipt stays frozen in the Run while the deployment lock is resolved at
+// runtime from the installed template binding; CodeEdge has no non-production
+// fallback because a package authorization without an independently verified
+// catalog and lock would be unverifiable.
 func (core *lifecycleServiceCore) loadFrozenCodeEdgeRun(ctx context.Context, runID string) (frozenCodeEdgeRun, error) {
 	if core == nil || core.store == nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge frozen Run verifier is not configured")
@@ -203,7 +205,7 @@ func (core *lifecycleServiceCore) loadFrozenCodeEdgeRun(ctx context.Context, run
 	if !configured || parentCatalog == nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge final compliance requires a deployment catalog: %w", stageprovider.ErrDeploymentOperationCatalogUnavailable)
 	}
-	if parentCatalog.lockResolver == nil || parentCatalog.lockIdentity == nil {
+	if parentCatalog.lockResolver == nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge final compliance requires a deployment catalog lock: %w", stageprovider.ErrDeploymentOperationCatalogLockUnavailable)
 	}
 	run, err := core.store.GetWorkflowRun(ctx, runID)
@@ -235,8 +237,9 @@ func (core *lifecycleServiceCore) loadFrozenCodeEdgeRun(ctx context.Context, run
 		return frozenCodeEdgeRun{}, err
 	}
 	// A parent and its evaluator child intentionally use distinct deployment
-	// catalogs. Always prove the parent persisted its own catalog/lock; compare
-	// against an actively installed catalog only when it names this template.
+	// catalogs. Always prove the parent persisted its own catalog receipt;
+	// compare against an actively installed catalog only when it names this
+	// template, and re-verify the installed lock identity at runtime.
 	if err := core.verifyPersistedCodeEdgeCatalogProof(*run, manifest, workflowadapter.CodeEdgePhase1TemplateReference()); err != nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("verify CodeEdge deployment catalog and lock: %w", err)
 	}
@@ -254,21 +257,18 @@ func (core *lifecycleServiceCore) loadFrozenCodeEdgeRun(ctx context.Context, run
 	if !catalogReceipt.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) {
 		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge catalog receipt names another workflow template")
 	}
-	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-	if err != nil {
-		return frozenCodeEdgeRun{}, fmt.Errorf("decode CodeEdge catalog lock identity: %w", err)
-	}
-	if lockIdentity == nil {
-		return frozenCodeEdgeRun{}, fmt.Errorf("CodeEdge Run has no frozen deployment catalog lock identity")
-	}
 	policy := specification.CodeEdgeFinalCompliancePolicy.Clone()
 	if err := policy.Validate(); err != nil {
 		return frozenCodeEdgeRun{}, fmt.Errorf("validate frozen CodeEdge final compliance policy: %w", err)
 	}
+	identity := parentCatalog.lockResolver.LockIdentity()
+	if err := parentCatalog.lockResolver.VerifyLockIdentity(identity); err != nil {
+		return frozenCodeEdgeRun{}, fmt.Errorf("verify CodeEdge deployment catalog lock identity: %w", err)
+	}
 	binding := codeedge.FrozenRunBinding{
 		TaskSnapshotDigest:  workflowkit.SubjectDigest(revision.TaskDigest),
 		CatalogFingerprint:  catalogReceipt.CatalogFingerprint,
-		LockFingerprint:     lockIdentity.Fingerprint,
+		LockFingerprint:     identity.Fingerprint,
 		ManifestFingerprint: manifestFingerprint,
 	}
 	if err := binding.Validate(); err != nil {

@@ -18,6 +18,11 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
+// deploymentCatalogLockIdentityFileName names the legacy per-Run lock identity
+// companion file. The freeze mechanism was removed; tests keep the constant to
+// prove no new Run or bundle ever writes it again.
+const deploymentCatalogLockIdentityFileName = "deployment-catalog.lock-identity.json"
+
 func TestLifecycleCatalogRequirementIsExplicitAndNonProductionDoesNotInventReceipt(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -33,13 +38,6 @@ func TestLifecycleCatalogRequirementIsExplicitAndNonProductionDoesNotInventRecei
 	}); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogUnavailable) {
 		t.Fatalf("required catalog without catalog-aware resolver = %v, want unavailable catalog", err)
 	}
-	if _, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		OperationResolver:     testsupport.AcceptAllStageOperationResolver(),
-		RequireDeploymentLock: true,
-	}); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockUnavailable) {
-		t.Fatalf("required deployment lock without lock-aware resolver = %v, want unavailable lock", err)
-	}
-
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
 		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
 	})
@@ -63,14 +61,8 @@ func TestLifecycleCatalogRequirementIsExplicitAndNonProductionDoesNotInventRecei
 	if receipt, err := canonicalManifestDeploymentCatalogReceipt(manifest); err != nil || len(receipt) != 0 {
 		t.Fatalf("non-production run receipt = %q, %v; want absent", receipt, err)
 	}
-	if identity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest); err != nil || identity != nil {
-		t.Fatalf("non-production run lock identity = %+v, %v; want absent", identity, err)
-	}
 	if _, err := os.Stat(filepath.Join(root, managedRunsDirectory, run.ID, deploymentCatalogReceiptFileName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("non-production run unexpectedly wrote deployment catalog receipt: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(root, managedRunsDirectory, run.ID, deploymentCatalogLockIdentityFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("non-production run unexpectedly wrote deployment catalog lock identity: %v", err)
 	}
 }
 
@@ -95,11 +87,6 @@ func TestCatalogEnabledStartRunFreezesCanonicalReceiptInInputBundleAndRunManifes
 	specification := catalogReceiptExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	profile := catalogReceiptProfile(t)
 	resolver := catalogReceiptResolverForSpec(t, specification, "catalog-freeze", "v1")
-	if _, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		OperationResolver: resolver, RequireDeploymentCatalog: true, RequireDeploymentLock: true,
-	}); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockUnavailable) {
-		t.Fatalf("catalog-only resolver satisfied required deployment lock: %v", err)
-	}
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
 		// The resolver itself exposes the receipt/verifier contract, so the
 		// lifecycle constructor must derive the catalog binding rather than
@@ -149,13 +136,6 @@ func TestCatalogEnabledStartRunFreezesCanonicalReceiptInInputBundleAndRunManifes
 	if err != nil || !bytes.Equal(canonicalBundleReceipt, expectedReceipt) {
 		t.Fatalf("bundle manifest deployment catalog receipt = %s, %v; want %s", canonicalBundleReceipt, err, expectedReceipt)
 	}
-	if identity, err := canonicalManifestDeploymentCatalogLockIdentity(runManifest{DeploymentCatalogLockIdentity: bundle.DeploymentCatalogLockIdentity}); err != nil || identity != nil {
-		t.Fatalf("catalog-only bundle lock identity = %+v, %v; want absent", identity, err)
-	}
-	if _, err := os.Stat(filepath.Join(bundleDirectory, deploymentCatalogLockIdentityFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("catalog-only bundle unexpectedly wrote deployment lock identity: %v", err)
-	}
-
 	started, err := services.Mutations.StartRun(ctx, command)
 	if err != nil {
 		t.Fatal(err)
@@ -172,18 +152,12 @@ func TestCatalogEnabledStartRunFreezesCanonicalReceiptInInputBundleAndRunManifes
 	if err != nil || !bytes.Equal(canonicalRunReceipt, expectedReceipt) {
 		t.Fatalf("run manifest deployment catalog receipt = %s, %v; want %s", canonicalRunReceipt, err, expectedReceipt)
 	}
-	if identity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest); err != nil || identity != nil {
-		t.Fatalf("catalog-only run lock identity = %+v, %v; want absent", identity, err)
-	}
 	runReceipt, err := os.ReadFile(filepath.Join(root, managedRunsDirectory, run.ID, deploymentCatalogReceiptFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(runReceipt, expectedReceipt) {
 		t.Fatalf("run deployment catalog receipt = %s, want %s", runReceipt, expectedReceipt)
-	}
-	if _, err := os.Stat(filepath.Join(root, managedRunsDirectory, run.ID, deploymentCatalogLockIdentityFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("catalog-only run unexpectedly wrote deployment lock identity: %v", err)
 	}
 	if err := services.core.verifyRunDeploymentCatalogReceipt(run); err != nil {
 		t.Fatalf("verify frozen catalog receipt: %v", err)
@@ -289,7 +263,7 @@ func TestCatalogReceiptDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *t
 	}
 }
 
-func TestCatalogLockEnabledStartRunFreezesIdentityInBundleManifestAndManagedFiles(t *testing.T) {
+func TestCatalogLockEnabledStartRunKeepsReceiptWithoutFrozenIdentity(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.OpenForTest(root)
@@ -309,14 +283,14 @@ func TestCatalogLockEnabledStartRunFreezesIdentityInBundleManifestAndManagedFile
 	specification := catalogReceiptExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
 	resolver := catalogLockAttestedResolverForSpec(t, specification, "catalog-lock-freeze", "v1", "lock-v1")
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		OperationResolver: resolver, RequireDeploymentCatalog: true, RequireDeploymentLock: true,
+		OperationResolver: resolver, RequireDeploymentCatalog: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectedIdentity := resolver.LockIdentity()
-	if err := resolver.VerifyLockIdentity(expectedIdentity); err != nil {
-		t.Fatalf("verify fixture lock identity: %v", err)
+	expectedReceipt, err := resolver.CanonicalReceiptJSON()
+	if err != nil {
+		t.Fatal(err)
 	}
 	checkpoint, err := services.Mutations.CaptureCheckpoint(ctx, task.ID, revision.ID, "", "")
 	if err != nil {
@@ -324,7 +298,7 @@ func TestCatalogLockEnabledStartRunFreezesIdentityInBundleManifestAndManagedFile
 	}
 	command := StartRunLifecycleCommand{
 		LifecycleMutationCommandBase: LifecycleMutationCommandBase{
-			IdempotencyKey: mustLifecycleMutationUUID(t), Actor: "tester", Reason: "freeze catalog lock identity", Expected: checkpoint,
+			IdempotencyKey: mustLifecycleMutationUUID(t), Actor: "tester", Reason: "freeze catalog receipt", Expected: checkpoint,
 		},
 		ProfilePath:       writeCatalogReceiptProfile(t, root, profile),
 		ExecutionSpecPath: writeCatalogReceiptExecutionSpec(t, root, specification),
@@ -335,25 +309,12 @@ func TestCatalogLockEnabledStartRunFreezesIdentityInBundleManifestAndManagedFile
 		t.Fatal(err)
 	}
 	bundleDirectory := filepath.Join(root, managedRunInputsDirectory, prepared.InputBundleID)
-	bundleIdentityRaw, err := os.ReadFile(filepath.Join(bundleDirectory, deploymentCatalogLockIdentityFileName))
-	if err != nil {
-		t.Fatal(err)
+	bundleReceipt, err := os.ReadFile(filepath.Join(bundleDirectory, deploymentCatalogReceiptFileName))
+	if err != nil || !bytes.Equal(bundleReceipt, expectedReceipt) {
+		t.Fatalf("input bundle receipt = %s, %v; want frozen receipt", bundleReceipt, err)
 	}
-	bundleIdentity, canonicalBundleIdentity, err := parseDeploymentCatalogLockIdentityJSON(bundleIdentityRaw)
-	if err != nil || !bytes.Equal(bundleIdentityRaw, canonicalBundleIdentity) || bundleIdentity != expectedIdentity {
-		t.Fatalf("input bundle lock identity = %+v, %v; want %+v", bundleIdentity, err, expectedIdentity)
-	}
-	bundleManifestRaw, err := os.ReadFile(filepath.Join(bundleDirectory, runStartInputManifestFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var bundle runStartInputBundle
-	if err := decodeStrictJSON(string(bundleManifestRaw), &bundle); err != nil {
-		t.Fatal(err)
-	}
-	bundleManifestIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(runManifest{DeploymentCatalogLockIdentity: bundle.DeploymentCatalogLockIdentity})
-	if err != nil || bundleManifestIdentity == nil || *bundleManifestIdentity != expectedIdentity {
-		t.Fatalf("input bundle manifest lock identity = %+v, %v; want %+v", bundleManifestIdentity, err, expectedIdentity)
+	if _, err := os.Stat(filepath.Join(bundleDirectory, deploymentCatalogLockIdentityFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("input bundle unexpectedly contains a lock identity file: %v", err)
 	}
 
 	started, err := services.Mutations.StartRun(ctx, command)
@@ -368,42 +329,138 @@ func TestCatalogLockEnabledStartRunFreezesIdentityInBundleManifestAndManagedFile
 	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	runManifestIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-	if err != nil || runManifestIdentity == nil || *runManifestIdentity != expectedIdentity {
-		t.Fatalf("run manifest lock identity = %+v, %v; want %+v", runManifestIdentity, err, expectedIdentity)
+	canonicalRunReceipt, err := canonicalManifestDeploymentCatalogReceipt(manifest)
+	if err != nil || !bytes.Equal(canonicalRunReceipt, expectedReceipt) {
+		t.Fatalf("run manifest deployment catalog receipt = %s, %v; want %s", canonicalRunReceipt, err, expectedReceipt)
 	}
-	runIdentityRaw, err := os.ReadFile(filepath.Join(root, managedRunsDirectory, run.ID, deploymentCatalogLockIdentityFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	runIdentity, canonicalRunIdentity, err := parseDeploymentCatalogLockIdentityJSON(runIdentityRaw)
-	if err != nil || !bytes.Equal(runIdentityRaw, canonicalRunIdentity) || runIdentity != expectedIdentity {
-		t.Fatalf("run managed lock identity = %+v, %v; want %+v", runIdentity, err, expectedIdentity)
+	if _, err := os.Stat(filepath.Join(root, managedRunsDirectory, run.ID, deploymentCatalogLockIdentityFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("run unexpectedly contains a lock identity file: %v", err)
 	}
 	if err := services.core.verifyRunDeploymentCatalogReceipt(run); err != nil {
-		t.Fatalf("verify frozen catalog/lock binding: %v", err)
+		t.Fatalf("verify frozen catalog receipt: %v", err)
 	}
-
-	// A run replay must compare the separately managed identity file instead
-	// of trusting only the value embedded in the database manifest.
-	tamperedIdentity := expectedIdentity
-	tamperedIdentity.LockVersion = "lock-v2"
-	tamperedIdentityRaw, err := canonicalDeploymentCatalogLockIdentity(tamperedIdentity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, managedRunsDirectory, run.ID, deploymentCatalogLockIdentityFileName), tamperedIdentityRaw, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := services.Runs.StartRun(ctx, StartRunRequest{
-		ID: run.ID, TaskID: task.ID, RevisionID: revision.ID, Profile: profile, ExecutionSpec: specification,
-		InputBundleID: command.IdempotencyKey, Trigger: command.Trigger, Actor: "tester", Reason: "freeze catalog lock identity",
-	}); !errors.Is(err, store.ErrIdempotencyConflict) || !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
-		t.Fatalf("replay with changed managed lock identity = %v, want idempotency conflict + lock drift", err)
+	if replayed, err := services.Mutations.StartRun(ctx, command); err != nil || replayed != started {
+		t.Fatalf("catalog-bound StartRun replay = %+v, %v; want %+v", replayed, err, started)
 	}
 }
 
-func TestCatalogLockDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *testing.T) {
+// TestLegacyFrozenLockIdentityFieldStaysDecodableAndCanonical proves that
+// persistent records written by a binary that still froze the deployment lock
+// identity remain strictly decodable and byte-canonical after the freeze
+// mechanism was removed. The legacy field is tolerated, never read, and never
+// re-persisted by a new Run.
+func TestLegacyFrozenLockIdentityFieldStaysDecodableAndCanonical(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := store.OpenForTest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	bootstrap, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{OperationResolver: testsupport.AcceptAllStageOperationResolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, revision := importCatalogReceiptFixture(t, ctx, bootstrap, "legacy-lock-field")
+	profile := catalogReceiptProfile(t)
+	specification := catalogReceiptExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
+	resolver := catalogLockAttestedResolverForSpec(t, specification, "legacy-lock-field", "v1", "lock-v1")
+	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+		OperationResolver: resolver, RequireDeploymentCatalog: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := services.Mutations.CaptureCheckpoint(ctx, task.ID, revision.ID, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := StartRunLifecycleCommand{
+		LifecycleMutationCommandBase: LifecycleMutationCommandBase{
+			IdempotencyKey: mustLifecycleMutationUUID(t), Actor: "tester", Reason: "legacy lock identity compatibility", Expected: checkpoint,
+		},
+		ProfilePath:       writeCatalogReceiptProfile(t, root, profile),
+		ExecutionSpecPath: writeCatalogReceiptExecutionSpec(t, root, specification),
+		Trigger:           "legacy-lock-field",
+	}
+	prepared, err := services.Mutations.PrepareStartRun(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleRaw, err := os.ReadFile(filepath.Join(root, managedRunInputsDirectory, prepared.InputBundleID, runStartInputManifestFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyBundle := injectLegacyDeploymentCatalogLockIdentity(t, string(bundleRaw), `"created_at"`)
+	var bundle runStartInputBundle
+	if err := decodeStrictJSON(string(legacyBundle), &bundle); err != nil {
+		t.Fatalf("decode legacy StartRun input bundle: %v", err)
+	}
+	if len(bundle.LegacyDeploymentCatalogLockIdentity) == 0 {
+		t.Fatal("legacy StartRun input bundle did not retain the lock identity field")
+	}
+	// The input bundle manifest is written indented, so re-marshaling is not
+	// byte-canonical; only strict decodability and field tolerance matter.
+	if _, err := json.Marshal(bundle); err != nil {
+		t.Fatalf("re-marshal legacy StartRun input bundle: %v", err)
+	}
+
+	started, err := services.Mutations.StartRun(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := services.Runs.Get(ctx, started.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyManifest := injectLegacyDeploymentCatalogLockIdentity(t, run.RunManifestJSON, `"created_at"`)
+	var manifest runManifest
+	if err := decodeStrictJSON(string(legacyManifest), &manifest); err != nil {
+		t.Fatalf("decode run manifest with legacy lock identity: %v", err)
+	}
+	if len(manifest.LegacyDeploymentCatalogLockIdentity) == 0 {
+		t.Fatal("legacy run manifest did not retain the lock identity field")
+	}
+	canonicalManifest, err := json.Marshal(manifest)
+	if err != nil || !bytes.Equal(canonicalManifest, legacyManifest) {
+		t.Fatalf("legacy run manifest canonical round trip = %s, %v", canonicalManifest, err)
+	}
+	legacyRun := run
+	legacyRun.RunManifestJSON = string(legacyManifest)
+	if err := services.core.verifyRunDeploymentCatalogReceipt(legacyRun); err != nil {
+		t.Fatalf("verify legacy run manifest catalog receipt: %v", err)
+	}
+
+	legacyPreparation := injectLegacyDeploymentCatalogLockIdentity(t,
+		`{"format":"harbor.standard-authoring-launch-preparation.v1","version":"5","lifecycle_operation_id":"018f0a73-3b49-7000-8000-000000000001","requested_source_id":"018f0a73-3b49-7000-8000-000000000002","target_task_id":"018f0a73-3b49-7000-8000-000000000003","authoring_session_id":"018f0a73-3b49-7000-8000-000000000004","run_id":"018f0a73-3b49-7000-8000-000000000005","workflow_template_id":"harbor.standard-authoring.v2","workflow_template_version":"1","source_snapshot_schema_version":"1","execution_profile":{},"profile_fingerprint":"fp","deployment_catalog_receipt":{},"preparation_fingerprint":"prep"}`,
+		`"preparation_fingerprint"`)
+	var preparation standardAuthoringLaunchPreparation
+	if err := decodeStrictJSON(string(legacyPreparation), &preparation); err != nil {
+		t.Fatalf("decode legacy Standard authoring launch preparation: %v", err)
+	}
+	if len(preparation.LegacyDeploymentCatalogLockIdentity) == 0 {
+		t.Fatal("legacy launch preparation did not retain the lock identity field")
+	}
+	canonicalPreparation, err := json.Marshal(preparation)
+	if err != nil || !bytes.Equal(canonicalPreparation, legacyPreparation) {
+		t.Fatalf("legacy launch preparation canonical round trip = %s, %v", canonicalPreparation, err)
+	}
+}
+
+// injectLegacyDeploymentCatalogLockIdentity inserts the lock identity field
+// at the exact position the pre-runtime-resolution binary wrote it: after the
+// deployment catalog receipt and before the next struct field.
+func injectLegacyDeploymentCatalogLockIdentity(t *testing.T, canonicalJSON string, anchor string) []byte {
+	t.Helper()
+	legacy := `"deployment_catalog_lock_identity":{"lock_id":"standard-authoring-production-lock","lock_version":"v1.8-9ac6a2c-codex146","fingerprint":"sha256:ec4072ef21d92ca5cc0237bc170662e37ef49fbfafe9fc4f95191cc9436742eb"},`
+	index := strings.Index(canonicalJSON, anchor)
+	if index < 0 {
+		t.Fatalf("legacy lock identity anchor %q missing from %s", anchor, canonicalJSON)
+	}
+	return []byte(canonicalJSON[:index] + legacy + canonicalJSON[index:])
+}
+
+func TestCatalogLockChangeStaysCompatibleWhenReceiptMatches(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.OpenForTest(root)
@@ -441,18 +498,14 @@ func TestCatalogLockDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *test
 	if _, err := servicesA.Mutations.PrepareStartRun(ctx, command); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := servicesB.Mutations.StartRun(ctx, command); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
-		t.Fatalf("prepared StartRun under changed lock = %v, want lock drift", err)
-	}
-	if runs, err := servicesA.Runs.ListForTask(ctx, task.ID); err != nil || len(runs) != 0 {
-		t.Fatalf("lock-drifted prepared StartRun created Runs = %+v, %v", runs, err)
-	}
-
-	started, err := servicesA.Mutations.StartRun(ctx, command)
+	// A Run frozen under one lock version must remain compatible with a
+	// deployment that installed a newer lock for the same approved catalog;
+	// only the catalog receipt is frozen per Run.
+	started, err := servicesB.Mutations.StartRun(ctx, command)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("prepared StartRun under changed lock version = %v, want compatible start", err)
 	}
-	run, err := servicesA.Runs.Get(ctx, started.RunID)
+	run, err := servicesB.Runs.Get(ctx, started.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,98 +514,18 @@ func TestCatalogLockDriftRejectsPreparedReplayRuntimeLoadAndEngineBridge(t *test
 		t.Fatal(err)
 	}
 	runtime := newFrozenRuntime(t, servicesB, catalogReceiptRuntimeRegistry(t, frozen.Workflow, completedFixtureStage))
-	if _, _, err := runtime.loadFrozenRun(ctx, run.ID, run.DefinitionHash, frozen.ExecutionSpecFingerprint, frozen.QuotaPolicy); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) || !errors.Is(err, ErrFrozenExecutionPayload) {
-		t.Fatalf("load lock-drifted frozen run = %v, want frozen payload + lock drift", err)
-	}
-	backend := &workflowkitStageBackend{runtime: runtime, run: run}
-	if _, err := backend.frozenExecution(); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) || !errors.Is(err, ErrFrozenExecutionPayload) {
-		t.Fatalf("public Engine bridge accepted lock-drifted run = %v", err)
+	if _, _, err := runtime.loadFrozenRun(ctx, run.ID, run.DefinitionHash, frozen.ExecutionSpecFingerprint, frozen.QuotaPolicy); err != nil {
+		t.Fatalf("load frozen run under changed lock version = %v", err)
 	}
 
 	worker := newFrozenRuntimeWorker(t, database, runtime, "catalog-lock-drift-worker")
 	result, workerErr := worker.RunOnce(ctx)
-	if !errors.Is(workerErr, stageprovider.ErrDeploymentOperationCatalogLockDrift) || result.FinalState != store.JobFailed {
-		t.Fatalf("lock-drifted worker result = %+v, %v", result, workerErr)
+	if workerErr != nil || result.FinalState != store.JobSucceeded {
+		t.Fatalf("worker under changed lock version = %+v, %v; want succeeded", result, workerErr)
 	}
 	updated, err := database.GetWorkflowRun(ctx, run.ID)
-	if err != nil || updated == nil || updated.Status != store.WorkflowRunInDoubt {
-		t.Fatalf("lock-drifted worker did not project in_doubt = %+v, %v", updated, err)
-	}
-}
-
-func TestCatalogLockBuildOnlyCompatibilityAcceptsOnlyReviewedPredecessor(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	database, err := store.OpenForTest(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-
-	bootstrap, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		OperationResolver: testsupport.AcceptAllStageOperationResolver(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	task, revision := importCatalogReceiptFixture(t, ctx, bootstrap, "catalog-lock-build-compatibility")
-	profile := catalogReceiptProfile(t)
-	specification := catalogReceiptExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
-	oldResolver := catalogLockAttestedResolverForSpecWithBuild(t, specification, "catalog-lock-build-compatibility", "v1", "lock-v1", stageprovider.HarborFlowBuildIdentity{
-		Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40),
-		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("catalog-lock-old-build")),
-	})
-	currentResolver := catalogLockAttestedResolverForSpecWithBuild(t, specification, "catalog-lock-build-compatibility", "v1", "lock-v2", stageprovider.HarborFlowBuildIdentity{
-		Module: "github.com/purplevoid/harbor-factory", Version: "v2.1.0", Commit: strings.Repeat("b", 40),
-		ContentSHA256: workflowkit.SHA256Fingerprint([]byte("catalog-lock-current-build")),
-	})
-	contract, err := currentResolver.ExecutionContractFingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	proof := stageprovider.DeploymentOperationCatalogLockCompatibilityProof{
-		Predecessor: oldResolver.LockIdentity(), ExecutionContractFingerprint: contract,
-	}
-	servicesOld := catalogLockLifecycleServices(t, root, database, oldResolver)
-	run, err := servicesOld.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: profile, ExecutionSpec: specification,
-		Trigger: "catalog lock build compatibility", Actor: "tester", Reason: "freeze predecessor lock",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	frozen, err := decodeFrozenRunDefinition(run)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	withoutProof := catalogLockLifecycleServices(t, root, database, currentResolver)
-	rejectedRuntime := newFrozenRuntime(t, withoutProof, catalogReceiptRuntimeRegistry(t, frozen.Workflow, completedFixtureStage))
-	if _, _, err := rejectedRuntime.loadFrozenRun(ctx, run.ID, run.DefinitionHash, frozen.ExecutionSpecFingerprint, frozen.QuotaPolicy); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) || !errors.Is(err, ErrFrozenExecutionPayload) {
-		t.Fatalf("unapproved predecessor lock load = %v, want frozen payload + lock drift", err)
-	}
-
-	withProof := catalogLockLifecycleServicesWithProofs(t, root, database, currentResolver, []stageprovider.DeploymentOperationCatalogLockCompatibilityProof{proof})
-	compatibleRuntime := newFrozenRuntime(t, withProof, catalogReceiptRuntimeRegistry(t, frozen.Workflow, completedFixtureStage))
-	if _, _, err := compatibleRuntime.loadFrozenRun(ctx, run.ID, run.DefinitionHash, frozen.ExecutionSpecFingerprint, frozen.QuotaPolicy); err != nil {
-		t.Fatalf("reviewed predecessor lock load = %v", err)
-	}
-
-	var manifest runManifest
-	if err := decodeStrictJSON(run.RunManifestJSON, &manifest); err != nil {
-		t.Fatal(err)
-	}
-	tampered := oldResolver.LockIdentity()
-	tampered.Fingerprint = workflowkit.SHA256Fingerprint([]byte("unreviewed-predecessor-lock"))
-	manifest.DeploymentCatalogLockIdentity = &tampered
-	manifestRaw, err := json.Marshal(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tamperedRun := run
-	tamperedRun.RunManifestJSON = string(manifestRaw)
-	if err := withProof.core.verifyRunDeploymentCatalogReceipt(tamperedRun); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
-		t.Fatalf("unreviewed predecessor identity verification = %v, want lock drift", err)
+	if err != nil || updated == nil || updated.Status == store.WorkflowRunInDoubt {
+		t.Fatalf("worker under changed lock version left run = %+v, %v; want not in_doubt", updated, err)
 	}
 }
 
@@ -596,8 +569,6 @@ func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(
 			{Template: parentSpecification.Template, Resolver: parentResolver},
 			{Template: childSpecification.Template, Resolver: childResolver},
 		},
-		RequireDeploymentCatalog: true,
-		RequireDeploymentLock:    true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -664,10 +635,6 @@ func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(
 		if err != nil || !parsedReceipt.Template.Equal(template) {
 			t.Fatalf("Run %s receipt template = %+v, %v; want %s@%s", run.ID, parsedReceipt.Template, err, template.ID, template.Version)
 		}
-		identity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-		if err != nil || identity == nil || *identity != resolver.LockIdentity() {
-			t.Fatalf("Run %s catalog lock identity = %+v, %v; want %+v", run.ID, identity, err, resolver.LockIdentity())
-		}
 		if err := services.core.verifyRunDeploymentCatalogReceipt(run); err != nil {
 			t.Fatalf("verify Run %s own template catalog binding: %v", run.ID, err)
 		}
@@ -724,34 +691,8 @@ func TestTemplateDeploymentCatalogRegistryFreezesAndVerifiesEachTemplateBinding(
 		t.Fatal(err)
 	}
 
-	parentLock, err := canonicalDeploymentCatalogLockIdentity(parentResolver.LockIdentity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	childLockPath := filepath.Join(root, managedRunsDirectory, child.ID, deploymentCatalogLockIdentityFileName)
-	childLock, err := os.ReadFile(childLockPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(childLockPath, parentLock, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := runtime.loadFrozenRun(ctx, child.ID, child.DefinitionHash, childFrozen.ExecutionSpecFingerprint, childFrozen.QuotaPolicy); !errors.Is(err, ErrFrozenExecutionPayload) || !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
-		t.Fatalf("worker accepted parent lock for evaluator child = %v", err)
-	}
-	if _, err := services.Runs.StartRun(ctx, StartRunRequest{
-		ID: child.ID, TaskID: task.ID, RevisionID: revision.ID, ParentRunID: parent.ID,
-		Profile: childProfile, ExecutionSpec: childSpecification,
-		Trigger: "template-keyed-child", Actor: "tester", Reason: "freeze evaluator child template binding",
-	}); !errors.Is(err, store.ErrIdempotencyConflict) || !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) {
-		t.Fatalf("replay accepted parent lock for evaluator child = %v", err)
-	}
-	if err := os.WriteFile(childLockPath, childLock, 0o640); err != nil {
-		t.Fatal(err)
-	}
 }
-
-func TestCatalogLockIdentityPropagatesToCandidateChildManifest(t *testing.T) {
+func TestCandidateChildManifestKeepsReceiptWithoutLockIdentity(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.OpenForTest(root)
@@ -784,7 +725,7 @@ func TestCatalogLockIdentityPropagatesToCandidateChildManifest(t *testing.T) {
 	}
 	// Candidate child managed inputs are derived from the pre-commit immutable
 	// target snapshot, not from the source Run's input identity. This fixture
-	// exercises only catalog-lock propagation, so materialize an unchanged
+	// exercises only catalog receipt propagation, so materialize an unchanged
 	// target snapshot explicitly instead of bypassing that invariant.
 	baseSnapshot, err := services.Revisions.SnapshotDirectory(task.ID, revision.ID)
 	if err != nil {
@@ -820,33 +761,21 @@ func TestCatalogLockIdentityPropagatesToCandidateChildManifest(t *testing.T) {
 			t.Fatalf("candidate child checkout %q was not rebound: %+v", checkout.ID, checkout)
 		}
 	}
-	expectedIdentity := resolver.LockIdentity()
-	childIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(child)
-	if err != nil || childIdentity == nil || *childIdentity != expectedIdentity {
-		t.Fatalf("candidate child manifest lock identity = %+v, %v; want %+v", childIdentity, err, expectedIdentity)
-	}
-	childIdentityRaw, err := os.ReadFile(filepath.Join(root, managedRunsDirectory, candidate.TargetRunID, deploymentCatalogLockIdentityFileName))
+	expectedReceipt, err := resolver.CanonicalReceiptJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
-	storedIdentity, canonicalIdentity, err := parseDeploymentCatalogLockIdentityJSON(childIdentityRaw)
-	if err != nil || !bytes.Equal(childIdentityRaw, canonicalIdentity) || storedIdentity != expectedIdentity {
-		t.Fatalf("candidate child managed lock identity = %+v, %v; want %+v", storedIdentity, err, expectedIdentity)
+	childReceipt, err := canonicalManifestDeploymentCatalogReceipt(child)
+	if err != nil || !bytes.Equal(childReceipt, expectedReceipt) {
+		t.Fatalf("candidate child manifest receipt = %s, %v; want %s", childReceipt, err, expectedReceipt)
 	}
-
-	// The idempotent child-manifest path must reject a changed independently
-	// managed identity before a candidate can reuse its frozen child Run.
-	tamperedIdentity := expectedIdentity
-	tamperedIdentity.LockVersion = "lock-v2"
-	tamperedIdentityRaw, err := canonicalDeploymentCatalogLockIdentity(tamperedIdentity)
-	if err != nil {
-		t.Fatal(err)
+	// The lock identity is no longer frozen into candidate child runs; only
+	// the deployment catalog receipt carries over from the source Run.
+	if _, err := os.Stat(filepath.Join(root, managedRunsDirectory, candidate.TargetRunID, deploymentCatalogLockIdentityFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("candidate child unexpectedly contains a lock identity file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, managedRunsDirectory, candidate.TargetRunID, deploymentCatalogLockIdentityFileName), tamperedIdentityRaw, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := services.Changes.ensureCandidateChildRunManifest(ctx, candidate, run); !errors.Is(err, stageprovider.ErrDeploymentOperationCatalogLockDrift) && !strings.Contains(err.Error(), "lock identity") {
-		t.Fatalf("reused candidate child manifest accepted changed lock identity: %v", err)
+	if reused, err := services.Changes.ensureCandidateChildRunManifest(ctx, candidate, run); err != nil || reused != string(childRaw) {
+		t.Fatalf("candidate child manifest reuse = %q, %v; want unchanged %q", reused, err, childRaw)
 	}
 }
 
@@ -960,18 +889,36 @@ func catalogReceiptResolverForSpec(t *testing.T, specification workflowadapter.R
 
 func catalogLockLifecycleServices(t *testing.T, root string, database *store.Store, resolver *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver) *LifecycleServices {
 	t.Helper()
-	return catalogLockLifecycleServicesWithProofs(t, root, database, resolver, nil)
+	return catalogLockLifecycleServicesWithTemplateResolvers(t, root, database, resolver)
 }
 
-func catalogLockLifecycleServicesWithProofs(t *testing.T, root string, database *store.Store, resolver *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver, proofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof) *LifecycleServices {
+func catalogLockLifecycleServicesWithTemplateResolvers(t *testing.T, root string, database *store.Store, resolvers ...*stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver) *LifecycleServices {
 	t.Helper()
+	if len(resolvers) == 1 {
+		services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
+			OperationResolver:          resolvers[0],
+			DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{Template: resolvers[0].Receipt().Template, Resolver: resolvers[0]}},
+			RequireDeploymentCatalog:   true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return services
+	}
+	registrations := make([]stageprovider.TemplateWorkflowkitProviderRegistration, 0, len(resolvers))
+	bindings := make([]TemplateDeploymentCatalogResolver, 0, len(resolvers))
+	for _, resolver := range resolvers {
+		registrations = append(registrations, stageprovider.TemplateWorkflowkitProviderRegistration{Template: resolver.Receipt().Template, Resolver: resolver})
+		bindings = append(bindings, TemplateDeploymentCatalogResolver{Template: resolver.Receipt().Template, Resolver: resolver})
+	}
+	router, err := stageprovider.NewTemplateWorkflowkitProviderOperationResolver(registrations)
+	if err != nil {
+		t.Fatal(err)
+	}
 	services, err := NewLifecycleServicesWithOptions(root, database, LifecycleServicesOptions{
-		OperationResolver: resolver,
-		DeploymentCatalogResolvers: []TemplateDeploymentCatalogResolver{{
-			Template: resolver.Receipt().Template, Resolver: resolver,
-			CompatibleLockProofs: append([]stageprovider.DeploymentOperationCatalogLockCompatibilityProof(nil), proofs...),
-		}},
-		RequireDeploymentCatalog: true, RequireDeploymentLock: true,
+		OperationResolver:          router,
+		DeploymentCatalogResolvers: bindings,
+		RequireDeploymentCatalog:   true,
 	})
 	if err != nil {
 		t.Fatal(err)

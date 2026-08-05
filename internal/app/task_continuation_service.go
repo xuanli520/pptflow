@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
@@ -593,16 +592,15 @@ func decodeFrozenContinuationPlan(ctx context.Context, core *lifecycleServiceCor
 }
 
 type frozenRunDefinition struct {
-	Workflow                      workflowkit.WorkflowDescriptor
-	InitialExecutionPlan          workflowkit.ExecutionPlan
-	ExecutionSpecFingerprint      workflowkit.Fingerprint
-	ContinuationPlanTTL           time.Duration
-	ControlGracePeriod            time.Duration
-	CandidateProviderBudget       workflowadapter.CandidateProviderBudget
-	QuotaPolicy                   workflowadapter.ResolvedQuotaPolicy
-	ReviewStages                  []workflowadapter.ReviewStage
-	DeploymentCatalogReceipt      []byte
-	DeploymentCatalogLockIdentity *stageprovider.DeploymentOperationCatalogLockIdentity
+	Workflow                 workflowkit.WorkflowDescriptor
+	InitialExecutionPlan     workflowkit.ExecutionPlan
+	ExecutionSpecFingerprint workflowkit.Fingerprint
+	ContinuationPlanTTL      time.Duration
+	ControlGracePeriod       time.Duration
+	CandidateProviderBudget  workflowadapter.CandidateProviderBudget
+	QuotaPolicy              workflowadapter.ResolvedQuotaPolicy
+	ReviewStages             []workflowadapter.ReviewStage
+	DeploymentCatalogReceipt []byte
 }
 
 func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, error) {
@@ -623,10 +621,6 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 	catalogReceipt, err := canonicalManifestDeploymentCatalogReceipt(manifest)
 	if err != nil {
 		return frozenRunDefinition{}, fmt.Errorf("validate frozen run manifest %s deployment catalog receipt: %w", run.ID, err)
-	}
-	lockIdentity, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-	if err != nil {
-		return frozenRunDefinition{}, fmt.Errorf("validate frozen run manifest %s deployment catalog lock identity: %w", run.ID, err)
 	}
 	if manifest.Resolved.ContinuationPlanTTL <= 0 || manifest.Resolved.ContinuationPlanTTL > workflowadapter.MaxContinuationPlanTTL {
 		return frozenRunDefinition{}, fmt.Errorf("frozen run manifest %s continuation plan TTL must be within (0, %s]", run.ID, workflowadapter.MaxContinuationPlanTTL)
@@ -684,16 +678,15 @@ func decodeFrozenRunDefinition(run store.WorkflowRun) (frozenRunDefinition, erro
 		}
 	}
 	return frozenRunDefinition{
-		Workflow:                      workflow,
-		InitialExecutionPlan:          initialExecutionPlan,
-		ExecutionSpecFingerprint:      executionSpecFingerprint,
-		ContinuationPlanTTL:           manifest.Resolved.ContinuationPlanTTL,
-		ControlGracePeriod:            manifest.Resolved.ControlGracePeriod,
-		CandidateProviderBudget:       manifest.Resolved.CandidateProviderBudget,
-		QuotaPolicy:                   quotaPolicy,
-		ReviewStages:                  reviewStages,
-		DeploymentCatalogReceipt:      append([]byte(nil), catalogReceipt...),
-		DeploymentCatalogLockIdentity: cloneDeploymentCatalogLockIdentity(lockIdentity),
+		Workflow:                 workflow,
+		InitialExecutionPlan:     initialExecutionPlan,
+		ExecutionSpecFingerprint: executionSpecFingerprint,
+		ContinuationPlanTTL:      manifest.Resolved.ContinuationPlanTTL,
+		ControlGracePeriod:       manifest.Resolved.ControlGracePeriod,
+		CandidateProviderBudget:  manifest.Resolved.CandidateProviderBudget,
+		QuotaPolicy:              quotaPolicy,
+		ReviewStages:             reviewStages,
+		DeploymentCatalogReceipt: append([]byte(nil), catalogReceipt...),
 	}, nil
 }
 

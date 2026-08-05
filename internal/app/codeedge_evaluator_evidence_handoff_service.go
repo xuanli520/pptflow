@@ -309,11 +309,12 @@ func (service *CodeEdgeEvaluatorEvidenceHandoffService) loadFrozenEvaluatorChild
 	if err != nil || !catalogReceipt.Template.Equal(workflowadapter.CodeEdgeEvaluatorChildTemplateReference()) {
 		return store.WorkflowRun{}, store.TaskRevision{}, codeedge.FrozenRunBinding{}, fmt.Errorf("CodeEdge evaluator child catalog receipt names another template")
 	}
-	lock, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-	if err != nil || lock == nil {
-		return store.WorkflowRun{}, store.TaskRevision{}, codeedge.FrozenRunBinding{}, fmt.Errorf("CodeEdge evaluator child has no valid frozen catalog lock")
+	childTemplateBinding, configured := service.core.configuredDeploymentCatalogBindingForTemplate(workflowadapter.CodeEdgeEvaluatorChildTemplateReference())
+	var lockFingerprint workflowkit.Fingerprint
+	if configured && childTemplateBinding != nil && childTemplateBinding.lockResolver != nil {
+		lockFingerprint = childTemplateBinding.lockResolver.LockIdentity().Fingerprint
 	}
-	binding := codeedge.FrozenRunBinding{TaskSnapshotDigest: workflowkit.SubjectDigest(revision.TaskDigest), CatalogFingerprint: catalogReceipt.CatalogFingerprint, LockFingerprint: lock.Fingerprint, ManifestFingerprint: manifestFingerprint}
+	binding := codeedge.FrozenRunBinding{TaskSnapshotDigest: workflowkit.SubjectDigest(revision.TaskDigest), CatalogFingerprint: catalogReceipt.CatalogFingerprint, LockFingerprint: lockFingerprint, ManifestFingerprint: manifestFingerprint}
 	if err := binding.Validate(); err != nil {
 		return store.WorkflowRun{}, store.TaskRevision{}, codeedge.FrozenRunBinding{}, err
 	}
@@ -329,25 +330,15 @@ func (core *lifecycleServiceCore) verifyPersistedCodeEdgeCatalogProof(run store.
 	if err != nil || !receipt.Template.Equal(template) {
 		return fmt.Errorf("CodeEdge Run frozen catalog receipt names another template")
 	}
-	lock, err := canonicalManifestDeploymentCatalogLockIdentity(manifest)
-	if err != nil || lock == nil {
-		return fmt.Errorf("CodeEdge Run has no valid frozen catalog lock identity")
-	}
 	path := filepath.Join(core.layout.runDirectory(run.ID), deploymentCatalogReceiptFileName)
 	raw, err := readManagedRunExecutionInputFile(path, "deployment catalog receipt")
 	if err != nil || !bytes.Equal(raw, catalogRaw) {
 		return fmt.Errorf("CodeEdge Run managed catalog receipt differs from frozen manifest")
 	}
-	lockPath := filepath.Join(core.layout.runDirectory(run.ID), deploymentCatalogLockIdentityFileName)
-	lockRaw, err := readManagedRunExecutionInputFile(lockPath, "deployment catalog lock identity")
-	if err != nil {
-		return err
-	}
-	parsedLock, canonicalLock, err := parseDeploymentCatalogLockIdentityJSON(lockRaw)
-	if err != nil || !bytes.Equal(lockRaw, canonicalLock) || parsedLock != *lock {
-		return fmt.Errorf("CodeEdge Run managed catalog lock identity differs from frozen manifest")
-	}
-	if _, configured := core.configuredDeploymentCatalogBindingForTemplate(template); configured {
+	if binding, configured := core.configuredDeploymentCatalogBindingForTemplate(template); configured && binding != nil && binding.lockResolver != nil {
+		if err := binding.lockResolver.VerifyLockIdentity(binding.lockResolver.LockIdentity()); err != nil {
+			return err
+		}
 		if err := core.verifyRunDeploymentCatalogReceipt(run); err != nil {
 			return err
 		}

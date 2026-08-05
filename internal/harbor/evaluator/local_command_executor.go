@@ -595,7 +595,7 @@ func (executor *HarborEvaluatorLocalCommandExecutor) writeApprovedEnvFile(worksp
 	}
 	fingerprint, err := stageprovider.CanonicalHarborEvaluatorEndpointFingerprint(endpoint)
 	if err != nil || fingerprint != config.EndpointFingerprint {
-		return "", nil, errors.New("approved Harbor evaluator endpoint does not match the frozen lock")
+		return "", nil, errors.New("approved Harbor evaluator endpoint does not match the installed lock")
 	}
 	entries := []string{config.EndpointChildEnvKey + "=" + endpoint}
 	sensitiveValues := []string{endpoint}

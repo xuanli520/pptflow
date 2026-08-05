@@ -21,11 +21,6 @@ var (
 	codeEdgePhase1ProductionBuildLockFingerprint           string
 )
 
-// This package has no reviewed predecessor whose Phase-1 execution contract
-// matches the installed lock. Keep the explicit empty set so composition
-// accepts only the linker-bound current lock.
-var codeEdgePhase1CompatibleLockProofs []stageprovider.DeploymentOperationCatalogLockCompatibilityProof
-
 // codeEdgePhase1ProductionBuildBinding is the complete linker-bound identity
 // of the parent deployment materials.  Root composition compares it with the
 // independently bound Standard and evaluator identities before it creates a
