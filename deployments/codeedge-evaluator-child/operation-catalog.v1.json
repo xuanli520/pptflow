@@ -2,7 +2,7 @@
   "format": "harbor.deployment-operation-catalog.v1",
   "version": "1",
   "catalog_id": "codeedge-phase1-evaluator-production",
-  "catalog_version": "2026.07.14.1",
+  "catalog_version": "2026.08.05.1",
   "template": {
     "id": "harbor.codeedge-evaluator",
     "version": "1.0.0"
@@ -63,7 +63,7 @@
         "model_version": "2026.07.14",
         "endpoint_env_name": "QWEN_HARBOR_BASE_URL",
         "endpoint_child_env_key": "ANTHROPIC_BASE_URL",
-        "endpoint_fingerprint": "sha256:2f3c0048b0783da387b7ec2781ede5104097819a0f0e88107a93e9f927a34573",
+        "endpoint_fingerprint": "sha256:bc4354d1ef87976ae1975e11dae278a4aca7972557a0fde6a46336f4c0d03ae0",
         "secret_env_templates": [
           {
             "secret": {
@@ -71,7 +71,7 @@
               "provider": "environment",
               "version": "2026.07.14"
             },
-            "host_env_key": "ANTHROPIC_AUTH_TOKEN",
+            "host_env_key": "QWEN_HARBOR_API_KEY",
             "child_env_key": "ANTHROPIC_AUTH_TOKEN",
             "template": "{{secret}}"
           }
@@ -142,7 +142,7 @@
         "model_version": "2026.07.14",
         "endpoint_env_name": "OPUS_HARBOR_BASE_URL",
         "endpoint_child_env_key": "ANTHROPIC_BASE_URL",
-        "endpoint_fingerprint": "sha256:17292c400a3b94bfd33ab005cbebf6e3b3d0daf07bab2ad7800821452260eeb4",
+        "endpoint_fingerprint": "sha256:eff0c3669627d04bc2400a132f578e2fb663cdba1e7c61e8e67d3191fbc77398",
         "secret_env_templates": [
           {
             "secret": {
@@ -150,7 +150,7 @@
               "provider": "environment",
               "version": "2026.07.14"
             },
-            "host_env_key": "ANTHROPIC_AUTH_TOKEN",
+            "host_env_key": "OPUS_HARBOR_API_KEY",
             "child_env_key": "ANTHROPIC_AUTH_TOKEN",
             "template": "{{secret}}"
           }
