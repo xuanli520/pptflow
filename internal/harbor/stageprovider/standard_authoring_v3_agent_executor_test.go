@@ -870,6 +870,199 @@ func TestStandardAuthoringV3RepairLedgerAcceptsRejectedHostReceipt(t *testing.T)
 	}
 }
 
+func TestStandardAuthoringV3CriticRejectsFindingNotBoundToCandidateReceipt(t *testing.T) {
+	stage, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.TestQualityCritic))
+	if !found || stage.AgentRole == nil {
+		t.Fatal("3.0 test quality critic stage is unavailable")
+	}
+	contract, err := workflowkit.NewCandidateValidationContract(workflowkit.SHA256Fingerprint([]byte("runtime")), workflowkit.SHA256Fingerprint([]byte("verification")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractDigest, err := contract.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := workflowkit.NewCandidateSnapshot([]workflowkit.CandidateFile{{
+		Path: "instruction.md", SchemaVersion: "harbor.artifact.v1", ContentDigest: workflowkit.SHA256Fingerprint([]byte("candidate")), SizeBytes: int64(len("candidate")),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	receipt, err := workflowkit.NewValidationReceipt(workflowkit.ValidationReceipt{
+		SnapshotDigest: snapshot.Digest, ContractDigest: contractDigest, Verdict: workflowkit.ValidationReject, FailureCode: workflowkit.AgentFailureValidatorReject,
+		Diagnostics: []workflowkit.AgentCommandReport{{CommandID: "environment_build", ExitCode: 1, TestStarted: false, StderrTail: "wasm-bindgen-cli version mismatch"}},
+		IssuedAt:    now, ExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRaw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRaw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, found, err := standardAuthoringV3CandidateValidationIdentityFromInputs(map[string][]byte{"candidate_snapshot": snapshotRaw, "validation_receipt": receiptRaw})
+	if err != nil || !found {
+		t.Fatalf("candidate validation identity = %+v, %t, %v", identity, found, err)
+	}
+	payloadFor := func(finding workflowkit.WorkflowFinding) json.RawMessage {
+		t.Helper()
+		findingRaw, err := json.Marshal(finding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := json.Marshal(map[string]any{
+			"verdict":   "pass",
+			"artifacts": []map[string]string{{"name": "test_quality_finding", "content": string(findingRaw)}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	unbound := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleCritic, "", 64<<10)
+	unbound.candidateValidationIdentity = &identity
+	unboundFinding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
+		Code: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair),
+		EvidenceDigest: workflowkit.SHA256Fingerprint([]byte("stale-evidence")), CandidateDigest: identity.CandidateSnapshotDigest, DiagnosticDigest: identity.ValidationReceiptDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := unbound.handle(context.Background(), payloadFor(unboundFinding))
+	if err != nil {
+		t.Fatalf("critic unbound finding: %s, %v", response, err)
+	}
+	assertStandardAuthoringV3StructuredRejected(t, response, "structured_output_invalid", "finding_not_bound")
+	if unbound.lastRejectionCode != "finding_not_bound" {
+		t.Fatalf("lastRejectionCode = %q, want finding_not_bound", unbound.lastRejectionCode)
+	}
+	if _, accepted := unbound.acceptedResult(); accepted {
+		t.Fatal("unbound finding produced a durable output")
+	}
+
+	bound := newStandardAuthoringV3Submission(standardAuthoringV3TestDescriptor(stage), workflowkit.AgentRoleCritic, "", 64<<10)
+	bound.candidateValidationIdentity = &identity
+	boundFinding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
+		Code: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair),
+		EvidenceDigest: identity.ValidationReceiptDigest, CandidateDigest: identity.CandidateSnapshotDigest, DiagnosticDigest: identity.ValidationReceiptDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = bound.handle(context.Background(), payloadFor(boundFinding))
+	if err != nil || string(response) != `{"accepted":true}` {
+		t.Fatalf("receipt-bound critic finding was rejected: %s, %v", response, err)
+	}
+	result, accepted := bound.acceptedResult()
+	if !accepted || len(result.Artifacts) != 1 || result.Artifacts[0].Name != "test_quality_finding" {
+		t.Fatalf("bound critic artifacts = %+v accepted=%t", result.Artifacts, accepted)
+	}
+}
+
+func TestStandardAuthoringV3RepairLedgerSkipsUnboundFindings(t *testing.T) {
+	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
+	resolved, err := template.Compile(standardAuthoringTestExecutionProfile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := workflowkit.NewCandidateSnapshot([]workflowkit.CandidateFile{{
+		Path: "candidate.txt", SchemaVersion: "harbor.artifact.v1", ContentDigest: workflowkit.SHA256Fingerprint([]byte("candidate")), SizeBytes: int64(len("candidate")),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := workflowkit.NewCandidateValidationContract(workflowkit.SHA256Fingerprint([]byte("runtime")), workflowkit.SHA256Fingerprint([]byte("verification")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractDigest, err := contract.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	receipt, err := workflowkit.NewValidationReceipt(workflowkit.ValidationReceipt{
+		SnapshotDigest: snapshot.Digest, ContractDigest: contractDigest, Verdict: workflowkit.ValidationReject, FailureCode: workflowkit.AgentFailureValidatorReject,
+		IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRaw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRaw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairContext, err := workflowadapter.NewStandardAuthoringValidationRepairContext(receipt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairContextRaw, err := json.Marshal(repairContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := map[string][]byte{
+		"candidate_snapshot": snapshotRaw, "validation_receipt": receiptRaw,
+		workflowadapter.StandardAuthoringValidationRepairContextArtifact: repairContextRaw,
+		"unbound_test_quality_finding":                                   []byte(`{"schema_version":"harbor.workflow-finding.v1","finding":{"code":"test_quality_defect","producing_stage":"test_quality_critic","target_writer":"authoring_repair","evidence_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","candidate_digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","diagnostic_digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333"}}`),
+	}
+	rules := []workflowkit.WorkflowRepairRule{
+		{FindingCode: "test_quality_defect", ProducingStage: workflowkit.StageKey(workflowadapter.TestQualityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
+		{FindingCode: "solution_integrity_defect", ProducingStage: workflowkit.StageKey(workflowadapter.SolutionIntegrityCritic), TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair), RequiresCandidateSnapshot: true, ConsumesCandidateRepair: true},
+	}
+	for name, findingSpec := range map[string]struct {
+		code  string
+		stage workflowkit.StageKey
+	}{
+		"test_quality_finding":       {code: "test_quality_defect", stage: workflowkit.StageKey(workflowadapter.TestQualityCritic)},
+		"solution_integrity_finding": {code: "solution_integrity_defect", stage: workflowkit.StageKey(workflowadapter.SolutionIntegrityCritic)},
+	} {
+		finding, err := workflowkit.NewWorkflowFinding(workflowkit.WorkflowFinding{
+			Code: findingSpec.code, ProducingStage: findingSpec.stage, TargetWriter: workflowkit.StageKey(workflowadapter.AuthoringRepair),
+			EvidenceDigest: receipt.Digest, CandidateDigest: snapshot.Digest, DiagnosticDigest: receipt.Digest,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		findingRaw, err := json.Marshal(finding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := workflowkit.PlanWorkflowRepair(resolved.Descriptor, finding, rules, nil); err != nil {
+			t.Fatal(err)
+		}
+		inputs[name] = findingRaw
+	}
+	ledgerRaw, err := standardAuthoringV3RepairLedger(resolved.Descriptor, inputs)
+	if err != nil {
+		t.Fatalf("repair ledger rejected inputs with an unbound finding: %v", err)
+	}
+	var ledger workflowkit.WorkflowRepairLedger
+	if err := json.Unmarshal(ledgerRaw, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if len(ledger.Entries) != 3 {
+		t.Fatalf("repair ledger = %+v, want host rejection plus bound findings only (unbound skipped)", ledger)
+	}
+	for _, entry := range ledger.Entries {
+		if entry.Finding.Code == "test_quality_defect" && entry.Finding.EvidenceDigest != receipt.Digest {
+			t.Fatalf("ledger contains an unbound finding: %+v", entry.Finding)
+		}
+	}
+}
+
 func standardAuthoringV3CandidateWorkspace(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

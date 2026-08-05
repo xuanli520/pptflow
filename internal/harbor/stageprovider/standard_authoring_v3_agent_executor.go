@@ -157,6 +157,9 @@ func (executor *StandardAuthoringCodexAgentTurnExecutor) executeV3AgentTurn(ctx 
 		return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
 	}
 	submission := newStandardAuthoringV3Submission(request.Stage, role.RoleID, taskRoot, program.MaxOutputBytes)
+	if identity, found, err := standardAuthoringV3CandidateValidationIdentityFromInputs(inputs); err == nil && found {
+		submission.candidateValidationIdentity = &identity
+	}
 	if request.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) {
 		if executor.candidateValidator == nil || request.Claim.Stage == nil || request.Claim.Stage.StageAttempt.ID == "" {
 			return standardAuthoringCodexFailure(workflowkit.FailurePolicy, standardAuthoringCodexFailureConfiguration), nil
@@ -394,10 +397,10 @@ func standardAuthoringV3RepairLedger(workflow workflowkit.WorkflowDescriptor, in
 		}
 		var finding workflowkit.WorkflowFinding
 		if err := standardAuthoringV3DecodeTypedInput(rawFinding, &finding); err != nil || finding.Validate() != nil {
-			return nil, fmt.Errorf("finding %q is invalid", name)
+			continue
 		}
 		if finding.CandidateDigest != identity.CandidateSnapshotDigest || finding.EvidenceDigest != identity.ValidationReceiptDigest || finding.DiagnosticDigest != identity.ValidationReceiptDigest {
-			return nil, fmt.Errorf("finding %q is not bound to the reviewed candidate receipt", name)
+			continue
 		}
 		plan, err := workflowkit.PlanWorkflowRepair(workflow, finding, rules, nil)
 		if err != nil {
@@ -758,18 +761,19 @@ func standardAuthoringV3ArtifactName(path string) string {
 }
 
 type standardAuthoringV3Submission struct {
-	mu                    sync.Mutex
-	stage                 workflowkit.StageDescriptor
-	role                  workflowkit.AgentRoleID
-	taskRoot              string
-	limit                 int
-	maxValidationAttempts int
-	validationAttempts    int
-	candidateValidator    func(context.Context, workflowkit.CandidateSnapshot, map[string][]byte) (workflowkit.ValidationReceipt, error)
-	repairLedger          func() ([]byte, error)
-	accepted              *workflowkit.StageExecutionResult
-	submissions           []workflowkit.AgentTurnSubmissionAttempt
-	lastRejectionCode     string
+	mu                          sync.Mutex
+	stage                       workflowkit.StageDescriptor
+	role                        workflowkit.AgentRoleID
+	taskRoot                    string
+	limit                       int
+	candidateValidationIdentity *standardAuthoringV3CandidateValidationIdentity
+	maxValidationAttempts       int
+	validationAttempts          int
+	candidateValidator          func(context.Context, workflowkit.CandidateSnapshot, map[string][]byte) (workflowkit.ValidationReceipt, error)
+	repairLedger                func() ([]byte, error)
+	accepted                    *workflowkit.StageExecutionResult
+	submissions                 []workflowkit.AgentTurnSubmissionAttempt
+	lastRejectionCode           string
 }
 type standardAuthoringV3SubmissionRequest struct {
 	Verdict   string `json:"verdict"`
@@ -1195,8 +1199,8 @@ func (submission *standardAuthoringV3Submission) captureStructured(request stand
 		if _, duplicate := seen[item.Name]; duplicate {
 			return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: "undeclared_output"}
 		}
-		if err := standardAuthoringV3ValidateStructuredOutput(output, []byte(item.Content)); err != nil {
-			return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: "typed_artifact_invalid"}
+		if err := standardAuthoringV3ValidateStructuredOutput(output, []byte(item.Content), submission.candidateValidationIdentity); err != nil {
+			return workflowkit.StageExecutionResult{}, standardAuthoringV3StructuredSubmissionError{rejectionCode: standardAuthoringV3StructuredRejectionCode(err)}
 		}
 		seen[item.Name] = struct{}{}
 		artifacts = append(artifacts, workflowkit.StageArtifact{Name: item.Name, SchemaVersion: output.SchemaVersion, Content: []byte(item.Content)})
@@ -1204,7 +1208,7 @@ func (submission *standardAuthoringV3Submission) captureStructured(request stand
 	return workflowkit.StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusCompleted, Verdict: workflowkit.VerdictPass}, Artifacts: artifacts}, nil
 }
 
-func standardAuthoringV3ValidateStructuredOutput(output workflowkit.ArtifactSpec, content []byte) error {
+func standardAuthoringV3ValidateStructuredOutput(output workflowkit.ArtifactSpec, content []byte, candidateValidationIdentity *standardAuthoringV3CandidateValidationIdentity) error {
 	switch output.SchemaVersion {
 	case workflowkit.WorkflowFindingFormat:
 		var finding workflowkit.WorkflowFinding
@@ -1213,6 +1217,11 @@ func standardAuthoringV3ValidateStructuredOutput(output workflowkit.ArtifactSpec
 		}
 		if err := finding.Validate(); err != nil {
 			return fmt.Errorf("workflow finding output %q is invalid", output.Name)
+		}
+		if candidateValidationIdentity != nil {
+			if finding.CandidateDigest != candidateValidationIdentity.CandidateSnapshotDigest || finding.EvidenceDigest != candidateValidationIdentity.ValidationReceiptDigest || finding.DiagnosticDigest != candidateValidationIdentity.ValidationReceiptDigest {
+				return standardAuthoringV3StructuredSubmissionError{rejectionCode: "finding_not_bound"}
+			}
 		}
 	case workflowadapter.StandardAuthoringVerificationContractFormat:
 		if output.Name != "verification_contract" {
