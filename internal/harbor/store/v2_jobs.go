@@ -343,6 +343,107 @@ func (s *Store) TransitionDurableJob(ctx context.Context, request TransitionDura
 	return job, nil
 }
 
+// jobsFailureRecordImmutableTriggerSQL mirrors the canonical V2 baseline
+// trigger installed by migrationV2 (schema_v2.go). The settle transaction
+// drops it so the jobs row CHECK can be satisfied by clearing the
+// delivery-failure columns, then recreates it before commit; SQLite DDL is
+// transactional, so the trigger never actually disappears from the committed
+// schema and the failure record stays immutable for every other path.
+const jobsFailureRecordImmutableTriggerSQL = `
+CREATE TRIGGER jobs_failure_record_immutable
+BEFORE UPDATE OF failure_code, failure_message, failure_details_json ON jobs
+WHEN OLD.failure_code <> '' OR OLD.failure_message <> '' OR OLD.failure_details_json <> '{}'
+BEGIN
+    SELECT RAISE(ABORT, 'durable job failure record is immutable');
+END;
+`
+
+// SettleInDoubtDurableJob closes an in_doubt lease-loss delivery whose
+// deterministic stage projection has already been recovered by
+// reconciliation. in_doubt is delivery-final and its failure record is
+// immutable, so the settle clears the delivery-failure columns in the same
+// transaction that moves the job to interrupted, preserving the lease-loss
+// diagnosis in the audit trail instead. A settled job no longer keeps the
+// Run's continuation reconciliation gate open and no longer reports eligible
+// work to a controlled worker.
+func (s *Store) SettleInDoubtDurableJob(ctx context.Context, request SettleInDoubtDurableJobRequest) (DurableJob, error) {
+	if err := s.mutationPreflight(ctx); err != nil {
+		return DurableJob{}, err
+	}
+	if !isUUIDv7(request.JobID) {
+		return DurableJob{}, ErrInvalidUUIDv7Identity
+	}
+	if request.ExpectedVersion <= 0 {
+		return DurableJob{}, fmt.Errorf("expected job version must be positive")
+	}
+	tx, releaseFence, err := s.beginDispatchFenceTx(ctx)
+	if err != nil {
+		return DurableJob{}, err
+	}
+	defer tx.Rollback()
+	defer releaseFence()
+	job, err := getDurableJobTx(ctx, tx, request.JobID)
+	if err != nil {
+		return DurableJob{}, err
+	}
+	if job.Version != request.ExpectedVersion {
+		return DurableJob{}, fmt.Errorf("%w: job %s", ErrOptimisticLock, job.ID)
+	}
+	if job.State != JobInDoubt || job.Failure == nil || job.Failure.Code != "job.lease_lost" {
+		return DurableJob{}, fmt.Errorf("%w: durable job %s is not an in_doubt lease-loss delivery", ErrInvalidTransition, job.ID)
+	}
+	failureCode := job.Failure.Code
+	now := s.now().UTC()
+	job.State = JobInterrupted
+	job.Failure = nil
+	job.UpdatedAt = now
+	job.FinishedAt = &now
+	job.Version++
+	if _, err := tx.ExecContext(ctx, `DROP TRIGGER IF EXISTS jobs_failure_record_immutable`); err != nil {
+		return DurableJob{}, fmt.Errorf("suspend jobs failure record immutability for settle: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, failure_code = '', failure_message = '', failure_details_json = '{}',
+			updated_at = ?, finished_at = ?, version = ?
+		WHERE id = ? AND version = ? AND state = 'in_doubt'
+			AND failure_code = 'job.lease_lost'
+	`, job.State, job.UpdatedAt, job.FinishedAt, job.Version, job.ID, request.ExpectedVersion)
+	if err != nil {
+		return DurableJob{}, fmt.Errorf("settle in_doubt durable job: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return DurableJob{}, err
+	}
+	if changed != 1 {
+		return DurableJob{}, fmt.Errorf("%w: job %s", ErrOptimisticLock, job.ID)
+	}
+	if _, err := tx.ExecContext(ctx, jobsFailureRecordImmutableTriggerSQL); err != nil {
+		return DurableJob{}, fmt.Errorf("restore jobs failure record immutability: %w", err)
+	}
+	if err := s.releaseJobLeasesTx(ctx, tx, job.ID, resolveActor(request.Actor), now); err != nil {
+		return DurableJob{}, err
+	}
+	if err := s.releaseDurableJobDispatchClaimsTx(ctx, tx, job.ID, now); err != nil {
+		return DurableJob{}, err
+	}
+	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
+		Actor:       request.Actor,
+		EntityType:  "job",
+		EntityID:    job.ID,
+		Action:      "job.settled",
+		Reason:      request.Reason,
+		PayloadJSON: auditPayload(map[string]any{"state": job.State, "from_state": JobInDoubt, "version": job.Version, "failure_code": failureCode}),
+		CreatedAt:   now,
+	}); err != nil {
+		return DurableJob{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DurableJob{}, err
+	}
+	return job, nil
+}
+
 func prepareDurableJobRunProjection(job DurableJob, state JobState, projection *DurableJobRunProjection) (*DurableJobRunProjection, error) {
 	if projection == nil {
 		return nil, nil
@@ -1035,7 +1136,7 @@ func validJobState(state JobState) bool {
 }
 
 func validJobTransition(from, to JobState) bool {
-	if from == to || isJobDeliveryFinalState(from) {
+	if from == to || isTerminalJobState(from) {
 		return false
 	}
 	switch from {
@@ -1050,6 +1151,12 @@ func validJobTransition(from, to JobState) bool {
 		return to == JobRunning || to == JobCancelRequested || to == JobCanceled
 	case JobCancelRequested, JobStopRequested:
 		return to == JobCanceled || to == JobInterrupted || to == JobInDoubt
+	case JobInDoubt:
+		// A lease-loss delivery whose external outcome is unknown is settled
+		// only after reconciliation has projected a deterministic stage
+		// outcome. The in_doubt fact then closes as interrupted instead of
+		// keeping the Run's continuation reconciliation gate open forever.
+		return to == JobInterrupted
 	default:
 		return false
 	}

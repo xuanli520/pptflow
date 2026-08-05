@@ -485,6 +485,15 @@ type TransitionDurableJobRequest struct {
 	Reason          string
 }
 
+// SettleInDoubtDurableJobRequest closes an in_doubt lease-loss delivery whose
+// deterministic stage projection has already been recovered.
+type SettleInDoubtDurableJobRequest struct {
+	JobID           string
+	ExpectedVersion int64
+	Actor           string
+	Reason          string
+}
+
 type Lease struct {
 	ID           string
 	ResourceType string

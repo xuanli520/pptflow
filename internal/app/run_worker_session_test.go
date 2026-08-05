@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -279,8 +280,21 @@ func TestRunWorkerSessionKeepsSupervisorThroughDispatchLeaseLossRecovery(t *test
 	}
 	job, payload := requireRuntimeStageJob(t, ctx, fixture.store, fixture.run.ID, runtimeFixtureSourceStage)
 	persistedJob, err := fixture.store.GetDurableJob(ctx, job.ID)
-	if err != nil || persistedJob == nil || persistedJob.State != store.JobInDoubt || persistedJob.Failure == nil || persistedJob.Failure.Code != "job.lease_lost" {
+	if err != nil || persistedJob == nil || persistedJob.State != store.JobInterrupted || persistedJob.Failure != nil {
 		t.Fatalf("lease-loss session job = %+v, %v", persistedJob, err)
+	}
+	events, err := fixture.store.ListAuditEvents(ctx, store.ListAuditEventsRequest{EntityType: "job", EntityID: job.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled := 0
+	for _, event := range events {
+		if event.Action == "job.settled" && strings.Contains(event.PayloadJSON, `"failure_code":"job.lease_lost"`) {
+			settled++
+		}
+	}
+	if settled != 1 {
+		t.Fatalf("lease-loss settle audit events = %d, want 1; events = %+v", settled, events)
 	}
 	stage, err := fixture.store.GetStageAttempt(ctx, payload.StageAttemptID)
 	if err != nil || stage == nil || stage.ExecutionStatus != store.StageExecutionInterrupted {

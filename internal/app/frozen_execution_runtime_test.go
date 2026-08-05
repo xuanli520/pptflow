@@ -436,7 +436,7 @@ func TestFrozenExecutionRuntimeRebuildsContentStageLeaseLossRecoveryFromDurableF
 		t.Fatal(err)
 	}
 	persistedJob, err := fixture.store.GetDurableJob(ctx, job.ID)
-	if err != nil || persistedJob == nil || persistedJob.State != store.JobInDoubt || persistedJob.Failure == nil || persistedJob.Failure.Code != "job.lease_lost" {
+	if err != nil || persistedJob == nil || persistedJob.State != store.JobInterrupted || persistedJob.Failure != nil {
 		t.Fatalf("recovered durable job = %+v, %v", persistedJob, err)
 	}
 	persistedNode, err := fixture.store.GetNodeAttempt(ctx, node.ID)

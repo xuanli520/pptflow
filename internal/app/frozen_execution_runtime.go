@@ -291,7 +291,7 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 		return runtime.reconcileLeaseLostStageAttempt(ctx, job, run, payload, *attempt)
 	}
 	if attempt.ExecutionStatus == store.StageExecutionInterrupted && run.Status == store.WorkflowRunFailedRecoverable && job.Failure != nil && job.Failure.Code == "job.lease_lost" {
-		return nil
+		return runtime.settleLeaseLostStageDelivery(ctx, job)
 	}
 	if run.Status != store.WorkflowRunRunning {
 		return runtime.enqueueAutomaticRepairOutcome(ctx, run.ID, job.CreatedBy, "recover repair-loop handoff after terminal stage projection")
@@ -391,8 +391,28 @@ func (runtime *FrozenExecutionRuntime) reconcileLeaseLostStageAttempt(ctx contex
 	if err := runtime.finishRunWithStatus(ctx, run.ID, store.WorkflowRunFailedRecoverable, job.CreatedBy, "stage dispatch lease loss is recoverable"); err != nil {
 		return err
 	}
-	_, err = runtime.finishContinuationForRunOutcome(ctx, payload.ContinuationExecutionID, store.ContinuationExecutionFailed, job.CreatedBy, "continuation stage dispatch lease was lost")
-	return err
+	if _, err := runtime.finishContinuationForRunOutcome(ctx, payload.ContinuationExecutionID, store.ContinuationExecutionFailed, job.CreatedBy, "continuation stage dispatch lease was lost"); err != nil {
+		return err
+	}
+	return runtime.settleLeaseLostStageDelivery(ctx, job)
+}
+
+// settleLeaseLostStageDelivery closes a lease-loss delivery whose stage
+// projection is already terminal. The in_doubt job is a reconciliation fact:
+// once the stage attempt and Run have been recovered, the delivery itself is
+// deterministically interrupted and must not keep the Run's continuation
+// reconciliation gate open forever.
+func (runtime *FrozenExecutionRuntime) settleLeaseLostStageDelivery(ctx context.Context, job store.DurableJob) error {
+	if job.State != store.JobInDoubt {
+		return nil
+	}
+	if _, err := runtime.core.store.SettleInDoubtDurableJob(ctx, store.SettleInDoubtDurableJobRequest{
+		JobID: job.ID, ExpectedVersion: job.Version,
+		Actor: job.CreatedBy, Reason: "settle recovered lease-loss stage delivery",
+	}); err != nil {
+		return fmt.Errorf("settle recovered lease-loss stage delivery %s: %w", job.ID, err)
+	}
+	return nil
 }
 
 func leaseLostStageHasUnknownEffect(operations []store.SideEffectOperation) bool {
