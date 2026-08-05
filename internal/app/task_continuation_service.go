@@ -252,9 +252,20 @@ func (service *TaskContinuationService) compileContinuationPlan(ctx context.Cont
 	if err != nil {
 		return compiledContinuationPlan{}, fmt.Errorf("allocate continuation plan ID: %w", err)
 	}
+	requiredScheduledInputs := make(map[workflowkit.NodeID][]workflowkit.ArtifactBinding)
+	if subject.isAuthoringSession() {
+		bindings, err := service.authoringRepairAdmissionReportInput(ctx, run, subject, workflow, state, invalidation)
+		if err != nil {
+			return compiledContinuationPlan{}, err
+		}
+		if len(bindings) > 0 {
+			requiredScheduledInputs[workflowkit.StageKey(workflowadapter.AuthoringRepair)] = bindings
+		}
+	}
 	snapshot, err := buildSameRunContinuationPlan(planID, commandID, continuationPlanInput{
 		Expected:                    payload.Expected,
 		ExternalEffectConfirmations: payload.ExternalEffectConfirmations,
+		RequiredScheduledInputs:     requiredScheduledInputs,
 	}, run, subject.Binding.RevisionID, subject.Binding.Digest, workflow, state, invalidation, targets, strategy, expiresAt, subject.isAuthoringSession())
 	if err != nil {
 		return compiledContinuationPlan{}, err
@@ -1036,6 +1047,59 @@ func expandContinuationStageGroups(command normalizedContinuationCommand, workfl
 		return command.TargetNodeIDs[left] < command.TargetNodeIDs[right]
 	})
 	return command, nil
+}
+
+// authoringRepairAdmissionReportInput binds the latest completed package
+// admission report as a continuation-plan-only repair input whenever the
+// authoring repair stage is scheduled by invalidation. The report is never
+// resolved from ordinary stage lineage, so an open repair conversation sees
+// the exact violation that failed packaging without a stale lineage report
+// claiming to supersede the open repair.
+func (service *TaskContinuationService) authoringRepairAdmissionReportInput(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, workflow workflowkit.WorkflowDescriptor, state continuationRunState, invalidation workflowkit.InvalidationPlan) ([]workflowkit.ArtifactBinding, error) {
+	repair, exists := workflow.Stage(workflowadapter.AuthoringRepair)
+	if !exists {
+		return nil, nil
+	}
+	scheduled := false
+	for _, entry := range invalidation.Entries {
+		if entry.NodeID != repair.Key {
+			continue
+		}
+		switch entry.Impact {
+		case workflowkit.ImpactInvalidate, workflowkit.ImpactRequiresConfirmation:
+			scheduled = true
+		}
+	}
+	if !scheduled {
+		return nil, nil
+	}
+	attempt, found := state.Latest[workflowadapter.CodeEdgePackageAdmission]
+	if !found || attempt.ExecutionStatus != store.StageExecutionCompleted || strings.TrimSpace(attempt.ArtifactManifestID) == "" {
+		return nil, nil
+	}
+	references, err := service.core.store.ListArtifactRefs(ctx, attempt.ArtifactManifestID)
+	if err != nil {
+		return nil, err
+	}
+	for _, reference := range references {
+		if reference.ArtifactKey != workflowadapter.StandardAuthoringPackageAdmissionReportArtifact {
+			continue
+		}
+		if reference.RunID != run.ID || reference.SubjectRevisionID != subject.subjectRevisionID() || reference.SubjectDigest != subject.subjectDigest() || reference.WorkflowFingerprint != run.DefinitionHash {
+			return nil, fmt.Errorf("admission report artifact %s does not match frozen run lineage", reference.ID)
+		}
+		binding := workflowkit.ArtifactBinding{
+			Name:          workflowadapter.StandardAuthoringPackageAdmissionReportArtifact,
+			ArtifactID:    workflowkit.ArtifactID(reference.ID),
+			ContentDigest: workflowkit.Fingerprint(reference.ContentDigest),
+			SchemaVersion: reference.SchemaVersion,
+		}
+		if err := binding.Validate(); err != nil {
+			return nil, err
+		}
+		return []workflowkit.ArtifactBinding{binding}, nil
+	}
+	return nil, nil
 }
 
 func continuationTargets(command normalizedContinuationCommand, run store.WorkflowRun, workflow workflowkit.WorkflowDescriptor, state continuationRunState, allowContentStages bool) ([]workflowkit.NodeID, workflowkit.ContinuationStrategy, error) {

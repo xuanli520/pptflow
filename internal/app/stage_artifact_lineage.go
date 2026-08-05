@@ -151,7 +151,13 @@ func resolveStageInputsForSubjectWithExplicitInputs(ctx context.Context, dataSto
 		}
 		input, found := declared[binding.Name]
 		if !found || input.SchemaVersion != binding.SchemaVersion {
-			return nil, fmt.Errorf("%w: explicit input %q is not declared by stage %q", ErrInvalidStageExecution, binding.Name, stage.Key)
+			// Continuation-plan-only authoring repair inputs are injected
+			// exclusively by the recovery planner and are never resolved from
+			// stage lineage, so a frozen descriptor that predates a newly added
+			// repair port still accepts the planned binding.
+			if !isAuthoringRepairOnlyInput(run, subject, workflowkit.ArtifactSpec{Name: binding.Name, SchemaVersion: binding.SchemaVersion, Required: false}) {
+				return nil, fmt.Errorf("%w: explicit input %q is not declared by stage %q", ErrInvalidStageExecution, binding.Name, stage.Key)
+			}
 		}
 		if current, present := resolved[binding.Name]; present {
 			if current != binding {

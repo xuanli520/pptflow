@@ -90,11 +90,51 @@ func validateCurrentStandardAuthoringFrozenContract(run store.WorkflowRun, manif
 		if !expectedUsesContract || !actualUsesContract || expectedContract != actualContract || !actualContract.Required || actualContract.SchemaVersion != workflowadapter.AuthoringContractSchemaVersion {
 			return fmt.Errorf("Standard authoring Run %s frozen descriptor has an invalid root contract for stage %q", run.ID, expectedStage.Key)
 		}
-		if !reflect.DeepEqual(expectedStage.Inputs, actualStage.Inputs) || !reflect.DeepEqual(expectedStage.ReadSet, actualStage.ReadSet) {
+		if !standardAuthoringInputContractSuperset(expectedStage.Inputs, actualStage.Inputs) || !reflect.DeepEqual(expectedStage.ReadSet, actualStage.ReadSet) {
 			return fmt.Errorf("Standard authoring Run %s frozen descriptor changes the versioned input contract for stage %q", run.ID, expectedStage.Key)
 		}
 	}
 	return nil
+}
+
+// standardAuthoringInputContractSuperset reports whether the frozen stage
+// input contract is compatible with the current catalog. Every catalog
+// required input must be present with the identical spec so execution never
+// misses a mandatory port, and every frozen input must still be declared
+// identically by the catalog so a drifted or removed shape is a hard cutover.
+// A newer catalog may add optional inputs (for example a later
+// package-admission report port) without orphaning Runs frozen against the
+// previous contract.
+func standardAuthoringInputContractSuperset(catalog, frozen []workflowkit.ArtifactSpec) bool {
+	catalogByName := make(map[string]workflowkit.ArtifactSpec, len(catalog))
+	for _, spec := range catalog {
+		catalogByName[spec.Name] = spec
+	}
+	for _, spec := range catalog {
+		if !spec.Required {
+			continue
+		}
+		frozenSpec, found := frozenSpecByName(frozen, spec.Name)
+		if !found || !reflect.DeepEqual(frozenSpec, spec) {
+			return false
+		}
+	}
+	for _, spec := range frozen {
+		current, found := catalogByName[spec.Name]
+		if !found || !reflect.DeepEqual(current, spec) {
+			return false
+		}
+	}
+	return true
+}
+
+func frozenSpecByName(frozen []workflowkit.ArtifactSpec, name string) (workflowkit.ArtifactSpec, bool) {
+	for _, spec := range frozen {
+		if spec.Name == name {
+			return spec, true
+		}
+	}
+	return workflowkit.ArtifactSpec{}, false
 }
 
 func standardAuthoringArtifactSpec(specifications []workflowkit.ArtifactSpec, name string) (workflowkit.ArtifactSpec, bool) {
