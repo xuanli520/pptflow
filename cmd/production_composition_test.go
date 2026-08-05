@@ -121,7 +121,7 @@ func TestCodeEdgeEvaluatorProviderDefinitionBindsOnlyApprovedEnvironmentNames(t 
 	for _, invocation := range invocations {
 		byCommand[invocation.CommandID] = invocation
 	}
-	assertInvocation := func(commandID, model, endpoint string) {
+	assertInvocation := func(commandID, model, endpoint, credentialHostKey string) {
 		t.Helper()
 		invocation, found := byCommand[commandID]
 		if !found {
@@ -147,12 +147,12 @@ func TestCodeEdgeEvaluatorProviderDefinitionBindsOnlyApprovedEnvironmentNames(t 
 			invocation.DockerBuildxVersionOutput != stageprovider.HarborEvaluatorDockerBuildxVersionOutput {
 			t.Fatalf("invocation %q did not retain the frozen Docker runtime: %+v", commandID, invocation)
 		}
-		if len(invocation.SecretEnvTemplates) != 1 || invocation.SecretEnvTemplates[0].HostEnvKey != "ANTHROPIC_AUTH_TOKEN" || invocation.SecretEnvTemplates[0].ChildEnvKey != "ANTHROPIC_AUTH_TOKEN" || invocation.SecretEnvTemplates[0].Template != stageprovider.HarborEvaluatorSecretValueTemplate {
+		if len(invocation.SecretEnvTemplates) != 1 || invocation.SecretEnvTemplates[0].HostEnvKey != credentialHostKey || invocation.SecretEnvTemplates[0].ChildEnvKey != "ANTHROPIC_AUTH_TOKEN" || invocation.SecretEnvTemplates[0].Template != stageprovider.HarborEvaluatorSecretValueTemplate {
 			t.Fatalf("invocation %q secret mapping is not the approved private env-file mapping", commandID)
 		}
 	}
-	assertInvocation(stageprovider.HarborEvaluatorQwenCommandID, "qwen3.7-max", "QWEN_HARBOR_BASE_URL")
-	assertInvocation(stageprovider.HarborEvaluatorOpusCommandID, "claude-opus-4-6", "OPUS_HARBOR_BASE_URL")
+	assertInvocation(stageprovider.HarborEvaluatorQwenCommandID, "qwen3.7-max", "QWEN_HARBOR_BASE_URL", "QWEN_HARBOR_API_KEY")
+	assertInvocation(stageprovider.HarborEvaluatorOpusCommandID, "claude-opus-4-6", "OPUS_HARBOR_BASE_URL", "OPUS_HARBOR_API_KEY")
 }
 
 func TestCodeEdgeEvaluatorDefinitionProviderBuildsLockOwnedChildBudgetAndSpec(t *testing.T) {

@@ -50,12 +50,14 @@ const (
 	evaluatorResultSchemaAssetFormat      = "harbor.codeedge-evaluator-result-schema.v1"
 	evaluatorResultSchemaAssetVersion     = "1"
 
-	qwenEndpointEnvironment   = "QWEN_HARBOR_BASE_URL"
-	opusEndpointEnvironment   = "OPUS_HARBOR_BASE_URL"
-	credentialEnvironment     = "ANTHROPIC_AUTH_TOKEN"
-	dockerServerVersionFormat = `{{.Server.Version}}`
-	dockerComposePathFormat   = `{{range .ClientInfo.Plugins}}{{if eq .Name "compose"}}{{.Path}}{{end}}{{end}}`
-	dockerBuildxPathFormat    = `{{range .ClientInfo.Plugins}}{{if eq .Name "buildx"}}{{.Path}}{{end}}{{end}}`
+	qwenEndpointEnvironment    = "QWEN_HARBOR_BASE_URL"
+	opusEndpointEnvironment    = "OPUS_HARBOR_BASE_URL"
+	qwenCredentialEnvironment  = "QWEN_HARBOR_API_KEY"
+	opusCredentialEnvironment  = "OPUS_HARBOR_API_KEY"
+	credentialChildEnvironment = "ANTHROPIC_AUTH_TOKEN"
+	dockerServerVersionFormat  = `{{.Server.Version}}`
+	dockerComposePathFormat    = `{{range .ClientInfo.Plugins}}{{if eq .Name "compose"}}{{.Path}}{{end}}{{end}}`
+	dockerBuildxPathFormat     = `{{range .ClientInfo.Plugins}}{{if eq .Name "buildx"}}{{.Path}}{{end}}{{end}}`
 )
 
 // generatedProductionLocks are omitted from the source manifest signed by
@@ -387,12 +389,13 @@ func cloneEvaluatorSecrets(values []workflowadapter.SecretReference) []workflowa
 }
 
 type requiredEvaluatorRegistration struct {
-	registration stageprovider.DeploymentOperationRegistration
-	stageKey     workflowkit.StageKey
-	commandID    string
-	operationID  string
-	modelID      string
-	endpointName string
+	registration  stageprovider.DeploymentOperationRegistration
+	stageKey      workflowkit.StageKey
+	commandID     string
+	operationID   string
+	modelID       string
+	endpointName  string
+	credentialEnv string
 }
 
 func requiredEvaluatorRegistrations(catalog *stageprovider.DeploymentOperationCatalogResolver) ([]stageprovider.DeploymentOperationRegistration, error) {
@@ -400,8 +403,8 @@ func requiredEvaluatorRegistrations(catalog *stageprovider.DeploymentOperationCa
 		return nil, errors.New("evaluator catalog is required")
 	}
 	definitions := []requiredEvaluatorRegistration{
-		{stageKey: workflowadapter.HarborRunQwen, commandID: stageprovider.HarborEvaluatorQwenCommandID, operationID: "codeedge.qwen.pass-at-four", modelID: "qwen3.7-max", endpointName: qwenEndpointEnvironment},
-		{stageKey: workflowadapter.HarborRunOpus, commandID: stageprovider.HarborEvaluatorOpusCommandID, operationID: "codeedge.opus.pass-at-four", modelID: "claude-opus-4-6", endpointName: opusEndpointEnvironment},
+		{stageKey: workflowadapter.HarborRunQwen, commandID: stageprovider.HarborEvaluatorQwenCommandID, operationID: "codeedge.qwen.pass-at-four", modelID: "qwen3.7-max", endpointName: qwenEndpointEnvironment, credentialEnv: qwenCredentialEnvironment},
+		{stageKey: workflowadapter.HarborRunOpus, commandID: stageprovider.HarborEvaluatorOpusCommandID, operationID: "codeedge.opus.pass-at-four", modelID: "claude-opus-4-6", endpointName: opusEndpointEnvironment, credentialEnv: opusCredentialEnvironment},
 	}
 	operations := catalog.Catalog().Operations
 	if len(operations) != len(definitions) {
@@ -439,7 +442,7 @@ func requiredEvaluatorRegistrations(catalog *stageprovider.DeploymentOperationCa
 			return nil, fmt.Errorf("evaluator catalog operation %q does not have the approved secret reference", expected.commandID)
 		}
 		secret := contract.SecretEnvTemplates[0]
-		if secret.Secret != registration.Secrets[0] || secret.HostEnvKey != credentialEnvironment || secret.ChildEnvKey != credentialEnvironment || secret.Template != stageprovider.HarborEvaluatorSecretValueTemplate {
+		if secret.Secret != registration.Secrets[0] || secret.HostEnvKey != expected.credentialEnv || secret.ChildEnvKey != credentialChildEnvironment || secret.Template != stageprovider.HarborEvaluatorSecretValueTemplate {
 			return nil, fmt.Errorf("evaluator catalog operation %q does not have the approved secret environment mapping", expected.commandID)
 		}
 		ordered = append(ordered, registration)
@@ -647,9 +650,11 @@ func validateEvaluatorEnvironment(lookup func(string) (string, bool), registrati
 			return fmt.Errorf("approved evaluator endpoint environment %q does not match the source-controlled catalog", contract.EndpointEnvName)
 		}
 	}
-	secret, present := lookup(credentialEnvironment)
-	if !present || secret == "" || strings.ContainsAny(secret, "\r\n\x00") {
-		return errors.New("approved evaluator credential environment is unavailable or malformed")
+	for _, name := range []string{qwenCredentialEnvironment, opusCredentialEnvironment} {
+		secret, present := lookup(name)
+		if !present || secret == "" || strings.ContainsAny(secret, "\r\n\x00") {
+			return fmt.Errorf("approved evaluator credential environment %q is unavailable or malformed", name)
+		}
 	}
 	return nil
 }

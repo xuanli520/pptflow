@@ -28,7 +28,8 @@ fi
 : "${HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION:?set HARBOR_FACTORY_CODEEDGE_EVALUATOR_LOCK_VERSION to the immutable evaluator lock version}"
 : "${QWEN_HARBOR_BASE_URL:?set QWEN_HARBOR_BASE_URL in the environment}"
 : "${OPUS_HARBOR_BASE_URL:?set OPUS_HARBOR_BASE_URL in the environment}"
-: "${ANTHROPIC_AUTH_TOKEN:?set ANTHROPIC_AUTH_TOKEN in the environment}"
+: "${QWEN_HARBOR_API_KEY:?set QWEN_HARBOR_API_KEY in the environment}"
+: "${OPUS_HARBOR_API_KEY:?set OPUS_HARBOR_API_KEY in the environment}"
 
 git_executable="$HARBOR_FACTORY_GIT_EXECUTABLE"
 harbor_launcher="$HARBOR_FACTORY_HARBOR_LAUNCHER"

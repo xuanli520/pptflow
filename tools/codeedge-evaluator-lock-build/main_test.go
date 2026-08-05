@@ -87,7 +87,7 @@ func TestBuildCreatesAttestedEvaluatorLockFromAssetsAndControlledProbes(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, value := range []string{fixture.environment[qwenEndpointEnvironment], fixture.environment[opusEndpointEnvironment], fixture.environment[credentialEnvironment]} {
+	for _, value := range []string{fixture.environment[qwenEndpointEnvironment], fixture.environment[opusEndpointEnvironment], fixture.environment[qwenCredentialEnvironment], fixture.environment[opusCredentialEnvironment]} {
 		if strings.Contains(string(canonical), value) {
 			t.Fatalf("generated lock persisted an environment value")
 		}
@@ -106,7 +106,7 @@ func TestBuildCreatesAttestedEvaluatorLockFromAssetsAndControlledProbes(t *testi
 			t.Fatalf("lock generation omitted a required controlled Docker probe: %v", err)
 		}
 	}
-	if got := fixture.lookedUpNames(); !sameStrings(got, []string{credentialEnvironment, opusEndpointEnvironment, qwenEndpointEnvironment}) {
+	if got := fixture.lookedUpNames(); !sameStrings(got, []string{opusCredentialEnvironment, opusEndpointEnvironment, qwenCredentialEnvironment, qwenEndpointEnvironment}) {
 		t.Fatalf("environment names read = %v, want exactly approved names", got)
 	}
 }
@@ -279,7 +279,7 @@ func TestBuildRejectsEndpointDriftWithoutReadingUnapprovedEnvironment(t *testing
 		t.Fatalf("endpoint drift build error = %v, want catalog mismatch", err)
 	}
 	for _, name := range fixture.lookedUpNames() {
-		if name != qwenEndpointEnvironment && name != opusEndpointEnvironment && name != credentialEnvironment {
+		if name != qwenEndpointEnvironment && name != opusEndpointEnvironment && name != qwenCredentialEnvironment && name != opusCredentialEnvironment {
 			t.Fatalf("generator read unapproved environment name %q", name)
 		}
 	}
@@ -460,9 +460,10 @@ func newEvaluatorLockGeneratorFixture(t *testing.T) *evaluatorLockGeneratorFixtu
 		}
 	}
 	environment := map[string]string{
-		qwenEndpointEnvironment: "https://qwen.example.invalid/v1",
-		opusEndpointEnvironment: "https://opus.example.invalid/v1",
-		credentialEnvironment:   "test-token-not-persisted",
+		qwenEndpointEnvironment:   "https://qwen.example.invalid/v1",
+		opusEndpointEnvironment:   "https://opus.example.invalid/v1",
+		qwenCredentialEnvironment: "qwen-test-token-not-persisted",
+		opusCredentialEnvironment: "opus-test-token-not-persisted",
 	}
 	catalog := evaluatorGeneratorCatalog(t, environment)
 	catalogRaw, err := catalog.CanonicalJSON()
@@ -594,7 +595,7 @@ func (fixture *evaluatorLockGeneratorFixture) lookedUpNames() []string {
 func evaluatorGeneratorCatalog(t *testing.T, environment map[string]string) stageprovider.DeploymentOperationCatalog {
 	t.Helper()
 	secret := workflowadapter.SecretReference{ID: "anthropic-auth-token", Provider: "environment", Version: "2026.07.14"}
-	makeRegistration := func(stageKey workflowkit.StageKey, stageType workflowadapter.StageBindingType, commandID, operationID, modelID, endpointName string) stageprovider.DeploymentOperationRegistration {
+	makeRegistration := func(stageKey workflowkit.StageKey, stageType workflowadapter.StageBindingType, commandID, operationID, modelID, endpointName, credentialHostEnv string) stageprovider.DeploymentOperationRegistration {
 		definition, present := workflowadapter.CodeEdgeEvaluatorChildStageCatalog().Stage(stageKey)
 		if !present {
 			t.Fatalf("missing evaluator child stage %q", stageKey)
@@ -609,7 +610,7 @@ func evaluatorGeneratorCatalog(t *testing.T, environment map[string]string) stag
 			TaskArtifactPort: stageprovider.HarborEvaluatorTaskArtifactPort, TaskArtifactSchema: stageprovider.HarborEvaluatorTaskArtifactSchema,
 			AgentID: "claude-code", AgentVersion: "2.1.207", ModelID: modelID, ModelVersion: "2026.07.14",
 			EndpointEnvName: endpointName, EndpointChildEnvKey: "ANTHROPIC_BASE_URL", EndpointFingerprint: endpointFingerprint,
-			SecretEnvTemplates: []stageprovider.HarborEvaluatorSecretEnvTemplate{{Secret: secret, HostEnvKey: credentialEnvironment, ChildEnvKey: credentialEnvironment, Template: stageprovider.HarborEvaluatorSecretValueTemplate}},
+			SecretEnvTemplates: []stageprovider.HarborEvaluatorSecretEnvTemplate{{Secret: secret, HostEnvKey: credentialHostEnv, ChildEnvKey: credentialChildEnvironment, Template: stageprovider.HarborEvaluatorSecretValueTemplate}},
 			Attempts:           stageprovider.HarborEvaluatorTrialCount, ConcurrentTrials: stageprovider.HarborEvaluatorConcurrentTrials, MaxRetries: stageprovider.HarborEvaluatorMaxRetries, RequireTrajectory: true,
 			ScreenshotRenderer: stageprovider.HarborEvaluatorScreenshotRenderer{ID: stageprovider.HarborEvaluatorTerminalPNGRendererID, Version: stageprovider.HarborEvaluatorTerminalPNGRendererVersion, SchemaVersion: stageprovider.HarborEvaluatorTerminalPNGRendererSchemaVersion},
 		}
@@ -629,8 +630,8 @@ func evaluatorGeneratorCatalog(t *testing.T, environment map[string]string) stag
 		Format: stageprovider.DeploymentOperationCatalogFormat, Version: stageprovider.DeploymentOperationCatalogVersion,
 		CatalogID: "codeedge-evaluator-generator-test", CatalogVersion: "1.0.0", Template: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
 		Operations: []stageprovider.DeploymentOperationRegistration{
-			makeRegistration(workflowadapter.HarborRunQwen, workflowadapter.StageBindingHarborRunQwen, stageprovider.HarborEvaluatorQwenCommandID, "codeedge.qwen.pass-at-four", "qwen3.7-max", qwenEndpointEnvironment),
-			makeRegistration(workflowadapter.HarborRunOpus, workflowadapter.StageBindingHarborRunOpus, stageprovider.HarborEvaluatorOpusCommandID, "codeedge.opus.pass-at-four", "claude-opus-4-6", opusEndpointEnvironment),
+			makeRegistration(workflowadapter.HarborRunQwen, workflowadapter.StageBindingHarborRunQwen, stageprovider.HarborEvaluatorQwenCommandID, "codeedge.qwen.pass-at-four", "qwen3.7-max", qwenEndpointEnvironment, qwenCredentialEnvironment),
+			makeRegistration(workflowadapter.HarborRunOpus, workflowadapter.StageBindingHarborRunOpus, stageprovider.HarborEvaluatorOpusCommandID, "codeedge.opus.pass-at-four", "claude-opus-4-6", opusEndpointEnvironment, opusCredentialEnvironment),
 		},
 	}
 }
