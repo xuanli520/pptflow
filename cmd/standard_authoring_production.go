@@ -165,6 +165,7 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 		CodexWorkspaceRoot:  workspaceRoot,
 		CodexWorkspaceMode:  stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
 		CodexSourceVerifier: repoPrepare,
+		CandidateValidator:  candidateHarness,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring provider composition: %w", err)

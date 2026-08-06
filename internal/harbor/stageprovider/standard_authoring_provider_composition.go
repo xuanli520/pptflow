@@ -109,6 +109,7 @@ func NewStandardAuthoringProviderComposition(config StandardAuthoringProviderCom
 	typedRegistrations := make([]TypedWorkflowkitStageOperationRegistration, 0, len(operations))
 	reviewRegistrations := make([]WorkflowkitStaticStageOperationRegistration, 0, len(operations))
 	requiresAgentTurn := false
+	repairRequiresCandidateValidator := false
 	reviewExecutor := config.Handlers.DurableReview
 	if isNilWorkflowkitStageExecutor(reviewExecutor) {
 		reviewExecutor = standardAuthoringReviewResolutionOnlyExecutor{}
@@ -125,6 +126,9 @@ func NewStandardAuthoringProviderComposition(config StandardAuthoringProviderCom
 			if !IsCodexAppServerProductionPayload(payload) {
 				return nil, fmt.Errorf("%w: Standard authoring Codex agent.turn must pin model %q with reasoning effort %q", ErrDeploymentOperationCatalogDrift, CodexAppServerProductionModelID, CodexAppServerProductionReasoningEffort)
 			}
+			if record.Stage.Key == workflowkit.StageKey(workflowadapter.AuthoringRepair) {
+				repairRequiresCandidateValidator = true
+			}
 			requiresAgentTurn = true
 			typedRegistrations = append(typedRegistrations, TypedWorkflowkitStageOperationRegistration{StageKey: record.Stage.Key, Operation: record.Operation.Clone()})
 		case workflowadapter.DurableReviewOperationPayload:
@@ -137,6 +141,9 @@ func NewStandardAuthoringProviderComposition(config StandardAuthoringProviderCom
 	}
 	agentTurn := config.Handlers.AgentTurn
 	if requiresAgentTurn && isNilAgentTurnOperationExecutor(agentTurn) {
+		if repairRequiresCandidateValidator && isNilInterface(config.CandidateValidator) {
+			return nil, fmt.Errorf("%w: Standard authoring repair requires the locked candidate validator", ErrStandardAuthoringCodexAgentTurnConfiguration)
+		}
 		bridge, err := NewStandardAuthoringAttestedAgentTurnBridgeFromDeployment(StandardAuthoringAttestedAgentTurnBridgeDeploymentConfig{
 			Verifier: verifier, Attestor: config.Attestor, WorkspaceRoot: config.CodexWorkspaceRoot,
 			WorkspaceMode: config.CodexWorkspaceMode, SourceVerifier: config.CodexSourceVerifier,

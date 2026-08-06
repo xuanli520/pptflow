@@ -147,6 +147,89 @@ func TestStandardAuthoringProviderCompositionRejectsDriftingCodexConfigurationAf
 	}
 }
 
+func TestStandardAuthoringProviderCompositionRequiresRepairCandidateValidator(t *testing.T) {
+	catalog, lock, _ := standardAuthoringRepairCompositionFixture(t)
+	contractRoot := t.TempDir()
+	writeStandardAuthoringContractAssets(t, contractRoot, lock)
+	attestor, err := NewStandardAuthoringRuntimeAttestor(StandardAuthoringRuntimeAttestorConfig{HarborFlowBuild: lock.HarborFlowBuild, ContractRoot: contractRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
+		CodexWorkspaceRoot: t.TempDir(),
+	})
+	if err == nil || !errors.Is(err, ErrStandardAuthoringCodexAgentTurnConfiguration) {
+		t.Fatalf("repair composition without candidate validator error = %v, want %v", err, ErrStandardAuthoringCodexAgentTurnConfiguration)
+	}
+	composition, err := NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
+		CodexWorkspaceRoot: t.TempDir(), CandidateValidator: standardAuthoringTestCandidateValidator{},
+	})
+	if err != nil {
+		t.Fatalf("repair composition with candidate validator: %v", err)
+	}
+	if composition == nil || composition.Resolver == nil {
+		t.Fatal("repair composition returned no resolver bundle")
+	}
+}
+
+type standardAuthoringTestCandidateValidator struct{}
+
+func (standardAuthoringTestCandidateValidator) ValidateStandardAuthoringCandidate(context.Context, StandardAuthoringCandidateValidationRequest) (workflowkit.ValidationReceipt, error) {
+	return workflowkit.ValidationReceipt{}, nil
+}
+
+func standardAuthoringRepairCompositionFixture(t *testing.T) (*DeploymentOperationCatalogResolver, DeploymentOperationCatalogLock, workflowadapter.StageOperationResolution) {
+	t.Helper()
+	fixture := newCodexAppServerAttestationFixture(t)
+	definition, found := workflowadapter.StandardAuthoringContractStageCatalog().Stage(workflowkit.StageKey(workflowadapter.AuthoringRepair))
+	if !found {
+		t.Fatal("missing Standard authoring authoring_repair stage")
+	}
+	provider := workflowadapter.ProviderReference{ID: StandardAuthoringProviderID, Kind: StandardAuthoringProviderKind, Version: StandardAuthoringProviderVersion}
+	payload := workflowadapter.AgentTurnOperationPayload{
+		AgentID: "codex-app-server", ModelID: CodexAppServerProductionModelID,
+		ReasoningEffort: CodexAppServerProductionReasoningEffort, MaxTurns: workflowadapter.StandardAuthoringRepairMaxTurns,
+	}
+	resolution := standardAuthoringCompositionResolution(definition, provider, workflowadapter.StageOperationBinding{ProviderID: provider.ID, OperationID: "standard-authoring.codex.authoring-repair", Version: "3.0.0", Payload: payload})
+	registration := DeploymentOperationRegistration{
+		Stage:    DeploymentStageContract{Key: resolution.StageKey, Type: resolution.StageType, Group: definition.Group, Plugin: resolution.Plugin},
+		Provider: resolution.Provider, Operation: resolution.Operation.Clone(), Runtime: resolution.Runtime,
+		Checkout: DeploymentCheckoutContract{ID: resolution.Checkout.ID, Purpose: "authoring-source-snapshot"}, Secrets: append([]workflowadapter.SecretReference{}, resolution.Secrets...),
+	}
+	catalog, err := NewDeploymentOperationCatalogResolver(DeploymentOperationCatalog{
+		Format: DeploymentOperationCatalogFormat, Version: DeploymentOperationCatalogVersion,
+		CatalogID: "standard-authoring-repair-composition-test", CatalogVersion: "test-v1",
+		Template: workflowadapter.StandardAuthoringCurrentTemplateReference(), Operations: []DeploymentOperationRegistration{registration},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex := fixture.lock.Clone()
+	lock := DeploymentOperationCatalogLock{
+		Format: DeploymentOperationCatalogLockFormat, Version: DeploymentOperationCatalogLockVersion,
+		LockID: "standard-authoring-repair-composition-test-lock", LockVersion: "test-v1", CatalogReceipt: catalog.Receipt(), HarborFlowBuild: fixture.attestation.HarborFlowBuild,
+		StandardAuthoringExecutionProfile: &StandardAuthoringExecutionProfileLock{Profile: standardAuthoringTestExecutionProfile(t)},
+		StandardAuthoringSSHTransport:     standardAuthoringSSHTransportTestLock(t, []byte(standardAuthoringSSHTransportTestKnownHosts)),
+		Operations: []DeploymentOperationCatalogLockRecord{{
+			Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
+			Checkout: registration.Checkout, Secrets: append([]workflowadapter.SecretReference{}, registration.Secrets...),
+			PromptContentFingerprint: workflowkit.SHA256Fingerprint([]byte("agent-prompt")), SchemaContentFingerprint: workflowkit.SHA256Fingerprint([]byte("agent-schema")),
+			ExecutionKind: workflowadapter.StageOperationPayloadAgentTurn,
+			AgentModel: &AgentModelLock{
+				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
+				ModelVersion: "deepseek-v4-flash",
+			},
+			CodexAppServer: &codex,
+			StandardAuthoringContract: &StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion,
+				Prompt: StandardAuthoringContractAssetReference{ID: "standard-authoring.authoring-repair.prompt", Version: "3.0.0", RelativePath: "prompts/authoring-repair.json"},
+				Schema: StandardAuthoringContractAssetReference{ID: "standard-authoring.v3-agent-output-schema", Version: "1.0.0", RelativePath: "schemas/v3-agent-output.schema.json"}},
+		}},
+	}
+	return catalog, lock, resolution
+}
+
 func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOperationCatalogResolver, DeploymentOperationCatalogLock, workflowadapter.StageOperationResolution) {
 	t.Helper()
 	fixture := newCodexAppServerAttestationFixture(t)
