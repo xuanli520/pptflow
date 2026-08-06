@@ -5,6 +5,11 @@ workflow-stability and lifecycle refactor.
 
 Source: User confirmations for `WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_PLAN.md`.
 
+> 2026-08-06 更新：CodeEdge Phase-1 与 qwen/opus evaluator 链路已整体删除，
+> 本节以下「CodeEdge Phase-1 production execution decisions」全部废止。
+> Standard authoring 是唯一生产模板，Run 止于 `materialize_task`；下游评估由
+> 操作者手动执行，不再由 Harbor Flow 的 Run 或 reconcile 承担。
+
 ## Confirmed Decisions
 
 | Area | Decision | Binding Rule |
@@ -63,27 +68,6 @@ Source: User confirmations for `WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_P
 | Review and release selection | Detail selection | Task Detail lets the operator choose a concrete ReviewRequest or Release before entering the existing confirmation flow. |
 | TUI source cutover | Delete legacy workspace TUI | Remove the residual legacy workspace TUI implementation and its obsolete tests; do not retain unreachable source as a compatibility path. |
 
-## CodeEdge Phase-1 production execution decisions
-
-| Area | Decision | Binding Rule |
-| --- | --- | --- |
-| Workflow descriptor | Independent closed CodeEdge Phase-1 template | CodeEdge never falls back to the Standard template. The frozen profile, execution specification, deployment catalog, registry and Run manifest must name the same template ID and version. |
-| Evaluator invocation | Freeze `harbor run --n-attempts 4 --n-concurrent 1 --max-retries 3` | Qwen runs before Opus, and each model runs its four logical attempts serially. Harbor 0.18.0 records `--n-attempts` as the sample count and `--n-concurrent` as concurrency. `--max-retries=3` is Harbor-internal per logical Trial; it never creates a fifth sample or enables a generic stage retry. |
-| Evaluation subject | Managed task snapshot | Evaluation binds the immutable task snapshot digest; it does not evaluate a mutable workspace or an early local package. |
-| Package timing | Final compliance first | The single managed local package is created only after Qwen, Opus, submission checks and the final compliance decision have completed. It is never uploaded or published by Harbor Flow. |
-| Catalog verification | Re-verify each external effect | Catalog receipt, the currently installed deployment lock fingerprint (resolved at runtime) and runtime attestation are checked immediately before every local command, container, agent or evaluator side effect, including retry/reconcile execution. |
-| Metadata mapping | Explicit deployment mapping | CodeEdge `task.toml` fields are selected only by a versioned `MetadataFieldMapping`; no table/key convention is inferred. |
-| Evaluation evidence | Trusted `result.json` plus one screenshot per model | A receipt is authoritative only when its result document, four logical trials, immutable identities and exactly one canonical screenshot are verified. |
-| Evaluator reconciliation | Local immutable result observation | The evaluator never uploads a job or queries a remote service. Reconciliation reads only the managed local Harbor job directory and accepts a receipt only after `config.json`, `lock.json`, job `result.json`, exactly four Trial results, frozen identities and secret scans pass the strict local parser. Incomplete, ambiguous or malformed local evidence remains `in_doubt`; observation never invokes `resume` or a model. |
-| Opus role | Reference evaluator | Opus evidence is retained and must be structurally valid, but it is not an independently invented hard pass/fail threshold. |
-| External rate limit | No local three-hour throttle | Harbor Flow does not fabricate a local submission throttle; any externally required limit belongs in an explicitly approved deployment operation. |
-
-The remaining deployment values (real command/image/model identities, secret
-references, prompt/schema fingerprints, evaluator ABI, metadata paths, package
-tooling and similarity policy) are intentionally not guessed. Until they are
-supplied in a versioned catalog and lock, production composition must reject
-the corresponding operation before it starts an external side effect.
-
 ## Current Deployment Activation Status
 
 This status record does not change any confirmed target behavior above.  It
@@ -95,19 +79,10 @@ mistaken for an enabled production operation.
   deployment capability: a production `agent.turn` provider must be separately
   catalog-attested and cannot fall back to a PATH-discovered executable, an
   ambient home directory, ambient authentication, or a default model.
-- `AgentRepairProvider` and the generic agent port remain application-layer
-  contracts, but the current CodeEdge production composition installs no
-  `agent.turn` provider.  Automated repair therefore fails closed until its
-  own model, prompt/schema, secret, timeout, checkpoint, and reconciliation
-  contract is frozen and installed.
-- The CodeEdge evaluator has no upload, remote-query or archive-download path.
-  It creates and observes only managed local Harbor job directories; incomplete
-  local evidence remains `in_doubt` until the strict local result parser can
-  prove completion.
-- The evaluator child receives a complete child-owned `ExecutionProfile` from
-  the immutable deployment lock: its two stage budgets, continuation TTL,
-  control grace, and candidate-provider budget are not projected from the
-  parent Run. Missing or malformed lock-owned profile data remains fail-closed.
+- The Standard authoring production composition installs the single
+  `agent.turn` provider pinned to `deepseek-v4-flash` / `max` from the
+  deployment lock; no PATH-discovered executable, ambient home directory,
+  ambient authentication, or default model is accepted.
 
 ## Canonical Task File Policy V2
 

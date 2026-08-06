@@ -7,6 +7,12 @@
 > 实施优先级：[`WORKFLOW_STABILITY_DECISIONS.md`](./WORKFLOW_STABILITY_DECISIONS.md) 是本方案的确认决策记录。本文的历史迁移推理与确认决策冲突时，以确认决策为准；尤其是 CLI/TUI 的 hard cutover 不保留旧命令或 mutation alias。
 >
 > 当前交付的 Delivery 边界：Release 仅表示 Harbor Flow 受管目录中的不可变本地 package。系统生成并记录 package、source digest、evidence digest 与 immutable receipt，可按 receipt 和 digest 对账；绝不上传、复制到外部目的地、调用远端发布 provider 或执行远端 publish。本文下文保留的 `publish` 若指旧系统或历史推理，不构成当前行为；若指 Task 的 `published` 生命周期状态，也不表示远端发布。
+>
+> 2026-08-06 更新：CodeEdge Phase-1 与 qwen/opus evaluator 链路（含
+> Trial/pass@4/evaluator profile、`result_review`/`submission_lint` Gate、
+> evaluator reconcile）已整体删除。本文中所有 evaluator、Qwen、Opus、
+> pass@4、Trial 相关设计与推理仅作历史方案留档，不再构成当前行为约束。
+> Standard authoring 是唯一生产模板，Run 止于 `materialize_task`。
 
 ## 1. 执行摘要
 
@@ -130,7 +136,7 @@ child_timeout <= parent_remaining_budget
 - 声明 1 次的 mutation、publish、package、Harbor 节点实际可能跑 3 次；
 - 声明 2 次的 similarity 实际跑 3 次；
 - 普通 `unknown` 错误可能被盲重试；
-- 外层 Engine retry 与插件内部 API/install/trial retry 相乘。
+- 外层 Engine retry 与插件内部 API/install retry 相乘。
 
 #### 3.1.3 checkpoint 粒度只到节点
 
@@ -165,7 +171,6 @@ RunResult/NodeRun/TUI：没有报告引用
 - node config hash；
 - template/prompt fingerprint；
 - 程序版本；
-- evaluator policy。
 
 代码、模型、timeout、阈值或磁盘报告变化后，恢复可能在不同 DAG 上复用旧节点。
 
@@ -176,7 +181,7 @@ RunResult/NodeRun/TUI：没有报告引用
 - 主动重跑成功节点；
 - 选择一个阶段组；
 - 指定重跑截止阶段；
-- 分别重跑 Quality、Similarity、Qwen 或 Opus；
+- 分别重跑 Quality、Similarity 等阶段；
 - 修改 profile 后预览失效范围；
 - 解释每个保留/失效 artifact 的原因；
 - 在重跑失败后保留旧的成功 artifact。
@@ -233,7 +238,7 @@ runs(workspace_path UNIQUE, task_id, status...)
 
 当前取消不是 durable domain command，只是从 TUI 向内存 context 传播：
 
-- 全局 `Ctrl+X` 和单键 `x` 都打开“取消整个运行”，但日志页单键 `x` 又定义为直接取消选中的 Qwen/Opus stage；全局路由优先使后者正常路径不可达，语义既冲突又不可预测；
+- 全局 `Ctrl+X` 和单键 `x` 都打开“取消整个运行”，但日志页单键 `x` 又定义为直接取消选中的长耗时 stage；全局路由优先使后者正常路径不可达，语义既冲突又不可预测；
 - `q/Ctrl+C` 退出也会调用 `cancelRun`，把“关闭界面”“脱离后台任务”“取消任务”混成同一动作；
 - `cancelRun` 若找不到当前 workspace 的 scheduler job，会取消 TUI 共享 root context，可能连带取消本进程其他任务；
 - TaskScheduler 只在内存把 job 标成 canceled，没有 CancelRequest、actor、reason、scope、ack 或 outbox event；
@@ -262,8 +267,6 @@ runs(workspace_path UNIQUE, task_id, status...)
 | Gate 行为 | `final_review` 特判 | GatePolicy capability |
 | restart 边界 | 裸 `restart_from` Node ID | InvalidationPlanner |
 | phase 路径 | phase1/phase2/phase3 拼接 | ArtifactCatalog |
-| evaluator | Qwen/Opus switch | EvaluatorProfile[] |
-| trial count | 多处固定 4 | EvaluationPolicy |
 | workspace | 默认路径和生成 task 路径 | WorkspaceService |
 | clone reuse | 四个布尔开关 | ReusePlan + fingerprint |
 | deletion | `os.RemoveAll` | LifecycleService + TrashPolicy |
@@ -275,7 +278,6 @@ runs(workspace_path UNIQUE, task_id, status...)
 
 - Harbor 标准任务文件白名单；
 - CodeEdge 提交所需字段；
-- 当前正式 pass@4 规则；
 - secret redaction 和路径逃逸规则；
 - immutable artifact 和 digest 校验规则。
 
@@ -324,13 +326,13 @@ V2 采用混合权威模型：
 
 ### 5.3 可复用 Workflow Kernel 与 Harbor Domain 边界
 
-统一执行预算、运行/阶段状态机、checkpoint、取消恢复、continuation、artifact lineage、Job/Lease 和 quota enforcement 都是任何 AI workflow 可复用的通用能力，应下沉为独立 Workflow Kernel。Kernel 不能导入 `internal/harbor/*`，也不能认识 Qwen、Opus、pass@4、TaskRepair 或 FinalReview。
+统一执行预算、运行/阶段状态机、checkpoint、取消恢复、continuation、artifact lineage、Job/Lease 和 quota enforcement 都是任何 AI workflow 可复用的通用能力，应下沉为独立 Workflow Kernel。Kernel 不能导入 `internal/harbor/*`，也不能认识 TaskRepair 或 FinalReview。
 
 ```text
 Harbor Factory Application
   ├─ Task/Revision/Review/Repair/Release lifecycle
   ├─ Harbor StageCatalog + resource vocabulary
-  ├─ pass@4 / evaluator / local package policies
+  ├─ local package policies
   └─ ChangeProvider + SubjectRevision adapter
                  ↓ typed contracts
 Reusable Workflow Kernel
@@ -347,8 +349,7 @@ Reusable Workflow Kernel
 |---|---|
 | run/stage/node/turn 的追加式状态机 | Task 的 draft/ready/published 生命周期 |
 | execution status 与 verdict 双通道 | 哪些 finding 表示 `needs_repair` |
-| timeout、attempt、elapsed、token、并发预算 | pass@4 必须恰好 4 次的正式规则 |
-| 多维 quota 申请、预留、结算和释放 | 每个 evaluator/repair stage 申请多少 quota |
+| timeout、attempt、elapsed、token、并发预算 | 每个 repair stage 申请多少 quota |
 | canceled/interrupted/in_doubt 与 reconcile 协议 | 哪些 Harbor side effect 可 reconcile |
 | effect/read/write、fingerprint 和失效闭包算法 | `task.instruction` 等资源键和 StageCatalog |
 | immutable artifact、plan、checkpoint、event | TaskRevision、Release 和 ReviewDecision schema |
@@ -615,7 +616,6 @@ MaxElapsed >= MaxAttempts * AttemptTimeout + MaxBackoffTotal
 | Agent generation | 1-2 | 从最近 turn checkpoint 继续 |
 | mutation/repair | 默认 1 | 幂等 reconcile，禁止盲重试 |
 | Docker verify | 单一预算来源 | 保留命令证据后重跑 |
-| Harbor evaluate | 外层 1 | 内部管理 install/API/trial retry |
 | Gate | 无执行 deadline | durable waiting + SLA 提醒 |
 
 ### 8.4 Durable quota 与 admission control
@@ -624,7 +624,7 @@ Budget 表示一次执行允许使用的时间/次数上限；Quota 表示跨 re
 
 ```go
 type QuotaRequest struct {
-    Dimension     string // stage_attempt, agent_turn, token, wall_time_ms, trial, repair_round, api_call, concurrency_slot
+    Dimension     string // stage_attempt, agent_turn, token, wall_time_ms, repair_round, api_call, concurrency_slot
     Units         int64
     Scope         ResourceScope
     ReclaimPolicy ReclaimPolicy
@@ -651,37 +651,18 @@ type BudgetGrant struct {
 }
 ```
 
-通用 Kernel 负责：admission、原子预留、事件驱动计量、未使用额度释放、超限阻止、grant 幂等和审计。Harbor policy 负责声明：pass@4 需要 4 个 trial、每个 evaluator 的并发上限、repair round 上限以及哪些 actor 可以补充额度。
+通用 Kernel 负责：admission、原子预留、事件驱动计量、未使用额度释放、超限阻止、grant 幂等和审计。Harbor policy 负责声明：repair round 上限、stage 配额以及哪些 actor 可以补充额度。
 
 配额规则：
 
-- 已发生的 API 调用、token、trial 和 elapsed cost 永不因暂停、取消、clone 或新 Run 而回滚；
+- 已发生的 API 调用、token 和 elapsed cost 永不因暂停、取消、clone 或新 Run 而回滚；
 - paused 恢复 checkpoint 时不自动增加 stage attempt；无法恢复必须新建 attempt 时，plan 显示并预留 `+1`；
 - 取消释放未使用 reservation 和 concurrency slot，但实际 consumed 保留；
 - quota exhausted 时 ContinuationPlan 为不可执行，必须缩小范围、等待额度恢复或提交 BudgetGrant；
 - BudgetGrant 与业务 command 分离，必须包含 actor、reason、delta、expected version 和 idempotency key；
 - 外部 provider 限流可通过 quota adapter 映射为共享 bucket，不在每个 plugin 内各写 sleep/retry。
 
-Harbor 当前把三个不同概念都叫 attempt，必须拆开：
-
-```text
-StageAttempt     workflow stage 的一次执行
-TrialExecution   pass@4 中一个逻辑独立样本
-TrialAttempt     同一 trial 因技术故障产生的 retry
-```
-
-所有非 Gate node 被强制三次外层 attempt，而 Harbor stage 内又运行 4 个 trial 并各自允许 infra retry，最坏消耗近似 `3 × 4 × (1 + infra_retries)`，既突破配额，也可能改变正式样本集合。近期止血是 Harbor stage 外层 `MaxAttempts=1`；长期由 HarborEvaluationPolicy 编译 4 个 WorkItem，Kernel 负责 fan-out、quota、取消和 checkpoint：
-
-```go
-type WorkItemPlan struct {
-    LogicalItemID    string
-    InputFingerprint string
-    RetryPolicy      RetryPolicy
-    ResourceClaims   []QuotaRequest
-}
-```
-
-Kernel 不知道“4”的含义，只保证 WorkItem 的 logical identity、资源结算和 retry 不新增业务样本；Harbor policy 负责恰好四个独立 trial、模型/agent/task digest 绑定和 pass@4 聚合。
+Harbor 当前把不同概念都叫 attempt，必须拆开：`StageAttempt` 表示 workflow stage 的一次执行，`RepairRound` 表示一轮修复重试；两者分别计入 durable quota，避免相乘突破配额。
 
 ## 9. Generation 多回合 checkpoint
 
@@ -732,8 +713,6 @@ runs/<run-id>/stages/<stage>/nodes/<node>/attempt-002/turn-001/agent.log
 | quality | lint、quality |
 | similarity | similarity |
 | final_review | final review / repair decision |
-| evaluation | evaluator profiles，如 Qwen、Opus |
-| submission | result review、submission lint |
 | delivery | local package、receipt reconcile、release |
 
 每个 StageDefinition 声明：
@@ -1031,7 +1010,7 @@ RepairSession 是 `revise_task` 策略的审计聚合，不是另一套执行入
 新增版本化 `WorkflowTemplateCompiler`：
 
 ```text
-WorkflowTemplate + ExecutionProfile + EvaluatorProfiles + RunRequest
+WorkflowTemplate + ExecutionProfile + RunRequest
   → validate
   → resolved WorkflowDefinition
   → freeze typed RunExecutionSpec + canonical profile
@@ -1058,22 +1037,6 @@ type PluginDescriptor struct {
 ```
 
 配置在 workflow compile 时完成 typed decode 和校验。
-
-### 13.3 EvaluatorProfile
-
-模型评测改为数组：
-
-```text
-evaluator_id
-model
-agent
-trial_policy
-concurrency
-infra_retry_policy
-evidence_validator
-```
-
-Qwen/Opus 是默认 profile，不再是 Runner、Registry、TUI 和路径层的固定分支。
 
 ## 14. 完整题目生命周期服务
 
@@ -1125,7 +1088,7 @@ GetBudgetAndQuota
 GrantBudget(expected_version)
 ```
 
-TaskContinuationService 是暂停/失败后的恢复、主动阶段重算和内容修订后的唯一 application service。ExecutionControlService 负责目标明确的暂停、stage cancel 和 Run terminate；它不自行决定后续重跑。任意声明 `cancel` capability 的耗时阶段均可取消，不再只支持 Qwen/Opus。
+TaskContinuationService 是暂停/失败后的恢复、主动阶段重算和内容修订后的唯一 application service。ExecutionControlService 负责目标明确的暂停、stage cancel 和 Run terminate；它不自行决定后续重跑。任意声明 `cancel` capability 的耗时阶段均可取消，不再只支持特定模型阶段。
 
 `StartRun` 和 `TaskContinuationService` 都只接受完整的 frozen profile 与 `RunExecutionSpec`。profile/spec 的 canonical bytes、格式版本和 fingerprint 必须在受管目录与 Run manifest 中一致；缺失、篡改或不匹配时拒绝执行，绝不降级到旧 Runner、旧配置文件或 stage-name fallback。
 
@@ -1252,7 +1215,7 @@ x c  继续处理
 
 当前阶段          harbor_qwen / attempt 2
 最近 checkpoint  14:32:18 / turn 3
-已用/剩余预算     stage 2/3, trial 2/4, elapsed 18m/45m
+已用/剩余预算     stage 2/3, elapsed 18m/45m
 未决副作用        无
 ```
 
@@ -1364,14 +1327,14 @@ type ControlOperation struct {
 
 | 取消/中断事实 | 后续处理 |
 |---|---|
-| queued job 取消，尚未执行 | 直接 canceled，释放全部 reservation，不产生 StageAttempt/trial 消耗 |
+| queued job 取消，尚未执行 | 直接 canceled，释放全部 reservation，不产生 StageAttempt 消耗 |
 | paused 且 checkpoint/input/definition 未变 | `x c` 生成 ResumeFromCheckpoint plan，恢复同一 Run，不新增 attempt |
 | paused 但 checkpoint 不可恢复 | plan 明示新增 StageAttempt 和 quota `+1` |
 | stage_canceled，Run 仍在运行 | 其他独立分支继续；目标 stage 后续由 ContinuationPlanner 决定是否补跑 |
 | Run 已可靠 canceled | 旧 Run 保持终态；`x c` 创建 parent-linked ContinuationExecution/StageAttempt |
 | worker 无 cancel intent 消失 | 标记 interrupted，恢复前校验 lease、definition、subject 和 artifact |
 | candidate preparation 被取消 | current revision 不变；candidate quarantine/discard，或在新计划中显式复用 checkpoint |
-| 本地 package materialization receipt、trial 或未来外部 API 结果未知 | in_doubt；package 先按 receipt、package digest 和 source digest 对账；其他情况先查询 operation/artifact，再决定 completed/canceled/failed_recoverable |
+| 本地 package materialization receipt 或未来外部 API 结果未知 | in_doubt；package 先按 receipt、package digest 和 source digest 对账；其他情况先查询 operation/artifact，再决定 completed/canceled/failed_recoverable |
 
 进程重启时，RecoveryReconciler 扫描 `requested/propagating/running` 且 lease 过期的 operation。系统可以自动 reconcile，但不得自动恢复用户明确 terminate 的 Run。terminal job 必须从 active reservation 索引移除，历史仍保留在 jobs 表。
 
@@ -1403,9 +1366,9 @@ type ExecutionLifecycle interface {
 }
 ```
 
-Admission 事务同时校验 frozen plan/policy、CAS quota bucket、写 BudgetLease、durable Job、decision 和 outbox。每个 `UsageEvent` 必须带 turn/trial/API operation key，重复上报只计一次。外部调用已经 started 但 usage 未知时，settlement 记为 uncertain，额度不能直接退还，等待 reconcile。
+Admission 事务同时校验 frozen plan/policy、CAS quota bucket、写 BudgetLease、durable Job、decision 和 outbox。每个 `UsageEvent` 必须带 turn/API operation key，重复上报只计一次。外部调用已经 started 但 usage 未知时，settlement 记为 uncertain，额度不能直接退还，等待 reconcile。
 
-部署级 worker/concurrency capacity、tenant/provider API bucket 和 run budget 可以组合取最小 grant。`MaxTaskConcurrency=10` 应成为 capacity pool 配置；pass@4、repair rounds 和 evaluator 限制只产生 ResourceDemand，不进入 AdmissionControl 的领域分支。
+部署级 worker/concurrency capacity、tenant/provider API bucket 和 run budget 可以组合取最小 grant。`MaxTaskConcurrency=10` 应成为 capacity pool 配置；repair rounds 等 Harbor 限制只产生 ResourceDemand，不进入 AdmissionControl 的领域分支。
 
 ## 18. 数据库与文件布局迁移
 
@@ -1531,7 +1494,7 @@ artifact lineage 必须由受管 V2 control plane 原生创建；不做 V1/V2 �
 - immutable Release；
 - soft delete/trash/restore/purge；
 - durable scheduler/jobs/leases；
-- Harbor TrialExecution/TrialAttempt 与本地 package materialization 接入 quota 与 reconcile；本轮 Harbor evaluator reconcile 仅基于受管本地 job 目录、immutable receipt、严格解析的 `result.json`/Trial 证据、package digest 和 source digest，远端 provider/publish/upload 不在范围内。
+- 本地 package materialization 接入 quota 与 reconcile；reconcile 仅基于受管本地目录、immutable receipt、package digest 和 source digest，远端 provider/publish/upload 不在范围内。
 
 ### M5：移除兼容债务
 
@@ -1623,7 +1586,6 @@ internal/harbor/store/
 - 单 stage、phase、start-through、多根节点计划正确；
 - task digest 不变时只重跑选择范围；
 - task digest 改变时所有相关证据失效；
-- Qwen/Opus 可分别重跑，修改题目时两者都失效；
 - 修改模型、阈值、template 或程序版本后旧结果不静默复用；
 - artifact 缺失/损坏时，即使输入 digest 未变也不能 preserve；
 - 每个节点在 plan 中恰好有一个 disposition，schedule 满足拓扑顺序；
@@ -1661,14 +1623,14 @@ internal/harbor/store/
 - plain `x` 在任何页面都不触发 mutation，`Ctrl+X` 只打开 RunControlOverlay；
 - overlay 默认“返回并保持运行”，`P/K/S` 只选择，Enter+确认后才创建 ControlOperation；仅 `interrupted`/`in_doubt` Run 额外显示 `R`，经同样确认后执行 scoped local reconcile，不调用 provider 或重跑 workflow；
 - 取消一个前台 Run 不会取消 TUI root context、其他 queued/running jobs 或 Hub；
-- queued cancel 不创建 StageAttempt，不消费 trial，仅释放 reservation；
+- queued cancel 不创建 StageAttempt，仅释放 reservation；
 - pause 在 checkpoint ack 后才进入 paused，恢复可用时不新增 attempt；
 - terminate 后 Engine、state projection、Scheduler 对状态统一为 `canceled`，不再出现 failed/cancelled/canceled 三套值；
 - stage cancel 只影响目标 capability，独立分支继续运行；
 - TUI exit 对每个 active Run 都有独立 handoff 决策和集成测试，任何单个选择都不影响其他 Run；
 - external side effect 未确认时进入 in_doubt，reconcile 前禁止 continue/retry；
 - terminal job 释放 active workspace reservation，但保留历史；
-- 已消费 token/API/trial/elapsed 不因 pause/cancel/clone/continuation 清零；
+- 已消费 token/API/elapsed 不因 pause/cancel/clone/continuation 清零；
 - quota exhausted 禁止执行 plan，BudgetGrant 幂等且 stale version 被拒绝。
 
 ### 21.6 通用 Kernel 可复用性
@@ -1677,9 +1639,9 @@ internal/harbor/store/
 - 使用 fake domain bindings 可运行一个非 Harbor AI workflow，并复用预算、quota、checkpoint、取消和 continuation；
 - 同一 dependency level 的初始 stage 形成一个可并行 batch，跨 level 依赖顺序被验证；
 - 缺失、篡改或非 canonical 的 `RunExecutionSpec`/profile 被拒绝，且不存在 legacy Runner、stage-name 或动态 payload fallback；
-- Kernel 不包含 Qwen、Opus、pass@4、FinalReview、TaskRepair 等字符串或分支；
-- Harbor TrialCount、TrialAttempt 和 StageAttempt 三种计数不会互相覆盖或相乘；
-- 新增 evaluator/change provider 不修改 Engine 即可编译、计划、取消和恢复。
+- Kernel 不包含 FinalReview、TaskRepair 等 Harbor 字符串或分支；
+- Harbor StageAttempt 与 repair round 计数不会互相覆盖或相乘；
+- 新增 change provider 不修改 Engine 即可编译、计划、取消和恢复。
 
 ## 22. 验收主线
 
@@ -1696,10 +1658,9 @@ internal/harbor/store/
   → FinalReview request_changes
   → `x c` 继续修改，RepairSession round 2 生成 revision 3
   → 验证通过
-  → Qwen 运行到 trial 2/4 时通过 Ctrl+X 暂停
+  → authoring_repair 运行中通过 Ctrl+X 暂停
   → checkpoint ack 后关闭 TUI，后台状态和 quota ledger 保持
-  → `x c` 恢复且不重复已完成 trial
-  → Qwen/Opus 分别完成，可用 `x c` 单独重新计算 Opus
+  → `x c` 恢复且不重复已完成 stage
   → 生成本地 package Release v1
   → 手工修改形成 revision 4
   → 生成本地 package Release v2
@@ -1743,8 +1704,8 @@ internal/harbor/store/
 - 让 TUI 直接实现业务状态迁移或直接 `RemoveAll` 生命周期实体；
 - 用单字符快捷键在不同页面复用 retry、rerun、resume、reject 或 cancel 语义；
 - 把关闭 TUI/进程退出等同于取消所有 durable jobs；
-- 在每次 Engine resume、clone 或新 Run 时重置 retry/trial/token quota；
-- 把 pass@4、Qwen/Opus、TaskRevision 等 Harbor 规则硬编码进通用 Kernel；
+- 在每次 Engine resume、clone 或新 Run 时重置 retry/token quota；
+- 把 TaskRevision 等 Harbor 规则硬编码进通用 Kernel；
 - 用 `mode=retry|rerun|repair` 把旧分支包装成新的统一 API；
 - 用更多 Gate ID、路径 switch 和布尔开关扩展功能。
 

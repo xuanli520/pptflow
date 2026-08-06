@@ -2,6 +2,8 @@
 
 > 状态：历史设计材料，已由 2026-07-13 的 V2 lifecycle 硬切换取代。本文记录 workspace-runner UI，不能据此推断支持的命令、参数、mutation 路径或验证要求。
 >
+> 2026-08-06 更新：文中 `harbor_run_qwen` / `harbor_run_opus` / `result_review` / `submission_lint` 等阶段与 Gate 已随 CodeEdge Phase-1 / evaluator 链路从代码中删除，相关段落仅作历史留档。
+>
 > 当前来源以 [`WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_PLAN.md`](./WORKFLOW_STABILITY_AND_TASK_LIFECYCLE_REFACTOR_PLAN.md)、[`WORKFLOW_STABILITY_DECISIONS.md`](./WORKFLOW_STABILITY_DECISIONS.md) 和 [`TUI_USAGE.md`](./TUI_USAGE.md) 为准。
 
 ## V1 原始文档：Harbor Flow TUI 中文化与人性化改造方案
@@ -72,17 +74,15 @@ type editorDoneMsg struct { ... }                 // 外部编辑器完成 → �
 type gateDecisionWrittenMsg struct { ... }        // Gate 决策写入磁盘 → 标记已决策
 ```
 
-#### 39 个 StartField 枚举（`model.go:47-92`）
+#### 36 个 StartField 枚举（`model.go:47-92`）
 
 ```go
 startFieldMode, startFieldTaskDir, startFieldRepoURL, startFieldCommit,
 startFieldWorkspace, startFieldTaskOutput, startFieldTestsAnalysis,
-startFieldQwenResult, startFieldOpusResult, startFieldQwenScreenshot,
-startFieldOpusScreenshot, startFieldQualityCheck, startFieldQualityAgent,
+startFieldQualityCheck, startFieldQualityAgent,
 startFieldSimilarityCheck, startFieldSimilarityGitHub, startFieldSimilarityThreshold,
 startFieldHistoryDirs, startFieldTB3Dirs, startFieldOutput, startFieldVerifyDocker,
-startFieldRunHarbor, startFieldHarborAgent, startFieldQwenModel, startFieldOpusModel,
-startFieldQwenHarborBaseURL, startFieldOpusHarborBaseURL, startFieldHarborTimeout,
+startFieldRunHarbor, startFieldHarborAgent, startFieldHarborTimeout,
 startFieldHarborSetupTimeout, startFieldHarborPreflight, startFieldHarborConcurrency,
 startFieldHarborAttempts, startFieldHarborInfraRetries, startFieldPackage,
 startFieldTaskName, startFieldCodeLang, startFieldTaskType, startFieldApplication,
@@ -245,12 +245,12 @@ workspace 有 state.json → 快照 initialWorkspaceModel
 #### P1 - 用户体验核心
 | # | 位置 | 问题 | 影响 |
 |---|------|------|------|
-| 4 | `model.go:316-323` | `x` 键的语义是"取消模型阶段"，但对非 Qwen/Opus 节点静默失败 | 误导 |
+| 4 | `model.go:316-323` | `x` 键的语义是"取消模型阶段"，但对不支持取消的节点静默失败 | 误导 |
 | 7 | `activeStartFields()` | 39 字段平铺遍历，无分组跳转 | 效率低下 |
 | 1 | `model.go:262-279` | Tab 在 5 个视图中行为各有不同，用户需记忆 | 困惑 |
 | 2 | `model.go:294-298` | 键 `4`（Done）在运行完成前按下无反应 | 沮丧 |
 | 5 | `model.go:302-306` | 键 `g`（Gate）在无活跃 Gate 时静默忽略 | 迷惑 |
-| 21 | `CancelNode()` | 取消模型仅 Qwen/Opus 有效，但 footer 始终显示 `[x] Cancel model` | 欺骗 |
+| 21 | `CancelNode()` | 取消模型仅部分耗时阶段有效，但 footer 始终显示 `[x] Cancel model` | 欺骗 |
 
 #### P2 - 工作流效率
 | # | 位置 | 问题 |
@@ -507,11 +507,10 @@ Runner (runner.go:120)
   repo_prepare → repo_analyze → task_design → [task_review GATE]
   → generate_task_files → ... → content_review → [content_review GATE]
   → codeedge_lint → harbor_verify → quality_check → similarity_check
-  → harbor_run_qwen → harbor_run_opus → [result_review GATE]
-  → submission_lint → [final_review GATE] → package
+  → [final_review GATE] → package
 
 4 个 Gate 关卡 (runner.go:1601-1672):
-  TaskReview (phase1) → ContentReview (phase1) → ResultReview (phase3) → FinalReview (phase2)
+  TaskReview (phase1) → ContentReview (phase1) → FinalReview (phase2)
 ```
 
 ### 3.3 优先级矩阵
@@ -672,20 +671,15 @@ type app struct {
 | oracle_verify | Oracle 验证 | Phase 2 |
 | quality_check | 质量检查 | Phase 2 |
 | similarity_check | 相似度检查 | Phase 2 |
-| harbor_run_qwen | Qwen 模型运行 | Phase 3 |
-| harbor_run_opus | Opus 模型运行 | Phase 3 |
-| submission_lint | 提交检查 | Phase 2 |
-| result_review | 结果审查 [关卡] | Phase 3 |
 | final_review | 最终审查 [关卡] | Phase 2 |
 | package | 打包 | 最终 |
 
-#### 4 个 Gate 名称（`runner.go` reviewGate）
+#### 3 个 Gate 名称（`runner.go` reviewGate）
 | Gate ID | 中文名称 | 阶段 | 支持的操作 |
 |---------|---------|------|-----------|
 | TaskReview | 任务审查 | Phase 1 | approve / reject |
 | ContentReview | 内容审查 | Phase 1 | approve / reject |
 | FinalReview | 最终审查 | Phase 2 | approve / reject / revise |
-| ResultReview | 结果审查 | Phase 3 | approve / reject / refresh |
 
 #### Gate 操作
 | English（来源 model.go） | 中文 |
@@ -711,10 +705,6 @@ type app struct {
 | "Workspace" | 工作区路径 | 文本 | - |
 | "Task output" | 任务输出目录 | 文本 | - |
 | "Tests analysis" | 测试分析路径 | 文本 | - |
-| "Qwen result" | Qwen 结果路径 | 文本 | - |
-| "Opus result" | Opus 结果路径 | 文本 | - |
-| "Qwen screenshot" | Qwen 截图路径 | 文本 | - |
-| "Opus screenshot" | Opus 截图路径 | 文本 | - |
 | "Package output" | 打包输出目录 | 文本 | - |
 | "Docker verify" | Docker 验证 | 布尔 | - |
 | "Quality check" | 质量检查 | 布尔 | - |
@@ -726,10 +716,6 @@ type app struct {
 | "TB3 dirs" | TB3 目录 | 列表 | - |
 | "Run Harbor" | 运行 Harbor | 布尔 | - |
 | "Harbor agent" | Harbor 代理 | 文本 | - |
-| "Qwen model" | Qwen 模型 | 文本 | - |
-| "Opus model" | Opus 模型 | 文本 | - |
-| "Qwen Harbor base URL" | Qwen Harbor 地址 | 文本 | - |
-| "Opus Harbor base URL" | Opus Harbor 地址 | 文本 | - |
 | "Harbor timeout" | Harbor 超时 | 整数 | 秒 |
 | "Harbor setup timeout" | Harbor 启动超时 | 整数 | 秒 |
 | "Harbor preflight" | Harbor 预检 | 布尔 | - |
@@ -902,8 +888,6 @@ func (d ConfirmDialog) View(width, height int) string {
 ```
 ┌ 高级选项 ─────────────────────────────┐
 │  ▸ Harbor 配置                         │  ← 可折叠
-│    Qwen 模型: [qwen3.7-max________]   │
-│    Opus 模型: [claude-opus-4-8_____]  │
 │    Harbor 超时: [7200] 秒             │
 │  ▸ 质量检查                            │
 │  ▸ 相似度检查                          │

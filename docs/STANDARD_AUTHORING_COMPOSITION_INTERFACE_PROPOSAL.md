@@ -4,10 +4,11 @@ Status: implemented provider/attestation boundary. Application, CLI, and TUI
 admission still have to install this exact composition; there is no fallback
 from another template.
 
-`harbor.standard-authoring@1.2.0` is the source-session half of task creation.
-Its `materialize_task` stage ends that Run after atomically creating the first
-TaskRevision and emitting a typed child handoff. It must not continue the
-task-bound CodeEdge lifecycle inside the AuthoringSession Run.
+`harbor.standard-authoring@3.0.0` is the sole production template. Its
+`materialize_task` stage ends that Run after atomically creating the first
+TaskRevision and emitting a sealed materialization receipt. The pipeline stops
+at materialization; downstream evaluation is an operator-owned manual step and
+is not part of any Harbor Flow Run.
 
 ## Sealed operation kinds
 
@@ -18,7 +19,7 @@ The closed deployment catalog permits only:
 | `local.command` | `repo_prepare` Git snapshot | exact regular Git executable, SHA-256, version, no caller argv |
 | `agent.turn` | analysis and content generation | pinned Codex JS launcher/Node/CODEX_HOME/sandbox, `deepseek-v4-flash` / `max`, plus locked prompt/schema assets |
 | `durable.review` | task, content, and solution gates | versioned durable-review policy; normal workflow handling waits for a decision |
-| `harbor.builtin` | `materialize_task` | exact handler ID/version and Harbor Flow build identity |
+| `harbor.builtin` | `host_candidate_verify`, `final_attestation`, `codeedge_package_admission`, `materialize_task` | exact handler ID/version and Harbor Flow build identity |
 
 `container.command` is rejected. Standard authoring does not claim an image
 or Docker execution ABI, so a generated task Dockerfile can never become an
@@ -73,7 +74,6 @@ the following injected handlers without widening the generic workflow engine:
 - a managed non-symlink Codex workspace root.
 
 The application must install the same exact resolver for StartRun, replay,
-foreground worker, detached worker, CLI, and TUI. The later CodeEdge Phase-1
-parent and evaluator-child resolver are separate template-keyed compositions;
-they are reached only through the durable authoring handoff, never through a
-Standard provider fallback.
+foreground worker, detached worker, CLI, and TUI. Standard authoring is the
+only installed production template; there is no parent/child resolver or
+handoff after materialization.

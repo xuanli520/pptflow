@@ -14,6 +14,11 @@ It exists to prevent two unsafe assumptions:
 2. Treating a behavior observed from Harbor 0.18.0 as though it applied to a
    newer Harbor release without re-probing it.
 
+> 2026-08-06 状态更新：本文服务的 CodeEdge evaluator 集成（Trial/pass@k、
+> `result.json` 解析、evaluator 本地运行）已随 CodeEdge Phase-1 / qwen-opus
+> evaluator 链路从 Harbor Factory 删除。本文仅保留为 2026-07 的 Harbor 0.18
+> 观察留档，不再作为当前任何适配器的权威依据。
+
 Only the facts in the `Observed Facts` sections are adapter authority. A change
 to the Harbor version, launcher fingerprint, installed Python source tree,
 Docker client/server version, or Compose/Buildx plugin identity invalidates this
